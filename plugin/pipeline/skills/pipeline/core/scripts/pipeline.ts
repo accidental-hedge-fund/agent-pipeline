@@ -93,6 +93,12 @@ import {
 import { finishReleasePr, realReleaseFinishDeps } from "./stages/release-finish.ts";
 import { realReleaseDeps, runRelease } from "./stages/release.ts";
 import { runIntake, realIntakeDeps } from "./stages/intake.ts";
+import {
+  runDecompose,
+  realDecomposeDeps,
+  isEpicLabeled,
+  type EffortBand,
+} from "./stages/decompose.ts";
 import { runRefineSpec, realRefineSpecDeps } from "./stages/refine-spec.ts";
 import {
   recordPapercut,
@@ -342,13 +348,21 @@ export interface CliOpts {
    * Commander's `--no-close-pack` sets `closePack: false`.
    */
   closePack?: boolean;
-  /** Intake: short free-text description to spec into a GitHub issue. */
+  /** Intake/decompose: short free-text description or seed. */
   description?: string;
+  /** decompose: parent epic issue number. */
+  epic?: number;
+  /** decompose: max child issues in the plan. */
+  maxChildren?: number;
+  /** decompose: max effort band S|M|L|XL. */
+  maxEffort?: string;
+  /** decompose: allow XL children despite max-effort. */
+  allowXl?: boolean;
   /** refine-spec: existing issue title to refine. */
   title?: string;
   /** refine-spec: existing issue body to refine. */
   body?: string;
-  /** Intake/release: pin the target release slot (e.g. "v1.6.0" or "1.6.0"). */
+  /** Intake/release/decompose: pin the target release slot (e.g. "v1.6.0" or "1.6.0"). */
   release?: string;
   /** release: theme for a scaffolded release-plan row when missing (#730). */
   theme?: string;
@@ -615,6 +629,7 @@ export function maxPositionalsFor(command: string | undefined): number {
     command === "run" ||
     command === "single" ||
     command === "intake" ||
+    command === "decompose" ||
     command === "triage" ||
     command === "merge" ||
     command === "merge-queue" ||
@@ -650,7 +665,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | single | release | ship | factory-gate | factory-release | factory-pin | engine-promote | intake | triage | roadmap | sweep | merge | merge-queue | train | summary | improve | scoreboard | queue | backfill | evals | loop | correction | report")
+    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | single | release | ship | factory-gate | factory-release | factory-pin | engine-promote | intake | decompose | triage | roadmap | sweep | merge | merge-queue | train | summary | improve | scoreboard | queue | backfill | evals | loop | correction | report")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -703,11 +718,15 @@ export function buildCmd(): Command {
       "--skip-frg",
       "release / engine-promote: thin-ship opt-out — do not require Factory Reliability Gate latest.json (FRG remains available via factory-gate)",
     )
-    .option("--description <text>", "intake: short free-text description to spec into a GitHub issue")
+    .option("--description <text>", "intake/decompose: free-text description or decomposition seed")
+    .option("--epic <n>", "decompose: parent epic issue number", Number)
+    .option("--max-children <n>", "decompose: maximum child issues in the plan (default: 12 or config)", Number)
+    .option("--max-effort <band>", "decompose: maximum child effort S|M|L|XL (default: M or config)")
+    .option("--allow-xl", "decompose: permit XL effort children despite max-effort")
     .option("--title <text>", "refine-spec: existing issue title to refine")
     .option("--body <markdown>", "refine-spec: existing issue body to refine")
-    .option("--release <version>", "intake/release: pin the target release slot (e.g. v1.6.0)")
-    .option("--apply", "roadmap/sweep/backfill/improve/config sync: execute write-backs; default is dry-run/preview")
+    .option("--release <version>", "intake/release/decompose: pin the target release slot (e.g. v1.6.0)")
+    .option("--apply", "roadmap/sweep/backfill/improve/config sync/decompose: execute write-backs; default is dry-run/preview")
     .option("--next <n>", "roadmap: emit top-N dependency-safe issues from existing plan.json without re-running the engine", Number)
     .option("--repo <owner/repo>", "sweep/backfill: override the target GitHub repository (default: current repo from gh config)")
     .option("--stage <stage>", "triage: target pre-pipeline stage label (ready or backlog)")
@@ -2023,8 +2042,11 @@ export async function resolveSelectorWorkList(
 
   if (selector.type === "milestone" || selector.type === "label") {
     const issues = await deps.listOpenIssues(cfg);
+    // Exclude pipeline:epic umbrellas from default milestone/label selectors (#766).
+    // Explicit work-list selectors are unchanged (handled above).
     const matches = issues
       .filter((i) => (selector.type === "milestone" ? i.milestone === selector.value : i.labels.includes(selector.value)))
+      .filter((i) => !isEpicLabeled(i.labels))
       .map((i) => i.number)
       .sort((a, b) => a - b);
     if (matches.length === 0) {
@@ -2041,8 +2063,22 @@ export async function resolveSelectorWorkList(
   if (matches.length === 0) {
     throw new Error(`roadmap slice "${selector.value}" was not found in ROADMAP.md, or references no issues`);
   }
+  // Exclude pipeline:epic parents listed in a slice; children remain eligible (#766).
+  let filtered = matches;
+  try {
+    const open = await deps.listOpenIssues(cfg);
+    const epicIds = new Set(
+      open.filter((i) => isEpicLabeled(i.labels)).map((i) => i.number),
+    );
+    filtered = matches.filter((n) => !epicIds.has(n));
+  } catch {
+    // If inventory is unavailable, keep the slice numbers (fail open on slice path only).
+  }
+  if (filtered.length === 0) {
+    throw new Error(`roadmap slice "${selector.value}" was not found in ROADMAP.md, or references no issues`);
+  }
   return {
-    issues: matches.map(String),
+    issues: filtered.map(String),
     roadmapDeclaredEdges: await tryLoadRoadmapDeclaredEdges(cfg, deps, roadmapText),
   };
 }
@@ -3065,6 +3101,8 @@ async function main(): Promise<void> {
   const isShipCommand = numArg === "ship";
   // `pipeline intake [--description "<text>"] [--release vX.Y.Z]` — no issue number.
   const isIntakeCommand = numArg === "intake";
+  // `pipeline decompose --epic N [--apply] …` — epic work breakdown (#766).
+  const isDecomposeCommand = numArg === "decompose";
   // `pipeline sweep [--apply] [--repo <owner/repo>]` — batch backlog re-spec + roadmap reconciliation.
   const isSweepCommand = numArg === "sweep";
   // `pipeline backfill [--apply] [--capability <name>] [--repo <owner/repo>]` — OpenSpec coverage backfill.
@@ -3641,6 +3679,74 @@ async function main(): Promise<void> {
       );
     } catch (err) {
       console.error(`pipeline intake: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    return;
+  }
+
+  // Early decompose dispatch (#766) — no issue-number positional; dry-run default.
+  // Uses full resolveConfig for optional decompose.* bounds + harness models.
+  if (isDecomposeCommand) {
+    if (opts.dryRun && opts.apply) {
+      console.error(
+        "pipeline decompose: --dry-run and --apply are mutually exclusive — omit one.",
+      );
+      process.exit(2);
+    }
+    const epicRaw = opts.epic;
+    if (epicRaw === undefined || epicRaw === null || Number.isNaN(Number(epicRaw)) || Number(epicRaw) < 1) {
+      console.error(
+        "pipeline decompose: --epic <N> is required (positive issue number).\n" +
+          "  Usage: pipeline decompose --epic <N> [--description \"…\"] [--apply] [--release vX.Y.Z]",
+      );
+      process.exit(2);
+    }
+    let decomposeCfg: import("./types.ts").PipelineConfig;
+    try {
+      decomposeCfg = resolveConfig({
+        repoPath: opts.repoPath,
+        baseBranch: opts.base,
+        profile: opts.profile,
+      });
+    } catch (err) {
+      console.error(`pipeline decompose: config error: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    const maxEffortOpt = opts.maxEffort
+      ? (String(opts.maxEffort).toUpperCase() as EffortBand)
+      : undefined;
+    try {
+      await runDecompose(
+        {
+          epic: Number(epicRaw),
+          description: opts.description,
+          apply: !!opts.apply,
+          release: opts.release,
+          maxChildren: opts.maxChildren,
+          maxEffort: maxEffortOpt,
+          allowXl: !!opts.allowXl,
+        },
+        {
+          repo_dir: decomposeCfg.repo_dir,
+          repo: decomposeCfg.repo,
+          base_branch: decomposeCfg.base_branch,
+          intake_timeout: decomposeCfg.intake_timeout,
+          models: decomposeCfg.models,
+          effort: decomposeCfg.effort,
+          harnesses: decomposeCfg.harnesses,
+          git: decomposeCfg.git,
+          decompose: decomposeCfg.decompose,
+        },
+        realDecomposeDeps(
+          decomposeCfg.repo_dir,
+          decomposeCfg.models.intake,
+          decomposeCfg.effort.intake,
+          decomposeCfg.harnesses.implementer,
+          decomposeCfg.git?.push_auth,
+        ),
+      );
+    } catch (err) {
+      console.error(`pipeline decompose: ${(err as Error).message}`);
       process.exit(1);
     }
     return;
@@ -4877,7 +4983,7 @@ async function main(): Promise<void> {
   if (numArg && !/^\d+$/.test(numArg)) {
     const recognized = [
       "init", "doctor", "status", "unblock", "override", "cleanup",
-      "logs", "path", "config", "run", "single", "release", "intake", "refine-spec",
+      "logs", "path", "config", "run", "single", "release", "intake", "decompose", "refine-spec",
       "roadmap", "sweep", "triage", "merge", "merge-queue", "train", "ship", "summary", "improve", "scoreboard", "factory-gate", "factory-release", "factory-pin", "engine-promote", "queue", "backfill", "evals",
       "loop",
     ];

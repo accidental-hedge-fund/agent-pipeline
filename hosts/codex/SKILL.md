@@ -94,6 +94,7 @@ $pipeline status <n>                            Read-only — print stage, block
 $pipeline train --milestone <m>|--issues <n,n> [--merge] [--json] Operator-authorized integrate train: dependency-order issues, advance each to ready-to-deploy, optionally merge and prove base containment before the next (never called by the advance loop)
 $pipeline unblock <n> "<answer>"                Post an answer and clear the blocked label
 $pipeline backfill [--apply] [--capability <name>] Preview or apply OpenSpec coverage for legacy behavior (spec-only PR)
+$pipeline decompose --epic <N> [--description "…"] [--apply] [--release vX.Y.Z] [--max-children N] [--max-effort S|M|L|XL] [--allow-xl] Break an epic issue into dependency-linked child issues and a ROADMAP PR (dry-run default; --apply writes; not intake / not roadmap-order-only / not loop-execute)
 $pipeline engine-promote --for <X.Y.Z> [--host all|codex|claude|grok|opencode] [--dry-run] [--json] [--skip-install] Self-host: verify published release, promote production pin, install exact tag to all hosts by default, verify version (rollback pin on install failure)
 $pipeline evals plan|run|grade|report|harvest … Offline eval plan/run/grade/report/harvest (never writes to production GitHub)
 $pipeline factory-gate --for <version> [--from-run <run-id>] [--observations <file>] [--scenario id=status:detail] [--promote-pin-on-pass] Score a durable loop / fixture pack and write immutable FRG evidence (never merges or tags)

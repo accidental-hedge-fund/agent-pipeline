@@ -981,6 +981,11 @@ export interface PipelineConfig {
     min_body_length?: number;
     required_sections?: string[];
   };
+  // Epic decompose (#766). Optional bounds for pipeline decompose.
+  decompose?: {
+    max_children?: number;
+    max_effort?: "S" | "M" | "L" | "XL";
+  };
   // Queue batch factory operation mode (#305). Optional operator defaults that
   // CLI flags override. All keys are optional; built-in defaults apply when absent.
   queue?: {

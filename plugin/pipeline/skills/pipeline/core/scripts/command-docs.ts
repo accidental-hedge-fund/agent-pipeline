@@ -104,6 +104,14 @@ export const COMMAND_DOCS: Record<string, CommandDoc> = {
     documented: true,
     section: "factory",
   },
+  decompose: {
+    summary:
+      "Break an epic issue into dependency-linked child issues and a ROADMAP PR (dry-run default; --apply writes; not intake / not roadmap-order-only / not loop-execute)",
+    usage:
+      'decompose --epic <N> [--description "…"] [--apply] [--release vX.Y.Z] [--max-children N] [--max-effort S|M|L|XL] [--allow-xl]',
+    documented: true,
+    section: "factory",
+  },
   triage: {
     summary: "Set a pre-pipeline stage label (ready or backlog) on an issue",
     usage: "triage <n> --stage ready|backlog",
