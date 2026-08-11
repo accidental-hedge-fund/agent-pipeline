@@ -85,7 +85,7 @@ distinct `pipeline:<command>` entries in the skill/command menu.
 /pipeline merge <pr>                            Operator-authorized squash merge of a ready-to-deploy PR (never called by the advance loop)
 /pipeline merge-queue --milestone <m> [--apply] [--release-when-complete --release-version <ver>] Operator-authorized sequential merge of ready-to-deploy PRs; dry-run by default; optional prepare-only release-when-complete
 /pipeline override <n> "<key>: <reason>"        Disposition a review finding and auto-resume the advance loop
-/pipeline release <version> [--theme "..."] [--dry-run|--json] [--no-edit] [--skip-frg] | release finish <pr> [--json] Prepare a release PR (version) or finish-merge one (finish <pr>); never tags or publishes (workflows do; auto-tag also refreshes tag-derived CHANGELOG)
+/pipeline release <version> [--theme "..."] [--dry-run|--json] [--no-edit] [--skip-frg] | release finish <pr> [--json] Prepare a release PR from the matching GitHub milestone plan (or finish-merge one); never tags or publishes (workflows do; auto-tag also refreshes tag-derived CHANGELOG); --dry-run reports milestone presence/open issues
 /pipeline remove-worktree <n> [--force]         Remove a managed pipeline worktree for an issue (optional --force)
 /pipeline ship --milestone <m> --for <X.Y.Z> --authorization <absolute-json> --json | ship status --milestone <m> --for <X.Y.Z> --json Run or inspect one exact, Buzz-authorized release shipment through train, FRG, release, and engine promotion
 /pipeline status <n>                            Read-only — print stage, blocker, PR, last review

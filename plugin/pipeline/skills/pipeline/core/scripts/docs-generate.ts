@@ -333,7 +333,7 @@ export function renderChangelogMarkdown(releases: ChangelogRelease[]): string {
     GENERATED_BANNER,
     "",
     "Release history generated from git tags (and optional GitHub Release bodies).",
-    "Forward-looking planning lives in [ROADMAP.md](ROADMAP.md).",
+    "GitHub milestones own planned release membership; [ROADMAP.md](ROADMAP.md) is human-readable forward documentation.",
     "",
     "Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).",
     "",

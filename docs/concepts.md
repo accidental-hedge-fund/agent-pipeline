@@ -216,7 +216,7 @@ Machine-facing helpers (no change to human skill flows):
 | `scripts/generate-docs.mjs` | Generate/check CLI, config, CHANGELOG, SKILL command tables |
 | `docs/` | Operator docs (`cli.md`, `config.md`, `concepts.md`) |
 | `openspec/` | Living specs + in-flight changes |
-| `ROADMAP.md` | Forward plan only |
+| `ROADMAP.md` | Human-readable forward plan (milestones own release plan membership) |
 | `CHANGELOG.md` | Generated release history |
 
 ## Generated docs contract

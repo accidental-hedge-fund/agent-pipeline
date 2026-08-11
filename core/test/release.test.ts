@@ -33,6 +33,8 @@ import {
   buildPRBody,
   extractTheme,
   computeUnifiedDiff,
+  formatMilestoneStatusLine,
+  missingMilestoneError,
   runRelease,
   resolvePreviousTagCreatedAt,
   mapGhIssueToSoakCandidate,
@@ -40,6 +42,7 @@ import {
   type ReleaseDeps,
   type ReleaseContext,
   type CommandResult,
+  type ReleaseMilestoneInfo,
 } from "../scripts/stages/release.ts";
 import {
   computeFrgEvidence,
@@ -73,6 +76,16 @@ function defaultFrgPass(version = "1.6.0") {
   });
 }
 
+/** Default matching milestone so live tests that focus on other gates stay unblocked (#985). */
+function defaultMilestone(version = "1.6.0"): ReleaseMilestoneInfo {
+  return {
+    title: `v${version} — test theme`,
+    issueNumbers: [158, 170],
+    openIssueCount: 0,
+    totalIssueCount: 2,
+  };
+}
+
 function makeDeps(overrides: Partial<ReleaseDeps> = {}): ReleaseDeps {
   const written: Record<string, string> = {};
   const editorCalls: string[] = [];
@@ -97,6 +110,8 @@ function makeDeps(overrides: Partial<ReleaseDeps> = {}): ReleaseDeps {
     stderr: (msg) => { stderrLines.push(msg); },
     // FRG pass by default so existing release tests stay focused on release logic.
     requireFrgPass: async (_dir, version) => defaultFrgPass(version),
+    // Milestone plan authority (#985): default present so unrelated gates stay focused.
+    fetchMilestoneForVersion: async (version) => defaultMilestone(version),
     ...overrides,
   };
   // Expose collected state via non-standard properties for test inspection.
@@ -513,10 +528,10 @@ test("resolveReleaseTheme: --theme overrides milestone and plan-row", () => {
   );
 });
 
-test("resolveReleaseTheme: milestone title when no CLI theme and no plan row", () => {
+test("resolveReleaseTheme: milestone title when no CLI theme (ROADMAP plan-row is not authority)", () => {
   assert.equal(
     resolveReleaseTheme({
-      roadmapText: ROADMAP_MISSING_PLAN_ROW,
+      roadmapText: SAMPLE_ROADMAP, // has plan-row theme "Intake & backlog automation"
       version: "1.6.0",
       milestoneTitle: "v1.6.0 — Factory reliability",
     }),
@@ -524,10 +539,25 @@ test("resolveReleaseTheme: milestone title when no CLI theme and no plan row", (
   );
 });
 
-test("resolveReleaseTheme: placeholder when nothing available", () => {
+test("resolveReleaseTheme: placeholder when neither CLI nor milestone theme exists", () => {
   assert.equal(
-    resolveReleaseTheme({ roadmapText: ROADMAP_MISSING_PLAN_ROW, version: "1.6.0" }),
+    resolveReleaseTheme({ roadmapText: SAMPLE_ROADMAP, version: "1.6.0" }),
     PLAN_ROW_THEME_PLACEHOLDER,
+  );
+});
+
+test("formatMilestoneStatusLine: present / absent / unavailable", () => {
+  assert.match(
+    formatMilestoneStatusLine("1.36.0", "present", { open: 3, total: 5 }),
+    /milestone: present for 1\.36\.0 \(open issues: 3, total non-PR: 5\)/,
+  );
+  assert.match(
+    formatMilestoneStatusLine("1.36.0", "absent"),
+    /milestone: absent for 1\.36\.0/,
+  );
+  assert.match(
+    formatMilestoneStatusLine("1.36.0", "unavailable", undefined, "network down"),
+    /milestone: unavailable for 1\.36\.0 \(network down\)/,
   );
 });
 
@@ -1140,8 +1170,9 @@ test("runRelease live: CI failure aborts before any fetchPRClosingIssues call", 
   assert.ok(!closingCalled, "fetchPRClosingIssues must NOT be called when CI fails");
 });
 
-test("runRelease live: impossible plan-row insert aborts before any file write with remediation", async () => {
-  const writes: string[] = [];
+test("runRelease live: missing ROADMAP plan anchors do not abort when milestone is present (#985)", async () => {
+  const writes: Record<string, string> = {};
+  const stderr: string[] = [];
   // Missing v1.6.0 plan row AND no insert sentinel → ensure cannot scaffold.
   const roadmapBroken = ROADMAP_MISSING_PLAN_ROW.replace("| *(none)* |", "| *(gone)* |");
 
@@ -1152,26 +1183,33 @@ test("runRelease live: impossible plan-row insert aborts before any file write w
       if (p.endsWith("ROADMAP.md")) return roadmapBroken;
       throw new Error(`unexpected read: ${p}`);
     },
-    writeFile: (p) => { writes.push(p); },
+    writeFile: (p, c) => { writes[p] = c; },
     runCommand: (cmd, args) => {
       if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
+      if (cmd === "git" && args[0] === "log") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "git" && args[0] === "status") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "node" || cmd === "npm") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "git" && (args[0] === "checkout" || args[0] === "add" || args[0] === "commit" || args[0] === "push" || args[0] === "clean")) {
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      if (cmd === "gh") return { code: 0, stdout: "https://github.com/org/repo/pull/1", stderr: "" };
       return { code: 0, stdout: "", stderr: "" };
     },
+    stderr: (msg) => { stderr.push(msg); },
+    fetchPRClosingIssues: async () => [],
   });
 
-  await assert.rejects(
-    () => runRelease("1.6.0", { noEdit: true }, { repo_dir: "/repo", repo: "org/repo" }, deps),
-    (err: Error) => {
-      assert.ok(
-        err.message.includes("release-plan-none-row") || err.message.includes("cannot auto-scaffold"),
-        `got: ${err.message}`,
-      );
-      assert.ok(err.message.includes("ROADMAP.md"), `got: ${err.message}`);
-      assert.ok(err.message.includes("| **v1.6.0** |"), `got: ${err.message}`);
-      return true;
-    },
+  const result = await runRelease(
+    "1.6.0",
+    { noEdit: true },
+    { repo_dir: "/repo", repo: "org/repo" },
+    deps,
   );
-  assert.equal(writes.length, 0, "no files written when plan-row insert is impossible");
+  assert.ok(result && result.pr > 0, "release PR still created when ROADMAP anchors missing");
+  assert.ok(
+    stderr.some((l) => /skipping release-plan-row/i.test(l)),
+    `expected best-effort ROADMAP skip warning, got: ${stderr.join("\n")}`,
+  );
 });
 
 test("runRelease live: missing plan row is scaffolded when *(none)* sentinel present (no abort)", async () => {
@@ -1277,6 +1315,8 @@ test("runRelease: --theme wins over milestone for scaffolded plan row", async ()
     fetchMilestoneForVersion: async () => ({
       title: "v1.6.0 — From milestone",
       issueNumbers: [999],
+      openIssueCount: 0,
+      totalIssueCount: 1,
     }),
     fetchPRClosingIssues: async () => [],
   });
@@ -1317,6 +1357,8 @@ test("runRelease: milestone theme used when --theme absent and plan row missing"
     fetchMilestoneForVersion: async () => ({
       title: "v1.6.0 — Milestone theme only",
       issueNumbers: [730, 723],
+      openIssueCount: 0,
+      totalIssueCount: 2,
     }),
     fetchPRClosingIssues: async () => [],
   });
@@ -1725,11 +1767,12 @@ test("CLI: 'pipeline release --status' exits non-zero with conflict message", ()
 });
 
 // ---------------------------------------------------------------------------
-// Finding 1: issue discovery failure aborts release in live mode
+// Finding 1 / #985: issue discovery failure is advisory (ROADMAP stamps best-effort)
 // ---------------------------------------------------------------------------
 
-test("runRelease live: issue discovery failure aborts and rolls back via git checkout (#170)", async () => {
+test("runRelease live: issue discovery failure warns and continues (#985)", async () => {
   const commands: string[][] = [];
+  const stderr: string[] = [];
   const deps = makeDeps({
     readFile: (p) => {
       if (p.endsWith("core/package.json")) return SAMPLE_CORE_PKG;
@@ -1743,26 +1786,30 @@ test("runRelease live: issue discovery failure aborts and rolls back via git che
       if (cmd === "git" && args[0] === "log") return { code: 0, stdout: "Merge pull request #203 from foo/bar", stderr: "" };
       if (cmd === "node") return { code: 0, stdout: "", stderr: "" };
       if (cmd === "npm") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "gh" && args[0] === "pr") {
+        return { code: 0, stdout: "https://github.com/org/repo/pull/300", stderr: "" };
+      }
       return { code: 0, stdout: "", stderr: "" };
     },
     fetchPRTitle: async (n) => `PR #${n}`,
     fetchPRClosingIssues: async () => { throw new Error("gh auth error"); },
+    stderr: (msg) => { stderr.push(msg); },
   });
 
-  await assert.rejects(
-    () => runRelease("1.6.0", { noEdit: true }, { repo_dir: "/repo", repo: "org/repo" }, deps),
-    (err: Error) => {
-      assert.ok(err.message.includes("issue discovery failed"), `got: ${err.message}`);
-      return true;
-    },
+  const result = await runRelease(
+    "1.6.0",
+    { noEdit: true },
+    { repo_dir: "/repo", repo: "org/repo" },
+    deps,
   );
-  // Rollback is a `git checkout -- ...` from HEAD (not a writeFile): it restores the
-  // bumped package.json files, ROADMAP.md, and the plugin/ mirror in one step, so a
-  // retry reads the original previousVersion. The branch is never created.
-  assert.ok(restoreInvoked(commands), "git checkout rollback issued on abort");
+  assert.ok(result && result.pr > 0, "prepare continues when closing-issue discovery fails");
   assert.ok(
-    !commands.some((c) => c[0] === "git" && c[1] === "checkout" && c[2] === "-b"),
-    "release branch is not created when issue discovery fails",
+    stderr.some((l) => /issue discovery failed|stamps may be incomplete/i.test(l)),
+    `expected advisory warning, got: ${stderr.join("\n")}`,
+  );
+  assert.ok(
+    commands.some((c) => c[0] === "git" && c[1] === "checkout" && c[2] === "-b"),
+    "release branch is created when issue discovery is best-effort",
   );
 });
 
@@ -1911,19 +1958,285 @@ function liveReleaseDeps(overrides: Partial<ReleaseDeps> = {}): ReleaseDeps {
   });
 }
 
-test("runRelease: aborts live release when shipped PRs resolve no stampable issue rows (#170)", async () => {
-  // PR #204 is shipped but closes no issue → shippedIssueNumbers empty → none of the
-  // 2 v1.6.0 rows can be stamped → would write an inconsistent ROADMAP → must abort.
-  const commands: string[][] = [];
-  const deps = liveReleaseDeps({ fetchPRClosingIssues: async () => [] });
-  const inner = deps.runCommand;
-  deps.runCommand = (cmd, args, opts) => { commands.push([cmd, ...args]); return inner(cmd, args, opts); };
+test("runRelease: ROADMAP stamp mismatch does not abort when milestone plan is present (#985)", async () => {
+  // Pre-#985 behavior aborted with "none could be stamped" when shipped PRs resolved no
+  // matching ROADMAP per-issue rows. Milestone is SSoT now — prepare continues.
+  const stderr: string[] = [];
+  let openedPr = false;
+  const deps = liveReleaseDeps({
+    fetchPRClosingIssues: async () => [],
+    stderr: (msg) => { stderr.push(msg); },
+    runCommand: (cmd, args) => {
+      if (cmd === "git" && args[0] === "log") return { code: 0, stdout: "a1b2c3d release: thing (#204)", stderr: "" };
+      if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
+      if (cmd === "gh" && args[0] === "pr") {
+        openedPr = true;
+        return { code: 0, stdout: "https://github.com/org/repo/pull/999", stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+  });
+  const result = await runRelease(
+    "1.6.0",
+    { noEdit: true },
+    { repo_dir: "/repo", repo: "org/repo" },
+    deps,
+  );
+  assert.ok(result && result.pr > 0, "prepare must succeed despite ROADMAP stamp mismatch");
+  assert.ok(openedPr, "release PR opened");
+  assert.ok(
+    stderr.some((l) => /none could be stamped|ROADMAP stamps are best-effort/i.test(l)),
+    `expected advisory stamp warning, got: ${stderr.join("\n")}`,
+  );
+  assert.ok(
+    !stderr.some((l) => /error:.*none could be stamped/.test(l)),
+    "must not re-raise historical hard abort as error",
+  );
+});
+
+test("runRelease: v1.35.0-class drift — stale ROADMAP plan rows do not block milestone ship (#985)", async () => {
+  // ROADMAP still plans #901,#765 for v1.35.0; milestone + shipped closing issues are
+  // #910,#978,#980,#983. Pre-change abort: "none could be stamped".
+  const staleRoadmap = `# Roadmap
+
+| Release | Bump | Theme | Issues | Why this bump |
+|---|---|---|---|---|
+| **v1.35.0** | minor | stale plan | #901, #765 | drift fixture |
+| *(none)* | | research | | |
+
+| # | Impact | Config | Theme | → Release | Depends on |
+|---|--------|--------|-------|-----------|------------|
+| #901 | minor | none | stale | v1.35.0 | — |
+| #765 | minor | none | stale | v1.35.0 | — |
+`;
+  const writes: Record<string, string> = {};
+  const stderr: string[] = [];
+  const deps = makeDeps({
+    readFile: (p) => {
+      if (p.endsWith("core/package.json")) {
+        return JSON.stringify({ name: "pipeline", version: "1.34.0", private: true }, null, 2) + "\n";
+      }
+      if (p.endsWith("package.json")) {
+        return JSON.stringify({ name: "agent-pipeline", version: "1.34.0", private: true }, null, 2) + "\n";
+      }
+      if (p.endsWith("ROADMAP.md")) return staleRoadmap;
+      throw new Error(`unexpected read: ${p}`);
+    },
+    writeFile: (p, c) => { writes[p] = c; },
+    runCommand: (cmd, args) => {
+      if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.34.0", stderr: "" };
+      if (cmd === "git" && args[0] === "log") {
+        return {
+          code: 0,
+          stdout: [
+            "aaaaaaa ship roadmap (#1001)",
+            "bbbbbbb ship docs (#1002)",
+            "ccccccc ship auth (#1003)",
+            "ddddddd ship supervisor (#1004)",
+          ].join("\n"),
+          stderr: "",
+        };
+      }
+      if (cmd === "git" && args[0] === "status") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "node" || cmd === "npm") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "git" && (args[0] === "checkout" || args[0] === "add" || args[0] === "commit" || args[0] === "push" || args[0] === "clean")) {
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      if (cmd === "gh") return { code: 0, stdout: "https://github.com/org/repo/pull/2000", stderr: "" };
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    fetchMilestoneForVersion: async () => ({
+      title: "v1.35.0 — Release, roadmap correctness, and supervisor hardening",
+      issueNumbers: [910, 978, 980, 983],
+      openIssueCount: 0,
+      totalIssueCount: 4,
+    }),
+    fetchPRClosingIssues: async (n) => {
+      const map: Record<number, number[]> = {
+        1001: [910],
+        1002: [978],
+        1003: [980],
+        1004: [983],
+      };
+      return map[n] ?? [];
+    },
+    inspectCreatedPR: async () => ({
+      number: 2000,
+      baseRefName: "main",
+      headRefName: "release/v1.35.0",
+      headRefOid: "b".repeat(40),
+    }),
+    requireFrgPass: async (_dir, version) => defaultFrgPass(version),
+    stderr: (msg) => { stderr.push(msg); },
+  });
+
+  const result = await runRelease(
+    "1.35.0",
+    { noEdit: true },
+    { repo_dir: "/repo", repo: "org/repo" },
+    deps,
+  );
+  assert.ok(result && result.kind === "release_prepare" && result.version === "1.35.0");
+  assert.ok(
+    !stderr.some((l) => /error:.*none could be stamped|found .* but none could be stamped — the shipped/.test(l) && !/warning/.test(l)),
+  );
+  // Bite proof: advisory may mention none stampable, but prepare must not throw that error.
+  assert.ok(result.pr === 2000);
+  const roadmapPath = Object.keys(writes).find((p) => p.endsWith("ROADMAP.md"));
+  assert.ok(roadmapPath, "ROADMAP still written best-effort");
+});
+
+test("runRelease: missing milestone aborts live prepare with remediation (#985)", async () => {
+  const writes: string[] = [];
+  const deps = makeDeps({
+    readFile: (p) => {
+      if (p.endsWith("core/package.json")) return SAMPLE_CORE_PKG;
+      if (p.endsWith("package.json")) return SAMPLE_ROOT_PKG;
+      if (p.endsWith("ROADMAP.md")) return SAMPLE_ROADMAP;
+      throw new Error(`unexpected read: ${p}`);
+    },
+    writeFile: (p) => { writes.push(p); },
+    fetchMilestoneForVersion: async () => null,
+  });
   await assert.rejects(
     () => runRelease("1.6.0", { noEdit: true }, { repo_dir: "/repo", repo: "org/repo" }, deps),
-    /none could be stamped/,
+    (err: Error) => {
+      assert.ok(err.message.includes("no GitHub milestone matching version 1.6.0"), `got: ${err.message}`);
+      assert.ok(err.message.includes("pipeline roadmap --apply") || err.message.includes("Create the milestone"), `got: ${err.message}`);
+      return true;
+    },
   );
-  // Rollback restores the bumped files + plugin/ mirror via `git checkout -- ...` from HEAD.
-  assert.ok(restoreInvoked(commands), "git checkout rollback issued on abort");
+  assert.equal(writes.length, 0, "no files written when milestone is absent");
+  // Helper matches the same remediation contract.
+  assert.match(missingMilestoneError("1.6.0").message, /1\.6\.0/);
+});
+
+test("runRelease: milestone present with membership matching shipped issues succeeds (#985)", async () => {
+  const writes: Record<string, string> = {};
+  const stdout: string[] = [];
+  const deps = makeDeps({
+    readFile: (p) => {
+      if (p.endsWith("core/package.json")) return SAMPLE_CORE_PKG;
+      if (p.endsWith("package.json")) return SAMPLE_ROOT_PKG;
+      if (p.endsWith("ROADMAP.md")) return SAMPLE_ROADMAP;
+      throw new Error(`unexpected read: ${p}`);
+    },
+    writeFile: (p, c) => { writes[p] = c; },
+    runCommand: (cmd, args) => {
+      if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
+      if (cmd === "git" && args[0] === "log") return { code: 0, stdout: "a1b2c3d ship (#204)", stderr: "" };
+      if (cmd === "git" && args[0] === "status") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "node" || cmd === "npm") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "git" && (args[0] === "checkout" || args[0] === "add" || args[0] === "commit" || args[0] === "push" || args[0] === "clean")) {
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      if (cmd === "gh") return { code: 0, stdout: "https://github.com/org/repo/pull/300", stderr: "" };
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    fetchMilestoneForVersion: async () => ({
+      title: "v1.6.0 — Intake & backlog automation",
+      issueNumbers: [158, 170],
+      openIssueCount: 0,
+      totalIssueCount: 2,
+    }),
+    fetchPRClosingIssues: async () => [158, 170],
+    stdout: (msg) => { stdout.push(msg); },
+  });
+  const result = await runRelease(
+    "1.6.0",
+    { noEdit: true },
+    { repo_dir: "/repo", repo: "org/repo" },
+    deps,
+  );
+  assert.ok(result && result.pr === 300);
+  assert.ok(stdout.some((l) => /milestone: present for 1\.6\.0/.test(l)), stdout.join("\n"));
+  assert.ok(stdout.some((l) => /#158/.test(l) && /#170/.test(l)), stdout.join("\n"));
+});
+
+test("runRelease dry-run: prints milestone present + open count without writes (#985)", async () => {
+  const writes: string[] = [];
+  const stdout: string[] = [];
+  const deps = makeDeps({
+    readFile: (p) => {
+      if (p.endsWith("core/package.json")) return SAMPLE_CORE_PKG;
+      if (p.endsWith("package.json")) return SAMPLE_ROOT_PKG;
+      if (p.endsWith("ROADMAP.md")) return SAMPLE_ROADMAP;
+      throw new Error(`unexpected read: ${p}`);
+    },
+    writeFile: (p) => { writes.push(p); },
+    runCommand: (cmd, args) => {
+      if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
+      if (cmd === "git" && args[0] === "log") return { code: 0, stdout: "", stderr: "" };
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    fetchMilestoneForVersion: async () => ({
+      title: "v1.6.0 — preview",
+      issueNumbers: [1, 2, 3],
+      openIssueCount: 3,
+      totalIssueCount: 3,
+    }),
+    stdout: (msg) => { stdout.push(msg); },
+  });
+  await runRelease("1.6.0", { dryRun: true }, { repo_dir: "/repo", repo: "org/repo" }, deps);
+  assert.equal(writes.length, 0);
+  assert.ok(
+    stdout.some((l) => /milestone: present for 1\.6\.0 \(open issues: 3/.test(l)),
+    stdout.join("\n"),
+  );
+});
+
+test("runRelease dry-run: absent milestone does not abort (#985)", async () => {
+  const writes: string[] = [];
+  const stdout: string[] = [];
+  const deps = makeDeps({
+    readFile: (p) => {
+      if (p.endsWith("core/package.json")) return SAMPLE_CORE_PKG;
+      if (p.endsWith("package.json")) return SAMPLE_ROOT_PKG;
+      if (p.endsWith("ROADMAP.md")) return SAMPLE_ROADMAP;
+      throw new Error(`unexpected read: ${p}`);
+    },
+    writeFile: (p) => { writes.push(p); },
+    runCommand: (cmd, args) => {
+      if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
+      if (cmd === "git" && args[0] === "log") return { code: 0, stdout: "", stderr: "" };
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    fetchMilestoneForVersion: async () => null,
+    stdout: (msg) => { stdout.push(msg); },
+  });
+  await runRelease("1.6.0", { dryRun: true }, { repo_dir: "/repo", repo: "org/repo" }, deps);
+  assert.equal(writes.length, 0);
+  assert.ok(stdout.some((l) => /milestone: absent for 1\.6\.0/.test(l)), stdout.join("\n"));
+});
+
+test("runRelease dry-run: fetch failure reports unavailable without inventing membership (#985)", async () => {
+  const writes: string[] = [];
+  const stdout: string[] = [];
+  const deps = makeDeps({
+    readFile: (p) => {
+      if (p.endsWith("core/package.json")) return SAMPLE_CORE_PKG;
+      if (p.endsWith("package.json")) return SAMPLE_ROOT_PKG;
+      if (p.endsWith("ROADMAP.md")) return SAMPLE_ROADMAP;
+      throw new Error(`unexpected read: ${p}`);
+    },
+    writeFile: (p) => { writes.push(p); },
+    runCommand: (cmd, args) => {
+      if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
+      if (cmd === "git" && args[0] === "log") return { code: 0, stdout: "", stderr: "" };
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    fetchMilestoneForVersion: async () => {
+      throw new Error("gh api rate limit");
+    },
+    stdout: (msg) => { stdout.push(msg); },
+  });
+  await runRelease("1.6.0", { dryRun: true }, { repo_dir: "/repo", repo: "org/repo" }, deps);
+  assert.equal(writes.length, 0);
+  assert.ok(
+    stdout.some((l) => /milestone: unavailable for 1\.6\.0/.test(l) && /rate limit/.test(l)),
+    stdout.join("\n"),
+  );
+  assert.ok(!stdout.some((l) => /planned issues from milestone: #/.test(l)));
 });
 
 test("runRelease: a post-bump abort (CI failure) restores the bumped files (#170)", async () => {

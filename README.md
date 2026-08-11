@@ -220,7 +220,7 @@ Uninstall removes the host skill tree. For Claude it also removes installer-writ
 | **[docs/config.md](docs/config.md)** | `.github/pipeline.yml` config key reference (generated from the Zod schema) |
 | **[docs/concepts.md](docs/concepts.md)** | Advanced/optional topics: gates, OpenSpec, review policy, desktop integration, troubleshooting |
 | **[CHANGELOG.md](CHANGELOG.md)** | Per-version release history (generated from git tags) |
-| **[ROADMAP.md](ROADMAP.md)** | Forward-looking release plan |
+| **[ROADMAP.md](ROADMAP.md)** | Human-readable forward plan (GitHub milestones are release-plan authority) |
 
 **Common commands** (see [docs/cli.md](docs/cli.md) for the full inventory):
 
