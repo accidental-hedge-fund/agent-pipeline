@@ -567,17 +567,32 @@ if [[ -s "$RUN_DIR/train.json" ]]; then
   ok=$(python3 - <<'PY' "$RUN_DIR/train.json"
 import json,sys
 p=sys.argv[1]
+complete=False
+blocker=None
 try:
-  d=json.load(open(p))
+    raw=open(p).read()
+    dec=json.JSONDecoder(); i=0
+    while i < len(raw):
+        while i < len(raw) and raw[i].isspace(): i+=1
+        if i>=len(raw): break
+        try:
+            o,j=dec.raw_decode(raw,i)
+            i=j
+            # handle both a bare train_status doc and arrays of objects
+            seq = o if isinstance(o, list) else [o]
+            for item in seq:
+                if isinstance(item, dict) and item.get("kind")=="train_status":
+                    complete = item.get("complete") is True
+                    blocker = item.get("blocker")
+        except Exception:
+            n=raw.find("{", i+1)
+            if n<0: break
+            i=n
 except Exception:
-  print("0"); raise SystemExit
-if isinstance(d, list):
-  d=d[-1]
-complete=d.get("complete")
-blocker=d.get("blocker")
+    pass
+if blocker is not None:
+    open(p+".blocker","w").write(str(blocker))
 print("1" if complete and not blocker else "0")
-if blocker:
-  open(p+".blocker","w").write(str(blocker))
 PY
 )
   if [[ "$ok" != "1" ]]; then
