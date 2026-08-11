@@ -12,6 +12,9 @@ import type {
   EffortSize,
   CrossRepoDep,
   CompatibilityClassification,
+  MilestoneCatalogEntry,
+  IssueMilestoneSnapshot,
+  ReconciliationManifest,
 } from "./types.ts";
 
 /**
@@ -45,9 +48,23 @@ export interface WritebackDeps {
   createPr(repoDir: string, title: string, body: string, base: string, head: string): Promise<string>;
   createLabel(repo: string, name: string, color: string): Promise<void>;
   applyLabel(repo: string, issueNumber: number, label: string): Promise<void>;
-  createMilestone(repo: string, title: string, dueOn?: string): Promise<number>;
+  createMilestone(repo: string, title: string, description?: string, dueOn?: string): Promise<number>;
   getMilestones(repo: string): Promise<Array<{ id: number; number: number; title: string }>>;
+  /**
+   * Full milestone catalog for SemVer reconciliation (state, description, issue counts).
+   * Continuous apply may leave this as a thin wrapper around getMilestones.
+   */
+  listMilestonesDetailed(repo: string): Promise<MilestoneCatalogEntry[]>;
+  /** Open issues with current milestone assignment for fingerprint + stale detection. */
+  listOpenIssueMilestoneSnapshots(repo: string): Promise<IssueMilestoneSnapshot[]>;
+  reopenMilestone(repo: string, milestoneNumber: number): Promise<void>;
+  updateMilestone(
+    repo: string,
+    milestoneNumber: number,
+    opts: { title?: string; description?: string },
+  ): Promise<void>;
   assignIssueMilestone(repo: string, issueNumber: number, milestoneTitle: string): Promise<void>;
+  clearIssueMilestone(repo: string, issueNumber: number): Promise<void>;
   closeIssue(repo: string, issueNumber: number): Promise<void>;
   addComment(repo: string, issueNumber: number, body: string): Promise<void>;
   editIssue(repo: string, issueNumber: number, opts: { title?: string; body?: string }): Promise<void>;
@@ -163,6 +180,43 @@ export function renderRoadmapMd(plan: PlanJson): string {
       lines.push(`- **Rationale:** ${m.rationale}`);
       if (m.uncertainty) {
         lines.push(`- **Note:** ${m.uncertainty}`);
+      }
+      lines.push("");
+    }
+  }
+
+  // SemVer full reconciliation summary (#910)
+  if (plan.reconciliation) {
+    const r = plan.reconciliation;
+    lines.push("---");
+    lines.push("");
+    lines.push("## SemVer milestone reconciliation");
+    lines.push("");
+    lines.push(
+      `_Identity: \`${r.identity}\` · Fingerprint: \`${r.live_state_fingerprint}\` · ` +
+        `Actions: ${r.actions.length} · Coverage blockers: ${r.coverage_blockers.length}_`,
+    );
+    lines.push("");
+    lines.push(
+      "Dry-run lists every planned create/reuse/reopen/rename/description/assign/clear-stale action. " +
+        "`--apply` executes only this reviewed manifest when the live-state fingerprint still matches. " +
+        "Theme/epic labels are secondary metadata and never satisfy the release-milestone invariant.",
+    );
+    lines.push("");
+    if (r.coverage_blockers.length > 0) {
+      lines.push("### Coverage blockers");
+      lines.push("");
+      for (const b of r.coverage_blockers) {
+        const issue = b.issue_number !== undefined ? `#${b.issue_number} ` : "";
+        lines.push(`- ${issue}**${b.reason}**: ${b.detail}`);
+      }
+      lines.push("");
+    }
+    if (r.actions.length > 0) {
+      lines.push("### Planned actions");
+      lines.push("");
+      for (const a of r.actions) {
+        lines.push(`- \`${a.kind}\` ${a.detail ?? a.id}`);
       }
       lines.push("");
     }
@@ -355,6 +409,8 @@ export async function openRoadmapPr(
 
 /**
  * Create GitHub milestones from plan.milestones[] and assign issues.
+ * Continuous / legacy title-idempotent path only.
+ * SemVer full reconciliation uses `applySemverReconciliation` in reconcile.ts (#910).
  * Idempotent: reuses existing milestones with the same title rather than
  * creating duplicates. Skipped when apply is false (dry-run).
  */
@@ -382,7 +438,7 @@ export async function applyMilestones(
   for (const spec of milestones) {
     let milestoneNumber = byTitle.get(spec.title);
     if (milestoneNumber === undefined) {
-      const newNumber = await deps.createMilestone(repo, spec.title);
+      const newNumber = await deps.createMilestone(repo, spec.title, spec.rationale);
       milestoneNumber = newNumber;
       byTitle.set(spec.title, newNumber);
       deps.log(`[roadmap] created milestone "${spec.title}" (#${milestoneNumber})`);
@@ -394,6 +450,39 @@ export async function applyMilestones(
       deps.log(`[roadmap] assigned #${issueNumber} to milestone "${spec.title}"`);
     }
   }
+}
+
+/**
+ * Log every planned SemVer reconciliation action and coverage blocker (dry-run).
+ * Does not mutate GitHub.
+ */
+export function logReconciliationPreview(
+  manifest: ReconciliationManifest,
+  deps: Pick<WritebackDeps, "log">,
+): void {
+  deps.log(
+    `\n[roadmap] SemVer reconciliation preview (identity=${manifest.identity} fingerprint=${manifest.live_state_fingerprint}):`,
+  );
+  if (manifest.coverage_blockers.length > 0) {
+    deps.log(
+      `[roadmap] coverage blockers (${manifest.coverage_blockers.length}) — apply will refuse until resolved:`,
+    );
+    for (const b of manifest.coverage_blockers) {
+      const issue = b.issue_number !== undefined ? `#${b.issue_number} ` : "";
+      deps.log(`  - ${issue}[${b.reason}] ${b.detail}`);
+    }
+  }
+  if (manifest.actions.length === 0) {
+    deps.log(`[roadmap] no reconciliation mutations required (converged or blocked only)`);
+  } else {
+    deps.log(`[roadmap] planned actions (${manifest.actions.length}):`);
+    for (const a of manifest.actions) {
+      deps.log(`  - [${a.kind}] ${a.id}${a.detail ? ` — ${a.detail}` : ""}`);
+    }
+  }
+  deps.log(
+    `[roadmap] theme/epic labels are secondary metadata only; they never satisfy the release-milestone invariant.`,
+  );
 }
 
 /**

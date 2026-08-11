@@ -732,7 +732,7 @@ const PartialConfigSchema = z.object({
         .describe("Multiplier overrides for each scoring sub-factor (default: 1.0 each)."),
       hygiene_auto_apply: z.boolean().optional().describe("When true, hygiene actions are applied automatically with --apply (default: false)."),
       pr_docs: z.boolean().optional().describe("When false, skip opening the roadmap.md PR (default: true)."),
-      release_model: z.enum(["semver", "continuous"]).optional().describe("How the roadmap groups issues into milestones: 'semver' (default) bundles issues with exclusive semver:major|minor|patch labels into version-numbered release lanes; 'continuous' groups by theme/epic for continuous delivery (no SemVer impact classification)."),
+      release_model: z.enum(["semver", "continuous"]).optional().describe("How the roadmap groups issues into milestones: 'semver' (default) builds version-numbered lanes from exclusive semver:major|minor|patch labels and dry-run/--apply perform full SemVer milestone reconciliation (create/reuse/reopen/rename/description/assign/clear-stale, fingerprint-gated, every open issue milestoned); 'continuous' groups by theme/epic for continuous delivery (title-idempotent create/assign only; no SemVer full-recon contract)."),
       release_capacity: z
         .object({
           effort_budget: z.number().positive().optional().describe("Per-milestone effort-points capacity budget for the semver model (XS=1 S=2 M=3 L=5 XL=8). An issue with effort_points ≥ budget is isolated into its own milestone. Default: 8."),

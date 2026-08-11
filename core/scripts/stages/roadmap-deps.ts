@@ -9,7 +9,16 @@ import * as path from "node:path";
 import { spawnSync } from "node:child_process";
 import { invoke } from "../harness.ts";
 import { resolveReviewerModelForHarness, reviewerModelSourceWasAuto } from "../stage-routing.ts";
-import { getOpenIssues, createMilestone, getMilestones } from "../gh.ts";
+import {
+  getOpenIssues,
+  createMilestone,
+  getMilestones,
+  listMilestonesDetailed,
+  listOpenIssueMilestoneSnapshots,
+  reopenMilestone,
+  updateMilestone,
+  clearIssueMilestone,
+} from "../gh.ts";
 import type { RoadmapDeps } from "../roadmap/index.ts";
 import type { PipelineConfig } from "../types.ts";
 import {
@@ -349,9 +358,18 @@ export function realRoadmapDeps(cfg: PipelineConfig): RoadmapDeps {
       if (r.status !== 0) throw new Error(`gh issue edit --add-label failed: ${r.stderr}`);
     },
 
-    createMilestone: (repo, title, dueOn) => createMilestone(repo, title, dueOn),
+    createMilestone: (repo, title, description, dueOn) =>
+      createMilestone(repo, title, description, dueOn),
 
     getMilestones: (repo) => getMilestones(repo),
+
+    listMilestonesDetailed: (repo) => listMilestonesDetailed(repo),
+
+    listOpenIssueMilestoneSnapshots: (repo) => listOpenIssueMilestoneSnapshots(repo),
+
+    reopenMilestone: (repo, milestoneNumber) => reopenMilestone(repo, milestoneNumber),
+
+    updateMilestone: (repo, milestoneNumber, opts) => updateMilestone(repo, milestoneNumber, opts),
 
     assignIssueMilestone: async (_repo, issueNumber, milestoneTitle) => {
       const r = spawnSync(
@@ -362,11 +380,21 @@ export function realRoadmapDeps(cfg: PipelineConfig): RoadmapDeps {
       if (r.status !== 0) throw new Error(`gh issue edit --milestone failed: ${r.stderr}`);
     },
 
+    clearIssueMilestone: (repo, issueNumber) => clearIssueMilestone(repo, issueNumber),
+
     getLatestTag: async (repoDir) => {
       const r = spawnSync("git", ["describe", "--tags", "--abbrev=0"], {
         cwd: repoDir, encoding: "utf8",
       });
       return r.status === 0 ? r.stdout.trim() : "";
+    },
+
+    listSemverTags: async (repoDir) => {
+      const r = spawnSync("git", ["tag", "--list", "v*"], {
+        cwd: repoDir, encoding: "utf8",
+      });
+      if (r.status !== 0) return [];
+      return r.stdout.split("\n").map((t) => t.trim()).filter(Boolean);
     },
 
     closeIssue: async (_repo, issueNumber) => {

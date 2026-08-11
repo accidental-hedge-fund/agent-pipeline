@@ -831,7 +831,7 @@ Nested fields:
 #### `roadmap.release_model`
 
 - **Type:** enum
-- **Description:** How the roadmap groups issues into milestones: 'semver' (default) bundles issues with exclusive semver:major|minor|patch labels into version-numbered release lanes; 'continuous' groups by theme/epic for continuous delivery (no SemVer impact classification).
+- **Description:** How the roadmap groups issues into milestones: 'semver' (default) builds version-numbered lanes from exclusive semver:major|minor|patch labels and dry-run/--apply perform full SemVer milestone reconciliation (create/reuse/reopen/rename/description/assign/clear-stale, fingerprint-gated, every open issue milestoned); 'continuous' groups by theme/epic for continuous delivery (title-idempotent create/assign only; no SemVer full-recon contract).
 
 - **Allowed values:** `semver`, `continuous`
 

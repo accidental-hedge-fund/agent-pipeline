@@ -123,7 +123,8 @@ export const COMMAND_DOCS: Record<string, CommandDoc> = {
     section: "factory",
   },
   roadmap: {
-    summary: "Analyze open backlog into a dependency-aware scored roadmap",
+    summary:
+      "Analyze open backlog into a dependency-aware scored roadmap; under SemVer, dry-run lists full milestone reconciliation actions and --apply converges open issues to the reviewed manifest (fingerprint-gated)",
     usage: "roadmap [--apply] [--next <n>]",
     documented: true,
     section: "factory",

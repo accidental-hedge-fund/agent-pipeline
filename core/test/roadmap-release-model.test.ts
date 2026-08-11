@@ -64,8 +64,9 @@ function makeInventoryItem(n: number, labels: string[] = []): InventoryItem {
 }
 
 function makeRoadmapDeps(overrides: Partial<RoadmapDeps> = {}): RoadmapDeps {
-  return {
-    getOpenIssues: async () => [makeInventoryItem(1).issue, makeInventoryItem(2).issue],
+  const defaultIssues = [makeInventoryItem(1).issue, makeInventoryItem(2).issue];
+  const base: RoadmapDeps = {
+    getOpenIssues: async () => defaultIssues,
     readFile: async () => null,
     runHarness: async () => ({ success: true, output: "[]" }),
     runCritiqueHarness: async () => ({ success: true, output: "{}" }),
@@ -79,6 +80,21 @@ function makeRoadmapDeps(overrides: Partial<RoadmapDeps> = {}): RoadmapDeps {
     applyLabel: async () => {},
     createMilestone: async () => 1,
     getMilestones: async () => [],
+    listMilestonesDetailed: async () => [],
+    listOpenIssueMilestoneSnapshots: async (repo) => {
+      const issues = await (overrides.getOpenIssues ?? base.getOpenIssues)(repo);
+      return issues.map((i) => ({
+        number: i.number,
+        state: i.state,
+        milestone_number: i.milestone?.number ?? null,
+        milestone_title: i.milestone?.title ?? null,
+        updatedAt: i.updatedAt,
+        labels: i.labels,
+      }));
+    },
+    reopenMilestone: async () => {},
+    updateMilestone: async () => {},
+    clearIssueMilestone: async () => {},
     assignIssueMilestone: async () => {},
     closeIssue: async () => {},
     addComment: async () => {},
@@ -87,9 +103,10 @@ function makeRoadmapDeps(overrides: Partial<RoadmapDeps> = {}): RoadmapDeps {
     getIssueState: async () => "open",
     getIssueComments: async () => [],
     getLatestTag: async () => "v1.6.0",
+    listSemverTags: async () => ["v1.6.0"],
     log: () => {},
-    ...overrides,
   };
+  return { ...base, ...overrides };
 }
 
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-rmm-test-"));
@@ -465,25 +482,50 @@ describe("runRoadmap: release_model dispatch", () => {
 // ---------------------------------------------------------------------------
 
 describe("runRoadmap --apply: milestone write-back", () => {
-  it("--apply calls createMilestone once per milestone entry and assigns each issue", async () => {
+  it("--apply creates SemVer milestones and assigns classified issues", async () => {
     const created: string[] = [];
     const assigned: Array<{ title: string; issue: number }> = [];
-    // Provide a roadmap with enough issues to produce at least one semver lane
+    const files = new Map<string, string>();
+    const issues = [
+      makeInventoryItem(1, ["semver:minor"]).issue,
+      makeInventoryItem(2, ["semver:patch"]).issue,
+    ];
     const deps = makeRoadmapDeps({
-      writeFile: async () => {},
+      writeFile: async (p, c) => {
+        files.set(p, c);
+      },
+      readFile: async (p) => files.get(p) ?? null,
       getLatestTag: async () => "v1.0.0",
-      createMilestone: async (_repo, title) => { created.push(title); return created.length; },
+      listSemverTags: async () => ["v1.0.0"],
+      getOpenIssues: async () => issues,
+      listOpenIssueMilestoneSnapshots: async () =>
+        issues.map((i) => ({
+          number: i.number,
+          state: i.state,
+          milestone_number: null,
+          milestone_title: null,
+          updatedAt: i.updatedAt,
+          labels: i.labels,
+        })),
+      listMilestonesDetailed: async () => [],
+      createMilestone: async (_repo, title) => {
+        created.push(title);
+        return created.length;
+      },
       getMilestones: async () => [],
       assignIssueMilestone: async (_repo, issueNumber, milestoneTitle) => {
         assigned.push({ title: milestoneTitle, issue: issueNumber });
       },
     });
+    // SemVer apply requires a prior dry-run that persists the reviewed manifest.
+    await runRoadmap("example/repo", "/repo", "main", {}, { apply: false, dryRun: true }, deps);
+    assert.ok(
+      [...files.keys()].some((k) => k.endsWith("reconciliation-manifest.json")),
+      "dry-run must persist reviewed reconciliation-manifest.json",
+    );
     await runRoadmap("example/repo", "/repo", "main", {}, { apply: true }, deps);
-    // The mock produces ~2 issues in inventory; with empty dep-graph scoring they
-    // should produce at least 1 roadmap entry → at least 1 lane → createMilestone called once
-    // (depends on scoring not blocking everything; the mock returns empty dep-graph)
-    // Just assert no error and log captures are not stale
-    // (deep coverage in writeback tests via applyMilestones unit tests)
+    assert.ok(created.length >= 1, "should create at least one SemVer milestone");
+    assert.ok(assigned.length >= 1, "should assign at least one issue");
   });
 
   it("dry-run does NOT call createMilestone or assignIssueMilestone", async () => {

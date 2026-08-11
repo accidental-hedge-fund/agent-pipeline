@@ -103,7 +103,7 @@ $pipeline improve [--apply] [--top <n>] [--json] Cluster papercuts / corrections
 $pipeline intake --description "<text>" [--release vX.Y.Z] [--dry-run] Spec a rough description into a GitHub issue and ROADMAP PR
 $pipeline queue [--max-issues <n>] [--concurrency <n>] [--budget-dollars <d>] Batch factory: dispatch all pipeline:ready issues up to concurrency/budget limits
 $pipeline refine-spec --title "<t>" --body "<b>" Refine an existing issue's spec; non-mutating JSON output
-$pipeline roadmap [--apply] [--next <n>]        Analyze open backlog into a dependency-aware scored roadmap
+$pipeline roadmap [--apply] [--next <n>]        Analyze open backlog into a dependency-aware scored roadmap; under SemVer, dry-run lists full milestone reconciliation actions and --apply converges open issues to the reviewed manifest (fingerprint-gated)
 $pipeline sweep [--apply] [--repo owner/name]   Batch re-spec thin issues and reconcile ROADMAP.md
 $pipeline triage <n> --stage ready|backlog      Set a pre-pipeline stage label (ready or backlog) on an issue
 $pipeline correction record|attribute …         Record a correction event or attribute a control (append-only local ledger)

@@ -2847,6 +2847,8 @@ export interface OpenIssue {
   url: string;
   state: "open" | "closed";
   updatedAt?: string;
+  /** Present when the API payload includes milestone (roadmap recon #910). */
+  milestone?: { number: number; title: string } | null;
 }
 
 interface GhIssueRaw {
@@ -2889,6 +2891,7 @@ export interface GhApiIssueRaw {
   updated_at?: string;
   /** Present on pull requests; absent on issues. Used to filter PRs out. */
   pull_request?: unknown;
+  milestone?: { number: number; title: string } | null;
 }
 
 /**
@@ -2904,6 +2907,11 @@ export function mapApiIssue(issue: GhApiIssueRaw): OpenIssue {
     url: issue.html_url,
     state: (issue.state?.toLowerCase() === "closed" ? "closed" : "open") as "open" | "closed",
     updatedAt: issue.updated_at,
+    milestone: issue.milestone
+      ? { number: issue.milestone.number, title: issue.milestone.title }
+      : issue.milestone === null
+        ? null
+        : undefined,
   };
 }
 
@@ -2933,6 +2941,20 @@ interface GhMilestoneRaw {
   id: number;
   number: number;
   title: string;
+  state?: string;
+  description?: string | null;
+  open_issues?: number;
+  closed_issues?: number;
+}
+
+export interface GhMilestoneDetailed {
+  id: number;
+  number: number;
+  title: string;
+  state: "open" | "closed";
+  description: string;
+  open_issues: number;
+  closed_issues: number;
 }
 
 /**
@@ -2940,12 +2962,28 @@ interface GhMilestoneRaw {
  * Uses `gh api repos/<repo>/milestones`.
  */
 export async function getMilestones(repo: string): Promise<Array<{ id: number; number: number; title: string }>> {
+  const detailed = await listMilestonesDetailed(repo);
+  return detailed.map((m) => ({ id: m.id, number: m.number, title: m.title }));
+}
+
+/**
+ * Fetch all milestones with state, description, and issue counts (#910).
+ */
+export async function listMilestonesDetailed(repo: string): Promise<GhMilestoneDetailed[]> {
   const stdout = await ghRun(["api", `repos/${repo}/milestones?state=all`, "--paginate", "--slurp"], {
     timeoutMs: 30_000,
   });
   // --slurp wraps each page array into an outer array. Flatten before mapping.
   const raw = (JSON.parse(stdout) as GhMilestoneRaw[][]).flat();
-  return raw.map((m) => ({ id: m.id, number: m.number, title: m.title }));
+  return raw.map((m) => ({
+    id: m.id,
+    number: m.number,
+    title: m.title,
+    state: (m.state?.toLowerCase() === "closed" ? "closed" : "open") as "open" | "closed",
+    description: m.description ?? "",
+    open_issues: m.open_issues ?? 0,
+    closed_issues: m.closed_issues ?? 0,
+  }));
 }
 
 /**
@@ -2954,8 +2992,23 @@ export async function getMilestones(repo: string): Promise<Array<{ id: number; n
 export async function createMilestone(
   repo: string,
   title: string,
+  descriptionOrDueOn?: string,
   dueOn?: string,
 ): Promise<number> {
+  // Back-compat: third arg was dueOn (ISO date). If it looks like a due date, treat as dueOn.
+  let description: string | undefined;
+  let due: string | undefined;
+  if (dueOn !== undefined) {
+    description = descriptionOrDueOn;
+    due = dueOn;
+  } else if (descriptionOrDueOn !== undefined) {
+    if (/^\d{4}-\d{2}-\d{2}/.test(descriptionOrDueOn)) {
+      due = descriptionOrDueOn;
+    } else {
+      description = descriptionOrDueOn;
+    }
+  }
+
   const args = [
     "api",
     `repos/${repo}/milestones`,
@@ -2964,11 +3017,85 @@ export async function createMilestone(
     "--field",
     `title=${title}`,
   ];
-  if (dueOn) args.push("--field", `due_on=${dueOn}`);
+  if (description) args.push("--field", `description=${description}`);
+  if (due) args.push("--field", `due_on=${due}`);
 
   const stdout = await ghRun(args, { timeoutMs: 30_000, retries: 1 });
   const result = JSON.parse(stdout) as { number: number };
   return result.number;
+}
+
+/**
+ * Reopen a closed milestone (#910).
+ */
+export async function reopenMilestone(repo: string, milestoneNumber: number): Promise<void> {
+  await ghRun(
+    [
+      "api",
+      `repos/${repo}/milestones/${milestoneNumber}`,
+      "--method",
+      "PATCH",
+      "--field",
+      "state=open",
+    ],
+    { timeoutMs: 30_000, retries: 1 },
+  );
+}
+
+/**
+ * Update milestone title and/or description (#910).
+ */
+export async function updateMilestone(
+  repo: string,
+  milestoneNumber: number,
+  opts: { title?: string; description?: string },
+): Promise<void> {
+  const args = [
+    "api",
+    `repos/${repo}/milestones/${milestoneNumber}`,
+    "--method",
+    "PATCH",
+  ];
+  if (opts.title !== undefined) args.push("--field", `title=${opts.title}`);
+  if (opts.description !== undefined) args.push("--field", `description=${opts.description}`);
+  if (opts.title === undefined && opts.description === undefined) return;
+  await ghRun(args, { timeoutMs: 30_000, retries: 1 });
+}
+
+/**
+ * Clear an issue's milestone assignment (#910).
+ */
+export async function clearIssueMilestone(repo: string, issueNumber: number): Promise<void> {
+  await ghRun(
+    ["issue", "edit", String(issueNumber), "--remove-milestone", "-R", repo],
+    { timeoutMs: 30_000, retries: 1 },
+  );
+}
+
+/**
+ * Open-issue snapshots with milestone fields for reconciliation fingerprinting (#910).
+ */
+export async function listOpenIssueMilestoneSnapshots(
+  repo: string,
+): Promise<
+  Array<{
+    number: number;
+    state: "open" | "closed";
+    milestone_number: number | null;
+    milestone_title: string | null;
+    updatedAt?: string;
+    labels: string[];
+  }>
+> {
+  const issues = await getOpenIssues(repo);
+  return issues.map((i) => ({
+    number: i.number,
+    state: i.state,
+    milestone_number: i.milestone?.number ?? null,
+    milestone_title: i.milestone?.title ?? null,
+    updatedAt: i.updatedAt,
+    labels: i.labels,
+  }));
 }
 
 /**

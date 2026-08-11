@@ -34,8 +34,20 @@ import {
   openRoadmapPr,
   applyHygiene,
   applyMilestones,
+  logReconciliationPreview,
 } from "./writeback.ts";
 import type { WritebackDeps } from "./writeback.ts";
+import {
+  buildReconciliationManifest,
+  loadLiveState,
+  applySemverReconciliation,
+  parseShippedSemverTitles,
+  saveReviewedManifest,
+  loadReviewedManifest,
+  loadProgress,
+  validateSemverApplyReady,
+} from "./reconcile.ts";
+import type { ReconciliationManifest } from "./types.ts";
 import { ROADMAP_ARTIFACT, artifactSubdir } from "../artifact-ignore.ts";
 
 export interface RoadmapOpts {
@@ -46,6 +58,11 @@ export interface RoadmapOpts {
   /** Cross-repo dependency map from config.repo_map. When set and non-empty,
    *  the engine gathers cross-repo annotations after the depgraph phase. */
   repoMap?: { depends_on: string[]; depended_on_by: string[] };
+  /**
+   * When applying SemVer reconciliation, require this reviewed manifest identity
+   * (from a prior dry-run plan.json). Mismatch refuses apply (#910).
+   */
+  expectedReconciliationIdentity?: string;
 }
 
 export interface RoadmapDeps extends InventoryDeps, DepgraphDeps, WritebackDeps {
@@ -53,6 +70,12 @@ export interface RoadmapDeps extends InventoryDeps, DepgraphDeps, WritebackDeps 
   runCritiqueHarness(prompt: string): Promise<{ success: boolean; output: string }>;
   /** Return the latest git tag (e.g. "v1.6.0") or "" if no tags exist. */
   getLatestTag(repoDir: string): Promise<string>;
+  /**
+   * List shipped SemVer-like tags (e.g. `git tag --list 'v*'`).
+   * Used to classify closed shipped milestones as immutable (#910).
+   * Defaults to wrapping getLatestTag when absent.
+   */
+  listSemverTags?(repoDir: string): Promise<string[]>;
   /** Injectable clock for phase timing; defaults to Date.now. */
   now?: () => number;
 }
@@ -142,14 +165,16 @@ function recommendFromTypeLabels(labelsLower: string[]): CompatibilityRecommenda
  * Title and body text never set, upgrade, or downgrade applied impact.
  * `entry` is accepted for call-site stability; applied class does not use tier/score.
  */
-export function classifyCompatibilityImpact(
-  entry: RoadmapEntry,
-  item: InventoryItem,
+/**
+ * Classify applied SemVer impact from explicit labels only (no inventory item).
+ * Used for open issues present in the full repository snapshot but absent from
+ * filtered inventory so coverage blockers still reflect label state.
+ */
+export function classifyCompatibilityFromLabels(
+  issueNumber: number,
+  labels: string[],
 ): CompatibilityClassification {
-  void entry;
-  const issueNumber = item.issue.number;
-  const labelsLower = item.issue.labels.map((l) => l.toLowerCase());
-
+  const labelsLower = labels.map((l) => l.toLowerCase());
   const presentExplicit = EXPLICIT_SEMVER_LABELS.filter((name) => labelsLower.includes(name));
 
   if (presentExplicit.length >= 2) {
@@ -183,6 +208,14 @@ export function classifyCompatibilityImpact(
     uncertain: true,
     ...(recommendation !== undefined ? { recommendation } : {}),
   };
+}
+
+export function classifyCompatibilityImpact(
+  entry: RoadmapEntry,
+  item: InventoryItem,
+): CompatibilityClassification {
+  void entry;
+  return classifyCompatibilityFromLabels(item.issue.number, item.issue.labels);
 }
 
 /**
@@ -1005,6 +1038,10 @@ export async function runRoadmap(
   let milestones: MilestoneSpec[];
   let continuousVersionMarker: string | undefined;
   let compatibilityClassifications: CompatibilityClassification[] | undefined;
+  let reconciliation: ReconciliationManifest | undefined;
+  let reconcileLive:
+    | Awaited<ReturnType<typeof loadLiveState>>
+    | undefined;
 
   if (releaseModel === "continuous") {
     milestones = buildContinuousGroups(roadmap, items);
@@ -1017,13 +1054,20 @@ export async function runRoadmap(
     const latestTag = await deps.getLatestTag(repoDir);
     const blockedSet = new Set(depGraph.blocked_pending_decision);
     compatibilityClassifications = buildCompatibilityClassifications(roadmap, items);
+    // Full recon applies the milestoned invariant to every open issue in scope,
+    // including dependency-blocked issues (design Decision 2). Pack lanes without
+    // excluding blocked issues so every resolved open issue is manifested.
+    // Full recon requires every open issue in scope to be manifested. Include
+    // dependency-blocked issues in lane packing so they receive a SemVer milestone
+    // (design Decision 2). Unresolved classifications remain coverage blockers.
     milestones = buildSemverLanes(
       roadmap,
       latestTag,
       items,
       config.release_capacity,
-      blockedSet,
+      new Set(),
     );
+    void blockedSet;
     deps.log(
       `[roadmap] semver model: ${milestones.length} lane(s) (latest tag: ${latestTag || "(none)"}); ` +
         `${compatibilityClassifications.filter((c) => c.status === "resolved").length} resolved / ` +
@@ -1052,6 +1096,47 @@ export async function runRoadmap(
         });
       }
     }
+
+    // Full SemVer reconciliation manifest (#910).
+    // Coverage + fingerprint use the full repository open-issue snapshot — not
+    // inventory-filtered items — so newly opened or filter-excluded issues still
+    // block incomplete manifests (b2694882).
+    const tagList =
+      deps.listSemverTags !== undefined
+        ? await deps.listSemverTags(repoDir)
+        : latestTag
+          ? [latestTag]
+          : [];
+    const shipped = parseShippedSemverTitles(tagList);
+    reconcileLive = await loadLiveState(repo, shipped, deps);
+    const openIssueNumbers = reconcileLive.openIssues
+      .filter((i) => i.state === "open")
+      .map((i) => i.number);
+    // Classify open issues outside inventory from snapshot labels so coverage
+    // blockers reflect true applied impact (or unresolved missing).
+    const classByIssue = new Map(
+      compatibilityClassifications.map((c) => [c.issue_number, c]),
+    );
+    const reconClassifications = [...compatibilityClassifications];
+    for (const issue of reconcileLive.openIssues) {
+      if (issue.state !== "open" || classByIssue.has(issue.number)) continue;
+      reconClassifications.push(
+        classifyCompatibilityFromLabels(issue.number, issue.labels ?? []),
+      );
+    }
+    reconciliation = buildReconciliationManifest({
+      milestones,
+      classifications: reconClassifications,
+      openIssueNumbers,
+      live: reconcileLive,
+      generatedAt: now,
+    });
+    deps.log(
+      `[roadmap] reconciliation: identity=${reconciliation.identity} ` +
+        `fingerprint=${reconciliation.live_state_fingerprint} ` +
+        `actions=${reconciliation.actions.length} blockers=${reconciliation.coverage_blockers.length} ` +
+        `open_issues=${openIssueNumbers.length}`,
+    );
   }
 
   // Build final plan.json.
@@ -1070,6 +1155,7 @@ export async function runRoadmap(
     ...(compatibilityClassifications !== undefined
       ? { compatibility_classifications: compatibilityClassifications }
       : {}),
+    ...(reconciliation !== undefined ? { reconciliation } : {}),
     ...(continuousVersionMarker !== undefined ? { continuous_version_marker: continuousVersionMarker } : {}),
     run_stats: runStats,
   };
@@ -1098,21 +1184,97 @@ export async function runRoadmap(
         deps.log(`  - #${h.issue_number}: ${h.action}`);
       }
     }
-    if (plan.milestones.length > 0) {
-      deps.log(`\n[roadmap] dry-run: ${plan.milestones.length} milestone(s) (not applied):`);
-      for (const m of plan.milestones) {
-        deps.log(
-          `  - "${m.title}" (version_impact=${m.version_impact ?? "n/a"}): ${m.issue_numbers.join(", ")}`,
-        );
+    if (releaseModel === "continuous") {
+      if (plan.milestones.length > 0) {
+        deps.log(`\n[roadmap] dry-run: ${plan.milestones.length} milestone(s) (not applied):`);
+        for (const m of plan.milestones) {
+          deps.log(
+            `  - "${m.title}" (version_impact=${m.version_impact ?? "n/a"}): ${m.issue_numbers.join(", ")}`,
+          );
+        }
       }
+    } else if (plan.reconciliation) {
+      // Persist the exact reviewed preview artifact for --apply (finding c33d6a3c).
+      await saveReviewedManifest(outputDir, plan.reconciliation, deps);
+      logReconciliationPreview(plan.reconciliation, deps);
+      deps.log(
+        `[roadmap] reviewed reconciliation manifest saved for --apply ` +
+          `(identity=${plan.reconciliation.identity})`,
+      );
     }
     deps.log(`\n[roadmap] dry-run complete. Run with --apply to execute GitHub write-backs.`);
     return;
   }
 
-  deps.log(`\n[roadmap] apply preview: milestones and classifications above will be written.`);
-  await applyHygiene(plan.hygiene, repo, { apply: true }, deps);
-  await applyMilestones(plan.milestones, repo, true, deps);
+  deps.log(`\n[roadmap] apply: executing GitHub write-backs...`);
+
+  if (releaseModel === "continuous") {
+    await applyHygiene(plan.hygiene, repo, { apply: true }, deps);
+    // Continuous keeps title-idempotent create/reuse/assign only (#910 non-goal).
+    await applyMilestones(plan.milestones, repo, true, deps);
+  } else {
+    // SemVer: load the exact reviewed preview manifest; never apply a freshly
+    // regenerated action list (finding c33d6a3c).
+    const reviewed = await loadReviewedManifest(outputDir, deps);
+    if (!reviewed) {
+      const msg =
+        "No reviewed reconciliation manifest found; run a dry-run preview first " +
+        "so --apply can execute the exact reviewed artifact";
+      deps.log(`[roadmap] SemVer reconciliation apply refused: ${msg}`);
+      throw new Error(`SemVer reconciliation apply refused: ${msg}`);
+    }
+    const expectedIdentity =
+      opts.expectedReconciliationIdentity ?? reviewed.identity;
+    if (plan.reconciliation && plan.reconciliation.identity !== reviewed.identity) {
+      const msg =
+        `Plan identity ${plan.reconciliation.identity} differs from reviewed preview ` +
+        `${reviewed.identity}; run a new dry-run preview before apply`;
+      deps.log(`[roadmap] SemVer reconciliation apply refused: ${msg}`);
+      throw new Error(`SemVer reconciliation apply refused: ${msg}`);
+    }
+
+    // Refresh live state before any write-back; gate fingerprint/coverage first
+    // so hygiene cannot mutate on a stale or blocked reconciliation (8420b97a).
+    // Full open-issue snapshot (no inventory scope filter) — b2694882.
+    const tagList =
+      deps.listSemverTags !== undefined
+        ? await deps.listSemverTags(repoDir)
+        : (await deps.getLatestTag(repoDir))
+          ? [await deps.getLatestTag(repoDir)]
+          : [];
+    const shippedTitles = parseShippedSemverTitles(tagList);
+    const freshLive = await loadLiveState(repo, shippedTitles, deps);
+    const existingProgress = await loadProgress(outputDir, deps);
+    const gate = validateSemverApplyReady(reviewed, freshLive, {
+      expectedIdentity,
+      resumeProgress: existingProgress,
+    });
+    if (!gate.ok) {
+      deps.log(`[roadmap] SemVer reconciliation apply refused: ${gate.reason}`);
+      throw new Error(`SemVer reconciliation apply refused: ${gate.reason}`);
+    }
+
+    // Hygiene only after the stale-preview gate (8420b97a). Then refresh live so
+    // apply-start / resume fingerprints seed post-hygiene timestamps (bcdee39b).
+    await applyHygiene(plan.hygiene, repo, { apply: true }, deps);
+    const postHygieneLive = await loadLiveState(repo, shippedTitles, deps);
+
+    const result = await applySemverReconciliation(
+      reviewed,
+      repo,
+      outputDir,
+      deps,
+      {
+        live: postHygieneLive,
+        expectedIdentity,
+        gatesAlreadyChecked: true,
+      },
+    );
+    if (!result.ok) {
+      deps.log(`[roadmap] SemVer reconciliation apply refused: ${result.reason}`);
+      throw new Error(`SemVer reconciliation apply refused: ${result.reason}`);
+    }
+  }
 
   if (config.pr_docs !== false) {
     await openRoadmapPr(plan, repoDir, baseBranch, deps);
