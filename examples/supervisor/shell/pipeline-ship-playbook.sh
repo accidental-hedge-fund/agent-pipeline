@@ -49,6 +49,7 @@ SHIP_NOTIFY_HEARTBEAT_S="${SHIP_NOTIFY_HEARTBEAT_S:-0}"
 SHIP_STAGE_WATCH_BIN="${SHIP_STAGE_WATCH_BIN:-$SCRIPT_DIR/ship-stage-watch.sh}"
 # Pure helper: last train_status from mixed prose+JSON capture (completion gate + resume)
 TRAIN_STATUS_COMPLETE_BIN="${TRAIN_STATUS_COMPLETE_BIN:-$SCRIPT_DIR/train-status-complete.py}"
+RELEASE_CHECKS_GREEN_BIN="${RELEASE_CHECKS_GREEN_BIN:-$SCRIPT_DIR/release-checks-green.py}"
 _HEARTBEAT_PID=""
 
 ship_notify() {
@@ -614,6 +615,46 @@ fi
 log "phase release-prepare: pr=$pr"
 write_state "release-prepare" "ok" "pr=$pr"
 echo "$pr" >"$RUN_DIR/release.pr"
+
+# C0: wait for the release PR's checks to go green before release-finish.
+# `pipeline release finish` refuses to merge while observable checks are
+# pending/failing ("No required checks configured, but observable checks are
+# not green"). The release PR is opened moments before this phase, so without
+# this wait the ship races CI and fails release-finish with exit 1. Poll until
+# green (or a hard fail), then proceed.
+log "phase release-finish: waiting for PR #$pr checks to go green"
+checks_green=0
+for i in $(seq 1 "$RELEASE_WAIT_ATTEMPTS"); do
+  set +e
+  gh pr checks "$pr" --json name,state,conclusion >"$RUN_DIR/release-checks.json" 2>"$RUN_DIR/release-checks.err"
+  cec=$?
+  set -e
+  if [[ "$cec" -ne 0 ]]; then
+    # gh may not see the just-created PR's checks yet; retry without failing.
+    log "phase release-finish: gh pr checks not available yet (attempt $i); retrying"
+    sleep "$RELEASE_WAIT_SLEEP_S"
+    continue
+  fi
+  green=$(python3 "$RELEASE_CHECKS_GREEN_BIN" "$RUN_DIR/release-checks.json")
+  if [[ "$green" == "1" ]]; then
+    log "phase release-finish: PR #$pr checks green (attempt $i)"
+    checks_green=1
+    break
+  elif [[ "$green" == "-1" ]]; then
+    log "phase release-finish: PR #$pr checks FAILED (attempt $i)"
+    write_state "release-finish" "failed" "PR #$pr checks failed"
+    log "FAIL: release PR #$pr checks failed"
+    exit 1
+  else
+    log "phase release-finish: PR #$pr checks not green yet (attempt $i); waiting"
+    sleep "$RELEASE_WAIT_SLEEP_S"
+  fi
+done
+if [[ "$checks_green" -ne 1 ]]; then
+  write_state "release-finish" "failed" "PR #$pr checks not green within wait budget"
+  log "FAIL: release PR #$pr checks not green in time"
+  exit 1
+fi
 
 # C: release finish
 write_state "release-finish" "running" "pipeline release finish $pr --json"
