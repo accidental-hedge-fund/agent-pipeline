@@ -1479,6 +1479,7 @@ function makeGhMetrics(overrides: Partial<GhMetricsSummary> = {}): GhMetricsSumm
       { category: "issue view", elapsed_ms: 30 },
       { category: "label add", elapsed_ms: 20 },
     ],
+    by_wrapper: { getPrDetail: 2, getPrChecks: 1 },
     ...overrides,
   };
 }
@@ -1498,7 +1499,31 @@ test("emitGhMetrics: appends a correctly structured gh_metrics_summary event lin
   assert.equal(event.p50_ms, 50);
   assert.equal(event.p95_ms, 100);
   assert.equal(event.slowest_calls.length, 3);
+  assert.deepEqual(event.by_wrapper, { getPrDetail: 2, getPrChecks: 1 });
   assert.ok(typeof event.at === "string" && event.at.length > 0, "must have an at timestamp");
+});
+
+test("emitGhMetrics: by_wrapper keys are wrapper identifiers only (no raw args) (#839)", async () => {
+  const { deps, readFile } = memRunStore();
+  // Simulates a run that tagged getPrDetail while the underlying gh args included
+  // a PR body / user content — by_wrapper must still only hold the stable name.
+  await emitGhMetrics(
+    RUN_DIR,
+    makeGhMetrics({
+      call_count: 1,
+      total_ms: 10,
+      p50_ms: 10,
+      p95_ms: 10,
+      slowest_calls: [{ category: "pr view", elapsed_ms: 10 }],
+      by_wrapper: { getPrDetail: 1 },
+    }),
+    deps,
+  );
+  const event = JSON.parse(readFile(EVENTS_JSONL).trim());
+  assert.deepEqual(Object.keys(event.by_wrapper), ["getPrDetail"]);
+  const serialized = JSON.stringify(event);
+  assert.ok(!serialized.includes("--body"), "event must not embed raw gh flag/body content");
+  assert.ok(!serialized.includes("gh "), "event must not embed raw arg lists");
 });
 
 test("emitGhMetrics: I/O error from appendFile is caught and does not propagate", async () => {
@@ -1536,12 +1561,17 @@ test("emitGhMetrics: event contains schema_version: 1 and no raw arg values", as
 test("emitGhMetrics: zero-call summary emits event with call_count: 0 and empty slowest_calls", async () => {
   const { deps, readFile } = memRunStore();
 
-  await emitGhMetrics(RUN_DIR, makeGhMetrics({ call_count: 0, total_ms: 0, p50_ms: 0, p95_ms: 0, slowest_calls: [] }), deps);
+  await emitGhMetrics(
+    RUN_DIR,
+    makeGhMetrics({ call_count: 0, total_ms: 0, p50_ms: 0, p95_ms: 0, slowest_calls: [], by_wrapper: {} }),
+    deps,
+  );
 
   const event = JSON.parse(readFile(EVENTS_JSONL).trim());
   assert.equal(event.call_count, 0);
   assert.equal(event.total_ms, 0);
   assert.deepEqual(event.slowest_calls, []);
+  assert.deepEqual(event.by_wrapper, {});
 });
 
 // ---------------------------------------------------------------------------

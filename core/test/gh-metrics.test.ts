@@ -1,9 +1,15 @@
-// Unit tests for GhMetricsCollector (#257).
+// Unit tests for GhMetricsCollector (#257) and by_wrapper breakdown (#839).
 // No real gh subprocess calls — all I/O is mocked or purely in-memory.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { GhMetricsCollector } from "../scripts/gh.ts";
+import {
+  GhMetricsCollector,
+  getPrChecks,
+  getPrDetail,
+  type GhSubprocessRunner,
+} from "../scripts/gh.ts";
+import type { PipelineConfig } from "../scripts/types.ts";
 
 // ---------------------------------------------------------------------------
 // call_count and total_ms
@@ -36,6 +42,7 @@ test("GhMetricsCollector: summary() with zero records returns all-zero values", 
   assert.equal(s.p50_ms, 0);
   assert.equal(s.p95_ms, 0);
   assert.deepEqual(s.slowest_calls, []);
+  assert.deepEqual(s.by_wrapper, {});
 });
 
 // ---------------------------------------------------------------------------
@@ -140,4 +147,90 @@ test("GhMetricsCollector: summary() returns consistent data across multiple call
   const s1 = c.summary();
   const s2 = c.summary();
   assert.deepEqual(s1, s2, "summary() must be deterministic across repeated calls");
+});
+
+// ---------------------------------------------------------------------------
+// by_wrapper breakdown (#839)
+// ---------------------------------------------------------------------------
+
+test("GhMetricsCollector: two wrappers accumulate independent by_wrapper counts (#839)", () => {
+  const c = new GhMetricsCollector();
+  c.record("pr view", 10, "getPrDetail");
+  c.record("pr view", 20, "getPrDetail");
+  c.record("pr checks", 30, "getPrChecks");
+  const s = c.summary();
+  assert.equal(s.call_count, 3);
+  assert.equal(s.by_wrapper.getPrDetail, 2);
+  assert.equal(s.by_wrapper.getPrChecks, 1);
+});
+
+test("GhMetricsCollector: missing wrapper name does not invent a key from category/args (#839)", () => {
+  const c = new GhMetricsCollector();
+  c.record("pr view", 40);
+  const s = c.summary();
+  assert.equal(s.call_count, 1, "untagged call still counts in aggregates");
+  assert.equal(s.total_ms, 40);
+  assert.deepEqual(s.by_wrapper, {}, "by_wrapper must not synthesize keys from category");
+  assert.ok(!("pr view" in s.by_wrapper));
+});
+
+test("GhMetricsCollector: untagged calls still count in aggregates alongside tagged (#839)", () => {
+  const c = new GhMetricsCollector();
+  c.record("pr view", 10, "getPrDetail");
+  c.record("api graphql", 50); // untagged
+  c.record("pr checks", 20, "getPrChecks");
+  const s = c.summary();
+  assert.equal(s.call_count, 3);
+  assert.equal(s.total_ms, 80);
+  assert.equal(s.by_wrapper.getPrDetail, 1);
+  assert.equal(s.by_wrapper.getPrChecks, 1);
+  assert.equal(Object.keys(s.by_wrapper).length, 2);
+});
+
+test("GhMetricsCollector: empty wrapper string is omitted from by_wrapper (#839)", () => {
+  const c = new GhMetricsCollector();
+  c.record("pr view", 10, "");
+  const s = c.summary();
+  assert.equal(s.call_count, 1);
+  assert.deepEqual(s.by_wrapper, {});
+});
+
+const FAKE_CFG = { repo: "acme/test" } as unknown as PipelineConfig;
+
+test("getPrDetail tags its call as getPrDetail when collector is active (#839)", async () => {
+  const collector = new GhMetricsCollector();
+  const runner: GhSubprocessRunner = async () => ({
+    stdout: JSON.stringify({
+      number: 42,
+      title: "t",
+      body: "",
+      state: "OPEN",
+      url: "https://example.invalid/pr/42",
+      headRefName: "head",
+      headRefOid: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      baseRefName: "main",
+      mergeable: "MERGEABLE",
+      mergeStateStatus: "CLEAN",
+      isDraft: false,
+      additions: 1,
+      deletions: 0,
+      changedFiles: 1,
+      mergeCommit: null,
+    }),
+  });
+  await getPrDetail(FAKE_CFG, 42, { runner, collector, retries: 1 });
+  const s = collector.summary();
+  assert.equal(s.by_wrapper.getPrDetail, 1);
+  assert.equal(s.call_count, 1);
+});
+
+test("getPrChecks tags its call as getPrChecks when collector is active (#839)", async () => {
+  const collector = new GhMetricsCollector();
+  const runner: GhSubprocessRunner = async () => ({
+    stdout: JSON.stringify([{ name: "ci", state: "SUCCESS", bucket: "pass" }]),
+  });
+  await getPrChecks(FAKE_CFG, 42, { runner, collector, retries: 1 });
+  const s = collector.summary();
+  assert.equal(s.by_wrapper.getPrChecks, 1);
+  assert.equal(s.call_count, 1);
 });

@@ -235,6 +235,8 @@ export interface GhMetricsSummaryEvent extends RunEventBase {
   p50_ms: number;
   p95_ms: number;
   slowest_calls: { category: string; elapsed_ms: number }[];
+  /** Per-run call counts by typed wrapper name (#839). Untagged calls omitted. */
+  by_wrapper: Record<string, number>;
 }
 export interface StageAccountingEvent extends RunEventBase, StageAccountingRecord {
   type: "stage_accounting";
@@ -1223,6 +1225,7 @@ export async function emitGhMetrics(
     p50_ms: summary.p50_ms,
     p95_ms: summary.p95_ms,
     slowest_calls: summary.slowest_calls,
+    by_wrapper: summary.by_wrapper ?? {},
   };
   try {
     await appendEvent(runDir, event, deps);

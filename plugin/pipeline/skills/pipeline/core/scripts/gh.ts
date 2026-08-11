@@ -40,6 +40,11 @@ export interface GhMetricsSummary {
   p50_ms: number;
   p95_ms: number;
   slowest_calls: { category: string; elapsed_ms: number }[];
+  /**
+   * Per-run call counts keyed by stable typed-wrapper name (e.g. `getPrDetail`).
+   * Untagged records contribute to aggregates only and are omitted here (#839).
+   */
+  by_wrapper: Record<string, number>;
 }
 
 /** Interpolated percentile over a sorted sample (linear interpolation). Returns 0 for empty. */
@@ -57,18 +62,38 @@ function computePercentile(sorted: number[], p: number): number {
 export class GhMetricsCollector {
   private times: number[] = [];
   private _slowest: { category: string; elapsed_ms: number }[] = [];
+  private _byWrapper = new Map<string, number>();
 
-  record(category: string, elapsedMs: number): void {
+  /**
+   * Record one completed `gh` invocation.
+   * @param category CLI category (first two `gh` args) — used by `slowest_calls`.
+   * @param elapsedMs wall time for the attempt.
+   * @param wrapperName optional stable typed-helper name (e.g. `getPrChecks`);
+   *   never derived from raw args. Empty/undefined → aggregates only, not `by_wrapper`.
+   */
+  record(category: string, elapsedMs: number, wrapperName?: string): void {
     this.times.push(elapsedMs);
     this._slowest.push({ category, elapsed_ms: elapsedMs });
     this._slowest.sort((a, b) => b.elapsed_ms - a.elapsed_ms);
     if (this._slowest.length > 5) this._slowest.length = 5;
+    if (wrapperName) {
+      this._byWrapper.set(wrapperName, (this._byWrapper.get(wrapperName) ?? 0) + 1);
+    }
   }
 
   summary(): GhMetricsSummary {
+    const by_wrapper: Record<string, number> = {};
+    for (const [k, v] of this._byWrapper) by_wrapper[k] = v;
     const n = this.times.length;
     if (n === 0) {
-      return { call_count: 0, total_ms: 0, p50_ms: 0, p95_ms: 0, slowest_calls: [] };
+      return {
+        call_count: 0,
+        total_ms: 0,
+        p50_ms: 0,
+        p95_ms: 0,
+        slowest_calls: [],
+        by_wrapper,
+      };
     }
     const total_ms = this.times.reduce((a, b) => a + b, 0);
     const sorted = [...this.times].sort((a, b) => a - b);
@@ -78,6 +103,7 @@ export class GhMetricsCollector {
       p50_ms: Math.floor(computePercentile(sorted, 50)),
       p95_ms: Math.floor(computePercentile(sorted, 95)),
       slowest_calls: [...this._slowest],
+      by_wrapper,
     };
   }
 }
@@ -266,6 +292,11 @@ export interface GhRunOptions {
   isTransient?: (stderr: string) => boolean;
   /** Injectable subprocess runner — replaces execFileAsync in unit tests. */
   runner?: GhSubprocessRunner;
+  /**
+   * Stable typed-wrapper name for `GhMetricsCollector` `by_wrapper` breakdown
+   * (e.g. `getPrDetail`). Must be a fixed code identifier — never raw args (#839).
+   */
+  wrapperName?: string;
 }
 
 /**
@@ -299,15 +330,16 @@ async function ghRun(args: string[], opts: GhRunOptions = {}): Promise<string> {
     })
   );
   const category = args.slice(0, 2).join(" ");
+  const wrapperName = opts.wrapperName;
   let lastErr: Error | null = null;
   for (let attempt = 0; attempt < retries; attempt++) {
     const t0 = performance.now();
     try {
       const { stdout } = await _runner(args);
-      collector?.record(category, Math.round(performance.now() - t0));
+      collector?.record(category, Math.round(performance.now() - t0), wrapperName);
       return stdout;
     } catch (err) {
-      collector?.record(category, Math.round(performance.now() - t0));
+      collector?.record(category, Math.round(performance.now() - t0), wrapperName);
       const e = err as GhSubprocessError;
       const combinedStderr = (e.stderr ?? "").toString() || e.message;
       lastErr = new Error(
@@ -338,16 +370,20 @@ export async function ghRunForTest(args: string[], opts: GhRunOptions): Promise<
 export async function getIssueDetail(
   cfg: PipelineConfig,
   issueNumber: number,
+  opts?: GhRunOptions,
 ): Promise<ItemDetail & { comments: { author: string; body: string; createdAt: string }[] }> {
-  const stdout = await ghRun([
-    "issue",
-    "view",
-    String(issueNumber),
-    "--json",
-    "number,title,body,labels,comments,state,url",
-    "-R",
-    cfg.repo,
-  ]);
+  const stdout = await ghRun(
+    [
+      "issue",
+      "view",
+      String(issueNumber),
+      "--json",
+      "number,title,body,labels,comments,state,url",
+      "-R",
+      cfg.repo,
+    ],
+    { ...opts, wrapperName: "getIssueDetail" },
+  );
   const data = JSON.parse(stdout) as {
     number: number;
     title: string;
@@ -389,7 +425,7 @@ export type GhApiRunner = (args: string[]) => Promise<string>;
 export async function getIssueLabelEvents(
   cfg: PipelineConfig,
   issueNumber: number,
-  run: GhApiRunner = (args) => ghRun(args),
+  run: GhApiRunner = (args) => ghRun(args, { wrapperName: "getIssueLabelEvents" }),
 ): Promise<{ label: string; createdAt: string }[]> {
   const [owner, repo] = cfg.repo.split("/");
   const stdout = await run([
@@ -422,15 +458,18 @@ export async function getIssueStateAndLabels(
   issueNumber: number,
 ): Promise<{ state: "open" | "closed"; labels: string[] } | null> {
   try {
-    const stdout = await ghRun([
-      "issue",
-      "view",
-      String(issueNumber),
-      "--json",
-      "state,labels",
-      "-R",
-      cfg.repo,
-    ]);
+    const stdout = await ghRun(
+      [
+        "issue",
+        "view",
+        String(issueNumber),
+        "--json",
+        "state,labels",
+        "-R",
+        cfg.repo,
+      ],
+      { wrapperName: "getIssueStateAndLabels" },
+    );
     const data = JSON.parse(stdout) as {
       state: string;
       labels: { name: string }[];
@@ -457,15 +496,18 @@ export async function getIssueCloseState(
   issueNumber: number,
 ): Promise<{ state: "open" | "closed"; stateReason: "completed" | "not_planned" | "reopened" | null } | null> {
   try {
-    const stdout = await ghRun([
-      "issue",
-      "view",
-      String(issueNumber),
-      "--json",
-      "state,stateReason",
-      "-R",
-      cfg.repo,
-    ]);
+    const stdout = await ghRun(
+      [
+        "issue",
+        "view",
+        String(issueNumber),
+        "--json",
+        "state,stateReason",
+        "-R",
+        cfg.repo,
+      ],
+      { wrapperName: "getIssueCloseState" },
+    );
     const data = JSON.parse(stdout) as { state: string; stateReason: string | null };
     const state = data.state.toUpperCase() === "CLOSED" ? "closed" : "open";
     const stateReason =
@@ -487,12 +529,15 @@ export async function getItemKind(
   cfg: PipelineConfig,
   number: number,
 ): Promise<"issue" | "pull_request"> {
-  const stdout = await ghRun([
-    "api",
-    `/repos/${cfg.repo}/issues/${number}`,
-    "--jq",
-    "if .pull_request then \"pull_request\" else \"issue\" end",
-  ]);
+  const stdout = await ghRun(
+    [
+      "api",
+      `/repos/${cfg.repo}/issues/${number}`,
+      "--jq",
+      "if .pull_request then \"pull_request\" else \"issue\" end",
+    ],
+    { wrapperName: "getItemKind" },
+  );
   const trimmed = stdout.trim();
   return trimmed === "pull_request" ? "pull_request" : "issue";
 }
@@ -503,15 +548,18 @@ export async function getPrLinkedIssue(
   prNumber: number,
 ): Promise<number | null> {
   try {
-    const stdout = await ghRun([
-      "pr",
-      "view",
-      String(prNumber),
-      "--json",
-      "closingIssuesReferences",
-      "-R",
-      cfg.repo,
-    ]);
+    const stdout = await ghRun(
+      [
+        "pr",
+        "view",
+        String(prNumber),
+        "--json",
+        "closingIssuesReferences",
+        "-R",
+        cfg.repo,
+      ],
+      { wrapperName: "getPrLinkedIssue" },
+    );
     const data = JSON.parse(stdout) as {
       closingIssuesReferences?: { number: number }[];
     };
@@ -522,16 +570,23 @@ export async function getPrLinkedIssue(
   }
 }
 
-export async function getPrDetail(cfg: PipelineConfig, prNumber: number): Promise<PrDetail> {
-  const stdout = await ghRun([
-    "pr",
-    "view",
-    String(prNumber),
-    "--json",
-    "number,title,body,state,url,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,isDraft,additions,deletions,changedFiles,mergeCommit",
-    "-R",
-    cfg.repo,
-  ]);
+export async function getPrDetail(
+  cfg: PipelineConfig,
+  prNumber: number,
+  opts?: GhRunOptions,
+): Promise<PrDetail> {
+  const stdout = await ghRun(
+    [
+      "pr",
+      "view",
+      String(prNumber),
+      "--json",
+      "number,title,body,state,url,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,isDraft,additions,deletions,changedFiles,mergeCommit",
+      "-R",
+      cfg.repo,
+    ],
+    { ...opts, wrapperName: "getPrDetail" },
+  );
   const data = JSON.parse(stdout) as {
     number: number;
     title: string;
@@ -600,7 +655,7 @@ export async function getPrChecks(
         "-R",
         cfg.repo,
       ],
-      opts,
+      { ...opts, wrapperName: "getPrChecks" },
     );
     return JSON.parse(stdout) as CheckRun[];
   } catch (err) {
@@ -615,7 +670,7 @@ export async function getPrChecks(
 export async function getPrDiff(cfg: PipelineConfig, prNumber: number): Promise<string> {
   const stdout = await ghRun(
     ["pr", "diff", String(prNumber), "-R", cfg.repo],
-    { timeoutMs: 60_000 },
+    { timeoutMs: 60_000, wrapperName: "getPrDiff" },
   );
   return stdout;
 }
@@ -717,7 +772,7 @@ export async function listPrHeadChangeDirs(
   try {
     stdout = await ghRun(
       ["api", `repos/${cfg.repo}/contents/openspec/changes?ref=${refQ}`],
-      { retries: 1 },
+      { retries: 1, wrapperName: "listPrHeadChangeDirs" },
     );
   } catch (err) {
     const msg = (err as Error).message ?? "";
@@ -729,7 +784,7 @@ export async function listPrHeadChangeDirs(
     try {
       await ghRun(
         ["api", `repos/${cfg.repo}/contents/?ref=${refQ}`],
-        { retries: 1 },
+        { retries: 1, wrapperName: "listPrHeadChangeDirs" },
       );
       tipRootOk = true;
     } catch (probeErr) {
@@ -765,15 +820,18 @@ export async function getPrCommits(
   cfg: PipelineConfig,
   prNumber: number,
 ): Promise<{ oid: string; messageHeadline: string }[]> {
-  const stdout = await ghRun([
-    "pr",
-    "view",
-    String(prNumber),
-    "--json",
-    "commits",
-    "-R",
-    cfg.repo,
-  ]);
+  const stdout = await ghRun(
+    [
+      "pr",
+      "view",
+      String(prNumber),
+      "--json",
+      "commits",
+      "-R",
+      cfg.repo,
+    ],
+    { wrapperName: "getPrCommits" },
+  );
   const data = JSON.parse(stdout) as {
     commits?: { oid: string; messageHeadline?: string }[];
   };
@@ -947,7 +1005,7 @@ export async function postComment(
 ): Promise<void> {
   await ghRun(
     ["issue", "comment", String(issueNumber), "--body", body, "-R", cfg.repo],
-    runOpts,
+    { ...runOpts, wrapperName: "postComment" },
   );
 }
 
@@ -1064,12 +1122,15 @@ export async function transition(
 ): Promise<void> {
   const _getIssueDetail = deps.getIssueDetail ?? getIssueDetail;
   const _editLabels = deps.editLabels ?? (async (c, n, from, to) => {
-    await ghRun([
-      "issue", "edit", String(n),
-      "--remove-label", `${LABEL_PREFIX}${from}`,
-      "--add-label", `${LABEL_PREFIX}${to}`,
-      "-R", c.repo,
-    ]);
+    await ghRun(
+      [
+        "issue", "edit", String(n),
+        "--remove-label", `${LABEL_PREFIX}${from}`,
+        "--add-label", `${LABEL_PREFIX}${to}`,
+        "-R", c.repo,
+      ],
+      { wrapperName: "transition" },
+    );
   });
   const _postComment = deps.postComment ?? postComment;
   const _sleep = deps.sleep;
@@ -1433,12 +1494,15 @@ export async function getHeadCheckRunCount(
   cfg: PipelineConfig,
   sha: string,
 ): Promise<number> {
-  const stdout = await ghRun([
-    "api",
-    `repos/${cfg.repo}/commits/${sha}/check-runs`,
-    "--jq",
-    ".total_count",
-  ]);
+  const stdout = await ghRun(
+    [
+      "api",
+      `repos/${cfg.repo}/commits/${sha}/check-runs`,
+      "--jq",
+      ".total_count",
+    ],
+    { wrapperName: "getHeadCheckRunCount" },
+  );
   const n = parseInt(stdout.trim(), 10);
   return isNaN(n) ? 0 : n;
 }
@@ -1452,12 +1516,15 @@ export async function getSuccessfulCheckRunCount(
   cfg: PipelineConfig,
   sha: string,
 ): Promise<number> {
-  const stdout = await ghRun([
-    "api",
-    `repos/${cfg.repo}/commits/${sha}/check-runs`,
-    "--jq",
-    "[.check_runs[] | select(.conclusion == \"success\")] | length",
-  ]);
+  const stdout = await ghRun(
+    [
+      "api",
+      `repos/${cfg.repo}/commits/${sha}/check-runs`,
+      "--jq",
+      "[.check_runs[] | select(.conclusion == \"success\")] | length",
+    ],
+    { wrapperName: "getSuccessfulCheckRunCount" },
+  );
   const n = parseInt(stdout.trim(), 10);
   return isNaN(n) ? 0 : n;
 }
@@ -1955,7 +2022,7 @@ async function fetchOpenPrCandidates(
 export async function getPrForIssue(
   cfg: PipelineConfig,
   issueNumber: number,
-  run: GhApiRunner = (args) => ghRun(args),
+  run: GhApiRunner = (args) => ghRun(args, { wrapperName: "getPrForIssue" }),
 ): Promise<number | null> {
   const candidates = await fetchOpenPrCandidates(cfg, run, "getPrForIssue");
   return resolvePrForIssue(candidates, issueNumber, cfg.repo);
@@ -1969,7 +2036,7 @@ export async function getPrForIssue(
 export async function listOpenPrsForIssue(
   cfg: PipelineConfig,
   issueNumber: number,
-  run: GhApiRunner = (args) => ghRun(args),
+  run: GhApiRunner = (args) => ghRun(args, { wrapperName: "listOpenPrsForIssue" }),
 ): Promise<number[]> {
   const candidates = await fetchOpenPrCandidates(cfg, run, "listOpenPrsForIssue");
   return resolveOpenPrsForIssue(candidates, issueNumber, cfg.repo);
@@ -1982,7 +2049,7 @@ export async function listOpenPrsForIssue(
  */
 export async function listOpenPrCandidates(
   cfg: PipelineConfig,
-  run: GhApiRunner = (args) => ghRun(args),
+  run: GhApiRunner = (args) => ghRun(args, { wrapperName: "listOpenPrCandidates" }),
 ): Promise<PrCandidate[]> {
   return fetchOpenPrCandidates(cfg, run, "listOpenPrCandidates");
 }
@@ -2411,7 +2478,7 @@ const ISSUE_TIMELINE_QUERY =
 export async function getPrForIssueAnyState(
   cfg: PipelineConfig,
   issueNumber: number,
-  run: GhApiRunner = (args) => ghRun(args),
+  run: GhApiRunner = (args) => ghRun(args, { wrapperName: "getPrForIssueAnyState" }),
 ): Promise<number | null> {
   const [owner, repo] = cfg.repo.split("/");
   let before: string | null = null;
@@ -2464,18 +2531,21 @@ export async function getPrForBranch(
   cfg: PipelineConfig,
   branch: string,
 ): Promise<number | null> {
-  const stdout = await ghRun([
-    "pr",
-    "list",
-    "--json",
-    "number,headRefName,isCrossRepository",
-    "--state",
-    "open",
-    "-L",
-    "100",
-    "-R",
-    cfg.repo,
-  ]);
+  const stdout = await ghRun(
+    [
+      "pr",
+      "list",
+      "--json",
+      "number,headRefName,isCrossRepository",
+      "--state",
+      "open",
+      "-L",
+      "100",
+      "-R",
+      cfg.repo,
+    ],
+    { wrapperName: "getPrForBranch" },
+  );
   const data = JSON.parse(stdout) as {
     number: number;
     headRefName: string;
@@ -3105,7 +3175,10 @@ export async function listOpenIssueMilestoneSnapshots(
  */
 export async function getGhActor(): Promise<string | null> {
   try {
-    const login = await ghRun(["api", "user", "--jq", ".login"], { timeoutMs: 10_000, retries: 1 });
+    const login = await ghRun(
+      ["api", "user", "--jq", ".login"],
+      { timeoutMs: 10_000, retries: 1, wrapperName: "getGhActor" },
+    );
     return login.trim() || null;
   } catch {
     return null;
