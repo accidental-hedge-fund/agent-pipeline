@@ -19,8 +19,8 @@ This file is the forward-looking source of truth for open work. Every open issue
 |---|---|---|---|---|
 | **v1.33.0** ✅ shipped | minor | Scoped Hermes factory and startup corrections | #898, #905, #874, #870 | Shipped 2026-08-10 (tag `v1.33.0`). See CHANGELOG.md. |
 | **v1.34.0** ✅ shipped | minor | Durable factory core and native release preparation | #890, #891, #908, #909 | Shipped 2026-08-10 (tag `v1.34.0`). See CHANGELOG.md. |
-| **v1.35.0** | minor | Integrated completion | #901, #765 | Add a durable integrated-base frontier and an optional post-loop integration workflow. |
-| **v1.36.0** | minor | Roadmap reconciliation | #910 | Add dry-run-first, full SemVer milestone reconciliation. |
+| **v1.35.0** | minor | Release, roadmap correctness, and supervisor hardening | #910, #978, #980, #983 | SemVer milestone reconciliation, tag-derived CHANGELOG regeneration, configurable git-push auth, and ship-playbook train-gate fix. |
+| **v1.36.0** | minor | Roadmap reconciliation | #985 | Derive release plan from GitHub Milestones instead of ROADMAP.md (#985). |
 | **v1.37.0** | minor | Human authority and evidence | #575, #576, #691–#695, #702, #599, #647, #703 | Add trusted authority, evidence identity, intent lineage, resumable handoffs, and outcome feedback. |
 | **v1.38.0** | minor | Factory operations | #892–#896 | Add replayable watch, durable alerts, controls, provider cooldowns, and intake admission. |
 | **v1.39.0** | minor | Hermes and Buzz integration | #907, #897 | Add a host-neutral Pipeline integration surface and the Hermes native Buzz outer host. |
@@ -51,9 +51,12 @@ This file is the forward-looking source of truth for open work. Every open issue
 | #891 | minor | none | factory health | v1.34.0 | #890 |
 | #908 | minor | default off | FRG and release preparation | v1.34.0 | #890, #891 |
 | #909 | patch | none | roadmap correctness | ✅ v1.34.0 | — |
-| #901 | minor | opt-in | integrated completion | v1.35.0 | #905 |
-| #765 | minor | opt-in | post-loop integration | v1.35.0 | #901, #764, #675 |
-| #910 | minor | opt-in | roadmap reconciliation | v1.36.0 | #909 |
+| #901 | — | — | integrated completion (closed-unmerged) | — | superseded; never shipped |
+| #765 | — | — | post-loop integration (closed-unmerged) | — | superseded; never shipped |
+| #910 | minor | opt-in | roadmap reconciliation | ✅ v1.35.0 | #909 |
+| #978 | fix | none | release docs | ✅ v1.35.0 | — |
+| #980 | minor | opt-in | git-push auth | ✅ v1.35.0 | — |
+| #983 | fix | none | ship supervisor | ✅ v1.35.0 | — |
 | #575 | minor | opt-in | human authority | v1.37.0 | — |
 | #576 | minor | none | production outcomes | v1.37.0 | — |
 | #691 | minor | none | trusted verification | v1.37.0 | — |
@@ -155,7 +158,7 @@ Theme labels remain on issues to support search and ownership. They do not repla
 | Theme label | Issues | Scope |
 |---|---|---|
 | `theme:loop-correctness` | #765 | Dependency-safe loop and integration behavior. |
-| `theme:factory-operations` | #892–#896, #909, #910 | Factory control, observation, and roadmap operations. |
+| `theme:factory-operations` | #892–#896, #909, #910, #985 | Factory control, observation, and roadmap operations. |
 | `theme:hermes-buzz` | #897, #907 | Hermes and Buzz integration. |
 | `theme:autonomous-delivery` | #662, #899, #900, #902, #903, #906, #908 | Qualified merge, release, and engine promotion. |
 | `theme:human-evidence` | #575, #576, #599, #647, #691–#695, #702, #703 | Human authority, evidence, intent, and outcomes. |
