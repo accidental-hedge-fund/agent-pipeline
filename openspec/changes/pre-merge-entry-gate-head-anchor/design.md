@@ -2,118 +2,145 @@
 
 See `proposal.md` for motivation. Current structure (post module split):
 
-- `advancePolling` owns one `PreMergePollingContext` per session and loops: `advance(...)` → sleep `ci_poll_interval` → repeat until advanced, non-waiting, or deadline.
-- `advance()` always runs, in order: resolve PR → review-SHA gate → optional `preArchiveSha` capture → OpenSpec archive → active-change guard → early-conflict via `getPrDetail` → Step 1 CI.
+- `advancePolling` owns one `PreMergePollingContext` per session and loops: `advance(...)` → sleep `ci_poll_interval` → repeat until advanced, non-waiting, or deadline (`pre-merge-routing.ts` ~1051–1072).
+- `advance()` always runs, in order: resolve PR → review-SHA gate → optional `preArchiveSha` capture → OpenSpec archive → active-change guard → early-conflict via `getPrDetail` → Step 1 CI (`pre-merge-routing.ts` ~356–505).
 - `PreMergePollingContext` already carries per-session state (`preArchiveSha`, CI recovery SHA sets, waiting spam flags) but has no “entry gates already passed for this head” marker.
-- Steady-state pending CI only needs head currency + check aggregation; the rest of the entry stack is pure re-validation of an unchanged head.
+- Steady-state pending CI only needs head currency + mergeability (base can move) + check aggregation; the head-bound entry stack is pure re-validation of an unchanged head.
 
 Constraints:
 
 - Rigor over latency: skip must not remove, demote, or policy-condition any gate.
 - Unit tests inject deps only (no real network/git/subprocess).
 - Edit orchestration in `pre-merge-routing.ts` (facade still re-exports); do not re-collapse domain modules.
-- Compose cleanly with sibling cache work (#838 and matrix children): this memo is **session + head SHA only**, not a durable gh response cache.
+- Compose cleanly with sibling cache work (#838): this memo is **session + head SHA only**, not a durable gh response cache.
 
 ## Goals / Non-Goals
 
 **Goals:**
 
-- One full entry-gate pass per distinct PR head SHA per polling session.
-- Re-ticks on the same head pay only for load-bearing CI-path reads (PR head/detail as needed + `getPrChecks` / local-mode equivalents).
-- Head movement always re-runs the full entry stack.
-- Memo records only a proceed verdict into Step 1.
-- Early-conflict predicate remains byte-identical after hoisting `getPrDetail`.
+- One full **head-bound** entry-gate pass per distinct PR head SHA per polling session.
+- Re-ticks on the same head pay only for load-bearing per-tick reads (PR detail for head + mergeability + `getPrChecks` / local-mode equivalents).
+- Head movement always re-runs the full head-bound entry stack.
+- Early-conflict is **not** memo-skipped: base movement with unchanged head must still conflict.
+- Memo records only a proceed verdict into Step 1, using post-stack head SHA.
+- Cached PR identity has an explicit validity rule.
 
 **Non-Goals:**
 
-- Shortening CI wall-clock beyond restoring poll interval tightness (sleep still dominates).
-- Cross-process / durable memo of entry-gate pass (ledger is for CI recovery markers, not this).
+- Shortening CI wall-clock beyond restoring poll interval tightness.
+- Cross-process / durable memo of entry-gate pass.
 - Caching review verdicts, archive outcomes, or gh GraphQL responses as a general layer (#838).
 - Parallelizing independent gate I/O inside a single full pass.
 - Changing SHA-gate policy, archive fail-closed rules, active-change guard, CI recovery ladder, or merge authority.
-- Skipping Step 1 CI itself when head is unchanged (CI status still polled every tick).
+- Skipping Step 1 CI when head is unchanged.
 
 ## Decisions
 
 ### 1. Memo key = PR head SHA on the existing polling context
 
-**Decision:** Add `entryGatesPassedForSha?: string` to `PreMergePollingContext`. On each `advance()` tick that has `pollingCtx`, after resolving current `prDetail.head_sha`, if `pollingCtx.entryGatesPassedForSha === prDetail.head_sha`, skip entry gates and enter Step 1 with the already-resolved PR identity.
+**Decision:** Add `entryGatesPassedForSha?: string` to `PreMergePollingContext`. On each `advance()` tick that has `pollingCtx`, after resolving current open-PR `prDetail.head_sha`, if `pollingCtx.entryGatesPassedForSha === prDetail.head_sha`, skip the **head-bound** entry gates and continue to early-conflict + Step 1 with the already-resolved PR identity.
 
-**Rationale:** Head SHA is the natural invalidation key for every entry gate (SHA gate currency, archive side-effects, conflict state relative to head). The context already lives for the session and is the right place for ephemeral memo (same family as `preArchiveSha` / `ciWaitingGateRecorded`).
-
-**Alternatives considered:**
-
-- *Module-level static memo.* Unsafe across issues and concurrent runs; rejected.
-- *Durable stage-attempt ledger entry.* Overkill for per-session amortization; survives process restart in ways that could skip gates after operator/worktree changes; rejected for this issue.
-- *Diff-hash or merge-base key.* Stronger than needed; head movement is the required invalidator and is simpler to test.
-
-### 2. Set the marker only on clean proceed into Step 1
-
-**Decision:** After the full entry stack completes without returning (SHA gate null, archive null, openspec guard null, not early-conflict), and immediately before Step 1, set `pollingCtx.entryGatesPassedForSha = prDetail.head_sha` when `pollingCtx` is present. Any early `return` from a gate MUST leave the marker unset for that head (do not set; do not invent a “failed at sha” cache).
-
-**Rationale:** Acceptance requires the memo to cache only a proceed verdict. Non-proceed results already stop or restructure the poll loop; caching them would either skip re-evaluation incorrectly or add complexity with no benefit.
+**Rationale:** Head SHA is the natural invalidation key for the SHA gate, archive, and active-change guard. The context already lives for the session (same family as `preArchiveSha` / `ciWaitingGateRecorded`).
 
 **Alternatives considered:**
 
-- *Set marker at start of first tick.* Would skip re-running gates after a transient false conflict or partial failure on the same head; rejected.
-- *Cache structured gate outcomes.* Out of scope; more like #838-class response caching.
+- *Module-level static memo.* Unsafe across issues; rejected.
+- *Durable stage-attempt ledger entry.* Overkill; could skip gates after operator/worktree changes across process restart; rejected for this issue.
+- *Diff-hash or merge-base key.* Stronger than needed for head-bound gates; early-conflict is re-checked every tick instead.
 
-### 3. Hoist `getPrDetail` (and optional cached `prNumber`) before the stack
+### 2. Skip scope = head-bound gates only; early-conflict always re-runs
+
+**Decision:** On memo hit, skip only:
+
+1. `enforceReviewShaGate`
+2. `preArchiveSha` capture body when already set (capture still happens on first full pass before memo set)
+3. `maybeArchiveOpenspec`
+4. `enforceOpenspecActiveChangeGuard`
+
+On **every** tick (memo hit or miss), after resolving `prDetail`:
+
+- Evaluate early-conflict with the **byte-identical** predicate:
+
+  ```ts
+  prDetail.mergeable === false ||
+  (prDetail.mergeable_state ?? "").toUpperCase() === "DIRTY"
+  ```
+
+- On conflict → `recoverFromMergeConflict` (and **do not** set / refresh a proceed memo for that return).
+- On non-conflict → Step 1 CI as today.
+
+**Gate audit (inputs that can change without PR-head change):**
+
+| Gate | Non-head inputs | Disposition |
+| --- | --- | --- |
+| Review-SHA gate | Issue comments, actor, overrides | Primary question is head vs reviewed SHA + residual for this head. Same head that already clean-proceeded remains covered; operator override re-enters via labels / non-waiting path, not pure CI poll. **Skip on memo hit.** |
+| OpenSpec archive | Worktree / PR tip change dirs | Archive is idempotent; new unarchived change requires tree/head change. **Skip on memo hit.** |
+| Active-change guard | Worktree tip dirs, or PR-head tree | PR product path is head-bound. Local-only worktree dirt without push is outside the PR advance product path for CI poll. **Skip on memo hit.** |
+| Early conflict | Base branch movement → `DIRTY` / `mergeable === false` without head change | **NOT head-bound. Always re-evaluate from fresh per-tick `prDetail`.** |
+| CI checks | Check run status | Always polled (Step 1). |
+
+**Rationale:** The original plan skipped early-conflict on memo hit. Review correctly noted mergeability can turn DIRTY when the base moves while head is fixed. Re-checking conflict costs one field already on the per-tick detail read.
+
+### 3. Set the marker only on clean proceed into Step 1, using post-stack head
 
 **Decision:**
 
-1. Resolve `prNumber` first (existing). Optionally store on `pollingCtx.prNumber` when present so later ticks can reuse without `getPrForIssue` when the cached number still matches the issue’s PR (implementation may still call a cheap verify path if needed; prefer reusing the cached number within the session as specified).
-2. Fetch `prDetail` once near the top of the non-dry-run path (after PR existence is known) so `head_sha` is available for the memo check **and** for the early-conflict predicate later.
-3. On memo hit: reuse that `prDetail` / `prNumber` for Step 1.
-4. On memo miss: run the full stack; use the **same** early-conflict predicate on the resolved detail (byte-identical comparison expression). If archive or another gate can move HEAD, re-fetch `prDetail` after the stack before setting the marker and before early-conflict / Step 1 as needed so the memo SHA matches the head that actually entered Step 1.
+- After a full (memo-miss) entry stack completes without non-proceed return, and after early-conflict is false, set `pollingCtx.entryGatesPassedForSha` to the head SHA that **enters** Step 1.
+- If archive (or any stack step) may have moved HEAD, **re-fetch `getPrDetail`** after the stack (before early-conflict and before setting the memo) so the memo SHA is the post-stack head.
+- Any early `return` from a gate MUST leave the marker unset for that proceed (do not set; do not invent a “failed at sha” cache).
+- Memo hit path never sets the marker again unless a full stack re-runs.
 
-**Rationale:** The issue requires hoisting detail for the conflict check and head-keyed memo. Archive can push commits that change head; setting the marker from a pre-archive SHA would falsely skip gates after archive. Post-stack head (or a single post-archive detail) must own the memo value.
+**Rationale:** Acceptance requires proceed-only memo and correct post-archive anchoring. Setting from pre-archive SHA would false-skip after archive moved HEAD (next tick would still see H2 ≠ H1 if memo were H1 — but if stack set memo to H1 pre-archive and archive produced H2 mid-pass, the same tick would enter CI on H2 while memo said H1, and the next tick would re-run the full stack; worse is setting memo to pre-archive after post-archive head was already observed as stable). Always set from the head used for CI entry after re-resolve.
 
-**Alternatives considered:**
+### 4. Hoist `getPrDetail` + session-scoped `prNumber` with validity rule
 
-- *Memo hit without any `getPrDetail`.* Cannot know head movement without a head read; at least one head-bearing read per tick remains load-bearing.
-- *Always use pre-stack detail for the marker after archive.* Incorrect after archive moves HEAD; rejected.
+**Decision:**
 
-### 4. Skip scope is the entry stack only
+1. Resolve `prNumber`:
+   - If `pollingCtx.prNumber` is a positive number, use it as candidate.
+   - Else call `getPrForIssue` (existing), store on `pollingCtx.prNumber` when present.
+2. Fetch `prDetail` via `getPrDetail(prNumber)` early (after dry-run skip).
+3. **PR identity validity (every tick):**
+   - If `getPrDetail` throws / not found, or `prDetail.state` is not `"open"` (closed/merged): clear `pollingCtx.prNumber` and `pollingCtx.entryGatesPassedForSha`, re-run `getPrForIssue`. If no open PR → existing “no PR” block path. If a new open PR number → continue with that identity (full entry stack; memo already cleared).
+   - If detail is open → keep cached `prNumber` for the session; do **not** re-scan repo-wide open PRs every tick.
+4. Use that open `prDetail` for memo compare, early-conflict, and Step 1.
 
-**Decision:** Memo skip covers only: review-SHA gate, pre-archive capture (when already set or when skip applies), `maybeArchiveOpenspec`, `enforceOpenspecActiveChangeGuard`, and early-conflict *re-derivation that would re-run the gate bodies*. Step 1 CI (pending poll, recovery ladder, local mode) always runs. Fresh mergeability checks that already exist after green CI remain as today.
+**Rationale:** Issue asked to cache `prNumber` to avoid the paginated open-PR scan. Review correctly required that a closed/replaced PR not keep being polled. `getPrDetail` already returns `state` (`open` | `closed` | `merged`) and is load-bearing every tick for head + mergeability; using it as the validity probe is surgical.
 
-**Rationale:** The waste is entry-stack re-validation; CI status is the question each tick asks.
+### 5. No pollingCtx → no memo
 
-### 5. No pollingCtx → no memo (first-shot / non-polling advance unchanged)
-
-**Decision:** When `opts.pollingCtx` is absent, behavior matches today’s full stack every call (single `advance` without polling session). Marker fields are only meaningful under `advancePolling` (or a caller that supplies a shared context).
-
-**Rationale:** Avoid surprising cross-call skips for one-shot advance; keep the optimization scoped to the documented poll session.
+**Decision:** When `opts.pollingCtx` is absent, full stack every call (one-shot advance). Marker fields only meaningful under `advancePolling` (or a shared context supplier).
 
 ### 6. Regression tests as the enforcement mechanism
 
-**Decision:**
+**Decision:** Injectable-deps tests:
 
-1. **Multi-tick pending CI:** shared `pollingCtx`, stub checks always pending for N ticks; assert entry-gate deps (SHA gate / archive / openspec guard — or their underlying gh/git seams) are invoked only on the first tick (or when head changes), and per-tick gh-like call count after tick 1 is 1–2.
-2. **Head invalidation:** after a proceed memo, change `getPrDetail` head SHA; assert full stack runs again. Mutate the implementation (or a test double flag) to prove the test fails if invalidation is removed.
-3. **Non-proceed does not set marker:** force SHA gate (or archive) to return a non-null outcome; assert marker unset and a later tick with same head still runs the stack.
-4. **Early-conflict predicate:** shared helper or source-level assertion that the conflict boolean expression is unchanged.
-
-**Rationale:** Acceptance criteria are falsifiable only with deps counters and explicit invalidation tests.
+1. **Multi-tick pending CI** — shared `pollingCtx`, checks pending ≥10 ticks, unchanged open head: head-bound gates only on first proceed; later ticks ≈ detail + checks (no SHA gate / archive / active-change deps).
+2. **Head invalidation** — memo H1, then head H2 → full head-bound stack runs; fails if skip ignores head equality.
+3. **Non-proceed does not set memo** — forced non-null SHA-gate / archive / guard / early-conflict recovery → marker unset; next same-head tick re-runs stack.
+4. **Base-only DIRTY** — memo set for H1; next tick same `head_sha`, `mergeable_state: "DIRTY"` (or `mergeable: false`) → conflict recovery; SHA gate / archive / guard may still be skipped but conflict path runs.
+5. **Post-archive memo SHA** — archive path moves head H1→H2 in one full pass → `entryGatesPassedForSha === H2`.
+6. **Closed / replaced PR** — cached `prNumber` closed → re-resolve; do not keep polling closed PR; entry memo cleared.
+7. **Early-conflict predicate** — expression remains byte-identical (shared helper or source assertion).
 
 ## Risks / Trade-offs
 
 | Risk | Mitigation |
 | --- | --- |
-| Stale skip after archive moves HEAD in the same tick | Set memo only after stack completion using post-stack head SHA; re-fetch detail if archive can change head |
-| Skip hides a new conflict that appeared without a head change (rare GitHub merge-base update) | Accept as out of scope for head-key design; conflict re-check still runs after green CI; document trade-off. Do not weaken early-conflict on first pass |
-| Memo hit skips `preArchiveSha` capture | Capture runs only when unset before archive on full path; first tick still sets it; memo hit implies first tick already passed archive path for that head or head was already post-entry. If first proceed set marker without capture, ensure capture still happens on first full pass before marker set |
-| Call-count flakiness if deps graph is fuzzy | Count explicit injected seams (`getPrForIssue`, `getIssueDetail`, archive-related git/gh, vs `getPrDetail`/`getPrChecks`) rather than global process counters |
-| Compose with #838 double-caching | Keep this memo semantic (gate proceed per head) separate from response caches; no shared global map |
+| Stale skip after archive moves HEAD in same tick | Re-fetch detail post-stack; set memo to post-stack head only |
+| Base moves → DIRTY without head change | Early-conflict always re-evaluated on fresh detail |
+| Closed/replaced PR with cached number | Validity check on every `getPrDetail`; clear cache + memo and re-resolve |
+| Skip hides mid-poll comment/override edge cases | Accepted for head-bound skip; override/operator paths re-enter outside pure waiting poll; head movement still re-runs stack |
+| Call-count flakiness | Count explicit injected seams, not global process counters |
+| Compose with #838 | Keep gate-proceed memo separate from response caches |
 
 ## Migration Plan
 
-1. Land OpenSpec change (this planning step).
+1. Land OpenSpec change (planning).
 2. Implement context fields + advance control flow + tests in one PR targeting `main`.
-3. No config flag required (behavior-preserving for gate outcomes; pure amortization).
-4. Rollback: remove memo check / fields; full stack every tick returns (safe fallback).
+3. No config flag (amortization only).
+4. Rollback: remove memo check / fields → full stack every tick.
 
 ## Open Questions
 
-None that block specs or tasks. Optional implementer choice: exact field name for cached PR number (`prNumber` vs `cachedPrNumber`) as long as it is session-scoped on `PreMergePollingContext` and documented in code comments.
+None blocking. Field name for cached PR number: `prNumber` on `PreMergePollingContext` (session-scoped; documented validity rule in code comment).
