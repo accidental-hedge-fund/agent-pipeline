@@ -36,6 +36,7 @@ import {
   roadmapBranchFetchRefspec,
   roadmapDayBranchPushRefspec,
 } from "./roadmap-deps.ts";
+import { withLock } from "../lock.ts";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -64,7 +65,13 @@ export interface DecomposeChildPlan {
   out_of_scope: string[];
   open_questions?: string[];
   effort: EffortBand;
+  /** Sibling plan keys this child requires first. */
   depends_on_keys: string[];
+  /**
+   * Existing GitHub issue numbers this child requires (not plan keys).
+   * Written into child bodies with the shared declared-dependency grammar.
+   */
+  depends_on_issue_numbers: number[];
 }
 
 export interface DecomposePlan {
@@ -122,6 +129,18 @@ export interface DecomposeDeps {
     branch: string,
     baseRef: string,
     fn: (worktreeDir: string) => Promise<T>,
+  ): Promise<T>;
+  /**
+   * Host-local critical section for provenance discovery through child
+   * creation for one epic (repo domain + epic number). Serializable apply
+   * prevents concurrent same-host runs from both observing an empty
+   * provenance set and creating duplicate children (#766 review 2).
+   * Recoverable: lock is released when `fn` settles (success or throw).
+   */
+  withEpicApplyLock<T>(
+    domain: string,
+    epicNumber: number,
+    fn: () => Promise<T>,
   ): Promise<T>;
   reserveRemoteBranch(repoDir: string, branch: string, sha: string): void;
   gitPushBranch(repoDir: string, branch: string): void;
@@ -334,6 +353,12 @@ export function realDecomposeDeps(
       fs.mkdirSync(path.dirname(p), { recursive: true });
       fs.writeFileSync(p, content, "utf8");
     },
+    /**
+     * Host-local epic apply lock (domain + epic). Recoverable: withLock
+     * always releases in finally when fn settles.
+     */
+    withEpicApplyLock: async (domain, epicNumber, fn) =>
+      withLock(domain, fn, epicNumber),
     /**
      * Throwaway detached linked worktree for ROADMAP PR delivery (#766).
      * Never switches the operator checkout. Safety scope: only the managed
@@ -674,6 +699,10 @@ export function parseDecomposePlan(raw: string): DecomposePlan {
       row.depends_on_keys ?? [],
       `children[${i}].depends_on_keys`,
     );
+    const depends_on_issue_numbers = asPositiveIntArray(
+      row.depends_on_issue_numbers ?? [],
+      `children[${i}].depends_on_issue_numbers`,
+    );
     children.push({
       key,
       title,
@@ -684,6 +713,7 @@ export function parseDecomposePlan(raw: string): DecomposePlan {
       open_questions,
       effort: effortRaw as EffortBand,
       depends_on_keys,
+      depends_on_issue_numbers,
     });
   }
   // Validate depends_on_keys reference known keys.
@@ -699,6 +729,16 @@ export function parseDecomposePlan(raw: string): DecomposePlan {
           `[pipeline decompose] child "${child.key}" cannot depend on itself`,
         );
       }
+    }
+    // depends_on_issue_numbers are existing issues (not plan keys); uniqueness only.
+    const seenNums = new Set<number>();
+    for (const n of child.depends_on_issue_numbers) {
+      if (seenNums.has(n)) {
+        throw new Error(
+          `[pipeline decompose] child "${child.key}" has duplicate depends_on_issue_numbers entry #${n}`,
+        );
+      }
+      seenNums.add(n);
     }
   }
   return { children };
@@ -716,6 +756,76 @@ function asStringArray(value: unknown, pathLabel: string): string[] {
     }
     return v.trim();
   });
+}
+
+/** Parse an array of positive integer issue numbers (existing-issue deps). */
+function asPositiveIntArray(value: unknown, pathLabel: string): number[] {
+  if (!Array.isArray(value)) {
+    throw new Error(
+      `[pipeline decompose] ${pathLabel} must be an array of positive issue numbers`,
+    );
+  }
+  return value.map((v, i) => {
+    const n =
+      typeof v === "number"
+        ? v
+        : typeof v === "string" && /^\d+$/.test(v.trim())
+          ? Number(v.trim())
+          : NaN;
+    if (!Number.isInteger(n) || n < 1) {
+      throw new Error(
+        `[pipeline decompose] ${pathLabel}[${i}] must be a positive integer issue number (got ${JSON.stringify(v)})`,
+      );
+    }
+    return n;
+  });
+}
+
+/** Collect provenance key → issue number for children of a parent epic. */
+export function indexProvenanceByKey(
+  issues: ReadonlyArray<DecomposeIssue>,
+  parentEpic: number,
+): Map<string, number> {
+  const byKey = new Map<string, number>();
+  for (const issue of issues) {
+    const marker = parseProvenanceMarker(issue.body ?? "");
+    if (marker && marker.parent === parentEpic) {
+      // Prefer lowest number when duplicates already exist (stable survivor).
+      const prev = byKey.get(marker.key);
+      if (prev === undefined || issue.number < prev) {
+        byKey.set(marker.key, issue.number);
+      }
+    }
+  }
+  return byKey;
+}
+
+/** Merge sibling-key deps and existing-issue deps into a unique ordered list. */
+export function resolveChildDependencyNumbers(
+  child: DecomposeChildPlan,
+  keyToNumber: ReadonlyMap<string, number>,
+): number[] {
+  const nums: number[] = [];
+  const seen = new Set<number>();
+  for (const n of child.depends_on_issue_numbers ?? []) {
+    if (!seen.has(n)) {
+      seen.add(n);
+      nums.push(n);
+    }
+  }
+  for (const depKey of child.depends_on_keys) {
+    const n = keyToNumber.get(depKey);
+    if (n === undefined) {
+      throw new Error(
+        `[pipeline decompose] internal error: dep key "${depKey}" has no issue number yet for child "${child.key}"`,
+      );
+    }
+    if (!seen.has(n)) {
+      seen.add(n);
+      nums.push(n);
+    }
+  }
+  return nums;
 }
 
 /** Extract the first top-level JSON object from harness output. */
@@ -849,6 +959,8 @@ export async function runDecompose(
     repo_dir: string;
     repo: string;
     base_branch: string;
+    /** Pipeline domain for host-local epic apply serialization (#766). */
+    domain?: string;
     intake_timeout?: number;
     models?: PipelineConfig["models"];
     effort?: PipelineConfig["effort"];
@@ -968,13 +1080,11 @@ export async function runDecompose(
     for (const child of ordered) {
       d.log(`### ${child.key} — ${child.title}`);
       d.log(`  effort: ${child.effort}`);
-      d.log(
-        `  deps: ${
-          child.depends_on_keys.length
-            ? child.depends_on_keys.join(", ")
-            : "(none)"
-        }`,
-      );
+      const depParts = [
+        ...child.depends_on_keys,
+        ...(child.depends_on_issue_numbers ?? []).map((n) => `#${n}`),
+      ];
+      d.log(`  deps: ${depParts.length ? depParts.join(", ") : "(none)"}`);
       d.log(`  summary: ${child.summary}`);
       d.log(`  AC:`);
       for (const ac of child.acceptance_criteria) {
@@ -1049,51 +1159,57 @@ export async function runDecompose(
   await d.addLabels(opts.epic, [EPIC_LABEL]);
   d.log(`[pipeline decompose] labeled parent #${opts.epic} with ${EPIC_LABEL}`);
 
-  // Idempotency: match existing children by provenance marker.
-  const openIssues = await d.listOpenIssues();
-  const existingByKey = new Map<string, number>();
-  for (const issue of openIssues) {
-    const marker = parseProvenanceMarker(issue.body ?? "");
-    if (marker && marker.parent === opts.epic) {
-      existingByKey.set(marker.key, issue.number);
-    }
-  }
+  // Serialize provenance discovery through child creation per (domain, epic)
+  // so concurrent same-host applies cannot both observe empty provenance and
+  // create duplicate children (#766 review 2 e9312c5c).
+  const domain =
+    cfg.domain?.trim() ||
+    (cfg.repo.includes("/") ? cfg.repo.split("/")[1]! : cfg.repo) ||
+    path.basename(repoDir);
 
-  const keyToNumber = new Map<string, number>(existingByKey);
-  let createdCount = 0;
-  let reusedCount = 0;
+  const { createdCount, reusedCount, keyToNumber } = await d.withEpicApplyLock(
+    domain,
+    opts.epic,
+    async () => {
+      // Re-read provenance only after the lock is held.
+      const openIssues = await d.listOpenIssues();
+      const existingByKey = indexProvenanceByKey(openIssues, opts.epic);
+      const keyToNumber = new Map<string, number>(existingByKey);
+      let createdCount = 0;
+      let reusedCount = 0;
 
-  for (const child of ordered) {
-    const existing = keyToNumber.get(child.key);
-    if (existing !== undefined) {
-      reusedCount += 1;
-      d.log(
-        `[pipeline decompose] reusing existing child #${existing} for key "${child.key}" (idempotent)`,
-      );
-      continue;
-    }
-    // Resolve deps among already-matched/created siblings.
-    const depNumbers: number[] = [];
-    for (const depKey of child.depends_on_keys) {
-      const n = keyToNumber.get(depKey);
-      if (n === undefined) {
-        throw new Error(
-          `[pipeline decompose] internal error: dep key "${depKey}" has no issue number yet for child "${child.key}"`,
+      for (const child of ordered) {
+        // Fresh check per key: another host or prior iteration may have filled
+        // the slot after our snapshot (defense in depth).
+        if (!keyToNumber.has(child.key)) {
+          const fresh = await d.listOpenIssues();
+          for (const [k, n] of indexProvenanceByKey(fresh, opts.epic)) {
+            if (!keyToNumber.has(k)) keyToNumber.set(k, n);
+          }
+        }
+        const existing = keyToNumber.get(child.key);
+        if (existing !== undefined) {
+          reusedCount += 1;
+          d.log(
+            `[pipeline decompose] reusing existing child #${existing} for key "${child.key}" (idempotent)`,
+          );
+          continue;
+        }
+        const depNumbers = resolveChildDependencyNumbers(child, keyToNumber);
+        const body = buildChildBody(child, opts.epic, depNumbers);
+        const triage = triageLabelForChild(child);
+        const labels = [triage];
+        if (version) labels.push(`release:v${version}`);
+        const num = await d.createIssue(child.title, body, labels);
+        keyToNumber.set(child.key, num);
+        createdCount += 1;
+        d.log(
+          `[pipeline decompose] created #${num}: ${child.title} [${triage}] (key=${child.key})`,
         );
       }
-      depNumbers.push(n);
-    }
-    const body = buildChildBody(child, opts.epic, depNumbers);
-    const triage = triageLabelForChild(child);
-    const labels = [triage];
-    if (version) labels.push(`release:v${version}`);
-    const num = await d.createIssue(child.title, body, labels);
-    keyToNumber.set(child.key, num);
-    createdCount += 1;
-    d.log(
-      `[pipeline decompose] created #${num}: ${child.title} [${triage}] (key=${child.key})`,
-    );
-  }
+      return { createdCount, reusedCount, keyToNumber };
+    },
+  );
 
   // ROADMAP mutations for all children (created + reused).
   const childNumbers = ordered.map((c) => ({
@@ -1102,6 +1218,10 @@ export async function runDecompose(
   }));
   let mutated = roadmapAtBase;
   for (const { child, number } of childNumbers) {
+    const depLabel =
+      resolveChildDependencyNumbers(child, keyToNumber)
+        .map((n) => `#${n}`)
+        .join(", ") || "—";
     mutated = insertPerIssueRow(
       mutated,
       number,
@@ -1109,12 +1229,7 @@ export async function runDecompose(
       "new sub-command",
       "decompose",
       version || "—",
-      child.depends_on_keys
-        .map((k) => {
-          const n = keyToNumber.get(k);
-          return n ? `#${n}` : k;
-        })
-        .join(", ") || "—",
+      depLabel,
     );
     try {
       if (version) {

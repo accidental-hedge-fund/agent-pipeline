@@ -15,6 +15,8 @@ import {
   triageLabelForChild,
   topoSort,
   isEpicLabeled,
+  resolveChildDependencyNumbers,
+  indexProvenanceByKey,
   EPIC_LABEL,
   type DecomposeDeps,
   type DecomposeOpts,
@@ -69,6 +71,7 @@ function samplePlan(overrides: Partial<DecomposeChildPlan>[] = []): DecomposePla
       out_of_scope: ["Desk UI"],
       effort: "S",
       depends_on_keys: [],
+      depends_on_issue_numbers: [],
     },
     {
       key: "child-create",
@@ -82,11 +85,17 @@ function samplePlan(overrides: Partial<DecomposeChildPlan>[] = []): DecomposePla
       out_of_scope: ["Auto-merge"],
       effort: "M",
       depends_on_keys: ["cli-dispatch"],
+      depends_on_issue_numbers: [],
     },
   ];
   return {
     children: overrides.length
-      ? overrides.map((o, i) => ({ ...base[Math.min(i, base.length - 1)]!, ...o, key: o.key ?? `k${i}` }))
+      ? overrides.map((o, i) => ({
+          ...base[Math.min(i, base.length - 1)]!,
+          ...o,
+          key: o.key ?? `k${i}`,
+          depends_on_issue_numbers: o.depends_on_issue_numbers ?? [],
+        }))
       : base,
   };
 }
@@ -102,14 +111,18 @@ function makeDeps(overrides: Partial<DecomposeDeps> = {}): DecomposeDeps & {
   _ensureLabelCalls: Array<{ name: string; color: string }>;
   _logLines: string[];
   _existingChildren: Array<{ number: number; body: string }>;
+  _lockCalls: Array<{ domain: string; epic: number }>;
 } {
   const createIssueCalls: Array<{ title: string; body: string; labels: string[] }> = [];
   const createPRCalls: Array<{ title: string; body: string; base: string; head: string }> = [];
   const addLabelsCalls: Array<{ issue: number; labels: string[] }> = [];
   const ensureLabelCalls: Array<{ name: string; color: string }> = [];
   const logLines: string[] = [];
+  const lockCalls: Array<{ domain: string; epic: number }> = [];
   let nextIssue = 1000;
   const existingChildren: Array<{ number: number; body: string }> = [];
+  // Simple mutex for concurrent-apply tests (injectable, no real /tmp lock).
+  let lockHeld = false;
 
   const base: DecomposeDeps = {
     getIssue: async (n) => ({
@@ -149,6 +162,20 @@ function makeDeps(overrides: Partial<DecomposeDeps> = {}): DecomposeDeps & {
       throw new Error(`readFile not mocked for ${p}`);
     },
     writeFile: () => {},
+    withEpicApplyLock: async (domain, epic, fn) => {
+      lockCalls.push({ domain, epic });
+      if (lockHeld) {
+        throw new Error(
+          `Pipeline lock held by another process for #${epic} (test mutex)`,
+        );
+      }
+      lockHeld = true;
+      try {
+        return await fn();
+      } finally {
+        lockHeld = false;
+      }
+    },
     withThrowawayWorktree: async (_repoDir, _branch, _baseRef, fn) =>
       fn("/tmp/decompose-throwaway-wt"),
     reserveRemoteBranch: () => {},
@@ -170,6 +197,7 @@ function makeDeps(overrides: Partial<DecomposeDeps> = {}): DecomposeDeps & {
   wrapped._ensureLabelCalls = ensureLabelCalls;
   wrapped._logLines = logLines;
   wrapped._existingChildren = existingChildren;
+  wrapped._lockCalls = lockCalls;
   return wrapped;
 }
 
@@ -177,6 +205,7 @@ const DEFAULT_CFG = {
   repo_dir: "/fake/repo",
   repo: "owner/repo",
   base_branch: "main",
+  domain: "repo",
 };
 
 // ---------------------------------------------------------------------------
@@ -193,6 +222,25 @@ test("decompose: parseDecomposePlan rejects unknown depends_on_keys", () => {
   const bad = samplePlan();
   bad.children[1]!.depends_on_keys = ["missing-key"];
   assert.throws(() => parseDecomposePlan(JSON.stringify(bad)), /unknown key/);
+});
+
+test("decompose: parseDecomposePlan accepts depends_on_issue_numbers", () => {
+  const plan = samplePlan();
+  plan.children[1]!.depends_on_issue_numbers = [42, 99];
+  const parsed = parseDecomposePlan(JSON.stringify(plan));
+  assert.deepEqual(parsed.children[1]!.depends_on_issue_numbers, [42, 99]);
+});
+
+test("decompose: parseDecomposePlan rejects non-positive depends_on_issue_numbers", () => {
+  const plan = samplePlan();
+  const raw = JSON.parse(JSON.stringify(plan)) as {
+    children: Array<Record<string, unknown>>;
+  };
+  raw.children[0]!.depends_on_issue_numbers = [0];
+  assert.throws(
+    () => parseDecomposePlan(JSON.stringify(raw)),
+    /depends_on_issue_numbers/,
+  );
 });
 
 test("decompose: detectDependencyCycle names A→B→A", () => {
@@ -627,4 +675,183 @@ test("decompose: roadmap-slice fails closed when epic inventory cannot load", as
       resolveSelectorIssues(cfg, { type: "roadmap-slice", value: "v1.42.0" }, deps),
     /cannot load open-issue inventory|pipeline:epic/,
   );
+});
+
+// ---------------------------------------------------------------------------
+// Existing-issue dependencies (#766 review 2 — 7b2118d6)
+// ---------------------------------------------------------------------------
+
+test("decompose: apply writes depends_on_issue_numbers into child body via grammar", async () => {
+  const plan: DecomposePlan = {
+    children: [
+      {
+        ...samplePlan().children[0]!,
+        key: "follow-on",
+        depends_on_keys: [],
+        depends_on_issue_numbers: [42, 55],
+      },
+    ],
+  };
+  const deps = makeDeps({
+    runHarness: async () => ({ success: true, output: JSON.stringify(plan) }),
+  });
+  await runDecompose(
+    { epic: 123, apply: true, release: "1.42.0" },
+    DEFAULT_CFG,
+    deps,
+  );
+  assert.equal(deps._createIssueCalls.length, 1);
+  const body = deps._createIssueCalls[0]!.body;
+  const parsed = parseDeclaredDependencyIds(body);
+  assert.ok(parsed.includes("42"), `body should declare #42, got ${parsed.join(",")}`);
+  assert.ok(parsed.includes("55"), `body should declare #55, got ${parsed.join(",")}`);
+});
+
+test("decompose: dry-run prints existing-issue deps", async () => {
+  const plan: DecomposePlan = {
+    children: [
+      {
+        ...samplePlan().children[0]!,
+        key: "follow-on",
+        depends_on_keys: [],
+        depends_on_issue_numbers: [42],
+      },
+    ],
+  };
+  const deps = makeDeps({
+    runHarness: async () => ({ success: true, output: JSON.stringify(plan) }),
+  });
+  await runDecompose({ epic: 123, apply: false }, DEFAULT_CFG, deps);
+  const log = deps._logLines.join("\n");
+  assert.match(log, /#42/);
+  assert.equal(deps._createIssueCalls.length, 0);
+});
+
+test("decompose: resolveChildDependencyNumbers merges existing + sibling keys", () => {
+  const child: DecomposeChildPlan = {
+    ...samplePlan().children[1]!,
+    depends_on_keys: ["cli-dispatch"],
+    depends_on_issue_numbers: [42],
+  };
+  const nums = resolveChildDependencyNumbers(
+    child,
+    new Map([["cli-dispatch", 1000]]),
+  );
+  assert.deepEqual(nums, [42, 1000]);
+});
+
+// ---------------------------------------------------------------------------
+// Concurrent apply serialization (#766 review 2 — e9312c5c)
+// ---------------------------------------------------------------------------
+
+test("decompose: apply acquires epic lock before provenance discovery", async () => {
+  const deps = makeDeps();
+  let listCallsDuringLock = 0;
+  let insideLock = false;
+  deps.withEpicApplyLock = async (domain, epic, fn) => {
+    deps._lockCalls.push({ domain, epic });
+    assert.equal(epic, 123);
+    assert.equal(domain, "repo");
+    insideLock = true;
+    try {
+      return await fn();
+    } finally {
+      insideLock = false;
+    }
+  };
+  const origList = deps.listOpenIssues.bind(deps);
+  deps.listOpenIssues = async () => {
+    if (insideLock) listCallsDuringLock += 1;
+    return origList();
+  };
+  await runDecompose(
+    { epic: 123, apply: true, release: "1.42.0" },
+    DEFAULT_CFG,
+    deps,
+  );
+  assert.ok(deps._lockCalls.length >= 1, "must call withEpicApplyLock");
+  assert.ok(
+    listCallsDuringLock >= 1,
+    "provenance listOpenIssues must run under the epic apply lock",
+  );
+  assert.equal(deps._createIssueCalls.length, 2);
+});
+
+test("decompose: concurrent applies serialize so second reuses first creates", async () => {
+  // Shared store + mutex simulates two simultaneous applies for the same epic.
+  const sharedChildren: Array<{ number: number; body: string }> = [];
+  let nextIssue = 2000;
+  let lockHeld = false;
+  const waiters: Array<() => void> = [];
+  const createCalls: string[] = [];
+
+  const makeConcurrentDeps = (): DecomposeDeps & {
+    _creates: string[];
+  } => {
+    const deps = makeDeps({
+      listOpenIssues: async () =>
+        sharedChildren.map((c) => ({
+          number: c.number,
+          title: "child",
+          body: c.body,
+          labels: [],
+        })),
+      createIssue: async (title, body, labels) => {
+        createCalls.push(title);
+        const num = nextIssue++;
+        sharedChildren.push({ number: num, body });
+        return num;
+      },
+      withEpicApplyLock: async (_domain, _epic, fn) => {
+        // Queue while held — proves serialization, not parallel creates.
+        while (lockHeld) {
+          await new Promise<void>((resolve) => waiters.push(resolve));
+        }
+        lockHeld = true;
+        try {
+          return await fn();
+        } finally {
+          lockHeld = false;
+          const next = waiters.shift();
+          if (next) next();
+        }
+      },
+    });
+    return Object.assign(deps, { _creates: createCalls });
+  };
+
+  const depsA = makeConcurrentDeps();
+  const depsB = makeConcurrentDeps();
+
+  // Overlap: start A, let it enter create of first child, then start B.
+  // Full concurrent Promise.all with shared lock still serializes creates.
+  await Promise.all([
+    runDecompose(
+      { epic: 123, apply: true, release: "1.42.0" },
+      DEFAULT_CFG,
+      depsA,
+    ),
+    runDecompose(
+      { epic: 123, apply: true, release: "1.42.0" },
+      DEFAULT_CFG,
+      depsB,
+    ),
+  ]);
+
+  // Exactly one create per plan key (2 children), not 4.
+  assert.equal(
+    createCalls.length,
+    2,
+    `concurrent applies must not duplicate children; creates=${createCalls.length} titles=${createCalls.join(" | ")}`,
+  );
+  // Shared store has exactly two provenance children for epic 123.
+  const byKey = indexProvenanceByKey(
+    sharedChildren.map((c) => ({
+      number: c.number,
+      title: "c",
+      body: c.body,
+    })),
+    123,
+  );
+  assert.equal(byKey.size, 2);
 });

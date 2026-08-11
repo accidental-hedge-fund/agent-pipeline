@@ -3735,6 +3735,7 @@ async function main(): Promise<void> {
           repo_dir: decomposeCfg.repo_dir,
           repo: decomposeCfg.repo,
           base_branch: decomposeCfg.base_branch,
+          domain: decomposeCfg.domain,
           intake_timeout: decomposeCfg.intake_timeout,
           models: decomposeCfg.models,
           effort: decomposeCfg.effort,

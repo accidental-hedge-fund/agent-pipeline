@@ -69,6 +69,12 @@ Given a valid epic seed, the handler SHALL produce a proposed set of child work 
 - **THEN** the child body SHALL declare that dependency using a form accepted by the shared declared-dependency grammar
 - **AND** a later work-list compile that fully observes lexical sources SHALL include `#A` in that child's declared dependencies
 
+#### Scenario: Plan may depend on existing issue numbers
+
+- **WHEN** a proposed child declares a prerequisite on an existing issue via `depends_on_issue_numbers` (for example `[42]`) in addition to or instead of sibling keys
+- **THEN** plan parse SHALL accept those positive issue numbers
+- **AND** under `--apply` the created child body SHALL include those issue numbers using the shared declared-dependency grammar forms
+
 #### Scenario: Harness is the only model-invoking step for the graph
 
 - **WHEN** decompose runs to successful completion under `--apply`
@@ -175,7 +181,7 @@ Under `--apply`, after successful child creation (or after determining the idemp
 
 ### Requirement: Re-running decompose for the same epic SHALL be idempotent
 
-A second `pipeline decompose --epic N --apply` for an epic that already has decompose-created children SHALL NOT create duplicate child issues for the same logical breakdown. The handler SHALL recognize prior children via a stable provenance marker (for example a machine-readable parent marker and stable child identity key written into each child body at creation time). When the prior set already matches the accepted plan identity, the command SHALL report existing children and MAY still refresh or open a ROADMAP PR only when the roadmap content would change; it SHALL NOT spam duplicate issues. Dry-run re-runs SHALL show the same logical graph without claiming new creates when identity matches.
+A second `pipeline decompose --epic N --apply` for an epic that already has decompose-created children SHALL NOT create duplicate child issues for the same logical breakdown. The handler SHALL recognize prior children via a stable provenance marker (for example a machine-readable parent marker and stable child identity key written into each child body at creation time). When the prior set already matches the accepted plan identity, the command SHALL report existing children and MAY still refresh or open a ROADMAP PR only when the roadmap content would change; it SHALL NOT spam duplicate issues. Dry-run re-runs SHALL show the same logical graph without claiming new creates when identity matches. Under `--apply`, provenance discovery through child creation for a given repository domain and epic SHALL run inside a host-local serialization critical section (recoverable lock released when the section settles) so concurrent same-host applies cannot both observe an empty provenance set and create duplicate children for the same plan keys.
 
 #### Scenario: Second apply does not duplicate children
 
@@ -188,6 +194,13 @@ A second `pipeline decompose --epic N --apply` for an epic that already has deco
 
 - **WHEN** a child issue body contains the decompose provenance marker for parent `#123`
 - **THEN** a subsequent decompose of `#123` SHALL treat that issue as an existing child of that epic for idempotency matching
+
+#### Scenario: Concurrent same-host applies serialize provenance discovery and creates
+
+- **WHEN** two `--apply` invocations for the same domain and epic run concurrently on one host
+- **THEN** provenance discovery through child creation SHALL be serialized for that epic
+- **AND** the second invocation SHALL re-read provenance after acquiring the critical section
+- **AND** it SHALL NOT create a second issue for a plan key already created by the first
 
 ### Requirement: Decompose I/O SHALL be seam-injected under unit test
 

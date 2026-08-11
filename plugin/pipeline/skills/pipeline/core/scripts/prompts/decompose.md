@@ -14,7 +14,8 @@ Each child must include:
 - **out_of_scope** — array of deliberate exclusions for this child.
 - **open_questions** — optional array; include ONLY when a decision is required before implementation. Omit or use [] when decision-complete.
 - **effort** — one of `"S"`, `"M"`, `"L"`, `"XL"`. Prefer S or M. Do not propose XL unless the epic cannot be split further.
-- **depends_on_keys** — array of sibling **key** values this child requires first (empty if none). No cycles.
+- **depends_on_keys** — array of sibling **key** values this child requires first (empty if none). No cycles among keys.
+- **depends_on_issue_numbers** — optional array of **existing** GitHub issue numbers (positive integers) this child requires first. Use when a prerequisite already exists outside this plan. Empty if none.
 
 ## Bounds
 
@@ -55,7 +56,8 @@ Return exactly one JSON object with this shape:
       "out_of_scope": ["…"],
       "open_questions": [],
       "effort": "S",
-      "depends_on_keys": []
+      "depends_on_keys": [],
+      "depends_on_issue_numbers": []
     }
   ]
 }
@@ -66,6 +68,7 @@ Rules:
 1. `children` must be a non-empty array.
 2. Every `key` is unique and non-empty.
 3. Every `depends_on_keys` entry must name another child key in this plan (or be empty).
-4. Graph must be acyclic.
-5. Acceptance criteria are observable outcomes, not "implement X in file Y".
-6. Do NOT wrap the JSON in markdown fences. Do NOT add prose outside the JSON object.
+4. Every `depends_on_issue_numbers` entry must be a positive integer for an existing issue (or the array empty/omitted). Do not put plan keys here.
+5. Graph among sibling keys must be acyclic.
+6. Acceptance criteria are observable outcomes, not "implement X in file Y".
+7. Do NOT wrap the JSON in markdown fences. Do NOT add prose outside the JSON object.
