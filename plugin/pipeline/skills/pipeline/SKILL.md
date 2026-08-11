@@ -92,6 +92,7 @@ distinct `pipeline:<command>` entries in the skill/command menu.
 /pipeline train --milestone <m>|--issues <n,n> [--merge] [--json] Operator-authorized integrate train: dependency-order issues, advance each to ready-to-deploy, optionally merge and prove base containment before the next (never called by the advance loop)
 /pipeline unblock <n> "<answer>"                Post an answer and clear the blocked label
 /pipeline backfill [--apply] [--capability <name>] Preview or apply OpenSpec coverage for legacy behavior (spec-only PR)
+/pipeline decompose --epic <N> [--description "…"] [--apply] [--release vX.Y.Z] [--max-children N] [--max-effort S|M|L|XL] [--allow-xl] Break an epic issue into dependency-linked child issues and a ROADMAP PR (dry-run default; --apply writes; not intake / not roadmap-order-only / not loop-execute)
 /pipeline engine-promote --for <X.Y.Z> [--host all|codex|claude|grok|opencode] [--dry-run] [--json] [--skip-install] Self-host: verify published release, promote production pin, install exact tag to all hosts by default, verify version (rollback pin on install failure)
 /pipeline evals plan|run|grade|report|harvest … Offline eval plan/run/grade/report/harvest (never writes to production GitHub)
 /pipeline factory-gate --for <version> [--from-run <run-id>] [--observations <file>] [--scenario id=status:detail] [--promote-pin-on-pass] Score a durable loop / fixture pack and write immutable FRG evidence (never merges or tags)
@@ -276,6 +277,24 @@ The spec-generation step is the only model call; issue creation and roadmap edit
 are deterministic. The roadmap update is opened as a PR for human review — the
 pipeline never merges. `--release vX.Y.Z` pins the target slot; omitting it
 proposes the first open lane from `ROADMAP.md`.
+
+`decompose` is the **epic work-breakdown** command: one parent epic → N small
+dependency-linked children + a ROADMAP PR. It is **not** intake (1→1), **not**
+roadmap (order existing inventory), and **not** loop (execute). Dry-run is the
+default; `--apply` creates children and opens a ROADMAP PR (never merges).
+
+```bash
+/pipeline decompose --epic 123                         # preview child graph (no writes)
+/pipeline decompose --epic 123 --description "prefer API slices"
+/pipeline decompose --epic 123 --apply --release v1.43.0
+/pipeline decompose --epic 123 --apply --max-children 12 --max-effort M
+```
+
+Child triage: decision-complete bodies get `pipeline:ready`; remaining open
+questions get `pipeline:backlog`. The parent stays open as umbrella, is labeled
+`pipeline:epic`, and is **excluded from default milestone/label loop selectors**
+(explicit issue lists may still name it). Compose next with
+`/pipeline loop --milestone <lane>` or merge-queue after children reach R2D.
 
 `refine-spec` is a **non-mutating** spec-refinement preview command. It accepts
 an existing issue's title and body and returns a refined spec as JSON — no GitHub

@@ -230,7 +230,17 @@ $pipeline N                 # advance issue N (Codex)
 /pipeline:status N          # stage, blocker, PR, last review
 /pipeline:doctor            # deterministic preflight (opt-in --harness-smoke)
 /pipeline:init              # labels + .github/pipeline.yml scaffold
+/pipeline decompose --epic N            # preview epic → child graph (no writes)
+/pipeline decompose --epic N --apply    # create children + ROADMAP PR (never merges)
 ```
+
+`pipeline decompose` breaks one epic issue into small dependency-linked children
+and a human-reviewable ROADMAP PR. It is **not** `intake` (1 description → 1 issue),
+**not** `roadmap` (score/order existing backlog), and **not** `loop` (execute a
+selector). Dry-run is the default. With `--apply`, children get `pipeline:ready`
+when decision-complete or `pipeline:backlog` when open questions remain; the
+parent is labeled `pipeline:epic` and is excluded from default milestone/label
+loop selectors. Then run `pipeline loop --milestone <lane>` on the children.
 
 ## Onboarding a new repo
 

@@ -663,10 +663,13 @@ test("resolveSelectorWorkList: roadmap-slice carries declared edges from ROADMAP
     "| #608 | Depender | _(blocked by #607)_ |",
     "| #607 | Prerequisite | independent |",
   ].join("\n");
+  // listOpenIssues is required for pipeline:epic exclusion on roadmap-slice (#766);
+  // return non-epic inventory so exclusion is a no-op for this edge-carry assertion.
   const deps: SelectorResolveDeps = {
-    listOpenIssues: async () => {
-      throw new Error("listOpenIssues must not be called for roadmap-slice");
-    },
+    listOpenIssues: async () => [
+      { number: 607, labels: [], milestone: null },
+      { number: 608, labels: [], milestone: null },
+    ],
     readRoadmap: async () => roadmap,
   };
   const resolved = await resolveSelectorWorkList(

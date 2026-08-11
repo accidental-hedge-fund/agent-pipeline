@@ -103,6 +103,11 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 - **Usage:** `pipeline backfill [--apply] [--capability <name>]`
 - **Summary:** Preview or apply OpenSpec coverage for legacy behavior (spec-only PR)
 
+#### `decompose`
+
+- **Usage:** `pipeline decompose --epic <N> [--description "…"] [--apply] [--release vX.Y.Z] [--max-children N] [--max-effort S|M|L|XL] [--allow-xl]`
+- **Summary:** Break an epic issue into dependency-linked child issues and a ROADMAP PR (dry-run default; --apply writes; not intake / not roadmap-order-only / not loop-execute)
+
 #### `engine-promote`
 
 - **Usage:** `pipeline engine-promote --for <X.Y.Z> [--host all|codex|claude|grok|opencode] [--dry-run] [--json] [--skip-install]`

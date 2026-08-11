@@ -204,6 +204,28 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
     supportsJson: false,
   },
 
+  // Epic work-breakdown (#766): dry-run default; GitHub writes only under --apply.
+  decompose: {
+    needsIssueNumber: false,
+    allowedFlags: new Set([
+      "repoPath",
+      "base",
+      "profile",
+      "epic",
+      "description",
+      "apply",
+      "release",
+      "maxChildren",
+      "maxEffort",
+      "allowXl",
+      "dryRun",
+    ]),
+    needsConfig: true,
+    needsGhAuth: true,
+    mutatesGitHub: true,
+    supportsJson: false,
+  },
+
   triage: {
     needsIssueNumber: false,
     allowedFlags: new Set(["repoPath", "base", "profile", "stage"]),

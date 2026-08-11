@@ -171,6 +171,25 @@ Nested fields:
 - **Type:** number
 - **Description:** Trailing window (hours) over which correction_event records are clustered for auto-filing.
 
+### `decompose`
+
+- **Type:** object
+- **Description:** Epic decompose bounds (#766). CLI --max-children / --max-effort override for one invocation.
+
+Nested fields:
+
+#### `decompose.max_children`
+
+- **Type:** integer
+- **Description:** Maximum child issues a single decompose plan may propose (default: 12).
+
+#### `decompose.max_effort`
+
+- **Type:** enum
+- **Description:** Maximum child effort band without --allow-xl (default: M).
+
+- **Allowed values:** `S`, `M`, `L`, `XL`
+
 ### `design_gate`
 
 - **Type:** object

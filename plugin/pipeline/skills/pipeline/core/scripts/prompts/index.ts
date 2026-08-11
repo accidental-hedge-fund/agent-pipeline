@@ -866,6 +866,31 @@ export function buildSweepPrompt(a: BuildSweepArgs): string {
   });
 }
 
+export interface BuildDecomposeArgs {
+  epicTitle: string;
+  epicBody: string;
+  descriptionSeed: string;
+  maxChildren: number;
+  maxEffort: string;
+  repoContext: string;
+}
+
+export function buildDecomposePrompt(a: BuildDecomposeArgs): string {
+  const seed =
+    a.descriptionSeed && a.descriptionSeed.trim()
+      ? a.descriptionSeed.trim()
+      : "(none)";
+  return substitute(loadTemplate("decompose"), {
+    epic_title: a.epicTitle,
+    epic_body: a.epicBody || "(no description)",
+    description_seed: seed,
+    max_children: String(a.maxChildren),
+    max_effort: a.maxEffort,
+    repo_context: a.repoContext,
+    no_tools_instruction: SPEC_GENERATION_TOOL_FREE_BLOCK,
+  });
+}
+
 export interface BuildRefineSpecArgs {
   title: string;
   body: string;

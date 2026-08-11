@@ -119,6 +119,13 @@ export const OPERATION_SURFACE = [
     fast: false,
   },
   {
+    name: "decompose",
+    desc: "Break an epic issue into dependency-linked child issues and a ROADMAP PR (dry-run default; --apply writes)",
+    argHint: "--epic <N> [--description \"…\"] [--apply] [--release vX.Y.Z] [--max-children N] [--max-effort S|M|L|XL] [--allow-xl]",
+    cliArgs: "decompose $ARGUMENTS",
+    fast: false,
+  },
+  {
     name: "sweep",
     desc: "Batch re-spec thin issues and reconcile ROADMAP.md",
     argHint: "[--apply] [--repo <owner/repo>]",

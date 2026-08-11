@@ -758,6 +758,15 @@ const PartialConfigSchema = z.object({
     .strict()
     .optional()
     .describe("Sweep backlog maintenance pass settings (#168)."),
+  // Epic decompose (#766). Optional bounds; CLI flags override for one invocation.
+  decompose: z
+    .object({
+      max_children: z.number().int().positive().optional().describe("Maximum child issues a single decompose plan may propose (default: 12)."),
+      max_effort: z.enum(["S", "M", "L", "XL"]).optional().describe("Maximum child effort band without --allow-xl (default: M)."),
+    })
+    .strict()
+    .optional()
+    .describe("Epic decompose bounds (#766). CLI --max-children / --max-effort override for one invocation."),
   // Queue batch factory operation mode (#305). Optional operator defaults.
   // CLI flags take precedence over these config values, which take precedence
   // over the built-in defaults (maxIssues=10, concurrency=1, maxFailureRate=1.0).
@@ -1544,6 +1553,7 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
       ? { ...fileConfig.roadmap, release_model: fileConfig.roadmap.release_model ?? "semver" }
       : fileConfig.roadmap,
     sweep: fileConfig.sweep,
+    decompose: fileConfig.decompose,
     queue: fileConfig.queue,
     context_snapshot: fileConfig.context_snapshot,
     auto_merge_eligibility: {
@@ -2896,6 +2906,14 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
         `#   min_body_length: 150 # ${sd("sweep.min_body_length", "minimum body character count for an issue to be considered sufficient (default: 150)")}`,
         `#   required_sections: ["Summary", "User story", "Acceptance criteria", "Out of scope"] # ${sd("sweep.required_sections", "section headings (without ##) that must be present for an issue to be considered sufficient")}`,
       ].join("\n"),
+    config.decompose !== undefined
+      ? `\ndecompose: # epic decompose bounds (#766)\n${yamlBlock(config.decompose, 2)}`
+      : [
+        "",
+        "# decompose: # epic decompose bounds (#766) — uncomment to override; absent (default): max_children 12, max_effort M",
+        `#   max_children: 12 # ${sd("decompose.max_children", "maximum child issues a single decompose plan may propose (default: 12)")}`,
+        `#   max_effort: M # ${sd("decompose.max_effort", "maximum child effort band without --allow-xl (default: M)")}`,
+      ].join("\n"),
     config.trusted_override_actors !== undefined
       ? `\ntrusted_override_actors: # additional GitHub identities trusted for override sentinels (#229)\n${yamlBlock(config.trusted_override_actors, 2)}`
       : [
@@ -3058,6 +3076,7 @@ function normalizeForSync(config: PartialConfig): unknown {
       ? { ...config.roadmap, release_model: config.roadmap.release_model ?? "semver" }
       : undefined,
     sweep: config.sweep,
+    decompose: config.decompose,
     queue: config.queue,
     auto_merge_eligibility: { ...d.auto_merge_eligibility, ...config.auto_merge_eligibility },
     context_snapshot: config.context_snapshot,
