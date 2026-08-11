@@ -1022,19 +1022,28 @@ export function parseReleaseMilestonesStdout(stdout: string): ReleaseMilestoneAp
 /**
  * Version-aware milestone title match (title contains `vX.Y.Z` or a bare
  * `X.Y.Z` token bounded so it does not match a different patch/minor).
+ *
+ * Returns the sole matching milestone, or null when none match.
+ * When two or more milestones match, throws {@link ambiguousMilestoneError}
+ * so live prepare cannot silently pick an arbitrary REST-list order entry
+ * and open a release PR with the wrong plan membership (#985 review 2).
  */
 export function findMilestoneMatchingVersion(
   milestones: ReleaseMilestoneApiRaw[],
   version: string,
 ): ReleaseMilestoneApiRaw | null {
-  const match = milestones.find((m) => {
+  const matches = milestones.filter((m) => {
     const t = m.title ?? "";
     return (
       t.includes(`v${version}`) ||
       new RegExp(`(?:^|[^0-9.])${escapeRegex(version)}(?:[^0-9.]|$)`).test(t)
     );
   });
-  return match ?? null;
+  if (matches.length === 0) return null;
+  if (matches.length > 1) {
+    throw ambiguousMilestoneError(version, matches);
+  }
+  return matches[0]!;
 }
 
 /**
@@ -1069,6 +1078,32 @@ export function missingMilestoneError(version: string): Error {
     `[pipeline release] no GitHub milestone matching version ${version}. ` +
       `Release plan membership is milestone-authoritative. ` +
       `Create the milestone and assign planned issues, or run \`pipeline roadmap --apply\`, then retry.`,
+  );
+}
+
+/**
+ * Live-prepare error when more than one GitHub milestone matches the version.
+ * GitHub permits duplicate titles; REST list order is not a disambiguation contract.
+ */
+export function ambiguousMilestoneError(
+  version: string,
+  matches: Array<{ number: number; title: string }>,
+): Error {
+  const listed = matches
+    .map((m) => `#${m.number} "${m.title ?? ""}"`)
+    .join("; ");
+  return new Error(
+    `[pipeline release] ambiguous GitHub milestones matching version ${version}: ${listed}. ` +
+      `Release plan membership requires exactly one matching milestone. ` +
+      `Rename or close the extras so only one title matches v${version} (or bare ${version}), then retry.`,
+  );
+}
+
+/** True when `err` is an {@link ambiguousMilestoneError} (by message contract). */
+export function isAmbiguousMilestoneError(err: unknown): boolean {
+  return (
+    err instanceof Error &&
+    /\[pipeline release\] ambiguous GitHub milestones matching version /.test(err.message)
   );
 }
 
@@ -1862,6 +1897,13 @@ export async function runRelease(
         milestoneStatus = "absent";
       }
     } catch (err) {
+      // Ambiguous matches are fail-closed on live prepare: do not wrap as
+      // "unavailable" (that would obscure remediation) and do not pick one.
+      // Dry-run still soft-fails as unavailable with the ambiguous reason so
+      // it does not invent membership or open a PR.
+      if (!opts.dryRun && isAmbiguousMilestoneError(err)) {
+        throw err;
+      }
       milestoneStatus = "unavailable";
       milestoneUnavailableReason = err instanceof Error ? err.message : String(err);
     }

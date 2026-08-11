@@ -35,6 +35,8 @@ import {
   computeUnifiedDiff,
   formatMilestoneStatusLine,
   missingMilestoneError,
+  ambiguousMilestoneError,
+  isAmbiguousMilestoneError,
   listReleaseMilestonesApiArgs,
   parseReleaseMilestonesStdout,
   findMilestoneMatchingVersion,
@@ -608,6 +610,47 @@ test("parseReleaseMilestonesStdout + findMilestoneMatchingVersion: match beyond 
 
   // Absent version returns null (empty plan / live fail-closed path).
   assert.equal(findMilestoneMatchingVersion(milestones, "9.9.9"), null);
+});
+
+// #985 review 2: GitHub allows duplicate milestone titles; REST list order is
+// not a release-plan disambiguation contract. Multiple matches must fail closed
+// rather than silently selecting the first entry (wrong plan membership).
+test("findMilestoneMatchingVersion: duplicate matching milestones fail closed (#985)", () => {
+  const milestones = [
+    { number: 10, title: "v1.36.0 — old accidental" },
+    { number: 11, title: "unrelated" },
+    { number: 20, title: "v1.36.0 — intended canonical" },
+  ];
+  assert.throws(
+    () => findMilestoneMatchingVersion(milestones, "1.36.0"),
+    (err: Error) => {
+      assert.ok(isAmbiguousMilestoneError(err), `expected ambiguous error, got: ${err.message}`);
+      assert.ok(err.message.includes("1.36.0"), err.message);
+      assert.ok(err.message.includes("#10"), err.message);
+      assert.ok(err.message.includes("#20"), err.message);
+      assert.ok(err.message.includes("old accidental"), err.message);
+      assert.ok(err.message.includes("intended canonical"), err.message);
+      assert.ok(
+        /exactly one matching milestone|Rename or close/i.test(err.message),
+        err.message,
+      );
+      return true;
+    },
+  );
+  // Sole match still returns that milestone (no throw).
+  assert.equal(
+    findMilestoneMatchingVersion(
+      [{ number: 20, title: "v1.36.0 — intended canonical" }],
+      "1.36.0",
+    )?.number,
+    20,
+  );
+  // Helper message contract used by live prepare rethrow path.
+  const helperErr = ambiguousMilestoneError("1.36.0", [
+    { number: 10, title: "v1.36.0 — a" },
+    { number: 20, title: "v1.36.0 — b" },
+  ]);
+  assert.ok(isAmbiguousMilestoneError(helperErr));
 });
 
 test("themeFromMilestoneTitle: strips version prefix", () => {
@@ -2158,6 +2201,47 @@ test("runRelease: missing milestone aborts live prepare with remediation (#985)"
   assert.equal(writes.length, 0, "no files written when milestone is absent");
   // Helper matches the same remediation contract.
   assert.match(missingMilestoneError("1.6.0").message, /1\.6\.0/);
+});
+
+// #985 review 2: duplicate matching milestones must not silently select one plan.
+// fetchMilestoneForVersion throws the finder ambiguity error (as real deps do);
+// live prepare rethrows it (not wrapped as unavailable) and opens no PR.
+test("runRelease: ambiguous matching milestones abort live prepare (#985)", async () => {
+  const writes: string[] = [];
+  const deps = makeDeps({
+    readFile: (p) => {
+      if (p.endsWith("core/package.json")) return SAMPLE_CORE_PKG;
+      if (p.endsWith("package.json")) return SAMPLE_ROOT_PKG;
+      if (p.endsWith("ROADMAP.md")) return SAMPLE_ROADMAP;
+      throw new Error(`unexpected read: ${p}`);
+    },
+    writeFile: (p) => { writes.push(p); },
+    fetchMilestoneForVersion: async (version) => {
+      // Simulate real deps: list yields two version matches with different issue sets.
+      findMilestoneMatchingVersion(
+        [
+          { number: 10, title: `v${version} — old accidental` },
+          { number: 20, title: `v${version} — intended` },
+        ],
+        version,
+      );
+      return null;
+    },
+  });
+  await assert.rejects(
+    () => runRelease("1.6.0", { noEdit: true }, { repo_dir: "/repo", repo: "org/repo" }, deps),
+    (err: Error) => {
+      assert.ok(isAmbiguousMilestoneError(err), `got: ${err.message}`);
+      assert.ok(err.message.includes("#10") && err.message.includes("#20"), err.message);
+      // Must not be re-wrapped as generic unavailable (would hide remediation).
+      assert.ok(
+        !err.message.startsWith("[pipeline release] could not load GitHub milestone"),
+        err.message,
+      );
+      return true;
+    },
+  );
+  assert.equal(writes.length, 0, "no files written when milestones are ambiguous");
 });
 
 test("runRelease: milestone present with membership matching shipped issues succeeds (#985)", async () => {

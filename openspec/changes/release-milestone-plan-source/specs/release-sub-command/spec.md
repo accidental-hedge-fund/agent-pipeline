@@ -39,6 +39,28 @@ When `pipeline release` runs a **live** prepare (not dry-run) under the SemVer r
 
 ---
 
+### Requirement: Live release prepare SHALL fail closed when multiple milestones match the version
+
+When `pipeline release` runs a **live** prepare (not dry-run) under the SemVer release path and **more than one** GitHub milestone matches the resolved version by the version-aware title rules, the command SHALL exit non-zero **before** opening a release pull request. The error SHALL name the resolved version and identify the matching milestones (numbers and/or titles) with remediation to keep exactly one canonical match (rename or close extras). The command SHALL NOT silently select the first REST-list entry, and SHALL NOT invent plan membership from an arbitrary match.
+
+GitHub permits duplicate milestone titles; list ordering is not a release-plan disambiguation contract.
+
+#### Scenario: Duplicate matching milestones abort live prepare
+
+- **WHEN** the operator runs a live `pipeline release 1.36.0`
+- **AND** two or more GitHub milestones match version `1.36.0` (for example an accidental old `v1.36.0` and an intended one with different issue membership)
+- **THEN** the command SHALL exit non-zero naming version `1.36.0` and the ambiguity
+- **AND** SHALL NOT open a release pull request as a successful completion
+- **AND** SHALL NOT treat either matching milestone as the sole plan authority without operator disambiguation
+
+#### Scenario: Exactly one matching milestone is required for plan resolution
+
+- **WHEN** exactly one GitHub milestone matches the resolved version
+- **THEN** plan membership resolution SHALL use that milestone
+- **AND** the ambiguous-milestone refusal SHALL NOT apply
+
+---
+
 ### Requirement: Stale or missing ROADMAP plan anchors SHALL NOT block a milestone-backed release
 
 When planned membership has been resolved from a matching GitHub milestone (or live prepare has already failed closed for a missing milestone), the release path SHALL NOT abort solely because:
