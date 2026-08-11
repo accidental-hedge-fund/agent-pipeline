@@ -55,9 +55,9 @@ export interface ReleaseOpts {
   dryRun?: boolean;
   noEdit?: boolean;
   /**
-   * Optional theme for a scaffolded release-plan row when none exists for the
-   * resolved version. Precedence: CLI `--theme` → existing plan-row theme →
-   * matching milestone title → {@link PLAN_ROW_THEME_PLACEHOLDER}.
+   * Optional theme for the release PR title and any best-effort ROADMAP plan-row
+   * documentation. Precedence: CLI `--theme` → matching milestone title →
+   * {@link PLAN_ROW_THEME_PLACEHOLDER}. ROADMAP plan-row Theme is not authority.
    */
   theme?: string;
   /**
@@ -96,11 +96,22 @@ export interface ShippedPR {
   title: string;
 }
 
-/** Milestone metadata used only for plan-row scaffold theme/issues (#730). */
+/**
+ * Milestone metadata for release plan membership (#985).
+ * GitHub milestones are the sole authority for planned issue numbers.
+ */
 export interface ReleaseMilestoneInfo {
   title: string;
+  /** Non-PR issue numbers assigned to the milestone (open + closed). */
   issueNumbers: number[];
+  /** Open non-PR issues on the milestone (dry-run / status reporting). */
+  openIssueCount: number;
+  /** Total non-PR issues on the milestone (open + closed). */
+  totalIssueCount: number;
 }
+
+/** Dry-run / prepare report for the matching version milestone. */
+export type MilestoneStatusKind = "present" | "absent" | "unavailable";
 
 export interface ReleaseContext {
   version: string;
@@ -119,8 +130,8 @@ export interface ReleaseContext {
 }
 
 /**
- * Documented placeholder when no theme is available from CLI, plan row, or milestone.
- * Matches {@link extractTheme}'s missing-row return value.
+ * Documented placeholder when no theme is available from CLI or milestone.
+ * Matches {@link extractTheme}'s missing-row return value (docs-only helper).
  */
 export const PLAN_ROW_THEME_PLACEHOLDER = "<theme>";
 
@@ -184,10 +195,10 @@ export interface ReleaseDeps {
    */
   requireFrgPass?(repoDir: string, version: string): Promise<FrgEvidence>;
   /**
-   * Optional: look up a GitHub milestone matching the resolved version for
-   * plan-row scaffold theme/issues (#730). Return null when none matches or
-   * discovery is unavailable. Soft-fail preferred — callers must not block
-   * ensure solely on milestone fetch. Dry-run paths typically omit the call.
+   * Look up a GitHub milestone matching the resolved version (#985).
+   * Return null when listed milestones contain no match (absent).
+   * Throw on network/auth/API failure so dry-run can report `unavailable`
+   * and live prepare can fail closed. Planned membership is milestone-only.
    */
   fetchMilestoneForVersion?(version: string): Promise<ReleaseMilestoneInfo | null>;
   /**
@@ -318,70 +329,85 @@ export function realReleaseDeps(repoDir?: string): ReleaseDeps {
     stdout: (msg) => process.stdout.write(msg + "\n"),
     stderr: (msg) => process.stderr.write(msg + "\n"),
     fetchMilestoneForVersion: async (version) => {
-      // Soft-fail: theme/issues fall back to placeholders when discovery fails.
-      try {
-        const repoResult = spawnSync(
-          "gh",
-          ["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"],
-          { encoding: "utf8", stdio: "pipe", cwd: repoDir },
+      // null = no matching milestone (absent). Throw on API/network failure so
+      // callers can fail closed (live) or report unavailable (dry-run).
+      const repoResult = spawnSync(
+        "gh",
+        ["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"],
+        { encoding: "utf8", stdio: "pipe", cwd: repoDir },
+      );
+      if (repoResult.status !== 0) {
+        throw new Error(
+          `gh repo view failed (exit ${repoResult.status}): ${repoResult.stderr?.trim() ?? ""}`,
         );
-        if (repoResult.status !== 0) return null;
-        const repo = repoResult.stdout.trim();
-        if (!repo) return null;
-
-        const msResult = spawnSync(
-          "gh",
-          ["api", `repos/${repo}/milestones?state=all&per_page=100`],
-          { encoding: "utf8", stdio: "pipe", cwd: repoDir, maxBuffer: 10 * 1024 * 1024 },
-        );
-        if (msResult.status !== 0) return null;
-        const milestones = JSON.parse(msResult.stdout || "[]") as Array<{
-          number: number;
-          title: string;
-        }>;
-        const match = milestones.find((m) => {
-          const t = m.title ?? "";
-          return (
-            t.includes(`v${version}`) ||
-            new RegExp(`(?:^|[^0-9.])${escapeRegex(version)}(?:[^0-9.]|$)`).test(t)
-          );
-        });
-        if (!match) return null;
-
-        const issuesResult = spawnSync(
-          "gh",
-          [
-            "api",
-            `repos/${repo}/issues?milestone=${match.number}&state=all&per_page=100`,
-            "--paginate",
-          ],
-          { encoding: "utf8", stdio: "pipe", cwd: repoDir, maxBuffer: 20 * 1024 * 1024 },
-        );
-        let issueNumbers: number[] = [];
-        if (issuesResult.status === 0 && issuesResult.stdout.trim()) {
-          // --paginate without --slurp concatenates JSON arrays; parse each page blob.
-          const raw = issuesResult.stdout.trim();
-          let items: Array<{ number?: number; pull_request?: unknown }> = [];
-          try {
-            items = JSON.parse(raw) as typeof items;
-          } catch {
-            // Multi-page concat: split on "][" boundaries
-            const joined = raw.replace(/\]\s*\[/g, ",");
-            try {
-              items = JSON.parse(joined) as typeof items;
-            } catch {
-              items = [];
-            }
-          }
-          // Milestones list both issues and PRs; plan-row Issues column wants issues.
-          issueNumbers = items
-            .filter((i) => i && typeof i.number === "number" && !i.pull_request)
-            .map((i) => i.number as number);
-        }
-        return { title: match.title, issueNumbers };
-      } catch {
-        return null;
       }
+      const repo = repoResult.stdout.trim();
+      if (!repo) {
+        throw new Error("gh repo view returned empty nameWithOwner");
+      }
+
+      const msResult = spawnSync(
+        "gh",
+        listReleaseMilestonesApiArgs(repo),
+        { encoding: "utf8", stdio: "pipe", cwd: repoDir, maxBuffer: 10 * 1024 * 1024 },
+      );
+      if (msResult.status !== 0) {
+        throw new Error(
+          `gh api milestones failed (exit ${msResult.status}): ${msResult.stderr?.trim() ?? ""}`,
+        );
+      }
+      // Paginate to completion (#985 review): a match beyond page 1 must not
+      // be treated as absent (fail-closed live prepare would block valid releases).
+      const milestones = parseReleaseMilestonesStdout(msResult.stdout || "[]");
+      const match = findMilestoneMatchingVersion(milestones, version);
+      if (!match) return null;
+
+      const issuesResult = spawnSync(
+        "gh",
+        [
+          "api",
+          `repos/${repo}/issues?milestone=${match.number}&state=all&per_page=100`,
+          "--paginate",
+        ],
+        { encoding: "utf8", stdio: "pipe", cwd: repoDir, maxBuffer: 20 * 1024 * 1024 },
+      );
+      if (issuesResult.status !== 0) {
+        throw new Error(
+          `gh api milestone issues failed (exit ${issuesResult.status}): ${issuesResult.stderr?.trim() ?? ""}`,
+        );
+      }
+      let items: Array<{
+        number?: number;
+        pull_request?: unknown;
+        state?: string;
+      }> = [];
+      if (issuesResult.stdout.trim()) {
+        // --paginate without --slurp concatenates JSON arrays; parse each page blob.
+        const raw = issuesResult.stdout.trim();
+        try {
+          items = JSON.parse(raw) as typeof items;
+        } catch {
+          // Multi-page concat: split on "][" boundaries
+          const joined = raw.replace(/\]\s*\[/g, ",");
+          try {
+            items = JSON.parse(joined) as typeof items;
+          } catch {
+            throw new Error("gh api milestone issues returned unparseable JSON");
+          }
+        }
+      }
+      // Milestones list both issues and PRs; plan membership is non-PR issues only.
+      const nonPr = items.filter(
+        (i) => i && typeof i.number === "number" && !i.pull_request,
+      );
+      const issueNumbers = nonPr.map((i) => i.number as number);
+      const openIssueCount = nonPr.filter((i) => (i.state ?? "open") === "open").length;
+      return {
+        title: match.title,
+        issueNumbers,
+        openIssueCount,
+        totalIssueCount: nonPr.length,
+      };
     },
     listOpenSoakDefectCandidates: async () => listSoakDefectCandidatesReal("open", repoDir),
     listClosedSoakDefectCandidates: async () => listSoakDefectCandidatesReal("closed", repoDir),
@@ -942,22 +968,151 @@ export function themeFromMilestoneTitle(title: string, version: string): string 
 }
 
 /**
- * Resolve theme for release scaffold: CLI `--theme` → plan-row theme → milestone
- * title → documented placeholder.
+ * Resolve theme for release PR / docs: CLI `--theme` → milestone title →
+ * documented placeholder. ROADMAP plan-row Theme is not authority (#985).
  */
 export function resolveReleaseTheme(args: {
   cliTheme?: string;
-  roadmapText: string;
+  /** Unused for theme authority; retained for call-site compatibility. */
+  roadmapText?: string;
   version: string;
   milestoneTitle?: string | null;
 }): string {
   if (args.cliTheme?.trim()) return args.cliTheme.trim();
-  const fromRow = extractTheme(args.roadmapText, args.version);
-  if (fromRow !== PLAN_ROW_THEME_PLACEHOLDER) return fromRow;
   if (args.milestoneTitle?.trim()) {
     return themeFromMilestoneTitle(args.milestoneTitle.trim(), args.version);
   }
   return PLAN_ROW_THEME_PLACEHOLDER;
+}
+
+/**
+ * `gh api` args for every repo milestone (open+closed), paginated to completion.
+ * `--paginate` follows Link headers past the first `per_page=100` page so a
+ * matching release milestone on a later page is not treated as absent (#985).
+ * `--slurp` yields a JSON array of pages for reliable multi-page parse.
+ */
+export function listReleaseMilestonesApiArgs(repo: string): string[] {
+  return [
+    "api",
+    `repos/${repo}/milestones?state=all&per_page=100`,
+    "--paginate",
+    "--slurp",
+  ];
+}
+
+export type ReleaseMilestoneApiRaw = {
+  number: number;
+  title: string;
+};
+
+/**
+ * Flatten paginated milestone list stdout from `gh api ... --paginate --slurp`
+ * (`[[page1...], [page2...]]`) or a single-page bare array.
+ */
+export function parseReleaseMilestonesStdout(stdout: string): ReleaseMilestoneApiRaw[] {
+  const raw = JSON.parse(stdout.trim() || "[]") as unknown;
+  if (!Array.isArray(raw)) return [];
+  if (raw.length > 0 && Array.isArray(raw[0])) {
+    return (raw as ReleaseMilestoneApiRaw[][]).flat();
+  }
+  // Non-slurp single page, or --paginate concat repaired by callers.
+  return raw as ReleaseMilestoneApiRaw[];
+}
+
+/**
+ * Version-aware milestone title match (title contains `vX.Y.Z` or a bare
+ * `X.Y.Z` token bounded so it does not match a different patch/minor).
+ *
+ * Returns the sole matching milestone, or null when none match.
+ * When two or more milestones match, throws {@link ambiguousMilestoneError}
+ * so live prepare cannot silently pick an arbitrary REST-list order entry
+ * and open a release PR with the wrong plan membership (#985 review 2).
+ */
+export function findMilestoneMatchingVersion(
+  milestones: ReleaseMilestoneApiRaw[],
+  version: string,
+): ReleaseMilestoneApiRaw | null {
+  const matches = milestones.filter((m) => {
+    const t = m.title ?? "";
+    return (
+      t.includes(`v${version}`) ||
+      new RegExp(`(?:^|[^0-9.])${escapeRegex(version)}(?:[^0-9.]|$)`).test(t)
+    );
+  });
+  if (matches.length === 0) return null;
+  if (matches.length > 1) {
+    throw ambiguousMilestoneError(version, matches);
+  }
+  return matches[0]!;
+}
+
+/**
+ * Format dry-run / prepare milestone status line for the resolved version.
+ * Does not invent membership when status is absent or unavailable.
+ */
+export function formatMilestoneStatusLine(
+  version: string,
+  status: MilestoneStatusKind,
+  counts?: { open: number; total?: number },
+  reason?: string,
+): string {
+  if (status === "present") {
+    const open = counts?.open ?? 0;
+    const totalPart =
+      counts?.total != null ? `, total non-PR: ${counts.total}` : "";
+    return (
+      `[pipeline release] milestone: present for ${version}` +
+      ` (open issues: ${open}${totalPart})`
+    );
+  }
+  if (status === "absent") {
+    return `[pipeline release] milestone: absent for ${version}`;
+  }
+  const detail = reason?.trim() ? ` (${reason.trim()})` : "";
+  return `[pipeline release] milestone: unavailable for ${version}${detail}`;
+}
+
+/** Live-prepare error when the matching GitHub milestone is missing. */
+export function missingMilestoneError(version: string): Error {
+  return new Error(
+    `[pipeline release] no GitHub milestone matching version ${version}. ` +
+      `Release plan membership is milestone-authoritative. ` +
+      `Create the milestone and assign planned issues, or run \`pipeline roadmap --apply\`, then retry.`,
+  );
+}
+
+/**
+ * Live-prepare error when more than one GitHub milestone matches the version.
+ * GitHub permits duplicate titles; REST list order is not a disambiguation contract.
+ */
+export function ambiguousMilestoneError(
+  version: string,
+  matches: Array<{ number: number; title: string }>,
+): Error {
+  const listed = matches
+    .map((m) => `#${m.number} "${m.title ?? ""}"`)
+    .join("; ");
+  return new Error(
+    `[pipeline release] ambiguous GitHub milestones matching version ${version}: ${listed}. ` +
+      `Release plan membership requires exactly one matching milestone. ` +
+      `Rename or close the extras so only one title matches v${version} (or bare ${version}), then retry.`,
+  );
+}
+
+/** True when `err` is an {@link ambiguousMilestoneError} (by message contract). */
+export function isAmbiguousMilestoneError(err: unknown): boolean {
+  return (
+    err instanceof Error &&
+    /\[pipeline release\] ambiguous GitHub milestones matching version /.test(err.message)
+  );
+}
+
+/** Live-prepare error when milestone lookup fails (network/auth/API). */
+export function unavailableMilestoneError(version: string, reason: string): Error {
+  return new Error(
+    `[pipeline release] could not load GitHub milestone for version ${version}: ${reason}. ` +
+      `Release plan membership is milestone-authoritative; retry when GitHub is available.`,
+  );
 }
 
 /** Format Issues column from discovered numbers; placeholder when empty. */
@@ -1230,10 +1385,8 @@ export function stampPerIssueTable(
 
 /**
  * Count per-issue ROADMAP rows planned for `version` (`→ Release == vX.Y.Z`) and how
- * many of those would be stamped given `shippedIssueNumbers`. Used to block a live
- * release that would otherwise write an inconsistent ROADMAP — shipped PRs exist and
- * the table has rows for this version, but none can be stamped because the shipped
- * PRs resolved no matching closing issues (e.g. empty `closingIssuesReferences`) (#170).
+ * many of those would be stamped given `shippedIssueNumbers`. Advisory only (#985):
+ * stamp mismatch no longer aborts release prepare; milestones own plan membership.
  */
 export function countPerIssueRows(
   text: string,
@@ -1426,9 +1579,12 @@ export function insertDetailSectionBullet(
 }
 
 /**
- * Ensure a plan row for the version (insert when missing), then apply the
- * remaining ROADMAP ship mutations that stay forward-looking (#597):
- * compact release-plan row ✅ shipped + per-issue table stamps.
+ * Best-effort ROADMAP documentation updates for a release (#597 / #985):
+ * ensure/insert plan row when anchors allow, compact ✅ ship-mark, per-issue stamps.
+ *
+ * ROADMAP is **not** plan authority — GitHub milestones own planned membership.
+ * Missing `release-plan-row` / `release-plan-none-row` / per-issue anchors
+ * warn and skip; they do not abort prepare.
  *
  * Does **not** accrete free-form "## Shipped" prose or intro-chain history —
  * those surfaces were retired in favor of generated CHANGELOG.md. The pure
@@ -1440,32 +1596,52 @@ export function insertDetailSectionBullet(
  * Post-tag refresh is owned by auto-tag-release.yml via
  * `scripts/release-docs-refresh.mjs` / `release-docs-refresh.ts` (#978).
  *
- * Throws with a named-anchor error on the first missing site (or plan-row
- * remediation when insert is impossible).
- * The optional `warn` callback is forwarded to stampPerIssueTable for
- * per-row "planned but not shipped" notifications.
+ * The optional `warn` callback receives skip/stamp notices.
  */
 export function scaffoldRoadmap(
   roadmapText: string,
   ctx: ReleaseContext,
   warn?: (msg: string) => void,
 ): string {
+  // Milestone membership is primary for Issues column; merge shipped discovery.
   const planIssues = formatPlanRowIssues([
     ...(ctx.planIssueNumbers ?? []),
     ...(ctx.shippedIssueNumbers ?? []),
   ]);
-  let text = ensureReleasePlanRow(roadmapText, {
-    version: ctx.version,
-    theme: ctx.theme,
-    issues: planIssues,
-    why: planRowScaffoldWhy(ctx.version),
-  });
+  let text = roadmapText;
+  try {
+    text = ensureReleasePlanRow(text, {
+      version: ctx.version,
+      theme: ctx.theme,
+      issues: planIssues,
+      why: planRowScaffoldWhy(ctx.version),
+    });
+  } catch (err) {
+    warn?.(
+      `[pipeline release] warning: skipping release-plan-row documentation update — ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
   // #597 / #978: do not call patchIntroLine / prependShippedBlock — CHANGELOG.md
   // is generator-owned from git tags; the shipped ## [X.Y.Z] section is written
   // by post-tag docs refresh (auto-tag), not prepare. ROADMAP keeps only
-  // forward plan + compact ✅ markers.
-  text = patchReleasePlanRow(text, ctx);
-  text = stampPerIssueTable(text, ctx, warn);
+  // derived docs + compact ✅ markers when anchors exist.
+  try {
+    text = patchReleasePlanRow(text, ctx);
+  } catch (err) {
+    warn?.(
+      `[pipeline release] warning: skipping release-plan-row ship-mark — ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  try {
+    text = stampPerIssueTable(text, ctx, warn);
+  } catch (err) {
+    warn?.(
+      `[pipeline release] warning: skipping per-issue ROADMAP stamps — ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
   return text;
 }
 
@@ -1528,8 +1704,8 @@ export function buildPRBody(
 /**
  * For each shipped PR, fetch the GitHub issue numbers it closes and return the
  * deduplicated union plus a `hadFailures` flag. A failure means the GitHub API
- * call returned non-zero — the caller should abort in live mode rather than
- * silently producing an incomplete per-issue ROADMAP stamp.
+ * call returned non-zero — the caller may warn and continue (ROADMAP stamps are
+ * best-effort documentation under #985).
  */
 export async function collectShippedIssueNumbers(
   prs: ShippedPR[],
@@ -1692,47 +1868,96 @@ export async function runRelease(
     }
   }
 
-  // 4. Read ROADMAP and resolve theme / plan-row issue sources.
-  //    Dry-run stays local-only (no milestone fetch). Live path may soft-fetch a
-  //    matching milestone for theme/issues when scaffolding a missing plan row (#730).
+  // 4. Resolve plan membership from the matching GitHub milestone (#985).
+  //    Milestones are the sole authority for planned issues. ROADMAP is
+  //    best-effort derived documentation only.
+  //    Dry-run MAY perform a read-only milestone lookup; live prepare fails
+  //    closed when the milestone is missing or lookup fails.
   const roadmapText = d.readFile(roadmapPath);
   const today = d.today();
 
   let milestoneTitle: string | null = null;
   let planIssueNumbers: number[] = [];
-  if (!opts.dryRun && d.fetchMilestoneForVersion) {
+  let milestoneOpenCount = 0;
+  let milestoneTotalCount = 0;
+  let milestoneStatus: MilestoneStatusKind = "unavailable";
+  let milestoneUnavailableReason: string | undefined;
+
+  const fetchMs = d.fetchMilestoneForVersion;
+  if (fetchMs) {
     try {
-      const ms = await d.fetchMilestoneForVersion(resolvedVersion);
+      const ms = await fetchMs(resolvedVersion);
       if (ms) {
+        milestoneStatus = "present";
         milestoneTitle = ms.title;
         planIssueNumbers = ms.issueNumbers ?? [];
+        milestoneOpenCount = ms.openIssueCount ?? 0;
+        milestoneTotalCount = ms.totalIssueCount ?? planIssueNumbers.length;
+      } else {
+        milestoneStatus = "absent";
       }
     } catch (err) {
-      d.stderr(
-        `[pipeline release] warning: milestone lookup for v${resolvedVersion} failed — ` +
-          `${err instanceof Error ? err.message : String(err)} (continuing with placeholders)`,
+      // Ambiguous matches are fail-closed on live prepare: do not wrap as
+      // "unavailable" (that would obscure remediation) and do not pick one.
+      // Dry-run still soft-fails as unavailable with the ambiguous reason so
+      // it does not invent membership or open a PR.
+      if (!opts.dryRun && isAmbiguousMilestoneError(err)) {
+        throw err;
+      }
+      milestoneStatus = "unavailable";
+      milestoneUnavailableReason = err instanceof Error ? err.message : String(err);
+    }
+  } else if (opts.dryRun) {
+    milestoneStatus = "unavailable";
+    milestoneUnavailableReason = "no fetchMilestoneForVersion dependency";
+  } else {
+    // Live prepare without an injectable fetch seam cannot prove plan membership.
+    throw unavailableMilestoneError(
+      resolvedVersion,
+      "fetchMilestoneForVersion dependency is not configured",
+    );
+  }
+
+  if (!opts.dryRun) {
+    if (milestoneStatus === "absent") {
+      throw missingMilestoneError(resolvedVersion);
+    }
+    if (milestoneStatus === "unavailable") {
+      throw unavailableMilestoneError(
+        resolvedVersion,
+        milestoneUnavailableReason ?? "milestone lookup failed",
       );
     }
   }
 
   const theme = resolveReleaseTheme({
     cliTheme: opts.theme,
-    roadmapText,
     version: resolvedVersion,
     milestoneTitle,
   });
 
-  // --- Dry-run path: no file writes. Open-soak preflight already ran (may use
-  // injected gh/list deps). Shipped-PR title/closing-issue discovery stays local. ---
+  // --- Dry-run path: no file writes. Read-only milestone lookup already ran.
+  //    Shipped-PR title/closing-issue discovery stays local. ---
   if (opts.dryRun) {
+    d.stdout(
+      formatMilestoneStatusLine(
+        resolvedVersion,
+        milestoneStatus,
+        milestoneStatus === "present"
+          ? { open: milestoneOpenCount, total: milestoneTotalCount }
+          : undefined,
+        milestoneUnavailableReason,
+      ),
+    );
+
     // Discover PR numbers from git log only (localOnly=true skips fetchPRTitle → gh).
     const shippedPRs = await discoverShippedPRs(lastTag, repoDir, d, /* localOnly= */ true);
 
     // shippedIssueNumbers is empty in dry-run: resolving closing issues requires GitHub API.
-    // planIssueNumbers also empty (no milestone fetch in dry-run) — Issues column uses placeholder if scaffolding.
+    // planIssueNumbers may be populated from the read-only milestone lookup.
     const ctx: ReleaseContext = {
       version: resolvedVersion, previousVersion, date: today, theme,
-      shippedPRs, shippedIssueNumbers: [], planIssueNumbers: [],
+      shippedPRs, shippedIssueNumbers: [], planIssueNumbers,
     };
 
     // Compute version-bump diffs in memory (no file writes).
@@ -1743,8 +1968,9 @@ export async function runRelease(
     const rootDiff = computeUnifiedDiff(rootPkgOld, rootPkgNew, "a/package.json", "b/package.json");
     const coreDiff = computeUnifiedDiff(corePkgText, corePkgNew, "a/core/package.json", "b/core/package.json");
 
-    // Scaffold ROADMAP in memory and diff it (per-issue table is not stamped in dry-run).
-    const patchedRoadmap = scaffoldRoadmap(roadmapText, ctx);
+    // Best-effort ROADMAP scaffold in memory (missing anchors warn + skip).
+    const dryWarnings: string[] = [];
+    const patchedRoadmap = scaffoldRoadmap(roadmapText, ctx, (msg) => dryWarnings.push(msg));
     const roadmapDiff = computeUnifiedDiff(roadmapText, patchedRoadmap, "a/ROADMAP.md", "b/ROADMAP.md");
 
     const prBody = buildPRBody(ctx, lastTag, frgEvidence, openSoakWaiver);
@@ -1756,6 +1982,7 @@ export async function runRelease(
     d.stdout(coreDiff || "(no changes)");
     d.stdout(`\n=== ROADMAP.md diff ===`);
     d.stdout(roadmapDiff || "(no changes)");
+    for (const w of dryWarnings) d.stderr(w);
     d.stdout(`\nNOTE: per-issue ROADMAP table stamping is omitted in dry-run (requires GitHub API for closing-issue lookup).`);
     d.stdout(`\n=== PR body ===`);
     d.stdout(prBody);
@@ -1763,19 +1990,20 @@ export async function runRelease(
   }
 
   // --- Live path ---
+  d.stdout(
+    formatMilestoneStatusLine(resolvedVersion, "present", {
+      open: milestoneOpenCount,
+      total: milestoneTotalCount,
+    }),
+  );
+  d.stdout(
+    `[pipeline release] planned issues from milestone: ` +
+      (planIssueNumbers.length > 0
+        ? planIssueNumbers.map((n) => `#${n}`).join(", ")
+        : "(none)"),
+  );
 
-  // 5. Pre-validate ROADMAP anchors in memory BEFORE writing any files.
-  //    scaffoldRoadmap throws with a named-anchor error if plan-row / per-issue
-  //    sites are missing (#597: intro-chain and ## Shipped are no longer required).
-  //    This guarantees a missing anchor aborts cleanly before version files are written.
-  d.stdout("[pipeline release] validating ROADMAP.md anchors...");
-  const validationCtx: ReleaseContext = {
-    version: resolvedVersion, previousVersion, date: today, theme,
-    shippedPRs: [], shippedIssueNumbers: [], planIssueNumbers,
-  };
-  // Ensure-or-scaffold plan row + compact ship mutations in memory; throws before package writes.
-  scaffoldRoadmap(roadmapText, validationCtx);  // result discarded
-
+  // ROADMAP documentation is best-effort; missing anchors no longer block prepare.
   // Refuse to start if any release-managed path already has uncommitted changes (tracked
   // modifications OR untracked files). The pre-branch rollback below restores these paths
   // from HEAD via `git checkout` + `git clean`, which would silently DISCARD a maintainer's
@@ -1870,30 +2098,32 @@ export async function runRelease(
     // 9. Discover shipped PRs with title enrichment (first GitHub API call; only reached after CI).
     const shippedPRs = await discoverShippedPRs(lastTag, repoDir, d);
 
-    // 10. Resolve shipped issue numbers from PR closing references (required for per-issue stamping).
+    // 10. Resolve shipped issue numbers from PR closing references (best-effort ROADMAP stamps).
     const { issueNumbers: shippedIssueNumbers, hadFailures: issueDiscoveryFailed } =
       await collectShippedIssueNumbers(shippedPRs, d);
     if (issueDiscoveryFailed && shippedPRs.length > 0) {
-      throw new Error(
-        "[pipeline release] issue discovery failed for one or more PRs — cannot reliably stamp per-issue ROADMAP rows. " +
-        "Resolve the GitHub API errors above and retry, or use --dry-run to preview without per-issue stamping.",
+      d.stderr(
+        "[pipeline release] warning: issue discovery failed for one or more PRs — " +
+          "ROADMAP per-issue stamps may be incomplete (best-effort documentation; " +
+          "milestone plan membership remains authoritative).",
       );
     }
-    // Finding 1 (#170): shipped PRs exist and the ROADMAP has rows planned for this
-    // version, but none can be stamped (the shipped PRs resolved no matching closing
-    // issues, e.g. empty closingIssuesReferences) → writing would produce an
-    // inconsistent release ROADMAP. Block for manual resolution. No abort when the
-    // ROADMAP simply has no rows planned for this version (planned === 0).
-    const { planned, stampable } = countPerIssueRows(roadmapText, resolvedVersion, shippedIssueNumbers);
+    // Advisory only (#985): ROADMAP stamp mismatch must not abort. Plan membership
+    // comes from the matching GitHub milestone; ROADMAP docs are derived.
+    const { planned, stampable } = countPerIssueRows(
+      roadmapText,
+      resolvedVersion,
+      shippedIssueNumbers,
+    );
     if (shippedPRs.length > 0 && planned > 0 && stampable === 0) {
-      throw new Error(
-        `[pipeline release] found ${shippedPRs.length} shipped PR(s) and ${planned} ROADMAP row(s) planned for v${resolvedVersion}, ` +
-        `but none could be stamped — the shipped PRs resolved no matching closing issues (resolved: [${shippedIssueNumbers.join(", ") || "none"}]). ` +
-        `Verify the PR→issue links (gh pr view <n> --json closingIssuesReferences) and retry, or stamp the rows manually.`,
+      d.stderr(
+        `[pipeline release] warning: found ${shippedPRs.length} shipped PR(s) and ${planned} ROADMAP row(s) planned for v${resolvedVersion}, ` +
+          `but none could be stamped against shipped closing issues (resolved: [${shippedIssueNumbers.join(", ") || "none"}]). ` +
+          `ROADMAP stamps are best-effort; milestone plan membership is authoritative.`,
       );
     }
 
-    // 11. Scaffold ROADMAP in memory and build PR body (ensure plan row first).
+    // 11. Best-effort ROADMAP documentation scaffold + PR body.
     const ctx: ReleaseContext = {
       version: resolvedVersion, previousVersion, date: today, theme,
       shippedPRs, shippedIssueNumbers, planIssueNumbers,

@@ -693,7 +693,7 @@ export function buildCmd(): Command {
     .option("--no-edit", "release: skip opening $EDITOR after ROADMAP scaffold (commit as scaffolded)")
     .option(
       "--theme <text>",
-      "release: theme for a scaffolded release-plan row when missing (overrides milestone title; default: plan-row theme, milestone title, or <theme>)",
+      "release: theme for the release PR title / optional ROADMAP docs (overrides milestone title; default: milestone title extraction, or <theme>)",
     )
     .option(
       "--allow-open-soak-defects <reason>",

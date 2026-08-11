@@ -1,6 +1,6 @@
 # Roadmap
 
-This file is the forward-looking source of truth for open work. Every open issue has one explicit SemVer release milestone. Theme labels remain as secondary scope labels. Release history is in [CHANGELOG.md](CHANGELOG.md). Last updated 2026-08-08.
+This file is human-readable forward-looking documentation for open work. **GitHub milestones** are the authoritative store for which issues are planned for each SemVer release (`pipeline roadmap --apply` writes them; `pipeline release` reads them). Theme labels remain as secondary scope labels. Release history is in [CHANGELOG.md](CHANGELOG.md). Last updated 2026-08-11.
 
 ## Roadmap rules
 
