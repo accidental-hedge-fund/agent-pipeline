@@ -47,6 +47,8 @@ SHIP_NOTIFY_BIN="${SHIP_NOTIFY_BIN:-$SCRIPT_DIR/ship-notify.sh}"
 # Default 0: stage-watch covers progress; avoid generic "still running" noise
 SHIP_NOTIFY_HEARTBEAT_S="${SHIP_NOTIFY_HEARTBEAT_S:-0}"
 SHIP_STAGE_WATCH_BIN="${SHIP_STAGE_WATCH_BIN:-$SCRIPT_DIR/ship-stage-watch.sh}"
+# Pure helper: last train_status from mixed prose+JSON capture (completion gate + resume)
+TRAIN_STATUS_COMPLETE_BIN="${TRAIN_STATUS_COMPLETE_BIN:-$SCRIPT_DIR/train-status-complete.py}"
 _HEARTBEAT_PID=""
 
 ship_notify() {
@@ -518,38 +520,18 @@ if [[ "$train_ec" -ne 0 ]]; then
     log "train: milestone has no open issues — treating as already complete (resume)"
     train_ec=0
     write_state "train" "ok" "no open issues (already shipped)"
-  elif python3 - "$RUN_DIR/train.json" <<'PY2'
-import json,sys,os
-p=sys.argv[1]
-if not os.path.exists(p):
-  raise SystemExit(1)
-raw=open(p).read().strip()
-prev=os.path.join(os.path.dirname(p), "train.complete.json")
-for path in (prev, p):
-  if not os.path.exists(path):
-    continue
-  try:
-    raw=open(path).read().strip()
-    dec=json.JSONDecoder(); i=0; objs=[]
-    while i < len(raw):
-      while i < len(raw) and raw[i].isspace(): i+=1
-      if i>=len(raw): break
-      try:
-        o,j=dec.raw_decode(raw,i); objs.append(o); i=j
-      except Exception:
-        n=raw.find("{", i+1)
-        if n<0: break
-        i=n
-    for o in reversed(objs):
-      if o.get("kind")=="train_status" and o.get("complete") is True:
-        raise SystemExit(0)
-  except SystemExit:
-    raise
-  except Exception:
-    pass
-raise SystemExit(1)
-PY2
-  then
+  elif {
+    # Same decoder as the success gate: last train_status with complete + no blocker.
+    # Prefer train.complete.json (prior success artifact) then the just-written capture.
+    _resume_ok=0
+    for _tp in "$RUN_DIR/train.complete.json" "$RUN_DIR/train.json"; do
+      if [[ -s "$_tp" ]] && [[ "$(python3 "$TRAIN_STATUS_COMPLETE_BIN" "$_tp" 2>/dev/null || echo 0)" == "1" ]]; then
+        _resume_ok=1
+        break
+      fi
+    done
+    [[ "$_resume_ok" -eq 1 ]]
+  }; then
     log "train: prior train_status complete=true — treating as already complete (resume)"
     train_ec=0
     write_state "train" "ok" "prior complete"
@@ -564,22 +546,8 @@ PY2
   fi
 fi
 if [[ -s "$RUN_DIR/train.json" ]]; then
-  ok=$(python3 - <<'PY' "$RUN_DIR/train.json"
-import json,sys
-p=sys.argv[1]
-try:
-  d=json.load(open(p))
-except Exception:
-  print("0"); raise SystemExit
-if isinstance(d, list):
-  d=d[-1]
-complete=d.get("complete")
-blocker=d.get("blocker")
-print("1" if complete and not blocker else "0")
-if blocker:
-  open(p+".blocker","w").write(str(blocker))
-PY
-)
+  # Decode trailing/embedded train_status (prose+JSON streams); do not require pure json.load.
+  ok=$(python3 "$TRAIN_STATUS_COMPLETE_BIN" "$RUN_DIR/train.json" 2>/dev/null || echo 0)
   if [[ "$ok" != "1" ]]; then
     detail="train JSON not complete"
     [[ -f "$RUN_DIR/train.json.blocker" ]] && detail=$(cat "$RUN_DIR/train.json.blocker")
