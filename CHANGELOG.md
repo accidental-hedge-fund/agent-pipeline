@@ -7,6 +7,10 @@ Forward-looking planning lives in [ROADMAP.md](ROADMAP.md).
 
 Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 
+## [1.35.0] - 2026-08-11
+
+Issue: #170 Pipeline-Run: 170/2026-08-11T00:00:00Z
+
 ## [1.34.0] - 2026-08-10
 
 **Shipped 2026-08-10**
