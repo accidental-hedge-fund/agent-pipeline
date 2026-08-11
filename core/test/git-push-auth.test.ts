@@ -21,6 +21,7 @@ import {
   rewriteOriginRemote,
   runConfiguredGitPush,
   runConfiguredGitPushSync,
+  sanitizePushErrorText,
   selectPushTransport,
   toHttpsRemoteUrl,
   type GitPushAuthDeps,
@@ -218,6 +219,33 @@ test("formatNonSshRemoteFailure / redaction: credential-bearing HTTPS URL never 
   assert.equal(redactRemoteUrlForDisplay(patUrl).includes("ghp_SUPER_SECRET"), false);
 });
 
+test("redactRemoteUrlForDisplay / formatNonSshRemoteFailure: HTTP basic-auth userinfo never leaks (#980 delta finding 2)", () => {
+  const httpUrl = "http://user:opaque-secret@host/repo.git";
+  const rendered = redactRemoteUrlForDisplay(httpUrl);
+  assert.doesNotMatch(rendered, /opaque-secret/);
+  assert.doesNotMatch(rendered, /user:opaque/);
+  assert.match(rendered, /http:\/\/\[REDACTED\]@/);
+  const msg = formatNonSshRemoteFailure(httpUrl);
+  assert.doesNotMatch(msg, /opaque-secret/);
+  assert.match(msg, /http:\/\/\[REDACTED\]@/);
+});
+
+test("sanitizePushErrorText: redacts userinfo on any scheme, not only https", () => {
+  assert.equal(
+    sanitizePushErrorText("fatal: could not push to http://alice:s3cret@example.com/repo.git"),
+    "fatal: could not push to http://[REDACTED]@example.com/repo.git",
+  );
+  assert.equal(
+    sanitizePushErrorText("ssh://deploy:keyval@example.com/repo.git"),
+    "ssh://[REDACTED]@example.com/repo.git",
+  );
+  // Bare token-looking substrings still redacted.
+  assert.equal(
+    sanitizePushErrorText("token ghp_SUPER_SECRET_PAT_VALUE here"),
+    "token [REDACTED] here",
+  );
+});
+
 test("runConfiguredGitPush: ssh preflight with token-in-URL does not leak into error or endpoint", async () => {
   const patUrl = `https://x-access-token:${SECRET}@github.com/owner/repo.git`;
   const res = await runConfiguredGitPush({
@@ -334,8 +362,10 @@ test("runConfiguredGitPush: https-token sets askpass env and disables helper; se
   assert.equal(env.GIT_ASKPASS, askpassPath);
   assert.equal(env[PIPELINE_GIT_PUSH_TOKEN_VALUE_ENV], SECRET);
   assert.equal(env.GIT_CONFIG_VALUE_0, "");
-  assert.equal(env.GIT_CONFIG_KEY_1, "remote.origin.pushurl");
-  assert.equal(env.GIT_CONFIG_VALUE_1, "https://github.com/owner/repo.git");
+  // https-token now uses a single-destination insteadOf rewrite, never a
+  // second pushurl (multivalue fan-out) (#980 delta finding 1).
+  assert.equal(env.GIT_CONFIG_KEY_1, "url.https://github.com/owner/repo.git.insteadOf");
+  assert.equal(env.GIT_CONFIG_VALUE_1, "git@github.com:owner/repo.git");
   assert.match(res.errorMessage ?? "", /GITHUB_PUSH_TOKEN/);
   assert.match(res.errorMessage ?? "", /workflow/i);
   assert.doesNotMatch(res.errorMessage ?? "", new RegExp(SECRET));
@@ -403,9 +433,11 @@ test("prepareWorktreePushAuthEnv: ssh marks mechanism", () => {
   assert.equal(env.PIPELINE_GIT_PUSH_AUTH, "ssh");
 });
 
-test("prepareWorktreePushAuthEnv: https-token with SSH origin sets process-only HTTPS pushurl", () => {
+test("prepareWorktreePushAuthEnv: https-token with SSH origin sets single-destination insteadOf rewrite", () => {
   // Harness `git push origin <branch>` must resolve to HTTPS-token transport
-  // when durable origin is SSH (#980 review-2 finding 6ca04bdd).
+  // when durable origin is SSH (#980 review-2 finding 6ca04bdd). The rewrite
+  // must be a `url.<https>.insteadOf` single-destination mapping, never a
+  // second `remote.origin.pushurl` (multivalue fan-out) (#980 delta finding 1).
   const env = prepareWorktreePushAuthEnv(
     { mechanism: "https-token", tokenEnv: "GITHUB_PUSH_TOKEN" },
     { PATH: "/bin", GITHUB_PUSH_TOKEN: SECRET },
@@ -423,10 +455,12 @@ test("prepareWorktreePushAuthEnv: https-token with SSH origin sets process-only 
   assert.equal(env[PIPELINE_GIT_PUSH_TOKEN_VALUE_ENV], SECRET);
   assert.equal(env.GIT_CONFIG_KEY_0, "credential.helper");
   assert.equal(env.GIT_CONFIG_VALUE_0, "");
-  assert.equal(env.GIT_CONFIG_KEY_1, "remote.origin.pushurl");
-  assert.equal(env.GIT_CONFIG_VALUE_1, "https://github.com/owner/repo.git");
-  // Secret must not appear in the process-only pushurl value.
+  assert.equal(env.GIT_CONFIG_KEY_1, "url.https://github.com/owner/repo.git.insteadOf");
+  assert.equal(env.GIT_CONFIG_VALUE_1, "git@github.com:owner/repo.git");
+  // Secret must not appear in the process-only rewrite value.
   assert.doesNotMatch(env.GIT_CONFIG_VALUE_1 ?? "", new RegExp(SECRET));
+  // No remote.origin.pushurl is added (would fan out to two destinations).
+  assert.notEqual(env.GIT_CONFIG_KEY_1, "remote.origin.pushurl");
 });
 
 // ---------------------------------------------------------------------------

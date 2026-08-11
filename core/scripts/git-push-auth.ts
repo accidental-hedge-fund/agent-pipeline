@@ -150,9 +150,14 @@ export function formatPushAuthFailure(
 /** Strip credential-like substrings from stderr before surfacing. */
 export function sanitizePushErrorText(text: string): string {
   return text
-    .replace(/https:\/\/[^/\s:]+:[^@\s]+@/gi, "https://[REDACTED]@")
-    .replace(/\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]+\b/g, "[REDACTED]")
-    .replace(/\bgithub_pat_[A-Za-z0-9_]+\b/g, "[REDACTED]");
+    // Redact userinfo from ANY scheme (http/https/ssh/git+ssh/...). Matches
+    // `scheme://` immediately followed by a non-empty userinfo term (user,
+    // user:pass, or a bare token) ending in `@`. Prevents credential-bearing
+    // remote URLs from leaking into operator-visible errors regardless of
+    // scheme (e.g. `http://user:secret@host/repo.git`).
+    .replace(/([a-z][a-z0-9+.-]*:\/\/)[^@\s/]+@/gi, "$1[REDACTED]@")
+    .replace(/\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]+/g, "[REDACTED]")
+    .replace(/\bgithub_pat_[A-Za-z0-9_]+/g, "[REDACTED]");
 }
 
 // ---------------------------------------------------------------------------
@@ -421,24 +426,36 @@ esac
 /**
  * Build child env for an HTTPS-token push so ambient `gh auth git-credential`
  * does not win. Token value is only in {@link PIPELINE_GIT_PUSH_TOKEN_VALUE_ENV}.
- * When `httpsPushUrl` is set, process-only `remote.origin.pushurl` is overridden
- * so a harness `git push origin` uses HTTPS even when the durable origin is SSH.
+ * When `httpsPushUrl` and `sourceOrigin` are set, a process-only
+ * `url.<httpsUrl>.insteadOf = <sourceOrigin>` rewrite makes a harness
+ * `git push origin` resolve to exactly ONE destination (the HTTPS endpoint)
+ * even when the durable worktree origin/pushurl is SSH.
+ *
+ * NOTE (#980 delta finding 1): we must NOT set `remote.origin.pushurl` via
+ * GIT_CONFIG_* to switch transport — `pushurl`/`url` are multivalued across
+ * config scopes, so git would push to BOTH the durable SSH destination and the
+ * injected HTTPS one (fan-out), recreating a false blocked/push-failed run. The
+ * `insteadOf` rewrite below rewrites the existing SSH URL to HTTPS once, so the
+ * harness pushes to the single configured endpoint and never the SSH origin.
  */
 export function buildHttpsTokenPushEnv(
   baseEnv: NodeJS.ProcessEnv,
   token: string,
   askpassPath: string,
-  opts?: { httpsPushUrl?: string },
+  opts?: { httpsPushUrl?: string; sourceOrigin?: string },
 ): NodeJS.ProcessEnv {
   // Disable ambient credential helpers for this child via GIT_CONFIG_* overrides.
   // GIT_CONFIG_COUNT keys override system/global/local for the process only.
   const httpsPushUrl = opts?.httpsPushUrl?.trim() || "";
+  const sourceOrigin = opts?.sourceOrigin?.trim() || "";
+  const hasRewrite = httpsPushUrl && sourceOrigin && sourceOrigin !== httpsPushUrl;
+  const count = 1 + (hasRewrite ? 1 : 0);
   const env: NodeJS.ProcessEnv = {
     ...baseEnv,
     GIT_TERMINAL_PROMPT: "0",
     GIT_ASKPASS: askpassPath,
     // Empty helper so gh/osxkeychain/etc. do not supply a different PAT.
-    GIT_CONFIG_COUNT: httpsPushUrl ? "2" : "1",
+    GIT_CONFIG_COUNT: String(count),
     GIT_CONFIG_KEY_0: "credential.helper",
     GIT_CONFIG_VALUE_0: "",
     // Private; consumed only by askpass. Not a durable config key.
@@ -446,10 +463,12 @@ export function buildHttpsTokenPushEnv(
     // Discourage GUI credential prompts.
     GCM_INTERACTIVE: "Never",
   };
-  if (httpsPushUrl) {
-    // Process-only pushurl so origin stays SSH on disk but push uses HTTPS+token.
-    env.GIT_CONFIG_KEY_1 = "remote.origin.pushurl";
-    env.GIT_CONFIG_VALUE_1 = httpsPushUrl;
+  if (hasRewrite) {
+    // Single-destination process-only rewrite: any URL matching sourceOrigin
+    // (the durable SSH origin/pushurl) becomes httpsPushUrl. Applied to both
+    // fetch and push; keeps origin SSH on disk but pushes to HTTPS+token.
+    env.GIT_CONFIG_KEY_1 = `url.${httpsPushUrl}.insteadOf`;
+    env.GIT_CONFIG_VALUE_1 = sourceOrigin;
   }
   return env;
 }
@@ -492,11 +511,18 @@ export function prepareWorktreePushAuthEnv(
     const writeAsk = opts.deps?.writeAskpassScript ?? defaultWriteAskpass;
     const askpassPath = writeAsk(askpassScriptBody());
     let httpsPushUrl: string | undefined;
+    let sourceOrigin: string | undefined;
     if (opts.cwd) {
       const originUrl = resolveSshPushEndpointSync(opts.cwd, opts.deps ?? {});
-      httpsPushUrl = originUrl ? (toHttpsRemoteUrl(originUrl) ?? undefined) : undefined;
+      if (originUrl) {
+        // Keep the DURABLE endpoint as the rewrite source and derive the HTTPS
+        // target, so git pushes to exactly one destination (insteadOf rewrite),
+        // never fanning out to both the durable SSH pushurl and an injected one.
+        sourceOrigin = originUrl;
+        httpsPushUrl = toHttpsRemoteUrl(originUrl) ?? undefined;
+      }
     }
-    Object.assign(env, buildHttpsTokenPushEnv(env, token, askpassPath, { httpsPushUrl }));
+    Object.assign(env, buildHttpsTokenPushEnv(env, token, askpassPath, { httpsPushUrl, sourceOrigin }));
   }
   return env;
 }
@@ -600,7 +626,13 @@ export async function runConfiguredGitPush(
   const cleanup = deps.cleanupAskpassScript ?? defaultCleanupAskpass;
   const askpassPath = writeAsk(askpassScriptBody());
   try {
-    const childEnv = buildHttpsTokenPushEnv(env, token, askpassPath, { httpsPushUrl: httpsUrl });
+    const childEnv = buildHttpsTokenPushEnv(env, token, askpassPath, {
+      httpsPushUrl: httpsUrl,
+      // Single-destination rewrite source (the durable SSH origin/pushurl) so a
+      // harness `git push origin` resolves to exactly one HTTPS endpoint and
+      // never fans out to both the SSH and injected destinations.
+      sourceOrigin: originUrl ?? undefined,
+    });
     childEnv[PIPELINE_GIT_PUSH_AUTH_ENV] = `https-token:${tokenEnv}`;
     const finalArgs = rewriteOriginRemote(opts.args, httpsUrl);
     // Also clear credential.helper via -c so system config cannot re-enable gh.
@@ -706,7 +738,13 @@ export function runConfiguredGitPushSync(opts: RunConfiguredGitPushOpts): RunCon
   const cleanup = deps.cleanupAskpassScript ?? defaultCleanupAskpass;
   const askpassPath = writeAsk(askpassScriptBody());
   try {
-    const childEnv = buildHttpsTokenPushEnv(env, token, askpassPath, { httpsPushUrl: httpsUrl });
+    const childEnv = buildHttpsTokenPushEnv(env, token, askpassPath, {
+      httpsPushUrl: httpsUrl,
+      // Single-destination rewrite source (the durable SSH origin/pushurl) so a
+      // harness `git push origin` resolves to exactly one HTTPS endpoint and
+      // never fans out to both the SSH and injected destinations.
+      sourceOrigin: originUrl ?? undefined,
+    });
     childEnv[PIPELINE_GIT_PUSH_AUTH_ENV] = `https-token:${tokenEnv}`;
     const finalArgs = rewriteOriginRemote(opts.args, httpsUrl);
     const argsWithCred = ["-c", "credential.helper=", ...finalArgs];
