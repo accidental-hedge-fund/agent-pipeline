@@ -21,11 +21,14 @@ const execFileAsync = promisify(execFile);
 
 export type EnginePromoteHost = "codex" | "claude" | "grok" | "opencode" | "all";
 
+/** Default install host when promote omits --host / host option (#989). */
+export const DEFAULT_ENGINE_PROMOTE_HOST: EnginePromoteHost = "all";
+
 export interface EnginePromoteOpts {
   /** Semver X.Y.Z (with or without leading v). */
   version: string;
   repoDir: string;
-  /** Host(s) for install.mjs --host (default codex). */
+  /** Host(s) for install.mjs --host (default all — every configured outer host). */
   host?: EnginePromoteHost;
   dryRun?: boolean;
   /** Skip promote when pin already at target version. Default true. */
@@ -144,7 +147,7 @@ export async function runEnginePromote(
 ): Promise<EnginePromoteResult> {
   const version = normalizeVersion(opts.version);
   const tag = tagForVersion(version);
-  const host = opts.host ?? "codex";
+  const host = opts.host ?? DEFAULT_ENGINE_PROMOTE_HOST;
   const dryRun = !!opts.dryRun;
   const skipPromoteIfCurrent = opts.skipPromoteIfCurrent !== false;
   const skipInstall = !!opts.skipInstall;

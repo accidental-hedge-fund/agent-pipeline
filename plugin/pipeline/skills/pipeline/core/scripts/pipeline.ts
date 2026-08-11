@@ -400,7 +400,7 @@ export interface CliOpts {
   gitSha?: string;
   /** factory-pin init: bootstrap from FRG pass for this version. */
   fromFrg?: string;
-  /** factory-pin / engine-promote: install host (codex|claude|all). */
+  /** factory-pin / engine-promote: install host (codex|claude|grok|opencode|all; default all). */
   host?: string;
   /** engine-promote: skip skill install (pin-only). */
   skipInstall?: boolean;
@@ -727,7 +727,7 @@ export function buildCmd(): Command {
     .option("--authorization <path>", "ship: absolute path to the gateway-authenticated authorization JSON")
     .option(
       "--host <name>",
-      "engine-promote: skill install host (codex|claude|grok|opencode|all; default codex)",
+      "engine-promote: skill install host (codex|claude|grok|opencode|all; default all)",
     )
     .option("--skip-install", "engine-promote: promote pin only; do not run npx install")
     .option("--from-run <run-id>", "factory-gate: score an existing durable loop run id")
@@ -4191,10 +4191,10 @@ async function main(): Promise<void> {
     if (!version) {
       console.error(
         "pipeline engine-promote: --for <X.Y.Z> is required.\n" +
-          "  Usage: pipeline engine-promote --for <X.Y.Z> [--host codex|claude|all] [--dry-run] [--json] [--skip-install]\n" +
-          "  Verifies the GitHub Release, promotes the production pin (FRG-gated), installs the exact tag,\n" +
-          "  and verifies installed version. Rolls the pin back if install/verify fails after promote.\n" +
-          "  Never merges PRs or creates tags.",
+          "  Usage: pipeline engine-promote --for <X.Y.Z> [--host all|codex|claude|grok|opencode] [--dry-run] [--json] [--skip-install]\n" +
+          "  Verifies the GitHub Release, promotes the production pin (FRG-gated), installs the exact tag\n" +
+          "  to all configured hosts by default (override with --host), and verifies installed version.\n" +
+          "  Rolls the pin back if install/verify fails after promote. Never merges PRs or creates tags.",
       );
       process.exit(2);
     }
@@ -4207,8 +4207,12 @@ async function main(): Promise<void> {
       process.exit(2);
     }
     try {
-      const { runEnginePromote, realEnginePromoteDeps } = await import("./stages/engine-promote.ts");
-      const hostRaw = opts.host ? String(opts.host).trim() : "codex";
+      const {
+        runEnginePromote,
+        realEnginePromoteDeps,
+        DEFAULT_ENGINE_PROMOTE_HOST,
+      } = await import("./stages/engine-promote.ts");
+      const hostRaw = opts.host ? String(opts.host).trim() : DEFAULT_ENGINE_PROMOTE_HOST;
       const allowedHosts = new Set(["codex", "claude", "grok", "opencode", "all"]);
       if (!allowedHosts.has(hostRaw)) {
         console.error(`pipeline engine-promote: invalid --host ${hostRaw}`);

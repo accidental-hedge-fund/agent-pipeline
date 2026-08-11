@@ -151,7 +151,7 @@ product work on milestone (train / loop / single)
 | FRG | `pipeline factory-gate --for X.Y.Z …` (pack/evidence) |
 | Pin show | `pipeline factory-pin` |
 | Release | `pipeline release X.Y.Z --no-edit` then `pipeline release finish <pr>` |
-| Promote | `pipeline engine-promote --for X.Y.Z --host codex` |
+| Promote | `pipeline engine-promote --for X.Y.Z` (default `--host all`; scope with `--host codex` etc.) |
 | Status | `pipeline status`, train/loop JSON, ship `state.json` |
 
 `train_status` JSON (`schema_version: 1`, `kind: train_status`) is the machine-readable ship progress contract for outer adapters.

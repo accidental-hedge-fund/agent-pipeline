@@ -72,6 +72,47 @@ cp "$ROOT/examples/supervisor/shell/train-status-complete.py" \
   "$HOME/.local/bin/train-status-complete.py"
 ```
 
+#### Required before the first multi-host promote ship (#989)
+
+An already-installed `~/.local/bin/pipeline-ship-playbook` from before #989
+still defaults `ENGINE_PROMOTE_HOST` to `codex` and passes explicit
+`--host codex`. That **bypasses** the engine-promote stage default of `all`,
+so the rollout ship of this fix still updates only Codex unless you refresh
+the playbook first.
+
+**Do one of these before the rollout ship** (enforceable via
+`pipeline doctor` check `supervisor:ship-playbook-promote-host`):
+
+1. **Refresh the installed playbook** from the checkout that contains the fix
+   (PR branch, worktree, or updated `main`):
+
+   ```bash
+   install -m 0755 "$ROOT/examples/supervisor/shell/pipeline-ship-playbook.sh" \
+     "$HOME/.local/bin/pipeline-ship-playbook"
+   ```
+
+2. **Invoke the versioned playbook directly** (do not use `~/.local/bin`):
+
+   ```bash
+   "$ROOT/examples/supervisor/shell/pipeline-ship-playbook.sh" --milestone vX.Y.Z
+   ```
+
+3. **Override for one run** without reinstalling:
+
+   ```bash
+   ENGINE_PROMOTE_HOST=all pipeline-ship-playbook --milestone vX.Y.Z
+   ```
+
+Verify before ship:
+
+```bash
+# From a checkout that includes the #989 doctor check:
+pipeline doctor
+# Expect supervisor:ship-playbook-promote-host to pass (or skip if unused).
+grep -n 'ENGINE_PROMOTE_HOST' "$HOME/.local/bin/pipeline-ship-playbook" | head
+# Should show :-all (not :-codex) after a refresh.
+```
+
 **Train completion gate:** the playbook evaluates the **last** `train_status`
 object in the captured `pipeline train --json` stream (via
 `train-status-complete.py` / `raw_decode`), so leading human-readable prose does

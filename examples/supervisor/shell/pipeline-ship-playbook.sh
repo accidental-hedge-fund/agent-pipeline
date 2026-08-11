@@ -27,7 +27,9 @@
 #   SHIP_NOTIFY_BIN            path to ship-notify.sh (default: sibling)
 #   SHIP_NOTIFY_HEARTBEAT_S    0 disables phase heartbeats (recommended with stage-watch)
 #   SHIP_STAGE_WATCH_BIN       path to ship-stage-watch.sh (default: sibling)
-#   ENGINE_PROMOTE_HOST        codex|claude|all (default codex)
+#   ENGINE_PROMOTE_HOST        codex|claude|grok|opencode|all (default all)
+#                              Ship promote installs every configured outer host
+#                              unless the operator scopes to one host.
 #   RELEASE_WAIT_ATTEMPTS      default 30
 #   RELEASE_WAIT_SLEEP_S       default 40
 #
@@ -38,7 +40,7 @@ PIPELINE="${PIPELINE:-pipeline}"
 REPO_DIR="${REPO_DIR:-}"
 ALLOW_MERGE="${ALLOW_MERGE:-0}"
 STATE_ROOT="${PIPELINE_SUPERVISOR_STATE:-$HOME/.local/state/pipeline-supervisor}"
-HOST="${ENGINE_PROMOTE_HOST:-codex}"
+HOST="${ENGINE_PROMOTE_HOST:-all}"
 RELEASE_WAIT_ATTEMPTS="${RELEASE_WAIT_ATTEMPTS:-30}"
 RELEASE_WAIT_SLEEP_S="${RELEASE_WAIT_SLEEP_S:-40}"
 

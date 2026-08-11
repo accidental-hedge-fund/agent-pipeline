@@ -105,8 +105,8 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 
 #### `engine-promote`
 
-- **Usage:** `pipeline engine-promote --for <X.Y.Z> [--host codex|claude|all] [--dry-run] [--json] [--skip-install]`
-- **Summary:** Self-host: verify published release, promote production pin, install exact tag, verify version (rollback pin on install failure)
+- **Usage:** `pipeline engine-promote --for <X.Y.Z> [--host all|codex|claude|grok|opencode] [--dry-run] [--json] [--skip-install]`
+- **Summary:** Self-host: verify published release, promote production pin, install exact tag to all hosts by default, verify version (rollback pin on install failure)
 
 #### `evals`
 

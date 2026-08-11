@@ -189,8 +189,9 @@ export const COMMAND_DOCS: Record<string, CommandDoc> = {
   },
   "engine-promote": {
     summary:
-      "Self-host: verify published release, promote production pin, install exact tag, verify version (rollback pin on install failure)",
-    usage: "engine-promote --for <X.Y.Z> [--host codex|claude|all] [--dry-run] [--json] [--skip-install]",
+      "Self-host: verify published release, promote production pin, install exact tag to all hosts by default, verify version (rollback pin on install failure)",
+    usage:
+      "engine-promote --for <X.Y.Z> [--host all|codex|claude|grok|opencode] [--dry-run] [--json] [--skip-install]",
     documented: true,
     section: "factory",
   },
