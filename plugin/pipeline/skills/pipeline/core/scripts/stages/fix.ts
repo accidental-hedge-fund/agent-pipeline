@@ -91,6 +91,13 @@ import {
   validateFixCommitSubject,
   type PushWithCurrencyDeps,
 } from "../transient-wrappers.ts";
+import {
+  DEFAULT_GIT_PUSH_AUTH,
+  formatPushAuthFailure,
+  gitExecForwardingEnv,
+  prepareWorktreePushAuthEnv,
+  runConfiguredGitPush,
+} from "../git-push-auth.ts";
 
 export interface AdvanceFixOpts {
   dryRun?: boolean;
@@ -725,13 +732,18 @@ export async function advanceFix(
             model,
           }
         : undefined,
-      env: papercutIdentityEnv(cfg, {
-        runId: opts.runDir ? path.basename(opts.runDir) : null,
-        issue: issueNumber,
-        stage,
-        harness,
-        model,
-      }),
+      // Align harness-initiated git push with configured mechanism (#980).
+      env: prepareWorktreePushAuthEnv(
+        cfg.git?.push_auth ?? DEFAULT_GIT_PUSH_AUTH,
+        papercutIdentityEnv(cfg, {
+          runId: opts.runDir ? path.basename(opts.runDir) : null,
+          issue: issueNumber,
+          stage,
+          harness,
+          model,
+        }),
+        { cwd: wt.path },
+      ),
     });
   };
 
@@ -1349,6 +1361,8 @@ export async function advanceFix(
 
   const branch = branchName(issueNumber, wt.slug);
   // #760: transient-retryable push with currency re-sync (no force-push).
+  // Authoritative delivery uses configured git.push_auth (#980).
+  const pushAuth = cfg.git?.push_auth ?? DEFAULT_GIT_PUSH_AUTH;
   const localHead = (
     await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
   ).stdout.trim();
@@ -1358,15 +1372,35 @@ export async function advanceFix(
     expectedLocalSha: localHead || null,
     sleep: deps.sleep,
     git: async (args) => {
-      // Currency-check uses fetch/rev-parse; push uses origin + branch.
+      // Currency-check uses fetch/rev-parse; push uses configured auth via the
+      // same injectable gitInWorktree seam unit tests already fake (#980).
       if (args[0] === "push") {
-        return gitInWorktree(wt.path, ["push", "origin", branch], { ignoreFailure: true });
+        const res = await runConfiguredGitPush({
+          cwd: wt.path,
+          auth: pushAuth,
+          args: ["push", "origin", branch],
+          deps: {
+            gitConfigGet: async (cwd, key) => {
+              const r = await gitInWorktree(cwd, ["config", "--get", key], {
+                ignoreFailure: true,
+              });
+              return r.code === 0 ? r.stdout.trim() || null : null;
+            },
+            // Forward GIT_ASKPASS / token child env into the git process (#980).
+            gitExec: gitExecForwardingEnv(wt.path, gitInWorktree),
+          },
+        });
+        return {
+          code: res.code,
+          stdout: res.stdout,
+          stderr: res.errorMessage ?? res.stderr,
+        };
       }
       return gitInWorktree(wt.path, args, { ignoreFailure: true });
     },
   } satisfies PushWithCurrencyDeps);
   if (!pushResult.ok) {
-    const pushFailedMsg = `Git push failed after fix: ${pushResult.reason}`;
+    const pushFailedMsg = formatPushAuthFailure(pushAuth, `after fix: ${pushResult.reason}`);
     await setBlocked(cfg, issueNumber, pushFailedMsg, stage, "push-failed");
     return {
       advanced: false,

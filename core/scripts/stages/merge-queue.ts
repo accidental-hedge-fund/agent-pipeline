@@ -15,6 +15,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { invoke } from "../harness.ts";
 import type { PipelineConfig } from "../types.ts";
+import { DEFAULT_GIT_PUSH_AUTH, gitExecForwardingEnv, runConfiguredGitPush } from "../git-push-auth.ts";
 import {
   branchName,
   ensureManagedWorktree,
@@ -611,12 +612,21 @@ export async function runDeterministicConflictRebase(
     }
 
     // Bound force-with-lease to the eligibility snapshot head, not a floating tracking ref.
+    // Configured push-auth (#980) owns the transport for this repair push.
     const leaseRef = `refs/heads/${branch}:${expected}`;
-    const push = await git(
-      managedRoot,
-      ["push", `--force-with-lease=${leaseRef}`, "origin", `HEAD:refs/heads/${branch}`],
-      { ignoreFailure: true },
-    );
+    const pushAuth = cfg.git?.push_auth ?? DEFAULT_GIT_PUSH_AUTH;
+    const push = await runConfiguredGitPush({
+      cwd: managedRoot,
+      auth: pushAuth,
+      args: ["push", `--force-with-lease=${leaseRef}`, "origin", `HEAD:refs/heads/${branch}`],
+      deps: {
+        gitConfigGet: async (cwd, key) => {
+          const r = await git(cwd, ["config", "--get", key], { ignoreFailure: true });
+          return r.code === 0 ? r.stdout.trim() || null : null;
+        },
+        gitExec: gitExecForwardingEnv(managedRoot, git),
+      },
+    });
     if (push.code !== 0) {
       // Restore local branch so a later drive can retry (avoids "already up to date" no-op).
       await git(managedRoot, ["reset", "--hard", expected], {

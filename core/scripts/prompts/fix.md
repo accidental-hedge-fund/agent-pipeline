@@ -45,6 +45,10 @@ Before committing or pushing:
 
 This self-check is a targeted scan of your own changes against the findings you were given — it is not a full re-review (the SHA-gate re-review handles that on push).
 
+## Git push auth (pipeline-configured)
+
+Push authentication is configured by the pipeline (`git.push_auth` in `.github/pipeline.yml`). Prefer the worktree's existing `origin` / `pushurl` and the process environment the pipeline prepared for this stage (including any process-only HTTPS pushurl / askpass when `https-token` is configured). Do **not** reconfigure origin to HTTPS via ambient `gh auth setup-git` / `gh auth git-credential` as the selected mechanism — that classic PAT often lacks the GitHub `workflow` scope and rejects pushes that touch `.github/workflows/**`. When you push, use `git push origin <branch>` with the remotes and environment the pipeline prepared — do not invent a separate remote.
+
 ## Single-Turn Invocation (required)
 
 This invocation is single-turn: there is no later turn in which deferred work can complete. Do NOT end your turn while committing or pushing still depends on a background task (e.g. a test suite launched in the background and not yet awaited) — wait synchronously for that work to finish, then commit and push, before ending the turn. A notification that arrives after your turn ends will never reach you.

@@ -389,6 +389,19 @@ Nested fields:
 - **Default:** `[]`
 - **Description:** Formatter/linter commands to run after implementing and fix-round harnesses exit.
 
+### `git`
+
+- **Type:** object
+- **Default:** `{"push_auth":{"mechanism":"ssh"}}`
+- **Description:** Git push authentication for every authoritative pipeline-owned delivery push (#980). Default when absent: ssh.
+
+Nested fields:
+
+#### `git.push_auth`
+
+- **Type:** string
+- **Description:** Git push authentication: "ssh" (default; worktree origin/pushurl, deploy key or SSH agent — no GitHub workflow scope) or "https-token:<ENV_NAME>" (HTTPS with the token from the named env var; grant workflow scope when pushing .github/workflows/**). Env-var NAME only — never a literal secret. "app" is reserved and not implemented.
+
 ### `harness_sandbox`
 
 - **Type:** boolean

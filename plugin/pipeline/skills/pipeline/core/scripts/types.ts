@@ -1083,7 +1083,26 @@ export interface PipelineConfig {
   loop: {
     native_goal_attestation: "auto" | "available" | "unavailable";
   };
+  /**
+   * Git push authentication for every authoritative pipeline-owned delivery
+   * push (#980). Default `ssh` uses the worktree origin / pushurl (deploy key
+   * or SSH agent) — no GitHub `workflow` scope required. Opt-in `https-token`
+   * authenticates over HTTPS with the value of `tokenEnv` at invocation time
+   * (env-var **name** only; never a secret value stored in config).
+   */
+  git: {
+    push_auth: GitPushAuth;
+  };
 }
+
+/**
+ * Structured git push-auth mechanism (#980). Config YAML uses the string forms
+ * `ssh` or `https-token:<ENV_NAME>`; resolveConfig always stores this structured
+ * shape. Never holds a secret token value.
+ */
+export type GitPushAuth =
+  | { mechanism: "ssh" }
+  | { mechanism: "https-token"; tokenEnv: string };
 
 // Keys resolved from the active profile at config time, never from defaults
 // or `.github/pipeline.yml`.
@@ -1208,6 +1227,7 @@ export const DEFAULT_CONFIG: Omit<
   executors: {} as Record<string, ExecutorDefinition>,
   stage_executors: {} as Partial<Record<ModelInvokingStage, string>>,
   loop: { native_goal_attestation: "auto" as const },
+  git: { push_auth: { mechanism: "ssh" as const } },
 };
 
 // ---------------------------------------------------------------------------

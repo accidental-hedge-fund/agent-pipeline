@@ -11,8 +11,12 @@ import * as fs from "node:fs";
 import * as crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { invoke } from "../harness.ts";
-import { DEFAULT_CONFIG } from "../types.ts";
+import { DEFAULT_CONFIG, type GitPushAuth, type PipelineConfig } from "../types.ts";
 import { buildIntakePrompt } from "../prompts/index.ts";
+import {
+  DEFAULT_GIT_PUSH_AUTH,
+  runConfiguredGitPushSync,
+} from "../git-push-auth.ts";
 import {
   insertReleasePlanRow,
   insertPerIssueRow,
@@ -111,7 +115,9 @@ export function realIntakeDeps(
   model: string = DEFAULT_CONFIG.models.intake,
   reasoningEffort?: string,
   implementerHarness: string = "claude",
+  pushAuth: GitPushAuth = DEFAULT_GIT_PUSH_AUTH,
 ): IntakeDeps {
+  const auth = pushAuth;
   return {
     runHarness: async (prompt, timeoutSec) => {
       // Intake is a self-contained description->spec transform: the prompt injects
@@ -216,23 +222,24 @@ export function realIntakeDeps(
       }
     },
     reserveRemoteBranch: (dir, branch, sha) => {
-      // Reserve via the SAME `git push` transport used later to publish the roadmap commit, so
-      // a missing/read-only origin push credential fails HERE — before the issue — instead of
-      // after it (which would strand a labeled issue). TRULY create-only via an empty
-      // --force-with-lease (expect the ref absent): git then refuses to update an existing ref
-      // AT ALL — including a fast-forward to a descendant SHA, which a plain push would silently
-      // perform and MOVE someone else's branch. Verified against the live remote: new ref → '*'
-      // exit 0; existing ref at any SHA (incl. an ancestor) → '!' "(stale info)" exit 1, ref
-      // unchanged.
-      const result = spawnSync("git", reservePushArgs(branch, sha), {
-        encoding: "utf8",
-        stdio: "pipe",
+      // Reserve via the SAME configured push-auth transport used later to publish
+      // the roadmap commit (#980), so a missing/read-only origin push credential
+      // fails HERE — before the issue — instead of after it (which would strand a
+      // labeled issue). TRULY create-only via an empty --force-with-lease (expect
+      // the ref absent): git then refuses to update an existing ref AT ALL —
+      // including a fast-forward to a descendant SHA, which a plain push would
+      // silently perform and MOVE someone else's branch. Verified against the live
+      // remote: new ref → '*' exit 0; existing ref at any SHA (incl. an ancestor)
+      // → '!' "(stale info)" exit 1, ref unchanged.
+      const result = runConfiguredGitPushSync({
         cwd: dir,
+        auth,
+        args: reservePushArgs(branch, sha),
       });
       const out = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
       const statusLine = out.split("\n").find((l) => l.includes(`:refs/heads/${branch}`)) ?? "";
       const flag = statusLine.charAt(0);
-      if (result.status === 0 && flag === "*") return; // newly created → reserved (never moves an existing ref)
+      if (result.code === 0 && flag === "*") return; // newly created → reserved (never moves an existing ref)
       if (flag === "!" || flag === "=" || /stale info/i.test(out)) {
         throw new Error(
           `[pipeline intake] branch ${branch} already exists on origin — aborting before creating any issue.\n` +
@@ -240,7 +247,7 @@ export function realIntakeDeps(
         );
       }
       throw new Error(
-        `[pipeline intake] could not reserve origin/${branch} via git push (exit ${result.status}): ${(result.stderr || result.stdout || "").trim()}\n` +
+        `[pipeline intake] could not reserve origin/${branch} via git push (exit ${result.code}): ${(result.errorMessage || result.stderr || result.stdout || "").trim()}\n` +
           `  The branch may already exist, or this checkout's origin push credentials are missing or read-only.`,
       );
     },
@@ -281,14 +288,14 @@ export function realIntakeDeps(
       }
     },
     gitPushBranch: (dir, branch) => {
-      const result = spawnSync("git", ["push", "origin", branch], {
-        encoding: "utf8",
-        stdio: "pipe",
+      const result = runConfiguredGitPushSync({
         cwd: dir,
+        auth,
+        args: ["push", "origin", branch],
       });
-      if (result.status !== 0) {
+      if (result.code !== 0) {
         throw new Error(
-          `[pipeline intake] git push origin ${branch} failed (exit ${result.status}): ${result.stderr?.trim() ?? ""}`,
+          `[pipeline intake] git push origin ${branch} failed (exit ${result.code}): ${(result.errorMessage ?? result.stderr)?.trim() ?? ""}`,
         );
       }
     },
@@ -438,10 +445,27 @@ export function validateSpecBody(body: string): void {
 
 export async function runIntake(
   opts: IntakeOpts,
-  cfg: { repo_dir: string; repo: string; base_branch: string; intake_timeout?: number },
+  cfg: {
+    repo_dir: string;
+    repo: string;
+    base_branch: string;
+    intake_timeout?: number;
+    git?: PipelineConfig["git"];
+    models?: PipelineConfig["models"];
+    effort?: PipelineConfig["effort"];
+    harnesses?: PipelineConfig["harnesses"];
+  },
   deps?: IntakeDeps,
 ): Promise<void> {
-  const d = deps ?? realIntakeDeps(cfg.repo_dir);
+  const d =
+    deps ??
+    realIntakeDeps(
+      cfg.repo_dir,
+      cfg.models?.intake ?? DEFAULT_CONFIG.models.intake,
+      cfg.effort?.intake,
+      cfg.harnesses?.implementer ?? "claude",
+      cfg.git?.push_auth ?? DEFAULT_GIT_PUSH_AUTH,
+    );
   const repoDir = cfg.repo_dir;
   const roadmapPath = path.join(repoDir, "ROADMAP.md");
 

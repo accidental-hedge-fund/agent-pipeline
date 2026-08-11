@@ -28,6 +28,7 @@ import {
   gitInWorktree,
 } from "../worktree.ts";
 import { appendEvent, defaultRunStoreDeps, runDirPath } from "../run-store.ts";
+import { DEFAULT_GIT_PUSH_AUTH, gitExecForwardingEnv, runConfiguredGitPush } from "../git-push-auth.ts";
 
 export interface RepairPipelineItemInput {
   runId: string;
@@ -327,11 +328,19 @@ export function createRepairPipelineItemExecutor(
             `is dirty or its parent is not the claimed head ${expected}`;
           return { succeeded: false, evidence: error, error };
         }
-        const push = await git(
-          wt.path,
-          ["push", "origin", `HEAD:refs/heads/${branch}`],
-          { ignoreFailure: true },
-        );
+        const pushAuth = cfg.git?.push_auth ?? DEFAULT_GIT_PUSH_AUTH;
+        const push = await runConfiguredGitPush({
+          cwd: wt.path,
+          auth: pushAuth,
+          args: ["push", "origin", `HEAD:refs/heads/${branch}`],
+          deps: {
+            gitConfigGet: async (cwd, key) => {
+              const r = await git(cwd, ["config", "--get", key], { ignoreFailure: true });
+              return r.code === 0 ? r.stdout.trim() || null : null;
+            },
+            gitExec: gitExecForwardingEnv(wt.path, git),
+          },
+        });
         const verifiedRemote = await git(
           wt.path,
           ["ls-remote", "origin", `refs/heads/${branch}`],
