@@ -317,9 +317,51 @@ test("auto-tag-release runs post-tag docs refresh after the tag-push step", () =
     "expected release-docs-refresh.mjs invoker with --push",
   );
   // Guard against removing the step while leaving a comment that mentions CHANGELOG.
-  const docsSlice = workflowSrc.slice(docsStep, docsStep + 2500);
+  // Slice is large enough for branch-attach + refresh (detached-HEAD fix #978 review 1).
+  const docsSlice = workflowSrc.slice(docsStep, docsStep + 4000);
   assert.match(docsSlice, /release-docs-refresh\.mjs/);
   assert.match(docsSlice, /RELEASE_TAG_TOKEN/);
+});
+
+// Regression (#978 review 1): actions/checkout leaves detached HEAD. Bare
+// `git push` from the refresh helper fails unless the step attaches a local
+// branch tracking origin/${{ github.ref_name }} first.
+test("post-tag docs-refresh attaches local default branch before bare git push (detached checkout)", () => {
+  const script = extractStepScript("Regenerate tag-derived CHANGELOG");
+  const refreshIdx = script.indexOf("release-docs-refresh.mjs");
+  assert.notEqual(refreshIdx, -1, "expected release-docs-refresh invoker");
+
+  assert.match(
+    script,
+    /git checkout -B /,
+    "expected git checkout -B to attach a local branch for the docs push",
+  );
+  const checkoutIdx = script.indexOf("git checkout -B ");
+  assert.ok(
+    checkoutIdx < refreshIdx,
+    "local branch attach must happen before release-docs-refresh --push",
+  );
+
+  // Branch target must come from the workflow default-branch ref.
+  assert.match(
+    script,
+    /github\.ref_name/,
+    "expected docs-refresh to target github.ref_name (default branch)",
+  );
+  assert.match(
+    script,
+    /origin\/\$\{branch\}|origin\/"\$\{branch\}"|origin\/\$\{\{\s*github\.ref_name\s*\}\}/,
+    "expected checkout to track origin/<default-branch>",
+  );
+
+  // Fail closed on attach — must not swallow with || true (old pull line did).
+  const checkoutLine = script.split("\n").find((l) => l.includes("git checkout -B"));
+  assert.ok(checkoutLine, "expected checkout -B line");
+  assert.equal(
+    checkoutLine.includes("|| true"),
+    false,
+    `branch attach must fail closed (no || true): ${checkoutLine}`,
+  );
 });
 
 test("auto-tag detection pattern rejects post-tag docs regenerate commit subject (no tag loop)", () => {

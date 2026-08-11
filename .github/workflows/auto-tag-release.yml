@@ -179,6 +179,21 @@ jobs:
           # GITHUB_TOKEN so commit push authenticates with RELEASE_TAG_TOKEN.
           git config --local --unset-all http.https://github.com/.extraheader || true
           git remote set-url origin "https://x-access-token:${RELEASE_TAG_TOKEN}@github.com/${{ github.repository }}.git"
-          # Stay on the default branch tip (release merge or already-tagged head).
-          git pull --ff-only origin "${{ github.ref_name }}" || true
+          # actions/checkout leaves a detached SHA. Attach a local branch that
+          # tracks origin/<default> so release-docs-refresh's bare `git push`
+          # can update the default branch (detached HEAD rejects a bare push).
+          # Fail closed if sync fails — do not leave main stale silently.
+          branch="${{ github.ref_name }}"
+          if ! git fetch origin "${branch}"; then
+            echo "::error::Could not fetch origin/${branch} for post-tag CHANGELOG refresh. Tag was not deleted."
+            exit 1
+          fi
+          if ! git checkout -B "${branch}" "origin/${branch}"; then
+            echo "::error::Could not check out local branch '${branch}' tracking origin/${branch} — post-tag CHANGELOG commit cannot be pushed from a detached Actions checkout. Tag was not deleted."
+            exit 1
+          fi
+          if [ "$(git branch --show-current)" != "${branch}" ]; then
+            echo "::error::Expected HEAD on branch '${branch}' for docs push; got '$(git branch --show-current || echo detached)'. Tag was not deleted."
+            exit 1
+          fi
           node scripts/release-docs-refresh.mjs --version "${version}" --push
