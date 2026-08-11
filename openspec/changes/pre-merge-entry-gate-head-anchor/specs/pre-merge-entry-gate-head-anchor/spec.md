@@ -38,7 +38,7 @@ Within a single pre-merge polling session, when the current open PR head SHA equ
 
 - **WHEN** a polling session has no `entryGatesPassedForSha` (or it is empty)
 - **THEN** the pipeline SHALL run the full pre-CI entry-gate stack before early-conflict and the CI step
-- **AND** on a clean proceed into the CI step SHALL set `entryGatesPassedForSha` to the head SHA that entered the CI step
+- **AND** on a clean proceed into the CI step with a post-stack head that still matches the stack-entry head SHALL set `entryGatesPassedForSha` to that stack-validated head SHA
 
 #### Scenario: Multi-tick pending CI reduces head-bound entry-gate work after first proceed
 
@@ -84,12 +84,19 @@ The pipeline SHALL set `entryGatesPassedForSha` only when the full head-bound en
 - **THEN** the pipeline SHALL NOT set `entryGatesPassedForSha` for the conflicting head as a proceed memo
 - **AND** a later tick SHALL re-evaluate entry gates unless a later clean proceed for that head is recorded
 
-#### Scenario: Proceed into CI sets the memo to the entering head
+#### Scenario: Proceed into CI sets the memo to the stack-validated head
 
 - **WHEN** the entry-gate stack completes with no non-proceed return
 - **AND** the PR is not treated as an early conflict that skips the CI step via recovery return
-- **THEN** before or as control enters the CI step the pipeline SHALL set `entryGatesPassedForSha` to the current PR head SHA used for that CI entry
-- **AND** that SHA SHALL reflect post-stack head when an earlier step in the same pass moved HEAD (for example an OpenSpec archive commit)
+- **AND** the post-stack PR detail re-fetch still reports the same head SHA observed before the stack
+- **THEN** before or as control enters the CI step the pipeline SHALL set `entryGatesPassedForSha` to that stack-entry head SHA
+
+#### Scenario: Unproven post-stack head change does not acquire a proceed memo
+
+- **WHEN** the head-bound entry-gate stack completes against head H1
+- **AND** a post-stack `getPrDetail` re-fetch reports head H2 where H2 ≠ H1 without a stack-proven transition for H2
+- **THEN** the pipeline SHALL leave `entryGatesPassedForSha` unset (SHALL NOT set it to H2)
+- **AND** a later tick that still observes H2 SHALL re-run the full head-bound entry-gate stack before H2 can become a memo hit
 
 ---
 

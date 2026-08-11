@@ -81,16 +81,18 @@ On **every** tick (memo hit or miss), after resolving `prDetail`:
 
 **Rationale:** The original plan skipped early-conflict on memo hit. Review correctly noted mergeability can turn DIRTY when the base moves while head is fixed. Re-checking conflict costs one field already on the per-tick detail read.
 
-### 3. Set the marker only on clean proceed into Step 1, using post-stack head
+### 3. Set the marker only on clean proceed into Step 1 for a stack-validated head
 
 **Decision:**
 
-- After a full (memo-miss) entry stack completes without non-proceed return, and after early-conflict is false, set `pollingCtx.entryGatesPassedForSha` to the head SHA that **enters** Step 1.
-- If archive (or any stack step) may have moved HEAD, **re-fetch `getPrDetail`** after the stack (before early-conflict and before setting the memo) so the memo SHA is the post-stack head.
+- Capture the open PR head SHA **before** entering the head-bound stack (`stackEntryHeadSha`).
+- After a full (memo-miss) entry stack completes without non-proceed return, **re-fetch `getPrDetail`** (mergeability + head observation) before early-conflict.
+- After early-conflict is false, set `pollingCtx.entryGatesPassedForSha` only when the post-stack head still equals `stackEntryHeadSha` (the head the gates validated).
+- If the post-stack re-fetch reports a different head without a stack-proven transition for that new SHA (external push/force-push race during the stack), **leave the memo unset**. The next tick re-runs the full head-bound stack for the new head before it can become a memo hit.
 - Any early `return` from a gate MUST leave the marker unset for that proceed (do not set; do not invent a “failed at sha” cache).
-- Memo hit path never sets the marker again unless a full stack re-runs.
+- Memo hit path re-affirms the existing matching memo; it does not invent a new head.
 
-**Rationale:** Acceptance requires proceed-only memo and correct post-archive anchoring. Setting from pre-archive SHA would false-skip after archive moved HEAD (next tick would still see H2 ≠ H1 if memo were H1 — but if stack set memo to H1 pre-archive and archive produced H2 mid-pass, the same tick would enter CI on H2 while memo said H1, and the next tick would re-run the full stack; worse is setting memo to pre-archive after post-archive head was already observed as stable). Always set from the head used for CI entry after re-resolve.
+**Rationale:** Proceed-only memo must not treat an externally introduced head as already gated. Successful OpenSpec archive currently returns `waiting` after push (no same-pass CI proceed/memo). Blindly memoizing whatever post-stack `getPrDetail` returns would permanently skip head-bound gates for an ungated developer push that lands between stack completion and the re-fetch.
 
 ### 4. Hoist `getPrDetail` + session-scoped `prNumber` with validity rule
 
@@ -119,7 +121,7 @@ On **every** tick (memo hit or miss), after resolving `prDetail`:
 2. **Head invalidation** — memo H1, then head H2 → full head-bound stack runs; fails if skip ignores head equality.
 3. **Non-proceed does not set memo** — forced non-null SHA-gate / archive / guard / early-conflict recovery → marker unset; next same-head tick re-runs stack.
 4. **Base-only DIRTY** — memo set for H1; next tick same `head_sha`, `mergeable_state: "DIRTY"` (or `mergeable: false`) → conflict recovery; SHA gate / archive / guard may still be skipped but conflict path runs.
-5. **Post-archive memo SHA** — archive path moves head H1→H2 in one full pass → `entryGatesPassedForSha === H2`.
+5. **Post-stack external head race** — after all three head-bound gates complete against H1, post-stack detail reports H2 → memo stays unset; next tick re-runs full stack for H2 (must fail if H2 is memoized without re-running).
 6. **Closed / replaced PR** — cached `prNumber` closed → re-resolve; do not keep polling closed PR; entry memo cleared.
 7. **Early-conflict predicate** — expression remains byte-identical (shared helper or source assertion).
 
@@ -127,7 +129,7 @@ On **every** tick (memo hit or miss), after resolving `prDetail`:
 
 | Risk | Mitigation |
 | --- | --- |
-| Stale skip after archive moves HEAD in same tick | Re-fetch detail post-stack; set memo to post-stack head only |
+| External post-stack head memoized as gated | Compare post-stack head to stack-entry head; leave memo unset on unproven mismatch |
 | Base moves → DIRTY without head change | Early-conflict always re-evaluated on fresh detail |
 | Closed/replaced PR with cached number | Validity check on every `getPrDetail`; clear cache + memo and re-resolve |
 | Skip hides mid-poll comment/override edge cases | Accepted for head-bound skip; override/operator paths re-enter outside pure waiting poll; head movement still re-runs stack |

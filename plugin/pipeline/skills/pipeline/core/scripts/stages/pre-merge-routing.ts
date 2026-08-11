@@ -483,7 +483,18 @@ export async function advance(
     pollingCtx.entryGatesPassedForSha.length > 0 &&
     pollingCtx.entryGatesPassedForSha === prDetail.head_sha;
 
+  // Head SHA the head-bound stack validated this tick (or already memoized).
+  // Only this value may become `entryGatesPassedForSha` on clean proceed — an
+  // unrecognized post-stack head change must not acquire a proceed memo
+  // (#816 review 2 / override-key 22170497).
+  let entryGateProceedSha: string | undefined = entryGatesMemoHit
+    ? prDetail.head_sha
+    : undefined;
+
   if (!entryGatesMemoHit) {
+    // Head observed before the stack; gates below validate this SHA only.
+    const stackEntryHeadSha = prDetail.head_sha;
+
     // ---- Review-SHA gate (#16): runs before any pre-merge work ----
     // pre-merge is the only stage that acts on a prior review verdict without
     // re-running review, so it is where a stale approval would slip through. If
@@ -591,13 +602,20 @@ export async function advance(
       if (openspecGuardOutcome) return openspecGuardOutcome;
     }
 
-    // Re-fetch after the stack: archive (or other steps) may have moved HEAD.
-    // Memo and early-conflict must use the post-stack head that enters CI (#816).
+    // Re-fetch after the stack: mergeability may change; stack steps may move HEAD.
+    // Only the stack-entry head is memo-eligible unless a future channel proves a
+    // stack-produced post-stack SHA. An external push/force-push between stack
+    // completion and this re-fetch must not become a proceed memo (#816 review 2).
     try {
       prDetail = await getPrDetailFn(cfg, prNumber);
     } catch {
       // Detail fetch failed post-stack; keep pre-stack detail for early-conflict/CI.
     }
+    if (prDetail.head_sha === stackEntryHeadSha) {
+      entryGateProceedSha = stackEntryHeadSha;
+    }
+    // else: leave entryGateProceedSha unset — next tick re-runs the full stack
+    // for the new head before it can become a memo hit.
   }
 
   // ---- Step 0.5: early conflict detection (#95) — every tick, including memo hits ----
@@ -615,10 +633,12 @@ export async function advance(
     return recoverFromMergeConflict(cfg, issueNumber, opts.stateDir, deps, prNumber, opts.runDir);
   }
 
-  // Clean proceed into Step 1: record head-bound entry-gate memo for this head (#816).
-  // Only set on proceed; non-null gate returns above never reach here.
-  if (pollingCtx) {
-    pollingCtx.entryGatesPassedForSha = prDetail.head_sha;
+  // Clean proceed into Step 1: record head-bound entry-gate memo only for a head
+  // the stack validated this tick (or an existing memo hit). Non-null gate
+  // returns above never reach here; unproven post-stack head changes leave the
+  // memo unset (#816 review 2).
+  if (pollingCtx && entryGateProceedSha) {
+    pollingCtx.entryGatesPassedForSha = entryGateProceedSha;
   }
 
   // ---- Step 1: CI ----

@@ -10,9 +10,9 @@
 - [x] 2.2 Hoist `getPrDetail` early (after dry-run skip). If detail missing/throws or `state !== "open"`, clear `prNumber` + `entryGatesPassedForSha`, re-resolve via `getPrForIssue`, and re-fetch detail (or block with existing no-PR path)
 - [x] 2.3 When `pollingCtx` is present and `entryGatesPassedForSha === prDetail.head_sha`, skip only review-SHA gate, OpenSpec archive, and active-change guard; **do not** skip early-conflict or Step 1 CI
 - [x] 2.4 When memo misses, run full entry stack in existing order (SHA gate → preArchive capture → archive → active-change guard)
-- [x] 2.5 After a full stack that may move HEAD (archive), re-fetch `getPrDetail` before early-conflict and before setting the memo so the memo SHA is the post-stack head that enters CI
+- [x] 2.5 After a full stack, re-fetch `getPrDetail` before early-conflict; set the proceed memo only when the post-stack head still equals the stack-entry head the gates validated (do not memoize unproven external post-stack head movement)
 - [x] 2.6 Always evaluate early-conflict with the byte-identical predicate on the current open `prDetail`; conflict recovery return must not set the proceed memo
-- [x] 2.7 Set `entryGatesPassedForSha` only on clean proceed into Step 1 (full-stack path completed, not early conflict)
+- [x] 2.7 Set `entryGatesPassedForSha` only on clean proceed into Step 1 for a stack-validated head (full-stack path completed, not early conflict, not unproven post-stack SHA mismatch)
 - [x] 2.8 Leave one-shot `advance` without `pollingCtx` on the full-stack path every call
 
 ## 3. Tests
@@ -22,7 +22,7 @@
 - [x] 3.2b Revert-to-prior-SHA regression: H1 proceed → H2 non-proceed clears memo → H1 again re-runs full head-bound stack (no stale memo hit)
 - [x] 3.3 Non-proceed test: forced non-null SHA-gate / archive / guard / early-conflict recovery does not set `entryGatesPassedForSha`; next same-head tick still runs the stack
 - [x] 3.4 Unchanged head + base-driven DIRTY / `mergeable === false` still takes conflict recovery (memo hit does not skip early-conflict)
-- [x] 3.5 Archive-induced head movement in one pass records post-archive SHA on `entryGatesPassedForSha`
+- [x] 3.5 Post-stack external head race: after all three head-bound gates complete, a getPrDetail head flip to H2 must not set `entryGatesPassedForSha` to H2; next tick re-runs the full stack
 - [x] 3.6 Cached `prNumber` for a closed/missing PR is cleared; identity re-resolved; entry memo cleared; closed PR is not kept as the poll target
 - [x] 3.7 Early-conflict predicate stability (shared helper or equivalent) and UNKNOWN/BEHIND fall-through unchanged
 - [x] 3.8 All new tests use injectable deps only (no real network, git, or subprocess)

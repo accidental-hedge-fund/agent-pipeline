@@ -494,17 +494,20 @@ test("#816 memo hit with base-driven DIRTY still takes early-conflict path", asy
 });
 
 // ---------------------------------------------------------------------------
-// 3.5 Archive-induced head movement records post-archive SHA on memo
+// 3.5 Post-stack external head race must not acquire a proceed memo
 // ---------------------------------------------------------------------------
 
-test("#816 post-stack head (archive) is what entryGatesPassedForSha records", async (t) => {
-  // Simulate archive moving HEAD: getPrDetail returns H1 until the stack has
-  // listed PR-head change dirs (archive/guard), then H2 for the post-stack
-  // re-fetch. preArchiveSha is captured from the early detail (H1).
-  let stackListed = false;
+test("#816 post-stack external head change does not memoize ungated SHA", async (t) => {
+  // Gates complete against H1; only after all three head-bound gates finish
+  // does getPrDetail report H2 (external push/force-push race). H2 must not
+  // become entryGatesPassedForSha — next tick must re-run the full stack.
+  let stackComplete = false;
+  let getIssueDetailN = 0;
+  let listPrHeadChangeDirsN = 0;
   const { deps, rec } = makeHarness({ checksBucket: "pending" });
   deps.getIssueDetail = async () => {
     rec.getIssueDetail++;
+    getIssueDetailN++;
     // No reviewed-sha → SHA gate no-ops without blocking on either head.
     return { comments: [] } as Awaited<
       ReturnType<NonNullable<AdvancePreMergeDeps["getIssueDetail"]>>
@@ -512,12 +515,17 @@ test("#816 post-stack head (archive) is what entryGatesPassedForSha records", as
   };
   deps.listPrHeadChangeDirs = async () => {
     rec.listPrHeadChangeDirs++;
-    stackListed = true;
+    listPrHeadChangeDirsN++;
+    // Archive + active-change guard both list; mark complete after the stack
+    // has exercised this dep (both gate paths use it without a worktree).
+    stackComplete = true;
     return [];
   };
   deps.getPrDetail = async (_cfg, n) => {
     rec.getPrDetail++;
-    const sha = stackListed ? SHA_H2 : SHA_H1;
+    // Early hoist + any mid-stack reads stay on H1; only the post-stack
+    // re-fetch (after listing) observes the external H2.
+    const sha = stackComplete ? SHA_H2 : SHA_H1;
     return {
       number: n,
       title: "t",
@@ -541,14 +549,43 @@ test("#816 post-stack head (archive) is what entryGatesPassedForSha records", as
   const cfg = makeCfg();
 
   await quiet(t, async () => {
-    const out = await runTick(cfg, deps, rec, pollingCtx);
-    assert.equal(out.reason, "CI still running");
+    const out1 = await runTick(cfg, deps, rec, pollingCtx);
+    assert.equal(out1.reason, "CI still running");
+    assert.equal(
+      pollingCtx.entryGatesPassedForSha,
+      undefined,
+      "external post-stack head must not acquire a proceed memo",
+    );
+    assert.notEqual(
+      pollingCtx.entryGatesPassedForSha,
+      SHA_H2,
+      "ungated H2 must never be memoized",
+    );
+    assert.equal(pollingCtx.preArchiveSha, SHA_H1, "preArchiveSha remains stack-entry H1");
+    assert.ok(getIssueDetailN >= 1, "tick 1 ran SHA gate");
+    assert.ok(listPrHeadChangeDirsN >= 1, "tick 1 ran archive/active-change listing");
+
+    // Next tick observes H2 from the start with memo unset → full stack re-runs
+    // and may memoize H2 only after gates complete against H2 itself.
+    const issueBefore = getIssueDetailN;
+    const listBefore = listPrHeadChangeDirsN;
+    const out2 = await runTick(cfg, deps, rec, pollingCtx);
+    assert.equal(out2.reason, "CI still running");
+    assert.ok(
+      getIssueDetailN > issueBefore,
+      "tick 2 must re-run SHA gate for ungated H2",
+    );
+    assert.ok(
+      listPrHeadChangeDirsN > listBefore,
+      "tick 2 must re-run archive/active-change for ungated H2",
+    );
+    // Tick 2 entered the stack on H2 (early detail already H2) and post-stack
+    // still reports H2, so H2 is now stack-validated and may be memoized.
     assert.equal(
       pollingCtx.entryGatesPassedForSha,
       SHA_H2,
-      "memo must record post-stack head that entered CI, not pre-archive H1",
+      "after a full stack that starts and ends on H2, memo may record H2",
     );
-    assert.equal(pollingCtx.preArchiveSha, SHA_H1, "preArchiveSha remains pre-stack");
   });
 });
 

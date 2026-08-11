@@ -11,7 +11,7 @@
 - When `pollingCtx.entryGatesPassedForSha === prDetail.head_sha`, skip **only** the head-bound entry gates (review-SHA gate, OpenSpec archive, active-change guard) and still:
   - evaluate the **early-conflict predicate every tick** from the fresh per-tick `prDetail`
   - run Step 1 CI every tick
-- When the marker is absent or the head differs, run the full stack in existing order and set `entryGatesPassedForSha` **only** on a clean proceed into Step 1, using the **post-stack** head SHA (re-fetch after archive if HEAD may have moved).
+- When the marker is absent or the head differs, run the full stack in existing order and set `entryGatesPassedForSha` **only** on a clean proceed into Step 1 when the post-stack re-fetch still reports the **stack-entry** head the gates validated (do not memoize unproven external post-stack head movement).
 - Any non-null gate outcome MUST NOT set the memo.
 - Any head movement invalidates the memo by SHA mismatch and re-runs every head-bound entry gate in full.
 - Cached `prNumber` is reused only while `getPrDetail` confirms the PR is still open; closed/missing/replaced PR clears the cache and re-resolves identity.
@@ -24,7 +24,7 @@
 - [ ] A regression test with stubbed `getPrChecks` returning pending for 10 ticks fails if entry gates re-run every tick; after the fix, per-tick load-bearing gh/detail/check calls after tick 1 drop to roughly the CI path (PR detail + checks), not the full ~9+ entry stack.
 - [ ] `entryGatesPassedForSha` is set only on clean proceed into Step 1; any non-null gate result leaves the marker unset (or unchanged from a prior head).
 - [ ] Changing `prDetail.head_sha` between ticks clears the skip path; a dedicated regression fails if invalidation is removed.
-- [ ] After an archive (or other stack step) that moves HEAD in the same pass, the memo records the **post-stack** head SHA, not the pre-archive SHA.
+- [ ] After an unproven post-stack head change (external push during the stack), the memo is **not** set to the new SHA; the next tick re-runs the full head-bound stack for that head.
 - [ ] Cached `prNumber` is not reused for a closed/missing PR; identity is re-resolved and entry memo cleared when PR identity is no longer valid.
 - [ ] Early-conflict predicate remains byte-identical: `mergeable === false || (mergeable_state ?? "").toUpperCase() === "DIRTY"`.
 - [ ] No review step, SHA-gate policy, OpenSpec archive fail-closed path, active-change guard, or CI recovery ladder is removed or demoted.
