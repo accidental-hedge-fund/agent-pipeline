@@ -47,6 +47,8 @@ test("supervisor examples exist and stay thin", () => {
     "examples/supervisor/shell/run-intent.sh",
     "examples/supervisor/shell/ship-stage-watch.sh",
     "examples/supervisor/shell/ship-milestone.sh",
+    "examples/supervisor/shell/pipeline-ship-playbook.sh",
+    "examples/supervisor/shell/train-status-complete.py",
     "examples/supervisor/hermes/SKILL.md",
     "examples/supervisor/openclaw/SKILL.md",
     "examples/supervisor/slack/README.md",

@@ -53,8 +53,13 @@ chain playbook instead (or alongside) — it composes only existing tools
 `engine-promote`) and needs no signed authorization document:
 
 ```bash
+# Install playbook + sibling train-status helper (completion gate).
 install -m 0755 "$ROOT/examples/supervisor/shell/pipeline-ship-playbook.sh" \
   "$HOME/.local/bin/pipeline-ship-playbook"
+install -m 0755 "$ROOT/examples/supervisor/shell/train-status-complete.py" \
+  "$HOME/.local/bin/train-status-complete.py"
+# Or keep both under one dir and point PIPELINE at that layout; the playbook
+# resolves train-status-complete.py next to itself by default.
 ```
 
 Keep the installed copy in sync with the source after updating the repo — the
@@ -63,7 +68,15 @@ host file is not generated, so refresh it manually when `main` changes it:
 ```bash
 cp "$ROOT/examples/supervisor/shell/pipeline-ship-playbook.sh" \
   "$HOME/.local/bin/pipeline-ship-playbook"
+cp "$ROOT/examples/supervisor/shell/train-status-complete.py" \
+  "$HOME/.local/bin/train-status-complete.py"
 ```
+
+**Train completion gate:** the playbook evaluates the **last** `train_status`
+object in the captured `pipeline train --json` stream (via
+`train-status-complete.py` / `raw_decode`), so leading human-readable prose does
+not false-fail a truly complete train. A non-null `blocker` still fails closed
+and is written to `train.json.blocker`.
 
 ## FRG is not part of thin ship
 
