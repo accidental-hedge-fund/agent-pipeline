@@ -6,6 +6,11 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  evaluateInstalledShipPlaybookPromoteHost,
+  shipPlaybookHasAllPromoteDefault,
+  shipPlaybookHasLegacyCodexOnlyPromoteDefault,
+} from "../scripts/ship-playbook-promote-host.ts";
+import {
   DEFAULT_ENGINE_PROMOTE_HOST,
   installArgsForTag,
   installCommandForTag,
@@ -157,6 +162,48 @@ test("ship playbook: ENGINE_PROMOTE_HOST defaults to all and passes --host (#989
     body,
     /engine-promote --for "\$version" --host "\$HOST" --skip-frg --json/,
   );
+  // Pure helper agrees with the repo playbook shape (doctor uses the same helper).
+  assert.equal(shipPlaybookHasAllPromoteDefault(body), true);
+  assert.equal(shipPlaybookHasLegacyCodexOnlyPromoteDefault(body), false);
+  assert.equal(evaluateInstalledShipPlaybookPromoteHost(body).status, "pass");
+});
+
+test("legacy installed ship playbook: codex-only default fails rollout preflight (#989)", () => {
+  // Fixture of the already-installed ~/.local/bin shape that triggered the incident:
+  // unset ENGINE_PROMOTE_HOST expands to codex and is forwarded as --host codex.
+  const legacy = [
+    '#!/usr/bin/env bash',
+    'HOST="${ENGINE_PROMOTE_HOST:-codex}"',
+    '"$PIPELINE" engine-promote --for "$version" --host "$HOST" --skip-frg --json',
+    "",
+  ].join("\n");
+  assert.equal(shipPlaybookHasLegacyCodexOnlyPromoteDefault(legacy), true);
+  assert.equal(shipPlaybookHasAllPromoteDefault(legacy), false);
+
+  const blocked = evaluateInstalledShipPlaybookPromoteHost(legacy, {
+    pathLabel: "/home/op/.local/bin/pipeline-ship-playbook",
+  });
+  assert.equal(blocked.status, "fail");
+  if (blocked.status === "fail") {
+    assert.match(blocked.detail, /codex/i);
+    assert.match(blocked.remediation, /ENGINE_PROMOTE_HOST=all|install -m 0755|REPO_DIR/i);
+  }
+
+  // Explicit override still honors operator intent (including multi-host rollout).
+  const withAll = evaluateInstalledShipPlaybookPromoteHost(legacy, {
+    enginePromoteHostEnv: "all",
+  });
+  assert.equal(withAll.status, "pass");
+
+  // Current repo playbook must not fail the same check.
+  const current = fs.readFileSync(
+    path.join(repoRoot, "examples/supervisor/shell/pipeline-ship-playbook.sh"),
+    "utf8",
+  );
+  assert.equal(evaluateInstalledShipPlaybookPromoteHost(current).status, "pass");
+
+  // Missing install is skip, not fail (hosts without the chain playbook).
+  assert.equal(evaluateInstalledShipPlaybookPromoteHost(null).status, "skip");
 });
 
 test("engine-promote: nested installer exempts only the launcher reservation passed by the shim", () => {

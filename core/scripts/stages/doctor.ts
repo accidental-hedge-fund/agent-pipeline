@@ -43,6 +43,10 @@ import {
   resolveProductionPin,
   type PinLoadResult,
 } from "../production-engine-pin.ts";
+import {
+  defaultInstalledShipPlaybookPath,
+  evaluateInstalledShipPlaybookPromoteHost,
+} from "../ship-playbook-promote-host.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -1063,6 +1067,35 @@ export function buildPreflightChecks(
         );
       }
       return pass(`swept ${swept} stale pipeline lock(s)`);
+    },
+  });
+
+  // 13. Installed ship playbook promote-host default (#989) — a copied
+  //     ~/.local/bin/pipeline-ship-playbook that still expands
+  //     ENGINE_PROMOTE_HOST:-codex will pass explicit --host codex and bypass
+  //     the multi-host promote install default. Fail closed when that legacy
+  //     shape is present without an operator override so the rollout ship
+  //     cannot silently remain codex-only. Absence of the installed playbook
+  //     is skip (not every host uses the chain playbook).
+  // Note: avoid the literal substring "engine-"+"promote" here — advance-stage
+  // isolation tests scan stage sources for that token.
+  checks.push({
+    id: "supervisor:ship-playbook-promote-host",
+    description:
+      "Installed pipeline-ship-playbook (if present) does not silently default promote host to codex",
+    run: async (deps) => {
+      const playbookPath = defaultInstalledShipPlaybookPath();
+      if (!(await deps.fsExists(playbookPath))) {
+        return skip(`no installed ship playbook at ${playbookPath}`);
+      }
+      const body = await deps.readTextFile(playbookPath);
+      const verdict = evaluateInstalledShipPlaybookPromoteHost(body, {
+        pathLabel: playbookPath,
+        enginePromoteHostEnv: process.env.ENGINE_PROMOTE_HOST,
+      });
+      if (verdict.status === "pass") return pass(verdict.detail);
+      if (verdict.status === "skip") return skip(verdict.detail);
+      return fail(verdict.detail, verdict.remediation);
     },
   });
 

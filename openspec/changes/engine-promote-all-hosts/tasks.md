@@ -17,6 +17,12 @@
 - [x] 3.2 Unit test: explicit `--host` / host option (e.g. `codex` or `claude`) is preserved in the install command
 - [x] 3.3 Test or static assertion: ship playbook unset default is `all` and honors `ENGINE_PROMOTE_HOST` override shape
 - [x] 3.4 Update any existing engine-promote tests that hard-assume default `codex` for omitted host
+- [x] 3.5 Pure helper + doctor check: legacy installed playbook with `:-codex` fails closed without override; `:-all` passes; missing playbook skips (#989 review 1)
+
+## 3b. Rollout enforcement for already-installed playbook
+
+- [x] 3b.1 Document mandatory pre-ship refresh / versioned-path / `ENGINE_PROMOTE_HOST=all` in `docs/runbooks/ship-milestone.md`
+- [x] 3b.2 Doctor check `supervisor:ship-playbook-promote-host` fails on legacy codex-only installed playbook when env override is unset
 
 ## 4. Docs surface
 

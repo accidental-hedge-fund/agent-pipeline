@@ -1431,6 +1431,57 @@ test("check install:engine-track — additive stable id alongside coherence and 
   assert.ok(ids.includes("install:engine-track"));
 });
 
+// #989: installed chain playbook that still defaults ENGINE_PROMOTE_HOST to codex
+// would pass explicit --host codex and bypass the multi-host promote default.
+test("check supervisor:ship-playbook-promote-host — fails on legacy codex-only default", async () => {
+  const saved = process.env.ENGINE_PROMOTE_HOST;
+  delete process.env.ENGINE_PROMOTE_HOST;
+  try {
+    const check = getCheck(makeConfig(), "supervisor:ship-playbook-promote-host");
+    const legacy = 'HOST="${ENGINE_PROMOTE_HOST:-codex}"\n';
+    const r = await check.run(
+      fakeDeps({
+        fsExists: (p) => p.includes("pipeline-ship-playbook"),
+        readTextFile: (p) => (p.includes("pipeline-ship-playbook") ? legacy : '{"version":"1.0.0"}'),
+      }),
+    );
+    assertFailWithRemediation(r);
+    assert.match(r.detail, /codex/i);
+    assert.match(r.remediation!, /ENGINE_PROMOTE_HOST=all|install -m 0755|#989/i);
+  } finally {
+    if (saved === undefined) delete process.env.ENGINE_PROMOTE_HOST;
+    else process.env.ENGINE_PROMOTE_HOST = saved;
+  }
+});
+
+test("check supervisor:ship-playbook-promote-host — passes when playbook defaults to all", async () => {
+  const check = getCheck(makeConfig(), "supervisor:ship-playbook-promote-host");
+  const current = 'HOST="${ENGINE_PROMOTE_HOST:-all}"\n';
+  const r = await check.run(
+    fakeDeps({
+      fsExists: (p) => p.includes("pipeline-ship-playbook"),
+      readTextFile: (p) => (p.includes("pipeline-ship-playbook") ? current : '{"version":"1.0.0"}'),
+    }),
+  );
+  assert.equal(r.status, "pass");
+  assert.match(r.detail, /all/);
+});
+
+test("check supervisor:ship-playbook-promote-host — skips when playbook is not installed", async () => {
+  const check = getCheck(makeConfig(), "supervisor:ship-playbook-promote-host");
+  const r = await check.run(
+    fakeDeps({
+      fsExists: (p) => !p.includes("pipeline-ship-playbook"),
+    }),
+  );
+  assert.equal(r.status, "skip");
+});
+
+test("check supervisor:ship-playbook-promote-host — additive stable id", () => {
+  const ids = buildPreflightChecks(makeConfig(), FAKE_VERSION, FAKE_INSTALL_ROOT).map((c) => c.id);
+  assert.ok(ids.includes("supervisor:ship-playbook-promote-host"));
+});
+
 // Regression for the corrupt-install startup path (#186 review 2): if core/package.json
 // is unreadable at startup, loadVersion() in pipeline.ts returns "" rather than throwing
 // at module load. This test proves runPreflight still executes (does not crash) and that

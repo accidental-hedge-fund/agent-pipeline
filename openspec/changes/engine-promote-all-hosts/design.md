@@ -85,8 +85,9 @@ Do not require unit tests to mutate real `~/.claude` / `~/.codex` trees.
 
 1. Land code/doc/test changes via normal PR for #989.
 2. Operators running the repo or next-released engine get the new default on the next promote.
-3. Operators with a copied `pipeline-ship-playbook` under `~/.local/bin` should reinstall or re-copy the script (or export `ENGINE_PROMOTE_HOST=all` until they do).
-4. Rollback: revert defaults to `codex` restores prior behavior (known multi-host drift after ship).
+3. **Before the first ship that must multi-host promote** (including the release that ships this fix): operators with a copied `pipeline-ship-playbook` under `~/.local/bin` MUST either reinstall/re-copy the script from the checkout that contains the fix, invoke the versioned repo playbook path directly, or export `ENGINE_PROMOTE_HOST=all` for that run. An installed playbook that still expands `:-codex` and forwards `--host codex` bypasses the stage default of `all`.
+4. **Enforceable gate:** `pipeline doctor` check `supervisor:ship-playbook-promote-host` fails when the installed playbook still has the legacy codex-only unset default and `ENGINE_PROMOTE_HOST` is unset. Run doctor from a checkout that includes this check before the rollout ship. See `docs/runbooks/ship-milestone.md`.
+5. Rollback: revert defaults to `codex` restores prior behavior (known multi-host drift after ship).
 
 ## Open Questions
 

@@ -42,3 +42,27 @@ The ship playbook's default promote host resolution (unset → `all`, set → ov
 - **WHEN** the automated check for ship playbook promote host resolution runs against a playbook whose unset default is `codex`
 - **THEN** the check SHALL fail
 - **AND** the same check SHALL pass when the unset default is `all` and an explicit override is still honored
+
+### Requirement: Legacy installed codex-only ship playbook SHALL fail doctor preflight
+
+When an installed chain-to-existing-tools ship playbook is present at the documented install path (`~/.local/bin/pipeline-ship-playbook` or equivalent) and its source still uses the pre-multi-host unset default `HOST="${ENGINE_PROMOTE_HOST:-codex}"`, and the operator has not set `ENGINE_PROMOTE_HOST` in the environment, doctor preflight SHALL fail closed with remediation that requires one of: reinstalling/refreshing the playbook from the repo example, invoking the versioned repo playbook path directly, or exporting `ENGINE_PROMOTE_HOST=all` for the ship run. Absence of an installed playbook SHALL skip the check (not every host uses the chain playbook). When the operator has set `ENGINE_PROMOTE_HOST`, the check SHALL NOT fail solely for the legacy default shape.
+
+#### Scenario: Legacy installed playbook without override fails doctor
+
+- **WHEN** doctor runs and `~/.local/bin/pipeline-ship-playbook` exists
+- **AND** that file contains the unset default `ENGINE_PROMOTE_HOST:-codex`
+- **AND** `ENGINE_PROMOTE_HOST` is unset in the doctor environment
+- **THEN** the `supervisor:ship-playbook-promote-host` check SHALL fail
+- **AND** remediation SHALL name refresh, versioned-repo invocation, or `ENGINE_PROMOTE_HOST=all`
+
+#### Scenario: Missing installed playbook skips the check
+
+- **WHEN** doctor runs and no installed ship playbook is present at the documented path
+- **THEN** the promote-host playbook check SHALL skip
+- **AND** doctor SHALL NOT fail solely because the chain playbook is unused
+
+#### Scenario: Legacy fixture regression fails pure helper without override
+
+- **WHEN** unit tests evaluate a fixture playbook body whose unset default is `codex` with no `ENGINE_PROMOTE_HOST` override
+- **THEN** the evaluation SHALL report fail
+- **AND** the same evaluation SHALL report pass for a body whose unset default is `all`
