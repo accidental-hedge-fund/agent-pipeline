@@ -7,6 +7,86 @@ import type { Outcome } from "../types.ts";
 import type { BlockerKind } from "../types.ts";
 import type { PreMergeOfframpPathTag } from "../pre-merge-offramp.ts";
 import type { StageDiagnostic } from "../stage-diagnostic.ts";
+import { normalizeCandidateSha } from "../tester-evidence.ts";
+
+// ---------------------------------------------------------------------------
+// Live-head SHA currency pin (#1010)
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether a recorded candidate / test / reviewed SHA is current for the live
+ * open PR head pin used by pre-merge tester, CI, and delta residual authority.
+ *
+ * - `current` — both are full SHAs and equal (case-normalized)
+ * - `stale`   — recorded SHA is absent, malformed, or differs from the live pin
+ * - `unknown` — live head pin itself is missing/malformed (cannot authorize)
+ */
+export type RecordedShaCurrencyStatus = "current" | "stale" | "unknown";
+
+export interface RecordedShaCurrency {
+  status: RecordedShaCurrencyStatus;
+  recordedSha: string | null;
+  liveHead: string | null;
+}
+
+/**
+ * Pure classifier: recorded evidence/test/reviewed SHA vs the live-head pin.
+ * Callers MUST NOT grant fail / residual-block authority when status ≠ current.
+ */
+export function classifyRecordedShaAgainstLiveHead(
+  recordedSha: string | null | undefined,
+  liveHead: string | null | undefined,
+): RecordedShaCurrency {
+  const rec = normalizeCandidateSha(recordedSha);
+  const live = normalizeCandidateSha(liveHead);
+  if (live == null) {
+    return { status: "unknown", recordedSha: rec, liveHead: live };
+  }
+  if (rec == null) {
+    return { status: "stale", recordedSha: rec, liveHead: live };
+  }
+  if (rec === live) {
+    return { status: "current", recordedSha: rec, liveHead: live };
+  }
+  return { status: "stale", recordedSha: rec, liveHead: live };
+}
+
+/** True only when the recorded SHA is a full SHA equal to the live-head pin. */
+export function recordedShaIsCurrentForLiveHead(
+  recordedSha: string | null | undefined,
+  liveHead: string | null | undefined,
+): boolean {
+  return classifyRecordedShaAgainstLiveHead(recordedSha, liveHead).status === "current";
+}
+
+/**
+ * Append dual-SHA disclosure when residual escalate involves a prior candidate
+ * SHA distinct from the live head (#1010). Does not auto-override findings.
+ */
+export function appendDualShaEscalationDisclosure(
+  reason: string,
+  liveHead: string,
+  priorCandidateSha?: string | null,
+  overrideRequired = true,
+): string {
+  const live = normalizeCandidateSha(liveHead);
+  const prior = normalizeCandidateSha(priorCandidateSha);
+  if (!live) return reason;
+  const parts: string[] = [reason.replace(/\s+$/, "")];
+  if (prior && prior !== live) {
+    parts.push(
+      `Prior candidate SHA \`${prior}\` is superseded; live open PR head is \`${live}\`.`,
+    );
+  } else {
+    parts.push(`Live open PR head: \`${live}\`.`);
+  }
+  if (overrideRequired) {
+    parts.push(
+      "Audited `pipeline override` of residual finding keys at the live head is required if they still block after re-evaluation.",
+    );
+  }
+  return parts.join(" ");
+}
 
 /**
  * Best-effort `gate_result` append for pre-merge observability (#682). Never

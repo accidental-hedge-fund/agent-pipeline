@@ -53,7 +53,11 @@ import { readEvents } from "../run-store.ts";
 import type { RunStoreDeps, StageAccountingEvent } from "../run-store.ts";
 import { runTestGate } from "../testgate.ts";
 import { getIssueDetail, getPrCommits, getPrDiff, listPrHeadChangeDirs, getGhActor, postComment, clearBlocked, createIssue, addIssueComment } from "../gh.ts";
-import { preMergeBlocked, recordPreMergeGateResult } from "./pre-merge-shared.ts";
+import {
+  preMergeBlocked,
+  recordedShaIsCurrentForLiveHead,
+  recordPreMergeGateResult,
+} from "./pre-merge-shared.ts";
 import {
   enforceReviewShaGate,
   type ShaGateDeps,
@@ -655,18 +659,22 @@ export async function advance(
     const runTestGateFn = deps.runTestGate ?? runTestGate;
     const tgResult = await latestTestGateOutcome(opts.runDir, readRunEventsFn);
 
+    // Live-head pin (#1010): both pass and fail authority require a SHA-matched
+    // test-gate row for the current open PR head. A failure recorded at a prior
+    // head (or with absent/legacy pr_head_sha) MUST NOT alone set
+    // test-gate-exhausted / suite-fail for the live tip — re-run inline at the
+    // live head instead. Stale **pass** remains fail-closed via the same path
+    // (fresh gate required; never advance on a superseded pass).
     const isAbsent = tgResult === null;
-    // Only treat as stale when the result is a success: a failure blocks regardless
-    // of which commit was tested (the developer must fix the tests). A successful
-    // result from an old commit needs re-validation against the current PR head.
-    const isStale = tgResult !== null &&
-      tgResult.outcome === "success" &&
-      (!tgResult.prHeadSha || prDetail.head_sha !== tgResult.prHeadSha);
+    const isCurrentHeadResult =
+      tgResult !== null &&
+      recordedShaIsCurrentForLiveHead(tgResult.prHeadSha, prDetail.head_sha);
+    const needsFreshGate = isAbsent || !isCurrentHeadResult;
 
-    if (isAbsent || isStale) {
+    if (needsFreshGate) {
       // No usable cached result (first entry to pre-merge, or PR head moved after
-      // an OpenSpec archive commit or rebase). Run the test gate inline against the
-      // current worktree so recovery is deterministic rather than a re-run dead-end.
+      // an OpenSpec archive commit, rebase, or fail→green tip). Run the test gate
+      // inline against the current worktree so recovery is deterministic.
       const localWt = await getForIssueFn(cfg, issueNumber);
       if (!localWt) {
         // Operational precondition (no worktree) — not a CI/local gate failure.
@@ -768,18 +776,21 @@ export async function advance(
         );
       }
       localTestedSha = prDetail.head_sha;
-    } else if (tgResult.outcome !== "success") {
+    } else if (tgResult!.outcome !== "success") {
+      // SHA-matched failure at the live head — block under existing local-mode
+      // contracts (current-head suite fail only; #1010).
       await setBlockedFn(
         cfg,
         issueNumber,
-        "ci_mode: local is set but the most recent local test-gate result is a failure. " +
+        "ci_mode: local is set but the most recent local test-gate result is a failure " +
+          `at the live PR head \`${prDetail.head_sha}\`. ` +
           "Fix the failing tests, push a new commit to re-run the test gate, then re-run the pipeline.",
         "pre-merge",
         "needs-human",
       );
       return preMergeBlocked("ci_mode: local — local test gate failed", "needs-human", "ci-failed");
     } else {
-      localTestedSha = tgResult.prHeadSha!;
+      localTestedSha = tgResult!.prHeadSha!;
     }
 
     console.log(

@@ -902,10 +902,15 @@ export function loadTesterEvidenceForReviewSync(
   }
   const evidence = readResult.evidence;
   if (!candidateShaMatches(evidence.candidate_sha, candidateSha)) {
+    // SHA mismatch → stale for both pass and fail authority (#1010 / review
+    // acquisition). Non-pass overall_status on a superseded candidate MUST NOT
+    // supply fail authority for the live head; pass is also never invented.
     const reason =
       `Tester suite evidence is stale: artifact candidate_sha=` +
       `${evidence.candidate_sha} does not match review HEAD ${candidateSha}. ` +
-      `Stale evidence cannot support suite success for the current candidate.`;
+      `Stale evidence cannot support suite success for the current candidate ` +
+      `and MUST NOT supply fail / test-gate-exhausted authority for the live head ` +
+      `(overall_status=${evidence.overall_status}).`;
     const base: TesterAcquisitionResult = {
       classification: "stale",
       artifact: evidence,

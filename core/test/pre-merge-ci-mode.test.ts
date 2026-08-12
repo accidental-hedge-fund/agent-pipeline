@@ -160,14 +160,15 @@ test("pre-merge ci_mode: local with passing test-gate advances without calling g
 });
 
 // ---------------------------------------------------------------------------
-// 3.4 — ci_mode: local with test-gate failure blocks to needs-human
+// 3.4 — ci_mode: local with test-gate failure at the live head blocks
 // ---------------------------------------------------------------------------
 
-test("pre-merge ci_mode: local with failing test-gate blocks to needs-human (#350)", async (t) => {
+test("pre-merge ci_mode: local with failing test-gate at live head blocks to needs-human (#350)", async (t) => {
   t.mock.method(console, "log", () => {});
 
   const blockedReasons: string[] = [];
-  const failEvents: RunEvent[] = [makeStageAccountingEvent("failure")];
+  // SHA-matched failure: only current-head fail authorizes the local-mode block (#1010).
+  const failEvents: RunEvent[] = [makeStageAccountingEvent("failure", SHA_HEAD)];
 
   const deps = makeBaseDeps({
     getPrChecks: async () => { throw new Error("should not be called"); },
@@ -612,4 +613,89 @@ test("pre-merge ci_mode: local absent pr_head_sha + no worktree → blocks fail-
     blockedReasons.some((r) => r.includes("ci_mode: local")),
     `blocked reason must mention ci_mode: local; got: ${blockedReasons.join("; ")}`,
   );
+});
+
+// ---------------------------------------------------------------------------
+// #1010 — live-head pin: fail evidence / test-gate rows for a prior head
+// ---------------------------------------------------------------------------
+
+const H_FAIL = "d8f2da7a8b322ec8dfa6843472adeddaa6a51642";
+const H_GREEN = SHA_HEAD; // live tip
+
+test("pre-merge ci_mode: local stale FAILURE at prior head + worktree + inline pass → advances (#1010)", async (t) => {
+  t.mock.method(console, "log", () => {});
+
+  // Prior fail at H_fail must NOT alone block H_green — re-run inline at live head.
+  const failEvents: RunEvent[] = [makeStageAccountingEvent("failure", H_FAIL)];
+  const reviewAtGreen = `## Review 2 (Adversarial) — approve\n\nLGTM\n\n<!-- reviewed-sha: ${H_GREEN} -->`;
+
+  const deps = makeBaseDeps({
+    getIssueDetail: async () =>
+      ({ comments: [{ body: reviewAtGreen }] }) as Awaited<
+        ReturnType<NonNullable<AdvancePreMergeDeps["getIssueDetail"]>>
+      >,
+    getPrChecks: async () => { throw new Error("should not be called"); },
+    readRunEvents: async () => failEvents,
+    getForIssue: async () => FAKE_WT,
+    runTestGate: fakeRunTestGate({ skipped: false, passed: true, attempts: 0 }),
+  });
+
+  const out = await advance(makeCfg("local"), 350, { runDir: "/fake/run/dir" }, deps);
+
+  assert.equal(
+    out.advanced,
+    true,
+    "stale fail at H_fail must not block when inline gate passes at H_green",
+  );
+});
+
+test("pre-merge ci_mode: local stale FAILURE at prior head + no worktree → fail-closed needs fresh gate (#1010)", async (t) => {
+  t.mock.method(console, "log", () => {});
+
+  const blockedReasons: string[] = [];
+  const failEvents: RunEvent[] = [makeStageAccountingEvent("failure", H_FAIL)];
+
+  const deps = makeBaseDeps({
+    getPrChecks: async () => { throw new Error("should not be called"); },
+    setBlocked: async (_cfg, _n, reason) => { blockedReasons.push(reason); },
+    readRunEvents: async () => failEvents,
+    // no worktree → cannot re-run; fail closed without replaying test-gate-exhausted
+  });
+
+  const out = await advance(makeCfg("local"), 350, { runDir: "/fake/run/dir" }, deps);
+
+  assert.equal(out.advanced, false);
+  assert.equal((out as { status: string }).status, "blocked");
+  assert.ok(
+    blockedReasons.some((r) => r.includes("no worktree")),
+    `must request fresh gate via worktree path, not prior-head suite-fail alone; got: ${blockedReasons.join("; ")}`,
+  );
+  assert.ok(
+    !blockedReasons.some((r) => r.includes("most recent local test-gate result is a failure")),
+    "must NOT replay prior-head failure narrative as current-head suite fail",
+  );
+});
+
+test("pre-merge ci_mode: github green on live head ignores prior-head local fail rows (#1010)", async (t) => {
+  t.mock.method(console, "log", () => {});
+
+  // Even if run events still hold a prior-head test-gate failure, github mode
+  // certifies via getPrChecks on the live head only.
+  const failEvents: RunEvent[] = [makeStageAccountingEvent("failure", H_FAIL)];
+  let getPrChecksCalled = false;
+
+  const deps = makeBaseDeps({
+    getPrChecks: async () => {
+      getPrChecksCalled = true;
+      return [{ name: "ci", bucket: "pass" }] as Awaited<
+        ReturnType<NonNullable<AdvancePreMergeDeps["getPrChecks"]>>
+      >;
+    },
+    readRunEvents: async () => failEvents,
+  });
+
+  const out = await advance(makeCfg("github"), 350, { runDir: "/fake/run/dir" }, deps);
+
+  assert.equal(getPrChecksCalled, true, "github mode must consult live-head checks");
+  assert.equal(out.advanced, true, "green checks on live head must not be overturned by H_fail rows");
 });

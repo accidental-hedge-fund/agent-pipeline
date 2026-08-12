@@ -1203,7 +1203,7 @@ function blockingReviewCommentWithHash(round: 1 | 2, sha: string, hash: string, 
   return blockingReviewComment(round, sha, keys) + `\n<!-- verdict-diff-hash: ${hash} -->`;
 }
 
-test("enforceReviewShaGate: diff-hash reuse path re-checks blockers — no-op commit cannot bypass (#228)", async (t) => {
+test("enforceReviewShaGate: diff-hash reuse path re-checks blockers — no-op commit cannot bypass (#228/#1010)", async (t) => {
   const DIFF = "diff --git a/foo.ts b/foo.ts\n+const x = 1;";
   const hash = computeDiffHash(DIFF);
   const { deps, rec } = makeDeps({
@@ -1216,10 +1216,14 @@ test("enforceReviewShaGate: diff-hash reuse path re-checks blockers — no-op co
   await quiet(t, async () => {
     out = await enforceReviewShaGate(cfg, 16, 99, deps);
   });
-  assert.notEqual(out, null, "diff-hash reuse must NOT proceed while a blocker is unresolved");
-  assert.equal((out as any)?.status, "blocked");
-  assert.equal(rec.blocked.length, 1);
-  assert.deepEqual(rec.transitions, []);
+  // #1010: prior-head residual keys on a diff-unchanged tip lack blocking
+  // authority — re-evaluate at the live head rather than silent proceed or
+  // setBlocked solely from the superseded key set.
+  assert.notEqual(out, null, "diff-hash reuse must NOT silent-proceed with unresolved prior-head keys");
+  assert.equal((out as any)?.advanced, true, "must re-evaluate, not park on prior-head keys alone");
+  assert.equal((out as any)?.to, "review-2");
+  assert.equal(rec.blocked.length, 0, "must not setBlocked solely from prior-head residual keys");
+  assert.equal(rec.transitions.length, 1);
 });
 
 test("enforceReviewShaGate: diff-hash reuse path proceeds once the blocker is overridden (#228)", async (t) => {
