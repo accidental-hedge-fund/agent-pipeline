@@ -15,10 +15,13 @@ import {
   branchName,
 } from "../worktree.ts";
 import {
-  isOnlyPipelineInternalMarkerDirt,
   PIPELINE_INTERNAL_MARKER_FILES,
   stripPipelineInternalMarkers,
 } from "../salvage-harness-work.ts";
+import {
+  classifyWorktreeDirt,
+  parsePorcelainPaths,
+} from "../worktree-dirt.ts";
 import { withTrailers } from "../traceability.ts";
 import {
   buildTrustedOverrideComments,
@@ -64,6 +67,82 @@ import {
 // ---------------------------------------------------------------------------
 // OpenSpec archive (once per PR)
 // ---------------------------------------------------------------------------
+
+/**
+ * Classify pre-archive porcelain into blocking product dirt vs untracked
+ * (waivable) scratch (#1017 review 1).
+ *
+ * Only pure untracked (`??`) engine-known scratch is waivable: `git clean` can
+ * remove it, and it is not in the index for archive commit. Tracked/staged/
+ * modified/renamed scratch is treated as product for this guard — `git clean`
+ * cannot clear it, `git add -A` would stage it into the archive commit, and
+ * archive-failure rollback (`git restore .`) would discard it.
+ */
+export function classifyPreArchiveDirt(porcelain: string): {
+  product: string[];
+  untrackedScratch: string[];
+} {
+  const product: string[] = [];
+  const untrackedScratch: string[] = [];
+  const seenProduct = new Set<string>();
+  const seenScratch = new Set<string>();
+
+  for (const line of porcelain.split("\n")) {
+    if (line.length < 3) continue;
+    const xy = line.slice(0, 2);
+    const paths = parsePorcelainPaths(line);
+    if (paths.length === 0) continue;
+    const { product: lineProduct, scratch: lineScratch } = classifyWorktreeDirt(paths);
+    for (const p of lineProduct) {
+      if (!seenProduct.has(p)) {
+        seenProduct.add(p);
+        product.push(p);
+      }
+    }
+    for (const p of lineScratch) {
+      if (xy === "??") {
+        if (!seenScratch.has(p) && !seenProduct.has(p)) {
+          seenScratch.add(p);
+          untrackedScratch.push(p);
+        }
+      } else if (!seenProduct.has(p)) {
+        // Tracked/staged/renamed scratch blocks like product.
+        seenProduct.add(p);
+        product.push(p);
+      }
+    }
+  }
+  return { product, untrackedScratch };
+}
+
+/**
+ * Engine-known scratch paths still staged in the index (porcelain X column is
+ * neither space nor `?`). Pure — post-archive safeguard uses this so a failed
+ * or incomplete `git restore --staged` cannot leave challenge-response JSON in
+ * the index for the archive commit (#1017 review 2). Untracked (`??`) and
+ * worktree-only (` M`) scratch are excluded: they do not enter `git commit`
+ * without pathspecs/`-a`.
+ */
+export function stagedScratchPaths(porcelain: string): string[] {
+  const staged: string[] = [];
+  const seen = new Set<string>();
+  for (const line of porcelain.split("\n")) {
+    if (line.length < 3) continue;
+    const x = line[0];
+    // Index-clean or untracked: not staged for a pathspec-free commit.
+    if (x === " " || x === "?") continue;
+    const paths = parsePorcelainPaths(line);
+    if (paths.length === 0) continue;
+    const { scratch } = classifyWorktreeDirt(paths);
+    for (const p of scratch) {
+      if (!seen.has(p)) {
+        seen.add(p);
+        staged.push(p);
+      }
+    }
+  }
+  return staged;
+}
 
 /**
  * Returns true when the PR branch commit history already contains a pipeline-
@@ -333,20 +412,26 @@ export async function maybeArchiveOpenspec(
 
   // Pre-archive cleanliness guard: the commit-failure rollback below is destructive
   // (`git restore .` + `git clean -fd openspec/`), so it is provably lossless ONLY when
-  // the worktree is fully clean of *real* work before archive. Block on genuine dirty
-  // state — a path-prefix filter is unsafe two ways: a dirty tracked openspec/ file (e.g.
-  // `M  openspec/specs/x.md`) would be silently discarded by the rollback, and a porcelain
-  // rename/copy record (`R  openspec/a -> core/a`) has a destination outside openspec/ that
-  // matching only the first path misses.
+  // the worktree is fully clean of *real* (product) work before archive. Block on
+  // product-relevant dirty state — a path-prefix filter is unsafe two ways: a dirty
+  // tracked openspec/ file (e.g. `M  openspec/specs/x.md`) would be silently discarded
+  // by the rollback, and a porcelain rename/copy record (`R  openspec/a -> core/a`) has
+  // a destination outside openspec/ that matching only the first path misses.
   //
-  // Pipeline-internal marker files (`.pipeline-rebase-attempted`, #522) are **not**
-  // operator work: salvage already treats marker-only porcelain as clean, and parking
-  // archive for them alone is a factory defect (dogfood #597). Strip them from the
-  // dirt decision; when they are the only dirty paths, unlink them and proceed.
-  // Fail CLOSED: only proceed when `git status` SUCCEEDS and reports a clean tree
-  // after marker strip. If the status check itself errors (non-zero exit, often with
-  // empty stdout), we cannot prove the tree is clean — treating that as clean would
-  // let the destructive rollback run over unproven state.
+  // Pipeline-internal marker files (`.pipeline-rebase-attempted`, #522 / #597) and
+  // *untracked* engine-known non-product scratch (`?? artifacts/challenge-response-*.json`,
+  // etc. — same class as format/test-gate trust via `classifyWorktreeDirt` / #1013)
+  // are **not** operator product work. Parking archive for untracked dumps alone is a
+  // factory defect (#597 markers; #1017 challenge-response dumps). Strip markers, then
+  // classify residual with porcelain status preserved (#1017 review 1): only pure
+  // untracked (`??`) scratch is waivable + git-cleanable. Tracked/modified scratch
+  // blocks — otherwise it survives clean, rides `git add -A` into the archive commit,
+  // and is at risk from destructive rollback (`git restore .`).
+  //
+  // Fail CLOSED: only proceed when `git status` SUCCEEDS and product (incl. tracked
+  // scratch) dirt is empty. If the status check itself errors (non-zero exit, often
+  // with empty stdout), we cannot prove the tree is clean — treating that as clean
+  // would let the destructive rollback run over unproven state.
   const preArchiveStatus = await gitFn(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
   if (preArchiveStatus.code !== 0) {
     const detail =
@@ -361,9 +446,11 @@ export async function maybeArchiveOpenspec(
     await recordDecision("fail", "pre-archive git status failed");
     return preMergeBlocked("pre-archive git status failed", "needs-human");
   }
-  const meaningfulDirt = stripPipelineInternalMarkers(preArchiveStatus.stdout);
-  if (meaningfulDirt.trim() !== "") {
-    const detail = `pre-existing dirty paths:\n${meaningfulDirt.trim()}`;
+  const withoutMarkers = stripPipelineInternalMarkers(preArchiveStatus.stdout);
+  const { product: productPaths, untrackedScratch: scratchPaths } =
+    classifyPreArchiveDirt(withoutMarkers);
+  if (productPaths.length > 0) {
+    const detail = `pre-existing dirty paths:\n${productPaths.join("\n")}`;
     // Workspace/git failures — not OpenSpec structural validation. Use needs-human
     // with no finer path tag so scoreboard offramp_class maps to residual `other`
     // (#683 review 1: dirty/status must not inflate openspec-invalid).
@@ -377,15 +464,18 @@ export async function maybeArchiveOpenspec(
     await recordDecision("fail", "worktree dirty before archive");
     return preMergeBlocked("worktree dirty before archive", "needs-human");
   }
-  // Marker-only dirt: remove engine markers so later porcelain checks stay clean.
-  // Real work was already ruled out above via isOnlyPipelineInternalMarkerDirt.
-  if (
-    preArchiveStatus.stdout.trim() !== "" &&
-    isOnlyPipelineInternalMarkerDirt(preArchiveStatus.stdout)
-  ) {
+  // Marker and/or untracked non-product scratch residual only: remove engine-owned
+  // paths so later porcelain checks stay clean. Product / tracked-scratch work was
+  // already ruled out above. Do not stage or commit these paths into the product tree.
+  if (preArchiveStatus.stdout.trim() !== "") {
     for (const marker of PIPELINE_INTERNAL_MARKER_FILES) {
       // Best-effort unlink via git clean of the untracked marker; ignore failures.
       await gitFn(wt.path, ["clean", "-fd", "--", marker], { ignoreFailure: true });
+    }
+    for (const scratchPath of scratchPaths) {
+      // Best-effort unlink of untracked scratch only (e.g. challenge-response dumps).
+      // Tracked scratch never reaches this loop — it blocks above (#1017 review 1).
+      await gitFn(wt.path, ["clean", "-fd", "--", scratchPath], { ignoreFailure: true });
     }
   }
 
@@ -653,9 +743,86 @@ export async function maybeArchiveOpenspec(
   }
 
   // Commit + push the archived specs so CI validates the finalized state.
+  // Stage everything, then unstage any engine-known scratch so challenge-response
+  // JSON (and other non-product residual) cannot ride into the archive commit if
+  // best-effort pre-archive clean left it behind (#1017 review 1 / no-auto-commit).
+  // Fail closed when restore fails or scratch remains staged (#1017 review 2):
+  // path-only classifyWorktreeDirt drops scratch from remainingProduct, so a
+  // silent unstage failure would still auto-commit staged challenge-response JSON.
   await gitFn(wt.path, ["add", "-A"], { ignoreFailure: true });
-  const status = await gitFn(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
-  if (!status.stdout.trim()) {
+  let status = await gitFn(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
+  if (status.code !== 0) {
+    const detail =
+      `git status --porcelain failed after archive staging (exit ${status.code}): ` +
+      `${(status.stderr || status.stdout || "(no output)").trim()}`;
+    await setBlockedFn(
+      cfg,
+      issueNumber,
+      `Cannot verify residual engine-known scratch was unstaged before the OpenSpec archive commit — ${detail}.`,
+      "pre-merge",
+      "needs-human",
+    );
+    await recordDecision("fail", "post-archive git status failed");
+    return preMergeBlocked("post-archive git status failed", "needs-human");
+  }
+  {
+    // XY-aware: only paths with a dirty index column need unstage (not `??` / ` M`).
+    const toUnstage = stagedScratchPaths(status.stdout);
+    if (toUnstage.length > 0) {
+      const restore = await gitFn(
+        wt.path,
+        ["restore", "--staged", "--", ...toUnstage],
+        { ignoreFailure: true },
+      );
+      if (restore.code !== 0) {
+        const detail =
+          restore.stderr.trim() || restore.stdout.trim() || `(exit ${restore.code})`;
+        await setBlockedFn(
+          cfg,
+          issueNumber,
+          `Cannot unstage engine-known scratch before OpenSpec archive commit ` +
+            `(git restore --staged failed):\n${detail}\nScratch paths:\n${toUnstage.join("\n")}`,
+          "pre-merge",
+          "needs-human",
+        );
+        await recordDecision("fail", "post-archive unstage failed");
+        return preMergeBlocked("post-archive unstage failed", "needs-human");
+      }
+      status = await gitFn(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
+      if (status.code !== 0) {
+        const detail =
+          `git status --porcelain failed after unstage (exit ${status.code}): ` +
+          `${(status.stderr || status.stdout || "(no output)").trim()}`;
+        await setBlockedFn(
+          cfg,
+          issueNumber,
+          `Cannot verify residual engine-known scratch was unstaged before the OpenSpec archive commit — ${detail}.`,
+          "pre-merge",
+          "needs-human",
+        );
+        await recordDecision("fail", "post-archive git status failed");
+        return preMergeBlocked("post-archive git status failed", "needs-human");
+      }
+    }
+    // Confirm residual scratch is unstaged/untracked — never commit it.
+    const stillStaged = stagedScratchPaths(status.stdout);
+    if (stillStaged.length > 0) {
+      await setBlockedFn(
+        cfg,
+        issueNumber,
+        `Engine-known scratch remains staged after unstage and would enter the OpenSpec archive commit:\n` +
+          `${stillStaged.join("\n")}`,
+        "pre-merge",
+        "needs-human",
+      );
+      await recordDecision("fail", "post-archive scratch still staged");
+      return preMergeBlocked("post-archive scratch still staged", "needs-human");
+    }
+  }
+  // Emptiness is product-path based: untracked scratch residual must not count as
+  // "archive produced changes" and must not trigger a no-op commit attempt.
+  const remainingProduct = classifyWorktreeDirt(parsePorcelainPaths(status.stdout)).product;
+  if (remainingProduct.length === 0) {
     // Archive claimed success and dirs are gone, but nothing to commit — fail closed
     // rather than skipped/no-candidates when the pre-archive shared set was non-empty (#714).
     const reason =
