@@ -10,8 +10,10 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { parseDeclaredDependencyIds } from "../declared-dependency-grammar.ts";
+import { getPrForIssueAnyState as ghGetPrForIssueAnyState } from "../gh.ts";
 import { compileContractItems, type RawContractItem } from "../loop/dependencies.ts";
 import { LoopError } from "../loop/types.ts";
+import type { PipelineConfig } from "../types.ts";
 import { mergePr, realMergeDeps, type MergeDeps } from "./merge.ts";
 
 const execFileAsync = promisify(execFile);
@@ -95,7 +97,13 @@ export interface TrainDeps {
   getIssue(issue: number): Promise<TrainIssueSnapshot>;
   /** Drive one issue through the existing single/advance path until a terminal stage. */
   advanceIssue(issue: number): Promise<AdvanceOutcome>;
+  /** Open PR only — used when a merge mutation may still be required. */
   getPrForIssue(issue: number): Promise<number | null>;
+  /**
+   * Linked PR across open/closed/merged states (timeline-based).
+   * Used for merge-mode already-integrated reconciliation after the open PR is gone.
+   */
+  getPrForIssueAnyState(issue: number): Promise<number | null>;
   /** Existing merge surface (same gates as `pipeline merge`). */
   mergeIssuePr(pr: number): Promise<void>;
   observePr(pr: number): Promise<{
@@ -107,6 +115,36 @@ export interface TrainDeps {
   baseTip(baseBranch: string): Promise<string>;
   /** True when `ancestor` is an ancestor of `descendant` (or equal). */
   isAncestor(ancestor: string, descendant: string): Promise<boolean>;
+}
+
+/** Result of reconciling a linked PR against base containment for integration. */
+export type IntegratedReconcileResult =
+  | { kind: "not-merged" }
+  | { kind: "integrated"; mergeCommitOid: string | null }
+  | { kind: "containment-failed"; mergeCommitOid: string; tip: string };
+
+/**
+ * Observe a PR and, when merged, prove merge-result containment in the fetched base.
+ * When the PR is merged but no merge-result OID is available, treat as integrated
+ * (observe already proved merged — #1014 closed+merged without OID).
+ */
+export async function reconcileMergedPrIntegration(
+  pr: number,
+  baseBranch: string,
+  deps: Pick<TrainDeps, "observePr" | "fetchBase" | "baseTip" | "isAncestor">,
+): Promise<IntegratedReconcileResult> {
+  const obs = await deps.observePr(pr);
+  if (obs.state !== "merged") return { kind: "not-merged" };
+  if (!obs.mergeCommitOid) {
+    return { kind: "integrated", mergeCommitOid: null };
+  }
+  await deps.fetchBase(baseBranch);
+  const tip = await deps.baseTip(baseBranch);
+  const contained = await deps.isAncestor(obs.mergeCommitOid, tip);
+  if (contained) {
+    return { kind: "integrated", mergeCommitOid: obs.mergeCommitOid };
+  }
+  return { kind: "containment-failed", mergeCommitOid: obs.mergeCommitOid, tip };
 }
 
 // ---------------------------------------------------------------------------
@@ -240,27 +278,51 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
     let snap = byNumber.get(issue) ?? (await deps.getIssue(issue));
     let stage = pipelineStageFromLabels(snap.labels);
 
-    // Idempotent: already merged PR contained in base → skip.
+    // Idempotent: already merged PR + base containment → skip before advance.
+    // Any-state (closed/merged) lookup is only for ready-to-deploy terminals —
+    // pre-R2D / reopened items may retain a historical merged PR and must still
+    // advance (#1014 review). Open-PR reconciliation remains available at any stage.
     if (mergeMode) {
-      const existingPr = await deps.getPrForIssue(issue);
-      if (existingPr != null) {
-        const obs = await deps.observePr(existingPr);
-        if (obs.state === "merged" && obs.mergeCommitOid) {
-          await deps.fetchBase(opts.baseBranch);
-          const tip = await deps.baseTip(opts.baseBranch);
-          const contained = await deps.isAncestor(obs.mergeCommitOid, tip);
-          if (contained) {
-            deps.log(`[train] #${issue}: already integrated (PR #${existingPr} merge ${obs.mergeCommitOid.slice(0, 12)}… in ${opts.baseBranch})`);
-            items.push({
-              issue,
-              pr: existingPr,
-              terminal: "already-integrated",
-              merge_result_oid: obs.mergeCommitOid,
-              integrated: true,
-            });
-            nextAction = "next-item";
-            continue;
-          }
+      const openPr = await deps.getPrForIssue(issue);
+      const linkedPr =
+        openPr ??
+        (stage === "ready-to-deploy" ? await deps.getPrForIssueAnyState(issue) : null);
+      if (linkedPr != null) {
+        const recon = await reconcileMergedPrIntegration(linkedPr, opts.baseBranch, deps);
+        if (recon.kind === "integrated") {
+          const oidNote =
+            recon.mergeCommitOid != null
+              ? ` merge ${recon.mergeCommitOid.slice(0, 12)}… in ${opts.baseBranch}`
+              : "";
+          deps.log(`[train] #${issue}: already integrated (PR #${linkedPr}${oidNote})`);
+          items.push({
+            issue,
+            pr: linkedPr,
+            terminal: "already-integrated",
+            merge_result_oid: recon.mergeCommitOid,
+            integrated: true,
+          });
+          nextAction = "next-item";
+          continue;
+        }
+        if (recon.kind === "containment-failed") {
+          // Merged linked PR (open-lookup race or any-state) not in base → stop
+          // before advance or merge work. Do not require openPr == null: an
+          // open-first race can observe merged+uncontained while openPr is set.
+          blocker =
+            `merge result ${recon.mergeCommitOid} for #${issue} PR #${linkedPr} is not contained in ` +
+            `fetched ${opts.baseBranch} tip ${recon.tip}`;
+          nextAction = "stopped";
+          items.push({
+            issue,
+            pr: linkedPr,
+            terminal: "ready-to-deploy",
+            merge_result_oid: recon.mergeCommitOid,
+            integrated: false,
+            error: blocker,
+          });
+          deps.log(`[train] STOP: ${blocker}`);
+          return { exitCode: 1, status: status() };
         }
       }
     }
@@ -350,6 +412,45 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
     nextAction = "merge";
     const pr = await deps.getPrForIssue(issue);
     if (pr == null) {
+      // No open PR: reconcile any-state (merged/closed) before failing closed.
+      const anyPr = await deps.getPrForIssueAnyState(issue);
+      if (anyPr != null) {
+        const recon = await reconcileMergedPrIntegration(anyPr, opts.baseBranch, deps);
+        if (recon.kind === "integrated") {
+          const oidNote =
+            recon.mergeCommitOid != null
+              ? ` merge ${recon.mergeCommitOid.slice(0, 12)}… in ${opts.baseBranch}`
+              : "";
+          deps.log(`[train] #${issue}: already integrated (PR #${anyPr}${oidNote})`);
+          items.push({
+            issue,
+            pr: anyPr,
+            terminal: "already-integrated",
+            merge_result_oid: recon.mergeCommitOid,
+            integrated: true,
+          });
+          nextAction = "next-item";
+          continue;
+        }
+        if (recon.kind === "containment-failed") {
+          blocker =
+            `merge result ${recon.mergeCommitOid} for #${issue} PR #${anyPr} is not contained in ` +
+            `fetched ${opts.baseBranch} tip ${recon.tip}`;
+          nextAction = "stopped";
+          items.push({
+            issue,
+            pr: anyPr,
+            terminal: "ready-to-deploy",
+            merge_result_oid: recon.mergeCommitOid,
+            integrated: false,
+            error: blocker,
+          });
+          deps.log(`[train] STOP: ${blocker}`);
+          return { exitCode: 1, status: status() };
+        }
+        // Linked PR exists but is not merged (e.g. closed unmerged) → same
+        // fail-closed class as missing open PR for merge-eligible work.
+      }
       blocker = `issue #${issue} is ready-to-deploy but has no linked open PR`;
       nextAction = "stopped";
       items.push({
@@ -541,6 +642,11 @@ export function realTrainDeps(opts: {
 
     async getPrForIssue(issue) {
       return mergeDeps.getPrForIssue(issue);
+    },
+
+    async getPrForIssueAnyState(issue) {
+      const cfg = { repo: opts.repo } as PipelineConfig;
+      return ghGetPrForIssueAnyState(cfg, issue);
     },
 
     async mergeIssuePr(pr) {

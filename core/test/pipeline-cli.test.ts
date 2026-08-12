@@ -217,6 +217,7 @@ test("pipeline-cli: train --json emits one train_status document after two neste
         throw new Error("the command must replace the base advanceIssue seam");
       },
       getPrForIssue: async () => null,
+      getPrForIssueAnyState: async () => null,
       mergeIssuePr: async () => {},
       observePr: async () => ({ state: "open", mergeCommitOid: null, headRefOid: null }),
       fetchBase: async () => {},
