@@ -24,20 +24,26 @@ function snap(
   body: string,
   labels: string[] = ["pipeline:ready"],
   title = `Issue ${n}`,
+  state: "open" | "closed" = "open",
 ): TrainIssueSnapshot {
-  return { number: n, title, body, labels, state: "open" };
+  return { number: n, title, body, labels, state };
 }
 
 function makeDeps(overrides: Partial<TrainDeps> = {}): TrainDeps & {
   advanceCalls: number[];
   mergeCalls: number[];
   fetchCalls: number;
+  anyStateCalls: number[];
 } {
   const advanceCalls: number[] = [];
   const mergeCalls: number[] = [];
+  const anyStateCalls: number[] = [];
   let fetchCalls = 0;
   const issues = new Map<number, TrainIssueSnapshot>();
-  const prByIssue = new Map<number, number>();
+  /** Open PRs only — mirrors production getPrForIssue. */
+  const openPrByIssue = new Map<number, number>();
+  /** Any-state PR (open/closed/merged) — mirrors getPrForIssueAnyState. */
+  const anyPrByIssue = new Map<number, number>();
   const prState = new Map<number, { state: "open" | "merged"; oid: string | null; head: string }>();
 
   const base: TrainDeps = {
@@ -57,7 +63,11 @@ function makeDeps(overrides: Partial<TrainDeps> = {}): TrainDeps & {
       return { ok: true, terminal: "ready-to-deploy", labels: s.labels };
     },
     async getPrForIssue(n) {
-      return prByIssue.get(n) ?? null;
+      return openPrByIssue.get(n) ?? null;
+    },
+    async getPrForIssueAnyState(n) {
+      anyStateCalls.push(n);
+      return anyPrByIssue.get(n) ?? openPrByIssue.get(n) ?? null;
     },
     async mergeIssuePr(pr) {
       mergeCalls.push(pr);
@@ -68,6 +78,10 @@ function makeDeps(overrides: Partial<TrainDeps> = {}): TrainDeps & {
         oid: `merge${pr}${"0".repeat(32)}`.slice(0, 40),
         head: cur.head,
       });
+      // After merge, open lookup no longer sees the PR (production open-only).
+      for (const [issue, p] of openPrByIssue) {
+        if (p === pr) openPrByIssue.delete(issue);
+      }
     },
     async observePr(pr) {
       const cur = prState.get(pr) ?? { state: "open" as const, oid: null, head: "h" };
@@ -93,25 +107,41 @@ function makeDeps(overrides: Partial<TrainDeps> = {}): TrainDeps & {
   return Object.assign(base, {
     advanceCalls,
     mergeCalls,
+    anyStateCalls,
     get fetchCalls() {
       return fetchCalls;
     },
     _issues: issues,
-    _prByIssue: prByIssue,
+    _openPrByIssue: openPrByIssue,
+    _anyPrByIssue: anyPrByIssue,
     _prState: prState,
     seedIssue(s: TrainIssueSnapshot) {
       issues.set(s.number, s);
     },
     seedPr(issue: number, pr: number, head = "a".repeat(40)) {
-      prByIssue.set(issue, pr);
+      openPrByIssue.set(issue, pr);
+      anyPrByIssue.set(issue, pr);
       prState.set(pr, { state: "open", oid: null, head });
+    },
+    /** Seed a merged PR visible only via any-state (open lookup returns null). */
+    seedMergedPrAnyState(
+      issue: number,
+      pr: number,
+      oid = `merge${pr}${"0".repeat(32)}`.slice(0, 40),
+      head = "a".repeat(40),
+    ) {
+      anyPrByIssue.set(issue, pr);
+      openPrByIssue.delete(issue);
+      prState.set(pr, { state: "merged", oid, head });
     },
   }) as TrainDeps & {
     advanceCalls: number[];
     mergeCalls: number[];
+    anyStateCalls: number[];
     fetchCalls: number;
     seedIssue(s: TrainIssueSnapshot): void;
     seedPr(issue: number, pr: number, head?: string): void;
+    seedMergedPrAnyState(issue: number, pr: number, oid?: string, head?: string): void;
   };
 }
 
@@ -229,8 +259,8 @@ test("train with merge: dependent does not start until prerequisite integrated",
 test("train merge: already-merged contained PR is idempotent", async () => {
   const deps = makeDeps();
   deps.seedIssue(snap(1, "done", ["pipeline:ready-to-deploy"]));
+  // Still on open map so open-only path finds it (pre-open-removal merge case).
   deps.seedPr(1, 101);
-  // Pre-seed as merged with containable oid
   (deps as unknown as { _prState: Map<number, { state: string; oid: string; head: string }> })._prState.set(
     101,
     { state: "merged", oid: "merge101" + "0".repeat(33), head: "a".repeat(40) },
@@ -239,6 +269,55 @@ test("train merge: already-merged contained PR is idempotent", async () => {
   const result = await runTrain(baseOpts({ issues: [1], merge: true }), deps);
   assert.equal(result.exitCode, 0);
   assert.equal(deps.advanceCalls.length, 0);
+  assert.equal(deps.mergeCalls.length, 0);
+  assert.equal(result.status.items[0]!.terminal, "already-integrated");
+  assert.equal(result.status.items[0]!.integrated, true);
+});
+
+test("train merge: closed issue + merged PR + stale R2D is already-integrated (#1014)", async () => {
+  // Bite: open-only getPrForIssue returns null after merge; without any-state
+  // reconciliation the train hard-stops with "no linked open PR".
+  const deps = makeDeps();
+  deps.seedIssue(
+    snap(927, "shipped", ["pipeline:ready-to-deploy"], "Issue 927", "closed"),
+  );
+  deps.seedMergedPrAnyState(927, 1009, "merge1009" + "0".repeat(31));
+
+  const result = await runTrain(baseOpts({ issues: [927], merge: true }), deps);
+  assert.equal(result.exitCode, 0, result.status.blocker ?? "ok");
+  assert.equal(deps.advanceCalls.length, 0);
+  assert.equal(deps.mergeCalls.length, 0);
+  assert.equal(result.status.items[0]!.terminal, "already-integrated");
+  assert.equal(result.status.items[0]!.integrated, true);
+  assert.equal(result.status.items[0]!.pr, 1009);
+  assert.equal(result.status.complete, true);
+  assert.equal(result.status.blocker, null);
+});
+
+test("train merge: closed+merged+R2D continues to next work-list item (#1014)", async () => {
+  const deps = makeDeps();
+  deps.seedIssue(
+    snap(927, "shipped", ["pipeline:ready-to-deploy"], "Issue 927", "closed"),
+  );
+  deps.seedIssue(snap(1010, "next", ["pipeline:ready"]));
+  deps.seedMergedPrAnyState(927, 1009, "merge1009" + "0".repeat(31));
+  deps.seedPr(1010, 1012);
+
+  const result = await runTrain(baseOpts({ issues: [927, 1010], merge: true }), deps);
+  assert.equal(result.exitCode, 0, result.status.blocker ?? "ok");
+  assert.equal(deps.mergeCalls.length, 1);
+  assert.deepEqual(deps.mergeCalls, [1012]);
+  assert.equal(result.status.items[0]!.terminal, "already-integrated");
+  assert.equal(result.status.items[1]!.integrated, true);
+});
+
+test("train merge: open R2D + since-merged PR (any-state only) is already-integrated (#1014)", async () => {
+  const deps = makeDeps();
+  deps.seedIssue(snap(1, "done", ["pipeline:ready-to-deploy"])); // open issue
+  deps.seedMergedPrAnyState(1, 55, "merge55" + "0".repeat(33));
+
+  const result = await runTrain(baseOpts({ issues: [1], merge: true }), deps);
+  assert.equal(result.exitCode, 0);
   assert.equal(deps.mergeCalls.length, 0);
   assert.equal(result.status.items[0]!.terminal, "already-integrated");
   assert.equal(result.status.items[0]!.integrated, true);
