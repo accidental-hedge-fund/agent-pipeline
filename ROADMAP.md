@@ -20,7 +20,7 @@ This file is human-readable forward-looking documentation for open work. **GitHu
 | **v1.33.0** ✅ shipped | minor | Scoped Hermes factory and startup corrections | #898, #905, #874, #870 | Shipped 2026-08-10 (tag `v1.33.0`). See CHANGELOG.md. |
 | **v1.34.0** ✅ shipped | minor | Durable factory core and native release preparation | #890, #891, #908, #909 | Shipped 2026-08-10 (tag `v1.34.0`). See CHANGELOG.md. |
 | **v1.35.0** ✅ shipped | minor | Release, roadmap correctness, and supervisor hardening | #910, #978, #980, #983 | Shipped 2026-08-11 (tag `v1.35.0`). See CHANGELOG.md. |
-| **v1.36.0** | minor | Roadmap reconciliation | #985 | Derive release plan from GitHub Milestones instead of ROADMAP.md (#985). |
+| **v1.36.0** ✅ shipped | minor | Roadmap reconciliation | #985 | Shipped 2026-08-11 (tag `v1.36.0`). See CHANGELOG.md. |
 | **v1.37.0** | minor | Human authority and evidence | #575, #576, #691–#695, #702, #599, #647, #703 | Add trusted authority, evidence identity, intent lineage, resumable handoffs, and outcome feedback. |
 | **v1.38.0** | minor | Factory operations | #892–#896 | Add replayable watch, durable alerts, controls, provider cooldowns, and intake admission. |
 | **v1.39.0** | minor | Hermes and Buzz integration | #907, #897 | Add a host-neutral Pipeline integration surface and the Hermes native Buzz outer host. |
