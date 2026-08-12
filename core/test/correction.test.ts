@@ -494,7 +494,18 @@ const CORR_SUBJECT = buildEvidenceSubject({
   required_evidence_set_revision: buildRequiredEvidenceSetRevision(),
 });
 
-test("emitCorrectionEvent: carries evidence_subject when supplied", async () => {
+/** Runtime digests that yield CORR_SUBJECT when built with CORR_SHA + BASE_PAYLOAD. */
+const CORR_SUBJECT_DIGESTS = {
+  domain: CORR_SUBJECT.domain,
+  policy_hash: CORR_SUBJECT.policy_hash,
+  engine_fingerprint: CORR_SUBJECT.engine_fingerprint,
+  verifier_fingerprint: CORR_SUBJECT.verifier_fingerprint,
+  required_evidence_set_revision: CORR_SUBJECT.required_evidence_set_revision,
+  diff_hash: CORR_SUBJECT.diff_hash,
+  pr: CORR_SUBJECT.pr,
+};
+
+test("emitCorrectionEvent: builds evidence_subject from runtime digests + SHAs", async () => {
   const { deps, lines } = memDeps();
   await emitCorrectionEvent(
     "/tmp/run",
@@ -502,7 +513,7 @@ test("emitCorrectionEvent: carries evidence_subject when supplied", async () => 
       ...BASE_PAYLOAD,
       reviewed_sha: CORR_SHA,
       head_sha: CORR_SHA,
-      evidence_subject: CORR_SUBJECT,
+      ...CORR_SUBJECT_DIGESTS,
     },
     deps,
   );
@@ -511,6 +522,81 @@ test("emitCorrectionEvent: carries evidence_subject when supplied", async () => 
   assert.equal(event.evidence_subject!.schema_version, 1);
   assert.equal(event.evidence_subject!.candidate_sha, CORR_SHA);
   assert.equal(event.evidence_subject!.run_id, BASE_PAYLOAD.run_id);
+  assert.equal(event.evidence_subject!.issue, BASE_PAYLOAD.issue);
+  assert.equal(event.evidence_subject!.domain, CORR_SUBJECT.domain);
+});
+
+test("emitCorrectionEvent: missing digests write explicit evidence_subject null — not omit — regression for #692 review-2 513f6d02", async () => {
+  const { deps, lines } = memDeps();
+  await emitCorrectionEvent(
+    "/tmp/run",
+    {
+      ...BASE_PAYLOAD,
+      reviewed_sha: CORR_SHA,
+      head_sha: CORR_SHA,
+      // digests omitted → cannot form full subject
+    },
+    deps,
+  );
+  const raw = lines()[0];
+  assert.ok(
+    /"evidence_subject"\s*:\s*null/.test(raw),
+    "new events must serialize evidence_subject: null, not omit the key",
+  );
+  const event = JSON.parse(raw) as CorrectionEvent;
+  assert.equal(event.evidence_subject, null);
+  assert.ok("evidence_subject" in event);
+});
+
+test("emitCorrectionEvent: ignores caller-supplied subject object; binds from event SHAs + digests — regression for #692 review-2 84abc2b3", async () => {
+  const { deps, lines } = memDeps();
+  const otherSha = "b".repeat(40);
+  const misleadingSubject = buildEvidenceSubject({
+    domain: CORR_SUBJECT.domain,
+    issue: BASE_PAYLOAD.issue,
+    pr: null,
+    run_id: BASE_PAYLOAD.run_id,
+    candidate_sha: otherSha,
+    diff_hash: null,
+    policy_hash: CORR_SUBJECT.policy_hash,
+    engine_fingerprint: CORR_SUBJECT.engine_fingerprint,
+    verifier_fingerprint: CORR_SUBJECT.verifier_fingerprint,
+    required_evidence_set_revision: CORR_SUBJECT.required_evidence_set_revision,
+  });
+  // Stale callers may still attach evidence_subject; emitter must ignore it.
+  await emitCorrectionEvent(
+    "/tmp/run",
+    {
+      ...BASE_PAYLOAD,
+      reviewed_sha: CORR_SHA,
+      head_sha: CORR_SHA,
+      ...CORR_SUBJECT_DIGESTS,
+      evidence_subject: misleadingSubject,
+    } as Parameters<typeof emitCorrectionEvent>[1],
+    deps,
+  );
+  const event = JSON.parse(lines()[0]) as CorrectionEvent;
+  assert.ok(event.evidence_subject);
+  assert.equal(event.evidence_subject!.candidate_sha, CORR_SHA);
+  assert.notEqual(event.evidence_subject!.candidate_sha, otherSha);
+  assert.equal(event.evidence_subject!.run_id, BASE_PAYLOAD.run_id);
+  assert.equal(event.evidence_subject!.issue, BASE_PAYLOAD.issue);
+});
+
+test("emitCorrectionEvent: caller-only subject without digests is unbound null — not trusted — regression for #692 review-2 84abc2b3", async () => {
+  const { deps, lines } = memDeps();
+  await emitCorrectionEvent(
+    "/tmp/run",
+    {
+      ...BASE_PAYLOAD,
+      reviewed_sha: CORR_SHA,
+      head_sha: CORR_SHA,
+      evidence_subject: CORR_SUBJECT,
+    } as Parameters<typeof emitCorrectionEvent>[1],
+    deps,
+  );
+  const event = JSON.parse(lines()[0]) as CorrectionEvent;
+  assert.equal(event.evidence_subject, null);
 });
 
 test("classifyCorrectionEventCurrency: subject candidate mismatch is stale", () => {
@@ -551,6 +637,21 @@ test("classifyCorrectionEventCurrency: historical event without subject is legac
   );
   assert.equal(result.subject_outcome, "legacy_unbound");
   assert.equal(result.stale, false);
+});
+
+test("classifyCorrectionEventCurrency: explicit null is quarantined not legacy_unbound — regression for #692 review-2 513f6d02", () => {
+  const result = classifyCorrectionEventCurrency(
+    {
+      reviewed_sha: CORR_SHA,
+      head_sha: CORR_SHA,
+      run_id: BASE_PAYLOAD.run_id,
+      evidence_subject: null,
+    },
+    { candidateSha: CORR_SHA },
+  );
+  assert.equal(result.stale, true);
+  assert.equal(result.subject_outcome, "malformed");
+  assert.notEqual(result.subject_outcome, "legacy_unbound");
 });
 
 test("classifyCorrectionEventCurrency: legacy reviewed_sha ≠ head is stale without claiming match", () => {

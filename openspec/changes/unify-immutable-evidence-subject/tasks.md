@@ -19,9 +19,9 @@
 
 ## 4. Correction event binding
 
-- [x] 4.1 Emit `evidence_subject` on new `correction_event` records from runtime state
-- [x] 4.2 Staleness helpers prefer subject comparison when present; align with reviewed_sha vs head legacy checks
-- [x] 4.3 Unit tests: subject present; candidate mismatch vs pin; historical event without subject → legacy_unbound
+- [x] 4.1 Emit `evidence_subject` on new `correction_event` records from runtime state (digests + SHAs only; never trust a caller-supplied subject object)
+- [x] 4.2 Staleness helpers prefer subject comparison when present; align with reviewed_sha vs head legacy checks; explicit `null` quarantines (not `legacy_unbound`); omit key only for historical records
+- [x] 4.3 Unit tests: subject present from digests; missing digests → explicit null; candidate mismatch vs pin; historical omission → legacy_unbound; explicit null → quarantine
 
 ## 5. Evidence bundle diagnostics
 

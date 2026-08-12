@@ -119,12 +119,16 @@ export interface CorrectionEvent {
   reusable: CorrectionReusable;
   proposed_control?: CorrectionProposedControl;
   /**
-   * Shared immutable evidence identity (#692). Present on newly emitted
-   * events when runtime state can form a full subject; absent on historical
-   * events (`legacy_unbound`). When present, `candidate_sha` aligns with the
+   * Shared immutable evidence identity (#692).
+   * - Present object: full subject from runtime state at emission.
+   * - Explicit `null`: current-schema unbound disposition (producer could not
+   *   resolve a full subject) — consumers MUST quarantine, not grant the
+   *   historical `legacy_unbound` SHA fallback.
+   * - Absent/undefined: pre-migration historical record (`legacy_unbound`).
+   * When a subject object is present, `candidate_sha` aligns with the
    * candidate those SHA fields represent for the event.
    */
-  evidence_subject?: import("./evidence-subject.ts").EvidenceSubjectV1;
+  evidence_subject?: import("./evidence-subject.ts").EvidenceSubjectV1 | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -274,15 +278,12 @@ export interface EmitCorrectionEventPayload {
   reusable: CorrectionReusable;
   proposed_control?: CorrectionProposedControl;
   /**
-   * Engine-built evidence_subject at emission time (#692). When omitted, the
-   * event is stored without a subject (`legacy_unbound` for consumers). Never
-   * derived from free-text `correction`.
-   */
-  evidence_subject?: import("./evidence-subject.ts").EvidenceSubjectV1 | null;
-  /**
-   * Optional domain for building a subject when `evidence_subject` is not
-   * supplied but digests + candidate SHA are available via the other fields.
-   * Prefer passing a full `evidence_subject` from the call site.
+   * Optional domain for building a subject from runtime digests + SHA fields.
+   * The emitter derives `evidence_subject` only from these runtime fields —
+   * never from a caller-supplied subject object or free-text `correction`.
+   * When digests / candidate SHA cannot form a full subject, the event is
+   * stored with explicit `evidence_subject: null` (producer unbound), not
+   * with the field omitted (historical `legacy_unbound`).
    */
   domain?: string;
   policy_hash?: string;
@@ -300,22 +301,20 @@ function nowIso(): string {
 }
 
 /**
- * Resolve evidence_subject for a correction_event from payload runtime state.
- * Prefers an explicit payload.evidence_subject; otherwise builds when domain +
- * digests + a candidate SHA are all present. Never invents digests.
+ * Build evidence_subject for a correction_event from authoritative runtime
+ * state only (#692 review-2): resolved domain/repo, issue, PR, run_id,
+ * reviewed/head SHA, and digest fields on the payload. Never accepts a
+ * caller-supplied subject object as identity authority (that path allowed a
+ * nested subject to name a different candidate or policy surface than the
+ * event). Never invents digests. Returns null when required inputs are
+ * missing or build fails — the emitter serializes that as explicit
+ * `evidence_subject: null` (producer unbound), not field omission.
  */
 function resolveCorrectionEvidenceSubject(
   payload: EmitCorrectionEventPayload,
   reviewedSha: string | null,
   headSha: string | null,
 ): EvidenceSubjectV1 | null {
-  if (payload.evidence_subject) {
-    return payload.evidence_subject;
-  }
-  if (payload.evidence_subject === null) {
-    // Explicit unbound disposition.
-    return null;
-  }
   const candidate =
     normalizeSubjectSha(reviewedSha) ??
     normalizeSubjectSha(headSha) ??
@@ -353,8 +352,12 @@ function resolveCorrectionEvidenceSubject(
  * Classify correction_event currency against a live evaluation pin / head.
  *
  * Prefers evidence_subject comparison when present (#692). Falls back to
- * reviewed_sha vs head string compare for legacy events, labeling them
- * `legacy_unbound` — never a full multi-dimension subject match.
+ * reviewed_sha vs head string compare only for historical events that omit
+ * the field (`legacy_unbound`) — never a full multi-dimension subject match.
+ *
+ * Explicit `evidence_subject: null` (current-schema producer unbound) is
+ * quarantined as `malformed` and does NOT receive the legacy SHA fallback —
+ * so a producer failure cannot silently pass as pre-migration evidence.
  *
  * Never returns `match` without a well-formed evaluation-pin subject. A
  * present but unparseable subject is quarantined (`malformed`). When a
@@ -381,7 +384,17 @@ export function classifyCorrectionEventCurrency(
 } {
   const pin = opts.evaluationPin ?? null;
 
-  if (event.evidence_subject !== undefined && event.evidence_subject !== null) {
+  // Explicit current-schema unbound: producer wrote null. Quarantine — do not
+  // grant historical legacy_unbound SHA fallback (#692 review-2 513f6d02).
+  if (event.evidence_subject === null) {
+    return {
+      stale: true,
+      subject_outcome: "malformed",
+      mismatched_fields: [],
+    };
+  }
+
+  if (event.evidence_subject !== undefined) {
     const parsed = parseEvidenceSubjectDetailed(event.evidence_subject);
     if (parsed.status !== "ok") {
       return {
@@ -442,7 +455,7 @@ export function classifyCorrectionEventCurrency(
     };
   }
 
-  // legacy_unbound: reviewed_sha vs head
+  // Historical omission only: reviewed_sha vs head under legacy_unbound.
   const reviewed = event.reviewed_sha;
   const live = opts.candidateSha;
   const stale = reviewed != null && reviewed !== live;
@@ -493,7 +506,13 @@ export async function emitCorrectionEvent(
       },
       deps,
     );
-    const evidenceSubject = resolveCorrectionEvidenceSubject(payload, reviewedSha, headSha);
+    // Always bind subject or explicit null — never omit on new writes so
+    // consumers can distinguish producer unbound from historical absence.
+    const evidenceSubject = resolveCorrectionEvidenceSubject(
+      payload,
+      reviewedSha,
+      headSha,
+    );
     const event: CorrectionEvent = {
       schema_version: RUN_SCHEMA_VERSION as 1,
       type: "correction_event",
@@ -529,7 +548,7 @@ export async function emitCorrectionEvent(
       ...(payload.proposed_control !== undefined
         ? { proposed_control: payload.proposed_control }
         : {}),
-      ...(evidenceSubject ? { evidence_subject: evidenceSubject } : {}),
+      evidence_subject: evidenceSubject,
     };
     return await appendEvent(runDir, event, deps);
   } catch (err) {

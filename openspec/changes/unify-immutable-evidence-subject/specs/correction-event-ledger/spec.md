@@ -4,17 +4,33 @@
 
 When the engine appends a new `correction_event` for an accepted operator correction or recovered failure, the event SHALL include either:
 
-- a nested `evidence_subject` conforming to the shared `evidence-subject` contract (`schema_version` starting at `1`), built from authoritative runtime state at emission time, or
-- an explicit subject disposition of `legacy_unbound` / null subject only when the emission path cannot resolve a full subject under documented constraints — never an implicit claim of full multi-dimension match.
+- a nested `evidence_subject` conforming to the shared `evidence-subject` contract (`schema_version` starting at `1`), built from authoritative runtime state at emission time (resolved domain/repo, issue, PR, run id, reviewed/head candidate SHA, and digest fields — never a caller-supplied subject object as identity authority), or
+- an explicit `evidence_subject: null` when the emission path cannot resolve a full subject under documented constraints — never omit the field on a newly written event, and never an implicit claim of full multi-dimension match.
 
-When `reviewed_sha` and `head_sha` are present as strings, and `evidence_subject` is present, `evidence_subject.candidate_sha` SHALL equal the candidate those SHA fields represent for that event (typically the reviewed or head SHA applicable to the correction). Staleness consumers SHALL prefer subject comparison when a subject is present; bare `reviewed_sha` ≠ current head remains a valid legacy signal and MUST agree with subject candidate mismatch when both are present.
+`evidence_subject: null` on a current-schema write is a producer unbound disposition. Consumers SHALL quarantine it (non-current; no full subject match) and SHALL NOT route it through the historical `legacy_unbound` reviewed_sha fallback. Only pre-migration records that omit `evidence_subject` entirely are `legacy_unbound`.
+
+When `reviewed_sha` and `head_sha` are present as strings, and `evidence_subject` is a present object, `evidence_subject.candidate_sha` SHALL equal the candidate those SHA fields represent for that event (typically the reviewed or head SHA applicable to the correction). Staleness consumers SHALL prefer subject comparison when a subject object is present; bare `reviewed_sha` ≠ current head remains a valid legacy signal and MUST agree with subject candidate mismatch when both are present.
 
 #### Scenario: new correction_event carries evidence_subject
 
-- **WHEN** a `correction_event` is emitted for an accepted override with a known candidate SHA S on run R
+- **WHEN** a `correction_event` is emitted for an accepted override with a known candidate SHA S on run R and the digest inputs required to build a subject
 - **THEN** the event SHALL contain `evidence_subject` with `schema_version: 1`
 - **AND** `evidence_subject.candidate_sha` SHALL equal S
 - **AND** `evidence_subject.run_id` SHALL equal R
+
+#### Scenario: new correction_event writes explicit null when subject cannot be resolved
+
+- **WHEN** a `correction_event` is emitted and required subject inputs (candidate SHA and/or digests) cannot form a full subject
+- **THEN** the written event SHALL include `evidence_subject: null`
+- **AND** SHALL NOT omit the `evidence_subject` key
+- **AND** a currency consumer SHALL quarantine the event (non-current)
+- **AND** SHALL NOT classify it as `legacy_unbound`
+
+#### Scenario: emitter does not trust a caller-supplied subject object
+
+- **WHEN** emission receives runtime digests and reviewed/head SHAs that resolve candidate S
+- **THEN** the written `evidence_subject.candidate_sha` SHALL equal S derived from those event SHA fields
+- **AND** the emitter SHALL NOT accept an arbitrary nested subject object as authoritative identity in place of that runtime derivation
 
 #### Scenario: subject candidate mismatch aligns with stale SHA lineage
 
@@ -26,7 +42,7 @@ When `reviewed_sha` and `head_sha` are present as strings, and `evidence_subject
 
 #### Scenario: historical events without subject are legacy_unbound
 
-- **WHEN** a consumer reads a pre-migration `correction_event` that has `reviewed_sha` / `head_sha` but no `evidence_subject`
+- **WHEN** a consumer reads a pre-migration `correction_event` that has `reviewed_sha` / `head_sha` but no `evidence_subject` key
 - **THEN** subject comparison SHALL return `legacy_unbound`
 - **AND** the consumer MAY still apply existing reviewed_sha vs head staleness rules
 - **AND** SHALL NOT claim a full subject match
