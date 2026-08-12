@@ -40,6 +40,14 @@ When `reviewed_sha` and `head_sha` are present as strings, and `evidence_subject
 - **AND** consumers SHALL classify the correction lineage as stale for B the same way a `reviewed_sha` ≠ head check does today
 - **AND** SHALL NOT treat the event as current for B solely because `run_id` matches
 
+#### Scenario: non-candidate subject mismatch is non-current for correction readiness
+
+- **WHEN** a correction_event’s `evidence_subject` matches the evaluation pin on `candidate_sha`
+- **AND** comparison mismatches on any of `policy_hash`, `engine_fingerprint`, `verifier_fingerprint`, or `required_evidence_set_revision`
+- **THEN** the currency consumer SHALL report `subject_outcome: mismatch` with those fields in `mismatched_fields`
+- **AND** SHALL classify the event as non-current (`stale: true`) for readiness reuse
+- **AND** SHALL NOT treat candidate-only freshness as event currentness
+
 #### Scenario: historical events without subject are legacy_unbound
 
 - **WHEN** a consumer reads a pre-migration `correction_event` that has `reviewed_sha` / `head_sha` but no `evidence_subject` key

@@ -626,6 +626,122 @@ test("classifyCorrectionEventCurrency: subject candidate mismatch is stale", () 
   assert.ok(result.mismatched_fields.includes("candidate_sha"));
 });
 
+test("classifyCorrectionEventCurrency: policy_hash mismatch is stale even when candidate matches — regression for #692 review-2 ebcde2b2", () => {
+  const pin = buildEvidenceSubject({
+    domain: CORR_SUBJECT.domain,
+    issue: CORR_SUBJECT.issue,
+    pr: CORR_SUBJECT.pr,
+    run_id: CORR_SUBJECT.run_id,
+    candidate_sha: CORR_SUBJECT.candidate_sha,
+    diff_hash: CORR_SUBJECT.diff_hash,
+    policy_hash: buildPolicyHash({ k: "other-policy" }),
+    engine_fingerprint: CORR_SUBJECT.engine_fingerprint,
+    verifier_fingerprint: CORR_SUBJECT.verifier_fingerprint,
+    required_evidence_set_revision: CORR_SUBJECT.required_evidence_set_revision,
+  });
+  const result = classifyCorrectionEventCurrency(
+    {
+      reviewed_sha: CORR_SHA,
+      head_sha: CORR_SHA,
+      run_id: BASE_PAYLOAD.run_id,
+      evidence_subject: CORR_SUBJECT,
+    },
+    { candidateSha: CORR_SHA, evaluationPin: pin },
+  );
+  assert.equal(result.stale, true);
+  assert.equal(result.subject_outcome, "mismatch");
+  assert.ok(result.mismatched_fields.includes("policy_hash"));
+  assert.ok(!result.mismatched_fields.includes("candidate_sha"));
+});
+
+test("classifyCorrectionEventCurrency: verifier_fingerprint mismatch is stale even when candidate matches — regression for #692 review-2 ebcde2b2", () => {
+  const pin = buildEvidenceSubject({
+    domain: CORR_SUBJECT.domain,
+    issue: CORR_SUBJECT.issue,
+    pr: CORR_SUBJECT.pr,
+    run_id: CORR_SUBJECT.run_id,
+    candidate_sha: CORR_SUBJECT.candidate_sha,
+    diff_hash: CORR_SUBJECT.diff_hash,
+    policy_hash: CORR_SUBJECT.policy_hash,
+    engine_fingerprint: CORR_SUBJECT.engine_fingerprint,
+    verifier_fingerprint: "d".repeat(64),
+    required_evidence_set_revision: CORR_SUBJECT.required_evidence_set_revision,
+  });
+  const result = classifyCorrectionEventCurrency(
+    {
+      reviewed_sha: CORR_SHA,
+      head_sha: CORR_SHA,
+      run_id: BASE_PAYLOAD.run_id,
+      evidence_subject: CORR_SUBJECT,
+    },
+    { candidateSha: CORR_SHA, evaluationPin: pin },
+  );
+  assert.equal(result.stale, true);
+  assert.equal(result.subject_outcome, "mismatch");
+  assert.ok(result.mismatched_fields.includes("verifier_fingerprint"));
+  assert.ok(!result.mismatched_fields.includes("candidate_sha"));
+});
+
+test("classifyCorrectionEventCurrency: engine_fingerprint mismatch is stale even when candidate matches — regression for #692 review-2 ebcde2b2", () => {
+  const pin = buildEvidenceSubject({
+    domain: CORR_SUBJECT.domain,
+    issue: CORR_SUBJECT.issue,
+    pr: CORR_SUBJECT.pr,
+    run_id: CORR_SUBJECT.run_id,
+    candidate_sha: CORR_SUBJECT.candidate_sha,
+    diff_hash: CORR_SUBJECT.diff_hash,
+    policy_hash: CORR_SUBJECT.policy_hash,
+    engine_fingerprint: "e".repeat(64),
+    verifier_fingerprint: CORR_SUBJECT.verifier_fingerprint,
+    required_evidence_set_revision: CORR_SUBJECT.required_evidence_set_revision,
+  });
+  const result = classifyCorrectionEventCurrency(
+    {
+      reviewed_sha: CORR_SHA,
+      head_sha: CORR_SHA,
+      run_id: BASE_PAYLOAD.run_id,
+      evidence_subject: CORR_SUBJECT,
+    },
+    { candidateSha: CORR_SHA, evaluationPin: pin },
+  );
+  assert.equal(result.stale, true);
+  assert.equal(result.subject_outcome, "mismatch");
+  assert.ok(result.mismatched_fields.includes("engine_fingerprint"));
+  assert.ok(!result.mismatched_fields.includes("candidate_sha"));
+});
+
+test("classifyCorrectionEventCurrency: required_evidence_set_revision mismatch is stale even when candidate matches — regression for #692 review-2 ebcde2b2", () => {
+  const pin = buildEvidenceSubject({
+    domain: CORR_SUBJECT.domain,
+    issue: CORR_SUBJECT.issue,
+    pr: CORR_SUBJECT.pr,
+    run_id: CORR_SUBJECT.run_id,
+    candidate_sha: CORR_SUBJECT.candidate_sha,
+    diff_hash: CORR_SUBJECT.diff_hash,
+    policy_hash: CORR_SUBJECT.policy_hash,
+    engine_fingerprint: CORR_SUBJECT.engine_fingerprint,
+    verifier_fingerprint: CORR_SUBJECT.verifier_fingerprint,
+    required_evidence_set_revision: buildRequiredEvidenceSetRevision([
+      "review",
+      "tester",
+      "correction",
+    ]),
+  });
+  const result = classifyCorrectionEventCurrency(
+    {
+      reviewed_sha: CORR_SHA,
+      head_sha: CORR_SHA,
+      run_id: BASE_PAYLOAD.run_id,
+      evidence_subject: CORR_SUBJECT,
+    },
+    { candidateSha: CORR_SHA, evaluationPin: pin },
+  );
+  assert.equal(result.stale, true);
+  assert.equal(result.subject_outcome, "mismatch");
+  assert.ok(result.mismatched_fields.includes("required_evidence_set_revision"));
+  assert.ok(!result.mismatched_fields.includes("candidate_sha"));
+});
+
 test("classifyCorrectionEventCurrency: historical event without subject is legacy_unbound", () => {
   // Pin unavailable: SHA-only lineage fallback may report non-stale.
   const result = classifyCorrectionEventCurrency(

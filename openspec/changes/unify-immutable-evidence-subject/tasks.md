@@ -20,8 +20,8 @@
 ## 4. Correction event binding
 
 - [x] 4.1 Emit `evidence_subject` on new `correction_event` records from runtime state (digests + SHAs only; never trust a caller-supplied subject object)
-- [x] 4.2 Staleness helpers prefer subject comparison when present; align with reviewed_sha vs head legacy checks; explicit `null` quarantines (not `legacy_unbound`); omit key only for historical records
-- [x] 4.3 Unit tests: subject present from digests; missing digests → explicit null; candidate mismatch vs pin; historical omission → legacy_unbound; explicit null → quarantine
+- [x] 4.2 Staleness helpers prefer subject comparison when present; any governing subject mismatch (candidate, policy, engine/verifier, required-evidence revision) is non-current — not candidate-only; align with reviewed_sha vs head legacy checks; explicit `null` quarantines (not `legacy_unbound`); omit key only for historical records
+- [x] 4.3 Unit tests: subject present from digests; missing digests → explicit null; candidate mismatch vs pin; policy/engine/verifier/required-evidence mismatch with matching candidate → stale; historical omission → legacy_unbound; explicit null → quarantine
 
 ## 5. Evidence bundle diagnostics
 

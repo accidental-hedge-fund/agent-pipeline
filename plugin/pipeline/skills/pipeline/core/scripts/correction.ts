@@ -15,11 +15,9 @@ import { redactSecrets, sanitize } from "./artifact-sanitize.ts";
 import { artifactSubdir, CONTROL_ATTRIBUTIONS_ARTIFACT } from "./artifact-ignore.ts";
 import {
   buildEvidenceSubject,
-  CANDIDATE_CURRENCY_FIELDS,
   compareEvidenceSubjects,
   normalizeSubjectSha,
   parseEvidenceSubjectDetailed,
-  subjectIsCurrentForFields,
   type EvidenceSubjectComparison,
   type EvidenceSubjectComparisonOutcome,
   type EvidenceSubjectV1,
@@ -366,6 +364,14 @@ function resolveCorrectionEvidenceSubject(
  * quarantined as `malformed` and does NOT receive the legacy SHA fallback —
  * so a producer failure cannot silently pass as pre-migration evidence.
  *
+ * Readiness currency (`stale`) is false only on full subject match against the
+ * evaluation pin. Any subject mismatch that governs correction acceptance —
+ * including candidate_sha, policy_hash, engine_fingerprint,
+ * verifier_fingerprint, required_evidence_set_revision, and other v1 compare
+ * fields — is non-current. Callers that need candidate-lineage visibility
+ * inspect `mismatched_fields` / `comparison` rather than treating candidate-
+ * only freshness as event currentness (#692 review-2 ebcde2b2).
+ *
  * Never returns `match` without a well-formed evaluation-pin subject. A
  * present but unparseable subject is quarantined (`malformed`). When a
  * subject is present without a pin, result is non-current (pin-unavailable),
@@ -437,9 +443,10 @@ export function classifyCorrectionEventCurrency(
         };
       }
       if (cmp.outcome === "mismatch") {
-        const stale = !subjectIsCurrentForFields(cmp, CANDIDATE_CURRENCY_FIELDS);
+        // Any governing subject mismatch is non-current for correction
+        // readiness reuse — not only candidate_sha (#692 review-2 ebcde2b2).
         return {
-          stale,
+          stale: true,
           subject_outcome: "mismatch",
           mismatched_fields: [...cmp.mismatched_fields],
           comparison: cmp,
