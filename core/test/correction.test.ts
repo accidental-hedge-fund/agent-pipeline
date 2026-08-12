@@ -462,3 +462,106 @@ test("stale-SHA lineage: evidence_ref.id for a finding-derived correction equals
   const event = JSON.parse(lines()[0]) as CorrectionEvent;
   assert.equal(event.evidence_ref.id, key);
 });
+
+// ---------------------------------------------------------------------------
+// evidence_subject (#692)
+// ---------------------------------------------------------------------------
+
+import {
+  buildEvidenceSubject,
+  buildEngineFingerprint,
+  buildPolicyHash,
+  buildRequiredEvidenceSetRevision,
+  verifierFingerprintFromEngine,
+} from "../scripts/evidence-subject.ts";
+import { classifyCorrectionEventCurrency } from "../scripts/correction.ts";
+
+const CORR_ENGINE = buildEngineFingerprint({
+  version: "1.0.0",
+  templates_fingerprint: "c".repeat(64),
+});
+const CORR_SHA = "a".repeat(40);
+const CORR_SUBJECT = buildEvidenceSubject({
+  domain: "acme/repo",
+  issue: 499,
+  pr: null,
+  run_id: BASE_PAYLOAD.run_id,
+  candidate_sha: CORR_SHA,
+  diff_hash: null,
+  policy_hash: buildPolicyHash({ k: 1 }),
+  engine_fingerprint: CORR_ENGINE,
+  verifier_fingerprint: verifierFingerprintFromEngine(CORR_ENGINE),
+  required_evidence_set_revision: buildRequiredEvidenceSetRevision(),
+});
+
+test("emitCorrectionEvent: carries evidence_subject when supplied", async () => {
+  const { deps, lines } = memDeps();
+  await emitCorrectionEvent(
+    "/tmp/run",
+    {
+      ...BASE_PAYLOAD,
+      reviewed_sha: CORR_SHA,
+      head_sha: CORR_SHA,
+      evidence_subject: CORR_SUBJECT,
+    },
+    deps,
+  );
+  const event = JSON.parse(lines()[0]) as CorrectionEvent;
+  assert.ok(event.evidence_subject);
+  assert.equal(event.evidence_subject!.schema_version, 1);
+  assert.equal(event.evidence_subject!.candidate_sha, CORR_SHA);
+  assert.equal(event.evidence_subject!.run_id, BASE_PAYLOAD.run_id);
+});
+
+test("classifyCorrectionEventCurrency: subject candidate mismatch is stale", () => {
+  const pin = buildEvidenceSubject({
+    domain: CORR_SUBJECT.domain,
+    issue: CORR_SUBJECT.issue,
+    pr: CORR_SUBJECT.pr,
+    run_id: CORR_SUBJECT.run_id,
+    candidate_sha: "b".repeat(40),
+    diff_hash: CORR_SUBJECT.diff_hash,
+    policy_hash: CORR_SUBJECT.policy_hash,
+    engine_fingerprint: CORR_SUBJECT.engine_fingerprint,
+    verifier_fingerprint: CORR_SUBJECT.verifier_fingerprint,
+    required_evidence_set_revision: CORR_SUBJECT.required_evidence_set_revision,
+  });
+  const result = classifyCorrectionEventCurrency(
+    {
+      reviewed_sha: CORR_SHA,
+      head_sha: CORR_SHA,
+      run_id: BASE_PAYLOAD.run_id,
+      evidence_subject: CORR_SUBJECT,
+    },
+    { candidateSha: "b".repeat(40), evaluationPin: pin },
+  );
+  assert.equal(result.stale, true);
+  assert.equal(result.subject_outcome, "mismatch");
+  assert.ok(result.mismatched_fields.includes("candidate_sha"));
+});
+
+test("classifyCorrectionEventCurrency: historical event without subject is legacy_unbound", () => {
+  const result = classifyCorrectionEventCurrency(
+    {
+      reviewed_sha: CORR_SHA,
+      head_sha: CORR_SHA,
+      run_id: BASE_PAYLOAD.run_id,
+    },
+    { candidateSha: CORR_SHA },
+  );
+  assert.equal(result.subject_outcome, "legacy_unbound");
+  assert.equal(result.stale, false);
+});
+
+test("classifyCorrectionEventCurrency: legacy reviewed_sha ≠ head is stale without claiming match", () => {
+  const result = classifyCorrectionEventCurrency(
+    {
+      reviewed_sha: CORR_SHA,
+      head_sha: CORR_SHA,
+      run_id: BASE_PAYLOAD.run_id,
+    },
+    { candidateSha: "b".repeat(40) },
+  );
+  assert.equal(result.stale, true);
+  assert.equal(result.subject_outcome, "legacy_unbound");
+});

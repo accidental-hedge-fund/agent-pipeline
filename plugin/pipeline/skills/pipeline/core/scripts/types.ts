@@ -1522,6 +1522,13 @@ export interface ReviewRecord {
   executorModel?: string;
   /** Multi-agent ensemble identity when review_ensemble ran (#645). */
   ensemble?: ReviewEnsembleRecord;
+  /**
+   * Shared immutable evidence identity (#692). Present on newly written
+   * readiness-relevant review rows; absent on historical records
+   * (`legacy_unbound`). When present, `evidence_subject.candidate_sha` MUST
+   * equal `sha`.
+   */
+  evidence_subject?: import("./evidence-subject.ts").EvidenceSubjectV1;
 }
 
 export type StageAccountingCostSource = "actual" | "estimated" | "unknown";
@@ -1640,6 +1647,12 @@ export interface OverrideRecord {
    *  operator-supplied `--override` dispositions. Optional for backward
    *  compatibility: absent on records written before #302. */
   kind?: import("./intervention.ts").HumanInterventionKind;
+  /**
+   * Shared immutable evidence identity (#692) for readiness composition.
+   * Engine-built at record time; never derived from free-text override reason.
+   * Absent on historical records (`legacy_unbound`).
+   */
+  evidence_subject?: import("./evidence-subject.ts").EvidenceSubjectV1;
 }
 
 /** One auto-recovery event. */
@@ -1766,6 +1779,13 @@ export interface EvidenceBundle {
    * append/sink/fallback delivery failed. Additive; pre-#633 bundles omit it.
    */
   write_health?: import("./run-store.ts").WriteHealthRecord;
+  /**
+   * Per-artifact evidence_subject comparison diagnostics (#692). Written at
+   * finalize against the evaluation pin (or best-known pin). Project Warrant
+   * and other aggregators consume these as written — they MUST NOT invent or
+   * repair subjects. Additive; pre-#692 bundles omit it.
+   */
+  evidence_subject_diagnostics?: import("./evidence-subject.ts").EvidenceSubjectDiagnostic[];
 }
 
 /** Pre-merge delta-round accounting (#483): the item's durable delta-round

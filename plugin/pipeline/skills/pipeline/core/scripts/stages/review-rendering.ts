@@ -29,6 +29,7 @@ import {
   SPEC_DIVERGENCE_CATEGORY,
 } from "../review-policy.ts";
 import type { ChurnResult } from "../review-history.ts";
+import type { EvidenceSubjectV1 } from "../evidence-subject.ts";
 import type { PipelineConfig, ReviewFinding, ReviewVerdict } from "../types.ts";
 
 export function cfgFooter(cfg: PipelineConfig | undefined): string {
@@ -99,6 +100,8 @@ export function formatReviewComment(
   reversalDemotions?: Map<string, ReversalMatch>,
   alternativeDemotions?: Map<string, AlternativeReinstatementMatch>,
   pipelineRunId?: string,
+  /** Engine-built evidence_subject for the ReviewArtifact footer (#692). */
+  evidenceSubject?: EvidenceSubjectV1 | null,
 ): string {
   const cfg = maybeReviewer === undefined ? undefined : cfgOrVerdict as PipelineConfig;
   const verdict = maybeReviewer === undefined
@@ -211,6 +214,9 @@ export function formatReviewComment(
         artifact.advisoryFindings = buildFindingsExtension(advisory);
       }
     }
+    if (evidenceSubject) {
+      artifact.evidence_subject = evidenceSubject;
+    }
     lines.push(encodeReviewArtifact(artifact));
   }
   return lines.join("\n");
@@ -232,6 +238,8 @@ export function formatDeltaReviewComment(
   churn?: ChurnResult,
   unverifiedSurfaceDemotions?: Map<string, UnverifiedSettledSurfaceMatch>,
   advisoryCarryForwardDemotions?: Map<string, AdvisoryCarryForwardMatch>,
+  /** Engine-built evidence_subject for the ReviewArtifact footer (#692). */
+  evidenceSubject?: EvidenceSubjectV1 | null,
 ): string {
   const shortSha = verdict.commitSha ? verdict.commitSha.slice(0, 7) : "";
   const heading = shortSha
@@ -328,6 +336,9 @@ export function formatDeltaReviewComment(
       if (advisory.length > 0) {
         artifact.advisoryFindings = buildFindingsExtension(advisory);
       }
+    }
+    if (evidenceSubject) {
+      artifact.evidence_subject = evidenceSubject;
     }
     lines.push(encodeReviewArtifact(artifact));
   }

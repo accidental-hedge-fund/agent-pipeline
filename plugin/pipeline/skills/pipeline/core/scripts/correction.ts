@@ -14,6 +14,16 @@ import * as path from "node:path";
 import { redactSecrets, sanitize } from "./artifact-sanitize.ts";
 import { artifactSubdir, CONTROL_ATTRIBUTIONS_ARTIFACT } from "./artifact-ignore.ts";
 import {
+  buildEvidenceSubject,
+  CANDIDATE_CURRENCY_FIELDS,
+  compareEvidenceSubjects,
+  normalizeSubjectSha,
+  subjectIsCurrentForFields,
+  type EvidenceSubjectComparison,
+  type EvidenceSubjectComparisonOutcome,
+  type EvidenceSubjectV1,
+} from "./evidence-subject.ts";
+import {
   appendEvent,
   defaultRunStoreDeps,
   readEvents,
@@ -107,6 +117,13 @@ export interface CorrectionEvent {
   correction: string;
   reusable: CorrectionReusable;
   proposed_control?: CorrectionProposedControl;
+  /**
+   * Shared immutable evidence identity (#692). Present on newly emitted
+   * events when runtime state can form a full subject; absent on historical
+   * events (`legacy_unbound`). When present, `candidate_sha` aligns with the
+   * candidate those SHA fields represent for the event.
+   */
+  evidence_subject?: import("./evidence-subject.ts").EvidenceSubjectV1;
 }
 
 // ---------------------------------------------------------------------------
@@ -255,12 +272,154 @@ export interface EmitCorrectionEventPayload {
   correction: string;
   reusable: CorrectionReusable;
   proposed_control?: CorrectionProposedControl;
+  /**
+   * Engine-built evidence_subject at emission time (#692). When omitted, the
+   * event is stored without a subject (`legacy_unbound` for consumers). Never
+   * derived from free-text `correction`.
+   */
+  evidence_subject?: import("./evidence-subject.ts").EvidenceSubjectV1 | null;
+  /**
+   * Optional domain for building a subject when `evidence_subject` is not
+   * supplied but digests + candidate SHA are available via the other fields.
+   * Prefer passing a full `evidence_subject` from the call site.
+   */
+  domain?: string;
+  policy_hash?: string;
+  engine_fingerprint?: string;
+  verifier_fingerprint?: string;
+  required_evidence_set_revision?: string;
+  diff_hash?: string | null;
+  pr?: number | null;
 }
 
 const CORRECTION_TEXT_CAP = 500;
 
 function nowIso(): string {
   return new Date().toISOString().replace(/\.\d+Z$/, "Z");
+}
+
+/**
+ * Resolve evidence_subject for a correction_event from payload runtime state.
+ * Prefers an explicit payload.evidence_subject; otherwise builds when domain +
+ * digests + a candidate SHA are all present. Never invents digests.
+ */
+function resolveCorrectionEvidenceSubject(
+  payload: EmitCorrectionEventPayload,
+  reviewedSha: string | null,
+  headSha: string | null,
+): EvidenceSubjectV1 | null {
+  if (payload.evidence_subject) {
+    return payload.evidence_subject;
+  }
+  if (payload.evidence_subject === null) {
+    // Explicit unbound disposition.
+    return null;
+  }
+  const candidate =
+    normalizeSubjectSha(reviewedSha) ??
+    normalizeSubjectSha(headSha) ??
+    null;
+  if (!candidate) return null;
+  const domain = (payload.domain ?? payload.repo ?? "").trim();
+  if (
+    !domain ||
+    !payload.policy_hash ||
+    !payload.engine_fingerprint ||
+    !payload.verifier_fingerprint ||
+    !payload.required_evidence_set_revision
+  ) {
+    return null;
+  }
+  try {
+    return buildEvidenceSubject({
+      domain,
+      issue: payload.issue,
+      pr: payload.pr ?? null,
+      run_id: payload.run_id,
+      candidate_sha: candidate,
+      diff_hash: payload.diff_hash ?? null,
+      policy_hash: payload.policy_hash,
+      engine_fingerprint: payload.engine_fingerprint,
+      verifier_fingerprint: payload.verifier_fingerprint,
+      required_evidence_set_revision: payload.required_evidence_set_revision,
+    });
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Classify correction_event currency against a live evaluation pin / head.
+ *
+ * Prefers evidence_subject comparison when present (#692). Falls back to
+ * reviewed_sha vs head string compare for legacy events, labeling them
+ * `legacy_unbound` — never a full multi-dimension subject match.
+ */
+export function classifyCorrectionEventCurrency(
+  event: Pick<
+    CorrectionEvent,
+    "reviewed_sha" | "head_sha" | "run_id" | "evidence_subject"
+  >,
+  opts: {
+    /** Live product candidate SHA (evaluation pin). */
+    candidateSha: string;
+    /** Full evaluation pin subject when available. */
+    evaluationPin?: EvidenceSubjectV1 | null;
+  },
+): {
+  stale: boolean;
+  subject_outcome: EvidenceSubjectComparisonOutcome;
+  mismatched_fields: string[];
+  comparison?: EvidenceSubjectComparison;
+} {
+  const pin = opts.evaluationPin;
+  if (event.evidence_subject && pin) {
+    const cmp = compareEvidenceSubjects(event.evidence_subject, pin);
+    if (cmp.outcome === "match") {
+      return {
+        stale: false,
+        subject_outcome: "match",
+        mismatched_fields: [],
+        comparison: cmp,
+      };
+    }
+    if (cmp.outcome === "mismatch") {
+      const stale = !subjectIsCurrentForFields(cmp, CANDIDATE_CURRENCY_FIELDS);
+      return {
+        stale,
+        subject_outcome: "mismatch",
+        mismatched_fields: [...cmp.mismatched_fields],
+        comparison: cmp,
+      };
+    }
+    return {
+      stale: true,
+      subject_outcome: cmp.outcome,
+      mismatched_fields: [],
+      comparison: cmp,
+    };
+  }
+  if (event.evidence_subject && !pin) {
+    const subjectSha = normalizeSubjectSha(
+      (event.evidence_subject as EvidenceSubjectV1).candidate_sha,
+    );
+    const live = normalizeSubjectSha(opts.candidateSha);
+    const stale = subjectSha == null || live == null || subjectSha !== live;
+    return {
+      stale,
+      subject_outcome: stale ? "mismatch" : "match",
+      mismatched_fields: stale ? ["candidate_sha"] : [],
+    };
+  }
+  // legacy_unbound: reviewed_sha vs head
+  const reviewed = event.reviewed_sha;
+  const live = opts.candidateSha;
+  const stale = reviewed != null && reviewed !== live;
+  return {
+    stale,
+    subject_outcome: "legacy_unbound",
+    mismatched_fields: [],
+  };
 }
 
 /**
@@ -303,6 +462,7 @@ export async function emitCorrectionEvent(
       },
       deps,
     );
+    const evidenceSubject = resolveCorrectionEvidenceSubject(payload, reviewedSha, headSha);
     const event: CorrectionEvent = {
       schema_version: RUN_SCHEMA_VERSION as 1,
       type: "correction_event",
@@ -338,6 +498,7 @@ export async function emitCorrectionEvent(
       ...(payload.proposed_control !== undefined
         ? { proposed_control: payload.proposed_control }
         : {}),
+      ...(evidenceSubject ? { evidence_subject: evidenceSubject } : {}),
     };
     return await appendEvent(runDir, event, deps);
   } catch (err) {

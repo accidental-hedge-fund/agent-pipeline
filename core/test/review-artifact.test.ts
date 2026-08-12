@@ -290,3 +290,66 @@ test("ReviewArtifact: returns null when blockingFindings is malformed (missing k
   const body = `<!-- review-artifact: ${b64} -->`;
   assert.equal(extractReviewArtifact(body), null);
 });
+
+// ---------------------------------------------------------------------------
+// evidence_subject (#692)
+// ---------------------------------------------------------------------------
+
+import {
+  buildEvidenceSubject,
+  buildEngineFingerprint,
+  buildRequiredEvidenceSetRevision,
+  buildReviewPolicyHash,
+  compareEvidenceSubjects,
+  verifierFingerprintFromEngine,
+} from "../scripts/evidence-subject.ts";
+
+const REVIEW_ENGINE = buildEngineFingerprint({
+  version: "1.0.0",
+  templates_fingerprint: "f".repeat(64),
+});
+const REVIEW_SUBJECT = buildEvidenceSubject({
+  domain: "owner/repo",
+  issue: 692,
+  pr: 10,
+  run_id: "692/run",
+  candidate_sha: SAMPLE.reviewedSha,
+  diff_hash: SAMPLE.diffHash,
+  policy_hash: buildReviewPolicyHash({
+    block_threshold: "high",
+    min_confidence: 0.7,
+  }),
+  engine_fingerprint: REVIEW_ENGINE,
+  verifier_fingerprint: verifierFingerprintFromEngine(REVIEW_ENGINE),
+  required_evidence_set_revision: buildRequiredEvidenceSetRevision(),
+});
+
+test("ReviewArtifact: encode/decode preserves evidence_subject", () => {
+  const artifact: ReviewArtifact = {
+    ...SAMPLE,
+    evidence_subject: REVIEW_SUBJECT,
+  };
+  const decoded = extractReviewArtifact(encodeReviewArtifact(artifact));
+  assert.ok(decoded?.evidence_subject);
+  assert.equal(decoded!.evidence_subject!.schema_version, 1);
+  assert.equal(decoded!.evidence_subject!.candidate_sha, SAMPLE.reviewedSha);
+  assert.equal(decoded!.evidence_subject!.diff_hash, SAMPLE.diffHash);
+  assert.deepEqual(decoded!.evidence_subject, REVIEW_SUBJECT);
+});
+
+test("ReviewArtifact: subject candidate_sha consistent with reviewedSha", () => {
+  const artifact: ReviewArtifact = {
+    ...SAMPLE,
+    evidence_subject: REVIEW_SUBJECT,
+  };
+  assert.equal(artifact.evidence_subject!.candidate_sha, artifact.reviewedSha);
+  assert.equal(artifact.evidence_subject!.diff_hash, artifact.diffHash);
+});
+
+test("ReviewArtifact: legacy artifact without subject remains extractable (legacy_unbound)", () => {
+  const decoded = extractReviewArtifact(encodeReviewArtifact(SAMPLE));
+  assert.ok(decoded);
+  assert.equal(decoded!.evidence_subject, undefined);
+  const cmp = compareEvidenceSubjects(decoded!.evidence_subject, REVIEW_SUBJECT);
+  assert.equal(cmp.outcome, "legacy_unbound");
+});

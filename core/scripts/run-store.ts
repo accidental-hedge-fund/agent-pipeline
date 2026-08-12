@@ -36,6 +36,11 @@ import { validateCorrectionEvent, type CorrectionEvent } from "./correction.ts";
 import type { ProductFaultEvent } from "./product-fault.ts";
 import { accountingSummary, sanitizeStageAccountingRecord } from "./accounting.ts";
 import { RUNS_ARTIFACT, HISTORY_ARTIFACT, artifactSubdir } from "./artifact-ignore.ts";
+import {
+  buildEvidenceSubjectDiagnostics,
+  collectDiagnosticArtifactsFromBundle,
+  selectEvaluationPinSubject,
+} from "./evidence-subject.ts";
 
 export const RUN_SCHEMA_VERSION = 1;
 
@@ -1449,6 +1454,39 @@ export async function finalizeRun(
   const writeHealth =
     (await readWriteHealth(runDir, deps)) ?? { ...HEALTHY_WRITE_HEALTH };
   (bundle as EvidenceBundle & { write_health?: WriteHealthRecord }).write_health = writeHealth;
+
+  // evidence_subject diagnostics (#692): compare readiness artifacts to the
+  // best-known evaluation pin. Never invents subjects — only compares what
+  // producers wrote. Optional tester-evidence.json subject is loaded best-effort.
+  let testerSubject: unknown = undefined;
+  let includeTesterRow = false;
+  try {
+    const tePath = path.join(runDir, "tester-evidence.json");
+    const teRaw = await deps.readFile(tePath);
+    const teParsed = JSON.parse(teRaw) as { evidence_subject?: unknown };
+    includeTesterRow = true;
+    testerSubject = teParsed.evidence_subject;
+  } catch {
+    // Missing or unreadable tester evidence — omit tester row unless we want
+    // legacy labeling; only include when the file existed. Absent file → no row.
+  }
+  const diagnosticArts = collectDiagnosticArtifactsFromBundle({
+    reviews: bundle.reviews,
+    overrides: bundle.overrides,
+    corrections,
+    tester_evidence_subject: testerSubject,
+    include_tester_row: includeTesterRow,
+  });
+  const pin =
+    selectEvaluationPinSubject(diagnosticArts) ??
+    null;
+  const evidenceSubjectDiagnostics = buildEvidenceSubjectDiagnostics(
+    pin,
+    diagnosticArts,
+  );
+  (bundle as EvidenceBundle).evidence_subject_diagnostics =
+    evidenceSubjectDiagnostics;
+
   const summaryWithVersion = {
     ...bundle,
     schema_version: RUN_SCHEMA_VERSION,
@@ -1457,6 +1495,7 @@ export async function finalizeRun(
     corrections,
     correctionErrors,
     write_health: writeHealth,
+    evidence_subject_diagnostics: evidenceSubjectDiagnostics,
   };
   const cleanedBundle = sanitizeDeep(summaryWithVersion);
   const serialized = sanitize(redactSecrets(`${JSON.stringify(cleanedBundle, null, 2)}\n`));

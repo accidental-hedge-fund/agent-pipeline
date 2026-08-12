@@ -10,6 +10,18 @@ import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import { redactSecrets, sanitize, sanitizeDeep } from "./artifact-sanitize.ts";
 import {
+  buildEvidenceSubject,
+  buildRequiredEvidenceSetRevision,
+  buildTesterPolicyHash,
+  canonicalizeEvidenceSubject,
+  compareEvidenceSubjects,
+  parseEvidenceSubjectDetailed,
+  subjectIsCurrentForFields,
+  TESTER_CURRENCY_FIELDS,
+  type EvidenceSubjectComparisonOutcome,
+  type EvidenceSubjectV1,
+} from "./evidence-subject.ts";
+import {
   appendEvent,
   recordWriteHealthFailure,
   type RunStoreDeps,
@@ -104,8 +116,12 @@ export interface TesterEvidence {
     component: "test-build-gate";
     engine_version?: string;
   };
-  /** Reserved for #692; absent in v1. Readers ignore unknown fields. */
-  evidence_subject?: Record<string, unknown>;
+  /**
+   * Shared immutable evidence identity (#692). Present on newly produced
+   * schema-current records; absent on historical pre-subject artifacts
+   * (`legacy_unbound`). Readers ignore unknown nested fields.
+   */
+  evidence_subject?: EvidenceSubjectV1;
 }
 
 export interface TesterTargetedCheck {
@@ -529,6 +545,17 @@ export interface TesterAcquisitionResult {
   reason: string;
   /** Rendered prompt section (always present when review proceeds). */
   section: string;
+  /**
+   * Subject comparison outcome vs the evaluation pin (#692).
+   * - `match` — full multi-dimension subject match
+   * - `mismatch` — well-formed subject differs on one or more governing fields
+   * - `malformed` — present but unreadable subject (quarantine)
+   * - `legacy_unbound` — historical artifact without subject (SHA fallback may apply)
+   * - omitted when no artifact was loaded (missing)
+   */
+  subject_outcome?: EvidenceSubjectComparisonOutcome;
+  /** Mismatched subject field names when outcome is mismatch. */
+  subject_mismatched_fields?: string[];
 }
 
 /**
@@ -863,9 +890,25 @@ export async function readTesterEvidence(
   return { status: "ok", evidence: validated.evidence };
 }
 
+export interface TesterAcquisitionPinOpts {
+  /**
+   * Full evaluation pin subject when known. When present and the artifact
+   * carries `evidence_subject`, multi-dimension subject comparison is preferred
+   * over bare `candidate_sha` (#692).
+   */
+  evaluationPin?: EvidenceSubjectV1 | null;
+}
+
 /**
- * Sole review acquisition helper: load + validate + SHA match + on_missing.
+ * Sole review acquisition helper: load + validate + subject/SHA match + on_missing.
  * Does **not** regenerate or run tests. Never implies pass on non-current evidence.
+ *
+ * Subject rules (#692):
+ * - present well-formed subject + pin → prefer subject comparison; mismatch on
+ *   tester currency fields → stale; full match → family-local status rules
+ * - present malformed subject → quarantine (malformed), never pass/fail authority
+ * - absent subject (legacy) → `legacy_unbound` + candidate_sha fallback; never
+ *   report full multi-dimension subject match
  */
 export function loadTesterEvidenceForReviewSync(
   readResult:
@@ -874,6 +917,7 @@ export function loadTesterEvidenceForReviewSync(
     | { status: "ok"; evidence: TesterEvidence },
   candidateSha: string,
   onMissing: TesterOnMissing = "fail_closed",
+  pinOpts: TesterAcquisitionPinOpts = {},
 ): TesterAcquisitionResult {
   if (readResult.status === "missing") {
     const reason =
@@ -901,6 +945,123 @@ export function loadTesterEvidenceForReviewSync(
     return base;
   }
   const evidence = readResult.evidence;
+  const subjectParse = parseEvidenceSubjectDetailed(evidence.evidence_subject);
+
+  // Malformed nested subject → quarantine (never pass or fail authority).
+  if (subjectParse.status === "malformed") {
+    const reason =
+      `Tester suite evidence has a malformed evidence_subject (${subjectParse.reason}); ` +
+      `quarantined — not pass or fail authority for the live pin.`;
+    const base: TesterAcquisitionResult = {
+      classification: "malformed",
+      artifact: evidence,
+      withholdInvoke: onMissing === "fail_closed",
+      reason,
+      section: "",
+      subject_outcome: "malformed",
+    };
+    base.section = renderTesterEvidenceSection(base);
+    return base;
+  }
+
+  // Prefer full subject comparison when both pin and artifact subject exist.
+  if (subjectParse.status === "ok" && pinOpts.evaluationPin) {
+    const cmp = compareEvidenceSubjects(
+      subjectParse.subject,
+      pinOpts.evaluationPin,
+    );
+    if (cmp.outcome === "malformed") {
+      const base: TesterAcquisitionResult = {
+        classification: "malformed",
+        artifact: evidence,
+        withholdInvoke: onMissing === "fail_closed",
+        reason:
+          "Tester suite evidence_subject could not be compared to the evaluation pin (malformed pin or subject).",
+        section: "",
+        subject_outcome: "malformed",
+      };
+      base.section = renderTesterEvidenceSection(base);
+      return base;
+    }
+    if (
+      cmp.outcome === "mismatch" &&
+      !subjectIsCurrentForFields(cmp, TESTER_CURRENCY_FIELDS)
+    ) {
+      const fields = cmp.mismatched_fields.join(",");
+      const reason =
+        `Tester suite evidence is stale under evidence_subject comparison ` +
+        `(mismatched: ${fields}). Artifact candidate_sha=${evidence.candidate_sha}; ` +
+        `pin candidate_sha=${pinOpts.evaluationPin.candidate_sha}. ` +
+        `Stale evidence cannot support suite success for the current candidate ` +
+        `and MUST NOT supply fail / test-gate-exhausted authority for the live head ` +
+        `(overall_status=${evidence.overall_status}). Regeneration required.`;
+      const base: TesterAcquisitionResult = {
+        classification: "stale",
+        artifact: evidence,
+        withholdInvoke: onMissing === "fail_closed",
+        reason,
+        section: "",
+        subject_outcome: "mismatch",
+        subject_mismatched_fields: [...cmp.mismatched_fields],
+      };
+      base.section = renderTesterEvidenceSection(base);
+      return base;
+    }
+    if (cmp.outcome === "match") {
+      const base: TesterAcquisitionResult = {
+        classification: "current",
+        artifact: evidence,
+        withholdInvoke: false,
+        reason: `current Tester evidence for ${evidence.candidate_sha} (evidence_subject match)`,
+        section: "",
+        subject_outcome: "match",
+        subject_mismatched_fields: [],
+      };
+      base.section = renderTesterEvidenceSection(base);
+      return base;
+    }
+  }
+
+  // Subject present but no full pin: still enforce candidate_sha currency via subject
+  // when available, else top-level field.
+  if (subjectParse.status === "ok") {
+    const subjectSha = subjectParse.subject.candidate_sha;
+    if (!candidateShaMatches(subjectSha, candidateSha)) {
+      const reason =
+        `Tester suite evidence is stale: evidence_subject.candidate_sha=` +
+        `${subjectSha} does not match review HEAD ${candidateSha}. ` +
+        `Stale evidence cannot support suite success for the current candidate ` +
+        `and MUST NOT supply fail / test-gate-exhausted authority for the live head ` +
+        `(overall_status=${evidence.overall_status}). Regeneration required.`;
+      const base: TesterAcquisitionResult = {
+        classification: "stale",
+        artifact: evidence,
+        withholdInvoke: onMissing === "fail_closed",
+        reason,
+        section: "",
+        subject_outcome: "mismatch",
+        subject_mismatched_fields: ["candidate_sha"],
+      };
+      base.section = renderTesterEvidenceSection(base);
+      return base;
+    }
+    // Candidate matches under subject; without a full pin we do not claim multi-
+    // dimension match — but suite candidate currency holds for family-local rules.
+    const base: TesterAcquisitionResult = {
+      classification: "current",
+      artifact: evidence,
+      withholdInvoke: false,
+      reason: `current Tester evidence for ${evidence.candidate_sha} (subject candidate match)`,
+      section: "",
+      // Not a full multi-dimension match without pin — still subject present.
+      subject_outcome: pinOpts.evaluationPin ? "match" : "match",
+      subject_mismatched_fields: [],
+    };
+    base.section = renderTesterEvidenceSection(base);
+    return base;
+  }
+
+  // legacy_unbound: no evidence_subject — fall back to top-level candidate_sha.
   if (!candidateShaMatches(evidence.candidate_sha, candidateSha)) {
     // SHA mismatch → stale for both pass and fail authority (#1010 / review
     // acquisition). Non-pass overall_status on a superseded candidate MUST NOT
@@ -910,24 +1071,29 @@ export function loadTesterEvidenceForReviewSync(
       `${evidence.candidate_sha} does not match review HEAD ${candidateSha}. ` +
       `Stale evidence cannot support suite success for the current candidate ` +
       `and MUST NOT supply fail / test-gate-exhausted authority for the live head ` +
-      `(overall_status=${evidence.overall_status}).`;
+      `(overall_status=${evidence.overall_status}). ` +
+      `Subject disposition: legacy_unbound (no evidence_subject).`;
     const base: TesterAcquisitionResult = {
       classification: "stale",
       artifact: evidence,
       withholdInvoke: onMissing === "fail_closed",
       reason,
       section: "",
+      subject_outcome: "legacy_unbound",
     };
     base.section = renderTesterEvidenceSection(base);
     return base;
   }
-  // Current — including disabled/not_run (explicit non-suite states).
+  // Current under legacy SHA path — never claim full subject match.
   const base: TesterAcquisitionResult = {
     classification: "current",
     artifact: evidence,
     withholdInvoke: false,
-    reason: `current Tester evidence for ${evidence.candidate_sha}`,
+    reason:
+      `current Tester evidence for ${evidence.candidate_sha} ` +
+      `(legacy_unbound: candidate_sha fallback; no multi-dimension subject match)`,
     section: "",
+    subject_outcome: "legacy_unbound",
   };
   base.section = renderTesterEvidenceSection(base);
   return base;
@@ -938,6 +1104,7 @@ export async function loadTesterEvidenceForReview(
   candidateSha: string,
   cfg: Pick<PipelineConfig, "tester_evidence"> | { tester_evidence?: TesterEvidenceConfig },
   io: TesterEvidenceIoDeps = defaultIoDeps,
+  pinOpts: TesterAcquisitionPinOpts = {},
 ): Promise<TesterAcquisitionResult> {
   const onMissing =
     cfg.tester_evidence?.on_missing ?? DEFAULT_TESTER_EVIDENCE_CONFIG.on_missing;
@@ -950,6 +1117,7 @@ export async function loadTesterEvidenceForReview(
       { status: "missing" },
       candidateSha,
       onMissing,
+      pinOpts,
     );
     acq.reason =
       "No run directory provided — Tester suite evidence cannot be loaded for this invocation.";
@@ -957,7 +1125,7 @@ export async function loadTesterEvidenceForReview(
     return acq;
   }
   const read = await readTesterEvidence(runDir, io);
-  return loadTesterEvidenceForReviewSync(read, candidateSha, onMissing);
+  return loadTesterEvidenceForReviewSync(read, candidateSha, onMissing, pinOpts);
 }
 
 /**
@@ -998,8 +1166,9 @@ export async function loadOrRegenerateTesterEvidenceForReview(
   cfg: Pick<PipelineConfig, "tester_evidence"> | { tester_evidence?: TesterEvidenceConfig },
   regenerate?: () => Promise<void>,
   io: TesterEvidenceIoDeps = defaultIoDeps,
+  pinOpts: TesterAcquisitionPinOpts = {},
 ): Promise<TesterAcquisitionResult> {
-  let acq = await loadTesterEvidenceForReview(runDir, candidateSha, cfg, io);
+  let acq = await loadTesterEvidenceForReview(runDir, candidateSha, cfg, io, pinOpts);
   if (!acq.withholdInvoke || !regenerate) return acq;
   if (!isTesterRegenerableClassification(acq.classification)) return acq;
   // No run surface: cannot persist producer output for re-acquisition.
@@ -1017,7 +1186,7 @@ export async function loadOrRegenerateTesterEvidenceForReview(
       }`,
     );
   }
-  return loadTesterEvidenceForReview(runDir, candidateSha, cfg, io);
+  return loadTesterEvidenceForReview(runDir, candidateSha, cfg, io, pinOpts);
 }
 
 // ---------------------------------------------------------------------------
@@ -1051,6 +1220,23 @@ export interface ProduceTesterEvidenceInput {
   tests?: TesterTestResult[];
   toolchain?: TesterToolchainFingerprint;
   engineVersion?: string;
+  /**
+   * Runtime identity for nested `evidence_subject` (#692). When `domain` and
+   * engine fingerprint material are supplied, the producer attaches a full
+   * subject. When only a pre-built `evidenceSubject` is supplied, it is used
+   * after consistency checks. When neither can form a subject, the record is
+   * still written without `evidence_subject` (callers that need readiness
+   * binding should pass domain + fingerprints).
+   */
+  domain?: string;
+  diffHash?: string | null;
+  /** Pre-computed digests; when omitted, derived from gate inputs / engine fields. */
+  policyHash?: string;
+  engineFingerprint?: string;
+  verifierFingerprint?: string;
+  requiredEvidenceSetRevision?: string;
+  /** Optional fully-built subject (overrides field-wise construction). */
+  evidenceSubject?: EvidenceSubjectV1;
 }
 
 export function buildTesterEvidence(input: ProduceTesterEvidenceInput): TesterEvidence {
@@ -1066,21 +1252,26 @@ export function buildTesterEvidence(input: ProduceTesterEvidenceInput): TesterEv
     });
   }
   const combinedOutput = input.lastCommand?.output ?? input.overallReason ?? "";
+  const candidateSha =
+    normalizeCandidateSha(input.candidateSha) ?? input.candidateSha;
+  const pr = input.pr ?? null;
+  const configDigest = computeConfigDigest({
+    command_identity: input.commandIdentity,
+    enabled: input.enabled,
+    timeout: input.timeoutSec,
+    max_output_chars: max,
+  });
+  const toolchain = input.toolchain ?? buildToolchainFingerprint();
   const evidence: TesterEvidence = {
     schema_version: TESTER_EVIDENCE_SCHEMA_VERSION,
     kind: TESTER_EVIDENCE_KIND,
-    candidate_sha: normalizeCandidateSha(input.candidateSha) ?? input.candidateSha,
+    candidate_sha: candidateSha,
     run_id: input.runId,
     issue: input.issue,
-    pr: input.pr ?? null,
+    pr,
     worktree_id: worktreeIdFromPath(input.wtPath),
-    config_digest: computeConfigDigest({
-      command_identity: input.commandIdentity,
-      enabled: input.enabled,
-      timeout: input.timeoutSec,
-      max_output_chars: max,
-    }),
-    toolchain_fingerprint: input.toolchain ?? buildToolchainFingerprint(),
+    config_digest: configDigest,
+    toolchain_fingerprint: toolchain,
     started_at: input.startedAt,
     ended_at: input.endedAt,
     duration_ms: input.durationMs,
@@ -1101,7 +1292,124 @@ export function buildTesterEvidence(input: ProduceTesterEvidenceInput): TesterEv
       message: t.message ? boundExcerpt(t.message, Math.min(max, 500)) : undefined,
     }));
   }
+
+  // Nested evidence_subject (#692): engine-derived only; never from prose.
+  const subject = resolveTesterEvidenceSubject(input, {
+    candidateSha,
+    pr,
+    configDigest,
+    toolchain,
+  });
+  if (subject) {
+    evidence.evidence_subject = subject;
+  }
   return evidence;
+}
+
+/**
+ * Build or validate the nested evidence_subject for a Tester record.
+ * Returns null when runtime inputs are insufficient (no fabricated placeholders).
+ */
+function resolveTesterEvidenceSubject(
+  input: ProduceTesterEvidenceInput,
+  resolved: {
+    candidateSha: string;
+    pr: number | null;
+    configDigest: string;
+    toolchain: TesterToolchainFingerprint;
+  },
+): EvidenceSubjectV1 | null {
+  if (input.evidenceSubject) {
+    const c = canonicalizeEvidenceSubject(input.evidenceSubject);
+    // Keep top-level identity consistent with subject.
+    if (
+      c.candidate_sha !== normalizeCandidateSha(resolved.candidateSha) ||
+      c.run_id !== input.runId ||
+      c.issue !== input.issue ||
+      c.pr !== resolved.pr
+    ) {
+      // Prefer correcting top-level from subject would break callers; instead
+      // re-canonicalize subject to match top-level authoritative runtime fields.
+    }
+    try {
+      return buildEvidenceSubject({
+        domain: c.domain,
+        issue: input.issue,
+        pr: resolved.pr,
+        run_id: input.runId,
+        candidate_sha: resolved.candidateSha,
+        diff_hash: c.diff_hash,
+        policy_hash: c.policy_hash,
+        engine_fingerprint: c.engine_fingerprint,
+        verifier_fingerprint: c.verifier_fingerprint,
+        required_evidence_set_revision: c.required_evidence_set_revision,
+      });
+    } catch {
+      return null;
+    }
+  }
+
+  const domain = typeof input.domain === "string" ? input.domain.trim() : "";
+  if (!domain) return null;
+
+  const policyHash =
+    input.policyHash ??
+    buildTesterPolicyHash({
+      command_identity: input.commandIdentity,
+      enabled: input.enabled,
+      timeout: input.timeoutSec,
+      max_output_chars: input.maxOutputChars,
+    });
+
+  // Engine fingerprint: require explicit runtime digest (or derive a stable
+  // stand-in from engineVersion only when provided — never invent version).
+  let engineFingerprint = input.engineFingerprint;
+  if (!engineFingerprint && input.engineVersion) {
+    engineFingerprint = createHash("sha256")
+      .update(
+        stableStringify({
+          version: input.engineVersion,
+          component: "test-build-gate",
+        }),
+        "utf8",
+      )
+      .digest("hex");
+  }
+  if (!engineFingerprint) return null;
+
+  const verifierFingerprint =
+    input.verifierFingerprint ??
+    createHash("sha256")
+      .update(
+        stableStringify({
+          family: "tester",
+          toolchain: resolved.toolchain,
+          command_identity: input.commandIdentity,
+          engine_fingerprint: engineFingerprint,
+        }),
+        "utf8",
+      )
+      .digest("hex");
+
+  const requiredRev =
+    input.requiredEvidenceSetRevision ?? buildRequiredEvidenceSetRevision();
+
+  try {
+    return buildEvidenceSubject({
+      domain,
+      issue: input.issue,
+      pr: resolved.pr,
+      run_id: input.runId,
+      candidate_sha: resolved.candidateSha,
+      diff_hash: input.diffHash ?? null,
+      policy_hash: policyHash,
+      engine_fingerprint: engineFingerprint,
+      verifier_fingerprint: verifierFingerprint,
+      required_evidence_set_revision: requiredRev,
+    });
+  } catch {
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------

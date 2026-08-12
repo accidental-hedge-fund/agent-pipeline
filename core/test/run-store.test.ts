@@ -2682,3 +2682,87 @@ test("finalizeRun: corrupt write-health embeds elevated state, not healthy (#633
   // Must not substitute HEALTHY_WRITE_HEALTH when the artifact is corrupt.
   assert.notEqual(summary.write_health.failure_count, 0);
 });
+
+// ---------------------------------------------------------------------------
+// evidence_subject diagnostics (#692)
+// ---------------------------------------------------------------------------
+
+test("finalizeRun: writes evidence_subject_diagnostics for review rows", async () => {
+  const {
+    buildEvidenceSubject,
+    buildEngineFingerprint,
+    buildPolicyHash,
+    buildRequiredEvidenceSetRevision,
+    verifierFingerprintFromEngine,
+  } = await import("../scripts/evidence-subject.ts");
+  const { deps, readFile } = memRunStore();
+  const engine = buildEngineFingerprint({
+    version: "1.0.0",
+    templates_fingerprint: "e".repeat(64),
+  });
+  const sha = "c".repeat(40);
+  const subject = buildEvidenceSubject({
+    domain: "owner/repo",
+    issue: ISSUE,
+    pr: null,
+    run_id: "155/run",
+    candidate_sha: sha,
+    diff_hash: null,
+    policy_hash: buildPolicyHash({ p: 1 }),
+    engine_fingerprint: engine,
+    verifier_fingerprint: verifierFingerprintFromEngine(engine),
+    required_evidence_set_revision: buildRequiredEvidenceSetRevision(),
+  });
+  const mismatched = buildEvidenceSubject({
+    domain: subject.domain,
+    issue: subject.issue,
+    pr: subject.pr,
+    run_id: subject.run_id,
+    candidate_sha: sha,
+    diff_hash: null,
+    policy_hash: buildPolicyHash({ p: 2 }),
+    engine_fingerprint: engine,
+    verifier_fingerprint: verifierFingerprintFromEngine(engine),
+    required_evidence_set_revision: buildRequiredEvidenceSetRevision(),
+  });
+  const bundle = makeBundle();
+  bundle.reviews = [
+    {
+      round: 1,
+      sha,
+      verdict: "approve",
+      findingCounts: {},
+      evidence_subject: subject,
+    },
+    {
+      round: 2,
+      sha,
+      verdict: "needs-attention",
+      findingCounts: { high: 1 },
+      evidence_subject: mismatched,
+    },
+  ];
+  bundle.overrides = [{ key: "legacy-key", reason: "old" }];
+
+  await finalizeRun(RUN_DIR, bundle, STATE_DIR, ISSUE, STARTED_AT_ISO, deps);
+  const summary = JSON.parse(readFile(path.join(RUN_DIR, "summary.json")));
+  assert.ok(Array.isArray(summary.evidence_subject_diagnostics));
+  const diags = summary.evidence_subject_diagnostics as Array<{
+    kind: string;
+    outcome: string;
+    mismatched_fields: string[];
+  }>;
+  // Pin is last well-formed subject (round 2 mismatched policy) — round 1 mismatches on policy_hash
+  const reviewDiags = diags.filter((d) => d.kind === "review");
+  assert.ok(reviewDiags.length >= 2);
+  const overrideDiag = diags.find((d) => d.kind === "override");
+  assert.ok(overrideDiag);
+  assert.equal(overrideDiag!.outcome, "legacy_unbound");
+  // At least one mismatch diagnostic names policy_hash (field-level, no recompute)
+  const policyMismatch = diags.find(
+    (d) => d.outcome === "mismatch" && d.mismatched_fields.includes("policy_hash"),
+  );
+  assert.ok(policyMismatch, "must surface policy_hash mismatch without inventing match");
+  // Match entry for the pin artifact itself
+  assert.ok(diags.some((d) => d.outcome === "match"));
+});

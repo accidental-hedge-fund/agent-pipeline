@@ -48,6 +48,12 @@ import {
   type TesterCommandStatus,
   type TesterOverallStatus,
 } from "./tester-evidence.ts";
+import {
+  buildEngineFingerprint,
+  buildRequiredEvidenceSetRevision,
+  verifierFingerprintFromEngine,
+} from "./evidence-subject.ts";
+import { resolvePinnedEngineIdentity } from "./engine-identity.ts";
 import type { Harness, PipelineConfig } from "./types.ts";
 
 /** A command split into program + argv — never a raw string at spawn time. */
@@ -288,6 +294,15 @@ export async function runTestGate(
       } else if (tests.diagnostic && !overallReason) {
         overallReason = `extractor diagnostic: ${tests.diagnostic}`;
       }
+      // evidence_subject (#692): domain + engine identity from runtime state.
+      const engineId = resolvePinnedEngineIdentity();
+      const engineFp = engineId
+        ? buildEngineFingerprint({
+            version: engineId.version,
+            templates_fingerprint: engineId.templates_fingerprint,
+            commit_sha: engineId.commit_sha,
+          })
+        : undefined;
       const evidence = buildTesterEvidence({
         candidateSha: candidateSha.trim(),
         runId: path.basename(runDir),
@@ -307,6 +322,13 @@ export async function runTestGate(
             ? lastCmdForEvidence
             : undefined,
         tests: tests.tests.length > 0 ? tests.tests : undefined,
+        domain: (cfg.domain || cfg.repo || "").trim() || undefined,
+        engineVersion: engineId?.version,
+        engineFingerprint: engineFp,
+        verifierFingerprint: engineFp
+          ? verifierFingerprintFromEngine(engineFp)
+          : undefined,
+        requiredEvidenceSetRevision: buildRequiredEvidenceSetRevision(),
       });
       await writeTesterEvidence(runDir, evidence, {
         maxArtifactChars,
