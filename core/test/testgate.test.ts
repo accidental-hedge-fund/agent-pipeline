@@ -355,6 +355,39 @@ test("gate (#173 regression): shell-backed configured command passes killProcess
   assert.equal(capturedKillProcessGroup, true, "shell-backed command must use killProcessGroup");
 });
 
+test("gate (#691 review-2): trusted base scripts.test body runs even when candidate package.json is no-op", async () => {
+  // Rebound binds test_gate.command to the base scripts.test body (not `npm test`).
+  // Candidate worktree package.json weakens scripts.test to `true`; the gate must
+  // still execute the trusted body, not re-resolve via the package manager.
+  const { testCommandFromPackageJson } = await import("../scripts/config.ts");
+  const basePkg = JSON.stringify({
+    scripts: { test: "node -e \"require('fs').writeFileSync('gate-ran','1')\"" },
+  });
+  const bound = testCommandFromPackageJson(basePkg);
+  assert.ok(bound, "base scripts.test must bind");
+  assert.notEqual(bound, "npm test");
+  assert.notEqual(bound, "true");
+
+  const wt = scaffold({
+    "package.json": JSON.stringify({ scripts: { test: "true" } }),
+  });
+  // Real spawn (no runTests stub): proves the configured body is what executes.
+  const out = await runTestGate(cfgWith({ command: bound!, max_attempts: 0 }), 691, wt, {
+    ...cleanGitDeps(),
+  });
+  assert.equal(out.passed, true);
+  assert.equal(
+    fs.existsSync(path.join(wt, "gate-ran")),
+    true,
+    "trusted base script body must execute in the candidate worktree",
+  );
+  // Auto-detect against the weakened candidate would prefer package manager
+  // resolution; prove we did not fall back to that path by checking command
+  // identity is the bound body (via evidence / that the side-effect file exists
+  // only from the node -e body, not from `true`).
+  assert.equal(out.skipped, false);
+});
+
 test("gate (#173 regression): auto-detected command passes killProcessGroup=false to runTests", async () => {
   // Auto-detected commands spawn the binary directly (no shell); descendants are
   // not an issue, so killProcessGroup must remain false.

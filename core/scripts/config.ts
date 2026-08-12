@@ -1793,17 +1793,68 @@ export function applyTrustedVerificationPolicy(
 }
 
 /**
+ * Package-manager script runners that re-read `package.json` at gate time.
+ * A trusted bind must expand these against the base scripts map so the
+ * candidate worktree cannot supply a weakened scripts.test (or nested script).
+ * Source only — each expand call constructs a fresh /g RegExp so recursive
+ * expansion cannot clobber lastIndex on a shared instance.
+ */
+const PM_SCRIPT_RUNNER_SOURCE =
+  String.raw`\b(?:npm|pnpm|yarn)\s+(?:run(?:-script)?\s+([A-Za-z0-9:_-]+)|test)\b`;
+
+/**
+ * Inline trusted package.json script references so the gate command never
+ * re-resolves `npm test` / `pnpm run …` against the candidate package.json.
+ * Unknown or cyclic references fail closed (null).
+ */
+export function expandTrustedPackageScriptBody(
+  body: string,
+  scripts: Record<string, string>,
+  stack: ReadonlySet<string> = new Set(),
+): string | null {
+  const re = new RegExp(PM_SCRIPT_RUNNER_SOURCE, "g");
+  let out = "";
+  let last = 0;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(body)) !== null) {
+    const name = match[1] ?? "test";
+    if (stack.has(name)) return null;
+    const target = scripts[name];
+    if (typeof target !== "string" || !target.trim()) return null;
+    const nextStack = new Set(stack);
+    nextStack.add(name);
+    const inner = expandTrustedPackageScriptBody(target.trim(), scripts, nextStack);
+    if (inner === null) return null;
+    out += body.slice(last, match.index) + `(${inner})`;
+    last = match.index + match[0].length;
+  }
+  out += body.slice(last);
+  return out;
+}
+
+/**
  * Derive an explicit test command from a trusted base `package.json` body.
- * Returns null when no scripts.test is present. Never reads the candidate tree.
+ * Returns the expanded base `scripts.test` body so the gate runs those
+ * authoritative bytes via `bash -c` — never a bare `npm test` / `pnpm test`,
+ * which would re-resolve `scripts.test` from the candidate worktree.
+ * Returns null when no scripts.test is present or nested expansion fails
+ * closed. Never reads the candidate tree.
  */
 export function testCommandFromPackageJson(packageJsonText: string): string | null {
   try {
     const pkg = JSON.parse(packageJsonText) as { scripts?: Record<string, unknown> };
-    const testScript = pkg.scripts?.test;
-    if (typeof testScript !== "string" || !testScript.trim()) return null;
-    // Prefer npm test so lockfile/package-manager detection stays consistent
-    // with detectTestCommand; the authority is that base defines a test script.
-    return "npm test";
+    const rawScripts = pkg.scripts;
+    if (!rawScripts || typeof rawScripts !== "object") return null;
+    const scripts: Record<string, string> = {};
+    for (const [k, v] of Object.entries(rawScripts)) {
+      if (typeof v === "string" && v.trim()) scripts[k] = v.trim();
+    }
+    const testScript = scripts.test;
+    if (!testScript) return null;
+    // Expand package-manager script runners against base scripts only. The gate
+    // then executes this body in the candidate worktree (product code under
+    // test) without consulting candidate package.json#scripts.
+    return expandTrustedPackageScriptBody(testScript, scripts, new Set(["test"]));
   } catch {
     return null;
   }

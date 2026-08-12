@@ -1356,7 +1356,9 @@ export async function runAdvance(
           continue;
         }
         if (c.class_id === "gate_commands") {
-          // When package.json is a trigger, bind test command identity to base.
+          // When package.json is a trigger, bind test command to the base
+          // scripts.test *body* (expanded) — never `npm test`, which would
+          // re-resolve scripts from the candidate worktree package.json.
           if (c.triggering_paths.includes("package.json")) {
             if (!baseBlobs.has("package.json")) {
               return {
@@ -1394,7 +1396,7 @@ export async function runAdvance(
               if (cmd) {
                 cfg.test_gate = { ...cfg.test_gate, command: cmd };
                 console.log(
-                  `[pipeline] #${issueNumber}: trusted-surface rebound bound test_gate.command from base package.json`,
+                  `[pipeline] #${issueNumber}: trusted-surface rebound bound test_gate.command to base package.json scripts.test body`,
                 );
               } else if (!cfg.test_gate.command) {
                 return {
@@ -1404,7 +1406,7 @@ export async function runAdvance(
                   reason: {
                     code: "trusted_binding_not_applied",
                     summary:
-                      "gate_commands: base package.json has no scripts.test and no trusted test_gate.command",
+                      "gate_commands: base package.json has no usable scripts.test body and no trusted test_gate.command",
                   },
                 };
               }

@@ -654,14 +654,58 @@ test("applyTrustedVerificationPolicy: base yml overlays test_gate.enabled (not c
   }
 });
 
-test("testCommandFromPackageJson: reads scripts.test authority", async () => {
+test("testCommandFromPackageJson: returns base scripts.test body (not npm test)", async () => {
   const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-pkg-cmd`);
+  // Authority is the base script body bytes — never a package-manager runner that
+  // would re-resolve scripts.test from the candidate worktree package.json.
   assert.equal(
     cfgMod.testCommandFromPackageJson(JSON.stringify({ scripts: { test: "node --test" } })),
-    "npm test",
+    "node --test",
   );
   assert.equal(cfgMod.testCommandFromPackageJson(JSON.stringify({ scripts: {} })), null);
   assert.equal(cfgMod.testCommandFromPackageJson("not-json"), null);
+});
+
+test("testCommandFromPackageJson: expands nested base script runners (#691 review-2)", async () => {
+  const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-pkg-expand`);
+  const base = JSON.stringify({
+    scripts: {
+      test: "npm run unit && pnpm run lint",
+      unit: "node --test test/*.test.ts",
+      lint: "eslint .",
+    },
+  });
+  assert.equal(
+    cfgMod.testCommandFromPackageJson(base),
+    "(node --test test/*.test.ts) && (eslint .)",
+  );
+  // Missing nested script → fail closed (null), not a candidate-resolved runner.
+  assert.equal(
+    cfgMod.testCommandFromPackageJson(
+      JSON.stringify({ scripts: { test: "npm run missing-script" } }),
+    ),
+    null,
+  );
+  // Cyclic npm test inside scripts.test → fail closed.
+  assert.equal(
+    cfgMod.testCommandFromPackageJson(JSON.stringify({ scripts: { test: "npm test" } })),
+    null,
+  );
+});
+
+test("testCommandFromPackageJson: candidate no-op scripts.test cannot become the bound command (#691)", async () => {
+  const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-pkg-noop`);
+  // Base suite is real; candidate would replace scripts.test with `true`.
+  // Binding must use only the base package.json body.
+  const basePkg = JSON.stringify({
+    scripts: { test: "node --test --test-reporter=spec test/**/*.test.ts" },
+  });
+  const candidatePkg = JSON.stringify({ scripts: { test: "true" } });
+  const bound = cfgMod.testCommandFromPackageJson(basePkg);
+  assert.equal(bound, "node --test --test-reporter=spec test/**/*.test.ts");
+  assert.notEqual(bound, "npm test");
+  assert.notEqual(bound, "true");
+  assert.notEqual(bound, cfgMod.testCommandFromPackageJson(candidatePkg));
 });
 
 // ---- review_ensemble (#645) ----
