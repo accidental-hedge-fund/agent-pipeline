@@ -717,13 +717,15 @@ export async function enforceReviewShaGate(
     const unresolved = [...recorded].filter((k) => !overrides.has(k));
     if (unresolved.length === 0) return null;
     // SHA-scope residual keys at gate start (#1010): keys recorded against a
-    // prior reviewed SHA lack blocking authority for a different live head.
-    // Pipeline-internal reuse is still same-effective-code and keeps residual
-    // authority (via contains that marker). Diff-unchanged with a prior-head
-    // key set must re-evaluate at the live head rather than auto-block.
-    // reviewedSha lives on the artifact; legacy comments use the sentinel via
-    // extractReviewedSha (comment-array API). Fall back to the gate's reviewed
-    // pin when neither is present.
+    // prior reviewed SHA lack blocking authority for a different live head —
+    // including pipeline-internal-only head advances. Approval reuse for
+    // pipeline-internal commits still holds when there are no residual keys
+    // (return null below); residual authority requires live-head re-evaluation
+    // so a prior-head key set cannot strand a green tip without re-check.
+    // Diff-unchanged with a prior-head key set likewise re-evaluates rather
+    // than auto-block. reviewedSha lives on the artifact; legacy comments use
+    // the sentinel via extractReviewedSha (comment-array API). Fall back to
+    // the gate's reviewed pin when neither is present.
     const keysRecordedSha =
       _bodyArtifact?.reviewedSha ??
       (commentBody
@@ -734,8 +736,7 @@ export async function enforceReviewShaGate(
       keysRecordedSha,
       head,
     );
-    const pipelineInternalReuse = via.includes("pipeline-internal");
-    if (!keysAreCurrentForLiveHead && !pipelineInternalReuse) {
+    if (!keysAreCurrentForLiveHead) {
       console.log(
         `[pipeline] #${issueNumber}: withholding residual block from prior-head ` +
           `keys (recorded ${keysRecordedSha ? keysRecordedSha.slice(0, 7) : "unknown"} ≠ ` +

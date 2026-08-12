@@ -12,6 +12,15 @@ At pre-merge SHA-gate / delta entry, before applying a residual block from durab
 - **THEN** the pipeline SHALL NOT `setBlocked` solely because F remains listed for `H_fail`
 - **AND** SHALL run delta evaluation (or conservative re-review) against `H_green` before a new block disposition
 
+#### Scenario: Pipeline-internal-only tip advance still re-evaluates prior-head residual keys
+
+- **WHEN** durable blocking keys for finding set F were recorded against reviewed SHA `H_fail`
+- **AND** the live open PR head is `H_green` where `H_green ≠ H_fail`
+- **AND** every commit since `H_fail` is pipeline-internal under the existing classifier
+- **THEN** the pipeline SHALL NOT `setBlocked` solely because F remains listed for `H_fail`
+- **AND** SHALL re-enter delta evaluation or conservative re-review at `H_green`
+- **AND** SHALL NOT silent-approve residual keys solely because the tip advance was pipeline-internal
+
 #### Scenario: Same-head keys still enforce residual block
 
 - **WHEN** durable blocking keys were recorded against reviewed SHA H

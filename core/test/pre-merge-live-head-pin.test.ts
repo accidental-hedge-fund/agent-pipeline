@@ -206,6 +206,51 @@ test("enforceReviewShaGate #1010: prior-head residual keys do not auto-block; re
   );
 });
 
+test("enforceReviewShaGate #1010: pipeline-internal head advance re-evals prior-head residual keys", async (t) => {
+  // Residual keys recorded at H_fail + only OpenSpec archive commits to H_green
+  // must not setBlocked from the prior-head marker (review finding 2064c9f2).
+  const rec: Rec = { comments: [], transitions: [], blocked: [], autoFixCalls: 0, deltaReviewCalls: 0 };
+  const key = "2064c9f2";
+  const body = blockingComment(H_FAIL, key);
+  const deps: ShaGateDeps = {
+    getIssueDetail: async () =>
+      ({ comments: [{ body, author: TEST_ACTOR }] }) as any,
+    getPrDetail: async () => ({ head_sha: H_GREEN }) as any,
+    getPrCommits: async () =>
+      [
+        { oid: H_FAIL, messageHeadline: "feat: implement" },
+        {
+          oid: H_GREEN,
+          messageHeadline: "chore: archive OpenSpec change(s) for #1010",
+        },
+      ] as any,
+    getGhActor: async () => TEST_ACTOR,
+    getForIssue: async () => null,
+    postComment: async (_c, _n, b) => {
+      rec.comments.push(b);
+    },
+    transition: async (_c, _n, from, to) => {
+      rec.transitions.push({ from, to });
+    },
+    setBlocked: async (_c, _n, reason) => {
+      rec.blocked.push({ reason });
+    },
+  };
+
+  let out: Awaited<ReturnType<typeof enforceReviewShaGate>> = null;
+  await quiet(t, async () => {
+    out = await enforceReviewShaGate(cfg, 1010, 1009, deps);
+  });
+
+  assert.equal(rec.blocked.length, 0, "pipeline-internal advance must not setBlocked from H_fail keys");
+  assert.equal((out as any)?.advanced, true);
+  assert.equal((out as any)?.to, "review-2");
+  assert.ok(
+    rec.comments.some((c) => /prior-head|stale-blocking-keys|#1010/i.test(c)),
+    "must disclose prior-head residual withholding",
+  );
+});
+
 test("enforceReviewShaGate #1010 control: same-head residual keys still block", async (t) => {
   const rec: Rec = { comments: [], transitions: [], blocked: [], autoFixCalls: 0, deltaReviewCalls: 0 };
   const key = "33f23af4";

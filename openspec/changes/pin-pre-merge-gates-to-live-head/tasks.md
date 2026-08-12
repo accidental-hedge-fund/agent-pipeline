@@ -21,6 +21,7 @@
 - [x] 4.1 At SHA-gate / delta entry, compare durable blocking-key marker reviewed SHA to live head; on mismatch, withhold residual block and re-evaluate delta (or conservative re-review) at live head
 - [x] 4.2 Preserve same-head residual block and mid-review supersession behavior
 - [x] 4.3 Unit tests: prior-head keys do not auto-block; same-head keys still block; control residual at live head still blocks
+- [x] 4.4 Review fix: remove pipeline-internal residual-authority bypass; pipeline-internal tip advance with prior-head keys re-evaluates at live head (no setBlocked solely from H_fail markers); regression + review-sha-gating MODIFIED delta
 
 ## 5. Autofix noop-clean / DNR + green head offramp
 
