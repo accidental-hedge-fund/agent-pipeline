@@ -211,9 +211,21 @@ test("tugboat install-parity helper: repo source passes; stripped source fails",
     assert.match(failPromote.remediation, /install -m 0755|#927|#1001/);
   }
 
-  // Null → skip (host does not use Option 1).
+  // Null → skip (host does not use Option 1). Absence only.
   const skipped = evaluateInstalledTugboatParity(null);
   assert.equal(skipped.status, "skip");
+
+  // Present but unrecognized / arbitrary local fork at the documented path
+  // must fail closed — not skip — so doctor cannot silently bypass (#927 r1).
+  const unrecognized = "#!/usr/bin/env bash\n# older host ship wrapper\necho ship\n";
+  const failUnrecognized = evaluateInstalledTugboatParity(unrecognized, {
+    pathLabel: "/tmp/home/.local/bin/tugboat",
+  });
+  assert.equal(failUnrecognized.status, "fail");
+  if (failUnrecognized.status === "fail") {
+    assert.match(failUnrecognized.detail, /missing critical thin markers/);
+    assert.match(failUnrecognized.remediation, /install -m 0755|tugboat\.sh|#927/);
+  }
 
   // Forbidden second brain → fail even if other markers present.
   const secondBrain = body + "\npipeline ship --milestone v1.0.0\n";

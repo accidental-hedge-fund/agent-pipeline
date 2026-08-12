@@ -65,30 +65,13 @@ export type TugboatInstallParityVerdict =
   | { status: "skip"; detail: string };
 
 /**
- * True when the body looks like a ship composer (or a broken fork of one),
- * not an unrelated file that happens to sit at the install path.
- * Unrecognized shapes skip — same disposition as ship-playbook promote-host
- * so doctor all-pass fakes stay hermetic.
- */
-export function looksLikeOption1ShipComposer(source: string): boolean {
-  return (
-    TUGBOAT_THIN_IDENTITY.test(source) ||
-    /ENGINE_PROMOTE_HOST/.test(source) ||
-    TUGBOAT_FAILURE_DETAIL.test(source) ||
-    TUGBOAT_CI_WAIT_BUCKET.test(source) ||
-    /\bship_one\b|tugboat start|pipeline train --milestone|pipeline-ship-playbook/.test(
-      source,
-    )
-  );
-}
-
-/**
  * Evaluate an installed (or fixture) Option 1 Tugboat body for install parity.
  * Pure: no filesystem or network.
  *
- * - null source → skip (not installed)
- * - unrelated content at the path → skip (not a recognized ship composer)
- * - looks like a ship composer but missing critical thin markers → fail
+ * - null source → skip (not installed; only absence skips)
+ * - any present body at the documented path → evaluate markers; fail closed
+ *   when critical thin markers are missing (including arbitrary older/local
+ *   forks that do not match recognizer strings — #927 review 1)
  * - forbidden second-brain markers → fail
  * - all critical markers present → pass
  */
@@ -106,14 +89,9 @@ export function evaluateInstalledTugboatParity(
     };
   }
 
-  if (!looksLikeOption1ShipComposer(source)) {
-    return {
-      status: "skip",
-      detail:
-        `installed ${label} is present but not a recognized Option 1 ship composer shape`,
-    };
-  }
-
+  // Any file present at the documented Option 1 path is treated as the primary
+  // ship binary. Skip is reserved for an absent path only — an unrecognized
+  // or stripped body must fail closed so a divergent fork cannot bypass doctor.
   if (tugboatHasForbiddenSecondBrainMarkers(source)) {
     return {
       status: "fail",

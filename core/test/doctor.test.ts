@@ -37,7 +37,19 @@ import {
   FACTORY_CONTROL_DIR_ENV,
   PRODUCTION_PIN_ENV,
 } from "../scripts/production-engine-pin.ts";
+import { defaultInstalledTugboatPath } from "../scripts/tugboat-install-parity.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
+
+/** Thin-marker-complete Tugboat body for hermetic all-pass when a test forces the path present. */
+const FAKE_THIN_TUGBOAT = [
+  "#!/usr/bin/env bash",
+  "# Tugboat — thin ship composer (Option 1, #1001).",
+  'ENGINE_PROMOTE_HOST="${ENGINE_PROMOTE_HOST:-all}"',
+  "failure_detail() { :; }",
+  'gh pr checks "$pr" --json name,state,bucket',
+  '"kind": "tugboat_ship"',
+  "",
+].join("\n");
 
 /** Clear host pin-authority env so unit tests stay hermetic under a live factory. */
 function withoutHostPinAuthorityEnv<T>(fn: () => T | Promise<T>): Promise<T> {
@@ -150,6 +162,12 @@ function fakeDeps(o: FakeOverrides = {}): DoctorDeps {
         installed_at: "2026-01-01T00:00:00Z",
       });
     }
+    // #927: any present body at the Option 1 path fails closed when markers are
+    // missing. When a test forces the path present without its own body, return
+    // a thin-complete fixture so hermetic all-pass still holds.
+    if (p === defaultInstalledTugboatPath() || p.endsWith(`${path.sep}tugboat`)) {
+      return FAKE_THIN_TUGBOAT;
+    }
     return '{"version":"1.0.0"}';
   };
   return {
@@ -167,7 +185,14 @@ function fakeDeps(o: FakeOverrides = {}): DoctorDeps {
       o.onCall?.(f, a);
       return o.execCheck ? o.execCheck(f, a) : true;
     },
-    fsExists: async (p) => (o.fsExists ? o.fsExists(p) : true),
+    // #927: default hermetic env has no Option 1 primary binary (skip). Present
+    // divergent installs fail closed in production; tests that need a present
+    // file override fsExists (and usually readTextFile) explicitly.
+    fsExists: async (p) => {
+      if (o.fsExists) return o.fsExists(p);
+      if (p === defaultInstalledTugboatPath()) return false;
+      return true;
+    },
     fileMtime: async (p) => (o.fileMtime ? o.fileMtime(p) : 1000),
     readTextFile,
     // Default: empty run-store (no elevated write-health) and writable path so
@@ -1527,6 +1552,27 @@ test("check supervisor:tugboat-install-parity — skips when tugboat is not inst
     }),
   );
   assert.equal(r.status, "skip");
+});
+
+// #927 review 1: present file at ~/.local/bin/tugboat that does not match
+// recognizer strings must fail closed (not skip) so divergent forks cannot
+// bypass the Option 1 parity gate.
+test("check supervisor:tugboat-install-parity — fails on present unrecognized tugboat", async () => {
+  const check = getCheck(makeConfig(), "supervisor:tugboat-install-parity");
+  const unrecognized =
+    "#!/usr/bin/env bash\n# arbitrary older/local fork — no thin markers\necho ship\n";
+  const r = await check.run(
+    fakeDeps({
+      fsExists: (p) => p.includes("/tugboat") && !p.includes("pipeline-ship"),
+      readTextFile: (p) =>
+        p.endsWith("/tugboat") || p.endsWith("tugboat")
+          ? unrecognized
+          : '{"version":"1.0.0"}',
+    }),
+  );
+  assertFailWithRemediation(r);
+  assert.match(r.detail, /missing critical thin markers/i);
+  assert.match(r.remediation!, /tugboat\.sh|install -m 0755|#927|#1001/i);
 });
 
 test("check supervisor:tugboat-install-parity — additive stable id", () => {
