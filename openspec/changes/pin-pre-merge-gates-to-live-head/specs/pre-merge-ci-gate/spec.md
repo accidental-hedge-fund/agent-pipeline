@@ -26,6 +26,22 @@ When `cfg.ci_mode` is `"local"`, the pre-merge CI gate SHALL read the most-recen
 - **THEN** the gate SHALL still block with `needs-human` under the existing stale-pass rule
 - **AND** SHALL NOT treat the earlier pass as certification of the current head
 
+#### Scenario: Inline local gate results are authoritative only when worktree HEAD equals live PR head
+
+- **WHEN** `cfg.ci_mode` is `"local"`
+- **AND** the gate runs the inline local test command against the managed worktree
+- **AND** the managed worktree HEAD differs from the live open PR head (lagging at a prior fail SHA, or ahead with unpushed commits)
+- **THEN** the gate SHALL NOT treat that inline pass or failure as suite-fail / `test-gate-exhausted` certification of the live head
+- **AND** SHALL block with an operational worktree-sync / fresh-certification reason that names both SHAs
+- **AND** SHALL NOT advance on the mismatched inline result as if it certified the live head
+
+#### Scenario: Inline fail at matching live-head worktree still suite-fails
+
+- **WHEN** `cfg.ci_mode` is `"local"`
+- **AND** the inline local test gate fails
+- **AND** the managed worktree HEAD equals the live open PR head H
+- **THEN** the gate SHALL block under existing local-mode suite-fail contracts for H
+
 ---
 
 ### Requirement: GitHub-mode green checks on the live head SHALL outrank superseded local fail narrative

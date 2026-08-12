@@ -699,3 +699,81 @@ test("pre-merge ci_mode: github green on live head ignores prior-head local fail
   assert.equal(getPrChecksCalled, true, "github mode must consult live-head checks");
   assert.equal(out.advanced, true, "green checks on live head must not be overturned by H_fail rows");
 });
+
+// #1010 review 2: cached fail at H_fail triggers needsFreshGate; inline gate fails
+// in a lagging worktree still at H_fail while live PR head is H_green. That inline
+// failure must NOT become suite-fail / test-gate-exhausted for H_green — only an
+// operational worktree-sync / fresh-certification block.
+test("pre-merge ci_mode: local stale H_fail cache + lagging worktree inline fail → no live-head suite-fail (#1010)", async (t) => {
+  t.mock.method(console, "log", () => {});
+
+  const blockedReasons: string[] = [];
+  const failEvents: RunEvent[] = [makeStageAccountingEvent("failure", H_FAIL)];
+  const reviewAtGreen = `## Review 2 (Adversarial) — approve\n\nLGTM\n\n<!-- reviewed-sha: ${H_GREEN} -->`;
+
+  const deps = makeBaseDeps({
+    getIssueDetail: async () =>
+      ({ comments: [{ body: reviewAtGreen }] }) as Awaited<
+        ReturnType<NonNullable<AdvancePreMergeDeps["getIssueDetail"]>>
+      >,
+    getPrChecks: async () => { throw new Error("should not be called"); },
+    // Live head is H_GREEN (makeBaseDeps getPrDetail default).
+    setBlocked: async (_cfg, _n, reason) => { blockedReasons.push(reason); },
+    readRunEvents: async () => failEvents,
+    getForIssue: async () => FAKE_WT,
+    // Inline gate fails because the worktree is still at the prior fail tip.
+    runTestGate: fakeRunTestGate({ skipped: false, passed: false }),
+    getWorktreeHead: async () => H_FAIL,
+  });
+
+  const out = await advance(makeCfg("local"), 350, { runDir: "/fake/run/dir" }, deps);
+
+  assert.equal(out.advanced, false);
+  assert.equal((out as { status: string }).status, "blocked");
+  assert.ok(
+    blockedReasons.some((r) => r.includes("worktree HEAD does not match") || r.includes("does not match the remote PR head")),
+    `must block for worktree/live-head mismatch; got: ${blockedReasons.join("; ")}`,
+  );
+  assert.ok(
+    !blockedReasons.some((r) =>
+      r.includes("inline local test gate (run from pre-merge) failed") ||
+      r.includes("most recent local test-gate result is a failure") ||
+      r.includes("test-gate-exhausted")
+    ),
+    "must NOT treat lagging-worktree inline fail as current-head suite-fail; " +
+      `got: ${blockedReasons.join("; ")}`,
+  );
+  // Operational residual (no ci-failed path tag on Outcome).
+  assert.notEqual(
+    (out as { offrampPathTag?: string }).offrampPathTag,
+    "ci-failed",
+    "mismatch must not score as suite/ci-failed",
+  );
+});
+
+// Control: inline fail with worktree HEAD == live head is still suite-fail.
+test("pre-merge ci_mode: local current-head worktree inline fail → suite-fail (#1010)", async (t) => {
+  t.mock.method(console, "log", () => {});
+
+  const blockedReasons: string[] = [];
+  const emptyEvents: RunEvent[] = [];
+
+  const deps = makeBaseDeps({
+    getPrChecks: async () => { throw new Error("should not be called"); },
+    setBlocked: async (_cfg, _n, reason) => { blockedReasons.push(reason); },
+    readRunEvents: async () => emptyEvents,
+    getForIssue: async () => FAKE_WT,
+    runTestGate: fakeRunTestGate({ skipped: false, passed: false }),
+    getWorktreeHead: async () => SHA_HEAD,
+  });
+
+  const out = await advance(makeCfg("local"), 350, { runDir: "/fake/run/dir" }, deps);
+
+  assert.equal(out.advanced, false);
+  assert.equal((out as { status: string }).status, "blocked");
+  assert.ok(
+    blockedReasons.some((r) => r.includes("inline") && r.includes("failed")),
+    `current-head inline fail must suite-fail; got: ${blockedReasons.join("; ")}`,
+  );
+  assert.equal((out as { offrampPathTag?: string }).offrampPathTag, "ci-failed");
+});

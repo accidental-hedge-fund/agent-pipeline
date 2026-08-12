@@ -15,6 +15,7 @@
 - [x] 3.2 Preserve existing local-mode stale-**pass** fail-closed behavior
 - [x] 3.3 Github mode: when checks are success on live head, do not divert to suite/CI block solely from prior-head local fail rows
 - [x] 3.4 Unit tests for 3.1–3.3 via injectable deps (no real network/git)
+- [x] 3.5 Review 2: pin inline local pass **and** fail to worktree HEAD == live PR head before suite-fail disposition; lagging H_fail worktree + inline fail must not suite-fail H_green
 
 ## 4. Delta blocking-key SHA scope at gate start
 

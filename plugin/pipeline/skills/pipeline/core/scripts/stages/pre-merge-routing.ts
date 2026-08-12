@@ -717,6 +717,34 @@ export async function advance(
           "needs-human",
         );
       }
+      // Pin both inline pass and inline failure to live PR head (#1010 review 2).
+      // `runTestGate` certifies the managed worktree HEAD, not the remote tip. A
+      // lagging worktree still at a prior fail SHA can fail the suite while the
+      // live head is green — that MUST NOT become suite-fail / test-gate-exhausted
+      // for the live tip. Same pin applies on pass (worktree ahead of remote with
+      // unpushed fix commits must not certify the remote head — #350).
+      // Operational mismatch: residual `other` (no ci-failed path tag), not suite-fail.
+      const gitFnForHead = deps.gitInWorktree ?? gitInWorktree;
+      const getWorktreeHeadFn = deps.getWorktreeHead ??
+        ((wt: string) => gitFnForHead(wt, ["rev-parse", "HEAD"]).then((r) => r.stdout.trim()));
+      const worktreeHead = await getWorktreeHeadFn(localWt.path);
+      if (worktreeHead !== prDetail.head_sha) {
+        await setBlockedFn(
+          cfg,
+          issueNumber,
+          "ci_mode: local — the local worktree HEAD does not match the remote PR head " +
+            `(worktree HEAD ${worktreeHead.slice(0, 7)}, PR head ${prDetail.head_sha.slice(0, 7)}). ` +
+            "The inline test gate certifies the worktree, not a lagging or ahead tree as if it " +
+            "were the live tip. Sync the worktree to the PR tip (or push local commits if the " +
+            "worktree is ahead), then re-run the pipeline so the gate certifies the live head.",
+          "pre-merge",
+          "needs-human",
+        );
+        return preMergeBlocked(
+          "ci_mode: local — worktree HEAD does not match PR head; sync required for live-head certification",
+          "needs-human",
+        );
+      }
       if (!inlineResult.passed) {
         await setBlockedFn(
           cfg,
@@ -733,6 +761,8 @@ export async function advance(
         // have created commits. Those commits exist only in the local worktree and are
         // not on the remote PR head. Certifying the remote PR head would advance an
         // untested commit. Block: push the fix commits and re-run the pipeline.
+        // (HEAD pin above already covers the usual unpushed-commit case; this remains
+        // for attempts>0 with matching HEAD after a pushed fix that still needs re-entry.)
         await setBlockedFn(
           cfg,
           issueNumber,
@@ -746,31 +776,6 @@ export async function advance(
         );
         return preMergeBlocked(
           "ci_mode: local — inline gate created fix commits; push required",
-          "needs-human",
-          "ci-failed",
-        );
-      }
-      // Verify the actual worktree HEAD matches the remote PR head. A prior inline
-      // gate run may have created fix commits (attempts > 0) and blocked; if the user
-      // retries without pushing, those commits remain in the worktree. A subsequent
-      // run passes with attempts === 0 (no new harness calls needed) but tests the
-      // ahead worktree, not the remote PR head. (#350 pre-merge finding)
-      const gitFnForHead = deps.gitInWorktree ?? gitInWorktree;
-      const getWorktreeHeadFn = deps.getWorktreeHead ??
-        ((wt: string) => gitFnForHead(wt, ["rev-parse", "HEAD"]).then((r) => r.stdout.trim()));
-      const worktreeHead = await getWorktreeHeadFn(localWt.path);
-      if (worktreeHead !== prDetail.head_sha) {
-        await setBlockedFn(
-          cfg,
-          issueNumber,
-          "ci_mode: local — the local worktree is ahead of the remote PR head " +
-            `(worktree HEAD ${worktreeHead.slice(0, 7)}, PR head ${prDetail.head_sha.slice(0, 7)}). ` +
-            "Push the worktree commits to the PR branch, then re-run the pipeline.",
-          "pre-merge",
-          "needs-human",
-        );
-        return preMergeBlocked(
-          "ci_mode: local — worktree ahead of PR head; push required",
           "needs-human",
           "ci-failed",
         );
