@@ -1796,16 +1796,78 @@ export function applyTrustedVerificationPolicy(
  * Package-manager script runners that re-read `package.json` at gate time.
  * A trusted bind must expand these against the base scripts map so the
  * candidate worktree cannot supply a weakened scripts.test (or nested script).
+ *
+ * Supports common CLI shapes (flags before/after `run`, dotted script names):
+ *   npm test | pnpm test | yarn test
+ *   npm run unit | npm run-script unit
+ *   npm --silent run verify | npm run --if-present verify
+ *   npm run test.unit
+ *
  * Source only — each expand call constructs a fresh /g RegExp so recursive
  * expansion cannot clobber lastIndex on a shared instance.
  */
+const PM_FLAG = String.raw`(?:--?[A-Za-z][\w-]*(?:=[^\s]*)?)`;
+const PM_SCRIPT_NAME = String.raw`([A-Za-z0-9][\w:.-]*)`;
 const PM_SCRIPT_RUNNER_SOURCE =
-  String.raw`\b(?:npm|pnpm|yarn)\s+(?:run(?:-script)?\s+([A-Za-z0-9:_-]+)|test)\b`;
+  String.raw`\b(?:npm|pnpm|yarn)(?:\s+${PM_FLAG})*\s+(?:run(?:-script)?(?:\s+${PM_FLAG})*\s+${PM_SCRIPT_NAME}|test)\b`;
+
+/**
+ * Residual package-manager tokens. After expansion any remaining
+ * `npm`/`pnpm`/`yarn` means we could not fully bind against the trusted
+ * scripts map (unsupported runner form, incomplete match, etc.) — fail
+ * closed rather than re-resolve against the candidate worktree.
+ */
+const RESIDUAL_PM_TOKEN = /\b(?:npm|pnpm|yarn)\b/;
+
+/**
+ * Expand one named script from a trusted scripts map, including npm-style
+ * pre/post lifecycle scripts (`pretest`/`posttest`, `preunit`/`postunit`, …).
+ * Nested package-manager runners inside those bodies are expanded the same way.
+ * Cycles, missing scripts, and residual unresolved runners fail closed (null).
+ */
+export function expandTrustedNamedScript(
+  name: string,
+  scripts: Record<string, string>,
+  stack: ReadonlySet<string> = new Set(),
+): string | null {
+  if (stack.has(name)) return null;
+  const target = scripts[name];
+  if (typeof target !== "string" || !target.trim()) return null;
+  const nextStack = new Set(stack);
+  nextStack.add(name);
+
+  const preName = `pre${name}`;
+  const postName = `post${name}`;
+  const preBody = scripts[preName];
+  const postBody = scripts[postName];
+  const hasPre = typeof preBody === "string" && !!preBody.trim();
+  const hasPost = typeof postBody === "string" && !!postBody.trim();
+
+  const parts: string[] = [];
+  if (hasPre) {
+    const preExpanded = expandTrustedPackageScriptBody(preBody.trim(), scripts, nextStack);
+    if (preExpanded === null) return null;
+    parts.push(`(${preExpanded})`);
+  }
+  const mainExpanded = expandTrustedPackageScriptBody(target.trim(), scripts, nextStack);
+  if (mainExpanded === null) return null;
+  // Parenthesize main when combining with lifecycle hooks so `&&` precedence
+  // matches package-manager semantics (pre && main && post).
+  parts.push(hasPre || hasPost ? `(${mainExpanded})` : mainExpanded);
+  if (hasPost) {
+    const postExpanded = expandTrustedPackageScriptBody(postBody.trim(), scripts, nextStack);
+    if (postExpanded === null) return null;
+    parts.push(`(${postExpanded})`);
+  }
+  return parts.join(" && ");
+}
 
 /**
  * Inline trusted package.json script references so the gate command never
  * re-resolves `npm test` / `pnpm run …` against the candidate package.json.
- * Unknown or cyclic references fail closed (null).
+ * Named runners expand with pre/post lifecycle scripts from the same map.
+ * Unknown, cyclic, or residual unresolved package-manager runners fail closed
+ * (null).
  */
 export function expandTrustedPackageScriptBody(
   body: string,
@@ -1818,26 +1880,25 @@ export function expandTrustedPackageScriptBody(
   let match: RegExpExecArray | null;
   while ((match = re.exec(body)) !== null) {
     const name = match[1] ?? "test";
-    if (stack.has(name)) return null;
-    const target = scripts[name];
-    if (typeof target !== "string" || !target.trim()) return null;
-    const nextStack = new Set(stack);
-    nextStack.add(name);
-    const inner = expandTrustedPackageScriptBody(target.trim(), scripts, nextStack);
+    const inner = expandTrustedNamedScript(name, scripts, stack);
     if (inner === null) return null;
     out += body.slice(last, match.index) + `(${inner})`;
     last = match.index + match[0].length;
   }
   out += body.slice(last);
+  // Trust boundary: partial regex coverage must not leave a package-manager
+  // token that could re-read the candidate package.json (or other PM state).
+  if (RESIDUAL_PM_TOKEN.test(out)) return null;
   return out;
 }
 
 /**
  * Derive an explicit test command from a trusted base `package.json` body.
- * Returns the expanded base `scripts.test` body so the gate runs those
- * authoritative bytes via `bash -c` — never a bare `npm test` / `pnpm test`,
- * which would re-resolve `scripts.test` from the candidate worktree.
- * Returns null when no scripts.test is present or nested expansion fails
+ * Returns the expanded base `scripts.test` body (including `pretest` /
+ * `posttest` lifecycle scripts and nested pre/post for inlined runners) so
+ * the gate runs those authoritative bytes via `bash -c` — never a bare
+ * `npm test` / `pnpm test`, which would re-resolve scripts from the candidate
+ * worktree. Returns null when no scripts.test is present or expansion fails
  * closed. Never reads the candidate tree.
  */
 export function testCommandFromPackageJson(packageJsonText: string): string | null {
@@ -1849,12 +1910,11 @@ export function testCommandFromPackageJson(packageJsonText: string): string | nu
     for (const [k, v] of Object.entries(rawScripts)) {
       if (typeof v === "string" && v.trim()) scripts[k] = v.trim();
     }
-    const testScript = scripts.test;
-    if (!testScript) return null;
-    // Expand package-manager script runners against base scripts only. The gate
-    // then executes this body in the candidate worktree (product code under
-    // test) without consulting candidate package.json#scripts.
-    return expandTrustedPackageScriptBody(testScript, scripts, new Set(["test"]));
+    if (!scripts.test) return null;
+    // Expand named `test` with lifecycle + nested runners against base scripts
+    // only. The gate then executes this body in the candidate worktree
+    // (product code under test) without consulting candidate package.json#scripts.
+    return expandTrustedNamedScript("test", scripts, new Set());
   } catch {
     return null;
   }

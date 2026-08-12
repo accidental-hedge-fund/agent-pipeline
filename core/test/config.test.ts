@@ -708,6 +708,92 @@ test("testCommandFromPackageJson: candidate no-op scripts.test cannot become the
   assert.notEqual(bound, cfgMod.testCommandFromPackageJson(candidatePkg));
 });
 
+test("testCommandFromPackageJson: includes pretest/posttest lifecycle (#691 a84c3494)", async () => {
+  const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-pkg-lifecycle`);
+  // npm test runs pretest → test → posttest. Direct body binding must preserve
+  // those trusted hooks so a candidate cannot drop them by rewriting package.json.
+  const bound = cfgMod.testCommandFromPackageJson(
+    JSON.stringify({
+      scripts: {
+        pretest: "node scripts/check-fixtures.mjs",
+        test: "node --test test/*.test.ts",
+        posttest: "node scripts/coverage-floor.mjs",
+      },
+    }),
+  );
+  assert.equal(
+    bound,
+    "(node scripts/check-fixtures.mjs) && (node --test test/*.test.ts) && (node scripts/coverage-floor.mjs)",
+  );
+  // Nested npm run unit must also expand preunit/postunit from the base map.
+  const nested = cfgMod.testCommandFromPackageJson(
+    JSON.stringify({
+      scripts: {
+        test: "npm run unit",
+        preunit: "node scripts/pre-unit.mjs",
+        unit: "node --test test/unit/*.test.ts",
+        postunit: "node scripts/post-unit.mjs",
+      },
+    }),
+  );
+  assert.equal(
+    nested,
+    "((node scripts/pre-unit.mjs) && (node --test test/unit/*.test.ts) && (node scripts/post-unit.mjs))",
+  );
+  // Candidate-weakened pretest must not affect the bound command (base only).
+  const baseWithPre = JSON.stringify({
+    scripts: { pretest: "node trusted-pre.mjs", test: "node --test" },
+  });
+  const candidateDropPre = JSON.stringify({ scripts: { test: "node --test" } });
+  assert.equal(
+    cfgMod.testCommandFromPackageJson(baseWithPre),
+    "(node trusted-pre.mjs) && (node --test)",
+  );
+  assert.equal(cfgMod.testCommandFromPackageJson(candidateDropPre), "node --test");
+});
+
+test("testCommandFromPackageJson: expands flagged/dotted runners; residual fails closed (#691 7995aedb)", async () => {
+  const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-pkg-runner-forms`);
+  // Flags before/after run and dotted script names must expand against base map.
+  assert.equal(
+    cfgMod.testCommandFromPackageJson(
+      JSON.stringify({
+        scripts: {
+          test: "npm --silent run verify && npm run --if-present lint && npm run test.unit",
+          verify: "node scripts/verify.mjs",
+          lint: "eslint .",
+          "test.unit": "node --test test/unit/*.test.ts",
+        },
+      }),
+    ),
+    "(node scripts/verify.mjs) && (eslint .) && (node --test test/unit/*.test.ts)",
+  );
+  // Candidate replacing a nested dotted script cannot become authority: bind uses base.
+  const base = JSON.stringify({
+    scripts: { test: "npm run test.unit", "test.unit": "node --test real/*.test.ts" },
+  });
+  const candidate = JSON.stringify({
+    scripts: { test: "npm run test.unit", "test.unit": "true" },
+  });
+  assert.equal(cfgMod.testCommandFromPackageJson(base), "(node --test real/*.test.ts)");
+  assert.equal(cfgMod.testCommandFromPackageJson(candidate), "(true)");
+  // Unresolvable residual package-manager script runner → fail closed (null).
+  // `npm exec` is not a supported trusted expansion form and must not pass through.
+  assert.equal(
+    cfgMod.testCommandFromPackageJson(
+      JSON.stringify({ scripts: { test: "npm exec --yes something" } }),
+    ),
+    null,
+  );
+  // Missing nested script after flagged runner still fails closed.
+  assert.equal(
+    cfgMod.testCommandFromPackageJson(
+      JSON.stringify({ scripts: { test: "npm --silent run missing-script" } }),
+    ),
+    null,
+  );
+});
+
 // ---- review_ensemble (#645) ----
 
 test("resolveConfig: review_ensemble absent — disabled by default", async () => {
