@@ -19,6 +19,7 @@ import {
   EVIDENCE_SUBJECT_SCHEMA_VERSION,
   parseEvidenceSubject,
   parseEvidenceSubjectDetailed,
+  resolveRequiredEvidenceKinds,
   selectEvaluationPinSubject,
   serializeEvidenceSubjectCanonical,
   sha256Hex,
@@ -299,6 +300,48 @@ test("unsupported schema_version is not a match", () => {
   const cmp = compareEvidenceSubjects(raw, pin);
   assert.equal(cmp.outcome, "malformed");
   assert.equal(parseEvidenceSubjectDetailed(raw).status, "malformed");
+});
+
+test("omitted diff_hash key is malformed — not silently null match", () => {
+  const pin = sampleSubject({ diff_hash: null });
+  const raw = { ...sampleSubject({ diff_hash: null }) } as Record<string, unknown>;
+  delete raw.diff_hash;
+  const parsed = parseEvidenceSubjectDetailed(raw);
+  assert.equal(parsed.status, "malformed");
+  const cmp = compareEvidenceSubjects(raw, pin);
+  assert.equal(cmp.outcome, "malformed");
+  assert.notEqual(cmp.outcome, "match");
+});
+
+test("explicit null diff_hash is well-formed and can match", () => {
+  const pin = sampleSubject({ diff_hash: null });
+  const art = sampleSubject({ diff_hash: null });
+  assert.equal(parseEvidenceSubjectDetailed(art).status, "ok");
+  assert.equal(compareEvidenceSubjects(art, pin).outcome, "match");
+});
+
+test("resolveRequiredEvidenceKinds derives set from gate enablement", () => {
+  assert.deepEqual(resolveRequiredEvidenceKinds({}), ["review", "tester"]);
+  assert.deepEqual(
+    resolveRequiredEvidenceKinds({ testGateEnabled: false }),
+    ["review"],
+  );
+  assert.deepEqual(
+    resolveRequiredEvidenceKinds({
+      testGateEnabled: true,
+      evalGateEnabled: true,
+      visualGateEnabled: true,
+      shipcheckGateEnabled: true,
+    }),
+    ["review", "tester", "eval", "visual", "shipcheck"],
+  );
+  const base = buildRequiredEvidenceSetRevision(["review", "tester"]);
+  const withEval = buildRequiredEvidenceSetRevision([
+    "review",
+    "tester",
+    "eval",
+  ]);
+  assert.notEqual(base, withEval);
 });
 
 test("run_id alone is not a complete subject match", () => {

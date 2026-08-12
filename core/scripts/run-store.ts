@@ -39,7 +39,7 @@ import { RUNS_ARTIFACT, HISTORY_ARTIFACT, artifactSubdir } from "./artifact-igno
 import {
   buildEvidenceSubjectDiagnostics,
   collectDiagnosticArtifactsFromBundle,
-  selectEvaluationPinSubject,
+  type EvidenceSubjectV1,
 } from "./evidence-subject.ts";
 
 export const RUN_SCHEMA_VERSION = 1;
@@ -831,6 +831,13 @@ export interface RunStoreDeps {
    *  stage_accounting/human_intervention data still reaches summary.json in
    *  exclusive mode, where events.jsonl is not written on the happy path. */
   summaryEvents?: RunEvent[];
+  /**
+   * Authoritative evaluation-pin subject for finalize diagnostics (#692).
+   * MUST be derived from live run/candidate runtime state — never inferred from
+   * the readiness artifacts under comparison. When absent/null, diagnostics
+   * MUST NOT report `match` (pin-unavailable disposition).
+   */
+  evaluationPinSubject?: EvidenceSubjectV1 | null;
 }
 
 export const defaultRunStoreDeps: RunStoreDeps = {
@@ -1477,9 +1484,12 @@ export async function finalizeRun(
     tester_evidence_subject: testerSubject,
     include_tester_row: includeTesterRow,
   });
+  // Authoritative pin only — never select from the artifacts being validated
+  // (that would label a co-stale set as match after product HEAD advanced).
   const pin =
-    selectEvaluationPinSubject(diagnosticArts) ??
-    null;
+    deps.evaluationPinSubject === undefined
+      ? null
+      : deps.evaluationPinSubject;
   const evidenceSubjectDiagnostics = buildEvidenceSubjectDiagnostics(
     pin,
     diagnosticArts,

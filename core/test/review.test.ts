@@ -17,7 +17,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
-  advanceReview,
+  advanceReview as advanceReviewCore,
   classifyReview1Risk,
   computeDiffHash,
   countPriorRounds,
@@ -36,7 +36,36 @@ import {
   reviewCeilingComment,
   reviewCeilingDemotionComment,
   type AdvanceReviewDeps,
+  type AdvanceReviewOpts,
 } from "../scripts/stages/review.ts";
+
+/**
+ * Test wrapper: supplies domain/repo on cfg when missing so #692 subject
+ * construction can succeed. Does NOT inject pipelineRunId — that scopes
+ * prior-round history and would break ceiling/reversal tests that use
+ * comments without a run-id marker.
+ */
+async function advanceReview(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  round: 1 | 2,
+  opts: AdvanceReviewOpts = {},
+  retryCount = 0,
+  deps: AdvanceReviewDeps = {},
+) {
+  const cfgWithIdentity =
+    !(cfg.domain || cfg.repo)
+      ? ({ ...cfg, domain: "test/repo", repo: "test/repo" } as PipelineConfig)
+      : cfg;
+  return advanceReviewCore(
+    cfgWithIdentity,
+    issueNumber,
+    round,
+    opts,
+    retryCount,
+    deps,
+  );
+}
 import { openspecContextFromDiff } from "../scripts/openspec.ts";
 import { buildUnblockedComment } from "../scripts/pipeline.ts";
 import { buildTransitionComment } from "../scripts/gh.ts";
@@ -743,10 +772,16 @@ const cfg = {
   review_mode: "prompt-harness",
   harnesses: { reviewer: "codex", implementer: "claude" },
   repo_dir: "/tmp/repo",
+  domain: "test/repo",
+  repo: "test/repo",
   models: { review: "opus" },
   // Default policy: block on every finding (block_threshold "low", min_confidence 0)
   // — reproduces pre-#17 behavior so existing routing assertions hold.
   review_policy: { block_threshold: "low", min_confidence: 0 },
+  test_gate: { enabled: true },
+  eval_gate: { enabled: false },
+  visual_gate: { enabled: false },
+  shipcheck_gate: { enabled: false },
 } as unknown as PipelineConfig;
 
 interface Recorder {
@@ -1158,9 +1193,15 @@ const cfgConverge = {
   review_mode: "prompt-harness",
   harnesses: { reviewer: "codex", implementer: "claude" },
   repo_dir: "/tmp/repo",
+  domain: "test/repo",
+  repo: "test/repo",
   models: { review: "opus" },
   marker_footer: "*Automated by Claude Code Pipeline Skill*",
   review_policy: { block_threshold: "medium", min_confidence: 0.7, max_adversarial_rounds: 3 },
+  test_gate: { enabled: true },
+  eval_gate: { enabled: false },
+  visual_gate: { enabled: false },
+  shipcheck_gate: { enabled: false },
 } as unknown as PipelineConfig;
 
 // `NA_MEDIUM` (declared above for the #17 tests) advances under the high default;

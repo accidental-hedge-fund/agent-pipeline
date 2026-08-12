@@ -565,3 +565,47 @@ test("classifyCorrectionEventCurrency: legacy reviewed_sha ≠ head is stale wit
   assert.equal(result.stale, true);
   assert.equal(result.subject_outcome, "legacy_unbound");
 });
+
+test("classifyCorrectionEventCurrency: subject without pin never returns match", () => {
+  const result = classifyCorrectionEventCurrency(
+    {
+      reviewed_sha: CORR_SHA,
+      head_sha: CORR_SHA,
+      run_id: BASE_PAYLOAD.run_id,
+      evidence_subject: CORR_SUBJECT,
+    },
+    { candidateSha: CORR_SHA },
+  );
+  assert.equal(result.stale, true);
+  assert.notEqual(result.subject_outcome, "match");
+});
+
+test("classifyCorrectionEventCurrency: malformed subject is quarantined", () => {
+  const result = classifyCorrectionEventCurrency(
+    {
+      reviewed_sha: CORR_SHA,
+      head_sha: CORR_SHA,
+      run_id: BASE_PAYLOAD.run_id,
+      evidence_subject: { schema_version: 1, candidate_sha: CORR_SHA } as never,
+    },
+    { candidateSha: CORR_SHA, evaluationPin: CORR_SUBJECT },
+  );
+  assert.equal(result.stale, true);
+  assert.equal(result.subject_outcome, "malformed");
+});
+
+test("classifyCorrectionEventCurrency: subject vs event SHA disagreement is mismatch", () => {
+  const otherSha = "b".repeat(40);
+  const result = classifyCorrectionEventCurrency(
+    {
+      reviewed_sha: otherSha,
+      head_sha: otherSha,
+      run_id: BASE_PAYLOAD.run_id,
+      evidence_subject: CORR_SUBJECT,
+    },
+    { candidateSha: CORR_SHA, evaluationPin: CORR_SUBJECT },
+  );
+  assert.equal(result.stale, true);
+  assert.equal(result.subject_outcome, "mismatch");
+  assert.ok(result.mismatched_fields.includes("candidate_sha"));
+});

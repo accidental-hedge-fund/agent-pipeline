@@ -18,6 +18,7 @@ import {
   CANDIDATE_CURRENCY_FIELDS,
   compareEvidenceSubjects,
   normalizeSubjectSha,
+  parseEvidenceSubjectDetailed,
   subjectIsCurrentForFields,
   type EvidenceSubjectComparison,
   type EvidenceSubjectComparisonOutcome,
@@ -354,6 +355,12 @@ function resolveCorrectionEvidenceSubject(
  * Prefers evidence_subject comparison when present (#692). Falls back to
  * reviewed_sha vs head string compare for legacy events, labeling them
  * `legacy_unbound` — never a full multi-dimension subject match.
+ *
+ * Never returns `match` without a well-formed evaluation-pin subject. A
+ * present but unparseable subject is quarantined (`malformed`). When a
+ * subject is present without a pin, result is non-current (pin-unavailable),
+ * not a SHA-only full match. Event `reviewed_sha` / `head_sha` must agree with
+ * `evidence_subject.candidate_sha` when both are well-formed SHAs.
  */
 export function classifyCorrectionEventCurrency(
   event: Pick<
@@ -372,45 +379,69 @@ export function classifyCorrectionEventCurrency(
   mismatched_fields: string[];
   comparison?: EvidenceSubjectComparison;
 } {
-  const pin = opts.evaluationPin;
-  if (event.evidence_subject && pin) {
-    const cmp = compareEvidenceSubjects(event.evidence_subject, pin);
-    if (cmp.outcome === "match") {
+  const pin = opts.evaluationPin ?? null;
+
+  if (event.evidence_subject !== undefined && event.evidence_subject !== null) {
+    const parsed = parseEvidenceSubjectDetailed(event.evidence_subject);
+    if (parsed.status !== "ok") {
       return {
-        stale: false,
-        subject_outcome: "match",
+        stale: true,
+        subject_outcome: "malformed",
+        mismatched_fields: [],
+      };
+    }
+
+    // Subject candidate must agree with applicable event SHA fields when those
+    // fields are well-formed full SHAs (spec: candidate_sha represents the
+    // same candidate as reviewed/head for that event).
+    const subjectSha = parsed.subject.candidate_sha;
+    for (const field of [event.reviewed_sha, event.head_sha] as const) {
+      const eventSha = normalizeSubjectSha(field);
+      if (eventSha !== null && eventSha !== subjectSha) {
+        return {
+          stale: true,
+          subject_outcome: "mismatch",
+          mismatched_fields: ["candidate_sha"],
+        };
+      }
+    }
+
+    if (pin) {
+      const cmp = compareEvidenceSubjects(parsed.subject, pin);
+      if (cmp.outcome === "match") {
+        return {
+          stale: false,
+          subject_outcome: "match",
+          mismatched_fields: [],
+          comparison: cmp,
+        };
+      }
+      if (cmp.outcome === "mismatch") {
+        const stale = !subjectIsCurrentForFields(cmp, CANDIDATE_CURRENCY_FIELDS);
+        return {
+          stale,
+          subject_outcome: "mismatch",
+          mismatched_fields: [...cmp.mismatched_fields],
+          comparison: cmp,
+        };
+      }
+      return {
+        stale: true,
+        subject_outcome: cmp.outcome,
         mismatched_fields: [],
         comparison: cmp,
       };
     }
-    if (cmp.outcome === "mismatch") {
-      const stale = !subjectIsCurrentForFields(cmp, CANDIDATE_CURRENCY_FIELDS);
-      return {
-        stale,
-        subject_outcome: "mismatch",
-        mismatched_fields: [...cmp.mismatched_fields],
-        comparison: cmp,
-      };
-    }
+
+    // Subject present but no evaluation pin: never claim multi-dimension match
+    // from live candidate SHA alone. Pin-unavailable → non-current quarantine.
     return {
       stale: true,
-      subject_outcome: cmp.outcome,
+      subject_outcome: "malformed",
       mismatched_fields: [],
-      comparison: cmp,
     };
   }
-  if (event.evidence_subject && !pin) {
-    const subjectSha = normalizeSubjectSha(
-      (event.evidence_subject as EvidenceSubjectV1).candidate_sha,
-    );
-    const live = normalizeSubjectSha(opts.candidateSha);
-    const stale = subjectSha == null || live == null || subjectSha !== live;
-    return {
-      stale,
-      subject_outcome: stale ? "mismatch" : "match",
-      mismatched_fields: stale ? ["candidate_sha"] : [],
-    };
-  }
+
   // legacy_unbound: reviewed_sha vs head
   const reviewed = event.reviewed_sha;
   const live = opts.candidateSha;

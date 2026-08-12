@@ -70,7 +70,7 @@ import {
 import { makePromptRecord, recordPrompt, recordReview } from "../evidence-bundle.ts";
 import {
   buildEvidenceSubject,
-  buildRequiredEvidenceSetRevision,
+  buildRequiredEvidenceSetRevisionFromGates,
   buildReviewPolicyHash,
   buildEngineFingerprint,
   verifierFingerprintFromEngine,
@@ -192,6 +192,8 @@ export type RunReviewFn = (
  * Build the shared evidence_subject for a review round from runtime state (#692).
  * Returns null when a required identity dimension cannot be resolved (no
  * fabricated placeholders). Pure aside from the optional engine-identity read.
+ * Callers that write new readiness artifacts MUST fail closed on null — never
+ * emit a silent legacy_unbound review row for a new production path.
  */
 export function buildReviewEvidenceSubject(args: {
   cfg: PipelineConfig;
@@ -213,6 +215,8 @@ export function buildReviewEvidenceSubject(args: {
     templates_fingerprint: string;
     commit_sha?: string;
   } | null;
+  /** Override required-evidence kinds revision when already computed. */
+  requiredEvidenceSetRevision?: string;
 }): EvidenceSubjectV1 | null {
   const domain = (args.cfg.domain || args.cfg.repo || "").trim();
   if (!domain) return null;
@@ -229,6 +233,14 @@ export function buildReviewEvidenceSubject(args: {
       templates_fingerprint: engine.templates_fingerprint,
       commit_sha: engine.commit_sha,
     });
+    const requiredRev =
+      args.requiredEvidenceSetRevision ??
+      buildRequiredEvidenceSetRevisionFromGates({
+        testGateEnabled: args.cfg.test_gate?.enabled,
+        evalGateEnabled: args.cfg.eval_gate?.enabled,
+        visualGateEnabled: args.cfg.visual_gate?.enabled,
+        shipcheckGateEnabled: args.cfg.shipcheck_gate?.enabled,
+      });
     return buildEvidenceSubject({
       domain,
       issue: args.issueNumber,
@@ -239,7 +251,7 @@ export function buildReviewEvidenceSubject(args: {
       policy_hash: buildReviewPolicyHash(args.reviewPolicy),
       engine_fingerprint: engineFp,
       verifier_fingerprint: verifierFingerprintFromEngine(engineFp),
-      required_evidence_set_revision: buildRequiredEvidenceSetRevision(),
+      required_evidence_set_revision: requiredRev,
     });
   } catch {
     return null;
@@ -804,17 +816,39 @@ export async function advanceReview(
 
   // evidence_subject for ReviewArtifact + bundle review rows (#692). Built only
   // from runtime state (cfg, SHA, diff hash, engine identity) — never from
-  // reviewer prose. Null when engine identity cannot be resolved (fail closed
-  // on subject emission; existing SHA/diff fields still work).
+  // reviewer prose. Missing required inputs fail closed: new readiness artifacts
+  // MUST NOT be written without a subject (would be silent legacy_unbound).
+  //
+  // Subject run_id prefers pipelineRunId, then runDir basename. When neither is
+  // set (unit tests / non-run invocations), use an explicit unscoped id so
+  // subject emission still succeeds without inventing a production run id that
+  // would also filter prior-round history (currentReviewRunId stays undefined).
+  const subjectRunId =
+    (typeof currentReviewRunId === "string" && currentReviewRunId.trim()) ||
+    (opts.runDir ? path.basename(opts.runDir) : "") ||
+    `issue-${issueNumber}/unscoped-run`;
   const reviewEvidenceSubject: EvidenceSubjectV1 | null = buildReviewEvidenceSubject({
     cfg,
     issueNumber,
     prNumber,
-    runId: currentReviewRunId,
+    runId: subjectRunId,
     candidateSha: commitSha,
     diffHash,
     reviewPolicy: effectivePol,
   });
+  if (!reviewEvidenceSubject) {
+    const reason =
+      "Review evidence_subject could not be built from runtime state " +
+      "(missing domain, engine identity, or other required identity " +
+      "inputs). New readiness review artifacts must not omit the subject.";
+    console.error(`[pipeline] #${issueNumber}: ${reason}`);
+    await setBlockedFn(cfg, issueNumber, reason, stage, "harness-failure");
+    return {
+      advanced: false,
+      status: "blocked",
+      reason: "evidence_subject production failed for review artifact",
+    };
+  }
 
   const findingCounts: Record<string, number> = { critical: 0, high: 0, medium: 0, low: 0 };
   for (const f of verdict.findings) {

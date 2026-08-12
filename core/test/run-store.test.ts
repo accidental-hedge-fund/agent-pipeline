@@ -2744,7 +2744,9 @@ test("finalizeRun: writes evidence_subject_diagnostics for review rows", async (
   ];
   bundle.overrides = [{ key: "legacy-key", reason: "old" }];
 
-  await finalizeRun(RUN_DIR, bundle, STATE_DIR, ISSUE, STARTED_AT_ISO, deps);
+  // Inject authoritative evaluation pin (runtime pin) — never derived from artifacts.
+  const depsWithPin = { ...deps, evaluationPinSubject: subject };
+  await finalizeRun(RUN_DIR, bundle, STATE_DIR, ISSUE, STARTED_AT_ISO, depsWithPin);
   const summary = JSON.parse(readFile(path.join(RUN_DIR, "summary.json")));
   assert.ok(Array.isArray(summary.evidence_subject_diagnostics));
   const diags = summary.evidence_subject_diagnostics as Array<{
@@ -2752,7 +2754,7 @@ test("finalizeRun: writes evidence_subject_diagnostics for review rows", async (
     outcome: string;
     mismatched_fields: string[];
   }>;
-  // Pin is last well-formed subject (round 2 mismatched policy) — round 1 mismatches on policy_hash
+  // Pin is injected subject (round 1) — round 2 mismatches on policy_hash
   const reviewDiags = diags.filter((d) => d.kind === "review");
   assert.ok(reviewDiags.length >= 2);
   const overrideDiag = diags.find((d) => d.kind === "override");
@@ -2763,6 +2765,58 @@ test("finalizeRun: writes evidence_subject_diagnostics for review rows", async (
     (d) => d.outcome === "mismatch" && d.mismatched_fields.includes("policy_hash"),
   );
   assert.ok(policyMismatch, "must surface policy_hash mismatch without inventing match");
-  // Match entry for the pin artifact itself
+  // Match entry for the pin-matching review artifact
   assert.ok(diags.some((d) => d.outcome === "match"));
+});
+
+test("finalizeRun: does not infer evaluation pin from readiness artifacts", async () => {
+  const {
+    buildEvidenceSubject,
+    buildEngineFingerprint,
+    buildPolicyHash,
+    buildRequiredEvidenceSetRevision,
+    verifierFingerprintFromEngine,
+  } = await import("../scripts/evidence-subject.ts");
+  const { deps, readFile } = memRunStore();
+  const engine = buildEngineFingerprint({
+    version: "1.0.0",
+    templates_fingerprint: "e".repeat(64),
+  });
+  const shaA = "a".repeat(40);
+  const subjectA = buildEvidenceSubject({
+    domain: "owner/repo",
+    issue: ISSUE,
+    pr: null,
+    run_id: "155/run",
+    candidate_sha: shaA,
+    diff_hash: null,
+    policy_hash: buildPolicyHash({ p: 1 }),
+    engine_fingerprint: engine,
+    verifier_fingerprint: verifierFingerprintFromEngine(engine),
+    required_evidence_set_revision: buildRequiredEvidenceSetRevision(),
+  });
+  const bundle = makeBundle();
+  bundle.reviews = [
+    {
+      round: 1,
+      sha: shaA,
+      verdict: "approve",
+      findingCounts: {},
+      evidence_subject: subjectA,
+    },
+  ];
+  // No evaluationPinSubject on deps — pin unavailable.
+  await finalizeRun(RUN_DIR, bundle, STATE_DIR, ISSUE, STARTED_AT_ISO, deps);
+  const summary = JSON.parse(readFile(path.join(RUN_DIR, "summary.json")));
+  const diags = summary.evidence_subject_diagnostics as Array<{
+    kind: string;
+    outcome: string;
+  }>;
+  // Must not claim match by selecting the artifact subject as its own pin.
+  assert.ok(diags.some((d) => d.kind === "review"));
+  assert.equal(
+    diags.some((d) => d.outcome === "match"),
+    false,
+    "pin-unavailable finalization must not report match",
+  );
 });

@@ -353,3 +353,86 @@ test("ReviewArtifact: legacy artifact without subject remains extractable (legac
   const cmp = compareEvidenceSubjects(decoded!.evidence_subject, REVIEW_SUBJECT);
   assert.equal(cmp.outcome, "legacy_unbound");
 });
+
+test("buildReviewEvidenceSubject: required revision reflects effective gate set", async () => {
+  const { buildReviewEvidenceSubject } = await import(
+    "../scripts/stages/review-routing.ts"
+  );
+  const { buildRequiredEvidenceSetRevisionFromGates } = await import(
+    "../scripts/evidence-subject.ts"
+  );
+  const baseCfg = {
+    domain: "owner/repo",
+    repo: "owner/repo",
+    test_gate: { enabled: true },
+    eval_gate: { enabled: false },
+    visual_gate: { enabled: false },
+    shipcheck_gate: { enabled: false },
+  } as never;
+  const withEvalCfg = {
+    ...baseCfg,
+    eval_gate: { enabled: true },
+  } as never;
+  const engine = {
+    version: "1.0.0",
+    templates_fingerprint: "f".repeat(64),
+  };
+  const policy = { block_threshold: "high", min_confidence: 0.7 };
+  const a = buildReviewEvidenceSubject({
+    cfg: baseCfg,
+    issueNumber: 692,
+    prNumber: 10,
+    runId: "692/run",
+    candidateSha: SAMPLE.reviewedSha,
+    diffHash: SAMPLE.diffHash,
+    reviewPolicy: policy,
+    engineIdentity: engine,
+  });
+  const b = buildReviewEvidenceSubject({
+    cfg: withEvalCfg,
+    issueNumber: 692,
+    prNumber: 10,
+    runId: "692/run",
+    candidateSha: SAMPLE.reviewedSha,
+    diffHash: SAMPLE.diffHash,
+    reviewPolicy: policy,
+    engineIdentity: engine,
+  });
+  assert.ok(a);
+  assert.ok(b);
+  assert.equal(
+    a!.required_evidence_set_revision,
+    buildRequiredEvidenceSetRevisionFromGates({ testGateEnabled: true }),
+  );
+  assert.equal(
+    b!.required_evidence_set_revision,
+    buildRequiredEvidenceSetRevisionFromGates({
+      testGateEnabled: true,
+      evalGateEnabled: true,
+    }),
+  );
+  assert.notEqual(
+    a!.required_evidence_set_revision,
+    b!.required_evidence_set_revision,
+  );
+});
+
+test("buildReviewEvidenceSubject: missing run_id fails closed (null)", async () => {
+  const { buildReviewEvidenceSubject } = await import(
+    "../scripts/stages/review-routing.ts"
+  );
+  const subject = buildReviewEvidenceSubject({
+    cfg: { domain: "owner/repo", repo: "owner/repo" } as never,
+    issueNumber: 692,
+    prNumber: null,
+    runId: undefined,
+    candidateSha: SAMPLE.reviewedSha,
+    diffHash: null,
+    reviewPolicy: { block_threshold: "high", min_confidence: 0.7 },
+    engineIdentity: {
+      version: "1.0.0",
+      templates_fingerprint: "f".repeat(64),
+    },
+  });
+  assert.equal(subject, null);
+});

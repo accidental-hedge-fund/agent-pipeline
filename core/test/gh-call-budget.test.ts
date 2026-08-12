@@ -64,10 +64,15 @@ function makeCfg(overrides: Partial<PipelineConfig> = {}): PipelineConfig {
     review_mode: "prompt-harness",
     harnesses: { reviewer: "codex", implementer: "claude" },
     repo_dir: "/tmp/repo",
+    domain: "test/repo",
+    repo: "test/repo",
     models: { review: "opus" },
     // Default policy: block on every finding so approve is the only happy path.
     review_policy: { block_threshold: "low", min_confidence: 0 },
+    test_gate: { enabled: true },
     eval_gate: { enabled: false },
+    visual_gate: { enabled: false },
+    shipcheck_gate: { enabled: false },
     ci_timeout: 600,
     ci_poll_interval: 1,
     ci_no_run_grace_s: 3600,
@@ -75,6 +80,8 @@ function makeCfg(overrides: Partial<PipelineConfig> = {}): PipelineConfig {
     ...overrides,
   } as unknown as PipelineConfig;
 }
+
+const BUDGET_RUN_ID = "test/budget-review-run";
 
 type PrDetailFake = Awaited<ReturnType<NonNullable<AdvancePreMergeDeps["getPrDetail"]>>>;
 
@@ -346,8 +353,8 @@ test("#839 advance walk: multi-stage review-1/review-2/pre-merge under ADVANCE_W
   await quiet(t, async () => {
     // Composed full advance walk under one shared deps counter (design §6):
     // load-bearing stage entrypoints, not a live GitHub issue.
-    r1 = await advanceReview(cfg, ISSUE, 1, {}, 0, deps);
-    r2 = await advanceReview(cfg, ISSUE, 2, {}, 0, deps);
+    r1 = await advanceReview(cfg, ISSUE, 1, { pipelineRunId: BUDGET_RUN_ID }, 0, deps);
+    r2 = await advanceReview(cfg, ISSUE, 2, { pipelineRunId: BUDGET_RUN_ID }, 0, deps);
     pm = await advance(cfg, ISSUE, {}, deps);
   });
 

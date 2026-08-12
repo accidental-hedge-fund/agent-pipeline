@@ -207,6 +207,38 @@ export function buildRequiredEvidenceSetRevision(
   return sha256Hex(stableStringify({ kinds: normalized }));
 }
 
+/**
+ * Derive the effective readiness evidence-kind set from runtime gate enablement.
+ * Always includes `review`. Adds optional families only when their gate is on.
+ * Producers MUST pass this set (not the static default alone) so a config
+ * change revises `required_evidence_set_revision` and invalidates composition.
+ */
+export function resolveRequiredEvidenceKinds(gates: {
+  testGateEnabled?: boolean;
+  evalGateEnabled?: boolean;
+  visualGateEnabled?: boolean;
+  shipcheckGateEnabled?: boolean;
+}): string[] {
+  const kinds: string[] = ["review"];
+  // test_gate defaults on in pipeline config; treat undefined as enabled so the
+  // default revision matches DEFAULT_REQUIRED_EVIDENCE_KINDS (review+tester).
+  if (gates.testGateEnabled !== false) kinds.push("tester");
+  if (gates.evalGateEnabled === true) kinds.push("eval");
+  if (gates.visualGateEnabled === true) kinds.push("visual");
+  if (gates.shipcheckGateEnabled === true) kinds.push("shipcheck");
+  return kinds;
+}
+
+/** Convenience: revision digest for the effective gate-derived kind set. */
+export function buildRequiredEvidenceSetRevisionFromGates(gates: {
+  testGateEnabled?: boolean;
+  evalGateEnabled?: boolean;
+  visualGateEnabled?: boolean;
+  shipcheckGateEnabled?: boolean;
+}): string {
+  return buildRequiredEvidenceSetRevision(resolveRequiredEvidenceKinds(gates));
+}
+
 /** Review-family policy slice → policy_hash (effective review_policy acceptance fields). */
 export function buildReviewPolicyHash(policy: {
   block_threshold: string;
@@ -406,16 +438,25 @@ export function parseEvidenceSubjectDetailed(
       reason: "candidate_sha must be a full 40-char hex SHA",
     };
   }
+  // v1 requires the nullable `diff_hash` key to be an own property: explicit
+  // `null` when unavailable. Omission is malformed (not silently null).
+  if (!Object.prototype.hasOwnProperty.call(v, "diff_hash")) {
+    return {
+      status: "malformed",
+      reason: "diff_hash required key (hex string or null)",
+    };
+  }
   let diffHash: string | null = null;
-  if (v.diff_hash !== null && v.diff_hash !== undefined) {
-    if (typeof v.diff_hash !== "string") {
-      return { status: "malformed", reason: "diff_hash must be string or null" };
-    }
+  if (v.diff_hash === null) {
+    diffHash = null;
+  } else if (typeof v.diff_hash === "string") {
     const d = v.diff_hash.trim().toLowerCase();
     if (!d || !HEX_DIGEST_RE.test(d)) {
       return { status: "malformed", reason: "diff_hash must be hex or null" };
     }
     diffHash = d;
+  } else {
+    return { status: "malformed", reason: "diff_hash must be string or null" };
   }
   const policyHash = normalizeDigest(
     typeof v.policy_hash === "string" ? v.policy_hash : null,
@@ -635,15 +676,13 @@ export interface DiagnosticArtifactInput {
 
 /**
  * Build per-artifact subject diagnostics against an evaluation pin.
- * When `pin` is null, well-formed subjects are still validated but cannot match
- * a pin — they report `malformed` only when the subject itself is bad; when the
- * subject is well-formed and pin is missing, outcome is `legacy_unbound` for
- * absent subjects and `mismatch` is not invented. For present well-formed
- * subjects with no pin, outcome is `malformed` is wrong — we use comparison
- * with pin=null → pin absent yields `malformed` on the pin side.
  *
- * Prefer always supplying a pin derived from authoritative runtime state or
- * from the best-known subject on the run (see {@link selectEvaluationPinSubject}).
+ * The pin MUST come from authoritative runtime state (live candidate / injected
+ * evaluation pin). Never invent a pin from the artifacts under comparison — that
+ * labels stale co-set evidence as `match`. When `pin` is null, present
+ * well-formed subjects are pin-unavailable: outcome is never `match` (compare
+ * against a missing pin returns `malformed` on the pin side). Absent artifact
+ * subjects remain `legacy_unbound`; malformed artifact subjects stay `malformed`.
  */
 export function buildEvidenceSubjectDiagnostics(
   pin: EvidenceSubjectV1 | null,
@@ -674,16 +713,7 @@ export function buildEvidenceSubjectDiagnostics(
     }
     if (pin === null) {
       // Present well-formed subject but no evaluation pin: cannot claim match.
-      // Surface as mismatch on all dimensions vs an empty comparison is wrong;
-      // report malformed pin side as outcome mismatch with empty fields is also
-      // wrong. Documented rule: without a pin, label as mismatch with empty
-      // fields is insufficient. Use outcome "malformed" only for bad subjects.
-      // Spec wants diagnostics vs pin — pin missing means we still echo the
-      // artifact subject and set outcome to "legacy_unbound" is incorrect.
-      // Practical rule: treat as mismatch with mismatched_fields listing that
-      // comparison was pin-unavailable — but that invents a field. Instead:
-      // outcome remains structural validity only via compare with pin absent →
-      // compareEvidenceSubjects returns malformed when pin absent.
+      // compareEvidenceSubjects returns malformed when pin is absent.
       const cmp = compareEvidenceSubjects(parsed.subject, null);
       out.push({
         kind: art.kind,
@@ -710,9 +740,11 @@ export function buildEvidenceSubjectDiagnostics(
 }
 
 /**
- * Prefer the last well-formed subject among readiness artifacts as the
- * best-known evaluation pin when an explicit pin was not supplied.
- * Never invents a subject from free text.
+ * Best-effort parse helper: last well-formed subject among readiness artifacts.
+ *
+ * NOT an authoritative evaluation pin. Finalization and readiness consumers
+ * MUST inject a runtime pin; do not use this to certify currency of the same
+ * artifact set (that would label stale co-set evidence as `match`).
  */
 export function selectEvaluationPinSubject(
   artifacts: readonly DiagnosticArtifactInput[],

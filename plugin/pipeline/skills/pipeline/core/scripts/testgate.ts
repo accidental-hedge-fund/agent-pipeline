@@ -50,7 +50,7 @@ import {
 } from "./tester-evidence.ts";
 import {
   buildEngineFingerprint,
-  buildRequiredEvidenceSetRevision,
+  buildRequiredEvidenceSetRevisionFromGates,
   verifierFingerprintFromEngine,
 } from "./evidence-subject.ts";
 import { resolvePinnedEngineIdentity } from "./engine-identity.ts";
@@ -328,7 +328,12 @@ export async function runTestGate(
         verifierFingerprint: engineFp
           ? verifierFingerprintFromEngine(engineFp)
           : undefined,
-        requiredEvidenceSetRevision: buildRequiredEvidenceSetRevision(),
+        requiredEvidenceSetRevision: buildRequiredEvidenceSetRevisionFromGates({
+          testGateEnabled: cfg.test_gate?.enabled,
+          evalGateEnabled: cfg.eval_gate?.enabled,
+          visualGateEnabled: cfg.visual_gate?.enabled,
+          shipcheckGateEnabled: cfg.shipcheck_gate?.enabled,
+        }),
       });
       await writeTesterEvidence(runDir, evidence, {
         maxArtifactChars,

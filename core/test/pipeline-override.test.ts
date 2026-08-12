@@ -95,7 +95,13 @@ const CFG = {
   marker_footer: "*Automated by Claude Code Pipeline Skill*",
   // Shipped default policy: high-severity findings block; ceiling cap 3.
   review_policy: { block_threshold: "medium", min_confidence: 0.7, max_adversarial_rounds: 3 },
+  test_gate: { enabled: true },
+  eval_gate: { enabled: false },
+  visual_gate: { enabled: false },
+  shipcheck_gate: { enabled: false },
 } as unknown as PipelineConfig;
+
+const OVERRIDE_RUN_ID = "test/override-review-run";
 
 const BLOCKER_A = { severity: "high", file: "src/a.ts", title: "Null deref in a" };
 const BLOCKER_B = { severity: "high", file: "src/b.ts", title: "Missing auth check in b" };
@@ -259,7 +265,7 @@ test("runOverride (#135): override covering the only blocker auto-resumes and th
   const review = makeReviewDeps(detail, [BLOCKER_A]);
   let outcome: Outcome | undefined;
   const { deps, rec } = makeOverrideDeps(detail, async () => {
-    outcome = await advanceReview(CFG, 7, 2, {}, 0, review.deps);
+    outcome = await advanceReview(CFG, 7, 2, { pipelineRunId: OVERRIDE_RUN_ID }, 0, review.deps);
   });
 
   const logged = await quiet(t, async () => {
@@ -307,7 +313,7 @@ test("runOverride (#135, #797): override covering only one of two blockers route
   const review = makeReviewDeps(detail, [BLOCKER_A, BLOCKER_B]);
   let outcome: Outcome | undefined;
   const { deps, rec } = makeOverrideDeps(detail, async () => {
-    outcome = await advanceReview(CFG, 7, 2, {}, 0, review.deps);
+    outcome = await advanceReview(CFG, 7, 2, { pipelineRunId: OVERRIDE_RUN_ID }, 0, review.deps);
   });
 
   await quiet(t, async () => {

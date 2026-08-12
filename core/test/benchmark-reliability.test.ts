@@ -53,7 +53,9 @@ const cfg = {
     surface_recurrence_rounds: 3,
   },
   steps: { plan_review: true, standard_review: true, adversarial_review: true, docs: true },
+  test_gate: { enabled: true },
   eval_gate: { enabled: false, mode: "gate", timeout: 300, max_attempts: 2 },
+  visual_gate: { enabled: false },
   shipcheck_gate: { enabled: false, mode: "advisory", max_rounds: 1, rubric_path: "", block_on_partial: false },
   trusted_override_actors: [],
   implementation_ready_message: "",
@@ -64,6 +66,8 @@ const cfg = {
   openspec: { enabled: "off", bootstrap: false },
   last30days: { enabled: false, timeout: 600 },
 } as unknown as PipelineConfig;
+
+const BENCH_RUN_ID = "test/bench-review-run";
 
 // A well-formed 40-char hex SHA used for PR head refs.
 const FAKE_SHA = "a".repeat(40);
@@ -348,7 +352,7 @@ describe("benchmark-reliability-suite", () => {
     const deps = makeBaseReviewDeps(counter);
 
     const stageStart = performance.now();
-    const outcome = await advanceReview(cfg, 42, 1, {}, 0, deps);
+    const outcome = await advanceReview(cfg, 42, 1, { pipelineRunId: BENCH_RUN_ID }, 0, deps);
     const stageDuration = performance.now() - stageStart;
 
     const result: BenchmarkResult = {
@@ -534,7 +538,7 @@ describe("benchmark-reliability-suite", () => {
       },
     };
 
-    const outcome = await advanceReview(cfg, 42, 1, {}, 0, deps);
+    const outcome = await advanceReview(cfg, 42, 1, { pipelineRunId: BENCH_RUN_ID }, 0, deps);
 
     // Stage must transition to blocked — not advance, not throw.
     assert.equal(outcome.advanced, false, "stage must NOT advance on harness timeout");
@@ -582,7 +586,7 @@ describe("benchmark-reliability-suite", () => {
       },
     };
 
-    const outcome = await advanceReview(cfg, 42, 1, {}, 0, deps);
+    const outcome = await advanceReview(cfg, 42, 1, { pipelineRunId: BENCH_RUN_ID }, 0, deps);
 
     // Transition must have been attempted (the stage reached the label-apply step).
     assert.ok(transitionAttempted, "transition must have been attempted before failing");
@@ -657,7 +661,7 @@ describe("benchmark-reliability-suite", () => {
       },
     };
 
-    const outcome = await advanceReview(cfg, 42, 1, {}, 0, deps);
+    const outcome = await advanceReview(cfg, 42, 1, { pipelineRunId: BENCH_RUN_ID }, 0, deps);
 
     assert.ok(transitionAttempted, "transition must have been attempted before failing");
     assert.equal(outcome.advanced, false, "stage must NOT advance when transition throws on non-approve path");
