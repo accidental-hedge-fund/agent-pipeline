@@ -2,7 +2,7 @@
 name: pipeline-supervisor
 description: >
   Thin Hermes skill for the private pipeline-factory Buzz channel.
-  Maps operator messages to the agent-pipeline CLI (ship / train / single / status).
+  Maps operator messages to the agent-pipeline CLI and Option 1 Tugboat ship.
   Does not use the removed hermes-factory grant wrapper.
 ---
 
@@ -11,22 +11,24 @@ description: >
 Use this skill only in the private **pipeline-factory** Buzz channel, via
 `/pipeline-supervisor` (or your host’s equivalent skill invocation).
 
-Read the contract: [docs/supervisor.md](../../../docs/supervisor.md).
+Read the contract: [docs/supervisor.md](../../../docs/supervisor.md).  
+Ship runbook: [docs/runbooks/ship-milestone.md](../../../docs/runbooks/ship-milestone.md).
 
 ## Absolute rules
 
-1. Call only the installed **pipeline** CLI (or `run-intent.sh`). Never call
-   `~/.local/lib/hermes-factory/factory.mjs` — that pilot is retired.
+1. Call only the installed **pipeline** CLI, `run-intent.sh`, or **Tugboat**
+   for ship. Never call `~/.local/lib/hermes-factory/factory.mjs` — that pilot
+   is retired. Never invent a grant factory or second ship brain.
 2. Do **not** invent models, effort, stage labels, or a second state machine.
 3. Do **not** default to merge. Only pass merge when the operator is explicit
    **and** `ALLOW_MERGE=1` is set in the host environment.
-4. Prefer **non-blocking** long runs: start train in the background and report
-   the command line + how to check status. Do not block the chat tool for hours.
+4. Prefer **non-blocking** long runs: detach ship / train and report how to
+   check status. Do not block the chat tool for hours.
 5. Never paste secrets, credential paths’ contents, or full harness logs into Buzz.
-6. For `ship`, pass only the absolute authorization file created by the
-   authenticated command-admission path. Never synthesize or edit authorization.
+6. Option 1 ship does **not** require a signed authorization file. Do not block
+   on ship-auth issuer tooling for `Ship milestone vX.Y.Z`.
 7. Do not discover “latest” event directories. Observe only an exact event path
-   returned by Pipeline status.
+   returned by Pipeline status when using stage-watch.
 
 ## Environment (host)
 
@@ -34,11 +36,12 @@ Expect these on the Hermes process PATH / env (set by the deployment profile):
 
 | Variable | Purpose |
 |---|---|
-| `REPO_DIR` | Target checkout (e.g. factory control clone) |
-| `PIPELINE` | Absolute launcher, e.g. `node …/pipeline.mjs` |
-| `ALLOW_MERGE` | `1` only if this channel may run `train --merge` / `release finish` |
+| `REPO_DIR` | Target checkout (e.g. factory control clone) — **required for ship** |
+| `PIPELINE` | Absolute launcher, e.g. `node …/pipeline.mjs` — **required** |
+| `ALLOW_MERGE` | `1` only if this channel may run `train --merge` / release finish — **required for ship** |
 | `AGENT_PIPELINE_ROOT` | Clone of agent-pipeline containing `examples/supervisor/shell/` |
 | `PIPELINE_MATERIAL_FILTER` | Installed `material-filter.mjs` used for exact-run progress |
+| `ENGINE_PROMOTE_HOST` | Optional; default `all` (do not force codex-only) |
 
 ## Commands
 
@@ -74,29 +77,36 @@ export REPO_DIR PIPELINE ALLOW_MERGE
 
 For long trains, wrap with `nohup` / systemd-run and post the log path.
 
-### Ship milestone
+### Ship milestone (Option 1 — Tugboat primary)
 
-The authenticated ingress must first validate the signed Buzz command and
-materialize its immutable, expiring authorization as an absolute file. Then
-submit exactly one Pipeline-owned ship operation:
+Operator phrase: **`Ship milestone vX.Y.Z`** (case-insensitive variants OK).
+
+Map to **Tugboat only** — not `pipeline-ship-playbook` as primary, not
+`ship-milestone.sh` / authorized `pipeline ship` as the Option 1 default.
 
 ```bash
 export REPO_DIR PIPELINE ALLOW_MERGE
-"$AGENT_PIPELINE_ROOT/examples/supervisor/shell/ship-milestone.sh" \
-  --milestone vX.Y.Z \
-  --for X.Y.Z \
-  --authorization "$VALIDATED_AUTHORIZATION_FILE" \
-  --detach
-"$AGENT_PIPELINE_ROOT/examples/supervisor/shell/ship-milestone.sh" \
-  --milestone vX.Y.Z --for X.Y.Z --status
+# Prefer installed binary (refresh from repo examples after engine promote):
+tugboat --milestone vX.Y.Z --detach
+# Or versioned source:
+# "$AGENT_PIPELINE_ROOT/examples/supervisor/shell/tugboat.sh" --milestone vX.Y.Z --detach
 ```
 
-Runbook: [docs/runbooks/ship-milestone.md](../../../docs/runbooks/ship-milestone.md).  
-Pipeline owns train, recovery, FRG, release, publication verification, and
-engine promotion. Hermes does not parse a release PR, poll releases, or decide
-how to resume.
+Status (no side effect — does not start train/release/promote):
 
-### Release (manual steps after train / FRG)
+```bash
+tugboat --milestone vX.Y.Z --status
+# or: cat "$HOME/.local/state/pipeline-supervisor/ship-vX.Y.Z/state.json"
+```
+
+State/logs: `~/.local/state/pipeline-supervisor/ship-vX.Y.Z/`.
+
+Tugboat composes: train → release (bare version) → wait CI green → release
+finish → wait GitHub Release → `engine-promote --host all`. Failure lines
+include phase reason (blocker / err tail). Do not reimplement those phases in
+Hermes.
+
+### Release (manual steps — rarely needed when Tugboat runs)
 
 ```bash
 # Prepare only (opens PR; never merges)
@@ -105,9 +115,9 @@ how to resume.
 # Finish: merge the open release PR (never tags — GitHub workflows tag)
 "$PIPELINE" release finish <pr> --json
 
-# After the published GitHub Release exists: pin + install on this host
+# After the published GitHub Release exists: pin + install (all hosts default)
 cd "$REPO_DIR"
-"$PIPELINE" engine-promote --for <X.Y.Z> --host codex --json
+"$PIPELINE" engine-promote --for <X.Y.Z> --host all --json
 ```
 
 ### Exact-run material posts
@@ -130,15 +140,16 @@ report typed status and do not guess one.
 | `train milestone vX.Y.Z` | `run-intent.sh 'train milestone vX.Y.Z'` |
 | `train issues 1 2 3` | `run-intent.sh 'train issues 1,2,3'` |
 | same + `and merge` | only if `ALLOW_MERGE=1` |
-| `ship milestone vX.Y.Z` | validate the signed command, then `ship-milestone.sh --milestone vX.Y.Z --authorization <absolute-file> --detach` if `ALLOW_MERGE=1` |
-| `ship status vX.Y.Z` | `ship-milestone.sh --milestone vX.Y.Z --status` |
+| `Ship milestone vX.Y.Z` / `ship milestone vX.Y.Z` | **Tugboat** `--milestone vX.Y.Z --detach` if `ALLOW_MERGE=1` (Option 1 primary) |
+| `ship status vX.Y.Z` / `Ship status vX.Y.Z` | **Tugboat** `--milestone vX.Y.Z --status` (state only) |
 | `release prepare 1.34.0` | `pipeline release 1.34.0 --no-edit` |
 | `release finish 123` | `pipeline release finish 123` if `ALLOW_MERGE=1` |
-| `stop` | stop the named `pipeline-ship-…` user-systemd unit; do not invent rollback |
+| `stop` | stop the detached tugboat/ship process for that milestone if known; do not invent rollback |
+
 ## What this skill is not
 
 - Not the removed grant-envelope factory under `ops/hermes-factory`
-- Not authorization by itself — Pipeline must validate the exact bounded
-  authorization; ambient `gh` access alone is not approval
 - Not a durable outer ledger — GitHub + pipeline run state are truth
-- Not a lifecycle controller — `pipeline ship` owns every ship transition
+- Not Option 2 in-engine `pipeline ship` as the Buzz primary path (parked)
+- Not MessagingPort / ship-auth issuer product work (#966–#968, #973)
+- Not a second merge policy — only `ALLOW_MERGE=1` + Pipeline CLI verbs

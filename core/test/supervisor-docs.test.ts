@@ -46,9 +46,11 @@ test("supervisor examples exist and stay thin", () => {
     "examples/supervisor/README.md",
     "examples/supervisor/shell/run-intent.sh",
     "examples/supervisor/shell/ship-stage-watch.sh",
+    "examples/supervisor/shell/tugboat.sh",
     "examples/supervisor/shell/ship-milestone.sh",
     "examples/supervisor/shell/pipeline-ship-playbook.sh",
     "examples/supervisor/shell/train-status-complete.py",
+    "examples/supervisor/shell/release-checks-green.py",
     "examples/supervisor/hermes/SKILL.md",
     "examples/supervisor/openclaw/SKILL.md",
     "examples/supervisor/slack/README.md",
@@ -63,6 +65,9 @@ test("supervisor examples exist and stay thin", () => {
   assert.doesNotMatch(shell, /ops\/hermes-factory|grant_fingerprint|auto_merge/);
   const hermes = read("examples/supervisor/hermes/SKILL.md");
   assert.match(hermes, /does not implement a second state machine|Not the removed/i);
+  // Option 1 (#927 / #1001): Ship milestone maps to Tugboat, not playbook-as-primary.
+  assert.match(hermes, /tugboat/i);
+  assert.match(hermes, /Ship milestone vX\.Y\.Z/i);
   const stageWatch = read("examples/supervisor/shell/ship-stage-watch.sh");
   assert.match(stageWatch, /--events-file/);
   assert.match(stageWatch, /PIPELINE_MATERIAL_FILTER/);
@@ -74,4 +79,9 @@ test("supervisor examples exist and stay thin", () => {
   const shipDoc = read("docs/runbooks/ship-milestone.md");
   assert.match(shipDoc, /exact.*events\.jsonl|events\.jsonl.*exact/i);
   assert.match(shipDoc, /material-filter\.mjs/);
+  assert.match(shipDoc, /tugboat\.sh|Option 1/i);
+  assert.match(shipDoc, /Alternate|legacy|non-primary/i);
+  const readme = read("examples/supervisor/README.md");
+  assert.match(readme, /tugboat\.sh/);
+  assert.match(readme, /Option 1 primary|primary ship composer/i);
 });

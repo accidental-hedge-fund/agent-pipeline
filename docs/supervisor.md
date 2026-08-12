@@ -228,28 +228,40 @@ Does **not** create git tags or GitHub Releases. Existing `auto-tag-release` and
 Host runbook: [runbooks/hermes-supervisor-deployment.md](./runbooks/hermes-supervisor-deployment.md).  
 Skill template: [examples/supervisor/hermes/SKILL.md](../examples/supervisor/hermes/SKILL.md).
 
-## Ship milestone (thin host adapter)
+## Ship milestone (Option 1 — Tugboat)
 
-Use the shell examples to submit and observe the Pipeline-owned coordinator.
-Do not implement the ship lifecycle in an outer shell or chat agent:
+**Primary agent-box / Buzz path:** thin host composer
+`examples/supervisor/shell/tugboat.sh` sequences existing Pipeline CLI verbs
+(train → release → wait CI → release finish → wait Release → engine-promote)
+plus notify. Operator phrase: `Ship milestone vX.Y.Z`. Status:
+`tugboat --milestone vX.Y.Z --status` or
+`~/.local/state/pipeline-supervisor/ship-vX.Y.Z/`.
 
 | Script | Role |
 |---|---|
-| `examples/supervisor/shell/ship-milestone.sh` | Authorized `pipeline ship` request/status adapter; systemd detach |
+| `examples/supervisor/shell/tugboat.sh` | **Option 1 primary** thin ship composer; detach + status |
 | `examples/supervisor/shell/ship-notify.sh` | Optional messenger posts; no-op without Buzz env |
-| `examples/supervisor/shell/ship-stage-watch.sh` | One exact event file through installed `material-filter.mjs` |
+| `examples/supervisor/shell/ship-stage-watch.sh` | Optional per-issue posts during train; shared install with Tugboat |
+| `examples/supervisor/shell/train-status-complete.py` | Train complete gate helper |
+| `examples/supervisor/shell/release-checks-green.py` | Release PR checks green helper (`bucket` schema) |
+| `examples/supervisor/shell/pipeline-ship-playbook.sh` | **Alternate / legacy** chain playbook (not primary Buzz path) |
+| `examples/supervisor/shell/ship-milestone.sh` | **Non-primary** authorized adapter for in-engine `pipeline ship` |
+
+Required env for mutating ship: `REPO_DIR`, `PIPELINE`, `ALLOW_MERGE=1`.  
+Promote defaults to all hosts (`ENGINE_PROMOTE_HOST` default `all`).
 
 Runbooks: [runbooks/ship-milestone.md](./runbooks/ship-milestone.md),  
 [runbooks/frg-pack-checklist.md](./runbooks/frg-pack-checklist.md).
 
-`pipeline ship` owns train, bounded recovery, candidate-bound FRG validation,
-release, publication verification, and engine promotion. It fails closed when
-the existing fixed-pack tooling has not produced candidate-bound evidence. Its typed status and GitHub state are
-authoritative. The host owns authenticated admission and process supervision.
+Pipeline CLI owns train/merge/release/promote policy. Tugboat does not add a
+grant factory, second merge policy, or `pipeline ship` product stage. Doctor:
+`supervisor:tugboat-install-parity` (installed Tugboat + CI/train helpers match
+repo example content) and
+`supervisor:ship-playbook-promote-host` (legacy playbook promote default).
 
-**Notify policy:** observe only an exact `events_file` returned by Pipeline.
-Pass it through `material-filter.mjs`; never search host-global run stores.
-Notification failures are observational and cannot alter the ship.
+**Notify policy:** observational only; notification failures must not alter ship
+phase decisions. Prefer shared `ship-notify.sh` / `ship-stage-watch.sh` siblings
+— one install set, not dual divergent binaries.
 
 Historical context for the v1.33 ship and v1.34 notifier-attribution incident:
 [runbooks/session-2026-08-ship-factory-lessons.md](./runbooks/session-2026-08-ship-factory-lessons.md).

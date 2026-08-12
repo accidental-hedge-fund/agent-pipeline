@@ -47,6 +47,12 @@ import {
   defaultInstalledShipPlaybookPath,
   evaluateInstalledShipPlaybookPromoteHost,
 } from "../ship-playbook-promote-host.ts";
+import {
+  canonicalOption1PackPaths,
+  defaultInstalledOption1PackPaths,
+  evaluateOption1PackParity,
+  type Option1PackBodies,
+} from "../tugboat-install-parity.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -1092,6 +1098,53 @@ export function buildPreflightChecks(
       const verdict = evaluateInstalledShipPlaybookPromoteHost(body, {
         pathLabel: playbookPath,
         enginePromoteHostEnv: process.env.ENGINE_PROMOTE_HOST,
+      });
+      if (verdict.status === "pass") return pass(verdict.detail);
+      if (verdict.status === "skip") return skip(verdict.detail);
+      return fail(verdict.detail, verdict.remediation);
+    },
+  });
+
+  // 14. Installed Option 1 pack content parity (#927) — compare ~/.local/bin
+  //     tugboat + critical CI/train helpers against repo examples by content
+  //     digest. Marker-only forks that keep recognizer strings while changing
+  //     promote/CI-wait behavior, or a stale release-checks-green.py, fail
+  //     closed with refresh remediation. Absence of tugboat is skip.
+  checks.push({
+    id: "supervisor:tugboat-install-parity",
+    description:
+      "Installed Option 1 pack (if present) matches repo Tugboat + CI/train helpers by content",
+    run: async (deps) => {
+      const installedPaths = defaultInstalledOption1PackPaths();
+      const tugboatPath = installedPaths.tugboat;
+      if (!(await deps.fsExists(tugboatPath))) {
+        return skip(`no installed Option 1 Tugboat at ${tugboatPath}`);
+      }
+      const canonPaths = canonicalOption1PackPaths(root);
+      const readBody = async (p: string): Promise<string | null> => {
+        if (!(await deps.fsExists(p))) return null;
+        return deps.readTextFile(p);
+      };
+      const installed: Option1PackBodies = {
+        tugboat: await deps.readTextFile(tugboatPath),
+        "release-checks-green.py": await readBody(
+          installedPaths["release-checks-green.py"],
+        ),
+        "train-status-complete.py": await readBody(
+          installedPaths["train-status-complete.py"],
+        ),
+      };
+      const canonical: Option1PackBodies = {
+        tugboat: await readBody(canonPaths.tugboat),
+        "release-checks-green.py": await readBody(
+          canonPaths["release-checks-green.py"],
+        ),
+        "train-status-complete.py": await readBody(
+          canonPaths["train-status-complete.py"],
+        ),
+      };
+      const verdict = evaluateOption1PackParity(installed, canonical, {
+        pathLabel: tugboatPath,
       });
       if (verdict.status === "pass") return pass(verdict.detail);
       if (verdict.status === "skip") return skip(verdict.detail);
