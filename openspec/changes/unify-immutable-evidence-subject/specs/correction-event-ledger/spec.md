@@ -44,5 +44,20 @@ When `reviewed_sha` and `head_sha` are present as strings, and `evidence_subject
 
 - **WHEN** a consumer reads a pre-migration `correction_event` that has `reviewed_sha` / `head_sha` but no `evidence_subject` key
 - **THEN** subject comparison SHALL return `legacy_unbound`
-- **AND** the consumer MAY still apply existing reviewed_sha vs head staleness rules
 - **AND** SHALL NOT claim a full subject match
+
+#### Scenario: legacy_unbound with evaluation pin is non-current for readiness
+
+- **WHEN** a consumer classifies a pre-migration `correction_event` that omits `evidence_subject`
+- **AND** a well-formed evaluation pin subject is available
+- **THEN** the consumer SHALL treat the event as non-current for readiness composition
+- **AND** SHALL label the outcome `legacy_unbound`
+- **AND** SHALL NOT certify currency from `reviewed_sha` matching the pin candidate alone
+
+#### Scenario: legacy SHA-only fallback when pin unavailable
+
+- **WHEN** a consumer classifies a pre-migration `correction_event` that omits `evidence_subject`
+- **AND** no evaluation pin subject is available
+- **THEN** the consumer MAY apply reviewed_sha vs candidate SHA staleness rules for non-readiness lineage
+- **AND** SHALL still label the outcome `legacy_unbound`
+- **AND** SHALL NOT claim a full multi-dimension subject match

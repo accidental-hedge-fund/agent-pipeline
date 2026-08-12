@@ -627,6 +627,7 @@ test("classifyCorrectionEventCurrency: subject candidate mismatch is stale", () 
 });
 
 test("classifyCorrectionEventCurrency: historical event without subject is legacy_unbound", () => {
+  // Pin unavailable: SHA-only lineage fallback may report non-stale.
   const result = classifyCorrectionEventCurrency(
     {
       reviewed_sha: CORR_SHA,
@@ -637,6 +638,21 @@ test("classifyCorrectionEventCurrency: historical event without subject is legac
   );
   assert.equal(result.subject_outcome, "legacy_unbound");
   assert.equal(result.stale, false);
+});
+
+test("classifyCorrectionEventCurrency: legacy_unbound with evaluation pin is non-current even on SHA match — regression for #692 b0373000", () => {
+  // Full pin available: SHA-only match must not certify readiness currency.
+  const result = classifyCorrectionEventCurrency(
+    {
+      reviewed_sha: CORR_SHA,
+      head_sha: CORR_SHA,
+      run_id: BASE_PAYLOAD.run_id,
+    },
+    { candidateSha: CORR_SHA, evaluationPin: CORR_SUBJECT },
+  );
+  assert.equal(result.subject_outcome, "legacy_unbound");
+  assert.equal(result.stale, true);
+  assert.notEqual(result.subject_outcome, "match");
 });
 
 test("classifyCorrectionEventCurrency: explicit null is quarantined not legacy_unbound — regression for #692 review-2 513f6d02", () => {

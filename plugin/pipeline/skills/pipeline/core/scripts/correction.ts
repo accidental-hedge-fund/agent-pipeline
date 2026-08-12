@@ -351,9 +351,16 @@ function resolveCorrectionEvidenceSubject(
 /**
  * Classify correction_event currency against a live evaluation pin / head.
  *
- * Prefers evidence_subject comparison when present (#692). Falls back to
- * reviewed_sha vs head string compare only for historical events that omit
- * the field (`legacy_unbound`) — never a full multi-dimension subject match.
+ * Prefers evidence_subject comparison when present (#692). Historical events
+ * that omit the field are always labeled `legacy_unbound` — never a full
+ * multi-dimension subject match.
+ *
+ * When a well-formed evaluation pin is available, historical omission is
+ * non-current for readiness composition even if `reviewed_sha` equals the pin
+ * candidate: SHA-only match must not certify multi-dimension currency
+ * (#692 pre-merge delta b0373000). The reviewed_sha vs candidate SHA fallback
+ * applies only when no evaluation pin is supplied (non-readiness / transitional
+ * lineage use).
  *
  * Explicit `evidence_subject: null` (current-schema producer unbound) is
  * quarantined as `malformed` and does NOT receive the legacy SHA fallback —
@@ -455,7 +462,18 @@ export function classifyCorrectionEventCurrency(
     };
   }
 
-  // Historical omission only: reviewed_sha vs head under legacy_unbound.
+  // Historical omission only (`legacy_unbound`). With an evaluation pin, do
+  // not certify readiness currency from reviewed_sha alone — multi-dimension
+  // identity is unavailable without a bound subject (#692 b0373000).
+  if (pin) {
+    return {
+      stale: true,
+      subject_outcome: "legacy_unbound",
+      mismatched_fields: [],
+    };
+  }
+
+  // Pin unavailable: SHA-only lineage fallback for non-readiness use.
   const reviewed = event.reviewed_sha;
   const live = opts.candidateSha;
   const stale = reviewed != null && reviewed !== live;
