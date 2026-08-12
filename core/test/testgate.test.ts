@@ -1589,6 +1589,70 @@ test("gate (#873): scratch-only .pipeline-prompt-* pre-dirty allows the test com
   assert.equal(ran, 1);
 });
 
+test("gate (#1013): challenge-response-only pre-dirty allows the test command to run", async () => {
+  // Dogfood on #1010: design-gate dump left as untracked artifacts/challenge-
+  // response-N.json must not hard-block or burn budget as test-gate-exhausted.
+  let ran = 0;
+  const out = await runTestGate(cfgWith({}), 1013, "/wt", {
+    detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+    runTests: async () => {
+      ran++;
+      return passResult;
+    },
+    gitDirty: async () => true,
+    gitStatusPorcelain: async () => "?? artifacts/challenge-response-1010.json\n",
+  });
+  assert.equal(out.passed, true, `expected pass, got: ${JSON.stringify(out)}`);
+  assert.equal(ran, 1, "test command must run when only challenge-response scratch is dirty");
+  assert.equal(out.dirtyWorktree, undefined);
+  assert.ok(!out.blockReason, "challenge-response-only dirt must not mint a blockReason");
+  // Product-dirt pre-run blocks set dirtyWorktree + attempts:0 and never run the
+  // command. A clean pass with the command invoked proves no product-dirt hold
+  // and no test-gate-exhausted path for this scratch alone.
+  assert.equal(out.dirtyWorktree, undefined);
+  assert.equal(out.toolingFailure, undefined);
+  assert.equal(out.buildFailure, undefined);
+});
+
+test("gate (#1013): challenge-response + product pre-dirty still blocks on product", async () => {
+  let ran = 0;
+  const out = await runTestGate(cfgWith({}), 1013, "/wt", {
+    detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+    runTests: async () => {
+      ran++;
+      return passResult;
+    },
+    gitDirty: async () => true,
+    gitStatusPorcelain: async () =>
+      "?? artifacts/challenge-response-1010.json\n M core/scripts/foo.ts\n",
+  });
+  assert.equal(out.passed, false);
+  assert.equal(out.attempts, 0);
+  assert.equal(ran, 0);
+  assert.equal(out.dirtyWorktree, true);
+  assert.match(out.blockReason ?? "", /core\/scripts\/foo\.ts/);
+  assert.doesNotMatch(out.blockReason ?? "", /challenge-response/);
+});
+
+test("gate (#1013): non-matching artifacts/ path still hard-blocks pre-run", async () => {
+  // Proves no blanket artifacts/** waiver.
+  let ran = 0;
+  const out = await runTestGate(cfgWith({}), 1013, "/wt", {
+    detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+    runTests: async () => {
+      ran++;
+      return passResult;
+    },
+    gitDirty: async () => true,
+    gitStatusPorcelain: async () => "?? artifacts/other-notes.md\n",
+  });
+  assert.equal(out.passed, false);
+  assert.equal(out.attempts, 0);
+  assert.equal(ran, 0);
+  assert.equal(out.dirtyWorktree, true);
+  assert.match(out.blockReason ?? "", /artifacts\/other-notes\.md/);
+});
+
 test("gate (#873, bites without exemption): product path still hard-blocks pre-run", async () => {
   // Proves classification is load-bearing: a product path (not scratch) with the
   // same dirty/porcelain seams blocks. Without product-vs-scratch filtering,

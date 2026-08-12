@@ -219,6 +219,10 @@ test("formatProductDirtDisclosure: empty → empty string; non-empty lists paths
 test("ENGINE_NON_PRODUCT_SCRATCH_GLOBS documents required engine set", () => {
   assert.ok(ENGINE_NON_PRODUCT_SCRATCH_GLOBS.includes("tasks/**"));
   assert.ok(ENGINE_NON_PRODUCT_SCRATCH_GLOBS.includes(".pipeline-prompt-*"));
+  assert.ok(
+    ENGINE_NON_PRODUCT_SCRATCH_GLOBS.includes("artifacts/challenge-response-*.json"),
+    "engine set must include challenge-response dumps (#1013)",
+  );
 });
 
 test("matchScratchGlob: prefix and star patterns", () => {
@@ -228,4 +232,76 @@ test("matchScratchGlob: prefix and star patterns", () => {
   assert.equal(matchScratchGlob("a/b", "a/*"), true);
   assert.equal(matchScratchGlob("a/b/c", "a/*"), false);
   assert.equal(matchScratchGlob("vendor/cache/x", "vendor/**"), true);
+});
+
+// ---------------------------------------------------------------------------
+// #1013: challenge-response dumps are engine-known non-product scratch
+// ---------------------------------------------------------------------------
+
+test("classifier (#1013): challenge-response-only porcelain is scratch", () => {
+  const paths = ["artifacts/challenge-response-1010.json"];
+  const c = classifyWorktreeDirt(paths);
+  assert.deepEqual(c.product, []);
+  assert.deepEqual(c.scratch, paths);
+  assert.deepEqual(productDirtyPaths(paths), []);
+  assert.equal(isNonProductScratchPath("artifacts/challenge-response-1010.json"), true);
+  assert.equal(isNonProductScratchPath("artifacts/challenge-response-42.json"), true);
+});
+
+test("classifier (#1013): challenge-response + product still product-blocks", () => {
+  const c = classifyWorktreeDirt([
+    "artifacts/challenge-response-1010.json",
+    "core/scripts/foo.ts",
+  ]);
+  assert.deepEqual(c.product, ["core/scripts/foo.ts"]);
+  assert.deepEqual(c.scratch, ["artifacts/challenge-response-1010.json"]);
+  assert.deepEqual(
+    productDirtyPaths([
+      "artifacts/challenge-response-1010.json",
+      "core/scripts/foo.ts",
+    ]),
+    ["core/scripts/foo.ts"],
+  );
+});
+
+test("classifier (#1013): non-matching artifacts/ path remains product dirt", () => {
+  // Narrow glob only — no blanket artifacts/** waiver.
+  assert.equal(isNonProductScratchPath("artifacts/other-notes.md"), false);
+  assert.equal(isNonProductScratchPath("artifacts/reports/pipeline-1.html"), false);
+  assert.equal(
+    isNonProductScratchPath("artifacts/nested/challenge-response-1.json"),
+    false,
+    "nested under artifacts/ must not match the single-segment engine glob",
+  );
+  assert.deepEqual(productDirtyPaths(["artifacts/other-notes.md"]), [
+    "artifacts/other-notes.md",
+  ]);
+});
+
+test("classifier (#1013, bites without new engine glob): legacy patterns alone do not match challenge-response", () => {
+  // Without artifacts/challenge-response-*.json in the engine set, this path
+  // would be product dirt. Legacy globs alone must not match it.
+  const path = "artifacts/challenge-response-1010.json";
+  assert.equal(matchScratchGlob(path, "tasks/**"), false);
+  assert.equal(matchScratchGlob(path, ".pipeline-prompt-*"), false);
+  assert.equal(
+    matchScratchGlob(path, "artifacts/challenge-response-*.json"),
+    true,
+    "new engine glob must match the observed dump path",
+  );
+  // Engine set is load-bearing: path is scratch only because of the new glob.
+  assert.ok(
+    ENGINE_NON_PRODUCT_SCRATCH_GLOBS.includes("artifacts/challenge-response-*.json"),
+  );
+  assert.equal(isNonProductScratchPath(path), true);
+});
+
+test("matchScratchGlob (#1013): challenge-response pattern is narrow", () => {
+  const pat = "artifacts/challenge-response-*.json";
+  assert.equal(matchScratchGlob("artifacts/challenge-response-1010.json", pat), true);
+  assert.equal(matchScratchGlob("artifacts/challenge-response-x.json", pat), true);
+  assert.equal(matchScratchGlob("artifacts/challenge-response.json", pat), false);
+  assert.equal(matchScratchGlob("artifacts/other.json", pat), false);
+  assert.equal(matchScratchGlob("challenge-response-1.json", pat), false);
+  assert.equal(matchScratchGlob("core/scripts/foo.ts", pat), false);
 });

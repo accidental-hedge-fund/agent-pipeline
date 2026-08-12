@@ -1,11 +1,11 @@
-// Product-vs-scratch classification for gate trust checks (#873).
+// Product-vs-scratch classification for gate trust checks (#873 / #1013).
 //
 // Format and test gates require a worktree that is "clean enough" to trust:
 // product-relevant uncommitted paths still hard-block, but engine-known
-// non-product agent scratch (planning notes, ephemeral prompt drop files)
-// must not alone refuse the gate or burn recovery budget as test-gate-
-// exhausted. Lockfiles are intentionally NOT classified as scratch — they
-// remain handled by lockfile fold (#722 / #358).
+// non-product agent scratch (planning notes, ephemeral prompt drop files,
+// challenge-response dumps) must not alone refuse the gate or burn recovery
+// budget as test-gate-exhausted. Lockfiles are intentionally NOT classified
+// as scratch — they remain handled by lockfile fold (#722 / #358).
 
 /**
  * Engine-known non-product scratch patterns (always active; config may only
@@ -15,10 +15,14 @@
  *   (`allowDirtyPattern: /^tasks\//`, #321); includes `tasks/todo.md`.
  * - `.pipeline-prompt-*` at worktree root — ephemeral harness prompt files
  *   (e.g. grok adapter writes `.pipeline-prompt-<uuid>.txt`).
+ * - `artifacts/challenge-response-*.json` — pipeline-owned design-gate /
+ *   review challenge dumps left untracked under `artifacts/` (#1013). Narrow
+ *   basename pattern only; the rest of `artifacts/**` remains product dirt.
  */
 export const ENGINE_NON_PRODUCT_SCRATCH_GLOBS: readonly string[] = [
   "tasks/**",
   ".pipeline-prompt-*",
+  "artifacts/challenge-response-*.json",
 ];
 
 export interface DirtClassification {
@@ -287,6 +291,14 @@ export function matchScratchGlob(filePath: string, pattern: string): boolean {
     // Worktree-root only: no directory separators
     if (path.includes("/")) return false;
     return matchSimpleStar(path, ".pipeline-prompt-*");
+  }
+  if (pat === "artifacts/challenge-response-*.json") {
+    // Worktree-relative under artifacts/ only; single segment basename.
+    // Nested paths (e.g. artifacts/nested/challenge-response-1.json) do not match.
+    if (!path.startsWith("artifacts/")) return false;
+    const rest = path.slice("artifacts/".length);
+    if (rest.includes("/")) return false;
+    return matchSimpleStar(rest, "challenge-response-*.json");
   }
 
   // General: convert glob to regex

@@ -525,9 +525,10 @@ export async function runTestGate(
   };
 
   // Require a worktree free of product-relevant dirt before the first trusted
-  // test run (#873). Non-product scratch (tasks/todo.md, .pipeline-prompt-*,
-  // plus config extensions) alone does not hard-block — product dirt still
-  // fails closed because tested state would diverge from committed state.
+  // test run (#873 / #1013). Non-product scratch (tasks/todo.md,
+  // .pipeline-prompt-*, artifacts/challenge-response-*.json, plus config
+  // extensions) alone does not hard-block — product dirt still fails closed
+  // because tested state would diverge from committed state.
   {
     const pre = await resolveProductDirt();
     if (pre.dirty) {
