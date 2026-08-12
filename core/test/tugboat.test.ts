@@ -159,8 +159,12 @@ test("tugboat supports serial multi-milestone and single-host lock", () => {
   const body = fs.readFileSync(tugboat, "utf8");
   assert.match(body, /--milestones/);
   assert.match(body, /ship_one/);
-<<<<<<< Updated upstream
-  assert.match(body, /lock_dir/);
+  assert.match(body, /try_acquire_ship_lock/);
+  assert.match(body, /ship_already_running/);
+  // Lock before playbook.pid write (no steal race).
+  assert.match(body, /NEVER write playbook\.pid before winning the lock/);
+  assert.match(body, /Do NOT write playbook\.pid here/);
+  assert.match(body, /ignored duplicate detach|already running/);
   // Serial: one ship_one per milestone in order; promote lives inside ship_one.
   assert.match(
     body,
@@ -175,13 +179,6 @@ test("tugboat supports serial multi-milestone and single-host lock", () => {
   assert.doesNotMatch(body, /xargs\s+-P/);
   assert.doesNotMatch(body, /&\s*ship_one\b/);
   assert.doesNotMatch(body, /\bGNU\s+parallel\b|\bparallel\s+--/);
-=======
-  assert.match(body, /try_acquire_ship_lock/);
-  assert.match(body, /ship_already_running/);
-  // Lock before playbook.pid write (no steal race).
-  assert.match(body, /NEVER write playbook\.pid before winning the lock/);
-  assert.match(body, /Do NOT write playbook\.pid here/);
-  assert.match(body, /ignored duplicate detach|already running/);
 });
 
 test("tugboat failure_detail prefers loop-lock stderr over generic exit code", () => {
@@ -201,7 +198,6 @@ test("tugboat failure_detail prefers loop-lock stderr over generic exit code", (
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
->>>>>>> Stashed changes
 });
 
 test("tugboat version rules: train v-prefix, release bare, promote bare, gh release v-prefix", () => {
