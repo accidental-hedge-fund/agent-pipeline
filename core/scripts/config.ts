@@ -32,6 +32,7 @@ import {
   registeredAdapterNames,
 } from "./harness-adapters/index.ts";
 import { isSafeScratchExtensionGlob } from "./worktree-dirt.ts";
+import { TRUSTED_SURFACE_CLASS_IDS } from "./trusted-surface.ts";
 
 // A `models.*`/`effort.*` value: an arbitrary alias/effort string, or the
 // "auto" sentinel (#366) resolved via stage-routing.ts at config-load time.
@@ -909,6 +910,32 @@ const PartialConfigSchema = z.object({
     .describe(
       "Git push authentication for every authoritative pipeline-owned delivery push (#980). Default when absent: ssh.",
     ),
+  // Trusted-surface rebind (#691). Additive path coverage only. Strict object
+  // rejects disable/shrink/use-candidate keys (disable_classes, classes, etc.).
+  trusted_surface: z
+    .object({
+      extra_paths: z
+        .array(
+          z
+            .object({
+              class: z.enum(TRUSTED_SURFACE_CLASS_IDS).describe("Built-in path class to extend."),
+              globs: z
+                .array(z.string().min(1))
+                .min(1)
+                .describe("Additional path globs merged into the class."),
+            })
+            .strict(),
+        )
+        .optional()
+        .describe(
+          "Additive path globs that extend built-in verifier-sensitive classes. Cannot disable or replace built-in classes.",
+        ),
+    })
+    .strict()
+    .optional()
+    .describe(
+      "Trusted-surface path coverage (#691). Only additive extra_paths are accepted; built-in classes remain engine-defined.",
+    ),
 }).strict();
 
 type PartialConfig = z.infer<typeof PartialConfigSchema>;
@@ -1494,6 +1521,13 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
       extractors:
         fileConfig.tester_evidence?.extractors ??
         [...DEFAULT_CONFIG.tester_evidence.extractors],
+    },
+    trusted_surface: {
+      extra_paths: (fileConfig.trusted_surface?.extra_paths ??
+        DEFAULT_CONFIG.trusted_surface.extra_paths).map((e) => ({
+        class: e.class,
+        globs: [...e.globs],
+      })),
     },
     doctor: {
       runOnStart: fileConfig.doctor?.runOnStart ?? DEFAULT_CONFIG.doctor.runOnStart,
@@ -2731,6 +2765,27 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
           `#   extractors: [] # ${sd("tester_evidence.extractors", "allowlisted per-test extractor ids; default empty = command-level only")}`,
         ].join("\n"),
     "",
+    // trusted_surface (#691): additive path coverage only; omit for built-in classes alone.
+    config.trusted_surface !== undefined &&
+      Array.isArray(config.trusted_surface.extra_paths) &&
+      config.trusted_surface.extra_paths.length > 0
+      ? [
+          "trusted_surface: # verifier-sensitive path coverage (#691) — additive only; cannot disable built-in classes",
+          "  extra_paths:",
+          ...config.trusted_surface.extra_paths.flatMap((e) => [
+            `    - class: ${yamlScalar(e.class)} # ${sd("trusted_surface.extra_paths", "built-in class id to extend")}`,
+            "      globs:",
+            ...e.globs.map((g) => `        - ${yamlScalar(g)}`),
+          ]),
+        ].join("\n")
+      : [
+          "# trusted_surface: # verifier-sensitive path coverage (#691) — additive only; cannot disable built-in classes",
+          `#   extra_paths: # ${sd("trusted_surface.extra_paths", "optional globs merged into built-in classes (engine_core, engine_prompts, repo_policy, gate_commands, evidence_schemas, eval_rubrics, ownership_authority)")}`,
+          "#     - class: eval_rubrics",
+          "#       globs:",
+          "#         - qa/rubrics/**",
+        ].join("\n"),
+    "",
     "doctor: # deterministic preflight capability check (#146) — run `pipeline doctor` standalone, or enable run-start gating here",
     `  runOnStart: ${yamlScalar(doctor.runOnStart)} # ${sd("doctor.runOnStart", "run preflight checks before planning; abort on any failure")}`,
     `  failFast: ${yamlScalar(doctor.failFast)} # ${sd("doctor.failFast", "stop at the first failing check instead of collecting all failures")}`,
@@ -3059,6 +3114,11 @@ function normalizeForSync(config: PartialConfig): unknown {
       ...d.tester_evidence,
       ...config.tester_evidence,
       extractors: config.tester_evidence?.extractors ?? [...d.tester_evidence.extractors],
+    },
+    trusted_surface: {
+      extra_paths:
+        config.trusted_surface?.extra_paths ??
+        d.trusted_surface.extra_paths,
     },
     doctor: { ...d.doctor, ...config.doctor },
     loop: { ...d.loop, ...config.loop },

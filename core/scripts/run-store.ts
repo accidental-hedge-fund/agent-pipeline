@@ -41,8 +41,15 @@ import {
   collectDiagnosticArtifactsFromBundle,
   type EvidenceSubjectV1,
 } from "./evidence-subject.ts";
+import {
+  parseTrustedSurfaceDecision,
+  type TrustedSurfaceDecision,
+} from "./trusted-surface.ts";
 
 export const RUN_SCHEMA_VERSION = 1;
+
+/** Durable trusted-surface decision artifact for a run (#691). */
+export const TRUSTED_SURFACE_FILE = "trusted-surface.json";
 
 export type RunId = string;
 
@@ -1343,6 +1350,55 @@ export async function appendIssueHistory(
 }
 
 // ---------------------------------------------------------------------------
+// Trusted-surface decision persistence (#691)
+// ---------------------------------------------------------------------------
+
+/** Absolute path of the durable trusted-surface decision for a run. */
+export function trustedSurfacePath(runDir: string): string {
+  return path.join(runDir, TRUSTED_SURFACE_FILE);
+}
+
+/**
+ * Persist the trusted-surface decision for the run (atomic tmp + rename).
+ * Non-fatal on I/O error. Callers recompute on product candidate SHA advance.
+ */
+export async function writeTrustedSurfaceDecision(
+  runDir: string,
+  decision: TrustedSurfaceDecision,
+  deps: RunStoreDeps = defaultRunStoreDeps,
+): Promise<void> {
+  try {
+    await deps.mkdir(runDir, { recursive: true });
+    const finalPath = trustedSurfacePath(runDir);
+    const tmp = `${finalPath}.tmp`;
+    const cleaned = sanitizeDeep(decision);
+    const serialized = sanitize(redactSecrets(`${JSON.stringify(cleaned, null, 2)}\n`));
+    await deps.writeFile(tmp, serialized);
+    await deps.rename(tmp, finalPath);
+  } catch (err) {
+    console.warn(
+      `[pipeline] run-store: trusted-surface write failed (non-fatal): ${(err as Error).message}`,
+    );
+  }
+}
+
+/**
+ * Load the durable trusted-surface decision, or null when absent/malformed.
+ * Does not invent passthrough for historical omission.
+ */
+export async function readTrustedSurfaceDecision(
+  runDir: string,
+  deps: RunStoreDeps = defaultRunStoreDeps,
+): Promise<TrustedSurfaceDecision | null> {
+  try {
+    const raw = await deps.readFile(trustedSurfacePath(runDir));
+    return parseTrustedSurfaceDecision(JSON.parse(raw));
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // finalizeRun
 // ---------------------------------------------------------------------------
 
@@ -1497,6 +1553,15 @@ export async function finalizeRun(
   (bundle as EvidenceBundle).evidence_subject_diagnostics =
     evidenceSubjectDiagnostics;
 
+  // Trusted-surface decision (#691): embed when computed; never invent passthrough
+  // for historical runs that lack the durable artifact.
+  const trustedSurface =
+    bundle.trusted_surface ??
+    (await readTrustedSurfaceDecision(runDir, deps));
+  if (trustedSurface) {
+    (bundle as EvidenceBundle).trusted_surface = trustedSurface;
+  }
+
   const summaryWithVersion = {
     ...bundle,
     schema_version: RUN_SCHEMA_VERSION,
@@ -1506,6 +1571,7 @@ export async function finalizeRun(
     correctionErrors,
     write_health: writeHealth,
     evidence_subject_diagnostics: evidenceSubjectDiagnostics,
+    ...(trustedSurface ? { trusted_surface: trustedSurface } : {}),
   };
   const cleanedBundle = sanitizeDeep(summaryWithVersion);
   const serialized = sanitize(redactSecrets(`${JSON.stringify(cleanedBundle, null, 2)}\n`));

@@ -73,7 +73,7 @@ import {
   buildRequiredEvidenceSetRevisionFromGates,
   buildReviewPolicyHash,
   buildEngineFingerprint,
-  verifierFingerprintFromEngine,
+  resolveVerifierFingerprint,
   type EvidenceSubjectV1,
 } from "../evidence-subject.ts";
 import { resolvePinnedEngineIdentity } from "../engine-identity.ts";
@@ -217,6 +217,14 @@ export function buildReviewEvidenceSubject(args: {
   } | null;
   /** Override required-evidence kinds revision when already computed. */
   requiredEvidenceSetRevision?: string;
+  /**
+   * Trusted-surface decision for the run (#691). When present, binds
+   * verifier_fingerprint to effective_verifier_hash (or fails closed on blocked).
+   */
+  trustedSurface?: {
+    outcome: string;
+    effective_verifier_hash: string | null;
+  } | null;
 }): EvidenceSubjectV1 | null {
   const domain = (args.cfg.domain || args.cfg.repo || "").trim();
   if (!domain) return null;
@@ -241,6 +249,11 @@ export function buildReviewEvidenceSubject(args: {
         visualGateEnabled: args.cfg.visual_gate?.enabled,
         shipcheckGateEnabled: args.cfg.shipcheck_gate?.enabled,
       });
+    const verifierFp = resolveVerifierFingerprint({
+      engineFingerprint: engineFp,
+      trustedSurface: args.trustedSurface,
+    });
+    if (!verifierFp) return null;
     return buildEvidenceSubject({
       domain,
       issue: args.issueNumber,
@@ -250,7 +263,7 @@ export function buildReviewEvidenceSubject(args: {
       diff_hash: args.diffHash,
       policy_hash: buildReviewPolicyHash(args.reviewPolicy),
       engine_fingerprint: engineFp,
-      verifier_fingerprint: verifierFingerprintFromEngine(engineFp),
+      verifier_fingerprint: verifierFp,
       required_evidence_set_revision: requiredRev,
     });
   } catch {

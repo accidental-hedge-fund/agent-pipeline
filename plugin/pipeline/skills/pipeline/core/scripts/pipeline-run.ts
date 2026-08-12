@@ -59,14 +59,22 @@ import {
   emitGhMetrics,
   finalizeRun,
   initRunDir,
+  readTrustedSurfaceDecision,
   resolveRunEngineIdentity,
   runDirPath,
   runIdFor,
   startTerminalLogTee,
+  writeTrustedSurfaceDecision,
   type RunStoreDeps,
   type BlockerSetEvent,
   type TerminalLogTee,
 } from "./run-store.ts";
+import {
+  classifyPaths,
+  computeTrustedSurfaceDecision,
+  effectiveVerifierHashChanged,
+  type TrustedSurfaceDecision,
+} from "./trusted-surface.ts";
 import { buildEventSinkDeps } from "./event-sink.ts";
 import {
   isEngineDriftTransition,
@@ -1213,13 +1221,109 @@ export async function runAdvance(
       }
     }
 
+    // Trusted-surface decision (#691): compute once candidate SHA + base +
+    // changed paths are known; recompute when product HEAD advances. Durable
+    // under the run dir; finalize embeds into summary.json.
+    let lastTrustedSurfaceCandidateSha: string | null = null;
+    let currentTrustedSurface: TrustedSurfaceDecision | null = null;
+
+    async function ensureTrustedSurfaceDecision(stageName: string): Promise<void> {
+      if (!runDir || !pinnedEngine) return;
+      const wt = await (deps.getOnDiskForIssue ?? getOnDiskForIssue)(cfg, issueNumber).catch(() => null);
+      if (!wt) return;
+      const headRes = await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true });
+      const candidateSha = headRes.stdout.trim().toLowerCase();
+      if (!/^[0-9a-f]{40}$/.test(candidateSha)) return;
+
+      // Reuse durable decision when candidate SHA is unchanged.
+      if (lastTrustedSurfaceCandidateSha === candidateSha && currentTrustedSurface) {
+        return;
+      }
+      if (!currentTrustedSurface) {
+        currentTrustedSurface = await readTrustedSurfaceDecision(runDir, runStoreDeps);
+        if (
+          currentTrustedSurface &&
+          currentTrustedSurface.candidate_sha === candidateSha
+        ) {
+          lastTrustedSurfaceCandidateSha = candidateSha;
+          return;
+        }
+      } else if (currentTrustedSurface.candidate_sha === candidateSha) {
+        lastTrustedSurfaceCandidateSha = candidateSha;
+        return;
+      }
+
+      const baseRef = `origin/${cfg.base_branch}`;
+      const baseRes = await gitInWorktree(wt.path, ["rev-parse", baseRef], {
+        ignoreFailure: true,
+      });
+      const baseShaRaw = baseRes.stdout.trim().toLowerCase();
+      const baseSha = /^[0-9a-f]{40}$/.test(baseShaRaw) ? baseShaRaw : null;
+
+      const diffRes = await gitInWorktree(
+        wt.path,
+        ["diff", "--name-only", baseSha ? `${baseSha}...${candidateSha}` : `${baseRef}...HEAD`],
+        { ignoreFailure: true },
+      );
+      const candidatePaths = diffRes.stdout
+        .split("\n")
+        .map((l) => l.trim())
+        .filter(Boolean);
+
+      // Pre-fetch base blobs for touched sensitive paths (async → sync map for pure decide).
+      const baseBlobCache = new Map<string, string | null>();
+      if (baseSha) {
+        const classified = classifyPaths(
+          candidatePaths,
+          cfg.trusted_surface?.extra_paths ?? [],
+        );
+        const touched = [...new Set(classified.map((c) => c.path))];
+        for (const p of touched) {
+          const show = await gitInWorktree(
+            wt.path,
+            ["show", `${baseSha}:${p}`],
+            { ignoreFailure: true },
+          );
+          baseBlobCache.set(p, show.code === 0 ? show.stdout : null);
+        }
+      }
+
+      const decision = computeTrustedSurfaceDecision({
+        candidate_paths: candidatePaths,
+        candidate_sha: candidateSha,
+        base_sha: baseSha,
+        base_readable: baseSha !== null,
+        engine_pin: {
+          version: pinnedEngine.version,
+          templates_fingerprint: pinnedEngine.templates_fingerprint,
+          root: pinnedEngine.root,
+          commit_sha: pinnedEngine.commit_sha ?? null,
+        },
+        extra_paths: cfg.trusted_surface?.extra_paths ?? [],
+        read_base_content: (p) =>
+          baseBlobCache.has(p) ? baseBlobCache.get(p)! : null,
+      });
+
+      currentTrustedSurface = decision;
+      lastTrustedSurfaceCandidateSha = candidateSha;
+      await writeTrustedSurfaceDecision(runDir, decision, runStoreDeps).catch(() => {});
+      console.log(
+        `[pipeline] #${issueNumber}: trusted-surface ${decision.outcome}` +
+          ` at ${stageName} (triggers=${decision.triggering_paths.length}` +
+          `${decision.effective_verifier_hash ? `; hash=${decision.effective_verifier_hash.slice(0, 12)}` : ""})`,
+      );
+      if (decision.outcome === "blocked") {
+        console.warn(
+          `[pipeline] #${issueNumber}: trusted-surface BLOCKED — ${decision.reason.summary}`,
+        );
+      }
+    }
+
     // Mid-run engine drift (#450): re-probe the on-disk engine identity at each
     // stage boundary and compare it to the identity this run pinned at start.
-    // Advisory only — never blocks, retries, or changes a stage outcome; a
-    // failed probe (or the absence of a pinned identity, e.g. a pre-#450 run
-    // directory) is silently treated as "no drift". Only state TRANSITIONS are
-    // recorded (compared against the last-observed identity, not the pinned one
-    // on every call), so a single update mid-run produces exactly one event.
+    // Advisory only for stage outcome — never blocks a stage. When drift changes
+    // the trusted-surface effective_verifier_hash (#691), record a diagnostic so
+    // readiness evidence under the prior hash is non-current.
     async function checkEngineDrift(stageName: string): Promise<void> {
       if (!pinnedEngine || !runDir) return;
       const observed = (deps.probeEngineIdentity ?? probeEngineIdentity)();
@@ -1246,6 +1350,24 @@ export async function runAdvance(
           pinned: pinnedEngine,
           observed,
         }).catch(() => {});
+      }
+      // #691: when effective verifier hash would change under the new engine
+      // material, surface a diagnostic. Prior verifier-bound readiness evidence is
+      // non-current until regenerated under the new identity.
+      if (currentTrustedSurface?.effective_verifier_hash) {
+        const change = effectiveVerifierHashChanged(currentTrustedSurface, {
+          version: observed.version,
+          templates_fingerprint: observed.templates_fingerprint,
+          root: observed.root,
+          commit_sha: observed.commit_sha ?? null,
+        });
+        if (change.changed) {
+          console.warn(
+            `[pipeline] #${issueNumber}: trusted-surface effective verifier hash changed mid-run ` +
+              `(${(change.previous_hash ?? "").slice(0, 12)} → ${(change.next_hash ?? "").slice(0, 12)}); ` +
+              `prior verifier-bound readiness evidence is non-current until regenerated`,
+          );
+        }
       }
     }
 
@@ -1364,6 +1486,7 @@ export async function runAdvance(
       }
       finalStage = stage;
       await checkEngineDrift(evidenceStageName(stage));
+      await ensureTrustedSurfaceDecision(evidenceStageName(stage));
 
       // Reconcile audit comments (#259): if a prior run's label write succeeded but its
       // comment post failed, the sentinel is missing. Detect and repair the gap.

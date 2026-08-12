@@ -312,6 +312,7 @@ const ADDED_KEYS = [
   "design_gate",
   "review_ensemble",
   "tester_evidence",
+  "trusted_surface",
   "roadmap",
   "sweep",
   "queue",

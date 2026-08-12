@@ -2820,3 +2820,83 @@ test("finalizeRun: does not infer evaluation pin from readiness artifacts", asyn
     "pin-unavailable finalization must not report match",
   );
 });
+
+// ---------------------------------------------------------------------------
+// trusted_surface on summary.json (#691)
+// ---------------------------------------------------------------------------
+
+test("finalizeRun: embeds rebound trusted_surface from durable artifact", async () => {
+  const { writeTrustedSurfaceDecision } = await import("../scripts/run-store.ts");
+  const { computeTrustedSurfaceDecision } = await import("../scripts/trusted-surface.ts");
+  const { deps, readFile } = memRunStore();
+  const decision = computeTrustedSurfaceDecision({
+    candidate_paths: [".github/pipeline.yml"],
+    candidate_sha: "a".repeat(40),
+    base_sha: "b".repeat(40),
+    engine_pin: {
+      version: "1.0.0",
+      templates_fingerprint: "e".repeat(64),
+    },
+    read_base_content: () => "test_gate:\n  enabled: true\n",
+  });
+  assert.equal(decision.outcome, "rebound");
+  await writeTrustedSurfaceDecision(RUN_DIR, decision, deps);
+  const bundle = makeBundle();
+  await finalizeRun(RUN_DIR, bundle, STATE_DIR, ISSUE, STARTED_AT_ISO, deps);
+  const summary = JSON.parse(readFile(path.join(RUN_DIR, "summary.json")));
+  assert.ok(summary.trusted_surface);
+  assert.equal(summary.trusted_surface.outcome, "rebound");
+  assert.equal(summary.trusted_surface.effective_verifier_hash, decision.effective_verifier_hash);
+  assert.ok(summary.trusted_surface.triggering_paths.length > 0);
+  // Legacy evidence.json mirror also carries the record
+  const legacy = JSON.parse(readFile(path.join(STATE_DIR, String(ISSUE), "evidence.json")));
+  assert.equal(legacy.trusted_surface.outcome, "rebound");
+});
+
+test("finalizeRun: embeds passthrough with empty triggers", async () => {
+  const { writeTrustedSurfaceDecision } = await import("../scripts/run-store.ts");
+  const { computeTrustedSurfaceDecision } = await import("../scripts/trusted-surface.ts");
+  const { deps, readFile } = memRunStore();
+  const decision = computeTrustedSurfaceDecision({
+    candidate_paths: ["src/app.ts"],
+    candidate_sha: "a".repeat(40),
+    base_sha: "b".repeat(40),
+    engine_pin: {
+      version: "1.0.0",
+      templates_fingerprint: "e".repeat(64),
+    },
+  });
+  assert.equal(decision.outcome, "passthrough");
+  await writeTrustedSurfaceDecision(RUN_DIR, decision, deps);
+  await finalizeRun(RUN_DIR, makeBundle(), STATE_DIR, ISSUE, STARTED_AT_ISO, deps);
+  const summary = JSON.parse(readFile(path.join(RUN_DIR, "summary.json")));
+  assert.equal(summary.trusted_surface.outcome, "passthrough");
+  assert.deepEqual(summary.trusted_surface.triggering_paths, []);
+});
+
+test("finalizeRun: embeds blocked decision with reason; historical omission not invented", async () => {
+  const { writeTrustedSurfaceDecision } = await import("../scripts/run-store.ts");
+  const { computeTrustedSurfaceDecision } = await import("../scripts/trusted-surface.ts");
+  const { deps, readFile } = memRunStore();
+  const blocked = computeTrustedSurfaceDecision({
+    candidate_paths: [".github/pipeline.yml"],
+    candidate_sha: "a".repeat(40),
+    base_sha: null,
+    engine_pin: {
+      version: "1.0.0",
+      templates_fingerprint: "e".repeat(64),
+    },
+  });
+  assert.equal(blocked.outcome, "blocked");
+  await writeTrustedSurfaceDecision(RUN_DIR, blocked, deps);
+  await finalizeRun(RUN_DIR, makeBundle(), STATE_DIR, ISSUE, STARTED_AT_ISO, deps);
+  const summary = JSON.parse(readFile(path.join(RUN_DIR, "summary.json")));
+  assert.equal(summary.trusted_surface.outcome, "blocked");
+  assert.ok(summary.trusted_surface.reason?.summary);
+
+  // Fresh run with no durable decision → omit (do not invent passthrough)
+  const { deps: deps2, readFile: read2 } = memRunStore();
+  await finalizeRun(RUN_DIR, makeBundle(), STATE_DIR, ISSUE, STARTED_AT_ISO, deps2);
+  const summary2 = JSON.parse(read2(path.join(RUN_DIR, "summary.json")));
+  assert.equal(summary2.trusted_surface, undefined);
+});

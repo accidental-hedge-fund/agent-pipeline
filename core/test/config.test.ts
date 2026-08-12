@@ -562,6 +562,75 @@ test("resolveConfig: design_gate unknown key is rejected at parse time", async (
   }
 });
 
+// ---- trusted_surface (#691) ----
+
+test("resolveConfig: trusted_surface omitted — empty extra_paths default (passthrough-safe)", async () => {
+  const repo = makeFakeRepo(null);
+  const binDir = makeFakeGh("acme/ts0");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-ts0`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.deepEqual(cfg.trusted_surface, { extra_paths: [] });
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: trusted_surface additive extra_paths accepted", async () => {
+  const repo = makeFakeRepo(`trusted_surface:
+  extra_paths:
+    - class: eval_rubrics
+      globs:
+        - qa/rubrics/**
+`);
+  const binDir = makeFakeGh("acme/ts1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-ts1`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.trusted_surface.extra_paths.length, 1);
+    assert.equal(cfg.trusted_surface.extra_paths[0].class, "eval_rubrics");
+    assert.deepEqual(cfg.trusted_surface.extra_paths[0].globs, ["qa/rubrics/**"]);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: trusted_surface disable_classes key rejected", async () => {
+  const repo = makeFakeRepo(`trusted_surface:\n  disable_classes: [repo_policy]\n`);
+  const binDir = makeFakeGh("acme/ts2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-ts2`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      /disable_classes|unrecognized|Invalid/i,
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: trusted_surface use_candidate_as_trusted rejected", async () => {
+  const repo = makeFakeRepo(`trusted_surface:\n  use_candidate_as_trusted: true\n`);
+  const binDir = makeFakeGh("acme/ts3");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-ts3`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      /use_candidate_as_trusted|unrecognized|Invalid/i,
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
 // ---- review_ensemble (#645) ----
 
 test("resolveConfig: review_ensemble absent — disabled by default", async () => {
