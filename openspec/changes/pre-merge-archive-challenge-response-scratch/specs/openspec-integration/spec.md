@@ -15,7 +15,10 @@ JSON into the product tree: tracked/staged/modified challenge-response paths
 SHALL block pre-archive (they are not git-cleanable and would ride into
 `git add -A` or be discarded by destructive rollback), and any residual scratch
 that is still present after archive staging SHALL be unstaged before the archive
-commit so it cannot enter the product tree.
+commit so it cannot enter the product tree. If `git restore --staged` exits
+nonzero, or a post-unstage porcelain re-read (XY fields preserved) still shows
+engine-known scratch staged in the index, the step SHALL call `setBlocked` with
+stage `pre-merge` and SHALL NOT invoke `git commit` for the archive.
 
 When porcelain still contains product-relevant dirt after excluding that
 untracked non-product residual — including paths under `core/`, `plugin/`, dirty
@@ -95,6 +98,28 @@ step SHALL fail closed with `setBlocked` and SHALL NOT treat the tree as clean.
   active archive candidate
 - **THEN** the test SHALL assert `setBlocked` is called and `openspec archive` is
   not invoked
+
+#### Scenario: Failed post-archive unstage blocks before commit
+
+- **WHEN** `maybeArchiveOpenspec` has successfully archived candidates and staged
+  the archive diff with `git add -A`
+- **AND** residual engine-known scratch is staged (e.g.
+  `A  artifacts/challenge-response-<N>.json`)
+- **AND** `git restore --staged` for that scratch exits nonzero
+- **THEN** the step SHALL call `setBlocked` with stage `pre-merge`
+- **AND** SHALL NOT invoke `git commit` for the archive
+- **AND** the block reason SHALL disclose the unstage failure and/or the staged
+  scratch path
+
+#### Scenario: Scratch still staged after unstage blocks before commit
+
+- **WHEN** `maybeArchiveOpenspec` runs the post-archive unstage safeguard
+- **AND** `git restore --staged` exits zero
+- **AND** a subsequent `git status --porcelain` still lists engine-known scratch
+  with a dirty index column (not `??` / worktree-only)
+- **THEN** the step SHALL call `setBlocked` with stage `pre-merge`
+- **AND** SHALL NOT invoke `git commit` for the archive
+- **AND** the block reason SHALL disclose the still-staged scratch path
 
 ## MODIFIED Requirements
 

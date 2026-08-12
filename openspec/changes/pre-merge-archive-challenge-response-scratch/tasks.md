@@ -6,6 +6,7 @@
 - [x] 1.4 Keep fail-closed behavior for nonzero `git status` and for product / dirty `openspec/` porcelain (including rename endpoints that remain product).
 - [x] 1.5 Preserve porcelain status while classifying scratch (#1017 review 1): only pure untracked (`??`) scratch is waivable + cleaned; tracked/staged/modified challenge-response blocks pre-archive.
 - [x] 1.6 After archive `git add -A`, unstage any residual engine-known scratch before commit so challenge-response JSON cannot enter the archive commit.
+- [x] 1.7 Fail closed when post-archive `git restore --staged` exits nonzero or XY-preserving porcelain still shows engine-known scratch staged — block before commit (#1017 review 2).
 
 ## 2. Unit regressions
 
@@ -15,6 +16,7 @@
 - [x] 2.4 Prove the challenge-response-only test **bites** without the fix (would call `setBlocked`).
 - [x] 2.5 Add tracked/modified challenge-response + active archive candidate → `setBlocked`, archive not invoked; helper unit for untracked vs tracked classification.
 - [x] 2.6 Add post-archive residual scratch → unstaged before commit (no auto-commit of challenge-response JSON).
+- [x] 2.7 Add restore `--staged` failure → `setBlocked`, no commit; residual still-staged after restore → `setBlocked`, no commit; `stagedScratchPaths` helper unit.
 
 ## 3. Mirror, validate, CI
 

@@ -116,6 +116,35 @@ export function classifyPreArchiveDirt(porcelain: string): {
 }
 
 /**
+ * Engine-known scratch paths still staged in the index (porcelain X column is
+ * neither space nor `?`). Pure — post-archive safeguard uses this so a failed
+ * or incomplete `git restore --staged` cannot leave challenge-response JSON in
+ * the index for the archive commit (#1017 review 2). Untracked (`??`) and
+ * worktree-only (` M`) scratch are excluded: they do not enter `git commit`
+ * without pathspecs/`-a`.
+ */
+export function stagedScratchPaths(porcelain: string): string[] {
+  const staged: string[] = [];
+  const seen = new Set<string>();
+  for (const line of porcelain.split("\n")) {
+    if (line.length < 3) continue;
+    const x = line[0];
+    // Index-clean or untracked: not staged for a pathspec-free commit.
+    if (x === " " || x === "?") continue;
+    const paths = parsePorcelainPaths(line);
+    if (paths.length === 0) continue;
+    const { scratch } = classifyWorktreeDirt(paths);
+    for (const p of scratch) {
+      if (!seen.has(p)) {
+        seen.add(p);
+        staged.push(p);
+      }
+    }
+  }
+  return staged;
+}
+
+/**
  * Returns true when the PR branch commit history already contains a pipeline-
  * internal archive commit for this issue (#181). Reads the committed log rather
  * than the local filesystem so it is reliable across polling iterations: the
@@ -717,18 +746,77 @@ export async function maybeArchiveOpenspec(
   // Stage everything, then unstage any engine-known scratch so challenge-response
   // JSON (and other non-product residual) cannot ride into the archive commit if
   // best-effort pre-archive clean left it behind (#1017 review 1 / no-auto-commit).
+  // Fail closed when restore fails or scratch remains staged (#1017 review 2):
+  // path-only classifyWorktreeDirt drops scratch from remainingProduct, so a
+  // silent unstage failure would still auto-commit staged challenge-response JSON.
   await gitFn(wt.path, ["add", "-A"], { ignoreFailure: true });
   let status = await gitFn(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
+  if (status.code !== 0) {
+    const detail =
+      `git status --porcelain failed after archive staging (exit ${status.code}): ` +
+      `${(status.stderr || status.stdout || "(no output)").trim()}`;
+    await setBlockedFn(
+      cfg,
+      issueNumber,
+      `Cannot verify residual engine-known scratch was unstaged before the OpenSpec archive commit — ${detail}.`,
+      "pre-merge",
+      "needs-human",
+    );
+    await recordDecision("fail", "post-archive git status failed");
+    return preMergeBlocked("post-archive git status failed", "needs-human");
+  }
   {
-    const postAddPaths = parsePorcelainPaths(status.stdout);
-    const { scratch: stagedScratch } = classifyWorktreeDirt(postAddPaths);
-    if (stagedScratch.length > 0) {
-      await gitFn(
+    // XY-aware: only paths with a dirty index column need unstage (not `??` / ` M`).
+    const toUnstage = stagedScratchPaths(status.stdout);
+    if (toUnstage.length > 0) {
+      const restore = await gitFn(
         wt.path,
-        ["restore", "--staged", "--", ...stagedScratch],
+        ["restore", "--staged", "--", ...toUnstage],
         { ignoreFailure: true },
       );
+      if (restore.code !== 0) {
+        const detail =
+          restore.stderr.trim() || restore.stdout.trim() || `(exit ${restore.code})`;
+        await setBlockedFn(
+          cfg,
+          issueNumber,
+          `Cannot unstage engine-known scratch before OpenSpec archive commit ` +
+            `(git restore --staged failed):\n${detail}\nScratch paths:\n${toUnstage.join("\n")}`,
+          "pre-merge",
+          "needs-human",
+        );
+        await recordDecision("fail", "post-archive unstage failed");
+        return preMergeBlocked("post-archive unstage failed", "needs-human");
+      }
       status = await gitFn(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
+      if (status.code !== 0) {
+        const detail =
+          `git status --porcelain failed after unstage (exit ${status.code}): ` +
+          `${(status.stderr || status.stdout || "(no output)").trim()}`;
+        await setBlockedFn(
+          cfg,
+          issueNumber,
+          `Cannot verify residual engine-known scratch was unstaged before the OpenSpec archive commit — ${detail}.`,
+          "pre-merge",
+          "needs-human",
+        );
+        await recordDecision("fail", "post-archive git status failed");
+        return preMergeBlocked("post-archive git status failed", "needs-human");
+      }
+    }
+    // Confirm residual scratch is unstaged/untracked — never commit it.
+    const stillStaged = stagedScratchPaths(status.stdout);
+    if (stillStaged.length > 0) {
+      await setBlockedFn(
+        cfg,
+        issueNumber,
+        `Engine-known scratch remains staged after unstage and would enter the OpenSpec archive commit:\n` +
+          `${stillStaged.join("\n")}`,
+        "pre-merge",
+        "needs-human",
+      );
+      await recordDecision("fail", "post-archive scratch still staged");
+      return preMergeBlocked("post-archive scratch still staged", "needs-human");
     }
   }
   // Emptiness is product-path based: untracked scratch residual must not count as

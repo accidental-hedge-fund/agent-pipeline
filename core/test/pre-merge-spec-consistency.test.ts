@@ -11,6 +11,7 @@ import {
   enforceSpecConsistencyGuard,
   maybeArchiveOpenspec,
   specDeltaIsStale,
+  stagedScratchPaths,
   type AdvancePreMergeDeps,
   type FixCommit,
   type SpecConsistencyDeps,
@@ -744,6 +745,178 @@ test("maybeArchiveOpenspec (#1017 review 1): post-archive unstages challenge-res
     out && out.status === "waiting",
     `expected waiting after successful archive push; got: ${JSON.stringify(out)}`,
   );
+});
+
+// Pure helper: only index-staged scratch is reported (#1017 review 2).
+test("stagedScratchPaths (#1017 review 2): staged scratch only; ?? and worktree-only excluded", () => {
+  assert.deepEqual(
+    stagedScratchPaths("A  artifacts/challenge-response-1013.json\n"),
+    ["artifacts/challenge-response-1013.json"],
+  );
+  assert.deepEqual(
+    stagedScratchPaths("M  artifacts/challenge-response-1013.json\n"),
+    ["artifacts/challenge-response-1013.json"],
+  );
+  assert.deepEqual(
+    stagedScratchPaths("?? artifacts/challenge-response-1013.json\n"),
+    [],
+  );
+  assert.deepEqual(
+    stagedScratchPaths(" M artifacts/challenge-response-1013.json\n"),
+    [],
+  );
+  assert.deepEqual(
+    stagedScratchPaths(
+      "A  openspec/specs/openspec-integration/spec.md\nA  artifacts/challenge-response-1.json\n",
+    ),
+    ["artifacts/challenge-response-1.json"],
+  );
+});
+
+// Failed restore --staged must block before commit — classifyWorktreeDirt would
+// otherwise drop still-staged scratch from remainingProduct and auto-commit it.
+test("maybeArchiveOpenspec (#1017 review 2): restore --staged failure → blocks; no commit", async () => {
+  const blocked: Array<{ reason: string; kind: string }> = [];
+  const commitCalls: string[][] = [];
+  let archived = false;
+  let dirExists = true;
+
+  const fakeGit = (async (_wt: string, args: string[]) => {
+    if (args[0] === "diff" && args.some((a) => a.includes("..."))) {
+      return { stdout: `openspec/changes/${ID}/specs/cap/spec.md`, stderr: "", code: 0 };
+    }
+    if (args[0] === "status") {
+      if (!archived) return { stdout: "", stderr: "", code: 0 };
+      return {
+        stdout:
+          "A  openspec/specs/openspec-integration/spec.md\nA  artifacts/challenge-response-1013.json\n",
+        stderr: "",
+        code: 0,
+      };
+    }
+    if (args[0] === "add") return { stdout: "", stderr: "", code: 0 };
+    if (args[0] === "restore" && args.includes("--staged")) {
+      // Simulate index-lock contention / restore failure.
+      return { stdout: "", stderr: "fatal: Unable to create '.git/index.lock'", code: 128 };
+    }
+    if (args[0] === "commit") {
+      commitCalls.push([...args]);
+      return { stdout: "", stderr: "", code: 0 };
+    }
+    if (args[0] === "rev-parse") return { stdout: "aaa", stderr: "", code: 0 };
+    if (args[0] === "fetch") return { stdout: "", stderr: "", code: 0 };
+    return { stdout: "", stderr: "", code: 0 };
+  }) as typeof import("../scripts/worktree.ts").gitInWorktree;
+
+  const deps: AdvancePreMergeDeps = {
+    getForIssue: (async () => ({ path: "/wt", slug: "s", branch: "b" })) as AdvancePreMergeDeps["getForIssue"],
+    openspecIsActive: () => true,
+    gitInWorktree: fakeGit,
+    changeDirExists: () => dirExists,
+    listChangeDirs: () => (dirExists ? [ID] : []),
+    branchDeveloperCommits: async () => [],
+    getIssueDetail: (async () => ({ comments: [] })) as AdvancePreMergeDeps["getIssueDetail"],
+    setBlocked: (async (_c, _n, reason: string, _stage: string, kind: string) => {
+      blocked.push({ reason, kind });
+    }) as AdvancePreMergeDeps["setBlocked"],
+    openspecArchive: (async () => {
+      archived = true;
+      dirExists = false;
+      return { success: true, unavailable: false, output: "" };
+    }) as AdvancePreMergeDeps["openspecArchive"],
+    trustedReviewAuthor: "test-actor",
+  };
+
+  const out = await maybeArchiveOpenspec(cfg, 1, "run", deps);
+
+  assert.ok(
+    out && !out.advanced && out.status === "blocked",
+    `expected blocked on unstage failure; got: ${JSON.stringify(out)}`,
+  );
+  assert.equal(blocked.length, 1, "setBlocked must be called exactly once");
+  assert.equal(blocked[0].kind, "needs-human");
+  assert.match(blocked[0].reason, /restore --staged failed|Unable to create/, "reason must cite unstage failure");
+  assert.match(
+    blocked[0].reason,
+    /artifacts\/challenge-response-1013\.json/,
+    "reason must disclose still-staged scratch path",
+  );
+  assert.deepEqual(commitCalls, [], "must NOT commit while scratch remains staged");
+  assert.equal(out.blockerKind, "needs-human");
+});
+
+// Even when restore exits 0, re-read porcelain must confirm scratch is unstaged.
+test("maybeArchiveOpenspec (#1017 review 2): scratch still staged after restore → blocks; no commit", async () => {
+  const blocked: Array<{ reason: string; kind: string }> = [];
+  const commitCalls: string[][] = [];
+  let archived = false;
+  let dirExists = true;
+  let statusCalls = 0;
+
+  const fakeGit = (async (_wt: string, args: string[]) => {
+    if (args[0] === "diff" && args.some((a) => a.includes("..."))) {
+      return { stdout: `openspec/changes/${ID}/specs/cap/spec.md`, stderr: "", code: 0 };
+    }
+    if (args[0] === "status") {
+      statusCalls += 1;
+      if (!archived) return { stdout: "", stderr: "", code: 0 };
+      // Post-add and post-restore both still show staged scratch (incomplete unstage).
+      return {
+        stdout:
+          "A  openspec/specs/openspec-integration/spec.md\nA  artifacts/challenge-response-1013.json\n",
+        stderr: "",
+        code: 0,
+      };
+    }
+    if (args[0] === "add") return { stdout: "", stderr: "", code: 0 };
+    if (args[0] === "restore" && args.includes("--staged")) {
+      return { stdout: "", stderr: "", code: 0 };
+    }
+    if (args[0] === "commit") {
+      commitCalls.push([...args]);
+      return { stdout: "", stderr: "", code: 0 };
+    }
+    if (args[0] === "rev-parse") return { stdout: "aaa", stderr: "", code: 0 };
+    if (args[0] === "fetch") return { stdout: "", stderr: "", code: 0 };
+    return { stdout: "", stderr: "", code: 0 };
+  }) as typeof import("../scripts/worktree.ts").gitInWorktree;
+
+  const deps: AdvancePreMergeDeps = {
+    getForIssue: (async () => ({ path: "/wt", slug: "s", branch: "b" })) as AdvancePreMergeDeps["getForIssue"],
+    openspecIsActive: () => true,
+    gitInWorktree: fakeGit,
+    changeDirExists: () => dirExists,
+    listChangeDirs: () => (dirExists ? [ID] : []),
+    branchDeveloperCommits: async () => [],
+    getIssueDetail: (async () => ({ comments: [] })) as AdvancePreMergeDeps["getIssueDetail"],
+    setBlocked: (async (_c, _n, reason: string, _stage: string, kind: string) => {
+      blocked.push({ reason, kind });
+    }) as AdvancePreMergeDeps["setBlocked"],
+    openspecArchive: (async () => {
+      archived = true;
+      dirExists = false;
+      return { success: true, unavailable: false, output: "" };
+    }) as AdvancePreMergeDeps["openspecArchive"],
+    trustedReviewAuthor: "test-actor",
+  };
+
+  const out = await maybeArchiveOpenspec(cfg, 1, "run", deps);
+
+  assert.ok(
+    out && !out.advanced && out.status === "blocked",
+    `expected blocked when scratch still staged; got: ${JSON.stringify(out)}`,
+  );
+  assert.equal(blocked.length, 1, "setBlocked must be called exactly once");
+  assert.equal(blocked[0].kind, "needs-human");
+  assert.match(blocked[0].reason, /remains staged|still staged/i, "reason must cite staged residual");
+  assert.match(
+    blocked[0].reason,
+    /artifacts\/challenge-response-1013\.json/,
+    "reason must disclose staged challenge-response path",
+  );
+  assert.deepEqual(commitCalls, [], "must NOT commit staged challenge-response JSON");
+  assert.ok(statusCalls >= 2, "must re-read porcelain after restore");
+  assert.equal(out.blockerKind, "needs-human");
 });
 
 // Regression (#255 review): a porcelain rename/copy record has a destination outside

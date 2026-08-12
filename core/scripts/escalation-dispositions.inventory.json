@@ -759,6 +759,54 @@
       "emitter": "setBlocked"
     },
     {
+      "site_id": "stages.pre-merge-openspec-archive:needs-human#9",
+      "module": "scripts/stages/pre-merge-openspec-archive.ts",
+      "line": 758,
+      "occurrence": 9,
+      "match": "Cannot verify residual engine-known scratch was unstaged before the OpenSpec arc",
+      "disposition": "deliberately-fail-closed",
+      "blocker_kind": "needs-human",
+      "canonical_reason": "workflow-state",
+      "notes": "post-archive status failed — cannot prove scratch unstaged before archive commit (#1017 review 2)",
+      "emitter": "setBlocked"
+    },
+    {
+      "site_id": "stages.pre-merge-openspec-archive:needs-human#10",
+      "module": "scripts/stages/pre-merge-openspec-archive.ts",
+      "line": 780,
+      "occurrence": 10,
+      "match": "Cannot unstage engine-known scratch before OpenSpec archive commit ",
+      "disposition": "deliberately-fail-closed",
+      "blocker_kind": "needs-human",
+      "canonical_reason": "workflow-state",
+      "notes": "restore --staged failed — fail closed so staged challenge-response JSON cannot enter archive commit (#1017 review 2)",
+      "emitter": "setBlocked"
+    },
+    {
+      "site_id": "stages.pre-merge-openspec-archive:needs-human#11",
+      "module": "scripts/stages/pre-merge-openspec-archive.ts",
+      "line": 796,
+      "occurrence": 11,
+      "match": "Cannot verify residual engine-known scratch was unstaged before the OpenSpec arc",
+      "disposition": "deliberately-fail-closed",
+      "blocker_kind": "needs-human",
+      "canonical_reason": "workflow-state",
+      "notes": "post-unstage status failed — cannot prove scratch unstaged before archive commit (#1017 review 2)",
+      "emitter": "setBlocked"
+    },
+    {
+      "site_id": "stages.pre-merge-openspec-archive:needs-human#12",
+      "module": "scripts/stages/pre-merge-openspec-archive.ts",
+      "line": 810,
+      "occurrence": 12,
+      "match": "Engine-known scratch remains staged after unstage and would enter the OpenSpec a",
+      "disposition": "deliberately-fail-closed",
+      "blocker_kind": "needs-human",
+      "canonical_reason": "workflow-state",
+      "notes": "XY-preserving re-read still shows staged scratch — block before archive commit (#1017 review 2)",
+      "emitter": "setBlocked"
+    },
+    {
       "site_id": "stages.pre-merge-openspec-archive:openspec-invalid#4",
       "module": "scripts/stages/pre-merge-openspec-archive.ts",
       "line": 629,
