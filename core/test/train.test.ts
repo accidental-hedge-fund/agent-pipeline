@@ -391,6 +391,67 @@ test("train merge: containment failure stops before next item", async () => {
   assert.equal(result.status.items.length, 1);
 });
 
+test("train merge: open-lookup race to merged + uncontained stops before merge (#1014 review-2)", async () => {
+  // Bite: getPrForIssue still returns the PR (stale open) while observePr sees
+  // merged with an OID not in base. Old code gated containment-failed on
+  // openPr == null, so R2D continued to mergeIssuePr for an already-merged PR.
+  const deps = makeDeps({
+    async isAncestor() {
+      return false;
+    },
+  });
+  deps.seedIssue(snap(1, "done", ["pipeline:ready-to-deploy"]));
+  deps.seedPr(1, 101);
+  (
+    deps as unknown as {
+      _prState: Map<number, { state: string; oid: string; head: string }>;
+    }
+  )._prState.set(101, {
+    state: "merged",
+    oid: "merge101" + "0".repeat(33),
+    head: "a".repeat(40),
+  });
+
+  const result = await runTrain(baseOpts({ issues: [1], merge: true }), deps);
+  assert.equal(result.exitCode, 1);
+  assert.match(result.status.blocker ?? "", /not contained/);
+  assert.ok(
+    !/no linked open PR/.test(result.status.blocker ?? ""),
+    "must be containment class, not no-open-PR",
+  );
+  assert.equal(deps.advanceCalls.length, 0);
+  assert.equal(deps.mergeCalls.length, 0, "must not merge after uncontained merge observation");
+  assert.equal(result.status.items[0]!.integrated, false);
+  assert.equal(result.status.items[0]!.pr, 101);
+});
+
+test("train merge: pre-R2D open-lookup race merged uncontained stops before advance (#1014 review-2)", async () => {
+  // Same race on a pre-R2D item: uncontained merge observation must stop the
+  // train before advanceIssue mutates state.
+  const deps = makeDeps({
+    async isAncestor() {
+      return false;
+    },
+  });
+  deps.seedIssue(snap(1, "still in progress", ["pipeline:ready"]));
+  deps.seedPr(1, 101);
+  (
+    deps as unknown as {
+      _prState: Map<number, { state: string; oid: string; head: string }>;
+    }
+  )._prState.set(101, {
+    state: "merged",
+    oid: "merge101" + "0".repeat(33),
+    head: "a".repeat(40),
+  });
+
+  const result = await runTrain(baseOpts({ issues: [1], merge: true }), deps);
+  assert.equal(result.exitCode, 1);
+  assert.match(result.status.blocker ?? "", /not contained/);
+  assert.equal(deps.advanceCalls.length, 0, "must not advance after uncontained merge");
+  assert.equal(deps.mergeCalls.length, 0);
+});
+
 test("train: needs-human parks the train", async () => {
   const deps = makeDeps({
     async advanceIssue(n) {

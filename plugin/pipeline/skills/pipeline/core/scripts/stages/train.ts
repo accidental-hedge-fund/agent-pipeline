@@ -305,9 +305,10 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
           nextAction = "next-item";
           continue;
         }
-        if (recon.kind === "containment-failed" && openPr == null) {
-          // Merged linked PR found only via any-state on an R2D item; not in
-          // base → stop (not "no linked open PR").
+        if (recon.kind === "containment-failed") {
+          // Merged linked PR (open-lookup race or any-state) not in base → stop
+          // before advance or merge work. Do not require openPr == null: an
+          // open-first race can observe merged+uncontained while openPr is set.
           blocker =
             `merge result ${recon.mergeCommitOid} for #${issue} PR #${linkedPr} is not contained in ` +
             `fetched ${opts.baseBranch} tip ${recon.tip}`;
