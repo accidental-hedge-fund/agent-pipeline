@@ -47,8 +47,12 @@ function extractFailureDetail(
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-fd-"));
   try {
     const src = fs.readFileSync(tugboat, "utf8");
-    const m = src.match(/^failure_detail\(\) \{[\s\S]*?\n\}/m);
-    assert.ok(m, "failure_detail() not found in tugboat.sh");
+    const helpers: string[] = [];
+    for (const name of ["train_stderr_reason", "failure_detail"]) {
+      const m = src.match(new RegExp(`^${name}\\(\\) \\{[\\s\\S]*?\\n\\}`, "m"));
+      assert.ok(m, `${name}() not found in tugboat.sh`);
+      helpers.push(m[0]);
+    }
     const runner = path.join(dir, "run.sh");
     fs.writeFileSync(
       runner,
@@ -56,7 +60,7 @@ function extractFailureDetail(
         "#!/usr/bin/env bash",
         `RUN_DIR=${JSON.stringify(runDir)}`,
         `LOG_FILE=${JSON.stringify(logFile)}`,
-        m[0],
+        ...helpers,
         `printf '%s' "$(failure_detail '${phase}')"`,
         "",
       ].join("\n"),
@@ -155,6 +159,7 @@ test("tugboat supports serial multi-milestone and single-host lock", () => {
   const body = fs.readFileSync(tugboat, "utf8");
   assert.match(body, /--milestones/);
   assert.match(body, /ship_one/);
+<<<<<<< Updated upstream
   assert.match(body, /lock_dir/);
   // Serial: one ship_one per milestone in order; promote lives inside ship_one.
   assert.match(
@@ -170,6 +175,33 @@ test("tugboat supports serial multi-milestone and single-host lock", () => {
   assert.doesNotMatch(body, /xargs\s+-P/);
   assert.doesNotMatch(body, /&\s*ship_one\b/);
   assert.doesNotMatch(body, /\bGNU\s+parallel\b|\bparallel\s+--/);
+=======
+  assert.match(body, /try_acquire_ship_lock/);
+  assert.match(body, /ship_already_running/);
+  // Lock before playbook.pid write (no steal race).
+  assert.match(body, /NEVER write playbook\.pid before winning the lock/);
+  assert.match(body, /Do NOT write playbook\.pid here/);
+  assert.match(body, /ignored duplicate detach|already running/);
+});
+
+test("tugboat failure_detail prefers loop-lock stderr over generic exit code", () => {
+  const dir = makeRunDir();
+  try {
+    fs.writeFileSync(
+      path.join(dir, "train.json.blocker"),
+      "advance failed for #1010: pipeline single exited with code 1",
+    );
+    fs.writeFileSync(
+      path.join(dir, "train.stderr"),
+      '[train] #1010: advancing…\npipeline single: loop run "loop-abc" lock is held by codex pid 4163931 on agent-ubuntu-us-den-01 and is not verifiably dead (not_stale) — refusing takeover\n[train] STOP: advance failed for #1010: pipeline single exited with code 1\n',
+    );
+    const out = extractFailureDetail(dir, "", "train");
+    assert.match(out, /lock is held/);
+    assert.doesNotMatch(out, /^advance failed for #1010: pipeline single exited with code 1$/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+>>>>>>> Stashed changes
 });
 
 test("tugboat version rules: train v-prefix, release bare, promote bare, gh release v-prefix", () => {

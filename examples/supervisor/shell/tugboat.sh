@@ -155,13 +155,36 @@ JSON
   notify "$msg" "tug-$(safe_of "$version")-${phase}-${status}-$$-$(date +%s)" --force
 }
 
+# Prefer operator-useful stderr (loop lock, refuse takeover) over a bare
+# "exited with code 1" blocker sidecar.
+train_stderr_reason() {
+  local f="$RUN_DIR/train.stderr"
+  [[ -s "$f" ]] || return 0
+  local reason
+  reason=$(grep -iE 'lock is held|refusing takeover|not verifiably dead|another tugboat|already running' "$f" 2>/dev/null | tail -1)
+  [[ -z "$reason" ]] && reason=$(grep -iE 'error|fail|block|refus|denied|deadlock|STOP:' "$f" 2>/dev/null | grep -viE '^\s*-' | tail -1)
+  [[ -n "$reason" ]] && echo "$reason" | sed 's/^\[pipeline[^]]*\] *//' | head -c 400
+}
+
 failure_detail() {
   local phase=$1
-  local f reason
+  local f reason blocker
   case "$phase" in
     train)
+      # Loop-lock / refuse lines beat a generic exit-code blocker.
+      reason=$(train_stderr_reason)
+      if [[ -n "$reason" ]]; then
+        echo "$reason"
+        return
+      fi
       if [[ -s "$RUN_DIR/train.json.blocker" ]]; then
-        cat "$RUN_DIR/train.json.blocker" 2>/dev/null | head -c 300
+        blocker=$(cat "$RUN_DIR/train.json.blocker" 2>/dev/null | head -c 300)
+        # If blocker is only "exited with code N", still try stderr/log.
+        if [[ "$blocker" =~ exited\ with\ code\ [0-9]+$ ]] || [[ "$blocker" =~ train\ exit\ [0-9]+$ ]]; then
+          reason=$(grep -iE 'lock is held|refusing|error|fail|block|STOP:' "$RUN_DIR/train.stderr" 2>/dev/null | tail -1)
+          [[ -n "$reason" ]] && { echo "$reason" | head -c 400; return; }
+        fi
+        echo "$blocker"
         return
       fi
       f="$RUN_DIR/train.stderr"
@@ -173,16 +196,60 @@ failure_detail() {
     *) f="$RUN_DIR/$phase.err" ;;
   esac
   if [[ -s "$f" ]]; then
-    reason=$(grep -iE 'error|fail|block|refus|denied|pending|not green|invalid|missing|cannot|could not|exit [1-9]|deadlock' "$f" 2>/dev/null | grep -viE '^\s*-' | tail -1)
-    [[ -z "$reason" ]] && reason=$(grep -iE 'error|fail|block|refus|denied|pending|not green|invalid|missing|cannot|could not|exit [1-9]|deadlock' "$f" 2>/dev/null | tail -1)
+    reason=$(grep -iE 'error|fail|block|refus|denied|pending|not green|invalid|missing|cannot|could not|exit [1-9]|deadlock|lock is held|takeover' "$f" 2>/dev/null | grep -viE '^\s*-' | tail -1)
+    [[ -z "$reason" ]] && reason=$(grep -iE 'error|fail|block|refus|denied|pending|not green|invalid|missing|cannot|could not|exit [1-9]|deadlock|lock is held|takeover' "$f" 2>/dev/null | tail -1)
     [[ -z "$reason" ]] && reason=$(tail -1 "$f" 2>/dev/null)
     echo "$reason" | sed 's/^\[pipeline[^]]*\] *//' | head -c 400
     return
   fi
   if [[ -s "$LOG_FILE" ]]; then
-    reason=$(grep -iE '\[pipeline[^]]*\] .*(error|fail|block|refus|denied|not green|exit [1-9]|deadlock)' "$LOG_FILE" 2>/dev/null | tail -1)
+    reason=$(grep -iE 'lock is held|refusing takeover|another tugboat|\[pipeline[^]]*\] .*(error|fail|block|refus|denied|not green|exit [1-9]|deadlock)' "$LOG_FILE" 2>/dev/null | tail -1)
     [[ -n "$reason" ]] && echo "$reason" | sed 's/^\[[0-9TZ:-]*\] *//' | head -c 400
   fi
+}
+
+# Single-host milestone lock. Lock dir is the mutex; lock/pid is the holder.
+# NEVER write playbook.pid before winning the lock (that race stole the mutex).
+# Returns 0 if acquired, 1 if another live holder owns it (stdout = holder pid).
+try_acquire_ship_lock() {
+  local run_dir=$1
+  local lock_dir="$run_dir/lock"
+  local holder=""
+  mkdir -p "$run_dir"
+
+  if mkdir "$lock_dir" 2>/dev/null; then
+    printf '%s\n' "$$" >"$lock_dir/pid"
+    printf '%s\n' "$$" >"$run_dir/playbook.pid"
+    return 0
+  fi
+
+  holder=$(cat "$lock_dir/pid" 2>/dev/null || true)
+  if [[ -n "$holder" && "$holder" != "$$" ]] && kill -0 "$holder" 2>/dev/null; then
+    printf '%s\n' "$holder"
+    return 1
+  fi
+
+  # Stale lock only: holder missing or dead. Do not steal from a live pid.
+  rm -rf "$lock_dir"
+  if mkdir "$lock_dir" 2>/dev/null; then
+    printf '%s\n' "$$" >"$lock_dir/pid"
+    printf '%s\n' "$$" >"$run_dir/playbook.pid"
+    return 0
+  fi
+
+  # Lost a race to another acquirer.
+  holder=$(cat "$lock_dir/pid" 2>/dev/null || echo unknown)
+  printf '%s\n' "$holder"
+  return 1
+}
+
+ship_already_running() {
+  local run_dir=$1
+  local lock_dir="$run_dir/lock"
+  local holder=""
+  [[ -d "$lock_dir" ]] || return 1
+  holder=$(cat "$lock_dir/pid" 2>/dev/null || cat "$run_dir/playbook.pid" 2>/dev/null || true)
+  [[ -n "$holder" && "$holder" != "$$" ]] && kill -0 "$holder" 2>/dev/null
 }
 
 # Find open release PR for bare version X.Y.Z (title "release: X.Y.Z …").
@@ -210,13 +277,26 @@ detach_self() {
   local self
   self=$(readlink -f "$0")
   local args=()
+  local m run_dir holder
   if [[ ${#milestones[@]} -eq 1 ]]; then
     args=(--milestone "v${milestones[0]}")
   else
     args=(--milestones)
-    local m
     for m in "${milestones[@]}"; do args+=("v$m"); done
   fi
+
+  # Idempotent detach: if any requested milestone already has a live ship, do
+  # not start a second child (Buzz/Hermes double-fire protection).
+  for m in "${milestones[@]}"; do
+    run_dir="$STATE_ROOT/ship-v$(safe_of "$m")"
+    if ship_already_running "$run_dir"; then
+      holder=$(cat "$run_dir/lock/pid" 2>/dev/null || cat "$run_dir/playbook.pid" 2>/dev/null || echo "?")
+      echo "ship v$m already running (pid $holder) — not detaching a second copy"
+      notify "ship v$m already running (pid $holder) — ignored duplicate detach" "tug-dup-detach-$m-$$" --force
+      return 0
+    fi
+  done
+
   nohup env PIPELINE="$PIPELINE" REPO_DIR="$REPO_DIR" ALLOW_MERGE="$ALLOW_MERGE" \
     SHIP_NOTIFY="$SHIP_NOTIFY" SHIP_NOTIFY_BIN="$SHIP_NOTIFY_BIN" \
     SHIP_STAGE_WATCH_BIN="$SHIP_STAGE_WATCH_BIN" \
@@ -227,9 +307,8 @@ detach_self() {
     "$self" "${args[@]}" >/dev/null 2>&1 &
   local pid=$!
   echo "detached tugboat ship ${milestones[*]} (pid $pid)"
-  # Best-effort pid marker for the first milestone's run dir
-  mkdir -p "$STATE_ROOT/ship-v$(safe_of "${milestones[0]}")"
-  echo "$pid" >"$STATE_ROOT/ship-v$(safe_of "${milestones[0]}")/playbook.pid"
+  # Do NOT write playbook.pid here — the child acquires the lock then writes it.
+  # Writing the parent/nohup pid here raced and let a second detach steal the lock.
   notify "detached ship ${milestones[*]} (pid $pid)" "tug-detach-$$" --force
 }
 
@@ -277,9 +356,9 @@ fi
 ship_one() {
   version=$1
   local lock_dir pr train_ec rel_ec fin_ec pro_ec ok checks_green published i draft gec cec green ver_out
-  local STAGE_WATCH_PID_FILE swp SHIP_SINCE train_resumed=0
+  local STAGE_WATCH_PID_FILE swp SHIP_SINCE train_resumed=0 holder
   local release_lock
-  release_lock() { rmdir "$lock_dir" 2>/dev/null || true; }
+  release_lock() { rmdir "$lock_dir" 2>/dev/null || rm -rf "$lock_dir" 2>/dev/null || true; }
 
   RUN_DIR="$STATE_ROOT/ship-v$(safe_of "$version")"
   STATE_FILE="$RUN_DIR/state.json"
@@ -289,24 +368,18 @@ ship_one() {
   mkdir -p "$RUN_DIR"
   touch "$LOG_FILE"
   PID=$$
-  echo "$PID" >"$RUN_DIR/playbook.pid"
 
   # Match fat playbook: run gh + relative paths from the ship target worktree.
-  # (Host pipeline launcher also cd's via REPO_DIR; this covers direct gh calls.)
   cd "$REPO_DIR"
 
-  # Simple single-host lock (prevent concurrent ships on same milestone).
-  if ! mkdir "$lock_dir" 2>/dev/null; then
-    local other_pid
-    other_pid=$(cat "$RUN_DIR/playbook.pid" 2>/dev/null || true)
-    if [[ -n "$other_pid" && "$other_pid" != "$$" ]] && kill -0 "$other_pid" 2>/dev/null; then
-      log "another tugboat holds the lock (pid $other_pid) — refusing"
-      exit 1
-    fi
-    rmdir "$lock_dir" 2>/dev/null || rm -rf "$lock_dir"
-    mkdir "$lock_dir"
+  # Acquire lock BEFORE writing playbook.pid (never steal from a live holder).
+  if ! holder=$(try_acquire_ship_lock "$RUN_DIR"); then
+    # try_acquire prints holder pid on failure
+    log "another tugboat holds the lock (pid ${holder:-?}) — refusing duplicate ship"
+    # Do not clobber a live ship's state.json to failed.
+    echo "ship v$version already running (pid ${holder:-?})" >&2
+    exit 0
   fi
-  # Clear this milestone's lock on function return AND process exit (multi-safe).
   trap 'release_lock' RETURN
   trap 'release_lock' EXIT
 
@@ -357,14 +430,28 @@ ship_one() {
       train_resumed=1
       write_state "train" "ok" "prior complete"
     else
-      # Ensure .blocker is written when possible.
+      # Ensure .blocker is written when possible; prefer stderr lock/refuse text.
       python3 "$TRAIN_STATUS_COMPLETE_BIN" "$RUN_DIR/train.json" >/dev/null 2>&1 || true
-      if [[ -f "$RUN_DIR/train.json.blocker" ]]; then
-        write_state "train" "failed" "$(cat "$RUN_DIR/train.json.blocker")"
-      else
-        write_state "train" "failed" "train exit $train_ec"
+      local fail_detail
+      fail_detail=$(train_stderr_reason)
+      if [[ -z "$fail_detail" && -f "$RUN_DIR/train.json.blocker" ]]; then
+        fail_detail=$(cat "$RUN_DIR/train.json.blocker")
       fi
-      log "FAIL: train exit $train_ec"
+      if [[ -z "$fail_detail" ]]; then
+        fail_detail="train exit $train_ec"
+      fi
+      # If sidecar is generic exit-code but stderr has the real lock line, prefer stderr.
+      if [[ -f "$RUN_DIR/train.json.blocker" ]]; then
+        local side
+        side=$(cat "$RUN_DIR/train.json.blocker")
+        if [[ "$side" =~ exited\ with\ code ]] || [[ "$side" =~ train\ exit ]]; then
+          local sr
+          sr=$(train_stderr_reason)
+          [[ -n "$sr" ]] && fail_detail="$sr"
+        fi
+      fi
+      write_state "train" "failed" "$fail_detail"
+      log "FAIL: train exit $train_ec — $fail_detail"
       if [[ -f "$STAGE_WATCH_PID_FILE" ]]; then
         swp=$(cat "$STAGE_WATCH_PID_FILE" 2>/dev/null || true)
         if [[ -n "$swp" ]] && kill -0 "$swp" 2>/dev/null; then kill "$swp" 2>/dev/null || true; fi
