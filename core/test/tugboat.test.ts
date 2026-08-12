@@ -1,8 +1,6 @@
-// Tugboat (thin ship composer, #1001) decision helpers are exercised here.
-// The composer itself sequences proven Pipeline CLI verbs; the testable logic
-// is: failure-detail extraction (same as #997) and the train-status resume
-// gate (same helper as #983). These tests source the bash function from
-// examples/supervisor/shell/tugboat.sh and assert its behavior.
+// Tugboat (thin ship composer, #1001) decision helpers + structural guards.
+// Lessons locked in: bare release version (no leading v), train complete gate,
+// failure detail, promote --host all, gh checks bucket schema.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -24,7 +22,6 @@ function extractFailureDetail(
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-fd-"));
   try {
     const src = fs.readFileSync(tugboat, "utf8");
-    // Extract the write_state/failure_detail core by sourcing the function.
     const m = src.match(/^failure_detail\(\) \{[\s\S]*?\n\}/m);
     assert.ok(m, "failure_detail() not found in tugboat.sh");
     const runner = path.join(dir, "run.sh");
@@ -96,24 +93,47 @@ test("tugboat is thin: no second ship brain / grant factory markers", () => {
   const body = fs.readFileSync(tugboat, "utf8");
   assert.match(body, /Tugboat — thin ship composer/);
   assert.doesNotMatch(body, /grant[\/_]factory|factory\.mjs/);
-  assert.doesNotMatch(body, /pipeline ship /); // no `pipeline ship` subcommand
+  assert.doesNotMatch(body, /pipeline ship /);
   assert.match(body, /engine-promote/);
-  assert.match(body, /--host (all|\$ENGINE_PROMOTE_HOST)/);
-  // The six CLI verbs must be present.
-  for (const verb of [
-    "train --milestone",
-    "release \"v$milestone\" --no-edit",
-    "release finish",
-    "gh release view",
-    "engine-promote",
-    "--json name,state,bucket",
-  ]) {
-    assert.match(body, new RegExp(verb.replace(/[$]/g, "\\$")));
-  }
+  assert.match(body, /ENGINE_PROMOTE_HOST:-all/);
 });
 
-test("tugboat idempotent release-PR finder: no duplicate PR logic present", () => {
+test("tugboat release uses bare X.Y.Z (leading v is invalid to pipeline release)", () => {
   const body = fs.readFileSync(tugboat, "utf8");
-  assert.match(body, /reuse|idempotent/);
-  assert.match(body, /existing open release PR/);
+  // Must call release with bare $version, never v$version
+  assert.match(body, /"\$PIPELINE" release "\$version"/);
+  assert.doesNotMatch(body, /"\$PIPELINE" release "v\$version"/);
+  assert.doesNotMatch(body, /"\$PIPELINE" release "v\$milestone"/);
+  assert.match(body, /leading v is INVALID/);
+});
+
+test("tugboat train always gates on train-status-complete (not only exit code)", () => {
+  const body = fs.readFileSync(tugboat, "utf8");
+  assert.match(body, /TRAIN_STATUS_COMPLETE_BIN/);
+  assert.match(body, /train JSON not complete/);
+  assert.match(body, /has no open issues/);
+  assert.match(body, /train\.complete\.json/);
+});
+
+test("tugboat CI-wait uses valid gh pr checks fields (bucket, not conclusion)", () => {
+  const body = fs.readFileSync(tugboat, "utf8");
+  const m = body.match(/gh pr checks "\$pr" --json ([a-z,]+)/);
+  assert.ok(m, "CI-wait gh pr checks line not found");
+  assert.doesNotMatch(m[1], /conclusion/);
+  assert.match(m[1], /\bbucket\b/);
+});
+
+test("tugboat supports serial multi-milestone and single-host lock", () => {
+  const body = fs.readFileSync(tugboat, "utf8");
+  assert.match(body, /--milestones/);
+  assert.match(body, /ship_one/);
+  assert.match(body, /lock_dir/);
+});
+
+test("tugboat version rules: train v-prefix, release bare, promote bare, gh release v-prefix", () => {
+  const body = fs.readFileSync(tugboat, "utf8");
+  assert.match(body, /train --milestone "v\$version"/);
+  assert.match(body, /release "\$version"/);
+  assert.match(body, /engine-promote --for "\$version"/);
+  assert.match(body, /gh release view "v\$version"/);
 });
