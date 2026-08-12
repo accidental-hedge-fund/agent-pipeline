@@ -4,23 +4,29 @@
 
 Before invoking `openspec archive`, the pre-merge archive step SHALL inspect
 `git status --porcelain` and SHALL treat the worktree as clean enough to archive
-when the only dirty paths are pipeline-owned non-product scratch matching the
-engine-known pattern `artifacts/challenge-response-*.json` and/or pipeline-internal
-marker files already excluded from archive dirt decisions. In that
-scratch-and/or-marker-only case the step SHALL NOT call `setBlocked` solely for
-those paths, and SHALL proceed with archive evaluation (it MAY best-effort remove
-those scratch or marker paths first so later porcelain checks stay clean). The step
-SHALL NOT auto-commit challenge-response JSON into the product tree.
+when the only dirty paths are **untracked** pipeline-owned non-product scratch
+matching the engine-known pattern `artifacts/challenge-response-*.json` (porcelain
+status `??`) and/or pipeline-internal marker files already excluded from archive
+dirt decisions. In that untracked-scratch-and/or-marker-only case the step SHALL
+NOT call `setBlocked` solely for those paths, and SHALL proceed with archive
+evaluation (it MAY best-effort remove those scratch or marker paths first so later
+porcelain checks stay clean). The step SHALL NOT auto-commit challenge-response
+JSON into the product tree: tracked/staged/modified challenge-response paths
+SHALL block pre-archive (they are not git-cleanable and would ride into
+`git add -A` or be discarded by destructive rollback), and any residual scratch
+that is still present after archive staging SHALL be unstaged before the archive
+commit so it cannot enter the product tree.
 
 When porcelain still contains product-relevant dirt after excluding that
-non-product residual — including paths under `core/`, `plugin/`, dirty paths under
-`openspec/`, hosts/scripts product trees, recognized lockfiles, other non-scratch
-paths, or rename/copy records whose product endpoint remains dirty — the step
-SHALL call `setBlocked` with stage `pre-merge` and type `needs-human` (or the
-established workspace-dirt block kind for this guard), SHALL NOT invoke
-`openspec archive`, and SHALL disclose the product-relevant dirty paths. When
-`git status --porcelain` exits nonzero, the step SHALL fail closed with
-`setBlocked` and SHALL NOT treat the tree as clean.
+untracked non-product residual — including paths under `core/`, `plugin/`, dirty
+paths under `openspec/`, hosts/scripts product trees, recognized lockfiles, other
+non-scratch paths, **tracked/modified engine-known scratch** (e.g.
+` M artifacts/challenge-response-*.json`), or rename/copy records whose product
+endpoint remains dirty — the step SHALL call `setBlocked` with stage `pre-merge`
+and type `needs-human` (or the established workspace-dirt block kind for this
+guard), SHALL NOT invoke `openspec archive`, and SHALL disclose the
+product-relevant dirty paths. When `git status --porcelain` exits nonzero, the
+step SHALL fail closed with `setBlocked` and SHALL NOT treat the tree as clean.
 
 #### Scenario: Challenge-response dump alone does not block pre-archive cleanliness
 
@@ -32,6 +38,17 @@ established workspace-dirt block kind for this guard), SHALL NOT invoke
 - **AND** SHALL proceed with archive evaluation (or remove the dump first and then
   proceed)
 - **AND** SHALL NOT auto-commit the challenge-response file into the product tree
+
+#### Scenario: Tracked challenge-response modification blocks pre-archive
+
+- **WHEN** `maybeArchiveOpenspec` runs the pre-archive cleanliness guard
+- **AND** porcelain lists a tracked or modified challenge-response path (e.g.
+  ` M artifacts/challenge-response-<N>.json` or staged `M  …`) with or without an
+  active archive candidate
+- **THEN** the step SHALL call `setBlocked` with stage `pre-merge`
+- **AND** SHALL NOT invoke `openspec archive`
+- **AND** the block reason SHALL disclose the tracked challenge-response path
+- **AND** SHALL NOT auto-commit that path into the product tree
 
 #### Scenario: Challenge-response dump plus product dirt still blocks
 
@@ -70,6 +87,14 @@ established workspace-dirt block kind for this guard), SHALL NOT invoke
 - **THEN** the test SHALL assert `setBlocked` is not called for that dirt alone
 - **AND** the test SHALL fail if challenge-response-only dirt reintroduces a
   pre-archive `setBlocked` for that path alone
+
+#### Scenario: Unit regression covers tracked challenge-response blocking
+
+- **WHEN** the unit suite exercises `maybeArchiveOpenspec` with injectable porcelain
+  listing a tracked/modified `artifacts/challenge-response-*.json` path and an
+  active archive candidate
+- **THEN** the test SHALL assert `setBlocked` is called and `openspec archive` is
+  not invoked
 
 ## MODIFIED Requirements
 

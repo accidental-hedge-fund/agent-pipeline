@@ -7,6 +7,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  classifyPreArchiveDirt,
   enforceSpecConsistencyGuard,
   maybeArchiveOpenspec,
   specDeltaIsStale,
@@ -577,6 +578,172 @@ test("maybeArchiveOpenspec (#1017): challenge-response + product dirt → still 
     "reason should not treat challenge-response as the blocking product dirt",
   );
   assert.equal(out.blockerKind, "needs-human");
+});
+
+// Pure helper: porcelain status is preserved — only `??` scratch is waivable (#1017 review 1).
+test("classifyPreArchiveDirt (#1017 review 1): untracked scratch waived; tracked scratch blocks", () => {
+  const untrackedOnly = classifyPreArchiveDirt("?? artifacts/challenge-response-1013.json\n");
+  assert.deepEqual(untrackedOnly.product, []);
+  assert.deepEqual(untrackedOnly.untrackedScratch, ["artifacts/challenge-response-1013.json"]);
+
+  const trackedMod = classifyPreArchiveDirt(" M artifacts/challenge-response-1013.json\n");
+  assert.deepEqual(trackedMod.product, ["artifacts/challenge-response-1013.json"]);
+  assert.deepEqual(trackedMod.untrackedScratch, []);
+
+  const staged = classifyPreArchiveDirt("M  artifacts/challenge-response-1013.json\n");
+  assert.deepEqual(staged.product, ["artifacts/challenge-response-1013.json"]);
+  assert.deepEqual(staged.untrackedScratch, []);
+
+  const mixed = classifyPreArchiveDirt(
+    "?? artifacts/challenge-response-1.json\n M core/scripts/foo.ts\n",
+  );
+  assert.deepEqual(mixed.product, ["core/scripts/foo.ts"]);
+  assert.deepEqual(mixed.untrackedScratch, ["artifacts/challenge-response-1.json"]);
+});
+
+// Tracked/modified challenge-response is not git-cleanable and would ride into
+// `git add -A` + destructive rollback — must block before archive (#1017 review 1).
+test("maybeArchiveOpenspec (#1017 review 1): tracked challenge-response + active candidate → blocks; archive not invoked", async () => {
+  const archiveCalls: string[] = [];
+  const blocked: Array<{ reason: string; kind: string }> = [];
+  const gitAddCalls: string[][] = [];
+
+  const fakeGit = (async (_wt: string, args: string[]) => {
+    if (args[0] === "diff" && args.some((a) => a.includes("..."))) {
+      return { stdout: `openspec/changes/${ID}/specs/cap/spec.md`, stderr: "", code: 0 };
+    }
+    if (args[0] === "status") {
+      // Tracked worktree modification (not `??`) — clean cannot remove it.
+      return {
+        stdout: " M artifacts/challenge-response-1013.json\n",
+        stderr: "",
+        code: 0,
+      };
+    }
+    if (args[0] === "add") {
+      gitAddCalls.push([...args]);
+      return { stdout: "", stderr: "", code: 0 };
+    }
+    return { stdout: "", stderr: "", code: 0 };
+  }) as typeof import("../scripts/worktree.ts").gitInWorktree;
+
+  const deps: AdvancePreMergeDeps = {
+    getForIssue: (async () => ({ path: "/wt", slug: "s", branch: "b" })) as AdvancePreMergeDeps["getForIssue"],
+    openspecIsActive: () => true,
+    gitInWorktree: fakeGit,
+    changeDirExists: () => true,
+    listChangeDirs: () => [ID],
+    branchDeveloperCommits: async () => [],
+    getIssueDetail: (async () => ({ comments: [] })) as AdvancePreMergeDeps["getIssueDetail"],
+    setBlocked: (async (_c, _n, reason: string, _stage: string, kind: string) => {
+      blocked.push({ reason, kind });
+    }) as AdvancePreMergeDeps["setBlocked"],
+    openspecArchive: (async (_w: string, id: string) => {
+      archiveCalls.push(id);
+      return { success: true, unavailable: false, output: "" };
+    }) as AdvancePreMergeDeps["openspecArchive"],
+    trustedReviewAuthor: "test-actor",
+  };
+
+  const out = await maybeArchiveOpenspec(cfg, 1, "run", deps);
+
+  assert.ok(
+    out && !out.advanced && out.status === "blocked",
+    `expected blocked outcome; got: ${JSON.stringify(out)}`,
+  );
+  assert.deepEqual(archiveCalls, [], "archive must NOT run over tracked challenge-response dirt");
+  assert.deepEqual(gitAddCalls, [], "git add must NOT run when tracked scratch blocks pre-archive");
+  assert.equal(blocked.length, 1, "setBlocked must be called exactly once");
+  assert.equal(blocked[0].kind, "needs-human");
+  assert.match(
+    blocked[0].reason,
+    /artifacts\/challenge-response-1013\.json/,
+    "reason must disclose the tracked challenge-response path",
+  );
+  assert.equal(out.blockerKind, "needs-human");
+});
+
+// After successful archive, any residual scratch that `git add -A` staged must be
+// unstaged so the archive commit never auto-commits challenge-response JSON.
+test("maybeArchiveOpenspec (#1017 review 1): post-archive unstages challenge-response scratch before commit", async () => {
+  const blocked: Array<{ reason: string; kind: string }> = [];
+  const restoreCalls: string[][] = [];
+  let archived = false;
+  let dirExists = true;
+  let statusCalls = 0;
+
+  const fakeGit = (async (_wt: string, args: string[]) => {
+    if (args[0] === "diff" && args.some((a) => a.includes("..."))) {
+      return { stdout: `openspec/changes/${ID}/specs/cap/spec.md`, stderr: "", code: 0 };
+    }
+    if (args[0] === "status") {
+      statusCalls += 1;
+      // Pre-archive: clean. Post-archive (after add): product + residual scratch
+      // that best-effort clean did not remove (or reappeared).
+      if (!archived) {
+        return { stdout: "", stderr: "", code: 0 };
+      }
+      // First post-add status includes staged scratch; after restore --staged,
+      // only product remains (simulated by statusCalls counting).
+      if (statusCalls <= 2) {
+        // pre-archive clean was call 1; this is first post-add (call 2)
+        return {
+          stdout:
+            "A  openspec/specs/openspec-integration/spec.md\nA  artifacts/challenge-response-1013.json\n",
+          stderr: "",
+          code: 0,
+        };
+      }
+      return {
+        stdout: "A  openspec/specs/openspec-integration/spec.md\n",
+        stderr: "",
+        code: 0,
+      };
+    }
+    if (args[0] === "add") return { stdout: "", stderr: "", code: 0 };
+    if (args[0] === "restore" && args.includes("--staged")) {
+      restoreCalls.push([...args]);
+      return { stdout: "", stderr: "", code: 0 };
+    }
+    if (args[0] === "rev-parse") return { stdout: "aaa", stderr: "", code: 0 };
+    if (args[0] === "fetch") return { stdout: "", stderr: "", code: 0 };
+    if (args[0] === "commit") return { stdout: "", stderr: "", code: 0 };
+    if (args[0] === "push" || (args[0] === "config" && args[1] === "--get")) {
+      return { stdout: "", stderr: "", code: 0 };
+    }
+    return { stdout: "", stderr: "", code: 0 };
+  }) as typeof import("../scripts/worktree.ts").gitInWorktree;
+
+  const deps: AdvancePreMergeDeps = {
+    getForIssue: (async () => ({ path: "/wt", slug: "s", branch: "b" })) as AdvancePreMergeDeps["getForIssue"],
+    openspecIsActive: () => true,
+    gitInWorktree: fakeGit,
+    changeDirExists: () => dirExists,
+    listChangeDirs: () => (dirExists ? [ID] : []),
+    branchDeveloperCommits: async () => [],
+    getIssueDetail: (async () => ({ comments: [] })) as AdvancePreMergeDeps["getIssueDetail"],
+    setBlocked: (async (_c, _n, reason: string, _stage: string, kind: string) => {
+      blocked.push({ reason, kind });
+    }) as AdvancePreMergeDeps["setBlocked"],
+    openspecArchive: (async () => {
+      archived = true;
+      dirExists = false;
+      return { success: true, unavailable: false, output: "" };
+    }) as AdvancePreMergeDeps["openspecArchive"],
+    trustedReviewAuthor: "test-actor",
+  };
+
+  const out = await maybeArchiveOpenspec(cfg, 1, "run", deps);
+
+  assert.equal(blocked.length, 0, `must not block; got: ${JSON.stringify(blocked)}`);
+  assert.ok(
+    restoreCalls.some((a) => a.includes("artifacts/challenge-response-1013.json")),
+    `must unstage challenge-response before archive commit; restoreCalls=${JSON.stringify(restoreCalls)}`,
+  );
+  assert.ok(
+    out && out.status === "waiting",
+    `expected waiting after successful archive push; got: ${JSON.stringify(out)}`,
+  );
 });
 
 // Regression (#255 review): a porcelain rename/copy record has a destination outside
