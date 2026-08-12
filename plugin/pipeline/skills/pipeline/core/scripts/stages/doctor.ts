@@ -48,8 +48,10 @@ import {
   evaluateInstalledShipPlaybookPromoteHost,
 } from "../ship-playbook-promote-host.ts";
 import {
-  defaultInstalledTugboatPath,
-  evaluateInstalledTugboatParity,
+  canonicalOption1PackPaths,
+  defaultInstalledOption1PackPaths,
+  evaluateOption1PackParity,
+  type Option1PackBodies,
 } from "../tugboat-install-parity.ts";
 
 const execFileAsync = promisify(execFile);
@@ -1103,22 +1105,45 @@ export function buildPreflightChecks(
     },
   });
 
-  // 14. Installed Option 1 Tugboat install parity (#927) — a copied
-  //     ~/.local/bin/tugboat that lost promote-all, failure_detail, CI-wait
-  //     bucket schema, or thin identity would diverge from the repo example
-  //     and reintroduce silent multi-host / reasonless failure regressions.
-  //     Fail closed with refresh remediation; absence is skip.
+  // 14. Installed Option 1 pack content parity (#927) — compare ~/.local/bin
+  //     tugboat + critical CI/train helpers against repo examples by content
+  //     digest. Marker-only forks that keep recognizer strings while changing
+  //     promote/CI-wait behavior, or a stale release-checks-green.py, fail
+  //     closed with refresh remediation. Absence of tugboat is skip.
   checks.push({
     id: "supervisor:tugboat-install-parity",
     description:
-      "Installed Option 1 Tugboat (if present) retains thin ship critical markers",
+      "Installed Option 1 pack (if present) matches repo Tugboat + CI/train helpers by content",
     run: async (deps) => {
-      const tugboatPath = defaultInstalledTugboatPath();
+      const installedPaths = defaultInstalledOption1PackPaths();
+      const tugboatPath = installedPaths.tugboat;
       if (!(await deps.fsExists(tugboatPath))) {
         return skip(`no installed Option 1 Tugboat at ${tugboatPath}`);
       }
-      const body = await deps.readTextFile(tugboatPath);
-      const verdict = evaluateInstalledTugboatParity(body, {
+      const canonPaths = canonicalOption1PackPaths(root);
+      const readBody = async (p: string): Promise<string | null> => {
+        if (!(await deps.fsExists(p))) return null;
+        return deps.readTextFile(p);
+      };
+      const installed: Option1PackBodies = {
+        tugboat: await deps.readTextFile(tugboatPath),
+        "release-checks-green.py": await readBody(
+          installedPaths["release-checks-green.py"],
+        ),
+        "train-status-complete.py": await readBody(
+          installedPaths["train-status-complete.py"],
+        ),
+      };
+      const canonical: Option1PackBodies = {
+        tugboat: await readBody(canonPaths.tugboat),
+        "release-checks-green.py": await readBody(
+          canonPaths["release-checks-green.py"],
+        ),
+        "train-status-complete.py": await readBody(
+          canonPaths["train-status-complete.py"],
+        ),
+      };
+      const verdict = evaluateOption1PackParity(installed, canonical, {
         pathLabel: tugboatPath,
       });
       if (verdict.status === "pass") return pass(verdict.detail);

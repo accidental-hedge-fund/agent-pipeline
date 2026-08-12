@@ -15,8 +15,8 @@ Audit result: no source gaps — Tugboat already implements promote `:-all`, fai
 
 ## 3. Install parity and doctor
 
-- [x] 3.1 Add a pure helper that evaluates whether an installed Option 1 ship binary matches critical thin markers (promote `:-all`, failure_detail, CI wait / bucket, thin composer identity)
-- [x] 3.2 Wire a doctor check (e.g. `supervisor:tugboat-install-parity`) that fails closed on divergent installed primary Tugboat/playbook-as-primary with refresh remediation, and skips when unused
+- [x] 3.1 Add a pure helper that evaluates whether an installed Option 1 pack matches repo examples by content digest (Tugboat + `release-checks-green.py` + `train-status-complete.py`); marker-only presence is not sufficient
+- [x] 3.2 Wire a doctor check (e.g. `supervisor:tugboat-install-parity`) that fails closed on divergent installed primary Tugboat/helpers with refresh remediation, and skips when unused
 - [x] 3.3 Keep existing `supervisor:ship-playbook-promote-host` for hosts that still install the legacy playbook
 - [x] 3.4 Unit-test doctor/helper pass/fail/skip fixtures without real home mutation outside test temp dirs
 

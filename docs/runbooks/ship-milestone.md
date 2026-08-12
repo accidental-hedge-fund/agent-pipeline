@@ -43,9 +43,10 @@ install -m 0755 "$ROOT/examples/supervisor/shell/release-checks-green.py" \
 Keep installed copies in sync with repo examples after `main` moves — host
 files are not generated. Doctor check
 `supervisor:tugboat-install-parity` fails closed when
-`~/.local/bin/tugboat` is present but missing critical thin markers (promote
-`:-all`, `failure_detail`, CI-wait `bucket` schema, thin identity). Refresh
-with the same `install` loop.
+`~/.local/bin/tugboat` is present but its content (or sibling
+`release-checks-green.py` / `train-status-complete.py`) does not match the
+repo examples under `examples/supervisor/shell/`. Marker-only forks are not
+accepted. Refresh with the same `install` loop.
 
 Host env (mode-0600 profile):
 

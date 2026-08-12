@@ -255,7 +255,8 @@ Runbooks: [runbooks/ship-milestone.md](./runbooks/ship-milestone.md),
 
 Pipeline CLI owns train/merge/release/promote policy. Tugboat does not add a
 grant factory, second merge policy, or `pipeline ship` product stage. Doctor:
-`supervisor:tugboat-install-parity` (installed Tugboat markers) and
+`supervisor:tugboat-install-parity` (installed Tugboat + CI/train helpers match
+repo example content) and
 `supervisor:ship-playbook-promote-host` (legacy playbook promote default).
 
 **Notify policy:** observational only; notification failures must not alter ship

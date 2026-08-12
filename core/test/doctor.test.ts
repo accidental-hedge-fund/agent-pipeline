@@ -37,19 +37,55 @@ import {
   FACTORY_CONTROL_DIR_ENV,
   PRODUCTION_PIN_ENV,
 } from "../scripts/production-engine-pin.ts";
-import { defaultInstalledTugboatPath } from "../scripts/tugboat-install-parity.ts";
+import {
+  canonicalOption1PackPaths,
+  defaultInstalledOption1PackPaths,
+  defaultInstalledTugboatPath,
+} from "../scripts/tugboat-install-parity.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
-/** Thin-marker-complete Tugboat body for hermetic all-pass when a test forces the path present. */
-const FAKE_THIN_TUGBOAT = [
+const FAKE_VERSION = "1.0.0";
+const FAKE_INSTALL_ROOT = "/fake/install/root";
+
+/** Content-matched Option 1 pack fixtures for hermetic doctor tests (#927 r2). */
+const FAKE_OPTION1_TUGBOAT = [
   "#!/usr/bin/env bash",
   "# Tugboat — thin ship composer (Option 1, #1001).",
   'ENGINE_PROMOTE_HOST="${ENGINE_PROMOTE_HOST:-all}"',
   "failure_detail() { :; }",
   'gh pr checks "$pr" --json name,state,bucket',
   '"kind": "tugboat_ship"',
+  'pipeline engine-promote --for "$version" --host "${ENGINE_PROMOTE_HOST}" --skip-frg',
   "",
 ].join("\n");
+const FAKE_OPTION1_RELEASE_CHECKS_GREEN =
+  "#!/usr/bin/env python3\ndef classify(checks):\n    return 1\n";
+const FAKE_OPTION1_TRAIN_STATUS_COMPLETE =
+  "#!/usr/bin/env python3\nprint(1)\n";
+
+/** Resolve fake Option 1 pack body by path (installed bin or install-root examples). */
+function fakeOption1PackBody(p: string, installRoot = FAKE_INSTALL_ROOT): string | null {
+  const installed = defaultInstalledOption1PackPaths();
+  const canon = canonicalOption1PackPaths(installRoot);
+  if (p === installed.tugboat || p === canon.tugboat || p.endsWith(`${path.sep}tugboat`)) {
+    return FAKE_OPTION1_TUGBOAT;
+  }
+  if (
+    p === installed["release-checks-green.py"] ||
+    p === canon["release-checks-green.py"] ||
+    p.endsWith("release-checks-green.py")
+  ) {
+    return FAKE_OPTION1_RELEASE_CHECKS_GREEN;
+  }
+  if (
+    p === installed["train-status-complete.py"] ||
+    p === canon["train-status-complete.py"] ||
+    p.endsWith("train-status-complete.py")
+  ) {
+    return FAKE_OPTION1_TRAIN_STATUS_COMPLETE;
+  }
+  return null;
+}
 
 /** Clear host pin-authority env so unit tests stay hermetic under a live factory. */
 function withoutHostPinAuthorityEnv<T>(fn: () => T | Promise<T>): Promise<T> {
@@ -108,6 +144,13 @@ interface FakeOverrides {
   execCheck?: (file: string, args: string[]) => boolean;
   exec?: (file: string, args: string[]) => ExecResult;
   fsExists?: (p: string) => boolean;
+  /**
+   * Opt-in: treat ~/.local/bin Option 1 pack paths as present. Blanket
+   * `fsExists: () => true` must NOT enable tugboat — otherwise full
+   * runPreflight hermetic all-pass / single-failure tests fail closed on
+   * content parity (#927 r2).
+   */
+  option1PackInstalled?: boolean;
   fileMtime?: (p: string) => number | null;
   readTextFile?: (p: string) => string | null;
   listDirNames?: (p: string) => string[] | null;
@@ -162,12 +205,10 @@ function fakeDeps(o: FakeOverrides = {}): DoctorDeps {
         installed_at: "2026-01-01T00:00:00Z",
       });
     }
-    // #927: any present body at the Option 1 path fails closed when markers are
-    // missing. When a test forces the path present without its own body, return
-    // a thin-complete fixture so hermetic all-pass still holds.
-    if (p === defaultInstalledTugboatPath() || p.endsWith(`${path.sep}tugboat`)) {
-      return FAKE_THIN_TUGBOAT;
-    }
+    // #927 r2: content-matched Option 1 pack for hermetic all-pass when a test
+    // forces the primary path present without its own bodies.
+    const packBody = fakeOption1PackBody(p);
+    if (packBody !== null) return packBody;
     return '{"version":"1.0.0"}';
   };
   return {
@@ -185,12 +226,23 @@ function fakeDeps(o: FakeOverrides = {}): DoctorDeps {
       o.onCall?.(f, a);
       return o.execCheck ? o.execCheck(f, a) : true;
     },
-    // #927: default hermetic env has no Option 1 primary binary (skip). Present
-    // divergent installs fail closed in production; tests that need a present
-    // file override fsExists (and usually readTextFile) explicitly.
+    // #927 r2: default hermetic env has no Option 1 pack (skip). Opt in with
+    // option1PackInstalled so blanket fsExists overrides cannot accidentally
+    // enable content parity and add a second failure to single-fail tests.
+    // Canonical examples under install-root still follow o.fsExists / default true.
     fsExists: async (p) => {
+      const installed = defaultInstalledOption1PackPaths();
+      const isInstalledPackPath =
+        p === installed.tugboat ||
+        p === installed["release-checks-green.py"] ||
+        p === installed["train-status-complete.py"];
+      if (isInstalledPackPath) {
+        if (!o.option1PackInstalled) return false;
+        // Pack opted in; allow per-path hide (missing helper regressions).
+        if (o.fsExists) return o.fsExists(p);
+        return true;
+      }
       if (o.fsExists) return o.fsExists(p);
-      if (p === defaultInstalledTugboatPath()) return false;
       return true;
     },
     fileMtime: async (p) => (o.fileMtime ? o.fileMtime(p) : 1000),
@@ -216,9 +268,6 @@ function fakeDeps(o: FakeOverrides = {}): DoctorDeps {
     },
   };
 }
-
-const FAKE_VERSION = "1.0.0";
-const FAKE_INSTALL_ROOT = "/fake/install/root";
 
 function getCheck(config: PipelineConfig, id: string, version = FAKE_VERSION): PreflightCheck {
   const c = buildPreflightChecks(config, version, FAKE_INSTALL_ROOT).find((x) => x.id === id);
@@ -1507,72 +1556,177 @@ test("check supervisor:ship-playbook-promote-host — additive stable id", () =>
   assert.ok(ids.includes("supervisor:ship-playbook-promote-host"));
 });
 
-// #927: installed Option 1 Tugboat that lost thin markers must fail closed.
-test("check supervisor:tugboat-install-parity — fails when critical markers missing", async () => {
+/** fsExists for Option 1 pack: installed tugboat + helpers + install-root canon. */
+function option1PackExists(p: string, installedTugboatBodyPresent = true): boolean {
+  const installed = defaultInstalledOption1PackPaths();
+  const canon = canonicalOption1PackPaths(FAKE_INSTALL_ROOT);
+  if (p === installed.tugboat) return installedTugboatBodyPresent;
+  if (
+    p === installed["release-checks-green.py"] ||
+    p === installed["train-status-complete.py"]
+  ) {
+    return installedTugboatBodyPresent;
+  }
+  if (
+    p === canon.tugboat ||
+    p === canon["release-checks-green.py"] ||
+    p === canon["train-status-complete.py"]
+  ) {
+    return true;
+  }
+  // Keep unrelated doctor paths available for other checks in multi-check runs.
+  if (p.includes("pipeline-ship")) return false;
+  return !p.includes("/tugboat") || p.includes("examples");
+}
+
+function option1PackRead(
+  p: string,
+  overrides: Partial<Record<string, string | null>> = {},
+): string | null {
+  if (Object.prototype.hasOwnProperty.call(overrides, p)) {
+    return overrides[p] ?? null;
+  }
+  const body = fakeOption1PackBody(p);
+  if (body !== null) return body;
+  return '{"version":"1.0.0"}';
+}
+
+// #927: installed Option 1 pack that diverges from repo examples must fail closed.
+test("check supervisor:tugboat-install-parity — fails when tugboat content diverges", async () => {
   const check = getCheck(makeConfig(), "supervisor:tugboat-install-parity");
-  // Divergent host fork: no promote-all, no failure_detail, no CI bucket, no thin id.
-  const divergent = "#!/usr/bin/env bash\n# host fork ship\nENGINE_PROMOTE_HOST=\"${ENGINE_PROMOTE_HOST:-codex}\"\n";
+  const installed = defaultInstalledOption1PackPaths();
+  const divergent =
+    '#!/usr/bin/env bash\n# host fork ship\nENGINE_PROMOTE_HOST="${ENGINE_PROMOTE_HOST:-codex}"\n';
   const r = await check.run(
     fakeDeps({
-      fsExists: (p) => p.includes("/tugboat") && !p.includes("pipeline-ship"),
-      readTextFile: (p) => (p.endsWith("/tugboat") || p.endsWith("tugboat") ? divergent : '{"version":"1.0.0"}'),
+      option1PackInstalled: true,
+      fsExists: (p) => option1PackExists(p),
+      readTextFile: (p) =>
+        option1PackRead(p, {
+          [installed.tugboat]: divergent,
+        }),
     }),
   );
   assertFailWithRemediation(r);
-  assert.match(r.detail, /missing critical thin markers|promote_all_default|thin_identity/i);
+  assert.match(r.detail, /diverges|content mismatch|tugboat/i);
   assert.match(r.remediation!, /tugboat\.sh|install -m 0755|#927|#1001/i);
 });
 
-test("check supervisor:tugboat-install-parity — passes on repo-shaped thin source", async () => {
+test("check supervisor:tugboat-install-parity — passes when pack matches repo examples", async () => {
   const check = getCheck(makeConfig(), "supervisor:tugboat-install-parity");
-  const thin = [
-    "#!/usr/bin/env bash",
-    "# Tugboat — thin ship composer (Option 1, #1001).",
-    'ENGINE_PROMOTE_HOST="${ENGINE_PROMOTE_HOST:-all}"',
-    'failure_detail() { echo reason; }',
-    'gh pr checks "$pr" --json name,state,bucket >"$RUN_DIR/release-checks.json"',
-    '"kind": "tugboat_ship"',
-    "",
-  ].join("\n");
   const r = await check.run(
     fakeDeps({
-      fsExists: (p) => p.includes("tugboat"),
-      readTextFile: (p) => (p.includes("tugboat") ? thin : '{"version":"1.0.0"}'),
+      option1PackInstalled: true,
+      fsExists: (p) => option1PackExists(p),
+      readTextFile: (p) => option1PackRead(p),
     }),
   );
   assert.equal(r.status, "pass");
-  assert.match(r.detail, /thin markers|promote all/i);
+  assert.match(r.detail, /content digests|matches repo examples/i);
 });
 
 test("check supervisor:tugboat-install-parity — skips when tugboat is not installed", async () => {
   const check = getCheck(makeConfig(), "supervisor:tugboat-install-parity");
   const r = await check.run(
     fakeDeps({
-      fsExists: (p) => !p.includes("tugboat"),
+      // option1PackInstalled defaults false → skip
+      fsExists: (p) => !p.includes("tugboat") || p.includes("examples"),
     }),
   );
   assert.equal(r.status, "skip");
 });
 
 // #927 review 1: present file at ~/.local/bin/tugboat that does not match
-// recognizer strings must fail closed (not skip) so divergent forks cannot
-// bypass the Option 1 parity gate.
+// canonical content must fail closed (not skip).
 test("check supervisor:tugboat-install-parity — fails on present unrecognized tugboat", async () => {
   const check = getCheck(makeConfig(), "supervisor:tugboat-install-parity");
+  const installed = defaultInstalledOption1PackPaths();
   const unrecognized =
     "#!/usr/bin/env bash\n# arbitrary older/local fork — no thin markers\necho ship\n";
   const r = await check.run(
     fakeDeps({
-      fsExists: (p) => p.includes("/tugboat") && !p.includes("pipeline-ship"),
+      option1PackInstalled: true,
+      fsExists: (p) => option1PackExists(p),
       readTextFile: (p) =>
-        p.endsWith("/tugboat") || p.endsWith("tugboat")
-          ? unrecognized
-          : '{"version":"1.0.0"}',
+        option1PackRead(p, {
+          [installed.tugboat]: unrecognized,
+        }),
     }),
   );
   assertFailWithRemediation(r);
-  assert.match(r.detail, /missing critical thin markers/i);
+  assert.match(r.detail, /diverges|content mismatch|tugboat/i);
   assert.match(r.remediation!, /tugboat\.sh|install -m 0755|#927|#1001/i);
+});
+
+// #927 review 2: marker-complete divergent Tugboat (recognizers present, active
+// promote path altered) must fail content parity.
+test("check supervisor:tugboat-install-parity — fails on marker-complete divergent tugboat", async () => {
+  const check = getCheck(makeConfig(), "supervisor:tugboat-install-parity");
+  const installed = defaultInstalledOption1PackPaths();
+  const markerCompleteDivergent = [
+    "#!/usr/bin/env bash",
+    "# Tugboat — thin ship composer (Option 1, #1001).",
+    'ENGINE_PROMOTE_HOST="${ENGINE_PROMOTE_HOST:-all}"',
+    "failure_detail() { :; }",
+    'gh pr checks "$pr" --json name,state,bucket',
+    '"kind": "tugboat_ship"',
+    // Active promote forced to single host — behavioral divergence.
+    "pipeline engine-promote --for \"$version\" --host codex --skip-frg",
+    "",
+  ].join("\n");
+  const r = await check.run(
+    fakeDeps({
+      option1PackInstalled: true,
+      fsExists: (p) => option1PackExists(p),
+      readTextFile: (p) =>
+        option1PackRead(p, {
+          [installed.tugboat]: markerCompleteDivergent,
+        }),
+    }),
+  );
+  assertFailWithRemediation(r);
+  assert.match(r.detail, /tugboat/);
+  assert.match(r.remediation!, /tugboat\.sh|install -m 0755|#927/i);
+});
+
+// #927 review 2: matching Tugboat with divergent CI-gate helper fails closed.
+test("check supervisor:tugboat-install-parity — fails on divergent release-checks-green helper", async () => {
+  const check = getCheck(makeConfig(), "supervisor:tugboat-install-parity");
+  const installed = defaultInstalledOption1PackPaths();
+  const alwaysGreen =
+    FAKE_OPTION1_RELEASE_CHECKS_GREEN +
+    "\n# local fork always green\ndef classify(checks):\n    return 1\n";
+  const r = await check.run(
+    fakeDeps({
+      option1PackInstalled: true,
+      fsExists: (p) => option1PackExists(p),
+      readTextFile: (p) =>
+        option1PackRead(p, {
+          [installed["release-checks-green.py"]]: alwaysGreen,
+        }),
+    }),
+  );
+  assertFailWithRemediation(r);
+  assert.match(r.detail, /release-checks-green\.py/);
+  assert.match(r.remediation!, /release-checks-green|install -m 0755|#927/i);
+});
+
+// #927 review 2: matching Tugboat with missing train helper fails closed.
+test("check supervisor:tugboat-install-parity — fails when train-status-complete helper missing", async () => {
+  const check = getCheck(makeConfig(), "supervisor:tugboat-install-parity");
+  const installed = defaultInstalledOption1PackPaths();
+  const r = await check.run(
+    fakeDeps({
+      option1PackInstalled: true,
+      fsExists: (p) => {
+        if (p === installed["train-status-complete.py"]) return false;
+        return option1PackExists(p);
+      },
+      readTextFile: (p) => option1PackRead(p),
+    }),
+  );
+  assertFailWithRemediation(r);
+  assert.match(r.detail, /train-status-complete\.py \(missing\)/);
 });
 
 test("check supervisor:tugboat-install-parity — additive stable id", () => {

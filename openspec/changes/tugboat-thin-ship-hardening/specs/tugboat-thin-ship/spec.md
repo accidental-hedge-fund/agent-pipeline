@@ -125,7 +125,7 @@ When the operator passes multiple milestones, Tugboat SHALL ship them one at a t
 
 ### Requirement: Option 1 install path SHALL be a single Tugboat pack from repo examples
 
-For hosts using Option 1 thin ship, the canonical composer entrypoint SHALL be the repo example Tugboat script (and its sibling notify, stage-watch, and pure helpers under `examples/supervisor/shell/`). Installed copies under the operator bin directory SHALL match those sources for the critical ship behaviors (promote default, failure detail, CI wait, thinness). The host SHALL NOT treat a divergent second ship binary as the primary Buzz ship path alongside Tugboat.
+For hosts using Option 1 thin ship, the canonical composer entrypoint SHALL be the repo example Tugboat script (and its sibling notify, stage-watch, and pure helpers under `examples/supervisor/shell/`). Installed copies under the operator bin directory SHALL match those sources by content digest for the critical pack files: Tugboat, `release-checks-green.py`, and `train-status-complete.py` (promote default, failure detail, CI wait, thinness, and the pure helpers that enforce them). Marker-only presence SHALL NOT be accepted as proof of pack parity. The host SHALL NOT treat a divergent second ship binary as the primary Buzz ship path alongside Tugboat.
 
 #### Scenario: Documented install names Tugboat as primary
 
@@ -136,9 +136,15 @@ For hosts using Option 1 thin ship, the canonical composer entrypoint SHALL be t
 #### Scenario: Doctor or install check fails on divergent primary install
 
 - **WHEN** a primary Option 1 ship binary is installed at the documented path
-- **AND** that binary lacks the multi-host promote default or other critical thin markers present in the repo Tugboat source
+- **AND** that binary or a critical sibling helper (`release-checks-green.py`, `train-status-complete.py`) is missing or does not match the corresponding repo example content under `examples/supervisor/shell/`
 - **THEN** doctor (or the pure helper it uses) SHALL fail closed with refresh remediation pointing at the repo example
 - **AND** absence of any installed Option 1 ship binary SHALL skip rather than fail hosts that do not use thin ship
+
+#### Scenario: Marker-complete divergent Tugboat fails content parity
+
+- **WHEN** an installed Tugboat retains recognizer thin markers but its body content does not match the repo example Tugboat
+- **THEN** doctor (or the pure helper it uses) SHALL fail closed
+- **AND** it SHALL NOT pass solely because marker regexes match
 
 ### Requirement: Operator phrase and status surface SHALL be documented
 

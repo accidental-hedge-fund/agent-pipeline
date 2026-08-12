@@ -1,13 +1,16 @@
-// Pure helpers for Option 1 Tugboat install parity (#927).
+// Pure helpers for Option 1 Tugboat install pack parity (#927).
 //
 // After #1001, agent-box / Buzz ship uses the thin composer under
-// examples/supervisor/shell/tugboat.sh. An already-installed ~/.local/bin/tugboat
-// (or a host fork that lost promote-all / failure_detail / CI-wait / thinness)
-// would silently diverge from repo examples. These helpers detect that shape so
-// doctor can fail closed with refresh remediation. Absence of an installed
-// Tugboat is skip — not every host uses Option 1 thin ship.
+// examples/supervisor/shell/tugboat.sh plus sibling pure helpers
+// (release-checks-green.py, train-status-complete.py). Marker-only checks
+// accept a fork that retains recognizer strings while changing promote or
+// CI-wait behavior. These helpers compare installed file content digests to
+// the repo examples so doctor fails closed on behavioral divergence, missing
+// helpers, or a stale CI gate. Absence of an installed Tugboat is skip —
+// not every host uses Option 1 thin ship.
 
 import * as path from "node:path";
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 
 /** Unset promote-host default after #989 / #1001 (multi-host). */
@@ -28,9 +31,47 @@ export const TUGBOAT_CI_WAIT_BUCKET =
 export const TUGBOAT_FORBIDDEN_SECOND_BRAIN =
   /grant[\/_]factory|factory\.mjs|pipeline ship /;
 
+/** Critical Option 1 pack members verified by content digest. */
+export const OPTION1_CRITICAL_PACK_IDS = [
+  "tugboat",
+  "release-checks-green.py",
+  "train-status-complete.py",
+] as const;
+
+export type Option1CriticalPackId = (typeof OPTION1_CRITICAL_PACK_IDS)[number];
+
+/** SHA-256 hex digest of UTF-8 file body (canonical content identity). */
+export function contentDigest(source: string): string {
+  return createHash("sha256").update(source, "utf8").digest("hex");
+}
+
 /** Default install path used by docs/runbooks/ship-milestone.md (Option 1). */
 export function defaultInstalledTugboatPath(home: string = homedir()): string {
   return path.join(home, ".local", "bin", "tugboat");
+}
+
+/** Documented Option 1 pack install paths under ~/.local/bin. */
+export function defaultInstalledOption1PackPaths(
+  home: string = homedir(),
+): Record<Option1CriticalPackId, string> {
+  const bin = path.join(home, ".local", "bin");
+  return {
+    tugboat: path.join(bin, "tugboat"),
+    "release-checks-green.py": path.join(bin, "release-checks-green.py"),
+    "train-status-complete.py": path.join(bin, "train-status-complete.py"),
+  };
+}
+
+/** Canonical pack sources under a pipeline install / checkout root. */
+export function canonicalOption1PackPaths(
+  installRoot: string,
+): Record<Option1CriticalPackId, string> {
+  const shell = path.join(installRoot, "examples", "supervisor", "shell");
+  return {
+    tugboat: path.join(shell, "tugboat.sh"),
+    "release-checks-green.py": path.join(shell, "release-checks-green.py"),
+    "train-status-complete.py": path.join(shell, "train-status-complete.py"),
+  };
 }
 
 export type ThinMarkerName =
@@ -39,7 +80,7 @@ export type ThinMarkerName =
   | "failure_detail"
   | "ci_wait_bucket";
 
-/** Critical thin markers an installed Option 1 Tugboat must retain. */
+/** Critical thin markers an Option 1 Tugboat source should retain (source audit). */
 export function missingTugboatThinMarkers(source: string): ThinMarkerName[] {
   const missing: ThinMarkerName[] = [];
   if (!TUGBOAT_THIN_IDENTITY.test(source)) missing.push("thin_identity");
@@ -59,40 +100,57 @@ export function tugboatHasForbiddenSecondBrainMarkers(source: string): boolean {
   return TUGBOAT_FORBIDDEN_SECOND_BRAIN.test(source);
 }
 
+/** Installed or canonical bodies for the critical Option 1 pack (null = missing). */
+export type Option1PackBodies = Record<Option1CriticalPackId, string | null>;
+
 export type TugboatInstallParityVerdict =
   | { status: "pass"; detail: string }
   | { status: "fail"; detail: string; remediation: string }
   | { status: "skip"; detail: string };
 
 /**
- * Evaluate an installed (or fixture) Option 1 Tugboat body for install parity.
+ * Evaluate installed Option 1 pack bodies against canonical repo examples.
  * Pure: no filesystem or network.
  *
- * - null source → skip (not installed; only absence skips)
- * - any present body at the documented path → evaluate markers; fail closed
- *   when critical thin markers are missing (including arbitrary older/local
- *   forks that do not match recognizer strings — #927 review 1)
- * - forbidden second-brain markers → fail
- * - all critical markers present → pass
+ * - installed.tugboat null → skip (not installed; only absence skips)
+ * - any present primary binary → content-digest the critical pack (Tugboat +
+ *   release-checks-green.py + train-status-complete.py) against canonical;
+ *   fail closed on missing sibling, content mismatch, or unreadable canonical
+ * - forbidden second-brain markers on installed Tugboat → fail
+ * - all digests match → pass
  */
-export function evaluateInstalledTugboatParity(
-  source: string | null,
+export function evaluateOption1PackParity(
+  installed: Option1PackBodies,
+  canonical: Option1PackBodies,
   opts: {
     pathLabel?: string;
   } = {},
 ): TugboatInstallParityVerdict {
   const label = opts.pathLabel ?? "tugboat";
-  if (source === null) {
+  if (installed.tugboat === null) {
     return {
       status: "skip",
       detail: `no installed Option 1 Tugboat at ${label}`,
     };
   }
 
+  const missingCanonical: string[] = [];
+  for (const id of OPTION1_CRITICAL_PACK_IDS) {
+    if (canonical[id] === null) missingCanonical.push(id === "tugboat" ? "tugboat.sh" : id);
+  }
+  if (missingCanonical.length > 0) {
+    return {
+      status: "fail",
+      detail:
+        `cannot verify Option 1 pack: missing canonical sources ` +
+        `(${missingCanonical.join(", ")}) under install-root examples/supervisor/shell/`,
+      remediation: tugboatRefreshRemediation(),
+    };
+  }
+
   // Any file present at the documented Option 1 path is treated as the primary
-  // ship binary. Skip is reserved for an absent path only — an unrecognized
-  // or stripped body must fail closed so a divergent fork cannot bypass doctor.
-  if (tugboatHasForbiddenSecondBrainMarkers(source)) {
+  // ship binary. Skip is reserved for an absent path only.
+  if (tugboatHasForbiddenSecondBrainMarkers(installed.tugboat)) {
     return {
       status: "fail",
       detail:
@@ -102,20 +160,34 @@ export function evaluateInstalledTugboatParity(
     };
   }
 
-  const missing = missingTugboatThinMarkers(source);
-  if (missing.length > 0) {
+  const divergent: string[] = [];
+  for (const id of OPTION1_CRITICAL_PACK_IDS) {
+    const got = installed[id];
+    const want = canonical[id]!;
+    if (got === null) {
+      divergent.push(`${id} (missing)`);
+      continue;
+    }
+    if (contentDigest(got) !== contentDigest(want)) {
+      divergent.push(id);
+    }
+  }
+
+  if (divergent.length > 0) {
     return {
       status: "fail",
       detail:
-        `installed Option 1 ship binary at ${label} is missing critical thin markers: ` +
-        `${missing.join(", ")}`,
+        `installed Option 1 pack diverges from repo examples ` +
+        `(content mismatch or missing): ${divergent.join(", ")}`,
       remediation: tugboatRefreshRemediation(),
     };
   }
 
   return {
     status: "pass",
-    detail: `installed ${label} retains Option 1 thin markers (promote all, failure_detail, CI-wait bucket, thin identity)`,
+    detail:
+      `installed Option 1 pack matches repo examples ` +
+      `(tugboat + release-checks-green.py + train-status-complete.py content digests)`,
   };
 }
 
@@ -123,7 +195,8 @@ function tugboatRefreshRemediation(): string {
   return (
     "Refresh Option 1 ship binaries from the repo examples " +
     '(`install -m 0755 "$ROOT/examples/supervisor/shell/tugboat.sh" ' +
-    '"$HOME/.local/bin/tugboat"` and sibling notify/stage-watch/helpers), ' +
+    '"$HOME/.local/bin/tugboat"` and sibling notify/stage-watch/helpers ' +
+    "including release-checks-green.py and train-status-complete.py), " +
     "or invoke the versioned copy under REPO_DIR directly " +
     '(`"$REPO_DIR/examples/supervisor/shell/tugboat.sh" --milestone vX.Y.Z`). ' +
     "Do not keep a divergent host fork as the primary Buzz ship path. " +
