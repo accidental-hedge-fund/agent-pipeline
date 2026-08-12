@@ -15,10 +15,13 @@ import {
   branchName,
 } from "../worktree.ts";
 import {
-  isOnlyPipelineInternalMarkerDirt,
   PIPELINE_INTERNAL_MARKER_FILES,
   stripPipelineInternalMarkers,
 } from "../salvage-harness-work.ts";
+import {
+  classifyWorktreeDirt,
+  parsePorcelainPaths,
+} from "../worktree-dirt.ts";
 import { withTrailers } from "../traceability.ts";
 import {
   buildTrustedOverrideComments,
@@ -333,20 +336,25 @@ export async function maybeArchiveOpenspec(
 
   // Pre-archive cleanliness guard: the commit-failure rollback below is destructive
   // (`git restore .` + `git clean -fd openspec/`), so it is provably lossless ONLY when
-  // the worktree is fully clean of *real* work before archive. Block on genuine dirty
-  // state — a path-prefix filter is unsafe two ways: a dirty tracked openspec/ file (e.g.
-  // `M  openspec/specs/x.md`) would be silently discarded by the rollback, and a porcelain
-  // rename/copy record (`R  openspec/a -> core/a`) has a destination outside openspec/ that
-  // matching only the first path misses.
+  // the worktree is fully clean of *real* (product) work before archive. Block on
+  // product-relevant dirty state — a path-prefix filter is unsafe two ways: a dirty
+  // tracked openspec/ file (e.g. `M  openspec/specs/x.md`) would be silently discarded
+  // by the rollback, and a porcelain rename/copy record (`R  openspec/a -> core/a`) has
+  // a destination outside openspec/ that matching only the first path misses.
   //
-  // Pipeline-internal marker files (`.pipeline-rebase-attempted`, #522) are **not**
-  // operator work: salvage already treats marker-only porcelain as clean, and parking
-  // archive for them alone is a factory defect (dogfood #597). Strip them from the
-  // dirt decision; when they are the only dirty paths, unlink them and proceed.
-  // Fail CLOSED: only proceed when `git status` SUCCEEDS and reports a clean tree
-  // after marker strip. If the status check itself errors (non-zero exit, often with
-  // empty stdout), we cannot prove the tree is clean — treating that as clean would
-  // let the destructive rollback run over unproven state.
+  // Pipeline-internal marker files (`.pipeline-rebase-attempted`, #522 / #597) and
+  // engine-known non-product scratch (`artifacts/challenge-response-*.json`, tasks/**
+  // notes, `.pipeline-prompt-*` — same class as format/test-gate trust via
+  // `classifyWorktreeDirt` / #1013) are **not** operator product work. Parking archive
+  // for them alone is a factory defect (#597 markers; #1017 challenge-response dumps).
+  // Strip markers, classify residual with the shared worktree dirt model, and block
+  // only when product paths remain. Scratch/marker-only residuals may be best-effort
+  // cleaned so later porcelain checks stay clean; never staged or committed.
+  //
+  // Fail CLOSED: only proceed when `git status` SUCCEEDS and product dirt is empty.
+  // If the status check itself errors (non-zero exit, often with empty stdout), we
+  // cannot prove the tree is clean — treating that as clean would let the destructive
+  // rollback run over unproven state.
   const preArchiveStatus = await gitFn(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
   if (preArchiveStatus.code !== 0) {
     const detail =
@@ -361,9 +369,11 @@ export async function maybeArchiveOpenspec(
     await recordDecision("fail", "pre-archive git status failed");
     return preMergeBlocked("pre-archive git status failed", "needs-human");
   }
-  const meaningfulDirt = stripPipelineInternalMarkers(preArchiveStatus.stdout);
-  if (meaningfulDirt.trim() !== "") {
-    const detail = `pre-existing dirty paths:\n${meaningfulDirt.trim()}`;
+  const withoutMarkers = stripPipelineInternalMarkers(preArchiveStatus.stdout);
+  const residualPaths = parsePorcelainPaths(withoutMarkers);
+  const { product: productPaths, scratch: scratchPaths } = classifyWorktreeDirt(residualPaths);
+  if (productPaths.length > 0) {
+    const detail = `pre-existing dirty paths:\n${productPaths.join("\n")}`;
     // Workspace/git failures — not OpenSpec structural validation. Use needs-human
     // with no finer path tag so scoreboard offramp_class maps to residual `other`
     // (#683 review 1: dirty/status must not inflate openspec-invalid).
@@ -377,15 +387,18 @@ export async function maybeArchiveOpenspec(
     await recordDecision("fail", "worktree dirty before archive");
     return preMergeBlocked("worktree dirty before archive", "needs-human");
   }
-  // Marker-only dirt: remove engine markers so later porcelain checks stay clean.
-  // Real work was already ruled out above via isOnlyPipelineInternalMarkerDirt.
-  if (
-    preArchiveStatus.stdout.trim() !== "" &&
-    isOnlyPipelineInternalMarkerDirt(preArchiveStatus.stdout)
-  ) {
+  // Marker and/or non-product scratch residual only: remove engine-owned paths so
+  // later porcelain checks stay clean. Product work was already ruled out above.
+  // Do not stage or commit these paths into the product tree.
+  if (preArchiveStatus.stdout.trim() !== "") {
     for (const marker of PIPELINE_INTERNAL_MARKER_FILES) {
       // Best-effort unlink via git clean of the untracked marker; ignore failures.
       await gitFn(wt.path, ["clean", "-fd", "--", marker], { ignoreFailure: true });
+    }
+    for (const scratchPath of scratchPaths) {
+      // Best-effort unlink of untracked scratch (e.g. challenge-response dumps).
+      // Tracked scratch modifications are left in place; they already do not block.
+      await gitFn(wt.path, ["clean", "-fd", "--", scratchPath], { ignoreFailure: true });
     }
   }
 

@@ -445,6 +445,140 @@ test("maybeArchiveOpenspec: marker-only dirty (.pipeline-rebase-attempted) → p
   );
 });
 
+// Challenge-response dumps are engine-known non-product scratch (#1013 format/test
+// gate). Pre-merge archive must share that class so a self-written design-gate
+// dump does not park a reviewed PR as needs-human (#1017). Without the product/
+// scratch classifier this porcelain alone would setBlocked — the test bites.
+test("maybeArchiveOpenspec (#1017): challenge-response-only porcelain → does not setBlocked; cleans dump", async () => {
+  const archiveCalls: string[] = [];
+  const blocked: Array<{ reason: string; kind: string }> = [];
+  const cleanCalls: string[][] = [];
+  const gitAddCalls: string[][] = [];
+  let statusCalls = 0;
+
+  const fakeGit = (async (_wt: string, args: string[]) => {
+    if (args[0] === "status") {
+      statusCalls += 1;
+      // First pre-archive status: challenge-response dump only.
+      if (statusCalls === 1) {
+        return { stdout: "?? artifacts/challenge-response-1013.json\n", stderr: "", code: 0 };
+      }
+      return { stdout: "", stderr: "", code: 0 };
+    }
+    if (args[0] === "clean") {
+      cleanCalls.push([...args]);
+      return { stdout: "", stderr: "", code: 0 };
+    }
+    if (args[0] === "add") {
+      gitAddCalls.push([...args]);
+      return { stdout: "", stderr: "", code: 0 };
+    }
+    if (args[0] === "rev-parse") return { stdout: "abc123", stderr: "", code: 0 };
+    if (args[0] === "fetch") return { stdout: "", stderr: "", code: 0 };
+    if (args[0] === "merge-base") return { stdout: "abc123", stderr: "", code: 0 };
+    if (args[0] === "diff" && args.includes("--name-only")) {
+      return { stdout: "", stderr: "", code: 0 };
+    }
+    if (args[0] === "rev-list" || args[0] === "log") {
+      return { stdout: "", stderr: "", code: 0 };
+    }
+    return { stdout: "", stderr: "", code: 0 };
+  }) as typeof import("../scripts/worktree.ts").gitInWorktree;
+
+  const deps: AdvancePreMergeDeps = {
+    getForIssue: (async () => ({ path: "/wt", slug: "s", branch: "b" })) as AdvancePreMergeDeps["getForIssue"],
+    openspecIsActive: () => true,
+    gitInWorktree: fakeGit,
+    changeDirExists: () => false,
+    listChangeDirs: () => [],
+    listPrHeadChangeDirs: (async () => []) as AdvancePreMergeDeps["listPrHeadChangeDirs"],
+    branchDeveloperCommits: async () => [],
+    getIssueDetail: (async () => ({ comments: [] })) as AdvancePreMergeDeps["getIssueDetail"],
+    setBlocked: (async (_c, _n, reason: string, _stage: string, kind: string) => {
+      blocked.push({ reason, kind });
+    }) as AdvancePreMergeDeps["setBlocked"],
+    openspecArchive: (async (_w: string, id: string) => {
+      archiveCalls.push(id);
+      return { success: true, unavailable: false, output: "" };
+    }) as AdvancePreMergeDeps["openspecArchive"],
+    trustedReviewAuthor: "test-actor",
+  };
+
+  const out = await maybeArchiveOpenspec(cfg, 1, "run", deps);
+
+  assert.equal(
+    blocked.length,
+    0,
+    `must not setBlocked on challenge-response-only dirt; got: ${JSON.stringify(blocked)}`,
+  );
+  assert.ok(
+    out === null || (out && out.advanced !== false) || (out && out.status !== "blocked"),
+    `expected non-blocked outcome; got: ${JSON.stringify(out)}`,
+  );
+  assert.ok(
+    cleanCalls.some((a) => a.includes("artifacts/challenge-response-1013.json")),
+    "must best-effort clean the challenge-response dump before continuing",
+  );
+  assert.ok(
+    !gitAddCalls.some((a) => a.some((x) => x.includes("challenge-response"))),
+    "must not stage/commit challenge-response JSON into the product tree",
+  );
+  assert.deepEqual(archiveCalls, [], "no active candidates → archive not invoked");
+});
+
+// Mixed dirt: challenge-response scratch must not waive a real product block (#1017).
+test("maybeArchiveOpenspec (#1017): challenge-response + product dirt → still blocks; archive not invoked", async () => {
+  const archiveCalls: string[] = [];
+  const blocked: Array<{ reason: string; kind: string }> = [];
+
+  const fakeGit = (async (_wt: string, args: string[]) => {
+    if (args[0] === "diff" && args.some((a) => a.includes("..."))) {
+      return { stdout: `openspec/changes/${ID}/specs/cap/spec.md`, stderr: "", code: 0 };
+    }
+    if (args[0] === "status") {
+      return {
+        stdout:
+          "?? artifacts/challenge-response-1013.json\n M core/scripts/foo.ts\n",
+        stderr: "",
+        code: 0,
+      };
+    }
+    return { stdout: "", stderr: "", code: 0 };
+  }) as typeof import("../scripts/worktree.ts").gitInWorktree;
+
+  const deps: AdvancePreMergeDeps = {
+    getForIssue: (async () => ({ path: "/wt", slug: "s", branch: "b" })) as AdvancePreMergeDeps["getForIssue"],
+    openspecIsActive: () => true,
+    gitInWorktree: fakeGit,
+    changeDirExists: () => true,
+    branchDeveloperCommits: async () => [],
+    getIssueDetail: (async () => ({ comments: [] })) as AdvancePreMergeDeps["getIssueDetail"],
+    setBlocked: (async (_c, _n, reason: string, _stage: string, kind: string) => {
+      blocked.push({ reason, kind });
+    }) as AdvancePreMergeDeps["setBlocked"],
+    openspecArchive: (async (_w: string, id: string) => {
+      archiveCalls.push(id);
+      return { success: true, unavailable: false, output: "" };
+    }) as AdvancePreMergeDeps["openspecArchive"],
+    trustedReviewAuthor: "test-actor",
+  };
+
+  const out = await maybeArchiveOpenspec(cfg, 1, "run", deps);
+
+  assert.ok(out && !out.advanced && out.status === "blocked",
+    `expected blocked outcome; got: ${JSON.stringify(out)}`);
+  assert.deepEqual(archiveCalls, [], "archive must NOT run when product dirt remains");
+  assert.equal(blocked.length, 1, "setBlocked must be called exactly once");
+  assert.equal(blocked[0].kind, "needs-human");
+  assert.match(blocked[0].reason, /core\/scripts\/foo\.ts/, "reason must disclose product path");
+  assert.doesNotMatch(
+    blocked[0].reason,
+    /challenge-response/,
+    "reason should not treat challenge-response as the blocking product dirt",
+  );
+  assert.equal(out.blockerKind, "needs-human");
+});
+
 // Regression (#255 review): a porcelain rename/copy record has a destination outside
 // openspec/ (`R  openspec/a -> core/a`) that first-path prefix matching misses; the
 // conservative guard blocks on any non-empty status, so it is covered.
