@@ -684,7 +684,7 @@ log "phase release-finish: waiting for PR #$pr checks to go green"
 checks_green=0
 for i in $(seq 1 "$RELEASE_WAIT_ATTEMPTS"); do
   set +e
-  gh pr checks "$pr" --json name,state,conclusion >"$RUN_DIR/release-checks.json" 2>"$RUN_DIR/release-checks.err"
+  gh pr checks "$pr" --json name,state,bucket >"$RUN_DIR/release-checks.json" 2>"$RUN_DIR/release-checks.err"
   cec=$?
   set -e
   if [[ "$cec" -ne 0 ]]; then

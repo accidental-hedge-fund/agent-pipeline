@@ -24,12 +24,26 @@ def classify(checks):
         return 1
     for c in checks:
         st = (c.get("state") or "").upper()
-        con = (c.get("conclusion") or "").upper()
+        # `state` is the GitHub check state (SUCCESS/FAILURE/PENDING/QUEUED/etc).
+        # `bucket` is gh's human bucket ("pass"/"fail"/"pending"/"error"/etc).
+        con = (c.get("bucket") or c.get("conclusion") or "").upper()
         if st in ("PENDING", "IN_PROGRESS", "QUEUED", "WAITING", "REQUESTED"):
             return 0
-        if st in ("FAILURE", "ERROR", "CANCELLED") or con in ("FAILURE", "CANCELLED"):
+        if st in ("FAILURE", "ERROR", "CANCELLED") or con in (
+            "FAILURE",
+            "CANCELLED",
+            "FAIL",
+            "ERROR",
+        ):
             return -1
-        if con and con not in ("SUCCESS", "NEUTRAL", "SKIPPED", "EMPTY", ""):
+        if con and con not in (
+            "SUCCESS",
+            "NEUTRAL",
+            "SKIPPED",
+            "EMPTY",
+            "PASS",
+            "",
+        ):
             return 0
     return 1
 
