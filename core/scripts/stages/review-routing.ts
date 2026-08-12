@@ -68,6 +68,15 @@ import {
   type Review1Risk,
 } from "../review-policy.ts";
 import { makePromptRecord, recordPrompt, recordReview } from "../evidence-bundle.ts";
+import {
+  buildEvidenceSubject,
+  buildRequiredEvidenceSetRevisionFromGates,
+  buildReviewPolicyHash,
+  buildEngineFingerprint,
+  verifierFingerprintFromEngine,
+  type EvidenceSubjectV1,
+} from "../evidence-subject.ts";
+import { resolvePinnedEngineIdentity } from "../engine-identity.ts";
 import { appendEvent, RUN_SCHEMA_VERSION, type RunStoreDeps } from "../run-store.ts";
 import { emitCorrectionEvent } from "../correction.ts";
 import { buildStageDiagnostic } from "../stage-diagnostic.ts";
@@ -178,6 +187,76 @@ export type RunReviewFn = (
   cwd: string,
   opts: AdvanceReviewOpts,
 ) => Promise<ReviewerInvocation>;
+
+/**
+ * Build the shared evidence_subject for a review round from runtime state (#692).
+ * Returns null when a required identity dimension cannot be resolved (no
+ * fabricated placeholders). Pure aside from the optional engine-identity read.
+ * Callers that write new readiness artifacts MUST fail closed on null — never
+ * emit a silent legacy_unbound review row for a new production path.
+ */
+export function buildReviewEvidenceSubject(args: {
+  cfg: PipelineConfig;
+  issueNumber: number;
+  prNumber: number | null;
+  runId: string | undefined;
+  candidateSha: string;
+  diffHash: string | null;
+  reviewPolicy: {
+    block_threshold: string;
+    min_confidence: number;
+    max_adversarial_rounds?: number;
+    max_delta_rounds?: number;
+    ceiling_action?: string;
+    surface_recurrence_rounds?: number | null;
+  };
+  engineIdentity?: {
+    version: string;
+    templates_fingerprint: string;
+    commit_sha?: string;
+  } | null;
+  /** Override required-evidence kinds revision when already computed. */
+  requiredEvidenceSetRevision?: string;
+}): EvidenceSubjectV1 | null {
+  const domain = (args.cfg.domain || args.cfg.repo || "").trim();
+  if (!domain) return null;
+  const runId = (args.runId ?? "").trim();
+  if (!runId) return null;
+  const engine =
+    args.engineIdentity !== undefined
+      ? args.engineIdentity
+      : resolvePinnedEngineIdentity();
+  if (!engine) return null;
+  try {
+    const engineFp = buildEngineFingerprint({
+      version: engine.version,
+      templates_fingerprint: engine.templates_fingerprint,
+      commit_sha: engine.commit_sha,
+    });
+    const requiredRev =
+      args.requiredEvidenceSetRevision ??
+      buildRequiredEvidenceSetRevisionFromGates({
+        testGateEnabled: args.cfg.test_gate?.enabled,
+        evalGateEnabled: args.cfg.eval_gate?.enabled,
+        visualGateEnabled: args.cfg.visual_gate?.enabled,
+        shipcheckGateEnabled: args.cfg.shipcheck_gate?.enabled,
+      });
+    return buildEvidenceSubject({
+      domain,
+      issue: args.issueNumber,
+      pr: args.prNumber,
+      run_id: runId,
+      candidate_sha: args.candidateSha,
+      diff_hash: args.diffHash,
+      policy_hash: buildReviewPolicyHash(args.reviewPolicy),
+      engine_fingerprint: engineFp,
+      verifier_fingerprint: verifierFingerprintFromEngine(engineFp),
+      required_evidence_set_revision: requiredRev,
+    });
+  } catch {
+    return null;
+  }
+}
 
 export async function advanceReview(
   cfg: PipelineConfig,
@@ -735,6 +814,42 @@ export async function advanceReview(
   // review1Risk passed to rendering so it embeds the sentinel in the right position.
   const review1RiskForComment: Review1Risk | undefined = round === 1 ? review1RiskFromVerdict : undefined;
 
+  // evidence_subject for ReviewArtifact + bundle review rows (#692). Built only
+  // from runtime state (cfg, SHA, diff hash, engine identity) — never from
+  // reviewer prose. Missing required inputs fail closed: new readiness artifacts
+  // MUST NOT be written without a subject (would be silent legacy_unbound).
+  //
+  // Subject run_id prefers pipelineRunId, then runDir basename. When neither is
+  // set (unit tests / non-run invocations), use an explicit unscoped id so
+  // subject emission still succeeds without inventing a production run id that
+  // would also filter prior-round history (currentReviewRunId stays undefined).
+  const subjectRunId =
+    (typeof currentReviewRunId === "string" && currentReviewRunId.trim()) ||
+    (opts.runDir ? path.basename(opts.runDir) : "") ||
+    `issue-${issueNumber}/unscoped-run`;
+  const reviewEvidenceSubject: EvidenceSubjectV1 | null = buildReviewEvidenceSubject({
+    cfg,
+    issueNumber,
+    prNumber,
+    runId: subjectRunId,
+    candidateSha: commitSha,
+    diffHash,
+    reviewPolicy: effectivePol,
+  });
+  if (!reviewEvidenceSubject) {
+    const reason =
+      "Review evidence_subject could not be built from runtime state " +
+      "(missing domain, engine identity, or other required identity " +
+      "inputs). New readiness review artifacts must not omit the subject.";
+    console.error(`[pipeline] #${issueNumber}: ${reason}`);
+    await setBlockedFn(cfg, issueNumber, reason, stage, "harness-failure");
+    return {
+      advanced: false,
+      status: "blocked",
+      reason: "evidence_subject production failed for review artifact",
+    };
+  }
+
   const findingCounts: Record<string, number> = { critical: 0, high: 0, medium: 0, low: 0 };
   for (const f of verdict.findings) {
     findingCounts[f.severity] = (findingCounts[f.severity] ?? 0) + 1;
@@ -790,6 +905,7 @@ export async function advanceReview(
       await recordReview(opts.stateDir, issueNumber, {
         round, sha: commitSha, verdict: verdict.verdict, findingCounts,
         findings: findingRecords, harness: reviewer, model: reviewerModel, selfReview,
+        ...(reviewEvidenceSubject ? { evidence_subject: reviewEvidenceSubject } : {}),
         ...executorEvidence,
         ...ensembleEvidence,
       }).catch(() => {});
@@ -808,7 +924,7 @@ export async function advanceReview(
     // reviewer's own findings (which may carry non-blocking advisory
     // findings) — not assume every prior blocking key is gone.
     await emitRepairedKeys(new Set(verdict.findings.map((f) => findingKey(f))));
-    await postCommentFn(cfg, issueNumber, reviewComment(formatReviewComment(cfg, verdict, round, reviewer, undefined, diffHash, review1RiskForComment, undefined, undefined, currentReviewRunId)));
+    await postCommentFn(cfg, issueNumber, reviewComment(formatReviewComment(cfg, verdict, round, reviewer, undefined, diffHash, review1RiskForComment, undefined, undefined, currentReviewRunId, reviewEvidenceSubject)));
     if (round === 1) {
       const r1Blocked = await safeTransitionFn("review-1", "review-2",
         `Standard review by ${reviewerLabel} — approved (${verdict.findings.length} findings).`);
@@ -830,11 +946,12 @@ export async function advanceReview(
       );
       return advanceReview(cfg, issueNumber, round, opts, retryCount + 1, deps);
     }
-    await postCommentFn(cfg, issueNumber, reviewComment(formatReviewComment(cfg, verdict, round, reviewer, undefined, undefined, review1RiskForComment, undefined, undefined, currentReviewRunId)));
+    await postCommentFn(cfg, issueNumber, reviewComment(formatReviewComment(cfg, verdict, round, reviewer, undefined, undefined, review1RiskForComment, undefined, undefined, currentReviewRunId, reviewEvidenceSubject)));
     if (opts.stateDir) {
       await recordReview(opts.stateDir, issueNumber, {
         round, sha: commitSha, verdict: verdict.verdict, findingCounts,
         findings: findingRecords, harness: reviewer, model: reviewerModel, selfReview,
+        ...(reviewEvidenceSubject ? { evidence_subject: reviewEvidenceSubject } : {}),
         ...executorEvidence,
         ...ensembleEvidence,
       }).catch(() => {});
@@ -917,6 +1034,7 @@ export async function advanceReview(
     await recordReview(opts.stateDir, issueNumber, {
       round, sha: commitSha, verdict: verdict.verdict, findingCounts,
       findings: findingRecords, harness: reviewer, model: reviewerModel, selfReview,
+      ...(reviewEvidenceSubject ? { evidence_subject: reviewEvidenceSubject } : {}),
       ...executorEvidence,
       ...ensembleEvidence,
     }).catch(() => {});
@@ -942,7 +1060,7 @@ export async function advanceReview(
   await emitRepairedKeys(new Set(verdict.findings.map((f) => findingKey(f))));
 
   if (partition.blocking.length === 0) {
-    await postCommentFn(cfg, issueNumber, reviewComment(formatReviewComment(cfg, verdict, round, reviewer, blockingKeysSet, diffHash, review1RiskForComment, reversalDemotions, alternativeDemotions, currentReviewRunId)));
+    await postCommentFn(cfg, issueNumber, reviewComment(formatReviewComment(cfg, verdict, round, reviewer, blockingKeysSet, diffHash, review1RiskForComment, reversalDemotions, alternativeDemotions, currentReviewRunId, reviewEvidenceSubject)));
     const advisory = reviewComment(advisoryAdvanceComment(cfg, round, reviewer, partition));
     await postCommentFn(cfg, issueNumber, advisory);
     if (partition.advisory.length || partition.overridden.length) {
@@ -968,7 +1086,7 @@ export async function advanceReview(
     };
   }
 
-  await postCommentFn(cfg, issueNumber, reviewComment(formatReviewComment(cfg, verdict, round, reviewer, blockingKeysSet, diffHash, review1RiskForComment, reversalDemotions, alternativeDemotions, currentReviewRunId)));
+  await postCommentFn(cfg, issueNumber, reviewComment(formatReviewComment(cfg, verdict, round, reviewer, blockingKeysSet, diffHash, review1RiskForComment, reversalDemotions, alternativeDemotions, currentReviewRunId, reviewEvidenceSubject)));
 
   const priorRoundComments = priorRoundCommentsForRecovery;
   const roundCap = cfg.review_policy.max_adversarial_rounds;

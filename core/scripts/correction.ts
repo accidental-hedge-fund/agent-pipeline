@@ -14,6 +14,15 @@ import * as path from "node:path";
 import { redactSecrets, sanitize } from "./artifact-sanitize.ts";
 import { artifactSubdir, CONTROL_ATTRIBUTIONS_ARTIFACT } from "./artifact-ignore.ts";
 import {
+  buildEvidenceSubject,
+  compareEvidenceSubjects,
+  normalizeSubjectSha,
+  parseEvidenceSubjectDetailed,
+  type EvidenceSubjectComparison,
+  type EvidenceSubjectComparisonOutcome,
+  type EvidenceSubjectV1,
+} from "./evidence-subject.ts";
+import {
   appendEvent,
   defaultRunStoreDeps,
   readEvents,
@@ -107,6 +116,17 @@ export interface CorrectionEvent {
   correction: string;
   reusable: CorrectionReusable;
   proposed_control?: CorrectionProposedControl;
+  /**
+   * Shared immutable evidence identity (#692).
+   * - Present object: full subject from runtime state at emission.
+   * - Explicit `null`: current-schema unbound disposition (producer could not
+   *   resolve a full subject) — consumers MUST quarantine, not grant the
+   *   historical `legacy_unbound` SHA fallback.
+   * - Absent/undefined: pre-migration historical record (`legacy_unbound`).
+   * When a subject object is present, `candidate_sha` aligns with the
+   * candidate those SHA fields represent for the event.
+   */
+  evidence_subject?: import("./evidence-subject.ts").EvidenceSubjectV1 | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -255,12 +275,220 @@ export interface EmitCorrectionEventPayload {
   correction: string;
   reusable: CorrectionReusable;
   proposed_control?: CorrectionProposedControl;
+  /**
+   * Optional domain for building a subject from runtime digests + SHA fields.
+   * The emitter derives `evidence_subject` only from these runtime fields —
+   * never from a caller-supplied subject object or free-text `correction`.
+   * When digests / candidate SHA cannot form a full subject, the event is
+   * stored with explicit `evidence_subject: null` (producer unbound), not
+   * with the field omitted (historical `legacy_unbound`).
+   */
+  domain?: string;
+  policy_hash?: string;
+  engine_fingerprint?: string;
+  verifier_fingerprint?: string;
+  required_evidence_set_revision?: string;
+  diff_hash?: string | null;
+  pr?: number | null;
 }
 
 const CORRECTION_TEXT_CAP = 500;
 
 function nowIso(): string {
   return new Date().toISOString().replace(/\.\d+Z$/, "Z");
+}
+
+/**
+ * Build evidence_subject for a correction_event from authoritative runtime
+ * state only (#692 review-2): resolved domain/repo, issue, PR, run_id,
+ * reviewed/head SHA, and digest fields on the payload. Never accepts a
+ * caller-supplied subject object as identity authority (that path allowed a
+ * nested subject to name a different candidate or policy surface than the
+ * event). Never invents digests. Returns null when required inputs are
+ * missing or build fails — the emitter serializes that as explicit
+ * `evidence_subject: null` (producer unbound), not field omission.
+ */
+function resolveCorrectionEvidenceSubject(
+  payload: EmitCorrectionEventPayload,
+  reviewedSha: string | null,
+  headSha: string | null,
+): EvidenceSubjectV1 | null {
+  const candidate =
+    normalizeSubjectSha(reviewedSha) ??
+    normalizeSubjectSha(headSha) ??
+    null;
+  if (!candidate) return null;
+  const domain = (payload.domain ?? payload.repo ?? "").trim();
+  if (
+    !domain ||
+    !payload.policy_hash ||
+    !payload.engine_fingerprint ||
+    !payload.verifier_fingerprint ||
+    !payload.required_evidence_set_revision
+  ) {
+    return null;
+  }
+  try {
+    return buildEvidenceSubject({
+      domain,
+      issue: payload.issue,
+      pr: payload.pr ?? null,
+      run_id: payload.run_id,
+      candidate_sha: candidate,
+      diff_hash: payload.diff_hash ?? null,
+      policy_hash: payload.policy_hash,
+      engine_fingerprint: payload.engine_fingerprint,
+      verifier_fingerprint: payload.verifier_fingerprint,
+      required_evidence_set_revision: payload.required_evidence_set_revision,
+    });
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Classify correction_event currency against a live evaluation pin / head.
+ *
+ * Prefers evidence_subject comparison when present (#692). Historical events
+ * that omit the field are always labeled `legacy_unbound` — never a full
+ * multi-dimension subject match.
+ *
+ * When a well-formed evaluation pin is available, historical omission is
+ * non-current for readiness composition even if `reviewed_sha` equals the pin
+ * candidate: SHA-only match must not certify multi-dimension currency
+ * (#692 pre-merge delta b0373000). The reviewed_sha vs candidate SHA fallback
+ * applies only when no evaluation pin is supplied (non-readiness / transitional
+ * lineage use).
+ *
+ * Explicit `evidence_subject: null` (current-schema producer unbound) is
+ * quarantined as `malformed` and does NOT receive the legacy SHA fallback —
+ * so a producer failure cannot silently pass as pre-migration evidence.
+ *
+ * Readiness currency (`stale`) is false only on full subject match against the
+ * evaluation pin. Any subject mismatch that governs correction acceptance —
+ * including candidate_sha, policy_hash, engine_fingerprint,
+ * verifier_fingerprint, required_evidence_set_revision, and other v1 compare
+ * fields — is non-current. Callers that need candidate-lineage visibility
+ * inspect `mismatched_fields` / `comparison` rather than treating candidate-
+ * only freshness as event currentness (#692 review-2 ebcde2b2).
+ *
+ * Never returns `match` without a well-formed evaluation-pin subject. A
+ * present but unparseable subject is quarantined (`malformed`). When a
+ * subject is present without a pin, result is non-current (pin-unavailable),
+ * not a SHA-only full match. Event `reviewed_sha` / `head_sha` must agree with
+ * `evidence_subject.candidate_sha` when both are well-formed SHAs.
+ */
+export function classifyCorrectionEventCurrency(
+  event: Pick<
+    CorrectionEvent,
+    "reviewed_sha" | "head_sha" | "run_id" | "evidence_subject"
+  >,
+  opts: {
+    /** Live product candidate SHA (evaluation pin). */
+    candidateSha: string;
+    /** Full evaluation pin subject when available. */
+    evaluationPin?: EvidenceSubjectV1 | null;
+  },
+): {
+  stale: boolean;
+  subject_outcome: EvidenceSubjectComparisonOutcome;
+  mismatched_fields: string[];
+  comparison?: EvidenceSubjectComparison;
+} {
+  const pin = opts.evaluationPin ?? null;
+
+  // Explicit current-schema unbound: producer wrote null. Quarantine — do not
+  // grant historical legacy_unbound SHA fallback (#692 review-2 513f6d02).
+  if (event.evidence_subject === null) {
+    return {
+      stale: true,
+      subject_outcome: "malformed",
+      mismatched_fields: [],
+    };
+  }
+
+  if (event.evidence_subject !== undefined) {
+    const parsed = parseEvidenceSubjectDetailed(event.evidence_subject);
+    if (parsed.status !== "ok") {
+      return {
+        stale: true,
+        subject_outcome: "malformed",
+        mismatched_fields: [],
+      };
+    }
+
+    // Subject candidate must agree with applicable event SHA fields when those
+    // fields are well-formed full SHAs (spec: candidate_sha represents the
+    // same candidate as reviewed/head for that event).
+    const subjectSha = parsed.subject.candidate_sha;
+    for (const field of [event.reviewed_sha, event.head_sha] as const) {
+      const eventSha = normalizeSubjectSha(field);
+      if (eventSha !== null && eventSha !== subjectSha) {
+        return {
+          stale: true,
+          subject_outcome: "mismatch",
+          mismatched_fields: ["candidate_sha"],
+        };
+      }
+    }
+
+    if (pin) {
+      const cmp = compareEvidenceSubjects(parsed.subject, pin);
+      if (cmp.outcome === "match") {
+        return {
+          stale: false,
+          subject_outcome: "match",
+          mismatched_fields: [],
+          comparison: cmp,
+        };
+      }
+      if (cmp.outcome === "mismatch") {
+        // Any governing subject mismatch is non-current for correction
+        // readiness reuse — not only candidate_sha (#692 review-2 ebcde2b2).
+        return {
+          stale: true,
+          subject_outcome: "mismatch",
+          mismatched_fields: [...cmp.mismatched_fields],
+          comparison: cmp,
+        };
+      }
+      return {
+        stale: true,
+        subject_outcome: cmp.outcome,
+        mismatched_fields: [],
+        comparison: cmp,
+      };
+    }
+
+    // Subject present but no evaluation pin: never claim multi-dimension match
+    // from live candidate SHA alone. Pin-unavailable → non-current quarantine.
+    return {
+      stale: true,
+      subject_outcome: "malformed",
+      mismatched_fields: [],
+    };
+  }
+
+  // Historical omission only (`legacy_unbound`). With an evaluation pin, do
+  // not certify readiness currency from reviewed_sha alone — multi-dimension
+  // identity is unavailable without a bound subject (#692 b0373000).
+  if (pin) {
+    return {
+      stale: true,
+      subject_outcome: "legacy_unbound",
+      mismatched_fields: [],
+    };
+  }
+
+  // Pin unavailable: SHA-only lineage fallback for non-readiness use.
+  const reviewed = event.reviewed_sha;
+  const live = opts.candidateSha;
+  const stale = reviewed != null && reviewed !== live;
+  return {
+    stale,
+    subject_outcome: "legacy_unbound",
+    mismatched_fields: [],
+  };
 }
 
 /**
@@ -303,6 +531,13 @@ export async function emitCorrectionEvent(
       },
       deps,
     );
+    // Always bind subject or explicit null — never omit on new writes so
+    // consumers can distinguish producer unbound from historical absence.
+    const evidenceSubject = resolveCorrectionEvidenceSubject(
+      payload,
+      reviewedSha,
+      headSha,
+    );
     const event: CorrectionEvent = {
       schema_version: RUN_SCHEMA_VERSION as 1,
       type: "correction_event",
@@ -338,6 +573,7 @@ export async function emitCorrectionEvent(
       ...(payload.proposed_control !== undefined
         ? { proposed_control: payload.proposed_control }
         : {}),
+      evidence_subject: evidenceSubject,
     };
     return await appendEvent(runDir, event, deps);
   } catch (err) {

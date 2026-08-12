@@ -110,6 +110,13 @@ export interface ReviewArtifact {
     confidence?: number;
     rejectedAlternatives?: string[];
   }>;
+  /**
+   * Shared immutable evidence identity (#692). Present on newly encoded
+   * artifacts; absent on pre-subject comments (`legacy_unbound`). When present,
+   * `candidate_sha` / `diff_hash` MUST equal `reviewedSha` / `diffHash`.
+   * Engine-authored only — never from reviewer free text.
+   */
+  evidence_subject?: import("../evidence-subject.ts").EvidenceSubjectV1;
 }
 
 /**
@@ -220,7 +227,10 @@ export function extractReviewArtifact(body: string): ReviewArtifact | null {
         (typeof obj.pipelineRunId !== "string" || !/^[A-Za-z0-9._:/-]+$/.test(obj.pipelineRunId))) ||
       (obj.bodyHash !== undefined && typeof obj.bodyHash !== "string") ||
       (obj.blockingFindings !== undefined && !isValidBlockingFindings(obj.blockingFindings)) ||
-      (obj.advisoryFindings !== undefined && !isValidBlockingFindings(obj.advisoryFindings))
+      (obj.advisoryFindings !== undefined && !isValidBlockingFindings(obj.advisoryFindings)) ||
+      (obj.evidence_subject !== undefined &&
+        obj.evidence_subject !== null &&
+        typeof obj.evidence_subject !== "object")
     ) {
       return null;
     }
@@ -238,6 +248,18 @@ export function extractReviewArtifact(body: string): ReviewArtifact | null {
     }
     if (isValidBlockingFindings(obj.advisoryFindings)) {
       artifact.advisoryFindings = obj.advisoryFindings;
+    }
+    // evidence_subject (#692): accept structurally; consumers parse/validate.
+    // Do not reject the whole artifact if subject is present but incomplete —
+    // subject comparison returns malformed/legacy; existing fields still work.
+    if (
+      obj.evidence_subject !== undefined &&
+      obj.evidence_subject !== null &&
+      typeof obj.evidence_subject === "object" &&
+      !Array.isArray(obj.evidence_subject)
+    ) {
+      artifact.evidence_subject =
+        obj.evidence_subject as import("../evidence-subject.ts").EvidenceSubjectV1;
     }
     return artifact;
   } catch {

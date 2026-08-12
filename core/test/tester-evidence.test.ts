@@ -925,3 +925,177 @@ test("loadOrRegenerate: no regenerate callback keeps pure load-only fail_closed"
 test("default max_output_chars constant", () => {
   assert.equal(DEFAULT_MAX_OUTPUT_CHARS, 4000);
 });
+
+// ---------------------------------------------------------------------------
+// evidence_subject (#692)
+// ---------------------------------------------------------------------------
+
+import {
+  buildEvidenceSubject,
+  buildEngineFingerprint,
+  buildRequiredEvidenceSetRevision,
+  buildTesterPolicyHash,
+  verifierFingerprintFromEngine,
+} from "../scripts/evidence-subject.ts";
+
+const ENGINE_FP = buildEngineFingerprint({
+  version: "1.0.0",
+  templates_fingerprint: "t".repeat(64),
+});
+const TESTER_POLICY = buildTesterPolicyHash({
+  command_identity: "npm test",
+  enabled: true,
+  timeout: 300,
+  max_output_chars: 4000,
+});
+const REQ_REV = buildRequiredEvidenceSetRevision();
+
+function sampleTesterSubject(
+  over: {
+    candidate_sha?: string;
+    policy_hash?: string;
+    run_id?: string;
+    domain?: string;
+  } = {},
+) {
+  return buildEvidenceSubject({
+    domain: over.domain ?? "owner/repo",
+    issue: 646,
+    pr: null,
+    run_id: over.run_id ?? "646/test-run",
+    candidate_sha: over.candidate_sha ?? SHA_A,
+    diff_hash: null,
+    policy_hash: over.policy_hash ?? TESTER_POLICY,
+    engine_fingerprint: ENGINE_FP,
+    verifier_fingerprint: verifierFingerprintFromEngine(ENGINE_FP),
+    required_evidence_set_revision: REQ_REV,
+  });
+}
+
+test("buildTesterEvidence emits evidence_subject consistent with top-level identity", () => {
+  const e = buildTesterEvidence({
+    candidateSha: SHA_A,
+    runId: "646/test-run",
+    issue: 646,
+    pr: null,
+    wtPath: "/wt/x",
+    enabled: true,
+    commandIdentity: "npm test",
+    timeoutSec: 300,
+    maxOutputChars: 4000,
+    startedAt: "2026-08-05T00:00:00Z",
+    endedAt: "2026-08-05T00:00:01Z",
+    durationMs: 1000,
+    overallStatus: "passed",
+    lastCommand: {
+      identity: "npm test",
+      exitCode: 0,
+      durationMs: 900,
+      status: "passed",
+      output: "ok",
+    },
+    domain: "owner/repo",
+    engineFingerprint: ENGINE_FP,
+    verifierFingerprint: verifierFingerprintFromEngine(ENGINE_FP),
+    requiredEvidenceSetRevision: REQ_REV,
+  });
+  assert.ok(e.evidence_subject, "subject must be present on new production");
+  assert.equal(e.evidence_subject!.schema_version, 1);
+  assert.equal(e.evidence_subject!.candidate_sha, e.candidate_sha);
+  assert.equal(e.evidence_subject!.run_id, e.run_id);
+  assert.equal(e.evidence_subject!.issue, e.issue);
+  assert.equal(e.evidence_subject!.pr, e.pr);
+  assert.equal(e.evidence_subject!.domain, "owner/repo");
+});
+
+test("acquisition: subject match + pass is current", () => {
+  const pin = sampleTesterSubject();
+  const evidence = baseEvidence({ evidence_subject: pin });
+  const acq = loadTesterEvidenceForReviewSync(
+    { status: "ok", evidence },
+    SHA_A,
+    "fail_closed",
+    { evaluationPin: pin },
+  );
+  assert.equal(acq.classification, "current");
+  assert.equal(acq.subject_outcome, "match");
+  assert.equal(acq.withholdInvoke, false);
+});
+
+test("acquisition: subject candidate mismatch is stale (post-fix regeneration required)", () => {
+  const artSubject = sampleTesterSubject({ candidate_sha: SHA_A });
+  const pin = sampleTesterSubject({ candidate_sha: SHA_B });
+  const evidence = baseEvidence({
+    candidate_sha: SHA_A,
+    evidence_subject: artSubject,
+  });
+  const acq = loadTesterEvidenceForReviewSync(
+    { status: "ok", evidence },
+    SHA_B,
+    "fail_closed",
+    { evaluationPin: pin },
+  );
+  assert.equal(acq.classification, "stale");
+  assert.equal(acq.subject_outcome, "mismatch");
+  assert.ok(acq.subject_mismatched_fields?.includes("candidate_sha"));
+  assert.equal(acq.withholdInvoke, true);
+  assert.match(acq.reason, /Regeneration required|stale/i);
+});
+
+test("acquisition: legacy record without subject uses candidate_sha fallback with legacy_unbound", () => {
+  const evidence = baseEvidence(); // no evidence_subject
+  assert.equal(evidence.evidence_subject, undefined);
+  const acq = loadTesterEvidenceForReviewSync(
+    { status: "ok", evidence },
+    SHA_A,
+    "fail_closed",
+  );
+  assert.equal(acq.classification, "current");
+  assert.equal(acq.subject_outcome, "legacy_unbound");
+  assert.match(acq.reason, /legacy_unbound/);
+});
+
+test("acquisition: legacy SHA match never claims full subject match", () => {
+  const acq = loadTesterEvidenceForReviewSync(
+    { status: "ok", evidence: baseEvidence() },
+    SHA_A,
+  );
+  assert.notEqual(acq.subject_outcome, "match");
+  assert.equal(acq.subject_outcome, "legacy_unbound");
+});
+
+test("post-fix regeneration: A-bound evidence non-current for B until rewrite", async () => {
+  const io = memoryIo();
+  const runDir = "/runs/692-postfix";
+  const subjectA = sampleTesterSubject({ candidate_sha: SHA_A });
+  await writeTesterEvidence(
+    runDir,
+    baseEvidence({ candidate_sha: SHA_A, evidence_subject: subjectA }),
+    { io, appendEvent: false },
+  );
+  const pinB = sampleTesterSubject({ candidate_sha: SHA_B });
+  const before = await loadTesterEvidenceForReview(
+    runDir,
+    SHA_B,
+    { tester_evidence: DEFAULT_TESTER_EVIDENCE_CONFIG },
+    io,
+    { evaluationPin: pinB },
+  );
+  assert.equal(before.classification, "stale");
+
+  const subjectB = sampleTesterSubject({ candidate_sha: SHA_B });
+  await writeTesterEvidence(
+    runDir,
+    baseEvidence({ candidate_sha: SHA_B, evidence_subject: subjectB }),
+    { io, appendEvent: false },
+  );
+  const after = await loadTesterEvidenceForReview(
+    runDir,
+    SHA_B,
+    { tester_evidence: DEFAULT_TESTER_EVIDENCE_CONFIG },
+    io,
+    { evaluationPin: pinB },
+  );
+  assert.equal(after.classification, "current");
+  assert.equal(after.subject_outcome, "match");
+});

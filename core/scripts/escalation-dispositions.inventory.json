@@ -1109,7 +1109,7 @@
     {
       "site_id": "stages.review-routing:harness-failure#0",
       "module": "scripts/stages/review-routing.ts",
-      "line": 189,
+      "line": 291,
       "occurrence": 0,
       "match": "Label transition failed: ${errMsg}",
       "disposition": "transient-retryable",
@@ -1121,7 +1121,7 @@
     {
       "site_id": "stages.review-routing:no-pull-request#0",
       "module": "scripts/stages/review-routing.ts",
-      "line": 201,
+      "line": 303,
       "occurrence": 0,
       "match": "No pull request found for this issue.",
       "disposition": "deliberately-fail-closed",
@@ -1133,7 +1133,7 @@
     {
       "site_id": "stages.review-routing:harness-failure#1",
       "module": "scripts/stages/review-routing.ts",
-      "line": 210,
+      "line": 312,
       "occurrence": 1,
       "match": "PR head SHA is missing or invalid: \"${sha}\"",
       "disposition": "transient-retryable",
@@ -1145,7 +1145,7 @@
     {
       "site_id": "stages.review-routing:harness-failure#2",
       "module": "scripts/stages/review-routing.ts",
-      "line": 215,
+      "line": 317,
       "occurrence": 2,
       "match": "Could not resolve PR head SHA: ${(err as Error).message}",
       "disposition": "transient-retryable",
@@ -1157,7 +1157,7 @@
     {
       "site_id": "stages.review-routing:harness-failure#3",
       "module": "scripts/stages/review-routing.ts",
-      "line": 230,
+      "line": 332,
       "occurrence": 3,
       "match": "Could not retrieve PR diff: ${e.message}",
       "disposition": "transient-retryable",
@@ -1169,7 +1169,7 @@
     {
       "site_id": "stages.review-routing:harness-failure#4",
       "module": "scripts/stages/review-routing.ts",
-      "line": 234,
+      "line": 336,
       "occurrence": 4,
       "match": "PR has an empty diff.",
       "disposition": "transient-retryable",
@@ -1181,7 +1181,7 @@
     {
       "site_id": "stages.review-routing:harness-failure#5",
       "module": "scripts/stages/review-routing.ts",
-      "line": 242,
+      "line": 344,
       "occurrence": 5,
       "match": "PR HEAD moved while fetching diff (${commitSha.slice(0, 7)} → ${postDiffSha.slic",
       "disposition": "transient-retryable",
@@ -1193,7 +1193,7 @@
     {
       "site_id": "stages.review-routing:harness-failure#6",
       "module": "scripts/stages/review-routing.ts",
-      "line": 254,
+      "line": 356,
       "occurrence": 6,
       "match": "Could not verify PR HEAD after diff fetch (${e.message}). Re-run the review stag",
       "disposition": "transient-retryable",
@@ -1205,7 +1205,7 @@
     {
       "site_id": "stages.review-routing:needs-human#0",
       "module": "scripts/stages/review-routing.ts",
-      "line": 305,
+      "line": 407,
       "occurrence": 0,
       "match": "${unacknowledged.length} unacknowledged human comment(s) after the latest plan —",
       "disposition": "deliberately-fail-closed",
@@ -1217,7 +1217,7 @@
     {
       "site_id": "stages.review-routing:harness-failure#7",
       "module": "scripts/stages/review-routing.ts",
-      "line": 539,
+      "line": 644,
       "occurrence": 7,
       "match": "harness-failure",
       "disposition": "transient-retryable",
@@ -1229,7 +1229,7 @@
     {
       "site_id": "stages.review-routing:harness-failure#8",
       "module": "scripts/stages/review-routing.ts",
-      "line": 603,
+      "line": 718,
       "occurrence": 8,
       "match": "Delegated executor \"${executorName}\"${providerNote} for stage \"${stage}\" format-",
       "disposition": "transient-retryable",
@@ -1241,7 +1241,7 @@
     {
       "site_id": "stages.review-routing:harness-failure#9",
       "module": "scripts/stages/review-routing.ts",
-      "line": 627,
+      "line": 742,
       "occurrence": 9,
       "match": "harness-failure",
       "disposition": "transient-retryable",
@@ -1253,8 +1253,20 @@
     {
       "site_id": "stages.review-routing:harness-failure#10",
       "module": "scripts/stages/review-routing.ts",
-      "line": 777,
+      "line": 845,
       "occurrence": 10,
+      "match": "harness-failure",
+      "disposition": "deliberately-fail-closed",
+      "blocker_kind": "harness-failure",
+      "canonical_reason": "workflow-engine-defect",
+      "notes": "evidence_subject production failed for new review artifact (#692) — fail closed, never silent legacy_unbound",
+      "emitter": "setBlocked"
+    },
+    {
+      "site_id": "stages.review-routing:harness-failure#11",
+      "module": "scripts/stages/review-routing.ts",
+      "line": 970,
+      "occurrence": 11,
       "match": "Review ${round} returned \\",
       "disposition": "transient-retryable",
       "blocker_kind": "harness-failure",
@@ -1265,7 +1277,7 @@
     {
       "site_id": "stages.review-routing:dynamic#0",
       "module": "scripts/stages/review-routing.ts",
-      "line": 914,
+      "line": 1110,
       "occurrence": 0,
       "match": "dynamic",
       "disposition": "deliberately-fail-closed",

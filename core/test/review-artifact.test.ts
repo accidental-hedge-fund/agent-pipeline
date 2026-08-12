@@ -290,3 +290,149 @@ test("ReviewArtifact: returns null when blockingFindings is malformed (missing k
   const body = `<!-- review-artifact: ${b64} -->`;
   assert.equal(extractReviewArtifact(body), null);
 });
+
+// ---------------------------------------------------------------------------
+// evidence_subject (#692)
+// ---------------------------------------------------------------------------
+
+import {
+  buildEvidenceSubject,
+  buildEngineFingerprint,
+  buildRequiredEvidenceSetRevision,
+  buildReviewPolicyHash,
+  compareEvidenceSubjects,
+  verifierFingerprintFromEngine,
+} from "../scripts/evidence-subject.ts";
+
+const REVIEW_ENGINE = buildEngineFingerprint({
+  version: "1.0.0",
+  templates_fingerprint: "f".repeat(64),
+});
+const REVIEW_SUBJECT = buildEvidenceSubject({
+  domain: "owner/repo",
+  issue: 692,
+  pr: 10,
+  run_id: "692/run",
+  candidate_sha: SAMPLE.reviewedSha,
+  diff_hash: SAMPLE.diffHash,
+  policy_hash: buildReviewPolicyHash({
+    block_threshold: "high",
+    min_confidence: 0.7,
+  }),
+  engine_fingerprint: REVIEW_ENGINE,
+  verifier_fingerprint: verifierFingerprintFromEngine(REVIEW_ENGINE),
+  required_evidence_set_revision: buildRequiredEvidenceSetRevision(),
+});
+
+test("ReviewArtifact: encode/decode preserves evidence_subject", () => {
+  const artifact: ReviewArtifact = {
+    ...SAMPLE,
+    evidence_subject: REVIEW_SUBJECT,
+  };
+  const decoded = extractReviewArtifact(encodeReviewArtifact(artifact));
+  assert.ok(decoded?.evidence_subject);
+  assert.equal(decoded!.evidence_subject!.schema_version, 1);
+  assert.equal(decoded!.evidence_subject!.candidate_sha, SAMPLE.reviewedSha);
+  assert.equal(decoded!.evidence_subject!.diff_hash, SAMPLE.diffHash);
+  assert.deepEqual(decoded!.evidence_subject, REVIEW_SUBJECT);
+});
+
+test("ReviewArtifact: subject candidate_sha consistent with reviewedSha", () => {
+  const artifact: ReviewArtifact = {
+    ...SAMPLE,
+    evidence_subject: REVIEW_SUBJECT,
+  };
+  assert.equal(artifact.evidence_subject!.candidate_sha, artifact.reviewedSha);
+  assert.equal(artifact.evidence_subject!.diff_hash, artifact.diffHash);
+});
+
+test("ReviewArtifact: legacy artifact without subject remains extractable (legacy_unbound)", () => {
+  const decoded = extractReviewArtifact(encodeReviewArtifact(SAMPLE));
+  assert.ok(decoded);
+  assert.equal(decoded!.evidence_subject, undefined);
+  const cmp = compareEvidenceSubjects(decoded!.evidence_subject, REVIEW_SUBJECT);
+  assert.equal(cmp.outcome, "legacy_unbound");
+});
+
+test("buildReviewEvidenceSubject: required revision reflects effective gate set", async () => {
+  const { buildReviewEvidenceSubject } = await import(
+    "../scripts/stages/review-routing.ts"
+  );
+  const { buildRequiredEvidenceSetRevisionFromGates } = await import(
+    "../scripts/evidence-subject.ts"
+  );
+  const baseCfg = {
+    domain: "owner/repo",
+    repo: "owner/repo",
+    test_gate: { enabled: true },
+    eval_gate: { enabled: false },
+    visual_gate: { enabled: false },
+    shipcheck_gate: { enabled: false },
+  } as never;
+  const withEvalCfg = {
+    ...baseCfg,
+    eval_gate: { enabled: true },
+  } as never;
+  const engine = {
+    version: "1.0.0",
+    templates_fingerprint: "f".repeat(64),
+  };
+  const policy = { block_threshold: "high", min_confidence: 0.7 };
+  const a = buildReviewEvidenceSubject({
+    cfg: baseCfg,
+    issueNumber: 692,
+    prNumber: 10,
+    runId: "692/run",
+    candidateSha: SAMPLE.reviewedSha,
+    diffHash: SAMPLE.diffHash,
+    reviewPolicy: policy,
+    engineIdentity: engine,
+  });
+  const b = buildReviewEvidenceSubject({
+    cfg: withEvalCfg,
+    issueNumber: 692,
+    prNumber: 10,
+    runId: "692/run",
+    candidateSha: SAMPLE.reviewedSha,
+    diffHash: SAMPLE.diffHash,
+    reviewPolicy: policy,
+    engineIdentity: engine,
+  });
+  assert.ok(a);
+  assert.ok(b);
+  assert.equal(
+    a!.required_evidence_set_revision,
+    buildRequiredEvidenceSetRevisionFromGates({ testGateEnabled: true }),
+  );
+  assert.equal(
+    b!.required_evidence_set_revision,
+    buildRequiredEvidenceSetRevisionFromGates({
+      testGateEnabled: true,
+      evalGateEnabled: true,
+    }),
+  );
+  assert.notEqual(
+    a!.required_evidence_set_revision,
+    b!.required_evidence_set_revision,
+  );
+});
+
+test("buildReviewEvidenceSubject: missing run_id fails closed (null)", async () => {
+  const { buildReviewEvidenceSubject } = await import(
+    "../scripts/stages/review-routing.ts"
+  );
+  const subject = buildReviewEvidenceSubject({
+    cfg: { domain: "owner/repo", repo: "owner/repo" } as never,
+    issueNumber: 692,
+    prNumber: null,
+    runId: undefined,
+    candidateSha: SAMPLE.reviewedSha,
+    diffHash: null,
+    reviewPolicy: { block_threshold: "high", min_confidence: 0.7 },
+    engineIdentity: {
+      version: "1.0.0",
+      templates_fingerprint: "f".repeat(64),
+    },
+  });
+  assert.equal(subject, null);
+});
