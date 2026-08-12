@@ -12,6 +12,7 @@
 - [x] 2.3 Add or retain fixture: open R2D + open PR still merges and proves containment.
 - [x] 2.4 Add or retain fixture: open R2D + already-merged PR contained in base → already-integrated without second merge (any-state path).
 - [x] 2.5 Prove the closed+merged+R2D test fails against current open-only behavior before the fix (or document equivalent bite), then passes with the fix.
+- [x] 2.6 Add unit fixture: open `pipeline:ready` (pre-R2D) issue with only a historical merged any-state PR → advances and merges new open PR; does not skip as already-integrated (#1014 review).
 
 ## 3. Mirror, CI, and docs touch
 

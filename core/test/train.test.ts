@@ -323,6 +323,55 @@ test("train merge: open R2D + since-merged PR (any-state only) is already-integr
   assert.equal(result.status.items[0]!.integrated, true);
 });
 
+test("train merge: reopened pre-R2D issue with only historical merged PR advances (#1014 review)", async () => {
+  // Bite: unrestricted any-state early reconciliation treated a reopened
+  // pipeline:ready issue as already-integrated from its prior merged PR and
+  // skipped unfinished work before advanceIssue. Any-state short-circuit is
+  // R2D-only; pre-R2D must still advance.
+  const deps = makeDeps();
+  deps.seedIssue(snap(42, "new work after reopen", ["pipeline:ready"]));
+  // Only historical merged timeline PR — no open PR yet.
+  deps.seedMergedPrAnyState(42, 900, "merge900" + "0".repeat(32));
+
+  const result = await runTrain(baseOpts({ issues: [42], merge: true }), deps);
+  assert.equal(result.exitCode, 0, result.status.blocker ?? "ok");
+  assert.deepEqual(deps.advanceCalls, [42], "pre-R2D must advance, not skip as integrated");
+  assert.equal(deps.mergeCalls.length, 0, "historical merged PR is not re-merged");
+  // After advance reaches R2D with no new open PR, merge-wave may correctly
+  // classify the historical merged PR as already-integrated. The bug was
+  // skipping *before* advance.
+  assert.equal(result.status.items[0]!.integrated, true);
+  assert.equal(result.status.items[0]!.terminal, "already-integrated");
+  assert.equal(result.status.items[0]!.pr, 900);
+});
+
+test("train merge: reopened pre-R2D with historical merged + new open PR merges new work (#1014 review)", async () => {
+  // Same reopen scenario, but advance surfaces a new open PR for the new work.
+  // Early any-state must not skip; the new open PR must be merged.
+  const advanceCalls: number[] = [];
+  const deps = makeDeps({
+    async advanceIssue(n) {
+      advanceCalls.push(n);
+      const issues = (deps as unknown as { _issues: Map<number, TrainIssueSnapshot> })._issues;
+      const s = issues.get(n)!;
+      s.labels = ["pipeline:ready-to-deploy"];
+      // New work PR appears only after advance (not present for early reconcile).
+      deps.seedPr(n, 901);
+      return { ok: true, terminal: "ready-to-deploy", labels: s.labels };
+    },
+  });
+  deps.seedIssue(snap(42, "new work after reopen", ["pipeline:ready"]));
+  deps.seedMergedPrAnyState(42, 900, "merge900" + "0".repeat(32));
+
+  const result = await runTrain(baseOpts({ issues: [42], merge: true }), deps);
+  assert.equal(result.exitCode, 0, result.status.blocker ?? "ok");
+  assert.deepEqual(advanceCalls, [42]);
+  assert.deepEqual(deps.mergeCalls, [901]);
+  assert.equal(result.status.items[0]!.pr, 901);
+  assert.equal(result.status.items[0]!.integrated, true);
+  assert.equal(result.status.items[0]!.terminal, "ready-to-deploy");
+});
+
 test("train merge: containment failure stops before next item", async () => {
   const deps = makeDeps({
     async isAncestor() {

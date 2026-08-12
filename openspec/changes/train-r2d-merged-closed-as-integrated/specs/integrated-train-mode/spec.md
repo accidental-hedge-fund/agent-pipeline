@@ -35,7 +35,7 @@ When `--merge` is provided and an item carries `pipeline:ready-to-deploy` (or an
 
 ### Requirement: Train merge mode SHALL integrate each item before starting the next
 
-When `--merge` is provided, for each work-list item in order the train SHALL: (1) reconcile whether the item is already integrated via a linked merged PR (any PR state) and base containment when a merge-result OID is available; (2) if not already integrated, advance the item to `pipeline:ready-to-deploy` if not already there; (3) resolve exactly one linked open pull request when a merge mutation is still required; (4) invoke the existing Pipeline issue-PR merge surface with the same gates as `pipeline merge`; (5) observe the pull request's merge-result commit; (6) fetch the configured base and prove that merge-result is contained in the fetched base tip ancestry; (7) only then start the next item. Concurrent capacity for item advance under merge mode SHALL be one. The train SHALL NOT treat "no linked open PR" as a hard stop when reconciliation already established a merged linked PR for the item.
+When `--merge` is provided, for each work-list item in order the train SHALL: (1) when the item is already at `pipeline:ready-to-deploy` (or an equivalent ready-to-deploy terminal), reconcile whether it is already integrated via a linked merged PR resolved across open, closed, or merged PR state and base containment when a merge-result OID is available — pre-ready-to-deploy items SHALL NOT be short-circuited as integrated from a historical merged PR alone; (2) if not already integrated, advance the item to `pipeline:ready-to-deploy` if not already there; (3) resolve exactly one linked open pull request when a merge mutation is still required; (4) invoke the existing Pipeline issue-PR merge surface with the same gates as `pipeline merge`; (5) observe the pull request's merge-result commit; (6) fetch the configured base and prove that merge-result is contained in the fetched base tip ancestry; (7) only then start the next item. Concurrent capacity for item advance under merge mode SHALL be one. The train SHALL NOT treat "no linked open PR" as a hard stop when reconciliation already established a merged linked PR for a ready-to-deploy item.
 
 #### Scenario: Dependent starts only after prerequisite merge is contained
 
@@ -57,7 +57,14 @@ When `--merge` is provided, for each work-list item in order the train SHALL: (1
 
 #### Scenario: Already-merged PR is idempotent success
 
-- **WHEN** reconciliation shows a linked PR (resolved across open, closed, or merged state) is already merged and its merge-result is contained in the fetched base
+- **WHEN** reconciliation shows a linked PR (resolved across open, closed, or merged state) is already merged and its merge-result is contained in the fetched base for an item at ready-to-deploy
 - **THEN** the train SHALL treat the item as integrated and continue to the next item
 - **AND** it SHALL NOT attempt a second merge mutation
 - **AND** this SHALL hold even when the issue is closed and still labeled `pipeline:ready-to-deploy`
+
+#### Scenario: Reopened pre-ready-to-deploy issue with historical merged PR is not skipped
+
+- **WHEN** `pipeline train --merge` processes an open issue labeled `pipeline:ready` (or another pre-ready-to-deploy stage) whose only linked PR from prior work is already merged
+- **THEN** the train SHALL NOT treat the item as already integrated from that historical PR alone
+- **AND** it SHALL advance the item toward ready-to-deploy
+- **AND** if a new open linked PR exists after advance, the train SHALL merge that PR under the normal merge path

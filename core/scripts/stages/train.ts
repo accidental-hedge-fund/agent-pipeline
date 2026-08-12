@@ -278,11 +278,15 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
     let snap = byNumber.get(issue) ?? (await deps.getIssue(issue));
     let stage = pipelineStageFromLabels(snap.labels);
 
-    // Idempotent: already merged PR (any state) + base containment → skip.
-    // Open-only lookup misses closed/merged PRs after integration (#1014).
+    // Idempotent: already merged PR + base containment → skip before advance.
+    // Any-state (closed/merged) lookup is only for ready-to-deploy terminals —
+    // pre-R2D / reopened items may retain a historical merged PR and must still
+    // advance (#1014 review). Open-PR reconciliation remains available at any stage.
     if (mergeMode) {
       const openPr = await deps.getPrForIssue(issue);
-      const linkedPr = openPr ?? (await deps.getPrForIssueAnyState(issue));
+      const linkedPr =
+        openPr ??
+        (stage === "ready-to-deploy" ? await deps.getPrForIssueAnyState(issue) : null);
       if (linkedPr != null) {
         const recon = await reconcileMergedPrIntegration(linkedPr, opts.baseBranch, deps);
         if (recon.kind === "integrated") {
@@ -302,8 +306,8 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
           continue;
         }
         if (recon.kind === "containment-failed" && openPr == null) {
-          // Merged linked PR found only via any-state; not in base → stop
-          // (not "no linked open PR").
+          // Merged linked PR found only via any-state on an R2D item; not in
+          // base → stop (not "no linked open PR").
           blocker =
             `merge result ${recon.mergeCommitOid} for #${issue} PR #${linkedPr} is not contained in ` +
             `fetched ${opts.baseBranch} tip ${recon.tip}`;
