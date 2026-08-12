@@ -70,19 +70,21 @@ export async function finalize(
 ): Promise<Outcome> {
   const storeDeps = runStoreDeps ?? defaultRunStoreDeps;
 
-  // Trusted-surface fail-closed (#691): refuse ready-to-deploy when the run's
-  // decision is blocked (or lacks a usable pin after a computed block).
-  // Historical runs with no decision record are not invented as passthrough —
-  // allowsReadyToDeploy(null) remains true so pre-#691 behavior is preserved.
+  // Trusted-surface fail-closed (#691): current runs with a runDir MUST have a
+  // durable decision. Missing decision is not treated as historical passthrough
+  // on the ready-to-deploy path — only external/historical consumers may opt
+  // into `allowsReadyToDeploy(null, { enforcement: "historical" })`.
   if (runDir) {
     const decision = await readTrustedSurfaceDecision(runDir, storeDeps);
     if (!allowsReadyToDeploy(decision)) {
       const reason =
         decision?.reason?.summary ??
-        "trusted-surface decision blocked readiness";
+        (decision
+          ? "trusted-surface decision blocked readiness"
+          : "trusted-surface decision missing for current run (fail closed)");
       console.log(
         `[pipeline] #${issueNumber}: ready-to-deploy refused — trusted_surface outcome=` +
-          `${decision?.outcome ?? "unknown"} (${decision?.reason?.code ?? "blocked"}): ${reason}`,
+          `${decision?.outcome ?? "missing"} (${decision?.reason?.code ?? "missing_decision"}): ${reason}`,
       );
       return {
         advanced: false,

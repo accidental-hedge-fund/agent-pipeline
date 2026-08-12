@@ -1360,26 +1360,51 @@ export function trustedSurfacePath(runDir: string): string {
 
 /**
  * Persist the trusted-surface decision for the run (atomic tmp + rename).
- * Non-fatal on I/O error. Callers recompute on product candidate SHA advance.
+ * **Fatal on I/O error** for current runs — callers must fail closed rather
+ * than advance readiness without a durable decision (#691 review).
+ * Callers recompute on product candidate SHA advance.
  */
 export async function writeTrustedSurfaceDecision(
   runDir: string,
   decision: TrustedSurfaceDecision,
   deps: RunStoreDeps = defaultRunStoreDeps,
 ): Promise<void> {
-  try {
-    await deps.mkdir(runDir, { recursive: true });
-    const finalPath = trustedSurfacePath(runDir);
-    const tmp = `${finalPath}.tmp`;
-    const cleaned = sanitizeDeep(decision);
-    const serialized = sanitize(redactSecrets(`${JSON.stringify(cleaned, null, 2)}\n`));
-    await deps.writeFile(tmp, serialized);
-    await deps.rename(tmp, finalPath);
-  } catch (err) {
-    console.warn(
-      `[pipeline] run-store: trusted-surface write failed (non-fatal): ${(err as Error).message}`,
+  await deps.mkdir(runDir, { recursive: true });
+  const finalPath = trustedSurfacePath(runDir);
+  const tmp = `${finalPath}.tmp`;
+  const cleaned = sanitizeDeep(decision);
+  const serialized = sanitize(redactSecrets(`${JSON.stringify(cleaned, null, 2)}\n`));
+  await deps.writeFile(tmp, serialized);
+  await deps.rename(tmp, finalPath);
+}
+
+/**
+ * Persist and read back the decision. Throws when write or readback fails or
+ * when the stored outcome/hash does not match (fail closed).
+ */
+export async function persistTrustedSurfaceDecision(
+  runDir: string,
+  decision: TrustedSurfaceDecision,
+  deps: RunStoreDeps = defaultRunStoreDeps,
+): Promise<TrustedSurfaceDecision> {
+  await writeTrustedSurfaceDecision(runDir, decision, deps);
+  const readBack = await readTrustedSurfaceDecision(runDir, deps);
+  if (!readBack) {
+    throw new Error(
+      "trusted-surface decision write succeeded but readback returned null/malformed",
     );
   }
+  if (readBack.outcome !== decision.outcome) {
+    throw new Error(
+      `trusted-surface decision readback outcome mismatch: wrote ${decision.outcome}, read ${readBack.outcome}`,
+    );
+  }
+  if (readBack.effective_verifier_hash !== decision.effective_verifier_hash) {
+    throw new Error(
+      "trusted-surface decision readback effective_verifier_hash mismatch",
+    );
+  }
+  return readBack;
 }
 
 /**
@@ -1393,6 +1418,51 @@ export async function readTrustedSurfaceDecision(
   try {
     const raw = await deps.readFile(trustedSurfacePath(runDir));
     return parseTrustedSurfaceDecision(JSON.parse(raw));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Path for mid-run verifier-identity invalidation marker (#691).
+ * Presence means readiness evidence bound to previous_hash is non-current.
+ */
+export function trustedSurfaceInvalidationPath(runDir: string): string {
+  return path.join(runDir, "trusted-surface-invalidation.json");
+}
+
+export interface TrustedSurfaceInvalidation {
+  at: string;
+  stage: string;
+  previous_hash: string | null;
+  next_hash: string | null;
+  reason: string;
+}
+
+/** Persist a verifier-drift invalidation record (atomic). Throws on I/O failure. */
+export async function writeTrustedSurfaceInvalidation(
+  runDir: string,
+  record: TrustedSurfaceInvalidation,
+  deps: RunStoreDeps = defaultRunStoreDeps,
+): Promise<void> {
+  await deps.mkdir(runDir, { recursive: true });
+  const finalPath = trustedSurfaceInvalidationPath(runDir);
+  const tmp = `${finalPath}.tmp`;
+  const serialized = sanitize(redactSecrets(`${JSON.stringify(sanitizeDeep(record), null, 2)}\n`));
+  await deps.writeFile(tmp, serialized);
+  await deps.rename(tmp, finalPath);
+}
+
+export async function readTrustedSurfaceInvalidation(
+  runDir: string,
+  deps: RunStoreDeps = defaultRunStoreDeps,
+): Promise<TrustedSurfaceInvalidation | null> {
+  try {
+    const raw = await deps.readFile(trustedSurfaceInvalidationPath(runDir));
+    const o = JSON.parse(raw) as TrustedSurfaceInvalidation;
+    if (!o || typeof o !== "object") return null;
+    if (typeof o.at !== "string" || typeof o.stage !== "string") return null;
+    return o;
   } catch {
     return null;
   }

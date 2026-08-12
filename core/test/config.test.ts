@@ -631,6 +631,39 @@ test("resolveConfig: trusted_surface use_candidate_as_trusted rejected", async (
   }
 });
 
+test("applyTrustedVerificationPolicy: base yml overlays test_gate.enabled (not candidate)", async () => {
+  const repo = makeFakeRepo(`test_gate:\n  enabled: false\n  max_attempts: 9\n`);
+  const binDir = makeFakeGh("acme/ts-bind");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-ts-bind`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    // Candidate-loaded config has test_gate disabled.
+    assert.equal(cfg.test_gate.enabled, false);
+    // Rebind from trusted base that enables the gate.
+    const r = cfgMod.applyTrustedVerificationPolicy(
+      cfg,
+      "test_gate:\n  enabled: true\n  max_attempts: 3\n",
+    );
+    assert.equal(r.ok, true);
+    assert.equal(cfg.test_gate.enabled, true);
+    assert.equal(cfg.test_gate.max_attempts, 3);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("testCommandFromPackageJson: reads scripts.test authority", async () => {
+  const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-pkg-cmd`);
+  assert.equal(
+    cfgMod.testCommandFromPackageJson(JSON.stringify({ scripts: { test: "node --test" } })),
+    "npm test",
+  );
+  assert.equal(cfgMod.testCommandFromPackageJson(JSON.stringify({ scripts: {} })), null);
+  assert.equal(cfgMod.testCommandFromPackageJson("not-json"), null);
+});
+
 // ---- review_ensemble (#645) ----
 
 test("resolveConfig: review_ensemble absent — disabled by default", async () => {

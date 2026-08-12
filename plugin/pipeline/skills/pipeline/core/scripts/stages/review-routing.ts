@@ -153,6 +153,15 @@ export interface AdvanceReviewOpts {
   runTestGate?: typeof runTestGate;
   /** Optional TestGateDeps for the regenerative producer (tests inject fakes). */
   testGateDeps?: TestGateDeps;
+  /**
+   * Trusted-surface decision for the run (#691). When set, binds review
+   * evidence_subject.verifier_fingerprint. When omitted and runDir is set,
+   * advanceReview loads the durable decision from the run store.
+   */
+  trustedSurface?: {
+    outcome: string;
+    effective_verifier_hash: string | null;
+  } | null;
 }
 
 /**
@@ -220,6 +229,7 @@ export function buildReviewEvidenceSubject(args: {
   /**
    * Trusted-surface decision for the run (#691). When present, binds
    * verifier_fingerprint to effective_verifier_hash (or fails closed on blocked).
+   * Callers should pass the run decision whenever available.
    */
   trustedSurface?: {
     outcome: string;
@@ -836,10 +846,30 @@ export async function advanceReview(
   // set (unit tests / non-run invocations), use an explicit unscoped id so
   // subject emission still succeeds without inventing a production run id that
   // would also filter prior-round history (currentReviewRunId stays undefined).
+  //
+  // Trusted-surface (#691): bind verifier_fingerprint to the run decision when
+  // present. Blocked / unusable decisions fail closed (null subject).
   const subjectRunId =
     (typeof currentReviewRunId === "string" && currentReviewRunId.trim()) ||
     (opts.runDir ? path.basename(opts.runDir) : "") ||
     `issue-${issueNumber}/unscoped-run`;
+  let trustedSurfaceForSubject:
+    | { outcome: string; effective_verifier_hash: string | null }
+    | null
+    | undefined = opts.trustedSurface;
+  if (trustedSurfaceForSubject === undefined && opts.runDir) {
+    try {
+      const { readTrustedSurfaceDecision, defaultRunStoreDeps } = await import(
+        "../run-store.ts"
+      );
+      trustedSurfaceForSubject = await readTrustedSurfaceDecision(
+        opts.runDir,
+        opts.runStoreDeps ?? defaultRunStoreDeps,
+      );
+    } catch {
+      trustedSurfaceForSubject = null;
+    }
+  }
   const reviewEvidenceSubject: EvidenceSubjectV1 | null = buildReviewEvidenceSubject({
     cfg,
     issueNumber,
@@ -848,6 +878,7 @@ export async function advanceReview(
     candidateSha: commitSha,
     diffHash,
     reviewPolicy: effectivePol,
+    trustedSurface: trustedSurfaceForSubject,
   });
   if (!reviewEvidenceSubject) {
     const reason =

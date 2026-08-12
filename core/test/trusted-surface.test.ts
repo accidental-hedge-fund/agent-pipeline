@@ -9,6 +9,7 @@ import {
   TRUSTED_SURFACE_DECISION_SCHEMA_VERSION,
   allowsReadyToDeploy,
   buildEffectiveVerifierHash,
+  classifyGitShowResult,
   classifyPaths,
   computeTrustedSurfaceDecision,
   effectiveVerifierHashChanged,
@@ -16,6 +17,7 @@ import {
   hashEnginePin,
   parseTrustedSurfaceDecision,
   pathMatchesAnyGlob,
+  rebindDecisionAfterEngineDrift,
   verifierFingerprintFromTrustedSurface,
   type TrustedEnginePin,
   type TrustedSurfaceDecision,
@@ -102,6 +104,17 @@ test("classifyPaths: pipeline.yml is repo_policy", () => {
   assert.ok(c[0].class_ids.includes("repo_policy"));
 });
 
+test("globToRegExp: dotted sensitive paths and wildcards match literally", () => {
+  // Regression for #691 review: metacharacter escape must keep the matched token.
+  assert.ok(pathMatchesAnyGlob(".github/pipeline.yml", [".github/pipeline.yml"]));
+  assert.ok(pathMatchesAnyGlob("package.json", ["package.json"]));
+  assert.ok(pathMatchesAnyGlob("foo.yml", ["*.yml"]));
+  assert.ok(pathMatchesAnyGlob(".github/workflows/ci.yml", [".github/workflows/**"]));
+  assert.equal(pathMatchesAnyGlob("xgithub/pipeline.yml", [".github/pipeline.yml"]), null);
+  // Dotted path must not be treated as "any char" + github...
+  assert.equal(pathMatchesAnyGlob("Xgithub/pipeline.yml", [".github/pipeline.yml"]), null);
+});
+
 test("classifyPaths: engine prompts match engine_prompts", () => {
   const c = classifyPaths(["core/scripts/prompts/review.md"]);
   assert.ok(c[0].class_ids.includes("engine_prompts"));
@@ -168,6 +181,24 @@ test("unreadable base → blocked for touched base_ref class", () => {
   const d = decide([".github/pipeline.yml"], { base_readable: false });
   assert.equal(d.outcome, "blocked");
   assert.equal(d.effective_verifier_hash, null);
+});
+
+test("base reader throw (unreadable object) → blocked, not engine_default", () => {
+  const d = computeTrustedSurfaceDecision({
+    candidate_paths: [".github/pipeline.yml"],
+    candidate_sha: CANDIDATE,
+    base_sha: BASE,
+    engine_pin: ENGINE,
+    base_readable: true,
+    read_base_content: () => {
+      throw new Error("git show failed");
+    },
+  });
+  assert.equal(d.outcome, "blocked");
+  assert.equal(d.effective_verifier_hash, null);
+  const repo = d.classes.find((c) => c.class_id === "repo_policy")!;
+  assert.equal(repo.status, "failed");
+  assert.equal(repo.failure_reason, "base_unreadable");
 });
 
 test("missing engine pin → blocked", () => {
@@ -253,6 +284,42 @@ test("mid-run engine pin change invalidates effective hash", () => {
   assert.notEqual(r.next_hash, d.effective_verifier_hash);
 });
 
+test("rebindDecisionAfterEngineDrift updates effective hash and keeps pin", () => {
+  const d = decide(["src/app.ts"]);
+  const next: TrustedEnginePin = {
+    ...ENGINE,
+    templates_fingerprint: "f".repeat(64),
+  };
+  const rebound = rebindDecisionAfterEngineDrift(d, next);
+  assert.ok(rebound.effective_verifier_hash);
+  assert.notEqual(rebound.effective_verifier_hash, d.effective_verifier_hash);
+  assert.notEqual(rebound.outcome, "blocked");
+  const engineClass = rebound.classes.find((c) => c.class_id === "engine_core")!;
+  assert.equal(engineClass.trusted_content_hash, hashEnginePin(next));
+});
+
+test("classifyGitShowResult distinguishes content, absent, unreadable", () => {
+  assert.equal(classifyGitShowResult({ code: 0, stdout: "x" }), "content");
+  assert.equal(
+    classifyGitShowResult({
+      code: 128,
+      stderr: "fatal: path '.github/pipeline.yml' does not exist in 'abc123'",
+    }),
+    "absent",
+  );
+  assert.equal(
+    classifyGitShowResult({
+      code: 128,
+      stderr: "fatal: bad object abc123",
+    }),
+    "unreadable",
+  );
+  assert.equal(
+    classifyGitShowResult({ code: 1, stderr: "error: unknown" }),
+    "unreadable",
+  );
+});
+
 test("candidate SHA advance recomputes (callers re-invoke; decision binds SHA)", () => {
   const d1 = decide(["src/app.ts"]);
   const d2 = computeTrustedSurfaceDecision({
@@ -282,8 +349,12 @@ test("blocked refuses ready-to-deploy; passthrough/rebound allow", () => {
     allowsReadyToDeploy(decide([".github/pipeline.yml"], { base_sha: null })),
     false,
   );
-  assert.equal(allowsReadyToDeploy(null), true); // historical omission
-  assert.equal(allowsReadyToDeploy(undefined), true);
+  // Current runs: missing decision fails closed.
+  assert.equal(allowsReadyToDeploy(null), false);
+  assert.equal(allowsReadyToDeploy(undefined), false);
+  // Historical consumers may opt in explicitly.
+  assert.equal(allowsReadyToDeploy(null, { enforcement: "historical" }), true);
+  assert.equal(allowsReadyToDeploy(undefined, { enforcement: "historical" }), true);
 });
 
 // ---------------------------------------------------------------------------

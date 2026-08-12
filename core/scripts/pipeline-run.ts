@@ -59,20 +59,27 @@ import {
   emitGhMetrics,
   finalizeRun,
   initRunDir,
+  persistTrustedSurfaceDecision,
   readTrustedSurfaceDecision,
   resolveRunEngineIdentity,
   runDirPath,
   runIdFor,
   startTerminalLogTee,
-  writeTrustedSurfaceDecision,
+  writeTrustedSurfaceInvalidation,
   type RunStoreDeps,
   type BlockerSetEvent,
   type TerminalLogTee,
 } from "./run-store.ts";
 import {
+  applyTrustedVerificationPolicy,
+  testCommandFromPackageJson,
+} from "./config.ts";
+import {
+  classifyGitShowResult,
   classifyPaths,
   computeTrustedSurfaceDecision,
   effectiveVerifierHashChanged,
+  rebindDecisionAfterEngineDrift,
   type TrustedSurfaceDecision,
 } from "./trusted-surface.ts";
 import { buildEventSinkDeps } from "./event-sink.ts";
@@ -1223,21 +1230,286 @@ export async function runAdvance(
 
     // Trusted-surface decision (#691): compute once candidate SHA + base +
     // changed paths are known; recompute when product HEAD advances. Durable
-    // under the run dir; finalize embeds into summary.json.
+    // under the run dir; finalize embeds into summary.json. Current runs always
+    // produce a decision (fail closed) — missing inputs yield `blocked`.
     let lastTrustedSurfaceCandidateSha: string | null = null;
     let currentTrustedSurface: TrustedSurfaceDecision | null = null;
 
-    async function ensureTrustedSurfaceDecision(stageName: string): Promise<void> {
-      if (!runDir || !pinnedEngine) return;
-      const wt = await (deps.getOnDiskForIssue ?? getOnDiskForIssue)(cfg, issueNumber).catch(() => null);
-      if (!wt) return;
-      const headRes = await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true });
+    async function persistDecision(
+      decision: TrustedSurfaceDecision,
+      stageName: string,
+    ): Promise<TrustedSurfaceDecision> {
+      if (!runDir) return decision;
+      try {
+        const stored = await persistTrustedSurfaceDecision(
+          runDir,
+          decision,
+          runStoreDeps,
+        );
+        currentTrustedSurface = stored;
+        return stored;
+      } catch (err) {
+        // Keep in-memory decision; upgrade to blocked so readiness cannot pass
+        // without durable evidence.
+        const blocked: TrustedSurfaceDecision = {
+          ...decision,
+          outcome: "blocked",
+          effective_verifier_hash: null,
+          reason: {
+            code: "decision_persistence_failed",
+            summary:
+              `Trusted-surface decision could not be durably persisted at ${stageName}: ` +
+              `${err instanceof Error ? err.message : String(err)}`,
+          },
+        };
+        currentTrustedSurface = blocked;
+        console.warn(
+          `[pipeline] #${issueNumber}: trusted-surface persistence failed — ${blocked.reason.summary}`,
+        );
+        // Best-effort write of the blocked decision; ignore secondary failure.
+        try {
+          await persistTrustedSurfaceDecision(runDir, blocked, runStoreDeps);
+        } catch {
+          /* in-memory blocked still authoritative for this process */
+        }
+        return blocked;
+      }
+    }
+
+    /**
+     * Bind judging inputs to the trusted surface after a rebound decision.
+     * Mutates live `cfg` for verification-sensitive fields. Returns blocked
+     * decision when binding cannot be applied.
+     */
+    function applyReboundBinding(
+      decision: TrustedSurfaceDecision,
+      baseBlobs: Map<string, string | null>,
+    ): TrustedSurfaceDecision {
+      if (decision.outcome !== "rebound") return decision;
+
+      const reboundClasses = decision.classes.filter((c) => c.status === "rebound");
+      for (const c of reboundClasses) {
+        if (c.class_id === "engine_core" || c.class_id === "engine_prompts") {
+          // Installed process pin is already the judging authority.
+          continue;
+        }
+        if (c.class_id === "repo_policy") {
+          const ymlPaths = c.triggering_paths.filter(
+            (p) =>
+              p === ".github/pipeline.yml" ||
+              p === ".github/pipeline.yaml" ||
+              p.startsWith(".github/pipeline/"),
+          );
+          // Prefer full pipeline.yml; absent → engine defaults.
+          let baseYml: string | null = null;
+          if (ymlPaths.includes(".github/pipeline.yml")) {
+            if (!baseBlobs.has(".github/pipeline.yml")) {
+              return {
+                ...decision,
+                outcome: "blocked",
+                effective_verifier_hash: null,
+                reason: {
+                  code: "trusted_binding_not_applied",
+                  summary:
+                    "repo_policy rebound but base .github/pipeline.yml was not resolved for judging bind",
+                },
+              };
+            }
+            baseYml = baseBlobs.get(".github/pipeline.yml") ?? null;
+          } else if (ymlPaths.includes(".github/pipeline.yaml")) {
+            if (!baseBlobs.has(".github/pipeline.yaml")) {
+              return {
+                ...decision,
+                outcome: "blocked",
+                effective_verifier_hash: null,
+                reason: {
+                  code: "trusted_binding_not_applied",
+                  summary:
+                    "repo_policy rebound but base .github/pipeline.yaml was not resolved for judging bind",
+                },
+              };
+            }
+            baseYml = baseBlobs.get(".github/pipeline.yaml") ?? null;
+          } else if (ymlPaths.length === 0) {
+            // Class rebound via extra_paths / includes only — still apply defaults
+            // when no primary yml in triggers (safe: cannot weaken from candidate yml).
+            baseYml = baseBlobs.has(".github/pipeline.yml")
+              ? (baseBlobs.get(".github/pipeline.yml") ?? null)
+              : null;
+          }
+          const overlay = applyTrustedVerificationPolicy(cfg, baseYml);
+          if (!overlay.ok) {
+            return {
+              ...decision,
+              outcome: "blocked",
+              effective_verifier_hash: null,
+              reason: {
+                code: "trusted_binding_not_applied",
+                summary: overlay.reason,
+              },
+            };
+          }
+          console.log(
+            `[pipeline] #${issueNumber}: trusted-surface rebound applied verification policy ` +
+              `from base (${overlay.applied.join(",")})`,
+          );
+          continue;
+        }
+        if (c.class_id === "gate_commands") {
+          // When package.json is a trigger, bind test command identity to base.
+          if (c.triggering_paths.includes("package.json")) {
+            if (!baseBlobs.has("package.json")) {
+              return {
+                ...decision,
+                outcome: "blocked",
+                effective_verifier_hash: null,
+                reason: {
+                  code: "trusted_binding_not_applied",
+                  summary:
+                    "gate_commands rebound includes package.json but base blob was not resolved",
+                },
+              };
+            }
+            const basePkg = baseBlobs.get("package.json");
+            if (basePkg === null) {
+              // Absent at base: clear explicit command so detection uses defaults /
+              // no weakened candidate script authority from config alone.
+              if (!cfg.test_gate.command) {
+                /* leave unset — detection will still see candidate package.json;
+                   fail closed by requiring explicit trusted command when package.json
+                   is newly added on candidate. */
+                return {
+                  ...decision,
+                  outcome: "blocked",
+                  effective_verifier_hash: null,
+                  reason: {
+                    code: "trusted_binding_not_applied",
+                    summary:
+                      "gate_commands: package.json added on candidate with no base authority for test command",
+                  },
+                };
+              }
+            } else {
+              const cmd = testCommandFromPackageJson(basePkg);
+              if (cmd) {
+                cfg.test_gate = { ...cfg.test_gate, command: cmd };
+                console.log(
+                  `[pipeline] #${issueNumber}: trusted-surface rebound bound test_gate.command from base package.json`,
+                );
+              } else if (!cfg.test_gate.command) {
+                return {
+                  ...decision,
+                  outcome: "blocked",
+                  effective_verifier_hash: null,
+                  reason: {
+                    code: "trusted_binding_not_applied",
+                    summary:
+                      "gate_commands: base package.json has no scripts.test and no trusted test_gate.command",
+                  },
+                };
+              }
+            }
+          }
+          // Script-only gate path changes: command identity comes from trusted
+          // policy (already overlaid if repo_policy also rebound; otherwise from
+          // the host-loaded config which is not the candidate worktree for
+          // pipeline.yml when advance started outside the worktree). Pin-only
+          // evidence binding covers residual script authority via verifier hash.
+          continue;
+        }
+        // evidence_schemas / eval_rubrics / ownership_authority: pin-only bind
+        // via effective_verifier_hash — readiness subjects must carry that hash
+        // (producers load the decision). Require a resolved trusted hash.
+        if (!c.trusted_content_hash) {
+          return {
+            ...decision,
+            outcome: "blocked",
+            effective_verifier_hash: null,
+            reason: {
+              code: "trusted_binding_not_applied",
+              summary: `class ${c.class_id} rebound without a trusted content hash`,
+            },
+          };
+        }
+      }
+      return decision;
+    }
+
+    async function ensureTrustedSurfaceDecision(
+      stageName: string,
+    ): Promise<TrustedSurfaceDecision | null> {
+      // Dry-run / no run dir: not a readiness-authoritative path.
+      if (!runDir) return currentTrustedSurface;
+
+      const failAndPersist = async (
+        code: string,
+        summary: string,
+        candidateSha = "",
+      ): Promise<TrustedSurfaceDecision> => {
+        // Use compute with null engine so schema is complete; then override reason.
+        const d = computeTrustedSurfaceDecision({
+          candidate_paths: [".github/pipeline.yml"],
+          candidate_sha: /^[0-9a-f]{40}$/i.test(candidateSha)
+            ? candidateSha
+            : "0".repeat(40),
+          base_sha: null,
+          engine_pin: pinnedEngine
+            ? {
+                version: pinnedEngine.version,
+                templates_fingerprint: pinnedEngine.templates_fingerprint,
+                root: pinnedEngine.root,
+                commit_sha: pinnedEngine.commit_sha ?? null,
+              }
+            : null,
+          base_readable: false,
+        });
+        const blocked: TrustedSurfaceDecision = {
+          ...d,
+          outcome: "blocked",
+          effective_verifier_hash: null,
+          reason: { code, summary },
+        };
+        lastTrustedSurfaceCandidateSha = blocked.candidate_sha || null;
+        return persistDecision(blocked, stageName);
+      };
+
+      if (!pinnedEngine) {
+        return failAndPersist(
+          "missing_engine_pin",
+          "Trusted-surface requires a pinned engine identity for this run",
+        );
+      }
+
+      const wt = await (deps.getOnDiskForIssue ?? getOnDiskForIssue)(cfg, issueNumber).catch(
+        () => null,
+      );
+      if (!wt) {
+        return failAndPersist(
+          "worktree_unavailable",
+          "Trusted-surface could not resolve the managed worktree for this issue",
+        );
+      }
+
+      const headRes = await gitInWorktree(wt.path, ["rev-parse", "HEAD"], {
+        ignoreFailure: true,
+      });
+      if (headRes.code !== 0) {
+        return failAndPersist(
+          "candidate_sha_unresolved",
+          `Trusted-surface could not resolve worktree HEAD (git exit ${headRes.code})`,
+        );
+      }
       const candidateSha = headRes.stdout.trim().toLowerCase();
-      if (!/^[0-9a-f]{40}$/.test(candidateSha)) return;
+      if (!/^[0-9a-f]{40}$/.test(candidateSha)) {
+        return failAndPersist(
+          "invalid_candidate_sha",
+          `Trusted-surface HEAD is not a full SHA: "${headRes.stdout.trim()}"`,
+        );
+      }
 
       // Reuse durable decision when candidate SHA is unchanged.
       if (lastTrustedSurfaceCandidateSha === candidateSha && currentTrustedSurface) {
-        return;
+        return currentTrustedSurface;
       }
       if (!currentTrustedSurface) {
         currentTrustedSurface = await readTrustedSurfaceDecision(runDir, runStoreDeps);
@@ -1246,11 +1518,11 @@ export async function runAdvance(
           currentTrustedSurface.candidate_sha === candidateSha
         ) {
           lastTrustedSurfaceCandidateSha = candidateSha;
-          return;
+          return currentTrustedSurface;
         }
       } else if (currentTrustedSurface.candidate_sha === candidateSha) {
         lastTrustedSurfaceCandidateSha = candidateSha;
-        return;
+        return currentTrustedSurface;
       }
 
       const baseRef = `origin/${cfg.base_branch}`;
@@ -1260,18 +1532,29 @@ export async function runAdvance(
       const baseShaRaw = baseRes.stdout.trim().toLowerCase();
       const baseSha = /^[0-9a-f]{40}$/.test(baseShaRaw) ? baseShaRaw : null;
 
-      const diffRes = await gitInWorktree(
-        wt.path,
-        ["diff", "--name-only", baseSha ? `${baseSha}...${candidateSha}` : `${baseRef}...HEAD`],
-        { ignoreFailure: true },
-      );
+      const diffRange = baseSha
+        ? `${baseSha}...${candidateSha}`
+        : `${baseRef}...HEAD`;
+      const diffRes = await gitInWorktree(wt.path, ["diff", "--name-only", diffRange], {
+        ignoreFailure: true,
+      });
+      if (diffRes.code !== 0) {
+        return failAndPersist(
+          "diff_unresolved",
+          `Trusted-surface changed-path diff failed (git exit ${diffRes.code})`,
+          candidateSha,
+        );
+      }
       const candidatePaths = diffRes.stdout
         .split("\n")
         .map((l) => l.trim())
         .filter(Boolean);
 
-      // Pre-fetch base blobs for touched sensitive paths (async → sync map for pure decide).
+      // Pre-fetch base blobs for touched sensitive paths. Distinguish confirmed
+      // absence from unreadable objects.
       const baseBlobCache = new Map<string, string | null>();
+      let baseReadUnreadable = false;
+      let baseReadError = "";
       if (baseSha) {
         const classified = classifyPaths(
           candidatePaths,
@@ -1279,20 +1562,26 @@ export async function runAdvance(
         );
         const touched = [...new Set(classified.map((c) => c.path))];
         for (const p of touched) {
-          const show = await gitInWorktree(
-            wt.path,
-            ["show", `${baseSha}:${p}`],
-            { ignoreFailure: true },
-          );
-          baseBlobCache.set(p, show.code === 0 ? show.stdout : null);
+          const show = await gitInWorktree(wt.path, ["show", `${baseSha}:${p}`], {
+            ignoreFailure: true,
+          });
+          const kind = classifyGitShowResult(show);
+          if (kind === "content") {
+            baseBlobCache.set(p, show.stdout);
+          } else if (kind === "absent") {
+            baseBlobCache.set(p, null);
+          } else {
+            baseReadUnreadable = true;
+            baseReadError = `unreadable base blob ${baseSha}:${p} (git exit ${show.code})`;
+            break;
+          }
         }
       }
-
-      const decision = computeTrustedSurfaceDecision({
+      let decision = computeTrustedSurfaceDecision({
         candidate_paths: candidatePaths,
         candidate_sha: candidateSha,
         base_sha: baseSha,
-        base_readable: baseSha !== null,
+        base_readable: baseSha !== null && !baseReadUnreadable,
         engine_pin: {
           version: pinnedEngine.version,
           templates_fingerprint: pinnedEngine.templates_fingerprint,
@@ -1300,13 +1589,36 @@ export async function runAdvance(
           commit_sha: pinnedEngine.commit_sha ?? null,
         },
         extra_paths: cfg.trusted_surface?.extra_paths ?? [],
-        read_base_content: (p) =>
-          baseBlobCache.has(p) ? baseBlobCache.get(p)! : null,
+        read_base_content: (p) => {
+          if (!baseBlobCache.has(p)) {
+            // Path not prefetched → treat as absent only when base was readable
+            // and we simply did not touch it; for touched paths the cache must
+            // have an entry. Missing entry after touch → unreadable.
+            throw new Error(`base content not resolved for path: ${p}`);
+          }
+          return baseBlobCache.get(p)!;
+        },
       });
 
-      currentTrustedSurface = decision;
+      if (baseReadUnreadable && decision.outcome !== "blocked") {
+        decision = {
+          ...decision,
+          outcome: "blocked",
+          effective_verifier_hash: null,
+          reason: {
+            code: "base_unreadable",
+            summary: baseReadError || "required base blob unreadable",
+          },
+        };
+      }
+
+      // Apply runtime rebind of judging inputs for rebound decisions.
+      if (decision.outcome === "rebound") {
+        decision = applyReboundBinding(decision, baseBlobCache);
+      }
+
       lastTrustedSurfaceCandidateSha = candidateSha;
-      await writeTrustedSurfaceDecision(runDir, decision, runStoreDeps).catch(() => {});
+      decision = await persistDecision(decision, stageName);
       console.log(
         `[pipeline] #${issueNumber}: trusted-surface ${decision.outcome}` +
           ` at ${stageName} (triggers=${decision.triggering_paths.length}` +
@@ -1317,13 +1629,14 @@ export async function runAdvance(
           `[pipeline] #${issueNumber}: trusted-surface BLOCKED — ${decision.reason.summary}`,
         );
       }
+      return decision;
     }
 
     // Mid-run engine drift (#450): re-probe the on-disk engine identity at each
     // stage boundary and compare it to the identity this run pinned at start.
-    // Advisory only for stage outcome — never blocks a stage. When drift changes
-    // the trusted-surface effective_verifier_hash (#691), record a diagnostic so
-    // readiness evidence under the prior hash is non-current.
+    // When drift changes the trusted-surface effective_verifier_hash (#691),
+    // persist a transition, rebind the decision, and mark prior verifier-bound
+    // readiness evidence non-current until regenerated under the new hash.
     async function checkEngineDrift(stageName: string): Promise<void> {
       if (!pinnedEngine || !runDir) return;
       const observed = (deps.probeEngineIdentity ?? probeEngineIdentity)();
@@ -1352,21 +1665,56 @@ export async function runAdvance(
         }).catch(() => {});
       }
       // #691: when effective verifier hash would change under the new engine
-      // material, surface a diagnostic. Prior verifier-bound readiness evidence is
-      // non-current until regenerated under the new identity.
-      if (currentTrustedSurface?.effective_verifier_hash) {
-        const change = effectiveVerifierHashChanged(currentTrustedSurface, {
+      // material, persist invalidation + rebind decision so prior evidence under
+      // H1 cannot support readiness under H2.
+      if (currentTrustedSurface) {
+        const nextPin = {
           version: observed.version,
           templates_fingerprint: observed.templates_fingerprint,
           root: observed.root,
           commit_sha: observed.commit_sha ?? null,
-        });
+        };
+        const change = effectiveVerifierHashChanged(currentTrustedSurface, nextPin);
         if (change.changed) {
           console.warn(
             `[pipeline] #${issueNumber}: trusted-surface effective verifier hash changed mid-run ` +
               `(${(change.previous_hash ?? "").slice(0, 12)} → ${(change.next_hash ?? "").slice(0, 12)}); ` +
               `prior verifier-bound readiness evidence is non-current until regenerated`,
           );
+          const invalidation = {
+            at,
+            stage: stageName,
+            previous_hash: change.previous_hash,
+            next_hash: change.next_hash,
+            reason: "engine_identity_drift",
+          };
+          try {
+            await writeTrustedSurfaceInvalidation(runDir, invalidation, runStoreDeps);
+          } catch (err) {
+            console.warn(
+              `[pipeline] #${issueNumber}: trusted-surface invalidation write failed: ` +
+                `${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+          await appendEvent(
+            runDir,
+            {
+              schema_version: RUN_SCHEMA_VERSION,
+              type: "trusted_surface_verifier_drift",
+              at,
+              stage: stageName,
+              previous_hash: change.previous_hash,
+              next_hash: change.next_hash,
+            },
+            runStoreDeps,
+          ).catch(() => {});
+          // Rebind decision under the new engine pin so subsequent producers
+          // bind subjects to H2 (H1 evidence becomes non-current via fingerprint).
+          const rebound = rebindDecisionAfterEngineDrift(
+            currentTrustedSurface,
+            nextPin,
+          );
+          await persistDecision(rebound, stageName);
         }
       }
     }

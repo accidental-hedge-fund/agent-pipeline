@@ -2900,3 +2900,51 @@ test("finalizeRun: embeds blocked decision with reason; historical omission not 
   const summary2 = JSON.parse(read2(path.join(RUN_DIR, "summary.json")));
   assert.equal(summary2.trusted_surface, undefined);
 });
+
+test("persistTrustedSurfaceDecision: write failure throws (fail closed)", async () => {
+  const { persistTrustedSurfaceDecision } = await import("../scripts/run-store.ts");
+  const { computeTrustedSurfaceDecision } = await import("../scripts/trusted-surface.ts");
+  const { deps } = memRunStore();
+  const decision = computeTrustedSurfaceDecision({
+    candidate_paths: ["src/app.ts"],
+    candidate_sha: "a".repeat(40),
+    base_sha: "b".repeat(40),
+    engine_pin: {
+      version: "1.0.0",
+      templates_fingerprint: "e".repeat(64),
+    },
+  });
+  const failingDeps = {
+    ...deps,
+    writeFile: async () => {
+      throw new Error("disk full");
+    },
+  };
+  await assert.rejects(
+    () => persistTrustedSurfaceDecision(RUN_DIR, decision, failingDeps),
+    /disk full/,
+  );
+});
+
+test("persistTrustedSurfaceDecision: readback verifies durable decision", async () => {
+  const { persistTrustedSurfaceDecision, readTrustedSurfaceDecision } = await import(
+    "../scripts/run-store.ts"
+  );
+  const { computeTrustedSurfaceDecision } = await import("../scripts/trusted-surface.ts");
+  const { deps } = memRunStore();
+  const decision = computeTrustedSurfaceDecision({
+    candidate_paths: [".github/pipeline.yml"],
+    candidate_sha: "a".repeat(40),
+    base_sha: "b".repeat(40),
+    engine_pin: {
+      version: "1.0.0",
+      templates_fingerprint: "e".repeat(64),
+    },
+    read_base_content: () => "ok: true\n",
+  });
+  const stored = await persistTrustedSurfaceDecision(RUN_DIR, decision, deps);
+  assert.equal(stored.outcome, decision.outcome);
+  const again = await readTrustedSurfaceDecision(RUN_DIR, deps);
+  assert.equal(again?.outcome, decision.outcome);
+  assert.equal(again?.effective_verifier_hash, decision.effective_verifier_hash);
+});

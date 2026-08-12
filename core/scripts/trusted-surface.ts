@@ -188,14 +188,16 @@ export interface ComputeTrustedSurfaceInput {
   engine_pin: TrustedEnginePin | null;
   /**
    * Read trusted content for a path at the integration base.
-   * Return null when the path is absent at base; throw/return undefined only
-   * via null — callers map unreadable base to resolution failure via
-   * `base_readable: false`.
+   * - Return `string` when the blob is present and readable.
+   * - Return `null` when the path is **confirmed absent** at base.
+   * - **Throw** when the base object is unreadable / resolution failed —
+   *   callers must not collapse unreadable into absent (that would rebound
+   *   to engine_default incorrectly).
    */
   read_base_content?: (path: string) => string | null;
   /**
    * Optional candidate content reader for recording candidate_content_hash.
-   * Never used as the trusted source.
+   * Never used as the trusted source. Throw-safe (errors → null hash side).
    */
   read_candidate_content?: (path: string) => string | null;
   /**
@@ -244,8 +246,11 @@ export function sha256Hex(payload: string): string {
 
 /** Glob matcher aligned with design-gate (supports `**` and `*`). */
 export function globToRegExp(pattern: string): RegExp {
+  // Escape regex metacharacters with the matched character (callback form —
+  // never a bare replacement that drops the token). Dot-paths like
+  // `.github/pipeline.yml` and `package.json` must match literally.
   const regexStr = pattern
-    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+    .replace(/[.+^${}()|[\]\\]/g, (ch) => `\\${ch}`)
     .replace(/\*\*\//g, "§§§")
     .replace(/\*\*/g, "¶¶¶")
     .replace(/\*/g, "[^/]*")
@@ -440,7 +445,7 @@ export function computeTrustedSurfaceDecision(
     if (isTouched && input.read_candidate_content) {
       const entries = touched.map((p) => ({
         path: p,
-        content: safeRead(input.read_candidate_content!, p),
+        content: safeReadCandidate(input.read_candidate_content!, p),
       }));
       candidateHash = hashPathContents(entries);
     }
@@ -458,7 +463,9 @@ export function computeTrustedSurfaceDecision(
         if (isTouched) anyRebound = true;
       }
     } else if (source === "base_ref" || source === "engine_default") {
-      // base_ref classes fall back to engine_default when path is absent at base.
+      // base_ref classes fall back to engine_default when path is **confirmed
+      // absent** at base. Unreadable base objects fail closed (do not treat as
+      // absence).
       if (isTouched) {
         if (!baseSha || !baseReadable) {
           status = "failed";
@@ -469,17 +476,31 @@ export function computeTrustedSurfaceDecision(
           failureReason = "missing_base_reader";
           anyFailed = true;
         } else {
-          const entries = touched.map((p) => ({
-            path: p,
-            content: safeRead(input.read_base_content!, p),
-          }));
-          // All absent at base → engine_default pin (judge under absence, not candidate).
-          const allAbsent = entries.every((e) => e.content === null);
-          trustedHash = allAbsent
-            ? engineDefaultHash(classId)
-            : hashPathContents(entries);
-          status = "rebound";
-          anyRebound = true;
+          const entries: Array<{ path: string; content: string | null }> = [];
+          let readFailed: string | undefined;
+          for (const p of touched) {
+            try {
+              entries.push({ path: p, content: input.read_base_content(p) });
+            } catch (err) {
+              readFailed =
+                err instanceof Error ? err.message : "base_read_failed";
+              break;
+            }
+          }
+          if (readFailed) {
+            status = "failed";
+            failureReason = "base_unreadable";
+            anyFailed = true;
+          } else {
+            // All confirmed absent at base → engine_default pin (judge under
+            // absence, not candidate).
+            const allAbsent = entries.every((e) => e.content === null);
+            trustedHash = allAbsent
+              ? engineDefaultHash(classId)
+              : hashPathContents(entries);
+            status = "rebound";
+            anyRebound = true;
+          }
         }
       } else {
         // Untouched: still resolve a default/base pin for effective hash when possible.
@@ -566,7 +587,11 @@ export function computeTrustedSurfaceDecision(
   };
 }
 
-function safeRead(reader: (path: string) => string | null, path: string): string | null {
+/** Candidate reads are observational only — errors become null content. */
+function safeReadCandidate(
+  reader: (path: string) => string | null,
+  path: string,
+): string | null {
   try {
     return reader(path);
   } catch {
@@ -641,13 +666,113 @@ export function effectiveVerifierHashChanged(
 
 /**
  * Whether readiness may advance to ready-to-deploy under this decision.
- * blocked → no. passthrough/rebound with effective hash → yes (other gates apply).
+ *
+ * - `blocked` → no
+ * - missing decision → no by default (current runs must compute a decision);
+ *   pass `{ enforcement: "historical" }` only for demonstrably pre-feature
+ *   consumers that opt into legacy omission
+ * - passthrough/rebound with effective hash → yes (other gates still apply)
  */
-export function allowsReadyToDeploy(decision: TrustedSurfaceDecision | null | undefined): boolean {
-  if (!decision) return true; // historical / not computed — other gates remain
+export function allowsReadyToDeploy(
+  decision: TrustedSurfaceDecision | null | undefined,
+  opts?: { enforcement?: "current" | "historical" },
+): boolean {
+  if (!decision) {
+    // Historical omission is explicit opt-in only. Current runs fail closed.
+    return opts?.enforcement === "historical";
+  }
   if (decision.outcome === "blocked") return false;
   return typeof decision.effective_verifier_hash === "string" &&
     decision.effective_verifier_hash.length > 0;
+}
+
+/**
+ * Classify a `git show <sha>:<path>` result.
+ * - code 0 → content present
+ * - path confirmed missing at that tree → absent
+ * - any other failure → unreadable (must not be treated as absence)
+ */
+export function classifyGitShowResult(result: {
+  code: number;
+  stdout?: string;
+  stderr?: string;
+}): "content" | "absent" | "unreadable" {
+  if (result.code === 0) return "content";
+  const err = `${result.stderr ?? ""}\n${result.stdout ?? ""}`.toLowerCase();
+  // Common git messages for a path that is simply not in the tree.
+  const absent =
+    result.code === 128 &&
+    (err.includes("does not exist in") ||
+      err.includes("exists on disk, but not in") ||
+      err.includes("did not match any") ||
+      (err.includes("fatal: path") && err.includes("not in")));
+  if (absent) return "absent";
+  return "unreadable";
+}
+
+/**
+ * When engine-class material drifts mid-run, produce the next decision's
+ * effective hash inputs by replacing installed_engine class hashes.
+ * Returns null next_hash only when previous had no pin.
+ */
+export function rebindDecisionAfterEngineDrift(
+  previous: TrustedSurfaceDecision,
+  nextEnginePin: TrustedEnginePin,
+): TrustedSurfaceDecision {
+  const nextClasses = previous.classes.map((c) => {
+    if (BUILTIN_CLASS_TRUSTED_SOURCE[c.class_id] !== "installed_engine") {
+      return { ...c };
+    }
+    if (!nextEnginePin.version || !nextEnginePin.templates_fingerprint) {
+      return {
+        ...c,
+        trusted_content_hash: null,
+        status: "failed" as const,
+        failure_reason: "missing_engine_pin",
+      };
+    }
+    return {
+      ...c,
+      trusted_content_hash: hashEnginePin(nextEnginePin),
+      status: c.status === "failed" ? ("resolved" as const) : c.status,
+      failure_reason: undefined,
+    };
+  });
+  const anyFailed = nextClasses.some((c) => c.status === "failed");
+  const resolvedHashes = nextClasses
+    .filter((c) => typeof c.trusted_content_hash === "string" && c.trusted_content_hash)
+    .map((c) => ({
+      class_id: c.class_id,
+      trusted_content_hash: c.trusted_content_hash as string,
+    }));
+  if (anyFailed) {
+    return {
+      ...previous,
+      outcome: "blocked",
+      classes: nextClasses,
+      effective_verifier_hash: null,
+      reason: {
+        code: "engine_drift_resolution_failed",
+        summary:
+          "Mid-run engine drift left a required installed_engine class unresolved",
+      },
+    };
+  }
+  const nextHash = buildEffectiveVerifierHash(resolvedHashes);
+  const anyRebound =
+    previous.outcome === "rebound" ||
+    nextClasses.some((c) => c.status === "rebound");
+  return {
+    ...previous,
+    outcome: anyRebound || previous.triggering_paths.length > 0 ? "rebound" : "passthrough",
+    classes: nextClasses,
+    effective_verifier_hash: nextHash,
+    reason: {
+      code: "engine_drift_rebound",
+      summary:
+        "Mid-run engine identity changed; effective verifier hash recomputed under the new pin",
+    },
+  };
 }
 
 /**

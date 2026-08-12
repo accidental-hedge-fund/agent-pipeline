@@ -1628,6 +1628,187 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
   return merged;
 }
 
+/**
+ * Overlay verification-sensitive fields from a trusted base `pipeline.yml`
+ * (or engine defaults when the base file is confirmed absent) onto a live
+ * config object. Used when trusted-surface outcome is `rebound` for
+ * `repo_policy` so the candidate cannot weaken judging via its own copy (#691).
+ *
+ * Mutates `cfg` in place. Returns which field groups were rebound.
+ */
+export function applyTrustedVerificationPolicy(
+  cfg: PipelineConfig,
+  basePipelineYml: string | null,
+): { ok: true; applied: string[] } | { ok: false; reason: string } {
+  let fileConfig: PartialConfig = {};
+  if (basePipelineYml !== null) {
+    let parsed: unknown;
+    try {
+      parsed = yaml.load(basePipelineYml);
+    } catch (err) {
+      return {
+        ok: false,
+        reason: `trusted base pipeline.yml parse failed: ${(err as Error).message}`,
+      };
+    }
+    if (parsed && typeof parsed === "object") {
+      const result = PartialConfigSchema.safeParse(parsed);
+      if (!result.success) {
+        const errors = flattenIssues(result.error.issues)
+          .map((i) => `${i.path.join(".") || "<root>"}: ${i.message}`)
+          .join("; ");
+        return {
+          ok: false,
+          reason: `trusted base pipeline.yml invalid: ${errors}`,
+        };
+      }
+      fileConfig = result.data;
+    }
+  }
+  // null base → engine defaults for verification fields (absence, not candidate).
+
+  const applied: string[] = [];
+
+  cfg.review_policy = {
+    block_threshold:
+      fileConfig.review_policy?.block_threshold ?? DEFAULT_CONFIG.review_policy.block_threshold,
+    min_confidence:
+      fileConfig.review_policy?.min_confidence ?? DEFAULT_CONFIG.review_policy.min_confidence,
+    max_adversarial_rounds:
+      fileConfig.review_policy?.max_adversarial_rounds ??
+      DEFAULT_CONFIG.review_policy.max_adversarial_rounds,
+    risk_proportional:
+      fileConfig.review_policy?.risk_proportional ?? DEFAULT_CONFIG.review_policy.risk_proportional,
+    ceiling_action:
+      fileConfig.review_policy?.ceiling_action ?? DEFAULT_CONFIG.review_policy.ceiling_action,
+    surface_recurrence_rounds:
+      fileConfig.review_policy?.surface_recurrence_rounds ??
+      DEFAULT_CONFIG.review_policy.surface_recurrence_rounds,
+    max_delta_rounds:
+      fileConfig.review_policy?.max_delta_rounds ?? DEFAULT_CONFIG.review_policy.max_delta_rounds,
+  };
+  applied.push("review_policy");
+
+  cfg.test_gate = {
+    enabled: fileConfig.test_gate?.enabled ?? DEFAULT_CONFIG.test_gate.enabled,
+    command: fileConfig.test_gate?.command,
+    max_attempts: fileConfig.test_gate?.max_attempts ?? DEFAULT_CONFIG.test_gate.max_attempts,
+    timeout: fileConfig.test_gate?.timeout ?? DEFAULT_CONFIG.test_gate.timeout,
+    non_product_dirty_globs: fileConfig.test_gate?.non_product_dirty_globs,
+  };
+  applied.push("test_gate");
+
+  cfg.eval_gate = {
+    enabled: fileConfig.eval_gate?.enabled ?? DEFAULT_CONFIG.eval_gate.enabled,
+    command: fileConfig.eval_gate?.command,
+    mode: fileConfig.eval_gate?.mode ?? DEFAULT_CONFIG.eval_gate.mode,
+    timeout: fileConfig.eval_gate?.timeout ?? DEFAULT_CONFIG.eval_gate.timeout,
+    max_attempts: fileConfig.eval_gate?.max_attempts ?? DEFAULT_CONFIG.eval_gate.max_attempts,
+  };
+  applied.push("eval_gate");
+
+  cfg.visual_gate = {
+    enabled: fileConfig.visual_gate?.enabled ?? DEFAULT_CONFIG.visual_gate.enabled,
+    command: fileConfig.visual_gate?.command,
+    mode: fileConfig.visual_gate?.mode ?? DEFAULT_CONFIG.visual_gate.mode,
+    timeout: fileConfig.visual_gate?.timeout ?? DEFAULT_CONFIG.visual_gate.timeout,
+    max_attempts: fileConfig.visual_gate?.max_attempts ?? DEFAULT_CONFIG.visual_gate.max_attempts,
+    artifacts_dir: fileConfig.visual_gate?.artifacts_dir ?? DEFAULT_CONFIG.visual_gate.artifacts_dir,
+    publish: fileConfig.visual_gate?.publish ?? DEFAULT_CONFIG.visual_gate.publish,
+  };
+  applied.push("visual_gate");
+
+  cfg.shipcheck_gate = {
+    enabled: fileConfig.shipcheck_gate?.enabled ?? DEFAULT_CONFIG.shipcheck_gate.enabled,
+    mode: fileConfig.shipcheck_gate?.mode ?? DEFAULT_CONFIG.shipcheck_gate.mode,
+    max_rounds: fileConfig.shipcheck_gate?.max_rounds ?? DEFAULT_CONFIG.shipcheck_gate.max_rounds,
+    rubric_path:
+      fileConfig.shipcheck_gate?.rubric_path ?? DEFAULT_CONFIG.shipcheck_gate.rubric_path,
+    block_on_partial:
+      fileConfig.shipcheck_gate?.block_on_partial ?? DEFAULT_CONFIG.shipcheck_gate.block_on_partial,
+  };
+  applied.push("shipcheck_gate");
+
+  cfg.design_gate = {
+    enabled: fileConfig.design_gate?.enabled ?? DEFAULT_CONFIG.design_gate.enabled,
+    triggers: fileConfig.design_gate?.triggers ?? DEFAULT_CONFIG.design_gate.triggers,
+    extra_triggers:
+      fileConfig.design_gate?.extra_triggers ?? DEFAULT_CONFIG.design_gate.extra_triggers,
+    max_rounds: fileConfig.design_gate?.max_rounds ?? DEFAULT_CONFIG.design_gate.max_rounds,
+    block_threshold:
+      fileConfig.design_gate?.block_threshold ?? DEFAULT_CONFIG.design_gate.block_threshold,
+    min_confidence:
+      fileConfig.design_gate?.min_confidence ?? DEFAULT_CONFIG.design_gate.min_confidence,
+    limits: {
+      max_decisions:
+        fileConfig.design_gate?.limits?.max_decisions ??
+        DEFAULT_CONFIG.design_gate.limits.max_decisions,
+      max_field_chars:
+        fileConfig.design_gate?.limits?.max_field_chars ??
+        DEFAULT_CONFIG.design_gate.limits.max_field_chars,
+      max_artifact_bytes:
+        fileConfig.design_gate?.limits?.max_artifact_bytes ??
+        DEFAULT_CONFIG.design_gate.limits.max_artifact_bytes,
+    },
+  };
+  applied.push("design_gate");
+
+  cfg.tester_evidence = {
+    on_missing:
+      fileConfig.tester_evidence?.on_missing ?? DEFAULT_CONFIG.tester_evidence.on_missing,
+    max_output_chars:
+      fileConfig.tester_evidence?.max_output_chars ??
+      DEFAULT_CONFIG.tester_evidence.max_output_chars,
+    max_artifact_chars:
+      fileConfig.tester_evidence?.max_artifact_chars ??
+      DEFAULT_CONFIG.tester_evidence.max_artifact_chars,
+    extractors:
+      fileConfig.tester_evidence?.extractors ??
+      [...DEFAULT_CONFIG.tester_evidence.extractors],
+  };
+  applied.push("tester_evidence");
+
+  cfg.trusted_surface = {
+    extra_paths: (fileConfig.trusted_surface?.extra_paths ??
+      DEFAULT_CONFIG.trusted_surface.extra_paths).map((e) => ({
+      class: e.class,
+      globs: [...e.globs],
+    })),
+  };
+  applied.push("trusted_surface");
+
+  cfg.ci_mode = fileConfig.ci_mode ?? DEFAULT_CONFIG.ci_mode;
+  cfg.ci_timeout = fileConfig.ci_timeout ?? DEFAULT_CONFIG.ci_timeout;
+  cfg.ci_poll_interval = fileConfig.ci_poll_interval ?? DEFAULT_CONFIG.ci_poll_interval;
+  cfg.ci_no_run_grace_s = fileConfig.ci_no_run_grace_s ?? DEFAULT_CONFIG.ci_no_run_grace_s;
+  cfg.pre_merge_ci_assertion_fix =
+    fileConfig.pre_merge_ci_assertion_fix ?? DEFAULT_CONFIG.pre_merge_ci_assertion_fix;
+  cfg.pre_merge_ci_rerun_enabled =
+    fileConfig.pre_merge_ci_rerun_enabled ?? DEFAULT_CONFIG.pre_merge_ci_rerun_enabled;
+  applied.push("ci");
+
+  // Gate command identity from base package.json (when provided separately by
+  // the caller via test_gate.command already set above from trusted yml).
+  return { ok: true, applied };
+}
+
+/**
+ * Derive an explicit test command from a trusted base `package.json` body.
+ * Returns null when no scripts.test is present. Never reads the candidate tree.
+ */
+export function testCommandFromPackageJson(packageJsonText: string): string | null {
+  try {
+    const pkg = JSON.parse(packageJsonText) as { scripts?: Record<string, unknown> };
+    const testScript = pkg.scripts?.test;
+    if (typeof testScript !== "string" || !testScript.trim()) return null;
+    // Prefer npm test so lockfile/package-manager detection stays consistent
+    // with detectTestCommand; the authority is that base defines a test script.
+    return "npm test";
+  } catch {
+    return null;
+  }
+}
+
 // Each `models.*` alias is honored by exactly one harness role. `models.review`
 // drives the reviewer; `models.planning`/`models.implementing`/`models.fix`/
 // `models.intake`/`models.sweep` drive the implementer.
