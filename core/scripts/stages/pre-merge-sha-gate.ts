@@ -96,7 +96,12 @@ import {
 } from "../tester-evidence.ts";
 import { runTestGate } from "../testgate.ts";
 import type { Outcome, PipelineConfig, ReviewFinding, Stage } from "../types.ts";
-import { preMergeBlocked, recordPreMergeGateResult } from "./pre-merge-shared.ts";
+import {
+  appendDualShaEscalationDisclosure,
+  preMergeBlocked,
+  recordedShaIsCurrentForLiveHead,
+  recordPreMergeGateResult,
+} from "./pre-merge-shared.ts";
 import {
   evaluatePreMergeNoopCleanDisposition,
   formatNoopAdvanceEvidenceNote,
@@ -706,9 +711,64 @@ export async function enforceReviewShaGate(
       : (commentBody ? extractBlockingKeysMarker(commentBody) : null);
     if (!recorded || recorded.size === 0) return null;
     // Trust overrides from any authorized runner identity (#229 Findings 1, 4, 5).
+    // Apply before SHA-scope so a full override still clears residual authority
+    // even when keys were recorded against a prior head (#1010 + #228).
     const overrides = extractOverrides(trustedOverrideComments);
     const unresolved = [...recorded].filter((k) => !overrides.has(k));
     if (unresolved.length === 0) return null;
+    // SHA-scope residual keys at gate start (#1010): keys recorded against a
+    // prior reviewed SHA lack blocking authority for a different live head —
+    // including pipeline-internal-only head advances. Approval reuse for
+    // pipeline-internal commits still holds when there are no residual keys
+    // (return null below); residual authority requires live-head re-evaluation
+    // so a prior-head key set cannot strand a green tip without re-check.
+    // Diff-unchanged with a prior-head key set likewise re-evaluates rather
+    // than auto-block. reviewedSha lives on the artifact; legacy comments use
+    // the sentinel via extractReviewedSha (comment-array API). Fall back to
+    // the gate's reviewed pin when neither is present.
+    const keysRecordedSha =
+      _bodyArtifact?.reviewedSha ??
+      (commentBody
+        ? extractReviewedSha([{ body: commentBody }])?.sha ?? null
+        : null) ??
+      reviewed.sha;
+    const keysAreCurrentForLiveHead = recordedShaIsCurrentForLiveHead(
+      keysRecordedSha,
+      head,
+    );
+    if (!keysAreCurrentForLiveHead) {
+      console.log(
+        `[pipeline] #${issueNumber}: withholding residual block from prior-head ` +
+          `keys (recorded ${keysRecordedSha ? keysRecordedSha.slice(0, 7) : "unknown"} ≠ ` +
+          `live ${head.slice(0, 7)}${via}); re-evaluate at live head`,
+      );
+      // Force re-evaluation at the live head — never silent-approve prior-head
+      // keys, and never setBlocked solely from them (#1010).
+      const reviewStage: Stage = reviewed.round === 1 ? "review-1" : "review-2";
+      await postCommentFn(
+        cfg,
+        issueNumber,
+        `**Pre-merge**: residual blocking keys were recorded against ` +
+          `\`${keysRecordedSha ? keysRecordedSha.slice(0, 7) : "unknown"}\` but live head is ` +
+          `\`${head.slice(0, 7)}\`. Withholding prior-head residual authority; ` +
+          `re-running review ${reviewed.round} at the live head (#1010).\n` +
+          `<!-- pipeline-stale-blocking-keys: ${keysRecordedSha ?? "none"} ${head} -->`,
+      );
+      await transitionFn(
+        cfg,
+        issueNumber,
+        "pre-merge",
+        reviewStage,
+        `Re-running review ${reviewed.round}: residual blocking keys are SHA-scoped to a ` +
+          `prior head; re-evaluate at live head \`${head.slice(0, 7)}\`.`,
+      );
+      return {
+        advanced: true,
+        from: "pre-merge",
+        to: reviewStage,
+        summary: `re-review: prior-head residual keys lack live-head authority`,
+      };
+    }
     // Scoped overrides may cover the remaining key-only blockers, but we can't verify
     // without the actual finding objects. Force a fresh review so partitionFindings
     // can be called with live findings and scopes (#229).
@@ -868,12 +928,20 @@ export async function enforceReviewShaGate(
       }
     }
 
-    await setBlockedFn(
-      cfg,
-      issueNumber,
+    const residualReason = appendDualShaEscalationDisclosure(
       `Pre-merge: the last review recorded ${unresolved.length} unresolved blocking finding(s) ` +
         `at HEAD (${unresolved.join(", ")})${via}. Fix them (push a commit) or \`--override\` each ` +
         `before pre-merge can proceed.`,
+      head,
+      keysRecordedSha && !recordedShaIsCurrentForLiveHead(keysRecordedSha, head)
+        ? keysRecordedSha
+        : null,
+      true,
+    );
+    await setBlockedFn(
+      cfg,
+      issueNumber,
+      residualReason,
       "pre-merge",
       "needs-human",
     );
@@ -1988,7 +2056,7 @@ export async function enforceReviewShaGate(
       // diagnostic-appended message (or noop still-broken recipe).
       // Residual labels come from the final disposition partition (post re-delta
       // when an attempt ran); auto-fixable labels report attempt scope.
-      const blockReason =
+      const rawBlockReason =
         autoFixBlockReason ??
         (dispositionResidual.length > 0 ||
         (dispositionAutoFixable.length > 0 && autoFixAttemptRecognized)
@@ -2001,6 +2069,17 @@ export async function enforceReviewShaGate(
           : autoFixDiagnostic
             ? `Pre-merge delta review found blocking findings; fix required before merging. ${autoFixDiagnostic}`
             : "Pre-merge delta review found blocking findings; fix required before merging.");
+      // #1010: when residual still blocks at the live head after autofix
+      // exhaustion, disclose live head (and prior reviewed SHA when distinct)
+      // plus whether override is required — never auto-override.
+      const blockReason = appendDualShaEscalationDisclosure(
+        rawBlockReason,
+        finalBlockingHead,
+        reviewed.sha && !recordedShaIsCurrentForLiveHead(reviewed.sha, finalBlockingHead)
+          ? reviewed.sha
+          : null,
+        true,
+      );
       await setBlockedFn(
         cfg,
         issueNumber,

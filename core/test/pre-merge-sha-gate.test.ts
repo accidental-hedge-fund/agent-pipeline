@@ -1203,7 +1203,7 @@ function blockingReviewCommentWithHash(round: 1 | 2, sha: string, hash: string, 
   return blockingReviewComment(round, sha, keys) + `\n<!-- verdict-diff-hash: ${hash} -->`;
 }
 
-test("enforceReviewShaGate: diff-hash reuse path re-checks blockers — no-op commit cannot bypass (#228)", async (t) => {
+test("enforceReviewShaGate: diff-hash reuse path re-checks blockers — no-op commit cannot bypass (#228/#1010)", async (t) => {
   const DIFF = "diff --git a/foo.ts b/foo.ts\n+const x = 1;";
   const hash = computeDiffHash(DIFF);
   const { deps, rec } = makeDeps({
@@ -1216,10 +1216,14 @@ test("enforceReviewShaGate: diff-hash reuse path re-checks blockers — no-op co
   await quiet(t, async () => {
     out = await enforceReviewShaGate(cfg, 16, 99, deps);
   });
-  assert.notEqual(out, null, "diff-hash reuse must NOT proceed while a blocker is unresolved");
-  assert.equal((out as any)?.status, "blocked");
-  assert.equal(rec.blocked.length, 1);
-  assert.deepEqual(rec.transitions, []);
+  // #1010: prior-head residual keys on a diff-unchanged tip lack blocking
+  // authority — re-evaluate at the live head rather than silent proceed or
+  // setBlocked solely from the superseded key set.
+  assert.notEqual(out, null, "diff-hash reuse must NOT silent-proceed with unresolved prior-head keys");
+  assert.equal((out as any)?.advanced, true, "must re-evaluate, not park on prior-head keys alone");
+  assert.equal((out as any)?.to, "review-2");
+  assert.equal(rec.blocked.length, 0, "must not setBlocked solely from prior-head residual keys");
+  assert.equal(rec.transitions.length, 1);
 });
 
 test("enforceReviewShaGate: diff-hash reuse path proceeds once the blocker is overridden (#228)", async (t) => {
@@ -1240,7 +1244,10 @@ test("enforceReviewShaGate: diff-hash reuse path proceeds once the blocker is ov
   assert.match(rec.comments[0], /Diff unchanged since last review/);
 });
 
-test("enforceReviewShaGate: pipeline-internal-only commits cannot reuse a blocking verdict (#228)", async (t) => {
+test("enforceReviewShaGate: pipeline-internal-only commits cannot reuse a blocking verdict (#228/#1010)", async (t) => {
+  // Archive advances the tip without laundering residual keys into a silent
+  // approve. #1010: prior-head residual keys also must not setBlocked solely
+  // from the H_fail marker — re-evaluate at the live head instead.
   const { deps, rec } = makeDeps({
     commentBody: blockingReviewComment(2, SHA_REVIEWED, ["953ac487"]),
     headSha: SHA_HEAD,
@@ -1250,9 +1257,15 @@ test("enforceReviewShaGate: pipeline-internal-only commits cannot reuse a blocki
   await quiet(t, async () => {
     out = await enforceReviewShaGate(cfg, 16, 99, deps);
   });
-  assert.notEqual(out, null, "an archive commit must NOT let a blocking verdict be reused");
-  assert.equal((out as any)?.status, "blocked");
-  assert.equal(rec.blocked.length, 1);
+  assert.notEqual(out, null, "an archive commit must NOT let a blocking verdict be reused as approval");
+  assert.equal((out as any)?.advanced, true, "must re-evaluate residual keys at live head");
+  assert.equal((out as any)?.to, "review-2");
+  assert.equal(rec.blocked.length, 0, "must not setBlocked solely from prior-head residual keys");
+  assert.equal(rec.transitions.length, 1);
+  assert.ok(
+    rec.comments.some((c) => /prior-head|stale-blocking-keys|#1010/i.test(c)),
+    "must disclose prior-head residual withholding",
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -1617,10 +1630,10 @@ test("enforceReviewShaGate: control — verdict recorded at the current head wit
   assert.deepEqual(rec.transitions, [], "must not route to a full review round");
 });
 
-test("enforceReviewShaGate: control — only pipeline-internal commits since the verdict → still blocks (5.4)", async (t) => {
-  // Mirrors the existing #228 coverage but named for #481's explicit acceptance
-  // criterion: the internal-commit classification must be unaffected by the
-  // new supersession check.
+test("enforceReviewShaGate: control — only pipeline-internal commits since the verdict → re-eval residual (#481/#1010)", async (t) => {
+  // Archive-only tip advance must not silent-approve residual keys (#228/#481).
+  // #1010: residual keys recorded at BASE_SHA also lack live-head authority at
+  // FIX1_SHA — re-evaluate rather than setBlocked solely from the prior-head set.
   const rec: Rec = { comments: [], transitions: [], blocked: [] };
   const blockingKey = "abc12345";
   const priorComment = {
@@ -1649,9 +1662,13 @@ test("enforceReviewShaGate: control — only pipeline-internal commits since the
   await quiet(t, async () => {
     out = await enforceReviewShaGate(cfg, 481, 99, deps);
   });
-  assert.equal(rec.blocked.length, 1, "archive-only commits since the verdict must not launder unresolved blockers");
-  assert.match(rec.blocked[0].reason, new RegExp(blockingKey));
-  assert.deepEqual(rec.transitions, [], "must not route to a full review round");
+  assert.equal(rec.blocked.length, 0, "must not setBlocked solely from prior-head residual keys");
+  assert.equal((out as any)?.advanced, true, "must re-evaluate residual keys at live head");
+  assert.equal(rec.transitions.length, 1, "routes to re-review at live head");
+  assert.ok(
+    rec.comments.some((c) => /prior-head|stale-blocking-keys|#1010/i.test(c)),
+    "must disclose prior-head residual withholding",
+  );
 });
 
 test("enforceReviewShaGate: bound test — head moves on every attempt → conservative fallback, no loop, no block (5.6)", async (t) => {

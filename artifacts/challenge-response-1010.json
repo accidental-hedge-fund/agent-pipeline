@@ -1,0 +1,311 @@
+{
+  "responses": [
+    {
+      "challengeKey": "8ea2c86e",
+      "disposition": "revised",
+      "evidence": "runTestGate does not checkout or pre-verify the remote PR tip. In core/scripts/testgate.ts runAndRecord, accounting prHeadSha is gitHead(wtPath) at test time only. pre-merge-routing inline path runs runTestGate against the managed worktree, then on pass+attempts=0 compares getWorktreeHead to prDetail.head_sha and refuses certification when unequal (#350; core/test/pre-merge-ci-mode.test.ts worktree-ahead). That equality prevents certifying a pass for H_green from tests at H_fail. Prior d2 was incomplete: the fail branch after !inlineResult.passed blocks as suite-fail before worktree/live-head equality, so a lagging worktree at H_fail while live head is H_green is not fully pin-gated on fail. d2 revised: worktree HEAD == live pin is mandatory for both pass and fail authority from inline results; runTestGate contract is worktree-HEAD recording plus consumer pin equality, not remote fetch."
+    },
+    {
+      "challengeKey": "6fef9f4a",
+      "disposition": "defended",
+      "evidence": "Approved carry-forward is explicit in openspec/specs/review-sha-gating/spec.md: when every commit since reviewed-sha is pipeline-internal, the verdict is current and unresolved blocking keys still hold (scenario Only pipeline-internal commits since the verdict — blockers still hold). openspec/specs/pipeline-commits/spec.md + core/scripts/pipeline-commits.ts restrict true-internal to (1) OpenSpec archive prefix chore: archive OpenSpec change(s) for # and (2) exact visual-publish subject; docs-update, auto-format, pre-merge auto-fix, feat/fix ordinary subjects return false. Fixtures: core/test/pipeline-commits.test.ts and core/test/pre-merge-sha-gate.test.ts (docs false; auto-format false; fix review false; near-miss publish false; archive/exact publish true). d4 is residual-key half of that same-effective-code exemption, not a waiver of developer-commit SHA scope (d3)."
+    },
+    {
+      "challengeKey": "0849d0fd",
+      "disposition": "revised",
+      "evidence": "Prior d5 framed only apply-before-SHA-scope ordering. Living policy already makes trusted key overrides durable and intentionally not SHA-scoped: review-policy overrideComment emits ## Pipeline: Finding override + <!-- pipeline-override: <8hex> <disposition> --> with no head SHA; extractOverrides maps key to disposition only. openspec/specs/review-severity-policy/spec.md requires stable findingKey overrides to keep applying across re-reviews; stable-finding-identity matches override sentinels by key. d5 revised: cross-head carry of trusted key overrides is explicit policy (#228 residual + #927 override recovery); code-changing heads still re-enter via diff-hash/delta where partitionFindings applies the same overrides to live findings. Residual reuse null on full override is durable clearance, not a silent drop of unevaluated code change."
+    },
+    {
+      "challengeKey": "39501847",
+      "disposition": "defended",
+      "evidence": "Call-site inventory under core/scripts: no pre-merge stage reads raw tester-evidence.json overall_status for fail/exhaustion without classification. pre-merge-routing local CI uses latestTestGateOutcome over stage_accounting + recordedShaIsCurrentForLiveHead. pre-merge-sha-gate uses loadOrRegenerateTesterEvidenceForReview / testerEvidenceWithholdResult only for delta-review prompt acquisition, via loadTesterEvidenceForReview → loadTesterEvidenceForReviewSync stale-on-mismatch. scoreboard/run-store consume tester_evidence events for metrics only. E2E advance H_fail→H_green: core/test/pre-merge-ci-mode.test.ts stale FAILURE + inline pass advances; no-worktree does not replay prior-head suite-fail; github green ignores prior-head local fail rows (production #927 used stage_accounting test-gate / test-gate-exhausted). Acquisition unit: pre-merge-live-head-pin.test.ts mismatched fail is stale."
+    },
+    {
+      "challengeKey": "ea10c065",
+      "disposition": "uncertainty-accepted",
+      "evidence": "noop-clean re-verify clear and residual dual-SHA control are evidenced through enforceReviewShaGate post-autofix path (pre-merge-live-head-pin.test.ts: noop-clean + clean re-verify → null/no block; residual blocks with H_FAIL+H_GREEN+pipeline override). evaluatePreMergeNoopCleanDisposition does not re-poll getPrChecks; in advance(), enforceReviewShaGate runs before Step 1 CI (pre-merge-routing.ts), so green live-head CI is a later gate on the same advance. No single injected fixture pairs noop-clean with pending/failed H_green checks. d8 uncertainty updated: green-check conjunction is stage composition, not a unified noop+CI regression. Terminal ready-to-deploy still cannot ignore red/pending CI under existing CI contracts."
+    }
+  ],
+  "decision_record": {
+    "schema_version": 1,
+    "decisions": [
+      {
+        "id": "d1",
+        "title": "Shared pure live-head SHA currency classifier",
+        "surface": "core/scripts/stages/pre-merge-shared.ts (`RecordedShaCurrencyStatus`, `classifyRecordedShaAgainstLiveHead`, `recordedShaIsCurrentForLiveHead`); consumers in core/scripts/stages/pre-merge-routing.ts (local test-gate), core/scripts/stages/pre-merge-sha-gate.ts (residual keys + escalation text); unit coverage in core/test/pre-merge-live-head-pin.test.ts",
+        "alternatives": [
+          {
+            "option": "Inline `pr_head_sha === head` string compares in each pre-merge consumer",
+            "rejected_because": "Independent readers of tester-evidence, stage_accounting test-gate rows, and blocking-key markers can disagree on normalization, null/legacy handling, and fail vs pass semantics; design.md Decision 1 requires one pin contract for the evaluation."
+          },
+          {
+            "option": "Thread a single live-head pin struct through every AdvancePreMergeDeps / ShaGateDeps call site as a new required field",
+            "rejected_because": "design.md Open Questions allow helper names and pin plumbing as implementation detail; adding a mandatory deps field would widen the public stage surface without changing the normative pin rule, and existing stages already re-read `getPrDetail().head_sha` at gate entry."
+          }
+        ],
+        "assumptions": [
+          "Live open PR head is available as a full 40-char SHA via existing `getPrDetail` / `prDetail.head_sha` at gate start.",
+          "Recorded evidence SHAs are normalized through `normalizeCandidateSha` from core/scripts/tester-evidence.ts (case-folded full SHA or null)."
+        ],
+        "invariants": [
+          "status is `current` only when both recorded and live are full SHAs and equal after normalize.",
+          "status `stale` covers absent, malformed, or unequal recorded SHA when live pin is valid.",
+          "status `unknown` when the live pin itself is missing/malformed — callers must not grant fail or residual-block authority.",
+          "Callers MUST NOT grant fail / residual-block authority when status ≠ current (documented on the classifier)."
+        ],
+        "evidence": [
+          "core/scripts/stages/pre-merge-shared.ts lines 12–59: classifier statuses and pure compare via normalizeCandidateSha.",
+          "openspec/changes/pin-pre-merge-gates-to-live-head/design.md Decision 1: live head is the sole gate pin source; reject worktree HEAD alone and comment sentinels alone.",
+          "core/test/pre-merge-live-head-pin.test.ts: current/stale/unknown cases including case-normalized match and #927 SHAs H_fail / H_green."
+        ],
+        "generalization_boundary": "Applies to pre-merge tester, local CI classification, and delta residual-key authority. Does not redefine entry-gate poll amortization (`pre-merge-entry-gate-head-anchor`), review-2 acquisition outside pre-merge, or merge-queue head pinning.",
+        "uncertainty": "Low for the three-status model; would be falsified if production evidence stores non-full SHAs that normalize to null while still being operationally current, or if a consumer bypasses the helper and reintroduces asymmetric pass-only staleness."
+      },
+      {
+        "id": "d2",
+        "title": "Local test-gate: stale fail re-runs inline; live-head authority requires worktree HEAD pin match",
+        "surface": "core/scripts/stages/pre-merge-routing.ts `advance` local `ci_mode` branch (`needsFreshGate`, `recordedShaIsCurrentForLiveHead`, post-inline `getWorktreeHead` vs `prDetail.head_sha`); `runTestGate` in core/scripts/testgate.ts records worktree HEAD as accounting `pr_head_sha` only; regressions in core/test/pre-merge-ci-mode.test.ts",
+        "alternatives": [
+          {
+            "option": "Keep prior behavior: block on any most-recent test-gate failure regardless of `pr_head_sha` (only successes were treated as stale)",
+            "rejected_because": "This is the #927 / #1010 strand: fail row at H_fail + green tip H_green produced test-gate-exhausted / suite-fail narrative without re-certifying the live head."
+          },
+          {
+            "option": "Treat SHA-mismatched fail as soft pass when github checks are green without re-running local suite",
+            "rejected_because": "Local mode’s certification contract is a SHA-matched local exit-0 (or inline re-run). Inventing a pass from a foreign fail would violate existing stale-pass fail-closed integrity and the non-goal of weakening CI."
+          },
+          {
+            "option": "Always require operator override when any historical fail row exists in the run dir",
+            "rejected_because": "Observed recovery on #927 was override with zero code change after the tip was already green; that is the failure mode this change removes."
+          },
+          {
+            "option": "Trust runTestGate outcome alone without comparing managed worktree HEAD to live PR head",
+            "rejected_because": "design.md Decision 1 rejects worktree HEAD alone as the pin source; a lagging worktree at H_fail can run tests that are not the live tip H_green. Pass path already refuse-certifies when worktree ≠ prDetail.head_sha (#350); fail authority must use the same pin, not claim live-head suite-fail from a mismatched worktree."
+          }
+        ],
+        "assumptions": [
+          "Inline `runTestGate` executes the command in the managed worktree as currently checked out; it records that worktree’s HEAD via `gitHead`/`rev-parse` into stage_accounting `pr_head_sha` and does not itself fetch/checkout the remote PR tip.",
+          "`latestTestGateOutcome` may return a prior-head failure that is still the newest accounting row after a developer push advances the PR tip.",
+          "After a successful inline gate (pass, attempts=0), pre-merge already compares worktree HEAD to `prDetail.head_sha` and blocks when they differ (#350)."
+        ],
+        "invariants": [
+          "Both pass and fail authority from cached rows require `recordedShaIsCurrentForLiveHead(tgResult.prHeadSha, prDetail.head_sha)`.",
+          "Absent or non-current cached row → `needsFreshGate` → inline re-run; never advance on stale pass; never block solely as current-head fail from a prior-head fail row.",
+          "Inline gate outcomes are live-head-authoritative only when managed worktree HEAD equals the live pin `prDetail.head_sha` (same equality used after pass today). Mismatch is an operational pin failure (sync/push worktree), not suite-fail authority for the live tip — including when the command failed while the worktree lagged the remote head.",
+          "Therefore the gate cannot certify a pass for H_green from tests executed at H_fail: post-gate HEAD inequality blocks certification; accounting `pr_head_sha` is the worktree HEAD at test time, not an invented live tip.",
+          "SHA-matched failure at the live head (worktree HEAD == live pin) still blocks with a reason that names that live head."
+        ],
+        "evidence": [
+          "core/scripts/stages/pre-merge-routing.ts: replaces success-only stale handling with `isCurrentHeadResult` / `needsFreshGate`; post-pass `getWorktreeHead` vs `prDetail.head_sha` equality before `localTestedSha = prDetail.head_sha` (#350 + #1010).",
+          "core/scripts/testgate.ts `runAndRecord`: sets accounting `prHeadSha` from worktree `gitHead` at test time — producer pin is worktree HEAD, not a silent rewrite to remote tip.",
+          "core/test/pre-merge-ci-mode.test.ts: stale fail at H_fail + inline pass advances; worktree≠PR head after pass blocks; github green ignores prior-head fail rows.",
+          "design.md Decision 1 + Decision 2: live head is sole pin; stale fail non-authoritative; worktree-alone rejected."
+        ],
+        "generalization_boundary": "Local `ci_mode` only. GitHub-mode CI continues to bind to live-head check runs via existing `getPrChecks` paths. Does not require runTestGate to implement remote fetch/checkout; pin equality is the pre-merge consumer contract. Does not add a new github recovery ledger.",
+        "uncertainty": "Medium: current production fail branch after inline `!passed` blocks as suite-fail before the worktree/live-head equality check that the pass path uses. Decision now requires that fail authority also be pin-gated; implementation must match before release. Would be falsified if a lagging worktree at H_fail can still set live-head suite-fail for H_green, or if a pass at H_fail can set localTestedSha to H_green."
+      },
+      {
+        "id": "d3",
+        "title": "Residual blocking keys SHA-scoped at gate start: withhold + re-evaluate",
+        "surface": "core/scripts/stages/pre-merge-sha-gate.ts `reuseBlockedBy` inside `enforceReviewShaGate`; marker comment `pipeline-stale-blocking-keys`; transitions back to review-1/review-2; tests in core/test/pre-merge-live-head-pin.test.ts",
+        "alternatives": [
+          {
+            "option": "Auto-clear prior-head `pipeline-blocking-keys` without re-review",
+            "rejected_because": "Weakens rigor when the live head still carries the defect; design.md Decision 3 and non-goals forbid silent drop of true residual blocks."
+          },
+          {
+            "option": "Keep auto-blocking on unresolved keys whenever the verdict-reuse short-circuit fires (exact SHA / diff-hash / pipeline-internal paths) regardless of recorded reviewed SHA",
+            "rejected_because": "#1010 class path: keys from H_fail (e.g. finding key 33f23af4) stranded pre-merge after tip moved green and autofix DNR did not rewrite markers; required operator override with no code change."
+          },
+          {
+            "option": "Require audited `pipeline override` for every head move that leaves residual keys",
+            "rejected_because": "design.md explicitly rejects override-for-every-head-move; override remains for true residual at the live head only."
+          }
+        ],
+        "assumptions": [
+          "Blocking keys can be associated with a reviewed SHA via review artifact `reviewedSha`, legacy `<!-- reviewed-sha: … -->`, or the gate’s current `reviewed.sha` fallback.",
+          "Re-running the same review round at the live head is an acceptable cost to re-assert or clear residual authority."
+        ],
+        "invariants": [
+          "Unresolved keys recorded only against a prior head MUST NOT alone call `setBlocked`.",
+          "Prior-head keys force transition to the corresponding review stage for re-evaluation (not silent approve).",
+          "Same-head residual keys still block under existing residual contracts (control fixture).",
+          "Does not invent approval: withholding residual authority is paired with re-review."
+        ],
+        "evidence": [
+          "core/scripts/stages/pre-merge-sha-gate.ts ~719–769: `keysAreCurrentForLiveHead` gate; comment + transition + advanced outcome `re-review: prior-head residual keys lack live-head authority`.",
+          "openspec/changes/pin-pre-merge-gates-to-live-head/specs/pre-merge-live-head-gate-pinning/spec.md: Blocking delta findings SHALL be SHA-scoped; finding keys from H_fail do not auto-block H_green.",
+          "core/test/pre-merge-live-head-pin.test.ts: prior-head keys re-eval without setBlocked; same-head residual still blocked."
+        ],
+        "generalization_boundary": "Gate-start residual reuse short-circuits in pre-merge SHA gate. Mid-review head supersession and post-delta re-validation paths remain separate. Does not change how finding keys are hashed or how review_policy partitions severity.",
+        "uncertainty": "Low-medium: re-review cost may loop if reviews keep recording keys while developers push between ticks; would be falsified if operators observe thrash without convergence when residual is truly gone at H_green but re-review keeps re-asserting false positives."
+      },
+      {
+        "id": "d4",
+        "title": "Pipeline-internal reuse keeps residual key authority across non-matching SHA",
+        "surface": "core/scripts/stages/pre-merge-sha-gate.ts `reuseBlockedBy` (`pipelineInternalReuse = via.includes(\"pipeline-internal\")`); interaction with existing pipeline-internal commit classification for verdict reuse",
+        "alternatives": [
+          {
+            "option": "Treat any recorded SHA ≠ live head as stale residual authority, including after OpenSpec archive / other pipeline-internal-only commits",
+            "rejected_because": "Would reintroduce non-converging re-review cascades on pipeline-internal commits that the SHA gate already classifies as same-effective-code (isPipelineInternalCommit / pipeline-internal reuse path)."
+          },
+          {
+            "option": "Drop residual authority on all non-exact SHA matches and only re-check via full adversarial review every archive",
+            "rejected_because": "Conflicts with established #16 / pipeline-internal exemption that archive and chore commits must not invalidate an approval when residual keys are already cleared or still correctly block same code."
+          }
+        ],
+        "assumptions": [
+          "When the reuse path is labeled pipeline-internal, intervening commits do not change developer-authored product code in a way that should clear residual findings without re-partition.",
+          "The `via` string on reuse paths remains a reliable marker for pipeline-internal-only ranges."
+        ],
+        "invariants": [
+          "If keys are not current for live head AND reuse is not pipeline-internal → withhold residual block and re-evaluate.",
+          "If reuse is pipeline-internal → residual unresolved keys may still block (same-effective-code residual enforcement).",
+          "Full audited overrides still clear residual authority even for prior-head keys (ordering with d5)."
+        ],
+        "evidence": [
+          "core/scripts/stages/pre-merge-sha-gate.ts comments at residual SHA-scope: pipeline-internal reuse keeps residual authority; `pipelineInternalReuse` guard.",
+          "CLAUDE.md / AGENTS.md review-SHA gate notes: pipeline-internal commits do not invalidate verdict; do not regress to re-review on any SHA change.",
+          "openspec/changes/pin-pre-merge-gates-to-live-head/proposal.md Not changing: pipeline-internal commit classification for the SHA gate."
+        ],
+        "generalization_boundary": "Only residual-key reuse short-circuits tagged as pipeline-internal. Developer/fix commits that advance the tip are not pipeline-internal and must re-scope keys (d3).",
+        "uncertainty": "Medium: depends on accurate pipeline-internal commit classification; would be falsified if a non-internal commit is mislabeled pipeline-internal and residual keys from a real prior defect incorrectly block a green tip without re-eval."
+      },
+      {
+        "id": "d5",
+        "title": "Trusted key overrides are durable key-scoped dispositions that intentionally carry across head SHAs; apply before residual SHA-scope invalidation",
+        "surface": "core/scripts/stages/pre-merge-sha-gate.ts `reuseBlockedBy`: `extractOverrides` → filter unresolved → then SHA-scope check; override syntax/persistence in core/scripts/review-policy.ts (`overrideComment`, `extractOverrides`); living specs `review-severity-policy` + `stable-finding-identity`",
+        "alternatives": [
+          {
+            "option": "SHA-scope first: if keys are prior-head, always re-review even when every key is already overridden",
+            "rejected_because": "Would ignore a complete audited override disposition and force unnecessary re-review loops after operator override of prior-head keys (the #927 recovery path used override of key 33f23af4)."
+          },
+          {
+            "option": "Make key overrides SHA-scoped so an override recorded at H_fail never applies at H_green without re-record",
+            "rejected_because": "Contradicts living stable-finding-identity / review-severity-policy: finding keys are stable across re-reviews and overrides keep applying when the same defect is re-emitted; DNR dispositions are the SHA-scoped machine path, not operator key overrides."
+          },
+          {
+            "option": "Treat prior-head keys as non-authoritative and ignore overrides as irrelevant",
+            "rejected_because": "Operators may override residual keys that remain after re-eval; override must clear residual authority regardless of which head first recorded the key (#228 residual reuse + #1010)."
+          }
+        ],
+        "assumptions": [
+          "Override comments from trusted actors are the durable audited disposition store for finding keys: heading `## Pipeline: Finding override`, sentinel `<!-- pipeline-override: <8hex> <disposition> -->` (no head SHA in the sentinel).",
+          "Stable `findingKey` identity means the same logical defect keeps the same 8-hex key across head moves and re-reviews.",
+          "An empty unresolved set after override means residual-key reuse may proceed without re-asserting those keys; code-changing head advances still enter delta / re-review paths where `partitionFindings` applies the same overrides to live findings."
+        ],
+        "invariants": [
+          "Trusted key overrides intentionally carry across head SHAs (explicit living-spec policy, not an accidental bypass of SHA-scope).",
+          "Full override of all recorded residual keys returns null from `reuseBlockedBy` (no residual setBlocked, no forced residual re-review) even when keys were first recorded against a prior head.",
+          "Partial override leaves unresolved keys subject to SHA-scope (re-eval if prior head, block if same head).",
+          "Override-before-SHA-scope ordering implements durable override carry-forward; it does not skip developer-commit re-review / delta paths for non-residual gate entry."
+        ],
+        "evidence": [
+          "core/scripts/review-policy.ts `overrideComment` / `extractOverrides`: key+disposition only; no reviewed-sha field on the sentinel.",
+          "openspec/specs/review-severity-policy/spec.md: override by key; key stable under rewording; gate excludes overridden keys from blocking set.",
+          "openspec/specs/stable-finding-identity/spec.md: override sentinels matched by findingKey.",
+          "core/scripts/stages/pre-merge-sha-gate.ts: apply overrides before SHA-scope so full override still clears residual authority for prior-head keys (#1010 + #228).",
+          "Issue #927 recovery: `pipeline override 33f23af4` with zero code change after green tip — intended audited clearance, not a silent drop."
+        ],
+        "generalization_boundary": "Key overrides and residual-key reuse ordering only. Does not change scoped-override re-review behavior (scoped overrides still force fresh partition), DNR SHA-anchored dispositions, or override CLI semantics. Does not claim overrides replace green CI.",
+        "uncertainty": "Low-medium: a developer fix at H_green that re-emits a different key for the same defect requires a new override; would be falsified if operators expect override-at-H_fail to clear a different key’s residual at H_green without re-disposition."
+      },
+      {
+        "id": "d6",
+        "title": "Dual-SHA escalation disclosure without auto-override",
+        "surface": "core/scripts/stages/pre-merge-shared.ts `appendDualShaEscalationDisclosure`; applied in pre-merge-sha-gate residual `setBlocked` and post-autofix residual block paths",
+        "alternatives": [
+          {
+            "option": "Auto-clear needs-human when prior candidate SHA ≠ live head at escalation time",
+            "rejected_because": "True residual findings re-verified at the live head must still escalate; auto-clear would weaken rigor (non-goal)."
+          },
+          {
+            "option": "Keep single-SHA / generic block reasons that omit which head is live vs stale",
+            "rejected_because": "Operators could not tell override-required residual at H from stranded H_fail narrative; design risk table standardizes “stale candidate / live head” text."
+          }
+        ],
+        "assumptions": [
+          "When residual still blocks after re-eval/autofix exhaustion, the live head SHA is known (`finalBlockingHead` / gate `head`).",
+          "Prior reviewed/candidate SHA may be null or equal to live head; disclosure degrades to live-head-only text."
+        ],
+        "invariants": [
+          "Escalation never auto-overrides findings; overrideRequired language is advisory in the reason string.",
+          "When prior candidate is a full SHA distinct from live head, reason names both SHAs.",
+          "Control path: residual at H_green after noop still blocks and includes override guidance."
+        ],
+        "evidence": [
+          "core/scripts/stages/pre-merge-shared.ts `appendDualShaEscalationDisclosure`.",
+          "core/scripts/stages/pre-merge-sha-gate.ts ~2071–2080: dual-SHA on residual after autofix exhaustion.",
+          "core/test/pre-merge-live-head-pin.test.ts: dual-SHA control asserts H_FAIL + H_GREEN + pipeline override in block reason."
+        ],
+        "generalization_boundary": "Operator-facing block reason text for residual pre-merge escalation. Does not change offramp_class taxonomy, scoreboard blocker kinds, or override key computation.",
+        "uncertainty": "Low; would be falsified if production blocks still omit live head after this change or if dual-SHA text confuses automation that parses reason strings for exact recipes."
+      },
+      {
+        "id": "d7",
+        "title": "Tester-evidence SHA mismatch: stale for pass and fail authority",
+        "surface": "core/scripts/tester-evidence.ts `loadTesterEvidenceForReviewSync` (classification `stale` on candidate_sha mismatch); pre-merge consumers that honor acquisition classification; tests in core/test/pre-merge-live-head-pin.test.ts",
+        "alternatives": [
+          {
+            "option": "Allow mismatched-SHA fail evidence to supply fail / test-gate-exhausted authority while only blocking mismatched pass",
+            "rejected_because": "Asymmetric currency is the production bug: fail at d8f2da7a… outranked green tip d14ac0ac…."
+          },
+          {
+            "option": "Delete or rewrite on-disk tester-evidence.json when head advances",
+            "rejected_because": "design.md migration: existing run dirs remain; acquisition treats them as stale for the new head (same as review); no data migration."
+          }
+        ],
+        "assumptions": [
+          "Pre-merge and review share `loadTesterEvidenceForReviewSync` currency rules for candidate_sha.",
+          "Stale classification withholds invoke/authority without inventing a pass from a failed artifact."
+        ],
+        "invariants": [
+          "candidate_sha ≠ review/live candidate → classification `stale`, withholdInvoke true.",
+          "Matching fail at live head remains current/authoritative.",
+          "Matching pass at live head remains current."
+        ],
+        "evidence": [
+          "core/scripts/tester-evidence.ts mismatch branch: reason states stale cannot support suite success and MUST NOT supply fail / test-gate-exhausted authority (overall_status included).",
+          "openspec/changes/pin-pre-merge-gates-to-live-head/specs/tester-evidence/spec.md (change delta capability) + design Decision 2.",
+          "core/test/pre-merge-live-head-pin.test.ts: mismatched fail at H_fail with live H_green is stale; matching fail/pass current."
+        ],
+        "generalization_boundary": "Acquisition/load classification only. Does not change how suite commands run, evidence schema version, or github check polling.",
+        "uncertainty": "Low; would be falsified if a pre-merge path reads raw tester-evidence.json and applies overall_status without going through acquisition classification."
+      },
+      {
+        "id": "d8",
+        "title": "Noop-clean / does-not-reproduce at green head prefers re-verify over prior-head exhaustion park",
+        "surface": "Existing pre-merge autofix + re-verify path in core/scripts/stages/pre-merge-sha-gate.ts (`noop-clean` → `evaluatePreMergeNoopCleanDisposition` / re-delta); residual dual-SHA escalation (d6); regression fixture in core/test/pre-merge-live-head-pin.test.ts; green CI enforced by subsequent pre-merge CI step in core/scripts/stages/pre-merge-routing.ts",
+        "alternatives": [
+          {
+            "option": "Escalate immediately to needs-human when autofix budget is exhausted, even if the only durable keys are prior-head and re-verify would clear",
+            "rejected_because": "Matches the #1010 observed offramp: autofix DNR + clean worktree + green CI still parked on autofix-exhausted + stale finding key until override."
+          },
+          {
+            "option": "Skip re-verify and auto-advance on any noop-clean when github checks are green",
+            "rejected_because": "Would advance past residual findings that still re-verify as blocking at the live head; control fixture requires residual at H_green to still block."
+          }
+        ],
+        "assumptions": [
+          "Bounded autofix can return `noop-clean` with authoritative local `headSha` equal to the live tip when regenerate is a no-op.",
+          "Re-delta after noop-clean does not consume a second autofix attempt and is the correct rigor path (#698 / existing contracts).",
+          "In `advance`, `enforceReviewShaGate` (delta/autofix/noop) runs in the entry stack before Step 1 CI; terminal pre-merge success still requires the later CI gate for the same live head."
+        ],
+        "invariants": [
+          "noop-clean + clean re-verify at H_green → SHA-gate proceeds (null / no residual setBlocked), no setBlocked solely from prior-head narrative.",
+          "noop-clean + residual still blocking at H_green → needs-human with dual-SHA disclosure when prior reviewed SHA differs.",
+          "Green CI is mandatory for completing pre-merge via the subsequent local/github CI step; red/pending live-head checks still wait/block under existing CI contracts and are not waived by noop-clean.",
+          "Dirty / failed autofix paths unchanged (not a free pass)."
+        ],
+        "evidence": [
+          "core/scripts/stages/pre-merge-sha-gate.ts: fix-committed and noop-clean share re-review path; noop-clean continues re-verify even if completion marker post fails.",
+          "core/scripts/stages/pre-merge-routing.ts: `enforceReviewShaGate` then later Step 1 CI (`getPrChecks` / local pin).",
+          "openspec/changes/pin-pre-merge-gates-to-live-head/design.md Decision 4 and live-head-gate-pinning spec DNR requirement.",
+          "core/test/pre-merge-live-head-pin.test.ts: DNR clear proceeds; residual control blocks with both SHAs."
+        ],
+        "generalization_boundary": "Pre-merge delta autofix one-attempt bound and re-verify only. Does not change review-2 ceilings, entry-gate amortization, or auto-merge (advance still never merges). Does not re-poll github checks inside `evaluatePreMergeNoopCleanDisposition`.",
+        "uncertainty": "Accepted medium: unit regressions prove noop re-verify clear and residual dual-SHA block through `enforceReviewShaGate` without injecting getPrChecks into that path. Green-check conjunction for terminal advance is by stage composition (SHA-gate then CI) rather than a single end-to-end injected fixture that pairs noop-clean with pending/failed H_green checks. Would be falsified if advance could exit ready-to-deploy after noop-clear while live-head CI remains red/pending, or if residual at H_green no longer escalates."
+      }
+    ]
+  }
+}
