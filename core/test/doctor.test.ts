@@ -1482,6 +1482,60 @@ test("check supervisor:ship-playbook-promote-host — additive stable id", () =>
   assert.ok(ids.includes("supervisor:ship-playbook-promote-host"));
 });
 
+// #927: installed Option 1 Tugboat that lost thin markers must fail closed.
+test("check supervisor:tugboat-install-parity — fails when critical markers missing", async () => {
+  const check = getCheck(makeConfig(), "supervisor:tugboat-install-parity");
+  // Divergent host fork: no promote-all, no failure_detail, no CI bucket, no thin id.
+  const divergent = "#!/usr/bin/env bash\n# host fork ship\nENGINE_PROMOTE_HOST=\"${ENGINE_PROMOTE_HOST:-codex}\"\n";
+  const r = await check.run(
+    fakeDeps({
+      fsExists: (p) => p.includes("/tugboat") && !p.includes("pipeline-ship"),
+      readTextFile: (p) => (p.endsWith("/tugboat") || p.endsWith("tugboat") ? divergent : '{"version":"1.0.0"}'),
+    }),
+  );
+  assertFailWithRemediation(r);
+  assert.match(r.detail, /missing critical thin markers|promote_all_default|thin_identity/i);
+  assert.match(r.remediation!, /tugboat\.sh|install -m 0755|#927|#1001/i);
+});
+
+test("check supervisor:tugboat-install-parity — passes on repo-shaped thin source", async () => {
+  const check = getCheck(makeConfig(), "supervisor:tugboat-install-parity");
+  const thin = [
+    "#!/usr/bin/env bash",
+    "# Tugboat — thin ship composer (Option 1, #1001).",
+    'ENGINE_PROMOTE_HOST="${ENGINE_PROMOTE_HOST:-all}"',
+    'failure_detail() { echo reason; }',
+    'gh pr checks "$pr" --json name,state,bucket >"$RUN_DIR/release-checks.json"',
+    '"kind": "tugboat_ship"',
+    "",
+  ].join("\n");
+  const r = await check.run(
+    fakeDeps({
+      fsExists: (p) => p.includes("tugboat"),
+      readTextFile: (p) => (p.includes("tugboat") ? thin : '{"version":"1.0.0"}'),
+    }),
+  );
+  assert.equal(r.status, "pass");
+  assert.match(r.detail, /thin markers|promote all/i);
+});
+
+test("check supervisor:tugboat-install-parity — skips when tugboat is not installed", async () => {
+  const check = getCheck(makeConfig(), "supervisor:tugboat-install-parity");
+  const r = await check.run(
+    fakeDeps({
+      fsExists: (p) => !p.includes("tugboat"),
+    }),
+  );
+  assert.equal(r.status, "skip");
+});
+
+test("check supervisor:tugboat-install-parity — additive stable id", () => {
+  const ids = buildPreflightChecks(makeConfig(), FAKE_VERSION, FAKE_INSTALL_ROOT).map((c) => c.id);
+  assert.ok(ids.includes("supervisor:tugboat-install-parity"));
+  // Legacy playbook check remains for hosts that still install it (#989).
+  assert.ok(ids.includes("supervisor:ship-playbook-promote-host"));
+});
+
 // Regression for the corrupt-install startup path (#186 review 2): if core/package.json
 // is unreadable at startup, loadVersion() in pipeline.ts returns "" rather than throwing
 // at module load. This test proves runPreflight still executes (does not crash) and that

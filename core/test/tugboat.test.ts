@@ -1,6 +1,7 @@
-// Tugboat (thin ship composer, #1001) decision helpers + structural guards.
+// Tugboat (thin ship composer, #1001 / #927) decision helpers + structural guards.
 // Lessons locked in: bare release version (no leading v), train complete gate,
-// failure detail, promote --host all, gh checks bucket schema.
+// failure detail, promote --host all, gh checks bucket schema, PR reuse,
+// serial multi-milestone, status no-side-effect, install-parity markers.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -9,6 +10,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import {
+  evaluateInstalledTugboatParity,
+  missingTugboatThinMarkers,
+  tugboatHasCriticalThinMarkers,
+  tugboatHasForbiddenSecondBrainMarkers,
+} from "../scripts/tugboat-install-parity.ts";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, "../..");
@@ -131,6 +138,20 @@ test("tugboat supports serial multi-milestone and single-host lock", () => {
   assert.match(body, /--milestones/);
   assert.match(body, /ship_one/);
   assert.match(body, /lock_dir/);
+  // Serial: one ship_one per milestone in order; promote lives inside ship_one.
+  assert.match(
+    body,
+    /for version in "\$\{milestones\[@\]\}"; do\s*\n\s*ship_one "\$version"/,
+  );
+  const shipOneStart = body.indexOf("ship_one() {");
+  const shipOneEnd = body.indexOf("\n# ---------- run serial multi-milestone");
+  assert.ok(shipOneStart >= 0 && shipOneEnd > shipOneStart);
+  const shipOneBody = body.slice(shipOneStart, shipOneEnd);
+  assert.match(shipOneBody, /engine-promote --for "\$version"/);
+  // No parallel fan-out of milestones (ignore prose comments about "ship brain").
+  assert.doesNotMatch(body, /xargs\s+-P/);
+  assert.doesNotMatch(body, /&\s*ship_one\b/);
+  assert.doesNotMatch(body, /\bGNU\s+parallel\b|\bparallel\s+--/);
 });
 
 test("tugboat version rules: train v-prefix, release bare, promote bare, gh release v-prefix", () => {
@@ -139,4 +160,63 @@ test("tugboat version rules: train v-prefix, release bare, promote bare, gh rele
   assert.match(body, /release "\$version"/);
   assert.match(body, /engine-promote --for "\$version"/);
   assert.match(body, /gh release view "v\$version"/);
+});
+
+test("tugboat reuses existing open release PR (idempotent prepare)", () => {
+  // Without find_open_release_pr + reuse branch, a second ship of the same
+  // version would fail closed even when the release PR is already open.
+  const body = fs.readFileSync(tugboat, "utf8");
+  assert.match(body, /find_open_release_pr\(\)/);
+  assert.match(body, /release: \{version\}|release: v\{version\}|startswith\(f"release: /);
+  assert.match(body, /existing open release PR #\$pr reused \(idempotent\)/);
+  assert.match(body, /could not determine release PR number/);
+});
+
+test("tugboat --status reads state without starting ship phases", () => {
+  // Status must exit before train/release/promote; regression if someone
+  // reorders the status branch after ship_one.
+  const body = fs.readFileSync(tugboat, "utf8");
+  const statusIdx = body.indexOf('if [[ "$do_status" == "1" ]]; then');
+  const detachIdx = body.indexOf('if [[ "$do_detach" == "1" ]]; then');
+  const trainIdx = body.indexOf('write_state "train" "running"');
+  assert.ok(statusIdx >= 0, "status branch missing");
+  assert.ok(detachIdx > statusIdx, "status must appear before detach");
+  assert.ok(trainIdx > detachIdx, "status/detach must appear before train phase");
+  // Only the status if-block — not the later ship_one definition.
+  const statusBlock = body.slice(statusIdx, detachIdx);
+  assert.match(statusBlock, /cat "\$STATE_FILE"/);
+  assert.match(statusBlock, /exit 0/);
+  assert.doesNotMatch(statusBlock, /ship_one|train --milestone|release finish/);
+  assert.doesNotMatch(statusBlock, /"\$PIPELINE" train|"\$PIPELINE" release/);
+});
+
+test("tugboat install-parity helper: repo source passes; stripped source fails", () => {
+  const body = fs.readFileSync(tugboat, "utf8");
+  assert.equal(tugboatHasCriticalThinMarkers(body), true);
+  assert.equal(tugboatHasForbiddenSecondBrainMarkers(body), false);
+  assert.deepEqual(missingTugboatThinMarkers(body), []);
+  const pass = evaluateInstalledTugboatParity(body, {
+    pathLabel: "/tmp/tugboat",
+  });
+  assert.equal(pass.status, "pass");
+
+  // Prove each marker is required: drop promote default → fail.
+  const noPromote = body.replace(/ENGINE_PROMOTE_HOST:-all/g, "ENGINE_PROMOTE_HOST:-codex");
+  const failPromote = evaluateInstalledTugboatParity(noPromote, {
+    pathLabel: "/tmp/tugboat",
+  });
+  assert.equal(failPromote.status, "fail");
+  if (failPromote.status === "fail") {
+    assert.match(failPromote.detail, /promote_all_default/);
+    assert.match(failPromote.remediation, /install -m 0755|#927|#1001/);
+  }
+
+  // Null → skip (host does not use Option 1).
+  const skipped = evaluateInstalledTugboatParity(null);
+  assert.equal(skipped.status, "skip");
+
+  // Forbidden second brain → fail even if other markers present.
+  const secondBrain = body + "\npipeline ship --milestone v1.0.0\n";
+  const failBrain = evaluateInstalledTugboatParity(secondBrain);
+  assert.equal(failBrain.status, "fail");
 });

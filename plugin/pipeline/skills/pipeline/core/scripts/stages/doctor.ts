@@ -47,6 +47,10 @@ import {
   defaultInstalledShipPlaybookPath,
   evaluateInstalledShipPlaybookPromoteHost,
 } from "../ship-playbook-promote-host.ts";
+import {
+  defaultInstalledTugboatPath,
+  evaluateInstalledTugboatParity,
+} from "../tugboat-install-parity.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -1092,6 +1096,30 @@ export function buildPreflightChecks(
       const verdict = evaluateInstalledShipPlaybookPromoteHost(body, {
         pathLabel: playbookPath,
         enginePromoteHostEnv: process.env.ENGINE_PROMOTE_HOST,
+      });
+      if (verdict.status === "pass") return pass(verdict.detail);
+      if (verdict.status === "skip") return skip(verdict.detail);
+      return fail(verdict.detail, verdict.remediation);
+    },
+  });
+
+  // 14. Installed Option 1 Tugboat install parity (#927) — a copied
+  //     ~/.local/bin/tugboat that lost promote-all, failure_detail, CI-wait
+  //     bucket schema, or thin identity would diverge from the repo example
+  //     and reintroduce silent multi-host / reasonless failure regressions.
+  //     Fail closed with refresh remediation; absence is skip.
+  checks.push({
+    id: "supervisor:tugboat-install-parity",
+    description:
+      "Installed Option 1 Tugboat (if present) retains thin ship critical markers",
+    run: async (deps) => {
+      const tugboatPath = defaultInstalledTugboatPath();
+      if (!(await deps.fsExists(tugboatPath))) {
+        return skip(`no installed Option 1 Tugboat at ${tugboatPath}`);
+      }
+      const body = await deps.readTextFile(tugboatPath);
+      const verdict = evaluateInstalledTugboatParity(body, {
+        pathLabel: tugboatPath,
       });
       if (verdict.status === "pass") return pass(verdict.detail);
       if (verdict.status === "skip") return skip(verdict.detail);
