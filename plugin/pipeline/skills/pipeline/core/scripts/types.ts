@@ -775,9 +775,10 @@ export interface PipelineConfig {
     timeout: number; // seconds per test/build run
     /**
      * Extra path globs treated as non-product scratch for format/test gate trust
-     * (#873). **Unioned** with the engine-known set (`tasks/**`,
-     * `.pipeline-prompt-*` at worktree root) — never replaces product fail-closed
-     * defaults. Lockfiles are not scratch (handled by lockfile fold).
+     * (#873 / #1013). **Unioned** with the engine-known set (`tasks/**`,
+     * `.pipeline-prompt-*` at worktree root,
+     * `artifacts/challenge-response-*.json`) — never replaces product
+     * fail-closed defaults. Lockfiles are not scratch (handled by lockfile fold).
      */
     non_product_dirty_globs?: string[];
   };

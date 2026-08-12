@@ -774,6 +774,31 @@ test("salvage (#873 onlyPaths): stages product only and unstages pre-staged scra
   );
 });
 
+test("salvage (#1013 onlyPaths): challenge-response scratch excluded from product commit", async () => {
+  const restoreCalls: string[][] = [];
+  let addArgs: string[] | null = null;
+  const deps: SalvageDeps = {
+    gitStatus: async () =>
+      "?? artifacts/challenge-response-1010.json\n M core/scripts/foo.ts\n",
+    gitRestoreStaged: async (_wt, args) => {
+      restoreCalls.push([...args]);
+    },
+    gitAddAll: async (_wt, args) => {
+      addArgs = [...args];
+    },
+    gitCommit: async () => {},
+    onlyPaths: ["core/scripts/foo.ts"],
+  };
+  const res = await salvageUncommittedWork("/wt", 1013, RUN_ID, "test-fix", deps);
+  assert.equal(res.salvaged, true);
+  assert.ok(addArgs !== null, "gitAddAll must be called");
+  assert.ok((addArgs as string[]).includes("core/scripts/foo.ts"), "must add product path");
+  assert.ok(
+    !(addArgs as string[]).includes("artifacts/challenge-response-1010.json"),
+    "must not add challenge-response dump",
+  );
+});
+
 test("salvage (#873 onlyPaths): scratch-only dirty → {salvaged: false}, no add/commit", async () => {
   let addCalled = false;
   let commitCalled = false;

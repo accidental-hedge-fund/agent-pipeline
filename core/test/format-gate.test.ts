@@ -268,6 +268,25 @@ test("format gate (#873): scratch-only pre-dirty does not refuse auto-fix gate",
   assert.equal(execCalls, 1, "format command must run when only scratch is dirty");
 });
 
+test("format gate (#1013): challenge-response-only pre-dirty does not refuse auto-fix gate", async () => {
+  let execCalls = 0;
+  const result = await runFormatGate(
+    "/wt",
+    cfg([{ command: "cargo fmt", auto_fix: true }]),
+    1013,
+    {
+      execInWorktree: async () => {
+        execCalls++;
+        return { code: 0, stdout: "" };
+      },
+      gitStatusPorcelain: async () => "?? artifacts/challenge-response-1010.json\n",
+      gitIsDirty: undefined,
+    },
+  );
+  assert.equal(result.status, "ok", `unexpected: ${JSON.stringify(result)}`);
+  assert.equal(execCalls, 1, "format command must run when only challenge-response scratch is dirty");
+});
+
 test("format gate (#873): mixed scratch + product pre-dirty still blocks", async () => {
   const result = await runFormatGate(
     "/wt",
@@ -333,6 +352,25 @@ test("format gate (#873 review): product-only commit plan unstages scratch and p
     "core/scripts/foo.ts",
   ]);
   assert.ok(!commitArgs.includes("tasks/todo.md"), "scratch must not appear in commit pathspec");
+});
+
+test("format gate (#1013): product-only commit plan excludes challenge-response scratch", () => {
+  const paths = ["artifacts/challenge-response-1010.json", "core/scripts/foo.ts"];
+  const { product, scratch } = classifyWorktreeDirt(paths);
+  assert.deepEqual(product, ["core/scripts/foo.ts"]);
+  assert.deepEqual(scratch, ["artifacts/challenge-response-1010.json"]);
+
+  const unstage = unstageScratchArgs(scratch);
+  assert.ok(unstage, "challenge-response scratch must be unstaged before commit");
+  assert.ok(unstage.includes("artifacts/challenge-response-1010.json"));
+  assert.ok(!unstage.includes("core/scripts/foo.ts"));
+
+  const commitArgs = productOnlyCommitArgs("chore: auto-format (#1013)", product);
+  assert.ok(commitArgs.includes("core/scripts/foo.ts"));
+  assert.ok(
+    !commitArgs.includes("artifacts/challenge-response-1010.json"),
+    "challenge-response dump must not enter auto-format commit",
+  );
 });
 
 test("format gate (#873 review): unstageScratchArgs is null when no scratch", () => {

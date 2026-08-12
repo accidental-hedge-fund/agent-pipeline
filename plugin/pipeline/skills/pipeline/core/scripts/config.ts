@@ -378,8 +378,9 @@ const PartialConfigSchema = z.object({
           }
         })
         .describe(
-          "Extra path globs treated as non-product scratch for format/test gate trust (#873). " +
-            "Unioned with the engine-known set (tasks/**, .pipeline-prompt-* at worktree root); " +
+          "Extra path globs treated as non-product scratch for format/test gate trust (#873 / #1013). " +
+            "Unioned with the engine-known set (tasks/**, .pipeline-prompt-* at worktree root, " +
+            "artifacts/challenge-response-*.json); " +
             "does not replace product fail-closed defaults. Must not match product trees " +
             "(core/, plugin/, openspec/) or repo-wide patterns (**). Lockfiles remain fold targets, not scratch.",
         ),
@@ -2610,15 +2611,16 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
       : `  # command: pnpm test # ${sd("test_gate.command", "explicit command; auto-detected when absent")}`,
     `  max_attempts: ${yamlScalar(testGate.max_attempts)} # ${sd("test_gate.max_attempts", "fix-harness invocations before blocking")}`,
     `  timeout: ${yamlScalar(testGate.timeout)} # ${sd("test_gate.timeout", "seconds per test/build run")}`,
-    // Optional: extra non-product scratch globs for gate trust (#873). Engine-
-    // known set (tasks/**, .pipeline-prompt-*) is always active; this only extends.
+    // Optional: extra non-product scratch globs for gate trust (#873 / #1013).
+    // Engine-known set (tasks/**, .pipeline-prompt-*,
+    // artifacts/challenge-response-*.json) is always active; this only extends.
     ...(testGate.non_product_dirty_globs && testGate.non_product_dirty_globs.length > 0
       ? [
-          `  non_product_dirty_globs: # ${sd("test_gate.non_product_dirty_globs", "extra scratch globs unioned with engine-known tasks/** and .pipeline-prompt-* for format/test gate trust (#873)")}`,
+          `  non_product_dirty_globs: # ${sd("test_gate.non_product_dirty_globs", "extra scratch globs unioned with engine-known tasks/**, .pipeline-prompt-*, and artifacts/challenge-response-*.json for format/test gate trust (#873 / #1013)")}`,
           ...testGate.non_product_dirty_globs.map((g) => `    - ${yamlScalar(g)}`),
         ]
       : [
-          `  # non_product_dirty_globs: [] # ${sd("test_gate.non_product_dirty_globs", "extra scratch globs unioned with engine-known tasks/** and .pipeline-prompt-* for format/test gate trust (#873)")}`,
+          `  # non_product_dirty_globs: [] # ${sd("test_gate.non_product_dirty_globs", "extra scratch globs unioned with engine-known tasks/**, .pipeline-prompt-*, and artifacts/challenge-response-*.json for format/test gate trust (#873 / #1013)")}`,
         ]),
     "",
     "visual_gate: # run the repo's E2E/visual suite after pre-merge and before eval-gate",
