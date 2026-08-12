@@ -113,6 +113,9 @@ test("tugboat train always gates on train-status-complete (not only exit code)",
   assert.match(body, /train JSON not complete/);
   assert.match(body, /has no open issues/);
   assert.match(body, /train\.complete\.json/);
+  // Resume must not re-fail the complete gate on a failed capture file.
+  assert.match(body, /train_resumed/);
+  assert.match(body, /cd "\$REPO_DIR"/);
 });
 
 test("tugboat CI-wait uses valid gh pr checks fields (bucket, not conclusion)", () => {

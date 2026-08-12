@@ -277,7 +277,9 @@ fi
 ship_one() {
   version=$1
   local lock_dir pr train_ec rel_ec fin_ec pro_ec ok checks_green published i draft gec cec green ver_out
-  local STAGE_WATCH_PID_FILE swp SHIP_SINCE
+  local STAGE_WATCH_PID_FILE swp SHIP_SINCE train_resumed=0
+  local release_lock
+  release_lock() { rmdir "$lock_dir" 2>/dev/null || true; }
 
   RUN_DIR="$STATE_ROOT/ship-v$(safe_of "$version")"
   STATE_FILE="$RUN_DIR/state.json"
@@ -289,16 +291,24 @@ ship_one() {
   PID=$$
   echo "$PID" >"$RUN_DIR/playbook.pid"
 
+  # Match fat playbook: run gh + relative paths from the ship target worktree.
+  # (Host pipeline launcher also cd's via REPO_DIR; this covers direct gh calls.)
+  cd "$REPO_DIR"
+
   # Simple single-host lock (prevent concurrent ships on same milestone).
   if ! mkdir "$lock_dir" 2>/dev/null; then
-    if [[ -f "$RUN_DIR/playbook.pid" ]] && kill -0 "$(cat "$RUN_DIR/playbook.pid" 2>/dev/null)" 2>/dev/null; then
-      log "another tugboat holds the lock (pid $(cat "$RUN_DIR/playbook.pid"))"
-      exit 0
+    local other_pid
+    other_pid=$(cat "$RUN_DIR/playbook.pid" 2>/dev/null || true)
+    if [[ -n "$other_pid" && "$other_pid" != "$$" ]] && kill -0 "$other_pid" 2>/dev/null; then
+      log "another tugboat holds the lock (pid $other_pid) — refusing"
+      exit 1
     fi
     rmdir "$lock_dir" 2>/dev/null || rm -rf "$lock_dir"
     mkdir "$lock_dir"
   fi
-  trap 'rmdir "$lock_dir" 2>/dev/null || true' EXIT
+  # Clear this milestone's lock on function return AND process exit (multi-safe).
+  trap 'release_lock' RETURN
+  trap 'release_lock' EXIT
 
   log "tugboat start milestone=v$version version=$version repo=$REPO_DIR host=$ENGINE_PROMOTE_HOST"
 
@@ -330,6 +340,7 @@ ship_one() {
     if grep -qi 'has no open issues' "$RUN_DIR/train.stderr" 2>/dev/null; then
       log "train: milestone has no open issues — treating as already complete (resume)"
       train_ec=0
+      train_resumed=1
       write_state "train" "ok" "no open issues (already shipped)"
     elif {
       _resume_ok=0
@@ -343,6 +354,7 @@ ship_one() {
     }; then
       log "train: prior train_status complete=true — treating as already complete (resume)"
       train_ec=0
+      train_resumed=1
       write_state "train" "ok" "prior complete"
     else
       # Ensure .blocker is written when possible.
@@ -361,8 +373,11 @@ ship_one() {
     fi
   fi
 
-  # Defense in depth: even on exit 0, require last train_status complete.
-  if [[ -s "$RUN_DIR/train.json" ]]; then
+  # Defense in depth: on a fresh train (exit 0, not a resume), require last
+  # train_status complete. Skip when we already accepted resume/no-open-issues —
+  # the just-written train.json may be an error capture while train.complete.json
+  # is the success artifact.
+  if [[ "$train_resumed" -eq 0 && -s "$RUN_DIR/train.json" ]]; then
     ok=$(python3 "$TRAIN_STATUS_COMPLETE_BIN" "$RUN_DIR/train.json" 2>/dev/null || echo 0)
     if [[ "$ok" != "1" ]]; then
       detail="train JSON not complete"
@@ -377,10 +392,14 @@ ship_one() {
     fi
   fi
 
-  write_state "train" "ok" "complete"
-  log "phase train: ok"
-  # Keep a success artifact for resume.
-  cp -f "$RUN_DIR/train.json" "$RUN_DIR/train.complete.json" 2>/dev/null || true
+  if [[ "$train_resumed" -eq 0 ]]; then
+    write_state "train" "ok" "complete"
+    log "phase train: ok"
+    # Keep a success artifact for resume.
+    cp -f "$RUN_DIR/train.json" "$RUN_DIR/train.complete.json" 2>/dev/null || true
+  else
+    log "phase train: ok (resumed)"
+  fi
 
   if [[ -f "$STAGE_WATCH_PID_FILE" ]]; then
     swp=$(cat "$STAGE_WATCH_PID_FILE" 2>/dev/null || true)
