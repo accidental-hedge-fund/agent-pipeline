@@ -76,6 +76,12 @@ import { extractBlockingKeysMarker, extractReviewedSha } from "./review.ts";
 import { appendEvent, RUN_SCHEMA_VERSION, type RunStoreDeps } from "../run-store.ts";
 import { buildStageDiagnostic } from "../stage-diagnostic.ts";
 import {
+  createAndPersistHandoff,
+  createInputFromHumanDecisionDeclaration,
+  prepareAuthorityParkCreate,
+  type HandoffStoreDeps,
+} from "../human-question-handoff.ts";
+import {
   computeBranchDeveloperCommits,
   enforceSpecConsistencyGuard,
   performBoundedSpecRepair,
@@ -212,6 +218,17 @@ export interface AdvanceFixDeps {
   ) => Promise<{ ok: boolean; reason?: string }>;
   /** On-disk worktree lookup (defaults to getOnDiskForIssue). */
   getOnDiskForIssue?: typeof getOnDiskForIssue;
+  /**
+   * Durable human-question handoff store (#647). Defaults to real fs deps.
+   * Tests inject in-memory fakes so park creates handoffs without disk I/O.
+   */
+  handoffStore?: HandoffStoreDeps;
+  /**
+   * Create/reuse authority-bearing handoffs on accepted needs-human-decision
+   * park (#647). Defaults to {@link createAndPersistHandoff}. Tests inject
+   * fakes to force create failure without real store I/O.
+   */
+  createHandoff?: typeof createAndPersistHandoff;
   /**
    * Durable comment sink for noop-advance evidence (#758 R2). Defaults to
    * `postComment`. Tests inject fakes so evidence write failure is exercised
@@ -992,6 +1009,41 @@ export async function advanceFix(
                 footer: cfg.marker_footer,
               }),
             );
+          }
+          // #647: durable authority-bearing handoff per accepted declaration.
+          // Create failure leaves the existing human-decision blocker intact —
+          // never treats the declaration as resolved. Idempotent on re-park.
+          const createHandoffFn = deps.createHandoff ?? createAndPersistHandoff;
+          for (const decl of acceptedHumanDecisions) {
+            if (decl.category === "external-dependency") continue;
+            const createInput = prepareAuthorityParkCreate(
+              createInputFromHumanDecisionDeclaration({
+                domain: cfg.domain,
+                repo: cfg.repo,
+                issue_number: issueNumber,
+                blocked_stage: stage,
+                decl: {
+                  category: decl.category,
+                  key: decl.key,
+                  fingerprint: decl.fingerprint,
+                  reviewedSha: decl.reviewedSha,
+                  request: decl.request,
+                },
+                resume_target: "override-or-unblock",
+              }),
+            );
+            try {
+              const hr = await createHandoffFn(cfg.repo_dir, createInput, deps.handoffStore);
+              if (!hr.ok) {
+                console.warn(
+                  `[pipeline] #${issueNumber}: handoff create failed (blocker retained): ${hr.reason}`,
+                );
+              }
+            } catch (err) {
+              console.warn(
+                `[pipeline] #${issueNumber}: handoff create threw (blocker retained): ${(err as Error).message}`,
+              );
+            }
           }
           const formatRequests = (decls: HumanDecisionDeclaration[]): string =>
             decls.map((d) => `\`${d.key}\`: ${neutralizeSentinelText(d.request)}`).join("; ");

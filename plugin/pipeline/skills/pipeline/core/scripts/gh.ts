@@ -2756,6 +2756,11 @@ export const PIPELINE_COMMENT_KINDS: readonly {
     verify: "pipeline-attest",
   },
   {
+    kind: "human-question-handoff",
+    heading: "## Pipeline: Human-question handoff",
+    verify: "pipeline-attest",
+  },
+  {
     kind: "noop-advance-evidence",
     heading: "## Pipeline: noop-advance evidence",
     verify: "pipeline-attest",

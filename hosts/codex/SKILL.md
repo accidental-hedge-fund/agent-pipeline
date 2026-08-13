@@ -114,6 +114,7 @@ $pipeline scoreboard [--days <n>|--since <iso>] [--until <iso>] [--bucket day|we
 $pipeline summary <run-id>                      Print the run evidence bundle for an issue number or exact run-id
 $pipeline config schema|validate|sync|repo-map … Config schema, validate, sync scaffold, and repo-map mutations
 $pipeline path [--json]                         Discover installed host skill paths (JSON-friendly for desktop integrators)
+$pipeline handoff list|show|answer|reject|supersede … [--json] [--issue N] [--run-id id] [--status pending] List, inspect, answer, reject, or supersede durable human-question handoffs (#647)
 ```
 <!-- END GENERATED: cli-command-table -->
 

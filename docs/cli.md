@@ -207,6 +207,13 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 - **Usage:** `pipeline path [--json]`
 - **Summary:** Discover installed host skill paths (JSON-friendly for desktop integrators)
 
+### Other
+
+#### `handoff`
+
+- **Usage:** `pipeline handoff list|show|answer|reject|supersede … [--json] [--issue N] [--run-id id] [--status pending]`
+- **Summary:** List, inspect, answer, reject, or supersede durable human-question handoffs (#647)
+
 ## Notes
 
 - Hidden/undocumented registry keywords (for example agent-only surfaces) are

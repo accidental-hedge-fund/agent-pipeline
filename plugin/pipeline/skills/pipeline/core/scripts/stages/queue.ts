@@ -107,6 +107,13 @@ export interface BatchSummary {
     failure_rate: number;
     total_cost_usd: number;
     total_duration_ms: number;
+    /**
+     * Pending human-question handoffs in this batch (#647). Waiting-human is
+     * NOT an agent/compute capacity failure and is not charged against
+     * failure_rate solely for waiting.
+     */
+    waiting_human_count: number;
+    waiting_human_oldest_age_seconds: number | null;
   };
   limits: {
     max_issues: number;
@@ -501,6 +508,8 @@ export function selectIssues(
  * Build a BatchSummary from the completed results.
  * `succeeded` = finalState is "ready-to-deploy" or "needs-human".
  * `failed` = everything else (for failure-rate and aggregate counts).
+ * Waiting-human handoff counts (#647) are projected separately and never
+ * inflate failure_rate solely because an item waits on a human.
  */
 export function buildBatchSummary(
   results: RunResult[],
@@ -510,6 +519,10 @@ export function buildBatchSummary(
   excludedCount: number,
   startedAt: number,
   endedAt: number,
+  waitingHuman: {
+    waiting_human_count: number;
+    waiting_human_oldest_age_seconds: number | null;
+  } = { waiting_human_count: 0, waiting_human_oldest_age_seconds: null },
 ): BatchSummary {
   const succeeded = results.filter(
     (r) => r.finalState === "ready-to-deploy" || r.finalState === "needs-human",
@@ -545,6 +558,8 @@ export function buildBatchSummary(
       failure_rate: failureRate,
       total_cost_usd: totalCostUsd,
       total_duration_ms: totalDurationMs,
+      waiting_human_count: waitingHuman.waiting_human_count,
+      waiting_human_oldest_age_seconds: waitingHuman.waiting_human_oldest_age_seconds,
     },
     limits: {
       max_issues: opts.maxIssues,
@@ -578,7 +593,13 @@ function printHumanSummary(
   deps.log(
     `Aggregate: ${agg.total_issues} issued, ${agg.succeeded} succeeded, ${agg.failed} failed, ` +
       `rate=${(agg.failure_rate * 100).toFixed(1)}%, cost=$${agg.total_cost_usd.toFixed(4)}, ` +
-      `duration=${(agg.total_duration_ms / 1000).toFixed(1)}s`,
+      `duration=${(agg.total_duration_ms / 1000).toFixed(1)}s` +
+      (agg.waiting_human_count > 0
+        ? `, waiting_human=${agg.waiting_human_count}` +
+          (agg.waiting_human_oldest_age_seconds != null
+            ? ` (oldest ${agg.waiting_human_oldest_age_seconds}s)`
+            : "")
+        : ""),
   );
   if (summary.halt_reason) {
     deps.log(`Batch halted: ${summary.halt_reason}`);
@@ -721,6 +742,24 @@ async function runQueueUnlocked(opts: QueueOpts, deps: QueueDeps): Promise<void>
 
   const endedAt = deps.clock();
 
+  // #647: project pending human-question handoffs for batch visibility.
+  // Waiting-human is not a capacity failure; counts are additive to summary.
+  let waitingHuman = {
+    waiting_human_count: 0,
+    waiting_human_oldest_age_seconds: null as number | null,
+  };
+  try {
+    const { listHandoffs, projectWaitingHuman } = await import("../human-question-handoff.ts");
+    const batchIssues = results.map((r) => r.issueNumber);
+    const handoffs = await listHandoffs(opts.repoDir, {
+      batch_issue_numbers: batchIssues,
+      status: "pending",
+    });
+    waitingHuman = projectWaitingHuman(handoffs);
+  } catch {
+    /* best-effort projection — missing store must not fail the batch */
+  }
+
   const summary = buildBatchSummary(
     results,
     titleMap,
@@ -729,6 +768,7 @@ async function runQueueUnlocked(opts: QueueOpts, deps: QueueDeps): Promise<void>
     excludedCount,
     startedAt,
     endedAt,
+    waitingHuman,
   );
 
   const artifactDir = path.join(

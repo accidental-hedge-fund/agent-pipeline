@@ -259,6 +259,13 @@ export const COMMAND_DOCS: Record<string, CommandDoc> = {
     documented: true,
     section: "factory",
   },
+  handoff: {
+    summary:
+      "List, inspect, answer, reject, or supersede durable human-question handoffs (#647)",
+    usage:
+      "handoff list|show|answer|reject|supersede … [--json] [--issue N] [--run-id id] [--status pending]",
+  },
+
   correction: {
     summary: "Record a correction event or attribute a control (append-only local ledger)",
     usage: "correction record|attribute …",

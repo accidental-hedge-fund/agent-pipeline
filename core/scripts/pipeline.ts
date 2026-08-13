@@ -535,6 +535,24 @@ export interface CliOpts {
   correctionsBy?: string[];
   /** report: skip the interactive confirmation prompt (-y/--yes). */
   yes?: boolean;
+  /** handoff answer: answer body text (#647). */
+  text?: string;
+  /** handoff reject/supersede: reason text (#647). */
+  reason?: string;
+  /** handoff answer/reject/supersede: client idempotency key (#647). */
+  clientRequestId?: string;
+  /** handoff list: comma-separated issue numbers for a queue batch (#647). */
+  batch?: string;
+  /** handoff list: status filter (#647). */
+  filterStatus?: string;
+  /** handoff supersede: candidate SHA (#647). */
+  candidateSha?: string;
+  /** handoff supersede: resume target (#647). */
+  resumeTarget?: string;
+  /** handoff supersede: handoff_class (#647). Commander maps `--class` → class. */
+  class?: string;
+  /** handoff supersede: bounded question (#647). */
+  question?: string;
 }
 
 export interface ShipCliInput {
@@ -666,7 +684,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | single | release | ship | factory-gate | factory-release | factory-pin | engine-promote | intake | decompose | triage | roadmap | sweep | merge | merge-queue | train | summary | improve | scoreboard | queue | backfill | evals | loop | correction | report")
+    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | single | release | ship | factory-gate | factory-release | factory-pin | engine-promote | intake | decompose | triage | roadmap | sweep | merge | merge-queue | train | summary | improve | scoreboard | queue | backfill | evals | loop | correction | handoff | report")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -855,6 +873,17 @@ export function buildCmd(): Command {
     .option("--supersedes <attribution-id>", "correction attribute: optional — the attribution_id this record supersedes")
     .option("--note <text>", "correction attribute: optional bounded free-text note")
     .option("--corrections-by <dimension>", "scoreboard: group correction/recurrence metrics by repo|stage|harness|model|source_kind|failure_class|proposed_control|implemented_control; repeatable (to detect a duplicate flag)", collectRepeatable, [])
+    // human-question handoff (#647)
+    .option("--text <text>", "handoff answer: the answer text")
+    .option("--reason <text>", "handoff reject/supersede: reason text")
+    .option("--client-request-id <id>", "handoff answer/reject/supersede: idempotency key")
+    .option("--batch <list>", "handoff list: comma-separated issue numbers for a queue batch filter")
+    .option("--filter-status <status>", "handoff list: filter by handoff status (pending|answered|rejected|superseded|expired)")
+    // handoff supersede reuses existing --capability <name> (also used by backfill)
+    .option("--candidate-sha <sha>", "handoff supersede: candidate SHA")
+    .option("--resume-target <stage>", "handoff supersede: resume target")
+    .option("--class <class>", "handoff supersede: handoff_class")
+    .option("--question <text>", "handoff supersede: bounded question text")
     // report (#502): privacy-safe upstream product-fault reporting. Disabled
     // by default (product_fault.enabled absent/false in .github/pipeline.yml)
     // — see `runProductFaultReport`. --yes supplies the explicit confirmation
@@ -3820,6 +3849,226 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Human-question handoff operator surface (#647): list | show | answer | reject | supersede.
+  // Mutating verbs are audited and never merge. Labels remain the workflow authority.
+  if (numArg === "handoff") {
+    const verb = cmd.args[1] as string | undefined;
+    const idOrFilter = cmd.args[2] as string | undefined;
+    const handoffStart = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
+    const repoDir = findGitRoot(handoffStart) ?? handoffStart;
+    const hq = await import("./human-question-handoff.ts");
+    const {
+      listHandoffs,
+      loadHandoff,
+      answerAndPersistHandoff,
+      supersedeAndPersistHandoff,
+      formatHandoffListHuman,
+      formatHandoffShowHuman,
+      HANDOFF_CLASSES,
+      HANDOFF_STATUSES,
+    } = hq;
+
+    const asStatus = (s: string | undefined) => {
+      if (!s) return undefined;
+      return (HANDOFF_STATUSES as readonly string[]).includes(s) ? s : undefined;
+    };
+
+    if (!verb || !["list", "show", "answer", "reject", "supersede"].includes(verb)) {
+      console.error(
+        "Usage: pipeline handoff list|show|answer|reject|supersede …\n" +
+          "  list   [--issue N] [--run-id id] [--filter-status pending] [--batch 1,2,3] [--json]\n" +
+          "  show   <handoff-id> --issue N [--json]\n" +
+          "  answer <handoff-id> --issue N --text \"…\" [--client-request-id id]\n" +
+          "  reject <handoff-id> --issue N [--reason …] [--client-request-id id]\n" +
+          "  supersede <handoff-id> --issue N --question \"…\" --class <class> --capability <cap> --candidate-sha <sha> --resume-target <t>",
+      );
+      process.exitCode = 2;
+      return;
+    }
+
+    if (verb === "list") {
+      const batchIssues = opts.batch
+        ? opts.batch.split(/[,\s]+/).map((s) => Number(s)).filter((n) => Number.isInteger(n) && n > 0)
+        : undefined;
+      const statusFilter = asStatus(opts.filterStatus) as
+        | import("./human-question-handoff.ts").HandoffStatus
+        | undefined;
+      const handoffs = await listHandoffs(repoDir, {
+        issue: opts.issue,
+        run_id: opts.runId ?? null,
+        status: statusFilter,
+        batch_issue_numbers: batchIssues,
+      });
+      if (opts.json) {
+        console.log(JSON.stringify({ schema_version: "1", handoffs }, null, 2));
+      } else {
+        console.log(formatHandoffListHuman(handoffs));
+      }
+      process.exitCode = 0;
+      return;
+    }
+
+    if (!idOrFilter) {
+      console.error(`pipeline handoff ${verb}: missing handoff id`);
+      process.exitCode = 2;
+      return;
+    }
+    if (!opts.issue) {
+      console.error(`pipeline handoff ${verb}: --issue <N> is required`);
+      process.exitCode = 2;
+      return;
+    }
+
+    if (verb === "show") {
+      const loaded = await loadHandoff(repoDir, opts.issue, idOrFilter);
+      if (!loaded.ok) {
+        console.error(`pipeline handoff show: ${loaded.reason}`);
+        process.exitCode = 1;
+        return;
+      }
+      if (opts.json) {
+        console.log(JSON.stringify(loaded.handoff, null, 2));
+      } else {
+        console.log(formatHandoffShowHuman(loaded.handoff));
+      }
+      process.exitCode = 0;
+      return;
+    }
+
+    // Mutating verbs need authenticated identity.
+    const { getGhActor } = await import("./gh.ts");
+    const actor = await getGhActor();
+    if (!actor) {
+      console.error(
+        `pipeline handoff ${verb}: could not resolve authenticated GitHub identity (gh auth)`,
+      );
+      process.exitCode = 1;
+      return;
+    }
+
+    if (verb === "answer" || verb === "reject") {
+      if (verb === "answer" && !(opts.text && opts.text.trim())) {
+        console.error('pipeline handoff answer: --text "…" is required');
+        process.exitCode = 2;
+        return;
+      }
+      const result = await answerAndPersistHandoff(repoDir, opts.issue, idOrFilter, {
+        decision: verb === "reject" ? "reject" : "answer",
+        actor,
+        identitySource: "gh",
+        authenticated: true,
+        answerText: verb === "answer" ? opts.text : opts.reason ?? "rejected",
+        clientRequestId: opts.clientRequestId ?? null,
+      });
+      if (!result.ok) {
+        console.error(`pipeline handoff ${verb}: ${result.reason}`);
+        process.exitCode = 1;
+        return;
+      }
+      if (opts.json) {
+        console.log(
+          JSON.stringify(
+            {
+              schema_version: "1",
+              ok: true,
+              duplicate: result.duplicate,
+              advances_item: false,
+              handoff: result.handoff,
+            },
+            null,
+            2,
+          ),
+        );
+      } else {
+        console.log(
+          result.duplicate
+            ? `Handoff ${idOrFilter}: duplicate ${verb} (idempotent, no advance).`
+            : `Handoff ${idOrFilter}: ${result.handoff.status} by ${actor}. Item is not advanced by this command alone.`,
+        );
+      }
+      process.exitCode = 0;
+      return;
+    }
+
+    if (verb === "supersede") {
+      const q = (opts.question ?? opts.text ?? "").trim();
+      const clsRaw = opts.class ?? "missing_context";
+      if (!q) {
+        console.error("pipeline handoff supersede: --question is required");
+        process.exitCode = 2;
+        return;
+      }
+      if (!(HANDOFF_CLASSES as readonly string[]).includes(clsRaw)) {
+        console.error(
+          `pipeline handoff supersede: --class must be one of ${HANDOFF_CLASSES.join("|")}`,
+        );
+        process.exitCode = 2;
+        return;
+      }
+      const cls = clsRaw as import("./human-question-handoff.ts").HandoffClass;
+      // Authority-bearing supersede without HDR fails closed in canCreateHandoff.
+      // Operator CLI defaults supersede to non-authority classes; product_judgment
+      // requires separate authority evidence (not invented here).
+      const authorityBearing = ["product_judgment", "risk_authority", "override_disposition"].includes(
+        cls,
+      );
+      if (authorityBearing) {
+        console.error(
+          "pipeline handoff supersede: authority-bearing classes require human-decision-required " +
+            "evidence at create; use a non-authority class or the fix-stage park path",
+        );
+        process.exitCode = 1;
+        return;
+      }
+      const domain = opts.domain ?? "local";
+      const result = await supersedeAndPersistHandoff(repoDir, opts.issue, idOrFilter, {
+        domain,
+        repo: opts.repoPath ?? repoDir,
+        issue_number: opts.issue,
+        blocked_stage: "needs-human",
+        question: q,
+        reason: opts.reason ?? `supersedes ${idOrFilter}`,
+        handoff_class: cls,
+        authority_mode: "non_authority",
+        required_capability: opts.capability ? [opts.capability] : ["operator"],
+        candidate_sha: opts.candidateSha ?? null,
+        tip_present: !!opts.candidateSha,
+        human_decision_required: null,
+        policy_bound_authority_gate: false,
+        resume_target: opts.resumeTarget ?? "override-or-unblock",
+      });
+      // If authority class without evidence, create fails closed — good.
+      if (!result.ok) {
+        console.error(`pipeline handoff supersede: ${result.reason}`);
+        process.exitCode = 1;
+        return;
+      }
+      if (opts.json) {
+        console.log(
+          JSON.stringify(
+            {
+              schema_version: "1",
+              ok: true,
+              prior: result.prior,
+              replacement: result.replacement,
+            },
+            null,
+            2,
+          ),
+        );
+      } else {
+        console.log(
+          `Handoff ${idOrFilter} superseded by ${result.replacement.handoff_id}. Prior resume path blocked.`,
+        );
+      }
+      process.exitCode = 0;
+      return;
+    }
+
+    process.exitCode = 2;
+    return;
+  }
+
   // Early `pipeline correction record` dispatch (#499) — a narrow, non-mutating
   // command that records exactly one correction_event against an EXISTING run.
   // No config resolution or gh auth required — it locates the run directory
@@ -5790,6 +6039,24 @@ export interface RunStatusDeps {
    *  events.jsonl finalized/last-event summary for the issue, or null when no
    *  run directory exists. */
   getLatestRunEvents?: (cfg: PipelineConfig, issueNumber: number) => Promise<RunEventsSummary | null>;
+  /**
+   * List durable human-question handoffs for status projection (#647).
+   * Optional — when absent, status skips the handoff section (ceiling punch-list
+   * behavior unchanged).
+   */
+  listHandoffs?: (
+    cfg: PipelineConfig,
+    issueNumber: number,
+  ) => Promise<
+    Array<{
+      handoff_id: string;
+      status: string;
+      handoff_class: string;
+      authority_mode: string;
+      question: string;
+      created_at: string;
+    }>
+  >;
 }
 
 const defaultRunStatusDeps: RunStatusDeps = {
@@ -5799,6 +6066,10 @@ const defaultRunStatusDeps: RunStatusDeps = {
   getForIssue: getOnDiskForIssue,
   getLabelEvents: getIssueLabelEvents,
   getLatestRunEvents: (cfg, issueNumber) => latestRunEventsSummaryForIssue(cfg.repo_dir, issueNumber),
+  listHandoffs: async (cfg, issueNumber) => {
+    const { listHandoffs } = await import("./human-question-handoff.ts");
+    return listHandoffs(cfg.repo_dir, { issue: issueNumber });
+  },
 };
 
 export async function runStatus(
@@ -5823,12 +6094,28 @@ export async function runStatus(
       const runEvents = deps.getLatestRunEvents
         ? await deps.getLatestRunEvents(cfg, issueNumber).catch(() => null)
         : null;
+      let handoffProj: StatusPayload["handoffs"] | undefined;
+      if (deps.listHandoffs) {
+        const hs = await deps.listHandoffs(cfg, issueNumber).catch(() => []);
+        if (hs.length > 0) {
+          handoffProj = hs.map((h) => ({
+            handoff_id: h.handoff_id,
+            status: h.status,
+            handoff_class: h.handoff_class,
+            authority_mode: h.authority_mode,
+            question_summary:
+              h.question.length > 80 ? `${h.question.slice(0, 77)}...` : h.question,
+          }));
+        }
+      }
       const payload: StatusPayload = buildStatusPayload(
         { ...detail, labelEvents },
         prNumber,
         worktreeInfo,
         cfg,
         runEvents,
+        new Date(),
+        handoffProj,
       );
       console.log(JSON.stringify(payload));
     } catch (err) {
@@ -5884,6 +6171,25 @@ export async function runStatus(
           `Run \`--override "<key>: <reason>"\` (auto-resumes) or fix the residual findings and relabel ` +
           `\`pipeline:needs-human\` → \`pipeline:review-<round>\` to resume.`,
     );
+    // #647: list pending human-question handoffs without replacing the punch-list.
+    if (deps.listHandoffs) {
+      const hs = await deps.listHandoffs(cfg, issueNumber).catch(() => []);
+      const pending = hs.filter((h) => h.status === "pending");
+      if (pending.length > 0) {
+        console.log("");
+        console.log(`Human-question handoffs (${pending.length} pending):`);
+        for (const h of pending) {
+          const q =
+            h.question.length > 80 ? `${h.question.slice(0, 77)}...` : h.question;
+          console.log(
+            `- ${h.handoff_id} [${h.handoff_class}/${h.authority_mode}] — ${q}`,
+          );
+        }
+        console.log(
+          "Inspect: pipeline handoff show <id>   Answer: pipeline handoff answer <id> --text \"...\"",
+        );
+      }
+    }
   }
 
   // #633: warn when the latest run's event stream recorded write failures so

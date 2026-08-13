@@ -55,6 +55,12 @@ export interface HumanInterventionEvent {
    */
   offramp_id?: string;
   /**
+   * Optional correlation to a durable human-question handoff (#647). Kind alone
+   * never authorizes resume; handoff resume rules apply independently.
+   * Additive optional — does not change HumanInterventionKind.
+   */
+  handoff_id?: string;
+  /**
    * Engine + discovery attribution (#763). New producers stamp discovery_channel
    * from the caller or from the active run's persisted `run.json` channel.
    * Historical events without these fields remain countable; collectors may
@@ -126,6 +132,8 @@ export async function emitHumanIntervention(
     ref?: string | null;
     /** Shared pair id with co-emitted blocker_set (#683 review 2). */
     offramp_id?: string;
+    /** Optional correlation to a durable human-question handoff (#647). */
+    handoff_id?: string;
     /** Optional engine identity for attribution stamps (#763). */
     engine_version?: string | null;
     engine_commit_sha?: string | null;
@@ -169,6 +177,9 @@ export async function emitHumanIntervention(
         : {}),
       ...(payload.offramp_id != null && payload.offramp_id !== ""
         ? { offramp_id: payload.offramp_id }
+        : {}),
+      ...(payload.handoff_id != null && payload.handoff_id !== ""
+        ? { handoff_id: payload.handoff_id }
         : {}),
       ...attribution,
     };
