@@ -9,10 +9,12 @@ import {
   ENGINE_CLASS_LIVE_SIBLING_MARKER,
   engineClassLiveSiblingBody,
   engineClassLiveSiblingTitle,
+  getTrainMilestoneContext,
+  setTrainMilestoneContext,
   type EngineClassLiveSiblingDeps,
   type OpenSiblingIssue,
 } from "../scripts/stages/engine-class-live-sibling.ts";
-import { BACKLOG_LABEL } from "../scripts/open-soak-defect-preflight.ts";
+import { BACKLOG_LABEL, ENGINE_CLASS_MARKER_LABEL } from "../scripts/open-soak-defect-preflight.ts";
 
 function makeDeps(seed: OpenSiblingIssue[] = []): EngineClassLiveSiblingDeps & {
   createCalls: Array<{ title: string; body: string; labels: string[]; milestone?: string }>;
@@ -74,7 +76,13 @@ function siblingIssue(
 test("labels are ready + engine-class + bug, never backlog", () => {
   assert.ok(ENGINE_CLASS_LIVE_SIBLING_LABELS.includes("pipeline:ready"));
   assert.ok(ENGINE_CLASS_LIVE_SIBLING_LABELS.includes("bug"));
+  assert.ok(ENGINE_CLASS_LIVE_SIBLING_LABELS.includes(ENGINE_CLASS_MARKER_LABEL));
   assert.ok(!ENGINE_CLASS_LIVE_SIBLING_LABELS.includes(BACKLOG_LABEL as never));
+  assert.deepEqual([...ENGINE_CLASS_LIVE_SIBLING_LABELS], [
+    "bug",
+    ENGINE_CLASS_MARKER_LABEL,
+    "pipeline:ready",
+  ]);
 });
 
 test("body declares Depends on recovered issue and marker", () => {
@@ -137,6 +145,53 @@ test("no milestone does not invent one", async () => {
     deps,
   );
   assert.equal(deps.createCalls[0]!.milestone, undefined);
+
+  // Whitespace / empty string also fail closed — never invent a title.
+  const deps2 = makeDeps();
+  await autoFileEngineClassLiveSibling(
+    {
+      recoveredIssue: 5,
+      evidenceKey: "fp-empty-ms",
+      milestone: "   ",
+      domain: "test",
+      windowHours: 24,
+      maxPerWindow: 3,
+    },
+    deps2,
+  );
+  assert.equal(deps2.createCalls[0]!.milestone, undefined);
+});
+
+test("train milestone context set/get/clear (train CLI seam)", () => {
+  setTrainMilestoneContext(null);
+  assert.equal(getTrainMilestoneContext(), null);
+  setTrainMilestoneContext("v1.38.1");
+  assert.equal(getTrainMilestoneContext(), "v1.38.1");
+  setTrainMilestoneContext("  ");
+  assert.equal(getTrainMilestoneContext(), null, "whitespace clears / does not invent");
+  setTrainMilestoneContext("v1.38.1");
+  setTrainMilestoneContext(null);
+  assert.equal(getTrainMilestoneContext(), null);
+});
+
+test("createIssue failure is non-fatal (returns skipped, does not throw)", async () => {
+  const deps = makeDeps();
+  deps.createIssue = async () => {
+    throw new Error("gh issue create failed: simulated");
+  };
+  const result = await autoFileEngineClassLiveSibling(
+    {
+      recoveredIssue: 7,
+      evidenceKey: "fp-fail",
+      milestone: "v1.38.1",
+      domain: "test",
+      windowHours: 24,
+      maxPerWindow: 3,
+    },
+    deps,
+  );
+  assert.equal(result.filed, false);
+  assert.match(result.skippedReason ?? "", /gh issue create failed/);
 });
 
 test("title is stable for evidence key", () => {

@@ -1,9 +1,4 @@
-# engine-class-live-sibling Specification
-
-## Purpose
-After first recovered engine-class scratch or workflow-engine defect on a live train item, file at most one milestone-scoped ready sibling so the durable engine fix lands in the current ship without patching the victim PR.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: First recovered engine-class fingerprint SHALL file at most one live milestone sibling
 
