@@ -6,10 +6,13 @@ import {
   inferRunFromTemporalProximity,
   parseCommitTrailers,
   resolveRunFromTrailer,
+  resolveRunsFromCandidateSha,
   type RunIdentity,
 } from "../scripts/outcomes/linkage.ts";
 
 const SHA = "c".repeat(40);
+const CANDIDATE = "a".repeat(40);
+const OTHER = "b".repeat(40);
 
 const runs: RunIdentity[] = [
   {
@@ -17,6 +20,7 @@ const runs: RunIdentity[] = [
     issue: 42,
     pr: 99,
     started_at: "2026-06-08T14:32:00Z",
+    candidate_sha: CANDIDATE,
   },
   {
     run_id: "42-2026-06-09T10-00-00-000Z",
@@ -124,4 +128,62 @@ test("disputed keeps both run attributions", () => {
   assert.equal(attribution.length, 2);
   assert.equal(observation_state, "disputed");
   assert.ok(attribution.every((x) => x.disputed === true));
+});
+
+test("candidate SHA exact match yields observed direct run attribution", () => {
+  const { attributions, diagnostic, disputed } = resolveRunsFromCandidateSha(CANDIDATE, runs);
+  assert.equal(attributions.length, 1);
+  assert.equal(attributions[0]!.target_id, "42-2026-06-08T14-32-00-000Z");
+  assert.equal(attributions[0]!.method, "direct");
+  assert.equal(attributions[0]!.authority, "observed");
+  assert.equal(diagnostic, null);
+  assert.equal(disputed, false);
+
+  const built = buildAttributionFromSignal({
+    merge_sha: CANDIDATE,
+    runs,
+  });
+  assert.ok(
+    built.attribution.some(
+      (a) =>
+        a.target_type === "run" &&
+        a.target_id === "42-2026-06-08T14-32-00-000Z" &&
+        a.authority === "observed" &&
+        a.method === "direct",
+    ),
+  );
+  assert.ok(built.attribution.some((a) => a.target_type === "commit" && a.target_id === CANDIDATE));
+});
+
+test("unresolved candidate SHA keeps commit only", () => {
+  const { attributions } = resolveRunsFromCandidateSha(OTHER, runs);
+  assert.equal(attributions.length, 0);
+
+  const built = buildAttributionFromSignal({
+    merge_sha: OTHER,
+    runs,
+  });
+  assert.ok(built.attribution.some((a) => a.target_type === "commit"));
+  assert.equal(
+    built.attribution.some((a) => a.target_type === "run"),
+    false,
+  );
+});
+
+test("multiple candidate SHA matches preserve all runs as disputed", () => {
+  const multi: RunIdentity[] = [
+    { run_id: "run-a", issue: 1, pr: 1, candidate_sha: CANDIDATE },
+    { run_id: "run-b", issue: 2, pr: 2, candidate_sha: CANDIDATE },
+  ];
+  const { attributions, diagnostic, disputed } = resolveRunsFromCandidateSha(CANDIDATE, multi);
+  assert.equal(attributions.length, 2);
+  assert.equal(disputed, true);
+  assert.equal(diagnostic, "disputed_targets");
+  assert.ok(attributions.every((a) => a.disputed === true));
+
+  const built = buildAttributionFromSignal({ merge_sha: CANDIDATE, runs: multi });
+  const runAttrs = built.attribution.filter((a) => a.target_type === "run");
+  assert.equal(runAttrs.length, 2);
+  assert.ok(runAttrs.every((a) => a.disputed === true));
+  assert.ok(built.linkage_diagnostics.includes("disputed_targets"));
 });

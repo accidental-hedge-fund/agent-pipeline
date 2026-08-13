@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as path from "node:path";
 import {
+  deriveDeliveryOutcomeId,
   deriveOutcomeId,
   githubOutcomeAdapter,
   GITHUB_OUTCOME_ADAPTER_ID,
@@ -60,6 +61,7 @@ const runs: RunIdentity[] = [
     issue: 576,
     pr: 1200,
     started_at: "2026-08-13T15:47:45Z",
+    candidate_sha: SHA,
   },
 ];
 
@@ -199,4 +201,108 @@ test("ingest dry-run does not write", async () => {
   assert.equal(summary.written, 1);
   assert.equal(summary.dry_run, true);
   assert.equal(deps.files.size, 0);
+});
+
+test("deriveDeliveryOutcomeId is shared for merge and deploy of same SHA", () => {
+  const mergeId = deriveDeliveryOutcomeId({ candidateSha: SHA, prNumber: 1200 });
+  const deployId = deriveDeliveryOutcomeId({
+    candidateSha: SHA,
+    prNumber: undefined,
+    fallbackSignalId: "deploy:prod",
+  });
+  assert.equal(mergeId, deployId);
+  // Must not include env/deploy markers that would split the chain.
+  const oldStyle = deriveOutcomeId(GITHUB_OUTCOME_ADAPTER_ID, "delivery", "deploy", "prod", SHA);
+  assert.notEqual(deployId, oldStyle);
+});
+
+test("merge then deploy upsert shares one delivery chain record", async () => {
+  const deps = memStore();
+  const deployFixture: RawOutcomeSignal = {
+    signal_id: "deploy:prod:1",
+    kind: "deployment",
+    payload: {
+      sha: SHA,
+      environment: "production",
+      state: "success",
+      at: "2026-08-13T18:00:00Z",
+      url: "https://github.com/example/repo/deployments/1",
+      pr_number: 1200,
+    },
+  };
+
+  const first = await ingestOutcomes({
+    repoDir: REPO,
+    signals: [mergeFixture],
+    runs,
+    deps,
+    now: new Date("2026-08-13T17:00:00Z"),
+  });
+  assert.equal(first.written, 1);
+  const oid = first.outcome_ids[0]!;
+
+  const second = await ingestOutcomes({
+    repoDir: REPO,
+    signals: [deployFixture],
+    runs,
+    deps,
+    now: new Date("2026-08-13T18:30:00Z"),
+  });
+  // Same outcome_id → replaced, not a second delivery fact.
+  assert.equal(second.replaced, 1);
+  assert.equal(second.written, 0);
+  assert.deepEqual(second.outcome_ids, [oid]);
+
+  const listed = await listOutcomes(REPO, { retentionDays: 0, includeExpired: true }, deps);
+  assert.equal(listed.records.length, 1);
+  const rec = listed.records[0]!;
+  assert.equal(rec.outcome_id, oid);
+  assert.equal(rec.outcome_kind, "delivery");
+  assert.equal(rec.delivery?.merge_status, "merged");
+  assert.equal(rec.delivery?.merged_sha, SHA);
+  assert.equal(rec.delivery?.deploy_status, "succeeded");
+  assert.equal(rec.delivery?.deployed_candidate_sha, SHA);
+  assert.equal(rec.delivery?.environment, "production");
+  // SHA-based observed run linkage without relying only on trailer.
+  assert.ok(
+    rec.attribution.some(
+      (a) =>
+        a.target_type === "run" &&
+        a.target_id === "576-2026-08-13T15-47-45-000Z" &&
+        a.authority === "observed",
+    ),
+  );
+});
+
+test("deployment alone links run via candidate_sha without trailer", () => {
+  const deployOnly: RawOutcomeSignal = {
+    signal_id: "deploy:only",
+    kind: "deployment",
+    payload: {
+      sha: SHA,
+      environment: "staging",
+      state: "success",
+      at: "2026-08-13T19:00:00Z",
+    },
+  };
+  const rec = githubOutcomeAdapter.normalize(deployOnly, {
+    repoDir: REPO,
+    runs,
+    now: new Date("2026-08-13T19:00:00Z"),
+  });
+  assert.ok(rec);
+  assert.ok(
+    rec.attribution.some(
+      (a) =>
+        a.target_type === "run" &&
+        a.method === "direct" &&
+        a.authority === "observed" &&
+        a.target_id === "576-2026-08-13T15-47-45-000Z",
+    ),
+  );
+  // No trailer in payload — linkage is pure candidate_sha match.
+  assert.equal(
+    rec.attribution.some((a) => a.method === "trailer"),
+    false,
+  );
 });

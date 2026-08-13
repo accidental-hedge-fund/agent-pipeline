@@ -81,6 +81,29 @@ export function deriveOutcomeId(adapterId: string, ...parts: Array<string | numb
   return `${safe}:${hash}`;
 }
 
+/**
+ * Shared delivery identity for merge and deployment observations of the same
+ * candidate. Prefer full candidate/merge SHA; fall back to PR; then signal id.
+ * Environment is a field on the delivery chain, not part of outcome_id, so a
+ * later deploy updates the same delivery record rather than splitting the chain.
+ */
+export function deriveDeliveryOutcomeId(args: {
+  adapterId?: string;
+  candidateSha?: string | null;
+  prNumber?: number | null;
+  fallbackSignalId?: string | null;
+}): string {
+  const adapterId = args.adapterId ?? GITHUB_OUTCOME_ADAPTER_ID;
+  const sha = normalizeFullSha(args.candidateSha ?? null);
+  if (sha) {
+    return deriveOutcomeId(adapterId, "delivery", sha);
+  }
+  if (args.prNumber != null && args.prNumber > 0) {
+    return deriveOutcomeId(adapterId, "delivery", `pr:${args.prNumber}`);
+  }
+  return deriveOutcomeId(adapterId, "delivery", args.fallbackSignalId ?? "unknown");
+}
+
 // ---------------------------------------------------------------------------
 // GitHub-native adapter
 // ---------------------------------------------------------------------------
@@ -156,16 +179,17 @@ export const githubOutcomeAdapter: OutcomeSourceAdapter = {
       const env = asString(signal.payload.environment);
       const deployedSha = normalizeFullSha(asString(signal.payload.deployed_candidate_sha));
 
-      const outcomeId = deriveOutcomeId(
-        GITHUB_OUTCOME_ADAPTER_ID,
-        "delivery",
-        pr,
-        mergeSha ?? signal.signal_id,
-      );
+      // Prefer deployed SHA when present so a co-bundled deploy still keys the
+      // same delivery identity as a later pure deployment signal for that SHA.
+      const outcomeId = deriveDeliveryOutcomeId({
+        candidateSha: deployedSha ?? mergeSha,
+        prNumber: pr,
+        fallbackSignalId: signal.signal_id,
+      });
 
       const link = buildAttributionFromSignal({
         commit_message: body,
-        merge_sha: mergeSha,
+        merge_sha: mergeSha ?? deployedSha,
         pr_number: pr ?? undefined,
         issue_number: asNumber(signal.payload.issue_number) ?? undefined,
         runs,
@@ -302,13 +326,13 @@ export const githubOutcomeAdapter: OutcomeSourceAdapter = {
       const at = asString(signal.payload.at) ?? asString(signal.payload.updated_at);
       const pr = asNumber(signal.payload.pr_number);
 
-      const outcomeId = deriveOutcomeId(
-        GITHUB_OUTCOME_ADAPTER_ID,
-        "delivery",
-        "deploy",
-        env,
-        sha ?? signal.signal_id,
-      );
+      // Same identity family as merge: candidate SHA (or PR) — not env/deploy
+      // markers — so deploy updates the existing delivery chain record.
+      const outcomeId = deriveDeliveryOutcomeId({
+        candidateSha: sha,
+        prNumber: pr,
+        fallbackSignalId: signal.signal_id,
+      });
 
       const link = buildAttributionFromSignal({
         merge_sha: sha,

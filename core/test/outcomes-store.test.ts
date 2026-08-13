@@ -7,6 +7,8 @@ import {
 } from "../scripts/outcomes/schema.ts";
 import {
   listOutcomes,
+  mergeDeliveryChains,
+  mergeOutcomeRecords,
   outcomesDir,
   upsertOutcome,
   type OutcomeStoreDeps,
@@ -133,4 +135,99 @@ test("write failure is non-fatal to caller (skipped_invalid)", async () => {
 
 test("outcomesDir is under .agent-pipeline/outcomes", () => {
   assert.equal(outcomesDir("/r"), path.join("/r", ".agent-pipeline", "outcomes"));
+});
+
+test("mergeDeliveryChains preserves merge when deploy arrives later", () => {
+  const merged = mergeDeliveryChains(
+    emptyDeliveryChain({
+      merge_status: "merged",
+      merged_sha: SHA,
+      deploy_status: "not_observed",
+    }),
+    emptyDeliveryChain({
+      environment: "production",
+      deploy_status: "succeeded",
+      deployed_candidate_sha: SHA,
+      merge_status: "unknown",
+      merged_sha: null,
+    }),
+  );
+  assert.ok(merged);
+  assert.equal(merged.merge_status, "merged");
+  assert.equal(merged.merged_sha, SHA);
+  assert.equal(merged.deploy_status, "succeeded");
+  assert.equal(merged.deployed_candidate_sha, SHA);
+  assert.equal(merged.environment, "production");
+});
+
+test("upsert field-merges delivery chain for same outcome_id", async () => {
+  const deps = memStore();
+  const id = "github:delivery:shared";
+  const mergeRec = makeOutcomeShell({
+    outcome_id: id,
+    outcome_kind: "delivery",
+    observation_state: "observed",
+    adapter_id: "github",
+    signal_ref: "merge:1",
+    summary: "Merged: feat",
+    signal_at: "2026-08-13T16:00:00Z",
+    observed_at: "2026-08-13T16:05:00Z",
+    delivery: emptyDeliveryChain({
+      merge_status: "merged",
+      merged_sha: SHA,
+      deploy_status: "not_observed",
+    }),
+    attribution: [
+      {
+        target_type: "pr",
+        target_id: "9",
+        method: "adapter",
+        authority: "observed",
+        confidence: 1,
+      },
+    ],
+    evidence_refs: ["merge:1"],
+  });
+  const deployRec = makeOutcomeShell({
+    outcome_id: id,
+    outcome_kind: "delivery",
+    observation_state: "observed",
+    adapter_id: "github",
+    signal_ref: "deploy:1",
+    summary: "Deployment succeeded to production",
+    signal_at: "2026-08-13T18:00:00Z",
+    observed_at: "2026-08-13T18:05:00Z",
+    delivery: emptyDeliveryChain({
+      environment: "production",
+      deploy_status: "succeeded",
+      deployed_candidate_sha: SHA,
+      merge_status: "unknown",
+    }),
+    attribution: [
+      {
+        target_type: "commit",
+        target_id: SHA,
+        method: "adapter",
+        authority: "observed",
+        confidence: 1,
+      },
+    ],
+    evidence_refs: ["deploy:1"],
+  });
+
+  await upsertOutcome(REPO, mergeRec, deps);
+  const up = await upsertOutcome(REPO, deployRec, deps);
+  assert.equal(up.action, "replaced");
+  assert.equal(up.record?.delivery?.merge_status, "merged");
+  assert.equal(up.record?.delivery?.deploy_status, "succeeded");
+  assert.equal(up.record?.delivery?.merged_sha, SHA);
+  assert.equal(up.record?.delivery?.deployed_candidate_sha, SHA);
+  assert.ok(up.record?.attribution.some((a) => a.target_type === "pr"));
+  assert.ok(up.record?.attribution.some((a) => a.target_type === "commit"));
+  assert.equal(up.record?.signal_at, "2026-08-13T16:00:00Z");
+  assert.equal(up.record?.observed_at, "2026-08-13T18:05:00Z");
+
+  const pure = mergeOutcomeRecords(mergeRec, deployRec);
+  assert.equal(pure.delivery?.merge_status, "merged");
+  assert.equal(pure.delivery?.deploy_status, "succeeded");
 });

@@ -65,6 +65,14 @@ Unit tests SHALL exercise a fixture end-to-end: raw signal → normalized record
 - **THEN** it SHALL write a `delivery` (or update an existing delivery) with `merge_status: "merged"` and `merged_sha` set
 - **AND** if no deployment signal is in the fixture, `deploy_status` SHALL be `not_observed` or `unknown`
 
+#### Scenario: merge then deploy share one delivery outcome_id
+
+- **WHEN** the GitHub adapter ingests a merge signal for candidate SHA S (or PR N when SHA is absent)
+- **AND** later ingests a deployment signal for the same candidate SHA S (or same PR N)
+- **THEN** both normalizations SHALL resolve to the same `outcome_id` (stable delivery identity; environment is not part of the id)
+- **AND** upsert SHALL update the existing delivery record so merge and deploy fields coexist on one chain
+- **AND** the store SHALL NOT retain two separate full `delivery` facts for that candidate under default dedupe rules
+
 #### Scenario: revert signal produces reversion outcome
 
 - **WHEN** the GitHub adapter ingests a revert PR fixture that references original PR N

@@ -14,8 +14,12 @@ import {
   readProductionOutcome,
   serializeProductionOutcome,
   validateProductionOutcome,
+  type DeliveryChain,
+  type ObservationState,
+  type OutcomeAttribution,
   type ProductionOutcome,
 } from "./schema.ts";
+import { applyDisputedRunAttributions } from "./linkage.ts";
 
 export const DEFAULT_OUTCOME_RETENTION_DAYS = 365;
 
@@ -208,11 +212,167 @@ export interface UpsertResult {
   error?: string;
 }
 
+const DEPLOY_STATUS_RANK: Record<string, number> = {
+  not_observed: 0,
+  unknown: 1,
+  in_progress: 2,
+  succeeded: 3,
+  failed: 3,
+  rolled_back: 3,
+};
+
+const MERGE_STATUS_RANK: Record<string, number> = {
+  not_observed: 0,
+  unknown: 1,
+  not_merged: 2,
+  merged: 3,
+};
+
+const VERIFICATION_STATUS_RANK: Record<string, number> = {
+  not_observed: 0,
+  unknown: 1,
+  passed: 2,
+  failed: 2,
+};
+
+const OBSERVATION_STATE_RANK: Record<string, number> = {
+  not_observed: 0,
+  unknown: 1,
+  delayed: 2,
+  observed: 3,
+  disputed: 4,
+};
+
+function preferByRank<T extends string>(a: T, b: T, rank: Record<string, number>): T {
+  return (rank[b] ?? 0) >= (rank[a] ?? 0) ? b : a;
+}
+
+function preferNonNullString(a: string | null, b: string | null): string | null {
+  return b ?? a ?? null;
+}
+
+/** Merge delivery-chain fields so later deploy/merge signals update one record. */
+export function mergeDeliveryChains(
+  existing: DeliveryChain | null,
+  incoming: DeliveryChain | null,
+): DeliveryChain | null {
+  if (!existing) return incoming;
+  if (!incoming) return existing;
+  return {
+    environment: preferNonNullString(existing.environment, incoming.environment),
+    deploy_status: preferByRank(existing.deploy_status, incoming.deploy_status, DEPLOY_STATUS_RANK),
+    deployed_candidate_sha: preferNonNullString(
+      existing.deployed_candidate_sha,
+      incoming.deployed_candidate_sha,
+    ),
+    merge_status: preferByRank(existing.merge_status, incoming.merge_status, MERGE_STATUS_RANK),
+    merged_sha: preferNonNullString(existing.merged_sha, incoming.merged_sha),
+    verification: {
+      status: preferByRank(
+        existing.verification.status,
+        incoming.verification.status,
+        VERIFICATION_STATUS_RANK,
+      ),
+      evidence_ref: preferNonNullString(
+        existing.verification.evidence_ref,
+        incoming.verification.evidence_ref,
+      ),
+      fresh_at: preferNonNullString(existing.verification.fresh_at, incoming.verification.fresh_at),
+    },
+    rollback: {
+      occurred:
+        existing.rollback.occurred === true || incoming.rollback.occurred === true
+          ? true
+          : existing.rollback.occurred === false || incoming.rollback.occurred === false
+            ? false
+            : null,
+      outcome: preferNonNullString(
+        existing.rollback.outcome,
+        incoming.rollback.outcome,
+      ) as DeliveryChain["rollback"]["outcome"],
+    },
+  };
+}
+
+/**
+ * Field-level merge for same outcome_id re-ingest (especially delivery chain).
+ * Attribution is unioned; multiple runs mark disputed. Does not drop prior claims.
+ */
+export function mergeOutcomeRecords(
+  existing: ProductionOutcome,
+  incoming: ProductionOutcome,
+): ProductionOutcome {
+  const { attribution, observation_state: disputedState } = applyDisputedRunAttributions(
+    existing.attribution,
+    incoming.attribution,
+  );
+  // Dedupe non-run targets by type+id (keep first; incoming fills gaps).
+  const mergedAttr: OutcomeAttribution[] = [];
+  for (const a of attribution) {
+    const dup = mergedAttr.find((m) => m.target_type === a.target_type && m.target_id === a.target_id);
+    if (!dup) mergedAttr.push({ ...a });
+    else if (a.disputed) dup.disputed = true;
+  }
+
+  let observation_state: ObservationState = preferByRank(
+    existing.observation_state,
+    incoming.observation_state,
+    OBSERVATION_STATE_RANK,
+  );
+  if (disputedState === "disputed") observation_state = "disputed";
+
+  const evidence = [...new Set([...existing.evidence_refs, ...incoming.evidence_refs])];
+  const diagnostics = [
+    ...new Set([...existing.linkage_diagnostics, ...incoming.linkage_diagnostics]),
+  ];
+
+  // Same signal re-ingest: last write for summary. Distinct signals: retain both.
+  const summary =
+    existing.summary === incoming.summary
+      ? existing.summary
+      : existing.source.signal_ref === incoming.source.signal_ref
+        ? incoming.summary
+        : `${existing.summary} | ${incoming.summary}`.slice(0, 500);
+
+  // signal_at: earliest known event in the chain; observed_at: latest observation.
+  const signalTimes = [existing.signal_at, incoming.signal_at].filter(
+    (t): t is string => typeof t === "string" && t.length > 0,
+  );
+  signalTimes.sort();
+  const observedTimes = [existing.observed_at, incoming.observed_at].filter(
+    (t): t is string => typeof t === "string" && t.length > 0,
+  );
+  observedTimes.sort();
+
+  const sameKind = existing.outcome_kind === incoming.outcome_kind;
+  const delivery =
+    existing.outcome_kind === "delivery" || incoming.outcome_kind === "delivery"
+      ? mergeDeliveryChains(existing.delivery, incoming.delivery)
+      : incoming.delivery ?? existing.delivery;
+
+  return {
+    ...existing,
+    // Prefer existing kind when both delivery; otherwise last write for kind mismatch.
+    outcome_kind: sameKind ? existing.outcome_kind : incoming.outcome_kind,
+    observation_state,
+    observed_at: observedTimes.length ? observedTimes[observedTimes.length - 1]! : null,
+    signal_at: signalTimes.length ? signalTimes[0]! : null,
+    source: existing.source,
+    delivery,
+    summary,
+    evidence_refs: evidence,
+    attribution: mergedAttr,
+    linkage_diagnostics: diagnostics,
+    supersedes_outcome_id:
+      incoming.supersedes_outcome_id ?? existing.supersedes_outcome_id,
+  };
+}
+
 /**
  * Idempotent upsert by outcome_id.
- * Same id replaces the prior record (merge rule: last write wins for fields;
- * attribution arrays from the new record replace the old, so re-ingest of the
- * same signal does not double-count).
+ * When a record with the same id already exists, field-merge (delivery chain +
+ * attribution union) so merge then deploy of the same candidate updates one
+ * delivery observation rather than last-write wiping prior chain steps.
  */
 export async function upsertOutcome(
   repoDir: string,
@@ -228,7 +388,7 @@ export async function upsertOutcome(
       error: validated.issues.map((i) => `${i.path}: ${i.message}`).join("; "),
     };
   }
-  const value = validated.value;
+  let value = validated.value;
   const dir = outcomesDir(repoDir);
   try {
     await deps.mkdir(dir, { recursive: true });
@@ -244,8 +404,22 @@ export async function upsertOutcome(
   const filePath = outcomeFilePath(repoDir, value.outcome_id);
   let existed = false;
   try {
-    await deps.readFile(filePath);
+    const raw = await deps.readFile(filePath);
     existed = true;
+    const prior = readProductionOutcome(JSON.parse(raw));
+    if (prior) {
+      value = mergeOutcomeRecords(prior, value);
+      const revalidated = validateProductionOutcome(value);
+      if (!revalidated.ok || !revalidated.value) {
+        return {
+          outcome_id: value.outcome_id,
+          action: "skipped_invalid",
+          record: null,
+          error: revalidated.issues.map((i) => `${i.path}: ${i.message}`).join("; "),
+        };
+      }
+      value = revalidated.value;
+    }
   } catch {
     existed = false;
   }

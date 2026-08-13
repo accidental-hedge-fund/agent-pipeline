@@ -239,6 +239,48 @@ export function inferRunFromTemporalProximity(args: {
 }
 
 /**
+ * Resolve run attributions by exact match of normalized SHA to RunIdentity.candidate_sha.
+ * Multiple matches are all retained with disputed markers (no silent single winner).
+ * Observed authority — durable run-store evidence of candidate equality.
+ */
+export function resolveRunsFromCandidateSha(
+  sha: string | null | undefined,
+  runs: readonly RunIdentity[],
+): {
+  attributions: OutcomeAttribution[];
+  diagnostic: string | null;
+  disputed: boolean;
+} {
+  const normalized = normalizeFullSha(sha ?? null);
+  if (!normalized) {
+    return { attributions: [], diagnostic: null, disputed: false };
+  }
+  const matches = runs.filter((r) => normalizeFullSha(r.candidate_sha ?? null) === normalized);
+  if (matches.length === 0) {
+    return { attributions: [], diagnostic: null, disputed: false };
+  }
+  const disputed = matches.length > 1;
+  const attributions: OutcomeAttribution[] = [];
+  for (const r of matches) {
+    const a = makeAttribution({
+      target_type: "run",
+      target_id: r.run_id,
+      method: "direct",
+      authority: "observed",
+      confidence: 1,
+      note: "candidate_sha exact match",
+      disputed: disputed || undefined,
+    });
+    if (a) attributions.push(a);
+  }
+  return {
+    attributions,
+    diagnostic: disputed ? LINKAGE_DIAGNOSTIC_CODES.disputed_targets : null,
+    disputed,
+  };
+}
+
+/**
  * Build attribution entries from adapter signal fields + optional run index.
  * Many-to-many: all resolvable targets are included; no primary forced.
  */
@@ -326,6 +368,21 @@ export function buildAttributionFromSignal(args: {
       confidence: 1,
     });
     if (a) attribution.push(a);
+
+    // SHA-based run linkage: deployment/merge SHA equal to stored candidate_sha.
+    const shaRuns = resolveRunsFromCandidateSha(sha, runs);
+    for (const ra of shaRuns.attributions) {
+      if (!attribution.some((x) => x.target_type === "run" && x.target_id === ra.target_id)) {
+        attribution.push(ra);
+      } else {
+        // Existing run entry — upgrade dispute marker when multi-match.
+        const existing = attribution.find(
+          (x) => x.target_type === "run" && x.target_id === ra.target_id,
+        );
+        if (existing && ra.disputed) existing.disputed = true;
+      }
+    }
+    if (shaRuns.diagnostic) diagnostics.push(shaRuns.diagnostic);
   }
 
   for (const comp of args.component_ids ?? []) {
@@ -338,6 +395,17 @@ export function buildAttributionFromSignal(args: {
       confidence: 0.8,
     });
     if (a) attribution.push(a);
+  }
+
+  // Multiple distinct observed/inferred runs on one outcome → dispute markers.
+  const runIds = attribution.filter((a) => a.target_type === "run").map((a) => a.target_id);
+  if (new Set(runIds).size > 1) {
+    for (const a of attribution) {
+      if (a.target_type === "run") a.disputed = true;
+    }
+    if (!diagnostics.includes(LINKAGE_DIAGNOSTIC_CODES.disputed_targets)) {
+      diagnostics.push(LINKAGE_DIAGNOSTIC_CODES.disputed_targets);
+    }
   }
 
   const hasRun = attribution.some((a) => a.target_type === "run" && a.authority === "observed");

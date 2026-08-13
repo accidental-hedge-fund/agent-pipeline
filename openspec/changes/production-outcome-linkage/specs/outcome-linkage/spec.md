@@ -89,3 +89,16 @@ The engine SHALL provide pure (or deps-injected) helpers that resolve candidate 
 - **WHEN** a trailer references a run id absent from the local store
 - **THEN** the helper SHALL return an unresolved diagnostic
 - **AND** SHALL NOT throw an unhandled exception
+
+#### Scenario: candidate SHA exact match is observed run link
+
+- **WHEN** helpers are given a merge or deployment SHA equal to a run store `candidate_sha`
+- **THEN** the helper SHALL emit a `run` attribution with `method: "direct"` and `authority: "observed"`
+- **AND** SHALL still include a `commit` attribution for that SHA when valid
+
+#### Scenario: multiple candidate SHA matches stay disputed
+
+- **WHEN** two or more runs share the same `candidate_sha` equal to the signal SHA
+- **THEN** the helper SHALL retain a `run` attribution for each match
+- **AND** SHALL mark them disputed (per-entry and/or `disputed_targets` diagnostic)
+- **AND** SHALL NOT silently keep only one run
