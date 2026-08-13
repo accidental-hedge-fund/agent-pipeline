@@ -34,6 +34,12 @@ import type { HumanInterventionEvent } from "./intervention.ts";
 import type { StageDiagnostic } from "./stage-diagnostic.ts";
 import { validateCorrectionEvent, type CorrectionEvent } from "./correction.ts";
 import type { ProductFaultEvent } from "./product-fault.ts";
+import type {
+  AssumptionLineageEvent,
+  MaterialReworkEvent,
+  PlanningLeveragePhaseEvent,
+  PlanningLeverageSnapshotEvent,
+} from "./planning-leverage/schema.ts";
 import { accountingSummary, sanitizeStageAccountingRecord } from "./accounting.ts";
 import { RUNS_ARTIFACT, HISTORY_ARTIFACT, artifactSubdir } from "./artifact-ignore.ts";
 import {
@@ -429,6 +435,8 @@ export interface AdvisoryCarryForwardEvent extends RunEventBase {
 export type { HumanInterventionEvent };
 export type { CorrectionEvent };
 export type { ProductFaultEvent };
+/** Planning-leverage family (#702) — additive; stream schema_version stays 1. */
+export type { PlanningLeveragePhaseEvent, AssumptionLineageEvent, MaterialReworkEvent, PlanningLeverageSnapshotEvent };
 
 export type RunEvent =
   | RunStartEvent
@@ -461,7 +469,11 @@ export type RunEvent =
   | EngineDriftEvent
   | HumanInterventionEvent
   | CorrectionEvent
-  | ProductFaultEvent;
+  | ProductFaultEvent
+  | PlanningLeveragePhaseEvent
+  | AssumptionLineageEvent
+  | MaterialReworkEvent
+  | PlanningLeverageSnapshotEvent;
 
 // ---------------------------------------------------------------------------
 // Write-health (#633) — durable mid-run event-stream delivery failures

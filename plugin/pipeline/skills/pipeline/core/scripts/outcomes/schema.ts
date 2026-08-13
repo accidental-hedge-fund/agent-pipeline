@@ -71,6 +71,8 @@ export const ATTRIBUTION_TARGET_TYPES = [
   "pr",
   "issue",
   "component",
+  /** Join target for planning-leverage / material-rework → #576 outcomes (#702). */
+  "production_outcome",
 ] as const;
 export type AttributionTargetType = (typeof ATTRIBUTION_TARGET_TYPES)[number];
 

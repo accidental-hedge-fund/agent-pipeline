@@ -120,6 +120,16 @@ import { makePipelineRunId } from "./traceability.ts";
 import { parseOverrideArg } from "./review-policy.ts";
 import { classifyProductFault, emitProductFault, resolveHostAdapter, resolveProductFaultConfig } from "./product-fault.ts";
 import { emitHumanIntervention, blockerKindToInterventionKind } from "./intervention.ts";
+import {
+  emitMaterialRework,
+  emitPlanningLeveragePhase,
+  fixRoundFromStage,
+} from "./planning-leverage/emit.ts";
+import {
+  makePhaseInstanceId,
+  mapStageToPhase,
+  unavailableActiveEffort,
+} from "./planning-leverage/schema.ts";
 import { toPreMergeOfframpClass } from "./pre-merge-offramp.ts";
 import { buildStageDiagnostic, projectStageDiagnostic } from "./stage-diagnostic.ts";
 import { autoFileCorrections, autoFilePapercuts, realAutoFileDeps } from "./stages/papercut.ts";
@@ -986,6 +996,8 @@ export async function runAdvance(
     // 'starting' and 'run id' lines below. Skipped under --dry-run.
     // runStoreDeps is mutated after the tee starts so --json-events events bypass it.
     let runDir: string | undefined;
+    /** Open planning-leverage phase instances keyed by delivery phase (#702). */
+    const openPhaseInstances = new Map<string, { phase_instance_id: string; started_at: string }>();
     let terminalTee: TerminalLogTee | undefined;
     // Engine identity this run is pinned to (#450) — resolved once at run start
     // and compared against the on-disk identity at each stage boundary below.
@@ -2010,6 +2022,38 @@ export async function runAdvance(
       }
       if (!dispatchOwnsLifecycle && runDir) {
         await appendEvent(runDir, { schema_version: RUN_SCHEMA_VERSION, type: "stage_start", at: stageEnteredAt, stage: auditStage }, runStoreDeps).catch(() => {});
+        // #702 planning-leverage phase start (additive; active effort unavailable).
+        const plPhase = mapStageToPhase(auditStage);
+        if (plPhase) {
+          const runIdForPl = path.basename(runDir);
+          const phaseInstanceId = makePhaseInstanceId({
+            run_id: runIdForPl,
+            phase: plPhase,
+            started_at: stageEnteredAt,
+          });
+          openPhaseInstances.set(plPhase, {
+            phase_instance_id: phaseInstanceId,
+            started_at: stageEnteredAt,
+          });
+          await emitPlanningLeveragePhase(
+            runDir,
+            {
+              run_id: runIdForPl,
+              issue: issueNumber,
+              phase: plPhase,
+              pipeline_stage: auditStage,
+              boundary: "start",
+              phase_instance_id: phaseInstanceId,
+              planning_depth: "unknown",
+              risk_class: "unknown",
+              started_at: stageEnteredAt,
+              ended_at: null,
+              active_effort: unavailableActiveEffort(),
+              at: stageEnteredAt,
+            },
+            runStoreDeps,
+          ).catch(() => {});
+        }
       }
       let out: Outcome;
       try {
@@ -2079,6 +2123,68 @@ export async function runAdvance(
       }
       if (!dispatchOwnsLifecycle && runDir) {
         await appendEvent(runDir, { schema_version: RUN_SCHEMA_VERSION, type: "stage_complete", at: stageExitedAt, stage: auditStage, outcome: evidenceOutcome(out), commits: stageCommits }, runStoreDeps).catch(() => {});
+        // #702 planning-leverage phase end + material_rework on fix rounds.
+        const plPhaseEnd = mapStageToPhase(auditStage);
+        if (plPhaseEnd) {
+          const runIdForPl = path.basename(runDir);
+          const open = openPhaseInstances.get(plPhaseEnd);
+          const phaseInstanceId =
+            open?.phase_instance_id ??
+            makePhaseInstanceId({
+              run_id: runIdForPl,
+              phase: plPhaseEnd,
+              started_at: stageEnteredAt,
+            });
+          const startedAt = open?.started_at ?? stageEnteredAt;
+          openPhaseInstances.delete(plPhaseEnd);
+          await emitPlanningLeveragePhase(
+            runDir,
+            {
+              run_id: runIdForPl,
+              issue: issueNumber,
+              phase: plPhaseEnd,
+              pipeline_stage: auditStage,
+              boundary: "end",
+              phase_instance_id: phaseInstanceId,
+              planning_depth: "unknown",
+              risk_class: "unknown",
+              started_at: startedAt,
+              ended_at: stageExitedAt,
+              active_effort: unavailableActiveEffort(),
+              at: stageExitedAt,
+            },
+            runStoreDeps,
+          ).catch(() => {});
+          const fixRound = fixRoundFromStage(auditStage);
+          if (fixRound != null) {
+            // Lifecycle boundary lacks scope/interface/replan/blocking-count
+            // evidence. Do not treat stage name fix-2 as multi_round_blocking.
+            // Emit ordinary when only formatting-level signals are known absent;
+            // richer classifiers may re-emit later with explicit criteria.
+            await emitMaterialRework(
+              runDir,
+              {
+                run_id: runIdForPl,
+                issue: issueNumber,
+                evidence: {
+                  evidence_sufficient: true,
+                  blocking_fix_rounds: 1,
+                  scope_expansion: false,
+                  design_interface_change: false,
+                  replan_or_assumption_reopen: false,
+                  engine_material_class: false,
+                },
+                fix_round: fixRound,
+                phase_instance_id: phaseInstanceId,
+                started_at: startedAt,
+                ended_at: stageExitedAt,
+                active_effort: unavailableActiveEffort(),
+                at: stageExitedAt,
+              },
+              runStoreDeps,
+            ).catch(() => {});
+          }
+        }
       }
       printOutcome(issueNumber, stage, out, tlog);
 

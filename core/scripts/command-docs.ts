@@ -225,7 +225,8 @@ export const COMMAND_DOCS: Record<string, CommandDoc> = {
   scoreboard: {
     summary:
       "Print read-only factory throughput/cost/reliability metrics from run artifacts " +
-      "(incl. human-touch, escape-recurrence, discovery-channel, stratified stabilization; #763; production outcomes #576)",
+      "(incl. human-touch, escape-recurrence, discovery-channel, stratified stabilization; #763; " +
+      "production outcomes #576; planning-leverage / material-rework #702)",
     usage: "scoreboard [--days <n>|--since <iso>] [--until <iso>] [--bucket day|week] [--by <dim>] [--json] [--html <path>]",
     documented: true,
     section: "observability",
