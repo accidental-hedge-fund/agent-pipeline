@@ -7,10 +7,13 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  assumptionAllocateLockHeld,
+  assumptionAllocateLockPath,
   emitAssumptionLineage,
   emitMaterialRework,
   emitPlanningLeveragePhase,
   emitPlanningLeverageSnapshot,
+  withAssumptionAllocateLock,
 } from "../scripts/planning-leverage/emit.ts";
 import {
   buildSnapshotFromEvents,
@@ -457,6 +460,98 @@ process.exit(ok ? 0 : 2);
   const current = projectAssumptionCurrentState(creates, runId);
   assert.equal(current.size, 2);
   assert.equal(countUnresolved(current), 2);
+});
+
+test("empty newly-created lock is not stolen before owner token is published", async () => {
+  // Regression #702 da56cc1d: open(wx) makes an empty lock visible before the
+  // owner token is written. A second acquirer must treat empty-in-grace as held
+  // and must not enter the critical section until the first releases.
+  const runDir = makeRunDir();
+  const lockPath = assumptionAllocateLockPath(runDir);
+
+  let resolveEmptyVisible!: () => void;
+  const emptyVisible = new Promise<void>((r) => {
+    resolveEmptyVisible = r;
+  });
+  let resolvePublish!: () => void;
+  const allowPublish = new Promise<void>((r) => {
+    resolvePublish = r;
+  });
+
+  let firstEntered = false;
+  let secondEntered = false;
+
+  const first = withAssumptionAllocateLock(
+    runDir,
+    async () => {
+      firstEntered = true;
+      // Hold while second has spun against the published owner.
+      await new Promise((r) => setTimeout(r, 40));
+      return "first";
+    },
+    {
+      afterExclusiveCreate: async (p) => {
+        assert.equal(p, lockPath);
+        assert.equal(fs.readFileSync(lockPath, "utf8"), "");
+        assert.equal(
+          assumptionAllocateLockHeld(lockPath),
+          true,
+          "empty newly-created lock must be held during create grace",
+        );
+        resolveEmptyVisible();
+        await allowPublish;
+      },
+    },
+  );
+
+  await emptyVisible;
+  assert.equal(fs.readFileSync(lockPath, "utf8"), "");
+  assert.equal(firstEntered, false, "first must still be paused before publish");
+
+  const second = withAssumptionAllocateLock(runDir, async () => {
+    secondEntered = true;
+    return "second";
+  });
+
+  // Second must spin while the empty (then published) lock is held.
+  await new Promise((r) => setTimeout(r, 60));
+  assert.equal(secondEntered, false, "second must not steal empty/in-flight lock");
+  assert.equal(firstEntered, false, "first still paused before owner publish");
+
+  resolvePublish();
+  const results = await Promise.all([first, second]);
+  assert.deepEqual(results.sort(), ["first", "second"]);
+  assert.equal(firstEntered, true);
+  assert.equal(secondEntered, true);
+  assert.equal(fs.existsSync(lockPath), false, "lock released after both finish");
+});
+
+test("stale empty lock is reclaimable only after create grace expires", async () => {
+  // Companion to da56cc1d: after grace, an abandoned empty lock must not block forever.
+  const runDir = makeRunDir();
+  const lockPath = assumptionAllocateLockPath(runDir);
+  fs.writeFileSync(lockPath, "", "utf8");
+  const st = fs.statSync(lockPath);
+  // Age the empty file past grace via clock injection.
+  const nowMs = () => st.mtimeMs + 10_000;
+  assert.equal(
+    assumptionAllocateLockHeld(lockPath, { nowMs, createGraceMs: 250 }),
+    false,
+    "empty lock past grace is not held",
+  );
+
+  let entered = false;
+  const value = await withAssumptionAllocateLock(
+    runDir,
+    async () => {
+      entered = true;
+      return "reclaimed";
+    },
+    { nowMs, createGraceMs: 250 },
+  );
+  assert.equal(value, "reclaimed");
+  assert.equal(entered, true);
+  assert.equal(fs.existsSync(lockPath), false);
 });
 
 test("representative lifecycle plan → implement → review → fix", async () => {
