@@ -246,6 +246,8 @@ export const githubOutcomeAdapter: OutcomeSourceAdapter = {
 
       // Never invent deploy success from merge alone.
       const resolvedDeployStatus = hasDeploy ? deploy_status : "not_observed";
+      // Rollback is observed-only: require explicit provider fields. Never derive
+      // occurred=true from deploy_status alone (e.g. inactive/superseded deploys).
       const mergeRollbackOutcomeRaw = asString(signal.payload.rollback_outcome);
       const mergeRollbackOutcome =
         mergeRollbackOutcomeRaw === "succeeded" ||
@@ -254,15 +256,10 @@ export const githubOutcomeAdapter: OutcomeSourceAdapter = {
         mergeRollbackOutcomeRaw === "not_observed"
           ? mergeRollbackOutcomeRaw
           : null;
-      let mergeRollbackOccurred: boolean | null =
+      const mergeRollbackOccurred: boolean | null =
         typeof signal.payload.rollback_occurred === "boolean"
           ? signal.payload.rollback_occurred
           : null;
-      let mergeRollbackOutcomeResolved = mergeRollbackOutcome;
-      if (resolvedDeployStatus === "rolled_back") {
-        if (mergeRollbackOccurred == null) mergeRollbackOccurred = true;
-        if (mergeRollbackOutcomeResolved == null) mergeRollbackOutcomeResolved = "unknown";
-      }
       const delivery = emptyDeliveryChain({
         environment: env,
         deploy_status: resolvedDeployStatus,
@@ -276,7 +273,7 @@ export const githubOutcomeAdapter: OutcomeSourceAdapter = {
         },
         rollback: {
           occurred: mergeRollbackOccurred,
-          outcome: mergeRollbackOutcomeResolved,
+          outcome: mergeRollbackOutcome,
         },
       });
 
@@ -376,6 +373,8 @@ export const githubOutcomeAdapter: OutcomeSourceAdapter = {
         commit_message: asString(signal.payload.commit_message),
       });
 
+      // Map known deploy statuses only. GitHub `inactive` (superseded/deactivated)
+      // falls through to unknown — it is not rolled_back and is not a rollback.
       const deploy_status =
         status === "success" || status === "succeeded"
           ? "succeeded"
@@ -387,7 +386,8 @@ export const githubOutcomeAdapter: OutcomeSourceAdapter = {
                 ? "rolled_back"
                 : "unknown";
 
-      // Explicit rollback fields from provider, else derive from rolled_back state.
+      // Explicit provider rollback fields only. Do not assert rollback.occurred from
+      // deploy_status (inactive/superseded deploys must stay not-observed).
       const rollbackOutcomeRaw = asString(signal.payload.rollback_outcome);
       const rollbackOutcome =
         rollbackOutcomeRaw === "succeeded" ||
@@ -396,16 +396,10 @@ export const githubOutcomeAdapter: OutcomeSourceAdapter = {
         rollbackOutcomeRaw === "not_observed"
           ? rollbackOutcomeRaw
           : null;
-      let rollbackOccurred: boolean | null =
+      const rollbackOccurred: boolean | null =
         typeof signal.payload.rollback_occurred === "boolean"
           ? signal.payload.rollback_occurred
           : null;
-      let rollbackOutcomeResolved = rollbackOutcome;
-      if (deploy_status === "rolled_back") {
-        // Observed rollback must populate the chain — not leave null/not-observed.
-        if (rollbackOccurred == null) rollbackOccurred = true;
-        if (rollbackOutcomeResolved == null) rollbackOutcomeResolved = "unknown";
-      }
 
       const delivery = emptyDeliveryChain({
         environment: env,
@@ -420,7 +414,7 @@ export const githubOutcomeAdapter: OutcomeSourceAdapter = {
         },
         rollback: {
           occurred: rollbackOccurred,
-          outcome: rollbackOutcomeResolved,
+          outcome: rollbackOutcome,
         },
       });
 

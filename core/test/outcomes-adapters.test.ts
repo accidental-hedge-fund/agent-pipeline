@@ -390,8 +390,10 @@ test("normalize merge prefers commit_message over body for trailer linkage", () 
   );
 });
 
-// Review 2 finding bad78331: rolled_back deploy must populate delivery.rollback.
-test("deployment rolled_back populates delivery.rollback occurred and outcome", () => {
+// Review 3 finding bb192d88: do not assert rollback from deploy_status alone.
+// state=rolled_back records deploy_status but leaves rollback not-observed unless
+// the provider also sends explicit rollback_occurred / rollback_outcome.
+test("deployment rolled_back alone does not invent rollback.occurred", () => {
   const rolledBack: RawOutcomeSignal = {
     signal_id: "deploy:prod:rb",
     kind: "deployment",
@@ -410,11 +412,35 @@ test("deployment rolled_back populates delivery.rollback occurred and outcome", 
   });
   assert.ok(rec);
   assert.equal(rec.delivery?.deploy_status, "rolled_back");
-  assert.equal(rec.delivery?.rollback.occurred, true);
-  assert.equal(rec.delivery?.rollback.outcome, "unknown");
+  assert.equal(rec.delivery?.rollback.occurred, null);
+  assert.equal(rec.delivery?.rollback.outcome, null);
 });
 
-test("deployment rolled_back preserves provider rollback_outcome when present", () => {
+// GitHub inactive = superseded/deactivated deployment, not an observed rollback.
+test("deployment inactive does not claim rollback occurred", () => {
+  const inactive: RawOutcomeSignal = {
+    signal_id: "deploy:prod:inactive",
+    kind: "deployment",
+    payload: {
+      sha: SHA,
+      environment: "production",
+      state: "inactive",
+      at: "2026-08-13T20:02:00Z",
+      url: "https://github.com/example/repo/deployments/10",
+    },
+  };
+  const rec = githubOutcomeAdapter.normalize(inactive, {
+    repoDir: REPO,
+    runs,
+    now: new Date("2026-08-13T20:02:00Z"),
+  });
+  assert.ok(rec);
+  assert.equal(rec.delivery?.deploy_status, "unknown");
+  assert.equal(rec.delivery?.rollback.occurred, null);
+  assert.equal(rec.delivery?.rollback.outcome, null);
+});
+
+test("deployment records explicit provider rollback fields only", () => {
   const rolledBack: RawOutcomeSignal = {
     signal_id: "deploy:prod:rb2",
     kind: "deployment",
@@ -422,6 +448,7 @@ test("deployment rolled_back preserves provider rollback_outcome when present", 
       sha: SHA,
       environment: "production",
       state: "rolled_back",
+      rollback_occurred: true,
       rollback_outcome: "succeeded",
       at: "2026-08-13T20:05:00Z",
     },
@@ -432,6 +459,7 @@ test("deployment rolled_back preserves provider rollback_outcome when present", 
     now: new Date("2026-08-13T20:05:00Z"),
   });
   assert.ok(rec);
+  assert.equal(rec.delivery?.deploy_status, "rolled_back");
   assert.equal(rec.delivery?.rollback.occurred, true);
   assert.equal(rec.delivery?.rollback.outcome, "succeeded");
 });
