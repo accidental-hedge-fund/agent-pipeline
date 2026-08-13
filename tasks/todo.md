@@ -1,33 +1,29 @@
-# #1025 — Stale blocked after HEAD moves past reviewed-sha must re-review
+# #1021 — file engine-class live sibling on current train milestone
 
 ## Status
 
-Implementation complete for full #1025 contract on top of epic #1028 first cut.
+Implementation complete for full #1021 contract on top of epic #1028 first cut.
 
-## What changed
+## Inventory (epic first cut)
 
-- `tryResumeStaleBlocked`: clear on currency `unknown` when H ≠ S (rebase / S absent / unclassifiable), not permanent keep.
-- Keep when H == S, currency `current` (internal-only #98), or PR/head unreadable.
-- Unit matrix expanded (13 tests): clear, same-head, internal-only, rebase-unknown, unreadable PR/head, no override, real `resolveReviewedShaCurrency` shared helper.
-- Advance enter-path wiring already present in `pipeline-run.ts` (continue after clear).
+Living code already had:
+- `core/scripts/stages/engine-class-live-sibling.ts` (marker, ready+engine-class+bug, Depends on, dedup, rate-cap, train context)
+- `unlink_engine_scratch` best-effort `onEngineClassRecovered` / default filer
+- `pipeline train` set/clear train milestone context
+
+## What changed this PR
+
+- Recover-path coupling tests: invoke once with evidence_key; filer throw non-fatal; product dirt + human-authority never call filer
+- Filer unit tests: exact labels, empty-string milestone fail-closed, train context set/get/clear, createIssue failure non-fatal
+- OpenSpec change tasks checklist completed
 
 ## Verification
 
-- [x] `openspec validate stale-blocked-after-head-rereview` — valid
+- [x] `openspec validate file-engine-class-live-sibling` — valid
+- [x] `openspec validate --all` — 289 passed
+- [x] `node scripts/build.mjs --check` — mirror up to date (no scripts change)
 - [x] `npm run ci` — green (exit 0)
-- [x] Commit `030a4bc1` with Issue/Pipeline-Run trailers (not pushed)
 
 ## Review
 
-### Inventory (epic first-cut vs #1025)
-
-| Site | Status |
-|------|--------|
-| `tryResumeStaleBlocked` | Fixed D2 gap: `unknown` + H ≠ S clears |
-| `pipeline-run.ts` enter-path | Already wired: resume before STOP; `continue` after clear |
-| train / loop / single | Reach `runAdvance` enter-path; post-advance park only if still blocked |
-| `needs-human` co-label | Residual uses blocker *kind*; stage stays pre-merge; clear enough |
-
-### Residual risk
-
-None for the dogfood class. Force-push / incomplete commit lists re-review more often when H ≠ S — intentional conservative path.
+No production-code gap beyond test lock-in. #538 backlog-only papercut path untouched. Filing remains non-fatal relative to recover.

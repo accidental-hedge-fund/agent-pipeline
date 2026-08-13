@@ -316,6 +316,182 @@ test("DEFAULT_RECOVERY_POLICY recipe order: unlink before repair (#1020)", async
   );
 });
 
+// #1021: recover → live sibling coupling (injectable onEngineClassRecovered)
+
+test("unlink_engine_scratch (#1021): successful recover invokes live sibling filer once", async () => {
+  let clears = 0;
+  let statusPhase = 0;
+  const siblingCalls: Array<{ issueNumber: number; evidenceKey: string; action: string }> = [];
+  const execute = realExecuteRecovery(cfg(), {
+    getOnDiskForIssue: async () => ({ path: "/wt/1013", slug: "1013-x", branch: "pipeline/1013-x" } as never),
+    gitInWorktree: async (_path, args) => {
+      if (args[0] === "status") {
+        statusPhase += 1;
+        return {
+          stdout: statusPhase === 1 ? "?? artifacts/challenge-response-1013.json\n" : "",
+          stderr: "",
+          code: 0,
+        };
+      }
+      if (args[0] === "clean") return { stdout: "", stderr: "", code: 0 };
+      return { stdout: "", stderr: "", code: 0 };
+    },
+    getIssueDetail: async () => ({
+      number: 1013,
+      type: "issue",
+      title: "t",
+      body: "",
+      state: "open",
+      url: "https://example.test/1013",
+      labels: clears === 0 ? ["blocked", "pipeline:pre-merge"] : ["pipeline:pre-merge"],
+    }),
+    clearBlocked: async () => {
+      clears++;
+    },
+    onEngineClassRecovered: async (input) => {
+      siblingCalls.push(input);
+    },
+  });
+  const diagnostic = buildStageDiagnostic({
+    reasonCode: "workflow-engine-defect",
+    blockerKind: "harness-failure",
+    reason: "scratch porcelain blocked factory",
+    evidenceKey: "ek-1013-scratch",
+  });
+  const result = await execute({
+    ...mechanicalInput(),
+    itemId: "1013",
+    action: "unlink_engine_scratch",
+    blockerClass: "workflow-engine-defect",
+    diagnostic,
+  });
+  assert.equal(result.succeeded, true, result.error ?? result.evidence);
+  assert.equal(clears, 1);
+  assert.equal(siblingCalls.length, 1, "filer must be invoked exactly once after recover");
+  assert.equal(siblingCalls[0]!.issueNumber, 1013);
+  assert.equal(siblingCalls[0]!.evidenceKey, "ek-1013-scratch");
+  assert.equal(siblingCalls[0]!.action, "unlink_engine_scratch");
+});
+
+test("unlink_engine_scratch (#1021): sibling filer throw does not reverse recover", async () => {
+  let clears = 0;
+  let statusPhase = 0;
+  const execute = realExecuteRecovery(cfg(), {
+    getOnDiskForIssue: async () => ({ path: "/wt/42", slug: "42-x", branch: "pipeline/42-x" } as never),
+    gitInWorktree: async (_path, args) => {
+      if (args[0] === "status") {
+        statusPhase += 1;
+        return {
+          stdout: statusPhase === 1 ? "?? artifacts/challenge-response-1.json\n" : "",
+          stderr: "",
+          code: 0,
+        };
+      }
+      if (args[0] === "clean") return { stdout: "", stderr: "", code: 0 };
+      return { stdout: "", stderr: "", code: 0 };
+    },
+    getIssueDetail: async () => ({
+      number: 42,
+      type: "issue",
+      title: "t",
+      body: "",
+      state: "open",
+      url: "https://example.test/42",
+      labels: clears === 0 ? ["blocked", "pipeline:pre-merge"] : ["pipeline:pre-merge"],
+    }),
+    clearBlocked: async () => {
+      clears++;
+    },
+    onEngineClassRecovered: async () => {
+      throw new Error("gh issue create failed: simulated");
+    },
+  });
+  const diagnostic = buildStageDiagnostic({
+    reasonCode: "workflow-engine-defect",
+    blockerKind: "harness-failure",
+    reason: "scratch",
+  });
+  const result = await execute({
+    ...mechanicalInput(),
+    action: "unlink_engine_scratch",
+    blockerClass: "workflow-engine-defect",
+    diagnostic,
+  });
+  assert.equal(result.succeeded, true, "sibling failure must not flip recover to failed");
+  assert.equal(clears, 1, "blocked clear must stand after sibling throw");
+});
+
+test("unlink_engine_scratch (#1021): product dirt does not invoke live sibling filer", async () => {
+  let siblingCalls = 0;
+  const execute = realExecuteRecovery(cfg(), {
+    getOnDiskForIssue: async () => ({ path: "/wt/42", slug: "42-x", branch: "pipeline/42-x" } as never),
+    gitInWorktree: async (_path, args) => {
+      if (args[0] === "status") {
+        return {
+          stdout: "?? artifacts/challenge-response-1.json\n M core/scripts/foo.ts\n",
+          stderr: "",
+          code: 0,
+        };
+      }
+      return { stdout: "", stderr: "", code: 0 };
+    },
+    clearBlocked: async () => {},
+    onEngineClassRecovered: async () => {
+      siblingCalls++;
+    },
+  });
+  const diagnostic = buildStageDiagnostic({
+    reasonCode: "workflow-engine-defect",
+    blockerKind: "harness-failure",
+    reason: "mixed dirt",
+  });
+  const result = await execute({
+    ...mechanicalInput(),
+    action: "unlink_engine_scratch",
+    blockerClass: "workflow-engine-defect",
+    diagnostic,
+  });
+  assert.equal(result.succeeded, false);
+  assert.match(result.error ?? "", /product dirt/);
+  assert.equal(siblingCalls, 0, "product dirt must never file a live sibling");
+});
+
+test("unlink_engine_scratch (#1021): human-authority path does not invoke live sibling filer", async () => {
+  let siblingCalls = 0;
+  let mutated = false;
+  const execute = realExecuteRecovery(cfg(), {
+    getOnDiskForIssue: async () => {
+      mutated = true;
+      return { path: "/wt/42", slug: "42-x", branch: "pipeline/42-x" } as never;
+    },
+    clearBlocked: async () => {
+      mutated = true;
+    },
+    onEngineClassRecovered: async () => {
+      siblingCalls++;
+    },
+  });
+  const human = buildStageDiagnostic({
+    blockerKind: "human-decision-required",
+    reason: "choose API",
+    authorityEvidence: [{
+      category: "product-decision",
+      finding_key: "deadbeef",
+      finding_fingerprint: "0123456789abcdef",
+      reviewed_sha: "abc1234",
+    }],
+  });
+  const result = await execute({
+    ...mechanicalInput(),
+    action: "unlink_engine_scratch",
+    blockerClass: "specification-decision",
+    diagnostic: human,
+  });
+  assert.equal(result.succeeded, false);
+  assert.equal(siblingCalls, 0, "human-decision must never file a live sibling");
+  assert.equal(mutated, false, "human-authority must not mutate before reject");
+});
+
 test("human authority and malformed diagnostics are rejected before any mutation", async () => {
   let mutated = false;
   const execute = realExecuteRecovery(cfg(), {
