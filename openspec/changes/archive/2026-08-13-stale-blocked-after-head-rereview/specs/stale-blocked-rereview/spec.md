@@ -1,9 +1,4 @@
-# stale-blocked-rereview Specification
-
-## Purpose
-Resume pre-merge when a leftover blocked label is stale because PR HEAD moved past the blocking reviewed-sha with a non-pipeline-internal commit, so train and loop re-review instead of STOP.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Stale blocked after non-internal HEAD movement SHALL clear and re-review on enter
 
@@ -67,6 +62,8 @@ True residuals that still block on **H** after re-review MAY re-set `pipeline:bl
 - **WHEN** the linked open PR cannot be resolved or the PR HEAD cannot be read during stale-block resume
 - **THEN** the pipeline SHALL keep `pipeline:blocked`
 - **AND** SHALL NOT clear the block without positive evidence that HEAD moved past S
+
+## ADDED Requirements
 
 ### Requirement: Advance enter-path SHALL attempt stale-block resume before terminal STOP
 
