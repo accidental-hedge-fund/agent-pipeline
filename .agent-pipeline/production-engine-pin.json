@@ -1,20 +1,20 @@
 {
   "schema_version": 1,
-  "version": "1.38.0",
-  "tag": "v1.38.0",
-  "frg_run_id": "no-frg-1.38.0",
+  "version": "1.38.1",
+  "tag": "v1.38.1",
+  "frg_run_id": "no-frg-1.38.1",
   "frg_evidence_path": null,
-  "promoted_at": "2026-08-13T17:12:11Z",
+  "promoted_at": "2026-08-13T22:04:21Z",
   "git_sha": null,
   "git_sha_source": "unknown",
   "previous": {
     "schema_version": 1,
-    "version": "1.37.0",
-    "tag": "v1.37.0",
+    "version": "1.38.0",
+    "tag": "v1.38.0",
     "git_sha": null,
     "git_sha_source": "unknown",
-    "frg_run_id": "no-frg-1.37.0",
+    "frg_run_id": "no-frg-1.38.0",
     "frg_evidence_path": null,
-    "promoted_at": "2026-08-12T03:14:01Z"
+    "promoted_at": "2026-08-13T17:12:11Z"
   }
 }
