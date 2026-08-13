@@ -8,6 +8,7 @@ machine, model matrix, or merge authority in chat.
 
 Related:
 
+- [Ship-path autonomy doctrine](./ship-path-autonomy.md) (recovery ladder; false vs real human)
 - [Factory simplification plan](./factory-simplification-plan.md)
 - [CLI reference](./cli.md) (`train`, `single`, `merge`, `status`, `logs`)
 - Examples: [`examples/supervisor/`](../examples/supervisor/)
@@ -137,10 +138,15 @@ Do not spam full logs or secrets into chat.
 
 | Situation | Supervisor action |
 |---|---|
-| `needs-human` / blocked | Report `blocker`; wait for human; re-run train (already-integrated items are skipped when safe) |
+| `needs-human` / blocked — **recoverable engine/workflow** (scratch, stale identity/labels, capacity, workflow-engine defect) | Report `blocker` with class if known. Expect **loop recovery / re-train after the deterministic recipe** (unlink scratch, resync, pin head, clear stale block) — not operator file-delete or label surgery as the default. Re-run train when the recipe or engine recoverer has run; already-integrated items are skipped when safe. See [ship-path autonomy](./ship-path-autonomy.md). |
+| `needs-human` / blocked — **true human authority** (product judgment, missing authority/sign-off, external capability the run cannot obtain) | Report `blocker`; **wait for human** / handoff (e.g. #647 path). Do not invent workarounds. Re-run train after the human disposition. |
 | Merge / checks / containment failure | Report exact error; do not force-merge or delete worktrees |
 | Process crash mid-train | Re-run the same selector; rely on GitHub + train idempotency for merged items |
 | Operator stop | Kill the train process only; do not run destructive git cleanup |
+
+Do **not** treat every `needs-human` / blocked outcome as unconditional “wait for
+human.” Classify first. Supervisors still do **not** gain merge authority, a
+second durable scheduler, or a second state machine from this guidance.
 
 ## Multi-platform bootstrap
 

@@ -26,6 +26,38 @@ test("supervisor.md documents train_status schema_version 1", () => {
   assert.match(doc, /engine-promote/);
 });
 
+// #1030: needs-human / blocked is conditional — recoverable engine vs real human.
+test("supervisor.md distinguishes recoverable engine blocked from true human-authority wait (#1030)", () => {
+  const doc = read("docs/supervisor.md");
+  assert.match(doc, /ship-path-autonomy\.md/);
+  assert.match(doc, /recoverable engine|workflow/i);
+  assert.match(doc, /deterministic recipe|loop recovery|re-train/i);
+  assert.match(doc, /true human authority|human authority|wait for human/i);
+  assert.match(doc, /Do \*\*not\*\* treat every|not.*unconditional/i);
+  // Non-goals: no second control plane / merge authority from this guidance.
+  assert.match(doc, /do \*\*not\*\* gain merge authority|second durable scheduler|second state machine/i);
+  // Must not be a single unconditional wait row for all needs-human outcomes.
+  assert.doesNotMatch(
+    doc,
+    /\|\s*`needs-human`\s*\/\s*blocked\s*\|\s*Report `blocker`; wait for human/,
+  );
+});
+
+test("docs/ship-path-autonomy.md exists with five doctrine points and is linked from concepts (#1030)", () => {
+  const doctrinePath = path.join(repoRoot, "docs/ship-path-autonomy.md");
+  assert.ok(fs.existsSync(doctrinePath), "docs/ship-path-autonomy.md must exist");
+  const doctrine = read("docs/ship-path-autonomy.md");
+  assert.match(doctrine, /Ship path|base-eligible frontiers/i);
+  assert.match(doctrine, /Recovery ladder|deterministic recipe/i);
+  assert.match(doctrine, /False human vs real human/i);
+  assert.match(doctrine, /Class over site/i);
+  assert.match(doctrine, /Anti-goals/i);
+  assert.match(doctrine, /pipeline-ship-path-autonomy:\s*v1/);
+  const concepts = read("docs/concepts.md");
+  assert.match(concepts, /ship-path-autonomy\.md/);
+  assert.match(concepts, /Ship-path autonomy|ship-path autonomy/i);
+});
+
 test("buildTrainStatus still emits schema_version 1 envelope", () => {
   const s = buildTrainStatus({
     ordered_issues: [1],

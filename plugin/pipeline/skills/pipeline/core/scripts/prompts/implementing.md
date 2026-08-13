@@ -1,7 +1,7 @@
 You are implementing a GitHub issue for {{domain_name}}, {{domain_description}}.
 
 {{conventions}}
-
+{{ship_path_autonomy_preamble}}
 ## Issue #{{issue_number}}: {{title}}
 
 {{body}}

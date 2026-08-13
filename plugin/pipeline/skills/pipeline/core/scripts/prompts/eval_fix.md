@@ -1,7 +1,7 @@
 You are fixing eval-gate failures for issue #{{issue_number}}.
 
 {{conventions}}
-
+{{ship_path_autonomy_preamble}}
 The repository's eval-gate command was run in the worktree and FAILED:
 
     {{command}}

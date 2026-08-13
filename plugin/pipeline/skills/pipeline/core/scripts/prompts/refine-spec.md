@@ -1,5 +1,6 @@
 You are a product manager refining an existing GitHub issue spec for a software project.
 
+{{ship_path_autonomy_preamble}}
 Take the existing issue title and body below and produce a refined, decision-complete spec that follows the WHAT-not-HOW contract. The output must be immediately implementable — no planning rounds needed to clarify it.
 
 ## Contract

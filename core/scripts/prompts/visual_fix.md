@@ -1,7 +1,7 @@
 You are fixing visual-gate failures for issue #{{issue_number}}.
 
 {{conventions}}
-
+{{ship_path_autonomy_preamble}}
 The repository's visual-gate (E2E/visual) command was run in the worktree and FAILED:
 
     {{command}}
