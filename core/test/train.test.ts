@@ -361,6 +361,123 @@ test("isIndependentOfHeld: edge fails closed", () => {
   assert.equal(isIndependentOfHeld(3, new Set([1]), new Map([[3, []], [1, []]])), true);
 });
 
+test("train (#1023): unproven independence fails closed — dep-linked R2D not merged while peer held", async () => {
+  // Bite: #1 parks; #2 declares Depends on #1 so independence is unproven.
+  // #2 must not enter the frontier (code-dep barrier) and must not merge.
+  // Separately, isIndependentOfHeld fails closed on the reverse edge so the
+  // merge-wave guard never merges a dep-linked pair under the independent-sibling rule.
+  const deps = makeDeps({
+    async advanceIssue(n) {
+      deps.advanceCalls.push(n);
+      const issues = (deps as unknown as { _issues: Map<number, TrainIssueSnapshot> })._issues;
+      if (n === 1) {
+        issues.get(1)!.labels = ["pipeline:needs-human"];
+        return { ok: true, terminal: "needs-human", labels: ["pipeline:needs-human"] };
+      }
+      issues.get(n)!.labels = ["pipeline:ready-to-deploy"];
+      return { ok: true, terminal: "ready-to-deploy", labels: ["pipeline:ready-to-deploy"] };
+    },
+  });
+  deps.seedIssue(snap(1, "prereq will park"));
+  deps.seedIssue(snap(2, "Depends on: #1"));
+  deps.seedPr(1, 101);
+  deps.seedPr(2, 102);
+
+  const result = await runTrain(baseOpts({ issues: [1, 2], merge: true }), deps);
+  assert.deepEqual(deps.waveCalls, [[1]], "only base-eligible #1 advances; #2 waits on code dep");
+  assert.equal(deps.mergeCalls.length, 0, "no merge while dep-linked peer is held / not integrated");
+  assert.ok(!deps.mergeCalls.includes(102));
+  assert.equal(result.exitCode, 1);
+  assert.match(result.status.blocker ?? "", /held|#1|needs-human|no base-eligible|waits on/i);
+  // Pure guard: if #2 were ever R2D alongside held #1, independence fails closed.
+  assert.equal(
+    isIndependentOfHeld(2, new Set([1]), new Map([[1, []], [2, [1]]])),
+    false,
+    "dep edge must fail closed for independent-sibling merge",
+  );
+});
+
+test("train (#1023): merge wave is serial with base proof between merges", async () => {
+  const deps = makeDeps();
+  deps.seedIssue(snap(1, "a independent"));
+  deps.seedIssue(snap(2, "b independent"));
+  deps.seedPr(1, 101);
+  deps.seedPr(2, 102);
+
+  const mergeOrder: number[] = [];
+  /** Snapshot of merge count at each fetchBase (containment proof). */
+  const fetchAtMergeCount: number[] = [];
+  let mergesDone = 0;
+  const origMerge = deps.mergeIssuePr.bind(deps);
+  const origFetch = deps.fetchBase.bind(deps);
+  deps.mergeIssuePr = async (pr) => {
+    // Prove serial: the previous merge must already be recorded (no parallel merges).
+    assert.equal(mergeOrder.length, mergesDone, "mergeIssuePr must not overlap");
+    mergeOrder.push(pr);
+    mergesDone += 1;
+    return origMerge(pr);
+  };
+  deps.fetchBase = async (baseBranch) => {
+    fetchAtMergeCount.push(mergesDone);
+    return origFetch(baseBranch);
+  };
+
+  const result = await runTrain(baseOpts({ issues: [1, 2], merge: true }), deps);
+  assert.equal(result.exitCode, 0, result.status.blocker ?? "ok");
+  assert.deepEqual(mergeOrder, [101, 102], "merges are one-at-a-time in frontier order");
+  // Containment fetch runs after each merge mutation (merge count 1 then 2).
+  assert.ok(
+    fetchAtMergeCount.filter((n) => n === 1).length >= 1,
+    "fetchBase after first merge for containment",
+  );
+  assert.ok(
+    fetchAtMergeCount.filter((n) => n === 2).length >= 1,
+    "fetchBase after second merge for containment",
+  );
+  // One multi-item advance wave for the independent frontier (concurrency>1 may
+  // co-advance inside loop; train still issues a single wave call).
+  assert.equal(deps.waveCalls.length, 1);
+  assert.deepEqual(deps.waveCalls[0]!.slice().sort((a, b) => a - b), [1, 2]);
+});
+
+test("train (#1023): production wiring is multi-item loop, not N×single / advanceWaveFromSingle", () => {
+  const pipelinePath = path.join(__dirname, "..", "scripts", "pipeline.ts");
+  const trainPath = path.join(__dirname, "..", "scripts", "stages", "train.ts");
+  const pipeline = fs
+    .readFileSync(pipelinePath, "utf8")
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/\/\/[^\n]*/g, "");
+  const trainSrc = fs.readFileSync(trainPath, "utf8");
+
+  // runTrainCommand default wave seam
+  const trainCmdStart = pipeline.indexOf("export async function runTrainCommand");
+  assert.ok(trainCmdStart !== -1);
+  const trainCmdSlice = pipeline.slice(trainCmdStart, trainCmdStart + 2500);
+  assert.ok(
+    trainCmdSlice.includes("advanceWaveThroughLoop"),
+    "runTrainCommand must default to advanceWaveThroughLoop",
+  );
+  assert.ok(
+    !trainCmdSlice.includes("advanceWaveFromSingle"),
+    "runTrainCommand must not wire production N×single via advanceWaveFromSingle",
+  );
+  assert.ok(
+    !trainCmdSlice.includes("advanceIssueThroughSingle"),
+    "runTrainCommand must not N× advanceIssueThroughSingle for frontiers",
+  );
+
+  // Train orchestrator must not host a second recoverer
+  assert.ok(
+    !trainSrc.includes("repair_pipeline_item"),
+    "train must not call repair_pipeline_item; recovery stays inside the loop wave",
+  );
+  // advanceWaveFromSingle may exist for tests only — production CLI must not default to it
+  assert.ok(
+    trainSrc.includes("export function advanceWaveFromSingle"),
+    "serial adapter may exist for tests/legacy adapters",
+  );
+});
+
 test("train with merge: dependent does not start until prerequisite integrated", async () => {
   const deps = makeDeps();
   deps.seedIssue(snap(1, "prereq"));
