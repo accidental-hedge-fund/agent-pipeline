@@ -3,6 +3,8 @@
 // Inherits denylist/redaction, event-sink delivery, and summaryEvents
 // accumulation from run-store. Non-fatal: append failures never throw.
 
+import * as fs from "node:fs";
+import * as path from "node:path";
 import {
   appendEvent,
   defaultRunStoreDeps,
@@ -47,31 +49,99 @@ function nowIso(): string {
 }
 
 /**
- * Per-runDir serialization for default assumption_id allocation (#702).
- * Host-local / in-process only: select ordinal from stream snapshot then append
- * must not interleave with another default allocate on the same runDir.
+ * Run-scoped lock for default assumption_id allocation (#702).
+ * Serializes read/select-ordinal/append across processes that share a runDir
+ * (module-local promise chains alone are not enough). Host-local: the lock
+ * lives under the run store next to events.jsonl.
  */
-const assumptionAllocateChains = new Map<string, Promise<unknown>>();
+export const ASSUMPTION_ALLOCATE_LOCK_NAME = ".assumption-allocate.lock";
 
-async function withAssumptionAllocateChain<T>(
+const ASSUMPTION_ALLOCATE_LOCK_TIMEOUT_MS = 10_000;
+const ASSUMPTION_ALLOCATE_LOCK_POLL_MS = 5;
+
+export function assumptionAllocateLockPath(runDir: string): string {
+  return path.join(runDir, ASSUMPTION_ALLOCATE_LOCK_NAME);
+}
+
+function assumptionAllocateLockOwnerAlive(lockPath: string): boolean {
+  let pidText = "";
+  try {
+    pidText = fs.readFileSync(lockPath, "utf8").trim();
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code === "ENOENT") return false;
+    throw err;
+  }
+  const pid = Number.parseInt(pidText.split(/\s+/)[0] ?? "", 10);
+  if (!Number.isFinite(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code === "ESRCH") return false;
+    // EPERM / unknown: treat as held (conservative).
+    return true;
+  }
+}
+
+function tryAcquireAssumptionAllocateLock(lockPath: string): boolean {
+  try {
+    const fd = fs.openSync(lockPath, "wx");
+    try {
+      fs.writeSync(fd, String(process.pid));
+    } finally {
+      fs.closeSync(fd);
+    }
+    return true;
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code !== "EEXIST") throw err;
+    if (assumptionAllocateLockOwnerAlive(lockPath)) return false;
+    try {
+      fs.unlinkSync(lockPath);
+    } catch (unlinkErr) {
+      const u = unlinkErr as NodeJS.ErrnoException;
+      if (u.code !== "ENOENT") throw unlinkErr;
+    }
+    return tryAcquireAssumptionAllocateLock(lockPath);
+  }
+}
+
+/**
+ * Hold the run-scoped allocate lock around `fn` (cross-process safe).
+ * Exported for multi-process regression tests.
+ */
+export async function withAssumptionAllocateLock<T>(
   runDir: string,
   fn: () => Promise<T>,
 ): Promise<T> {
-  const prev = assumptionAllocateChains.get(runDir) ?? Promise.resolve();
-  let release!: () => void;
-  const gate = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  const chained = prev.then(() => gate).catch(() => undefined);
-  assumptionAllocateChains.set(runDir, chained);
-  await prev.catch(() => undefined);
+  const lockPath = assumptionAllocateLockPath(runDir);
   try {
-    return await fn();
-  } finally {
-    release();
-    if (assumptionAllocateChains.get(runDir) === chained) {
-      assumptionAllocateChains.delete(runDir);
+    fs.mkdirSync(runDir, { recursive: true });
+  } catch {
+    /* runDir may already exist or be created by append path */
+  }
+  const deadline = Date.now() + ASSUMPTION_ALLOCATE_LOCK_TIMEOUT_MS;
+  for (;;) {
+    if (tryAcquireAssumptionAllocateLock(lockPath)) {
+      try {
+        return await fn();
+      } finally {
+        try {
+          fs.unlinkSync(lockPath);
+        } catch (err) {
+          const e = err as NodeJS.ErrnoException;
+          if (e.code !== "ENOENT") throw err;
+        }
+      }
     }
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `planning-leverage: assumption allocate lock timeout (${lockPath})`,
+      );
+    }
+    await new Promise<void>((r) => setTimeout(r, ASSUMPTION_ALLOCATE_LOCK_POLL_MS));
   }
 }
 
@@ -274,13 +344,14 @@ export async function emitAssumptionLineage(
     // Collision-free default ids: producer id, producer ordinal, or next free
     // ordinal for this (run_id, kind, statement) from the append-only stream.
     // When id is omitted and ordinal is omitted, select+append is serialized
-    // per runDir so concurrent implicit emits cannot both claim the same id.
+    // with a run-scoped inter-process lock so concurrent writers (same process
+    // or separate processes) cannot both claim the same derived assumption_id.
     const assumption_id = opts.assumption_id;
     const needsDefaultOrdinal =
       (assumption_id == null || assumption_id === "") && opts.ordinal == null;
 
     if (needsDefaultOrdinal) {
-      return await withAssumptionAllocateChain(runDir, async () => {
+      return await withAssumptionAllocateLock(runDir, async () => {
         let events: unknown[] = [];
         try {
           events = await readEvents(runDir, deps);

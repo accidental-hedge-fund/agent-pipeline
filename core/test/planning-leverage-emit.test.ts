@@ -1,9 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   emitAssumptionLineage,
   emitMaterialRework,
@@ -22,6 +24,10 @@ import {
   countUnresolved,
 } from "../scripts/planning-leverage/assumptions.ts";
 import { unavailableActiveEffort } from "../scripts/planning-leverage/schema.ts";
+
+const EMIT_MODULE_PATH = fileURLToPath(
+  new URL("../scripts/planning-leverage/emit.ts", import.meta.url),
+);
 
 function makeRunDir(): string {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pl-emit-"));
@@ -333,8 +339,8 @@ test("implicit emit after sparse producer ordinal does not reuse that id", async
 });
 
 test("two concurrent implicit emits get distinct assumption_ids", async () => {
-  // Regression #702 9d6443b4: concurrent default allocate must serialize
-  // select+append so both do not claim ordinal 0.
+  // Regression #702 9d6443b4 / d63cb222: concurrent default allocate must
+  // serialize select+append (run-scoped lock) so both do not claim ordinal 0.
   const runDir = makeRunDir();
   const deps = baseDeps();
   const runId = "702-test-run";
@@ -371,6 +377,83 @@ test("two concurrent implicit emits get distinct assumption_ids", async () => {
   assert.equal(creates.length, 2);
   const ids = creates.map((e) => String(e.assumption_id));
   assert.notEqual(ids[0], ids[1], "concurrent implicit emits must not share assumption_id");
+  const current = projectAssumptionCurrentState(creates, runId);
+  assert.equal(current.size, 2);
+  assert.equal(countUnresolved(current), 2);
+});
+
+test("two processes implicit emit get distinct assumption_ids on one run", async () => {
+  // Regression #702 d63cb222: module-local promise chains do not serialize
+  // across process boundaries. Default allocate must use a run-scoped lock.
+  const runDir = makeRunDir();
+  const runId = "702-mp-run";
+  const statement = "multi-process same text";
+  const workerPath = path.join(path.dirname(runDir), "assumption-allocate-worker.ts");
+  const workerSource = `
+import { emitAssumptionLineage } from ${JSON.stringify(EMIT_MODULE_PATH)};
+import * as fsp from "node:fs/promises";
+
+const runDir = process.argv[2];
+const runId = process.argv[3];
+const statement = process.argv[4];
+const deps = {
+  appendFile: (p: string, data: string) => fsp.appendFile(p, data, "utf8"),
+  writeFile: (p: string, data: string) => fsp.writeFile(p, data, "utf8"),
+  readFile: (p: string) => fsp.readFile(p, "utf8"),
+  rename: (from: string, to: string) => fsp.rename(from, to),
+  mkdir: async (p: string, opts?: { recursive?: boolean }) => {
+    await fsp.mkdir(p, opts);
+  },
+  readdir: async (p: string) => {
+    const entries = await fsp.readdir(p, { withFileTypes: true });
+    return entries as Array<{ name: string; isDirectory(): boolean }>;
+  },
+  stat: (p: string) => fsp.stat(p),
+};
+
+const ok = await emitAssumptionLineage(
+  runDir,
+  {
+    run_id: runId,
+    kind: "assumption",
+    statement,
+    introduced_phase: "planning",
+    status: "open",
+  },
+  deps,
+);
+process.exit(ok ? 0 : 2);
+`;
+  await fsp.writeFile(workerPath, workerSource, "utf8");
+
+  const spawnWorker = (): Promise<{ code: number | null; stderr: string }> =>
+    new Promise((resolve, reject) => {
+      const child = spawn(
+        process.execPath,
+        ["--experimental-strip-types", workerPath, runDir, runId, statement],
+        { stdio: ["ignore", "pipe", "pipe"] },
+      );
+      let stderr = "";
+      child.stderr.on("data", (chunk: Buffer | string) => {
+        stderr += String(chunk);
+      });
+      child.on("error", reject);
+      child.on("close", (code) => resolve({ code, stderr }));
+    });
+
+  const [a, b] = await Promise.all([spawnWorker(), spawnWorker()]);
+  assert.equal(a.code, 0, `worker A failed: ${a.stderr}`);
+  assert.equal(b.code, 0, `worker B failed: ${b.stderr}`);
+
+  const events = await readEvents(runDir);
+  const creates = events.filter((e) => e.type === "assumption_lineage");
+  assert.equal(creates.length, 2, "both processes must append one lineage event");
+  const ids = creates.map((e) => String(e.assumption_id));
+  assert.notEqual(
+    ids[0],
+    ids[1],
+    "cross-process implicit emits must not share assumption_id",
+  );
   const current = projectAssumptionCurrentState(creates, runId);
   assert.equal(current.size, 2);
   assert.equal(countUnresolved(current), 2);
