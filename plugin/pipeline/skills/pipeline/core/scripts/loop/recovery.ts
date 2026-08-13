@@ -193,7 +193,8 @@ export const DEFAULT_RECOVERY_POLICY: RecoveryPolicy = compileRecoveryPolicy({
     repeated_evidence_limit: 3,
   },
   "workflow-engine-defect": {
-    recipes: ["restart_workflow_engine", "repair_pipeline_item"],
+    // #1020: deterministic unlink of engine-owned scratch before implementer repair.
+    recipes: ["unlink_engine_scratch", "restart_workflow_engine", "repair_pipeline_item"],
     retry_budget: 2,
     backoff: { initial_seconds: 5, multiplier: 1, max_seconds: 5 },
     terminal_outcome: "retry",
@@ -238,6 +239,12 @@ const STALE_DEFAULT_POLICY_ENTRIES: Partial<Record<DurableBlockerClass, readonly
       recipes: ["restart_workflow_engine", "repair_pipeline_item"], retry_budget: 1,
       backoff: { initial_seconds: 5, multiplier: 1, max_seconds: 5 },
       terminal_outcome: "retry", run_fatal: true, repeated_evidence_limit: 1,
+    },
+    // Pre-#1020 default (no unlink_engine_scratch first recipe).
+    {
+      recipes: ["restart_workflow_engine", "repair_pipeline_item"], retry_budget: 2,
+      backoff: { initial_seconds: 5, multiplier: 1, max_seconds: 5 },
+      terminal_outcome: "retry", run_fatal: true, repeated_evidence_limit: 2,
     },
   ],
 };

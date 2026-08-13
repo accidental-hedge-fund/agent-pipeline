@@ -3,6 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  classifyPorcelainForScratchRecover,
   classifyWorktreeDirt,
   ENGINE_NON_PRODUCT_SCRATCH_GLOBS,
   formatProductDirtDisclosure,
@@ -304,4 +305,28 @@ test("matchScratchGlob (#1013): challenge-response pattern is narrow", () => {
   assert.equal(matchScratchGlob("artifacts/other.json", pat), false);
   assert.equal(matchScratchGlob("challenge-response-1.json", pat), false);
   assert.equal(matchScratchGlob("core/scripts/foo.ts", pat), false);
+});
+
+// ---------------------------------------------------------------------------
+// #1020: porcelain classification for scratch recover (untracked-only)
+// ---------------------------------------------------------------------------
+
+test("classifyPorcelainForScratchRecover (#1020): untracked scratch only", () => {
+  const c = classifyPorcelainForScratchRecover("?? artifacts/challenge-response-1.json\n");
+  assert.deepEqual(c.product, []);
+  assert.deepEqual(c.untrackedScratch, ["artifacts/challenge-response-1.json"]);
+});
+
+test("classifyPorcelainForScratchRecover (#1020): tracked scratch is product", () => {
+  const c = classifyPorcelainForScratchRecover(" M artifacts/challenge-response-1.json\n");
+  assert.deepEqual(c.untrackedScratch, []);
+  assert.deepEqual(c.product, ["artifacts/challenge-response-1.json"]);
+});
+
+test("classifyPorcelainForScratchRecover (#1020): mixed product blocks", () => {
+  const c = classifyPorcelainForScratchRecover(
+    "?? artifacts/challenge-response-1.json\n M core/scripts/foo.ts\n",
+  );
+  assert.deepEqual(c.untrackedScratch, ["artifacts/challenge-response-1.json"]);
+  assert.deepEqual(c.product, ["core/scripts/foo.ts"]);
 });

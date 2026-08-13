@@ -39,7 +39,7 @@ import {
   orderIssuesByDeclaredDeps,
   realTrainDeps,
   runTrain,
-  type AdvanceOutcome,
+  type AdvanceWaveResult,
   type TrainDeps,
   type TrainIssueSnapshot,
 } from "./train.ts";
@@ -107,8 +107,11 @@ export interface RealShipCoordinatorDepsOptions {
   profile?: string;
   progress(msg: string): void;
   authorizationPublicKey: string;
-  /** Canonical single-issue drive supplied by pipeline.ts to avoid a cycle. */
-  advanceIssue(issue: number): Promise<AdvanceOutcome>;
+  /**
+   * Multi-item frontier advance supplied by pipeline.ts (one loop/advance-wave
+   * call per frontier — same seam as `runTrainCommand`). Must not be N×single.
+   */
+  advanceWave(issues: readonly number[]): Promise<AdvanceWaveResult>;
   state?: ShipStateStore;
   env?: NodeJS.ProcessEnv;
 }
@@ -497,7 +500,9 @@ function realShipAdapterOperations(opts: RealShipCoordinatorDepsOptions): ShipAd
       repoDir: opts.repoDir,
       repo: opts.repo,
       baseBranch: opts.baseBranch,
-      advanceIssue: opts.advanceIssue,
+      // Production ship uses the injected multi-item wave (loop engine), not
+      // a per-issue single loop — see integrated-train-mode #1023.
+      advanceWave: opts.advanceWave,
       mergeDeps,
     });
     return {

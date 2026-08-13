@@ -55,6 +55,7 @@ import {
 } from "./stages/review-parsing.ts";
 import { makePipelineRunId } from "./traceability.ts";
 import { branchName, getForIssue, getOnDiskForIssue, gitInWorktree, removeWorktreeForIssue, sweepMergedWorktrees } from "./worktree.ts";
+import { classifyPorcelainForScratchRecover } from "./worktree-dirt.ts";
 import {
   bundlePath,
   createBundle,
@@ -1621,6 +1622,17 @@ export interface RealExecuteRecoveryDeps {
    * work). Failures must return false (fail closed).
    */
   isWorktreeClean?: (wtPath: string) => Promise<boolean>;
+  /** Injectable git-in-worktree for unlink_engine_scratch (#1020 / #1028). */
+  gitInWorktree?: typeof gitInWorktree;
+  /**
+   * After first successful engine-scratch recover, file a live milestone sibling
+   * (#1021 / #1028). Non-fatal: failures must not reverse the recover.
+   */
+  onEngineClassRecovered?: (input: {
+    issueNumber: number;
+    evidenceKey: string;
+    action: string;
+  }) => Promise<void>;
   getOnDiskForIssue?: typeof getOnDiskForIssue;
   /**
    * @deprecated Prefer probeImplementDeliverable. Kept so older test stubs
@@ -1688,15 +1700,16 @@ export function realExecuteRecovery(
   const repairPipelineItem = deps.repairPipelineItem ?? createRepairPipelineItemExecutor(cfg);
   const getWorktree = deps.getOnDiskForIssue ?? getOnDiskForIssue;
   const post = deps.postComment ?? postComment;
+  const gitInWt = deps.gitInWorktree ?? gitInWorktree;
   const gitHead =
     deps.gitHead ??
     (async (wtPath: string) =>
-      (await gitInWorktree(wtPath, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim());
+      (await gitInWt(wtPath, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim());
   const isWorktreeClean =
     deps.isWorktreeClean ??
     (async (wtPath: string) => {
       // Fail closed: non-zero status or any porcelain output ⇒ not clean.
-      const status = await gitInWorktree(
+      const status = await gitInWt(
         wtPath,
         ["status", "--porcelain", "--untracked-files=all"],
         { ignoreFailure: true },
@@ -1923,6 +1936,146 @@ export function realExecuteRecovery(
     };
   };
 
+  /**
+   * #1020 / #1028: deterministic unlink of engine-owned non-product scratch.
+   * Ordered ahead of repair_pipeline_item for workflow-engine-defect. Does not
+   * invoke the implementer; product dirt fails closed so later recipes run.
+   */
+  const unlinkEngineScratch = async (
+    input: ExecuteRecoveryInput,
+  ): Promise<RepairPipelineItemResult> => {
+    const issueNumber = Number(input.itemId);
+    if (!Number.isSafeInteger(issueNumber) || issueNumber <= 0) {
+      return failed(`unlink_engine_scratch requires a positive numeric item id`);
+    }
+    // Human-decision evidence must never take this path.
+    if (input.blockerClass === "specification-decision" || input.blockerClass === "missing-authority") {
+      return failed(`unlink_engine_scratch does not apply to human-authority class ${input.blockerClass}`);
+    }
+    const wt = await getWorktree(cfg, issueNumber);
+    if (!wt) {
+      return failed(`unlink_engine_scratch: no managed worktree for #${issueNumber}`);
+    }
+    const extraGlobs = cfg.test_gate?.non_product_dirty_globs ?? [];
+    const status = await gitInWt(
+      wt.path,
+      ["status", "--porcelain", "--untracked-files=all"],
+      { ignoreFailure: true },
+    );
+    if (status.code !== 0) {
+      return failed(
+        `unlink_engine_scratch: git status failed (exit ${status.code}); cannot classify porcelain`,
+      );
+    }
+    const classified = classifyPorcelainForScratchRecover(status.stdout, extraGlobs);
+    if (classified.product.length > 0) {
+      return failed(
+        `unlink_engine_scratch: product dirt remains (${classified.product.slice(0, 5).join(", ")}); ` +
+          `not engine-scratch-only — trying next recipe`,
+      );
+    }
+    // Require current engine-scratch evidence. Clean porcelain or non-scratch
+    // workflow-engine failures must fall through to restart/repair — never
+    // clear blocked solely because the tree is already clean (#1028 review).
+    if (classified.untrackedScratch.length === 0) {
+      return failed(
+        `unlink_engine_scratch: no current engine-scratch paths; not scratch-only evidence — trying next recipe`,
+      );
+    }
+    const unlinked: string[] = [];
+    for (const scratchPath of classified.untrackedScratch) {
+      const clean = await gitInWt(
+        wt.path,
+        ["clean", "-fd", "--", scratchPath],
+        { ignoreFailure: true },
+      );
+      if (clean.code === 0) unlinked.push(scratchPath);
+    }
+    // Re-check: product must stay empty after unlink.
+    const afterStatus = await gitInWt(
+      wt.path,
+      ["status", "--porcelain", "--untracked-files=all"],
+      { ignoreFailure: true },
+    );
+    if (afterStatus.code !== 0) {
+      return failed(`unlink_engine_scratch: post-unlink git status failed`);
+    }
+    const after = classifyPorcelainForScratchRecover(afterStatus.stdout, extraGlobs);
+    if (after.product.length > 0) {
+      return failed(
+        `unlink_engine_scratch: product dirt present after unlink (${after.product.slice(0, 5).join(", ")})`,
+      );
+    }
+    if (after.untrackedScratch.length > 0) {
+      return failed(
+        `unlink_engine_scratch: scratch paths remain after clean (${after.untrackedScratch.join(", ")})`,
+      );
+    }
+    // Clear mechanical blocked when present (scratch-only cause).
+    let before: Awaited<ReturnType<typeof getIssueDetail>>;
+    try {
+      before = await getDetail(cfg, issueNumber);
+    } catch (err) {
+      return failed(
+        `unlink_engine_scratch: cannot inspect live item: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    if (before.labels.includes(BLOCKED_LABEL)) {
+      try {
+        await clear(cfg, issueNumber);
+        const afterDetail = await getDetail(cfg, issueNumber);
+        if (afterDetail.labels.includes(BLOCKED_LABEL)) {
+          return failed(`unlink_engine_scratch: cleared but blocked label remains`);
+        }
+      } catch (err) {
+        return failed(
+          `unlink_engine_scratch: could not clear blocked: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+    const evidenceKey =
+      (typeof input.diagnostic.evidence_key === "string" && input.diagnostic.evidence_key.trim()) ||
+      `engine-scratch:${issueNumber}:${unlinked.sort().join(",") || "clean"}`;
+    const notifySibling = async () => {
+      if (deps.onEngineClassRecovered) {
+        await deps.onEngineClassRecovered({
+          issueNumber,
+          evidenceKey,
+          action: "unlink_engine_scratch",
+        });
+        return;
+      }
+      // Default: best-effort live sibling on current train milestone (#1021).
+      try {
+        const { autoFileEngineClassLiveSibling, realEngineClassLiveSiblingDeps, getTrainMilestoneContext } =
+          await import("./stages/engine-class-live-sibling.ts");
+        await autoFileEngineClassLiveSibling(
+          {
+            recoveredIssue: issueNumber,
+            evidenceKey,
+            milestone: getTrainMilestoneContext(),
+            domain: cfg.domain,
+            windowHours: cfg.papercuts?.auto_file_window_hours ?? 24,
+            maxPerWindow: cfg.papercuts?.auto_file_max_per_window ?? 3,
+          },
+          realEngineClassLiveSiblingDeps(cfg.repo_dir),
+        );
+      } catch {
+        // Non-fatal
+      }
+    };
+    try {
+      await notifySibling();
+    } catch {
+      // Non-fatal: sibling filing must not reverse recover success.
+    }
+    return {
+      succeeded: true,
+      evidence:
+        `unlink_engine_scratch: removed engine scratch [${unlinked.join(", ")}] and cleared mechanical block when present`,
+    };
+  };
+
   return async (input) => {
     const projection = projectStageDiagnostic(input.diagnostic);
     if (projection.disposition !== "recover" || projection.blockerClass !== input.blockerClass) {
@@ -1941,6 +2094,8 @@ export function realExecuteRecovery(
         });
       case "verify_head_goal":
         return verifyHeadGoal(input);
+      case "unlink_engine_scratch":
+        return unlinkEngineScratch(input);
       case "wait_and_retry":
       case "rerun_ci":
       case "resync_workflow_state":
@@ -2798,14 +2953,23 @@ export interface TrainCommandDeps {
     baseBranch: string;
   }): TrainDeps;
   runSingleIssue: typeof runSingleIssueCommand;
+  /**
+   * Multi-item frontier advance (#1023 / #1028). Production: one loop engine
+   * call per frontier. Injected so unit tests never spawn a real loop.
+   */
+  runAdvanceWave?: (
+    issues: readonly number[],
+    opts: CliOpts,
+    getIssue: TrainDeps["getIssue"],
+  ) => Promise<import("./stages/train.ts").AdvanceWaveResult>;
 }
 
 const defaultTrainCommandDeps: TrainCommandDeps = {
   makeTrainDeps(input) {
     return realTrainDeps({
       ...input,
-      advanceIssue: async () => {
-        throw new Error("advanceIssue must be overridden");
+      advanceWave: async () => {
+        throw new Error("advanceWave must be overridden by runTrainCommand");
       },
     });
   },
@@ -2833,7 +2997,14 @@ export async function advanceIssueThroughSingle(
     process.exitCode = previousExit ?? 0;
   }
 
-  const snap = await getIssue(issue);
+  return classifyTrainAdvanceLabels(await getIssue(issue), exit);
+}
+
+/** Map live issue labels (+ optional exit code) to a train AdvanceOutcome. */
+export function classifyTrainAdvanceLabels(
+  snap: { labels: string[] },
+  exit = 0,
+): AdvanceOutcome {
   const stageLabel = snap.labels.find((label) => label.startsWith("pipeline:"));
   const stage = stageLabel?.slice("pipeline:".length) ?? null;
   if (stage === "ready-to-deploy") {
@@ -2846,9 +3017,81 @@ export async function advanceIssueThroughSingle(
     return { ok: true, terminal: "blocked", labels: snap.labels };
   }
   if (exit !== 0) {
-    return { ok: false, error: `pipeline single exited with code ${exit}` };
+    return { ok: false, error: `pipeline advance exited with code ${exit}` };
   }
   return { ok: true, terminal: "other", labels: snap.labels };
+}
+
+/**
+ * One multi-item loop engine call for a base-eligible frontier (#1023).
+ * Recovery and parallel disjoint advance stay inside the loop; train does not
+ * call repair_pipeline_item.
+ */
+export async function advanceWaveThroughLoop(
+  issues: readonly number[],
+  opts: CliOpts,
+  getIssue: TrainDeps["getIssue"],
+  runLoopEngine: (input: RunLoopEngineInput) => Promise<LoopEngineResult> = defaultRunLoopEngine,
+  resolveCfg: typeof resolveConfig = resolveConfig,
+): Promise<import("./stages/train.ts").AdvanceWaveResult> {
+  if (issues.length === 0) return new Map();
+  let cfg: PipelineConfig;
+  try {
+    cfg = resolveCfg({
+      repoPath: opts.repoPath,
+      baseBranch: opts.base,
+      profile: opts.profile,
+    });
+  } catch (err) {
+    const out = new Map<number, AdvanceOutcome>();
+    for (const n of issues) {
+      out.set(n, { ok: false, error: `config error: ${(err as Error).message}` });
+    }
+    return out;
+  }
+  const engine: LoopEngine = opts.profile === "claude" ? "claude" : "codex";
+  const previousExit = process.exitCode;
+  process.exitCode = 0;
+  let engineFailed: string | null = null;
+  try {
+    const engineResult = await runLoopEngine({
+      engine,
+      selector: { type: "work-list", value: issues.map(String) },
+      audit: false,
+      autoSupersedeTerminal: true,
+      repoDir: cfg.repo_dir,
+      onRunReady: async (ctx) => {
+        console.error(
+          `[train] advance-wave loop ready ${ctx.runId}; issues ${issues.map((n) => `#${n}`).join(", ")}`,
+        );
+      },
+    });
+    if (engineResult.kind === "error") {
+      engineFailed = engineResult.message;
+    }
+  } catch (err) {
+    engineFailed = (err as Error).message;
+  } finally {
+    process.exitCode = previousExit ?? 0;
+  }
+  const out = new Map<number, AdvanceOutcome>();
+  for (const issue of issues) {
+    if (engineFailed) {
+      // Still read labels — loop may have advanced some items before failing.
+      try {
+        out.set(issue, classifyTrainAdvanceLabels(await getIssue(issue), 1));
+      } catch {
+        out.set(issue, { ok: false, error: engineFailed });
+      }
+      continue;
+    }
+    try {
+      out.set(issue, classifyTrainAdvanceLabels(await getIssue(issue), 0));
+    } catch (err) {
+      out.set(issue, { ok: false, error: (err as Error).message });
+    }
+  }
+  return out;
 }
 
 /** Execute parsed `pipeline train` options through the ordered train engine.
@@ -2871,9 +3114,8 @@ export async function runTrainCommand(
       "pipeline train: --issues <n,n> and/or --milestone <title> is required.\n" +
         "  Usage: pipeline train --issues 10,11,12 [--merge] [--json]\n" +
         "         pipeline train --milestone v1.34.0 [--merge] [--json]\n" +
-        "  Without --merge: advances each issue to ready-to-deploy only.\n" +
-        "  With --merge: merges each ready-to-deploy PR via the existing merge surface,\n" +
-        "  proves squash-aware base containment, then starts the next issue.\n" +
+        "  Without --merge: advances base-eligible frontiers via one loop wave each.\n" +
+        "  With --merge: serial merge + base containment after each advance wave.\n" +
         "  Never called from the advance loop. No auto_merge config key.",
     );
     return 2;
@@ -2888,6 +3130,16 @@ export async function runTrainCommand(
     repo: trainCfg.repo,
     baseBranch: trainCfg.base_branch,
   });
+  const wave =
+    deps.runAdvanceWave ??
+    ((issues, waveOpts, getIssue) => advanceWaveThroughLoop(issues, waveOpts, getIssue));
+  // Expose train milestone to engine-class live sibling filing (#1021).
+  try {
+    const { setTrainMilestoneContext } = await import("./stages/engine-class-live-sibling.ts");
+    setTrainMilestoneContext(milestone || null);
+  } catch {
+    // Non-fatal
+  }
   const trainResult = await runTrain(
     {
       issues: issueNumbers.length > 0 ? issueNumbers : undefined,
@@ -2899,10 +3151,15 @@ export async function runTrainCommand(
     },
     {
       ...baseDeps,
-      advanceIssue: (issue) =>
-        advanceIssueThroughSingle(issue, opts, baseDeps.getIssue, deps.runSingleIssue),
+      advanceWave: (issues) => wave(issues, opts, baseDeps.getIssue),
     },
   );
+  try {
+    const { setTrainMilestoneContext } = await import("./stages/engine-class-live-sibling.ts");
+    setTrainMilestoneContext(null);
+  } catch {
+    // Non-fatal
+  }
 
   if (opts.json) {
     console.log(JSON.stringify(trainResult.status, null, 2));
@@ -3585,8 +3842,8 @@ async function main(): Promise<void> {
         repoDir: shipCfg.repo_dir,
         repo: shipCfg.repo,
         baseBranch: shipCfg.base_branch,
-        advanceIssue: async () => {
-          throw new Error("ship advanceIssue must be supplied by the CLI adapter");
+        advanceWave: async () => {
+          throw new Error("ship advanceWave must be supplied by the CLI adapter");
         },
       });
       const coordinatorDeps = realShipCoordinatorDeps({
@@ -3596,8 +3853,9 @@ async function main(): Promise<void> {
         profile: opts.profile,
         progress: (message: string) => process.stderr.write(`${message}\n`),
         authorizationPublicKey,
-        advanceIssue: (issue: number) =>
-          advanceIssueThroughSingle(issue, opts, shipTrainReadDeps.getIssue),
+        // Same multi-item loop wave as `runTrainCommand` — not N×single (#1023 / #1028).
+        advanceWave: (issues) =>
+          advanceWaveThroughLoop(issues, opts, shipTrainReadDeps.getIssue),
         state: shipState,
       });
       try {

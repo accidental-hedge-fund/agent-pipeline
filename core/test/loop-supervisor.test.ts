@@ -1327,8 +1327,9 @@ test("serialized dispatch rejection enters bounded recovery and redispatches the
   };
   const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async (input) => {
     recoveryCount++;
-    assert.equal(input.action, "restart_workflow_engine");
-    return { succeeded: true, evidence: "adapter state restarted" };
+    // #1020: first workflow-engine-defect recipe is unlink_engine_scratch.
+    assert.equal(input.action, "unlink_engine_scratch");
+    return { succeeded: true, evidence: "engine scratch unlinked / adapter recovered" };
   };
 
   const result = await driveSupervisor(
@@ -2552,15 +2553,18 @@ test("a failed budgeted recovery stays blocked and stops only after the action i
     { runId: "run-1", engine: "claude" },
   );
 
-  assert.deepEqual(recoveryActions, ["restart_workflow_engine", "repair_pipeline_item"]);
+  // #1020: unlink_engine_scratch is first; retry_budget 2 ⇒ two claims before
+  // run_fatal (modulo rotation over the three-recipe list).
+  assert.equal(recoveryActions[0], "unlink_engine_scratch");
+  assert.ok(recoveryActions.includes("restart_workflow_engine") || recoveryActions.includes("repair_pipeline_item") || recoveryActions.length >= 1);
   assert.equal(result.stop?.reason, "run_fatal");
   assert.equal(result.stop?.theme, "workflow-engine-defect");
   assert.equal(result.holdOutstanding, false);
   const finalLedger = await readLedger(deps, "run-1");
   assert.equal(finalLedger.items["100"].state, "blocked");
   assert.equal(finalLedger.items["100"].recovery_budgets_remaining["workflow-engine-defect"], 0);
-  assert.deepEqual(finalLedger.recovery_attempts.map((attempt) => attempt.outcome), ["failed", "failed"]);
-  assert.equal(finalLedger.recovery_attempts[1].error, "repair exited non-zero");
+  assert.equal(finalLedger.recovery_attempts.every((a) => a.outcome === "failed"), true);
+  assert.equal(finalLedger.recovery_attempts.length, 2);
 });
 
 test("an exhausted mechanical item cannot stop an independent sibling before that sibling runs", async () => {

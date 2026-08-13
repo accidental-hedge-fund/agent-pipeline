@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
   alignReleaseCheckoutToCandidate,
@@ -14,6 +17,8 @@ import type {
   ShipTrainEvidence,
 } from "../scripts/stages/ship.ts";
 import type { FrgEvidence } from "../scripts/factory-reliability-gate.ts";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const head = "a".repeat(40);
 const releaseHead = "b".repeat(40);
@@ -390,5 +395,44 @@ test("ship release checkout is fast-forwarded and must equal the FRG candidate",
     alignReleaseCheckoutToCandidate("main", head, async (args) =>
       args[0] === "rev-parse" ? "f".repeat(40) : ""),
     /does not match the FRG candidate/,
+  );
+});
+
+test("production ship adapter wires multi-item advanceWave, not N×single (review 2 b09c0a25)", () => {
+  const shipAdapter = fs.readFileSync(
+    path.join(__dirname, "..", "scripts", "stages", "ship-adapter.ts"),
+    "utf8",
+  );
+  // Strip comments so a doc mention of the forbidden helper cannot false-fail.
+  const shipCode = shipAdapter
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/\/\/[^\n]*/g, "");
+  assert.ok(
+    !shipCode.includes("advanceWaveFromSingle"),
+    "ship-adapter production path must not convert frontiers to N×single via advanceWaveFromSingle",
+  );
+  assert.ok(
+    shipCode.includes("advanceWave: opts.advanceWave"),
+    "ship-adapter must pass the injected multi-item advanceWave into realTrainDeps",
+  );
+  assert.ok(
+    /advanceWave\s*\(\s*issues:\s*readonly number\[\]\s*\)/.test(shipCode),
+    "RealShipCoordinatorDepsOptions must require multi-item advanceWave",
+  );
+
+  const pipeline = fs.readFileSync(
+    path.join(__dirname, "..", "scripts", "pipeline.ts"),
+    "utf8",
+  );
+  const shipBlockStart = pipeline.indexOf("realShipCoordinatorDeps({");
+  assert.ok(shipBlockStart !== -1, "pipeline ship path must construct realShipCoordinatorDeps");
+  const shipBlock = pipeline.slice(shipBlockStart, shipBlockStart + 800);
+  assert.ok(
+    shipBlock.includes("advanceWaveThroughLoop"),
+    "pipeline ship must wire advanceWaveThroughLoop (same multi-item loop wave as runTrainCommand)",
+  );
+  assert.ok(
+    !shipBlock.includes("advanceIssueThroughSingle") && !shipBlock.includes("advanceWaveFromSingle"),
+    "pipeline ship must not wire N×single advance into the train production adapter",
   );
 });

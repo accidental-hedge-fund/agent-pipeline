@@ -151,7 +151,7 @@ export const COMMAND_DOCS: Record<string, CommandDoc> = {
   },
   train: {
     summary:
-      "Operator-authorized integrate train: dependency-order issues, advance each to ready-to-deploy, optionally merge and prove base containment before the next (never called by the advance loop)",
+      "Operator-authorized integrate train: base-eligible frontiers advance via one loop wave each (recovery inside the wave); optionally serial-merge with base containment; independent R2D siblings may merge while a peer is parked (never called by the advance loop)",
     usage: "train --milestone <m>|--issues <n,n> [--merge] [--json]",
     documented: true,
     section: "lifecycle",
