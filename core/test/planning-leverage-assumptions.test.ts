@@ -4,6 +4,7 @@ import {
   allocateAssumptionId,
   countUnresolved,
   createOpenAssumption,
+  nextAssumptionOrdinal,
   projectAssumptionCurrentState,
   updateAssumptionStatus,
 } from "../scripts/planning-leverage/assumptions.ts";
@@ -135,6 +136,87 @@ test("allocateAssumptionId is stable for same inputs", () => {
   const c = allocateAssumptionId({ run_id: "r", statement: "same", ordinal: 1 });
   assert.equal(a, b);
   assert.notEqual(a, c);
+});
+
+test("identical statements with distinct ordinals get distinct ids", () => {
+  const a = createOpenAssumption({
+    run_id: "run-1",
+    kind: "assumption",
+    statement: "same text twice",
+    introduced_phase: "planning",
+    status_updated_at: "t1",
+    ordinal: 0,
+  });
+  const b = createOpenAssumption({
+    run_id: "run-1",
+    kind: "assumption",
+    statement: "same text twice",
+    introduced_phase: "planning",
+    status_updated_at: "t1",
+    ordinal: 1,
+  });
+  assert.notEqual(a.assumption_id, b.assumption_id);
+  assert.equal(a.statement, b.statement);
+  const current = projectAssumptionCurrentState([a, b], "run-1");
+  assert.equal(current.size, 2);
+  assert.equal(countUnresolved(current), 2);
+});
+
+test("nextAssumptionOrdinal counts distinct same-text items, not status updates", () => {
+  const a0 = createOpenAssumption({
+    run_id: "run-1",
+    kind: "assumption",
+    statement: "dup",
+    introduced_phase: "planning",
+    status_updated_at: "t1",
+    ordinal: 0,
+  });
+  const a0resolved = updateAssumptionStatus({
+    prior: a0,
+    status: "resolved",
+    status_updated_at: "t2",
+    resolved_in_phase: "implementation",
+  });
+  assert.equal(
+    nextAssumptionOrdinal({
+      events: [a0, a0resolved],
+      run_id: "run-1",
+      kind: "assumption",
+      statement: "dup",
+    }),
+    1,
+  );
+  const a1 = createOpenAssumption({
+    run_id: "run-1",
+    kind: "assumption",
+    statement: "dup",
+    introduced_phase: "planning",
+    status_updated_at: "t3",
+    ordinal: 1,
+  });
+  assert.equal(
+    nextAssumptionOrdinal({
+      events: [a0, a0resolved, a1],
+      run_id: "run-1",
+      kind: "assumption",
+      statement: "dup",
+    }),
+    2,
+  );
+  // Status update on a1 must keep a1's id (not reallocate).
+  const a1deferred = updateAssumptionStatus({
+    prior: a1,
+    status: "deferred",
+    status_updated_at: "t4",
+  });
+  assert.equal(a1deferred.assumption_id, a1.assumption_id);
+  const current = projectAssumptionCurrentState(
+    [a0, a0resolved, a1, a1deferred],
+    "run-1",
+  );
+  assert.equal(current.size, 2);
+  assert.equal(current.get(a0.assumption_id)?.status, "resolved");
+  assert.equal(current.get(a1.assumption_id)?.status, "deferred");
 });
 
 test("open assumption still visible after planning ends", () => {

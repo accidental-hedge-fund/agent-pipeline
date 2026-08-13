@@ -28,6 +28,27 @@ export function allocateAssumptionId(args: {
   return `A-${hash}`;
 }
 
+/**
+ * Next free ordinal for a (run_id, kind, statement) identity key so default
+ * allocation stays unique when producers omit assumption_id (#702 review-2).
+ * Counts distinct current-state ids that already share the same redacted
+ * statement and kind; status updates do not inflate the count.
+ */
+export function nextAssumptionOrdinal(args: {
+  events: readonly unknown[];
+  run_id: string;
+  kind: AssumptionKind;
+  statement: string;
+}): number {
+  const normalized = redactFreeText(args.statement.trim(), 500);
+  const current = projectAssumptionCurrentState(args.events, args.run_id);
+  let n = 0;
+  for (const p of current.values()) {
+    if (p.kind === args.kind && p.statement === normalized) n++;
+  }
+  return n;
+}
+
 export function isUnresolvedStatus(status: AssumptionStatus): boolean {
   return status === "open" || status === "deferred";
 }

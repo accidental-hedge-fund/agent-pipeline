@@ -6,6 +6,7 @@
 import {
   appendEvent,
   defaultRunStoreDeps,
+  readEvents,
   RUN_SCHEMA_VERSION,
   type RunStoreDeps,
 } from "../run-store.ts";
@@ -33,7 +34,11 @@ import {
   emptyReviewEffort,
 } from "./schema.ts";
 import { classifyMateriality, type MaterialityEvidence } from "./materiality.ts";
-import { createOpenAssumption, updateAssumptionStatus } from "./assumptions.ts";
+import {
+  createOpenAssumption,
+  nextAssumptionOrdinal,
+  updateAssumptionStatus,
+} from "./assumptions.ts";
 import type { AssumptionLineagePayload } from "./schema.ts";
 import type { PlanningLeverageSnapshotPayload } from "./schema.ts";
 
@@ -150,6 +155,12 @@ export interface EmitAssumptionOpts {
   run_id: string;
   issue?: number | null;
   assumption_id?: string;
+  /**
+   * Per-run ordinal for default id allocation when assumption_id is omitted.
+   * Distinct same-text assumptions must use different ordinals (or explicit ids).
+   * When omitted on create, emit allocates the next free ordinal from the run stream.
+   */
+  ordinal?: number;
   kind: AssumptionKind;
   statement: string;
   introduced_phase: DeliveryPhase;
@@ -180,14 +191,35 @@ export async function emitAssumptionLineage(
         evidence_refs: opts.evidence_refs,
       });
     } else {
+      // Collision-free default ids: producer id, producer ordinal, or next free
+      // ordinal for this (run_id, kind, statement) from the append-only stream.
+      let assumption_id = opts.assumption_id;
+      let ordinal = opts.ordinal;
+      if (assumption_id == null || assumption_id === "") {
+        if (ordinal == null) {
+          let events: unknown[] = [];
+          try {
+            events = await readEvents(runDir, deps);
+          } catch {
+            events = [];
+          }
+          ordinal = nextAssumptionOrdinal({
+            events,
+            run_id: opts.run_id,
+            kind: opts.kind,
+            statement: opts.statement,
+          });
+        }
+      }
       payload = createOpenAssumption({
         run_id: opts.run_id,
         issue: opts.issue,
-        assumption_id: opts.assumption_id,
+        assumption_id,
         kind: opts.kind,
         statement: opts.statement,
         introduced_phase: opts.introduced_phase,
         status_updated_at: at,
+        ordinal,
       });
       if (opts.status && opts.status !== "open") {
         payload = updateAssumptionStatus({

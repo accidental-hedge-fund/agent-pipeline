@@ -16,7 +16,11 @@ import {
 } from "../scripts/planning-leverage/snapshot.ts";
 import { isStageTimelineEventType } from "../scripts/planning-leverage/scoreboard-section.ts";
 import { appendEvent, type RunStoreDeps } from "../scripts/run-store.ts";
-import { createOpenAssumption, updateAssumptionStatus } from "../scripts/planning-leverage/assumptions.ts";
+import {
+  createOpenAssumption,
+  projectAssumptionCurrentState,
+  countUnresolved,
+} from "../scripts/planning-leverage/assumptions.ts";
 import { unavailableActiveEffort } from "../scripts/planning-leverage/schema.ts";
 
 function makeRunDir(): string {
@@ -211,6 +215,80 @@ test("secret redaction applies before assumption append", async () => {
   );
   const disk = await fsp.readFile(path.join(runDir, "events.jsonl"), "utf8");
   assert.ok(!disk.includes(secret));
+});
+
+test("two identical statements get distinct assumption_ids; status updates retain ids", async () => {
+  // Regression for #702 review-2 eae15cbf: default allocateAssumptionId used
+  // ordinal 0 for every emit without an explicit id, collapsing same-text items.
+  const runDir = makeRunDir();
+  const deps = baseDeps();
+  const runId = "702-test-run";
+  const statement = "API remains stable";
+
+  await emitAssumptionLineage(
+    runDir,
+    {
+      run_id: runId,
+      kind: "assumption",
+      statement,
+      introduced_phase: "planning",
+      status: "open",
+    },
+    deps,
+  );
+  await emitAssumptionLineage(
+    runDir,
+    {
+      run_id: runId,
+      kind: "assumption",
+      statement,
+      introduced_phase: "planning",
+      status: "open",
+    },
+    deps,
+  );
+
+  const events = await readEvents(runDir);
+  const creates = events.filter((e) => e.type === "assumption_lineage");
+  assert.equal(creates.length, 2);
+  const id0 = String(creates[0].assumption_id);
+  const id1 = String(creates[1].assumption_id);
+  assert.notEqual(id0, id1, "identical statements must not share assumption_id");
+  assert.ok(id0.length > 0);
+  assert.ok(id1.length > 0);
+
+  // Resolve only the first logical item; second stays open with its own id.
+  const prior0 = createOpenAssumption({
+    run_id: runId,
+    assumption_id: id0,
+    kind: "assumption",
+    statement,
+    introduced_phase: "planning",
+    status_updated_at: "2026-08-13T12:00:00Z",
+  });
+  await emitAssumptionLineage(
+    runDir,
+    {
+      run_id: runId,
+      prior: prior0,
+      status: "resolved",
+      resolution: { note: "confirmed", resolved_in_phase: "implementation" },
+    },
+    deps,
+  );
+
+  const after = await readEvents(runDir);
+  const lineage = after.filter((e) => e.type === "assumption_lineage");
+  assert.equal(lineage.length, 3);
+  const resolveEvent = lineage[2];
+  assert.equal(resolveEvent.assumption_id, id0);
+  assert.equal(resolveEvent.status, "resolved");
+
+  const current = projectAssumptionCurrentState(lineage, runId);
+  assert.equal(current.size, 2);
+  assert.equal(current.get(id0)?.status, "resolved");
+  assert.equal(current.get(id1)?.status, "open");
+  assert.equal(countUnresolved(current), 1);
 });
 
 test("representative lifecycle plan → implement → review → fix", async () => {
