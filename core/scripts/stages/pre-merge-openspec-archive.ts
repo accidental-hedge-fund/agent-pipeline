@@ -752,6 +752,8 @@ export async function maybeArchiveOpenspec(
   await gitFn(wt.path, ["add", "-A"], { ignoreFailure: true });
   let status = await gitFn(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
   if (status.code !== 0) {
+    // #1020: engine-scratch residual (cannot prove scratch unstaged) → harness-failure
+    // so stage-diagnostic projects workflow-engine-defect (recover), not needs-human.
     const detail =
       `git status --porcelain failed after archive staging (exit ${status.code}): ` +
       `${(status.stderr || status.stdout || "(no output)").trim()}`;
@@ -760,10 +762,10 @@ export async function maybeArchiveOpenspec(
       issueNumber,
       `Cannot verify residual engine-known scratch was unstaged before the OpenSpec archive commit — ${detail}.`,
       "pre-merge",
-      "needs-human",
+      "harness-failure",
     );
     await recordDecision("fail", "post-archive git status failed");
-    return preMergeBlocked("post-archive git status failed", "needs-human");
+    return preMergeBlocked("post-archive git status failed", "harness-failure");
   }
   {
     // XY-aware: only paths with a dirty index column need unstage (not `??` / ` M`).
@@ -775,6 +777,7 @@ export async function maybeArchiveOpenspec(
         { ignoreFailure: true },
       );
       if (restore.code !== 0) {
+        // #1020: factory cannot clear staged engine scratch → harness-failure / recover.
         const detail =
           restore.stderr.trim() || restore.stdout.trim() || `(exit ${restore.code})`;
         await setBlockedFn(
@@ -783,10 +786,10 @@ export async function maybeArchiveOpenspec(
           `Cannot unstage engine-known scratch before OpenSpec archive commit ` +
             `(git restore --staged failed):\n${detail}\nScratch paths:\n${toUnstage.join("\n")}`,
           "pre-merge",
-          "needs-human",
+          "harness-failure",
         );
         await recordDecision("fail", "post-archive unstage failed");
-        return preMergeBlocked("post-archive unstage failed", "needs-human");
+        return preMergeBlocked("post-archive unstage failed", "harness-failure");
       }
       status = await gitFn(wt.path, ["status", "--porcelain"], { ignoreFailure: true });
       if (status.code !== 0) {
@@ -798,25 +801,26 @@ export async function maybeArchiveOpenspec(
           issueNumber,
           `Cannot verify residual engine-known scratch was unstaged before the OpenSpec archive commit — ${detail}.`,
           "pre-merge",
-          "needs-human",
+          "harness-failure",
         );
         await recordDecision("fail", "post-archive git status failed");
-        return preMergeBlocked("post-archive git status failed", "needs-human");
+        return preMergeBlocked("post-archive git status failed", "harness-failure");
       }
     }
     // Confirm residual scratch is unstaged/untracked — never commit it.
     const stillStaged = stagedScratchPaths(status.stdout);
     if (stillStaged.length > 0) {
+      // #1020: residual staged engine scratch is a factory defect, not human authority.
       await setBlockedFn(
         cfg,
         issueNumber,
         `Engine-known scratch remains staged after unstage and would enter the OpenSpec archive commit:\n` +
           `${stillStaged.join("\n")}`,
         "pre-merge",
-        "needs-human",
+        "harness-failure",
       );
       await recordDecision("fail", "post-archive scratch still staged");
-      return preMergeBlocked("post-archive scratch still staged", "needs-human");
+      return preMergeBlocked("post-archive scratch still staged", "harness-failure");
     }
   }
   // Emptiness is product-path based: untracked scratch residual must not count as

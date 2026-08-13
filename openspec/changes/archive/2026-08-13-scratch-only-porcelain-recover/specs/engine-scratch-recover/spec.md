@@ -1,9 +1,4 @@
-# engine-scratch-recover Specification
-
-## Purpose
-Deterministically classify and recover engine-owned scratch porcelain so scratch-only dirt unlinks and clears without escalating to needs-human or train STOP, while product dirt stays fail-closed.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Engine-owned scratch-only porcelain SHALL recover without needs-human escalation
 
@@ -79,6 +74,8 @@ For the engine-scratch / `workflow-engine-defect` recovery path, the autonomous 
 - **WHEN** `unlink_engine_scratch` runs and product dirt remains after unlink
 - **THEN** the recipe SHALL NOT clear `pipeline:blocked` solely as a successful scratch recover
 - **AND** SHALL NOT invoke `repair_pipeline_item` as if scratch-only succeeded
+
+## ADDED Requirements
 
 ### Requirement: Residual engine-scratch blocks SHALL use harness-failure not needs-human
 
