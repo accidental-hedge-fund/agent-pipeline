@@ -306,3 +306,132 @@ test("deployment alone links run via candidate_sha without trailer", () => {
     false,
   );
 });
+
+// Review 2 finding 0d180995: live discover must fetch merge-commit trailers.
+test("live discover fetches merge commit message and links via Pipeline-Run trailer", async () => {
+  const trailerOnlyOnCommit =
+    "feat: outcomes (#1200)\n\nIssue: #576\nPipeline-Run: 576/2026-08-13T15:47:45Z\n";
+  const prListJson = JSON.stringify([
+    {
+      number: 1200,
+      mergedAt: "2026-08-13T16:00:00Z",
+      mergeCommit: { oid: SHA },
+      // Body deliberately lacks trailers — squash merge puts them on the commit.
+      title: "feat: outcomes",
+      body: "Implements the feature without trailers in the PR body.",
+      url: "https://github.com/example/repo/pull/1200",
+    },
+  ]);
+  const commitJson = JSON.stringify({
+    commit: { message: trailerOnlyOnCommit },
+  });
+  const ghCalls: string[][] = [];
+  const gh = async (args: string[]): Promise<string> => {
+    ghCalls.push(args);
+    if (args[0] === "pr" && args[1] === "list") return prListJson;
+    if (args[0] === "api" && typeof args[1] === "string" && args[1].includes(`/commits/${SHA}`)) {
+      return commitJson;
+    }
+    throw new Error(`unexpected gh args: ${args.join(" ")}`);
+  };
+
+  const signals = await githubOutcomeAdapter.discover({ repoDir: REPO, gh });
+  assert.equal(signals.length, 1);
+  // asString trims; durable trailers must still be present on the fetched message.
+  assert.match(String(signals[0]!.payload.commit_message), /Pipeline-Run:\s*576\/2026-08-13T15:47:45Z/);
+  assert.ok(ghCalls.some((c) => c[0] === "api" && String(c[1]).includes(`/commits/${SHA}`)));
+
+  const rec = githubOutcomeAdapter.normalize(signals[0]!, {
+    repoDir: REPO,
+    runs,
+    now: new Date("2026-08-13T17:00:00Z"),
+  });
+  assert.ok(rec);
+  assert.ok(
+    rec.attribution.some(
+      (a) =>
+        a.target_type === "run" &&
+        a.authority === "observed" &&
+        (a.method === "trailer" || a.method === "direct") &&
+        a.target_id === "576-2026-08-13T15-47-45-000Z",
+    ),
+    "merge-commit trailer must yield observed run attribution when body has no trailer",
+  );
+});
+
+// Prefer commit_message over body when both are present (trailer on commit only).
+test("normalize merge prefers commit_message over body for trailer linkage", () => {
+  const signal: RawOutcomeSignal = {
+    signal_id: "merge:pr:1200",
+    kind: "merge",
+    payload: {
+      pr_number: 1200,
+      merged_at: "2026-08-13T16:00:00Z",
+      merge_commit_sha: SHA,
+      title: "feat: outcomes",
+      body: "No trailers here — squash body may omit them.",
+      commit_message: "feat: outcomes\n\nIssue: #576\nPipeline-Run: 576/2026-08-13T15:47:45Z\n",
+      url: "https://github.com/example/repo/pull/1200",
+    },
+  };
+  const rec = githubOutcomeAdapter.normalize(signal, {
+    repoDir: REPO,
+    runs,
+    now: new Date("2026-08-13T17:00:00Z"),
+  });
+  assert.ok(rec);
+  assert.ok(
+    rec.attribution.some(
+      (a) =>
+        a.target_type === "run" &&
+        a.authority === "observed" &&
+        a.target_id === "576-2026-08-13T15-47-45-000Z",
+    ),
+  );
+});
+
+// Review 2 finding bad78331: rolled_back deploy must populate delivery.rollback.
+test("deployment rolled_back populates delivery.rollback occurred and outcome", () => {
+  const rolledBack: RawOutcomeSignal = {
+    signal_id: "deploy:prod:rb",
+    kind: "deployment",
+    payload: {
+      sha: SHA,
+      environment: "production",
+      state: "rolled_back",
+      at: "2026-08-13T20:00:00Z",
+      url: "https://github.com/example/repo/deployments/9",
+    },
+  };
+  const rec = githubOutcomeAdapter.normalize(rolledBack, {
+    repoDir: REPO,
+    runs,
+    now: new Date("2026-08-13T20:00:00Z"),
+  });
+  assert.ok(rec);
+  assert.equal(rec.delivery?.deploy_status, "rolled_back");
+  assert.equal(rec.delivery?.rollback.occurred, true);
+  assert.equal(rec.delivery?.rollback.outcome, "unknown");
+});
+
+test("deployment rolled_back preserves provider rollback_outcome when present", () => {
+  const rolledBack: RawOutcomeSignal = {
+    signal_id: "deploy:prod:rb2",
+    kind: "deployment",
+    payload: {
+      sha: SHA,
+      environment: "production",
+      state: "rolled_back",
+      rollback_outcome: "succeeded",
+      at: "2026-08-13T20:05:00Z",
+    },
+  };
+  const rec = githubOutcomeAdapter.normalize(rolledBack, {
+    repoDir: REPO,
+    runs,
+    now: new Date("2026-08-13T20:05:00Z"),
+  });
+  assert.ok(rec);
+  assert.equal(rec.delivery?.rollback.occurred, true);
+  assert.equal(rec.delivery?.rollback.outcome, "succeeded");
+});

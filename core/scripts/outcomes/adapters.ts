@@ -145,21 +145,46 @@ export const githubOutcomeAdapter: OutcomeSourceAdapter = {
         "number,mergedAt,mergeCommit,title,body,url",
       ]);
       const list = JSON.parse(raw) as Array<Record<string, unknown>>;
-      return list.map((pr) => ({
-        signal_id: `merge:pr:${pr.number}`,
-        kind: "merge" as const,
-        payload: {
-          pr_number: pr.number,
-          merged_at: pr.mergedAt,
-          merge_commit_sha:
-            pr.mergeCommit && typeof pr.mergeCommit === "object"
-              ? (pr.mergeCommit as { oid?: string }).oid
-              : null,
-          title: pr.title,
-          body: pr.body,
-          url: pr.url,
-        },
-      }));
+      const signals: RawOutcomeSignal[] = [];
+      for (const pr of list) {
+        const mergeSha =
+          pr.mergeCommit && typeof pr.mergeCommit === "object"
+            ? asString((pr.mergeCommit as { oid?: unknown }).oid)
+            : null;
+        // Durable Pipeline-Run / Issue trailers live on the merge commit message
+        // (esp. squash/rebase). PR body is only supplemental — fetch commit text.
+        let commitMessage: string | null = null;
+        if (mergeSha && ctx.gh) {
+          try {
+            const commitRaw = await ctx.gh([
+              "api",
+              `repos/{owner}/{repo}/commits/${mergeSha}`,
+            ]);
+            const commitJson = JSON.parse(commitRaw) as {
+              commit?: { message?: unknown };
+            };
+            commitMessage = asString(commitJson.commit?.message);
+          } catch {
+            // Non-fatal: keep body-only evidence when commit fetch fails.
+            commitMessage = null;
+          }
+        }
+        signals.push({
+          signal_id: `merge:pr:${pr.number}`,
+          kind: "merge" as const,
+          payload: {
+            pr_number: pr.number,
+            merged_at: pr.mergedAt,
+            merge_commit_sha: mergeSha,
+            title: pr.title,
+            body: pr.body,
+            // Preferred linkage source for trailers (see normalize merge path).
+            commit_message: commitMessage,
+            url: pr.url,
+          },
+        });
+      }
+      return signals;
     } catch {
       return [];
     }
@@ -173,7 +198,9 @@ export const githubOutcomeAdapter: OutcomeSourceAdapter = {
       const pr = asNumber(signal.payload.pr_number);
       const mergeSha = normalizeFullSha(asString(signal.payload.merge_commit_sha));
       const mergedAt = asString(signal.payload.merged_at);
-      const body = asString(signal.payload.body) ?? asString(signal.payload.commit_message) ?? "";
+      // Prefer merge-commit message (durable trailers); PR body is supplemental.
+      const commitMessage =
+        asString(signal.payload.commit_message) ?? asString(signal.payload.body) ?? "";
       const title = asString(signal.payload.title) ?? `PR ${pr ?? "?"}`;
       const deployStatusRaw = asString(signal.payload.deploy_status);
       const env = asString(signal.payload.environment);
@@ -188,7 +215,7 @@ export const githubOutcomeAdapter: OutcomeSourceAdapter = {
       });
 
       const link = buildAttributionFromSignal({
-        commit_message: body,
+        commit_message: commitMessage,
         merge_sha: mergeSha ?? deployedSha,
         pr_number: pr ?? undefined,
         issue_number: asNumber(signal.payload.issue_number) ?? undefined,
@@ -218,9 +245,27 @@ export const githubOutcomeAdapter: OutcomeSourceAdapter = {
           : "not_observed";
 
       // Never invent deploy success from merge alone.
+      const resolvedDeployStatus = hasDeploy ? deploy_status : "not_observed";
+      const mergeRollbackOutcomeRaw = asString(signal.payload.rollback_outcome);
+      const mergeRollbackOutcome =
+        mergeRollbackOutcomeRaw === "succeeded" ||
+        mergeRollbackOutcomeRaw === "failed" ||
+        mergeRollbackOutcomeRaw === "unknown" ||
+        mergeRollbackOutcomeRaw === "not_observed"
+          ? mergeRollbackOutcomeRaw
+          : null;
+      let mergeRollbackOccurred: boolean | null =
+        typeof signal.payload.rollback_occurred === "boolean"
+          ? signal.payload.rollback_occurred
+          : null;
+      let mergeRollbackOutcomeResolved = mergeRollbackOutcome;
+      if (resolvedDeployStatus === "rolled_back") {
+        if (mergeRollbackOccurred == null) mergeRollbackOccurred = true;
+        if (mergeRollbackOutcomeResolved == null) mergeRollbackOutcomeResolved = "unknown";
+      }
       const delivery = emptyDeliveryChain({
         environment: env,
-        deploy_status: hasDeploy ? deploy_status : "not_observed",
+        deploy_status: resolvedDeployStatus,
         deployed_candidate_sha: deployedSha,
         merge_status: "merged",
         merged_sha: mergeSha,
@@ -230,21 +275,8 @@ export const githubOutcomeAdapter: OutcomeSourceAdapter = {
           fresh_at: asString(signal.payload.verification_fresh_at),
         },
         rollback: {
-          occurred:
-            typeof signal.payload.rollback_occurred === "boolean"
-              ? signal.payload.rollback_occurred
-              : null,
-          outcome:
-            asString(signal.payload.rollback_outcome) === "succeeded" ||
-            asString(signal.payload.rollback_outcome) === "failed" ||
-            asString(signal.payload.rollback_outcome) === "unknown" ||
-            asString(signal.payload.rollback_outcome) === "not_observed"
-              ? (asString(signal.payload.rollback_outcome) as
-                  | "succeeded"
-                  | "failed"
-                  | "unknown"
-                  | "not_observed")
-              : null,
+          occurred: mergeRollbackOccurred,
+          outcome: mergeRollbackOutcomeResolved,
         },
       });
 
@@ -268,7 +300,9 @@ export const githubOutcomeAdapter: OutcomeSourceAdapter = {
     if (signal.kind === "revert") {
       const pr = asNumber(signal.payload.pr_number);
       const originalPr = asNumber(signal.payload.original_pr);
-      const body = asString(signal.payload.body) ?? asString(signal.payload.commit_message) ?? "";
+      // Prefer merge-commit message (durable trailers); PR body is supplemental.
+      const commitMessage =
+        asString(signal.payload.commit_message) ?? asString(signal.payload.body) ?? "";
       const title = asString(signal.payload.title) ?? `Revert ${originalPr ?? pr ?? "?"}`;
       const mergeSha = normalizeFullSha(asString(signal.payload.merge_commit_sha));
       const at = asString(signal.payload.merged_at) ?? asString(signal.payload.at);
@@ -281,7 +315,7 @@ export const githubOutcomeAdapter: OutcomeSourceAdapter = {
       );
 
       const link = buildAttributionFromSignal({
-        commit_message: body,
+        commit_message: commitMessage,
         merge_sha: mergeSha,
         pr_number: originalPr ?? pr ?? undefined,
         issue_number: asNumber(signal.payload.issue_number) ?? undefined,
@@ -353,6 +387,26 @@ export const githubOutcomeAdapter: OutcomeSourceAdapter = {
                 ? "rolled_back"
                 : "unknown";
 
+      // Explicit rollback fields from provider, else derive from rolled_back state.
+      const rollbackOutcomeRaw = asString(signal.payload.rollback_outcome);
+      const rollbackOutcome =
+        rollbackOutcomeRaw === "succeeded" ||
+        rollbackOutcomeRaw === "failed" ||
+        rollbackOutcomeRaw === "unknown" ||
+        rollbackOutcomeRaw === "not_observed"
+          ? rollbackOutcomeRaw
+          : null;
+      let rollbackOccurred: boolean | null =
+        typeof signal.payload.rollback_occurred === "boolean"
+          ? signal.payload.rollback_occurred
+          : null;
+      let rollbackOutcomeResolved = rollbackOutcome;
+      if (deploy_status === "rolled_back") {
+        // Observed rollback must populate the chain — not leave null/not-observed.
+        if (rollbackOccurred == null) rollbackOccurred = true;
+        if (rollbackOutcomeResolved == null) rollbackOutcomeResolved = "unknown";
+      }
+
       const delivery = emptyDeliveryChain({
         environment: env,
         deploy_status,
@@ -363,6 +417,10 @@ export const githubOutcomeAdapter: OutcomeSourceAdapter = {
           status: "not_observed",
           evidence_ref: asString(signal.payload.url),
           fresh_at: at,
+        },
+        rollback: {
+          occurred: rollbackOccurred,
+          outcome: rollbackOutcomeResolved,
         },
       });
 
