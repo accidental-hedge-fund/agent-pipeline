@@ -1,0 +1,5 @@
+schema: spec-driven
+created: 2026-08-13
+goal: Require authenticated, policy-authorized human attestation on
+  risk-triggered work before implementation; preserve autonomous path when
+  unconfigured or untriggered
