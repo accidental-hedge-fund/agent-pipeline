@@ -834,7 +834,8 @@ test("maybeArchiveOpenspec (#1017 review 2): restore --staged failure → blocks
     `expected blocked on unstage failure; got: ${JSON.stringify(out)}`,
   );
   assert.equal(blocked.length, 1, "setBlocked must be called exactly once");
-  assert.equal(blocked[0].kind, "needs-human");
+  // #1020: residual engine-scratch cleanup failure is harness-failure (recover), not needs-human.
+  assert.equal(blocked[0].kind, "harness-failure");
   assert.match(blocked[0].reason, /restore --staged failed|Unable to create/, "reason must cite unstage failure");
   assert.match(
     blocked[0].reason,
@@ -842,7 +843,7 @@ test("maybeArchiveOpenspec (#1017 review 2): restore --staged failure → blocks
     "reason must disclose still-staged scratch path",
   );
   assert.deepEqual(commitCalls, [], "must NOT commit while scratch remains staged");
-  assert.equal(out.blockerKind, "needs-human");
+  assert.equal(out.blockerKind, "harness-failure");
 });
 
 // Even when restore exits 0, re-read porcelain must confirm scratch is unstaged.
@@ -907,7 +908,8 @@ test("maybeArchiveOpenspec (#1017 review 2): scratch still staged after restore 
     `expected blocked when scratch still staged; got: ${JSON.stringify(out)}`,
   );
   assert.equal(blocked.length, 1, "setBlocked must be called exactly once");
-  assert.equal(blocked[0].kind, "needs-human");
+  // #1020: residual staged engine scratch → harness-failure (workflow-engine-defect recover).
+  assert.equal(blocked[0].kind, "harness-failure");
   assert.match(blocked[0].reason, /remains staged|still staged/i, "reason must cite staged residual");
   assert.match(
     blocked[0].reason,
@@ -916,7 +918,7 @@ test("maybeArchiveOpenspec (#1017 review 2): scratch still staged after restore 
   );
   assert.deepEqual(commitCalls, [], "must NOT commit staged challenge-response JSON");
   assert.ok(statusCalls >= 2, "must re-read porcelain after restore");
-  assert.equal(out.blockerKind, "needs-human");
+  assert.equal(out.blockerKind, "harness-failure");
 });
 
 // Regression (#255 review): a porcelain rename/copy record has a destination outside
