@@ -3,7 +3,7 @@ You are fixing code review findings for issue #{{issue_number}}: {{title}}
 This is fix round {{fix_round}} — addressing findings from the {{review_type}} review.
 
 {{conventions}}
-
+{{ship_path_autonomy_preamble}}
 ## Surgical Fix Discipline (required)
 
 **Make the minimal diff that resolves the specific finding(s) listed below — nothing more.**

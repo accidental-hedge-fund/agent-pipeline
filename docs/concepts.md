@@ -11,6 +11,7 @@ A newcomer who completed Prerequisites, Install, and Quickstart in the README ha
 - [Test/build gate](#testbuild-gate-optional-default-on)
 - [Configurable steps (optional)](#configurable-steps-optional)
 - [External supervisors (compose the CLI)](#external-supervisors-compose-the-cli)
+- [Ship-path autonomy](#ship-path-autonomy)
 - [Human plan feedback (optional)](#human-plan-feedback-optional)
 - [Review severity policy & audited overrides](#review-severity-policy--audited-overrides)
 - [Design-interrogation gate (optional, default off)](#design-interrogation-gate-optional-default-off)
@@ -107,6 +108,17 @@ Portable supervisor contract (intent → CLI, status JSON, multi-platform bootst
 The current Grok profile must use exactly `grok-4.5` for planning,
 implementation, and fixes. It has no Grok fallback. Codex remains the reviewer.
 Product direction: [factory-simplification-plan.md](./factory-simplification-plan.md).
+
+## Ship-path autonomy
+
+Factory memory for train∘loop frontiers, the recovery ladder (classify →
+deterministic recipe → verify/CI → bounded model repair → real human only for
+human-authority classes), false-`needs-human` vs real human handoff, class-over-site
+dogfood fixes, and anti-goals (no merge-in-advance, no second recoverer in
+`train.ts`, no LLM-first recovery). Canonical short doctrine:
+[ship-path-autonomy.md](./ship-path-autonomy.md). Supervisors that hit
+`needs-human` / blocked must read that distinction — not every blocked outcome
+is “wait for a human.”
 
 ### Human plan feedback
 

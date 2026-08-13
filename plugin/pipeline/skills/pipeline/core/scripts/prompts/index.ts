@@ -64,6 +64,36 @@ function loadTemplate(name: string): string {
   return content;
 }
 
+/**
+ * Ship-path autonomy constitution (#1030 / epic #1028). Single-sourced and
+ * versioned — derived from `docs/ship-path-autonomy.md`, not read from disk at
+ * prompt-build time (pin-friendly, offline, mid-run docs edits cannot drift
+ * this block for a live process). Bump the marker version token when the
+ * constitution changes in a way that must reach every new harness load.
+ *
+ * Injected into plan / implement / fix-family / intake-authoring builders only.
+ * Does NOT replace surgical-fix discipline for ordinary product review findings.
+ */
+export const SHIP_PATH_AUTONOMY_PREAMBLE_V1 = `<!-- pipeline-ship-path-autonomy: v1 -->
+## Ship-path autonomy (factory constitution)
+
+- **Ship path:** \`train\` advances base-eligible frontiers via loop/advance; optional serial merge barrier for code-stacked deps when merge is authorized. Not N×\`single\` STOP shells. Advance/loop never merge.
+- **Recovery ladder:** classify → deterministic recipe (unlink scratch, resync, pin head, clear stale block) → verify / re-review / rerun CI → bounded model repair (\`repair_pipeline_item\` / fix harness) → **real** human only for human-authority classes.
+- **False human vs real human:** engine scratch, stale identity/labels, capacity, and workflow-engine defects are **not** janitor / unconditional wait work. True product judgment and missing authority stay parked (handoff such as #647).
+- **Class over site:** engine dogfood failures must land shared classifier / recipe / gate / controller law — a pure path-local mole is incomplete without the class fix.
+- **Anti-goals:** LLM as first recoverer; second recoverer inside \`train.ts\`; PR stacking onto parent PR head; merge inside advance/loop; reversing papercut backlog policy (#538).
+- **Surgical coexistence:** ordinary product review findings still use minimal finding-scoped diffs (no refactors / scope-broadening / opportunistic cleanup), destructive-op scope, and pre-commit self-check. Class-over-site applies to engine recovery / self-host / ship-path dogfood — not a license to broaden ordinary product fixes.
+- **Engine-dogfood plan/intake bar:** when the issue is clearly engine/pipeline self-host or ship-path recover (domain dogfood, labels/theme, body markers), the plan or issue body MUST answer (1) class vs site, (2) which shared classifier/recipe/gate/controller changes, (3) how the next identical fault does not require a new mole issue. Spot-fix-only / path-local-only plans are insufficient for that class.
+`;
+
+/** Templates place `{{ship_path_autonomy_preamble}}` on its own line after
+ *  conventions (or after the opening role line when there is no conventions
+ *  slot). Return the constant as-is — no extra wrapping newlines — so the
+ *  template's surrounding blank lines stay single-spaced (no `\n\n\n`). */
+function shipPathAutonomyPreambleSection(): string {
+  return SHIP_PATH_AUTONOMY_PREAMBLE_V1;
+}
+
 export function substitute(template: string, vars: Record<string, string>): string {
   // Validate placeholders against the TEMPLATE, not the post-substitution
   // output. The output legitimately contains user content (issue bodies,
@@ -115,6 +145,7 @@ export function buildPlanningPrompt(a: BuildPlanArgs): string {
     domain_name: dc.name,
     domain_description: dc.description,
     conventions: readConventions(a.cfg),
+    ship_path_autonomy_preamble: shipPathAutonomyPreambleSection(),
     issue_number: String(a.issueNumber),
     title: a.title,
     body: a.body || "(no description)",
@@ -136,6 +167,7 @@ export function buildPlanningOpenspecPrompt(a: BuildPlanningOpenspecArgs): strin
     domain_name: dc.name,
     domain_description: dc.description,
     conventions: readConventions(a.cfg),
+    ship_path_autonomy_preamble: shipPathAutonomyPreambleSection(),
     issue_number: String(a.issueNumber),
     title: a.title,
     body: a.body || "(no description)",
@@ -235,6 +267,7 @@ export function buildImplementingPrompt(a: BuildImplementingArgs): string {
     domain_name: dc.name,
     domain_description: dc.description,
     conventions: readConventions(a.cfg),
+    ship_path_autonomy_preamble: shipPathAutonomyPreambleSection(),
     issue_number: String(a.issueNumber),
     title: a.title,
     body: a.body || "(no description)",
@@ -515,6 +548,7 @@ export interface BuildFixArgs {
 export function buildFixPrompt(a: BuildFixArgs): string {
   return substitute(loadTemplate("fix"), {
     conventions: readConventions(a.cfg),
+    ship_path_autonomy_preamble: shipPathAutonomyPreambleSection(),
     issue_number: String(a.issueNumber),
     title: a.title,
     fix_round: String(a.fixRound),
@@ -548,6 +582,7 @@ export interface BuildTestFixArgs {
 export function buildTestFixPrompt(a: BuildTestFixArgs): string {
   return substitute(loadTemplate("test_fix"), {
     conventions: readConventions(a.cfg),
+    ship_path_autonomy_preamble: shipPathAutonomyPreambleSection(),
     issue_number: String(a.issueNumber),
     command: a.command,
     attempt: String(a.attempt),
@@ -578,6 +613,7 @@ export interface BuildEvalFixArgs {
 export function buildEvalFixPrompt(a: BuildEvalFixArgs): string {
   return substitute(loadTemplate("eval_fix"), {
     conventions: readConventions(a.cfg),
+    ship_path_autonomy_preamble: shipPathAutonomyPreambleSection(),
     issue_number: String(a.issueNumber),
     command: a.command,
     attempt: String(a.attempt),
@@ -608,6 +644,7 @@ export interface BuildVisualFixArgs {
 export function buildVisualFixPrompt(a: BuildVisualFixArgs): string {
   return substitute(loadTemplate("visual_fix"), {
     conventions: readConventions(a.cfg),
+    ship_path_autonomy_preamble: shipPathAutonomyPreambleSection(),
     issue_number: String(a.issueNumber),
     command: a.command,
     attempt: String(a.attempt),
@@ -848,6 +885,7 @@ export function buildIntakePrompt(a: BuildIntakeArgs): string {
     repo_context: a.repoContext,
     roadmap_context: a.roadmapContext,
     no_tools_instruction: SPEC_GENERATION_TOOL_FREE_BLOCK,
+    ship_path_autonomy_preamble: shipPathAutonomyPreambleSection(),
   });
 }
 
@@ -863,6 +901,7 @@ export function buildSweepPrompt(a: BuildSweepArgs): string {
     existing_body: a.existingBody,
     repo_context: a.repoContext,
     no_tools_instruction: SPEC_GENERATION_TOOL_FREE_BLOCK,
+    ship_path_autonomy_preamble: shipPathAutonomyPreambleSection(),
   });
 }
 
@@ -900,6 +939,7 @@ export function buildRefineSpecPrompt(a: BuildRefineSpecArgs): string {
   return substitute(loadTemplate("refine-spec"), {
     title: a.title,
     body: a.body,
+    ship_path_autonomy_preamble: shipPathAutonomyPreambleSection(),
   });
 }
 
@@ -978,4 +1018,15 @@ export function buildDesignResponsePrompt(a: BuildDesignResponseArgs): string {
 // are exposed so the drift test can assert both review prompts embed the shared
 // constants byte-for-byte. SEVERITY_RUBRIC is exposed for the rubric-content test.
 // carryForwardSection is exposed for injection-boundary fixture tests.
-export const _testing = { loadTemplate, CONFIDENCE_CALIBRATION_BLOCK, NON_BLOCKING_GUIDANCE_BLOCK, SEVERITY_RUBRIC, SPEC_GENERATION_TOOL_FREE_BLOCK, carryForwardSection, crossRepoContextSection, priorRoundsDigestSection, resolvedFindingVerificationSection };
+export const _testing = {
+  loadTemplate,
+  CONFIDENCE_CALIBRATION_BLOCK,
+  NON_BLOCKING_GUIDANCE_BLOCK,
+  SEVERITY_RUBRIC,
+  SPEC_GENERATION_TOOL_FREE_BLOCK,
+  SHIP_PATH_AUTONOMY_PREAMBLE_V1,
+  carryForwardSection,
+  crossRepoContextSection,
+  priorRoundsDigestSection,
+  resolvedFindingVerificationSection,
+};

@@ -1,7 +1,7 @@
 You are a senior engineer authoring an OpenSpec change proposal for {{domain_name}}, {{domain_description}}.
 
 {{conventions}}
-
+{{ship_path_autonomy_preamble}}
 ## Issue #{{issue_number}}: {{title}}
 
 {{body}}{{context_snapshot}}

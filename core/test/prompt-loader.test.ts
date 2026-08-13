@@ -17,11 +17,13 @@ import {
   buildPlanReviewPrompt,
   buildPlanRevisionPrompt,
   buildDeltaReviewPrompt,
+  buildRefineSpecPrompt,
   buildReviewAdversarialPrompt,
   buildReviewStandardPrompt,
   buildSweepPrompt,
   buildTestFixPrompt,
   buildVisualFixPrompt,
+  SHIP_PATH_AUTONOMY_PREAMBLE_V1,
   substitute,
 } from "../scripts/prompts/index.ts";
 import { sanitizeBriefForPrompt } from "../scripts/stages/planning.ts";
@@ -2165,4 +2167,267 @@ test("intake prompt: code-referencing description (#421-shaped) carries the tool
     /no tools|do not explore|write the spec directly/i,
     "the description itself must carry no caller-side tool-free preamble — the prompt template supplies the instruction",
   );
+});
+
+// ---------------------------------------------------------------------------
+// #1030: ship-path autonomy doctrine preamble — version marker, single-source,
+// invariant bullets, surgical coexistence, engine-dogfood class-vs-site bar.
+// ---------------------------------------------------------------------------
+
+const SHIP_PATH_AUTONOMY_MARKER = "<!-- pipeline-ship-path-autonomy: v1 -->";
+
+/** Critical invariant phrases the preamble must carry (drift-guard). */
+const SHIP_PATH_AUTONOMY_INVARIANTS: { name: string; re: RegExp }[] = [
+  { name: "version marker", re: /<!-- pipeline-ship-path-autonomy: v1 -->/ },
+  { name: "recovery ladder order", re: /deterministic recipe/i },
+  { name: "false vs real human", re: /false human|not.*janitor|real human/i },
+  { name: "class over site", re: /class over site/i },
+  { name: "advance/loop never merge anti-goal", re: /Advance\/loop never merge|merge inside advance/i },
+  { name: "engine-dogfood class-vs-site bar", re: /class vs site/i },
+  { name: "spot-fix-only insufficient", re: /spot-fix-only/i },
+  { name: "surgical coexistence", re: /Surgical coexistence|ordinary product review findings/i },
+];
+
+function assertShipPathAutonomyPreamble(out: string, builderName: string): void {
+  assert.ok(
+    out.includes(SHIP_PATH_AUTONOMY_MARKER),
+    `${builderName} must include ship-path autonomy version marker`,
+  );
+  assert.ok(
+    out.includes(SHIP_PATH_AUTONOMY_PREAMBLE_V1),
+    `${builderName} must embed SHIP_PATH_AUTONOMY_PREAMBLE_V1 byte-for-byte`,
+  );
+  assert.ok(
+    out.includes(_testing.SHIP_PATH_AUTONOMY_PREAMBLE_V1),
+    `${builderName} must match _testing export of the shared preamble`,
+  );
+  for (const inv of SHIP_PATH_AUTONOMY_INVARIANTS) {
+    assert.match(out, inv.re, `${builderName} missing autonomy invariant: ${inv.name}`);
+  }
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/, `${builderName} left unfilled placeholders`);
+}
+
+test("ship-path autonomy: preamble constant exposes v1 marker and critical invariants (#1030)", () => {
+  assert.equal(_testing.SHIP_PATH_AUTONOMY_PREAMBLE_V1, SHIP_PATH_AUTONOMY_PREAMBLE_V1);
+  assert.ok(SHIP_PATH_AUTONOMY_PREAMBLE_V1.includes(SHIP_PATH_AUTONOMY_MARKER));
+  for (const inv of SHIP_PATH_AUTONOMY_INVARIANTS) {
+    assert.match(
+      SHIP_PATH_AUTONOMY_PREAMBLE_V1,
+      inv.re,
+      `SHIP_PATH_AUTONOMY_PREAMBLE_V1 missing invariant: ${inv.name}`,
+    );
+  }
+  // Tight constitution — not a full essay dump (order-of-magnitude ≤40 lines).
+  const lineCount = SHIP_PATH_AUTONOMY_PREAMBLE_V1.split("\n").length;
+  assert.ok(lineCount <= 40, `preamble should stay pin-sized (≤40 lines); got ${lineCount}`);
+});
+
+test("ship-path autonomy: planning builders include versioned preamble (#1030)", () => {
+  const cfg = dummyConfig();
+  assertShipPathAutonomyPreamble(
+    buildPlanningPrompt({ cfg, issueNumber: 1030, title: "t", body: "b" }),
+    "buildPlanningPrompt",
+  );
+  assertShipPathAutonomyPreamble(
+    buildPlanningOpenspecPrompt({
+      cfg,
+      issueNumber: 1030,
+      title: "t",
+      body: "b",
+      pipelineRunId: "1030/x",
+    }),
+    "buildPlanningOpenspecPrompt",
+  );
+});
+
+test("ship-path autonomy: implementing builder includes versioned preamble (#1030)", () => {
+  assertShipPathAutonomyPreamble(
+    buildImplementingPrompt({
+      cfg: dummyConfig(),
+      issueNumber: 1030,
+      title: "t",
+      body: "b",
+      plan: "p",
+      pipelineRunId: "1030/x",
+    }),
+    "buildImplementingPrompt",
+  );
+});
+
+test("ship-path autonomy: fix-family builders include versioned preamble (#1030)", () => {
+  const cfg = dummyConfig();
+  assertShipPathAutonomyPreamble(
+    buildFixPrompt({
+      cfg,
+      issueNumber: 1030,
+      title: "t",
+      reviewFindings: "f",
+      fixRound: 1,
+      pipelineRunId: "1030/x",
+    }),
+    "buildFixPrompt",
+  );
+  assertShipPathAutonomyPreamble(
+    buildTestFixPrompt({
+      cfg,
+      issueNumber: 1030,
+      command: "npm test",
+      attempt: 1,
+      maxAttempts: 3,
+      output: "fail",
+      pipelineRunId: "1030/x",
+    }),
+    "buildTestFixPrompt",
+  );
+  assertShipPathAutonomyPreamble(
+    buildEvalFixPrompt({
+      cfg,
+      issueNumber: 1030,
+      command: "npm run eval",
+      attempt: 1,
+      maxAttempts: 3,
+      output: "fail",
+      pipelineRunId: "1030/x",
+    }),
+    "buildEvalFixPrompt",
+  );
+  assertShipPathAutonomyPreamble(
+    buildVisualFixPrompt({
+      cfg,
+      issueNumber: 1030,
+      command: "npm run visual",
+      attempt: 1,
+      maxAttempts: 3,
+      output: "fail",
+      artifacts: "(none)",
+      pipelineRunId: "1030/x",
+    }),
+    "buildVisualFixPrompt",
+  );
+});
+
+test("ship-path autonomy: authoring builders include versioned preamble (#1030)", () => {
+  assertShipPathAutonomyPreamble(
+    buildIntakePrompt({
+      description: "d",
+      repoContext: "acme/widget",
+      roadmapContext: "v1",
+    }),
+    "buildIntakePrompt",
+  );
+  assertShipPathAutonomyPreamble(
+    buildRefineSpecPrompt({ title: "t", body: "b" }),
+    "buildRefineSpecPrompt",
+  );
+  assertShipPathAutonomyPreamble(
+    buildSweepPrompt({
+      issueTitle: "t",
+      existingBody: "b",
+      repoContext: "acme/widget",
+    }),
+    "buildSweepPrompt",
+  );
+});
+
+test("ship-path autonomy: listed builders share the same preamble block (#1030)", () => {
+  const cfg = dummyConfig();
+  const samples = [
+    buildPlanningPrompt({ cfg, issueNumber: 1, title: "t", body: "b" }),
+    buildImplementingPrompt({
+      cfg,
+      issueNumber: 1,
+      title: "t",
+      body: "b",
+      plan: "p",
+      pipelineRunId: "1/x",
+    }),
+    buildFixPrompt({
+      cfg,
+      issueNumber: 1,
+      title: "t",
+      reviewFindings: "f",
+      fixRound: 1,
+      pipelineRunId: "1/x",
+    }),
+    buildIntakePrompt({ description: "d", repoContext: "r", roadmapContext: "v" }),
+  ];
+  for (const out of samples) {
+    assert.ok(
+      out.includes(SHIP_PATH_AUTONOMY_PREAMBLE_V1),
+      "each listed builder must embed the same shared preamble text",
+    );
+  }
+});
+
+test("ship-path autonomy: fix prompt still carries surgical discipline with preamble present (#1030)", () => {
+  const out = buildFixPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 1030,
+    title: "coexistence",
+    reviewFindings: "FINDINGS",
+    fixRound: 1,
+    pipelineRunId: "1030/x",
+  });
+  assert.ok(out.includes(SHIP_PATH_AUTONOMY_MARKER), "autonomy marker required");
+  // Surgical triad still present (#235 / surgical-fix-rounds coexistence).
+  assert.match(out, /minimal diff/i);
+  assert.match(out, /Do NOT refactor|do NOT refactor/i);
+  assert.match(out, /Do NOT broaden|do NOT broaden/i);
+  assert.match(out, /unrelated changes|opportunistic cleanup/);
+  assert.match(out, /worktree remove --force|push --force/);
+  assert.match(out, /managed worktree root|reviewed head/);
+  assert.match(out, /do NOT push|withhold the push/i);
+  // Autonomy must not instruct ignoring surgical rules for ordinary product findings.
+  assert.doesNotMatch(
+    out,
+    /ignore surgical|skip surgical|always broaden|always refactor ordinary/i,
+  );
+  // Surgical section remains a leading discipline before Review Findings.
+  assert.ok(
+    out.indexOf("Surgical Fix Discipline") < out.indexOf("## Review Findings"),
+    "Surgical Fix Discipline must remain a leading section before Review Findings",
+  );
+});
+
+test("ship-path autonomy: planning and intake carry engine-dogfood class-vs-site bar (#1030)", () => {
+  const plan = buildPlanningPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 1030,
+    title: "engine recover",
+    body: "pipeline self-host",
+  });
+  const intake = buildIntakePrompt({
+    description: "engine dogfood",
+    repoContext: "agent-pipeline",
+    roadmapContext: "v1.38.1",
+  });
+  const refine = buildRefineSpecPrompt({ title: "t", body: "b" });
+  const sweep = buildSweepPrompt({
+    issueTitle: "t",
+    existingBody: "b",
+    repoContext: "agent-pipeline",
+  });
+  for (const [name, out] of [
+    ["planning", plan],
+    ["intake", intake],
+    ["refine-spec", refine],
+    ["sweep", sweep],
+  ] as const) {
+    assert.match(out, /class vs site/i, `${name} must require class vs site answers`);
+    assert.match(
+      out,
+      /shared classifier|recipe|gate|controller/i,
+      `${name} must name shared surfaces that land class law`,
+    );
+    assert.match(
+      out,
+      /spot-fix-only|path-local-only/i,
+      `${name} must call out spot-fix-only plans as insufficient for engine dogfood`,
+    );
+    assert.match(
+      out,
+      /new mole issue|mole issue/i,
+      `${name} must require non-recurrence without a new mole issue`,
+    );
+  }
 });
