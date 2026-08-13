@@ -3853,8 +3853,9 @@ async function main(): Promise<void> {
         profile: opts.profile,
         progress: (message: string) => process.stderr.write(`${message}\n`),
         authorizationPublicKey,
-        advanceIssue: (issue: number) =>
-          advanceIssueThroughSingle(issue, opts, shipTrainReadDeps.getIssue),
+        // Same multi-item loop wave as `runTrainCommand` — not N×single (#1023 / #1028).
+        advanceWave: (issues) =>
+          advanceWaveThroughLoop(issues, opts, shipTrainReadDeps.getIssue),
         state: shipState,
       });
       try {

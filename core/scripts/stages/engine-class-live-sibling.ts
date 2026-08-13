@@ -172,6 +172,100 @@ function evidenceKeyInBody(body: string, key: string): boolean {
 }
 
 /**
+ * Rate-cap membership for engine-class live siblings (same rule for pre-create
+ * deferral and post-create overflow). Marker-scoped open issues only; GitHub
+ * state is authoritative across hosts (#631 / #1028).
+ */
+export function countsTowardEngineClassLiveSiblingRateCap(
+  issue: OpenSiblingIssue,
+  cutoffMs: number,
+): boolean {
+  if (issue.state !== "OPEN") return false;
+  if (!hasMarker(issue.body ?? "")) return false;
+  const createdMs = Date.parse(issue.createdAt);
+  return Number.isFinite(createdMs) && createdMs >= cutoffMs;
+}
+
+/**
+ * Post-create read-back: close title/evidence-key duplicates and category-wide
+ * rate-cap overflow down to the lowest-numbered open survivors. Failures are
+ * non-fatal (a later trigger re-reconciles).
+ */
+async function reconcileEngineClassLiveSiblingPostCreate(
+  title: string,
+  evidenceKey: string,
+  deps: EngineClassLiveSiblingDeps,
+  cutoffMs: number,
+  maxPerWindow: number,
+): Promise<void> {
+  let after: OpenSiblingIssue[];
+  try {
+    after = await deps.listOpenImproveIssues();
+  } catch (err) {
+    deps.log(
+      `[engine-class-live-sibling] post-create list failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return;
+  }
+
+  const closedNumbers = new Set<number>();
+
+  // 1) Duplicate title / evidence_key → keep lowest number.
+  const dups = after
+    .filter(
+      (i) =>
+        i.state === "OPEN" &&
+        hasMarker(i.body) &&
+        (i.title === title || evidenceKeyInBody(i.body, evidenceKey)),
+    )
+    .sort((a, b) => a.number - b.number);
+  if (dups.length > 1) {
+    const survivor = dups[0]!;
+    for (const d of dups.slice(1)) {
+      try {
+        await deps.closeIssue(
+          d.number,
+          `Cross-host reconcile: keeping lowest-numbered engine-class live sibling #${survivor.number}.`,
+        );
+        closedNumbers.add(d.number);
+        deps.log(
+          `[engine-class-live-sibling] reconciled cross-host duplicate — closed #${d.number}, kept #${survivor.number}`,
+        );
+      } catch (err) {
+        deps.log(
+          `[engine-class-live-sibling] reconcile close failed (non-fatal) for #${d.number}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+  }
+
+  // 2) Category-wide in-window rate cap (distinct keys can overshoot across
+  // hosts when only host-local lock guards pre-create). Same membership as
+  // pre-create; survivors = lowest issue numbers.
+  const inWindow = after
+    .filter((i) => countsTowardEngineClassLiveSiblingRateCap(i, cutoffMs))
+    .filter((i) => !closedNumbers.has(i.number))
+    .sort((a, b) => a.number - b.number);
+  for (const over of inWindow.slice(maxPerWindow)) {
+    try {
+      await deps.closeIssue(
+        over.number,
+        `Closed to enforce the engine-class live-sibling rate cap (${maxPerWindow} per window) — a concurrent ` +
+          `pipeline run on another host filed past the cap before this host's pre-create check observed it ` +
+          `(cross-host auto-file reconciliation).`,
+      );
+      deps.log(
+        `[engine-class-live-sibling] reconciled rate-cap overflow — closed #${over.number}`,
+      );
+    } catch (err) {
+      deps.log(
+        `[engine-class-live-sibling] rate-cap reconcile close failed (non-fatal) for #${over.number}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+}
+
+/**
  * File at most one live sibling for the evidence key. Never triggers for
  * human-decision or product dirt (caller responsibility). Non-fatal total.
  */
@@ -200,6 +294,7 @@ export async function autoFileEngineClassLiveSibling(
       const all = await deps.listOpenImproveIssues();
       const now = deps.now();
       const windowMs = opts.windowHours * 3600_000;
+      const cutoffMs = now - windowMs;
       const openMarked = all.filter(
         (i) => i.state === "OPEN" && hasMarker(i.body),
       );
@@ -212,11 +307,10 @@ export async function autoFileEngineClassLiveSibling(
       if (existing) {
         return { filed: false, issueNumber: existing.number, skippedReason: "duplicate evidence_key" };
       }
-      // Rate cap: open marked siblings in window.
-      const inWindow = openMarked.filter((i) => {
-        const t = Date.parse(i.createdAt);
-        return Number.isFinite(t) && now - t <= windowMs;
-      });
+      // Rate cap: open marked siblings in window (same predicate as post-create).
+      const inWindow = openMarked.filter((i) =>
+        countsTowardEngineClassLiveSiblingRateCap(i, cutoffMs),
+      );
       if (inWindow.length >= opts.maxPerWindow) {
         return { filed: false, skippedReason: "rate-cap" };
       }
@@ -231,23 +325,14 @@ export async function autoFileEngineClassLiveSibling(
       const m = url.match(/\/issues\/(\d+)/);
       const issueNumber = m ? Number(m[1]) : undefined;
 
-      // Post-create reconcile: close title duplicates down to lowest number.
-      try {
-        const after = await deps.listOpenImproveIssues();
-        const dups = after
-          .filter((i) => i.state === "OPEN" && (i.title === title || evidenceKeyInBody(i.body, opts.evidenceKey)))
-          .sort((a, b) => a.number - b.number);
-        for (const d of dups.slice(1)) {
-          await deps.closeIssue(
-            d.number,
-            `Cross-host reconcile: keeping lowest-numbered engine-class live sibling #${dups[0]!.number}.`,
-          );
-        }
-      } catch (err) {
-        deps.log(
-          `[engine-class-live-sibling] post-create reconcile failed: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      }
+      // Post-create: title/key dups + category-wide rate-cap overflow (GitHub-authoritative).
+      await reconcileEngineClassLiveSiblingPostCreate(
+        title,
+        opts.evidenceKey,
+        deps,
+        cutoffMs,
+        opts.maxPerWindow,
+      );
 
       deps.log(
         `[engine-class-live-sibling] filed sibling for #${opts.recoveredIssue} evidence=${opts.evidenceKey}` +
