@@ -413,6 +413,25 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
     supportsJson: true,
   },
 
+  // Production/rework outcome ingest + list (#576). Host-local store only;
+  // never mutates GitHub labels, stages, worktrees, or merge state.
+  outcomes: {
+    needsIssueNumber: false,
+    allowedFlags: new Set([
+      "repoPath",
+      "json",
+      "dryRun",
+      "days",
+      "adapter",
+      "retentionDays",
+      "fixture",
+    ]),
+    needsConfig: false,
+    needsGhAuth: false,
+    mutatesGitHub: false,
+    supportsJson: true,
+  },
+
   roadmap: {
     needsIssueNumber: false,
     allowedFlags: new Set(["repoPath", "base", "profile", "apply", "next", "dryRun"]),

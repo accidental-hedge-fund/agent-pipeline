@@ -218,8 +218,17 @@ export const COMMAND_DOCS: Record<string, CommandDoc> = {
   scoreboard: {
     summary:
       "Print read-only factory throughput/cost/reliability metrics from run artifacts " +
-      "(incl. human-touch, escape-recurrence, discovery-channel, stratified stabilization; #763)",
+      "(incl. human-touch, escape-recurrence, discovery-channel, stratified stabilization; #763; production outcomes #576)",
     usage: "scoreboard [--days <n>|--since <iso>] [--until <iso>] [--bucket day|week] [--by <dim>] [--json] [--html <path>]",
+    documented: true,
+    section: "observability",
+  },
+  outcomes: {
+    summary:
+      "Ingest or list production/rework outcomes linked to pipeline runs (host-local store; #576). " +
+      "R2D alone is never production delivery; free text is redacted; no GitHub mutations",
+    usage:
+      "outcomes ingest|list [--adapter github] [--fixture <path>] [--days <n>] [--retention-days <n>] [--dry-run] [--json]",
     documented: true,
     section: "observability",
   },
