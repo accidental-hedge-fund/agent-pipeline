@@ -130,6 +130,7 @@ import {
   mapStageToPhase,
   unavailableActiveEffort,
 } from "./planning-leverage/schema.ts";
+import { resolvePlanningLeverageSelection } from "./planning-leverage/selection.ts";
 import { toPreMergeOfframpClass } from "./pre-merge-offramp.ts";
 import { buildStageDiagnostic, projectStageDiagnostic } from "./stage-diagnostic.ts";
 import { autoFileCorrections, autoFilePapercuts, realAutoFileDeps } from "./stages/papercut.ts";
@@ -998,6 +999,15 @@ export async function runAdvance(
     let runDir: string | undefined;
     /** Open planning-leverage phase instances keyed by delivery phase (#702). */
     const openPhaseInstances = new Map<string, { phase_instance_id: string; started_at: string }>();
+    /**
+     * Selected planning depth / risk for this run (#702). Resolved once from
+     * authoritative config (and optional declared risk classes when supplied).
+     * `unknown` only when no selection can be determined — never hard-coded.
+     */
+    const plSelection = resolvePlanningLeverageSelection({
+      plan_review: cfg.steps?.plan_review,
+      planning_effort: cfg.effort?.planning ?? cfg.plan_review_effort,
+    });
     let terminalTee: TerminalLogTee | undefined;
     // Engine identity this run is pinned to (#450) — resolved once at run start
     // and compared against the on-disk identity at each stage boundary below.
@@ -2044,8 +2054,9 @@ export async function runAdvance(
               pipeline_stage: auditStage,
               boundary: "start",
               phase_instance_id: phaseInstanceId,
-              planning_depth: "unknown",
-              risk_class: "unknown",
+              planning_depth: plSelection.planning_depth,
+              risk_class: plSelection.risk_class,
+              risk_classes: plSelection.risk_classes,
               started_at: stageEnteredAt,
               ended_at: null,
               active_effort: unavailableActiveEffort(),
@@ -2146,8 +2157,9 @@ export async function runAdvance(
               pipeline_stage: auditStage,
               boundary: "end",
               phase_instance_id: phaseInstanceId,
-              planning_depth: "unknown",
-              risk_class: "unknown",
+              planning_depth: plSelection.planning_depth,
+              risk_class: plSelection.risk_class,
+              risk_classes: plSelection.risk_classes,
               started_at: startedAt,
               ended_at: stageExitedAt,
               active_effort: unavailableActiveEffort(),
@@ -2158,21 +2170,16 @@ export async function runAdvance(
           const fixRound = fixRoundFromStage(auditStage);
           if (fixRound != null) {
             // Lifecycle boundary lacks scope/interface/replan/blocking-count
-            // evidence. Do not treat stage name fix-2 as multi_round_blocking.
-            // Emit ordinary when only formatting-level signals are known absent;
-            // richer classifiers may re-emit later with explicit criteria.
+            // evidence. Do not invent ordinary when criteria cannot be observed.
+            // Emit unknown; richer review/fix classifiers may re-emit later
+            // with affirmative sufficient evidence or explicit criteria.
             await emitMaterialRework(
               runDir,
               {
                 run_id: runIdForPl,
                 issue: issueNumber,
                 evidence: {
-                  evidence_sufficient: true,
-                  blocking_fix_rounds: 1,
-                  scope_expansion: false,
-                  design_interface_change: false,
-                  replan_or_assumption_reopen: false,
-                  engine_material_class: false,
+                  evidence_sufficient: false,
                 },
                 fix_round: fixRound,
                 phase_instance_id: phaseInstanceId,

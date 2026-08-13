@@ -10,6 +10,7 @@ export * from "./assumptions.ts";
 export * from "./emit.ts";
 export * from "./snapshot.ts";
 export * from "./linkage.ts";
+export * from "./selection.ts";
 export {
   aggregatePlanningLeverageScoreboardSection,
   emptyPlanningLeverageScoreboardSection,
