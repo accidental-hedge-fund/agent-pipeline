@@ -1,26 +1,17 @@
-# #1028 — train∘loop ship path autonomy
+# #1025 — Stale blocked after HEAD moves past reviewed-sha must re-review
 
-## Plan
+## Status
 
-- [x] OpenSpec validate `train-loop-ship-path-autonomy`
-- [x] #1020 engine-scratch recover (`unlink_engine_scratch` before repair)
-- [x] #1025 stale blocked re-review on enter
-- [x] #1023 train base-eligible frontiers + one advance-wave per frontier
-- [x] #1021 engine-class live sibling auto-file
-- [x] plugin mirror + docs regenerate
-- [ ] `npm run ci` green
+Implementation complete for full #1025 contract on top of epic #1028 first cut.
+
+## What changed
+
+- `tryResumeStaleBlocked`: clear on currency `unknown` when H ≠ S (rebase / S absent / unclassifiable), not permanent keep.
+- Keep when H == S, currency `current` (internal-only #98), or PR/head unreadable.
+- Unit matrix expanded (13 tests): clear, same-head, internal-only, rebase-unknown, unreadable PR/head, no override, real `resolveReviewedShaCurrency` shared helper.
+- Advance enter-path wiring already present in `pipeline-run.ts` (continue after clear).
+
+## Remaining
+
+- [ ] `openspec validate` + `npm run ci`
 - [ ] Commit with Issue/Pipeline-Run trailers
-
-## Review
-
-### What changed
-
-- Recovery: `unlink_engine_scratch` recipe + default order before `repair_pipeline_item` on workflow-engine-defect
-- Advance: stale-block resume clears leftover `blocked` when HEAD past reviewed-sha with non-internal commits
-- Train: frontier waves via `advanceWave` / multi-item loop; independent merge while peer parked
-- Live sibling: ready-labeled milestone sibling after engine-scratch recover
-
-### Verification
-
-- Targeted unit suites for train, recovery, stale-block, live sibling, worktree-dirt
-- Full `npm run ci` pending

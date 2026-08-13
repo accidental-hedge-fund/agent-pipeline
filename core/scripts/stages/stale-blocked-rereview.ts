@@ -1,9 +1,13 @@
 // Stale blocked resume on enter (#1025 / #1028).
 //
-// When an item already carries `blocked` and advance re-enters pre-merge (or
-// fix), compare the blocking reviewed-sha S to PR HEAD H. If H supersedes S with
-// at least one non-pipeline-internal commit, clear the leftover block so the
-// stage path re-runs delta / full re-review. Does not invent --override.
+// When an item already carries `blocked` and advance re-enters pre-merge / fix /
+// review, compare the blocking reviewed-sha S to PR HEAD H. Clear leftover
+// `blocked` and re-enter review when:
+//   - currency is `superseded` (non-pipeline-internal commit in S..H), or
+//   - currency is `unknown` and H ≠ S (rebase/squash / S absent / unclassifiable
+//     history — cannot prove pipeline-internal-only tip advance).
+// Keep when H == S, when currency is `current` (internal-only / #98), or when
+// PR/head cannot be read. Does not invent --override.
 
 import {
   clearBlocked,
@@ -47,9 +51,11 @@ export function stageEligibleForStaleBlockedResume(stage: string | null | undefi
 
 /**
  * On enter of an already-blocked item: if PR HEAD supersedes the blocking
- * reviewed-sha with a non-pipeline-internal commit, clear `blocked` so advance
+ * reviewed-sha with a non-pipeline-internal commit — or history no longer
+ * contains that sha while HEAD moved (rebase) — clear `blocked` so advance
  * re-enters review / pre-merge. Pipeline-internal-only ranges keep the block
- * (verdict reuse #98). HEAD still equal to S keeps the block.
+ * (verdict reuse #98). HEAD still equal to S keeps the block. Unreadable PR
+ * or head fails closed (keep). Never writes --override.
  */
 export async function tryResumeStaleBlocked(
   cfg: PipelineConfig,
@@ -100,6 +106,8 @@ export async function tryResumeStaleBlocked(
     };
   }
 
+  // Shared supersession classification with the pre-merge SHA gate (#1025
+  // review-sha-gating ADDED requirement).
   const currency = await resolveCurrency(cfg, prNumber, reviewedSha, {
     getPrDetail: getDetailPr,
     getPrCommits: getCommits,
@@ -113,15 +121,20 @@ export async function tryResumeStaleBlocked(
         `PR HEAD ${headSha.slice(0, 7)} supersedes ${reviewedSha.slice(0, 7)} with only pipeline-internal commits; keeping block/verdict`,
     };
   }
-  if (currency.status === "unknown") {
-    // Fail closed: do not clear without positive non-internal supersession proof.
-    return {
-      kind: "keep",
-      reason: `cannot classify commits between reviewed-sha and HEAD; keeping block`,
-    };
-  }
 
-  // superseded — at least one non-pipeline-internal commit
+  // Design D2 (#1025):
+  // - superseded → clear (non-internal in S..H)
+  // - unknown + H ≠ S → clear (S absent / rebase / unclassifiable; cannot prove
+  //   internal-only). Head unreadable already returned keep above.
+  const clearedHead = currency.status === "superseded" ? currency.headSha : headSha;
+  const clearReason =
+    currency.status === "superseded"
+      ? `cleared stale blocked: HEAD ${clearedHead.slice(0, 7)} supersedes reviewed-sha ` +
+        `${reviewedSha.slice(0, 7)} with non-pipeline-internal commit(s); re-review will run`
+      : `cleared stale blocked: cannot prove pipeline-internal-only between reviewed-sha ` +
+        `${reviewedSha.slice(0, 7)} and HEAD ${clearedHead.slice(0, 7)} ` +
+        `(rebase/squash or unclassifiable history); re-review will run`;
+
   try {
     await clear(cfg, issueNumber);
   } catch (err) {
@@ -134,9 +147,7 @@ export async function tryResumeStaleBlocked(
   return {
     kind: "cleared",
     reviewedSha,
-    headSha: currency.headSha,
-    reason:
-      `cleared stale blocked: HEAD ${currency.headSha.slice(0, 7)} supersedes reviewed-sha ` +
-      `${reviewedSha.slice(0, 7)} with non-pipeline-internal commit(s); re-review will run`,
+    headSha: clearedHead,
+    reason: clearReason,
   };
 }
