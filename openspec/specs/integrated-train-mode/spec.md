@@ -106,6 +106,8 @@ When `--merge` is provided, the train SHALL integrate work through **base-eligib
 - **AND** it SHALL advance the item toward ready-to-deploy in an eligible frontier
 - **AND** if a new open linked PR exists after advance, the train SHALL merge that PR under the normal merge path
 
+---
+
 ### Requirement: Train status and events SHALL be machine-readable for supervisors
 
 The train SHALL expose a status read model (CLI status and/or JSON events) that includes train identity, ordered issue list, current issue, current stage or item state, linked PR when known, last merge-result identity when known, next action, and blocker if stopped. Notification failure by an external supervisor SHALL NOT change train or Pipeline state.
@@ -263,5 +265,27 @@ When one frontier member is parked or blocked and another is ready-to-deploy wit
 - **WHEN** item P is parked and item S is ready-to-deploy but independence cannot be proven from deps/ledger
 - **THEN** the train SHALL NOT merge S under the independent-sibling rule
 - **AND** SHALL fail closed with a typed blocker or serialize until independence is proven
+
+### Requirement: Production train and ship entry points SHALL inject multi-item loop advance waves
+
+When `pipeline train` runs in production (including the ship / Tugboat path that invokes train with merge authorization), the entry point SHALL supply a multi-item advance-wave function whose work list is the current base-eligible frontier and that runs the durable loop engine (or an equivalent multi-item advance-wave implementation that preserves loop recovery and co-advance rules). Production entry points SHALL NOT default to serial N× one-item `single` advance for frontier members, and SHALL NOT default to an adapter that only serializes single-item advances as the production path. Test doubles MAY inject fakes that record call shape without invoking the live loop engine. A thin single-item serial adapter MAY exist for tests or non-production adapters that lack a loop engine, but it SHALL NOT be the production train or ship wiring.
+
+#### Scenario: Production train entry wires multi-item loop advance
+
+- **WHEN** production `pipeline train` advances a frontier of two or more issues
+- **THEN** the production entry point SHALL invoke one multi-item loop/advance-wave call for that frontier
+- **AND** it SHALL NOT loop N× one-item `single` for those frontier members as the production path
+
+#### Scenario: Ship train path matches train multi-item wiring
+
+- **WHEN** the ship / Tugboat path runs train with merge authorization
+- **THEN** it SHALL use the same multi-item loop/advance-wave production wiring class as `pipeline train`
+- **AND** it SHALL NOT introduce a production N×`single` advance path
+
+#### Scenario: Injected tests assert call shape without live network
+
+- **WHEN** unit tests exercise frontier advance
+- **THEN** they SHALL inject train/loop deps (or fakes) so no real network, git, or subprocess is required
+- **AND** they SHALL be able to assert that one multi-item advance-wave call is made per frontier
 
 ---
