@@ -945,6 +945,54 @@ export async function runPlanningPhases(
     console.log(`[pipeline] #${issueNumber}: plan-review step disabled; implementing from the original artifact`);
   }
 
+  // ---- pre-code attestation gate (#575) before implementing ----
+  // Structural stage between plan-review and implementing. When the gate is
+  // disabled or untriggered, we record the inert reason and continue into
+  // implementing in this same advance. When triggered without a current
+  // approve, we transition to pre-code-attestation, block with a typed hold,
+  // and stop — resume re-enters via the pre-code-attestation stage dispatch.
+  {
+    const { evaluatePreCodeGateForPlanning } = await import("./pre_code_attestation.ts");
+    const gateIssue = await (deps.getIssueDetail ?? getIssueDetail)(cfg, issueNumber);
+    const gateEval = await evaluatePreCodeGateForPlanning(
+      cfg,
+      issueNumber,
+      revisedPlan,
+      {
+        stateDir: opts.stateDir,
+        comments: gateIssue.comments ?? [],
+        labels: gateIssue.labels ?? [],
+      },
+    );
+    if (!gateEval.mayImplement) {
+      await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
+      await doTransition(
+        cfg,
+        issueNumber,
+        preImplStage,
+        "pre-code-attestation",
+        `pre-code attestation required (${gateEval.state.outcome ?? "hold"})`,
+      );
+      await doSetBlocked(
+        cfg,
+        issueNumber,
+        gateEval.reason,
+        "pre-code-attestation",
+        gateEval.blockerKind,
+      );
+      return blockedOutcome(gateEval.reason, gateEval.blockerKind);
+    }
+    if (gateEval.state.outcome === "gate-disabled" || gateEval.state.outcome === "no-trigger-matched") {
+      console.log(
+        `[pipeline] #${issueNumber}: pre-code-attestation inert (${gateEval.state.outcome}); continuing to implementing`,
+      );
+    } else if (gateEval.state.outcome === "approved") {
+      console.log(
+        `[pipeline] #${issueNumber}: pre-code-attestation already approved; continuing to implementing`,
+      );
+    }
+  }
+
   // ---- → implementing ----
   await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "advanced", wt.path);
   await doTransition(

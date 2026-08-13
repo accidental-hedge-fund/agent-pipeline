@@ -6,6 +6,13 @@ The label-driven state machine at the heart of the pipeline: the canonical order
 ### Requirement: Canonical ordered stage sequence
 The pipeline SHALL define its stages as an ordered constant `STAGES` in `core/scripts/types.ts`. Each stage is represented on an issue by the label `pipeline:<stage>` (prefix `LABEL_PREFIX = "pipeline:"`), and an issue carries at most one `pipeline:<stage>` label at a time.
 
+`pre-code-attestation` (#575) SHALL sit between `plan-review` and `implementing`. It is always
+present in the graph, but it is inert unless `pre_code_attestation.enabled` is true and a risk
+trigger matches: when disabled or untriggered it SHALL advance toward `implementing` with a
+recorded reason and without a human attestation hold. Gate behavior is specified by the
+`pre-code-attestation` and `pre-code-design-dossier` capabilities. It SHALL NOT replace
+`plan-review` or `design-gate`.
+
 `design-gate` (#436) SHALL sit between `implementing` and `review-1`. It is always traversed, but it is
 inert unless the design-interrogation gate is enabled and a risk trigger matches: when disabled or
 untriggered it SHALL advance immediately to `review-1` with a recorded reason and no harness call. Its
@@ -18,13 +25,24 @@ surfaces are specified by the `needs-human-status-surface` and override-related 
 
 #### Scenario: STAGES order
 - **WHEN** the `STAGES` constant is inspected
-- **THEN** it SHALL list, in order: `backlog`, `ready`, `planning`, `plan-review`, `implementing`, `design-gate`, `review-1`, `fix-1`, `review-2`, `fix-2`, `pre-merge`, `visual-gate`, `eval-gate`, `shipcheck-gate`, `ready-to-deploy`, `needs-human`
+- **THEN** it SHALL list, in order: `backlog`, `ready`, `planning`, `plan-review`, `pre-code-attestation`, `implementing`, `design-gate`, `review-1`, `fix-1`, `review-2`, `fix-2`, `pre-merge`, `visual-gate`, `eval-gate`, `shipcheck-gate`, `ready-to-deploy`, `needs-human`
+- **AND** `pre-code-attestation` SHALL appear at an index greater than `plan-review` and less than `implementing`
 - **AND** `design-gate` SHALL appear at an index greater than `implementing` and less than `review-1`
 - **AND** `visual-gate` SHALL appear at an index greater than `pre-merge` and less than `eval-gate`
 - **AND** `eval-gate` SHALL appear at an index greater than `visual-gate` and less than `shipcheck-gate`
 - **AND** `shipcheck-gate` SHALL appear at an index greater than `eval-gate` and less than `ready-to-deploy`
 - **AND** `needs-human` SHALL appear after `ready-to-deploy` in the constant order
 - **AND** `needs-human` SHALL be a member of `TERMINAL_STAGES`
+
+#### Scenario: dispatch routes pre-code-attestation
+- **WHEN** the current stage label is `pipeline:pre-code-attestation`
+- **THEN** the orchestrator SHALL call the pre-code attestation stage handler
+- **AND** SHALL NOT call the implementing handler in the same transition until the stage advances
+
+#### Scenario: disabled pre-code-attestation is a no-op pass-through
+- **WHEN** the current stage is `pre-code-attestation` and `cfg.pre_code_attestation.enabled` is `false`
+- **THEN** the issue SHALL transition toward `implementing` in the same run
+- **AND** no human attestation SHALL be required by this stage
 
 #### Scenario: dispatch routes design-gate
 - **WHEN** the current stage label is `pipeline:design-gate`
@@ -501,4 +519,40 @@ The pipeline CLI dispatch block SHALL accept `decompose` as a recognized positio
 
 - **WHEN** the user runs `pipeline --help`
 - **THEN** the output SHALL include `decompose` in the list of recognized sub-command keywords alongside peer no-issue-number modes
+
+### Requirement: STAGES SHALL include pre-code-attestation between plan-review and implementing
+
+The ordered `STAGES` constant SHALL include `pre-code-attestation` after `plan-review` and before
+`implementing`. The stage is always present in the graph but is **inert unless**
+`cfg.pre_code_attestation.enabled` is true and a risk trigger matches. When disabled or untriggered,
+the stage SHALL advance immediately toward `implementing` with a recorded reason and without a human
+attestation hold. Gate behavior is specified by the `pre-code-attestation` and
+`pre-code-design-dossier` capabilities. This stage SHALL NOT replace `plan-review` or `design-gate`,
+and SHALL NOT introduce additional mandatory Product, Architecture, Program Design, or Vertical
+Slice stages.
+
+#### Scenario: STAGES order includes pre-code-attestation
+
+- **WHEN** the `STAGES` constant is inspected
+- **THEN** `pre-code-attestation` SHALL appear at an index greater than `plan-review` and less than `implementing`
+- **AND** `design-gate` SHALL remain between `implementing` and `review-1`
+
+#### Scenario: dispatch routes pre-code-attestation
+
+- **WHEN** the current stage label is `pipeline:pre-code-attestation`
+- **THEN** the orchestrator SHALL call the pre-code attestation stage handler
+- **AND** SHALL NOT call the implementing handler in the same transition until the stage advances
+
+#### Scenario: disabled gate is a no-op pass-through
+
+- **WHEN** the current stage is `pre-code-attestation` and `cfg.pre_code_attestation.enabled` is `false`
+- **THEN** the issue SHALL transition toward `implementing` in the same run
+- **AND** no human attestation SHALL be required by this stage
+
+#### Scenario: untriggered enabled gate is a no-op pass-through
+
+- **WHEN** the current stage is `pre-code-attestation`, the gate is enabled, and no risk trigger matches
+- **THEN** the issue SHALL transition toward `implementing` in the same run
+- **AND** the stage record SHALL carry reason `no-trigger-matched`
+)
 

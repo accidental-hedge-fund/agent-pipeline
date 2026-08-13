@@ -21,6 +21,7 @@ const REPO_ROOT = join(__dirname, "..", "..");
 /** Stages that host SKILL diagrams historically omitted and must name. */
 const REQUIRED_HOST_STAGES = [
   "plan-review",
+  "pre-code-attestation",
   "design-gate",
   "visual-gate",
   "needs-human",
@@ -300,13 +301,14 @@ export function assertLivingSpineInventory(specText: string, label: string): voi
 // Code pins (runtime SSOT unchanged by this capability)
 // ---------------------------------------------------------------------------
 
-test("stage-inventory-ssot: code STAGES length and membership are the pre-change truth", () => {
-  assert.equal(STAGES.length, 16);
+test("stage-inventory-ssot: code STAGES length and membership are the inventory truth", () => {
+  assert.equal(STAGES.length, 17);
   assert.deepEqual([...STAGES], [
     "backlog",
     "ready",
     "planning",
     "plan-review",
+    "pre-code-attestation",
     "implementing",
     "design-gate",
     "review-1",
@@ -395,18 +397,19 @@ test("stage-inventory-ssot: living pipeline-state-machine spine matches STAGES /
 // ---------------------------------------------------------------------------
 
 test("stage-inventory-ssot bite: under-count N-stage fails", () => {
+  const under = STAGES.length - 1;
   assert.throws(
-    () => assertStageCountsMatch("through a 15-stage state machine", "synthetic"),
-    /15-stage.*must equal STAGES\.length \(16\)/,
+    () => assertStageCountsMatch(`through a ${under}-stage state machine`, "synthetic"),
+    new RegExp(`${under}-stage.*must equal STAGES\\.length \\(${STAGES.length}\\)`),
   );
 });
 
 test("stage-inventory-ssot bite: host omitting plan-review fails", () => {
   const drifted = [
     "## State machine",
-    "through a 16-stage label-driven state machine",
+    `through a ${STAGES.length}-stage label-driven state machine`,
     "```",
-    "backlog → ready → planning → implementing → design-gate",
+    "backlog → ready → planning → pre-code-attestation → implementing → design-gate",
     "→ review-1 → fix-1 → review-2 → fix-2",
     "→ pre-merge → visual-gate → eval-gate → shipcheck-gate",
     "→ ready-to-deploy",
@@ -426,9 +429,9 @@ test("stage-inventory-ssot bite: diagram-only omission fails even when stage app
     "Elsewhere in the skill: plan-review is a real stage.",
     "",
     "## State machine",
-    "through a 16-stage label-driven state machine",
+    `through a ${STAGES.length}-stage label-driven state machine`,
     "```",
-    "backlog → ready → planning → implementing → design-gate",
+    "backlog → ready → planning → pre-code-attestation → implementing → design-gate",
     "→ review-1 → fix-1 → review-2 → fix-2",
     "→ pre-merge → visual-gate → eval-gate → shipcheck-gate",
     "→ ready-to-deploy",
@@ -495,7 +498,7 @@ test("stage-inventory-ssot bite: README inventory omitting review-1 fails", () =
   const drifted = [
     "# agent-pipeline",
     "",
-    "**agent-pipeline** is a label-driven GitHub issue pipeline that advances an issue from backlog to `pipeline:ready-to-deploy` through a 16-stage state machine — backlog → ready → planning → plan-review → implementing → design-gate → review → fix → pre-merge → visual-gate → eval-gate → shipcheck-gate → ready-to-deploy, with `needs-human` as the terminal park off-ramp.",
+    `**agent-pipeline** is a label-driven GitHub issue pipeline that advances an issue from backlog to \`pipeline:ready-to-deploy\` through a ${STAGES.length}-stage state machine — backlog → ready → planning → plan-review → pre-code-attestation → implementing → design-gate → review → fix → pre-merge → visual-gate → eval-gate → shipcheck-gate → ready-to-deploy, with \`needs-human\` as the terminal park off-ramp.`,
   ].join("\n");
   assert.throws(
     () => assertReadmeInventoryCoverage(drifted, "synthetic-readme"),

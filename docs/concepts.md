@@ -118,7 +118,7 @@ When the feedback window ends with **no** human comments, plan revision proceeds
 
 When human comments are present, the revised plan comment attributes contributors, and the revision **must** end with a `## Human Feedback Acknowledgement` section listing each commenter as `addressed — <reason>` or `declined — <reason>`.
 
-**Authority boundary:** when the reviewer harness runs, independent agent plan review is the plan-review control; when same-harness fallback applies, the labeled self-review is the plan-review evidence and is **not** independent; the human feedback window is optional steering; **human attestation** (pipeline output markers / operator capability attestations) is provenance, not plan sign-off. Merge authority remains outside the advance path. A direct operator (or external supervisor under operator authority) can invoke a loop-isolated merge surface. True human-decision gates such as `needs-human` dispositions remain human-owned.
+**Authority boundary:** when the reviewer harness runs, independent agent plan review is the plan-review control; when same-harness fallback applies, the labeled self-review is the plan-review evidence and is **not** independent; the human feedback window is optional steering; **human attestation** (pipeline output markers / operator capability attestations) is provenance, not plan sign-off. Plan-review is **not** human sign-off for high-risk work. Opt-in **pre-code human attestation** (`pre_code_attestation`, #575) is a separate risk-triggered control before implementing — required only when configured and a risk trigger matches; omitted configuration preserves autonomous advancement without that human gate. Merge authority remains outside the advance path. A direct operator (or external supervisor under operator authority) can invoke a loop-isolated merge surface. True human-decision gates such as `needs-human` dispositions remain human-owned.
 
 ## Review severity policy & audited overrides
 
@@ -133,9 +133,13 @@ When human comments are present, the revised plan comment attributes contributor
 
 Overrides are audited in issue comments. The advance path still never merges.
 
+## Pre-code human attestation (optional, default off)
+
+`pre_code_attestation` sits between `plan-review` and `implementing` as the stage `pre-code-attestation`. It is **opt-in and risk-triggered**: when the config block is omitted or `enabled: false`, the gate is disabled and planning advances to implementing without a human hold (current autonomous behavior). When enabled but no risk trigger matches, the stage records `no-trigger-matched` and passes through. When a trigger matches, the pipeline requires a compact pre-code design dossier and affirmative attestation from an authenticated actor authorized under repository-owned policy before product code changes. Agent plan-review alone never clears a triggered gate. Distinct from plan-review (agent review) and from design-gate (post-code agent interrogation). See [config.md](config.md).
+
 ## Design-interrogation gate (optional, default off)
 
-`design_gate` sits between `implementing` and `review-1`. It is inert unless enabled **and** a risk trigger matches. When it fires, the implementer records material design decisions; an independent reviewer challenges them under bounded rounds. No merge/release authority. See [config.md](config.md) for `triggers`, thresholds, and limits.
+`design_gate` sits between `implementing` and `review-1`. It is inert unless enabled **and** a risk trigger matches. When it fires, the implementer records material design decisions; an independent reviewer challenges them under bounded rounds. No merge/release authority. Post-code agent interrogation — not the pre-code human attestation gate. See [config.md](config.md) for `triggers`, thresholds, and limits.
 
 ## Visual gate (optional, default off)
 

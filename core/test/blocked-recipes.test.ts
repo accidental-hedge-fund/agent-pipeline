@@ -182,6 +182,13 @@ const RECIPE_SNAPSHOTS: Record<(typeof BLOCKER_KINDS)[number], string> = {
     "record or challenge verdict after its bounded re-ask, or the reviewer " +
     "harness is unavailable (see the error above). Investigate and fix the " +
     "root cause, remove the `blocked` label, then re-run `$pipeline 7`.",
+  "pre-code-attestation-failed":
+    "The pre-code human attestation gate (#575) failed closed (unauthorized " +
+    "approval, separation-of-duty violation, unresolved ownership, reject, " +
+    "invalid or expired attestation, missing dossier, or configuration error — " +
+    "see the reason above). Fix the integrity issue, produce a current approved " +
+    "attestation for the current dossier and policy revision when required, " +
+    "remove the `blocked` label, then re-run `$pipeline 7`.",
   "human-decision-required":
     "The fix harness determined that the correct next step is a human " +
     "product decision, an authority it lacks, or an unavailable external " +

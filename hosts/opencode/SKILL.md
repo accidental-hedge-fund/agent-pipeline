@@ -20,7 +20,7 @@ so `/pipeline --version` injects the installed launcher version instead of
 embedding instructional skill text in the template.
 
 Self-contained TypeScript skill that advances a GitHub issue (or PR's linked
-issue) through a 16-stage label-driven state machine, ending at
+issue) through a 17-stage label-driven state machine, ending at
 `pipeline:ready-to-deploy` on the happy path (or parking at `pipeline:needs-human`
 when review ceilings / similar paths exhaust). The ordinary advance path never
 merges. Merge commands require separate operator authority.
@@ -39,7 +39,7 @@ of `core/` (+ `hosts/claude`). After editing any file under `core/`, run
 Happy path (16 stages total in code `STAGES`, including the park off-ramp):
 
 ```
-backlog → ready → planning → plan-review → implementing → design-gate
+backlog → ready → planning → plan-review → pre-code-attestation → implementing → design-gate
               → review-1 → fix-1 → review-2 → fix-2
               → pre-merge → visual-gate → eval-gate → shipcheck-gate
               → ready-to-deploy

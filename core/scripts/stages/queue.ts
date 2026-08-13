@@ -191,6 +191,7 @@ export const STAGE_PRIORITY_SCORE: Record<string, number> = {
   "ready": 100,
   "planning": 90,
   "plan-review": 85,
+  "pre-code-attestation": 82,
   "implementing": 80,
   "design-gate": 75,
   "review-1": 70,

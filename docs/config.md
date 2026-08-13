@@ -615,6 +615,54 @@ Nested fields:
 - **Default:** `300`
 - **Description:** Seconds for the plan-review harness before timing out.
 
+### `pre_code_attestation`
+
+- **Type:** object
+- **Default:** `{"enabled":false,"triggers":["architecture","auth","storage","migration","public-api","large-diff"],"extra_triggers":{},"thresholds":{"max_files":null,"max_loc":null},"expiration":{"max_age_hours":72,"reapprove_on":["dossier_change","policy_change","scope_change","ownership_change"]},"approvers":[],"separation_of_duties":{"enabled":false,"forbid_self_attest_roles":["implementer","dossier_author"]},"wait":{"mode":"resume_safe","max_wait_hours":168}}`
+- **Description:** Opt-in pre-code human attestation for high-risk changes (#575). Off by default; omitted block preserves autonomous advancement. Distinct from plan-review and design-gate.
+
+Nested fields:
+
+#### `pre_code_attestation.approvers`
+
+- **Type:** array of object | object | object | object | object
+- **Description:** Ordered authorized-approver resolution rules (identity, group_ref, role, path_owner, risk_class).
+
+#### `pre_code_attestation.enabled`
+
+- **Type:** boolean
+- **Description:** Enable the pre-code human attestation gate (default false).
+
+#### `pre_code_attestation.expiration`
+
+- **Type:** object
+- **Description:** Attestation expiration and re-approval policy.
+
+#### `pre_code_attestation.extra_triggers`
+
+- **Type:** object
+- **Description:** Additional path/label globs by class name (built-in or repo-specific).
+
+#### `pre_code_attestation.separation_of_duties`
+
+- **Type:** object
+- **Description:** Optional separation of duties between implementer/dossier_author and approver.
+
+#### `pre_code_attestation.thresholds`
+
+- **Type:** object
+- **Description:** Pre-code size/blast-radius thresholds evaluated before implementing.
+
+#### `pre_code_attestation.triggers`
+
+- **Type:** array of enum
+- **Description:** Built-in risk classes armed for trigger evaluation (default: all).
+
+#### `pre_code_attestation.wait`
+
+- **Type:** object
+- **Description:** Wait/hold policy while awaiting an authorized human attestation.
+
 ### `pre_merge_ci_assertion_fix`
 
 - **Type:** boolean

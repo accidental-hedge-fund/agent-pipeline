@@ -732,6 +732,21 @@ export async function recordDesignInterrogation(
   await writeBundle(stateDir, issue, bundle, deps);
 }
 
+/** Write the pre-code attestation record to the bundle (#575). Set for every
+ *  run that reaches the pre-code-attestation stage position, including inert
+ *  gate-disabled / no-trigger-matched skips. Non-fatal: write errors are
+ *  caught and logged by callers. */
+export async function recordPreCodeAttestation(
+  stateDir: string,
+  issue: number,
+  state: import("./types.ts").PreCodeAttestationState,
+  deps: BundleDeps = defaultDeps,
+): Promise<void> {
+  const bundle = await loadForUpdate(stateDir, issue, deps);
+  bundle.preCodeAttestation = state;
+  await writeBundle(stateDir, issue, bundle, deps);
+}
+
 /** Write the auto-merge eligibility artifact to the bundle (#306).
  *  The artifact is set on `bundle.auto_merge_eligibility` and the bundle
  *  is written atomically. Non-fatal: write errors are caught and logged. */

@@ -95,7 +95,7 @@ export function escalationSiteKey(module: string, kind: string, occurrence: numb
 }
 
 const BLOCKER_KIND_PATTERN =
-  /"(needs-human|merge-conflict|worktree-missing|worktree-creation-failed|worktree-capacity|pr-creation-failed|no-pull-request|plan-gen-failed|push-failed|head-drift|worktree-setup-failed|test-gate-exhausted|no-commits|openspec-invalid|openspec-stale-delta|eval-gate-misconfigured|eval-gate-failed|visual-gate-misconfigured|visual-gate-failed|shipcheck-failed|build-failed|design-gate-failed|ci-exhausted|review-findings|harness-failure|human-decision-required)"/;
+  /"(needs-human|merge-conflict|worktree-missing|worktree-creation-failed|worktree-capacity|pr-creation-failed|no-pull-request|plan-gen-failed|push-failed|head-drift|worktree-setup-failed|test-gate-exhausted|no-commits|openspec-invalid|openspec-stale-delta|eval-gate-misconfigured|eval-gate-failed|visual-gate-misconfigured|visual-gate-failed|shipcheck-failed|build-failed|design-gate-failed|pre-code-attestation-failed|ci-exhausted|review-findings|harness-failure|human-decision-required)"/;
 
 export interface DiscoveredEscalationSite {
   module: string;

@@ -562,6 +562,70 @@ test("resolveConfig: design_gate unknown key is rejected at parse time", async (
   }
 });
 
+// ---- pre_code_attestation (#575) ----
+
+test("resolveConfig: pre_code_attestation omitted — gate disabled by default", async () => {
+  const repo = makeFakeRepo(null);
+  const binDir = makeFakeGh("acme/pca0");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-pca0`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.pre_code_attestation.enabled, false);
+    assert.equal(cfg.pre_code_attestation.wait.mode, "resume_safe");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: pre_code_attestation enabled with a trigger subset", async () => {
+  const repo = makeFakeRepo(
+    `pre_code_attestation:\n  enabled: true\n  triggers: ["auth", "storage"]\n`,
+  );
+  const binDir = makeFakeGh("acme/pca1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-pca1`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.pre_code_attestation.enabled, true);
+    assert.deepEqual(cfg.pre_code_attestation.triggers, ["auth", "storage"]);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: pre_code_attestation unknown key is rejected at parse time", async () => {
+  const repo = makeFakeRepo(
+    `pre_code_attestation:\n  enabled: true\n  silent_approve: true\n`,
+  );
+  const binDir = makeFakeGh("acme/pca2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-pca2`);
+    assert.throws(() => cfgMod.resolveConfig({ repoPath: repo }), /Invalid.*silent_approve/s);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: pre_code_attestation invalid wait mode is rejected", async () => {
+  const repo = makeFakeRepo(
+    `pre_code_attestation:\n  enabled: true\n  wait:\n    mode: silent_approve\n`,
+  );
+  const binDir = makeFakeGh("acme/pca3");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-pca3`);
+    assert.throws(() => cfgMod.resolveConfig({ repoPath: repo }), /Invalid|wait|mode/s);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
 // ---- trusted_surface (#691) ----
 
 test("resolveConfig: trusted_surface omitted — empty extra_paths default (passthrough-safe)", async () => {
