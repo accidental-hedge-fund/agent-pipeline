@@ -41,6 +41,11 @@ import {
   type StratifiedStabilizationMetrics,
   type StabilizationRun,
 } from "./scoreboard-stabilization.ts";
+import {
+  collectOutcomeScoreboardSection,
+  formatOutcomeScoreboardHuman,
+  type OutcomeScoreboardSection,
+} from "./outcomes/scoreboard-section.ts";
 
 /** Repo-relative FRG trend ledger path (#757) — duplicated string to avoid
  *  importing factory-reliability-gate (config/zod) into the scoreboard graph. */
@@ -377,6 +382,12 @@ export interface ScoreboardReport {
    * Prefers FRG trend ledger observations when present.
    */
   engine_class_release_series?: EngineClassReleaseSeries;
+  /**
+   * Production/rework outcomes from the host-local outcome store (#576).
+   * Additive; counts by kind and observation_state; observed vs inferred
+   * attribution partitioned. Never a collapsed maintainability score.
+   */
+  outcomes?: OutcomeScoreboardSection;
 }
 
 export interface ScoreboardOpts {
@@ -643,7 +654,39 @@ export async function buildScoreboardReport(
     ...engineClassReleaseSeries.diagnostics,
   ];
 
-  const diagnostics = [...core.diagnostics, ...correctionDiagnostics, ...stabDiagnostics];
+  // #576 production/rework outcomes (additive; host-local store; no collapsed score).
+  const outcomesSection = await collectOutcomeScoreboardSection(
+    {
+      repoDir: opts.repoDir,
+      since: window.since,
+      until: window.until,
+    },
+    {
+      readFile: deps.readFile,
+      writeFile: async () => {
+        /* scoreboard is read-only toward the outcome store */
+      },
+      readdir: deps.readdir,
+      mkdir: async () => {
+        /* read-only */
+      },
+    },
+  );
+  const outcomeDiagnostics: ScoreboardDiagnostic[] = outcomesSection.diagnostics
+    .filter((d) => d.code === "missing_outcome_store" || d.code === "outcome_store_unreadable")
+    .map((d) => ({
+      severity: "warning" as const,
+      code: d.code,
+      path: d.path ?? opts.repoDir,
+      message: d.message,
+    }));
+
+  const diagnostics = [
+    ...core.diagnostics,
+    ...correctionDiagnostics,
+    ...stabDiagnostics,
+    ...outcomeDiagnostics,
+  ];
   const report: ScoreboardReport = {
     ...core,
     metrics: metricsWithStab,
@@ -652,6 +695,7 @@ export async function buildScoreboardReport(
     corrections,
     ...(correctionsBy ? { correctionsBy, correctionsGrouping } : {}),
     engine_class_release_series: engineClassReleaseSeries,
+    outcomes: outcomesSection,
   };
   if (bucket === null) return report;
 
@@ -2827,6 +2871,11 @@ export function formatScoreboardHuman(report: ScoreboardReport): string {
   if (report.corrections) {
     lines.push("");
     appendCorrectionsSection(lines, report.corrections, report.correctionsBy, report.correctionsGrouping);
+  }
+
+  if (report.outcomes) {
+    lines.push("");
+    lines.push(...formatOutcomeScoreboardHuman(report.outcomes));
   }
 
   if (report.diagnostics.length > 0) {

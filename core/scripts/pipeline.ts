@@ -423,8 +423,14 @@ export interface CliOpts {
   to?: string;
   /** scoreboard: restrict analysis to runs on or before this ISO date. */
   until?: string;
-  /** scoreboard: use a relative N-day window. */
+  /** scoreboard / outcomes list: use a relative N-day window. */
   days?: number;
+  /** outcomes: source adapter id (default: github). */
+  adapter?: string;
+  /** outcomes: retention window in days for list/scoreboard-style filters. */
+  retentionDays?: number;
+  /** outcomes ingest: absolute path to a JSON fixture of RawOutcomeSignal[]. */
+  fixture?: string;
   /** scoreboard: explicit per-harness cost estimates, as harness=usd-per-call. */
   estimateCost?: string[];
   /** scoreboard: emit a chronological day|week time-series alongside the full-window summary. */
@@ -684,7 +690,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | single | release | ship | factory-gate | factory-release | factory-pin | engine-promote | intake | decompose | triage | roadmap | sweep | merge | merge-queue | train | summary | improve | scoreboard | queue | backfill | evals | loop | correction | handoff | report")
+    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | single | release | ship | factory-gate | factory-release | factory-pin | engine-promote | intake | decompose | triage | roadmap | sweep | merge | merge-queue | train | summary | improve | scoreboard | outcomes | queue | backfill | evals | loop | correction | handoff | report")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -800,7 +806,10 @@ export function buildCmd(): Command {
     )
     .option("--since <date>", "improve/scoreboard: restrict analysis to runs on or after this ISO date (e.g. 2026-06-01)")
     .option("--until <date>", "scoreboard: restrict analysis to runs on or before this ISO date (e.g. 2026-06-15)")
-    .option("--days <n>", "scoreboard: analyze the last N days (default: 30)", Number)
+    .option("--days <n>", "scoreboard/outcomes: analyze the last N days (default: 30 for scoreboard)", Number)
+    .option("--adapter <id>", "outcomes ingest: source adapter id (default: github)")
+    .option("--retention-days <n>", "outcomes list: exclude records older than N days (default: 365)", Number)
+    .option("--fixture <path>", "outcomes ingest: JSON fixture of raw signals (offline; no network)")
     .option("--estimate-cost <harness=usd>", "scoreboard: estimate missing harness-call costs; repeatable", collectRepeatable, [])
     .option("--bucket <unit>", "scoreboard: add a chronological day|week time-series alongside the full-window summary")
     .option("--by <dimension>", "scoreboard: group metrics by harness|model|effort|executor; repeatable (to detect a duplicate flag)", collectRepeatable, [])
@@ -3082,7 +3091,11 @@ async function main(): Promise<void> {
       "  pipeline scoreboard --days 1 --json\n" +
       "  # → .metrics.pre_merge_needs_human, .metrics.human_touches, .metrics.escape_recurrence,\n" +
       "  #   .metrics.discovery_channel, .metrics.stratified, .metrics.candidate_integrity,\n" +
-      "  #   .engine_class_release_series\n\n" +
+      "  #   .engine_class_release_series, .outcomes (production/rework; #576)\n\n" +
+      "Production outcomes (#576): additive .outcomes section from .agent-pipeline/outcomes/.\n" +
+      "Counts by kind and observation_state; observed vs inferred attribution partitioned.\n" +
+      "No maintainability_score; merge without deploy is not deploy success; R2D ≠ delivery.\n" +
+      "Ingest separately: pipeline outcomes ingest [--fixture path] [--dry-run] [--json]\n\n" +
       "Options:\n" +
       "  --since <date>              window start (ISO-8601)\n" +
       "  --until <date>              window end (ISO-8601)\n" +
@@ -4774,6 +4787,47 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Early outcomes dispatch (#576) — host-local store only; no GitHub mutations.
+  if (numArg === "outcomes") {
+    if (rawArgs.includes("--help") || rawArgs.includes("-h")) {
+      const { OUTCOMES_HELP } = await import("./outcomes/cli.ts");
+      process.stdout.write(OUTCOMES_HELP);
+      process.exit(0);
+    }
+    const verb = cmd.args[1] as string | undefined;
+    if (verb !== "ingest" && verb !== "list") {
+      console.error(
+        'pipeline outcomes: expected subcommand "ingest" or "list".\n' +
+          "  Usage: pipeline outcomes ingest [--adapter github] [--fixture <path>] [--dry-run] [--json]\n" +
+          "         pipeline outcomes list [--days <n>] [--retention-days <n>] [--json]\n" +
+          "  Host-local store under .agent-pipeline/outcomes/; free text redacted; R2D ≠ production delivery.",
+      );
+      process.exit(2);
+    }
+    const startDirOut = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
+    const repoDirOut = findGitRoot(startDirOut) ?? startDirOut;
+    try {
+      const { runOutcomesCli, realOutcomesCliDeps } = await import("./outcomes/cli.ts");
+      await runOutcomesCli(
+        {
+          repoDir: repoDirOut,
+          verb,
+          adapter: opts.adapter,
+          json: !!opts.json,
+          dryRun: !!opts.dryRun,
+          days: opts.days,
+          retentionDays: opts.retentionDays,
+          fixturePath: opts.fixture,
+        },
+        realOutcomesCliDeps(),
+      );
+    } catch (err) {
+      console.error(`pipeline outcomes: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    return;
+  }
+
   // Early scoreboard dispatch — no issue number, no config resolution, no GitHub calls.
   // It reads only existing run artifacts under .agent-pipeline/runs.
   if (numArg === "scoreboard") {
@@ -5239,7 +5293,7 @@ async function main(): Promise<void> {
     const recognized = [
       "init", "doctor", "status", "unblock", "override", "cleanup",
       "logs", "path", "config", "run", "single", "release", "intake", "decompose", "refine-spec",
-      "roadmap", "sweep", "triage", "merge", "merge-queue", "train", "ship", "summary", "improve", "scoreboard", "factory-gate", "factory-release", "factory-pin", "engine-promote", "queue", "backfill", "evals",
+      "roadmap", "sweep", "triage", "merge", "merge-queue", "train", "ship", "summary", "improve", "scoreboard", "outcomes", "factory-gate", "factory-release", "factory-pin", "engine-promote", "queue", "backfill", "evals",
       "loop",
     ];
     if (!recognized.includes(numArg)) {

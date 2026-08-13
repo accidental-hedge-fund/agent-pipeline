@@ -75,6 +75,15 @@ export const HANDOFFS_ARTIFACT: ArtifactContractEntry = {
     "Durable human-question handoff records + audit logs (#647); local-only, never committed.",
 };
 
+/** Host-local production/rework outcome store (#576). Per-outcome JSON under
+ *  `.agent-pipeline/outcomes/`; independent of run dirs so late signals do
+ *  not rewrite finalized runs. Local-only, never committed. */
+export const OUTCOMES_ARTIFACT: ArtifactContractEntry = {
+  name: "outcomes",
+  comment:
+    "Production/rework outcome records linked to pipeline runs (#576); host-local, never committed.",
+};
+
 /** Ordered contract of every `.agent-pipeline/` directory (or file) the
  *  engine writes. No other module SHALL independently define an
  *  `.agent-pipeline/` artifact path — derive it from an entry here instead. */
@@ -86,6 +95,7 @@ export const ARTIFACT_CONTRACT: readonly ArtifactContractEntry[] = [
   CONTROL_ATTRIBUTIONS_ARTIFACT,
   PRODUCT_FAULT_REPORTS_ARTIFACT,
   HANDOFFS_ARTIFACT,
+  OUTCOMES_ARTIFACT,
 ];
 
 /** Resolve `<repoDir>/.agent-pipeline/<entry.name>` for a contract entry. */

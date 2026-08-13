@@ -180,6 +180,11 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 - **Usage:** `pipeline logs [<run-id>] [--events] [-f] [--no-until-terminal]`
 - **Summary:** List or stream pipeline run logs (events --follow exits 0 on terminal run_complete)
 
+#### `outcomes`
+
+- **Usage:** `pipeline outcomes ingest|list [--adapter github] [--fixture <path>] [--days <n>] [--retention-days <n>] [--dry-run] [--json]`
+- **Summary:** Ingest or list production/rework outcomes linked to pipeline runs (host-local store; #576). R2D alone is never production delivery; free text is redacted; no GitHub mutations
+
 #### `report`
 
 - **Usage:** `pipeline report [--yes]`
@@ -188,7 +193,7 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 #### `scoreboard`
 
 - **Usage:** `pipeline scoreboard [--days <n>|--since <iso>] [--until <iso>] [--bucket day|week] [--by <dim>] [--json] [--html <path>]`
-- **Summary:** Print read-only factory throughput/cost/reliability metrics from run artifacts (incl. human-touch, escape-recurrence, discovery-channel, stratified stabilization; #763)
+- **Summary:** Print read-only factory throughput/cost/reliability metrics from run artifacts (incl. human-touch, escape-recurrence, discovery-channel, stratified stabilization; #763; production outcomes #576)
 
 #### `summary`
 
