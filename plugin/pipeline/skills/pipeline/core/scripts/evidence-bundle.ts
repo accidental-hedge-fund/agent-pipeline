@@ -31,6 +31,7 @@ import {
 } from "./types.ts";
 import { redactSecrets, sanitize, sanitizeDeep } from "./artifact-sanitize.ts";
 import { attestPipelineComment } from "./stages/review-parsing.ts";
+import type { HandoffEvidenceRecord } from "./human-question-handoff.ts";
 
 /** Bundle filename written under `<stateDir>/<issue>/`. */
 export const EVIDENCE_FILE = "evidence.json";
@@ -288,6 +289,23 @@ export async function recordCommand(
   entry.commands.push(
     makeCommandRecord(cmd.cmd, cmd.exitCode, cmd.durationMs, cmd.outputExcerpt),
   );
+  await writeBundle(stateDir, issue, bundle, deps);
+}
+
+/**
+ * Append a human-question handoff lifecycle record to the evidence bundle (#647).
+ * Non-fatal and additive. Missing this write must never clear a required human hold;
+ * the durable handoff store remains authoritative for resume.
+ */
+export async function recordHandoffEvidence(
+  stateDir: string,
+  issue: number,
+  record: HandoffEvidenceRecord,
+  deps: BundleDeps = defaultDeps,
+): Promise<void> {
+  const bundle = await loadForUpdate(stateDir, issue, deps);
+  if (!bundle.handoffs) bundle.handoffs = [];
+  bundle.handoffs.push(record);
   await writeBundle(stateDir, issue, bundle, deps);
 }
 

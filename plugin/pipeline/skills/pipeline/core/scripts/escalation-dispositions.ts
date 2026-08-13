@@ -48,11 +48,22 @@ export interface AuthorityEmitterEntry {
   notes: string;
 }
 
+/** Human-question handoff integrity / wait sites (#647). */
+export interface HandoffEscalationSiteEntry {
+  site_id: string;
+  module: string;
+  match: string;
+  disposition: EscalationSiteDisposition;
+  notes: string;
+}
+
 export interface EscalationInventory {
   schema: string;
   issue: number;
   sites: readonly EscalationSiteEntry[];
   authority_emitters: readonly AuthorityEmitterEntry[];
+  /** Optional #647 handoff integrity inventory; absent on pre-#647 inventories. */
+  handoff_sites?: readonly HandoffEscalationSiteEntry[];
 }
 
 /** Closed inventory loaded from the seeded module (and re-checked by drift guards). */

@@ -67,6 +67,14 @@ export const PRODUCT_FAULT_REPORTS_ARTIFACT: ArtifactContractEntry = {
   isFile: true,
 };
 
+/** Durable human-question handoff records + audit logs (#647). Issue-scoped
+ *  under `.agent-pipeline/handoffs/issue-<N>/`. Local-only, never committed. */
+export const HANDOFFS_ARTIFACT: ArtifactContractEntry = {
+  name: "handoffs",
+  comment:
+    "Durable human-question handoff records + audit logs (#647); local-only, never committed.",
+};
+
 /** Ordered contract of every `.agent-pipeline/` directory (or file) the
  *  engine writes. No other module SHALL independently define an
  *  `.agent-pipeline/` artifact path — derive it from an entry here instead. */
@@ -77,6 +85,7 @@ export const ARTIFACT_CONTRACT: readonly ArtifactContractEntry[] = [
   EVALS_ARTIFACT,
   CONTROL_ATTRIBUTIONS_ARTIFACT,
   PRODUCT_FAULT_REPORTS_ARTIFACT,
+  HANDOFFS_ARTIFACT,
 ];
 
 /** Resolve `<repoDir>/.agent-pipeline/<entry.name>` for a contract entry. */

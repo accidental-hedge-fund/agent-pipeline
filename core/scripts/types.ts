@@ -2098,6 +2098,12 @@ export interface EvidenceBundle {
    *  order. Populated by `finalizeRun` from `events.jsonl` (#499). Additive
    *  and optional: consumers that do not recognize this field SHALL ignore it. */
   corrections?: import("./correction.ts").CorrectionEvent[];
+  /**
+   * Human-question handoff lifecycle records for this run (#647). Additive and
+   * optional; missing display fields never clear a required human hold.
+   * Durable handoff store is authoritative for resume — this is a supplement.
+   */
+  handoffs?: import("./human-question-handoff.ts").HandoffEvidenceRecord[];
   /** Finalized stage accounting copied from `stage_accounting` events by
    *  `finalizeRun`. Additive and optional for older bundles. */
   accounting?: StageAccountingSummary;

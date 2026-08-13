@@ -553,6 +553,35 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
     supportsJson: false,
   },
 
+  // Human-question handoff (#647): list/show are non-mutating; answer/reject/
+  // supersede are audited local mutations (and optional comment) — not merge.
+  handoff: {
+    needsIssueNumber: false,
+    allowedFlags: new Set([
+      "repoPath",
+      "base",
+      "profile",
+      "domain",
+      "json",
+      "issue",
+      "runId",
+      "filterStatus",
+      "batch",
+      "text",
+      "reason",
+      "clientRequestId",
+      "question",
+      "class",
+      "capability",
+      "candidateSha",
+      "resumeTarget",
+    ]),
+    needsConfig: true,
+    needsGhAuth: true,
+    mutatesGitHub: true,
+    supportsJson: true,
+  },
+
   // report (#502): operator-facing `pipeline report` — builds a sanitized
   // product-fault payload, previews it, and (only after explicit operator
   // confirmation) submits it to the configured intake service, or prepares a

@@ -42,6 +42,17 @@ export interface StatusPayload {
    * no run-events summary was provided. Additive; schema_version stays `"1"`.
    */
   event_stream_write_health: WriteHealthRecord | null;
+  /**
+   * Pending/known human-question handoffs for this issue (#647). Additive;
+   * absent or empty when no handoffs exist. Schema_version stays `"1"`.
+   */
+  handoffs?: Array<{
+    handoff_id: string;
+    status: string;
+    handoff_class: string;
+    authority_mode: string;
+    question_summary?: string;
+  }>;
 }
 
 export interface StatusErrorEnvelope {
@@ -221,6 +232,7 @@ export function buildStatusPayload(
   cfg: Pick<PipelineConfig, "repo" | "domain"> & StageTimeoutConfig,
   runEvents: RunEventsSummary | null = null,
   now: Date = new Date(),
+  handoffs?: StatusPayload["handoffs"],
 ): StatusPayload {
   const stage = pickStage(detail.labels);
   const blocked = isBlocked(detail.labels);
@@ -249,6 +261,7 @@ export function buildStatusPayload(
     possibly_wedged: derivePossiblyWedged(runEvents, largestConfiguredStageTimeoutSec(cfg) * 1000 + WEDGE_MARGIN_MS, now),
     // Elevated only — healthy/absent must not invent a failure (#633).
     event_stream_write_health: isElevatedWriteHealth(writeHealth) ? writeHealth : null,
+    ...(handoffs && handoffs.length > 0 ? { handoffs } : {}),
   };
 }
 

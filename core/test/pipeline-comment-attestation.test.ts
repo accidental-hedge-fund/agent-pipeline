@@ -68,6 +68,7 @@ import {
   staleReviewNotice,
 } from "../scripts/stages/pre_merge.ts";
 import { formatNoopAdvanceEvidenceNote } from "../scripts/noop-advance.ts";
+import { handoffDiscoveryCommentBody } from "../scripts/human-question-handoff.ts";
 import { buildAutoRecoveryComment, buildAutoRecoveryLimitComment } from "../scripts/stages/auto_recover.ts";
 import { buildPipelineCompleteComment } from "../scripts/stages/deploy_ready.ts";
 import { buildDesignGateComment } from "../scripts/stages/design_gate.ts";
@@ -310,6 +311,40 @@ const KIND_RENDERERS: Record<string, () => string> = {
       stage: "fix-1",
       timestamp: ts(0),
     }),
+  "human-question-handoff": () =>
+    attestPipelineComment(
+      "human-question-handoff",
+      handoffDiscoveryCommentBody({
+        schema_version: 1,
+        handoff_id: "hqh_testfixture",
+        domain: "test",
+        repo: "acme/repo",
+        issue_number: 647,
+        run_id: null,
+        attempt_id: null,
+        blocked_stage: "needs-human",
+        question: "What is the product decision?",
+        reason: "fixture",
+        handoff_class: "product_judgment",
+        authority_mode: "authority",
+        human_decision_required: null,
+        scope: { candidate_sha: "a".repeat(40) },
+        required_capability: ["authority"],
+        resolution_evidence: {
+          unresolved: false,
+          eligible_actors: ["alice"],
+          resolution_summary: "alice",
+        },
+        status: "pending",
+        created_at: ts(0),
+        expires_at: null,
+        supersedes: null,
+        superseded_by: null,
+        answer: null,
+        resume_target: "override-or-unblock",
+        resume_preconditions: [],
+      }),
+    ),
   "noop-advance-evidence": () =>
     formatNoopAdvanceEvidenceNote({
       stage: "implementing",
