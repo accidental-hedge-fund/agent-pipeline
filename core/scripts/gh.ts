@@ -2602,6 +2602,8 @@ export const PIPELINE_COMMENT_HEADERS: readonly string[] = [
   // this entry, `classifyComment` treats design-interrogation progress as
   // human input and `findUnacknowledgedComments` false-blocks review-1.
   "## Design Interrogation",
+  // Pre-code attestation gate posts (#575).
+  "## Pre-Code Attestation",
 ];
 
 // ---------------------------------------------------------------------------
@@ -2693,6 +2695,14 @@ export const PIPELINE_COMMENT_KINDS: readonly {
   {
     kind: "design-interrogation",
     heading: "## Design Interrogation",
+    verify: "pipeline-attest",
+  },
+  // Pre-code human attestation gate (#575). Heading does not start with
+  // `## Pipeline`, so it is listed for classification + attestation; the
+  // source guard only scans `## Pipeline…` literals.
+  {
+    kind: "pre-code-attestation",
+    heading: "## Pre-Code Attestation",
     verify: "pipeline-attest",
   },
   // Deliberately unattested/unverified comment types, with justification. Moved here

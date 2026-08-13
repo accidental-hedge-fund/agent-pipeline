@@ -7,6 +7,10 @@ export const STAGES = [
   "ready",
   "planning",
   "plan-review",
+  // Opt-in, risk-triggered human attestation before product code (#575).
+  // Always present in the graph; inert unless pre_code_attestation.enabled and
+  // a risk trigger matches. Does not replace plan-review or design-gate.
+  "pre-code-attestation",
   "implementing",
   "design-gate",
   "review-1",
@@ -279,6 +283,7 @@ export const BLOCKER_KINDS = [
   "worktree-setup-failed",
   "build-failed",
   "design-gate-failed",
+  "pre-code-attestation-failed",
   "human-decision-required",
   "ci-exhausted",
 ] as const;
@@ -417,6 +422,13 @@ export const BLOCKER_RECIPES: Record<BlockerKind, string> = {
     "record or challenge verdict after its bounded re-ask, or the reviewer " +
     "harness is unavailable (see the error above). Investigate and fix the " +
     "root cause, remove the `blocked` label, then re-run `$pipeline {{N}}`.",
+  "pre-code-attestation-failed":
+    "The pre-code human attestation gate (#575) failed closed (unauthorized " +
+    "approval, separation-of-duty violation, unresolved ownership, reject, " +
+    "invalid or expired attestation, missing dossier, or configuration error — " +
+    "see the reason above). Fix the integrity issue, produce a current approved " +
+    "attestation for the current dossier and policy revision when required, " +
+    "remove the `blocked` label, then re-run `$pipeline {{N}}`.",
   "human-decision-required":
     "The fix harness determined that the correct next step is a human " +
     "product decision, an authority it lacks, or an unavailable external " +
@@ -588,6 +600,285 @@ export interface DesignGateState {
 
 export type OpenspecMode = "auto" | "on" | "off";
 
+// ---------------------------------------------------------------------------
+// Pre-code human attestation gate (#575) — config types, risk classes, dossier
+// contracts, attestation records, and stage state.
+// ---------------------------------------------------------------------------
+
+/** Built-in risk classes for pre-code attestation triggers. */
+export const PRE_CODE_ATTESTATION_TRIGGER_CLASSES = [
+  "architecture",
+  "auth",
+  "storage",
+  "migration",
+  "public-api",
+  "large-diff",
+] as const;
+export type PreCodeAttestationTriggerClass =
+  (typeof PRE_CODE_ATTESTATION_TRIGGER_CLASSES)[number];
+
+/** Closed invalidation events that force re-approval when present in reapprove_on. */
+export const PRE_CODE_REAPPROVE_ON_EVENTS = [
+  "dossier_change",
+  "policy_change",
+  "scope_change",
+  "ownership_change",
+] as const;
+export type PreCodeReapproveOnEvent = (typeof PRE_CODE_REAPPROVE_ON_EVENTS)[number];
+
+/** Wait mode after a trigger fires without a current approve. */
+export type PreCodeAttestationWaitMode = "resume_safe" | "hard_block";
+
+/** Roles that may be forbidden from self-attesting when SoD is enabled. */
+export const PRE_CODE_SOD_ROLES = ["implementer", "dossier_author"] as const;
+export type PreCodeSodRole = (typeof PRE_CODE_SOD_ROLES)[number];
+
+/** Approver rule kinds (provider-agnostic). */
+export const PRE_CODE_APPROVER_KINDS = [
+  "identity",
+  "group_ref",
+  "role",
+  "path_owner",
+  "risk_class",
+] as const;
+export type PreCodeApproverKind = (typeof PRE_CODE_APPROVER_KINDS)[number];
+
+/** One ordered approver resolution rule. */
+export type PreCodeApproverRule =
+  | {
+      kind: "identity";
+      /** Authenticated login / subject id. */
+      identity: string;
+      /** Optional path globs this rule covers; empty/omit = all paths. */
+      paths?: string[];
+      /** Optional risk-class scope; empty/omit = all matched classes. */
+      risk_classes?: PreCodeAttestationTriggerClass[];
+    }
+  | {
+      kind: "group_ref";
+      /** Opaque external group/team reference resolved by injectable adapter. */
+      group_ref: string;
+      paths?: string[];
+      risk_classes?: PreCodeAttestationTriggerClass[];
+    }
+  | {
+      kind: "role";
+      /** Repository role token (e.g. admin, maintainer). */
+      role: string;
+      paths?: string[];
+      risk_classes?: PreCodeAttestationTriggerClass[];
+    }
+  | {
+      kind: "path_owner";
+      /** Path globs this ownership rule covers. */
+      paths: string[];
+      risk_classes?: PreCodeAttestationTriggerClass[];
+    }
+  | {
+      kind: "risk_class";
+      /** Scope filter only: when these classes match, subsequent/paired coverage applies. */
+      risk_classes: PreCodeAttestationTriggerClass[];
+      paths?: string[];
+    };
+
+export interface PreCodeAttestationConfig {
+  enabled: boolean;
+  triggers: PreCodeAttestationTriggerClass[];
+  /**
+   * Extra path/label globs keyed by built-in class name, or free-form class names
+   * for repository-specific extensions (matched only via extra_triggers).
+   */
+  extra_triggers: Record<string, string[]>;
+  thresholds: {
+    /** Pre-code max files from plan/dossier estimate; null = no threshold. */
+    max_files: number | null;
+    /** Pre-code max LOC from plan/dossier estimate; null = no threshold. */
+    max_loc: number | null;
+  };
+  expiration: {
+    max_age_hours: number;
+    reapprove_on: PreCodeReapproveOnEvent[];
+  };
+  approvers: PreCodeApproverRule[];
+  separation_of_duties: {
+    enabled: boolean;
+    forbid_self_attest_roles: PreCodeSodRole[];
+  };
+  wait: {
+    mode: PreCodeAttestationWaitMode;
+    max_wait_hours: number | null;
+  };
+}
+
+/** One matched pre-code trigger with concrete evidence. */
+export interface PreCodeTriggerMatch {
+  trigger: string;
+  evidence: string;
+}
+
+/** Pure result of evaluatePreCodeAttestationTrigger. */
+export interface PreCodeTriggerResult {
+  triggered: boolean;
+  matched: PreCodeTriggerMatch[];
+  reason: string;
+}
+
+export type BehaviorDiffOp = "addition" | "change" | "removal";
+export type BehaviorOrigin = "stated" | "derived";
+export type DerivedDisposition = "accept" | "reject" | "pending";
+
+export type BehaviorVerification =
+  | { kind: "ref"; ref: string }
+  | { kind: "untestable"; reason: string };
+
+/** One add/change/remove entry against accepted repository behavior. */
+export interface BehaviorDiffEntry {
+  op: BehaviorDiffOp;
+  /** Target contract or behavior identity. */
+  target: string;
+  summary?: string;
+}
+
+/** Structured behavioral contract for a vertical slice. */
+export interface BehavioralContract {
+  /** Stable objective id for downstream traceability. */
+  objective_id: string;
+  preconditions: string;
+  command_or_input: string;
+  expected_outcome: string;
+  ownership_boundary: string;
+  failure_retry_concurrency?: string;
+  origin: BehaviorOrigin;
+  verification: BehaviorVerification;
+  /** Required when origin is derived; pending blocks approval. */
+  derived_disposition?: DerivedDisposition;
+}
+
+/** One independently testable vertical slice. */
+export interface PreCodeDossierSlice {
+  id: string;
+  title: string;
+  behavior_diff: BehaviorDiffEntry[];
+  behaviors: BehavioralContract[];
+}
+
+/** Schema-versioned compact pre-code design dossier (#575). */
+export interface PreCodeDesignDossier {
+  schema_version: 1;
+  intent: string;
+  /** True when work is UI-facing; then ui_mockup is required unless exception. */
+  ui_facing?: boolean;
+  ui_mockup?: string;
+  ui_mockup_exception?: string;
+  system_boundary: string;
+  interaction_sequence: string;
+  expected_delta: {
+    call_stack?: string;
+    file_tree: string[];
+  };
+  key_contracts: string[];
+  slices: PreCodeDossierSlice[];
+  /** Attributed dossier author (for SoD). */
+  dossier_author?: string;
+  /** Declared risk classes / components for trigger and ownership. */
+  declared_risk_classes?: string[];
+  declared_components?: string[];
+  estimated_files?: number;
+  estimated_loc?: number;
+}
+
+/** Compact objective manifest derived from an approved dossier. */
+export interface PreCodeObjectiveManifestEntry {
+  objective_id: string;
+  content_hash: string;
+  origin: BehaviorOrigin;
+  verification: BehaviorVerification;
+  untestable_affirmed?: boolean;
+}
+
+export type PreCodeAttestationDecision = "approve" | "reject";
+
+/** Authorization resolution evidence for one obligation. */
+export interface PreCodeAuthzResolution {
+  component: string;
+  risk_class: string;
+  authorized: boolean;
+  matched_rule?: string;
+  evidence: string;
+}
+
+/** Full attestation record bound to dossier + policy. */
+export interface PreCodeAttestationRecord {
+  actor: string;
+  identity_source: string;
+  authorized_rules: string[];
+  resolution_evidence: PreCodeAuthzResolution[];
+  timestamp: string;
+  expires_at?: string;
+  scope: {
+    components: string[];
+    risk_classes: string[];
+    objective_ids: string[];
+  };
+  decision: PreCodeAttestationDecision;
+  dossier_hash: string;
+  policy_hash: string;
+  /** Affirmed Untestable: objective ids. */
+  untestable_affirmations?: string[];
+  /** Derived behavior dispositions at approve time. */
+  derived_dispositions?: Record<string, "accept" | "reject">;
+  /** Optional nested binding to shared evidence_subject dimensions. */
+  evidence_subject?: {
+    policy_hash: string;
+    dossier_hash: string;
+  };
+}
+
+export type PreCodeContractTraceStatus =
+  | "verified"
+  | "unverified_exception"
+  | "missing";
+
+export interface PreCodeContractTraceRow {
+  objective_id: string;
+  content_hash: string;
+  status: PreCodeContractTraceStatus;
+  evidence_ref?: string;
+}
+
+export type PreCodeAttestationOutcomeCode =
+  | "gate-disabled"
+  | "no-trigger-matched"
+  | "waiting-for-attestation"
+  | "approved"
+  | "rejected"
+  | "unauthorized"
+  | "unresolved-ownership"
+  | "sod-violation"
+  | "dossier-invalid"
+  | "dossier-missing"
+  | "attestation-expired"
+  | "attestation-stale"
+  | "wait-exhausted-resume-safe"
+  | "wait-exhausted-hard-block"
+  | "config-error";
+
+/** Resumable pre-code attestation stage state for evidence + comments. */
+export interface PreCodeAttestationState {
+  schema_version: 1;
+  enabled: boolean;
+  trigger: PreCodeTriggerResult;
+  policy_hash: string;
+  dossier_hash: string | null;
+  dossier: PreCodeDesignDossier | null;
+  objectives: PreCodeObjectiveManifestEntry[];
+  attestations: PreCodeAttestationRecord[];
+  authorization_summary: PreCodeAuthzResolution[] | null;
+  outcome: PreCodeAttestationOutcomeCode | null;
+  traces: PreCodeContractTraceRow[];
+  wait_started_at?: string;
+}
+
 /**
  * One ensemble agent entry (#645). Either `role: "primary"` (resolves to the
  * configured reviewer) or an explicit `harness` string (built-in or custom CLI).
@@ -739,6 +1030,14 @@ export interface PipelineConfig {
       max_artifact_bytes: number;
     };
   };
+  /**
+   * Opt-in pre-code human attestation for high-risk changes (#575). Default-off:
+   * omitted config preserves autonomous planning → implementing advancement.
+   * When enabled and a risk trigger matches, implementation is gated on an
+   * authorized human attestation of a design dossier. Distinct from plan-review
+   * (agent review) and design-gate (post-code agent interrogation).
+   */
+  pre_code_attestation: PreCodeAttestationConfig;
   /**
    * Opt-in parallel multi-agent review ensemble (#645). Default-off so existing
    * repos see no latency/cost change. When enabled, plan-review / review-1 /
@@ -1182,6 +1481,22 @@ export const DEFAULT_CONFIG: Omit<
     block_threshold: "medium" as const,
     min_confidence: 0.6,
     limits: { max_decisions: 8, max_field_chars: 4000, max_artifact_bytes: 65_536 },
+  },
+  pre_code_attestation: {
+    enabled: false,
+    triggers: [...PRE_CODE_ATTESTATION_TRIGGER_CLASSES],
+    extra_triggers: {},
+    thresholds: { max_files: null, max_loc: null },
+    expiration: {
+      max_age_hours: 72,
+      reapprove_on: ["dossier_change", "policy_change", "scope_change", "ownership_change"],
+    },
+    approvers: [],
+    separation_of_duties: {
+      enabled: false,
+      forbid_self_attest_roles: ["implementer", "dossier_author"],
+    },
+    wait: { mode: "resume_safe" as const, max_wait_hours: 168 },
   },
   test_gate: { enabled: true, max_attempts: 3, timeout: 300 },
   eval_gate: { enabled: false, mode: "gate" as const, timeout: 300, max_attempts: 2 },
@@ -1799,6 +2114,13 @@ export interface EvidenceBundle {
    *  gate's final outcome. Present for every run that reaches `design-gate`;
    *  untriggered runs carry only `trigger` and `outcome: null`. */
   designInterrogation?: DesignGateState;
+  /**
+   * Pre-code attestation gate record (#575). Present for every run that reaches
+   * the `pre-code-attestation` stage position (including inert gate-disabled /
+   * no-trigger-matched skips). Triggered runs include dossier hash, attestation
+   * decisions, authorization summary, and contract-to-evidence traces.
+   */
+  preCodeAttestation?: PreCodeAttestationState;
   /** Mid-run engine-identity drift transitions detected at stage boundaries
    *  (#450). Additive and optional; absent for pre-#450 bundles and for runs
    *  where the engine identity never changed. */

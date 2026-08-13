@@ -91,6 +91,8 @@ export function deriveNextAction(stage: string | null, blocked: boolean): string
     ready: "Pipeline will run planning and implementation.",
     planning: "Planning is in progress.",
     "plan-review": "Plan review is in progress.",
+    "pre-code-attestation":
+      "Pre-code human attestation gate will run next (inert unless enabled and a risk trigger matched).",
     implementing: "Implementation is in progress.",
     "design-gate": "Design-interrogation gate will run next (inert unless enabled and a risk trigger matched).",
     "review-1": "Standard review will run next.",

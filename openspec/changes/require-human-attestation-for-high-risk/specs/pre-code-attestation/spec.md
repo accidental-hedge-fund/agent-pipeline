@@ -193,10 +193,7 @@ derived from policy. Reject decisions SHALL fail closed, preserve evidence, and 
 
 ### Requirement: Material change after approval SHALL invalidate attestation
 
-A material change to the dossier content hash/revision, implementation scope, affected
-component/risk classification, ownership mapping used for resolution, identity authorization rules,
-or effective policy hash SHALL mark the prior attestation non-current and return the item to the
-pre-code attestation gate. Expired attestations SHALL likewise be non-current.
+A material change to the dossier content hash/revision, implementation scope, affected component/risk classification, ownership mapping used for resolution, identity authorization rules, or effective policy hash SHALL mark the prior attestation non-current and return the item to the pre-code attestation gate. Expired attestations SHALL likewise be non-current.
 
 #### Scenario: dossier hash change invalidates approve
 
@@ -222,13 +219,7 @@ pre-code attestation gate. Expired attestations SHALL likewise be non-current.
 
 ### Requirement: Wait and integrity outcomes SHALL use typed escalation without silent bypass
 
-Rejection, unauthorized approval, unresolved ownership, separation-of-duty failure, and
-configuration-error paths SHALL fail closed and preserve evidence. Waiting for an authorized human
-SHALL use the durable wait/human-input surfaces with a typed request rather than inventing a new
-unrecoverable park class. When `wait.mode` is `resume_safe` (default), wait-budget exhaustion SHALL
-remain operator-visible and resume-safe and SHALL NOT silently approve. When `wait.mode` is
-`hard_block`, wait-budget exhaustion MAY hard-block under the typed escalation inventory. No
-configuration SHALL permit silent approval or bypass once a trigger has fired.
+Rejection, unauthorized approval, unresolved ownership, separation-of-duty failure, and configuration-error paths SHALL fail closed and preserve evidence. Waiting for an authorized human SHALL use the durable wait/human-input surfaces with a typed request rather than inventing a new unrecoverable park class. When `wait.mode` is `resume_safe` (default), wait-budget exhaustion SHALL remain operator-visible and resume-safe and SHALL NOT silently approve. When `wait.mode` is `hard_block`, wait-budget exhaustion MAY hard-block under the typed escalation inventory. No configuration SHALL permit silent approval or bypass once a trigger has fired.
 
 #### Scenario: unauthorized path fails closed
 

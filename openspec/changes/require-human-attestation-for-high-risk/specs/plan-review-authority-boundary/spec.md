@@ -2,8 +2,7 @@
 
 ### Requirement: Operator surfaces SHALL distinguish pre-code human attestation from plan-review
 
-Operator-facing documentation, host skill guidance, and high-traffic authority copy that describe
-plan-review and high-risk controls SHALL keep these terms distinct:
+Operator-facing documentation, host skill guidance, and high-traffic authority copy that describe plan-review and high-risk controls SHALL keep these terms distinct:
 
 1. **Independent agent plan review** remains evidence from the configured secondary reviewer (or labeled same-harness self-review fallback) — not human approval.
 2. **Human feedback window** remains optional steering — not approval.

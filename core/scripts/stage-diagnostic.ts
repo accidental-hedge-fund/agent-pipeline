@@ -119,6 +119,7 @@ function mechanicalReasonCodeForKind(kind: BlockerKind): StageDiagnosticReasonCo
     case "shipcheck-failed":
     case "build-failed":
     case "design-gate-failed":
+    case "pre-code-attestation-failed":
     case "ci-exhausted":
       return "implementation-ci";
     case "review-findings":

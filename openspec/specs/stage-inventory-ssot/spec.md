@@ -39,7 +39,7 @@ Both `hosts/claude/SKILL.md` and `hosts/codex/SKILL.md` SHALL present a state-ma
 ---
 
 ### Requirement: README and openspec project context SHALL align stage-count language with code
-`README.md` and `openspec/project.md` SHALL describe the pipeline stage inventory consistently with code `STAGES`. Neither file SHALL claim an “11-stage”, “13-stage”, or “15-stage” machine (or any other under-count) while code `STAGES` has sixteen members including `needs-human`. When a numeric stage count is stated, it SHALL equal `STAGES.length`.
+`README.md` and `openspec/project.md` SHALL describe the pipeline stage inventory consistently with code `STAGES`. Neither file SHALL claim an “11-stage”, “13-stage”, “15-stage”, or “16-stage” machine (or any other under-count) while code `STAGES` has seventeen members including `pre-code-attestation` and `needs-human`. When a numeric stage count is stated, it SHALL equal `STAGES.length`.
 
 #### Scenario: README does not under-count stages
 - **WHEN** `README.md` states a numeric stage count for the state machine

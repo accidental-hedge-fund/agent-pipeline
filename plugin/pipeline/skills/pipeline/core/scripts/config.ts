@@ -15,12 +15,16 @@ import {
   MODEL_ENDPOINT_ROUTING_PARAM_KEYS,
   MODEL_ENDPOINT_RESERVED_HEADERS,
   DESIGN_GATE_TRIGGER_CLASSES,
+  PRE_CODE_ATTESTATION_TRIGGER_CLASSES,
+  PRE_CODE_REAPPROVE_ON_EVENTS,
+  PRE_CODE_SOD_ROLES,
   type GitPushAuth,
   type Harness,
   type HarnessRoleSource,
   type PipelineConfig,
   type ModelEndpointDialect,
   type ModelEndpointParams,
+  type PreCodeApproverRule,
 } from "./types.ts";
 import { parseGitPushAuth, GitPushAuthConfigError } from "./git-push-auth.ts";
 import { loadProfile, type PipelineProfile } from "./profile.ts";
@@ -347,6 +351,119 @@ const PartialConfigSchema = z.object({
     .strict()
     .optional()
     .describe("Risk-triggered design-interrogation gate settings (#436). Off by default."),
+  // Pre-code human attestation for high-risk changes (#575). Opt-in; default
+  // disabled so omitted config preserves autonomous planning→implementing.
+  // Strict schema: unknown keys (including silent-approve knobs) are rejected.
+  pre_code_attestation: z
+    .object({
+      enabled: z.boolean().optional().describe("Enable the pre-code human attestation gate (default false)."),
+      triggers: z
+        .array(z.enum(PRE_CODE_ATTESTATION_TRIGGER_CLASSES))
+        .optional()
+        .describe("Built-in risk classes armed for trigger evaluation (default: all)."),
+      extra_triggers: z
+        .record(z.string(), z.array(z.string()))
+        .optional()
+        .describe("Additional path/label globs by class name (built-in or repo-specific)."),
+      thresholds: z
+        .object({
+          max_files: z.number().int().positive().nullable().optional().describe("Pre-code max files from plan estimate; null disables."),
+          max_loc: z.number().int().positive().nullable().optional().describe("Pre-code max LOC from plan estimate; null disables."),
+        })
+        .strict()
+        .optional()
+        .describe("Pre-code size/blast-radius thresholds evaluated before implementing."),
+      expiration: z
+        .object({
+          max_age_hours: z.number().int().min(1).optional().describe("Hours an approve remains current (default 72)."),
+          reapprove_on: z
+            .array(z.enum(PRE_CODE_REAPPROVE_ON_EVENTS))
+            .optional()
+            .describe("Material change events that invalidate a prior approve."),
+        })
+        .strict()
+        .optional()
+        .describe("Attestation expiration and re-approval policy."),
+      approvers: z
+        .array(
+          z.discriminatedUnion("kind", [
+            z
+              .object({
+                kind: z.literal("identity"),
+                identity: z.string().min(1),
+                paths: z.array(z.string()).optional(),
+                risk_classes: z.array(z.enum(PRE_CODE_ATTESTATION_TRIGGER_CLASSES)).optional(),
+              })
+              .strict(),
+            z
+              .object({
+                kind: z.literal("group_ref"),
+                group_ref: z.string().min(1),
+                paths: z.array(z.string()).optional(),
+                risk_classes: z.array(z.enum(PRE_CODE_ATTESTATION_TRIGGER_CLASSES)).optional(),
+              })
+              .strict(),
+            z
+              .object({
+                kind: z.literal("role"),
+                role: z.string().min(1),
+                paths: z.array(z.string()).optional(),
+                risk_classes: z.array(z.enum(PRE_CODE_ATTESTATION_TRIGGER_CLASSES)).optional(),
+              })
+              .strict(),
+            z
+              .object({
+                kind: z.literal("path_owner"),
+                paths: z.array(z.string()).min(1),
+                risk_classes: z.array(z.enum(PRE_CODE_ATTESTATION_TRIGGER_CLASSES)).optional(),
+              })
+              .strict(),
+            z
+              .object({
+                kind: z.literal("risk_class"),
+                risk_classes: z.array(z.enum(PRE_CODE_ATTESTATION_TRIGGER_CLASSES)).min(1),
+                paths: z.array(z.string()).optional(),
+              })
+              .strict(),
+          ]),
+        )
+        .optional()
+        .describe("Ordered authorized-approver resolution rules (identity, group_ref, role, path_owner, risk_class)."),
+      separation_of_duties: z
+        .object({
+          enabled: z.boolean().optional().describe("When true, forbid listed roles from self-attesting (default false)."),
+          forbid_self_attest_roles: z
+            .array(z.enum(PRE_CODE_SOD_ROLES))
+            .optional()
+            .describe("Roles that cannot self-attest when SoD is enabled."),
+        })
+        .strict()
+        .optional()
+        .describe("Optional separation of duties between implementer/dossier_author and approver."),
+      wait: z
+        .object({
+          mode: z
+            .enum(["resume_safe", "hard_block"])
+            .optional()
+            .describe("Wait-budget exhaustion disposition (default resume_safe; never silent-approve)."),
+          max_wait_hours: z
+            .number()
+            .int()
+            .positive()
+            .nullable()
+            .optional()
+            .describe("Bounded wait hours before typed exhaustion outcome; null uses default."),
+        })
+        .strict()
+        .optional()
+        .describe("Wait/hold policy while awaiting an authorized human attestation."),
+    })
+    .strict()
+    .optional()
+    .describe(
+      "Opt-in pre-code human attestation for high-risk changes (#575). Off by default; " +
+        "omitted block preserves autonomous advancement. Distinct from plan-review and design-gate.",
+    ),
   test_gate: z
     .object({
       enabled: z.boolean().optional().describe("Enable the test gate before opening a PR."),
@@ -1188,6 +1305,51 @@ export interface ResolveOptions {
  *   3. If `<repo>/.github/pipeline.yml` exists, parse + validate; merge with defaults.
  *   4. CLI overrides (baseBranch) win.
  */
+/**
+ * Merge partial/omitted `pre_code_attestation` file config with defaults (#575).
+ * Omitted block → enabled false and documented defaults for remaining fields.
+ */
+export function resolvePreCodeAttestationConfig(
+  fileBlock: PartialConfig["pre_code_attestation"] | undefined,
+): PipelineConfig["pre_code_attestation"] {
+  const d = DEFAULT_CONFIG.pre_code_attestation;
+  return {
+    enabled: fileBlock?.enabled ?? d.enabled,
+    triggers: fileBlock?.triggers ? [...fileBlock.triggers] : [...d.triggers],
+    extra_triggers: { ...(fileBlock?.extra_triggers ?? d.extra_triggers) },
+    thresholds: {
+      max_files:
+        fileBlock?.thresholds?.max_files !== undefined
+          ? fileBlock.thresholds.max_files
+          : d.thresholds.max_files,
+      max_loc:
+        fileBlock?.thresholds?.max_loc !== undefined
+          ? fileBlock.thresholds.max_loc
+          : d.thresholds.max_loc,
+    },
+    expiration: {
+      max_age_hours: fileBlock?.expiration?.max_age_hours ?? d.expiration.max_age_hours,
+      reapprove_on: fileBlock?.expiration?.reapprove_on
+        ? [...fileBlock.expiration.reapprove_on]
+        : [...d.expiration.reapprove_on],
+    },
+    approvers: (fileBlock?.approvers ?? d.approvers) as PreCodeApproverRule[],
+    separation_of_duties: {
+      enabled: fileBlock?.separation_of_duties?.enabled ?? d.separation_of_duties.enabled,
+      forbid_self_attest_roles: fileBlock?.separation_of_duties?.forbid_self_attest_roles
+        ? [...fileBlock.separation_of_duties.forbid_self_attest_roles]
+        : [...d.separation_of_duties.forbid_self_attest_roles],
+    },
+    wait: {
+      mode: fileBlock?.wait?.mode ?? d.wait.mode,
+      max_wait_hours:
+        fileBlock?.wait?.max_wait_hours !== undefined
+          ? fileBlock.wait.max_wait_hours
+          : d.wait.max_wait_hours,
+    },
+  };
+}
+
 export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
   const profile = loadProfile(opts.profile ?? process.env.PIPELINE_PROFILE ?? "codex");
   const startDir = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
@@ -1459,6 +1621,7 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
         max_artifact_bytes: fileConfig.design_gate?.limits?.max_artifact_bytes ?? DEFAULT_CONFIG.design_gate.limits.max_artifact_bytes,
       },
     },
+    pre_code_attestation: resolvePreCodeAttestationConfig(fileConfig.pre_code_attestation),
     test_gate: {
       enabled: fileConfig.test_gate?.enabled ?? DEFAULT_CONFIG.test_gate.enabled,
       command: fileConfig.test_gate?.command,
@@ -1752,6 +1915,9 @@ export function applyTrustedVerificationPolicy(
     },
   };
   applied.push("design_gate");
+
+  cfg.pre_code_attestation = resolvePreCodeAttestationConfig(fileConfig.pre_code_attestation);
+  applied.push("pre_code_attestation");
 
   cfg.tester_evidence = {
     on_missing:
@@ -2804,6 +2970,7 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
   const durableRuns = { ...d.durable_runs, ...config.durable_runs };
   const autoLoop = { ...d.auto_loop, ...config.auto_loop };
   const designGate = { ...d.design_gate, ...config.design_gate, limits: { ...d.design_gate.limits, ...config.design_gate?.limits } };
+  const preCodeAttestation = resolvePreCodeAttestationConfig(config.pre_code_attestation);
   const autoMergeEligibility = { ...d.auto_merge_eligibility, ...config.auto_merge_eligibility };
 
   const optionalTop: string[] = [];
@@ -2928,6 +3095,46 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
         `#     max_decisions: ${yamlScalar(d.design_gate.limits.max_decisions)} # ${sd("design_gate.limits.max_decisions", "max decisions retained per record")}`,
         `#     max_field_chars: ${yamlScalar(d.design_gate.limits.max_field_chars)} # ${sd("design_gate.limits.max_field_chars", "max characters per free-text field before truncation")}`,
         `#     max_artifact_bytes: ${yamlScalar(d.design_gate.limits.max_artifact_bytes)} # ${sd("design_gate.limits.max_artifact_bytes", "max persisted artifact size in bytes")}`,
+      ].join("\n"),
+    "",
+    config.pre_code_attestation !== undefined
+      ? [
+        "pre_code_attestation: # opt-in pre-code human attestation for high-risk changes (#575)",
+        `  enabled: ${yamlScalar(preCodeAttestation.enabled)} # ${sd("pre_code_attestation.enabled", "set true to enable; omitted/false preserves autonomous planning→implementing")}`,
+        `  triggers: ${yamlInline(preCodeAttestation.triggers)} # ${sd("pre_code_attestation.triggers", "built-in risk classes armed")}; known: ${PRE_CODE_ATTESTATION_TRIGGER_CLASSES.join(", ")}`,
+        `  extra_triggers: ${yamlInline(preCodeAttestation.extra_triggers)} # ${sd("pre_code_attestation.extra_triggers", "path/label globs by class name")}`,
+        "  thresholds:",
+        `    max_files: ${yamlScalar(preCodeAttestation.thresholds.max_files)} # ${sd("pre_code_attestation.thresholds.max_files", "pre-code file estimate ceiling; null disables")}`,
+        `    max_loc: ${yamlScalar(preCodeAttestation.thresholds.max_loc)} # ${sd("pre_code_attestation.thresholds.max_loc", "pre-code LOC estimate ceiling; null disables")}`,
+        "  expiration:",
+        `    max_age_hours: ${yamlScalar(preCodeAttestation.expiration.max_age_hours)} # ${sd("pre_code_attestation.expiration.max_age_hours", "hours an approve remains current")}`,
+        `    reapprove_on: ${yamlInline(preCodeAttestation.expiration.reapprove_on)} # ${sd("pre_code_attestation.expiration.reapprove_on", "material change events requiring re-approval")}`,
+        `  approvers: ${yamlInline(preCodeAttestation.approvers)} # ${sd("pre_code_attestation.approvers", "ordered identity|group_ref|role|path_owner|risk_class rules")}`,
+        "  separation_of_duties:",
+        `    enabled: ${yamlScalar(preCodeAttestation.separation_of_duties.enabled)} # ${sd("pre_code_attestation.separation_of_duties.enabled", "block prohibited self-attestation when true")}`,
+        `    forbid_self_attest_roles: ${yamlInline(preCodeAttestation.separation_of_duties.forbid_self_attest_roles)} # ${sd("pre_code_attestation.separation_of_duties.forbid_self_attest_roles", "roles that cannot self-attest")}`,
+        "  wait:",
+        `    mode: ${yamlScalar(preCodeAttestation.wait.mode)} # ${sd("pre_code_attestation.wait.mode", "resume_safe|hard_block — never silent-approve")}`,
+        `    max_wait_hours: ${yamlScalar(preCodeAttestation.wait.max_wait_hours)} # ${sd("pre_code_attestation.wait.max_wait_hours", "bounded wait before typed exhaustion outcome")}`,
+      ].join("\n")
+      : [
+        "# pre_code_attestation: # opt-in pre-code human attestation for high-risk changes (#575). Disabled by default.",
+        `#   enabled: ${yamlScalar(d.pre_code_attestation.enabled)} # ${sd("pre_code_attestation.enabled", "set true to enable; omitted/false preserves autonomous planning→implementing")}`,
+        `#   triggers: ${yamlInline(d.pre_code_attestation.triggers)} # known: ${PRE_CODE_ATTESTATION_TRIGGER_CLASSES.join(", ")}`,
+        `#   extra_triggers: {} # path/label globs by class, e.g. {auth: ["**/oauth/**"]}`,
+        "#   thresholds:",
+        `#     max_files: null # pre-code file estimate ceiling`,
+        `#     max_loc: null # pre-code LOC estimate ceiling`,
+        "#   expiration:",
+        `#     max_age_hours: ${yamlScalar(d.pre_code_attestation.expiration.max_age_hours)}`,
+        `#     reapprove_on: ${yamlInline(d.pre_code_attestation.expiration.reapprove_on)}`,
+        `#   approvers: [] # e.g. [{kind: identity, identity: alice, risk_classes: [auth]}]`,
+        "#   separation_of_duties:",
+        `#     enabled: ${yamlScalar(d.pre_code_attestation.separation_of_duties.enabled)}`,
+        `#     forbid_self_attest_roles: ${yamlInline(d.pre_code_attestation.separation_of_duties.forbid_self_attest_roles)}`,
+        "#   wait:",
+        `#     mode: ${yamlScalar(d.pre_code_attestation.wait.mode)} # resume_safe|hard_block — never silent-approve`,
+        `#     max_wait_hours: ${yamlScalar(d.pre_code_attestation.wait.max_wait_hours)}`,
       ].join("\n"),
     "",
     "test_gate: # run the repo's tests/build before opening a PR",

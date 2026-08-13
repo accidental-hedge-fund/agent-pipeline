@@ -71,6 +71,7 @@ import { formatNoopAdvanceEvidenceNote } from "../scripts/noop-advance.ts";
 import { buildAutoRecoveryComment, buildAutoRecoveryLimitComment } from "../scripts/stages/auto_recover.ts";
 import { buildPipelineCompleteComment } from "../scripts/stages/deploy_ready.ts";
 import { buildDesignGateComment } from "../scripts/stages/design_gate.ts";
+import { buildPreCodeAttestationComment } from "../scripts/stages/pre_code_attestation.ts";
 import { formatEvidenceCommentBody } from "../scripts/evidence-bundle.ts";
 import {
   buildAuditRepairBlockedComment,
@@ -360,6 +361,27 @@ const KIND_RENDERERS: Record<string, () => string> = {
         outcome: null,
       } as DesignGateState,
       "Round 1 interrogation complete — do not proceed until challenges resolve.",
+    ),
+  "pre-code-attestation": () =>
+    buildPreCodeAttestationComment(
+      {
+        schema_version: 1,
+        enabled: true,
+        trigger: {
+          triggered: true,
+          matched: [{ trigger: "auth", evidence: 'path "src/auth.ts" matched glob "**/*auth*.*"' }],
+          reason: "triggered",
+        },
+        policy_hash: "a".repeat(64),
+        dossier_hash: "b".repeat(64),
+        dossier: null,
+        objectives: [],
+        attestations: [],
+        authorization_summary: null,
+        outcome: "waiting-for-attestation",
+        traces: [],
+      },
+      "Waiting for authorized human attestation — do not implement without approve.",
     ),
   unblocked: () =>
     buildUnblockedComment({ stage: "fix-2", ts: ts(0), answer: "don't retry the call — batch it instead" }),

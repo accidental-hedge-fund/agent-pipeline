@@ -76,6 +76,7 @@ test("state machine: STAGES order is forward", () => {
     "ready",
     "planning",
     "plan-review",
+    "pre-code-attestation",
     "implementing",
     "design-gate",
     "review-1",
@@ -90,6 +91,17 @@ test("state machine: STAGES order is forward", () => {
     "needs-human",
   ];
   assert.deepEqual([...STAGES], expected);
+});
+
+test("state machine: pre-code-attestation sits between plan-review and implementing (#575)", () => {
+  const stages = [...STAGES];
+  const planReviewIdx = stages.indexOf("plan-review");
+  const preCodeIdx = stages.indexOf("pre-code-attestation");
+  const implementingIdx = stages.indexOf("implementing");
+  const designGateIdx = stages.indexOf("design-gate");
+  assert.ok(preCodeIdx > planReviewIdx, "pre-code-attestation must come after plan-review");
+  assert.ok(preCodeIdx < implementingIdx, "pre-code-attestation must come before implementing");
+  assert.ok(designGateIdx > implementingIdx, "design-gate must remain after implementing");
 });
 
 test("state machine: visual-gate sits between pre-merge and eval-gate (#395)", () => {

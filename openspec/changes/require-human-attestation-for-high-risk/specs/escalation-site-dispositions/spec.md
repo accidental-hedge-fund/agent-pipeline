@@ -2,11 +2,7 @@
 
 ### Requirement: Pre-code attestation escalation sites SHALL declare closed dispositions
 
-Every production escalation emitter introduced for the pre-code attestation gate — including
-unauthorized approval, separation-of-duty failure, unresolved ownership, configuration-error
-surfaces that block advancement, attestation expiration invalidation that blocks implementing,
-attestor-unavailable / waiting-for-human holds, and post-approval scope mismatch returns to gate —
-SHALL appear in the escalation-site inventory with exactly one closed disposition:
+Pre-code attestation production escalation emitters SHALL appear in the escalation-site inventory with exactly one closed disposition, covering unauthorized approval, separation-of-duty failure, unresolved ownership, configuration-error surfaces that block advancement, attestation expiration invalidation that blocks implementing, attestor-unavailable / waiting-for-human holds, and post-approval scope mismatch returns to gate:
 
 - Integrity and authority failures (unauthorized, SoD, unresolved ownership, reject handling that
   blocks implementing, config-error fail-closed, scope-mismatch invalidation) SHALL be

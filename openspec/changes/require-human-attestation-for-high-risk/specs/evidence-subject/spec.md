@@ -2,12 +2,7 @@
 
 ### Requirement: Pre-code attestation and dossier evidence SHALL bind shared evidence_subject identity
 
-Pre-code attestation records and design-dossier revisions that participate in readiness or gate
-currency SHALL attach or reference the shared `evidence_subject` contract (or a documented binding
-to its policy and run identity dimensions). The effective attestation-policy configuration hash
-SHALL contribute to `policy_hash` (or an explicitly documented attestation-policy digest that
-invalidates on policy change under the same comparison rules). The pipeline SHALL NOT invent a
-second subject vocabulary solely for pre-code attestation.
+Pre-code attestation records and design-dossier revisions that participate in readiness or gate currency SHALL attach or reference the shared `evidence_subject` contract (or a documented binding to its policy and run identity dimensions). The effective attestation-policy configuration hash SHALL contribute to `policy_hash` (or an explicitly documented attestation-policy digest that invalidates on policy change under the same comparison rules). The pipeline SHALL NOT invent a second subject vocabulary solely for pre-code attestation.
 
 #### Scenario: attestation policy change mismatches policy dimension
 

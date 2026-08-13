@@ -126,6 +126,7 @@ import * as preMergeStage from "./stages/pre_merge.ts";
 import * as evalStage from "./stages/eval.ts";
 import * as visualStage from "./stages/visual.ts";
 import * as designGateStage from "./stages/design_gate.ts";
+import * as preCodeAttestationStage from "./stages/pre_code_attestation.ts";
 import * as shipchecKStage from "./stages/shipcheck.ts";
 import * as deployReady from "./stages/deploy_ready.ts";
 import * as autoRecover from "./stages/auto_recover.ts";
@@ -801,6 +802,11 @@ export async function dispatch(
       }
       return readyDeps.planningAdvance(cfg, issueNumber, { dryRun, model, pipelineRunId, stateDir, runDir, runStoreDeps });
     }
+    case "pre-code-attestation":
+      return preCodeAttestationStage.advancePreCodeAttestation(cfg, issueNumber, {
+        dryRun,
+        stateDir,
+      });
     case "design-gate":
       return designGateStage.advanceDesignGate(cfg, issueNumber, { dryRun, stateDir });
     case "review-1":

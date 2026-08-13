@@ -111,10 +111,7 @@ relevant failure, retry, and concurrency cases for that slice. Each contract SHA
 
 ### Requirement: Derived behaviors SHALL require explicit accept or reject at attestation
 
-Any behavior inferred from the issue, repository, or surrounding context rather than explicitly
-stated by the requester SHALL be marked `origin: derived`. During attestation, each derived behavior
-SHALL receive an explicit `accept` or `reject` disposition. Rejected derived behaviors SHALL NOT
-remain in the approved dossier set. Pending derived dispositions SHALL block approval.
+Any behavior inferred from the issue, repository, or surrounding context rather than explicitly stated by the requester SHALL be marked `origin: derived`. During attestation, each derived behavior SHALL receive an explicit `accept` or `reject` disposition. Rejected derived behaviors SHALL NOT remain in the approved dossier set. Pending derived dispositions SHALL block approval.
 
 #### Scenario: derived behavior pending blocks approval
 
