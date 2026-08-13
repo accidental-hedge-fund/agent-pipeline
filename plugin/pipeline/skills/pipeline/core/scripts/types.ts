@@ -763,6 +763,26 @@ export interface PipelineConfig {
     /** Allowlisted per-test extractor ids (default empty = command-level only). */
     extractors: string[];
   };
+  /**
+   * Trusted-surface rebind (#691). Optional additive path coverage only —
+   * repository config MUST NOT disable or shrink built-in verifier-sensitive
+   * classes. Default empty extra_paths preserves passthrough for candidates
+   * that touch no sensitive paths.
+   */
+  trusted_surface: {
+    /** Extend built-in class globs; never replace or disable classes. */
+    extra_paths: Array<{
+      class:
+        | "engine_core"
+        | "engine_prompts"
+        | "repo_policy"
+        | "gate_commands"
+        | "evidence_schemas"
+        | "eval_rubrics"
+        | "ownership_authority";
+      globs: string[];
+    }>;
+  };
   // Test/build gate (#15). When enabled, the target repo's own test/build
   // command runs in the worktree during implementation and after each fix
   // round; on failure a bounded generate→test→fix loop runs before a PR is
@@ -1187,6 +1207,20 @@ export const DEFAULT_CONFIG: Omit<
     max_output_chars: 4000,
     max_artifact_chars: 48_000,
     extractors: [] as string[],
+  },
+  // Trusted-surface rebind (#691): additive path coverage only; empty by default.
+  trusted_surface: {
+    extra_paths: [] as Array<{
+      class:
+        | "engine_core"
+        | "engine_prompts"
+        | "repo_policy"
+        | "gate_commands"
+        | "evidence_schemas"
+        | "eval_rubrics"
+        | "ownership_authority";
+      globs: string[];
+    }>,
   },
   doctor: { runOnStart: false, failFast: false },
   papercuts: {
@@ -1786,6 +1820,12 @@ export interface EvidenceBundle {
    * repair subjects. Additive; pre-#692 bundles omit it.
    */
   evidence_subject_diagnostics?: import("./evidence-subject.ts").EvidenceSubjectDiagnostic[];
+  /**
+   * Trusted-surface decision for this run (#691). Written by deterministic
+   * engine code when a decision was computed. Historical bundles MAY omit it;
+   * consumers MUST NOT invent `passthrough` for a missing record.
+   */
+  trusted_surface?: import("./trusted-surface.ts").TrustedSurfaceDecision;
 }
 
 /** Pre-merge delta-round accounting (#483): the item's durable delta-round

@@ -32,6 +32,7 @@ import {
   registeredAdapterNames,
 } from "./harness-adapters/index.ts";
 import { isSafeScratchExtensionGlob } from "./worktree-dirt.ts";
+import { TRUSTED_SURFACE_CLASS_IDS } from "./trusted-surface.ts";
 
 // A `models.*`/`effort.*` value: an arbitrary alias/effort string, or the
 // "auto" sentinel (#366) resolved via stage-routing.ts at config-load time.
@@ -909,6 +910,32 @@ const PartialConfigSchema = z.object({
     .describe(
       "Git push authentication for every authoritative pipeline-owned delivery push (#980). Default when absent: ssh.",
     ),
+  // Trusted-surface rebind (#691). Additive path coverage only. Strict object
+  // rejects disable/shrink/use-candidate keys (disable_classes, classes, etc.).
+  trusted_surface: z
+    .object({
+      extra_paths: z
+        .array(
+          z
+            .object({
+              class: z.enum(TRUSTED_SURFACE_CLASS_IDS).describe("Built-in path class to extend."),
+              globs: z
+                .array(z.string().min(1))
+                .min(1)
+                .describe("Additional path globs merged into the class."),
+            })
+            .strict(),
+        )
+        .optional()
+        .describe(
+          "Additive path globs that extend built-in verifier-sensitive classes. Cannot disable or replace built-in classes.",
+        ),
+    })
+    .strict()
+    .optional()
+    .describe(
+      "Trusted-surface path coverage (#691). Only additive extra_paths are accepted; built-in classes remain engine-defined.",
+    ),
 }).strict();
 
 type PartialConfig = z.infer<typeof PartialConfigSchema>;
@@ -1495,6 +1522,13 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
         fileConfig.tester_evidence?.extractors ??
         [...DEFAULT_CONFIG.tester_evidence.extractors],
     },
+    trusted_surface: {
+      extra_paths: (fileConfig.trusted_surface?.extra_paths ??
+        DEFAULT_CONFIG.trusted_surface.extra_paths).map((e) => ({
+        class: e.class,
+        globs: [...e.globs],
+      })),
+    },
     doctor: {
       runOnStart: fileConfig.doctor?.runOnStart ?? DEFAULT_CONFIG.doctor.runOnStart,
       failFast: fileConfig.doctor?.failFast ?? DEFAULT_CONFIG.doctor.failFast,
@@ -1592,6 +1626,298 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     warnInertEffort(fileConfig.effort, merged.harnesses);
   }
   return merged;
+}
+
+/**
+ * Overlay verification-sensitive fields from a trusted base `pipeline.yml`
+ * (or engine defaults when the base file is confirmed absent) onto a live
+ * config object. Used when trusted-surface outcome is `rebound` for
+ * `repo_policy` so the candidate cannot weaken judging via its own copy (#691).
+ *
+ * Mutates `cfg` in place. Returns which field groups were rebound.
+ */
+export function applyTrustedVerificationPolicy(
+  cfg: PipelineConfig,
+  basePipelineYml: string | null,
+): { ok: true; applied: string[] } | { ok: false; reason: string } {
+  let fileConfig: PartialConfig = {};
+  if (basePipelineYml !== null) {
+    let parsed: unknown;
+    try {
+      parsed = yaml.load(basePipelineYml);
+    } catch (err) {
+      return {
+        ok: false,
+        reason: `trusted base pipeline.yml parse failed: ${(err as Error).message}`,
+      };
+    }
+    if (parsed && typeof parsed === "object") {
+      const result = PartialConfigSchema.safeParse(parsed);
+      if (!result.success) {
+        const errors = flattenIssues(result.error.issues)
+          .map((i) => `${i.path.join(".") || "<root>"}: ${i.message}`)
+          .join("; ");
+        return {
+          ok: false,
+          reason: `trusted base pipeline.yml invalid: ${errors}`,
+        };
+      }
+      fileConfig = result.data;
+    }
+  }
+  // null base → engine defaults for verification fields (absence, not candidate).
+
+  const applied: string[] = [];
+
+  cfg.review_policy = {
+    block_threshold:
+      fileConfig.review_policy?.block_threshold ?? DEFAULT_CONFIG.review_policy.block_threshold,
+    min_confidence:
+      fileConfig.review_policy?.min_confidence ?? DEFAULT_CONFIG.review_policy.min_confidence,
+    max_adversarial_rounds:
+      fileConfig.review_policy?.max_adversarial_rounds ??
+      DEFAULT_CONFIG.review_policy.max_adversarial_rounds,
+    risk_proportional:
+      fileConfig.review_policy?.risk_proportional ?? DEFAULT_CONFIG.review_policy.risk_proportional,
+    ceiling_action:
+      fileConfig.review_policy?.ceiling_action ?? DEFAULT_CONFIG.review_policy.ceiling_action,
+    surface_recurrence_rounds:
+      fileConfig.review_policy?.surface_recurrence_rounds ??
+      DEFAULT_CONFIG.review_policy.surface_recurrence_rounds,
+    max_delta_rounds:
+      fileConfig.review_policy?.max_delta_rounds ?? DEFAULT_CONFIG.review_policy.max_delta_rounds,
+  };
+  applied.push("review_policy");
+
+  cfg.test_gate = {
+    enabled: fileConfig.test_gate?.enabled ?? DEFAULT_CONFIG.test_gate.enabled,
+    command: fileConfig.test_gate?.command,
+    max_attempts: fileConfig.test_gate?.max_attempts ?? DEFAULT_CONFIG.test_gate.max_attempts,
+    timeout: fileConfig.test_gate?.timeout ?? DEFAULT_CONFIG.test_gate.timeout,
+    non_product_dirty_globs: fileConfig.test_gate?.non_product_dirty_globs,
+  };
+  applied.push("test_gate");
+
+  cfg.eval_gate = {
+    enabled: fileConfig.eval_gate?.enabled ?? DEFAULT_CONFIG.eval_gate.enabled,
+    command: fileConfig.eval_gate?.command,
+    mode: fileConfig.eval_gate?.mode ?? DEFAULT_CONFIG.eval_gate.mode,
+    timeout: fileConfig.eval_gate?.timeout ?? DEFAULT_CONFIG.eval_gate.timeout,
+    max_attempts: fileConfig.eval_gate?.max_attempts ?? DEFAULT_CONFIG.eval_gate.max_attempts,
+  };
+  applied.push("eval_gate");
+
+  cfg.visual_gate = {
+    enabled: fileConfig.visual_gate?.enabled ?? DEFAULT_CONFIG.visual_gate.enabled,
+    command: fileConfig.visual_gate?.command,
+    mode: fileConfig.visual_gate?.mode ?? DEFAULT_CONFIG.visual_gate.mode,
+    timeout: fileConfig.visual_gate?.timeout ?? DEFAULT_CONFIG.visual_gate.timeout,
+    max_attempts: fileConfig.visual_gate?.max_attempts ?? DEFAULT_CONFIG.visual_gate.max_attempts,
+    artifacts_dir: fileConfig.visual_gate?.artifacts_dir ?? DEFAULT_CONFIG.visual_gate.artifacts_dir,
+    publish: fileConfig.visual_gate?.publish ?? DEFAULT_CONFIG.visual_gate.publish,
+  };
+  applied.push("visual_gate");
+
+  cfg.shipcheck_gate = {
+    enabled: fileConfig.shipcheck_gate?.enabled ?? DEFAULT_CONFIG.shipcheck_gate.enabled,
+    mode: fileConfig.shipcheck_gate?.mode ?? DEFAULT_CONFIG.shipcheck_gate.mode,
+    max_rounds: fileConfig.shipcheck_gate?.max_rounds ?? DEFAULT_CONFIG.shipcheck_gate.max_rounds,
+    rubric_path:
+      fileConfig.shipcheck_gate?.rubric_path ?? DEFAULT_CONFIG.shipcheck_gate.rubric_path,
+    block_on_partial:
+      fileConfig.shipcheck_gate?.block_on_partial ?? DEFAULT_CONFIG.shipcheck_gate.block_on_partial,
+  };
+  applied.push("shipcheck_gate");
+
+  cfg.design_gate = {
+    enabled: fileConfig.design_gate?.enabled ?? DEFAULT_CONFIG.design_gate.enabled,
+    triggers: fileConfig.design_gate?.triggers ?? DEFAULT_CONFIG.design_gate.triggers,
+    extra_triggers:
+      fileConfig.design_gate?.extra_triggers ?? DEFAULT_CONFIG.design_gate.extra_triggers,
+    max_rounds: fileConfig.design_gate?.max_rounds ?? DEFAULT_CONFIG.design_gate.max_rounds,
+    block_threshold:
+      fileConfig.design_gate?.block_threshold ?? DEFAULT_CONFIG.design_gate.block_threshold,
+    min_confidence:
+      fileConfig.design_gate?.min_confidence ?? DEFAULT_CONFIG.design_gate.min_confidence,
+    limits: {
+      max_decisions:
+        fileConfig.design_gate?.limits?.max_decisions ??
+        DEFAULT_CONFIG.design_gate.limits.max_decisions,
+      max_field_chars:
+        fileConfig.design_gate?.limits?.max_field_chars ??
+        DEFAULT_CONFIG.design_gate.limits.max_field_chars,
+      max_artifact_bytes:
+        fileConfig.design_gate?.limits?.max_artifact_bytes ??
+        DEFAULT_CONFIG.design_gate.limits.max_artifact_bytes,
+    },
+  };
+  applied.push("design_gate");
+
+  cfg.tester_evidence = {
+    on_missing:
+      fileConfig.tester_evidence?.on_missing ?? DEFAULT_CONFIG.tester_evidence.on_missing,
+    max_output_chars:
+      fileConfig.tester_evidence?.max_output_chars ??
+      DEFAULT_CONFIG.tester_evidence.max_output_chars,
+    max_artifact_chars:
+      fileConfig.tester_evidence?.max_artifact_chars ??
+      DEFAULT_CONFIG.tester_evidence.max_artifact_chars,
+    extractors:
+      fileConfig.tester_evidence?.extractors ??
+      [...DEFAULT_CONFIG.tester_evidence.extractors],
+  };
+  applied.push("tester_evidence");
+
+  cfg.trusted_surface = {
+    extra_paths: (fileConfig.trusted_surface?.extra_paths ??
+      DEFAULT_CONFIG.trusted_surface.extra_paths).map((e) => ({
+      class: e.class,
+      globs: [...e.globs],
+    })),
+  };
+  applied.push("trusted_surface");
+
+  cfg.ci_mode = fileConfig.ci_mode ?? DEFAULT_CONFIG.ci_mode;
+  cfg.ci_timeout = fileConfig.ci_timeout ?? DEFAULT_CONFIG.ci_timeout;
+  cfg.ci_poll_interval = fileConfig.ci_poll_interval ?? DEFAULT_CONFIG.ci_poll_interval;
+  cfg.ci_no_run_grace_s = fileConfig.ci_no_run_grace_s ?? DEFAULT_CONFIG.ci_no_run_grace_s;
+  cfg.pre_merge_ci_assertion_fix =
+    fileConfig.pre_merge_ci_assertion_fix ?? DEFAULT_CONFIG.pre_merge_ci_assertion_fix;
+  cfg.pre_merge_ci_rerun_enabled =
+    fileConfig.pre_merge_ci_rerun_enabled ?? DEFAULT_CONFIG.pre_merge_ci_rerun_enabled;
+  applied.push("ci");
+
+  // Gate command identity from base package.json (when provided separately by
+  // the caller via test_gate.command already set above from trusted yml).
+  return { ok: true, applied };
+}
+
+/**
+ * Package-manager script runners that re-read `package.json` at gate time.
+ * A trusted bind must expand these against the base scripts map so the
+ * candidate worktree cannot supply a weakened scripts.test (or nested script).
+ *
+ * Supports common CLI shapes (flags before/after `run`, dotted script names):
+ *   npm test | pnpm test | yarn test
+ *   npm run unit | npm run-script unit
+ *   npm --silent run verify | npm run --if-present verify
+ *   npm run test.unit
+ *
+ * Source only — each expand call constructs a fresh /g RegExp so recursive
+ * expansion cannot clobber lastIndex on a shared instance.
+ */
+const PM_FLAG = String.raw`(?:--?[A-Za-z][\w-]*(?:=[^\s]*)?)`;
+const PM_SCRIPT_NAME = String.raw`([A-Za-z0-9][\w:.-]*)`;
+const PM_SCRIPT_RUNNER_SOURCE =
+  String.raw`\b(?:npm|pnpm|yarn)(?:\s+${PM_FLAG})*\s+(?:run(?:-script)?(?:\s+${PM_FLAG})*\s+${PM_SCRIPT_NAME}|test)\b`;
+
+/**
+ * Residual package-manager tokens. After expansion any remaining
+ * `npm`/`pnpm`/`yarn` means we could not fully bind against the trusted
+ * scripts map (unsupported runner form, incomplete match, etc.) — fail
+ * closed rather than re-resolve against the candidate worktree.
+ */
+const RESIDUAL_PM_TOKEN = /\b(?:npm|pnpm|yarn)\b/;
+
+/**
+ * Expand one named script from a trusted scripts map, including npm-style
+ * pre/post lifecycle scripts (`pretest`/`posttest`, `preunit`/`postunit`, …).
+ * Nested package-manager runners inside those bodies are expanded the same way.
+ * Cycles, missing scripts, and residual unresolved runners fail closed (null).
+ */
+export function expandTrustedNamedScript(
+  name: string,
+  scripts: Record<string, string>,
+  stack: ReadonlySet<string> = new Set(),
+): string | null {
+  if (stack.has(name)) return null;
+  const target = scripts[name];
+  if (typeof target !== "string" || !target.trim()) return null;
+  const nextStack = new Set(stack);
+  nextStack.add(name);
+
+  const preName = `pre${name}`;
+  const postName = `post${name}`;
+  const preBody = scripts[preName];
+  const postBody = scripts[postName];
+  const hasPre = typeof preBody === "string" && !!preBody.trim();
+  const hasPost = typeof postBody === "string" && !!postBody.trim();
+
+  const parts: string[] = [];
+  if (hasPre) {
+    const preExpanded = expandTrustedPackageScriptBody(preBody.trim(), scripts, nextStack);
+    if (preExpanded === null) return null;
+    parts.push(`(${preExpanded})`);
+  }
+  const mainExpanded = expandTrustedPackageScriptBody(target.trim(), scripts, nextStack);
+  if (mainExpanded === null) return null;
+  // Parenthesize main when combining with lifecycle hooks so `&&` precedence
+  // matches package-manager semantics (pre && main && post).
+  parts.push(hasPre || hasPost ? `(${mainExpanded})` : mainExpanded);
+  if (hasPost) {
+    const postExpanded = expandTrustedPackageScriptBody(postBody.trim(), scripts, nextStack);
+    if (postExpanded === null) return null;
+    parts.push(`(${postExpanded})`);
+  }
+  return parts.join(" && ");
+}
+
+/**
+ * Inline trusted package.json script references so the gate command never
+ * re-resolves `npm test` / `pnpm run …` against the candidate package.json.
+ * Named runners expand with pre/post lifecycle scripts from the same map.
+ * Unknown, cyclic, or residual unresolved package-manager runners fail closed
+ * (null).
+ */
+export function expandTrustedPackageScriptBody(
+  body: string,
+  scripts: Record<string, string>,
+  stack: ReadonlySet<string> = new Set(),
+): string | null {
+  const re = new RegExp(PM_SCRIPT_RUNNER_SOURCE, "g");
+  let out = "";
+  let last = 0;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(body)) !== null) {
+    const name = match[1] ?? "test";
+    const inner = expandTrustedNamedScript(name, scripts, stack);
+    if (inner === null) return null;
+    out += body.slice(last, match.index) + `(${inner})`;
+    last = match.index + match[0].length;
+  }
+  out += body.slice(last);
+  // Trust boundary: partial regex coverage must not leave a package-manager
+  // token that could re-read the candidate package.json (or other PM state).
+  if (RESIDUAL_PM_TOKEN.test(out)) return null;
+  return out;
+}
+
+/**
+ * Derive an explicit test command from a trusted base `package.json` body.
+ * Returns the expanded base `scripts.test` body (including `pretest` /
+ * `posttest` lifecycle scripts and nested pre/post for inlined runners) so
+ * the gate runs those authoritative bytes via `bash -c` — never a bare
+ * `npm test` / `pnpm test`, which would re-resolve scripts from the candidate
+ * worktree. Returns null when no scripts.test is present or expansion fails
+ * closed. Never reads the candidate tree.
+ */
+export function testCommandFromPackageJson(packageJsonText: string): string | null {
+  try {
+    const pkg = JSON.parse(packageJsonText) as { scripts?: Record<string, unknown> };
+    const rawScripts = pkg.scripts;
+    if (!rawScripts || typeof rawScripts !== "object") return null;
+    const scripts: Record<string, string> = {};
+    for (const [k, v] of Object.entries(rawScripts)) {
+      if (typeof v === "string" && v.trim()) scripts[k] = v.trim();
+    }
+    if (!scripts.test) return null;
+    // Expand named `test` with lifecycle + nested runners against base scripts
+    // only. The gate then executes this body in the candidate worktree
+    // (product code under test) without consulting candidate package.json#scripts.
+    return expandTrustedNamedScript("test", scripts, new Set());
+  } catch {
+    return null;
+  }
 }
 
 // Each `models.*` alias is honored by exactly one harness role. `models.review`
@@ -2731,6 +3057,27 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
           `#   extractors: [] # ${sd("tester_evidence.extractors", "allowlisted per-test extractor ids; default empty = command-level only")}`,
         ].join("\n"),
     "",
+    // trusted_surface (#691): additive path coverage only; omit for built-in classes alone.
+    config.trusted_surface !== undefined &&
+      Array.isArray(config.trusted_surface.extra_paths) &&
+      config.trusted_surface.extra_paths.length > 0
+      ? [
+          "trusted_surface: # verifier-sensitive path coverage (#691) — additive only; cannot disable built-in classes",
+          "  extra_paths:",
+          ...config.trusted_surface.extra_paths.flatMap((e) => [
+            `    - class: ${yamlScalar(e.class)} # ${sd("trusted_surface.extra_paths", "built-in class id to extend")}`,
+            "      globs:",
+            ...e.globs.map((g) => `        - ${yamlScalar(g)}`),
+          ]),
+        ].join("\n")
+      : [
+          "# trusted_surface: # verifier-sensitive path coverage (#691) — additive only; cannot disable built-in classes",
+          `#   extra_paths: # ${sd("trusted_surface.extra_paths", "optional globs merged into built-in classes (engine_core, engine_prompts, repo_policy, gate_commands, evidence_schemas, eval_rubrics, ownership_authority)")}`,
+          "#     - class: eval_rubrics",
+          "#       globs:",
+          "#         - qa/rubrics/**",
+        ].join("\n"),
+    "",
     "doctor: # deterministic preflight capability check (#146) — run `pipeline doctor` standalone, or enable run-start gating here",
     `  runOnStart: ${yamlScalar(doctor.runOnStart)} # ${sd("doctor.runOnStart", "run preflight checks before planning; abort on any failure")}`,
     `  failFast: ${yamlScalar(doctor.failFast)} # ${sd("doctor.failFast", "stop at the first failing check instead of collecting all failures")}`,
@@ -3059,6 +3406,11 @@ function normalizeForSync(config: PartialConfig): unknown {
       ...d.tester_evidence,
       ...config.tester_evidence,
       extractors: config.tester_evidence?.extractors ?? [...d.tester_evidence.extractors],
+    },
+    trusted_surface: {
+      extra_paths:
+        config.trusted_surface?.extra_paths ??
+        d.trusted_surface.extra_paths,
     },
     doctor: { ...d.doctor, ...config.doctor },
     loop: { ...d.loop, ...config.loop },

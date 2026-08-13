@@ -1032,6 +1032,19 @@ Nested fields:
 - **Type:** array of string
 - **Description:** Additional GitHub identities whose override sentinels are trusted besides the current pipeline actor.
 
+### `trusted_surface`
+
+- **Type:** object
+- **Default:** `{"extra_paths":[]}`
+- **Description:** Trusted-surface path coverage (#691). Only additive extra_paths are accepted; built-in classes remain engine-defined.
+
+Nested fields:
+
+#### `trusted_surface.extra_paths`
+
+- **Type:** array of object
+- **Description:** Additive path globs that extend built-in verifier-sensitive classes. Cannot disable or replace built-in classes.
+
 ### `visual_gate`
 
 - **Type:** object

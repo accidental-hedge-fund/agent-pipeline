@@ -23,12 +23,17 @@
 //     subject that claims a fabricated engine pin (fail closed / omit readiness).
 //
 //   verifier_fingerprint
-//     sha256 hex of the family verifier/prompt surface. Review: sorted prompt
-//     template names + content hashes for review-related templates when known, or
-//     a documented derivation equal to engine_fingerprint when no distinct surface
-//     is available. Tester: stable JSON of toolchain_fingerprint + command identity
-//     (or engine_fingerprint when no distinct toolchain). Always present on a
-//     well-formed v1 subject.
+//     When a trusted-surface decision (#691) is present for the run with a
+//     resolved effective_verifier_hash, producers SHALL set this field to that
+//     hash or a documented pure derivation that includes that hash plus any
+//     family-local verifier slice (see verifierFingerprintFromTrustedSurface).
+//     When no decision is present, legacy family-local behavior applies:
+//     Review: sorted prompt template names + content hashes when known, or a
+//     documented derivation equal to engine_fingerprint. Tester: stable JSON of
+//     toolchain_fingerprint + command identity (or engine_fingerprint when no
+//     distinct toolchain). Always present on a well-formed v1 subject. Blocked
+//     trusted-surface outcomes MUST NOT invent a matching fingerprint for
+//     readiness pass (fail closed / omit subject).
 //
 //   required_evidence_set_revision
 //     sha256 hex of stable JSON { kinds: string[] } with kinds sorted uniquely —
@@ -188,6 +193,46 @@ export function verifierFingerprintFromEngine(engineFingerprint: string): string
     derived_from: "engine",
     engine_fingerprint: engineFingerprint,
   });
+}
+
+/**
+ * Prefer trusted-surface effective verifier identity (#691) when a decision is
+ * present and resolvable. Falls back to engine-derived fingerprint for
+ * historical / no-decision runs. Returns null when decision is blocked (fail
+ * closed — caller must not emit a readiness pass subject).
+ */
+export function resolveVerifierFingerprint(input: {
+  engineFingerprint: string;
+  trustedSurface?: {
+    outcome: string;
+    effective_verifier_hash: string | null;
+  } | null;
+  familyLocal?: Record<string, unknown> | null;
+}): string | null {
+  const ts = input.trustedSurface;
+  if (ts) {
+    if (ts.outcome === "blocked") return null;
+    const h = ts.effective_verifier_hash;
+    if (typeof h === "string" && h.length > 0) {
+      if (input.familyLocal && Object.keys(input.familyLocal).length > 0) {
+        return buildVerifierFingerprint({
+          trusted_surface_effective_verifier_hash: h,
+          family_local: input.familyLocal,
+        });
+      }
+      return h;
+    }
+    // Decision present but no usable pin — fail closed.
+    return null;
+  }
+  if (input.familyLocal && Object.keys(input.familyLocal).length > 0) {
+    return buildVerifierFingerprint({
+      derived_from: "engine",
+      engine_fingerprint: input.engineFingerprint,
+      family_local: input.familyLocal,
+    });
+  }
+  return verifierFingerprintFromEngine(input.engineFingerprint);
 }
 
 /**

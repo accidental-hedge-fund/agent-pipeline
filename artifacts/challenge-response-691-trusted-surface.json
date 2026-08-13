@@ -1,0 +1,359 @@
+{
+  "responses": [
+    {
+      "challengeKey": "d6de0baa",
+      "disposition": "revised",
+      "evidence": "Falsifier holds against current wiring: pipeline-run ensureTrustedSurfaceDecision passes cfg.trusted_surface.extra_paths from resolveConfig on the candidate worktree (core/scripts/pipeline-run.ts ~1276–1302; trusted-surface.ts classifyPaths/globsForClass use that list). Base-declared extras are not loaded. A candidate that deletes trusted_surface.extra_paths from .github/pipeline.yml and weakens a previously covered local gate/rubric can classify as passthrough. d1 revised: classification extras are resolved from base_ref repo_policy (union built-ins + base extras + optional candidate-only additive extras); candidate deletion cannot shrink coverage. Required regression: base extras cover a local path, candidate removes extras and weakens that path → rebound or blocked."
+    },
+    {
+      "challengeKey": "3143e32d",
+      "disposition": "revised",
+      "evidence": "Falsifier holds: hashEnginePin (trusted-surface.ts) digests only version, templates_fingerprint, optional root, optional commit_sha. engine-identity resolvePinnedEngineIdentity likewise omits a content hash of judging engine_core modules (only package.json version + templatesFingerprint + optional git commit). Editing installed core/scripts/*.ts without version/template/commit change leaves effective_verifier_hash unchanged. d3 revised: TrustedEnginePin requires modules_fingerprint (process-start content digest of installed engine_core judging modules, same pattern as templates_fingerprint); hashEnginePin includes it; missing modules_fingerprint fails closed on readiness like missing templates_fingerprint; mid-run probe re-hash can drift-invalidate. Residual: already-imported module memory vs disk until process restart is handled by fail-closed invalidation on disk probe change, not by claiming in-memory rebind without restart."
+    },
+    {
+      "challengeKey": "c9c63ccd",
+      "disposition": "revised",
+      "evidence": "Falsifier holds: rebound today records hashes and allowsReadyToDeploy(true) while resolveConfig still reads worktree .github/pipeline.yml and gate stages execute candidate-side commands/scripts; ensureTrustedSurfaceDecision does not rebind loaders. Prior d5 required (a) load-from-trusted or (b) digest-gate but left class→loader map unspecified. d5 revised with explicit v1 CLASS_LIVE_ENFORCEMENT map for every base_ref and installed_engine class (repo_policy→base config resolution or digest gate; gate_commands→trusted command identity + referenced script bytes; evidence_schemas/eval_rubrics/ownership_authority→base or engine pin loaders; engine_*→process pin). Newly base-absent sensitive files rebound to engine_default/absence and MUST NOT become live acceptance authority. End-to-end injectable fixtures required per class proving candidate-weakened bytes cannot reach readiness."
+    },
+    {
+      "challengeKey": "167d2ee1",
+      "disposition": "revised",
+      "evidence": "Falsifier holds: computeTrustedSurfaceDecision untouched base_ref branch sets trustedHash = engineDefaultHash(classId) for all untouched classes (trusted-surface.ts ~484–500), so concrete base .github/pipeline.yml content does not enter effective_verifier_hash on product-only passthrough even though resolveConfig always loads it when present. d6 revised: engine-defined ALWAYS_CONSULTED_VERIFIER_PATHS and CONDITIONAL_CONSULT_RULES constants. Always: installed engine pin (including modules_fingerprint); base blobs for .github/pipeline.yml|.yaml when present at base_sha (repo_policy). Conditional: enabled test/eval/visual/shipcheck gate command strings and referenced script paths from trusted policy; eval/visual/shipcheck rubric paths when those gates enabled; evidence schema modules for families in resolveRequiredEvidenceKinds; ownership/authority maps when override/authority resolution runs. engineDefaultHash only for true absence or documented not-on-path. Tests: matrix changing each always-consulted base blob alters effective_verifier_hash (or blocks) with product-only candidate_paths."
+    },
+    {
+      "challengeKey": "16d2e94c",
+      "disposition": "revised",
+      "evidence": "Falsifier holds: checkEngineDrift on effectiveVerifierHashChanged only console.warns (pipeline-run.ts ~1354–1370); no durable invalidation artifact, no affected-family mapping, no readiness refuse until regeneration. ensureTrustedSurfaceDecision early-returns when candidate_sha unchanged, so identity drift without HEAD advance does not re-pin or invalidate evidence. d5 revised mid-run section: durable verifier_invalidation (or equivalent run-store marker) with previous_hash, next_hash, stage, at, affected_evidence_families; class→family map; readiness composition treats prior verifier_fingerprint-bound evidence as non-current; finalize refuses ready-to-deploy while invalidation is open without replacement evidence under the new identity. Fault-injection regression required."
+    }
+  ],
+  "decision_record": {
+    "schema_version": 1,
+    "decisions": [
+      {
+        "id": "d1",
+        "title": "Engine-owned path-class registry; classification extras from trusted base (additive only)",
+        "surface": "core/scripts/trusted-surface.ts (PATH_CLASS_SCHEMA_VERSION, TRUSTED_SURFACE_CLASS_IDS, BUILTIN_CLASS_GLOBS, globsForClass, classifyPaths); core/scripts/config.ts (PartialConfigSchema.trusted_surface); core/scripts/pipeline-run.ts ensureTrustedSurfaceDecision; docs/config.md; openspec/.../specs/trusted-surface-rebind/spec.md; openspec/.../specs/pipeline-configuration/spec.md",
+        "alternatives": [
+          {
+            "option": "Fully config-driven classes and globs in .github/pipeline.yml",
+            "rejected_because": "A candidate can remove or rewrite the sensitive-class list and self-judge under a weaker surface."
+          },
+          {
+            "option": "Treat every repository file as verifier-sensitive",
+            "rejected_because": "Issue non-goal; causes constant rebound noise and breaks ordinary product-PR passthrough."
+          },
+          {
+            "option": "Resolve extra_paths only from candidate worktree resolveConfig",
+            "rejected_because": "Candidate can delete base-declared trusted_surface.extra_paths and shrink classification so a weakened local gate/rubric becomes silent passthrough (challenge d6de0baa)."
+          }
+        ],
+        "assumptions": [
+          "The running installed engine is a higher-trust authority than candidate worktree content for defining which paths are sensitive.",
+          "Repositories may need extra globs for local rubric/gate layout without redefining built-in classes.",
+          "Base-ref .github/pipeline.yml is readable whenever base_sha is available for readiness-relevant runs that may use extras."
+        ],
+        "invariants": [
+          "path_class_schema_version starts at 1 and includes engine_core, engine_prompts, repo_policy, gate_commands, evidence_schemas, eval_rubrics, ownership_authority.",
+          "Repository config accepts only additive trusted_surface.extra_paths under a strict Zod object; disable/shrink keys are rejected.",
+          "Built-in globs live in engine code; candidate content cannot redefine class membership for the decision.",
+          "Effective classification globs for a run = BUILTIN_CLASS_GLOBS ∪ extra_paths from base_ref repo_policy pipeline.yml (when base readable) ∪ optional candidate-declared extra_paths applied only as set-union (never set-minus).",
+          "Deleting or omitting base-declared extras on the candidate MUST NOT remove those globs from classification for that candidate.",
+          "If base_sha/base reader is required to load base extras and is unavailable while the candidate changed repo_policy or any path that would only match via unknown extras, fail closed (blocked) rather than classify under candidate-shrunk coverage alone.",
+          "Tests MUST prove: base declares extra_paths covering a local gate/rubric; candidate removes that declaration and weakens the covered file → outcome rebound or blocked, not passthrough."
+        ],
+        "evidence": [
+          "Pre-revise gap: ensureTrustedSurfaceDecision uses cfg.trusted_surface?.extra_paths from candidate resolveConfig only.",
+          "core/scripts/config.ts: trusted_surface z.object({ extra_paths }).strict().optional() with class enum restricted to TRUSTED_SURFACE_CLASS_IDS.",
+          "core/test/config.test.ts: disable_classes and use_candidate_as_trusted rejected.",
+          "Challenge d6de0baa falsifier accepted; d1 revised for base-sourced additive extras."
+        ],
+        "generalization_boundary": "Stops at v1 built-in class set and additive globs. Does not version arbitrary future class semantics for consumers that skip path_class_schema_version gates. Does not detect semantic sensitivity outside glob match. Does not treat candidate-only extra_paths as a way to shrink builtins.",
+        "uncertainty": "Low on the base-union rule after revision. Residual: if base pipeline.yml is malformed for extras parse, implementation must fail closed or fall back to builtins-only with an explicit reason — not candidate extras alone when base declared coverage."
+      },
+      {
+        "id": "d2",
+        "title": "Three-way outcome taxonomy with blocked > rebound > passthrough aggregation",
+        "surface": "core/scripts/trusted-surface.ts (TrustedSurfaceOutcome, computeTrustedSurfaceDecision); deploy_ready finalize gate via allowsReadyToDeploy; durable TrustedSurfaceDecision record",
+        "alternatives": [
+          {
+            "option": "Boolean sensitive/not-sensitive only",
+            "rejected_because": "Does not distinguish safe rebound-to-trusted from unresolvable trust failure."
+          },
+          {
+            "option": "Soft-warn diagnostics without blocking readiness",
+            "rejected_because": "Issue requires fail-closed when trusted surface cannot be resolved; soft-warn allows silent self-judging."
+          },
+          {
+            "option": "Always auto-block on any sensitive path touch",
+            "rejected_because": "Dogfood and policy edits could never land; design allows rebound when a trusted revision resolves."
+          }
+        ],
+        "assumptions": [
+          "Exactly one top-level decision per readiness-relevant evaluation is enough for Warrant and readiness consumers.",
+          "Rebound means judging authority is the resolved trusted pin, including execution-path enforcement per revised d5 — not silent candidate-only weakening."
+        ],
+        "invariants": [
+          "Outcome is exactly one of passthrough | rebound | blocked.",
+          "Any required class resolution failure forces blocked and effective_verifier_hash null.",
+          "Any sensitive intersection with successful trust resolution yields rebound.",
+          "No sensitive intersection yields passthrough."
+        ],
+        "evidence": [
+          "core/scripts/trusted-surface.ts computeTrustedSurfaceDecision aggregate rules and failClosedDecision.",
+          "core/test/trusted-surface.test.ts: product-only passthrough; pipeline.yml rebound; missing base blocked; allowsReadyToDeploy false only on blocked.",
+          "openspec/.../specs/trusted-surface-rebind/spec.md aggregate outcome rules and scenarios."
+        ],
+        "generalization_boundary": "Does not add per-class policy forbidding rebound for ownership_authority (design mentioned possible hard-block; v1 uses same rebound-if-resolved rule for all base_ref classes). Does not encode operator-authorized evaluate-under-candidate mode.",
+        "uncertainty": "Low on taxonomy shape (issue-mandated). Rebound operational strength depends on revised d5 live enforcement."
+      },
+      {
+        "id": "d3",
+        "title": "Split trust sources: installed_engine content identity for engine classes; base_ref (+ engine_default) for repo classes",
+        "surface": "core/scripts/trusted-surface.ts (BUILTIN_CLASS_TRUSTED_SOURCE, hashEnginePin, TrustedEnginePin, hashPathContents, engineDefaultHash); core/scripts/engine-identity.ts; core/scripts/prompts/index.ts; pipeline-run ensureTrustedSurfaceDecision base blob prefetch",
+        "alternatives": [
+          {
+            "option": "Always trust candidate worktree / HEAD content for all classes",
+            "rejected_because": "Direct self-judging under a weakened surface."
+          },
+          {
+            "option": "Always trust only integration base for engine prompts/code too",
+            "rejected_because": "Dogfood changes live in the candidate tree; the installed skill process is the actual judging binary and template snapshot authority already used elsewhere (#450 engine identity)."
+          },
+          {
+            "option": "Use candidate content when base path is newly added",
+            "rejected_because": "A candidate can introduce a brand-new weakening policy/rubric and become sole authority."
+          },
+          {
+            "option": "hashEnginePin from version + templates_fingerprint + root + commit_sha only (pre-revise)",
+            "rejected_because": "Judging-relevant engine_core source can change under a fixed version/template/commit identity (dirty install or unbumped modules); effective verifier would not move (challenge 3143e32d)."
+          }
+        ],
+        "assumptions": [
+          "Installed engine pin (version + templates_fingerprint + modules_fingerprint [+ root/commit]) is available for readiness-relevant runs.",
+          "Integration base SHA is obtainable for base_ref classes when the candidate touches those classes or always-consulted base paths are hashed.",
+          "Absence at base is a defined trusted state (engine_default), not an invitation to use candidate-only bytes.",
+          "Engine modules and prompt templates for the judging process are loaded from process-local paths (import.meta.url), not from the product candidate worktree under evaluation."
+        ],
+        "invariants": [
+          "engine_core and engine_prompts trusted hashes come only from hashEnginePin; never from candidate tree bytes.",
+          "TrustedEnginePin MUST include version, templates_fingerprint, and modules_fingerprint (process-start content digest of installed engine judging modules under the engine-defined engine_core path set relative to the install root). root and commit_sha remain optional metadata.",
+          "modules_fingerprint is computed like templatesFingerprint: sorted path → sha256(content) over the installed engine_core module set at process start (and re-probed on stage boundaries for drift). It is not optional on readiness-relevant pins.",
+          "hashEnginePin digests at least version, templates_fingerprint, and modules_fingerprint (plus root/commit when present).",
+          "If engine_pin lacks version, templates_fingerprint, or modules_fingerprint, engine classes status=failed with failure_reason missing_engine_pin (or missing_modules_fingerprint) and aggregate outcome blocked.",
+          "Touched base_ref classes hash base blobs via injectable read_base_content; missing base SHA/reader/unreadable base → failed class → blocked.",
+          "All touched paths absent at base → engineDefaultHash(classId) as trusted pin for that class’s absence state.",
+          "Harness prose / model JSON cannot supply trusted revisions (pure function over injectable inputs only).",
+          "Prompt builders use the process-init template snapshot (prompts/index.ts); mid-run candidate edits under worktree prompts/ do not replace that snapshot for the running process.",
+          "Tests MUST show: changing installed engine_core module bytes without changing version or templates_fingerprint changes hashEnginePin / effective_verifier_hash (or blocks readiness)."
+        ],
+        "evidence": [
+          "Pre-revise hashEnginePin omitted module content (challenge 3143e32d accepted).",
+          "core/scripts/engine-identity.ts: templates_fingerprint pattern to mirror for modules_fingerprint.",
+          "core/scripts/prompts/index.ts: defaultReadTemplates reads only files next to this module at init.",
+          "core/scripts/pipeline-run.ts: git rev-parse base, git show baseSha:path into baseBlobCache, then pure computeTrustedSurfaceDecision.",
+          "openspec/.../design.md Decision 3 and Decision 6 (dogfood vs target)."
+        ],
+        "generalization_boundary": "Does not pin arbitrary transitive dependencies of gate scripts. Does not resolve multi-base merge-queue rebases beyond the single base_sha input. engine_default for absent paths is a class-level sentinel digest, not a dump of engine-shipped default file bodies. Does not claim OS sandbox against running a binary copied from the candidate tree — process pin attributes that execution root (#762). In-memory already-imported modules may lag disk until process restart; disk probe drift fail-closes readiness evidence rather than silently re-executing new disk code in the same process.",
+        "uncertainty": "Low once modules_fingerprint is required in the pin. Residual: exact module path set (full engine_core globs vs documented judging subset) must be engine-enumerated and tested; too-narrow a set reopens the falsifier."
+      },
+      {
+        "id": "d4",
+        "title": "Engine pin required on readiness paths; missing pin must block, not silent early-return",
+        "surface": "core/scripts/trusted-surface.ts installed_engine branch; core/scripts/pipeline-run.ts ensureTrustedSurfaceDecision; deploy_ready finalize via allowsReadyToDeploy",
+        "alternatives": [
+          {
+            "option": "Require engine pin only when engine_core/engine_prompts paths are touched",
+            "rejected_because": "Every readiness run depends on engine judging rules; an unknown engine identity makes the effective verifier undefined."
+          },
+          {
+            "option": "Soft-default a synthetic pin when missing",
+            "rejected_because": "Invented identity violates fail-closed and breaks evidence binding."
+          },
+          {
+            "option": "Early-return without decision when pin/worktree missing (pre-revise)",
+            "rejected_because": "Orchestration treated missing pin as historical omission (allowsReadyToDeploy null=true), bypassing pure-function fail-closed."
+          }
+        ],
+        "assumptions": [
+          "pipeline-run aims to have pinnedEngine before readiness-relevant stages.",
+          "Unit tests inject TrustedEnginePin for product-only cases.",
+          "A readiness-relevant run can still lack a pin (probe failure); that case must surface as blocked, not as absence."
+        ],
+        "invariants": [
+          "If engine_pin lacks version, templates_fingerprint, or modules_fingerprint, engine classes status=failed with failure_reason missing_engine_pin (or missing_modules_fingerprint) and aggregate outcome blocked.",
+          "Product-only path sets still blocked without an engine pin when computeTrustedSurfaceDecision is invoked.",
+          "ensureTrustedSurfaceDecision on a readiness-relevant path SHALL NOT exit without a blocked decision when pinnedEngine is missing, unusable, or decision computation cannot complete for a run that requires trusted-surface evaluation (see d7 required marker).",
+          "Blocked decisions from missing pin must be persisted or held in-memory for finalize so allowsReadyToDeploy cannot treat the run as historical omission."
+        ],
+        "evidence": [
+          "core/scripts/trusted-surface.ts installed_engine branch without isTouched gate on pin presence.",
+          "core/test/trusted-surface.test.ts missing engine pin → blocked.",
+          "Challenge falsifier: pipeline-run ensureTrustedSurfaceDecision early `if (!runDir || !pinnedEngine) return` — revised contract forbids this on readiness paths."
+        ],
+        "generalization_boundary": "Non-readiness-only tooling that never finalizes ready-to-deploy may omit the decision. Historical runs without the d7 required marker remain out of this hard pin gate.",
+        "uncertainty": "Low once orchestration matches the pure-function fail-closed contract. Implementation must wire blocked persistence on pin absence without inventing a synthetic passthrough."
+      },
+      {
+        "id": "d5",
+        "title": "Rebound requires class→loader enforcement; mid-run identity change durably invalidates evidence families",
+        "surface": "core/scripts/pipeline-run.ts ensureTrustedSurfaceDecision / checkEngineDrift; config/gate loading paths; evidence-subject resolveVerifierFingerprint; stages/deploy_ready allowsReadyToDeploy; trusted-surface class hashes; run-store invalidation marker",
+        "alternatives": [
+          {
+            "option": "Decision record + effective_verifier_hash binding only (pre-revise v1)",
+            "rejected_because": "Candidate can still change live .github/pipeline.yml / gates used by resolveConfig and stage gates while outcome=rebound and readiness still advances; fails issue and rebound scenario SHALL use trusted policy surface."
+          },
+          {
+            "option": "Decision-only diagnostics with no readiness enforcement",
+            "rejected_because": "Would not meet blocked-refuses-ready-to-deploy or fail-closed fingerprint requirements."
+          },
+          {
+            "option": "Full OS command sandbox for every gate (#618)",
+            "rejected_because": "Issue non-goal; isolation roadmap is separate."
+          },
+          {
+            "option": "Stage-boundary ensureTrustedSurfaceDecision + console.warn on hash change only",
+            "rejected_because": "Does not durable-invalidate prior readiness evidence or map affected families; readiness can still finalize on stale verifier-bound artifacts (challenge 16d2e94c)."
+          }
+        ],
+        "assumptions": [
+          "Engine classes are process-bound (d3): live prompts/modules come from installed process pin + modules_fingerprint.",
+          "Repo base_ref classes that affect acceptance need an explicit rebind of live inputs or a digest gate.",
+          "Fingerprint binding remains necessary but not sufficient.",
+          "Evidence families align with resolveRequiredEvidenceKinds (review, tester, eval, visual, shipcheck) plus policy-bound residual/override paths."
+        ],
+        "invariants": [
+          "Every stage iteration on readiness-relevant runs calls ensureTrustedSurfaceDecision after engine drift check; SHA-stable early-return MUST still re-check engine modules/templates probe and open invalidation state.",
+          "blocked decisions refuse deploy_ready finalize when a decision record is present (and when d7 requires a decision).",
+          "When trustedSurface is present and blocked or lacks usable hash, resolveVerifierFingerprint returns null.",
+          "When trustedSurface is present and resolvable, verifier_fingerprint equals effective_verifier_hash (or pure family-local refinement).",
+          "v1 CLASS_LIVE_ENFORCEMENT (explicit class→loader/execution map): (1) engine_core → process modules via import.meta.url + modules_fingerprint digest gate; (2) engine_prompts → prompts/index.ts process-init snapshot + templates_fingerprint; (3) repo_policy → load acceptance-relevant policy from base_sha blob(s) for .github/pipeline.yml|.yaml (and documented includes) OR compare digest of live resolved policy material to class trusted_content_hash and fail closed on mismatch; (4) gate_commands → for each enabled gate in the trusted policy, command identity and referenced script path bytes are loaded from base_sha (or engine default when absent) OR live bytes digest-gated to trusted_content_hash before the gate may authorize readiness; (5) evidence_schemas → readiness producers use engine-shipped and/or base_ref schema modules bound in the decision, not candidate-only weakened schemas; (6) eval_rubrics → when eval/visual/shipcheck gates are on the judging path, rubric files come from base_ref trusted revision or digest-gate; (7) ownership_authority → CODEOWNERS / ownership|authority maps consulted for override/stage ownership load from base_ref or digest-gate.",
+          "On outcome=rebound for a class that feeds live acceptance, the run SHALL enforce that class’s CLASS_LIVE_ENFORCEMENT entry before ready-to-deploy.",
+          "Base-absent newly added sensitive files: trusted side is engine_default/absence; candidate bytes for those paths MUST NOT become sole live acceptance authority for the same run.",
+          "End-to-end / injectable fixtures MUST show a candidate-weakened policy, gate command/script, schema, rubric, or ownership rule cannot reach readiness unless the trusted rule governs acceptance — one fixture family per base_ref class minimum.",
+          "Mid-run effective verifier identity change (engine probe drift, re-computed decision hash change, or always-consulted surface digest change): (a) durable-write verifier_invalidation (or equivalent) with previous_hash, next_hash, stage, at, affected_evidence_families; (b) map changed classes to families — engine_core|engine_prompts|repo_policy → all readiness families on the path; gate_commands → tester and any enabled gate family whose command/script changed; eval_rubrics → eval/visual/shipcheck as enabled; evidence_schemas → families consuming those schemas; ownership_authority → review residual/override authority paths; (c) treat readiness evidence whose verifier_fingerprint binds the prior effective_verifier_hash as non-current; (d) allowsReadyToDeploy / finalize refuse ready-to-deploy while invalidation is open until replacement evidence is produced under the new identity (or the run blocks).",
+          "Fault-injection tests: generate readiness evidence under H1, alter effective verifier input, later stage must refuse readiness on H1-bound evidence."
+        ],
+        "evidence": [
+          "Spec rebound scenario: readiness-relevant policy acceptance SHALL use trusted (base) policy surface.",
+          "Pre-revise gaps: ensureTrustedSurfaceDecision does not re-resolve cfg from base; resolveConfig reads worktree pipeline.yml; checkEngineDrift only warns; no class→loader map (challenges c9c63ccd, 16d2e94c).",
+          "Engine side already satisfies process binding via import.meta.url + template snapshot; modules_fingerprint added in d3."
+        ],
+        "generalization_boundary": "Does not sandbox arbitrary subprocesses (#618). Does not move verification into Project Warrant. Operator-authorized evaluate-under-candidate mode remains out of scope for v1. Does not require re-executing already-imported JS without process restart when disk drifts — invalidation + refuse readiness is sufficient.",
+        "uncertainty": "Medium on implementation mix per class (full base cfg reload vs targeted digest gate). Low that decision+fingerprint alone or warn-only drift is insufficient — those options are rejected."
+      },
+      {
+        "id": "d6",
+        "title": "effective_verifier_hash records concrete always- and conditionally-consulted surfaces; defaults only for absence or unused classes",
+        "surface": "core/scripts/trusted-surface.ts (ALWAYS_CONSULTED_VERIFIER_PATHS, CONDITIONAL_CONSULT_RULES, computeTrustedSurfaceDecision, buildEffectiveVerifierHash); resolveConfig; gate enablement; resolveRequiredEvidenceKinds",
+        "alternatives": [
+          {
+            "option": "On every run, hash all built-in glob matches at base_sha for every class (full tree walk)",
+            "rejected_because": "Expensive full-tree walk; rejected as default for all globs."
+          },
+          {
+            "option": "Omit untouched classes from effective_verifier_hash entirely",
+            "rejected_because": "Effective verifier identity would under-specify the surface map and change when path classification noise flips."
+          },
+          {
+            "option": "Class-level engineDefaultHash for all untouched base_ref classes (pre-revise)",
+            "rejected_because": "Does not identify which base policy/gate/rubric content actually governs the run; fails issue evidence requirement when those files are still loaded (challenge 167d2ee1)."
+          }
+        ],
+        "assumptions": [
+          "Some verifier surfaces are always loaded (engine pin; .github/pipeline.yml via resolveConfig when present).",
+          "Some classes are only on the judging path when gates/config enable them (e.g. eval rubrics when eval gate off).",
+          "Touched paths still hash concrete base (or engine_default when all absent at base)."
+        ],
+        "invariants": [
+          "Engine-defined ALWAYS_CONSULTED_VERIFIER_PATHS (v1 minimum): (a) installed engine pin fields used by hashEnginePin including modules_fingerprint; (b) .github/pipeline.yml and .github/pipeline.yaml at base_sha when the blob exists (repo_policy always-consulted paths for resolveConfig).",
+          "Engine-defined CONDITIONAL_CONSULT_RULES (v1): from trusted (base-resolved) policy — if test_gate enabled (default on): include test_gate.command string identity and any filesystem script path referenced by that command that matches gate_commands globs when resolvable as a repo path; if eval_gate/visual_gate/shipcheck_gate enabled: include that gate’s command identity, referenced scripts, and rubric paths matched by eval_rubrics that the gate/config declares or the engine loads for that family; evidence_schemas modules for each kind in resolveRequiredEvidenceKinds(gates); ownership_authority paths when the run consults override/stage ownership maps.",
+          "installed_engine classes always contribute hashEnginePin when the pin resolves.",
+          "Always-consulted base_ref material SHALL contribute concrete base content digests to trusted_content_hash / effective_verifier_hash even when untouched.",
+          "Touched base_ref paths continue to hash base blobs (or engineDefaultHash when all touched paths absent at base).",
+          "engineDefaultHash(classId) is allowed only for (1) true absence at base for that material, or (2) classes documented as not on this run’s judging path via CONDITIONAL_CONSULT_RULES (unused gate families) with an explicit not-on-path reason in the class record or design tests.",
+          "blocked outcomes set effective_verifier_hash null rather than a partial pin.",
+          "Tests MUST include a matrix: change base content of each ALWAYS_CONSULTED path and each CONDITIONAL path that is on-path for a fixture config, with candidate_paths product-only; each relevant change alters effective_verifier_hash or blocks."
+        ],
+        "evidence": [
+          "Issue: run evidence explains which version of every relevant verifier surface was used.",
+          "resolveConfig always reads .github/pipeline.yml when present — relevant even if not in candidate_paths.",
+          "Pre-revise untouched branch used only engineDefaultHash — insufficient for always-loaded classes (challenge 167d2ee1 accepted)."
+        ],
+        "generalization_boundary": "Still does not require hashing every file matching every built-in glob on every passthrough. Optional unused-class material stays default/omitted with an explicit not-on-path reason. Cross-run audits of unused classes are out of scope. Command auto-detection that does not resolve to a repo path contributes the command string identity only, not an unbounded filesystem walk.",
+        "uncertainty": "Low on naming the inventory constants. Residual medium on auto-detected test commands that shell out without a single script path — those contribute command-string identity under trusted policy, not full argv expansion of every binary on PATH."
+      },
+      {
+        "id": "d7",
+        "title": "Historical omission vs required-decision failure are distinct; only true pre-feature absence allows ready-to-deploy without a decision",
+        "surface": "core/scripts/trusted-surface.ts allowsReadyToDeploy; run-store write/readTrustedSurfaceDecision; pipeline-run ensureTrustedSurfaceDecision; deploy_ready finalize; run.json / feature marker",
+        "alternatives": [
+          {
+            "option": "Missing decision always blocks ready-to-deploy",
+            "rejected_because": "Breaks pre-#691 historical runs; large migration cliff."
+          },
+          {
+            "option": "Missing decision is treated as synthetic passthrough in the parser",
+            "rejected_because": "External consumers (Warrant) must not invent decisions; parser returns null."
+          },
+          {
+            "option": "Missing decision always allows ready-to-deploy (pre-revise)",
+            "rejected_because": "Write failures and skipped computation look like historical runs; sensitive-path current runs can finalize without a decision."
+          }
+        ],
+        "assumptions": [
+          "New readiness-relevant runs under engines that ship #691 can record a durable required marker at run start.",
+          "Absence without that marker means historical/unwired, not verified passthrough.",
+          "In-memory decision state can cover the window before durable write succeeds, but finalize must not treat required+missing as allow."
+        ],
+        "invariants": [
+          "allowsReadyToDeploy(null|undefined) === true only when the run is not marked trusted-surface-required (historical / pre-feature).",
+          "When a run is trusted-surface-required, missing, malformed, or unpersistable decision SHALL refuse ready-to-deploy (equivalent to blocked).",
+          "allowsReadyToDeploy(blocked) === false.",
+          "allowsReadyToDeploy(passthrough|rebound with non-empty effective hash) === true when other gates pass and no open verifier_invalidation (d5).",
+          "parseTrustedSurfaceDecision rejects incomplete objects; does not default outcome to passthrough.",
+          "writeTrustedSurfaceDecision failure on a required run MUST set a durable failure/blocked marker or keep an in-memory blocked decision that finalize honors — not silent non-fatal success for readiness.",
+          "Fault-injection tests cover: missing pin, missing worktree/HEAD, compute failure, write failure, read/malformed artifact — none of these may finalize ready-to-deploy on a required run with sensitive-path changes."
+        ],
+        "evidence": [
+          "Pre-revise: allowsReadyToDeploy(null) true; write catch non-fatal; ensureTrustedSurfaceDecision early returns and .catch(() => {}) on write.",
+          "deploy_ready comments on pre-#691 preservation remain valid only for unmarked historical runs."
+        ],
+        "generalization_boundary": "Does not force decision presence on every historical evidence bundle. External Warrant still must not invent passthrough. Does not require signed remote attestation of the marker.",
+        "uncertainty": "Low on the need for a distinguisher. Medium on marker placement (run.json field vs feature flag vs schema_version bump) — any durable run-start signal is acceptable if tests pin behavior."
+      },
+      {
+        "id": "d8",
+        "title": "Durable run artifact trusted-surface.json embedded into evidence bundle summary",
+        "surface": "core/scripts/run-store.ts (TRUSTED_SURFACE_FILE, write/readTrustedSurfaceDecision, finalizeRun embedding); core/scripts/types.ts EvidenceBundle.trusted_surface; summary.json",
+        "alternatives": [
+          {
+            "option": "Only in-memory decision for the process lifetime",
+            "rejected_because": "No durable evidence for Warrant/external consumers; lost across re-entry."
+          },
+          {
+            "option": "Only GitHub comment / label as storage",
+            "rejected_because": "Not structured for evidence-bundle consumers; forgeable comment surface is a worse authority."
+          }
+        ],
+        "assumptions": [
+          "runDir lifecycle matches other run-store artifacts.",
+          "sanitize/redact pipeline used for other run files is appropriate for decision JSON."
+        ],
+        "invariants": [
+          "Decision written to runDir/trusted-surface.json via tmp+rename when computation succeeds.",
+          "finalizeRun copies durable decision into bundle.trusted_surface and summary when present.",
+          "Read/parse never invents a missing decision as passthrough.",
+          "On trusted-surface-required runs (d7), write failure is readiness-blocking (failure marker or in-memory blocked), not best-effort-only for the finalize gate.",
+          "Mid-run verifier_invalidation markers (d5) are also durable under the run dir (same lifecycle) so re-entry cannot forget open invalidation."
+        ],
+        "evidence": [
+          "core/scripts/run-store.ts TRUSTED_SURFACE_FILE and write/read helpers.",
+          "core/test/run-store.test.ts rebound/passthrough/blocked embed cases and absence case.",
+          "openspec/.../specs/evidence-bundle/spec.md delta for trusted_surface on run summary."
+        ],
+        "generalization_boundary": "Does not publish the decision as a signed remote attestation. Best-effort logging may remain for non-required diagnostic paths, but required-run readiness cannot ignore write failure.",
+        "uncertainty": "Low for shape. Reliability under disk failure is covered by d7 fail-closed for required runs."
+      }
+    ]
+  }
+}

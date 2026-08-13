@@ -562,6 +562,238 @@ test("resolveConfig: design_gate unknown key is rejected at parse time", async (
   }
 });
 
+// ---- trusted_surface (#691) ----
+
+test("resolveConfig: trusted_surface omitted — empty extra_paths default (passthrough-safe)", async () => {
+  const repo = makeFakeRepo(null);
+  const binDir = makeFakeGh("acme/ts0");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-ts0`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.deepEqual(cfg.trusted_surface, { extra_paths: [] });
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: trusted_surface additive extra_paths accepted", async () => {
+  const repo = makeFakeRepo(`trusted_surface:
+  extra_paths:
+    - class: eval_rubrics
+      globs:
+        - qa/rubrics/**
+`);
+  const binDir = makeFakeGh("acme/ts1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-ts1`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.trusted_surface.extra_paths.length, 1);
+    assert.equal(cfg.trusted_surface.extra_paths[0].class, "eval_rubrics");
+    assert.deepEqual(cfg.trusted_surface.extra_paths[0].globs, ["qa/rubrics/**"]);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: trusted_surface disable_classes key rejected", async () => {
+  const repo = makeFakeRepo(`trusted_surface:\n  disable_classes: [repo_policy]\n`);
+  const binDir = makeFakeGh("acme/ts2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-ts2`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      /disable_classes|unrecognized|Invalid/i,
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: trusted_surface use_candidate_as_trusted rejected", async () => {
+  const repo = makeFakeRepo(`trusted_surface:\n  use_candidate_as_trusted: true\n`);
+  const binDir = makeFakeGh("acme/ts3");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-ts3`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      /use_candidate_as_trusted|unrecognized|Invalid/i,
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("applyTrustedVerificationPolicy: base yml overlays test_gate.enabled (not candidate)", async () => {
+  const repo = makeFakeRepo(`test_gate:\n  enabled: false\n  max_attempts: 9\n`);
+  const binDir = makeFakeGh("acme/ts-bind");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-ts-bind`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    // Candidate-loaded config has test_gate disabled.
+    assert.equal(cfg.test_gate.enabled, false);
+    // Rebind from trusted base that enables the gate.
+    const r = cfgMod.applyTrustedVerificationPolicy(
+      cfg,
+      "test_gate:\n  enabled: true\n  max_attempts: 3\n",
+    );
+    assert.equal(r.ok, true);
+    assert.equal(cfg.test_gate.enabled, true);
+    assert.equal(cfg.test_gate.max_attempts, 3);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("testCommandFromPackageJson: returns base scripts.test body (not npm test)", async () => {
+  const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-pkg-cmd`);
+  // Authority is the base script body bytes — never a package-manager runner that
+  // would re-resolve scripts.test from the candidate worktree package.json.
+  assert.equal(
+    cfgMod.testCommandFromPackageJson(JSON.stringify({ scripts: { test: "node --test" } })),
+    "node --test",
+  );
+  assert.equal(cfgMod.testCommandFromPackageJson(JSON.stringify({ scripts: {} })), null);
+  assert.equal(cfgMod.testCommandFromPackageJson("not-json"), null);
+});
+
+test("testCommandFromPackageJson: expands nested base script runners (#691 review-2)", async () => {
+  const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-pkg-expand`);
+  const base = JSON.stringify({
+    scripts: {
+      test: "npm run unit && pnpm run lint",
+      unit: "node --test test/*.test.ts",
+      lint: "eslint .",
+    },
+  });
+  assert.equal(
+    cfgMod.testCommandFromPackageJson(base),
+    "(node --test test/*.test.ts) && (eslint .)",
+  );
+  // Missing nested script → fail closed (null), not a candidate-resolved runner.
+  assert.equal(
+    cfgMod.testCommandFromPackageJson(
+      JSON.stringify({ scripts: { test: "npm run missing-script" } }),
+    ),
+    null,
+  );
+  // Cyclic npm test inside scripts.test → fail closed.
+  assert.equal(
+    cfgMod.testCommandFromPackageJson(JSON.stringify({ scripts: { test: "npm test" } })),
+    null,
+  );
+});
+
+test("testCommandFromPackageJson: candidate no-op scripts.test cannot become the bound command (#691)", async () => {
+  const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-pkg-noop`);
+  // Base suite is real; candidate would replace scripts.test with `true`.
+  // Binding must use only the base package.json body.
+  const basePkg = JSON.stringify({
+    scripts: { test: "node --test --test-reporter=spec test/**/*.test.ts" },
+  });
+  const candidatePkg = JSON.stringify({ scripts: { test: "true" } });
+  const bound = cfgMod.testCommandFromPackageJson(basePkg);
+  assert.equal(bound, "node --test --test-reporter=spec test/**/*.test.ts");
+  assert.notEqual(bound, "npm test");
+  assert.notEqual(bound, "true");
+  assert.notEqual(bound, cfgMod.testCommandFromPackageJson(candidatePkg));
+});
+
+test("testCommandFromPackageJson: includes pretest/posttest lifecycle (#691 a84c3494)", async () => {
+  const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-pkg-lifecycle`);
+  // npm test runs pretest → test → posttest. Direct body binding must preserve
+  // those trusted hooks so a candidate cannot drop them by rewriting package.json.
+  const bound = cfgMod.testCommandFromPackageJson(
+    JSON.stringify({
+      scripts: {
+        pretest: "node scripts/check-fixtures.mjs",
+        test: "node --test test/*.test.ts",
+        posttest: "node scripts/coverage-floor.mjs",
+      },
+    }),
+  );
+  assert.equal(
+    bound,
+    "(node scripts/check-fixtures.mjs) && (node --test test/*.test.ts) && (node scripts/coverage-floor.mjs)",
+  );
+  // Nested npm run unit must also expand preunit/postunit from the base map.
+  const nested = cfgMod.testCommandFromPackageJson(
+    JSON.stringify({
+      scripts: {
+        test: "npm run unit",
+        preunit: "node scripts/pre-unit.mjs",
+        unit: "node --test test/unit/*.test.ts",
+        postunit: "node scripts/post-unit.mjs",
+      },
+    }),
+  );
+  assert.equal(
+    nested,
+    "((node scripts/pre-unit.mjs) && (node --test test/unit/*.test.ts) && (node scripts/post-unit.mjs))",
+  );
+  // Candidate-weakened pretest must not affect the bound command (base only).
+  const baseWithPre = JSON.stringify({
+    scripts: { pretest: "node trusted-pre.mjs", test: "node --test" },
+  });
+  const candidateDropPre = JSON.stringify({ scripts: { test: "node --test" } });
+  assert.equal(
+    cfgMod.testCommandFromPackageJson(baseWithPre),
+    "(node trusted-pre.mjs) && (node --test)",
+  );
+  assert.equal(cfgMod.testCommandFromPackageJson(candidateDropPre), "node --test");
+});
+
+test("testCommandFromPackageJson: expands flagged/dotted runners; residual fails closed (#691 7995aedb)", async () => {
+  const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-pkg-runner-forms`);
+  // Flags before/after run and dotted script names must expand against base map.
+  assert.equal(
+    cfgMod.testCommandFromPackageJson(
+      JSON.stringify({
+        scripts: {
+          test: "npm --silent run verify && npm run --if-present lint && npm run test.unit",
+          verify: "node scripts/verify.mjs",
+          lint: "eslint .",
+          "test.unit": "node --test test/unit/*.test.ts",
+        },
+      }),
+    ),
+    "(node scripts/verify.mjs) && (eslint .) && (node --test test/unit/*.test.ts)",
+  );
+  // Candidate replacing a nested dotted script cannot become authority: bind uses base.
+  const base = JSON.stringify({
+    scripts: { test: "npm run test.unit", "test.unit": "node --test real/*.test.ts" },
+  });
+  const candidate = JSON.stringify({
+    scripts: { test: "npm run test.unit", "test.unit": "true" },
+  });
+  assert.equal(cfgMod.testCommandFromPackageJson(base), "(node --test real/*.test.ts)");
+  assert.equal(cfgMod.testCommandFromPackageJson(candidate), "(true)");
+  // Unresolvable residual package-manager script runner → fail closed (null).
+  // `npm exec` is not a supported trusted expansion form and must not pass through.
+  assert.equal(
+    cfgMod.testCommandFromPackageJson(
+      JSON.stringify({ scripts: { test: "npm exec --yes something" } }),
+    ),
+    null,
+  );
+  // Missing nested script after flagged runner still fails closed.
+  assert.equal(
+    cfgMod.testCommandFromPackageJson(
+      JSON.stringify({ scripts: { test: "npm --silent run missing-script" } }),
+    ),
+    null,
+  );
+});
+
 // ---- review_ensemble (#645) ----
 
 test("resolveConfig: review_ensemble absent — disabled by default", async () => {

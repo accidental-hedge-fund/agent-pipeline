@@ -51,7 +51,7 @@ import {
 import {
   buildEngineFingerprint,
   buildRequiredEvidenceSetRevisionFromGates,
-  verifierFingerprintFromEngine,
+  resolveVerifierFingerprint,
 } from "./evidence-subject.ts";
 import { resolvePinnedEngineIdentity } from "./engine-identity.ts";
 import type { Harness, PipelineConfig } from "./types.ts";
@@ -294,7 +294,9 @@ export async function runTestGate(
       } else if (tests.diagnostic && !overallReason) {
         overallReason = `extractor diagnostic: ${tests.diagnostic}`;
       }
-      // evidence_subject (#692): domain + engine identity from runtime state.
+      // evidence_subject (#692/#691): domain + engine identity; verifier
+      // fingerprint prefers trusted-surface effective hash when the run has a
+      // decision. Blocked decisions skip subject emission (fail closed).
       const engineId = resolvePinnedEngineIdentity();
       const engineFp = engineId
         ? buildEngineFingerprint({
@@ -303,6 +305,36 @@ export async function runTestGate(
             commit_sha: engineId.commit_sha,
           })
         : undefined;
+      let trustedSurface: {
+        outcome: string;
+        effective_verifier_hash: string | null;
+      } | null = null;
+      try {
+        const { readTrustedSurfaceDecision, defaultRunStoreDeps } = await import(
+          "./run-store.ts"
+        );
+        trustedSurface = await readTrustedSurfaceDecision(
+          runDir,
+          runStoreDeps ?? defaultRunStoreDeps,
+        );
+      } catch {
+        trustedSurface = null;
+      }
+      const verifierFp = engineFp
+        ? resolveVerifierFingerprint({
+            engineFingerprint: engineFp,
+            trustedSurface,
+          })
+        : null;
+      // When a decision exists and fingerprint is unusable (blocked / no pin),
+      // do not emit a readiness subject with a fabricated engine-only fingerprint.
+      if (trustedSurface && !verifierFp) {
+        console.warn(
+          `[pipeline] tester-evidence: trusted-surface ${trustedSurface.outcome} ` +
+            `prevents readiness subject emission (fail closed)`,
+        );
+        return;
+      }
       const evidence = buildTesterEvidence({
         candidateSha: candidateSha.trim(),
         runId: path.basename(runDir),
@@ -325,9 +357,7 @@ export async function runTestGate(
         domain: (cfg.domain || cfg.repo || "").trim() || undefined,
         engineVersion: engineId?.version,
         engineFingerprint: engineFp,
-        verifierFingerprint: engineFp
-          ? verifierFingerprintFromEngine(engineFp)
-          : undefined,
+        verifierFingerprint: verifierFp ?? undefined,
         requiredEvidenceSetRevision: buildRequiredEvidenceSetRevisionFromGates({
           testGateEnabled: cfg.test_gate?.enabled,
           evalGateEnabled: cfg.eval_gate?.enabled,

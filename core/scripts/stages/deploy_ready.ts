@@ -10,7 +10,14 @@ import {
   type SafeRemoveDeps,
 } from "../worktree.ts";
 import type { Outcome, PipelineConfig } from "../types.ts";
-import { RUN_SCHEMA_VERSION, appendEvent, defaultRunStoreDeps, type RunStoreDeps } from "../run-store.ts";
+import {
+  RUN_SCHEMA_VERSION,
+  appendEvent,
+  defaultRunStoreDeps,
+  readTrustedSurfaceDecision,
+  type RunStoreDeps,
+} from "../run-store.ts";
+import { allowsReadyToDeploy } from "../trusted-surface.ts";
 
 /** Injectable seams for {@link finalize} unit tests (#759). */
 export interface FinalizeDeps {
@@ -61,6 +68,33 @@ export async function finalize(
   runStoreDeps?: RunStoreDeps,
   deps: FinalizeDeps = {},
 ): Promise<Outcome> {
+  const storeDeps = runStoreDeps ?? defaultRunStoreDeps;
+
+  // Trusted-surface fail-closed (#691): current runs with a runDir MUST have a
+  // durable decision. Missing decision is not treated as historical passthrough
+  // on the ready-to-deploy path — only external/historical consumers may opt
+  // into `allowsReadyToDeploy(null, { enforcement: "historical" })`.
+  if (runDir) {
+    const decision = await readTrustedSurfaceDecision(runDir, storeDeps);
+    if (!allowsReadyToDeploy(decision)) {
+      const reason =
+        decision?.reason?.summary ??
+        (decision
+          ? "trusted-surface decision blocked readiness"
+          : "trusted-surface decision missing for current run (fail closed)");
+      console.log(
+        `[pipeline] #${issueNumber}: ready-to-deploy refused — trusted_surface outcome=` +
+          `${decision?.outcome ?? "missing"} (${decision?.reason?.code ?? "missing_decision"}): ${reason}`,
+      );
+      return {
+        advanced: false,
+        status: "blocked",
+        reason: `trusted-surface blocked: ${reason}`,
+        blockerKind: "needs-human",
+      };
+    }
+  }
+
   const detail = await getIssueDetail(cfg, issueNumber);
   const prNumber = await getPrForIssue(cfg, issueNumber);
   const getOnDiskFn = deps.getOnDiskForIssue ?? getOnDiskForIssue;
@@ -124,7 +158,7 @@ export async function finalize(
       console.log(`[pipeline] #${issueNumber}: worktree removed`);
       if (runDir) {
         const at = new Date().toISOString().replace(/\.\d+Z$/, "Z");
-        await appendEvent(runDir, { schema_version: RUN_SCHEMA_VERSION, type: "worktree_removed", at, _localPath: wt.path }, runStoreDeps ?? defaultRunStoreDeps).catch(() => {});
+        await appendEvent(runDir, { schema_version: RUN_SCHEMA_VERSION, type: "worktree_removed", at, _localPath: wt.path }, storeDeps).catch(() => {});
       }
     } else {
       console.log(

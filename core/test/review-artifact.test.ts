@@ -436,3 +436,49 @@ test("buildReviewEvidenceSubject: missing run_id fails closed (null)", async () 
   });
   assert.equal(subject, null);
 });
+
+test("buildReviewEvidenceSubject: trusted-surface binds verifier_fingerprint; blocked fails closed", async () => {
+  const { buildReviewEvidenceSubject } = await import(
+    "../scripts/stages/review-routing.ts"
+  );
+  const engine = {
+    version: "1.0.0",
+    templates_fingerprint: "f".repeat(64),
+  };
+  const base = {
+    cfg: {
+      domain: "owner/repo",
+      repo: "owner/repo",
+      test_gate: { enabled: true },
+      eval_gate: { enabled: false },
+      visual_gate: { enabled: false },
+      shipcheck_gate: { enabled: false },
+    } as never,
+    issueNumber: 691,
+    prNumber: 1,
+    runId: "691/run",
+    candidateSha: SAMPLE.reviewedSha,
+    diffHash: SAMPLE.diffHash,
+    reviewPolicy: { block_threshold: "high", min_confidence: 0.7 },
+    engineIdentity: engine,
+  };
+  const trustedHash = "a".repeat(64);
+  const rebound = buildReviewEvidenceSubject({
+    ...base,
+    trustedSurface: {
+      outcome: "rebound",
+      effective_verifier_hash: trustedHash,
+    },
+  });
+  assert.ok(rebound);
+  assert.equal(rebound!.verifier_fingerprint, trustedHash);
+
+  const blocked = buildReviewEvidenceSubject({
+    ...base,
+    trustedSurface: {
+      outcome: "blocked",
+      effective_verifier_hash: null,
+    },
+  });
+  assert.equal(blocked, null);
+});
