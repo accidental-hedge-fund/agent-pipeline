@@ -202,6 +202,7 @@ test("pipeline-cli: train --json emits one train_status document after two neste
     repo_dir: "/repo",
     base_branch: "main",
   } as PipelineConfig;
+  const waveCalls: number[][] = [];
   const deps: TrainCommandDeps = {
     makeTrainDeps: () => ({
       log: () => {},
@@ -213,8 +214,8 @@ test("pipeline-cli: train --json emits one train_status document after two neste
         labels: ready.has(issue) ? ["pipeline:ready-to-deploy"] : ["pipeline:ready"],
         state: "open",
       }),
-      advanceIssue: async () => {
-        throw new Error("the command must replace the base advanceIssue seam");
+      advanceWave: async () => {
+        throw new Error("the command must replace the base advanceWave seam");
       },
       getPrForIssue: async () => null,
       getPrForIssueAnyState: async () => null,
@@ -224,15 +225,24 @@ test("pipeline-cli: train --json emits one train_status document after two neste
       baseTip: async () => "base-tip",
       isAncestor: async () => false,
     }),
-    async runSingleIssue(rawIssue, _opts, _deps, output) {
-      const issue = Number(rawIssue);
-      advanced.push(issue);
-      if (output?.emitMachineOutput !== false) {
-        console.log(JSON.stringify({ schema_version: "1", kind: "loop_run_handoff", issue }));
-        console.log(JSON.stringify({ schema_version: "1", kind: "drive", issue }));
+    async runSingleIssue() {
+      throw new Error("train production path uses advanceWave, not N×single");
+    },
+    // #1023: one multi-item wave for the frontier (independent peers 10,11).
+    async runAdvanceWave(issues, _opts, getIssue) {
+      waveCalls.push([...issues]);
+      const out = new Map<number, import("../scripts/stages/train.ts").AdvanceOutcome>();
+      for (const issue of issues) {
+        advanced.push(issue);
+        ready.add(issue);
+        const snap = await getIssue(issue);
+        out.set(issue, {
+          ok: true,
+          terminal: "ready-to-deploy",
+          labels: snap.labels,
+        });
       }
-      ready.add(issue);
-      process.exitCode = 0;
+      return out;
     },
   };
 
@@ -246,7 +256,8 @@ test("pipeline-cli: train --json emits one train_status document after two neste
   try {
     const exitCode = await runTrainCommand(opts, trainCfg, deps);
     assert.equal(exitCode, 0);
-    assert.deepEqual(advanced, [10, 11], "both ordered issues must use the nested single command");
+    assert.deepEqual(waveCalls, [[10, 11]], "one advance-wave call for independent frontier");
+    assert.deepEqual(advanced, [10, 11], "both ordered issues must advance inside the wave");
 
     const emitted = stdout.join("");
     const document = JSON.parse(emitted) as { kind?: string; ordered_issues?: number[]; items?: unknown[] };

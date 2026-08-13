@@ -147,6 +147,11 @@ export const RECOVERY_RECIPES = [
   "verify_authentication",
   /** #758: deterministic HEAD goal-satisfaction check (no model-repair budget). */
   "verify_head_goal",
+  /**
+   * #1020 / #1028: unlink engine-owned non-product scratch porcelain before any
+   * implementer repair on the workflow-engine / engine-scratch path.
+   */
+  "unlink_engine_scratch",
   "repair_pipeline_item",
   "rerun_ci",
   "resync_workflow_state",

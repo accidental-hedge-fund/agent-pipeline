@@ -36,6 +36,7 @@ import {
   type ShipTrainPlan,
 } from "./ship.ts";
 import {
+  advanceWaveFromSingle,
   orderIssuesByDeclaredDeps,
   realTrainDeps,
   runTrain,
@@ -497,7 +498,7 @@ function realShipAdapterOperations(opts: RealShipCoordinatorDepsOptions): ShipAd
       repoDir: opts.repoDir,
       repo: opts.repo,
       baseBranch: opts.baseBranch,
-      advanceIssue: opts.advanceIssue,
+      advanceWave: advanceWaveFromSingle(opts.advanceIssue),
       mergeDeps,
     });
     return {

@@ -39,6 +39,10 @@ import {
   type ParkReleaseDeps,
   type ParkReleaseResult,
 } from "./worktree.ts";
+import {
+  stageEligibleForStaleBlockedResume,
+  tryResumeStaleBlocked,
+} from "./stages/stale-blocked-rereview.ts";
 import { withLock, runStateDir, isLivePlanningActive, tryAcquireLivePlanningMarker } from "./lock.ts";
 import {
   bundlePath,
@@ -1907,6 +1911,24 @@ export async function runAdvance(
             lastStage = (out as { to: Stage }).to;
             if (opts.once) break;
             continue;
+          }
+        }
+        // #1025 / #1028: leftover blocked after non-internal HEAD movement past
+        // reviewed-sha must clear and re-enter review on this advance — do not
+        // STOP train/loop solely on the pre-resume label.
+        if (!opts.dryRun && stageEligibleForStaleBlockedResume(stage)) {
+          const resume = await tryResumeStaleBlocked(cfg, issueNumber, detail, {
+            getPrForIssue: deps.getPrForIssue ?? getPrForIssue,
+            clearBlocked,
+            getIssueDetail: deps.getIssueDetail ?? getIssueDetail,
+          });
+          if (resume.kind === "cleared") {
+            tlog(`[pipeline] #${issueNumber}: ${resume.reason}`);
+            // Re-fetch and continue the advance loop so pre-merge re-runs review.
+            continue;
+          }
+          if (resume.kind === "keep") {
+            tlog(`[pipeline] #${issueNumber}: stale-block resume kept block — ${resume.reason}`);
           }
         }
         console.log(`[pipeline] #${issueNumber}: blocked at ${stage}; surface latest blocker:`);

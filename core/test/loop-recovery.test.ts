@@ -176,7 +176,11 @@ test("deterministic redispatch precedes provider-neutral model repair for mechan
     "repair_pipeline_item",
   ]);
   assert.deepEqual(DEFAULT_RECOVERY_POLICY["review-findings"].recipes, ["repair_pipeline_item"]);
-  assert.deepEqual(DEFAULT_RECOVERY_POLICY["workflow-engine-defect"].recipes, ["restart_workflow_engine", "repair_pipeline_item"]);
+  assert.deepEqual(DEFAULT_RECOVERY_POLICY["workflow-engine-defect"].recipes, [
+    "unlink_engine_scratch",
+    "restart_workflow_engine",
+    "repair_pipeline_item",
+  ]);
   assert.equal(DEFAULT_RECOVERY_POLICY["workflow-engine-defect"].retry_budget, 2);
   assert.equal(DEFAULT_RECOVERY_POLICY["workflow-engine-defect"].repeated_evidence_limit, 2);
   assert.deepEqual(DEFAULT_RECOVERY_POLICY["environment-auth"].recipes, ["verify_authentication"]);
@@ -897,7 +901,11 @@ test("upgradeContractForRecovery: exact pre-#787 defaults gain deterministic rep
     "repair_pipeline_item",
   ]);
   assert.deepEqual(upgraded.recovery_policy["review-findings"], DEFAULT_RECOVERY_POLICY["review-findings"]);
-  assert.deepEqual(upgraded.recovery_policy["workflow-engine-defect"].recipes, ["restart_workflow_engine", "repair_pipeline_item"]);
+  assert.deepEqual(upgraded.recovery_policy["workflow-engine-defect"].recipes, [
+    "unlink_engine_scratch",
+    "restart_workflow_engine",
+    "repair_pipeline_item",
+  ]);
   assert.equal(upgraded.recovery_policy["workflow-engine-defect"].retry_budget, 2);
   assert.deepEqual(upgraded.recovery_policy["environment-auth"].recipes, ["verify_authentication"]);
   assert.equal(upgraded.canonical_hash, "immutable-run-identity", "runtime migration must not rewrite run identity");

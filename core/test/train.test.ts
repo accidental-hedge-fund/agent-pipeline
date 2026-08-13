@@ -7,11 +7,16 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  advanceWaveFromSingle,
   buildTrainStatus,
+  computeBaseEligibleFrontier,
+  isIndependentOfHeld,
   orderIssuesByDeclaredDeps,
   parseIssueList,
   pipelineStageFromLabels,
   runTrain,
+  type AdvanceOutcome,
+  type AdvanceWaveResult,
   type TrainDeps,
   type TrainIssueSnapshot,
   type TrainOpts,
@@ -31,11 +36,13 @@ function snap(
 
 function makeDeps(overrides: Partial<TrainDeps> = {}): TrainDeps & {
   advanceCalls: number[];
+  waveCalls: number[][];
   mergeCalls: number[];
   fetchCalls: number;
   anyStateCalls: number[];
 } {
   const advanceCalls: number[] = [];
+  const waveCalls: number[][] = [];
   const mergeCalls: number[] = [];
   const anyStateCalls: number[] = [];
   let fetchCalls = 0;
@@ -45,6 +52,16 @@ function makeDeps(overrides: Partial<TrainDeps> = {}): TrainDeps & {
   /** Any-state PR (open/closed/merged) — mirrors getPrForIssueAnyState. */
   const anyPrByIssue = new Map<number, number>();
   const prState = new Map<number, { state: "open" | "merged"; oid: string | null; head: string }>();
+
+  const defaultAdvance = async (n: number): Promise<AdvanceOutcome> => {
+    advanceCalls.push(n);
+    const s = issues.get(n)!;
+    s.labels = ["pipeline:ready-to-deploy"];
+    return { ok: true, terminal: "ready-to-deploy", labels: s.labels };
+  };
+
+  const userAdvanceIssue = overrides.advanceIssue;
+  const userAdvanceWave = overrides.advanceWave;
 
   const base: TrainDeps = {
     log() {},
@@ -56,11 +73,15 @@ function makeDeps(overrides: Partial<TrainDeps> = {}): TrainDeps & {
       if (!s) throw new Error(`missing issue ${n}`);
       return s;
     },
-    async advanceIssue(n) {
-      advanceCalls.push(n);
-      const s = issues.get(n)!;
-      s.labels = ["pipeline:ready-to-deploy"];
-      return { ok: true, terminal: "ready-to-deploy", labels: s.labels };
+    async advanceWave(issueList) {
+      waveCalls.push([...issueList]);
+      if (userAdvanceWave) return userAdvanceWave(issueList);
+      const single = userAdvanceIssue ?? defaultAdvance;
+      const out: AdvanceWaveResult = new Map();
+      for (const n of issueList) {
+        out.set(n, await single(n));
+      }
+      return out;
     },
     async getPrForIssue(n) {
       return openPrByIssue.get(n) ?? null;
@@ -102,10 +123,22 @@ function makeDeps(overrides: Partial<TrainDeps> = {}): TrainDeps & {
       return descendant === "b".repeat(40) && ancestor.startsWith("merge");
     },
     ...overrides,
+    // Always keep our advanceWave wrapper (overrides.advanceWave handled inside).
+    advanceWave: async (issueList) => {
+      waveCalls.push([...issueList]);
+      if (userAdvanceWave) return userAdvanceWave(issueList);
+      const single = userAdvanceIssue ?? defaultAdvance;
+      const out: AdvanceWaveResult = new Map();
+      for (const n of issueList) {
+        out.set(n, await single(n));
+      }
+      return out;
+    },
   };
 
   return Object.assign(base, {
     advanceCalls,
+    waveCalls,
     mergeCalls,
     anyStateCalls,
     get fetchCalls() {
@@ -136,6 +169,7 @@ function makeDeps(overrides: Partial<TrainDeps> = {}): TrainDeps & {
     },
   }) as TrainDeps & {
     advanceCalls: number[];
+    waveCalls: number[][];
     mergeCalls: number[];
     anyStateCalls: number[];
     fetchCalls: number;
@@ -227,9 +261,75 @@ test("train without merge: advances each issue to ready-to-deploy", async () => 
   assert.equal(result.exitCode, 0);
   assert.equal(result.status.complete, true);
   assert.deepEqual(result.status.ordered_issues, [1, 2]);
+  // Code-dep A→B: separate frontiers (one advance-wave call each).
+  assert.deepEqual(deps.waveCalls, [[1], [2]]);
   assert.deepEqual(deps.advanceCalls, [1, 2]);
   assert.equal(deps.mergeCalls.length, 0);
   assert.ok(result.status.items.every((i) => i.terminal === "ready-to-deploy"));
+});
+
+test("train (#1023): independent peers use one advance-wave call per frontier", async () => {
+  const deps = makeDeps();
+  deps.seedIssue(snap(1, "a"));
+  deps.seedIssue(snap(2, "b independent"));
+  deps.seedPr(1, 101);
+  deps.seedPr(2, 102);
+
+  const result = await runTrain(baseOpts({ issues: [1, 2], merge: false }), deps);
+  assert.equal(result.exitCode, 0);
+  assert.equal(deps.waveCalls.length, 1, "one multi-item wave, not N×single loops at train layer");
+  assert.deepEqual(deps.waveCalls[0]!.slice().sort((a, b) => a - b), [1, 2]);
+});
+
+test("train (#1023): independent R2D sibling merges while peer is parked", async () => {
+  const deps = makeDeps({
+    async advanceIssue(n) {
+      deps.advanceCalls.push(n);
+      const issues = (deps as unknown as { _issues: Map<number, TrainIssueSnapshot> })._issues;
+      if (n === 1) {
+        issues.get(1)!.labels = ["pipeline:needs-human"];
+        return { ok: true, terminal: "needs-human", labels: ["pipeline:needs-human"] };
+      }
+      issues.get(n)!.labels = ["pipeline:ready-to-deploy"];
+      return { ok: true, terminal: "ready-to-deploy", labels: ["pipeline:ready-to-deploy"] };
+    },
+  });
+  deps.seedIssue(snap(1, "will park"));
+  deps.seedIssue(snap(2, "independent ready"));
+  deps.seedPr(1, 101);
+  deps.seedPr(2, 102);
+
+  const result = await runTrain(baseOpts({ issues: [1, 2], merge: true }), deps);
+  // Peer #1 parked; independent #2 must still merge.
+  assert.ok(deps.mergeCalls.includes(102), "independent sibling PR must merge");
+  assert.ok(!deps.mergeCalls.includes(101), "parked item must not merge");
+  assert.equal(result.exitCode, 1, "held peer still stops train after independents finish");
+  assert.match(result.status.blocker ?? "", /held|#1|needs-human/i);
+});
+
+test("computeBaseEligibleFrontier: code child waits for integrated parent", () => {
+  const frontier = computeBaseEligibleFrontier({
+    ordered: [1, 2],
+    finished: new Set(),
+    held: new Set(),
+    integrated: new Set(),
+    codeDeps: new Map([[1, []], [2, [1]]]),
+  });
+  assert.deepEqual(frontier, [1]);
+  const after = computeBaseEligibleFrontier({
+    ordered: [1, 2],
+    finished: new Set([1]),
+    held: new Set(),
+    integrated: new Set([1]),
+    codeDeps: new Map([[1, []], [2, [1]]]),
+  });
+  assert.deepEqual(after, [2]);
+});
+
+test("isIndependentOfHeld: edge fails closed", () => {
+  const deps = new Map<number, number[]>([[1, []], [2, [1]]]);
+  assert.equal(isIndependentOfHeld(2, new Set([1]), deps), false);
+  assert.equal(isIndependentOfHeld(3, new Set([1]), new Map([[3, []], [1, []]])), true);
 });
 
 test("train with merge: dependent does not start until prerequisite integrated", async () => {
@@ -454,7 +554,7 @@ test("train merge: pre-R2D open-lookup race merged uncontained stops before adva
 
 test("train: needs-human parks the train", async () => {
   const deps = makeDeps({
-    async advanceIssue(n) {
+    async advanceIssue(_n) {
       return {
         ok: true,
         terminal: "needs-human",
@@ -465,7 +565,7 @@ test("train: needs-human parks the train", async () => {
   deps.seedIssue(snap(1, "a"));
   const result = await runTrain(baseOpts({ issues: [1], merge: false }), deps);
   assert.equal(result.exitCode, 1);
-  assert.match(result.status.blocker ?? "", /needs-human/);
+  assert.match(result.status.blocker ?? "", /needs-human|held/i);
   assert.equal(result.status.next_action, "stopped");
 });
 

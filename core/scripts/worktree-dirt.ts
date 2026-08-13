@@ -376,3 +376,46 @@ export function formatProductDirtDisclosure(
   if (body.length <= cap) return `\n\nUncommitted paths:\n${body}`;
   return `\n\nUncommitted paths:\n${body.slice(0, cap)}\n\n[…output truncated]`;
 }
+
+/**
+ * Parse porcelain into product vs **untracked-only** engine scratch paths for
+ * recovery unlink (#1020 / #1028). Only `??` status rows are unlink candidates —
+ * tracked/staged scratch is product-like and must hard-block (same rule as
+ * pre-archive cleanliness).
+ */
+export function classifyPorcelainForScratchRecover(
+  statusOutput: string,
+  extraGlobs: readonly string[] = [],
+): { product: string[]; untrackedScratch: string[] } {
+  const product: string[] = [];
+  const untrackedScratch: string[] = [];
+  for (const line of statusOutput.split("\n")) {
+    if (line.length < 3) continue;
+    const xy = line.slice(0, 2);
+    const rest = line.slice(3);
+    const arrow = rest.indexOf(" -> ");
+    const pathRaw =
+      arrow >= 0 ? unquotePorcelainPath(rest.slice(arrow + 4)) : unquotePorcelainPath(rest);
+    if (!pathRaw) continue;
+    // Rename source endpoint can still be product.
+    if (arrow >= 0) {
+      const src = unquotePorcelainPath(rest.slice(0, arrow));
+      if (src && !isNonProductScratchPath(src, extraGlobs)) product.push(src);
+    }
+    if (isNonProductScratchPath(pathRaw, extraGlobs)) {
+      if (xy === "??") untrackedScratch.push(pathRaw);
+      else product.push(pathRaw); // tracked/staged scratch fails closed
+    } else {
+      product.push(pathRaw);
+    }
+  }
+  return { product, untrackedScratch };
+}
+
+/** True when porcelain is empty of product dirt (scratch-only or clean). */
+export function isScratchOnlyOrCleanPorcelain(
+  statusOutput: string,
+  extraGlobs: readonly string[] = [],
+): boolean {
+  return classifyPorcelainForScratchRecover(statusOutput, extraGlobs).product.length === 0;
+}
