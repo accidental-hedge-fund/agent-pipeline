@@ -104,6 +104,29 @@ export function deriveDeliveryOutcomeId(args: {
   return deriveOutcomeId(adapterId, "delivery", args.fallbackSignalId ?? "unknown");
 }
 
+/**
+ * When linkage uniquely resolves one observed, non-disputed run that carries a
+ * candidate_sha, return that SHA. Used so squash/rebase merge commits do not
+ * split delivery identity from a later deployment of the pipeline candidate.
+ * Multiple or disputed runs → null (do not invent a winner).
+ */
+export function uniqueObservedRunCandidateSha(
+  attribution: ReadonlyArray<{
+    target_type: string;
+    target_id: string;
+    authority: string;
+    disputed?: boolean;
+  }>,
+  runs: readonly RunIdentity[],
+): string | null {
+  const observedRuns = attribution.filter(
+    (a) => a.target_type === "run" && a.authority === "observed" && !a.disputed,
+  );
+  if (observedRuns.length !== 1) return null;
+  const hit = runs.find((r) => r.run_id === observedRuns[0]!.target_id);
+  return normalizeFullSha(hit?.candidate_sha ?? null);
+}
+
 // ---------------------------------------------------------------------------
 // GitHub-native adapter
 // ---------------------------------------------------------------------------
@@ -206,14 +229,8 @@ export const githubOutcomeAdapter: OutcomeSourceAdapter = {
       const env = asString(signal.payload.environment);
       const deployedSha = normalizeFullSha(asString(signal.payload.deployed_candidate_sha));
 
-      // Prefer deployed SHA when present so a co-bundled deploy still keys the
-      // same delivery identity as a later pure deployment signal for that SHA.
-      const outcomeId = deriveDeliveryOutcomeId({
-        candidateSha: deployedSha ?? mergeSha,
-        prNumber: pr,
-        fallbackSignalId: signal.signal_id,
-      });
-
+      // Link first so a uniquely resolved run candidate can key delivery identity
+      // (squash/rebase: merge commit SHA ≠ pipeline candidate SHA).
       const link = buildAttributionFromSignal({
         commit_message: commitMessage,
         merge_sha: mergeSha ?? deployedSha,
@@ -221,6 +238,16 @@ export const githubOutcomeAdapter: OutcomeSourceAdapter = {
         issue_number: asNumber(signal.payload.issue_number) ?? undefined,
         runs,
         signal_at: mergedAt,
+      });
+      const linkedCandidateSha = uniqueObservedRunCandidateSha(link.attribution, runs);
+
+      // Prefer explicit deploy SHA, else unique run candidate, else merge SHA / PR.
+      // Keep merge_sha on the delivery chain; do not use it as sole identity when
+      // linkage already resolved a distinct candidate.
+      const outcomeId = deriveDeliveryOutcomeId({
+        candidateSha: deployedSha ?? linkedCandidateSha ?? mergeSha,
+        prNumber: pr,
+        fallbackSignalId: signal.signal_id,
       });
 
       const hasDeploy =
@@ -246,8 +273,6 @@ export const githubOutcomeAdapter: OutcomeSourceAdapter = {
 
       // Never invent deploy success from merge alone.
       const resolvedDeployStatus = hasDeploy ? deploy_status : "not_observed";
-      // Rollback is observed-only: require explicit provider fields. Never derive
-      // occurred=true from deploy_status alone (e.g. inactive/superseded deploys).
       const mergeRollbackOutcomeRaw = asString(signal.payload.rollback_outcome);
       const mergeRollbackOutcome =
         mergeRollbackOutcomeRaw === "succeeded" ||
@@ -256,10 +281,16 @@ export const githubOutcomeAdapter: OutcomeSourceAdapter = {
         mergeRollbackOutcomeRaw === "not_observed"
           ? mergeRollbackOutcomeRaw
           : null;
-      const mergeRollbackOccurred: boolean | null =
+      let mergeRollbackOccurred: boolean | null =
         typeof signal.payload.rollback_occurred === "boolean"
           ? signal.payload.rollback_occurred
           : null;
+      let mergeRollbackOutcomeResolved = mergeRollbackOutcome;
+      // Explicit rolled_back deploy status is an observed rollback; inactive is not.
+      if (resolvedDeployStatus === "rolled_back") {
+        if (mergeRollbackOccurred == null) mergeRollbackOccurred = true;
+        if (mergeRollbackOutcomeResolved == null) mergeRollbackOutcomeResolved = "unknown";
+      }
       const delivery = emptyDeliveryChain({
         environment: env,
         deploy_status: resolvedDeployStatus,
@@ -273,7 +304,7 @@ export const githubOutcomeAdapter: OutcomeSourceAdapter = {
         },
         rollback: {
           occurred: mergeRollbackOccurred,
-          outcome: mergeRollbackOutcome,
+          outcome: mergeRollbackOutcomeResolved,
         },
       });
 
@@ -357,20 +388,23 @@ export const githubOutcomeAdapter: OutcomeSourceAdapter = {
       const at = asString(signal.payload.at) ?? asString(signal.payload.updated_at);
       const pr = asNumber(signal.payload.pr_number);
 
-      // Same identity family as merge: candidate SHA (or PR) — not env/deploy
-      // markers — so deploy updates the existing delivery chain record.
-      const outcomeId = deriveDeliveryOutcomeId({
-        candidateSha: sha,
-        prNumber: pr,
-        fallbackSignalId: signal.signal_id,
-      });
-
+      // Link first so a uniquely resolved run candidate can share identity with
+      // merge normalization when deploy SHA is a squash merge commit.
       const link = buildAttributionFromSignal({
         merge_sha: sha,
         pr_number: pr ?? undefined,
         runs,
         signal_at: at,
         commit_message: asString(signal.payload.commit_message),
+      });
+      const linkedCandidateSha = uniqueObservedRunCandidateSha(link.attribution, runs);
+
+      // Prefer unique linked run candidate (aligns with merge on squash/rebase),
+      // else payload deploy SHA, else PR fallback.
+      const outcomeId = deriveDeliveryOutcomeId({
+        candidateSha: linkedCandidateSha ?? sha,
+        prNumber: pr,
+        fallbackSignalId: signal.signal_id,
       });
 
       // Map known deploy statuses only. GitHub `inactive` (superseded/deactivated)
@@ -386,8 +420,9 @@ export const githubOutcomeAdapter: OutcomeSourceAdapter = {
                 ? "rolled_back"
                 : "unknown";
 
-      // Explicit provider rollback fields only. Do not assert rollback.occurred from
-      // deploy_status (inactive/superseded deploys must stay not-observed).
+      // Provider explicit fields override; state=rolled_back still populates the
+      // rollback chain (spec: observed rollback must set occurred + outcome).
+      // inactive stays unknown deploy_status above and does not enter this branch.
       const rollbackOutcomeRaw = asString(signal.payload.rollback_outcome);
       const rollbackOutcome =
         rollbackOutcomeRaw === "succeeded" ||
@@ -396,10 +431,15 @@ export const githubOutcomeAdapter: OutcomeSourceAdapter = {
         rollbackOutcomeRaw === "not_observed"
           ? rollbackOutcomeRaw
           : null;
-      const rollbackOccurred: boolean | null =
+      let rollbackOccurred: boolean | null =
         typeof signal.payload.rollback_occurred === "boolean"
           ? signal.payload.rollback_occurred
           : null;
+      let rollbackOutcomeResolved = rollbackOutcome;
+      if (deploy_status === "rolled_back") {
+        if (rollbackOccurred == null) rollbackOccurred = true;
+        if (rollbackOutcomeResolved == null) rollbackOutcomeResolved = "unknown";
+      }
 
       const delivery = emptyDeliveryChain({
         environment: env,
@@ -414,7 +454,7 @@ export const githubOutcomeAdapter: OutcomeSourceAdapter = {
         },
         rollback: {
           occurred: rollbackOccurred,
-          outcome: rollbackOutcome,
+          outcome: rollbackOutcomeResolved,
         },
       });
 

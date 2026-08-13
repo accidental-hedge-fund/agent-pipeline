@@ -390,10 +390,8 @@ test("normalize merge prefers commit_message over body for trailer linkage", () 
   );
 });
 
-// Review 3 finding bb192d88: do not assert rollback from deploy_status alone.
-// state=rolled_back records deploy_status but leaves rollback not-observed unless
-// the provider also sends explicit rollback_occurred / rollback_outcome.
-test("deployment rolled_back alone does not invent rollback.occurred", () => {
+// Review 2 finding 5b9d2331: state=rolled_back must populate delivery.rollback.
+test("deployment rolled_back populates delivery.rollback occurred and outcome", () => {
   const rolledBack: RawOutcomeSignal = {
     signal_id: "deploy:prod:rb",
     kind: "deployment",
@@ -412,8 +410,8 @@ test("deployment rolled_back alone does not invent rollback.occurred", () => {
   });
   assert.ok(rec);
   assert.equal(rec.delivery?.deploy_status, "rolled_back");
-  assert.equal(rec.delivery?.rollback.occurred, null);
-  assert.equal(rec.delivery?.rollback.outcome, null);
+  assert.equal(rec.delivery?.rollback.occurred, true);
+  assert.equal(rec.delivery?.rollback.outcome, "unknown");
 });
 
 // GitHub inactive = superseded/deactivated deployment, not an observed rollback.
@@ -440,7 +438,7 @@ test("deployment inactive does not claim rollback occurred", () => {
   assert.equal(rec.delivery?.rollback.outcome, null);
 });
 
-test("deployment records explicit provider rollback fields only", () => {
+test("deployment rolled_back preserves provider rollback_outcome when present", () => {
   const rolledBack: RawOutcomeSignal = {
     signal_id: "deploy:prod:rb2",
     kind: "deployment",
@@ -448,7 +446,6 @@ test("deployment records explicit provider rollback fields only", () => {
       sha: SHA,
       environment: "production",
       state: "rolled_back",
-      rollback_occurred: true,
       rollback_outcome: "succeeded",
       at: "2026-08-13T20:05:00Z",
     },
@@ -462,4 +459,138 @@ test("deployment records explicit provider rollback fields only", () => {
   assert.equal(rec.delivery?.deploy_status, "rolled_back");
   assert.equal(rec.delivery?.rollback.occurred, true);
   assert.equal(rec.delivery?.rollback.outcome, "succeeded");
+});
+
+// Review 2 finding bb8f74f1: squash/rebase merge SHA ≠ candidate SHA must still
+// share one delivery identity with a later deploy of the pipeline candidate.
+test("squash merge then candidate deploy share one delivery outcome_id", async () => {
+  const candidateSha = "a".repeat(40);
+  const mergeCommitSha = "b".repeat(40);
+  assert.notEqual(candidateSha, mergeCommitSha);
+
+  const squashRuns: RunIdentity[] = [
+    {
+      run_id: "576-2026-08-13T15-47-45-000Z",
+      issue: 576,
+      pr: 1200,
+      started_at: "2026-08-13T15:47:45Z",
+      candidate_sha: candidateSha,
+    },
+  ];
+
+  const squashMerge: RawOutcomeSignal = {
+    signal_id: "merge:pr:1200:squash",
+    kind: "merge",
+    payload: {
+      pr_number: 1200,
+      merged_at: "2026-08-13T16:00:00Z",
+      merge_commit_sha: mergeCommitSha,
+      title: "feat: outcomes (squash)",
+      // Trailers only on the merge commit — resolves the run whose candidate differs.
+      commit_message:
+        "feat: outcomes (#1200)\n\nIssue: #576\nPipeline-Run: 576/2026-08-13T15:47:45Z\n",
+      body: "No trailers in PR body.",
+      url: "https://github.com/example/repo/pull/1200",
+    },
+  };
+
+  const deployCandidate: RawOutcomeSignal = {
+    signal_id: "deploy:prod:candidate",
+    kind: "deployment",
+    payload: {
+      sha: candidateSha,
+      environment: "production",
+      state: "success",
+      at: "2026-08-13T18:00:00Z",
+      url: "https://github.com/example/repo/deployments/2",
+      pr_number: 1200,
+    },
+  };
+
+  const mergeRec = githubOutcomeAdapter.normalize(squashMerge, {
+    repoDir: REPO,
+    runs: squashRuns,
+    now: new Date("2026-08-13T17:00:00Z"),
+  });
+  assert.ok(mergeRec);
+  assert.equal(mergeRec.delivery?.merged_sha, mergeCommitSha);
+  // Identity keys on uniquely resolved run candidate, not the squash merge commit.
+  assert.equal(
+    mergeRec.outcome_id,
+    deriveDeliveryOutcomeId({ candidateSha, prNumber: 1200 }),
+  );
+
+  const deps = memStore();
+  const first = await ingestOutcomes({
+    repoDir: REPO,
+    signals: [squashMerge],
+    runs: squashRuns,
+    deps,
+    now: new Date("2026-08-13T17:00:00Z"),
+  });
+  assert.equal(first.written, 1);
+  const oid = first.outcome_ids[0]!;
+
+  const second = await ingestOutcomes({
+    repoDir: REPO,
+    signals: [deployCandidate],
+    runs: squashRuns,
+    deps,
+    now: new Date("2026-08-13T18:30:00Z"),
+  });
+  assert.equal(second.replaced, 1);
+  assert.equal(second.written, 0);
+  assert.deepEqual(second.outcome_ids, [oid]);
+
+  const listed = await listOutcomes(REPO, { retentionDays: 0, includeExpired: true }, deps);
+  assert.equal(listed.records.length, 1);
+  const rec = listed.records[0]!;
+  assert.equal(rec.delivery?.merge_status, "merged");
+  assert.equal(rec.delivery?.merged_sha, mergeCommitSha);
+  assert.equal(rec.delivery?.deploy_status, "succeeded");
+  assert.equal(rec.delivery?.deployed_candidate_sha, candidateSha);
+});
+
+// End-to-end: rolled_back deploy upserts rollback fields onto the delivery chain.
+test("rolled_back deployment upserts rollback chain on existing delivery", async () => {
+  const deps = memStore();
+  const first = await ingestOutcomes({
+    repoDir: REPO,
+    signals: [mergeFixture],
+    runs,
+    deps,
+    now: new Date("2026-08-13T17:00:00Z"),
+  });
+  assert.equal(first.written, 1);
+  const oid = first.outcome_ids[0]!;
+
+  const rolledBack: RawOutcomeSignal = {
+    signal_id: "deploy:prod:rb-e2e",
+    kind: "deployment",
+    payload: {
+      sha: SHA,
+      environment: "production",
+      state: "rolled_back",
+      at: "2026-08-13T21:00:00Z",
+      url: "https://github.com/example/repo/deployments/11",
+      pr_number: 1200,
+    },
+  };
+  const second = await ingestOutcomes({
+    repoDir: REPO,
+    signals: [rolledBack],
+    runs,
+    deps,
+    now: new Date("2026-08-13T21:30:00Z"),
+  });
+  assert.equal(second.replaced, 1);
+  assert.deepEqual(second.outcome_ids, [oid]);
+
+  const listed = await listOutcomes(REPO, { retentionDays: 0, includeExpired: true }, deps);
+  assert.equal(listed.records.length, 1);
+  const rec = listed.records[0]!;
+  assert.equal(rec.delivery?.deploy_status, "rolled_back");
+  assert.equal(rec.delivery?.rollback.occurred, true);
+  assert.equal(rec.delivery?.rollback.outcome, "unknown");
+  assert.equal(rec.delivery?.merge_status, "merged");
 });
