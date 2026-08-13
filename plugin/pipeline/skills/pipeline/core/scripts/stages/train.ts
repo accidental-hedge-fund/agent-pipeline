@@ -240,7 +240,9 @@ export function codeDependencyMap(
 
 /**
  * Base-eligible frontier: not done/held, code prereqs all integrated, stable order.
- * Unknown ownership is not modeled here — loop serializes unproven pairs inside the wave.
+ * Code prereqs require base containment (`integrated`) only — non-merge R2D
+ * (`finished`) is not sufficient (#1028 review). Unknown ownership is not
+ * modeled here — loop serializes unproven pairs inside the wave.
  */
 export function computeBaseEligibleFrontier(input: {
   ordered: readonly number[];
@@ -257,7 +259,8 @@ export function computeBaseEligibleFrontier(input: {
   for (const issue of input.ordered) {
     if (input.finished.has(issue) || input.held.has(issue)) continue;
     const prereqs = input.codeDeps.get(issue) ?? [];
-    const prereqsOk = prereqs.every((p) => input.integrated.has(p) || input.finished.has(p));
+    // Code deps: merge-result base containment only (not mere R2D / finished).
+    const prereqsOk = prereqs.every((p) => input.integrated.has(p));
     if (!prereqsOk) continue;
     frontier.push(issue);
   }
@@ -461,10 +464,11 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
         }
         break; // complete
       }
-      // Dependents waiting on prereqs that are held / not integrated
+      // Dependents waiting on code prereqs not yet base-contained (finished R2D
+      // without merge is not enough — #1028).
       const waitingOn = remaining.map((n) => {
-        const prereqs = (codeDeps.get(n) ?? []).filter((p) => !integrated.has(p) && !finished.has(p));
-        return `#${n} waits on ${prereqs.map((p) => `#${p}`).join(",") || "?"} (held or not integrated)`;
+        const prereqs = (codeDeps.get(n) ?? []).filter((p) => !integrated.has(p));
+        return `#${n} waits on ${prereqs.map((p) => `#${p}`).join(",") || "?"} (not integrated on base)`;
       });
       blocker = `no base-eligible frontier; ${waitingOn.join("; ")}`;
       nextAction = "stopped";

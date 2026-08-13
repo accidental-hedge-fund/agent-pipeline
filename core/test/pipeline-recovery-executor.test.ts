@@ -256,6 +256,53 @@ test("unlink_engine_scratch (#1020): product dirt fails closed without repair", 
   assert.equal(repairs, 0);
 });
 
+test("unlink_engine_scratch (#1028): clean porcelain fails so restart/repair can run", async () => {
+  // Bite: clean non-scratch workflow-engine failures must NOT succeed unlink
+  // and clear blocked — that falsely recovered real engine defects.
+  let clears = 0;
+  let repairs = 0;
+  const execute = realExecuteRecovery(cfg(), {
+    getOnDiskForIssue: async () => ({ path: "/wt/42", slug: "42-x", branch: "pipeline/42-x" } as never),
+    gitInWorktree: async (_path, args) => {
+      if (args[0] === "status") {
+        return { stdout: "", stderr: "", code: 0 };
+      }
+      return { stdout: "", stderr: "", code: 0 };
+    },
+    getIssueDetail: async () => ({
+      number: 42,
+      type: "issue",
+      title: "t",
+      body: "",
+      state: "open",
+      url: "https://example.test/42",
+      labels: ["blocked", "pipeline:pre-merge"],
+    }),
+    clearBlocked: async () => {
+      clears++;
+    },
+    repairPipelineItem: async () => {
+      repairs++;
+      return { succeeded: true, evidence: "should not run from unlink" };
+    },
+  });
+  const diagnostic = buildStageDiagnostic({
+    reasonCode: "workflow-engine-defect",
+    blockerKind: "harness-failure",
+    reason: "engine defect without scratch",
+  });
+  const result = await execute({
+    ...mechanicalInput(),
+    action: "unlink_engine_scratch",
+    blockerClass: "workflow-engine-defect",
+    diagnostic,
+  });
+  assert.equal(result.succeeded, false);
+  assert.match(result.error ?? "", /no current engine-scratch/);
+  assert.equal(clears, 0, "must not clear blocked without scratch evidence");
+  assert.equal(repairs, 0);
+});
+
 test("DEFAULT_RECOVERY_POLICY recipe order: unlink before repair (#1020)", async () => {
   const { DEFAULT_RECOVERY_POLICY } = await import("../scripts/loop/recovery.ts");
   const recipes = DEFAULT_RECOVERY_POLICY["workflow-engine-defect"].recipes;

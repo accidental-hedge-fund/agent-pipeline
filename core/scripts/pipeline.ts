@@ -1974,6 +1974,14 @@ export function realExecuteRecovery(
           `not engine-scratch-only — trying next recipe`,
       );
     }
+    // Require current engine-scratch evidence. Clean porcelain or non-scratch
+    // workflow-engine failures must fall through to restart/repair — never
+    // clear blocked solely because the tree is already clean (#1028 review).
+    if (classified.untrackedScratch.length === 0) {
+      return failed(
+        `unlink_engine_scratch: no current engine-scratch paths; not scratch-only evidence — trying next recipe`,
+      );
+    }
     const unlinked: string[] = [];
     for (const scratchPath of classified.untrackedScratch) {
       const clean = await gitInWt(
@@ -2064,9 +2072,7 @@ export function realExecuteRecovery(
     return {
       succeeded: true,
       evidence:
-        unlinked.length > 0
-          ? `unlink_engine_scratch: removed engine scratch [${unlinked.join(", ")}] and cleared mechanical block when present`
-          : `unlink_engine_scratch: worktree already free of product dirt and engine scratch; cleared mechanical block when present`,
+        `unlink_engine_scratch: removed engine scratch [${unlinked.join(", ")}] and cleared mechanical block when present`,
     };
   };
 
