@@ -46,6 +46,35 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
+/**
+ * Per-runDir serialization for default assumption_id allocation (#702).
+ * Host-local / in-process only: select ordinal from stream snapshot then append
+ * must not interleave with another default allocate on the same runDir.
+ */
+const assumptionAllocateChains = new Map<string, Promise<unknown>>();
+
+async function withAssumptionAllocateChain<T>(
+  runDir: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const prev = assumptionAllocateChains.get(runDir) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const chained = prev.then(() => gate).catch(() => undefined);
+  assumptionAllocateChains.set(runDir, chained);
+  await prev.catch(() => undefined);
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (assumptionAllocateChains.get(runDir) === chained) {
+      assumptionAllocateChains.delete(runDir);
+    }
+  }
+}
+
 function streamBase(type: PlanningLeverageFamilyEvent["type"], at?: string) {
   return {
     schema_version: RUN_SCHEMA_VERSION as 1,
@@ -173,6 +202,56 @@ export interface EmitAssumptionOpts {
   at?: string;
 }
 
+function buildOpenAssumptionPayload(
+  opts: EmitAssumptionOpts,
+  at: string,
+  assumption_id: string | undefined,
+  ordinal: number | undefined,
+): AssumptionLineagePayload {
+  let payload = createOpenAssumption({
+    run_id: opts.run_id,
+    issue: opts.issue,
+    assumption_id,
+    kind: opts.kind,
+    statement: opts.statement,
+    introduced_phase: opts.introduced_phase,
+    status_updated_at: at,
+    ordinal,
+  });
+  if (opts.status && opts.status !== "open") {
+    payload = updateAssumptionStatus({
+      prior: payload,
+      status: opts.status,
+      status_updated_at: at,
+      resolved_in_phase: opts.resolution?.resolved_in_phase,
+      resolution_note: opts.resolution?.note,
+      evidence_refs: opts.evidence_refs,
+    });
+  }
+  return payload;
+}
+
+async function appendAssumptionPayload(
+  runDir: string,
+  opts: EmitAssumptionOpts,
+  at: string,
+  payload: AssumptionLineagePayload,
+  deps: RunStoreDeps,
+): Promise<boolean> {
+  const built = buildAssumptionPayload(payload);
+  if (!built.ok || !built.value) {
+    console.warn(
+      `[pipeline] planning-leverage: assumption payload invalid: ${built.issues.map((i) => i.message).join("; ")}`,
+    );
+    return false;
+  }
+  const event = {
+    ...streamBase("assumption_lineage", opts.at ?? at),
+    ...built.value,
+  } as PlanningLeverageFamilyEvent;
+  return await appendEvent(runDir, event, deps);
+}
+
 export async function emitAssumptionLineage(
   runDir: string,
   opts: EmitAssumptionOpts,
@@ -180,9 +259,8 @@ export async function emitAssumptionLineage(
 ): Promise<boolean> {
   try {
     const at = opts.status_updated_at ?? opts.at ?? nowIso();
-    let payload: AssumptionLineagePayload;
     if (opts.prior) {
-      payload = updateAssumptionStatus({
+      const payload = updateAssumptionStatus({
         prior: opts.prior,
         status: opts.status ?? "open",
         status_updated_at: at,
@@ -190,60 +268,48 @@ export async function emitAssumptionLineage(
         resolution_note: opts.resolution?.note,
         evidence_refs: opts.evidence_refs,
       });
-    } else {
-      // Collision-free default ids: producer id, producer ordinal, or next free
-      // ordinal for this (run_id, kind, statement) from the append-only stream.
-      let assumption_id = opts.assumption_id;
-      let ordinal = opts.ordinal;
-      if (assumption_id == null || assumption_id === "") {
-        if (ordinal == null) {
-          let events: unknown[] = [];
-          try {
-            events = await readEvents(runDir, deps);
-          } catch {
-            events = [];
-          }
-          ordinal = nextAssumptionOrdinal({
-            events,
-            run_id: opts.run_id,
-            kind: opts.kind,
-            statement: opts.statement,
-          });
+      return await appendAssumptionPayload(runDir, opts, at, payload, deps);
+    }
+
+    // Collision-free default ids: producer id, producer ordinal, or next free
+    // ordinal for this (run_id, kind, statement) from the append-only stream.
+    // When id is omitted and ordinal is omitted, select+append is serialized
+    // per runDir so concurrent implicit emits cannot both claim the same id.
+    const assumption_id = opts.assumption_id;
+    const needsDefaultOrdinal =
+      (assumption_id == null || assumption_id === "") && opts.ordinal == null;
+
+    if (needsDefaultOrdinal) {
+      return await withAssumptionAllocateChain(runDir, async () => {
+        let events: unknown[] = [];
+        try {
+          events = await readEvents(runDir, deps);
+        } catch {
+          events = [];
         }
-      }
-      payload = createOpenAssumption({
-        run_id: opts.run_id,
-        issue: opts.issue,
-        assumption_id,
-        kind: opts.kind,
-        statement: opts.statement,
-        introduced_phase: opts.introduced_phase,
-        status_updated_at: at,
-        ordinal,
-      });
-      if (opts.status && opts.status !== "open") {
-        payload = updateAssumptionStatus({
-          prior: payload,
-          status: opts.status,
-          status_updated_at: at,
-          resolved_in_phase: opts.resolution?.resolved_in_phase,
-          resolution_note: opts.resolution?.note,
-          evidence_refs: opts.evidence_refs,
+        const ordinal = nextAssumptionOrdinal({
+          events,
+          run_id: opts.run_id,
+          kind: opts.kind,
+          statement: opts.statement,
         });
-      }
+        const payload = buildOpenAssumptionPayload(
+          opts,
+          at,
+          undefined,
+          ordinal,
+        );
+        return await appendAssumptionPayload(runDir, opts, at, payload, deps);
+      });
     }
-    const built = buildAssumptionPayload(payload);
-    if (!built.ok || !built.value) {
-      console.warn(
-        `[pipeline] planning-leverage: assumption payload invalid: ${built.issues.map((i) => i.message).join("; ")}`,
-      );
-      return false;
-    }
-    const event = {
-      ...streamBase("assumption_lineage", opts.at ?? at),
-      ...built.value,
-    } as PlanningLeverageFamilyEvent;
-    return await appendEvent(runDir, event, deps);
+
+    const payload = buildOpenAssumptionPayload(
+      opts,
+      at,
+      assumption_id,
+      opts.ordinal,
+    );
+    return await appendAssumptionPayload(runDir, opts, at, payload, deps);
   } catch (err) {
     console.warn(
       `[pipeline] planning-leverage: emitAssumptionLineage failed (non-fatal): ${(err as Error).message}`,

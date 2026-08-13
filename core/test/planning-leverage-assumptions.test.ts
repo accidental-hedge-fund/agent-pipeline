@@ -162,7 +162,7 @@ test("identical statements with distinct ordinals get distinct ids", () => {
   assert.equal(countUnresolved(current), 2);
 });
 
-test("nextAssumptionOrdinal counts distinct same-text items, not status updates", () => {
+test("nextAssumptionOrdinal skips occupied ordinals; status updates do not inflate", () => {
   const a0 = createOpenAssumption({
     run_id: "run-1",
     kind: "assumption",
@@ -217,6 +217,72 @@ test("nextAssumptionOrdinal counts distinct same-text items, not status updates"
   assert.equal(current.size, 2);
   assert.equal(current.get(a0.assumption_id)?.status, "resolved");
   assert.equal(current.get(a1.assumption_id)?.status, "deferred");
+});
+
+test("nextAssumptionOrdinal returns lowest free under sparse producer ordinal", () => {
+  // Regression #702 9d6443b4: producer supplies ordinal 1 only; count-based
+  // next would return 1 and recreate that id. Lowest free is 0.
+  const sparse = createOpenAssumption({
+    run_id: "run-1",
+    kind: "assumption",
+    statement: "shared text",
+    introduced_phase: "planning",
+    status_updated_at: "t1",
+    ordinal: 1,
+  });
+  assert.equal(
+    nextAssumptionOrdinal({
+      events: [sparse],
+      run_id: "run-1",
+      kind: "assumption",
+      statement: "shared text",
+    }),
+    0,
+  );
+  const hole = createOpenAssumption({
+    run_id: "run-1",
+    kind: "assumption",
+    statement: "shared text",
+    introduced_phase: "planning",
+    status_updated_at: "t2",
+    ordinal: 0,
+  });
+  // 0 and 1 taken → next is 2 (not count==2 only by coincidence).
+  assert.equal(
+    nextAssumptionOrdinal({
+      events: [sparse, hole],
+      run_id: "run-1",
+      kind: "assumption",
+      statement: "shared text",
+    }),
+    2,
+  );
+  // Gap: only 0 and 2 present → next is 1.
+  const high = createOpenAssumption({
+    run_id: "run-1",
+    kind: "assumption",
+    statement: "gap text",
+    introduced_phase: "planning",
+    status_updated_at: "t3",
+    ordinal: 2,
+  });
+  const low = createOpenAssumption({
+    run_id: "run-1",
+    kind: "assumption",
+    statement: "gap text",
+    introduced_phase: "planning",
+    status_updated_at: "t4",
+    ordinal: 0,
+  });
+  assert.equal(
+    nextAssumptionOrdinal({
+      events: [high, low],
+      run_id: "run-1",
+      kind: "assumption",
+      statement: "gap text",
+    }),
+    1,
+  );
 });
 
 test("open assumption still visible after planning ends", () => {

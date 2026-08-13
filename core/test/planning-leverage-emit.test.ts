@@ -291,6 +291,91 @@ test("two identical statements get distinct assumption_ids; status updates retai
   assert.equal(countUnresolved(current), 1);
 });
 
+test("implicit emit after sparse producer ordinal does not reuse that id", async () => {
+  // Regression #702 9d6443b4: producer ordinal 1 then default allocate.
+  const runDir = makeRunDir();
+  const deps = baseDeps();
+  const runId = "702-test-run";
+  const statement = "shared sparse text";
+
+  await emitAssumptionLineage(
+    runDir,
+    {
+      run_id: runId,
+      kind: "assumption",
+      statement,
+      introduced_phase: "planning",
+      ordinal: 1,
+      status: "open",
+    },
+    deps,
+  );
+  await emitAssumptionLineage(
+    runDir,
+    {
+      run_id: runId,
+      kind: "assumption",
+      statement,
+      introduced_phase: "planning",
+      status: "open",
+    },
+    deps,
+  );
+
+  const events = await readEvents(runDir);
+  const creates = events.filter((e) => e.type === "assumption_lineage");
+  assert.equal(creates.length, 2);
+  const ids = new Set(creates.map((e) => String(e.assumption_id)));
+  assert.equal(ids.size, 2, "sparse ordinal must not collide with default allocate");
+  const current = projectAssumptionCurrentState(creates, runId);
+  assert.equal(current.size, 2);
+  assert.equal(countUnresolved(current), 2);
+});
+
+test("two concurrent implicit emits get distinct assumption_ids", async () => {
+  // Regression #702 9d6443b4: concurrent default allocate must serialize
+  // select+append so both do not claim ordinal 0.
+  const runDir = makeRunDir();
+  const deps = baseDeps();
+  const runId = "702-test-run";
+  const statement = "concurrent same text";
+
+  const results = await Promise.all([
+    emitAssumptionLineage(
+      runDir,
+      {
+        run_id: runId,
+        kind: "assumption",
+        statement,
+        introduced_phase: "planning",
+        status: "open",
+      },
+      deps,
+    ),
+    emitAssumptionLineage(
+      runDir,
+      {
+        run_id: runId,
+        kind: "assumption",
+        statement,
+        introduced_phase: "planning",
+        status: "open",
+      },
+      deps,
+    ),
+  ]);
+  assert.deepEqual(results, [true, true]);
+
+  const events = await readEvents(runDir);
+  const creates = events.filter((e) => e.type === "assumption_lineage");
+  assert.equal(creates.length, 2);
+  const ids = creates.map((e) => String(e.assumption_id));
+  assert.notEqual(ids[0], ids[1], "concurrent implicit emits must not share assumption_id");
+  const current = projectAssumptionCurrentState(creates, runId);
+  assert.equal(current.size, 2);
+  assert.equal(countUnresolved(current), 2);
+});
+
 test("representative lifecycle plan → implement → review → fix", async () => {
   const runDir = makeRunDir();
   const deps = baseDeps();

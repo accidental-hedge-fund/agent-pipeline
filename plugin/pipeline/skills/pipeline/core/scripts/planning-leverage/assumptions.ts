@@ -29,10 +29,13 @@ export function allocateAssumptionId(args: {
 }
 
 /**
- * Next free ordinal for a (run_id, kind, statement) identity key so default
- * allocation stays unique when producers omit assumption_id (#702 review-2).
- * Counts distinct current-state ids that already share the same redacted
- * statement and kind; status updates do not inflate the count.
+ * Lowest free ordinal for a (run_id, kind, statement) identity key so default
+ * allocation stays unique when producers omit assumption_id (#702).
+ *
+ * Scans ordinals 0,1,2,… and returns the first whose derived assumption_id is
+ * absent from current state. Count-of-matches is wrong under sparse producer
+ * ordinals (e.g. only ordinal 1 exists → next must be 0, not 1). Status
+ * updates do not allocate and do not occupy extra ordinals.
  */
 export function nextAssumptionOrdinal(args: {
   events: readonly unknown[];
@@ -40,13 +43,16 @@ export function nextAssumptionOrdinal(args: {
   kind: AssumptionKind;
   statement: string;
 }): number {
-  const normalized = redactFreeText(args.statement.trim(), 500);
   const current = projectAssumptionCurrentState(args.events, args.run_id);
-  let n = 0;
-  for (const p of current.values()) {
-    if (p.kind === args.kind && p.statement === normalized) n++;
+  for (let ordinal = 0; ; ordinal++) {
+    const id = allocateAssumptionId({
+      run_id: args.run_id,
+      statement: args.statement,
+      ordinal,
+      kind: args.kind,
+    });
+    if (!current.has(id)) return ordinal;
   }
-  return n;
 }
 
 export function isUnresolvedStatus(status: AssumptionStatus): boolean {
