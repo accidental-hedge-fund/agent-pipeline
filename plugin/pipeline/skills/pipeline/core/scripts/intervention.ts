@@ -293,6 +293,8 @@ export function blockerKindToInterventionKind(kind: BlockerKind): HumanIntervent
     case "plan-gen-failed":
       return "auth-tooling-preflight-failure";
     case "harness-failure":
+    case "review-independent-quorum-unmet":
+    case "review-no-usable-reviewers":
       return "reviewer-unavailable";
     case "openspec-invalid":
     case "openspec-stale-delta":

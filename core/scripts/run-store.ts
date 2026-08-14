@@ -174,8 +174,31 @@ export interface ReviewVerdictEvent extends RunEventBase {
       status: "usable" | "failed";
       failureClass?: string;
       costUsd?: number | null;
+      providerFamily?: string;
+      modelFamily?: string;
+      latencyMs?: number | null;
+      costClass?: string;
+      failureOrFallbackReason?: string;
+      independentlyEligible?: boolean;
     }>;
     summary?: string;
+    coverage?: {
+      configured: number;
+      attempted: number;
+      usable: number;
+      independent: number;
+      required: number;
+    };
+    aggregation_outcome?: string;
+    aggregation_reason?: string;
+    cost?: {
+      requested: number;
+      attempted: number;
+      completed: number;
+      billable: number;
+      billable_cost_usd?: number | null;
+    };
+    risk_class?: string;
   };
 }
 export interface GateResultEvent extends RunEventBase {

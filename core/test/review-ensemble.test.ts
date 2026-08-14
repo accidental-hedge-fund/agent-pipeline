@@ -691,6 +691,33 @@ test("invokeReviewEnsemble: per-agent self-review labeled; other agent stays ind
   void inv;
 });
 
+function agentId(
+  partial: Partial<import("../scripts/review-ensemble.ts").EnsembleAgentIdentity> &
+    Pick<
+      import("../scripts/review-ensemble.ts").EnsembleAgentIdentity,
+      "index" | "harness" | "effectiveHarness"
+    >,
+): import("../scripts/review-ensemble.ts").EnsembleAgentIdentity {
+  return {
+    index: partial.index,
+    role: partial.role,
+    harness: partial.harness,
+    effectiveHarness: partial.effectiveHarness,
+    model: partial.model,
+    selfReview: partial.selfReview ?? false,
+    status: partial.status ?? "usable",
+    failureClass: partial.failureClass,
+    costUsd: partial.costUsd,
+    providerFamily: partial.providerFamily ?? "unknown",
+    modelFamily: partial.modelFamily ?? "unknown",
+    implementerHarness: partial.implementerHarness ?? "claude",
+    latencyMs: partial.latencyMs ?? null,
+    costClass: partial.costClass ?? "completed",
+    failureOrFallbackReason: partial.failureOrFallbackReason,
+    independentlyEligible: partial.independentlyEligible ?? false,
+  };
+}
+
 test("formatEnsembleIdentityLine names agents", () => {
   const line = formatEnsembleIdentityLine({
     size: 2,
@@ -698,25 +725,294 @@ test("formatEnsembleIdentityLine names agents", () => {
     failed: 0,
     merge: "union_blocking",
     agents: [
-      {
+      agentId({
         index: 0,
         role: "primary",
         harness: "codex",
         effectiveHarness: "codex",
-        selfReview: false,
-        status: "usable",
-      },
-      {
+        providerFamily: "openai",
+        modelFamily: "gpt-5",
+        independentlyEligible: true,
+      }),
+      agentId({
         index: 1,
         harness: "claude",
         effectiveHarness: "claude",
-        selfReview: false,
-        status: "usable",
-      },
+        providerFamily: "anthropic",
+        modelFamily: "claude-sonnet",
+        independentlyEligible: true,
+      }),
     ],
     summary: "ok",
+    coverage: {
+      configured: 2,
+      attempted: 2,
+      usable: 2,
+      independent: 2,
+      required: 0,
+    },
+    aggregation_outcome: "complete",
+    aggregation_reason: "usable=2/2 independent=2 required=0",
+    cost: {
+      requested: 2,
+      attempted: 2,
+      completed: 2,
+      billable: 0,
+      billable_cost_usd: null,
+    },
+    risk_class: "standard",
   });
   assert.match(line, /Ensemble/);
   assert.match(line, /codex/);
   assert.match(line, /claude/);
+  assert.match(line, /outcome=complete/);
+});
+
+// ---------------------------------------------------------------------------
+// #694 independence / quorum orchestration
+// ---------------------------------------------------------------------------
+
+test("invokeReviewEnsemble: lineage fields and complete outcome when two independent usable", async () => {
+  const inv = async (harness: string): Promise<HarnessResult> => {
+    if (harness === "codex") {
+      return okJson(verdict("approve", []));
+    }
+    return okJson(verdict("approve", []));
+  };
+  const cfg = baseCfg({
+    harnesses: {
+      implementer: "grok",
+      reviewer: "codex",
+      implementerSource: "profile",
+      reviewerSource: "profile",
+    },
+    review_ensemble: {
+      enabled: true,
+      agents: [{ role: "primary" }, { harness: "claude" }],
+      min_usable_agents: 1,
+      max_agents: 4,
+      min_independent_by_risk: { high: 2 },
+    },
+  });
+  const out = await invokeReviewEnsemble(cfg, {
+    worktreeDir: "/wt",
+    prompt: "p",
+    implementer: "grok",
+    kind: "structured",
+    timeoutSec: 30,
+    riskClass: "high",
+    inv: inv as never,
+  });
+  assert.equal(out.result.success, true);
+  assert.ok(out.ensemble);
+  assert.equal(out.ensemble!.coverage.configured, 2);
+  assert.equal(out.ensemble!.coverage.usable, 2);
+  assert.equal(out.ensemble!.coverage.independent, 2);
+  assert.equal(out.ensemble!.coverage.required, 2);
+  assert.equal(out.ensemble!.aggregation_outcome, "complete");
+  for (const a of out.ensemble!.agents) {
+    assert.ok(a.providerFamily);
+    assert.ok(a.modelFamily);
+    assert.equal(typeof a.independentlyEligible, "boolean");
+  }
+});
+
+test("invokeReviewEnsemble: quorum_unmet when required 2 and only one independent lineage", async () => {
+  // Two agents both map to openai/gpt-5 when both are codex-family with same model.
+  const inv = async (): Promise<HarnessResult> =>
+    okJson(
+      verdict("needs-attention", [
+        finding({ severity: "high", title: "blocker", file: "z.ts", line_start: 1 }),
+      ]),
+    );
+  const cfg = baseCfg({
+    harnesses: {
+      implementer: "claude",
+      reviewer: "codex",
+      implementerSource: "profile",
+      reviewerSource: "profile",
+    },
+    models: { ...DEFAULT_CONFIG.models, review: "gpt-5.1" },
+    review_ensemble: {
+      enabled: true,
+      agents: [
+        { role: "primary", model: "gpt-5.1" },
+        { harness: "codex", model: "gpt-5.1" },
+      ],
+      min_usable_agents: 1,
+      max_agents: 4,
+      min_independent_by_risk: { high: 2 },
+      allow_quorum_degrade: false,
+    },
+  });
+  const out = await invokeReviewEnsemble(cfg, {
+    worktreeDir: "/wt",
+    prompt: "p",
+    implementer: "claude",
+    kind: "structured",
+    timeoutSec: 30,
+    riskClass: "high",
+    inv: inv as never,
+  });
+  assert.equal(out.result.success, false);
+  assert.equal(out.ensemble!.aggregation_outcome, "quorum_unmet");
+  assert.equal(out.ensemble!.coverage.independent, 1);
+  assert.equal(out.ensemble!.coverage.required, 2);
+  // Union findings retained under quorum_unmet
+  assert.ok(out.mergedVerdict);
+  assert.equal(out.mergedVerdict!.findings.length, 1);
+  assert.match(out.result.stdout, /blocker|needs-attention/);
+});
+
+test("invokeReviewEnsemble: no_usable_reviewers outcome when all fail", async () => {
+  const inv = async (): Promise<HarnessResult> => timeout();
+  const cfg = baseCfg({
+    review_ensemble: {
+      enabled: true,
+      agents: [{ role: "primary" }, { harness: "claude" }],
+      min_usable_agents: 1,
+      max_agents: 4,
+    },
+  });
+  const out = await invokeReviewEnsemble(cfg, {
+    worktreeDir: "/wt",
+    prompt: "p",
+    implementer: "claude",
+    kind: "structured",
+    timeoutSec: 30,
+    inv: inv as never,
+  });
+  assert.equal(out.result.success, false);
+  assert.equal(out.ensemble!.aggregation_outcome, "no_usable_reviewers");
+  assert.equal(out.coverage!.aggregation_outcome, "no_usable_reviewers");
+});
+
+test("invokeReviewEnsemble: substitute wave can repair quorum once", async () => {
+  let calls = 0;
+  const inv = async (harness: string): Promise<HarnessResult> => {
+    calls++;
+    if (harness === "claude") {
+      return okJson(verdict("approve", []));
+    }
+    // primary codex fails first wave
+    if (harness === "codex" && calls <= 1) return timeout();
+    // substitute or later
+    return okJson(verdict("approve", []));
+  };
+  const cfg = baseCfg({
+    harnesses: {
+      implementer: "grok",
+      reviewer: "codex",
+      implementerSource: "profile",
+      reviewerSource: "profile",
+    },
+    review_ensemble: {
+      enabled: true,
+      agents: [{ role: "primary" }],
+      min_usable_agents: 1,
+      max_agents: 4,
+      min_independent_by_risk: { high: 1 },
+      substitute_agents: [{ harness: "claude" }],
+    },
+  });
+  const out = await invokeReviewEnsemble(cfg, {
+    worktreeDir: "/wt",
+    prompt: "p",
+    implementer: "grok",
+    kind: "structured",
+    timeoutSec: 30,
+    riskClass: "high",
+    inv: inv as never,
+  });
+  assert.equal(out.result.success, true);
+  assert.ok(out.ensemble!.substitute_wave);
+  assert.ok(out.ensemble!.coverage.independent >= 1);
+  assert.notEqual(out.ensemble!.aggregation_outcome, "quorum_unmet");
+  assert.ok(calls >= 2, "substitute wave must invoke again");
+});
+
+test("invokeReviewEnsemble: self-review labeled and never independent", async () => {
+  const inv = async (harness: string): Promise<HarnessResult> => {
+    if (harness === "codex") return spawnErr();
+    return okJson(verdict("approve", []));
+  };
+  const cfg = baseCfg({
+    harnesses: {
+      implementer: "claude",
+      reviewer: "codex",
+      implementerSource: "profile",
+      reviewerSource: "profile",
+    },
+    review_ensemble: {
+      enabled: true,
+      agents: [{ role: "primary" }],
+      min_usable_agents: 1,
+      max_agents: 4,
+    },
+  });
+  const out = await invokeReviewEnsemble(cfg, {
+    worktreeDir: "/wt",
+    prompt: "p",
+    implementer: "claude",
+    kind: "structured",
+    timeoutSec: 30,
+    inv: inv as never,
+  });
+  assert.equal(out.result.success, true);
+  assert.equal(out.selfReview, true);
+  assert.equal(out.ensemble!.agents[0]!.selfReview, true);
+  assert.equal(out.ensemble!.agents[0]!.independentlyEligible, false);
+  assert.equal(out.ensemble!.coverage.independent, 0);
+  assert.equal(out.ensemble!.aggregation_outcome, "same_lineage_fallback");
+});
+
+test("invokeReviewEnsemble: disabled path still records single-agent coverage", async () => {
+  const inv = async (): Promise<HarnessResult> => okJson(verdict("approve", []));
+  const out = await invokeReviewEnsemble(baseCfg(), {
+    worktreeDir: "/wt",
+    prompt: "p",
+    implementer: "claude",
+    kind: "structured",
+    timeoutSec: 30,
+    inv: inv as never,
+  });
+  assert.equal(out.ensemble, undefined);
+  assert.ok(out.coverage);
+  assert.equal(out.coverage!.counts.configured, 1);
+  assert.equal(out.coverage!.counts.attempted, 1);
+});
+
+test("invokeReviewEnsemble: partial success is partial_quorum when required met", async () => {
+  const inv = async (harness: string): Promise<HarnessResult> => {
+    if (harness === "claude") return timeout();
+    return okJson(verdict("approve", []));
+  };
+  const cfg = baseCfg({
+    harnesses: {
+      implementer: "grok",
+      reviewer: "codex",
+      implementerSource: "profile",
+      reviewerSource: "profile",
+    },
+    review_ensemble: {
+      enabled: true,
+      agents: [{ role: "primary" }, { harness: "claude" }],
+      min_usable_agents: 1,
+      max_agents: 4,
+      min_independent_by_risk: { high: 1 },
+    },
+  });
+  const out = await invokeReviewEnsemble(cfg, {
+    worktreeDir: "/wt",
+    prompt: "p",
+    implementer: "grok",
+    kind: "structured",
+    timeoutSec: 30,
+    riskClass: "high",
+    inv: inv as never,
+  });
+  assert.equal(out.result.success, true);
+  assert.equal(out.ensemble!.aggregation_outcome, "partial_quorum");
+  assert.equal(out.ensemble!.coverage.usable, 1);
+  assert.equal(out.ensemble!.coverage.required, 1);
 });

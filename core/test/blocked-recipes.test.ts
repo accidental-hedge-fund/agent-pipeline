@@ -207,6 +207,21 @@ const RECIPE_SNAPSHOTS: Record<(typeof BLOCKER_KINDS)[number], string> = {
     "block reason above, fix product test/build failures or remaining " +
     "infrastructure issues, push any code fix to the PR head, remove the " +
     "`blocked` label, then re-run `$pipeline 7`.",
+  "review-independent-quorum-unmet":
+    "Independent reviewer coverage did not meet the risk-class quorum " +
+    "(see independent vs required counts above). Restore independent coverage " +
+    "by adding a distinct provider/model-family reviewer, fixing same-harness " +
+    "self-review-only degradation, or adjusting " +
+    "`review_ensemble.min_independent_by_risk` with an audited config change. " +
+    "Do not silent-approve. Remove the `blocked` label, then re-run " +
+    "`$pipeline 7`.",
+  "review-no-usable-reviewers":
+    "No usable reviewer verdicts were produced (all agents failed, timed out, " +
+    "or returned unparseable output after any one-shot substitute attempt). " +
+    "Restore reviewer harness availability (CLI install, auth, capacity, and " +
+    "model entitlement), remove the `blocked` label, then re-run " +
+    "`$pipeline 7`. This is an engine harness/coverage failure, not a " +
+    "product-judgment needs-human hold by default.",
 };
 
 test("each kind's rendered recipe matches its pinned snapshot", () => {

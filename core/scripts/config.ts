@@ -642,6 +642,42 @@ const PartialConfigSchema = z.object({
         .literal("union_blocking")
         .optional()
         .describe('Merge mode. v1 supports only "union_blocking" (union findings, rigor-first blocking). Majority-vote approve is not available.'),
+      min_independent_by_risk: z
+        .record(z.string(), z.number().int().min(0, "review_ensemble.min_independent_by_risk values must be non-negative integers"))
+        .optional()
+        .describe("Optional minimum independent reviewer count by risk class (#694). Missing/zero leaves required=0 (min-usable-only)."),
+      substitute_agents: z
+        .array(
+          z
+            .object({
+              role: z.literal("primary").optional().describe('Use the configured primary reviewer. Mutually exclusive with "harness".'),
+              harness: z.string().min(1, "review_ensemble.substitute_agents[].harness must not be empty").optional().describe("Substitute reviewer harness. Mutually exclusive with role: primary."),
+              model: z.string().min(1).optional().describe("Optional model override for this substitute agent only."),
+              effort: z.string().min(1).optional().describe("Optional reasoning-effort override for this substitute agent only."),
+            })
+            .strict()
+            .superRefine((agent, ctx) => {
+              const hasPrimary = agent.role === "primary";
+              const hasHarness = typeof agent.harness === "string" && agent.harness.length > 0;
+              if (hasPrimary && hasHarness) {
+                ctx.addIssue({
+                  code: "custom",
+                  message: 'review_ensemble substitute agent must set either role: "primary" or harness, not both',
+                });
+              } else if (!hasPrimary && !hasHarness) {
+                ctx.addIssue({
+                  code: "custom",
+                  message: 'review_ensemble substitute agent must set role: "primary" or a non-empty harness',
+                });
+              }
+            }),
+        )
+        .optional()
+        .describe("Optional one-shot substitute agent list when first-wave coverage is quorum_unmet or no_usable_reviewers (#694)."),
+      allow_quorum_degrade: z
+        .boolean()
+        .optional()
+        .describe("When true, quorum_unmet may proceed with loud advisory coverage disclosure; default false fail-closed (#694)."),
     })
     .strict()
     .optional()
@@ -1224,6 +1260,39 @@ function resolveReviewEnsemble(
     );
   }
 
+  // min_independent_by_risk: reject negatives (Zod also enforces min 0; keep resolve defensive).
+  let minIndependentByRisk: Record<string, number> | undefined;
+  if (raw?.min_independent_by_risk && typeof raw.min_independent_by_risk === "object") {
+    minIndependentByRisk = {};
+    for (const [k, v] of Object.entries(raw.min_independent_by_risk)) {
+      const n = Number(v);
+      if (!Number.isFinite(n) || !Number.isInteger(n) || n < 0) {
+        throw new Error(
+          `review_ensemble.min_independent_by_risk.${k} must be a non-negative integer (got ${String(v)}).`,
+        );
+      }
+      minIndependentByRisk[k] = n;
+    }
+  }
+
+  const mapAgent = (a: { role?: "primary"; harness?: string; model?: string; effort?: string }) => {
+    if (a.role === "primary") {
+      return {
+        role: "primary" as const,
+        ...(a.model !== undefined ? { model: a.model } : {}),
+        ...(a.effort !== undefined ? { effort: a.effort } : {}),
+      };
+    }
+    return {
+      harness: a.harness as string,
+      ...(a.model !== undefined ? { model: a.model } : {}),
+      ...(a.effort !== undefined ? { effort: a.effort } : {}),
+    };
+  };
+
+  const substituteAgents = (raw?.substitute_agents ?? []).map(mapAgent);
+  const allowQuorumDegrade = raw?.allow_quorum_degrade ?? d.allow_quorum_degrade ?? false;
+
   return {
     enabled,
     agents,
@@ -1232,6 +1301,11 @@ function resolveReviewEnsemble(
     ...(raw?.agent_timeout_sec !== undefined
       ? { agent_timeout_sec: raw.agent_timeout_sec }
       : {}),
+    ...(minIndependentByRisk !== undefined
+      ? { min_independent_by_risk: minIndependentByRisk }
+      : {}),
+    ...(substituteAgents.length > 0 ? { substitute_agents: substituteAgents } : {}),
+    allow_quorum_degrade: allowQuorumDegrade,
   };
 }
 
@@ -2400,6 +2474,9 @@ export const RIGOR_GATING_PATHS: readonly string[] = [
   "review_ensemble.min_usable_agents",
   "review_ensemble.max_agents",
   "review_ensemble.merge",
+  "review_ensemble.min_independent_by_risk",
+  "review_ensemble.substitute_agents",
+  "review_ensemble.allow_quorum_degrade",
   "tester_evidence.on_missing",
   "steps.plan_review",
   "steps.standard_review",
@@ -3230,6 +3307,14 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
             ? `  agent_timeout_sec: ${yamlScalar(config.review_ensemble.agent_timeout_sec)} # ${sd("review_ensemble.agent_timeout_sec", "optional per-agent timeout seconds")}`
             : `  # agent_timeout_sec: 1500 # ${sd("review_ensemble.agent_timeout_sec", "optional per-agent timeout seconds")}`,
           `  # merge: union_blocking # ${sd("review_ensemble.merge", 'v1 supports only "union_blocking"; majority-vote approve is not available')}`,
+          `  # min_independent_by_risk: # ${sd("review_ensemble.min_independent_by_risk", "optional risk-class independent quorum (#694); omit → required 0")}`,
+          `  #   high: 2`,
+          `  # substitute_agents: # ${sd("review_ensemble.substitute_agents", "optional one-shot substitute wave when quorum unmet (#694)")}`,
+          `  #   - harness: claude # ${sd("review_ensemble.substitute_agents.harness", "substitute harness; mutually exclusive with role: primary")}`,
+          `  #     model: auto # ${sd("review_ensemble.substitute_agents.model", "optional model override for this substitute only")}`,
+          `  #     effort: medium # ${sd("review_ensemble.substitute_agents.effort", "optional reasoning-effort override for this substitute only")}`,
+          `  #   - role: primary # ${sd("review_ensemble.substitute_agents.role", "use configured primary reviewer as substitute")}`,
+          `  allow_quorum_degrade: ${yamlScalar(config.review_ensemble.allow_quorum_degrade ?? false)} # ${sd("review_ensemble.allow_quorum_degrade", "default false; when true quorum_unmet proceeds with advisory disclosure only")}`,
         ].join("\n")
       : [
           "# review_ensemble: # parallel multi-agent review at the shared reviewer seam (#645). Default off — no latency/cost change.",
@@ -3243,6 +3328,14 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
           `#   max_agents: ${yamlScalar(d.review_ensemble.max_agents)} # ${sd("review_ensemble.max_agents", "hard upper bound on ensemble agent count")}`,
           `#   agent_timeout_sec: 1500 # ${sd("review_ensemble.agent_timeout_sec", "optional per-agent timeout seconds")}`,
           `#   merge: union_blocking # ${sd("review_ensemble.merge", 'v1 supports only "union_blocking"; majority-vote approve is not available')}`,
+          `#   min_independent_by_risk: # ${sd("review_ensemble.min_independent_by_risk", "optional risk-class independent quorum (#694); omit → required 0")}`,
+          `#     high: 2`,
+          `#   substitute_agents: # ${sd("review_ensemble.substitute_agents", "optional one-shot substitute wave when quorum unmet (#694)")}`,
+          `#     - harness: claude # ${sd("review_ensemble.substitute_agents.harness", "substitute harness; mutually exclusive with role: primary")}`,
+          `#       model: auto # ${sd("review_ensemble.substitute_agents.model", "optional model override for this substitute only")}`,
+          `#       effort: medium # ${sd("review_ensemble.substitute_agents.effort", "optional reasoning-effort override for this substitute only")}`,
+          `#     - role: primary # ${sd("review_ensemble.substitute_agents.role", "use configured primary reviewer as substitute")}`,
+          `#   allow_quorum_degrade: ${yamlScalar(d.review_ensemble.allow_quorum_degrade ?? false)} # ${sd("review_ensemble.allow_quorum_degrade", "default false; when true quorum_unmet proceeds with advisory disclosure only")}`,
         ].join("\n"),
     "",
     // tester_evidence (#646): commented defaults so operators can opt into fail_open.

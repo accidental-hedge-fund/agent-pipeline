@@ -308,6 +308,14 @@ export interface ScoreboardMetrics {
   review_ensemble: {
     ensemble_rounds: number;
     ensemble_agent_invocations: number;
+    /** Rounds that recorded independent/required coverage (#694). */
+    coverage_rounds?: number;
+    /** Sum of independent counts across coverage rounds (#694). */
+    independent_total?: number;
+    /** Sum of required counts across coverage rounds (#694). */
+    required_total?: number;
+    /** Counts by aggregation outcome (#694). */
+    by_outcome?: Partial<Record<string, number>>;
   };
   gate_pass_rates: {
     test: GatePassMetric;
@@ -1589,6 +1597,10 @@ function reduceRunsCore(
   let sameHarnessFallbacks = 0;
   let ensembleRounds = 0;
   let ensembleAgentInvocations = 0;
+  let coverageRounds = 0;
+  let independentTotal = 0;
+  let requiredTotal = 0;
+  const outcomeCounts = new Map<string, number>();
   let preMergeEntries = 0;
   let preMergeNeedsHumanCount = 0;
   const preMergeClassCounts = zeroPreMergeOfframpClassCounts();
@@ -1640,6 +1652,17 @@ function reduceRunsCore(
       if (review.ensembleSize !== undefined && review.ensembleSize > 1) {
         ensembleRounds++;
         ensembleAgentInvocations += review.ensembleSize;
+      }
+      if (review.coverage) {
+        coverageRounds++;
+        independentTotal += review.coverage.independent;
+        requiredTotal += review.coverage.required;
+        if (review.coverage.outcome) {
+          outcomeCounts.set(
+            review.coverage.outcome,
+            (outcomeCounts.get(review.coverage.outcome) ?? 0) + 1,
+          );
+        }
       }
     }
 
@@ -1789,6 +1812,10 @@ function reduceRunsCore(
     review_ensemble: {
       ensemble_rounds: ensembleRounds,
       ensemble_agent_invocations: ensembleAgentInvocations,
+      coverage_rounds: coverageRounds,
+      independent_total: independentTotal,
+      required_total: requiredTotal,
+      by_outcome: Object.fromEntries(outcomeCounts.entries()),
     },
     gate_pass_rates: {
       test: gateMetric(gateCounts.test),
@@ -2345,31 +2372,61 @@ function collectOverrides(run: IncludedRun): JsonRecord[] {
   return arrayRecords(run.summary?.["overrides"]);
 }
 
+function extractEnsembleCoverage(ensemble: unknown): {
+  independent: number;
+  required: number;
+  outcome?: string;
+} | undefined {
+  if (!ensemble || typeof ensemble !== "object") return undefined;
+  const e = ensemble as JsonRecord;
+  const cov = e["coverage"];
+  if (cov && typeof cov === "object") {
+    const c = cov as JsonRecord;
+    const independent = typeof c["independent"] === "number" ? (c["independent"] as number) : undefined;
+    const required = typeof c["required"] === "number" ? (c["required"] as number) : undefined;
+    if (independent === undefined || required === undefined) return undefined;
+    const outcome =
+      typeof e["aggregation_outcome"] === "string"
+        ? (e["aggregation_outcome"] as string)
+        : undefined;
+    return { independent, required, outcome };
+  }
+  return undefined;
+}
+
 function collectReviewRecords(run: IncludedRun): Array<{
   selfReview: boolean;
   /** Self-review count when ensemble agents are present (#645); else 0/1. */
   selfReviewCount: number;
   ensembleSize?: number;
+  coverage?: { independent: number; required: number; outcome?: string };
 }> {
   const reviews = new Map<
     string,
-    { selfReview: boolean; selfReviewCount: number; ensembleSize?: number }
+    {
+      selfReview: boolean;
+      selfReviewCount: number;
+      ensembleSize?: number;
+      coverage?: { independent: number; required: number; outcome?: string };
+    }
   >();
   const absorb = (
     key: string,
     selfReview: boolean,
     selfReviewCount: number,
     ensembleSize?: number,
+    coverage?: { independent: number; required: number; outcome?: string },
   ) => {
     const prev = reviews.get(key);
     if (!prev) {
-      reviews.set(key, { selfReview, selfReviewCount, ensembleSize });
+      reviews.set(key, { selfReview, selfReviewCount, ensembleSize, coverage });
       return;
     }
     reviews.set(key, {
       selfReview: prev.selfReview || selfReview,
       selfReviewCount: Math.max(prev.selfReviewCount, selfReviewCount),
       ensembleSize: ensembleSize ?? prev.ensembleSize,
+      coverage: coverage ?? prev.coverage,
     });
   };
   for (const item of arrayRecords(run.summary?.["reviews"])) {
@@ -2378,6 +2435,7 @@ function collectReviewRecords(run: IncludedRun): Array<{
     const agents = ensemble && typeof ensemble === "object"
       ? arrayRecords((ensemble as JsonRecord)["agents"])
       : [];
+    const coverage = extractEnsembleCoverage(ensemble);
     if (agents.length > 0) {
       const selfReviewCount = agents.filter(
         (a) => a["selfReview"] === true || a["self_review"] === true,
@@ -2386,10 +2444,10 @@ function collectReviewRecords(run: IncludedRun): Array<{
         typeof (ensemble as JsonRecord)["size"] === "number"
           ? ((ensemble as JsonRecord)["size"] as number)
           : agents.length;
-      absorb(key, selfReviewCount > 0, selfReviewCount, size);
+      absorb(key, selfReviewCount > 0, selfReviewCount, size, coverage);
     } else {
       const selfReview = item["selfReview"] === true || item["self_review"] === true;
-      absorb(key, selfReview, selfReview ? 1 : 0);
+      absorb(key, selfReview, selfReview ? 1 : 0, undefined, coverage);
     }
   }
   for (const event of run.events) {
@@ -2399,6 +2457,7 @@ function collectReviewRecords(run: IncludedRun): Array<{
     const agents = ensemble && typeof ensemble === "object"
       ? arrayRecords((ensemble as JsonRecord)["agents"])
       : [];
+    const coverage = extractEnsembleCoverage(ensemble);
     if (agents.length > 0) {
       const selfReviewCount = agents.filter(
         (a) => a["selfReview"] === true || a["self_review"] === true,
@@ -2407,10 +2466,10 @@ function collectReviewRecords(run: IncludedRun): Array<{
         typeof (ensemble as JsonRecord)["size"] === "number"
           ? ((ensemble as JsonRecord)["size"] as number)
           : agents.length;
-      absorb(key, selfReviewCount > 0, selfReviewCount, size);
+      absorb(key, selfReviewCount > 0, selfReviewCount, size, coverage);
     } else {
       const selfReview = event["self_review"] === true || event["selfReview"] === true;
-      absorb(key, selfReview, selfReview ? 1 : 0);
+      absorb(key, selfReview, selfReview ? 1 : 0, undefined, coverage);
     }
   }
   return [...reviews.values()];

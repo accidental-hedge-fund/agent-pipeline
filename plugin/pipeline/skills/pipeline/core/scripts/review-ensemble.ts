@@ -14,6 +14,17 @@ import {
 } from "./review-policy.ts";
 import { invokeReviewer, type ReviewerInvocation } from "./self-review.ts";
 import { parseProseReview, parseStrictVerdict } from "./stages/review-parsing.ts";
+import {
+  buildCoverageSummary,
+  isCoverageFailClosed,
+  isIndependentlyEligible,
+  mapModelFamily,
+  mapProviderFamily,
+  resolveRequiredIndependent,
+  type AggregationOutcome,
+  type ReviewerAttemptLineage,
+  type ReviewerCoverageSummary,
+} from "./reviewer-independence.ts";
 import type {
   Harness,
   PipelineConfig,
@@ -48,6 +59,24 @@ export interface EnsembleAgentIdentity {
   failureClass?: EnsembleFailureClass;
   /** Cost in USD when known from the harness result path (usually absent). */
   costUsd?: number | null;
+  /** Deterministic provider family (#694). */
+  providerFamily: string;
+  /** Deterministic model family (#694). */
+  modelFamily: string;
+  /** Implementer harness for this run (#694). */
+  implementerHarness: string;
+  /** Latency ms when known; null if unknown (#694). */
+  latencyMs: number | null;
+  /**
+   * Cost coverage class for this attempt (#694):
+   * requested always; attempted when started; completed when terminal;
+   * billable only with known actual/estimated cost.
+   */
+  costClass: "requested" | "attempted" | "completed" | "billable";
+  /** Closed failure class or self-review fallback reason when applicable (#694). */
+  failureOrFallbackReason?: string;
+  /** Independently eligible under pure rules (#694). */
+  independentlyEligible: boolean;
 }
 
 export interface EnsembleMergeSummary {
@@ -65,17 +94,44 @@ export interface EnsembleMeta {
   agents: EnsembleAgentIdentity[];
   /** Human-readable one-liner for comments / diagnostics. */
   summary: string;
+  /** Explicit coverage counts (#694). */
+  coverage: {
+    configured: number;
+    attempted: number;
+    usable: number;
+    independent: number;
+    required: number;
+  };
+  /** Closed aggregation outcome (#694). */
+  aggregation_outcome: AggregationOutcome;
+  aggregation_reason: string;
+  /** Cost dimensions (#694). */
+  cost: {
+    requested: number;
+    attempted: number;
+    completed: number;
+    billable: number;
+    billable_cost_usd: number | null;
+  };
+  risk_class: string;
+  /** True when a one-shot substitute wave ran (#694). */
+  substitute_wave?: boolean;
 }
 
 /** Result of an ensemble (or single-agent no-op) invoke. */
 export interface EnsembleInvocation extends ReviewerInvocation {
-  /** Present only when ensemble ran (enabled + ≥1 configured agent path). */
+  /**
+   * Multi-agent ensemble meta when ensemble ran; also set for single-agent
+   * coverage recording when the shared seam emits lineage (#694).
+   */
   ensemble?: EnsembleMeta;
   /**
    * When structured merge succeeded, the merged verdict (also serialized into
    * `result.stdout` as a JSON fence for existing parse paths).
    */
   mergedVerdict?: ReviewVerdict;
+  /** Coverage summary always present after the shared seam (#694). */
+  coverage?: ReviewerCoverageSummary;
 }
 
 export type EnsembleOutputKind = "structured" | "plan-review";
@@ -169,6 +225,46 @@ export function resolveEnsembleAgents(
         model: a.model ?? primaryModel,
         effort: a.effort ?? primaryEffort,
         // Additional agents default to argv; custom CLIs can set their own later.
+        promptDelivery: "argv",
+      });
+    }
+  }
+  return agents;
+}
+
+/**
+ * Resolve substitute agents for the one-shot repair wave (#694). Indices continue
+ * after the primary configured list so audit order stays stable.
+ */
+export function resolveSubstituteAgents(
+  cfg: Pick<PipelineConfig, "review_ensemble" | "harnesses" | "models">,
+  opts?: { model?: string; reasoningEffort?: string; promptDelivery?: "argv" | "stdin" },
+  startIndex = 0,
+): ResolvedEnsembleAgent[] {
+  const subs = cfg.review_ensemble?.substitute_agents ?? [];
+  if (subs.length === 0) return [];
+  const primaryHarness = cfg.harnesses.reviewer;
+  const primaryModel = opts?.model ?? cfg.harnesses.reviewerModel ?? cfg.models.review;
+  const primaryEffort = opts?.reasoningEffort ?? cfg.harnesses.reviewerEffort;
+  const primaryDelivery = opts?.promptDelivery ?? cfg.harnesses.reviewerPromptDelivery;
+  const agents: ResolvedEnsembleAgent[] = [];
+  for (let i = 0; i < subs.length; i++) {
+    const a = subs[i]!;
+    if (a.role === "primary") {
+      agents.push({
+        index: startIndex + i,
+        role: "primary",
+        harness: primaryHarness,
+        model: a.model ?? primaryModel,
+        effort: a.effort ?? primaryEffort,
+        promptDelivery: primaryDelivery,
+      });
+    } else {
+      agents.push({
+        index: startIndex + i,
+        harness: a.harness!,
+        model: a.model ?? primaryModel,
+        effort: a.effort ?? primaryEffort,
         promptDelivery: "argv",
       });
     }
@@ -467,13 +563,19 @@ export interface InvokeReviewEnsembleOptions {
   inv?: typeof invoke;
   /** Injectable per-agent invokeReviewer (defaults to real). */
   invokeReviewerFn?: typeof invokeReviewer;
+  /**
+   * Structured risk class for min_independent_by_risk lookup (#694).
+   * Default "standard". Pure structured input — not free-text.
+   */
+  riskClass?: string;
 }
 
 /**
  * Shared reviewer seam for plan-review / review-1 / review-2 (and SHA-gate
- * re-review). When ensemble is disabled, delegates to a single `invokeReviewer`
- * call. When enabled, fans out concurrently, merges usable agents, and returns
- * one disposition-shaped result.
+ * re-review). When ensemble is disabled, runs a single `invokeReviewer` and
+ * still records coverage counts (#694). When enabled, fans out concurrently,
+ * optionally runs one substitute wave, merges usable agents, and returns one
+ * disposition-shaped result with independence/quorum coverage.
  */
 export async function invokeReviewEnsemble(
   cfg: PipelineConfig,
@@ -481,36 +583,31 @@ export async function invokeReviewEnsemble(
 ): Promise<EnsembleInvocation> {
   const invokeReviewerFn = options.invokeReviewerFn ?? invokeReviewer;
   const inv = options.inv ?? invoke;
+  const implementer = options.implementer;
+  const riskClass = (options.riskClass && options.riskClass.trim()) || "standard";
+  const minUsable = isEnsembleEnabled(cfg)
+    ? cfg.review_ensemble!.min_usable_agents
+    : 1;
+  const required = resolveRequiredIndependent(
+    cfg.review_ensemble?.min_independent_by_risk,
+    riskClass,
+  );
+  const allowQuorumDegrade = cfg.review_ensemble?.allow_quorum_degrade === true;
+  const agentTimeout = isEnsembleEnabled(cfg)
+    ? (cfg.review_ensemble!.agent_timeout_sec ?? options.timeoutSec)
+    : options.timeoutSec;
 
-  if (!isEnsembleEnabled(cfg)) {
-    const single = await invokeReviewerFn(
-      cfg.harnesses.reviewer,
-      options.implementer,
-      options.worktreeDir,
-      options.prompt,
-      {
-        timeoutSec: options.timeoutSec,
-        model: options.model,
-        modelWasAuto: options.modelWasAuto,
-        reasoningEffort: options.reasoningEffort,
-        promptDelivery: options.promptDelivery,
-        ...options.invokeOpts,
-      },
-      inv,
-    );
-    return single;
-  }
+  type AgentOutcome = {
+    agent: ResolvedEnsembleAgent;
+    invocation: ReviewerInvocation;
+    usable: boolean;
+    failureClass?: EnsembleFailureClass;
+    parsed?: ReviewVerdict;
+    planText?: string;
+    attempted: boolean;
+    completed: boolean;
+  };
 
-  const agents = resolveEnsembleAgents(cfg, {
-    model: options.model,
-    reasoningEffort: options.reasoningEffort,
-    promptDelivery: options.promptDelivery,
-  });
-  const minUsable = cfg.review_ensemble!.min_usable_agents;
-  const agentTimeout =
-    cfg.review_ensemble!.agent_timeout_sec ?? options.timeoutSec;
-
-  // Optional identity suffix only — core prompt material is identical.
   const promptFor = (agent: ResolvedEnsembleAgent): string => {
     const role = agent.role === "primary" ? "primary" : "cross-check";
     return (
@@ -521,21 +618,12 @@ export async function invokeReviewEnsemble(
     );
   };
 
-  type AgentOutcome = {
-    agent: ResolvedEnsembleAgent;
-    invocation: ReviewerInvocation;
-    usable: boolean;
-    failureClass?: EnsembleFailureClass;
-    parsed?: ReviewVerdict;
-    planText?: string;
-  };
-
-  const started = agents.map(async (agent): Promise<AgentOutcome> => {
+  async function runAgent(agent: ResolvedEnsembleAgent): Promise<AgentOutcome> {
     const invocation = await invokeReviewerFn(
       agent.harness,
-      options.implementer,
+      implementer,
       options.worktreeDir,
-      promptFor(agent),
+      isEnsembleEnabled(cfg) ? promptFor(agent) : options.prompt,
       {
         timeoutSec: agentTimeout,
         model: agent.model,
@@ -543,8 +631,6 @@ export async function invokeReviewEnsemble(
         reasoningEffort: agent.effort,
         promptDelivery: agent.promptDelivery,
         ...options.invokeOpts,
-        // Per-agent accounting stage suffix so concurrent agents don't collide
-        // on identical (issue, stage) accounting rows when present.
         ...(options.invokeOpts?.accounting
           ? {
               accounting: {
@@ -557,12 +643,15 @@ export async function invokeReviewEnsemble(
       inv,
     );
 
+    const completed = true; // harness returned a terminal result
     if (!invocation.result.success || !invocation.result.stdout?.trim()) {
       return {
         agent,
         invocation,
         usable: false,
         failureClass: classifyFailure(invocation.result, false),
+        attempted: true,
+        completed,
       };
     }
 
@@ -573,6 +662,8 @@ export async function invokeReviewEnsemble(
           invocation,
           usable: false,
           failureClass: "unparseable",
+          attempted: true,
+          completed,
         };
       }
       return {
@@ -580,6 +671,8 @@ export async function invokeReviewEnsemble(
         invocation,
         usable: true,
         planText: invocation.result.stdout,
+        attempted: true,
+        completed,
       };
     }
 
@@ -593,170 +686,401 @@ export async function invokeReviewEnsemble(
         invocation,
         usable: false,
         failureClass: "unparseable",
+        attempted: true,
+        completed,
       };
     }
-    return { agent, invocation, usable: true, parsed };
+    return { agent, invocation, usable: true, parsed, attempted: true, completed };
+  }
+
+  async function runWave(agents: ResolvedEnsembleAgent[]): Promise<AgentOutcome[]> {
+    const started = agents.map((agent) => runAgent(agent));
+    const settled = await Promise.allSettled(started);
+    return settled.map((s, i) => {
+      if (s.status === "fulfilled") return s.value;
+      const agent = agents[i]!;
+      const failedResult: HarnessResult = {
+        success: false,
+        stdout: "",
+        stderr: String(s.reason ?? "ensemble agent rejected"),
+        exit_code: -1,
+        duration: 0,
+        timed_out: false,
+      };
+      return {
+        agent,
+        invocation: {
+          result: failedResult,
+          effectiveReviewer: agent.harness,
+          selfReview: false,
+        },
+        usable: false,
+        failureClass: "rejected" as const,
+        attempted: true,
+        completed: true,
+      };
+    });
+  }
+
+  function costFromResult(result: HarnessResult): {
+    costUsd: number | null;
+    billable: boolean;
+    costClass: "requested" | "attempted" | "completed" | "billable";
+  } {
+    // HarnessResult does not currently expose structured cost; treat as completed
+    // with unknown cost (never invent billable $0).
+    const usageCost =
+      result && typeof (result as { cost_usd?: unknown }).cost_usd === "number"
+        ? ((result as { cost_usd: number }).cost_usd)
+        : null;
+    if (usageCost !== null && Number.isFinite(usageCost)) {
+      return { costUsd: usageCost, billable: true, costClass: "billable" };
+    }
+    return { costUsd: null, billable: false, costClass: "completed" };
+  }
+
+  function toLineage(o: AgentOutcome): ReviewerAttemptLineage {
+    const { costUsd, billable } = costFromResult(o.invocation.result);
+    const provider = mapProviderFamily(o.agent.harness, o.agent.model);
+    const modelFam = mapModelFamily(o.agent.model);
+    const latencyMs =
+      typeof o.invocation.result.duration === "number" &&
+      Number.isFinite(o.invocation.result.duration)
+        ? Math.round(o.invocation.result.duration * 1000)
+        : null;
+    const selfReview = o.invocation.selfReview;
+    const failureOrFallback = o.usable
+      ? selfReview
+        ? "self_review_fallback"
+        : undefined
+      : o.failureClass;
+    return {
+      index: o.agent.index,
+      configured_harness: o.agent.harness,
+      effective_harness: o.invocation.effectiveReviewer,
+      provider_family: provider,
+      model_family: modelFam,
+      model: o.agent.model,
+      self_review: selfReview,
+      implementer_harness: implementer,
+      status: o.usable ? "usable" : "failed",
+      latency_ms: latencyMs,
+      attempted: o.attempted,
+      completed: o.completed,
+      billable,
+      cost_usd: costUsd,
+      failure_reason: o.usable ? undefined : o.failureClass,
+      fallback_reason: selfReview ? "self_review_fallback" : undefined,
+    };
+  }
+
+  function toIdentity(o: AgentOutcome): EnsembleAgentIdentity {
+    const lineage = toLineage(o);
+    const { costUsd, billable, costClass } = costFromResult(o.invocation.result);
+    const failureOrFallbackReason =
+      lineage.fallback_reason ?? lineage.failure_reason;
+    return {
+      index: o.agent.index,
+      role: o.agent.role,
+      harness: o.agent.harness,
+      effectiveHarness: o.invocation.effectiveReviewer,
+      model: o.agent.model,
+      selfReview: o.invocation.selfReview,
+      status: o.usable ? "usable" : "failed",
+      failureClass: o.failureClass,
+      costUsd,
+      providerFamily: lineage.provider_family,
+      modelFamily: lineage.model_family,
+      implementerHarness: implementer,
+      latencyMs: lineage.latency_ms,
+      costClass: o.attempted ? costClass : "requested",
+      failureOrFallbackReason,
+      independentlyEligible: isIndependentlyEligible(lineage),
+    };
+  }
+
+  function buildMeta(
+    configuredCount: number,
+    outcomes: AgentOutcome[],
+    summary: string,
+    substituteWave: boolean,
+  ): { meta: EnsembleMeta; coverage: ReviewerCoverageSummary } {
+    const lineages = outcomes.map(toLineage);
+    const coverage = buildCoverageSummary({
+      attempts: lineages,
+      configured: configuredCount,
+      minUsable,
+      required,
+      riskClass,
+    });
+    const identities = outcomes.map(toIdentity);
+    const usableN = outcomes.filter((o) => o.usable).length;
+    const meta: EnsembleMeta = {
+      size: configuredCount,
+      usable: usableN,
+      failed: outcomes.length - usableN,
+      merge: "union_blocking",
+      agents: identities,
+      summary,
+      coverage: coverage.counts,
+      aggregation_outcome: coverage.aggregation_outcome,
+      aggregation_reason: coverage.aggregation_reason,
+      cost: coverage.cost,
+      risk_class: riskClass,
+      ...(substituteWave ? { substitute_wave: true } : {}),
+    };
+    return { meta, coverage };
+  }
+
+  // ---- Single-agent path (ensemble disabled) ----
+  if (!isEnsembleEnabled(cfg)) {
+    // Match pre-#694 invokeReviewer opts: pass through options.model as-is
+    // (undefined) so harness-level alias filtering still applies (#441).
+    const singleAgent: ResolvedEnsembleAgent = {
+      index: 0,
+      role: "primary",
+      harness: cfg.harnesses.reviewer,
+      model: options.model,
+      effort: options.reasoningEffort,
+      promptDelivery: options.promptDelivery,
+    };
+    const outcomes = await runWave([singleAgent]);
+    const o = outcomes[0]!;
+    const summary =
+      o.usable
+        ? `Single-reviewer coverage: usable=1 independent lineage recorded`
+        : `Single-reviewer failed: ${o.failureClass ?? "failed"}`;
+    const { meta, coverage } = buildMeta(1, outcomes, summary, false);
+    // Single-agent: keep ensemble undefined for #645 consumers that treat
+    // ensemble presence as multi-agent; coverage is on the invocation.
+    if (!o.usable) {
+      return {
+        result: o.invocation.result,
+        effectiveReviewer: o.invocation.effectiveReviewer,
+        selfReview: o.invocation.selfReview,
+        coverage,
+      };
+    }
+    return {
+      result: o.invocation.result,
+      effectiveReviewer: o.invocation.effectiveReviewer,
+      selfReview: o.invocation.selfReview,
+      coverage,
+      ...(options.kind === "structured" && o.parsed
+        ? { mergedVerdict: o.parsed }
+        : {}),
+    };
+  }
+
+  // ---- Ensemble path ----
+  const agents = resolveEnsembleAgents(cfg, {
+    model: options.model,
+    reasoningEffort: options.reasoningEffort,
+    promptDelivery: options.promptDelivery,
+  });
+  let outcomes = await runWave(agents);
+  let substituteWave = false;
+  const configuredCount = agents.length;
+
+  const firstCoverage = buildCoverageSummary({
+    attempts: outcomes.map(toLineage),
+    configured: configuredCount,
+    minUsable,
+    required,
+    riskClass,
   });
 
-  const settled = await Promise.allSettled(started);
-  const outcomes: AgentOutcome[] = settled.map((s, i) => {
-    if (s.status === "fulfilled") return s.value;
-    // Unexpected throw from invoke — treat as failed agent.
-    const agent = agents[i]!;
-    const failedResult: HarnessResult = {
-      success: false,
-      stdout: "",
-      stderr: String(s.reason ?? "ensemble agent rejected"),
-      exit_code: -1,
-      duration: 0,
-      timed_out: false,
-    };
-    return {
-      agent,
-      invocation: {
-        result: failedResult,
-        effectiveReviewer: agent.harness,
-        selfReview: false,
+  // One-shot substitute wave when coverage fail-closed and substitutes configured.
+  if (
+    isCoverageFailClosed(firstCoverage.aggregation_outcome, false) &&
+    (cfg.review_ensemble?.substitute_agents?.length ?? 0) > 0
+  ) {
+    const subs = resolveSubstituteAgents(
+      cfg,
+      {
+        model: options.model,
+        reasoningEffort: options.reasoningEffort,
+        promptDelivery: options.promptDelivery,
       },
-      usable: false,
-      failureClass: "rejected" as const,
-    };
-  });
+      agents.length,
+    );
+    if (subs.length > 0) {
+      const subOutcomes = await runWave(subs);
+      outcomes = [...outcomes, ...subOutcomes];
+      substituteWave = true;
+    }
+  }
 
   const usable = outcomes.filter((o) => o.usable);
   const failed = outcomes.filter((o) => !o.usable);
-
-  const agentIdentities: EnsembleAgentIdentity[] = outcomes.map((o) => ({
-    index: o.agent.index,
-    role: o.agent.role,
-    harness: o.agent.harness,
-    effectiveHarness: o.invocation.effectiveReviewer,
-    model: o.agent.model,
-    selfReview: o.invocation.selfReview,
-    status: o.usable ? "usable" : "failed",
-    failureClass: o.failureClass,
-  }));
-
-  const metaBase = {
-    size: agents.length,
-    usable: usable.length,
-    failed: failed.length,
-    merge: "union_blocking" as const,
-    agents: agentIdentities,
-  };
-
   const anySelfReview = outcomes.some((o) => o.invocation.selfReview);
-  // Primary-effective reviewer for banner / label: first usable primary, else
-  // first usable agent, else configured primary.
   const primaryUsable =
     usable.find((o) => o.agent.role === "primary") ?? usable[0];
   const effectiveReviewer =
     primaryUsable?.invocation.effectiveReviewer ?? cfg.harnesses.reviewer;
 
-  if (usable.length < minUsable) {
-    const named = failed
-      .map(
-        (f) =>
-          `${f.agent.harness}#${f.agent.index}(${f.failureClass ?? "failed"})`,
-      )
-      .join(", ");
-    const stderr = outcomes
-      .map((o) => o.invocation.result.stderr?.trim())
-      .filter(Boolean)
-      .join("\n");
+  // Coverage uses configured = primary agent list size (not substitutes).
+  // Attempted/usable include substitute attempts so rollups stay honest.
+  const coverageConfigured = configuredCount;
+  let { meta, coverage } = buildMeta(
+    coverageConfigured,
+    outcomes,
+    "",
+    substituteWave,
+  );
+  // Recompute configured count on meta to primary configured (not substitute-inflated size).
+  // size field remains primary configured for #645 consumers; usable/failed over all outcomes.
+  meta = {
+    ...meta,
+    size: coverageConfigured,
+    usable: usable.length,
+    failed: failed.length,
+    coverage: {
+      ...coverage.counts,
+      configured: coverageConfigured,
+    },
+  };
+  coverage = {
+    ...coverage,
+    counts: { ...coverage.counts, configured: coverageConfigured },
+  };
+
+  const coverageLine =
+    `coverage configured=${coverage.counts.configured} attempted=${coverage.counts.attempted} ` +
+    `usable=${coverage.counts.usable} independent=${coverage.counts.independent} ` +
+    `required=${coverage.counts.required} outcome=${coverage.aggregation_outcome}`;
+
+  const failClosed = isCoverageFailClosed(
+    coverage.aggregation_outcome,
+    allowQuorumDegrade,
+  );
+
+  // Merge usable agents even under quorum_unmet so findings are retained.
+  let mergedVerdict: ReviewVerdict | undefined;
+  let mergedPlanText: string | undefined;
+  if (usable.length > 0) {
+    if (options.kind === "plan-review") {
+      mergedPlanText = mergePlanReviewOutputs(
+        usable.map((o) => ({
+          agentIndex: o.agent.index,
+          harness: o.agent.harness,
+          text: o.planText ?? o.invocation.result.stdout,
+        })),
+      );
+    } else {
+      mergedVerdict = mergeEnsembleVerdicts(
+        usable.map((o) => ({
+          agentIndex: o.agent.index,
+          verdict: o.parsed!,
+        })),
+        options.commitSha ?? "",
+      );
+    }
+  }
+
+  const namedFailed = failed
+    .map((f) => `${f.agent.harness}#${f.agent.index}(${f.failureClass ?? "failed"})`)
+    .join(", ");
+  const duration = Math.max(
+    0,
+    ...outcomes.map((o) => o.invocation.result.duration ?? 0),
+  );
+  const stderrParts = outcomes
+    .map((o) => o.invocation.result.stderr?.trim())
+    .filter(Boolean);
+
+  if (failClosed) {
+    const findingNote =
+      mergedVerdict && mergedVerdict.findings.length > 0
+        ? ` Usable agents still reported ${mergedVerdict.findings.length} finding(s) (union retained).`
+        : "";
     const summary =
-      `Review ensemble failed closed: usable ${usable.length} < min_usable_agents ${minUsable}. ` +
-      `Failed agents: ${named || "(none named)"}.`;
-    const duration = Math.max(
-      0,
-      ...outcomes.map((o) => o.invocation.result.duration ?? 0),
-    );
+      coverage.aggregation_outcome === "no_usable_reviewers"
+        ? `Review ensemble failed closed: no usable reviewers (${coverageLine}). Failed agents: ${namedFailed || "(none named)"}.`
+        : `Review ensemble failed closed: independent quorum unmet (${coverageLine}).${findingNote}`;
+    meta = { ...meta, summary: `${summary} ${coverage.aggregation_reason}` };
+    // When findings exist under quorum_unmet, surface them in stdout so
+    // operators can still see union blockers on the block surface.
+    const stdout =
+      coverage.aggregation_outcome === "quorum_unmet" && mergedVerdict
+        ? serializeMergedVerdict(mergedVerdict)
+        : "";
     return {
       result: {
         success: false,
-        stdout: "",
-        stderr: [summary, stderr].filter(Boolean).join("\n"),
+        stdout,
+        stderr: [summary, ...stderrParts].filter(Boolean).join("\n"),
         exit_code: -1,
         duration,
         timed_out: outcomes.every((o) => o.invocation.result.timed_out),
       },
       effectiveReviewer,
       selfReview: anySelfReview,
-      ensemble: { ...metaBase, summary },
+      ensemble: meta,
+      coverage,
+      ...(mergedVerdict ? { mergedVerdict } : {}),
     };
   }
 
-  // Soft-fail path: merge usable agents.
+  // Soft-fail / success path (including allow_quorum_degrade advisory).
+  const degradeNote =
+    coverage.aggregation_outcome === "quorum_unmet" && allowQuorumDegrade
+      ? " ADVISORY: quorum_unmet with allow_quorum_degrade — coverage not complete."
+      : "";
+  const failNote =
+    failed.length > 0
+      ? `\n\n<!-- ensemble-diagnostics failed=${failed.map((f) => `${f.agent.harness}:${f.failureClass}`).join(",")} -->\n`
+      : "";
+
   if (options.kind === "plan-review") {
-    const mergedText = mergePlanReviewOutputs(
-      usable.map((o) => ({
-        agentIndex: o.agent.index,
-        harness: o.agent.harness,
-        text: o.planText ?? o.invocation.result.stdout,
-      })),
-    );
-    const failNote =
-      failed.length > 0
-        ? `\n\n<!-- ensemble-diagnostics failed=${failed.map((f) => `${f.agent.harness}:${f.failureClass}`).join(",")} -->\n`
-        : "";
     const summary =
-      `Ensemble plan-review: ${usable.length}/${agents.length} usable` +
+      `Ensemble plan-review: ${usable.length}/${coverageConfigured} usable; ${coverageLine}${degradeNote}` +
       (failed.length ? `; failed: ${failed.map((f) => f.agent.harness).join(", ")}` : "");
-    const duration = Math.max(
-      0,
-      ...outcomes.map((o) => o.invocation.result.duration ?? 0),
-    );
+    meta = { ...meta, summary };
     return {
       result: {
         success: true,
-        stdout: mergedText + failNote,
-        stderr: failed
-          .map((f) => f.invocation.result.stderr?.trim())
-          .filter(Boolean)
-          .join("\n"),
+        stdout: (mergedPlanText ?? "") + failNote,
+        stderr: stderrParts.join("\n"),
         exit_code: 0,
         duration,
         timed_out: false,
       },
       effectiveReviewer,
       selfReview: anySelfReview,
-      ensemble: { ...metaBase, summary },
+      ensemble: meta,
+      coverage,
     };
   }
 
-  // Structured merge
-  const mergedVerdict = mergeEnsembleVerdicts(
-    usable.map((o) => ({
-      agentIndex: o.agent.index,
-      verdict: o.parsed!,
-    })),
-    options.commitSha ?? "",
-  );
   const summary =
-    `Ensemble review: ${usable.length}/${agents.length} usable, ` +
-    `${mergedVerdict.findings.length} finding(s) after union+findingKey dedupe` +
+    `Ensemble review: ${usable.length}/${coverageConfigured} usable, ` +
+    `${mergedVerdict?.findings.length ?? 0} finding(s) after union+findingKey dedupe; ${coverageLine}${degradeNote}` +
     (failed.length
       ? `; failed agents: ${failed.map((f) => `${f.agent.harness}(${f.failureClass})`).join(", ")}`
       : "");
-  const duration = Math.max(
-    0,
-    ...outcomes.map((o) => o.invocation.result.duration ?? 0),
-  );
+  meta = { ...meta, summary };
   return {
     result: {
       success: true,
-      stdout: serializeMergedVerdict(mergedVerdict),
-      stderr: failed
-        .map((f) => f.invocation.result.stderr?.trim())
-        .filter(Boolean)
-        .join("\n"),
+      stdout: serializeMergedVerdict(
+        mergedVerdict ?? {
+          verdict: "approve",
+          summary: "Ensemble: no findings from usable agents",
+          findings: [],
+          next_steps: [],
+          commitSha: options.commitSha ?? "",
+        },
+      ),
+      stderr: stderrParts.join("\n"),
       exit_code: 0,
       duration,
       timed_out: false,
     },
     effectiveReviewer,
     selfReview: anySelfReview,
-    ensemble: { ...metaBase, summary },
+    ensemble: meta,
+    coverage,
     mergedVerdict,
   };
 }
@@ -771,22 +1095,62 @@ export function ensembleSelfReviewBanner(
     .map((a) => `\`${a.harness}\`→\`${a.effectiveHarness}\``)
     .join(", ");
   return (
-    `> ⚠️ **Ensemble includes same-harness self-review (#39 / #645).** ` +
+    `> ⚠️ **Ensemble includes same-harness self-review (#39 / #645 / #694).** ` +
     `Agent(s) fell back to the implementer: ${named}. ` +
-    `A same-harness review is weaker than an independent cross-harness review — weigh it accordingly.`
+    `Self-review does not count as independent coverage when policy forbids it.`
   );
 }
 
-/** Short multi-agent identity line for review comments. */
+/** Short multi-agent identity + coverage line for review comments. */
 export function formatEnsembleIdentityLine(ensemble: EnsembleMeta): string {
   const parts = ensemble.agents.map((a) => {
     const label = a.selfReview
       ? `${a.effectiveHarness} (self-review of ${a.harness})`
       : a.harness;
+    const lineage = a.providerFamily && a.modelFamily
+      ? ` ${a.providerFamily}/${a.modelFamily}`
+      : "";
     const st = a.status === "failed" ? ` [failed:${a.failureClass ?? "?"}]` : "";
-    return `${label}${st}`;
+    const ind = a.independentlyEligible ? " indep" : "";
+    return `${label}${lineage}${ind}${st}`;
   });
-  return `**Ensemble** (${ensemble.usable}/${ensemble.size} usable, merge=${ensemble.merge}): ${parts.join(", ")}`;
+  const cov = ensemble.coverage
+    ? ` cov=${ensemble.coverage.independent}/${ensemble.coverage.required}req` +
+      ` outcome=${ensemble.aggregation_outcome}`
+    : "";
+  return (
+    `**Ensemble** (${ensemble.usable}/${ensemble.size} usable, merge=${ensemble.merge}${cov}): ` +
+    `${parts.join(", ")}`
+  );
+}
+
+/** Coverage disclosure line for disposition comments (#694). */
+export function formatCoverageDisclosure(
+  coverage: ReviewerCoverageSummary | EnsembleMeta | undefined,
+): string {
+  if (!coverage) return "";
+  const counts = "coverage" in coverage && coverage.coverage
+    ? coverage.coverage
+    : "counts" in coverage
+      ? (coverage as ReviewerCoverageSummary).counts
+      : null;
+  const outcome =
+    "aggregation_outcome" in coverage
+      ? coverage.aggregation_outcome
+      : undefined;
+  const reason =
+    "aggregation_reason" in coverage ? coverage.aggregation_reason : undefined;
+  if (!counts || !outcome) return "";
+  const degraded =
+    outcome === "same_lineage_fallback" || outcome === "quorum_unmet"
+      ? " — independence degraded or unmet"
+      : "";
+  return (
+    `**Reviewer coverage (#694):** configured=${counts.configured} attempted=${counts.attempted} ` +
+    `usable=${counts.usable} independent=${counts.independent} required=${counts.required} ` +
+    `outcome=\`${outcome}\`${degraded}` +
+    (reason ? ` (${reason})` : "")
+  );
 }
 
 /** Resolve a ReviewEnsembleConfig with defaults applied (for tests / display). */
@@ -796,5 +1160,6 @@ export function defaultReviewEnsembleConfig(): ReviewEnsembleConfig {
     agents: [],
     min_usable_agents: 1,
     max_agents: 4,
+    allow_quorum_degrade: false,
   };
 }

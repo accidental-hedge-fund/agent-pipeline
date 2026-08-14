@@ -130,6 +130,10 @@ function mechanicalReasonCodeForKind(kind: BlockerKind): StageDiagnosticReasonCo
       return "worktree-capacity";
     case "human-decision-required":
       return "human-decision-required";
+    case "review-independent-quorum-unmet":
+      return "workflow-engine-defect";
+    case "review-no-usable-reviewers":
+      return "harness-contract";
     default:
       return assertNever(kind);
   }

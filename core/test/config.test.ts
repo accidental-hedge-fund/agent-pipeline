@@ -1001,6 +1001,80 @@ test("resolveConfig: review_ensemble + stage_executors.planning (non-review) is 
   }
 });
 
+// ---- review_ensemble independence quorum (#694) ----
+
+test("resolveConfig: min_independent_by_risk omitted is inert (#694)", async () => {
+  const repo = makeFakeRepo(
+    `review_ensemble:\n  enabled: true\n  agents:\n    - role: primary\n    - harness: claude\n`,
+  );
+  const binDir = makeFakeGh("acme/re-ind0");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-re-ind0`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.review_ensemble.enabled, true);
+    assert.equal(cfg.review_ensemble.min_independent_by_risk, undefined);
+    assert.equal(cfg.review_ensemble.allow_quorum_degrade, false);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: min_independent_by_risk.high:2 accepted (#694)", async () => {
+  const repo = makeFakeRepo(
+    `review_ensemble:\n  enabled: true\n  agents:\n    - role: primary\n    - harness: claude\n  min_independent_by_risk:\n    high: 2\n    standard: 0\n`,
+  );
+  const binDir = makeFakeGh("acme/re-ind1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-re-ind1`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.review_ensemble.min_independent_by_risk?.high, 2);
+    assert.equal(cfg.review_ensemble.min_independent_by_risk?.standard, 0);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: negative min_independent_by_risk is rejected (#694)", async () => {
+  const repo = makeFakeRepo(
+    `review_ensemble:\n  enabled: true\n  agents:\n    - role: primary\n  min_independent_by_risk:\n    high: -1\n`,
+  );
+  const binDir = makeFakeGh("acme/re-ind2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-re-ind2`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      /min_independent_by_risk|non-negative|Invalid/i,
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: ensemble disabled still resolves with min_independent map (#694)", async () => {
+  const repo = makeFakeRepo(
+    `review_ensemble:\n  enabled: false\n  min_independent_by_risk:\n    high: 2\n`,
+  );
+  const binDir = makeFakeGh("acme/re-ind3");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-re-ind3`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.review_ensemble.enabled, false);
+    assert.equal(cfg.review_ensemble.min_independent_by_risk?.high, 2);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+
+
 // ---- review_policy (#17) ----
 
 test("resolveConfig: review_policy defaults apply when absent (block medium+, conf floor 0.7, bounded rounds)", async () => {
