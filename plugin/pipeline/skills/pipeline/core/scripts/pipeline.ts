@@ -705,7 +705,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | controls | run | single | release | ship | factory-gate | factory-release | factory-pin | engine-promote | intake | decompose | triage | roadmap | sweep | merge | merge-queue | train | summary | improve | scoreboard | outcomes | queue | backfill | evals | loop | correction | handoff | report")
+    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | controls | run | single | release | ship | factory-gate | factory-release | factory-pin | engine-promote | intake | decompose | triage | roadmap | sweep | merge | merge-queue | train | summary | improve | scoreboard | outcomes | lineage | queue | backfill | evals | loop | correction | handoff | report")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -5108,6 +5108,60 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Early lineage dispatch (#599) — host-local graph store only; no GitHub mutations.
+  if (numArg === "lineage") {
+    if (rawArgs.includes("--help") || rawArgs.includes("-h")) {
+      const { LINEAGE_HELP } = await import("./lineage/cli.ts");
+      process.stdout.write(LINEAGE_HELP);
+      process.exit(0);
+    }
+    const verb = cmd.args[1] as string | undefined;
+    if (verb !== "export" && verb !== "impact" && verb !== "propose" && verb !== "ingest") {
+      console.error(
+        'pipeline lineage: expected subcommand "export", "impact", "propose", or "ingest".\n' +
+          "  Usage: pipeline lineage export  [--json] [--retention-days <n>]\n" +
+          "         pipeline lineage impact  [--json] --node-id <id>\n" +
+          "         pipeline lineage propose [--json] [--evidence-node-id <id>]\n" +
+          "         pipeline lineage ingest  [--fixture <path>] [--dry-run] [--json]\n" +
+          "  Host-local store under .agent-pipeline/lineage/; free text redacted; no silent upstream mutation.",
+      );
+      process.exit(2);
+    }
+    const startDirLin = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
+    const repoDirLin = findGitRoot(startDirLin) ?? startDirLin;
+    // Parse lineage-specific flags from raw argv (not all are on the shared commander surface).
+    const raw = rawArgs;
+    const flagVal = (name: string): string | undefined => {
+      const i = raw.indexOf(name);
+      if (i < 0 || i + 1 >= raw.length) return undefined;
+      return raw[i + 1];
+    };
+    try {
+      const { runLineageCli, realLineageCliDeps } = await import("./lineage/cli.ts");
+      await runLineageCli(
+        {
+          repoDir: repoDirLin,
+          verb,
+          json: !!opts.json,
+          dryRun: !!opts.dryRun,
+          retentionDays: opts.retentionDays,
+          fixturePath: opts.fixture ?? flagVal("--fixture"),
+          runId: flagVal("--run-id"),
+          nodeId: flagVal("--node-id"),
+          newRevision: flagVal("--new-revision"),
+          newHash: flagVal("--new-hash"),
+          evidenceNodeId: flagVal("--evidence-node-id"),
+          includeRecords: raw.includes("--include-records"),
+        },
+        realLineageCliDeps(),
+      );
+    } catch (err) {
+      console.error(`pipeline lineage: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    return;
+  }
+
   // Early scoreboard dispatch — no issue number, no config resolution, no GitHub calls.
   // It reads only existing run artifacts under .agent-pipeline/runs.
   if (numArg === "scoreboard") {
@@ -5573,7 +5627,7 @@ async function main(): Promise<void> {
     const recognized = [
       "init", "doctor", "status", "unblock", "override", "cleanup",
       "logs", "path", "config", "run", "single", "release", "intake", "decompose", "refine-spec",
-      "roadmap", "sweep", "triage", "merge", "merge-queue", "train", "ship", "summary", "improve", "scoreboard", "outcomes", "factory-gate", "factory-release", "factory-pin", "engine-promote", "queue", "backfill", "evals",
+      "roadmap", "sweep", "triage", "merge", "merge-queue", "train", "ship", "summary", "improve", "scoreboard", "outcomes", "lineage", "factory-gate", "factory-release", "factory-pin", "engine-promote", "queue", "backfill", "evals",
       "loop", "controls",
     ];
     if (!recognized.includes(numArg)) {
