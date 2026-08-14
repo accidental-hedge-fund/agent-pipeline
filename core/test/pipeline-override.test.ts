@@ -99,6 +99,24 @@ const CFG = {
   eval_gate: { enabled: false },
   visual_gate: { enabled: false },
   shipcheck_gate: { enabled: false },
+  // #693: implicit low-risk governance so record path authorizes authenticated actor.
+  override_governance: {
+    schema_version: 1,
+    implicit: true,
+    default_class: "low_risk_deferred",
+    classes: {
+      low_risk_deferred: {
+        max_duration_hours: 720,
+        required_evidence: [],
+        renewal: {
+          mode: "lite",
+          require_human_on: ["fingerprint_drift", "region_drift", "subject_mismatch"],
+        },
+        approvers: [{ kind: "trusted_override_actors_allowlist" }],
+        separation_of_duties: { enabled: false, forbid_roles: [] },
+      },
+    },
+  },
 } as unknown as PipelineConfig;
 
 const OVERRIDE_RUN_ID = "test/override-review-run";
@@ -170,6 +188,8 @@ function makeOverrideDeps(
       rec.sequence.push("advance");
       if (onAdvance) await onAdvance();
     },
+    // #693: authenticated actor required for governed record path.
+    getGhActor: async () => "operator",
   };
   return { deps, rec };
 }

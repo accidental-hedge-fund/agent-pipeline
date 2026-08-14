@@ -26,6 +26,7 @@ import {
   matchFindingScope,
   neutralizeSentinelText,
   nonReproducingDispositionComment,
+  projectOverridesForPartition,
   type ScopedOverride,
 } from "../review-policy.ts";
 import * as path from "node:path";
@@ -583,8 +584,13 @@ export async function advanceFix(
     // predating the review must not silently suppress a finding the review
     // still marked blocking.
     const trustedAfterReview = filterOverridesAfterReview(trustedForAck, triggeringReviewComment);
-    const overrides = extractOverrides(trustedAfterReview);
-    const scopes = extractScopedOverrides(trustedAfterReview);
+    // #693: validity-gated projection so expired/invalidated do not pre-filter.
+    const projected = projectOverridesForPartition({
+      comments: trustedAfterReview,
+      governance: cfg.override_governance,
+    });
+    const overrides = projected.overrides;
+    const scopes = projected.scopes;
     const nonReproducing = extractNonReproducingDispositions(trustedForAck);
     const reviewedShaAtEntry = extractReviewedSha(trustedForAck, round)?.sha ?? null;
     const summaries = parseFindingSummaries(reviewBody);

@@ -57,6 +57,15 @@ export interface HandoffEscalationSiteEntry {
   notes: string;
 }
 
+/** Governed override integrity / expiry sites (#693). */
+export interface OverrideGovernanceEscalationSiteEntry {
+  site_id: string;
+  module: string;
+  match: string;
+  disposition: EscalationSiteDisposition;
+  notes: string;
+}
+
 export interface EscalationInventory {
   schema: string;
   issue: number;
@@ -64,6 +73,8 @@ export interface EscalationInventory {
   authority_emitters: readonly AuthorityEmitterEntry[];
   /** Optional #647 handoff integrity inventory; absent on pre-#647 inventories. */
   handoff_sites?: readonly HandoffEscalationSiteEntry[];
+  /** Optional #693 override-governance integrity inventory. */
+  override_governance_sites?: readonly OverrideGovernanceEscalationSiteEntry[];
 }
 
 /** Closed inventory loaded from the seeded module (and re-checked by drift guards). */

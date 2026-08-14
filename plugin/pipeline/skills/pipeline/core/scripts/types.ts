@@ -620,6 +620,77 @@ export interface DesignGateState {
 export type OpenspecMode = "auto" | "on" | "off";
 
 // ---------------------------------------------------------------------------
+// Governed typed overrides (#693) — class taxonomy and per-class policy.
+// ---------------------------------------------------------------------------
+
+/** Closed renewal modes for override classes. */
+export const OVERRIDE_RENEWAL_MODES = ["lite", "human", "none"] as const;
+export type OverrideRenewalMode = (typeof OVERRIDE_RENEWAL_MODES)[number];
+
+/** Drift events that force human renewal when listed under require_human_on. */
+export const OVERRIDE_REQUIRE_HUMAN_ON_EVENTS = [
+  "fingerprint_drift",
+  "region_drift",
+  "subject_mismatch",
+  "policy_change",
+] as const;
+export type OverrideRequireHumanOn = (typeof OVERRIDE_REQUIRE_HUMAN_ON_EVENTS)[number];
+
+/** Known evidence reference kinds that a class may require. */
+export const OVERRIDE_EVIDENCE_REF_KINDS = [
+  "remediation_issue_url",
+  "risk_acceptance_ref",
+  "evidence_url",
+  "ticket_url",
+] as const;
+export type OverrideEvidenceRefKind = (typeof OVERRIDE_EVIDENCE_REF_KINDS)[number];
+
+/** Roles that may be forbidden from self-disposition when SoD is enabled. */
+export const OVERRIDE_SOD_ROLES = ["implementer", "finding_author"] as const;
+export type OverrideSodRole = (typeof OVERRIDE_SOD_ROLES)[number];
+
+/** Approver rule kinds for override class authorization (#693; family of #575). */
+export type OverrideApproverRule =
+  | { kind: "identity"; identity: string }
+  | { kind: "group_ref"; group_ref: string }
+  | { kind: "role"; role: string }
+  | {
+      /** Continuity with trusted_override_actors allowlist (#229 / #693). */
+      kind: "trusted_override_actors_allowlist";
+    };
+
+/** Per-class policy bound to an override class id. */
+export interface OverrideClassPolicy {
+  max_duration_hours: number;
+  required_evidence: OverrideEvidenceRefKind[];
+  renewal: {
+    mode: OverrideRenewalMode;
+    require_human_on: OverrideRequireHumanOn[];
+  };
+  approvers: OverrideApproverRule[];
+  separation_of_duties: {
+    enabled: boolean;
+    forbid_roles: OverrideSodRole[];
+  };
+}
+
+/**
+ * Resolved override governance config. When the YAML block is omitted,
+ * `implicit` is true and a single low-risk compatibility class is present.
+ */
+export interface OverrideGovernanceConfig {
+  schema_version: 1;
+  classes: Record<string, OverrideClassPolicy>;
+  /** Class applied to bare free-form reasons when set and present in classes. */
+  default_class?: string;
+  /**
+   * True when the config block was omitted and the engine injected the
+   * built-in low-risk compatibility defaults. Not a YAML field.
+   */
+  implicit: boolean;
+}
+
+// ---------------------------------------------------------------------------
 // Pre-code human attestation gate (#575) — config types, risk classes, dossier
 // contracts, attestation records, and stage state.
 // ---------------------------------------------------------------------------
@@ -1354,6 +1425,15 @@ export interface PipelineConfig {
   // pipeline actor (#229). Useful for multi-actor setups (e.g., a CI bot and a
   // human operator share the same pipeline installation). Default: [] (actor-only).
   trusted_override_actors?: string[];
+  /**
+   * Governed override class taxonomy and per-class policy (#693). When omitted,
+   * the engine applies an implicit low-risk compatibility class
+   * (`low_risk_deferred`) that preserves free-form dispositions under the
+   * trusted-actor model with renewal-lite and a 720h max duration. When present,
+   * unknown keys/classes fail at parse time; bare free-form reasons map only to
+   * `default_class` if set.
+   */
+  override_governance: OverrideGovernanceConfig;
   // Bounded auto-loop mode (#149). When enabled, recoverable stops at allowlisted
   // pipeline-owned stages convert from stop to automatic continuation within
   // explicit round and wall-clock budgets, recording rationale per continuation,
@@ -1532,6 +1612,28 @@ export const DEFAULT_CONFIG: Omit<
       forbid_self_attest_roles: ["implementer", "dossier_author"],
     },
     wait: { mode: "resume_safe" as const, max_wait_hours: 168 },
+  },
+  // #693: resolved always; omit block → implicit low-risk class (see resolveOverrideGovernanceConfig).
+  override_governance: {
+    schema_version: 1 as const,
+    implicit: true,
+    default_class: "low_risk_deferred",
+    classes: {
+      low_risk_deferred: {
+        max_duration_hours: 720,
+        required_evidence: [],
+        renewal: {
+          mode: "lite" as const,
+          require_human_on: [
+            "fingerprint_drift" as const,
+            "region_drift" as const,
+            "subject_mismatch" as const,
+          ],
+        },
+        approvers: [{ kind: "trusted_override_actors_allowlist" as const }],
+        separation_of_duties: { enabled: false, forbid_roles: [] },
+      },
+    },
   },
   test_gate: { enabled: true, max_attempts: 3, timeout: 300 },
   eval_gate: { enabled: false, mode: "gate" as const, timeout: 300, max_attempts: 2 },
@@ -2075,6 +2177,32 @@ export interface OverrideRecord {
    * Absent on historical records (`legacy_unbound`).
    */
   evidence_subject?: import("./evidence-subject.ts").EvidenceSubjectV1;
+  /** Governed override class id (#693). */
+  class?: string;
+  /** Stable decision id for lineage (#693). */
+  decision_id?: string;
+  /** Lifecycle projection at record/export time (#693). */
+  lifecycle?:
+    | "active"
+    | "expired"
+    | "superseded"
+    | "renewed"
+    | "rejected"
+    | "invalidated";
+  /** ISO expiry for the decision window (#693). */
+  expires_at?: string;
+  /** ISO creation time (#693). */
+  created_at?: string;
+  /** Actor who recorded the decision (#693). */
+  actor?: string;
+  /** Authorization summary (matched rule / evidence) (#693). */
+  authorization_summary?: string;
+  /** Prior decision id when this supersedes another (#693). */
+  supersedes?: string | null;
+  /** Prior decision id when this renews another (#693). */
+  renewed_from?: string | null;
+  /** Renewal kind when this is a renewal (#693). */
+  renewal_kind?: "lite" | "human" | null;
 }
 
 /** One auto-recovery event. */

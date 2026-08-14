@@ -576,6 +576,29 @@ Nested fields:
 
 - **Allowed values:** `auto`, `on`, `off`
 
+### `override_governance`
+
+- **Type:** object
+- **Default:** `{"schema_version":1,"implicit":true,"default_class":"low_risk_deferred","classes":{"low_risk_deferred":{"max_duration_hours":720,"required_evidence":[],"renewal":{"mode":"lite","require_human_on":["fingerprint_drift","region_drift","subject_mismatch"]},"approvers":[{"kind":"trusted_override_actors_allowlist"}],"separation_of_duties":{"enabled":false,"forbid_roles":[]}}}}`
+- **Description:** Governed override class taxonomy (#693). Omitted → implicit low-risk compatibility class. Unknown keys and invalid durations/renewal modes fail at parse time.
+
+Nested fields:
+
+#### `override_governance.classes`
+
+- **Type:** object
+- **Description:** Map of class id → per-class policy. Class ids are repository-defined.
+
+#### `override_governance.default_class`
+
+- **Type:** string
+- **Description:** Class applied to bare free-form reasons when set; must exist in classes.
+
+#### `override_governance.schema_version`
+
+- **Type:** number
+- **Description:** Override governance schema version (only 1 is supported).
+
 ### `papercuts`
 
 - **Type:** object

@@ -57,6 +57,7 @@ import {
   normalizeFile,
   overrideComment,
   partitionFindings,
+  projectOverridesForPartition,
   severityRank,
   surfaceKey,
   type AdvisoryCarryForwardMatch,
@@ -1293,8 +1294,14 @@ export async function enforceReviewShaGate(
       }
 
       // Trust overrides from any authorized runner identity (#229 Findings 1, 4, 5).
-      const overrides = extractOverrides(trustedOverrideComments);
-      const scopes = extractScopedOverrides(trustedOverrideComments);
+      // #693: validity-gated projection (expired/invalidated do not deblock).
+      const projected = projectOverridesForPartition({
+        comments: trustedOverrideComments,
+        governance: cfg.override_governance,
+        findings: deltaResult.findings,
+      });
+      const overrides = projected.overrides;
+      const scopes = projected.scopes;
       const settled = settledFindings(priorRoundsDigest);
       const partition = partitionFindings(deltaResult.findings, cfg.review_policy, overrides, scopes, new Map(), null, settled);
       const reversalDemotions = new Map<string, ReversalMatch>();

@@ -1761,5 +1761,70 @@
       "disposition": "reconcile-owned",
       "notes": "pending human wait is not transient-retryable authority"
     }
+  ],
+  "override_governance_sites": [
+    {
+      "site_id": "override-governance:unauthorized-record",
+      "module": "scripts/override-governance.ts",
+      "match": "unauthorized",
+      "disposition": "deliberately-fail-closed",
+      "notes": "unauthorized override record refused; no active sentinel posted"
+    },
+    {
+      "site_id": "override-governance:sod-violation",
+      "module": "scripts/override-governance.ts",
+      "match": "sod_violation",
+      "disposition": "deliberately-fail-closed",
+      "notes": "SoD forbids implementer/finding_author self-disposition"
+    },
+    {
+      "site_id": "override-governance:missing-evidence",
+      "module": "scripts/override-governance.ts",
+      "match": "missing_evidence",
+      "disposition": "deliberately-fail-closed",
+      "notes": "class-required evidence refs missing at record"
+    },
+    {
+      "site_id": "override-governance:unknown-class",
+      "module": "scripts/override-governance.ts",
+      "match": "unknown_class",
+      "disposition": "deliberately-fail-closed",
+      "notes": "unknown override class id refused before post"
+    },
+    {
+      "site_id": "override-governance:malformed-target",
+      "module": "scripts/override-governance.ts",
+      "match": "malformed_target",
+      "disposition": "deliberately-fail-closed",
+      "notes": "malformed key/scope target refused before post"
+    },
+    {
+      "site_id": "override-governance:unauthenticated",
+      "module": "scripts/override-governance.ts",
+      "match": "unauthenticated",
+      "disposition": "deliberately-fail-closed",
+      "notes": "null actor fail-closed at record"
+    },
+    {
+      "site_id": "override-governance:expired-unblock",
+      "module": "scripts/override-governance.ts",
+      "match": "expired",
+      "disposition": "deliberately-fail-closed",
+      "notes": "expired decision cannot unblock; finding returns to blocking set; not a new park class"
+    },
+    {
+      "site_id": "override-governance:invalidated-subject-drift",
+      "module": "scripts/override-governance.ts",
+      "match": "invalidated",
+      "disposition": "deliberately-fail-closed",
+      "notes": "subject/fingerprint/region drift invalidates active unblock; typed reason; not transient-retryable"
+    },
+    {
+      "site_id": "override-governance:drift-blocked-lite-renewal",
+      "module": "scripts/override-governance.ts",
+      "match": "fingerprint_drift",
+      "disposition": "deliberately-fail-closed",
+      "notes": "lite renewal blocked by drift; resume-safe hold pending human renewal or fix; not transient-retryable"
+    }
   ]
 }

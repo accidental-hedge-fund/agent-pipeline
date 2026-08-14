@@ -18,6 +18,10 @@ import {
   PRE_CODE_ATTESTATION_TRIGGER_CLASSES,
   PRE_CODE_REAPPROVE_ON_EVENTS,
   PRE_CODE_SOD_ROLES,
+  OVERRIDE_RENEWAL_MODES,
+  OVERRIDE_REQUIRE_HUMAN_ON_EVENTS,
+  OVERRIDE_EVIDENCE_REF_KINDS,
+  OVERRIDE_SOD_ROLES,
   type GitPushAuth,
   type Harness,
   type HarnessRoleSource,
@@ -25,6 +29,9 @@ import {
   type ModelEndpointDialect,
   type ModelEndpointParams,
   type PreCodeApproverRule,
+  type OverrideApproverRule,
+  type OverrideClassPolicy,
+  type OverrideGovernanceConfig,
 } from "./types.ts";
 import { parseGitPushAuth, GitPushAuthConfigError } from "./git-push-auth.ts";
 import { loadProfile, type PipelineProfile } from "./profile.ts";
@@ -37,6 +44,7 @@ import {
 } from "./harness-adapters/index.ts";
 import { isSafeScratchExtensionGlob } from "./worktree-dirt.ts";
 import { TRUSTED_SURFACE_CLASS_IDS } from "./trusted-surface.ts";
+import { implicitOverrideGovernance } from "./override-governance.ts";
 
 // A `models.*`/`effort.*` value: an arbitrary alias/effort string, or the
 // "auto" sentinel (#366) resolved via stage-routing.ts at config-load time.
@@ -939,6 +947,95 @@ const PartialConfigSchema = z.object({
   // `## Pipeline: Finding override` and `## Pipeline: Scope override` comments
   // are trusted in addition to the current actor. Default: [] (actor-only).
   trusted_override_actors: z.array(z.string()).optional().describe("Additional GitHub identities whose override sentinels are trusted besides the current pipeline actor."),
+  // Governed override class taxonomy (#693). Optional; omitted → implicit
+  // low-risk compatibility class. Strict: unknown keys fail parse.
+  override_governance: z
+    .object({
+      schema_version: z
+        .literal(1)
+        .describe("Override governance schema version (only 1 is supported)."),
+      classes: z
+        .record(
+          z.string().min(1),
+          z
+            .object({
+              max_duration_hours: z
+                .number()
+                .int()
+                .min(1)
+                .describe("Maximum override duration in hours (≥ 1)."),
+              required_evidence: z
+                .array(z.enum(OVERRIDE_EVIDENCE_REF_KINDS))
+                .optional()
+                .describe("Evidence reference kinds required to record this class."),
+              renewal: z
+                .object({
+                  mode: z
+                    .enum(OVERRIDE_RENEWAL_MODES)
+                    .describe("lite | human | none"),
+                  require_human_on: z
+                    .array(z.enum(OVERRIDE_REQUIRE_HUMAN_ON_EVENTS))
+                    .optional()
+                    .describe("Drift events that block lite auto-renew."),
+                })
+                .strict()
+                .describe("Renewal policy for this class."),
+              approvers: z
+                .array(
+                  z.discriminatedUnion("kind", [
+                    z
+                      .object({
+                        kind: z.literal("identity"),
+                        identity: z.string().min(1),
+                      })
+                      .strict(),
+                    z
+                      .object({
+                        kind: z.literal("group_ref"),
+                        group_ref: z.string().min(1),
+                      })
+                      .strict(),
+                    z
+                      .object({
+                        kind: z.literal("role"),
+                        role: z.string().min(1),
+                      })
+                      .strict(),
+                    z
+                      .object({
+                        kind: z.literal("trusted_override_actors_allowlist"),
+                      })
+                      .strict(),
+                  ]),
+                )
+                .optional()
+                .describe(
+                  "Ordered authorized-actor rules (identity, group_ref, role, trusted_override_actors_allowlist).",
+                ),
+              separation_of_duties: z
+                .object({
+                  enabled: z.boolean().optional(),
+                  forbid_roles: z.array(z.enum(OVERRIDE_SOD_ROLES)).optional(),
+                })
+                .strict()
+                .optional()
+                .describe("Optional SoD between implementer/finding_author and overridder."),
+            })
+            .strict(),
+        )
+        .describe("Map of class id → per-class policy. Class ids are repository-defined."),
+      default_class: z
+        .string()
+        .min(1)
+        .optional()
+        .describe("Class applied to bare free-form reasons when set; must exist in classes."),
+    })
+    .strict()
+    .optional()
+    .describe(
+      "Governed override class taxonomy (#693). Omitted → implicit low-risk compatibility class. " +
+        "Unknown keys and invalid durations/renewal modes fail at parse time.",
+    ),
   // Bounded auto-loop mode (#149). Opt-in; disabled by default. When enabled,
   // recoverable stops at allowlisted pipeline-owned stages convert from stop to
   // automatic continuation within explicit round/wall-clock budgets. Parks at
@@ -1383,6 +1480,62 @@ export interface ResolveOptions {
  * Merge partial/omitted `pre_code_attestation` file config with defaults (#575).
  * Omitted block → enabled false and documented defaults for remaining fields.
  */
+/**
+ * Merge partial/omitted `override_governance` file config with implicit
+ * low-risk compatibility defaults (#693).
+ *
+ * When the block is omitted, returns the built-in implicit class taxonomy.
+ * When present, validates that `default_class` (if set) exists in `classes`
+ * and normalizes each class policy. Unknown keys are already rejected by the
+ * Zod schema before this runs.
+ */
+export function resolveOverrideGovernanceConfig(
+  fileBlock: PartialConfig["override_governance"] | undefined,
+): OverrideGovernanceConfig {
+  if (fileBlock === undefined) {
+    return implicitOverrideGovernance();
+  }
+  const classIds = Object.keys(fileBlock.classes ?? {});
+  if (classIds.length === 0) {
+    throw new Error(
+      "override_governance.classes must define at least one class when the block is present",
+    );
+  }
+  if (fileBlock.default_class && !fileBlock.classes[fileBlock.default_class]) {
+    throw new Error(
+      `override_governance.default_class "${fileBlock.default_class}" is not in classes ` +
+        `(known: ${classIds.sort().join(", ")})`,
+    );
+  }
+  const classes: Record<string, OverrideClassPolicy> = {};
+  for (const [id, raw] of Object.entries(fileBlock.classes)) {
+    if (!/^[a-z][a-z0-9_]*$/.test(id)) {
+      throw new Error(
+        `override_governance.classes key "${id}" is invalid — use lowercase snake_case class ids`,
+      );
+    }
+    classes[id] = {
+      max_duration_hours: raw.max_duration_hours,
+      required_evidence: [...(raw.required_evidence ?? [])],
+      renewal: {
+        mode: raw.renewal.mode,
+        require_human_on: [...(raw.renewal.require_human_on ?? [])],
+      },
+      approvers: (raw.approvers ?? []) as OverrideApproverRule[],
+      separation_of_duties: {
+        enabled: raw.separation_of_duties?.enabled ?? false,
+        forbid_roles: [...(raw.separation_of_duties?.forbid_roles ?? [])],
+      },
+    };
+  }
+  return {
+    schema_version: 1,
+    implicit: false,
+    default_class: fileBlock.default_class,
+    classes,
+  };
+}
+
 export function resolvePreCodeAttestationConfig(
   fileBlock: PartialConfig["pre_code_attestation"] | undefined,
 ): PipelineConfig["pre_code_attestation"] {
@@ -1815,6 +1968,7 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     format_gate: fileConfig.format_gate ?? DEFAULT_CONFIG.format_gate,
     harness_sandbox: fileConfig.harness_sandbox ?? DEFAULT_CONFIG.harness_sandbox,
     trusted_override_actors: fileConfig.trusted_override_actors,
+    override_governance: resolveOverrideGovernanceConfig(fileConfig.override_governance),
     auto_loop: {
       enabled: fileConfig.auto_loop?.enabled ?? DEFAULT_CONFIG.auto_loop.enabled,
       max_rounds: fileConfig.auto_loop?.max_rounds ?? DEFAULT_CONFIG.auto_loop.max_rounds,
@@ -1992,6 +2146,9 @@ export function applyTrustedVerificationPolicy(
 
   cfg.pre_code_attestation = resolvePreCodeAttestationConfig(fileConfig.pre_code_attestation);
   applied.push("pre_code_attestation");
+
+  cfg.override_governance = resolveOverrideGovernanceConfig(fileConfig.override_governance);
+  applied.push("override_governance");
 
   cfg.tester_evidence = {
     on_missing:
@@ -3213,6 +3370,50 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
         `#     mode: ${yamlScalar(d.pre_code_attestation.wait.mode)} # resume_safe|hard_block — never silent-approve`,
         `#     max_wait_hours: ${yamlScalar(d.pre_code_attestation.wait.max_wait_hours)}`,
       ].join("\n"),
+    "",
+    (() => {
+      const og = config.override_governance ?? DEFAULT_CONFIG.override_governance;
+      if (!og.implicit) {
+        return [
+          "override_governance: # governed override class taxonomy (#693)",
+          `  schema_version: 1 # ${sd("override_governance.schema_version", "only 1 is supported")}`,
+          "  classes:",
+          ...Object.entries(og.classes).flatMap(([id, cls]) => [
+            `    ${id}:`,
+            `      max_duration_hours: ${yamlScalar(cls.max_duration_hours)} # ${sd("override_governance.classes.*.max_duration_hours", "hours an override remains active (≥ 1)")}`,
+            `      required_evidence: ${yamlInline(cls.required_evidence)} # ${sd("override_governance.classes.*.required_evidence", "evidence ref kinds required at record")}`,
+            "      renewal:",
+            `        mode: ${yamlScalar(cls.renewal.mode)} # ${sd("override_governance.classes.*.renewal.mode", "lite|human|none")}`,
+            `        require_human_on: ${yamlInline(cls.renewal.require_human_on)} # ${sd("override_governance.classes.*.renewal.require_human_on", "drift events that block lite renew")}`,
+            `      approvers: ${yamlInline(cls.approvers)} # ${sd("override_governance.classes.*.approvers", "identity|group_ref|role|trusted_override_actors_allowlist")}`,
+            "      separation_of_duties:",
+            `        enabled: ${yamlScalar(cls.separation_of_duties.enabled)}`,
+            `        forbid_roles: ${yamlInline(cls.separation_of_duties.forbid_roles)}`,
+          ]),
+          og.default_class
+            ? `  default_class: ${yamlScalar(og.default_class)} # ${sd("override_governance.default_class", "class for bare free-form reasons")}`
+            : `#  default_class: low_risk_deferred # ${sd("override_governance.default_class", "class for bare free-form reasons")}`,
+        ].join("\n");
+      }
+      return [
+        "# override_governance: # governed override class taxonomy (#693). Omitted → implicit low_risk_deferred.",
+        "#   schema_version: 1",
+        "#   classes:",
+        "#     low_risk_deferred:",
+        "#       max_duration_hours: 720  # 30d",
+        "#       required_evidence: []",
+        "#       renewal: { mode: lite, require_human_on: [fingerprint_drift, region_drift, subject_mismatch] }",
+        "#       approvers: [{ kind: trusted_override_actors_allowlist }]",
+        "#       separation_of_duties: { enabled: false, forbid_roles: [] }",
+        "#     high_risk_accept:",
+        "#       max_duration_hours: 72",
+        "#       required_evidence: [remediation_issue_url, risk_acceptance_ref]",
+        "#       renewal: { mode: human, require_human_on: [fingerprint_drift, region_drift, subject_mismatch, policy_change] }",
+        "#       approvers: [{ kind: role, role: risk_authority }]",
+        "#       separation_of_duties: { enabled: true, forbid_roles: [implementer, finding_author] }",
+        "#   default_class: low_risk_deferred",
+      ].join("\n");
+    })(),
     "",
     "test_gate: # run the repo's tests/build before opening a PR",
     `  enabled: ${yamlScalar(testGate.enabled)} # ${sd("test_gate.enabled", "set false to disable entirely")}`,

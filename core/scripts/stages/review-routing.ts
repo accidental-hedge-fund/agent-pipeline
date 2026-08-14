@@ -62,6 +62,7 @@ import {
   findingPayloadFingerprint,
   overrideComment,
   partitionFindings,
+  projectOverridesForPartition,
   severityRank,
   surfaceKey,
   type AlternativeReinstatementMatch,
@@ -1097,8 +1098,14 @@ export async function advanceReview(
 
   // needs-attention with findings → apply the severity policy (#17).
   const trustedComments = buildTrustedOverrideComments(detail.comments, actor, cfg.trusted_override_actors);
-  const overrides = extractOverrides(trustedComments);
-  const scopes = extractScopedOverrides(trustedComments);
+  // #693: validity-gated active projection (expiry / subject / supersession).
+  const projected = projectOverridesForPartition({
+    comments: trustedComments,
+    governance: cfg.override_governance,
+    findings: verdict.findings,
+  });
+  const overrides = projected.overrides;
+  const scopes = projected.scopes;
   // #391 review-2 finding 7b965502: a prior fix round's SHA-anchored
   // non-reproducing disposition must also be consulted on review entry — not
   // just fix entry — so a re-review at the same reviewed SHA does not re-block
