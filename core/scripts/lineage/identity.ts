@@ -84,11 +84,16 @@ export function resolveCapabilityId(domain: string, localKey: string): Capabilit
 
 /**
  * Encode a local identifier so path separators cannot collide distinct paths.
- * Percent-encodes `/` and `\` only — reversible and stable for unchanged input.
- * Example: `a/b` → `a%2Fb` vs `a_b` → `a_b` (distinct).
+ * Percent-escapes `%` before `/` and `\` so the mapping is injective:
+ * literal `a%2Fb` → `a%252Fb` while path `a/b` → `a%2Fb` (distinct).
+ * Reversible for unchanged input and stable.
  */
 export function encodeLocalId(localId: string): string {
-  return localId.replace(/[/\\]/g, (ch) => (ch === "/" ? "%2F" : "%5C"));
+  return localId.replace(/[%/\\]/g, (ch) => {
+    if (ch === "%") return "%25";
+    if (ch === "/") return "%2F";
+    return "%5C";
+  });
 }
 
 /**

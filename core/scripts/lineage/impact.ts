@@ -500,9 +500,13 @@ function refuseMissingSupersession(message: string): ApplyProposalResult {
 
 /**
  * Validate mutation adapter output: revised nodes + supersedes edges required.
+ * When `approvedTargetIds` is provided, every supersession edge target must be
+ * an approved proposal target so a valid-looking edge cannot supersede an
+ * unrelated prior artifact (#599 pre-merge 76e987cc).
  */
 export function validateUpstreamMutationResult(
   mutation: UpstreamMutationResult | null | undefined,
+  approvedTargetIds?: readonly string[] | null,
 ): { ok: true; result: UpstreamMutationResult } | { ok: false; message: string } {
   if (!mutation || typeof mutation !== "object") {
     return {
@@ -524,6 +528,9 @@ export function validateUpstreamMutationResult(
       message: "mutation adapter must return supersession_edges (relationship supersedes)",
     };
   }
+  const approved = approvedTargetIds && approvedTargetIds.length > 0
+    ? new Set(approvedTargetIds)
+    : null;
   const revisedIds = new Set(revised.map((n) => n.node_id));
   let supersedesCount = 0;
   for (const e of edges) {
@@ -543,6 +550,12 @@ export function validateUpstreamMutationResult(
       return {
         ok: false,
         message: `supersession edge ${e.edge_id} must reference prior node as target`,
+      };
+    }
+    if (approved && !approved.has(e.target_id)) {
+      return {
+        ok: false,
+        message: `supersession edge ${e.edge_id} target ${e.target_id} is not an approved proposal target`,
       };
     }
     supersedesCount += 1;
@@ -604,7 +617,10 @@ export function applyLineageProposal(
         `mutation adapter threw: ${(err as Error).message}`,
       );
     }
-    const validated = validateUpstreamMutationResult(raw);
+    const validated = validateUpstreamMutationResult(
+      raw,
+      proposal.target_upstream_node_ids,
+    );
     if (!validated.ok) {
       return refuseMissingSupersession(
         `apply refused: ${validated.message}`,

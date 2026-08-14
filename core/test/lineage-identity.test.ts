@@ -97,3 +97,31 @@ test("path-derived node ids are collision-safe for slash vs underscore paths", (
     withSlash,
   );
 });
+
+test("literal percent path cannot collide with a separator-encoded path (#599 b775d25c)", () => {
+  const literalPercent = makeDomainNodeId(
+    "agent-pipeline",
+    "requirement",
+    "openspec/specs/a%2Fb/spec.md@h1",
+  );
+  const slashPath = makeDomainNodeId(
+    "agent-pipeline",
+    "requirement",
+    "openspec/specs/a/b/spec.md@h1",
+  );
+  const literalSlash = makeDomainNodeId(
+    "agent-pipeline",
+    "requirement",
+    "openspec/specs/a/b/spec.md@h1",
+  );
+  // a%2Fb (literal percent) must NOT equal a/b (encoded slash)
+  assert.notEqual(literalPercent, slashPath);
+  assert.notEqual(literalPercent, literalSlash);
+  // literal percent is escaped as %25 (readable), while real slashes encode %2F
+  assert.ok(literalPercent.includes("%252F"));
+  // A literal a%2Fb path is distinct from a/b after encoding
+  assert.notEqual(
+    makeDomainNodeId("agent-pipeline", "requirement", "a%2Fb"),
+    makeDomainNodeId("agent-pipeline", "requirement", "a/b"),
+  );
+});

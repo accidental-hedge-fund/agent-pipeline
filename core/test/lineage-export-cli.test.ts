@@ -250,6 +250,90 @@ test("impact and propose persist analysis records loaded by export", async () =>
   );
 });
 
+test("impact fails when analysis persistence is skipped (#599 39e56c5e)", async () => {
+  const store = memStore();
+  const g = ingestLineageArtifacts({
+    domain: D,
+    requirements: [{ domain: D, path: "openspec/specs/p/spec.md", content_hash: "h1" }],
+    objectives: [{ domain: D, objective_id: "obj-pf", content_hash: "oh" }],
+    runs: [{ domain: D, run_id: "run-pf" }],
+  });
+  await upsertGraph(REPO, { nodes: g.nodes, edges: g.edges }, store);
+  // Break the analysis write so upsertAnalysisRecord returns skipped
+  const origWrite = store.writeFile;
+  store.writeFile = async () => {
+    throw new Error("disk-full (test injected)");
+  };
+  const deps: LineageCliDeps = {
+    store,
+    readFile: store.readFile,
+    log: () => {},
+  };
+  const req = g.nodes.find((n) => n.node_type === "requirement")!;
+  await assert.rejects(
+    () =>
+      runLineageImpact(
+        { repoDir: REPO, verb: "impact", nodeId: req.node_id, runId: "run-pf" },
+        deps,
+      ),
+    /analysis record was not persisted/,
+  );
+  // Restore writes so propose path can be exercised independently
+  store.writeFile = origWrite;
+});
+
+test("impact and propose fail when analysis record write fails (#599 39e56c5e)", async () => {
+  const store = memStore();
+  const g = ingestLineageArtifacts({
+    domain: D,
+    requirements: [{ domain: D, path: "openspec/specs/zz/spec.md", content_hash: "h1" }],
+    objectives: [{ domain: D, objective_id: "obj-pf2", content_hash: "oh" }],
+    runs: [{ domain: D, run_id: "run-pf2" }],
+    outcomes: [
+      {
+        domain: D,
+        outcome_id: "out-pf2",
+        outcome_kind: "reversion",
+        attribution: [
+          { target_type: "run", target_id: "run-pf2", method: "direct", authority: "observed" },
+        ],
+      },
+    ],
+  });
+  const nodes = g.nodes.map((n) => ({
+    ...n,
+    provenance: { ...n.provenance, observed_at: "2026-08-01T00:00:00Z" },
+  }));
+  await upsertGraph(REPO, { nodes, edges: g.edges }, store);
+  const origWrite = store.writeFile;
+  store.writeFile = async () => {
+    throw new Error("disk-full");
+  };
+  const deps: LineageCliDeps = {
+    store,
+    readFile: store.readFile,
+    log: () => {},
+  };
+  const req = nodes.find((n) => n.node_type === "requirement")!;
+  await assert.rejects(
+    () =>
+      runLineageImpact(
+        { repoDir: REPO, verb: "impact", nodeId: req.node_id, runId: "run-pf2" },
+        deps,
+      ),
+    /analysis record was not persisted/,
+  );
+  await assert.rejects(
+    () =>
+      runLineagePropose(
+        { repoDir: REPO, verb: "propose", runId: "run-pf2" },
+        deps,
+      ),
+    /proposal record was not persisted/,
+  );
+  store.writeFile = origWrite;
+});
+
 test("ingest fails closed and does not persist when integrity fails", async () => {
   const store = memStore();
   // Valid fixture content; inject failing integrity to prove fail-closed before upsert.

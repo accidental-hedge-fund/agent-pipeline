@@ -304,6 +304,57 @@ test("mutation adapter without supersession is refused", () => {
   assert.equal(applied.diagnostic?.code, "missing_revision_or_supersession");
 });
 
+test("supersession edge targeting an unapproved node is refused (#599 76e987cc)", () => {
+  const g = chainGraph();
+  const outcome = g.nodes.find((n) => n.node_type === "production_outcome")!;
+  const { proposals } = computeBackwardProposals(g, { evidence_node_id: outcome.node_id });
+  const proposal = proposals[0];
+  const approved = new Set(proposal.target_upstream_node_ids);
+  assert.ok(approved.size >= 1, "fixture should have an approved upstream target");
+  const outside = [...approved][0] + "/unrelated-prior-node";
+  const revised = makeNodeShell({
+    node_id: makeDomainNodeId(D, "requirement", "openspec/specs/foo/spec.md@reqH2"),
+    node_type: "requirement",
+    domain: D,
+    revision: "reqH2",
+    content_hash: "reqH2",
+    identity: { path: "openspec/specs/foo/spec.md", content_hash: "reqH2" },
+    producer: "lineage.apply.test",
+    observed_at: "2026-08-14T00:00:00Z",
+  });
+  const supersedes = makeEdgeShell({
+    edge_id: makeDomainNodeId(D, "edge", `supersedes:${revised.node_id}:${outside}`),
+    source_id: revised.node_id,
+    target_id: outside,
+    relationship: "supersedes",
+    revision: "1",
+    method: "manual",
+    authority: "observed",
+    producer: "lineage.apply.test",
+    observed_at: "2026-08-14T00:00:00Z",
+  });
+  const applied = applyLineageProposal(
+    proposal,
+    {
+      authority: "human",
+      actor_id: "alice",
+      approved_at: "2026-08-14T00:00:00Z",
+      approval_id: "appr-1",
+    },
+    {
+      approvalVerifier: { verify: () => true },
+      mutateUpstream: () => ({
+        revised_nodes: [revised],
+        supersession_edges: [supersedes],
+      }),
+    },
+  );
+  assert.equal(applied.ok, false);
+  assert.equal(applied.authority_status, "refused");
+  assert.equal(applied.diagnostic?.code, "missing_revision_or_supersession");
+  assert.match(applied.diagnostic?.message ?? "", /not an approved proposal target/);
+});
+
 test("verification evidence yields backward proposal via verifies edges", () => {
   const g = chainGraph();
   const verification = g.nodes.find((n) => n.node_type === "verification")!;

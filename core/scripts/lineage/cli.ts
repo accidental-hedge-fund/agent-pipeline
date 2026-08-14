@@ -193,7 +193,14 @@ export async function runLineageImpact(
       proposals: null,
       drift_reason_codes: [...report.drift_reason_codes],
     };
-    await upsertAnalysisRecord(opts.repoDir, record, deps.store);
+    const upsert = await upsertAnalysisRecord(opts.repoDir, record, deps.store);
+    if (upsert.action === "skipped" || upsert.diagnostics.length > 0) {
+      throw new Error(
+        `lineage impact: analysis record was not persisted (${upsert.action}): ` +
+          upsert.diagnostics.map((d) => `[${d.code}] ${d.message}`).join("; ") ||
+          "write failed",
+      );
+    }
   }
 
   return report;
@@ -236,7 +243,14 @@ export async function runLineagePropose(
       proposals: result.proposals,
       drift_reason_codes: [...drift].sort(),
     };
-    await upsertAnalysisRecord(opts.repoDir, record, deps.store);
+    const upsert = await upsertAnalysisRecord(opts.repoDir, record, deps.store);
+    if (upsert.action === "skipped" || upsert.diagnostics.length > 0) {
+      throw new Error(
+        `lineage propose: proposal record was not persisted (${upsert.action}): ` +
+          upsert.diagnostics.map((d) => `[${d.code}] ${d.message}`).join("; ") ||
+          "write failed",
+      );
+    }
   }
 
   return result;
