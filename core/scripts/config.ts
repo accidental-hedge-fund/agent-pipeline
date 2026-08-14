@@ -3962,15 +3962,37 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
       `#   repair: ${yamlScalar(d.merge_queue.repair)} # ${sd("merge_queue.repair", "when true, merge-queue --apply may attempt surgical repair of conflict/CI holds; default false; dry-run never repairs; does not grant auto_merge")}`,
       `#   repair_max_attempts: ${yamlScalar(d.merge_queue.repair_max_attempts)} # ${sd("merge_queue.repair_max_attempts", "max charged implementer repair attempts per held item per drive (default 1)")}`,
     ].join("\n"),
-    // Staged policies + repository-control desired state (#695): commented opt-in examples.
+    // Staged policies + repository-control desired state (#695).
+    // When configured, round-trip the full object graph (acceptance, lineage,
+    // branch_protections, rulesets, collectors, policy binding, risk classes).
+    // Emitting only id/state or empty placeholders drops enforcing lineage and
+    // silently weakens repository-control drift coverage on a later full re-render
+    // (#695 06e2dd51).
     config.staged_policies !== undefined && config.staged_policies.length > 0
       ? [
           "",
           "staged_policies: # staged policy lifecycle (#695) — opt-in; enforcing requires lineage (required→enforcing + authority)",
-          ...config.staged_policies.map(
-            (p) =>
-              `  - policy_id: ${yamlScalar(p.policy_id)} # ${sd("staged_policies.policy_id", "stable policy identifier")}\n` +
-              `    state: ${yamlScalar(p.state)} # ${sd("staged_policies.state", "effective lifecycle state; enforcing needs lineage")}`,
+          yamlBlock(
+            config.staged_policies.map((p) => ({
+              policy_id: p.policy_id,
+              state: p.state,
+              ...(p.acceptance !== undefined ? { acceptance: p.acceptance } : {}),
+              ...(p.lineage !== undefined
+                ? {
+                    lineage: p.lineage.map((e) => ({
+                      policy_id: e.policy_id,
+                      from_state: e.from_state,
+                      to_state: e.to_state,
+                      policy_hash_before: e.policy_hash_before,
+                      policy_hash_after: e.policy_hash_after,
+                      at: e.at,
+                      authority: e.authority,
+                      evidence_refs: e.evidence_refs ?? [],
+                    })),
+                  }
+                : {}),
+            })),
+            2,
           ),
         ].join("\n")
       : [
@@ -3995,18 +4017,7 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
       ? [
           "",
           "repository_control_desired_state: # desired repository controls vs live forge state (#695) — read-only compare; never mutates branch protection/rulesets",
-          `  schema_version: 1 # ${sd("repository_control_desired_state.schema_version", "only 1 is accepted")}`,
-          `  repository: ${yamlScalar(config.repository_control_desired_state.repository)} # ${sd("repository_control_desired_state.repository", "owner/name")}`,
-          `  default_branch: ${yamlScalar(config.repository_control_desired_state.default_branch)} # ${sd("repository_control_desired_state.default_branch", "protected branch in scope")}`,
-          `  required_checks: ${yamlInline(config.repository_control_desired_state.required_checks)} # ${sd("repository_control_desired_state.required_checks", "check contexts that MUST be required")}`,
-          `  branch_protections: # ${sd("repository_control_desired_state.branch_protections", "expected branch-protection fields readable via gh")}`,
-          `    # required_approving_review_count: 1`,
-          `  rulesets: [] # ${sd("repository_control_desired_state.rulesets", "expected rulesets when readable")}`,
-          `  required_pipeline_gates: ${yamlInline(config.repository_control_desired_state.required_pipeline_gates)} # ${sd("repository_control_desired_state.required_pipeline_gates", "pipeline evidence/gate identifiers")}`,
-          `  collector_requirements: [] # ${sd("repository_control_desired_state.collector_requirements", "collector/version constraints when used")}`,
-          `  # policy_id: repo-controls # ${sd("repository_control_desired_state.policy_id", "optional binding to a staged policy")}`,
-          `  # risk_class: observation # ${sd("repository_control_desired_state.risk_class", "observation|fail_open|fail_closed")}`,
-          `  # risk_class_by_family: # ${sd("repository_control_desired_state.risk_class_by_family", "optional per-family risk_class overrides")}`,
+          yamlBlock(config.repository_control_desired_state, 2),
         ].join("\n")
       : [
           "",
@@ -4169,6 +4180,11 @@ function normalizeForSync(config: PartialConfig): unknown {
     product_fault: config.product_fault,
     executors: config.executors,
     stage_executors: config.stage_executors,
+    // #695: include full staged-policy + repository-control graphs so a
+    // re-render that drops lineage / desired-state constraints fails the
+    // behavior-preserving sync check rather than writing a weaker config.
+    staged_policies: config.staged_policies,
+    repository_control_desired_state: config.repository_control_desired_state,
     git: config.git,
   };
 }
@@ -4322,6 +4338,40 @@ export function syncConfig(
   // doesn't already have; every line already in `current` (including
   // operator comments and non-canonical formatting) is preserved untouched.
   const freshRender = renderConfigTemplate(parsed);
+
+  // Guard #695 06e2dd51: append-only merge preserves existing blocks byte-for-
+  // byte, which can mask an incomplete template re-render of staged_policies
+  // (lineage/acceptance) or repository_control_desired_state (nested controls).
+  // Fail closed if the fresh render cannot round-trip those configured graphs.
+  if (
+    (parsed.staged_policies !== undefined && parsed.staged_policies.length > 0) ||
+    parsed.repository_control_desired_state
+  ) {
+    const freshParsed = parseValidPartialConfig(freshRender);
+    if (
+      !freshParsed ||
+      stableJson(parsed.staged_policies) !== stableJson(freshParsed.staged_policies) ||
+      stableJson(parsed.repository_control_desired_state) !==
+        stableJson(freshParsed.repository_control_desired_state)
+    ) {
+      return {
+        ok: false,
+        changed: false,
+        applied: false,
+        configPath,
+        candidate: freshRender,
+        diagnostics: [
+          {
+            severity: "error",
+            path: "",
+            message:
+              "Synced config template would drop staged_policies lineage/acceptance or repository_control_desired_state fields; refusing to write.",
+          },
+        ],
+      };
+    }
+  }
+
   const candidate = buildSyncCandidate(current, freshRender);
   const candidateValidation = validateConfig(gitRoot, {
     ...deps,

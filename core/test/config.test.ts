@@ -2755,6 +2755,128 @@ test("syncConfig: auto_merge_eligibility settings are preserved through sync --a
   assert.match(synced, /max_diff_lines: 150/, "max_diff_lines value must be preserved");
 });
 
+// Regression (#695 06e2dd51): config sync / re-render must round-trip the full
+// staged-policy graph (acceptance + lineage events) and the full repository-
+// control desired-state graph (branch_protections, rulesets, collectors,
+// policy_id, risk classes). Emitting only policy_id/state or empty placeholders
+// drops lineage and silently weakens drift coverage. Config cannot declare
+// enforcing (needs engine-attested provenance); use a fully populated `required`
+// policy with a complete draft→observe→required chain instead.
+test("syncConfig: fully populated staged_policies + repository_control_desired_state round-trip deep equality (#695 06e2dd51)", async () => {
+  const { computeStagedPolicyHash } = await import("../scripts/stage-policy-lifecycle.ts");
+  const policyId = "repo-controls";
+  const acceptance = { gate: "branch-protection", min_checks: 2 };
+  const h = (state: "draft" | "observe" | "required") =>
+    computeStagedPolicyHash({ policy_id: policyId, state, acceptance });
+  const original = [
+    "staged_policies:",
+    `  - policy_id: ${policyId}`,
+    "    state: required",
+    "    acceptance:",
+    "      gate: branch-protection",
+    "      min_checks: 2",
+    "    lineage:",
+    `      - policy_id: ${policyId}`,
+    "        from_state: draft",
+    "        to_state: observe",
+    `        policy_hash_before: ${h("draft")}`,
+    `        policy_hash_after: ${h("observe")}`,
+    '        at: "2026-08-14T00:00:00.000Z"',
+    "        authority: null",
+    "        evidence_refs: []",
+    `      - policy_id: ${policyId}`,
+    "        from_state: observe",
+    "        to_state: required",
+    `        policy_hash_before: ${h("observe")}`,
+    `        policy_hash_after: ${h("required")}`,
+    '        at: "2026-08-14T01:00:00.000Z"',
+    "        authority: null",
+    '        evidence_refs: ["obs://promotion-1"]',
+    "repository_control_desired_state:",
+    "  schema_version: 1",
+    "  repository: acme/widget",
+    "  default_branch: main",
+    "  required_checks:",
+    "    - CI",
+    "    - lint",
+    "  branch_protections:",
+    "    required_approving_review_count: 2",
+    "    dismiss_stale_reviews: true",
+    "    require_code_owner_reviews: true",
+    "    require_conversation_resolution: true",
+    "    allow_force_pushes: false",
+    "    allow_deletions: false",
+    "    required_status_check_contexts:",
+    "      - CI",
+    "      - lint",
+    "  rulesets:",
+    "    - id_or_name: default",
+    "      enforcement: active",
+    "    - id_or_name: release",
+    "      enforcement: evaluate",
+    "  required_pipeline_gates:",
+    "    - review-sha-gate",
+    "    - ci-green",
+    "  collector_requirements:",
+    "    - collector_id: metrics",
+    '      min_version: "1.2.0"',
+    "    - collector_id: coverage",
+    "  policy_id: repo-controls",
+    "  risk_class: fail_closed",
+    "  risk_class_by_family:",
+    "    required_checks: fail_closed",
+    "    branch_protections: fail_closed",
+    "    rulesets: observation",
+    "    required_pipeline_gates: fail_closed",
+    "    collector_requirements: observation",
+    "",
+  ].join("\n");
+
+  const beforeYaml = yaml.load(original) as Record<string, unknown>;
+  const repo = makeFakeRepo(original);
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+
+  const result = syncConfig(repo, { apply: true });
+  assert.equal(result.ok, true, `diagnostics: ${JSON.stringify(result.diagnostics)}`);
+  assert.ok(result.candidate, "sync must produce a candidate");
+
+  // Behavior-preserving check: reparse candidate and assert deep equality on
+  // the full #695 graphs (not merely policy_id/state presence).
+  const afterYaml = yaml.load(result.candidate!) as Record<string, unknown>;
+  assert.deepEqual(
+    afterYaml.staged_policies,
+    beforeYaml.staged_policies,
+    "staged_policies must round-trip acceptance + full lineage through sync",
+  );
+  assert.deepEqual(
+    afterYaml.repository_control_desired_state,
+    beforeYaml.repository_control_desired_state,
+    "repository_control_desired_state must round-trip nested protections/rulesets/collectors/risk",
+  );
+
+  // On-disk file (append-only or rewrite) must also preserve the graphs.
+  const synced = fs.readFileSync(configPath, "utf8");
+  const onDisk = yaml.load(synced) as Record<string, unknown>;
+  assert.deepEqual(onDisk.staged_policies, beforeYaml.staged_policies);
+  assert.deepEqual(onDisk.repository_control_desired_state, beforeYaml.repository_control_desired_state);
+
+  // resolveConfig path must still materialize the same structured values.
+  const binDir = makeFakeGh("acme/widget");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const { resolveConfig } = await import("../scripts/config.ts");
+    const cfg = resolveConfig({ repoPath: repo }) as {
+      staged_policies?: unknown;
+      repository_control_desired_state?: unknown;
+    };
+    assert.deepEqual(cfg.staged_policies, beforeYaml.staged_policies);
+    assert.deepEqual(cfg.repository_control_desired_state, beforeYaml.repository_control_desired_state);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
 test("CLI: `pipeline config sync` previews without mutating", () => {
   const original = "base_branch: staging\n";
   const repo = makeFakeRepo(original);
