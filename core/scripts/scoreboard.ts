@@ -46,6 +46,11 @@ import {
   formatOutcomeScoreboardHuman,
   type OutcomeScoreboardSection,
 } from "./outcomes/scoreboard-section.ts";
+import {
+  aggregatePlanningLeverageScoreboardSection,
+  formatPlanningLeverageScoreboardHuman,
+  type PlanningLeverageScoreboardSection,
+} from "./planning-leverage/scoreboard-section.ts";
 
 /** Repo-relative FRG trend ledger path (#757) — duplicated string to avoid
  *  importing factory-reliability-gate (config/zod) into the scoreboard graph. */
@@ -396,6 +401,12 @@ export interface ScoreboardReport {
    * attribution partitioned. Never a collapsed maintainability score.
    */
   outcomes?: OutcomeScoreboardSection;
+  /**
+   * Planning-leverage / material-rework aggregates from run events (#702).
+   * Additive; observed vs derived vs unavailable partitions. Never a
+   * productivity / leverage / expected-pain score.
+   */
+  planning_leverage?: PlanningLeverageScoreboardSection;
 }
 
 export interface ScoreboardOpts {
@@ -689,11 +700,24 @@ export async function buildScoreboardReport(
       message: d.message,
     }));
 
+  // #702 planning-leverage / material-rework (additive; events.jsonl; no collapsed score).
+  const planningLeverageSection = aggregatePlanningLeverageScoreboardSection(
+    scan.runs.map((r) => ({ runId: r.runId, events: r.events })),
+  );
+  const planningLeverageDiagnostics: ScoreboardDiagnostic[] =
+    planningLeverageSection.diagnostics.map((d) => ({
+      severity: "warning" as const,
+      code: d.code,
+      path: opts.repoDir,
+      message: d.message,
+    }));
+
   const diagnostics = [
     ...core.diagnostics,
     ...correctionDiagnostics,
     ...stabDiagnostics,
     ...outcomeDiagnostics,
+    ...planningLeverageDiagnostics,
   ];
   const report: ScoreboardReport = {
     ...core,
@@ -704,6 +728,7 @@ export async function buildScoreboardReport(
     ...(correctionsBy ? { correctionsBy, correctionsGrouping } : {}),
     engine_class_release_series: engineClassReleaseSeries,
     outcomes: outcomesSection,
+    planning_leverage: planningLeverageSection,
   };
   if (bucket === null) return report;
 
@@ -2935,6 +2960,11 @@ export function formatScoreboardHuman(report: ScoreboardReport): string {
   if (report.outcomes) {
     lines.push("");
     lines.push(...formatOutcomeScoreboardHuman(report.outcomes));
+  }
+
+  if (report.planning_leverage) {
+    lines.push("");
+    lines.push(...formatPlanningLeverageScoreboardHuman(report.planning_leverage));
   }
 
   if (report.diagnostics.length > 0) {

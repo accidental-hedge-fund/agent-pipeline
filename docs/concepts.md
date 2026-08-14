@@ -21,6 +21,7 @@ A newcomer who completed Prerequisites, Install, and Quickstart in the README ha
 - [OpenSpec integration (optional)](#openspec-integration-optional)
 - [last30days context (optional, default off)](#last30days-context-optional-default-off)
 - [Commit traceability trailers (always on)](#commit-traceability-trailers-always-on)
+- [Planning-leverage and material-rework telemetry](#planning-leverage-and-material-rework-telemetry)
 - [Conventions & carry-forward lessons](#conventions--carry-forward-lessons)
 - [Troubleshooting](#troubleshooting)
 - [Desktop / editor integration](#desktop--editor-integration)
@@ -188,6 +189,43 @@ Pipeline-Run: <n>/<UTC-ISO-datetime>
 ```
 
 The test/build gate enforces both trailers. There is no toggle.
+
+## Planning-leverage and material-rework telemetry
+
+Additive measurement for how planning investment relates to later review and correction cost (#702). It is the upstream companion to production/rework outcomes (#576). It does **not** auto-change planning depth, emit a productivity score, or claim causal impact.
+
+### What is recorded
+
+Events go through the same host-local `events.jsonl` `appendEvent` path as other run telemetry (stream `schema_version` stays `1`):
+
+| Event type | Role |
+| --- | --- |
+| `planning_leverage_phase` | Phase boundary start/end for `alignment`, `planning`, `implementation`, `review`, `correction` |
+| `assumption_lineage` | Stable assumption / open-question id with status across stages |
+| `material_rework` | Material vs ordinary vs unknown classification for a fix round |
+| `planning_leverage_snapshot` | Optional rolled-up raw + derived checkpoint |
+
+Selected fields:
+
+- `planning_depth`: `minimal` \| `standard` \| `deep` \| `unknown` (selected for the run, not post-hoc plan quality)
+- `risk_class`: closed built-in vocabulary (pre-code classes + `unknown`)
+- Durations: `elapsed_ms` only when both timestamps exist; `active_effort` uses `availability: unavailable` and `value_ms: null` when unknown — never `0` or a silent copy of elapsed
+- Material criteria (OR): `scope_expansion`, `design_interface_change`, `replan_or_assumption_reopen`, `multi_round_blocking` — formatting-only edits are **ordinary**
+
+### Reporting
+
+`pipeline scoreboard` adds a `planning_leverage` section (human + JSON) with depth/risk histograms, observed phase elapsed, assumption open/resolved counts, and materiality breakdowns. Observed raw fields, derived ratios, and unavailable values are labeled separately. Missing telemetry yields zeros and a `telemetry_absent` diagnostic — not fabricated depths.
+
+### Privacy and retention
+
+- Default storage is host-local under `.agent-pipeline/runs/<run-id>/` (events + optional `planning_leverage.json`)
+- Free text is denylist- and secret-redacted; no raw prompts, model transcripts, source dumps, or tokens
+- Retention follows the scoreboard/run evidence window; expired runs drop out of default report totals
+- Customer-hosted installs do not require a fleet collector
+
+### Linkage to #576
+
+Attribution may include `target_type: "production_outcome"` only when a durable outcome id exists. Missing production outcomes are omitted, not invented. In-pipeline material rework is distinct from post-delivery `follow_up_rework`.
 
 ## Conventions & carry-forward lessons
 

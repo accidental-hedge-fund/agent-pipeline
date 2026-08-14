@@ -114,7 +114,7 @@ $pipeline lineage export|impact|propose|ingest [--run-id <id>] [--node-id <id>] 
 $pipeline logs [<run-id>] [--events] [-f] [--no-until-terminal] List or stream pipeline run logs (events --follow exits 0 on terminal run_complete)
 $pipeline outcomes ingest|list [--adapter github] [--fixture <path>] [--days <n>] [--retention-days <n>] [--dry-run] [--json] Ingest or list production/rework outcomes linked to pipeline runs (host-local store; #576). R2D alone is never production delivery; free text is redacted; no GitHub mutations
 $pipeline report [--yes]                        Privacy-safe product-fault report preview/submit (optional; off by default in config)
-$pipeline scoreboard [--days <n>|--since <iso>] [--until <iso>] [--bucket day|week] [--by <dim>] [--json] [--html <path>] Print read-only factory throughput/cost/reliability metrics from run artifacts (incl. human-touch, escape-recurrence, discovery-channel, stratified stabilization; #763; production outcomes #576)
+$pipeline scoreboard [--days <n>|--since <iso>] [--until <iso>] [--bucket day|week] [--by <dim>] [--json] [--html <path>] Print read-only factory throughput/cost/reliability metrics from run artifacts (incl. human-touch, escape-recurrence, discovery-channel, stratified stabilization; #763; production outcomes #576; planning-leverage / material-rework #702)
 $pipeline summary <run-id>                      Print the run evidence bundle for an issue number or exact run-id
 $pipeline config schema|validate|sync|repo-map … Config schema, validate, sync scaffold, and repo-map mutations
 $pipeline path [--json]                         Discover installed host skill paths (JSON-friendly for desktop integrators)
