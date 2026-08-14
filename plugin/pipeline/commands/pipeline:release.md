@@ -1,5 +1,5 @@
 ---
-description: Prepare a release PR for the given version
+description: 'Prepare a release PR for the given version'
 argument-hint: '<version | major | minor | patch>'
 ---
 

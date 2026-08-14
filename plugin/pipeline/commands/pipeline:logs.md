@@ -1,5 +1,5 @@
 ---
-description: List or stream pipeline run logs (events --follow exits 0 on run_complete; --no-until-terminal for interrupt-only)
+description: 'List or stream pipeline run logs (events --follow exits 0 on run_complete; --no-until-terminal for interrupt-only)'
 argument-hint: '[<run-id>] [--events] [-f]'
 ---
 

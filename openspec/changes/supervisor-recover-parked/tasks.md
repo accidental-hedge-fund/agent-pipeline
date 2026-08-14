@@ -1,46 +1,54 @@
 ## 1. Inventory and seams
 
-- [ ] 1.1 Map current park paths: review ceiling → needs-human/blocked, pre-merge residual delta block, leftover `blocked` after HEAD move, engine-scratch false parks.
-- [ ] 1.2 Identify reusable entrypoints for deterministic recover (`unlink_engine_scratch` / engine-scratch path, stale-blocked re-review), audited `pipeline override` record path, implementer fix round, and `pipeline single` re-enter.
-- [ ] 1.3 Confirm structured finding fields used for eligibility (`severity`, `category`, override-key / `findingKey`) and where residual sets are loaded at live HEAD.
-- [ ] 1.4 Choose fingerprint marker storage (issue sentinel vs run-state) that supports one-pass budget and deps-injected unit tests.
+- [x] 1.1 Confirm park detection labels (`blocked`, `pipeline:needs-human`) and residual review artifacts used at park.
+- [x] 1.2 Wire deterministic entrypoints: `tryResumeStaleBlocked` (`stages/stale-blocked-rereview.ts`), `unlink_engine_scratch` recovery action (`pipeline.ts`); document success/failure kinds in deps.
+- [x] 1.3 Wire audited override path: `parseOverrideArg` + `runOverride` shared record path / `overrideComment` + governed validation — no label side door.
+- [x] 1.4 Confirm structured fields: `ReviewArtifact.blockingFindings` (`key`, `severity`, `title`, `surface`), `findingKey`, category via surface / finding; authority via `human-decision-required` / `isHumanAuthorityBlocker`.
+- [x] 1.5 Confirm host generation source: `OPERATION_SURFACE` in `scripts/build.mjs` + `COMMAND_REGISTRY` / `COMMAND_DOCS`; never hand-edit `plugin/`.
 
-## 2. Pure eligibility and fingerprint budget
+## 2. Pure eligibility, fingerprint, result contract
 
-- [ ] 2.1 Implement pure classification: structured-record non-overridable (HIGH/CRITICAL/security/human-decision-required) vs eligible (stale/DNR/below-high); prose must not unlock override.
-- [ ] 2.2 Implement fingerprint `(issue, stage, sorted blocking override-keys)` spend/refuse helpers; same keys after new commit do not reset budget; deterministic-only clear does not spend senior budget.
-- [ ] 2.3 Implement override payload builder: finding key + closed evidence reason (`stale` | `DNR` | `below-high`); refuse keyless/prose-only.
+- [x] 2.1 Implement pure `classifyParkedFinding` / residual classification: non-overridable (HIGH/CRITICAL/security/authority/unknown severity) vs eligible (stale/DNR/below-high); prose never consulted.
+- [x] 2.2 Implement fingerprint id `(issue, stageId, sorted keys)` + covering-superset spent rule (subset after partial override does not re-grant).
+- [x] 2.3 Implement spend sentinel post/extract (`pipeline-recover-parked-spent: v1`); write-before-side-effects under issue-run lock.
+- [x] 2.4 Implement override payload builder: key + closed reason `stale`|`DNR`|`below-high`; refuse keyless.
+- [x] 2.5 Define `RecoverParkedResult` statuses: `deterministic-cleared` | `recovered` | `still-parked` | `already-spent` | `not-parked` | `fail-closed` + exit code map.
 
 ## 3. recover-parked command
 
-- [ ] 3.1 Register `recover-parked` in the command registry with docs metadata, needs-issue, allowedFlags, non-merge classification.
-- [ ] 3.2 Wire CLI handler: deterministic recover first → classify at live HEAD → audited overrides for eligible keys only → optional one fix round for non-overridable → re-evaluate → re-enter `single` or keep park + notify.
-- [ ] 3.3 Ensure overrides call existing audited override path (governed validity / ledger); no label side door.
-- [ ] 3.4 Refuse override of non-overridable keys even if an internal step requests them; fail closed on unreadable HEAD/PR.
-- [ ] 3.5 Idempotent refuse when fingerprint already spent.
+- [x] 3.1 Register `recover-parked` in command registry + command-docs; allowedFlags; non-merge; disallowed flags → exit 2 before mutation.
+- [x] 3.2 Implement `runRecoverParked` with deps injection: lock → deterministic first → classify at live HEAD → spend marker → eligible overrides only → optional one fix round → re-eval HEAD → re-enter single/advance with `skipRecoverParked` or keep park.
+- [x] 3.3 CLI dispatch in `pipeline.ts`; `--json` emits result; no merge/merge-queue path.
+- [x] 3.4 Re-read live HEAD before override batch and before re-entry; fail closed if unreadable.
+- [x] 3.5 Partial override failure: no keyless audit; no label clear without disposition; fingerprint remains spent.
 
 ## 4. Train and outer-host hooks
 
-- [ ] 4.1 Train: after deterministic enter-path resume, on `needs-human` / leftover `blocked`, invoke recover-parked once per fingerprint; if still parked apply today's hold/STOP + notify; continue independent peers under existing rules.
-- [ ] 4.2 Ensure train does not call override directly, drop labels, or add a train-local senior recoverer.
-- [ ] 4.3 Update ship-path / supervisor docs (and Tugboat guidance if present) so residual parks use recover-parked once or STOP — no host-invented override.
-- [ ] 4.4 Host packaging: add `pipeline:recover-parked` to namespaced command surface / single-source operation list; forward only to CLI.
+- [x] 4.1 Train: after park observation post deterministic resume, call `runRecoverParked` once; map result to continue vs hold/STOP; never call override or drop labels.
+- [x] 4.2 Docs: `docs/supervisor.md` / ship-path autonomy residual park row → `pipeline recover-parked` once then STOP if still parked.
+- [x] 4.3 Add `recover-parked` to `OPERATION_SURFACE`; host entry CLI-only forward; regenerate via `node scripts/build.mjs`.
 
 ## 5. Unit tests (injected deps only)
 
-- [ ] 5.1 Fixture: stale/DNR/below-high park → override + single re-enter; no backlog restart.
-- [ ] 5.2 Fixture: structured CRITICAL (and HIGH/security) remains parked; no override for those keys.
-- [ ] 5.3 Fixture: structured CRITICAL + prose "nit" still refuses override.
-- [ ] 5.4 Fixture: same sorted keys after new commit refuse second supervisor pass.
-- [ ] 5.5 Fixture: scratch-only / stale-SHA park clears via deterministic path without override and without spending senior fingerprint.
-- [ ] 5.6 Fixture: extra fix may commit for HIGH/CRITICAL; override of those keys refused; residuals after fix keep park.
-- [ ] 5.7 Fixture: second identical fingerprint is idempotent refuse.
-- [ ] 5.8 Fixture: train hook invokes recover-parked once then STOP/hold if still parked; never invents override.
-- [ ] 5.9 Registry allowlist / lookup tests for `recover-parked`; host surface includes entry if packaging changed.
-- [ ] 5.10 All new tests use deps injection — no real network, git, or subprocess.
+- [x] 5.1 Stale/DNR/below-high → override + re-enter; no backlog restart.
+- [x] 5.2 Still-valid HIGH remains parked; no override for that key.
+- [x] 5.3 Still-valid CRITICAL remains parked; no override.
+- [x] 5.4 `category: security` remains parked; no override.
+- [x] 5.5 `human-decision-required` / missing-authority remains parked; no override.
+- [x] 5.6 Structured CRITICAL + prose "nit" refuses override.
+- [x] 5.7 Same sorted keys after new commit → `already-spent`; no second senior pass.
+- [x] 5.8 Partial override leaves HIGH/CRITICAL subset → second invoke does not re-grant senior pass (covering-superset rule).
+- [x] 5.9 Scratch-only / stale-SHA → `deterministic-cleared`; no override; no spend.
+- [x] 5.10 Extra fix may commit for HIGH/CRITICAL; override of those keys refused; residuals keep park.
+- [x] 5.11 Second identical fingerprint → idempotent `already-spent`.
+- [x] 5.12 Train hook once-then-hold; no invented override.
+- [x] 5.13 Unparked → `not-parked` no mutations; unreadable PR → `fail-closed`.
+- [x] 5.14 Disallowed flags exit 2; recover-parked cannot reach merge paths.
+- [x] 5.15 Registry lookup + OPERATION_SURFACE / generated host entry presence after build.
+- [x] 5.16 All tests deps-injected — no real network/git/subprocess.
 
 ## 6. Mirror, validate, CI
 
-- [ ] 6.1 After any `core/` or host packaging edits, run `node scripts/build.mjs` and include regenerated `plugin/` in the same commit when required.
-- [ ] 6.2 Run `openspec validate supervisor-recover-parked` (and `openspec validate --all` as needed) until clean.
-- [ ] 6.3 Run `npm run ci` from the repo root and fix failures until green.
+- [x] 6.1 `node scripts/build.mjs` after core/host packaging edits; commit `plugin/` when required.
+- [x] 6.2 `openspec validate supervisor-recover-parked` (and `--all` as needed).
+- [x] 6.3 `npm run ci` green from repo root.

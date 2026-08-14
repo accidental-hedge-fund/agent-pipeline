@@ -1,5 +1,5 @@
 ---
-description: Print the evidence bundle for issue N
+description: 'Print the evidence bundle for issue N'
 argument-hint: '<N>'
 ---
 

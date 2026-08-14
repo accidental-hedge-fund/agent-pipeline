@@ -1,5 +1,5 @@
 ---
-description: Batch re-spec thin issues and reconcile ROADMAP.md
+description: 'Batch re-spec thin issues and reconcile ROADMAP.md'
 argument-hint: '[--apply] [--repo <owner/repo>]'
 ---
 

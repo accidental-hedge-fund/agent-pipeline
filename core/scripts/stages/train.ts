@@ -93,6 +93,21 @@ export type AdvanceOutcome =
 
 export type AdvanceWaveResult = Map<number, AdvanceOutcome>;
 
+/** Result shape consumed from recover-parked (shared entrypoint). */
+export type TrainRecoverParkedStatus =
+  | "deterministic-cleared"
+  | "recovered"
+  | "still-parked"
+  | "already-spent"
+  | "not-parked"
+  | "fail-closed";
+
+export interface TrainRecoverParkedResult {
+  status: TrainRecoverParkedStatus;
+  issue: number;
+  message: string;
+}
+
 export interface TrainDeps {
   log(msg: string): void;
   listMilestoneIssues(milestone: string): Promise<TrainIssueSnapshot[]>;
@@ -107,6 +122,12 @@ export interface TrainDeps {
    * wiring via {@link advanceWaveFromSingle}. Prefer advanceWave in production.
    */
   advanceIssue?(issue: number): Promise<AdvanceOutcome>;
+  /**
+   * One supervisor recover-parked pass for a parked item (#1061).
+   * Train MUST NOT invent override or drop blocked labels itself.
+   * Default production wiring invokes `runRecoverParked`; tests inject fakes.
+   */
+  recoverParked?(issue: number): Promise<TrainRecoverParkedResult>;
   /** Open PR only — used when a merge mutation may still be required. */
   getPrForIssue(issue: number): Promise<number | null>;
   /**
@@ -352,6 +373,8 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
   const finished = new Set<number>();
   const held = new Set<number>();
   const integrated = new Set<number>();
+  /** Per-wave-drive: at most one recover-parked attempt per issue (#1061). */
+  const recoverParkedAttempted = new Set<number>();
   const itemByIssue = new Map<number, TrainItemResult>();
   let blocker: string | null = null;
   let nextAction: TrainNextAction = "advance";
@@ -530,6 +553,44 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
           (advanced.terminal === "ready-to-deploy" ? "ready-to-deploy" : null);
 
         if (advanced.terminal === "needs-human" || stage === "needs-human") {
+          // #1061: one recover-parked pass per park before terminal hold.
+          // Train never invents override or drops blocked labels itself.
+          if (deps.recoverParked && !recoverParkedAttempted.has(issue)) {
+            recoverParkedAttempted.add(issue);
+            deps.log(`[train] recover-parked once for #${issue} (needs-human)`);
+            let rp: TrainRecoverParkedResult;
+            try {
+              rp = await deps.recoverParked(issue);
+            } catch (err) {
+              rp = {
+                status: "fail-closed",
+                issue,
+                message: `recover-parked threw: ${(err as Error).message}`,
+              };
+            }
+            deps.log(
+              `[train] recover-parked #${issue}: ${rp.status} — ${rp.message}`,
+            );
+            if (rp.status === "recovered" || rp.status === "deterministic-cleared") {
+              // Same-issue continues on work list; refresh labels and do not hold.
+              try {
+                const refreshed = await deps.getIssue(issue);
+                byNumber.set(issue, {
+                  ...byNumber.get(issue)!,
+                  labels: refreshed.labels,
+                  body: refreshed.body,
+                  title: refreshed.title,
+                  state: refreshed.state,
+                });
+              } catch {
+                /* keep prior labels; re-advance may still help next wave */
+              }
+              deps.log(
+                `[train] #${issue}: recover-parked ${rp.status}; continuing same issue (no backlog restart)`,
+              );
+              continue;
+            }
+          }
           held.add(issue);
           const err = `issue #${issue} parked at pipeline:needs-human`;
           pushItem({
@@ -544,6 +605,41 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
           continue;
         }
         if (advanced.terminal === "blocked" || labels.includes("blocked")) {
+          if (deps.recoverParked && !recoverParkedAttempted.has(issue)) {
+            recoverParkedAttempted.add(issue);
+            deps.log(`[train] recover-parked once for #${issue} (blocked)`);
+            let rp: TrainRecoverParkedResult;
+            try {
+              rp = await deps.recoverParked(issue);
+            } catch (err) {
+              rp = {
+                status: "fail-closed",
+                issue,
+                message: `recover-parked threw: ${(err as Error).message}`,
+              };
+            }
+            deps.log(
+              `[train] recover-parked #${issue}: ${rp.status} — ${rp.message}`,
+            );
+            if (rp.status === "recovered" || rp.status === "deterministic-cleared") {
+              try {
+                const refreshed = await deps.getIssue(issue);
+                byNumber.set(issue, {
+                  ...byNumber.get(issue)!,
+                  labels: refreshed.labels,
+                  body: refreshed.body,
+                  title: refreshed.title,
+                  state: refreshed.state,
+                });
+              } catch {
+                /* keep prior */
+              }
+              deps.log(
+                `[train] #${issue}: recover-parked ${rp.status}; continuing same issue (no backlog restart)`,
+              );
+              continue;
+            }
+          }
           held.add(issue);
           const err = `issue #${issue} is blocked`;
           pushItem({

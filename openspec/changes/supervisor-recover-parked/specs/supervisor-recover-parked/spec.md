@@ -123,6 +123,40 @@ The pipeline SHALL allow at most **one** supervisor senior pass per fingerprint 
 - **THEN** `recover-parked` SHALL exit without re-running the senior override/fix budget
 - **AND** SHALL leave human recovery as the remaining path
 
+#### Scenario: Subset keys after partial override do not re-grant a senior pass
+
+- **WHEN** a supervisor pass was spent for key set K at stage S
+- **AND** eligible keys in K were dispositioned so remaining blocking keys K' are a subset of K
+- **AND** `recover-parked` is invoked again with residual keys K'
+- **THEN** the command SHALL treat the senior budget as already spent for that residual set
+- **AND** SHALL NOT run another supervisor override batch or supervisor-budgeted extra fix for K' solely because the fingerprint string changed
+
+#### Scenario: Spend marker is written before override side effects
+
+- **WHEN** `recover-parked` enters the senior path for an unspent fingerprint
+- **THEN** it SHALL record the durable spend marker for that fingerprint before posting override dispositions
+- **AND** if a later step fails after the marker is written, a retry with the same fingerprint SHALL refuse another senior pass
+
+---
+
+### Requirement: recover-parked SHALL expose a closed result contract for train and CLI consumers
+
+The command and its pure engine entrypoint SHALL return a closed status from at least: `deterministic-cleared`, `recovered`, `still-parked`, `already-spent`, `not-parked`, `fail-closed`. Train and other in-process consumers SHALL use that result (or the shared entrypoint) rather than inventing a second classifier. Thin hosts that only invoke the CLI SHALL stop or hold when the outcome is still parked (or equivalent non-zero park result) and SHALL NOT invent override.
+
+#### Scenario: Train maps recovered vs still-parked from the shared result
+
+- **WHEN** train invokes recover-parked for a parked item
+- **AND** the result status is `recovered` or `deterministic-cleared`
+- **THEN** train MAY continue same-issue advance without backlog restart
+- **WHEN** the result status is `still-parked`, `already-spent`, or `fail-closed`
+- **THEN** train SHALL hold/STOP that item under existing park rules without inventing an override
+
+#### Scenario: Re-entry does not recursively invoke recover-parked
+
+- **WHEN** recover-parked re-enters `pipeline single` / advance for the same issue after a successful clear
+- **THEN** that re-entry SHALL carry an internal guard that prevents nested recover-parked on the same stack
+- **AND** SHALL preserve the existing issue-run lock contract for that issue
+
 ---
 
 ### Requirement: Extra fix round MAY code-fix non-overridable defects and MUST NOT override them
@@ -180,3 +214,14 @@ The change SHALL include unit tests that inject I/O via deps and perform no real
 
 - **WHEN** unit tests run a scratch-only or stale-SHA park fixture that deterministic recover clears
 - **THEN** the test SHALL fail if a supervisor override was recorded or senior fingerprint budget was spent
+
+#### Scenario: Negative fixtures cover each protected structured condition
+
+- **WHEN** unit tests run recover-parked fixtures for structured HIGH, CRITICAL, `category: security`, `human-decision-required`, and missing-authority residuals
+- **THEN** each fixture SHALL fail if an override for the protected key/class is recorded
+- **AND** classifier prose SHALL not unlock override in any of those fixtures
+
+#### Scenario: Partial-override subset fixture refuses second senior pass
+
+- **WHEN** unit tests spend a pass for keys including both eligible and HIGH/CRITICAL keys, apply only eligible overrides, then re-invoke with the remaining HIGH/CRITICAL subset
+- **THEN** the test SHALL fail if a second supervisor pass (override batch or budgeted extra fix) runs for that subset

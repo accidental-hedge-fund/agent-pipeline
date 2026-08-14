@@ -1,5 +1,5 @@
 ---
-description: Spec a rough description into a GitHub issue and ROADMAP PR
+description: 'Spec a rough description into a GitHub issue and ROADMAP PR'
 argument-hint: '[--description "<text>"] [--release <version>]'
 ---
 

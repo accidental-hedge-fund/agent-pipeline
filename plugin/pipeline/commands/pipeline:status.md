@@ -1,5 +1,5 @@
 ---
-description: Read-only status of issue or PR N — stage, blocker, PR, last review
+description: 'Read-only status of issue or PR N — stage, blocker, PR, last review'
 argument-hint: '<N>'
 ---
 

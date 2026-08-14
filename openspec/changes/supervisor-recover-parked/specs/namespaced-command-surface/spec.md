@@ -50,13 +50,13 @@ appear in that host's command/skill discovery surface.
 
 ### Requirement: Host recover-parked entry SHALL only forward to the CLI
 
-The host `pipeline:recover-parked` entry (Claude `/pipeline:recover-parked`, Codex
+The host `pipeline:recover-parked` entry SHALL forward exclusively to the engine CLI
+`pipeline recover-parked` (Claude `/pipeline:recover-parked`, Codex
 `$pipeline:recover-parked`, and any Tugboat/Hermes skill text that documents the
-operation) SHALL forward exclusively to the engine CLI `pipeline recover-parked`
-(or no-op + STOP when the host chooses not to invoke it). Host packaging and skill
-prose SHALL NOT instruct inventing `pipeline override` dispositions, dropping
-`blocked`/`needs-human` labels, or reclassifying structured HIGH/CRITICAL/security
-findings outside the CLI.
+operation), or no-op + STOP when the host chooses not to invoke it. Host packaging
+and skill prose SHALL NOT instruct inventing `pipeline override` dispositions,
+dropping `blocked`/`needs-human` labels, or reclassifying structured
+HIGH/CRITICAL/security findings outside the CLI.
 
 #### Scenario: Host entry documents CLI-only reflow
 

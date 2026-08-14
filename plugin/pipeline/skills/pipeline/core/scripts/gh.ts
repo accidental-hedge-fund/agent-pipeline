@@ -2730,6 +2730,11 @@ export const PIPELINE_COMMENT_KINDS: readonly {
     operatorSurface: true,
   },
   {
+    kind: "recover-parked-spent",
+    heading: "## Pipeline: recover-parked supervisor pass spent",
+    verify: "pipeline-attest",
+  },
+  {
     kind: "scope-override",
     heading: "## Pipeline: Scope override",
     verify: "pipeline-attest",

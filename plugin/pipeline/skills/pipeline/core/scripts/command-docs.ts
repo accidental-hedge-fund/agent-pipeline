@@ -67,6 +67,13 @@ export const COMMAND_DOCS: Record<string, CommandDoc> = {
     documented: true,
     section: "lifecycle",
   },
+  "recover-parked": {
+    summary:
+      "One supervisor pass for a parked issue: deterministic recover first, then reflow only stale/DNR/below-high residuals (never auto-override HIGH/CRITICAL/security); re-enter single if clear",
+    usage: "recover-parked <n> [--json] [--dry-run]",
+    documented: true,
+    section: "lifecycle",
+  },
   summary: {
     summary: "Print the run evidence bundle for an issue number or exact run-id",
     usage: "summary <run-id>",

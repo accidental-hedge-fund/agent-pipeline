@@ -1,5 +1,5 @@
 ---
-description: Set a pre-pipeline stage label (ready or backlog) on issue N
+description: 'Set a pre-pipeline stage label (ready or backlog) on issue N'
 argument-hint: '<N> --stage <ready|backlog>'
 ---
 
