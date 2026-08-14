@@ -7,6 +7,7 @@ import { createHash } from "node:crypto";
 import {
   isPlaceholderIdentity,
   makeNodeShell,
+  type LineageEdge,
   type LineageNode,
 } from "./schema.ts";
 
@@ -94,6 +95,136 @@ export function encodeLocalId(localId: string): string {
     if (ch === "/") return "%2F";
     return "%5C";
   });
+}
+
+/**
+ * Legacy (v1 schema) local-id encoder: only `/` and `\` were escaped, so a
+ * literal percent remained `%` and `a%2Fb` collided with `a/b`. Used by the
+ * v1→v2 identity migration to detect and rewrite stored ids deterministically.
+ */
+export function encodeLocalIdV1(localId: string): string {
+  return localId.replace(/[/\\]/g, (ch) => (ch === "/" ? "%2F" : "%5C"));
+}
+
+/**
+ * Rewrite a stored v1 node_id to the v2 injective encoding, or null when the
+ * stored id was already v2 (no `%` to re-escape). `localId` is the canonical
+ * artifact local key (path, id, sha, …) recorded on the node's identity.
+ */
+export function migrateV1NodeId(
+  storedNodeId: string,
+  domain: string,
+  nodeType: string,
+  localId: string,
+): string | null {
+  const local = String(localId ?? "").trim();
+  if (!local) return null;
+  const v2 = makeDomainNodeId(domain, nodeType, local);
+  if (v2 === storedNodeId) return null;
+  const v1 = `${assertDomain(domain)}${DOMAIN_ID_SEP}${nodeType}:${encodeLocalIdV1(local)}`;
+  return v1 === storedNodeId ? v2 : null;
+}
+
+/**
+ * Canonical local id for each lineage node type, read from the recorded
+ * identity material. Returns null when the node carries no usable local key.
+ */
+export function canonicalLocalIdForNode(node: {
+  node_type: string;
+  identity: Record<string, unknown>;
+}): string | null {
+  const id = node.identity;
+  const pick = (k: string): string | null => {
+    const v = id[k];
+    return typeof v === "string" && v.trim() ? v.trim() : null;
+  };
+  switch (node.node_type) {
+    case "requirement":
+      return pick("path");
+    case "component":
+    case "capability":
+      return pick("local_key") ?? pick("component_id") ?? pick("capability_id");
+    case "objective":
+      return pick("objective_id");
+    case "intent_outcome":
+      return pick("intent_id");
+    case "run":
+      return pick("run_id");
+    case "commit":
+      return pick("sha");
+    case "pr":
+      return pick("pr") ?? pick("pr_number");
+    case "verification":
+      return pick("verification_id");
+    case "production_outcome":
+      return pick("outcome_id");
+    case "decision":
+      return pick("decision_id");
+    case "policy_event":
+    case "override_event":
+      return pick("event_id");
+    default:
+      return null;
+  }
+}
+
+export interface IdentityMigrationResult {
+  nodes: LineageNode[];
+  edges: LineageEdge[];
+  rewritten: number;
+  ambiguous: number;
+  diagnostics: Array<{ code: string; message: string }>;
+}
+
+/**
+ * Deterministic v1→v2 identity rewrite for a lineage graph. Rewrites node ids
+ * that still use the legacy (collision-prone) local-id encoding, remaps every
+ * edge endpoint, and fails closed (ambiguous diagnostic, node untouched) when
+ * a stored id cannot be mapped from the recorded canonical local key.
+ */
+export function migrateLineageIdentityV1ToV2(
+  nodes: readonly LineageNode[],
+  edges: readonly LineageEdge[],
+): IdentityMigrationResult {
+  const diagnostics: IdentityMigrationResult["diagnostics"] = [];
+  const oldToNew = new Map<string, string>();
+  let rewritten = 0;
+  let ambiguous = 0;
+
+  const rewrittenNodes: LineageNode[] = nodes.map((n) => {
+    if (!n.node_id) return n;
+    const local = canonicalLocalIdForNode(n);
+    if (!local) return n;
+    const nextId = migrateV1NodeId(n.node_id, n.domain, n.node_type, local);
+    if (!nextId || nextId === n.node_id) return n;
+    rewritten += 1;
+    oldToNew.set(n.node_id, nextId);
+    return { ...n, node_id: nextId };
+  });
+
+  const rewrittenEdges: LineageEdge[] = edges.map((edge) => {
+    const source = oldToNew.get(edge.source_id) ?? edge.source_id;
+    const target = oldToNew.get(edge.target_id) ?? edge.target_id;
+    if (source === edge.source_id && target === edge.target_id) return edge;
+    return { ...edge, source_id: source, target_id: target };
+  });
+
+  // Fail closed: any stored v1-looking id we could not rewrite is flagged.
+  for (const node of nodes) {
+    if (
+      node.node_id &&
+      (node.node_id.includes("%2F") || node.node_id.includes("%5C")) &&
+      !oldToNew.has(node.node_id)
+    ) {
+      ambiguous += 1;
+      diagnostics.push({
+        code: "legacy_identity_ambiguous",
+        message: `cannot deterministically migrate legacy node_id ${node.node_id}; record left unrewritten`,
+      });
+    }
+  }
+
+  return { nodes: rewrittenNodes, edges: rewrittenEdges, rewritten, ambiguous, diagnostics };
 }
 
 /**

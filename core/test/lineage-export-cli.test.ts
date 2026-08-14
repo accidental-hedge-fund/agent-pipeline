@@ -112,7 +112,7 @@ test("JSON export shape is available without UI", () => {
   });
   const json = JSON.stringify(section);
   const parsed = JSON.parse(json);
-  assert.equal(parsed.schema_version, 1);
+  assert.equal(parsed.schema_version, 2);
   assert.ok(parsed.objective_ids.includes("obj-y"));
   assert.ok(Array.isArray(parsed.nodes));
 });

@@ -19,8 +19,8 @@ import {
 const DOMAIN = "agent-pipeline";
 const SHA = "a".repeat(40);
 
-test("closed enums are locked for schema_version 1", () => {
-  assert.equal(LINEAGE_SCHEMA_VERSION, 1);
+test("closed enums are locked for schema_version 2", () => {
+  assert.equal(LINEAGE_SCHEMA_VERSION, 2);
   assert.ok(NODE_TYPES.includes("objective"));
   assert.ok(NODE_TYPES.includes("production_outcome"));
   assert.ok(NODE_TYPES.includes("decision"));
@@ -43,7 +43,7 @@ test("validate accepts well-formed node with identity fields", () => {
   const r = validateLineageNode(node);
   assert.equal(r.ok, true);
   assert.equal(r.value?.node_type, "objective");
-  assert.equal(r.value?.schema_version, 1);
+  assert.equal(r.value?.schema_version, 2);
 });
 
 test("validate accepts well-formed edge with relationship and endpoints", () => {

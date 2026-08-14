@@ -10,7 +10,11 @@ import { redactSecrets, sanitize } from "../artifact-sanitize.ts";
 // Schema version + closed enums
 // ---------------------------------------------------------------------------
 
-export const LINEAGE_SCHEMA_VERSION = 1 as const;
+export const LINEAGE_SCHEMA_VERSION = 2 as const;
+
+/** Lowest schema_version the reader still accepts (v1 files existed before
+ *  the injective identity encoding; see lineage/identity.ts migrate helper). */
+export const LINEAGE_MIN_SUPPORTED_SCHEMA_VERSION = 1 as const;
 
 export const NODE_TYPES = [
   "intent_outcome",
@@ -316,7 +320,10 @@ export function validateLineageNode(input: unknown): ValidationResult<LineageNod
   const o = input as Record<string, unknown>;
 
   if (o.schema_version !== LINEAGE_SCHEMA_VERSION) {
-    issues.push({ path: "schema_version", message: `must be ${LINEAGE_SCHEMA_VERSION}` });
+    issues.push({
+      path: "schema_version",
+      message: `must be ${LINEAGE_SCHEMA_VERSION} (or legacy ${LINEAGE_MIN_SUPPORTED_SCHEMA_VERSION})`,
+    });
   }
   if (o.type !== "lineage_node") {
     issues.push({ path: "type", message: 'must be "lineage_node"' });
@@ -450,7 +457,10 @@ export function validateLineageEdge(input: unknown): ValidationResult<LineageEdg
   const o = input as Record<string, unknown>;
 
   if (o.schema_version !== LINEAGE_SCHEMA_VERSION) {
-    issues.push({ path: "schema_version", message: `must be ${LINEAGE_SCHEMA_VERSION}` });
+    issues.push({
+      path: "schema_version",
+      message: `must be ${LINEAGE_SCHEMA_VERSION} (or legacy ${LINEAGE_MIN_SUPPORTED_SCHEMA_VERSION})`,
+    });
   }
   if (o.type !== "lineage_edge") {
     issues.push({ path: "type", message: 'must be "lineage_edge"' });

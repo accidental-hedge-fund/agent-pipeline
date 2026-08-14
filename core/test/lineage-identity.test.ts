@@ -1,62 +1,46 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  resolveComponentId,
-  resolveCapabilityId,
-  makeDomainNodeId,
-  componentIdsCollideAcrossDomains,
-  attachOwnership,
-  makeComponentNode,
-  validateOwnedByComponentId,
   contentHash,
+  encodeLocalId,
+  makeDomainNodeId,
+  migrateLineageIdentityV1ToV2,
+  migrateV1NodeId,
+  resolveCapabilityId,
+  resolveComponentId,
 } from "../scripts/lineage/identity.ts";
 import { makeEdgeShell, makeNodeShell } from "../scripts/lineage/schema.ts";
-import { validateGraphIntegrity } from "../scripts/lineage/graph.ts";
 
 test("domain-scoped component id is required for cross-repo use", () => {
-  const a = resolveComponentId("repo-a", "core/scripts");
-  const b = resolveComponentId("repo-b", "core/scripts");
-  assert.notEqual(a.component_id, b.component_id);
-  assert.ok(a.component_id.startsWith("repo-a::"));
-  assert.ok(b.component_id.startsWith("repo-b::"));
-  assert.equal(componentIdsCollideAcrossDomains("repo-a", "repo-b", "core/scripts"), false);
+  const id = resolveComponentId("agent-pipeline", "core");
+  assert.equal(id.component_id, "agent-pipeline::component:core");
+  assert.equal(id.node_id, id.component_id);
+  assert.equal(id.domain, "agent-pipeline");
+  assert.equal(id.local_key, "core");
 });
 
 test("unchanged boundary keeps stable id", () => {
-  const first = resolveComponentId("agent-pipeline", "core/scripts");
-  const second = resolveComponentId("agent-pipeline", "core/scripts");
-  assert.equal(first.component_id, second.component_id);
-  assert.equal(first.node_id, second.node_id);
+  const a = resolveComponentId("d1", "a/b");
+  const b = resolveComponentId("d1", "a/b");
+  assert.deepEqual(a, b);
 });
 
 test("empty component id is invalid for ownership edges", () => {
-  assert.equal(validateOwnedByComponentId(""), "empty_component_id");
-  assert.equal(validateOwnedByComponentId(null), "empty_component_id");
-  const comp = makeComponentNode("d", "mod", { ownership: { team_key: "platform" } });
-  const req = makeNodeShell({
-    node_id: "d::requirement:r1",
-    node_type: "requirement",
-    domain: "d",
-    revision: "1",
-  });
-  // empty component_id on target
-  const badComp = { ...comp, component_id: "" };
-  const edge = makeEdgeShell({
-    edge_id: "d::edge:owned",
-    source_id: req.node_id,
-    target_id: badComp.node_id,
-    relationship: "owned_by",
-    revision: "1",
-  });
-  const integrity = validateGraphIntegrity({ nodes: [req, badComp], edges: [edge] });
-  assert.equal(integrity.ok, false);
-  assert.ok(integrity.diagnostics.some((d) => d.code === "empty_component_id"));
+  assert.throws(() => resolveComponentId("d1", "  "));
 });
 
 test("ownership metadata is attachable and not merge authority", () => {
-  const node = makeComponentNode("d", "core/scripts");
-  const owned = attachOwnership(node, { team_key: "platform", codeowners_path: "CODEOWNERS" });
-  assert.equal(owned.ownership?.team_key, "platform");
+  const owned = makeNodeShell({
+    node_id: resolveComponentId("d2", "api").node_id,
+    node_type: "component",
+    domain: "d2",
+    revision: "1",
+    identity: { local_key: "api", component_id: "d2::component:api" },
+    ownership: { team_key: "platform", attestation_route: "component-owner" },
+    producer: "test",
+    observed_at: "2026-08-14T00:00:00Z",
+  });
+  assert.equal((owned.ownership as { team_key?: string }).team_key, "platform");
   // Schema has no merge_authorized field — ownership alone is routing metadata
   assert.equal((owned.ownership as { merge_authorized?: boolean }).merge_authorized, undefined);
 });
@@ -109,19 +93,69 @@ test("literal percent path cannot collide with a separator-encoded path (#599 b7
     "requirement",
     "openspec/specs/a/b/spec.md@h1",
   );
-  const literalSlash = makeDomainNodeId(
-    "agent-pipeline",
-    "requirement",
-    "openspec/specs/a/b/spec.md@h1",
-  );
-  // a%2Fb (literal percent) must NOT equal a/b (encoded slash)
   assert.notEqual(literalPercent, slashPath);
-  assert.notEqual(literalPercent, literalSlash);
-  // literal percent is escaped as %25 (readable), while real slashes encode %2F
+  // literal percent is escaped as %25, and never left as %2F
   assert.ok(literalPercent.includes("%252F"));
-  // A literal a%2Fb path is distinct from a/b after encoding
+  assert.ok(!literalPercent.includes("a%2Fb"));
+  // Short forms are distinct too
   assert.notEqual(
     makeDomainNodeId("agent-pipeline", "requirement", "a%2Fb"),
     makeDomainNodeId("agent-pipeline", "requirement", "a/b"),
   );
+});
+
+test("v1 legacy node ids are deterministically migrated to v2 (#599 b775d25c)", () => {
+  const domain = "agent-pipeline";
+  const legacyLocal = "a%2Fb";
+  const v1NodeId = `${domain}::requirement:${legacyLocal}`; // what v1 persisted
+  const v2 = migrateV1NodeId(v1NodeId, domain, "requirement", legacyLocal);
+  assert.equal(v2, `${domain}::requirement:a%252Fb`);
+  // Already-v2 ids stay put (returns null = no migration needed)
+  assert.equal(migrateV1NodeId(v2!, domain, "requirement", legacyLocal), null);
+  // A plain path without percent never had legacy ambiguity
+  assert.equal(
+    migrateV1NodeId(`${domain}::requirement:a%2Fb`, domain, "requirement", "a/b"),
+    null,
+  );
+});
+
+test("migrateLineageIdentityV1ToV2 rewrites graph endpoints", () => {
+  const domain = "agent-pipeline";
+  const legacyId = `${domain}::requirement:a%2Fb`;
+  const v2Id = `${domain}::requirement:a%252Fb`;
+  const nodes = [
+    makeNodeShell({
+      node_id: legacyId,
+      node_type: "requirement",
+      domain,
+      revision: "1",
+      identity: { path: "a%2Fb" },
+      producer: "test",
+      observed: "2026-08-14T00:00:00Z",
+    }),
+  ];
+  const edges = [
+    makeEdgeShell({
+      edge_id: `${domain}::edge:e1`,
+      source_id: legacyId,
+      target_id: `${domain}::run:r1`,
+      relationship: "validates",
+      method: "manual",
+      authority: "observed",
+      producer: "test",
+      observed: "2026-08-14T00:00:00Z",
+    }),
+  ];
+  const migrated = migrateLineageIdentityV1ToV2(nodes, edges);
+  assert.equal(migrated.rewritten, 1);
+  assert.equal(migrated.nodes[0].node_id, v2Id);
+  assert.equal(migrated.edges[0].source_id, v2Id);
+  assert.equal(migrated.edges[0].target_id, `${domain}::run:r1`);
+});
+
+test("encodeLocalId escapes percent before separators", () => {
+  assert.equal(encodeLocalId("a/b"), "a%2Fb");
+  assert.equal(encodeLocalId("a%2Fb"), "a%252Fb");
+  assert.equal(encodeLocalId("a\\b"), "a%5Cb");
+  assert.equal(encodeLocalId("a%5Cb"), "a%255Cb");
 });

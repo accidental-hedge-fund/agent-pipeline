@@ -21,6 +21,7 @@ import {
   type LineageGraphSnapshot,
   type LineageNode,
 } from "./schema.ts";
+import { migrateLineageIdentityV1ToV2 } from "./identity.ts";
 import type { ForwardImpactReport, LineageUpdateProposal } from "./impact.ts";
 
 /** Default retention window for export (days). Config key: lineage.retention_days */
@@ -405,11 +406,16 @@ export async function loadGraphSnapshot(
   deps: LineageStoreDeps = realLineageStoreDeps(),
 ): Promise<LineageGraphSnapshot & { diagnostics: StoreDiagnostic[] }> {
   const listed = await listLineage(repoDir, opts, deps);
+  // Deterministic v1→v2 identity migration (#599 b775d25c): any legacy stored
+  // id that collided (literal `%` vs encoded `/`) is rewritten from the
+  // recorded canonical identity; ambiguous leftovers fail closed with a
+  // diagnostic rather than being silently re-keyed.
+  const migrated = migrateLineageIdentityV1ToV2(listed.nodes, listed.edges);
   return {
     schema_version: LINEAGE_SCHEMA_VERSION,
-    nodes: listed.nodes,
-    edges: listed.edges,
-    diagnostics: listed.diagnostics,
+    nodes: migrated.nodes,
+    edges: migrated.edges,
+    diagnostics: [...listed.diagnostics, ...migrated.diagnostics],
   };
 }
 
