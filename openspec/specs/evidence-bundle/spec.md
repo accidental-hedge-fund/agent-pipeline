@@ -737,6 +737,7 @@ When a run creates, answers, rejects, supersedes, expires, or attempts resume va
 - **THEN** evidence SHALL include responder identity reference, decision, and timestamp
 - **AND** SHALL include whether the handoff was authority-bearing
 
+
 ### Requirement: Evidence bundle SHALL record governed override decisions and lifecycle state
 
 The evidence bundle (or equivalent run evidence surface) SHALL include override decision records sufficient to distinguish `active`, `expired`, `superseded`, `renewed`, `rejected`, and `invalidated` outcomes for the run. Each recorded decision SHALL expose class, target, actor, authorization summary, timestamps (`created_at`, `expires_at`), lineage identifiers when present, evidence and remediation references, and evidence-subject binding or legacy-unbound disposition. Free-text reasons alone SHALL NOT be the only machine-readable representation of lifecycle state.
@@ -801,4 +802,35 @@ When repository-control desired state is configured and a compare runs during th
 - **WHEN** live read fails due to permissions during the run
 - **THEN** finalized evidence SHALL record `outcome: "unavailable"`
 - **AND** SHALL NOT record that control as `in_sync`
- (chore: archive OpenSpec change(s) for #695)
+
+
+### Requirement: Evidence surfaces SHALL expose lineage export slices and drift reason codes
+
+When lineage data exists for a run, finalized evidence surfaces (evidence bundle and/or `summary.json` and the human-readable summary path) SHALL expose a lineage section that includes at least:
+
+- schema version of the lineage export slice
+- counts of nodes and edges relevant to the run (or explicit zero with reason)
+- key objective ids linked to the run when present
+- any computed forward impact or backward proposal references for the run
+- stable drift reason codes when impact analysis was run
+
+Absence of a hosted UI SHALL NOT prevent operators from reading these fields via JSON or human-readable summary. Missing lineage for a run SHALL be explicit (empty section or skip reason), not silent success that implies complete attribution.
+
+#### Scenario: human-readable summary includes drift codes when impact ran
+
+- **WHEN** forward impact analysis records `objective_content_hash_changed` for a run's objective
+- **AND** the human-readable summary is printed
+- **THEN** the summary SHALL include that drift reason code
+- **AND** SHALL name the affected objective id or bounded summary
+
+#### Scenario: JSON export is available without UI
+
+- **WHEN** an operator requests lineage or evidence JSON for a run with projected edges
+- **THEN** the export SHALL include the lineage section fields above
+- **AND** SHALL be consumable without a hosted UI
+
+#### Scenario: missing lineage is explicit
+
+- **WHEN** a run finalizes before any lineage projection exists
+- **THEN** the evidence surface SHALL omit the section or record an explicit skip/empty reason
+- **AND** SHALL NOT claim complete intent-to-outcome attribution
