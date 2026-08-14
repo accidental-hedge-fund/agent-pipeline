@@ -477,12 +477,14 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
     }
 
     // ---- Advance wave ----
-    const toAdvance = frontier.filter((issue) => {
-      const snap = byNumber.get(issue)!;
-      const stage = pipelineStageFromLabels(snap.labels);
-      if (skipIfReady && stage === "ready-to-deploy") return false;
-      return true;
-    });
+    const toAdvance = frontier
+      .filter((issue) => {
+        const snap = byNumber.get(issue)!;
+        const stage = pipelineStageFromLabels(snap.labels);
+        if (skipIfReady && stage === "ready-to-deploy") return false;
+        return true;
+      })
+      .slice(0, mergeMode ? 1 : undefined);
 
     if (toAdvance.length > 0) {
       currentIssue = toAdvance[0]!;
@@ -554,7 +556,13 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
             integrated: false,
             error: err,
           });
-          deps.log(`[train] park #${issue}: blocked (independent peers may continue)`);
+          deps.log(`[train] park #${issue}: blocked`);
+          if (mergeMode) {
+            blocker = `issue #${issue} is blocked; later milestone items will not advance until this is resolved`;
+            nextAction = "stopped";
+            deps.log(`[train] STOP: ${blocker}`);
+            return { exitCode: 1, status: status() };
+          }
           continue;
         }
         if (stage !== "ready-to-deploy" && advanced.terminal !== "ready-to-deploy") {

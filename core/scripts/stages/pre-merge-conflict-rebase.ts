@@ -3,7 +3,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { getPrDetail, setBlocked } from "../gh.ts";
+import { getPrDetail } from "../gh.ts";
 import {
   branchName,
   getOnDiskForIssue,
@@ -12,7 +12,6 @@ import {
 import { PIPELINE_INTERNAL_MARKER_FILES } from "../salvage-harness-work.ts";
 import { makeCommandRecord, recordCommand } from "../evidence-bundle.ts";
 import type { Outcome, PipelineConfig } from "../types.ts";
-import { preMergeBlocked } from "./pre-merge-shared.ts";
 import type { AdvancePreMergeDeps } from "./pre-merge-routing.ts";
 import {
   claimAndPersistStageAttempt,
@@ -44,7 +43,12 @@ export type RebasePushResult =
   | { ok: true; verified: false; beforeSha: string }
   | { ok: false; reason: string; beforeSha?: string; afterSha?: string };
 
-/** Wait reason when rebase/push succeeded but post-rebase HEAD could not be verified. */
+/** Wait reason when auto-rebase cannot finish — never a human merge-conflict park (#1065). */
+export const CONFLICT_REBASE_UNRESOLVED_REASON = "conflict-rebase-unresolved";
+
+export function conflictRebaseUnresolved(): Outcome {
+  return { advanced: false, status: "waiting", reason: CONFLICT_REBASE_UNRESOLVED_REASON };
+}
 export const REBASE_HEAD_UNVERIFIED_WAIT_REASON =
   "rebase completed; re-evaluating PR head";
 
@@ -104,7 +108,6 @@ export async function recoverFromMergeConflict(
 ): Promise<Outcome> {
   const getForIssueFn = deps.getForIssue ?? getOnDiskForIssue;
   const getPrDetailFn = deps.getPrDetail ?? getPrDetail;
-  const setBlockedFn = deps.setBlocked ?? setBlocked;
   const tryRebaseAndPushFn = deps.tryRebaseAndPush ?? tryRebaseAndPush;
   const rebaseAlreadyAttemptedFn = deps.rebaseAlreadyAttempted ?? rebaseAlreadyAttempted;
   const markRebaseAttemptedFn = deps.markRebaseAttempted ?? markRebaseAttempted;
@@ -145,14 +148,7 @@ export async function recoverFromMergeConflict(
     if (beforeSha && ledgerRunDir) {
       const hydrated = hydrateStageAttemptLedger(ledgerRunDir, ledgerDeps);
       if (!hydrated.ok) {
-        await setBlockedFn(
-          cfg,
-          issueNumber,
-          `PR has a merge conflict; stage-attempt ledger unusable (${hydrated.reason}) — manual rebase needed.`,
-          "pre-merge",
-          "merge-conflict",
-        );
-        return preMergeBlocked("merge conflict", "merge-conflict");
+        return conflictRebaseUnresolved();
       }
       const claimed = claimAndPersistStageAttempt(
         ledgerRunDir,
@@ -165,25 +161,11 @@ export async function recoverFromMergeConflict(
         ledgerDeps,
       );
       if (!claimed.ok) {
-        await setBlockedFn(
-          cfg,
-          issueNumber,
-          `PR has a merge conflict; could not durably claim rebase attempt (${claimed.reason}) — manual rebase needed.`,
-          "pre-merge",
-          "merge-conflict",
-        );
-        return preMergeBlocked("merge conflict", "merge-conflict");
+        return conflictRebaseUnresolved();
       }
       if (!claimed.created && hasAttempted(claimed.ledger, beforeSha, "conflict_rebase")) {
-        // Prior claim — do not re-fire.
-        await setBlockedFn(
-          cfg,
-          issueNumber,
-          "PR has a merge conflict with the base branch that could not be automatically rebased — manual rebase needed.",
-          "pre-merge",
-          "merge-conflict",
-        );
-        return preMergeBlocked("merge conflict", "merge-conflict");
+        // Prior claim — do not re-fire git rebase; do not park as a human gate (#1065).
+        return conflictRebaseUnresolved();
       }
     }
 
@@ -338,14 +320,7 @@ export async function recoverFromMergeConflict(
       }
     }
   }
-  await setBlockedFn(
-    cfg,
-    issueNumber,
-    "PR has a merge conflict with the base branch that could not be automatically rebased — manual rebase needed.",
-    "pre-merge",
-    "merge-conflict",
-  );
-  return preMergeBlocked("merge conflict", "merge-conflict");
+  return conflictRebaseUnresolved();
 }
 
 /**

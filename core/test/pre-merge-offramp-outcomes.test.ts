@@ -124,14 +124,13 @@ test("pre-merge no-PR blocked outcome is residual other (#683)", async (t) => {
   assert.equal(outcomeClass(out), "other");
 });
 
-test("pre-merge merge-conflict blocks with merge-conflict class (#683)", async (t) => {
+test("pre-merge merge-conflict waits unresolved — never parks merge-conflict class (#1065)", async (t) => {
   t.mock.method(console, "log", () => {});
   const deps = makeBaseDeps({
     getPrChecks: async () =>
       [{ name: "ci", bucket: "pass", state: "SUCCESS" }] as Awaited<
         ReturnType<NonNullable<AdvancePreMergeDeps["getPrChecks"]>>
       >,
-    // Fresh re-fetch after CI still conflicting
     getPrDetail: async () =>
       ({ head_sha: SHA_HEAD, mergeable: false, mergeable_state: "DIRTY" }) as Awaited<
         ReturnType<NonNullable<AdvancePreMergeDeps["getPrDetail"]>>
@@ -143,9 +142,10 @@ test("pre-merge merge-conflict blocks with merge-conflict class (#683)", async (
   });
   const out = await advance(makeCfg("github"), 683, {}, deps);
   assert.equal(out.advanced, false);
-  assert.equal(out.status, "blocked");
-  assert.equal(out.blockerKind, "merge-conflict");
-  assert.equal(outcomeClass(out), "merge-conflict");
+  assert.equal(out.status, "waiting");
+  assert.match(String(out.reason ?? ""), /conflict-rebase-unresolved/);
+  assert.notEqual(out.blockerKind, "merge-conflict");
+  assert.notEqual(outcomeClass(out), "merge-conflict");
 });
 
 test("pre-merge active OpenSpec change guard maps to openspec-invalid (#683)", async (t) => {

@@ -434,10 +434,36 @@ test("train (#1023): merge wave is serial with base proof between merges", async
     fetchAtMergeCount.filter((n) => n === 2).length >= 1,
     "fetchBase after second merge for containment",
   );
-  // One multi-item advance wave for the independent frontier (concurrency>1 may
-  // co-advance inside loop; train still issues a single wave call).
-  assert.equal(deps.waveCalls.length, 1);
-  assert.deepEqual(deps.waveCalls[0]!.slice().sort((a, b) => a - b), [1, 2]);
+  // #1063/#1065: merge mode advances one issue at a time so a conflict park
+  // cannot start the next implement (1061→1060 cascade).
+  assert.ok(deps.waveCalls.length >= 2, "merge mode serializes implement waves");
+  assert.deepEqual(deps.waveCalls[0], [1]);
+  assert.ok(deps.waveCalls.some((w) => w.length === 1 && w[0] === 2));
+});
+
+test("train (#1065): merge-conflict block STOPs — later issues are not advanced", async () => {
+  const deps = makeDeps({
+    async advanceIssue(n) {
+      deps.advanceCalls.push(n);
+      const issues = (deps as unknown as { _issues: Map<number, TrainIssueSnapshot> })._issues;
+      if (n === 1) {
+        issues.get(1)!.labels = ["blocked", "pipeline:pre-merge"];
+        return { ok: true, terminal: "blocked", labels: ["blocked", "pipeline:pre-merge"] };
+      }
+      issues.get(n)!.labels = ["pipeline:ready-to-deploy"];
+      return { ok: true, terminal: "ready-to-deploy", labels: ["pipeline:ready-to-deploy"] };
+    },
+  });
+  deps.seedIssue(snap(1, "will conflict"));
+  deps.seedIssue(snap(2, "must not start"));
+  deps.seedPr(1, 101);
+  deps.seedPr(2, 102);
+
+  const result = await runTrain(baseOpts({ issues: [1, 2], merge: true }), deps);
+  assert.deepEqual(deps.waveCalls, [[1]], "must not start #2 after #1 merge-conflict park");
+  assert.equal(deps.mergeCalls.length, 0);
+  assert.equal(result.exitCode, 1);
+  assert.match(result.status.blocker ?? "", /#1|blocked|merge-conflict|STOP/i);
 });
 
 test("train (#1023): production wiring is multi-item loop, not N×single / advanceWaveFromSingle", () => {

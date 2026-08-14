@@ -435,7 +435,7 @@ test("#816 early-conflict recovery does not set proceed memo", async (t) => {
     mergeable: { current: false },
     mergeableState: { current: "DIRTY" },
   });
-  // Rebase already attempted → conflict path blocks without CI.
+  // Rebase already attempted → conflict path waits without CI (#1065).
   deps.rebaseAlreadyAttempted = () => true;
   const pollingCtx: PreMergePollingContext = {};
   const cfg = makeCfg();
@@ -443,7 +443,8 @@ test("#816 early-conflict recovery does not set proceed memo", async (t) => {
   await quiet(t, async () => {
     const out = await runTick(cfg, deps, rec, pollingCtx);
     assert.equal(out.advanced, false);
-    assert.equal(out.status, "blocked");
+    assert.equal(out.status, "waiting");
+    assert.match(String(out.reason ?? ""), /conflict-rebase-unresolved/);
     assert.equal(
       pollingCtx.entryGatesPassedForSha,
       undefined,
@@ -480,8 +481,8 @@ test("#816 memo hit with base-driven DIRTY still takes early-conflict path", asy
     mergeableState.current = "DIRTY";
     const o2 = await runTick(cfg, deps, rec, pollingCtx);
     assert.equal(o2.advanced, false);
-    assert.equal(o2.status, "blocked");
-    assert.equal(o2.reason, "merge conflict");
+    assert.equal(o2.status, "waiting");
+    assert.match(String(o2.reason ?? ""), /conflict-rebase-unresolved/);
     // Head-bound gates skipped (memo hit) but conflict path ran (no CI poll).
     assert.equal(rec.ticks[1]!.getIssueDetail, 0, "memo hit skips SHA gate");
     assert.equal(

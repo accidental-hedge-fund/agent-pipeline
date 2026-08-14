@@ -106,22 +106,22 @@ test("CONFLICTING PR skips the CI poll and rebases (#95)", async (t) => {
   assert.deepEqual(rec.blocked, []);
 });
 
-test("CONFLICTING PR with rebase already attempted blocks, no second rebase (#95)", async (t) => {
+test("CONFLICTING PR with rebase already attempted stays waiting — never parks merge-conflict (#1065)", async (t) => {
   const { deps, rec } = makeDeps({ mergeable: false, mergeable_state: "DIRTY" });
   deps.rebaseAlreadyAttempted = () => true;
   let out;
   await quiet(t, async () => {
     out = await advance(makeCfg(), ISSUE, {}, deps);
   });
-  assert.deepEqual(out, { advanced: false, status: "blocked", reason: "merge conflict", blockerKind: "merge-conflict" });
+  assert.equal(out?.advanced, false);
+  assert.equal(out?.status, "waiting");
+  assert.match(String(out?.reason ?? ""), /conflict-rebase-unresolved/);
+  assert.notEqual((out as { blockerKind?: string }).blockerKind, "merge-conflict");
   assert.equal(rec.ciPolls, 0, "CI checks must never be polled for a conflicting PR");
-  assert.equal(rec.rebaseCalls, 0, "no second rebase attempt once the marker is set");
-  assert.equal(rec.blocked.length, 1);
-  assert.match(rec.blocked[0], /merge conflict/);
-  assert.match(rec.blocked[0], /manual rebase needed/);
+  assert.deepEqual(rec.blocked, [], "merge-conflict must not setBlocked as a human gate");
 });
 
-test("CONFLICTING PR whose rebase fails blocks with a conflict-specific reason (#95)", async (t) => {
+test("CONFLICTING PR whose rebase fails stays waiting — never parks merge-conflict (#1065)", async (t) => {
   const { deps, rec } = makeDeps({ mergeable: false, mergeable_state: "DIRTY" });
   deps.tryRebaseAndPush = async () => {
     rec.rebaseCalls++;
@@ -131,14 +131,13 @@ test("CONFLICTING PR whose rebase fails blocks with a conflict-specific reason (
   await quiet(t, async () => {
     out = await advance(makeCfg(), ISSUE, {}, deps);
   });
-  assert.deepEqual(out, { advanced: false, status: "blocked", reason: "merge conflict", blockerKind: "merge-conflict" });
+  assert.equal(out?.advanced, false);
+  assert.equal(out?.status, "waiting");
+  assert.match(String(out?.reason ?? ""), /conflict-rebase-unresolved/);
+  assert.notEqual((out as { blockerKind?: string }).blockerKind, "merge-conflict");
   assert.equal(rec.ciPolls, 0, "CI checks must never be polled for a conflicting PR");
   assert.equal(rec.rebaseCalls, 1);
-  // #771: consume one-shot budget on fail so the next poll does not thrash rebase.
-  assert.deepEqual(rec.marked, [WT_PATH], "failed conflict rebase still consumes the one-shot marker");
-  assert.equal(rec.blocked.length, 1);
-  assert.match(rec.blocked[0], /merge conflict/);
-  assert.match(rec.blocked[0], /manual rebase needed/);
+  assert.deepEqual(rec.blocked, [], "failed auto-rebase is not a human merge-conflict park");
 });
 
 test("UNKNOWN mergeability does not enter the early-conflict path; CI poll proceeds (#95)", async (t) => {
@@ -218,34 +217,22 @@ test("BLOCKED with rebase marker present does not set merge-conflict block reaso
   assert.equal(rec.rebaseCalls, 0, "must not attempt a second rebase");
 });
 
-test("BEHIND with rebase marker present blocks with a behind-specific reason, not merge-conflict reason (#95)", async (t) => {
-  // Regression for Review 2 finding: BEHIND was mapped to "conflict" by parseMergeable(),
-  // which on a second poll (marker present) would block with "merge conflict — manual rebase
-  // needed" — wrong message for a PR that is just behind the base branch.
-  // After the fix: BEHIND+marker blocks with "branch behind base", not "merge conflict".
+test("BEHIND with rebase marker present waits — never parks merge-conflict (#1065)", async (t) => {
   const { deps, rec } = makeDeps({ mergeable: null, mergeable_state: "BEHIND" });
   deps.rebaseAlreadyAttempted = () => true;
   let out;
   await quiet(t, async () => {
     out = await advance(makeCfg(), ISSUE, {}, deps);
   });
-  const blockedOut = out as { advanced: false; status: "blocked"; reason: string; blockerKind: string };
-  assert.equal(blockedOut.status, "blocked", "marker-present BEHIND must block");
-  assert.match(blockedOut.reason, /behind/, "blocked reason must mention 'behind'");
-  assert.doesNotMatch(blockedOut.reason, /merge conflict/, "blocked reason must NOT say 'merge conflict'");
-  assert.equal(blockedOut.blockerKind, "merge-conflict", "blockerKind must be merge-conflict");
-  assert.equal(rec.blocked.length, 1, "must call setBlocked exactly once");
-  assert.match(rec.blocked[0], /behind/, "block reason must mention 'behind'");
-  assert.doesNotMatch(rec.blocked[0], /merge conflict/, "block reason must NOT mention 'merge conflict'");
+  assert.equal(out?.status, "waiting");
+  assert.match(String(out?.reason ?? ""), /conflict-rebase-unresolved|behind/);
+  assert.notEqual((out as { blockerKind?: string }).blockerKind, "merge-conflict");
+  assert.deepEqual(rec.blocked, [], "must not setBlocked for BEHIND");
   assert.equal(rec.rebaseCalls, 0, "must not attempt a second rebase");
 });
 
 test("post-CI BEHIND invokes tryRebaseAndPush instead of returning waiting indefinitely (#95 review-2 regression)", async (t) => {
-  // Regression: Review 2 found that Step 2 passively returned "waiting" for
-  // BEHIND PRs, leaving repos that require branches to be up-to-date stuck in
-  // pre-merge until ci_timeout. BEHIND must attempt one auto-rebase, not stall.
   const { deps, rec } = makeDeps({ mergeable: null, mergeable_state: "BEHIND" });
-  // Rebase fails (e.g. network issue) — confirm we don't return a waiting outcome.
   deps.tryRebaseAndPush = async () => {
     rec.rebaseCalls++;
     return false;
@@ -256,16 +243,9 @@ test("post-CI BEHIND invokes tryRebaseAndPush instead of returning waiting indef
   });
   assert.equal(rec.ciPolls, 1, "must still poll CI — BEHIND does not bypass early-conflict check");
   assert.equal(rec.rebaseCalls, 1, "BEHIND must invoke tryRebaseAndPush");
-  // #771: consume one-shot budget on fail so the next poll does not thrash rebase.
-  assert.deepEqual(rec.marked, [WT_PATH], "failed BEHIND rebase still consumes the one-shot marker");
-  const blockedOut2 = out as { advanced: false; status: "blocked"; reason: string; blockerKind: string };
-  assert.equal(blockedOut2.status, "blocked");
-  assert.match(blockedOut2.reason, /behind/);
-  assert.doesNotMatch(blockedOut2.reason, /merge conflict/);
-  assert.equal(blockedOut2.blockerKind, "merge-conflict");
-  assert.equal(rec.blocked.length, 1);
-  assert.match(rec.blocked[0], /behind/, "block message must name the root cause");
-  assert.doesNotMatch(rec.blocked[0], /merge conflict/, "must not use merge-conflict wording for an out-of-date branch");
+  assert.equal(out?.status, "waiting");
+  assert.match(String(out?.reason ?? ""), /conflict-rebase-unresolved/);
+  assert.deepEqual(rec.blocked, [], "failed BEHIND rebase is not a human park (#1065)");
 });
 
 test("non-conflicting PR with zero checks (no CI workflow) still advances after grace (#95)", async (t) => {

@@ -78,6 +78,7 @@ import {
   recoverFromMergeConflict,
   resolveRebasePushResult,
   tryRebaseAndPush,
+  conflictRebaseUnresolved,
 } from "./pre-merge-conflict-rebase.ts";
 import {
   performPreMergeAutoFix,
@@ -1125,9 +1126,7 @@ export async function advance(
         };
       }
     }
-    const mergeConflictMsg = "PR branch is behind the base branch and could not be automatically updated — manual rebase or update needed.";
-    await setBlockedFn(cfg, issueNumber, mergeConflictMsg, "pre-merge", "merge-conflict");
-    return preMergeBlocked(mergeConflictMsg, "merge-conflict");
+    return conflictRebaseUnresolved();
   }
   if (freshState === "BLOCKED") {
     return { advanced: false, status: "waiting", reason: "GitHub mergeability: blocked" };
