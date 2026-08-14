@@ -37,14 +37,13 @@ and a “manual rebase needed” reason as the first-conflict terminal.
 
 ### Requirement: Auto-rebase failure emits a clear conflict-specific block reason
 
-When the early-conflict or post-CI conflict path invokes clean auto-rebase and that
-rebase cannot complete without conflict resolution, the pre-merge gate SHALL NOT
-treat that single failure as a human terminal. The gate SHALL keep the managed
-worktree and run bounded conflict resolution. Only after resolution budget
-exhaustion with a still-conflicting tree MAY the gate block — and then with a
-product / engine-owned failure that names conflict files and still identifies the
-unresolved merge conflict as the structural cause, **not** with `BlockerKind`
-`merge-conflict` and the text “manual rebase needed.”
+The pre-merge gate SHALL NOT treat a single clean auto-rebase failure as a human
+terminal when the early-conflict or post-CI conflict path cannot complete without
+conflict resolution. The gate SHALL keep the managed worktree and run bounded
+conflict resolution. Only after resolution budget exhaustion with a still-conflicting
+tree MAY the gate block — and then with a product / engine-owned failure that names
+conflict files and still identifies the unresolved merge conflict as the structural
+cause, **not** with `BlockerKind` `merge-conflict` and the text “manual rebase needed.”
 
 #### Scenario: Auto-rebase fails — block reason names merge conflict
 
@@ -143,10 +142,10 @@ string is produced as the legal terminal for those cases.
 
 ### Requirement: Multi-item advance SHALL NOT abandon an item solely for first-conflict false park
 
-While an item is in pre-merge conflict recovery (clean rebase miss → bounded resolve /
-push / re-enter), multi-item advance / train SHALL NOT treat a first-conflict
-`merge-conflict` human park as a completed disposition that alone authorizes starting
-the next issue while this item remains unmerged because rebase was skipped.
+Multi-item advance / train SHALL NOT treat a first-conflict `merge-conflict` human
+park as a completed disposition that alone authorizes starting the next issue while
+this item remains unmerged because rebase was skipped, while the item is in pre-merge
+conflict recovery (clean rebase miss → bounded resolve / push / re-enter).
 
 #### Scenario: First-conflict recovery does not free the wave by false human park
 
@@ -159,11 +158,11 @@ the next issue while this item remains unmerged because rebase was skipped.
 
 ### Requirement: Conflict resolution is class-level for pre-merge CONFLICTING and DIRTY paths
 
-Both the early-conflict path and the post-CI mergeability re-check path that detect
-true CONFLICTING or DIRTY mergeability SHALL share the same recovery law: clean
-auto-rebase, then bounded resolve, then product-failure only on budget exhaust — never
-first-conflict human manual-rebase park. A path-local fix of only one call site is
-insufficient.
+The early-conflict path and the post-CI CONFLICTING/DIRTY re-check path SHALL share
+the same recovery law: clean auto-rebase, then bounded resolve, then product-failure
+only on budget exhaust — never first-conflict human manual-rebase park. A path-local
+fix of only one call site is insufficient.
+
 
 #### Scenario: Early-conflict and post-CI conflict share non-park recovery
 

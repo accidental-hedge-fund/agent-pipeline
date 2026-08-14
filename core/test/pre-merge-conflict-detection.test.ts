@@ -3,10 +3,22 @@
 // conflict BEFORE the CI poll and route to the rebase path — not poll for
 // checks that can never appear until ci_timeout. Deps are injected via
 // AdvancePreMergeDeps, the same DI pattern as pre-merge-single-ci-cycle.test.ts.
+//
+// #1065: first clean auto-rebase miss escalates to bounded conflict resolve —
+// never parks with BlockerKind `merge-conflict` / “manual rebase needed”.
 
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { advance, type AdvancePreMergeDeps } from "../scripts/stages/pre_merge.ts";
+import {
+  advance,
+  type AdvancePreMergeDeps,
+  MERGE_CONFLICT_MANUAL_REBASE_TERMINAL,
+  CONFLICT_RESOLVE_EXHAUSTED_BLOCKER_KIND,
+  tryResolveAdditiveUnionContent,
+  buildConflictResolveExhaustedReason,
+  isIllegalMergeConflictManualRebaseTerminal,
+  reconcileConflictRebaseState,
+} from "../scripts/stages/pre_merge.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
 const SHA_HEAD = "3333333333333333333333333333333333333333";
@@ -24,8 +36,10 @@ function makeCfg(): PipelineConfig {
 interface Rec {
   ciPolls: number;
   rebaseCalls: number;
+  resolveCalls: number;
   marked: string[];
   blocked: string[];
+  blockedKinds: string[];
 }
 
 type PrDetailFake = Awaited<ReturnType<NonNullable<AdvancePreMergeDeps["getPrDetail"]>>>;
@@ -39,7 +53,7 @@ type PrDetailFake = Awaited<ReturnType<NonNullable<AdvancePreMergeDeps["getPrDet
  * `rebased; CI re-running` / `rebase-resolved; CI re-running`.
  */
 function makeDeps(prDetail: Partial<PrDetailFake>): { deps: AdvancePreMergeDeps; rec: Rec; headSha: { current: string } } {
-  const rec: Rec = { ciPolls: 0, rebaseCalls: 0, marked: [], blocked: [] };
+  const rec: Rec = { ciPolls: 0, rebaseCalls: 0, resolveCalls: 0, marked: [], blocked: [], blockedKinds: [] };
   const headSha = { current: (prDetail.head_sha as string | undefined) ?? SHA_HEAD };
   const deps: AdvancePreMergeDeps = {
     getPrForIssue: async () => PR_NUMBER,
@@ -59,8 +73,9 @@ function makeDeps(prDetail: Partial<PrDetailFake>): { deps: AdvancePreMergeDeps;
     getForIssue: async () => ({ path: WT_PATH, slug: "conflict-detection" }),
     postComment: async () => {},
     transition: async () => {},
-    setBlocked: async (_cfg, _n, reason) => {
+    setBlocked: async (_cfg, _n, reason, _stage, kind) => {
       rec.blocked.push(reason);
+      rec.blockedKinds.push(kind ?? "needs-human");
     },
     tryRebaseAndPush: async () => {
       rec.rebaseCalls++;
@@ -106,39 +121,58 @@ test("CONFLICTING PR skips the CI poll and rebases (#95)", async (t) => {
   assert.deepEqual(rec.blocked, []);
 });
 
-test("CONFLICTING PR with rebase already attempted blocks, no second rebase (#95)", async (t) => {
+test("CONFLICTING PR with clean rebase already attempted escalates resolve — no second clean rebase (#95/#1065)", async (t) => {
   const { deps, rec } = makeDeps({ mergeable: false, mergeable_state: "DIRTY" });
   deps.rebaseAlreadyAttempted = () => true;
+  // Inject exhausted resolve so we see product failure without real git.
+  deps.conflictResolveAttemptedForHead = () => true;
   let out;
   await quiet(t, async () => {
     out = await advance(makeCfg(), ISSUE, {}, deps);
   });
-  assert.deepEqual(out, { advanced: false, status: "blocked", reason: "merge conflict", blockerKind: "merge-conflict" });
+  const blocked = out as { advanced: false; status: "blocked"; reason: string; blockerKind: string };
+  assert.equal(blocked.status, "blocked");
+  assert.equal(blocked.blockerKind, CONFLICT_RESOLVE_EXHAUSTED_BLOCKER_KIND);
+  assert.notEqual(blocked.blockerKind, "merge-conflict");
   assert.equal(rec.ciPolls, 0, "CI checks must never be polled for a conflicting PR");
-  assert.equal(rec.rebaseCalls, 0, "no second rebase attempt once the marker is set");
+  assert.equal(rec.rebaseCalls, 0, "no second clean rebase once the marker is set");
   assert.equal(rec.blocked.length, 1);
-  assert.match(rec.blocked[0], /merge conflict/);
-  assert.match(rec.blocked[0], /manual rebase needed/);
+  assert.equal(isIllegalMergeConflictManualRebaseTerminal(rec.blocked[0]!), false);
+  assert.notEqual(rec.blocked[0], MERGE_CONFLICT_MANUAL_REBASE_TERMINAL);
 });
 
-test("CONFLICTING PR whose rebase fails blocks with a conflict-specific reason (#95)", async (t) => {
+test("CONFLICTING PR whose clean rebase fails escalates to resolve — not merge-conflict park (#95/#1065)", async (t) => {
   const { deps, rec } = makeDeps({ mergeable: false, mergeable_state: "DIRTY" });
   deps.tryRebaseAndPush = async () => {
     rec.rebaseCalls++;
     return false;
   };
+  // Exhaust immediately on resolve (simulates budget miss after clean fail).
+  deps.resolveMergeConflicts = async () => {
+    rec.resolveCalls++;
+    return {
+      status: "exhausted",
+      conflictPaths: ["core/scripts/pipeline.ts"],
+      reason: "injected resolve exhaust",
+    };
+  };
   let out;
   await quiet(t, async () => {
     out = await advance(makeCfg(), ISSUE, {}, deps);
   });
-  assert.deepEqual(out, { advanced: false, status: "blocked", reason: "merge conflict", blockerKind: "merge-conflict" });
+  const blocked = out as { advanced: false; status: "blocked"; reason: string; blockerKind: string };
+  assert.equal(blocked.status, "blocked");
+  assert.equal(blocked.blockerKind, CONFLICT_RESOLVE_EXHAUSTED_BLOCKER_KIND);
+  assert.notEqual(blocked.blockerKind, "merge-conflict");
   assert.equal(rec.ciPolls, 0, "CI checks must never be polled for a conflicting PR");
   assert.equal(rec.rebaseCalls, 1);
-  // #771: consume one-shot budget on fail so the next poll does not thrash rebase.
-  assert.deepEqual(rec.marked, [WT_PATH], "failed conflict rebase still consumes the one-shot marker");
+  assert.equal(rec.resolveCalls, 1, "must enter bounded conflict resolve after clean miss");
+  // Clean miss + resolve both invoke the mark spy (writer is still a no-op).
+  assert.ok(rec.marked.includes(WT_PATH), "conflict path still records markRebaseAttempted spy");
   assert.equal(rec.blocked.length, 1);
-  assert.match(rec.blocked[0], /merge conflict/);
-  assert.match(rec.blocked[0], /manual rebase needed/);
+  assert.match(rec.blocked[0]!, /core\/scripts\/pipeline\.ts/);
+  assert.equal(isIllegalMergeConflictManualRebaseTerminal(rec.blocked[0]!), false);
+  assert.equal(rec.blockedKinds[0], CONFLICT_RESOLVE_EXHAUSTED_BLOCKER_KIND);
 });
 
 test("UNKNOWN mergeability does not enter the early-conflict path; CI poll proceeds (#95)", async (t) => {
@@ -368,5 +402,220 @@ test("getPrChecks throws 'no checks reported' within grace window waits (#882)",
   });
   assert.equal(rec.ciPolls, 1);
   assert.equal(pollingCtx.ciGateEnteredAt, 1_000);
+  assert.deepEqual(rec.blocked, []);
+});
+
+// ---------------------------------------------------------------------------
+// #1065 — never park first-conflict as human merge-conflict
+// ---------------------------------------------------------------------------
+
+test("#1065: first clean auto-rebase miss never setBlocked merge-conflict / manual rebase", async (t) => {
+  const { deps, rec } = makeDeps({ mergeable: false, mergeable_state: "DIRTY" });
+  deps.tryRebaseAndPush = async () => {
+    rec.rebaseCalls++;
+    return false;
+  };
+  deps.resolveMergeConflicts = async () => {
+    rec.resolveCalls++;
+    return {
+      status: "exhausted",
+      conflictPaths: ["core/scripts/pipeline.ts"],
+      reason: "budget",
+    };
+  };
+  let out;
+  await quiet(t, async () => {
+    out = await advance(makeCfg(), ISSUE, {}, deps);
+  });
+  assert.equal(rec.rebaseCalls, 1);
+  assert.equal(rec.resolveCalls, 1);
+  assert.equal(rec.blockedKinds.includes("merge-conflict"), false);
+  for (const reason of rec.blocked) {
+    assert.equal(
+      isIllegalMergeConflictManualRebaseTerminal(reason),
+      false,
+      `illegal terminal reintroduced: ${reason}`,
+    );
+    assert.notEqual(reason, MERGE_CONFLICT_MANUAL_REBASE_TERMINAL);
+  }
+  const blocked = out as { blockerKind?: string; status: string };
+  assert.equal(blocked.status, "blocked");
+  assert.equal(blocked.blockerKind, CONFLICT_RESOLVE_EXHAUSTED_BLOCKER_KIND);
+});
+
+test("#1065: additive help-string union fixture resolves and pushes without blocked", async (t) => {
+  // Models the #1061 / #1064 class: dual-side additive CLI help-string unions.
+  const fixture = [
+    "  pipeline train    Advance base-eligible frontiers",
+    "<<<<<<< HEAD",
+    "  pipeline lineage  Intent lineage and drift-impact graph",
+    "=======",
+    "  pipeline recover-parked  One senior pass then reflow",
+    ">>>>>>> origin/main",
+    "  pipeline status   Read-only status",
+  ].join("\n");
+  const resolved = tryResolveAdditiveUnionContent(fixture);
+  assert.ok(resolved !== null);
+  assert.ok(resolved!.includes("pipeline lineage"));
+  assert.ok(resolved!.includes("pipeline recover-parked"));
+  assert.equal(resolved!.includes("<<<<<<<"), false);
+
+  const { deps, rec, headSha } = makeDeps({ mergeable: false, mergeable_state: "CONFLICTING" });
+  deps.tryRebaseAndPush = async () => {
+    rec.rebaseCalls++;
+    return false;
+  };
+  deps.resolveMergeConflicts = async () => {
+    rec.resolveCalls++;
+    // Simulate successful resolve + push: advance authoritative head.
+    headSha.current = SHA_AFTER_REBASE;
+    return { status: "resolved_and_pushed", afterSha: SHA_AFTER_REBASE };
+  };
+  let out;
+  await quiet(t, async () => {
+    out = await advance(makeCfg(), ISSUE, {}, deps);
+  });
+  assert.deepEqual(out, {
+    advanced: false,
+    status: "waiting",
+    reason: "rebase-resolved; CI re-running",
+  });
+  assert.equal(rec.rebaseCalls, 1);
+  assert.equal(rec.resolveCalls, 1);
+  assert.deepEqual(rec.blocked, []);
+  assert.deepEqual(rec.blockedKinds, []);
+});
+
+test("#1065: successful resolve returns waiting / CI re-running without blocked label", async (t) => {
+  const { deps, rec, headSha } = makeDeps({ mergeable: false, mergeable_state: "DIRTY" });
+  deps.tryRebaseAndPush = async () => {
+    rec.rebaseCalls++;
+    return false;
+  };
+  deps.resolveMergeConflicts = async () => {
+    rec.resolveCalls++;
+    headSha.current = SHA_AFTER_REBASE;
+    return { status: "resolved_and_pushed", afterSha: SHA_AFTER_REBASE };
+  };
+  let out;
+  await quiet(t, async () => {
+    out = await advance(makeCfg(), ISSUE, {}, deps);
+  });
+  assert.deepEqual(out, {
+    advanced: false,
+    status: "waiting",
+    reason: "rebase-resolved; CI re-running",
+  });
+  assert.equal(rec.blocked.length, 0);
+});
+
+test("#1065: budget exhaust with residual conflicts is product failure with paths", async (t) => {
+  const { deps, rec } = makeDeps({ mergeable: false, mergeable_state: "DIRTY" });
+  deps.tryRebaseAndPush = async () => {
+    rec.rebaseCalls++;
+    return false;
+  };
+  deps.resolveMergeConflicts = async () => ({
+    status: "exhausted",
+    conflictPaths: ["core/scripts/pipeline.ts", "core/scripts/types.ts"],
+    reason: "implementer could not finish",
+  });
+  let out;
+  await quiet(t, async () => {
+    out = await advance(makeCfg(), ISSUE, {}, deps);
+  });
+  const blocked = out as { status: string; blockerKind: string; reason: string };
+  assert.equal(blocked.status, "blocked");
+  assert.equal(blocked.blockerKind, CONFLICT_RESOLVE_EXHAUSTED_BLOCKER_KIND);
+  assert.match(blocked.reason, /pipeline\.ts/);
+  assert.match(blocked.reason, /types\.ts/);
+  assert.notEqual(blocked.reason, MERGE_CONFLICT_MANUAL_REBASE_TERMINAL);
+  assert.equal(isIllegalMergeConflictManualRebaseTerminal(blocked.reason), false);
+  assert.equal(rec.blockedKinds[0], "review-findings");
+  assert.equal(isIllegalMergeConflictManualRebaseTerminal(rec.blocked[0]!), false);
+});
+
+test("#1065 regression: #1061 18:07Z terminal text is not a legal first-conflict terminal", async (t) => {
+  // Pure invariant: the recovery path builders and first-conflict outcomes must
+  // never produce the exact legal terminal used in the #1061 park comment.
+  assert.equal(
+    isIllegalMergeConflictManualRebaseTerminal(MERGE_CONFLICT_MANUAL_REBASE_TERMINAL),
+    true,
+  );
+  const product = buildConflictResolveExhaustedReason(["core/scripts/pipeline.ts"]);
+  assert.equal(isIllegalMergeConflictManualRebaseTerminal(product), false);
+  assert.notEqual(product, MERGE_CONFLICT_MANUAL_REBASE_TERMINAL);
+
+  const { deps, rec } = makeDeps({ mergeable: false, mergeable_state: "DIRTY" });
+  deps.tryRebaseAndPush = async () => false;
+  deps.resolveMergeConflicts = async () => ({
+    status: "failed",
+    reason: "could not be automatically rebased — manual rebase needed", // hostile inject
+    conflictPaths: ["x.ts"],
+  });
+  await quiet(t, async () => {
+    await advance(makeCfg(), ISSUE, {}, deps);
+  });
+  // Even if a resolver mis-reports manual-rebase wording, setBlocked kind must
+  // not be merge-conflict and the emitted terminal must not equal the #1061 string
+  // under merge-conflict (product path sanitizes / uses exhausted builder).
+  assert.equal(rec.blockedKinds.includes("merge-conflict"), false);
+  for (const r of rec.blocked) {
+    assert.notEqual(r, MERGE_CONFLICT_MANUAL_REBASE_TERMINAL);
+  }
+});
+
+test("#1065: reconcileConflictRebaseState escalates resolve instead of block_manual_rebase", () => {
+  const first = reconcileConflictRebaseState({ headSha: SHA_HEAD, ledgerAttempted: false });
+  assert.deepEqual(first.actions, [{ kind: "attempt_rebase" }]);
+
+  const afterClean = reconcileConflictRebaseState({ headSha: SHA_HEAD, ledgerAttempted: true });
+  assert.deepEqual(afterClean.actions, [{ kind: "escalate_resolve" }]);
+  assert.equal(
+    afterClean.actions.some((a) => a.kind === "block_manual_rebase"),
+    false,
+  );
+
+  const exhausted = reconcileConflictRebaseState({
+    headSha: SHA_HEAD,
+    ledgerAttempted: true,
+    resolveBudgetExhausted: true,
+  });
+  assert.deepEqual(exhausted.actions, [{ kind: "block_product_failure" }]);
+});
+
+test("#1065: first-conflict recovery waiting does not free wave via false human park", async (t) => {
+  // Multi-item / train: while resolve is in progress (or succeeds to waiting),
+  // the outcome must not be blocked merge-conflict — so disposition cannot treat
+  // a false human park as completed solely because that park fired.
+  const { deps, rec, headSha } = makeDeps({ mergeable: false, mergeable_state: "DIRTY" });
+  deps.tryRebaseAndPush = async () => {
+    rec.rebaseCalls++;
+    return false;
+  };
+  deps.resolveMergeConflicts = async () => {
+    rec.resolveCalls++;
+    return { status: "in_progress", reason: "conflict-resolve in progress; re-entering pre-merge" };
+  };
+  let out;
+  await quiet(t, async () => {
+    out = await advance(makeCfg(), ISSUE, {}, deps);
+  });
+  assert.equal((out as { status: string }).status, "waiting");
+  assert.deepEqual(rec.blocked, []);
+  assert.equal(rec.blockedKinds.includes("merge-conflict"), false);
+
+  // Success path also non-blocked.
+  deps.resolveMergeConflicts = async () => {
+    headSha.current = SHA_AFTER_REBASE;
+    return { status: "resolved_and_pushed", afterSha: SHA_AFTER_REBASE };
+  };
+  deps.tryRebaseAndPush = async () => false;
+  deps.rebaseAlreadyAttempted = () => false;
+  let out2;
+  await quiet(t, async () => {
+    out2 = await advance(makeCfg(), ISSUE, {}, deps);
+  });
+  assert.equal((out2 as { status: string }).status, "waiting");
   assert.deepEqual(rec.blocked, []);
 });

@@ -481,7 +481,10 @@ test("#816 memo hit with base-driven DIRTY still takes early-conflict path", asy
     const o2 = await runTick(cfg, deps, rec, pollingCtx);
     assert.equal(o2.advanced, false);
     assert.equal(o2.status, "blocked");
-    assert.equal(o2.reason, "merge conflict");
+    // #1065: clean-rebase already attempted + missing worktree → product/engine
+    // failure (review-findings), not merge-conflict “manual rebase” park.
+    assert.equal(o2.blockerKind, "review-findings");
+    assert.match(String(o2.reason), /worktree/i);
     // Head-bound gates skipped (memo hit) but conflict path ran (no CI poll).
     assert.equal(rec.ticks[1]!.getIssueDetail, 0, "memo hit skips SHA gate");
     assert.equal(

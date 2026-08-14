@@ -124,7 +124,7 @@ test("pre-merge no-PR blocked outcome is residual other (#683)", async (t) => {
   assert.equal(outcomeClass(out), "other");
 });
 
-test("pre-merge merge-conflict blocks with merge-conflict class (#683)", async (t) => {
+test("pre-merge residual conflict after resolve budget exhausts as product failure, not merge-conflict park (#683/#1065)", async (t) => {
   t.mock.method(console, "log", () => {});
   const deps = makeBaseDeps({
     getPrChecks: async () =>
@@ -140,12 +140,17 @@ test("pre-merge merge-conflict blocks with merge-conflict class (#683)", async (
       ReturnType<NonNullable<AdvancePreMergeDeps["getForIssue"]>>
     >,
     rebaseAlreadyAttempted: () => true,
+    // Resolve budget already spent → product/engine-owned terminal (#1065).
+    conflictResolveAttemptedForHead: () => true,
   });
   const out = await advance(makeCfg("github"), 683, {}, deps);
   assert.equal(out.advanced, false);
   assert.equal(out.status, "blocked");
-  assert.equal(out.blockerKind, "merge-conflict");
-  assert.equal(outcomeClass(out), "merge-conflict");
+  // #1065: residual conflict is review-findings product failure, not merge-conflict
+  // “manual rebase needed” human park. Offramp maps via kind (other for review-findings).
+  assert.equal(out.blockerKind, "review-findings");
+  assert.notEqual(out.blockerKind, "merge-conflict");
+  assert.equal(outcomeClass(out), "other");
 });
 
 test("pre-merge active OpenSpec change guard maps to openspec-invalid (#683)", async (t) => {

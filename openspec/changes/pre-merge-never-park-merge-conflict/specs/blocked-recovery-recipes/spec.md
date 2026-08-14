@@ -2,13 +2,13 @@
 
 ### Requirement: Pre-merge first-conflict recovery SHALL NOT terminate on the merge-conflict manual-rebase recipe
 
-The `BlockerKind` value `merge-conflict` and its `BLOCKER_RECIPES` entry MAY remain
-for surfaces that still park with that kind (for example merge-queue hold
-reporting). The pre-merge true-conflict recovery path (early-conflict and post-CI
-CONFLICTING/DIRTY) SHALL NOT call `setBlocked` with `kind: "merge-conflict"` as the
-terminal outcome of a first clean auto-rebase conflict or solely because the clean
-rebase bound was hit. Therefore the merge-conflict “Rebase… resolve… push…” recipe
-SHALL NOT be the operator-visible terminal for that pre-merge first-conflict case.
+The pre-merge true-conflict recovery path SHALL NOT call `setBlocked` with
+`kind: "merge-conflict"` as the terminal outcome of a first clean auto-rebase conflict
+or solely because the clean rebase bound was hit (early-conflict and post-CI
+CONFLICTING/DIRTY). The `BlockerKind` value `merge-conflict` and its `BLOCKER_RECIPES`
+entry MAY remain for surfaces that still park with that kind (for example merge-queue
+hold reporting). Therefore the merge-conflict “Rebase… resolve… push…” recipe SHALL NOT
+be the operator-visible terminal for that pre-merge first-conflict case.
 
 #### Scenario: First clean auto-rebase miss does not post merge-conflict recipe
 

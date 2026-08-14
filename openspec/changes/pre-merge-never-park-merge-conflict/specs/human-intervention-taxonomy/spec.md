@@ -2,12 +2,12 @@
 
 ### Requirement: Pre-merge base-branch merge conflict is not human authority by default
 
-The reporting kind `merge-conflict-or-branch-drift` (and any projection of a pre-merge
-true CONFLICTING/DIRTY recovery) SHALL remain a metrics / reporting dimension only
-unless a separate current human-authority diagnostic is present. A first clean
-auto-rebase conflict during pre-merge recovery SHALL NOT authorize a human hold,
-`needs-human` authority transition, or suppression of engine-owned conflict
-resolution solely because that reporting kind exists. Engine-owned recovery
+A first clean auto-rebase conflict during pre-merge recovery SHALL NOT authorize a
+human hold, `needs-human` authority transition, or suppression of engine-owned
+conflict resolution solely because a reporting kind exists. The reporting kind
+`merge-conflict-or-branch-drift` (and any projection of a pre-merge true
+CONFLICTING/DIRTY recovery) SHALL remain a metrics / reporting dimension only unless
+a separate current human-authority diagnostic is present. Engine-owned recovery
 (bounded resolve → push → re-enter pre-merge) remains mandatory until resolution
 budget exhaustion maps to a product / engine-owned failure, not a “manual rebase
 needed” human class.
