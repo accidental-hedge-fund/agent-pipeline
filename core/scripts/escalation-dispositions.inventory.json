@@ -63,6 +63,42 @@
       "emitter": "setBlocked"
     },
     {
+      "site_id": "repository-control-drift:needs-human#0",
+      "module": "scripts/repository-control-drift.ts",
+      "line": 1183,
+      "occurrence": 0,
+      "match": "needs-human",
+      "disposition": "deliberately-fail-closed",
+      "blocker_kind": "needs-human",
+      "canonical_reason": "workflow-state",
+      "notes": "fail-closed repository-control drift readiness park (#695); no auto-remediation of forge settings",
+      "emitter": "setBlocked"
+    },
+    {
+      "site_id": "stages.deploy_ready:needs-human#0",
+      "module": "scripts/stages/deploy_ready.ts",
+      "line": 122,
+      "occurrence": 0,
+      "match": "ready-to-deploy",
+      "disposition": "deliberately-fail-closed",
+      "blocker_kind": "needs-human",
+      "canonical_reason": "workflow-state",
+      "notes": "new site — fail-closed until explicit",
+      "emitter": "setBlocked"
+    },
+    {
+      "site_id": "stages.deploy_ready:needs-human#1",
+      "module": "scripts/stages/deploy_ready.ts",
+      "line": 144,
+      "occurrence": 1,
+      "match": "ready-to-deploy",
+      "disposition": "deliberately-fail-closed",
+      "blocker_kind": "needs-human",
+      "canonical_reason": "workflow-state",
+      "notes": "fail-closed repository-control drift readiness park (#695); no auto-remediation of forge settings",
+      "emitter": "setBlocked"
+    },
+    {
       "site_id": "stages.design_gate:no-pull-request#0",
       "module": "scripts/stages/design_gate.ts",
       "line": 291,

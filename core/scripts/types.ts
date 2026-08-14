@@ -1533,6 +1533,20 @@ export interface PipelineConfig {
   git: {
     push_auth: GitPushAuth;
   };
+  /**
+   * Opt-in staged policies (#695). Absent or empty → no lifecycle recording.
+   * States are the closed set draft|observe|required|enforcing|retired.
+   */
+  staged_policies?: Array<{
+    policy_id: string;
+    state: "draft" | "observe" | "required" | "enforcing" | "retired";
+    acceptance?: Record<string, unknown>;
+  }>;
+  /**
+   * Opt-in repository-control desired state (#695). Absent → no drift compare
+   * or readiness gate. Schema version 1 only.
+   */
+  repository_control_desired_state?: import("./repository-control-drift.ts").RepositoryControlDesiredStateV1 | null;
 }
 
 /**
@@ -2355,6 +2369,16 @@ export interface EvidenceBundle {
    * consumers MUST NOT invent `passthrough` for a missing record.
    */
   trusted_surface?: import("./trusted-surface.ts").TrustedSurfaceDecision;
+  /**
+   * In-scope staged policies for this run (#695). Absent or empty when no
+   * staged-policy configuration is active. Each row: policy_id, state, policy_hash.
+   */
+  staged_policies?: import("./stage-policy-lifecycle.ts").StagedPolicyEvidenceRow[];
+  /**
+   * Repository-control drift compare results for this run (#695). Absent when
+   * desired state is not configured. Never invents in_sync for missing reads.
+   */
+  repository_control_drift?: import("./repository-control-drift.ts").RepositoryControlDriftResult[];
 }
 
 /** Pre-merge delta-round accounting (#483): the item's durable delta-round

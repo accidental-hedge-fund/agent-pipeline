@@ -32,7 +32,7 @@ const DISPATCH_KEYWORDS = [
   "release", "ship", "intake", "decompose", "sweep", "triage", "merge", "merge-queue", "train",
   "refine-spec", "logs", "summary", "path", "config", "run", "single", "improve",
   "scoreboard", "outcomes", "roadmap", "loop", "correction", "report", "engine-promote",
-  "factory-gate", "factory-release", "factory-pin",
+  "factory-gate", "factory-release", "factory-pin", "controls",
 ];
 
 test("command-registry: every recognized dispatch keyword has a registry entry", () => {

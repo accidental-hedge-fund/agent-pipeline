@@ -256,6 +256,13 @@ export const COMMAND_DOCS: Record<string, CommandDoc> = {
     documented: true,
     section: "config",
   },
+  controls: {
+    summary:
+      "Read-only repository-control drift check against configured desired state (#695); never mutates forge settings",
+    usage: "controls check [--json] [--strict]",
+    documented: true,
+    section: "observability",
+  },
   "refine-spec": {
     summary: "Refine an existing issue's spec; non-mutating JSON output",
     usage: 'refine-spec --title "<t>" --body "<b>"',

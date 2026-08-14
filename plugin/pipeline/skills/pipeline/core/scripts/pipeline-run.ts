@@ -2222,6 +2222,45 @@ export async function runAdvance(
             await patchBundleIdentity(stateDir, issueNumber, identityPatch).catch(() => {});
           }
           const finalized = await finalizeBundle(stateDir, issueNumber, finalStage);
+          // Staged policies + repository-control drift evidence (#695): record when
+          // configured. Best-effort live compare; never invents policies when absent.
+          try {
+            const { createStagedPolicy, toPolicyEvidenceRow } = await import("./stage-policy-lifecycle.ts");
+            const {
+              runControlsCheck,
+            } = await import("./repository-control-drift.ts");
+            const { ghRunForTest } = await import("./gh.ts");
+            if (cfg.staged_policies?.length) {
+              finalized.staged_policies = cfg.staged_policies.map((p) =>
+                toPolicyEvidenceRow(
+                  createStagedPolicy(p.policy_id, p.acceptance ?? {}, p.state),
+                ),
+              );
+            }
+            if (cfg.repository_control_desired_state) {
+              const desired = cfg.repository_control_desired_state;
+              const staged = (cfg.staged_policies ?? []).map((p) =>
+                createStagedPolicy(p.policy_id, p.acceptance ?? {}, p.state),
+              );
+              const lifecycle =
+                desired.policy_id != null
+                  ? staged.find((p) => p.policy_id === desired.policy_id)?.state ?? null
+                  : null;
+              const check = await runControlsCheck(
+                {
+                  desired,
+                  lifecycle_state: lifecycle,
+                  staged_policies: staged,
+                },
+                { ghRun: (args, runOpts) => ghRunForTest(args, runOpts) },
+              );
+              if (check.results.length > 0) {
+                finalized.repository_control_drift = check.results;
+              }
+            }
+          } catch {
+            // Non-fatal: missing desired state or live-read failure must not abort finalize.
+          }
           // Run-store finalization (#155): write summary.json + run_complete event before
           // notifyBundlePath so that finalizeRun does not overwrite the notifiedAt stamp
           // that markNotified writes to evidence.json (finding #5).

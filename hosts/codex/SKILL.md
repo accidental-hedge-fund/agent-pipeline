@@ -107,6 +107,7 @@ $pipeline refine-spec --title "<t>" --body "<b>" Refine an existing issue's spec
 $pipeline roadmap [--apply] [--next <n>]        Analyze open backlog into a dependency-aware scored roadmap; under SemVer, dry-run lists full milestone reconciliation actions and --apply converges open issues to the reviewed manifest (fingerprint-gated)
 $pipeline sweep [--apply] [--repo owner/name]   Batch re-spec thin issues and reconcile ROADMAP.md
 $pipeline triage <n> --stage ready|backlog      Set a pre-pipeline stage label (ready or backlog) on an issue
+$pipeline controls check [--json] [--strict]    Read-only repository-control drift check against configured desired state (#695); never mutates forge settings
 $pipeline correction record|attribute …         Record a correction event or attribute a control (append-only local ledger)
 $pipeline logs [<run-id>] [--events] [-f] [--no-until-terminal] List or stream pipeline run logs (events --follow exits 0 on terminal run_complete)
 $pipeline outcomes ingest|list [--adapter github] [--fixture <path>] [--days <n>] [--retention-days <n>] [--dry-run] [--json] Ingest or list production/rework outcomes linked to pipeline runs (host-local store; #576). R2D alone is never production delivery; free text is redacted; no GitHub mutations

@@ -1,7 +1,7 @@
 // Terminal stage. Posts a final summary on the issue, removes the worktree.
 // Idempotent — safe to call multiple times.
 
-import { addLabelToPr, getIssueDetail, getPrForIssue, postComment, postPrComment } from "../gh.ts";
+import { addLabelToPr, getIssueDetail, getPrForIssue, ghRunForTest, postComment, postPrComment, setBlocked } from "../gh.ts";
 import { attestPipelineComment } from "./review-parsing.ts";
 import { LABEL_PREFIX } from "../types.ts";
 import {
@@ -18,6 +18,15 @@ import {
   type RunStoreDeps,
 } from "../run-store.ts";
 import { allowsReadyToDeploy } from "../trusted-surface.ts";
+import {
+  disposeCompareResult,
+  parkFailClosedRepositoryControlDrift,
+  runControlsCheck,
+} from "../repository-control-drift.ts";
+import {
+  createStagedPolicy,
+  type PolicyLifecycleState,
+} from "../stage-policy-lifecycle.ts";
 
 /** Injectable seams for {@link finalize} unit tests (#759). */
 export interface FinalizeDeps {
@@ -69,6 +78,83 @@ export async function finalize(
   deps: FinalizeDeps = {},
 ): Promise<Outcome> {
   const storeDeps = runStoreDeps ?? defaultRunStoreDeps;
+
+  // Repository-control drift gate (#695): only when desired state is configured.
+  // Observation / fail_open never block; enforcing + fail_closed blocks on non-in_sync.
+  // No automatic forge remediation — parks with typed reason via setBlocked.
+  if (cfg.repository_control_desired_state) {
+    const desired = cfg.repository_control_desired_state;
+    const staged = (cfg.staged_policies ?? []).map((p) =>
+      createStagedPolicy(
+        p.policy_id,
+        p.acceptance ?? {},
+        p.state as PolicyLifecycleState,
+      ),
+    );
+    const lifecycle =
+      desired.policy_id != null
+        ? staged.find((p) => p.policy_id === desired.policy_id)?.state ?? null
+        : null;
+    try {
+      const check = await runControlsCheck(
+        {
+          desired,
+          lifecycle_state: lifecycle,
+          staged_policies: staged,
+        },
+        {
+          ghRun: (args, runOpts) => ghRunForTest(args, runOpts),
+        },
+      );
+      const result = check.results[0];
+      const decision =
+        check.decisions[0] ??
+        (result
+          ? disposeCompareResult({
+              result,
+              desired,
+              lifecycle_state: lifecycle,
+            })
+          : null);
+      if (decision?.blocks_readiness && result) {
+        await parkFailClosedRepositoryControlDrift(issueNumber, decision, result, {
+          setBlocked: async ({ issueNumber: n, reason }) => {
+            await setBlocked(cfg, n, reason, "ready-to-deploy", "needs-human");
+          },
+        });
+        console.log(
+          `[pipeline] #${issueNumber}: ready-to-deploy refused — repository-control drift ` +
+            `${result.outcome} (${decision.reason_code ?? "unknown"})`,
+        );
+        return {
+          advanced: false,
+          status: "blocked",
+          reason: `repository-control drift fail-closed: ${decision.reason_code ?? result.outcome}`,
+          blockerKind: "needs-human",
+        };
+      }
+    } catch (err) {
+      // Fail closed only when risk_class is fail_closed and lifecycle is enforcing;
+      // otherwise record and continue (compare errors must not invent in_sync).
+      const risk = desired.risk_class ?? "observation";
+      if (lifecycle === "enforcing" && risk === "fail_closed") {
+        const reason =
+          `repository-control drift fail-closed: live compare failed (${(err as Error).message}). ` +
+          `Agent Pipeline does not auto-remediate forge settings.`;
+        await setBlocked(cfg, issueNumber, reason, "ready-to-deploy", "needs-human");
+        return {
+          advanced: false,
+          status: "blocked",
+          reason,
+          blockerKind: "needs-human",
+        };
+      }
+      console.log(
+        `[pipeline] #${issueNumber}: repository-control drift check error (non-blocking for ` +
+          `${lifecycle ?? "unbound"}/${risk}): ${(err as Error).message}`,
+      );
+    }
+  }
 
   // Trusted-surface fail-closed (#691): current runs with a runDir MUST have a
   // durable decision. Missing decision is not treated as historical passthrough
