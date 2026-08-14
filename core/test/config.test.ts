@@ -4612,10 +4612,11 @@ test("resolveConfig: reasoning.on_unsupported must be the literal 'record' (#434
 });
 
 // ---------------------------------------------------------------------------
-// Staged policies (#695): enforcing requires fully validated lineage (review 1c974526)
+// Staged policies (#695): enforcing requires verified promotion provenance
+// (delta 66803fac) — config-declared lineage can never mint enforcing.
 // ---------------------------------------------------------------------------
 
-test("resolveConfig: staged_policies bare state enforcing is rejected without lineage", async () => {
+test("resolveConfig: staged_policies bare state enforcing is rejected", async () => {
   await expectInvalidConfig(
     [
       "staged_policies:",
@@ -4624,11 +4625,11 @@ test("resolveConfig: staged_policies bare state enforcing is rejected without li
       "",
     ].join("\n"),
     "acme/pol-enforcing-bare",
-    /enforcing.*lineage|lineage.*enforcing|cannot invent enforcing/i,
+    /verified promotion provenance|config-declared lineage cannot mint authority/i,
   );
 });
 
-test("resolveConfig: staged_policies bare retired is rejected without lineage", async () => {
+test("resolveConfig: staged_policies bare retired is rejected", async () => {
   await expectInvalidConfig(
     [
       "staged_policies:",
@@ -4637,7 +4638,7 @@ test("resolveConfig: staged_policies bare retired is rejected without lineage", 
       "",
     ].join("\n"),
     "acme/pol-retired-bare",
-    /retired.*lineage|cannot invent retired/i,
+    /verified promotion provenance|retired/i,
   );
 });
 
@@ -4694,7 +4695,7 @@ test("resolveConfig: staged_policies forged single-head enforcing lineage is rej
       "",
     ].join("\n"),
     "acme/pol-enforcing-forged-head",
-    /complete predecessor chain|self-attested|draft→observe→required→enforcing/i,
+    /verified promotion provenance|config-declared lineage cannot mint authority/i,
   );
 });
 
@@ -4736,11 +4737,11 @@ test("resolveConfig: staged_policies enforcing with forged arbitrary hashes is r
       "",
     ].join("\n"),
     "acme/pol-enforcing-forged-hashes",
-    /recomputed hash|forged or stale/i,
+    /verified promotion provenance|config-declared lineage cannot mint authority/i,
   );
 });
 
-test("resolveConfig: staged_policies enforcing with full validated lineage is accepted", async () => {
+test("resolveConfig: staged_policies enforcing with full validated lineage is REJECTED (#695 66803fac)", async () => {
   const { computeStagedPolicyHash } = await import("../scripts/stage-policy-lifecycle.ts");
   const acceptance = { gate: true };
   const policyId = "repo-controls";
@@ -4778,7 +4779,10 @@ test("resolveConfig: staged_policies enforcing with full validated lineage is ac
         ].join("\n"),
     )
     .join("\n");
-  const cfg = (await resolveWithConfig(
+  // A locally-consistent config lineage with recomputed hashes + evidence_refs +
+  // claimed authority is NOT independent promotion evidence: config load must
+  // reject static enforcing (delta 66803fac).
+  await expectInvalidConfig(
     [
       "staged_policies:",
       "  - policy_id: repo-controls",
@@ -4790,18 +4794,8 @@ test("resolveConfig: staged_policies enforcing with full validated lineage is ac
       "",
     ].join("\n"),
     "acme/pol-enforcing-lineage",
-  )) as {
-    staged_policies?: Array<{
-      policy_id: string;
-      state: string;
-      lineage?: Array<{ to_state: string; authority: { actor: string; role: string } | null }>;
-    }>;
-  };
-  assert.ok(cfg.staged_policies);
-  assert.equal(cfg.staged_policies![0]!.state, "enforcing");
-  assert.equal(cfg.staged_policies![0]!.lineage?.length, 3);
-  assert.equal(cfg.staged_policies![0]!.lineage![2]!.to_state, "enforcing");
-  assert.equal(cfg.staged_policies![0]!.lineage![2]!.authority?.actor, "operator");
+    /verified promotion provenance|config-declared lineage cannot mint authority/i,
+  );
 });
 
 test("resolveConfig: staged_policies enforcing lineage without authority is rejected", async () => {
@@ -4845,7 +4839,7 @@ test("resolveConfig: staged_policies enforcing lineage without authority is reje
       "",
     ].join("\n"),
     "acme/pol-enforcing-no-auth",
-    /authority/i,
+    /verified promotion provenance|config-declared lineage cannot mint authority|authority/i,
   );
 });
 
@@ -4872,6 +4866,6 @@ test("resolveConfig: staged_policies unauthorized retirement is rejected", async
       "",
     ].join("\n"),
     "acme/pol-retired-no-auth",
-    /authority|retired/i,
+    /verified promotion provenance|authority|retired/i,
   );
 });

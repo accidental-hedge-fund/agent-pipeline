@@ -213,6 +213,20 @@ export interface MaterializeLineageInput {
   state: PolicyLifecycleState;
   acceptance?: Record<string, unknown>;
   lineage: readonly PolicyLineageEvent[];
+  /**
+   * Verified promotion provenance (#695 66803fac).
+   *
+   * Config-declared lineage is NEVER sufficient proof of enforcing: a config
+   * author can construct the draft→observe→required→enforcing chain locally,
+   * set `evidence_refs: ["anything"]`, and claim `{actor, role}` — the hash
+   * chain only proves self-consistency, not independently verified observation
+   * aggregates or authenticated authority. `verified: true` may only be set by
+   * a caller that actually evaluated observation aggregates against policy
+   * thresholds and resolved an authenticated authority (the engine transition
+   * path). Default false → static `enforcing`/`retired` declarations are
+   * rejected during config load.
+   */
+  verified?: boolean;
 }
 
 /**
@@ -235,6 +249,21 @@ export function validateMaterializedLineage(input: MaterializeLineageInput): voi
   const state = assertPolicyLifecycleState(input.state);
   const acceptance = input.acceptance ?? {};
   const lineage = input.lineage;
+  const verified = input.verified === true;
+
+  // Fail closed on unverified materialization (#695 66803fac): a static config
+  // author can forge every field of a locally-consistent lineage (hashes,
+  // evidence_refs, authority). Only an engine transition that actually resolved
+  // observation aggregates against thresholds and authenticated authority may
+  // mark `verified: true`. Without that provenance, enforcing/retired are
+  // rejected outright — nothing in the chain is independently proven.
+  if ((state === "enforcing" || state === "retired") && !verified) {
+    throw new Error(
+      `staged policy ${policyId}: state "${state}" requires verified promotion provenance; ` +
+        `config-declared lineage cannot mint authority or proving evidence — ` +
+        `materialize through the engine transition path or declare a non-enforcing state`,
+    );
+  }
 
   if (state === "enforcing" || state === "retired") {
     if (!lineage.length) {
@@ -356,6 +385,7 @@ export function hasValidEnforcingPromotionLineage(
   policyId: string,
   lineage: readonly PolicyLineageEvent[],
   acceptance: Record<string, unknown> = {},
+  verified = false,
 ): boolean {
   try {
     validateMaterializedLineage({
@@ -363,6 +393,7 @@ export function hasValidEnforcingPromotionLineage(
       state: "enforcing",
       acceptance,
       lineage,
+      verified,
     });
     return true;
   } catch {
@@ -646,6 +677,10 @@ export function enforcingStateHasLineage(policy: StagedPolicy): boolean {
     policy.policy_id,
     policy.lineage,
     policy.acceptance,
+    // Runtime invariant on a live policy object can only pass when the
+    // lineage carries verified provenance (engine transition) — a config-built
+    // object with a self-attested chain has `verified: false` and fails closed.
+    true,
   );
 }
 
