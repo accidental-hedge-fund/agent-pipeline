@@ -15,7 +15,7 @@ They only map intent → `pipeline` CLI. They are **not** a second control plane
 | Script | Purpose |
 |---|---|
 | **`tugboat.sh`** | **Option 1 primary ship composer (Buzz / agent-box):** train → release → wait CI green → release finish → wait GitHub Release → `engine-promote --host all`. Detach + `--status`. No grant factory, no second ship brain. |
-| `ship-notify.sh` | Optional Buzz status posts; **no-op** without messenger env (shared with Tugboat) |
+| `ship-notify.sh` | Optional Buzz status posts; **no-op** without messenger env (shared with Tugboat). Retries transient send failures; audits under `$PIPELINE_SUPERVISOR_STATE/notify/` (`audit.log`, `failed/*`); still exit 0 so ship never blocks on delivery. |
 | `ship-stage-watch.sh` | Stream one explicit run event file through `material-filter.mjs` (shared) |
 | `train-status-complete.py` | Pure helper: last `train_status` complete gate from mixed prose+JSON (`raw_decode`) |
 | `release-checks-green.py` | Pure helper: release PR checks green from `gh pr checks --json` (`bucket` schema) |
@@ -63,6 +63,12 @@ tugboat --milestone v1.37.0 --status
 
 Required env for a mutating ship: `REPO_DIR`, `PIPELINE`, `ALLOW_MERGE=1`.  
 Optional: `ENGINE_PROMOTE_HOST` (default `all`), `SHIP_NOTIFY`, wait budgets.
+
+If Buzz is quiet during a ship, check
+`$PIPELINE_SUPERVISOR_STATE/notify/audit.log` and `notify/failed/` (default state
+root `~/.local/state/pipeline-supervisor`). Reinstall `ship-notify` from
+`examples/supervisor/shell/` with the same sibling install loop after `main`
+moves — host copies are not auto-updated.
 
 **Not in Option 1 scope:** grant factory, MessagingPort / ship-auth issuer, shared NL platform, Option 2 in-engine `pipeline ship` as the Buzz path. See issue #927 / epic #1001.
 

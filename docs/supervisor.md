@@ -268,7 +268,12 @@ repo example content) and
 
 **Notify policy:** observational only; notification failures must not alter ship
 phase decisions. Prefer shared `ship-notify.sh` / `ship-stage-watch.sh` siblings
-— one install set, not dual divergent binaries.
+— one install set, not dual divergent binaries. `ship-notify` retries transient
+messenger failures (default 3 attempts), appends `notify/audit.log`, and writes
+`notify/failed/*` markers on final failure while still exiting 0. When Buzz is
+quiet, inspect `$PIPELINE_SUPERVISOR_STATE/notify/` before assuming silence means
+“never invoked.” Keep `~/.local/bin/ship-notify` in sync with
+`examples/supervisor/shell/ship-notify.sh` after merge.
 
 Historical context for the v1.33 ship and v1.34 notifier-attribution incident:
 [runbooks/session-2026-08-ship-factory-lessons.md](./runbooks/session-2026-08-ship-factory-lessons.md).
