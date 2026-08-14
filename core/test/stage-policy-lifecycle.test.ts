@@ -597,6 +597,8 @@ test("config-declared enforcing with full validated lineage is REJECTED (#695 66
   runtime = promoteTo(runtime, "required");
   runtime = promoteTo(runtime, "enforcing");
   assert.equal(runtime.state, "enforcing");
+  assert.equal(runtime.promotion_provenance?.kind, "engine-transition");
+  assert.equal(runtime.promotion_provenance?.actor, "operator");
   assert.equal(enforcingStateHasLineage(runtime), true);
   validateMaterializedLineage({
     policy_id: runtime.policy_id,
@@ -605,6 +607,34 @@ test("config-declared enforcing with full validated lineage is REJECTED (#695 66
     lineage: runtime.lineage,
     verified: true,
   });
+});
+
+test("forged StagedPolicy with valid lineage but no provenance fails invariant (#695 delta)", () => {
+  // A caller can hand-construct a structurally valid enforcing policy with the
+  // full draft→…→enforcing chain — but without engine-attested provenance it
+  // must NOT satisfy the enforcing invariant.
+  const acceptance = { gate: true };
+  const lineage = buildLegalEnforcingLineage("p1", acceptance);
+  const forged: StagedPolicy = {
+    policy_id: "p1",
+    state: "enforcing",
+    acceptance,
+    lineage,
+  };
+  assert.equal(forged.promotion_provenance, undefined);
+  assert.equal(enforcingStateHasLineage(forged), false);
+  // Stale provenance token (hash mismatch) also fails closed.
+  const stale: StagedPolicy = {
+    ...forged,
+    promotion_provenance: {
+      kind: "engine-transition",
+      policy_hash: "0".repeat(64),
+      actor: "operator",
+      role: "policy-admin",
+      observed_at: AT,
+    },
+  };
+  assert.equal(enforcingStateHasLineage(stale), false);
 });
 
 test("authorized retirement lineage is accepted via verified; bare retired is not", () => {

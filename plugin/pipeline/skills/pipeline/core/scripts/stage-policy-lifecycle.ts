@@ -141,6 +141,18 @@ export interface PolicyLineageEvent {
   evidence_refs: string[];
 }
 
+export interface StagedPolicyPromotionProvenance {
+  /** Only the engine transition path may produce this kind. */
+  kind: "engine-transition";
+  /** effectivePolicyHash at the moment promotion into enforcing was evaluated. */
+  policy_hash: string;
+  /** Authenticated authority that authorized the promotion. */
+  actor: string;
+  role: string;
+  /** ISO 8601 observed-at of the transition evaluation. */
+  observed_at: string;
+}
+
 export interface StagedPolicy {
   policy_id: string;
   state: PolicyLifecycleState;
@@ -148,6 +160,15 @@ export interface StagedPolicy {
   acceptance: Record<string, unknown>;
   /** Append-only lineage; never rewrite or delete entries. */
   lineage: PolicyLineageEvent[];
+  /**
+   * Engine-attested promotion provenance (#695 66803fac). Absent for config
+   * materialization; only set by evaluateLifecycleTransition when a promotion
+   * into `enforcing` actually evaluated observation aggregates against policy
+   * thresholds and resolved an authenticated authority. Config-declared
+   * lineage can never carry this token, so a forged StagedPolicy object does
+   * not satisfy the enforcing invariant.
+   */
+  promotion_provenance?: StagedPolicyPromotionProvenance | null;
 }
 
 /**
@@ -450,6 +471,8 @@ export function createStagedPolicy(
     state,
     acceptance: { ...acceptance },
     lineage: lineageCopy,
+    // Config/materialize can never mint promotion provenance (#695 66803fac).
+    promotion_provenance: null,
   };
 }
 
@@ -656,6 +679,20 @@ export function evaluateLifecycleTransition(input: TransitionInput): TransitionR
     acceptance: acceptanceAfter,
     // Append-only: copy prior events byte-stable, then append.
     lineage: [...input.policy.lineage, event],
+    // Engine-attested promotion provenance (#695 66803fac): only the transition
+    // path that actually evaluated observation aggregates against thresholds
+    // and resolved an authenticated authority may attach this token. Config
+    // materialization never sets it.
+    promotion_provenance:
+      to === "enforcing" && authorityPresent(input.authority)
+        ? {
+            kind: "engine-transition",
+            policy_hash: hashAfter,
+            actor: (input.authority as PolicyAuthorityRecord).actor,
+            role: (input.authority as PolicyAuthorityRecord).role,
+            observed_at: input.at,
+          }
+        : null,
   };
 
   return { ok: true, policy: next, event };
@@ -667,19 +704,21 @@ export function hasEnforcingLineage(policy: StagedPolicy): boolean {
 }
 
 /**
- * Invariant check: an enforcing effective state MUST have a fully validated
- * promotion lineage (complete path, recomputed hashes, authority, evidence).
- * Returns false when the invariant is broken (config bypass or forged record).
+ * Invariant check: an enforcing effective state MUST carry engine-attested
+ * promotion provenance (transition-evaluated observation + authority) AND a
+ * fully validated promotion lineage. Returns false when the invariant is
+ * broken (config bypass or forged record).
  */
 export function enforcingStateHasLineage(policy: StagedPolicy): boolean {
   if (policy.state !== "enforcing") return true;
+  const prov = policy.promotion_provenance;
+  if (!prov || prov.kind !== "engine-transition") return false;
+  // Provenance must match the current hash — a stale/forged token fails closed.
+  if (prov.policy_hash !== effectivePolicyHash(policy)) return false;
   return hasValidEnforcingPromotionLineage(
     policy.policy_id,
     policy.lineage,
     policy.acceptance,
-    // Runtime invariant on a live policy object can only pass when the
-    // lineage carries verified provenance (engine transition) — a config-built
-    // object with a self-attested chain has `verified: false` and fails closed.
     true,
   );
 }
