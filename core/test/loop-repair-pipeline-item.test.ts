@@ -268,6 +268,101 @@ test("repair_pipeline_item charges a clean model no-op as failure instead of cla
   assert.equal(result.succeeded, false);
   assert.equal(cleared, false);
   assert.match(result.error ?? "", /no verifiable candidate change/);
+  assert.match(result.error ?? "", /category=noop-clean/);
+  assert.match(result.error ?? "", /status=noop-clean/);
+  assert.match(result.error ?? "", /diagnostic=no changes/);
+});
+
+test("repair_pipeline_item #1060: harness error with diagnostic is category harness-error with tail", async () => {
+  const execute = createRepairPipelineItemExecutor(cfg(), {
+    getOnDiskForIssue: async () => ({ path: "/repo/.worktrees/42", slug: "repair" }),
+    gitInWorktree: async () => ({ code: 0, stdout: `${HEAD}\n`, stderr: "" }),
+    getIssueDetail: async () => ({
+      number: 42,
+      type: "issue",
+      title: "Repair archive",
+      body: "",
+      state: "open",
+      url: "https://example.test/42",
+      labels: ["blocked"],
+    }),
+    performRepair: async () => ({
+      status: "error",
+      diagnostic: "implementer crashed: exit 1\nstderr: stacktrace line 99",
+    }),
+  });
+  const result = await execute(input());
+  assert.equal(result.succeeded, false);
+  assert.match(result.error ?? "", /status=error/);
+  assert.match(result.error ?? "", /category=harness-error/);
+  assert.match(result.error ?? "", /implementer crashed/);
+  assert.match(result.error ?? "", /did not produce a committed and pushed repair/);
+  assert.notEqual(
+    result.error,
+    "configured implementer did not produce a committed and pushed repair for " + HEAD,
+    "must not collapse to generic-only string",
+  );
+});
+
+test("repair_pipeline_item #1060: bare error with residual porcelain is dirt-blocked with path summary", async () => {
+  const execute = createRepairPipelineItemExecutor(cfg(), {
+    getOnDiskForIssue: async () => ({ path: "/repo/.worktrees/42", slug: "repair" }),
+    gitInWorktree: async (_dir, args) => {
+      if (args[0] === "rev-parse" && args[1] === "HEAD") {
+        return { code: 0, stdout: `${HEAD}\n`, stderr: "" };
+      }
+      if (args[0] === "status") {
+        return {
+          code: 0,
+          stdout: "?? artifacts/challenge-response-599.json\n M core/scripts/identity.ts\n",
+          stderr: "",
+        };
+      }
+      if (args[0] === "update-ref") return { code: 0, stdout: "", stderr: "" };
+      return { code: 0, stdout: `${HEAD}\n`, stderr: "" };
+    },
+    getIssueDetail: async () => ({
+      number: 42,
+      type: "issue",
+      title: "Repair archive",
+      body: "",
+      state: "open",
+      url: "https://example.test/42",
+      labels: ["blocked"],
+    }),
+    // Bare pre-dirty-style error with no diagnostic (historical autofix shape).
+    performRepair: async () => ({ status: "error" }),
+  });
+  const result = await execute(input());
+  assert.equal(result.succeeded, false);
+  assert.match(result.error ?? "", /category=dirt-blocked/);
+  assert.match(result.error ?? "", /engine-scratch:artifacts\/challenge-response-599\.json|product:core\/scripts\/identity\.ts/);
+  assert.match(result.error ?? "", /status=error/);
+});
+
+test("repair_pipeline_item #1060: no diagnostic and clean tree is category no-diagnostic", async () => {
+  const execute = createRepairPipelineItemExecutor(cfg(), {
+    getOnDiskForIssue: async () => ({ path: "/repo/.worktrees/42", slug: "repair" }),
+    gitInWorktree: async (_dir, args) => {
+      if (args[0] === "status") return { code: 0, stdout: "", stderr: "" };
+      return { code: 0, stdout: `${HEAD}\n`, stderr: "" };
+    },
+    getIssueDetail: async () => ({
+      number: 42,
+      type: "issue",
+      title: "Repair archive",
+      body: "",
+      state: "open",
+      url: "https://example.test/42",
+      labels: ["blocked"],
+    }),
+    performRepair: async () => ({ status: "error" }),
+  });
+  const result = await execute(input());
+  assert.equal(result.succeeded, false);
+  assert.match(result.error ?? "", /category=no-diagnostic/);
+  assert.match(result.error ?? "", /no diagnostic was captured/);
+  assert.match(result.error ?? "", /status=error/);
 });
 
 test("repair_pipeline_item hard-syncs a present-but-stale worktree when the remote still holds the claimed head", async () => {

@@ -608,9 +608,21 @@ async function supersedeStartedRecoveryAttempts(
   return next;
 }
 
+/** #1060: findings prep unlink fall-through evidence (prep-complete or not-applicable). */
+export function isReviewFindingsPrepFallthrough(evidence: string, error?: string): boolean {
+  const text = `${evidence}\n${error ?? ""}`;
+  return (
+    /prep-complete for review-findings/i.test(text) ||
+    /prep not-applicable for review-findings/i.test(text) ||
+    (/unlink_engine_scratch/i.test(text) && /trying next recipe/i.test(text) && /no (?:current )?engine-scratch/i.test(text))
+  );
+}
+
 /** Claims one deterministic action before executing it. Existing `started`
  *  claims are replayed after process death without charging another budget
- *  unit; a fresh claim requires reconciled head/PR identity. */
+ *  unit; a fresh claim requires reconciled head/PR identity.
+ *  #1060: after review-findings prep unlink fall-through, continues in the same
+ *  cycle to claim/execute `repair_pipeline_item` (forceNextAction). */
 async function executeBlockedRecovery(
   deps: SupervisorDeps,
   contractInput: LoopContract,
@@ -618,6 +630,7 @@ async function executeBlockedRecovery(
   token: string,
   engine: LoopEngineName,
   itemId: string,
+  options?: { forceNextAction?: RecoveryRecipe },
 ): Promise<RecoveryExecutionResult> {
   // A pre-#509 contract/ledger carries no recovery_policy/recovery_attempts
   // field — route both through the pure upgraders before any recovery access.
@@ -787,9 +800,26 @@ async function executeBlockedRecovery(
     const executableRecipes = hasCandidateHead
       ? policy.recipes
       : policy.recipes.filter((recipe) => recipe !== "repair_pipeline_item");
-    const action = executableRecipes.length > 0
-      ? executableRecipes[matchingAttempts.length % executableRecipes.length]
-      : undefined;
+    // #1060: same-sequence continuation forces repair after findings prep unlink.
+    // Also prefer repair when the last matching attempt was already findings prep
+    // unlink (avoids modulo re-picking free unlink after scratch is gone).
+    const lastMatching = matchingAttempts[matchingAttempts.length - 1];
+    const preferRepairAfterFindingsPrep =
+      item.blocked_theme === "review-findings" &&
+      lastMatching?.action === "unlink_engine_scratch" &&
+      hasCandidateHead &&
+      executableRecipes.includes("repair_pipeline_item");
+    const forced =
+      options?.forceNextAction && executableRecipes.includes(options.forceNextAction)
+        ? options.forceNextAction
+        : undefined;
+    const action = forced
+      ? forced
+      : preferRepairAfterFindingsPrep
+        ? "repair_pipeline_item"
+        : executableRecipes.length > 0
+          ? executableRecipes[matchingAttempts.length % executableRecipes.length]
+          : undefined;
     if (!action) {
       ledger = await stopForRecoveryPreflight(
         deps,
@@ -1012,6 +1042,29 @@ async function executeBlockedRecovery(
     succeeded: execution.succeeded,
     error: execution.error,
   });
+
+  // #1060: review-findings prep unlink is never terminal recover. After
+  // prep-complete or not-applicable fall-through, claim and run repair in this
+  // same blocked-recovery cycle so implementer budget is not delayed a cycle.
+  if (
+    !execution.succeeded &&
+    attempt.action === "unlink_engine_scratch" &&
+    attempt.class === "review-findings" &&
+    isReviewFindingsPrepFallthrough(execution.evidence, execution.error) &&
+    options?.forceNextAction !== "repair_pipeline_item"
+  ) {
+    const continued = await executeBlockedRecovery(
+      deps,
+      contract,
+      runId,
+      token,
+      engine,
+      itemId,
+      { forceNextAction: "repair_pipeline_item" },
+    );
+    return { ledger: continued.ledger, attempted: true };
+  }
+
   return { ledger: completed.ledger, attempted: true };
 }
 

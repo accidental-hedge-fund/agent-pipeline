@@ -1974,9 +1974,11 @@ export function realExecuteRecovery(
   };
 
   /**
-   * #1020 / #1028: deterministic unlink of engine-owned non-product scratch.
-   * Ordered ahead of repair_pipeline_item for workflow-engine-defect. Does not
-   * invoke the implementer; product dirt fails closed so later recipes run.
+   * #1020 / #1028 / #1060: deterministic unlink of engine-owned non-product scratch.
+   * - workflow-engine-defect: terminal scratch-only recover (unlink + clear blocked).
+   * - review-findings: preparatory only — unlink when present, never clear blocked,
+   *   never succeed as findings recovery; fall through so repair_pipeline_item runs.
+   * Does not invoke the implementer; product dirt fails closed so later recipes run.
    */
   const unlinkEngineScratch = async (
     input: ExecuteRecoveryInput,
@@ -1989,6 +1991,7 @@ export function realExecuteRecovery(
     if (input.blockerClass === "specification-decision" || input.blockerClass === "missing-authority") {
       return failed(`unlink_engine_scratch does not apply to human-authority class ${input.blockerClass}`);
     }
+    const findingsPrep = input.blockerClass === "review-findings";
     const wt = await getWorktree(cfg, issueNumber);
     if (!wt) {
       return failed(`unlink_engine_scratch: no managed worktree for #${issueNumber}`);
@@ -2014,9 +2017,12 @@ export function realExecuteRecovery(
     // Require current engine-scratch evidence. Clean porcelain or non-scratch
     // workflow-engine failures must fall through to restart/repair — never
     // clear blocked solely because the tree is already clean (#1028 review).
+    // #1060 findings prep: same not-applicable fall-through so repair still runs.
     if (classified.untrackedScratch.length === 0) {
       return failed(
-        `unlink_engine_scratch: no current engine-scratch paths; not scratch-only evidence — trying next recipe`,
+        findingsPrep
+          ? `unlink_engine_scratch: prep not-applicable for review-findings (no engine-scratch paths) — trying next recipe`
+          : `unlink_engine_scratch: no current engine-scratch paths; not scratch-only evidence — trying next recipe`,
       );
     }
     const unlinked: string[] = [];
@@ -2048,7 +2054,18 @@ export function realExecuteRecovery(
         `unlink_engine_scratch: scratch paths remain after clean (${after.untrackedScratch.join(", ")})`,
       );
     }
-    // Clear mechanical blocked when present (scratch-only cause).
+
+    // #1060: under review-findings, unlink is preparatory only. Do not clear
+    // pipeline:blocked, do not file sibling as recovered, do not succeed —
+    // same-sequence controller continues to repair_pipeline_item.
+    if (findingsPrep) {
+      return failed(
+        `unlink_engine_scratch: prep-complete for review-findings; removed engine scratch ` +
+          `[${unlinked.join(", ")}] — findings still require repair_pipeline_item (trying next recipe)`,
+      );
+    }
+
+    // Clear mechanical blocked when present (scratch-only workflow-engine-defect cause).
     let before: Awaited<ReturnType<typeof getIssueDetail>>;
     try {
       before = await getDetail(cfg, issueNumber);
