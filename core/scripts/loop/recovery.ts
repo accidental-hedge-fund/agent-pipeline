@@ -638,6 +638,18 @@ function recoveryCandidateIdentity(
   return explicit || `block:${repeatedEvidenceCount}:${evidenceFingerprint}`;
 }
 
+/**
+ * #1060: preparatory `unlink_engine_scratch` under `review-findings` is free of
+ * class retry budget and repeated-evidence accounting. Only substantive recipes
+ * (today: `repair_pipeline_item`) charge those budgets for this class.
+ */
+export function isReviewFindingsPrepUnlink(
+  blockerClass: string | undefined,
+  action: string | undefined,
+): boolean {
+  return blockerClass === "review-findings" && action === "unlink_engine_scratch";
+}
+
 /** Durably claims exactly one recovery action before its external side effect.
  *  The claim consumes one class-budget unit whether the later action succeeds,
  *  fails, or the process dies. Replaying the same deterministic identity after
@@ -685,20 +697,22 @@ export async function startRecoveryAttempt(
   const remaining = item.recovery_budgets_remaining[blockerClass] ?? policyEntry.retry_budget;
   // #1060: preparatory unlink under review-findings is free of the class retry
   // budget so three implementer repair attempts remain after scratch prep.
-  const isFindingsPrepUnlink =
-    blockerClass === "review-findings" && input.action === "unlink_engine_scratch";
-  const outcome: RecoveryAttemptOutcome = remaining <= 0 ? "exhausted" : "started";
-  const budgetRemaining = isFindingsPrepUnlink
+  const findingsPrep = isReviewFindingsPrepUnlink(blockerClass, input.action);
+  const outcome: RecoveryAttemptOutcome = remaining <= 0 && !findingsPrep ? "exhausted" : "started";
+  const budgetRemaining = findingsPrep
     ? remaining
     : Math.max(0, remaining - (outcome === "started" ? 1 : 0));
+  // Free prep must not advance backoff for subsequent substantive recipes, or a
+  // same-sequence repair would inherit an extra backoff step from the prep claim.
   const priorClassAttempts = ledger.recovery_attempts.filter(
     (attempt) =>
       attempt.item_id === input.itemId &&
       attempt.class === blockerClass &&
-      attempt.evidence_fingerprint === evidenceFingerprint,
+      attempt.evidence_fingerprint === evidenceFingerprint &&
+      !isReviewFindingsPrepUnlink(attempt.class, attempt.action),
   ).length;
   // Prep unlink runs immediately (no backoff) so same-sequence repair can follow.
-  const backoffSeconds = isFindingsPrepUnlink
+  const backoffSeconds = findingsPrep
     ? 0
     : Math.min(
         policyEntry.backoff.max_seconds,
@@ -732,7 +746,7 @@ export async function startRecoveryAttempt(
       : {}),
   };
   ledger.recovery_attempts.push(attempt);
-  if (outcome === "started" && !isFindingsPrepUnlink) {
+  if (outcome === "started" && !findingsPrep) {
     item.recovery_budgets_remaining[blockerClass] = budgetRemaining;
   }
 
@@ -778,23 +792,44 @@ export async function completeRecoveryAttempt(
     throw new LoopError("validation", `recovery attempt "${input.attemptId}" no longer matches the blocked candidate for item "${input.itemId}"`);
   }
 
+  // #1060: prep unlink fall-through is intentionally non-success so the
+  // supervisor can claim repair next, but it must never bill repeated-evidence
+  // (only blockItem increments that count, after a successful recover + re-block).
+  // Capture and restore so a future "increment on failed recovery" change cannot
+  // silently charge free findings prep.
+  const findingsPrep = isReviewFindingsPrepUnlink(attempt.class, attempt.action);
+  const repeatedEvidenceBefore = item.repeated_evidence_count;
+
   const time = deps.now().toISOString();
   attempt.completed_at = time;
   if (input.succeeded) {
-    attempt.outcome = "recovered";
-    attempt.status = "recovered";
-    attempt.terminal_outcome = "success";
-    delete attempt.error;
-    delete attempt.last_error;
-    item.state = "in_progress";
-    item.history.push({
-      time,
-      from: "blocked",
-      to: "in_progress",
-      engine: input.engine,
-      theme: attempt.class,
-      note: `recovery action "${attempt.action}" completed (${attempt.budget_remaining} of class "${attempt.class}" remaining)`,
-    });
+    // Findings prep must never resume as recovered — fall-through is failure only.
+    if (findingsPrep) {
+      attempt.outcome = "failed";
+      attempt.status = "failed";
+      attempt.terminal_outcome = "failed";
+      const err =
+        input.error?.trim() ||
+        `recovery action "${attempt.action}" is preparatory for review-findings and cannot mark recovery success`;
+      attempt.error = err;
+      attempt.last_error = err;
+      item.repeated_evidence_count = repeatedEvidenceBefore;
+    } else {
+      attempt.outcome = "recovered";
+      attempt.status = "recovered";
+      attempt.terminal_outcome = "success";
+      delete attempt.error;
+      delete attempt.last_error;
+      item.state = "in_progress";
+      item.history.push({
+        time,
+        from: "blocked",
+        to: "in_progress",
+        engine: input.engine,
+        theme: attempt.class,
+        note: `recovery action "${attempt.action}" completed (${attempt.budget_remaining} of class "${attempt.class}" remaining)`,
+      });
+    }
   } else {
     attempt.outcome = "failed";
     attempt.status = "failed";
@@ -802,6 +837,9 @@ export async function completeRecoveryAttempt(
     const err = input.error?.trim() || `recovery action "${attempt.action}" failed without error detail`;
     attempt.error = err;
     attempt.last_error = err;
+    if (findingsPrep) {
+      item.repeated_evidence_count = repeatedEvidenceBefore;
+    }
   }
 
   await writeLedger(deps, ledger, input.token);

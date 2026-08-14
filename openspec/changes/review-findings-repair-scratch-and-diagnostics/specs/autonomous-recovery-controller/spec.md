@@ -35,7 +35,9 @@ Controller semantics for preparatory unlink under this class SHALL be:
 
 - **WHEN** class is `review-findings` and preparatory `unlink_engine_scratch` runs (scratch removed or not-applicable)
 - **THEN** `recovery_budgets_remaining` for `review-findings` SHALL be unchanged by that prep step
+- **AND** `repeated_evidence_count` for the item SHALL be unchanged by that prep step (including on failed completion)
 - **AND** a following `repair_pipeline_item` claim in the same sequence SHALL still be able to charge against the full configured class retry budget
+- **AND** preparatory fall-through failures SHALL NOT exhaust `repeated_evidence_limit` before the configured implementer repair attempts complete
 
 #### Scenario: No-scratch findings path still reaches repair
 

@@ -16,6 +16,7 @@ import {
   completeRecoveryAttempt,
   recoverItem,
   recoveryAttemptId,
+  isReviewFindingsPrepUnlink,
   isRunFatalBlocked,
   eligibleIndependentItems,
   initRecoverableRun,
@@ -1036,6 +1037,138 @@ test("startRecoveryAttempt #1060: findings prep unlink does not charge retry bud
   assert.equal(repair.attempt.outcome, "started");
   assert.equal(repair.attempt.budget_remaining, 2, "only the repair claim charges one unit");
   assert.equal(repair.ledger.items[itemId].recovery_budgets_remaining["review-findings"], 2);
+});
+
+test("completeRecoveryAttempt #1060: prep failure does not charge repeated-evidence; full repair budget remains", async () => {
+  assert.equal(isReviewFindingsPrepUnlink("review-findings", "unlink_engine_scratch"), true);
+  assert.equal(isReviewFindingsPrepUnlink("review-findings", "repair_pipeline_item"), false);
+  assert.equal(isReviewFindingsPrepUnlink("workflow-engine-defect", "unlink_engine_scratch"), false);
+
+  const { deps, contract, token } = await setup();
+  const itemId = contract.items[0].id;
+  const evidence = "blocking review finding for repeated-evidence accounting";
+  const fingerprint = fingerprintEvidence(evidence);
+  const ledger = await readLedger(deps, "run-1");
+  const item = ledger.items[itemId];
+  item.state = "blocked";
+  item.blocked_theme = "review-findings";
+  item.evidence_fingerprint = fingerprint;
+  item.repeated_evidence_count = 0;
+  item.recovery_budgets_remaining = { "review-findings": 3 };
+  item.history.push({
+    time: "2026-08-14T00:00:00.000Z",
+    from: "in_progress",
+    to: "blocked",
+    engine: "claude",
+    theme: "review-findings",
+    evidence,
+  });
+  await writeLedger(deps, ledger, token);
+
+  // Two prep fall-through completions (scratch removed + no-scratch) must leave
+  // repeated_evidence_count and retry budget untouched.
+  for (const [i, err] of [
+    "unlink_engine_scratch: prep-complete for review-findings; removed engine scratch [artifacts/challenge-response-1.json] — findings still require repair_pipeline_item (trying next recipe)",
+    "unlink_engine_scratch: prep not-applicable for review-findings (no engine-scratch paths) — trying next recipe",
+  ].entries()) {
+    const prep = await startRecoveryAttempt(deps, contract, {
+      runId: "run-1",
+      token,
+      itemId,
+      engine: "claude",
+      action: "unlink_engine_scratch",
+      candidateIdentity: `head=${"a".repeat(40)}|prep=${i}`,
+    });
+    assert.equal(prep.attempt.outcome, "started");
+    const completed = await completeRecoveryAttempt(deps, contract, {
+      runId: "run-1",
+      token,
+      itemId,
+      engine: "claude",
+      attemptId: prep.attempt.attempt_id,
+      succeeded: false,
+      error: err,
+    });
+    assert.equal(completed.attempt.outcome, "failed");
+    assert.equal(
+      completed.ledger.items[itemId].repeated_evidence_count,
+      0,
+      "prep fall-through must not increment repeated_evidence_count",
+    );
+    assert.equal(
+      completed.ledger.items[itemId].recovery_budgets_remaining["review-findings"],
+      3,
+      "prep fall-through must not charge retry budget",
+    );
+  }
+
+  // Succeeded:true on findings prep must also refuse to resume (and not bill evidence).
+  const roguePrep = await startRecoveryAttempt(deps, contract, {
+    runId: "run-1",
+    token,
+    itemId,
+    engine: "claude",
+    action: "unlink_engine_scratch",
+    candidateIdentity: `head=${"a".repeat(40)}|prep=rogue`,
+  });
+  const rogueDone = await completeRecoveryAttempt(deps, contract, {
+    runId: "run-1",
+    token,
+    itemId,
+    engine: "claude",
+    attemptId: roguePrep.attempt.attempt_id,
+    succeeded: true,
+  });
+  assert.equal(rogueDone.attempt.outcome, "failed", "findings prep cannot mark recovered");
+  assert.equal(rogueDone.ledger.items[itemId].state, "blocked");
+  assert.equal(rogueDone.ledger.items[itemId].repeated_evidence_count, 0);
+
+  // Full configured retry_budget of 3 repair claims must still start — only
+  // substantive repairs charge the class budget; prep failures never exhaust
+  // repeated_evidence_limit (limit 2) by themselves.
+  const limit = contract.recovery_policy["review-findings"].repeated_evidence_limit;
+  assert.equal(limit, 2);
+  for (let i = 0; i < 3; i++) {
+    const repair = await startRecoveryAttempt(deps, contract, {
+      runId: "run-1",
+      token,
+      itemId,
+      engine: "claude",
+      action: "repair_pipeline_item",
+      candidateIdentity: `head=${"a".repeat(40)}|repair=${i}`,
+    });
+    assert.equal(
+      repair.attempt.outcome,
+      "started",
+      `repair claim ${i + 1}/3 must start after free prep failures`,
+    );
+    assert.equal(
+      repair.ledger.items[itemId].repeated_evidence_count ?? 0,
+      0,
+      "repair claims alone must not raise repeated_evidence_count",
+    );
+    assert.ok(
+      (repair.ledger.items[itemId].repeated_evidence_count ?? 0) < limit,
+      "prep+repair failures must not park via repeated_evidence_limit before implementer budget is used",
+    );
+    await completeRecoveryAttempt(deps, contract, {
+      runId: "run-1",
+      token,
+      itemId,
+      engine: "claude",
+      attemptId: repair.attempt.attempt_id,
+      succeeded: false,
+      error: "fixture repair failure",
+    });
+  }
+  const final = await readLedger(deps, "run-1");
+  assert.equal(final.items[itemId].recovery_budgets_remaining["review-findings"], 0);
+  assert.equal(final.items[itemId].repeated_evidence_count, 0);
+  assert.equal(
+    final.recovery_attempts.filter((a) => a.action === "repair_pipeline_item" && a.outcome === "failed").length,
+    3,
+    "exactly three substantive repair failures charged the retry budget",
+  );
 });
 
 test("upgradeContractForRecovery: custom entries keep their policy while legacy auth action is renamed", () => {

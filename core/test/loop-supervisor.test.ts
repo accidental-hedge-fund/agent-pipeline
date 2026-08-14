@@ -5196,6 +5196,65 @@ test("regression #1060: findings prep not-applicable still same-sequence repairs
   assert.equal(finalLedger.items["100"].state, "blocked", "unlink alone must not recover findings");
 });
 
+test("regression #1060: supervisor prep fall-through does not raise repeated-evidence or starve repair", async () => {
+  // Same-sequence prep→repair: prep failure must leave repeated_evidence_count
+  // untouched and charge only one retry-budget unit for the repair claim.
+  // (Full three-repair budget accounting is covered in loop-recovery.test.ts.)
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const seeded = blockedReviewRecoveryItem("100");
+  seeded.repeated_evidence_count = 0;
+  seeded.recovery_budgets_remaining = { "review-findings": 3 };
+  const ledger = testLedger({ "100": seeded });
+  const { deps } = await setup(contract, ledger);
+  const observe = blockedRecoveryObserve();
+  const actions: string[] = [];
+  const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async (input) => {
+    actions.push(input.action);
+    if (input.action === "unlink_engine_scratch") {
+      return {
+        succeeded: false,
+        evidence:
+          "unlink_engine_scratch: prep not-applicable for review-findings (no engine-scratch paths) — trying next recipe",
+        error:
+          "unlink_engine_scratch: prep not-applicable for review-findings (no engine-scratch paths) — trying next recipe",
+      };
+    }
+    return { succeeded: false, evidence: "repair failed", error: "repair failed" };
+  };
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  await runSupervisorCycle(
+    {
+      store: deps,
+      observe,
+      dispatchItem: async () => {
+        throw new Error("blocked item must not redispatch until recovered");
+      },
+      executeRecovery,
+    },
+    "run-1",
+    token,
+    "claude",
+  );
+  assert.deepEqual(actions, ["unlink_engine_scratch", "repair_pipeline_item"]);
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.items["100"].state, "blocked");
+  assert.equal(
+    finalLedger.items["100"].repeated_evidence_count ?? 0,
+    0,
+    "prep fall-through + failed repair must not increment repeated_evidence_count",
+  );
+  assert.equal(
+    finalLedger.items["100"].recovery_budgets_remaining["review-findings"],
+    2,
+    "only the repair claim charges one unit of retry_budget 3",
+  );
+  assert.ok(
+    (finalLedger.items["100"].repeated_evidence_count ?? 0) <
+      DEFAULT_RECOVERY_POLICY["review-findings"].repeated_evidence_limit,
+    "must remain under repeated_evidence_limit so further implementer repairs can claim",
+  );
+});
+
 /** Observe fake for the coexistence-guard tests: blocked items sit mid-pipeline
  *  (mirrors the seeded-blocked fake at "pipeline:review-1") with an observable
  *  local head so the recovery preflight can bind a candidate identity. */
