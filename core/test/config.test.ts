@@ -4610,3 +4610,97 @@ test("resolveConfig: reasoning.on_unsupported must be the literal 'record' (#434
     /on_unsupported/,
   );
 });
+
+// ---------------------------------------------------------------------------
+// Staged policies (#695): enforcing requires validated lineage (review b24e688e)
+// ---------------------------------------------------------------------------
+
+test("resolveConfig: staged_policies bare state enforcing is rejected without lineage", async () => {
+  await expectInvalidConfig(
+    [
+      "staged_policies:",
+      "  - policy_id: repo-controls",
+      "    state: enforcing",
+      "",
+    ].join("\n"),
+    "acme/pol-enforcing-bare",
+    /enforcing.*lineage|lineage.*enforcing/i,
+  );
+});
+
+test("resolveConfig: staged_policies observe without lineage is accepted", async () => {
+  const cfg = (await resolveWithConfig(
+    [
+      "staged_policies:",
+      "  - policy_id: repo-controls",
+      "    state: observe",
+      "    acceptance:",
+      "      gate: true",
+      "",
+    ].join("\n"),
+    "acme/pol-observe",
+  )) as {
+    staged_policies?: Array<{ policy_id: string; state: string; acceptance?: Record<string, unknown> }>;
+  };
+  assert.ok(cfg.staged_policies);
+  assert.equal(cfg.staged_policies![0]!.policy_id, "repo-controls");
+  assert.equal(cfg.staged_policies![0]!.state, "observe");
+});
+
+test("resolveConfig: staged_policies enforcing with validated lineage is accepted", async () => {
+  const cfg = (await resolveWithConfig(
+    [
+      "staged_policies:",
+      "  - policy_id: repo-controls",
+      "    state: enforcing",
+      "    acceptance:",
+      "      gate: true",
+      "    lineage:",
+      "      - policy_id: repo-controls",
+      "        from_state: required",
+      "        to_state: enforcing",
+      "        policy_hash_before: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "        policy_hash_after: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "        at: \"2026-08-14T00:00:00.000Z\"",
+      "        authority:",
+      "          actor: operator",
+      "          role: policy-admin",
+      "        evidence_refs: []",
+      "",
+    ].join("\n"),
+    "acme/pol-enforcing-lineage",
+  )) as {
+    staged_policies?: Array<{
+      policy_id: string;
+      state: string;
+      lineage?: Array<{ to_state: string; authority: { actor: string; role: string } | null }>;
+    }>;
+  };
+  assert.ok(cfg.staged_policies);
+  assert.equal(cfg.staged_policies![0]!.state, "enforcing");
+  assert.ok(cfg.staged_policies![0]!.lineage?.length);
+  assert.equal(cfg.staged_policies![0]!.lineage![0]!.to_state, "enforcing");
+  assert.equal(cfg.staged_policies![0]!.lineage![0]!.authority?.actor, "operator");
+});
+
+test("resolveConfig: staged_policies enforcing lineage without authority is rejected", async () => {
+  await expectInvalidConfig(
+    [
+      "staged_policies:",
+      "  - policy_id: repo-controls",
+      "    state: enforcing",
+      "    lineage:",
+      "      - policy_id: repo-controls",
+      "        from_state: required",
+      "        to_state: enforcing",
+      "        policy_hash_before: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "        policy_hash_after: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "        at: \"2026-08-14T00:00:00.000Z\"",
+      "        authority: null",
+      "        evidence_refs: []",
+      "",
+    ].join("\n"),
+    "acme/pol-enforcing-no-auth",
+    /enforcing.*lineage|lineage.*enforcing|authority/i,
+  );
+});

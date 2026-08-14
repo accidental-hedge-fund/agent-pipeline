@@ -11,9 +11,11 @@ import {
 import {
   assertPolicyLifecycleState,
   type PolicyLifecycleState,
+  type PolicyLineageEvent,
   type StagedPolicy,
   type StagedPolicyEvidenceRow,
   toPolicyEvidenceRow,
+  assertEnforcingLineage,
 } from "./stage-policy-lifecycle.ts";
 import {
   sha256Hex,
@@ -331,6 +333,58 @@ export interface StagedPolicyConfigDecl {
   policy_id: string;
   state: PolicyLifecycleState;
   acceptance?: Record<string, unknown>;
+  lineage?: PolicyLineageEvent[];
+}
+
+function parseLineageEvents(raw: unknown, policyId: string): PolicyLineageEvent[] {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) {
+    throw new Error(`staged_policies[].lineage for ${policyId} must be an array`);
+  }
+  return raw.map((item, i) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      throw new Error(`staged_policies[].lineage[${i}] must be an object`);
+    }
+    const e = item as Record<string, unknown>;
+    const from_state = assertPolicyLifecycleState(e.from_state);
+    const to_state = assertPolicyLifecycleState(e.to_state);
+    if (typeof e.policy_id !== "string" || !e.policy_id.trim()) {
+      throw new Error(`staged_policies[].lineage[${i}].policy_id is required`);
+    }
+    if (typeof e.policy_hash_before !== "string" || !e.policy_hash_before.trim()) {
+      throw new Error(`staged_policies[].lineage[${i}].policy_hash_before is required`);
+    }
+    if (typeof e.policy_hash_after !== "string" || !e.policy_hash_after.trim()) {
+      throw new Error(`staged_policies[].lineage[${i}].policy_hash_after is required`);
+    }
+    if (typeof e.at !== "string" || !e.at.trim()) {
+      throw new Error(`staged_policies[].lineage[${i}].at is required`);
+    }
+    let authority: PolicyLineageEvent["authority"] = null;
+    if (e.authority != null) {
+      if (typeof e.authority !== "object" || Array.isArray(e.authority)) {
+        throw new Error(`staged_policies[].lineage[${i}].authority must be an object or null`);
+      }
+      const a = e.authority as Record<string, unknown>;
+      if (typeof a.actor !== "string" || !a.actor.trim() || typeof a.role !== "string" || !a.role.trim()) {
+        throw new Error(`staged_policies[].lineage[${i}].authority requires non-empty actor and role`);
+      }
+      authority = { actor: a.actor.trim(), role: a.role.trim() };
+    }
+    const evidence_refs = Array.isArray(e.evidence_refs)
+      ? e.evidence_refs.filter((r): r is string => typeof r === "string")
+      : [];
+    return {
+      policy_id: e.policy_id.trim(),
+      from_state,
+      to_state,
+      policy_hash_before: e.policy_hash_before,
+      policy_hash_after: e.policy_hash_after,
+      at: e.at,
+      authority,
+      evidence_refs,
+    };
+  });
 }
 
 export function parseStagedPolicyDecl(raw: unknown): StagedPolicyConfigDecl {
@@ -341,12 +395,21 @@ export function parseStagedPolicyDecl(raw: unknown): StagedPolicyConfigDecl {
   if (typeof o.policy_id !== "string" || !o.policy_id.trim()) {
     throw new Error("staged_policies[].policy_id is required");
   }
+  const policy_id = o.policy_id.trim();
   const state = assertPolicyLifecycleState(o.state);
   const acceptance =
     o.acceptance && typeof o.acceptance === "object" && !Array.isArray(o.acceptance)
       ? (o.acceptance as Record<string, unknown>)
       : {};
-  return { policy_id: o.policy_id.trim(), state, acceptance };
+  const lineage = parseLineageEvents(o.lineage, policy_id);
+  // Fail closed: enforcing without validated promotion lineage is rejected.
+  assertEnforcingLineage(policy_id, state, lineage);
+  return {
+    policy_id,
+    state,
+    acceptance,
+    ...(lineage.length > 0 ? { lineage } : {}),
+  };
 }
 
 // ---------------------------------------------------------------------------

@@ -1187,6 +1187,8 @@ const PartialConfigSchema = z.object({
       "Trusted-surface path coverage (#691). Only additive extra_paths are accepted; built-in classes remain engine-defined.",
     ),
   // Staged policy lifecycle (#695). Opt-in; absent → no policy lifecycle recording.
+  // state "enforcing" is rejected unless lineage includes a validated promotion
+  // event (required → enforcing with named authority) — see superRefine below.
   staged_policies: z
     .array(
       z
@@ -1199,12 +1201,65 @@ const PartialConfigSchema = z.object({
             .record(z.string(), z.unknown())
             .optional()
             .describe("Acceptance-relevant slice folded into policy_hash."),
+          lineage: z
+            .array(
+              z
+                .object({
+                  policy_id: z.string().min(1),
+                  from_state: z.enum(["draft", "observe", "required", "enforcing", "retired"]),
+                  to_state: z.enum(["draft", "observe", "required", "enforcing", "retired"]),
+                  policy_hash_before: z.string().min(1),
+                  policy_hash_after: z.string().min(1),
+                  at: z.string().min(1),
+                  authority: z
+                    .object({
+                      actor: z.string().min(1),
+                      role: z.string().min(1),
+                    })
+                    .strict()
+                    .nullable(),
+                  evidence_refs: z.array(z.string()).default([]),
+                })
+                .strict(),
+            )
+            .optional()
+            .describe(
+              "Append-only lineage. Required when state is enforcing: must include required→enforcing with named authority.",
+            ),
         })
-        .strict(),
+        .strict()
+        .superRefine((p, ctx) => {
+          if (p.state !== "enforcing") return;
+          const lineage = p.lineage ?? [];
+          const ok = lineage.some(
+            (e) =>
+              e.policy_id === p.policy_id &&
+              e.from_state === "required" &&
+              e.to_state === "enforcing" &&
+              e.authority != null &&
+              typeof e.authority.actor === "string" &&
+              e.authority.actor.trim().length > 0 &&
+              typeof e.authority.role === "string" &&
+              e.authority.role.trim().length > 0 &&
+              e.policy_hash_after.trim().length > 0 &&
+              e.at.trim().length > 0,
+          );
+          if (!ok) {
+            ctx.addIssue({
+              code: "custom",
+              message:
+                `state "enforcing" requires validated lineage entry into enforcing ` +
+                `(from_state "required", non-empty authority actor+role, policy_hash_after, at); ` +
+                `static config cannot place a policy into enforcing without promotion evidence`,
+              path: ["state"],
+            });
+          }
+        }),
     )
     .optional()
     .describe(
-      "Opt-in staged policies (#695). States: draft|observe|required|enforcing|retired. Absent/empty → no lifecycle gate.",
+      "Opt-in staged policies (#695). States: draft|observe|required|enforcing|retired. " +
+        "enforcing requires lineage with a required→enforcing promotion event and named authority. Absent/empty → no lifecycle gate.",
     ),
   // Repository-control desired state (#695). Opt-in; absent → no drift compare.
   repository_control_desired_state: z
@@ -2098,6 +2153,15 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
             policy_id: p.policy_id,
             state: p.state,
             ...(p.acceptance !== undefined ? { acceptance: { ...p.acceptance } } : {}),
+            ...(p.lineage !== undefined
+              ? {
+                  lineage: p.lineage.map((e) => ({
+                    ...e,
+                    authority: e.authority ? { ...e.authority } : null,
+                    evidence_refs: [...(e.evidence_refs ?? [])],
+                  })),
+                }
+              : {}),
           })),
         }
       : {}),
@@ -3910,19 +3974,30 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
     config.staged_policies !== undefined && config.staged_policies.length > 0
       ? [
           "",
-          "staged_policies: # staged policy lifecycle (#695) — opt-in; closed states draft|observe|required|enforcing|retired",
+          "staged_policies: # staged policy lifecycle (#695) — opt-in; enforcing requires lineage (required→enforcing + authority)",
           ...config.staged_policies.map(
             (p) =>
               `  - policy_id: ${yamlScalar(p.policy_id)} # ${sd("staged_policies.policy_id", "stable policy identifier")}\n` +
-              `    state: ${yamlScalar(p.state)} # ${sd("staged_policies.state", "effective lifecycle state")}`,
+              `    state: ${yamlScalar(p.state)} # ${sd("staged_policies.state", "effective lifecycle state; enforcing needs lineage")}`,
           ),
         ].join("\n")
       : [
           "",
           "# staged_policies: # staged policy lifecycle (#695) — opt-in rollout states. Absent (default): no lifecycle recording or promotion gate.",
           `#   - policy_id: repo-controls # ${sd("staged_policies.policy_id", "stable policy identifier")}`,
-          `#     state: observe # ${sd("staged_policies.state", "closed set: draft|observe|required|enforcing|retired")}`,
+          `#     state: observe # ${sd("staged_policies.state", "closed set: draft|observe|required|enforcing|retired; enforcing requires lineage")}`,
           `#     acceptance: {} # ${sd("staged_policies.acceptance", "acceptance-relevant slice folded into policy_hash")}`,
+          `#     lineage: # ${sd("staged_policies.lineage", "append-only promotion/retirement events; required when state is enforcing (required→enforcing + named authority)")}`,
+          `#       - policy_id: repo-controls # ${sd("staged_policies.lineage.policy_id", "must match parent policy_id")}`,
+          `#         from_state: required # ${sd("staged_policies.lineage.from_state", "prior lifecycle state")}`,
+          `#         to_state: enforcing # ${sd("staged_policies.lineage.to_state", "target lifecycle state")}`,
+          `#         policy_hash_before: "<hex>" # ${sd("staged_policies.lineage.policy_hash_before", "policy_hash before transition")}`,
+          `#         policy_hash_after: "<hex>" # ${sd("staged_policies.lineage.policy_hash_after", "policy_hash after transition")}`,
+          `#         at: "2026-08-14T00:00:00.000Z" # ${sd("staged_policies.lineage.at", "ISO 8601 transition timestamp")}`,
+          `#         authority: # ${sd("staged_policies.lineage.authority", "named authority; required for enforcing/retired entries")}`,
+          `#           actor: operator # ${sd("staged_policies.lineage.authority.actor", "authenticated actor identity")}`,
+          `#           role: policy-admin # ${sd("staged_policies.lineage.authority.role", "role or capability authorizing the transition")}`,
+          `#         evidence_refs: [] # ${sd("staged_policies.lineage.evidence_refs", "observation or audit evidence references")}`,
         ].join("\n"),
     config.repository_control_desired_state
       ? [

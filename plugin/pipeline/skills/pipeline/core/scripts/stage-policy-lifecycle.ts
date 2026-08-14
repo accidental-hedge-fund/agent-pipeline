@@ -150,21 +150,99 @@ export interface StagedPolicy {
   lineage: PolicyLineageEvent[];
 }
 
+/**
+ * True when lineage contains a promotion event into enforcing that includes
+ * named authority and a non-empty policy_hash_after. Config and materialize
+ * paths require this before exposing effective state `enforcing`.
+ */
+export function hasValidEnforcingPromotionLineage(
+  policyId: string,
+  lineage: readonly PolicyLineageEvent[],
+): boolean {
+  return lineage.some(
+    (e) =>
+      e.policy_id === policyId &&
+      e.from_state === "required" &&
+      e.to_state === "enforcing" &&
+      authorityPresent(e.authority) &&
+      typeof e.policy_hash_after === "string" &&
+      e.policy_hash_after.trim().length > 0 &&
+      typeof e.at === "string" &&
+      e.at.trim().length > 0,
+  );
+}
+
+/**
+ * Reject effective `enforcing` without a validated lineage entry into
+ * enforcing (from required + authority + hash). Used by config load and
+ * materialize so static YAML cannot activate the gate without promotion evidence.
+ */
+export function assertEnforcingLineage(
+  policyId: string,
+  state: PolicyLifecycleState,
+  lineage: readonly PolicyLineageEvent[],
+): void {
+  if (state !== "enforcing") return;
+  if (!hasValidEnforcingPromotionLineage(policyId, lineage)) {
+    throw new Error(
+      `staged policy ${policyId}: state "enforcing" requires a validated lineage entry into enforcing ` +
+        `(from_state "required", non-empty authority actor+role, policy_hash_after, at). ` +
+        `Static config cannot place a policy into enforcing without promotion evidence and named authority.`,
+    );
+  }
+}
+
 export function createStagedPolicy(
   policyId: string,
   acceptance: Record<string, unknown> = {},
   initialState: PolicyLifecycleState = "draft",
+  lineage: readonly PolicyLineageEvent[] = [],
 ): StagedPolicy {
   if (!policyId || typeof policyId !== "string" || !policyId.trim()) {
     throw new Error("policy_id must be a non-empty string");
   }
-  assertPolicyLifecycleState(initialState);
+  const id = policyId.trim();
+  const state = assertPolicyLifecycleState(initialState);
+  const lineageCopy = lineage.map((e) => ({
+    ...e,
+    authority: e.authority ? { ...e.authority } : null,
+    evidence_refs: [...(e.evidence_refs ?? [])],
+  }));
+  assertEnforcingLineage(id, state, lineageCopy);
   return {
-    policy_id: policyId.trim(),
-    state: initialState,
+    policy_id: id,
+    state,
     acceptance: { ...acceptance },
-    lineage: [],
+    lineage: lineageCopy,
   };
+}
+
+/** Config / decl shape for a staged policy (optional lineage for enforcing). */
+export interface StagedPolicyDecl {
+  policy_id: string;
+  state: PolicyLifecycleState;
+  acceptance?: Record<string, unknown>;
+  lineage?: readonly PolicyLineageEvent[];
+}
+
+/**
+ * Materialize a StagedPolicy from a config declaration. Fails closed when
+ * state is enforcing without validated promotion lineage.
+ */
+export function stagedPolicyFromDecl(decl: StagedPolicyDecl): StagedPolicy {
+  return createStagedPolicy(
+    decl.policy_id,
+    decl.acceptance ?? {},
+    decl.state,
+    decl.lineage ?? [],
+  );
+}
+
+export function stagedPoliciesFromDecls(
+  decls: readonly StagedPolicyDecl[] | undefined,
+): StagedPolicy[] {
+  if (!decls?.length) return [];
+  return decls.map((d) => stagedPolicyFromDecl(d));
 }
 
 export function effectivePolicyHash(policy: StagedPolicy): string {
@@ -353,12 +431,13 @@ export function hasEnforcingLineage(policy: StagedPolicy): boolean {
 }
 
 /**
- * Invariant check: an enforcing effective state MUST have lineage into enforcing.
- * Returns false when the invariant is broken (should never happen via evaluateLifecycleTransition).
+ * Invariant check: an enforcing effective state MUST have a validated lineage
+ * entry into enforcing (required → enforcing with authority + hash). Returns
+ * false when the invariant is broken (config bypass or forged record).
  */
 export function enforcingStateHasLineage(policy: StagedPolicy): boolean {
   if (policy.state !== "enforcing") return true;
-  return hasEnforcingLineage(policy);
+  return hasValidEnforcingPromotionLineage(policy.policy_id, policy.lineage);
 }
 
 /** Evidence row for run finalize: policy_id, state, policy_hash (+ optional lineage head). */

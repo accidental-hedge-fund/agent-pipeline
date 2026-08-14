@@ -1058,7 +1058,7 @@ Nested fields:
 ### `staged_policies`
 
 - **Type:** array of object
-- **Description:** Opt-in staged policies (#695). States: draft|observe|required|enforcing|retired. Absent/empty → no lifecycle gate.
+- **Description:** Opt-in staged policies (#695). States: draft|observe|required|enforcing|retired. enforcing requires lineage with a required→enforcing promotion event and named authority. Absent/empty → no lifecycle gate.
 
 ### `steps`
 

@@ -1536,11 +1536,14 @@ export interface PipelineConfig {
   /**
    * Opt-in staged policies (#695). Absent or empty → no lifecycle recording.
    * States are the closed set draft|observe|required|enforcing|retired.
+   * Effective state `enforcing` requires validated lineage (required→enforcing
+   * with named authority); bare config cannot activate enforcing without it.
    */
   staged_policies?: Array<{
     policy_id: string;
     state: "draft" | "observe" | "required" | "enforcing" | "retired";
     acceptance?: Record<string, unknown>;
+    lineage?: import("./stage-policy-lifecycle.ts").PolicyLineageEvent[];
   }>;
   /**
    * Opt-in repository-control desired state (#695). Absent → no drift compare

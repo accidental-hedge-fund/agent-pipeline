@@ -11,6 +11,7 @@ The pipeline SHALL represent each staged policy’s effective state as exactly o
 #### Scenario: Valid state is accepted
 
 - **WHEN** a policy declaration or transition target uses one of `draft`, `observe`, `required`, `enforcing`, or `retired`
+- **AND** when the declared or resulting effective state is `enforcing`, a validated lineage entry into `enforcing` is present (see lineage requirement)
 - **THEN** validation SHALL accept that state
 
 #### Scenario: Unknown state is rejected
@@ -18,6 +19,13 @@ The pipeline SHALL represent each staged policy’s effective state as exactly o
 - **WHEN** a policy declaration or transition target uses a string outside the closed set
 - **THEN** validation SHALL fail with an error naming the invalid state
 - **AND** SHALL NOT treat the unknown string as a default lifecycle state
+
+#### Scenario: Config declaration of enforcing without lineage is rejected
+
+- **WHEN** a staged policy is declared in config with `state: enforcing`
+- **AND** no validated lineage entry into `enforcing` is present (required → enforcing with non-empty named authority and `policy_hash_after`)
+- **THEN** config validation SHALL fail
+- **AND** the policy SHALL NOT be exposed with effective state `enforcing`
 
 ---
 
@@ -116,6 +124,13 @@ Every successful promotion or retirement SHALL append a lineage record that incl
 - **WHEN** a policy’s effective state is `enforcing`
 - **THEN** lineage SHALL contain an event with `to_state: "enforcing"`
 - **AND** that event SHALL include non-empty `authority` and the policy hash after the transition
+
+#### Scenario: Static config cannot invent enforcing without lineage
+
+- **WHEN** config load or policy materialization is asked to expose effective state `enforcing`
+- **AND** the loaded record has no lineage event with `from_state: "required"`, `to_state: "enforcing"`, non-empty authority, and `policy_hash_after`
+- **THEN** load or materialization SHALL fail closed
+- **AND** SHALL NOT activate fail-closed readiness gates as if the policy were lawfully enforcing
 
 #### Scenario: Lineage is not rewritten on later promotion
 

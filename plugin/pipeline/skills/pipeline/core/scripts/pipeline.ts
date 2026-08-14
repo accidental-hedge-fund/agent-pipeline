@@ -7028,24 +7028,8 @@ export async function handleControlsCommand(
     process.exit(2);
   }
   const { resolveConfig } = await import("./config.ts");
-  const {
-    runControlsCheck,
-    formatControlsCheckHuman,
-    createStagedPoliciesFromConfig,
-  } = await import("./repository-control-drift.ts").then(async (m) => {
-    const life = await import("./stage-policy-lifecycle.ts");
-    return {
-      ...m,
-      createStagedPoliciesFromConfig: (
-        decls: Array<{ policy_id: string; state: string; acceptance?: Record<string, unknown> }> | undefined,
-      ) => {
-        if (!decls?.length) return [];
-        return decls.map((d) =>
-          life.createStagedPolicy(d.policy_id, d.acceptance ?? {}, d.state as import("./stage-policy-lifecycle.ts").PolicyLifecycleState),
-        );
-      },
-    };
-  });
+  const { runControlsCheck, formatControlsCheckHuman } = await import("./repository-control-drift.ts");
+  const { stagedPoliciesFromDecls } = await import("./stage-policy-lifecycle.ts");
   const { ghRunForTest } = await import("./gh.ts");
 
   let cfg: PipelineConfig;
@@ -7062,7 +7046,8 @@ export async function handleControlsCommand(
   }
 
   const desired = cfg.repository_control_desired_state ?? null;
-  const staged = createStagedPoliciesFromConfig(cfg.staged_policies);
+  // Config load already rejects bare enforcing; materialize still validates lineage.
+  const staged = stagedPoliciesFromDecls(cfg.staged_policies);
   const lifecycle =
     desired?.policy_id != null
       ? staged.find((p) => p.policy_id === desired.policy_id)?.state ?? null

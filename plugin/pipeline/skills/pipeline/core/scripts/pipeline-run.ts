@@ -2225,23 +2225,17 @@ export async function runAdvance(
           // Staged policies + repository-control drift evidence (#695): record when
           // configured. Best-effort live compare; never invents policies when absent.
           try {
-            const { createStagedPolicy, toPolicyEvidenceRow } = await import("./stage-policy-lifecycle.ts");
+            const { stagedPoliciesFromDecls, toPolicyEvidenceRow } = await import("./stage-policy-lifecycle.ts");
             const {
               runControlsCheck,
             } = await import("./repository-control-drift.ts");
             const { ghRunForTest } = await import("./gh.ts");
-            if (cfg.staged_policies?.length) {
-              finalized.staged_policies = cfg.staged_policies.map((p) =>
-                toPolicyEvidenceRow(
-                  createStagedPolicy(p.policy_id, p.acceptance ?? {}, p.state),
-                ),
-              );
+            const staged = stagedPoliciesFromDecls(cfg.staged_policies);
+            if (staged.length) {
+              finalized.staged_policies = staged.map((p) => toPolicyEvidenceRow(p));
             }
             if (cfg.repository_control_desired_state) {
               const desired = cfg.repository_control_desired_state;
-              const staged = (cfg.staged_policies ?? []).map((p) =>
-                createStagedPolicy(p.policy_id, p.acceptance ?? {}, p.state),
-              );
               const lifecycle =
                 desired.policy_id != null
                   ? staged.find((p) => p.policy_id === desired.policy_id)?.state ?? null

@@ -24,7 +24,7 @@ import {
   runControlsCheck,
 } from "../repository-control-drift.ts";
 import {
-  createStagedPolicy,
+  stagedPoliciesFromDecls,
   type PolicyLifecycleState,
 } from "../stage-policy-lifecycle.ts";
 
@@ -84,12 +84,14 @@ export async function finalize(
   // No automatic forge remediation — parks with typed reason via setBlocked.
   if (cfg.repository_control_desired_state) {
     const desired = cfg.repository_control_desired_state;
-    const staged = (cfg.staged_policies ?? []).map((p) =>
-      createStagedPolicy(
-        p.policy_id,
-        p.acceptance ?? {},
-        p.state as PolicyLifecycleState,
-      ),
+    // Materialize with lineage; bare enforcing is rejected at config load and here.
+    const staged = stagedPoliciesFromDecls(
+      (cfg.staged_policies ?? []).map((p) => ({
+        policy_id: p.policy_id,
+        state: p.state as PolicyLifecycleState,
+        acceptance: p.acceptance,
+        lineage: p.lineage,
+      })),
     );
     const lifecycle =
       desired.policy_id != null
