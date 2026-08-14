@@ -8,6 +8,8 @@ import {
   evaluateLineageCompletenessGate,
   formatImpactReportHuman,
 } from "../scripts/lineage/impact.ts";
+import { makeEdgeShell, makeNodeShell } from "../scripts/lineage/schema.ts";
+import { makeDomainNodeId } from "../scripts/lineage/identity.ts";
 
 const D = "agent-pipeline";
 const SHA = "c".repeat(40);
@@ -187,11 +189,10 @@ test("forged actor_id rejected by verifier does not mutate", () => {
   assert.equal(mutateCalls, 0);
 });
 
-test("verified approval records decision provenance and may mutate once", () => {
+test("verified approval records decision provenance without mutation adapter", () => {
   const g = chainGraph();
   const outcome = g.nodes.find((n) => n.node_type === "production_outcome")!;
   const { proposals } = computeBackwardProposals(g, { evidence_node_id: outcome.node_id });
-  let mutateCalls = 0;
   const applied = applyLineageProposal(
     proposals[0],
     {
@@ -207,9 +208,6 @@ test("verified approval records decision provenance and may mutate once", () => 
           approval.authority === "human" &&
           proposal.proposal_id === proposals[0].proposal_id,
       },
-      mutateUpstream: () => {
-        mutateCalls += 1;
-      },
     },
   );
   assert.equal(applied.ok, true);
@@ -217,7 +215,111 @@ test("verified approval records decision provenance and may mutate once", () => 
   assert.equal(applied.nodes[0].node_type, "decision");
   assert.equal(applied.nodes[0].decision_status, "answered");
   assert.equal(applied.grants_merge_authority, false);
+});
+
+test("verified approval with mutation requires revision and supersession", () => {
+  const g = chainGraph();
+  const outcome = g.nodes.find((n) => n.node_type === "production_outcome")!;
+  const req = g.nodes.find((n) => n.node_type === "requirement")!;
+  const { proposals } = computeBackwardProposals(g, { evidence_node_id: outcome.node_id });
+  let mutateCalls = 0;
+  const revised = makeNodeShell({
+    node_id: makeDomainNodeId(D, "requirement", "openspec/specs/foo/spec.md@reqH2"),
+    node_type: "requirement",
+    domain: D,
+    revision: "reqH2",
+    content_hash: "reqH2",
+    identity: { path: "openspec/specs/foo/spec.md", content_hash: "reqH2" },
+    producer: "lineage.apply.test",
+    observed_at: "2026-08-14T00:00:00Z",
+  });
+  const supersedes = makeEdgeShell({
+    edge_id: makeDomainNodeId(D, "edge", `supersedes:${revised.node_id}:${req.node_id}`),
+    source_id: revised.node_id,
+    target_id: req.node_id,
+    relationship: "supersedes",
+    revision: "1",
+    method: "manual",
+    authority: "observed",
+    producer: "lineage.apply.test",
+    observed_at: "2026-08-14T00:00:00Z",
+  });
+  const applied = applyLineageProposal(
+    proposals[0],
+    {
+      authority: "human",
+      actor_id: "alice",
+      approved_at: "2026-08-14T00:00:00Z",
+      approval_id: "appr-1",
+    },
+    {
+      approvalVerifier: {
+        verify: (approval, proposal) =>
+          approval.actor_id === "alice" &&
+          proposal.proposal_id === proposals[0].proposal_id,
+      },
+      mutateUpstream: () => {
+        mutateCalls += 1;
+        return {
+          revised_nodes: [revised],
+          supersession_edges: [supersedes],
+        };
+      },
+    },
+  );
+  assert.equal(applied.ok, true);
+  assert.equal(applied.authority_status, "applied");
   assert.equal(mutateCalls, 1);
+  assert.ok(applied.nodes.some((n) => n.node_id === revised.node_id));
+  assert.ok(
+    applied.edges.some(
+      (e) => e.relationship === "supersedes" && e.source_id === revised.node_id,
+    ),
+  );
+  assert.equal(applied.nodes.find((n) => n.node_type === "decision")?.decision_status, "answered");
+});
+
+test("mutation adapter without supersession is refused", () => {
+  const g = chainGraph();
+  const outcome = g.nodes.find((n) => n.node_type === "production_outcome")!;
+  const { proposals } = computeBackwardProposals(g, { evidence_node_id: outcome.node_id });
+  const applied = applyLineageProposal(
+    proposals[0],
+    {
+      authority: "human",
+      actor_id: "alice",
+      approved_at: "2026-08-14T00:00:00Z",
+    },
+    {
+      approvalVerifier: { verify: () => true },
+      mutateUpstream: () =>
+        ({
+          revised_nodes: [],
+          supersession_edges: [],
+        }) as never,
+    },
+  );
+  assert.equal(applied.ok, false);
+  assert.equal(applied.authority_status, "refused");
+  assert.equal(applied.diagnostic?.code, "missing_revision_or_supersession");
+});
+
+test("verification evidence yields backward proposal via verifies edges", () => {
+  const g = chainGraph();
+  const verification = g.nodes.find((n) => n.node_type === "verification")!;
+  const result = computeBackwardProposals(g, { evidence_node_id: verification.node_id });
+  assert.ok(
+    result.proposals.length >= 1,
+    `expected proposal from verification; diagnostics=${JSON.stringify(result.diagnostics)}`,
+  );
+  const p = result.proposals[0];
+  assert.equal(p.authority_status, "proposal");
+  assert.ok(p.citing_evidence_node_ids.includes(verification.node_id));
+  assert.ok(p.citing_edge_ids.length >= 1);
+  assert.ok(p.reason_codes.includes("downstream_verification_evidence"));
+  assert.ok(p.target_upstream_node_ids.length >= 1);
+  // Should not fall through to no_upstream for verification with verifies edge
+  assert.ok(!result.diagnostics.some((d) => d.code === "no_upstream_for_evidence"));
 });
 
 test("default-off completeness gate does not block", () => {

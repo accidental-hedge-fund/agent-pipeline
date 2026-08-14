@@ -252,9 +252,35 @@ function proposalId(domain: string, parts: string[]): string {
   return makeDomainNodeId(domain, "proposal", h);
 }
 
+/** Collect objective/requirement upstream targets from a seed set of node ids. */
+function collectUpstreamTargets(
+  graph: { edges: readonly LineageEdge[] },
+  seedIds: Iterable<string>,
+  citingEdges: string[],
+): Set<string> {
+  const upstreamTargets = new Set<string>();
+  for (const seedId of seedIds) {
+    upstreamTargets.add(seedId);
+    for (const e of graph.edges) {
+      if (e.relationship === "derived_from" && e.source_id === seedId) {
+        upstreamTargets.add(e.target_id);
+        citingEdges.push(e.edge_id);
+      }
+      if (e.relationship === "decomposes_to" && e.target_id === seedId) {
+        upstreamTargets.add(e.source_id);
+        citingEdges.push(e.edge_id);
+      }
+    }
+  }
+  return upstreamTargets;
+}
+
 /**
  * Emit non-applied proposals from downstream evidence (outcomes, failures).
  * Never mutates authoritative upstream content.
+ *
+ * Verification evidence walks inbound `verifies` / `maps_evidence` edges to
+ * objectives/requirements (not `outcome_of`, which is outcome→run only).
  */
 export function computeBackwardProposals(
   graph: { nodes: readonly LineageNode[]; edges: readonly LineageEdge[] },
@@ -277,41 +303,57 @@ export function computeBackwardProposals(
       );
 
   for (const ev of evidenceNodes) {
-    // Find linked runs via outcome_of edges
-    const outEdges = outboundEdges(graph.edges, ev.node_id, {
-      relationships: ["outcome_of"],
-    });
-    const runIds = outEdges
-      .map((e) => e.target_id)
-      .filter((id) => byId.get(id)?.node_type === "run");
+    const citingEdges: string[] = [];
+    const seedIds = new Set<string>();
+    const reasonCodes: string[] = [];
 
-    // From runs, find implements edges to objectives
-    const objectiveIds = new Set<string>();
-    const citingEdges = [...outEdges.map((e) => e.edge_id)];
-    for (const runId of runIds) {
-      for (const e of graph.edges) {
-        if (e.relationship === "implements" && e.source_id === runId) {
-          objectiveIds.add(e.target_id);
-          citingEdges.push(e.edge_id);
+    if (ev.node_type === "verification") {
+      // verifies / maps_evidence: objective|requirement → verification
+      const inbound = inboundEdges(graph.edges, ev.node_id, {
+        relationships: ["verifies", "maps_evidence"],
+      });
+      for (const e of inbound) {
+        citingEdges.push(e.edge_id);
+        const src = byId.get(e.source_id);
+        if (
+          src &&
+          (src.node_type === "objective" ||
+            src.node_type === "requirement" ||
+            src.node_type === "intent_outcome")
+        ) {
+          seedIds.add(e.source_id);
+        }
+        // Preserve link-state diagnostics for non-active mapping edges
+        if (e.link_state !== "active") {
+          diagnostics.push({
+            code: "verification_mapping_link_state",
+            message: `evidence ${ev.node_id} edge ${e.edge_id} link_state=${e.link_state}`,
+          });
         }
       }
-    }
+      reasonCodes.push("downstream_verification_evidence");
+    } else {
+      // production_outcome (and other outcome-like): outcome_of → run → implements → objective
+      const outEdges = outboundEdges(graph.edges, ev.node_id, {
+        relationships: ["outcome_of"],
+      });
+      citingEdges.push(...outEdges.map((e) => e.edge_id));
+      const runIds = outEdges
+        .map((e) => e.target_id)
+        .filter((id) => byId.get(id)?.node_type === "run");
 
-    // From objectives, walk derived_from / reverse decomposes_to to requirements
-    const upstreamTargets = new Set<string>();
-    for (const objId of objectiveIds) {
-      upstreamTargets.add(objId);
-      for (const e of graph.edges) {
-        if (e.relationship === "derived_from" && e.source_id === objId) {
-          upstreamTargets.add(e.target_id);
-          citingEdges.push(e.edge_id);
-        }
-        if (e.relationship === "decomposes_to" && e.target_id === objId) {
-          upstreamTargets.add(e.source_id);
-          citingEdges.push(e.edge_id);
+      for (const runId of runIds) {
+        for (const e of graph.edges) {
+          if (e.relationship === "implements" && e.source_id === runId) {
+            seedIds.add(e.target_id);
+            citingEdges.push(e.edge_id);
+          }
         }
       }
+      reasonCodes.push("downstream_outcome_evidence");
     }
+
+    const upstreamTargets = collectUpstreamTargets(graph, seedIds, citingEdges);
 
     if (upstreamTargets.size === 0) {
       diagnostics.push({
@@ -324,7 +366,7 @@ export function computeBackwardProposals(
     const kind =
       typeof ev.identity?.outcome_kind === "string" ? ev.identity.outcome_kind : ev.node_type;
     const summary = redactFreeText(
-      `Review upstream assumptions after ${kind} evidence ${ev.identity?.outcome_id ?? ev.node_id}`,
+      `Review upstream assumptions after ${kind} evidence ${ev.identity?.outcome_id ?? ev.identity?.verification_id ?? ev.node_id}`,
       300,
     );
 
@@ -337,7 +379,7 @@ export function computeBackwardProposals(
       citing_edge_ids: [...new Set(citingEdges)].sort(),
       proposed_change_summary: summary,
       authority_status: "proposal",
-      reason_codes: ["downstream_outcome_evidence"],
+      reason_codes: reasonCodes,
       domain: opts.domain ?? ev.domain,
     });
   }
@@ -391,11 +433,27 @@ export interface ApplyProposalResult {
   ok: boolean;
   authority_status: ProposalAuthorityStatus;
   diagnostic?: { code: string; message: string };
-  /** New decision node / supersession artifacts when applied (in-memory only). */
+  /** New decision node / revision / supersession artifacts when applied. */
   nodes: LineageNode[];
   edges: LineageEdge[];
   /** Explicit: apply never merges or releases. */
   grants_merge_authority: false;
+}
+
+/**
+ * Durable result of an approved upstream mutation adapter.
+ * Must include the new authoritative revision(s) and supersession linkage
+ * so history is never rewritten silently.
+ */
+export interface UpstreamMutationResult {
+  /** New revision nodes for authoritative upstream artifacts. */
+  revised_nodes: LineageNode[];
+  /**
+   * Edges with relationship `supersedes` linking each new revision (source)
+   * to the prior authoritative node (target). At least one required when
+   * revised_nodes is non-empty.
+   */
+  supersession_edges: LineageEdge[];
 }
 
 export interface ApplyProposalOpts {
@@ -404,8 +462,12 @@ export interface ApplyProposalOpts {
    * shape checks alone never authorize mutation.
    */
   approvalVerifier?: ApprovalVerifier;
-  /** Optional callback that mutates authoritative upstream; default is no-op record only. */
-  mutateUpstream?: (proposal: LineageUpdateProposal) => void;
+  /**
+   * Optional mutation adapter. When provided it MUST return revised nodes and
+   * supersession edges; invalid returns fail closed and do not mark applied.
+   * When omitted, apply records decision provenance only (no upstream rewrite).
+   */
+  mutateUpstream?: (proposal: LineageUpdateProposal) => UpstreamMutationResult;
 }
 
 function refuseUnauthorized(message: string): ApplyProposalResult {
@@ -422,10 +484,84 @@ function refuseUnauthorized(message: string): ApplyProposalResult {
   };
 }
 
+function refuseMissingSupersession(message: string): ApplyProposalResult {
+  return {
+    ok: false,
+    authority_status: "refused",
+    diagnostic: {
+      code: "missing_revision_or_supersession",
+      message,
+    },
+    nodes: [],
+    edges: [],
+    grants_merge_authority: false,
+  };
+}
+
+/**
+ * Validate mutation adapter output: revised nodes + supersedes edges required.
+ */
+export function validateUpstreamMutationResult(
+  mutation: UpstreamMutationResult | null | undefined,
+): { ok: true; result: UpstreamMutationResult } | { ok: false; message: string } {
+  if (!mutation || typeof mutation !== "object") {
+    return {
+      ok: false,
+      message: "mutation adapter must return revised_nodes and supersession_edges",
+    };
+  }
+  const revised = mutation.revised_nodes;
+  const edges = mutation.supersession_edges;
+  if (!Array.isArray(revised) || revised.length === 0) {
+    return {
+      ok: false,
+      message: "mutation adapter must return at least one revised_node",
+    };
+  }
+  if (!Array.isArray(edges) || edges.length === 0) {
+    return {
+      ok: false,
+      message: "mutation adapter must return supersession_edges (relationship supersedes)",
+    };
+  }
+  const revisedIds = new Set(revised.map((n) => n.node_id));
+  let supersedesCount = 0;
+  for (const e of edges) {
+    if (e.relationship !== "supersedes") {
+      return {
+        ok: false,
+        message: `supersession edge ${e.edge_id} must use relationship supersedes`,
+      };
+    }
+    if (!revisedIds.has(e.source_id)) {
+      return {
+        ok: false,
+        message: `supersession edge ${e.edge_id} source must be a revised node`,
+      };
+    }
+    if (!e.target_id?.trim()) {
+      return {
+        ok: false,
+        message: `supersession edge ${e.edge_id} must reference prior node as target`,
+      };
+    }
+    supersedesCount += 1;
+  }
+  if (supersedesCount === 0) {
+    return {
+      ok: false,
+      message: "no valid supersedes edges in mutation result",
+    };
+  }
+  return { ok: true, result: mutation };
+}
+
 /**
  * Apply a proposal only with verified human or repository-workflow approval.
  * Unauthorized attempts fail closed and record unauthorized_upstream_mutation.
  * Caller-asserted actor_id/authority strings are never sufficient alone.
+ * When a mutation adapter is provided, apply requires durable revision +
+ * supersession provenance in the adapter return value.
  */
 export function applyLineageProposal(
   proposal: LineageUpdateProposal,
@@ -457,7 +593,27 @@ export function applyLineageProposal(
     );
   }
 
-  // Record decision provenance; do not rewrite history without supersession.
+  // When mutation is requested, require revision + supersession before applying.
+  let mutationResult: UpstreamMutationResult | null = null;
+  if (opts.mutateUpstream) {
+    let raw: UpstreamMutationResult;
+    try {
+      raw = opts.mutateUpstream(proposal);
+    } catch (err) {
+      return refuseMissingSupersession(
+        `mutation adapter threw: ${(err as Error).message}`,
+      );
+    }
+    const validated = validateUpstreamMutationResult(raw);
+    if (!validated.ok) {
+      return refuseMissingSupersession(
+        `apply refused: ${validated.message}`,
+      );
+    }
+    mutationResult = validated.result;
+  }
+
+  // Record decision provenance with supersession history when mutation ran.
   const decisionLocal = `apply:${proposal.proposal_id}`;
   const decisionNode = makeNodeShell({
     node_id: makeDomainNodeId(proposal.domain, "decision", decisionLocal),
@@ -474,12 +630,19 @@ export function applyLineageProposal(
       approval_authority: approval.authority,
       actor_id: approval.actor_id,
       ...(approval.approval_id ? { approval_id: approval.approval_id } : {}),
+      ...(mutationResult
+        ? {
+            revised_node_ids: mutationResult.revised_nodes.map((n) => n.node_id),
+            supersession_edge_ids: mutationResult.supersession_edges.map((e) => e.edge_id),
+          }
+        : {}),
     },
     decision_status: "answered",
     producer: "lineage.apply",
     observed_at: approval.approved_at,
   });
 
+  const nodes: LineageNode[] = [decisionNode];
   const edges: LineageEdge[] = [];
   for (const target of proposal.target_upstream_node_ids) {
     edges.push(
@@ -501,14 +664,15 @@ export function applyLineageProposal(
     );
   }
 
-  if (opts.mutateUpstream) {
-    opts.mutateUpstream(proposal);
+  if (mutationResult) {
+    nodes.push(...mutationResult.revised_nodes);
+    edges.push(...mutationResult.supersession_edges);
   }
 
   return {
     ok: true,
     authority_status: "applied",
-    nodes: [decisionNode],
+    nodes,
     edges,
     grants_merge_authority: false,
   };

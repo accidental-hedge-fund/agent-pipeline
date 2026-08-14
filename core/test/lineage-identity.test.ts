@@ -76,3 +76,24 @@ test("cross-domain issue numbers do not collide", () => {
   const b = makeDomainNodeId("domain-b", "intent_outcome", "issue-42");
   assert.notEqual(a, b);
 });
+
+test("path-derived node ids are collision-safe for slash vs underscore paths", () => {
+  const withUnderscore = makeDomainNodeId(
+    "agent-pipeline",
+    "requirement",
+    "openspec/specs/a_b/spec.md@h1",
+  );
+  const withSlash = makeDomainNodeId(
+    "agent-pipeline",
+    "requirement",
+    "openspec/specs/a/b/spec.md@h1",
+  );
+  assert.notEqual(withUnderscore, withSlash);
+  assert.ok(withUnderscore.includes("%2F"));
+  assert.ok(withSlash.includes("%2F"));
+  // Same path twice is stable
+  assert.equal(
+    makeDomainNodeId("agent-pipeline", "requirement", "openspec/specs/a/b/spec.md@h1"),
+    withSlash,
+  );
+});

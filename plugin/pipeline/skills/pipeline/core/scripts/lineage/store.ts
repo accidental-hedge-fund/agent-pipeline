@@ -3,6 +3,7 @@
 // Layout:
 //   .agent-pipeline/lineage/nodes/<safe_node_id>.json
 //   .agent-pipeline/lineage/edges/<safe_edge_id>.json
+//   .agent-pipeline/lineage/analyses/<safe_analysis_id>.json  (impact / proposals)
 //   .agent-pipeline/lineage/index.jsonl  (optional rewrite on upsert)
 //
 // Append/upsert by id. Retention filters default export. Inject fs deps for tests.
@@ -20,6 +21,7 @@ import {
   type LineageGraphSnapshot,
   type LineageNode,
 } from "./schema.ts";
+import type { ForwardImpactReport, LineageUpdateProposal } from "./impact.ts";
 
 /** Default retention window for export (days). Config key: lineage.retention_days */
 export const DEFAULT_LINEAGE_RETENTION_DAYS = 365;
@@ -61,8 +63,153 @@ export function lineageIndexPath(repoDir: string): string {
   return path.join(lineageDir(repoDir), "index.jsonl");
 }
 
+export function lineageAnalysesDir(repoDir: string): string {
+  return path.join(lineageDir(repoDir), "analyses");
+}
+
 function safeId(id: string): string {
   return id.replace(/[/\\:]/g, "_");
+}
+
+export interface StoreDiagnostic {
+  code: string;
+  message: string;
+  path?: string;
+}
+
+export interface UpsertResult {
+  action: "written" | "replaced" | "skipped";
+  id: string;
+  diagnostics: StoreDiagnostic[];
+}
+
+// ---------------------------------------------------------------------------
+// Analysis records (immutable impact / proposal outputs for evidence export)
+// ---------------------------------------------------------------------------
+
+export type LineageAnalysisKind = "forward_impact" | "backward_proposals";
+
+export interface LineageAnalysisRecord {
+  schema_version: typeof LINEAGE_SCHEMA_VERSION;
+  type: "lineage_analysis_record";
+  analysis_id: string;
+  record_kind: LineageAnalysisKind;
+  run_id: string | null;
+  computed_at: string;
+  /** Set when record_kind is forward_impact. */
+  impact?: ForwardImpactReport | null;
+  /** Set when record_kind is backward_proposals. */
+  proposals?: LineageUpdateProposal[] | null;
+  drift_reason_codes: string[];
+}
+
+export function analysisFilePath(repoDir: string, analysisId: string): string {
+  return path.join(lineageAnalysesDir(repoDir), `${safeId(analysisId)}.json`);
+}
+
+export async function upsertAnalysisRecord(
+  repoDir: string,
+  record: LineageAnalysisRecord,
+  deps: LineageStoreDeps = realLineageStoreDeps(),
+): Promise<UpsertResult> {
+  const diagnostics: StoreDiagnostic[] = [];
+  const filePath = analysisFilePath(repoDir, record.analysis_id);
+  let action: UpsertResult["action"] = "written";
+  try {
+    await deps.readFile(filePath);
+    action = "replaced";
+  } catch {
+    action = "written";
+  }
+  try {
+    await deps.mkdir(lineageAnalysesDir(repoDir), { recursive: true });
+    await deps.writeFile(filePath, `${JSON.stringify(record, null, 2)}\n`);
+  } catch (err) {
+    diagnostics.push({
+      code: "lineage_analysis_write_failed",
+      message: (err as Error).message,
+      path: filePath,
+    });
+    return { action: "skipped", id: record.analysis_id, diagnostics };
+  }
+  return { action, id: record.analysis_id, diagnostics };
+}
+
+export interface ListAnalysesOpts {
+  runId?: string;
+}
+
+export async function listAnalysisRecords(
+  repoDir: string,
+  opts: ListAnalysesOpts = {},
+  deps: LineageStoreDeps = realLineageStoreDeps(),
+): Promise<{ records: LineageAnalysisRecord[]; diagnostics: StoreDiagnostic[] }> {
+  const diagnostics: StoreDiagnostic[] = [];
+  const dir = lineageAnalysesDir(repoDir);
+  let files: string[] = [];
+  try {
+    const entries = await deps.readdir(dir);
+    files = entries
+      .filter((e) => !e.isDirectory() && e.name.endsWith(".json"))
+      .map((e) => path.join(dir, e.name));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      diagnostics.push({
+        code: "lineage_analyses_unreadable",
+        message: (err as Error).message,
+        path: dir,
+      });
+    }
+    return { records: [], diagnostics };
+  }
+
+  const records: LineageAnalysisRecord[] = [];
+  for (const filePath of files) {
+    let raw: string;
+    try {
+      raw = await deps.readFile(filePath);
+    } catch (err) {
+      diagnostics.push({
+        code: "lineage_analysis_unreadable",
+        message: (err as Error).message,
+        path: filePath,
+      });
+      continue;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      diagnostics.push({
+        code: "lineage_analysis_corrupt",
+        message: "invalid JSON",
+        path: filePath,
+      });
+      continue;
+    }
+    if (
+      !parsed ||
+      typeof parsed !== "object" ||
+      (parsed as { type?: string }).type !== "lineage_analysis_record" ||
+      typeof (parsed as { analysis_id?: string }).analysis_id !== "string"
+    ) {
+      diagnostics.push({
+        code: "lineage_analysis_invalid",
+        message: "failed analysis record shape check",
+        path: filePath,
+      });
+      continue;
+    }
+    const rec = parsed as LineageAnalysisRecord;
+    if (opts.runId) {
+      // Include records for this run, and unscoped records (run_id null).
+      if (rec.run_id != null && rec.run_id !== opts.runId) continue;
+    }
+    records.push(rec);
+  }
+
+  records.sort((a, b) => a.analysis_id.localeCompare(b.analysis_id));
+  return { records, diagnostics };
 }
 
 export function nodeFilePath(repoDir: string, nodeId: string): string {
@@ -71,12 +218,6 @@ export function nodeFilePath(repoDir: string, nodeId: string): string {
 
 export function edgeFilePath(repoDir: string, edgeId: string): string {
   return path.join(lineageEdgesDir(repoDir), `${safeId(edgeId)}.json`);
-}
-
-export interface StoreDiagnostic {
-  code: string;
-  message: string;
-  path?: string;
 }
 
 export interface ListLineageOpts {
@@ -270,12 +411,6 @@ export async function loadGraphSnapshot(
     edges: listed.edges,
     diagnostics: listed.diagnostics,
   };
-}
-
-export interface UpsertResult {
-  action: "written" | "replaced" | "skipped";
-  id: string;
-  diagnostics: StoreDiagnostic[];
 }
 
 async function rewriteIndex(

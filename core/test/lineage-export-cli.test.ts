@@ -7,8 +7,18 @@ import {
   buildLineageExportSection,
   formatLineageExportHuman,
 } from "../scripts/lineage/export.ts";
-import { upsertGraph, type LineageStoreDeps } from "../scripts/lineage/store.ts";
-import { runLineageExport, type LineageCliDeps } from "../scripts/lineage/cli.ts";
+import {
+  listAnalysisRecords,
+  upsertGraph,
+  type LineageStoreDeps,
+} from "../scripts/lineage/store.ts";
+import {
+  runLineageExport,
+  runLineageImpact,
+  runLineageIngest,
+  runLineagePropose,
+  type LineageCliDeps,
+} from "../scripts/lineage/cli.ts";
 
 const D = "agent-pipeline";
 const SHA = "d".repeat(40);
@@ -161,6 +171,128 @@ test("proposals appear in export section refs", () => {
     proposals: proposals.proposals,
   });
   assert.ok((section.proposal_refs?.length ?? 0) >= 1);
+});
+
+test("impact and propose persist analysis records loaded by export", async () => {
+  const store = memStore();
+  const g = ingestLineageArtifacts({
+    domain: D,
+    requirements: [{ domain: D, path: "openspec/specs/y/spec.md", content_hash: "h1" }],
+    objectives: [{ domain: D, objective_id: "obj-persist", content_hash: "oh" }],
+    runs: [{ domain: D, run_id: "run-persist" }],
+    outcomes: [
+      {
+        domain: D,
+        outcome_id: "out-persist",
+        outcome_kind: "reversion",
+        attribution: [
+          {
+            target_type: "run",
+            target_id: "run-persist",
+            method: "direct",
+            authority: "observed",
+          },
+        ],
+      },
+    ],
+  });
+  const nodes = g.nodes.map((n) => ({
+    ...n,
+    provenance: { ...n.provenance, observed_at: "2026-08-01T00:00:00Z" },
+  }));
+  await upsertGraph(REPO, { nodes, edges: g.edges }, store);
+  const deps: LineageCliDeps = {
+    store,
+    readFile: store.readFile,
+    log: () => {},
+  };
+  const req = nodes.find((n) => n.node_type === "requirement")!;
+  const impact = await runLineageImpact(
+    {
+      repoDir: REPO,
+      verb: "impact",
+      nodeId: req.node_id,
+      newHash: "h2",
+      newRevision: "h2",
+      runId: "run-persist",
+      now: new Date("2026-08-02T00:00:00Z"),
+    },
+    deps,
+  );
+  assert.ok(impact.drift_reason_codes.length >= 0);
+  const propose = await runLineagePropose(
+    {
+      repoDir: REPO,
+      verb: "propose",
+      runId: "run-persist",
+      now: new Date("2026-08-02T00:00:01Z"),
+    },
+    deps,
+  );
+  assert.ok(propose.proposals.length >= 1);
+
+  const stored = await listAnalysisRecords(REPO, { runId: "run-persist" }, store);
+  assert.ok(stored.records.some((r) => r.record_kind === "forward_impact"));
+  assert.ok(stored.records.some((r) => r.record_kind === "backward_proposals"));
+
+  const section = await runLineageExport(
+    { repoDir: REPO, verb: "export", runId: "run-persist", retentionDays: 365 },
+    deps,
+  );
+  assert.ok(section.impact_ref, "export must include persisted impact_ref");
+  assert.ok(
+    (section.proposal_refs?.length ?? 0) >= 1,
+    "export must include persisted proposal_refs",
+  );
+  assert.ok(
+    section.drift_reason_codes.length >= 0 ||
+      (section.impact_ref?.drift_reason_codes.length ?? 0) >= 0,
+  );
+});
+
+test("ingest fails closed and does not persist when integrity fails", async () => {
+  const store = memStore();
+  // Valid fixture content; inject failing integrity to prove fail-closed before upsert.
+  const input = {
+    domain: D,
+    objectives: [{ domain: D, objective_id: "obj-ok", content_hash: "h" }],
+  };
+  store.files.set("/fixture-bad.json", JSON.stringify(input));
+  let writes = 0;
+  const origWrite = store.writeFile;
+  store.writeFile = async (p, content) => {
+    writes += 1;
+    return origWrite(p, content);
+  };
+  const deps: LineageCliDeps = {
+    store,
+    readFile: store.readFile,
+    log: () => {},
+    validateIntegrity: () => ({
+      ok: false,
+      diagnostics: [
+        {
+          code: "unknown_target",
+          message: "edge target_id absent from graph (injected for fail-closed test)",
+          edge_id: "e-bad",
+        },
+      ],
+    }),
+  };
+  const summary = await runLineageIngest(
+    {
+      repoDir: REPO,
+      verb: "ingest",
+      fixturePath: "/fixture-bad.json",
+    },
+    deps,
+  );
+  assert.equal(summary.integrity_ok, false);
+  assert.equal(summary.rejected, true);
+  assert.equal(summary.written_nodes, 0);
+  assert.equal(summary.written_edges, 0);
+  assert.equal(writes, 0, "must not write nodes/edges when integrity fails");
+  assert.ok(summary.diagnostics.some((d) => d.code === "unknown_target"));
 });
 
 // ---------------------------------------------------------------------------

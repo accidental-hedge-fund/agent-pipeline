@@ -83,8 +83,21 @@ export function resolveCapabilityId(domain: string, localKey: string): Capabilit
 }
 
 /**
+ * Encode a local identifier so path separators cannot collide distinct paths.
+ * Percent-encodes `/` and `\` only — reversible and stable for unchanged input.
+ * Example: `a/b` → `a%2Fb` vs `a_b` → `a_b` (distinct).
+ */
+export function encodeLocalId(localId: string): string {
+  return localId.replace(/[/\\]/g, (ch) => (ch === "/" ? "%2F" : "%5C"));
+}
+
+/**
  * Build a global node_id for an artifact type under a domain.
- * Form: `{domain}::{node_type}:{local_id}`
+ * Form: `{domain}::{node_type}:{encoded_local_id}`
+ *
+ * Local ids use collision-free encoding for path separators so repository-native
+ * paths like `openspec/specs/a_b/spec.md` and `openspec/specs/a/b/spec.md` never
+ * share one node identity.
  */
 export function makeDomainNodeId(
   domain: string,
@@ -96,8 +109,7 @@ export function makeDomainNodeId(
   if (!local || isPlaceholderIdentity(local)) {
     throw new Error("local id must be non-empty and non-placeholder");
   }
-  // Commit SHAs and similar may contain colons rarely; sanitize path seps only.
-  const safeLocal = local.replace(/[/\\]/g, "_");
+  const safeLocal = encodeLocalId(local);
   return `${d}${DOMAIN_ID_SEP}${nodeType}:${safeLocal}`;
 }
 

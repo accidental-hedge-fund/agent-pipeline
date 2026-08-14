@@ -7,14 +7,17 @@
 // Host-local store under .agent-pipeline/lineage/. No hosted UI. Free text redacted.
 // Does not mutate GitHub, stages, or merge state.
 
+import { createHash } from "node:crypto";
 import * as fsp from "node:fs/promises";
-import * as path from "node:path";
 import {
   DEFAULT_LINEAGE_RETENTION_DAYS,
+  listAnalysisRecords,
   listLineage,
   loadGraphSnapshot,
   realLineageStoreDeps,
+  upsertAnalysisRecord,
   upsertGraph,
+  type LineageAnalysisRecord,
   type LineageStoreDeps,
 } from "./store.ts";
 import {
@@ -24,6 +27,8 @@ import {
   formatProposalsHuman,
   type CompletenessGateConfig,
   evaluateLineageCompletenessGate,
+  type ForwardImpactReport,
+  type LineageUpdateProposal,
 } from "./impact.ts";
 import { buildLineageExportSection, formatLineageExportHuman } from "./export.ts";
 import { ingestLineageArtifacts, type LineageIngestInput } from "./ingest.ts";
@@ -71,6 +76,8 @@ export interface LineageCliDeps {
   store: LineageStoreDeps;
   readFile: (p: string) => Promise<string>;
   log: (msg: string) => void;
+  /** Injectable integrity validator (tests inject fakes; default is pure offline check). */
+  validateIntegrity?: typeof validateGraphIntegrity;
 }
 
 export function realLineageCliDeps(): LineageCliDeps {
@@ -80,7 +87,38 @@ export function realLineageCliDeps(): LineageCliDeps {
     log: (msg) => {
       process.stdout.write(`${msg}\n`);
     },
+    validateIntegrity: validateGraphIntegrity,
   };
+}
+
+function analysisIdFor(kind: string, parts: string[]): string {
+  const h = createHash("sha1").update([kind, ...parts].join("|")).digest("hex").slice(0, 16);
+  return `${kind}:${h}`;
+}
+
+function impactFromAnalyses(
+  records: LineageAnalysisRecord[],
+): ForwardImpactReport | null {
+  const ordered = records
+    .filter((r) => r.record_kind === "forward_impact" && r.impact)
+    .sort((a, b) => a.computed_at.localeCompare(b.computed_at));
+  return ordered[ordered.length - 1]?.impact ?? null;
+}
+
+function proposalsFromAnalyses(
+  records: LineageAnalysisRecord[],
+): LineageUpdateProposal[] {
+  const out: LineageUpdateProposal[] = [];
+  const seen = new Set<string>();
+  for (const r of records) {
+    if (r.record_kind !== "backward_proposals" || !r.proposals) continue;
+    for (const p of r.proposals) {
+      if (seen.has(p.proposal_id)) continue;
+      seen.add(p.proposal_id);
+      out.push(p);
+    }
+  }
+  return out;
 }
 
 export async function runLineageExport(
@@ -93,10 +131,19 @@ export async function runLineageExport(
     { retentionDays, now: opts.now, runId: opts.runId },
     deps.store,
   );
+  const analyses = await listAnalysisRecords(
+    opts.repoDir,
+    { runId: opts.runId },
+    deps.store,
+  );
+  const impact = impactFromAnalyses(analyses.records);
+  const proposals = proposalsFromAnalyses(analyses.records);
   return buildLineageExportSection({
     nodes: listed.nodes,
     edges: listed.edges,
     run_id: opts.runId,
+    impact,
+    proposals: proposals.length > 0 ? proposals : null,
     include_records: opts.includeRecords,
     skip_reason:
       listed.nodes.length === 0 && listed.diagnostics.some((d) => d.code === "missing_lineage_store")
@@ -119,11 +166,37 @@ export async function runLineageImpact(
     { retentionDays: opts.retentionDays ?? DEFAULT_LINEAGE_RETENTION_DAYS, now: opts.now },
     deps.store,
   );
-  return computeForwardImpact(graph, {
+  const report = computeForwardImpact(graph, {
     upstream_node_id: opts.nodeId,
     new_revision: opts.newRevision ?? null,
     new_content_hash: opts.newHash ?? null,
   });
+
+  // Persist immutable impact record for later evidence export.
+  if (!opts.dryRun) {
+    const computedAt = (opts.now ?? new Date()).toISOString();
+    const analysis_id = analysisIdFor("impact", [
+      opts.nodeId,
+      opts.newRevision ?? "",
+      opts.newHash ?? "",
+      opts.runId ?? "",
+      computedAt,
+    ]);
+    const record: LineageAnalysisRecord = {
+      schema_version: LINEAGE_SCHEMA_VERSION,
+      type: "lineage_analysis_record",
+      analysis_id,
+      record_kind: "forward_impact",
+      run_id: opts.runId ?? null,
+      computed_at: computedAt,
+      impact: report,
+      proposals: null,
+      drift_reason_codes: [...report.drift_reason_codes],
+    };
+    await upsertAnalysisRecord(opts.repoDir, record, deps.store);
+  }
+
+  return report;
 }
 
 export async function runLineagePropose(
@@ -135,9 +208,38 @@ export async function runLineagePropose(
     { retentionDays: opts.retentionDays ?? DEFAULT_LINEAGE_RETENTION_DAYS, now: opts.now },
     deps.store,
   );
-  return computeBackwardProposals(graph, {
+  const result = computeBackwardProposals(graph, {
     evidence_node_id: opts.evidenceNodeId,
   });
+
+  // Persist immutable proposal records for later evidence export.
+  if (!opts.dryRun) {
+    const computedAt = (opts.now ?? new Date()).toISOString();
+    const analysis_id = analysisIdFor("propose", [
+      opts.evidenceNodeId ?? "all",
+      opts.runId ?? "",
+      ...result.proposals.map((p) => p.proposal_id).sort(),
+      computedAt,
+    ]);
+    const drift = new Set<string>();
+    for (const p of result.proposals) {
+      for (const c of p.reason_codes) drift.add(c);
+    }
+    const record: LineageAnalysisRecord = {
+      schema_version: LINEAGE_SCHEMA_VERSION,
+      type: "lineage_analysis_record",
+      analysis_id,
+      record_kind: "backward_proposals",
+      run_id: opts.runId ?? null,
+      computed_at: computedAt,
+      impact: null,
+      proposals: result.proposals,
+      drift_reason_codes: [...drift].sort(),
+    };
+    await upsertAnalysisRecord(opts.repoDir, record, deps.store);
+  }
+
+  return result;
 }
 
 export async function runLineageIngest(
@@ -149,6 +251,7 @@ export async function runLineageIngest(
   diagnostics: Array<{ code: string; message: string; ref?: string }>;
   integrity_ok: boolean;
   dry_run: boolean;
+  rejected: boolean;
 }> {
   if (!opts.fixturePath) {
     throw new Error("lineage ingest requires --fixture <path> (JSON LineageIngestInput)");
@@ -156,7 +259,28 @@ export async function runLineageIngest(
   const raw = await deps.readFile(opts.fixturePath);
   const input = JSON.parse(raw) as LineageIngestInput;
   const result = ingestLineageArtifacts(input);
-  const integrity = validateGraphIntegrity({ nodes: result.nodes, edges: result.edges });
+  const checkIntegrity = deps.validateIntegrity ?? validateGraphIntegrity;
+  const integrity = checkIntegrity({ nodes: result.nodes, edges: result.edges });
+  const diagnostics = [
+    ...result.diagnostics,
+    ...integrity.diagnostics.map((d) => ({
+      code: d.code,
+      message: d.message,
+      ref: d.edge_id ?? d.node_id,
+    })),
+  ];
+
+  // Fail closed: never write invalid graphs as authoritative.
+  if (!integrity.ok) {
+    return {
+      written_nodes: 0,
+      written_edges: 0,
+      diagnostics,
+      integrity_ok: false,
+      dry_run: !!opts.dryRun,
+      rejected: true,
+    };
+  }
 
   if (!opts.dryRun) {
     await upsertGraph(
@@ -169,13 +293,10 @@ export async function runLineageIngest(
   return {
     written_nodes: result.nodes.length,
     written_edges: result.edges.length,
-    diagnostics: [...result.diagnostics, ...integrity.diagnostics.map((d) => ({
-      code: d.code,
-      message: d.message,
-      ref: d.edge_id ?? d.node_id,
-    }))],
-    integrity_ok: integrity.ok,
+    diagnostics,
+    integrity_ok: true,
     dry_run: !!opts.dryRun,
+    rejected: false,
   };
 }
 
@@ -221,19 +342,26 @@ export async function runLineageCli(
       process.stdout.write(
         `${JSON.stringify({ schema_version: LINEAGE_SCHEMA_VERSION, type: "lineage_ingest", ...summary }, null, 2)}\n`,
       );
-      return;
-    }
-    deps.log("# pipeline lineage ingest");
-    deps.log(`Nodes: ${summary.written_nodes}; edges: ${summary.written_edges}${summary.dry_run ? " (dry-run)" : ""}`);
-    deps.log(`Integrity: ${summary.integrity_ok ? "ok" : "diagnostics present"}`);
-    if (summary.diagnostics.length) {
-      deps.log("Diagnostics:");
-      for (const d of summary.diagnostics) {
-        deps.log(`  [${d.code}] ${d.message}`);
+    } else {
+      deps.log("# pipeline lineage ingest");
+      deps.log(
+        `Nodes: ${summary.written_nodes}; edges: ${summary.written_edges}${summary.dry_run ? " (dry-run)" : ""}${summary.rejected ? " (rejected)" : ""}`,
+      );
+      deps.log(`Integrity: ${summary.integrity_ok ? "ok" : "failed — not written"}`);
+      if (summary.diagnostics.length) {
+        deps.log("Diagnostics:");
+        for (const d of summary.diagnostics) {
+          deps.log(`  [${d.code}] ${d.message}`);
+        }
       }
+      deps.log("");
+      deps.log("Privacy: store is host-local under .agent-pipeline/lineage/; free text redacted.");
     }
-    deps.log("");
-    deps.log("Privacy: store is host-local under .agent-pipeline/lineage/; free text redacted.");
+    if (summary.rejected || !summary.integrity_ok) {
+      throw new Error(
+        "lineage ingest refused: graph integrity validation failed; invalid records were not written",
+      );
+    }
     return;
   }
 
