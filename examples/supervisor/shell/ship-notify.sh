@@ -46,7 +46,11 @@ DEDUP_TTL_S="${SHIP_NOTIFY_DEDUP_TTL_S:-120}"
 MAX_ATTEMPTS="${SHIP_NOTIFY_MAX_ATTEMPTS:-3}"
 BACKOFF_S="${SHIP_NOTIFY_BACKOFF_S:-5 15 45}"
 VERBOSE="${SHIP_NOTIFY_VERBOSE:-0}"
-mkdir -p "$DEDUP_DIR"
+# Best-effort notify directory: unusable state must not abort before send.
+if ! mkdir -p "$DEDUP_DIR" 2>/dev/null; then
+  printf 'ship-notify: notify state unavailable (%s); continuing without local persistence\n' \
+    "$DEDUP_DIR" >&2 || true
+fi
 
 force=0
 args=()
@@ -79,9 +83,14 @@ if [[ -n "$key" && "$force" -eq 0 ]]; then
       [[ $age -lt $DEDUP_TTL_S ]] && exit 0
     fi
   fi
-  printf '%s\t%s' "$now" "$content" >"$last"
+  # Best-effort dedupe write — skip if state is unusable.
+  if ! printf '%s\t%s' "$now" "$content" >"$last" 2>/dev/null; then
+    printf 'ship-notify: dedupe write failed (%s); continuing\n' "$last" >&2 || true
+  fi
 elif [[ -n "$key" ]]; then
-  printf '%s\t%s' "$(date +%s)" "$content" >"$DEDUP_DIR/$key_safe"
+  if ! printf '%s\t%s' "$(date +%s)" "$content" >"$DEDUP_DIR/$key_safe" 2>/dev/null; then
+    printf 'ship-notify: dedupe write failed (%s); continuing\n' "$DEDUP_DIR/$key_safe" >&2 || true
+  fi
 fi
 
 # No-op when messenger is not configured (safe default for CI / local use)

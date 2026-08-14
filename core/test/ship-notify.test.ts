@@ -254,3 +254,20 @@ test("unwritable audit/marker targets still exit 0 after send failure", () => {
   // Stderr fallback names the persistence failure (do not require exact wording).
   assert.match(r.stderr, /ship-notify:.*(audit|failure marker) write failed/i);
 });
+
+test("unusable PIPELINE_SUPERVISOR_STATE still exits 0 on fail-all send", () => {
+  // Eager mkdir/dedupe under set -e must not block before messenger retry or
+  // exit 0 — a broken state root is still best-effort notify.
+  const fx = makeFixture({ alwaysFail: true });
+  fs.rmSync(fx.state, { recursive: true, force: true });
+  // File (not directory) at the state root → mkdir -p for notify/ fails.
+  fs.writeFileSync(fx.state, "not-a-directory");
+
+  const r = runNotify(fx, ["unusable state root", "state-root-fail-key"]);
+  assert.equal(r.status, 0, `stderr=${r.stderr}`);
+  assert.equal(callCount(fx), 3, "must still attempt messenger sends");
+  assert.match(
+    r.stderr,
+    /ship-notify:.*(notify state unavailable|dedupe write failed|audit write failed|failure marker write failed)/i,
+  );
+});

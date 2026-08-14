@@ -16,6 +16,7 @@
 - [x] 2.5 Fixture: unconfigured / `SHIP_NOTIFY=0` / empty message → exit 0, no send, no invented failure marker.
 - [x] 2.6 Ensure the fail-all fixture would fail if audit/marker writing were removed (prove the regression bites).
 - [x] 2.7 Fixture: unwritable audit/marker targets after fail-all send → exit 0 with stderr persistence fallback (best-effort observability).
+- [x] 2.8 Fixture: unusable `PIPELINE_SUPERVISOR_STATE` with fail-all sends → exit 0; messenger still attempted; stderr notes state/persistence failure.
 
 ## 3. Docs and operator notes
 
