@@ -180,6 +180,11 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 - **Usage:** `pipeline correction record|attribute …`
 - **Summary:** Record a correction event or attribute a control (append-only local ledger)
 
+#### `lineage`
+
+- **Usage:** `pipeline lineage export|impact|propose|ingest [--run-id <id>] [--node-id <id>] [--fixture <path>] [--retention-days <n>] [--dry-run] [--json]`
+- **Summary:** Export, impact-analyze, or propose updates on the intent-lineage evidence graph (host-local store; #599). Backward proposals never silently edit authority; free text is redacted; no GitHub mutations
+
 #### `logs`
 
 - **Usage:** `pipeline logs [<run-id>] [--events] [-f] [--no-until-terminal]`

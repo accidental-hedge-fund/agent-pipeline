@@ -109,6 +109,7 @@ $pipeline sweep [--apply] [--repo owner/name]   Batch re-spec thin issues and re
 $pipeline triage <n> --stage ready|backlog      Set a pre-pipeline stage label (ready or backlog) on an issue
 $pipeline controls check [--json] [--strict]    Read-only repository-control drift check against configured desired state (#695); never mutates forge settings
 $pipeline correction record|attribute …         Record a correction event or attribute a control (append-only local ledger)
+$pipeline lineage export|impact|propose|ingest [--run-id <id>] [--node-id <id>] [--fixture <path>] [--retention-days <n>] [--dry-run] [--json] Export, impact-analyze, or propose updates on the intent-lineage evidence graph (host-local store; #599). Backward proposals never silently edit authority; free text is redacted; no GitHub mutations
 $pipeline logs [<run-id>] [--events] [-f] [--no-until-terminal] List or stream pipeline run logs (events --follow exits 0 on terminal run_complete)
 $pipeline outcomes ingest|list [--adapter github] [--fixture <path>] [--days <n>] [--retention-days <n>] [--dry-run] [--json] Ingest or list production/rework outcomes linked to pipeline runs (host-local store; #576). R2D alone is never production delivery; free text is redacted; no GitHub mutations
 $pipeline report [--yes]                        Privacy-safe product-fault report preview/submit (optional; off by default in config)

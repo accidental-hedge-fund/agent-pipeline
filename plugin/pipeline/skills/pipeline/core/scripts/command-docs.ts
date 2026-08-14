@@ -232,6 +232,15 @@ export const COMMAND_DOCS: Record<string, CommandDoc> = {
     documented: true,
     section: "observability",
   },
+  lineage: {
+    summary:
+      "Export, impact-analyze, or propose updates on the intent-lineage evidence graph (host-local store; #599). " +
+      "Backward proposals never silently edit authority; free text is redacted; no GitHub mutations",
+    usage:
+      "lineage export|impact|propose|ingest [--run-id <id>] [--node-id <id>] [--fixture <path>] [--retention-days <n>] [--dry-run] [--json]",
+    documented: true,
+    section: "observability",
+  },
   improve: {
     summary: "Cluster papercuts / corrections / durable-run blockers into backlog candidates",
     usage: "improve [--apply] [--top <n>] [--json]",

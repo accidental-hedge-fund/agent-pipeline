@@ -432,6 +432,29 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
     supportsJson: true,
   },
 
+  // Intent-lineage graph export / impact / propose / ingest (#599). Host-local
+  // store only; never mutates GitHub, stages, worktrees, or merge state.
+  lineage: {
+    needsIssueNumber: false,
+    allowedFlags: new Set([
+      "repoPath",
+      "json",
+      "dryRun",
+      "retentionDays",
+      "fixture",
+      "runId",
+      "nodeId",
+      "newRevision",
+      "newHash",
+      "evidenceNodeId",
+      "includeRecords",
+    ]),
+    needsConfig: false,
+    needsGhAuth: false,
+    mutatesGitHub: false,
+    supportsJson: true,
+  },
+
   roadmap: {
     needsIssueNumber: false,
     allowedFlags: new Set(["repoPath", "base", "profile", "apply", "next", "dryRun"]),

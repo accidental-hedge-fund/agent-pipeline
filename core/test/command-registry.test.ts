@@ -31,7 +31,7 @@ const DISPATCH_KEYWORDS = [
   "init", "doctor", "status", "unblock", "override", "cleanup",
   "release", "ship", "intake", "decompose", "sweep", "triage", "merge", "merge-queue", "train",
   "refine-spec", "logs", "summary", "path", "config", "run", "single", "improve",
-  "scoreboard", "outcomes", "roadmap", "loop", "correction", "report", "engine-promote",
+  "scoreboard", "outcomes", "lineage", "roadmap", "loop", "correction", "report", "engine-promote",
   "factory-gate", "factory-release", "factory-pin", "controls",
 ];
 

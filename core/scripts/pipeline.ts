@@ -445,6 +445,16 @@ export interface CliOpts {
   retentionDays?: number;
   /** outcomes ingest: absolute path to a JSON fixture of RawOutcomeSignal[]. */
   fixture?: string;
+  /** lineage impact: upstream node id for forward impact walk. */
+  nodeId?: string;
+  /** lineage impact: revised revision identity for the upstream node. */
+  newRevision?: string;
+  /** lineage impact: revised content hash for the upstream node. */
+  newHash?: string;
+  /** lineage propose: start backward proposals from this evidence node. */
+  evidenceNodeId?: string;
+  /** lineage export: include full node/edge records in the JSON slice. */
+  includeRecords?: boolean;
   /** scoreboard: explicit per-harness cost estimates, as harness=usd-per-call. */
   estimateCost?: string[];
   /** scoreboard: emit a chronological day|week time-series alongside the full-window summary. */
@@ -677,7 +687,10 @@ export function maxPositionalsFor(command: string | undefined): number {
     command === "status" ||
     command === "papercut" ||
     command === "correction" ||
-    command === "controls"
+    command === "controls" ||
+    // host-local store verbs with a subcommand: outcomes list|ingest, lineage export|impact|…
+    command === "outcomes" ||
+    command === "lineage"
   ) {
     return 2;
   }
@@ -705,7 +718,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | controls | run | single | release | ship | factory-gate | factory-release | factory-pin | engine-promote | intake | decompose | triage | roadmap | sweep | merge | merge-queue | train | summary | improve | scoreboard | outcomes | queue | backfill | evals | loop | correction | handoff | report")
+    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | controls | run | single | release | ship | factory-gate | factory-release | factory-pin | engine-promote | intake | decompose | triage | roadmap | sweep | merge | merge-queue | train | summary | improve | scoreboard | outcomes | lineage | queue | backfill | evals | loop | correction | handoff | report")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -824,8 +837,13 @@ export function buildCmd(): Command {
     .option("--until <date>", "scoreboard: restrict analysis to runs on or before this ISO date (e.g. 2026-06-15)")
     .option("--days <n>", "scoreboard/outcomes: analyze the last N days (default: 30 for scoreboard)", Number)
     .option("--adapter <id>", "outcomes ingest: source adapter id (default: github)")
-    .option("--retention-days <n>", "outcomes list: exclude records older than N days (default: 365)", Number)
-    .option("--fixture <path>", "outcomes ingest: JSON fixture of raw signals (offline; no network)")
+    .option("--retention-days <n>", "outcomes/lineage: exclude records older than N days (default: 365 outcomes / 90 lineage)", Number)
+    .option("--fixture <path>", "outcomes/lineage ingest: JSON fixture path (offline; no network)")
+    .option("--node-id <id>", "lineage impact: upstream node id for the forward impact walk")
+    .option("--new-revision <rev>", "lineage impact: new revision identity for the revised upstream node")
+    .option("--new-hash <hash>", "lineage impact: new content hash for the revised upstream node")
+    .option("--evidence-node-id <id>", "lineage propose: start backward proposals from this evidence node")
+    .option("--include-records", "lineage export: include full node/edge records in JSON output")
     .option("--estimate-cost <harness=usd>", "scoreboard: estimate missing harness-call costs; repeatable", collectRepeatable, [])
     .option("--bucket <unit>", "scoreboard: add a chronological day|week time-series alongside the full-window summary")
     .option("--by <dimension>", "scoreboard: group metrics by harness|model|effort|executor; repeatable (to detect a duplicate flag)", collectRepeatable, [])
@@ -5108,6 +5126,53 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Early lineage dispatch (#599) — host-local graph store only; no GitHub mutations.
+  if (numArg === "lineage") {
+    if (rawArgs.includes("--help") || rawArgs.includes("-h")) {
+      const { LINEAGE_HELP } = await import("./lineage/cli.ts");
+      process.stdout.write(LINEAGE_HELP);
+      process.exit(0);
+    }
+    const verb = cmd.args[1] as string | undefined;
+    if (verb !== "export" && verb !== "impact" && verb !== "propose" && verb !== "ingest") {
+      console.error(
+        'pipeline lineage: expected subcommand "export", "impact", "propose", or "ingest".\n' +
+          "  Usage: pipeline lineage export  [--json] [--retention-days <n>]\n" +
+          "         pipeline lineage impact  [--json] --node-id <id>\n" +
+          "         pipeline lineage propose [--json] [--evidence-node-id <id>]\n" +
+          "         pipeline lineage ingest  [--fixture <path>] [--dry-run] [--json]\n" +
+          "  Host-local store under .agent-pipeline/lineage/; free text redacted; no silent upstream mutation.",
+      );
+      process.exit(2);
+    }
+    const startDirLin = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
+    const repoDirLin = findGitRoot(startDirLin) ?? startDirLin;
+    try {
+      const { runLineageCli, realLineageCliDeps } = await import("./lineage/cli.ts");
+      await runLineageCli(
+        {
+          repoDir: repoDirLin,
+          verb,
+          json: !!opts.json,
+          dryRun: !!opts.dryRun,
+          retentionDays: opts.retentionDays,
+          fixturePath: opts.fixture,
+          runId: opts.runId,
+          nodeId: opts.nodeId,
+          newRevision: opts.newRevision,
+          newHash: opts.newHash,
+          evidenceNodeId: opts.evidenceNodeId,
+          includeRecords: !!opts.includeRecords,
+        },
+        realLineageCliDeps(),
+      );
+    } catch (err) {
+      console.error(`pipeline lineage: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    return;
+  }
+
   // Early scoreboard dispatch — no issue number, no config resolution, no GitHub calls.
   // It reads only existing run artifacts under .agent-pipeline/runs.
   if (numArg === "scoreboard") {
@@ -5573,7 +5638,7 @@ async function main(): Promise<void> {
     const recognized = [
       "init", "doctor", "status", "unblock", "override", "cleanup",
       "logs", "path", "config", "run", "single", "release", "intake", "decompose", "refine-spec",
-      "roadmap", "sweep", "triage", "merge", "merge-queue", "train", "ship", "summary", "improve", "scoreboard", "outcomes", "factory-gate", "factory-release", "factory-pin", "engine-promote", "queue", "backfill", "evals",
+      "roadmap", "sweep", "triage", "merge", "merge-queue", "train", "ship", "summary", "improve", "scoreboard", "outcomes", "lineage", "factory-gate", "factory-release", "factory-pin", "engine-promote", "queue", "backfill", "evals",
       "loop", "controls",
     ];
     if (!recognized.includes(numArg)) {

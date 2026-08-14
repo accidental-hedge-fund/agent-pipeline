@@ -84,6 +84,15 @@ export const OUTCOMES_ARTIFACT: ArtifactContractEntry = {
     "Production/rework outcome records linked to pipeline runs (#576); host-local, never committed.",
 };
 
+/** Host-local intent-lineage evidence graph (#599). Nodes/edges under
+ *  `.agent-pipeline/lineage/`; projects #575/#576 identities without a second
+ *  planning store. Local-only, never committed. */
+export const LINEAGE_ARTIFACT: ArtifactContractEntry = {
+  name: "lineage",
+  comment:
+    "Intent-lineage evidence graph (nodes/edges; #599); host-local, never committed.",
+};
+
 /** Ordered contract of every `.agent-pipeline/` directory (or file) the
  *  engine writes. No other module SHALL independently define an
  *  `.agent-pipeline/` artifact path — derive it from an entry here instead. */
@@ -96,6 +105,7 @@ export const ARTIFACT_CONTRACT: readonly ArtifactContractEntry[] = [
   PRODUCT_FAULT_REPORTS_ARTIFACT,
   HANDOFFS_ARTIFACT,
   OUTCOMES_ARTIFACT,
+  LINEAGE_ARTIFACT,
 ];
 
 /** Resolve `<repoDir>/.agent-pipeline/<entry.name>` for a contract entry. */
