@@ -110,6 +110,13 @@ export const PORCELAIN_DIRT_SITES: readonly PorcelainDirtSiteEntry[] = [
       "Pre-fix cleanliness refuses any porcelain before git reset --hard (destructive rollback safety #235). Does not setBlocked; returns error. Not a scratch-classification gate — any residual dirt is unsafe for hard reset.",
   },
   {
+    site_id: "stages.pre-merge-conflict-rebase",
+    module: "scripts/stages/pre-merge-conflict-rebase.ts",
+    disposition: "not-porcelain-dirt-gate",
+    notes:
+      "Lists unmerged paths via git status --porcelain / diff --diff-filter=U for conflict resolve (#1065). Not a product-vs-scratch dirt gate; residual conflict parks as review-findings product failure with path evidence.",
+  },
+  {
     site_id: "lockfile-side-effects",
     module: "scripts/lockfile-side-effects.ts",
     disposition: "not-porcelain-dirt-gate",

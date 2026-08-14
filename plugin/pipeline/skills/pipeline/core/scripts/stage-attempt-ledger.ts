@@ -25,6 +25,8 @@ export const STAGE_ACTIONS = [
   "ci_archive_fail_recovery",
   "ci_assertion_fix",
   "conflict_rebase",
+  /** Bounded conflict resolution after a clean auto-rebase miss (#1065). */
+  "conflict_resolve",
   "pre_merge_autofix",
   "openspec_repair",
   "worktree_rematerialize",

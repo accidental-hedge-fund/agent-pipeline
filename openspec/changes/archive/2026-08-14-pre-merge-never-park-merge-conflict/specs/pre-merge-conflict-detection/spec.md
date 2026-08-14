@@ -1,38 +1,4 @@
-# pre-merge-conflict-detection Specification
-
-## Purpose
-TBD - created by archiving change pre-merge-conflict-detection. Update Purpose after archive.
-
-## Requirements
-
-### Requirement: Pre-merge gate checks mergeability before waiting for CI
-
-The pre-merge gate SHALL fetch PR mergeability state before beginning the CI-check poll. If the mergeability state is CONFLICTING or DIRTY, the gate SHALL immediately route to the rebase path without polling for CI check runs.
-
-#### Scenario: CONFLICTING PR is detected before CI poll begins
-
-- **WHEN** the pre-merge gate begins processing a PR
-- **AND** `gh pr view --json mergeable,mergeStateStatus` returns `mergeable: "CONFLICTING"` or `mergeStateStatus: "DIRTY"`
-- **THEN** the gate SHALL skip the CI-check poll entirely
-- **AND** SHALL invoke `tryRebaseAndPush` for the PR branch
-- **AND** SHALL NOT return a "CI still running" or "gh pr checks failed" waiting reason
-
-#### Scenario: Non-conflicting PR with no CI workflow is unaffected
-
-- **WHEN** the pre-merge gate begins processing a PR
-- **AND** the PR is not CONFLICTING (mergeable is MERGEABLE or UNKNOWN)
-- **AND** `getPrChecks` returns zero check runs (repo has no CI workflow)
-- **THEN** the gate SHALL treat zero checks as passing
-- **AND** SHALL proceed to the mergeability check as today
-
-#### Scenario: UNKNOWN mergeability does not trigger the early-conflict path
-
-- **WHEN** the pre-merge gate fetches PR detail
-- **AND** GitHub has not yet computed mergeability (`mergeable` is null / UNKNOWN)
-- **THEN** the gate SHALL NOT invoke the early-conflict rebase path
-- **AND** SHALL continue with the CI poll as normal
-
----
+## MODIFIED Requirements
 
 ### Requirement: Early-conflict rebase attempt is bounded by a rebase-attempted guard
 
@@ -130,6 +96,8 @@ than immediately blocking with a merge-conflict manual-rebase reason.
 - **AND** SHALL NOT call `setBlocked` with a merge-conflict manual-rebase reason solely
   because the ledger already recorded that clean attempt
 
+## ADDED Requirements
+
 ### Requirement: Pre-merge conflict resolution SHALL finish rebase, force-with-lease push, and re-enter pre-merge
 
 When conflict resolution succeeds, pre-merge recovery SHALL complete the rebase in the
@@ -194,6 +162,7 @@ The early-conflict path and the post-CI CONFLICTING/DIRTY re-check path SHALL sh
 the same recovery law: clean auto-rebase, then bounded resolve, then product-failure
 only on budget exhaust — never first-conflict human manual-rebase park. A path-local
 fix of only one call site is insufficient.
+
 
 #### Scenario: Early-conflict and post-CI conflict share non-park recovery
 

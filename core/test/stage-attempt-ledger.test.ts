@@ -135,6 +135,14 @@ test("double-claim rejection: second claim returns existing without new charge",
 
 test("supersession on HEAD movement frees new head budget", () => {
   const ledger = emptyStageAttemptLedger();
+  // #1065: conflict_resolve is a first-class stage action (bounded resolve after clean miss).
+  const resolveClaim = claimStageAttempt(ledger, { headSha: HEAD, action: "conflict_resolve" });
+  assert.equal(resolveClaim.ok, true);
+  if (resolveClaim.ok) {
+    assert.equal(resolveClaim.created, true);
+    assert.equal(resolveClaim.attempt.action, "conflict_resolve");
+  }
+
   const claimed = claimStageAttempt(ledger, { headSha: HEAD, action: "conflict_rebase" });
   assert.equal(claimed.ok, true);
   if (!claimed.ok) return;

@@ -186,6 +186,17 @@ export interface AdvancePreMergeDeps extends ShaGateDeps {
    * the stage-attempt ledger when runDir is available.
    */
   rebaseAttemptedForHead?: (headSha: string) => boolean;
+  /**
+   * Optional head-SHA conflict-resolve budget probe for tests (#1065).
+   * Production uses the stage-attempt ledger `conflict_resolve` action.
+   */
+  conflictResolveAttemptedForHead?: (headSha: string) => boolean;
+  /**
+   * Bounded conflict resolution after a clean auto-rebase miss (#1065).
+   * Production default: deterministic additive resolve then implementer.
+   * Tests inject fakes — never parks first-conflict as human merge-conflict.
+   */
+  resolveMergeConflicts?: import("./pre-merge-conflict-rebase.ts").ResolveMergeConflictsFn;
   /** Injectable stage-attempt ledger I/O (#759). */
   stageAttemptLedgerDeps?: import("../stage-attempt-ledger.ts").StageAttemptLedgerDeps;
   // Seams for the OpenSpec archive step + its consistency guard (#106), so
@@ -1040,9 +1051,8 @@ export async function advance(
   // parseMergeable(), which also maps BEHIND/BLOCKED to "conflict". BEHIND
   // is an out-of-date branch (code is compatible, not conflicting); BLOCKED
   // is branch-protection preventing the merge. Routing those states to
-  // recoverFromMergeConflict consumes the rebase marker and then blocks on
-  // the next poll with a misleading "merge conflict — manual rebase needed"
-  // reason for a PR that never had a real code conflict.
+  // recoverFromMergeConflict would run clean-rebase + bounded resolve for a
+  // PR that never had a real code conflict (#95 / #1065).
   const freshPrDetail = await getPrDetailFn(cfg, prNumber);
 
   // Final SHA re-check for ci_mode: local: a developer push that arrives

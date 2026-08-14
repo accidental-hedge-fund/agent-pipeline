@@ -1,0 +1,5 @@
+schema: spec-driven
+created: 2026-08-14
+goal: On rebase conflict, keep worktree, dispatch implementer to finish rebase,
+  push force-with-lease, re-enter pre-merge; only fail closed after implementer
+  budget with product failure not manual-rebase park
