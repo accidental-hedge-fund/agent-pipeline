@@ -146,11 +146,73 @@ export interface StagedPolicyPromotionProvenance {
   kind: "engine-transition";
   /** effectivePolicyHash at the moment promotion into enforcing was evaluated. */
   policy_hash: string;
+  /**
+   * Digest of the append-only lineage at mint time. Binds this attestation to
+   * that exact chain so a stolen/reused token cannot cover a different lineage.
+   */
+  lineage_digest: string;
   /** Authenticated authority that authorized the promotion. */
   actor: string;
   role: string;
   /** ISO 8601 observed-at of the transition evaluation. */
   observed_at: string;
+}
+
+/**
+ * Module-private registry of provenance objects minted by
+ * {@link evaluateLifecycleTransition}. A caller-constructed plain object with
+ * matching public fields is NOT a member — structural self-attestation cannot
+ * satisfy the enforcing invariant (#695 ecf5cd91).
+ */
+const ENGINE_MINTED_PROMOTION_PROVENANCE = new WeakSet<object>();
+
+/** Stable digest over an ordered lineage chain (acceptance-independent). */
+function lineageDigest(lineage: readonly PolicyLineageEvent[]): string {
+  return buildPolicyHash({
+    lineage: lineage.map((e) => ({
+      policy_id: e.policy_id,
+      from_state: e.from_state,
+      to_state: e.to_state,
+      policy_hash_before: e.policy_hash_before,
+      policy_hash_after: e.policy_hash_after,
+      at: e.at,
+      authority: e.authority
+        ? { actor: e.authority.actor, role: e.authority.role }
+        : null,
+      evidence_refs: [...(e.evidence_refs ?? [])],
+    })),
+  });
+}
+
+/**
+ * Mint a frozen, engine-owned promotion provenance record. Only this path
+ * registers the object in the module-private WeakSet; public field forgeries
+ * and spread-copies are rejected by {@link isEngineMintedPromotionProvenance}.
+ */
+function mintEnginePromotionProvenance(input: {
+  policy_hash: string;
+  lineage: readonly PolicyLineageEvent[];
+  actor: string;
+  role: string;
+  observed_at: string;
+}): StagedPolicyPromotionProvenance {
+  const prov = Object.freeze({
+    kind: "engine-transition" as const,
+    policy_hash: input.policy_hash,
+    lineage_digest: lineageDigest(input.lineage),
+    actor: input.actor,
+    role: input.role,
+    observed_at: input.observed_at,
+  });
+  ENGINE_MINTED_PROMOTION_PROVENANCE.add(prov);
+  return prov;
+}
+
+/** True only for provenance objects minted by the engine in this process. */
+function isEngineMintedPromotionProvenance(
+  prov: StagedPolicyPromotionProvenance | null | undefined,
+): prov is StagedPolicyPromotionProvenance {
+  return !!prov && ENGINE_MINTED_PROMOTION_PROVENANCE.has(prov);
 }
 
 export interface StagedPolicy {
@@ -161,12 +223,15 @@ export interface StagedPolicy {
   /** Append-only lineage; never rewrite or delete entries. */
   lineage: PolicyLineageEvent[];
   /**
-   * Engine-attested promotion provenance (#695 66803fac). Absent for config
-   * materialization; only set by evaluateLifecycleTransition when a promotion
-   * into `enforcing` actually evaluated observation aggregates against policy
-   * thresholds and resolved an authenticated authority. Config-declared
-   * lineage can never carry this token, so a forged StagedPolicy object does
-   * not satisfy the enforcing invariant.
+   * Engine-attested promotion provenance (#695 66803fac / ecf5cd91). Absent for
+   * config materialization; only set by evaluateLifecycleTransition when a
+   * promotion into `enforcing` actually evaluated observation aggregates
+   * against policy thresholds and resolved an authenticated authority.
+   *
+   * The public DTO fields alone are NOT proof: the invariant requires the
+   * object identity to be engine-minted (module-private WeakSet) and the
+   * lineage_digest to match the current chain. A caller-constructed literal
+   * with matching kind/policy_hash/actor/role fails closed.
    */
   promotion_provenance?: StagedPolicyPromotionProvenance | null;
 }
@@ -720,26 +785,31 @@ export function evaluateLifecycleTransition(input: TransitionInput): TransitionR
     evidence_refs: [...(input.evidence_refs ?? [])],
   };
 
+  // Append-only: copy prior events byte-stable, then append.
+  const nextLineage = [...input.policy.lineage, event];
+
+  // Engine-owned promotion provenance (#695 66803fac / ecf5cd91): only the
+  // transition path that actually evaluated observation aggregates against
+  // thresholds and resolved an authenticated authority may mint this token
+  // into the module-private registry. Config materialization never sets it;
+  // a plain-object forgery with matching public fields fails the invariant.
+  const promotion_provenance =
+    to === "enforcing" && authorityPresent(input.authority)
+      ? mintEnginePromotionProvenance({
+          policy_hash: hashAfter,
+          lineage: nextLineage,
+          actor: (input.authority as PolicyAuthorityRecord).actor,
+          role: (input.authority as PolicyAuthorityRecord).role,
+          observed_at: input.at,
+        })
+      : null;
+
   const next: StagedPolicy = {
     policy_id: input.policy.policy_id,
     state: to,
     acceptance: acceptanceAfter,
-    // Append-only: copy prior events byte-stable, then append.
-    lineage: [...input.policy.lineage, event],
-    // Engine-attested promotion provenance (#695 66803fac): only the transition
-    // path that actually evaluated observation aggregates against thresholds
-    // and resolved an authenticated authority may attach this token. Config
-    // materialization never sets it.
-    promotion_provenance:
-      to === "enforcing" && authorityPresent(input.authority)
-        ? {
-            kind: "engine-transition",
-            policy_hash: hashAfter,
-            actor: (input.authority as PolicyAuthorityRecord).actor,
-            role: (input.authority as PolicyAuthorityRecord).role,
-            observed_at: input.at,
-          }
-        : null,
+    lineage: nextLineage,
+    promotion_provenance,
   };
 
   return { ok: true, policy: next, event };
@@ -751,17 +821,22 @@ export function hasEnforcingLineage(policy: StagedPolicy): boolean {
 }
 
 /**
- * Invariant check: an enforcing effective state MUST carry engine-attested
- * promotion provenance (transition-evaluated observation + authority) AND a
- * fully validated promotion lineage. Returns false when the invariant is
- * broken (config bypass or forged record).
+ * Invariant check: an enforcing effective state MUST carry engine-minted
+ * promotion provenance (transition-evaluated observation + authority, bound to
+ * the current policy_hash and lineage_digest) AND a fully validated promotion
+ * lineage. Returns false when the invariant is broken (config bypass, public
+ * DTO forgery, stolen/spread token, or hash/lineage mismatch).
  */
 export function enforcingStateHasLineage(policy: StagedPolicy): boolean {
   if (policy.state !== "enforcing") return true;
   const prov = policy.promotion_provenance;
-  if (!prov || prov.kind !== "engine-transition") return false;
-  // Provenance must match the current hash — a stale/forged token fails closed.
+  // Public structural fields alone are never sufficient (#695 ecf5cd91): the
+  // object must be engine-minted in this process (WeakSet membership).
+  if (!isEngineMintedPromotionProvenance(prov)) return false;
+  if (prov.kind !== "engine-transition") return false;
+  // Provenance must match the current hash and lineage — stale/stolen fails closed.
   if (prov.policy_hash !== effectivePolicyHash(policy)) return false;
+  if (prov.lineage_digest !== lineageDigest(policy.lineage)) return false;
   return hasValidEnforcingPromotionLineage(
     policy.policy_id,
     policy.lineage,

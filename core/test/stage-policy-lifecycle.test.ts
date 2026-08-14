@@ -641,12 +641,77 @@ test("forged StagedPolicy with valid lineage but no provenance fails invariant (
     promotion_provenance: {
       kind: "engine-transition",
       policy_hash: "0".repeat(64),
+      lineage_digest: "0".repeat(64),
       actor: "operator",
       role: "policy-admin",
       observed_at: AT,
     },
   };
   assert.equal(enforcingStateHasLineage(stale), false);
+});
+
+test("matching forged provenance DTO fails invariant (#695 ecf5cd91)", () => {
+  // A caller can construct an otherwise valid enforcing policy + lineage,
+  // compute its hash, and attach a literal token whose public fields match an
+  // engine attestation. That MUST fail: only engine-minted object identity
+  // (module-private WeakSet) counts as verified provenance.
+  const acceptance = { gate: true };
+  let runtime = createStagedPolicy("p1", acceptance);
+  runtime = promoteTo(runtime, "observe", { authority: null, observation: null });
+  runtime = promoteTo(runtime, "required");
+  runtime = promoteTo(runtime, "enforcing");
+  assert.equal(enforcingStateHasLineage(runtime), true);
+  assert.ok(runtime.promotion_provenance);
+  const realProv = runtime.promotion_provenance;
+
+  // Perfect structural forgery: clone policy + lineage and every public
+  // provenance field (kind, policy_hash, lineage_digest, actor, role, at).
+  // Only object identity differs from the engine mint.
+  const forgedLiteral: StagedPolicy = {
+    policy_id: runtime.policy_id,
+    state: "enforcing",
+    acceptance: { ...runtime.acceptance },
+    lineage: runtime.lineage.map((e) => ({
+      ...e,
+      authority: e.authority ? { ...e.authority } : null,
+      evidence_refs: [...e.evidence_refs],
+    })),
+    promotion_provenance: {
+      kind: realProv.kind,
+      policy_hash: realProv.policy_hash,
+      lineage_digest: realProv.lineage_digest,
+      actor: realProv.actor,
+      role: realProv.role,
+      observed_at: realProv.observed_at,
+    },
+  };
+  assert.equal(enforcingStateHasLineage(forgedLiteral), false);
+
+  // Spread-copy of a real provenance object is a new identity → not minted.
+  const stolenCopy: StagedPolicy = {
+    ...forgedLiteral,
+    promotion_provenance: { ...realProv },
+  };
+  assert.equal(enforcingStateHasLineage(stolenCopy), false);
+
+  // Attaching the real minted object to a different policy_id/hash fails the
+  // binding checks even though the object is engine-minted.
+  const rebound: StagedPolicy = {
+    policy_id: "other",
+    state: "enforcing",
+    acceptance: { ...runtime.acceptance },
+    lineage: runtime.lineage.map((e) => ({
+      ...e,
+      policy_id: "other",
+      authority: e.authority ? { ...e.authority } : null,
+      evidence_refs: [...e.evidence_refs],
+    })),
+    promotion_provenance: realProv,
+  };
+  assert.equal(enforcingStateHasLineage(rebound), false);
+
+  // Real engine-minted object on its original policy still passes.
+  assert.equal(enforcingStateHasLineage(runtime), true);
 });
 
 test("authorized retirement lineage is accepted via verified; bare retired is not", () => {
