@@ -45,7 +45,18 @@ import {
 } from "./gh.ts";
 import { PipelineLock, isKillSwitchActive, isLivePlanningActive, tryAcquireLivePlanningMarker, runStateDir, withLock } from "./lock.ts";
 import { findWrapperPidForIssue, isCoexistenceFailureEvidence } from "./loop/live-advance.ts";
-import { overrideComment, parseOverrideArg, scopedOverrideComment } from "./review-policy.ts";
+import {
+  govPayloadFromDecision,
+  overrideComment,
+  parseOverrideArg,
+  scopedOverrideComment,
+} from "./review-policy.ts";
+import {
+  buildOverrideDecision,
+  buildOverrideEvent,
+  implicitOverrideGovernance,
+  validateOverrideRecord,
+} from "./override-governance.ts";
 import {
   attestPipelineComment,
   extractBlockingKeysFromComment,
@@ -707,7 +718,7 @@ export function buildCmd(): Command {
     .option("--unblock <answer>", "post answer as a comment and clear the blocked label")
     .option(
       "--override <spec>",
-      'disposition a review finding so it no longer blocks, then auto-resume the advance loop: "<override-key>: <reason>" (key from the review comment; reason may lead with "rejected" or "deferred #N")',
+      'disposition a review finding so it no longer blocks, then auto-resume: "<key|scope>: [<class>:] <reason>" (class optional; bare reasons use default_class / implicit low_risk_deferred; evidence as kind=url tokens)',
     )
     .option("--once", "advance one stage and stop")
     .option("--dry-run", "log what would happen without invoking harnesses or modifying GitHub")
@@ -5739,16 +5750,20 @@ async function main(): Promise<void> {
     if (!overrideNumStr || !/^\d+$/.test(overrideNumStr)) {
       console.error(
         "pipeline override: an issue or PR number is required.\n" +
-          '  Usage: pipeline override <N> "<key>: <reason>"\n' +
-          '  Example: pipeline override 42 "abc123: deferred #99"',
+          '  Usage: pipeline override <N> "<key|scope>: [<class>:] <reason>"\n' +
+          '  Example: pipeline override 42 "abc12345: deferred #99"\n' +
+          '  Example: pipeline override 42 "abc12345: high_risk_accept: accept residual remediation_issue_url=https://… risk_acceptance_ref=RA-1"\n' +
+          "  Bare reasons map to default_class / implicit low_risk_deferred (#693).",
       );
       process.exit(2);
     }
     if (overrideSpec === undefined) {
       console.error(
         "pipeline override: a spec string is required.\n" +
-          '  Usage: pipeline override <N> "<key>: <reason>"\n' +
-          '  Example: pipeline override 42 "abc123: deferred #99"',
+          '  Usage: pipeline override <N> "<key|scope>: [<class>:] <reason>"\n' +
+          '  Example: pipeline override 42 "abc12345: deferred #99"\n' +
+          '  Example: pipeline override 42 "abc12345: high_risk_accept: accept residual remediation_issue_url=https://… risk_acceptance_ref=RA-1"\n' +
+          "  Bare reasons map to default_class / implicit low_risk_deferred (#693).",
       );
       process.exit(2);
     }
@@ -7132,6 +7147,10 @@ export interface RunOverrideDeps {
   silentTransition: typeof silentTransition;
   /** The advance loop re-entered after the disposition is recorded (#135). */
   runAdvance: typeof runAdvance;
+  /** Authenticated actor for governed override authority (#693). */
+  getGhActor?: typeof getGhActor;
+  /** Injectable clock for expiry fields (#693). */
+  now?: () => Date;
 }
 
 const defaultRunOverrideDeps: RunOverrideDeps = {
@@ -7140,6 +7159,7 @@ const defaultRunOverrideDeps: RunOverrideDeps = {
   clearBlocked,
   silentTransition,
   runAdvance,
+  getGhActor,
 };
 
 export async function runOverride(
@@ -7161,14 +7181,115 @@ export async function runOverride(
     process.exitCode = 2;
     return;
   }
-  const parsed = parseOverrideArg(spec);
+
+  const governance = cfg.override_governance ?? implicitOverrideGovernance();
+  const knownClasses = Object.keys(governance.classes);
+  const parsed = parseOverrideArg(spec, knownClasses);
   if ("error" in parsed) {
     console.error(`pipeline: ${parsed.error}`);
     process.exit(2);
   }
+
+  const getActor = deps.getGhActor ?? getGhActor;
+  const actor = await getActor();
+  const identitySource = "gh_actor";
+  const createdAt = (deps.now ?? (() => new Date))()
+    .toISOString()
+    .replace(/\.\d{3}Z$/, "Z");
+
+  const validated = await validateOverrideRecord({
+    governance,
+    classId: parsed.classId,
+    actor,
+    identitySource,
+    explanation: parsed.reason,
+    trustedAllowlist: cfg.trusted_override_actors,
+  });
+
+  const overrideRunDirEarly = await latestRunDirForIssue(
+    cfg.repo_dir,
+    originalNumber,
+    runStoreDeps,
+  ).catch(() => null);
+
+  if (!validated.ok) {
+    // Refuse path: no post, no label flip, clear error + rejected event (#693).
+    if (overrideRunDirEarly) {
+      await appendEvent(
+        overrideRunDirEarly,
+        {
+          schema_version: RUN_SCHEMA_VERSION,
+          ...buildOverrideEvent("override_rejected", {
+            class: parsed.classId,
+            actor,
+            target:
+              parsed.kind === "key"
+                ? { kind: "key", key: parsed.key }
+                : {
+                    kind: "scope",
+                    scopeType: parsed.scopeType,
+                    scopeValue: parsed.scopeValue,
+                  },
+            lifecycle: "rejected",
+            reason: validated.message,
+            at: createdAt,
+          }),
+        },
+        runStoreDeps,
+      ).catch(() => {});
+      const stateDir = path.dirname(overrideRunDirEarly);
+      await recordOverride(stateDir, originalNumber, {
+        key:
+          parsed.kind === "key"
+            ? parsed.key
+            : `${parsed.scopeType}:${parsed.scopeValue}`,
+        reason: parsed.reason,
+        kind: "human-risk-override",
+        class: parsed.classId,
+        lifecycle: "rejected",
+        actor: actor ?? undefined,
+        created_at: createdAt,
+        authorization_summary: validated.refusal,
+      }).catch(() => {});
+    }
+    console.error(`pipeline: override refused (${validated.refusal}): ${validated.message}`);
+    process.exitCode = 2;
+    return;
+  }
+
   const detail = await deps.getIssueDetail(cfg, issueNumber);
   const stage = pickStage(detail.labels) ?? "(unknown)";
-  const ts = new Date().toISOString().replace(/\.\d+Z$/, "Z");
+  const ts = createdAt;
+
+  const target =
+    parsed.kind === "key"
+      ? ({ kind: "key" as const, key: parsed.key })
+      : ({
+          kind: "scope" as const,
+          scopeType: parsed.scopeType,
+          scopeValue: parsed.scopeValue,
+        });
+
+  // Fingerprint/region/subject: optional at CLI record time when no live
+  // finding objects are available; extractors treat missing subject as
+  // legacy_unbound for low-risk compatibility. Validity still enforces
+  // expiry and authorization.
+  const decision = buildOverrideDecision({
+    classId: validated.classId,
+    disposition: parsed.disposition,
+    target,
+    explanation: validated.explanation,
+    actor: actor!,
+    identitySource,
+    authorization: validated.authorization,
+    evidenceRefs: validated.evidenceRefs,
+    findingFingerprint: null,
+    codeRegion: null,
+    createdAt: ts,
+    maxDurationHours: validated.classPolicy.max_duration_hours,
+  });
+  const gov = govPayloadFromDecision(decision);
+
   // Branch on kind: scope dispositions use a distinct sentinel so extractScopedOverrides
   // can read them back; key dispositions keep the existing pipeline-override sentinel.
   let body: string;
@@ -7178,22 +7299,28 @@ export async function runOverride(
       scopeType: parsed.scopeType,
       scopeValue: parsed.scopeValue,
       disposition: parsed.disposition,
-      reason: parsed.reason,
+      reason: validated.explanation,
       stage,
       timestamp: ts,
       footer: cfg.marker_footer,
+      gov,
     });
-    overrideLogMsg = `recorded scoped override for ${parsed.scopeType}:${parsed.scopeValue} (${parsed.disposition}).`;
+    overrideLogMsg =
+      `recorded scoped override for ${parsed.scopeType}:${parsed.scopeValue} ` +
+      `(${parsed.disposition}, class=${validated.classId}, expires=${decision.expires_at}).`;
   } else {
     body = overrideComment({
       key: parsed.key,
       disposition: parsed.disposition,
-      reason: parsed.reason,
+      reason: validated.explanation,
       stage,
       timestamp: ts,
       footer: cfg.marker_footer,
+      gov,
     });
-    overrideLogMsg = `recorded override for finding ${parsed.key} (${parsed.disposition}).`;
+    overrideLogMsg =
+      `recorded override for finding ${parsed.key} ` +
+      `(${parsed.disposition}, class=${validated.classId}, expires=${decision.expires_at}).`;
   }
   await deps.postComment(cfg, issueNumber, body);
   // If the item is blocked (e.g. a review round blocked on this finding), clear
@@ -7209,7 +7336,8 @@ export async function runOverride(
   // "rejected" is a rejection disposition; every other disposition (e.g.
   // "deferred-#N") is an override. Non-fatal/best-effort: no run directory for
   // this issue silently skips emission.
-  const overrideRunDir = await latestRunDirForIssue(cfg.repo_dir, originalNumber, runStoreDeps).catch(() => null);
+  const overrideRunDir = overrideRunDirEarly ??
+    (await latestRunDirForIssue(cfg.repo_dir, originalNumber, runStoreDeps).catch(() => null));
   if (overrideRunDir) {
     const evidenceRefId = parsed.kind === "key" ? parsed.key : `${parsed.scopeType}:${parsed.scopeValue}`;
     // #499 finding 7971a697: stamp the SHA the overridden/rejected finding was
@@ -7241,9 +7369,45 @@ export async function runOverride(
       failure_class: "review-finding",
       reviewed_sha: overrideReviewedSha,
       evidence_ref: { kind: "finding", id: evidenceRefId },
-      correction: `${parsed.disposition}: ${parsed.reason}`,
+      correction: `${parsed.disposition}: ${validated.explanation}`,
       reusable: "unknown",
     }, runStoreDeps).catch(() => {});
+
+    await appendEvent(
+      overrideRunDir,
+      {
+        schema_version: RUN_SCHEMA_VERSION,
+        ...buildOverrideEvent("override_recorded", {
+          decision_id: decision.decision_id,
+          class: decision.class,
+          actor: decision.actor,
+          target: decision.target,
+          lifecycle: "active",
+          expires_at: decision.expires_at,
+          created_at: decision.created_at,
+          at: ts,
+        }),
+      },
+      runStoreDeps,
+    ).catch(() => {});
+
+    const stateDir = path.dirname(overrideRunDir);
+    await recordOverride(stateDir, originalNumber, {
+      key: evidenceRefId,
+      reason: validated.explanation,
+      kind: "human-risk-override",
+      class: decision.class,
+      decision_id: decision.decision_id,
+      lifecycle: "active",
+      expires_at: decision.expires_at,
+      created_at: decision.created_at,
+      actor: decision.actor,
+      authorization_summary: decision.authorization.evidence,
+      supersedes: decision.supersedes,
+      renewed_from: decision.renewed_from,
+      renewal_kind: decision.renewal_kind,
+      evidence_subject: decision.evidence_subject,
+    }).catch(() => {});
   }
 
   // #135: the human's judgment WAS the key+reason — everything from here is
@@ -7253,6 +7417,7 @@ export async function runOverride(
   // the ceiling comment — the same relabel the operator previously did by hand.
   // Fail-safe: remaining blockers re-park at needs-human; the resumed loop never
   // advances past an unresolved one, and still stops at ready-to-deploy.
+  // #693: auto-resume only after a currently valid governed record (refuse path returned above).
   if (stage === "needs-human") {
     const ceiling = [...detail.comments]
       .reverse()

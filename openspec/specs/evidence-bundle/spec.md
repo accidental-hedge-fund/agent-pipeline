@@ -2,7 +2,9 @@
 
 ## Purpose
 TBD - created by archiving change evidence-bundle. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: Pipeline run writes a JSON evidence bundle to a stable, issue-scoped path
 The pipeline orchestrator SHALL create a run directory at `.agent-pipeline/runs/<run-id>/` before any stage handler is called (see `run-directory-layout` spec). The evidence bundle is now composed of two files within that directory: `events.jsonl` (incremental append-only event log, see `events-jsonl-streaming` spec) and `summary.json` (the finalized bundle written at `finalizeRun()`). For backward compatibility, `summary.json` content SHALL also be written to `<stateDir>/<issueNumber>/evidence.json` at finalization. The legacy `evidence.json` at `<stateDir>/<issueNumber>/evidence.json` SHALL remain readable after finalization so that existing consumers experience no breakage.
 
@@ -735,3 +737,34 @@ When a run creates, answers, rejects, supersedes, expires, or attempts resume va
 - **THEN** evidence SHALL include responder identity reference, decision, and timestamp
 - **AND** SHALL include whether the handoff was authority-bearing
 
+### Requirement: Evidence bundle SHALL record governed override decisions and lifecycle state
+
+The evidence bundle (or equivalent run evidence surface) SHALL include override decision records sufficient to distinguish `active`, `expired`, `superseded`, `renewed`, `rejected`, and `invalidated` outcomes for the run. Each recorded decision SHALL expose class, target, actor, authorization summary, timestamps (`created_at`, `expires_at`), lineage identifiers when present, evidence and remediation references, and evidence-subject binding or legacy-unbound disposition. Free-text reasons alone SHALL NOT be the only machine-readable representation of lifecycle state.
+
+#### Scenario: active and expired decisions appear distinctly
+
+- **WHEN** a run recorded one still-active decision and one expired decision
+- **THEN** the evidence bundle SHALL list both
+- **AND** their lifecycle fields SHALL differ (`active` vs `expired`)
+
+#### Scenario: rejected attempt is visible
+
+- **WHEN** an override recording attempt is refused for unauthorized or missing-evidence reasons
+- **THEN** the run evidence or event stream SHALL retain a rejected outcome record for analysis
+- **AND** SHALL NOT imply the finding was dispositioned
+
+#### Scenario: renewal lineage is visible
+
+- **WHEN** decision D2 renews D1
+- **THEN** evidence SHALL allow a consumer to read D2’s link to D1
+- **AND** to see both records without in-place mutation of D1
+
+### Requirement: Evidence bundle SHALL support age and recurrence analysis fields
+
+For each override decision in evidence, the bundle or accompanying machine-readable events SHALL include enough structured fields for consumers to compute decision age, class, authority actor, renewal count or lineage depth, and correlation to the finding or scope target for recurrence analysis.
+
+#### Scenario: age and class are structured
+
+- **WHEN** a consumer reads an override decision from the evidence bundle
+- **THEN** it SHALL obtain `created_at`, `expires_at`, and `class` without parsing the human explanation paragraph
+- **AND** SHALL obtain the target key or scope identity as structured fields

@@ -30,7 +30,19 @@ import {
   type SettledFindingVerification,
 } from "./review-history.ts";
 import { attestPipelineComment, isVerifiedPipelineAttestation } from "./stages/review-parsing.ts";
-import type { ReviewFinding } from "./types.ts";
+import type { ReviewFinding, OverrideGovernanceConfig } from "./types.ts";
+import type { EvidenceSubjectV1 } from "./evidence-subject.ts";
+import {
+  activeProjectionToPartitionInputs,
+  buildOverrideDecision,
+  IMPLICIT_LOW_RISK_CLASS,
+  IMPLICIT_MAX_DURATION_HOURS,
+  implicitOverrideGovernance,
+  projectActiveOverrides,
+  type OverrideDecisionV1,
+  type OverrideTarget,
+  type LiveOverrideContext,
+} from "./override-governance.ts";
 
 // Severity ordering, least → most severe. A finding blocks when its severity
 // rank is >= the configured threshold's rank.
@@ -981,6 +993,7 @@ function normalizeDisposition(reason: string): string {
  * The audited override comment body. The visible block records the disposition,
  * stage, timestamp, and reason; the trailing sentinel is what the gate reads.
  * GitHub comment authorship supplies the "who" half of the audit trail.
+ * Optional `gov` adds a dual-read governance line before the legacy sentinel (#693).
  */
 export function overrideComment(args: {
   key: string;
@@ -989,13 +1002,17 @@ export function overrideComment(args: {
   stage: string;
   timestamp: string;
   footer?: string;
+  /** Governed decision payload (#693). When set, class/expiry/lineage are visible. */
+  gov?: OverrideGovPayload;
 }): string {
-  const { key, disposition, reason, stage, timestamp, footer } = args;
+  const { key, disposition, reason, stage, timestamp, footer, gov } = args;
+  const classLine = gov ? [`**Class**: \`${gov.class}\``, `**Decision**: \`${gov.decision_id}\``, `**Expires**: ${gov.expires_at}`, ""] : [];
   const rendered = [
     "## Pipeline: Finding override",
     "",
     `**Finding**: \`${key}\``,
     `**Disposition**: ${disposition}`,
+    ...classLine,
     `**Stage**: ${stage}`,
     `**Recorded at**: ${timestamp}`,
     "",
@@ -1004,6 +1021,7 @@ export function overrideComment(args: {
     "",
     (footer ?? "*Automated by Claude Code Pipeline Skill*").trim(),
     "",
+    ...(gov ? [formatOverrideGovLine(gov), ""] : []),
     `<!-- pipeline-override: ${key} ${disposition} -->`,
   ].join("\n");
   return attestPipelineComment("finding-override", rendered);
@@ -1024,17 +1042,21 @@ export function scopedOverrideComment(args: {
   stage: string;
   timestamp: string;
   footer?: string;
+  /** Governed decision payload (#693). */
+  gov?: OverrideGovPayload;
 }): string {
-  const { scopeType, scopeValue, disposition, reason, stage, timestamp, footer } = args;
+  const { scopeType, scopeValue, disposition, reason, stage, timestamp, footer, gov } = args;
   // Sanitize the reason before embedding in the machine sentinel: strip newlines and
   // escape HTML comment close sequences so reason text cannot contain a sentinel-shaped
   // line or close the comment early (#229 Finding 2).
   const safeReason = reason.replace(/[\r\n]/g, " ").replace(/-->/g, "—>");
+  const classLine = gov ? [`**Class**: \`${gov.class}\``, `**Decision**: \`${gov.decision_id}\``, `**Expires**: ${gov.expires_at}`, ""] : [];
   const rendered = [
     "## Pipeline: Scope override",
     "",
     `**Scope**: \`${scopeType}:${scopeValue}\``,
     `**Disposition**: ${disposition}`,
+    ...classLine,
     `**Stage**: ${stage}`,
     `**Recorded at**: ${timestamp}`,
     "",
@@ -1043,10 +1065,38 @@ export function scopedOverrideComment(args: {
     "",
     (footer ?? "*Automated by Claude Code Pipeline Skill*").trim(),
     "",
+    ...(gov ? [formatOverrideGovLine(gov), ""] : []),
     `<!-- pipeline-override-scope: ${scopeType}:${encodeURIComponent(scopeValue)} ${disposition} | ${safeReason} -->`,
   ].join("\n");
   return attestPipelineComment("scope-override", rendered);
 }
+
+/** Build a gov payload from a recorded decision for comment embedding. */
+export function govPayloadFromDecision(d: OverrideDecisionV1): OverrideGovPayload {
+  return {
+    decision_id: d.decision_id,
+    class: d.class,
+    disposition: d.disposition,
+    target: d.target,
+    actor: d.actor,
+    identity_source: d.identity_source,
+    authorization_matched_rule: d.authorization.matched_rule,
+    authorization_evidence: d.authorization.evidence,
+    explanation: d.explanation,
+    evidence_refs: { ...d.evidence_refs },
+    finding_fingerprint: d.finding_fingerprint,
+    code_region: d.code_region,
+    created_at: d.created_at,
+    expires_at: d.expires_at,
+    supersedes: d.supersedes,
+    renewed_from: d.renewed_from,
+    renewal_kind: d.renewal_kind,
+    evidence_subject: d.evidence_subject,
+  };
+}
+
+// Re-export for callers that need decision construction without importing governance.
+export { buildOverrideDecision, IMPLICIT_LOW_RISK_CLASS, IMPLICIT_MAX_DURATION_HOURS };
 
 // ---------------------------------------------------------------------------
 // Non-reproducing disposition (#391) — SHA-anchored, machine-authored, weaker
@@ -1217,25 +1267,62 @@ export function extractNonReproducingDispositions(
 }
 
 /**
- * Parse a `--override` CLI argument. Accepts three forms:
+ * Parse a `--override` CLI argument. Accepts:
  *
- *   "<key>: <reason>"                    → key disposition (existing behavior)
- *   "category:<name>: <reason>"          → category scope disposition (#229)
- *   "file:<path>: <reason>"              → file/path-prefix scope disposition (#229)
+ *   "<key>: <reason>"                         → key disposition
+ *   "<key>: <class>: <reason>"                → key + explicit class (#693)
+ *   "category:<name>: <reason>"               → category scope (#229)
+ *   "category:<name>: <class>: <reason>"      → category + class (#693)
+ *   "file:<path>: <reason>"                   → file/path-prefix scope (#229)
+ *   "file:<path>: <class>: <reason>"          → file + class (#693)
  *
+ * Class is recognized only when `knownClasses` is supplied and the token is a
+ * member; otherwise the token is part of the free-form reason (compatibility).
  * For key dispositions, the key must be exactly 8 lowercase hex chars.
- * For scoped dispositions, the scope value must be non-empty and the reason
- * must be non-empty; the scope value is normalized (lowercase, trimmed).
- * An empty scope value or empty reason is rejected with a usage error.
  * Reason strings are normalized to a sentinel disposition token:
  * "deferred" (optionally "deferred-#N") or "rejected" (the default).
  */
 export function parseOverrideArg(
   arg: string,
+  knownClasses?: ReadonlySet<string> | readonly string[],
 ):
-  | { kind: "key"; key: string; disposition: string; reason: string }
-  | { kind: "scope"; scopeType: "category" | "file"; scopeValue: string; disposition: string; reason: string }
+  | { kind: "key"; key: string; disposition: string; reason: string; classId?: string }
+  | {
+      kind: "scope";
+      scopeType: "category" | "file";
+      scopeValue: string;
+      disposition: string;
+      reason: string;
+      classId?: string;
+    }
   | { error: string } {
+  const classSet =
+    knownClasses === undefined
+      ? null
+      : knownClasses instanceof Set
+        ? knownClasses
+        : new Set(knownClasses);
+
+  const splitClassAndReason = (
+    body: string,
+  ): { classId?: string; reason: string } | { error: string } => {
+    // Optional class form: "<class>: <reason>" when class is known.
+    if (classSet) {
+      const sep = body.indexOf(": ");
+      if (sep !== -1) {
+        const maybeClass = body.slice(0, sep).trim();
+        const rest = body.slice(sep + 2).trim();
+        if (classSet.has(maybeClass)) {
+          if (!rest) return { error: "Override reason must not be empty." };
+          return { classId: maybeClass, reason: rest };
+        }
+      }
+    }
+    const reason = body.trim();
+    if (!reason) return { error: "Override reason must not be empty." };
+    return { reason };
+  };
+
   // Detect scope prefix: "category:" or "file:"
   const scopeType: "category" | "file" | null =
     arg.startsWith("category:") ? "category" : arg.startsWith("file:") ? "file" : null;
@@ -1243,39 +1330,332 @@ export function parseOverrideArg(
   if (scopeType !== null) {
     // Everything after "category:" / "file:"
     const rest = arg.slice(scopeType.length + 1);
-    // Split on the first ": " to separate scope value from reason.
+    // Split on the first ": " to separate scope value from reason/class body.
     const sep = rest.indexOf(": ");
     if (sep === -1) {
       return {
-        error: `Scoped override must be "${scopeType}:<value>: <reason>" — got: ${arg}`,
+        error: `Scoped override must be "${scopeType}:<value>: <reason>" or "${scopeType}:<value>: <class>: <reason>" — got: ${arg}`,
       };
     }
     const scopeValue = rest.slice(0, sep).trim().toLowerCase();
-    const reason = rest.slice(sep + 2).trim();
     if (!scopeValue) {
       return { error: `Scope value must not be empty — expected "${scopeType}:<name>: <reason>".` };
     }
-    if (!reason) {
-      return { error: "Override reason must not be empty." };
-    }
-    return { kind: "scope", scopeType, scopeValue, disposition: normalizeDisposition(reason), reason };
+    const body = rest.slice(sep + 2);
+    const cr = splitClassAndReason(body);
+    if ("error" in cr) return cr;
+    return {
+      kind: "scope",
+      scopeType,
+      scopeValue,
+      disposition: normalizeDisposition(cr.reason),
+      reason: cr.reason,
+      classId: cr.classId,
+    };
   }
 
-  // Existing key logic: "<key>: <reason>"
+  // Key logic: "<key>: <reason>" or "<key>: <class>: <reason>"
   const colon = arg.indexOf(":");
   if (colon === -1) {
-    return { error: `Override must be "<key>: <reason>" — got: ${arg}` };
+    return {
+      error: `Override must be "<key>: <reason>" or "<key>: <class>: <reason>" — got: ${arg}`,
+    };
   }
   const key = arg.slice(0, colon).trim().toLowerCase();
-  const reason = arg.slice(colon + 1).trim();
   if (!isValidFindingKey(key)) {
     return { error: `Invalid finding key "${key}" — expected 8 hex chars (see the review comment).` };
   }
-  if (!reason) {
-    return { error: "Override reason must not be empty." };
-  }
-  return { kind: "key", key, disposition: normalizeDisposition(reason), reason };
+  const body = arg.slice(colon + 1);
+  const cr = splitClassAndReason(body);
+  if ("error" in cr) return cr;
+  return {
+    kind: "key",
+    key,
+    disposition: normalizeDisposition(cr.reason),
+    reason: cr.reason,
+    classId: cr.classId,
+  };
 }
+
+// ---------------------------------------------------------------------------
+// Governed decision sentinels (#693)
+// ---------------------------------------------------------------------------
+
+/**
+ * Machine-readable governance extension line. Placed immediately before the
+ * legacy `pipeline-override` / `pipeline-override-scope` sentinel so dual-read
+ * extractors still recover key/scope from the last-line legacy sentinel.
+ * Format (single line, no nested comments):
+ *   <!-- pipeline-override-gov: v1 <json> -->
+ * JSON is sanitized to strip `-->` sequences.
+ */
+export const OVERRIDE_GOV_RE =
+  /^<!-- pipeline-override-gov: v1 (.+?) -->$/m;
+
+export interface OverrideGovPayload {
+  decision_id: string;
+  class: string;
+  disposition: string;
+  target: OverrideTarget;
+  actor: string;
+  identity_source: string;
+  authorization_matched_rule: string | null;
+  authorization_evidence: string;
+  explanation: string;
+  evidence_refs: Record<string, string | undefined>;
+  finding_fingerprint: string | null;
+  code_region: string | null;
+  created_at: string;
+  expires_at: string;
+  supersedes: string | null;
+  renewed_from: string | null;
+  renewal_kind: "lite" | "human" | null;
+  evidence_subject?: EvidenceSubjectV1;
+}
+
+function sanitizeGovJson(obj: unknown): string {
+  return JSON.stringify(obj).replace(/-->/g, "—>");
+}
+
+export function formatOverrideGovLine(payload: OverrideGovPayload): string {
+  return `<!-- pipeline-override-gov: v1 ${sanitizeGovJson(payload)} -->`;
+}
+
+export function parseOverrideGovLine(line: string): OverrideGovPayload | null {
+  const m = OVERRIDE_GOV_RE.exec(line.trim());
+  if (!m) return null;
+  try {
+    const raw = JSON.parse(m[1]!) as OverrideGovPayload;
+    if (!raw || typeof raw !== "object") return null;
+    if (typeof raw.decision_id !== "string" || typeof raw.class !== "string") return null;
+    if (!raw.target || typeof raw.target !== "object") return null;
+    return raw;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Collect append-only override decisions from trusted-author comments.
+ * Dual-reads governance lines + legacy sentinels (legacy → low_risk_deferred).
+ */
+export function extractOverrideDecisions(
+  comments: { body: string; createdAt?: string }[],
+): OverrideDecisionV1[] {
+  const decisions: OverrideDecisionV1[] = [];
+  for (const c of comments) {
+    if (
+      !c.body.startsWith(OVERRIDE_HEADING) &&
+      !c.body.startsWith(SCOPE_OVERRIDE_HEADING)
+    ) {
+      continue;
+    }
+    const lines = c.body.split("\n").map((l) => l.trim()).filter(Boolean);
+    // Strip attestation marker if present
+    if (lines.length > 0 && isVerifiedPipelineAttestation(c.body)) {
+      lines.pop();
+    }
+    if (lines.length === 0) continue;
+
+    // Find gov line (scan from end-1 for dual-read) and legacy last line
+    let gov: OverrideGovPayload | null = null;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const p = parseOverrideGovLine(lines[i]!);
+      if (p) {
+        gov = p;
+        break;
+      }
+    }
+
+    const lastLine = lines.at(-1) ?? "";
+    // If last line is gov, legacy may be above it (we now place gov before legacy)
+    // Prefer explicit legacy match on last non-gov non-attest line
+    let legacyLine = lastLine;
+    if (parseOverrideGovLine(legacyLine)) {
+      legacyLine = lines.at(-2) ?? "";
+    }
+
+    if (gov) {
+      decisions.push({
+        schema_version: 1,
+        decision_id: gov.decision_id,
+        class: gov.class,
+        disposition: gov.disposition,
+        target: gov.target,
+        explanation: gov.explanation,
+        actor: gov.actor,
+        identity_source: gov.identity_source,
+        authorization: {
+          authorized: true,
+          matched_rule: gov.authorization_matched_rule,
+          evidence: gov.authorization_evidence,
+          identity_source: gov.identity_source,
+        },
+        evidence_refs: { ...(gov.evidence_refs ?? {}) },
+        remediation_refs: {},
+        evidence_subject: gov.evidence_subject,
+        finding_fingerprint: gov.finding_fingerprint,
+        code_region: gov.code_region,
+        created_at: gov.created_at,
+        expires_at: gov.expires_at,
+        lifecycle: "active",
+        supersedes: gov.supersedes,
+        renewed_from: gov.renewed_from,
+        renewal_kind: gov.renewal_kind,
+        invalidation_reason: null,
+      });
+      continue;
+    }
+
+    // Legacy key sentinel
+    const keyM = OVERRIDE_RE.exec(legacyLine);
+    if (keyM) {
+      const created =
+        c.createdAt && Number.isFinite(Date.parse(c.createdAt))
+          ? new Date(c.createdAt).toISOString().replace(/\.\d{3}Z$/, "Z")
+          : "1970-01-01T00:00:00Z";
+      // Far-future expiry for pure legacy: honor until re-recorded (compat path).
+      const expires = "9999-12-31T23:59:59Z";
+      decisions.push({
+        schema_version: 1,
+        decision_id: `legacy-key-${keyM[1]}-${created}`,
+        class: IMPLICIT_LOW_RISK_CLASS,
+        disposition: keyM[2]!.trim(),
+        target: { kind: "key", key: keyM[1]! },
+        explanation: keyM[2]!.trim(),
+        actor: "legacy",
+        identity_source: "legacy_sentinel",
+        authorization: {
+          authorized: true,
+          matched_rule: "legacy_compat",
+          evidence: "pre-governance sentinel under low_risk_deferred",
+          identity_source: "legacy_sentinel",
+        },
+        evidence_refs: {},
+        remediation_refs: {},
+        finding_fingerprint: null,
+        code_region: null,
+        created_at: created,
+        expires_at: expires,
+        lifecycle: "active",
+        supersedes: null,
+        renewed_from: null,
+        renewal_kind: null,
+        invalidation_reason: null,
+        legacy_compat: true,
+      });
+      continue;
+    }
+
+    // Legacy scope sentinel
+    SCOPE_OVERRIDE_RE.lastIndex = 0;
+    const scopeM = SCOPE_OVERRIDE_RE.exec(legacyLine);
+    if (scopeM) {
+      const type = scopeM[1] as "category" | "file";
+      let value: string;
+      try {
+        value = decodeURIComponent(scopeM[2]!);
+      } catch {
+        value = scopeM[2]!;
+      }
+      const captured = scopeM[3]!.trim();
+      const pipeIdx = captured.indexOf(" | ");
+      const disposition = pipeIdx >= 0 ? captured.slice(0, pipeIdx).trim() : captured;
+      const reason = pipeIdx >= 0 ? captured.slice(pipeIdx + 3).trim() : captured;
+      const created =
+        c.createdAt && Number.isFinite(Date.parse(c.createdAt))
+          ? new Date(c.createdAt).toISOString().replace(/\.\d{3}Z$/, "Z")
+          : "1970-01-01T00:00:00Z";
+      decisions.push({
+        schema_version: 1,
+        decision_id: `legacy-scope-${type}-${value}-${created}`,
+        class: IMPLICIT_LOW_RISK_CLASS,
+        disposition,
+        target: { kind: "scope", scopeType: type, scopeValue: value },
+        explanation: reason,
+        actor: "legacy",
+        identity_source: "legacy_sentinel",
+        authorization: {
+          authorized: true,
+          matched_rule: "legacy_compat",
+          evidence: "pre-governance scope sentinel under low_risk_deferred",
+          identity_source: "legacy_sentinel",
+        },
+        evidence_refs: {},
+        remediation_refs: {},
+        finding_fingerprint: null,
+        code_region: null,
+        created_at: created,
+        expires_at: "9999-12-31T23:59:59Z",
+        lifecycle: "active",
+        supersedes: null,
+        renewed_from: null,
+        renewal_kind: null,
+        invalidation_reason: null,
+        legacy_compat: true,
+      });
+    }
+  }
+  SCOPE_OVERRIDE_RE.lastIndex = 0;
+  return decisions;
+}
+
+/**
+ * Validity-gated active projection for partitionFindings consumers (#693).
+ * When `governance` is omitted, uses the implicit low-risk class.
+ */
+export function projectOverridesForPartition(input: {
+  comments: { body: string; createdAt?: string }[];
+  governance?: OverrideGovernanceConfig;
+  pin?: EvidenceSubjectV1 | null;
+  now?: number;
+  findings?: ReviewFinding[];
+}): {
+  overrides: Map<string, string>;
+  scopes: ScopedOverride[];
+  decisions: OverrideDecisionV1[];
+  active: Map<string, { decision: OverrideDecisionV1; validity: { status: string; reason: string } }>;
+} {
+  const governance = input.governance ?? implicitOverrideGovernance();
+  const decisions = extractOverrideDecisions(input.comments);
+  const liveByTarget = new Map<string, LiveOverrideContext>();
+  if (input.findings) {
+    for (const f of input.findings) {
+      const key = findingKey(f);
+      liveByTarget.set(`key:${key}`, {
+        finding_fingerprint: findingPayloadFingerprint(f),
+        code_region: codeRegionFromFinding(f),
+      });
+    }
+  }
+  const { activeByTarget } = projectActiveOverrides({
+    decisions,
+    governance,
+    pin: input.pin ?? null,
+    now: input.now ?? Date.now(),
+    liveByTarget,
+  });
+  const { overrides, scopes } = activeProjectionToPartitionInputs(activeByTarget);
+  return {
+    overrides,
+    scopes,
+    decisions,
+    active: activeByTarget as Map<
+      string,
+      { decision: OverrideDecisionV1; validity: { status: string; reason: string } }
+    >,
+  };
+}
+
+function codeRegionFromFinding(
+  f: Pick<ReviewFinding, "file" | "line_start">,
+): string {
+  const file = normalizeFile(f.file);
+  const bucket = lineBucket(f.line_start);
+  return createHash("sha1").update(`${file}|${bucket}`).digest("hex").slice(0, 16);
+}
+
+export { codeRegionFromFinding as overrideCodeRegionFromFinding };
 
 // ---------------------------------------------------------------------------
 // Post-noop re-verify: unsupported classification claims against correct HEAD

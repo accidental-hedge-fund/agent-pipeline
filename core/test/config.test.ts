@@ -562,6 +562,115 @@ test("resolveConfig: design_gate unknown key is rejected at parse time", async (
   }
 });
 
+// ---- override_governance (#693) ----
+
+test("resolveConfig: override_governance omitted — implicit low-risk class", async () => {
+  const repo = makeFakeRepo(null);
+  const binDir = makeFakeGh("acme/widget");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const { resolveConfig } = await import("../scripts/config.ts");
+    const cfg = resolveConfig({ repoPath: repo });
+    assert.equal(cfg.override_governance.implicit, true);
+    assert.equal(cfg.override_governance.default_class, "low_risk_deferred");
+    assert.ok(cfg.override_governance.classes.low_risk_deferred);
+    assert.equal(cfg.override_governance.classes.low_risk_deferred.max_duration_hours, 720);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: override_governance valid low+high risk classes", async () => {
+  const repo = makeFakeRepo(
+    `override_governance:
+  schema_version: 1
+  default_class: low_risk_deferred
+  classes:
+    low_risk_deferred:
+      max_duration_hours: 720
+      required_evidence: []
+      renewal:
+        mode: lite
+        require_human_on: [fingerprint_drift, region_drift, subject_mismatch]
+      approvers:
+        - kind: trusted_override_actors_allowlist
+      separation_of_duties:
+        enabled: false
+        forbid_roles: []
+    high_risk_accept:
+      max_duration_hours: 72
+      required_evidence: [remediation_issue_url, risk_acceptance_ref]
+      renewal:
+        mode: human
+        require_human_on: [fingerprint_drift, region_drift, subject_mismatch, policy_change]
+      approvers:
+        - kind: role
+          role: risk_authority
+      separation_of_duties:
+        enabled: true
+        forbid_roles: [implementer, finding_author]
+`,
+  );
+  const binDir = makeFakeGh("acme/widget");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const { resolveConfig } = await import("../scripts/config.ts");
+    const cfg = resolveConfig({ repoPath: repo });
+    assert.equal(cfg.override_governance.implicit, false);
+    assert.equal(cfg.override_governance.classes.high_risk_accept.max_duration_hours, 72);
+    assert.equal(cfg.override_governance.classes.high_risk_accept.renewal.mode, "human");
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: override_governance unknown key is rejected at parse time", async () => {
+  const repo = makeFakeRepo(
+    `override_governance:\n  schema_version: 1\n  silent_approve: true\n  classes:\n    low_risk_deferred:\n      max_duration_hours: 10\n      renewal:\n        mode: none\n`,
+  );
+  const binDir = makeFakeGh("acme/widget");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const { resolveConfig } = await import("../scripts/config.ts");
+    assert.throws(() => resolveConfig({ repoPath: repo }), /silent_approve/);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: override_governance invalid max_duration_hours rejected", async () => {
+  const repo = makeFakeRepo(
+    `override_governance:\n  schema_version: 1\n  classes:\n    low_risk_deferred:\n      max_duration_hours: 0\n      renewal:\n        mode: lite\n`,
+  );
+  const binDir = makeFakeGh("acme/widget");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const { resolveConfig } = await import("../scripts/config.ts");
+    assert.throws(() => resolveConfig({ repoPath: repo }), /max_duration_hours|Invalid/);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: override_governance invalid renewal mode rejected", async () => {
+  const repo = makeFakeRepo(
+    `override_governance:\n  schema_version: 1\n  classes:\n    low_risk_deferred:\n      max_duration_hours: 10\n      renewal:\n        mode: auto_forever\n`,
+  );
+  const binDir = makeFakeGh("acme/widget");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const { resolveConfig } = await import("../scripts/config.ts");
+    assert.throws(() => resolveConfig({ repoPath: repo }), /renewal|auto_forever|Invalid/);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
 // ---- pre_code_attestation (#575) ----
 
 test("resolveConfig: pre_code_attestation omitted — gate disabled by default", async () => {

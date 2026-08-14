@@ -474,3 +474,30 @@ test("attestation getGhActor sites are deliberately-fail-closed in inventory", (
     );
   }
 });
+
+// ---------------------------------------------------------------------------
+// Override governance integrity sites (#693)
+// ---------------------------------------------------------------------------
+
+test("override_governance_sites inventory covers refuse and expiry classes", () => {
+  const sites = ESCALATION_INVENTORY.override_governance_sites ?? [];
+  assert.ok(sites.length >= 6, "expected override_governance_sites rows");
+  const ids = new Set(sites.map((s) => s.site_id));
+  for (const required of [
+    "override-governance:unauthorized-record",
+    "override-governance:sod-violation",
+    "override-governance:missing-evidence",
+    "override-governance:unknown-class",
+    "override-governance:expired-unblock",
+    "override-governance:drift-blocked-lite-renewal",
+  ]) {
+    assert.ok(ids.has(required), `missing inventory row ${required}`);
+  }
+  for (const s of sites) {
+    assert.notEqual(
+      s.disposition,
+      "transient-retryable",
+      `${s.site_id} must not be transient-retryable (integrity / typed hold)`,
+    );
+  }
+});

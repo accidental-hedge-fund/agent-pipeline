@@ -1,29 +1,36 @@
-# #1021 — file engine-class live sibling on current train milestone
+# #693 Plan revision — governed typed overrides
 
 ## Status
+- [x] Plan review feedback incorporated
+- [x] Implementation complete
 
-Implementation complete for full #1021 contract on top of epic #1028 first cut.
+## Reviewer feedback dispositions
+See chat response `## Feedback Incorporated` (authoritative for this revision).
 
-## Inventory (epic first cut)
-
-Living code already had:
-- `core/scripts/stages/engine-class-live-sibling.ts` (marker, ready+engine-class+bug, Depends on, dedup, rate-cap, train context)
-- `unlink_engine_scratch` best-effort `onEngineClassRecovered` / default filer
-- `pipeline train` set/clear train milestone context
-
-## What changed this PR
-
-- Recover-path coupling tests: invoke once with evidence_key; filer throw non-fatal; product dirt + human-authority never call filer
-- Filer unit tests: exact labels, empty-string milestone fail-closed, train context set/get/clear, createIssue failure non-fatal
-- OpenSpec change tasks checklist completed
-
-## Verification
-
-- [x] `openspec validate file-engine-class-live-sibling` — valid
-- [x] `openspec validate --all` — 289 passed
-- [x] `node scripts/build.mjs --check` — mirror up to date (no scripts change)
-- [x] `npm run ci` — green (exit 0)
+## Implementation sequence (post-approval)
+1. Config schema + types (`config.ts`, `types.ts`) — done
+2. Pure module `override-governance.ts` (decision schema, validity, projection, renewal-lite eligibility) — done
+3. Authority reuse from pre-code patterns + trusted_override_actors — done
+4. Record path (`runOverride`, comment sentinels, rejected events) — done
+5. Wire `partitionFindings` + auto-resume gates — done
+6. Renewal side-effect job, events, evidence-bundle — done
+7. Escalation inventory + docs — done
+8. Tests + `build.mjs` + `npm run ci` — done
 
 ## Review
 
-No production-code gap beyond test lock-in. #538 backlog-only papercut path untouched. Filing remains non-fatal relative to recover.
+### What changed
+- Added `override_governance` strict config block with implicit `low_risk_deferred` defaults when omitted.
+- Pure `override-governance.ts`: validity, authority, SoD, renewal-lite, projection, events.
+- Dual-read `pipeline-override-gov` sentinels; legacy sentinels map to low-risk compat.
+- `runOverride` refuses unauthorized/missing-evidence/unknown-class before post.
+- Partition consumers use validity-gated active projection.
+- Escalation inventory rows for integrity refuse + expiry/drift (not transient-retryable).
+- Docs + generated config reference for low-risk and high-risk examples.
+
+### Verification
+- `node --test` override-governance + pipeline-override: pass
+- `npm run ci` from repo root: pass
+- `openspec validate governed-typed-overrides`: pass
+- `node scripts/build.mjs --check`: pass
+- `npm run docs:check`: pass

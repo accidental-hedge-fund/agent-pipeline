@@ -141,7 +141,12 @@ When human comments are present, the revised plan comment attributes contributor
 ```text
 /pipeline N --override "<override-key>: rejected — <why>"
 /pipeline N --override "category:rollback-safety: deferred #90 — tracked separately"
+/pipeline N --override "<override-key>: high_risk_accept: accept residual remediation_issue_url=https://… risk_acceptance_ref=RA-1"
 ```
+
+Bare `"<key>: <reason>"` maps to `override_governance.default_class` when configured, or to the implicit `low_risk_deferred` class when the block is omitted (compatibility path). Optional class form: `"<key>: <class>: <reason>"`. Required evidence refs for a class are passed as `kind=value` tokens in the reason.
+
+**Governed overrides (#693):** optional `override_governance` in `.github/pipeline.yml` defines a versioned class taxonomy with per-class max duration, approvers, required evidence, separation of duties, and renewal mode (`lite` | `human` | `none`). Only currently valid active decisions unblock; expired, invalidated, unauthorized, or superseded decisions leave the finding blocking. History is append-only with supersession/renewal lineage. Auto-resume after override runs only when the recorded decision is currently valid. See [config.md](config.md).
 
 Overrides are audited in issue comments. The advance path still never merges.
 
