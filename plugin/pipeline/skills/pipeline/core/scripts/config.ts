@@ -18,10 +18,6 @@ import {
   PRE_CODE_ATTESTATION_TRIGGER_CLASSES,
   PRE_CODE_REAPPROVE_ON_EVENTS,
   PRE_CODE_SOD_ROLES,
-  OVERRIDE_RENEWAL_MODES,
-  OVERRIDE_REQUIRE_HUMAN_ON_EVENTS,
-  OVERRIDE_EVIDENCE_REF_KINDS,
-  OVERRIDE_SOD_ROLES,
   type GitPushAuth,
   type Harness,
   type HarnessRoleSource,
@@ -29,9 +25,6 @@ import {
   type ModelEndpointDialect,
   type ModelEndpointParams,
   type PreCodeApproverRule,
-  type OverrideApproverRule,
-  type OverrideClassPolicy,
-  type OverrideGovernanceConfig,
 } from "./types.ts";
 import { parseGitPushAuth, GitPushAuthConfigError } from "./git-push-auth.ts";
 import { loadProfile, type PipelineProfile } from "./profile.ts";
@@ -44,7 +37,7 @@ import {
 } from "./harness-adapters/index.ts";
 import { isSafeScratchExtensionGlob } from "./worktree-dirt.ts";
 import { TRUSTED_SURFACE_CLASS_IDS } from "./trusted-surface.ts";
-import { implicitOverrideGovernance } from "./override-governance.ts";
+import { validateMaterializedLineage } from "./stage-policy-lifecycle.ts";
 
 // A `models.*`/`effort.*` value: an arbitrary alias/effort string, or the
 // "auto" sentinel (#366) resolved via stage-routing.ts at config-load time.
@@ -650,42 +643,6 @@ const PartialConfigSchema = z.object({
         .literal("union_blocking")
         .optional()
         .describe('Merge mode. v1 supports only "union_blocking" (union findings, rigor-first blocking). Majority-vote approve is not available.'),
-      min_independent_by_risk: z
-        .record(z.string(), z.number().int().min(0, "review_ensemble.min_independent_by_risk values must be non-negative integers"))
-        .optional()
-        .describe("Optional minimum independent reviewer count by risk class (#694). Missing/zero leaves required=0 (min-usable-only)."),
-      substitute_agents: z
-        .array(
-          z
-            .object({
-              role: z.literal("primary").optional().describe('Use the configured primary reviewer. Mutually exclusive with "harness".'),
-              harness: z.string().min(1, "review_ensemble.substitute_agents[].harness must not be empty").optional().describe("Substitute reviewer harness. Mutually exclusive with role: primary."),
-              model: z.string().min(1).optional().describe("Optional model override for this substitute agent only."),
-              effort: z.string().min(1).optional().describe("Optional reasoning-effort override for this substitute agent only."),
-            })
-            .strict()
-            .superRefine((agent, ctx) => {
-              const hasPrimary = agent.role === "primary";
-              const hasHarness = typeof agent.harness === "string" && agent.harness.length > 0;
-              if (hasPrimary && hasHarness) {
-                ctx.addIssue({
-                  code: "custom",
-                  message: 'review_ensemble substitute agent must set either role: "primary" or harness, not both',
-                });
-              } else if (!hasPrimary && !hasHarness) {
-                ctx.addIssue({
-                  code: "custom",
-                  message: 'review_ensemble substitute agent must set role: "primary" or a non-empty harness',
-                });
-              }
-            }),
-        )
-        .optional()
-        .describe("Optional one-shot substitute agent list when first-wave coverage is quorum_unmet or no_usable_reviewers (#694)."),
-      allow_quorum_degrade: z
-        .boolean()
-        .optional()
-        .describe("When true, quorum_unmet may proceed with loud advisory coverage disclosure; default false fail-closed (#694)."),
     })
     .strict()
     .optional()
@@ -947,95 +904,6 @@ const PartialConfigSchema = z.object({
   // `## Pipeline: Finding override` and `## Pipeline: Scope override` comments
   // are trusted in addition to the current actor. Default: [] (actor-only).
   trusted_override_actors: z.array(z.string()).optional().describe("Additional GitHub identities whose override sentinels are trusted besides the current pipeline actor."),
-  // Governed override class taxonomy (#693). Optional; omitted → implicit
-  // low-risk compatibility class. Strict: unknown keys fail parse.
-  override_governance: z
-    .object({
-      schema_version: z
-        .literal(1)
-        .describe("Override governance schema version (only 1 is supported)."),
-      classes: z
-        .record(
-          z.string().min(1),
-          z
-            .object({
-              max_duration_hours: z
-                .number()
-                .int()
-                .min(1)
-                .describe("Maximum override duration in hours (≥ 1)."),
-              required_evidence: z
-                .array(z.enum(OVERRIDE_EVIDENCE_REF_KINDS))
-                .optional()
-                .describe("Evidence reference kinds required to record this class."),
-              renewal: z
-                .object({
-                  mode: z
-                    .enum(OVERRIDE_RENEWAL_MODES)
-                    .describe("lite | human | none"),
-                  require_human_on: z
-                    .array(z.enum(OVERRIDE_REQUIRE_HUMAN_ON_EVENTS))
-                    .optional()
-                    .describe("Drift events that block lite auto-renew."),
-                })
-                .strict()
-                .describe("Renewal policy for this class."),
-              approvers: z
-                .array(
-                  z.discriminatedUnion("kind", [
-                    z
-                      .object({
-                        kind: z.literal("identity"),
-                        identity: z.string().min(1),
-                      })
-                      .strict(),
-                    z
-                      .object({
-                        kind: z.literal("group_ref"),
-                        group_ref: z.string().min(1),
-                      })
-                      .strict(),
-                    z
-                      .object({
-                        kind: z.literal("role"),
-                        role: z.string().min(1),
-                      })
-                      .strict(),
-                    z
-                      .object({
-                        kind: z.literal("trusted_override_actors_allowlist"),
-                      })
-                      .strict(),
-                  ]),
-                )
-                .optional()
-                .describe(
-                  "Ordered authorized-actor rules (identity, group_ref, role, trusted_override_actors_allowlist).",
-                ),
-              separation_of_duties: z
-                .object({
-                  enabled: z.boolean().optional(),
-                  forbid_roles: z.array(z.enum(OVERRIDE_SOD_ROLES)).optional(),
-                })
-                .strict()
-                .optional()
-                .describe("Optional SoD between implementer/finding_author and overridder."),
-            })
-            .strict(),
-        )
-        .describe("Map of class id → per-class policy. Class ids are repository-defined."),
-      default_class: z
-        .string()
-        .min(1)
-        .optional()
-        .describe("Class applied to bare free-form reasons when set; must exist in classes."),
-    })
-    .strict()
-    .optional()
-    .describe(
-      "Governed override class taxonomy (#693). Omitted → implicit low-risk compatibility class. " +
-        "Unknown keys and invalid durations/renewal modes fail at parse time.",
-    ),
   // Bounded auto-loop mode (#149). Opt-in; disabled by default. When enabled,
   // recoverable stops at allowlisted pipeline-owned stages convert from stop to
   // automatic continuation within explicit round/wall-clock budgets. Parks at
@@ -1187,8 +1055,9 @@ const PartialConfigSchema = z.object({
       "Trusted-surface path coverage (#691). Only additive extra_paths are accepted; built-in classes remain engine-defined.",
     ),
   // Staged policy lifecycle (#695). Opt-in; absent → no policy lifecycle recording.
-  // state "enforcing" is rejected unless lineage includes a validated promotion
-  // event (required → enforcing with named authority) — see superRefine below.
+  // state "enforcing"/"retired" materialize only through validateMaterializedLineage
+  // (complete predecessor chain, recomputed hashes, authority, evidence_refs, ISO at)
+  // — self-attested single-head lineage is rejected.
   staged_policies: z
     .array(
       z
@@ -1224,33 +1093,23 @@ const PartialConfigSchema = z.object({
             )
             .optional()
             .describe(
-              "Append-only lineage. Required when state is enforcing: must include required→enforcing with named authority.",
+              "Append-only lineage. Required when state is enforcing or retired: complete legal chain with recomputed policy hashes, authority on enforcing/retired edges, and non-empty evidence_refs on observation-gated promotions.",
             ),
         })
         .strict()
         .superRefine((p, ctx) => {
-          if (p.state !== "enforcing") return;
-          const lineage = p.lineage ?? [];
-          const ok = lineage.some(
-            (e) =>
-              e.policy_id === p.policy_id &&
-              e.from_state === "required" &&
-              e.to_state === "enforcing" &&
-              e.authority != null &&
-              typeof e.authority.actor === "string" &&
-              e.authority.actor.trim().length > 0 &&
-              typeof e.authority.role === "string" &&
-              e.authority.role.trim().length > 0 &&
-              e.policy_hash_after.trim().length > 0 &&
-              e.at.trim().length > 0,
-          );
-          if (!ok) {
+          try {
+            validateMaterializedLineage({
+              policy_id: p.policy_id,
+              state: p.state,
+              acceptance: p.acceptance ?? {},
+              lineage: p.lineage ?? [],
+            });
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
             ctx.addIssue({
               code: "custom",
-              message:
-                `state "enforcing" requires validated lineage entry into enforcing ` +
-                `(from_state "required", non-empty authority actor+role, policy_hash_after, at); ` +
-                `static config cannot place a policy into enforcing without promotion evidence`,
+              message,
               path: ["state"],
             });
           }
@@ -1259,7 +1118,7 @@ const PartialConfigSchema = z.object({
     .optional()
     .describe(
       "Opt-in staged policies (#695). States: draft|observe|required|enforcing|retired. " +
-        "enforcing requires lineage with a required→enforcing promotion event and named authority. Absent/empty → no lifecycle gate.",
+        "enforcing/retired require fully validated lineage (complete path, recomputed hashes, authority). Absent/empty → no lifecycle gate.",
     ),
   // Repository-control desired state (#695). Opt-in; absent → no drift compare.
   repository_control_desired_state: z
@@ -1496,39 +1355,6 @@ function resolveReviewEnsemble(
     );
   }
 
-  // min_independent_by_risk: reject negatives (Zod also enforces min 0; keep resolve defensive).
-  let minIndependentByRisk: Record<string, number> | undefined;
-  if (raw?.min_independent_by_risk && typeof raw.min_independent_by_risk === "object") {
-    minIndependentByRisk = {};
-    for (const [k, v] of Object.entries(raw.min_independent_by_risk)) {
-      const n = Number(v);
-      if (!Number.isFinite(n) || !Number.isInteger(n) || n < 0) {
-        throw new Error(
-          `review_ensemble.min_independent_by_risk.${k} must be a non-negative integer (got ${String(v)}).`,
-        );
-      }
-      minIndependentByRisk[k] = n;
-    }
-  }
-
-  const mapAgent = (a: { role?: "primary"; harness?: string; model?: string; effort?: string }) => {
-    if (a.role === "primary") {
-      return {
-        role: "primary" as const,
-        ...(a.model !== undefined ? { model: a.model } : {}),
-        ...(a.effort !== undefined ? { effort: a.effort } : {}),
-      };
-    }
-    return {
-      harness: a.harness as string,
-      ...(a.model !== undefined ? { model: a.model } : {}),
-      ...(a.effort !== undefined ? { effort: a.effort } : {}),
-    };
-  };
-
-  const substituteAgents = (raw?.substitute_agents ?? []).map(mapAgent);
-  const allowQuorumDegrade = raw?.allow_quorum_degrade ?? d.allow_quorum_degrade ?? false;
-
   return {
     enabled,
     agents,
@@ -1537,11 +1363,6 @@ function resolveReviewEnsemble(
     ...(raw?.agent_timeout_sec !== undefined
       ? { agent_timeout_sec: raw.agent_timeout_sec }
       : {}),
-    ...(minIndependentByRisk !== undefined
-      ? { min_independent_by_risk: minIndependentByRisk }
-      : {}),
-    ...(substituteAgents.length > 0 ? { substitute_agents: substituteAgents } : {}),
-    allow_quorum_degrade: allowQuorumDegrade,
   };
 }
 
@@ -1619,62 +1440,6 @@ export interface ResolveOptions {
  * Merge partial/omitted `pre_code_attestation` file config with defaults (#575).
  * Omitted block → enabled false and documented defaults for remaining fields.
  */
-/**
- * Merge partial/omitted `override_governance` file config with implicit
- * low-risk compatibility defaults (#693).
- *
- * When the block is omitted, returns the built-in implicit class taxonomy.
- * When present, validates that `default_class` (if set) exists in `classes`
- * and normalizes each class policy. Unknown keys are already rejected by the
- * Zod schema before this runs.
- */
-export function resolveOverrideGovernanceConfig(
-  fileBlock: PartialConfig["override_governance"] | undefined,
-): OverrideGovernanceConfig {
-  if (fileBlock === undefined) {
-    return implicitOverrideGovernance();
-  }
-  const classIds = Object.keys(fileBlock.classes ?? {});
-  if (classIds.length === 0) {
-    throw new Error(
-      "override_governance.classes must define at least one class when the block is present",
-    );
-  }
-  if (fileBlock.default_class && !fileBlock.classes[fileBlock.default_class]) {
-    throw new Error(
-      `override_governance.default_class "${fileBlock.default_class}" is not in classes ` +
-        `(known: ${classIds.sort().join(", ")})`,
-    );
-  }
-  const classes: Record<string, OverrideClassPolicy> = {};
-  for (const [id, raw] of Object.entries(fileBlock.classes)) {
-    if (!/^[a-z][a-z0-9_]*$/.test(id)) {
-      throw new Error(
-        `override_governance.classes key "${id}" is invalid — use lowercase snake_case class ids`,
-      );
-    }
-    classes[id] = {
-      max_duration_hours: raw.max_duration_hours,
-      required_evidence: [...(raw.required_evidence ?? [])],
-      renewal: {
-        mode: raw.renewal.mode,
-        require_human_on: [...(raw.renewal.require_human_on ?? [])],
-      },
-      approvers: (raw.approvers ?? []) as OverrideApproverRule[],
-      separation_of_duties: {
-        enabled: raw.separation_of_duties?.enabled ?? false,
-        forbid_roles: [...(raw.separation_of_duties?.forbid_roles ?? [])],
-      },
-    };
-  }
-  return {
-    schema_version: 1,
-    implicit: false,
-    default_class: fileBlock.default_class,
-    classes,
-  };
-}
-
 export function resolvePreCodeAttestationConfig(
   fileBlock: PartialConfig["pre_code_attestation"] | undefined,
 ): PipelineConfig["pre_code_attestation"] {
@@ -2107,7 +1872,6 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     format_gate: fileConfig.format_gate ?? DEFAULT_CONFIG.format_gate,
     harness_sandbox: fileConfig.harness_sandbox ?? DEFAULT_CONFIG.harness_sandbox,
     trusted_override_actors: fileConfig.trusted_override_actors,
-    override_governance: resolveOverrideGovernanceConfig(fileConfig.override_governance),
     auto_loop: {
       enabled: fileConfig.auto_loop?.enabled ?? DEFAULT_CONFIG.auto_loop.enabled,
       max_rounds: fileConfig.auto_loop?.max_rounds ?? DEFAULT_CONFIG.auto_loop.max_rounds,
@@ -2306,9 +2070,6 @@ export function applyTrustedVerificationPolicy(
 
   cfg.pre_code_attestation = resolvePreCodeAttestationConfig(fileConfig.pre_code_attestation);
   applied.push("pre_code_attestation");
-
-  cfg.override_governance = resolveOverrideGovernanceConfig(fileConfig.override_governance);
-  applied.push("override_governance");
 
   cfg.tester_evidence = {
     on_missing:
@@ -2791,9 +2552,6 @@ export const RIGOR_GATING_PATHS: readonly string[] = [
   "review_ensemble.min_usable_agents",
   "review_ensemble.max_agents",
   "review_ensemble.merge",
-  "review_ensemble.min_independent_by_risk",
-  "review_ensemble.substitute_agents",
-  "review_ensemble.allow_quorum_degrade",
   "tester_evidence.on_missing",
   "steps.plan_review",
   "steps.standard_review",
@@ -3531,50 +3289,6 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
         `#     max_wait_hours: ${yamlScalar(d.pre_code_attestation.wait.max_wait_hours)}`,
       ].join("\n"),
     "",
-    (() => {
-      const og = config.override_governance ?? DEFAULT_CONFIG.override_governance;
-      if (!og.implicit) {
-        return [
-          "override_governance: # governed override class taxonomy (#693)",
-          `  schema_version: 1 # ${sd("override_governance.schema_version", "only 1 is supported")}`,
-          "  classes:",
-          ...Object.entries(og.classes).flatMap(([id, cls]) => [
-            `    ${id}:`,
-            `      max_duration_hours: ${yamlScalar(cls.max_duration_hours)} # ${sd("override_governance.classes.*.max_duration_hours", "hours an override remains active (≥ 1)")}`,
-            `      required_evidence: ${yamlInline(cls.required_evidence)} # ${sd("override_governance.classes.*.required_evidence", "evidence ref kinds required at record")}`,
-            "      renewal:",
-            `        mode: ${yamlScalar(cls.renewal.mode)} # ${sd("override_governance.classes.*.renewal.mode", "lite|human|none")}`,
-            `        require_human_on: ${yamlInline(cls.renewal.require_human_on)} # ${sd("override_governance.classes.*.renewal.require_human_on", "drift events that block lite renew")}`,
-            `      approvers: ${yamlInline(cls.approvers)} # ${sd("override_governance.classes.*.approvers", "identity|group_ref|role|trusted_override_actors_allowlist")}`,
-            "      separation_of_duties:",
-            `        enabled: ${yamlScalar(cls.separation_of_duties.enabled)}`,
-            `        forbid_roles: ${yamlInline(cls.separation_of_duties.forbid_roles)}`,
-          ]),
-          og.default_class
-            ? `  default_class: ${yamlScalar(og.default_class)} # ${sd("override_governance.default_class", "class for bare free-form reasons")}`
-            : `#  default_class: low_risk_deferred # ${sd("override_governance.default_class", "class for bare free-form reasons")}`,
-        ].join("\n");
-      }
-      return [
-        "# override_governance: # governed override class taxonomy (#693). Omitted → implicit low_risk_deferred.",
-        "#   schema_version: 1",
-        "#   classes:",
-        "#     low_risk_deferred:",
-        "#       max_duration_hours: 720  # 30d",
-        "#       required_evidence: []",
-        "#       renewal: { mode: lite, require_human_on: [fingerprint_drift, region_drift, subject_mismatch] }",
-        "#       approvers: [{ kind: trusted_override_actors_allowlist }]",
-        "#       separation_of_duties: { enabled: false, forbid_roles: [] }",
-        "#     high_risk_accept:",
-        "#       max_duration_hours: 72",
-        "#       required_evidence: [remediation_issue_url, risk_acceptance_ref]",
-        "#       renewal: { mode: human, require_human_on: [fingerprint_drift, region_drift, subject_mismatch, policy_change] }",
-        "#       approvers: [{ kind: role, role: risk_authority }]",
-        "#       separation_of_duties: { enabled: true, forbid_roles: [implementer, finding_author] }",
-        "#   default_class: low_risk_deferred",
-      ].join("\n");
-    })(),
-    "",
     "test_gate: # run the repo's tests/build before opening a PR",
     `  enabled: ${yamlScalar(testGate.enabled)} # ${sd("test_gate.enabled", "set false to disable entirely")}`,
     testGate.command !== undefined
@@ -3668,14 +3382,6 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
             ? `  agent_timeout_sec: ${yamlScalar(config.review_ensemble.agent_timeout_sec)} # ${sd("review_ensemble.agent_timeout_sec", "optional per-agent timeout seconds")}`
             : `  # agent_timeout_sec: 1500 # ${sd("review_ensemble.agent_timeout_sec", "optional per-agent timeout seconds")}`,
           `  # merge: union_blocking # ${sd("review_ensemble.merge", 'v1 supports only "union_blocking"; majority-vote approve is not available')}`,
-          `  # min_independent_by_risk: # ${sd("review_ensemble.min_independent_by_risk", "optional risk-class independent quorum (#694); omit → required 0")}`,
-          `  #   high: 2`,
-          `  # substitute_agents: # ${sd("review_ensemble.substitute_agents", "optional one-shot substitute wave when quorum unmet (#694)")}`,
-          `  #   - harness: claude # ${sd("review_ensemble.substitute_agents.harness", "substitute harness; mutually exclusive with role: primary")}`,
-          `  #     model: auto # ${sd("review_ensemble.substitute_agents.model", "optional model override for this substitute only")}`,
-          `  #     effort: medium # ${sd("review_ensemble.substitute_agents.effort", "optional reasoning-effort override for this substitute only")}`,
-          `  #   - role: primary # ${sd("review_ensemble.substitute_agents.role", "use configured primary reviewer as substitute")}`,
-          `  allow_quorum_degrade: ${yamlScalar(config.review_ensemble.allow_quorum_degrade ?? false)} # ${sd("review_ensemble.allow_quorum_degrade", "default false; when true quorum_unmet proceeds with advisory disclosure only")}`,
         ].join("\n")
       : [
           "# review_ensemble: # parallel multi-agent review at the shared reviewer seam (#645). Default off — no latency/cost change.",
@@ -3689,14 +3395,6 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
           `#   max_agents: ${yamlScalar(d.review_ensemble.max_agents)} # ${sd("review_ensemble.max_agents", "hard upper bound on ensemble agent count")}`,
           `#   agent_timeout_sec: 1500 # ${sd("review_ensemble.agent_timeout_sec", "optional per-agent timeout seconds")}`,
           `#   merge: union_blocking # ${sd("review_ensemble.merge", 'v1 supports only "union_blocking"; majority-vote approve is not available')}`,
-          `#   min_independent_by_risk: # ${sd("review_ensemble.min_independent_by_risk", "optional risk-class independent quorum (#694); omit → required 0")}`,
-          `#     high: 2`,
-          `#   substitute_agents: # ${sd("review_ensemble.substitute_agents", "optional one-shot substitute wave when quorum unmet (#694)")}`,
-          `#     - harness: claude # ${sd("review_ensemble.substitute_agents.harness", "substitute harness; mutually exclusive with role: primary")}`,
-          `#       model: auto # ${sd("review_ensemble.substitute_agents.model", "optional model override for this substitute only")}`,
-          `#       effort: medium # ${sd("review_ensemble.substitute_agents.effort", "optional reasoning-effort override for this substitute only")}`,
-          `#     - role: primary # ${sd("review_ensemble.substitute_agents.role", "use configured primary reviewer as substitute")}`,
-          `#   allow_quorum_degrade: ${yamlScalar(d.review_ensemble.allow_quorum_degrade ?? false)} # ${sd("review_ensemble.allow_quorum_degrade", "default false; when true quorum_unmet proceeds with advisory disclosure only")}`,
         ].join("\n"),
     "",
     // tester_evidence (#646): commented defaults so operators can opt into fail_open.

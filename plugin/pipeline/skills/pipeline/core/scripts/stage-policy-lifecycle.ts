@@ -151,45 +151,245 @@ export interface StagedPolicy {
 }
 
 /**
- * True when lineage contains a promotion event into enforcing that includes
- * named authority and a non-empty policy_hash_after. Config and materialize
- * paths require this before exposing effective state `enforcing`.
+ * ISO 8601 date-time (with zone) for lineage `at`. Rejects bare dates and
+ * free-form non-empty strings so config cannot self-attest with placeholders.
+ */
+export function isIso8601Timestamp(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const s = value.trim();
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/.test(s)) {
+    return false;
+  }
+  return !Number.isNaN(Date.parse(s));
+}
+
+/** Transitions that require non-empty evidence_refs in materialize/config lineage. */
+function edgeRequiresEvidenceRefs(
+  from: PolicyLifecycleState,
+  to: PolicyLifecycleState,
+): boolean {
+  return (from === "observe" && to === "required") || (from === "required" && to === "enforcing");
+}
+
+/** Transitions that require a named authority record in materialize/config lineage. */
+function edgeRequiresAuthority(to: PolicyLifecycleState): boolean {
+  return to === "enforcing" || to === "retired";
+}
+
+/**
+ * Legal full promotion path into enforcing (draft → observe → required → enforcing).
+ * Config cannot self-attest enforcing via a forged single required→enforcing head.
+ */
+export const ENFORCING_PROMOTION_PATH: ReadonlyArray<
+  readonly [PolicyLifecycleState, PolicyLifecycleState]
+> = [
+  ["draft", "observe"],
+  ["observe", "required"],
+  ["required", "enforcing"],
+] as const;
+
+function lineageContainsEnforcingPromotionPath(
+  lineage: readonly PolicyLineageEvent[],
+): boolean {
+  const need = ENFORCING_PROMOTION_PATH;
+  if (lineage.length < need.length) return false;
+  for (let i = 0; i <= lineage.length - need.length; i++) {
+    let ok = true;
+    for (let j = 0; j < need.length; j++) {
+      const e = lineage[i + j]!;
+      const [from, to] = need[j]!;
+      if (e.from_state !== from || e.to_state !== to) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) return true;
+  }
+  return false;
+}
+
+export interface MaterializeLineageInput {
+  policy_id: string;
+  state: PolicyLifecycleState;
+  acceptance?: Record<string, unknown>;
+  lineage: readonly PolicyLineageEvent[];
+}
+
+/**
+ * Validate ordered config/materialize lineage for a declared effective state.
+ *
+ * Fail-closed for `enforcing` and `retired`:
+ * - complete legal chain (no discontinuous / illegal edges)
+ * - last event lands on the declared state
+ * - `enforcing` requires the full draft→observe→required→enforcing path
+ * - authority on enforcing/retired entries
+ * - non-empty evidence_refs on observe→required and required→enforcing
+ * - ISO 8601 `at` on every event
+ * - policy_hash_before/after recomputed from the canonical acceptance slice
+ * - consecutive hash continuity
+ *
+ * Self-attested single-head lineage with arbitrary strings is rejected.
+ */
+export function validateMaterializedLineage(input: MaterializeLineageInput): void {
+  const policyId = input.policy_id.trim();
+  const state = assertPolicyLifecycleState(input.state);
+  const acceptance = input.acceptance ?? {};
+  const lineage = input.lineage;
+
+  if (state === "enforcing" || state === "retired") {
+    if (!lineage.length) {
+      throw new Error(
+        `staged policy ${policyId}: state "${state}" requires validated append-only lineage; ` +
+          `static config cannot invent ${state} without a promotion/retirement chain`,
+      );
+    }
+  }
+
+  if (!lineage.length) return;
+
+  const last = lineage[lineage.length - 1]!;
+  if (last.to_state !== state) {
+    throw new Error(
+      `staged policy ${policyId}: lineage last to_state "${last.to_state}" does not match ` +
+        `declared state "${state}"`,
+    );
+  }
+
+  for (let i = 0; i < lineage.length; i++) {
+    const e = lineage[i]!;
+    if (e.policy_id !== policyId) {
+      throw new Error(
+        `staged policy ${policyId}: lineage[${i}].policy_id "${e.policy_id}" does not match`,
+      );
+    }
+    if (!isLegalLifecycleEdge(e.from_state, e.to_state)) {
+      throw new Error(
+        `staged policy ${policyId}: lineage[${i}] illegal edge ${e.from_state} → ${e.to_state}`,
+      );
+    }
+    if (!isIso8601Timestamp(e.at)) {
+      throw new Error(
+        `staged policy ${policyId}: lineage[${i}].at must be ISO 8601 date-time with zone; got ${JSON.stringify(e.at)}`,
+      );
+    }
+    if (edgeRequiresAuthority(e.to_state) && !authorityPresent(e.authority)) {
+      throw new Error(
+        `staged policy ${policyId}: lineage[${i}] ${e.from_state} → ${e.to_state} requires named authority (actor + role)`,
+      );
+    }
+    if (edgeRequiresEvidenceRefs(e.from_state, e.to_state)) {
+      const refs = e.evidence_refs ?? [];
+      if (!refs.some((r) => typeof r === "string" && r.trim().length > 0)) {
+        throw new Error(
+          `staged policy ${policyId}: lineage[${i}] ${e.from_state} → ${e.to_state} requires non-empty evidence_refs ` +
+            `(observation/promotion evidence cannot be self-attested empty)`,
+        );
+      }
+    }
+
+    const expectedBefore = computeStagedPolicyHash({
+      policy_id: policyId,
+      state: e.from_state,
+      acceptance,
+    });
+    const expectedAfter = computeStagedPolicyHash({
+      policy_id: policyId,
+      state: e.to_state,
+      acceptance,
+    });
+    if (e.policy_hash_before !== expectedBefore) {
+      throw new Error(
+        `staged policy ${policyId}: lineage[${i}].policy_hash_before does not match recomputed hash ` +
+          `for state "${e.from_state}" (forged or stale hash rejected)`,
+      );
+    }
+    if (e.policy_hash_after !== expectedAfter) {
+      throw new Error(
+        `staged policy ${policyId}: lineage[${i}].policy_hash_after does not match recomputed hash ` +
+          `for state "${e.to_state}" (forged or stale hash rejected)`,
+      );
+    }
+
+    if (i > 0) {
+      const prev = lineage[i - 1]!;
+      if (prev.to_state !== e.from_state) {
+        throw new Error(
+          `staged policy ${policyId}: lineage discontinuous at [${i}]: ` +
+            `prior to_state "${prev.to_state}" !== from_state "${e.from_state}"`,
+        );
+      }
+      if (prev.policy_hash_after !== e.policy_hash_before) {
+        throw new Error(
+          `staged policy ${policyId}: lineage hash chain broken at [${i}]: ` +
+            `prior policy_hash_after !== policy_hash_before`,
+        );
+      }
+    }
+  }
+
+  if (state === "enforcing" || lineage.some((e) => e.to_state === "enforcing")) {
+    if (!lineageContainsEnforcingPromotionPath(lineage)) {
+      throw new Error(
+        `staged policy ${policyId}: enforcing requires the complete predecessor chain ` +
+          `draft→observe→required→enforcing with validated hashes and evidence; ` +
+          `a self-attested required→enforcing head alone is rejected`,
+      );
+    }
+  }
+
+  if (state === "retired") {
+    const retire = last;
+    if (retire.to_state !== "retired" || !authorityPresent(retire.authority)) {
+      throw new Error(
+        `staged policy ${policyId}: state "retired" requires a final lineage event to retired ` +
+          `with named authority; static config cannot retire without authority`,
+      );
+    }
+  }
+}
+
+/**
+ * True when lineage is a fully validated materialization into enforcing
+ * (complete promotion path, recomputed hashes, authority, evidence_refs, ISO at).
  */
 export function hasValidEnforcingPromotionLineage(
   policyId: string,
   lineage: readonly PolicyLineageEvent[],
+  acceptance: Record<string, unknown> = {},
 ): boolean {
-  return lineage.some(
-    (e) =>
-      e.policy_id === policyId &&
-      e.from_state === "required" &&
-      e.to_state === "enforcing" &&
-      authorityPresent(e.authority) &&
-      typeof e.policy_hash_after === "string" &&
-      e.policy_hash_after.trim().length > 0 &&
-      typeof e.at === "string" &&
-      e.at.trim().length > 0,
-  );
+  try {
+    validateMaterializedLineage({
+      policy_id: policyId,
+      state: "enforcing",
+      acceptance,
+      lineage,
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
- * Reject effective `enforcing` without a validated lineage entry into
- * enforcing (from required + authority + hash). Used by config load and
- * materialize so static YAML cannot activate the gate without promotion evidence.
+ * Reject effective `enforcing` (and, when state is retired, unauthorized
+ * retirement) without validated lineage. Prefer
+ * {@link validateMaterializedLineage} when acceptance is available for hash recompute.
+ *
+ * @deprecated Callers with acceptance should use validateMaterializedLineage.
+ * Kept for call sites that only pass policyId/state/lineage; uses empty acceptance.
  */
 export function assertEnforcingLineage(
   policyId: string,
   state: PolicyLifecycleState,
   lineage: readonly PolicyLineageEvent[],
+  acceptance: Record<string, unknown> = {},
 ): void {
-  if (state !== "enforcing") return;
-  if (!hasValidEnforcingPromotionLineage(policyId, lineage)) {
-    throw new Error(
-      `staged policy ${policyId}: state "enforcing" requires a validated lineage entry into enforcing ` +
-        `(from_state "required", non-empty authority actor+role, policy_hash_after, at). ` +
-        `Static config cannot place a policy into enforcing without promotion evidence and named authority.`,
-    );
-  }
+  validateMaterializedLineage({
+    policy_id: policyId,
+    state,
+    acceptance,
+    lineage,
+  });
 }
 
 export function createStagedPolicy(
@@ -208,7 +408,12 @@ export function createStagedPolicy(
     authority: e.authority ? { ...e.authority } : null,
     evidence_refs: [...(e.evidence_refs ?? [])],
   }));
-  assertEnforcingLineage(id, state, lineageCopy);
+  validateMaterializedLineage({
+    policy_id: id,
+    state,
+    acceptance,
+    lineage: lineageCopy,
+  });
   return {
     policy_id: id,
     state,
@@ -227,7 +432,7 @@ export interface StagedPolicyDecl {
 
 /**
  * Materialize a StagedPolicy from a config declaration. Fails closed when
- * state is enforcing without validated promotion lineage.
+ * state is enforcing/retired without a fully validated lineage chain.
  */
 export function stagedPolicyFromDecl(decl: StagedPolicyDecl): StagedPolicy {
   return createStagedPolicy(
@@ -431,13 +636,17 @@ export function hasEnforcingLineage(policy: StagedPolicy): boolean {
 }
 
 /**
- * Invariant check: an enforcing effective state MUST have a validated lineage
- * entry into enforcing (required → enforcing with authority + hash). Returns
- * false when the invariant is broken (config bypass or forged record).
+ * Invariant check: an enforcing effective state MUST have a fully validated
+ * promotion lineage (complete path, recomputed hashes, authority, evidence).
+ * Returns false when the invariant is broken (config bypass or forged record).
  */
 export function enforcingStateHasLineage(policy: StagedPolicy): boolean {
   if (policy.state !== "enforcing") return true;
-  return hasValidEnforcingPromotionLineage(policy.policy_id, policy.lineage);
+  return hasValidEnforcingPromotionLineage(
+    policy.policy_id,
+    policy.lineage,
+    policy.acceptance,
+  );
 }
 
 /** Evidence row for run finalize: policy_id, state, policy_hash (+ optional lineage head). */

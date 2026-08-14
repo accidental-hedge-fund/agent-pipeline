@@ -13,12 +13,15 @@ import {
   evaluateLifecycleTransition,
   hasEnforcingLineage,
   hasValidEnforcingPromotionLineage,
+  isIso8601Timestamp,
   isLegalLifecycleEdge,
   isPolicyLifecycleState,
   POLICY_LIFECYCLE_STATES,
   stagedPolicyFromDecl,
   toPolicyEvidenceRow,
+  validateMaterializedLineage,
   type PolicyAuthorityRecord,
+  type PolicyLifecycleState,
   type PolicyLineageEvent,
   type PolicyObservationAggregates,
   type StagedPolicy,
@@ -56,6 +59,40 @@ function promoteTo(
   });
   assert.equal(r.ok, true, r.ok ? "" : r.message);
   return (r as { ok: true; policy: StagedPolicy }).policy;
+}
+
+/** Build a full legal draft→…→enforcing lineage with recomputed hashes (config materialize). */
+function buildLegalEnforcingLineage(
+  policyId: string,
+  acceptance: Record<string, unknown> = {},
+  at: string = AT,
+): PolicyLineageEvent[] {
+  const path: Array<[PolicyLifecycleState, PolicyLifecycleState]> = [
+    ["draft", "observe"],
+    ["observe", "required"],
+    ["required", "enforcing"],
+  ];
+  return path.map(([from, to]) => ({
+    policy_id: policyId,
+    from_state: from,
+    to_state: to,
+    policy_hash_before: computeStagedPolicyHash({
+      policy_id: policyId,
+      state: from,
+      acceptance,
+    }),
+    policy_hash_after: computeStagedPolicyHash({
+      policy_id: policyId,
+      state: to,
+      acceptance,
+    }),
+    at,
+    authority: to === "enforcing" ? AUTH : null,
+    evidence_refs:
+      (from === "observe" && to === "required") || (from === "required" && to === "enforcing")
+        ? ["obs://1"]
+        : [],
+  }));
 }
 
 // ---------------------------------------------------------------------------
@@ -313,7 +350,7 @@ test("observe is not treated as enforcing in evidence row", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Config / materialize: enforcing requires lineage (#695 review finding b24e688e)
+// Config / materialize: enforcing requires full validated lineage (#695 review 1c974526)
 // ---------------------------------------------------------------------------
 
 test("createStagedPolicy rejects bare enforcing without lineage", () => {
@@ -331,60 +368,237 @@ test("createStagedPolicy rejects bare enforcing without lineage", () => {
   );
 });
 
-test("createStagedPolicy rejects enforcing lineage missing authority", () => {
+test("createStagedPolicy rejects bare retired without lineage", () => {
+  assert.throws(
+    () => createStagedPolicy("p1", {}, "retired"),
+    /retired.*lineage|lineage.*retired|cannot invent retired/i,
+  );
+  assert.throws(
+    () => stagedPolicyFromDecl({ policy_id: "p1", state: "retired" }),
+    /retired.*lineage|cannot invent retired/i,
+  );
+});
+
+test("forged single-head required→enforcing lineage is rejected", () => {
+  const acceptance = { gate: true };
   const forged: PolicyLineageEvent = {
     policy_id: "p1",
     from_state: "required",
     to_state: "enforcing",
-    policy_hash_before: "a".repeat(64),
-    policy_hash_after: "b".repeat(64),
+    policy_hash_before: computeStagedPolicyHash({
+      policy_id: "p1",
+      state: "required",
+      acceptance,
+    }),
+    policy_hash_after: computeStagedPolicyHash({
+      policy_id: "p1",
+      state: "enforcing",
+      acceptance,
+    }),
     at: AT,
-    authority: null,
-    evidence_refs: [],
+    authority: AUTH,
+    evidence_refs: ["obs://1"],
   };
   assert.throws(
-    () => createStagedPolicy("p1", {}, "enforcing", [forged]),
-    /enforcing.*lineage|authority/i,
+    () => createStagedPolicy("p1", acceptance, "enforcing", [forged]),
+    /complete predecessor chain|self-attested|draft→observe→required→enforcing/i,
   );
-  assert.equal(hasValidEnforcingPromotionLineage("p1", [forged]), false);
+  assert.equal(hasValidEnforcingPromotionLineage("p1", [forged], acceptance), false);
   assert.equal(
     enforcingStateHasLineage({
       policy_id: "p1",
       state: "enforcing",
-      acceptance: {},
+      acceptance,
       lineage: [forged],
     }),
     false,
   );
 });
 
-test("createStagedPolicy accepts enforcing when lineage has required→enforcing + authority", () => {
-  const event: PolicyLineageEvent = {
-    policy_id: "p1",
-    from_state: "required",
-    to_state: "enforcing",
-    policy_hash_before: "a".repeat(64),
-    policy_hash_after: "b".repeat(64),
-    at: AT,
-    authority: AUTH,
-    evidence_refs: ["obs://1"],
-  };
-  const p = createStagedPolicy("p1", { gate: true }, "enforcing", [event]);
+test("forged lineage with arbitrary non-empty hashes is rejected", () => {
+  const forgedPath: PolicyLineageEvent[] = [
+    {
+      policy_id: "p1",
+      from_state: "draft",
+      to_state: "observe",
+      policy_hash_before: "a".repeat(64),
+      policy_hash_after: "b".repeat(64),
+      at: AT,
+      authority: null,
+      evidence_refs: [],
+    },
+    {
+      policy_id: "p1",
+      from_state: "observe",
+      to_state: "required",
+      policy_hash_before: "b".repeat(64),
+      policy_hash_after: "c".repeat(64),
+      at: AT,
+      authority: null,
+      evidence_refs: ["obs://1"],
+    },
+    {
+      policy_id: "p1",
+      from_state: "required",
+      to_state: "enforcing",
+      policy_hash_before: "c".repeat(64),
+      policy_hash_after: "d".repeat(64),
+      at: AT,
+      authority: AUTH,
+      evidence_refs: ["obs://1"],
+    },
+  ];
+  assert.throws(
+    () => createStagedPolicy("p1", { gate: true }, "enforcing", forgedPath),
+    /recomputed hash|forged or stale/i,
+  );
+});
+
+test("illegal predecessor edge in lineage chain is rejected", () => {
+  const acceptance = {};
+  const bad: PolicyLineageEvent[] = [
+    {
+      policy_id: "p1",
+      from_state: "draft",
+      to_state: "observe",
+      policy_hash_before: computeStagedPolicyHash({
+        policy_id: "p1",
+        state: "draft",
+        acceptance,
+      }),
+      policy_hash_after: computeStagedPolicyHash({
+        policy_id: "p1",
+        state: "observe",
+        acceptance,
+      }),
+      at: AT,
+      authority: null,
+      evidence_refs: [],
+    },
+    {
+      policy_id: "p1",
+      from_state: "observe",
+      to_state: "enforcing",
+      policy_hash_before: computeStagedPolicyHash({
+        policy_id: "p1",
+        state: "observe",
+        acceptance,
+      }),
+      policy_hash_after: computeStagedPolicyHash({
+        policy_id: "p1",
+        state: "enforcing",
+        acceptance,
+      }),
+      at: AT,
+      authority: AUTH,
+      evidence_refs: ["obs://1"],
+    },
+  ];
+  assert.throws(
+    () => createStagedPolicy("p1", acceptance, "enforcing", bad),
+    /illegal edge|complete predecessor/i,
+  );
+});
+
+test("evidence-less observe→required or required→enforcing is rejected", () => {
+  const acceptance = { gate: true };
+  const lineage = buildLegalEnforcingLineage("p1", acceptance);
+  lineage[1] = { ...lineage[1]!, evidence_refs: [] };
+  assert.throws(
+    () => createStagedPolicy("p1", acceptance, "enforcing", lineage),
+    /evidence_refs/i,
+  );
+});
+
+test("non-ISO at timestamp is rejected", () => {
+  assert.equal(isIso8601Timestamp("not-a-date"), false);
+  assert.equal(isIso8601Timestamp(AT), true);
+  const acceptance = {};
+  const lineage = buildLegalEnforcingLineage("p1", acceptance, "yesterday");
+  assert.throws(
+    () => createStagedPolicy("p1", acceptance, "enforcing", lineage),
+    /ISO 8601/i,
+  );
+});
+
+test("createStagedPolicy rejects enforcing lineage missing authority on promotion", () => {
+  const acceptance = {};
+  const lineage = buildLegalEnforcingLineage("p1", acceptance);
+  lineage[2] = { ...lineage[2]!, authority: null };
+  assert.throws(
+    () => createStagedPolicy("p1", acceptance, "enforcing", lineage),
+    /authority/i,
+  );
+  assert.equal(hasValidEnforcingPromotionLineage("p1", lineage, acceptance), false);
+});
+
+test("createStagedPolicy accepts enforcing with full validated promotion path", () => {
+  const acceptance = { gate: true };
+  const lineage = buildLegalEnforcingLineage("p1", acceptance);
+  const p = createStagedPolicy("p1", acceptance, "enforcing", lineage);
   assert.equal(p.state, "enforcing");
   assert.equal(enforcingStateHasLineage(p), true);
-  assert.equal(hasValidEnforcingPromotionLineage("p1", p.lineage), true);
+  assert.equal(hasValidEnforcingPromotionLineage("p1", p.lineage, acceptance), true);
+  assert.equal(p.lineage.length, 3);
   const fromDecl = stagedPolicyFromDecl({
     policy_id: "p1",
     state: "enforcing",
-    acceptance: { gate: true },
-    lineage: [event],
+    acceptance,
+    lineage,
   });
   assert.equal(fromDecl.state, "enforcing");
-  assert.equal(fromDecl.lineage.length, 1);
+  assert.equal(fromDecl.lineage.length, 3);
+  // Runtime path after evaluateLifecycleTransition also satisfies invariant.
+  let runtime = createStagedPolicy("p1", acceptance);
+  runtime = promoteTo(runtime, "observe", { authority: null, observation: null });
+  runtime = promoteTo(runtime, "required");
+  runtime = promoteTo(runtime, "enforcing");
+  assert.equal(enforcingStateHasLineage(runtime), true);
+  validateMaterializedLineage({
+    policy_id: runtime.policy_id,
+    state: runtime.state,
+    acceptance: runtime.acceptance,
+    lineage: runtime.lineage,
+  });
 });
 
-test("non-enforcing initial states still allow empty lineage", () => {
-  for (const s of ["draft", "observe", "required", "retired"] as const) {
+test("authorized retirement lineage is accepted; unauthorized bare retired is not", () => {
+  const acceptance = { gate: true };
+  const enforceLineage = buildLegalEnforcingLineage("p1", acceptance);
+  const retireEvent: PolicyLineageEvent = {
+    policy_id: "p1",
+    from_state: "enforcing",
+    to_state: "retired",
+    policy_hash_before: computeStagedPolicyHash({
+      policy_id: "p1",
+      state: "enforcing",
+      acceptance,
+    }),
+    policy_hash_after: computeStagedPolicyHash({
+      policy_id: "p1",
+      state: "retired",
+      acceptance,
+    }),
+    at: AT,
+    authority: AUTH,
+    evidence_refs: [],
+  };
+  const retired = createStagedPolicy("p1", acceptance, "retired", [
+    ...enforceLineage,
+    retireEvent,
+  ]);
+  assert.equal(retired.state, "retired");
+  assert.equal(retired.lineage.length, 4);
+
+  const noAuth = { ...retireEvent, authority: null };
+  assert.throws(
+    () => createStagedPolicy("p1", acceptance, "retired", [...enforceLineage, noAuth]),
+    /authority|retired/i,
+  );
+});
+
+test("non-enforcing non-retired initial states still allow empty lineage", () => {
+  for (const s of ["draft", "observe", "required"] as const) {
     const p = createStagedPolicy("p1", {}, s);
     assert.equal(p.state, s);
     assert.equal(p.lineage.length, 0);

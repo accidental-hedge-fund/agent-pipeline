@@ -23,9 +23,23 @@ The pipeline SHALL represent each staged policy’s effective state as exactly o
 #### Scenario: Config declaration of enforcing without lineage is rejected
 
 - **WHEN** a staged policy is declared in config with `state: enforcing`
-- **AND** no validated lineage entry into `enforcing` is present (required → enforcing with non-empty named authority and `policy_hash_after`)
+- **AND** no fully validated lineage chain into `enforcing` is present (complete legal path `draft` → `observe` → `required` → `enforcing`, recomputed `policy_hash_before`/`policy_hash_after` matching the acceptance slice, ISO 8601 `at`, non-empty named authority on the enforcing entry, and non-empty `evidence_refs` on observation-gated promotions)
 - **THEN** config validation SHALL fail
 - **AND** the policy SHALL NOT be exposed with effective state `enforcing`
+
+#### Scenario: Config self-attested single-head enforcing lineage is rejected
+
+- **WHEN** a staged policy is declared in config with `state: enforcing`
+- **AND** lineage contains only a self-attested `required` → `enforcing` head (even with non-empty authority strings and non-empty hash strings)
+- **THEN** config validation SHALL fail
+- **AND** the policy SHALL NOT be exposed with effective state `enforcing`
+
+#### Scenario: Config declaration of retired without authority lineage is rejected
+
+- **WHEN** a staged policy is declared in config with `state: retired`
+- **AND** no lineage event to `retired` with non-empty named authority is present (or hashes/`at` fail materialize validation)
+- **THEN** config validation SHALL fail
+- **AND** the policy SHALL NOT be exposed with effective state `retired`
 
 ---
 
@@ -128,9 +142,10 @@ Every successful promotion or retirement SHALL append a lineage record that incl
 #### Scenario: Static config cannot invent enforcing without lineage
 
 - **WHEN** config load or policy materialization is asked to expose effective state `enforcing`
-- **AND** the loaded record has no lineage event with `from_state: "required"`, `to_state: "enforcing"`, non-empty authority, and `policy_hash_after`
+- **AND** the loaded record lacks a fully validated lineage chain (complete `draft` → `observe` → `required` → `enforcing` path, recomputed acceptance-slice hashes, ISO 8601 `at`, named authority on enforcing, non-empty `evidence_refs` on observation-gated promotions)
 - **THEN** load or materialization SHALL fail closed
 - **AND** SHALL NOT activate fail-closed readiness gates as if the policy were lawfully enforcing
+- **AND** a self-attested single-head `required` → `enforcing` record with arbitrary non-empty strings SHALL NOT satisfy validation
 
 #### Scenario: Lineage is not rewritten on later promotion
 

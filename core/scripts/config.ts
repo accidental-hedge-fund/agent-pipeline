@@ -45,6 +45,7 @@ import {
 import { isSafeScratchExtensionGlob } from "./worktree-dirt.ts";
 import { TRUSTED_SURFACE_CLASS_IDS } from "./trusted-surface.ts";
 import { implicitOverrideGovernance } from "./override-governance.ts";
+import { validateMaterializedLineage } from "./stage-policy-lifecycle.ts";
 
 // A `models.*`/`effort.*` value: an arbitrary alias/effort string, or the
 // "auto" sentinel (#366) resolved via stage-routing.ts at config-load time.
@@ -1187,8 +1188,9 @@ const PartialConfigSchema = z.object({
       "Trusted-surface path coverage (#691). Only additive extra_paths are accepted; built-in classes remain engine-defined.",
     ),
   // Staged policy lifecycle (#695). Opt-in; absent → no policy lifecycle recording.
-  // state "enforcing" is rejected unless lineage includes a validated promotion
-  // event (required → enforcing with named authority) — see superRefine below.
+  // state "enforcing"/"retired" materialize only through validateMaterializedLineage
+  // (complete predecessor chain, recomputed hashes, authority, evidence_refs, ISO at)
+  // — self-attested single-head lineage is rejected.
   staged_policies: z
     .array(
       z
@@ -1224,33 +1226,23 @@ const PartialConfigSchema = z.object({
             )
             .optional()
             .describe(
-              "Append-only lineage. Required when state is enforcing: must include required→enforcing with named authority.",
+              "Append-only lineage. Required when state is enforcing or retired: complete legal chain with recomputed policy hashes, authority on enforcing/retired edges, and non-empty evidence_refs on observation-gated promotions.",
             ),
         })
         .strict()
         .superRefine((p, ctx) => {
-          if (p.state !== "enforcing") return;
-          const lineage = p.lineage ?? [];
-          const ok = lineage.some(
-            (e) =>
-              e.policy_id === p.policy_id &&
-              e.from_state === "required" &&
-              e.to_state === "enforcing" &&
-              e.authority != null &&
-              typeof e.authority.actor === "string" &&
-              e.authority.actor.trim().length > 0 &&
-              typeof e.authority.role === "string" &&
-              e.authority.role.trim().length > 0 &&
-              e.policy_hash_after.trim().length > 0 &&
-              e.at.trim().length > 0,
-          );
-          if (!ok) {
+          try {
+            validateMaterializedLineage({
+              policy_id: p.policy_id,
+              state: p.state,
+              acceptance: p.acceptance ?? {},
+              lineage: p.lineage ?? [],
+            });
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
             ctx.addIssue({
               code: "custom",
-              message:
-                `state "enforcing" requires validated lineage entry into enforcing ` +
-                `(from_state "required", non-empty authority actor+role, policy_hash_after, at); ` +
-                `static config cannot place a policy into enforcing without promotion evidence`,
+              message,
               path: ["state"],
             });
           }
@@ -1259,7 +1251,7 @@ const PartialConfigSchema = z.object({
     .optional()
     .describe(
       "Opt-in staged policies (#695). States: draft|observe|required|enforcing|retired. " +
-        "enforcing requires lineage with a required→enforcing promotion event and named authority. Absent/empty → no lifecycle gate.",
+        "enforcing/retired require fully validated lineage (complete path, recomputed hashes, authority). Absent/empty → no lifecycle gate.",
     ),
   // Repository-control desired state (#695). Opt-in; absent → no drift compare.
   repository_control_desired_state: z
