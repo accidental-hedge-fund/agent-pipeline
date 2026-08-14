@@ -114,14 +114,24 @@ truncate_reason() {
 }
 
 append_audit() {
+  # Best-effort: filesystem failures must not make the helper exit non-zero.
   local status=$1 attempts=$2 reason=$3
   local ts key_field
   ts=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%s)
   key_field="${key:-}"
-  mkdir -p "$DEDUP_DIR"
+  if ! mkdir -p "$DEDUP_DIR" 2>/dev/null; then
+    printf 'ship-notify: audit write failed (mkdir %s); status=%s reason=%s\n' \
+      "$DEDUP_DIR" "$status" "$reason" >&2 || true
+    return 0
+  fi
   # Fields: ts status attempts key reason  (tab-separated; reason last)
-  printf '%s\t%s\tattempts=%s\tkey=%s\t%s\n' \
-    "$ts" "$status" "$attempts" "$key_field" "$reason" >>"$AUDIT_LOG"
+  if ! printf '%s\t%s\tattempts=%s\tkey=%s\t%s\n' \
+    "$ts" "$status" "$attempts" "$key_field" "$reason" >>"$AUDIT_LOG" 2>/dev/null; then
+    printf 'ship-notify: audit write failed (%s); status=%s reason=%s\n' \
+      "$AUDIT_LOG" "$status" "$reason" >&2 || true
+    return 0
+  fi
+  return 0
 }
 
 clear_key_failure_markers() {
@@ -133,27 +143,38 @@ clear_key_failure_markers() {
     [[ -e "$f" ]] || continue
     rm -f "$f" || true
   done
+  return 0
 }
 
 write_failure_marker() {
+  # Best-effort: marker persistence failures must not make the helper exit non-zero.
   local attempts=$1 reason=$2
   local epoch marker id
   epoch=$(date +%s)
-  mkdir -p "$FAILED_DIR"
+  if ! mkdir -p "$FAILED_DIR" 2>/dev/null; then
+    printf 'ship-notify: failure marker write failed (mkdir %s); attempts=%s reason=%s\n' \
+      "$FAILED_DIR" "$attempts" "$reason" >&2 || true
+    return 0
+  fi
   if [[ -n "$key_safe" ]]; then
     id="${key_safe}-${epoch}"
   else
     id="anon-${epoch}"
   fi
   marker="$FAILED_DIR/$id"
-  {
+  if ! {
     printf 'status=fail\n'
     printf 'epoch=%s\n' "$epoch"
     printf 'attempts=%s\n' "$attempts"
     printf 'key=%s\n' "${key:-}"
     printf 'content=%s\n' "$content"
     printf 'reason=%s\n' "$reason"
-  } >"$marker"
+  } >"$marker" 2>/dev/null; then
+    printf 'ship-notify: failure marker write failed (%s); attempts=%s reason=%s\n' \
+      "$marker" "$attempts" "$reason" >&2 || true
+    return 0
+  fi
+  return 0
 }
 
 if ! [[ "$MAX_ATTEMPTS" =~ ^[1-9][0-9]*$ ]]; then

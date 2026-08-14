@@ -234,3 +234,23 @@ test("success clears prior key-scoped failure marker", () => {
   assert.equal(remaining.length, 0, `leftover markers: ${remaining}`);
   assert.match(auditLog(fx), /\tok\t/);
 });
+
+test("unwritable audit/marker targets still exit 0 after send failure", () => {
+  // Observability persistence is best-effort: a full/unwritable state tree must
+  // not turn messenger failure into a ship-blocking non-zero exit.
+  const fx = makeFixture({ alwaysFail: true });
+  const notifyDir = path.join(fx.state, "notify");
+  const auditPath = path.join(notifyDir, "audit.log");
+  const failedPath = path.join(notifyDir, "failed");
+
+  // audit.log as a directory → append redirection fails.
+  fs.mkdirSync(auditPath, { recursive: true });
+  // failed as a regular file → mkdir -p for the marker dir fails.
+  fs.writeFileSync(failedPath, "not-a-directory");
+
+  const r = runNotify(fx, ["unwritable persistence", "persist-fail-key"]);
+  assert.equal(r.status, 0, `stderr=${r.stderr}`);
+  assert.equal(callCount(fx), 3);
+  // Stderr fallback names the persistence failure (do not require exact wording).
+  assert.match(r.stderr, /ship-notify:.*(audit|failure marker) write failed/i);
+});

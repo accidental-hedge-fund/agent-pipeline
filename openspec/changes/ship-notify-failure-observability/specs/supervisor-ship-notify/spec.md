@@ -79,7 +79,7 @@ When a dedupe key is supplied without `--force`, the helper SHALL continue to su
 
 ### Requirement: Ship-notify delivery failure SHALL NOT block ship or train progression
 
-Callers of the shared ship-notify helper (including Tugboat, the chain ship playbook, and stage-watch) rely on best-effort delivery. A messenger send failure after retries SHALL leave the helper exit status 0 so that notify failure alone does not fail a ship phase or train solely due to channel delivery. Stage progression and composer phase status remain governed by their own gates, not by proof of Buzz delivery.
+Callers of the shared ship-notify helper (including Tugboat, the chain ship playbook, and stage-watch) rely on best-effort delivery. A messenger send failure after retries SHALL leave the helper exit status 0 so that notify failure alone does not fail a ship phase or train solely due to channel delivery. Stage progression and composer phase status remain governed by their own gates, not by proof of Buzz delivery. Terminal audit and final-failure marker persistence SHALL also be best-effort: when those filesystem writes fail after a send outcome is known, the helper SHALL still exit 0 and SHOULD emit a concise stderr fallback naming the persistence failure.
 
 #### Scenario: Exhausted notify failure does not fail the helper process
 
@@ -87,9 +87,16 @@ Callers of the shared ship-notify helper (including Tugboat, the chain ship play
 - **THEN** `ship-notify` SHALL exit 0
 - **AND** durable audit and failure marker artifacts SHALL still be present for operators
 
+#### Scenario: Unwritable audit or marker path still exits zero
+
+- **WHEN** a configured send fails every attempt in the retry budget
+- **AND** the notify audit log or failure-marker path cannot be written (unwritable, full, or wrong file type)
+- **THEN** `ship-notify` SHALL still exit 0
+- **AND** it SHALL emit a concise stderr line indicating the persistence failure
+
 ### Requirement: Ship-notify delivery observability SHALL be regression-tested
 
-Automated tests covered by `npm run ci` SHALL exercise the shared helper with a fake messenger binary (no real network). The suite SHALL include at least: (1) fail-then-succeed within budget → one successful outcome and success audit; (2) fail-all → failure audit, supervisor-visible marker, exit 0. The suite SHALL fail if the helper again discards all send failures without durable audit/marker artifacts while claiming success only by exit code.
+Automated tests covered by `npm run ci` SHALL exercise the shared helper with a fake messenger binary (no real network). The suite SHALL include at least: (1) fail-then-succeed within budget → one successful outcome and success audit; (2) fail-all → failure audit, supervisor-visible marker, exit 0; (3) unwritable audit/marker targets after a fail-all send → exit 0 with a stderr persistence fallback. The suite SHALL fail if the helper again discards all send failures without durable audit/marker artifacts while claiming success only by exit code.
 
 #### Scenario: Transient-success fixture passes
 
@@ -107,3 +114,9 @@ Automated tests covered by `npm run ci` SHALL exercise the shared helper with a 
 
 - **WHEN** the helper implementation returns exit 0 after a total send failure without writing a failure audit or marker
 - **THEN** the automated regression tests SHALL fail
+
+#### Scenario: Unwritable-persistence fixture passes
+
+- **WHEN** the automated ship-notify tests run with a fake messenger that always fails and unwritable audit/marker targets
+- **THEN** the tests SHALL observe exit 0 and a stderr persistence-failure signal
+- **AND** they SHALL pass under `npm run ci`
