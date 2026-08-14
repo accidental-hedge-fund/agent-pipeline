@@ -32,8 +32,14 @@ When a ship-path item fails, recover in this order:
 3. **Verify** / re-review / rerun CI as the class requires.
 4. **Bounded model repair** (`repair_pipeline_item` / fix harness) only after
    the deterministic path is exhausted or inapplicable.
-5. **Real human handoff** only for human-authority classes (product judgment,
-   missing authority). That path is handoff such as #647 — not scratch cleanup.
+5. **One supervisor reflow** for residual review parks at current HEAD:
+   `pipeline recover-parked <N>` (once per park fingerprint). Deterministic
+   first; audited override only for stale/DNR/below-high; **never** auto-override
+   HIGH/CRITICAL/security/authority. Outer hosts may only invoke this CLI (or
+   STOP) — they must not invent override or drop `blocked`.
+6. **Real human handoff** only for human-authority classes (product judgment,
+   missing authority) and still-valid HIGH/CRITICAL/security residuals after
+   recover-parked. That path is handoff such as #647 — not scratch cleanup.
 
 ## 3. False human vs real human
 

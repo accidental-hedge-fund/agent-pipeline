@@ -1,5 +1,5 @@
 ---
-description: Disposition a review finding and auto-resume the advance loop for issue N
+description: 'Disposition a review finding and auto-resume the advance loop for issue N'
 argument-hint: '<N> "<key>: <reason>"'
 ---
 

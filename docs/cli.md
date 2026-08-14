@@ -66,6 +66,11 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 - **Usage:** `pipeline override <n> "<key>: <reason>"`
 - **Summary:** Disposition a review finding and auto-resume the advance loop
 
+#### `recover-parked`
+
+- **Usage:** `pipeline recover-parked <n> [--json] [--dry-run]`
+- **Summary:** One supervisor pass for a parked issue: deterministic recover first, then reflow only stale/DNR/below-high residuals (never auto-override HIGH/CRITICAL/security); re-enter single if clear
+
 #### `release`
 
 - **Usage:** `pipeline release <version> [--theme "..."] [--dry-run|--json] [--no-edit] [--skip-frg] | release finish <pr> [--json]`

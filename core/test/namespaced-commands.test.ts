@@ -22,6 +22,7 @@ const EXPECTED_OPERATIONS = new Set([
   "status",
   "unblock",
   "override",
+  "recover-parked",
   "summary",
   "doctor",
   "init",

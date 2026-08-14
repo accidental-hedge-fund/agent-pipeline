@@ -2,14 +2,17 @@
 
 ## Purpose
 TBD - created by archiving change namespaced-command-surface. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: Each in-scope operation SHALL be exposed as a distinct `pipeline:<command>` host entry
 
 The host packaging SHALL expose each in-scope pipeline operation as its own
 discoverable `pipeline:<command>` command entry, rather than as a flag on a single
 `/pipeline` command. The in-scope operation set SHALL be exactly: `status`,
 `unblock`, `override`, `summary`, `doctor`, `init`, `cleanup`, `intake`, `sweep`,
-`triage`, `merge`, `merge-queue`, `release`, `roadmap`, `logs`, `loop`. On the
+`triage`, `merge`, `merge-queue`, `release`, `roadmap`, `logs`, `loop`,
+`recover-parked`. On the
 Claude host these entries SHALL be invocable as `/pipeline:<command>`; on the
 Codex host they SHALL be invocable as `$pipeline:<command>`. Each entry SHALL
 appear in that host's command/skill discovery surface.
@@ -21,7 +24,7 @@ appear in that host's command/skill discovery surface.
   `pipeline:override`, `pipeline:summary`, `pipeline:doctor`, `pipeline:init`,
   `pipeline:cleanup`, `pipeline:intake`, `pipeline:sweep`, `pipeline:triage`,
   `pipeline:merge`, `pipeline:merge-queue`, `pipeline:release`, `pipeline:roadmap`,
-  `pipeline:logs`, and `pipeline:loop` entry
+  `pipeline:logs`, `pipeline:loop`, and `pipeline:recover-parked` entry
 - **AND** no in-scope operation SHALL be reachable only as a flag on the base
   `/pipeline` command
 
@@ -40,7 +43,13 @@ appear in that host's command/skill discovery surface.
   overlay SHALL gain the matching agent entry
 - **AND** the `plugin/` mirror SHALL regenerate to match
 
----
+#### Scenario: recover-parked host entry is generated from the same single source
+
+- **WHEN** `recover-parked` is present in the single-source operation list and
+  `scripts/build.mjs` is run
+- **THEN** the Claude `commands/` surface SHALL gain `pipeline:recover-parked` (or
+  equivalent host entry) and the Codex overlay SHALL gain the matching agent entry
+- **AND** the `plugin/` mirror SHALL regenerate to match when host packaging is mirrored
 
 ### Requirement: The host command set SHALL be symmetric across Claude and Codex
 
@@ -250,3 +259,24 @@ describe autonomous or background merging.
 - **THEN** it SHALL mention dry-run (or default non-mutating plan) behavior
 - **AND** SHALL NOT claim the advance loop merges via this command
 
+### Requirement: Host recover-parked entry SHALL only forward to the CLI
+
+The host `pipeline:recover-parked` entry SHALL forward exclusively to the engine CLI
+`pipeline recover-parked` (Claude `/pipeline:recover-parked`, Codex
+`$pipeline:recover-parked`, and any Tugboat/Hermes skill text that documents the
+operation), or no-op + STOP when the host chooses not to invoke it. Host packaging
+and skill prose SHALL NOT instruct inventing `pipeline override` dispositions,
+dropping `blocked`/`needs-human` labels, or reclassifying structured
+HIGH/CRITICAL/security findings outside the CLI.
+
+#### Scenario: Host entry documents CLI-only reflow
+
+- **WHEN** an operator reads the host `pipeline:recover-parked` command or skill entry
+- **THEN** the documented action SHALL be invocation of `pipeline recover-parked`
+- **AND** it SHALL NOT document a host-local override or label-drop alternative for the same reflow
+
+#### Scenario: Host skill must not invent override for parked residuals
+
+- **WHEN** a thin host observes `needs-human` or leftover `blocked` after deterministic resume
+- **THEN** the host contract SHALL allow calling `pipeline recover-parked` once or STOP
+- **AND** SHALL forbid host-improvised `pipeline override` or silent removal of `blocked` for that reflow

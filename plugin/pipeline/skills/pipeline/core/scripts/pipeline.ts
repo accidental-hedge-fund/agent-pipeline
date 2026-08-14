@@ -34,6 +34,7 @@ import {
   getIssueLabelEvents,
   getItemKind,
   getLatestBlockedLabeledAt,
+  getPrDetail,
   getPrForIssue,
   getPrLinkedIssue,
   isBlocked,
@@ -701,6 +702,9 @@ export function maxPositionalsFor(command: string | undefined): number {
   if (command === "unblock" || command === "override" || command === "evals") {
     return 3;
   }
+  if (command === "recover-parked") {
+    return 2;
+  }
   // loop keyword + up to MAX_RANGE_SPAN issue numbers (same ceiling as --range).
   if (command === "loop") {
     return 1 + MAX_RANGE_SPAN;
@@ -718,7 +722,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | controls | run | single | release | ship | factory-gate | factory-release | factory-pin | engine-promote | intake | decompose | triage | roadmap | sweep | merge | merge-queue | train | summary | improve | scoreboard | outcomes | lineage | queue | backfill | evals | loop | correction | handoff | report")
+    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | recover-parked | cleanup | logs | path | config | controls | run | single | release | ship | factory-gate | factory-release | factory-pin | engine-promote | intake | decompose | triage | roadmap | sweep | merge | merge-queue | train | summary | improve | scoreboard | outcomes | lineage | queue | backfill | evals | loop | correction | handoff | report")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -3185,6 +3189,48 @@ export async function runTrainCommand(
     {
       ...baseDeps,
       advanceWave: (issues) => wave(issues, opts, baseDeps.getIssue),
+      // #1061: one supervisor recover-parked pass on park; never invent override in train.
+      recoverParked: async (issue) => {
+        const {
+          runRecoverParked,
+          reenterAdvanceAfterRecoverParked,
+        } = await import("./recover-parked.ts");
+        const { runAdvance: runAdvanceForRecover } = await import("./pipeline-run.ts");
+        const result = await runRecoverParked(
+          trainCfg,
+          issue,
+          {},
+          {
+            getIssueDetail,
+            getPrForIssue,
+            getPrDetail,
+            postComment,
+            clearBlocked,
+            getGhActor,
+            // Default tryUnlinkEngineScratch = production defaultTryUnlinkEngineScratch.
+            reenterAdvance: async (c, n, reOpts) => {
+              // Propagate skipRecoverParked into same-issue advance so a
+              // re-park cannot recursively invoke recover-parked on this stack.
+              await reenterAdvanceAfterRecoverParked(
+                c,
+                n,
+                {
+                  getIssueDetail,
+                  silentTransition,
+                  runAdvance: runAdvanceForRecover,
+                },
+                { ...toAdvanceOpts(opts), skipRecoverParked: reOpts.skipRecoverParked },
+              );
+            },
+            log: (m) => console.error(m),
+          },
+        );
+        return {
+          status: result.status,
+          issue: result.issue,
+          message: result.message,
+        };
+      },
     },
   );
   try {
@@ -5636,7 +5682,7 @@ async function main(): Promise<void> {
   // so the user sees a clear usage error rather than a gh auth/repo-discovery failure.
   if (numArg && !/^\d+$/.test(numArg)) {
     const recognized = [
-      "init", "doctor", "status", "unblock", "override", "cleanup",
+      "init", "doctor", "status", "unblock", "override", "recover-parked", "cleanup",
       "logs", "path", "config", "run", "single", "release", "intake", "decompose", "refine-spec",
       "roadmap", "sweep", "triage", "merge", "merge-queue", "train", "ship", "summary", "improve", "scoreboard", "outcomes", "lineage", "factory-gate", "factory-release", "factory-pin", "engine-promote", "queue", "backfill", "evals",
       "loop", "controls",
@@ -5815,6 +5861,80 @@ async function main(): Promise<void> {
       process.exit(1);
     }
     await runUnblock(cfg, unblockIssueNumber!, unblockAnswer, unblockN);
+    return;
+  }
+
+  // Positional `pipeline recover-parked <N>` (#1061): one supervisor reflow pass.
+  if (numArg === "recover-parked") {
+    const rpNumStr = cmd.args[1];
+    if (!rpNumStr || !/^\d+$/.test(rpNumStr)) {
+      console.error(
+        "pipeline recover-parked: an issue or PR number is required.\n" +
+          "  Usage: pipeline recover-parked <N> [--json] [--dry-run]\n" +
+          "  One supervisor pass per park fingerprint; never auto-overrides HIGH/CRITICAL/security.",
+      );
+      process.exit(2);
+    }
+    if (isKillSwitchActive(cfg.domain)) {
+      console.error(
+        `pipeline: kill switch is active (/tmp/pipeline-${cfg.domain}.disabled). Remove it to re-enable.`,
+      );
+      process.exit(0);
+    }
+    const rpN = Number.parseInt(rpNumStr, 10);
+    let rpIssueNumber: number;
+    try {
+      rpIssueNumber = await resolveIssueNumber(cfg, rpN);
+    } catch (err) {
+      const e = err as Error;
+      console.error(`pipeline: ${e.message}`);
+      process.exit(1);
+    }
+    const {
+      runRecoverParked,
+      recoverParkedExitCode,
+      reenterAdvanceAfterRecoverParked,
+    } = await import("./recover-parked.ts");
+    const { runAdvance: runAdvanceForRecover } = await import("./pipeline-run.ts");
+    const result = await runRecoverParked(
+      cfg,
+      rpIssueNumber,
+      {
+        dryRun: !!opts.dryRun,
+      },
+      {
+        getIssueDetail,
+        getPrForIssue,
+        getPrDetail,
+        postComment,
+        clearBlocked,
+        getGhActor,
+        // Default tryUnlinkEngineScratch = production defaultTryUnlinkEngineScratch.
+        reenterAdvance: async (c, issue, reOpts) => {
+          // Propagate skipRecoverParked into same-issue advance so a re-park
+          // cannot recursively invoke recover-parked on this stack.
+          await reenterAdvanceAfterRecoverParked(
+            c,
+            issue,
+            {
+              getIssueDetail,
+              silentTransition,
+              runAdvance: runAdvanceForRecover,
+            },
+            { ...toAdvanceOpts(opts), skipRecoverParked: reOpts.skipRecoverParked },
+          );
+        },
+        log: (m) => console.log(m),
+      },
+    );
+    if (opts.json) {
+      console.log(JSON.stringify(result));
+    } else {
+      console.log(
+        `[pipeline] recover-parked #${result.issue}: ${result.status} — ${result.message}`,
+      );
+    }
+    process.exitCode = recoverParkedExitCode(result.status);
     return;
   }
 

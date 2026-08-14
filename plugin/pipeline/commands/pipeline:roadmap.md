@@ -1,5 +1,5 @@
 ---
-description: Generate a dependency-aware scored roadmap for the backlog
+description: 'Generate a dependency-aware scored roadmap for the backlog'
 argument-hint: '[--apply] [--next <N>]'
 ---
 

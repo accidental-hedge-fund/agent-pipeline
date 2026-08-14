@@ -1,5 +1,5 @@
 ---
-description: Durable multi-item run — driven in-repo by the pipeline's own loop supervisor
+description: 'Durable multi-item run — driven in-repo by the pipeline''s own loop supervisor'
 argument-hint: '[--milestone <name>] [--label <label>] [--range <spec>] [--roadmap-slice <slice>] [<N> ...] [--resume <run-id>] [--audit]'
 ---
 

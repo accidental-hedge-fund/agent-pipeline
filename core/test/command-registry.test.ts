@@ -28,7 +28,7 @@ import { buildCmd } from "../scripts/pipeline.ts";
 
 // These are the named keywords the dispatch block in pipeline.ts recognizes.
 const DISPATCH_KEYWORDS = [
-  "init", "doctor", "status", "unblock", "override", "cleanup",
+  "init", "doctor", "status", "unblock", "override", "recover-parked", "cleanup",
   "release", "ship", "intake", "decompose", "sweep", "triage", "merge", "merge-queue", "train",
   "refine-spec", "logs", "summary", "path", "config", "run", "single", "improve",
   "scoreboard", "outcomes", "lineage", "roadmap", "loop", "correction", "report", "engine-promote",

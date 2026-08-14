@@ -81,6 +81,14 @@ export const OPERATION_SURFACE = [
     fast: false,
   },
   {
+    name: "recover-parked",
+    desc:
+      "One supervisor pass for parked issue N: deterministic recover first; reflow only stale/DNR/below-high (never auto-override HIGH/CRITICAL/security); re-enter single if clear",
+    argHint: "<N>",
+    cliArgs: "recover-parked $ARGUMENTS",
+    fast: false,
+  },
+  {
     name: "summary",
     desc: "Print the evidence bundle for issue N",
     argHint: "<N>",
@@ -228,6 +236,9 @@ export function renderClaudeCommand(op, skillPath) {
   // Single-quote the argHint value so YAML parsers don't misinterpret [ or : characters.
   // None of the current argHint values contain single quotes, so '' escaping is not triggered.
   const argHintLine = op.argHint ? `argument-hint: '${op.argHint.replace(/'/g, "''")}'` : "";
+  // Quote description when it contains YAML-significant characters (e.g. colons).
+  const descEscaped = String(op.desc ?? "").replace(/'/g, "''");
+  const descLine = `description: '${descEscaped}'`;
   const invocation = op.specialCli
     ? `\`node ${skillPath}/scripts/pipeline.mjs ${op.cliArgs}\``
     : op.argHint
@@ -257,7 +268,7 @@ export function renderClaudeCommand(op, skillPath) {
 
   return [
     "---",
-    `description: ${op.desc}`,
+    descLine,
     ...(argHintLine ? [argHintLine] : []),
     "---",
     "",

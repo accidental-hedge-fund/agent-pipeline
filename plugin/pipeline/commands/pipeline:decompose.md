@@ -1,5 +1,5 @@
 ---
-description: Break an epic issue into dependency-linked child issues and a ROADMAP PR (dry-run default; --apply writes)
+description: 'Break an epic issue into dependency-linked child issues and a ROADMAP PR (dry-run default; --apply writes)'
 argument-hint: '--epic <N> [--description "…"] [--apply] [--release vX.Y.Z] [--max-children N] [--max-effort S|M|L|XL] [--allow-xl]'
 ---
 

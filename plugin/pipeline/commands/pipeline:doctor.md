@@ -1,5 +1,5 @@
 ---
-description: Run deterministic preflight checks and print a pass/fail summary (opt-in --harness-smoke for role-aware runtime smoke)
+description: 'Run deterministic preflight checks and print a pass/fail summary (opt-in --harness-smoke for role-aware runtime smoke)'
 argument-hint: '[--harness-smoke]'
 ---
 

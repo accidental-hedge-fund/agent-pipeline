@@ -32,6 +32,7 @@ import {
   overrideComment,
   scopedOverrideComment,
 } from "../scripts/review-policy.ts";
+import { formatRecoverParkedSpentComment } from "../scripts/recover-parked.ts";
 import {
   PIPELINE_COMMENT_KINDS,
   buildAttestedBlockedComment,
@@ -436,6 +437,14 @@ const KIND_RENDERERS: Record<string, () => string> = {
       reason: "please don't flag this category — instead defer it",
       stage: "review-1",
       timestamp: ts(0),
+    }),
+  "recover-parked-spent": () =>
+    formatRecoverParkedSpentComment({
+      fingerprint: "deadbeefdeadbeef",
+      issue: 1061,
+      stage: "needs-human",
+      keys: ["aabbcc01"],
+      at: ts(0),
     }),
 };
 

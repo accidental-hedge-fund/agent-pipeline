@@ -1,5 +1,5 @@
 ---
-description: Sweep merged-PR worktrees and delete their local branches
+description: 'Sweep merged-PR worktrees and delete their local branches'
 ---
 
 Invoke: `node ${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/pipeline.mjs cleanup`

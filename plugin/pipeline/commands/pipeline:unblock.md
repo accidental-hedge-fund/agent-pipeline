@@ -1,5 +1,5 @@
 ---
-description: Post the answer and clear the blocked label for issue N
+description: 'Post the answer and clear the blocked label for issue N'
 argument-hint: '<N> "<answer>"'
 ---
 

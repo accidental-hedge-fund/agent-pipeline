@@ -509,6 +509,24 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
     supportsJson: false,
   },
 
+  // recover-parked (#1061): one supervisor senior pass per park fingerprint.
+  // May record audited overrides and re-enter advance; never authorizes merge.
+  "recover-parked": {
+    needsIssueNumber: true,
+    allowedFlags: new Set([
+      "repoPath",
+      "base",
+      "profile",
+      "domain",
+      "json",
+      "dryRun",
+    ]),
+    needsConfig: true,
+    needsGhAuth: true,
+    mutatesGitHub: true,
+    supportsJson: true,
+  },
+
   // cleanup is registered both for the legacy --cleanup flag mode and as an
   // actually-dispatched positional keyword (`pipeline cleanup`).
   cleanup: {
