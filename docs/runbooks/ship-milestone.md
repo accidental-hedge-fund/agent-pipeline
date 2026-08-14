@@ -20,7 +20,7 @@ Epic / hardening: #1001 / #927
 | Phase sequence, wait CI / Release, failure detail, notify | **Tugboat** (host composer) |
 | Detached process, logs, state dir | host (`nohup` + `PIPELINE_SUPERVISOR_STATE`) |
 | Material progress during train (optional) | shared `ship-stage-watch.sh` + `material-filter.mjs` |
-| Buzz delivery | shared `ship-notify.sh` (no-op without messenger env) |
+| Buzz delivery | shared `ship-notify.sh` (no-op without messenger env; best-effort with retry + audit) |
 
 GitHub and Pipeline run state remain authoritative. Tugboat does not implement
 a grant factory, durable outer ledger, or merge-from-advance.
@@ -46,7 +46,8 @@ files are not generated. Doctor check
 `~/.local/bin/tugboat` is present but its content (or sibling
 `release-checks-green.py` / `train-status-complete.py`) does not match the
 repo examples under `examples/supervisor/shell/`. Marker-only forks are not
-accepted. Refresh with the same `install` loop.
+accepted. Refresh with the same `install` loop (includes **`ship-notify`** —
+post-merge reinstall so hosts pick up delivery retry/audit changes).
 
 Host env (mode-0600 profile):
 
@@ -80,7 +81,18 @@ State and logs:
   state.json      # phase, status, detail (failure reasons enriched)
   playbook.log
   train.json / release-*.err / engine-promote.err …
+
+~/.local/state/pipeline-supervisor/notify/   # shared ship-notify state
+  <dedupe-key>    # TTL dedupe (epoch + content); not proof of remote delivery
+  audit.log       # terminal send outcomes: ok / fail + attempts + reason
+  failed/<id>     # supervisor-visible marker after exhausted retries
 ```
+
+If the Buzz channel is quiet during a ship, check `notify/audit.log` and
+`notify/failed/` under `PIPELINE_SUPERVISOR_STATE` before assuming the helper
+never ran. Notify is still best-effort (exit 0 after failure); ship/train do
+not block solely on messenger delivery. Reinstall `ship-notify` from
+`examples/supervisor/shell/` after `main` moves (same install loop as Tugboat).
 
 Issues on the milestone must be `pipeline:ready` before train dispatch.
 
