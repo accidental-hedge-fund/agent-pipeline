@@ -345,6 +345,8 @@ export interface CliOpts {
   runId?: string;
   /** Emit machine-readable JSON (for --status, the doctor command, `pipeline path`, and `pipeline config validate/sync`). */
   json?: boolean;
+  /** controls check: non-zero exit on any drifted outcome (#695). */
+  strict?: boolean;
   /** Doctor: silent exit-0/1 polling gate; no output. Mutually exclusive with --json. */
   isOk?: boolean;
   /**
@@ -674,7 +676,8 @@ export function maxPositionalsFor(command: string | undefined): number {
     command === "ship" ||
     command === "status" ||
     command === "papercut" ||
-    command === "correction"
+    command === "correction" ||
+    command === "controls"
   ) {
     return 2;
   }
@@ -702,7 +705,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | run | single | release | ship | factory-gate | factory-release | factory-pin | engine-promote | intake | decompose | triage | roadmap | sweep | merge | merge-queue | train | summary | improve | scoreboard | outcomes | queue | backfill | evals | loop | correction | handoff | report")
+    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | cleanup | logs | path | config | controls | run | single | release | ship | factory-gate | factory-release | factory-pin | engine-promote | intake | decompose | triage | roadmap | sweep | merge | merge-queue | train | summary | improve | scoreboard | outcomes | queue | backfill | evals | loop | correction | handoff | report")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -713,7 +716,8 @@ export function buildCmd(): Command {
     )
     .option("--is-ok", "doctor: silent exit-0/1 gate (no output); mutually exclusive with --json")
     .option("--status", "read-only status; print stage and exit")
-    .option("--json", "emit machine-readable JSON (for --status or the doctor command)")
+    .option("--json", "emit machine-readable JSON (for --status, doctor, or controls check)")
+    .option("--strict", "controls check: non-zero exit on any drifted outcome (not only fail-closed)")
     .option("--summary", "print the human-readable evidence-bundle summary for <number> and exit")
     .option("--unblock <answer>", "post answer as a comment and clear the blocked label")
     .option(
@@ -3735,6 +3739,13 @@ async function main(): Promise<void> {
     return;
   }
 
+  // `pipeline controls check [--json] [--strict]` — read-only repository-control
+  // drift compare (#695). Never mutates forge settings.
+  if (numArg === "controls") {
+    await handleControlsCommand(cmd.args.slice(1), opts);
+    return;
+  }
+
   // Guard: extra positional arguments are a mistake for the remaining commands
   // (plain `pipeline <N>`, doctor, init). `run <N>`, `release <version>`, and
   // `intake [description]` legitimately have two positionals; `config`/`path`
@@ -5563,7 +5574,7 @@ async function main(): Promise<void> {
       "init", "doctor", "status", "unblock", "override", "cleanup",
       "logs", "path", "config", "run", "single", "release", "intake", "decompose", "refine-spec",
       "roadmap", "sweep", "triage", "merge", "merge-queue", "train", "ship", "summary", "improve", "scoreboard", "outcomes", "factory-gate", "factory-release", "factory-pin", "engine-promote", "queue", "backfill", "evals",
-      "loop",
+      "loop", "controls",
     ];
     if (!recognized.includes(numArg)) {
       console.error(
@@ -6997,6 +7008,70 @@ export async function handlePathSubcommand(
   }
 
   console.log(formatDiscovery(result, !!opts.json));
+}
+
+/**
+ * `pipeline controls check` — read-only repository-control drift compare (#695).
+ * Loads desired state from config, fetches live state via injectable gh reads,
+ * prints human or JSON results. Never mutates forge settings.
+ */
+export async function handleControlsCommand(
+  args: string[],
+  opts: CliOpts,
+): Promise<void> {
+  const sub = args[0] ?? "check";
+  if (sub !== "check") {
+    console.error(
+      `pipeline controls: unknown subcommand "${sub}".\n` +
+        `  Usage: pipeline controls check [--json] [--strict]`,
+    );
+    process.exit(2);
+  }
+  const { resolveConfig } = await import("./config.ts");
+  const { runControlsCheck, formatControlsCheckHuman } = await import("./repository-control-drift.ts");
+  const { stagedPoliciesFromDecls } = await import("./stage-policy-lifecycle.ts");
+  const { ghRunForTest } = await import("./gh.ts");
+
+  let cfg: PipelineConfig;
+  try {
+    cfg = resolveConfig({
+      repoPath: opts.repoPath,
+      baseBranch: opts.base,
+      profile: opts.profile,
+    });
+  } catch (err) {
+    console.error(`pipeline controls: config error: ${(err as Error).message}`);
+    process.exit(2);
+    return;
+  }
+
+  const desired = cfg.repository_control_desired_state ?? null;
+  // Config load already rejects bare enforcing; materialize still validates lineage.
+  const staged = stagedPoliciesFromDecls(cfg.staged_policies);
+  const lifecycle =
+    desired?.policy_id != null
+      ? staged.find((p) => p.policy_id === desired.policy_id)?.state ?? null
+      : null;
+
+  const out = await runControlsCheck(
+    {
+      desired,
+      lifecycle_state: lifecycle,
+      staged_policies: staged,
+      strict: !!opts.strict,
+      json: !!opts.json,
+    },
+    {
+      ghRun: (args, runOpts) => ghRunForTest(args, runOpts),
+    },
+  );
+
+  if (opts.json) {
+    console.log(JSON.stringify(out, null, 2));
+  } else {
+    console.log(formatControlsCheckHuman(out));
+  }
+  process.exit(out.exit_code);
 }
 
 // ---------------------------------------------------------------------------

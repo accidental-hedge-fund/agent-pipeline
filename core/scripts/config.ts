@@ -45,6 +45,7 @@ import {
 import { isSafeScratchExtensionGlob } from "./worktree-dirt.ts";
 import { TRUSTED_SURFACE_CLASS_IDS } from "./trusted-surface.ts";
 import { implicitOverrideGovernance } from "./override-governance.ts";
+import { validateMaterializedLineage } from "./stage-policy-lifecycle.ts";
 
 // A `models.*`/`effort.*` value: an arbitrary alias/effort string, or the
 // "auto" sentinel (#366) resolved via stage-routing.ts at config-load time.
@@ -1186,6 +1187,138 @@ const PartialConfigSchema = z.object({
     .describe(
       "Trusted-surface path coverage (#691). Only additive extra_paths are accepted; built-in classes remain engine-defined.",
     ),
+  // Staged policy lifecycle (#695). Opt-in; absent → no policy lifecycle recording.
+  // Non-draft states materialize only through validateMaterializedLineage
+  // (complete predecessor chain, recomputed hashes, evidence_refs, ISO at).
+  // enforcing/retired additionally require engine-attested verified provenance
+  // and cannot be minted from config-declared lineage alone.
+  staged_policies: z
+    .array(
+      z
+        .object({
+          policy_id: z.string().min(1).describe("Stable policy identifier."),
+          state: z
+            .enum(["draft", "observe", "required", "enforcing", "retired"])
+            .describe("Effective lifecycle state (closed set)."),
+          acceptance: z
+            .record(z.string(), z.unknown())
+            .optional()
+            .describe("Acceptance-relevant slice folded into policy_hash."),
+          lineage: z
+            .array(
+              z
+                .object({
+                  policy_id: z.string().min(1),
+                  from_state: z.enum(["draft", "observe", "required", "enforcing", "retired"]),
+                  to_state: z.enum(["draft", "observe", "required", "enforcing", "retired"]),
+                  policy_hash_before: z.string().min(1),
+                  policy_hash_after: z.string().min(1),
+                  at: z.string().min(1),
+                  authority: z
+                    .object({
+                      actor: z.string().min(1),
+                      role: z.string().min(1),
+                    })
+                    .strict()
+                    .nullable(),
+                  evidence_refs: z.array(z.string()).default([]),
+                })
+                .strict(),
+            )
+            .optional()
+            .describe(
+              "Append-only lineage. Required for every non-draft state: complete legal predecessor chain with recomputed policy hashes, authority on enforcing/retired edges, and non-empty evidence_refs on observation-gated promotions. enforcing/retired also require engine-attested verified provenance (config cannot mint them).",
+            ),
+        })
+        .strict()
+        .superRefine((p, ctx) => {
+          try {
+            validateMaterializedLineage({
+              policy_id: p.policy_id,
+              state: p.state,
+              acceptance: p.acceptance ?? {},
+              lineage: p.lineage ?? [],
+            });
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            ctx.addIssue({
+              code: "custom",
+              message,
+              path: ["state"],
+            });
+          }
+        }),
+    )
+    .optional()
+    .describe(
+      "Opt-in staged policies (#695). States: draft|observe|required|enforcing|retired. " +
+        "Non-draft states require fully validated lineage (complete path, recomputed hashes, evidence_refs); " +
+        "enforcing/retired also require engine-attested verified provenance and cannot be minted from config. Absent/empty → no lifecycle gate.",
+    ),
+  // Repository-control desired state (#695). Opt-in; absent → no drift compare.
+  repository_control_desired_state: z
+    .object({
+      schema_version: z.literal(1).describe("Desired-state schema version; only 1 is accepted."),
+      repository: z.string().min(1).describe("Repository identity (owner/name)."),
+      default_branch: z.string().min(1).describe("Protected branch whose controls are in scope."),
+      required_checks: z.array(z.string()).describe("Check context names that MUST be required."),
+      branch_protections: z
+        .object({
+          required_approving_review_count: z.number().int().min(0).optional(),
+          dismiss_stale_reviews: z.boolean().optional(),
+          require_code_owner_reviews: z.boolean().optional(),
+          require_conversation_resolution: z.boolean().optional(),
+          allow_force_pushes: z.boolean().optional(),
+          allow_deletions: z.boolean().optional(),
+          required_status_check_contexts: z.array(z.string()).optional(),
+        })
+        .strict()
+        .describe("Expected branch-protection fields readable via gh."),
+      rulesets: z
+        .array(
+          z
+            .object({
+              id_or_name: z.string().min(1),
+              enforcement: z.enum(["active", "evaluate", "disabled"]).optional(),
+            })
+            .strict(),
+        )
+        .describe("Expected rulesets when ruleset reads are in scope."),
+      required_pipeline_gates: z
+        .array(z.string())
+        .describe("Agent Pipeline evidence/gate identifiers required for readiness composition."),
+      collector_requirements: z
+        .array(
+          z
+            .object({
+              collector_id: z.string().min(1),
+              min_version: z.string().optional(),
+            })
+            .strict(),
+        )
+        .describe("Collector/version constraints when configured (empty when unused)."),
+      policy_id: z.string().nullable().optional().describe("Optional binding to a staged policy."),
+      risk_class: z
+        .enum(["observation", "fail_open", "fail_closed"])
+        .optional()
+        .describe("Section-level risk class for fail-open/fail-closed disposition."),
+      risk_class_by_family: z
+        .object({
+          required_checks: z.enum(["observation", "fail_open", "fail_closed"]).optional(),
+          branch_protections: z.enum(["observation", "fail_open", "fail_closed"]).optional(),
+          rulesets: z.enum(["observation", "fail_open", "fail_closed"]).optional(),
+          required_pipeline_gates: z.enum(["observation", "fail_open", "fail_closed"]).optional(),
+          collector_requirements: z.enum(["observation", "fail_open", "fail_closed"]).optional(),
+        })
+        .strict()
+        .optional()
+        .describe("Optional per-family risk_class overrides."),
+    })
+    .strict()
+    .optional()
+    .describe(
+      "Opt-in repository-control desired state (#695). Absent → no drift gate. Live compare is read-only; never mutates forge settings.",
+    ),
 }).strict();
 
 type PartialConfig = z.infer<typeof PartialConfigSchema>;
@@ -2008,6 +2141,27 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     product_fault: fileConfig.product_fault,
     executors: fileConfig.executors ?? DEFAULT_CONFIG.executors,
     stage_executors: fileConfig.stage_executors ?? DEFAULT_CONFIG.stage_executors,
+    ...(fileConfig.staged_policies !== undefined
+      ? {
+          staged_policies: fileConfig.staged_policies.map((p) => ({
+            policy_id: p.policy_id,
+            state: p.state,
+            ...(p.acceptance !== undefined ? { acceptance: { ...p.acceptance } } : {}),
+            ...(p.lineage !== undefined
+              ? {
+                  lineage: p.lineage.map((e) => ({
+                    ...e,
+                    authority: e.authority ? { ...e.authority } : null,
+                    evidence_refs: [...(e.evidence_refs ?? [])],
+                  })),
+                }
+              : {}),
+          })),
+        }
+      : {}),
+    ...(fileConfig.repository_control_desired_state !== undefined
+      ? { repository_control_desired_state: fileConfig.repository_control_desired_state }
+      : {}),
     git: {
       push_auth: resolveGitPushAuth(fileConfig.git?.push_auth),
     },
@@ -3810,6 +3964,94 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
       `#   repair: ${yamlScalar(d.merge_queue.repair)} # ${sd("merge_queue.repair", "when true, merge-queue --apply may attempt surgical repair of conflict/CI holds; default false; dry-run never repairs; does not grant auto_merge")}`,
       `#   repair_max_attempts: ${yamlScalar(d.merge_queue.repair_max_attempts)} # ${sd("merge_queue.repair_max_attempts", "max charged implementer repair attempts per held item per drive (default 1)")}`,
     ].join("\n"),
+    // Staged policies + repository-control desired state (#695).
+    // When configured, round-trip the full object graph (acceptance, lineage,
+    // branch_protections, rulesets, collectors, policy binding, risk classes).
+    // Emitting only id/state or empty placeholders drops enforcing lineage and
+    // silently weakens repository-control drift coverage on a later full re-render
+    // (#695 06e2dd51).
+    config.staged_policies !== undefined && config.staged_policies.length > 0
+      ? [
+          "",
+          "staged_policies: # staged policy lifecycle (#695) — opt-in; non-draft states require validated lineage",
+          yamlBlock(
+            config.staged_policies.map((p) => ({
+              policy_id: p.policy_id,
+              state: p.state,
+              ...(p.acceptance !== undefined ? { acceptance: p.acceptance } : {}),
+              ...(p.lineage !== undefined
+                ? {
+                    lineage: p.lineage.map((e) => ({
+                      policy_id: e.policy_id,
+                      from_state: e.from_state,
+                      to_state: e.to_state,
+                      policy_hash_before: e.policy_hash_before,
+                      policy_hash_after: e.policy_hash_after,
+                      at: e.at,
+                      authority: e.authority,
+                      evidence_refs: e.evidence_refs ?? [],
+                    })),
+                  }
+                : {}),
+            })),
+            2,
+          ),
+        ].join("\n")
+      : [
+          "",
+          "# staged_policies: # staged policy lifecycle (#695) — opt-in rollout states. Absent (default): no lifecycle recording or promotion gate.",
+          `#   - policy_id: repo-controls # ${sd("staged_policies.policy_id", "stable policy identifier")}`,
+          `#     state: draft # ${sd("staged_policies.state", "closed set: draft|observe|required|enforcing|retired; non-draft requires lineage")}`,
+          `#     acceptance: {} # ${sd("staged_policies.acceptance", "acceptance-relevant slice folded into policy_hash")}`,
+          `#     lineage: # ${sd("staged_policies.lineage", "append-only promotion/retirement events; required for every non-draft state")}`,
+          `#       - policy_id: repo-controls # ${sd("staged_policies.lineage.policy_id", "must match parent policy_id")}`,
+          `#         from_state: draft # ${sd("staged_policies.lineage.from_state", "prior lifecycle state")}`,
+          `#         to_state: observe # ${sd("staged_policies.lineage.to_state", "target lifecycle state")}`,
+          `#         policy_hash_before: "<hex>" # ${sd("staged_policies.lineage.policy_hash_before", "policy_hash before transition")}`,
+          `#         policy_hash_after: "<hex>" # ${sd("staged_policies.lineage.policy_hash_after", "policy_hash after transition")}`,
+          `#         at: "2026-08-14T00:00:00.000Z" # ${sd("staged_policies.lineage.at", "ISO 8601 transition timestamp")}`,
+          `#         authority: # ${sd("staged_policies.lineage.authority", "named authority; required for enforcing/retired entries")}`,
+          `#           actor: operator # ${sd("staged_policies.lineage.authority.actor", "authenticated actor identity")}`,
+          `#           role: policy-admin # ${sd("staged_policies.lineage.authority.role", "role or capability authorizing the transition")}`,
+          `#         evidence_refs: [] # ${sd("staged_policies.lineage.evidence_refs", "observation or audit evidence references; non-empty on observe→required / required→enforcing")}`,
+        ].join("\n"),
+    config.repository_control_desired_state
+      ? [
+          "",
+          "repository_control_desired_state: # desired repository controls vs live forge state (#695) — read-only compare; never mutates branch protection/rulesets",
+          yamlBlock(config.repository_control_desired_state, 2),
+        ].join("\n")
+      : [
+          "",
+          "# repository_control_desired_state: # desired repository controls vs live forge state (#695). Absent (default): no drift gate. Compare is read-only — never mutates forge settings.",
+          `#   schema_version: 1 # ${sd("repository_control_desired_state.schema_version", "only 1 is accepted")}`,
+          `#   repository: owner/name # ${sd("repository_control_desired_state.repository", "repository identity")}`,
+          `#   default_branch: main # ${sd("repository_control_desired_state.default_branch", "protected branch in scope")}`,
+          `#   required_checks: ["CI"] # ${sd("repository_control_desired_state.required_checks", "check contexts that MUST be required")}`,
+          `#   branch_protections: # ${sd("repository_control_desired_state.branch_protections", "expected branch-protection fields readable via gh")}`,
+          `#     required_approving_review_count: 1 # ${sd("repository_control_desired_state.branch_protections.required_approving_review_count", "required approving reviews")}`,
+          `#     dismiss_stale_reviews: true # ${sd("repository_control_desired_state.branch_protections.dismiss_stale_reviews", "dismiss stale reviews")}`,
+          `#     require_code_owner_reviews: false # ${sd("repository_control_desired_state.branch_protections.require_code_owner_reviews", "require code owner reviews")}`,
+          `#     require_conversation_resolution: true # ${sd("repository_control_desired_state.branch_protections.require_conversation_resolution", "require conversation resolution")}`,
+          `#     allow_force_pushes: false # ${sd("repository_control_desired_state.branch_protections.allow_force_pushes", "allow force pushes")}`,
+          `#     allow_deletions: false # ${sd("repository_control_desired_state.branch_protections.allow_deletions", "allow branch deletions")}`,
+          `#     required_status_check_contexts: ["CI"] # ${sd("repository_control_desired_state.branch_protections.required_status_check_contexts", "nested required status contexts")}`,
+          `#   rulesets: # ${sd("repository_control_desired_state.rulesets", "expected rulesets when readable")}`,
+          `#     - id_or_name: default # ${sd("repository_control_desired_state.rulesets.id_or_name", "ruleset name or id")}`,
+          `#       enforcement: active # ${sd("repository_control_desired_state.rulesets.enforcement", "active|evaluate|disabled")}`,
+          `#   required_pipeline_gates: [] # ${sd("repository_control_desired_state.required_pipeline_gates", "pipeline evidence/gate identifiers")}`,
+          `#   collector_requirements: # ${sd("repository_control_desired_state.collector_requirements", "collector/version constraints when used")}`,
+          `#     - collector_id: metrics # ${sd("repository_control_desired_state.collector_requirements.collector_id", "collector id")}`,
+          `#       min_version: "1.0.0" # ${sd("repository_control_desired_state.collector_requirements.min_version", "minimum collector version")}`,
+          `#   policy_id: repo-controls # ${sd("repository_control_desired_state.policy_id", "optional binding to a staged policy")}`,
+          `#   risk_class: observation # ${sd("repository_control_desired_state.risk_class", "observation|fail_open|fail_closed")}`,
+          `#   risk_class_by_family: # ${sd("repository_control_desired_state.risk_class_by_family", "optional per-family risk_class overrides")}`,
+          `#     required_checks: fail_closed # ${sd("repository_control_desired_state.risk_class_by_family.required_checks", "risk class for required checks")}`,
+          `#     branch_protections: fail_closed # ${sd("repository_control_desired_state.risk_class_by_family.branch_protections", "risk class for branch protections")}`,
+          `#     rulesets: observation # ${sd("repository_control_desired_state.risk_class_by_family.rulesets", "risk class for rulesets")}`,
+          `#     required_pipeline_gates: observation # ${sd("repository_control_desired_state.risk_class_by_family.required_pipeline_gates", "risk class for pipeline gates")}`,
+          `#     collector_requirements: observation # ${sd("repository_control_desired_state.risk_class_by_family.collector_requirements", "risk class for collectors")}`,
+        ].join("\n"),
     config.context_snapshot !== undefined
       ? `\ncontext_snapshot: # stage-aware issue context snapshot cap override (#318)\n${yamlBlock(config.context_snapshot, 2)}`
       : [
@@ -3940,6 +4182,11 @@ function normalizeForSync(config: PartialConfig): unknown {
     product_fault: config.product_fault,
     executors: config.executors,
     stage_executors: config.stage_executors,
+    // #695: include full staged-policy + repository-control graphs so a
+    // re-render that drops lineage / desired-state constraints fails the
+    // behavior-preserving sync check rather than writing a weaker config.
+    staged_policies: config.staged_policies,
+    repository_control_desired_state: config.repository_control_desired_state,
     git: config.git,
   };
 }
@@ -4093,6 +4340,40 @@ export function syncConfig(
   // doesn't already have; every line already in `current` (including
   // operator comments and non-canonical formatting) is preserved untouched.
   const freshRender = renderConfigTemplate(parsed);
+
+  // Guard #695 06e2dd51: append-only merge preserves existing blocks byte-for-
+  // byte, which can mask an incomplete template re-render of staged_policies
+  // (lineage/acceptance) or repository_control_desired_state (nested controls).
+  // Fail closed if the fresh render cannot round-trip those configured graphs.
+  if (
+    (parsed.staged_policies !== undefined && parsed.staged_policies.length > 0) ||
+    parsed.repository_control_desired_state
+  ) {
+    const freshParsed = parseValidPartialConfig(freshRender);
+    if (
+      !freshParsed ||
+      stableJson(parsed.staged_policies) !== stableJson(freshParsed.staged_policies) ||
+      stableJson(parsed.repository_control_desired_state) !==
+        stableJson(freshParsed.repository_control_desired_state)
+    ) {
+      return {
+        ok: false,
+        changed: false,
+        applied: false,
+        configPath,
+        candidate: freshRender,
+        diagnostics: [
+          {
+            severity: "error",
+            path: "",
+            message:
+              "Synced config template would drop staged_policies lineage/acceptance or repository_control_desired_state fields; refusing to write.",
+          },
+        ],
+      };
+    }
+  }
+
   const candidate = buildSyncCandidate(current, freshRender);
   const candidateValidation = validateConfig(gitRoot, {
     ...deps,

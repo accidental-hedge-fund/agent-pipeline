@@ -775,6 +775,70 @@ Nested fields:
 - **Type:** array of string
 - **Description:** Repos this repo consumes (owner/repo strings). The planning stage fetches open issues from these repos as supplemental context.
 
+### `repository_control_desired_state`
+
+- **Type:** object
+- **Description:** Opt-in repository-control desired state (#695). Absent → no drift gate. Live compare is read-only; never mutates forge settings.
+
+Nested fields:
+
+#### `repository_control_desired_state.branch_protections`
+
+- **Type:** object
+- **Description:** Expected branch-protection fields readable via gh.
+
+#### `repository_control_desired_state.collector_requirements`
+
+- **Type:** array of object
+- **Description:** Collector/version constraints when configured (empty when unused).
+
+#### `repository_control_desired_state.default_branch`
+
+- **Type:** string
+- **Description:** Protected branch whose controls are in scope.
+
+#### `repository_control_desired_state.policy_id`
+
+- **Type:** string | null
+- **Description:** Optional binding to a staged policy.
+
+#### `repository_control_desired_state.repository`
+
+- **Type:** string
+- **Description:** Repository identity (owner/name).
+
+#### `repository_control_desired_state.required_checks`
+
+- **Type:** array of string
+- **Description:** Check context names that MUST be required.
+
+#### `repository_control_desired_state.required_pipeline_gates`
+
+- **Type:** array of string
+- **Description:** Agent Pipeline evidence/gate identifiers required for readiness composition.
+
+#### `repository_control_desired_state.risk_class`
+
+- **Type:** enum
+- **Description:** Section-level risk class for fail-open/fail-closed disposition.
+
+- **Allowed values:** `observation`, `fail_open`, `fail_closed`
+
+#### `repository_control_desired_state.risk_class_by_family`
+
+- **Type:** object
+- **Description:** Optional per-family risk_class overrides.
+
+#### `repository_control_desired_state.rulesets`
+
+- **Type:** array of object
+- **Description:** Expected rulesets when ruleset reads are in scope.
+
+#### `repository_control_desired_state.schema_version`
+
+- **Type:** number
+- **Description:** Desired-state schema version; only 1 is accepted.
+
 ### `review_ensemble`
 
 - **Type:** object
@@ -990,6 +1054,11 @@ Nested fields:
 - **Type:** object
 - **Default:** `{}`
 - **Description:** Assigns a named executor (from executors:) to a model-invoking stage, delegating that stage's execution to it instead of the local harness.
+
+### `staged_policies`
+
+- **Type:** array of object
+- **Description:** Opt-in staged policies (#695). States: draft|observe|required|enforcing|retired. Non-draft states require fully validated lineage (complete path, recomputed hashes, evidence_refs); enforcing/retired also require engine-attested verified provenance and cannot be minted from config. Absent/empty → no lifecycle gate.
 
 ### `steps`
 

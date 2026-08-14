@@ -617,6 +617,17 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
     mutatesGitHub: false,
     supportsJson: false,
   },
+
+  // controls check (#695): read-only repository-control drift compare.
+  // Never mutates branch protection, rulesets, or required checks.
+  controls: {
+    needsIssueNumber: false,
+    allowedFlags: new Set(["repoPath", "base", "profile", "json", "strict"]),
+    needsConfig: true,
+    needsGhAuth: true,
+    mutatesGitHub: false,
+    supportsJson: true,
+  },
 };
 
 /**

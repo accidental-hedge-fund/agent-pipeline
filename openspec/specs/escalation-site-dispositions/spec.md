@@ -244,7 +244,6 @@ Every production site that creates a human-question handoff, refuses an unauthor
 - **WHEN** a new production handoff create or resume-refusal emitter is added without an inventory row
 - **THEN** the disposition drift-guard test SHALL fail
 
-
 ### Requirement: Independent-quorum and no-usable-reviewers escalations SHALL be inventory sites
 
 Production escalation emitters for review independent-quorum unmet and review no-usable-reviewers SHALL each appear as rows in the escalation-site disposition inventory. The independent-quorum unmet site SHALL declare disposition `deliberately-fail-closed` (coverage integrity: do not auto-approve when required independent coverage is missing). The no-usable-reviewers site SHALL declare a closed disposition of `deliberately-fail-closed` or `transient-retryable` only when the underlying failure class is a documented transient spawn/timeout eligible for the single substitute wave; after that bound it SHALL escalate as a typed engine-owned failure and SHALL NOT default to open-ended product-judgment human hold. Each row SHALL name module path or stable site id, trigger, disposition, and canonical reason projection. The disposition drift-guard SHALL fail if either emitter is added without an inventory row.
@@ -301,3 +300,25 @@ When renewal mode is `lite` and auto-renew is blocked by fingerprint, region, or
 - **AND** SHALL surface a typed reason that the finding is again blocking pending human renewal or fix
 - **AND** the inventory disposition for that site SHALL not be `transient-retryable`
 
+### Requirement: Fail-closed repository-control drift parks SHALL appear in the escalation inventory
+
+When the engine parks or blocks readiness because an `enforcing` control with `risk_class: fail_closed` is not `in_sync` (outcomes `drifted`, `unavailable`, or `unknown`), that production escalation site SHALL be present in the machine-readable escalation-site inventory with disposition `deliberately-fail-closed`. The site SHALL use a typed reason projection from the closed drift reason set (including at least codes for required-check drift, branch-protection drift, ruleset drift, pipeline-gate drift, collector drift, live unavailable, and unsupported control). The site SHALL NOT perform automatic forge remediation or transient retry that mutates repository controls before escalating.
+
+#### Scenario: Fail-closed drift park is inventoried
+
+- **WHEN** the escalation-site inventory is loaded after this capability ships
+- **THEN** it SHALL include an entry for fail-closed repository-control drift readiness parks
+- **AND** that entry’s disposition SHALL be `deliberately-fail-closed`
+
+#### Scenario: Observation-only drift is not an escalation site
+
+- **WHEN** drift is recorded for a policy in `observe` or for `risk_class: observation`
+- **THEN** the engine SHALL NOT require an escalation-inventory park solely for that observation record
+- **AND** SHALL NOT invent automatic remediation
+
+#### Scenario: Drift park does not auto-remediate forge settings
+
+- **WHEN** a fail-closed drift park site is triggered
+- **THEN** the site SHALL escalate with a typed drift reason
+- **AND** SHALL NOT recreate rulesets, rewrite branch protection, or force-add required checks as part of the escalation path
+ (chore: archive OpenSpec change(s) for #695)

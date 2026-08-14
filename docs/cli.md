@@ -170,6 +170,11 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 
 ### Observability
 
+#### `controls`
+
+- **Usage:** `pipeline controls check [--json] [--strict]`
+- **Summary:** Read-only repository-control drift check against configured desired state (#695); never mutates forge settings
+
 #### `correction`
 
 - **Usage:** `pipeline correction record|attribute …`

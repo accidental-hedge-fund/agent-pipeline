@@ -2755,6 +2755,128 @@ test("syncConfig: auto_merge_eligibility settings are preserved through sync --a
   assert.match(synced, /max_diff_lines: 150/, "max_diff_lines value must be preserved");
 });
 
+// Regression (#695 06e2dd51): config sync / re-render must round-trip the full
+// staged-policy graph (acceptance + lineage events) and the full repository-
+// control desired-state graph (branch_protections, rulesets, collectors,
+// policy_id, risk classes). Emitting only policy_id/state or empty placeholders
+// drops lineage and silently weakens drift coverage. Config cannot declare
+// enforcing (needs engine-attested provenance); use a fully populated `required`
+// policy with a complete draft→observe→required chain instead.
+test("syncConfig: fully populated staged_policies + repository_control_desired_state round-trip deep equality (#695 06e2dd51)", async () => {
+  const { computeStagedPolicyHash } = await import("../scripts/stage-policy-lifecycle.ts");
+  const policyId = "repo-controls";
+  const acceptance = { gate: "branch-protection", min_checks: 2 };
+  const h = (state: "draft" | "observe" | "required") =>
+    computeStagedPolicyHash({ policy_id: policyId, state, acceptance });
+  const original = [
+    "staged_policies:",
+    `  - policy_id: ${policyId}`,
+    "    state: required",
+    "    acceptance:",
+    "      gate: branch-protection",
+    "      min_checks: 2",
+    "    lineage:",
+    `      - policy_id: ${policyId}`,
+    "        from_state: draft",
+    "        to_state: observe",
+    `        policy_hash_before: ${h("draft")}`,
+    `        policy_hash_after: ${h("observe")}`,
+    '        at: "2026-08-14T00:00:00.000Z"',
+    "        authority: null",
+    "        evidence_refs: []",
+    `      - policy_id: ${policyId}`,
+    "        from_state: observe",
+    "        to_state: required",
+    `        policy_hash_before: ${h("observe")}`,
+    `        policy_hash_after: ${h("required")}`,
+    '        at: "2026-08-14T01:00:00.000Z"',
+    "        authority: null",
+    '        evidence_refs: ["obs://promotion-1"]',
+    "repository_control_desired_state:",
+    "  schema_version: 1",
+    "  repository: acme/widget",
+    "  default_branch: main",
+    "  required_checks:",
+    "    - CI",
+    "    - lint",
+    "  branch_protections:",
+    "    required_approving_review_count: 2",
+    "    dismiss_stale_reviews: true",
+    "    require_code_owner_reviews: true",
+    "    require_conversation_resolution: true",
+    "    allow_force_pushes: false",
+    "    allow_deletions: false",
+    "    required_status_check_contexts:",
+    "      - CI",
+    "      - lint",
+    "  rulesets:",
+    "    - id_or_name: default",
+    "      enforcement: active",
+    "    - id_or_name: release",
+    "      enforcement: evaluate",
+    "  required_pipeline_gates:",
+    "    - review-sha-gate",
+    "    - ci-green",
+    "  collector_requirements:",
+    "    - collector_id: metrics",
+    '      min_version: "1.2.0"',
+    "    - collector_id: coverage",
+    "  policy_id: repo-controls",
+    "  risk_class: fail_closed",
+    "  risk_class_by_family:",
+    "    required_checks: fail_closed",
+    "    branch_protections: fail_closed",
+    "    rulesets: observation",
+    "    required_pipeline_gates: fail_closed",
+    "    collector_requirements: observation",
+    "",
+  ].join("\n");
+
+  const beforeYaml = yaml.load(original) as Record<string, unknown>;
+  const repo = makeFakeRepo(original);
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+
+  const result = syncConfig(repo, { apply: true });
+  assert.equal(result.ok, true, `diagnostics: ${JSON.stringify(result.diagnostics)}`);
+  assert.ok(result.candidate, "sync must produce a candidate");
+
+  // Behavior-preserving check: reparse candidate and assert deep equality on
+  // the full #695 graphs (not merely policy_id/state presence).
+  const afterYaml = yaml.load(result.candidate!) as Record<string, unknown>;
+  assert.deepEqual(
+    afterYaml.staged_policies,
+    beforeYaml.staged_policies,
+    "staged_policies must round-trip acceptance + full lineage through sync",
+  );
+  assert.deepEqual(
+    afterYaml.repository_control_desired_state,
+    beforeYaml.repository_control_desired_state,
+    "repository_control_desired_state must round-trip nested protections/rulesets/collectors/risk",
+  );
+
+  // On-disk file (append-only or rewrite) must also preserve the graphs.
+  const synced = fs.readFileSync(configPath, "utf8");
+  const onDisk = yaml.load(synced) as Record<string, unknown>;
+  assert.deepEqual(onDisk.staged_policies, beforeYaml.staged_policies);
+  assert.deepEqual(onDisk.repository_control_desired_state, beforeYaml.repository_control_desired_state);
+
+  // resolveConfig path must still materialize the same structured values.
+  const binDir = makeFakeGh("acme/widget");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const { resolveConfig } = await import("../scripts/config.ts");
+    const cfg = resolveConfig({ repoPath: repo }) as {
+      staged_policies?: unknown;
+      repository_control_desired_state?: unknown;
+    };
+    assert.deepEqual(cfg.staged_policies, beforeYaml.staged_policies);
+    assert.deepEqual(cfg.repository_control_desired_state, beforeYaml.repository_control_desired_state);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
 test("CLI: `pipeline config sync` previews without mutating", () => {
   const original = "base_branch: staging\n";
   const repo = makeFakeRepo(original);
@@ -4608,5 +4730,350 @@ test("resolveConfig: reasoning.on_unsupported must be the literal 'record' (#434
     `executors:\n  bad:\n    type: model-endpoint\n    base_url: http://localhost:11434/v1\n    model: llama3\n    reasoning:\n      effort: high\n      on_unsupported: ignore\n`,
     "acme/exec20",
     /on_unsupported/,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Staged policies (#695): enforcing requires verified promotion provenance
+// (delta 66803fac) — config-declared lineage can never mint enforcing.
+// ---------------------------------------------------------------------------
+
+test("resolveConfig: staged_policies bare state enforcing is rejected", async () => {
+  await expectInvalidConfig(
+    [
+      "staged_policies:",
+      "  - policy_id: repo-controls",
+      "    state: enforcing",
+      "",
+    ].join("\n"),
+    "acme/pol-enforcing-bare",
+    /verified promotion provenance|config-declared lineage cannot mint authority/i,
+  );
+});
+
+test("resolveConfig: staged_policies bare retired is rejected", async () => {
+  await expectInvalidConfig(
+    [
+      "staged_policies:",
+      "  - policy_id: repo-controls",
+      "    state: retired",
+      "",
+    ].join("\n"),
+    "acme/pol-retired-bare",
+    /verified promotion provenance|retired/i,
+  );
+});
+
+test("resolveConfig: staged_policies observe without lineage is rejected (#695 121f8a7b)", async () => {
+  await expectInvalidConfig(
+    [
+      "staged_policies:",
+      "  - policy_id: repo-controls",
+      "    state: observe",
+      "    acceptance:",
+      "      gate: true",
+      "",
+    ].join("\n"),
+    "acme/pol-observe-bare",
+    /requires validated append-only lineage|lineage-free/i,
+  );
+});
+
+test("resolveConfig: staged_policies required without lineage is rejected (#695 121f8a7b)", async () => {
+  await expectInvalidConfig(
+    [
+      "staged_policies:",
+      "  - policy_id: repo-controls",
+      "    state: required",
+      "    acceptance:",
+      "      gate: true",
+      "",
+    ].join("\n"),
+    "acme/pol-required-bare",
+    /requires validated append-only lineage|lineage-free|required requires/i,
+  );
+});
+
+test("resolveConfig: staged_policies required with full validated lineage is accepted", async () => {
+  const { computeStagedPolicyHash } = await import("../scripts/stage-policy-lifecycle.ts");
+  const acceptance = { gate: true };
+  const policyId = "repo-controls";
+  const h = (state: "draft" | "observe" | "required") =>
+    computeStagedPolicyHash({ policy_id: policyId, state, acceptance });
+  const cfg = (await resolveWithConfig(
+    [
+      "staged_policies:",
+      "  - policy_id: repo-controls",
+      "    state: required",
+      "    acceptance:",
+      "      gate: true",
+      "    lineage:",
+      "      - policy_id: repo-controls",
+      "        from_state: draft",
+      "        to_state: observe",
+      `        policy_hash_before: ${h("draft")}`,
+      `        policy_hash_after: ${h("observe")}`,
+      '        at: "2026-08-14T00:00:00.000Z"',
+      "        authority: null",
+      "        evidence_refs: []",
+      "      - policy_id: repo-controls",
+      "        from_state: observe",
+      "        to_state: required",
+      `        policy_hash_before: ${h("observe")}`,
+      `        policy_hash_after: ${h("required")}`,
+      '        at: "2026-08-14T00:00:00.000Z"',
+      "        authority: null",
+      '        evidence_refs: ["obs://1"]',
+      "",
+    ].join("\n"),
+    "acme/pol-required-lineage",
+  )) as {
+    staged_policies?: Array<{ policy_id: string; state: string; lineage?: unknown[] }>;
+  };
+  assert.ok(cfg.staged_policies);
+  assert.equal(cfg.staged_policies![0]!.policy_id, "repo-controls");
+  assert.equal(cfg.staged_policies![0]!.state, "required");
+  assert.equal(cfg.staged_policies![0]!.lineage?.length, 2);
+});
+
+test("resolveConfig: staged_policies observe with draft→observe lineage is accepted", async () => {
+  const { computeStagedPolicyHash } = await import("../scripts/stage-policy-lifecycle.ts");
+  const acceptance = { gate: true };
+  const policyId = "repo-controls";
+  const hDraft = computeStagedPolicyHash({ policy_id: policyId, state: "draft", acceptance });
+  const hObs = computeStagedPolicyHash({ policy_id: policyId, state: "observe", acceptance });
+  const cfg = (await resolveWithConfig(
+    [
+      "staged_policies:",
+      "  - policy_id: repo-controls",
+      "    state: observe",
+      "    acceptance:",
+      "      gate: true",
+      "    lineage:",
+      "      - policy_id: repo-controls",
+      "        from_state: draft",
+      "        to_state: observe",
+      `        policy_hash_before: ${hDraft}`,
+      `        policy_hash_after: ${hObs}`,
+      '        at: "2026-08-14T00:00:00.000Z"',
+      "        authority: null",
+      "        evidence_refs: []",
+      "",
+    ].join("\n"),
+    "acme/pol-observe",
+  )) as {
+    staged_policies?: Array<{ policy_id: string; state: string; acceptance?: Record<string, unknown> }>;
+  };
+  assert.ok(cfg.staged_policies);
+  assert.equal(cfg.staged_policies![0]!.policy_id, "repo-controls");
+  assert.equal(cfg.staged_policies![0]!.state, "observe");
+});
+
+test("resolveConfig: staged_policies forged single-head enforcing lineage is rejected", async () => {
+  const { computeStagedPolicyHash } = await import("../scripts/stage-policy-lifecycle.ts");
+  const acceptance = { gate: true };
+  const hReq = computeStagedPolicyHash({
+    policy_id: "repo-controls",
+    state: "required",
+    acceptance,
+  });
+  const hEnf = computeStagedPolicyHash({
+    policy_id: "repo-controls",
+    state: "enforcing",
+    acceptance,
+  });
+  await expectInvalidConfig(
+    [
+      "staged_policies:",
+      "  - policy_id: repo-controls",
+      "    state: enforcing",
+      "    acceptance:",
+      "      gate: true",
+      "    lineage:",
+      "      - policy_id: repo-controls",
+      "        from_state: required",
+      "        to_state: enforcing",
+      `        policy_hash_before: ${hReq}`,
+      `        policy_hash_after: ${hEnf}`,
+      "        at: \"2026-08-14T00:00:00.000Z\"",
+      "        authority:",
+      "          actor: operator",
+      "          role: policy-admin",
+      "        evidence_refs: [\"obs://1\"]",
+      "",
+    ].join("\n"),
+    "acme/pol-enforcing-forged-head",
+    /verified promotion provenance|config-declared lineage cannot mint authority/i,
+  );
+});
+
+test("resolveConfig: staged_policies enforcing with forged arbitrary hashes is rejected", async () => {
+  await expectInvalidConfig(
+    [
+      "staged_policies:",
+      "  - policy_id: repo-controls",
+      "    state: enforcing",
+      "    acceptance:",
+      "      gate: true",
+      "    lineage:",
+      "      - policy_id: repo-controls",
+      "        from_state: draft",
+      "        to_state: observe",
+      "        policy_hash_before: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "        policy_hash_after: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "        at: \"2026-08-14T00:00:00.000Z\"",
+      "        authority: null",
+      "        evidence_refs: []",
+      "      - policy_id: repo-controls",
+      "        from_state: observe",
+      "        to_state: required",
+      "        policy_hash_before: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "        policy_hash_after: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "        at: \"2026-08-14T00:00:00.000Z\"",
+      "        authority: null",
+      "        evidence_refs: [\"obs://1\"]",
+      "      - policy_id: repo-controls",
+      "        from_state: required",
+      "        to_state: enforcing",
+      "        policy_hash_before: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "        policy_hash_after: dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "        at: \"2026-08-14T00:00:00.000Z\"",
+      "        authority:",
+      "          actor: operator",
+      "          role: policy-admin",
+      "        evidence_refs: [\"obs://1\"]",
+      "",
+    ].join("\n"),
+    "acme/pol-enforcing-forged-hashes",
+    /verified promotion provenance|config-declared lineage cannot mint authority/i,
+  );
+});
+
+test("resolveConfig: staged_policies enforcing with full validated lineage is REJECTED (#695 66803fac)", async () => {
+  const { computeStagedPolicyHash } = await import("../scripts/stage-policy-lifecycle.ts");
+  const acceptance = { gate: true };
+  const policyId = "repo-controls";
+  const path: Array<["draft" | "observe" | "required", "observe" | "required" | "enforcing"]> = [
+    ["draft", "observe"],
+    ["observe", "required"],
+    ["required", "enforcing"],
+  ];
+  const events = path.map(([from, to]) => ({
+    from,
+    to,
+    before: computeStagedPolicyHash({ policy_id: policyId, state: from, acceptance }),
+    after: computeStagedPolicyHash({ policy_id: policyId, state: to, acceptance }),
+  }));
+  const lineageYaml = events
+    .map(
+      (e) =>
+        [
+          `      - policy_id: ${policyId}`,
+          `        from_state: ${e.from}`,
+          `        to_state: ${e.to}`,
+          `        policy_hash_before: ${e.before}`,
+          `        policy_hash_after: ${e.after}`,
+          `        at: "2026-08-14T00:00:00.000Z"`,
+          e.to === "enforcing"
+            ? [
+                "        authority:",
+                "          actor: operator",
+                "          role: policy-admin",
+              ].join("\n")
+            : "        authority: null",
+          e.from === "observe" || e.from === "required"
+            ? '        evidence_refs: ["obs://1"]'
+            : "        evidence_refs: []",
+        ].join("\n"),
+    )
+    .join("\n");
+  // A locally-consistent config lineage with recomputed hashes + evidence_refs +
+  // claimed authority is NOT independent promotion evidence: config load must
+  // reject static enforcing (delta 66803fac).
+  await expectInvalidConfig(
+    [
+      "staged_policies:",
+      "  - policy_id: repo-controls",
+      "    state: enforcing",
+      "    acceptance:",
+      "      gate: true",
+      "    lineage:",
+      lineageYaml,
+      "",
+    ].join("\n"),
+    "acme/pol-enforcing-lineage",
+    /verified promotion provenance|config-declared lineage cannot mint authority/i,
+  );
+});
+
+test("resolveConfig: staged_policies enforcing lineage without authority is rejected", async () => {
+  const { computeStagedPolicyHash } = await import("../scripts/stage-policy-lifecycle.ts");
+  const acceptance = { gate: true };
+  const policyId = "repo-controls";
+  const h = (state: "draft" | "observe" | "required" | "enforcing") =>
+    computeStagedPolicyHash({ policy_id: policyId, state, acceptance });
+  await expectInvalidConfig(
+    [
+      "staged_policies:",
+      "  - policy_id: repo-controls",
+      "    state: enforcing",
+      "    acceptance:",
+      "      gate: true",
+      "    lineage:",
+      "      - policy_id: repo-controls",
+      "        from_state: draft",
+      "        to_state: observe",
+      `        policy_hash_before: ${h("draft")}`,
+      `        policy_hash_after: ${h("observe")}`,
+      "        at: \"2026-08-14T00:00:00.000Z\"",
+      "        authority: null",
+      "        evidence_refs: []",
+      "      - policy_id: repo-controls",
+      "        from_state: observe",
+      "        to_state: required",
+      `        policy_hash_before: ${h("observe")}`,
+      `        policy_hash_after: ${h("required")}`,
+      "        at: \"2026-08-14T00:00:00.000Z\"",
+      "        authority: null",
+      "        evidence_refs: [\"obs://1\"]",
+      "      - policy_id: repo-controls",
+      "        from_state: required",
+      "        to_state: enforcing",
+      `        policy_hash_before: ${h("required")}`,
+      `        policy_hash_after: ${h("enforcing")}`,
+      "        at: \"2026-08-14T00:00:00.000Z\"",
+      "        authority: null",
+      "        evidence_refs: [\"obs://1\"]",
+      "",
+    ].join("\n"),
+    "acme/pol-enforcing-no-auth",
+    /verified promotion provenance|config-declared lineage cannot mint authority|authority/i,
+  );
+});
+
+test("resolveConfig: staged_policies unauthorized retirement is rejected", async () => {
+  const { computeStagedPolicyHash } = await import("../scripts/stage-policy-lifecycle.ts");
+  const acceptance = {};
+  const policyId = "repo-controls";
+  const hDraft = computeStagedPolicyHash({ policy_id: policyId, state: "draft", acceptance });
+  const hRet = computeStagedPolicyHash({ policy_id: policyId, state: "retired", acceptance });
+  await expectInvalidConfig(
+    [
+      "staged_policies:",
+      "  - policy_id: repo-controls",
+      "    state: retired",
+      "    lineage:",
+      "      - policy_id: repo-controls",
+      "        from_state: draft",
+      "        to_state: retired",
+      `        policy_hash_before: ${hDraft}`,
+      `        policy_hash_after: ${hRet}`,
+      "        at: \"2026-08-14T00:00:00.000Z\"",
+      "        authority: null",
+      "        evidence_refs: []",
+      "",
+    ].join("\n"),
+    "acme/pol-retired-no-auth",
+    /verified promotion provenance|authority|retired/i,
   );
 });
