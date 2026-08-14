@@ -445,6 +445,16 @@ export interface CliOpts {
   retentionDays?: number;
   /** outcomes ingest: absolute path to a JSON fixture of RawOutcomeSignal[]. */
   fixture?: string;
+  /** lineage impact: upstream node id for forward impact walk. */
+  nodeId?: string;
+  /** lineage impact: revised revision identity for the upstream node. */
+  newRevision?: string;
+  /** lineage impact: revised content hash for the upstream node. */
+  newHash?: string;
+  /** lineage propose: start backward proposals from this evidence node. */
+  evidenceNodeId?: string;
+  /** lineage export: include full node/edge records in the JSON slice. */
+  includeRecords?: boolean;
   /** scoreboard: explicit per-harness cost estimates, as harness=usd-per-call. */
   estimateCost?: string[];
   /** scoreboard: emit a chronological day|week time-series alongside the full-window summary. */
@@ -677,7 +687,10 @@ export function maxPositionalsFor(command: string | undefined): number {
     command === "status" ||
     command === "papercut" ||
     command === "correction" ||
-    command === "controls"
+    command === "controls" ||
+    // host-local store verbs with a subcommand: outcomes list|ingest, lineage export|impact|…
+    command === "outcomes" ||
+    command === "lineage"
   ) {
     return 2;
   }
@@ -824,8 +837,13 @@ export function buildCmd(): Command {
     .option("--until <date>", "scoreboard: restrict analysis to runs on or before this ISO date (e.g. 2026-06-15)")
     .option("--days <n>", "scoreboard/outcomes: analyze the last N days (default: 30 for scoreboard)", Number)
     .option("--adapter <id>", "outcomes ingest: source adapter id (default: github)")
-    .option("--retention-days <n>", "outcomes list: exclude records older than N days (default: 365)", Number)
-    .option("--fixture <path>", "outcomes ingest: JSON fixture of raw signals (offline; no network)")
+    .option("--retention-days <n>", "outcomes/lineage: exclude records older than N days (default: 365 outcomes / 90 lineage)", Number)
+    .option("--fixture <path>", "outcomes/lineage ingest: JSON fixture path (offline; no network)")
+    .option("--node-id <id>", "lineage impact: upstream node id for the forward impact walk")
+    .option("--new-revision <rev>", "lineage impact: new revision identity for the revised upstream node")
+    .option("--new-hash <hash>", "lineage impact: new content hash for the revised upstream node")
+    .option("--evidence-node-id <id>", "lineage propose: start backward proposals from this evidence node")
+    .option("--include-records", "lineage export: include full node/edge records in JSON output")
     .option("--estimate-cost <harness=usd>", "scoreboard: estimate missing harness-call costs; repeatable", collectRepeatable, [])
     .option("--bucket <unit>", "scoreboard: add a chronological day|week time-series alongside the full-window summary")
     .option("--by <dimension>", "scoreboard: group metrics by harness|model|effort|executor; repeatable (to detect a duplicate flag)", collectRepeatable, [])
@@ -5129,13 +5147,6 @@ async function main(): Promise<void> {
     }
     const startDirLin = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
     const repoDirLin = findGitRoot(startDirLin) ?? startDirLin;
-    // Parse lineage-specific flags from raw argv (not all are on the shared commander surface).
-    const raw = rawArgs;
-    const flagVal = (name: string): string | undefined => {
-      const i = raw.indexOf(name);
-      if (i < 0 || i + 1 >= raw.length) return undefined;
-      return raw[i + 1];
-    };
     try {
       const { runLineageCli, realLineageCliDeps } = await import("./lineage/cli.ts");
       await runLineageCli(
@@ -5145,13 +5156,13 @@ async function main(): Promise<void> {
           json: !!opts.json,
           dryRun: !!opts.dryRun,
           retentionDays: opts.retentionDays,
-          fixturePath: opts.fixture ?? flagVal("--fixture"),
-          runId: flagVal("--run-id"),
-          nodeId: flagVal("--node-id"),
-          newRevision: flagVal("--new-revision"),
-          newHash: flagVal("--new-hash"),
-          evidenceNodeId: flagVal("--evidence-node-id"),
-          includeRecords: raw.includes("--include-records"),
+          fixturePath: opts.fixture,
+          runId: opts.runId,
+          nodeId: opts.nodeId,
+          newRevision: opts.newRevision,
+          newHash: opts.newHash,
+          evidenceNodeId: opts.evidenceNodeId,
+          includeRecords: !!opts.includeRecords,
         },
         realLineageCliDeps(),
       );

@@ -154,6 +154,10 @@ test("e2e fixture chain supports forward impact and backward proposal", () => {
       (a) => a.node_id === obj.node_id || a.drift_reason_codes.length > 0,
     ),
   );
+  assert.ok(
+    impact.affected.some((a) => a.node_id === outcome.node_id),
+    "forward impact must reach linked production_outcome via reverse outcome_of",
+  );
   assert.ok(impact.drift_reason_codes.includes("upstream_requirement_revised"));
 
   // Backward proposal from reversion outcome
@@ -164,10 +168,16 @@ test("e2e fixture chain supports forward impact and backward proposal", () => {
   assert.ok(prop.citing_evidence_node_ids.includes(outcome.node_id));
   assert.ok(prop.target_upstream_node_ids.length >= 1);
 
-  // Unauthorized apply refused
+  // Unauthorized apply refused (missing approval and missing verifier)
   const refused = applyLineageProposal(prop, undefined);
   assert.equal(refused.ok, false);
   assert.equal(refused.diagnostic?.code, "unauthorized_upstream_mutation");
+  const forged = applyLineageProposal(
+    prop,
+    { authority: "human", actor_id: "someone", approved_at: "2026-08-14T00:00:00Z" },
+  );
+  assert.equal(forged.ok, false);
+  assert.equal(forged.diagnostic?.code, "unauthorized_upstream_mutation");
 
   // Export slice
   const section = buildLineageExportSection({

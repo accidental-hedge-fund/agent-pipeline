@@ -28,7 +28,8 @@ pipeline lineage ingest  [--fixture <path>] [--dry-run] [--json]
 ```
 
 Backward proposals never silently edit authoritative upstream artifacts.
-Apply requires human or repository-workflow approval (`applyLineageProposal`).
+Apply requires verified human or repository-workflow approval via an injected
+`ApprovalVerifier` (`applyLineageProposal`); caller-asserted actor ids alone fail closed.
 
 ## Composition
 

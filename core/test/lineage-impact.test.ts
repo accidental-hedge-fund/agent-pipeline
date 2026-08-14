@@ -81,6 +81,27 @@ test("requirement revision marks downstream objectives stale in impact report", 
   assert.ok(human.includes("upstream_requirement_revised"));
 });
 
+test("forward impact includes linked production outcomes via reverse outcome_of", () => {
+  const g = chainGraph();
+  const req = g.nodes.find((n) => n.node_type === "requirement")!;
+  const outcome = g.nodes.find((n) => n.node_type === "production_outcome")!;
+  const report = computeForwardImpact(g, {
+    upstream_node_id: req.node_id,
+    prior_content_hash: "reqH1",
+    new_content_hash: "reqH2",
+    new_revision: "reqH2",
+    reason: "upstream_requirement_revised",
+  });
+  const hit = report.affected.find((a) => a.node_id === outcome.node_id);
+  assert.ok(
+    hit,
+    `expected production_outcome ${outcome.node_id} in forward impact; got ${JSON.stringify(report.affected.map((a) => a.node_type + ":" + a.node_id))}`,
+  );
+  assert.equal(hit.node_type, "production_outcome");
+  assert.ok(hit.edge_ids.length >= 1);
+  assert.ok(hit.path_node_ids.includes(outcome.node_id));
+});
+
 test("forward pass does not require network or model", () => {
   const g = chainGraph();
   const req = g.nodes.find((n) => n.node_type === "requirement")!;
@@ -114,20 +135,89 @@ test("agent apply without approval is refused", () => {
   assert.equal(applied.grants_merge_authority, false);
 });
 
-test("approved apply records decision provenance", () => {
+test("caller-asserted approval without verifier is refused", () => {
   const g = chainGraph();
   const outcome = g.nodes.find((n) => n.node_type === "production_outcome")!;
   const { proposals } = computeBackwardProposals(g, { evidence_node_id: outcome.node_id });
-  const applied = applyLineageProposal(proposals[0], {
-    authority: "human",
-    actor_id: "alice",
-    approved_at: "2026-08-14T00:00:00Z",
-  });
+  let mutateCalls = 0;
+  const applied = applyLineageProposal(
+    proposals[0],
+    {
+      authority: "human",
+      actor_id: "someone",
+      approved_at: "2026-08-14T00:00:00Z",
+    },
+    {
+      mutateUpstream: () => {
+        mutateCalls += 1;
+      },
+    },
+  );
+  assert.equal(applied.ok, false);
+  assert.equal(applied.authority_status, "refused");
+  assert.equal(applied.diagnostic?.code, "unauthorized_upstream_mutation");
+  assert.equal(mutateCalls, 0);
+  assert.equal(applied.grants_merge_authority, false);
+});
+
+test("forged actor_id rejected by verifier does not mutate", () => {
+  const g = chainGraph();
+  const outcome = g.nodes.find((n) => n.node_type === "production_outcome")!;
+  const { proposals } = computeBackwardProposals(g, { evidence_node_id: outcome.node_id });
+  let mutateCalls = 0;
+  const applied = applyLineageProposal(
+    proposals[0],
+    {
+      authority: "human",
+      actor_id: "forged-admin",
+      approved_at: "2026-08-14T00:00:00Z",
+    },
+    {
+      approvalVerifier: {
+        verify: () => false,
+      },
+      mutateUpstream: () => {
+        mutateCalls += 1;
+      },
+    },
+  );
+  assert.equal(applied.ok, false);
+  assert.equal(applied.authority_status, "refused");
+  assert.equal(applied.diagnostic?.code, "unauthorized_upstream_mutation");
+  assert.equal(mutateCalls, 0);
+});
+
+test("verified approval records decision provenance and may mutate once", () => {
+  const g = chainGraph();
+  const outcome = g.nodes.find((n) => n.node_type === "production_outcome")!;
+  const { proposals } = computeBackwardProposals(g, { evidence_node_id: outcome.node_id });
+  let mutateCalls = 0;
+  const applied = applyLineageProposal(
+    proposals[0],
+    {
+      authority: "human",
+      actor_id: "alice",
+      approved_at: "2026-08-14T00:00:00Z",
+      approval_id: "appr-1",
+    },
+    {
+      approvalVerifier: {
+        verify: (approval, proposal) =>
+          approval.actor_id === "alice" &&
+          approval.authority === "human" &&
+          proposal.proposal_id === proposals[0].proposal_id,
+      },
+      mutateUpstream: () => {
+        mutateCalls += 1;
+      },
+    },
+  );
   assert.equal(applied.ok, true);
   assert.equal(applied.authority_status, "applied");
   assert.equal(applied.nodes[0].node_type, "decision");
   assert.equal(applied.nodes[0].decision_status, "answered");
   assert.equal(applied.grants_merge_authority, false);
+  assert.equal(mutateCalls, 1);
 });
 
 test("default-off completeness gate does not block", () => {

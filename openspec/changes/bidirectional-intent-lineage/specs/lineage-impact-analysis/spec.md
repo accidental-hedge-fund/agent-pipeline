@@ -66,6 +66,8 @@ The engine SHALL NOT apply those proposals to authoritative upstream artifacts a
 
 Applying a lineage-driven change to an authoritative upstream artifact (OpenSpec requirement text, issue acceptance criteria treated as authority, approved dossier contract content, or repository-owned controls) SHALL require an explicit approval record from an authenticated human or a repository-owned workflow configured as the approval authority. Agents MAY draft proposals only. Unauthorized apply attempts SHALL fail closed, leave authority unchanged, and record a diagnostic or audit entry.
 
+Caller-asserted approval shape fields alone (for example a non-empty `actor_id` with `authority: "human"` or `authority: "repository_workflow"`) SHALL NOT authorize apply. The apply path SHALL require an injected authenticated approval verifier (or equivalent injectable approval-resolution dependency) that binds the claim to a configured authority for that proposal; missing verifier, failed verification, or an unconfigured workflow authority SHALL fail closed with a diagnostic such as `unauthorized_upstream_mutation` and SHALL NOT invoke upstream mutation callbacks.
+
 #### Scenario: agent apply without approval is refused
 
 - **WHEN** an agent requests apply of a `lineage_update_proposal` without a recorded human or repository-workflow approval
@@ -73,9 +75,16 @@ Applying a lineage-driven change to an authoritative upstream artifact (OpenSpec
 - **AND** the upstream artifact SHALL remain unchanged
 - **AND** a diagnostic such as `unauthorized_upstream_mutation` SHALL be recorded
 
+#### Scenario: caller-asserted approval without authenticated verification is refused
+
+- **WHEN** an agent supplies a non-empty `actor_id` and `authority` of `human` or `repository_workflow` without a verifier-accepted authenticated approval record for that proposal
+- **THEN** the engine SHALL refuse the apply
+- **AND** SHALL NOT call any upstream mutation callback
+- **AND** a diagnostic such as `unauthorized_upstream_mutation` SHALL be recorded
+
 #### Scenario: approved apply records decision provenance
 
-- **WHEN** a valid approval is present and apply succeeds
+- **WHEN** a valid approval is present, authenticated by the injected verifier for that proposal, and apply succeeds
 - **THEN** the engine SHALL record a `decision` node or edge with status `answered` (or equivalent applied provenance)
 - **AND** SHALL write a new upstream revision rather than silently rewriting history without supersession
 

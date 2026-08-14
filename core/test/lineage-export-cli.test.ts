@@ -162,3 +162,74 @@ test("proposals appear in export section refs", () => {
   });
   assert.ok((section.proposal_refs?.length ?? 0) >= 1);
 });
+
+// ---------------------------------------------------------------------------
+// command-registry: lineage flags required by documented verbs (#599 review)
+// ---------------------------------------------------------------------------
+
+import {
+  COMMAND_REGISTRY,
+  lookupCommand,
+  validateFlags,
+} from "../scripts/command-registry.ts";
+
+test("command-registry: lineage allows every documented lineage option", () => {
+  const entry = COMMAND_REGISTRY.lineage;
+  assert.ok(entry);
+  assert.equal(lookupCommand("lineage"), entry);
+  assert.equal(entry.mutatesGitHub, false);
+  assert.equal(entry.needsGhAuth, false);
+  assert.equal(entry.supportsJson, true);
+  const required = [
+    "repoPath",
+    "json",
+    "dryRun",
+    "retentionDays",
+    "fixture",
+    "runId",
+    "nodeId",
+    "newRevision",
+    "newHash",
+    "evidenceNodeId",
+    "includeRecords",
+  ];
+  for (const flag of required) {
+    assert.ok(
+      (entry.allowedFlags as Set<string>).has(flag),
+      `lineage.allowedFlags should include "${flag}"`,
+    );
+  }
+});
+
+test("command-registry: lineage validateFlags accepts documented options from CLI", () => {
+  const entry = COMMAND_REGISTRY.lineage;
+  const provided = new Set([
+    "runId",
+    "nodeId",
+    "newRevision",
+    "newHash",
+    "evidenceNodeId",
+    "includeRecords",
+    "json",
+    "repoPath",
+    "fixture",
+    "retentionDays",
+    "dryRun",
+  ]);
+  const cmd = {
+    options: [...provided].map((key) => ({
+      attributeName: () => key,
+      long: `--${key.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)}`,
+    })),
+    getOptionValueSource: (key: string) => (provided.has(key) ? "cli" : undefined),
+  };
+  assert.deepEqual(validateFlags(entry, cmd), []);
+});
+
+import { maxPositionalsFor } from "../scripts/pipeline.ts";
+
+test("maxPositionalsFor: lineage accepts command + verb (export|impact|propose|ingest)", () => {
+  assert.equal(maxPositionalsFor("lineage"), 2);
+  assert.ok(["lineage", "impact"].length <= maxPositionalsFor("lineage"));
+  assert.ok(["lineage", "export", "extra"].length > maxPositionalsFor("lineage"));
+});

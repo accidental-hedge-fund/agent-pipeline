@@ -135,8 +135,8 @@ export function computeForwardImpact(
         // implements: run → objective; reverse to find runs from objective
         next = e.source_id;
       } else if (e.target_id === cur.nodeId && e.relationship === "outcome_of") {
-        // outcome_of: outcome → run; reverse not needed for requirement→objective
-        continue;
+        // outcome_of: outcome → run; reverse to find production outcomes from run
+        next = e.source_id;
       } else {
         continue;
       }
@@ -351,17 +351,40 @@ export function computeBackwardProposals(
 }
 
 // ---------------------------------------------------------------------------
-// Apply path (approval required)
+// Apply path (authenticated approval required)
 // ---------------------------------------------------------------------------
 
 export type ApprovalAuthority = "human" | "repository_workflow";
 
+/**
+ * Caller-supplied approval claim. Shape alone is NOT sufficient authority —
+ * {@link ApprovalVerifier} must bind it to an authenticated surface.
+ */
 export interface ProposalApproval {
   authority: ApprovalAuthority;
-  /** Authenticated human login or workflow id. */
+  /** Claimed human login or workflow id (must be verified, not trusted raw). */
   actor_id: string;
   approved_at: string;
   note?: string | null;
+  /**
+   * Optional opaque approval record id when the host resolves a stored
+   * approval rather than an online identity check.
+   */
+  approval_id?: string;
+}
+
+/**
+ * Injected dependency that authenticates an approval claim for a specific
+ * proposal. Hosts bind this to live credentials (e.g. gh user) or a
+ * repository-owned workflow attestation. Unit tests inject fakes.
+ */
+export interface ApprovalVerifier {
+  /**
+   * Return true only when `approval` is valid for `proposal` and issued by a
+   * configured authority. Must fail closed on missing records, wrong proposal
+   * targets, unconfigured workflows, or forged actor identity.
+   */
+  verify(approval: ProposalApproval, proposal: LineageUpdateProposal): boolean;
 }
 
 export interface ApplyProposalResult {
@@ -375,43 +398,63 @@ export interface ApplyProposalResult {
   grants_merge_authority: false;
 }
 
+export interface ApplyProposalOpts {
+  /**
+   * Required for successful apply. Missing verifier fails closed — caller
+   * shape checks alone never authorize mutation.
+   */
+  approvalVerifier?: ApprovalVerifier;
+  /** Optional callback that mutates authoritative upstream; default is no-op record only. */
+  mutateUpstream?: (proposal: LineageUpdateProposal) => void;
+}
+
+function refuseUnauthorized(message: string): ApplyProposalResult {
+  return {
+    ok: false,
+    authority_status: "refused",
+    diagnostic: {
+      code: "unauthorized_upstream_mutation",
+      message,
+    },
+    nodes: [],
+    edges: [],
+    grants_merge_authority: false,
+  };
+}
+
 /**
- * Apply a proposal only with explicit human or repository-workflow approval.
+ * Apply a proposal only with verified human or repository-workflow approval.
  * Unauthorized attempts fail closed and record unauthorized_upstream_mutation.
+ * Caller-asserted actor_id/authority strings are never sufficient alone.
  */
 export function applyLineageProposal(
   proposal: LineageUpdateProposal,
   approval: ProposalApproval | null | undefined,
-  opts: {
-    /** Optional callback that mutates authoritative upstream; default is no-op record only. */
-    mutateUpstream?: (proposal: LineageUpdateProposal) => void;
-  } = {},
+  opts: ApplyProposalOpts = {},
 ): ApplyProposalResult {
   if (!approval || !approval.actor_id?.trim()) {
-    return {
-      ok: false,
-      authority_status: "refused",
-      diagnostic: {
-        code: "unauthorized_upstream_mutation",
-        message: "apply refused: human or repository-workflow approval required",
-      },
-      nodes: [],
-      edges: [],
-      grants_merge_authority: false,
-    };
+    return refuseUnauthorized(
+      "apply refused: human or repository-workflow approval required",
+    );
   }
   if (approval.authority !== "human" && approval.authority !== "repository_workflow") {
-    return {
-      ok: false,
-      authority_status: "refused",
-      diagnostic: {
-        code: "unauthorized_upstream_mutation",
-        message: "apply refused: invalid approval authority",
-      },
-      nodes: [],
-      edges: [],
-      grants_merge_authority: false,
-    };
+    return refuseUnauthorized("apply refused: invalid approval authority");
+  }
+  if (!opts.approvalVerifier) {
+    return refuseUnauthorized(
+      "apply refused: authenticated approval verifier required",
+    );
+  }
+  let verified = false;
+  try {
+    verified = opts.approvalVerifier.verify(approval, proposal) === true;
+  } catch {
+    verified = false;
+  }
+  if (!verified) {
+    return refuseUnauthorized(
+      "apply refused: approval not authenticated for this proposal",
+    );
   }
 
   // Record decision provenance; do not rewrite history without supersession.
@@ -430,6 +473,7 @@ export function applyLineageProposal(
       proposal_id: proposal.proposal_id,
       approval_authority: approval.authority,
       actor_id: approval.actor_id,
+      ...(approval.approval_id ? { approval_id: approval.approval_id } : {}),
     },
     decision_status: "answered",
     producer: "lineage.apply",
