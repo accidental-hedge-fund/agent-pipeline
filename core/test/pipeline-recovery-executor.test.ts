@@ -316,6 +316,134 @@ test("DEFAULT_RECOVERY_POLICY recipe order: unlink before repair (#1020)", async
   );
 });
 
+test("DEFAULT_RECOVERY_POLICY recipe order: review-findings unlink before repair (#1060)", async () => {
+  const { DEFAULT_RECOVERY_POLICY } = await import("../scripts/loop/recovery.ts");
+  const recipes = DEFAULT_RECOVERY_POLICY["review-findings"].recipes;
+  const unlinkIdx = recipes.indexOf("unlink_engine_scratch");
+  const repairIdx = recipes.indexOf("repair_pipeline_item");
+  assert.ok(unlinkIdx >= 0, "unlink_engine_scratch must be first prep for findings");
+  assert.ok(repairIdx >= 0, "repair_pipeline_item must remain configured");
+  assert.ok(unlinkIdx < repairIdx, `got ${recipes.join(" → ")}`);
+});
+
+test("unlink_engine_scratch #1060: review-findings prep unlinks scratch, never clears blocked, never succeeds", async () => {
+  let clears = 0;
+  let cleaned = false;
+  const cleanedArgs: string[][] = [];
+  const execute = realExecuteRecovery(cfg(), {
+    getOnDiskForIssue: async () => ({ path: "/wt/599", slug: "599-x", branch: "pipeline/599-x" } as never),
+    gitInWorktree: async (_path, args) => {
+      if (args[0] === "status") {
+        return {
+          stdout: cleaned ? "" : "?? artifacts/challenge-response-599.json\n",
+          stderr: "",
+          code: 0,
+        };
+      }
+      if (args[0] === "clean") {
+        cleanedArgs.push(args as string[]);
+        cleaned = true;
+        return { stdout: "", stderr: "", code: 0 };
+      }
+      return { stdout: "", stderr: "", code: 0 };
+    },
+    getIssueDetail: async () => ({
+      number: 599,
+      type: "issue",
+      title: "t",
+      body: "",
+      state: "open",
+      url: "https://example.test/599",
+      labels: ["blocked", "pipeline:pre-merge"],
+    }),
+    clearBlocked: async () => {
+      clears++;
+    },
+    onEngineClassRecovered: async () => {
+      throw new Error("sibling filer must not run for findings prep");
+    },
+  });
+  const diagnostic = buildStageDiagnostic({
+    blockerKind: "review-findings",
+    reason: "2 unresolved findings at d0c0d39",
+    stage: "pre-merge",
+  });
+  const result = await execute({
+    ...mechanicalInput(),
+    itemId: "599",
+    action: "unlink_engine_scratch",
+    blockerClass: "review-findings",
+    diagnostic,
+  });
+  assert.equal(result.succeeded, false, "prep must not count as findings recovery success");
+  assert.match(result.error ?? result.evidence, /prep-complete for review-findings/);
+  assert.match(result.error ?? result.evidence, /challenge-response-599/);
+  assert.equal(clears, 0, "must not clear blocked for findings prep unlink");
+  assert.ok(cleanedArgs.some((a) => a.includes("artifacts/challenge-response-599.json")));
+});
+
+test("unlink_engine_scratch #1060: review-findings no-scratch is not-applicable fall-through", async () => {
+  let clears = 0;
+  const execute = realExecuteRecovery(cfg(), {
+    getOnDiskForIssue: async () => ({ path: "/wt/42", slug: "42-x", branch: "pipeline/42-x" } as never),
+    gitInWorktree: async (_path, args) => {
+      if (args[0] === "status") return { stdout: "", stderr: "", code: 0 };
+      return { stdout: "", stderr: "", code: 0 };
+    },
+    clearBlocked: async () => {
+      clears++;
+    },
+  });
+  const diagnostic = buildStageDiagnostic({
+    blockerKind: "review-findings",
+    reason: "findings without scratch",
+    stage: "pre-merge",
+  });
+  const result = await execute({
+    ...mechanicalInput(),
+    action: "unlink_engine_scratch",
+    blockerClass: "review-findings",
+    diagnostic,
+  });
+  assert.equal(result.succeeded, false);
+  assert.match(result.error ?? "", /prep not-applicable for review-findings|trying next recipe/);
+  assert.equal(clears, 0);
+});
+
+test("unlink_engine_scratch #1060: review-findings product dirt fails closed without clear", async () => {
+  let clears = 0;
+  const execute = realExecuteRecovery(cfg(), {
+    getOnDiskForIssue: async () => ({ path: "/wt/42", slug: "42-x", branch: "pipeline/42-x" } as never),
+    gitInWorktree: async (_path, args) => {
+      if (args[0] === "status") {
+        return {
+          stdout: "?? artifacts/challenge-response-1.json\n M core/scripts/foo.ts\n",
+          stderr: "",
+          code: 0,
+        };
+      }
+      return { stdout: "", stderr: "", code: 0 };
+    },
+    clearBlocked: async () => {
+      clears++;
+    },
+  });
+  const diagnostic = buildStageDiagnostic({
+    blockerKind: "review-findings",
+    reason: "mixed dirt under findings",
+    stage: "pre-merge",
+  });
+  const result = await execute({
+    ...mechanicalInput(),
+    action: "unlink_engine_scratch",
+    blockerClass: "review-findings",
+    diagnostic,
+  });
+  assert.equal(result.succeeded, false);
+  assert.match(result.error ?? "", /product dirt/);
+  assert.equal(clears, 0);
+});
+
 // #1021: recover → live sibling coupling (injectable onEngineClassRecovered)
 
 test("unlink_engine_scratch (#1021): successful recover invokes live sibling filer once", async () => {

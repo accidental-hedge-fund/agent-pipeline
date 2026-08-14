@@ -29,6 +29,62 @@ import {
 } from "../worktree.ts";
 import { appendEvent, defaultRunStoreDeps, runDirPath } from "../run-store.ts";
 import { DEFAULT_GIT_PUSH_AUTH, gitExecForwardingEnv, runConfiguredGitPush } from "../git-push-auth.ts";
+import { classifyPorcelainForScratchRecover } from "../worktree-dirt.ts";
+
+/** #1060: closed set of non-commit repair failure categories. */
+export type RepairFailureCategory =
+  | "noop-clean"
+  | "dirt-blocked"
+  | "harness-error"
+  | "no-diagnostic";
+
+const REPAIR_DIAGNOSTIC_TAIL_MAX = 500;
+
+/** Bound a harness/diagnostic tail for operator-visible recovery evidence. */
+export function boundRepairDiagnosticTail(text: string, max = REPAIR_DIAGNOSTIC_TAIL_MAX): string {
+  const trimmed = text.trim();
+  if (trimmed.length <= max) return trimmed;
+  return `…${trimmed.slice(-(max - 1))}`;
+}
+
+/**
+ * #1060: typed non-fix-committed evidence for supervisor/dashboard survival.
+ * Never collapses to the generic "did not produce a committed and pushed repair"
+ * string alone when status/category/diagnostic exist.
+ */
+export function formatRepairFailureEvidence(input: {
+  status: string;
+  category: RepairFailureCategory;
+  head?: string;
+  diagnostic?: string;
+  pathSummary?: string;
+}): string {
+  const headBit = input.head ? ` head=${input.head}` : "";
+  const parts = [
+    `repair_pipeline_item failed: status=${input.status} category=${input.category}${headBit}`,
+  ];
+  if (input.category === "noop-clean") {
+    parts.push(
+      `configured implementer inspected${input.head ? ` ${input.head}` : ""} but produced no verifiable candidate change`,
+    );
+  }
+  if (input.pathSummary?.trim()) {
+    parts.push(`paths=${input.pathSummary.trim()}`);
+  }
+  if (input.diagnostic?.trim()) {
+    parts.push(`diagnostic=${boundRepairDiagnosticTail(input.diagnostic)}`);
+  } else if (input.category === "no-diagnostic") {
+    parts.push("no diagnostic was captured");
+  }
+  parts.push("configured implementer did not produce a committed and pushed repair");
+  return parts.join("; ");
+}
+
+function dirtHintFromText(text: string): boolean {
+  return /\b(dirt|dirty|porcelain|uncommitted|pre-dirty|worktree dirty|product dirt|engine-scratch)\b/i.test(
+    text,
+  );
+}
 
 export interface RepairPipelineItemInput {
   runId: string;
@@ -476,10 +532,56 @@ export function createRepairPipelineItemExecutor(
     // only ever vouch for a genuinely interrupted (crashed) harness run.
     await git(wt.path, ["update-ref", "-d", breadcrumbRef], { ignoreFailure: true });
     if (result.status !== "fix-committed") {
-      const error =
-        result.status === "noop-clean"
-          ? `configured implementer inspected ${actualHead} but produced no verifiable candidate change: ${result.diagnostic ?? "clean no-op"}`
-          : `configured implementer did not produce a committed and pushed repair for ${actualHead}`;
+      // #1060: typed failure evidence (status + category + diagnostic tail).
+      // Single scratch-cleanup boundary: do NOT strip engine scratch here;
+      // residual porcelain surfaces as dirt-blocked via the shared classifier.
+      if (result.status === "noop-clean") {
+        const error = formatRepairFailureEvidence({
+          status: "noop-clean",
+          category: "noop-clean",
+          head: actualHead,
+          diagnostic:
+            "diagnostic" in result && typeof result.diagnostic === "string"
+              ? result.diagnostic
+              : "clean no-op",
+        });
+        return { succeeded: false, evidence: error, error };
+      }
+      const diagnostic =
+        "diagnostic" in result && typeof result.diagnostic === "string"
+          ? result.diagnostic
+          : undefined;
+      let category: RepairFailureCategory = diagnostic?.trim()
+        ? dirtHintFromText(diagnostic)
+          ? "dirt-blocked"
+          : "harness-error"
+        : "no-diagnostic";
+      let pathSummary: string | undefined;
+      // When diagnostic is missing (e.g. bare pre-dirty error) or dirt-hinted,
+      // re-read porcelain and classify with the shared engine-scratch rules.
+      if (category === "no-diagnostic" || category === "dirt-blocked") {
+        const porcelain = await git(wt.path, ["status", "--porcelain", "--untracked-files=all"], {
+          ignoreFailure: true,
+        });
+        if (porcelain.code === 0 && porcelain.stdout.trim()) {
+          const classified = classifyPorcelainForScratchRecover(porcelain.stdout);
+          const paths = [
+            ...classified.product.map((p) => `product:${p}`),
+            ...classified.untrackedScratch.map((p) => `engine-scratch:${p}`),
+          ];
+          if (paths.length > 0) {
+            category = "dirt-blocked";
+            pathSummary = paths.slice(0, 8).join(", ");
+          }
+        }
+      }
+      const error = formatRepairFailureEvidence({
+        status: result.status,
+        category,
+        head: actualHead,
+        diagnostic,
+        pathSummary,
+      });
       return { succeeded: false, evidence: error, error };
     }
 

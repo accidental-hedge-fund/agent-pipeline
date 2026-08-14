@@ -23,7 +23,7 @@ import {
   upgradeLedgerForRecovery,
 } from "../scripts/loop/recovery.ts";
 import { mapLegacyThemeToBlockerClass } from "../scripts/loop/import.ts";
-import { initRun, readContract, readLedger, acquireLock, type LoopStoreDeps } from "../scripts/loop/store.ts";
+import { initRun, readContract, readLedger, writeLedger, acquireLock, type LoopStoreDeps } from "../scripts/loop/store.ts";
 import {
   DURABLE_BLOCKER_CLASSES,
   LOOP_CONTRACT_SCHEMA,
@@ -175,7 +175,17 @@ test("deterministic redispatch precedes provider-neutral model repair for mechan
     "rerun_ci",
     "repair_pipeline_item",
   ]);
-  assert.deepEqual(DEFAULT_RECOVERY_POLICY["review-findings"].recipes, ["repair_pipeline_item"]);
+  assert.deepEqual(DEFAULT_RECOVERY_POLICY["review-findings"].recipes, [
+    "unlink_engine_scratch",
+    "repair_pipeline_item",
+  ]);
+  assert.ok(
+    DEFAULT_RECOVERY_POLICY["review-findings"].recipes.indexOf("unlink_engine_scratch") <
+      DEFAULT_RECOVERY_POLICY["review-findings"].recipes.indexOf("repair_pipeline_item"),
+    "review-findings must order preparatory unlink before repair (#1060)",
+  );
+  assert.equal(DEFAULT_RECOVERY_POLICY["review-findings"].retry_budget, 3);
+  assert.equal(DEFAULT_RECOVERY_POLICY["review-findings"].repeated_evidence_limit, 2);
   assert.deepEqual(DEFAULT_RECOVERY_POLICY["workflow-engine-defect"].recipes, [
     "unlink_engine_scratch",
     "restart_workflow_engine",
@@ -936,6 +946,96 @@ test("upgradeContractForRecovery: adding review recovery preserves unrelated cus
   assert.deepEqual(upgraded.recovery_policy["implementation-ci"], legacyPolicy["implementation-ci"]);
   assert.deepEqual(upgraded.recovery_policy["review-findings"], DEFAULT_RECOVERY_POLICY["review-findings"]);
   assert.deepEqual(upgraded.recovery_policy["workflow-engine-defect"], DEFAULT_RECOVERY_POLICY["workflow-engine-defect"]);
+});
+
+test("upgradeContractForRecovery #1060: exact pre-#1060 repair-only review-findings migrates to unlink-then-repair", () => {
+  const legacyPolicy = structuredClone(DEFAULT_RECOVERY_POLICY) as unknown as Record<string, unknown>;
+  legacyPolicy["review-findings"] = {
+    recipes: ["repair_pipeline_item"],
+    retry_budget: 3,
+    backoff: { initial_seconds: 15, multiplier: 2, max_seconds: 300 },
+    terminal_outcome: "retry",
+    run_fatal: false,
+    repeated_evidence_limit: 2,
+  };
+  const upgraded = upgradeContractForRecovery({
+    ...testContract(),
+    recovery_policy: legacyPolicy,
+  } as unknown as LoopContract);
+  assert.deepEqual(upgraded.recovery_policy["review-findings"].recipes, [
+    "unlink_engine_scratch",
+    "repair_pipeline_item",
+  ]);
+  assert.equal(upgraded.recovery_policy["review-findings"].retry_budget, 3);
+});
+
+test("upgradeContractForRecovery #1060: custom repair-only review-findings with different budget is preserved", () => {
+  const custom = {
+    recipes: ["repair_pipeline_item"],
+    retry_budget: 9,
+    backoff: { initial_seconds: 15, multiplier: 2, max_seconds: 300 },
+    terminal_outcome: "retry" as const,
+    run_fatal: false,
+    repeated_evidence_limit: 2,
+  };
+  const legacyPolicy = structuredClone(DEFAULT_RECOVERY_POLICY) as unknown as Record<string, unknown>;
+  legacyPolicy["review-findings"] = custom;
+  const upgraded = upgradeContractForRecovery({
+    ...testContract(),
+    recovery_policy: legacyPolicy,
+  } as unknown as LoopContract);
+  assert.deepEqual(upgraded.recovery_policy["review-findings"], custom);
+});
+
+test("startRecoveryAttempt #1060: findings prep unlink does not charge retry budget", async () => {
+  const { deps, contract, token } = await setup();
+  const itemId = contract.items[0].id;
+  // Seed a blocked review-findings item with full budget.
+  const ledger = await readLedger(deps, "run-1");
+  const item = ledger.items[itemId];
+  item.state = "blocked";
+  item.blocked_theme = "review-findings";
+  item.evidence_fingerprint = fingerprintEvidence("blocking finding");
+  item.repeated_evidence_count = 0;
+  item.recovery_budgets_remaining = { "review-findings": 3 };
+  item.history.push({
+    time: "2026-08-14T00:00:00.000Z",
+    from: "in_progress",
+    to: "blocked",
+    engine: "claude",
+    theme: "review-findings",
+    evidence: "blocking finding",
+  });
+  await writeLedger(deps, ledger, token);
+
+  const started = await startRecoveryAttempt(deps, contract, {
+    runId: "run-1",
+    token,
+    itemId,
+    engine: "claude",
+    action: "unlink_engine_scratch",
+    candidateIdentity: `head=${"a".repeat(40)}`,
+  });
+  assert.equal(started.attempt.outcome, "started");
+  assert.equal(started.attempt.budget_remaining, 3, "prep unlink must not decrement budget");
+  assert.equal(
+    started.ledger.items[itemId].recovery_budgets_remaining["review-findings"],
+    3,
+    "ledger budget remaining must stay 3 after free prep claim",
+  );
+
+  // A subsequent repair claim still has the full budget available.
+  const repair = await startRecoveryAttempt(deps, contract, {
+    runId: "run-1",
+    token,
+    itemId,
+    engine: "claude",
+    action: "repair_pipeline_item",
+    candidateIdentity: `head=${"a".repeat(40)}|repair=1`,
+  });
+  assert.equal(repair.attempt.outcome, "started");
+  assert.equal(repair.attempt.budget_remaining, 2, "only the repair claim charges one unit");
+  assert.equal(repair.ledger.items[itemId].recovery_budgets_remaining["review-findings"], 2);
 });
 
 test("upgradeContractForRecovery: custom entries keep their policy while legacy auth action is renamed", () => {

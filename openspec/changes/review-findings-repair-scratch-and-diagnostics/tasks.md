@@ -1,35 +1,47 @@
 ## 1. Default policy and migration
 
-- [ ] 1.1 Change `DEFAULT_RECOVERY_POLICY["review-findings"].recipes` to `["unlink_engine_scratch", "repair_pipeline_item"]` in `core/scripts/loop/recovery.ts` (keep existing budgets unless D3 requires a documented adjustment).
-- [ ] 1.2 Add the pre-#1060 repair-only default to `STALE_DEFAULT_POLICY_ENTRIES["review-findings"]` so `upgradeContractForRecovery` migrates exact stale defaults.
-- [ ] 1.3 Update unit assertions that snapshot `DEFAULT_RECOVERY_POLICY["review-findings"]` (e.g. `loop-recovery.test.ts`) for the new recipe order and migration.
+- [x] 1.1 Change `DEFAULT_RECOVERY_POLICY["review-findings"].recipes` to `["unlink_engine_scratch", "repair_pipeline_item"]` in `core/scripts/loop/recovery.ts` (keep `retry_budget: 3`, `repeated_evidence_limit: 2`).
+- [x] 1.2 Add the **exact** pre-#1060 repair-only default to `STALE_DEFAULT_POLICY_ENTRIES["review-findings"]` (recipes, budgets, backoff, terminal, run_fatal — see design D5).
+- [x] 1.3 Unit tests: default recipe order; exact stale migrates; custom repair-only-with-different-budget preserved; unrelated custom classes preserved (`loop-recovery.test.ts`).
 
-## 2. Unlink prep semantics for review-findings
+## 2. Unlink prep semantics for review-findings (class-scoped)
 
-- [ ] 2.1 Extend `unlink_engine_scratch` so class `review-findings` unlinks engine-known scratch when present, does **not** clear `pipeline:blocked` as successful findings recovery, and returns a not-success fall-through / try-next-recipe outcome with explicit evidence.
-- [ ] 2.2 Preserve terminal scratch-only success for `workflow-engine-defect` (unlink + clear blocked when scratch-only, no harness round).
-- [ ] 2.3 Keep product-dirt and no-scratch paths fail-closed / try-next-recipe without false recover.
-- [ ] 2.4 Implement D3 mitigation so no-scratch findings recovery still reaches `repair_pipeline_item` within budget (skip unlink when no scratch and/or best-effort prep unlink inside repair).
+- [x] 2.1 Extend `unlink_engine_scratch` in `pipeline.ts` so class `review-findings` unlinks engine-known scratch when present, **never** clears `pipeline:blocked`, **never** returns `succeeded: true` as findings recovery, and returns prep-complete / not-applicable fall-through evidence (shared classifier only; product dirt fail-closed).
+- [x] 2.2 Preserve terminal scratch-only success for `workflow-engine-defect` (unlink + clear blocked when scratch-only, no harness round, sibling filer).
+- [x] 2.3 Keep product-dirt and no-scratch paths fail-closed / try-next-recipe without false recover.
 
-## 3. Repair failure diagnostics
+## 3. Same-sequence controller semantics and budget accounting
 
-- [ ] 3.1 Propagate non-`fix-committed` status and diagnostic/harness output from the shared autofix / harness-round result into `repair_pipeline_item` failure evidence.
-- [ ] 3.2 Distinguish at least: implementer `noop-clean`, dirt/porcelain-blocked commit or pre-dirty refusal (with path summary when available), and harness/error with bounded output tail; never collapse all of these to only the generic “did not produce a committed and pushed repair” string when status/diagnostic exist.
-- [ ] 3.3 Bound/redact tails consistently with existing harness log practices.
+- [x] 3.1 Supervisor / recovery start: preparatory `unlink_engine_scratch` under `review-findings` does **not** decrement `recovery_budgets_remaining` and does **not** burn repeated-evidence as a repair failure.
+- [x] 3.2 After prep-complete or no-scratch not-applicable, **same `executeBlockedRecovery` cycle** claims and runs `repair_pipeline_item` (when candidate head exists and repair budget remains).
+- [x] 3.3 When no engine-known scratch at claim time, skip unlink claim and go straight to `repair_pipeline_item` (default policy order still lists unlink first under test).
+- [x] 3.4 Regression: three repair budget units remain available for implementer repair after free prep (scratch present and no-scratch paths).
 
-## 4. Regression tests (#599 shape)
+## 4. Single scratch-cleanup boundary + repair failure diagnostics
 
-- [ ] 4.1 Policy order test: default `review-findings` recipes place `unlink_engine_scratch` before `repair_pipeline_item`.
-- [ ] 4.2 Fixture: `review-findings` + `artifacts/challenge-response-*.json` present → unlink claimed before repair; repair observes clean engine-scratch porcelain (injectable deps, no real git/network/subprocess).
-- [ ] 4.3 Fixture: unlink under `review-findings` does not clear blocked / does not mark substantive recovery success while findings still apply.
-- [ ] 4.4 Fixture: no engine scratch → recovery still claims `repair_pipeline_item` within budget.
-- [ ] 4.5 Fixture: repair completes without commit but with harness/diagnostic output → error/evidence includes status + tail (not generic-only).
-- [ ] 4.6 Fixture: `noop-clean` still surfaces the explicit implementer no-change message + diagnostic.
-- [ ] 4.7 Confirm existing `workflow-engine-defect` unlink-before-repair and scratch-only composition tests still pass.
-- [ ] 4.8 Stale-default migration test for `review-findings` repair-only → new default.
+- [x] 4.1 **Authoritative boundary only:** do **not** add best-effort engine-scratch strip inside `repair_pipeline_item`. Residual porcelain after prep → dirt-blocked evidence, not silent delete.
+- [x] 4.2 Build typed non-`fix-committed` evidence: `status`, `category` (`noop-clean` \| `dirt-blocked` \| `harness-error` \| `no-diagnostic`), and bounded diagnostic tail or explicit absence (`repair-pipeline-item.ts`; propagate autofix/harness diagnostics including pre-dirty).
+- [x] 4.3 Dirt-blocked uses shared porcelain classifier (`classifyPorcelainForScratchRecover` / `worktree-dirt.ts`); path summary; product dirt fail-closed; no broad `artifacts/**` waiver.
+- [x] 4.4 Ensure evidence/error is what supervisor stores on `loop_recovery_action_executed` and `completeRecoveryAttempt` (no silent collapse).
+- [x] 4.5 Do not mislabel committed-but-unpushed, harness crash, or bare pre-dirty error as `noop-clean`.
 
-## 5. Mirror, validate, CI
+## 5. Regression tests (#599 shape)
 
-- [ ] 5.1 After any `core/` edits, run `node scripts/build.mjs` and include regenerated `plugin/` in the same commit.
-- [ ] 5.2 Run `openspec validate review-findings-repair-scratch-and-diagnostics` (and `openspec validate --all` as needed) until clean.
-- [ ] 5.3 Run `npm run ci` from the repo root and fix failures until green.
+- [x] 5.1 Policy order: default `review-findings` places `unlink_engine_scratch` before `repair_pipeline_item`.
+- [x] 5.2 Fixture: findings + `artifacts/challenge-response-*.json` → unlink executed before repair; repair observes no remaining engine-known scratch; blocked not cleared by unlink alone.
+- [x] 5.3 Fixture: no engine scratch → still reaches `repair_pipeline_item` same sequence / within budget (no dead-end, no false recover).
+- [x] 5.4 Fixture: prep does not charge findings retry budget (budget after prep+failed repair still allows remaining attempts per `retry_budget`).
+- [x] 5.5 Fixture: repair no-commit with harness output → evidence includes status + category + tail (not generic-only).
+- [x] 5.6 Fixture: `noop-clean` explicit no-change + diagnostic.
+- [x] 5.7 Fixture: dirt-blocked residual product dirt (and residual engine scratch if prep skipped) → dirt-blocked category + path summary.
+- [x] 5.8 Fixture: no captured diagnostic → evidence states absence.
+- [x] 5.9 Confirm `workflow-engine-defect` scratch-only terminal path and product-dirt fail-closed still pass.
+- [x] 5.10 Stale-default migration + custom-policy preservation tests (1.3).
+- [x] 5.11 Injected deps only (no real network/git/subprocess) in unit tests.
+
+## 6. Spec deltas, mirror, validate, CI
+
+- [x] 6.1 Align delta specs with D2–D5 (same-sequence free prep, typed evidence survival, single cleanup boundary) if not already complete.
+- [x] 6.2 After any `core/` edits, run `node scripts/build.mjs` and include regenerated `plugin/` in the same commit.
+- [x] 6.3 Run `openspec validate review-findings-repair-scratch-and-diagnostics` and `openspec validate --all` until clean.
+- [x] 6.4 Run `npm run ci` from the repo root until green.

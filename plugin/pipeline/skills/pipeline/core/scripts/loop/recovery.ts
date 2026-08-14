@@ -153,7 +153,9 @@ export const DEFAULT_RECOVERY_POLICY: RecoveryPolicy = compileRecoveryPolicy({
     repeated_evidence_limit: 2,
   },
   "review-findings": {
-    recipes: ["repair_pipeline_item"],
+    // #1060: preparatory unlink of engine-owned scratch before implementer repair
+    // (same action as #1020 workflow-engine-defect, class-scoped prep semantics).
+    recipes: ["unlink_engine_scratch", "repair_pipeline_item"],
     retry_budget: 3,
     backoff: { initial_seconds: 15, multiplier: 2, max_seconds: 300 },
     terminal_outcome: "retry",
@@ -247,6 +249,15 @@ const STALE_DEFAULT_POLICY_ENTRIES: Partial<Record<DurableBlockerClass, readonly
       terminal_outcome: "retry", run_fatal: true, repeated_evidence_limit: 2,
     },
   ],
+  // Pre-#1060 default (repair-only; no preparatory unlink_engine_scratch).
+  "review-findings": [{
+    recipes: ["repair_pipeline_item"],
+    retry_budget: 3,
+    backoff: { initial_seconds: 15, multiplier: 2, max_seconds: 300 },
+    terminal_outcome: "retry",
+    run_fatal: false,
+    repeated_evidence_limit: 2,
+  }],
 };
 
 function samePolicyEntry(left: unknown, right: unknown): boolean {
@@ -672,18 +683,27 @@ export async function startRecoveryAttempt(
   if (existing) return { ledger, attempt: existing };
 
   const remaining = item.recovery_budgets_remaining[blockerClass] ?? policyEntry.retry_budget;
+  // #1060: preparatory unlink under review-findings is free of the class retry
+  // budget so three implementer repair attempts remain after scratch prep.
+  const isFindingsPrepUnlink =
+    blockerClass === "review-findings" && input.action === "unlink_engine_scratch";
   const outcome: RecoveryAttemptOutcome = remaining <= 0 ? "exhausted" : "started";
-  const budgetRemaining = Math.max(0, remaining - (outcome === "started" ? 1 : 0));
+  const budgetRemaining = isFindingsPrepUnlink
+    ? remaining
+    : Math.max(0, remaining - (outcome === "started" ? 1 : 0));
   const priorClassAttempts = ledger.recovery_attempts.filter(
     (attempt) =>
       attempt.item_id === input.itemId &&
       attempt.class === blockerClass &&
       attempt.evidence_fingerprint === evidenceFingerprint,
   ).length;
-  const backoffSeconds = Math.min(
-    policyEntry.backoff.max_seconds,
-    policyEntry.backoff.initial_seconds * Math.pow(policyEntry.backoff.multiplier, priorClassAttempts),
-  );
+  // Prep unlink runs immediately (no backoff) so same-sequence repair can follow.
+  const backoffSeconds = isFindingsPrepUnlink
+    ? 0
+    : Math.min(
+        policyEntry.backoff.max_seconds,
+        policyEntry.backoff.initial_seconds * Math.pow(policyEntry.backoff.multiplier, priorClassAttempts),
+      );
   const notBefore = new Date(Date.parse(time) + backoffSeconds * 1000).toISOString();
 
   const attempt: LoopRecoveryAttempt = {
@@ -712,7 +732,7 @@ export async function startRecoveryAttempt(
       : {}),
   };
   ledger.recovery_attempts.push(attempt);
-  if (outcome === "started") {
+  if (outcome === "started" && !isFindingsPrepUnlink) {
     item.recovery_budgets_remaining[blockerClass] = budgetRemaining;
   }
 

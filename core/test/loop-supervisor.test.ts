@@ -5112,7 +5112,7 @@ function blockedReviewRecoveryItem(id: string): LoopLedger["items"][string] {
   };
 }
 
-test("regression #797: review non-convergence enters substantive repair as its first durable action", async () => {
+test("regression #797/#1060: review non-convergence preps unlink then same-sequence repair", async () => {
   const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
   const ledger = testLedger({ "100": blockedReviewRecoveryItem("100") });
   const { deps } = await setup(contract, ledger);
@@ -5123,7 +5123,18 @@ test("regression #797: review non-convergence enters substantive repair as its f
   const actions: string[] = [];
   const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async (input) => {
     actions.push(input.action);
-    return { succeeded: false, evidence: "repair attempted", error: "fixture stops after action selection" };
+    if (input.action === "unlink_engine_scratch") {
+      return {
+        succeeded: false,
+        evidence:
+          "unlink_engine_scratch: prep-complete for review-findings; removed engine scratch " +
+          "[artifacts/challenge-response-599.json] — findings still require repair_pipeline_item (trying next recipe)",
+        error:
+          "unlink_engine_scratch: prep-complete for review-findings; removed engine scratch " +
+          "[artifacts/challenge-response-599.json] — findings still require repair_pipeline_item (trying next recipe)",
+      };
+    }
+    return { succeeded: false, evidence: "repair attempted", error: "fixture stops after repair selection" };
   };
   const { token } = await acquireLock(deps, "run-1", "claude");
 
@@ -5134,10 +5145,55 @@ test("regression #797: review non-convergence enters substantive repair as its f
     "claude",
   );
 
-  assert.deepEqual(actions, ["repair_pipeline_item"]);
+  assert.deepEqual(actions, ["unlink_engine_scratch", "repair_pipeline_item"]);
   const finalLedger = await readLedger(deps, "run-1");
   assert.equal(finalLedger.recovery_attempts[0].class, "review-findings");
-  assert.equal(finalLedger.recovery_attempts[0].action, "repair_pipeline_item");
+  assert.equal(finalLedger.recovery_attempts[0].action, "unlink_engine_scratch");
+  assert.equal(finalLedger.recovery_attempts[1]?.action, "repair_pipeline_item");
+  // Prep unlink is free of findings retry budget (retry_budget: 3 → still 2 after one repair charge).
+  assert.equal(
+    finalLedger.items["100"].recovery_budgets_remaining["review-findings"],
+    2,
+    "prep must not charge budget; only repair charges one unit of 3",
+  );
+});
+
+test("regression #1060: findings prep not-applicable still same-sequence repairs without false recover", async () => {
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": blockedReviewRecoveryItem("100") });
+  const { deps } = await setup(contract, ledger);
+  const observe = blockedRecoveryObserve();
+  const actions: string[] = [];
+  const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async (input) => {
+    actions.push(input.action);
+    if (input.action === "unlink_engine_scratch") {
+      return {
+        succeeded: false,
+        evidence:
+          "unlink_engine_scratch: prep not-applicable for review-findings (no engine-scratch paths) — trying next recipe",
+        error:
+          "unlink_engine_scratch: prep not-applicable for review-findings (no engine-scratch paths) — trying next recipe",
+      };
+    }
+    return { succeeded: false, evidence: "repair attempted", error: "fixture stops" };
+  };
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  await runSupervisorCycle(
+    {
+      store: deps,
+      observe,
+      dispatchItem: async () => {
+        throw new Error("blocked");
+      },
+      executeRecovery,
+    },
+    "run-1",
+    token,
+    "claude",
+  );
+  assert.deepEqual(actions, ["unlink_engine_scratch", "repair_pipeline_item"]);
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.items["100"].state, "blocked", "unlink alone must not recover findings");
 });
 
 /** Observe fake for the coexistence-guard tests: blocked items sit mid-pipeline
