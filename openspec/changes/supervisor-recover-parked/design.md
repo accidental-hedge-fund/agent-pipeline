@@ -62,15 +62,15 @@ Pure engine entrypoint: `runRecoverParked(cfg, issueNumber, opts, deps) → Reco
 
 | Condition on structured record | Result |
 |--------------------------------|--------|
-| Key **absent** from live residual set | `override-eligible` reason `stale` or `DNR` (closed code) |
-| Key present, `severity` ∈ {`high`,`critical`} (case-insensitive) | `non-overridable` — **ignore all prose** |
-| Key present, category `security` | `non-overridable` |
-| Key present, authority / human-decision-required residual | `non-overridable` |
+| Authority / human-decision-required / missing-authority (any presence) | `non-overridable` — **before** DNR |
+| category `security` (any presence, incl. absent-at-HEAD historical) | `non-overridable` |
+| `severity` ∈ {`high`,`critical`} (incl. historical park record when absent at HEAD) | `non-overridable` — **ignore all prose** |
+| Key **absent** from live residual set **and** not protected above | `override-eligible` reason `stale` or `DNR` (closed code) |
 | Key present, severity `unknown` or unparsable | `non-overridable` (fail-closed) |
 | Key present, severity below high, not security, not authority | `override-eligible` reason `below-high` |
 | Free-text / classifier prose saying "nit" | **never consulted** |
 
-**Absent-key original record:** not required for severity to allow DNR — absence at live HEAD is sufficient for `stale`/`DNR`. Historical CRITICAL keys that disappeared are DNR-eligible; historical CRITICAL keys still present remain non-overridable.
+**Absent-key original record:** park-time structured severity/category/authority SHALL be retained when merging with the live residual. Protected-class gate runs before stale/DNR so a historical HIGH/CRITICAL/security/authority key absent from a later residual artifact is never auto-overridden. Only non-protected absent keys are DNR-eligible. Senior residual load is HEAD-bound (`useLatestIfNoHeadMatch: false`).
 
 ### D3: Deterministic engine recover before fingerprint creation or senior mutation
 

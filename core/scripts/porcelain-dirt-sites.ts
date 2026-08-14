@@ -88,6 +88,14 @@ export const PORCELAIN_DIRT_SITES: readonly PorcelainDirtSiteEntry[] = [
       "Recovery action unlink_engine_scratch; XY-aware untracked scratch only; never setBlocked (#1020 / #1028)",
   },
   {
+    site_id: "recover-parked.default_try_unlink_engine_scratch",
+    module: "scripts/recover-parked.ts",
+    disposition: "uses-shared-classifier",
+    classifier: "classifyPorcelainForScratchRecover",
+    notes:
+      "Production defaultTryUnlinkEngineScratch (#1061); same XY-aware untracked scratch recipe as unlink_engine_scratch; never setBlocked — clearBlocked only after scratch-only clean",
+  },
+  {
     site_id: "worktree-dirt",
     module: "scripts/worktree-dirt.ts",
     disposition: "uses-shared-classifier",

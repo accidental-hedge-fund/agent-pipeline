@@ -7,10 +7,15 @@ import {
   buildSupervisorOverridePayload,
   classifyParkedFinding,
   computeFingerprintId,
+  defaultTryUnlinkEngineScratch,
+  extractAuthorityKeysFromComments,
+  extractParkFindings,
   extractRecoverParkedSpent,
   formatRecoverParkedSpentComment,
   isFingerprintSpent,
+  mergeParkAndLiveFindings,
   recoverParkedExitCode,
+  reenterAdvanceAfterRecoverParked,
   runRecoverParked,
   trainShouldContinueAfterRecover,
   type RecoverParkedDeps,
@@ -20,7 +25,7 @@ import { encodeReviewArtifact } from "../scripts/stages/review-parsing.ts";
 import { lookupCommand, validateFlags, COMMAND_REGISTRY } from "../scripts/command-registry.ts";
 import { runTrain, type TrainDeps, type AdvanceWaveResult } from "../scripts/stages/train.ts";
 import { DEFAULT_CONFIG, type PipelineConfig } from "../scripts/types.ts";
-import { overrideComment } from "../scripts/review-policy.ts";
+import { humanDecisionComment, overrideComment } from "../scripts/review-policy.ts";
 
 const HEAD = "a".repeat(40);
 const HEAD2 = "b".repeat(40);
@@ -215,15 +220,36 @@ function makeHarness(state: {
 // Pure classification
 // ---------------------------------------------------------------------------
 
-test("classifyParkedFinding: stale/DNR when absent at live HEAD", () => {
+test("classifyParkedFinding: protected CRITICAL absent at HEAD remains non-overridable", () => {
   const r = classifyParkedFinding({
     key: KEY_CRIT,
     severity: "critical",
     presentAtLiveHead: false,
     prose: "still critical somehow",
   });
+  assert.equal(r.kind, "non-overridable");
+  if (r.kind === "non-overridable") assert.equal(r.cause, "critical");
+});
+
+test("classifyParkedFinding: below-high absent at live HEAD is DNR", () => {
+  const r = classifyParkedFinding({
+    key: KEY_MED,
+    severity: "medium",
+    presentAtLiveHead: false,
+  });
   assert.equal(r.kind, "override-eligible");
   if (r.kind === "override-eligible") assert.equal(r.reason, "DNR");
+});
+
+test("classifyParkedFinding: security category absent at HEAD remains non-overridable", () => {
+  const r = classifyParkedFinding({
+    key: KEY_SEC,
+    severity: "medium",
+    category: "security",
+    presentAtLiveHead: false,
+  });
+  assert.equal(r.kind, "non-overridable");
+  if (r.kind === "non-overridable") assert.equal(r.cause, "security");
 });
 
 test("classifyParkedFinding: CRITICAL non-overridable; prose ignored", () => {
@@ -879,4 +905,333 @@ test("5.12b train continues same issue when recover-parked recovers", async () =
   assert.ok(wave >= 2, "should re-advance same issue after recover");
   assert.equal(result.status.items.some((i) => i.terminal === "ready-to-deploy"), true);
   assert.ok(logs.some((l) => l.includes("continuing same issue")));
+});
+
+// ---------------------------------------------------------------------------
+// Review-1 regression fixtures (#1061)
+// ---------------------------------------------------------------------------
+
+test("R1-1: historical CRITICAL absent from live residual is not DNR-overridden", async () => {
+  // Park evidence: CRITICAL + medium. Live HEAD residual: medium only.
+  const parkBody = reviewBody({
+    sha: HEAD,
+    findings: [
+      { key: KEY_CRIT, severity: "critical", title: "crit" },
+      { key: KEY_MED, severity: "medium", title: "med" },
+    ],
+  });
+  // Newer HEAD-matched review drops CRITICAL (simulates incomplete residual /
+  // fixed-at-HEAD selection that would previously invent DNR).
+  const liveBody = reviewBody({
+    sha: HEAD,
+    findings: [{ key: KEY_MED, severity: "medium", title: "med" }],
+  });
+  const h = makeHarness({
+    labels: ["pipeline:needs-human"],
+    comments: [
+      { author: "bot", body: parkBody, createdAt: "2026-08-14T00:00:00Z" },
+      { author: "bot", body: liveBody, createdAt: "2026-08-14T01:00:00Z" },
+    ],
+  });
+  const result = await runRecoverParked(cfg(), 1061, {}, h.deps);
+  assert.equal(result.status, "still-parked");
+  assert.ok(
+    !h.overrides.some((o) => o.key === KEY_CRIT),
+    "CRITICAL must not be DNR-overridden when absent from live residual",
+  );
+  // medium may still be overridden as below-high
+  assert.ok(
+    h.overrides.every((o) => o.key !== KEY_CRIT),
+    "no CRITICAL override recorded",
+  );
+});
+
+test("R1-1b: mergeParkAndLiveFindings retains historical severity for absent keys", () => {
+  const merged = mergeParkAndLiveFindings({
+    parkFindings: [
+      {
+        key: KEY_CRIT,
+        severity: "critical",
+        title: "c",
+        surface: "a.ts|security",
+        category: "security",
+        presentAtLiveHead: false,
+      },
+    ],
+    liveFindings: [],
+  });
+  assert.equal(merged.length, 1);
+  assert.equal(merged[0]!.severity, "critical");
+  assert.equal(merged[0]!.category, "security");
+  assert.equal(merged[0]!.presentAtLiveHead, false);
+  const cls = classifyParkedFinding({
+    key: merged[0]!.key,
+    severity: merged[0]!.severity,
+    category: merged[0]!.category,
+    presentAtLiveHead: false,
+  });
+  assert.equal(cls.kind, "non-overridable");
+});
+
+test("R1-2: human-authority residual is never auto-overridden", async () => {
+  const KEY_AUTH = "aabbcc07";
+  const review = reviewBody({
+    sha: HEAD,
+    findings: [
+      {
+        key: KEY_AUTH,
+        severity: "medium",
+        title: "needs product call",
+        surface: "plan.md|human-decision-required",
+      },
+    ],
+  });
+  const decision = humanDecisionComment({
+    category: "product-decision",
+    key: KEY_AUTH,
+    fingerprint: "1234567890abcdef",
+    reviewedSha: HEAD,
+    request: "Which API shape should ship?",
+    stage: "needs-human",
+    timestamp: "2026-08-14T16:51:26Z",
+  });
+  const h = makeHarness({
+    labels: ["pipeline:needs-human"],
+    comments: [
+      { author: "bot", body: review, createdAt: "2026-08-14T00:00:00Z" },
+      { author: "bot", body: decision, createdAt: "2026-08-14T00:01:00Z" },
+    ],
+  });
+  const result = await runRecoverParked(cfg(), 1061, {}, h.deps);
+  assert.equal(result.status, "still-parked");
+  assert.equal(h.overrides.length, 0);
+  assert.equal(h.reentries, 0);
+});
+
+test("R1-2b: extractAuthorityKeysFromComments detects product-decision keys", () => {
+  const body = humanDecisionComment({
+    category: "authority",
+    key: KEY_MED,
+    fingerprint: "fedcba9876543210",
+    reviewedSha: HEAD,
+    request: "Who owns this surface?",
+    stage: "needs-human",
+    timestamp: "2026-08-14T16:51:26Z",
+  });
+  const { keys, wholeParkAuthority } = extractAuthorityKeysFromComments([{ body }]);
+  assert.equal(keys.has(KEY_MED), true);
+  assert.equal(wholeParkAuthority, true);
+});
+
+test("R1-2c: authority category alone refuses override without comment", async () => {
+  const KEY_AUTH = "aabbcc08";
+  const h = makeHarness({
+    labels: ["pipeline:needs-human"],
+    comments: [
+      {
+        author: "bot",
+        body: reviewBody({
+          sha: HEAD,
+          findings: [
+            {
+              key: KEY_AUTH,
+              severity: "low",
+              title: "missing authority",
+              surface: "cfg.yml|missing-authority",
+            },
+          ],
+        }),
+        createdAt: "2026-08-14T00:00:00Z",
+      },
+    ],
+  });
+  const result = await runRecoverParked(cfg(), 1061, {}, h.deps);
+  assert.equal(result.status, "still-parked");
+  assert.equal(h.overrides.length, 0);
+});
+
+test("R1-3: production defaultTryUnlinkEngineScratch clears scratch-only park", async () => {
+  let labels = ["blocked", "pipeline:pre-merge"];
+  let statusCalls = 0;
+  const result = await defaultTryUnlinkEngineScratch(
+    cfg(),
+    1061,
+    {
+      number: 1061,
+      type: "issue",
+      title: "t",
+      body: "",
+      state: "open",
+      url: "u",
+      labels,
+      comments: [],
+    },
+    {
+      getOnDiskForIssue: async () => ({
+        path: "/tmp/managed-wt-1061",
+        slug: "pipeline-1061",
+      }),
+      gitInWorktree: async (_wt, args) => {
+        if (args[0] === "status") {
+          statusCalls++;
+          // First status: scratch only; after clean: empty.
+          if (statusCalls === 1) {
+            return { code: 0, stdout: "?? tasks/todo.md\n", stderr: "" };
+          }
+          return { code: 0, stdout: "", stderr: "" };
+        }
+        if (args[0] === "clean") {
+          assert.equal(args.includes("tasks/todo.md"), true);
+          return { code: 0, stdout: "", stderr: "" };
+        }
+        return { code: 0, stdout: "", stderr: "" };
+      },
+      clearBlocked: async () => {
+        labels = labels.filter((l) => l !== "blocked");
+      },
+      getIssueDetail: async () => ({
+        number: 1061,
+        type: "issue" as const,
+        title: "t",
+        body: "",
+        state: "open" as const,
+        url: "u",
+        labels,
+        comments: [],
+      }),
+    },
+  );
+  assert.equal(result.kind, "cleared");
+  assert.ok(!labels.includes("blocked"));
+});
+
+test("R1-3b: runRecoverParked uses production scratch default when dep omitted", async () => {
+  // Harness always injects tryUnlinkEngineScratch; prove default path by
+  // deleting the inject and providing scratchUnlinkDeps instead.
+  const h = makeHarness({
+    labels: ["blocked", "pipeline:pre-merge"],
+    comments: [
+      {
+        author: "bot",
+        body: reviewBody({
+          sha: HEAD,
+          findings: [{ key: KEY_HIGH, severity: "high", title: "h" }],
+        }),
+        createdAt: "2026-08-14T00:00:00Z",
+      },
+    ],
+  });
+  delete (h.deps as { tryUnlinkEngineScratch?: unknown }).tryUnlinkEngineScratch;
+  let statusCalls = 0;
+  h.deps.scratchUnlinkDeps = {
+    getOnDiskForIssue: async () => ({ path: "/tmp/wt-1061", slug: "s" }),
+    gitInWorktree: async (_wt, args) => {
+      if (args[0] === "status") {
+        statusCalls++;
+        if (statusCalls === 1) return { code: 0, stdout: "?? tasks/x.md\n", stderr: "" };
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      if (args[0] === "clean") return { code: 0, stdout: "", stderr: "" };
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    clearBlocked: async () => {
+      h.setLabels(["pipeline:pre-merge"]);
+    },
+    getIssueDetail: async () =>
+      h.deps.getIssueDetail(cfg(), 1061),
+  };
+  const result = await runRecoverParked(cfg(), 1061, { skipReentry: true }, h.deps);
+  assert.equal(result.status, "deterministic-cleared");
+  assert.equal(h.overrides.length, 0);
+  assert.ok(!h.posts.some((p) => p.includes("pipeline-recover-parked-spent")));
+});
+
+test("R1-4: re-entry runs only after issue-run lock release", async () => {
+  let lockHeld = false;
+  let reenterSawLock = false;
+  const h = makeHarness({
+    labels: ["pipeline:needs-human", "blocked"],
+    comments: [
+      {
+        author: "bot",
+        body: reviewBody({
+          sha: HEAD,
+          findings: [{ key: KEY_MED, severity: "medium", title: "m" }],
+        }),
+        createdAt: "2026-08-14T00:00:00Z",
+      },
+    ],
+  });
+  h.deps.withIssueLock = async (_d, _i, fn) => {
+    lockHeld = true;
+    try {
+      return await fn();
+    } finally {
+      lockHeld = false;
+    }
+  };
+  h.deps.reenterAdvance = async () => {
+    reenterSawLock = lockHeld;
+    h.setLabels(["pipeline:review-2"]);
+  };
+  const result = await runRecoverParked(cfg(), 1061, {}, h.deps);
+  assert.equal(result.status, "recovered");
+  assert.equal(result.reentered, true);
+  assert.equal(reenterSawLock, false, "reenter must not run while lock is held");
+});
+
+test("R1-5: shared reenterAdvanceAfterRecoverParked clears needs-human", async () => {
+  let labels = ["pipeline:needs-human", "blocked"];
+  let advanced = false;
+  let transitioned: { from: string; to: string } | null = null;
+  await reenterAdvanceAfterRecoverParked(
+    cfg(),
+    1061,
+    {
+      getIssueDetail: async () => ({
+        number: 1061,
+        type: "issue",
+        title: "t",
+        body: "",
+        state: "open",
+        url: "u",
+        labels,
+        comments: [],
+      }),
+      silentTransition: async (_c, _i, from, to) => {
+        transitioned = { from, to };
+        labels = labels
+          .filter((l) => l !== "pipeline:needs-human")
+          .concat([`pipeline:${to}`]);
+      },
+      runAdvance: async () => {
+        advanced = true;
+      },
+    },
+  );
+  assert.deepEqual(transitioned, { from: "needs-human", to: "review-2" });
+  assert.equal(advanced, true);
+  assert.ok(labels.includes("pipeline:review-2"));
+  assert.ok(!labels.includes("pipeline:needs-human"));
+});
+
+test("R1-5b: extractParkFindings retains historical CRITICAL after newer residual drops it", () => {
+  const older = reviewBody({
+    sha: HEAD,
+    findings: [
+      { key: KEY_CRIT, severity: "critical", title: "c" },
+      { key: KEY_MED, severity: "medium", title: "m" },
+    ],
+  });
+  const newer = reviewBody({
+    sha: HEAD,
+    findings: [{ key: KEY_MED, severity: "medium", title: "m" }],
+  });
+  const park = extractParkFindings([
+    { body: older },
+    { body: newer },
+  ]);
+  const crit = park.find((f) => f.key === KEY_CRIT);
+  assert.ok(crit, "historical CRITICAL must remain in park findings");
+  assert.equal(crit!.severity, "critical");
 });

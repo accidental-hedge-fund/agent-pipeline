@@ -68,9 +68,17 @@ The command SHALL treat a finding as **override-eligible** only when it is not n
 #### Scenario: Key absent at live HEAD is stale/DNR eligible
 
 - **WHEN** a parked blocking override-key is no longer present in the residual set at live PR HEAD
+- **AND** the key's structured park-time record is not HIGH, CRITICAL, security-category, or human-authority
 - **AND** the fingerprint budget remains
 - **THEN** `recover-parked` MAY disposition that key as stale or DNR through the audited override path
 - **AND** SHALL cite the finding key and a one-line stale/DNR evidence reason
+
+#### Scenario: Historical protected key absent at live HEAD remains non-overridable
+
+- **WHEN** a parked blocking key had structured severity HIGH or CRITICAL, or category security, or human-authority
+- **AND** that key is absent from a later live residual artifact at HEAD
+- **THEN** `recover-parked` SHALL NOT record a stale/DNR override for that key
+- **AND** SHALL keep the park for human disposition (protected-class gate before DNR)
 
 ---
 

@@ -3191,7 +3191,10 @@ export async function runTrainCommand(
       advanceWave: (issues) => wave(issues, opts, baseDeps.getIssue),
       // #1061: one supervisor recover-parked pass on park; never invent override in train.
       recoverParked: async (issue) => {
-        const { runRecoverParked } = await import("./recover-parked.ts");
+        const {
+          runRecoverParked,
+          reenterAdvanceAfterRecoverParked,
+        } = await import("./recover-parked.ts");
         const { runAdvance: runAdvanceForRecover } = await import("./pipeline-run.ts");
         const result = await runRecoverParked(
           trainCfg,
@@ -3204,9 +3207,21 @@ export async function runTrainCommand(
             postComment,
             clearBlocked,
             getGhActor,
+            // Default tryUnlinkEngineScratch = production defaultTryUnlinkEngineScratch.
             reenterAdvance: async (c, n, reOpts) => {
               void reOpts;
-              await runAdvanceForRecover(c, n, toAdvanceOpts(opts));
+              // Shared helper: clear needs-human → review-2, then advance.
+              // Invoked after recover-parked releases the issue-run lock.
+              await reenterAdvanceAfterRecoverParked(
+                c,
+                n,
+                {
+                  getIssueDetail,
+                  silentTransition,
+                  runAdvance: runAdvanceForRecover,
+                },
+                toAdvanceOpts(opts),
+              );
             },
             log: (m) => console.error(m),
           },
@@ -5876,7 +5891,11 @@ async function main(): Promise<void> {
       console.error(`pipeline: ${e.message}`);
       process.exit(1);
     }
-    const { runRecoverParked, recoverParkedExitCode } = await import("./recover-parked.ts");
+    const {
+      runRecoverParked,
+      recoverParkedExitCode,
+      reenterAdvanceAfterRecoverParked,
+    } = await import("./recover-parked.ts");
     const { runAdvance: runAdvanceForRecover } = await import("./pipeline-run.ts");
     const result = await runRecoverParked(
       cfg,
@@ -5891,17 +5910,21 @@ async function main(): Promise<void> {
         postComment,
         clearBlocked,
         getGhActor,
+        // Default tryUnlinkEngineScratch = production defaultTryUnlinkEngineScratch.
         reenterAdvance: async (c, issue, reOpts) => {
           // skipRecoverParked is a recover-parked internal guard; advance does not
-          // re-invoke recover-parked. Re-enter same-issue advance without backlog restart.
+          // re-invoke recover-parked. Called after issue-run lock release.
           void reOpts;
-          const d = await getIssueDetail(c, issue);
-          if (pickStage(d.labels) === "needs-human") {
-            // Resume at review-2 by default when ceiling round is unknown;
-            // partitionFindings will re-apply remaining overrides/findings.
-            await silentTransition(c, issue, "needs-human", "review-2");
-          }
-          await runAdvanceForRecover(c, issue, toAdvanceOpts(opts));
+          await reenterAdvanceAfterRecoverParked(
+            c,
+            issue,
+            {
+              getIssueDetail,
+              silentTransition,
+              runAdvance: runAdvanceForRecover,
+            },
+            toAdvanceOpts(opts),
+          );
         },
         log: (m) => console.log(m),
       },

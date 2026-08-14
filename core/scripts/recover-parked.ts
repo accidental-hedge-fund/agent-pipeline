@@ -18,6 +18,7 @@ import {
   isBlocked,
   pickStage,
   postComment,
+  silentTransition,
   type IssueDetail,
 } from "./gh.ts";
 import { withLock } from "./lock.ts";
@@ -53,6 +54,8 @@ import {
   LABEL_PREFIX,
   type PipelineConfig,
 } from "./types.ts";
+import { getOnDiskForIssue, gitInWorktree } from "./worktree.ts";
+import { classifyPorcelainForScratchRecover } from "./worktree-dirt.ts";
 
 // ---------------------------------------------------------------------------
 // Result contract
@@ -130,19 +133,30 @@ export interface StructuredParkedFinding {
 /**
  * Classify one residual finding from structured record fields only.
  * Prose is ignored. Severity/category case-insensitive.
+ *
+ * Protected-class gate (authority / security / HIGH / CRITICAL) runs **before**
+ * stale/DNR eligibility so a historical protected key absent from a later
+ * residual artifact is never auto-overridden as DNR (#1061 review).
  */
 export function classifyParkedFinding(f: StructuredParkedFinding): ParkedFindingClass {
-  // Key absent at live HEAD → stale/DNR (historical severity does not matter).
-  if (!f.presentAtLiveHead) {
-    return { kind: "override-eligible", reason: "DNR" };
-  }
-
+  // Authority first — whole-park or per-key human-decision / missing-authority.
   if (f.authority) {
     return { kind: "non-overridable", cause: "authority" };
   }
 
   const sev = (f.severity ?? "").trim().toLowerCase();
   const cat = (f.category ?? "").trim().toLowerCase();
+
+  // Category-encoded authority (human-decision-required / missing-authority /
+  // product-decision / authority). Fail closed for these protected classes.
+  if (
+    cat === "human-decision-required" ||
+    cat === "missing-authority" ||
+    cat === "product-decision" ||
+    cat === "authority"
+  ) {
+    return { kind: "non-overridable", cause: "authority" };
+  }
 
   if (cat === "security") {
     return { kind: "non-overridable", cause: "security" };
@@ -153,6 +167,12 @@ export function classifyParkedFinding(f: StructuredParkedFinding): ParkedFinding
   if (sev === "high") {
     return { kind: "non-overridable", cause: "high" };
   }
+
+  // Only non-protected keys may use stale/DNR when absent at live HEAD.
+  if (!f.presentAtLiveHead) {
+    return { kind: "override-eligible", reason: "DNR" };
+  }
+
   if (!sev || sev === "unknown") {
     return { kind: "non-overridable", cause: "unknown-severity" };
   }
@@ -320,6 +340,13 @@ export interface ResidualFindingRecord {
   surface: string | null;
   category: string | null;
   presentAtLiveHead: boolean;
+  /**
+   * Structured human-authority residual for this key (human-decision-required /
+   * missing-authority / product-decision / authority). Absent/ambiguous signals
+   * that cannot be proven non-authority remain false only when no authority
+   * marker applies; explicit authority markers set true.
+   */
+  authority?: boolean;
 }
 
 function categoryFromSurface(surface: string | null | undefined): string | null {
@@ -328,6 +355,84 @@ function categoryFromSurface(surface: string | null | undefined): string | null 
   if (pipe < 0) return null;
   const cat = surface.slice(pipe + 1).trim();
   return cat || null;
+}
+
+/** Categories that encode human-authority / missing-authority residuals. */
+export function isAuthorityCategory(category: string | null | undefined): boolean {
+  const cat = (category ?? "").trim().toLowerCase();
+  return (
+    cat === "human-decision-required" ||
+    cat === "missing-authority" ||
+    cat === "product-decision" ||
+    cat === "authority"
+  );
+}
+
+const HUMAN_DECISION_SENTINEL_RE =
+  /<!--\s*pipeline-human-decision:\s*([0-9a-f]{8})\s+[0-9a-f]{16}\s+[0-9a-fA-F]{40}\s*-->/gi;
+
+const HUMAN_DECISION_CATEGORY_LINE_RE =
+  /\*\*Category\*\*:\s*(product-decision|authority|external-dependency)/i;
+
+/**
+ * Extract per-key human-authority signals from durable needs-human-decision
+ * evidence comments. product-decision and authority are human-authority;
+ * external-dependency is wait/retry (not auto-override, not human authority
+ * override class for senior path — still non-overridable via authority flag
+ * when the comment names a residual key so the senior path does not waive it).
+ */
+export function extractAuthorityKeysFromComments(
+  comments: readonly { body: string }[],
+): { keys: Set<string>; wholeParkAuthority: boolean } {
+  const keys = new Set<string>();
+  let wholeParkAuthority = false;
+  for (const c of comments) {
+    const body = c.body ?? "";
+    if (
+      body.includes("## Pipeline: Human decision required") ||
+      body.includes("pipeline-human-decision:") ||
+      body.includes("pipeline-needs-human-decision:")
+    ) {
+      // Any durable human-decision evidence makes whole-park authority refuse
+      // senior override of residual keys that lack a clearer non-authority path.
+      // Per-key keys are collected from the sentinel when present.
+      const catLine = body.match(HUMAN_DECISION_CATEGORY_LINE_RE);
+      const cat = catLine?.[1]?.toLowerCase() ?? null;
+      // product-decision + authority are human authority; external-dependency
+      // still blocks auto-override of the named key (fail closed for senior).
+      const marksAuthority =
+        cat === null ||
+        cat === "product-decision" ||
+        cat === "authority" ||
+        cat === "external-dependency";
+      if (marksAuthority) {
+        wholeParkAuthority = wholeParkAuthority || cat === "product-decision" || cat === "authority" || cat === null;
+        HUMAN_DECISION_SENTINEL_RE.lastIndex = 0;
+        let m: RegExpExecArray | null;
+        while ((m = HUMAN_DECISION_SENTINEL_RE.exec(body)) !== null) {
+          keys.add(m[1]!.toLowerCase());
+        }
+        HUMAN_DECISION_SENTINEL_RE.lastIndex = 0;
+        // Also parse harness declaration form when present on comments.
+        const declRe =
+          /<!--\s*pipeline-needs-human-decision:\s*(product-decision|authority|external-dependency)\s+([0-9a-f]{8})\s+/gi;
+        let dm: RegExpExecArray | null;
+        while ((dm = declRe.exec(body)) !== null) {
+          const dcat = dm[1]!.toLowerCase();
+          keys.add(dm[2]!.toLowerCase());
+          if (dcat === "product-decision" || dcat === "authority") {
+            wholeParkAuthority = true;
+          }
+        }
+      }
+    }
+    // Blocker-kind attestation: human-decision-required is whole-park authority.
+    const blocker = body.match(
+      /<!--\s*pipeline-blocker-kind:\s*(human-decision-required)\s*-->/i,
+    );
+    if (blocker) wholeParkAuthority = true;
+  }
+  return { keys, wholeParkAuthority };
 }
 
 function isReviewishBody(body: string): boolean {
@@ -342,39 +447,63 @@ function isReviewishBody(body: string): boolean {
  * Load residual blocking findings from issue comments against live HEAD.
  * Prefers ReviewArtifact.blockingFindings; falls back to blocking-keys marker
  * with severity "unknown" (fail-closed for override).
+ *
+ * Senior path MUST pass `useLatestIfNoHeadMatch: false` so DNR is never
+ * invented from a SHA-mismatched fallback residual.
  */
 export function loadResidualFindings(args: {
   comments: readonly { body: string; author?: string }[];
   liveHeadSha: string;
-  /** When true, only use the latest review comment (any sha) for key set. */
+  /** When true, fall back to newest review of any SHA. Senior path: false. */
   useLatestIfNoHeadMatch?: boolean;
+  /** Keys marked human-authority via durable decision evidence. */
+  authorityKeys?: ReadonlySet<string>;
+  /** Whole-park human-authority refuse (all residual keys). */
+  wholeParkAuthority?: boolean;
 }): {
   findings: ResidualFindingRecord[];
   keys: string[];
   matchedReviewedSha: string | null;
   source: "artifact" | "blocking-keys" | "none";
+  /** True when a review comment's reviewedSha matched live HEAD. */
+  headBound: boolean;
 } {
+  const authorityKeys = args.authorityKeys ?? new Set<string>();
+  const wholeParkAuthority = args.wholeParkAuthority === true;
+  const markAuthority = (key: string, category: string | null): boolean =>
+    wholeParkAuthority ||
+    authorityKeys.has(key) ||
+    isAuthorityCategory(category);
+
   const reviewComments = args.comments.filter((c) => isReviewishBody(c.body));
   // Prefer comments whose artifact/sentinel reviewed-sha equals live HEAD.
   let chosen: { body: string; artifact: ReviewArtifact | null } | null = null;
+  let headBound = false;
   for (let i = reviewComments.length - 1; i >= 0; i--) {
     const body = reviewComments[i]!.body;
     const artifact = extractReviewArtifact(body);
     const sha = artifact?.reviewedSha ?? null;
     if (sha && sha.toLowerCase() === args.liveHeadSha.toLowerCase()) {
       chosen = { body, artifact };
+      headBound = true;
       break;
     }
   }
-  if (!chosen && args.useLatestIfNoHeadMatch !== false) {
-    // Fall back to newest review comment for park residual set.
+  if (!chosen && args.useLatestIfNoHeadMatch === true) {
+    // Explicit opt-in fallback only (not used by senior recover-parked path).
     const last = reviewComments[reviewComments.length - 1];
     if (last) {
       chosen = { body: last.body, artifact: extractReviewArtifact(last.body) };
     }
   }
   if (!chosen) {
-    return { findings: [], keys: [], matchedReviewedSha: null, source: "none" };
+    return {
+      findings: [],
+      keys: [],
+      matchedReviewedSha: null,
+      source: "none",
+      headBound: false,
+    };
   }
 
   const overrides = extractOverrides([...args.comments]);
@@ -387,13 +516,15 @@ export function loadResidualFindings(args: {
       if (!isValidFindingKey(key)) continue;
       if (overrides.has(key)) continue; // already dispositioned
       const surface = bf.surface ?? surfaces.get(key) ?? null;
+      const category = categoryFromSurface(surface);
       findings.push({
         key,
         severity: bf.severity,
         title: bf.title,
         surface,
-        category: categoryFromSurface(surface),
+        category,
         presentAtLiveHead: true,
+        authority: markAuthority(key, category),
       });
     }
     // Also include parked keys from artifact.blockingKeys that disappeared from
@@ -404,13 +535,15 @@ export function loadResidualFindings(args: {
       if (!isValidFindingKey(key) || overrides.has(key) || keySet.has(key)) continue;
       // Key listed as blocking but no finding entry → present unknown.
       const surface = surfaces.get(key) ?? null;
+      const category = categoryFromSurface(surface);
       findings.push({
         key,
         severity: "unknown",
         title: "",
         surface,
-        category: categoryFromSurface(surface),
+        category,
         presentAtLiveHead: true,
+        authority: markAuthority(key, category),
       });
     }
     return {
@@ -418,6 +551,7 @@ export function loadResidualFindings(args: {
       keys: canonicalKeys(findings.map((f) => f.key)),
       matchedReviewedSha: chosen.artifact.reviewedSha,
       source: "artifact",
+      headBound,
     };
   }
 
@@ -428,13 +562,15 @@ export function loadResidualFindings(args: {
     const key = k.toLowerCase();
     if (overrides.has(key)) continue;
     const surface = surfaces.get(key) ?? null;
+    const category = categoryFromSurface(surface);
     findings.push({
       key,
       severity: "unknown",
       title: "",
       surface,
-      category: categoryFromSurface(surface),
+      category,
       presentAtLiveHead: true,
+      authority: markAuthority(key, category),
     });
   }
   return {
@@ -442,33 +578,70 @@ export function loadResidualFindings(args: {
     keys: canonicalKeys(findings.map((f) => f.key)),
     matchedReviewedSha: null,
     source: findings.length > 0 ? "blocking-keys" : "none",
+    headBound,
   };
 }
 
 /**
- * Park residual keys: keys that were blocking at park (from latest review
- * evidence) minus active overrides. For DNR detection, keys in the park set
- * but absent from live residual are eligible as DNR/stale.
+ * Merge park-time structured findings with the live residual set.
+ * Keys present only at park retain historical severity/category/authority and
+ * are marked presentAtLiveHead=false (DNR candidate only if not protected).
  */
 export function mergeParkAndLiveFindings(args: {
-  parkKeys: readonly string[];
+  parkKeys?: readonly string[];
+  /** Preferred: structured park-time records (retains severity/category). */
+  parkFindings?: readonly ResidualFindingRecord[];
   liveFindings: ResidualFindingRecord[];
 }): ResidualFindingRecord[] {
-  const liveByKey = new Map(args.liveFindings.map((f) => [f.key, f]));
-  const out: ResidualFindingRecord[] = [];
-  const seen = new Set<string>();
-  for (const k of canonicalKeys(args.parkKeys)) {
-    const live = liveByKey.get(k);
-    if (live) {
-      out.push(live);
-    } else {
-      out.push({
-        key: k,
+  const parkByKey = new Map<string, ResidualFindingRecord>();
+  if (args.parkFindings) {
+    for (const f of args.parkFindings) {
+      parkByKey.set(f.key, f);
+    }
+  }
+  for (const k of args.parkKeys ?? []) {
+    const key = k.toLowerCase();
+    if (!parkByKey.has(key)) {
+      parkByKey.set(key, {
+        key,
         severity: "unknown",
         title: "",
         surface: null,
         category: null,
         presentAtLiveHead: false,
+        authority: false,
+      });
+    }
+  }
+  const liveByKey = new Map(args.liveFindings.map((f) => [f.key, f]));
+  const out: ResidualFindingRecord[] = [];
+  const seen = new Set<string>();
+  for (const k of canonicalKeys([...parkByKey.keys()])) {
+    const live = liveByKey.get(k);
+    const park = parkByKey.get(k)!;
+    if (live) {
+      // Live wins for presence; preserve authority if either side marks it.
+      out.push({
+        ...live,
+        authority: live.authority === true || park.authority === true,
+        // Prefer non-unknown severity when live is sparse but park had structure.
+        severity:
+          live.severity && live.severity !== "unknown"
+            ? live.severity
+            : park.severity || live.severity,
+        category: live.category ?? park.category,
+      });
+    } else {
+      // Retain historical structured severity/category/authority — never wipe
+      // to unknown when the park record had structure (protected-class gate).
+      out.push({
+        key: k,
+        severity: park.severity || "unknown",
+        title: park.title || "",
+        surface: park.surface,
+        category: park.category,
+        presentAtLiveHead: false,
+        authority: park.authority === true || isAuthorityCategory(park.category),
       });
     }
     seen.add(k);
@@ -479,21 +652,95 @@ export function mergeParkAndLiveFindings(args: {
   return out;
 }
 
-/** Extract park key set from the newest review-ish comment (any HEAD). */
-export function extractParkKeySet(
+/**
+ * Extract structured park findings from review-ish comments.
+ * Newest structured record per key wins; scans all review comments so keys
+ * that later disappeared still retain historical severity/category.
+ */
+export function extractParkFindings(
   comments: readonly { body: string }[],
-): string[] {
-  for (let i = comments.length - 1; i >= 0; i--) {
+  opts?: {
+    authorityKeys?: ReadonlySet<string>;
+    wholeParkAuthority?: boolean;
+  },
+): ResidualFindingRecord[] {
+  const overrides = extractOverrides([...comments]);
+  const authorityKeys = opts?.authorityKeys ?? new Set<string>();
+  const wholeParkAuthority = opts?.wholeParkAuthority === true;
+  const byKey = new Map<string, ResidualFindingRecord>();
+
+  for (let i = 0; i < comments.length; i++) {
     const body = comments[i]!.body;
     if (!isReviewishBody(body)) continue;
     const art = extractReviewArtifact(body);
-    if (art?.blockingKeys?.length) {
-      return canonicalKeys(art.blockingKeys);
+    const surfaces = extractBlockingSurfacesFromComment(body);
+    if (art?.blockingFindings && art.blockingFindings.length > 0) {
+      for (const bf of art.blockingFindings) {
+        const key = bf.key.toLowerCase();
+        if (!isValidFindingKey(key) || overrides.has(key)) continue;
+        const surface = bf.surface ?? surfaces.get(key) ?? null;
+        const category = categoryFromSurface(surface);
+        byKey.set(key, {
+          key,
+          severity: bf.severity,
+          title: bf.title,
+          surface,
+          category,
+          presentAtLiveHead: false,
+          authority:
+            wholeParkAuthority ||
+            authorityKeys.has(key) ||
+            isAuthorityCategory(category),
+        });
+      }
+      for (const k of art.blockingKeys ?? []) {
+        const key = k.toLowerCase();
+        if (!isValidFindingKey(key) || overrides.has(key) || byKey.has(key)) continue;
+        const surface = surfaces.get(key) ?? null;
+        const category = categoryFromSurface(surface);
+        byKey.set(key, {
+          key,
+          severity: "unknown",
+          title: "",
+          surface,
+          category,
+          presentAtLiveHead: false,
+          authority:
+            wholeParkAuthority ||
+            authorityKeys.has(key) ||
+            isAuthorityCategory(category),
+        });
+      }
+      continue;
     }
-    const keys = extractBlockingKeysFromComment(body);
-    if (keys.size > 0) return canonicalKeys([...keys]);
+    const markerKeys = extractBlockingKeysFromComment(body);
+    for (const k of markerKeys) {
+      const key = k.toLowerCase();
+      if (overrides.has(key) || byKey.has(key)) continue;
+      const surface = surfaces.get(key) ?? null;
+      const category = categoryFromSurface(surface);
+      byKey.set(key, {
+        key,
+        severity: "unknown",
+        title: "",
+        surface,
+        category,
+        presentAtLiveHead: false,
+        authority:
+          wholeParkAuthority ||
+          authorityKeys.has(key) ||
+          isAuthorityCategory(category),
+      });
+    }
   }
-  return [];
+  return [...byKey.values()];
+}
+
+/** Extract park key set from review-ish comments (any HEAD). */
+export function extractParkKeySet(
+  comments: readonly { body: string }[],
+): string[] {
+  return canonicalKeys(extractParkFindings(comments).map((f) => f.key));
 }
 
 // ---------------------------------------------------------------------------
@@ -570,7 +817,8 @@ export interface RecoverParkedDeps {
   ) => Promise<StaleBlockedResumeResult>;
   /**
    * Engine-scratch unlink. Returns cleared when park labels no longer apply.
-   * Default: no-op keep (production can inject recovery path).
+   * Default production path: {@link defaultTryUnlinkEngineScratch}. Tests inject
+   * a no-op / fake; production CLI/train may omit this dep to use the default.
    */
   tryUnlinkEngineScratch?: (
     cfg: PipelineConfig,
@@ -600,6 +848,7 @@ export interface RecoverParkedDeps {
   }) => Promise<FixRoundResult>;
   /**
    * Re-enter same-issue advance/single. Receives skipRecoverParked: true.
+   * Invoked **after** the issue-run lock is released (never while held).
    */
   reenterAdvance?: (
     cfg: PipelineConfig,
@@ -609,6 +858,171 @@ export interface RecoverParkedDeps {
   log?: (msg: string) => void;
   /** Stale-blocked resume sub-deps (tests). */
   staleBlockedDeps?: StaleBlockedResumeDeps;
+  /** Injectable seams for default scratch unlink (tests). */
+  scratchUnlinkDeps?: DefaultScratchUnlinkDeps;
+}
+
+/** Injectable seams for the production engine-scratch unlink default. */
+export interface DefaultScratchUnlinkDeps {
+  getOnDiskForIssue?: (
+    cfg: PipelineConfig,
+    issue: number,
+  ) => Promise<{ path: string; slug: string } | null>;
+  gitInWorktree?: (
+    wtPath: string,
+    args: string[],
+    opts?: { ignoreFailure?: boolean },
+  ) => Promise<{ code: number; stdout: string; stderr: string }>;
+  clearBlocked?: (cfg: PipelineConfig, issue: number) => Promise<void>;
+  getIssueDetail?: (cfg: PipelineConfig, issue: number) => Promise<IssueDetail>;
+}
+
+/**
+ * Production default for engine-scratch deterministic recover (#1020 / #1061).
+ *
+ * Safety scope: destructive `git clean -fd -- <path>` is limited to
+ * **untracked engine-scratch paths inside the managed worktree root** returned
+ * by `getOnDiskForIssue` for this issue only — never the primary checkout or
+ * arbitrary paths.
+ */
+export async function defaultTryUnlinkEngineScratch(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  _detail: IssueDetail,
+  scratchDeps: DefaultScratchUnlinkDeps = {},
+): Promise<DeterministicRecoverResult> {
+  const getWt = scratchDeps.getOnDiskForIssue ?? getOnDiskForIssue;
+  const git = scratchDeps.gitInWorktree ?? gitInWorktree;
+  const clear = scratchDeps.clearBlocked ?? clearBlocked;
+  const getDetail = scratchDeps.getIssueDetail ?? getIssueDetail;
+
+  const wt = await getWt(cfg, issueNumber);
+  if (!wt) {
+    return { kind: "no-op", reason: "no managed worktree for scratch unlink" };
+  }
+  // Managed worktree root only — all clean ops are relative to wt.path.
+  const managedRoot = wt.path;
+  const extraGlobs = cfg.test_gate?.non_product_dirty_globs ?? [];
+  const status = await git(
+    managedRoot,
+    ["status", "--porcelain", "--untracked-files=all"],
+    { ignoreFailure: true },
+  );
+  if (status.code !== 0) {
+    return {
+      kind: "failed",
+      reason: `scratch unlink: git status failed (exit ${status.code})`,
+    };
+  }
+  const classified = classifyPorcelainForScratchRecover(status.stdout, extraGlobs);
+  if (classified.product.length > 0) {
+    return {
+      kind: "keep",
+      reason: `scratch unlink: product dirt present (${classified.product.slice(0, 3).join(", ")})`,
+    };
+  }
+  if (classified.untrackedScratch.length === 0) {
+    return {
+      kind: "no-op",
+      reason: "scratch unlink: no current engine-scratch paths",
+    };
+  }
+  const unlinked: string[] = [];
+  for (const scratchPath of classified.untrackedScratch) {
+    // Path is worktree-relative from porcelain; clean scoped to managed root.
+    const clean = await git(
+      managedRoot,
+      ["clean", "-fd", "--", scratchPath],
+      { ignoreFailure: true },
+    );
+    if (clean.code === 0) unlinked.push(scratchPath);
+  }
+  const afterStatus = await git(
+    managedRoot,
+    ["status", "--porcelain", "--untracked-files=all"],
+    { ignoreFailure: true },
+  );
+  if (afterStatus.code !== 0) {
+    return { kind: "failed", reason: "scratch unlink: post-clean status failed" };
+  }
+  const after = classifyPorcelainForScratchRecover(afterStatus.stdout, extraGlobs);
+  if (after.product.length > 0) {
+    return {
+      kind: "failed",
+      reason: `scratch unlink: product dirt after clean (${after.product.slice(0, 3).join(", ")})`,
+    };
+  }
+  if (after.untrackedScratch.length > 0) {
+    return {
+      kind: "failed",
+      reason: `scratch unlink: scratch remains (${after.untrackedScratch.join(", ")})`,
+    };
+  }
+  let before: IssueDetail;
+  try {
+    before = await getDetail(cfg, issueNumber);
+  } catch (err) {
+    return {
+      kind: "failed",
+      reason: `scratch unlink: cannot re-read issue: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+  if (before.labels.includes(BLOCKED_LABEL) || before.labels.includes("blocked")) {
+    try {
+      await clear(cfg, issueNumber);
+    } catch (err) {
+      return {
+        kind: "failed",
+        reason: `scratch unlink: clearBlocked failed: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+  }
+  // Re-check: if still parked (e.g. needs-human remains), caller continues senior path.
+  const afterDetail = await getDetail(cfg, issueNumber).catch(() => before);
+  if (!isParkedForRecover(afterDetail.labels)) {
+    return {
+      kind: "cleared",
+      reason: `unlinked engine scratch [${unlinked.join(", ")}] and park labels cleared`,
+    };
+  }
+  // Scratch removed but park labels remain (e.g. needs-human) — not a full clear.
+  return {
+    kind: "keep",
+    reason: `unlinked engine scratch [${unlinked.join(", ")}] but park labels remain`,
+  };
+}
+
+/**
+ * Shared re-entry helper for CLI and train (#1061).
+ * Transitions needs-human → review-2 when present, then invokes advance.
+ * Callers MUST invoke this only after releasing the recover-parked issue-run lock.
+ */
+export async function reenterAdvanceAfterRecoverParked(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  deps: {
+    getIssueDetail: (cfg: PipelineConfig, issue: number) => Promise<IssueDetail>;
+    silentTransition?: (
+      cfg: PipelineConfig,
+      issue: number,
+      from: string,
+      to: string,
+    ) => Promise<void>;
+    runAdvance: (
+      cfg: PipelineConfig,
+      issue: number,
+      opts?: unknown,
+    ) => Promise<unknown>;
+  },
+  advanceOpts?: unknown,
+): Promise<void> {
+  const getDetail = deps.getIssueDetail;
+  const transition = deps.silentTransition ?? silentTransition;
+  const d = await getDetail(cfg, issueNumber);
+  if (pickStage(d.labels) === "needs-human") {
+    await transition(cfg, issueNumber, "needs-human", "review-2");
+  }
+  await deps.runAdvance(cfg, issueNumber, advanceOpts);
 }
 
 async function defaultWithIssueLock<T>(
@@ -685,6 +1099,10 @@ function defaultRecordKeyOverrideFactory(
 /**
  * Main entry: one supervisor pass per park fingerprint.
  * CLI and train both call this function.
+ *
+ * Issue-run lock is held for classification/overrides/spend only. Re-entry
+ * advance runs **after** lock release so it does not self-conflict on the
+ * unified issue-run lock (#1061 concurrency).
  */
 export async function runRecoverParked(
   cfg: PipelineConfig,
@@ -693,7 +1111,7 @@ export async function runRecoverParked(
   deps: RecoverParkedDeps,
 ): Promise<RecoverParkedResult> {
   const log = deps.log ?? ((m: string) => console.log(m));
-  const withLock = deps.withIssueLock ?? defaultWithIssueLock;
+  const withLockFn = deps.withIssueLock ?? defaultWithIssueLock;
 
   if (opts.skipRecoverParked) {
     return {
@@ -703,9 +1121,13 @@ export async function runRecoverParked(
     };
   }
 
+  let shouldReenter = false;
+  let result: RecoverParkedResult;
   try {
-    return await withLock(cfg.domain, issueNumber, async () => {
-      return await runRecoverParkedLocked(cfg, issueNumber, opts, deps, log);
+    result = await withLockFn(cfg.domain, issueNumber, async () => {
+      const locked = await runRecoverParkedLocked(cfg, issueNumber, opts, deps, log);
+      shouldReenter = locked.shouldReenter;
+      return locked.result;
     });
   } catch (err) {
     return {
@@ -714,6 +1136,26 @@ export async function runRecoverParked(
       message: `recover-parked fail-closed: ${err instanceof Error ? err.message : String(err)}`,
     };
   }
+
+  // Re-enter only after lock release (preserves unified issue-run exclusion).
+  if (
+    shouldReenter &&
+    !opts.skipReentry &&
+    !opts.dryRun &&
+    deps.reenterAdvance
+  ) {
+    try {
+      await deps.reenterAdvance(cfg, issueNumber, { skipRecoverParked: true });
+      return { ...result, reentered: true };
+    } catch (err) {
+      return {
+        ...result,
+        reentered: false,
+        message: `${result.message}; re-entry failed: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+  }
+  return result;
 }
 
 async function runRecoverParkedLocked(
@@ -722,7 +1164,7 @@ async function runRecoverParkedLocked(
   opts: RecoverParkedOpts,
   deps: RecoverParkedDeps,
   log: (msg: string) => void,
-): Promise<RecoverParkedResult> {
+): Promise<{ result: RecoverParkedResult; shouldReenter: boolean }> {
   const getDetail = deps.getIssueDetail;
   const getPr = deps.getPrForIssue;
   const getDetailPr = deps.getPrDetail;
@@ -731,28 +1173,34 @@ async function runRecoverParkedLocked(
   const resumeStale = deps.tryResumeStaleBlocked ?? tryResumeStaleBlocked;
   const unlinkScratch =
     deps.tryUnlinkEngineScratch ??
-    (async () =>
-      ({ kind: "no-op", reason: "no scratch recoverer configured" }) as DeterministicRecoverResult);
+    ((c, n, d) => defaultTryUnlinkEngineScratch(c, n, d, deps.scratchUnlinkDeps));
   const recordOverride =
     deps.recordKeyOverride ?? defaultRecordKeyOverrideFactory(deps);
+  const wrap = (
+    result: RecoverParkedResult,
+    shouldReenter = false,
+  ): { result: RecoverParkedResult; shouldReenter: boolean } => ({
+    result,
+    shouldReenter,
+  });
 
   let detail: IssueDetail;
   try {
     detail = await getDetail(cfg, issueNumber);
   } catch (err) {
-    return {
+    return wrap({
       status: "fail-closed",
       issue: issueNumber,
       message: `cannot read issue: ${err instanceof Error ? err.message : String(err)}`,
-    };
+    });
   }
 
   if (!isParkedForRecover(detail.labels)) {
-    return {
+    return wrap({
       status: "not-parked",
       issue: issueNumber,
       message: `issue #${issueNumber} is not parked (no blocked / needs-human)`,
-    };
+    });
   }
 
   // ---- Live PR HEAD (fail closed if unreadable) ----
@@ -761,43 +1209,47 @@ async function runRecoverParkedLocked(
   try {
     prNumber = await getPr(cfg, issueNumber);
     if (prNumber == null) {
-      return {
+      return wrap({
         status: "fail-closed",
         issue: issueNumber,
         message: "no linked open PR; keep park",
-      };
+      });
     }
     headSha = (await getDetailPr(cfg, prNumber)).head_sha;
     if (!headSha || typeof headSha !== "string") {
-      return {
+      return wrap({
         status: "fail-closed",
         issue: issueNumber,
         message: "PR HEAD unreadable; keep park",
-      };
+      });
     }
   } catch (err) {
-    return {
+    return wrap({
       status: "fail-closed",
       issue: issueNumber,
       message: `cannot read PR/HEAD: ${err instanceof Error ? err.message : String(err)}`,
-    };
+    });
   }
 
   // ---- Deterministic recover first (no senior budget) ----
   const scratch = await unlinkScratch(cfg, issueNumber, detail);
   if (scratch.kind === "cleared") {
-    // Re-check labels
     const after = await getDetail(cfg, issueNumber).catch(() => detail);
     if (!isParkedForRecover(after.labels)) {
       log(
         `[recover-parked] #${issueNumber}: deterministic-cleared (scratch) — ${scratch.reason}`,
       );
-      return {
-        status: "deterministic-cleared",
-        issue: issueNumber,
-        message: `deterministic scratch clear: ${scratch.reason}`,
-        reentered: false,
-      };
+      // Schedule re-entry after lock release when a reenter dep is present.
+      const wantReenter = !opts.skipReentry && !opts.dryRun && !!deps.reenterAdvance;
+      return wrap(
+        {
+          status: "deterministic-cleared",
+          issue: issueNumber,
+          message: `deterministic scratch clear: ${scratch.reason}`,
+          reentered: false,
+        },
+        wantReenter,
+      );
     }
   }
 
@@ -810,22 +1262,17 @@ async function runRecoverParkedLocked(
         log(
           `[recover-parked] #${issueNumber}: deterministic-cleared (stale-blocked) — ${stale.reason}`,
         );
-        // Optionally re-enter so same-issue advance continues.
-        if (!opts.skipReentry && !opts.dryRun && deps.reenterAdvance) {
-          await deps.reenterAdvance(cfg, issueNumber, { skipRecoverParked: true });
-          return {
+        const wantReenter =
+          !opts.skipReentry && !opts.dryRun && !!deps.reenterAdvance;
+        return wrap(
+          {
             status: "deterministic-cleared",
             issue: issueNumber,
             message: `deterministic stale-blocked clear: ${stale.reason}`,
-            reentered: true,
-          };
-        }
-        return {
-          status: "deterministic-cleared",
-          issue: issueNumber,
-          message: `deterministic stale-blocked clear: ${stale.reason}`,
-          reentered: false,
-        };
+            reentered: false,
+          },
+          wantReenter,
+        );
       }
       // Labels still parked (e.g. needs-human remains) — continue senior path.
       detail = after;
@@ -833,36 +1280,47 @@ async function runRecoverParkedLocked(
   }
 
   // ---- Senior path: residual classification at live HEAD ----
-  // Re-read HEAD before classification.
   try {
     headSha = (await getDetailPr(cfg, prNumber)).head_sha;
   } catch (err) {
-    return {
+    return wrap({
       status: "fail-closed",
       issue: issueNumber,
       message: `HEAD re-read failed: ${err instanceof Error ? err.message : String(err)}`,
-    };
+    });
   }
 
   detail = await getDetail(cfg, issueNumber).catch(() => detail);
   const stageId = stageIdForPark(detail.labels);
 
-  // Authority park: whole-item human authority refuses senior override path.
-  const authorityPark =
-    detail.labels.includes(`${LABEL_PREFIX}needs-human`) &&
-    // Human-decision punch list with no residual keys still may reflow empty;
-    // when residual keys exist we classify per-key. Whole-park authority is
-    // signaled via comment markers / isHumanAuthority — keep simple: only if
-    // a human-decision-required attestation is present without review residuals.
-    false; // per-key authority set below when needed
+  // Human-authority: durable decision comments + blocker-kind + category.
+  const authSignals = extractAuthorityKeysFromComments(detail.comments);
+  const wholeParkAuthority = authSignals.wholeParkAuthority;
 
-  const parkKeys = extractParkKeySet(detail.comments);
+  const parkFindings = extractParkFindings(detail.comments, {
+    authorityKeys: authSignals.keys,
+    wholeParkAuthority,
+  });
+  // Senior residual MUST be HEAD-bound — never invent DNR from any-SHA fallback.
   const live = loadResidualFindings({
     comments: detail.comments,
     liveHeadSha: headSha,
+    useLatestIfNoHeadMatch: false,
+    authorityKeys: authSignals.keys,
+    wholeParkAuthority,
   });
+  if (!live.headBound) {
+    return wrap({
+      status: "still-parked",
+      issue: issueNumber,
+      stageId,
+      keys: canonicalKeys(parkFindings.map((f) => f.key)),
+      message:
+        "still-parked: no HEAD-bound residual review artifact; refuse DNR/stale overrides (fail closed)",
+    });
+  }
   const residual = mergeParkAndLiveFindings({
-    parkKeys: parkKeys.length > 0 ? parkKeys : live.keys,
+    parkFindings: parkFindings.length > 0 ? parkFindings : live.findings,
     liveFindings: live.findings,
   });
 
@@ -875,14 +1333,14 @@ async function runRecoverParkedLocked(
     log(
       `[recover-parked] #${issueNumber}: already-spent fingerprint ${fingerprintId}`,
     );
-    return {
+    return wrap({
       status: "already-spent",
       issue: issueNumber,
       fingerprintId,
       stageId,
       keys: blockingKeys,
       message: `supervisor pass already spent for fingerprint ${fingerprintId}`,
-    };
+    });
   }
 
   // Classify each residual (pure; dry-run stops after this without mutations).
@@ -890,12 +1348,17 @@ async function runRecoverParkedLocked(
     [];
   const nonOverridable: ResidualFindingRecord[] = [];
   for (const f of residual) {
+    const authority =
+      f.authority === true ||
+      wholeParkAuthority ||
+      authSignals.keys.has(f.key) ||
+      isAuthorityCategory(f.category);
     const cls = classifyParkedFinding({
       key: f.key,
       severity: f.severity,
       category: f.category,
       presentAtLiveHead: f.presentAtLiveHead,
-      authority: authorityPark,
+      authority,
     });
     if (cls.kind === "override-eligible") {
       const reason: SupervisorOverrideReason = !f.presentAtLiveHead
@@ -911,31 +1374,48 @@ async function runRecoverParkedLocked(
           : `below-high residual at live HEAD ${headSha.slice(0, 7)}`,
       });
     } else {
-      nonOverridable.push(f);
+      nonOverridable.push({ ...f, authority });
     }
   }
 
   if (opts.dryRun) {
-    return {
+    return wrap({
       status: "still-parked",
       issue: issueNumber,
       fingerprintId,
       stageId,
       keys: blockingKeys,
       message: `dry-run: eligible=${eligible.length} non-overridable=${nonOverridable.length}; no mutations`,
-    };
+    });
   }
 
   // No residual keys and nothing to reflow — keep park (do not drop labels).
   if (blockingKeys.length === 0) {
-    return {
+    return wrap({
       status: "still-parked",
       issue: issueNumber,
       fingerprintId,
       stageId,
       keys: [],
-      message: "still-parked: no residual review keys to reflow; human punch list / labels unchanged",
-    };
+      message:
+        "still-parked: no residual review keys to reflow; human punch list / labels unchanged",
+    });
+  }
+
+  // Whole-park authority with residual keys: refuse senior override batch entirely.
+  if (wholeParkAuthority && residual.some((f) => f.presentAtLiveHead)) {
+    log(
+      `[recover-parked] #${issueNumber}: still-parked (whole-park human-authority)`,
+    );
+    return wrap({
+      status: "still-parked",
+      issue: issueNumber,
+      fingerprintId,
+      stageId,
+      keys: blockingKeys,
+      message:
+        "still-parked: human-authority residual park; senior override path refused",
+    });
   }
 
   // Spend marker BEFORE side effects (write-before-side-effects).
@@ -953,25 +1433,31 @@ async function runRecoverParkedLocked(
   try {
     await post(cfg, issueNumber, spendBody);
   } catch (err) {
-    return {
+    return wrap({
       status: "fail-closed",
       issue: issueNumber,
       fingerprintId,
       stageId,
       keys: blockingKeys,
       message: `spend marker post failed: ${err instanceof Error ? err.message : String(err)}`,
-    };
+    });
   }
 
   // Eligible overrides only (never HIGH/CRITICAL/security/authority).
   const overridesApplied: Array<{ key: string; reason: SupervisorOverrideReason }> = [];
   for (const e of eligible) {
+    const recFinding = residual.find((r) => r.key === e.key);
     // Re-gate eligibility (defense in depth against internal misuse).
     const recheck = classifyParkedFinding({
       key: e.key,
-      severity: residual.find((r) => r.key === e.key)?.severity,
-      category: residual.find((r) => r.key === e.key)?.category,
-      presentAtLiveHead: residual.find((r) => r.key === e.key)?.presentAtLiveHead ?? false,
+      severity: recFinding?.severity,
+      category: recFinding?.category,
+      presentAtLiveHead: recFinding?.presentAtLiveHead ?? false,
+      authority:
+        recFinding?.authority === true ||
+        wholeParkAuthority ||
+        authSignals.keys.has(e.key) ||
+        isAuthorityCategory(recFinding?.category),
     });
     if (recheck.kind !== "override-eligible") {
       log(
@@ -998,15 +1484,12 @@ async function runRecoverParkedLocked(
       log(
         `[recover-parked] #${issueNumber}: override failed for ${e.key}: ${rec.error ?? "unknown"}`,
       );
-      // Fingerprint remains spent; continue other keys.
     }
   }
 
   // Optional one fix round for remaining non-overridable (fix ≠ override).
   let fixRoundRan = false;
   if (nonOverridable.length > 0 && deps.runOneImplementerFixRound) {
-    // Guard: ensure fix deps path cannot override protected keys by re-checking
-    // before and after (caller must not inject override into fix).
     const fix = await deps.runOneImplementerFixRound({
       cfg,
       issue: issueNumber,
@@ -1019,7 +1502,7 @@ async function runRecoverParkedLocked(
   try {
     headSha = (await getDetailPr(cfg, prNumber)).head_sha;
   } catch {
-    return {
+    return wrap({
       status: "still-parked",
       issue: issueNumber,
       fingerprintId,
@@ -1028,26 +1511,45 @@ async function runRecoverParkedLocked(
       overridesApplied,
       fixRoundRan,
       message: "HEAD unreadable after senior pass; keep park",
-    };
+    });
   }
   detail = await getDetail(cfg, issueNumber);
+  const afterAuth = extractAuthorityKeysFromComments(detail.comments);
   const afterLive = loadResidualFindings({
     comments: detail.comments,
     liveHeadSha: headSha,
+    useLatestIfNoHeadMatch: false,
+    authorityKeys: afterAuth.keys,
+    wholeParkAuthority: afterAuth.wholeParkAuthority,
   });
-  // Remaining blocking = live findings not overridden (extractOverrides filters).
-  const remaining = afterLive.findings.filter((f) => {
+  // Re-merge park + live so protected historical keys that stayed non-overridable
+  // (absent at HEAD) still keep the park — do not recover solely because the
+  // live residual artifact omitted them.
+  const afterPark = extractParkFindings(detail.comments, {
+    authorityKeys: afterAuth.keys,
+    wholeParkAuthority: afterAuth.wholeParkAuthority,
+  });
+  const afterMerged = mergeParkAndLiveFindings({
+    parkFindings: afterPark.length > 0 ? afterPark : afterLive.findings,
+    liveFindings: afterLive.findings,
+  });
+  const remaining = afterMerged.filter((f) => {
     const cls = classifyParkedFinding({
       key: f.key,
       severity: f.severity,
       category: f.category,
-      presentAtLiveHead: true,
+      presentAtLiveHead: f.presentAtLiveHead,
+      authority:
+        f.authority === true ||
+        afterAuth.wholeParkAuthority ||
+        afterAuth.keys.has(f.key) ||
+        isAuthorityCategory(f.category),
     });
     return cls.kind === "non-overridable";
   });
 
   if (remaining.length === 0 && afterLive.findings.length === 0) {
-    // Fully clear: clear leftover blocked if still set, re-enter.
+    // Fully clear: clear leftover blocked if still set; re-enter after lock.
     if (isBlocked(detail.labels)) {
       try {
         await clear(cfg, issueNumber);
@@ -1055,32 +1557,30 @@ async function runRecoverParkedLocked(
         /* keep going; re-entry will re-evaluate */
       }
     }
-    let reentered = false;
-    if (!opts.skipReentry && deps.reenterAdvance) {
-      await deps.reenterAdvance(cfg, issueNumber, { skipRecoverParked: true });
-      reentered = true;
-    }
+    const wantReenter = !opts.skipReentry && !opts.dryRun && !!deps.reenterAdvance;
     log(
       `[recover-parked] #${issueNumber}: recovered (overrides=${overridesApplied.length} fix=${fixRoundRan})`,
     );
-    return {
-      status: "recovered",
-      issue: issueNumber,
-      fingerprintId,
-      stageId,
-      keys: blockingKeys,
-      overridesApplied,
-      fixRoundRan,
-      reentered,
-      message: `recovered: applied ${overridesApplied.length} override(s); residual empty`,
-    };
+    return wrap(
+      {
+        status: "recovered",
+        issue: issueNumber,
+        fingerprintId,
+        stageId,
+        keys: blockingKeys,
+        overridesApplied,
+        fixRoundRan,
+        reentered: false,
+        message: `recovered: applied ${overridesApplied.length} override(s); residual empty`,
+      },
+      wantReenter,
+    );
   }
 
-  // Still have non-overridable (or unresolved present findings).
   log(
     `[recover-parked] #${issueNumber}: still-parked (remaining non-overridable=${remaining.length})`,
   );
-  return {
+  return wrap({
     status: "still-parked",
     issue: issueNumber,
     fingerprintId,
@@ -1093,7 +1593,7 @@ async function runRecoverParkedLocked(
       remaining.length > 0
         ? `still-parked: ${remaining.length} non-overridable residual(s) at HEAD; human required`
         : `still-parked: residuals remain after senior pass`,
-  };
+  });
 }
 
 /** Map train continue vs hold from result status. */
