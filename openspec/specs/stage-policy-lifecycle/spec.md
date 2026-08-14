@@ -35,6 +35,20 @@ The pipeline SHALL represent each staged policy’s effective state as exactly o
 - **THEN** config validation SHALL fail
 - **AND** the policy SHALL NOT be exposed with effective state `enforcing`
 
+#### Scenario: Config declaration of required without lineage is rejected
+
+- **WHEN** a staged policy is declared in config with `state: required`
+- **AND** no fully validated lineage chain into `required` is present (complete legal path `draft` → `observe` → `required`, recomputed acceptance-slice hashes, ISO 8601 `at`, and non-empty `evidence_refs` on the `observe` → `required` edge)
+- **THEN** config validation SHALL fail
+- **AND** the policy SHALL NOT be exposed with effective state `required`
+
+#### Scenario: Config declaration of observe without lineage is rejected
+
+- **WHEN** a staged policy is declared in config with `state: observe`
+- **AND** no fully validated lineage chain into `observe` is present (legal path `draft` → `observe` with recomputed acceptance-slice hashes and ISO 8601 `at`)
+- **THEN** config validation SHALL fail
+- **AND** the policy SHALL NOT be exposed with effective state `observe`
+
 #### Scenario: Config declaration of retired without authority lineage is rejected
 
 - **WHEN** a staged policy is declared in config with `state: retired`

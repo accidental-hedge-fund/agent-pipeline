@@ -61,9 +61,10 @@ function promoteTo(
   return (r as { ok: true; policy: StagedPolicy }).policy;
 }
 
-/** Build a full legal draft→…→enforcing lineage with recomputed hashes (config materialize). */
-function buildLegalEnforcingLineage(
+/** Build legal promotion lineage through `through` with recomputed hashes (config materialize). */
+function buildLegalPromotionLineage(
   policyId: string,
+  through: "observe" | "required" | "enforcing",
   acceptance: Record<string, unknown> = {},
   at: string = AT,
 ): PolicyLineageEvent[] {
@@ -72,7 +73,9 @@ function buildLegalEnforcingLineage(
     ["observe", "required"],
     ["required", "enforcing"],
   ];
-  return path.map(([from, to]) => ({
+  const stopAt =
+    through === "observe" ? 1 : through === "required" ? 2 : 3;
+  return path.slice(0, stopAt).map(([from, to]) => ({
     policy_id: policyId,
     from_state: from,
     to_state: to,
@@ -93,6 +96,15 @@ function buildLegalEnforcingLineage(
         ? ["obs://1"]
         : [],
   }));
+}
+
+/** Build a full legal draft→…→enforcing lineage with recomputed hashes (config materialize). */
+function buildLegalEnforcingLineage(
+  policyId: string,
+  acceptance: Record<string, unknown> = {},
+  at: string = AT,
+): PolicyLineageEvent[] {
+  return buildLegalPromotionLineage(policyId, "enforcing", acceptance, at);
 }
 
 // ---------------------------------------------------------------------------
@@ -686,11 +698,89 @@ test("authorized retirement lineage is accepted via verified; bare retired is no
   );
 });
 
-test("non-enforcing non-retired initial states still allow empty lineage", () => {
-  for (const s of ["draft", "observe", "required"] as const) {
-    const p = createStagedPolicy("p1", {}, s);
-    assert.equal(p.state, s);
-    assert.equal(p.lineage.length, 0);
-    assert.equal(enforcingStateHasLineage(p), true);
-  }
+test("draft is the only empty-lineage initial state; observe/required need predecessor chain", () => {
+  const draft = createStagedPolicy("p1", {}, "draft");
+  assert.equal(draft.state, "draft");
+  assert.equal(draft.lineage.length, 0);
+  assert.equal(enforcingStateHasLineage(draft), true);
+
+  assert.throws(
+    () => createStagedPolicy("p1", {}, "observe"),
+    /requires validated append-only lineage|lineage-free/i,
+  );
+  assert.throws(
+    () => createStagedPolicy("p1", {}, "required"),
+    /requires validated append-only lineage|lineage-free|required requires/i,
+  );
+  assert.throws(
+    () => stagedPolicyFromDecl({ policy_id: "p1", state: "required" }),
+    /requires validated append-only lineage|lineage-free|required requires/i,
+  );
+});
+
+test("lineage-free required materialization is rejected (#695 121f8a7b)", () => {
+  assert.throws(
+    () =>
+      validateMaterializedLineage({
+        policy_id: "p1",
+        state: "required",
+        acceptance: {},
+        lineage: [],
+      }),
+    /requires validated append-only lineage/,
+  );
+  // Single-head observe→required without draft→observe is also rejected.
+  const acceptance = { gate: true };
+  const forgedHead: PolicyLineageEvent = {
+    policy_id: "p1",
+    from_state: "observe",
+    to_state: "required",
+    policy_hash_before: computeStagedPolicyHash({
+      policy_id: "p1",
+      state: "observe",
+      acceptance,
+    }),
+    policy_hash_after: computeStagedPolicyHash({
+      policy_id: "p1",
+      state: "required",
+      acceptance,
+    }),
+    at: AT,
+    authority: null,
+    evidence_refs: ["obs://1"],
+  };
+  assert.throws(
+    () =>
+      validateMaterializedLineage({
+        policy_id: "p1",
+        state: "required",
+        acceptance,
+        lineage: [forgedHead],
+      }),
+    /required requires the complete predecessor chain|draft→observe→required/i,
+  );
+});
+
+test("required with full draft→observe→required validated lineage is accepted", () => {
+  const acceptance = { gate: true };
+  const lineage = buildLegalPromotionLineage("p1", "required", acceptance);
+  validateMaterializedLineage({
+    policy_id: "p1",
+    state: "required",
+    acceptance,
+    lineage,
+  });
+  const p = createStagedPolicy("p1", acceptance, "required", lineage);
+  assert.equal(p.state, "required");
+  assert.equal(p.lineage.length, 2);
+  assert.equal(p.lineage[0]!.from_state, "draft");
+  assert.equal(p.lineage[1]!.to_state, "required");
+});
+
+test("observe with draft→observe validated lineage is accepted", () => {
+  const acceptance = {};
+  const lineage = buildLegalPromotionLineage("p1", "observe", acceptance);
+  const p = createStagedPolicy("p1", acceptance, "observe", lineage);
+  assert.equal(p.state, "observe");
+  assert.equal(p.lineage.length, 1);
 });

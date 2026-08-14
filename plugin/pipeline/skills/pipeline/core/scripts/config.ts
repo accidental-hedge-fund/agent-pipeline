@@ -1188,9 +1188,10 @@ const PartialConfigSchema = z.object({
       "Trusted-surface path coverage (#691). Only additive extra_paths are accepted; built-in classes remain engine-defined.",
     ),
   // Staged policy lifecycle (#695). Opt-in; absent → no policy lifecycle recording.
-  // state "enforcing"/"retired" materialize only through validateMaterializedLineage
-  // (complete predecessor chain, recomputed hashes, authority, evidence_refs, ISO at)
-  // — self-attested single-head lineage is rejected.
+  // Non-draft states materialize only through validateMaterializedLineage
+  // (complete predecessor chain, recomputed hashes, evidence_refs, ISO at).
+  // enforcing/retired additionally require engine-attested verified provenance
+  // and cannot be minted from config-declared lineage alone.
   staged_policies: z
     .array(
       z
@@ -1226,7 +1227,7 @@ const PartialConfigSchema = z.object({
             )
             .optional()
             .describe(
-              "Append-only lineage. Required when state is enforcing or retired: complete legal chain with recomputed policy hashes, authority on enforcing/retired edges, and non-empty evidence_refs on observation-gated promotions.",
+              "Append-only lineage. Required for every non-draft state: complete legal predecessor chain with recomputed policy hashes, authority on enforcing/retired edges, and non-empty evidence_refs on observation-gated promotions. enforcing/retired also require engine-attested verified provenance (config cannot mint them).",
             ),
         })
         .strict()
@@ -1251,7 +1252,8 @@ const PartialConfigSchema = z.object({
     .optional()
     .describe(
       "Opt-in staged policies (#695). States: draft|observe|required|enforcing|retired. " +
-        "enforcing/retired require fully validated lineage (complete path, recomputed hashes, authority). Absent/empty → no lifecycle gate.",
+        "Non-draft states require fully validated lineage (complete path, recomputed hashes, evidence_refs); " +
+        "enforcing/retired also require engine-attested verified provenance and cannot be minted from config. Absent/empty → no lifecycle gate.",
     ),
   // Repository-control desired state (#695). Opt-in; absent → no drift compare.
   repository_control_desired_state: z
@@ -3971,7 +3973,7 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
     config.staged_policies !== undefined && config.staged_policies.length > 0
       ? [
           "",
-          "staged_policies: # staged policy lifecycle (#695) — opt-in; enforcing requires lineage (required→enforcing + authority)",
+          "staged_policies: # staged policy lifecycle (#695) — opt-in; non-draft states require validated lineage",
           yamlBlock(
             config.staged_policies.map((p) => ({
               policy_id: p.policy_id,
@@ -3999,19 +4001,19 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
           "",
           "# staged_policies: # staged policy lifecycle (#695) — opt-in rollout states. Absent (default): no lifecycle recording or promotion gate.",
           `#   - policy_id: repo-controls # ${sd("staged_policies.policy_id", "stable policy identifier")}`,
-          `#     state: observe # ${sd("staged_policies.state", "closed set: draft|observe|required|enforcing|retired; enforcing requires lineage")}`,
+          `#     state: draft # ${sd("staged_policies.state", "closed set: draft|observe|required|enforcing|retired; non-draft requires lineage")}`,
           `#     acceptance: {} # ${sd("staged_policies.acceptance", "acceptance-relevant slice folded into policy_hash")}`,
-          `#     lineage: # ${sd("staged_policies.lineage", "append-only promotion/retirement events; required when state is enforcing (required→enforcing + named authority)")}`,
+          `#     lineage: # ${sd("staged_policies.lineage", "append-only promotion/retirement events; required for every non-draft state")}`,
           `#       - policy_id: repo-controls # ${sd("staged_policies.lineage.policy_id", "must match parent policy_id")}`,
-          `#         from_state: required # ${sd("staged_policies.lineage.from_state", "prior lifecycle state")}`,
-          `#         to_state: enforcing # ${sd("staged_policies.lineage.to_state", "target lifecycle state")}`,
+          `#         from_state: draft # ${sd("staged_policies.lineage.from_state", "prior lifecycle state")}`,
+          `#         to_state: observe # ${sd("staged_policies.lineage.to_state", "target lifecycle state")}`,
           `#         policy_hash_before: "<hex>" # ${sd("staged_policies.lineage.policy_hash_before", "policy_hash before transition")}`,
           `#         policy_hash_after: "<hex>" # ${sd("staged_policies.lineage.policy_hash_after", "policy_hash after transition")}`,
           `#         at: "2026-08-14T00:00:00.000Z" # ${sd("staged_policies.lineage.at", "ISO 8601 transition timestamp")}`,
           `#         authority: # ${sd("staged_policies.lineage.authority", "named authority; required for enforcing/retired entries")}`,
           `#           actor: operator # ${sd("staged_policies.lineage.authority.actor", "authenticated actor identity")}`,
           `#           role: policy-admin # ${sd("staged_policies.lineage.authority.role", "role or capability authorizing the transition")}`,
-          `#         evidence_refs: [] # ${sd("staged_policies.lineage.evidence_refs", "observation or audit evidence references")}`,
+          `#         evidence_refs: [] # ${sd("staged_policies.lineage.evidence_refs", "observation or audit evidence references; non-empty on observe→required / required→enforcing")}`,
         ].join("\n"),
     config.repository_control_desired_state
       ? [

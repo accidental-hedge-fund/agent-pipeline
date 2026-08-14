@@ -1058,7 +1058,7 @@ Nested fields:
 ### `staged_policies`
 
 - **Type:** array of object
-- **Description:** Opt-in staged policies (#695). States: draft|observe|required|enforcing|retired. enforcing/retired require fully validated lineage (complete path, recomputed hashes, authority). Absent/empty → no lifecycle gate.
+- **Description:** Opt-in staged policies (#695). States: draft|observe|required|enforcing|retired. Non-draft states require fully validated lineage (complete path, recomputed hashes, evidence_refs); enforcing/retired also require engine-attested verified provenance and cannot be minted from config. Absent/empty → no lifecycle gate.
 
 ### `steps`
 

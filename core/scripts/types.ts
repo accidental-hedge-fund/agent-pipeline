@@ -1536,8 +1536,10 @@ export interface PipelineConfig {
   /**
    * Opt-in staged policies (#695). Absent or empty → no lifecycle recording.
    * States are the closed set draft|observe|required|enforcing|retired.
-   * Effective state `enforcing` requires validated lineage (required→enforcing
-   * with named authority); bare config cannot activate enforcing without it.
+   * Every non-draft effective state requires validated append-only lineage
+   * (draft→observe, draft→…→required, full path into enforcing). Bare config
+   * cannot invent required/enforcing without that chain; enforcing/retired
+   * additionally require engine-attested verified provenance.
    */
   staged_policies?: Array<{
     policy_id: string;

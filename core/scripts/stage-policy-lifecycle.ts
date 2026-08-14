@@ -198,6 +198,21 @@ function edgeRequiresAuthority(to: PolicyLifecycleState): boolean {
 }
 
 /**
+ * Legal promotion paths for non-draft materialized states.
+ * Config cannot invent observe/required/enforcing without the predecessor chain.
+ */
+export const OBSERVE_PROMOTION_PATH: ReadonlyArray<
+  readonly [PolicyLifecycleState, PolicyLifecycleState]
+> = [["draft", "observe"]] as const;
+
+export const REQUIRED_PROMOTION_PATH: ReadonlyArray<
+  readonly [PolicyLifecycleState, PolicyLifecycleState]
+> = [
+  ["draft", "observe"],
+  ["observe", "required"],
+] as const;
+
+/**
  * Legal full promotion path into enforcing (draft → observe → required → enforcing).
  * Config cannot self-attest enforcing via a forged single required→enforcing head.
  */
@@ -209,10 +224,10 @@ export const ENFORCING_PROMOTION_PATH: ReadonlyArray<
   ["required", "enforcing"],
 ] as const;
 
-function lineageContainsEnforcingPromotionPath(
+function lineageContainsPromotionPath(
   lineage: readonly PolicyLineageEvent[],
+  need: ReadonlyArray<readonly [PolicyLifecycleState, PolicyLifecycleState]>,
 ): boolean {
-  const need = ENFORCING_PROMOTION_PATH;
   if (lineage.length < need.length) return false;
   for (let i = 0; i <= lineage.length - need.length; i++) {
     let ok = true;
@@ -227,6 +242,12 @@ function lineageContainsEnforcingPromotionPath(
     if (ok) return true;
   }
   return false;
+}
+
+function lineageContainsEnforcingPromotionPath(
+  lineage: readonly PolicyLineageEvent[],
+): boolean {
+  return lineageContainsPromotionPath(lineage, ENFORCING_PROMOTION_PATH);
 }
 
 export interface MaterializeLineageInput {
@@ -253,9 +274,12 @@ export interface MaterializeLineageInput {
 /**
  * Validate ordered config/materialize lineage for a declared effective state.
  *
- * Fail-closed for `enforcing` and `retired`:
+ * Fail-closed for every non-draft materialized state:
+ * - non-empty append-only lineage (draft is the only empty-lineage initial state)
  * - complete legal chain (no discontinuous / illegal edges)
  * - last event lands on the declared state
+ * - `observe` requires draft→observe
+ * - `required` requires draft→observe→required
  * - `enforcing` requires the full draft→observe→required→enforcing path
  * - authority on enforcing/retired entries
  * - non-empty evidence_refs on observe→required and required→enforcing
@@ -263,6 +287,8 @@ export interface MaterializeLineageInput {
  * - policy_hash_before/after recomputed from the canonical acceptance slice
  * - consecutive hash continuity
  *
+ * Additionally, `enforcing`/`retired` require engine-attested `verified`
+ * provenance — config-declared lineage alone cannot mint those states.
  * Self-attested single-head lineage with arbitrary strings is rejected.
  */
 export function validateMaterializedLineage(input: MaterializeLineageInput): void {
@@ -286,13 +312,13 @@ export function validateMaterializedLineage(input: MaterializeLineageInput): voi
     );
   }
 
-  if (state === "enforcing" || state === "retired") {
-    if (!lineage.length) {
-      throw new Error(
-        `staged policy ${policyId}: state "${state}" requires validated append-only lineage; ` +
-          `static config cannot invent ${state} without a promotion/retirement chain`,
-      );
-    }
+  // Non-draft states are promotions (or retirement): empty lineage is a
+  // lineage-free bypass of observe→required (and peer) edges (#695 121f8a7b).
+  if (state !== "draft" && !lineage.length) {
+    throw new Error(
+      `staged policy ${policyId}: state "${state}" requires validated append-only lineage; ` +
+        `static config cannot invent ${state} without a promotion/retirement chain`,
+    );
   }
 
   if (!lineage.length) return;
@@ -374,6 +400,25 @@ export function validateMaterializedLineage(input: MaterializeLineageInput): voi
             `prior policy_hash_after !== policy_hash_before`,
         );
       }
+    }
+  }
+
+  if (state === "observe") {
+    if (!lineageContainsPromotionPath(lineage, OBSERVE_PROMOTION_PATH)) {
+      throw new Error(
+        `staged policy ${policyId}: observe requires the complete predecessor chain ` +
+          `draft→observe with validated hashes; a lineage-free observe declaration is rejected`,
+      );
+    }
+  }
+
+  if (state === "required") {
+    if (!lineageContainsPromotionPath(lineage, REQUIRED_PROMOTION_PATH)) {
+      throw new Error(
+        `staged policy ${policyId}: required requires the complete predecessor chain ` +
+          `draft→observe→required with validated hashes and observation evidence_refs; ` +
+          `a lineage-free or jump-to-required declaration is rejected`,
+      );
     }
   }
 
@@ -486,7 +531,9 @@ export interface StagedPolicyDecl {
 
 /**
  * Materialize a StagedPolicy from a config declaration. Fails closed when
- * state is enforcing/retired without a fully validated lineage chain.
+ * state is a non-draft promotion/retirement without a fully validated lineage
+ * chain (observe/required require predecessor paths; enforcing/retired also
+ * require engine-attested verified provenance and cannot be minted from config).
  */
 export function stagedPolicyFromDecl(decl: StagedPolicyDecl): StagedPolicy {
   return createStagedPolicy(

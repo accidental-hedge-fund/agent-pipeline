@@ -402,8 +402,9 @@ export function parseStagedPolicyDecl(raw: unknown): StagedPolicyConfigDecl {
       ? (o.acceptance as Record<string, unknown>)
       : {};
   const lineage = parseLineageEvents(o.lineage, policy_id);
-  // Fail closed: enforcing/retired without fully validated lineage is rejected
-  // (complete chain, recomputed hashes, authority — not self-attested head).
+  // Fail closed: non-draft states without fully validated lineage are rejected
+  // (complete predecessor path, recomputed hashes, evidence_refs/authority —
+  // not a lineage-free or self-attested jump).
   assertEnforcingLineage(policy_id, state, lineage, acceptance);
   return {
     policy_id,

@@ -4764,7 +4764,84 @@ test("resolveConfig: staged_policies bare retired is rejected", async () => {
   );
 });
 
-test("resolveConfig: staged_policies observe without lineage is accepted", async () => {
+test("resolveConfig: staged_policies observe without lineage is rejected (#695 121f8a7b)", async () => {
+  await expectInvalidConfig(
+    [
+      "staged_policies:",
+      "  - policy_id: repo-controls",
+      "    state: observe",
+      "    acceptance:",
+      "      gate: true",
+      "",
+    ].join("\n"),
+    "acme/pol-observe-bare",
+    /requires validated append-only lineage|lineage-free/i,
+  );
+});
+
+test("resolveConfig: staged_policies required without lineage is rejected (#695 121f8a7b)", async () => {
+  await expectInvalidConfig(
+    [
+      "staged_policies:",
+      "  - policy_id: repo-controls",
+      "    state: required",
+      "    acceptance:",
+      "      gate: true",
+      "",
+    ].join("\n"),
+    "acme/pol-required-bare",
+    /requires validated append-only lineage|lineage-free|required requires/i,
+  );
+});
+
+test("resolveConfig: staged_policies required with full validated lineage is accepted", async () => {
+  const { computeStagedPolicyHash } = await import("../scripts/stage-policy-lifecycle.ts");
+  const acceptance = { gate: true };
+  const policyId = "repo-controls";
+  const h = (state: "draft" | "observe" | "required") =>
+    computeStagedPolicyHash({ policy_id: policyId, state, acceptance });
+  const cfg = (await resolveWithConfig(
+    [
+      "staged_policies:",
+      "  - policy_id: repo-controls",
+      "    state: required",
+      "    acceptance:",
+      "      gate: true",
+      "    lineage:",
+      "      - policy_id: repo-controls",
+      "        from_state: draft",
+      "        to_state: observe",
+      `        policy_hash_before: ${h("draft")}`,
+      `        policy_hash_after: ${h("observe")}`,
+      '        at: "2026-08-14T00:00:00.000Z"',
+      "        authority: null",
+      "        evidence_refs: []",
+      "      - policy_id: repo-controls",
+      "        from_state: observe",
+      "        to_state: required",
+      `        policy_hash_before: ${h("observe")}`,
+      `        policy_hash_after: ${h("required")}`,
+      '        at: "2026-08-14T00:00:00.000Z"',
+      "        authority: null",
+      '        evidence_refs: ["obs://1"]',
+      "",
+    ].join("\n"),
+    "acme/pol-required-lineage",
+  )) as {
+    staged_policies?: Array<{ policy_id: string; state: string; lineage?: unknown[] }>;
+  };
+  assert.ok(cfg.staged_policies);
+  assert.equal(cfg.staged_policies![0]!.policy_id, "repo-controls");
+  assert.equal(cfg.staged_policies![0]!.state, "required");
+  assert.equal(cfg.staged_policies![0]!.lineage?.length, 2);
+});
+
+test("resolveConfig: staged_policies observe with draft→observe lineage is accepted", async () => {
+  const { computeStagedPolicyHash } = await import("../scripts/stage-policy-lifecycle.ts");
+  const acceptance = { gate: true };
+  const policyId = "repo-controls";
+  const hDraft = computeStagedPolicyHash({ policy_id: policyId, state: "draft", acceptance });
+  const hObs = computeStagedPolicyHash({ policy_id: policyId, state: "observe", acceptance });
   const cfg = (await resolveWithConfig(
     [
       "staged_policies:",
@@ -4772,6 +4849,15 @@ test("resolveConfig: staged_policies observe without lineage is accepted", async
       "    state: observe",
       "    acceptance:",
       "      gate: true",
+      "    lineage:",
+      "      - policy_id: repo-controls",
+      "        from_state: draft",
+      "        to_state: observe",
+      `        policy_hash_before: ${hDraft}`,
+      `        policy_hash_after: ${hObs}`,
+      '        at: "2026-08-14T00:00:00.000Z"',
+      "        authority: null",
+      "        evidence_refs: []",
       "",
     ].join("\n"),
     "acme/pol-observe",
