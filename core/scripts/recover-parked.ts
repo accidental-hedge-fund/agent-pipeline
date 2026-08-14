@@ -653,70 +653,115 @@ export function mergeParkAndLiveFindings(args: {
 }
 
 /**
- * Extract structured park findings from review-ish comments.
- * Newest structured record per key wins; scans all review comments so keys
- * that later disappeared still retain historical severity/category.
+ * Identify the single causal park review artifact.
+ *
+ * Causal park = the **oldest** review-ish comment whose reviewed-sha matches
+ * the current park HEAD identity:
+ * - when `liveHeadSha` is provided: that SHA (fail closed → null if none match)
+ * - otherwise: the reviewed-sha of the newest review-ish comment
+ *
+ * Never unions findings across historical SHAs or unrelated earlier parks.
+ * Within the matched SHA, oldest wins so a later incomplete residual at the
+ * same HEAD still retains park-time structured severity for protected-class
+ * DNR gating.
+ */
+export function selectCausalParkComment(
+  comments: readonly { body: string }[],
+  opts?: { liveHeadSha?: string | null },
+): { body: string; artifact: ReviewArtifact | null } | null {
+  const reviewish: Array<{ body: string; sha: string | null }> = [];
+  for (const c of comments) {
+    if (!isReviewishBody(c.body)) continue;
+    const art = extractReviewArtifact(c.body);
+    const sha = art?.reviewedSha?.toLowerCase() ?? null;
+    reviewish.push({ body: c.body, sha });
+  }
+  if (reviewish.length === 0) return null;
+
+  let targetSha: string | null =
+    typeof opts?.liveHeadSha === "string" && opts.liveHeadSha.length > 0
+      ? opts.liveHeadSha.toLowerCase()
+      : null;
+  if (!targetSha) {
+    // Newest review's SHA defines the current park identity when HEAD is unknown.
+    for (let i = reviewish.length - 1; i >= 0; i--) {
+      if (reviewish[i]!.sha) {
+        targetSha = reviewish[i]!.sha;
+        break;
+      }
+    }
+  }
+
+  let matched: Array<{ body: string }> = [];
+  if (targetSha) {
+    matched = reviewish.filter((r) => r.sha === targetSha);
+  }
+  if (matched.length === 0) {
+    // No SHA-bound match: fail closed when liveHeadSha was required; otherwise
+    // fall back to the single newest review-ish comment only (never a union).
+    if (opts?.liveHeadSha) return null;
+    const last = reviewish[reviewish.length - 1]!;
+    return { body: last.body, artifact: extractReviewArtifact(last.body) };
+  }
+  // Oldest matching comment = park-time full residual for this HEAD.
+  const chosen = matched[0]!;
+  return { body: chosen.body, artifact: extractReviewArtifact(chosen.body) };
+}
+
+/**
+ * Extract structured park findings from the **causal** current-park review
+ * artifact only. Historical reviews at other SHAs are ignored so a prior
+ * code-fixed HIGH/CRITICAL cannot strand a later unrelated park.
+ *
+ * For keys in that artifact, structured severity/category/authority are
+ * retained for protected-class gating when a later live residual at the same
+ * HEAD drops them.
  */
 export function extractParkFindings(
   comments: readonly { body: string }[],
   opts?: {
     authorityKeys?: ReadonlySet<string>;
     wholeParkAuthority?: boolean;
+    /** Live PR HEAD — scopes causal park to reviews of this SHA. */
+    liveHeadSha?: string | null;
   },
 ): ResidualFindingRecord[] {
   const overrides = extractOverrides([...comments]);
   const authorityKeys = opts?.authorityKeys ?? new Set<string>();
   const wholeParkAuthority = opts?.wholeParkAuthority === true;
-  const byKey = new Map<string, ResidualFindingRecord>();
+  const causal = selectCausalParkComment(comments, {
+    liveHeadSha: opts?.liveHeadSha,
+  });
+  if (!causal) return [];
 
-  for (let i = 0; i < comments.length; i++) {
-    const body = comments[i]!.body;
-    if (!isReviewishBody(body)) continue;
-    const art = extractReviewArtifact(body);
-    const surfaces = extractBlockingSurfacesFromComment(body);
-    if (art?.blockingFindings && art.blockingFindings.length > 0) {
-      for (const bf of art.blockingFindings) {
-        const key = bf.key.toLowerCase();
-        if (!isValidFindingKey(key) || overrides.has(key)) continue;
-        const surface = bf.surface ?? surfaces.get(key) ?? null;
-        const category = categoryFromSurface(surface);
-        byKey.set(key, {
-          key,
-          severity: bf.severity,
-          title: bf.title,
-          surface,
-          category,
-          presentAtLiveHead: false,
-          authority:
-            wholeParkAuthority ||
-            authorityKeys.has(key) ||
-            isAuthorityCategory(category),
-        });
-      }
-      for (const k of art.blockingKeys ?? []) {
-        const key = k.toLowerCase();
-        if (!isValidFindingKey(key) || overrides.has(key) || byKey.has(key)) continue;
-        const surface = surfaces.get(key) ?? null;
-        const category = categoryFromSurface(surface);
-        byKey.set(key, {
-          key,
-          severity: "unknown",
-          title: "",
-          surface,
-          category,
-          presentAtLiveHead: false,
-          authority:
-            wholeParkAuthority ||
-            authorityKeys.has(key) ||
-            isAuthorityCategory(category),
-        });
-      }
-      continue;
+  const body = causal.body;
+  const art = causal.artifact;
+  const surfaces = extractBlockingSurfacesFromComment(body);
+  const byKey = new Map<string, ResidualFindingRecord>();
+  const markAuthority = (key: string, category: string | null): boolean =>
+    wholeParkAuthority ||
+    authorityKeys.has(key) ||
+    isAuthorityCategory(category);
+
+  if (art?.blockingFindings && art.blockingFindings.length > 0) {
+    for (const bf of art.blockingFindings) {
+      const key = bf.key.toLowerCase();
+      if (!isValidFindingKey(key) || overrides.has(key)) continue;
+      const surface = bf.surface ?? surfaces.get(key) ?? null;
+      const category = categoryFromSurface(surface);
+      byKey.set(key, {
+        key,
+        severity: bf.severity,
+        title: bf.title,
+        surface,
+        category,
+        presentAtLiveHead: false,
+        authority: markAuthority(key, category),
+      });
     }
-    const markerKeys = extractBlockingKeysFromComment(body);
-    for (const k of markerKeys) {
+    for (const k of art.blockingKeys ?? []) {
       const key = k.toLowerCase();
-      if (overrides.has(key) || byKey.has(key)) continue;
+      if (!isValidFindingKey(key) || overrides.has(key) || byKey.has(key)) continue;
       const surface = surfaces.get(key) ?? null;
       const category = categoryFromSurface(surface);
       byKey.set(key, {
@@ -726,21 +771,41 @@ export function extractParkFindings(
         surface,
         category,
         presentAtLiveHead: false,
-        authority:
-          wholeParkAuthority ||
-          authorityKeys.has(key) ||
-          isAuthorityCategory(category),
+        authority: markAuthority(key, category),
       });
     }
+    return [...byKey.values()];
+  }
+
+  const markerKeys = extractBlockingKeysFromComment(body);
+  for (const k of markerKeys) {
+    const key = k.toLowerCase();
+    if (overrides.has(key) || byKey.has(key)) continue;
+    const surface = surfaces.get(key) ?? null;
+    const category = categoryFromSurface(surface);
+    byKey.set(key, {
+      key,
+      severity: "unknown",
+      title: "",
+      surface,
+      category,
+      presentAtLiveHead: false,
+      authority: markAuthority(key, category),
+    });
   }
   return [...byKey.values()];
 }
 
-/** Extract park key set from review-ish comments (any HEAD). */
+/** Extract park key set from the causal park artifact only. */
 export function extractParkKeySet(
   comments: readonly { body: string }[],
+  opts?: { liveHeadSha?: string | null },
 ): string[] {
-  return canonicalKeys(extractParkFindings(comments).map((f) => f.key));
+  return canonicalKeys(
+    extractParkFindings(comments, { liveHeadSha: opts?.liveHeadSha }).map(
+      (f) => f.key,
+    ),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -996,6 +1061,10 @@ export async function defaultTryUnlinkEngineScratch(
  * Shared re-entry helper for CLI and train (#1061).
  * Transitions needs-human → review-2 when present, then invokes advance.
  * Callers MUST invoke this only after releasing the recover-parked issue-run lock.
+ *
+ * Always stamps `skipRecoverParked: true` on the advance opts so a re-entered
+ * advance that parks again cannot recursively invoke recover-parked on the
+ * same stack (typed internal guard).
  */
 export async function reenterAdvanceAfterRecoverParked(
   cfg: PipelineConfig,
@@ -1011,10 +1080,10 @@ export async function reenterAdvanceAfterRecoverParked(
     runAdvance: (
       cfg: PipelineConfig,
       issue: number,
-      opts?: unknown,
+      opts?: { skipRecoverParked?: boolean; [k: string]: unknown },
     ) => Promise<unknown>;
   },
-  advanceOpts?: unknown,
+  advanceOpts?: { skipRecoverParked?: boolean; [k: string]: unknown },
 ): Promise<void> {
   const getDetail = deps.getIssueDetail;
   const transition = deps.silentTransition ?? silentTransition;
@@ -1022,7 +1091,12 @@ export async function reenterAdvanceAfterRecoverParked(
   if (pickStage(d.labels) === "needs-human") {
     await transition(cfg, issueNumber, "needs-human", "review-2");
   }
-  await deps.runAdvance(cfg, issueNumber, advanceOpts);
+  // Force the nested-recovery guard regardless of caller opts.
+  const optsWithGuard = {
+    ...(advanceOpts ?? {}),
+    skipRecoverParked: true as const,
+  };
+  await deps.runAdvance(cfg, issueNumber, optsWithGuard);
 }
 
 async function defaultWithIssueLock<T>(
@@ -1297,9 +1371,11 @@ async function runRecoverParkedLocked(
   const authSignals = extractAuthorityKeysFromComments(detail.comments);
   const wholeParkAuthority = authSignals.wholeParkAuthority;
 
+  // Causal park artifact is HEAD-scoped only — never union historical SHAs.
   const parkFindings = extractParkFindings(detail.comments, {
     authorityKeys: authSignals.keys,
     wholeParkAuthority,
+    liveHeadSha: headSha,
   });
   // Senior residual MUST be HEAD-bound — never invent DNR from any-SHA fallback.
   const live = loadResidualFindings({
@@ -1317,6 +1393,17 @@ async function runRecoverParkedLocked(
       keys: canonicalKeys(parkFindings.map((f) => f.key)),
       message:
         "still-parked: no HEAD-bound residual review artifact; refuse DNR/stale overrides (fail closed)",
+    });
+  }
+  // Fail closed when the causal park artifact cannot be identified at HEAD.
+  if (parkFindings.length === 0 && live.findings.length === 0) {
+    return wrap({
+      status: "still-parked",
+      issue: issueNumber,
+      stageId,
+      keys: [],
+      message:
+        "still-parked: causal park artifact empty at live HEAD; refuse senior reflow (fail closed)",
     });
   }
   const residual = mergeParkAndLiveFindings({
@@ -1522,12 +1609,14 @@ async function runRecoverParkedLocked(
     authorityKeys: afterAuth.keys,
     wholeParkAuthority: afterAuth.wholeParkAuthority,
   });
-  // Re-merge park + live so protected historical keys that stayed non-overridable
-  // (absent at HEAD) still keep the park — do not recover solely because the
-  // live residual artifact omitted them.
+  // Re-merge causal park + live so protected keys from the *current* park
+  // artifact that stayed non-overridable (absent at HEAD) still keep the park.
+  // Do not recover solely because the live residual artifact omitted them —
+  // and do not re-import historical keys from unrelated earlier parks.
   const afterPark = extractParkFindings(detail.comments, {
     authorityKeys: afterAuth.keys,
     wholeParkAuthority: afterAuth.wholeParkAuthority,
+    liveHeadSha: headSha,
   });
   const afterMerged = mergeParkAndLiveFindings({
     parkFindings: afterPark.length > 0 ? afterPark : afterLive.findings,

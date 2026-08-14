@@ -54,7 +54,7 @@ Pure engine entrypoint: `runRecoverParked(cfg, issueNumber, opts, deps) → Reco
 1. **Live residual set at PR HEAD (for still-present keys):** latest review / delta-review comment whose `reviewed-sha` equals live PR HEAD (or the newest review artifact if HEAD matches the park evidence under existing supersession rules). Parse via existing ladder:
    - `extractReviewArtifact(body).blockingFindings[]` → `{ key, severity, title, surface, confidence? }`
    - else `pipeline-blocking-keys` / `pipeline-blocking-surfaces` markers (severity `unknown` → **non-overridable**, fail-closed)
-2. **Parked key set (for DNR/stale detection):** sorted keys that were blocking at park time from the same artifact/markers on the needs-human / blocked evidence comments (last blocking review round), minus keys already dispositioned by trusted `pipeline-override` sentinels (`extractOverrides` / governed active projection).
+2. **Parked key set (for DNR/stale detection):** sorted keys from the **single causal current-park review artifact** only — the oldest review-ish comment whose `reviewed-sha` equals live PR HEAD (last blocking review round at that HEAD). Never union findings across historical SHAs or prior unrelated parks. Keys already dispositioned by trusted `pipeline-override` sentinels are excluded (`extractOverrides` / governed active projection). When no causal artifact can be identified at live HEAD, senior reflow fails closed.
 3. **Category:** prefer structured `ReviewFinding.category` when a full verdict object is available; else parse `surface` as `surfaceKey` form `${normalizeFile}|${category}` when surface is present; category match for security is exact lowercased `security`. Missing/unknown category does **not** unlock override of high/critical; for below-high present keys without security category → eligible as `below-high`.
 4. **Authority parks:** if current `blockerKind` / stage diagnostic is `human-decision-required` or missing-authority / human-authority class (`isHumanAuthorityBlocker`), senior override path is refused entirely (no key reclassification). Deterministic recover may still run first.
 
@@ -70,7 +70,7 @@ Pure engine entrypoint: `runRecoverParked(cfg, issueNumber, opts, deps) → Reco
 | Key present, severity below high, not security, not authority | `override-eligible` reason `below-high` |
 | Free-text / classifier prose saying "nit" | **never consulted** |
 
-**Absent-key original record:** park-time structured severity/category/authority SHALL be retained when merging with the live residual. Protected-class gate runs before stale/DNR so a historical HIGH/CRITICAL/security/authority key absent from a later residual artifact is never auto-overridden. Only non-protected absent keys are DNR-eligible. Senior residual load is HEAD-bound (`useLatestIfNoHeadMatch: false`).
+**Absent-key original record:** within the causal park artifact, park-time structured severity/category/authority SHALL be retained when merging with the live residual. Protected-class gate runs before stale/DNR so a park-time HIGH/CRITICAL/security/authority key absent from a later residual artifact **at the same HEAD** is never auto-overridden. Keys from reviews at other SHAs are not part of the current park and MUST NOT strand a later park. Only non-protected absent keys (from the causal artifact) are DNR-eligible. Senior residual load is HEAD-bound (`useLatestIfNoHeadMatch: false`).
 
 ### D3: Deterministic engine recover before fingerprint creation or senior mutation
 

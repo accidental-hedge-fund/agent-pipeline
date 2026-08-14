@@ -3209,9 +3209,8 @@ export async function runTrainCommand(
             getGhActor,
             // Default tryUnlinkEngineScratch = production defaultTryUnlinkEngineScratch.
             reenterAdvance: async (c, n, reOpts) => {
-              void reOpts;
-              // Shared helper: clear needs-human → review-2, then advance.
-              // Invoked after recover-parked releases the issue-run lock.
+              // Propagate skipRecoverParked into same-issue advance so a
+              // re-park cannot recursively invoke recover-parked on this stack.
               await reenterAdvanceAfterRecoverParked(
                 c,
                 n,
@@ -3220,7 +3219,7 @@ export async function runTrainCommand(
                   silentTransition,
                   runAdvance: runAdvanceForRecover,
                 },
-                toAdvanceOpts(opts),
+                { ...toAdvanceOpts(opts), skipRecoverParked: reOpts.skipRecoverParked },
               );
             },
             log: (m) => console.error(m),
@@ -5912,9 +5911,8 @@ async function main(): Promise<void> {
         getGhActor,
         // Default tryUnlinkEngineScratch = production defaultTryUnlinkEngineScratch.
         reenterAdvance: async (c, issue, reOpts) => {
-          // skipRecoverParked is a recover-parked internal guard; advance does not
-          // re-invoke recover-parked. Called after issue-run lock release.
-          void reOpts;
+          // Propagate skipRecoverParked into same-issue advance so a re-park
+          // cannot recursively invoke recover-parked on this stack.
           await reenterAdvanceAfterRecoverParked(
             c,
             issue,
@@ -5923,7 +5921,7 @@ async function main(): Promise<void> {
               silentTransition,
               runAdvance: runAdvanceForRecover,
             },
-            toAdvanceOpts(opts),
+            { ...toAdvanceOpts(opts), skipRecoverParked: reOpts.skipRecoverParked },
           );
         },
         log: (m) => console.log(m),

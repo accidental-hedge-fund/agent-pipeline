@@ -177,6 +177,12 @@ export interface AdvanceOpts {
    * `run.json.discovery_channel` wins over this field (written-once).
    */
   discoveryChannel?: DiscoveryChannel;
+  /**
+   * Internal recover-parked re-entry guard (#1061). When true, nested
+   * recover-parked on this advance stack is refused. Set by
+   * `reenterAdvanceAfterRecoverParked` only — not a public CLI flag.
+   */
+  skipRecoverParked?: boolean;
 }
 
 /** Pure + exported so the PIPELINE_COMMENT_KINDS drift guard exercises the real renderer. */

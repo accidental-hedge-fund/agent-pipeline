@@ -73,12 +73,19 @@ The command SHALL treat a finding as **override-eligible** only when it is not n
 - **THEN** `recover-parked` MAY disposition that key as stale or DNR through the audited override path
 - **AND** SHALL cite the finding key and a one-line stale/DNR evidence reason
 
-#### Scenario: Historical protected key absent at live HEAD remains non-overridable
+#### Scenario: Park-time protected key absent from later residual at same HEAD remains non-overridable
 
-- **WHEN** a parked blocking key had structured severity HIGH or CRITICAL, or category security, or human-authority
-- **AND** that key is absent from a later live residual artifact at HEAD
+- **WHEN** the causal current-park review artifact (oldest review at live HEAD) recorded structured severity HIGH or CRITICAL, or category security, or human-authority for a key
+- **AND** that key is absent from a later live residual artifact at the same HEAD
 - **THEN** `recover-parked` SHALL NOT record a stale/DNR override for that key
 - **AND** SHALL keep the park for human disposition (protected-class gate before DNR)
+
+#### Scenario: Historical protected key from another SHA does not strand a later park
+
+- **WHEN** a prior review at a different reviewed-sha recorded HIGH or CRITICAL (or security/authority) for a key without an override
+- **AND** the current park residual at live HEAD has only other keys (the prior key is not in the causal park artifact)
+- **THEN** `recover-parked` SHALL NOT treat that historical key as part of the current park
+- **AND** SHALL classify and reflow only from the causal park artifact merged with the live residual
 
 ---
 

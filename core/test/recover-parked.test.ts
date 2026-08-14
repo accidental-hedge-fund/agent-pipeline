@@ -1184,6 +1184,7 @@ test("R1-5: shared reenterAdvanceAfterRecoverParked clears needs-human", async (
   let labels = ["pipeline:needs-human", "blocked"];
   let advanced = false;
   let transitioned: { from: string; to: string } | null = null;
+  let advanceOpts: { skipRecoverParked?: boolean } | undefined;
   await reenterAdvanceAfterRecoverParked(
     cfg(),
     1061,
@@ -1204,8 +1205,9 @@ test("R1-5: shared reenterAdvanceAfterRecoverParked clears needs-human", async (
           .filter((l) => l !== "pipeline:needs-human")
           .concat([`pipeline:${to}`]);
       },
-      runAdvance: async () => {
+      runAdvance: async (_c, _i, opts) => {
         advanced = true;
+        advanceOpts = opts;
       },
     },
   );
@@ -1213,9 +1215,15 @@ test("R1-5: shared reenterAdvanceAfterRecoverParked clears needs-human", async (
   assert.equal(advanced, true);
   assert.ok(labels.includes("pipeline:review-2"));
   assert.ok(!labels.includes("pipeline:needs-human"));
+  assert.equal(
+    advanceOpts?.skipRecoverParked,
+    true,
+    "re-entry must stamp skipRecoverParked on advance opts",
+  );
 });
 
-test("R1-5b: extractParkFindings retains historical CRITICAL after newer residual drops it", () => {
+test("R1-5b: extractParkFindings retains same-HEAD park-time CRITICAL when later residual drops it", () => {
+  // Causal park = oldest review at the live HEAD SHA (not a union of all history).
   const older = reviewBody({
     sha: HEAD,
     findings: [
@@ -1227,11 +1235,104 @@ test("R1-5b: extractParkFindings retains historical CRITICAL after newer residua
     sha: HEAD,
     findings: [{ key: KEY_MED, severity: "medium", title: "m" }],
   });
-  const park = extractParkFindings([
-    { body: older },
-    { body: newer },
-  ]);
+  const park = extractParkFindings(
+    [{ body: older }, { body: newer }],
+    { liveHeadSha: HEAD },
+  );
   const crit = park.find((f) => f.key === KEY_CRIT);
-  assert.ok(crit, "historical CRITICAL must remain in park findings");
+  assert.ok(crit, "same-HEAD park-time CRITICAL must remain in causal park findings");
   assert.equal(crit!.severity, "critical");
+});
+
+test("R2-1: historical CRITICAL at other SHA does not strand a later park", async () => {
+  // Prior park cycle: CRITICAL at old HEAD (code-fixed, never overridden).
+  // Current park: medium-only residual at live HEAD — must reflow, not inherit
+  // the unrelated historical protected key.
+  const historical = reviewBody({
+    sha: HEAD2,
+    findings: [{ key: KEY_CRIT, severity: "critical", title: "old crit" }],
+  });
+  const current = reviewBody({
+    sha: HEAD,
+    findings: [{ key: KEY_MED, severity: "medium", title: "new med" }],
+  });
+  const pure = extractParkFindings(
+    [{ body: historical }, { body: current }],
+    { liveHeadSha: HEAD },
+  );
+  assert.equal(
+    pure.some((f) => f.key === KEY_CRIT),
+    false,
+    "other-SHA CRITICAL must not enter causal park findings",
+  );
+  assert.equal(pure.map((f) => f.key).sort().join(","), KEY_MED);
+
+  const h = makeHarness({
+    labels: ["pipeline:needs-human", "blocked"],
+    headSha: HEAD,
+    comments: [
+      { author: "bot", body: historical, createdAt: "2026-08-14T00:00:00Z" },
+      { author: "bot", body: current, createdAt: "2026-08-14T01:00:00Z" },
+    ],
+  });
+  const result = await runRecoverParked(cfg(), 1061, {}, h.deps);
+  assert.equal(result.status, "recovered");
+  assert.equal(h.overrides.length, 1);
+  assert.equal(h.overrides[0]!.key, KEY_MED);
+  assert.ok(!h.overrides.some((o) => o.key === KEY_CRIT));
+  assert.equal(h.reentries, 1);
+});
+
+test("R2-2: re-entry passes skipRecoverParked; nested recover-parked refuses", async () => {
+  const body = reviewBody({
+    sha: HEAD,
+    findings: [{ key: KEY_MED, severity: "medium", title: "nit" }],
+  });
+  let nestedCalls = 0;
+  let nestedStatus: string | null = null;
+  let sawSkipOnAdvance = false;
+  const h = makeHarness({
+    labels: ["pipeline:needs-human"],
+    comments: [
+      { author: "bot", body, createdAt: "2026-08-14T00:00:00Z" },
+    ],
+  });
+  // Replace reenter to simulate advance-induced re-park calling recover-parked
+  // with the guard stamped on advance opts.
+  h.deps.reenterAdvance = async (c, issue, reOpts) => {
+    assert.equal(reOpts.skipRecoverParked, true);
+    // Shared helper always stamps the guard on advance opts.
+    await reenterAdvanceAfterRecoverParked(
+      c,
+      issue,
+      {
+        getIssueDetail: h.deps.getIssueDetail,
+        silentTransition: async () => {},
+        runAdvance: async (_cfg, _n, advOpts) => {
+          sawSkipOnAdvance = advOpts?.skipRecoverParked === true;
+          // Advance-induced re-park: nested recover must honor the guard.
+          const nested = await runRecoverParked(
+            cfg(),
+            issue,
+            { skipRecoverParked: advOpts?.skipRecoverParked === true },
+            {
+              ...h.deps,
+              reenterAdvance: async () => {
+                throw new Error("nested reenter must not run");
+              },
+            },
+          );
+          nestedCalls++;
+          nestedStatus = nested.status;
+        },
+      },
+      { skipRecoverParked: reOpts.skipRecoverParked },
+    );
+  };
+  const result = await runRecoverParked(cfg(), 1061, {}, h.deps);
+  assert.equal(result.status, "recovered");
+  assert.equal(result.reentered, true);
+  assert.equal(sawSkipOnAdvance, true);
+  assert.equal(nestedCalls, 1);
+  assert.equal(nestedStatus, "fail-closed");
 });
