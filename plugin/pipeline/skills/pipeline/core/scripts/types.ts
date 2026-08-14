@@ -286,6 +286,10 @@ export const BLOCKER_KINDS = [
   "pre-code-attestation-failed",
   "human-decision-required",
   "ci-exhausted",
+  /** Independent reviewer quorum unmet after substitute bound (#694). */
+  "review-independent-quorum-unmet",
+  /** No usable reviewers after substitute bound (#694). */
+  "review-no-usable-reviewers",
 ] as const;
 export type BlockerKind = (typeof BLOCKER_KINDS)[number];
 
@@ -447,6 +451,21 @@ export const BLOCKER_RECIPES: Record<BlockerKind, string> = {
     "block reason above, fix product test/build failures or remaining " +
     "infrastructure issues, push any code fix to the PR head, remove the " +
     "`blocked` label, then re-run `$pipeline {{N}}`.",
+  "review-independent-quorum-unmet":
+    "Independent reviewer coverage did not meet the risk-class quorum " +
+    "(see independent vs required counts above). Restore independent coverage " +
+    "by adding a distinct provider/model-family reviewer, fixing same-harness " +
+    "self-review-only degradation, or adjusting " +
+    "`review_ensemble.min_independent_by_risk` with an audited config change. " +
+    "Do not silent-approve. Remove the `blocked` label, then re-run " +
+    "`$pipeline {{N}}`.",
+  "review-no-usable-reviewers":
+    "No usable reviewer verdicts were produced (all agents failed, timed out, " +
+    "or returned unparseable output after any one-shot substitute attempt). " +
+    "Restore reviewer harness availability (CLI install, auth, capacity, and " +
+    "model entitlement), remove the `blocked` label, then re-run " +
+    "`$pipeline {{N}}`. This is an engine harness/coverage failure, not a " +
+    "product-judgment needs-human hold by default.",
 };
 
 // ---------------------------------------------------------------------------
@@ -898,6 +917,22 @@ export interface ReviewEnsembleConfig {
   max_agents: number;
   /** Optional per-agent timeout override (seconds); else review/plan_review timeouts. */
   agent_timeout_sec?: number;
+  /**
+   * Optional minimum independent reviewer count by risk class (#694).
+   * Missing map or missing class → required 0 (min-usable-only behavior).
+   * Negative values are rejected at config resolve.
+   */
+  min_independent_by_risk?: Record<string, number>;
+  /**
+   * Optional substitute agents for a single repair wave when first-wave
+   * coverage is quorum_unmet or no_usable_reviewers (#694).
+   */
+  substitute_agents?: ReviewEnsembleAgent[];
+  /**
+   * When true, quorum_unmet may proceed with loud advisory coverage disclosure
+   * while still preserving union blockers. Default false (fail closed).
+   */
+  allow_quorum_degrade?: boolean;
 }
 
 export interface PipelineConfig {
@@ -1515,6 +1550,7 @@ export const DEFAULT_CONFIG: Omit<
     agents: [] as ReviewEnsembleAgent[],
     min_usable_agents: 1,
     max_agents: 4,
+    allow_quorum_degrade: false,
   },
   // SHA-pinned Tester evidence (#646): fail-closed by default; never imply suite pass without evidence.
   tester_evidence: {
@@ -1836,6 +1872,18 @@ export interface ReviewEnsembleAgentRecord {
   status: "usable" | "failed";
   failureClass?: string;
   costUsd?: number | null;
+  /** Deterministic provider family (#694). */
+  providerFamily?: string;
+  /** Deterministic model family (#694). */
+  modelFamily?: string;
+  /** Latency ms when known (#694). */
+  latencyMs?: number | null;
+  /** Cost coverage class for this attempt (#694). */
+  costClass?: "requested" | "attempted" | "completed" | "billable";
+  /** Fallback / failure reason when not usable or self-review (#694). */
+  failureOrFallbackReason?: string;
+  /** True when independently eligible under pure rules (#694). */
+  independentlyEligible?: boolean;
 }
 
 /** Ensemble summary on a review round (#645). Additive optional. */
@@ -1846,6 +1894,31 @@ export interface ReviewEnsembleRecord {
   merge: "union_blocking";
   agents: ReviewEnsembleAgentRecord[];
   summary?: string;
+  /** Coverage counts (#694). Additive optional. */
+  coverage?: {
+    configured: number;
+    attempted: number;
+    usable: number;
+    independent: number;
+    required: number;
+  };
+  /** Closed aggregation outcome (#694). */
+  aggregation_outcome?:
+    | "complete"
+    | "partial_quorum"
+    | "same_lineage_fallback"
+    | "quorum_unmet"
+    | "no_usable_reviewers";
+  aggregation_reason?: string;
+  /** Cost dimensions requested/attempted/completed/billable (#694). */
+  cost?: {
+    requested: number;
+    attempted: number;
+    completed: number;
+    billable: number;
+    billable_cost_usd?: number | null;
+  };
+  risk_class?: string;
 }
 
 /** Summary of one review round's verdict. `findingCounts` maps severity → count.

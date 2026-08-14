@@ -24,11 +24,13 @@ import { selfReviewBanner, type ReviewerInvocation } from "../self-review.ts";
 import {
   assertNoEnsembleStageExecutorBypass,
   ensembleSelfReviewBanner,
+  formatCoverageDisclosure,
   formatEnsembleIdentityLine,
   invokeReviewEnsemble,
   type EnsembleInvocation,
   type EnsembleMeta,
 } from "../review-ensemble.ts";
+import { coverageBlockerKind } from "../reviewer-independence.ts";
 import { formatStderrExcerpt, papercutIdentityEnv } from "../harness.ts";
 import { expandAutoEffort, resolveReviewerModelForHarness, reviewerModelSourceWasAuto } from "../stage-routing.ts";
 import { invokeStageExecutor, resolveStageExecutor, type ExecutorHttpDeps } from "../executors.ts";
@@ -660,6 +662,41 @@ export async function advanceReview(
     // which model id they configured, not just codex's own error text.
     const configuredModel = opts.model ?? cfg.harnesses.reviewerModel ?? cfg.models.review;
     const modelNote = configuredModel ? ` (configured model: "${configuredModel}")` : "";
+    // #694: map fail-closed ensemble coverage outcomes to typed blocker kinds.
+    // Single-agent harness failures keep harness-failure (ensembleMeta absent).
+    const covOutcome =
+      ensembleMeta?.aggregation_outcome ??
+      (invocation as EnsembleInvocation).coverage?.aggregation_outcome;
+    const coverageKind =
+      ensembleMeta && covOutcome ? coverageBlockerKind(covOutcome) : null;
+    if (coverageKind === "review-independent-quorum-unmet") {
+      const cov = (invocation as EnsembleInvocation).coverage ?? ensembleMeta;
+      const counts = cov && "counts" in cov ? cov.counts : ensembleMeta?.coverage;
+      const detailMsg =
+        `Independent reviewer quorum unmet for review-${round}` +
+        (counts
+          ? ` (independent=${counts.independent}, required=${counts.required}, usable=${counts.usable}/${counts.configured})`
+          : "") +
+        `. ${reason}${stderrExcerpt}`;
+      await setBlockedFn(cfg, issueNumber, detailMsg, stage, "review-independent-quorum-unmet");
+      return {
+        advanced: false,
+        status: "blocked",
+        reason: detailMsg,
+        blockerKind: "review-independent-quorum-unmet",
+      };
+    }
+    if (coverageKind === "review-no-usable-reviewers") {
+      const detailMsg =
+        `No usable reviewers for review-${round}: ${reason}${stderrExcerpt}`;
+      await setBlockedFn(cfg, issueNumber, detailMsg, stage, "review-no-usable-reviewers");
+      return {
+        advanced: false,
+        status: "blocked",
+        reason: detailMsg,
+        blockerKind: "review-no-usable-reviewers",
+      };
+    }
     const detailMsg = selfReview
       ? `Neither the cross-harness reviewer (${configuredReviewer}) nor the implementing ` +
         `harness (${reviewer}) is installed/spawnable for a self-review fallback — ${reason}${stderrExcerpt}`
@@ -778,12 +815,19 @@ export async function advanceReview(
     const banners: string[] = [];
     if (ensembleMeta) {
       banners.push(formatEnsembleIdentityLine(ensembleMeta));
+      const covLine = formatCoverageDisclosure(ensembleMeta);
+      if (covLine) banners.push(covLine);
       if (selfReview) {
         const ensBanner = ensembleSelfReviewBanner(ensembleMeta.agents);
         if (ensBanner) banners.push(ensBanner);
       }
-    } else if (selfReview) {
-      banners.push(selfReviewBanner(configuredReviewer, reviewer));
+    } else {
+      const invCov = (invocation as EnsembleInvocation).coverage;
+      const covLine = formatCoverageDisclosure(invCov);
+      if (covLine) banners.push(covLine);
+      if (selfReview) {
+        banners.push(selfReviewBanner(configuredReviewer, reviewer));
+      }
     }
     if (banners.length === 0) return text;
     const bannerBlock = banners.join("\n\n");
@@ -797,6 +841,7 @@ export async function advanceReview(
     : selfReview
       ? `${reviewer} (self-review)`
       : reviewer;
+  const invCoverage = (invocation as EnsembleInvocation).coverage;
   const ensembleEvidence = ensembleMeta
     ? {
         ensemble: {
@@ -813,11 +858,38 @@ export async function advanceReview(
             status: a.status,
             failureClass: a.failureClass,
             costUsd: a.costUsd,
+            providerFamily: a.providerFamily,
+            modelFamily: a.modelFamily,
+            latencyMs: a.latencyMs,
+            costClass: a.costClass,
+            failureOrFallbackReason: a.failureOrFallbackReason,
+            independentlyEligible: a.independentlyEligible,
           })),
           summary: ensembleMeta.summary,
+          coverage: ensembleMeta.coverage,
+          aggregation_outcome: ensembleMeta.aggregation_outcome,
+          aggregation_reason: ensembleMeta.aggregation_reason,
+          cost: ensembleMeta.cost,
+          risk_class: ensembleMeta.risk_class,
         },
       }
-    : {};
+    : invCoverage
+      ? {
+          ensemble: {
+            size: invCoverage.counts.configured,
+            usable: invCoverage.counts.usable,
+            failed: Math.max(0, invCoverage.counts.attempted - invCoverage.counts.usable),
+            merge: "union_blocking" as const,
+            agents: [] as Array<Record<string, unknown>>,
+            summary: invCoverage.aggregation_reason,
+            coverage: invCoverage.counts,
+            aggregation_outcome: invCoverage.aggregation_outcome,
+            aggregation_reason: invCoverage.aggregation_reason,
+            cost: invCoverage.cost,
+            risk_class: invCoverage.risk_class,
+          },
+        }
+      : {};
 
   // Local (non-delegated) path keeps parseStructuredVerdict product tolerances;
   // review.verdict@1 is the pure schema gate used for delegated repair + fixtures.

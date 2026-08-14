@@ -755,7 +755,7 @@ Nested fields:
 ### `review_ensemble`
 
 - **Type:** object
-- **Default:** `{"enabled":false,"agents":[],"min_usable_agents":1,"max_agents":4}`
+- **Default:** `{"enabled":false,"agents":[],"min_usable_agents":1,"max_agents":4,"allow_quorum_degrade":false}`
 - **Description:** Opt-in parallel multi-agent review ensemble (#645). Default off — no latency/cost change when absent or disabled.
 
 Nested fields:
@@ -769,6 +769,11 @@ Nested fields:
 
 - **Type:** array of object
 - **Description:** Ordered ensemble agents. Use { role: "primary" } for the configured reviewer and { harness: "<cli>" } for additional cross-checks.
+
+#### `review_ensemble.allow_quorum_degrade`
+
+- **Type:** boolean
+- **Description:** When true, quorum_unmet may proceed with loud advisory coverage disclosure; default false fail-closed (#694).
 
 #### `review_ensemble.enabled`
 
@@ -785,10 +790,20 @@ Nested fields:
 - **Type:** string
 - **Description:** Merge mode. v1 supports only "union_blocking" (union findings, rigor-first blocking). Majority-vote approve is not available.
 
+#### `review_ensemble.min_independent_by_risk`
+
+- **Type:** object
+- **Description:** Optional minimum independent reviewer count by risk class (#694). Missing/zero leaves required=0 (min-usable-only).
+
 #### `review_ensemble.min_usable_agents`
 
 - **Type:** integer
 - **Description:** Minimum usable agents required to soft-fail and merge; below this the stage fails closed (default 1).
+
+#### `review_ensemble.substitute_agents`
+
+- **Type:** array of object
+- **Description:** Optional one-shot substitute agent list when first-wave coverage is quorum_unmet or no_usable_reviewers (#694).
 
 ### `review_harness`
 

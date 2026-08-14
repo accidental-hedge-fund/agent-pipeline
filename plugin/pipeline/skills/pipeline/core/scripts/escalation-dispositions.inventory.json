@@ -11,7 +11,7 @@
       "disposition": "deliberately-fail-closed",
       "blocker_kind": null,
       "canonical_reason": "workflow-engine-defect",
-      "notes": "dynamic kind — fail-closed until explicit",
+      "notes": "dynamic kind \u2014 fail-closed until explicit",
       "emitter": "setBlocked"
     },
     {
@@ -223,7 +223,7 @@
       "module": "scripts/stages/eval.ts",
       "line": 778,
       "occurrence": 2,
-      "match": "Eval gate runner/tooling error${attempts} — the eval command could not be execut",
+      "match": "Eval gate runner/tooling error${attempts} \u2014 the eval command could not be execut",
       "disposition": "transient-retryable",
       "blocker_kind": "harness-failure",
       "canonical_reason": "harness-contract",
@@ -283,7 +283,7 @@
       "module": "scripts/stages/fix.ts",
       "line": 561,
       "occurrence": 0,
-      "match": "${unacknowledged.length} unacknowledged human comment(s) after the latest plan —",
+      "match": "${unacknowledged.length} unacknowledged human comment(s) after the latest plan \u2014",
       "disposition": "deliberately-fail-closed",
       "blocker_kind": "needs-human",
       "canonical_reason": "human-context-required",
@@ -323,7 +323,7 @@
       "disposition": "deliberately-fail-closed",
       "blocker_kind": "no-commits",
       "canonical_reason": "implementation-ci",
-      "notes": "external-commit noop evidence write failure — fail closed (#758 R2)",
+      "notes": "external-commit noop evidence write failure \u2014 fail closed (#758 R2)",
       "emitter": "setBlocked"
     },
     {
@@ -523,7 +523,7 @@
       "module": "scripts/stages/pre-merge-conflict-rebase.ts",
       "line": 148,
       "occurrence": 0,
-      "match": "PR has a merge conflict; stage-attempt ledger unusable (${hydrated.reason}) — ma",
+      "match": "PR has a merge conflict; stage-attempt ledger unusable (${hydrated.reason}) \u2014 ma",
       "disposition": "reconcile-owned",
       "blocker_kind": "merge-conflict",
       "canonical_reason": "workflow-state",
@@ -791,7 +791,7 @@
       "disposition": "deliberately-fail-closed",
       "blocker_kind": "harness-failure",
       "canonical_reason": "workflow-engine-defect",
-      "notes": "post-archive status failed — cannot prove scratch unstaged before archive commit (#1017 review 2 / #1020 harness-failure)",
+      "notes": "post-archive status failed \u2014 cannot prove scratch unstaged before archive commit (#1017 review 2 / #1020 harness-failure)",
       "emitter": "setBlocked"
     },
     {
@@ -803,7 +803,7 @@
       "disposition": "deliberately-fail-closed",
       "blocker_kind": "harness-failure",
       "canonical_reason": "workflow-engine-defect",
-      "notes": "restore --staged failed — fail closed so staged challenge-response JSON cannot enter archive commit (#1017 review 2 / #1020 harness-failure)",
+      "notes": "restore --staged failed \u2014 fail closed so staged challenge-response JSON cannot enter archive commit (#1017 review 2 / #1020 harness-failure)",
       "emitter": "setBlocked"
     },
     {
@@ -815,7 +815,7 @@
       "disposition": "deliberately-fail-closed",
       "blocker_kind": "harness-failure",
       "canonical_reason": "workflow-engine-defect",
-      "notes": "post-archive status failed — cannot prove scratch unstaged before archive commit (#1017 review 2 / #1020 harness-failure)",
+      "notes": "post-archive status failed \u2014 cannot prove scratch unstaged before archive commit (#1017 review 2 / #1020 harness-failure)",
       "emitter": "setBlocked"
     },
     {
@@ -827,7 +827,7 @@
       "disposition": "deliberately-fail-closed",
       "blocker_kind": "harness-failure",
       "canonical_reason": "workflow-engine-defect",
-      "notes": "XY-preserving re-read still shows staged scratch — block before archive commit (#1017 review 2 / #1020 harness-failure)",
+      "notes": "XY-preserving re-read still shows staged scratch \u2014 block before archive commit (#1017 review 2 / #1020 harness-failure)",
       "emitter": "setBlocked"
     },
     {
@@ -883,7 +883,7 @@
       "module": "scripts/stages/pre-merge-routing.ts",
       "line": 683,
       "occurrence": 1,
-      "match": "ci_mode: local — no worktree found for this issue; cannot run the local test gat",
+      "match": "ci_mode: local \u2014 no worktree found for this issue; cannot run the local test gat",
       "disposition": "deliberately-fail-closed",
       "blocker_kind": "needs-human",
       "canonical_reason": "workflow-state",
@@ -895,7 +895,7 @@
       "module": "scripts/stages/pre-merge-routing.ts",
       "line": 706,
       "occurrence": 2,
-      "match": "ci_mode: local — the inline local test gate was skipped (test_gate is disabled o",
+      "match": "ci_mode: local \u2014 the inline local test gate was skipped (test_gate is disabled o",
       "disposition": "deliberately-fail-closed",
       "blocker_kind": "needs-human",
       "canonical_reason": "workflow-state",
@@ -919,7 +919,7 @@
       "module": "scripts/stages/pre-merge-routing.ts",
       "line": 749,
       "occurrence": 4,
-      "match": "ci_mode: local — the inline local test gate (run from pre-merge) failed. ",
+      "match": "ci_mode: local \u2014 the inline local test gate (run from pre-merge) failed. ",
       "disposition": "deliberately-fail-closed",
       "blocker_kind": "needs-human",
       "canonical_reason": "workflow-state",
@@ -991,7 +991,7 @@
       "module": "scripts/stages/pre-merge-sha-gate.ts",
       "line": 524,
       "occurrence": 0,
-      "match": "Pre-merge: cannot verify review-comment provenance — authenticated gh actor ",
+      "match": "Pre-merge: cannot verify review-comment provenance \u2014 authenticated gh actor ",
       "disposition": "deliberately-fail-closed",
       "blocker_kind": "needs-human",
       "canonical_reason": "environment-auth",
@@ -1163,7 +1163,7 @@
       "disposition": "deliberately-fail-closed",
       "blocker_kind": "human-decision-required",
       "canonical_reason": "human-decision-required",
-      "notes": "wait for authorized human attestation — durable hold, not new park class (#575)",
+      "notes": "wait for authorized human attestation \u2014 durable hold, not new park class (#575)",
       "emitter": "setBlocked"
     },
     {
@@ -1327,7 +1327,7 @@
       "module": "scripts/stages/review-routing.ts",
       "line": 367,
       "occurrence": 5,
-      "match": "PR HEAD moved while fetching diff (${commitSha.slice(0, 7)} → ${postDiffSha.slic",
+      "match": "PR HEAD moved while fetching diff (${commitSha.slice(0, 7)} \u2192 ${postDiffSha.slic",
       "disposition": "transient-retryable",
       "blocker_kind": "harness-failure",
       "canonical_reason": "harness-contract",
@@ -1351,7 +1351,7 @@
       "module": "scripts/stages/review-routing.ts",
       "line": 430,
       "occurrence": 0,
-      "match": "${unacknowledged.length} unacknowledged human comment(s) after the latest plan —",
+      "match": "${unacknowledged.length} unacknowledged human comment(s) after the latest plan \u2014",
       "disposition": "deliberately-fail-closed",
       "blocker_kind": "needs-human",
       "canonical_reason": "human-context-required",
@@ -1379,7 +1379,7 @@
       "disposition": "transient-retryable",
       "blocker_kind": "harness-failure",
       "canonical_reason": "harness-contract",
-      "notes": "delegated review format-repair invoke failure (#777) — harness-contract class",
+      "notes": "delegated review format-repair invoke failure (#777) \u2014 harness-contract class",
       "emitter": "setBlocked"
     },
     {
@@ -1391,7 +1391,7 @@
       "disposition": "transient-retryable",
       "blocker_kind": "harness-failure",
       "canonical_reason": "harness-contract",
-      "notes": "delegated review.verdict@1 exhausted after shared format-repair (#777) — harness-contract",
+      "notes": "delegated review.verdict@1 exhausted after shared format-repair (#777) \u2014 harness-contract",
       "emitter": "setBlocked"
     },
     {
@@ -1403,7 +1403,7 @@
       "disposition": "deliberately-fail-closed",
       "blocker_kind": "harness-failure",
       "canonical_reason": "workflow-engine-defect",
-      "notes": "evidence_subject production failed for new review artifact (#692) — fail closed, never silent legacy_unbound",
+      "notes": "evidence_subject production failed for new review artifact (#692) \u2014 fail closed, never silent legacy_unbound",
       "emitter": "setBlocked"
     },
     {
@@ -1415,7 +1415,7 @@
       "disposition": "transient-retryable",
       "blocker_kind": "harness-failure",
       "canonical_reason": "harness-contract",
-      "notes": "needs-attention+0 findings on re-review — likely unparseable; harness-contract class",
+      "notes": "needs-attention+0 findings on re-review \u2014 likely unparseable; harness-contract class",
       "emitter": "setBlocked"
     },
     {
@@ -1428,6 +1428,30 @@
       "blocker_kind": null,
       "canonical_reason": "review-findings",
       "notes": "dynamic blockerKind from review policy",
+      "emitter": "setBlocked"
+    },
+    {
+      "site_id": "stages.review-routing:review-independent-quorum-unmet#0",
+      "module": "scripts/stages/review-routing.ts",
+      "line": 681,
+      "occurrence": 0,
+      "match": "review-independent-quorum-unmet",
+      "disposition": "deliberately-fail-closed",
+      "blocker_kind": "review-independent-quorum-unmet",
+      "canonical_reason": "workflow-engine-defect",
+      "notes": "independent quorum unmet after substitute bound \u2014 coverage integrity fail-closed (#694)",
+      "emitter": "setBlocked"
+    },
+    {
+      "site_id": "stages.review-routing:review-no-usable-reviewers#0",
+      "module": "scripts/stages/review-routing.ts",
+      "line": 692,
+      "occurrence": 0,
+      "match": "review-no-usable-reviewers",
+      "disposition": "deliberately-fail-closed",
+      "blocker_kind": "review-no-usable-reviewers",
+      "canonical_reason": "harness-contract",
+      "notes": "zero usable reviewers after substitute bound \u2014 engine harness/coverage failure not product-judgment (#694)",
       "emitter": "setBlocked"
     },
     {
@@ -1663,7 +1687,7 @@
       "module": "scripts/stages/visual.ts",
       "line": 1236,
       "occurrence": 2,
-      "match": "Visual gate runner/tooling error${attempts} — the visual command could not be ex",
+      "match": "Visual gate runner/tooling error${attempts} \u2014 the visual command could not be ex",
       "disposition": "transient-retryable",
       "blocker_kind": "harness-failure",
       "canonical_reason": "harness-contract",
