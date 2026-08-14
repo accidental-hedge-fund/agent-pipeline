@@ -179,8 +179,16 @@ export interface IdentityMigrationResult {
 /**
  * Deterministic v1→v2 identity rewrite for a lineage graph. Rewrites node ids
  * that still use the legacy (collision-prone) local-id encoding, remaps every
- * edge endpoint, and fails closed (ambiguous diagnostic, node untouched) when
- * a stored id cannot be mapped from the recorded canonical local key.
+ * edge endpoint, and fails closed on ambiguous/colliding ids.
+ *
+ * Collision rule (#599 6af379e4): v1 allowed a literal `a%2Fb` and a slash
+ * path `a/b` to share the stored id `…:a%2Fb`. A legacy id is colliding when
+ * its nodes' canonical v2 identities differ; nothing under that id is
+ * rewritten and `legacy_identity_collision` requires manual reconciliation.
+ *
+ * False-positive rule (#599 2d1b8f8d): a normal v2 slash-path node stores
+ * `%2F` legitimately. Only ids that are neither valid v2 (canonical local id)
+ * nor uniquely migratable v1 are flagged as `legacy_identity_ambiguous`.
  */
 export function migrateLineageIdentityV1ToV2(
   nodes: readonly LineageNode[],
@@ -191,37 +199,76 @@ export function migrateLineageIdentityV1ToV2(
   let rewritten = 0;
   let ambiguous = 0;
 
+  // Group every stored id by the FINAL v2 identity of the nodes that use it.
+  // Distinct finals for one stored id = legacy collision (refuse rewrite).
+  const finalsByStored = new Map<string, Set<string>>();
+  const localByStored = new Map<LineageNode, string | null>();
+  for (const n of nodes) {
+    const local = canonicalLocalIdForNode(n);
+    localByStored.set(n, local);
+    if (!n.node_id) continue;
+    if (!local) continue;
+    const v2 = makeDomainNodeId(n.domain, n.node_type, local);
+    let finals = finalsByStored.get(n.node_id);
+    if (!finals) {
+      finals = new Set();
+      finalsByStored.set(n.node_id, finals);
+    }
+    finals.add(v2);
+  }
+  const collisionIds = new Set<string>();
+  for (const [storedId, finals] of finalsByStored) {
+    if (finals.size > 1) collisionIds.add(storedId);
+  }
+
   const rewrittenNodes: LineageNode[] = nodes.map((n) => {
     if (!n.node_id) return n;
-    const local = canonicalLocalIdForNode(n);
+    if (collisionIds.has(n.node_id)) {
+      diagnostics.push({
+        code: "legacy_identity_collision",
+        message: `legacy node_id ${n.node_id} maps to multiple v2 identities; manual reconciliation required`,
+      });
+      return n;
+    }
+    const local = localByStored.get(n);
     if (!local) return n;
-    const nextId = migrateV1NodeId(n.node_id, n.domain, n.node_type, local);
-    if (!nextId || nextId === n.node_id) return n;
+    const v2 = makeDomainNodeId(n.domain, n.node_type, local);
+    if (v2 === n.node_id) return n; // already current format
     rewritten += 1;
-    oldToNew.set(n.node_id, nextId);
-    return { ...n, node_id: nextId };
+    oldToNew.set(n.node_id, v2);
+    return { ...n, node_id: v2 };
   });
 
   const rewrittenEdges: LineageEdge[] = edges.map((edge) => {
+    if (collisionIds.has(edge.source_id) || collisionIds.has(edge.target_id)) {
+      // Refuse endpoint rewrite on a colliding id; leave the edge untouched so
+      // the diagnostic (above) drives manual reconciliation instead of
+      // retargeting an unrelated artifact.
+      return edge;
+    }
     const source = oldToNew.get(edge.source_id) ?? edge.source_id;
     const target = oldToNew.get(edge.target_id) ?? edge.target_id;
     if (source === edge.source_id && target === edge.target_id) return edge;
     return { ...edge, source_id: source, target_id: target };
   });
 
-  // Fail closed: any stored v1-looking id we could not rewrite is flagged.
+  // Fail closed: a stored percent-bearing id that is neither valid v2 nor
+  // migratable v1 cannot be attributed — flag it, do not guess.
   for (const node of nodes) {
-    if (
-      node.node_id &&
-      (node.node_id.includes("%2F") || node.node_id.includes("%5C")) &&
-      !oldToNew.has(node.node_id)
-    ) {
-      ambiguous += 1;
-      diagnostics.push({
-        code: "legacy_identity_ambiguous",
-        message: `cannot deterministically migrate legacy node_id ${node.node_id}; record left unrewritten`,
-      });
+    if (!node.node_id || !(node.node_id.includes("%2F") || node.node_id.includes("%5C"))) continue;
+    if (oldToNew.has(node.node_id) || collisionIds.has(node.node_id)) continue;
+    const local = localByStored.get(node);
+    if (local) {
+      const v2 = makeDomainNodeId(node.domain, node.node_type, local);
+      if (v2 === node.node_id) continue; // valid v2
+    } else {
+      // No canonical local key: cannot prove v2 or v1 → ambiguous.
     }
+    ambiguous += 1;
+    diagnostics.push({
+      code: "legacy_identity_ambiguous",
+      message: `cannot deterministically attribute legacy node_id ${node.node_id}; record left unrewritten`,
+    });
   }
 
   return { nodes: rewrittenNodes, edges: rewrittenEdges, rewritten, ambiguous, diagnostics };

@@ -319,7 +319,10 @@ export function validateLineageNode(input: unknown): ValidationResult<LineageNod
   }
   const o = input as Record<string, unknown>;
 
-  if (o.schema_version !== LINEAGE_SCHEMA_VERSION) {
+  if (
+    o.schema_version !== LINEAGE_SCHEMA_VERSION &&
+    o.schema_version !== LINEAGE_MIN_SUPPORTED_SCHEMA_VERSION
+  ) {
     issues.push({
       path: "schema_version",
       message: `must be ${LINEAGE_SCHEMA_VERSION} (or legacy ${LINEAGE_MIN_SUPPORTED_SCHEMA_VERSION})`,
@@ -456,7 +459,10 @@ export function validateLineageEdge(input: unknown): ValidationResult<LineageEdg
   }
   const o = input as Record<string, unknown>;
 
-  if (o.schema_version !== LINEAGE_SCHEMA_VERSION) {
+  if (
+    o.schema_version !== LINEAGE_SCHEMA_VERSION &&
+    o.schema_version !== LINEAGE_MIN_SUPPORTED_SCHEMA_VERSION
+  ) {
     issues.push({
       path: "schema_version",
       message: `must be ${LINEAGE_SCHEMA_VERSION} (or legacy ${LINEAGE_MIN_SUPPORTED_SCHEMA_VERSION})`,

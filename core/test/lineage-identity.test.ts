@@ -151,6 +151,75 @@ test("migrateLineageIdentityV1ToV2 rewrites graph endpoints", () => {
   assert.equal(migrated.nodes[0].node_id, v2Id);
   assert.equal(migrated.edges[0].source_id, v2Id);
   assert.equal(migrated.edges[0].target_id, `${domain}::run:r1`);
+  assert.equal(migrated.ambiguous, 0);
+});
+
+test("v2 slash-path node is not flagged as legacy ambiguity (#599 2d1b8f8d)", () => {
+  const domain = "agent-pipeline";
+  const v2Id = makeDomainNodeId(domain, "requirement", "a/b"); // …::requirement:a%2Fb
+  const nodes = [
+    makeNodeShell({
+      node_id: v2Id,
+      node_type: "requirement",
+      domain,
+      revision: "1",
+      identity: { path: "a/b" },
+      producer: "test",
+      observed: "2026-08-14T00:00:00Z",
+    }),
+  ];
+  const migrated = migrateLineageIdentityV1ToV2(nodes, []);
+  assert.equal(migrated.rewritten, 0);
+  assert.equal(migrated.ambiguous, 0);
+  assert.equal(migrated.diagnostics.length, 0);
+});
+
+test("legacy id shared by slash path and literal percent fails closed (#599 6af379e4)", () => {
+  const domain = "agent-pipeline";
+  const legacyShared = `${domain}::requirement:a%2Fb`;
+  const nodes = [
+    // v1 literal-percent node: canonical local `a%2Fb` migrates to `a%252Fb`
+    makeNodeShell({
+      node_id: legacyShared,
+      node_type: "requirement",
+      domain,
+      revision: "1",
+      identity: { path: "a%2Fb" },
+      producer: "test",
+      observed: "2026-08-14T00:00:00Z",
+    }),
+    // v1 slash-path node: canonical `a/b` stays at `a%2Fb` in both encodings —
+    // same stored id, different final identity → collision
+    makeNodeShell({
+      node_id: legacyShared,
+      node_type: "requirement",
+      domain,
+      revision: "2",
+      identity: { path: "a/b" },
+      producer: "test",
+      observed: "2026-08-14T00:00:00Z",
+    }),
+  ];
+  const edges = [
+    makeEdgeShell({
+      edge_id: `${domain}::edge:coll` ,
+      source_id: legacyShared,
+      target_id: `${domain}::run:r1`,
+      relationship: "validates",
+      method: "manual",
+      authority: "observed",
+      producer: "test",
+      observed: "2026-08-14T00:00:00Z",
+    }),
+  ];
+  const migrated = migrateLineageIdentityV1ToV2(nodes, edges);
+  assert.equal(migrated.rewritten, 0);
+  assert.ok(
+    migrated.diagnostics.some((d) => d.code === "legacy_identity_collision"),
+    `expected collision diagnostic; got ${JSON.stringify(migrated.diagnostics)}`,
+  );
+  // Edge endpoint must NOT be silently retargeted.
+  assert.equal(migrated.edges[0].source_id, legacyShared);
 });
 
 test("encodeLocalId escapes percent before separators", () => {

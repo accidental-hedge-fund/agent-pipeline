@@ -9,9 +9,14 @@ import {
 } from "../scripts/lineage/export.ts";
 import {
   listAnalysisRecords,
+  loadGraphSnapshot,
   upsertGraph,
   type LineageStoreDeps,
 } from "../scripts/lineage/store.ts";
+import {
+  LINEAGE_SCHEMA_VERSION,
+  readLineageNode,
+} from "../scripts/lineage/schema.ts";
 import {
   runLineageExport,
   runLineageImpact,
@@ -280,6 +285,42 @@ test("impact fails when analysis persistence is skipped (#599 39e56c5e)", async 
   );
   // Restore writes so propose path can be exercised independently
   store.writeFile = origWrite;
+});
+
+test("persisted v1 lineage records load and migrate through loadGraphSnapshot (#599 b50bf85a)", async () => {
+  const store = memStore();
+  const domain = D;
+  const v1NodeId = `${domain}::requirement:a%2Fb`;
+  // Write a legacy v1-schema record directly (validators must accept it on read)
+  const v1Node = {
+    schema_version: 1,
+    type: "lineage_node",
+    node_id: v1NodeId,
+    node_type: "requirement",
+    domain,
+    revision: "1",
+    content_hash: "h1",
+    summary: null,
+    identity: { path: "a%2Fb", content_hash: "h1" },
+    provenance: {
+      schema_version: 1,
+      observed_at: "2026-08-14T00:00:00Z",
+      producer: "test",
+      method: "manual",
+      authority: "observed",
+    },
+  };
+  const validNode = readLineageNode(v1Node);
+  assert.ok(validNode, "v1 record must pass validation (legacy acceptance)");
+  store.files.set(
+    `/repo-lineage/.agent-pipeline/lineage/nodes/safe-${encodeURIComponent(v1NodeId)}.json`,
+    JSON.stringify(v1Node),
+  );
+  const loaded = await loadGraphSnapshot(REPO, {}, store);
+  // Migrated node carries v2 id (literal percent escaped)
+  const migratedNode = loaded.nodes.find((n) => n.node_id.includes("a%252Fb"));
+  assert.ok(migratedNode, `expected migrated v2 node; got ids=${loaded.nodes.map((n) => n.node_id)}`);
+  assert.equal(migratedNode.schema_version, LINEAGE_SCHEMA_VERSION);
 });
 
 test("impact and propose fail when analysis record write fails (#599 39e56c5e)", async () => {
