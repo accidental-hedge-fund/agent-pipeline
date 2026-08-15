@@ -244,74 +244,112 @@ pin_repo_dir() {
   export REPO_DIR
 }
 
-# Pure: space-separated cmdline is a live ship for bare version X.Y.Z (#1062).
-# Live = train with --merge for this milestone, OR tugboat owning that ship
-# (foreground/detached composer — not --status / not the --detach launcher).
-# Does NOT treat bare playbook.pid, issue-run locks, or unrelated pids as live.
-cmdline_is_live_ship() {
-  local cmdline=$1
-  local version=$2
+# Live ship = structured argv match only (#1062 R2): exact argument boundaries
+# from NUL-delimited /proc/<pid>/cmdline — never flattened substring search.
+# Live = Pipeline train with positional train + exact --merge + milestone option,
+# OR owning tugboat for that milestone (not --status / not --detach launcher).
+# Does NOT treat bare playbook.pid, issue-run locks, or spoofed single-arg text.
+
+# Read /proc/pid/cmdline into __proc_argv (NUL-delimited). Return 1 if empty.
+read_proc_argv() {
+  local pid=$1
+  __proc_argv=()
+  [[ -r "/proc/$pid/cmdline" ]] || return 1
+  mapfile -d '' -t __proc_argv <"/proc/$pid/cmdline" 2>/dev/null || return 1
+  while [[ ${#__proc_argv[@]} -gt 0 && -z "${__proc_argv[-1]}" ]]; do
+    unset '__proc_argv[-1]'
+  done
+  [[ ${#__proc_argv[@]} -gt 0 ]] || return 1
+  return 0
+}
+
+# Pure: argv_is_live_ship VERSION ARG... — exact token match for bare X.Y.Z.
+argv_is_live_ship() {
+  local version=$1
+  shift
+  local -a argv=("$@")
   local tag="v${version}"
-  # Normalize runs of whitespace for robust substring checks.
-  cmdline=$(printf '%s' "$cmdline" | tr -s '[:space:]' ' ')
-  [[ -n "$cmdline" ]] || return 1
+  local i arg base next j m
+  local has_train=0 has_merge=0 has_milestone=0
+  local is_tugboat=0 has_status=0 has_detach=0
+  local has_pipeline_entry=0
 
-  # Owning tugboat for this milestone (composer child). Exclude status/detach
-  # wrappers so a --status read never looks like a live ship.
-  case "$cmdline" in
-    *tugboat*)
-      case "$cmdline" in
-        *--status*|*--detach*) ;;
-        *)
-          case "$cmdline" in
-            *"--milestone ${tag}"*|*"--milestone ${version}"*) return 0 ;;
-          esac
-          if [[ "$cmdline" == *"--milestones"* ]]; then
-            case " $cmdline " in
-              *" ${tag} "*|*" ${version} "*) return 0 ;;
-            esac
-          fi
-          ;;
-      esac
-      ;;
-  esac
+  [[ ${#argv[@]} -gt 0 ]] || return 1
 
-  # Detached train ship: must include train, --merge, and the milestone.
-  # Per-issue "pipeline N" / "pipeline single N" never match (no --merge train).
-  case "$cmdline" in
-    *train*)
-      case "$cmdline" in
-        *--merge*)
-          case "$cmdline" in
-            *"--milestone ${tag}"*|*"--milestone ${version}"*) return 0 ;;
-          esac
-          case " $cmdline " in
-            *" ${tag} "*) return 0 ;;
-          esac
-          ;;
+  for ((i = 0; i < ${#argv[@]}; i++)); do
+    arg="${argv[i]}"
+    base="${arg##*/}"
+    case "$base" in
+      tugboat|tugboat.sh) is_tugboat=1 ;;
+      *tugboat*) is_tugboat=1 ;;
+      pipeline|pipeline.sh|pipeline.mjs|pipeline.js|pipeline.ts) has_pipeline_entry=1 ;;
+    esac
+    # node /path/to/pipeline.mjs (entrypoint is the next arg)
+    if [[ "$base" == "node" || "$base" == "nodejs" ]]; then
+      next="${argv[i + 1]:-}"
+      case "${next##*/}" in
+        pipeline|pipeline.sh|pipeline.mjs|pipeline.js|pipeline.ts) has_pipeline_entry=1 ;;
       esac
-      ;;
-  esac
+    fi
+    [[ "$arg" == "train" ]] && has_train=1
+    [[ "$arg" == "--merge" ]] && has_merge=1
+    [[ "$arg" == "--status" ]] && has_status=1
+    [[ "$arg" == "--detach" ]] && has_detach=1
+    if [[ "$arg" == "--milestone" || "$arg" == "-m" ]]; then
+      next="${argv[i + 1]:-}"
+      if [[ "$next" == "$tag" || "$next" == "$version" ]]; then
+        has_milestone=1
+      fi
+    fi
+    if [[ "$arg" == "--milestones" ]]; then
+      for ((j = i + 1; j < ${#argv[@]}; j++)); do
+        m="${argv[j]}"
+        [[ "$m" == --* ]] && break
+        if [[ "$m" == "$tag" || "$m" == "$version" ]]; then
+          has_milestone=1
+        fi
+      done
+    fi
+  done
+
+  # Owning tugboat: basename tugboat, exact milestone option, not status/detach.
+  if [[ $is_tugboat -eq 1 && $has_status -eq 0 && $has_detach -eq 0 && $has_milestone -eq 1 ]]; then
+    return 0
+  fi
+
+  # Pipeline train ship: exact positional train + exact --merge + milestone
+  # option/value, with a pipeline entrypoint (or node + pipeline script).
+  if [[ $has_pipeline_entry -eq 1 && $has_train -eq 1 && $has_merge -eq 1 && $has_milestone -eq 1 ]]; then
+    return 0
+  fi
   return 1
 }
 
-# Live-ship probe: scan host process cmdlines. Fails open to "not live" when
-# /proc is unreadable (never false-refuse detach on bare pid files).
+# Back-compat pure helper for tests that pass a single flattened string.
+# Word-splits for convenience only — production probe uses read_proc_argv.
+cmdline_is_live_ship() {
+  local cmdline=$1
+  local version=$2
+  local -a words=()
+  # shellcheck disable=SC2206
+  words=($cmdline)
+  argv_is_live_ship "$version" "${words[@]}"
+}
+
+# Live-ship probe: scan host process argv (NUL-delimited). Fails open to
+# "not live" when /proc is unreadable (never false-refuse on bare pid files).
 # Prints matching pid on stdout when live; return 0 live / 1 not live.
 # version = bare X.Y.Z (no leading v).
 live_ship_probe() {
   local version=$1
-  local pid cmdline
+  local pid
   local self=$$
   shopt -s nullglob
   for dir in /proc/[0-9]*; do
     pid=${dir#/proc/}
     [[ "$pid" == "$self" ]] && continue
-    [[ -r "$dir/cmdline" ]] || continue
-    # Convert null-separated argv to spaces.
-    cmdline=$(tr '\0' ' ' <"$dir/cmdline" 2>/dev/null || true)
-    [[ -n "${cmdline// /}" ]] || continue
-    if cmdline_is_live_ship "$cmdline" "$version"; then
+    read_proc_argv "$pid" || continue
+    if argv_is_live_ship "$version" "${__proc_argv[@]}"; then
       printf '%s\n' "$pid"
       return 0
     fi
@@ -323,7 +361,7 @@ live_ship_probe() {
 # NEVER write playbook.pid before winning the lock (that race stole the mutex).
 # Returns 0 if acquired, 1 if another live holder owns it (stdout = holder pid).
 # version = bare X.Y.Z (no leading v) — same milestone coordinate as the run_dir.
-# Holder retention uses cmdline_is_live_ship for THAT version only: a live
+# Holder retention uses argv_is_live_ship for THAT version only: a live
 # train/tugboat for a different milestone (stale/recycled lock pid) is reclaimed.
 # Note: this mutex is separate from the live-ship probe used for detach refuse.
 try_acquire_ship_lock() {
@@ -331,7 +369,6 @@ try_acquire_ship_lock() {
   local version=$2
   local lock_dir="$run_dir/lock"
   local holder=""
-  local holder_cmd=""
   mkdir -p "$run_dir"
 
   if mkdir "$lock_dir" 2>/dev/null; then
@@ -344,8 +381,7 @@ try_acquire_ship_lock() {
   if [[ -n "$holder" && "$holder" != "$$" ]] && kill -0 "$holder" 2>/dev/null; then
     # Only refuse if the holder is still a live ship for THIS milestone —
     # bare kill -0, or a live train/tugboat for another milestone, is reclaimed.
-    holder_cmd=$(tr '\0' ' ' <"/proc/$holder/cmdline" 2>/dev/null || true)
-    if [[ -n "$holder_cmd" ]] && cmdline_is_live_ship "$holder_cmd" "$version"; then
+    if read_proc_argv "$holder" && argv_is_live_ship "$version" "${__proc_argv[@]}"; then
       printf '%s\n' "$holder"
       return 1
     fi
@@ -363,6 +399,44 @@ try_acquire_ship_lock() {
   holder=$(cat "$lock_dir/pid" 2>/dev/null || echo unknown)
   printf '%s\n' "$holder"
   return 1
+}
+
+# Short-lived host mutex: serializes probe-and-spawn for one milestone so
+# concurrent Ship requests cannot both pass not-live and stack detached
+# tugboats. Refusing a second ship is still based on live_ship_probe while
+# holding the gate — not on gate presence alone (#1062 R2).
+try_acquire_detach_gate() {
+  local version=$1
+  local dir gate holder
+  local i
+  dir="$STATE_ROOT/ship-v$(safe_of "$version")"
+  gate="$dir/detach.gate"
+  mkdir -p "$dir"
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 \
+           21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 \
+           41 42 43 44 45 46 47 48 49 50; do
+    if mkdir "$gate" 2>/dev/null; then
+      printf '%s\n' "$$" >"$gate/pid"
+      return 0
+    fi
+    holder=$(cat "$gate/pid" 2>/dev/null || true)
+    if [[ -z "$holder" ]] || ! kill -0 "$holder" 2>/dev/null; then
+      rm -rf "$gate" 2>/dev/null || true
+      continue
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+release_detach_gate() {
+  local version=$1
+  local gate="$STATE_ROOT/ship-v$(safe_of "$version")/detach.gate"
+  local holder
+  holder=$(cat "$gate/pid" 2>/dev/null || true)
+  if [[ -z "$holder" || "$holder" == "$$" ]]; then
+    rm -rf "$gate" 2>/dev/null || true
+  fi
 }
 
 # Find open release PR for bare version X.Y.Z (title "release: X.Y.Z …").
@@ -426,7 +500,9 @@ detach_self() {
   local self
   self=$(readlink -f "$0")
   local args=()
-  local m run_dir holder
+  local m holder pid
+  local -a gates=()
+  local _wait
   pin_repo_dir
   if [[ -z "$REPO_DIR" || ! -d "$REPO_DIR" ]]; then
     echo "FAIL: REPO_DIR required and must be a directory (got: ${REPO_DIR:-<unset>})" >&2
@@ -442,8 +518,40 @@ detach_self() {
   # Idempotent detach: live-ship probe ONLY may refuse a second detach (#1062).
   # Bare playbook.pid + kill -0, issue-run locks, and stale state are NOT live.
   # Buzz and TUI paste share this path — no paste detector.
+  #
+  # Serialize probe-and-spawn with a short-lived per-milestone detach.gate so
+  # two concurrent Ship requests cannot both observe not-live and stack
+  # detached tugboats. Second request is refused only when re-probe is live
+  # while holding the gate — not merely because the gate exists (#1062 R2).
+  release_held_detach_gates() {
+    local g
+    for g in "${gates[@]}"; do
+      release_detach_gate "$g"
+    done
+    gates=()
+  }
+
+  for m in "${milestones[@]}"; do
+    if ! try_acquire_detach_gate "$m"; then
+      # Gate timeout: re-probe; if live, refuse as duplicate. Else fail closed
+      # rather than risk stacking another detached tugboat.
+      if holder=$(live_ship_probe "$m" 2>/dev/null); then
+        release_held_detach_gates
+        echo "ship v$m already running (pid $holder) — not detaching a second copy"
+        emit_status_json "$m"
+        notify "ship v$m already running (pid $holder) — ignored duplicate detach" "tug-dup-detach-$m-$$" --force
+        return 0
+      fi
+      release_held_detach_gates
+      echo "FAIL: could not acquire detach gate for v$m (concurrent ship in progress?)" >&2
+      exit 1
+    fi
+    gates+=("$m")
+  done
+
   for m in "${milestones[@]}"; do
     if holder=$(live_ship_probe "$m" 2>/dev/null); then
+      release_held_detach_gates
       echo "ship v$m already running (pid $holder) — not detaching a second copy"
       emit_status_json "$m"
       notify "ship v$m already running (pid $holder) — ignored duplicate detach" "tug-dup-detach-$m-$$" --force
@@ -459,11 +567,26 @@ detach_self() {
     RELEASE_CHECKS_GREEN_BIN="$RELEASE_CHECKS_GREEN_BIN" \
     TRAIN_STATUS_COMPLETE_BIN="$TRAIN_STATUS_COMPLETE_BIN" \
     "$self" "${args[@]}" >/dev/null 2>&1 &
-  local pid=$!
+  pid=$!
   echo "detached tugboat ship ${milestones[*]} (pid $pid)"
   # Do NOT write playbook.pid here — the child acquires the lock then writes it.
   # Writing the parent/nohup pid here raced and let a second detach steal the lock.
+
+  # Hold gate until the new ship is visible to live_ship_probe (or brief timeout)
+  # so a concurrent waiter re-probes after we release and sees live.
+  for _wait in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    if live_ship_probe "${milestones[0]}" >/dev/null 2>&1; then
+      break
+    fi
+    if kill -0 "$pid" 2>/dev/null && read_proc_argv "$pid" \
+      && argv_is_live_ship "${milestones[0]}" "${__proc_argv[@]}"; then
+      break
+    fi
+    sleep 0.05
+  done
+
   notify "detached ship ${milestones[*]} (pid $pid)" "tug-detach-$$" --force
+  release_held_detach_gates
 }
 
 # ---------- status / detach (before any single-milestone bind) --------------
