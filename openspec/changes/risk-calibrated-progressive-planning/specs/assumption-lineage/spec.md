@@ -21,3 +21,23 @@ When progressive-planning policy (or any planning-depth selection) chooses a lig
 - **WHEN** routing resolves to `request_human_authority` and open or deferred assumptions exist
 - **THEN** the open/deferred assumption set SHALL remain reconstructable from the run lineage stream for the handoff surface
 - **AND** SHALL NOT be cleared as a side effect of parking for human authority
+
+#### Scenario: assumption_id list not count alone for reconstructability
+
+- **WHEN** a progressive-planning recommendation carries `preserve_assumptions` with supplied `open_or_deferred_assumption_ids`
+- **THEN** those `assumption_id` values SHALL match open or deferred rows in the run’s current-state lineage projection
+- **AND** a numeric open/deferred count without ids SHALL NOT be treated as sufficient proof that the underlying set is reconstructable
+
+#### Scenario: same ids across lightweight deep and human paths
+
+- **WHEN** the same open and deferred `assumption_id` values are present on a run
+- **AND** offline composition is evaluated under lightweight, deepen, and `request_human_authority` inputs
+- **THEN** each recommendation path that attaches `preserve_assumptions` SHALL echo those same `assumption_id` values
+- **AND** SHALL NOT mint replacement identities
+
+#### Scenario: contradictory count and id list is rejected
+
+- **WHEN** offline composition is given a non-empty `open_or_deferred_assumption_ids` list
+- **AND** a numeric `open_or_deferred_assumption_count` that does not equal the deduped id list length
+- **THEN** composition SHALL reject the input before producing a recommendation
+- **AND** when only ids are supplied, the open count used for routing SHALL be derived from the deduped id list

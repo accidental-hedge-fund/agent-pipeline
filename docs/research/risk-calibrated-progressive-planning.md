@@ -79,8 +79,55 @@ Assignment rules:
 | `novelty` | First use of external integration in-repo; new subsystem directory with no pattern match; operator-declared “greenfield” marker | New file in an established pattern (e.g. another stage file under `core/scripts/stages/`); copy-extend of existing module |
 | `dependency_uncertainty` | Open `Depends on` / blocked-on issues not closed; unresolved external dep versions; declared dependency grammar targets not ready | Closed dependencies; soft “nice-to-have” references without blocking semantics |
 | `security_compliance` | AuthN/AuthZ, secrets, PII, regulated data, privilege elevation; pre-code `auth` trigger; compliance/audit markers in issue or design | Mention of “security” in prose without surface touch; security **docs** only with no code path to auth/secrets/PII |
-| `observed_rework_cost` | Historical #702 material rework rates and #576 production follow-up for similar depth×risk cohorts with `authority: observed` preferred | Invented rates; inferred joins treated as observed; n below sample floor (see §7) |
+| `observed_rework_cost` | Historical #702 material rework rates and #576 production follow-up for **prior completed** depth×risk cohorts with `authority: observed` preferred; must satisfy the pre-routing provenance contract (§2.3) | Invented rates; inferred joins treated as observed; n below sample floor (see §7); **any** material_rework / review / production_outcome belonging to the **target run** or completed after `recommendation_as_of` |
 | `unknown` | No class matched after allowed sources checked; or evidence unreadable | Used as a **bucket for insufficient evidence**, not a claim of safety |
+
+### 2.3 Pre-routing provenance for `observed_rework_cost`
+
+`history_available` / `history_elevated` MUST be computed only from completed work available **before** the target recommendation. Composition rejects elevation when provenance is missing or invalid (`history_provenance_rejected`).
+
+| Field | Rule |
+| --- | --- |
+| `recommendation_as_of` | ISO-8601 instant of composition |
+| `history_cutoff_at` | Upper bound for cohort membership; MUST be ≤ `recommendation_as_of` |
+| `target_run_id` | Run being routed; MUST NOT appear in `cohort_run_ids` |
+| `cohort_run_ids` | Prior completed runs that contributed rates |
+| `cohort_completed_at[run_id]` | Required for each cohort id; MUST be `< recommendation_as_of` and ≤ `history_cutoff_at` |
+
+**Forbidden inputs (outcome leakage):**
+
+- Target-run `material_rework`, fix-round, review_effort, or `production_outcome` records
+- Any cohort run with `completed_at ≥ recommendation_as_of`
+- Missing provenance object when `history_available: true`
+
+Pure helper: `validateObservedReworkProvenance` in `core/scripts/progressive-planning/compose.ts`.
+
+### 2.4 Per-class evidence provenance (every asserted class)
+
+Every progressive class assertion that contributes an action floor MUST carry **immutable pre-routing evidence**:
+
+| Field | Rule |
+| --- | --- |
+| `evidence[].ref` | Non-empty stable pointer (path glob, label, design marker, prior run id, event id) |
+| `evidence[].source_kind` | Closed allowed set only: `structural` \| `declared` \| `historical_observed` |
+| `evidence[].observed_as_of` | ISO-8601; MUST be ≤ `recommendation_as_of` (pre-routing) |
+
+**Forbidden source kinds for class assignment** (rejected; no elevation):
+
+| Kind | Why |
+| --- | --- |
+| `outcome_derived` | Target-run material_rework / production_outcome / fix-round after routing |
+| `post_routing` | Evidence timestamp after `recommendation_as_of` |
+| `llm_free_text` | Not a standalone automation class assignment |
+
+**Composition behavior:**
+
+- Structured class entries without valid evidence → `class_evidence_missing` or `class_evidence_rejected`; class is **not** matched; no action floor from it.
+- Bare string class shorthand without evidence → same rejection when `require_class_evidence` is true (default).
+- `unknown` may omit evidence (bucket for insufficient evidence).
+- Refs encoding `production_outcome:…`, `material_rework:target…`, or `outcome_derived:…` are rejected even if `source_kind` is mislabeled as structural.
+
+Pure helpers: `validateClassEvidenceRef`, `validateClassEvidenceAssignment` in `compose.ts`.
 
 ### 2.2 Mapping to planning-leverage `risk_class` / pre-code triggers
 
@@ -124,6 +171,8 @@ Primary depth-like actions (exclusive pick by max severity):
 lightweight_plan < standard_plan < deepen_product ≈ deepen_technical
   < zoom_feasibility ≈ zoom_vertical_slice < request_human_authority
 ```
+
+**Provisional hypothesis (not calibrated policy):** This total order and the non-safety class floors in §3.3 (`ambiguity`→`deepen_product`, `novelty`→`zoom_feasibility`, etc.) are **starting hypotheses** for offline fixtures. They are **not** retained as calibrated conclusions until #702/#576 cohort results show acceptable FP/FN tradeoffs relative to materially plausible alternative orderings (e.g. swapping zoom vs deepen tiers, or flooring `novelty` at `deepen_technical`). Safety floors that map incomplete `security_compliance` / irreversible work without rollback to `request_human_authority` remain fail-closed defaults independent of that calibration; only their **coexistence** with non-safety floors is re-ranked by evidence. **Evaluation result required to retain:** hold-out window report (§7) with per-class FP/FN and a sensitivity table against at least one alternative severity order; retain only if FP/FN stay within the operator-accepted band documented in that report.
 
 Stacking rules:
 
@@ -185,20 +234,38 @@ Sub-actions stay in the action id field; they do **not** invent new depth enum v
 
 | Evidence state | Default |
 | --- | --- |
-| No signals matched | `standard_plan` (+ `preserve_assumptions` if open questions/assumptions) |
+| No signals matched **and** high-severity predicate scan complete | `standard_plan` (+ `preserve_assumptions` if open questions/assumptions); diagnostic `unknown_default` |
+| High-severity predicate scan **incomplete** (declarations/structure not checked) | **Not** ordinary `standard_plan`: floor `deepen_technical` + `preserve_assumptions`; diagnostic `high_severity_scan_incomplete` — never `lightweight_plan` / never `unknown_default` |
 | Conflicting signals (e.g. “low risk” label vs `auth` / public-api structural) | Prefer **more restrictive** action; record conflict diagnostic |
+| Structured safety conflicts (§4.1) | Fail closed to elevating floor; **never** ordinary `standard_plan` or `lightweight_plan` |
 | Historical rework / production data unavailable | Do not invent rates; omit `observed_rework_cost`; structural/declared only |
+| Historical rates claimed without valid pre-routing provenance (§2.3) | Treat as unavailable (`history_provenance_rejected`); structural/declared only |
 | Irreversible / high-blast / security / compliance matched with incomplete sub-signals | Floor: `request_human_authority` or documented `deepen_technical` + `preserve_assumptions` — **never** `lightweight_plan` solely for missing history |
 | Lightweight recommended but open/deferred assumptions remain | **MUST** attach `preserve_assumptions` |
 | Stale evidence (expired attestation, superseded dossier) | Treat high-severity classes as incomplete → fail closed per §5 |
 
-**Fail-closed principle:** silent under-planning of irreversible, high-blast, security, or compliance work is forbidden. Unknown non-high-severity work fails to **standard**, not minimal.
+**Fail-closed principle:** silent under-planning of irreversible, high-blast, security, or compliance work is forbidden. Unknown non-high-severity work fails to **standard**, not minimal — and only after the high-severity scan attests that those predicates were evaluated.
+
+**High-severity scan (precondition for `unknown_default` → `standard_plan`):** before the no-signals branch may select ordinary `standard_plan`, the caller MUST evaluate the §5.1 / §5.3 predicates using **structural and declared** sources (pre-code path/label triggers, design-gate classes, issue/OpenSpec markers, path-prefix scope). Omitting that scan (`high_severity_scan_complete: false`) is an adversarial / incomplete-input case: composition fails closed to deepen, not to standard. Empty `classes` with `high_severity_scan_complete: true` means “scan finished; no match,” not “scan skipped.”
+
+### 4.1 Safety evidence conflict matrix (declared vs structural)
+
+When declared markers and structural signals **contradict** on a safety dimension, composition records `safety_conflict` + `conflict` and applies the **elevating** floor. Clearing declarations never override elevating structure.
+
+| Dimension | Declared clearing + structural elevating (and reverse) | Conservative floor | May reach standard/lightweight? |
+| --- | --- | --- | --- |
+| `rollback` | e.g. issue says “has rollback” but plan has DROP without reverse migration | `request_human_authority` + `deepen_technical` + `preserve_assumptions` | **No** |
+| `security` | e.g. “docs only / not security” label vs pre-code `auth` path | `request_human_authority` + `deepen_technical` + `preserve_assumptions` | **No** |
+| `compliance` | e.g. no compliance label vs regulated retention control in design | `request_human_authority` + `deepen_technical` + `preserve_assumptions` | **No** |
+| `blast_radius` | e.g. “single module” claim vs multi-package public-api structural match | `deepen_technical` + `zoom_feasibility` + `preserve_assumptions` | **No** |
+
+Representation: `ComposeRoutingInput.safety_conflicts[]` with `{ dimension, declared_polarity, structural_polarity }` where polarity ∈ {`elevating`,`clearing`}. Same-polarity pairs are not contradictions; elevating-only still applies the floor. Pure helper: `resolveSafetyConflicts`.
 
 ---
 
 ## 5. Human-authority boundaries
 
-Human authority is a **closed checklist**. Satisfying it requires a real human sign-off event (operator disposition, audited authority record). The following do **not** count:
+Human authority is a **closed checklist** with an operational data dictionary (§5.3). Satisfying it requires a real human sign-off event (operator disposition, audited authority record). The following do **not** count:
 
 - Agent plan-review approve (including same-harness fallback)
 - Optional human **feedback window** without explicit authority disposition
@@ -207,12 +274,14 @@ Human authority is a **closed checklist**. Satisfying it requires a real human s
 
 ### 5.1 Checklist (policy floor → `request_human_authority`)
 
-1. **Irreversible:** production/data/shared-state mutation without a documented automated rollback path.
-2. **High blast radius:** multi-tenant or cross-system schema/API break with external consumers, or multi-repo coordinated cutover without a staged rollout plan.
-3. **Security-sensitive:** AuthN/AuthZ model change, secret handling, privilege elevation, or security boundary move.
-4. **Compliance-sensitive:** regulated data processing change or audit-required control change.
+Predicate ids (closed): `irreversible_no_automated_rollback` | `high_blast_radius` | `security_sensitive` | `compliance_sensitive` (see `HUMAN_AUTHORITY_PREDICATES` in schema).
 
-When any item fires, routing includes `request_human_authority`. Agent plan-review approval alone **does not** satisfy the boundary.
+1. **Irreversible (`irreversible_no_automated_rollback`):** production/data/shared-state mutation without a documented automated rollback path.
+2. **High blast radius (`high_blast_radius`):** see §5.3 blast criteria — not limited to multi-tenant wording.
+3. **Security-sensitive (`security_sensitive`):** AuthN/AuthZ model change, secret handling, privilege elevation, or security boundary move.
+4. **Compliance-sensitive (`compliance_sensitive`):** regulated data processing change or audit-required control change.
+
+When any predicate fires, routing includes `request_human_authority` (compose: `human_authority_boundary: true` or class floors for reversibility without rollback / incomplete security). Agent plan-review approval alone **does not** satisfy the boundary.
 
 ### 5.2 Distinction from plan-review and feedback window
 
@@ -224,28 +293,68 @@ When any item fires, routing includes `request_human_authority`. Agent plan-revi
 
 Open/deferred assumptions must remain reconstructable on the handoff surface when parking for human authority (see §6).
 
+### 5.3 Operational data dictionary (evidence required)
+
+| Predicate id | Observable / declared evidence that **sets** the predicate | Evidence that **clears** or does not set | Borderline resolution |
+| --- | --- | --- | --- |
+| `irreversible_no_automated_rollback` | Plan/design names data wipe, DROP without reverse migration, force-push to shared branch, shared production secret rotation without dual-control rollback; `automated_rollback_documented !== true` on reversibility class | Feature-flag kill switch documented in-repo; forward+back migration pair committed; reversible config toggle with documented restore steps | **Sets:** single-repo schema DROP COLUMN of retained data with no down migration. **Does not set:** additive nullable column with documented down migration. |
+| `high_blast_radius` | **Any one of:** (a) multi-tenant schema/API break; (b) cross-system / multi-repo coordinated cutover without staged rollout plan; (c) public API or wire-format break with external consumers declared or path-triggered (`public-api`); (d) **default-traffic deploy surface** per narrow criteria below (not ordinary app delivery); (e) path-prefix growth across ≥2 top-level packages **and** design-gate `architecture` / `large-diff` when coupled with public contract change | Single private module; docs-only; test-only; internal API with no external consumers declared and no `public-api` trigger; **ordinary production app release through existing CI/CD** | **Sets:** single-repo public REST field rename with external consumers in issue body. **Does not set:** rename of a non-exported helper in one package. **Sets:** change to deploy pipeline / CDN / auth gateway / ingress that alters default production traffic path, or forced all-tenant rollout without staged plan. **Does not set:** normal feature merge via existing pipeline; feature-flagged or canary rollout with documented staged plan; CI-only workflow with no deploy path. |
+| `security_sensitive` | Pre-code / design-gate `auth` trigger; plan touches AuthN/AuthZ model, secret storage/handling, privilege elevation, or trust-boundary move; issue/OpenSpec security control change | Security **docs** only; mention of “security” in prose without code path to auth/secrets/PII | **Sets:** session cookie flags change. **Does not set:** README security section edit with no code. |
+| `compliance_sensitive` | Explicit regulated-data marker (PII retention, audit log control, legal hold) in issue/OpenSpec; compliance label or design decision requiring audit control change | Generic “we should be careful” prose; unregulated telemetry wording without control change | **Sets:** change to audit-log retention period for regulated tenants. **Does not set:** adding an optional debug log in a non-regulated path. |
+
+**How compose sets `human_authority_boundary`:** callers evaluate §5.3 with structural+declared sources and pass `human_authority_boundary: true` when any predicate sets. Class floors additionally force human authority for reversibility without `automated_rollback_documented: true` and for incomplete `security_compliance` sub-signals.
+
+#### Default-traffic deploy criterion (narrow; not ordinary production delivery)
+
+Predicate sub-clause (d) of `high_blast_radius` is **not** “any production deploy.” Ordinary application delivery through an existing pipeline does **not** set high blast by itself.
+
+| Case | Sets high blast via deploy criterion? | Rationale |
+| --- | --- | --- |
+| App feature ships via existing CI/CD; no pipeline/infra change | **No** | Routine production delivery |
+| Feature-flagged or canary rollout with documented staged plan | **No** | Staged / non-default path |
+| CI-only workflow edit; no deploy path | **No** | No production traffic surface |
+| Change to deploy pipeline, release infra, CDN, auth gateway, or cluster ingress that alters **default** production traffic path | **Yes** | Default-traffic path change |
+| Forced all-tenant / default-traffic rollout without staged or canary plan | **Yes** | Unscoped blast |
+| Capacity or routing cutover that moves default traffic | **Yes** | Default-traffic path change |
+
+Pure helper: `isHighBlastDefaultTrafficDeploy` in `schema.ts` (positive/negative fixture cases in unit tests).
+
 ---
 
 ## 6. Assumption and open-question lineage under progressive depth
 
-Compose with #702 `assumption_lineage` emitters. Progressive routing **never**:
+Compose with #702 `assumption_lineage` emitters (`core/scripts/planning-leverage/assumptions.ts`). Progressive routing **never**:
 
 - deletes open/deferred assumptions because `planning_depth` is `minimal` or action is `lightweight_plan`
 - omits open/deferred items from carry-forward projections solely due to light planning
 - mints a second `assumption_id` for the same logical assumption when attaching `preserve_assumptions`
 
+### 6.1 Traceability contract (count vs identity)
+
+| Layer | Role |
+| --- | --- |
+| `assumption_lineage` event stream | Source of truth: `assumption_id`, `status`, `introduced_phase`, `resolved_in_phase`, statement |
+| `projectAssumptionCurrentState` | Latest status per `assumption_id` for a `run_id` |
+| `open_or_deferred_assumption_ids` | Compose input: explicit id list for open/deferred rows |
+| `open_or_deferred_assumption_count` | Routing-only fallback when ids are not supplied; **does not** prove reconstructability |
+| `preserved_assumption_ids` on recommendation | Echo of supplied ids; consumers re-join the lineage stream by `run_id` + id |
+
+**Count vs id agreement:** when `open_or_deferred_assumption_ids` is non-empty, the open count is **derived** from the deduped id list. If the caller also supplies `open_or_deferred_assumption_count` and it **disagrees** with the deduped length, composition **throws** (`assumption_count_id_mismatch`) and produces **no** recommendation. Silent override of a contradictory count is forbidden.
+
+**Reconstructability rule:** given a recommendation with `preserve_assumptions` and a run event stream, the open/deferred set MUST equal `projectAssumptionCurrentState(events, run_id)` filtered to status ∈ {`open`,`deferred`}. A count alone is insufficient for handoff surfaces.
+
 Requirements:
 
-- Lightweight paths still emit and carry lineage records.
+- Lightweight, deep, and human-authority paths still carry the same `assumption_id` values.
 - Implementation and review remain consumers of open items.
-- `request_human_authority` handoff includes the open/deferred set from the run lineage stream.
+- `request_human_authority` handoff includes the open/deferred set from the run lineage stream (ids + statuses).
 - Status transitions stay on the same `assumption_id` (`open` → `resolved` / `deferred` / `invalidated`).
 
 ---
 
 ## 7. Offline evaluation design
 
-Evaluation is **batch/offline** over host-local run stores + outcome stores. It does **not** require live auto-routing. Causal claims are **not** required; associational cohort rates with sample size are sufficient until observe-mode exists.
+Evaluation is **batch/offline** over host-local run stores + outcome stores. It does **not** require live auto-routing. Causal claims are **not** required. **Associational rates alone are not sufficient for routing calibration** when planning depth is confounded with inherent task difficulty: deeper plans often attach to harder work that also has more rework. Calibration MUST use the confounding-controlled protocol in §7.3 before any action floor is retained or changed.
 
 ### 7.1 Join keys (#702 / #576)
 
@@ -256,6 +365,27 @@ Evaluation is **batch/offline** over host-local run stores + outcome stores. It 
 | In-pipeline rework | `run_id`, `materiality`, `material_criteria`, `fix_round`, review_effort | Material ≠ ordinary formatting |
 | Production outcomes | attribution `target_type: production_outcome` or run/commit/pr joins | Preserve `authority: observed \| inferred` |
 | Progressive recommendation (future observe) | offline-computed action ids + `recommended_planning_depth` | Not applied in advance until policy enforces |
+| Pre-routing severity strata | structural progressive class multi-label set **before** depth selection; repo/domain id; issue size band (files/LOC estimate when available) | Used for matching — never post-outcome class labels |
+
+### 7.1.1 Source of progressive multi-label classes for offline eval (no observe-mode yet)
+
+This research package does **not** emit observe-mode recommendations into the advance loop. Offline strata still need a progressive multi-label class set per target run. Allowed sources (immutable or blinded; **never** target-run outcomes):
+
+| Source | Keying / procedure | Forbidden |
+| --- | --- | --- |
+| **A. Immutable pre-routing snapshot** (when present) | Prefer a planning-time snapshot of progressive classes + per-class evidence refs + `recommendation_as_of` stored before depth selection / implementation (future observe-mode or offline script attach). Join key: `run_id` + snapshot `as_of` ≤ first implement event. | Recomputing classes after material_rework or production_outcome exists for that run and folding those outcomes into the snapshot |
+| **B. Blinded retrospective coding** | Coder (human or script) assigns progressive classes using **only** evidence available at planning start: issue body/labels at open, OpenSpec design at plan-complete, pre-code path/label triggers, path-prefix scope, declared dependency grammar — timestamped ≤ planning phase end. Record evidence refs per §2.4. Blind to review findings, fix rounds, material_rework, and production outcomes for the target run. | Unblinded coding after reading rework/production labels; using post-merge incident text as class evidence |
+| **C. Prior-cohort historical only for `observed_rework_cost`** | Same §2.3 provenance; prior runs only | Target-run history |
+
+**Join procedure for a target run R:**
+
+1. Resolve `planning_as_of` = end of planning phase for R (or plan-review complete time).
+2. Obtain progressive class multi-label set via A if snapshot exists; else B with evidence cutoff = `planning_as_of`.
+3. Attach #702 selected `planning_depth`, `risk_class`/`risk_classes`, assumption ids by `run_id`.
+4. Attach in-pipeline rework and #576 production outcomes **after** class assignment is frozen.
+5. Form strata from step-2 classes × repo/domain × size band; then compute within-stratum outcome rates.
+
+Until A exists in production telemetry, offline eval documents which runs used A vs B and keeps coding worksheets with evidence refs.
 
 ### 7.2 Primary outcome dimensions
 
@@ -263,17 +393,46 @@ Evaluation is **batch/offline** over host-local run stores + outcome stores. It 
 2. **Review effort** — `findings_blocking`, `findings_advisory`, `re_review_count` with per-field availability.
 3. **Fix rounds** — count of fix-stage iterations when observed.
 4. **Material rework** — rates of `materiality: material` and criterion breakdowns (not a productivity score).
-5. **Post-merge production/rework** — #576 kinds (`follow_up_rework`, `reversion`, `escaped_defect`, etc.) when join exists.
+5. **Post-merge production/rework** — #576 kinds (`follow_up_rework`, `reversion`, `escaped_defect`, etc.) when join exists **and** the run is outcome-eligible under §7.2.1.
 
 Missing production or materiality → label **unavailable** / omit metric; **do not** treat missing as successful zero-rework.
 
-### 7.3 Cohort keys and reporting
+For each reported rate, also report: **n**, **unavailable count**, and an uncertainty band (Wilson or bootstrap CI when n ≥ 10; otherwise withhold rate and report n only).
 
-- Address rows by selected `planning_depth` × primary `risk_class` (and multi-class set when present).
-- Optionally stratify by progressive class multi-label set when offline classifier is applied.
+### 7.2.1 Post-merge time-at-risk and censoring
+
+Post-merge production/rework comparisons use a **fixed follow-up eligibility horizon** so recent merges are not scored as “no incident.”
+
+| Rule | Value / treatment |
+| --- | --- |
+| Default observation horizon | **H = 14 days** after merge (or after production deploy time when that is the attribution anchor). Constant: `DEFAULT_POST_MERGE_OBSERVATION_HORIZON_DAYS`. Operators may document a longer H for a window (e.g. 30 days) but must not mix H within one report without stratification. |
+| Eligibility | A run is **outcome-eligible** for binary “any production follow-up within H” only when `eval_as_of ≥ merge_at + H`. |
+| Not yet observable | If `eval_as_of < merge_at + H`, label production metrics **`not_yet_observable`** (a form of right-censoring). Count these under **unavailable / not-yet-observable**, **not** under negative (no incident). |
+| Observed negative | Eligible run with no production_outcome of the measured kinds with `detected_at` ∈ `(merge_at, merge_at + H]` and join authority recorded. |
+| Observed positive | Eligible run with ≥1 such outcome in the window. |
+| Late discovery after H | Incidents with `detected_at > merge_at + H` are reported in a separate **late_discovery** bucket; they do **not** convert an eligible negative into a positive for the primary H-window rate (optional sensitivity: H=30 or H=90 tables). |
+| Missing merge/deploy anchor | Production metric **unavailable** (not negative). |
+
+**Reporting:** every post-merge rate table columns MUST include `n_eligible`, `n_not_yet_observable`, `n_unavailable_join`, `n_positive`, `n_negative`, and optional `n_late_discovery`. Never zero-fill not-yet-observable as success.
+
+### 7.3 Cohort keys, matching, and confounding controls
+
+**Naive depth×outcome tables are banned as sole calibration evidence.** Hard work both receives deeper plans and has more rework; an unadjusted association will look like “deep planning causes rework.”
+
+**Comparable pre-routing cohorts:**
+
+1. Form strata **before** looking at outcomes: progressive multi-label class set (or PL `risk_classes[]`), repository/domain, and optional size band.
+2. Within each stratum, compare runs that received different planning actions / depths (observational) **or** compare offline **counterfactual recommendations** against actual selected depth without claiming causation.
+3. Prefer exact stratum match; when sparse, coarsen class set (drop novelty/ambiguity first; never drop security/reversibility/blast from the match key).
+4. Report **within-stratum** outcome deltas with n per cell; do not pool across high-severity and docs-only work.
+5. Sensitivity: re-run tables with an alternative severity order (§3.2) and show whether retain/revise decisions flip.
+6. Uncertainty: every retained floor must cite stratum ids, n, CI/withheld flag, and whether production joins were observed vs inferred.
+
+**Reporting rules (continued):**
+
 - Always report **sample size n** when showing rates.
 - Partition **observed** vs **inferred** production joins; never present inferred as observed fact.
-- Label rates as **associational** (or derived with availability metadata). No required causal impact claim.
+- Label rates as **associational within matched strata** (or derived with availability metadata). No required causal impact claim — but also **no** routing calibration from unmatched pooled associations alone.
 
 ### 7.4 False-positive and false-negative (operational)
 
@@ -378,3 +537,5 @@ Tests: fixture-only, no network/git/subprocess.
 | Version | Date | Notes |
 | --- | --- | --- |
 | progressive-planning-v1 | 2026-08-15 | Initial research package for #703; host evidence n≈0; automation off |
+| progressive-planning-v1 (challenge pass) | 2026-08-15 | Pre-routing rework provenance; high-severity scan gate; human-authority data dictionary; assumption_id lineage; confounding-controlled offline eval; severity order marked provisional |
+| progressive-planning-v1 (challenge pass 2) | 2026-08-15 | Per-class evidence provenance; safety conflict matrix; narrow default-traffic deploy; count/id agreement; offline class sources A/B; post-merge H-day censoring |

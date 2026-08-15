@@ -47,10 +47,12 @@ See proposal.md for motivation and acceptance criteria.
 | `novelty` | No in-repo pattern match; new subsystem; first use of external integration |
 | `dependency_uncertainty` | Unresolved external deps; blocked-on open issues; declared `Depends on` without closed targets |
 | `security_compliance` | Auth, secrets, PII, regulated data, permission model, attestation triggers (`auth`, etc.) |
-| `observed_rework_cost` | Historical material rework / production follow-up rates for similar depth×risk cohorts (from #702/#576) |
+| `observed_rework_cost` | Historical material rework / production follow-up rates for **prior completed** depth×risk cohorts (from #702/#576) under a pre-routing provenance contract (`recommendation_as_of`, cutoff, exclude `target_run_id`) |
 | `unknown` | Insufficient evidence after declared sources checked |
 
-A run may carry **multiple** classes (same pattern as `risk_classes[]` on planning-leverage). Routing uses the **most restrictive** applicable action among matched classes (see D4), not an average score.
+A run may carry **multiple** classes (same pattern as `risk_classes[]` on planning-leverage). Routing uses the **most restrictive** applicable action among matched classes (see D4), not an average score. `observed_rework_cost` elevation MUST NOT use the target run’s later review, material rework, or production outcomes.
+
+Every asserted progressive class that contributes an action floor MUST carry per-class evidence refs (`ref`, `source_kind` ∈ structural|declared|historical_observed, `observed_as_of` ≤ `recommendation_as_of`). Forbidden kinds: `outcome_derived`, `post_routing`, `llm_free_text`. Invalid or missing evidence rejects the class assignment (no elevation).
 
 **Rationale:** Issue forbids one opaque risk score; multi-label matches pre-code multi-trigger practice.
 
@@ -88,6 +90,8 @@ Composition: when multiple classes match, select the **maximum severity action**
 
 `lightweight_plan` < `standard_plan` < `deepen_product` ≈ `deepen_technical` < `zoom_*` < `preserve_assumptions` (can stack) < `request_human_authority`.
 
+This severity order and non-safety class floors are **provisional hypotheses** until #702/#576 matched-stratum FP/FN calibration retains or revises them. Safety floors (incomplete security / irreversible without rollback → human authority) remain fail-closed defaults.
+
 `preserve_assumptions` **stacks** with any depth action (does not replace deepen). `request_human_authority` always wins when its class criteria fire.
 
 Selected action(s) map to recommended `planning_depth` (`minimal` / `standard` / `deep`) for **evaluation and future policy only** — not applied automatically in this change.
@@ -100,17 +104,21 @@ Selected action(s) map to recommended `planning_depth` (`minimal` / `standard` /
 
 | Evidence state | Default |
 | --- | --- |
-| No signals matched | `standard_plan` + `preserve_assumptions` if any open questions exist, else `standard_plan` |
+| No signals matched **and** high-severity predicate scan complete | `standard_plan` + `preserve_assumptions` if any open questions exist, else `standard_plan` |
+| High-severity predicate scan incomplete | Fail closed: `deepen_technical` + `preserve_assumptions` (not ordinary `standard_plan` / not `lightweight_plan`) |
 | Conflicting signals (e.g. “low risk” label vs `auth` path globs) | Prefer the **more restrictive** action; record conflict diagnostic |
+| Structured safety conflicts (rollback / blast / security / compliance declared vs structural) | Fail closed to elevating floor (`request_human_authority` for rollback/security/compliance; deepen+zoom for blast); never ordinary standard or lightweight |
 | Historical rework data unavailable | Do not invent rates; use structural/declared signals only; label `observed_rework_cost` as unavailable |
+| Historical rates without valid pre-routing provenance | Reject elevation; treat as unavailable |
 | Irreversible / security / compliance class matched with any missing sub-signal | `request_human_authority` or at least `deepen_technical` + `preserve_assumptions` (research note pins which class → which floor) |
-| Lightweight recommended but open assumptions remain | MUST attach `preserve_assumptions` |
+| Lightweight recommended but open assumptions remain | MUST attach `preserve_assumptions` and carry `assumption_id`s when supplied |
+| Assumption count vs non-empty id list disagree | Reject input; produce no recommendation |
 
 **Rationale:** Fail closed for high-blast and security; fail standard (not minimal) when unknown.
 
 ### D6 — Assumption lineage is mandatory carry-forward under progressive depth
 
-**Decision:** Progressive routing never deletes open/deferred assumptions. Lightweight paths still emit and carry `assumption_lineage` records. Review and implementation phases remain consumers of open items. Escalation to human authority includes the open-assumption set in the handoff surface.
+**Decision:** Progressive routing never deletes open/deferred assumptions. Lightweight paths still emit and carry `assumption_lineage` records. Review and implementation phases remain consumers of open items. Escalation to human authority includes the open-assumption set in the handoff surface. Reconstructability is by stable `assumption_id` via `projectAssumptionCurrentState` (and recommendation `preserved_assumption_ids` when ids are supplied). An open/deferred **count alone** is a routing signal only — it does not prove lineage reconstruction. When ids are supplied, count is derived from the deduped id list; a supplied count that disagrees with that length is rejected before any recommendation is produced.
 
 **Rationale:** Issue acceptance criterion; reuses #702 lineage rather than inventing parallel storage.
 
@@ -126,8 +134,12 @@ Selected action(s) map to recommended `planning_depth` (`minimal` / `standard` /
 
 **Comparisons:**
 
-- Cohort by selected `planning_depth` × primary `risk_class` / multi-class sets
-- Counterfactual framing is **associational** until an observe-mode policy exists: report conditional rates with sample size and confidence bands; **do not** claim “deeper planning caused lower rework” without experimental design
+- Form **pre-routing strata** (progressive multi-label class set, repo/domain, optional size band) **before** outcome joins; compare planning actions **within** strata
+- Obtain progressive class sets for offline eval from **immutable pre-routing snapshots** when available, else **blinded retrospective coding** from planning-time structural/declared evidence only (research note §7.1.1) — never from target-run outcomes
+- Do **not** calibrate floors from unmatched pooled depth×rework associations (confounds inherent difficulty with planning investment)
+- Counterfactual framing is **associational within matched strata** until an observe-mode policy exists: report conditional rates with sample size and confidence bands; **do not** claim “deeper planning caused lower rework” without experimental design
+- Sensitivity tables against alternative severity orderings required before retaining provisional floors
+- Post-merge outcomes use fixed observation horizon **H** (default 14 days): not-yet-observable runs are censored/unavailable, not negatives; late discovery after H is a separate bucket (research note §7.2.1)
 - **False positive (over-planning):** deep/zoom/human gate where outcomes would have been ordinary under lighter depth (cost of delay/effort)
 - **False negative (under-planning):** lightweight/standard where material rework or production follow-up followed, or human authority was later required
 
@@ -137,12 +149,14 @@ Selected action(s) map to recommended `planning_depth` (`minimal` / `standard` /
 
 ### D8 — Human-authority boundaries are closed and distinct from plan-review
 
-**Decision:** Human authority is required (policy floor) when any of:
+**Decision:** Human authority is required (policy floor) when any closed predicate fires. Operational evidence criteria live in research note §5.3:
 
-1. **Irreversible** production/data/shared-state mutation without an automated rollback path
-2. **High blast radius** multi-tenant or cross-system schema/API breaks
-3. **Security-sensitive** authZ/authN, secret handling, privilege elevation
-4. **Compliance-sensitive** regulated data processing or audit-required changes
+1. **`irreversible_no_automated_rollback`** — production/data/shared-state mutation without documented automated rollback
+2. **`high_blast_radius`** — multi-tenant **or** cross-system/multi-repo cutover without staged plan **or** public API/wire break with external consumers **or** **default-traffic** deploy/infra change (pipeline/CDN/auth-gateway/ingress cutover or forced all-tenant rollout — **not** ordinary app release via existing CI/CD) **or** multi-package path growth coupled with public contract / architecture triggers
+3. **`security_sensitive`** — AuthN/AuthZ, secrets, privilege elevation, trust-boundary move (structural `auth` trigger or declared control change)
+4. **`compliance_sensitive`** — regulated data processing or audit-required control change with explicit markers
+
+Borderline examples (single-repo public field rename sets blast; private helper rename does not; docs-only security prose does not set security; ordinary existing-pipeline app deploy does not set blast) are normative for consistent classification.
 
 Agent plan-review, same-harness plan-review fallback, and the optional human feedback window are **not** human authority (per `plan-review-authority-boundary`).
 

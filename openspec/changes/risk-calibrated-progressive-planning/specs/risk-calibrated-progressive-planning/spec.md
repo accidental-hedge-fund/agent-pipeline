@@ -32,6 +32,12 @@ Class assignment SHALL NOT require a single numeric risk score spanning all repo
 - **THEN** assignment for that class SHALL be absent or `unknown`
 - **AND** SHALL NOT fabricate historical rework rates or structural matches
 
+#### Scenario: per-class evidence provenance is required for assignment
+
+- **WHEN** a progressive class is asserted for routing composition
+- **THEN** it SHALL carry evidence refs with allowed `source_kind` (structural, declared, or historical_observed), a non-empty `ref`, and `observed_as_of` at or before recommendation time
+- **AND** outcome-derived, post-routing, or free-text-only source kinds SHALL be rejected without elevating from that class
+
 ---
 
 ### Requirement: Progressive-planning policy SHALL specify closed routing actions and class-to-action mapping
@@ -83,7 +89,21 @@ Safe defaults SHALL NOT route irreversible / high-blast / security / compliance 
 #### Scenario: unknown structural history defaults away from silent under-planning
 
 - **WHEN** no historical rework rates are available and no high-severity class matched
+- **AND** the high-severity predicate scan is complete
 - **THEN** the default action SHALL be at least `standard_plan` (not forced `lightweight_plan` solely for missing history)
+
+#### Scenario: incomplete high-severity scan does not ordinary-standard
+
+- **WHEN** progressive composition runs with high-severity predicate scan incomplete
+- **AND** no progressive classes were matched
+- **THEN** the recommendation SHALL NOT select ordinary `standard_plan` via `unknown_default`
+- **AND** SHALL fail closed toward deeper planning or human authority as documented
+
+#### Scenario: observed rework history respects pre-routing provenance
+
+- **WHEN** `observed_rework_cost` claims history is available
+- **THEN** cohort inputs SHALL exclude the target run and any work completed at or after recommendation time
+- **AND** invalid or missing provenance SHALL prevent history-based elevation
 
 #### Scenario: security class with missing sub-signal fails closed
 
@@ -97,6 +117,12 @@ Safe defaults SHALL NOT route irreversible / high-blast / security / compliance 
 - **THEN** the composed action SHALL follow the more restrictive mapping
 - **AND** a conflict diagnostic SHALL be recordable
 
+#### Scenario: structured safety conflicts fail closed
+
+- **WHEN** declared and structural evidence conflict on rollback, security, compliance, or blast_radius
+- **THEN** composition SHALL apply the elevating safety floor for that dimension
+- **AND** SHALL NOT select ordinary `standard_plan` or `lightweight_plan` as the resolved primary action for that conflict set
+
 ---
 
 ### Requirement: Offline evaluation design SHALL compare planning investment to primary outcomes without proxy-only optimization
@@ -109,7 +135,7 @@ The change SHALL publish an offline evaluation design that:
 - includes a calibration procedure (hold-out or time-window re-evaluation)
 - forbids treating plan length, planning wall time alone, or token spend alone as success metrics
 
-Causal impact claims SHALL NOT be required for the research package; associational cohort rates with sample size are sufficient until an observe-mode policy exists.
+Causal impact claims SHALL NOT be required for the research package. Associational rates used for routing calibration SHALL be computed within comparable pre-routing strata (class multi-label set, repository/domain context, and documented size bands when available) so that planning investment is not confounded with inherent task severity. Unmatched pooled depth×rework associations SHALL NOT alone justify retaining or changing action floors.
 
 #### Scenario: primary outcomes are listed
 
@@ -135,6 +161,18 @@ Causal impact claims SHALL NOT be required for the research package; association
 - **THEN** offline eval SHALL omit production outcome metrics for that run or mark them unavailable
 - **AND** SHALL NOT fabricate outcome ids
 
+#### Scenario: offline progressive classes come from pre-routing sources
+
+- **WHEN** offline evaluation builds pre-routing strata for progressive multi-label classes without observe-mode emissions
+- **THEN** class sets SHALL be taken from immutable pre-routing snapshots when present, or from blinded retrospective coding of planning-time structural/declared evidence only
+- **AND** SHALL NOT use the target run’s material rework, review findings, or production outcomes as class evidence
+
+#### Scenario: post-merge outcomes use time-at-risk censoring
+
+- **WHEN** offline eval reports post-merge production or rework rates
+- **THEN** it SHALL apply a fixed observation horizon H (default 14 days) from merge or deploy anchor
+- **AND** runs with `eval_as_of` before merge_at + H SHALL be labeled not-yet-observable or unavailable, not as negative (no incident) outcomes
+
 ---
 
 ### Requirement: Human-authority boundaries SHALL be explicit and distinct from agent plan-review
@@ -152,6 +190,18 @@ The policy SHALL define closed human-authority boundaries covering at least irre
 - **WHEN** plan-review returns approve with no human sign-off event
 - **THEN** human-authority boundaries for security/compliance/irreversible classes SHALL remain unsatisfied
 - **AND** the policy SHALL NOT treat plan-review as the human authority action
+
+#### Scenario: high blast radius has operational criteria beyond multi-tenant wording
+
+- **WHEN** a change is a public API or wire-format break with external consumers, or a default-traffic deploy/infra change (pipeline/CDN/auth-gateway cutover or forced all-tenant rollout), or a multi-repo cutover without a staged rollout plan
+- **THEN** the high-blast-radius human-authority predicate MAY fire even without multi-tenant language
+- **AND** a single private-module rename with no external consumers SHALL NOT set that predicate solely by path count
+
+#### Scenario: ordinary production delivery is not high blast by deploy criterion
+
+- **WHEN** a change is an ordinary application release through an existing CI/CD path with no deploy-pipeline, CDN, auth-gateway, or default-traffic path change and no forced all-tenant rollout
+- **THEN** the default-traffic deploy sub-criterion of high_blast_radius SHALL NOT set solely from that ordinary delivery
+- **AND** a documented staged or canary plan without default-path cutover SHALL NOT set that sub-criterion alone
 
 ---
 
