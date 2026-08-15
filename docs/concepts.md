@@ -22,6 +22,7 @@ A newcomer who completed Prerequisites, Install, and Quickstart in the README ha
 - [last30days context (optional, default off)](#last30days-context-optional-default-off)
 - [Commit traceability trailers (always on)](#commit-traceability-trailers-always-on)
 - [Planning-leverage and material-rework telemetry](#planning-leverage-and-material-rework-telemetry)
+- [Risk-calibrated progressive planning (research)](#risk-calibrated-progressive-planning-research)
 - [Conventions & carry-forward lessons](#conventions--carry-forward-lessons)
 - [Troubleshooting](#troubleshooting)
 - [Desktop / editor integration](#desktop--editor-integration)
@@ -226,6 +227,17 @@ Selected fields:
 ### Linkage to #576
 
 Attribution may include `target_type: "production_outcome"` only when a durable outcome id exists. Missing production outcomes are omitted, not invented. In-pipeline material rework is distinct from post-delivery `follow_up_rework`.
+
+## Risk-calibrated progressive planning (research)
+
+Research package for **when** planning should stay light, deepen, zoom, preserve assumptions, or request **human** authority — designed from #702/#576 joins, not a single opaque risk score (#703).
+
+- Durable note: [docs/research/risk-calibrated-progressive-planning.md](research/risk-calibrated-progressive-planning.md)
+- Closed work/risk classes, routing actions, safe defaults, offline evaluation, and human-authority boundaries live in that note
+- Future staged policy id: `progressive_planning_depth` — state remains **`draft`**; automated depth routing is **off** until evidence-sufficiency is recorded
+- Optional pure offline helpers: `core/scripts/progressive-planning/` (composition only; not wired into advance)
+
+This is **not** an always-on router. Longer plans or longer planning wall time are not success metrics.
 
 ## Conventions & carry-forward lessons
 
