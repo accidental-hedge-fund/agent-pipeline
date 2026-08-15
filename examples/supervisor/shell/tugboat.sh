@@ -322,9 +322,13 @@ live_ship_probe() {
 # Single-host milestone lock. Lock dir is the mutex; lock/pid is the holder.
 # NEVER write playbook.pid before winning the lock (that race stole the mutex).
 # Returns 0 if acquired, 1 if another live holder owns it (stdout = holder pid).
+# version = bare X.Y.Z (no leading v) — same milestone coordinate as the run_dir.
+# Holder retention uses cmdline_is_live_ship for THAT version only: a live
+# train/tugboat for a different milestone (stale/recycled lock pid) is reclaimed.
 # Note: this mutex is separate from the live-ship probe used for detach refuse.
 try_acquire_ship_lock() {
   local run_dir=$1
+  local version=$2
   local lock_dir="$run_dir/lock"
   local holder=""
   local holder_cmd=""
@@ -338,16 +342,16 @@ try_acquire_ship_lock() {
 
   holder=$(cat "$lock_dir/pid" 2>/dev/null || true)
   if [[ -n "$holder" && "$holder" != "$$" ]] && kill -0 "$holder" 2>/dev/null; then
-    # Only refuse if the holder is still a real ship/tugboat for this dir's
-    # milestone — bare kill -0 on an unrelated recycled pid is not enough.
+    # Only refuse if the holder is still a live ship for THIS milestone —
+    # bare kill -0, or a live train/tugboat for another milestone, is reclaimed.
     holder_cmd=$(tr '\0' ' ' <"/proc/$holder/cmdline" 2>/dev/null || true)
-    if [[ -n "$holder_cmd" ]] && { [[ "$holder_cmd" == *tugboat* ]] || [[ "$holder_cmd" == *train* && "$holder_cmd" == *--merge* ]]; }; then
+    if [[ -n "$holder_cmd" ]] && cmdline_is_live_ship "$holder_cmd" "$version"; then
       printf '%s\n' "$holder"
       return 1
     fi
   fi
 
-  # Stale lock only: holder missing, dead, or not a ship process.
+  # Stale lock: holder missing, dead, wrong-milestone ship, or not a ship process.
   rm -rf "$lock_dir"
   if mkdir "$lock_dir" 2>/dev/null; then
     printf '%s\n' "$$" >"$lock_dir/pid"
@@ -523,7 +527,8 @@ ship_one() {
   cd "$REPO_DIR"
 
   # Acquire lock BEFORE writing playbook.pid (never steal from a live holder).
-  if ! holder=$(try_acquire_ship_lock "$RUN_DIR"); then
+  # Pass version so a recycled lock pid for another milestone is reclaimed.
+  if ! holder=$(try_acquire_ship_lock "$RUN_DIR" "$version"); then
     # try_acquire prints holder pid on failure
     log "another tugboat holds the lock (pid ${holder:-?}) — refusing duplicate ship"
     # Do not clobber a live ship's state.json to failed.

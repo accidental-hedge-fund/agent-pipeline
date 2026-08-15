@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import {
   contentDigest,
@@ -531,6 +531,117 @@ test("live-ship probe (#1062): train --merge cmdline is live; bare pid / single 
     false,
     "train without --merge is not Option 1 live ship",
   );
+});
+
+test("ship lock (#1062): stale lock pid for other-milestone train is reclaimed", () => {
+  const body = fs.readFileSync(tugboat, "utf8");
+  // Mutex must gate on cmdline_is_live_ship for the requested version (not any train --merge).
+  const lockFn = body.match(/^try_acquire_ship_lock\(\) \{[\s\S]*?\n\}/m);
+  assert.ok(lockFn, "try_acquire_ship_lock missing");
+  assert.match(lockFn[0], /cmdline_is_live_ship "\$holder_cmd" "\$version"/);
+  assert.match(lockFn[0], /local version=\$2/);
+  // Loose any-tugboat / any-train--merge check must not remain as the retain gate.
+  assert.doesNotMatch(
+    lockFn[0],
+    /\[\[\s*"\$holder_cmd"\s*==\s*\*tugboat\*\s*\]\]\s*\|\|/,
+  );
+  assert.match(body, /try_acquire_ship_lock "\$RUN_DIR" "\$version"/);
+
+  // Behavioral: lock/pid for ship-v1.39.0 points at a live train --merge for v1.40.0.
+  // try_acquire for 1.39.0 must reclaim (not refuse as if it owns 1.39.0).
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-lock-"));
+  const fakeBin = path.join(dir, "pipeline");
+  let childPid: number | undefined;
+  try {
+    fs.writeFileSync(
+      fakeBin,
+      "#!/usr/bin/env bash\n# stub train holder for lock reclaim regression\nsleep 3600\n",
+    );
+    fs.chmodSync(fakeBin, 0o755);
+    // Detached so the stub survives after spawn returns; argv must look like train --merge v1.40.0.
+    const child = spawn(
+      fakeBin,
+      ["train", "--milestone", "v1.40.0", "--merge", "--json"],
+      { detached: true, stdio: "ignore" },
+    );
+    child.unref();
+    childPid = child.pid;
+    assert.ok(
+      childPid !== undefined && Number.isFinite(childPid) && childPid > 0,
+      `bad stub pid: ${String(childPid)}`,
+    );
+
+    // Confirm /proc cmdline is the other-milestone train (so the old loose check would refuse).
+    const cmdline = fs
+      .readFileSync(`/proc/${childPid}/cmdline`)
+      .toString("utf8")
+      .replace(/\0/g, " ");
+    assert.match(cmdline, /train/);
+    assert.match(cmdline, /--merge/);
+    assert.match(cmdline, /v1\.40\.0/);
+    assert.equal(
+      evalCmdlineIsLiveShip(cmdline, "1.39.0"),
+      false,
+      "v1.40 train must not be live ship for 1.39.0",
+    );
+    assert.equal(
+      evalCmdlineIsLiveShip(cmdline, "1.40.0"),
+      true,
+      "v1.40 train must be live ship for 1.40.0",
+    );
+
+    const runDir = path.join(dir, "ship-v1.39.0");
+    const lockDir = path.join(runDir, "lock");
+    fs.mkdirSync(lockDir, { recursive: true });
+    fs.writeFileSync(path.join(lockDir, "pid"), `${childPid}\n`);
+
+    const src = fs.readFileSync(tugboat, "utf8");
+    const probeFn = src.match(/^cmdline_is_live_ship\(\) \{[\s\S]*?\n\}/m);
+    assert.ok(probeFn, "cmdline_is_live_ship missing");
+    const runner = path.join(dir, "acquire.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        probeFn[0],
+        lockFn[0],
+        `if out=$(try_acquire_ship_lock ${JSON.stringify(runDir)} "1.39.0"); then`,
+        '  echo "ACQUIRED:$$"',
+        "  exit 0",
+        "else",
+        '  echo "REFUSED:$out"',
+        "  exit 1",
+        "fi",
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    const r = spawnSync("bash", [runner], { encoding: "utf8" });
+    assert.equal(
+      r.status,
+      0,
+      `expected reclaim of wrong-milestone lock, got status=${r.status} out=${r.stdout} err=${r.stderr}`,
+    );
+    assert.match(r.stdout, /^ACQUIRED:/);
+    // Lock now held by the acquirer, not the v1.40 train pid.
+    const newHolder = fs.readFileSync(path.join(lockDir, "pid"), "utf8").trim();
+    assert.notEqual(newHolder, String(childPid));
+    assert.match(r.stdout, new RegExp(`ACQUIRED:${newHolder}`));
+  } finally {
+    if (childPid !== undefined) {
+      try {
+        process.kill(-childPid, "SIGTERM");
+      } catch {
+        try {
+          process.kill(childPid, "SIGTERM");
+        } catch {
+          /* already gone */
+        }
+      }
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("live-ship probe (#1062): detach path uses probe only; not bare playbook.pid", () => {
