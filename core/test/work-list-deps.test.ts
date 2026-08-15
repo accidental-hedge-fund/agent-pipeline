@@ -5,8 +5,13 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { compileContractItems } from "../scripts/loop/dependencies.ts";
 import {
+  allExternalDependenciesSatisfied,
+  compileContractItems,
+  detectDependencyDeadlock,
+} from "../scripts/loop/dependencies.ts";
+import {
+  admitHardWaits,
   assertDiscoveryCompleteForAdmission,
   collectBlockedByIssueNumbers,
   discoverDeclaredDependencies,
@@ -14,9 +19,17 @@ import {
   IncompleteDependencyDiscoveryError,
   parseDeclaredDependencyIds,
   realWorkListDependencyDiscoverDeps,
+  type PrerequisiteOpenClass,
   type WorkListDependencyDiscoverDeps,
 } from "../scripts/loop/work-list-deps.ts";
-import { LoopError } from "../scripts/loop/types.ts";
+import { eligibleIndependentItems } from "../scripts/loop/recovery.ts";
+import {
+  LOOP_CONTRACT_SCHEMA,
+  LOOP_LEDGER_SCHEMA,
+  LoopError,
+  type LoopContract,
+  type LoopLedger,
+} from "../scripts/loop/types.ts";
 import {
   compileWorkListRun,
   compileWorkListRunFresh,
@@ -149,6 +162,8 @@ function fakeDiscoverDeps(opts: {
   bodies?: Record<string, { title: string; body: string } | null>;
   blockedBy?: Record<string, number[] | null>;
   roadmap?: Array<{ depender: string; prerequisite: string }> | null;
+  /** Issue id → open/closed; omit target to leave getIssueOpenState unset (assume open). */
+  openState?: Record<string, "open" | "closed" | null>;
   throwOnBody?: Set<string>;
   throwOnBlockedBy?: Set<string>;
 }): WorkListDependencyDiscoverDeps {
@@ -168,6 +183,14 @@ function fakeDiscoverDeps(opts: {
     getRoadmapDeclaredEdges: opts.roadmap === undefined
       ? undefined
       : async () => opts.roadmap,
+    getIssueOpenState:
+      opts.openState === undefined
+        ? undefined
+        : async (n) => {
+            const id = String(n);
+            if (!(id in opts.openState!)) return null;
+            return opts.openState![id] ?? null;
+          },
   };
 }
 
@@ -193,18 +216,23 @@ test("discoverDeclaredDependencies: body section declaration becomes raw depends
 });
 
 test("discoverDeclaredDependencies: multi-source union (body + native) dedupes", async () => {
+  // Include 607/609 on the selector so hard-wait admission retains both edges.
   const result = await discoverDeclaredDependencies(
-    ["608"],
+    ["607", "608", "609"],
     fakeDiscoverDeps({
       bodies: {
+        "607": { title: "", body: "" },
         "608": { title: "x", body: "Depends on #607." },
+        "609": { title: "", body: "" },
       },
       blockedBy: {
+        "607": [],
         "608": [607, 609],
+        "609": [],
       },
     }),
   );
-  assert.deepEqual(result.items[0]!.depends_on, ["607", "609"]);
+  assert.deepEqual(result.items.find((i) => i.id === "608")!.depends_on, ["607", "609"]);
   const edge607 = result.edge_provenance.find(
     (e) => e.depender === "608" && e.prerequisite === "607",
   );
@@ -227,7 +255,13 @@ test("discoverDeclaredDependencies: roadmap edges union when provided", async ()
       ],
     }),
   );
-  assert.deepEqual(result.items.find((i) => i.id === "20")!.depends_on, ["10", "99"]);
+  // On-selector #10 admitted; off-selector #99 ignored (#1073).
+  assert.deepEqual(result.items.find((i) => i.id === "20")!.depends_on, ["10"]);
+  assert.ok(
+    result.ignored_deps.some(
+      (d) => d.depender === "20" && d.target === "99" && d.reason === "not_on_selector",
+    ),
+  );
   const road = result.observations.find((o) => o.source === "roadmap-declared");
   assert.equal(road?.status, "observed-with-edges");
 });
@@ -325,7 +359,7 @@ test("discoverDeclaredDependencies: lexical edge retained when native is observe
   assert.equal(lex?.status, "observed-with-edges");
 });
 
-test("discoverDeclaredDependencies: multi-ref body fully preserved before partition", async () => {
+test("discoverDeclaredDependencies: multi-ref admits on-selector only; off-selector ignored (#1073)", async () => {
   const result = await discoverDeclaredDependencies(
     ["899", "900"],
     fakeDiscoverDeps({
@@ -336,7 +370,13 @@ test("discoverDeclaredDependencies: multi-ref body fully preserved before partit
       blockedBy: { "899": [], "900": [] },
     }),
   );
-  assert.deepEqual(result.items.find((i) => i.id === "900")!.depends_on, ["899", "662"]);
+  // Hard-wait admission drops #662 (not on selector) before compile partition.
+  assert.deepEqual(result.items.find((i) => i.id === "900")!.depends_on, ["899"]);
+  assert.ok(
+    result.ignored_deps.some(
+      (d) => d.depender === "900" && d.target === "662" && d.reason === "not_on_selector",
+    ),
+  );
 });
 
 test("discoverDeclaredDependencies: no declarations → empty depends_on (independent-by-default)", async () => {
@@ -401,7 +441,7 @@ test("compile: in-snapshot declaration → depends_on, not external_depends_on",
   assert.equal(discovery.has_incomplete, false);
 });
 
-test("compile: multi-ref partitions in-snapshot vs external (#900 style)", async () => {
+test("compile: multi-ref admits on-selector hard wait; off-selector becomes ignored_dep (#1073)", async () => {
   const deps = fakeDiscoverDeps({
     bodies: {
       "899": { title: "", body: "" },
@@ -409,7 +449,7 @@ test("compile: multi-ref partitions in-snapshot vs external (#900 style)", async
     },
     blockedBy: { "899": [], "900": [] },
   });
-  const { contract } = await compileWorkListRunFresh(
+  const { contract, discovery } = await compileWorkListRunFresh(
     fakeCfg(),
     "claude",
     ["899", "900"],
@@ -418,20 +458,42 @@ test("compile: multi-ref partitions in-snapshot vs external (#900 style)", async
   );
   const item900 = contract.items.find((i) => i.id === "900")!;
   assert.deepEqual(item900.depends_on, ["899"]);
-  assert.deepEqual(item900.external_depends_on, ["662"]);
+  // Off-selector open refs no longer land on external_depends_on (#1073).
+  assert.deepEqual(item900.external_depends_on, []);
+  assert.ok(
+    discovery.ignored_deps.some(
+      (d) => d.depender === "900" && d.target === "662" && d.reason === "not_on_selector",
+    ),
+  );
+  assert.ok(
+    contract.dependency_discovery?.ignored_deps?.some(
+      (d) => d.depender === "900" && d.target === "662" && d.reason === "not_on_selector",
+    ),
+  );
 });
 
-test("compile: out-of-snapshot declaration → external_depends_on only", async () => {
+test("compile: out-of-snapshot declaration is ignored (not external hard wait) (#1073)", async () => {
   const deps = fakeDiscoverDeps({
     bodies: {
       "608": { title: "dep", body: "Depends on #607." },
     },
   });
-  const { contract } = await compileWorkListRunFresh(fakeCfg(), "claude", ["608"], "run-ext", deps);
+  const { contract, discovery } = await compileWorkListRunFresh(
+    fakeCfg(),
+    "claude",
+    ["608"],
+    "run-ext",
+    deps,
+  );
   const item = contract.items[0]!;
   assert.equal(item.id, "608");
   assert.deepEqual(item.depends_on, []);
-  assert.deepEqual(item.external_depends_on, ["607"]);
+  assert.deepEqual(item.external_depends_on, []);
+  assert.ok(
+    discovery.ignored_deps.some(
+      (d) => d.depender === "608" && d.target === "607" && d.reason === "not_on_selector",
+    ),
+  );
 });
 
 test("compile: multi-item refuses incomplete discovery and produces no contract", async () => {
@@ -810,10 +872,16 @@ test("realWorkListDependencyDiscoverDeps: paginates blockedBy past first 100 (62
   assert.ok(!blockedBy.includes(50) || blockedBy.filter((n) => n === 50).length === 1);
   assert.equal(calls.length, 2, "must issue a follow-up cursor query");
 
-  // Discovery union path also sees the beyond-first-page id.
+  // Native discovery still observes beyond-first-page ids; hard-wait admission
+  // drops off-selector targets (#1073) rather than treating them as gates.
   const result = await discoverDeclaredDependencies(["608"], deps);
-  assert.ok(result.items[0]!.depends_on.includes("101"));
-  assert.ok(result.items[0]!.depends_on.includes("1"));
+  assert.deepEqual(result.items[0]!.depends_on, []);
+  assert.ok(
+    result.ignored_deps.some((d) => d.depender === "608" && d.target === "101" && d.reason === "not_on_selector"),
+  );
+  assert.ok(
+    result.ignored_deps.some((d) => d.depender === "608" && d.target === "1" && d.reason === "not_on_selector"),
+  );
 });
 
 test("realWorkListDependencyDiscoverDeps: single-page blockedBy needs no after cursor", async () => {
@@ -839,4 +907,327 @@ test("realWorkListDependencyDiscoverDeps: single-page blockedBy needs no after c
   const text = await deps.getIssueTitleBody(9);
   assert.deepEqual(text, { title: "x", body: "Depends on #1." });
   assert.equal(calls, 1);
+});
+
+// ---------------------------------------------------------------------------
+// Hard-wait admission (#1073) — pure helper + dogfood / deadlock fixtures
+// ---------------------------------------------------------------------------
+
+test("admitHardWaits: open on-selector admitted; off-selector / closed / not_open ignored", () => {
+  const selector = new Set(["647", "599", "901"]);
+  const openState = new Map<string, PrerequisiteOpenClass>([
+    ["599", "open"],
+    ["822", "open"],
+    ["900", "closed"],
+    ["901", "not_open"],
+  ]);
+  const { admitted, ignored } = admitHardWaits(
+    [
+      { depender: "647", prerequisite: "599" },
+      { depender: "647", prerequisite: "822" },
+      { depender: "647", prerequisite: "900" },
+      { depender: "647", prerequisite: "901" },
+    ],
+    selector,
+    openState,
+  );
+  assert.deepEqual(admitted, [{ depender: "647", prerequisite: "599" }]);
+  assert.deepEqual(ignored, [
+    { depender: "647", target: "822", reason: "not_on_selector" },
+    { depender: "647", target: "900", reason: "closed" },
+    { depender: "647", target: "901", reason: "not_open" },
+  ]);
+});
+
+test("admitHardWaits: missing openState entry is not_open on-selector", () => {
+  const { admitted, ignored } = admitHardWaits(
+    [{ depender: "1", prerequisite: "2" }],
+    new Set(["1", "2"]),
+    new Map(),
+  );
+  assert.deepEqual(admitted, []);
+  assert.deepEqual(ignored, [{ depender: "1", target: "2", reason: "not_open" }]);
+});
+
+test("admitHardWaits: unobserved off-selector is not_on_selector", () => {
+  const { admitted, ignored } = admitHardWaits(
+    [{ depender: "1", prerequisite: "99" }],
+    new Set(["1"]),
+    new Map(), // missing → not_open, but off-selector wins
+  );
+  assert.deepEqual(admitted, []);
+  assert.deepEqual(ignored, [{ depender: "1", target: "99", reason: "not_on_selector" }]);
+});
+
+test("#1073 soft Related-only / see #B: no hard wait, no dependency_deadlock", async () => {
+  const softBody = [
+    "## Related",
+    "See #822 for later-milestone context.",
+    "History of #100.",
+  ].join("\n");
+  assert.deepEqual(parseDeclaredDependencyIds(softBody, "838"), []);
+
+  const deps = fakeDiscoverDeps({
+    bodies: {
+      "838": { title: "dogfood soft", body: softBody },
+    },
+  });
+  const { contract, discovery } = await compileWorkListRunFresh(
+    fakeCfg(),
+    "claude",
+    ["838"],
+    "run-soft-related",
+    deps,
+  );
+  const item = contract.items[0]!;
+  assert.deepEqual(item.depends_on, []);
+  assert.deepEqual(item.external_depends_on, []);
+  assert.deepEqual(discovery.ignored_deps, []);
+
+  const ledger: LoopLedger = {
+    schema: LOOP_LEDGER_SCHEMA,
+    run_id: "run-soft-related",
+    items: {
+      "838": { id: "838", state: "pending", history: [], recovery_budgets_remaining: { default: 3 } },
+    },
+    consecutive_blocked: 0,
+    merge_barrier: null,
+    stop: null,
+    last_native_goal_check: null,
+    last_reconciliation: null,
+    reconciliation_sequence: 0,
+    recovery_attempts: [],
+    authority_amendments: [],
+  };
+  const loopContract = contract as unknown as LoopContract;
+  assert.deepEqual(eligibleIndependentItems(loopContract, ledger, {}), ["838"]);
+  assert.equal(detectDependencyDeadlock(loopContract, ledger, {}), null);
+});
+
+test("#1073 Depends on open on-selector: hard wait hold (#647→#599 class)", async () => {
+  const deps = fakeDiscoverDeps({
+    bodies: {
+      "599": { title: "prereq", body: "" },
+      "647": { title: "handoff", body: "Depends on: #599" },
+    },
+    openState: { "599": "open", "647": "open" },
+  });
+  const { contract, discovery } = await compileWorkListRunFresh(
+    fakeCfg(),
+    "claude",
+    ["647", "599"],
+    "run-hard-intrain",
+    deps,
+  );
+  const item647 = contract.items.find((i) => i.id === "647")!;
+  assert.deepEqual(item647.depends_on, ["599"]);
+  assert.deepEqual(item647.external_depends_on, []);
+  assert.deepEqual(discovery.ignored_deps, []);
+
+  const pendingBoth: LoopLedger = {
+    schema: LOOP_LEDGER_SCHEMA,
+    run_id: "run-hard-intrain",
+    items: {
+      "599": { id: "599", state: "pending", history: [], recovery_budgets_remaining: { default: 3 } },
+      "647": { id: "647", state: "pending", history: [], recovery_budgets_remaining: { default: 3 } },
+    },
+    consecutive_blocked: 0,
+    merge_barrier: null,
+    stop: null,
+    last_native_goal_check: null,
+    last_reconciliation: null,
+    reconciliation_sequence: 0,
+    recovery_attempts: [],
+    authority_amendments: [],
+  };
+  const loopContract = contract as unknown as LoopContract;
+  // 599 is free; 647 is held on the admitted hard wait.
+  assert.deepEqual(eligibleIndependentItems(loopContract, pendingBoth, {}), ["599"]);
+  assert.ok(!eligibleIndependentItems(loopContract, pendingBoth, {}).includes("647"));
+
+  // After prereq reaches terminal success, 647 becomes eligible.
+  const afterPrereq: LoopLedger = {
+    ...pendingBoth,
+    items: {
+      "599": { id: "599", state: "ready", history: [], recovery_budgets_remaining: { default: 3 } },
+      "647": { id: "647", state: "pending", history: [], recovery_budgets_remaining: { default: 3 } },
+    },
+  };
+  assert.deepEqual(eligibleIndependentItems(loopContract, afterPrereq, {}), ["647"]);
+  assert.equal(detectDependencyDeadlock(loopContract, afterPrereq, {}), null);
+
+  // Admitted hard wait still appears in a dependency_deadlock chain when the
+  // prereq ledger entry is missing (structurally unrunnable frontier).
+  const dangling: LoopContract = {
+    ...loopContract,
+    schema: LOOP_CONTRACT_SCHEMA,
+    items: [
+      { id: "599", depends_on: [], external_depends_on: [] },
+      { id: "647", depends_on: ["599"], external_depends_on: [] },
+    ],
+  };
+  const missingPrereqLedger: LoopLedger = {
+    ...pendingBoth,
+    items: {
+      "647": { id: "647", state: "pending", history: [], recovery_budgets_remaining: { default: 3 } },
+    },
+  };
+  const chain = detectDependencyDeadlock(dangling, missingPrereqLedger, {});
+  assert.ok(chain);
+  assert.ok(chain!.some((e) => e.item_id === "647" && e.waiting_on === "599" && e.kind === "in_run"));
+});
+
+test("#1073 Depends on closed target: ignored; A eligible", async () => {
+  const deps = fakeDiscoverDeps({
+    bodies: {
+      "838": { title: "a", body: "Depends on: #822" },
+    },
+    openState: { "822": "closed" },
+  });
+  // 822 not on selector AND closed → reason closed (closed checked first).
+  const { contract, discovery } = await compileWorkListRunFresh(
+    fakeCfg(),
+    "claude",
+    ["838"],
+    "run-closed-dep",
+    deps,
+  );
+  const item = contract.items[0]!;
+  assert.deepEqual(item.depends_on, []);
+  assert.deepEqual(item.external_depends_on, []);
+  assert.ok(
+    discovery.ignored_deps.some(
+      (d) => d.depender === "838" && d.target === "822" && d.reason === "closed",
+    ),
+  );
+  const ledger: LoopLedger = {
+    schema: LOOP_LEDGER_SCHEMA,
+    run_id: "run-closed-dep",
+    items: {
+      "838": { id: "838", state: "pending", history: [], recovery_budgets_remaining: { default: 3 } },
+    },
+    consecutive_blocked: 0,
+    merge_barrier: null,
+    stop: null,
+    last_native_goal_check: null,
+    last_reconciliation: null,
+    reconciliation_sequence: 0,
+    recovery_attempts: [],
+    authority_amendments: [],
+  };
+  const loopContract = contract as unknown as LoopContract;
+  assert.deepEqual(eligibleIndependentItems(loopContract, ledger, {}), ["838"]);
+  assert.equal(detectDependencyDeadlock(loopContract, ledger, {}), null);
+});
+
+test("#1073 bare #B under ## Dependencies open off-selector: no ship-stop (#838/#839 class)", async () => {
+  const deps = fakeDiscoverDeps({
+    bodies: {
+      "838": {
+        title: "slice",
+        body: ["## Dependencies", "#822 was related dogfood work."].join("\n"),
+      },
+      "839": {
+        title: "sibling",
+        body: ["## Dependencies", "#822"].join("\n"),
+      },
+    },
+    openState: { "822": "open", "838": "open", "839": "open" },
+  });
+  const { contract, discovery } = await compileWorkListRunFresh(
+    fakeCfg(),
+    "claude",
+    ["838", "839"],
+    "run-deps-section-offtrain",
+    deps,
+  );
+  for (const id of ["838", "839"]) {
+    const item = contract.items.find((i) => i.id === id)!;
+    assert.deepEqual(item.depends_on, []);
+    assert.deepEqual(item.external_depends_on, []);
+  }
+  assert.ok(
+    discovery.ignored_deps.some(
+      (d) => d.depender === "838" && d.target === "822" && d.reason === "not_on_selector",
+    ),
+  );
+  assert.ok(
+    discovery.ignored_deps.some(
+      (d) => d.depender === "839" && d.target === "822" && d.reason === "not_on_selector",
+    ),
+  );
+  // Lexical still extracts bare section refs as candidates (admission drops them).
+  assert.deepEqual(
+    parseDeclaredDependencyIds("## Dependencies\n#822", "838"),
+    ["822"],
+  );
+
+  const ledger: LoopLedger = {
+    schema: LOOP_LEDGER_SCHEMA,
+    run_id: "run-deps-section-offtrain",
+    items: {
+      "838": { id: "838", state: "pending", history: [], recovery_budgets_remaining: { default: 3 } },
+      "839": { id: "839", state: "pending", history: [], recovery_budgets_remaining: { default: 3 } },
+    },
+    consecutive_blocked: 0,
+    merge_barrier: null,
+    stop: null,
+    last_native_goal_check: null,
+    last_reconciliation: null,
+    reconciliation_sequence: 0,
+    recovery_attempts: [],
+    authority_amendments: [],
+  };
+  const loopContract = contract as unknown as LoopContract;
+  const eligible = eligibleIndependentItems(loopContract, ledger, {});
+  assert.ok(eligible.includes("838"));
+  assert.ok(eligible.includes("839"));
+  assert.equal(detectDependencyDeadlock(loopContract, ledger, {}), null);
+  assert.equal(allExternalDependenciesSatisfied(contract.items[0]!, {}), true);
+});
+
+test("#1073 closed on-selector Depends on is not a hard wait", async () => {
+  const deps = fakeDiscoverDeps({
+    bodies: {
+      "100": { title: "done", body: "" },
+      "200": { title: "next", body: "Depends on #100" },
+    },
+    openState: { "100": "closed", "200": "open" },
+  });
+  const { contract, discovery } = await compileWorkListRunFresh(
+    fakeCfg(),
+    "claude",
+    ["100", "200"],
+    "run-closed-on-selector",
+    deps,
+  );
+  assert.deepEqual(contract.items.find((i) => i.id === "200")!.depends_on, []);
+  assert.ok(
+    discovery.ignored_deps.some(
+      (d) => d.depender === "200" && d.target === "100" && d.reason === "closed",
+    ),
+  );
+});
+
+test("#1073 phrase under Related still extracts; open on-selector remains hard wait", async () => {
+  const deps = fakeDiscoverDeps({
+    bodies: {
+      "599": { title: "", body: "" },
+      "647": {
+        title: "",
+        body: ["## Related", "Depends on: #599", "See also bare #822."].join("\n"),
+      },
+    },
+  });
+  const { contract, discovery } = await compileWorkListRunFresh(
+    fakeCfg(),
+    "claude",
+    ["647", "599"],
+    "run-phrase-under-related",
+    deps,
+  );
+  assert.deepEqual(contract.items.find((i) => i.id === "647")!.depends_on, ["599"]);
+  assert.ok(!discovery.ignored_deps.some((d) => d.target === "599"));
+  // Bare #822 under Related never entered raw set.
+  assert.ok(!discovery.ignored_deps.some((d) => d.target === "822"));
 });
