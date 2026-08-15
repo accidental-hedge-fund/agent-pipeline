@@ -59,6 +59,8 @@ export interface CiRecoveryMarkers {
   ciRerunAttemptedShas?: string[];
   ciArchiveFailRecoveryAttemptedShas?: string[];
   ciAssertionFixAttemptedShas?: string[];
+  /** One-shot generate-docs heal SHAs for docs_stale CI (#1081). */
+  ciDocsStaleHealAttemptedShas?: string[];
   /** Terminal ci/fail gate_result already emitted for these head SHAs (#771). */
   ciTerminalFailRecordedShas?: string[];
   /** @deprecated scalar form — migrated into `ciRebaseAttemptedShas` on load. */
@@ -142,6 +144,7 @@ export function normalizeCiRecoveryMarkers(raw: CiRecoveryMarkers): CiRecoveryMa
       raw.ciAssertionFixAttemptedShas,
       raw.ciAssertionFixAttemptedForSha,
     ),
+    ciDocsStaleHealAttemptedShas: asSet(raw.ciDocsStaleHealAttemptedShas, undefined),
     ciTerminalFailRecordedShas: asSet(
       raw.ciTerminalFailRecordedShas,
       raw.ciTerminalFailRecordedForSha,
@@ -292,6 +295,10 @@ export function hydrateCiRecoveryMarkers(
     ctx.ciAssertionFixAttemptedShas,
     projection.ciAssertionFixAttemptedShas,
   );
+  ctx.ciDocsStaleHealAttemptedShas = ciRecoveryShaSetUnion(
+    ctx.ciDocsStaleHealAttemptedShas,
+    projection.ciDocsStaleHealAttemptedShas,
+  );
   ctx.ciTerminalFailRecordedShas = ciRecoveryShaSetUnion(
     ctx.ciTerminalFailRecordedShas,
     projection.ciTerminalFailRecordedShas,
@@ -336,6 +343,7 @@ export function persistCtxCiMarkers(
       ciRerunAttemptedShas: ctx.ciRerunAttemptedShas,
       ciArchiveFailRecoveryAttemptedShas: ctx.ciArchiveFailRecoveryAttemptedShas,
       ciAssertionFixAttemptedShas: ctx.ciAssertionFixAttemptedShas,
+      ciDocsStaleHealAttemptedShas: ctx.ciDocsStaleHealAttemptedShas,
       ciTerminalFailRecordedShas: ctx.ciTerminalFailRecordedShas,
       noRunRecoveryAttemptedForSha: ctx.noRunRecoveryAttemptedForSha,
     },
@@ -349,6 +357,7 @@ export function persistCtxCiMarkers(
     ctx.ciRerunAttemptedShas = projection.ciRerunAttemptedShas;
     ctx.ciArchiveFailRecoveryAttemptedShas = projection.ciArchiveFailRecoveryAttemptedShas;
     ctx.ciAssertionFixAttemptedShas = projection.ciAssertionFixAttemptedShas;
+    ctx.ciDocsStaleHealAttemptedShas = projection.ciDocsStaleHealAttemptedShas;
     ctx.ciTerminalFailRecordedShas = projection.ciTerminalFailRecordedShas;
   }
   return result;
@@ -369,6 +378,7 @@ export function reconcileCiRecoveryState(input: {
     | { kind: "ci_rerun" }
     | { kind: "ci_archive_fail_recovery" }
     | { kind: "ci_assertion_fix" }
+    | { kind: "ci_docs_stale_heal" }
     | { kind: "escalate" }
   >;
   attempted: {
@@ -376,6 +386,7 @@ export function reconcileCiRecoveryState(input: {
     rerun: boolean;
     archive_fail: boolean;
     assertion_fix: boolean;
+    docs_stale_heal: boolean;
   };
 } {
   const attempted = {
@@ -387,6 +398,9 @@ export function reconcileCiRecoveryState(input: {
     assertion_fix: attemptedShasForAction(input.ledger, "ci_assertion_fix").includes(
       input.headSha,
     ),
+    docs_stale_heal: attemptedShasForAction(input.ledger, "ci_docs_stale_heal").includes(
+      input.headSha,
+    ),
   };
   if (!input.definitiveRed) {
     return { actions: [], attempted };
@@ -396,12 +410,14 @@ export function reconcileCiRecoveryState(input: {
     | { kind: "ci_rerun" }
     | { kind: "ci_archive_fail_recovery" }
     | { kind: "ci_assertion_fix" }
+    | { kind: "ci_docs_stale_heal" }
     | { kind: "escalate" }
   > = [];
   if (!attempted.rebase) actions.push({ kind: "ci_rebase" });
   if (!attempted.rerun) actions.push({ kind: "ci_rerun" });
   if (!attempted.archive_fail) actions.push({ kind: "ci_archive_fail_recovery" });
   if (!attempted.assertion_fix) actions.push({ kind: "ci_assertion_fix" });
+  if (!attempted.docs_stale_heal) actions.push({ kind: "ci_docs_stale_heal" });
   if (actions.length === 0) actions.push({ kind: "escalate" });
   return { actions, attempted };
 }
@@ -437,6 +453,7 @@ interface DefinitiveCiFailureFns {
     check: CheckRun,
   ) => Promise<string | null>;
   runCiAssertionFixFn?: AdvancePreMergeDeps["runCiAssertionFix"];
+  runCiDocsStaleHealFn?: AdvancePreMergeDeps["runCiDocsStaleHeal"];
   stateDir?: string;
 }
 
@@ -447,11 +464,12 @@ interface DefinitiveCiFailureFns {
  * | Order | Class          | Budget key (SHA set)                    | On success side-effect                                      |
  * |------:|----------------|-----------------------------------------|-------------------------------------------------------------|
  * | 1     | rebase         | `ciRebaseAttemptedShas` (durable)       | verified HEAD moved → `waiting` `rebased; CI re-running`; unverified → re-eval wait; else continue |
- * | 2     | classify       | n/a (pure)                              | drives steps 3–5                                            |
+ * | 2     | classify       | n/a (pure)                              | drives steps 3–6                                            |
  * | 3     | rerun          | `ciRerunAttemptedShas`                  | re-request → `waiting` `CI re-triggered (…)`                  |
  * | 4     | archive_fail   | `ciArchiveFailRecoveryAttemptedShas`    | close+reopen → archive waiting reason                    |
  * | 5     | assertion_fix | `ciAssertionFixAttemptedShas`           | fix ok → assertion waiting reason                           |
- * | 6     | escalate       | n/a                                     | `setBlocked` `ci-exhausted` + offramp `ci-failed`           |
+ * | 6     | docs_stale_heal | `ciDocsStaleHealAttemptedShas`         | generate+commit+push → waiting on new SHA                   |
+ * | 7     | escalate       | n/a                                     | `setBlocked` `ci-exhausted` + offramp `ci-failed`           |
  *
  * Budget is durable per head SHA via the stage-attempt ledger (#759), projected
  * onto pollingCtx SHA sets as a process-local cache (#679). Rebase budget is
@@ -488,6 +506,10 @@ export async function handleDefinitiveCiFailure(
     );
     ctx.ciAssertionFixAttemptedShas = ciRecoveryShaSetAdd(
       ctx.ciAssertionFixAttemptedShas,
+      headSha,
+    );
+    ctx.ciDocsStaleHealAttemptedShas = ciRecoveryShaSetAdd(
+      ctx.ciDocsStaleHealAttemptedShas,
       headSha,
     );
     console.log(
@@ -682,6 +704,7 @@ export async function handleDefinitiveCiFailure(
     headSha,
   );
   let assertionFixAttempted = ciRecoveryShaSetHas(ctx.ciAssertionFixAttemptedShas, headSha);
+  let docsStaleHealAttempted = ciRecoveryShaSetHas(ctx.ciDocsStaleHealAttemptedShas, headSha);
   /** Set when archive close succeeded but reopen did not — operator must reopen. */
   let prLeftClosed: { prNumber: number } | undefined;
   let closeReopenError: string | undefined;
@@ -864,7 +887,59 @@ export async function handleDefinitiveCiFailure(
     }
   }
 
-  // 6. Budget exhausted → escalate with ci-exhausted + rich reason.
+  // 6. docs_stale → one generate-docs heal + pipeline-internal commit (#1081).
+  // Persist marker before dispatch so restart cannot re-invoke the heal loop.
+  if (classification === "docs_stale" && !docsStaleHealAttempted) {
+    const prevHealShas = ctx.ciDocsStaleHealAttemptedShas;
+    ctx.ciDocsStaleHealAttemptedShas = ciRecoveryShaSetAdd(
+      ctx.ciDocsStaleHealAttemptedShas,
+      headSha,
+    );
+    const persist = persistCtxCiMarkers(ctx, opts.runDir);
+    if (!persist.ok) {
+      ctx.ciDocsStaleHealAttemptedShas = prevHealShas;
+      durablePersistFailure = durablePersistFailure ?? persist.reason;
+      console.log(
+        `[pipeline] #${issueNumber}: refusing CI docs-stale heal for ${headSha.slice(0, 7)} — ${persist.reason}`,
+      );
+    } else {
+      docsStaleHealAttempted = true;
+      if (fns.runCiDocsStaleHealFn) {
+        let healResult: { ok: boolean; reason?: string };
+        try {
+          healResult = await fns.runCiDocsStaleHealFn(cfg, issueNumber, {
+            prNumber,
+            headSha,
+            failedChecks,
+            classification,
+            logExcerpt,
+          });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          healResult = { ok: false, reason: msg };
+        }
+        if (healResult.ok) {
+          console.log(
+            `[pipeline] #${issueNumber}: CI docs-stale heal committed for head ${headSha.slice(0, 7)}`,
+          );
+          return {
+            advanced: false,
+            status: "waiting",
+            reason: "CI docs-stale heal committed; waiting for checks",
+          };
+        }
+        console.log(
+          `[pipeline] #${issueNumber}: CI docs-stale heal failed: ${healResult.reason ?? "unknown"}`,
+        );
+      } else {
+        console.log(
+          `[pipeline] #${issueNumber}: CI docs-stale heal has no production handler`,
+        );
+      }
+    }
+  }
+
+  // 7. Budget exhausted → escalate with ci-exhausted + rich reason.
   const archiveInfo = await evaluateArchiveOnlyPriorGreen(
     cfg,
     headSha,
@@ -883,6 +958,7 @@ export async function handleDefinitiveCiFailure(
     archiveFailRecoveryAttempted,
     assertionFixAttempted,
     assertionFixEnabled,
+    docsStaleHealAttempted,
     rerunEnabled,
     prLeftClosed,
     closeReopenError,
@@ -928,6 +1004,7 @@ export function buildCiExhaustedBlockReason(input: {
   archiveFailRecoveryAttempted: boolean;
   assertionFixAttempted: boolean;
   assertionFixEnabled: boolean;
+  docsStaleHealAttempted?: boolean;
   rerunEnabled: boolean;
   /** When archive close+reopen left the PR closed after reopen failure. */
   prLeftClosed?: { prNumber: number };
@@ -978,6 +1055,7 @@ export function buildCiExhaustedBlockReason(input: {
     `- automatic re-run: ${input.rerunEnabled ? (input.rerunAttempted ? "yes" : "no") : "disabled"}`,
     `- archive failed-run close+reopen: ${input.archiveFailRecoveryAttempted ? "yes" : "no"}`,
     `- assertion auto-fix: ${input.assertionFixEnabled ? (input.assertionFixAttempted ? "yes" : "no") : "disabled"}`,
+    `- docs-stale generate-docs heal: ${input.docsStaleHealAttempted ? "yes" : "no"}`,
     "",
     "Next steps: " +
       (input.prLeftClosed

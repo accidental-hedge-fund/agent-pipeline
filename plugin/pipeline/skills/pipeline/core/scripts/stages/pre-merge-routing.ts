@@ -47,6 +47,7 @@ import {
   isPipelineInternalCommit,
   OPENSPEC_ARCHIVE_PREFIX,
 } from "../pipeline-commits.ts";
+import { runCiDocsStaleHeal } from "../ci-docs-stale-heal.ts";
 import type { CheckRun, Outcome, PipelineConfig, Stage } from "../types.ts";
 import { makeCommandRecord, recordCommand } from "../evidence-bundle.ts";
 import { readEvents } from "../run-store.ts";
@@ -140,6 +141,8 @@ export interface PreMergePollingContext {
   ciArchiveFailRecoveryAttemptedShas?: string[];
   /** Head SHAs for which optional CI assertion auto-fix was attempted (#679). */
   ciAssertionFixAttemptedShas?: string[];
+  /** Head SHAs for which generate-docs --check heal was attempted (#1081). */
+  ciDocsStaleHealAttemptedShas?: string[];
   /**
    * Head SHAs for which a terminal `gate_result` `ci`/`fail` was already recorded
    * after recovery budget exhaustion (#771). Pure re-polls must not spam another fail.
@@ -321,6 +324,21 @@ export interface AdvancePreMergeDeps extends ShaGateDeps {
       logExcerpt: string | null;
     },
   ) => Promise<{ ok: boolean; reason?: string }>;
+  /**
+   * One-shot generate-docs heal for docs_stale CI (#1081). Production default
+   * fetches tags, regenerates, commits, and pushes. Tests inject fakes.
+   */
+  runCiDocsStaleHeal?: (
+    cfg: PipelineConfig,
+    issueNumber: number,
+    ctx: {
+      prNumber: number;
+      headSha: string;
+      failedChecks: CheckRun[];
+      classification: CiFailureClass;
+      logExcerpt: string | null;
+    },
+  ) => Promise<{ ok: boolean; reason?: string }>;
 }
 
 /**
@@ -393,6 +411,7 @@ export async function advance(
   const rerunFailedWorkflowsFn = deps.rerunFailedWorkflows ?? rerunFailedWorkflows;
   const fetchCheckLogExcerptFn = deps.fetchCheckLogExcerpt ?? fetchCheckLogExcerpt;
   const runCiAssertionFixFn = deps.runCiAssertionFix;
+  const runCiDocsStaleHealFn = deps.runCiDocsStaleHeal ?? runCiDocsStaleHeal;
 
   console.log(`[pipeline] #${issueNumber}: pre-merge gate`);
 
@@ -972,6 +991,7 @@ export async function advance(
         rerunFailedWorkflowsFn,
         fetchCheckLogExcerptFn,
         runCiAssertionFixFn,
+        runCiDocsStaleHealFn,
         stateDir: opts.stateDir,
       });
       // Observability for the loop progress mirror (#682 / #771).

@@ -1,18 +1,20 @@
 /**
- * Deterministic pre-merge CI failure classification (#679).
+ * Deterministic pre-merge CI failure classification (#679 / #1081).
  *
  * Maps check metadata + optional log excerpts to one of:
+ *   - docs_stale — generate-docs --check / generator-owned freshness fail
  *   - infra    — runner/setup/IPC/OOM/cancelled/transient GH infrastructure
  *   - assertion — product test/lint/type failures with assertion/compiler output
  *   - unknown  — cannot classify confidently
  *
  * Mixed sets prefer `assertion` so we never paper over product red with re-run-only.
+ * Pure docs_stale (no assertion/infra) is regen-able, not unknown.
  * Pure; no I/O.
  */
 
 import type { CheckRun } from "./types.ts";
 
-export type CiFailureClass = "infra" | "assertion" | "unknown";
+export type CiFailureClass = "docs_stale" | "infra" | "assertion" | "unknown";
 
 export interface ClassifyCiFailureInput {
   /** Definitive failed checks (bucket fail/cancel). */
@@ -93,6 +95,17 @@ const ASSERTION_SIGNATURES: readonly string[] = [
   "not ok ",
 ];
 
+/**
+ * Generator-owned docs freshness signatures (#1081).
+ * Keep these specific so a product test mentioning CHANGELOG.md is not
+ * classified as regen-able.
+ */
+const DOCS_STALE_SIGNATURES: readonly string[] = [
+  "generate-docs --check: stale generated docs:",
+  "stale generated docs:",
+  "run: node scripts/generate-docs.mjs",
+];
+
 function haystackForCheck(check: CheckRun, logExcerpt?: string | null): string {
   const parts = [
     check.name ?? "",
@@ -125,16 +138,18 @@ export function classifySingleCheck(
   const hasInfra =
     bucket === "cancel" ||
     matchesAny(haystack, INFRA_SIGNATURES);
+  const hasDocsStale = matchesAny(haystack, DOCS_STALE_SIGNATURES);
 
   if (hasAssertion) return "assertion";
   if (hasInfra) return "infra";
+  if (hasDocsStale) return "docs_stale";
   return "unknown";
 }
 
 /**
  * Classify a set of definitive failures into exactly one overall class.
- * Mixed assertion + infra → assertion. Pure infra → infra. Else unknown
- * unless every check is confidently infra.
+ * Mixed assertion + anything → assertion. Pure infra → infra. Pure docs_stale
+ * (no assertion/infra) → docs_stale. Else unknown unless infra is present.
  */
 export function classifyCiFailure(input: ClassifyCiFailureInput): CiFailureClass {
   const { failed, logExcerpt } = input;
@@ -142,12 +157,14 @@ export function classifyCiFailure(input: ClassifyCiFailureInput): CiFailureClass
 
   let anyAssertion = false;
   let anyInfra = false;
+  let anyDocsStale = false;
   let anyUnknown = false;
 
   for (const check of failed) {
     const cls = classifySingleCheck(check, logExcerpt);
     if (cls === "assertion") anyAssertion = true;
     else if (cls === "infra") anyInfra = true;
+    else if (cls === "docs_stale") anyDocsStale = true;
     else anyUnknown = true;
   }
 
@@ -155,5 +172,6 @@ export function classifyCiFailure(input: ClassifyCiFailureInput): CiFailureClass
   if (anyAssertion) return "assertion";
   if (anyInfra && !anyUnknown) return "infra";
   if (anyInfra && anyUnknown) return "infra"; // unknown + infra still takes re-run budget
+  if (anyDocsStale && !anyUnknown) return "docs_stale";
   return "unknown";
 }

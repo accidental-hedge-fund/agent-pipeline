@@ -29,10 +29,18 @@ export const VISUAL_PUBLISH_COMMIT_PATTERN = new RegExp(
 );
 
 /**
+ * Docs-generator heal subject (#1081 / docsRegenerateCommitMessage).
+ * Exact `docs: regenerate generated docs (#N)` only — ordinary docs: commits
+ * remain developer commits (#91).
+ */
+export const DOCS_REGENERATE_COMMIT_PATTERN = /^docs: regenerate generated docs \(#\d+\)$/;
+
+/**
  * True iff the commit headline is pipeline-internal under the tested runtime
- * contract (#98 / #228 / #463):
+ * contract (#98 / #228 / #463 / #1081):
  * - OpenSpec archive prefix, or
- * - exact visual-gate artifact-publish subject
+ * - exact visual-gate artifact-publish subject, or
+ * - exact docs-generator regenerate heal subject
  *
  * Docs-update, auto-format, pre-merge auto-fix, salvage, and ordinary
  * developer/fix/feat subjects are NOT pipeline-internal.
@@ -40,6 +48,7 @@ export const VISUAL_PUBLISH_COMMIT_PATTERN = new RegExp(
 export function isPipelineInternalCommit(messageHeadline: string): boolean {
   return (
     messageHeadline.startsWith(OPENSPEC_ARCHIVE_PREFIX) ||
-    VISUAL_PUBLISH_COMMIT_PATTERN.test(messageHeadline)
+    VISUAL_PUBLISH_COMMIT_PATTERN.test(messageHeadline) ||
+    DOCS_REGENERATE_COMMIT_PATTERN.test(messageHeadline)
   );
 }

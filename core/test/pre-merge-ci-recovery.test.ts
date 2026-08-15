@@ -1542,3 +1542,86 @@ test("#771 r2b terminal claim persist failure does not append fail before durabl
     await rm(parent, { recursive: true, force: true });
   }
 });
+
+const DOCS_STALE_LOG = [
+  "Totals: 302 passed, 0 failed (302 items)",
+  "generate-docs --check: stale generated docs:",
+  "  - CHANGELOG.md",
+  "Run: node scripts/generate-docs.mjs",
+].join("\n");
+
+test("#1081 docs_stale heal commits and waits — no setBlocked", async (t) => {
+  await withRunDir(async (runDir) => {
+    let healCalls = 0;
+    const { deps, rec } = baseDeps({
+      rebaseAlreadyAttempted: () => true,
+      fetchCheckLogExcerpt: async () => DOCS_STALE_LOG,
+      rerunFailedWorkflows: async () => {
+        rec.reruns++;
+        return { attempted: true, runIds: ["1"] };
+      },
+      runCiDocsStaleHeal: async () => {
+        healCalls++;
+        return { ok: true };
+      },
+    });
+    let out;
+    await quiet(t, async () => {
+      out = await advance(cfg, ISSUE, { runDir, pollingCtx: {} }, deps);
+    });
+    assert.equal(healCalls, 1);
+    assert.equal(rec.reruns, 0, "docs_stale must not consume flake re-run");
+    assert.equal(rec.blocked.length, 0);
+    assert.equal(out!.status, "waiting");
+    assert.match(out!.reason ?? "", /docs-stale heal committed/i);
+  });
+});
+
+test("#1081 second docs_stale fail on same SHA does not heal again", async (t) => {
+  await withRunDir(async (runDir) => {
+    let healCalls = 0;
+    const { deps, rec } = baseDeps({
+      rebaseAlreadyAttempted: () => true,
+      fetchCheckLogExcerpt: async () => DOCS_STALE_LOG,
+      runCiDocsStaleHeal: async () => {
+        healCalls++;
+        return { ok: true };
+      },
+    });
+    const pollingCtx = {};
+    await quiet(t, async () => {
+      await advance(cfg, ISSUE, { runDir, pollingCtx }, deps);
+    });
+    let out;
+    await quiet(t, async () => {
+      out = await advance(cfg, ISSUE, { runDir, pollingCtx }, deps);
+    });
+    assert.equal(healCalls, 1);
+    assert.equal(rec.blocked.length, 1);
+    assert.equal(rec.blocked[0]!.kind, "ci-exhausted");
+    assert.match(rec.blocked[0]!.reason, /classification: docs_stale/);
+    assert.match(rec.blocked[0]!.reason, /docs-stale generate-docs heal: yes/);
+    assert.equal(out!.status, "blocked");
+  });
+});
+
+test("#1081 docs-stale heal failure escalates with heal reason, not unknown", async (t) => {
+  await withRunDir(async (runDir) => {
+    const { deps, rec } = baseDeps({
+      rebaseAlreadyAttempted: () => true,
+      fetchCheckLogExcerpt: async () => DOCS_STALE_LOG,
+      runCiDocsStaleHeal: async () => ({
+        ok: false,
+        reason: "docs generator failed while attempting to heal stale generated docs",
+      }),
+    });
+    let out;
+    await quiet(t, async () => {
+      out = await advance(cfg, ISSUE, { runDir, pollingCtx: {} }, deps);
+    });
+    assert.equal(rec.blocked.length, 1);
+    assert.match(rec.blocked[0]!.reason, /classification: docs_stale/);
+    assert.doesNotMatch(rec.blocked[0]!.reason, /classification: unknown/);
+    assert.equal(out!.status, "blocked");
+  });
+});

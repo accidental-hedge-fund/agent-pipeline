@@ -100,3 +100,42 @@ test("extract: bare check name without log stays unknown (not forced assertion)"
     "unknown",
   );
 });
+
+test("#1081: generate-docs --check stale CHANGELOG classifies as docs_stale, not unknown", () => {
+  assert.equal(
+    classifyCiFailure({
+      failed: [check({ name: "test" })],
+      logExcerpt: [
+        "Totals: 302 passed, 0 failed (302 items)",
+        "generate-docs --check: stale generated docs:",
+        "  - CHANGELOG.md",
+        "Run: node scripts/generate-docs.mjs",
+      ].join("\n"),
+    }),
+    "docs_stale",
+  );
+});
+
+test("#1081: mixed docs_stale + assertion prefers assertion", () => {
+  assert.equal(
+    classifyCiFailure({
+      failed: [check({ name: "test" })],
+      logExcerpt: [
+        "AssertionError: expected 1 to equal 2",
+        "generate-docs --check: stale generated docs:",
+        "  - CHANGELOG.md",
+      ].join("\n"),
+    }),
+    "assertion",
+  );
+});
+
+test("#1081: CHANGELOG mention without generator signature stays unknown", () => {
+  assert.equal(
+    classifyCiFailure({
+      failed: [check({ name: "test" })],
+      logExcerpt: "update CHANGELOG.md before merge",
+    }),
+    "unknown",
+  );
+});
