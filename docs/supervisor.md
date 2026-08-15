@@ -255,7 +255,9 @@ plus notify. Operator phrase: `Ship milestone vX.Y.Z`. Status:
 | `examples/supervisor/shell/ship-milestone.sh` | **Non-primary** authorized adapter for in-engine `pipeline ship` |
 
 Required env for mutating ship: `REPO_DIR`, `PIPELINE`, `ALLOW_MERGE=1`.  
-Promote defaults to all hosts (`ENGINE_PROMOTE_HOST` default `all`).
+`REPO_DIR` is the live control checkout; Tugboat refuses `*factory-control*`
+and treats only live `train --merge` (or owning tugboat) as an already-running
+ship (#1062). Promote defaults to all hosts (`ENGINE_PROMOTE_HOST` default `all`).
 
 Runbooks: [runbooks/ship-milestone.md](./runbooks/ship-milestone.md),  
 [runbooks/frg-pack-checklist.md](./runbooks/frg-pack-checklist.md).

@@ -92,8 +92,14 @@ systemctl --user is-active hermes-gateway-pipeline-factory.service
 
 ## 5. Control checkout
 
+`REPO_DIR` must be the **live control checkout** (e.g. `ap-main-control`).
+Tugboat pins `REPO_DIR` at start and **refuses** paths matching `*factory-control*`
+(#1062). Do not point ship at the retired factory-control plane.
+
 ```bash
-CONTROL="${REPO_DIR:-$HOME/dev/agent-pipeline-factory-control}"
+CONTROL="${REPO_DIR:-$HOME/dev/ap-main-control}"
+# Refuse known-wrong plane (matches Tugboat gate):
+case "$CONTROL" in *factory-control*) echo "REFUSE factory-control REPO_DIR"; exit 1 ;; esac
 git -C "$CONTROL" fetch origin
 git -C "$CONTROL" checkout main
 git -C "$CONTROL" pull --ff-only

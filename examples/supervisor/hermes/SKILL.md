@@ -36,7 +36,7 @@ Expect these on the Hermes process PATH / env (set by the deployment profile):
 
 | Variable | Purpose |
 |---|---|
-| `REPO_DIR` | Target checkout (e.g. factory control clone) — **required for ship** |
+| `REPO_DIR` | Live control checkout (e.g. `ap-main-control`) — **required for ship**. Tugboat pins this at start and **refuses** `*factory-control*` (#1062). |
 | `PIPELINE` | Absolute launcher, e.g. `node …/pipeline.mjs` — **required** |
 | `ALLOW_MERGE` | `1` only if this channel may run `train --merge` / release finish — **required for ship** |
 | `AGENT_PIPELINE_ROOT` | Clone of agent-pipeline containing `examples/supervisor/shell/` |
@@ -92,11 +92,19 @@ tugboat --milestone vX.Y.Z --detach
 # "$AGENT_PIPELINE_ROOT/examples/supervisor/shell/tugboat.sh" --milestone vX.Y.Z --detach
 ```
 
-Status (no side effect — does not start train/release/promote):
+**Live ship (#1062):** Tugboat refuses a second detach only when a live process
+cmdline is `train --merge` for that milestone (or the owning tugboat). A bare
+`playbook.pid` / `kill -0`, a per-issue `pipeline N` lock, or stale `state.json`
+alone is **not** a live ship — still detach once. Buzz and TUI paste share this
+path; do not invent a paste detector. Second Ship while live → status + notify,
+no stack.
+
+Status (no side effect — does not start train/release/promote). Does **not**
+claim `running` from a dead pid alone:
 
 ```bash
 tugboat --milestone vX.Y.Z --status
-# or: cat "$HOME/.local/state/pipeline-supervisor/ship-vX.Y.Z/state.json"
+# Prefer this over raw state.json (status rewrites stale "running")
 ```
 
 State/logs: `~/.local/state/pipeline-supervisor/ship-vX.Y.Z/`.
