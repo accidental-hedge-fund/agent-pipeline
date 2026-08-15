@@ -103,11 +103,12 @@ test("lightweight_favoring alone selects lightweight_plan → minimal", () => {
 test("lightweight + open assumptions stacks preserve_assumptions", () => {
   const rec = composeProgressivePlanningRecommendation({
     lightweight_favoring: true,
-    open_or_deferred_assumption_count: 2,
+    open_or_deferred_assumption_ids: ["A-open-1", "A-open-2"],
   });
   assert.equal(rec.primary_action, "lightweight_plan");
   assert.ok(rec.actions.includes("preserve_assumptions"));
   assert.ok(rec.diagnostics.includes("open_assumptions_preserved"));
+  assert.deepEqual(rec.preserved_assumption_ids, ["A-open-1", "A-open-2"]);
 });
 
 test("security_compliance incomplete does not default to lightweight", () => {
@@ -197,11 +198,12 @@ test("human_authority_boundary dominates", () => {
   const rec = composeProgressivePlanningRecommendation({
     lightweight_favoring: true,
     human_authority_boundary: true,
-    open_or_deferred_assumption_count: 1,
+    open_or_deferred_assumption_ids: ["A-handoff-1"],
   });
   assert.equal(rec.primary_action, "request_human_authority");
   assert.ok(rec.actions.includes("preserve_assumptions"));
   assert.ok(!rec.actions.includes("lightweight_plan"));
+  assert.deepEqual(rec.preserved_assumption_ids, ["A-handoff-1"]);
 });
 
 test("observed_rework_cost without history is ignored (history_unavailable)", () => {
@@ -541,9 +543,13 @@ test("structured class without evidence does not elevate (class_evidence_missing
     lightweight_favoring: true,
   });
   assert.ok(rec.diagnostics.includes("class_evidence_missing"));
-  // Rejected class must not force human authority; lightweight may win.
-  assert.equal(rec.primary_action, "lightweight_plan");
+  // Rejected high-severity class must not match or apply its floor, but must
+  // still block lightweight (unknown standard floor).
   assert.ok(!rec.matched_classes.includes("security_compliance"));
+  assert.notEqual(rec.primary_action, "lightweight_plan");
+  assert.notEqual(rec.primary_action, "request_human_authority");
+  assert.equal(rec.primary_action, "standard_plan");
+  assert.ok(!rec.actions.includes("lightweight_plan"));
 });
 
 test("valid structural evidence assigns class and floors action", () => {
@@ -754,4 +760,171 @@ test("contradictory count vs ids throws before recommendation", () => {
       }),
     /assumption_count_id_mismatch/,
   );
+});
+
+// ---------------------------------------------------------------------------
+// Review 2 (adversarial) regressions — f2d2693d / cab3d23a / be9bd734
+// ---------------------------------------------------------------------------
+
+test("positive count without assumption ids is rejected (f2d2693d)", () => {
+  assert.throws(
+    () =>
+      composeProgressivePlanningRecommendation({
+        lightweight_favoring: true,
+        open_or_deferred_assumption_count: 2,
+      }),
+    /assumption_count_without_ids/,
+  );
+  assert.throws(
+    () =>
+      resolveOpenAssumptionsStrict({
+        open_or_deferred_assumption_count: 1,
+      }),
+    /assumption_count_without_ids/,
+  );
+  // Zero count without ids remains valid (no preserve claim).
+  const resolved = resolveOpenAssumptionsStrict({
+    open_or_deferred_assumption_count: 0,
+  });
+  assert.equal(resolved.openCount, 0);
+  assert.deepEqual(resolved.preservedIds, []);
+});
+
+test("preserve_assumptions never attaches without reconstructable ids (f2d2693d)", () => {
+  const rec = composeProgressivePlanningRecommendation({
+    lightweight_favoring: true,
+  });
+  assert.equal(rec.primary_action, "lightweight_plan");
+  assert.ok(!rec.actions.includes("preserve_assumptions"));
+  assert.deepEqual(rec.preserved_assumption_ids, []);
+  assert.ok(!rec.diagnostics.includes("open_assumptions_preserved"));
+});
+
+test("structured class assertion requires recommendation_as_of (cab3d23a)", () => {
+  assert.throws(
+    () =>
+      composeProgressivePlanningRecommendation({
+        classes: [cls("security_compliance", { subsignals_complete: true }, "pre-code:auth")],
+      }),
+    /recommendation_as_of_required/,
+  );
+});
+
+test("provenance recommendation_as_of must match composition as-of (cab3d23a)", () => {
+  const T0 = "2026-08-15T12:00:00.000Z";
+  const T1 = "2026-08-15T18:00:00.000Z";
+  assert.throws(
+    () =>
+      composeProgressivePlanningRecommendation({
+        recommendation_as_of: T0,
+        classes: [
+          cls(
+            "observed_rework_cost",
+            {
+              history_available: true,
+              history_elevated: true,
+              evidence: [evRef("cohort:run-prior-1", "historical_observed")],
+            },
+          ),
+        ],
+        observed_rework_provenance: {
+          recommendation_as_of: T1,
+          history_cutoff_at: T1,
+          target_run_id: "run-target",
+          cohort_run_ids: ["run-prior-1"],
+          cohort_completed_at: {
+            "run-prior-1": "2026-08-14T10:00:00.000Z",
+          },
+        },
+      }),
+    /recommendation_as_of_mismatch/,
+  );
+});
+
+test("class evidence without recommendation_as_of is rejected (cab3d23a)", () => {
+  const check = validateClassEvidenceRef(
+    {
+      ref: "path:core/scripts",
+      source_kind: "structural",
+      observed_as_of: BEFORE,
+    },
+    undefined,
+  );
+  assert.equal(check.ok, false);
+  if (!check.ok) {
+    assert.match(check.reason, /recommendation_as_of is required/);
+  }
+});
+
+test("rejected security evidence with lightweight_favoring fails closed to standard (be9bd734)", () => {
+  // Exact adversarial case: bare security assertion + lightweight_favoring
+  // must not return lightweight_plan after evidence rejection.
+  const rec = composeProgressivePlanningRecommendation({
+    recommendation_as_of: AS_OF,
+    classes: [{ class_id: "security_compliance" }],
+    lightweight_favoring: true,
+  });
+  assert.ok(rec.diagnostics.includes("class_evidence_missing"));
+  assert.ok(!rec.matched_classes.includes("security_compliance"));
+  assert.notEqual(rec.primary_action, "lightweight_plan");
+  assert.equal(rec.primary_action, "standard_plan");
+  assert.ok(!rec.actions.includes("lightweight_plan"));
+  // Rejected class must not apply its normal human-authority floor.
+  assert.notEqual(rec.primary_action, "request_human_authority");
+});
+
+test("rejected reversibility evidence also blocks lightweight (be9bd734)", () => {
+  const rec = composeProgressivePlanningRecommendation({
+    recommendation_as_of: AS_OF,
+    classes: [
+      {
+        class_id: "reversibility",
+        evidence: [
+          {
+            ref: "outcome_derived:target",
+            source_kind: "outcome_derived" as never,
+            observed_as_of: BEFORE,
+          },
+        ],
+      },
+    ],
+    lightweight_favoring: true,
+  });
+  assert.ok(rec.diagnostics.includes("class_evidence_rejected"));
+  assert.ok(!rec.matched_classes.includes("reversibility"));
+  assert.notEqual(rec.primary_action, "lightweight_plan");
+  assert.equal(rec.primary_action, "standard_plan");
+});
+
+test("invalid evidence refs after as-of cannot elevate observed_rework (cab3d23a)", () => {
+  const rec = composeProgressivePlanningRecommendation({
+    recommendation_as_of: AS_OF,
+    classes: [
+      {
+        class_id: "observed_rework_cost",
+        history_available: true,
+        history_elevated: true,
+        evidence: [
+          {
+            ref: "cohort:late",
+            source_kind: "historical_observed",
+            observed_as_of: "2026-08-16T00:00:00.000Z",
+          },
+        ],
+      },
+    ],
+    observed_rework_provenance: {
+      recommendation_as_of: AS_OF,
+      history_cutoff_at: AS_OF,
+      target_run_id: "run-target",
+      cohort_run_ids: ["run-prior-1"],
+      cohort_completed_at: {
+        "run-prior-1": "2026-08-14T10:00:00.000Z",
+      },
+    },
+  });
+  // Post-routing evidence rejects the class; no deepen from elevated history.
+  assert.ok(rec.diagnostics.includes("class_evidence_rejected"));
+  assert.ok(!rec.matched_classes.includes("observed_rework_cost"));
+  assert.equal(rec.primary_action, "standard_plan");
 });

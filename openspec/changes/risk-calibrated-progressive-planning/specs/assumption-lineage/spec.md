@@ -28,6 +28,13 @@ When progressive-planning policy (or any planning-depth selection) chooses a lig
 - **THEN** those `assumption_id` values SHALL match open or deferred rows in the run’s current-state lineage projection
 - **AND** a numeric open/deferred count without ids SHALL NOT be treated as sufficient proof that the underlying set is reconstructable
 
+#### Scenario: positive count without ids is rejected before preserve
+
+- **WHEN** offline composition is given a positive `open_or_deferred_assumption_count`
+- **AND** `open_or_deferred_assumption_ids` is absent or empty
+- **THEN** composition SHALL reject the input before producing a recommendation
+- **AND** SHALL NOT emit `preserve_assumptions` with an empty reconstructable id set solely from that count
+
 #### Scenario: same ids across lightweight deep and human paths
 
 - **WHEN** the same open and deferred `assumption_id` values are present on a run

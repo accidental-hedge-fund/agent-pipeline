@@ -118,7 +118,7 @@ Selected action(s) map to recommended `planning_depth` (`minimal` / `standard` /
 
 ### D6 — Assumption lineage is mandatory carry-forward under progressive depth
 
-**Decision:** Progressive routing never deletes open/deferred assumptions. Lightweight paths still emit and carry `assumption_lineage` records. Review and implementation phases remain consumers of open items. Escalation to human authority includes the open-assumption set in the handoff surface. Reconstructability is by stable `assumption_id` via `projectAssumptionCurrentState` (and recommendation `preserved_assumption_ids` when ids are supplied). An open/deferred **count alone** is a routing signal only — it does not prove lineage reconstruction. When ids are supplied, count is derived from the deduped id list; a supplied count that disagrees with that length is rejected before any recommendation is produced.
+**Decision:** Progressive routing never deletes open/deferred assumptions. Lightweight paths still emit and carry `assumption_lineage` records. Review and implementation phases remain consumers of open items. Escalation to human authority includes the open-assumption set in the handoff surface. Reconstructability is by stable `assumption_id` via `projectAssumptionCurrentState` (and recommendation `preserved_assumption_ids` when ids are supplied). An open/deferred **count alone** is never sufficient for `preserve_assumptions`: a positive count without `open_or_deferred_assumption_ids` is rejected before any recommendation is produced. When ids are supplied, count is derived from the deduped id list; a supplied count that disagrees with that length is also rejected.
 
 **Rationale:** Issue acceptance criterion; reuses #702 lineage rather than inventing parallel storage.
 

@@ -122,8 +122,10 @@ export interface ComposeRoutingInput {
   /** Matched progressive classes with optional completeness flags. */
   classes?: readonly ClassEvidenceInput[] | readonly ProgressiveRiskClass[];
   /**
-   * Composition as-of time for per-class evidence validation.
-   * Defaults to observed_rework_provenance.recommendation_as_of when present.
+   * Composition as-of time for per-class evidence and cohort validation.
+   * Required whenever structured progressive classes are asserted (or when
+   * observed_rework history is claimed). Must match
+   * observed_rework_provenance.recommendation_as_of when provenance is present.
    */
   recommendation_as_of?: string;
   /**
@@ -139,14 +141,15 @@ export interface ComposeRoutingInput {
   lightweight_favoring?: boolean;
   /**
    * Open or deferred assumption / open_question count for the run.
-   * Routing-only signal; reconstructability of the set requires
-   * open_or_deferred_assumption_ids (or the #702 lineage stream by run_id).
    * When ids are also supplied, count MUST equal the deduped id length or
-   * composition throws (no recommendation produced).
+   * composition throws (no recommendation produced). A positive count without
+   * open_or_deferred_assumption_ids is rejected — count alone is not
+   * reconstructable proof for preserve_assumptions.
    */
   open_or_deferred_assumption_count?: number;
   /**
    * Stable #702 assumption_id values whose latest status is open or deferred.
+   * Required whenever preserve_assumptions is stacked for open items.
    * When provided, count is derived from this list unless a contradictory
    * count is also supplied (then rejected). preserve_assumptions does not mint
    * new ids; consumers re-project lineage.
@@ -227,8 +230,21 @@ function normalizeClasses(
 }
 
 /**
+ * Parse a required ISO-8601 recommendation timestamp.
+ * Used as the single cutoff for evidence and cohort provenance checks.
+ */
+export function parseRecommendationAsOf(
+  value: unknown,
+): { ok: true; value: string } | { ok: false; reason: string } {
+  if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) {
+    return { ok: false, reason: "recommendation_as_of must be a valid ISO-8601 time" };
+  }
+  return { ok: true, value };
+}
+
+/**
  * Validate a single class evidence ref against recommendation_as_of.
- * Rejects forbidden source kinds, empty refs, and post-routing timestamps.
+ * Rejects forbidden source kinds, empty refs, missing as-of, and post-routing timestamps.
  */
 export function validateClassEvidenceRef(
   ref: unknown,
@@ -256,15 +272,22 @@ export function validateClassEvidenceRef(
   if (typeof o.observed_as_of !== "string" || !Number.isFinite(Date.parse(o.observed_as_of))) {
     return { ok: false, reason: "evidence observed_as_of must be a valid ISO-8601 time" };
   }
-  if (recommendationAsOf != null) {
-    const asOf = Date.parse(recommendationAsOf);
-    const observed = Date.parse(o.observed_as_of);
-    if (Number.isFinite(asOf) && observed > asOf) {
-      return {
-        ok: false,
-        reason: "evidence observed_as_of is after recommendation_as_of (post-routing)",
-      };
-    }
+  if (recommendationAsOf == null || recommendationAsOf === "") {
+    return {
+      ok: false,
+      reason: "recommendation_as_of is required when validating class evidence",
+    };
+  }
+  const asOf = Date.parse(recommendationAsOf);
+  if (!Number.isFinite(asOf)) {
+    return { ok: false, reason: "recommendation_as_of must be a valid ISO-8601 time" };
+  }
+  const observed = Date.parse(o.observed_as_of);
+  if (observed > asOf) {
+    return {
+      ok: false,
+      reason: "evidence observed_as_of is after recommendation_as_of (post-routing)",
+    };
   }
   // Reject refs that encode target-run outcome leakage by convention.
   const lower = o.ref.toLowerCase();
@@ -336,10 +359,13 @@ export function validateClassEvidenceAssignment(
  * Validate observed_rework provenance. Returns diagnostic codes when invalid.
  * Valid provenance: cutoff ≤ as_of; every cohort run completed before as_of;
  * target_run_id not in cohort; cohort_completed_at present for each cohort id.
+ * When compositionAsOf is supplied, provenance.recommendation_as_of MUST equal it
+ * (single recommendation-time clock for evidence and cohort cutoffs).
  */
 export function validateObservedReworkProvenance(
   prov: ObservedReworkProvenance | undefined,
   historyAvailable: boolean,
+  compositionAsOf?: string,
 ): { ok: true } | { ok: false; diagnostics: RoutingDiagnostic[] } {
   if (!historyAvailable) return { ok: true };
   if (!prov) {
@@ -348,6 +374,15 @@ export function validateObservedReworkProvenance(
   const asOf = Date.parse(prov.recommendation_as_of);
   const cutoff = Date.parse(prov.history_cutoff_at);
   if (!Number.isFinite(asOf) || !Number.isFinite(cutoff)) {
+    return { ok: false, diagnostics: ["history_provenance_rejected"] };
+  }
+  if (
+    compositionAsOf != null &&
+    compositionAsOf !== "" &&
+    prov.recommendation_as_of !== compositionAsOf
+  ) {
+    // Strict string equality keeps one recommendation clock; do not allow
+    // T0 composition with T1 provenance cohort cutoffs.
     return { ok: false, diagnostics: ["history_provenance_rejected"] };
   }
   if (cutoff > asOf) {
@@ -448,6 +483,8 @@ function applyElevatingSafetyFloor(
  * Validate open assumption count vs id list. When ids are supplied and count
  * is also supplied, they MUST agree (after id dedupe). Returns derived count/ids.
  * Throws when both are supplied and disagree — no recommendation may be produced.
+ * Positive count without reconstructable ids is rejected: preserve_assumptions
+ * must echo run-bound assumption_id values (count alone is not sufficient).
  */
 export function resolveOpenAssumptionsStrict(input: ComposeRoutingInput): {
   openCount: number;
@@ -481,8 +518,27 @@ export function resolveOpenAssumptionsStrict(input: ComposeRoutingInput): {
     }
     return { openCount: preservedIds.length, preservedIds };
   }
-  const count = input.open_or_deferred_assumption_count ?? 0;
-  return { openCount: count > 0 ? count : 0, preservedIds: [] };
+
+  if (countProvided) {
+    const count = Number(input.open_or_deferred_assumption_count);
+    if (Number.isFinite(count) && count > 0) {
+      throw new Error(
+        `assumption_count_without_ids: open_or_deferred_assumption_count=${String(
+          input.open_or_deferred_assumption_count,
+        )} requires open_or_deferred_assumption_ids for preserve reconstructability`,
+      );
+    }
+  }
+  return { openCount: 0, preservedIds: [] };
+}
+
+/** High-severity classes that must not silently fall through to lightweight. */
+function isHighSeverityRiskClass(classId: ProgressiveRiskClass): boolean {
+  return (
+    classId === "security_compliance" ||
+    classId === "reversibility" ||
+    classId === "blast_radius"
+  );
 }
 
 function actionFloorForClass(
@@ -637,13 +693,14 @@ function assertNoScoreFields(rec: ProgressivePlanningRecommendation): void {
  * hypotheses (not calibrated conclusions) until #702/#576 cohort FP/FN
  * calibration retains or revises them.
  *
- * Throws when open_or_deferred_assumption_count disagrees with supplied ids
- * (no recommendation is produced for contradictory assumption inputs).
+ * Throws when open_or_deferred_assumption_count disagrees with supplied ids,
+ * when a positive count is supplied without reconstructable ids, or when
+ * structured class assertions lack a consistent recommendation_as_of.
  */
 export function composeProgressivePlanningRecommendation(
   input: ComposeRoutingInput = {},
 ): ProgressivePlanningRecommendation {
-  // Fail before any recommendation when count/ids contradict.
+  // Fail before any recommendation when count/ids contradict or count-only.
   const { openCount, preservedIds } = resolveOpenAssumptionsStrict(input);
 
   const diagnostics: RoutingDiagnostic[] = [];
@@ -652,19 +709,67 @@ export function composeProgressivePlanningRecommendation(
 
   const { structured, shorthand } = normalizeClasses(input.classes);
   const requireEvidence = input.require_class_evidence !== false;
-  const recommendationAsOf =
-    input.recommendation_as_of ??
-    input.observed_rework_provenance?.recommendation_as_of;
 
-  let anyHighSeverity = false;
-
-  // Provenance gate for any history_available observed_rework_cost entry.
+  // Structured class assertions require one valid recommendation timestamp.
+  // Provenance.recommendation_as_of must match it when both are present.
+  const hasStructuredAssertions = structured.some((c) => c.class_id !== "unknown");
   const needsHistory = structured.some(
     (c) => c.class_id === "observed_rework_cost" && c.history_available === true,
   );
+  let recommendationAsOf: string | undefined;
+
+  if (hasStructuredAssertions || needsHistory || input.observed_rework_provenance != null) {
+    const asOfRaw = input.recommendation_as_of;
+    if (asOfRaw == null || asOfRaw === "") {
+      if (hasStructuredAssertions || needsHistory) {
+        throw new Error(
+          "recommendation_as_of_required: structured class assertions require a valid ISO recommendation_as_of",
+        );
+      }
+      // Provenance alone without structured classes still needs a clock.
+      const fromProv = input.observed_rework_provenance?.recommendation_as_of;
+      const parsedProv = parseRecommendationAsOf(fromProv);
+      if (!parsedProv.ok) {
+        throw new Error(`recommendation_as_of_required: ${parsedProv.reason}`);
+      }
+      recommendationAsOf = parsedProv.value;
+    } else {
+      const parsed = parseRecommendationAsOf(asOfRaw);
+      if (!parsed.ok) {
+        throw new Error(`recommendation_as_of_invalid: ${parsed.reason}`);
+      }
+      recommendationAsOf = parsed.value;
+    }
+    if (
+      input.observed_rework_provenance != null &&
+      input.observed_rework_provenance.recommendation_as_of !== recommendationAsOf
+    ) {
+      throw new Error(
+        "recommendation_as_of_mismatch: observed_rework_provenance.recommendation_as_of must equal composition recommendation_as_of",
+      );
+    }
+  } else {
+    // No structured assertions: optional as-of for fixture convenience.
+    if (input.recommendation_as_of != null && input.recommendation_as_of !== "") {
+      const parsed = parseRecommendationAsOf(input.recommendation_as_of);
+      if (!parsed.ok) {
+        throw new Error(`recommendation_as_of_invalid: ${parsed.reason}`);
+      }
+      recommendationAsOf = parsed.value;
+    }
+  }
+
+  let anyHighSeverity = false;
+  // High-severity assertion encountered but rejected (missing/invalid evidence):
+  // do not match/elevate the class, but fail closed away from lightweight
+  // (unknown standard floor).
+  let highSeverityEvidenceIncomplete = false;
+
+  // Provenance gate for any history_available observed_rework_cost entry.
   const provenanceCheck = validateObservedReworkProvenance(
     input.observed_rework_provenance,
     needsHistory,
+    recommendationAsOf,
   );
   const provenanceOk = provenanceCheck.ok;
   if (!provenanceCheck.ok) {
@@ -677,6 +782,10 @@ export function composeProgressivePlanningRecommendation(
     for (const d of evCheck.diagnostics) diagnostics.push(d);
     if (!evCheck.ok) {
       // Do not elevate from unsupported/outcome-derived/post-routing assertions.
+      // High-severity rejections must not enable lightweight routing.
+      if (isHighSeverityRiskClass(ev.class_id)) {
+        highSeverityEvidenceIncomplete = true;
+      }
       continue;
     }
     if (!matched.includes(ev.class_id)) matched.push(ev.class_id);
@@ -685,11 +794,7 @@ export function composeProgressivePlanningRecommendation(
       if (isRoutingAction(a)) actionSet.add(a);
     }
     for (const diag of d) diagnostics.push(diag);
-    if (
-      ev.class_id === "security_compliance" ||
-      ev.class_id === "reversibility" ||
-      ev.class_id === "blast_radius"
-    ) {
+    if (isHighSeverityRiskClass(ev.class_id)) {
       anyHighSeverity = true;
     }
   }
@@ -712,6 +817,10 @@ export function composeProgressivePlanningRecommendation(
     if (requireEvidence) {
       diagnostics.push("class_evidence_missing");
       // Reject assignment: no action floor from bare string without evidence.
+      // High-severity shorthand without evidence still blocks lightweight.
+      if (isHighSeverityRiskClass(classId)) {
+        highSeverityEvidenceIncomplete = true;
+      }
       continue;
     }
     if (!matched.includes(classId)) matched.push(classId);
@@ -723,11 +832,7 @@ export function composeProgressivePlanningRecommendation(
       if (isRoutingAction(a)) actionSet.add(a);
     }
     for (const diag of d) diagnostics.push(diag);
-    if (
-      classId === "security_compliance" ||
-      classId === "reversibility" ||
-      classId === "blast_radius"
-    ) {
+    if (isHighSeverityRiskClass(classId)) {
       anyHighSeverity = true;
     }
   }
@@ -759,11 +864,12 @@ export function composeProgressivePlanningRecommendation(
     // Remove lightweight if present later; do not allow unknown_default standard.
   }
 
-  // Lightweight-favoring only wins when no high-severity class matched and no
-  // unresolved conflict is present.
+  // Lightweight-favoring only wins when no high-severity class matched, no
+  // rejected high-severity assertion, and no unresolved conflict is present.
   if (input.lightweight_favoring) {
     if (
       anyHighSeverity ||
+      highSeverityEvidenceIncomplete ||
       input.human_authority_boundary ||
       !scanComplete ||
       unresolvedConflict
@@ -820,6 +926,7 @@ export function composeProgressivePlanningRecommendation(
 
   // Security incomplete already added human authority; ensure never lightweight alone.
   // Unresolved conflict (boolean or structured safety) also blocks lightweight.
+  // Rejected high-severity evidence fails closed to at least unknown standard floor.
   if (
     actionSet.has("lightweight_plan") &&
     (actionSet.has("request_human_authority") ||
@@ -828,7 +935,8 @@ export function composeProgressivePlanningRecommendation(
       actionSet.has("zoom_feasibility") ||
       actionSet.has("zoom_vertical_slice") ||
       !scanComplete ||
-      unresolvedConflict)
+      unresolvedConflict ||
+      highSeverityEvidenceIncomplete)
   ) {
     actionSet.delete("lightweight_plan");
     if (!diagnostics.includes("conflict")) diagnostics.push("conflict");

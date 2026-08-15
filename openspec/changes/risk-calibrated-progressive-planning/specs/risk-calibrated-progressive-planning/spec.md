@@ -38,6 +38,21 @@ Class assignment SHALL NOT require a single numeric risk score spanning all repo
 - **THEN** it SHALL carry evidence refs with allowed `source_kind` (structural, declared, or historical_observed), a non-empty `ref`, and `observed_as_of` at or before recommendation time
 - **AND** outcome-derived, post-routing, or free-text-only source kinds SHALL be rejected without elevating from that class
 
+#### Scenario: structured class assertion requires recommendation timestamp
+
+- **WHEN** offline composition receives one or more structured progressive class assertions
+- **THEN** composition SHALL require a single valid ISO `recommendation_as_of`
+- **AND** SHALL use that timestamp for every evidence and cohort cutoff check
+- **AND** SHALL reject inputs whose `observed_rework_provenance.recommendation_as_of` differs from it
+
+#### Scenario: rejected high-severity assertion does not enable lightweight
+
+- **WHEN** a high-severity class (`security_compliance`, `reversibility`, or `blast_radius`) is asserted
+- **AND** its evidence is missing or invalid
+- **THEN** composition SHALL NOT match that class or apply its normal action floor
+- **AND** SHALL NOT select `lightweight_plan` solely because the assertion was dropped
+- **AND** SHALL resolve at least to the unknown `standard_plan` floor when no other elevating class matched
+
 ---
 
 ### Requirement: Progressive-planning policy SHALL specify closed routing actions and class-to-action mapping
