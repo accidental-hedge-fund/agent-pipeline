@@ -48,6 +48,13 @@ test("isPipelineInternalCommit: docs, auto-format, auto-fix are NOT internal", (
   assert.equal(isPipelineInternalCommit("feat: add a thing"), false);
 });
 
+test("isPipelineInternalCommit: exact docs regenerate heal is internal (#1081)", () => {
+  assert.equal(isPipelineInternalCommit("docs: regenerate generated docs (#1081)"), true);
+  assert.equal(isPipelineInternalCommit("docs: regenerate generated docs (#1)"), true);
+  assert.equal(isPipelineInternalCommit("docs: regenerate generated docs (#1081) and refactor"), false);
+  assert.equal(isPipelineInternalCommit("docs: regenerate CHANGELOG for v1.39.0"), false);
+});
+
 test("pipeline-commits.ts source pin: neutral module has no stages/ imports", async () => {
   const src = await readFile(
     fileURLToPath(new URL("../scripts/pipeline-commits.ts", import.meta.url)),

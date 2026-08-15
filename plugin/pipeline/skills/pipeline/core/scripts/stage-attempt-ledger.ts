@@ -24,6 +24,7 @@ export const STAGE_ACTIONS = [
   "ci_rerun",
   "ci_archive_fail_recovery",
   "ci_assertion_fix",
+  "ci_docs_stale_heal",
   "conflict_rebase",
   /** Bounded conflict resolution after a clean auto-rebase miss (#1065). */
   "conflict_resolve",
@@ -301,6 +302,7 @@ export interface LegacyCiRecoveryMarkers {
   ciRerunAttemptedShas?: string[];
   ciArchiveFailRecoveryAttemptedShas?: string[];
   ciAssertionFixAttemptedShas?: string[];
+  ciDocsStaleHealAttemptedShas?: string[];
   ciTerminalFailRecordedShas?: string[];
   ciRebaseAttemptedForSha?: string;
   ciRerunAttemptedForSha?: string;
@@ -369,6 +371,9 @@ export function migrateLegacyCiMarkersToAttempts(
     markers.ciAssertionFixAttemptedForSha,
   )) {
     push(sha, "ci_assertion_fix");
+  }
+  for (const sha of asShaList(markers.ciDocsStaleHealAttemptedShas, undefined)) {
+    push(sha, "ci_docs_stale_heal");
   }
   const preArchiveSha =
     typeof markers.preArchiveSha === "string" && markers.preArchiveSha.length > 0
@@ -807,6 +812,7 @@ export interface CiRecoveryProjection {
   ciRerunAttemptedShas?: string[];
   ciArchiveFailRecoveryAttemptedShas?: string[];
   ciAssertionFixAttemptedShas?: string[];
+  ciDocsStaleHealAttemptedShas?: string[];
   ciTerminalFailRecordedShas?: string[];
   noRunRecoveryAttemptedShas?: string[];
 }
@@ -823,6 +829,7 @@ export function projectCiRecoveryFromLedger(ledger: StageAttemptLedger): CiRecov
       attemptedShasForAction(ledger, "ci_archive_fail_recovery"),
     ),
     ciAssertionFixAttemptedShas: nonEmpty(attemptedShasForAction(ledger, "ci_assertion_fix")),
+    ciDocsStaleHealAttemptedShas: nonEmpty(attemptedShasForAction(ledger, "ci_docs_stale_heal")),
     ciTerminalFailRecordedShas: nonEmpty(ledger.ciTerminalFailRecordedShas ?? []),
     noRunRecoveryAttemptedShas: nonEmpty(attemptedShasForAction(ledger, "no_run_recovery")),
   };
@@ -840,6 +847,7 @@ export function syncCiProjectionIntoLedger(
     ciRerunAttemptedShas?: string[];
     ciArchiveFailRecoveryAttemptedShas?: string[];
     ciAssertionFixAttemptedShas?: string[];
+    ciDocsStaleHealAttemptedShas?: string[];
     ciTerminalFailRecordedShas?: string[];
     noRunRecoveryAttemptedForSha?: string;
   },
@@ -871,6 +879,7 @@ export function syncCiProjectionIntoLedger(
   ensure(projection.ciRerunAttemptedShas, "ci_rerun");
   ensure(projection.ciArchiveFailRecoveryAttemptedShas, "ci_archive_fail_recovery");
   ensure(projection.ciAssertionFixAttemptedShas, "ci_assertion_fix");
+  ensure(projection.ciDocsStaleHealAttemptedShas, "ci_docs_stale_heal");
   if (projection.noRunRecoveryAttemptedForSha) {
     ensure([projection.noRunRecoveryAttemptedForSha], "no_run_recovery");
   }
@@ -886,7 +895,7 @@ export function syncCiProjectionIntoLedger(
 
 /** Map CI recovery class name used by the ladder to a stage action. */
 export function ciRecoveryClassToAction(
-  cls: "rebase" | "rerun" | "archive_fail" | "assertion_fix",
+  cls: "rebase" | "rerun" | "archive_fail" | "assertion_fix" | "docs_stale_heal",
 ): StageAction {
   switch (cls) {
     case "rebase":
@@ -897,6 +906,8 @@ export function ciRecoveryClassToAction(
       return "ci_archive_fail_recovery";
     case "assertion_fix":
       return "ci_assertion_fix";
+    case "docs_stale_heal":
+      return "ci_docs_stale_heal";
   }
 }
 
