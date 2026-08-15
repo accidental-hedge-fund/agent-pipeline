@@ -447,6 +447,177 @@ test("advanceIssueThroughSingle (#1074): evidence reader used after single non-z
   }
 });
 
+test("advanceIssueThroughSingle (#1074): production path loads events from single result (no evidence arg)", async () => {
+  // Mirrors the legacy adapter wiring: runSingleIssueCommand-shaped return
+  // (runId + exit) without an injected fifth evidence argument; events come
+  // from the production readLoopEvents seam after the single attempt.
+  const original = process.exitCode;
+  process.exitCode = 0;
+  const readRuns: string[] = [];
+  try {
+    const result = await advanceIssueThroughSingle(
+      1010,
+      { json: true },
+      async () => ({
+        number: 1010,
+        title: "",
+        body: "",
+        labels: ["pipeline:implementing"],
+        state: "open",
+      }),
+      async () => {
+        process.exitCode = 1;
+        return {
+          exitCode: 1,
+          runId: "loop-single-prod-1010",
+          stopReason: null,
+        };
+      },
+      // evidence omitted — production default must still quote structured class
+      undefined,
+      async (runId) => {
+        readRuns.push(runId);
+        return [
+          {
+            kind: "loop_run_stopped",
+            data: { reason: "supervisor_no_progress" },
+          },
+          {
+            kind: "loop_item_blocked",
+            data: { item_id: "1010", class: "recovery_exhausted" },
+          },
+        ];
+      },
+    );
+    assert.deepEqual(readRuns, ["loop-single-prod-1010"]);
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.match(result.error, /supervisor_no_progress/);
+      assert.match(result.error, /1010/);
+      assert.doesNotMatch(
+        result.error,
+        /^(?:advance failed for #\d+: )?pipeline (?:single|advance) exited with code 1$/,
+      );
+    }
+  } finally {
+    process.exitCode = original;
+  }
+});
+
+test("advanceIssueThroughSingle (#1074): production path via runSingleIssueCommand return shape", async () => {
+  // Full production adapter: real runSingleIssueCommand with injected engine
+  // deps — no fifth evidence arg; stop reason from drive result + events.
+  const { runSingleIssueCommand } = await import("../scripts/pipeline.ts");
+  const original = process.exitCode;
+  const originalError = console.error;
+  process.exitCode = 0;
+  console.error = () => {};
+  const fakeCfg = {
+    repo_dir: "/tmp/repo",
+    repo: "o/r",
+    base_branch: "main",
+    domain: "o-r",
+  };
+  try {
+    const result = await advanceIssueThroughSingle(
+      42,
+      { json: true, profile: "codex" },
+      async () => ({
+        number: 42,
+        title: "",
+        body: "",
+        labels: ["pipeline:fix"],
+        state: "open",
+      }),
+      async (raw, opts, _deps, output) =>
+        runSingleIssueCommand(
+          raw,
+          opts,
+          {
+            resolveConfig: () => fakeCfg as never,
+            resolveIssueNumber: async (_c, n) => n,
+            runLoopEngine: async () => ({
+              kind: "drive",
+              result: {
+                runId: "loop-via-single-cmd",
+                cycles: 1,
+                stop: { reason: "supervisor_no_progress", time: "t" },
+                holdOutstanding: false,
+                allDone: false,
+                resumed: false,
+                heldItemIds: [],
+                dispatched: 0,
+                excludedItemIds: [],
+                exclusionReason: null,
+                completion: null,
+              },
+            }),
+            writeStdoutLine: () => {},
+          },
+          output,
+        ),
+      undefined,
+      async (runId) => {
+        assert.equal(runId, "loop-via-single-cmd");
+        return [
+          {
+            kind: "loop_run_stopped",
+            data: { reason: "supervisor_no_progress" },
+          },
+        ];
+      },
+    );
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.match(result.error, /supervisor_no_progress/);
+      assert.match(result.error, /42/);
+      assert.doesNotMatch(
+        result.error,
+        /^(?:advance failed for #\d+: )?pipeline (?:single|advance) exited with code 1$/,
+      );
+    }
+  } finally {
+    process.exitCode = original;
+    console.error = originalError;
+  }
+});
+
+test("advanceIssueThroughSingle (#1074): production path with no runId stays exit-only", async () => {
+  const original = process.exitCode;
+  process.exitCode = 0;
+  let eventsRead = false;
+  try {
+    const result = await advanceIssueThroughSingle(
+      7,
+      { json: true },
+      async () => ({
+        number: 7,
+        title: "",
+        body: "",
+        labels: ["pipeline:ready"],
+        state: "open",
+      }),
+      async () => {
+        process.exitCode = 1;
+        return { exitCode: 1, engineMessage: "single hard fail" };
+      },
+      undefined,
+      async () => {
+        eventsRead = true;
+        return [];
+      },
+    );
+    assert.equal(eventsRead, false, "must not read events without a run id");
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.match(result.error, /single hard fail|exited with code 1|advance failed/);
+      assert.doesNotMatch(result.error, /supervisor_no_progress|dependency_deadlock|recovery_exhausted/);
+    }
+  } finally {
+    process.exitCode = original;
+  }
+});
+
 test("classifyTrainAdvanceLabels (#1074): stop reason beats exit-only", async () => {
   const { classifyTrainAdvanceLabels } = await import("../scripts/pipeline.ts");
   const out = classifyTrainAdvanceLabels(

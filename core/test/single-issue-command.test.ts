@@ -68,7 +68,7 @@ test("single issue command routes the resolved issue through the durable one-ite
   console.error = () => {};
   process.exitCode = undefined;
   try {
-    await runSingleIssueCommand("42", { profile: "claude" }, deps);
+    const result = await runSingleIssueCommand("42", { profile: "claude" }, deps);
     assert.deepEqual(input?.selector, { type: "work-list", value: ["99"] });
     assert.equal(input?.autoSupersedeTerminal, true);
     assert.equal(input?.audit, false);
@@ -88,6 +88,10 @@ test("single issue command routes the resolved issue through the durable one-ite
     assert.equal(output.length, 1);
     assert.equal(JSON.parse(output[0]!).run_id, "loop-single");
     assert.equal(process.exitCode, 0);
+    // #1074: production adapters need runId / exit for STOP evidence.
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.runId, "loop-single");
+    assert.equal(result.stopReason, null);
   } finally {
     console.log = originalLog;
     console.error = originalError;
@@ -125,13 +129,15 @@ test("nested single issue command can suppress machine stdout for train --json",
   console.error = () => {};
   process.exitCode = undefined;
   try {
-    await runSingleIssueCommand("42", { profile: "codex" }, deps, {
+    const result = await runSingleIssueCommand("42", { profile: "codex" }, deps, {
       emitMachineOutput: false,
     });
     assert.equal(readyCallbackRan, true, "suppression must not skip the durable-run handoff callback");
     assert.deepEqual(handoffs, [], "nested handoff must not leak to stdout");
     assert.deepEqual(output, [], "nested terminal result must not leak to stdout");
     assert.equal(process.exitCode, 0);
+    assert.equal(result.runId, "loop-nested");
+    assert.equal(result.exitCode, 0);
   } finally {
     console.log = originalLog;
     console.error = originalError;
@@ -155,10 +161,55 @@ test("single issue command rejects an invalid issue before config or GitHub acce
   console.error = () => {};
   process.exitCode = undefined;
   try {
-    await runSingleIssueCommand("42x", { profile: "codex" }, deps);
+    const result = await runSingleIssueCommand("42x", { profile: "codex" }, deps);
     assert.equal(called, false);
     assert.equal(process.exitCode, 2);
+    assert.equal(result.exitCode, 2);
+    assert.equal(result.runId, undefined);
   } finally {
+    console.error = originalError;
+    process.exitCode = priorExitCode;
+  }
+});
+
+test("single issue command (#1074): returns stopReason from drive stop for adapter evidence", async () => {
+  const deps: SingleIssueCommandDeps = {
+    resolveConfig: () => cfg(),
+    resolveIssueNumber: async (_c, n) => n,
+    runLoopEngine: async () => ({
+      kind: "drive",
+      result: {
+        runId: "loop-stop",
+        cycles: 1,
+        stop: { reason: "supervisor_no_progress", time: "t" },
+        holdOutstanding: false,
+        allDone: false,
+        resumed: false,
+        heldItemIds: [],
+        dispatched: 0,
+        excludedItemIds: [],
+        exclusionReason: null,
+        completion: null,
+      },
+    }),
+    writeStdoutLine: () => {},
+  };
+  const originalLog = console.log;
+  const originalError = console.error;
+  const priorExitCode = process.exitCode;
+  console.log = () => {};
+  console.error = () => {};
+  process.exitCode = undefined;
+  try {
+    const result = await runSingleIssueCommand("9", { profile: "codex" }, deps, {
+      emitMachineOutput: false,
+    });
+    assert.equal(result.runId, "loop-stop");
+    assert.equal(result.stopReason, "supervisor_no_progress");
+    assert.equal(result.exitCode, 1);
+    assert.equal(process.exitCode, 1);
+  } finally {
+    console.log = originalLog;
     console.error = originalError;
     process.exitCode = priorExitCode;
   }
