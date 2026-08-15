@@ -21,6 +21,11 @@ import {
   type TrainIssueSnapshot,
   type TrainOpts,
 } from "../scripts/stages/train.ts";
+import {
+  MERGEABILITY_UNKNOWN_RETRY_DELAY_MS,
+  mergePr,
+  type MergeDeps,
+} from "../scripts/stages/merge.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -500,6 +505,132 @@ test("train with merge: dependent does not start until prerequisite integrated",
   assert.deepEqual(deps.mergeCalls, [101, 102]);
   assert.ok(result.status.items.every((i) => i.integrated));
   assert.ok(result.status.items.every((i) => i.merge_result_oid?.startsWith("merge")));
+});
+
+// ---------------------------------------------------------------------------
+// #1071 — train inherits shared UNKNOWN mergeability retry (no train-local mole)
+// ---------------------------------------------------------------------------
+
+test("train (#1071): first UNKNOWN then MERGEABLE via real mergePr — merges and continues", async () => {
+  // Hermetic: wire mergeIssuePr → real mergePr with injected UNKNOWN→MERGEABLE
+  // sequence + fake sleep. Must NOT mock mergeIssuePr as an instant success.
+  // Regression vs #1059 20:04Z class: first-attempt UNKNOWN must not STOP the ship
+  // when a later in-budget re-read is MERGEABLE+CLEAN.
+  const logs: string[] = [];
+  const sleepCalls: number[] = [];
+  const realMergeCalls: Array<{ pr: number; headRefOid: string }> = [];
+  let mergeabilityViews = 0;
+
+  const mergeDeps: MergeDeps = {
+    async ghPrView(_pr, _fields) {
+      mergeabilityViews += 1;
+      if (mergeabilityViews === 1) {
+        return {
+          mergeable: "UNKNOWN",
+          mergeStateStatus: "UNKNOWN",
+          headRefOid: "unknown-head-sha-001",
+        };
+      }
+      return {
+        mergeable: "MERGEABLE",
+        mergeStateStatus: "CLEAN",
+        headRefOid: "clean-head-sha-002",
+      };
+    },
+    async ghPrChecksRequired() {
+      return [{ name: "ci", bucket: "pass" }];
+    },
+    async ghPrChecksAll() {
+      return [{ name: "ci", bucket: "pass" }];
+    },
+    async ghPrMerge(pr, headRefOid) {
+      realMergeCalls.push({ pr, headRefOid });
+    },
+    async getIssueLabels() {
+      return ["pipeline:ready-to-deploy"];
+    },
+    async getPrLinkedIssue() {
+      return 1059;
+    },
+    async getPrForIssue() {
+      return 1070;
+    },
+    log(msg) {
+      logs.push(msg);
+    },
+    async sleep(ms) {
+      sleepCalls.push(ms);
+    },
+  };
+
+  let deps!: ReturnType<typeof makeDeps>;
+  deps = makeDeps({
+    log(msg) {
+      logs.push(msg);
+    },
+    async mergeIssuePr(pr) {
+      // Shared merge surface only — no train-local UNKNOWN recoverer.
+      await mergePr(pr, mergeDeps);
+      // Mirror default post-merge fixture state so observePr + containment work.
+      const self = deps as unknown as {
+        mergeCalls: number[];
+        _prState: Map<number, { state: string; oid: string | null; head: string }>;
+        _openPrByIssue: Map<number, number>;
+      };
+      self.mergeCalls.push(pr);
+      const cur = self._prState.get(pr);
+      if (!cur) throw new Error(`unknown pr ${pr}`);
+      self._prState.set(pr, {
+        state: "merged",
+        oid: `merge${pr}${"0".repeat(32)}`.slice(0, 40),
+        head: cur.head,
+      });
+      for (const [issue, p] of self._openPrByIssue) {
+        if (p === pr) self._openPrByIssue.delete(issue);
+      }
+    },
+  });
+  deps.seedIssue(
+    snap(1059, "ship notify", ["pipeline:ready-to-deploy"], "Issue 1059"),
+  );
+  deps.seedPr(1059, 1070);
+
+  const result = await runTrain(baseOpts({ issues: [1059], merge: true }), deps);
+
+  assert.equal(result.exitCode, 0, result.status.blocker ?? "ok");
+  assert.equal(mergeabilityViews, 2, "shared surface re-reads once after UNKNOWN");
+  assert.deepEqual(sleepCalls, [MERGEABILITY_UNKNOWN_RETRY_DELAY_MS]);
+  assert.equal(realMergeCalls.length, 1, "squash merge runs once after CLEAN");
+  assert.equal(
+    realMergeCalls[0]!.headRefOid,
+    "clean-head-sha-002",
+    "bind --match-head-commit to successful read, not UNKNOWN-read SHA",
+  );
+  assert.deepEqual(deps.mergeCalls, [1070]);
+  assert.equal(result.status.items[0]!.integrated, true);
+  assert.equal(result.status.complete, true);
+  assert.equal(result.status.blocker, null);
+
+  // #1059-class first-attempt terminal is illegal when in-budget success applies.
+  const stopLogs = logs.filter((l) => l.includes("[train] STOP:"));
+  const unknownStop = stopLogs.find(
+    (l) =>
+      l.includes("merge failed for #1059 PR #1070") &&
+      l.includes("PR mergeability is not yet computed (UNKNOWN)"),
+  );
+  assert.equal(
+    unknownStop,
+    undefined,
+    "must not STOP the ship on first-attempt UNKNOWN when budget would succeed",
+  );
+  assert.ok(
+    !result.status.items.some(
+      (i) =>
+        typeof i.error === "string" &&
+        i.error.includes("PR mergeability is not yet computed (UNKNOWN)"),
+    ),
+    "item error must not be first-attempt UNKNOWN refuse after successful in-budget path",
+  );
 });
 
 test("train merge: already-merged contained PR is idempotent", async () => {

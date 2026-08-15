@@ -10,7 +10,13 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
-import { mergePr, type MergeDeps, type RequiredCheck } from "../scripts/stages/merge.ts";
+import {
+  MERGEABILITY_UNKNOWN_MAX_ATTEMPTS,
+  MERGEABILITY_UNKNOWN_RETRY_DELAY_MS,
+  mergePr,
+  type MergeDeps,
+  type RequiredCheck,
+} from "../scripts/stages/merge.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STAGES_DIR = path.join(__dirname, "..", "scripts", "stages");
@@ -23,10 +29,20 @@ const PIPELINE_SCRIPT = path.join(__dirname, "..", "scripts", "pipeline.ts");
 
 function makeDeps(overrides: Partial<MergeDeps> = {}): MergeDeps & {
   mergeCalls: Array<{ pr: number; headRefOid: string }>;
+  sleepCalls: number[];
+  viewCalls: number;
 } {
   const mergeCalls: Array<{ pr: number; headRefOid: string }> = [];
+  const sleepCalls: number[] = [];
+  let viewCalls = 0;
+  const userGhPrView = overrides.ghPrView;
+  const userSleep = overrides.sleep;
+  const userGhPrMerge = overrides.ghPrMerge;
+
   const base: MergeDeps = {
-    async ghPrView(_pr, _fields) {
+    async ghPrView(pr, fields) {
+      viewCalls += 1;
+      if (userGhPrView) return userGhPrView(pr, fields);
       return {
         mergeable: "MERGEABLE",
         mergeStateStatus: "CLEAN",
@@ -40,6 +56,7 @@ function makeDeps(overrides: Partial<MergeDeps> = {}): MergeDeps & {
       return [{ name: "ci", bucket: "pass" }];
     },
     async ghPrMerge(pr, headRefOid) {
+      if (userGhPrMerge) return userGhPrMerge(pr, headRefOid);
       mergeCalls.push({ pr, headRefOid });
     },
     async getIssueLabels(_issueNumber) {
@@ -53,9 +70,35 @@ function makeDeps(overrides: Partial<MergeDeps> = {}): MergeDeps & {
       return 42;
     },
     log(_msg) {},
-    ...overrides,
+    // No-wait sleep recorder — unit tests must not wall-clock wait (#1071).
+    async sleep(ms) {
+      sleepCalls.push(ms);
+      if (userSleep) await userSleep(ms);
+    },
   };
-  return Object.assign(base, { mergeCalls });
+
+  // Apply non-instrumented overrides (view/sleep/merge stay instrumented above).
+  const {
+    ghPrView: _v,
+    sleep: _s,
+    ghPrMerge: _m,
+    ...rest
+  } = overrides;
+  Object.assign(base, rest);
+
+  // Do not Object.assign the viewCalls getter — assign copies the current value once.
+  const out = Object.assign(base, { mergeCalls, sleepCalls }) as MergeDeps & {
+    mergeCalls: Array<{ pr: number; headRefOid: string }>;
+    sleepCalls: number[];
+    viewCalls: number;
+  };
+  Object.defineProperty(out, "viewCalls", {
+    enumerable: true,
+    get() {
+      return viewCalls;
+    },
+  });
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -119,10 +162,10 @@ test("merge: dirty mergeStateStatus — refuses and does not merge", async () =>
 });
 
 // ---------------------------------------------------------------------------
-// 4.4 Unknown mergeability is refused
+// 4.4 Unknown mergeability — bounded retry then refuse (#1071)
 // ---------------------------------------------------------------------------
 
-test("merge: unknown mergeability — refuses and does not merge", async () => {
+test("merge: unknown mergeability through full budget — refuses and does not merge", async () => {
   const deps = makeDeps({
     async ghPrView(_pr, _fields) {
       return {
@@ -136,10 +179,119 @@ test("merge: unknown mergeability — refuses and does not merge", async () => {
     () => mergePr(42, deps),
     (err: Error) => {
       assert.ok(err.message.includes("UNKNOWN"), `expected UNKNOWN in: ${err.message}`);
+      assert.ok(
+        err.message.includes("not yet computed") || err.message.includes("still evaluating"),
+        `expected actionable UNKNOWN message, got: ${err.message}`,
+      );
       return true;
     },
   );
+  assert.equal(
+    deps.viewCalls,
+    MERGEABILITY_UNKNOWN_MAX_ATTEMPTS,
+    `exactly ${MERGEABILITY_UNKNOWN_MAX_ATTEMPTS} mergeability reads`,
+  );
+  assert.equal(
+    deps.sleepCalls.length,
+    MERGEABILITY_UNKNOWN_MAX_ATTEMPTS - 1,
+    "MAX-1 sleeps between UNKNOWN attempts",
+  );
+  assert.ok(
+    deps.sleepCalls.every((ms) => ms === MERGEABILITY_UNKNOWN_RETRY_DELAY_MS),
+    `every sleep must be ${MERGEABILITY_UNKNOWN_RETRY_DELAY_MS}ms`,
+  );
+  assert.equal(deps.mergeCalls.length, 0, "ghPrMerge must not be called while UNKNOWN");
+});
+
+test("merge (#1071): UNKNOWN then MERGEABLE+CLEAN succeeds with second head SHA", async () => {
+  let views = 0;
+  const deps = makeDeps({
+    async ghPrView(_pr, _fields) {
+      views += 1;
+      if (views === 1) {
+        return {
+          mergeable: "UNKNOWN",
+          mergeStateStatus: "UNKNOWN",
+          headRefOid: "unknown-sha-1111",
+        };
+      }
+      return {
+        mergeable: "MERGEABLE",
+        mergeStateStatus: "CLEAN",
+        headRefOid: "clean-sha-2222",
+      };
+    },
+  });
+  await mergePr(42, deps);
+  assert.equal(deps.viewCalls, 2, "exactly two mergeability reads");
+  assert.deepEqual(deps.sleepCalls, [MERGEABILITY_UNKNOWN_RETRY_DELAY_MS], "one sleep between attempts");
+  assert.equal(deps.mergeCalls.length, 1, "exactly one merge");
+  assert.equal(
+    deps.mergeCalls[0]!.headRefOid,
+    "clean-sha-2222",
+    "merge must use the successful MERGEABLE+CLEAN head SHA, never the UNKNOWN-read SHA",
+  );
+  assert.notEqual(deps.mergeCalls[0]!.headRefOid, "unknown-sha-1111");
+});
+
+test("merge (#1071): first-read CONFLICTING refuses with zero sleeps", async () => {
+  const deps = makeDeps({
+    async ghPrView(_pr, _fields) {
+      return {
+        mergeable: "CONFLICTING",
+        mergeStateStatus: "DIRTY",
+        headRefOid: "abc123def456",
+      };
+    },
+  });
+  await assert.rejects(
+    () => mergePr(42, deps),
+    (err: Error) => {
+      assert.ok(err.message.includes("CONFLICTING"), `expected CONFLICTING in: ${err.message}`);
+      return true;
+    },
+  );
+  assert.equal(deps.viewCalls, 1, "single mergeability read");
+  assert.equal(deps.sleepCalls.length, 0, "CONFLICTING must not burn UNKNOWN sleep budget");
   assert.equal(deps.mergeCalls.length, 0, "ghPrMerge must not be called");
+});
+
+test("merge (#1071): first-read MERGEABLE+DIRTY refuses with zero sleeps", async () => {
+  const deps = makeDeps({
+    async ghPrView(_pr, _fields) {
+      return {
+        mergeable: "MERGEABLE",
+        mergeStateStatus: "DIRTY",
+        headRefOid: "abc123def456",
+      };
+    },
+  });
+  await assert.rejects(
+    () => mergePr(42, deps),
+    (err: Error) => {
+      assert.ok(err.message.includes("DIRTY"), `expected DIRTY in: ${err.message}`);
+      return true;
+    },
+  );
+  assert.equal(deps.viewCalls, 1, "single mergeability read");
+  assert.equal(deps.sleepCalls.length, 0, "DIRTY must not burn UNKNOWN sleep budget");
+  assert.equal(deps.mergeCalls.length, 0, "ghPrMerge must not be called");
+});
+
+test("merge (#1071): UNKNOWN is never treated as MERGEABLE — no merge while latest is UNKNOWN", async () => {
+  const deps = makeDeps({
+    async ghPrView(_pr, _fields) {
+      return {
+        mergeable: "UNKNOWN",
+        mergeStateStatus: "UNKNOWN",
+        headRefOid: "still-unknown-sha",
+      };
+    },
+  });
+  await assert.rejects(() => mergePr(42, deps));
+  // At every attempt the classification was UNKNOWN; merge must never have run.
+  assert.equal(deps.mergeCalls.length, 0, "must not squash while latest classification is UNKNOWN");
+  assert.equal(deps.viewCalls, MERGEABILITY_UNKNOWN_MAX_ATTEMPTS);
 });
 
 // ---------------------------------------------------------------------------
