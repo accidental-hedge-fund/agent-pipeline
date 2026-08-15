@@ -138,7 +138,7 @@ pre_merge_ci_assertion_fix: true # Allow one surgical implementer fix attempt pe
 pre_merge_ci_rerun_enabled: true # When true (default), allow one automatic failed-workflow re-run per head SHA for infra/unknown pre-merge CI failures.
 
 design_gate: # risk-triggered design-interrogation gate (#436)
-  enabled: true
+  enabled: false # 2026-08-15: off — architecture size trigger ran 2 Codex rounds on almost every ship item; no unique catch vs review-1/2 (see ship comments on #1074/#1071/#599/#1065)
   triggers: [concurrency, storage, auth, migration, infrastructure, public-api, architecture]
   extra_triggers: {}
   max_rounds: 2
