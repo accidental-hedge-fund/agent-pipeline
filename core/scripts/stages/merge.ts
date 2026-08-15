@@ -31,6 +31,19 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 
 // ---------------------------------------------------------------------------
+// UNKNOWN mergeability retry budget (#1071)
+// ---------------------------------------------------------------------------
+// GitHub briefly reports mergeable: UNKNOWN while computing mergeability.
+// That is a transient compute gap, not a product block. Bounded re-reads live
+// on the shared merge surface so train --merge and pipeline merge inherit the
+// same behavior (class-over-site — not a train-only mole).
+
+/** Total mergeability reads per merge attempt (initial read counts). */
+export const MERGEABILITY_UNKNOWN_MAX_ATTEMPTS = 5;
+/** Fixed delay between consecutive UNKNOWN mergeability reads (ms). */
+export const MERGEABILITY_UNKNOWN_RETRY_DELAY_MS = 5000;
+
+// ---------------------------------------------------------------------------
 // Dependency-injection seam
 // ---------------------------------------------------------------------------
 
@@ -61,6 +74,9 @@ export interface MergeDeps {
    *  in this repository, guarding against cross-repo reference mismatches. */
   getPrForIssue(issueNumber: number): Promise<number | null>;
   log(msg: string): void;
+  /** Delay seam for UNKNOWN mergeability re-reads. Production uses a real timer;
+   *  unit tests inject a no-wait recorder so suites do not wall-clock sleep. */
+  sleep(ms: number): Promise<void>;
 }
 
 export function realMergeDeps(repo: string): MergeDeps {
@@ -206,6 +222,10 @@ export function realMergeDeps(repo: string): MergeDeps {
     log(msg) {
       console.log(msg);
     },
+
+    async sleep(ms) {
+      await new Promise<void>((resolve) => setTimeout(resolve, ms));
+    },
   };
 }
 
@@ -348,32 +368,69 @@ async function checkIssueStage(
 // Public entry point
 // ---------------------------------------------------------------------------
 
+/** Actionable refusal when mergeability stays UNKNOWN after the retry budget. */
+function unknownMergeabilityMessage(): string {
+  return (
+    `PR mergeability is not yet computed (UNKNOWN). ` +
+    `GitHub is still evaluating — wait a few seconds and retry \`pipeline merge\`.`
+  );
+}
+
 export async function mergePr(pr: number, deps: MergeDeps): Promise<void> {
   deps.log(`[pipeline merge] #${pr}: checking mergeability...`);
 
   // Fetch mergeable state and the head SHA together. headRefOid is threaded
   // through to --match-head-commit so the merge is bound to the commit that
-  // was inspected, closing the TOCTOU race between gate inspection and merge.
-  const prData = await deps.ghPrView(pr, [
-    "mergeable",
-    "mergeStateStatus",
-    "headRefOid",
-  ]);
+  // passed the successful MERGEABLE+CLEAN gate (never an earlier UNKNOWN read),
+  // closing the TOCTOU race between gate inspection and merge.
+  //
+  // mergeable: UNKNOWN is a transient GitHub compute gap (#1071). Re-read under
+  // a bounded budget; hard unclean states refuse immediately with zero sleep.
+  let headRefOid = "";
+  for (let attempt = 1; attempt <= MERGEABILITY_UNKNOWN_MAX_ATTEMPTS; attempt++) {
+    const prData = await deps.ghPrView(pr, [
+      "mergeable",
+      "mergeStateStatus",
+      "headRefOid",
+    ]);
+    const mergeable = String(prData.mergeable ?? "UNKNOWN");
+    const mergeStateStatus = String(prData.mergeStateStatus ?? "UNKNOWN");
+    const oid = String(prData.headRefOid ?? "");
 
-  const mergeabilityError = checkMergeability(
-    String(prData.mergeable ?? "UNKNOWN"),
-    String(prData.mergeStateStatus ?? "UNKNOWN"),
-  );
-  if (mergeabilityError) {
-    throw new Error(mergeabilityError);
+    if (mergeable === "UNKNOWN") {
+      if (attempt < MERGEABILITY_UNKNOWN_MAX_ATTEMPTS) {
+        deps.log(
+          `[pipeline merge] #${pr}: mergeability UNKNOWN ` +
+            `(attempt ${attempt}/${MERGEABILITY_UNKNOWN_MAX_ATTEMPTS}); ` +
+            `waiting ${MERGEABILITY_UNKNOWN_RETRY_DELAY_MS}ms before re-read…`,
+        );
+        await deps.sleep(MERGEABILITY_UNKNOWN_RETRY_DELAY_MS);
+        continue;
+      }
+      // Budget exhausted — fail closed; never treat UNKNOWN as MERGEABLE.
+      throw new Error(unknownMergeabilityMessage());
+    }
+
+    // Non-UNKNOWN: hard unclean states refuse immediately (no further UNKNOWN sleeps).
+    const mergeabilityError = checkMergeability(mergeable, mergeStateStatus);
+    if (mergeabilityError) {
+      throw new Error(mergeabilityError);
+    }
+
+    // Latest read is MERGEABLE+CLEAN — bind --match-head-commit to this OID only.
+    if (!oid) {
+      throw new Error(
+        `PR #${pr}: could not determine head commit SHA (headRefOid was empty). ` +
+          `Retry or check gh authentication.`,
+      );
+    }
+    headRefOid = oid;
+    break;
   }
 
-  const headRefOid = String(prData.headRefOid ?? "");
   if (!headRefOid) {
-    throw new Error(
-      `PR #${pr}: could not determine head commit SHA (headRefOid was empty). ` +
-      `Retry or check gh authentication.`,
-    );
+    // Unreachable if the loop is correct; fail closed rather than merge on empty SHA.
+    throw new Error(unknownMergeabilityMessage());
   }
 
   deps.log(`[pipeline merge] #${pr}: checking required status checks...`);

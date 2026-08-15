@@ -2,6 +2,10 @@
 
 ### Requirement: Train merge wave SHALL not STOP the ship on in-budget UNKNOWN mergeability
 
+Train merge waves SHALL not STOP the ship on first-read `mergeable: "UNKNOWN"`
+when the shared merge surface resolves that PR to `MERGEABLE`/`CLEAN` within
+its bounded retry budget.
+
 When `--merge` is provided and the train invokes the existing issue-PR merge
 surface for a ready-to-deploy item’s linked open PR, a first-read
 `mergeable: "UNKNOWN"` that the shared merge surface resolves to

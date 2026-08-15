@@ -8,24 +8,33 @@ and `headRefOid` before proceeding to later gates or the squash merge.
 
 When the latest read reports `mergeable: "UNKNOWN"` (GitHub has not yet
 computed mergeability), the handler SHALL **not** treat that as a terminal
-refusal on the first observation. It SHALL wait a short deterministic delay and
-re-read mergeability under a **bounded** attempt budget (a fixed small maximum
-attempt count with short sleeps between attempts, on the order of several
-attempts over tens of seconds). The delay SHALL be injectable for tests so unit
-tests do not wall-clock wait.
+refusal on the first observation. It SHALL re-read under a bounded budget
+defined by named constants:
+
+- `MERGEABILITY_UNKNOWN_MAX_ATTEMPTS = 5` total mergeability reads (the initial
+  read **counts** toward the budget);
+- `MERGEABILITY_UNKNOWN_RETRY_DELAY_MS = 5000` fixed delay between consecutive
+  UNKNOWN reads (at most 4 sleeps for a full budget).
+
+The delay SHALL be injectable for tests so unit tests do not wall-clock wait.
+
+The handler SHALL sleep and re-read **only** when `mergeable === "UNKNOWN"`.
+Any other non-success classification (`CONFLICTING`, `DIRTY`, `BEHIND`,
+`BLOCKED`, `HAS_HOOKS`, `MERGEABLE` with non-`CLEAN` status, or any other
+non-`MERGEABLE`/`CLEAN` combination that is not the pure UNKNOWN compute gap)
+SHALL refuse immediately on that read with **zero** sleep and without further
+UNKNOWN-budget consumption.
 
 The handler SHALL proceed to the checks gate only when a successful read reports
 `mergeable: "MERGEABLE"` and `mergeStateStatus: "CLEAN"`. The head SHA used for
-`--match-head-commit` SHALL come from the same successful read that passed the
-mergeability gate.
+`--match-head-commit` SHALL come from the same successful MERGEABLE+CLEAN read
+that passed the mergeability gate — never from an earlier UNKNOWN read.
 
 The handler SHALL refuse to merge and exit non-zero (or throw to the caller)
 with an actionable message when:
 
 - after the retry budget is exhausted, mergeability is still `UNKNOWN`; or
-- any read reports a hard unclean state (`CONFLICTING`, `DIRTY`, `BEHIND`,
-  `BLOCKED`, `HAS_HOOKS`, or any non-`MERGEABLE`/`CLEAN` combination that is not
-  the UNKNOWN compute gap).
+- any read reports a hard unclean state as above.
 
 The handler SHALL **never** treat `UNKNOWN` as `MERGEABLE` and SHALL **not**
 invoke the squash merge while the latest successful mergeability classification
@@ -45,15 +54,16 @@ in the attempt loop is still UNKNOWN.
 #### Scenario: Transient UNKNOWN then MERGEABLE succeeds within budget
 
 - **WHEN** the first mergeability read returns `mergeable: "UNKNOWN"`
-- **AND** a later re-read within the bounded attempt budget returns `mergeable: "MERGEABLE"` and `mergeStateStatus: "CLEAN"`
-- **THEN** the handler SHALL proceed to the checks gate (and subsequent gates) using the head SHA from the successful read
+- **AND** the second read within the budget returns `mergeable: "MERGEABLE"` and `mergeStateStatus: "CLEAN"` with a distinct `headRefOid`
+- **THEN** the handler SHALL proceed to the checks gate (and subsequent gates) using the head SHA from the **second** (successful) read
 - **AND** it SHALL NOT exit non-zero solely because the first read was UNKNOWN
-- **AND** a unit test with injected deps and fake sleep SHALL assert at least two mergeability reads and no premature merge refusal
+- **AND** a unit test with injected deps and fake sleep SHALL assert exactly two mergeability reads, one sleep of `MERGEABILITY_UNKNOWN_RETRY_DELAY_MS`, and one merge using the second head SHA
 
 #### Scenario: Unknown mergeability state is refused
 
 - **WHEN** every mergeability read within the bounded attempt budget returns `mergeable: "UNKNOWN"` (GitHub never computes a definite state in budget)
-- **THEN** the handler SHALL exit non-zero (or throw) with an actionable message that mergeability is still UNKNOWN / not yet computed and advising wait/retry
+- **THEN** the handler SHALL perform exactly `MERGEABILITY_UNKNOWN_MAX_ATTEMPTS` mergeability reads and `MAX_ATTEMPTS - 1` sleeps
+- **AND** the handler SHALL exit non-zero (or throw) with an actionable message that mergeability is still UNKNOWN / not yet computed and advising wait/retry
 - **AND** the handler SHALL NOT invoke `gh pr merge`
 
 #### Scenario: UNKNOWN is never treated as MERGEABLE

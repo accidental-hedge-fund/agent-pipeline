@@ -13,9 +13,9 @@ the engine never retries — train exits 1 and kills the ship.
 - **BREAKING (product behavior for UNKNOWN only):** The issue-PR merge surface
   (`mergePr` / `pipeline merge` gates) SHALL **not** treat a first-read
   `mergeable: UNKNOWN` as a terminal refusal. It SHALL wait and re-read
-  mergeability under a **bounded** retry budget (small fixed attempt count and
-  short sleep between attempts; on the order of several attempts over tens of
-  seconds).
+  mergeability under a **bounded** retry budget pinned as
+  `MERGEABILITY_UNKNOWN_MAX_ATTEMPTS = 5` total reads (initial counts) and
+  `MERGEABILITY_UNKNOWN_RETRY_DELAY_MS = 5000` between UNKNOWN reads (≤4 sleeps).
 - After the budget is exhausted and mergeability is still `UNKNOWN`, the surface
   SHALL fail closed with an actionable message (same class as today: wait and
   retry later / inspect GitHub).
@@ -40,11 +40,11 @@ the engine never retries — train exits 1 and kills the ship.
       later in-budget re-read is `MERGEABLE` with `mergeStateStatus: CLEAN` (and
       other existing merge gates pass), `mergePr` completes the squash merge
       successfully.
-- [ ] A hermetic fixture (injected deps / fake sleep) models first
-      `getPrDetail`/`ghPrView` UNKNOWN then MERGEABLE+CLEAN; under
-      `pipeline train --merge` the item merges, base containment proceeds as
-      today, and the train continues (does not exit 1 solely for that first
-      UNKNOWN).
+- [ ] A hermetic train fixture wires the **real** shared `mergePr` path
+      (`mergeIssuePr: (pr) => mergePr(pr, mergeDeps)` with injected
+      `ghPrView` UNKNOWN→MERGEABLE+CLEAN and fake sleep — not a mocked success
+      `mergeIssuePr`); the item merges, base containment proceeds, and the
+      train continues (does not exit 1 solely for that first UNKNOWN).
 - [ ] On first-attempt UNKNOWN that would succeed on re-read within budget, the
       train SHALL NOT emit a terminal ship STOP whose error is only
       `merge failed for #<issue> PR #<pr>: PR mergeability is not yet computed
