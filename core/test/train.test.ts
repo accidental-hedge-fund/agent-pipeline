@@ -960,3 +960,131 @@ test("train: command registry includes train with merge and issues flags", async
   assert.ok((flags as Set<string>).has("milestone"));
   assert.equal(COMMAND_REGISTRY.train.supportsJson, true);
 });
+
+// ---------------------------------------------------------------------------
+// #1074 — train STOP quotes structured loop evidence (not exit-only)
+// ---------------------------------------------------------------------------
+
+test("train (#1074): supervisor_no_progress evidence appears in blocker and stays non-zero", async () => {
+  const deps = makeDeps({
+    async advanceWave(issueList) {
+      const out: AdvanceWaveResult = new Map();
+      for (const n of issueList) {
+        out.set(n, {
+          ok: false,
+          error: `advance failed for #${n}: supervisor_no_progress`,
+        });
+      }
+      return out;
+    },
+  });
+  deps.seedIssue(snap(1010, "work", ["pipeline:implementing"]));
+  deps.seedPr(1010, 5010);
+
+  const logs: string[] = [];
+  deps.log = (m) => {
+    logs.push(m);
+  };
+
+  const result = await runTrain(baseOpts({ issues: [1010], merge: false }), deps);
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.status.complete, false);
+  assert.match(result.status.blocker ?? "", /supervisor_no_progress/);
+  assert.match(result.status.blocker ?? "", /1010/);
+  assert.doesNotMatch(
+    result.status.blocker ?? "",
+    /^held: #1010: pipeline (?:single|advance) exited with code 1$/,
+  );
+  const item = result.status.items.find((i) => i.issue === 1010);
+  assert.equal(item?.terminal, "error");
+  assert.match(item?.error ?? "", /supervisor_no_progress/);
+  assert.ok(logs.some((l) => /supervisor_no_progress/.test(l) && /STOP|park/.test(l)));
+});
+
+test("train (#1074): exit-only advance error does not invent a stop class", async () => {
+  const deps = makeDeps({
+    async advanceWave(issueList) {
+      const out: AdvanceWaveResult = new Map();
+      for (const n of issueList) {
+        out.set(n, {
+          ok: false,
+          error: `advance failed for #${n}: pipeline advance exited with code 1`,
+        });
+      }
+      return out;
+    },
+  });
+  deps.seedIssue(snap(42, "work", ["pipeline:ready"]));
+  deps.seedPr(42, 142);
+
+  const result = await runTrain(baseOpts({ issues: [42], merge: false }), deps);
+  assert.equal(result.exitCode, 1);
+  assert.match(result.status.blocker ?? "", /exited with code 1/);
+  assert.doesNotMatch(
+    result.status.blocker ?? "",
+    /supervisor_no_progress|dependency_deadlock|recovery_exhausted/,
+  );
+  const item = result.status.items.find((i) => i.issue === 42);
+  assert.match(item?.error ?? "", /exited with code 1/);
+});
+
+test("train (#1074): recovery_exhausted class + issue in held item error", async () => {
+  const deps = makeDeps({
+    async advanceWave(issueList) {
+      const out: AdvanceWaveResult = new Map();
+      for (const n of issueList) {
+        out.set(n, {
+          ok: false,
+          error: `advance failed for #${n}: recovery_exhausted on #${n}`,
+        });
+      }
+      return out;
+    },
+  });
+  deps.seedIssue(snap(839, "work", ["pipeline:fix"]));
+  deps.seedPr(839, 1839);
+
+  const result = await runTrain(baseOpts({ issues: [839], merge: false }), deps);
+  assert.equal(result.exitCode, 1);
+  assert.match(result.status.blocker ?? "", /recovery_exhausted/);
+  assert.match(result.status.blocker ?? "", /839/);
+  const item = result.status.items.find((i) => i.issue === 839);
+  assert.match(item?.error ?? "", /recovery_exhausted/);
+  assert.match(item?.error ?? "", /#839/);
+});
+
+test("train (#1074): held aggregation preserves enriched per-item reason", async () => {
+  const deps = makeDeps({
+    async advanceWave(issueList) {
+      const out: AdvanceWaveResult = new Map();
+      for (const n of issueList) {
+        if (n === 1) {
+          out.set(n, {
+            ok: false,
+            error: "advance failed for #1: dependency_deadlock",
+          });
+        } else {
+          // Peer also fails independently so both are held
+          out.set(n, {
+            ok: false,
+            error: "advance failed for #2: supervisor_no_progress",
+          });
+        }
+      }
+      return out;
+    },
+  });
+  deps.seedIssue(snap(1, "a"));
+  deps.seedIssue(snap(2, "b independent"));
+  deps.seedPr(1, 101);
+  deps.seedPr(2, 102);
+
+  const result = await runTrain(baseOpts({ issues: [1, 2], merge: false }), deps);
+  assert.equal(result.exitCode, 1);
+  assert.match(result.status.blocker ?? "", /dependency_deadlock/);
+  assert.match(result.status.blocker ?? "", /supervisor_no_progress/);
+  assert.doesNotMatch(
+    result.status.blocker ?? "",
+    /^held: #1: pipeline advance exited with code 1; #2: pipeline advance exited with code 1$/,
+  );
+});

@@ -89,7 +89,17 @@ export interface TrainResult {
 }
 
 export type AdvanceOutcome =
-  | { ok: true; terminal: "ready-to-deploy" | "needs-human" | "blocked" | "other"; labels: string[] }
+  | {
+      ok: true;
+      terminal: "ready-to-deploy" | "needs-human" | "blocked" | "other";
+      labels: string[];
+      /**
+       * Optional structured loop stop / block diagnostic (#1074). Used when
+       * parking holds so item `error` / train blocker quote class/reason
+       * instead of a generic park phrase alone.
+       */
+      diagnostic?: string;
+    }
   | { ok: false; error: string };
 
 export type AdvanceWaveResult = Map<number, AdvanceOutcome>;
@@ -670,7 +680,8 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
             }
           }
           held.add(issue);
-          const err = `issue #${issue} parked at pipeline:needs-human`;
+          const err =
+            advanced.diagnostic ?? `issue #${issue} parked at pipeline:needs-human`;
           pushItem({
             issue,
             pr: await deps.getPrForIssue(issue),
@@ -725,7 +736,7 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
             }
           }
           held.add(issue);
-          const err = `issue #${issue} is blocked`;
+          const err = advanced.diagnostic ?? `issue #${issue} is blocked`;
           pushItem({
             issue,
             pr: await deps.getPrForIssue(issue),
@@ -745,7 +756,9 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
         }
         if (stage !== "ready-to-deploy" && advanced.terminal !== "ready-to-deploy") {
           held.add(issue);
-          const err = `issue #${issue} did not reach ready-to-deploy (stage=${stage ?? advanced.terminal})`;
+          const err =
+            advanced.diagnostic ??
+            `issue #${issue} did not reach ready-to-deploy (stage=${stage ?? advanced.terminal})`;
           pushItem({
             issue,
             pr: await deps.getPrForIssue(issue),

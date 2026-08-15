@@ -385,6 +385,144 @@ test("pipeline-cli: nested single failure restores the owning command exit state
   }
 });
 
+test("classifyTrainAdvanceLabels (#1074): stop reason beats exit-only", async () => {
+  const { classifyTrainAdvanceLabels } = await import("../scripts/pipeline.ts");
+  const out = classifyTrainAdvanceLabels(
+    { labels: ["pipeline:implementing"] },
+    1,
+    { stopReason: "supervisor_no_progress", exitCode: 1 },
+    1010,
+  );
+  assert.equal(out.ok, false);
+  if (!out.ok) {
+    assert.match(out.error, /supervisor_no_progress/);
+    assert.match(out.error, /1010/);
+    assert.doesNotMatch(
+      out.error,
+      /^pipeline advance exited with code 1$/,
+    );
+  }
+});
+
+test("classifyTrainAdvanceLabels (#1074): no evidence keeps exit code, invents no class", async () => {
+  const { classifyTrainAdvanceLabels } = await import("../scripts/pipeline.ts");
+  const out = classifyTrainAdvanceLabels(
+    { labels: ["pipeline:ready"] },
+    1,
+    { exitCode: 1 },
+    7,
+  );
+  assert.equal(out.ok, false);
+  if (!out.ok) {
+    assert.match(out.error, /exited with code 1/);
+    assert.doesNotMatch(out.error, /supervisor_no_progress|dependency_deadlock/);
+  }
+});
+
+test("classifyTrainAdvanceLabels (#1074): blocked class on needs-human diagnostic", async () => {
+  const { classifyTrainAdvanceLabels } = await import("../scripts/pipeline.ts");
+  const out = classifyTrainAdvanceLabels(
+    { labels: ["pipeline:needs-human"] },
+    0,
+    {
+      blockedClass: "recovery_exhausted",
+      blockedIssue: 839,
+      stopReason: undefined,
+    },
+    839,
+  );
+  assert.equal(out.ok, true);
+  if (out.ok) {
+    assert.equal(out.terminal, "needs-human");
+    assert.match(out.diagnostic ?? "", /recovery_exhausted/);
+    assert.match(out.diagnostic ?? "", /839/);
+  }
+});
+
+test("advanceWaveThroughLoop (#1074): injects stop reason from drive + events", async () => {
+  const { advanceWaveThroughLoop } = await import("../scripts/pipeline.ts");
+  const fakeCfg = {
+    repo_dir: "/tmp/repo",
+    repo: "o/r",
+    base_branch: "main",
+    domain: "o-r",
+  };
+  const result = await advanceWaveThroughLoop(
+    [1010],
+    {},
+    async () => ({
+      number: 1010,
+      title: "t",
+      body: "",
+      labels: ["pipeline:implementing"],
+      state: "open",
+    }),
+    async () => ({
+      kind: "drive",
+      result: {
+        runId: "loop-test-run",
+        cycles: 1,
+        stop: { reason: "supervisor_no_progress", time: "t" },
+        holdOutstanding: false,
+        allDone: false,
+        resumed: false,
+        heldItemIds: [],
+        dispatched: 0,
+        excludedItemIds: [],
+        exclusionReason: null,
+        completion: null,
+      },
+    }),
+    () => fakeCfg as never,
+    async () => [
+      {
+        kind: "loop_run_stopped",
+        data: { reason: "supervisor_no_progress" },
+      },
+    ],
+  );
+  const outcome = result.get(1010);
+  assert.ok(outcome);
+  assert.equal(outcome!.ok, false);
+  if (!outcome!.ok) {
+    assert.match(outcome!.error, /supervisor_no_progress/);
+    assert.match(outcome!.error, /1010/);
+  }
+});
+
+test("advanceWaveThroughLoop (#1074): engine error without events keeps message, no invented class", async () => {
+  const { advanceWaveThroughLoop } = await import("../scripts/pipeline.ts");
+  const fakeCfg = {
+    repo_dir: "/tmp/repo",
+    repo: "o/r",
+    base_branch: "main",
+    domain: "o-r",
+  };
+  const result = await advanceWaveThroughLoop(
+    [3],
+    {},
+    async () => ({
+      number: 3,
+      title: "t",
+      body: "",
+      labels: ["pipeline:ready"],
+      state: "open",
+    }),
+    async () => ({ kind: "error", message: "pipeline advance hard fail" }),
+    () => fakeCfg as never,
+    async () => {
+      throw new Error("events must not be required when no run id");
+    },
+  );
+  const outcome = result.get(3);
+  assert.ok(outcome);
+  assert.equal(outcome!.ok, false);
+  if (!outcome!.ok) {
+    assert.match(outcome!.error, /hard fail|exited with code|advance failed/);
+    assert.doesNotMatch(outcome!.error, /supervisor_no_progress|dependency_deadlock/);
+  }
+});
+
 test("pipeline-cli: ship emits only the failure status persisted by this authorization", () => {
   const status = {
     kind: "ship_status",

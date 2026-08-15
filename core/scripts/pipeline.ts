@@ -133,6 +133,13 @@ import {
   type AdvanceOutcome,
   type TrainDeps,
 } from "./stages/train.ts";
+import {
+  composeTrainAdvanceStopReason,
+  extractTrainAdvanceLoopEvidence,
+  hasStructuredTrainAdvanceEvidence,
+  scopeTrainAdvanceEvidenceForIssue,
+  type TrainAdvanceLoopEvidence,
+} from "./stages/train-advance-stop-reason.ts";
 import * as reviewStage from "./stages/review.ts";
 import { emitHumanIntervention, blockerKindToInterventionKind } from "./intervention.ts";
 import {
@@ -3051,35 +3058,94 @@ export async function advanceIssueThroughSingle(
     process.exitCode = previousExit ?? 0;
   }
 
-  return classifyTrainAdvanceLabels(await getIssue(issue), exit);
+  return classifyTrainAdvanceLabels(await getIssue(issue), exit, undefined, issue);
 }
 
-/** Map live issue labels (+ optional exit code) to a train AdvanceOutcome. */
+/**
+ * Map live issue labels (+ optional exit code / loop evidence) to a train
+ * AdvanceOutcome. When structured loop evidence is present (#1074), non-ok and
+ * park diagnostics quote stop reason / blocked class before raw exit code.
+ */
 export function classifyTrainAdvanceLabels(
   snap: { labels: string[] },
   exit = 0,
+  evidence?: TrainAdvanceLoopEvidence | null,
+  issue?: number,
 ): AdvanceOutcome {
   const stageLabel = snap.labels.find((label) => label.startsWith("pipeline:"));
   const stage = stageLabel?.slice("pipeline:".length) ?? null;
+
+  const merged: TrainAdvanceLoopEvidence = {
+    ...(evidence ?? {}),
+  };
+  if (evidence?.exitCode != null) {
+    merged.exitCode = evidence.exitCode;
+  } else if (exit !== 0) {
+    merged.exitCode = exit;
+  }
+  if (exit !== 0 && (merged.exitCode == null || merged.exitCode === 0)) {
+    merged.exitCode = exit;
+  }
+
+  const diagnostic =
+    hasStructuredTrainAdvanceEvidence(merged) ||
+    (merged.exitCode != null && merged.exitCode !== 0) ||
+    !!merged.engineMessage
+      ? composeTrainAdvanceStopReason(merged, issue)
+      : undefined;
+
   if (stage === "ready-to-deploy") {
     return { ok: true, terminal: "ready-to-deploy", labels: snap.labels };
   }
   if (stage === "needs-human") {
-    return { ok: true, terminal: "needs-human", labels: snap.labels };
+    return {
+      ok: true,
+      terminal: "needs-human",
+      labels: snap.labels,
+      ...(diagnostic ? { diagnostic } : {}),
+    };
   }
   if (snap.labels.includes("blocked")) {
-    return { ok: true, terminal: "blocked", labels: snap.labels };
+    return {
+      ok: true,
+      terminal: "blocked",
+      labels: snap.labels,
+      ...(diagnostic ? { diagnostic } : {}),
+    };
   }
-  if (exit !== 0) {
-    return { ok: false, error: `pipeline advance exited with code ${exit}` };
+
+  // Non-zero exit, engine failure message, or structured stop/block evidence
+  // without a terminal park label → non-ok with composed reason (#1074).
+  if (
+    exit !== 0 ||
+    !!merged.engineMessage ||
+    hasStructuredTrainAdvanceEvidence(merged)
+  ) {
+    return {
+      ok: false,
+      error:
+        diagnostic ??
+        composeTrainAdvanceStopReason(
+          { exitCode: exit !== 0 ? exit : 1 },
+          issue,
+        ),
+    };
   }
-  return { ok: true, terminal: "other", labels: snap.labels };
+  return {
+    ok: true,
+    terminal: "other",
+    labels: snap.labels,
+    ...(diagnostic ? { diagnostic } : {}),
+  };
 }
 
 /**
  * One multi-item loop engine call for a base-eligible frontier (#1023).
  * Recovery and parallel disjoint advance stay inside the loop; train does not
  * call repair_pipeline_item.
+ *
+ * When the wave ends non-ok, per-item errors quote structured loop stop /
+ * block evidence before raw exit code (#1074).
  */
 export async function advanceWaveThroughLoop(
   issues: readonly number[],
@@ -3087,6 +3153,9 @@ export async function advanceWaveThroughLoop(
   getIssue: TrainDeps["getIssue"],
   runLoopEngine: (input: RunLoopEngineInput) => Promise<LoopEngineResult> = defaultRunLoopEngine,
   resolveCfg: typeof resolveConfig = resolveConfig,
+  readLoopEvents: (
+    runId: string,
+  ) => Promise<readonly { kind?: string; data?: unknown }[]> = defaultReadLoopEventsForTrain,
 ): Promise<import("./stages/train.ts").AdvanceWaveResult> {
   if (issues.length === 0) return new Map();
   let cfg: PipelineConfig;
@@ -3107,6 +3176,8 @@ export async function advanceWaveThroughLoop(
   const previousExit = process.exitCode;
   process.exitCode = 0;
   let engineFailed: string | null = null;
+  let driveStopReason: string | null = null;
+  let driveRunId: string | null = null;
   try {
     const engineResult = await runLoopEngine({
       engine,
@@ -3122,30 +3193,79 @@ export async function advanceWaveThroughLoop(
     });
     if (engineResult.kind === "error") {
       engineFailed = engineResult.message;
+    } else if (engineResult.kind === "drive") {
+      driveRunId = engineResult.result.runId;
+      const stop = engineResult.result.stop;
+      if (stop && typeof stop.reason === "string" && stop.reason.trim()) {
+        driveStopReason = stop.reason.trim();
+      }
     }
   } catch (err) {
     engineFailed = (err as Error).message;
   } finally {
     process.exitCode = previousExit ?? 0;
   }
+
+  let events: readonly { kind?: string; data?: unknown }[] = [];
+  if (driveRunId) {
+    try {
+      events = await readLoopEvents(driveRunId);
+    } catch {
+      events = [];
+    }
+  }
+
+  const waveEvidence = extractTrainAdvanceLoopEvidence({
+    events,
+    stopReason: driveStopReason,
+    exitCode: engineFailed ? 1 : driveStopReason ? 1 : 0,
+    engineMessage: engineFailed,
+  });
+
   const out = new Map<number, AdvanceOutcome>();
   for (const issue of issues) {
-    if (engineFailed) {
-      // Still read labels — loop may have advanced some items before failing.
-      try {
-        out.set(issue, classifyTrainAdvanceLabels(await getIssue(issue), 1));
-      } catch {
-        out.set(issue, { ok: false, error: engineFailed });
-      }
-      continue;
-    }
+    const scoped = scopeTrainAdvanceEvidenceForIssue(waveEvidence, issue);
+    const exitForClassify =
+      engineFailed || driveStopReason || (scoped.exitCode != null && scoped.exitCode !== 0)
+        ? scoped.exitCode != null && scoped.exitCode !== 0
+          ? scoped.exitCode
+          : 1
+        : 0;
     try {
-      out.set(issue, classifyTrainAdvanceLabels(await getIssue(issue), 0));
+      out.set(
+        issue,
+        classifyTrainAdvanceLabels(await getIssue(issue), exitForClassify, scoped, issue),
+      );
     } catch (err) {
-      out.set(issue, { ok: false, error: (err as Error).message });
+      if (engineFailed || hasStructuredTrainAdvanceEvidence(scoped) || scoped.engineMessage) {
+        out.set(issue, {
+          ok: false,
+          error: composeTrainAdvanceStopReason(
+            {
+              ...scoped,
+              engineMessage: scoped.engineMessage ?? engineFailed ?? (err as Error).message,
+            },
+            issue,
+          ),
+        });
+      } else {
+        out.set(issue, { ok: false, error: (err as Error).message });
+      }
     }
   }
   return out;
+}
+
+/** Production default: read loop events.jsonl for the wave run (best-effort). */
+async function defaultReadLoopEventsForTrain(
+  runId: string,
+): Promise<readonly { kind?: string; data?: unknown }[]> {
+  try {
+    const { readEvents } = await import("./loop/store.ts");
+    return await readEvents(defaultLoopStoreDeps(), runId);
+  } catch {
+    return [];
+  }
 }
 
 /** Execute parsed `pipeline train` options through the ordered train engine.
