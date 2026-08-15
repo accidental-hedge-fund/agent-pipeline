@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import {
   contentDigest,
@@ -160,7 +160,10 @@ test("tugboat supports serial multi-milestone and single-host lock", () => {
   assert.match(body, /--milestones/);
   assert.match(body, /ship_one/);
   assert.match(body, /try_acquire_ship_lock/);
-  assert.match(body, /ship_already_running/);
+  // Live-ship probe (not bare playbook.pid + kill -0) gates second detach (#1062).
+  assert.match(body, /live_ship_probe/);
+  assert.match(body, /cmdline_is_live_ship/);
+  assert.doesNotMatch(body, /\bship_already_running\b/);
   // Lock before playbook.pid write (no steal race).
   assert.match(body, /NEVER write playbook\.pid before winning the lock/);
   assert.match(body, /Do NOT write playbook\.pid here/);
@@ -265,10 +268,13 @@ test("tugboat --status reads state without starting ship phases", () => {
   assert.ok(trainIdx > detachIdx, "status/detach must appear before train phase");
   // Only the status if-block — not the later ship_one definition.
   const statusBlock = body.slice(statusIdx, detachIdx);
-  assert.match(statusBlock, /cat "\$STATE_FILE"/);
+  assert.match(statusBlock, /emit_status_json/);
   assert.match(statusBlock, /exit 0/);
   assert.doesNotMatch(statusBlock, /ship_one|train --milestone|release finish/);
   assert.doesNotMatch(statusBlock, /"\$PIPELINE" train|"\$PIPELINE" release/);
+  // Status rewrites dead-pid "running" → stale via live-ship probe (#1062).
+  assert.match(body, /emit_status_json\s*\(/);
+  assert.match(body, /live-ship probe not live|status.*=.*"stale"/);
 });
 
 test("tugboat install-parity helper: repo pack passes; content/helpers fail closed", () => {
@@ -393,5 +399,610 @@ test("tugboat install-parity helper: repo pack passes; content/helpers fail clos
   assert.equal(failTrain.status, "fail");
   if (failTrain.status === "fail") {
     assert.match(failTrain.detail, /train-status-complete\.py \(missing\)/);
+  }
+});
+
+// ---------- #1062 live-ship probe + REPO_DIR refuse --------------------------
+
+/** Extract argv_is_live_ship (+ optional helpers) and evaluate ARGV for version. */
+function extractLiveShipHelpers(src: string): string {
+  const names = [
+    "argv_is_live_ship",
+    "cmdline_is_live_ship",
+    "read_proc_argv",
+  ] as const;
+  const parts: string[] = [];
+  for (const name of names) {
+    const m = src.match(new RegExp(`^${name}\\(\\) \\{[\\s\\S]*?\\n\\}`, "m"));
+    if (m) parts.push(m[0]);
+  }
+  assert.ok(
+    parts.some((p) => p.startsWith("argv_is_live_ship")),
+    "argv_is_live_ship() not found in tugboat.sh",
+  );
+  return parts.join("\n");
+}
+
+/** Structured argv match (production path). */
+function evalArgvIsLiveShip(version: string, argv: string[]): boolean {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-probe-"));
+  try {
+    const src = fs.readFileSync(tugboat, "utf8");
+    const helpers = extractLiveShipHelpers(src);
+    const runner = path.join(dir, "run.sh");
+    const quoted = argv.map((a) => JSON.stringify(a)).join(" ");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        helpers,
+        `if argv_is_live_ship ${JSON.stringify(version)} ${quoted}; then echo LIVE; else echo NOT_LIVE; fi`,
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    const r = spawnSync("bash", [runner], { encoding: "utf8" });
+    assert.equal(r.status, 0, `probe runner exited ${r.status}: ${r.stderr}`);
+    return r.stdout.trim() === "LIVE";
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/** Word-split convenience (tests historical space-separated forms). */
+function evalCmdlineIsLiveShip(cmdline: string, version: string): boolean {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-probe-"));
+  try {
+    const src = fs.readFileSync(tugboat, "utf8");
+    const helpers = extractLiveShipHelpers(src);
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        helpers,
+        `if cmdline_is_live_ship ${JSON.stringify(cmdline)} ${JSON.stringify(version)}; then echo LIVE; else echo NOT_LIVE; fi`,
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    const r = spawnSync("bash", [runner], { encoding: "utf8" });
+    assert.equal(r.status, 0, `probe runner exited ${r.status}: ${r.stderr}`);
+    return r.stdout.trim() === "LIVE";
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("live-ship probe (#1062): train --merge cmdline is live; bare pid / single / status are not", () => {
+  // Live: detached train ship for the milestone (exact argv tokens).
+  assert.equal(
+    evalArgvIsLiveShip("1.39.0", [
+      "/home/u/.local/bin/pipeline",
+      "train",
+      "--milestone",
+      "v1.39.0",
+      "--merge",
+      "--json",
+    ]),
+    true,
+    "train --merge for milestone must be live",
+  );
+  assert.equal(
+    evalArgvIsLiveShip("1.39.0", [
+      "node",
+      "pipeline.mjs",
+      "train",
+      "--milestone",
+      "v1.39.0",
+      "--merge",
+    ]),
+    true,
+  );
+  // Live: owning tugboat composer (no --status / --detach).
+  assert.equal(
+    evalArgvIsLiveShip("1.39.0", [
+      "/home/u/.local/bin/tugboat",
+      "--milestone",
+      "v1.39.0",
+    ]),
+    true,
+    "owning tugboat must be live",
+  );
+  assert.equal(
+    evalArgvIsLiveShip("1.39.0", [
+      "bash",
+      "/path/tugboat.sh",
+      "--milestones",
+      "v1.39.0",
+      "v1.40.0",
+    ]),
+    true,
+  );
+
+  // NOT live: status / detach wrappers.
+  assert.equal(
+    evalArgvIsLiveShip("1.39.0", [
+      "/home/u/.local/bin/tugboat",
+      "--milestone",
+      "v1.39.0",
+      "--status",
+    ]),
+    false,
+    "--status must not look like a live ship",
+  );
+  assert.equal(
+    evalArgvIsLiveShip("1.39.0", [
+      "/home/u/.local/bin/tugboat",
+      "--milestone",
+      "v1.39.0",
+      "--detach",
+    ]),
+    false,
+  );
+
+  // NOT live: bare sleep / recycled pid that happens to be alive (playbook.pid case).
+  assert.equal(
+    evalArgvIsLiveShip("1.39.0", ["/bin/sleep", "3600"]),
+    false,
+    "bare kill -0 pid without train/tugboat cmdline is not live",
+  );
+  assert.equal(
+    evalArgvIsLiveShip("1.39.0", ["bash", "-c", "while true; do :; done"]),
+    false,
+  );
+
+  // NOT live: spoofed single-arg text that only matches when flattened (R2 a6a5cb4a).
+  assert.equal(
+    evalArgvIsLiveShip("1.39.0", [
+      "bash",
+      "-c",
+      "sleep 3600",
+      "pipeline train --milestone v1.39.0 --merge",
+    ]),
+    false,
+    "spoofed multi-word single argv must not be live",
+  );
+  assert.equal(
+    evalArgvIsLiveShip("1.39.0", [
+      "bash",
+      "-c",
+      "pipeline train --milestone v1.39.0 --merge; sleep 3600",
+    ]),
+    false,
+    "spoofed -c script string must not be live",
+  );
+  // Flattened substring helper must also reject the spoof when word-split cannot
+  // invent train/--merge as separate tokens from one quoted arg.
+  assert.equal(
+    evalCmdlineIsLiveShip(
+      "bash -c sleep 3600 'pipeline train --milestone v1.39.0 --merge'",
+      "1.39.0",
+    ),
+    false,
+  );
+
+  // NOT live: per-issue pipeline N / pipeline single N lock holders.
+  assert.equal(
+    evalArgvIsLiveShip("1.39.0", [
+      "/home/u/.local/bin/pipeline",
+      "single",
+      "702",
+    ]),
+    false,
+    "pipeline single N is not a live ship",
+  );
+  assert.equal(
+    evalArgvIsLiveShip("1.39.0", ["/home/u/.local/bin/pipeline", "702"]),
+    false,
+  );
+  assert.equal(
+    evalArgvIsLiveShip("1.39.0", [
+      "node",
+      "pipeline.mjs",
+      "advance",
+      "702",
+      "--json",
+    ]),
+    false,
+  );
+
+  // NOT live: train for a different milestone, or train without --merge.
+  assert.equal(
+    evalArgvIsLiveShip("1.39.0", [
+      "pipeline",
+      "train",
+      "--milestone",
+      "v1.38.0",
+      "--merge",
+      "--json",
+    ]),
+    false,
+    "other milestone train is not live for this ship",
+  );
+  assert.equal(
+    evalArgvIsLiveShip("1.39.0", [
+      "pipeline",
+      "train",
+      "--milestone",
+      "v1.39.0",
+      "--json",
+    ]),
+    false,
+    "train without --merge is not Option 1 live ship",
+  );
+
+  // Word-split back-compat for ordinary space-separated forms.
+  assert.equal(
+    evalCmdlineIsLiveShip(
+      "/home/u/.local/bin/pipeline train --milestone v1.39.0 --merge --json",
+      "1.39.0",
+    ),
+    true,
+  );
+});
+
+test("ship lock (#1062): stale lock pid for other-milestone train is reclaimed", () => {
+  const body = fs.readFileSync(tugboat, "utf8");
+  // Mutex must gate on argv_is_live_ship for the requested version (not any train --merge).
+  const lockFn = body.match(/^try_acquire_ship_lock\(\) \{[\s\S]*?\n\}/m);
+  assert.ok(lockFn, "try_acquire_ship_lock missing");
+  assert.match(lockFn[0], /argv_is_live_ship "\$version" "\$\{__proc_argv\[@\]\}"/);
+  assert.match(lockFn[0], /read_proc_argv "\$holder"/);
+  assert.match(lockFn[0], /local version=\$2/);
+  // Loose any-tugboat / any-train--merge / flattened substring check must not remain.
+  assert.doesNotMatch(
+    lockFn[0],
+    /\[\[\s*"\$holder_cmd"\s*==\s*\*tugboat\*\s*\]\]\s*\|\|/,
+  );
+  assert.doesNotMatch(lockFn[0], /tr '\\0' ' '/);
+  assert.match(body, /try_acquire_ship_lock "\$RUN_DIR" "\$version"/);
+
+  // Behavioral: lock/pid for ship-v1.39.0 points at a live train --merge for v1.40.0.
+  // try_acquire for 1.39.0 must reclaim (not refuse as if it owns 1.39.0).
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-lock-"));
+  const fakeBin = path.join(dir, "pipeline");
+  let childPid: number | undefined;
+  try {
+    fs.writeFileSync(
+      fakeBin,
+      "#!/usr/bin/env bash\n# stub train holder for lock reclaim regression\nsleep 3600\n",
+    );
+    fs.chmodSync(fakeBin, 0o755);
+    // Detached so the stub survives after spawn returns; argv must look like train --merge v1.40.0.
+    const child = spawn(
+      fakeBin,
+      ["train", "--milestone", "v1.40.0", "--merge", "--json"],
+      { detached: true, stdio: "ignore" },
+    );
+    child.unref();
+    childPid = child.pid;
+    assert.ok(
+      childPid !== undefined && Number.isFinite(childPid) && childPid > 0,
+      `bad stub pid: ${String(childPid)}`,
+    );
+
+    // Confirm /proc cmdline is the other-milestone train (structured argv).
+    const raw = fs.readFileSync(`/proc/${childPid}/cmdline`);
+    const argv = raw
+      .toString("utf8")
+      .split("\0")
+      .filter((s) => s.length > 0);
+    assert.ok(argv.includes("train"));
+    assert.ok(argv.includes("--merge"));
+    assert.ok(argv.includes("v1.40.0"));
+    assert.equal(
+      evalArgvIsLiveShip("1.39.0", argv),
+      false,
+      "v1.40 train must not be live ship for 1.39.0",
+    );
+    assert.equal(
+      evalArgvIsLiveShip("1.40.0", argv),
+      true,
+      "v1.40 train must be live ship for 1.40.0",
+    );
+
+    const runDir = path.join(dir, "ship-v1.39.0");
+    const lockDir = path.join(runDir, "lock");
+    fs.mkdirSync(lockDir, { recursive: true });
+    fs.writeFileSync(path.join(lockDir, "pid"), `${childPid}\n`);
+
+    const src = fs.readFileSync(tugboat, "utf8");
+    const helpers = extractLiveShipHelpers(src);
+    const runner = path.join(dir, "acquire.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        helpers,
+        lockFn[0],
+        `if out=$(try_acquire_ship_lock ${JSON.stringify(runDir)} "1.39.0"); then`,
+        '  echo "ACQUIRED:$$"',
+        "  exit 0",
+        "else",
+        '  echo "REFUSED:$out"',
+        "  exit 1",
+        "fi",
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    const r = spawnSync("bash", [runner], { encoding: "utf8" });
+    assert.equal(
+      r.status,
+      0,
+      `expected reclaim of wrong-milestone lock, got status=${r.status} out=${r.stdout} err=${r.stderr}`,
+    );
+    assert.match(r.stdout, /^ACQUIRED:/);
+    // Lock now held by the acquirer, not the v1.40 train pid.
+    const newHolder = fs.readFileSync(path.join(lockDir, "pid"), "utf8").trim();
+    assert.notEqual(newHolder, String(childPid));
+    assert.match(r.stdout, new RegExp(`ACQUIRED:${newHolder}`));
+  } finally {
+    if (childPid !== undefined) {
+      try {
+        process.kill(-childPid, "SIGTERM");
+      } catch {
+        try {
+          process.kill(childPid, "SIGTERM");
+        } catch {
+          /* already gone */
+        }
+      }
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("live-ship probe (#1062): detach path uses probe only; not bare playbook.pid", () => {
+  const body = fs.readFileSync(tugboat, "utf8");
+  // Detach refuse must call live_ship_probe — not ship_already_running / bare kill -0 on pid file.
+  const detachFn = body.match(/detach_self\(\) \{[\s\S]*?\n\}/);
+  assert.ok(detachFn, "detach_self missing");
+  assert.match(detachFn[0], /live_ship_probe/);
+  assert.match(detachFn[0], /emit_status_json/);
+  // Race-safe: short-lived detach.gate serializes probe-and-spawn; re-probe under gate.
+  assert.match(detachFn[0], /try_acquire_detach_gate/);
+  assert.match(detachFn[0], /release_detach_gate|release_held_detach_gates/);
+  assert.match(body, /try_acquire_detach_gate\(\)/);
+  assert.match(body, /detach\.gate/);
+  // Structured argv probe (not flattened tr '\\0' ' ' substring match).
+  assert.match(body, /read_proc_argv/);
+  assert.match(body, /argv_is_live_ship/);
+  assert.match(body, /mapfile -d ''/);
+  // Executable refuse path must not use the old helpers (comments may mention them).
+  assert.doesNotMatch(detachFn[0], /\bship_already_running\b/);
+  assert.doesNotMatch(
+    detachFn[0],
+    /^\s*[^#\n]*kill -0 "\$\{?holder\}?"/m,
+  );
+  assert.doesNotMatch(
+    detachFn[0],
+    /^\s*[^#\n]*playbook\.pid/m,
+  );
+  // Documented class law in source (regression if someone restores pid-only refuse).
+  assert.match(body, /Bare playbook\.pid \+ kill -0/);
+  assert.match(body, /per-issue pipeline N locks/);
+  assert.match(body, /no paste detector/i);
+});
+
+test("detach race (#1062 R2): concurrent Ship detaches exactly once", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-race-"));
+  const stateRoot = path.join(dir, "state");
+  const repo = path.join(dir, "repo");
+  const fakePipeline = path.join(dir, "pipeline");
+  const childPids: number[] = [];
+  try {
+    fs.mkdirSync(repo, { recursive: true });
+    fs.writeFileSync(
+      fakePipeline,
+      "#!/usr/bin/env bash\n# long-lived train stub for concurrent detach\nsleep 3600\n",
+    );
+    fs.chmodSync(fakePipeline, 0o755);
+
+    const env = {
+      ...process.env,
+      REPO_DIR: repo,
+      PIPELINE: fakePipeline,
+      ALLOW_MERGE: "1",
+      SHIP_NOTIFY: "0",
+      PIPELINE_SUPERVISOR_STATE: stateRoot,
+    };
+    const args = [tugboat, "--milestone", "v1.39.0", "--detach"];
+
+    const runOne = () =>
+      new Promise<{ status: number | null; out: string }>((resolve) => {
+        const child = spawn("bash", args, {
+          env,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        let out = "";
+        child.stdout.on("data", (b) => {
+          out += String(b);
+        });
+        child.stderr.on("data", (b) => {
+          out += String(b);
+        });
+        child.on("close", (code) => {
+          resolve({ status: code, out });
+        });
+      });
+
+    const [a, b] = await Promise.all([runOne(), runOne()]);
+    const combined = `${a.out}\n${b.out}`;
+    const detachCount = (combined.match(/detached tugboat ship/g) || []).length;
+    const alreadyCount = (
+      combined.match(/already running.*not detaching a second copy/g) || []
+    ).length;
+
+    assert.equal(
+      detachCount,
+      1,
+      `expected exactly one detach, got ${detachCount}:\n${combined}`,
+    );
+    assert.ok(
+      alreadyCount >= 1 || a.status === 0,
+      `expected second request to report already-running or exit 0:\n${combined}`,
+    );
+    assert.equal(a.status, 0, `first detach status: ${a.status} out=${a.out}`);
+    assert.equal(b.status, 0, `second detach status: ${b.status} out=${b.out}`);
+
+    // Collect any long-lived ship children under state for cleanup via /proc scan.
+    // Kill train stubs (pipeline sleep) that match our fake path.
+    for (const ent of fs.readdirSync("/proc")) {
+      if (!/^\d+$/.test(ent)) continue;
+      try {
+        const cmd = fs.readFileSync(`/proc/${ent}/cmdline`).toString("utf8");
+        if (cmd.includes(fakePipeline) || cmd.includes(dir)) {
+          childPids.push(Number(ent));
+        }
+      } catch {
+        /* gone */
+      }
+    }
+  } finally {
+    for (const p of childPids) {
+      try {
+        process.kill(p, "SIGTERM");
+      } catch {
+        /* already gone */
+      }
+    }
+    // Also try process group of any leftover ship under state root.
+    try {
+      const shipDir = path.join(stateRoot, "ship-v1.39.0");
+      const pidFile = path.join(shipDir, "playbook.pid");
+      if (fs.existsSync(pidFile)) {
+        const p = Number(fs.readFileSync(pidFile, "utf8").trim());
+        if (Number.isFinite(p) && p > 0) {
+          try {
+            process.kill(p, "SIGTERM");
+          } catch {
+            /* gone */
+          }
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("tugboat REPO_DIR (#1062): pin at start; refuse factory-control", () => {
+  const body = fs.readFileSync(tugboat, "utf8");
+  assert.match(body, /pin_repo_dir/);
+  assert.match(body, /\*factory-control\*/);
+  assert.match(body, /REPO_DIR refused|refused — path matches \*factory-control\*/);
+  assert.match(body, /pwd -P/);
+  // pin is invoked before status/detach/ship (process start).
+  const pinDef = body.indexOf("pin_repo_dir() {");
+  const pinCall = body.indexOf("pin_repo_dir\n");
+  const statusIdx = body.indexOf('if [[ "$do_status" == "1" ]]; then');
+  assert.ok(pinDef >= 0 && pinCall > pinDef);
+  assert.ok(pinCall < statusIdx, "pin_repo_dir must run before status/detach");
+
+  // Behavioral: factory-control path fails closed without detaching.
+  const badRoot = fs.mkdtempSync(path.join(os.tmpdir(), "factory-control-"));
+  try {
+    // Ensure path contains the refused segment.
+    const refuseDir = path.join(badRoot, "agent-pipeline-factory-control");
+    fs.mkdirSync(refuseDir, { recursive: true });
+    const r = spawnSync(
+      "bash",
+      [tugboat, "--milestone", "v1.39.0", "--detach"],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          REPO_DIR: refuseDir,
+          ALLOW_MERGE: "1",
+          SHIP_NOTIFY: "0",
+          PIPELINE_SUPERVISOR_STATE: path.join(badRoot, "state"),
+        },
+      },
+    );
+    assert.notEqual(r.status, 0, "factory-control REPO_DIR must fail closed");
+    assert.match(
+      `${r.stdout}\n${r.stderr}`,
+      /factory-control|refused/i,
+      "error must name the refused plane",
+    );
+    assert.doesNotMatch(
+      `${r.stdout}\n${r.stderr}`,
+      /detached tugboat ship/,
+      "must not detach when REPO_DIR is factory-control",
+    );
+  } finally {
+    fs.rmSync(badRoot, { recursive: true, force: true });
+  }
+});
+
+test("hermes env.example (#1062): REPO_DIR does not default to factory-control", () => {
+  const envExample = path.join(
+    repoRoot,
+    "examples/supervisor/hermes/env.example",
+  );
+  const body = fs.readFileSync(envExample, "utf8");
+  const repoLine = body
+    .split("\n")
+    .find((l) => /^\s*REPO_DIR=/.test(l) && !l.trim().startsWith("#"));
+  assert.ok(repoLine, "REPO_DIR assignment required in env.example");
+  assert.doesNotMatch(
+    repoLine,
+    /factory-control/,
+    "env.example must not default REPO_DIR to *factory-control*",
+  );
+});
+
+test("tugboat status (#1062): dead pid / stale running → not running", () => {
+  const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-status-"));
+  const runDir = path.join(stateRoot, "ship-v9.9.9");
+  fs.mkdirSync(runDir, { recursive: true });
+  // Stale "running" state with a dead pid — no live train/tugboat for v9.9.9.
+  fs.writeFileSync(
+    path.join(runDir, "state.json"),
+    JSON.stringify({
+      schema_version: 1,
+      kind: "tugboat_ship",
+      milestone: "v9.9.9",
+      version: "9.9.9",
+      phase: "train",
+      status: "running",
+      detail: "pipeline train --milestone v9.9.9 --merge --json",
+      updated_at: "2020-01-01T00:00:00Z",
+      log: path.join(runDir, "playbook.log"),
+      pid: 1, // init/special; cmdline will not match train --merge for v9.9.9
+    }),
+  );
+  fs.writeFileSync(path.join(runDir, "playbook.pid"), "1\n");
+  try {
+    const r = spawnSync(
+      "bash",
+      [tugboat, "--milestone", "v9.9.9", "--status"],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          PIPELINE_SUPERVISOR_STATE: stateRoot,
+          SHIP_NOTIFY: "0",
+          // Unset REPO_DIR so pin does not require a real checkout for status.
+          REPO_DIR: "",
+        },
+      },
+    );
+    assert.equal(r.status, 0, `status exited ${r.status}: ${r.stderr}`);
+    const out = r.stdout.trim();
+    assert.doesNotMatch(
+      out,
+      /"status"\s*:\s*"running"/,
+      "status must not claim running from dead/stale state alone",
+    );
+    assert.match(out, /"status"\s*:\s*"(stale|none|failed|ok)"/);
+  } finally {
+    fs.rmSync(stateRoot, { recursive: true, force: true });
   }
 });

@@ -6,11 +6,20 @@ plus wait and notify. It is not a second control plane and not in-engine
 `pipeline ship`.
 
 Phrase: **`Ship milestone vX.Y.Z`** → detach Tugboat for that milestone.  
-Status: **`tugboat --milestone vX.Y.Z --status`** or read
-`~/.local/state/pipeline-supervisor/ship-vX.Y.Z/state.json`.
+Status: **`tugboat --milestone vX.Y.Z --status`** (prefer over raw `state.json`;
+status does not claim `running` from a dead pid alone — #1062).
+
+**Live ship (#1062):** a second detach is refused only when a live process
+cmdline is `train --merge` for that milestone, or the owning tugboat. Bare
+`playbook.pid` + `kill -0`, per-issue `pipeline N` locks, and stale state alone
+are **not** live ships — Ship still detaches once. Buzz and TUI paste share
+that path (no paste detector).
+
+**`REPO_DIR`:** pin the live control checkout at tugboat start. Paths matching
+`*factory-control*` are refused.
 
 Contract: [supervisor.md](../supervisor.md)  
-Epic / hardening: #1001 / #927
+Epic / hardening: #1001 / #927 / #1062
 
 ## Ownership
 
@@ -52,7 +61,7 @@ post-merge reinstall so hosts pick up delivery retry/audit changes).
 Host env (mode-0600 profile):
 
 ```bash
-export REPO_DIR=/path/to/control-checkout   # required
+export REPO_DIR=/path/to/control-checkout   # required; not *factory-control* (#1062)
 export PIPELINE=$HOME/.local/bin/pipeline   # required
 export ALLOW_MERGE=1                        # required for mutating ship
 # optional:
