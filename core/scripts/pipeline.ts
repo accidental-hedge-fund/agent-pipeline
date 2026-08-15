@@ -133,6 +133,13 @@ import {
   type AdvanceOutcome,
   type TrainDeps,
 } from "./stages/train.ts";
+import {
+  composeTrainAdvanceStopReason,
+  extractTrainAdvanceLoopEvidence,
+  hasStructuredTrainAdvanceEvidence,
+  scopeTrainAdvanceEvidenceForIssue,
+  type TrainAdvanceLoopEvidence,
+} from "./stages/train-advance-stop-reason.ts";
 import * as reviewStage from "./stages/review.ts";
 import { emitHumanIntervention, blockerKindToInterventionKind } from "./intervention.ts";
 import {
@@ -2924,6 +2931,21 @@ export interface SingleIssueCommandOutput {
   emitMachineOutput?: boolean;
 }
 
+/**
+ * Compact result from `pipeline single` so legacy adapters (e.g. train's
+ * {@link advanceIssueThroughSingle}) can load loop evidence for the attempt
+ * without relying on process-global state alone (#1074).
+ */
+export interface SingleIssueCommandResult {
+  exitCode: number;
+  /** Durable loop run id when a drive result was returned. */
+  runId?: string;
+  /** `stop.reason` from the drive result when present. */
+  stopReason?: string | null;
+  /** Engine / facade error message when no drive completed. */
+  engineMessage?: string | null;
+}
+
 /** Canonical one-item autonomous drive. The stage machine still performs every
  * normal transition; this facade supplies the same durable supervisor and
  * recovery controller used by `pipeline loop` without requiring an outer
@@ -2933,12 +2955,12 @@ export async function runSingleIssueCommand(
   opts: CliOpts,
   deps: SingleIssueCommandDeps = defaultSingleIssueCommandDeps,
   output: SingleIssueCommandOutput = {},
-): Promise<void> {
+): Promise<SingleIssueCommandResult> {
   const parsed = Number.parseInt(rawNumber ?? "", 10);
   if (!Number.isSafeInteger(parsed) || parsed <= 0 || String(parsed) !== rawNumber) {
     console.error("pipeline single: <number> is required and must be a positive integer");
     process.exitCode = 2;
-    return;
+    return { exitCode: 2, engineMessage: "invalid issue number" };
   }
 
   let cfg: PipelineConfig;
@@ -2951,7 +2973,7 @@ export async function runSingleIssueCommand(
   } catch (err) {
     console.error(`pipeline single: config error: ${(err as Error).message}`);
     process.exitCode = 2;
-    return;
+    return { exitCode: 2, engineMessage: (err as Error).message };
   }
 
   let issueNumber: number;
@@ -2960,7 +2982,7 @@ export async function runSingleIssueCommand(
   } catch (err) {
     console.error(`pipeline single: ${(err as Error).message}`);
     process.exitCode = 1;
-    return;
+    return { exitCode: 1, engineMessage: (err as Error).message };
   }
 
   const engine: LoopEngine = opts.profile === "claude" ? "claude" : "codex";
@@ -2985,19 +3007,31 @@ export async function runSingleIssueCommand(
   if (engineResult.kind === "error") {
     console.error(`pipeline single: ${engineResult.message}`);
     process.exitCode = 1;
-    return;
+    return { exitCode: 1, engineMessage: engineResult.message };
   }
   if (engineResult.kind !== "drive") {
-    console.error("pipeline single: internal error: one-item drive returned an audit result");
+    const msg = "internal error: one-item drive returned an audit result";
+    console.error(`pipeline single: ${msg}`);
     process.exitCode = 1;
-    return;
+    return { exitCode: 1, engineMessage: msg };
   }
-  process.exitCode = renderLoopDriveResult(
+  const stop = engineResult.result.stop;
+  const stopReason =
+    stop && typeof stop.reason === "string" && stop.reason.trim()
+      ? stop.reason.trim()
+      : null;
+  const exitCode = renderLoopDriveResult(
     engine,
     engineResult.result,
     "pipeline single",
     output.emitMachineOutput !== false,
   );
+  process.exitCode = exitCode;
+  return {
+    exitCode,
+    runId: engineResult.result.runId,
+    stopReason,
+  };
 }
 
 export interface TrainCommandDeps {
@@ -3035,51 +3069,213 @@ export async function advanceIssueThroughSingle(
   opts: CliOpts,
   getIssue: TrainDeps["getIssue"],
   runSingleIssue: typeof runSingleIssueCommand = runSingleIssueCommand,
+  /**
+   * Optional structured loop evidence for this single-item attempt (#1074).
+   * Callers/tests inject stop/block evidence (or a reader that loads it after
+   * `pipeline single`) so non-ok STOP text can quote `loop_run_stopped` /
+   * `loop_item_blocked` instead of exit-only.
+   *
+   * When **omitted** (production default), evidence is derived from the
+   * `runSingleIssue` return value (`runId` / `stopReason` / `engineMessage`)
+   * plus loop events loaded via {@link readLoopEvents}. Explicit `null` or an
+   * empty reader keeps exit-code / engine message only — never invents a class.
+   */
+  evidence?:
+    | TrainAdvanceLoopEvidence
+    | null
+    | (() =>
+        | TrainAdvanceLoopEvidence
+        | null
+        | undefined
+        | Promise<TrainAdvanceLoopEvidence | null | undefined>),
+  /**
+   * Production seam: read loop events.jsonl for the single attempt's run id.
+   * Defaults to the same store reader as {@link advanceWaveThroughLoop}.
+   * Injected in unit tests (no real loop store / network / subprocess).
+   */
+  readLoopEvents: (
+    runId: string,
+  ) => Promise<readonly { kind?: string; data?: unknown }[]> = defaultReadLoopEventsForTrain,
 ): Promise<AdvanceOutcome> {
   const previousExit = process.exitCode;
   process.exitCode = 0;
   let exit = 0;
+  let singleResult: SingleIssueCommandResult | void | undefined;
   try {
-    await runSingleIssue(String(issue), opts, undefined, {
+    singleResult = await runSingleIssue(String(issue), opts, undefined, {
       // The owning command emits its own single JSON document.
       emitMachineOutput: !opts.json,
     });
     exit = process.exitCode ?? 0;
+    if (singleResult && typeof singleResult.exitCode === "number") {
+      exit = singleResult.exitCode;
+    }
   } catch (err) {
     return { ok: false, error: (err as Error).message };
   } finally {
     process.exitCode = previousExit ?? 0;
   }
 
-  return classifyTrainAdvanceLabels(await getIssue(issue), exit);
+  let resolved: TrainAdvanceLoopEvidence | null | undefined;
+  if (typeof evidence === "function") {
+    resolved = await evidence();
+  } else if (evidence !== undefined) {
+    // Explicit inject (including null) — do not re-read production store.
+    resolved = evidence;
+  } else {
+    // Production path: structured evidence from the single attempt itself.
+    resolved = await loadTrainAdvanceEvidenceFromSingleResult(
+      singleResult,
+      exit,
+      readLoopEvents,
+    );
+  }
+
+  return classifyTrainAdvanceLabels(await getIssue(issue), exit, resolved, issue);
 }
 
-/** Map live issue labels (+ optional exit code) to a train AdvanceOutcome. */
+/**
+ * Derive train STOP evidence from a `pipeline single` result + optional events.
+ * Best-effort event read; never invents stop/block class names.
+ */
+async function loadTrainAdvanceEvidenceFromSingleResult(
+  singleResult: SingleIssueCommandResult | void | undefined,
+  exit: number,
+  readLoopEvents: (
+    runId: string,
+  ) => Promise<readonly { kind?: string; data?: unknown }[]>,
+): Promise<TrainAdvanceLoopEvidence> {
+  const runId =
+    singleResult && typeof singleResult.runId === "string" && singleResult.runId.trim()
+      ? singleResult.runId.trim()
+      : null;
+  let events: readonly { kind?: string; data?: unknown }[] = [];
+  if (runId) {
+    try {
+      events = await readLoopEvents(runId);
+    } catch {
+      events = [];
+    }
+  }
+  const stopFromResult =
+    singleResult && typeof singleResult.stopReason === "string"
+      ? singleResult.stopReason
+      : singleResult?.stopReason === null
+        ? null
+        : undefined;
+  const engineMessage =
+    singleResult && typeof singleResult.engineMessage === "string"
+      ? singleResult.engineMessage
+      : null;
+  return extractTrainAdvanceLoopEvidence({
+    events,
+    stopReason: stopFromResult ?? null,
+    exitCode: exit !== 0 ? exit : singleResult?.exitCode ?? 0,
+    engineMessage,
+  });
+}
+
+/**
+ * Map live issue labels (+ optional exit code / loop evidence) to a train
+ * AdvanceOutcome. When structured loop evidence is present (#1074), non-ok and
+ * park diagnostics quote stop reason / blocked class before raw exit code.
+ */
 export function classifyTrainAdvanceLabels(
   snap: { labels: string[] },
   exit = 0,
+  evidence?: TrainAdvanceLoopEvidence | null,
+  issue?: number,
 ): AdvanceOutcome {
   const stageLabel = snap.labels.find((label) => label.startsWith("pipeline:"));
   const stage = stageLabel?.slice("pipeline:".length) ?? null;
+
+  const merged: TrainAdvanceLoopEvidence = {
+    ...(evidence ?? {}),
+  };
+  if (evidence?.exitCode != null) {
+    merged.exitCode = evidence.exitCode;
+  } else if (exit !== 0) {
+    merged.exitCode = exit;
+  }
+  if (exit !== 0 && (merged.exitCode == null || merged.exitCode === 0)) {
+    merged.exitCode = exit;
+  }
+
+  const diagnostic =
+    hasStructuredTrainAdvanceEvidence(merged) ||
+    (merged.exitCode != null && merged.exitCode !== 0) ||
+    !!merged.engineMessage
+      ? composeTrainAdvanceStopReason(merged, issue)
+      : undefined;
+
+  // Non-zero exit / engine failure must not be masked by a success label
+  // (e.g. ready-to-deploy set before the wave engine failed) (#1074 review).
+  // Park terminals (needs-human / blocked) still classify as ok park outcomes
+  // with optional diagnostic — only the success terminal is gated.
+  const advanceFailed =
+    exit !== 0 ||
+    !!merged.engineMessage ||
+    hasStructuredTrainAdvanceEvidence(merged);
+  if (advanceFailed && stage === "ready-to-deploy") {
+    return {
+      ok: false,
+      error:
+        diagnostic ??
+        composeTrainAdvanceStopReason(
+          { exitCode: exit !== 0 ? exit : 1, engineMessage: merged.engineMessage },
+          issue,
+        ),
+    };
+  }
+
   if (stage === "ready-to-deploy") {
     return { ok: true, terminal: "ready-to-deploy", labels: snap.labels };
   }
   if (stage === "needs-human") {
-    return { ok: true, terminal: "needs-human", labels: snap.labels };
+    return {
+      ok: true,
+      terminal: "needs-human",
+      labels: snap.labels,
+      ...(diagnostic ? { diagnostic } : {}),
+    };
   }
   if (snap.labels.includes("blocked")) {
-    return { ok: true, terminal: "blocked", labels: snap.labels };
+    return {
+      ok: true,
+      terminal: "blocked",
+      labels: snap.labels,
+      ...(diagnostic ? { diagnostic } : {}),
+    };
   }
-  if (exit !== 0) {
-    return { ok: false, error: `pipeline advance exited with code ${exit}` };
+
+  // Non-zero exit, engine failure message, or structured stop/block evidence
+  // without a terminal park label → non-ok with composed reason (#1074).
+  if (advanceFailed) {
+    return {
+      ok: false,
+      error:
+        diagnostic ??
+        composeTrainAdvanceStopReason(
+          { exitCode: exit !== 0 ? exit : 1 },
+          issue,
+        ),
+    };
   }
-  return { ok: true, terminal: "other", labels: snap.labels };
+  return {
+    ok: true,
+    terminal: "other",
+    labels: snap.labels,
+    ...(diagnostic ? { diagnostic } : {}),
+  };
 }
 
 /**
  * One multi-item loop engine call for a base-eligible frontier (#1023).
  * Recovery and parallel disjoint advance stay inside the loop; train does not
  * call repair_pipeline_item.
+ *
+ * When the wave ends non-ok, per-item errors quote structured loop stop /
+ * block evidence before raw exit code (#1074).
  */
 export async function advanceWaveThroughLoop(
   issues: readonly number[],
@@ -3087,6 +3283,9 @@ export async function advanceWaveThroughLoop(
   getIssue: TrainDeps["getIssue"],
   runLoopEngine: (input: RunLoopEngineInput) => Promise<LoopEngineResult> = defaultRunLoopEngine,
   resolveCfg: typeof resolveConfig = resolveConfig,
+  readLoopEvents: (
+    runId: string,
+  ) => Promise<readonly { kind?: string; data?: unknown }[]> = defaultReadLoopEventsForTrain,
 ): Promise<import("./stages/train.ts").AdvanceWaveResult> {
   if (issues.length === 0) return new Map();
   let cfg: PipelineConfig;
@@ -3107,6 +3306,8 @@ export async function advanceWaveThroughLoop(
   const previousExit = process.exitCode;
   process.exitCode = 0;
   let engineFailed: string | null = null;
+  let driveStopReason: string | null = null;
+  let driveRunId: string | null = null;
   try {
     const engineResult = await runLoopEngine({
       engine,
@@ -3122,30 +3323,79 @@ export async function advanceWaveThroughLoop(
     });
     if (engineResult.kind === "error") {
       engineFailed = engineResult.message;
+    } else if (engineResult.kind === "drive") {
+      driveRunId = engineResult.result.runId;
+      const stop = engineResult.result.stop;
+      if (stop && typeof stop.reason === "string" && stop.reason.trim()) {
+        driveStopReason = stop.reason.trim();
+      }
     }
   } catch (err) {
     engineFailed = (err as Error).message;
   } finally {
     process.exitCode = previousExit ?? 0;
   }
+
+  let events: readonly { kind?: string; data?: unknown }[] = [];
+  if (driveRunId) {
+    try {
+      events = await readLoopEvents(driveRunId);
+    } catch {
+      events = [];
+    }
+  }
+
+  const waveEvidence = extractTrainAdvanceLoopEvidence({
+    events,
+    stopReason: driveStopReason,
+    exitCode: engineFailed ? 1 : driveStopReason ? 1 : 0,
+    engineMessage: engineFailed,
+  });
+
   const out = new Map<number, AdvanceOutcome>();
   for (const issue of issues) {
-    if (engineFailed) {
-      // Still read labels — loop may have advanced some items before failing.
-      try {
-        out.set(issue, classifyTrainAdvanceLabels(await getIssue(issue), 1));
-      } catch {
-        out.set(issue, { ok: false, error: engineFailed });
-      }
-      continue;
-    }
+    const scoped = scopeTrainAdvanceEvidenceForIssue(waveEvidence, issue);
+    const exitForClassify =
+      engineFailed || driveStopReason || (scoped.exitCode != null && scoped.exitCode !== 0)
+        ? scoped.exitCode != null && scoped.exitCode !== 0
+          ? scoped.exitCode
+          : 1
+        : 0;
     try {
-      out.set(issue, classifyTrainAdvanceLabels(await getIssue(issue), 0));
+      out.set(
+        issue,
+        classifyTrainAdvanceLabels(await getIssue(issue), exitForClassify, scoped, issue),
+      );
     } catch (err) {
-      out.set(issue, { ok: false, error: (err as Error).message });
+      if (engineFailed || hasStructuredTrainAdvanceEvidence(scoped) || scoped.engineMessage) {
+        out.set(issue, {
+          ok: false,
+          error: composeTrainAdvanceStopReason(
+            {
+              ...scoped,
+              engineMessage: scoped.engineMessage ?? engineFailed ?? (err as Error).message,
+            },
+            issue,
+          ),
+        });
+      } else {
+        out.set(issue, { ok: false, error: (err as Error).message });
+      }
     }
   }
   return out;
+}
+
+/** Production default: read loop events.jsonl for the wave run (best-effort). */
+async function defaultReadLoopEventsForTrain(
+  runId: string,
+): Promise<readonly { kind?: string; data?: unknown }[]> {
+  try {
+    const { readEvents } = await import("./loop/store.ts");
+    return await readEvents(defaultLoopStoreDeps(), runId);
+  } catch {
+    return [];
+  }
 }
 
 /** Execute parsed `pipeline train` options through the ordered train engine.

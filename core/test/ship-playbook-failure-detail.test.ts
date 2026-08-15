@@ -71,6 +71,21 @@ test("failure_detail train: reads blocker sidecar", () => {
   }
 });
 
+test("failure_detail train (#1074): preserves structured stop class from train blocker", () => {
+  const dir = makeRunDir();
+  try {
+    fs.writeFileSync(
+      path.join(dir, "train.json.blocker"),
+      "held: #1010: advance failed for #1010: supervisor_no_progress",
+    );
+    const out = extractFailureDetail(dir, "", "train");
+    assert.match(out, /supervisor_no_progress/);
+    assert.match(out, /1010/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("failure_detail release-finish: surfaces pending checks line", () => {
   const dir = makeRunDir();
   try {

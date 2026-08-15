@@ -200,6 +200,41 @@ test("tugboat failure_detail prefers loop-lock stderr over generic exit code", (
   }
 });
 
+test("tugboat failure_detail (#1074): preserves train blocker stop class + issue", () => {
+  const dir = makeRunDir();
+  try {
+    fs.writeFileSync(
+      path.join(dir, "train.json.blocker"),
+      "held: #1010: advance failed for #1010: supervisor_no_progress",
+    );
+    const out = extractFailureDetail(dir, "", "train");
+    assert.match(out, /supervisor_no_progress/);
+    assert.match(out, /1010/);
+    assert.doesNotMatch(out, /^train exit 1$/);
+    assert.doesNotMatch(
+      out,
+      /^advance failed for #1010: pipeline (?:single|advance) exited with code 1$/,
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("tugboat failure_detail (#1074): exit-only train blocker is not rewritten into a class", () => {
+  const dir = makeRunDir();
+  try {
+    fs.writeFileSync(
+      path.join(dir, "train.json.blocker"),
+      "advance failed for #42: pipeline advance exited with code 1",
+    );
+    const out = extractFailureDetail(dir, "", "train");
+    assert.match(out, /exited with code 1/);
+    assert.doesNotMatch(out, /supervisor_no_progress|dependency_deadlock|recovery_exhausted/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("tugboat version rules: train v-prefix, release bare, promote bare, gh release v-prefix", () => {
   const body = fs.readFileSync(tugboat, "utf8");
   assert.match(body, /train --milestone "v\$version"/);
