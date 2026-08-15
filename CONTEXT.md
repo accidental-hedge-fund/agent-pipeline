@@ -47,9 +47,17 @@ _Avoid_: Codex (as the name of the role), self-review as the default product
 A detached `pipeline train --merge` for one milestone. That process is the ship.
 _Avoid_: Buzz thread as the ship, playbook as the definition, `pipeline 702` / `single` lock as a live ship
 
+**Live-ship probe**:
+A live pid whose cmdline is that `train --merge` (or the tugboat that owns it). Only this may refuse a second detach.
+_Avoid_: `playbook.pid` + `kill -0`, any issue lock
+
 **Playbook**:
-A launcher that detaches a live ship. Not the ship.
-_Avoid_: live-ship probe, second scheduler
+A launcher that detaches a live ship. Not the ship. Same detach path for Buzz and a TUI paste: live ship exists → status + notify; else detach once.
+_Avoid_: live-ship probe, paste detector, second scheduler
+
+**Ship origin**:
+`REPO_DIR` resolved once at tugboat start from install/env. Paths matching `*factory-control*` are refused. Later session text cannot retarget.
+_Avoid_: `env.example` factory-control default, mid-ship model override
 
 **STOP**:
 `train --merge` will not implement or merge another sibling.
@@ -88,5 +96,5 @@ _Avoid_: supervisor_no_progress when `next_actions` is advance
 _Avoid_: unknown, assertion, flake re-run
 
 **Review-prompt-too-large**:
-Assembled reviewer input exceeds the harness ceiling. Fail-fast. Do not retry the same payload.
-_Avoid_: transient timeout, unblock-and-rerun, shrink-the-1.29MB as this cut
+Assembled reviewer prompt (after `buildReview*Prompt`, before spawn) exceeds the configured reviewer’s declared max, else Codex `1048576`. `setBlocked`. Do not retry the same payload. Review-1 and review-2.
+_Avoid_: transient timeout, skip-review-and-advance, shrink-the-1.29MB as this cut, per-model table this cut
