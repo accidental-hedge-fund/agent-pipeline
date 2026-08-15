@@ -295,6 +295,7 @@ export function blockerKindToInterventionKind(kind: BlockerKind): HumanIntervent
     case "harness-failure":
     case "review-independent-quorum-unmet":
     case "review-no-usable-reviewers":
+    case "review-prompt-too-large":
       return "reviewer-unavailable";
     case "openspec-invalid":
     case "openspec-stale-delta":

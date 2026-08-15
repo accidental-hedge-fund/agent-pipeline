@@ -134,6 +134,10 @@ function mechanicalReasonCodeForKind(kind: BlockerKind): StageDiagnosticReasonCo
       return "workflow-engine-defect";
     case "review-no-usable-reviewers":
       return "harness-contract";
+    case "review-prompt-too-large":
+      // Mechanical payload/ceiling refusal — not a transient harness crash and
+      // not human-authority. Same-payload auto-retry is forbidden (#1054).
+      return "capability-refusal";
     default:
       return assertNever(kind);
   }
