@@ -24,13 +24,13 @@ harnesses:
   implementer: grok
   reviewer: codex
 
-models: # current Grok factory roles use exactly grok-4.5; no Grok fallback is configured
-  planning: grok-4.5 # implementer harness
-  implementing: grok-4.5 # implementer harness
+models: # current Grok factory roles use exactly grok-4.6; no Grok fallback is configured
+  planning: grok-4.6 # implementer harness
+  implementing: grok-4.6 # implementer harness
   review: gpt-5.6-terra # reviewer harness
-  fix: grok-4.5 # implementer harness
-  intake: grok-4.5 # implementer harness; explicit so doctor smoke never inherits a non-Grok default
-  sweep: grok-4.5 # implementer harness; explicit so doctor smoke never inherits a non-Grok default
+  fix: grok-4.6 # implementer harness
+  intake: grok-4.6 # implementer harness; explicit so doctor smoke never inherits a non-Grok default
+  sweep: grok-4.6 # implementer harness; explicit so doctor smoke never inherits a non-Grok default
 
 effort: # per-phase reasoning effort — passed through each resolved harness adapter (#366, #608).
   planning: high # implementer harness — also sources plan-review's effort (Adversarial/Definitive)
