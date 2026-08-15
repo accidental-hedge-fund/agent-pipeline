@@ -50,12 +50,38 @@ export function isPrePipelineStage(stage: string | null): boolean {
  *  - Unknown non-null string not in {@link STAGES} → mid-flight (defensive against vocabulary
  *    growth lag so future stages are not stranded at `pr_opened`)
  *
- *  Pure — no I/O. */
+ *  Pure — no I/O. Mid-flight is a **subset** of {@link isAdvanceStillNeeded} (#1068). */
 export function isMidFlightPipelineStage(stage: string | null): boolean {
   if (stage == null) return false;
   if (NON_MID_FLIGHT_STAGE_SUFFIXES.has(stage)) return false;
   if (MID_FLIGHT_STAGE_SUFFIXES.has(stage)) return true;
   // Unknown non-null: treat as mid-flight so a new stage cannot reintroduce stranding.
+  return true;
+}
+
+/** Minimal identity fields for {@link isAdvanceStillNeeded} — open-PR residual that still
+ *  needs advance toward ready-to-deploy (#1068). */
+export interface AdvanceStillNeededIdentity {
+  pr_number: number | null;
+  pr_state: string | null;
+  ready_label_present: boolean;
+  pipeline_stage: string | null;
+}
+
+/** True when verified open-PR identity still needs advance toward `pipeline:ready-to-deploy`
+ *  (#1068, class generalization of the #712 mid-flight heal).
+ *
+ *  Membership:
+ *  - open PR (`pr_number` set, `pr_state === "open"`)
+ *  - not ready-to-deploy (`ready_label_present` false — intake-ready `pipeline:ready` alone
+ *    never sets this flag)
+ *  - stage is not the terminal off-ramp `needs-human`
+ *
+ *  Includes intake-ready stage `ready`, mid-flight stages, and missing/`null` stage. Pure — no I/O. */
+export function isAdvanceStillNeeded(identity: AdvanceStillNeededIdentity): boolean {
+  if (identity.pr_number === null || identity.pr_state !== "open") return false;
+  if (identity.ready_label_present) return false;
+  if (identity.pipeline_stage === "needs-human") return false;
   return true;
 }
 

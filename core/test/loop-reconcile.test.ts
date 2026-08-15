@@ -397,13 +397,12 @@ test("classifyDrift: a local state (implemented) with no PR at all produces no d
   assert.equal(classifyDrift("implemented", openPrIdentity({ pr_number: null, pr_state: null }), null), null);
 });
 
-test("classifyDrift: a local state (implemented) is ledger-behind when a PR is already discovered (#511 review-2 regression)", () => {
-  // A worker that crashed after opening (or even merging) the PR but before
-  // recording implemented -> pr_opened must be repaired forward, not treated
-  // as aligned — the old behavior hard-returned null for every local state.
-  // Null / non-mid-flight stage preserves this catch-up; mid-flight is gated (#712).
-  assert.equal(classifyDrift("implemented", openPrIdentity({ pipeline_stage: null }), null), "ledger-behind");
+test("classifyDrift: a local state (implemented) is ledger-behind when a merged PR is already discovered (#511 review-2 regression)", () => {
+  // A worker that crashed after merging the PR but before recording the
+  // transition must be repaired forward. Open PR alone while advance still
+  // needed no longer catches up to stranded pr_opened (#1068).
   assert.equal(classifyDrift("implemented", openPrIdentity({ pr_state: "merged" }), null), "ledger-behind");
+  assert.equal(classifyDrift("implemented", openPrIdentity({ pipeline_stage: null }), null), null);
 });
 
 test("classifyDrift: local + open PR + mid-flight stage is NOT ledger-behind (#712)", () => {
@@ -419,6 +418,23 @@ test("classifyDrift: local + open PR + mid-flight stage is NOT ledger-behind (#7
   );
   assert.equal(
     classifyDrift("implemented", openPrIdentity({ pipeline_stage: "pre-merge" }), null),
+    null,
+  );
+});
+
+test("classifyDrift: local + open PR + intake-ready stage is NOT ledger-behind (#1068)", () => {
+  // Without this gate, heal→in_progress oscillates: next reconcile demotes
+  // intake-ready back to stranded pr_opened under the old #511 catch-up.
+  assert.equal(
+    classifyDrift("in_progress", openPrIdentity({ pipeline_stage: "ready", checks_conclusion: "success" }), null),
+    null,
+  );
+  assert.equal(
+    classifyDrift("pending", openPrIdentity({ pipeline_stage: "ready" }), null),
+    null,
+  );
+  assert.equal(
+    classifyDrift("implemented", openPrIdentity({ pipeline_stage: null }), null),
     null,
   );
 });
@@ -537,16 +553,20 @@ test("reconcile: records a sequence-numbered last_reconciliation and emits an ev
   const result = await reconcile(deps, observeDeps, { runId: "run-1", token, engine: "claude" });
   assert.equal(result.sequence, 1);
   assert.equal(result.drift.length, 0);
-  assert.equal(result.next_actions["100"], "advance");
+  // #1068: open PR + null stage is advance-still-needed — heal to in_progress so
+  // next_actions is not stranded non-consuming "advance" on pr_opened.
+  assert.equal(result.next_actions["100"], "noop");
   assert.ok(calls.length > 0);
 
   const ledger = await readLedger(deps, "run-1");
   assert.equal(ledger.reconciliation_sequence, 1);
   assert.equal(ledger.last_reconciliation?.sequence, 1);
   assert.equal(ledger.items["100"].last_verified_identity?.pr_number, 12);
+  assert.equal(ledger.items["100"].state, "in_progress");
 
   const events = ledger.run_id; // sanity: readLedger returns the same run
   assert.equal(events, "run-1");
+  void contract;
 });
 
 test("reconcile: caller-supplied claims never enter the picture — truth comes only from the live observation", async () => {
@@ -564,7 +584,10 @@ test("reconcile: caller-supplied claims never enter the picture — truth comes 
   });
   await reconcile(deps, observeDeps, { runId: "run-1", token, engine: "claude" });
   const ledger = await readLedger(deps, "run-1");
-  assert.equal(ledger.items["100"].state, "pr_opened");
+  // Observed open PR + advance-still-needed heals stranded pr_opened to in_progress (#1068).
+  assert.equal(ledger.items["100"].state, "in_progress");
+  assert.equal(ledger.items["100"].last_verified_identity?.pr_number, 12);
+  void contract;
 });
 
 test("reconcile: sequence increments by exactly one across repeated passes", async () => {
@@ -609,7 +632,7 @@ test("reconcile: benign ledger-behind drift is repaired forward with a history e
   // so this repair could not have performed an external mutation even in principle.
 });
 
-test("reconcile: a crash before recording implemented -> pr_opened is repaired to the verified target, not hard-coded to merged (#511 review-2 regression)", async () => {
+test("reconcile: a crash before recording implemented + open PR stays dispatchable, not hard-coded to merged (#511 / #1068)", async () => {
   const { deps, token } = await setup("implemented");
   const { deps: observeDeps } = fakeObserveDeps({
     async findPrForIssue() {
@@ -621,16 +644,16 @@ test("reconcile: a crash before recording implemented -> pr_opened is repaired t
   });
 
   const result = await reconcile(deps, observeDeps, { runId: "run-1", token, engine: "claude" });
-  assert.equal(result.drift[0].class, "ledger-behind");
-  assert.equal(result.next_actions["100"], "repair-forward");
+  // Open PR alone while advance still needed is not terminal catch-up: keep local
+  // dispatchable state (do not park at stranded pr_opened with dead advance).
+  assert.equal(result.drift.find((d) => d.item_id === "100")?.class, undefined);
+  assert.notEqual(result.next_actions["100"], "repair-forward");
 
   const ledger = await readLedger(deps, "run-1");
-  // The PR is only open (not merged) — repairing to a hard-coded "merged"
-  // target would fabricate an unproven merge; the verified target is pr_opened.
-  assert.equal(ledger.items["100"].state, "pr_opened");
-  const last = ledger.items["100"].history.at(-1);
-  assert.equal(last?.from, "implemented");
-  assert.equal(last?.to, "pr_opened");
+  // The PR is only open (not merged) — must never fabricate merged.
+  assert.notEqual(ledger.items["100"].state, "merged");
+  assert.equal(ledger.items["100"].state, "implemented");
+  assert.notEqual(ledger.items["100"].state, "pr_opened");
 });
 
 test("reconcile: a crash before recording implemented -> merged repairs all the way to merged", async () => {
@@ -953,22 +976,29 @@ test("regression #797: reconcile preserves a blocked item and its started recove
   assert.ok(!after.items["100"].history.some((entry) => entry.from === "blocked" && entry.to === "pr_opened"));
 });
 
-test("reconcile: local + open PR + null stage still repairs to pr_opened (#511 compatibility)", async () => {
+test("reconcile: local + open PR + null stage stays dispatchable, not stranded pr_opened (#1068 / #511)", async () => {
+  // #511 crash-after-PR-open residual: open PR with null stage still needs
+  // advance. Prefer keep local dispatchable state over parking at non-consuming
+  // pr_opened (advance-still-needed local gate).
   const { deps, token } = await setup("implemented");
   const observeDeps = openPrObserveDeps({ stage: null });
   const result = await reconcile(deps, observeDeps, { runId: "run-1", token, engine: "claude" });
-  assert.equal(result.drift[0]?.class, "ledger-behind");
+  assert.equal(result.drift.find((d) => d.item_id === "100")?.class, undefined);
   const ledger = await readLedger(deps, "run-1");
-  assert.equal(ledger.items["100"].state, "pr_opened");
+  assert.equal(ledger.items["100"].state, "implemented");
+  assert.notEqual(ledger.items["100"].state, "pr_opened");
 });
 
-test("reconcile: local + open PR + ready stage still repairs to pr_opened (#511 / non-mid-flight)", async () => {
+test("reconcile: local + open PR + ready stage stays in_progress, not stranded pr_opened (#1068)", async () => {
+  // Pre-#1068: non-mid-flight intake-ready repaired to pr_opened (#511 path),
+  // then never healed — dead next_actions.advance. Gate keeps dispatchable local.
   const { deps, token } = await setup("in_progress");
   const observeDeps = openPrObserveDeps({ stage: "ready" });
   const result = await reconcile(deps, observeDeps, { runId: "run-1", token, engine: "claude" });
-  assert.equal(result.drift[0]?.class, "ledger-behind");
+  assert.equal(result.drift.find((d) => d.item_id === "100")?.class, undefined);
   const ledger = await readLedger(deps, "run-1");
-  assert.equal(ledger.items["100"].state, "pr_opened");
+  assert.equal(ledger.items["100"].state, "in_progress");
+  assert.notEqual(ledger.items["100"].state, "pr_opened");
 });
 
 test("reconcile: mid-flight local open PR leaves local state across checks matrix (#712)", async () => {
@@ -990,9 +1020,33 @@ test("reconcile: stranded pr_opened + mid-flight open PR heals to in_progress (#
   const last = ledger.items["100"].history.at(-1);
   assert.equal(last?.from, "pr_opened");
   assert.equal(last?.to, "in_progress");
-  assert.match(last?.note ?? "", /mid-flight/);
+  assert.match(last?.note ?? "", /advance-still-needed/);
   // Not stranded with non-consuming advance.
   assert.notEqual(ledger.last_reconciliation?.next_actions["100"], "advance");
+});
+
+test("reconcile: stranded pr_opened + intake-ready stage ready heals to in_progress (#1068)", async () => {
+  // Live class: pipeline:ready (intake) + open PR + green checks left at
+  // pr_opened with non-consuming next_actions.advance → supervisor_no_progress.
+  const { deps, token } = await setup("pr_opened");
+  const observeDeps = openPrObserveDeps({ stage: "ready", checks: "success" });
+  await reconcile(deps, observeDeps, { runId: "run-1", token, engine: "claude" });
+  const ledger = await readLedger(deps, "run-1");
+  assert.equal(ledger.items["100"].state, "in_progress");
+  const last = ledger.items["100"].history.at(-1);
+  assert.equal(last?.from, "pr_opened");
+  assert.equal(last?.to, "in_progress");
+  assert.match(last?.note ?? "", /advance-still-needed/);
+  assert.notEqual(ledger.last_reconciliation?.next_actions["100"], "advance");
+});
+
+test("reconcile: stranded pr_opened + needs-human is NOT healed to in_progress (#1068)", async () => {
+  const { deps, token } = await setup("pr_opened");
+  const observeDeps = openPrObserveDeps({ stage: "needs-human", checks: "success" });
+  await reconcile(deps, observeDeps, { runId: "run-1", token, engine: "claude" });
+  const ledger = await readLedger(deps, "run-1");
+  assert.equal(ledger.items["100"].state, "pr_opened");
+  assert.ok(!ledger.items["100"].history.some((h) => h.to === "in_progress"));
 });
 
 // Pre-fix stranded rows normally retain last_verified_identity. If the PR head
@@ -1068,10 +1122,27 @@ test("reconcile: mid-flight heal is idempotent across repeated passes (#712)", a
   assert.equal(second.items["100"].state, "in_progress");
   // No re-promote to pr_opened and no duplicate heal history spam.
   assert.equal(
-    second.items["100"].history.filter((h) => h.to === "in_progress" && (h.note ?? "").includes("mid-flight")).length,
+    second.items["100"].history.filter((h) => h.to === "in_progress" && (h.note ?? "").includes("advance-still-needed")).length,
     1,
   );
   assert.ok(second.items["100"].history.length === historyLen || second.items["100"].history.at(-1)?.to !== "pr_opened");
+});
+
+test("reconcile: intake-ready heal is idempotent and does not oscillate back to pr_opened (#1068)", async () => {
+  const { deps, token } = await setup("pr_opened");
+  const observeDeps = openPrObserveDeps({ stage: "ready", checks: "success" });
+  await reconcile(deps, observeDeps, { runId: "run-1", token, engine: "claude" });
+  const afterHeal = await readLedger(deps, "run-1");
+  assert.equal(afterHeal.items["100"].state, "in_progress");
+
+  await reconcile(deps, observeDeps, { runId: "run-1", token, engine: "claude" });
+  const second = await readLedger(deps, "run-1");
+  assert.equal(second.items["100"].state, "in_progress");
+  assert.notEqual(second.items["100"].state, "pr_opened");
+  assert.equal(
+    second.items["100"].history.filter((h) => h.to === "in_progress" && (h.note ?? "").includes("advance-still-needed")).length,
+    1,
+  );
 });
 
 test("reconcile: heal does not override ready or merged catch-up from pr_opened (#712)", async () => {

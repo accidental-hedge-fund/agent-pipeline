@@ -199,10 +199,13 @@ test("FRG Layer A resume-mid-flight: open PR + mid-flight stage does not target 
   assert.equal(drift, null, "mid-flight open PR must not invent pr_opened catch-up");
 });
 
-test("FRG Layer A resume-mid-flight: open PR + non-mid-flight can catch up to pr_opened (crash-after-open)", () => {
+test("FRG Layer A resume-mid-flight: open PR + non-mid-flight advance-still-needed stays local (#1068)", () => {
+  // #1068: open PR without R2D is advance-still-needed even when stage is not
+  // mid-flight (null / intake-ready). Do not invent stranded pr_opened catch-up;
+  // keep local dispatchable state (or heal from existing pr_opened).
   const identity = openPrIdentity(null);
   const drift = classifyDrift("in_progress", identity, null);
-  assert.equal(drift, "ledger-behind", "non-mid-flight open PR still allows #511 recovery catch-up");
+  assert.equal(drift, null, "advance-still-needed open PR must not invent pr_opened catch-up");
 });
 
 // ---------------------------------------------------------------------------
