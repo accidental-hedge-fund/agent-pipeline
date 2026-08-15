@@ -162,8 +162,11 @@ function fakeDiscoverDeps(opts: {
   bodies?: Record<string, { title: string; body: string } | null>;
   blockedBy?: Record<string, number[] | null>;
   roadmap?: Array<{ depender: string; prerequisite: string }> | null;
-  /** Issue id → open/closed; omit target to leave getIssueOpenState unset (assume open). */
-  openState?: Record<string, "open" | "closed" | null>;
+  /**
+   * Issue id → open / closed / merged (linked PR merged while issue may still
+   * be open); omit target to leave getIssueOpenState unset (assume open).
+   */
+  openState?: Record<string, "open" | "closed" | "merged" | null>;
   throwOnBody?: Set<string>;
   throwOnBlockedBy?: Set<string>;
 }): WorkListDependencyDiscoverDeps {
@@ -1207,6 +1210,82 @@ test("#1073 closed on-selector Depends on is not a hard wait", async () => {
       (d) => d.depender === "200" && d.target === "100" && d.reason === "closed",
     ),
   );
+});
+
+test("#1073 on-selector open issue with merged linked PR is not a hard wait (depender eligible)", async () => {
+  // Issue still open at Issue.state, but linked PR is merged → closed/merged-class
+  // non-admission (spec: satisfied via merged linked PR under observation seam).
+  const deps = fakeDiscoverDeps({
+    bodies: {
+      "100": { title: "shipped via PR; issue left open", body: "" },
+      "200": { title: "next", body: "Depends on #100" },
+    },
+    openState: { "100": "merged", "200": "open" },
+  });
+  const { contract, discovery } = await compileWorkListRunFresh(
+    fakeCfg(),
+    "claude",
+    ["100", "200"],
+    "run-merged-pr-on-selector",
+    deps,
+  );
+  const item200 = contract.items.find((i) => i.id === "200")!;
+  assert.deepEqual(item200.depends_on, []);
+  assert.deepEqual(item200.external_depends_on, []);
+  assert.ok(
+    discovery.ignored_deps.some(
+      (d) => d.depender === "200" && d.target === "100" && d.reason === "closed",
+    ),
+    "merged linked-PR satisfaction must ignore with closed/merged-class reason",
+  );
+
+  const ledger: LoopLedger = {
+    schema: LOOP_LEDGER_SCHEMA,
+    run_id: "run-merged-pr-on-selector",
+    items: {
+      "100": { id: "100", state: "pending", history: [], recovery_budgets_remaining: { default: 3 } },
+      "200": { id: "200", state: "pending", history: [], recovery_budgets_remaining: { default: 3 } },
+    },
+    consecutive_blocked: 0,
+    merge_barrier: null,
+    stop: null,
+    last_native_goal_check: null,
+    last_reconciliation: null,
+    reconciliation_sequence: 0,
+    recovery_attempts: [],
+    authority_amendments: [],
+  };
+  const loopContract = contract as unknown as LoopContract;
+  const eligible = eligibleIndependentItems(loopContract, ledger, {});
+  assert.ok(eligible.includes("200"), "depender must be eligible once merged-PR prereq is non-admitted");
+  assert.ok(eligible.includes("100"));
+  assert.equal(detectDependencyDeadlock(loopContract, ledger, {}), null);
+});
+
+test("realWorkListDependencyDiscoverDeps: open issue + merged linked PR → merged admission class", async () => {
+  // Production observation seam: Issue.state OPEN, linked PR MERGED → "merged".
+  const deps = realWorkListDependencyDiscoverDeps(fakeCfg(), {
+    runGhApi: async () =>
+      JSON.stringify({
+        data: { repository: { issue: { state: "OPEN" } } },
+      }),
+    findPrForIssue: async (n) => (n === 100 ? 55 : null),
+    getPrState: async (pr) => (pr === 55 ? "merged" : null),
+  });
+  assert.equal(await deps.getIssueOpenState!(100), "merged");
+  assert.equal(await deps.getIssueOpenState!(200), "open");
+});
+
+test("realWorkListDependencyDiscoverDeps: open issue + no merged PR stays open", async () => {
+  const deps = realWorkListDependencyDiscoverDeps(fakeCfg(), {
+    runGhApi: async () =>
+      JSON.stringify({
+        data: { repository: { issue: { state: "OPEN" } } },
+      }),
+    findPrForIssue: async () => null,
+    getPrState: async () => null,
+  });
+  assert.equal(await deps.getIssueOpenState!(42), "open");
 });
 
 test("#1073 phrase under Related still extracts; open on-selector remains hard wait", async () => {

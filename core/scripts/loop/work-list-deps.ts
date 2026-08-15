@@ -17,7 +17,12 @@ import {
   isCanonicalIssueId,
   parseDeclaredDependencyIds,
 } from "../declared-dependency-grammar.ts";
-import { getIssueDetail, type GhApiRunner } from "../gh.ts";
+import {
+  getIssueDetail,
+  getPrDetail,
+  getPrForIssueAnyState,
+  type GhApiRunner,
+} from "../gh.ts";
 import type { PipelineConfig } from "../types.ts";
 import { type RawContractItem } from "./dependencies.ts";
 import { LoopError } from "./types.ts";
@@ -86,10 +91,18 @@ export interface IgnoredDep {
 }
 
 /**
- * Observed open/closed class for hard-wait admission. `not_open` covers
- * unobservable, missing, or any non-open class that is not a clean `closed`.
+ * Observed open/closed class for hard-wait admission. `closed` covers
+ * issue-closed and linked-PR-merged satisfaction (closed/merged-class).
+ * `not_open` covers unobservable, missing, or any non-open class that is not
+ * a clean closed/merged class.
  */
 export type PrerequisiteOpenClass = "open" | "closed" | "not_open";
+
+/**
+ * Live observation for hard-wait admission (#1073). `"merged"` means a linked
+ * PR is merged (issue may still be open) — maps to closed/merged-class ignore.
+ */
+export type PrerequisiteObservation = "open" | "closed" | "merged" | null;
 
 /** One raw directed edge before hard-wait admission. */
 export interface RawDeclaredEdge {
@@ -99,9 +112,10 @@ export interface RawDeclaredEdge {
 
 /**
  * Pure hard-wait admission (#1073): a declared prerequisite becomes a hard wait
- * only when the target is **open** and a member of the current work-list /
- * train selector snapshot. Non-admitted candidates are returned as
- * `ignored_dep` records with stable reason codes. Does not invent edges.
+ * only when the target is **open** (not closed, not satisfied via merged linked
+ * PR) and a member of the current work-list / train selector snapshot.
+ * Non-admitted candidates are returned as `ignored_dep` records with stable
+ * reason codes. Does not invent edges.
  */
 export function admitHardWaits(
   edges: readonly RawDeclaredEdge[],
@@ -120,9 +134,10 @@ export function admitHardWaits(
 
     const state = openState.get(target) ?? "not_open";
     let reason: IgnoredDepReason | null = null;
-    // Closed wins for audit when observed, even off-selector. Off-selector
-    // (open or unobserved) is not_on_selector so ship-path forensics name the
-    // train membership rule. On-selector not-open stays not_open.
+    // Closed/merged-class wins for audit when observed, even off-selector.
+    // Off-selector (open or unobserved) is not_on_selector so ship-path
+    // forensics name the train membership rule. On-selector not-open stays
+    // not_open.
     if (state === "closed") {
       reason = "closed";
     } else if (!selectorIds.has(target)) {
@@ -279,12 +294,14 @@ export interface WorkListDependencyDiscoverDeps {
    */
   getRoadmapDeclaredEdges?(): Promise<readonly RoadmapDeclaredEdge[] | null>;
   /**
-   * Open/closed observation for hard-wait admission (#1073). Returns `"open"`,
-   * `"closed"`, or `null` when the issue cannot be observed (`not_open`).
-   * When omitted, discovery treats every candidate as open so selector
-   * membership alone decides admission (closed-class reasons require a seam).
+   * Open/closed/merged observation for hard-wait admission (#1073). Returns
+   * `"open"`, `"closed"` (issue closed), `"merged"` (linked PR merged — issue
+   * may still be open), or `null` when the issue cannot be observed
+   * (`not_open`). When omitted, discovery treats every candidate as open so
+   * selector membership alone decides admission (closed/merged-class reasons
+   * require a seam).
    */
-  getIssueOpenState?(issueNumber: number): Promise<"open" | "closed" | null>;
+  getIssueOpenState?(issueNumber: number): Promise<PrerequisiteObservation>;
 }
 
 /**
@@ -454,8 +471,9 @@ export async function discoverDeclaredDependencies(
     }
     try {
       const observed = await deps.getIssueOpenState!(Number(target));
+      // Issue closed OR linked-PR-merged → closed/merged-class (not a hard wait).
       if (observed === "open") openState.set(target, "open");
-      else if (observed === "closed") openState.set(target, "closed");
+      else if (observed === "closed" || observed === "merged") openState.set(target, "closed");
       else openState.set(target, "not_open");
     } catch {
       openState.set(target, "not_open");
@@ -618,6 +636,9 @@ export function collectBlockedByIssueNumbers(
  * `getIssueDetail` for text when GraphQL is unavailable. Roadmap edges default
  * to none unless the caller injects `getRoadmapDeclaredEdges`.
  *
+ * Hard-wait open-state observation also treats a merged linked PR as
+ * closed/merged-class satisfaction (even when the issue is still open).
+ *
  * Incomplete pagination throws (does not cache a truncated set). Null cache
  * entries mean the issue was unobservable — callers classify as unavailable.
  */
@@ -629,6 +650,10 @@ export function realWorkListDependencyDiscoverDeps(
     getBlockedByIssueNumbers?: WorkListDependencyDiscoverDeps["getBlockedByIssueNumbers"];
     getRoadmapDeclaredEdges?: WorkListDependencyDiscoverDeps["getRoadmapDeclaredEdges"];
     getIssueOpenState?: WorkListDependencyDiscoverDeps["getIssueOpenState"];
+    /** Injectable linked-PR lookup for merged-PR satisfaction (#1073 r1). */
+    findPrForIssue?: (issueNumber: number) => Promise<number | null>;
+    /** Injectable PR state for merged-PR satisfaction (#1073 r1). */
+    getPrState?: (prNumber: number) => Promise<"open" | "closed" | "merged" | null>;
   } = {},
 ): WorkListDependencyDiscoverDeps {
   type Cached = {
@@ -642,8 +667,23 @@ export function realWorkListDependencyDiscoverDeps(
   const cache = new Map<number, Cached | null>();
   /** Open-state cache for targets that never loaded full dep sources. */
   const openStateOnly = new Map<number, "open" | "closed" | null>();
+  /** Admission observation cache (includes merged-linked-PR class). */
+  const admissionStateCache = new Map<number, PrerequisiteObservation>();
 
   const runGhApi: GhApiRunner = options.runGhApi ?? defaultGhApiRunner;
+  const findPrForIssue =
+    options.findPrForIssue ??
+    ((issueNumber: number) => getPrForIssueAnyState(cfg, issueNumber, runGhApi));
+  const getPrState =
+    options.getPrState ??
+    (async (prNumber: number): Promise<"open" | "closed" | "merged" | null> => {
+      try {
+        const detail = await getPrDetail(cfg, prNumber);
+        return detail.state;
+      } catch {
+        return null;
+      }
+    });
 
   async function load(issueNumber: number): Promise<Cached | null> {
     if (cache.has(issueNumber)) return cache.get(issueNumber)!;
@@ -804,14 +844,51 @@ export function realWorkListDependencyDiscoverDeps(
       }),
     getIssueOpenState:
       options.getIssueOpenState ??
-      (async (issueNumber) => {
-        // Prefer full-cache row when discovery already loaded this issue.
+      (async (issueNumber): Promise<PrerequisiteObservation> => {
+        if (admissionStateCache.has(issueNumber)) {
+          return admissionStateCache.get(issueNumber)!;
+        }
+
+        // Prefer issue open/closed from full-cache row when discovery already loaded it.
+        let issueState: "open" | "closed" | null;
         if (cache.has(issueNumber)) {
           const row = cache.get(issueNumber);
-          if (!row) return null;
-          return row.openState;
+          if (!row) {
+            admissionStateCache.set(issueNumber, null);
+            return null;
+          }
+          issueState = row.openState;
+        } else {
+          issueState = await loadOpenStateOnly(issueNumber);
         }
-        return loadOpenStateOnly(issueNumber);
+
+        if (issueState === "closed") {
+          admissionStateCache.set(issueNumber, "closed");
+          return "closed";
+        }
+        if (issueState !== "open") {
+          admissionStateCache.set(issueNumber, null);
+          return null;
+        }
+
+        // Issue still open: linked merged PR satisfies the prerequisite
+        // (closed/merged-class) so it is not admitted as a hard wait (#1073).
+        try {
+          const prNumber = await findPrForIssue(issueNumber);
+          if (prNumber !== null) {
+            const prState = await getPrState(prNumber);
+            if (prState === "merged") {
+              admissionStateCache.set(issueNumber, "merged");
+              return "merged";
+            }
+          }
+        } catch {
+          // PR observation failure does not invent satisfaction — fall through
+          // to open (fail closed toward hard wait, never toward "satisfied").
+        }
+
+        admissionStateCache.set(issueNumber, "open");
+        return "open";
       }),
     getRoadmapDeclaredEdges: options.getRoadmapDeclaredEdges,
   };
