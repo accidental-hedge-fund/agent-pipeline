@@ -38,6 +38,7 @@ This file is human-readable forward-looking documentation for open work. **GitHu
 | **v1.49.2** | patch | Run, evidence, and harness efficiency | #824–#832 | Improve bounded local I/O and reuse without changing behavior. |
 | **v1.49.3** | patch | Batch, CI, cache, and event efficiency | #833–#840 | Parallelize independent work and add call-budget checks without reducing rigor. |
 | **v1.38.1** ✅ shipped | patch | v1.38.1 | #1020, #1021, #1023, #1025, #1028, #1029, #1030 | Shipped 2026-08-13 (tag `v1.38.1`). See CHANGELOG.md. |
+| **v1.39.1** ✅ shipped | patch | v1.39.1 | #1047, #1054, #1062, #1063, #1065, #1068, #1073, #1074, #1081 | Shipped 2026-08-15 (tag `v1.39.1`). See CHANGELOG.md. |
 | *(none)* | — | Unscheduled / no release | — | _Structural insertion anchor for `intake` and `sweep` — do not remove._ |
 
 ## Per-issue plan
