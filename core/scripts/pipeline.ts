@@ -3042,6 +3042,21 @@ export async function advanceIssueThroughSingle(
   opts: CliOpts,
   getIssue: TrainDeps["getIssue"],
   runSingleIssue: typeof runSingleIssueCommand = runSingleIssueCommand,
+  /**
+   * Optional structured loop evidence for this single-item attempt (#1074).
+   * Callers/tests inject stop/block evidence (or a reader that loads it after
+   * `pipeline single`) so non-ok STOP text can quote `loop_run_stopped` /
+   * `loop_item_blocked` instead of exit-only. When omitted or empty, falls
+   * back to exit-code / engine message only — never invents a class.
+   */
+  evidence?:
+    | TrainAdvanceLoopEvidence
+    | null
+    | (() =>
+        | TrainAdvanceLoopEvidence
+        | null
+        | undefined
+        | Promise<TrainAdvanceLoopEvidence | null | undefined>),
 ): Promise<AdvanceOutcome> {
   const previousExit = process.exitCode;
   process.exitCode = 0;
@@ -3058,7 +3073,14 @@ export async function advanceIssueThroughSingle(
     process.exitCode = previousExit ?? 0;
   }
 
-  return classifyTrainAdvanceLabels(await getIssue(issue), exit, undefined, issue);
+  let resolved: TrainAdvanceLoopEvidence | null | undefined;
+  if (typeof evidence === "function") {
+    resolved = await evidence();
+  } else {
+    resolved = evidence;
+  }
+
+  return classifyTrainAdvanceLabels(await getIssue(issue), exit, resolved, issue);
 }
 
 /**
@@ -3094,6 +3116,26 @@ export function classifyTrainAdvanceLabels(
       ? composeTrainAdvanceStopReason(merged, issue)
       : undefined;
 
+  // Non-zero exit / engine failure must not be masked by a success label
+  // (e.g. ready-to-deploy set before the wave engine failed) (#1074 review).
+  // Park terminals (needs-human / blocked) still classify as ok park outcomes
+  // with optional diagnostic — only the success terminal is gated.
+  const advanceFailed =
+    exit !== 0 ||
+    !!merged.engineMessage ||
+    hasStructuredTrainAdvanceEvidence(merged);
+  if (advanceFailed && stage === "ready-to-deploy") {
+    return {
+      ok: false,
+      error:
+        diagnostic ??
+        composeTrainAdvanceStopReason(
+          { exitCode: exit !== 0 ? exit : 1, engineMessage: merged.engineMessage },
+          issue,
+        ),
+    };
+  }
+
   if (stage === "ready-to-deploy") {
     return { ok: true, terminal: "ready-to-deploy", labels: snap.labels };
   }
@@ -3116,11 +3158,7 @@ export function classifyTrainAdvanceLabels(
 
   // Non-zero exit, engine failure message, or structured stop/block evidence
   // without a terminal park label → non-ok with composed reason (#1074).
-  if (
-    exit !== 0 ||
-    !!merged.engineMessage ||
-    hasStructuredTrainAdvanceEvidence(merged)
-  ) {
+  if (advanceFailed) {
     return {
       ok: false,
       error:

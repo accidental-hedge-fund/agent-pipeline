@@ -385,6 +385,68 @@ test("pipeline-cli: nested single failure restores the owning command exit state
   }
 });
 
+test("advanceIssueThroughSingle (#1074): injects loop evidence for non-zero single", async () => {
+  const original = process.exitCode;
+  process.exitCode = 0;
+  try {
+    const result = await advanceIssueThroughSingle(
+      1010,
+      { json: true },
+      async () => ({
+        number: 1010,
+        title: "",
+        body: "",
+        labels: ["pipeline:implementing"],
+        state: "open",
+      }),
+      async () => {
+        process.exitCode = 1;
+      },
+      { stopReason: "supervisor_no_progress", exitCode: 1 },
+    );
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.match(result.error, /supervisor_no_progress/);
+      assert.match(result.error, /1010/);
+      assert.doesNotMatch(
+        result.error,
+        /^(?:advance failed for #\d+: )?pipeline (?:single|advance) exited with code 1$/,
+      );
+    }
+  } finally {
+    process.exitCode = original;
+  }
+});
+
+test("advanceIssueThroughSingle (#1074): evidence reader used after single non-zero", async () => {
+  const original = process.exitCode;
+  process.exitCode = 0;
+  try {
+    const result = await advanceIssueThroughSingle(
+      55,
+      { json: true },
+      async () => ({
+        number: 55,
+        title: "",
+        body: "",
+        labels: ["pipeline:fix"],
+        state: "open",
+      }),
+      async () => {
+        process.exitCode = 1;
+      },
+      async () => ({ stopReason: "supervisor_no_progress", exitCode: 1 }),
+    );
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.match(result.error, /supervisor_no_progress/);
+      assert.match(result.error, /55/);
+    }
+  } finally {
+    process.exitCode = original;
+  }
+});
+
 test("classifyTrainAdvanceLabels (#1074): stop reason beats exit-only", async () => {
   const { classifyTrainAdvanceLabels } = await import("../scripts/pipeline.ts");
   const out = classifyTrainAdvanceLabels(
@@ -436,6 +498,36 @@ test("classifyTrainAdvanceLabels (#1074): blocked class on needs-human diagnosti
     assert.equal(out.terminal, "needs-human");
     assert.match(out.diagnostic ?? "", /recovery_exhausted/);
     assert.match(out.diagnostic ?? "", /839/);
+  }
+});
+
+test("classifyTrainAdvanceLabels (#1074): non-zero exit does not succeed as ready-to-deploy", async () => {
+  const { classifyTrainAdvanceLabels } = await import("../scripts/pipeline.ts");
+  const out = classifyTrainAdvanceLabels(
+    { labels: ["pipeline:ready-to-deploy"] },
+    1,
+    { stopReason: "supervisor_no_progress", exitCode: 1 },
+    99,
+  );
+  assert.equal(out.ok, false);
+  if (!out.ok) {
+    assert.match(out.error, /supervisor_no_progress/);
+    assert.match(out.error, /99/);
+  }
+});
+
+test("classifyTrainAdvanceLabels (#1074): engine failure does not succeed as ready-to-deploy", async () => {
+  const { classifyTrainAdvanceLabels } = await import("../scripts/pipeline.ts");
+  const out = classifyTrainAdvanceLabels(
+    { labels: ["pipeline:ready-to-deploy"] },
+    0,
+    { engineMessage: "loop engine crashed", exitCode: 1 },
+    12,
+  );
+  assert.equal(out.ok, false);
+  if (!out.ok) {
+    assert.match(out.error, /loop engine crashed|advance failed/);
+    assert.match(out.error, /12/);
   }
 });
 
@@ -520,6 +612,91 @@ test("advanceWaveThroughLoop (#1074): engine error without events keeps message,
   if (!outcome!.ok) {
     assert.match(outcome!.error, /hard fail|exited with code|advance failed/);
     assert.doesNotMatch(outcome!.error, /supervisor_no_progress|dependency_deadlock/);
+  }
+});
+
+test("advanceWaveThroughLoop (#1074): engine fail with ready-to-deploy label stays non-ok", async () => {
+  const { advanceWaveThroughLoop } = await import("../scripts/pipeline.ts");
+  const fakeCfg = {
+    repo_dir: "/tmp/repo",
+    repo: "o/r",
+    base_branch: "main",
+    domain: "o-r",
+  };
+  const result = await advanceWaveThroughLoop(
+    [77],
+    {},
+    async () => ({
+      number: 77,
+      title: "t",
+      body: "",
+      // Label advanced to R2D before the wave engine failed — must not mask.
+      labels: ["pipeline:ready-to-deploy"],
+      state: "open",
+    }),
+    async () => ({ kind: "error", message: "wave engine failed after label update" }),
+    () => fakeCfg as never,
+    async () => {
+      throw new Error("events must not be required when no run id");
+    },
+  );
+  const outcome = result.get(77);
+  assert.ok(outcome);
+  assert.equal(outcome!.ok, false, "ready-to-deploy must not mask engine failure");
+  if (!outcome!.ok) {
+    assert.match(outcome!.error, /wave engine failed|advance failed|exited with code/);
+    assert.match(outcome!.error, /77/);
+  }
+});
+
+test("advanceWaveThroughLoop (#1074): stop reason with ready-to-deploy stays non-ok", async () => {
+  const { advanceWaveThroughLoop } = await import("../scripts/pipeline.ts");
+  const fakeCfg = {
+    repo_dir: "/tmp/repo",
+    repo: "o/r",
+    base_branch: "main",
+    domain: "o-r",
+  };
+  const result = await advanceWaveThroughLoop(
+    [88],
+    {},
+    async () => ({
+      number: 88,
+      title: "t",
+      body: "",
+      labels: ["pipeline:ready-to-deploy"],
+      state: "open",
+    }),
+    async () => ({
+      kind: "drive",
+      result: {
+        runId: "loop-r2d-stop",
+        cycles: 1,
+        stop: { reason: "supervisor_no_progress", time: "t" },
+        holdOutstanding: false,
+        allDone: false,
+        resumed: false,
+        heldItemIds: [],
+        dispatched: 0,
+        excludedItemIds: [],
+        exclusionReason: null,
+        completion: null,
+      },
+    }),
+    () => fakeCfg as never,
+    async () => [
+      {
+        kind: "loop_run_stopped",
+        data: { reason: "supervisor_no_progress" },
+      },
+    ],
+  );
+  const outcome = result.get(88);
+  assert.ok(outcome);
+  assert.equal(outcome!.ok, false);
+  if (!outcome!.ok) {
+    assert.match(outcome!.error, /supervisor_no_progress/);
+    assert.match(outcome!.error, /88/);
   }
 });
 
