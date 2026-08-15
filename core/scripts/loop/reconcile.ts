@@ -469,19 +469,23 @@ export async function reconcile(
       items[id] = repaired;
     } else if (
       // Advance-still-needed heal (#1068 / #712 Decision 4 class expansion):
-      // stranded `pr_opened` with open PR that still needs advance (intake-ready,
-      // mid-flight, null stage — not `needs-human`, not R2D) is restored to
-      // dispatchable `in_progress` so the supervisor re-drives it. Runs only when
-      // forward catch-up (merged/ready) did not already apply — those win via
-      // ledger-behind above. Non-forward identity drift (head SHA / PR-number
+      // stranded `pr_opened` OR non-dispatchable local `implemented` with open PR
+      // that still needs advance (intake-ready, mid-flight, null stage — not
+      // `needs-human`, not R2D) is restored to dispatchable `in_progress` so the
+      // supervisor re-drives it. `implemented` is outside both supervisor frontiers
+      // (re-dispatch only covers `in_progress`; admission only covers `pending`),
+      // so crash-after-PR-open residual must not remain parked there (#1068 review-1).
+      // Runs only when forward catch-up (merged/ready) did not already apply — those
+      // win via ledger-behind above. Non-forward identity drift (head SHA / PR-number
       // mismatch, checks regression) MUST NOT suppress this heal: a pre-fix
       // stranded row almost always carries `last_verified_identity`, and ordinary
       // commit/check churn would otherwise leave the item permanently
       // non-dispatchable. Observed drift is still recorded above; heal updates
-      // `last_verified_identity`. Heals only from `pr_opened`, so a second pass
-      // is a no-op once restored (companion local→pr_opened gate prevents
-      // oscillation for advance-still-needed stages).
-      entry.state === "pr_opened" &&
+      // `last_verified_identity`. Heals only from `pr_opened` / `implemented`, so a
+      // second pass is a no-op once restored (companion local→pr_opened gate prevents
+      // oscillation for advance-still-needed stages). `pending` stays schedule-
+      // admissible and is not restored here.
+      (entry.state === "pr_opened" || entry.state === "implemented") &&
       isAdvanceStillNeeded(identity)
     ) {
       const time = deps.now().toISOString();

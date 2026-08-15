@@ -23,7 +23,7 @@ Reconciliation SHALL treat a ledger item at `pr_opened` whose verified identity 
 
 ### Requirement: Reconciliation SHALL restore advance-still-needed pr_opened items to in_progress
 
-When the ledger state is `pr_opened` and the item is advance-still-needed (open PR, not `ready_label_present`, not merged, stage not `needs-human`), reconciliation SHALL restore the item to `in_progress` via an audited ledger history entry (and event) so the supervisor can re-dispatch advance through the normal `in_progress` path. The restore SHALL apply for intake-ready stage `ready`, for mid-flight stages, and for non-mid-flight stages that are still advance-still-needed (including missing/`null` stage when open PR remains and R2D is absent). The restore SHALL apply regardless of non-forward identity drift on the stranded row (`identity-mismatch`, `checks-regressed`), SHALL update `last_verified_identity` to the freshly observed identity, and SHALL be idempotent (second pass leaves `in_progress` without oscillating back to stranded `pr_opened`). Merged PR and `ready_label_present` catch-up SHALL take precedence over this restore.
+When the ledger state is `pr_opened` or non-dispatchable local `implemented` and the item is advance-still-needed (open PR, not `ready_label_present`, not merged, stage not `needs-human`), reconciliation SHALL restore the item to `in_progress` via an audited ledger history entry (and event) so the supervisor can re-dispatch advance through the normal `in_progress` path. The restore SHALL apply for intake-ready stage `ready`, for mid-flight stages, and for non-mid-flight stages that are still advance-still-needed (including missing/`null` stage when open PR remains and R2D is absent). The restore SHALL apply regardless of non-forward identity drift on the stranded row (`identity-mismatch`, `checks-regressed`), SHALL update `last_verified_identity` to the freshly observed identity, and SHALL be idempotent (second pass leaves `in_progress` without oscillating back to stranded `pr_opened` or non-dispatchable `implemented`). Merged PR and `ready_label_present` catch-up SHALL take precedence over this restore. Schedule-admissible `pending` is not restored by this heal.
 
 #### Scenario: Stranded pr_opened at intake-ready heals to in_progress
 
@@ -38,12 +38,19 @@ When the ledger state is `pr_opened` and the item is advance-still-needed (open 
 - **THEN** reconciliation SHALL restore the item to `in_progress`
 - **AND** the item SHALL NOT remain stranded at `pr_opened`
 
+#### Scenario: Crash-after-PR-open implemented heals to in_progress
+
+- **WHEN** the ledger records `implemented` and the verified identity reports open PR, not `ready_label_present`, not merged, and stage is not `needs-human`
+- **THEN** reconciliation SHALL restore the item to `in_progress`
+- **AND** SHALL append a history note that records the advance-still-needed restore
+- **AND** the item SHALL NOT remain at non-dispatchable `implemented` outside every supervisor frontier
+
 #### Scenario: Advance-still-needed heal is idempotent
 
-- **WHEN** an advance-still-needed item has been restored from `pr_opened` to `in_progress`
+- **WHEN** an advance-still-needed item has been restored from `pr_opened` or `implemented` to `in_progress`
 - **AND** reconciliation runs again with the same open PR and still not ready-to-deploy
 - **THEN** the item's state SHALL remain `in_progress`
-- **AND** reconciliation SHALL NOT re-promote the item to stranded `pr_opened`
+- **AND** reconciliation SHALL NOT re-promote the item to stranded `pr_opened` or non-dispatchable `implemented`
 
 #### Scenario: Heal does not override ready or merged catch-up
 
@@ -53,7 +60,7 @@ When the ledger state is `pr_opened` and the item is advance-still-needed (open 
 
 ### Requirement: Reconciliation SHALL NOT repair-forward advance-still-needed local work to stranded pr_opened on open PR alone
 
-When an item's ledger state is a non-remote-proving local state — including `pending`, `in_progress`, and `implemented` — and the verified identity reports an open PR without `ready_label_present` and without a merged PR, and the item is advance-still-needed (stage is not the terminal off-ramp that ends advance eligibility under the advance-still-needed definition, including intake-ready `ready` and mid-flight stages), reconciliation SHALL NOT classify open-PR alone as `ledger-behind` solely to park the item at stranded `pr_opened`, and SHALL NOT repair the ledger state to `pr_opened` when that would leave only non-consuming `next_actions.advance`. The item's local ledger state SHALL remain dispatchable (stay `in_progress` / `pending` / `implemented` as appropriate) so a subsequent supervisor cycle can dispatch or re-dispatch it. True terminal catch-up remains separate and takes precedence: a verified merged PR or ready-to-deploy label may still drive forward repair. This requirement generalizes the mid-flight open-PR gate so intake-ready open PR cannot re-strand a just-healed `in_progress` item.
+When an item's ledger state is a non-remote-proving local state — including `pending`, `in_progress`, and `implemented` — and the verified identity reports an open PR without `ready_label_present` and without a merged PR, and the item is advance-still-needed (stage is not the terminal off-ramp that ends advance eligibility under the advance-still-needed definition, including intake-ready `ready` and mid-flight stages), reconciliation SHALL NOT classify open-PR alone as `ledger-behind` solely to park the item at stranded `pr_opened`, and SHALL NOT repair the ledger state to `pr_opened` when that would leave only non-consuming `next_actions.advance`. Supervisor-dispatchable local states (`in_progress`, schedule-admissible `pending`) SHALL remain on that path. Non-dispatchable local `implemented` that is advance-still-needed SHALL be restored to `in_progress` (same heal as stranded `pr_opened`) so a subsequent supervisor cycle can re-dispatch it. True terminal catch-up remains separate and takes precedence: a verified merged PR or ready-to-deploy label may still drive forward repair. This requirement generalizes the mid-flight open-PR gate so intake-ready open PR cannot re-strand a just-healed `in_progress` item.
 
 #### Scenario: in_progress plus open PR at intake-ready is not repaired to stranded pr_opened
 
@@ -124,11 +131,11 @@ When an item's ledger state is a local non-remote-proving state and the verified
 
 - **WHEN** the ledger records `implemented` (or `in_progress`) and the verified identity reports an open PR with `pipeline_stage` `null` and `ready_label_present` false
 - **THEN** reconciliation SHALL NOT leave the item only at stranded `pr_opened` with non-consuming `advance` after the pass(es) required for restore
-- **AND** the item SHALL be on a path the supervisor can dispatch (remain local, or restore from transitional `pr_opened` to `in_progress`)
+- **AND** the item SHALL be on a path the supervisor can dispatch (`in_progress` re-dispatch path — restore from `implemented` or transitional `pr_opened` to `in_progress`; `in_progress` may remain)
 
 #### Scenario: Local state plus open PR at ready stage still repairs to pr_opened
 
 - **WHEN** the ledger records a local state and the verified identity reports an open PR with `pipeline_stage` `ready` and `ready_label_present` false
-- **THEN** reconciliation SHALL NOT leave the item stranded at `pr_opened` with only non-consuming `advance` after restore
+- **THEN** reconciliation SHALL NOT leave the item stranded at `pr_opened` or non-dispatchable `implemented` with only non-consuming `advance` after restore
 - **AND** SHALL NOT treat intake-ready as terminal completion
 - **AND** SHALL NOT apply the mid-flight-only gate as the sole reason the item remains undriven

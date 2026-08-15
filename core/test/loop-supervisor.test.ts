@@ -3908,6 +3908,35 @@ test("driveSupervisor: next_actions advance never terminates as supervisor_no_pr
   assert.ok(calls.length >= 1, "must have dispatched the advance-eligible item at least once");
 });
 
+test("runSupervisorCycle: implemented + open non-R2D PR heals and dispatches advance (#1068 review-1)", async () => {
+  // Crash-after-PR-open residual: ledger still says implemented while live identity
+  // has an open non-R2D PR. implemented is outside pending admission and in_progress
+  // re-dispatch; reconcile must restore to in_progress and this cycle must dispatch.
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const { deps } = await setup(contract, testLedger({ "100": itemEntry("100", "implemented") }));
+  const calls: LoopExecutionRequest[] = [];
+  const observe = midFlightOpenPrObserve({ "100": "ready" });
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    calls.push(request);
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "blocked",
+      evidence: { pr_number: 1068, pipeline_run_id: `pipeline-run-${request.item_id}` },
+    };
+  };
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
+
+  assert.equal(calls.length, 1, "dispatchItem must run for healed implemented item (dispatched >= 1)");
+  assert.equal(calls[0]!.item_id, "100");
+  assert.equal(calls[0]!.schema, LOOP_EXECUTION_CONTRACT_SCHEMA);
+  const ledger = await readLedger(deps, "run-1");
+  assert.notEqual(ledger.items["100"].state, "implemented", "must not remain outside every dispatch frontier");
+  assert.notEqual(ledger.items["100"].state, "pr_opened", "must not strand at pr_opened");
+});
+
 // ---------------------------------------------------------------------------
 // #770 — loop live-advance coexistence (review 1 regressions)
 // ---------------------------------------------------------------------------

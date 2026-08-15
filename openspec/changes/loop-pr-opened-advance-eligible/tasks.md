@@ -11,6 +11,7 @@
 - [x] 2.3 Generalize local-state open-PR gate so advance-still-needed local work (`in_progress` / `pending` / `implemented`) is not repair-forwarded to stranded `pr_opened` on open PR alone (prevents heal oscillation for intake-ready)
 - [x] 2.4 Keep mid-flight gate behavior as a subset; existing mid-flight tests stay green
 - [x] 2.5 Idempotence: second reconcile leaves healed item at `in_progress` without re-promoting to `pr_opened`
+- [x] 2.6 Restore non-dispatchable advance-still-needed `implemented` to `in_progress` in the same heal path (crash-after-PR-open residual; review-1 #1068)
 
 ## 3. Supervisor: re-dispatch + no-progress guard
 
@@ -26,6 +27,7 @@
 - [x] 4.4 Supervisor execution-trace: intake-ready + `pr_opened` fixture → `dispatchItem` called (`dispatched >= 1`)
 - [x] 4.5 Supervisor: `next_actions: advance` never terminates as `supervisor_no_progress` under consecutive no-progress limit
 - [x] 4.6 All new tests use injected observe/store/supervisor fakes only — no real network, git, or subprocess
+- [x] 4.7 Supervisor execution-trace: `implemented` + open non-R2D PR → heal to `in_progress` and `dispatchItem` called (`dispatched >= 1`)
 
 ## 5. OpenSpec deltas, mirror, CI
 
