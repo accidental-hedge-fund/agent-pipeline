@@ -38,7 +38,8 @@ that dependency-independent items continue while others are gated.
 
 ### Requirement: External pending gates SHALL apply only to remaining admitted external hard waits
 
-When an item still carries ids on `external_depends_on` after hard-wait admission, the
+The engine SHALL apply external pending gates only to ids that remain on
+`external_depends_on` after hard-wait admission. When an item still carries such ids, the
 existing three-valued external verification (satisfied / pending / unsatisfiable) and
 skip/deadlock rules continue to apply to those ids. Population that drops off-selector
 and closed candidates before compile SHALL leave `external_depends_on` empty for those

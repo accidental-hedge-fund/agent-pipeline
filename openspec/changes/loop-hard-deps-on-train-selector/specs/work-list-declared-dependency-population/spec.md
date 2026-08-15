@@ -2,8 +2,8 @@
 
 ### Requirement: Hard waits SHALL be admitted only for open prerequisites on the current work-list selector
 
-After raw declared prerequisites are unioned from authoritative sources, work-list population
-SHALL apply a deterministic **hard-wait admission** step before `depends_on` /
+Work-list population SHALL apply a deterministic **hard-wait admission** step after raw
+declared prerequisites are unioned from authoritative sources, and before `depends_on` /
 `external_depends_on` partition and contract compilation. A candidate prerequisite id for a
 depender SHALL be admitted as a hard wait only when **both** are true:
 
