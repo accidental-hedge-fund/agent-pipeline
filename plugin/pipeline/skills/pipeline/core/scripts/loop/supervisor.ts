@@ -57,7 +57,16 @@ import { blockItem, completeRecoveryAttempt, startRecoveryAttempt, upgradeContra
 import { waitItem } from "./pause.ts";
 import { computeExternalDependencyStatuses, detectDependencyDeadlock, propagateSkips } from "./dependencies.ts";
 import { detectChangedFileOverlap, selectSchedulableSet } from "./schedule.ts";
-import { buildPreconditionExclusion, classifyPreconditionExclusions, excludeContractItems, hasNewLabelEvent, isBlockedInLabels, isPrePipelineStage, pipelineStageFromLabels } from "./precondition.ts";
+import {
+  buildPreconditionExclusion,
+  classifyPreconditionExclusions,
+  excludeContractItems,
+  hasNewLabelEvent,
+  isAdvanceStillNeeded,
+  isBlockedInLabels,
+  isPrePipelineStage,
+  pipelineStageFromLabels,
+} from "./precondition.ts";
 import {
   LOOP_EXECUTION_CONTRACT_SCHEMA,
   normalizeLoopOutcome,
@@ -2710,8 +2719,29 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
       }
 
       if (record.consecutive_no_progress >= limit) {
-        const time = deps.store.now().toISOString();
+        // #1068 defense-in-depth: consecutive no_eligible_item cycles while any
+        // non-done item still has next_actions === "advance" for advance-still-
+        // needed work is a reconcile/dispatch defect surface, not a legitimate
+        // "nothing left to do" terminal. Heal should have restored such items
+        // to in_progress; do not record supervisor_no_progress solely from
+        // empty pending selection while advance remains advertised.
         const ledger = await readLedger(deps.store, input.runId);
+        const nextActions = ledger.last_reconciliation?.next_actions ?? {};
+        const observed = ledger.last_reconciliation?.observed ?? {};
+        const hasAdvanceStillNeeded = contract.items.some((item) => {
+          const entry = ledger.items[item.id];
+          if (!entry || DONE_OR_ABANDONED.has(entry.state)) return false;
+          if (nextActions[item.id] !== "advance") return false;
+          const identity = observed[item.id];
+          // Without a fresh observed identity, treat advertised advance as live
+          // work rather than a false terminal (heal lag / partial reconcile).
+          if (!identity) return true;
+          return isAdvanceStillNeeded(identity);
+        });
+        if (hasAdvanceStillNeeded) {
+          continue;
+        }
+        const time = deps.store.now().toISOString();
         const newLedger: LoopLedger = {
           ...ledger,
           stop: { reason: "supervisor_no_progress", time, outstanding_ready: outstandingReadyItemIds(ledger) },

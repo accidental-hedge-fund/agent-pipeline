@@ -12,6 +12,7 @@ import {
   excludeContractItems,
   hasNewLabelEvent,
   isBlockedInLabels,
+  isAdvanceStillNeeded,
   isMidFlightPipelineStage,
   isPrePipelineStage,
   pipelineStageFromLabels,
@@ -131,6 +132,56 @@ test("isMidFlightPipelineStage: null, backlog, ready, ready-to-deploy, needs-hum
 
 test("isMidFlightPipelineStage: unknown non-null stage is treated as mid-flight", () => {
   assert.equal(isMidFlightPipelineStage("future-stage-not-in-STAGES"), true);
+});
+
+// ---------------------------------------------------------------------------
+// isAdvanceStillNeeded (#1068 advance-still-needed open-PR class)
+// ---------------------------------------------------------------------------
+
+function openPrAdvanceIdentity(overrides: Partial<Parameters<typeof isAdvanceStillNeeded>[0]> = {}) {
+  return {
+    pr_number: 12,
+    pr_state: "open" as const,
+    ready_label_present: false,
+    pipeline_stage: "ready" as string | null,
+    ...overrides,
+  };
+}
+
+test("isAdvanceStillNeeded: intake-ready stage ready is advance-still-needed", () => {
+  assert.equal(isAdvanceStillNeeded(openPrAdvanceIdentity({ pipeline_stage: "ready" })), true);
+});
+
+test("isAdvanceStillNeeded: mid-flight stage is advance-still-needed", () => {
+  assert.equal(isAdvanceStillNeeded(openPrAdvanceIdentity({ pipeline_stage: "fix-2" })), true);
+});
+
+test("isAdvanceStillNeeded: null stage is advance-still-needed", () => {
+  assert.equal(isAdvanceStillNeeded(openPrAdvanceIdentity({ pipeline_stage: null })), true);
+});
+
+test("isAdvanceStillNeeded: ready_label_present (R2D) is not advance-still-needed", () => {
+  assert.equal(
+    isAdvanceStillNeeded(openPrAdvanceIdentity({ pipeline_stage: "ready-to-deploy", ready_label_present: true })),
+    false,
+  );
+  // Intake-ready alone never sets ready_label_present — only ready-to-deploy does.
+  assert.equal(
+    isAdvanceStillNeeded(openPrAdvanceIdentity({ pipeline_stage: "ready", ready_label_present: false })),
+    true,
+  );
+});
+
+test("isAdvanceStillNeeded: needs-human is not advance-still-needed", () => {
+  assert.equal(isAdvanceStillNeeded(openPrAdvanceIdentity({ pipeline_stage: "needs-human" })), false);
+});
+
+test("isAdvanceStillNeeded: merged PR is not advance-still-needed", () => {
+  assert.equal(isAdvanceStillNeeded(openPrAdvanceIdentity({ pr_state: "merged" })), false);
+});
+
+test("isAdvanceStillNeeded: no PR is not advance-still-needed", () => {
+  assert.equal(isAdvanceStillNeeded(openPrAdvanceIdentity({ pr_number: null, pr_state: null })), false);
 });
 
 test("isPrePipelineStage: an in-flight advance-loop stage is admissible", () => {

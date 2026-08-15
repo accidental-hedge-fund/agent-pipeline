@@ -533,17 +533,21 @@ test("exhausting the cycle safety cap while every cycle reports progress records
   // `progress: true` — recurs every single cycle forever: a reconciliation
   // defect or continually changing non-actionable live state, never settling
   // into a stop, hold, or all-done terminal condition on its own.
+  // Stage is needs-human so #1068 advance-still-needed heal does not restore
+  // to in_progress (that class would re-dispatch and exit the spin fixture).
   const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
   const boundIdentity = {
     issue_number: 100,
     issue_open: true,
     ready_label_present: false,
+    blocked_label_present: false,
     pr_number: 12,
     pr_state: "open" as const,
     head_branch: "pipeline/100-x",
     head_sha: "abc123",
     merge_commit_sha: null,
     checks_conclusion: "success" as const,
+    pipeline_stage: "needs-human" as string | null,
     observed_at: "2026-07-23T00:00:00.000Z",
   };
   const ledger = testLedger({
@@ -552,7 +556,7 @@ test("exhausting the cycle safety cap while every cycle reports progress records
   const { deps } = await setup(contract, ledger);
   const observe: ReconcileObserveDeps = {
     async getIssueStateAndLabels() {
-      return { state: "open", labels: [] };
+      return { state: "open", labels: ["pipeline:needs-human"] };
     },
     async findPrForIssue() {
       return 12;
@@ -3797,6 +3801,140 @@ test("runSupervisorCycle: healed pr_opened mid-flight item is re-dispatched via 
   assert.equal(calls[0]!.schema, LOOP_EXECUTION_CONTRACT_SCHEMA);
   // Dispatch goes through existing loop-execution path (live labels), not a restart-from-ready transition.
   assert.equal(calls[0]!.done_definition, "pipeline:ready-to-deploy");
+});
+
+// ---------------------------------------------------------------------------
+// #1068 — intake-ready pr_opened is advance-eligible; no false supervisor_no_progress
+// ---------------------------------------------------------------------------
+
+test("runSupervisorCycle: intake-ready pr_opened heals and dispatches advance (#1068)", async () => {
+  // Live class: ledger pr_opened + pipeline:ready (intake, not R2D) + open PR +
+  // green checks. Pre-fix: next_actions.advance with no consumer → no_eligible_item.
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const { deps } = await setup(contract, testLedger({ "100": itemEntry("100", "pr_opened") }));
+  const calls: LoopExecutionRequest[] = [];
+  const observe = midFlightOpenPrObserve({ "100": "ready" });
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    calls.push(request);
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "blocked",
+      evidence: { pr_number: 1066, pipeline_run_id: `pipeline-run-${request.item_id}` },
+    };
+  };
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
+
+  assert.equal(calls.length, 1, "dispatchItem must run for healed intake-ready item (dispatched >= 1)");
+  assert.equal(calls[0]!.item_id, "100");
+  assert.equal(calls[0]!.schema, LOOP_EXECUTION_CONTRACT_SCHEMA);
+  const ledger = await readLedger(deps, "run-1");
+  assert.notEqual(ledger.items["100"].state, "pr_opened", "must not remain stranded at pr_opened");
+});
+
+test("runSupervisorCycle: healed intake-ready item is re-dispatched before pending sibling (#1068)", async () => {
+  const contract = testContract({
+    items: [
+      { id: "100", depends_on: [] },
+      { id: "200", depends_on: [] },
+    ],
+  });
+  const { deps } = await setup(
+    contract,
+    testLedger({
+      "100": itemEntry("100", "pr_opened"),
+      "200": itemEntry("200", "pending"),
+    }),
+  );
+  const calls: LoopExecutionRequest[] = [];
+  const observe = midFlightOpenPrObserve({ "100": "ready" });
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    calls.push(request);
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "blocked",
+      evidence: { pr_number: request.item_id === "100" ? 1066 : null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+    };
+  };
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
+
+  assert.ok(
+    calls.some((c) => c.item_id === "100"),
+    "execution call trace must include dispatch for healed intake-ready item A",
+  );
+  assert.equal(
+    calls.filter((c) => c.item_id === "200").length,
+    0,
+    "with max_active_items=1 and active in_progress after heal, pending sibling must not start this cycle",
+  );
+});
+
+test("driveSupervisor: next_actions advance never terminates as supervisor_no_progress (#1068)", async () => {
+  // Pre-fix: pr_opened + intake-ready → six no_eligible_item → supervisor_no_progress.
+  // Tight consecutive limit proves the false terminal cannot fire while work remains.
+  const contract = testContract({
+    items: [{ id: "100", depends_on: [] }],
+    consecutive_no_progress_limit: 2,
+  });
+  const { deps } = await setup(contract, testLedger({ "100": itemEntry("100", "pr_opened") }));
+  const calls: LoopExecutionRequest[] = [];
+  const observe = midFlightOpenPrObserve({ "100": "ready" });
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    calls.push(request);
+    // Keep item non-terminal so drive continues; blocked still counts as cycle progress.
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "blocked",
+      evidence: { pr_number: 1066, pipeline_run_id: `pipeline-run-${request.item_id}` },
+    };
+  };
+  const result = await driveSupervisor(
+    { store: deps, observe, dispatchItem },
+    { runId: "run-1", engine: "claude", consecutiveNoProgressLimit: 2, maxCycles: 4 },
+  );
+
+  assert.notEqual(
+    result.stop?.reason,
+    "supervisor_no_progress",
+    "must not stop supervisor_no_progress while intake-ready open PR still needs advance",
+  );
+  assert.ok(calls.length >= 1, "must have dispatched the advance-eligible item at least once");
+});
+
+test("runSupervisorCycle: implemented + open non-R2D PR heals and dispatches advance (#1068 review-1)", async () => {
+  // Crash-after-PR-open residual: ledger still says implemented while live identity
+  // has an open non-R2D PR. implemented is outside pending admission and in_progress
+  // re-dispatch; reconcile must restore to in_progress and this cycle must dispatch.
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const { deps } = await setup(contract, testLedger({ "100": itemEntry("100", "implemented") }));
+  const calls: LoopExecutionRequest[] = [];
+  const observe = midFlightOpenPrObserve({ "100": "ready" });
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    calls.push(request);
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "blocked",
+      evidence: { pr_number: 1068, pipeline_run_id: `pipeline-run-${request.item_id}` },
+    };
+  };
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
+
+  assert.equal(calls.length, 1, "dispatchItem must run for healed implemented item (dispatched >= 1)");
+  assert.equal(calls[0]!.item_id, "100");
+  assert.equal(calls[0]!.schema, LOOP_EXECUTION_CONTRACT_SCHEMA);
+  const ledger = await readLedger(deps, "run-1");
+  assert.notEqual(ledger.items["100"].state, "implemented", "must not remain outside every dispatch frontier");
+  assert.notEqual(ledger.items["100"].state, "pr_opened", "must not strand at pr_opened");
 });
 
 // ---------------------------------------------------------------------------
