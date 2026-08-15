@@ -1110,6 +1110,16 @@ export async function compileWorkListRunFresh(
       prerequisite: e.prerequisite,
       sources: [...e.sources],
     })),
+    // Hard-wait admission audit (#1073): off-selector / closed / not-open refs.
+    ...(discovery.ignored_deps.length > 0
+      ? {
+          ignored_deps: discovery.ignored_deps.map((d) => ({
+            depender: d.depender,
+            target: d.target,
+            reason: d.reason,
+          })),
+        }
+      : {}),
   };
   return { contract, ledger, discovery };
 }

@@ -17,7 +17,12 @@ import {
   isCanonicalIssueId,
   parseDeclaredDependencyIds,
 } from "../declared-dependency-grammar.ts";
-import { getIssueDetail, type GhApiRunner } from "../gh.ts";
+import {
+  getIssueDetail,
+  getPrDetail,
+  getPrForIssueAnyState,
+  type GhApiRunner,
+} from "../gh.ts";
 import type { PipelineConfig } from "../types.ts";
 import { type RawContractItem } from "./dependencies.ts";
 import { LoopError } from "./types.ts";
@@ -72,11 +77,109 @@ export interface DeclaredEdgeProvenance {
   sources: DependencyEdgeSource[];
 }
 
+/**
+ * Stable reason codes when a raw declared prerequisite is not admitted as a
+ * hard wait (#1073, capability `work-list-declared-dependency-population`).
+ */
+export type IgnoredDepReason = "not_on_selector" | "closed" | "not_open";
+
+/** Structured audit record for a non-admitted declared dependency. */
+export interface IgnoredDep {
+  depender: string;
+  target: string;
+  reason: IgnoredDepReason;
+}
+
+/**
+ * Observed open/closed class for hard-wait admission. `closed` covers
+ * issue-closed and linked-PR-merged satisfaction (closed/merged-class).
+ * `not_open` covers unobservable, missing, or any non-open class that is not
+ * a clean closed/merged class.
+ */
+export type PrerequisiteOpenClass = "open" | "closed" | "not_open";
+
+/**
+ * Live observation for hard-wait admission (#1073). `"merged"` means a linked
+ * PR is merged (issue may still be open) — maps to closed/merged-class ignore.
+ */
+export type PrerequisiteObservation = "open" | "closed" | "merged" | null;
+
+/** One raw directed edge before hard-wait admission. */
+export interface RawDeclaredEdge {
+  depender: string;
+  prerequisite: string;
+}
+
+/**
+ * Pure hard-wait admission (#1073): a declared prerequisite becomes a hard wait
+ * only when the target is **open** (not closed, not satisfied via merged linked
+ * PR) and a member of the current work-list / train selector snapshot.
+ * Non-admitted candidates are returned as `ignored_dep` records with stable
+ * reason codes. Does not invent edges.
+ */
+export function admitHardWaits(
+  edges: readonly RawDeclaredEdge[],
+  selectorIds: ReadonlySet<string>,
+  openState: ReadonlyMap<string, PrerequisiteOpenClass>,
+): { admitted: RawDeclaredEdge[]; ignored: IgnoredDep[] } {
+  const admitted: RawDeclaredEdge[] = [];
+  const ignored: IgnoredDep[] = [];
+  const seenIgnored = new Set<string>();
+  const seenAdmitted = new Set<string>();
+
+  for (const edge of edges) {
+    const { depender, prerequisite: target } = edge;
+    if (!isCanonicalIssueId(depender) || !isCanonicalIssueId(target)) continue;
+    if (depender === target) continue;
+
+    const state = openState.get(target) ?? "not_open";
+    let reason: IgnoredDepReason | null = null;
+    // Closed/merged-class wins for audit when observed, even off-selector.
+    // Off-selector (open or unobserved) is not_on_selector so ship-path
+    // forensics name the train membership rule. On-selector not-open stays
+    // not_open.
+    if (state === "closed") {
+      reason = "closed";
+    } else if (!selectorIds.has(target)) {
+      reason = "not_on_selector";
+    } else if (state !== "open") {
+      reason = "not_open";
+    }
+
+    if (reason) {
+      const key = `${depender}:${target}:${reason}`;
+      if (!seenIgnored.has(key)) {
+        seenIgnored.add(key);
+        ignored.push({ depender, target, reason });
+      }
+      continue;
+    }
+
+    const admitKey = `${depender}:${target}`;
+    if (seenAdmitted.has(admitKey)) continue;
+    seenAdmitted.add(admitKey);
+    admitted.push({ depender, prerequisite: target });
+  }
+
+  ignored.sort((a, b) => {
+    if (a.depender !== b.depender) return a.depender.localeCompare(b.depender, "en");
+    if (a.target !== b.target) return a.target.localeCompare(b.target, "en");
+    return a.reason.localeCompare(b.reason, "en");
+  });
+
+  return { admitted, ignored };
+}
+
 /** Result of declared-dependency discovery for a work-list snapshot. */
 export interface DeclaredDependencyDiscoveryResult {
   items: RawContractItem[];
   observations: SourceObservation[];
   edge_provenance: DeclaredEdgeProvenance[];
+  /**
+   * Declared prerequisites dropped by hard-wait admission (off-selector, closed,
+   * or not open). Empty when every raw edge was admitted (#1073).
+   */
+  ignored_deps: IgnoredDep[];
   /** True when any enabled observation is unavailable or incomplete. */
   has_incomplete: boolean;
 }
@@ -190,13 +293,25 @@ export interface WorkListDependencyDiscoverDeps {
    * Null means the source was enabled but could not be fully observed.
    */
   getRoadmapDeclaredEdges?(): Promise<readonly RoadmapDeclaredEdge[] | null>;
+  /**
+   * Open/closed/merged observation for hard-wait admission (#1073). Returns
+   * `"open"`, `"closed"` (issue closed), `"merged"` (linked PR merged — issue
+   * may still be open), or `null` when the issue cannot be observed
+   * (`not_open`). When omitted, discovery treats every candidate as open so
+   * selector membership alone decides admission (closed/merged-class reasons
+   * require a seam).
+   */
+  getIssueOpenState?(issueNumber: number): Promise<PrerequisiteObservation>;
 }
 
 /**
  * Resolves declared raw dependencies for each work-list issue id by unioning
  * successfully observed edges from lexical body/title conventions, native
- * blockedBy, and optional roadmap edges. Returns observation records and edge
- * provenance alongside raw items. Does not invent edges from list order.
+ * blockedBy, and optional roadmap edges; then applies **hard-wait admission**
+ * so only open prerequisites on the current selector remain on `depends_on`
+ * (#1073). Off-selector / closed / not-open candidates become `ignored_deps`
+ * and never land on `external_depends_on` after compile. Does not invent edges
+ * from list order.
  *
  * Callers that admit a fresh multi-item run must refuse when
  * `result.has_incomplete` is true (see {@link assertDiscoveryCompleteForAdmission}).
@@ -206,7 +321,7 @@ export async function discoverDeclaredDependencies(
   deps: WorkListDependencyDiscoverDeps,
 ): Promise<DeclaredDependencyDiscoveryResult> {
   const observations: SourceObservation[] = [];
-  // depender → prerequisite → contributing sources
+  // depender → prerequisite → contributing sources (raw union, pre-admission)
   const provenance = new Map<string, Map<string, Set<DependencyEdgeSource>>>();
 
   const addEdge = (depender: string, prerequisite: string, source: DependencyEdgeSource): void => {
@@ -227,7 +342,6 @@ export async function discoverDeclaredDependencies(
 
   // --- Roadmap (list-level) ---
   const roadmapEnabled = typeof deps.getRoadmapDeclaredEdges === "function";
-  const roadmapByDepender = new Map<string, string[]>();
   if (roadmapEnabled) {
     try {
       const edges = await deps.getRoadmapDeclaredEdges!();
@@ -242,9 +356,6 @@ export async function discoverDeclaredDependencies(
             continue;
           }
           if (edge.depender === edge.prerequisite) continue;
-          const list = roadmapByDepender.get(edge.depender) ?? [];
-          if (!list.includes(edge.prerequisite)) list.push(edge.prerequisite);
-          roadmapByDepender.set(edge.depender, list);
           addEdge(edge.depender, edge.prerequisite, "roadmap-declared");
           edgeCount += 1;
         }
@@ -340,15 +451,55 @@ export async function discoverDeclaredDependencies(
     }
   }
 
+  // --- Hard-wait admission (#1073): open + on selector only ---
+  const selectorIds = new Set(issueIds.filter((id) => isCanonicalIssueId(id)));
+  const rawEdges: RawDeclaredEdge[] = [];
+  for (const [depender, byPrereq] of provenance) {
+    for (const prerequisite of byPrereq.keys()) {
+      rawEdges.push({ depender, prerequisite });
+    }
+  }
+
+  const openState = new Map<string, PrerequisiteOpenClass>();
+  const candidateTargets = new Set(rawEdges.map((e) => e.prerequisite));
+  const observeOpen = typeof deps.getIssueOpenState === "function";
+  for (const target of candidateTargets) {
+    if (!observeOpen) {
+      // No seam: assume open so selector membership is the sole filter.
+      openState.set(target, "open");
+      continue;
+    }
+    try {
+      const observed = await deps.getIssueOpenState!(Number(target));
+      // Issue closed OR linked-PR-merged → closed/merged-class (not a hard wait).
+      if (observed === "open") openState.set(target, "open");
+      else if (observed === "closed" || observed === "merged") openState.set(target, "closed");
+      else openState.set(target, "not_open");
+    } catch {
+      openState.set(target, "not_open");
+    }
+  }
+
+  const { admitted, ignored } = admitHardWaits(rawEdges, selectorIds, openState);
+  const admittedSet = new Set(admitted.map((e) => `${e.depender}:${e.prerequisite}`));
+
+  // items / provenance only for admitted hard waits
+  const admittedByDepender = new Map<string, string[]>();
+  for (const edge of admitted) {
+    const list = admittedByDepender.get(edge.depender) ?? [];
+    list.push(edge.prerequisite);
+    admittedByDepender.set(edge.depender, list);
+  }
+
   const items: RawContractItem[] = issueIds.map((id) => {
-    const byPrereq = provenance.get(id);
-    const depends_on = byPrereq ? [...byPrereq.keys()] : [];
+    const depends_on = admittedByDepender.get(id) ?? [];
     return { id, depends_on };
   });
 
   const edge_provenance: DeclaredEdgeProvenance[] = [];
   for (const [depender, byPrereq] of provenance) {
     for (const [prerequisite, sources] of byPrereq) {
+      if (!admittedSet.has(`${depender}:${prerequisite}`)) continue;
       edge_provenance.push({
         depender,
         prerequisite,
@@ -364,7 +515,13 @@ export async function discoverDeclaredDependencies(
 
   const has_incomplete = observations.some((o) => isIncompleteStatus(o.status));
 
-  return { items, observations, edge_provenance, has_incomplete };
+  return {
+    items,
+    observations,
+    edge_provenance,
+    ignored_deps: ignored,
+    has_incomplete,
+  };
 }
 
 /**
@@ -410,10 +567,16 @@ const BLOCKED_BY_MAX_PAGES = 50;
 const ISSUE_DEP_SOURCES_QUERY =
   "query($owner:String!,$repo:String!,$n:Int!,$after:String){" +
   "repository(owner:$owner,name:$repo){issue(number:$n){" +
-  "title body " +
+  "title body state " +
   `blockedBy(first:${BLOCKED_BY_PAGE_SIZE},after:$after){` +
   "pageInfo{hasNextPage endCursor}nodes{... on Issue{number}}" +
   "}}}}";
+
+/** Lightweight state-only query for hard-wait admission of off-list targets. */
+const ISSUE_OPEN_STATE_QUERY =
+  "query($owner:String!,$repo:String!,$n:Int!){" +
+  "repository(owner:$owner,name:$repo){issue(number:$n){state}}" +
+  "}";
 
 interface BlockedByPage {
   pageInfo?: { hasNextPage?: boolean; endCursor?: string | null } | null;
@@ -426,11 +589,31 @@ interface IssueDepSourcesPayload {
       issue?: {
         title?: string | null;
         body?: string | null;
+        state?: string | null;
         blockedBy?: BlockedByPage | null;
       } | null;
     } | null;
   };
   errors?: unknown[];
+}
+
+interface IssueOpenStatePayload {
+  data?: {
+    repository?: {
+      issue?: {
+        state?: string | null;
+      } | null;
+    } | null;
+  };
+  errors?: unknown[];
+}
+
+function openClassFromGraphqlState(state: string | null | undefined): "open" | "closed" | null {
+  if (!state) return null;
+  const upper = state.toUpperCase();
+  if (upper === "OPEN") return "open";
+  if (upper === "CLOSED") return "closed";
+  return null;
 }
 
 /** Collect valid positive issue numbers from a blockedBy page, first-seen order. */
@@ -453,6 +636,9 @@ export function collectBlockedByIssueNumbers(
  * `getIssueDetail` for text when GraphQL is unavailable. Roadmap edges default
  * to none unless the caller injects `getRoadmapDeclaredEdges`.
  *
+ * Hard-wait open-state observation also treats a merged linked PR as
+ * closed/merged-class satisfaction (even when the issue is still open).
+ *
  * Incomplete pagination throws (does not cache a truncated set). Null cache
  * entries mean the issue was unobservable — callers classify as unavailable.
  */
@@ -463,17 +649,41 @@ export function realWorkListDependencyDiscoverDeps(
     getIssueTitleBody?: WorkListDependencyDiscoverDeps["getIssueTitleBody"];
     getBlockedByIssueNumbers?: WorkListDependencyDiscoverDeps["getBlockedByIssueNumbers"];
     getRoadmapDeclaredEdges?: WorkListDependencyDiscoverDeps["getRoadmapDeclaredEdges"];
+    getIssueOpenState?: WorkListDependencyDiscoverDeps["getIssueOpenState"];
+    /** Injectable linked-PR lookup for merged-PR satisfaction (#1073 r1). */
+    findPrForIssue?: (issueNumber: number) => Promise<number | null>;
+    /** Injectable PR state for merged-PR satisfaction (#1073 r1). */
+    getPrState?: (prNumber: number) => Promise<"open" | "closed" | "merged" | null>;
   } = {},
 ): WorkListDependencyDiscoverDeps {
   type Cached = {
     title: string;
     body: string;
+    /** Null when open/closed was not observed with this cache row. */
+    openState: "open" | "closed" | null;
     /** Null when native blockedBy was not fully observed (e.g. REST-only fallback). */
     blockedBy: number[] | null;
   };
   const cache = new Map<number, Cached | null>();
+  /** Open-state cache for targets that never loaded full dep sources. */
+  const openStateOnly = new Map<number, "open" | "closed" | null>();
+  /** Admission observation cache (includes merged-linked-PR class). */
+  const admissionStateCache = new Map<number, PrerequisiteObservation>();
 
   const runGhApi: GhApiRunner = options.runGhApi ?? defaultGhApiRunner;
+  const findPrForIssue =
+    options.findPrForIssue ??
+    ((issueNumber: number) => getPrForIssueAnyState(cfg, issueNumber, runGhApi));
+  const getPrState =
+    options.getPrState ??
+    (async (prNumber: number): Promise<"open" | "closed" | "merged" | null> => {
+      try {
+        const detail = await getPrDetail(cfg, prNumber);
+        return detail.state;
+      } catch {
+        return null;
+      }
+    });
 
   async function load(issueNumber: number): Promise<Cached | null> {
     if (cache.has(issueNumber)) return cache.get(issueNumber)!;
@@ -509,6 +719,7 @@ export function realWorkListDependencyDiscoverDeps(
     let after: string | null = null;
     let title = "";
     let body = "";
+    let openState: "open" | "closed" | null = null;
 
     for (let page = 0; page < BLOCKED_BY_MAX_PAGES; page++) {
       const args = [
@@ -541,11 +752,12 @@ export function realWorkListDependencyDiscoverDeps(
       if (page === 0) {
         title = issue.title ?? "";
         body = issue.body ?? "";
+        openState = openClassFromGraphqlState(issue.state);
       }
       const connection = issue.blockedBy;
       collectBlockedByIssueNumbers(connection?.nodes, seen, blockedBy);
       if (!connection?.pageInfo?.hasNextPage) {
-        return { title, body, blockedBy };
+        return { title, body, openState, blockedBy };
       }
       after = connection.pageInfo.endCursor ?? null;
       if (!after) {
@@ -567,9 +779,52 @@ export function realWorkListDependencyDiscoverDeps(
       const detail = await getIssueDetail(cfg, issueNumber);
       // REST has no blockedBy connection — mark native as unobserved (null),
       // never as an authoritative empty list (#905).
-      return { title: detail.title, body: detail.body ?? "", blockedBy: null };
+      const openState =
+        detail.state === "closed" ? "closed" : detail.state === "open" ? "open" : null;
+      return { title: detail.title, body: detail.body ?? "", openState, blockedBy: null };
     } catch {
       return null;
+    }
+  }
+
+  async function loadOpenStateOnly(issueNumber: number): Promise<"open" | "closed" | null> {
+    if (openStateOnly.has(issueNumber)) return openStateOnly.get(issueNumber)!;
+    const [owner, repoName] = cfg.repo.split("/");
+    if (!owner || !repoName) {
+      openStateOnly.set(issueNumber, null);
+      return null;
+    }
+    try {
+      const stdout = await runGhApi([
+        "api",
+        "graphql",
+        "-f",
+        `query=${ISSUE_OPEN_STATE_QUERY}`,
+        "-F",
+        `owner=${owner}`,
+        "-F",
+        `repo=${repoName}`,
+        "-F",
+        `n=${issueNumber}`,
+      ]);
+      const payload = JSON.parse(stdout) as IssueOpenStatePayload;
+      if (payload.errors && Array.isArray(payload.errors) && payload.errors.length > 0) {
+        throw new Error("GraphQL errors");
+      }
+      const state = openClassFromGraphqlState(payload.data?.repository?.issue?.state);
+      openStateOnly.set(issueNumber, state);
+      return state;
+    } catch {
+      try {
+        const detail = await getIssueDetail(cfg, issueNumber);
+        const state =
+          detail.state === "closed" ? "closed" : detail.state === "open" ? "open" : null;
+        openStateOnly.set(issueNumber, state);
+        return state;
+      } catch {
+        openStateOnly.set(issueNumber, null);
+        return null;
+      }
     }
   }
 
@@ -586,6 +841,54 @@ export function realWorkListDependencyDiscoverDeps(
         const row = await load(issueNumber);
         if (!row) return null;
         return row.blockedBy;
+      }),
+    getIssueOpenState:
+      options.getIssueOpenState ??
+      (async (issueNumber): Promise<PrerequisiteObservation> => {
+        if (admissionStateCache.has(issueNumber)) {
+          return admissionStateCache.get(issueNumber)!;
+        }
+
+        // Prefer issue open/closed from full-cache row when discovery already loaded it.
+        let issueState: "open" | "closed" | null;
+        if (cache.has(issueNumber)) {
+          const row = cache.get(issueNumber);
+          if (!row) {
+            admissionStateCache.set(issueNumber, null);
+            return null;
+          }
+          issueState = row.openState;
+        } else {
+          issueState = await loadOpenStateOnly(issueNumber);
+        }
+
+        if (issueState === "closed") {
+          admissionStateCache.set(issueNumber, "closed");
+          return "closed";
+        }
+        if (issueState !== "open") {
+          admissionStateCache.set(issueNumber, null);
+          return null;
+        }
+
+        // Issue still open: linked merged PR satisfies the prerequisite
+        // (closed/merged-class) so it is not admitted as a hard wait (#1073).
+        try {
+          const prNumber = await findPrForIssue(issueNumber);
+          if (prNumber !== null) {
+            const prState = await getPrState(prNumber);
+            if (prState === "merged") {
+              admissionStateCache.set(issueNumber, "merged");
+              return "merged";
+            }
+          }
+        } catch {
+          // PR observation failure does not invent satisfaction — fall through
+          // to open (fail closed toward hard wait, never toward "satisfied").
+        }
+
+        admissionStateCache.set(issueNumber, "open");
+        return "open";
       }),
     getRoadmapDeclaredEdges: options.getRoadmapDeclaredEdges,
   };

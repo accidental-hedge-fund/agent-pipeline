@@ -421,12 +421,31 @@ export interface DependencyEdgeProvenance {
 }
 
 /**
+ * Stable reason when a declared prerequisite is not admitted as a hard wait
+ * (#1073). See work-list hard-wait admission.
+ */
+export type IgnoredDepReason = "not_on_selector" | "closed" | "not_open";
+
+/** Audit record for a non-admitted declared dependency (#1073). */
+export interface IgnoredDepRecord {
+  depender: string;
+  target: string;
+  reason: IgnoredDepReason;
+}
+
+/**
  * Additive discovery audit attached to a freshly compiled contract (#905).
  * Absent on older on-disk contracts — resume must not re-discover or rewrite.
  */
 export interface DependencyDiscoveryAudit {
   observations: DependencyDiscoveryObservation[];
   edge_provenance: DependencyEdgeProvenance[];
+  /**
+   * Declared prerequisites dropped by hard-wait admission (off-selector /
+   * closed / not open). Absent or empty on older contracts and when every
+   * raw edge was admitted (#1073).
+   */
+  ignored_deps?: IgnoredDepRecord[];
 }
 
 export interface LoopContract {

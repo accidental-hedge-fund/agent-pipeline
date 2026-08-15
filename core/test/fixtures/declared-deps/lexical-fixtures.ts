@@ -117,4 +117,64 @@ export const LEXICAL_FIXTURE_ROWS: readonly LexicalFixtureRow[] = [
     text: "Depends on #8 #9",
     expected: ["8", "9"],
   },
+  // Soft related-work sections (#1073): bare #N is never a lexical prerequisite.
+  // Phrase forms still extract wherever they appear.
+  {
+    name: "Related section bare ref is not a dependency",
+    text: [
+      "## Related",
+      "See also #822 for later-milestone dogfood.",
+      "History of #100 is useful context.",
+    ].join("\n"),
+    expected: [],
+  },
+  {
+    name: "See also heading bare ref is not a dependency",
+    text: ["## See also", "Track #607 and #608 on the next train."].join("\n"),
+    expected: [],
+  },
+  {
+    name: "Dogfood / Later milestone bare refs are not dependencies",
+    text: [
+      "## Dogfood",
+      "Pairs with #838 and #839.",
+      "",
+      "## Later milestone",
+      "Deferred work lives in #999.",
+    ].join("\n"),
+    expected: [],
+  },
+  {
+    name: "Related work heading bare ref is not a dependency",
+    text: ["## Related work", "Companion issue #422 is out of scope."].join("\n"),
+    expected: [],
+  },
+  {
+    name: "phrase under soft Related still extracts",
+    text: ["## Related", "Depends on: #599 for the real hard wait."].join("\n"),
+    expected: ["599"],
+  },
+  {
+    name: "Dependencies section bare refs remain lexical candidates",
+    text: [
+      "## Dependencies",
+      "#607 must land first.",
+      "Also see #822 (may be off-train; admission decides hard wait).",
+    ].join("\n"),
+    expected: ["607", "822"],
+  },
+  {
+    name: "soft section next to Dependencies keeps bare refs only in dep section",
+    text: [
+      "## Related",
+      "See #822.",
+      "",
+      "## Dependencies",
+      "#599",
+      "",
+      "## Acceptance",
+      "Mentions #300 only in acceptance prose.",
+    ].join("\n"),
+    expected: ["599"],
+  },
 ];

@@ -66,9 +66,16 @@ function consumeReferenceList(text: string, start: number): string[] {
  * Matches:
  * - Case-insensitive phrases: `depends on|requires|blocked by|needs` + optional
  *   `:` + a reference list of one or more `#N` (comma / `and` / whitespace
- *   separated). Every listed reference is preserved.
+ *   separated). Every listed reference is preserved. Phrase forms match
+ *   anywhere in free text, including under soft related-work headings.
  * - `#N` references under a `## Dependency` / `## Dependencies` (any ATX level)
  *   section body (until the next ATX heading)
+ *
+ * Soft related-work sections (`Related`, `Related work`, `See also`, `Dogfood`,
+ * `Later`, `Later milestone`, and clear title variants) are **not** dependency
+ * sections — bare `#N` there is never a lexical prerequisite (#1073). Admission
+ * to a hard wait (open + on the current train/work-list selector) is owned by
+ * work-list population, not by this grammar.
  *
  * Ignores self-references when `selfId` is provided, non-canonical ids, and
  * bare `#N` mentions outside phrase or dependency-section context. Returns
