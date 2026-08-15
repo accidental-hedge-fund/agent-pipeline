@@ -73,7 +73,7 @@ under operator authority. This repository does not ship a Hermes/Buzz factory
 control plane, grant schema, or second durable scheduler. Merge authority is
 not repository configuration (`.github/pipeline.yml` cannot authorize merges).
 Do not add an `auto_merge` key or merge stage. In the current Grok factory
-profile, Grok planning, implementation, and fixes use only `grok-4.5`, with no Grok fallback. Codex performs review.
+profile, Grok planning, implementation, and fixes use only `grok-4.6`, with no Grok fallback. Codex performs review.
 
 ## Modes
 

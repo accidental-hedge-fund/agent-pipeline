@@ -107,7 +107,7 @@ Repository content in `.github/pipeline.yml` cannot authorize merges or set
 Portable supervisor contract (intent → CLI, status JSON, multi-platform bootstrap):
 [supervisor.md](./supervisor.md). Thin examples: [`examples/supervisor/`](../examples/supervisor/).
 
-The current Grok profile must use exactly `grok-4.5` for planning,
+The current Grok profile must use exactly `grok-4.6` for planning,
 implementation, and fixes. It has no Grok fallback. Codex remains the reviewer.
 Product direction: [factory-simplification-plan.md](./factory-simplification-plan.md).
 

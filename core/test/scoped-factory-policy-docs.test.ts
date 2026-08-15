@@ -47,14 +47,14 @@ test("README and concepts describe CLI composition without a grant factory", () 
   assert.match(readme, /examples\/supervisor/);
   assert.match(readme, /cannot authorize\s+merges/i);
   assert.match(readme, /cannot set `auto_merge`/i);
-  assert.match(readme, /`grok-4\.5`, with no Grok model fallback/i);
+  assert.match(readme, /`grok-4\.6`, with no Grok model fallback/i);
   assert.match(readme, /factory-simplification-plan\.md/);
 
   const concepts = read("docs/concepts.md");
   assert.match(concepts, /External supervisors \(compose the CLI\)/);
   assert.match(concepts, /does not ship a Hermes\/Buzz(?:\/Slack)?\s+factory control\s+plane/i);
   assert.match(concepts, /supervisor\.md/);
-  assert.match(concepts, /exactly `grok-4\.5`/i);
+  assert.match(concepts, /exactly `grok-4\.6`/i);
   assert.match(concepts, /no Grok fallback/i);
 });
 
@@ -67,7 +67,7 @@ test("all host skills keep merge loop-isolated without a grant factory", () => {
     const source = read(relPath);
     assertMergeIsolation(source, relPath);
     assert.match(source, /merge-queue`? is dry-run by default/i);
-    assert.match(source, /only `grok-4\.5`, with no Grok fallback/i);
+    assert.match(source, /only `grok-4\.6`, with no Grok fallback/i);
   }
 });
 
@@ -132,7 +132,7 @@ test("the repository does not ship the Hermes factory pilot package", () => {
   assert.doesNotMatch(pkg.scripts?.ci ?? "", /ci:ops/, "default ci must not call ci:ops");
 });
 
-test("the repository factory profile pins only grok-4.5 for Grok roles", () => {
+test("the repository factory profile pins only grok-4.6 for Grok roles", () => {
   const source = read(".github/pipeline.yml");
   const parsed = yaml.load(source) as {
     harnesses?: { implementer?: string; reviewer?: string };
@@ -148,7 +148,7 @@ test("the repository factory profile pins only grok-4.5 for Grok roles", () => {
       parsed.models?.intake,
       parsed.models?.sweep,
     ],
-    ["grok-4.5", "grok-4.5", "grok-4.5", "grok-4.5", "grok-4.5"],
+    ["grok-4.6", "grok-4.6", "grok-4.6", "grok-4.6", "grok-4.6"],
   );
-  assert.doesNotMatch(source, /grok-(?!4\.5\b)[\w.-]+/i, "no other Grok model may be configured");
+  assert.doesNotMatch(source, /grok-(?!4\.6\b)[\w.-]+/i, "no other Grok model may be configured");
 });

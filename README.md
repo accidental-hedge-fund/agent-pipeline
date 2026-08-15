@@ -122,7 +122,7 @@ thin examples under [`examples/supervisor/`](examples/supervisor/) (shell, Herme
 OpenClaw, Slack notes). Adapters only map intent → CLI.
 
 For the current Grok profile, planning, implementation, and fixes use only
-`grok-4.5`, with no Grok model fallback. Codex performs independent review. See
+`grok-4.6`, with no Grok model fallback. Codex performs independent review. See
 [the factory simplification plan](docs/factory-simplification-plan.md) for product
 direction.
 

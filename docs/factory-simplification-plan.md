@@ -60,7 +60,7 @@ Harvested invariants (still product goals):
 
 - FRG / `factory-gate` / `factory-pin` CLI used for release quality of this repo
 - Dependency discovery, loop engine, merge gates
-- Grok `grok-4.5` model pins in `.github/pipeline.yml` when that is the configured profile
+- Grok `grok-4.6` model pins in `.github/pipeline.yml` when that is the configured profile
 
 ## Historical pilot docs
 
