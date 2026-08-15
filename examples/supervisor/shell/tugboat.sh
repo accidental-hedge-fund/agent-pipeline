@@ -5,10 +5,11 @@
 #   train --milestone --merge  →  release  →  wait CI green  →  release finish
 #   →  wait GitHub Release  →  engine-promote --host all
 #
-# No train-completion JSON archaeology beyond the existing resume helper, no
-# second merge policy, no grant factory, no `pipeline ship` subcommand, no
-# parallel "ship brain". The Pipeline engine owns every decision; Tugboat
-# sequences and reports.
+# `--merge` train is **serial** (#1063): merge-first R2D, one implement, STOP on
+# blocked/needs-human. Never `pipeline single` / `pipeline loop` for a milestone
+# ship — that is the PR farm. Loop frontiers stay on `pipeline loop` only.
+#
+# No second merge policy, no grant factory, no `pipeline ship` subcommand.
 #
 # Usage:
 #   tugboat.sh --milestone v1.37.0 [--detach]

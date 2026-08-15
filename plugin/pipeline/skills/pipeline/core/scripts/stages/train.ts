@@ -1,8 +1,9 @@
-// Operator-authorized integrated train (#901 / #1023 / #1028).
+// Operator-authorized integrated train (#901 / #1023 / #1028 / #1063).
 //
-// Two-wave facade over the durable loop: for each base-eligible frontier,
-// one multi-item advance-wave (loop owns recovery), then optional serial merge
-// wave with squash-aware base containment. Advance never merges.
+// Advance-only (`merge: false`): base-eligible frontier waves (loop recovery).
+// `--merge` / Tugboat ship: **serial** — merge-first R2D, at most one implement
+// at a time, STOP on blocked/needs-human. Never start a sibling. That is the
+// anti-PR-farm rule. `pipeline loop` keeps frontier parallelism.
 //
 // Unit tests inject TrainDeps — no real network, git, or subprocess in tests.
 
@@ -211,6 +212,35 @@ export function pipelineStageFromLabels(labels: readonly string[]): string | nul
   return stages[0]!.slice("pipeline:".length);
 }
 
+
+export function isReadyToDeploySnapshot(s: TrainIssueSnapshot): boolean {
+  return pipelineStageFromLabels(s.labels) === "ready-to-deploy";
+}
+
+export function isBlockedOrNeedsHumanSnapshot(s: TrainIssueSnapshot): boolean {
+  return s.labels.includes("blocked") || pipelineStageFromLabels(s.labels) === "needs-human";
+}
+
+/**
+ * `--merge` order: already-R2D issues first (stable relative order), then the rest.
+ * Declared-dep order is preserved inside each partition (#1063).
+ */
+export function orderIssuesForTrain(
+  snapshots: readonly TrainIssueSnapshot[],
+  mergeMode: boolean,
+): number[] {
+  const base = orderIssuesByDeclaredDeps(snapshots);
+  if (!mergeMode) return base;
+  const byN = new Map(snapshots.map((s) => [s.number, s]));
+  const r2d: number[] = [];
+  const rest: number[] = [];
+  for (const n of base) {
+    if (isReadyToDeploySnapshot(byN.get(n)!)) r2d.push(n);
+    else rest.push(n);
+  }
+  return [...r2d, ...rest];
+}
+
 /**
  * Build a dependency-ordered issue list from snapshots.
  * Uses declared lexical deps (#905 grammar) among in-list issues only.
@@ -360,14 +390,25 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
     );
   }
 
-  const ordered = orderIssuesByDeclaredDeps(snapshots);
+  snapshots = snapshots.filter((s) => pipelineStageFromLabels(s.labels) !== "backlog");
+  if (snapshots.length === 0) {
+    throw new Error("work list has no eligible issues (all pipeline:backlog or empty)");
+  }
+
+  const ordered = orderIssuesForTrain(snapshots, mergeMode);
   const byNumber = new Map(snapshots.map((s) => [s.number, s]));
   const codeDeps = codeDependencyMap(snapshots);
+  const mergeFirst = mergeMode
+    ? ordered.filter((n) => isReadyToDeploySnapshot(byNumber.get(n)!))
+    : [];
 
   deps.log(
     `[train] ordered issues: ${ordered.map((n) => `#${n}`).join(" → ")}` +
-      (mergeMode ? " (merge mode, frontier waves)" : " (advance only, frontier waves)"),
+      (mergeMode
+        ? ` (merge mode, serial ship; merge-first ${mergeFirst.length ? mergeFirst.map((n) => `#${n}`).join(", ") : "none"})`
+        : " (advance only, frontier waves)"),
   );
+
 
   const items: TrainItemResult[] = [];
   const finished = new Set<number>();
@@ -385,6 +426,27 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
     items.push(item);
     itemByIssue.set(item.issue, item);
   };
+
+  if (mergeMode) {
+    for (const s of snapshots) {
+      if (!isBlockedOrNeedsHumanSnapshot(s)) continue;
+      const needsHuman = pipelineStageFromLabels(s.labels) === "needs-human";
+      held.add(s.number);
+      pushItem({
+        issue: s.number,
+        pr: null,
+        terminal: needsHuman ? "needs-human" : "blocked",
+        merge_result_oid: null,
+        integrated: false,
+        error: needsHuman
+          ? `issue #${s.number} parked at pipeline:needs-human`
+          : `issue #${s.number} is blocked`,
+      });
+      deps.log(
+        `[train] #${s.number}: already ${needsHuman ? "needs-human" : "blocked"} — held (will not implement siblings)`,
+      );
+    }
+  }
 
   const status = (): TrainStatus =>
     buildTrainStatus({
@@ -500,12 +562,23 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
     }
 
     // ---- Advance wave ----
-    const toAdvance = frontier.filter((issue) => {
+    let toAdvance = frontier.filter((issue) => {
       const snap = byNumber.get(issue)!;
       const stage = pipelineStageFromLabels(snap.labels);
       if (skipIfReady && stage === "ready-to-deploy") return false;
       return true;
     });
+    if (mergeMode && toAdvance.length > 0) {
+      if (held.size > 0) {
+        blocker =
+          `will not implement #${toAdvance[0]} while ` +
+          `${[...held].map((h) => `#${h}`).join(", ")} is blocked/parked`;
+        nextAction = "stopped";
+        deps.log(`[train] STOP: ${blocker}`);
+        return { exitCode: 1, status: status() };
+      }
+      toAdvance = [toAdvance[0]!];
+    }
 
     if (toAdvance.length > 0) {
       currentIssue = toAdvance[0]!;
@@ -543,7 +616,12 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
             integrated: false,
             error: advanced.error,
           });
-          // Do not abort independent peers — continue after recording.
+          if (mergeMode) {
+            blocker = advanced.error;
+            nextAction = "stopped";
+            deps.log(`[train] STOP: ${blocker} — will not implement another sibling`);
+            return { exitCode: 1, status: status() };
+          }
           continue;
         }
         const labels = advanced.labels;
@@ -601,7 +679,13 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
             integrated: false,
             error: err,
           });
-          deps.log(`[train] park #${issue}: needs-human (independent peers may continue)`);
+          if (mergeMode) {
+            blocker = err;
+            nextAction = "stopped";
+            deps.log(`[train] STOP: ${blocker} — will not implement another sibling`);
+            return { exitCode: 1, status: status() };
+          }
+          deps.log(`[train] park #${issue}: needs-human (advance-only peers may continue)`);
           continue;
         }
         if (advanced.terminal === "blocked" || labels.includes("blocked")) {
@@ -650,7 +734,13 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
             integrated: false,
             error: err,
           });
-          deps.log(`[train] park #${issue}: blocked (independent peers may continue)`);
+          if (mergeMode) {
+            blocker = err;
+            nextAction = "stopped";
+            deps.log(`[train] STOP: ${blocker} — will not implement another sibling`);
+            return { exitCode: 1, status: status() };
+          }
+          deps.log(`[train] park #${issue}: blocked (advance-only peers may continue)`);
           continue;
         }
         if (stage !== "ready-to-deploy" && advanced.terminal !== "ready-to-deploy") {
@@ -664,6 +754,12 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
             integrated: false,
             error: err,
           });
+          if (mergeMode) {
+            blocker = err;
+            nextAction = "stopped";
+            deps.log(`[train] STOP: ${blocker} — will not implement another sibling`);
+            return { exitCode: 1, status: status() };
+          }
           deps.log(`[train] park #${issue}: ${err}`);
           continue;
         }

@@ -140,7 +140,7 @@ report typed status and do not guess one.
 | `train milestone vX.Y.Z` | `run-intent.sh 'train milestone vX.Y.Z'` |
 | `train issues 1 2 3` | `run-intent.sh 'train issues 1,2,3'` |
 | same + `and merge` | only if `ALLOW_MERGE=1` |
-| `Ship milestone vX.Y.Z` / `ship milestone vX.Y.Z` | **Tugboat** `--milestone vX.Y.Z --detach` if `ALLOW_MERGE=1` (Option 1 primary) |
+| `Ship milestone vX.Y.Z` / `ship milestone vX.Y.Z` | **Tugboat** `--milestone vX.Y.Z --detach` if `ALLOW_MERGE=1`. **Never** `pipeline single` / `pipeline loop` during ship (#1063). Train `--merge` is serial: STOP on block, do not start the next sibling. |
 | `ship status vX.Y.Z` / `Ship status vX.Y.Z` | **Tugboat** `--milestone vX.Y.Z --status` (state only) |
 | `release prepare 1.34.0` | `pipeline release 1.34.0 --no-edit` |
 | `release finish 123` | `pipeline release finish 123` if `ALLOW_MERGE=1` |

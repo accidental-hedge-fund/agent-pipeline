@@ -12,6 +12,7 @@ import {
   computeBaseEligibleFrontier,
   isIndependentOfHeld,
   orderIssuesByDeclaredDeps,
+  orderIssuesForTrain,
   parseIssueList,
   pipelineStageFromLabels,
   runTrain,
@@ -306,7 +307,7 @@ test("train (#1023): independent peers use one advance-wave call per frontier", 
   assert.deepEqual(deps.waveCalls[0]!.slice().sort((a, b) => a - b), [1, 2]);
 });
 
-test("train (#1023): independent R2D sibling merges while peer is parked", async () => {
+test("train (#1063): merge-mode does not merge independent sibling while peer is parked", async () => {
   const deps = makeDeps({
     async advanceIssue(n) {
       deps.advanceCalls.push(n);
@@ -325,11 +326,48 @@ test("train (#1023): independent R2D sibling merges while peer is parked", async
   deps.seedPr(2, 102);
 
   const result = await runTrain(baseOpts({ issues: [1, 2], merge: true }), deps);
-  // Peer #1 parked; independent #2 must still merge.
-  assert.ok(deps.mergeCalls.includes(102), "independent sibling PR must merge");
-  assert.ok(!deps.mergeCalls.includes(101), "parked item must not merge");
-  assert.equal(result.exitCode, 1, "held peer still stops train after independents finish");
-  assert.match(result.status.blocker ?? "", /held|#1|needs-human/i);
+  assert.equal(result.exitCode, 1);
+  assert.deepEqual(deps.advanceCalls, [1], "serial ship advances one item");
+  assert.equal(deps.mergeCalls.length, 0, "must not merge a sibling after a park");
+  assert.match(result.status.blocker ?? "", /needs-human|will not implement/i);
+});
+
+test("orderIssuesForTrain: merge-mode puts R2D before newer ready (#1063)", () => {
+  const ordered = orderIssuesForTrain(
+    [
+      snap(1061, "new work", ["pipeline:ready"]),
+      snap(599, "approved", ["pipeline:ready-to-deploy"]),
+    ],
+    true,
+  );
+  assert.deepEqual(ordered, [599, 1061]);
+});
+
+test("train (#1063): merge-first R2D before implementing newer sibling", async () => {
+  const deps = makeDeps();
+  deps.seedIssue(snap(599, "approved", ["pipeline:ready-to-deploy"]));
+  deps.seedIssue(snap(1061, "newer sibling", ["pipeline:ready"]));
+  deps.seedPr(599, 1058);
+  deps.seedPr(1061, 1064);
+
+  const result = await runTrain(baseOpts({ issues: [1061, 599], merge: true }), deps);
+  assert.equal(result.exitCode, 0, result.status.blocker ?? "ok");
+  assert.ok(deps.mergeCalls[0] === 1058, "first merge is the already-R2D PR");
+  assert.ok(deps.advanceCalls.includes(1061));
+  assert.ok(!deps.advanceCalls.includes(599), "R2D item is not re-advanced");
+});
+
+test("train (#1063): already-blocked sibling stops before implementing the next", async () => {
+  const deps = makeDeps();
+  deps.seedIssue(snap(1074, "parked", ["pipeline:pre-merge", "blocked"]));
+  deps.seedIssue(snap(1073, "next ready", ["pipeline:ready"]));
+  deps.seedPr(1074, 1079);
+  deps.seedPr(1073, 1082);
+
+  const result = await runTrain(baseOpts({ issues: [1074, 1073], merge: true }), deps);
+  assert.equal(result.exitCode, 1);
+  assert.equal(deps.advanceCalls.length, 0, "must not implement #1073");
+  assert.match(result.status.blocker ?? "", /1074|blocked|will not implement/i);
 });
 
 test("computeBaseEligibleFrontier: code child waits for integrated parent", () => {
@@ -439,10 +477,8 @@ test("train (#1023): merge wave is serial with base proof between merges", async
     fetchAtMergeCount.filter((n) => n === 2).length >= 1,
     "fetchBase after second merge for containment",
   );
-  // One multi-item advance wave for the independent frontier (concurrency>1 may
-  // co-advance inside loop; train still issues a single wave call).
-  assert.equal(deps.waveCalls.length, 1);
-  assert.deepEqual(deps.waveCalls[0]!.slice().sort((a, b) => a - b), [1, 2]);
+  // #1063: merge-mode advances one item at a time, then merges, then the next.
+  assert.deepEqual(deps.waveCalls, [[1], [2]]);
 });
 
 test("train (#1023): production wiring is multi-item loop, not N×single / advanceWaveFromSingle", () => {

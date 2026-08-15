@@ -94,11 +94,12 @@ export const SHIP_PATH_COMPOSITION_INVENTORY: readonly ShipPathCompositionClassE
     kind: "hard",
     covering_modules: ["test/train.test.ts"],
     covering_test_name_substrings: [
-      "independent R2D sibling merges while peer is parked",
+      "merge-mode does not merge independent sibling while peer is parked",
+      "already-blocked sibling stops before implementing the next",
       "unproven independence fails closed — dep-linked R2D not merged while peer held",
     ],
     notes:
-      "Proven-independent already-R2D sibling still merges when a peer is parked/blocked; unproven independence fails closed (#1023)",
+      "#1063 serial ship: --merge does not implement or merge a sibling after a park/block. Unproven independence still fails closed.",
   },
   {
     id: "scratch-only-no-needs-human",
