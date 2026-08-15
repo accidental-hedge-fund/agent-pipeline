@@ -1431,6 +1431,18 @@
       "emitter": "setBlocked"
     },
     {
+      "site_id": "stages.review-routing:review-prompt-too-large#0",
+      "module": "scripts/stages/review-routing.ts",
+      "line": 678,
+      "occurrence": 0,
+      "match": "review-prompt-too-large",
+      "disposition": "deliberately-fail-closed",
+      "blocker_kind": "review-prompt-too-large",
+      "canonical_reason": "capability-refusal",
+      "notes": "assembled review prompt exceeds reviewer character ceiling before spawn — same-payload retry forbidden (#1054)",
+      "emitter": "setBlocked"
+    },
+    {
       "site_id": "stages.review-routing:harness-failure#8",
       "module": "scripts/stages/review-routing.ts",
       "line": 741,
@@ -1481,7 +1493,7 @@
     {
       "site_id": "stages.review-routing:dynamic#0",
       "module": "scripts/stages/review-routing.ts",
-      "line": 1154,
+      "line": 1262,
       "occurrence": 0,
       "match": "dynamic",
       "disposition": "deliberately-fail-closed",

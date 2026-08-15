@@ -43,6 +43,12 @@ import {
   loadOrRegenerateTesterEvidenceForReview,
   testerEvidenceWithholdResult,
 } from "../tester-evidence.ts";
+import {
+  checkReviewPromptSize,
+  formatReviewPromptTooLargeReason,
+  resolveReviewPromptCharCeiling,
+} from "../review-prompt-ceiling.ts";
+import { resolveAdapter } from "../harness-adapters/index.ts";
 import { runTestGate, type TestGateDeps } from "../testgate.ts";
 import {
   buildPriorRoundDigest,
@@ -165,6 +171,13 @@ export interface AdvanceReviewOpts {
     outcome: string;
     effective_verifier_hash: string | null;
   } | null;
+  /**
+   * Optional character ceiling override for the review-prompt size preflight
+   * (#1054). Production omits this and resolves from the reviewer adapter's
+   * finite maxPromptBytes (else Codex 1_048_576). Unit tests inject a low
+   * ceiling so oversize paths can be exercised without multi-MB fixtures.
+   */
+  reviewPromptCharCeiling?: number;
 }
 
 /**
@@ -654,6 +667,22 @@ export async function advanceReview(
     (invocation as EnsembleInvocation).ensemble;
 
   if (!result.success) {
+    // #1054: pre-spawn character ceiling refusal — distinct kind so auto-loop
+    // does not re-drive the same oversize payload as harness-failure.
+    if (invocation.promptTooLarge) {
+      const detailMsg = formatReviewPromptTooLargeReason(
+        round,
+        invocation.promptTooLarge.measured,
+        invocation.promptTooLarge.ceiling,
+      );
+      await setBlockedFn(cfg, issueNumber, detailMsg, stage, "review-prompt-too-large");
+      return {
+        advanced: false,
+        status: "blocked",
+        reason: detailMsg,
+        blockerKind: "review-prompt-too-large",
+      };
+    }
     const reason = result.timed_out
       ? `timed out after ${result.duration.toFixed(0)}s`
       : `exit ${result.exit_code}`;
@@ -1593,6 +1622,39 @@ export async function invokePromptHarnessReview(
       result: testerEvidenceWithholdResult(testerAcq.reason),
       effectiveReviewer: "tester-evidence-gate",
       selfReview: false,
+    };
+  }
+
+  // #1054: character-count preflight on the fully assembled prompt (template +
+  // same-path appendages such as Tester evidence) before any harness, ensemble
+  // member, or stage-executor spawn. Distinct from #779 byte maxPromptBytes —
+  // Codex declares unlimited for stdin but still enforces a 1_048_576-char API
+  // ceiling. Over ceiling → typed block; never spawn; never auto-retry same payload.
+  const declaredMax = resolveAdapter(cfg.harnesses.reviewer)?.capabilities.maxPromptBytes;
+  const charCeiling =
+    opts.reviewPromptCharCeiling ?? resolveReviewPromptCharCeiling(declaredMax);
+  const sizeCheck = checkReviewPromptSize(prompt, charCeiling);
+  if (!sizeCheck.ok) {
+    const reason = formatReviewPromptTooLargeReason(
+      round,
+      sizeCheck.measured,
+      sizeCheck.ceiling,
+    );
+    return {
+      result: {
+        success: false,
+        stdout: "",
+        stderr: reason,
+        exit_code: -1,
+        duration: 0,
+        timed_out: false,
+      },
+      effectiveReviewer: cfg.harnesses.reviewer,
+      selfReview: false,
+      promptTooLarge: {
+        measured: sizeCheck.measured,
+        ceiling: sizeCheck.ceiling,
+      },
     };
   }
 

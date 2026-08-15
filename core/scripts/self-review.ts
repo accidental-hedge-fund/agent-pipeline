@@ -39,6 +39,13 @@ export interface ReviewerInvocation {
   preferredModel?: string | undefined;
   /** Model actually used for the result returned to the caller. */
   resolvedModel?: string | undefined;
+  /**
+   * Present when the review path refused before harness spawn because the
+   * fully assembled prompt exceeds the effective character ceiling (#1054).
+   * Callers must setBlocked with kind `review-prompt-too-large` and must not
+   * treat this as a generic retriable harness-failure.
+   */
+  promptTooLarge?: { measured: number; ceiling: number };
 }
 
 /**

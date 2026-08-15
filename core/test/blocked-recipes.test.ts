@@ -222,6 +222,15 @@ const RECIPE_SNAPSHOTS: Record<(typeof BLOCKER_KINDS)[number], string> = {
     "model entitlement), remove the `blocked` label, then re-run " +
     "`$pipeline 7`. This is an engine harness/coverage failure, not a " +
     "product-judgment needs-human hold by default.",
+  "review-prompt-too-large":
+    "The fully assembled review prompt exceeded the reviewer input character " +
+    "ceiling (see measured size and ceiling in the reason above). Re-running " +
+    "the pipeline without reducing the assembled prompt (or changing the " +
+    "reviewer / ceiling configuration) will fail the same way — this is not a " +
+    "transient timeout. Reduce the review payload, switch to a reviewer with a " +
+    "higher declared ceiling when appropriate, or wait for a follow-up that " +
+    "shrinks prompt assembly. Then remove the `blocked` label and re-run " +
+    "`$pipeline 7`.",
 };
 
 test("each kind's rendered recipe matches its pinned snapshot", () => {
@@ -525,6 +534,30 @@ test("worktree-creation-failed directs to remove config lock, delete dangling br
   assert.ok(body.includes("`blocked`"), "must mention clearing the blocked label");
   assert.ok(body.includes("re-run `$pipeline 7`"), "must direct to re-run");
   assert.ok(!body.includes("--unblock"), "must not direct to --unblock");
+});
+
+// ---------------------------------------------------------------------------
+// review-prompt-too-large (#1054): not same-payload re-run / transient timeout.
+// ---------------------------------------------------------------------------
+
+test("review-prompt-too-large is a closed BlockerKind with non-empty recipe (#1054)", () => {
+  assert.ok(BLOCKER_KINDS.includes("review-prompt-too-large"));
+  assert.ok(BLOCKER_RECIPES["review-prompt-too-large"].trim().length > 0);
+});
+
+test("review-prompt-too-large recipe refuses same-payload re-run guidance (#1054)", () => {
+  const body = comment("review-prompt-too-large");
+  const recipe = renderRecipe("review-prompt-too-large", 7);
+  assert.match(recipe, /exceeded the reviewer input character ceiling/i);
+  assert.match(recipe, /without reducing the assembled prompt/i);
+  assert.ok(!recipe.includes("re-run as-is"), "must not say re-run as-is");
+  assert.ok(!body.includes("re-run as-is"), "blocked comment must not say re-run as-is");
+  assert.ok(
+    !recipe.toLowerCase().includes("transient timeout can usually just be"),
+    "must not present as transient timeout clearable by unblock alone",
+  );
+  assert.ok(!body.includes("--unblock"), "must not direct to --unblock");
+  assert.ok(body.includes("re-run `$pipeline 7`"), "must still direct a re-run after material change");
 });
 
 // head-drift: must direct to push the local commits, not merely clear the label (#317).

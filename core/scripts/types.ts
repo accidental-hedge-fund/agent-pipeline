@@ -290,6 +290,12 @@ export const BLOCKER_KINDS = [
   "review-independent-quorum-unmet",
   /** No usable reviewers after substitute bound (#694). */
   "review-no-usable-reviewers",
+  /**
+   * Assembled review prompt exceeds the reviewer input character ceiling
+   * before harness spawn (#1054). Distinct from harness-failure / #779
+   * prompt-limit so auto-loop does not re-send the same oversize payload.
+   */
+  "review-prompt-too-large",
 ] as const;
 export type BlockerKind = (typeof BLOCKER_KINDS)[number];
 
@@ -466,6 +472,15 @@ export const BLOCKER_RECIPES: Record<BlockerKind, string> = {
     "model entitlement), remove the `blocked` label, then re-run " +
     "`$pipeline {{N}}`. This is an engine harness/coverage failure, not a " +
     "product-judgment needs-human hold by default.",
+  "review-prompt-too-large":
+    "The fully assembled review prompt exceeded the reviewer input character " +
+    "ceiling (see measured size and ceiling in the reason above). Re-running " +
+    "the pipeline without reducing the assembled prompt (or changing the " +
+    "reviewer / ceiling configuration) will fail the same way — this is not a " +
+    "transient timeout. Reduce the review payload, switch to a reviewer with a " +
+    "higher declared ceiling when appropriate, or wait for a follow-up that " +
+    "shrinks prompt assembly. Then remove the `blocked` label and re-run " +
+    "`$pipeline {{N}}`.",
 };
 
 // ---------------------------------------------------------------------------

@@ -342,11 +342,14 @@ export function isAutoLoopRecoverable(out: Outcome): boolean {
   // Capacity is an ops admission wait and review non-convergence requires a
   // candidate-changing durable repair. Re-driving the same stage cannot
   // satisfy either invariant. Human-required blocks also stay out.
+  // review-prompt-too-large: re-sending the same oversize assembled prompt
+  // cannot succeed until the payload or ceiling changes (#1054).
   if (
     out.blockerKind === "needs-human" ||
     out.blockerKind === "human-decision-required" ||
     out.blockerKind === "review-findings" ||
-    out.blockerKind === "worktree-capacity"
+    out.blockerKind === "worktree-capacity" ||
+    out.blockerKind === "review-prompt-too-large"
   ) {
     return false;
   }

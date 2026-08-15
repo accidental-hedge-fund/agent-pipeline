@@ -389,6 +389,30 @@ test("isAutoLoopRecoverable: blocked with needs-human kind → false (requires h
   assert.equal(isAutoLoopRecoverable(BLOCKED_NEEDS_HUMAN), false);
 });
 
+test("isAutoLoopRecoverable: review-prompt-too-large → false (same-payload retry forbidden #1054)", () => {
+  assert.equal(
+    isAutoLoopRecoverable({
+      advanced: false,
+      status: "blocked",
+      reason: "prompt too large",
+      blockerKind: "review-prompt-too-large" as BlockerKind,
+    }),
+    false,
+  );
+});
+
+test("isAutoLoopRecoverable: harness-failure remains recoverable after #1054", () => {
+  assert.equal(
+    isAutoLoopRecoverable({
+      advanced: false,
+      status: "blocked",
+      reason: "exit 1",
+      blockerKind: "harness-failure" as BlockerKind,
+    }),
+    true,
+  );
+});
+
 test("isAutoLoopRecoverable: error → false", () => {
   assert.equal(isAutoLoopRecoverable(ERROR_OUT), false);
 });
