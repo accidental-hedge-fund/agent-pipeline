@@ -283,20 +283,82 @@ export function extractReviewArtifact(body: string): ReviewArtifact | null {
  * scope-language detection. Comments without a `bodyHash` (encoded before
  * this field existed) are conservatively treated as unverified.
  */
-export function isVerifiedPipelineReviewOutput(body: string): boolean {
-  const artifact = extractReviewArtifact(body);
-  if (artifact === null) return false;
+function lastReviewArtifactMatch(body: string): RegExpExecArray | null {
   REVIEW_ARTIFACT_RE.lastIndex = 0;
   let lastMatch: RegExpExecArray | null = null;
   let cur: RegExpExecArray | null;
   while ((cur = REVIEW_ARTIFACT_RE.exec(body)) !== null) lastMatch = cur;
   REVIEW_ARTIFACT_RE.lastIndex = 0;
+  return lastMatch;
+}
+
+export function isVerifiedPipelineReviewOutput(body: string): boolean {
+  const artifact = extractReviewArtifact(body);
+  if (artifact === null) return false;
+  const lastMatch = lastReviewArtifactMatch(body);
   if (lastMatch === null) return false;
   if (body.slice(lastMatch.index + lastMatch[0].length).trim() !== "") return false;
   const rawPrefix = body.slice(0, lastMatch.index);
   const prefix = rawPrefix.endsWith("\n") ? rawPrefix.slice(0, -1) : rawPrefix;
   if (typeof artifact.bodyHash !== "string") return false;
-  return hashReviewBody(prefix) === artifact.bodyHash;
+  if (hashReviewBody(prefix) === artifact.bodyHash) return true;
+  // Already-posted reviews had coverage / self-review banners inserted after
+  // formatReviewComment hashed the unbannered body (#1095 recovery). Strip
+  // only those engine-owned lines and retry. A human objection in the prefix
+  // is not a banner line, so the hash still fails.
+  const stripped = stripEngineOwnedReviewBanners(prefix);
+  return stripped !== prefix && hashReviewBody(stripped) === artifact.bodyHash;
+}
+
+/** Engine-owned lines review-routing inserts after the heading, after hashing. */
+const ENGINE_REVIEW_BANNER_LINE =
+  /^(?:\*\*Reviewer coverage \(#694\):|\*\*Ensemble\*\* \(|> ⚠️ \*\*(?:Ensemble includes same-harness self-review|Same-harness self-review))/;
+
+/**
+ * Remove coverage / ensemble / self-review banners that sit between the
+ * review heading and `**Reviewer**:`. Used only to verify already-posted
+ * comments whose bodyHash predates the banner insert.
+ */
+export function stripEngineOwnedReviewBanners(prefix: string): string {
+  const lines = prefix.split("\n");
+  if (lines.length < 2) return prefix;
+  let i = 1;
+  let removed = false;
+  while (i < lines.length) {
+    const line = lines[i]!;
+    if (line === "" || ENGINE_REVIEW_BANNER_LINE.test(line)) {
+      if (ENGINE_REVIEW_BANNER_LINE.test(line)) removed = true;
+      i += 1;
+      continue;
+    }
+    break;
+  }
+  if (!removed) return prefix;
+  return [lines[0], ...lines.slice(i)].join("\n");
+}
+
+/**
+ * Recompute `bodyHash` on the last review-artifact after an engine-owned
+ * post-render mutation (coverage / self-review banners inserted after
+ * `formatReviewComment` hashed the unbannered body).
+ *
+ * Call only on freshly rendered engine output before post. This is not a
+ * verification fallback: a later human edit of a posted body must still fail
+ * `isVerifiedPipelineReviewOutput`.
+ */
+export function rebindReviewArtifactBodyHash(body: string): string {
+  const artifact = extractReviewArtifact(body);
+  if (artifact === null) return body;
+  const lastMatch = lastReviewArtifactMatch(body);
+  if (lastMatch === null) return body;
+  if (body.slice(lastMatch.index + lastMatch[0].length).trim() !== "") return body;
+  const rawPrefix = body.slice(0, lastMatch.index);
+  const prefix = rawPrefix.endsWith("\n") ? rawPrefix.slice(0, -1) : rawPrefix;
+  const nextHash = hashReviewBody(prefix);
+  if (artifact.bodyHash === nextHash) return body;
+  artifact.bodyHash = nextHash;
+  const suffix = body.slice(lastMatch.index + lastMatch[0].length);
+  return `${prefix}\n${encodeReviewArtifact(artifact)}${suffix}`;
 }
 
 /** Return the child pipeline run that produced a verified review comment.

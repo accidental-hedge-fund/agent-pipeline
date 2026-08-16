@@ -21,6 +21,13 @@ export interface TrainAdvanceLoopEvidence {
   exitCode?: number;
   /** Engine / LoopError message when the wave failed without events. */
   engineMessage?: string;
+  /**
+   * Last item-level terminal for the current `blockedIssue` (or the wave
+   * after a successful ready / `all_done` clear). `blocked` means a
+   * `loop_item_blocked` was not superseded. `ready` means a later successful
+   * terminal won. Absent when no item terminal was observed.
+   */
+  itemTerminal?: "ready" | "blocked";
 }
 
 /** Loose event shape for pure extraction (matches loop events.jsonl records). */
@@ -52,9 +59,109 @@ export function parseIssueIdFromItemId(value: unknown): number | undefined {
   return Number.isSafeInteger(n) && n > 0 ? n : undefined;
 }
 
+/** Item-block fields that a later successful terminal for that item may clear. */
+interface ItemBlockEvidence {
+  blockedClass?: string;
+  blockedIssue?: number;
+  blockerKind?: string;
+  blockerCommentFirstLine?: string;
+}
+
+function firstLineComment(value: string): string | undefined {
+  const first = value.split(/\r?\n/, 1)[0]!.trim();
+  if (!first) return undefined;
+  return first.length > 160 ? `${first.slice(0, 157)}...` : first;
+}
+
+function readItemBlockEvidence(data: Record<string, unknown>): ItemBlockEvidence | null {
+  const cls = asNonEmptyString(data.class) ?? asNonEmptyString(data.blocker_class);
+  const kindField =
+    asNonEmptyString(data.blocker_kind) ?? asNonEmptyString(data.blockerKind);
+  const commentRaw =
+    asNonEmptyString(data.blocker_comment_first_line) ??
+    asNonEmptyString(data.comment_first_line) ??
+    asNonEmptyString(data.evidence);
+  const comment = commentRaw ? firstLineComment(commentRaw) : undefined;
+  if (!cls && !kindField && !comment) return null;
+  const fields: ItemBlockEvidence = {};
+  if (cls) fields.blockedClass = cls;
+  const issue = parseIssueIdFromItemId(data.item_id ?? data.issue);
+  if (cls && issue != null) fields.blockedIssue = issue;
+  if (kindField) fields.blockerKind = kindField;
+  if (comment) fields.blockerCommentFirstLine = comment;
+  return fields;
+}
+
+function applyItemBlockToEvidence(
+  out: TrainAdvanceLoopEvidence,
+  fields: ItemBlockEvidence,
+): void {
+  if (fields.blockedClass) out.blockedClass = fields.blockedClass;
+  else delete out.blockedClass;
+  if (fields.blockedIssue != null) out.blockedIssue = fields.blockedIssue;
+  else delete out.blockedIssue;
+  if (fields.blockerKind) out.blockerKind = fields.blockerKind;
+  else delete out.blockerKind;
+  if (fields.blockerCommentFirstLine) {
+    out.blockerCommentFirstLine = fields.blockerCommentFirstLine;
+  } else {
+    delete out.blockerCommentFirstLine;
+  }
+}
+
+function clearItemBlockFields(out: TrainAdvanceLoopEvidence): void {
+  delete out.blockedClass;
+  delete out.blockedIssue;
+  delete out.blockerKind;
+  delete out.blockerCommentFirstLine;
+}
+
+/** Item-level successful terminals that supersede an earlier loop_item_blocked. */
+function isItemSuccessfulTerminal(
+  kind: string,
+  data: Record<string, unknown>,
+): boolean {
+  if (kind === "ready_to_deploy") return true;
+  if (kind === "loop_item_transitioned") {
+    const to = asNonEmptyString(data.to);
+    return to === "ready" || to === "ready_to_deploy";
+  }
+  if (kind === "loop_item_advance_finished") {
+    const outcome = asNonEmptyString(data.outcome);
+    return outcome === "ready_to_deploy" || outcome === "ready";
+  }
+  return false;
+}
+
+/**
+ * Wave-level successful terminal. `loop_run_complete` with `all_done` (or no
+ * failing outcome) and explicit `all_done` clear remaining item-block fields.
+ * A later `loop_run_stopped` invalidates this (caller tracks that).
+ */
+function isWaveSuccessfulTerminal(
+  kind: string,
+  data: Record<string, unknown>,
+): boolean {
+  if (kind === "all_done") return true;
+  if (kind === "loop_run_complete") {
+    const outcome =
+      asNonEmptyString(data.outcome) ?? asNonEmptyString(data.completion);
+    if (!outcome) return true;
+    return outcome === "all_done";
+  }
+  return false;
+}
+
 /**
  * Scan loop events (and optional drive stop / exit) into a compact evidence
- * summary. Last matching event wins for each field. Does not invent classes.
+ * summary. Last **terminal** wins per item: a later successful terminal
+ * (`ready_to_deploy`, ledger `ready`, or wave `all_done` / `loop_run_complete`
+ * with no later `loop_run_stopped`) clears that item's current
+ * `loop_item_blocked` fields. Wave `all_done` / `loop_run_complete` with no
+ * later stop clears every remaining item-block for that completed wave
+ * (`allDone` cannot fire while a ledger item is still blocked). A sibling
+ * that is still blocked is kept only when no wave-success terminal follows.
+ * Does not invent classes.
  */
 export function extractTrainAdvanceLoopEvidence(input: {
   events?: readonly TrainAdvanceLoopEventLike[] | null;
@@ -67,36 +174,62 @@ export function extractTrainAdvanceLoopEvidence(input: {
   const stopFromDrive = asNonEmptyString(input.stopReason);
   if (stopFromDrive) out.stopReason = stopFromDrive;
 
+  const blockByIssue = new Map<number, ItemBlockEvidence>();
+  const readyItems = new Set<number>();
+  let orphanBlock: ItemBlockEvidence | undefined;
+  let waveSuccessfulTerminal = false;
+
   const events = input.events ?? [];
   for (const ev of events) {
     const kind = typeof ev.kind === "string" ? ev.kind : "";
     const data = asRecord(ev.data) ?? {};
     if (kind === "loop_run_stopped") {
-      const reason = asNonEmptyString(data.reason);
-      if (reason) out.stopReason = reason;
+      // Every stop is current failure, including a missing/empty reason
+      // (#1095 review-2). Stable fallback keeps #1074 unmaskable.
+      out.stopReason = asNonEmptyString(data.reason) ?? "loop_run_stopped";
+      // A later stop remains current even if labels later say ready-to-deploy.
+      waveSuccessfulTerminal = false;
     } else if (kind === "loop_item_blocked") {
-      const cls = asNonEmptyString(data.class) ?? asNonEmptyString(data.blocker_class);
-      if (cls) {
-        out.blockedClass = cls;
-        const issue = parseIssueIdFromItemId(data.item_id ?? data.issue);
-        if (issue != null) out.blockedIssue = issue;
+      const fields = readItemBlockEvidence(data);
+      if (!fields) continue;
+      const issue = parseIssueIdFromItemId(data.item_id ?? data.issue);
+      if (issue != null) {
+        blockByIssue.set(issue, { ...fields, blockedIssue: issue });
+        readyItems.delete(issue);
+      } else {
+        orphanBlock = fields;
       }
-      const kindField =
-        asNonEmptyString(data.blocker_kind) ?? asNonEmptyString(data.blockerKind);
-      if (kindField) out.blockerKind = kindField;
-      const comment =
-        asNonEmptyString(data.blocker_comment_first_line) ??
-        asNonEmptyString(data.comment_first_line) ??
-        asNonEmptyString(data.evidence);
-      if (comment) {
-        // Keep operator-scannable: first line only, cap length.
-        const first = comment.split(/\r?\n/, 1)[0]!.trim();
-        if (first) {
-          out.blockerCommentFirstLine =
-            first.length > 160 ? `${first.slice(0, 157)}...` : first;
-        }
+    } else if (isItemSuccessfulTerminal(kind, data)) {
+      const issue = parseIssueIdFromItemId(data.item_id ?? data.issue);
+      if (issue != null) {
+        blockByIssue.delete(issue);
+        readyItems.add(issue);
       }
+    } else if (isWaveSuccessfulTerminal(kind, data)) {
+      waveSuccessfulTerminal = true;
     }
+  }
+
+  if (waveSuccessfulTerminal) {
+    // all_done / loop_run_complete cannot fire while a ledger item is still
+    // blocked (DONE_OR_ABANDONED). Clear every remaining item-block for this
+    // completed wave, including multi-item recovered blocks with no
+    // item-level ready event (#1095 review-2).
+    blockByIssue.clear();
+    orphanBlock = undefined;
+  }
+
+  clearItemBlockFields(out);
+  if (blockByIssue.size > 0) {
+    let last: ItemBlockEvidence | undefined;
+    for (const fields of blockByIssue.values()) last = fields;
+    if (last) applyItemBlockToEvidence(out, last);
+    out.itemTerminal = "blocked";
+  } else if (orphanBlock && !waveSuccessfulTerminal) {
+    applyItemBlockToEvidence(out, orphanBlock);
+    out.itemTerminal = "blocked";
+  } else if (readyItems.size > 0 || waveSuccessfulTerminal) {
+    out.itemTerminal = "ready";
   }
 
   if (typeof input.exitCode === "number" && Number.isFinite(input.exitCode)) {
@@ -202,6 +335,7 @@ export function scopeTrainAdvanceEvidenceForIssue(
     // Comment/kind were tied to that blocked item — drop if class dropped.
     delete scoped.blockerKind;
     delete scoped.blockerCommentFirstLine;
+    if (scoped.itemTerminal === "blocked") delete scoped.itemTerminal;
   }
   return scoped;
 }

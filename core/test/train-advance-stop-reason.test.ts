@@ -139,3 +139,130 @@ test("parseIssueIdFromItemId", () => {
   assert.equal(parseIssueIdFromItemId(7), 7);
   assert.equal(parseIssueIdFromItemId("x"), undefined);
 });
+
+// ---------------------------------------------------------------------------
+// #1095 — last terminal wins: recovered loop_item_blocked is not current
+// ---------------------------------------------------------------------------
+
+test("extract (#1095): loop_item_blocked then ready_to_deploy does not leave class current", () => {
+  const evidence = extractTrainAdvanceLoopEvidence({
+    events: [
+      {
+        kind: "loop_item_blocked",
+        data: { item_id: "1037", class: "implementation-ci" },
+      },
+      {
+        kind: "loop_item_advance_finished",
+        data: { item_id: "1037", outcome: "ready_to_deploy" },
+      },
+      { kind: "loop_run_complete", data: { outcome: "all_done" } },
+    ],
+  });
+  assert.equal(evidence.blockedClass, undefined);
+  assert.equal(evidence.blockedIssue, undefined);
+  assert.equal(evidence.itemTerminal, "ready");
+  assert.equal(evidence.stopReason, undefined);
+});
+
+test("extract (#1095): loop_item_blocked then ledger ready transition clears that item", () => {
+  const evidence = extractTrainAdvanceLoopEvidence({
+    events: [
+      {
+        kind: "loop_item_blocked",
+        data: { item_id: "12", class: "implementation-ci" },
+      },
+      {
+        kind: "loop_item_transitioned",
+        data: { item_id: "12", from: "in_progress", to: "ready" },
+      },
+    ],
+  });
+  assert.equal(evidence.blockedClass, undefined);
+  assert.equal(evidence.blockedIssue, undefined);
+});
+
+test("extract (#1095): later loop_run_stopped stays current stop evidence", () => {
+  const evidence = extractTrainAdvanceLoopEvidence({
+    events: [
+      {
+        kind: "loop_item_blocked",
+        data: { item_id: "88", class: "implementation-ci" },
+      },
+      {
+        kind: "loop_item_advance_finished",
+        data: { item_id: "88", outcome: "ready_to_deploy" },
+      },
+      { kind: "loop_run_complete", data: { outcome: "all_done" } },
+      { kind: "loop_run_stopped", data: { reason: "supervisor_no_progress" } },
+    ],
+  });
+  assert.equal(evidence.stopReason, "supervisor_no_progress");
+  assert.equal(evidence.blockedClass, undefined);
+});
+
+test("extract (#1095): reasonless loop_run_stopped records a stable stop marker", () => {
+  const evidence = extractTrainAdvanceLoopEvidence({
+    events: [{ kind: "loop_run_stopped", data: { reason: "" } }],
+  });
+  assert.equal(evidence.stopReason, "loop_run_stopped");
+});
+
+test("extract (#1095): two-item recovered blocks then all_done clear current class", () => {
+  const evidence = extractTrainAdvanceLoopEvidence({
+    events: [
+      {
+        kind: "loop_item_blocked",
+        data: { item_id: "1", class: "implementation-ci" },
+      },
+      {
+        kind: "loop_item_blocked",
+        data: { item_id: "2", class: "review-findings" },
+      },
+      { kind: "loop_run_complete", data: { outcome: "all_done" } },
+    ],
+  });
+  assert.equal(evidence.blockedClass, undefined);
+  assert.equal(evidence.blockedIssue, undefined);
+  assert.equal(evidence.itemTerminal, "ready");
+  assert.equal(evidence.stopReason, undefined);
+});
+
+test("extract (#1095): current loop_item_blocked without later ready stays blocked", () => {
+  const evidence = extractTrainAdvanceLoopEvidence({
+    events: [
+      {
+        kind: "loop_item_blocked",
+        data: { item_id: "1037", class: "implementation-ci" },
+      },
+    ],
+  });
+  assert.equal(evidence.blockedClass, "implementation-ci");
+  assert.equal(evidence.blockedIssue, 1037);
+  assert.equal(evidence.itemTerminal, "blocked");
+});
+
+test("extract (#1095): sibling still blocked keeps its class after peer ready", () => {
+  const evidence = extractTrainAdvanceLoopEvidence({
+    events: [
+      {
+        kind: "loop_item_blocked",
+        data: { item_id: "1", class: "implementation-ci" },
+      },
+      {
+        kind: "loop_item_blocked",
+        data: { item_id: "2", class: "review-findings" },
+      },
+      {
+        kind: "loop_item_advance_finished",
+        data: { item_id: "1", outcome: "ready_to_deploy" },
+      },
+    ],
+  });
+  assert.equal(evidence.blockedClass, "review-findings");
+  assert.equal(evidence.blockedIssue, 2);
+  const for1 = scopeTrainAdvanceEvidenceForIssue(evidence, 1);
+  assert.equal(for1.blockedClass, undefined);
+  const for2 = scopeTrainAdvanceEvidenceForIssue(evidence, 2);
+  assert.equal(for2.blockedClass, "review-findings");
+  assert.equal(for2.blockedIssue, 2);
+});

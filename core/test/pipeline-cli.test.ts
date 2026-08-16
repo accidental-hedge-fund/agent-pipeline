@@ -702,6 +702,140 @@ test("classifyTrainAdvanceLabels (#1074): engine failure does not succeed as rea
   }
 });
 
+test("classifyTrainAdvanceLabels (#1095): recovered implementation-ci then R2D is ok", async () => {
+  const { classifyTrainAdvanceLabels } = await import("../scripts/pipeline.ts");
+  const { extractTrainAdvanceLoopEvidence } = await import(
+    "../scripts/stages/train-advance-stop-reason.ts"
+  );
+  const evidence = extractTrainAdvanceLoopEvidence({
+    events: [
+      {
+        kind: "loop_item_blocked",
+        data: { item_id: "1037", class: "implementation-ci" },
+      },
+      {
+        kind: "loop_item_advance_finished",
+        data: { item_id: "1037", outcome: "ready_to_deploy" },
+      },
+      { kind: "loop_run_complete", data: { outcome: "all_done" } },
+    ],
+  });
+  const out = classifyTrainAdvanceLabels(
+    { labels: ["pipeline:ready-to-deploy"] },
+    0,
+    evidence,
+    1037,
+  );
+  assert.equal(out.ok, true);
+  if (out.ok) {
+    assert.equal(out.terminal, "ready-to-deploy");
+  }
+});
+
+test("classifyTrainAdvanceLabels (#1095): current blockedClass plus R2D flicker is not ok", async () => {
+  const { classifyTrainAdvanceLabels } = await import("../scripts/pipeline.ts");
+  const out = classifyTrainAdvanceLabels(
+    { labels: ["pipeline:ready-to-deploy"] },
+    0,
+    { blockedClass: "implementation-ci", blockedIssue: 1037, itemTerminal: "blocked" },
+    1037,
+  );
+  assert.equal(out.ok, false);
+  if (!out.ok) {
+    assert.match(out.error, /implementation-ci/);
+  }
+});
+
+test("classifyTrainAdvanceLabels (#1095): reasonless loop_run_stopped plus live R2D is not ok", async () => {
+  const { classifyTrainAdvanceLabels } = await import("../scripts/pipeline.ts");
+  const { extractTrainAdvanceLoopEvidence } = await import(
+    "../scripts/stages/train-advance-stop-reason.ts"
+  );
+  const evidence = extractTrainAdvanceLoopEvidence({
+    events: [{ kind: "loop_run_stopped", data: {} }],
+  });
+  const out = classifyTrainAdvanceLabels(
+    { labels: ["pipeline:ready-to-deploy"] },
+    0,
+    evidence,
+    1037,
+  );
+  assert.equal(out.ok, false);
+  if (!out.ok) {
+    assert.match(out.error, /loop_run_stopped/);
+  }
+});
+
+test("classifyTrainAdvanceLabels (#1095): live blocked label is not a recovered R2D success", async () => {
+  const { classifyTrainAdvanceLabels } = await import("../scripts/pipeline.ts");
+  const out = classifyTrainAdvanceLabels(
+    { labels: ["pipeline:ready-to-deploy", "blocked"] },
+    0,
+    { blockedClass: "implementation-ci", blockedIssue: 1037 },
+    1037,
+  );
+  assert.equal(out.ok, true);
+  if (out.ok) {
+    assert.equal(out.terminal, "blocked");
+    assert.notEqual(out.terminal, "ready-to-deploy");
+  }
+});
+
+test("advanceWaveThroughLoop (#1095): recovered block then all_done + live R2D is ok", async () => {
+  const { advanceWaveThroughLoop } = await import("../scripts/pipeline.ts");
+  const fakeCfg = {
+    repo_dir: "/tmp/repo",
+    repo: "o/r",
+    base_branch: "main",
+    domain: "o-r",
+  };
+  const result = await advanceWaveThroughLoop(
+    [1037],
+    {},
+    async () => ({
+      number: 1037,
+      title: "t",
+      body: "",
+      labels: ["pipeline:ready-to-deploy"],
+      state: "open",
+    }),
+    async () => ({
+      kind: "drive",
+      result: {
+        runId: "loop-recovered-r2d",
+        cycles: 2,
+        stop: null,
+        holdOutstanding: false,
+        allDone: true,
+        resumed: false,
+        heldItemIds: [],
+        dispatched: 1,
+        excludedItemIds: [],
+        exclusionReason: null,
+        completion: "all_done",
+      },
+    }),
+    () => fakeCfg as never,
+    async () => [
+      {
+        kind: "loop_item_blocked",
+        data: { item_id: "1037", class: "implementation-ci" },
+      },
+      {
+        kind: "loop_item_advance_finished",
+        data: { item_id: "1037", outcome: "ready_to_deploy" },
+      },
+      { kind: "loop_run_complete", data: { outcome: "all_done" } },
+    ],
+  );
+  const outcome = result.get(1037);
+  assert.ok(outcome);
+  assert.equal(outcome!.ok, true);
+  if (outcome!.ok) {
+    assert.equal(outcome!.terminal, "ready-to-deploy");
+  }
+});
+
 test("advanceWaveThroughLoop (#1074): injects stop reason from drive + events", async () => {
   const { advanceWaveThroughLoop } = await import("../scripts/pipeline.ts");
   const fakeCfg = {

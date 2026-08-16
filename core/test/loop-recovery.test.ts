@@ -546,6 +546,28 @@ test("recoverItem: exhausted class budget remains blocked for supervisor schedul
   await assert.rejects(() => recoverItem(deps, contract, { runId: "run-1", token, itemId: "200", engine: "claude", actions: [] , succeeded: true }));
 });
 
+test("recoverItem (#1095): success resume to in_progress still retains blocked_theme", async () => {
+  const { deps, contract, token } = await setup();
+  await blockItem(deps, contract, {
+    runId: "run-1",
+    token,
+    itemId: "100",
+    engine: "claude",
+    blockerClass: "implementation-ci",
+    evidence: "ci failed",
+  });
+  const { ledger } = await recoverItem(deps, contract, {
+    runId: "run-1",
+    token,
+    itemId: "100",
+    engine: "claude",
+    actions: ["rerun_ci"],
+    succeeded: true,
+  });
+  assert.equal(ledger.items["100"].state, "in_progress");
+  assert.equal(ledger.items["100"].blocked_theme, "implementation-ci");
+});
+
 test("recoverItem: on success the same item resumes blocked -> in_progress, retaining history, class, and evidence", async () => {
   const { deps, contract, token } = await setup();
   await blockItem(deps, contract, { runId: "run-1", token, itemId: "100", engine: "claude", blockerClass: "implementation-ci", evidence: "ci failed", note: "first block" });

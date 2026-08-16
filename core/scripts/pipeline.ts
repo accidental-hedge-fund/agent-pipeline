@@ -3218,27 +3218,35 @@ export function classifyTrainAdvanceLabels(
       ? composeTrainAdvanceStopReason(merged, issue)
       : undefined;
 
-  // Non-zero exit / engine failure must not be masked by a success label
-  // (e.g. ready-to-deploy set before the wave engine failed) (#1074 review).
-  // Park terminals (needs-human / blocked) still classify as ok park outcomes
-  // with optional diagnostic — only the success terminal is gated.
-  const advanceFailed =
+  // Current failure (not a recovered, superseded item-block): non-zero exit,
+  // engine message, or loop_run_stopped (including a reasonless stop).
+  // A still-current loop_item_blocked (itemTerminal !== "ready") is also
+  // current failure — R2D label flicker must not merge it (#1095 review-2).
+  // Recovered blocks have itemTerminal "ready" (or no remaining block
+  // fields). #1074 still forbids masking a real stop / engine failure.
+  const currentFailure =
     exit !== 0 ||
     !!merged.engineMessage ||
-    hasStructuredTrainAdvanceEvidence(merged);
-  if (advanceFailed && stage === "ready-to-deploy") {
-    return {
-      ok: false,
-      error:
-        diagnostic ??
-        composeTrainAdvanceStopReason(
-          { exitCode: exit !== 0 ? exit : 1, engineMessage: merged.engineMessage },
-          issue,
-        ),
-    };
-  }
+    !!merged.stopReason;
+  const leftoverItemBlock =
+    !!merged.blockedClass ||
+    !!merged.blockerKind ||
+    !!merged.blockerCommentFirstLine;
+  const currentItemBlock = leftoverItemBlock && merged.itemTerminal !== "ready";
+  const liveBlocked = snap.labels.includes("blocked");
 
-  if (stage === "ready-to-deploy") {
+  if (stage === "ready-to-deploy" && !liveBlocked) {
+    if (currentFailure || currentItemBlock) {
+      return {
+        ok: false,
+        error:
+          diagnostic ??
+          composeTrainAdvanceStopReason(
+            { exitCode: exit !== 0 ? exit : 1, engineMessage: merged.engineMessage },
+            issue,
+          ),
+      };
+    }
     return { ok: true, terminal: "ready-to-deploy", labels: snap.labels };
   }
   if (stage === "needs-human") {
@@ -3249,7 +3257,7 @@ export function classifyTrainAdvanceLabels(
       ...(diagnostic ? { diagnostic } : {}),
     };
   }
-  if (snap.labels.includes("blocked")) {
+  if (liveBlocked) {
     return {
       ok: true,
       terminal: "blocked",
@@ -3258,9 +3266,9 @@ export function classifyTrainAdvanceLabels(
     };
   }
 
-  // Non-zero exit, engine failure message, or structured stop/block evidence
-  // without a terminal park label → non-ok with composed reason (#1074).
-  if (advanceFailed) {
+  // Non-zero exit, engine failure message, current stop, or still-current
+  // item-block evidence without a terminal park label → non-ok (#1074).
+  if (currentFailure || leftoverItemBlock) {
     return {
       ok: false,
       error:

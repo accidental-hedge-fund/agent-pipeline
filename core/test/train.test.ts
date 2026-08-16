@@ -1053,6 +1053,86 @@ test("train (#1074): recovery_exhausted class + issue in held item error", async
   assert.match(item?.error ?? "", /#839/);
 });
 
+test("train (#1095): merge-mode merges recovered-block-then-R2D and does not STOP on implementation-ci", async () => {
+  const { classifyTrainAdvanceLabels } = await import("../scripts/pipeline.ts");
+  const { extractTrainAdvanceLoopEvidence } = await import(
+    "../scripts/stages/train-advance-stop-reason.ts"
+  );
+  const deps = makeDeps({
+    async advanceWave(issueList) {
+      const evidence = extractTrainAdvanceLoopEvidence({
+        events: [
+          {
+            kind: "loop_item_blocked",
+            data: { item_id: "1037", class: "implementation-ci" },
+          },
+          {
+            kind: "loop_item_advance_finished",
+            data: { item_id: "1037", outcome: "ready_to_deploy" },
+          },
+          { kind: "loop_run_complete", data: { outcome: "all_done" } },
+        ],
+      });
+      const out: AdvanceWaveResult = new Map();
+      for (const n of issueList) {
+        const issues = (deps as unknown as { _issues: Map<number, TrainIssueSnapshot> })._issues;
+        issues.get(n)!.labels = ["pipeline:ready-to-deploy"];
+        out.set(
+          n,
+          classifyTrainAdvanceLabels(
+            { labels: ["pipeline:ready-to-deploy"] },
+            0,
+            evidence,
+            n,
+          ),
+        );
+      }
+      return out;
+    },
+  });
+  deps.seedIssue(snap(1037, "recovered ci then r2d", ["pipeline:implementing"]));
+  deps.seedPr(1037, 2095);
+
+  const result = await runTrain(baseOpts({ issues: [1037], merge: true }), deps);
+  assert.equal(result.exitCode, 0, result.status.blocker ?? "ok");
+  assert.deepEqual(deps.mergeCalls, [2095]);
+  assert.doesNotMatch(result.status.blocker ?? "", /implementation-ci/);
+  const item = result.status.items.find((i) => i.issue === 1037);
+  assert.notEqual(item?.terminal, "error");
+  assert.doesNotMatch(item?.error ?? "", /implementation-ci on #1037/);
+});
+
+test("train (#1095): merge-mode does not merge a live blocked item on leftover class", async () => {
+  const { classifyTrainAdvanceLabels } = await import("../scripts/pipeline.ts");
+  const deps = makeDeps({
+    async advanceWave(issueList) {
+      const out: AdvanceWaveResult = new Map();
+      for (const n of issueList) {
+        const issues = (deps as unknown as { _issues: Map<number, TrainIssueSnapshot> })._issues;
+        issues.get(n)!.labels = ["pipeline:implementing", "blocked"];
+        out.set(
+          n,
+          classifyTrainAdvanceLabels(
+            { labels: ["pipeline:implementing", "blocked"] },
+            0,
+            { blockedClass: "implementation-ci", blockedIssue: n },
+            n,
+          ),
+        );
+      }
+      return out;
+    },
+  });
+  deps.seedIssue(snap(1037, "still blocked", ["pipeline:implementing", "blocked"]));
+  deps.seedPr(1037, 2095);
+
+  const result = await runTrain(baseOpts({ issues: [1037], merge: true }), deps);
+  assert.equal(result.exitCode, 1);
+  assert.equal(deps.mergeCalls.length, 0);
+  const item = result.status.items.find((i) => i.issue === 1037);
+  assert.notEqual(item?.terminal, "ready-to-deploy");
+});
+
 test("train (#1074): held aggregation preserves enriched per-item reason", async () => {
   const deps = makeDeps({
     async advanceWave(issueList) {

@@ -14,7 +14,11 @@ import {
 } from "../scripts/issue-context-snapshot.ts";
 import { classifyComment } from "../scripts/gh.ts";
 import { buildTrustedOverrideComments, scopedOverrideComment } from "../scripts/review-policy.ts";
-import { formatDeltaReviewComment } from "../scripts/stages/review-rendering.ts";
+import { formatDeltaReviewComment, formatReviewComment } from "../scripts/stages/review-rendering.ts";
+import {
+  isVerifiedPipelineReviewOutput,
+  rebindReviewArtifactBodyHash,
+} from "../scripts/stages/review-parsing.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
 // ---------------------------------------------------------------------------
@@ -702,6 +706,49 @@ test("findUnacknowledgedComments: genuine pipeline review verdict with objection
     0,
     "genuine, untampered pipeline review verdict must not gate on its own objection wording",
   );
+});
+
+test("findUnacknowledgedComments: coverage-banner insert then rebind does not gate a review-2 verdict (#1095 recovery)", () => {
+  // Production review-routing inserts coverage banners after formatReviewComment
+  // hashed the body. Without rebind, bodyHash fails and "instead" in the
+  // finding trips the human-input gate (the #1095 fix-2 park).
+  const rendered = formatReviewComment(
+    undefined as unknown as PipelineConfig,
+    {
+      verdict: "needs-attention",
+      summary: "No-ship.",
+      findings: [{
+        severity: "high",
+        title: "current block can merge on R2D flicker",
+        body: "Last terminal remains loop_item_blocked.",
+        confidence: 0.97,
+        recommendation: "Preserve current terminal state instead of treating all item-block fields as historical.",
+      }],
+      next_steps: ["Fix the classifier."],
+      commitSha: "2d95cc8acb51125e57e4d1bab7be2afe6e267b2e",
+    },
+    2,
+    "codex",
+    new Set(["137339b7"]),
+  );
+  assert.equal(isVerifiedPipelineReviewOutput(rendered), true);
+  const nl = rendered.indexOf("\n");
+  const banner = "**Reviewer coverage (#694):** configured=1 attempted=1 usable=1 independent=1 required=0 outcome=`complete`";
+  const withBanner = `${rendered.slice(0, nl)}\n\n${banner}${rendered.slice(nl)}`;
+  assert.equal(
+    isVerifiedPipelineReviewOutput(withBanner),
+    true,
+    "already-posted coverage-banner insert must still verify (strip path)",
+  );
+  const rebound = rebindReviewArtifactBodyHash(withBanner);
+  assert.equal(isVerifiedPipelineReviewOutput(rebound), true, "rebind must restore verification");
+  const comments = [
+    makeComment("operator", "## Revised Implementation Plan\n\nDo X.", ts(0)),
+    makeComment("operator", withBanner, ts(1)),
+  ];
+  const trusted = [comments[1]];
+  const unacked = findUnacknowledgedComments(comments, trusted);
+  assert.equal(unacked.length, 0, "bannered review-2 verdict must not count as unacknowledged human input");
 });
 
 test("findUnacknowledgedComments: human objection appended after a quoted genuine review verdict is still counted (#390 review 1)", () => {
