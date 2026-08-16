@@ -8,10 +8,14 @@ import { EventEmitter } from "node:events";
 import {
   buildFactoryReleaseUnsignedDigestBinding,
   compareSemver,
+  CANDIDATE_LOOP_DENIED_FRG_ENV,
   defaultFactoryReleasePrepareDeps,
   defaultObserveAttestation,
+  defaultResumeBoundPackLoop,
+  defaultSpawnCandidateLoop,
   defaultStartBoundPackLoop,
   factoryReleaseLoopBindingPath,
+  sanitizeCandidateLoopEnv,
   factoryReleasePackInstancePath,
   factoryReleaseRequestFingerprint,
   factoryReleaseWorkDir,
@@ -1568,4 +1572,128 @@ test("failed detached spawn is retried on the same bound run", async () => {
   assert.deepEqual(startCalls, ["create"]);
   const after = JSON.parse(files.get(factoryReleaseLoopBindingPath("loop-spawn-enoent"))!);
   assert.equal(after.dispatch_state, "dispatched");
+});
+
+function dirtyFrgSigningEnv(): NodeJS.ProcessEnv {
+  return {
+    PATH: "/usr/bin",
+    PIPELINE_BIN: "/opt/pipeline",
+    HOME: "/home/wrapper",
+    PIPELINE_FRG_ATTESTATION_KEY: "production-attestor-secret",
+    PIPELINE_FRG_ATTESTATION_KEY_FILE: "/secrets/frg-attestation.key",
+  };
+}
+
+function capturingCandidateSpawn(captured: {
+  env?: NodeJS.ProcessEnv;
+  command?: string;
+  args?: readonly string[];
+}) {
+  return (
+    command: string,
+    args: readonly string[],
+    options: { env?: NodeJS.ProcessEnv },
+  ) => {
+    captured.command = command;
+    captured.args = args;
+    captured.env = options.env;
+    const child = new EventEmitter() as EventEmitter & { unref: () => void };
+    child.unref = () => {};
+    queueMicrotask(() => child.emit("spawn"));
+    return child;
+  };
+}
+
+test("sanitizeCandidateLoopEnv drops FRG signing credential and path vars", () => {
+  const sanitized = sanitizeCandidateLoopEnv(dirtyFrgSigningEnv());
+  for (const name of CANDIDATE_LOOP_DENIED_FRG_ENV) {
+    assert.equal(sanitized[name], undefined, `${name} must be absent`);
+    assert.equal(Object.hasOwn(sanitized, name), false, `${name} must be deleted`);
+  }
+  assert.equal(sanitized.PATH, "/usr/bin");
+  assert.equal(sanitized.PIPELINE_BIN, "/opt/pipeline");
+  assert.equal(dirtyFrgSigningEnv().PIPELINE_FRG_ATTESTATION_KEY, "production-attestor-secret");
+});
+
+test("dispatch spawn strips FRG signing vars from the candidate loop environment", async () => {
+  const captured: { env?: NodeJS.ProcessEnv; command?: string; args?: readonly string[] } = {};
+  const files = new Map<string, string>();
+  const persistCtx = {
+    repoDir: "/repo",
+    workDir: "/tmp/frg-work-env-dispatch",
+    request: baseRequest(),
+    pack: packWithTemplates(),
+    packRunId: "pack-1340-env",
+    frgRunId: "frg-env",
+    requestFingerprint: factoryReleaseRequestFingerprint(baseRequest()),
+    writeFile: async (p: string, body: string) => {
+      files.set(p, body);
+    },
+    readFile: async (p: string) => {
+      const v = files.get(p);
+      if (v === undefined) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+      return v;
+    },
+    fileExists: async (p: string) => files.has(p),
+    now: () => new Date("2026-08-10T12:00:00Z"),
+  };
+  await productionDispatchPackLoop(
+    {
+      repoDir: "/repo",
+      request: baseRequest(),
+      pack: packWithTemplates(),
+      packRunId: "pack-1340-env",
+      issue_numbers: [101, 102],
+      engineTrack: "candidate",
+      label: "factory-gate",
+      persistCtx,
+    },
+    {
+      initBoundLoop: async () => ({ loop_run_id: "loop-env-dispatch" }),
+      spawnCandidateLoop: (args) =>
+        defaultSpawnCandidateLoop(args, {
+          spawn: capturingCandidateSpawn(captured),
+          env: dirtyFrgSigningEnv(),
+        }),
+    },
+  );
+  assert.ok(captured.env, "dispatch must pass an explicit child env");
+  for (const name of CANDIDATE_LOOP_DENIED_FRG_ENV) {
+    assert.equal(captured.env![name], undefined, `${name} must not reach dispatch child`);
+    assert.equal(Object.hasOwn(captured.env!, name), false);
+  }
+  assert.equal(captured.env!.PATH, "/usr/bin");
+  assert.equal(captured.command, "/opt/pipeline");
+  assert.deepEqual(captured.args, [
+    "loop",
+    "--resume",
+    "loop-env-dispatch",
+    "--engine-track",
+    "candidate",
+  ]);
+});
+
+test("resume spawn strips FRG signing vars from the candidate loop environment", async () => {
+  const captured: { env?: NodeJS.ProcessEnv; command?: string; args?: readonly string[] } = {};
+  await defaultResumeBoundPackLoop(
+    { repoDir: "/repo", loop_run_id: "loop-env-resume" },
+    {
+      spawn: capturingCandidateSpawn(captured),
+      env: dirtyFrgSigningEnv(),
+    },
+  );
+  assert.ok(captured.env, "resume must pass an explicit child env");
+  for (const name of CANDIDATE_LOOP_DENIED_FRG_ENV) {
+    assert.equal(captured.env![name], undefined, `${name} must not reach resume child`);
+    assert.equal(Object.hasOwn(captured.env!, name), false);
+  }
+  assert.equal(captured.env!.HOME, "/home/wrapper");
+  assert.equal(captured.command, "/opt/pipeline");
+  assert.deepEqual(captured.args, [
+    "loop",
+    "--resume",
+    "loop-env-resume",
+    "--engine-track",
+    "candidate",
+  ]);
 });

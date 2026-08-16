@@ -1145,25 +1145,78 @@ export function observeDetachedChildStart(child: {
   });
 }
 
-export async function defaultSpawnCandidateLoop(args: {
-  repoDir: string;
-  loop_run_id: string;
-}): Promise<void> {
-  const { spawn } = await import("node:child_process");
-  const bin = process.env.PIPELINE_BIN?.trim() || "pipeline";
-  const child = spawn(
+/**
+ * FRG signing credential and credential-path vars. Candidate-track children
+ * must not inherit these from a prepare wrapper that holds the attestor secret.
+ */
+export const CANDIDATE_LOOP_DENIED_FRG_ENV = [
+  "PIPELINE_FRG_ATTESTATION_KEY",
+  "PIPELINE_FRG_ATTESTATION_KEY_FILE",
+] as const;
+
+export type CandidateLoopSpawn = (
+  command: string,
+  args: readonly string[],
+  options: {
+    cwd?: string;
+    detached?: boolean;
+    stdio?: "ignore";
+    env?: NodeJS.ProcessEnv;
+  },
+) => {
+  once(event: "error", listener: (err: Error) => void): unknown;
+  once(event: "spawn", listener: () => void): unknown;
+  unref?: () => void;
+};
+
+/** Copy `source` and drop every supported FRG signing credential / path var. */
+export function sanitizeCandidateLoopEnv(
+  source: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...source };
+  for (const name of CANDIDATE_LOOP_DENIED_FRG_ENV) {
+    delete env[name];
+  }
+  return env;
+}
+
+export async function defaultSpawnCandidateLoop(
+  args: {
+    repoDir: string;
+    loop_run_id: string;
+  },
+  deps: {
+    spawn?: CandidateLoopSpawn;
+    env?: NodeJS.ProcessEnv;
+  } = {},
+): Promise<void> {
+  const spawnImpl = deps.spawn ?? (await import("node:child_process")).spawn;
+  const sourceEnv = deps.env ?? process.env;
+  const bin = sourceEnv.PIPELINE_BIN?.trim() || "pipeline";
+  const child = spawnImpl(
     bin,
     ["loop", "--resume", args.loop_run_id, "--engine-track", "candidate"],
-    { cwd: args.repoDir, detached: true, stdio: "ignore" },
+    {
+      cwd: args.repoDir,
+      detached: true,
+      stdio: "ignore",
+      env: sanitizeCandidateLoopEnv(sourceEnv),
+    },
   );
   await observeDetachedChildStart(child);
 }
 
-export async function defaultResumeBoundPackLoop(args: {
-  repoDir: string;
-  loop_run_id: string;
-}): Promise<void> {
-  await defaultSpawnCandidateLoop(args);
+export async function defaultResumeBoundPackLoop(
+  args: {
+    repoDir: string;
+    loop_run_id: string;
+  },
+  deps: {
+    spawn?: CandidateLoopSpawn;
+    env?: NodeJS.ProcessEnv;
+  } = {},
+): Promise<void> {
+  await defaultSpawnCandidateLoop(args, deps);
 }
 
 /**
@@ -2281,10 +2334,7 @@ export async function runFactoryReleasePrepare(
 
   // Refuse FRG credential material in the candidate environment.
   const env = deps.env ?? process.env;
-  for (const name of [
-    "PIPELINE_FRG_ATTESTATION_KEY",
-    "PIPELINE_FRG_ATTESTATION_KEY_FILE",
-  ] as const) {
+  for (const name of CANDIDATE_LOOP_DENIED_FRG_ENV) {
     const v = env[name];
     if (typeof v === "string" && v.trim() !== "") {
       throw new Error(
