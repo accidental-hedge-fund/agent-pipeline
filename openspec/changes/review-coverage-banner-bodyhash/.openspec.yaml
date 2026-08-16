@@ -1,0 +1,6 @@
+schema: spec-driven
+created: 2026-08-16
+goal: Posted review/delta comments verify (isVerifiedPipelineReviewOutput)
+  including engine-owned banners; verified pipeline reviews with objection
+  wording do not trip findUnacknowledgedComments; real human comments after the
+  plan still block.
