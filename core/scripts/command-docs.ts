@@ -188,7 +188,7 @@ export const COMMAND_DOCS: Record<string, CommandDoc> = {
   },
   "factory-release": {
     summary:
-      "Durable post-pilot FRG generation + prepare-only release handoff (two-call: awaiting_frg_attestation → complete; never merges/tags)",
+      "Durable post-pilot FRG generation + prepare-only release handoff (in_progress → awaiting_frg_attestation → complete; never merges/tags)",
     usage:
       "factory-release prepare --request <absolute-request.json> --json",
     documented: true,

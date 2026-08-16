@@ -121,17 +121,38 @@ Later releases still generate FRG through the durable engine command:
 pipeline factory-release prepare --request <absolute-request.json> --json
 ```
 
-This is an idempotent two-call protocol. The first call runs without the FRG
-credential and returns `awaiting_frg_attestation` with unsigned artifact
-identities and digests. It does **not** open a release PR. Checkpoint state is
-stored under `.agent-pipeline/factory-release/<request-fingerprint>/checkpoint.json`
-(keyed by repository, version, candidate commit, and action identity). The
-wrapper submits those closed artifacts to the fixed trusted attestor. The second
-call uses the **unchanged** request, verifies the production-owned attestation,
-invokes shared `runRelease` (prepare-only), and returns `complete` with one exact
-release pull request, FRG run id, head, base, and restart checkpoint. Repeated
-calls must reconcile the same checkpoint without another pack, attestation,
-branch, or pull request.
+This is an idempotent multi-tick protocol.
+
+1. First call with no request-bound pack loop **starts** a `factory-gate`
+   candidate pack loop (`pipeline loop --engine-track candidate`, work-list or
+   `--label factory-gate`) from `frg-packs/factory-gate-v1/templates/`, writes
+   `factory-release-binding.json` (request fingerprint, candidate SHA, version,
+   manifest), persists `loop_run_id`, and returns `status: "in_progress"`.
+   A re-invoke of the **unchanged** request **resumes** the same `loop_run_id`.
+   It does **not** start a second unbound pack and does **not** adopt the newest
+   unbound `factory-gate` loop. A missing pre-bound loop is a start/resume
+   signal, not `missing_generator` / `pack_loop_missing`.
+2. When the bound loop is terminal, prepare scores it with
+   `pipeline factory-gate --for <version> --from-run <loop_run_id>` (or the
+   in-process equivalent). It does **not** pass `--observations`. Hybrid v2
+   scoring applies: required-live from the candidate pack loop; Layer A TAP
+   hashes on the same candidate SHA. Release-eligible
+   `.agent-pipeline/frg/<version>/latest.json` with `pass: true` is written
+   only on a genuine scorer pass. Fail stays `pass: false`.
+3. After unsigned artifacts exist and no verified production-owned attestation
+   exists, the call returns `awaiting_frg_attestation` with unsigned artifact
+   identities and digests. It does **not** open a release PR. Checkpoint state
+   is stored under
+   `.agent-pipeline/factory-release/<request-fingerprint>/checkpoint.json`
+   (keyed by repository, version, candidate commit, and action identity). The
+   wrapper submits those closed artifacts to the fixed trusted attestor. A later
+   call uses the **unchanged** request, verifies the production-owned
+   attestation, invokes shared `runRelease` (prepare-only), and returns
+   `complete` with one exact release pull request, FRG run id, head, base, and
+   restart checkpoint. Repeated calls must reconcile the same checkpoint
+   without another pack, attestation, branch, or pull request.
+
+Prepare never merges, tags, promotes a pin, or flips Tugboat `--skip-frg`.
 
 **Hard gate:** missing, stale, failed, mismatched, skipped, or waived
 required-live evidence, or a missing/mismatched Layer A TAP hash, yields

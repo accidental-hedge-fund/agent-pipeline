@@ -372,9 +372,11 @@ export function shipCoordinatorDepsFromOperations(
             `ship FRG: no release-eligible candidate artifact for v${intent.version}. ` +
               `Auto-generate genuine FRG via the durable path (not a synthetic trivial pack):\n` +
               `  pipeline factory-release prepare --request <absolute-request.json> --json\n` +
-              `Two-call protocol: first call returns awaiting_frg_attestation; after the ` +
-              `production-owned attestor stores the MAC, the second unchanged call returns ` +
-              `complete (or write attested latest.json and retry ship). ` +
+              `Multi-tick protocol: first call starts/resumes a bound pack loop and ` +
+              `returns in_progress; after the loop is scored --from-run (no --observations) ` +
+              `it returns awaiting_frg_attestation; after the production-owned attestor ` +
+              `stores the MAC, the next unchanged call returns complete (or write attested ` +
+              `latest.json and retry ship). ` +
               `Hybrid pilot remains valid only for exactly v${FRG_HYBRID_PILOT_VERSION}.`,
           );
         }

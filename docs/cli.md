@@ -136,7 +136,7 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 #### `factory-release`
 
 - **Usage:** `pipeline factory-release prepare --request <absolute-request.json> --json`
-- **Summary:** Durable post-pilot FRG generation + prepare-only release handoff (two-call: awaiting_frg_attestation → complete; never merges/tags)
+- **Summary:** Durable post-pilot FRG generation + prepare-only release handoff (in_progress → awaiting_frg_attestation → complete; never merges/tags)
 
 #### `improve`
 

@@ -1,32 +1,34 @@
-// Durable post-pilot FRG generation + prepare-only release handoff (#953 / #908).
+// Durable post-pilot FRG generation + prepare-only release handoff (#953 / #908 / #1037).
 //
 // CLI: pipeline factory-release prepare --request <absolute-request.json> --json
 //
-// Idempotent two-call protocol:
-//   1) No verified production-owned attestation → create/reconcile unsigned FRG
-//      artifacts and return status "awaiting_frg_attestation" (no release PR).
-//   2) After the trusted attestor stores a valid attestation for those exact
+// Idempotent multi-tick protocol:
+//   1) No request-bound pack loop, or bound loop not terminal → start/resume
+//      that factory-gate candidate pack loop and return status "in_progress"
+//      (no pass, no complete, no release PR).
+//   2) Bound loop terminal → score with factory-gate --from-run (no
+//      --observations). If unsigned artifacts are structurally eligible and
+//      no verified production-owned attestation exists →
+//      "awaiting_frg_attestation" (no release PR).
+//   3) After the trusted attestor stores a valid attestation for those exact
 //      artifacts → verify, invoke shared runRelease, return status "complete".
 //
 // Never merges, tags, publishes, promotes, or installs. Never places the FRG
 // signing key or path in the candidate environment, request, or result.
 // Never accepts caller-authored pass / status / metric / receipt claims.
+// Never invents pass: true. Never adopts an unbound newest factory-gate loop.
 
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
   FRG_PACK_MANIFEST,
-  FRG_SCENARIO_IDS,
-  computeFrgEvidence,
-  detectEmptyDependsOnStackHonesty,
   isAllowedFrgPackSelector,
   isReleaseEligibleFrgPass,
   itemsFromLoopLedger,
   normalizeFrgVersion,
   parseFrgEvidenceJson,
-  parseFrgObservationsJson,
-  projectCompositionFromScoreboard,
+  runFactoryGate,
   validateFrgPackContract,
   validateReleaseEligibleFrgEvidence,
   type FrgCompositionOverride,
@@ -37,7 +39,9 @@ import {
   defaultFrgPackRoot,
   FRG_HYBRID_PILOT_VERSION,
   loadFrgPack,
+  renderFrgPackIssues,
   type LoadedFrgPack,
+  type RenderedFrgIssue,
 } from "./frg-pack-observations.ts";
 import {
   defaultLoopStoreDeps,
@@ -159,6 +163,20 @@ export interface FactoryReleasePrepareRequest {
   frg_manifest: { pack_id: string; sha256: string };
 }
 
+export interface FactoryReleaseInProgressResult {
+  schema_version: 1;
+  kind: typeof FACTORY_RELEASE_CHECKPOINT_KIND;
+  status: "in_progress";
+  action_id: string;
+  grant_fingerprint: string;
+  repository: string;
+  base_branch: string;
+  target_version: string;
+  candidate_git_sha: string;
+  loop_run_id: string;
+  checkpoint: string;
+}
+
 export interface FactoryReleaseAwaitingResult {
   schema_version: 1;
   kind: typeof FACTORY_RELEASE_CHECKPOINT_KIND;
@@ -211,6 +229,7 @@ export interface FactoryReleaseFailedResult {
 }
 
 export type FactoryReleaseResult =
+  | FactoryReleaseInProgressResult
   | FactoryReleaseAwaitingResult
   | FactoryReleaseCompleteResult
   | FactoryReleaseFailedResult;
@@ -247,6 +266,13 @@ export interface UnsignedFrgGenerationResult {
   structurally_eligible: boolean;
   defect_class?: string;
   message?: string;
+  /**
+   * Bound pack loop started or resumed and is not terminal.
+   * Prepare MUST return status "in_progress" (exit 0) — not failed / complete.
+   */
+  in_progress?: boolean;
+  /** Bound loop run id when started, resumed, or scored. */
+  loop_run_id?: string;
 }
 
 export interface ObservedAttestation {
@@ -290,6 +316,23 @@ export interface FactoryReleasePrepareDeps {
     opts: ReleaseOpts,
     cfg: { repo_dir: string; repo: string; base_branch?: string },
   ): Promise<ReleasePrepareResult | null | void>;
+  /**
+   * Start a request-bound factory-gate pack loop. Production default creates
+   * or reuses pack issues and dispatches `pipeline loop --engine-track candidate`.
+   * Unit tests inject this seam — no real subprocess.
+   */
+  startBoundPackLoop?: (
+    ctx: DurableReconcilePackLoopCtx,
+  ) => Promise<{ loop_run_id: string } | null>;
+  /** Create or reuse factory-gate pack issues from rendered templates. */
+  createOrReusePackIssues?: CreateOrReusePackIssues;
+  /** Dispatch a candidate-track durable loop for the pack work-list. */
+  dispatchPackLoop?: DispatchPackLoop;
+  /**
+   * Terminal score of a bound pack loop. Production default is
+   * `runFactoryGate({ fromRun, writeEvidence })` with no observations.
+   */
+  scoreBoundPackLoop?: ScoreBoundPackLoop;
   /** Optional log sink. */
   log?(msg: string): void;
 }
@@ -665,6 +708,56 @@ export interface FactoryReleaseUnsignedDigestBinding {
   };
 }
 
+export interface CreateOrReusePackIssuesInput {
+  repoDir: string;
+  request: FactoryReleasePrepareRequest;
+  pack: LoadedFrgPack;
+  packRunId: string;
+  rendered: RenderedFrgIssue[];
+}
+
+export type CreateOrReusePackIssues = (
+  input: CreateOrReusePackIssuesInput,
+) => Promise<{ issue_numbers: number[] }>;
+
+export type FactoryReleaseLoopDispatchState = "bound" | "dispatched";
+
+export interface DispatchPackLoopInput {
+  repoDir: string;
+  request: FactoryReleasePrepareRequest;
+  pack: LoadedFrgPack;
+  packRunId: string;
+  issue_numbers: number[];
+  engineTrack: "candidate";
+  label: string;
+  /** When set, production dispatch persists the request binding before spawn. */
+  persistCtx?: DurableReconcilePackLoopCtx;
+}
+
+export type DispatchPackLoop = (
+  input: DispatchPackLoopInput,
+) => Promise<{ loop_run_id: string }>;
+
+export interface ScoreBoundPackLoopArgs {
+  version: string;
+  fromRun: string;
+  repoDir: string;
+  request: FactoryReleasePrepareRequest;
+  loop: DurablePackLoopArtifacts;
+  pack: LoadedFrgPack;
+  now: () => Date;
+}
+
+export interface ScoreBoundPackLoopResult {
+  evidence: FrgEvidence;
+  evidencePath: string | null;
+  latestPath: string | null;
+}
+
+export type ScoreBoundPackLoop = (
+  args: ScoreBoundPackLoopArgs,
+) => Promise<ScoreBoundPackLoopResult>;
+
 export interface DurableGenerateOptions {
   /**
    * Reconcile a pack loop bound to this exact request fingerprint / candidate /
@@ -674,12 +767,28 @@ export interface DurableGenerateOptions {
     ctx: DurableReconcilePackLoopCtx,
   ) => Promise<DurablePackLoopArtifacts | null>;
   /**
-   * Optional start of a fresh fixed-pack durable loop for this request.
-   * When provided and no bound loop exists, called once then re-reconciled.
+   * Start of a fresh fixed-pack durable loop for this request.
+   * Production default creates/reuses pack issues and dispatches a candidate
+   * pack loop. When no bound loop exists, called once.
    */
   startBoundPackLoop?: (
     ctx: DurableReconcilePackLoopCtx,
   ) => Promise<{ loop_run_id: string } | null>;
+  createOrReusePackIssues?: CreateOrReusePackIssues;
+  dispatchPackLoop?: DispatchPackLoop;
+  /**
+   * Resume a request-bound run whose binding was persisted but whose spawn
+   * never confirmed. Tests inject this seam — no real subprocess.
+   */
+  resumeBoundPackLoop?: (args: {
+    repoDir: string;
+    loop_run_id: string;
+  }) => Promise<void>;
+  /**
+   * Terminal score through factory-gate --from-run (no --observations).
+   * Tests inject this seam.
+   */
+  scoreBoundPackLoop?: ScoreBoundPackLoop;
   writeFile?: (path: string, body: string, mode?: number) => Promise<void>;
   mkdir?: (path: string, opts?: { recursive?: boolean; mode?: number }) => Promise<void>;
   readFile?: (path: string) => Promise<string>;
@@ -714,6 +823,471 @@ export function factoryReleasePackInstancePath(workDir: string): string {
 
 export function factoryReleaseLoopBindingPath(loopRunId: string): string {
   return path.join(runDir(defaultLoopStoreDeps(), loopRunId), "factory-release-binding.json");
+}
+
+/** True when the binding was persisted but spawn never confirmed. */
+export function isPendingLoopDispatch(binding: Record<string, unknown>): boolean {
+  return binding.dispatch_state === "bound";
+}
+
+/**
+ * Persist pack-instance `loop_run_id` and the matching loop binding.
+ * Callers write `bound` before spawn and `dispatched` after spawn confirms.
+ */
+export async function persistFactoryReleaseLoopBinding(
+  ctx: DurableReconcilePackLoopCtx,
+  loopRunId: string,
+  dispatchState: FactoryReleaseLoopDispatchState,
+): Promise<void> {
+  const loopBindingPath = factoryReleaseLoopBindingPath(loopRunId);
+  await ctx.writeFile(
+    loopBindingPath,
+    canonicalJson({
+      schema_version: 1,
+      kind: "factory_release_loop_binding",
+      request_fingerprint: ctx.requestFingerprint,
+      target_version: ctx.request.target_version,
+      candidate_git_sha: ctx.request.integrated_candidate.git_sha,
+      pack_id: ctx.request.frg_manifest.pack_id,
+      manifest_sha256: ctx.request.frg_manifest.sha256,
+      pack_run_id: ctx.packRunId,
+      frg_run_id: ctx.frgRunId,
+      loop_run_id: loopRunId,
+      dispatch_state: dispatchState,
+    }),
+    0o600,
+  );
+  const instancePath = factoryReleasePackInstancePath(ctx.workDir);
+  let createdAt = isoNow(ctx.now());
+  if (await ctx.fileExists(instancePath)) {
+    try {
+      const raw = JSON.parse(await ctx.readFile(instancePath)) as FactoryReleasePackInstance;
+      if (raw.kind === "factory_release_pack_instance" && typeof raw.created_at === "string") {
+        createdAt = raw.created_at;
+      }
+    } catch {
+      // Replace an unreadable instance with a fresh matching record.
+    }
+  }
+  await ctx.writeFile(
+    instancePath,
+    canonicalJson({
+      schema_version: 1,
+      kind: "factory_release_pack_instance",
+      request_fingerprint: ctx.requestFingerprint,
+      target_version: ctx.request.target_version,
+      candidate_git_sha: ctx.request.integrated_candidate.git_sha,
+      pack_id: ctx.request.frg_manifest.pack_id,
+      manifest_sha256: ctx.request.frg_manifest.sha256,
+      pack_run_id: ctx.packRunId,
+      frg_run_id: ctx.frgRunId,
+      loop_run_id: loopRunId,
+      created_at: createdAt,
+      updated_at: isoNow(ctx.now()),
+    } satisfies FactoryReleasePackInstance),
+    0o600,
+  );
+}
+
+async function boundLoopNeedsDispatchRetry(
+  loopRunId: string,
+  request: FactoryReleasePrepareRequest,
+  fingerprint: string,
+  readFile: (p: string) => Promise<string>,
+  fileExists: (p: string) => Promise<boolean>,
+): Promise<boolean> {
+  const bindingPath = factoryReleaseLoopBindingPath(loopRunId);
+  if (!(await fileExists(bindingPath))) return false;
+  try {
+    const binding = JSON.parse(await readFile(bindingPath)) as Record<string, unknown>;
+    return loopBindingMatchesRequest(binding, request, fingerprint) && isPendingLoopDispatch(binding);
+  } catch {
+    return false;
+  }
+}
+
+const TERMINAL_PACK_ITEM_STATES = new Set([
+  "ready",
+  "merged",
+  "released",
+  "deployed",
+  "abandoned",
+  "skipped",
+]);
+
+/**
+ * True when the bound pack loop has finished driving: ledger.stop is set, or
+ * every item is in a terminal item state. An empty / unparsable ledger is
+ * not terminal (in-progress / still starting).
+ */
+export function isBoundPackLoopTerminal(loop: DurablePackLoopArtifacts): boolean {
+  let ledger: { stop?: unknown; items?: Record<string, { state?: string }> };
+  try {
+    ledger = JSON.parse(loop.ledger_text) as {
+      stop?: unknown;
+      items?: Record<string, { state?: string }>;
+    };
+  } catch {
+    return false;
+  }
+  if (ledger.stop) return true;
+  const items = Object.values(ledger.items ?? {});
+  if (items.length === 0) return false;
+  return items.every(
+    (item) => typeof item?.state === "string" && TERMINAL_PACK_ITEM_STATES.has(item.state),
+  );
+}
+
+function loopBindingMatchesRequest(
+  binding: Record<string, unknown>,
+  request: FactoryReleasePrepareRequest,
+  fingerprint: string,
+): boolean {
+  return (
+    binding.request_fingerprint === fingerprint &&
+    binding.target_version === request.target_version &&
+    binding.candidate_git_sha === request.integrated_candidate.git_sha &&
+    binding.manifest_sha256 === request.frg_manifest.sha256 &&
+    binding.pack_id === request.frg_manifest.pack_id
+  );
+}
+
+function nonTerminalBoundStub(loopRunId: string): DurablePackLoopArtifacts {
+  return {
+    loop_run_id: loopRunId,
+    contract_text: "",
+    ledger_text: "{}",
+    events_text: "",
+    action_evidence_text: "{}\n",
+  };
+}
+
+/**
+ * Production start: render factory-gate-v1 templates, create or reuse pack
+ * issues to the manifest minimum, dispatch `pipeline loop --engine-track
+ * candidate` via the injected dispatch seam.
+ */
+export async function defaultStartBoundPackLoop(
+  ctx: DurableReconcilePackLoopCtx,
+  opts: Pick<DurableGenerateOptions, "createOrReusePackIssues" | "dispatchPackLoop"> = {},
+): Promise<{ loop_run_id: string } | null> {
+  const create = opts.createOrReusePackIssues;
+  const dispatch = opts.dispatchPackLoop;
+  if (!create || !dispatch) {
+    throw new Error(
+      "factory-release prepare: startBoundPackLoop requires createOrReusePackIssues " +
+        "and dispatchPackLoop seams (inject in tests; production defaultFactoryReleasePrepareDeps wires them)",
+    );
+  }
+  const rendered = renderFrgPackIssues(ctx.pack, {
+    release_version: ctx.request.target_version,
+    pack_run_id: ctx.packRunId,
+  });
+  const minimum = ctx.pack.manifest.minimum_fresh_issues;
+  if (rendered.length < minimum) {
+    throw new Error(
+      `factory-release prepare: factory-gate-v1 templates produced ${rendered.length} ` +
+        `issues; manifest minimum_fresh_issues is ${minimum}`,
+    );
+  }
+  const created = await create({
+    repoDir: ctx.repoDir,
+    request: ctx.request,
+    pack: ctx.pack,
+    packRunId: ctx.packRunId,
+    rendered,
+  });
+  if (created.issue_numbers.length < minimum) {
+    throw new Error(
+      `factory-release prepare: create/reuse returned ${created.issue_numbers.length} ` +
+        `issues; manifest minimum_fresh_issues is ${minimum}`,
+    );
+  }
+  const selector = ctx.pack.manifest.selector;
+  const label = selector.type === "label" ? selector.value : "factory-gate";
+  return dispatch({
+    repoDir: ctx.repoDir,
+    request: ctx.request,
+    pack: ctx.pack,
+    packRunId: ctx.packRunId,
+    issue_numbers: created.issue_numbers,
+    engineTrack: "candidate",
+    label,
+    persistCtx: ctx,
+  });
+}
+
+/**
+ * In-process equivalent of `pipeline factory-gate --for <ver> --from-run <id>`.
+ * Never accepts --observations / scenarioOverrides / a work-directory file.
+ */
+export async function defaultScoreBoundPackLoop(
+  args: ScoreBoundPackLoopArgs,
+): Promise<ScoreBoundPackLoopResult> {
+  let contract: LoopContract;
+  try {
+    contract = JSON.parse(args.loop.contract_text) as LoopContract;
+  } catch (err) {
+    throw new Error(
+      `factory-release prepare: terminal score requires a loadable loop contract: ${(err as Error).message}`,
+    );
+  }
+  let ledger;
+  try {
+    ledger = JSON.parse(args.loop.ledger_text);
+  } catch (err) {
+    throw new Error(
+      `factory-release prepare: terminal score requires a loadable loop ledger: ${(err as Error).message}`,
+    );
+  }
+  const result = await runFactoryGate({
+    version: args.version,
+    repoDir: args.repoDir,
+    fromRun: args.fromRun,
+    writeEvidence: false,
+    loadLedger: async () => ledger,
+    loadContract: async () => contract,
+    // Explicit: no --observations, no scenario/composition overrides, no
+    // caller-authored pack provenance. Hybrid v2 inside the scorer applies.
+    attestationKey: null,
+    stdout: () => {},
+    stderr: () => {},
+    now: args.now,
+  });
+  return {
+    evidence: result.evidence,
+    evidencePath: result.evidencePath,
+    latestPath: result.latestPath,
+  };
+}
+
+/**
+ * Production create/reuse: reuse open factory-gate issues that already carry
+ * this pack_run_id + template_id; create the rest via gh.
+ */
+export async function productionCreateOrReusePackIssues(
+  input: CreateOrReusePackIssuesInput,
+  deps: {
+    listOpenPackIssues?: (repo: string, labels: string[]) => Promise<
+      Array<{ number: number; title: string; body: string }>
+    >;
+    createIssue?: (title: string, body: string, labels: string[]) => Promise<number>;
+  } = {},
+): Promise<{ issue_numbers: number[] }> {
+  const list =
+    deps.listOpenPackIssues ??
+    (async (repo, labels) => {
+      const { getOpenIssues } = await import("./gh.ts");
+      const open = await getOpenIssues(repo, { labels });
+      return open.map((issue) => ({
+        number: issue.number,
+        title: issue.title,
+        body: issue.body,
+      }));
+    });
+  const create =
+    deps.createIssue ??
+    (async (title, body, labels) => {
+      const { createIssue } = await import("./gh.ts");
+      const { resolveConfig } = await import("./config.ts");
+      const cfg = resolveConfig({ repoPath: input.repoDir });
+      return createIssue(cfg, title, body, labels);
+    });
+  const open = await list(input.request.repository, input.pack.manifest.issue_labels);
+  const numbers: number[] = [];
+  for (const rendered of input.rendered) {
+    const existing = open.find(
+      (issue) =>
+        issue.body.includes(input.packRunId) &&
+        issue.body.includes(rendered.provenance.template_id),
+    );
+    if (existing) {
+      numbers.push(existing.number);
+      continue;
+    }
+    numbers.push(await create(rendered.title, rendered.body, rendered.labels));
+  }
+  return { issue_numbers: numbers };
+}
+
+export type SpawnCandidateLoop = (args: {
+  repoDir: string;
+  loop_run_id: string;
+  issue_numbers: number[];
+  engineTrack: "candidate";
+  label: string;
+}) => Promise<void>;
+
+/**
+ * Wait for detached `spawn` or `error` before treating launch as confirmed.
+ * Do not unref until spawn succeeds — otherwise startup ENOENT is lost.
+ */
+export function observeDetachedChildStart(child: {
+  once(event: "error", listener: (err: Error) => void): unknown;
+  once(event: "spawn", listener: () => void): unknown;
+  unref?: () => void;
+}): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const onError = (err: Error) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    };
+    const onSpawn = () => {
+      if (settled) return;
+      settled = true;
+      child.unref?.();
+      resolve();
+    };
+    child.once("error", onError);
+    child.once("spawn", onSpawn);
+  });
+}
+
+/**
+ * FRG signing credential and credential-path vars. Candidate-track children
+ * must not inherit these from a prepare wrapper that holds the attestor secret.
+ */
+export const CANDIDATE_LOOP_DENIED_FRG_ENV = [
+  "PIPELINE_FRG_ATTESTATION_KEY",
+  "PIPELINE_FRG_ATTESTATION_KEY_FILE",
+] as const;
+
+export type CandidateLoopSpawn = (
+  command: string,
+  args: readonly string[],
+  options: {
+    cwd?: string;
+    detached?: boolean;
+    stdio?: "ignore";
+    env?: NodeJS.ProcessEnv;
+  },
+) => {
+  once(event: "error", listener: (err: Error) => void): unknown;
+  once(event: "spawn", listener: () => void): unknown;
+  unref?: () => void;
+};
+
+/** Copy `source` and drop every supported FRG signing credential / path var. */
+export function sanitizeCandidateLoopEnv(
+  source: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...source };
+  for (const name of CANDIDATE_LOOP_DENIED_FRG_ENV) {
+    delete env[name];
+  }
+  return env;
+}
+
+export async function defaultSpawnCandidateLoop(
+  args: {
+    repoDir: string;
+    loop_run_id: string;
+  },
+  deps: {
+    spawn?: CandidateLoopSpawn;
+    env?: NodeJS.ProcessEnv;
+  } = {},
+): Promise<void> {
+  const spawnImpl = deps.spawn ?? (await import("node:child_process")).spawn;
+  const sourceEnv = deps.env ?? process.env;
+  const bin = sourceEnv.PIPELINE_BIN?.trim() || "pipeline";
+  const child = spawnImpl(
+    bin,
+    ["loop", "--resume", args.loop_run_id, "--engine-track", "candidate"],
+    {
+      cwd: args.repoDir,
+      detached: true,
+      stdio: "ignore",
+      env: sanitizeCandidateLoopEnv(sourceEnv),
+    },
+  );
+  await observeDetachedChildStart(child);
+}
+
+export async function defaultResumeBoundPackLoop(
+  args: {
+    repoDir: string;
+    loop_run_id: string;
+  },
+  deps: {
+    spawn?: CandidateLoopSpawn;
+    env?: NodeJS.ProcessEnv;
+  } = {},
+): Promise<void> {
+  await defaultSpawnCandidateLoop(args, deps);
+}
+
+/**
+ * Production dispatch: allocate/init the work-list run, persist the request
+ * binding, then spawn a detached `pipeline loop --resume <id> --engine-track
+ * candidate`. Spawn is startup-observable (error rejects; spawn confirms).
+ */
+export async function productionDispatchPackLoop(
+  input: DispatchPackLoopInput,
+  deps: {
+    spawnCandidateLoop?: SpawnCandidateLoop;
+    initBoundLoop?: (args: {
+      repoDir: string;
+      issue_numbers: number[];
+      label: string;
+    }) => Promise<{ loop_run_id: string }>;
+    persistBinding?: (loop_run_id: string) => Promise<void>;
+    markDispatched?: (loop_run_id: string) => Promise<void>;
+  } = {},
+): Promise<{ loop_run_id: string }> {
+  const init =
+    deps.initBoundLoop ??
+    (async ({ repoDir, issue_numbers, label }) => {
+      const { compileWorkListRunFresh, workListRunId } = await import("./pipeline.ts");
+      const { resolveConfig } = await import("./config.ts");
+      const { initRecoverableRun } = await import("./loop/recovery.ts");
+      const { defaultLoopStoreDeps, runExists } = await import("./loop/store.ts");
+      const { realWorkListDependencyDiscoverDeps } = await import("./loop/work-list-deps.ts");
+      const cfg = resolveConfig({ repoPath: repoDir });
+      const issues = issue_numbers.map(String);
+      const loop_run_id = workListRunId(cfg.repo, "codex", issues);
+      const store = defaultLoopStoreDeps();
+      if (!(await runExists(store, loop_run_id))) {
+        const compiled = await compileWorkListRunFresh(
+          cfg,
+          "codex",
+          issues,
+          loop_run_id,
+          realWorkListDependencyDiscoverDeps(cfg),
+          { type: "label", value: label },
+        );
+        await initRecoverableRun(store, compiled.contract, compiled.ledger);
+      }
+      return { loop_run_id };
+    });
+  const { loop_run_id } = await init({
+    repoDir: input.repoDir,
+    issue_numbers: input.issue_numbers,
+    label: input.label,
+  });
+  const persist =
+    deps.persistBinding ??
+    (input.persistCtx
+      ? (id: string) => persistFactoryReleaseLoopBinding(input.persistCtx!, id, "bound")
+      : null);
+  if (persist) await persist(loop_run_id);
+  const spawn = deps.spawnCandidateLoop ?? defaultSpawnCandidateLoop;
+  await spawn({
+    repoDir: input.repoDir,
+    loop_run_id,
+    issue_numbers: input.issue_numbers,
+    engineTrack: "candidate",
+    label: input.label,
+  });
+  const mark =
+    deps.markDispatched ??
+    (input.persistCtx
+      ? (id: string) => persistFactoryReleaseLoopBinding(input.persistCtx!, id, "dispatched")
+      : null);
+  if (mark) await mark(loop_run_id);
+  return { loop_run_id };
 }
 
 export function buildFactoryReleaseUnsignedDigestBinding(
@@ -839,13 +1413,7 @@ async function loadBoundLoopArtifacts(
       } catch {
         return null;
       }
-      if (
-        binding.request_fingerprint !== fingerprint ||
-        binding.target_version !== request.target_version ||
-        binding.candidate_git_sha !== request.integrated_candidate.git_sha ||
-        binding.manifest_sha256 !== request.frg_manifest.sha256 ||
-        binding.pack_id !== request.frg_manifest.pack_id
-      ) {
+      if (!loopBindingMatchesRequest(binding, request, fingerprint)) {
         return null;
       }
     }
@@ -946,7 +1514,20 @@ export async function defaultReconcileBoundPackLoop(
       ctx.fileExists,
     );
     if (loaded) return loaded;
-    // Stale loop id — clear and fall through.
+    // Binding matches but artifacts are not loadable yet (loop still starting).
+    // Keep the bound id — do not adopt an unbound newest factory-gate loop.
+    const bindingPath = factoryReleaseLoopBindingPath(instance.loop_run_id);
+    if (await ctx.fileExists(bindingPath)) {
+      try {
+        const binding = JSON.parse(await ctx.readFile(bindingPath)) as Record<string, unknown>;
+        if (loopBindingMatchesRequest(binding, ctx.request, ctx.requestFingerprint)) {
+          return nonTerminalBoundStub(instance.loop_run_id);
+        }
+      } catch {
+        // Fall through to stale-clear only when the binding is unusable.
+      }
+    }
+    // Stale loop id with no matching binding — clear and fall through.
     instance = {
       ...instance,
       loop_run_id: null,
@@ -979,14 +1560,33 @@ export async function defaultReconcileBoundPackLoop(
       ctx.readFile,
       ctx.fileExists,
     );
-    if (!loaded) continue;
-    instance = {
-      ...instance,
-      loop_run_id: runId,
-      updated_at: isoNow(ctx.now()),
-    };
-    await ctx.writeFile(instancePath, canonicalJson(instance), 0o600);
-    return loaded;
+    if (loaded) {
+      instance = {
+        ...instance,
+        loop_run_id: runId,
+        updated_at: isoNow(ctx.now()),
+      };
+      await ctx.writeFile(instancePath, canonicalJson(instance), 0o600);
+      return loaded;
+    }
+    // Binding persisted before spawn/artifacts — adopt the same run, do not start another.
+    try {
+      const binding = JSON.parse(await ctx.readFile(bindingPath)) as Record<string, unknown>;
+      if (
+        loopBindingMatchesRequest(binding, ctx.request, ctx.requestFingerprint) &&
+        isPendingLoopDispatch(binding)
+      ) {
+        instance = {
+          ...instance,
+          loop_run_id: runId,
+          updated_at: isoNow(ctx.now()),
+        };
+        await ctx.writeFile(instancePath, canonicalJson(instance), 0o600);
+        return nonTerminalBoundStub(runId);
+      }
+    } catch {
+      // Unreadable binding — keep scanning.
+    }
   }
 
   return null;
@@ -995,9 +1595,9 @@ export async function defaultReconcileBoundPackLoop(
 /**
  * Durable post-pilot unsigned FRG generator.
  *
- * Instantiates a request-bound pack instance, collects evidence only from the
- * durable loop + live-run artifacts (never Layer A / pilot hybrid), scores
- * structural eligibility without the FRG signing key, and writes closed
+ * Instantiates a request-bound pack instance, starts or resumes a bound
+ * factory-gate candidate pack loop when none exists, scores a terminal loop
+ * with factory-gate --from-run (no --observations), and writes closed
  * artifact digests under workDir. Synthetic trivial docs packs are never
  * accepted as release-eligible.
  */
@@ -1021,6 +1621,15 @@ export async function generateDurableUnsignedFrg(
     opts.readFile ?? ((p: string) => fs.readFile(p, "utf8"));
   const fileExists = opts.fileExists ?? defaultFileExists;
   const reconcilePackLoop = opts.reconcilePackLoop ?? defaultReconcileBoundPackLoop;
+  const startBoundPackLoop =
+    opts.startBoundPackLoop ??
+    ((startCtx: DurableReconcilePackLoopCtx) =>
+      defaultStartBoundPackLoop(startCtx, {
+        createOrReusePackIssues: opts.createOrReusePackIssues,
+        dispatchPackLoop: opts.dispatchPackLoop,
+      }));
+  const resumeBoundPackLoop = opts.resumeBoundPackLoop ?? defaultResumeBoundPackLoop;
+  const scoreBoundPackLoop = opts.scoreBoundPackLoop ?? defaultScoreBoundPackLoop;
 
   const requestFingerprint = factoryReleaseRequestFingerprint(request);
   const packRunId = `pack-${request.target_version.replace(/\./g, "")}-${request.action_id}`.slice(
@@ -1064,64 +1673,80 @@ export async function generateDurableUnsignedFrg(
   };
 
   let loop = await reconcilePackLoop(reconcileCtx);
-  if (!loop && opts.startBoundPackLoop) {
-    const started = await opts.startBoundPackLoop(reconcileCtx);
+  if (!loop) {
+    let started: { loop_run_id: string } | null = null;
+    try {
+      started = await startBoundPackLoop(reconcileCtx);
+    } catch (err) {
+      return refuseSyntheticTrivialPack(request, {
+        defect_class: "pack_loop_start_failed",
+        message:
+          `factory-release prepare: failed to start a request-bound factory-gate pack loop ` +
+          `for ${request.target_version}: ${(err as Error).message}`,
+      });
+    }
     if (started?.loop_run_id) {
-      // Persist binding on the started loop so later reconcile accepts only this run.
-      const storeDeps = defaultLoopStoreDeps();
-      const loopBindingPath = path.join(
-        runDir(storeDeps, started.loop_run_id),
-        "factory-release-binding.json",
-      );
-      await writeFile(
-        loopBindingPath,
-        canonicalJson({
-          schema_version: 1,
-          kind: "factory_release_loop_binding",
-          request_fingerprint: requestFingerprint,
-          target_version: request.target_version,
-          candidate_git_sha: request.integrated_candidate.git_sha,
-          pack_id: request.frg_manifest.pack_id,
-          manifest_sha256: request.frg_manifest.sha256,
-          pack_run_id: packRunId,
-          frg_run_id: frgRunId,
-          loop_run_id: started.loop_run_id,
-        }),
-        0o600,
-      );
-      const instancePath = factoryReleasePackInstancePath(ctx.workDir);
-      await writeFile(
-        instancePath,
-        canonicalJson({
-          schema_version: 1,
-          kind: "factory_release_pack_instance",
-          request_fingerprint: requestFingerprint,
-          target_version: request.target_version,
-          candidate_git_sha: request.integrated_candidate.git_sha,
-          pack_id: request.frg_manifest.pack_id,
-          manifest_sha256: request.frg_manifest.sha256,
-          pack_run_id: packRunId,
-          frg_run_id: frgRunId,
-          loop_run_id: started.loop_run_id,
-          created_at: isoNow(now()),
-          updated_at: isoNow(now()),
-        } satisfies FactoryReleasePackInstance),
-        0o600,
-      );
+      // Safety-net persist after a successful start. Production dispatch already
+      // wrote `bound` before spawn and `dispatched` after spawn confirmed.
+      await persistFactoryReleaseLoopBinding(reconcileCtx, started.loop_run_id, "dispatched");
       loop = await reconcilePackLoop(reconcileCtx);
+      if (!loop) {
+        loop = nonTerminalBoundStub(started.loop_run_id);
+      }
+    }
+  } else if (
+    await boundLoopNeedsDispatchRetry(
+      loop.loop_run_id,
+      request,
+      requestFingerprint,
+      readFile,
+      fileExists,
+    )
+  ) {
+    try {
+      await resumeBoundPackLoop({
+        repoDir: ctx.repoDir,
+        loop_run_id: loop.loop_run_id,
+      });
+      await persistFactoryReleaseLoopBinding(reconcileCtx, loop.loop_run_id, "dispatched");
+    } catch (err) {
+      return refuseSyntheticTrivialPack(request, {
+        defect_class: "pack_loop_start_failed",
+        message:
+          `factory-release prepare: failed to resume request-bound factory-gate pack loop ` +
+          `${loop.loop_run_id} for ${request.target_version}: ${(err as Error).message}`,
+      });
     }
   }
 
   if (!loop) {
     return refuseSyntheticTrivialPack(request, {
-      defect_class: "pack_loop_missing",
+      defect_class: "pack_loop_start_failed",
       message:
-        `factory-release prepare: no request-bound factory-gate pack loop for ${request.target_version} ` +
-        `(fingerprint=${requestFingerprint.slice(0, 12)}…, candidate=${request.integrated_candidate.git_sha}). ` +
-        `A fresh pack instance was created under the factory-release work dir; bind a durable loop ` +
-        `with factory-release-binding.json (request fingerprint, candidate, version, manifest) and re-run. ` +
-        `Unbound prior loops and synthetic trivial docs packs are not release-eligible after v${FRG_HYBRID_PILOT_VERSION}.`,
+        `factory-release prepare: could not start a request-bound factory-gate pack loop for ` +
+        `${request.target_version} (fingerprint=${requestFingerprint.slice(0, 12)}…, ` +
+        `candidate=${request.integrated_candidate.git_sha}). Unbound prior factory-gate loops ` +
+        `are not adopted. Synthetic trivial docs packs are not release-eligible after ` +
+        `v${FRG_HYBRID_PILOT_VERSION}.`,
     });
+  }
+
+  if (!isBoundPackLoopTerminal(loop)) {
+    return {
+      frg: {
+        ...refusedFrgPayload(request),
+        loop_run_id: loop.loop_run_id,
+        pack_run_id: packRunId,
+        frg_run_id: frgRunId,
+      },
+      structurally_eligible: false,
+      in_progress: true,
+      loop_run_id: loop.loop_run_id,
+      defect_class: "frg_running",
+      message:
+        `factory-release prepare: bound pack loop ${loop.loop_run_id} is in progress for ` +
+        `${request.target_version}; re-invoke the same request to resume.`,
+    };
   }
 
   let contract: LoopContract;
@@ -1141,11 +1766,10 @@ export async function generateDurableUnsignedFrg(
     });
   }
 
-  let ledgerItems;
   let ledger;
   try {
     ledger = JSON.parse(loop.ledger_text);
-    ledgerItems = itemsFromLoopLedger(ledger);
+    itemsFromLoopLedger(ledger);
   } catch (err) {
     return refuseSyntheticTrivialPack(request, {
       defect_class: "ledger_unparsable",
@@ -1153,172 +1777,64 @@ export async function generateDurableUnsignedFrg(
     });
   }
 
-  // Collect runner-owned observations ONLY from the reconciled request-bound
-  // loop (loop.runner_observations_text, loaded from the loop run store after
-  // factory-release-binding verification). Never read a work-directory
-  // runner-observations.json — that path is caller-writable and would let a
-  // pre-staged all-pass file forge release-eligible scenario/composition
-  // statuses (closed-input / caller-authored-pass requirement).
-  // Refuse Layer A provenance; accept live/ledger/derived/observation only.
-  const scenarioById = new Map<string, FrgScenarioOverride>();
-  const compositionById = new Map<string, FrgCompositionOverride>();
-  let falseHumanAuthorityCount = 0;
-  let recoveryAggregates: Parameters<typeof computeFrgEvidence>[0]["recovery_aggregates"];
-
-  const observationCandidates: string[] = [];
-  if (loop.runner_observations_text) observationCandidates.push(loop.runner_observations_text);
-
-  for (const text of observationCandidates) {
-    let parsed;
-    try {
-      parsed = parseFrgObservationsJson(text);
-    } catch (err) {
-      return refuseSyntheticTrivialPack(request, {
-        defect_class: "runner_observations_invalid",
-        message:
-          `factory-release prepare: runner observations unusable: ${(err as Error).message}`,
-      });
-    }
-    if (parsed.pack_provenance != null) {
-      return refuseSyntheticTrivialPack(request, {
-        defect_class: "hybrid_provenance_refused",
-        message:
-          `factory-release prepare: hybrid pack_provenance is not accepted for ` +
-          `${request.target_version}; durable full-current FRG policy applies after v${FRG_HYBRID_PILOT_VERSION}`,
-      });
-    }
-    for (const s of parsed.scenarios ?? []) {
-      try {
-        refuseLayerASource(s.source, `scenario ${s.id}`);
-      } catch (err) {
-        return refuseSyntheticTrivialPack(request, {
-          defect_class: "layer_a_refused",
-          message: (err as Error).message,
-        });
-      }
-      scenarioById.set(s.id, s);
-    }
-    for (const c of parsed.composition ?? []) {
-      try {
-        refuseLayerASource(c.source, `composition ${c.id}`);
-      } catch (err) {
-        return refuseSyntheticTrivialPack(request, {
-          defect_class: "layer_a_refused",
-          message: (err as Error).message,
-        });
-      }
-      compositionById.set(c.id, c);
-    }
-    if (typeof parsed.false_human_authority_count === "number") {
-      falseHumanAuthorityCount = parsed.false_human_authority_count;
-    }
-    if (parsed.recovery_aggregates) recoveryAggregates = parsed.recovery_aggregates;
-  }
-
-  // Contract-derived honesty scenario (ledger/derived — never Layer A).
-  const stackHonesty = detectEmptyDependsOnStackHonesty(contract, ledger);
-  if (stackHonesty && !scenarioById.has("empty-depends-on-stack-honesty")) {
-    scenarioById.set("empty-depends-on-stack-honesty", {
-      ...stackHonesty,
-      source: "derived",
+  // Terminal score: factory-gate --from-run <id> (in-process). Never pass
+  // --observations, scenarioOverrides from the request, or a work-directory
+  // observations file. Hybrid v2 inside the scorer applies.
+  let scoreResult: ScoreBoundPackLoopResult;
+  try {
+    scoreResult = await scoreBoundPackLoop({
+      version: request.target_version,
+      fromRun: loop.loop_run_id,
+      repoDir: ctx.repoDir,
+      request,
+      loop,
+      pack: ctx.pack,
+      now,
     });
-  }
-
-  const scenarioOverrides = FRG_SCENARIO_IDS.map((id) => {
-    if (id === "clean-item-throughput" || id === "blocker-taxonomy") {
-      // Auto-scored from ledger items inside computeFrgEvidence.
-      return null;
-    }
-    return (
-      scenarioById.get(id) ?? {
-        id,
-        status: "not_observed" as const,
-        detail: "not observed by durable loop / live-run collector",
-        observed: null,
-        threshold: null,
-        source: "derived" as const,
-      }
-    );
-  }).filter((s): s is FrgScenarioOverride => s !== null);
-
-  // First score for auto scenarios + scoreboard-derived composition projections.
-  const partial = computeFrgEvidence({
-    version: request.target_version,
-    run_id: frgRunId,
-    loop_run_id: loop.loop_run_id,
-    pack_id: request.frg_manifest.pack_id,
-    items: ledgerItems,
-    scenario_overrides: scenarioOverrides,
-    composition_overrides: [...compositionById.values()],
-    false_human_authority_count: falseHumanAuthorityCount,
-    recovery_aggregates: recoveryAggregates,
-    attestation_key: null,
-    notes: [
-      `durable factory-release prepare unsigned pack for ${request.target_version}`,
-      `candidate=${request.integrated_candidate.git_sha}`,
-      `request_fingerprint=${requestFingerprint}`,
-      `pack_run_id=${packRunId}`,
-    ],
-  });
-
-  const projected = projectCompositionFromScoreboard(
-    partial.scenarios,
-    partial.scoreboard,
-    partial.thresholds,
-  );
-  for (const p of projected) {
-    if (!compositionById.has(p.id)) compositionById.set(p.id, p);
-  }
-  // Leave missing composition dimensions not_observed so eligibility fails closed.
-
-  const compositionOverrides = [...compositionById.values()];
-  const scored = computeFrgEvidence({
-    version: request.target_version,
-    run_id: frgRunId,
-    loop_run_id: loop.loop_run_id,
-    pack_id: request.frg_manifest.pack_id,
-    items: ledgerItems,
-    scenario_overrides: scenarioOverrides,
-    composition_overrides: compositionOverrides,
-    false_human_authority_count: falseHumanAuthorityCount,
-    recovery_aggregates: recoveryAggregates,
-    // Explicit null: never sign in the candidate prepare process.
-    attestation_key: null,
-    notes: [
-      `durable factory-release prepare unsigned pack for ${request.target_version}`,
-      `candidate=${request.integrated_candidate.git_sha}`,
-      `request_fingerprint=${requestFingerprint}`,
-      `pack_run_id=${packRunId}`,
-    ],
-  });
-
-  // Refuse any Layer A that slipped into scored outcomes.
-  const layerAScenario = scored.scenarios.find((s) => s.source === "layer_a");
-  const layerAComp = scored.composition.dimensions.find((d) => d.source === "layer_a");
-  if (layerAScenario || layerAComp) {
+  } catch (err) {
     return refuseSyntheticTrivialPack(request, {
-      defect_class: "layer_a_refused",
+      defect_class: "frg_not_eligible",
       message:
-        `factory-release prepare: Layer A proof source is forbidden for ${request.target_version} ` +
-        `(scenario=${layerAScenario?.id ?? "none"}, composition=${layerAComp?.id ?? "none"})`,
+        `factory-release prepare: factory-gate --from-run ${loop.loop_run_id} failed for ` +
+        `${request.target_version}: ${(err as Error).message}`,
     });
   }
 
-  const structural = isReleaseEligibleFrgPass(
-    {
-      ...scored,
-      pass: true, // evaluate structure as if pass were claimed
-    },
-    { requireAttestation: false },
-  );
+  const scored = scoreResult.evidence;
+  const eligible = isReleaseEligibleFrgPass(scored, { requireAttestation: false });
   const scenariosOk = scored.scenarios.every(
     (s) => s.status === "pass" || s.status === "warn",
   );
-  const eligible =
-    structural &&
-    scenariosOk &&
-    scored.composition.missing.length === 0 &&
-    scored.pack_provenance == null;
+  const scenarioOverrides: FrgScenarioOverride[] = scored.scenarios.map((s) => ({
+    id: s.id,
+    status: s.status,
+    detail: s.detail,
+    observed: s.observed ?? null,
+    threshold: s.threshold ?? null,
+    source: s.source,
+  }));
+  const compositionOverrides: FrgCompositionOverride[] = scored.composition.dimensions.map((d) => ({
+    id: d.id,
+    status: d.status,
+    detail: d.detail,
+    source: d.source,
+    observed: d.observed ?? null,
+  }));
+
+  // Release-eligible latest.json pass:true only on a genuine scorer pass.
+  // A fail MAY be written with pass:false. Never flip fail to pass.
+  const latestPath = path.join(
+    ctx.repoDir,
+    ".agent-pipeline",
+    "frg",
+    request.target_version,
+    "latest.json",
+  );
+  const latestEvidence = isReleaseEligibleFrgPass(scored)
+    ? scored
+    : { ...scored, pass: false };
+  await mkdir(path.dirname(latestPath), { recursive: true, mode: 0o700 });
+  await writeFile(latestPath, canonicalJson(latestEvidence), 0o600);
 
   const eventsBody = loop.events_text || "\n";
   const actionBody = loop.action_evidence_text || "{}\n";
@@ -1603,6 +2119,13 @@ export function defaultFactoryReleasePrepareDeps(
           writeFile: overrides.writeFile,
           mkdir: overrides.mkdir,
           now: overrides.now,
+          readFile: overrides.readFile,
+          fileExists: overrides.fileExists,
+          startBoundPackLoop: overrides.startBoundPackLoop,
+          createOrReusePackIssues:
+            overrides.createOrReusePackIssues ?? productionCreateOrReusePackIssues,
+          dispatchPackLoop: overrides.dispatchPackLoop ?? productionDispatchPackLoop,
+          scoreBoundPackLoop: overrides.scoreBoundPackLoop,
         })),
     observeAttestation:
       overrides.observeAttestation ??
@@ -1618,6 +2141,11 @@ export function defaultFactoryReleasePrepareDeps(
         } as Parameters<typeof runRelease>[2]);
         return result ?? null;
       }),
+    startBoundPackLoop: overrides.startBoundPackLoop,
+    createOrReusePackIssues:
+      overrides.createOrReusePackIssues ?? productionCreateOrReusePackIssues,
+    dispatchPackLoop: overrides.dispatchPackLoop ?? productionDispatchPackLoop,
+    scoreBoundPackLoop: overrides.scoreBoundPackLoop,
     log: overrides.log,
   };
 }
@@ -1712,6 +2240,26 @@ function failedResult(
   };
 }
 
+function inProgressResult(
+  request: FactoryReleasePrepareRequest,
+  loopRunId: string,
+  checkpoint: string,
+): FactoryReleaseInProgressResult {
+  return {
+    schema_version: 1,
+    kind: FACTORY_RELEASE_CHECKPOINT_KIND,
+    status: "in_progress",
+    action_id: request.action_id,
+    grant_fingerprint: grantFingerprintOrAction(request),
+    repository: request.repository,
+    base_branch: request.base_branch,
+    target_version: request.target_version,
+    candidate_git_sha: request.integrated_candidate.git_sha,
+    loop_run_id: loopRunId,
+    checkpoint,
+  };
+}
+
 function awaitingResult(
   request: FactoryReleasePrepareRequest,
   frg: FactoryReleaseFrgPayload,
@@ -1786,10 +2334,7 @@ export async function runFactoryReleasePrepare(
 
   // Refuse FRG credential material in the candidate environment.
   const env = deps.env ?? process.env;
-  for (const name of [
-    "PIPELINE_FRG_ATTESTATION_KEY",
-    "PIPELINE_FRG_ATTESTATION_KEY_FILE",
-  ] as const) {
+  for (const name of CANDIDATE_LOOP_DENIED_FRG_ENV) {
     const v = env[name];
     if (typeof v === "string" && v.trim() !== "") {
       throw new Error(
@@ -1905,6 +2450,22 @@ export async function runFactoryReleasePrepare(
       pack,
       manifestPath,
     });
+    if (generated.in_progress && generated.loop_run_id) {
+      const runningId = checkpointId("running", fingerprint);
+      store = {
+        ...store,
+        phase: "frg_running",
+        updated_at: isoNow(deps.now()),
+      };
+      await saveCheckpoint(deps, checkpointPath, store);
+      log(
+        `[factory-release prepare] bound pack loop ${generated.loop_run_id} in progress; re-invoke to resume`,
+      );
+      return {
+        exitCode: 0,
+        result: inProgressResult(request, generated.loop_run_id, runningId),
+      };
+    }
     if (!generated.structurally_eligible) {
       const msg =
         generated.message ??
@@ -2169,14 +2730,25 @@ export const FACTORY_RELEASE_PREPARE_HELP = `
 pipeline factory-release prepare --request <absolute-request.json> --json
 
 Durable post-pilot (versions after ${FRG_HYBRID_PILOT_VERSION}) FRG generation and
-prepare-only release handoff. Idempotent two-call protocol:
+prepare-only release handoff. Idempotent multi-tick protocol:
 
-  1) First call creates/reconciles fresh unsigned FRG artifacts for the exact
-     integrated candidate and returns status "awaiting_frg_attestation" with
-     closed artifact identities and digests. It does NOT open a release PR and
-     must NOT see PIPELINE_FRG_ATTESTATION_KEY in the candidate environment.
-  2) After the trusted production-owned attestor stores a verified attestation
-     for those exact artifacts, the second call with the UNCHANGED request
+  1) First call with no request-bound pack loop (or a bound loop that is not
+     terminal) starts or resumes a factory-gate candidate pack loop
+     (--engine-track candidate, work-list or --label factory-gate), persists
+     loop_run_id, and returns status "in_progress" with that id and a restart
+     checkpoint. It does NOT invent pass, does NOT return complete, and does
+     NOT treat a missing pre-bound loop as missing_generator. Re-invoke the
+     UNCHANGED request to resume the same loop_run_id. An unbound newest
+     factory-gate loop is never adopted.
+  2) When the bound loop is terminal, the command scores it with
+     factory-gate --for <version> --from-run <loop_run_id> (no --observations).
+     If unsigned artifacts are structurally eligible and no verified
+     production-owned attestation exists, it returns status
+     "awaiting_frg_attestation" with closed artifact identities and digests.
+     It does NOT open a release PR and must NOT see
+     PIPELINE_FRG_ATTESTATION_KEY in the candidate environment.
+  3) After the trusted production-owned attestor stores a verified attestation
+     for those exact artifacts, a later call with the UNCHANGED request
      verifies the attestation, invokes shared runRelease (prepare-only), and
      returns status "complete" with FRG run id, release PR, head, base, and
      restart checkpoint.
@@ -2189,6 +2761,7 @@ Request JSON (schema_version: 1, kind: "${FACTORY_RELEASE_REQUEST_KIND}"):
   Forbidden: credentials, executable paths, modules, network targets,
              caller-authored pass/status/metric/receipt claims.
 
-Never merges, tags, publishes, promotes, installs, or rolls back.
+Never merges, tags, publishes, promotes, installs, rolls back, or sets
+Tugboat --skip-frg.
 Hybrid Layer A pilot remains valid only for exactly ${FRG_HYBRID_PILOT_VERSION}.
 `.trim();
