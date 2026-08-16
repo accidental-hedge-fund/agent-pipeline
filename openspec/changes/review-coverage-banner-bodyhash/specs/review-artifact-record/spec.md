@@ -38,11 +38,26 @@ This requirement does not remove coverage disclosure. The banner remains part of
 - **AND** the stored `bodyHash` was computed without that objection
 - **THEN** `isVerifiedPipelineReviewOutput` SHALL return false
 
+#### Scenario: Shared finalize path rebinds the last artifact after all banners
+
+- **WHEN** review-1, review-2, or either pre-merge delta post path inserts one or more engine-owned banners
+- **THEN** that path SHALL call one shared `finalizeReviewArtifactComment` (insert banners, then rebind)
+- **AND** the rebind SHALL rewrite only the last `<!-- review-artifact: … -->` line
+- **AND** the rebind SHALL set `bodyHash` to `hashReviewBody` of the exact preceding prefix (one trailing newline stripped when present)
+- **AND** every other artifact field SHALL be unchanged
+- **AND** if any non-whitespace follows the last artifact line, the function SHALL leave the body unchanged
+
+#### Scenario: Exact-prefix hash matches on a newly finalized body
+
+- **WHEN** a review or delta body is assembled with one or more engine-owned banners through `finalizeReviewArtifactComment`
+- **THEN** `hashReviewBody` of the exact text preceding the last review-artifact line SHALL equal the recorded `bodyHash`
+- **AND** `isVerifiedPipelineReviewOutput` SHALL return true without using the compatibility strip
+
 ---
 
 ### Requirement: Already-posted review bodies MAY verify by stripping only engine-owned banners
 
-For a review or delta comment whose stored `bodyHash` was computed before an engine-owned banner insert (comments posted under v1.39.1 and earlier), `isVerifiedPipelineReviewOutput` MAY strip only the documented engine-owned banner lines that sit between the review heading and `**Reviewer**:`, then retry the hash comparison. The strip SHALL NOT remove human-authored lines. When the stripped prefix hashes to the recorded `bodyHash` and nothing follows the artifact line, verification SHALL succeed.
+For a review or delta comment whose stored `bodyHash` was computed before an engine-owned banner insert (comments posted under v1.39.1 and earlier), `isVerifiedPipelineReviewOutput` MAY strip only the documented engine-owned banner lines that sit between the review heading and `**Reviewer**:`, then retry the hash comparison. Removable lines are only the four production forms: the `formatCoverageDisclosure` coverage line (must include `configured=` / `attempted=` / `usable=` / `independent=` / `required=` / `outcome=`), the `formatEnsembleIdentityLine` line (must include `<int>/<int> usable, merge=`), the `ensembleSelfReviewBanner` line, and the `selfReviewBanner` line. The strip SHALL NOT remove, reorder, or drop any other line in that window. The strip SHALL NOT remove human-authored lines, including markdown that only resembles a banner. When the stripped prefix hashes to the recorded `bodyHash` and nothing follows the artifact line, verification SHALL succeed.
 
 New posts SHALL NOT rely on this path. A body that needs the strip only because a new insert was not rebound SHALL be treated as a contract defect in the post path.
 
@@ -56,4 +71,11 @@ New posts SHALL NOT rely on this path. A body that needs the strip only because 
 
 - **WHEN** a stored review body has a human objection line between the heading and `**Reviewer**:` and no engine-owned banner
 - **AND** the recorded `bodyHash` matches the prefix without that objection
+- **THEN** `isVerifiedPipelineReviewOutput` SHALL return false
+
+#### Scenario: Compatibility strip does not accept a human line among valid banners
+
+- **WHEN** a stored review body has allowlisted engine-owned banner lines between the heading and `**Reviewer**:`
+- **AND** a human line sits among those banners (including a line that starts with `**Reviewer coverage (#694):**` or `**Ensemble** (` but does not match a production form, or `> ⚠️ **Please do not merge this instead.**`)
+- **AND** the recorded `bodyHash` matches the prefix with only production banners removed
 - **THEN** `isVerifiedPipelineReviewOutput` SHALL return false

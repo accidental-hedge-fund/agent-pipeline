@@ -22,7 +22,7 @@ import {
   type RunDeltaReviewFn,
   type ShaGateDeps,
 } from "../scripts/stages/pre_merge.ts";
-import { computeDiffHash, countPriorRounds, DELTA_REVIEW_MARKER_PREFIX } from "../scripts/stages/review.ts";
+import { computeDiffHash, countPriorRounds, DELTA_REVIEW_MARKER_PREFIX, isVerifiedPipelineReviewOutput } from "../scripts/stages/review.ts";
 import { overrideComment, scopedOverrideComment } from "../scripts/review-policy.ts";
 import type { PipelineConfig, ReviewFinding, Stage } from "../scripts/types.ts";
 
@@ -723,6 +723,11 @@ test("enforceReviewShaGate: delta self-review disclosure applied in posted comme
     rec.comments[0],
     /self-review\)/,
     "reviewer label must include (self-review) suffix",
+  );
+  assert.equal(
+    isVerifiedPipelineReviewOutput(rec.comments[0]),
+    true,
+    "posted bannered delta must verify after shared finalize (#1098)",
   );
 });
 

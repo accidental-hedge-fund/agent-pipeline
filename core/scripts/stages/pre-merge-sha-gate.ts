@@ -40,6 +40,7 @@ import {
   findLatestReviewCommentBody,
   formatDeltaReviewComment,
   extractReviewedSha,
+  finalizeReviewArtifactComment,
   isVerifiedPipelineAttestation,
   parseStructuredVerdict,
   type DeltaCeilingFinding,
@@ -1442,15 +1443,7 @@ export async function enforceReviewShaGate(
       } else if (deltaIsSelfReview) {
         deltaBanners.push(selfReviewBanner(cfg.harnesses.reviewer, deltaEffectiveReviewer));
       }
-      const deltaComment = deltaBanners.length
-        ? (() => {
-            const nl = deltaCommentBody.indexOf("\n");
-            const block = deltaBanners.join("\n\n");
-            return nl >= 0
-              ? `${deltaCommentBody.slice(0, nl)}\n\n${block}${deltaCommentBody.slice(nl)}`
-              : `${deltaCommentBody}\n\n${block}`;
-          })()
-        : deltaCommentBody;
+      const deltaComment = finalizeReviewArtifactComment(deltaCommentBody, deltaBanners);
       await postCommentFn(cfg, issueNumber, deltaComment);
 
       if (partition.blocking.length === 0) {
@@ -1832,14 +1825,10 @@ export async function enforceReviewShaGate(
               reUnverifiedSurfaceDemotions,
               reAdvisoryCarryForwardDemotions,
             );
-            const reComment = reSelfReview
-              ? (() => {
-                  const nl = reCommentBody.indexOf("\n");
-                  return nl >= 0
-                    ? `${reCommentBody.slice(0, nl)}\n\n${selfReviewBanner(cfg.harnesses.reviewer, reEffective)}${reCommentBody.slice(nl)}`
-                    : `${reCommentBody}\n\n${selfReviewBanner(cfg.harnesses.reviewer, reEffective)}`;
-                })()
-              : reCommentBody;
+            const reComment = finalizeReviewArtifactComment(
+              reCommentBody,
+              reSelfReview ? [selfReviewBanner(cfg.harnesses.reviewer, reEffective)] : [],
+            );
 
             // A blocking post-auto-fix re-review verdict is subject to the same
             // supersession re-validation as the initial delta review (#481): the

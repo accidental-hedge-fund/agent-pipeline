@@ -302,45 +302,68 @@ export function isVerifiedPipelineReviewOutput(body: string): boolean {
   const prefix = rawPrefix.endsWith("\n") ? rawPrefix.slice(0, -1) : rawPrefix;
   if (typeof artifact.bodyHash !== "string") return false;
   if (hashReviewBody(prefix) === artifact.bodyHash) return true;
-  // Already-posted reviews had coverage / self-review banners inserted after
-  // formatReviewComment hashed the unbannered body (#1095 recovery). Strip
-  // only those engine-owned lines and retry. A human objection in the prefix
-  // is not a banner line, so the hash still fails.
+  // Compatibility only: already-posted v1.39.1 (and earlier) comments had
+  // engine-owned banners inserted after formatReviewComment wrote bodyHash.
+  // New posts must verify on the exact prefix via finalizeReviewArtifactComment.
   const stripped = stripEngineOwnedReviewBanners(prefix);
   return stripped !== prefix && hashReviewBody(stripped) === artifact.bodyHash;
 }
 
-/** Engine-owned lines review-routing inserts after the heading, after hashing. */
-const ENGINE_REVIEW_BANNER_LINE =
-  /^(?:\*\*Reviewer coverage \(#694\):|\*\*Ensemble\*\* \(|> ⚠️ \*\*(?:Ensemble includes same-harness self-review|Same-harness self-review))/;
+// Production line forms for the four engine-owned review/delta banners
+// (formatCoverageDisclosure, formatEnsembleIdentityLine, ensembleSelfReviewBanner,
+// selfReviewBanner). Prefix-only lookalikes are not banners (#1098 / D7).
+const COVERAGE_BANNER_LINE =
+  /^\*\*Reviewer coverage \(#694\):\*\* configured=\d+ attempted=\d+ usable=\d+ independent=\d+ required=\d+ outcome=`[^`]+`(?: — independence degraded or unmet)?(?: \(.+\))?$/;
+const ENSEMBLE_IDENTITY_LINE =
+  /^\*\*Ensemble\*\* \(\d+\/\d+ usable, merge=/;
+const ENSEMBLE_SELF_REVIEW_LINE =
+  /^> ⚠️ \*\*Ensemble includes same-harness self-review \(#39 \/ #645 \/ #694\)\.\*\*/;
+const SELF_REVIEW_LINE =
+  /^> ⚠️ \*\*Same-harness self-review \(#39\)\.\*\*/;
+
+function isEngineOwnedReviewBannerLine(line: string): boolean {
+  return (
+    COVERAGE_BANNER_LINE.test(line) ||
+    ENSEMBLE_IDENTITY_LINE.test(line) ||
+    ENSEMBLE_SELF_REVIEW_LINE.test(line) ||
+    SELF_REVIEW_LINE.test(line)
+  );
+}
 
 /**
- * Remove coverage / ensemble / self-review banners that sit between the
- * review heading and `**Reviewer**:`. Used only to verify already-posted
- * comments whose bodyHash predates the banner insert.
+ * Remove only documented engine-owned banner lines that sit between the
+ * review/delta heading and `**Reviewer**:`. Compatibility for already-posted
+ * comments whose bodyHash predates the banner insert. A human line in that
+ * window — including markdown that only resembles a banner — is not stripped.
  */
 export function stripEngineOwnedReviewBanners(prefix: string): string {
   const lines = prefix.split("\n");
   if (lines.length < 2) return prefix;
-  let i = 1;
-  let removed = false;
-  while (i < lines.length) {
-    const line = lines[i]!;
-    if (line === "" || ENGINE_REVIEW_BANNER_LINE.test(line)) {
-      if (ENGINE_REVIEW_BANNER_LINE.test(line)) removed = true;
-      i += 1;
+  const reviewerIdx = lines.findIndex((line, i) => i > 0 && line.startsWith("**Reviewer**:"));
+  const windowEnd = reviewerIdx === -1 ? lines.length : reviewerIdx;
+  const window = lines.slice(1, windowEnd);
+  if (window.length === 0) return prefix;
+  let removedBanner = false;
+  for (const line of window) {
+    if (line === "") continue;
+    if (isEngineOwnedReviewBannerLine(line)) {
+      removedBanner = true;
       continue;
     }
-    break;
+    // Human or unknown line in the banner window — do not strip.
+    return prefix;
   }
-  if (!removed) return prefix;
-  return [lines[0], ...lines.slice(i)].join("\n");
+  if (!removedBanner) return prefix;
+  return [lines[0], ...lines.slice(windowEnd)].join("\n");
 }
 
 /**
  * Recompute `bodyHash` on the last review-artifact after an engine-owned
- * post-render mutation (coverage / self-review banners inserted after
- * `formatReviewComment` hashed the unbannered body).
+ * post-render mutation. This is the only hash writer after a banner insert.
+ *
+ * Last `review-artifact` line only. Hash the exact prefix (strip one trailing
+ * `\n` when present). Preserve every other artifact field. No-op when any
+ * non-whitespace follows the artifact, or when the artifact is missing.
  *
  * Call only on freshly rendered engine output before post. This is not a
  * verification fallback: a later human edit of a posted body must still fail
@@ -359,6 +382,26 @@ export function rebindReviewArtifactBodyHash(body: string): string {
   artifact.bodyHash = nextHash;
   const suffix = body.slice(lastMatch.index + lastMatch[0].length);
   return `${prefix}\n${encodeReviewArtifact(artifact)}${suffix}`;
+}
+
+/**
+ * Shared review/delta post finalizer (#1098). Insert engine-owned banner
+ * lines after the first newline, then rebind `bodyHash` as the last mutation.
+ *
+ * Assembly matches the previous call-site copy: `heading\\n\\n` + banners
+ * joined by `\\n\\n` + remainder (including that remainder's leading newline).
+ * Empty banners skip insert and still rebind (no-op when the hash already
+ * matches). Review-1 / review-2 and both pre-merge delta posts must call this
+ * and must not assemble+post a bannered body on their own.
+ */
+export function finalizeReviewArtifactComment(body: string, banners: readonly string[]): string {
+  const bannerBlock = banners.filter((line) => line.length > 0).join("\n\n");
+  if (bannerBlock === "") return rebindReviewArtifactBodyHash(body);
+  const nl = body.indexOf("\n");
+  const assembled = nl >= 0
+    ? `${body.slice(0, nl)}\n\n${bannerBlock}${body.slice(nl)}`
+    : `${body}\n\n${bannerBlock}`;
+  return rebindReviewArtifactBodyHash(assembled);
 }
 
 /** Return the child pipeline run that produced a verified review comment.

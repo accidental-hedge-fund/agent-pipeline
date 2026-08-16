@@ -117,7 +117,7 @@ import {
   extractPipelineAttestation,
   isVerifiedPipelineAttestation,
   parseStrictVerdict,
-  rebindReviewArtifactBodyHash,
+  finalizeReviewArtifactComment,
   parseStructuredVerdict,
   REVIEW_MARKER_PREFIX_R1,
   REVIEW_MARKER_PREFIX_R2,
@@ -860,16 +860,7 @@ export async function advanceReview(
         banners.push(selfReviewBanner(configuredReviewer, reviewer));
       }
     }
-    if (banners.length === 0) return rebindReviewArtifactBodyHash(text);
-    const bannerBlock = banners.join("\n\n");
-    const nl = text.indexOf("\n");
-    const assembled = nl >= 0
-      ? `${text.slice(0, nl)}\n\n${bannerBlock}${text.slice(nl)}`
-      : `${text}\n\n${bannerBlock}`;
-    // Banners are inserted after formatReviewComment hashed the body.
-    // Rebind so the posted verdict still verifies and does not false-block
-    // as unacknowledged human input (#1095 recovery).
-    return rebindReviewArtifactBodyHash(assembled);
+    return finalizeReviewArtifactComment(text, banners);
   };
   const reviewerLabel = ensembleMeta
     ? `ensemble(${ensembleMeta.usable}/${ensembleMeta.size})`

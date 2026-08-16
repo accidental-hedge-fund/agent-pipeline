@@ -84,6 +84,51 @@ Constraints:
 
 **Rationale:** Same class, all three comment kinds. A delta-only or review-2-only fix is a mole.
 
+### D6 — One exported finalize path; every review/delta post uses it
+
+**Decision:** Export one function, `finalizeReviewArtifactComment(body, banners)`, from `core/scripts/stages/review-parsing.ts` next to the existing `rebindReviewArtifactBodyHash`. It SHALL (1) insert the supplied engine-owned banner lines after the first newline using the current assembly (`heading\n\n` + banners joined by `\n\n` + remainder, including that remainder's leading newline), then (2) call `rebindReviewArtifactBodyHash` as the last mutation. Review-1 / review-2 (`reviewComment` in `review-routing.ts`) and both pre-merge delta posts (initial delta and post-auto-fix re-review in `pre-merge-sha-gate.ts`) SHALL call this function. They SHALL NOT assemble banners and post without it.
+
+**Inventory (2026-08-16, this worktree):**
+
+| Site | File | Today | This change |
+| --- | --- | --- | --- |
+| Review-1 / review-2 / advisory wrap | `review-routing.ts` `reviewComment` | inserts coverage / ensemble / self-review, then rebinds | keep banner *selection* local; route insert+rebind through `finalizeReviewArtifactComment` |
+| Initial delta post | `pre-merge-sha-gate.ts` ~1435–1454 | inserts ensemble / self-review; **no rebind** | must finalize |
+| Post-auto-fix delta re-review | `pre-merge-sha-gate.ts` ~1835–1842 | inserts self-review; **no rebind** | must finalize |
+| Plan-review comment | `planning.ts` ~835–849 | inserts ensemble / self-review; `## Plan Review` + `footer(cfg)` | **no change** — no `review-artifact` |
+| Other `postComment` notices | sha-gate stale/supersede/autofix | `pipeline-attest` or no review-artifact | **no change** |
+
+Do not add a coverage line to delta if that path does not already emit one. Class law is last-bind after whatever engine-owned inserts exist, not new disclosure.
+
+**Rationale:** #1095 rebound only the review-routing coverage site. The two delta sites are the same class and still post a stale hash.
+
+### D7 — Rebind and strip contracts are exact
+
+**Rebind (`rebindReviewArtifactBodyHash` / last step of the finalizer):**
+
+1. Locate the **last** `<!-- review-artifact: … -->` line (`lastReviewArtifactMatch` / last-occurrence-wins).
+2. If that line is missing, or any non-whitespace follows it, return the body unchanged (do not mint a hash over a suffix).
+3. Hash the exact prefix: bytes before the last artifact line, minus one trailing `\n` when present. Same rule as `isVerifiedPipelineReviewOutput`.
+4. Write `bodyHash` to that last artifact only. Re-encode that line. Preserve every other artifact field (`round`, `reviewedSha`, `diffHash`, `blockingKeys`, `review1Risk`, `pipelineRunId`, `blockingFindings`, `advisoryFindings`, `evidence_subject`).
+5. Do not rewrite earlier artifact lines.
+
+**Compatibility strip (`stripEngineOwnedReviewBanners`) — allowlist only:**
+
+Operate only on lines **after the first line (review / delta heading)** and **before the first line that starts with `**Reviewer**:`**. Do not strip, reorder, or drop any other line.
+
+A line is removable only when the **entire line** matches one of these production forms (from `formatCoverageDisclosure`, `formatEnsembleIdentityLine`, `ensembleSelfReviewBanner`, `selfReviewBanner`):
+
+1. `**Reviewer coverage (#694):** configured=<int> attempted=<int> usable=<int> independent=<int> required=<int> outcome=\`<token>\`` with optional ` — independence degraded or unmet` and optional ` (<reason>)`.
+2. `**Ensemble** (<int>/<int> usable, merge=…` (remainder is formatter-owned; the prefix through `usable, merge=` is required).
+3. `> ⚠️ **Ensemble includes same-harness self-review (#39 / #645 / #694).** …`
+4. `> ⚠️ **Same-harness self-review (#39).** …`
+
+Blank lines in that window MAY be removed only together with at least one allowlisted banner. A human line in that window, including markdown that only *resembles* a banner (`**Reviewer coverage (#694):** please do X instead`, `**Ensemble** (please do not merge)`, `> ⚠️ **Please do not merge this instead.**`), SHALL remain. The strip then fails to match the stored pre-banner hash.
+
+New posts SHALL verify on the exact prefix. They SHALL NOT depend on this strip.
+
+**Rationale:** A prefix-only matcher (`**Reviewer coverage (#694):**`) would accept a human objection that starts with the same label. The #1095 strip is the starting point; this change tightens it to the four production forms.
+
 ## Risks / Trade-offs
 
 - **[Risk] Rebind after a human-edited body would mint a new hash over an objection** → **Mitigation:** Rebind runs only on freshly rendered engine output, before post. It is a no-op when trailing content follows the artifact. Posted-body verification still fails on a later human append.
@@ -99,4 +144,4 @@ Constraints:
 
 ## Open Questions
 
-None that block specs or tasks. Whether banners are passed into the renderer or rebound after insert is an implement detail as long as D1 holds for every new post.
+None. D6 locks the shared finalizer. D7 locks rebind and strip semantics. Banner *selection* may stay at each call site.
