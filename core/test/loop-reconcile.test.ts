@@ -873,6 +873,86 @@ test("transitionItem: a merged PR never proves released or deployed — no evide
   assert.equal(ledger.items["100"].state, "merged");
 });
 
+test("transitionItem (#1095): ready transition omits current blocked_theme and keeps history", async () => {
+  const { deps, contract, token } = await setup(
+    "in_progress",
+    {},
+    {
+      items: {
+        "100": {
+          id: "100",
+          state: "in_progress",
+          history: [
+            {
+              time: "2026-07-23T00:00:00.000Z",
+              from: "blocked",
+              to: "in_progress",
+              engine: "claude",
+              theme: "implementation-ci",
+              evidence: "ci failed",
+            },
+          ],
+          recovery_budgets_remaining: { default: 3 },
+          blocked_theme: "implementation-ci",
+        },
+      },
+    },
+  );
+  const observeDeps = openPrObserveDeps({ stage: "ready-to-deploy", readyLabel: true });
+  const ledger = await transitionItem(deps, observeDeps, contract, {
+    runId: "run-1",
+    token,
+    itemId: "100",
+    engine: "claude",
+    to: "ready",
+  });
+  assert.equal(ledger.items["100"].state, "ready");
+  assert.equal(ledger.items["100"].blocked_theme, undefined);
+  assert.ok(
+    ledger.items["100"].history.some(
+      (h) => h.theme === "implementation-ci" || h.evidence === "ci failed",
+    ),
+    "prior block history remains readable",
+  );
+});
+
+test("transitionItem (#1095): resume to in_progress still retains blocked_theme", async () => {
+  const { deps, contract, token } = await setup(
+    "blocked",
+    {},
+    {
+      items: {
+        "100": {
+          id: "100",
+          state: "blocked",
+          history: [
+            {
+              time: "2026-07-23T00:00:00.000Z",
+              from: "in_progress",
+              to: "blocked",
+              engine: "claude",
+              theme: "implementation-ci",
+              evidence: "ci failed",
+            },
+          ],
+          recovery_budgets_remaining: { default: 3 },
+          blocked_theme: "implementation-ci",
+        },
+      },
+    },
+  );
+  const { deps: observeDeps } = fakeObserveDeps();
+  const ledger = await transitionItem(deps, observeDeps, contract, {
+    runId: "run-1",
+    token,
+    itemId: "100",
+    engine: "claude",
+    to: "in_progress",
+  });
+  assert.equal(ledger.items["100"].state, "in_progress");
+  assert.equal(ledger.items["100"].blocked_theme, "implementation-ci");
+});
+
 test("transitionItem: a local transition (implemented) needs no external identity", async () => {
   const { deps, contract, token } = await setup("in_progress");
   const { deps: observeDeps } = fakeObserveDeps();
@@ -931,6 +1011,43 @@ test("reconcile: local + merged still repairs to merged even with mid-flight sta
   assert.equal(result.drift[0]?.class, "ledger-behind");
   const ledger = await readLedger(deps, "run-1");
   assert.equal(ledger.items["100"].state, "merged");
+});
+
+test("reconcile (#1095): repair-forward to ready omits current blocked_theme", async () => {
+  const { deps, token } = await setup(
+    "in_progress",
+    {},
+    {
+      items: {
+        "100": {
+          id: "100",
+          state: "in_progress",
+          history: [
+            {
+              time: "2026-07-23T00:00:00.000Z",
+              from: "blocked",
+              to: "in_progress",
+              engine: "claude",
+              theme: "implementation-ci",
+              evidence: "ci failed",
+            },
+          ],
+          recovery_budgets_remaining: { default: 3 },
+          blocked_theme: "implementation-ci",
+        },
+      },
+    },
+  );
+  const observeDeps = openPrObserveDeps({ stage: "pre-merge", readyLabel: true });
+  const result = await reconcile(deps, observeDeps, { runId: "run-1", token, engine: "claude" });
+  assert.equal(result.drift[0]?.class, "ledger-behind");
+  const ledger = await readLedger(deps, "run-1");
+  assert.equal(ledger.items["100"].state, "ready");
+  assert.equal(ledger.items["100"].blocked_theme, undefined);
+  assert.ok(
+    ledger.items["100"].history.some((h) => h.theme === "implementation-ci"),
+    "prior block history remains readable",
+  );
 });
 
 test("reconcile: local + ready-to-deploy label still repairs to ready even with mid-flight stage (#712)", async () => {

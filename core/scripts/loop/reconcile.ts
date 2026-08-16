@@ -466,6 +466,9 @@ export async function reconcile(
           { time, from, to: target, engine: input.engine, note: "reconciliation repaired forward on verified external identity" },
         ],
       };
+      if (target === "ready") {
+        delete repaired.blocked_theme;
+      }
       items[id] = repaired;
     } else if (
       // Advance-still-needed heal (#1068 / #712 Decision 4 class expansion):
@@ -679,6 +682,11 @@ export async function transitionItem(
     history: [...item.history, { time, from, to: input.to, engine: input.engine, note: input.note }],
     ...(observedIdentity ? { last_verified_identity: observedIdentity } : {}),
   };
+  // Ready is a successful terminal: leftover blocked_theme is stale. Resume
+  // to in_progress keeps theme so recovery identity still matches (#1095).
+  if (input.to === "ready") {
+    delete updated.blocked_theme;
+  }
   ledger.items = { ...ledger.items, [input.itemId]: updated };
 
   await writeLedger(deps, ledger, input.token);
