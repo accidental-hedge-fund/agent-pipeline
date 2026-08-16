@@ -309,17 +309,58 @@ export function isVerifiedPipelineReviewOutput(body: string): boolean {
   return stripped !== prefix && hashReviewBody(stripped) === artifact.bodyHash;
 }
 
-// Production line forms for the four engine-owned review/delta banners
-// (formatCoverageDisclosure, formatEnsembleIdentityLine, ensembleSelfReviewBanner,
-// selfReviewBanner). Prefix-only lookalikes are not banners (#1098 / D7).
-const COVERAGE_BANNER_LINE =
-  /^\*\*Reviewer coverage \(#694\):\*\* configured=\d+ attempted=\d+ usable=\d+ independent=\d+ required=\d+ outcome=`[^`]+`(?: — independence degraded or unmet)?(?: \(.+\))?$/;
-const ENSEMBLE_IDENTITY_LINE =
-  /^\*\*Ensemble\*\* \(\d+\/\d+ usable, merge=/;
-const ENSEMBLE_SELF_REVIEW_LINE =
-  /^> ⚠️ \*\*Ensemble includes same-harness self-review \(#39 \/ #645 \/ #694\)\.\*\*/;
-const SELF_REVIEW_LINE =
-  /^> ⚠️ \*\*Same-harness self-review \(#39\)\.\*\*/;
+// Complete formatter-produced line forms for the four engine-owned
+// review/delta banners (formatCoverageDisclosure, formatEnsembleIdentityLine,
+// ensembleSelfReviewBanner, selfReviewBanner). Each recognizer is end-anchored
+// and uses a closed outcome/merge/reason/agent grammar. A production prefix
+// with appended human text is not a banner (#1098 review-2 / D7).
+const BANNER_ID = String.raw`[A-Za-z0-9][A-Za-z0-9._+-]{0,63}`;
+const COVERAGE_OUTCOME =
+  "(?:complete|partial_quorum|same_lineage_fallback|quorum_unmet|no_usable_reviewers)";
+const COVERAGE_FAILED = String.raw` failed=\[(?:${BANNER_ID}(?::${BANNER_ID})?(?:,${BANNER_ID}(?::${BANNER_ID})?)*)\]`;
+const COVERAGE_REASON = `(?:${[
+  String.raw`usable=\d+/\d+ independent=\d+ required=\d+`,
+  String.raw`usable=\d+ < configured=\d+; independent=\d+ >= required=\d+(?:${COVERAGE_FAILED})?`,
+  String.raw`independence degraded \((?:self-review|lineage-collapse|self-review\+lineage-collapse)\): usable=\d+ independent=\d+ required=\d+ configured=\d+(?:${COVERAGE_FAILED})?`,
+  String.raw`independent=\d+ < required=\d+ \(usable=\d+/\d+\)(?:${COVERAGE_FAILED})?`,
+  String.raw`usable=\d+ < min_usable=\d+ \(configured=\d+, independent=\d+, required=\d+\)(?:${COVERAGE_FAILED})?`,
+].join("|")})`;
+const COVERAGE_BANNER_LINE = new RegExp(
+  String.raw`^\*\*Reviewer coverage \(#694\):\*\* configured=\d+ attempted=\d+ usable=\d+ independent=\d+ required=\d+ outcome=\`` +
+    `(?:` +
+    String.raw`(?:complete|partial_quorum|no_usable_reviewers)\`` +
+    String.raw`(?: \(${COVERAGE_REASON}\))?` +
+    `|` +
+    String.raw`(?:same_lineage_fallback|quorum_unmet)\`` +
+    String.raw`(?: — independence degraded or unmet)?` +
+    String.raw`(?: \(${COVERAGE_REASON}\))?` +
+    `)` +
+    `$`,
+);
+const ENSEMBLE_FAIL_CLASS = "(?:spawn_error|timeout|nonzero|unparseable|empty|rejected|\\?)";
+const ENSEMBLE_AGENT =
+  `(?:${BANNER_ID}|${BANNER_ID} \\(self-review of ${BANNER_ID}\\))` +
+  `(?: ${BANNER_ID}/${BANNER_ID})?` +
+  `(?: indep)?` +
+  `(?: \\[failed:${ENSEMBLE_FAIL_CLASS}\\])?`;
+const ENSEMBLE_IDENTITY_LINE = new RegExp(
+  String.raw`^\*\*Ensemble\*\* \(\d+/\d+ usable, merge=union_blocking` +
+    `(?: cov=\\d+/\\d+req outcome=${COVERAGE_OUTCOME})?` +
+    `\\): ${ENSEMBLE_AGENT}(?:, ${ENSEMBLE_AGENT})*$`,
+);
+const ENSEMBLE_SELF_PAIR = `\`${BANNER_ID}\`→\`${BANNER_ID}\``;
+const ENSEMBLE_SELF_REVIEW_LINE = new RegExp(
+  String.raw`^> ⚠️ \*\*Ensemble includes same-harness self-review \(#39 \/ #645 \/ #694\)\.\*\* ` +
+    `Agent\\(s\\) fell back to the implementer: ${ENSEMBLE_SELF_PAIR}(?:, ${ENSEMBLE_SELF_PAIR})*\\. ` +
+    `Self-review does not count as independent coverage when policy forbids it\\.$`,
+);
+const SELF_REVIEW_LINE = new RegExp(
+  String.raw`^> ⚠️ \*\*Same-harness self-review \(#39\)\.\*\* The cross-harness reviewer ` +
+    `\`${BANNER_ID}\` is not installed / not spawnable, so this review was ` +
+    `performed by the implementing harness \`${BANNER_ID}\` reviewing its own ` +
+    `work\\. A same-harness review is weaker than an independent cross-harness review — ` +
+    `weigh it accordingly\\.$`,
+);
 
 function isEngineOwnedReviewBannerLine(line: string): boolean {
   return (

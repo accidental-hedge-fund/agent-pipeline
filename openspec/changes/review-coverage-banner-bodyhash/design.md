@@ -116,14 +116,14 @@ Do not add a coverage line to delta if that path does not already emit one. Clas
 
 Operate only on lines **after the first line (review / delta heading)** and **before the first line that starts with `**Reviewer**:`**. Do not strip, reorder, or drop any other line.
 
-A line is removable only when the **entire line** matches one of these production forms (from `formatCoverageDisclosure`, `formatEnsembleIdentityLine`, `ensembleSelfReviewBanner`, `selfReviewBanner`):
+A line is removable only when the **entire line** matches one of these production forms (from `formatCoverageDisclosure`, `formatEnsembleIdentityLine`, `ensembleSelfReviewBanner`, `selfReviewBanner`). Each recognizer is end-anchored. A valid production prefix with appended human text SHALL NOT match.
 
-1. `**Reviewer coverage (#694):** configured=<int> attempted=<int> usable=<int> independent=<int> required=<int> outcome=\`<token>\`` with optional ` — independence degraded or unmet` and optional ` (<reason>)`.
-2. `**Ensemble** (<int>/<int> usable, merge=…` (remainder is formatter-owned; the prefix through `usable, merge=` is required).
-3. `> ⚠️ **Ensemble includes same-harness self-review (#39 / #645 / #694).** …`
-4. `> ⚠️ **Same-harness self-review (#39).** …`
+1. `**Reviewer coverage (#694):** configured=<int> attempted=<int> usable=<int> independent=<int> required=<int> outcome=\`<AggregationOutcome>\`` where `AggregationOutcome` is one of `complete` / `partial_quorum` / `same_lineage_fallback` / `quorum_unmet` / `no_usable_reviewers`. Optional ` — independence degraded or unmet` only when outcome is `same_lineage_fallback` or `quorum_unmet`. Optional ` (<reason>)` only when `<reason>` matches a `classifyAggregationOutcome` machine-readable form (`usable=` / `independent=` / `independence degraded` / `min_usable=` counts, optional `failed=[id[:id],…]`). Arbitrary parenthesized prose is not a reason.
+2. `**Ensemble** (<int>/<int> usable, merge=union_blocking[ cov=<int>/<int>req outcome=<AggregationOutcome>]): <agent-list>` where each agent is `<id>` or `<id> (self-review of <id>)` with optional ` <family>/<family>`, optional ` indep`, and optional ` [failed:<closed-class|?>]`. `merge` is only `union_blocking`. Free text after `merge=` or after `):` is not an agent list.
+3. `> ⚠️ **Ensemble includes same-harness self-review (#39 / #645 / #694).** Agent(s) fell back to the implementer: \`<id>\`→\`<id>\`[, …]. Self-review does not count as independent coverage when policy forbids it.`
+4. `> ⚠️ **Same-harness self-review (#39).** The cross-harness reviewer \`<id>\` is not installed / not spawnable, so this review was performed by the implementing harness \`<id>\` reviewing its own work. A same-harness review is weaker than an independent cross-harness review — weigh it accordingly.`
 
-Blank lines in that window MAY be removed only together with at least one allowlisted banner. A human line in that window, including markdown that only *resembles* a banner (`**Reviewer coverage (#694):** please do X instead`, `**Ensemble** (please do not merge)`, `> ⚠️ **Please do not merge this instead.**`), SHALL remain. The strip then fails to match the stored pre-banner hash.
+Blank lines in that window MAY be removed only together with at least one allowlisted banner. A human line in that window, including markdown that only *resembles* a banner (`**Reviewer coverage (#694):** please do X instead`, `**Ensemble** (please do not merge)`, `> ⚠️ **Please do not merge this instead.**`, or any of the four production prefixes followed by objection text such as ` (do not merge; use X instead)` / ` Do not merge this — do X instead.`), SHALL remain. The strip then fails to match the stored pre-banner hash.
 
 New posts SHALL verify on the exact prefix. They SHALL NOT depend on this strip.
 

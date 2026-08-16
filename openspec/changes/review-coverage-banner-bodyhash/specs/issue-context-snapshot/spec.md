@@ -39,3 +39,10 @@ This requirement does not loosen `NEGATION_PATTERNS` and does not change author-
 - **WHEN** a trusted-actor comment after the plan uses a review heading and contains `NEGATION_PATTERNS` wording
 - **AND** `isVerifiedPipelineOutput` is false for that body
 - **THEN** `findUnacknowledgedComments` SHALL count the comment as unacknowledged human input
+
+#### Scenario: Production banner prefix with appended human text still counts
+
+- **WHEN** a trusted-actor review-shaped comment after the plan has a stale `bodyHash` computed without banners
+- **AND** a line between the heading and `**Reviewer**:` starts with a production coverage, ensemble, or self-review banner prefix and continues with `NEGATION_PATTERNS` wording
+- **THEN** `isVerifiedPipelineOutput` SHALL be false
+- **AND** `findUnacknowledgedComments` SHALL count the comment as unacknowledged human input

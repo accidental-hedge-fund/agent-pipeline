@@ -57,7 +57,7 @@ This requirement does not remove coverage disclosure. The banner remains part of
 
 ### Requirement: Already-posted review bodies MAY verify by stripping only engine-owned banners
 
-For a review or delta comment whose stored `bodyHash` was computed before an engine-owned banner insert (comments posted under v1.39.1 and earlier), `isVerifiedPipelineReviewOutput` MAY strip only the documented engine-owned banner lines that sit between the review heading and `**Reviewer**:`, then retry the hash comparison. Removable lines are only the four production forms: the `formatCoverageDisclosure` coverage line (must include `configured=` / `attempted=` / `usable=` / `independent=` / `required=` / `outcome=`), the `formatEnsembleIdentityLine` line (must include `<int>/<int> usable, merge=`), the `ensembleSelfReviewBanner` line, and the `selfReviewBanner` line. The strip SHALL NOT remove, reorder, or drop any other line in that window. The strip SHALL NOT remove human-authored lines, including markdown that only resembles a banner. When the stripped prefix hashes to the recorded `bodyHash` and nothing follows the artifact line, verification SHALL succeed.
+For a review or delta comment whose stored `bodyHash` was computed before an engine-owned banner insert (comments posted under v1.39.1 and earlier), `isVerifiedPipelineReviewOutput` MAY strip only the documented engine-owned banner lines that sit between the review heading and `**Reviewer**:`, then retry the hash comparison. Removable lines are only the four complete formatter-produced forms: the `formatCoverageDisclosure` coverage line (closed `AggregationOutcome` token, optional degraded suffix only for `same_lineage_fallback` / `quorum_unmet`, optional parenthesized reason only when it matches a `classifyAggregationOutcome` machine-readable form), the `formatEnsembleIdentityLine` line (`merge=union_blocking`, optional closed coverage clause, closed agent-list grammar), the complete `ensembleSelfReviewBanner` sentence, and the complete `selfReviewBanner` sentence. Each recognizer SHALL be end-anchored. The strip SHALL NOT remove a line that only begins with a production prefix and then continues with other text. The strip SHALL NOT remove, reorder, or drop any other line in that window. The strip SHALL NOT remove human-authored lines, including markdown that only resembles a banner. When the stripped prefix hashes to the recorded `bodyHash` and nothing follows the artifact line, verification SHALL succeed.
 
 New posts SHALL NOT rely on this path. A body that needs the strip only because a new insert was not rebound SHALL be treated as a contract defect in the post path.
 
@@ -79,3 +79,11 @@ New posts SHALL NOT rely on this path. A body that needs the strip only because 
 - **AND** a human line sits among those banners (including a line that starts with `**Reviewer coverage (#694):**` or `**Ensemble** (` but does not match a production form, or `> ⚠️ **Please do not merge this instead.**`)
 - **AND** the recorded `bodyHash` matches the prefix with only production banners removed
 - **THEN** `isVerifiedPipelineReviewOutput` SHALL return false
+
+#### Scenario: Compatibility strip does not accept a production prefix with appended human text
+
+- **WHEN** a stored review body has a line between the heading and `**Reviewer**:` that begins with a production coverage, ensemble-identity, ensemble-self-review, or self-review banner prefix
+- **AND** that line continues with human objection text (for example ` (do not merge; use X instead)` or ` Do not merge this — do X instead.`)
+- **AND** the recorded `bodyHash` matches the prefix with that line removed
+- **THEN** the strip SHALL leave the line in place
+- **AND** `isVerifiedPipelineReviewOutput` SHALL return false

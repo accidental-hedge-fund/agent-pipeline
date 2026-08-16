@@ -24,6 +24,7 @@
 - [x] 3.8 Human line among valid banners, including `**Reviewer coverage (#694):** please do X instead` and `**Ensemble** (please do not merge)` → strip does not accept; verify false.
 - [x] 3.9 Rebind preserves non-`bodyHash` artifact fields. Rebind is a no-op when a suffix follows the artifact.
 - [x] 3.10 Tests inject deps. No real network, git, or subprocess.
+- [x] 3.11 Valid production prefix plus appended objection text for all four banner types → strip does not accept; verify false; trusted-actor stale-hash comment remains unacknowledged.
 
 ## 4. Mirror and gate
 
