@@ -76,8 +76,11 @@ test("ReviewArtifact: round-trip preserves empty blockingKeys", () => {
 // Encoding format
 // ---------------------------------------------------------------------------
 
+// Exact complete-outcome line posted on #1098 Review 2 (comment 5310141949).
+// Production formatCoverageDisclosure always includes the classifyAggregationOutcome
+// reason for this shape; a reason-less fixture would not prove the live strip path.
 const PRODUCTION_COVERAGE =
-  "**Reviewer coverage (#694):** configured=1 attempted=1 usable=1 independent=1 required=0 outcome=`complete`";
+  "**Reviewer coverage (#694):** configured=1 attempted=1 usable=1 independent=1 required=0 outcome=`complete` (usable=1/1 independent=1 required=0)";
 const PRODUCTION_COVERAGE_DEGRADED =
   "**Reviewer coverage (#694):** configured=2 attempted=2 usable=2 independent=1 required=2 outcome=`quorum_unmet` — independence degraded or unmet (usable=2/2 independent=1 required=2)";
 

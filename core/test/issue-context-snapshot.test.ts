@@ -738,7 +738,7 @@ test("findUnacknowledgedComments: coverage-banner insert then rebind does not ga
   );
   assert.equal(isVerifiedPipelineReviewOutput(rendered), true);
   const nl = rendered.indexOf("\n");
-  const banner = "**Reviewer coverage (#694):** configured=1 attempted=1 usable=1 independent=1 required=0 outcome=`complete`";
+  const banner = "**Reviewer coverage (#694):** configured=1 attempted=1 usable=1 independent=1 required=0 outcome=`complete` (usable=1/1 independent=1 required=0)";
   const withBanner = `${rendered.slice(0, nl)}\n\n${banner}${rendered.slice(nl)}`;
   assert.equal(
     isVerifiedPipelineReviewOutput(withBanner),
@@ -757,7 +757,7 @@ test("findUnacknowledgedComments: coverage-banner insert then rebind does not ga
 });
 
 const COVERAGE_BANNER_1098 =
-  "**Reviewer coverage (#694):** configured=1 attempted=1 usable=1 independent=1 required=0 outcome=`complete`";
+  "**Reviewer coverage (#694):** configured=1 attempted=1 usable=1 independent=1 required=0 outcome=`complete` (usable=1/1 independent=1 required=0)";
 
 test("findUnacknowledgedComments: finalized review-2 with instead is not unacknowledged (#1098)", () => {
   const rendered = formatReviewComment(
