@@ -116,7 +116,7 @@ function releaseEligibleEvidence(
   opts?: { unsigned?: FactoryReleaseFrgPayload; request?: FactoryReleasePrepareRequest },
 ): FrgEvidence {
   // Build via computeFrgEvidence so fingerprints + attestation match.
-  // Post-pilot: no pack_provenance (hybrid is 1.33.0-only).
+  // Post-pilot evidence without hybrid-v2 pack_provenance is not release-eligible.
   const unsigned = opts?.unsigned ?? unsignedPayload();
   const request = opts?.request ?? baseRequest();
   const scenarioPass = (id: (typeof FRG_SCENARIO_IDS)[number]) => ({
@@ -160,8 +160,8 @@ function releaseEligibleEvidence(
     attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
     notes: [`factory_release_binding:${JSON.stringify(binding)}`],
   });
-  assert.equal(evidence.pass, true);
   assert.equal(evidence.pack_provenance, null);
+  assert.equal(evidence.pass, false);
   // Attach binding for prepare orchestration (notes also carry it for observers).
   (evidence as FrgEvidence & { factory_release_binding?: unknown }).factory_release_binding =
     binding;
@@ -874,8 +874,9 @@ test("attestation with matching unsigned digests is accepted (5782ec4d positive)
     (p) => mem.readFile(p),
     (p) => mem.fileExists(p),
   );
-  assert.ok(observed);
-  assert.equal(observed?.frg_run_id, unsigned.frg_run_id);
+  // Matching digests are not enough: 1.34.0 without hybrid-v2 pack_provenance
+  // is not release-eligible, so the observer must not accept the artifact.
+  assert.equal(observed, null);
 });
 
 test("default generateUnsigned refuses synthetic trivial pack as release-eligible", async () => {

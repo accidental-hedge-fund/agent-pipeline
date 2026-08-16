@@ -31,7 +31,33 @@ export const FRG_HYBRID_V1_MANIFEST_SHA256 =
  */
 export const FRG_HYBRID_V2_MANIFEST_SHA256 =
   "27f65953f20032c7b8d6d86ae1e69e26f951e6f5fed25e499a9a8f51463f2e2e";
-/** Closed Layer A probe ids shared by historical v1 and current v2. */
+/**
+ * Frozen historical hybrid-v1 Layer A probe ids.
+ * Decode `factory-gate-v1-hybrid-v1` / 1.33.0 evidence only.
+ * Do not alias this to the current v2 list — a later v2 matrix change
+ * must not rewrite validation of immutable v1.33.0 evidence.
+ */
+export const FRG_HYBRID_V1_LAYER_A_PROBE_IDS = [
+  "capacity-blocked-retain",
+  "restart-hydration",
+  "openspec-multi-change",
+  "managed-worktree-dirt",
+  "local-docs-parity",
+  "forge-http-5xx-backoff",
+  "ci-pending-red-recovery",
+  "fix-rereview-cycle",
+  "same-head-noop-reentry",
+  "pr-supersession",
+  "release-plan-row",
+  "release-tag-guard",
+  "recovery-controller-one-item-route",
+  "recovery-controller-one-item-action",
+  "recovery-controller-multi-item",
+] as const;
+/**
+ * Current durable hybrid-v2 Layer A probe ids.
+ * Independently versioned from {@link FRG_HYBRID_V1_LAYER_A_PROBE_IDS}.
+ */
 export const FRG_HYBRID_LAYER_A_PROBE_IDS = [
   "capacity-blocked-retain",
   "restart-hydration",
@@ -69,6 +95,36 @@ export function expectedHybridManifestSha256(policyId: string): string | undefin
   if (isFrgHybridV1PolicyId(policyId)) return FRG_HYBRID_V1_MANIFEST_SHA256;
   if (isFrgHybridV2PolicyId(policyId)) return FRG_HYBRID_V2_MANIFEST_SHA256;
   return undefined;
+}
+
+/**
+ * Closed Layer A probe matrix for a known hybrid policy.
+ * Historical v1 uses the frozen v1 list; current v2 uses the current list.
+ */
+export function expectedHybridLayerAProbeIds(
+  policyId: string,
+): readonly string[] | undefined {
+  if (isFrgHybridV1PolicyId(policyId)) return FRG_HYBRID_V1_LAYER_A_PROBE_IDS;
+  if (isFrgHybridV2PolicyId(policyId)) return FRG_HYBRID_LAYER_A_PROBE_IDS;
+  return undefined;
+}
+
+/** True when `version` is strictly after the 1.33.0 hybrid-v1 pin. */
+export function isPostHybridPilotVersion(version: string | undefined): boolean {
+  if (typeof version !== "string" || !/^\d+\.\d+\.\d+$/.test(version)) return false;
+  const [maj, min, pat] = version.split(".").map(Number);
+  const [pMaj, pMin, pPat] = FRG_HYBRID_PILOT_VERSION.split(".").map(Number);
+  if (maj !== pMaj) return (maj ?? 0) > (pMaj ?? 0);
+  if (min !== pMin) return (min ?? 0) > (pMin ?? 0);
+  return (pat ?? 0) > (pPat ?? 0);
+}
+
+/**
+ * Hybrid pack_provenance is required for 1.33.0 (historical v1 or current v2)
+ * and for every later release (durable hybrid v2). Pre-1.33.0 evidence may omit it.
+ */
+export function hybridProvenanceRequired(version: string | undefined): boolean {
+  return version === FRG_HYBRID_PILOT_VERSION || isPostHybridPilotVersion(version);
 }
 
 export function isFrgRequiredLiveScenarioId(id: string): boolean {

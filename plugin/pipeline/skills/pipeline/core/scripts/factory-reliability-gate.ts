@@ -22,18 +22,20 @@ import {
   type LoopItemState,
 } from "./loop/types.ts";
 import {
-  FRG_HYBRID_LAYER_A_PROBE_IDS,
   FRG_HYBRID_LIVE_COMPOSITION_IDS,
   FRG_HYBRID_LIVE_SCENARIO_IDS,
   FRG_HYBRID_PILOT_POLICY_ID,
   FRG_HYBRID_PILOT_VERSION,
   FRG_HYBRID_REPLACEMENT_ISSUE,
   FRG_HYBRID_V2_POLICY_ID,
+  expectedHybridLayerAProbeIds,
   expectedHybridManifestSha256,
+  hybridProvenanceRequired,
   isFrgHybridV1PolicyId,
   isFrgHybridV2PolicyId,
   isFrgRequiredLiveCompositionId,
   isFrgRequiredLiveScenarioId,
+  isPostHybridPilotVersion,
   type FrgPackProofSource,
   type FrgPackProvenance,
 } from "./frg-pack-observations.ts";
@@ -1299,7 +1301,9 @@ export function hybridPilotProofValid(evidence: {
 }): boolean {
   const provenance = evidence.pack_provenance ?? null;
   if (!provenance) {
-    return evidence.version !== FRG_HYBRID_PILOT_VERSION;
+    // 1.33.0 and every later release require hybrid provenance.
+    // Pre-1.33.0 evidence may omit it (legacy full-live scoring).
+    return !hybridProvenanceRequired(evidence.version);
   }
   if (isFrgHybridV1PolicyId(provenance.policy_id)) {
     if (evidence.version !== FRG_HYBRID_PILOT_VERSION) return false;
@@ -1352,7 +1356,9 @@ function hybridSplitProofValid(
   if (!templates.has("clean-docs") || !templates.has("clean-openspec") || templates.size !== 2) {
     return false;
   }
-  const expectedProbeIds = new Set<string>(FRG_HYBRID_LAYER_A_PROBE_IDS);
+  const expectedProbeList = expectedHybridLayerAProbeIds(provenance.policy_id);
+  if (!expectedProbeList) return false;
+  const expectedProbeIds = new Set<string>(expectedProbeList);
   const probeIds = new Set(provenance.probes.map((probe) => probe.id));
   if (
     probeIds.size !== expectedProbeIds.size ||
@@ -1501,7 +1507,7 @@ export function isReleaseEligibleFrgPass(
     ) {
       return false;
     }
-  } else if (evidence.version === FRG_HYBRID_PILOT_VERSION) {
+  } else if (hybridProvenanceRequired(evidence.version)) {
     return false;
   }
   if (typeof evidence.run_id === "string" && evidence.run_id.trim() === "") return false;
@@ -3647,6 +3653,11 @@ export async function runFactoryGate(
     throw new Error(
       `pipeline factory-gate: v${FRG_HYBRID_PILOT_VERSION} requires the closed ` +
         `hybrid runner provenance; CLI scenario claims are not release evidence`,
+    );
+  } else if (isPostHybridPilotVersion(version)) {
+    throw new Error(
+      `pipeline factory-gate: v${version} requires ${FRG_HYBRID_V2_POLICY_ID} ` +
+        `pack provenance; missing provenance is not release evidence`,
     );
   }
 
