@@ -27,6 +27,11 @@ import {
   FRG_HYBRID_PILOT_POLICY_ID,
   FRG_HYBRID_PILOT_VERSION,
   FRG_HYBRID_REPLACEMENT_ISSUE,
+  FRG_HYBRID_V2_POLICY_ID,
+  isFrgHybridV1PolicyId,
+  isFrgHybridV2PolicyId,
+  isFrgRequiredLiveCompositionId,
+  isFrgRequiredLiveScenarioId,
   type FrgPackProofSource,
   type FrgPackProvenance,
 } from "./frg-pack-observations.ts";
@@ -139,12 +144,12 @@ export type FrgScenarioStatus = "pass" | "fail" | "warn" | "skip" | "not_observe
 /**
  * Scenario statuses that always fail overall FRG pass when present.
  * `skip` is also non-passing for every required pack scenario (Layer B mandatory).
+ * `not_observed` fails required-live only; Layer A-allowed may prove from TAP.
  * `warn` is pass-permitting only for documented honesty scenarios (see
  * {@link frgScenariosPermitPass}).
  */
-const FRG_FAILING_SCENARIO_STATUSES: ReadonlySet<FrgScenarioStatus> = new Set([
+const FRG_ALWAYS_FAILING_SCENARIO_STATUSES: ReadonlySet<FrgScenarioStatus> = new Set([
   "fail",
-  "not_observed",
   "skip",
 ]);
 
@@ -169,7 +174,7 @@ export interface FrgScenarioOutcome {
   observed?: number | null;
   /** Optional threshold used for this scenario. */
   threshold?: number | null;
-  /** Exact proof class. Required on the v1.33.0 hybrid pilot path. */
+  /** Exact proof class. Required on hybrid v1 (1.33.0) and durable hybrid v2. */
   source?: FrgPackProofSource;
   /** Identities resolved against pack_provenance.proofs. */
   proof_ids?: string[];
@@ -1222,22 +1227,64 @@ function parseFrgRecoveryAggregates(raw: unknown): FrgRecoveryAggregates | undef
 }
 
 /**
- * True when scenario statuses alone permit overall pass:
- * - no fail / not_observed / skip
- * - warn only on documented honesty scenarios (stack-honesty)
+ * Layer A-allowed scenario ids proven by same-candidate TAP hashes on
+ * `pack_provenance`. Required-live ids are never included.
  */
-export function frgScenariosPermitPass(scenarios: readonly FrgScenarioOutcome[]): boolean {
+export function layerAIdsProvenByTap(
+  provenance: FrgPackProvenance | null | undefined,
+  scenarios: readonly FrgScenarioOutcome[] = [],
+): Set<string> {
+  const proven = new Set<string>();
+  if (!provenance) return proven;
+  const proofs = new Map(provenance.proofs.map((proof) => [proof.id, proof] as const));
+  if (
+    provenance.probes.length === 0 ||
+    provenance.probes.some((probe) => probe.candidate_git_sha !== provenance.candidate_git_sha)
+  ) {
+    return proven;
+  }
+  for (const scenario of scenarios) {
+    if (isFrgRequiredLiveScenarioId(scenario.id)) continue;
+    if (!scenario.proof_ids?.length) continue;
+    if (scenario.proof_ids.some((id) => !id.startsWith("probe:"))) continue;
+    const allTap = scenario.proof_ids.every((id) => {
+      const proof = proofs.get(id);
+      return Boolean(proof && proof.source === "layer_a");
+    });
+    if (allTap) proven.add(scenario.id);
+  }
+  return proven;
+}
+
+/**
+ * True when scenario statuses alone permit overall pass:
+ * - no fail / skip
+ * - warn only on documented honesty scenarios (stack-honesty)
+ * - `not_observed` fails required-live only
+ * - Layer A-allowed `not_observed` is pass-permitting only when a same-candidate
+ *   TAP hash proves that closed probe
+ */
+export function frgScenariosPermitPass(
+  scenarios: readonly FrgScenarioOutcome[],
+  opts?: { layerAProvenByTap?: ReadonlySet<string> },
+): boolean {
+  const tapProven = opts?.layerAProvenByTap ?? new Set<string>();
   for (const s of scenarios) {
-    if (FRG_FAILING_SCENARIO_STATUSES.has(s.status)) return false;
+    if (FRG_ALWAYS_FAILING_SCENARIO_STATUSES.has(s.status)) return false;
     if (s.status === "warn" && !FRG_WARN_PERMITTED_SCENARIO_IDS.has(s.id)) return false;
+    if (s.status === "not_observed") {
+      if (isFrgRequiredLiveScenarioId(s.id)) return false;
+      if (!tapProven.has(s.id)) return false;
+    }
   }
   return true;
 }
 
 /**
- * Validate the temporary v1.33.0 hybrid proof boundary. This check does not
- * turn digests into truth. It proves that the signed evidence contains the
- * exact live/Layer A split that the closed runner is allowed to emit.
+ * Validate hybrid proof (historical v1 for 1.33.0, durable v2 for any version).
+ * This check does not turn digests into truth. It proves that the signed
+ * evidence contains the exact required-live / Layer A split the closed runner
+ * is allowed to emit.
  */
 export function hybridPilotProofValid(evidence: {
   version?: string;
@@ -1248,15 +1295,37 @@ export function hybridPilotProofValid(evidence: {
   composition?: FrgComposition;
   pack_provenance?: FrgPackProvenance | null;
 }): boolean {
-  if (evidence.version !== FRG_HYBRID_PILOT_VERSION) {
-    return evidence.pack_provenance == null;
+  const provenance = evidence.pack_provenance ?? null;
+  if (!provenance) {
+    return evidence.version !== FRG_HYBRID_PILOT_VERSION;
   }
+  if (isFrgHybridV1PolicyId(provenance.policy_id)) {
+    if (evidence.version !== FRG_HYBRID_PILOT_VERSION) return false;
+    return hybridSplitProofValid(evidence, { historicalV1: true });
+  }
+  if (isFrgHybridV2PolicyId(provenance.policy_id)) {
+    return hybridSplitProofValid(evidence, { historicalV1: false });
+  }
+  return false;
+}
+
+function hybridSplitProofValid(
+  evidence: {
+    version?: string;
+    loop_run_id: string | null;
+    pack_id: string | null;
+    scenarios: readonly FrgScenarioOutcome[];
+    scoreboard?: FrgScoreboard;
+    composition?: FrgComposition;
+    pack_provenance?: FrgPackProvenance | null;
+  },
+  opts: { historicalV1: boolean },
+): boolean {
   const provenance = evidence.pack_provenance;
   if (
     !provenance ||
-    provenance.policy_id !== FRG_HYBRID_PILOT_POLICY_ID ||
-    provenance.replacement_issue !== FRG_HYBRID_REPLACEMENT_ISSUE ||
-    provenance.release_version !== FRG_HYBRID_PILOT_VERSION ||
+    (opts.historicalV1 && provenance.replacement_issue !== FRG_HYBRID_REPLACEMENT_ISSUE) ||
+    provenance.release_version !== evidence.version ||
     provenance.pack_id !== FRG_PACK_MANIFEST.pack_id ||
     provenance.pack_id !== evidence.pack_id ||
     provenance.loop_run_id !== evidence.loop_run_id ||
@@ -1302,6 +1371,12 @@ export function hybridPilotProofValid(evidence: {
         : scenario.id === "empty-depends-on-stack-honesty"
           ? "derived"
           : "layer_a";
+    if (scenario.source === "layer_a" && liveScenarioIds.has(scenario.id)) return false;
+    if (scenario.status === "not_observed" && liveScenarioIds.has(scenario.id)) {
+      // Required-live not_observed is scored as overall fail; hybrid identity
+      // can still be structurally valid so the not_observed rule is the fail.
+      continue;
+    }
     if (scenario.source !== expectedSource || !scenario.proof_ids?.length) return false;
     if (liveScenarioIds.has(scenario.id)) {
       const exactProof = scenario.id === "empty-depends-on-stack-honesty"
@@ -1322,6 +1397,10 @@ export function hybridPilotProofValid(evidence: {
     const expectedSource: FrgCompositionSource = liveComposition.has(dimension.id)
       ? "live"
       : "layer_a";
+    if (dimension.source === "layer_a" && liveComposition.has(dimension.id)) return false;
+    if (dimension.status === "not_observed" && liveComposition.has(dimension.id)) {
+      continue;
+    }
     if (dimension.source !== expectedSource || !dimension.proof_ids?.length) return false;
     if (expectedSource === "live") {
       if (
@@ -1379,7 +1458,11 @@ export function isReleaseEligibleFrgPass(
   },
 ): boolean {
   if (!evidence.pass) return false;
-  if (!frgScenariosPermitPass(evidence.scenarios)) return false;
+  const layerAProvenByTap = layerAIdsProvenByTap(
+    evidence.pack_provenance,
+    evidence.scenarios,
+  );
+  if (!frgScenariosPermitPass(evidence.scenarios, { layerAProvenByTap })) return false;
   if (typeof evidence.loop_run_id !== "string" || evidence.loop_run_id.trim() === "") {
     return false;
   }
@@ -1402,14 +1485,15 @@ export function isReleaseEligibleFrgPass(
   const expectedComp = computeCompositionFingerprint(evidence.composition);
   if (evidence.integrity.scoreboard_fingerprint !== expectedSb) return false;
   if (evidence.integrity.composition_fingerprint !== expectedComp) return false;
-  if (evidence.version === FRG_HYBRID_PILOT_VERSION) {
+  if (evidence.pack_provenance) {
     if (
-      !evidence.pack_provenance ||
       evidence.integrity.pack_provenance_fingerprint !==
         computePackProvenanceFingerprint(evidence.pack_provenance)
     ) {
       return false;
     }
+  } else if (evidence.version === FRG_HYBRID_PILOT_VERSION) {
+    return false;
   }
   if (typeof evidence.run_id === "string" && evidence.run_id.trim() === "") return false;
   // Attestation must be present for release-eligible pass (MAC verified on tag path).
@@ -2302,13 +2386,35 @@ export function parseFrgPackProvenance(raw: unknown): FrgPackProvenance {
   const p = raw as Record<string, unknown>;
   if (
     p.schema_version !== 1 ||
-    p.policy_id !== FRG_HYBRID_PILOT_POLICY_ID ||
-    p.replacement_issue !== FRG_HYBRID_REPLACEMENT_ISSUE ||
     p.pack_id !== FRG_PACK_MANIFEST.pack_id ||
-    p.manifest_version !== 1 ||
-    p.release_version !== FRG_HYBRID_PILOT_VERSION
+    p.manifest_version !== 1
   ) {
-    throw new Error("FRG observations.pack_provenance does not match the v1.33.0/#908 pilot policy");
+    throw new Error("FRG observations.pack_provenance identity or schema is invalid");
+  }
+  if (typeof p.policy_id !== "string" || p.policy_id.trim() === "") {
+    throw new Error("FRG observations.pack_provenance.policy_id is invalid");
+  }
+  const policyId = p.policy_id;
+  if (!isFrgHybridV1PolicyId(policyId) && !isFrgHybridV2PolicyId(policyId)) {
+    throw new Error(
+      `FRG observations.pack_provenance.policy_id is not a known hybrid policy (got ${policyId})`,
+    );
+  }
+  if (typeof p.release_version !== "string" || !/^\d+\.\d+\.\d+$/.test(p.release_version)) {
+    throw new Error("FRG observations.pack_provenance.release_version must be X.Y.Z");
+  }
+  const releaseVersion = p.release_version;
+  if (isFrgHybridV1PolicyId(policyId)) {
+    if (releaseVersion !== FRG_HYBRID_PILOT_VERSION) {
+      throw new Error(
+        `historical ${FRG_HYBRID_PILOT_POLICY_ID} pack_provenance is valid only for ${FRG_HYBRID_PILOT_VERSION}`,
+      );
+    }
+    if (p.replacement_issue !== FRG_HYBRID_REPLACEMENT_ISSUE) {
+      throw new Error(
+        `historical ${FRG_HYBRID_PILOT_POLICY_ID} pack_provenance requires replacement_issue ${FRG_HYBRID_REPLACEMENT_ISSUE}`,
+      );
+    }
   }
   const digest = /^[0-9a-f]{64}$/;
   const gitSha = /^[0-9a-f]{40,64}$/;
@@ -2403,14 +2509,25 @@ export function parseFrgPackProvenance(raw: unknown): FrgPackProvenance {
   if (new Set(proofs.map((proof) => proof.id)).size !== proofs.length) {
     throw new Error("FRG observations.pack_provenance.proofs has duplicate ids");
   }
+  let replacementIssue: number | undefined;
+  if (p.replacement_issue !== undefined) {
+    if (
+      typeof p.replacement_issue !== "number" ||
+      !Number.isSafeInteger(p.replacement_issue) ||
+      p.replacement_issue <= 0
+    ) {
+      throw new Error("FRG observations.pack_provenance.replacement_issue is invalid");
+    }
+    replacementIssue = p.replacement_issue;
+  }
   return {
     schema_version: 1,
-    policy_id: FRG_HYBRID_PILOT_POLICY_ID,
-    replacement_issue: FRG_HYBRID_REPLACEMENT_ISSUE,
+    policy_id: policyId,
+    ...(replacementIssue !== undefined ? { replacement_issue: replacementIssue } : {}),
     pack_id: FRG_PACK_MANIFEST.pack_id,
     manifest_version: 1,
     manifest_sha256: manifestSha,
-    release_version: FRG_HYBRID_PILOT_VERSION,
+    release_version: releaseVersion,
     candidate_git_sha: candidateSha,
     pack_run_id: packRunId,
     loop_run_id: loopRunId,
@@ -2499,6 +2616,11 @@ export function parseFrgObservationsFile(raw: unknown): FrgObservationsFile {
         ) {
           throw new Error(`FRG observations.scenarios[${i}].source is invalid`);
         }
+        if (rec.source === "layer_a" && isFrgRequiredLiveScenarioId(rec.id as string)) {
+          throw new Error(
+            `FRG observations.scenarios[${i}] source layer_a is refused for required-live id ${rec.id}`,
+          );
+        }
         source = rec.source as FrgPackProofSource;
       }
       let proofIds: string[] | undefined;
@@ -2570,6 +2692,11 @@ export function parseFrgObservationsFile(raw: unknown): FrgObservationsFile {
         !FRG_VALID_COMPOSITION_SOURCES.has(source as FrgCompositionSource)
       ) {
         throw new Error(`FRG observations.composition[${i}].source is invalid`);
+      }
+      if (source === "layer_a" && isFrgRequiredLiveCompositionId(rec.id as string)) {
+        throw new Error(
+          `FRG observations.composition[${i}] source layer_a is refused for required-live id ${rec.id}`,
+        );
       }
       let proofIds: string[] | undefined;
       if (rec.proof_ids !== undefined) {
@@ -2762,7 +2889,7 @@ export function computeFrgEvidence(input: ComputeFrgInput): FrgEvidence {
           : `${readyCleanCount} clean ready items < K=${thresholds.min_clean_ready_to_deploy}`,
         observed: readyCleanCount,
         threshold: thresholds.min_clean_ready_to_deploy,
-        ...(version === FRG_HYBRID_PILOT_VERSION
+        ...(version === FRG_HYBRID_PILOT_VERSION || input.pack_provenance
           ? { source: "ledger" as const, proof_ids: ["ledger:final"] }
           : {}),
       };
@@ -2788,7 +2915,7 @@ export function computeFrgEvidence(input: ComputeFrgInput): FrgEvidence {
           : `engine-class rate ${(rate * 100).toFixed(1)}% (${engine}/${itemCount}) > max ${(thresholds.max_engine_class_rate * 100).toFixed(0)}%`,
         observed: rate,
         threshold: thresholds.max_engine_class_rate,
-        ...(version === FRG_HYBRID_PILOT_VERSION
+        ...(version === FRG_HYBRID_PILOT_VERSION || input.pack_provenance
           ? { source: "ledger" as const, proof_ids: ["ledger:final"] }
           : {}),
       };
@@ -2801,6 +2928,16 @@ export function computeFrgEvidence(input: ComputeFrgInput): FrgEvidence {
       threshold: null,
     };
   });
+
+  if (input.pack_provenance) {
+    for (const s of rawScenarios) {
+      if (s.source) continue;
+      if (s.id === "empty-depends-on-stack-honesty") {
+        s.source = "derived";
+        s.proof_ids = ["live:contract"];
+      }
+    }
+  }
 
   // Overrides are not authoritative for numeric/skip rules — re-validate.
   const scenarios = enforceRequiredScenarioCriteria(rawScenarios, thresholds);
@@ -3250,7 +3387,7 @@ export interface FactoryGateOpts {
   compositionOverrides?: FrgCompositionOverride[];
   falseHumanAuthorityCount?: number;
   recoveryAggregates?: FrgRecoveryAggregates;
-  /** Structured proof block from the closed v1.33.0 pack runner. */
+  /** Structured proof block from the closed hybrid pack runner (v1 or v2). */
   packProvenance?: FrgPackProvenance;
   thresholds?: FrgThresholds;
   now?: () => Date;
@@ -3476,12 +3613,18 @@ export async function runFactoryGate(
     );
   }
 
-  if (version === FRG_HYBRID_PILOT_VERSION) {
+  if (computeInput.pack_provenance) {
     const provenance = computeInput.pack_provenance;
-    if (!provenance) {
+    if (isFrgHybridV1PolicyId(provenance.policy_id)) {
+      if (version !== FRG_HYBRID_PILOT_VERSION) {
+        throw new Error(
+          `pipeline factory-gate: ${FRG_HYBRID_PILOT_POLICY_ID} is historical for ` +
+            `v${FRG_HYBRID_PILOT_VERSION} only; v${version} requires ${FRG_HYBRID_V2_POLICY_ID}`,
+        );
+      }
+    } else if (!isFrgHybridV2PolicyId(provenance.policy_id)) {
       throw new Error(
-        `pipeline factory-gate: v${FRG_HYBRID_PILOT_VERSION} requires the closed ` +
-          `${FRG_HYBRID_PILOT_POLICY_ID} runner provenance; CLI scenario claims are not release evidence`,
+        `pipeline factory-gate: unknown hybrid policy ${provenance.policy_id}`,
       );
     }
     if (
@@ -3491,10 +3634,10 @@ export async function runFactoryGate(
     ) {
       throw new Error("pipeline factory-gate: pack provenance does not match the scored version, loop, or pack");
     }
-  } else if (computeInput.pack_provenance) {
+  } else if (version === FRG_HYBRID_PILOT_VERSION) {
     throw new Error(
-      `pipeline factory-gate: ${FRG_HYBRID_PILOT_POLICY_ID} expires after ` +
-        `v${FRG_HYBRID_PILOT_VERSION}; issue #${FRG_HYBRID_REPLACEMENT_ISSUE} owns its replacement`,
+      `pipeline factory-gate: v${FRG_HYBRID_PILOT_VERSION} requires the closed ` +
+        `hybrid runner provenance; CLI scenario claims are not release evidence`,
     );
   }
 
