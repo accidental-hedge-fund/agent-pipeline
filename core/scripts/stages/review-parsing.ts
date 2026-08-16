@@ -301,7 +301,40 @@ export function isVerifiedPipelineReviewOutput(body: string): boolean {
   const rawPrefix = body.slice(0, lastMatch.index);
   const prefix = rawPrefix.endsWith("\n") ? rawPrefix.slice(0, -1) : rawPrefix;
   if (typeof artifact.bodyHash !== "string") return false;
-  return hashReviewBody(prefix) === artifact.bodyHash;
+  if (hashReviewBody(prefix) === artifact.bodyHash) return true;
+  // Already-posted reviews had coverage / self-review banners inserted after
+  // formatReviewComment hashed the unbannered body (#1095 recovery). Strip
+  // only those engine-owned lines and retry. A human objection in the prefix
+  // is not a banner line, so the hash still fails.
+  const stripped = stripEngineOwnedReviewBanners(prefix);
+  return stripped !== prefix && hashReviewBody(stripped) === artifact.bodyHash;
+}
+
+/** Engine-owned lines review-routing inserts after the heading, after hashing. */
+const ENGINE_REVIEW_BANNER_LINE =
+  /^(?:\*\*Reviewer coverage \(#694\):|\*\*Ensemble\*\* \(|> ⚠️ \*\*(?:Ensemble includes same-harness self-review|Same-harness self-review))/;
+
+/**
+ * Remove coverage / ensemble / self-review banners that sit between the
+ * review heading and `**Reviewer**:`. Used only to verify already-posted
+ * comments whose bodyHash predates the banner insert.
+ */
+export function stripEngineOwnedReviewBanners(prefix: string): string {
+  const lines = prefix.split("\n");
+  if (lines.length < 2) return prefix;
+  let i = 1;
+  let removed = false;
+  while (i < lines.length) {
+    const line = lines[i]!;
+    if (line === "" || ENGINE_REVIEW_BANNER_LINE.test(line)) {
+      if (ENGINE_REVIEW_BANNER_LINE.test(line)) removed = true;
+      i += 1;
+      continue;
+    }
+    break;
+  }
+  if (!removed) return prefix;
+  return [lines[0], ...lines.slice(i)].join("\n");
 }
 
 /**

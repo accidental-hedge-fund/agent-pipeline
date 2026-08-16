@@ -735,16 +735,20 @@ test("findUnacknowledgedComments: coverage-banner insert then rebind does not ga
   const nl = rendered.indexOf("\n");
   const banner = "**Reviewer coverage (#694):** configured=1 attempted=1 usable=1 independent=1 required=0 outcome=`complete`";
   const withBanner = `${rendered.slice(0, nl)}\n\n${banner}${rendered.slice(nl)}`;
-  assert.equal(isVerifiedPipelineReviewOutput(withBanner), false, "banner insert must break the pre-banner hash");
+  assert.equal(
+    isVerifiedPipelineReviewOutput(withBanner),
+    true,
+    "already-posted coverage-banner insert must still verify (strip path)",
+  );
   const rebound = rebindReviewArtifactBodyHash(withBanner);
   assert.equal(isVerifiedPipelineReviewOutput(rebound), true, "rebind must restore verification");
   const comments = [
     makeComment("operator", "## Revised Implementation Plan\n\nDo X.", ts(0)),
-    makeComment("operator", rebound, ts(1)),
+    makeComment("operator", withBanner, ts(1)),
   ];
   const trusted = [comments[1]];
   const unacked = findUnacknowledgedComments(comments, trusted);
-  assert.equal(unacked.length, 0, "rebound review-2 verdict must not count as unacknowledged human input");
+  assert.equal(unacked.length, 0, "bannered review-2 verdict must not count as unacknowledged human input");
 });
 
 test("findUnacknowledgedComments: human objection appended after a quoted genuine review verdict is still counted (#390 review 1)", () => {
