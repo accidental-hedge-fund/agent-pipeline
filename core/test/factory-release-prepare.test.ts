@@ -9,10 +9,15 @@ import {
   compareSemver,
   defaultFactoryReleasePrepareDeps,
   defaultObserveAttestation,
+  defaultStartBoundPackLoop,
+  factoryReleasePackInstancePath,
   factoryReleaseRequestFingerprint,
+  factoryReleaseWorkDir,
   generateDurableUnsignedFrg,
+  isBoundPackLoopTerminal,
   isPostPilotReleaseVersion,
   parseFactoryReleasePrepareRequest,
+  productionCreateOrReusePackIssues,
   rejectForbiddenRequestFields,
   runFactoryReleasePrepare,
   unsignedDigestBindingMismatch,
@@ -20,6 +25,7 @@ import {
   type FactoryReleasePrepareDeps,
   type FactoryReleasePrepareRequest,
   type ObservedAttestation,
+  type ScoreBoundPackLoopArgs,
   type UnsignedFrgGenerationResult,
 } from "../scripts/factory-release-prepare.ts";
 import {
@@ -58,6 +64,66 @@ function baseRequest(over: Partial<FactoryReleasePrepareRequest> = {}): FactoryR
   };
 }
 
+function boundLoopArtifacts(over: {
+  loop_run_id?: string;
+  item_state?: string;
+  stop?: unknown;
+  runner_observations_text?: string;
+} = {}) {
+  const loopRunId = over.loop_run_id ?? "loop-bound-134";
+  return {
+    loop_run_id: loopRunId,
+    contract_text: JSON.stringify({
+      schema: "pipeline.loop.contract/v1",
+      run_id: loopRunId,
+      selector: { type: "label", value: "factory-gate" },
+      items: [
+        { id: "1", depends_on: [] },
+        { id: "2", depends_on: [] },
+      ],
+    }),
+    ledger_text: JSON.stringify({
+      stop: over.stop ?? null,
+      items: {
+        "1": { state: over.item_state ?? "pending" },
+        "2": { state: over.item_state ?? "pending" },
+      },
+    }),
+    events_text: "\n",
+    action_evidence_text: "{}\n",
+    runner_observations_text: over.runner_observations_text,
+  };
+}
+
+function failScoreEvidence(loopRunId: string, version = "1.34.0"): import("../scripts/factory-reliability-gate.ts").FrgEvidence {
+  return {
+    schema_version: 1,
+    version,
+    run_id: "frg-score-fail",
+    loop_run_id: loopRunId,
+    pack_id: "factory-gate-v1",
+    pass: false,
+    scenarios: FRG_SCENARIO_IDS.map((id) => ({
+      id,
+      status: "not_observed" as const,
+      detail: "unit fail score",
+    })),
+    composition: { dimensions: [], missing: ["openspec-bearing-item"] },
+    scoreboard: {
+      item_count: 2,
+      ready_clean_count: 0,
+      engine_class_count: 0,
+      product_class_count: 0,
+      human_authority_count: 0,
+      engine_class_rate: 0,
+      per_item: [],
+    },
+    thresholds: { min_clean_ready_to_deploy: 2, capacity_stress_n: 2, max_engine_class_rate: 0.25 },
+    integrity: { producer: "pipeline-factory-gate" },
+    notes: ["unit fail score"],
+  } as import("../scripts/factory-reliability-gate.ts").FrgEvidence;
+}
+
 function fakePack(): LoadedFrgPack {
   return {
     root_dir: "/pack/factory-gate-v1",
@@ -86,6 +152,58 @@ function fakePack(): LoadedFrgPack {
     template_bodies: new Map(),
     recipes: new Map(),
   } as unknown as LoadedFrgPack;
+}
+
+function packWithTemplates(): LoadedFrgPack {
+  const base = fakePack();
+  return {
+    ...base,
+    manifest: {
+      ...base.manifest,
+      templates: [
+        {
+          id: "clean-docs",
+          title: "FRG docs {{release_version}}",
+          file: "templates/clean-docs.md",
+          sha256: "1".repeat(64),
+          clean_path: true,
+        },
+        {
+          id: "clean-openspec",
+          title: "FRG openspec {{release_version}}",
+          file: "templates/clean-openspec.md",
+          sha256: "2".repeat(64),
+          clean_path: true,
+        },
+      ],
+    },
+    template_bodies: new Map([
+      [
+        "clean-docs",
+        [
+          "pack={{pack_id}}",
+          "manifest_version={{manifest_version}}",
+          "manifest_sha256={{manifest_sha256}}",
+          "release={{release_version}}",
+          "pack_run_id={{pack_run_id}}",
+          "template_id={{template_id}}",
+          "template_sha256={{template_sha256}}",
+        ].join("\n"),
+      ],
+      [
+        "clean-openspec",
+        [
+          "pack={{pack_id}}",
+          "manifest_version={{manifest_version}}",
+          "manifest_sha256={{manifest_sha256}}",
+          "release={{release_version}}",
+          "pack_run_id={{pack_run_id}}",
+          "template_id={{template_id}}",
+          "template_sha256={{template_sha256}}",
+        ].join("\n"),
+      ],
+    ]),
+  } as LoadedFrgPack;
 }
 
 function unsignedPayload(over: Partial<FactoryReleaseFrgPayload> = {}): FactoryReleaseFrgPayload {
@@ -511,10 +629,11 @@ test("stale foreign evidence (wrong frg_run_id) is refused at attestation", asyn
 // Review 1 regressions (#953)
 // ---------------------------------------------------------------------------
 
-test("post-pilot generator refuses Layer A runner observations (f5a999cf)", async () => {
+test("terminal score path ignores runner observations (does not pass --observations)", async () => {
   const files = new Map<string, string>();
   const request = baseRequest();
   const workDir = "/tmp/frg-work-layer-a";
+  const scoreArgs: ScoreBoundPackLoopArgs[] = [];
   const result = await generateDurableUnsignedFrg(
     request,
     {
@@ -535,51 +654,46 @@ test("post-pilot generator refuses Layer A runner observations (f5a999cf)", asyn
         return v;
       },
       fileExists: async (p) => files.has(p),
-      reconcilePackLoop: async () => ({
-        loop_run_id: "loop-bound-134",
-        contract_text: JSON.stringify({
-          schema: "pipeline.loop.contract/v1",
-          run_id: "loop-bound-134",
-          selector: { type: "label", value: "factory-gate" },
-          items: [
-            { id: "1", depends_on: [] },
-            { id: "2", depends_on: [] },
-          ],
+      reconcilePackLoop: async () =>
+        boundLoopArtifacts({
+          loop_run_id: "loop-bound-134",
+          item_state: "ready",
+          runner_observations_text: JSON.stringify({
+            schema_version: 1,
+            scenarios: [
+              {
+                id: "capacity-blocked-retain",
+                status: "pass",
+                detail: "layer a leak",
+                source: "layer_a",
+                observed: 2,
+                threshold: 2,
+              },
+            ],
+          }),
         }),
-        ledger_text: JSON.stringify({
-          items: {
-            "1": { state: "ready" },
-            "2": { state: "ready" },
-          },
-        }),
-        events_text: "\n",
-        action_evidence_text: "{}\n",
-        runner_observations_text: JSON.stringify({
-          schema_version: 1,
-          scenarios: [
-            {
-              id: "capacity-blocked-retain",
-              status: "pass",
-              detail: "layer a leak",
-              source: "layer_a",
-              observed: 2,
-              threshold: 2,
-            },
-          ],
-        }),
-      }),
+      scoreBoundPackLoop: async (args) => {
+        scoreArgs.push(args);
+        return {
+          evidence: failScoreEvidence(args.fromRun),
+          evidencePath: null,
+          latestPath: null,
+        };
+      },
     },
   );
+  assert.equal(scoreArgs.length, 1);
+  assert.equal(scoreArgs[0]?.fromRun, "loop-bound-134");
+  assert.equal("observations" in scoreArgs[0]!, false);
   assert.equal(result.structurally_eligible, false);
-  assert.equal(result.defect_class, "layer_a_refused");
-  assert.match(result.message ?? "", /layer_a/i);
+  assert.notEqual(result.in_progress, true);
 });
 
 test("generator never treats unbound newest loop as evidence (ba5b5ff5)", async () => {
   const files = new Map<string, string>();
   const request = baseRequest();
   const workDir = "/tmp/frg-work-unbound";
-  // Default reconcile with no bound loop / no factory-release-binding → missing.
+  const startIds: string[] = [];
   const result = await generateDurableUnsignedFrg(
     request,
     {
@@ -600,17 +714,22 @@ test("generator never treats unbound newest loop as evidence (ba5b5ff5)", async 
         return v;
       },
       fileExists: async (p) => files.has(p),
-      // Explicitly no reconcile that invents an unbound loop.
+      // Default reconcile refuses unbound loops. Start a *new* bound run.
+      startBoundPackLoop: async () => {
+        startIds.push("loop-bound-started");
+        return { loop_run_id: "loop-bound-started" };
+      },
     },
   );
+  assert.equal(result.in_progress, true);
+  assert.equal(result.loop_run_id, "loop-bound-started");
+  assert.notEqual(result.loop_run_id, "loop-unbound-newest");
+  assert.deepEqual(startIds, ["loop-bound-started"]);
   assert.equal(result.structurally_eligible, false);
-  assert.equal(result.defect_class, "pack_loop_missing");
-  assert.match(result.message ?? "", /request-bound|fingerprint/i);
-  // Pack instance was instantiated for this request.
-  assert.ok(
-    [...files.keys()].some((k) => k.endsWith("pack-instance.json")),
-    "expected pack-instance.json to be created",
-  );
+  const instancePath = [...files.keys()].find((k) => k.endsWith("pack-instance.json"));
+  assert.ok(instancePath, "expected pack-instance.json to be created");
+  const instance = JSON.parse(files.get(instancePath!)!);
+  assert.equal(instance.loop_run_id, "loop-bound-started");
 });
 
 test("pre-staged workDir runner-observations.json cannot forge FRG eligibility (09b1d835)", async () => {
@@ -676,27 +795,19 @@ test("pre-staged workDir runner-observations.json cannot forge FRG eligibility (
         return v;
       },
       fileExists: async (p) => files.has(p),
-      reconcilePackLoop: async () => ({
-        loop_run_id: "loop-bound-forged-obs",
-        contract_text: JSON.stringify({
-          schema: "pipeline.loop.contract/v1",
-          run_id: "loop-bound-forged-obs",
-          selector: { type: "label", value: "factory-gate" },
-          items: [
-            { id: "1", depends_on: [] },
-            { id: "2", depends_on: [] },
-          ],
+      reconcilePackLoop: async () =>
+        boundLoopArtifacts({
+          loop_run_id: "loop-bound-forged-obs",
+          item_state: "ready",
         }),
-        ledger_text: JSON.stringify({
-          items: {
-            "1": { state: "ready", ready_clean: true },
-            "2": { state: "ready", ready_clean: true },
-          },
-        }),
-        events_text: "\n",
-        action_evidence_text: "{}\n",
-        // No loop-owned runner observations — only the workDir forgery exists.
-      }),
+      scoreBoundPackLoop: async (args) => {
+        assert.equal("observations" in args, false);
+        return {
+          evidence: failScoreEvidence(args.fromRun),
+          evidencePath: null,
+          latestPath: null,
+        };
+      },
     },
   );
 
@@ -727,25 +838,15 @@ test("pre-staged workDir runner-observations.json cannot forge FRG eligibility (
         mkdir: () => mem.mkdir(),
         readFile: (p) => mem.readFile(p),
         fileExists: (p) => mem.fileExists(p),
-        reconcilePackLoop: async () => ({
-          loop_run_id: "loop-bound-forged-obs-e2e",
-          contract_text: JSON.stringify({
-            schema: "pipeline.loop.contract/v1",
-            run_id: "loop-bound-forged-obs-e2e",
-            selector: { type: "label", value: "factory-gate" },
-            items: [
-              { id: "1", depends_on: [] },
-              { id: "2", depends_on: [] },
-            ],
+        reconcilePackLoop: async () =>
+          boundLoopArtifacts({
+            loop_run_id: "loop-bound-forged-obs-e2e",
+            item_state: "ready",
           }),
-          ledger_text: JSON.stringify({
-            items: {
-              "1": { state: "ready", ready_clean: true },
-              "2": { state: "ready", ready_clean: true },
-            },
-          }),
-          events_text: "\n",
-          action_evidence_text: "{}\n",
+        scoreBoundPackLoop: async (args) => ({
+          evidence: failScoreEvidence(args.fromRun),
+          evidencePath: null,
+          latestPath: null,
         }),
       });
     },
@@ -879,12 +980,11 @@ test("attestation with matching unsigned digests is accepted (5782ec4d positive)
   assert.equal(observed, null);
 });
 
-test("default generateUnsigned refuses synthetic trivial pack as release-eligible", async () => {
+test("default generateUnsigned starts a bound loop and does not invent pass", async () => {
   const mem = memoryFs();
   const request = baseRequest();
   const requestPath = "/tmp/req-134.json";
   await mem.writeFile(requestPath, JSON.stringify(request));
-  // Use default generator (refuseSyntheticTrivialPack)
   const deps = defaultFactoryReleasePrepareDeps({
     env: {},
     now: () => new Date("2026-08-10T12:00:00Z"),
@@ -894,7 +994,7 @@ test("default generateUnsigned refuses synthetic trivial pack as release-eligibl
     mkdir: async () => {},
     fileExists: (p) => mem.fileExists(p),
     loadPack: async () => fakePack(),
-    // leave generateUnsignedFrg as default refuse
+    startBoundPackLoop: async () => ({ loop_run_id: "loop-default-start" }),
     observeAttestation: async () => null,
     runRelease: async () => {
       throw new Error("must not release");
@@ -902,20 +1002,13 @@ test("default generateUnsigned refuses synthetic trivial pack as release-eligibl
   });
 
   const outcome = await runFactoryReleasePrepare({ requestPath, repoDir: "/repo" }, deps);
-  assert.equal(outcome.exitCode, 1);
-  assert.equal(outcome.result.status, "failed");
-  if (outcome.result.status === "failed") {
-    // Default durable generator fails closed without a factory-gate loop;
-    // it never invents a synthetic trivial pack pass.
-    assert.match(outcome.result.message, /factory-gate|Synthetic trivial|not release-eligible/i);
-    assert.ok(
-      ["missing_generator", "pack_loop_missing", "probe_failed", "frg_not_eligible"].includes(
-        outcome.result.defect_class,
-      ),
-      `unexpected defect_class ${outcome.result.defect_class}`,
-    );
-    assert.notEqual(outcome.result.defect_class, "complete");
+  assert.equal(outcome.exitCode, 0);
+  assert.equal(outcome.result.status, "in_progress");
+  if (outcome.result.status === "in_progress") {
+    assert.equal(outcome.result.loop_run_id, "loop-default-start");
+    assert.equal("pass" in outcome.result, false);
   }
+  assert.notEqual(outcome.result.status, "complete");
 });
 
 test("request fingerprint is stable for the same binding", () => {
@@ -932,4 +1025,276 @@ test("hybrid pilot version is not post-pilot", () => {
   assert.equal(isPostPilotReleaseVersion("1.33.0"), false);
   assert.equal(isPostPilotReleaseVersion("1.34.0"), true);
   assert.equal(isPostPilotReleaseVersion("2.0.0"), true);
+});
+
+test("isBoundPackLoopTerminal: pending is not terminal; ready/stop is", () => {
+  assert.equal(isBoundPackLoopTerminal(boundLoopArtifacts({ item_state: "pending" })), false);
+  assert.equal(isBoundPackLoopTerminal(boundLoopArtifacts({ item_state: "ready" })), true);
+  assert.equal(
+    isBoundPackLoopTerminal(boundLoopArtifacts({ item_state: "pending", stop: { reason: "done" } })),
+    true,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// #1037: start / resume / unbound refusal / --from-run score
+// ---------------------------------------------------------------------------
+
+test("first prepare with no bound loop dispatches start and returns in_progress", async () => {
+  const mem = memoryFs();
+  const request = baseRequest();
+  const requestPath = "/tmp/req-1037-first.json";
+  await mem.writeFile(requestPath, JSON.stringify(request));
+  const startCalls: string[] = [];
+  const deps = defaultFactoryReleasePrepareDeps({
+    env: {},
+    now: () => new Date("2026-08-10T12:00:00Z"),
+    readRequestText: (p) => mem.readRequestText(p),
+    readFile: (p) => mem.readFile(p),
+    writeFile: (p, body) => mem.writeFile(p, body),
+    mkdir: async () => {},
+    fileExists: (p) => mem.fileExists(p),
+    loadPack: async () => fakePack(),
+    startBoundPackLoop: async () => {
+      startCalls.push("loop-1037-a");
+      return { loop_run_id: "loop-1037-a" };
+    },
+    observeAttestation: async () => null,
+    runRelease: async () => {
+      throw new Error("must not release");
+    },
+  });
+
+  const outcome = await runFactoryReleasePrepare({ requestPath, repoDir: "/repo" }, deps);
+  assert.equal(outcome.exitCode, 0);
+  assert.equal(outcome.result.status, "in_progress");
+  if (outcome.result.status !== "in_progress") return;
+  assert.equal(outcome.result.loop_run_id, "loop-1037-a");
+  assert.ok(outcome.result.checkpoint);
+  assert.equal("pass" in outcome.result, false);
+  assert.deepEqual(startCalls, ["loop-1037-a"]);
+
+  const fingerprint = factoryReleaseRequestFingerprint(request);
+  const instancePath = factoryReleasePackInstancePath(
+    factoryReleaseWorkDir("/repo", fingerprint),
+  );
+  const instance = JSON.parse(await mem.readFile(instancePath));
+  assert.equal(instance.loop_run_id, "loop-1037-a");
+});
+
+test("second prepare with the same request resumes the same loop_run_id", async () => {
+  const mem = memoryFs();
+  const request = baseRequest();
+  const requestPath = "/tmp/req-1037-resume.json";
+  await mem.writeFile(requestPath, JSON.stringify(request));
+  const startCalls: string[] = [];
+  const deps = defaultFactoryReleasePrepareDeps({
+    env: {},
+    now: () => new Date("2026-08-10T12:00:00Z"),
+    readRequestText: (p) => mem.readRequestText(p),
+    readFile: (p) => mem.readFile(p),
+    writeFile: (p, body) => mem.writeFile(p, body),
+    mkdir: async () => {},
+    fileExists: (p) => mem.fileExists(p),
+    loadPack: async () => fakePack(),
+    startBoundPackLoop: async () => {
+      startCalls.push("loop-1037-resume");
+      return { loop_run_id: "loop-1037-resume" };
+    },
+    observeAttestation: async () => null,
+    runRelease: async () => {
+      throw new Error("must not release");
+    },
+  });
+
+  const first = await runFactoryReleasePrepare({ requestPath, repoDir: "/repo" }, deps);
+  const second = await runFactoryReleasePrepare({ requestPath, repoDir: "/repo" }, deps);
+  assert.equal(first.result.status, "in_progress");
+  assert.equal(second.result.status, "in_progress");
+  if (first.result.status === "in_progress" && second.result.status === "in_progress") {
+    assert.equal(first.result.loop_run_id, "loop-1037-resume");
+    assert.equal(second.result.loop_run_id, first.result.loop_run_id);
+  }
+  assert.equal(startCalls.length, 1, "second tick must resume, not start another pack");
+});
+
+test("unbound newest factory-gate loop is not adopted as the bound run", async () => {
+  const files = new Map<string, string>();
+  const request = baseRequest();
+  const workDir = "/tmp/frg-work-unbound-1037";
+  const result = await generateDurableUnsignedFrg(
+    request,
+    {
+      repoDir: "/repo",
+      workDir,
+      pack: fakePack(),
+      manifestPath: "/pack/factory-gate-v1/manifest.json",
+    },
+    {
+      now: () => new Date("2026-08-10T12:00:00Z"),
+      writeFile: async (p, body) => {
+        files.set(p, body);
+      },
+      mkdir: async () => {},
+      readFile: async (p) => {
+        const v = files.get(p);
+        if (v === undefined) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+        return v;
+      },
+      fileExists: async (p) => files.has(p),
+      startBoundPackLoop: async () => ({ loop_run_id: "loop-request-bound" }),
+    },
+  );
+  assert.equal(result.in_progress, true);
+  assert.equal(result.loop_run_id, "loop-request-bound");
+  assert.notEqual(result.loop_run_id, "loop-unbound-newest");
+});
+
+test("terminal score uses --from-run and does not pass --observations; fail stays fail", async () => {
+  const files = new Map<string, string>();
+  const request = baseRequest();
+  const workDir = "/tmp/frg-work-score";
+  const scoreCalls: ScoreBoundPackLoopArgs[] = [];
+  const result = await generateDurableUnsignedFrg(
+    request,
+    {
+      repoDir: "/repo",
+      workDir,
+      pack: fakePack(),
+      manifestPath: "/pack/factory-gate-v1/manifest.json",
+    },
+    {
+      now: () => new Date("2026-08-10T12:00:00Z"),
+      writeFile: async (p, body) => {
+        files.set(p, body);
+      },
+      mkdir: async () => {},
+      readFile: async (p) => {
+        const v = files.get(p);
+        if (v === undefined) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+        return v;
+      },
+      fileExists: async (p) => files.has(p),
+      reconcilePackLoop: async () =>
+        boundLoopArtifacts({ loop_run_id: "loop-terminal-1037", item_state: "ready" }),
+      scoreBoundPackLoop: async (args) => {
+        scoreCalls.push(args);
+        return {
+          evidence: failScoreEvidence(args.fromRun),
+          evidencePath: null,
+          latestPath: null,
+        };
+      },
+    },
+  );
+
+  assert.equal(scoreCalls.length, 1);
+  assert.equal(scoreCalls[0]?.fromRun, "loop-terminal-1037");
+  assert.equal(scoreCalls[0]?.version, "1.34.0");
+  assert.equal("observations" in (scoreCalls[0] ?? {}), false);
+  assert.equal(result.structurally_eligible, false);
+  assert.equal(result.defect_class, "frg_not_eligible");
+  assert.notEqual(result.in_progress, true);
+
+  const latestPath = [...files.keys()].find((k) => k.endsWith("/latest.json"));
+  assert.ok(latestPath, "fail MAY write latest.json");
+  const latest = JSON.parse(files.get(latestPath!)!);
+  assert.equal(latest.pass, false);
+});
+
+test("defaultStartBoundPackLoop creates pack issues and dispatches candidate loop", async () => {
+  const renderedSeen: string[] = [];
+  const dispatched: Array<{ engineTrack: string; label: string; n: number }> = [];
+  const result = await defaultStartBoundPackLoop(
+    {
+      repoDir: "/repo",
+      workDir: "/tmp/work",
+      request: baseRequest(),
+      pack: packWithTemplates(),
+      packRunId: "pack-1340-action",
+      frgRunId: "frg-x",
+      requestFingerprint: "f".repeat(64),
+      writeFile: async () => {},
+      readFile: async () => {
+        throw new Error("ENOENT");
+      },
+      fileExists: async () => false,
+      now: () => new Date("2026-08-10T12:00:00Z"),
+    },
+    {
+      createOrReusePackIssues: async ({ rendered }) => {
+        renderedSeen.push(...rendered.map((r) => r.provenance.template_id));
+        assert.ok(rendered.length >= 2);
+        return { issue_numbers: [101, 102] };
+      },
+      dispatchPackLoop: async (input) => {
+        dispatched.push({
+          engineTrack: input.engineTrack,
+          label: input.label,
+          n: input.issue_numbers.length,
+        });
+        return { loop_run_id: "loop-dispatch-1037" };
+      },
+    },
+  );
+  assert.equal(result?.loop_run_id, "loop-dispatch-1037");
+  assert.deepEqual(renderedSeen, ["clean-docs", "clean-openspec"]);
+  assert.deepEqual(dispatched, [{ engineTrack: "candidate", label: "factory-gate", n: 2 }]);
+});
+
+test("productionCreateOrReusePackIssues reuses matching pack_run_id issues", async () => {
+  const created: string[] = [];
+  const result = await productionCreateOrReusePackIssues(
+    {
+      repoDir: "/repo",
+      request: baseRequest(),
+      pack: packWithTemplates(),
+      packRunId: "pack-reuse-1",
+      rendered: [
+        {
+          title: "docs",
+          body: "pack_run_id=pack-reuse-1 template_id=clean-docs",
+          labels: ["factory-gate"],
+          provenance: {
+            pack_id: "factory-gate-v1",
+            manifest_version: 1,
+            manifest_sha256: MANIFEST_SHA,
+            release_version: "1.34.0",
+            pack_run_id: "pack-reuse-1",
+            template_id: "clean-docs",
+            template_sha256: "1".repeat(64),
+          },
+        },
+        {
+          title: "openspec",
+          body: "pack_run_id=pack-reuse-1 template_id=clean-openspec",
+          labels: ["factory-gate"],
+          provenance: {
+            pack_id: "factory-gate-v1",
+            manifest_version: 1,
+            manifest_sha256: MANIFEST_SHA,
+            release_version: "1.34.0",
+            pack_run_id: "pack-reuse-1",
+            template_id: "clean-openspec",
+            template_sha256: "2".repeat(64),
+          },
+        },
+      ],
+    },
+    {
+      listOpenPackIssues: async () => [
+        {
+          number: 55,
+          title: "docs",
+          body: "pack_run_id=pack-reuse-1 template_id=clean-docs",
+        },
+      ],
+      createIssue: async (title) => {
+        created.push(title);
+        return 56;
+      },
+    },
+  );
+  assert.deepEqual(result.issue_numbers, [55, 56]);
+  assert.deepEqual(created, ["openspec"]);
 });

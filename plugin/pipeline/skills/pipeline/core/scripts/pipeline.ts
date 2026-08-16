@@ -4971,16 +4971,18 @@ async function main(): Promise<void> {
       console.error(
         "pipeline factory-release: expected subcommand 'prepare'.\n" +
           "  Usage: pipeline factory-release prepare --request <absolute-request.json> --json\n" +
-          "  Idempotent two-call protocol for versions after 1.33.0:\n" +
-          "    1) returns status awaiting_frg_attestation with unsigned artifact digests\n" +
-          "    2) after production-owned attestation, returns status complete with release PR\n" +
+          "  Idempotent multi-tick protocol for versions after 1.33.0:\n" +
+          "    1) starts/resumes a bound factory-gate pack loop and returns status in_progress\n" +
+          "    2) after the bound loop is terminal and scored --from-run (no --observations),\n" +
+          "       returns status awaiting_frg_attestation with unsigned artifact digests\n" +
+          "    3) after production-owned attestation, returns status complete with release PR\n" +
           "  See docs/factory-reliability-gate-runbook.md",
       );
       process.exit(2);
     }
     if (!opts.json) {
       console.error(
-        "pipeline factory-release prepare: --json is required (machine-readable two-call protocol).",
+        "pipeline factory-release prepare: --json is required (machine-readable multi-tick protocol).",
       );
       process.exit(2);
     }
