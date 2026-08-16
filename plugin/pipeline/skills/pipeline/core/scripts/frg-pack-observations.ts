@@ -1,7 +1,9 @@
-// Internal representative-pack loader and proof projector for the v1.33.0
-// factory pilot. The deployment runner owns live I/O. This module accepts only
-// closed, candidate-bound records from that runner. It has no CLI that accepts
-// caller-authored pass receipts, scenario status, or metrics.
+// Internal representative-pack loader and proof projector for durable hybrid
+// v2 (required-live vs closed Layer A-allowed). Historical hybrid v1 remains
+// a decoder for v1.33.0 evidence only. The deployment runner owns live I/O.
+// This module accepts only closed, candidate-bound records from that runner.
+// It has no CLI that accepts caller-authored pass receipts, scenario status,
+// or metrics.
 
 import * as crypto from "node:crypto";
 import * as fsp from "node:fs/promises";
@@ -11,15 +13,127 @@ import { fileURLToPath } from "node:url";
 export const FRG_PACK_ASSET_SCHEMA_VERSION = 1;
 export const FRG_PACK_BUNDLE_SCHEMA_VERSION = 1;
 export const FRG_PACK_PROVENANCE_SCHEMA_VERSION = 1;
+/** Current pack policy. Not pinned to one SemVer. */
+export const FRG_HYBRID_V2_POLICY_ID = "factory-gate-v1-hybrid-v2";
+/** Historical 1.33.0 hybrid v1 identity. Readable for that version only. */
 export const FRG_HYBRID_PILOT_POLICY_ID = "factory-gate-v1-hybrid-v1";
 export const FRG_HYBRID_PILOT_VERSION = "1.33.0";
 export const FRG_HYBRID_REPLACEMENT_ISSUE = 908;
+/**
+ * Frozen sha256 of `factory-gate-v1/manifest.json` under hybrid v1
+ * (pre-#1036 `pilot_policy` id/release pin). Decode v1.33.0 evidence only.
+ */
+export const FRG_HYBRID_V1_MANIFEST_SHA256 =
+  "d1fc4bfb4852a600875693e666ffbede65314dda045846d1513fb13da03f9b6a";
+/**
+ * sha256 of the current `factory-gate-v1/manifest.json` (hybrid v2).
+ * Drift-guarded against `loadFrgPack().manifest_sha256`.
+ */
+export const FRG_HYBRID_V2_MANIFEST_SHA256 =
+  "27f65953f20032c7b8d6d86ae1e69e26f951e6f5fed25e499a9a8f51463f2e2e";
+/**
+ * Frozen historical hybrid-v1 Layer A probe ids.
+ * Decode `factory-gate-v1-hybrid-v1` / 1.33.0 evidence only.
+ * Do not alias this to the current v2 list — a later v2 matrix change
+ * must not rewrite validation of immutable v1.33.0 evidence.
+ */
+export const FRG_HYBRID_V1_LAYER_A_PROBE_IDS = [
+  "capacity-blocked-retain",
+  "restart-hydration",
+  "openspec-multi-change",
+  "managed-worktree-dirt",
+  "local-docs-parity",
+  "forge-http-5xx-backoff",
+  "ci-pending-red-recovery",
+  "fix-rereview-cycle",
+  "same-head-noop-reentry",
+  "pr-supersession",
+  "release-plan-row",
+  "release-tag-guard",
+  "recovery-controller-one-item-route",
+  "recovery-controller-one-item-action",
+  "recovery-controller-multi-item",
+] as const;
+/**
+ * Current durable hybrid-v2 Layer A probe ids.
+ * Independently versioned from {@link FRG_HYBRID_V1_LAYER_A_PROBE_IDS}.
+ */
+export const FRG_HYBRID_LAYER_A_PROBE_IDS = [
+  "capacity-blocked-retain",
+  "restart-hydration",
+  "openspec-multi-change",
+  "managed-worktree-dirt",
+  "local-docs-parity",
+  "forge-http-5xx-backoff",
+  "ci-pending-red-recovery",
+  "fix-rereview-cycle",
+  "same-head-noop-reentry",
+  "pr-supersession",
+  "release-plan-row",
+  "release-tag-guard",
+  "recovery-controller-one-item-route",
+  "recovery-controller-one-item-action",
+  "recovery-controller-multi-item",
+] as const;
 export const FRG_HYBRID_LIVE_SCENARIO_IDS = [
   "clean-item-throughput",
   "blocker-taxonomy",
   "empty-depends-on-stack-honesty",
 ] as const;
 export const FRG_HYBRID_LIVE_COMPOSITION_IDS = ["openspec-bearing-item"] as const;
+
+export function isFrgHybridV2PolicyId(id: string): boolean {
+  return id === FRG_HYBRID_V2_POLICY_ID;
+}
+
+export function isFrgHybridV1PolicyId(id: string): boolean {
+  return id === FRG_HYBRID_PILOT_POLICY_ID;
+}
+
+/** Expected pack-manifest SHA for a known hybrid policy. Undefined if unknown. */
+export function expectedHybridManifestSha256(policyId: string): string | undefined {
+  if (isFrgHybridV1PolicyId(policyId)) return FRG_HYBRID_V1_MANIFEST_SHA256;
+  if (isFrgHybridV2PolicyId(policyId)) return FRG_HYBRID_V2_MANIFEST_SHA256;
+  return undefined;
+}
+
+/**
+ * Closed Layer A probe matrix for a known hybrid policy.
+ * Historical v1 uses the frozen v1 list; current v2 uses the current list.
+ */
+export function expectedHybridLayerAProbeIds(
+  policyId: string,
+): readonly string[] | undefined {
+  if (isFrgHybridV1PolicyId(policyId)) return FRG_HYBRID_V1_LAYER_A_PROBE_IDS;
+  if (isFrgHybridV2PolicyId(policyId)) return FRG_HYBRID_LAYER_A_PROBE_IDS;
+  return undefined;
+}
+
+/** True when `version` is strictly after the 1.33.0 hybrid-v1 pin. */
+export function isPostHybridPilotVersion(version: string | undefined): boolean {
+  if (typeof version !== "string" || !/^\d+\.\d+\.\d+$/.test(version)) return false;
+  const [maj, min, pat] = version.split(".").map(Number);
+  const [pMaj, pMin, pPat] = FRG_HYBRID_PILOT_VERSION.split(".").map(Number);
+  if (maj !== pMaj) return (maj ?? 0) > (pMaj ?? 0);
+  if (min !== pMin) return (min ?? 0) > (pMin ?? 0);
+  return (pat ?? 0) > (pPat ?? 0);
+}
+
+/**
+ * Hybrid pack_provenance is required for 1.33.0 (historical v1 or current v2)
+ * and for every later release (durable hybrid v2). Pre-1.33.0 evidence may omit it.
+ */
+export function hybridProvenanceRequired(version: string | undefined): boolean {
+  return version === FRG_HYBRID_PILOT_VERSION || isPostHybridPilotVersion(version);
+}
+
+export function isFrgRequiredLiveScenarioId(id: string): boolean {
+  return (FRG_HYBRID_LIVE_SCENARIO_IDS as readonly string[]).includes(id);
+}
+
+export function isFrgRequiredLiveCompositionId(id: string): boolean {
+  return (FRG_HYBRID_LIVE_COMPOSITION_IDS as readonly string[]).includes(id);
+}
 
 const SHA256_RE = /^[0-9a-f]{64}$/;
 const GIT_SHA_RE = /^[0-9a-f]{40,64}$/;
@@ -59,8 +173,10 @@ export interface FrgPackProbeManifest {
 
 export interface FrgPackPilotPolicy {
   id: string;
-  release_version: typeof FRG_HYBRID_PILOT_VERSION;
-  replacement_issue: typeof FRG_HYBRID_REPLACEMENT_ISSUE;
+  /** Historical hybrid v1 only. Durable hybrid v2 must not pin a SemVer. */
+  release_version?: string;
+  /** Historical hybrid v1 only (#908). Absent on durable hybrid v2. */
+  replacement_issue?: number;
   live_scenario_ids: string[];
   live_composition_ids: string[];
   layer_a_probes: FrgPackProbeManifest[];
@@ -287,12 +403,16 @@ function parseManifest(raw: unknown): FrgPackManifest {
   }
 
   const pilotRaw = record(value.pilot_policy, "FRG pack manifest.pilot_policy");
-  if (
-    pilotRaw.id !== FRG_HYBRID_PILOT_POLICY_ID ||
-    pilotRaw.release_version !== FRG_HYBRID_PILOT_VERSION ||
-    pilotRaw.replacement_issue !== FRG_HYBRID_REPLACEMENT_ISSUE
-  ) {
-    throw new Error("factory-gate-v1 hybrid policy must expire after 1.33.0 into issue #908");
+  if (pilotRaw.id !== FRG_HYBRID_V2_POLICY_ID) {
+    throw new Error(
+      `factory-gate-v1 current pack must declare ${FRG_HYBRID_V2_POLICY_ID} ` +
+        `(historical ${FRG_HYBRID_PILOT_POLICY_ID} is not the current pack policy)`,
+    );
+  }
+  if (pilotRaw.release_version !== undefined || pilotRaw.replacement_issue !== undefined) {
+    throw new Error(
+      "durable hybrid v2 must not pin release_version or replacement_issue",
+    );
   }
   const liveScenarios = stringArray(
     pilotRaw.live_scenario_ids,
@@ -379,9 +499,7 @@ function parseManifest(raw: unknown): FrgPackManifest {
     auto_scored_scenario_ids: autoScenarios,
     required_composition_ids: requiredComposition,
     pilot_policy: {
-      id: FRG_HYBRID_PILOT_POLICY_ID,
-      release_version: FRG_HYBRID_PILOT_VERSION,
-      replacement_issue: FRG_HYBRID_REPLACEMENT_ISSUE,
+      id: FRG_HYBRID_V2_POLICY_ID,
       live_scenario_ids: liveScenarios,
       live_composition_ids: liveComposition,
       layer_a_probes: layerAProbes,
@@ -590,7 +708,8 @@ export interface VerifiedFrgPackRun {
 export interface FrgPackProvenance {
   schema_version: 1;
   policy_id: string;
-  replacement_issue: typeof FRG_HYBRID_REPLACEMENT_ISSUE;
+  /** Present on historical hybrid v1 evidence only. */
+  replacement_issue?: number;
   pack_id: string;
   manifest_version: number;
   manifest_sha256: string;
@@ -718,9 +837,16 @@ export function collectFrgPackObservations(
   const bundle = record(raw, "FRG verified bundle");
   if (bundle.schema_version !== 1) throw new Error("FRG verified bundle.schema_version must be 1");
   const policy = pack.manifest.pilot_policy;
-  if (bundle.policy_id !== policy.id || bundle.release_version !== policy.release_version) {
-    throw new Error("FRG hybrid proof is valid only for release 1.33.0 under its exact pilot policy");
+  if (bundle.policy_id !== policy.id) {
+    throw new Error(
+      `FRG verified bundle.policy_id must be ${policy.id} ` +
+        `(historical ${FRG_HYBRID_PILOT_POLICY_ID} cannot score the current pack)`,
+    );
   }
+  const releaseVersion = checkedReleaseVersion(
+    bundle.release_version,
+    "FRG verified bundle.release_version",
+  );
   if (
     bundle.pack_id !== pack.manifest.pack_id ||
     bundle.manifest_version !== pack.manifest.manifest_version ||
@@ -739,7 +865,7 @@ export function collectFrgPackObservations(
   const startedAt = timestamp(bundle.started_at, "FRG verified bundle.started_at");
 
   const rendered = renderFrgPackIssues(pack, {
-    release_version: policy.release_version,
+    release_version: releaseVersion,
     pack_run_id: packRunId,
   });
   const renderedByTemplate = new Map(rendered.map((issue) => [issue.provenance.template_id, issue] as const));
@@ -878,7 +1004,9 @@ export function collectFrgPackObservations(
     const probe = record(entry, field);
     const id = checkedId(probe.id, `${field}.id`);
     const expected = probeById.get(id);
-    if (!expected) throw new Error(`${field}.id is not in the closed pilot probe list`);
+    if (!expected) {
+      throw new Error(`${field}.id is not on the closed Layer A-allowed probe list`);
+    }
     if (
       probe.candidate_git_sha !== candidateGitSha ||
       probe.test_file !== expected.test_file ||
@@ -983,11 +1111,10 @@ export function collectFrgPackObservations(
     pack_provenance: {
       schema_version: 1,
       policy_id: policy.id,
-      replacement_issue: FRG_HYBRID_REPLACEMENT_ISSUE,
       pack_id: pack.manifest.pack_id,
       manifest_version: pack.manifest.manifest_version,
       manifest_sha256: pack.manifest_sha256,
-      release_version: policy.release_version,
+      release_version: releaseVersion,
       candidate_git_sha: candidateGitSha,
       pack_run_id: packRunId,
       loop_run_id: loopRunId,

@@ -7,6 +7,18 @@ import { fileURLToPath } from "node:url";
 import {
   collectFrgPackObservations,
   defaultFrgPackRoot,
+  FRG_HYBRID_LAYER_A_PROBE_IDS,
+  FRG_HYBRID_PILOT_POLICY_ID,
+  FRG_HYBRID_REPLACEMENT_ISSUE,
+  FRG_HYBRID_V1_LAYER_A_PROBE_IDS,
+  FRG_HYBRID_V1_MANIFEST_SHA256,
+  FRG_HYBRID_V2_MANIFEST_SHA256,
+  FRG_HYBRID_V2_POLICY_ID,
+  expectedHybridLayerAProbeIds,
+  hybridProvenanceRequired,
+  isFrgRequiredLiveCompositionId,
+  isFrgRequiredLiveScenarioId,
+  isPostHybridPilotVersion,
   loadFrgPack,
   renderFrgPackIssues,
   serializeFrgPackObservations,
@@ -19,6 +31,8 @@ import {
   FRG_SCENARIO_IDS,
   FRG_UNIT_TEST_ATTESTATION_KEY,
   computeFrgEvidence,
+  hybridPilotProofValid,
+  isReleaseEligibleFrgPass,
   parseFrgEvidence,
   parseFrgObservationsFile,
   verifyFrgAttestation,
@@ -28,8 +42,10 @@ function digest(value: string): string {
   return crypto.createHash("sha256").update(value).digest("hex");
 }
 
-function makeEvidenceBundle(pack: LoadedFrgPack): VerifiedFrgPackRun {
-  const releaseVersion = "1.33.0";
+function makeEvidenceBundle(
+  pack: LoadedFrgPack,
+  releaseVersion = "1.33.0",
+): VerifiedFrgPackRun {
   const packRunId = "frg-pack-run-a";
   const loopRunId = "loop-frg-a";
   const candidateGitSha = "a".repeat(40);
@@ -126,12 +142,18 @@ function makeEvidenceBundle(pack: LoadedFrgPack): VerifiedFrgPackRun {
   };
 }
 
-test("factory-gate-v1 manifest closes the v1.33.0 hybrid proof matrix", async () => {
+test("factory-gate-v1 manifest closes the durable hybrid v2 proof matrix", async () => {
   const pack = await loadFrgPack();
   assert.equal(pack.manifest.pack_id, "factory-gate-v1");
-  assert.equal(pack.manifest.pilot_policy.release_version, "1.33.0");
-  assert.equal(pack.manifest.pilot_policy.replacement_issue, 908);
-  assert.match(pack.manifest_sha256, /^[0-9a-f]{64}$/);
+  assert.equal(pack.manifest.pilot_policy.id, FRG_HYBRID_V2_POLICY_ID);
+  assert.equal(pack.manifest.pilot_policy.release_version, undefined);
+  assert.equal(pack.manifest.pilot_policy.replacement_issue, undefined);
+  assert.equal(pack.manifest_sha256, FRG_HYBRID_V2_MANIFEST_SHA256);
+  assert.notEqual(pack.manifest_sha256, FRG_HYBRID_V1_MANIFEST_SHA256);
+  assert.deepEqual(
+    pack.manifest.pilot_policy.layer_a_probes.map((probe) => probe.id),
+    [...FRG_HYBRID_LAYER_A_PROBE_IDS],
+  );
   assert.deepEqual(pack.manifest.required_scenario_ids, [...FRG_SCENARIO_IDS]);
   assert.deepEqual(pack.manifest.required_composition_ids, [...FRG_COMPOSITION_DIMENSION_IDS]);
   assert.equal(pack.template_bodies.size, pack.manifest.templates.length);
@@ -207,11 +229,21 @@ test("collector rejects stale, wrong-head, incomplete OpenSpec, and missing-prob
   assert.throws(() => collectFrgPackObservations(pack, missingProbe), /must contain every exact Layer A probe once/);
 });
 
-test("collector refuses another release, manifest, selector, or issue set", async () => {
+test("collector refuses historical v1 policy, unknown Layer A probe, manifest, selector, or issue set", async () => {
   const pack = await loadFrgPack();
-  const wrongRelease = makeEvidenceBundle(pack);
-  wrongRelease.release_version = "1.33.1";
-  assert.throws(() => collectFrgPackObservations(pack, wrongRelease), /valid only for release 1\.33\.0/);
+  const wrongPolicy = makeEvidenceBundle(pack);
+  wrongPolicy.policy_id = FRG_HYBRID_PILOT_POLICY_ID;
+  assert.throws(
+    () => collectFrgPackObservations(pack, wrongPolicy),
+    /historical factory-gate-v1-hybrid-v1 cannot score the current pack/,
+  );
+
+  const unknownProbe = makeEvidenceBundle(pack);
+  unknownProbe.probes[0]!.id = "not-a-closed-probe";
+  assert.throws(
+    () => collectFrgPackObservations(pack, unknownProbe),
+    /not on the closed Layer A-allowed probe list/,
+  );
 
   const wrongManifest = makeEvidenceBundle(pack);
   wrongManifest.manifest_sha256 = "0".repeat(64);
@@ -241,25 +273,33 @@ test("collector projection is deterministic and the FRG parser preserves proof p
   assert.deepEqual(parsed.composition?.map((item) => item.proof_ids), first.composition.map((item) => item.proof_ids));
 });
 
-test("v1.33.0 evidence signs the full structured provenance and fails after provenance mutation", async () => {
-  const pack = await loadFrgPack();
+function scoreCollected(pack: LoadedFrgPack, releaseVersion: string) {
   const observations = parseFrgObservationsFile(
-    collectFrgPackObservations(pack, makeEvidenceBundle(pack)),
+    collectFrgPackObservations(pack, makeEvidenceBundle(pack, releaseVersion)),
   );
   const issueIds = observations.pack_provenance!.issues.map((issue) => String(issue.issue_number));
-  const evidence = computeFrgEvidence({
-    version: "1.33.0",
-    run_id: "frg-hybrid-pass",
-    loop_run_id: observations.pack_provenance!.loop_run_id,
-    pack_id: FRG_PACK_MANIFEST.pack_id,
-    items: issueIds.map((item_id) => ({ item_id, state: "ready", ready_clean: true })),
-    scenario_overrides: observations.scenarios,
-    composition_overrides: observations.composition,
-    false_human_authority_count: observations.false_human_authority_count,
-    pack_provenance: observations.pack_provenance,
-    attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
-    now: () => new Date("2026-08-08T12:10:00.000Z"),
-  });
+  return {
+    observations,
+    evidence: computeFrgEvidence({
+      version: releaseVersion,
+      run_id: `frg-hybrid-${releaseVersion}`,
+      loop_run_id: observations.pack_provenance!.loop_run_id,
+      pack_id: FRG_PACK_MANIFEST.pack_id,
+      items: issueIds.map((item_id) => ({ item_id, state: "ready", ready_clean: true })),
+      scenario_overrides: observations.scenarios,
+      composition_overrides: observations.composition,
+      false_human_authority_count: observations.false_human_authority_count,
+      pack_provenance: observations.pack_provenance,
+      attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
+      now: () => new Date("2026-08-08T12:10:00.000Z"),
+    }),
+  };
+}
+
+test("hybrid v2 evidence signs structured provenance and fails after provenance mutation", async () => {
+  const pack = await loadFrgPack();
+  const { observations, evidence } = scoreCollected(pack, "1.33.0");
+  assert.equal(observations.pack_provenance!.policy_id, FRG_HYBRID_V2_POLICY_ID);
   assert.equal(evidence.pass, true);
   assert.ok(evidence.integrity.pack_provenance_fingerprint);
   assert.equal(verifyFrgAttestation(evidence, FRG_UNIT_TEST_ATTESTATION_KEY), true);
@@ -271,37 +311,348 @@ test("v1.33.0 evidence signs the full structured provenance and fails after prov
   assert.throws(() => parseFrgEvidence(mutated), /pack_provenance_fingerprint/);
 });
 
-test("v1.33.0 cannot pass without pilot provenance and the pilot cannot escape to v1.33.1", async () => {
+test("required-live not_observed fails overall pass even when Layer A TAP hashes are valid", async () => {
   const pack = await loadFrgPack();
-  const observations = collectFrgPackObservations(pack, makeEvidenceBundle(pack));
-  const items = observations.pack_provenance.issues.map((issue) => ({
+  const { observations } = scoreCollected(pack, "1.34.0");
+  const items = observations.pack_provenance!.issues.map((issue) => ({
     item_id: String(issue.issue_number),
-    state: "ready",
+    state: "ready" as const,
+    ready_clean: true,
+  }));
+  const scenarios = observations.scenarios!.map((s) =>
+    s.id === "empty-depends-on-stack-honesty"
+      ? { ...s, status: "not_observed" as const, detail: "required-live missing" }
+      : s,
+  );
+  const evidence = computeFrgEvidence({
+    version: "1.34.0",
+    run_id: "frg-hybrid-required-live-miss",
+    loop_run_id: observations.pack_provenance!.loop_run_id,
+    pack_id: FRG_PACK_MANIFEST.pack_id,
+    items,
+    scenario_overrides: scenarios,
+    composition_overrides: observations.composition,
+    false_human_authority_count: 0,
+    pack_provenance: observations.pack_provenance,
+    attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
+  });
+  assert.equal(evidence.pass, false);
+  assert.equal(
+    evidence.scenarios.find((s) => s.id === "empty-depends-on-stack-honesty")?.status,
+    "not_observed",
+  );
+  assert.ok(
+    evidence.scenarios
+      .filter((s) => !isFrgRequiredLiveScenarioId(s.id))
+      .every((s) => s.status === "pass" && s.source === "layer_a"),
+  );
+});
+
+test("Layer A TAP hash on the same candidate SHA can pass for a version other than 1.33.0", async () => {
+  const pack = await loadFrgPack();
+  const { observations, evidence } = scoreCollected(pack, "1.34.0");
+  assert.equal(observations.pack_provenance!.policy_id, FRG_HYBRID_V2_POLICY_ID);
+  assert.equal(observations.pack_provenance!.release_version, "1.34.0");
+  assert.equal(evidence.version, "1.34.0");
+  assert.equal(evidence.pass, true);
+  assert.ok(
+    evidence.scenarios
+      .filter((s) => !isFrgRequiredLiveScenarioId(s.id))
+      .every((s) => s.source === "layer_a" && s.status === "pass"),
+  );
+  assert.ok(
+    evidence.composition.dimensions
+      .filter((d) => !isFrgRequiredLiveCompositionId(d.id))
+      .every((d) => d.source === "layer_a" && d.status === "pass"),
+  );
+  assert.equal(parseFrgEvidence(evidence).pass, true);
+});
+
+test("unknown or required-live id claimed as layer_a is refused", async () => {
+  const pack = await loadFrgPack();
+  const { observations } = scoreCollected(pack, "1.34.0");
+  const items = observations.pack_provenance!.issues.map((issue) => ({
+    item_id: String(issue.issue_number),
+    state: "ready" as const,
     ready_clean: true,
   }));
   const common = {
-    run_id: "frg-hybrid-boundary",
-    loop_run_id: observations.pack_provenance.loop_run_id,
+    run_id: "frg-hybrid-refuse-layer-a",
+    loop_run_id: observations.pack_provenance!.loop_run_id,
+    pack_id: FRG_PACK_MANIFEST.pack_id,
+    items,
+    false_human_authority_count: 0,
+    pack_provenance: observations.pack_provenance,
+    attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
+  };
+
+  assert.throws(
+    () =>
+      parseFrgObservationsFile({
+        ...observations,
+        composition: observations.composition!.map((item) =>
+          item.id === "openspec-bearing-item"
+            ? {
+                ...item,
+                source: "layer_a",
+                proof_ids: [`probe:${pack.manifest.pilot_policy.layer_a_probes[0]!.id}`],
+              }
+            : item,
+        ),
+      }),
+    /source layer_a is refused for required-live id openspec-bearing-item/,
+  );
+
+  const layerAOpenSpec = structuredClone(observations);
+  const openSpec = layerAOpenSpec.composition!.find((item) => item.id === "openspec-bearing-item")!;
+  openSpec.source = "layer_a";
+  openSpec.proof_ids = [`probe:${pack.manifest.pilot_policy.layer_a_probes[0]!.id}`];
+  assert.equal(
+    computeFrgEvidence({
+      ...common,
+      version: "1.34.0",
+      scenario_overrides: observations.scenarios,
+      composition_overrides: layerAOpenSpec.composition,
+    }).pass,
+    false,
+  );
+
+  const layerAThroughput = structuredClone(observations.scenarios!);
+  const throughput = {
+    id: "clean-item-throughput" as const,
+    status: "pass" as const,
+    detail: "forged required-live as layer_a",
+    source: "layer_a" as const,
+    proof_ids: [`probe:${pack.manifest.pilot_policy.layer_a_probes[0]!.id}`],
+    observed: 2,
+    threshold: 2,
+  };
+  assert.throws(
+    () => parseFrgObservationsFile({
+      schema_version: 1,
+      scenarios: [...layerAThroughput, throughput],
+    }),
+    /source layer_a is refused for required-live id clean-item-throughput/,
+  );
+});
+
+test("1.34.0 evidence without pack_provenance is not release-eligible", async () => {
+  assert.equal(isPostHybridPilotVersion("1.34.0"), true);
+  assert.equal(hybridProvenanceRequired("1.34.0"), true);
+  assert.equal(hybridProvenanceRequired("1.33.0"), true);
+  assert.equal(hybridProvenanceRequired("1.29.1"), false);
+
+  const pack = await loadFrgPack();
+  const { observations } = scoreCollected(pack, "1.34.0");
+  const items = observations.pack_provenance!.issues.map((issue) => ({
+    item_id: String(issue.issue_number),
+    state: "ready" as const,
+    ready_clean: true,
+  }));
+  const evidence = computeFrgEvidence({
+    version: "1.34.0",
+    run_id: "frg-hybrid-1.34-no-provenance",
+    loop_run_id: observations.pack_provenance!.loop_run_id,
     pack_id: FRG_PACK_MANIFEST.pack_id,
     items,
     scenario_overrides: observations.scenarios,
     composition_overrides: observations.composition,
     false_human_authority_count: 0,
     attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
+  });
+  assert.equal(evidence.pack_provenance, null);
+  assert.equal(hybridPilotProofValid(evidence), false);
+  assert.equal(evidence.pass, false);
+  assert.equal(
+    isReleaseEligibleFrgPass({ ...evidence, pass: true }),
+    false,
+    "otherwise passing 1.34.0 evidence without pack_provenance must be rejected",
+  );
+});
+
+test("v1.33.0 cannot pass without provenance and hybrid v1 cannot escape to 1.33.1", async () => {
+  const pack = await loadFrgPack();
+  const v2 = collectFrgPackObservations(pack, makeEvidenceBundle(pack, "1.33.0"));
+  const items = v2.pack_provenance.issues.map((issue) => ({
+    item_id: String(issue.issue_number),
+    state: "ready" as const,
+    ready_clean: true,
+  }));
+  const common = {
+    run_id: "frg-hybrid-boundary",
+    loop_run_id: v2.pack_provenance.loop_run_id,
+    pack_id: FRG_PACK_MANIFEST.pack_id,
+    items,
+    scenario_overrides: v2.scenarios,
+    composition_overrides: v2.composition,
+    false_human_authority_count: 0,
+    attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
   };
   assert.equal(computeFrgEvidence({ ...common, version: "1.33.0" }).pass, false);
-  assert.equal(computeFrgEvidence({ ...common, version: "1.33.1", pack_provenance: observations.pack_provenance }).pass, false);
+  assert.equal(
+    computeFrgEvidence({
+      ...common,
+      version: "1.33.1",
+      pack_provenance: v2.pack_provenance,
+    }).pass,
+    false,
+    "v2 provenance collected for 1.33.0 cannot unlock 1.33.1",
+  );
 
-  const layerAOpenSpec = structuredClone(observations);
-  const openSpec = layerAOpenSpec.composition.find((item) => item.id === "openspec-bearing-item")!;
-  openSpec.source = "layer_a";
-  openSpec.proof_ids = [`probe:${pack.manifest.pilot_policy.layer_a_probes[0]!.id}`];
-  assert.equal(computeFrgEvidence({
-    ...common,
+  const relabeledV2AsV1 = {
+    ...v2.pack_provenance,
+    policy_id: FRG_HYBRID_PILOT_POLICY_ID,
+    replacement_issue: FRG_HYBRID_REPLACEMENT_ISSUE,
+    release_version: "1.33.0",
+  };
+  assert.equal(
+    computeFrgEvidence({
+      ...common,
+      version: "1.33.0",
+      pack_provenance: relabeledV2AsV1,
+    }).pass,
+    false,
+    "current v2 manifest SHA is not authentic historical v1 evidence",
+  );
+  assert.equal(
+    computeFrgEvidence({
+      ...common,
+      version: "1.33.1",
+      pack_provenance: relabeledV2AsV1,
+    }).pass,
+    false,
+    "historical hybrid v1 cannot satisfy 1.33.1",
+  );
+  assert.throws(
+    () => parseFrgObservationsFile({
+      schema_version: 1,
+      pack_provenance: { ...relabeledV2AsV1, release_version: "1.33.1" },
+    }),
+    /valid only for 1\.33\.0/,
+  );
+});
+
+test("authentic historical v1.33.0 evidence with the frozen pre-v2 manifest SHA remains valid", async () => {
+  const pack = await loadFrgPack();
+  const v2 = collectFrgPackObservations(pack, makeEvidenceBundle(pack, "1.33.0"));
+  const items = v2.pack_provenance.issues.map((issue) => ({
+    item_id: String(issue.issue_number),
+    state: "ready" as const,
+    ready_clean: true,
+  }));
+  const historicalV1 = {
+    ...v2.pack_provenance,
+    policy_id: FRG_HYBRID_PILOT_POLICY_ID,
+    replacement_issue: FRG_HYBRID_REPLACEMENT_ISSUE,
+    release_version: "1.33.0",
+    manifest_sha256: FRG_HYBRID_V1_MANIFEST_SHA256,
+  };
+  const common = {
+    run_id: "frg-hybrid-historical-v1",
+    loop_run_id: historicalV1.loop_run_id,
+    pack_id: FRG_PACK_MANIFEST.pack_id,
+    items,
+    scenario_overrides: v2.scenarios,
+    composition_overrides: v2.composition,
+    false_human_authority_count: 0,
+    attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
+    pack_provenance: historicalV1,
+  };
+  const evidence = computeFrgEvidence({ ...common, version: "1.33.0" });
+  assert.equal(historicalV1.manifest_sha256, FRG_HYBRID_V1_MANIFEST_SHA256);
+  assert.notEqual(historicalV1.manifest_sha256, pack.manifest_sha256);
+  assert.equal(evidence.pass, true);
+  assert.equal(hybridPilotProofValid(evidence), true);
+  assert.equal(parseFrgEvidence(evidence).pass, true);
+  assert.equal(
+    computeFrgEvidence({ ...common, version: "1.33.1" }).pass,
+    false,
+    "authentic historical v1 cannot satisfy 1.33.1",
+  );
+});
+
+test("historical v1 probe matrix stays frozen when the current v2 list is simulated as divergent", async () => {
+  const pack = await loadFrgPack();
+  const v2 = collectFrgPackObservations(pack, makeEvidenceBundle(pack, "1.33.0"));
+  const items = v2.pack_provenance.issues.map((issue) => ({
+    item_id: String(issue.issue_number),
+    state: "ready" as const,
+    ready_clean: true,
+  }));
+  const historicalV1 = {
+    ...v2.pack_provenance,
+    policy_id: FRG_HYBRID_PILOT_POLICY_ID,
+    replacement_issue: FRG_HYBRID_REPLACEMENT_ISSUE,
+    release_version: "1.33.0",
+    manifest_sha256: FRG_HYBRID_V1_MANIFEST_SHA256,
+  };
+  const evidence = computeFrgEvidence({
     version: "1.33.0",
-    composition_overrides: layerAOpenSpec.composition,
-    pack_provenance: observations.pack_provenance,
-  }).pass, false);
+    run_id: "frg-hybrid-v1-frozen-probes",
+    loop_run_id: historicalV1.loop_run_id,
+    pack_id: FRG_PACK_MANIFEST.pack_id,
+    items,
+    scenario_overrides: v2.scenarios,
+    composition_overrides: v2.composition,
+    false_human_authority_count: 0,
+    attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
+    pack_provenance: historicalV1,
+  });
+
+  const frozenV1 = expectedHybridLayerAProbeIds(FRG_HYBRID_PILOT_POLICY_ID);
+  const currentV2 = expectedHybridLayerAProbeIds(FRG_HYBRID_V2_POLICY_ID);
+  assert.ok(frozenV1);
+  assert.ok(currentV2);
+  assert.notEqual(
+    frozenV1,
+    currentV2,
+    "v1 and v2 probe matrices must be independently declared",
+  );
+  assert.deepEqual([...frozenV1], [...FRG_HYBRID_V1_LAYER_A_PROBE_IDS]);
+  assert.deepEqual([...currentV2], [...FRG_HYBRID_LAYER_A_PROBE_IDS]);
+
+  const simulatedDivergentV2 = [...currentV2, "future-v2-only-probe"];
+  assert.notDeepEqual([...frozenV1], simulatedDivergentV2);
+  const v1ProbeIds = historicalV1.probes.map((probe) => probe.id);
+  assert.deepEqual([...v1ProbeIds].sort(), [...frozenV1].sort());
+  assert.notEqual(v1ProbeIds.length, simulatedDivergentV2.length);
+
+  assert.equal(evidence.pass, true);
+  assert.equal(hybridPilotProofValid(evidence), true);
+
+  const extraProbe = {
+    ...historicalV1.probes[0]!,
+    id: "future-v2-only-probe",
+  };
+  const v1WithSimulatedV2Probe = {
+    ...historicalV1,
+    probes: [...historicalV1.probes, extraProbe],
+  };
+  assert.equal(
+    hybridPilotProofValid({
+      ...evidence,
+      pack_provenance: v1WithSimulatedV2Probe,
+    }),
+    false,
+    "authentic v1 evidence is valid only against the frozen v1 matrix",
+  );
+});
+
+test("runbook states durable hybrid v2 as current policy", async () => {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const runbook = await fsp.readFile(
+    path.join(here, "../../docs/factory-reliability-gate-runbook.md"),
+    "utf8",
+  );
+  assert.match(runbook, /Durable hybrid v2 \(current policy\)/);
+  assert.match(runbook, /factory-gate-v1-hybrid-v2/);
+  assert.match(runbook, /not_observed` fails \*\*required-live only\*\*/);
+  assert.match(runbook, /this candidate SHA/);
+  assert.match(runbook, /Historical note: v1\.33\.0 hybrid v1/);
+  assert.doesNotMatch(
+    runbook,
+    /Hybrid Layer A provenance is refused for any version\s+other than exactly `1\.33\.0`/,
+  );
 });
 
 test("production collector has no CLI or all-pass fixture import", async () => {

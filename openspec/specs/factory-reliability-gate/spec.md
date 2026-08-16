@@ -47,21 +47,21 @@ composition behavior, not only single-issue advance. The pack SHALL include at l
 named scenarios (ids stable for scoring and tests):
 
 1. `capacity-blocked-retain` — capacity under blocked retain does not false-block eligible work as
-   needs-human solely for capacity  
+   needs-human solely for capacity
 2. `resume-mid-flight` — supervisor kill/resume leaves every in-flight item with a live next action;
-   no permanent dead `pr_opened` strand  
+   no permanent dead `pr_opened` strand
 3. `openspec-multi-change` — partial archive / foreign active change: archive result and residual
-   still-active check agree  
+   still-active check agree
 4. `implement-lockfile-dirt` — implement leaving uncommitted lockfile after HEAD advances is folded
-   or cleaned without human-blocking known lock dirt at zero attempts  
+   or cleaned without human-blocking known lock dirt at zero attempts
 5. `local-docs-parity` — docs/generator checks that would fail on CI fail before PR open (or before
-   ready-to-deploy)  
+   ready-to-deploy)
 6. `clean-item-throughput` — at least K easy items reach `pipeline:ready-to-deploy` without
-   engine-class block  
+   engine-class block
 7. `blocker-taxonomy` — scoreboard of engine-class vs product-class vs human-authority; engine-class
-   rate above threshold fails the gate  
-8. `pr-supersession` — a stale second PR for the same issue does not remain open after a new head  
-9. `release-plan-row` — release-cut path has plan-row present or scaffolded and documents the tag path  
+   rate above threshold fails the gate
+8. `pr-supersession` — a stale second PR for the same issue does not remain open after a new head
+9. `release-plan-row` — release-cut path has plan-row present or scaffolded and documents the tag path
 10. `empty-depends-on-stack-honesty` — items with empty `depends_on` that still stack OpenSpec
     changes across branches produce a warn or fail (process honesty)
 
@@ -92,11 +92,16 @@ numbers and SHALL be checked by the FRG driver.
 
 #### Scenario: Unobserved required scenarios fail the gate
 
-- **WHEN** the FRG driver scores a run and any required pack scenario lacks verifiable evidence
-  (status `not_observed`)
+- **WHEN** the FRG driver scores a run and any **required-live** pack scenario
+  (`clean-item-throughput`, `blocker-taxonomy`,
+  `empty-depends-on-stack-honesty`) or the required OpenSpec-bearing
+  composition item lacks verifiable live/ledger/derived evidence (status
+  `not_observed`)
 - **THEN** the report SHALL set overall `pass: false`
 - **AND** SHALL NOT treat throughput-only success as a release-usable FRG pass
-- **AND** `not_observed` SHALL be reserved for reports that cannot be used as release evidence
+- **AND** `not_observed` SHALL fail required-live only
+- **AND** a Layer A-allowed id MAY remain unobserved on the live loop when a
+  valid same-candidate TAP hash proves that closed probe
 
 #### Scenario: Required scenarios cannot be skipped without failing the gate
 
@@ -119,8 +124,6 @@ numbers and SHALL be checked by the FRG driver.
   selector is not the versioned FRG fixed pack (for example a product milestone or ad-hoc work-list)
 - **THEN** the driver SHALL refuse to write a passing FRG evidence artifact for a release version
 - **AND** SHALL surface that the run is not the fixed factory-gate pack
-
----
 
 ### Requirement: FRG Layer A hermetic scenarios SHALL run in CI without real I/O
 
@@ -178,8 +181,10 @@ intentionally injected product-class holds defined by the pack.
 
 - **WHEN** an FRG evidence artifact claims `pass: true` but omits the required named scenario
   inventory, numeric thresholds, scoreboard metrics, or timestamps, or declares `pass: true` while
-  any scenario is `fail`, `not_observed`, or `skip`, or omits a non-empty durable `loop_run_id` or
-  validated fixed-pack `pack_id`, or claims capacity pass without observed ≥ N
+  any **required-live** scenario is `fail`, `not_observed`, or `skip`, or while any Layer
+  A-allowed scenario is `fail` or `skip`, or while any Layer A-allowed scenario is
+  `not_observed` without a valid same-candidate TAP proof, or omits a non-empty durable
+  `loop_run_id` or validated fixed-pack `pack_id`, or claims capacity pass without observed ≥ N
 - **THEN** runtime validation SHALL reject the artifact as unparsable against the expected FRG schema
 - **AND** the release FRG precondition SHALL remain unsatisfied
 
@@ -209,8 +214,6 @@ intentionally injected product-class holds defined by the pack.
 - **WHEN** operators run FRG for version `X.Y.Z` and later for version `X.Y+1.0` (or next release)
 - **THEN** both runs SHALL use the same FRG driver entrypoint and runbook procedure
 - **AND** each version SHALL have its own evidence artifact keyed by that version
-
----
 
 ### Requirement: The FRG runbook SHALL document procedure, thresholds, and evidence layout
 
@@ -832,7 +835,7 @@ The representative pack SHALL provide a collector that creates the documented ob
 
 ### Requirement: The v1.33.0 pilot MAY use candidate-bound Layer A proof for unsafe fault classes
 
-For release v1.33.0 only, pack `factory-gate-v1` MAY prove fault classes that have no safe production injection seam with a closed manifest list of exact Layer A probes. Live proof remains mandatory for fresh manifest issues, the exact loop item set, two clean ready items, blocker taxonomy, one real OpenSpec-bearing item, pull-request heads, and final checks. The runner SHALL execute every Layer A probe from the same clean candidate commit. It SHALL construct each command from the manifest and SHALL NOT accept a caller-supplied status, metric, receipt, or pass result. This temporary rule SHALL expire after v1.33.0. Later releases SHALL NOT use the hybrid rule. Later releases SHALL generate genuine FRG evidence through the durable candidate-native path (`pipeline factory-release prepare` and the fixed pack / `pipeline factory-gate` scorer) from the exact integrated candidate.
+For release v1.33.0 only, pack `factory-gate-v1` MAY prove fault classes that have no safe production injection seam with a closed manifest list of exact Layer A probes under historical hybrid v1. Live proof remains mandatory for fresh manifest issues, the exact loop item set, two clean ready items, blocker taxonomy, one real OpenSpec-bearing item, pull-request heads, and final checks. The runner SHALL execute every Layer A probe from the same clean candidate commit. It SHALL construct each command from the manifest and SHALL NOT accept a caller-supplied status, metric, receipt, or pass result. This historical hybrid v1 rule applies to v1.33.0 evidence only. Later releases SHALL use durable hybrid v2 (required-live vs closed Layer A-allowed hashed to the current candidate SHA). Later releases SHALL NOT reuse v1.33.0 hybrid v1 policy identity, 1.33.0-only release pins, or 1.33.0 candidate artifacts. Later releases SHALL still generate FRG evidence through the durable candidate-native path (`pipeline factory-release prepare` and the fixed pack / `pipeline factory-gate` scorer) from the exact integrated candidate.
 
 #### Scenario: Candidate-bound hybrid evidence may pass for v1.33.0
 
@@ -851,9 +854,9 @@ For release v1.33.0 only, pack `factory-gate-v1` MAY prove fault classes that ha
 #### Scenario: Hybrid proof is not reusable after v1.33.0
 
 - **WHEN** the target release is not exactly `1.33.0`
-- **THEN** the hybrid rule SHALL fail closed
+- **THEN** historical hybrid v1 (`factory-gate-v1-hybrid-v1` pinned to release `1.33.0`) SHALL NOT satisfy that later version
 - **AND** the wrapper SHALL NOT reinterpret static bootstrap or candidate-version config as current proof
-- **AND** the durable factory-release prepare path and full current FRG policy SHALL apply through the fixed pack and scorer
+- **AND** durable hybrid v2 and the durable factory-release prepare path SHALL apply through the fixed pack and scorer
 - **AND** a synthetic trivial-docs or fixture-only pack SHALL NOT satisfy release-eligible FRG generation
 
 #### Scenario: Unverified probe output fails closed
@@ -931,9 +934,21 @@ The durable FRG generation path SHALL construct every probe, action, and observa
 
 #### Scenario: Missing required scenario evidence fails closed
 
-- **WHEN** any required pack scenario lacks verifiable runner-derived evidence, or is recorded as `fail`, `skip`, `not_observed`, or an unsupported waiver
+- **WHEN** any **required-live** pack scenario or the required OpenSpec-bearing
+  composition item lacks verifiable runner-derived live/ledger/derived
+  evidence, or is recorded as `fail`, `skip`, `not_observed`, or an unsupported
+  waiver
 - **THEN** overall FRG pass SHALL be false or refused
 - **AND** release preparation SHALL NOT proceed to a complete release PR for that request
+
+#### Scenario: Missing Layer A-allowed TAP proof fails closed
+
+- **WHEN** any Layer A-allowed probe lacks a valid TAP hash on the current
+  candidate SHA, or is recorded as `fail`, `skip`, mismatch, or an unsupported
+  waiver
+- **THEN** overall FRG pass SHALL be false or refused
+- **AND** a live-loop `not_observed` for that Layer A-allowed id SHALL NOT by
+  itself be the failure reason when a valid same-candidate TAP proof exists
 
 ### Requirement: Durable FRG generation SHALL stop release preparation when evidence is not release-eligible
 
@@ -972,3 +987,145 @@ When the repository maintains ship-path composition class ids under `ship-path-c
 - **WHEN** ship-path composition unit tests pass without a conforming live FRG evidence artifact
 - **THEN** the FRG release precondition for a version SHALL remain governed by existing FRG live-loop and attestation rules
 - **AND** unit composition success SHALL NOT substitute for release-eligible FRG `pass: true`
+
+### Requirement: Durable hybrid v2 SHALL split required-live proof from a closed Layer A-allowed set
+
+The FRG pack manifest and scorer SHALL encode a **durable hybrid v2** proof policy
+that is not pinned to one SemVer. Every required pack scenario id and every
+required composition dimension id SHALL have exactly one proof owner in one of
+two disjoint sets:
+
+1. **Required-live / ledger / derived** — MUST be observed on the **candidate**
+   pack loop for the scored version: `clean-item-throughput`,
+   `blocker-taxonomy`, `empty-depends-on-stack-honesty`, and at least one
+   OpenSpec-bearing composition item (`openspec-bearing-item`).
+2. **Layer A-allowed** — a **closed** set of named hermetic probes hashed to
+   **this candidate SHA**, same class as the historical 1.33.0 `pilot_probes`.
+   The closed scenario set is: `capacity-blocked-retain`, `resume-mid-flight`,
+   `openspec-multi-change`, `implement-lockfile-dirt`, `local-docs-parity`,
+   `pr-supersession`, and `release-plan-row` (including the auto-tag guard
+   probe). Remaining required composition dimensions that the 1.33.0 matrix
+   already mapped to those probes (including fix→re-review, concurrency
+   contention, managed worktree dirt, process-restart hydration, forge HTTP
+   5xx backoff, CI pending/red recovery, same-HEAD no-op re-entry, capacity
+   live-run coexistence, and recovery-controller one-item / multi-item entry)
+   SHALL stay Layer A-allowed. The set SHALL NOT grow without a later spec
+   change.
+
+Required-live ids SHALL use proof source `live`, `ledger`, or `derived` as
+appropriate to the id. They SHALL NOT use source `layer_a`. Layer A-allowed
+ids MAY use source `layer_a` only when a named probe from the closed set
+reports the exact named test as passed and not skipped on the unchanged clean
+candidate commit, with a hash of the actual TAP output bound to that SHA.
+
+Hybrid Layer A provenance SHALL remain **refused** for ids that are not on the
+closed Layer A-allowed set. The collector and scorer SHALL NOT accept a
+caller-authored pass, scenario status, metric, evidence receipt, or all-pass
+observation file as authority for either set.
+
+This policy **succeeds** the 1.33.0-only hybrid v1 expiry. v1.33.0 evidence
+bound to hybrid v1 remains historically valid for that version only. The scorer
+SHALL resolve the expected pack-manifest SHA and closed Layer A probe matrix by
+policy id: historical `factory-gate-v1-hybrid-v1` uses the frozen pre-v2
+manifest identity; current `factory-gate-v1-hybrid-v2` uses the current
+manifest identity. Relabeling current-manifest provenance as hybrid v1 SHALL
+NOT satisfy historical v1.
+
+#### Scenario: Historical hybrid v1 evidence with the frozen v1 manifest SHA remains valid
+
+- **WHEN** a `1.33.0` evidence artifact binds policy `factory-gate-v1-hybrid-v1`
+- **AND** its `pack_provenance.manifest_sha256` is the frozen pre-v2 hybrid-v1
+  manifest SHA
+- **AND** the closed v1 probe matrix and required-live / Layer A split hold
+- **THEN** hybrid proof validation SHALL accept that artifact for version
+  `1.33.0`
+- **AND** SHALL refuse the same v1 policy identity when the SHA is the current
+  v2 manifest SHA
+- **AND** SHALL refuse that v1 artifact for any version other than `1.33.0`
+
+#### Scenario: Required-live not_observed fails overall pass
+
+- **WHEN** the FRG scorer scores a candidate pack run
+- **AND** any required-live scenario or the required OpenSpec-bearing
+  composition item has status `not_observed`
+- **THEN** the report SHALL set overall `pass: false`
+- **AND** valid TAP hashes for Layer A-allowed probes SHALL NOT make the
+  evidence release-eligible
+
+#### Scenario: Layer A-allowed proven by candidate TAP hash can pass
+
+- **WHEN** required-live ids are observed on the candidate pack loop
+  (`clean-item-throughput` and `blocker-taxonomy` from the ledger,
+  `empty-depends-on-stack-honesty` derived, OpenSpec-bearing composition
+  from the live pack item)
+- **AND** every Layer A-allowed probe reports the exact named test as passed
+  and not skipped on the same clean candidate commit
+- **AND** the TAP output hash is bound to that candidate SHA
+- **AND** existing numeric thresholds, representative composition, pack
+  identity, loop provenance, and attestation criteria are met
+- **THEN** the scorer MAY produce release-eligible `pass: true` for a version
+  other than `1.33.0`
+- **AND** each Layer A-allowed outcome SHALL record source `layer_a`
+- **AND** no report SHALL describe a Layer A probe as a live production fault
+  injection
+
+#### Scenario: Unknown id as layer_a is refused
+
+- **WHEN** a scenario or composition id that is not on the closed Layer
+  A-allowed set claims source `layer_a`, or a probe id outside the closed
+  manifest list is offered as Layer A proof
+- **THEN** the collector or scorer SHALL refuse that provenance
+- **AND** SHALL NOT treat the claim as proof of that id
+- **AND** SHALL NOT emit release-eligible `pass: true` from that claim
+
+#### Scenario: Missing skip or mismatched TAP fails the Layer A probe
+
+- **WHEN** a Layer A-allowed probe is missing, skipped, fails, lacks the exact
+  named TAP pass, runs on another commit, moves or dirties the checkout, or
+  has an unreadable output digest
+- **THEN** the collector SHALL refuse the mapped outcomes
+- **AND** that probe SHALL fail
+- **AND** overall FRG pass SHALL be false or refused
+
+#### Scenario: Hybrid v2 is not a one-version waiver
+
+- **WHEN** the target release is `1.34.0` or any later version
+- **AND** required-live is observed on that version's candidate pack loop
+- **AND** every closed Layer A-allowed probe is proven by TAP hash on that
+  same candidate SHA
+- **THEN** hybrid Layer A provenance for the closed set SHALL NOT be refused
+  solely because the version is not `1.33.0`
+- **AND** a 1.33.0 hybrid v1 policy id, 1.33.0-only release pin, or earlier
+  candidate SHA SHALL NOT satisfy the later version
+
+#### Scenario: Caller-authored pass is still refused
+
+- **WHEN** a prepare request, observation input, or verified bundle includes a
+  caller-supplied `pass: true`, scenario status map, metric, or evidence
+  receipt intended to short-circuit scoring
+- **THEN** the collector and scorer SHALL ignore or reject that field per the
+  closed schema
+- **AND** only runner-derived live/ledger/derived evidence and closed Layer A
+  TAP hashes MAY contribute to a release-eligible pass
+
+### Requirement: FRG runbook SHALL document durable hybrid v2 as current policy
+
+The checked-in FRG runbook SHALL replace the hybrid-expiry paragraph that
+forbids Layer A provenance after v1.33.0 with durable hybrid v2: required-live
+must be observed on the candidate pack loop; Layer A-allowed may prove from
+named TAP hashes on this candidate SHA; `not_observed` fails required-live
+only; unknown `layer_a` ids are refused; caller-authored pass is refused.
+The runbook SHALL keep v1.33.0 hybrid v1 as a historical note. It SHALL NOT
+describe Layer A probes as live fault injection.
+
+#### Scenario: Runbook states the two-set split
+
+- **WHEN** an operator reads the FRG runbook hybrid section
+- **THEN** it SHALL name the required-live ids and the closed Layer A-allowed
+  set
+- **AND** SHALL state that `not_observed` fails required-live only
+- **AND** SHALL state that Layer A TAP hashes must bind to the current
+  candidate SHA
+- **AND** SHALL mark v1.33.0 hybrid v1 as historical
+
+---

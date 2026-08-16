@@ -41,9 +41,7 @@
     "recovery-controller-multi-item"
   ],
   "pilot_policy": {
-    "id": "factory-gate-v1-hybrid-v1",
-    "release_version": "1.33.0",
-    "replacement_issue": 908,
+    "id": "factory-gate-v1-hybrid-v2",
     "live_scenario_ids": [
       "clean-item-throughput",
       "blocker-taxonomy",

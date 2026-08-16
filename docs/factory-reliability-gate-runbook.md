@@ -72,29 +72,50 @@ pipeline doctor
 | **A. Hermetic** | Every PR that can break composition; always in `npm test` / `npm run ci` | Fake-deps composition tests for capacity, resume, OpenSpec archive coherence, lockfold, docs parity, supersede_mode, auto-tag FRG guard |
 | **B. Live** | **Every release** (patch / minor / major) | Multi-item durable `pipeline:loop` against a **representative** fixed scenario pack; immutable evidence artifact |
 
-### v1.33.0 hybrid pilot boundary
+### Durable hybrid v2 (current policy)
 
 The current CLI has no safe production switch for controlled process death, forge 5xx,
 CI red-to-green, stale pull-request creation, or forced recoverable outcomes. Do not add
-an unsafe public injection switch only to run this release.
+an unsafe public injection switch only to green FRG.
 
-For v1.33.0 only, `factory-gate-v1` uses this fixed hybrid rule:
+`factory-gate-v1` uses **durable hybrid v2** (`factory-gate-v1-hybrid-v2`). The
+policy is not pinned to one SemVer. Proof binds to the pack id, manifest hash,
+**this candidate SHA**, the loop run, and the closed probe list.
 
-- The live candidate loop must contain exactly the two fresh manifest issues.
-- Both issues must reach ready-to-deploy with real pull requests, exact heads, and green checks.
-- At least one final pull-request tree must prove the real OpenSpec path.
-- The live ledger must prove clean throughput and blocker taxonomy.
-- Only the closed `pilot_probes` list in the manifest may prove the remaining unsafe fault classes.
-- Each probe must run its exact named test on the same clean candidate commit. It must pass,
-  must not skip, and must retain a hash of the actual TAP output.
+Two disjoint proof sets. Every required scenario and composition id has exactly
+one owner.
+
+**Required-live / ledger / derived** — must be observed on the **candidate** pack
+loop:
+
+- `clean-item-throughput`
+- `blocker-taxonomy`
+- `empty-depends-on-stack-honesty`
+- `openspec-bearing-item` (composition)
+
+`not_observed` fails **required-live only**. Valid Layer A TAP hashes cannot make
+unobserved required-live evidence release-eligible.
+
+**Layer A-allowed** — closed hermetic probes hashed to **this candidate SHA**.
+Named scenario set: `capacity-blocked-retain`, `resume-mid-flight`,
+`openspec-multi-change`, `implement-lockfile-dirt`, `local-docs-parity`,
+`pr-supersession`, `release-plan-row` (including the auto-tag guard probe).
+Remaining required composition dimensions already mapped on that matrix stay
+Layer A-allowed. The set does not grow without a later spec change.
+
+- Each Layer A probe must run its exact named test on the same clean candidate
+  commit. It must pass, must not skip, and must retain a hash of the actual TAP
+  output bound to that SHA.
+- Missing, skipped, failed, other-commit, dirty-checkout, or unreadable TAP
+  fails that probe and overall pass.
+- An id that is not on the closed set, including any required-live id, cannot
+  use source `layer_a`.
 - Evidence must label each proof as `live`, `ledger`, `derived`, or `layer_a`.
-- The FRG HMAC must bind the release, candidate commit, manifest hash, loop run, exact issue
-  set, and proof digests.
-- A Layer A probe is not a live fault injection. Reports must not describe it as one.
+- A Layer A probe is not a live fault injection. Reports must not describe it as
+  one.
 - The runner accepts no caller-written pass, status, metric, or evidence receipt.
 
-This rule expires after v1.33.0. Later releases use the durable engine command
-implemented for #953 / #908:
+Later releases still generate FRG through the durable engine command:
 
 ```text
 pipeline factory-release prepare --request <absolute-request.json> --json
@@ -112,11 +133,19 @@ release pull request, FRG run id, head, base, and restart checkpoint. Repeated
 calls must reconcile the same checkpoint without another pack, attestation,
 branch, or pull request.
 
-**Hard gate:** missing, stale, failed, mismatched, skipped, or waived required
-evidence yields non-zero exit / non-`complete` status and blocks release
-preparation. Synthetic trivial docs/fixture packs are **not** release-eligible
-for versions after v1.33.0. Hybrid Layer A provenance is refused for any version
-other than exactly `1.33.0`.
+**Hard gate:** missing, stale, failed, mismatched, skipped, or waived
+required-live evidence, or a missing/mismatched Layer A TAP hash, yields
+non-zero exit / non-`complete` status and blocks release preparation. Synthetic
+trivial docs/fixture packs are **not** release-eligible. Hybrid v1
+(`factory-gate-v1-hybrid-v1` pinned to `1.33.0`) cannot satisfy a later version.
+
+### Historical note: v1.33.0 hybrid v1
+
+v1.33.0 evidence bound to `factory-gate-v1-hybrid-v1` remains historically valid
+for that version only. The 1.33.0 runner used the same required-live vs closed
+Layer A split, but the policy identity and release pin expired after that
+version. Do not reuse the v1 policy id, a 1.33.0-only release pin, or a 1.33.0
+candidate artifact for a later version.
 
 Request JSON (`schema_version: 1`, `kind: "factory_release_prepare_request"`)
 binds at least: `action_id`, `repository`, `base_branch`, `target_version`,
@@ -350,10 +379,14 @@ pipeline factory-gate --for 1.30.0 --from-run <loop-run-id> \
   pack manifest (`pack_id=factory-gate-v1`: selector must be label `factory-gate` or milestone
   `factory-gate` / `frg-pack` / `reliability-pack`, and ≥2 items). Unrelated successful loops are
   refused and do not write release evidence.
-- **Observation required:** overall `pass: true` requires every named pack scenario to be
-  observed with machine-checked criteria; `not_observed`, `fail`, or `skip` fails the gate.
-  `capacity-blocked-retain` pass requires `observed ≥ N` (`capacity_stress_n`). `warn` is
-  pass-permitting only for documented honesty outcomes (e.g. `empty-depends-on-stack-honesty`).
+- **Observation required:** overall `pass: true` requires every **required-live**
+  scenario (`clean-item-throughput`, `blocker-taxonomy`,
+  `empty-depends-on-stack-honesty`) and the OpenSpec-bearing composition item to
+  be observed with machine-checked criteria. `not_observed` fails required-live
+  only. Layer A-allowed ids may prove from a same-candidate TAP hash. `fail` or
+  `skip` still fails the gate for every required id. `capacity-blocked-retain`
+  pass requires `observed ≥ N` (`capacity_stress_n`). `warn` is pass-permitting
+  only for documented honesty outcomes (e.g. `empty-depends-on-stack-honesty`).
 - **Composition required:** release-eligible pass also requires every composition dimension
   to pass (via ledger projection and/or observations file).
 - **Live loop + pack provenance:** non-empty `loop_run_id` and `pack_id=factory-gate-v1`.
