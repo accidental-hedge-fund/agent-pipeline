@@ -4,20 +4,26 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as crypto from "node:crypto";
+import { EventEmitter } from "node:events";
 import {
   buildFactoryReleaseUnsignedDigestBinding,
   compareSemver,
   defaultFactoryReleasePrepareDeps,
   defaultObserveAttestation,
   defaultStartBoundPackLoop,
+  factoryReleaseLoopBindingPath,
   factoryReleasePackInstancePath,
   factoryReleaseRequestFingerprint,
   factoryReleaseWorkDir,
   generateDurableUnsignedFrg,
   isBoundPackLoopTerminal,
+  isPendingLoopDispatch,
   isPostPilotReleaseVersion,
+  observeDetachedChildStart,
   parseFactoryReleasePrepareRequest,
+  persistFactoryReleaseLoopBinding,
   productionCreateOrReusePackIssues,
+  productionDispatchPackLoop,
   rejectForbiddenRequestFields,
   runFactoryReleasePrepare,
   unsignedDigestBindingMismatch,
@@ -1297,4 +1303,269 @@ test("productionCreateOrReusePackIssues reuses matching pack_run_id issues", asy
   );
   assert.deepEqual(result.issue_numbers, [55, 56]);
   assert.deepEqual(created, ["openspec"]);
+});
+
+test("observeDetachedChildStart rejects child error and does not unref", async () => {
+  const child = new EventEmitter() as EventEmitter & { unref: () => void };
+  let unrefed = false;
+  child.unref = () => {
+    unrefed = true;
+  };
+  const pending = observeDetachedChildStart(child);
+  const err = Object.assign(new Error("spawn ENOENT"), { code: "ENOENT" });
+  child.emit("error", err);
+  await assert.rejects(pending, /ENOENT/);
+  assert.equal(unrefed, false);
+});
+
+test("observeDetachedChildStart resolves on spawn and unrefs", async () => {
+  const child = new EventEmitter() as EventEmitter & { unref: () => void };
+  let unrefed = false;
+  child.unref = () => {
+    unrefed = true;
+  };
+  const pending = observeDetachedChildStart(child);
+  child.emit("spawn");
+  await pending;
+  assert.equal(unrefed, true);
+});
+
+test("productionDispatchPackLoop persists binding before spawn", async () => {
+  const events: string[] = [];
+  const files = new Map<string, string>();
+  const persistCtx = {
+    repoDir: "/repo",
+    workDir: "/tmp/frg-work-persist-order",
+    request: baseRequest(),
+    pack: packWithTemplates(),
+    packRunId: "pack-1340-order",
+    frgRunId: "frg-order",
+    requestFingerprint: factoryReleaseRequestFingerprint(baseRequest()),
+    writeFile: async (p: string, body: string) => {
+      files.set(p, body);
+    },
+    readFile: async (p: string) => {
+      const v = files.get(p);
+      if (v === undefined) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+      return v;
+    },
+    fileExists: async (p: string) => files.has(p),
+    now: () => new Date("2026-08-10T12:00:00Z"),
+  };
+  const result = await productionDispatchPackLoop(
+    {
+      repoDir: "/repo",
+      request: baseRequest(),
+      pack: packWithTemplates(),
+      packRunId: "pack-1340-order",
+      issue_numbers: [101, 102],
+      engineTrack: "candidate",
+      label: "factory-gate",
+      persistCtx,
+    },
+    {
+      initBoundLoop: async () => {
+        events.push("init");
+        return { loop_run_id: "loop-persist-order" };
+      },
+      spawnCandidateLoop: async () => {
+        events.push("spawn");
+        const bindingPath = factoryReleaseLoopBindingPath("loop-persist-order");
+        assert.equal(files.has(bindingPath), true, "binding must exist before spawn");
+        const binding = JSON.parse(files.get(bindingPath)!);
+        assert.equal(isPendingLoopDispatch(binding), true);
+        const instance = JSON.parse(files.get(factoryReleasePackInstancePath(persistCtx.workDir))!);
+        assert.equal(instance.loop_run_id, "loop-persist-order");
+      },
+    },
+  );
+  assert.equal(result.loop_run_id, "loop-persist-order");
+  assert.deepEqual(events, ["init", "spawn"]);
+  const binding = JSON.parse(files.get(factoryReleaseLoopBindingPath("loop-persist-order"))!);
+  assert.equal(binding.dispatch_state, "dispatched");
+});
+
+test("crash after persist before spawn resumes the same bound run", async () => {
+  const files = new Map<string, string>();
+  const request = baseRequest();
+  const workDir = "/tmp/frg-work-crash-window";
+  const spawnCalls: string[] = [];
+  const startCalls: string[] = [];
+  const resumeCalls: string[] = [];
+  const fs = {
+    writeFile: async (p: string, body: string) => {
+      files.set(p, body);
+    },
+    readFile: async (p: string) => {
+      const v = files.get(p);
+      if (v === undefined) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+      return v;
+    },
+    fileExists: async (p: string) => files.has(p),
+  };
+  const first = await generateDurableUnsignedFrg(
+    request,
+    {
+      repoDir: "/repo",
+      workDir,
+      pack: packWithTemplates(),
+      manifestPath: "/pack/factory-gate-v1/manifest.json",
+    },
+    {
+      now: () => new Date("2026-08-10T12:00:00Z"),
+      writeFile: fs.writeFile,
+      mkdir: async () => {},
+      readFile: fs.readFile,
+      fileExists: fs.fileExists,
+      createOrReusePackIssues: async () => {
+        startCalls.push("create");
+        return { issue_numbers: [101, 102] };
+      },
+      dispatchPackLoop: async (input) =>
+        productionDispatchPackLoop(input, {
+          initBoundLoop: async () => ({ loop_run_id: "loop-crash-window" }),
+          persistBinding: async (id) => {
+            if (!input.persistCtx) throw new Error("missing persistCtx");
+            await persistFactoryReleaseLoopBinding(input.persistCtx, id, "bound");
+            throw new Error("simulated crash after persist");
+          },
+          spawnCandidateLoop: async () => {
+            spawnCalls.push("first");
+          },
+        }),
+    },
+  );
+  assert.equal(first.in_progress, undefined);
+  assert.equal(first.defect_class, "pack_loop_start_failed");
+  assert.deepEqual(spawnCalls, []);
+  const binding = JSON.parse(files.get(factoryReleaseLoopBindingPath("loop-crash-window"))!);
+  assert.equal(isPendingLoopDispatch(binding), true);
+  const instance = JSON.parse(files.get(factoryReleasePackInstancePath(workDir))!);
+  assert.equal(instance.loop_run_id, "loop-crash-window");
+
+  const second = await generateDurableUnsignedFrg(
+    request,
+    {
+      repoDir: "/repo",
+      workDir,
+      pack: packWithTemplates(),
+      manifestPath: "/pack/factory-gate-v1/manifest.json",
+    },
+    {
+      now: () => new Date("2026-08-10T12:00:00Z"),
+      writeFile: fs.writeFile,
+      mkdir: async () => {},
+      readFile: fs.readFile,
+      fileExists: fs.fileExists,
+      createOrReusePackIssues: async () => {
+        startCalls.push("create-again");
+        return { issue_numbers: [101, 102] };
+      },
+      dispatchPackLoop: async () => {
+        startCalls.push("dispatch-again");
+        return { loop_run_id: "loop-second-pack" };
+      },
+      resumeBoundPackLoop: async ({ loop_run_id }) => {
+        resumeCalls.push(loop_run_id);
+      },
+    },
+  );
+  assert.equal(second.in_progress, true);
+  assert.equal(second.loop_run_id, "loop-crash-window");
+  assert.deepEqual(resumeCalls, ["loop-crash-window"]);
+  assert.deepEqual(startCalls, ["create"]);
+  assert.notEqual(second.loop_run_id, "loop-second-pack");
+});
+
+test("failed detached spawn is retried on the same bound run", async () => {
+  const files = new Map<string, string>();
+  const request = baseRequest();
+  const workDir = "/tmp/frg-work-spawn-enoent";
+  const spawnAttempts: string[] = [];
+  const startCalls: string[] = [];
+  const fs = {
+    writeFile: async (p: string, body: string) => {
+      files.set(p, body);
+    },
+    readFile: async (p: string) => {
+      const v = files.get(p);
+      if (v === undefined) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+      return v;
+    },
+    fileExists: async (p: string) => files.has(p),
+  };
+  const spawnOnce = async (label: string) => {
+    spawnAttempts.push(label);
+    if (spawnAttempts.length === 1) {
+      throw Object.assign(new Error("spawn ENOENT"), { code: "ENOENT" });
+    }
+  };
+  const first = await generateDurableUnsignedFrg(
+    request,
+    {
+      repoDir: "/repo",
+      workDir,
+      pack: packWithTemplates(),
+      manifestPath: "/pack/factory-gate-v1/manifest.json",
+    },
+    {
+      now: () => new Date("2026-08-10T12:00:00Z"),
+      writeFile: fs.writeFile,
+      mkdir: async () => {},
+      readFile: fs.readFile,
+      fileExists: fs.fileExists,
+      createOrReusePackIssues: async () => {
+        startCalls.push("create");
+        return { issue_numbers: [101, 102] };
+      },
+      dispatchPackLoop: async (input) =>
+        productionDispatchPackLoop(input, {
+          initBoundLoop: async () => ({ loop_run_id: "loop-spawn-enoent" }),
+          spawnCandidateLoop: async () => spawnOnce("first"),
+        }),
+    },
+  );
+  assert.equal(first.defect_class, "pack_loop_start_failed");
+  assert.match(first.message ?? "", /ENOENT/);
+  assert.notEqual(first.in_progress, true);
+  const binding = JSON.parse(files.get(factoryReleaseLoopBindingPath("loop-spawn-enoent"))!);
+  assert.equal(isPendingLoopDispatch(binding), true);
+  assert.equal(
+    JSON.parse(files.get(factoryReleasePackInstancePath(workDir))!).loop_run_id,
+    "loop-spawn-enoent",
+  );
+
+  const second = await generateDurableUnsignedFrg(
+    request,
+    {
+      repoDir: "/repo",
+      workDir,
+      pack: packWithTemplates(),
+      manifestPath: "/pack/factory-gate-v1/manifest.json",
+    },
+    {
+      now: () => new Date("2026-08-10T12:00:00Z"),
+      writeFile: fs.writeFile,
+      mkdir: async () => {},
+      readFile: fs.readFile,
+      fileExists: fs.fileExists,
+      createOrReusePackIssues: async () => {
+        startCalls.push("create-again");
+        return { issue_numbers: [103, 104] };
+      },
+      dispatchPackLoop: async () => {
+        startCalls.push("dispatch-again");
+        return { loop_run_id: "loop-other" };
+      },
+      resumeBoundPackLoop: async ({ loop_run_id }) => {
+        await spawnOnce(`resume:${loop_run_id}`);
+      },
+    },
+  );
+  assert.equal(second.in_progress, true);
+  assert.equal(second.loop_run_id, "loop-spawn-enoent");
+  assert.deepEqual(spawnAttempts, ["first", "resume:loop-spawn-enoent"]);
+  assert.deepEqual(startCalls, ["create"]);
+  const after = JSON.parse(files.get(factoryReleaseLoopBindingPath("loop-spawn-enoent"))!);
+  assert.equal(after.dispatch_state, "dispatched");
 });

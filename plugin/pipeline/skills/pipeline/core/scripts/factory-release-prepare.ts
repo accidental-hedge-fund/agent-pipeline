@@ -720,6 +720,8 @@ export type CreateOrReusePackIssues = (
   input: CreateOrReusePackIssuesInput,
 ) => Promise<{ issue_numbers: number[] }>;
 
+export type FactoryReleaseLoopDispatchState = "bound" | "dispatched";
+
 export interface DispatchPackLoopInput {
   repoDir: string;
   request: FactoryReleasePrepareRequest;
@@ -728,6 +730,8 @@ export interface DispatchPackLoopInput {
   issue_numbers: number[];
   engineTrack: "candidate";
   label: string;
+  /** When set, production dispatch persists the request binding before spawn. */
+  persistCtx?: DurableReconcilePackLoopCtx;
 }
 
 export type DispatchPackLoop = (
@@ -773,6 +777,14 @@ export interface DurableGenerateOptions {
   createOrReusePackIssues?: CreateOrReusePackIssues;
   dispatchPackLoop?: DispatchPackLoop;
   /**
+   * Resume a request-bound run whose binding was persisted but whose spawn
+   * never confirmed. Tests inject this seam — no real subprocess.
+   */
+  resumeBoundPackLoop?: (args: {
+    repoDir: string;
+    loop_run_id: string;
+  }) => Promise<void>;
+  /**
    * Terminal score through factory-gate --from-run (no --observations).
    * Tests inject this seam.
    */
@@ -811,6 +823,87 @@ export function factoryReleasePackInstancePath(workDir: string): string {
 
 export function factoryReleaseLoopBindingPath(loopRunId: string): string {
   return path.join(runDir(defaultLoopStoreDeps(), loopRunId), "factory-release-binding.json");
+}
+
+/** True when the binding was persisted but spawn never confirmed. */
+export function isPendingLoopDispatch(binding: Record<string, unknown>): boolean {
+  return binding.dispatch_state === "bound";
+}
+
+/**
+ * Persist pack-instance `loop_run_id` and the matching loop binding.
+ * Callers write `bound` before spawn and `dispatched` after spawn confirms.
+ */
+export async function persistFactoryReleaseLoopBinding(
+  ctx: DurableReconcilePackLoopCtx,
+  loopRunId: string,
+  dispatchState: FactoryReleaseLoopDispatchState,
+): Promise<void> {
+  const loopBindingPath = factoryReleaseLoopBindingPath(loopRunId);
+  await ctx.writeFile(
+    loopBindingPath,
+    canonicalJson({
+      schema_version: 1,
+      kind: "factory_release_loop_binding",
+      request_fingerprint: ctx.requestFingerprint,
+      target_version: ctx.request.target_version,
+      candidate_git_sha: ctx.request.integrated_candidate.git_sha,
+      pack_id: ctx.request.frg_manifest.pack_id,
+      manifest_sha256: ctx.request.frg_manifest.sha256,
+      pack_run_id: ctx.packRunId,
+      frg_run_id: ctx.frgRunId,
+      loop_run_id: loopRunId,
+      dispatch_state: dispatchState,
+    }),
+    0o600,
+  );
+  const instancePath = factoryReleasePackInstancePath(ctx.workDir);
+  let createdAt = isoNow(ctx.now());
+  if (await ctx.fileExists(instancePath)) {
+    try {
+      const raw = JSON.parse(await ctx.readFile(instancePath)) as FactoryReleasePackInstance;
+      if (raw.kind === "factory_release_pack_instance" && typeof raw.created_at === "string") {
+        createdAt = raw.created_at;
+      }
+    } catch {
+      // Replace an unreadable instance with a fresh matching record.
+    }
+  }
+  await ctx.writeFile(
+    instancePath,
+    canonicalJson({
+      schema_version: 1,
+      kind: "factory_release_pack_instance",
+      request_fingerprint: ctx.requestFingerprint,
+      target_version: ctx.request.target_version,
+      candidate_git_sha: ctx.request.integrated_candidate.git_sha,
+      pack_id: ctx.request.frg_manifest.pack_id,
+      manifest_sha256: ctx.request.frg_manifest.sha256,
+      pack_run_id: ctx.packRunId,
+      frg_run_id: ctx.frgRunId,
+      loop_run_id: loopRunId,
+      created_at: createdAt,
+      updated_at: isoNow(ctx.now()),
+    } satisfies FactoryReleasePackInstance),
+    0o600,
+  );
+}
+
+async function boundLoopNeedsDispatchRetry(
+  loopRunId: string,
+  request: FactoryReleasePrepareRequest,
+  fingerprint: string,
+  readFile: (p: string) => Promise<string>,
+  fileExists: (p: string) => Promise<boolean>,
+): Promise<boolean> {
+  const bindingPath = factoryReleaseLoopBindingPath(loopRunId);
+  if (!(await fileExists(bindingPath))) return false;
+  try {
+    const binding = JSON.parse(await readFile(bindingPath)) as Record<string, unknown>;
+    return loopBindingMatchesRequest(binding, request, fingerprint) && isPendingLoopDispatch(binding);
+  } catch {
+    return false;
+  }
 }
 
 const TERMINAL_PACK_ITEM_STATES = new Set([
@@ -920,6 +1013,7 @@ export async function defaultStartBoundPackLoop(
     issue_numbers: created.issue_numbers,
     engineTrack: "candidate",
     label,
+    persistCtx: ctx,
   });
 }
 
@@ -1016,25 +1110,78 @@ export async function productionCreateOrReusePackIssues(
   return { issue_numbers: numbers };
 }
 
+export type SpawnCandidateLoop = (args: {
+  repoDir: string;
+  loop_run_id: string;
+  issue_numbers: number[];
+  engineTrack: "candidate";
+  label: string;
+}) => Promise<void>;
+
 /**
- * Production dispatch: compile/init the work-list run when needed, then spawn
- * a detached `pipeline loop --resume <id> --engine-track candidate`.
+ * Wait for detached `spawn` or `error` before treating launch as confirmed.
+ * Do not unref until spawn succeeds — otherwise startup ENOENT is lost.
+ */
+export function observeDetachedChildStart(child: {
+  once(event: "error", listener: (err: Error) => void): unknown;
+  once(event: "spawn", listener: () => void): unknown;
+  unref?: () => void;
+}): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const onError = (err: Error) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    };
+    const onSpawn = () => {
+      if (settled) return;
+      settled = true;
+      child.unref?.();
+      resolve();
+    };
+    child.once("error", onError);
+    child.once("spawn", onSpawn);
+  });
+}
+
+export async function defaultSpawnCandidateLoop(args: {
+  repoDir: string;
+  loop_run_id: string;
+}): Promise<void> {
+  const { spawn } = await import("node:child_process");
+  const bin = process.env.PIPELINE_BIN?.trim() || "pipeline";
+  const child = spawn(
+    bin,
+    ["loop", "--resume", args.loop_run_id, "--engine-track", "candidate"],
+    { cwd: args.repoDir, detached: true, stdio: "ignore" },
+  );
+  await observeDetachedChildStart(child);
+}
+
+export async function defaultResumeBoundPackLoop(args: {
+  repoDir: string;
+  loop_run_id: string;
+}): Promise<void> {
+  await defaultSpawnCandidateLoop(args);
+}
+
+/**
+ * Production dispatch: allocate/init the work-list run, persist the request
+ * binding, then spawn a detached `pipeline loop --resume <id> --engine-track
+ * candidate`. Spawn is startup-observable (error rejects; spawn confirms).
  */
 export async function productionDispatchPackLoop(
   input: DispatchPackLoopInput,
   deps: {
-    spawnCandidateLoop?: (args: {
-      repoDir: string;
-      loop_run_id: string;
-      issue_numbers: number[];
-      engineTrack: "candidate";
-      label: string;
-    }) => Promise<void>;
+    spawnCandidateLoop?: SpawnCandidateLoop;
     initBoundLoop?: (args: {
       repoDir: string;
       issue_numbers: number[];
       label: string;
     }) => Promise<{ loop_run_id: string }>;
+    persistBinding?: (loop_run_id: string) => Promise<void>;
+    markDispatched?: (loop_run_id: string) => Promise<void>;
   } = {},
 ): Promise<{ loop_run_id: string }> {
   const init =
@@ -1067,18 +1214,13 @@ export async function productionDispatchPackLoop(
     issue_numbers: input.issue_numbers,
     label: input.label,
   });
-  const spawn =
-    deps.spawnCandidateLoop ??
-    (async ({ repoDir, loop_run_id: runId }) => {
-      const { spawn } = await import("node:child_process");
-      const bin = process.env.PIPELINE_BIN?.trim() || "pipeline";
-      const child = spawn(
-        bin,
-        ["loop", "--resume", runId, "--engine-track", "candidate"],
-        { cwd: repoDir, detached: true, stdio: "ignore" },
-      );
-      child.unref();
-    });
+  const persist =
+    deps.persistBinding ??
+    (input.persistCtx
+      ? (id: string) => persistFactoryReleaseLoopBinding(input.persistCtx!, id, "bound")
+      : null);
+  if (persist) await persist(loop_run_id);
+  const spawn = deps.spawnCandidateLoop ?? defaultSpawnCandidateLoop;
   await spawn({
     repoDir: input.repoDir,
     loop_run_id,
@@ -1086,6 +1228,12 @@ export async function productionDispatchPackLoop(
     engineTrack: "candidate",
     label: input.label,
   });
+  const mark =
+    deps.markDispatched ??
+    (input.persistCtx
+      ? (id: string) => persistFactoryReleaseLoopBinding(input.persistCtx!, id, "dispatched")
+      : null);
+  if (mark) await mark(loop_run_id);
   return { loop_run_id };
 }
 
@@ -1359,14 +1507,33 @@ export async function defaultReconcileBoundPackLoop(
       ctx.readFile,
       ctx.fileExists,
     );
-    if (!loaded) continue;
-    instance = {
-      ...instance,
-      loop_run_id: runId,
-      updated_at: isoNow(ctx.now()),
-    };
-    await ctx.writeFile(instancePath, canonicalJson(instance), 0o600);
-    return loaded;
+    if (loaded) {
+      instance = {
+        ...instance,
+        loop_run_id: runId,
+        updated_at: isoNow(ctx.now()),
+      };
+      await ctx.writeFile(instancePath, canonicalJson(instance), 0o600);
+      return loaded;
+    }
+    // Binding persisted before spawn/artifacts — adopt the same run, do not start another.
+    try {
+      const binding = JSON.parse(await ctx.readFile(bindingPath)) as Record<string, unknown>;
+      if (
+        loopBindingMatchesRequest(binding, ctx.request, ctx.requestFingerprint) &&
+        isPendingLoopDispatch(binding)
+      ) {
+        instance = {
+          ...instance,
+          loop_run_id: runId,
+          updated_at: isoNow(ctx.now()),
+        };
+        await ctx.writeFile(instancePath, canonicalJson(instance), 0o600);
+        return nonTerminalBoundStub(runId);
+      }
+    } catch {
+      // Unreadable binding — keep scanning.
+    }
   }
 
   return null;
@@ -1408,6 +1575,7 @@ export async function generateDurableUnsignedFrg(
         createOrReusePackIssues: opts.createOrReusePackIssues,
         dispatchPackLoop: opts.dispatchPackLoop,
       }));
+  const resumeBoundPackLoop = opts.resumeBoundPackLoop ?? defaultResumeBoundPackLoop;
   const scoreBoundPackLoop = opts.scoreBoundPackLoop ?? defaultScoreBoundPackLoop;
 
   const requestFingerprint = factoryReleaseRequestFingerprint(request);
@@ -1465,51 +1633,36 @@ export async function generateDurableUnsignedFrg(
       });
     }
     if (started?.loop_run_id) {
-      // Persist binding on the started loop so later reconcile accepts only this run.
-      const storeDeps = defaultLoopStoreDeps();
-      const loopBindingPath = path.join(
-        runDir(storeDeps, started.loop_run_id),
-        "factory-release-binding.json",
-      );
-      await writeFile(
-        loopBindingPath,
-        canonicalJson({
-          schema_version: 1,
-          kind: "factory_release_loop_binding",
-          request_fingerprint: requestFingerprint,
-          target_version: request.target_version,
-          candidate_git_sha: request.integrated_candidate.git_sha,
-          pack_id: request.frg_manifest.pack_id,
-          manifest_sha256: request.frg_manifest.sha256,
-          pack_run_id: packRunId,
-          frg_run_id: frgRunId,
-          loop_run_id: started.loop_run_id,
-        }),
-        0o600,
-      );
-      const instancePath = factoryReleasePackInstancePath(ctx.workDir);
-      await writeFile(
-        instancePath,
-        canonicalJson({
-          schema_version: 1,
-          kind: "factory_release_pack_instance",
-          request_fingerprint: requestFingerprint,
-          target_version: request.target_version,
-          candidate_git_sha: request.integrated_candidate.git_sha,
-          pack_id: request.frg_manifest.pack_id,
-          manifest_sha256: request.frg_manifest.sha256,
-          pack_run_id: packRunId,
-          frg_run_id: frgRunId,
-          loop_run_id: started.loop_run_id,
-          created_at: isoNow(now()),
-          updated_at: isoNow(now()),
-        } satisfies FactoryReleasePackInstance),
-        0o600,
-      );
+      // Safety-net persist after a successful start. Production dispatch already
+      // wrote `bound` before spawn and `dispatched` after spawn confirmed.
+      await persistFactoryReleaseLoopBinding(reconcileCtx, started.loop_run_id, "dispatched");
       loop = await reconcilePackLoop(reconcileCtx);
       if (!loop) {
         loop = nonTerminalBoundStub(started.loop_run_id);
       }
+    }
+  } else if (
+    await boundLoopNeedsDispatchRetry(
+      loop.loop_run_id,
+      request,
+      requestFingerprint,
+      readFile,
+      fileExists,
+    )
+  ) {
+    try {
+      await resumeBoundPackLoop({
+        repoDir: ctx.repoDir,
+        loop_run_id: loop.loop_run_id,
+      });
+      await persistFactoryReleaseLoopBinding(reconcileCtx, loop.loop_run_id, "dispatched");
+    } catch (err) {
+      return refuseSyntheticTrivialPack(request, {
+        defect_class: "pack_loop_start_failed",
+        message:
+          `factory-release prepare: failed to resume request-bound factory-gate pack loop ` +
+          `${loop.loop_run_id} for ${request.target_version}: ${(err as Error).message}`,
+      });
     }
   }
 

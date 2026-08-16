@@ -6,17 +6,18 @@ For every release version after v1.33.0, the durable FRG generator SHALL start
 or resume one `factory-gate` pack loop bound to the active prepare request.
 When no request-bound loop exists, the generator SHALL create or reuse pack
 issues from the checked-in `factory-gate-v1` templates so the item count meets
-the pack manifest minimum, dispatch a candidate-track durable loop selected by
-the pack work-list or the `factory-gate` label, write
+the pack manifest minimum, allocate the candidate-track run id, persist
 `factory-release-binding.json` on that loop (request fingerprint, candidate
-git SHA, target version, pack/manifest identity), and persist the resulting
-`loop_run_id` on the pack instance. While that bound loop is not terminal, the
-generator SHALL return a machine-readable in-progress status and SHALL NOT
-treat the missing terminal loop as `missing_generator` or
-`pack_loop_missing`. A re-invoke of the same request SHALL resume the same
-`loop_run_id` and SHALL NOT start a second unbound pack. The generator SHALL
-NOT adopt an unbound newest `factory-gate` loop as the bound run or as
-release-eligible evidence.
+git SHA, target version, pack/manifest identity) together with a non-null
+`loop_run_id` on the pack instance, and only then spawn or resume the loop.
+A failed detached spawn SHALL fail that tick and SHALL leave the request
+bound to the same `loop_run_id` so a later invoke can resume it. While that
+bound loop is not terminal, the generator SHALL return a machine-readable
+in-progress status and SHALL NOT treat the missing terminal loop as
+`missing_generator` or `pack_loop_missing`. A re-invoke of the same request
+SHALL resume the same `loop_run_id` and SHALL NOT start a second unbound pack.
+The generator SHALL NOT adopt an unbound newest `factory-gate` loop as the
+bound run or as release-eligible evidence.
 
 #### Scenario: First prepare with no bound loop dispatches a candidate pack loop
 
@@ -25,10 +26,10 @@ release-eligible evidence.
   candidate SHA, version, and manifest
 - **THEN** the generator SHALL create or reuse pack issues from
   `factory-gate-v1` templates that meet the manifest minimum item count
-- **AND** it SHALL dispatch one durable loop on the candidate engine track
-  with the pack work-list or the `factory-gate` label
 - **AND** it SHALL persist a non-null `loop_run_id` on the pack instance
-  together with a matching `factory-release-binding.json`
+  together with a matching `factory-release-binding.json` before spawn
+- **AND** it SHALL then dispatch one durable loop on the candidate engine track
+  with the pack work-list or the `factory-gate` label
 - **AND** it SHALL return in-progress status without inventing `pass: true`
 
 #### Scenario: Second prepare resumes the same bound loop
@@ -45,6 +46,22 @@ release-eligible evidence.
 - **AND** no `factory-release-binding.json` matches the active request
 - **THEN** the generator SHALL NOT adopt that unbound loop as the bound run
 - **AND** it SHALL start or resume only a request-bound pack loop
+
+#### Scenario: Crash after persist before spawn resumes the same bound run
+
+- **WHEN** the generator has persisted pack-instance `loop_run_id` `L` and a
+  matching `factory-release-binding.json`
+- **AND** the process stops before spawn confirms
+- **THEN** a later invoke of the same request SHALL resume `L`
+- **AND** it SHALL NOT start a second unbound pack
+
+#### Scenario: Failed detached spawn is retried on the same bound run
+
+- **WHEN** detached spawn fails at startup (including missing `PIPELINE_BIN`)
+- **THEN** that tick SHALL NOT return in-progress as if the loop were running
+- **AND** a later invoke of the same request SHALL resume the same
+  `loop_run_id`
+- **AND** it SHALL NOT start a second unbound pack
 
 ### Requirement: Terminal pack-loop scoring SHALL use factory-gate from-run without observations
 

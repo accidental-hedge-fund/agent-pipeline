@@ -25,6 +25,8 @@
 - [x] 4.3 Unbound newest `factory-gate` loop is not adopted
 - [x] 4.4 Terminal score path invokes `--from-run` and does not pass `--observations`. Fail score does not write `pass: true` `latest.json`
 - [x] 4.5 Tests inject I/O through deps. They make no real network, git, or subprocess calls
+- [x] 4.6 Crash after persist before spawn: re-invoke resumes the same `loop_run_id` and does not start a second pack
+- [x] 4.7 Detached spawn startup failure (ENOENT): first tick fails; re-invoke retries the same bound run
 
 ## 5. Docs and packaging
 

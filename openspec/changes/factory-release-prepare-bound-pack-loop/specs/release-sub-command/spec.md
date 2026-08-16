@@ -4,7 +4,7 @@
 
 The engine SHALL expose the exact non-interactive command `pipeline factory-release prepare --request <absolute-request.json> --json` for durable FRG generation and prepare-only release handoff on every release after v1.33.0. Stable wrappers and ship adapters MAY invoke this command from the clean exact integrated candidate when the installed production engine is one release behind the candidate that provides the command. The request SHALL be versioned, secret-free, and bound to the verified installed production pin (when present), freshly observed base, exact integrated candidate, target release version, and stable action identity when supplied. The request SHALL NOT carry FRG credentials, executable paths, module names, network targets, or caller-authored pass claims.
 
-The command SHALL implement an idempotent multi-tick protocol. A call for a post-1.33 request with no request-bound pack loop, or with a bound loop that is not terminal, SHALL start or resume that bound candidate pack loop, persist `loop_run_id`, and return JSON with `status: "in_progress"`, the bound `loop_run_id`, and a stable restart checkpoint. That call SHALL NOT invent `pass: true`, SHALL NOT return `status: "complete"`, and SHALL NOT open the release pull request. A repeat call with the **unchanged** request SHALL resume the same `loop_run_id` and SHALL NOT start a second unbound pack.
+The command SHALL implement an idempotent multi-tick protocol. A call for a post-1.33 request with no request-bound pack loop, or with a bound loop that is not terminal, SHALL start or resume that bound candidate pack loop, persist `loop_run_id` and the matching request binding before spawn, and return JSON with `status: "in_progress"`, the bound `loop_run_id`, and a stable restart checkpoint. A failed detached spawn SHALL fail that tick and SHALL leave the request bound to the same `loop_run_id` so a later invoke can resume it. That call SHALL NOT invent `pass: true`, SHALL NOT return `status: "complete"`, and SHALL NOT open the release pull request. A repeat call with the **unchanged** request SHALL resume the same `loop_run_id` and SHALL NOT start a second unbound pack.
 
 When the bound pack loop is terminal, the command SHALL score it with `pipeline factory-gate --for <target-version> --from-run <loop_run_id>` (or the in-process equivalent) and SHALL NOT pass `--observations`. Only after that score produces complete unsigned FRG artifacts, and no verified production-owned attestation exists, SHALL the command return JSON with `status: "awaiting_frg_attestation"`, closed unsigned artifact identities and digests, and a stable restart checkpoint. It SHALL NOT open the release pull request on that call.
 
@@ -32,7 +32,7 @@ The command SHALL grant no attestation signing, release-PR merge, publication, p
 
 #### Scenario: Crash mid-protocol re-observes before mutate
 
-- **WHEN** the process stops after pack creation, after loop dispatch, after attestation storage, or after release PR creation but before checkpoint advancement
+- **WHEN** the process stops after pack creation, after binding persist, after loop dispatch, after attestation storage, or after release PR creation but before checkpoint advancement
 - **THEN** a restart with the same request SHALL re-observe pack, loop, run, attestation, branch, PR, and head state
 - **AND** it SHALL continue from the proved checkpoint without creating a duplicate pack, loop, branch, or release PR
 
