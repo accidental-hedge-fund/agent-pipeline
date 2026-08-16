@@ -3219,10 +3219,11 @@ export function classifyTrainAdvanceLabels(
       : undefined;
 
   // Current failure (not a recovered, superseded item-block): non-zero exit,
-  // engine message, or loop_run_stopped. Leftover loop_item_blocked class
-  // alone is not a failed wave when live labels are already ready-to-deploy
-  // and there is no live `blocked` label (#1095). #1074 still forbids
-  // masking a real stop / engine failure with a success label.
+  // engine message, or loop_run_stopped (including a reasonless stop).
+  // A still-current loop_item_blocked (itemTerminal !== "ready") is also
+  // current failure — R2D label flicker must not merge it (#1095 review-2).
+  // Recovered blocks have itemTerminal "ready" (or no remaining block
+  // fields). #1074 still forbids masking a real stop / engine failure.
   const currentFailure =
     exit !== 0 ||
     !!merged.engineMessage ||
@@ -3231,10 +3232,11 @@ export function classifyTrainAdvanceLabels(
     !!merged.blockedClass ||
     !!merged.blockerKind ||
     !!merged.blockerCommentFirstLine;
+  const currentItemBlock = leftoverItemBlock && merged.itemTerminal !== "ready";
   const liveBlocked = snap.labels.includes("blocked");
 
   if (stage === "ready-to-deploy" && !liveBlocked) {
-    if (currentFailure) {
+    if (currentFailure || currentItemBlock) {
       return {
         ok: false,
         error:

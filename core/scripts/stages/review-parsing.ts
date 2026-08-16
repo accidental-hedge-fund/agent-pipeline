@@ -283,20 +283,49 @@ export function extractReviewArtifact(body: string): ReviewArtifact | null {
  * scope-language detection. Comments without a `bodyHash` (encoded before
  * this field existed) are conservatively treated as unverified.
  */
-export function isVerifiedPipelineReviewOutput(body: string): boolean {
-  const artifact = extractReviewArtifact(body);
-  if (artifact === null) return false;
+function lastReviewArtifactMatch(body: string): RegExpExecArray | null {
   REVIEW_ARTIFACT_RE.lastIndex = 0;
   let lastMatch: RegExpExecArray | null = null;
   let cur: RegExpExecArray | null;
   while ((cur = REVIEW_ARTIFACT_RE.exec(body)) !== null) lastMatch = cur;
   REVIEW_ARTIFACT_RE.lastIndex = 0;
+  return lastMatch;
+}
+
+export function isVerifiedPipelineReviewOutput(body: string): boolean {
+  const artifact = extractReviewArtifact(body);
+  if (artifact === null) return false;
+  const lastMatch = lastReviewArtifactMatch(body);
   if (lastMatch === null) return false;
   if (body.slice(lastMatch.index + lastMatch[0].length).trim() !== "") return false;
   const rawPrefix = body.slice(0, lastMatch.index);
   const prefix = rawPrefix.endsWith("\n") ? rawPrefix.slice(0, -1) : rawPrefix;
   if (typeof artifact.bodyHash !== "string") return false;
   return hashReviewBody(prefix) === artifact.bodyHash;
+}
+
+/**
+ * Recompute `bodyHash` on the last review-artifact after an engine-owned
+ * post-render mutation (coverage / self-review banners inserted after
+ * `formatReviewComment` hashed the unbannered body).
+ *
+ * Call only on freshly rendered engine output before post. This is not a
+ * verification fallback: a later human edit of a posted body must still fail
+ * `isVerifiedPipelineReviewOutput`.
+ */
+export function rebindReviewArtifactBodyHash(body: string): string {
+  const artifact = extractReviewArtifact(body);
+  if (artifact === null) return body;
+  const lastMatch = lastReviewArtifactMatch(body);
+  if (lastMatch === null) return body;
+  if (body.slice(lastMatch.index + lastMatch[0].length).trim() !== "") return body;
+  const rawPrefix = body.slice(0, lastMatch.index);
+  const prefix = rawPrefix.endsWith("\n") ? rawPrefix.slice(0, -1) : rawPrefix;
+  const nextHash = hashReviewBody(prefix);
+  if (artifact.bodyHash === nextHash) return body;
+  artifact.bodyHash = nextHash;
+  const suffix = body.slice(lastMatch.index + lastMatch[0].length);
+  return `${prefix}\n${encodeReviewArtifact(artifact)}${suffix}`;
 }
 
 /** Return the child pipeline run that produced a verified review comment.

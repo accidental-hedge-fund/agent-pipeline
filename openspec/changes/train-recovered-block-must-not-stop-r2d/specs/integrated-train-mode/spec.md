@@ -44,6 +44,27 @@ When `--merge` is provided and that item classifies ok at `ready-to-deploy`, the
 - **THEN** the train SHALL invoke the existing merge surface for that PR
 - **AND** it SHALL NOT STOP with a reason whose sole current class is the recovered `loop_item_blocked` class (for example `implementation-ci on #N`)
 
+#### Scenario: Current loop_item_blocked plus R2D label flicker remains non-ok
+
+- **WHEN** a train advance wave’s current evidence for issue N still has `loop_item_blocked` as that item’s last terminal (no later `ready_to_deploy` / `all_done` / `loop_run_complete`)
+- **AND** live labels for issue N include `pipeline:ready-to-deploy` and do not include `blocked`
+- **THEN** train advance classification for issue N SHALL be ok false
+- **AND** it SHALL NOT treat the attempt as successful solely because a ready-to-deploy label is present
+
+#### Scenario: Reasonless loop_run_stopped remains non-ok on live R2D
+
+- **WHEN** live labels for issue N include `pipeline:ready-to-deploy`
+- **AND** the attempt’s events include `loop_run_stopped` with a missing or empty reason
+- **THEN** train advance classification for issue N SHALL be ok false
+- **AND** the extracted evidence SHALL record a current stop marker independently of the optional reason
+- **AND** the human-visible error SHALL quote a stable fallback diagnostic when no reason is available
+
+#### Scenario: Multi-item recovered blocks then all_done do not remain current
+
+- **WHEN** the shared extractor scans `loop_item_blocked` for two or more items
+- **AND** a later wave terminal is `all_done` / `loop_run_complete` with no later `loop_run_stopped`
+- **THEN** the extracted current evidence SHALL NOT report any of those blocked classes as the current terminal
+
 #### Scenario: Recovered-block classification is regression-tested with injected deps
 
 - **WHEN** the automated train tests for this requirement run under `npm run ci`

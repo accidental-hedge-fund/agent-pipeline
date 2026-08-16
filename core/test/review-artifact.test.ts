@@ -6,6 +6,9 @@ import assert from "node:assert/strict";
 import {
   encodeReviewArtifact,
   extractReviewArtifact,
+  hashReviewBody,
+  isVerifiedPipelineReviewOutput,
+  rebindReviewArtifactBodyHash,
   type ReviewArtifact,
 } from "../scripts/stages/review-parsing.ts";
 
@@ -55,6 +58,44 @@ test("ReviewArtifact: round-trip preserves empty blockingKeys", () => {
 // ---------------------------------------------------------------------------
 // Encoding format
 // ---------------------------------------------------------------------------
+
+test("rebindReviewArtifactBodyHash: restores verification after a prefix insert", () => {
+  const prefix = "## Review 2 (Adversarial) — needs-attention\n\n**Reviewer**: codex";
+  const hashed = hashReviewBody(prefix);
+  const artifact: ReviewArtifact = {
+    ...SAMPLE,
+    round: 2,
+    review1Risk: null,
+    bodyHash: hashed,
+  };
+  const original = `${prefix}\n${encodeReviewArtifact(artifact)}`;
+  assert.equal(isVerifiedPipelineReviewOutput(original), true);
+
+  const mutated = `## Review 2 (Adversarial) — needs-attention\n\n**Reviewer coverage (#694):** configured=1\n\n**Reviewer**: codex\n${encodeReviewArtifact(artifact)}`;
+  assert.equal(isVerifiedPipelineReviewOutput(mutated), false);
+  const rebound = rebindReviewArtifactBodyHash(mutated);
+  assert.equal(isVerifiedPipelineReviewOutput(rebound), true);
+  assert.notEqual(extractReviewArtifact(rebound)?.bodyHash, hashed);
+});
+
+test("rebindReviewArtifactBodyHash: no-op when hash already matches", () => {
+  const prefix = "## Review 1 (Standard) — approve";
+  const artifact: ReviewArtifact = { ...SAMPLE, bodyHash: hashReviewBody(prefix) };
+  const body = `${prefix}\n${encodeReviewArtifact(artifact)}`;
+  assert.equal(rebindReviewArtifactBodyHash(body), body);
+});
+
+test("rebindReviewArtifactBodyHash: no-op when trailing content follows the artifact", () => {
+  const prefix = "## Review 2 (Adversarial) — needs-attention";
+  const artifact: ReviewArtifact = {
+    ...SAMPLE,
+    round: 2,
+    review1Risk: null,
+    bodyHash: hashReviewBody(prefix),
+  };
+  const body = `${prefix}\n${encodeReviewArtifact(artifact)}\n\nI disagree, don't merge.`;
+  assert.equal(rebindReviewArtifactBodyHash(body), body);
+});
 
 test("ReviewArtifact: encoded line uses base64url charset only (no +, /, =)", () => {
   const line = encodeReviewArtifact(SAMPLE);

@@ -21,6 +21,13 @@ export interface TrainAdvanceLoopEvidence {
   exitCode?: number;
   /** Engine / LoopError message when the wave failed without events. */
   engineMessage?: string;
+  /**
+   * Last item-level terminal for the current `blockedIssue` (or the wave
+   * after a successful ready / `all_done` clear). `blocked` means a
+   * `loop_item_blocked` was not superseded. `ready` means a later successful
+   * terminal won. Absent when no item terminal was observed.
+   */
+  itemTerminal?: "ready" | "blocked";
 }
 
 /** Loose event shape for pure extraction (matches loop events.jsonl records). */
@@ -150,8 +157,11 @@ function isWaveSuccessfulTerminal(
  * summary. Last **terminal** wins per item: a later successful terminal
  * (`ready_to_deploy`, ledger `ready`, or wave `all_done` / `loop_run_complete`
  * with no later `loop_run_stopped`) clears that item's current
- * `loop_item_blocked` fields. Wave `all_done` does not clear a sibling that
- * never reached ready / R2D. Does not invent classes.
+ * `loop_item_blocked` fields. Wave `all_done` / `loop_run_complete` with no
+ * later stop clears every remaining item-block for that completed wave
+ * (`allDone` cannot fire while a ledger item is still blocked). A sibling
+ * that is still blocked is kept only when no wave-success terminal follows.
+ * Does not invent classes.
  */
 export function extractTrainAdvanceLoopEvidence(input: {
   events?: readonly TrainAdvanceLoopEventLike[] | null;
@@ -174,8 +184,9 @@ export function extractTrainAdvanceLoopEvidence(input: {
     const kind = typeof ev.kind === "string" ? ev.kind : "";
     const data = asRecord(ev.data) ?? {};
     if (kind === "loop_run_stopped") {
-      const reason = asNonEmptyString(data.reason);
-      if (reason) out.stopReason = reason;
+      // Every stop is current failure, including a missing/empty reason
+      // (#1095 review-2). Stable fallback keeps #1074 unmaskable.
+      out.stopReason = asNonEmptyString(data.reason) ?? "loop_run_stopped";
       // A later stop remains current even if labels later say ready-to-deploy.
       waveSuccessfulTerminal = false;
     } else if (kind === "loop_item_blocked") {
@@ -200,17 +211,12 @@ export function extractTrainAdvanceLoopEvidence(input: {
   }
 
   if (waveSuccessfulTerminal) {
-    // Wave all_done / loop_run_complete: clear item-block fields only for
-    // items that themselves reached ready / R2D. A sibling that is still
-    // blocked keeps its class. When no item-level ready was observed, a
-    // sole remaining blocked item is still cleared — all_done means that
-    // item finished.
-    if (readyItems.size > 0) {
-      for (const issue of readyItems) blockByIssue.delete(issue);
-    } else if (blockByIssue.size <= 1) {
-      blockByIssue.clear();
-      orphanBlock = undefined;
-    }
+    // all_done / loop_run_complete cannot fire while a ledger item is still
+    // blocked (DONE_OR_ABANDONED). Clear every remaining item-block for this
+    // completed wave, including multi-item recovered blocks with no
+    // item-level ready event (#1095 review-2).
+    blockByIssue.clear();
+    orphanBlock = undefined;
   }
 
   clearItemBlockFields(out);
@@ -218,8 +224,12 @@ export function extractTrainAdvanceLoopEvidence(input: {
     let last: ItemBlockEvidence | undefined;
     for (const fields of blockByIssue.values()) last = fields;
     if (last) applyItemBlockToEvidence(out, last);
+    out.itemTerminal = "blocked";
   } else if (orphanBlock && !waveSuccessfulTerminal) {
     applyItemBlockToEvidence(out, orphanBlock);
+    out.itemTerminal = "blocked";
+  } else if (readyItems.size > 0 || waveSuccessfulTerminal) {
+    out.itemTerminal = "ready";
   }
 
   if (typeof input.exitCode === "number" && Number.isFinite(input.exitCode)) {
@@ -325,6 +335,7 @@ export function scopeTrainAdvanceEvidenceForIssue(
     // Comment/kind were tied to that blocked item — drop if class dropped.
     delete scoped.blockerKind;
     delete scoped.blockerCommentFirstLine;
+    if (scoped.itemTerminal === "blocked") delete scoped.itemTerminal;
   }
   return scoped;
 }

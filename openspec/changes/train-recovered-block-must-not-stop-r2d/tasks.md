@@ -4,6 +4,8 @@
 - [x] 1.2 Keep wave `loop_run_stopped` as current stop evidence even when live labels later say ready-to-deploy.
 - [x] 1.3 Scope the successful-terminal clear to the same item. A sibling that is still blocked keeps its blocked class.
 - [x] 1.4 Unit-test the extractor: `loop_item_blocked` (`implementation-ci`) then later `ready_to_deploy` / `all_done` does not leave that class as current evidence for the item.
+- [x] 1.5 Unit-test two-item recovered blocks then `all_done` clear current class.
+- [x] 1.6 Unit-test reasonless `loop_run_stopped` records a stable stop marker.
 
 ## 2. Classifier: recovered block is not a failed R2D wave
 
@@ -11,6 +13,8 @@
 - [x] 2.2 Keep #1074: live `pipeline:ready-to-deploy` plus current `loop_run_stopped` or non-zero engine failure / engine message remains `ok: false`.
 - [x] 2.3 Live `blocked` label still parks; it is not a recovered-success merge candidate.
 - [x] 2.4 Unit-test classification for 2.1, 2.2, and 2.3 with injected labels and evidence (no network, git, or subprocess).
+- [x] 2.5 Unit-test current `loop_item_blocked` plus R2D-label flicker is non-ok.
+- [x] 2.6 Unit-test reasonless `loop_run_stopped` plus live R2D is non-ok.
 
 ## 3. Merge-mode train uses the recovered R2D outcome
 

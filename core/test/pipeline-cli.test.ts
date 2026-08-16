@@ -732,17 +732,37 @@ test("classifyTrainAdvanceLabels (#1095): recovered implementation-ci then R2D i
   }
 });
 
-test("classifyTrainAdvanceLabels (#1095): leftover blockedClass alone does not fail live R2D", async () => {
+test("classifyTrainAdvanceLabels (#1095): current blockedClass plus R2D flicker is not ok", async () => {
   const { classifyTrainAdvanceLabels } = await import("../scripts/pipeline.ts");
   const out = classifyTrainAdvanceLabels(
     { labels: ["pipeline:ready-to-deploy"] },
     0,
-    { blockedClass: "implementation-ci", blockedIssue: 1037 },
+    { blockedClass: "implementation-ci", blockedIssue: 1037, itemTerminal: "blocked" },
     1037,
   );
-  assert.equal(out.ok, true);
-  if (out.ok) {
-    assert.equal(out.terminal, "ready-to-deploy");
+  assert.equal(out.ok, false);
+  if (!out.ok) {
+    assert.match(out.error, /implementation-ci/);
+  }
+});
+
+test("classifyTrainAdvanceLabels (#1095): reasonless loop_run_stopped plus live R2D is not ok", async () => {
+  const { classifyTrainAdvanceLabels } = await import("../scripts/pipeline.ts");
+  const { extractTrainAdvanceLoopEvidence } = await import(
+    "../scripts/stages/train-advance-stop-reason.ts"
+  );
+  const evidence = extractTrainAdvanceLoopEvidence({
+    events: [{ kind: "loop_run_stopped", data: {} }],
+  });
+  const out = classifyTrainAdvanceLabels(
+    { labels: ["pipeline:ready-to-deploy"] },
+    0,
+    evidence,
+    1037,
+  );
+  assert.equal(out.ok, false);
+  if (!out.ok) {
+    assert.match(out.error, /loop_run_stopped/);
   }
 });
 
