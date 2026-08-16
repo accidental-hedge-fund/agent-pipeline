@@ -22,12 +22,14 @@ import {
   type LoopItemState,
 } from "./loop/types.ts";
 import {
+  FRG_HYBRID_LAYER_A_PROBE_IDS,
   FRG_HYBRID_LIVE_COMPOSITION_IDS,
   FRG_HYBRID_LIVE_SCENARIO_IDS,
   FRG_HYBRID_PILOT_POLICY_ID,
   FRG_HYBRID_PILOT_VERSION,
   FRG_HYBRID_REPLACEMENT_ISSUE,
   FRG_HYBRID_V2_POLICY_ID,
+  expectedHybridManifestSha256,
   isFrgHybridV1PolicyId,
   isFrgHybridV2PolicyId,
   isFrgRequiredLiveCompositionId,
@@ -1322,8 +1324,11 @@ function hybridSplitProofValid(
   opts: { historicalV1: boolean },
 ): boolean {
   const provenance = evidence.pack_provenance;
+  const expectedManifestSha = expectedHybridManifestSha256(provenance?.policy_id ?? "");
   if (
     !provenance ||
+    !expectedManifestSha ||
+    provenance.manifest_sha256 !== expectedManifestSha ||
     (opts.historicalV1 && provenance.replacement_issue !== FRG_HYBRID_REPLACEMENT_ISSUE) ||
     provenance.release_version !== evidence.version ||
     provenance.pack_id !== FRG_PACK_MANIFEST.pack_id ||
@@ -1347,8 +1352,12 @@ function hybridSplitProofValid(
   if (!templates.has("clean-docs") || !templates.has("clean-openspec") || templates.size !== 2) {
     return false;
   }
+  const expectedProbeIds = new Set<string>(FRG_HYBRID_LAYER_A_PROBE_IDS);
+  const probeIds = new Set(provenance.probes.map((probe) => probe.id));
   if (
-    provenance.probes.length === 0 ||
+    probeIds.size !== expectedProbeIds.size ||
+    probeIds.size !== provenance.probes.length ||
+    [...expectedProbeIds].some((id) => !probeIds.has(id)) ||
     provenance.probes.some((probe) => probe.candidate_git_sha !== provenance.candidate_git_sha)
   ) {
     return false;

@@ -7,8 +7,11 @@ import { fileURLToPath } from "node:url";
 import {
   collectFrgPackObservations,
   defaultFrgPackRoot,
+  FRG_HYBRID_LAYER_A_PROBE_IDS,
   FRG_HYBRID_PILOT_POLICY_ID,
   FRG_HYBRID_REPLACEMENT_ISSUE,
+  FRG_HYBRID_V1_MANIFEST_SHA256,
+  FRG_HYBRID_V2_MANIFEST_SHA256,
   FRG_HYBRID_V2_POLICY_ID,
   isFrgRequiredLiveCompositionId,
   isFrgRequiredLiveScenarioId,
@@ -24,6 +27,7 @@ import {
   FRG_SCENARIO_IDS,
   FRG_UNIT_TEST_ATTESTATION_KEY,
   computeFrgEvidence,
+  hybridPilotProofValid,
   parseFrgEvidence,
   parseFrgObservationsFile,
   verifyFrgAttestation,
@@ -139,7 +143,12 @@ test("factory-gate-v1 manifest closes the durable hybrid v2 proof matrix", async
   assert.equal(pack.manifest.pilot_policy.id, FRG_HYBRID_V2_POLICY_ID);
   assert.equal(pack.manifest.pilot_policy.release_version, undefined);
   assert.equal(pack.manifest.pilot_policy.replacement_issue, undefined);
-  assert.match(pack.manifest_sha256, /^[0-9a-f]{64}$/);
+  assert.equal(pack.manifest_sha256, FRG_HYBRID_V2_MANIFEST_SHA256);
+  assert.notEqual(pack.manifest_sha256, FRG_HYBRID_V1_MANIFEST_SHA256);
+  assert.deepEqual(
+    pack.manifest.pilot_policy.layer_a_probes.map((probe) => probe.id),
+    [...FRG_HYBRID_LAYER_A_PROBE_IDS],
+  );
   assert.deepEqual(pack.manifest.required_scenario_ids, [...FRG_SCENARIO_IDS]);
   assert.deepEqual(pack.manifest.required_composition_ids, [...FRG_COMPOSITION_DIMENSION_IDS]);
   assert.equal(pack.template_bodies.size, pack.manifest.templates.length);
@@ -451,7 +460,7 @@ test("v1.33.0 cannot pass without provenance and hybrid v1 cannot escape to 1.33
     "v2 provenance collected for 1.33.0 cannot unlock 1.33.1",
   );
 
-  const v1Provenance = {
+  const relabeledV2AsV1 = {
     ...v2.pack_provenance,
     policy_id: FRG_HYBRID_PILOT_POLICY_ID,
     replacement_issue: FRG_HYBRID_REPLACEMENT_ISSUE,
@@ -460,8 +469,17 @@ test("v1.33.0 cannot pass without provenance and hybrid v1 cannot escape to 1.33
   assert.equal(
     computeFrgEvidence({
       ...common,
+      version: "1.33.0",
+      pack_provenance: relabeledV2AsV1,
+    }).pass,
+    false,
+    "current v2 manifest SHA is not authentic historical v1 evidence",
+  );
+  assert.equal(
+    computeFrgEvidence({
+      ...common,
       version: "1.33.1",
-      pack_provenance: v1Provenance,
+      pack_provenance: relabeledV2AsV1,
     }).pass,
     false,
     "historical hybrid v1 cannot satisfy 1.33.1",
@@ -469,9 +487,48 @@ test("v1.33.0 cannot pass without provenance and hybrid v1 cannot escape to 1.33
   assert.throws(
     () => parseFrgObservationsFile({
       schema_version: 1,
-      pack_provenance: { ...v1Provenance, release_version: "1.33.1" },
+      pack_provenance: { ...relabeledV2AsV1, release_version: "1.33.1" },
     }),
     /valid only for 1\.33\.0/,
+  );
+});
+
+test("authentic historical v1.33.0 evidence with the frozen pre-v2 manifest SHA remains valid", async () => {
+  const pack = await loadFrgPack();
+  const v2 = collectFrgPackObservations(pack, makeEvidenceBundle(pack, "1.33.0"));
+  const items = v2.pack_provenance.issues.map((issue) => ({
+    item_id: String(issue.issue_number),
+    state: "ready" as const,
+    ready_clean: true,
+  }));
+  const historicalV1 = {
+    ...v2.pack_provenance,
+    policy_id: FRG_HYBRID_PILOT_POLICY_ID,
+    replacement_issue: FRG_HYBRID_REPLACEMENT_ISSUE,
+    release_version: "1.33.0",
+    manifest_sha256: FRG_HYBRID_V1_MANIFEST_SHA256,
+  };
+  const common = {
+    run_id: "frg-hybrid-historical-v1",
+    loop_run_id: historicalV1.loop_run_id,
+    pack_id: FRG_PACK_MANIFEST.pack_id,
+    items,
+    scenario_overrides: v2.scenarios,
+    composition_overrides: v2.composition,
+    false_human_authority_count: 0,
+    attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
+    pack_provenance: historicalV1,
+  };
+  const evidence = computeFrgEvidence({ ...common, version: "1.33.0" });
+  assert.equal(historicalV1.manifest_sha256, FRG_HYBRID_V1_MANIFEST_SHA256);
+  assert.notEqual(historicalV1.manifest_sha256, pack.manifest_sha256);
+  assert.equal(evidence.pass, true);
+  assert.equal(hybridPilotProofValid(evidence), true);
+  assert.equal(parseFrgEvidence(evidence).pass, true);
+  assert.equal(
+    computeFrgEvidence({ ...common, version: "1.33.1" }).pass,
+    false,
+    "authentic historical v1 cannot satisfy 1.33.1",
   );
 });
 

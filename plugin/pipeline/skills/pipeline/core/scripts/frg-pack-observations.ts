@@ -19,6 +19,36 @@ export const FRG_HYBRID_V2_POLICY_ID = "factory-gate-v1-hybrid-v2";
 export const FRG_HYBRID_PILOT_POLICY_ID = "factory-gate-v1-hybrid-v1";
 export const FRG_HYBRID_PILOT_VERSION = "1.33.0";
 export const FRG_HYBRID_REPLACEMENT_ISSUE = 908;
+/**
+ * Frozen sha256 of `factory-gate-v1/manifest.json` under hybrid v1
+ * (pre-#1036 `pilot_policy` id/release pin). Decode v1.33.0 evidence only.
+ */
+export const FRG_HYBRID_V1_MANIFEST_SHA256 =
+  "d1fc4bfb4852a600875693e666ffbede65314dda045846d1513fb13da03f9b6a";
+/**
+ * sha256 of the current `factory-gate-v1/manifest.json` (hybrid v2).
+ * Drift-guarded against `loadFrgPack().manifest_sha256`.
+ */
+export const FRG_HYBRID_V2_MANIFEST_SHA256 =
+  "27f65953f20032c7b8d6d86ae1e69e26f951e6f5fed25e499a9a8f51463f2e2e";
+/** Closed Layer A probe ids shared by historical v1 and current v2. */
+export const FRG_HYBRID_LAYER_A_PROBE_IDS = [
+  "capacity-blocked-retain",
+  "restart-hydration",
+  "openspec-multi-change",
+  "managed-worktree-dirt",
+  "local-docs-parity",
+  "forge-http-5xx-backoff",
+  "ci-pending-red-recovery",
+  "fix-rereview-cycle",
+  "same-head-noop-reentry",
+  "pr-supersession",
+  "release-plan-row",
+  "release-tag-guard",
+  "recovery-controller-one-item-route",
+  "recovery-controller-one-item-action",
+  "recovery-controller-multi-item",
+] as const;
 export const FRG_HYBRID_LIVE_SCENARIO_IDS = [
   "clean-item-throughput",
   "blocker-taxonomy",
@@ -32,6 +62,13 @@ export function isFrgHybridV2PolicyId(id: string): boolean {
 
 export function isFrgHybridV1PolicyId(id: string): boolean {
   return id === FRG_HYBRID_PILOT_POLICY_ID;
+}
+
+/** Expected pack-manifest SHA for a known hybrid policy. Undefined if unknown. */
+export function expectedHybridManifestSha256(policyId: string): string | undefined {
+  if (isFrgHybridV1PolicyId(policyId)) return FRG_HYBRID_V1_MANIFEST_SHA256;
+  if (isFrgHybridV2PolicyId(policyId)) return FRG_HYBRID_V2_MANIFEST_SHA256;
+  return undefined;
 }
 
 export function isFrgRequiredLiveScenarioId(id: string): boolean {

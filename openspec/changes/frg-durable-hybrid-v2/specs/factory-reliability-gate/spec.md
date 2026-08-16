@@ -36,7 +36,24 @@ caller-authored pass, scenario status, metric, evidence receipt, or all-pass
 observation file as authority for either set.
 
 This policy **succeeds** the 1.33.0-only hybrid v1 expiry. v1.33.0 evidence
-bound to hybrid v1 remains historically valid for that version only.
+bound to hybrid v1 remains historically valid for that version only. The scorer
+SHALL resolve the expected pack-manifest SHA and closed Layer A probe matrix by
+policy id: historical `factory-gate-v1-hybrid-v1` uses the frozen pre-v2
+manifest identity; current `factory-gate-v1-hybrid-v2` uses the current
+manifest identity. Relabeling current-manifest provenance as hybrid v1 SHALL
+NOT satisfy historical v1.
+
+#### Scenario: Historical hybrid v1 evidence with the frozen v1 manifest SHA remains valid
+
+- **WHEN** a `1.33.0` evidence artifact binds policy `factory-gate-v1-hybrid-v1`
+- **AND** its `pack_provenance.manifest_sha256` is the frozen pre-v2 hybrid-v1
+  manifest SHA
+- **AND** the closed v1 probe matrix and required-live / Layer A split hold
+- **THEN** hybrid proof validation SHALL accept that artifact for version
+  `1.33.0`
+- **AND** SHALL refuse the same v1 policy identity when the SHA is the current
+  v2 manifest SHA
+- **AND** SHALL refuse that v1 artifact for any version other than `1.33.0`
 
 #### Scenario: Required-live not_observed fails overall pass
 
