@@ -67,21 +67,129 @@ def normalize_branch(raw):
         raw = raw[len("origin/"):]
     return raw
 
+def _yaml_unquote(token):
+    token = token.strip()
+    if len(token) >= 2 and token[0] == token[-1] and token[0] in "'\"":
+        q = token[0]
+        inner = token[1:-1]
+        if q == "'":
+            return inner.replace("''", "'")
+        out = []
+        i = 0
+        while i < len(inner):
+            if inner[i] == "\\" and i + 1 < len(inner):
+                esc = inner[i + 1]
+                out.append({"n": "\n", "t": "\t", "r": "\r", "\\": "\\", '"': '"'}.get(esc, esc))
+                i += 2
+                continue
+            out.append(inner[i])
+            i += 1
+        return "".join(out)
+    return token
+
+def _yaml_strip_comment(raw):
+    # '#' starts a comment only after whitespace (or at column 0).
+    # Keep deploy#blue; strip "staging # comment".
+    in_s = in_d = False
+    i = 0
+    while i < len(raw):
+        c = raw[i]
+        if in_s:
+            if c == "'" and i + 1 < len(raw) and raw[i + 1] == "'":
+                i += 2
+                continue
+            if c == "'":
+                in_s = False
+            i += 1
+            continue
+        if in_d:
+            if c == "\\" and i + 1 < len(raw):
+                i += 2
+                continue
+            if c == '"':
+                in_d = False
+            i += 1
+            continue
+        if c == "'":
+            in_s = True
+        elif c == '"':
+            in_d = True
+        elif c == "#" and (i == 0 or raw[i - 1].isspace()):
+            return raw[:i]
+        i += 1
+    return raw
+
+def _yaml_key_name(raw):
+    raw = raw.strip()
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "'\"":
+        return raw[1:-1]
+    return raw
+
+_TOP_PAIR = re.compile(
+    r"^(?P<indent>[ \t]*)(?P<key>['\"][^'\"]+['\"]|[A-Za-z_][\w.-]*)[ \t]*:[ \t]*(?P<rest>.*)$"
+)
+
 def pipeline_yml_base_branch(repo_dir):
+    # Same top-level key train/release read. Quoted keys and '#' in the
+    # scalar must match YAML, not a line regex. Unsupported forms fail
+    # closed instead of defaulting to main.
     path = os.path.join(repo_dir, ".github", "pipeline.yml")
     if not os.path.isfile(path):
         return None
+    text = open(path, encoding="utf-8").read()
+    stripped = text.lstrip()
+    if stripped.startswith("{") or stripped.startswith("["):
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            sys.stderr.write(
+                "FAIL: unsupported flow/JSON .github/pipeline.yml base_branch; "
+                "set TUGBOAT_BASE_BRANCH\n"
+            )
+            raise SystemExit(1)
+        if isinstance(parsed, dict):
+            if "base_branch" not in parsed:
+                return "main"
+            val = parsed.get("base_branch")
+            if not isinstance(val, str):
+                sys.stderr.write("FAIL: pipeline.yml base_branch must be a string\n")
+                raise SystemExit(1)
+            return val
+        sys.stderr.write(
+            "FAIL: unsupported flow .github/pipeline.yml; set TUGBOAT_BASE_BRANCH\n"
+        )
+        raise SystemExit(1)
     found = False
     value = None
-    for line in open(path, encoding="utf-8"):
-        m = re.match(
-            r'^base_branch:\s*(?:["\']([^"\']+)["\']|([^\s#]+))',
-            line,
-        )
-        if m:
-            found = True
-            value = (m.group(1) or m.group(2) or "").strip()
-            break
+    root_indent = None
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        m = _TOP_PAIR.match(line)
+        if not m:
+            if re.match(r"^[ \t]*['\"]?base_branch['\"]?", line) and ":" in line:
+                sys.stderr.write(
+                    "FAIL: unsupported .github/pipeline.yml base_branch syntax; "
+                    "set TUGBOAT_BASE_BRANCH\n"
+                )
+                raise SystemExit(1)
+            continue
+        if root_indent is None:
+            root_indent = m.group("indent")
+        if _yaml_key_name(m.group("key")) != "base_branch":
+            continue
+        if m.group("indent") != root_indent:
+            continue
+        rest = _yaml_strip_comment(m.group("rest")).strip()
+        if rest[:1] in "{[&*|>":
+            sys.stderr.write(
+                "FAIL: unsupported .github/pipeline.yml base_branch form; "
+                "set TUGBOAT_BASE_BRANCH\n"
+            )
+            raise SystemExit(1)
+        found = True
+        value = _yaml_unquote(rest) if rest else ""
+        break
     if not found:
         return "main"
     return value or None

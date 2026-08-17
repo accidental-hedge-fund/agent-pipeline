@@ -1145,12 +1145,50 @@ function envWithoutBase(extra: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 }
 
 function writePipelineYml(repoDir: string, baseBranch: string): void {
+  writePipelineYmlRaw(repoDir, `base_branch: ${baseBranch} # integration branch\n`);
+}
+
+function writePipelineYmlRaw(repoDir: string, body: string): void {
   const dir = path.join(repoDir, ".github");
   fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "pipeline.yml"), body);
+}
+
+function runWriteRequest(dir: string, gitScript: string): {
+  status: number | null;
+  stdout: string;
+  stderr: string;
+  dest: string;
+} {
+  const binDir = path.join(dir, "bin");
+  writeFakeGit(binDir, gitScript);
+  const manifest = path.join(dir, "manifest.json");
   fs.writeFileSync(
-    path.join(dir, "pipeline.yml"),
-    `base_branch: ${baseBranch} # integration branch\n`,
+    manifest,
+    JSON.stringify({ schema_version: 1, pack_id: "factory-gate-v1" }),
   );
+  const dest = path.join(dir, "req.json");
+  const runner = path.join(dir, "run.sh");
+  fs.writeFileSync(
+    runner,
+    [
+      "#!/usr/bin/env bash",
+      "set -euo pipefail",
+      `. ${JSON.stringify(frgHelpers)}`,
+      `write_factory_release_request ${JSON.stringify(dest)} "1.39.0" ${JSON.stringify(dir)}`,
+      "",
+    ].join("\n"),
+  );
+  fs.chmodSync(runner, 0o755);
+  const r = spawnSync("bash", [runner], {
+    encoding: "utf8",
+    env: envWithoutBase({
+      PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
+      TUGBOAT_REPOSITORY: "accidental-hedge-fund/agent-pipeline",
+      TUGBOAT_FRG_MANIFEST_PATH: manifest,
+    }),
+  });
+  return { status: r.status, stdout: r.stdout, stderr: r.stderr, dest };
 }
 
 test("write_factory_release_request: binds origin/<base> tip, not local HEAD", () => {
@@ -1316,6 +1354,93 @@ test("write_factory_release_request: uses pipeline.yml base_branch not origin/HE
     assert.notEqual(req.integrated_candidate.git_sha, mainTip);
     const gitCalls = fs.existsSync(calls) ? fs.readFileSync(calls, "utf8") : "";
     assert.doesNotMatch(gitCalls, /symbolic-ref/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("write_factory_release_request: quoted pipeline.yml key binds staging not main", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-req-quoted-key-"));
+  try {
+    const mainTip = "b".repeat(40);
+    const stagingTip = "c".repeat(40);
+    writePipelineYmlRaw(dir, '"base_branch": staging\n');
+    const r = runWriteRequest(
+      dir,
+      [
+        'args=("$@")',
+        'if [[ "${args[0]:-}" == "-C" ]]; then args=("${args[@]:2}"); fi',
+        'cmd="${args[0]:-}"',
+        "case \"$cmd\" in",
+        "  ls-remote)",
+        '    joined="${args[*]}"',
+        '    if [[ "$joined" == *refs/heads/staging* ]]; then',
+        `      printf '%s\\t%s\\n' ${JSON.stringify(stagingTip)} refs/heads/staging`,
+        "      exit 0",
+        "    fi",
+        '    if [[ "$joined" == *refs/heads/main* ]]; then',
+        `      printf '%s\\t%s\\n' ${JSON.stringify(mainTip)} refs/heads/main`,
+        "      exit 0",
+        "    fi",
+        "    exit 2",
+        "    ;;",
+        "esac",
+        'echo "unexpected git ${args[*]}" >&2',
+        "exit 1",
+      ].join("\n"),
+    );
+    assert.equal(r.status, 0, `writer exited ${r.status}: ${r.stderr}`);
+    const req = JSON.parse(fs.readFileSync(r.dest, "utf8")) as {
+      base_branch: string;
+      integrated_candidate: { git_sha: string };
+    };
+    assert.equal(req.base_branch, "staging");
+    assert.equal(req.integrated_candidate.git_sha, stagingTip);
+    assert.notEqual(req.integrated_candidate.git_sha, mainTip);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("write_factory_release_request: preserves embedded # in pipeline.yml branch name", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-req-hash-"));
+  try {
+    const hashTip = "e".repeat(40);
+    const deployTip = "f".repeat(40);
+    writePipelineYmlRaw(dir, "base_branch: deploy#blue\n");
+    const r = runWriteRequest(
+      dir,
+      [
+        'args=("$@")',
+        'if [[ "${args[0]:-}" == "-C" ]]; then args=("${args[@]:2}"); fi',
+        'cmd="${args[0]:-}"',
+        "case \"$cmd\" in",
+        "  ls-remote)",
+        '    joined="${args[*]}"',
+        `    if [[ "$joined" == *${JSON.stringify("refs/heads/deploy#blue")}* ]]; then`,
+        `      printf '%s\\t%s\\n' ${JSON.stringify(hashTip)} ${JSON.stringify("refs/heads/deploy#blue")}`,
+        "      exit 0",
+        "    fi",
+        '    if [[ "$joined" == *refs/heads/deploy* ]]; then',
+        `      printf '%s\\t%s\\n' ${JSON.stringify(deployTip)} refs/heads/deploy`,
+        "      exit 0",
+        "    fi",
+        "    exit 2",
+        "    ;;",
+        "esac",
+        'echo "unexpected git ${args[*]}" >&2',
+        "exit 1",
+      ].join("\n"),
+    );
+    assert.equal(r.status, 0, `writer exited ${r.status}: ${r.stderr}`);
+    const req = JSON.parse(fs.readFileSync(r.dest, "utf8")) as {
+      base_branch: string;
+      integrated_candidate: { git_sha: string };
+    };
+    assert.equal(req.base_branch, "deploy#blue");
+    assert.equal(req.integrated_candidate.git_sha, hashTip);
+    assert.notEqual(req.base_branch, "deploy");
+    assert.notEqual(req.integrated_candidate.git_sha, deployTip);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

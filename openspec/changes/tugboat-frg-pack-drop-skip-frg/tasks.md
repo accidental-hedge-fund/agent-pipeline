@@ -21,6 +21,7 @@
 - [x] 3.5 Regression: `write_factory_release_request` binds `origin/<base>` remote tip (injected fake git), not local `HEAD`, and fail-closes when the remote tip is missing
 - [x] 3.6 Review-2: `classify_frg_pack_tick` fails on `latest.json` `pass: false` before awaiting/complete, and `complete` is done only with a verified open release PR
 - [x] 3.7 Review-2: request writer uses `.github/pipeline.yml` / `TUGBOAT_BASE_BRANCH`, preserves slash names, and does not guess `origin/HEAD`
+- [x] 3.8 Review-3: request writer binds quoted `"base_branch"` keys and unquoted `deploy#blue` names; it does not default those forms to `main` or truncate at `#`
 
 ## 4. Docs and Hermes skill
 

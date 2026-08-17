@@ -118,6 +118,20 @@ Pack-done SHALL mean prepare JSON `status` is `awaiting_frg_attestation`, or `.a
 - **THEN** the request `base_branch` SHALL be `release/1.39`
 - **AND** the candidate SHALL bind the `origin/release/1.39` tip
 
+#### Scenario: Quoted pipeline.yml key binds the configured branch
+
+- **WHEN** `TUGBOAT_BASE_BRANCH` is unset
+- **AND** `.github/pipeline.yml` sets `"base_branch": staging`
+- **THEN** the factory-release prepare request `base_branch` SHALL be `staging`
+- **AND** it SHALL NOT bind `main` as if the key were absent
+
+#### Scenario: Embedded hash in the configured branch name is preserved
+
+- **WHEN** `TUGBOAT_BASE_BRANCH` is unset
+- **AND** `.github/pipeline.yml` sets `base_branch` to the unquoted scalar `deploy#blue`
+- **THEN** the request `base_branch` SHALL be `deploy#blue`
+- **AND** it SHALL NOT truncate the name at `#`
+
 #### Scenario: Missing integration-branch source fails before write
 
 - **WHEN** `TUGBOAT_BASE_BRANCH` is unset
