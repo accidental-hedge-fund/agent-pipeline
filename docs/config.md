@@ -1049,6 +1049,11 @@ Nested fields:
 - **Type:** string
 - **Description:** Repo-root-relative path to the Markdown rubric file.
 
+### `skip_frg`
+
+- **Type:** boolean
+- **Description:** Escape that skips Factory Reliability Gate (FRG) on pipeline release and pipeline engine-promote. Unset or false keeps FRG required. CLI --skip-frg still wins.
+
 ### `stage_executors`
 
 - **Type:** object

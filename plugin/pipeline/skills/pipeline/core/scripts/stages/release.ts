@@ -1,9 +1,9 @@
 // Release sub-command (#170): prepares a release PR by:
 // 1. Resolving the version (alias → semver)
 // 2. Factory Reliability Gate for that version (#723) — default required;
-//    opt out with ReleaseOpts.skipFrg for thin ship (train→release→promote)
+//    skip via ReleaseOpts.skipFrg or config skip_frg (#1092)
 // 2c. Failing closed on open candidate-linked engine-class soak defects (#755)
-//    (skipped when skipFrg — soak attribution is FRG-linked)
+//    (skipped when FRG skip is active — soak attribution is FRG-linked)
 // 3. Bumping both package.json files
 // 4. Regenerating the plugin/ mirror (node scripts/build.mjs)
 // 5. Running the CI gate (npm run ci)
@@ -46,6 +46,7 @@ import {
   projectStageDiagnostic,
   type StageDiagnostic,
 } from "../stage-diagnostic.ts";
+import { formatFrgSkipReason, resolveFrgSkip } from "../frg-skip.ts";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -1734,7 +1735,7 @@ export async function collectShippedIssueNumbers(
 export async function runRelease(
   versionArg: string,
   opts: ReleaseOpts,
-  cfg: { repo_dir: string; repo: string; base_branch?: string; release_model?: 'semver' | 'continuous' },
+  cfg: { repo_dir: string; repo: string; base_branch?: string; release_model?: 'semver' | 'continuous'; skip_frg?: boolean },
   deps?: ReleaseDeps,
 ): Promise<ReleasePrepareResult | null> {
   const d = deps ?? realReleaseDeps(cfg.repo_dir);
@@ -1765,14 +1766,20 @@ export async function runRelease(
   const resolvedVersion = resolveVersion(versionArg, previousVersion);
   d.stdout(`[pipeline release] resolved version: ${resolvedVersion}`);
 
-  // 2b. Factory Reliability Gate (#723) — default fail-closed; opt out with skipFrg
-  // for thin milestone ship (train --merge → release → engine-promote). FRG stays
-  // available as an explicit factory-gate / durable-prepare command.
+  // 2b. Factory Reliability Gate (#723) — default fail-closed; skip via CLI
+  // `--skip-frg` or config `skip_frg: true` (#1092). FRG stays available as
+  // an explicit factory-gate / durable-prepare command.
+  const frgSkip = resolveFrgSkip({
+    cliSkip: !!opts.skipFrg,
+    configSkip: cfg.skip_frg,
+  });
+  const skipFrg = frgSkip.skip;
+  const skipReason = frgSkip.source ? formatFrgSkipReason(frgSkip.source) : null;
   let frgEvidence: FrgEvidence | null = null;
   const releaseFrgDir = path.join(FRG_EVIDENCE_ROOT_REL, resolvedVersion);
-  if (opts.skipFrg) {
+  if (skipFrg) {
     d.stdout(
-      `[pipeline release] skipping Factory Reliability Gate for ${resolvedVersion} (--skip-frg); ` +
+      `[pipeline release] skipping Factory Reliability Gate for ${resolvedVersion} (${skipReason}); ` +
         `FRG is advisory for thin ship — run \`pipeline factory-gate --for ${resolvedVersion}\` separately if desired`,
     );
   } else {
@@ -1818,9 +1825,9 @@ export async function runRelease(
     waived: OpenSoakDefectWaiver;
     blocking: BlockingSoakDefect[];
   } | null = null;
-  if (opts.skipFrg) {
+  if (skipFrg) {
     d.stdout(
-      "[pipeline release] skipping open soak-defect preflight (--skip-frg; soak attribution is FRG-linked)",
+      `[pipeline release] skipping open soak-defect preflight (${skipReason}; soak attribution is FRG-linked)`,
     );
   } else {
     d.stdout("[pipeline release] checking open engine-class soak defects for candidate...");

@@ -2,7 +2,9 @@
 
 ## Purpose
 Defines self-host engine promote after a published release: pin promotion plus tag install host selection so every configured outer-host skill tree receives the released engine unless the operator scopes the install.
+
 ## Requirements
+
 ### Requirement: Engine-promote install host SHALL default to all configured hosts
 
 When `pipeline engine-promote` runs without an explicit `--host` value, or when the promote stage is invoked without a host option, the effective install host selector SHALL be `all`. The promote path SHALL pass that selector to the tag install as an explicit `--host all` (or equivalent argv) so the installer updates every host tree it supports under `all` (including Codex, Claude, Grok when applicable, and OpenCode, honoring configured base dirs such as `CODEX_HOME`, `CLAUDE_CONFIG_DIR`, and `OPENCODE_CONFIG_DIR`). The promote path SHALL NOT silently default the install host to `codex` alone.
@@ -68,3 +70,26 @@ Host default and override resolution for engine-promote SHALL be covered by unit
 - **THEN** the install command under test SHALL contain `--host claude` (or that host)
 - **AND** it SHALL NOT expand to `--host all`
 
+### Requirement: Engine-promote SHALL require FRG unless the resolved skip is active
+
+The live `pipeline engine-promote` path SHALL require Factory Reliability Gate (FRG) evidence for the target version unless the shared skip resolution is active: explicit CLI `--skip-frg`, or else `.github/pipeline.yml` `skip_frg: true` when the flag is absent. Unset or `skip_frg: false` SHALL leave FRG required. When only the yml key causes the skip, the skip log SHALL name config. Config SHALL NOT force FRG on if the operator passed `--skip-frg`.
+
+#### Scenario: Unset or false still requires FRG without the flag
+
+- **WHEN** `.github/pipeline.yml` omits `skip_frg` or sets `skip_frg: false`
+- **AND** the operator runs `pipeline engine-promote --for X.Y.Z` without `--skip-frg`
+- **AND** no FRG pass artifact for `X.Y.Z` is available
+- **THEN** the command SHALL fail closed and SHALL NOT promote the pin as a successful unblocked completion
+
+#### Scenario: Config skip_frg true skips FRG without the flag
+
+- **WHEN** `.github/pipeline.yml` sets `skip_frg: true`
+- **AND** the operator runs `pipeline engine-promote --for X.Y.Z` without `--skip-frg`
+- **THEN** the command SHALL skip the FRG requirement
+- **AND** the skip log SHALL name config as the source
+
+#### Scenario: CLI --skip-frg still skips when skip_frg is unset or false
+
+- **WHEN** `.github/pipeline.yml` omits `skip_frg` or sets `skip_frg: false`
+- **AND** the operator runs `pipeline engine-promote --for X.Y.Z` with `--skip-frg`
+- **THEN** the command SHALL skip the FRG requirement

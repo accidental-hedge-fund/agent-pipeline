@@ -711,6 +711,13 @@ const PartialConfigSchema = z.object({
     .describe(
       'Factory engine track intent: "pinned" (production pin / dogfood) or "candidate" (FRG/eval soak). CLI --engine-track overrides. factory-gate always forces candidate. Unset: factory control defaults to pinned; ordinary product repos leave policy inactive.',
     ),
+  // Optional FRG skip escape (#1092). Absence / false keeps FRG required.
+  skip_frg: z
+    .boolean()
+    .optional()
+    .describe(
+      "Escape that skips Factory Reliability Gate (FRG) on pipeline release and pipeline engine-promote. Unset or false keeps FRG required. CLI --skip-frg still wins.",
+    ),
   production_engine_pin_path: z
     .string()
     .optional()
@@ -2058,6 +2065,8 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     },
     // Two-track engine pin (#762): optional; absent means command defaults.
     ...(fileConfig.engine_track ? { engine_track: fileConfig.engine_track } : {}),
+    // FRG skip escape (#1092): optional; absent / false keeps FRG required.
+    ...(fileConfig.skip_frg !== undefined ? { skip_frg: fileConfig.skip_frg } : {}),
     ...(fileConfig.production_engine_pin_path
       ? { production_engine_pin_path: fileConfig.production_engine_pin_path }
       : {}),
@@ -2564,7 +2573,7 @@ export function resolveReleaseConfig(
   repoDir: string,
   baseBranchOverride?: string,
   profileName?: string,
-): { repo_dir: string; repo: string; base_branch: string; release_model?: 'semver' | 'continuous'; intake_model: string; intake_effort?: string; intake_timeout: number; implementer_harness: string } {
+): { repo_dir: string; repo: string; base_branch: string; release_model?: 'semver' | 'continuous'; intake_model: string; intake_effort?: string; intake_timeout: number; implementer_harness: string; skip_frg?: boolean } {
   let baseBranch = DEFAULT_CONFIG.base_branch;
   let releaseModel: 'semver' | 'continuous' | undefined;
   let intakeModel: string = DEFAULT_CONFIG.models.intake;
@@ -2573,6 +2582,7 @@ export function resolveReleaseConfig(
   // accepted but dropped).
   let intakeEffort: string | undefined;
   let intakeTimeout: number = DEFAULT_CONFIG.intake_timeout;
+  let skipFrg: boolean | undefined;
   // Resolve the implementer harness locally (#608) — no `gh` call, mirroring
   // this function's gh-free contract. Profile loading is a local file read,
   // not network I/O, so it is safe here.
@@ -2608,6 +2618,9 @@ export function resolveReleaseConfig(
       if (typeof result.data.intake_timeout === "number") {
         intakeTimeout = result.data.intake_timeout;
       }
+      if (typeof result.data.skip_frg === "boolean") {
+        skipFrg = result.data.skip_frg;
+      }
     }
   }
   const intakeHarness = repoImplementer ?? profile.harnesses.implementer;
@@ -2621,6 +2634,7 @@ export function resolveReleaseConfig(
     intake_effort: intakeEffort,
     intake_timeout: intakeTimeout,
     implementer_harness: intakeHarness,
+    ...(skipFrg !== undefined ? { skip_frg: skipFrg } : {}),
   };
 }
 
@@ -2631,6 +2645,42 @@ export function resolveReleaseConfig(
  * zero external calls before its checks pass, so it cannot go through
  * `resolveConfig()` (which always shells out to `gh repo view`).
  */
+export interface ReadSkipFrgYmlDeps {
+  /** Return file text, or null when the file is missing. */
+  readFile?: (filePath: string) => string | null;
+}
+
+function defaultReadFileOrNull(filePath: string): string | null {
+  if (!fs.existsSync(filePath)) return null;
+  return fs.readFileSync(filePath, "utf8");
+}
+
+/**
+ * Read optional `skip_frg` from `.github/pipeline.yml` with the gh-free
+ * {@link PartialConfigSchema} parse. Missing file or unset key is not skip.
+ * Does not call {@link resolveConfig} (that shells out to `gh repo view`).
+ */
+export function readSkipFrgFromPipelineYml(
+  repoDir: string,
+  deps: ReadSkipFrgYmlDeps = {},
+): boolean | undefined {
+  const configPath = path.join(repoDir, ".github", "pipeline.yml");
+  const read = deps.readFile ?? defaultReadFileOrNull;
+  const text = read(configPath);
+  if (text === null) return undefined;
+  // yaml.load throws YAMLException on malformed YAML — propagate.
+  const parsed = yaml.load(text);
+  if (!parsed || typeof parsed !== "object") return undefined;
+  const result = PartialConfigSchema.safeParse(parsed);
+  if (!result.success) {
+    const errors = flattenIssues(result.error.issues)
+      .map((i) => `${i.path.join(".") || "<root>"}: ${i.message}`)
+      .join("; ");
+    throw new Error(`Invalid ${configPath}: ${errors}`);
+  }
+  return typeof result.data.skip_frg === "boolean" ? result.data.skip_frg : undefined;
+}
+
 export function resolveLoopNativeGoalAttestation(repoDir: string): "auto" | "available" | "unavailable" {
   const configPath = path.join(repoDir, ".github", "pipeline.yml");
   if (!fs.existsSync(configPath)) return DEFAULT_CONFIG.loop.native_goal_attestation;
@@ -3741,6 +3791,10 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
     config.engine_track !== undefined
       ? `engine_track: ${yamlScalar(config.engine_track)} # ${sd("engine_track", 'pinned (factory production pin) or candidate (FRG/eval soak); CLI --engine-track overrides; unset = factory control default pinned, product repos inactive')}`
       : `# engine_track: pinned # ${sd("engine_track", 'optional: "pinned" | "candidate"; factory-gate forces candidate; non-factory unset leaves policy inactive')}`,
+    // FRG skip escape (#1092) — optional; commented off so the default stays FRG-on.
+    config.skip_frg !== undefined
+      ? `skip_frg: ${yamlScalar(config.skip_frg)} # ${sd("skip_frg", "Escape that skips Factory Reliability Gate (FRG) on pipeline release and pipeline engine-promote. Unset or false keeps FRG required. CLI --skip-frg still wins.")}`
+      : `# skip_frg: false # ${sd("skip_frg", "Escape that skips Factory Reliability Gate (FRG) on pipeline release and pipeline engine-promote. Unset or false keeps FRG required. CLI --skip-frg still wins.")}`,
     config.production_engine_pin_path !== undefined
       ? `production_engine_pin_path: ${yamlScalar(config.production_engine_pin_path)} # ${sd("production_engine_pin_path", "absolute override for factory production pin JSON")}`
       : `# production_engine_pin_path: /path/to/production-engine-pin.json # ${sd("production_engine_pin_path", "optional; factory control authority, not every product target")}`,

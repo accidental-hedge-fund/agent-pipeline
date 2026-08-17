@@ -119,6 +119,22 @@ test("generateConfigSchema: steps sub-properties carry descriptions", () => {
   }
 });
 
+test("generateConfigSchema: skip_frg is an optional boolean escape (#1092)", () => {
+  const schema = generateConfigSchema() as Record<string, unknown>;
+  const field = resolvePath(schema, "skip_frg") as Record<string, unknown> | undefined;
+  assert.ok(field, "skip_frg must exist in schema");
+  assert.equal(field["type"], "boolean");
+  const description = String(field["description"] ?? "");
+  assert.match(description, /escape/i);
+  assert.match(description, /Unset or false keeps FRG required/);
+  assert.match(description, /CLI --skip-frg still wins/);
+  const required = schema["required"];
+  assert.ok(
+    required === undefined || (Array.isArray(required) && !required.includes("skip_frg")),
+    "skip_frg must not be a required key",
+  );
+});
+
 test("generateConfigSchema: all top-level keys are optional (not in required array)", () => {
   const schema = generateConfigSchema() as Record<string, unknown>;
   // Zod v4 omits `required` entirely when all fields are optional

@@ -351,6 +351,23 @@ for (const key of ADDED_KEYS) {
 //    drift out of sync with the schema.
 // ---------------------------------------------------------------------------
 
+test("scaffold: skip_frg is commented off with the schema .describe() text (#1092)", () => {
+  const template = buildConfigTemplate();
+  const description = schemaFieldDescription("skip_frg");
+  assert.ok(description, "expected a schema .describe() for skip_frg");
+  assert.match(template, /^# skip_frg: false #/m);
+  assert.ok(
+    template.includes(description!),
+    `template must contain the exact schema .describe() text for skip_frg: ${description}`,
+  );
+  assert.doesNotMatch(template, /^skip_frg:\s*true/m);
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(DEFAULT_CONFIG, "skip_frg"),
+    false,
+    "DEFAULT_CONFIG must omit skip_frg (absence-default, not skip_frg: true)",
+  );
+});
+
 test("shared-source: rendered comments for repo/domain_name/max_concurrent_worktrees contain the exact schema .describe() text", () => {
   const template = buildConfigTemplate();
   for (const path_ of ["repo", "domain_name", "max_concurrent_worktrees"]) {
