@@ -10,6 +10,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import {
+  isProductionQualityPin,
   promoteProductionPin,
   resolveProductionPin,
   rollbackProductionPin,
@@ -38,8 +39,8 @@ export interface EnginePromoteOpts {
   /** Skip the install step (pin-only). Default false. */
   skipInstall?: boolean;
   /**
-   * Thin ship: promote pin without FRG latest.json (after published release).
-   * Default false.
+   * Explicit skip escape: write a non-production-quality pin
+   * (`no-frg-<version>` + null evidence). Default false.
    */
   allowWithoutFrg?: boolean;
   gitSha?: string | null;
@@ -207,10 +208,14 @@ export async function runEnginePromote(
     repoDir: opts.repoDir,
     overridePath: opts.pinPath,
   });
+  // Same version+tag is already-current only for a production-quality pin,
+  // or when the resolved skip is active. A no-frg-* / null-evidence pin
+  // must re-enter promote (real FRG) or refuse — never succeed as current.
   let alreadyPinned =
     pinLoad.kind === "ok" &&
     pinLoad.pin.version === version &&
-    pinLoad.pin.tag === tag;
+    pinLoad.pin.tag === tag &&
+    (allowWithoutFrg || isProductionQualityPin(pinLoad.pin));
 
   if (alreadyPinned && skipPromoteIfCurrent) {
     steps.push(`pin_already_current: ${version}`);

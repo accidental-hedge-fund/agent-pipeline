@@ -147,7 +147,9 @@ A failed or missing pack stops the ship **before** `pipeline release`.
 non-empty `--skip-frg-reason` / `TUGBOAT_SKIP_FRG_REASON`. Missing reason fails
 closed and does not skip. A valid escape omits the pack phase, passes
 `--skip-frg` to release and promote, and writes the reason into ship state or
-log.
+log. A skip promote writes `frg_run_id` `no-frg-<X.Y.Z>` and
+`frg_evidence_path` null. That pin is not production-quality. Default promote
+requires a real FRG `run_id` and evidence path.
 
 ## Alternate / legacy paths (not primary Buzz)
 

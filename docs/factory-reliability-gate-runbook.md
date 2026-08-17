@@ -34,9 +34,21 @@ degrade the factory's ability to repair itself:
 .agent-pipeline/production-engine-pin.json
 ```
 
-Fields: `version`, `tag` (for `npx …#vX.Y.Z install`), `frg_run_id`, optional
-`git_sha` (null/unknown is valid — never invent a SHA), `promoted_at`, optional
-`previous` for rollback.
+Fields: `version`, `tag` (for `npx …#vX.Y.Z install`), `frg_run_id`,
+`frg_evidence_path`, optional `git_sha` (null/unknown is valid — never invent a
+SHA), `promoted_at`, optional `previous` for rollback.
+
+A **production-quality** pin after an FRG ship has a real `frg_run_id` (not
+`no-frg-*`) and a non-null `frg_evidence_path` for that version. Default
+`pipeline factory-pin promote` and `pipeline engine-promote` refuse missing FRG,
+`pass: false`, a `no-frg-*` run id, or a null evidence path. `--skip-frg` (or
+`skip_frg: true`) is an explicit escape only: it writes `frg_run_id`
+`no-frg-<X.Y.Z>` and `frg_evidence_path` null. That marker is not
+production-quality. `pipeline factory-pin promote` has no skip and stays FRG-only.
+
+On this factory repo, `pipeline doctor` check `install:engine-track` fails when
+the live pin is `no-frg-*` or has null evidence under pinned intent. Remediate
+with a non-skip promote from a real FRG pass.
 
 | Action | Command |
 |--------|---------|

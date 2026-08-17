@@ -1052,7 +1052,7 @@ Nested fields:
 ### `skip_frg`
 
 - **Type:** boolean
-- **Description:** Escape that skips Factory Reliability Gate (FRG) on pipeline release and pipeline engine-promote. Unset or false keeps FRG required. CLI --skip-frg still wins.
+- **Description:** Escape that skips Factory Reliability Gate (FRG) on pipeline release and pipeline engine-promote. Unset or false keeps FRG required. CLI --skip-frg still wins. A skip promote writes a non-production-quality pin (no-frg-<version>, null evidence), not a production-quality FRG pin.
 
 ### `stage_executors`
 

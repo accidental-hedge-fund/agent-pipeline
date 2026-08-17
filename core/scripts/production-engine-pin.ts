@@ -3,8 +3,10 @@
 // The factory maintains a machine-readable pin for the last FRG-passed release
 // that has been promoted into production dogfood. Ordinary production runs
 // execute that pin (track `pinned`); FRG Layer B / eval soaks use track
-// `candidate`. Promote defaults to requiring FRG pass evidence; thin ship may
-// set allowWithoutFrg after a published GitHub Release. Never merges or tags.
+// `candidate`. Promote defaults to requiring a production-quality FRG pin
+// (real run_id, non-null evidence path). allowWithoutFrg / --skip-frg may
+// write a marked non-production-quality pin (`no-frg-<version>` + null
+// evidence). Never merges or tags.
 //
 // The live pin lives on the factory control checkout
 // (`.agent-pipeline/production-engine-pin.json`), not inside the frozen skill
@@ -36,6 +38,9 @@ export const PRODUCTION_ENGINE_PIN_REL = path.join(
 export const PRODUCTION_PIN_ENV = "AGENT_PIPELINE_PRODUCTION_PIN";
 
 export const PRODUCTION_PIN_SCHEMA_VERSION = 1;
+
+/** Skip-escape `frg_run_id` prefix. Not a production-quality FRG pass. */
+export const NO_FRG_RUN_ID_PREFIX = "no-frg-";
 
 /**
  * Installer receipt written next to the managed-skill marker by `install.mjs`.
@@ -302,6 +307,33 @@ export type PinLoadResult =
 
 function isNonEmptyString(v: unknown): v is string {
   return typeof v === "string" && v.trim().length > 0;
+}
+
+/** True when `run_id` / `frg_run_id` is the explicit skip-escape marker. */
+export function isNoFrgRunId(runId: string | null | undefined): boolean {
+  return typeof runId === "string" && runId.startsWith(NO_FRG_RUN_ID_PREFIX);
+}
+
+/**
+ * True when a pin (or FRG evidence fields) is production-quality: real
+ * `frg_run_id` (not `no-frg-*`) and a non-null, non-empty evidence path.
+ * Parse stays permissive; this predicate is the policy classifier.
+ */
+export function isProductionQualityPin(pin: {
+  frg_run_id?: string | null;
+  run_id?: string | null;
+  frg_evidence_path?: string | null;
+} | null | undefined): boolean {
+  if (!pin) return false;
+  const runId =
+    typeof pin.frg_run_id === "string"
+      ? pin.frg_run_id
+      : typeof pin.run_id === "string"
+        ? pin.run_id
+        : "";
+  if (!runId.trim() || isNoFrgRunId(runId)) return false;
+  const evidence = pin.frg_evidence_path;
+  return typeof evidence === "string" && evidence.trim().length > 0;
 }
 
 function isGitShaSource(v: unknown): v is GitShaSource {
@@ -1030,10 +1062,14 @@ export function evaluateEngineTrackCheck(input: {
       : input.pinLoad.kind === "missing"
         ? "production pin absent (ok for non-factory hosts)"
         : `production pin ${input.pinLoad.kind} (ok for non-factory hosts)`;
+    const qualityPart =
+      pin && !isProductionQualityPin(pin)
+        ? `; pin frg_run_id=${pin.frg_run_id} is not production-quality (not enforced)`
+        : "";
     return {
       status: "pass",
       detail:
-        `two-track factory policy inactive; running v${input.runningVersion || "(unknown)"}; ${pinPart}`,
+        `two-track factory policy inactive; running v${input.runningVersion || "(unknown)"}; ${pinPart}${qualityPart}`,
     };
   }
 
@@ -1054,11 +1090,16 @@ export function evaluateEngineTrackCheck(input: {
       : input.pinLoad.kind === "missing"
         ? "production pin absent"
         : `production pin not usable (${input.pinLoad.kind})`;
+    const qualityPart =
+      pin && !isProductionQualityPin(pin)
+        ? `; pin frg_run_id=${pin.frg_run_id} is a no-frg-* / null-evidence marker`
+        : "";
     return {
       status: "pass",
       detail:
         `track=candidate; running v${input.runningVersion || "(unknown)"}; ${pinPart}` +
-        (classification.pin_match ? "; install happens to match pin" : "; install ≠ pin (expected for soak)"),
+        (classification.pin_match ? "; install happens to match pin" : "; install ≠ pin (expected for soak)") +
+        qualityPart,
     };
   }
 
@@ -1088,6 +1129,24 @@ export function evaluateEngineTrackCheck(input: {
     pin!.git_sha && pin!.git_sha.trim()
       ? ` pin_sha=${pin!.git_sha.slice(0, 12)}…`
       : " pin_sha=unknown";
+
+  if (!isProductionQualityPin(pin)) {
+    const defect = isNoFrgRunId(pin!.frg_run_id)
+      ? `frg_run_id ${pin!.frg_run_id} is a no-frg-* skip marker, not a real FRG pass`
+      : `frg_evidence_path is ${
+          pin!.frg_evidence_path == null || !String(pin!.frg_evidence_path).trim()
+            ? "null/empty"
+            : JSON.stringify(pin!.frg_evidence_path)
+        }`;
+    return {
+      status: "fail",
+      detail: `production pin v${pinVer} is not production-quality: ${defect}${shaPart}`,
+      remediation:
+        `Promote from a real FRG pass: pipeline factory-pin promote --for ${pinVer} ` +
+        `or pipeline engine-promote --for ${pinVer} (do not pass --skip-frg). ` +
+        `Explicit --skip-frg writes a non-production-quality pin and is not the factory success path.`,
+    };
+  }
 
   if (!input.runningVersion || !input.runningVersion.trim()) {
     return {
@@ -1150,6 +1209,7 @@ export type PromotePinResult =
         | "frg_unparsable"
         | "version_mismatch"
         | "empty_run_id"
+        | "no_frg_marker"
         | "already_exists"
         | "invalid_target"
         | "no_previous"
@@ -1208,7 +1268,7 @@ function buildPinFromFrgPass(opts: {
   return pin;
 }
 
-/** Thin-ship pin when FRG is advisory (no latest.json pass required). */
+/** Skip-escape pin only. Writes `no-frg-<version>` + null evidence. */
 function buildPinWithoutFrg(opts: {
   version: string;
   gitSha?: string | null;
@@ -1263,6 +1323,16 @@ function frgRefusal(
         message: `FRG evidence for ${target} has empty run_id; refuse promote`,
       };
     }
+    if (isNoFrgRunId(look.evidence.run_id)) {
+      return {
+        ok: false,
+        code: "no_frg_marker",
+        message:
+          `FRG evidence for ${target} has non-production-quality run_id ${look.evidence.run_id} ` +
+          `(no-frg-* is only the --skip-frg marker); refuse promote. ` +
+          `Run: pipeline factory-gate --for ${target}`,
+      };
+    }
     if (!versionsMatch(look.evidence.version, target)) {
       return {
         ok: false,
@@ -1301,8 +1371,10 @@ function frgRefusal(
 
 /**
  * Promote the production pin to `version` only when lookupFrgPass yields a
- * matching pass with non-empty run_id. Never merges or tags.
- * On refusal: zero pin mutations.
+ * matching pass with a production-quality run_id (not `no-frg-*`) and the
+ * write would set a non-null evidence path. Never merges or tags.
+ * On refusal: zero pin mutations. `allowWithoutFrg` is the only writer of
+ * the `no-frg-<version>` + null-evidence skip marker.
  */
 export async function promoteProductionPin(opts: {
   repoDir: string;
@@ -1316,8 +1388,8 @@ export async function promoteProductionPin(opts: {
   now?: () => Date;
   env?: NodeJS.ProcessEnv;
   /**
-   * Thin ship: promote after a published release without FRG latest.json.
-   * Default false (FRG still required for factory-gate --promote-pin-on-pass).
+   * Explicit skip escape: write a non-production-quality pin
+   * (`no-frg-<version>` + null evidence). Default false — FRG required.
    */
   allowWithoutFrg?: boolean;
 }): Promise<PromotePinResult> {
@@ -1404,6 +1476,15 @@ export async function promoteProductionPin(opts: {
     previous,
     now,
   });
+  if (!isProductionQualityPin(pin)) {
+    return {
+      ok: false,
+      code: "no_frg_marker",
+      message:
+        `refuse production-quality promote for ${target}: write would leave ` +
+        `frg_run_id=${pin.frg_run_id} frg_evidence_path=${pin.frg_evidence_path ?? "null"}`,
+    };
+  }
 
   try {
     await atomicWritePin(pinPath, pin, fsDeps);
