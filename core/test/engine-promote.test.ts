@@ -160,8 +160,15 @@ test("ship playbook: ENGINE_PROMOTE_HOST defaults to all and passes --host (#989
   // Promote always passes explicit --host (no silent omission).
   assert.match(
     body,
+    /engine-promote --for "\$version" --host "\$HOST" "\$\{SKIP_FRG_ARGS\[@\]\}" --json/,
+  );
+  assert.doesNotMatch(
+    body,
     /engine-promote --for "\$version" --host "\$HOST" --skip-frg --json/,
   );
+  assert.match(body, /factory-release prepare --request/);
+  assert.match(body, /release "\$version" --no-edit "\$\{SKIP_FRG_ARGS\[@\]\}"/);
+  assert.doesNotMatch(body, /release "\$version" --no-edit --skip-frg/);
   // Pure helper agrees with the repo playbook shape (doctor uses the same helper).
   assert.equal(shipPlaybookHasAllPromoteDefault(body), true);
   assert.equal(shipPlaybookHasLegacyCodexOnlyPromoteDefault(body), false);

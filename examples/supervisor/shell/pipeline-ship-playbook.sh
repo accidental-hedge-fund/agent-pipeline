@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Ship playbook: train (--merge) → release → wait GitHub Release → engine-promote.
-# Portable example for thin supervisors. Chains existing pipeline CLI only.
+# Ship playbook: train (--merge) → FRG pack → release → wait GitHub Release →
+# engine-promote. Portable example for thin supervisors. Chains existing
+# pipeline CLI only. Default release / promote argv omit --skip-frg.
 #
 # This is the chain-to-existing-tools ship: it composes `single`/`train --merge`,
 # `release`, `release finish`, and `engine-promote`. It is an ALTERNATIVE to the
@@ -32,6 +33,12 @@
 #                              unless the operator scopes to one host.
 #   RELEASE_WAIT_ATTEMPTS      default 30
 #   RELEASE_WAIT_SLEEP_S       default 40
+#   FRG_WAIT_ATTEMPTS          FRG pack re-invoke attempts (default RELEASE_WAIT_ATTEMPTS)
+#   FRG_WAIT_SLEEP_S           FRG pack sleep seconds (default RELEASE_WAIT_SLEEP_S)
+#   TUGBOAT_SKIP_FRG           1 to skip FRG pack (requires TUGBOAT_SKIP_FRG_REASON)
+#   TUGBOAT_SKIP_FRG_REASON    non-empty logged reason for skip escape
+#   TUGBOAT_BASE_BRANCH        integration branch override; else pipeline.yml
+#                              base_branch. Missing both fails closed.
 #
 set -euo pipefail
 
@@ -43,6 +50,10 @@ STATE_ROOT="${PIPELINE_SUPERVISOR_STATE:-$HOME/.local/state/pipeline-supervisor}
 HOST="${ENGINE_PROMOTE_HOST:-all}"
 RELEASE_WAIT_ATTEMPTS="${RELEASE_WAIT_ATTEMPTS:-30}"
 RELEASE_WAIT_SLEEP_S="${RELEASE_WAIT_SLEEP_S:-40}"
+FRG_WAIT_ATTEMPTS="${FRG_WAIT_ATTEMPTS:-$RELEASE_WAIT_ATTEMPTS}"
+FRG_WAIT_SLEEP_S="${FRG_WAIT_SLEEP_S:-$RELEASE_WAIT_SLEEP_S}"
+SKIP_FRG=0
+SKIP_FRG_REASON=""
 
 SHIP_NOTIFY="${SHIP_NOTIFY:-1}"
 SHIP_NOTIFY_BIN="${SHIP_NOTIFY_BIN:-$SCRIPT_DIR/ship-notify.sh}"
@@ -205,6 +216,26 @@ json_str() {
   printf '%s' "$1" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'
 }
 
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/frg-pack-helpers.sh"
+
+resolve_playbook_skip_frg() {
+  local want_skip=0
+  local reason=""
+  SKIP_FRG=0
+  SKIP_FRG_REASON=""
+  [[ "${TUGBOAT_SKIP_FRG:-}" == "1" ]] && want_skip=1
+  reason=$(printf '%s' "${TUGBOAT_SKIP_FRG_REASON:-}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  if [[ "$want_skip" == "1" ]]; then
+    if [[ -z "$reason" ]]; then
+      echo "FAIL: TUGBOAT_SKIP_FRG requires a non-empty TUGBOAT_SKIP_FRG_REASON" >&2
+      exit 1
+    fi
+    SKIP_FRG=1
+    SKIP_FRG_REASON="$reason"
+  fi
+}
+
 # ---------- status ----------
 if [[ "$do_status" -eq 1 ]]; then
   if [[ ${#milestones[@]} -eq 1 ]]; then
@@ -260,6 +291,9 @@ PY
   exit 0
 fi
 
+# Skip escape is validated before detach or any train/release mutation.
+resolve_playbook_skip_frg
+
 # ---------- detach ----------
 if [[ "$do_detach" -eq 1 ]]; then
   if [[ ${#milestones[@]} -eq 1 ]]; then
@@ -277,6 +311,8 @@ if [[ "$do_detach" -eq 1 ]]; then
     nohup env PIPELINE="$PIPELINE" REPO_DIR="$REPO_DIR" ALLOW_MERGE="$ALLOW_MERGE" \
       PIPELINE_SUPERVISOR_STATE="$STATE_ROOT" ENGINE_PROMOTE_HOST="$HOST" \
       RELEASE_WAIT_ATTEMPTS="$RELEASE_WAIT_ATTEMPTS" RELEASE_WAIT_SLEEP_S="$RELEASE_WAIT_SLEEP_S" \
+      FRG_WAIT_ATTEMPTS="$FRG_WAIT_ATTEMPTS" FRG_WAIT_SLEEP_S="$FRG_WAIT_SLEEP_S" \
+      TUGBOAT_SKIP_FRG="$SKIP_FRG" TUGBOAT_SKIP_FRG_REASON="$SKIP_FRG_REASON" \
       SHIP_NOTIFY="$SHIP_NOTIFY" SHIP_NOTIFY_BIN="$SHIP_NOTIFY_BIN" \
       SHIP_NOTIFY_HEARTBEAT_S="$SHIP_NOTIFY_HEARTBEAT_S" \
       SHIP_STAGE_WATCH_BIN="$SHIP_STAGE_WATCH_BIN" \
@@ -303,6 +339,8 @@ if [[ "$do_detach" -eq 1 ]]; then
   nohup env PIPELINE="$PIPELINE" REPO_DIR="$REPO_DIR" ALLOW_MERGE="$ALLOW_MERGE" \
     PIPELINE_SUPERVISOR_STATE="$STATE_ROOT" ENGINE_PROMOTE_HOST="$HOST" \
     RELEASE_WAIT_ATTEMPTS="$RELEASE_WAIT_ATTEMPTS" RELEASE_WAIT_SLEEP_S="$RELEASE_WAIT_SLEEP_S" \
+    FRG_WAIT_ATTEMPTS="$FRG_WAIT_ATTEMPTS" FRG_WAIT_SLEEP_S="$FRG_WAIT_SLEEP_S" \
+    TUGBOAT_SKIP_FRG="$SKIP_FRG" TUGBOAT_SKIP_FRG_REASON="$SKIP_FRG_REASON" \
     SHIP_NOTIFY="$SHIP_NOTIFY" SHIP_NOTIFY_BIN="$SHIP_NOTIFY_BIN" \
     SHIP_NOTIFY_HEARTBEAT_S="$SHIP_NOTIFY_HEARTBEAT_S" \
     SHIP_STAGE_WATCH_BIN="$SHIP_STAGE_WATCH_BIN" \
@@ -628,14 +666,62 @@ if [[ -f "$RUN_DIR/stage-watch.pid" ]]; then
   fi
 fi
 
+SKIP_FRG_ARGS=()
+if [[ "$SKIP_FRG" == "1" ]]; then
+  SKIP_FRG_ARGS=(--skip-frg)
+  printf '%s\n' "$SKIP_FRG_REASON" >"$RUN_DIR/skip-frg-reason.txt"
+  log "skip-frg escape reason=$SKIP_FRG_REASON"
+fi
+
+# B0: FRG pack (compose factory-release prepare). Skip only on logged escape.
+# Default path fail-closes here or at release if pack evidence is missing.
+if [[ "$SKIP_FRG" != "1" ]]; then
+  req="$RUN_DIR/factory-release-prepare-request.json"
+  write_state "frg-pack" "running" "pipeline factory-release prepare --request $req --json"
+  log "phase frg-pack: start request=$req"
+  if ! write_factory_release_request "$req" "$version" "$REPO_DIR"; then
+    write_state "frg-pack" "failed" "could not write factory-release prepare request"
+    log "FAIL: could not write factory-release prepare request"
+    exit 1
+  fi
+  pack_done=0
+  latest_json="$REPO_DIR/.agent-pipeline/frg/$version/latest.json"
+  for i in $(seq 1 "$FRG_WAIT_ATTEMPTS"); do
+    set +e
+    "$PIPELINE" factory-release prepare --request "$req" --json >"$RUN_DIR/frg-pack.json" 2>"$RUN_DIR/frg-pack.err"
+    pack_ec=$?
+    set -e
+    cat "$RUN_DIR/frg-pack.err" >>"$LOG_FILE" 2>/dev/null || true
+    pack_verdict=$(classify_frg_pack_tick "$RUN_DIR/frg-pack.json" "$latest_json" "$pack_ec" "$req")
+    if [[ "$pack_verdict" == "done" ]]; then
+      log "phase frg-pack: pack-done (attempt $i)"
+      pack_done=1
+      break
+    elif [[ "$pack_verdict" == "retry" ]]; then
+      log "phase frg-pack: in_progress (attempt $i); waiting"
+      sleep "$FRG_WAIT_SLEEP_S"
+    else
+      write_state "frg-pack" "failed" "FRG pack failed (prepare status or latest.json)"
+      log "FAIL: FRG pack failed (attempt $i)"
+      exit 1
+    fi
+  done
+  if [[ "$pack_done" -ne 1 ]]; then
+    write_state "frg-pack" "failed" "FRG pack still in_progress within wait budget"
+    log "FAIL: FRG pack still in_progress within wait budget"
+    exit 1
+  fi
+  write_state "frg-pack" "ok" "pack-done"
+  log "phase frg-pack: ok"
+else
+  log "phase frg-pack: omitted (skip-frg escape)"
+fi
+
 # B: release prepare — thin ship path (train --merge already finished).
-# FRG is NOT a hard gate for milestone ship. Optional advisory FRG remains:
-#   pipeline factory-gate --for <ver> --from-run <loop>
-# Release uses --skip-frg so missing/broken FRG tooling cannot block a clean train.
-write_state "release-prepare" "running" "pipeline release $version --no-edit --skip-frg"
-log "phase release-prepare: start (thin ship; FRG not required)"
+write_state "release-prepare" "running" "pipeline release $version --no-edit ${SKIP_FRG_ARGS[*]}"
+log "phase release-prepare: start (bare version=$version)"
 set +e
-"$PIPELINE" release "$version" --no-edit --skip-frg >"$RUN_DIR/release-prepare.out" 2>"$RUN_DIR/release-prepare.err"
+"$PIPELINE" release "$version" --no-edit "${SKIP_FRG_ARGS[@]}" >"$RUN_DIR/release-prepare.out" 2>"$RUN_DIR/release-prepare.err"
 rel_ec=$?
 set -e
 cat "$RUN_DIR/release-prepare.out" >>"$LOG_FILE" 2>/dev/null || true
@@ -763,10 +849,10 @@ fi
 write_state "wait-release" "ok" "v$version published"
 
 # E: engine-promote
-write_state "engine-promote" "running" "pipeline engine-promote --for $version --host $HOST --skip-frg --json"
+write_state "engine-promote" "running" "pipeline engine-promote --for $version --host $HOST ${SKIP_FRG_ARGS[*]} --json"
 log "phase engine-promote: start"
 set +e
-"$PIPELINE" engine-promote --for "$version" --host "$HOST" --skip-frg --json >"$RUN_DIR/engine-promote.json" 2>"$RUN_DIR/engine-promote.err"
+"$PIPELINE" engine-promote --for "$version" --host "$HOST" "${SKIP_FRG_ARGS[@]}" --json >"$RUN_DIR/engine-promote.json" 2>"$RUN_DIR/engine-promote.err"
 pro_ec=$?
 set -e
 cat "$RUN_DIR/engine-promote.err" >>"$LOG_FILE" 2>/dev/null || true

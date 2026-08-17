@@ -156,12 +156,13 @@ Prepare never merges, tags, promotes a pin, or flips Tugboat `--skip-frg`.
 
 ### Post-1.33 honest-pass precondition (skip-frg restore)
 
-Tugboat, `pipeline release`, and `pipeline engine-promote` **keep** the
-default `--skip-frg` flag until `isHonestPost133FrgPass` accepts at least
-one `.agent-pipeline/frg/<version>/latest.json` for a version **after**
-`1.33.0`. That helper is the single skip-frg restore predicate. Later
-children (#1039–#1041) reuse it. They do not invent a second pass
-definition.
+#1038 landed `isHonestPost133FrgPass` and one accepted post-1.33
+`latest.json` `pass: true`. That helper remains the single skip-frg restore
+predicate. #1039 consumed it: Tugboat default release and promote argv now
+**omit** `--skip-frg`, and Tugboat runs one FRG pack phase
+(`pipeline factory-release prepare`) after train and before release.
+Auto-tag (#1040) and pin (#1041) remain later children. They do not invent
+a second pass definition.
 
 The check accepts only a genuine `factory-gate --for <version> --from-run
 <loop_run_id>` score (or the in-process equivalent) of a request-bound
@@ -192,10 +193,9 @@ The check **refuses**:
 
 Full HMAC attestation (`integrity.attestation`) is **not** required for
 this precondition. The score receipt still requires the producer key.
-A fail score stays `pass: false` and does not unlock the Tugboat
-`--skip-frg` flip.
-This change does **not** drop `--skip-frg` from default release or promote
-argv and does **not** add an FRG pack phase to Tugboat.
+A fail score stays `pass: false` and does not put `--skip-frg` back on
+Tugboat default argv. The operator escape with a logged reason is the only
+skip path.
 
 **Hard gate:** missing, stale, failed, mismatched, skipped, or waived
 required-live evidence, or a missing/mismatched Layer A TAP hash, yields

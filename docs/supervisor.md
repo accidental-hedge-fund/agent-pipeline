@@ -239,7 +239,7 @@ Skill template: [examples/supervisor/hermes/SKILL.md](../examples/supervisor/her
 
 **Primary agent-box / Buzz path:** thin host composer
 `examples/supervisor/shell/tugboat.sh` sequences existing Pipeline CLI verbs
-(train → release → wait CI → release finish → wait Release → engine-promote)
+(train → FRG pack → release → wait CI → release finish → wait Release → engine-promote)
 plus notify. Operator phrase: `Ship milestone vX.Y.Z`. Status:
 `tugboat --milestone vX.Y.Z --status` or
 `~/.local/state/pipeline-supervisor/ship-vX.Y.Z/`.

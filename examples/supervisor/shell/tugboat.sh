@@ -2,8 +2,11 @@
 # Tugboat — thin ship composer (Option 1, #1001).
 #
 # Ship = compose existing Pipeline CLI verbs + wait + notify. Nothing more.
-#   train --milestone --merge  →  release  →  wait CI green  →  release finish
-#   →  wait GitHub Release  →  engine-promote --host all
+#   train --milestone --merge  →  FRG pack (factory-release prepare)  →  release
+#   →  wait CI green  →  release finish  →  wait GitHub Release  →
+#   engine-promote --host all
+# Default release / promote argv omit --skip-frg. Skip is an operator escape
+# with a logged reason (--skip-frg / TUGBOAT_SKIP_FRG + reason).
 #
 # `--merge` train is **serial** (#1063): merge-first R2D, one implement, STOP on
 # blocked/needs-human. Never `pipeline single` / `pipeline loop` for a milestone
@@ -28,7 +31,16 @@
 #   SHIP_STAGE_WATCH_BIN   optional per-issue stage posts during train
 #   RELEASE_WAIT_ATTEMPTS  CI/release wait poll attempts (default 30)
 #   RELEASE_WAIT_SLEEP_S   wait sleep seconds (default 40)
+#   FRG_WAIT_ATTEMPTS      FRG pack re-invoke attempts (default RELEASE_WAIT_ATTEMPTS)
+#   FRG_WAIT_SLEEP_S       FRG pack sleep seconds (default RELEASE_WAIT_SLEEP_S)
 #   ENGINE_PROMOTE_HOST    promote host scope (default all)
+#   TUGBOAT_SKIP_FRG       1 to skip FRG pack (requires TUGBOAT_SKIP_FRG_REASON)
+#   TUGBOAT_SKIP_FRG_REASON  non-empty logged reason for skip escape
+#   TUGBOAT_BASE_BRANCH    integration branch override. When unset, the
+#                          request writer reads .github/pipeline.yml
+#                          base_branch (same source as train/release).
+#                          Missing both fails closed — origin/HEAD is not
+#                          used. Slash names such as release/1.39 are kept.
 #   PIPELINE_SUPERVISOR_STATE  state root
 #
 # Live ship (#1062): a milestone is "already running" only when a live process
@@ -56,6 +68,8 @@ SHIP_NOTIFY_BIN="${SHIP_NOTIFY_BIN:-$SCRIPT_DIR/ship-notify.sh}"
 SHIP_STAGE_WATCH_BIN="${SHIP_STAGE_WATCH_BIN:-$SCRIPT_DIR/ship-stage-watch.sh}"
 RELEASE_WAIT_ATTEMPTS="${RELEASE_WAIT_ATTEMPTS:-30}"
 RELEASE_WAIT_SLEEP_S="${RELEASE_WAIT_SLEEP_S:-40}"
+FRG_WAIT_ATTEMPTS="${FRG_WAIT_ATTEMPTS:-$RELEASE_WAIT_ATTEMPTS}"
+FRG_WAIT_SLEEP_S="${FRG_WAIT_SLEEP_S:-$RELEASE_WAIT_SLEEP_S}"
 ENGINE_PROMOTE_HOST="${ENGINE_PROMOTE_HOST:-all}"
 RELEASE_CHECKS_GREEN_BIN="${RELEASE_CHECKS_GREEN_BIN:-$SCRIPT_DIR/release-checks-green.py}"
 TRAIN_STATUS_COMPLETE_BIN="${TRAIN_STATUS_COMPLETE_BIN:-$SCRIPT_DIR/train-status-complete.py}"
@@ -64,6 +78,10 @@ REPO_DIR_PINNED=0
 milestones=()
 do_detach=0
 do_status=0
+flag_skip_frg=0
+flag_skip_frg_reason=""
+SKIP_FRG=0
+SKIP_FRG_REASON=""
 
 usage() {
   cat <<'USAGE'
@@ -71,6 +89,7 @@ Usage:
   tugboat.sh --milestone vX.Y.Z [--detach]
   tugboat.sh --milestones vA.B.C vD.E.F [--detach]   # serial; promote after each
   tugboat.sh --milestone vX.Y.Z --status
+  tugboat.sh --milestone vX.Y.Z --skip-frg --skip-frg-reason "<reason>"
 USAGE
 }
 
@@ -96,6 +115,15 @@ while [[ $# -gt 0 ]]; do
       do_status=1
       shift
       ;;
+    --skip-frg)
+      flag_skip_frg=1
+      shift
+      ;;
+    --skip-frg-reason)
+      [[ -n "${2:-}" ]] || { echo "missing value for $1" >&2; exit 2; }
+      flag_skip_frg_reason=$2
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -119,6 +147,473 @@ json_str() {
 # Keep dots (ship-v1.36.0), lowercase only — matches historical state dirs.
 safe_of() {
   echo "$1" | tr 'A-Z' 'a-z'
+}
+
+# Operator escape: --skip-frg or TUGBOAT_SKIP_FRG=1 requires a non-empty reason.
+# Fail closed before any ship mutation when skip is requested without a reason.
+# Status does not call this.
+resolve_skip_frg() {
+  local want_skip=0
+  local reason=""
+  SKIP_FRG=0
+  SKIP_FRG_REASON=""
+  [[ "$flag_skip_frg" == "1" ]] && want_skip=1
+  [[ "${TUGBOAT_SKIP_FRG:-}" == "1" ]] && want_skip=1
+  reason="${flag_skip_frg_reason:-}"
+  [[ -z "$reason" ]] && reason="${TUGBOAT_SKIP_FRG_REASON:-}"
+  reason=$(printf '%s' "$reason" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  if [[ "$want_skip" == "1" ]]; then
+    if [[ -z "$reason" ]]; then
+      echo "FAIL: --skip-frg / TUGBOAT_SKIP_FRG requires a non-empty --skip-frg-reason or TUGBOAT_SKIP_FRG_REASON" >&2
+      exit 1
+    fi
+    SKIP_FRG=1
+    SKIP_FRG_REASON="$reason"
+  fi
+}
+
+# Secret-free factory_release_prepare_request bound to ship coordinates.
+# dest=$1 version=$2 repo_dir=$3. Tests inject TUGBOAT_CANDIDATE_SHA,
+# TUGBOAT_REPOSITORY, TUGBOAT_BASE_BRANCH, TUGBOAT_FRG_MANIFEST_PATH,
+# TUGBOAT_OPEN_RELEASE_PR.
+# Unset candidate SHA: resolve base_branch first, then the current
+# origin/<base> remote tip (ls-remote, else fetch). Never local HEAD —
+# train --merge via GitHub leaves the local checkout at the pre-train SHA.
+# base_branch: TUGBOAT_BASE_BRANCH, else .github/pipeline.yml (same source
+# as train/release). Never origin/HEAD. Preserve slash names (release/x).
+# Inlined so ~/.local/bin/tugboat stays self-contained. Keep in sync with
+# examples/supervisor/shell/frg-pack-helpers.sh (playbook source).
+write_factory_release_request() {
+  local dest=$1
+  local ver=$2
+  local repo=$3
+  python3 - "$dest" "$ver" "$repo" <<'PY'
+import hashlib, json, os, re, subprocess, sys
+
+dest, version, repo = sys.argv[1], sys.argv[2], sys.argv[3]
+forbidden = {
+    "pass", "status", "metrics", "metric", "receipt", "evidence_receipt",
+    "attestation_key", "attestation_key_path", "PIPELINE_FRG_ATTESTATION_KEY",
+    "credential", "credentials", "executable", "module", "command",
+    "network_target", "signer_path", "private_key", "secret",
+}
+
+manifest = os.environ.get("TUGBOAT_FRG_MANIFEST_PATH") or os.path.join(
+    repo, "core", "scripts", "frg-packs", "factory-gate-v1", "manifest.json"
+)
+if not os.path.isfile(manifest):
+    sys.stderr.write(f"FAIL: FRG pack manifest missing: {manifest}\n")
+    raise SystemExit(1)
+raw = open(manifest, "rb").read()
+sha = hashlib.sha256(raw).hexdigest()
+try:
+    pack = json.loads(raw.decode())
+except Exception as exc:
+    sys.stderr.write(f"FAIL: FRG pack manifest is not valid JSON: {exc}\n")
+    raise SystemExit(1)
+pack_id = pack.get("pack_id") or "factory-gate-v1"
+
+repo_id = os.environ.get("TUGBOAT_REPOSITORY", "").strip().lower()
+if not repo_id:
+    try:
+        repo_id = subprocess.check_output(
+            ["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
+            cwd=repo,
+            text=True,
+        ).strip().lower()
+    except Exception:
+        url = subprocess.check_output(
+            ["git", "-C", repo, "remote", "get-url", "origin"], text=True
+        ).strip()
+        m = re.search(r"[:/]([^/]+/[^/]+?)(?:\.git)?$", url)
+        repo_id = (m.group(1) if m else "").lower()
+if not re.fullmatch(r"[a-z0-9_.-]+/[a-z0-9_.-]+", repo_id):
+    sys.stderr.write("FAIL: repository identity is missing (owner/repo)\n")
+    raise SystemExit(1)
+
+def normalize_branch(raw):
+    raw = (raw or "").strip()
+    if raw.startswith("refs/heads/"):
+        raw = raw[len("refs/heads/"):]
+    elif raw.startswith("refs/remotes/origin/"):
+        raw = raw[len("refs/remotes/origin/"):]
+    elif raw.startswith("origin/"):
+        raw = raw[len("origin/"):]
+    return raw
+
+def _yaml_unquote(token):
+    token = token.strip()
+    if len(token) >= 2 and token[0] == token[-1] and token[0] in "'\"":
+        q = token[0]
+        inner = token[1:-1]
+        if q == "'":
+            return inner.replace("''", "'")
+        out = []
+        i = 0
+        while i < len(inner):
+            if inner[i] == "\\" and i + 1 < len(inner):
+                esc = inner[i + 1]
+                out.append({"n": "\n", "t": "\t", "r": "\r", "\\": "\\", '"': '"'}.get(esc, esc))
+                i += 2
+                continue
+            out.append(inner[i])
+            i += 1
+        return "".join(out)
+    return token
+
+def _yaml_strip_comment(raw):
+    # '#' starts a comment only after whitespace (or at column 0).
+    # Keep deploy#blue; strip "staging # comment".
+    in_s = in_d = False
+    i = 0
+    while i < len(raw):
+        c = raw[i]
+        if in_s:
+            if c == "'" and i + 1 < len(raw) and raw[i + 1] == "'":
+                i += 2
+                continue
+            if c == "'":
+                in_s = False
+            i += 1
+            continue
+        if in_d:
+            if c == "\\" and i + 1 < len(raw):
+                i += 2
+                continue
+            if c == '"':
+                in_d = False
+            i += 1
+            continue
+        if c == "'":
+            in_s = True
+        elif c == '"':
+            in_d = True
+        elif c == "#" and (i == 0 or raw[i - 1].isspace()):
+            return raw[:i]
+        i += 1
+    return raw
+
+def _yaml_key_name(raw):
+    raw = raw.strip()
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "'\"":
+        return raw[1:-1]
+    return raw
+
+_TOP_PAIR = re.compile(
+    r"^(?P<indent>[ \t]*)(?P<key>['\"][^'\"]+['\"]|[A-Za-z_][\w.-]*)[ \t]*:[ \t]*(?P<rest>.*)$"
+)
+
+def pipeline_yml_base_branch(repo_dir):
+    # Same top-level key train/release read. Quoted keys and '#' in the
+    # scalar must match YAML, not a line regex. Unsupported forms fail
+    # closed instead of defaulting to main.
+    path = os.path.join(repo_dir, ".github", "pipeline.yml")
+    if not os.path.isfile(path):
+        return None
+    text = open(path, encoding="utf-8").read()
+    stripped = text.lstrip()
+    if stripped.startswith("{") or stripped.startswith("["):
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            sys.stderr.write(
+                "FAIL: unsupported flow/JSON .github/pipeline.yml base_branch; "
+                "set TUGBOAT_BASE_BRANCH\n"
+            )
+            raise SystemExit(1)
+        if isinstance(parsed, dict):
+            if "base_branch" not in parsed:
+                return "main"
+            val = parsed.get("base_branch")
+            if not isinstance(val, str):
+                sys.stderr.write("FAIL: pipeline.yml base_branch must be a string\n")
+                raise SystemExit(1)
+            return val
+        sys.stderr.write(
+            "FAIL: unsupported flow .github/pipeline.yml; set TUGBOAT_BASE_BRANCH\n"
+        )
+        raise SystemExit(1)
+    found = False
+    value = None
+    root_indent = None
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        m = _TOP_PAIR.match(line)
+        if not m:
+            if re.match(r"^[ \t]*['\"]?base_branch['\"]?", line) and ":" in line:
+                sys.stderr.write(
+                    "FAIL: unsupported .github/pipeline.yml base_branch syntax; "
+                    "set TUGBOAT_BASE_BRANCH\n"
+                )
+                raise SystemExit(1)
+            continue
+        if root_indent is None:
+            root_indent = m.group("indent")
+        if _yaml_key_name(m.group("key")) != "base_branch":
+            continue
+        if m.group("indent") != root_indent:
+            continue
+        rest = _yaml_strip_comment(m.group("rest")).strip()
+        if rest[:1] in "{[&*|>":
+            sys.stderr.write(
+                "FAIL: unsupported .github/pipeline.yml base_branch form; "
+                "set TUGBOAT_BASE_BRANCH\n"
+            )
+            raise SystemExit(1)
+        found = True
+        value = _yaml_unquote(rest) if rest else ""
+        break
+    if not found:
+        return "main"
+    return value or None
+
+base = normalize_branch(os.environ.get("TUGBOAT_BASE_BRANCH", ""))
+if not base:
+    base = normalize_branch(pipeline_yml_base_branch(repo) or "")
+if not base:
+    sys.stderr.write(
+        "FAIL: base_branch is unset; set TUGBOAT_BASE_BRANCH or "
+        ".github/pipeline.yml base_branch (do not guess origin/HEAD)\n"
+    )
+    raise SystemExit(1)
+if re.search(r"\s", base):
+    sys.stderr.write("FAIL: base_branch is empty or contains whitespace\n")
+    raise SystemExit(1)
+
+# Bind the live origin/<base> tip after train. Local HEAD stays at the
+# pre-train SHA when train merges through GitHub.
+git_sha = os.environ.get("TUGBOAT_CANDIDATE_SHA", "").strip().lower()
+if not git_sha:
+    try:
+        out = subprocess.check_output(
+            ["git", "-C", repo, "ls-remote", "--exit-code", "origin", f"refs/heads/{base}"],
+            text=True,
+        ).strip()
+        git_sha = (out.split()[0] if out else "").strip().lower()
+    except Exception:
+        git_sha = ""
+    if not git_sha:
+        try:
+            subprocess.check_output(
+                ["git", "-C", repo, "fetch", "--quiet", "origin", f"{base}:refs/remotes/origin/{base}"],
+                text=True,
+            )
+            git_sha = subprocess.check_output(
+                ["git", "-C", repo, "rev-parse", "--verify", f"refs/remotes/origin/{base}"],
+                text=True,
+            ).strip().lower()
+        except Exception:
+            git_sha = ""
+if not re.fullmatch(r"[0-9a-f]{40,64}", git_sha):
+    sys.stderr.write(
+        "FAIL: integrated_candidate.git_sha is not a git object id "
+        f"(need TUGBOAT_CANDIDATE_SHA or origin/{base} tip after train)\n"
+    )
+    raise SystemExit(1)
+
+req = {
+    "schema_version": 1,
+    "kind": "factory_release_prepare_request",
+    "action_id": f"tugboat-ship-{version}",
+    "repository": repo_id,
+    "base_branch": base,
+    "target_version": version,
+    "integrated_candidate": {"git_sha": git_sha},
+    "frg_manifest": {"pack_id": pack_id, "sha256": sha},
+}
+for key in req:
+    if key in forbidden:
+        sys.stderr.write(f"FAIL: request must not contain forbidden field {key}\n")
+        raise SystemExit(1)
+
+os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+with open(dest, "w", encoding="utf-8") as fh:
+    json.dump(req, fh, indent=2)
+    fh.write("\n")
+print(dest)
+PY
+}
+
+# Classify one factory-release prepare tick. Prints done | retry | fail.
+# $1 prepare JSON path, $2 latest.json path, $3 prepare exit code,
+# $4 factory-release request JSON (version + candidate SHA binding).
+# pass: false is pack-fail before any success status. pass: true is
+# pack-done only when latest records the request target_version and
+# integrated_candidate.git_sha (and action_id when the artifact has it).
+# complete is done only after an open release PR for the requested
+# version is verified (TUGBOAT_OPEN_RELEASE_PR injects that number;
+# else gh pr list).
+classify_frg_pack_tick() {
+  python3 - "$1" "$2" "$3" "${4:-}" <<'PY'
+import json, os, subprocess, sys
+
+prep_path, latest_path, ec_s = sys.argv[1], sys.argv[2], sys.argv[3]
+req_path = sys.argv[4] if len(sys.argv) > 4 else ""
+try:
+    ec = int(ec_s)
+except ValueError:
+    ec = 1
+
+def load_maybe(path):
+    if not path or not os.path.isfile(path) or os.path.getsize(path) == 0:
+        return None
+    text = open(path, encoding="utf-8").read().strip()
+    try:
+        return json.loads(text)
+    except Exception:
+        i = text.rfind("{")
+        if i >= 0:
+            try:
+                return json.loads(text[i:])
+            except Exception:
+                return None
+        return None
+
+def as_dict(value):
+    return value if isinstance(value, dict) else {}
+
+def norm_ver(raw):
+    v = str(raw or "").strip()
+    if v.startswith("v") or v.startswith("V"):
+        v = v[1:]
+    return v
+
+def norm_sha(raw):
+    return str(raw or "").strip().lower()
+
+def request_binding(req):
+    if not isinstance(req, dict):
+        return None
+    version = norm_ver(req.get("target_version"))
+    sha = norm_sha(as_dict(req.get("integrated_candidate")).get("git_sha"))
+    action = str(req.get("action_id") or "").strip()
+    if not version or not sha:
+        return None
+    return (version, sha, action)
+
+def extract_factory_binding(latest):
+    frb = latest.get("factory_release_binding")
+    if isinstance(frb, dict):
+        return frb
+    notes = latest.get("notes")
+    if isinstance(notes, list):
+        prefix = "factory_release_binding:"
+        for note in notes:
+            if not isinstance(note, str) or not note.startswith(prefix):
+                continue
+            try:
+                parsed = json.loads(note[len(prefix):])
+            except Exception:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+    return {}
+
+def latest_binding(latest):
+    if not isinstance(latest, dict):
+        return None
+    frb = extract_factory_binding(latest)
+    prov = as_dict(latest.get("pack_provenance"))
+    version = norm_ver(
+        latest.get("version") or frb.get("target_version") or prov.get("release_version")
+    )
+    sha = norm_sha(
+        frb.get("candidate_git_sha")
+        or prov.get("candidate_git_sha")
+        or latest.get("candidate_git_sha")
+    )
+    action = str(
+        frb.get("action_id") or latest.get("action_id") or prov.get("action_id") or ""
+    ).strip()
+    if not version or not sha:
+        return None
+    return (version, sha, action)
+
+def pass_matches_request(latest, req):
+    want = request_binding(req)
+    got = latest_binding(latest)
+    if want is None or got is None:
+        return False
+    if want[0] != got[0] or want[1] != got[1]:
+        return False
+    if got[2] and want[2] and got[2] != want[2]:
+        return False
+    return True
+
+def complete_has_open_release_pr(prep):
+    if not isinstance(prep, dict):
+        return False
+    pr = prep.get("release_pr")
+    number = pr.get("number") if isinstance(pr, dict) else None
+    try:
+        number = int(number)
+    except (TypeError, ValueError):
+        return False
+    if number <= 0:
+        return False
+    version = str(prep.get("target_version") or "").strip()
+    if version.startswith("v"):
+        version = version[1:]
+    injected = os.environ.get("TUGBOAT_OPEN_RELEASE_PR")
+    if injected is not None:
+        inj = injected.strip()
+        if not inj or inj.lower() in ("0", "closed", "none", "false"):
+            return False
+        try:
+            return int(inj) == number
+        except ValueError:
+            return False
+    repo = os.environ.get("REPO_DIR") or os.getcwd()
+    try:
+        out = subprocess.check_output(
+            ["gh", "pr", "list", "--state", "open", "--json", "number,title", "--limit", "50"],
+            cwd=repo,
+            text=True,
+        )
+        for item in json.loads(out):
+            if int(item.get("number") or 0) != number:
+                continue
+            title = item.get("title") or ""
+            if not version:
+                return True
+            if title.startswith(f"release: {version}") or title.startswith(
+                f"release: v{version}"
+            ):
+                return True
+        return False
+    except Exception:
+        return False
+
+prep = load_maybe(prep_path)
+latest = load_maybe(latest_path)
+req = load_maybe(req_path)
+status = prep.get("status") if isinstance(prep, dict) else None
+pass_v = latest.get("pass") if isinstance(latest, dict) else None
+
+if pass_v is False:
+    print("fail")
+    raise SystemExit(0)
+if pass_v is True and pass_matches_request(latest, req):
+    print("done")
+    raise SystemExit(0)
+if status == "awaiting_frg_attestation":
+    print("done")
+    raise SystemExit(0)
+if status == "complete":
+    if complete_has_open_release_pr(prep):
+        print("done")
+        raise SystemExit(0)
+    print("fail")
+    raise SystemExit(0)
+if status == "in_progress":
+    print("retry")
+    raise SystemExit(0)
+if status in ("failed", "error", "missing") or status is None or ec != 0:
+    print("fail")
+    raise SystemExit(0)
+print("fail")
+PY
 }
 
 log() {
@@ -200,6 +695,7 @@ failure_detail() {
       fi
       f="$RUN_DIR/train.stderr"
       ;;
+    frg-pack) f="$RUN_DIR/frg-pack.err" ;;
     release-prepare) f="$RUN_DIR/release-prepare.err" ;;
     release-finish) f="$RUN_DIR/release-finish.err" ;;
     wait-release) f="$RUN_DIR/gh-release.err" ;;
@@ -563,9 +1059,15 @@ detach_self() {
     SHIP_NOTIFY="$SHIP_NOTIFY" SHIP_NOTIFY_BIN="$SHIP_NOTIFY_BIN" \
     SHIP_STAGE_WATCH_BIN="$SHIP_STAGE_WATCH_BIN" \
     RELEASE_WAIT_ATTEMPTS="$RELEASE_WAIT_ATTEMPTS" RELEASE_WAIT_SLEEP_S="$RELEASE_WAIT_SLEEP_S" \
+    FRG_WAIT_ATTEMPTS="$FRG_WAIT_ATTEMPTS" FRG_WAIT_SLEEP_S="$FRG_WAIT_SLEEP_S" \
     ENGINE_PROMOTE_HOST="$ENGINE_PROMOTE_HOST" PIPELINE_SUPERVISOR_STATE="$STATE_ROOT" \
     RELEASE_CHECKS_GREEN_BIN="$RELEASE_CHECKS_GREEN_BIN" \
     TRAIN_STATUS_COMPLETE_BIN="$TRAIN_STATUS_COMPLETE_BIN" \
+    TUGBOAT_SKIP_FRG="$SKIP_FRG" TUGBOAT_SKIP_FRG_REASON="$SKIP_FRG_REASON" \
+    TUGBOAT_CANDIDATE_SHA="${TUGBOAT_CANDIDATE_SHA:-}" \
+    TUGBOAT_REPOSITORY="${TUGBOAT_REPOSITORY:-}" \
+    TUGBOAT_BASE_BRANCH="${TUGBOAT_BASE_BRANCH:-}" \
+    TUGBOAT_FRG_MANIFEST_PATH="${TUGBOAT_FRG_MANIFEST_PATH:-}" \
     "$self" "${args[@]}" >/dev/null 2>&1 &
   pid=$!
   echo "detached tugboat ship ${milestones[*]} (pid $pid)"
@@ -599,6 +1101,9 @@ if [[ "$do_status" == "1" ]]; then
   emit_status_json "$version"
   exit 0
 fi
+
+# Skip escape is validated before detach or any train/release mutation.
+resolve_skip_frg
 
 if [[ "$do_detach" == "1" ]]; then
   detach_self
@@ -662,6 +1167,12 @@ ship_one() {
   trap 'release_lock' EXIT
 
   log "tugboat start milestone=v$version version=$version repo=$REPO_DIR host=$ENGINE_PROMOTE_HOST"
+  SKIP_FRG_ARGS=()
+  if [[ "$SKIP_FRG" == "1" ]]; then
+    SKIP_FRG_ARGS=(--skip-frg)
+    printf '%s\n' "$SKIP_FRG_REASON" >"$RUN_DIR/skip-frg-reason.txt"
+    log "skip-frg escape reason=$SKIP_FRG_REASON"
+  fi
 
   # ----- A: train + merge ---------------------------------------------------
   write_state "train" "running" "pipeline train --milestone v$version --merge --json"
@@ -774,11 +1285,55 @@ ship_one() {
     fi
   fi
 
+  # ----- A2: FRG pack (compose factory-release prepare; no second runner) ---
+  if [[ "$SKIP_FRG" != "1" ]]; then
+    local req pack_done pack_ec pack_verdict latest_json
+    req="$RUN_DIR/factory-release-prepare-request.json"
+    write_state "frg-pack" "running" "pipeline factory-release prepare --request $req --json"
+    log "phase frg-pack: start request=$req"
+    if ! write_factory_release_request "$req" "$version" "$REPO_DIR"; then
+      write_state "frg-pack" "failed" "could not write factory-release prepare request"
+      log "FAIL: could not write factory-release prepare request"
+      exit 1
+    fi
+    pack_done=0
+    latest_json="$REPO_DIR/.agent-pipeline/frg/$version/latest.json"
+    for i in $(seq 1 "$FRG_WAIT_ATTEMPTS"); do
+      set +e
+      "$PIPELINE" factory-release prepare --request "$req" --json >"$RUN_DIR/frg-pack.json" 2>"$RUN_DIR/frg-pack.err"
+      pack_ec=$?
+      set -e
+      cat "$RUN_DIR/frg-pack.err" >>"$LOG_FILE" 2>/dev/null || true
+      pack_verdict=$(classify_frg_pack_tick "$RUN_DIR/frg-pack.json" "$latest_json" "$pack_ec" "$req")
+      if [[ "$pack_verdict" == "done" ]]; then
+        log "phase frg-pack: pack-done (attempt $i)"
+        pack_done=1
+        break
+      elif [[ "$pack_verdict" == "retry" ]]; then
+        log "phase frg-pack: in_progress (attempt $i); waiting"
+        sleep "$FRG_WAIT_SLEEP_S"
+      else
+        write_state "frg-pack" "failed" "FRG pack failed (prepare status or latest.json)"
+        log "FAIL: FRG pack failed (attempt $i)"
+        exit 1
+      fi
+    done
+    if [[ "$pack_done" -ne 1 ]]; then
+      write_state "frg-pack" "failed" "FRG pack still in_progress within wait budget"
+      log "FAIL: FRG pack still in_progress within wait budget"
+      exit 1
+    fi
+    write_state "frg-pack" "ok" "pack-done"
+    log "phase frg-pack: ok"
+  else
+    log "phase frg-pack: omitted (skip-frg escape)"
+  fi
+
   # ----- B: release prepare (bare X.Y.Z — leading v is INVALID) -------------
-  write_state "release-prepare" "running" "pipeline release $version --no-edit --skip-frg"
+  write_state "release-prepare" "running" "pipeline release $version --no-edit ${SKIP_FRG_ARGS[*]}"
   log "phase release-prepare: start (bare version=$version)"
   set +e
-  "$PIPELINE" release "$version" --no-edit --skip-frg >"$RUN_DIR/release-prepare.out" 2>"$RUN_DIR/release-prepare.err"
+  "$PIPELINE" release "$version" --no-edit "${SKIP_FRG_ARGS[@]}" >"$RUN_DIR/release-prepare.out" 2>"$RUN_DIR/release-prepare.err"
   rel_ec=$?
   set -e
   cat "$RUN_DIR/release-prepare.err" >>"$LOG_FILE" 2>/dev/null || true
@@ -883,10 +1438,10 @@ ship_one() {
   write_state "wait-release" "ok" "v$version published"
 
   # ----- E: engine-promote (all hosts by default) ---------------------------
-  write_state "engine-promote" "running" "pipeline engine-promote --for $version --host $ENGINE_PROMOTE_HOST --skip-frg --json"
+  write_state "engine-promote" "running" "pipeline engine-promote --for $version --host $ENGINE_PROMOTE_HOST ${SKIP_FRG_ARGS[*]} --json"
   log "phase engine-promote: start host=$ENGINE_PROMOTE_HOST"
   set +e
-  "$PIPELINE" engine-promote --for "$version" --host "$ENGINE_PROMOTE_HOST" --skip-frg --json >"$RUN_DIR/engine-promote.json" 2>"$RUN_DIR/engine-promote.err"
+  "$PIPELINE" engine-promote --for "$version" --host "$ENGINE_PROMOTE_HOST" "${SKIP_FRG_ARGS[@]}" --json >"$RUN_DIR/engine-promote.json" 2>"$RUN_DIR/engine-promote.err"
   pro_ec=$?
   set -e
   cat "$RUN_DIR/engine-promote.err" >>"$LOG_FILE" 2>/dev/null || true

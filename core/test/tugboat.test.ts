@@ -123,6 +123,7 @@ test("tugboat is thin: no second ship brain / grant factory markers", () => {
   assert.match(body, /Tugboat — thin ship composer/);
   assert.doesNotMatch(body, /grant[\/_]factory|factory\.mjs/);
   assert.doesNotMatch(body, /pipeline ship /);
+  assert.match(body, /factory-release prepare --request/);
   assert.match(body, /engine-promote/);
   assert.match(body, /ENGINE_PROMOTE_HOST:-all/);
 });
@@ -178,14 +179,22 @@ test("tugboat supports serial multi-milestone and single-host lock", () => {
   assert.ok(shipOneStart >= 0 && shipOneEnd > shipOneStart);
   const shipOneBody = body.slice(shipOneStart, shipOneEnd);
   assert.match(shipOneBody, /engine-promote --for "\$version"/);
-  // #1038 keep-skip: default release/promote argv still include --skip-frg
-  // until isHonestPost133FrgPass accepts a post-1.33 from-run artifact.
-  assert.match(shipOneBody, /release "\$version" --no-edit --skip-frg/);
+  // #1039: default release/promote argv omit --skip-frg and compose FRG pack.
+  assert.match(shipOneBody, /release "\$version" --no-edit "\$\{SKIP_FRG_ARGS\[@\]\}"/);
+  assert.doesNotMatch(shipOneBody, /release "\$version" --no-edit --skip-frg/);
   assert.match(
+    shipOneBody,
+    /engine-promote --for "\$version" --host "\$ENGINE_PROMOTE_HOST" "\$\{SKIP_FRG_ARGS\[@\]\}" --json/,
+  );
+  assert.doesNotMatch(
     shipOneBody,
     /engine-promote --for "\$version" --host "\$ENGINE_PROMOTE_HOST" --skip-frg --json/,
   );
-  assert.doesNotMatch(shipOneBody, /factory-release prepare/);
+  assert.match(shipOneBody, /factory-release prepare --request/);
+  assert.match(shipOneBody, /write_factory_release_request/);
+  // Escape still passes --skip-frg via SKIP_FRG_ARGS; pack is omitted.
+  assert.match(shipOneBody, /SKIP_FRG_ARGS=\(--skip-frg\)/);
+  assert.match(shipOneBody, /phase frg-pack: omitted \(skip-frg escape\)/);
   // No parallel fan-out of milestones (ignore prose comments about "ship brain").
   assert.doesNotMatch(body, /xargs\s+-P/);
   assert.doesNotMatch(body, /&\s*ship_one\b/);
@@ -278,7 +287,7 @@ test("tugboat --status reads state without starting ship phases", () => {
   const statusBlock = body.slice(statusIdx, detachIdx);
   assert.match(statusBlock, /emit_status_json/);
   assert.match(statusBlock, /exit 0/);
-  assert.doesNotMatch(statusBlock, /ship_one|train --milestone|release finish/);
+  assert.doesNotMatch(statusBlock, /ship_one|train --milestone|release finish|factory-release/);
   assert.doesNotMatch(statusBlock, /"\$PIPELINE" train|"\$PIPELINE" release/);
   // Status rewrites dead-pid "running" → stale via live-ship probe (#1062).
   assert.match(body, /emit_status_json\s*\(/);
@@ -956,6 +965,789 @@ test("tugboat REPO_DIR (#1062): pin at start; refuse factory-control", () => {
   } finally {
     fs.rmSync(badRoot, { recursive: true, force: true });
   }
+});
+
+const frgHelpers = path.join(
+  repoRoot,
+  "examples/supervisor/shell/frg-pack-helpers.sh",
+);
+
+function extractNamedFn(src: string, name: string, label: string): string {
+  const m = src.match(new RegExp(`^${name}\\(\\) \\{[\\s\\S]*?\\n\\}`, "m"));
+  assert.ok(m, `${name}() not found in ${label}`);
+  return m[0];
+}
+
+test("playbook frg-pack-helpers.sh stays in sync with tugboat pack helpers", () => {
+  const tug = fs.readFileSync(tugboat, "utf8");
+  const help = fs.readFileSync(frgHelpers, "utf8");
+  for (const name of ["write_factory_release_request", "classify_frg_pack_tick"]) {
+    assert.equal(
+      extractNamedFn(tug, name, "tugboat.sh"),
+      extractNamedFn(help, name, "frg-pack-helpers.sh"),
+      `${name} drifted between tugboat.sh and frg-pack-helpers.sh`,
+    );
+  }
+});
+
+test("tugboat skip-frg without reason fails closed before ship mutation", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-skip-"));
+  try {
+    const r = spawnSync("bash", [tugboat, "--milestone", "v1.39.0", "--skip-frg"], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        SHIP_NOTIFY: "0",
+        PIPELINE_SUPERVISOR_STATE: path.join(dir, "state"),
+        REPO_DIR: "",
+        ALLOW_MERGE: "0",
+      },
+    });
+    assert.notEqual(r.status, 0, "skip without reason must fail closed");
+    assert.match(`${r.stdout}\n${r.stderr}`, /requires a non-empty/);
+    assert.doesNotMatch(`${r.stdout}\n${r.stderr}`, /phase train|detached tugboat/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("tugboat TUGBOAT_SKIP_FRG=1 without reason fails closed", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-skip-env-"));
+  try {
+    const r = spawnSync("bash", [tugboat, "--milestone", "v1.39.0"], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        SHIP_NOTIFY: "0",
+        PIPELINE_SUPERVISOR_STATE: path.join(dir, "state"),
+        REPO_DIR: "",
+        ALLOW_MERGE: "0",
+        TUGBOAT_SKIP_FRG: "1",
+      },
+    });
+    assert.notEqual(r.status, 0, "env skip without reason must fail closed");
+    assert.match(`${r.stdout}\n${r.stderr}`, /requires a non-empty/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("tugboat skip-frg with reason is accepted before status (no ship start)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-skip-ok-"));
+  try {
+    const r = spawnSync(
+      "bash",
+      [
+        tugboat,
+        "--milestone",
+        "v9.9.9",
+        "--skip-frg",
+        "--skip-frg-reason",
+        "operator test escape",
+        "--status",
+      ],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          SHIP_NOTIFY: "0",
+          PIPELINE_SUPERVISOR_STATE: path.join(dir, "state"),
+          REPO_DIR: "",
+        },
+      },
+    );
+    assert.equal(r.status, 0, `status+skip exited ${r.status}: ${r.stderr}`);
+    assert.match(r.stdout, /"status"\s*:\s*"none"/);
+    assert.doesNotMatch(r.stdout + r.stderr, /phase train|factory-release prepare/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("write_factory_release_request: secret-free identity only (injected I/O)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-req-"));
+  try {
+    const manifest = path.join(dir, "manifest.json");
+    fs.writeFileSync(
+      manifest,
+      JSON.stringify({ schema_version: 1, pack_id: "factory-gate-v1" }),
+    );
+    const dest = path.join(dir, "req.json");
+    const sha = "a".repeat(40);
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        `. ${JSON.stringify(frgHelpers)}`,
+        `write_factory_release_request ${JSON.stringify(dest)} "1.39.0" ${JSON.stringify(dir)}`,
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    const r = spawnSync("bash", [runner], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        TUGBOAT_CANDIDATE_SHA: sha,
+        TUGBOAT_REPOSITORY: "accidental-hedge-fund/agent-pipeline",
+        TUGBOAT_BASE_BRANCH: "main",
+        TUGBOAT_FRG_MANIFEST_PATH: manifest,
+      },
+    });
+    assert.equal(r.status, 0, `writer exited ${r.status}: ${r.stderr}`);
+    const req = JSON.parse(fs.readFileSync(dest, "utf8")) as Record<string, unknown>;
+    assert.equal(req.schema_version, 1);
+    assert.equal(req.kind, "factory_release_prepare_request");
+    assert.equal(req.target_version, "1.39.0");
+    assert.equal(req.action_id, "tugboat-ship-1.39.0");
+    assert.equal(req.repository, "accidental-hedge-fund/agent-pipeline");
+    assert.equal(req.base_branch, "main");
+    const cand = req.integrated_candidate as { git_sha: string };
+    assert.equal(cand.git_sha, sha);
+    const man = req.frg_manifest as { pack_id: string; sha256: string };
+    assert.equal(man.pack_id, "factory-gate-v1");
+    assert.match(man.sha256, /^[0-9a-f]{64}$/);
+    for (const forbidden of [
+      "pass",
+      "status",
+      "credential",
+      "credentials",
+      "secret",
+      "executable",
+      "attestation_key",
+    ]) {
+      assert.equal(req[forbidden], undefined, `request must not contain ${forbidden}`);
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+function writeFakeGit(binDir: string, body: string): void {
+  fs.mkdirSync(binDir, { recursive: true });
+  const git = path.join(binDir, "git");
+  fs.writeFileSync(git, `#!/usr/bin/env bash\nset -euo pipefail\n${body}\n`);
+  fs.chmodSync(git, 0o755);
+}
+
+function envWithoutCandidate(extra: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env = { ...process.env, ...extra };
+  delete env.TUGBOAT_CANDIDATE_SHA;
+  return env;
+}
+
+function envWithoutBase(extra: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env = envWithoutCandidate(extra);
+  delete env.TUGBOAT_BASE_BRANCH;
+  return env;
+}
+
+function writePipelineYml(repoDir: string, baseBranch: string): void {
+  writePipelineYmlRaw(repoDir, `base_branch: ${baseBranch} # integration branch\n`);
+}
+
+function writePipelineYmlRaw(repoDir: string, body: string): void {
+  const dir = path.join(repoDir, ".github");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "pipeline.yml"), body);
+}
+
+function runWriteRequest(dir: string, gitScript: string): {
+  status: number | null;
+  stdout: string;
+  stderr: string;
+  dest: string;
+} {
+  const binDir = path.join(dir, "bin");
+  writeFakeGit(binDir, gitScript);
+  const manifest = path.join(dir, "manifest.json");
+  fs.writeFileSync(
+    manifest,
+    JSON.stringify({ schema_version: 1, pack_id: "factory-gate-v1" }),
+  );
+  const dest = path.join(dir, "req.json");
+  const runner = path.join(dir, "run.sh");
+  fs.writeFileSync(
+    runner,
+    [
+      "#!/usr/bin/env bash",
+      "set -euo pipefail",
+      `. ${JSON.stringify(frgHelpers)}`,
+      `write_factory_release_request ${JSON.stringify(dest)} "1.39.0" ${JSON.stringify(dir)}`,
+      "",
+    ].join("\n"),
+  );
+  fs.chmodSync(runner, 0o755);
+  const r = spawnSync("bash", [runner], {
+    encoding: "utf8",
+    env: envWithoutBase({
+      PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
+      TUGBOAT_REPOSITORY: "accidental-hedge-fund/agent-pipeline",
+      TUGBOAT_FRG_MANIFEST_PATH: manifest,
+    }),
+  });
+  return { status: r.status, stdout: r.stdout, stderr: r.stderr, dest };
+}
+
+test("write_factory_release_request: binds origin/<base> tip, not local HEAD", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-req-tip-"));
+  try {
+    const localHead = "a".repeat(40);
+    const remoteTip = "b".repeat(40);
+    const binDir = path.join(dir, "bin");
+    const calls = path.join(dir, "git-calls.txt");
+    writeFakeGit(
+      binDir,
+      [
+        `echo "$*" >> ${JSON.stringify(calls)}`,
+        'args=("$@")',
+        'if [[ "${args[0]:-}" == "-C" ]]; then args=("${args[@]:2}"); fi',
+        'cmd="${args[0]:-}"',
+        "case \"$cmd\" in",
+        "  ls-remote)",
+        `    printf '%s\\t%s\\n' ${JSON.stringify(remoteTip)} refs/heads/main`,
+        "    exit 0",
+        "    ;;",
+        "  fetch) exit 0 ;;",
+        "  rev-parse)",
+        '    joined="${args[*]}"',
+        '    if [[ "$joined" == *origin/main* || "$joined" == *refs/remotes/origin/main* ]]; then',
+        `      echo ${JSON.stringify(remoteTip)}`,
+        "      exit 0",
+        "    fi",
+        '    if [[ "$joined" == *HEAD* ]]; then',
+        `      echo ${JSON.stringify(localHead)}`,
+        "      exit 0",
+        "    fi",
+        "    ;;",
+        "esac",
+        'echo "unexpected git ${args[*]}" >&2',
+        "exit 1",
+      ].join("\n"),
+    );
+    const manifest = path.join(dir, "manifest.json");
+    fs.writeFileSync(
+      manifest,
+      JSON.stringify({ schema_version: 1, pack_id: "factory-gate-v1" }),
+    );
+    const dest = path.join(dir, "req.json");
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        `. ${JSON.stringify(frgHelpers)}`,
+        `write_factory_release_request ${JSON.stringify(dest)} "1.39.0" ${JSON.stringify(dir)}`,
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    const r = spawnSync("bash", [runner], {
+      encoding: "utf8",
+      env: envWithoutCandidate({
+        PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
+        TUGBOAT_REPOSITORY: "accidental-hedge-fund/agent-pipeline",
+        TUGBOAT_BASE_BRANCH: "main",
+        TUGBOAT_FRG_MANIFEST_PATH: manifest,
+      }),
+    });
+    assert.equal(r.status, 0, `writer exited ${r.status}: ${r.stderr}`);
+    const req = JSON.parse(fs.readFileSync(dest, "utf8")) as {
+      integrated_candidate: { git_sha: string };
+    };
+    assert.equal(req.integrated_candidate.git_sha, remoteTip);
+    assert.notEqual(req.integrated_candidate.git_sha, localHead);
+    const helperSrc = fs.readFileSync(tugboat, "utf8");
+    assert.match(helperSrc, /ls-remote/);
+    assert.doesNotMatch(helperSrc, /rev-parse", "HEAD"/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("write_factory_release_request: uses pipeline.yml base_branch not origin/HEAD", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-req-staging-"));
+  try {
+    const localHead = "a".repeat(40);
+    const mainTip = "b".repeat(40);
+    const stagingTip = "c".repeat(40);
+    const binDir = path.join(dir, "bin");
+    const calls = path.join(dir, "git-calls.txt");
+    writePipelineYml(dir, "staging");
+    writeFakeGit(
+      binDir,
+      [
+        `echo "$*" >> ${JSON.stringify(calls)}`,
+        'args=("$@")',
+        'if [[ "${args[0]:-}" == "-C" ]]; then args=("${args[@]:2}"); fi',
+        'cmd="${args[0]:-}"',
+        "case \"$cmd\" in",
+        "  symbolic-ref)",
+        "    echo origin/main",
+        "    exit 0",
+        "    ;;",
+        "  ls-remote)",
+        '    joined="${args[*]}"',
+        '    if [[ "$joined" == *refs/heads/staging* ]]; then',
+        `      printf '%s\\t%s\\n' ${JSON.stringify(stagingTip)} refs/heads/staging`,
+        "      exit 0",
+        "    fi",
+        '    if [[ "$joined" == *refs/heads/main* ]]; then',
+        `      printf '%s\\t%s\\n' ${JSON.stringify(mainTip)} refs/heads/main`,
+        "      exit 0",
+        "    fi",
+        "    exit 2",
+        "    ;;",
+        "  fetch) exit 0 ;;",
+        "  rev-parse)",
+        '    joined="${args[*]}"',
+        '    if [[ "$joined" == *origin/staging* || "$joined" == *refs/remotes/origin/staging* ]]; then',
+        `      echo ${JSON.stringify(stagingTip)}`,
+        "      exit 0",
+        "    fi",
+        '    if [[ "$joined" == *HEAD* ]]; then',
+        `      echo ${JSON.stringify(localHead)}`,
+        "      exit 0",
+        "    fi",
+        "    ;;",
+        "esac",
+        'echo "unexpected git ${args[*]}" >&2',
+        "exit 1",
+      ].join("\n"),
+    );
+    const manifest = path.join(dir, "manifest.json");
+    fs.writeFileSync(
+      manifest,
+      JSON.stringify({ schema_version: 1, pack_id: "factory-gate-v1" }),
+    );
+    const dest = path.join(dir, "req.json");
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        `. ${JSON.stringify(frgHelpers)}`,
+        `write_factory_release_request ${JSON.stringify(dest)} "1.39.0" ${JSON.stringify(dir)}`,
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    const r = spawnSync("bash", [runner], {
+      encoding: "utf8",
+      env: envWithoutBase({
+        PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
+        TUGBOAT_REPOSITORY: "accidental-hedge-fund/agent-pipeline",
+        TUGBOAT_FRG_MANIFEST_PATH: manifest,
+      }),
+    });
+    assert.equal(r.status, 0, `writer exited ${r.status}: ${r.stderr}`);
+    const req = JSON.parse(fs.readFileSync(dest, "utf8")) as {
+      base_branch: string;
+      integrated_candidate: { git_sha: string };
+    };
+    assert.equal(req.base_branch, "staging");
+    assert.equal(req.integrated_candidate.git_sha, stagingTip);
+    assert.notEqual(req.integrated_candidate.git_sha, mainTip);
+    const gitCalls = fs.existsSync(calls) ? fs.readFileSync(calls, "utf8") : "";
+    assert.doesNotMatch(gitCalls, /symbolic-ref/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("write_factory_release_request: quoted pipeline.yml key binds staging not main", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-req-quoted-key-"));
+  try {
+    const mainTip = "b".repeat(40);
+    const stagingTip = "c".repeat(40);
+    writePipelineYmlRaw(dir, '"base_branch": staging\n');
+    const r = runWriteRequest(
+      dir,
+      [
+        'args=("$@")',
+        'if [[ "${args[0]:-}" == "-C" ]]; then args=("${args[@]:2}"); fi',
+        'cmd="${args[0]:-}"',
+        "case \"$cmd\" in",
+        "  ls-remote)",
+        '    joined="${args[*]}"',
+        '    if [[ "$joined" == *refs/heads/staging* ]]; then',
+        `      printf '%s\\t%s\\n' ${JSON.stringify(stagingTip)} refs/heads/staging`,
+        "      exit 0",
+        "    fi",
+        '    if [[ "$joined" == *refs/heads/main* ]]; then',
+        `      printf '%s\\t%s\\n' ${JSON.stringify(mainTip)} refs/heads/main`,
+        "      exit 0",
+        "    fi",
+        "    exit 2",
+        "    ;;",
+        "esac",
+        'echo "unexpected git ${args[*]}" >&2',
+        "exit 1",
+      ].join("\n"),
+    );
+    assert.equal(r.status, 0, `writer exited ${r.status}: ${r.stderr}`);
+    const req = JSON.parse(fs.readFileSync(r.dest, "utf8")) as {
+      base_branch: string;
+      integrated_candidate: { git_sha: string };
+    };
+    assert.equal(req.base_branch, "staging");
+    assert.equal(req.integrated_candidate.git_sha, stagingTip);
+    assert.notEqual(req.integrated_candidate.git_sha, mainTip);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("write_factory_release_request: preserves embedded # in pipeline.yml branch name", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-req-hash-"));
+  try {
+    const hashTip = "e".repeat(40);
+    const deployTip = "f".repeat(40);
+    writePipelineYmlRaw(dir, "base_branch: deploy#blue\n");
+    const r = runWriteRequest(
+      dir,
+      [
+        'args=("$@")',
+        'if [[ "${args[0]:-}" == "-C" ]]; then args=("${args[@]:2}"); fi',
+        'cmd="${args[0]:-}"',
+        "case \"$cmd\" in",
+        "  ls-remote)",
+        '    joined="${args[*]}"',
+        `    if [[ "$joined" == *${JSON.stringify("refs/heads/deploy#blue")}* ]]; then`,
+        `      printf '%s\\t%s\\n' ${JSON.stringify(hashTip)} ${JSON.stringify("refs/heads/deploy#blue")}`,
+        "      exit 0",
+        "    fi",
+        '    if [[ "$joined" == *refs/heads/deploy* ]]; then',
+        `      printf '%s\\t%s\\n' ${JSON.stringify(deployTip)} refs/heads/deploy`,
+        "      exit 0",
+        "    fi",
+        "    exit 2",
+        "    ;;",
+        "esac",
+        'echo "unexpected git ${args[*]}" >&2',
+        "exit 1",
+      ].join("\n"),
+    );
+    assert.equal(r.status, 0, `writer exited ${r.status}: ${r.stderr}`);
+    const req = JSON.parse(fs.readFileSync(r.dest, "utf8")) as {
+      base_branch: string;
+      integrated_candidate: { git_sha: string };
+    };
+    assert.equal(req.base_branch, "deploy#blue");
+    assert.equal(req.integrated_candidate.git_sha, hashTip);
+    assert.notEqual(req.base_branch, "deploy");
+    assert.notEqual(req.integrated_candidate.git_sha, deployTip);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("write_factory_release_request: preserves slash-containing branch names", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-req-slash-"));
+  try {
+    const remoteTip = "d".repeat(40);
+    const binDir = path.join(dir, "bin");
+    writeFakeGit(
+      binDir,
+      [
+        'args=("$@")',
+        'if [[ "${args[0]:-}" == "-C" ]]; then args=("${args[@]:2}"); fi',
+        'cmd="${args[0]:-}"',
+        "case \"$cmd\" in",
+        "  ls-remote)",
+        '    joined="${args[*]}"',
+        '    if [[ "$joined" == *refs/heads/release/1.39* ]]; then',
+        `      printf '%s\\t%s\\n' ${JSON.stringify(remoteTip)} refs/heads/release/1.39`,
+        "      exit 0",
+        "    fi",
+        "    exit 2",
+        "    ;;",
+        "esac",
+        'echo "unexpected git ${args[*]}" >&2',
+        "exit 1",
+      ].join("\n"),
+    );
+    const manifest = path.join(dir, "manifest.json");
+    fs.writeFileSync(
+      manifest,
+      JSON.stringify({ schema_version: 1, pack_id: "factory-gate-v1" }),
+    );
+    const dest = path.join(dir, "req.json");
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        `. ${JSON.stringify(frgHelpers)}`,
+        `write_factory_release_request ${JSON.stringify(dest)} "1.39.0" ${JSON.stringify(dir)}`,
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    const r = spawnSync("bash", [runner], {
+      encoding: "utf8",
+      env: envWithoutCandidate({
+        PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
+        TUGBOAT_REPOSITORY: "accidental-hedge-fund/agent-pipeline",
+        TUGBOAT_BASE_BRANCH: "origin/release/1.39",
+        TUGBOAT_FRG_MANIFEST_PATH: manifest,
+      }),
+    });
+    assert.equal(r.status, 0, `writer exited ${r.status}: ${r.stderr}`);
+    const req = JSON.parse(fs.readFileSync(dest, "utf8")) as {
+      base_branch: string;
+      integrated_candidate: { git_sha: string };
+    };
+    assert.equal(req.base_branch, "release/1.39");
+    assert.equal(req.integrated_candidate.git_sha, remoteTip);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("write_factory_release_request: missing pipeline.yml and unset TUGBOAT_BASE_BRANCH fails closed", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-req-no-base-"));
+  try {
+    const binDir = path.join(dir, "bin");
+    writeFakeGit(
+      binDir,
+      [
+        'args=("$@")',
+        'if [[ "${args[0]:-}" == "-C" ]]; then args=("${args[@]:2}"); fi',
+        'cmd="${args[0]:-}"',
+        "case \"$cmd\" in",
+        "  symbolic-ref)",
+        "    echo origin/main",
+        "    exit 0",
+        "    ;;",
+        "esac",
+        "exit 1",
+      ].join("\n"),
+    );
+    const manifest = path.join(dir, "manifest.json");
+    fs.writeFileSync(
+      manifest,
+      JSON.stringify({ schema_version: 1, pack_id: "factory-gate-v1" }),
+    );
+    const dest = path.join(dir, "req.json");
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        `. ${JSON.stringify(frgHelpers)}`,
+        `write_factory_release_request ${JSON.stringify(dest)} "1.39.0" ${JSON.stringify(dir)}`,
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    const r = spawnSync("bash", [runner], {
+      encoding: "utf8",
+      env: envWithoutBase({
+        PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
+        TUGBOAT_REPOSITORY: "accidental-hedge-fund/agent-pipeline",
+        TUGBOAT_FRG_MANIFEST_PATH: manifest,
+      }),
+    });
+    assert.notEqual(r.status, 0, "missing base_branch source must fail closed");
+    assert.match(`${r.stdout}\n${r.stderr}`, /TUGBOAT_BASE_BRANCH|pipeline\.yml|origin\/HEAD/);
+    assert.equal(fs.existsSync(dest), false, "must not write a request on the wrong branch");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("write_factory_release_request: missing remote tip fails closed (does not use HEAD)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-req-no-tip-"));
+  try {
+    const localHead = "c".repeat(40);
+    const binDir = path.join(dir, "bin");
+    writeFakeGit(
+      binDir,
+      [
+        'args=("$@")',
+        'if [[ "${args[0]:-}" == "-C" ]]; then args=("${args[@]:2}"); fi',
+        'cmd="${args[0]:-}"',
+        "case \"$cmd\" in",
+        "  ls-remote) exit 2 ;;",
+        "  fetch) exit 1 ;;",
+        "  rev-parse)",
+        '    joined="${args[*]}"',
+        '    if [[ "$joined" == *HEAD* ]]; then',
+        `      echo ${JSON.stringify(localHead)}`,
+        "      exit 0",
+        "    fi",
+        "    exit 1",
+        "    ;;",
+        "esac",
+        "exit 1",
+      ].join("\n"),
+    );
+    const manifest = path.join(dir, "manifest.json");
+    fs.writeFileSync(
+      manifest,
+      JSON.stringify({ schema_version: 1, pack_id: "factory-gate-v1" }),
+    );
+    const dest = path.join(dir, "req.json");
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        `. ${JSON.stringify(frgHelpers)}`,
+        `write_factory_release_request ${JSON.stringify(dest)} "1.39.0" ${JSON.stringify(dir)}`,
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    const r = spawnSync("bash", [runner], {
+      encoding: "utf8",
+      env: envWithoutCandidate({
+        PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
+        TUGBOAT_REPOSITORY: "accidental-hedge-fund/agent-pipeline",
+        TUGBOAT_BASE_BRANCH: "main",
+        TUGBOAT_FRG_MANIFEST_PATH: manifest,
+      }),
+    });
+    assert.notEqual(r.status, 0, "missing remote tip must fail closed");
+    assert.match(`${r.stdout}\n${r.stderr}`, /origin\/main tip after train|git object id/);
+    if (fs.existsSync(dest)) {
+      const req = JSON.parse(fs.readFileSync(dest, "utf8")) as {
+        integrated_candidate?: { git_sha?: string };
+      };
+      assert.notEqual(req.integrated_candidate?.git_sha, localHead);
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("classify_frg_pack_tick: done / retry / fail without live pack", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-tick-"));
+  try {
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        `. ${JSON.stringify(frgHelpers)}`,
+        'classify_frg_pack_tick "$1" "$2" "$3" "${4:-}"',
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    const run = (
+      prep: unknown,
+      latest: unknown | null,
+      ec: number,
+      extraEnv: NodeJS.ProcessEnv = {},
+      request: unknown | null = null,
+    ): string => {
+      const prepPath = path.join(dir, "prep.json");
+      const latestPath = path.join(dir, "latest.json");
+      const reqPath = path.join(dir, "request.json");
+      fs.writeFileSync(prepPath, JSON.stringify(prep));
+      if (latest === null) {
+        if (fs.existsSync(latestPath)) fs.rmSync(latestPath);
+      } else {
+        fs.writeFileSync(latestPath, JSON.stringify(latest));
+      }
+      if (request === null) {
+        if (fs.existsSync(reqPath)) fs.rmSync(reqPath);
+      } else {
+        fs.writeFileSync(reqPath, JSON.stringify(request));
+      }
+      const env = { ...process.env, ...extraEnv };
+      delete env.TUGBOAT_OPEN_RELEASE_PR;
+      Object.assign(env, extraEnv);
+      const argv = [runner, prepPath, latestPath, String(ec)];
+      if (request !== null) argv.push(reqPath);
+      const r = spawnSync("bash", argv, {
+        encoding: "utf8",
+        env,
+      });
+      assert.equal(r.status, 0, `classifier exited ${r.status}: ${r.stderr}`);
+      return r.stdout.trim();
+    };
+    const completePrep = {
+      status: "complete",
+      target_version: "1.39.0",
+      release_pr: { number: 12, head_oid: "a".repeat(40), base_oid: "b".repeat(40) },
+    };
+    const shaOld = "a".repeat(40);
+    const shaNew = "b".repeat(40);
+    const reqNew = {
+      target_version: "1.39.0",
+      action_id: "tugboat-ship-1.39.0",
+      integrated_candidate: { git_sha: shaNew },
+    };
+    const latestFor = (sha: string, extra: Record<string, unknown> = {}) => ({
+      pass: true,
+      version: "1.39.0",
+      pack_provenance: { candidate_git_sha: sha, release_version: "1.39.0" },
+      ...extra,
+    });
+    assert.equal(
+      run({ status: "awaiting_frg_attestation" }, null, 0),
+      "done",
+    );
+    assert.equal(run({ status: "in_progress" }, null, 0), "retry");
+    assert.equal(run({ status: "complete" }, null, 0), "fail");
+    assert.equal(run(completePrep, null, 0), "fail");
+    assert.equal(
+      run(completePrep, null, 0, { TUGBOAT_OPEN_RELEASE_PR: "12" }),
+      "done",
+    );
+    assert.equal(
+      run(completePrep, { pass: false }, 0, { TUGBOAT_OPEN_RELEASE_PR: "12" }),
+      "fail",
+    );
+    assert.equal(run({ status: "failed" }, null, 1), "fail");
+    assert.equal(
+      run({ status: "in_progress" }, { pass: true }, 0, {}, reqNew),
+      "retry",
+    );
+    assert.equal(
+      run({ status: "in_progress" }, latestFor(shaOld), 0, {}, reqNew),
+      "retry",
+    );
+    assert.equal(
+      run({ status: "in_progress" }, latestFor(shaNew), 0, {}, reqNew),
+      "done",
+    );
+    assert.equal(run({ status: "complete" }, { pass: false }, 0), "fail");
+    assert.equal(
+      run({ status: "awaiting_frg_attestation" }, { pass: false }, 0),
+      "fail",
+    );
+    assert.equal(run({ status: "failed" }, { pass: false }, 1), "fail");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("tugboat pack phase does not sign, merge, tag, promote, or install", () => {
+  const body = fs.readFileSync(tugboat, "utf8");
+  const shipOneStart = body.indexOf("ship_one() {");
+  const shipOneEnd = body.indexOf("\n# ---------- run serial multi-milestone");
+  const shipOneBody = body.slice(shipOneStart, shipOneEnd);
+  const packStart = shipOneBody.indexOf("A2: FRG pack");
+  const releaseStart = shipOneBody.indexOf("B: release prepare");
+  assert.ok(packStart >= 0 && releaseStart > packStart, "frg-pack phase missing");
+  const pack = shipOneBody.slice(packStart, releaseStart);
+  assert.match(pack, /factory-release prepare --request/);
+  assert.doesNotMatch(pack, /attestation_key|HMAC|grant[\/_]factory|factory\.mjs/);
+  assert.doesNotMatch(pack, /pipeline ship /);
+  assert.doesNotMatch(pack, /release finish|engine-promote|git tag|gh release create/);
+  assert.doesNotMatch(pack, /pass:\s*true|"pass": true/);
 });
 
 test("hermes env.example (#1062): REPO_DIR does not default to factory-control", () => {
