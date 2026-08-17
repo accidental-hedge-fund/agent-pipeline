@@ -1975,9 +1975,35 @@ export function validateReleaseEligibleFrgEvidence(
   return evidence;
 }
 
+/** Repo-relative latest.json path named in every tag-path fail-closed message. */
+export function frgLatestRelPath(version: string): string {
+  return path.join(FRG_EVIDENCE_ROOT_REL, normalizeFrgVersion(version), "latest.json");
+}
+
+/**
+ * Shared remediating suffix for tag-path FRG fail-closed. Auto-tag and
+ * `--validate-tag` reuse this; do not tell the operator FRG is optional.
+ */
+export const FRG_TAG_PATH_REMEDIATION =
+  "Remediation: run factory-release prepare or the Tugboat FRG pack phase " +
+  "so that path contains a release-eligible pass artifact.";
+
+/** Fail-closed tag-path message: names latest.json and the pack remediation. */
+export function formatFrgTagPathFailure(version: string, reason: string): string {
+  const v = normalizeFrgVersion(version);
+  const lookup = frgLatestRelPath(v);
+  return (
+    `FRG evidence is not release-eligible for version ${v} at ${lookup} — ${reason}. ` +
+    `Cannot create or push tag v${v} without a release-eligible FRG pass. ` +
+    FRG_TAG_PATH_REMEDIATION
+  );
+}
+
 /**
  * Validate the on-disk latest.json for a version (auto-tag / release path).
  * Fail closed on missing, unparsable, or not release-eligible evidence.
+ * Every fail-closed path names `.agent-pipeline/frg/<X.Y.Z>/latest.json` and
+ * the factory-release prepare / Tugboat FRG pack remediation.
  */
 export async function validateFrgEvidenceFileForTag(
   repoDir: string,
@@ -1992,17 +2018,17 @@ export async function validateFrgEvidenceFileForTag(
     text = await deps.readFile(latestPath);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-      throw new Error(
-        `FRG evidence missing for version ${v} at ${latestPath} — ` +
-          `cannot create/push tag without a release-eligible FRG pass ` +
-          `(see docs/factory-reliability-gate-runbook.md)`,
-      );
+      throw new Error(formatFrgTagPathFailure(v, `missing at ${latestPath}`));
     }
     throw new Error(
-      `FRG evidence unreadable for version ${v} at ${latestPath}: ${(err as Error).message}`,
+      formatFrgTagPathFailure(v, `unreadable at ${latestPath}: ${(err as Error).message}`),
     );
   }
-  return validateReleaseEligibleFrgEvidence(text, v, opts);
+  try {
+    return validateReleaseEligibleFrgEvidence(text, v, opts);
+  } catch (err) {
+    throw new Error(formatFrgTagPathFailure(v, (err as Error).message));
+  }
 }
 
 /** capacity-blocked-retain pass requires observed blocked-retain count ≥ N. */
