@@ -48,7 +48,9 @@ The written `.agent-pipeline/frg/<version>/latest.json` SHALL include
 pack identity `factory-gate-v1`, and `pack_provenance.candidate_git_sha`
 for that candidate. The evidence object SHALL record runner-stamped
 `score_source` `from-run` and `work_list` `factory-gate-pack`. Free-text
-notes and caller options SHALL NOT establish those fields.
+notes and caller options SHALL NOT establish those fields. Persist SHALL
+require those fields already present on the scored object and SHALL NOT
+stamp them from caller options.
 
 #### Scenario: Bound pack from-run writes honest pass latest.json
 
@@ -92,6 +94,14 @@ notes and caller options SHALL NOT establish those fields.
 - **THEN** the honest-pass check SHALL reject that evidence
 - **AND** lookup of a hand-edited `latest.json` that only adds that note
   SHALL NOT accept the artifact
+
+#### Scenario: Persist caller options cannot stamp missing provenance
+
+- **WHEN** the scored object has no `score_source` or no `work_list`
+- **AND** persist is called with caller options that name `from-run` and
+  `factory-gate-pack`
+- **THEN** persist SHALL NOT add those fields to the scored object
+- **AND** persist SHALL NOT return `pass: true`
 
 ### Requirement: Honest-pass required-live ids SHALL not be not_observed
 
@@ -196,8 +206,12 @@ The pipeline SHALL expose one deterministic honest-pass check over a
 `latest.json` (or equivalent evidence object). That check SHALL accept
 only evidence that meets the post-1.33, from-run, required-live,
 Layer A TAP, pack-identity, and no-observations rules in this change.
-Later skip-frg restore, auto-tag, and pin work SHALL reuse this check.
-They SHALL NOT invent a second pass definition.
+The check SHALL require a runner-issued `integrity.score_receipt` that
+binds the computed `pass` to the evidence run. A hand-edited `pass: true`
+on an unsigned or failed score SHALL NOT match that receipt. HMAC
+attestation remains optional for this check. Later skip-frg restore,
+auto-tag, and pin work SHALL reuse this check. They SHALL NOT invent a
+second pass definition.
 
 #### Scenario: Checker accepts a conforming post-1.33 from-run pass
 
@@ -214,4 +228,11 @@ They SHALL NOT invent a second pass definition.
   `not_observed`, or lacks a candidate-SHA TAP for a used Layer A id,
   or was scored from an observations file, or used the product
   milestone work-list
+- **THEN** the honest-pass check SHALL return reject
+
+#### Scenario: Checker rejects a hand-edited pass on an unsigned fail
+
+- **WHEN** the runner writes a structurally eligible unsigned score with
+  `pass: false` and a `score_receipt` bound to that fail
+- **AND** a caller clones the object with `pass: true`
 - **THEN** the honest-pass check SHALL return reject

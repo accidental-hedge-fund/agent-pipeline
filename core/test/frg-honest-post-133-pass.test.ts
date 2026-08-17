@@ -9,6 +9,7 @@ import {
   FRG_PACK_MANIFEST,
   FRG_UNIT_TEST_ATTESTATION_KEY,
   computeFrgEvidence,
+  computeFrgScoreReceipt,
   frgLatestPath,
   isHonestPost133FrgPass,
   isReleaseEligibleFrgPass,
@@ -188,10 +189,31 @@ test("isHonestPost133FrgPass accepts a fixture post-1.33 from-run pass (fails if
     true,
     "production helper must accept a conforming from-run hybrid v2 pass",
   );
-  // Unsigned structural twin: HMAC is not this issue's missing proof.
+  assert.ok(evidence.integrity.score_receipt);
+  assert.equal(
+    evidence.integrity.score_receipt,
+    computeFrgScoreReceipt({
+      pass: true,
+      version: evidence.version,
+      run_id: evidence.run_id,
+      loop_run_id: evidence.loop_run_id,
+      pack_id: evidence.pack_id,
+      score_source: evidence.score_source,
+      work_list: evidence.work_list,
+      scoreboard_fingerprint: evidence.integrity.scoreboard_fingerprint,
+      composition_fingerprint: evidence.integrity.composition_fingerprint,
+      pack_provenance_fingerprint: evidence.integrity.pack_provenance_fingerprint,
+    }),
+  );
+  // Unsigned structural twin: HMAC is optional, but flipping pass is not proof.
   const { evidence: unsigned } = scoreCollected(pack, "1.39.0", { attestation_key: null });
   assert.equal(unsigned.pass, false);
-  assert.equal(isHonestPost133FrgPass({ ...unsigned, pass: true }), true);
+  assert.ok(unsigned.integrity.score_receipt);
+  assert.equal(
+    isHonestPost133FrgPass({ ...unsigned, pass: true }),
+    false,
+    "hand-edited pass:true on an unsigned fail must not satisfy honest-pass",
+  );
 });
 
 test("isHonestPost133FrgPass rejects 1.33.0 pass:true as the skip-frg restore precondition", async () => {
@@ -335,13 +357,25 @@ test("isHonestPost133FrgPass rejects missing/other work-list and note-only from-
   );
   assert.equal(persistFail.pass, false);
 
+  const persistOk = latestJsonForHonestPost133Persist(evidence);
+  assert.equal(persistOk.pass, true);
+  assert.equal(persistOk.score_source, "from-run");
+  assert.equal(persistOk.work_list, "factory-gate-pack");
+
   const persistStamped = latestJsonForHonestPost133Persist(noSource, {
     scoreSource: "from-run",
     workList: "factory-gate-pack",
   });
-  assert.equal(persistStamped.pass, true);
-  assert.equal(persistStamped.score_source, "from-run");
+  assert.equal(persistStamped.pass, false);
+  assert.equal(persistStamped.score_source, undefined);
   assert.equal(persistStamped.work_list, "factory-gate-pack");
+
+  const persistNoWork = latestJsonForHonestPost133Persist(noWorkList, {
+    scoreSource: "from-run",
+    workList: "factory-gate-pack",
+  });
+  assert.equal(persistNoWork.pass, false);
+  assert.equal(persistNoWork.work_list, undefined);
 });
 
 test("lookupHonestPost133FrgPass injects I/O and ignores 1.33.0 / fail / unparsable", async () => {

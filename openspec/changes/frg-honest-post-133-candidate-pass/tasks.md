@@ -5,6 +5,8 @@
 - [x] 1.3 Require every `source: layer_a` id to be on the closed Layer A-allowed set and to cite a TAP hash bound to the same candidate SHA
 - [x] 1.4 Reject version `1.33.0` (or earlier), `pass: false`, product-milestone work-lists, and caller-authored observations as honest-pass evidence
 - [x] 1.5 Call `isReleaseEligibleFrgPass` with `requireAttestation: false` so HMAC is not this issue's missing proof
+- [x] 1.6 Require a runner-issued `integrity.score_receipt` that binds computed `pass` to the run; reject a hand-edited `pass: true`
+- [x] 1.7 Persist requires `score_source` and `work_list` already on the scored object; caller options cannot stamp them
 
 ## 2. Tests
 

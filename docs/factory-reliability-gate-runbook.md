@@ -175,7 +175,10 @@ same candidate SHA.
 
 The check requires runner-stamped `score_source: from-run` and
 `work_list: factory-gate-pack` on the evidence object. Notes and caller
-options cannot establish those fields.
+options cannot establish those fields. Persist does not stamp those
+fields from caller options. The check also requires a runner-issued
+`integrity.score_receipt` that binds the computed `pass` to the run, so
+a hand-edited `pass: true` is not proof.
 
 The check **refuses**:
 

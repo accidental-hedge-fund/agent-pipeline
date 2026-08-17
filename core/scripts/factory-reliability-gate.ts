@@ -267,6 +267,12 @@ export interface FrgIntegrity {
   /** Present when structured pack provenance is part of the evidence. */
   pack_provenance_fingerprint?: string;
   /**
+   * Runner-issued binding of computed `pass` to the evidence run. Honest-pass
+   * requires this receipt to match; flipping `pass` alone cannot create proof.
+   * HMAC attestation remains optional for that check.
+   */
+  score_receipt?: string;
+  /**
    * HMAC attestation binding evidence to a producer that holds
    * {@link FRG_ATTESTATION_KEY_ENV}. Required for release-eligible `pass: true`
    * and verified (not merely present) on the auto-tag path.
@@ -473,6 +479,40 @@ export function computePackProvenanceFingerprint(
   provenance: FrgPackProvenance,
 ): string {
   return frgStableFingerprint(provenance);
+}
+
+/** Runner-issued score receipt payload kind (public hash; not a substitute for HMAC). */
+const FRG_SCORE_RECEIPT_KIND = "frg-score-receipt-v1";
+
+/**
+ * Bind the runner-computed `pass` to the evidence run. Flipping `pass`
+ * without reminting this receipt fails {@link isHonestPost133FrgPass}.
+ */
+export function computeFrgScoreReceipt(input: {
+  pass: boolean;
+  version?: string;
+  run_id?: string;
+  loop_run_id?: string | null;
+  pack_id?: string | null;
+  score_source?: HonestPost133ScoreSource;
+  work_list?: HonestPost133WorkList;
+  scoreboard_fingerprint?: string;
+  composition_fingerprint?: string;
+  pack_provenance_fingerprint?: string;
+}): string {
+  return frgStableFingerprint({
+    kind: FRG_SCORE_RECEIPT_KIND,
+    pass: input.pass,
+    version: input.version ?? null,
+    run_id: input.run_id ?? null,
+    loop_run_id: input.loop_run_id ?? null,
+    pack_id: input.pack_id ?? null,
+    score_source: input.score_source ?? null,
+    work_list: input.work_list ?? null,
+    scoreboard_fingerprint: input.scoreboard_fingerprint ?? null,
+    composition_fingerprint: input.composition_fingerprint ?? null,
+    pack_provenance_fingerprint: input.pack_provenance_fingerprint ?? null,
+  });
 }
 
 export function buildFrgIntegrity(
@@ -1217,6 +1257,14 @@ function parseFrgIntegrity(raw: unknown): FrgIntegrity {
   if (typeof i.pack_provenance_fingerprint === "string") {
     integrity.pack_provenance_fingerprint = i.pack_provenance_fingerprint;
   }
+  if (i.score_receipt !== undefined && i.score_receipt !== null) {
+    if (typeof i.score_receipt !== "string" || !/^[0-9a-f]{64}$/.test(i.score_receipt)) {
+      throw new Error(
+        "FRG evidence.integrity.score_receipt must be a lowercase SHA-256 digest when present",
+      );
+    }
+    integrity.score_receipt = i.score_receipt;
+  }
   if (attestation) integrity.attestation = attestation;
   return integrity;
 }
@@ -1620,6 +1668,24 @@ function honestPassIsFactoryGatePack(
   return true;
 }
 
+function honestPassScoreReceiptMatches(evidence: HonestPost133FrgPassEvidence): boolean {
+  const receipt = evidence.integrity?.score_receipt;
+  if (typeof receipt !== "string" || !SHA256_RE.test(receipt)) return false;
+  const expected = computeFrgScoreReceipt({
+    pass: evidence.pass,
+    version: evidence.version,
+    run_id: evidence.run_id,
+    loop_run_id: evidence.loop_run_id,
+    pack_id: evidence.pack_id,
+    score_source: evidence.score_source,
+    work_list: evidence.work_list,
+    scoreboard_fingerprint: evidence.integrity.scoreboard_fingerprint,
+    composition_fingerprint: evidence.integrity.composition_fingerprint,
+    pack_provenance_fingerprint: evidence.integrity.pack_provenance_fingerprint,
+  });
+  return timingSafeEqualHex(receipt, expected);
+}
+
 function requiredLiveObserved(evidence: HonestPost133FrgPassEvidence): boolean {
   for (const id of FRG_HYBRID_LIVE_SCENARIO_IDS) {
     const scenario = evidence.scenarios.find((item) => item.id === id);
@@ -1678,7 +1744,9 @@ function layerAClaimsHaveCandidateTap(evidence: HonestPost133FrgPassEvidence): b
  * TAP hashes bound to the same candidate SHA.
  *
  * HMAC attestation is **not** required here (`requireAttestation: false`).
- * Auto-tag / pin children may still require a MAC later.
+ * A runner-issued `integrity.score_receipt` **is** required so a hand-edited
+ * `pass: true` cannot satisfy the skip-frg precondition. Auto-tag / pin
+ * children may still require a MAC later.
  *
  * Later skip-frg restore work SHALL call this helper. It SHALL NOT invent a
  * second pass definition.
@@ -1701,30 +1769,24 @@ export function isHonestPost133FrgPass(
   if (!honestPassIsFactoryGatePack(evidence, opts)) return false;
   if (!requiredLiveObserved(evidence)) return false;
   if (!layerAClaimsHaveCandidateTap(evidence)) return false;
+  if (!honestPassScoreReceiptMatches(evidence)) return false;
   return isReleaseEligibleFrgPass(evidence, { requireAttestation: false });
 }
 
 /**
  * Persist gate for `.agent-pipeline/frg/<ver>/latest.json`.
  *
- * Stamps runner-supplied `score_source` / `work_list` when the scored
- * object lacks them. Never rewrites `pass: false` to `pass: true`.
- * Persist `pass: true` only when the actual scored result is true and
- * the honest-pass checker accepts the stamped object.
+ * Requires `score_source` and `work_list` already present on `scored`.
+ * Caller options cannot stamp those fields. Never rewrites `pass: false`
+ * to `pass: true`. Persist `pass: true` only when the scored result is
+ * true and the honest-pass checker accepts the object as-is.
  */
 export function latestJsonForHonestPost133Persist(
   scored: HonestPost133FrgPassEvidence,
   opts?: HonestPost133FrgPassOpts,
 ): HonestPost133FrgPassEvidence {
-  const next: HonestPost133FrgPassEvidence = { ...scored };
-  if (next.score_source === undefined && opts?.scoreSource !== undefined) {
-    next.score_source = opts.scoreSource;
-  }
-  if (next.work_list === undefined && opts?.workList !== undefined) {
-    next.work_list = opts.workList;
-  }
   if (!scored.pass) {
-    return { ...next, pass: false };
+    return { ...scored, pass: false };
   }
   const checkOpts: HonestPost133FrgPassOpts = {
     usedObservationsFile: opts?.usedObservationsFile,
@@ -1733,10 +1795,10 @@ export function latestJsonForHonestPost133Persist(
   if (opts?.workList === "product-milestone" || opts?.workList === "other") {
     checkOpts.workList = opts.workList;
   }
-  if (isHonestPost133FrgPass(next, checkOpts)) {
-    return { ...next, pass: true };
+  if (isHonestPost133FrgPass(scored, checkOpts)) {
+    return { ...scored, pass: true };
   }
-  return { ...next, pass: false };
+  return { ...scored, pass: false };
 }
 
 export interface HonestPost133LookupDeps {
@@ -3337,6 +3399,22 @@ export function computeFrgEvidence(input: ComputeFrgInput): FrgEvidence {
   );
   // Claim pass:true only when structure is eligible and we will attach attestation.
   const pass = structuralPass && canSign;
+
+  integrity = {
+    ...integrity,
+    score_receipt: computeFrgScoreReceipt({
+      pass,
+      version,
+      run_id: runId,
+      loop_run_id: loopRunId,
+      pack_id: packId,
+      score_source: input.score_source,
+      work_list: input.work_list,
+      scoreboard_fingerprint: integrity.scoreboard_fingerprint,
+      composition_fingerprint: integrity.composition_fingerprint,
+      pack_provenance_fingerprint: integrity.pack_provenance_fingerprint,
+    }),
+  };
 
   if (canSign) {
     integrity = signFrgIntegrity({

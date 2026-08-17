@@ -1824,6 +1824,7 @@ export async function generateDurableUnsignedFrg(
 
   // Honest-pass latest.json: persist pass:true only when the skip-frg
   // restore checker accepts a from-run candidate pack (HMAC not required).
+  // Provenance must already be on `scored`; persist does not stamp it.
   // A structural fail MAY be written with pass:false. Never flip fail to pass.
   const latestPath = path.join(
     ctx.repoDir,
@@ -1832,11 +1833,7 @@ export async function generateDurableUnsignedFrg(
     request.target_version,
     "latest.json",
   );
-  const latestEvidence = latestJsonForHonestPost133Persist(scored, {
-    scoreSource: "from-run",
-    usedObservationsFile: false,
-    workList: "factory-gate-pack",
-  });
+  const latestEvidence = latestJsonForHonestPost133Persist(scored);
   await mkdir(path.dirname(latestPath), { recursive: true, mode: 0o700 });
   await writeFile(latestPath, canonicalJson(latestEvidence), 0o600);
 
