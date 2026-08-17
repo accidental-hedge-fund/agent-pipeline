@@ -302,45 +302,109 @@ export function isVerifiedPipelineReviewOutput(body: string): boolean {
   const prefix = rawPrefix.endsWith("\n") ? rawPrefix.slice(0, -1) : rawPrefix;
   if (typeof artifact.bodyHash !== "string") return false;
   if (hashReviewBody(prefix) === artifact.bodyHash) return true;
-  // Already-posted reviews had coverage / self-review banners inserted after
-  // formatReviewComment hashed the unbannered body (#1095 recovery). Strip
-  // only those engine-owned lines and retry. A human objection in the prefix
-  // is not a banner line, so the hash still fails.
+  // Compatibility only: already-posted v1.39.1 (and earlier) comments had
+  // engine-owned banners inserted after formatReviewComment wrote bodyHash.
+  // New posts must verify on the exact prefix via finalizeReviewArtifactComment.
   const stripped = stripEngineOwnedReviewBanners(prefix);
   return stripped !== prefix && hashReviewBody(stripped) === artifact.bodyHash;
 }
 
-/** Engine-owned lines review-routing inserts after the heading, after hashing. */
-const ENGINE_REVIEW_BANNER_LINE =
-  /^(?:\*\*Reviewer coverage \(#694\):|\*\*Ensemble\*\* \(|> ⚠️ \*\*(?:Ensemble includes same-harness self-review|Same-harness self-review))/;
+// Complete formatter-produced line forms for the four engine-owned
+// review/delta banners (formatCoverageDisclosure, formatEnsembleIdentityLine,
+// ensembleSelfReviewBanner, selfReviewBanner). Each recognizer is end-anchored
+// and uses a closed outcome/merge/reason/agent grammar. A production prefix
+// with appended human text is not a banner (#1098 review-2 / D7).
+const BANNER_ID = String.raw`[A-Za-z0-9][A-Za-z0-9._+-]{0,63}`;
+const COVERAGE_OUTCOME =
+  "(?:complete|partial_quorum|same_lineage_fallback|quorum_unmet|no_usable_reviewers)";
+const COVERAGE_FAILED = String.raw` failed=\[(?:${BANNER_ID}(?::${BANNER_ID})?(?:,${BANNER_ID}(?::${BANNER_ID})?)*)\]`;
+const COVERAGE_REASON = `(?:${[
+  String.raw`usable=\d+/\d+ independent=\d+ required=\d+`,
+  String.raw`usable=\d+ < configured=\d+; independent=\d+ >= required=\d+(?:${COVERAGE_FAILED})?`,
+  String.raw`independence degraded \((?:self-review|lineage-collapse|self-review\+lineage-collapse)\): usable=\d+ independent=\d+ required=\d+ configured=\d+(?:${COVERAGE_FAILED})?`,
+  String.raw`independent=\d+ < required=\d+ \(usable=\d+/\d+\)(?:${COVERAGE_FAILED})?`,
+  String.raw`usable=\d+ < min_usable=\d+ \(configured=\d+, independent=\d+, required=\d+\)(?:${COVERAGE_FAILED})?`,
+].join("|")})`;
+const COVERAGE_BANNER_LINE = new RegExp(
+  String.raw`^\*\*Reviewer coverage \(#694\):\*\* configured=\d+ attempted=\d+ usable=\d+ independent=\d+ required=\d+ outcome=\`` +
+    `(?:` +
+    String.raw`(?:complete|partial_quorum|no_usable_reviewers)\`` +
+    String.raw`(?: \(${COVERAGE_REASON}\))?` +
+    `|` +
+    String.raw`(?:same_lineage_fallback|quorum_unmet)\`` +
+    String.raw`(?: — independence degraded or unmet)?` +
+    String.raw`(?: \(${COVERAGE_REASON}\))?` +
+    `)` +
+    `$`,
+);
+const ENSEMBLE_FAIL_CLASS = "(?:spawn_error|timeout|nonzero|unparseable|empty|rejected|\\?)";
+const ENSEMBLE_AGENT =
+  `(?:${BANNER_ID}|${BANNER_ID} \\(self-review of ${BANNER_ID}\\))` +
+  `(?: ${BANNER_ID}/${BANNER_ID})?` +
+  `(?: indep)?` +
+  `(?: \\[failed:${ENSEMBLE_FAIL_CLASS}\\])?`;
+const ENSEMBLE_IDENTITY_LINE = new RegExp(
+  String.raw`^\*\*Ensemble\*\* \(\d+/\d+ usable, merge=union_blocking` +
+    `(?: cov=\\d+/\\d+req outcome=${COVERAGE_OUTCOME})?` +
+    `\\): ${ENSEMBLE_AGENT}(?:, ${ENSEMBLE_AGENT})*$`,
+);
+const ENSEMBLE_SELF_PAIR = `\`${BANNER_ID}\`→\`${BANNER_ID}\``;
+const ENSEMBLE_SELF_REVIEW_LINE = new RegExp(
+  String.raw`^> ⚠️ \*\*Ensemble includes same-harness self-review \(#39 \/ #645 \/ #694\)\.\*\* ` +
+    `Agent\\(s\\) fell back to the implementer: ${ENSEMBLE_SELF_PAIR}(?:, ${ENSEMBLE_SELF_PAIR})*\\. ` +
+    `Self-review does not count as independent coverage when policy forbids it\\.$`,
+);
+const SELF_REVIEW_LINE = new RegExp(
+  String.raw`^> ⚠️ \*\*Same-harness self-review \(#39\)\.\*\* The cross-harness reviewer ` +
+    `\`${BANNER_ID}\` is not installed / not spawnable, so this review was ` +
+    `performed by the implementing harness \`${BANNER_ID}\` reviewing its own ` +
+    `work\\. A same-harness review is weaker than an independent cross-harness review — ` +
+    `weigh it accordingly\\.$`,
+);
+
+function isEngineOwnedReviewBannerLine(line: string): boolean {
+  return (
+    COVERAGE_BANNER_LINE.test(line) ||
+    ENSEMBLE_IDENTITY_LINE.test(line) ||
+    ENSEMBLE_SELF_REVIEW_LINE.test(line) ||
+    SELF_REVIEW_LINE.test(line)
+  );
+}
 
 /**
- * Remove coverage / ensemble / self-review banners that sit between the
- * review heading and `**Reviewer**:`. Used only to verify already-posted
- * comments whose bodyHash predates the banner insert.
+ * Remove only documented engine-owned banner lines that sit between the
+ * review/delta heading and `**Reviewer**:`. Compatibility for already-posted
+ * comments whose bodyHash predates the banner insert. A human line in that
+ * window — including markdown that only resembles a banner — is not stripped.
  */
 export function stripEngineOwnedReviewBanners(prefix: string): string {
   const lines = prefix.split("\n");
   if (lines.length < 2) return prefix;
-  let i = 1;
-  let removed = false;
-  while (i < lines.length) {
-    const line = lines[i]!;
-    if (line === "" || ENGINE_REVIEW_BANNER_LINE.test(line)) {
-      if (ENGINE_REVIEW_BANNER_LINE.test(line)) removed = true;
-      i += 1;
+  const reviewerIdx = lines.findIndex((line, i) => i > 0 && line.startsWith("**Reviewer**:"));
+  const windowEnd = reviewerIdx === -1 ? lines.length : reviewerIdx;
+  const window = lines.slice(1, windowEnd);
+  if (window.length === 0) return prefix;
+  let removedBanner = false;
+  for (const line of window) {
+    if (line === "") continue;
+    if (isEngineOwnedReviewBannerLine(line)) {
+      removedBanner = true;
       continue;
     }
-    break;
+    // Human or unknown line in the banner window — do not strip.
+    return prefix;
   }
-  if (!removed) return prefix;
-  return [lines[0], ...lines.slice(i)].join("\n");
+  if (!removedBanner) return prefix;
+  return [lines[0], ...lines.slice(windowEnd)].join("\n");
 }
 
 /**
  * Recompute `bodyHash` on the last review-artifact after an engine-owned
- * post-render mutation (coverage / self-review banners inserted after
- * `formatReviewComment` hashed the unbannered body).
+ * post-render mutation. This is the only hash writer after a banner insert.
+ *
+ * Last `review-artifact` line only. Hash the exact prefix (strip one trailing
+ * `\n` when present). Preserve every other artifact field. No-op when any
+ * non-whitespace follows the artifact, or when the artifact is missing.
  *
  * Call only on freshly rendered engine output before post. This is not a
  * verification fallback: a later human edit of a posted body must still fail
@@ -359,6 +423,26 @@ export function rebindReviewArtifactBodyHash(body: string): string {
   artifact.bodyHash = nextHash;
   const suffix = body.slice(lastMatch.index + lastMatch[0].length);
   return `${prefix}\n${encodeReviewArtifact(artifact)}${suffix}`;
+}
+
+/**
+ * Shared review/delta post finalizer (#1098). Insert engine-owned banner
+ * lines after the first newline, then rebind `bodyHash` as the last mutation.
+ *
+ * Assembly matches the previous call-site copy: `heading\\n\\n` + banners
+ * joined by `\\n\\n` + remainder (including that remainder's leading newline).
+ * Empty banners skip insert and still rebind (no-op when the hash already
+ * matches). Review-1 / review-2 and both pre-merge delta posts must call this
+ * and must not assemble+post a bannered body on their own.
+ */
+export function finalizeReviewArtifactComment(body: string, banners: readonly string[]): string {
+  const bannerBlock = banners.filter((line) => line.length > 0).join("\n\n");
+  if (bannerBlock === "") return rebindReviewArtifactBodyHash(body);
+  const nl = body.indexOf("\n");
+  const assembled = nl >= 0
+    ? `${body.slice(0, nl)}\n\n${bannerBlock}${body.slice(nl)}`
+    : `${body}\n\n${bannerBlock}`;
+  return rebindReviewArtifactBodyHash(assembled);
 }
 
 /** Return the child pipeline run that produced a verified review comment.

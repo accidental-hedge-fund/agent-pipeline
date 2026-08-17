@@ -16,8 +16,13 @@ import { classifyComment } from "../scripts/gh.ts";
 import { buildTrustedOverrideComments, scopedOverrideComment } from "../scripts/review-policy.ts";
 import { formatDeltaReviewComment, formatReviewComment } from "../scripts/stages/review-rendering.ts";
 import {
+  encodeReviewArtifact,
+  finalizeReviewArtifactComment,
+  hashReviewBody,
+  isVerifiedPipelineOutput,
   isVerifiedPipelineReviewOutput,
   rebindReviewArtifactBodyHash,
+  type ReviewArtifact,
 } from "../scripts/stages/review-parsing.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
@@ -733,7 +738,7 @@ test("findUnacknowledgedComments: coverage-banner insert then rebind does not ga
   );
   assert.equal(isVerifiedPipelineReviewOutput(rendered), true);
   const nl = rendered.indexOf("\n");
-  const banner = "**Reviewer coverage (#694):** configured=1 attempted=1 usable=1 independent=1 required=0 outcome=`complete`";
+  const banner = "**Reviewer coverage (#694):** configured=1 attempted=1 usable=1 independent=1 required=0 outcome=`complete` (usable=1/1 independent=1 required=0)";
   const withBanner = `${rendered.slice(0, nl)}\n\n${banner}${rendered.slice(nl)}`;
   assert.equal(
     isVerifiedPipelineReviewOutput(withBanner),
@@ -749,6 +754,136 @@ test("findUnacknowledgedComments: coverage-banner insert then rebind does not ga
   const trusted = [comments[1]];
   const unacked = findUnacknowledgedComments(comments, trusted);
   assert.equal(unacked.length, 0, "bannered review-2 verdict must not count as unacknowledged human input");
+});
+
+const COVERAGE_BANNER_1098 =
+  "**Reviewer coverage (#694):** configured=1 attempted=1 usable=1 independent=1 required=0 outcome=`complete` (usable=1/1 independent=1 required=0)";
+
+test("findUnacknowledgedComments: finalized review-2 with instead is not unacknowledged (#1098)", () => {
+  const rendered = formatReviewComment(
+    undefined as unknown as PipelineConfig,
+    {
+      verdict: "needs-attention",
+      summary: "No-ship.",
+      findings: [{
+        severity: "high",
+        title: "current block can merge on R2D flicker",
+        body: "Last terminal remains loop_item_blocked.",
+        confidence: 0.97,
+        recommendation: "Preserve current terminal state instead of treating all item-block fields as historical.",
+      }],
+      next_steps: ["Fix the classifier."],
+      commitSha: "2d95cc8acb51125e57e4d1bab7be2afe6e267b2e",
+    },
+    2,
+    "codex",
+    new Set(["137339b7"]),
+  );
+  const posted = finalizeReviewArtifactComment(rendered, [COVERAGE_BANNER_1098]);
+  assert.equal(isVerifiedPipelineReviewOutput(posted), true);
+  assert.equal(isVerifiedPipelineOutput(posted), true);
+  const comments = [
+    makeComment("operator", "## Revised Implementation Plan\n\nDo X.", ts(0)),
+    makeComment("pipeline-actor", posted, ts(1)),
+  ];
+  const unacked = findUnacknowledgedComments(comments, [comments[1]]);
+  assert.equal(unacked.length, 0, "verified bannered review-2 with \\binstead\\b must not count");
+});
+
+test("findUnacknowledgedComments: free-form human comment after revised plan still counts (#1098)", () => {
+  const comments = [
+    makeComment("operator", "## Revised Implementation Plan\n\nDo X.", ts(0)),
+    makeComment("alice", "Please do not merge this — do Y instead.", ts(1)),
+  ];
+  const unacked = findUnacknowledgedComments(comments);
+  assert.equal(unacked.length, 1);
+  assert.equal(unacked[0].author, "alice");
+});
+
+test("findUnacknowledgedComments: human objection in review prefix still counts (#1098)", () => {
+  const rendered = formatReviewComment(
+    undefined as unknown as PipelineConfig,
+    {
+      verdict: "needs-attention",
+      summary: "No-ship.",
+      findings: [{
+        severity: "high",
+        title: "finding",
+        body: "some finding body",
+        confidence: 0.97,
+        recommendation: "revert",
+      }],
+      next_steps: [],
+      commitSha: "2d95cc8acb51125e57e4d1bab7be2afe6e267b2e",
+    },
+    2,
+    "codex",
+    new Set(["137339b7"]),
+  );
+  const nl = rendered.indexOf("\n");
+  const tampered =
+    `${rendered.slice(0, nl)}\n\nDo not merge this — do X instead.${rendered.slice(nl)}`;
+  assert.equal(isVerifiedPipelineReviewOutput(tampered), false);
+  const comments = [
+    makeComment("operator", "## Revised Implementation Plan\n\nDo X.", ts(0)),
+    makeComment("pipeline-actor", tampered, ts(1)),
+  ];
+  const unacked = findUnacknowledgedComments(comments, [comments[1]]);
+  assert.equal(unacked.length, 1, "human objection in the review prefix must still count");
+});
+
+test("findUnacknowledgedComments: production banner prefix plus human suffix still counts (#1098)", () => {
+  const heading = "## Review 2 (Adversarial) — needs-attention";
+  const rest = "**Reviewer**: codex";
+  const cleanPrefix = `${heading}\n${rest}`;
+  const artifact: ReviewArtifact = {
+    round: 2,
+    reviewedSha: "aabbccdd11223344aabbccdd11223344aabbccdd",
+    diffHash: "0123456789abcdef",
+    blockingKeys: ["137339b7"],
+    review1Risk: null,
+    bodyHash: hashReviewBody(cleanPrefix),
+  };
+  const spoofs = [
+    `${COVERAGE_BANNER_1098} (do not merge; use X instead)`,
+    `**Ensemble** (1/1 usable, merge=union_blocking): Do not merge this instead`,
+    `> ⚠️ **Ensemble includes same-harness self-review (#39 / #645 / #694).** Do not merge this — do X instead.`,
+    `> ⚠️ **Same-harness self-review (#39).** Do not merge this — do X instead.`,
+  ];
+  for (const spoof of spoofs) {
+    const body = `${heading}\n\n${spoof}\n${rest}\n${encodeReviewArtifact(artifact)}`;
+    assert.equal(
+      isVerifiedPipelineReviewOutput(body),
+      false,
+      `spoofed banner must not verify: ${spoof}`,
+    );
+    const comments = [
+      makeComment("operator", "## Revised Implementation Plan\n\nDo X.", ts(0)),
+      makeComment("pipeline-actor", body, ts(1)),
+    ];
+    const unacked = findUnacknowledgedComments(comments, [comments[1]]);
+    assert.equal(
+      unacked.length,
+      1,
+      `trusted-actor stale artifact with banner-prefix + human suffix must stay unacknowledged: ${spoof}`,
+    );
+  }
+});
+
+test("findUnacknowledgedComments: unverified trusted-actor review-shaped body with instead still counts (#1098)", () => {
+  const body = [
+    "## Review 2 (Adversarial) — needs-attention",
+    "**Reviewer**: codex",
+    "",
+    "Please do not merge this — do X instead.",
+  ].join("\n");
+  assert.equal(isVerifiedPipelineOutput(body), false);
+  const comments = [
+    makeComment("operator", "## Revised Implementation Plan\n\nDo X.", ts(0)),
+    makeComment("pipeline-actor", body, ts(1)),
+  ];
+  const unacked = findUnacknowledgedComments(comments, [comments[1]]);
+  assert.equal(unacked.length, 1, "unverified review-shaped trusted body must still count");
 });
 
 test("findUnacknowledgedComments: human objection appended after a quoted genuine review verdict is still counted (#390 review 1)", () => {
