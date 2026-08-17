@@ -15,7 +15,7 @@ import {
   setBlocked,
   transition,
 } from "../gh.ts";
-import { buildNewHumanInputWarningComment, findUnacknowledgedComments } from "../issue-context-snapshot.ts";
+import { applyHumanAckGate } from "../issue-context-snapshot.ts";
 import {
   buildTrustedOverrideComments,
   extractNonReproducingDispositions,
@@ -219,6 +219,14 @@ export interface AdvanceFixDeps {
   ) => Promise<{ ok: boolean; reason?: string }>;
   /** On-disk worktree lookup (defaults to getOnDiskForIssue). */
   getOnDiskForIssue?: typeof getOnDiskForIssue;
+  /** Issue snapshot for the human-ack gate (#1099). Tests inject fakes. */
+  getIssueDetail?: typeof getIssueDetail;
+  /** Pipeline actor for the human-ack trusted set (#1099). Tests inject a login. */
+  getGhActor?: typeof getGhActor;
+  /** Label/blocker writes for the human-ack gate (#1099). Tests inject fakes. */
+  setBlocked?: typeof setBlocked;
+  /** Stage transition for ambiguous-trusted recover (#1099). Tests inject fakes. */
+  transition?: typeof transition;
   /**
    * Durable human-question handoff store (#647). Defaults to real fs deps.
    * Tests inject in-memory fakes so park creates handoffs without disk I/O.
@@ -542,26 +550,31 @@ export async function advanceFix(
     wt = { path: remat.worktree.path, slug: remat.worktree.slug };
   }
 
-  const detail = await getIssueDetail(cfg, issueNumber);
+  const getIssueDetailFn = deps.getIssueDetail ?? getIssueDetail;
+  const getGhActorFn = deps.getGhActor ?? getGhActor;
+  const postCommentFn = deps.postComment ?? postComment;
+  const setBlockedFn = deps.setBlocked ?? setBlocked;
+  const transitionFn = deps.transition ?? transition;
+  const detail = await getIssueDetailFn(cfg, issueNumber);
 
-  // Acknowledgement gate: block when human comments after the revised plan
-  // have not been acknowledged via re-plan or override (#318 review-2 finding 3).
-  // Only trusted-author scope-override comments may act as ack anchors (#318 fix c5825398).
-  const fixActor = await getGhActor();
+  // Acknowledgement gate (#318 / #1099): needs-human only for operator-scope-change.
+  // Ambiguous trusted notes recover in-engine (re-plan), never needs-human.
+  const fixActor = await getGhActorFn();
   const trustedForAck = buildTrustedOverrideComments(detail.comments, fixActor, cfg.trusted_override_actors);
-  const unacknowledged = findUnacknowledgedComments(detail.comments, trustedForAck);
-  if (unacknowledged.length > 0) {
-    console.log(`[pipeline] #${issueNumber}: ${unacknowledged.length} unacknowledged human comment(s) detected before ${stage} — blocking`);
-    // Deduplicate: only post the warning when no prior warning exists.
-    const warningExists = detail.comments.some(
-      (c) => c.body.trimStart().startsWith('## Pipeline: New human input detected'),
-    );
-    if (!warningExists) {
-      await postComment(cfg, issueNumber, buildNewHumanInputWarningComment(unacknowledged, stage));
-    }
-    await setBlocked(cfg, issueNumber, `${unacknowledged.length} unacknowledged human comment(s) after the latest plan — re-plan or post a scope override to proceed.`, stage, "needs-human");
-    return { advanced: false, status: "blocked", reason: "unacknowledged human input", blockerKind: "needs-human" };
-  }
+  const ackOutcome = await applyHumanAckGate({
+    cfg,
+    issueNumber,
+    stage,
+    comments: detail.comments,
+    trustedComments: trustedForAck,
+    dryRun: opts.dryRun,
+    deps: {
+      postComment: postCommentFn,
+      setBlocked: setBlockedFn,
+      transition: transitionFn,
+    },
+  });
+  if (ackOutcome) return ackOutcome;
 
   // #391: pre-filter the triggering review's blocking findings against LIVE
   // overrides and SHA-anchored non-reproducing dispositions, before the harness

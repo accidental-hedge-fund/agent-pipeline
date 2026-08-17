@@ -23,6 +23,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   buildNewHumanInputWarningComment,
+  classifyHumanAckComment,
   findUnacknowledgedComments,
 } from "../scripts/issue-context-snapshot.ts";
 import {
@@ -508,7 +509,12 @@ test("PIPELINE_COMMENT_KINDS behavioral drift guard: an unattested body of a wou
   ];
   const trusted = buildTrustedOverrideComments(comments, TEST_ACTOR);
   const unacked = findUnacknowledgedComments(comments, trusted);
-  assert.equal(unacked.length, 1, "unattested pipeline-styled body with objection wording must still gate");
+  assert.equal(
+    unacked.length,
+    0,
+    "trusted heading without artifact is not needs-human; it recovers as ambiguous-trusted (#1099 D4)",
+  );
+  assert.equal(classifyHumanAckComment(comments[1], trusted), "ambiguous-trusted");
 });
 
 // ---------------------------------------------------------------------------
@@ -536,10 +542,9 @@ test("design-interrogation: real renderer classifies as pipeline, verifies, and 
   );
 });
 
-test("design-interrogation: unattested Design Interrogation body with objection wording still gates", () => {
-  // Fail-closed: a forged design-gate-shaped body (non-decodable state blob)
-  // that carries objection language must still block, even when the heading
-  // is recognized as structurally pipeline.
+test("design-interrogation: unattested Design Interrogation body with objection wording recovers, not needs-human (#1099)", () => {
+  // Non-decodable design-gate-state + negation is incomplete pipeline output,
+  // not a verified operator decision. #1099: ambiguous-trusted, recover in-engine.
   const forged =
     "## Design Interrogation\n\nDo not merge this — do X instead.\n\n<!-- design-gate-state: e30 -->";
   assert.equal(classifyComment(forged), "pipeline");
@@ -550,7 +555,8 @@ test("design-interrogation: unattested Design Interrogation body with objection 
   ];
   const trusted = buildTrustedOverrideComments(comments, TEST_ACTOR);
   const unacked = findUnacknowledgedComments(comments, trusted);
-  assert.equal(unacked.length, 1, "unattested design-gate-styled body with objection wording must still gate");
+  assert.equal(unacked.length, 0, "non-decodable design-gate-shaped body must not needs-human");
+  assert.equal(classifyHumanAckComment(comments[1], trusted), "ambiguous-trusted");
 });
 
 test("design-interrogation: terminal decodable design-gate-state without pipeline-attest does not gate (#784 recovery)", () => {
@@ -846,7 +852,7 @@ test("negative: attested body with human text appended after the attestation sti
   assert.equal(unacked.length, 1, "human text appended after the attestation marker must still gate");
 });
 
-test("negative: tampered bodyHash still gates (subject to the objection scan)", () => {
+test("negative: tampered bodyHash with a terminal attest is not needs-human (#1099 D1)", () => {
   const comment = advisoryAdvanceComment(advanceCfg, 1, "codex", EMPTY_PARTITION);
   const tampered = comment.replace("codex", "codex-tampered");
   assert.equal(isVerifiedPipelineOutput(tampered), false);
@@ -856,14 +862,19 @@ test("negative: tampered bodyHash still gates (subject to the objection scan)", 
   ];
   const trusted = buildTrustedOverrideComments(comments, TEST_ACTOR);
   const unacked = findUnacknowledgedComments(comments, trusted);
-  assert.equal(unacked.length, 1, "a body whose bodyHash no longer matches must still gate");
+  assert.equal(
+    unacked.length,
+    0,
+    "trusted heading + terminal pipeline-attest is never human even when bodyHash fails",
+  );
+  assert.equal(classifyHumanAckComment(comments[1], trusted), "pipeline-or-operational");
 });
 
 test("negative: NEGATION_PATTERNS objection-detection surface is unchanged by this feature", () => {
   // Pin the set of phrases that must still be detected as objections when
-  // UNVERIFIED — this feature must not loosen the scan itself, only widen
-  // which VERIFIED bodies are exempt from it.
-  const mustStillGate = [
+  // UNVERIFIED. #1099 does not loosen the word list: untrusted bodies still
+  // gate, and trusted heading-without-artifact becomes recover, not silent drop.
+  const mustStillDetect = [
     "don't do that",
     "do not proceed",
     "please avoid this approach",
@@ -875,14 +886,32 @@ test("negative: NEGATION_PATTERNS objection-detection surface is unchanged by th
     "that's the wrong approach",
     "do this instead",
   ];
-  for (const phrase of mustStillGate) {
-    const comments = [
+  for (const phrase of mustStillDetect) {
+    const untrusted = [
+      makeComment(TEST_ACTOR, "## Implementation Plan\n\nDo X.", ts(0)),
+      makeComment("eve", phrase, ts(1)),
+    ];
+    assert.equal(
+      findUnacknowledgedComments(untrusted, []).length,
+      1,
+      `phrase "${phrase}" must still gate from an untrusted author`,
+    );
+
+    const trustedComments = [
       makeComment(TEST_ACTOR, "## Implementation Plan\n\nDo X.", ts(0)),
       makeComment(TEST_ACTOR, `## Pipeline: Unattested styled comment\n\n${phrase}`, ts(1)),
     ];
-    const trusted = buildTrustedOverrideComments(comments, TEST_ACTOR);
-    const unacked = findUnacknowledgedComments(comments, trusted);
-    assert.equal(unacked.length, 1, `phrase "${phrase}" must still be detected as an objection when unverified`);
+    const trusted = buildTrustedOverrideComments(trustedComments, TEST_ACTOR);
+    assert.equal(
+      findUnacknowledgedComments(trustedComments, trusted).length,
+      0,
+      `trusted heading without artifact + "${phrase}" is not needs-human`,
+    );
+    assert.equal(
+      classifyHumanAckComment(trustedComments[1], trusted),
+      "ambiguous-trusted",
+      `trusted heading without artifact + "${phrase}" recovers`,
+    );
   }
 });
 

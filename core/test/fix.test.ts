@@ -2,7 +2,7 @@
 // Tests enforceFixCommitGate directly so the full advanceFix call chain (GitHub
 // API, git, harness) does not need to be mocked.
 
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -34,6 +34,8 @@ import {
   parseHumanDecisionDeclarations,
   resolveFixCommitGateMode,
   syncWorktreeToDelegatedExecutorResult,
+  advanceFix,
+  type AdvanceFixDeps,
 } from "../scripts/stages/fix.ts";
 import type { HarnessResult } from "../scripts/harness.ts";
 
@@ -2318,3 +2320,83 @@ test("advanceFix source pin: retry-event/recovery recording is best-effort — a
   assert.ok(appendEventCall, "retry appendEvent call must be .catch()-wrapped (best-effort)");
   assert.ok(recordRecoveryCall, "retry recordRecovery call must be .catch()-wrapped (best-effort)");
 });
+
+// ---------------------------------------------------------------------------
+// #1099 — human-ack gate shares the classifier with review-routing
+// ---------------------------------------------------------------------------
+
+const ACK_CFG = {
+  repo: "acme/x",
+  harnesses: { implementer: "codex" },
+  trusted_override_actors: [],
+} as unknown as PipelineConfig;
+
+async function quietFix(t: TestContext, fn: () => Promise<void>): Promise<void> {
+  t.mock.method(console, "log", () => {});
+  t.mock.method(console, "warn", () => {});
+  await fn();
+}
+
+function makeAckFixDeps(comments: { author: string; body: string; createdAt: string }[]) {
+  const rec = {
+    comments: [] as string[],
+    blocked: [] as { reason: string; kind?: string }[],
+    transitions: [] as string[],
+  };
+  const deps: AdvanceFixDeps = {
+    getOnDiskForIssue: async () => ({ path: "/tmp/wt", slug: "ack-gate" }),
+    getIssueDetail: async () =>
+      ({
+        number: 1099,
+        type: "issue",
+        title: "t",
+        body: "b",
+        state: "open",
+        url: "https://example.test/1099",
+        labels: [],
+        comments,
+      }) as Awaited<ReturnType<NonNullable<AdvanceFixDeps["getIssueDetail"]>>>,
+    getGhActor: async () => "pipeline-bot",
+    postComment: async (_c, _n, body) => {
+      rec.comments.push(body);
+    },
+    setBlocked: async (_c, _n, reason, _s, kind) => {
+      rec.blocked.push({ reason, kind });
+    },
+    transition: async (_c, _n, _from, to) => {
+      rec.transitions.push(to);
+    },
+  };
+  return { deps, rec };
+}
+
+test("advanceFix: please-also from a non-pipeline author setBlocked needs-human (#1099)", async (t) => {
+  const { deps, rec } = makeAckFixDeps([
+    { author: "pipeline-bot", body: "## Revised Implementation Plan\n\nDo X.", createdAt: "2026-01-01T00:00:00Z" },
+    { author: "alice", body: "please also change X", createdAt: "2026-01-02T00:00:00Z" },
+  ]);
+  let outcome: Awaited<ReturnType<typeof advanceFix>> | undefined;
+  await quietFix(t, async () => {
+    outcome = await advanceFix(ACK_CFG, 1099, 1, {}, deps);
+  });
+  assert.equal(outcome?.advanced, false);
+  assert.equal(outcome && "blockerKind" in outcome ? outcome.blockerKind : undefined, "needs-human");
+  assert.equal(rec.blocked[0]?.kind, "needs-human");
+  assert.ok(rec.comments.some((c) => c.startsWith("## Pipeline: New human input detected")));
+});
+
+test("advanceFix: ambiguous trusted unmarked note recovers to planning, not needs-human (#1099)", async (t) => {
+  const { deps, rec } = makeAckFixDeps([
+    { author: "pipeline-bot", body: "## Revised Implementation Plan\n\nDo X.", createdAt: "2026-01-01T00:00:00Z" },
+    { author: "pipeline-bot", body: "this won't work in prod", createdAt: "2026-01-02T00:00:00Z" },
+  ]);
+  let outcome: Awaited<ReturnType<typeof advanceFix>> | undefined;
+  await quietFix(t, async () => {
+    outcome = await advanceFix(ACK_CFG, 1099, 1, {}, deps);
+  });
+  assert.equal(outcome?.advanced, true);
+  assert.equal(outcome && "to" in outcome ? outcome.to : undefined, "planning");
+  assert.deepEqual(rec.transitions, ["planning"]);
+  assert.equal(rec.blocked.some((b) => b.kind === "needs-human"), false);
+});
+

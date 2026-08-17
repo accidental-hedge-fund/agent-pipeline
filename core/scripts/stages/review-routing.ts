@@ -15,9 +15,8 @@ import {
   transition,
 } from "../gh.ts";
 import {
-  buildNewHumanInputWarningComment,
+  applyHumanAckGate,
   extractSnapshotComment,
-  findUnacknowledgedComments,
 } from "../issue-context-snapshot.ts";
 import * as path from "node:path";
 import { selfReviewBanner, type ReviewerInvocation } from "../self-review.ts";
@@ -421,32 +420,24 @@ export async function advanceReview(
     opts = { ...opts, contextSnapshot: stripped };
   }
 
-  // Acknowledgement gate: block when human comments after the revised plan
-  // have not been acknowledged via re-plan or override (#318 review-2 finding 3).
-  // Only trusted-author scope-override comments may act as ack anchors (#318 fix c5825398).
+  // Acknowledgement gate (#318 / #1099): needs-human only for operator-scope-change.
+  // Ambiguous trusted notes recover in-engine (re-plan), never needs-human.
   const trustedForAck = buildTrustedOverrideComments(detail.comments, actor, cfg.trusted_override_actors);
-  const unacknowledged = findUnacknowledgedComments(detail.comments, trustedForAck);
-  if (unacknowledged.length > 0) {
-    console.log(`[pipeline] #${issueNumber}: ${unacknowledged.length} unacknowledged human comment(s) detected before ${stage} — blocking`);
-    // Dry-run: log only — no GitHub writes (#318 fix 937b9d25).
-    if (opts.dryRun) {
-      console.log(`[pipeline] #${issueNumber}: [dry-run] would post warning and set blocked for ${unacknowledged.length} unacknowledged human comment(s)`);
-      return { advanced: false, status: "blocked", reason: "unacknowledged human input" };
-    }
-    // Deduplicate: only post the warning when no prior warning exists.
-    const warningExists = detail.comments.some(
-      (c) => c.body.trimStart().startsWith('## Pipeline: New human input detected'),
-    );
-    if (!warningExists) {
-      await postCommentFn(
-        cfg,
-        issueNumber,
-        buildNewHumanInputWarningComment(unacknowledged, stage, cfgFooter(cfg)),
-      );
-    }
-    await setBlockedFn(cfg, issueNumber, `${unacknowledged.length} unacknowledged human comment(s) after the latest plan — re-plan or post a scope override to proceed.`, stage, "needs-human");
-    return { advanced: false, status: "blocked", reason: "unacknowledged human input" };
-  }
+  const ackOutcome = await applyHumanAckGate({
+    cfg,
+    issueNumber,
+    stage,
+    comments: detail.comments,
+    trustedComments: trustedForAck,
+    dryRun: opts.dryRun,
+    warningFooter: cfgFooter(cfg),
+    deps: {
+      postComment: postCommentFn,
+      setBlocked: setBlockedFn,
+      transition: transitionFn,
+    },
+  });
+  if (ackOutcome) return ackOutcome;
 
   // Diff-hash cache check (#228).
   const diffHash = computeDiffHash(diff);

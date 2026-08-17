@@ -789,12 +789,39 @@ test("live-ship probe (#1062): detach path uses probe only; not bare playbook.pi
   assert.match(body, /no paste detector/i);
 });
 
+/** /proc cmdline scan — used so failed assertions still reap sleep stubs. */
+function pidsWithCmdlineNeedle(needle: string): number[] {
+  const pids: number[] = [];
+  for (const ent of fs.readdirSync("/proc")) {
+    if (!/^\d+$/.test(ent)) continue;
+    try {
+      const cmd = fs.readFileSync(`/proc/${ent}/cmdline`).toString("utf8");
+      if (cmd.includes(needle)) pids.push(Number(ent));
+    } catch {
+      /* gone */
+    }
+  }
+  return pids;
+}
+
+function killPids(pids: number[]): void {
+  for (const p of pids) {
+    try {
+      process.kill(p, "SIGTERM");
+    } catch {
+      /* already gone */
+    }
+  }
+}
+
 test("detach race (#1062 R2): concurrent Ship detaches exactly once", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-race-"));
   const stateRoot = path.join(dir, "state");
   const repo = path.join(dir, "repo");
   const fakePipeline = path.join(dir, "pipeline");
-  const childPids: number[] = [];
+  // live_ship_probe is host-global per milestone. A shared real version
+  // (v1.39.0) collides with leftover test stubs and any live ship on the host.
+  const version = `9.99.${process.pid}.${Date.now()}`;
   try {
     fs.mkdirSync(repo, { recursive: true });
     fs.writeFileSync(
@@ -811,7 +838,7 @@ test("detach race (#1062 R2): concurrent Ship detaches exactly once", async () =
       SHIP_NOTIFY: "0",
       PIPELINE_SUPERVISOR_STATE: stateRoot,
     };
-    const args = [tugboat, "--milestone", "v1.39.0", "--detach"];
+    const args = [tugboat, "--milestone", `v${version}`, "--detach"];
 
     const runOne = () =>
       new Promise<{ status: number | null; out: string }>((resolve) => {
@@ -849,31 +876,13 @@ test("detach race (#1062 R2): concurrent Ship detaches exactly once", async () =
     );
     assert.equal(a.status, 0, `first detach status: ${a.status} out=${a.out}`);
     assert.equal(b.status, 0, `second detach status: ${b.status} out=${b.out}`);
-
-    // Collect any long-lived ship children under state for cleanup via /proc scan.
-    // Kill train stubs (pipeline sleep) that match our fake path.
-    for (const ent of fs.readdirSync("/proc")) {
-      if (!/^\d+$/.test(ent)) continue;
-      try {
-        const cmd = fs.readFileSync(`/proc/${ent}/cmdline`).toString("utf8");
-        if (cmd.includes(fakePipeline) || cmd.includes(dir)) {
-          childPids.push(Number(ent));
-        }
-      } catch {
-        /* gone */
-      }
-    }
   } finally {
-    for (const p of childPids) {
-      try {
-        process.kill(p, "SIGTERM");
-      } catch {
-        /* already gone */
-      }
-    }
-    // Also try process group of any leftover ship under state root.
+    // Reap before rmSync. Collecting only after asserts leaked sleep 3600
+    // stubs whose argv still matched train --merge for the old milestone.
+    killPids(pidsWithCmdlineNeedle(dir));
+    killPids(pidsWithCmdlineNeedle(`--milestone v${version}`));
     try {
-      const shipDir = path.join(stateRoot, "ship-v1.39.0");
+      const shipDir = path.join(stateRoot, `ship-v${version}`);
       const pidFile = path.join(shipDir, "playbook.pid");
       if (fs.existsSync(pidFile)) {
         const p = Number(fs.readFileSync(pidFile, "utf8").trim());

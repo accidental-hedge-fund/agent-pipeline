@@ -279,6 +279,30 @@
       "emitter": "setBlocked"
     },
     {
+      "site_id": "issue-context-snapshot:needs-human#0",
+      "module": "scripts/issue-context-snapshot.ts",
+      "line": 542,
+      "occurrence": 0,
+      "match": "${unacknowledged.length} unacknowledged human comment(s) after the latest plan —",
+      "disposition": "deliberately-fail-closed",
+      "blocker_kind": "needs-human",
+      "canonical_reason": "human-context-required",
+      "notes": "human-ack gate: operator-scope-change only (#1099)",
+      "emitter": "setBlocked"
+    },
+    {
+      "site_id": "issue-context-snapshot:harness-failure#0",
+      "module": "scripts/issue-context-snapshot.ts",
+      "line": 571,
+      "occurrence": 0,
+      "match": "Ambiguous trusted comments require in-engine re-plan; transition to planning fai",
+      "disposition": "deliberately-fail-closed",
+      "blocker_kind": "harness-failure",
+      "canonical_reason": "workflow-engine-defect",
+      "notes": "human-ack recover fallback when in-engine re-plan cannot start (#1099 D5)",
+      "emitter": "setBlocked"
+    },
+    {
       "site_id": "stages.fix:worktree-capacity#0",
       "module": "scripts/stages/fix.ts",
       "line": 531,
@@ -317,20 +341,8 @@
     {
       "site_id": "stages.fix:needs-human#0",
       "module": "scripts/stages/fix.ts",
-      "line": 561,
-      "occurrence": 0,
-      "match": "${unacknowledged.length} unacknowledged human comment(s) after the latest plan —",
-      "disposition": "deliberately-fail-closed",
-      "blocker_kind": "needs-human",
-      "canonical_reason": "human-context-required",
-      "notes": "human input/context required",
-      "emitter": "setBlocked"
-    },
-    {
-      "site_id": "stages.fix:needs-human#1",
-      "module": "scripts/stages/fix.ts",
       "line": 844,
-      "occurrence": 1,
+      "occurrence": 0,
       "match": "Failed to reattach detached worktree to pipeline branch: ${stderr}",
       "disposition": "deliberately-fail-closed",
       "blocker_kind": "needs-human",
@@ -375,10 +387,10 @@
       "emitter": "setBlocked"
     },
     {
-      "site_id": "stages.fix:needs-human#2",
+      "site_id": "stages.fix:needs-human#1",
       "module": "scripts/stages/fix.ts",
       "line": 1081,
-      "occurrence": 2,
+      "occurrence": 1,
       "match": "needs-human",
       "disposition": "deliberately-fail-closed",
       "blocker_kind": "needs-human",
@@ -399,10 +411,10 @@
       "emitter": "setBlocked"
     },
     {
-      "site_id": "stages.fix:needs-human#3",
+      "site_id": "stages.fix:needs-human#2",
       "module": "scripts/stages/fix.ts",
       "line": 1215,
-      "occurrence": 3,
+      "occurrence": 2,
       "match": "needs-human",
       "disposition": "deliberately-fail-closed",
       "blocker_kind": "needs-human",
@@ -447,10 +459,10 @@
       "emitter": "setBlocked"
     },
     {
-      "site_id": "stages.fix:needs-human#4",
+      "site_id": "stages.fix:needs-human#3",
       "module": "scripts/stages/fix.ts",
       "line": 1322,
-      "occurrence": 4,
+      "occurrence": 3,
       "match": "needs-human",
       "disposition": "deliberately-fail-closed",
       "blocker_kind": "needs-human",
@@ -471,10 +483,10 @@
       "emitter": "setBlocked"
     },
     {
-      "site_id": "stages.fix:needs-human#5",
+      "site_id": "stages.fix:needs-human#4",
       "module": "scripts/stages/fix.ts",
       "line": 1343,
-      "occurrence": 5,
+      "occurrence": 4,
       "match": "needs-human",
       "disposition": "deliberately-fail-closed",
       "blocker_kind": "needs-human",
@@ -483,10 +495,10 @@
       "emitter": "setBlocked"
     },
     {
-      "site_id": "stages.fix:needs-human#6",
+      "site_id": "stages.fix:needs-human#5",
       "module": "scripts/stages/fix.ts",
       "line": 1369,
-      "occurrence": 6,
+      "occurrence": 5,
       "match": "needs-human",
       "disposition": "deliberately-fail-closed",
       "blocker_kind": "needs-human",
@@ -1380,18 +1392,6 @@
       "blocker_kind": "harness-failure",
       "canonical_reason": "harness-contract",
       "notes": "harness/process failure eligible for bounded classify+retry class",
-      "emitter": "setBlocked"
-    },
-    {
-      "site_id": "stages.review-routing:needs-human#0",
-      "module": "scripts/stages/review-routing.ts",
-      "line": 430,
-      "occurrence": 0,
-      "match": "${unacknowledged.length} unacknowledged human comment(s) after the latest plan —",
-      "disposition": "deliberately-fail-closed",
-      "blocker_kind": "needs-human",
-      "canonical_reason": "human-context-required",
-      "notes": "human input/context required",
       "emitter": "setBlocked"
     },
     {
