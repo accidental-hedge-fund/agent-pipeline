@@ -92,9 +92,17 @@ Operator-facing supervisor documentation and the Hermes skill map SHALL document
 
 ### Requirement: Tugboat SHALL run one FRG pack phase after train and before release
 
-After train is complete or resumed complete, and when the operator escape is not active, Tugboat SHALL run exactly one Factory Reliability Gate (FRG) pack phase before `pipeline release`. That phase SHALL compose `pipeline factory-release prepare --request <absolute-request.json> --json` (or the documented #1037 CLI sequence) with a secret-free request bound to the ship version and candidate. Tugboat SHALL re-invoke the unchanged request until pack-done or pack-fail. Tugboat SHALL NOT start a second unbound pack, SHALL NOT implement a second pack runner, and SHALL NOT sign attestation, merge, tag, promote, or install in this phase.
+After train is complete or resumed complete, and when the operator escape is not active, Tugboat SHALL run exactly one Factory Reliability Gate (FRG) pack phase before `pipeline release`. That phase SHALL compose `pipeline factory-release prepare --request <absolute-request.json> --json` (or the documented #1037 CLI sequence) with a secret-free request bound to the ship version and candidate. The request `integrated_candidate.git_sha` SHALL be the current remote tip of the configured integration `base_branch` after train (via `origin/<base>` `ls-remote` or fetch, or injected `TUGBOAT_CANDIDATE_SHA`). It SHALL NOT default to the local checkout `HEAD`, which remains at the pre-train SHA when train merges through GitHub. Tugboat SHALL re-invoke the unchanged request until pack-done or pack-fail. Tugboat SHALL NOT start a second unbound pack, SHALL NOT implement a second pack runner, and SHALL NOT sign attestation, merge, tag, promote, or install in this phase.
 
 Pack-done SHALL mean prepare JSON `status` is `awaiting_frg_attestation`, or `.agent-pipeline/frg/<X.Y.Z>/latest.json` has `pass: true`, or prepare already returned `status: "complete"` with an open release PR for that version. Pack-fail SHALL mean a failed or missing FRG status, `latest.json` `pass: false` after a terminal score, or wait-budget exhaustion while status stays `in_progress`. On pack-fail Tugboat SHALL fail the frg-pack phase and SHALL NOT invoke `pipeline release` for that version.
+
+#### Scenario: Request binds the post-train integration tip
+
+- **WHEN** train completes by merging through GitHub
+- **AND** the local checkout `HEAD` is still the pre-train SHA
+- **AND** the operator escape is not active
+- **THEN** the factory-release prepare request SHALL set `integrated_candidate.git_sha` to the current remote tip of the configured base branch
+- **AND** it SHALL NOT bind `integrated_candidate.git_sha` to the pre-train local `HEAD`
 
 #### Scenario: Successful pack precedes release
 

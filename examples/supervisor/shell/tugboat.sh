@@ -170,6 +170,9 @@ resolve_skip_frg() {
 # Secret-free factory_release_prepare_request bound to ship coordinates.
 # dest=$1 version=$2 repo_dir=$3. Tests inject TUGBOAT_CANDIDATE_SHA,
 # TUGBOAT_REPOSITORY, TUGBOAT_BASE_BRANCH, TUGBOAT_FRG_MANIFEST_PATH.
+# Unset candidate SHA: resolve base_branch first, then the current
+# origin/<base> remote tip (ls-remote, else fetch). Never local HEAD —
+# train --merge via GitHub leaves the local checkout at the pre-train SHA.
 # Inlined so ~/.local/bin/tugboat stays self-contained. Keep in sync with
 # examples/supervisor/shell/frg-pack-helpers.sh (playbook source).
 write_factory_release_request() {
@@ -202,15 +205,6 @@ except Exception as exc:
     raise SystemExit(1)
 pack_id = pack.get("pack_id") or "factory-gate-v1"
 
-git_sha = os.environ.get("TUGBOAT_CANDIDATE_SHA", "").strip().lower()
-if not git_sha:
-    git_sha = subprocess.check_output(
-        ["git", "-C", repo, "rev-parse", "HEAD"], text=True
-    ).strip().lower()
-if not re.fullmatch(r"[0-9a-f]{40,64}", git_sha):
-    sys.stderr.write("FAIL: integrated_candidate.git_sha is not a git object id\n")
-    raise SystemExit(1)
-
 repo_id = os.environ.get("TUGBOAT_REPOSITORY", "").strip().lower()
 if not repo_id:
     try:
@@ -241,6 +235,37 @@ if not base:
         base = "main"
 if not base or re.search(r"\s", base):
     sys.stderr.write("FAIL: base_branch is empty or contains whitespace\n")
+    raise SystemExit(1)
+
+# Bind the live origin/<base> tip after train. Local HEAD stays at the
+# pre-train SHA when train merges through GitHub.
+git_sha = os.environ.get("TUGBOAT_CANDIDATE_SHA", "").strip().lower()
+if not git_sha:
+    try:
+        out = subprocess.check_output(
+            ["git", "-C", repo, "ls-remote", "--exit-code", "origin", f"refs/heads/{base}"],
+            text=True,
+        ).strip()
+        git_sha = (out.split()[0] if out else "").strip().lower()
+    except Exception:
+        git_sha = ""
+    if not git_sha:
+        try:
+            subprocess.check_output(
+                ["git", "-C", repo, "fetch", "--quiet", "origin", f"{base}:refs/remotes/origin/{base}"],
+                text=True,
+            )
+            git_sha = subprocess.check_output(
+                ["git", "-C", repo, "rev-parse", "--verify", f"refs/remotes/origin/{base}"],
+                text=True,
+            ).strip().lower()
+        except Exception:
+            git_sha = ""
+if not re.fullmatch(r"[0-9a-f]{40,64}", git_sha):
+    sys.stderr.write(
+        "FAIL: integrated_candidate.git_sha is not a git object id "
+        f"(need TUGBOAT_CANDIDATE_SHA or origin/{base} tip after train)\n"
+    )
     raise SystemExit(1)
 
 req = {

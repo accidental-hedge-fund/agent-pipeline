@@ -18,6 +18,7 @@
 - [x] 3.2 Composer or unit test: escape with a non-empty reason omits pack and still passes `--skip-frg` to release and promote. Skip without reason does not skip
 - [x] 3.3 Flip doctor / playbook source assertions that currently require default `--skip-frg` (`core/test/doctor.test.ts`, `core/test/engine-promote.test.ts`, and any sibling)
 - [x] 3.4 Tests inject I/O or inspect source/fixtures. They start no live pack, network, git, or subprocess ship
+- [x] 3.5 Regression: `write_factory_release_request` binds `origin/<base>` remote tip (injected fake git), not local `HEAD`, and fail-closes when the remote tip is missing
 
 ## 4. Docs and Hermes skill
 

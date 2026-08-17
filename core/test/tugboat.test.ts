@@ -1125,6 +1125,162 @@ test("write_factory_release_request: secret-free identity only (injected I/O)", 
   }
 });
 
+function writeFakeGit(binDir: string, body: string): void {
+  fs.mkdirSync(binDir, { recursive: true });
+  const git = path.join(binDir, "git");
+  fs.writeFileSync(git, `#!/usr/bin/env bash\nset -euo pipefail\n${body}\n`);
+  fs.chmodSync(git, 0o755);
+}
+
+function envWithoutCandidate(extra: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env = { ...process.env, ...extra };
+  delete env.TUGBOAT_CANDIDATE_SHA;
+  return env;
+}
+
+test("write_factory_release_request: binds origin/<base> tip, not local HEAD", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-req-tip-"));
+  try {
+    const localHead = "a".repeat(40);
+    const remoteTip = "b".repeat(40);
+    const binDir = path.join(dir, "bin");
+    const calls = path.join(dir, "git-calls.txt");
+    writeFakeGit(
+      binDir,
+      [
+        `echo "$*" >> ${JSON.stringify(calls)}`,
+        'args=("$@")',
+        'if [[ "${args[0]:-}" == "-C" ]]; then args=("${args[@]:2}"); fi',
+        'cmd="${args[0]:-}"',
+        "case \"$cmd\" in",
+        "  ls-remote)",
+        `    printf '%s\\t%s\\n' ${JSON.stringify(remoteTip)} refs/heads/main`,
+        "    exit 0",
+        "    ;;",
+        "  fetch) exit 0 ;;",
+        "  rev-parse)",
+        '    joined="${args[*]}"',
+        '    if [[ "$joined" == *origin/main* || "$joined" == *refs/remotes/origin/main* ]]; then',
+        `      echo ${JSON.stringify(remoteTip)}`,
+        "      exit 0",
+        "    fi",
+        '    if [[ "$joined" == *HEAD* ]]; then',
+        `      echo ${JSON.stringify(localHead)}`,
+        "      exit 0",
+        "    fi",
+        "    ;;",
+        "esac",
+        'echo "unexpected git ${args[*]}" >&2',
+        "exit 1",
+      ].join("\n"),
+    );
+    const manifest = path.join(dir, "manifest.json");
+    fs.writeFileSync(
+      manifest,
+      JSON.stringify({ schema_version: 1, pack_id: "factory-gate-v1" }),
+    );
+    const dest = path.join(dir, "req.json");
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        `. ${JSON.stringify(frgHelpers)}`,
+        `write_factory_release_request ${JSON.stringify(dest)} "1.39.0" ${JSON.stringify(dir)}`,
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    const r = spawnSync("bash", [runner], {
+      encoding: "utf8",
+      env: envWithoutCandidate({
+        PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
+        TUGBOAT_REPOSITORY: "accidental-hedge-fund/agent-pipeline",
+        TUGBOAT_BASE_BRANCH: "main",
+        TUGBOAT_FRG_MANIFEST_PATH: manifest,
+      }),
+    });
+    assert.equal(r.status, 0, `writer exited ${r.status}: ${r.stderr}`);
+    const req = JSON.parse(fs.readFileSync(dest, "utf8")) as {
+      integrated_candidate: { git_sha: string };
+    };
+    assert.equal(req.integrated_candidate.git_sha, remoteTip);
+    assert.notEqual(req.integrated_candidate.git_sha, localHead);
+    const helperSrc = fs.readFileSync(tugboat, "utf8");
+    assert.match(helperSrc, /ls-remote/);
+    assert.doesNotMatch(helperSrc, /rev-parse", "HEAD"/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("write_factory_release_request: missing remote tip fails closed (does not use HEAD)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-req-no-tip-"));
+  try {
+    const localHead = "c".repeat(40);
+    const binDir = path.join(dir, "bin");
+    writeFakeGit(
+      binDir,
+      [
+        'args=("$@")',
+        'if [[ "${args[0]:-}" == "-C" ]]; then args=("${args[@]:2}"); fi',
+        'cmd="${args[0]:-}"',
+        "case \"$cmd\" in",
+        "  ls-remote) exit 2 ;;",
+        "  fetch) exit 1 ;;",
+        "  rev-parse)",
+        '    joined="${args[*]}"',
+        '    if [[ "$joined" == *HEAD* ]]; then',
+        `      echo ${JSON.stringify(localHead)}`,
+        "      exit 0",
+        "    fi",
+        "    exit 1",
+        "    ;;",
+        "esac",
+        "exit 1",
+      ].join("\n"),
+    );
+    const manifest = path.join(dir, "manifest.json");
+    fs.writeFileSync(
+      manifest,
+      JSON.stringify({ schema_version: 1, pack_id: "factory-gate-v1" }),
+    );
+    const dest = path.join(dir, "req.json");
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        `. ${JSON.stringify(frgHelpers)}`,
+        `write_factory_release_request ${JSON.stringify(dest)} "1.39.0" ${JSON.stringify(dir)}`,
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    const r = spawnSync("bash", [runner], {
+      encoding: "utf8",
+      env: envWithoutCandidate({
+        PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
+        TUGBOAT_REPOSITORY: "accidental-hedge-fund/agent-pipeline",
+        TUGBOAT_BASE_BRANCH: "main",
+        TUGBOAT_FRG_MANIFEST_PATH: manifest,
+      }),
+    });
+    assert.notEqual(r.status, 0, "missing remote tip must fail closed");
+    assert.match(`${r.stdout}\n${r.stderr}`, /origin\/main tip after train|git object id/);
+    if (fs.existsSync(dest)) {
+      const req = JSON.parse(fs.readFileSync(dest, "utf8")) as {
+        integrated_candidate?: { git_sha?: string };
+      };
+      assert.notEqual(req.integrated_candidate?.git_sha, localHead);
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("classify_frg_pack_tick: done / retry / fail without live pack", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-tick-"));
   try {
