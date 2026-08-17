@@ -12,6 +12,16 @@ import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import {
+  computeFrgEvidence,
+  FRG_PACK_MANIFEST,
+  FRG_UNIT_TEST_ATTESTATION_KEY,
+  frgRequiredCompositionOverrides,
+  frgRequiredObservationOverrides,
+  validateFrgEvidenceFileForTag,
+  writeFrgEvidence,
+  type FrgFsDeps,
+} from "../scripts/factory-reliability-gate.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const WORKFLOW_PATH = join(__dirname, "../../.github/workflows/auto-tag-release.yml");
@@ -417,19 +427,159 @@ exit 1
 });
 
 // ---------------------------------------------------------------------------
-// Thin ship: auto-tag must NOT hard-require FRG (#962 follow-up)
+// Auto-tag fail-closes on missing / failed FRG (#1040 restore of #757)
 // ---------------------------------------------------------------------------
 
-test("auto-tag-release workflow does not hard-gate tag create on FRG evidence", () => {
+function workflowMemFs(): FrgFsDeps & { files: Map<string, string> } {
+  const files = new Map<string, string>();
+  return {
+    files,
+    async readFile(p) {
+      const v = files.get(p);
+      if (v === undefined) {
+        const err = new Error(`ENOENT: ${p}`) as NodeJS.ErrnoException;
+        err.code = "ENOENT";
+        throw err;
+      }
+      return v;
+    },
+    async writeFile(p, data) {
+      files.set(p, data);
+    },
+    async mkdir() {},
+    async rename(from, to) {
+      const v = files.get(from);
+      if (v === undefined) throw new Error(`ENOENT rename ${from}`);
+      files.set(to, v);
+      files.delete(from);
+    },
+  };
+}
+
+test("auto-tag-release workflow hard-gates tag create on FRG evidence before tag push", () => {
   const workflowSrc = readFileSync(WORKFLOW_PATH, "utf-8");
+  const existsStep = workflowSrc.indexOf("- name: Check whether the tag already exists");
   const frgStep = workflowSrc.indexOf("- name: Verify Factory Reliability Gate evidence");
+  const notesStep = workflowSrc.indexOf("- name: Resolve release notes");
   const tagStep = workflowSrc.indexOf("- name: Create and push annotated tag");
-  assert.equal(frgStep, -1, "FRG verification step must be removed from auto-tag (thin ship)");
+  assert.notEqual(existsStep, -1, "expected existing-tag check");
+  assert.notEqual(frgStep, -1, "FRG verification step must exist before tag create/push");
+  assert.notEqual(notesStep, -1, "expected notes resolution step");
   assert.notEqual(tagStep, -1, "expected tag create/push step");
-  // Tag step must not depend on a frg_ok output
-  assert.equal(/steps\.frg\.outputs/.test(workflowSrc), false);
-  // Optional FRG tooling may still be mentioned in comments, but no validate-tag gate
+  assert.ok(frgStep > existsStep, "FRG verify must run after the existing-tag check");
+  assert.ok(frgStep < notesStep, "FRG verify must run before notes resolution");
+  assert.ok(frgStep < tagStep, "FRG verify must run before tag create/push");
+
+  const frgSlice = workflowSrc.slice(frgStep, notesStep);
+  assert.match(frgSlice, /--validate-tag/, "FRG step must invoke the shared --validate-tag CLI");
+  assert.match(
+    frgSlice,
+    /PIPELINE_FRG_ATTESTATION_KEY/,
+    "FRG step must require PIPELINE_FRG_ATTESTATION_KEY for HMAC verification",
+  );
+  assert.match(
+    frgSlice,
+    /steps\.exists\.outputs\.exists == 'false'/,
+    "FRG step must run only when the version tag does not already exist",
+  );
+  assert.equal(
+    /optional|advisory/i.test(frgSlice),
+    false,
+    "FRG step must not call FRG optional or advisory",
+  );
+
   const tagSlice = workflowSrc.slice(tagStep, tagStep + 1500);
-  assert.equal(/--validate-tag/.test(tagSlice), false);
-  assert.equal(/PIPELINE_FRG_ATTESTATION_KEY/.test(tagSlice), false);
+  assert.equal(
+    /if:\s*always\(\)/.test(tagSlice),
+    false,
+    "tag create/push must not run after an FRG failure",
+  );
+  assert.equal(
+    workflowSrc.includes("FRG is optional/advisory"),
+    false,
+    "#962 inverted optional/advisory comment must not remain",
+  );
+});
+
+test("auto-tag FRG verify step script calls shared --validate-tag and does not tag", () => {
+  const script = extractStepScript("Verify Factory Reliability Gate evidence");
+  assert.match(script, /--validate-tag "\$\{version\}"/);
+  assert.match(script, /factory-reliability-gate\.ts/);
+  assert.match(script, /PIPELINE_FRG_ATTESTATION_KEY/);
+  assert.equal(/git tag/.test(script), false);
+  assert.equal(/git push/.test(script), false);
+  assert.equal(/optional|advisory/i.test(script), false);
+});
+
+test("missing latest.json fails closed and names path plus pack remediation", async () => {
+  const fs = workflowMemFs();
+  await assert.rejects(
+    () =>
+      validateFrgEvidenceFileForTag("/repo", "1.39.0", fs, {
+        attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
+      }),
+    (err: unknown) => {
+      const message = (err as Error).message;
+      assert.match(message, /\.agent-pipeline\/frg\/1\.39\.0\/latest\.json/);
+      assert.match(message, /factory-release prepare/);
+      assert.match(message, /Tugboat FRG pack/);
+      assert.match(message, /missing/);
+      assert.equal(/optional|advisory/i.test(message), false);
+      return true;
+    },
+  );
+});
+
+test("pass:false latest.json fails closed and does not allow tag proceed", async () => {
+  const fs = workflowMemFs();
+  const failEv = computeFrgEvidence({
+    version: "1.30.0",
+    run_id: "frg-auto-tag-fail",
+    loop_run_id: "loop",
+    pack_id: FRG_PACK_MANIFEST.pack_id,
+    items: [{ item_id: "1", state: "ready", ready_clean: true }],
+    scenario_overrides: frgRequiredObservationOverrides("pass"),
+    composition_overrides: frgRequiredCompositionOverrides("pass"),
+    attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
+  });
+  assert.equal(failEv.pass, false);
+  await writeFrgEvidence("/repo", failEv, fs);
+  await assert.rejects(
+    () =>
+      validateFrgEvidenceFileForTag("/repo", "1.30.0", fs, {
+        attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
+      }),
+    (err: unknown) => {
+      const message = (err as Error).message;
+      assert.match(message, /\.agent-pipeline\/frg\/1\.30\.0\/latest\.json/);
+      assert.match(message, /factory-release prepare/);
+      assert.match(message, /Tugboat FRG pack/);
+      assert.match(message, /pass=false/i);
+      return true;
+    },
+  );
+});
+
+test("release-eligible pass:true latest.json allows tag proceed", async () => {
+  const fs = workflowMemFs();
+  const good = computeFrgEvidence({
+    version: "1.30.0",
+    run_id: "frg-auto-tag-pass",
+    loop_run_id: "loop-full-pass",
+    pack_id: FRG_PACK_MANIFEST.pack_id,
+    items: [
+      { item_id: "1", state: "ready", ready_clean: true },
+      { item_id: "2", state: "ready", ready_clean: true },
+    ],
+    scenario_overrides: frgRequiredObservationOverrides("pass"),
+    composition_overrides: frgRequiredCompositionOverrides("pass"),
+    attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
+  });
+  assert.equal(good.pass, true);
+  await writeFrgEvidence("/repo", good, fs);
+  const ok = await validateFrgEvidenceFileForTag("/repo", "1.30.0", fs, {
+    attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
+  });
+  assert.equal(ok.pass, true);
+  assert.equal(ok.version, "1.30.0");
 });

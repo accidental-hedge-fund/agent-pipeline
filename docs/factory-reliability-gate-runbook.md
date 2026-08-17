@@ -571,7 +571,7 @@ Optional repeated CLI tokens:
 5. Still runs `npm run ci` (additive). FRG, open-soak preflight, and CI are independent.
 6. Does **not** merge or tag because FRG/open-soak passed.
 
-### Auto-tag FRG guard (#757)
+### Auto-tag FRG guard (#757 / #1040)
 
 On a detected release merge (`release: X.Y.Z — …` subject + `core/package.json` version match,
 tag not already present), `.github/workflows/auto-tag-release.yml`:
@@ -579,12 +579,25 @@ tag not already present), `.github/workflows/auto-tag-release.yml`:
 1. Verifies `.agent-pipeline/frg/<X.Y.Z>/latest.json` via the shared Node validator
    (`factory-reliability-gate.ts --validate-tag <version>`).
 2. **Fails closed** (no tag create/push) when missing, unparsable, `pass: false`, or not
-   release-eligible.
+   release-eligible. The fail-closed message names
+   `.agent-pipeline/frg/<X.Y.Z>/latest.json` and names `factory-release prepare` /
+   the Tugboat FRG pack phase as the remediation. FRG is not optional or advisory
+   on auto-tag.
 3. On success, proceeds to notes resolution and annotated tag push (existing rules).
 4. Non-release pushes remain successful no-ops without FRG.
 5. Existing tags remain successful no-ops.
 
 FRG never creates tags itself; the workflow remains the tag owner.
+
+Remediation when auto-tag fail-closes:
+
+```bash
+pipeline factory-release prepare --request <absolute-request.json> --json
+```
+
+Or re-run the Tugboat FRG pack phase so `.agent-pipeline/frg/<X.Y.Z>/latest.json`
+is a release-eligible `pass: true` artifact. Then retry the tag path after that
+evidence is committed.
 
 ### Open soak-defect override (audited only)
 

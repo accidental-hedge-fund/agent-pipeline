@@ -40,6 +40,7 @@ import {
   isReleaseEligibleFrgPass,
   validateReleaseEligibleFrgEvidence,
   validateFrgEvidenceFileForTag,
+  frgLatestRelPath,
   formatFrgPackCloseComment,
   parseFrgItemIssueNumber,
   packLabelFromSelector,
@@ -1825,6 +1826,17 @@ test("HMAC binds pass/scenarios/thresholds — eligibility-field replay rejected
   assert.equal(verifyFrgAttestation(thr, FRG_UNIT_TEST_ATTESTATION_KEY), false);
 });
 
+function assertTagPathRemediation(err: unknown, version: string): void {
+  const message = err instanceof Error ? err.message : String(err);
+  assert.ok(
+    message.includes(frgLatestRelPath(version)),
+    `expected ${frgLatestRelPath(version)} in: ${message}`,
+  );
+  assert.match(message, /factory-release prepare/);
+  assert.match(message, /Tugboat FRG pack/);
+  assert.equal(/optional|advisory/i.test(message), false, message);
+}
+
 test("validateFrgEvidenceFileForTag: missing fails closed; good pass succeeds", async () => {
   const fs = memFs();
   await assert.rejects(
@@ -1861,6 +1873,60 @@ test("validateFrgEvidenceFileForTag: missing fails closed; good pass succeeds", 
       }),
     /release-eligibility|pass=false/i,
   );
+});
+
+test("validateFrgEvidenceFileForTag: missing latest.json names path and pack remediation", async () => {
+  const fs = memFs();
+  await assert.rejects(
+    () =>
+      validateFrgEvidenceFileForTag("/repo", "1.39.0", fs, {
+        attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
+      }),
+    (err: unknown) => {
+      assertTagPathRemediation(err, "1.39.0");
+      assert.match((err as Error).message, /missing/);
+      return true;
+    },
+  );
+});
+
+test("validateFrgEvidenceFileForTag: pass:false latest.json names path and pack remediation", async () => {
+  const fs = memFs();
+  const failEv = computeFrgEvidence({
+    version: "1.39.0",
+    run_id: "frg-tag-fail-139",
+    loop_run_id: "loop",
+    pack_id: FRG_PACK_MANIFEST.pack_id,
+    items: [{ item_id: "1", state: "ready", ready_clean: true }],
+    scenario_overrides: frgRequiredObservationOverrides("pass"),
+    composition_overrides: frgRequiredCompositionOverrides("pass"),
+    attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
+  });
+  assert.equal(failEv.pass, false);
+  await writeFrgEvidence("/repo", failEv, fs);
+  await assert.rejects(
+    () =>
+      validateFrgEvidenceFileForTag("/repo", "1.39.0", fs, {
+        attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
+      }),
+    (err: unknown) => {
+      assertTagPathRemediation(err, "1.39.0");
+      assert.match((err as Error).message, /pass=false/i);
+      return true;
+    },
+  );
+});
+
+test("validateFrgEvidenceFileForTag: release-eligible pass does not emit fail-closed remediation", async () => {
+  const fs = memFs();
+  const good = computeFrgEvidence(fullPackPassInput({ version: "1.30.0", run_id: "frg-tag-pass-msg" }));
+  assert.equal(good.pass, true);
+  await writeFrgEvidence("/repo", good, fs);
+  const ok = await validateFrgEvidenceFileForTag("/repo", "1.30.0", fs, {
+    attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
+  });
+  assert.equal(ok.pass, true);
+  assert.equal(ok.version, "1.30.0");
 });
 
 test("FRG composition inventory is frozen (#757)", () => {

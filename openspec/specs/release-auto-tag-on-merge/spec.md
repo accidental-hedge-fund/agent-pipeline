@@ -2,7 +2,9 @@
 
 ## Purpose
 TBD - created by archiving change auto-tag-release-on-merge. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: An auto-tag workflow SHALL trigger on default-branch pushes
 
 The repository SHALL provide a GitHub Actions workflow that triggers on `push` to the
@@ -221,12 +223,21 @@ evidence. The FRG check SHALL NOT merge pull requests, enable auto-merge, or sub
 independent authority to merge the release pull request. That authority SHALL come from a direct
 operator action or an external supervisor under operator authority.
 
+The fail-closed message SHALL name the lookup path
+`.agent-pipeline/frg/<X.Y.Z>/latest.json` and SHALL name `factory-release prepare` or the
+Tugboat FRG pack phase as the remediation. The message SHALL NOT say FRG is optional or
+advisory on auto-tag. The workflow SHALL invoke the shared tag validator already used by
+the factory-reliability-gate capability (the `--validate-tag` entry or its documented
+equivalent). It SHALL NOT replace that validator with a file-exists check alone.
+
 #### Scenario: Missing FRG evidence blocks the tag
 
 - **WHEN** a release merge for `1.30.0` is detected (subject and package version match)
 - **AND** no FRG evidence artifact for `1.30.0` is present in the tree (or lookup path is empty)
 - **THEN** the workflow SHALL exit non-zero
 - **AND** SHALL NOT create or push `v1.30.0`
+- **AND** the fail-closed message SHALL name `.agent-pipeline/frg/1.30.0/latest.json`
+- **AND** SHALL name `factory-release prepare` or the Tugboat FRG pack phase
 
 #### Scenario: Failed FRG evidence blocks the tag
 
@@ -235,6 +246,8 @@ operator action or an external supervisor under operator authority.
   release-eligibility validation)
 - **THEN** the workflow SHALL exit non-zero
 - **AND** SHALL NOT create or push `v1.30.0`
+- **AND** the fail-closed message SHALL name `.agent-pipeline/frg/1.30.0/latest.json`
+- **AND** SHALL name `factory-release prepare` or the Tugboat FRG pack phase
 
 #### Scenario: Passing release-eligible FRG allows tag proceed
 
@@ -266,6 +279,7 @@ operator action or an external supervisor under operator authority.
 - **THEN** they SHALL assert that a step validates FRG evidence for the detected version before
   the tag-create/push step
 - **AND** removing that validation SHALL fail the drift-guard test
+- **AND** a test that asserts the FRG validation step is absent SHALL NOT remain
 
 ### Requirement: After creating a release version tag the auto-tag path SHALL refresh generator-owned docs
 
@@ -302,4 +316,3 @@ A default-branch push that exists only to commit regenerated generator-owned doc
 - **WHEN** a commit whose subject does not match the release merge subject pattern is pushed to the default branch after post-tag docs refresh
 - **THEN** the auto-tag workflow SHALL exit as a successful no-op
 - **AND** SHALL NOT create or push a new version tag
-

@@ -94,10 +94,28 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # Thin ship (#962): FRG is optional/advisory. Auto-tag must not hard-require
-      # .agent-pipeline/frg/<ver>/latest.json — that gate blocked v1.34.0 tagging after
-      # a successful release PR merge when FRG tooling could not produce a pack.
-      # Optional FRG remains via `pipeline factory-gate` / durable prepare.
+      # FRG guard (#757 / #1040): fail closed before any tag create/push when
+      # release-eligible evidence for this version is missing, unparsable,
+      # pass:false, or lacks a valid HMAC attestation. Uses the same shared
+      # --validate-tag validator as pipeline factory-gate. Evidence must be
+      # committed on the release PR under .agent-pipeline/frg/<version>/latest.json
+      # and signed with PIPELINE_FRG_ATTESTATION_KEY (hand-authored self-consistent
+      # JSON without the secret is rejected). Missing or failed evidence is
+      # remediable via factory-release prepare / the Tugboat FRG pack phase.
+      - name: Verify Factory Reliability Gate evidence
+        id: frg
+        if: steps.exists.outputs.exists == 'false'
+        env:
+          PIPELINE_FRG_ATTESTATION_KEY: ${{ secrets.PIPELINE_FRG_ATTESTATION_KEY }}
+        run: |
+          version="${{ steps.detect.outputs.version }}"
+          if [ -z "${PIPELINE_FRG_ATTESTATION_KEY}" ]; then
+            echo "::error::PIPELINE_FRG_ATTESTATION_KEY secret is required to verify FRG attestation before tagging. Remediation: run factory-release prepare or the Tugboat FRG pack phase so .agent-pipeline/frg/${version}/latest.json is a release-eligible pass, and provision PIPELINE_FRG_ATTESTATION_KEY."
+            exit 1
+          fi
+          node --experimental-strip-types core/scripts/factory-reliability-gate.ts \
+            --validate-tag "${version}"
+          echo "frg_ok=true" >> "$GITHUB_OUTPUT"
 
       - name: Resolve release notes
         id: notes
