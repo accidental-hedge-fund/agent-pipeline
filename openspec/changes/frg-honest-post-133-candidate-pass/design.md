@@ -85,8 +85,10 @@ object):
    `not_observed`.
 6. Every `source: layer_a` id is on the closed Layer A-allowed set and
    has a TAP hash bound to that same `candidate_git_sha`.
-7. Provenance records scoring via `--from-run` (or the in-process
-   equivalent). A caller-authored observations file SHALL NOT satisfy.
+7. Provenance records scoring via structured `score_source: from-run`
+   and `work_list: factory-gate-pack` on the evidence object (stamped
+   by the runner). Notes and caller options SHALL NOT establish those
+   fields. A caller-authored observations file SHALL NOT satisfy.
 
 #1039 and later children SHALL call this helper. They SHALL NOT invent
 a second pass definition.

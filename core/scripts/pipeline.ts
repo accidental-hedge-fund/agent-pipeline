@@ -5139,6 +5139,7 @@ async function main(): Promise<void> {
         falseHumanAuthorityCount,
         recoveryAggregates,
         packProvenance,
+        usedObservationsFile: Boolean(opts.observations),
         packCloseDeps: noClosePack
           ? undefined
           : {

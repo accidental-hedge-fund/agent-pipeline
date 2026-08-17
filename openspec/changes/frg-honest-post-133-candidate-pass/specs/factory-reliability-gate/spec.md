@@ -46,7 +46,9 @@ candidate pack. It SHALL NOT be the product v1.39 milestone work-list.
 The written `.agent-pipeline/frg/<version>/latest.json` SHALL include
 `pass: true`, a non-empty `run_id`, a non-empty bound `loop_run_id`,
 pack identity `factory-gate-v1`, and `pack_provenance.candidate_git_sha`
-for that candidate.
+for that candidate. The evidence object SHALL record runner-stamped
+`score_source` `from-run` and `work_list` `factory-gate-pack`. Free-text
+notes and caller options SHALL NOT establish those fields.
 
 #### Scenario: Bound pack from-run writes honest pass latest.json
 
@@ -66,6 +68,14 @@ for that candidate.
 - **THEN** the honest-pass check SHALL reject that loop as evidence
 - **AND** the skip-frg default restore SHALL remain blocked
 
+#### Scenario: Missing or other work-list is refused as FRG evidence
+
+- **WHEN** the evidence object has no `work_list`, or `work_list` is
+  `other`, or a caller option names `other`
+- **THEN** the honest-pass check SHALL reject that evidence
+- **AND** free-text notes SHALL NOT establish `factory-gate-pack`
+  identity
+
 #### Scenario: Observations file cannot create an honest pass
 
 - **WHEN** a caller or work directory supplies an observations file to
@@ -73,6 +83,15 @@ for that candidate.
 - **THEN** that file SHALL NOT be used as authority for `pass: true`
 - **AND** only runner-derived hybrid v2 evidence MAY contribute to an
   honest pass
+
+#### Scenario: Note-only or caller-opt from-run does not establish honest pass
+
+- **WHEN** the evidence object has no `score_source` of `from-run`
+- **AND** notes begin with a from-run prefix or a caller option claims
+  `from-run`
+- **THEN** the honest-pass check SHALL reject that evidence
+- **AND** lookup of a hand-edited `latest.json` that only adds that note
+  SHALL NOT accept the artifact
 
 ### Requirement: Honest-pass required-live ids SHALL not be not_observed
 
@@ -158,13 +177,16 @@ The pipeline SHALL keep the tracking issue open and SHALL NOT start the
 Tugboat `--skip-frg` default flip when the bound candidate pack cannot
 produce an accepted honest pass. A fail score, a missing artifact, or an
 operator waiver SHALL NOT grant that permission. The written
-`latest.json`, if any, SHALL keep `pass: false`.
+`latest.json`, if any, SHALL keep `pass: false`. Persist SHALL NOT
+rewrite a scorer `pass: false` to `pass: true`.
 
 #### Scenario: Pack fail keeps the issue open
 
 - **WHEN** factory-gate scoring of the bound terminal loop yields
   `pass: false`
 - **THEN** any written `latest.json` SHALL keep `pass: false`
+- **AND** persist SHALL NOT validate `{ ...scored, pass: true }` and
+  rewrite the scorer result
 - **AND** issue #1038 SHALL remain open
 - **AND** the Tugboat skip-frg child SHALL stay blocked
 

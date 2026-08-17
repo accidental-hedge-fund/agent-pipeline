@@ -162,6 +162,8 @@ function scoreCollected(
       false_human_authority_count: observations.false_human_authority_count,
       pack_provenance: observations.pack_provenance,
       notes: over.notes ?? fromRunNotes(loopRunId),
+      score_source: "from-run",
+      work_list: "factory-gate-pack",
       attestation_key:
         over.attestation_key === undefined ? FRG_UNIT_TEST_ATTESTATION_KEY : over.attestation_key,
       now: () => new Date("2026-08-16T12:10:00.000Z"),
@@ -286,7 +288,11 @@ test("isHonestPost133FrgPass rejects pass:false and persist does not unlock a fa
   const { evidence } = scoreCollected(pack, "1.39.0");
   const failed = { ...evidence, pass: false };
   assert.equal(isHonestPost133FrgPass(failed), false);
-  assert.equal(latestJsonForHonestPost133Persist(failed).pass, true, "unsigned-or-signed structural pass persists as true");
+  assert.equal(
+    latestJsonForHonestPost133Persist(failed).pass,
+    false,
+    "persist must keep the scorer's pass:false",
+  );
 
   const requiredLiveFail = structuredClone(evidence);
   const tax = requiredLiveFail.scenarios.find((s) => s.id === "blocker-taxonomy");
@@ -296,6 +302,46 @@ test("isHonestPost133FrgPass rejects pass:false and persist does not unlock a fa
   const persisted = latestJsonForHonestPost133Persist(requiredLiveFail);
   assert.equal(persisted.pass, false);
   assert.equal(isHonestPost133FrgPass(persisted), false);
+});
+
+test("isHonestPost133FrgPass rejects missing/other work-list and note-only from-run", async () => {
+  const pack = await loadFrgPack();
+  const { evidence } = scoreCollected(pack, "1.39.0");
+  assert.equal(isHonestPost133FrgPass(evidence), true);
+
+  const { work_list: _work, ...noWorkList } = evidence;
+  assert.equal(isHonestPost133FrgPass(noWorkList), false);
+  assert.equal(isHonestPost133FrgPass({ ...evidence, work_list: "other" }), false);
+  assert.equal(isHonestPost133FrgPass({ ...evidence, work_list: undefined }), false);
+  assert.equal(isHonestPost133FrgPass(evidence, { workList: "other" }), false);
+  assert.equal(
+    isHonestPost133FrgPass({ ...noWorkList, notes: fromRunNotes("loop-frg-honest") }),
+    false,
+  );
+
+  const { score_source: _src, ...noSource } = evidence;
+  assert.equal(isHonestPost133FrgPass(noSource), false);
+  assert.equal(isHonestPost133FrgPass({ ...evidence, score_source: "unknown" }), false);
+  assert.equal(isHonestPost133FrgPass(noSource, { scoreSource: "from-run" }), false);
+  const editedNotes = {
+    ...noSource,
+    notes: [`${FRG_FROM_RUN_NOTE_PREFIX}loop-frg-honest`, "hand-edited from-run claim"],
+  };
+  assert.equal(isHonestPost133FrgPass(editedNotes), false);
+
+  const persistFail = latestJsonForHonestPost133Persist(
+    { ...evidence, pass: false },
+    { scoreSource: "from-run", workList: "factory-gate-pack" },
+  );
+  assert.equal(persistFail.pass, false);
+
+  const persistStamped = latestJsonForHonestPost133Persist(noSource, {
+    scoreSource: "from-run",
+    workList: "factory-gate-pack",
+  });
+  assert.equal(persistStamped.pass, true);
+  assert.equal(persistStamped.score_source, "from-run");
+  assert.equal(persistStamped.work_list, "factory-gate-pack");
 });
 
 test("lookupHonestPost133FrgPass injects I/O and ignores 1.33.0 / fail / unparsable", async () => {

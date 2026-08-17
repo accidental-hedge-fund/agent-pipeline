@@ -173,12 +173,16 @@ The check accepts only a genuine `factory-gate --for <version> --from-run
 `not_observed`. Layer A-allowed ids must cite TAP hashes bound to that
 same candidate SHA.
 
+The check requires runner-stamped `score_source: from-run` and
+`work_list: factory-gate-pack` on the evidence object. Notes and caller
+options cannot establish those fields.
+
 The check **refuses**:
 
 - a `1.33.0`-only (or earlier) artifact
-- `pass: false`
-- the product v1.39 milestone work-list
-- a caller-authored `--observations` file
+- `pass: false` (persist never rewrites a fail score to `pass: true`)
+- the product v1.39 milestone work-list, `work_list: other`, or a missing work-list
+- a caller-authored `--observations` file, or missing `score_source: from-run`
 - required-live `not_observed`
 - an unknown `layer_a` id or a TAP bound to another commit
 

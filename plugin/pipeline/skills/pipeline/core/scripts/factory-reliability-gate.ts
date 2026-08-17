@@ -313,6 +313,19 @@ export interface FrgItemOutcome {
   blocker_class: FrgBlockerTaxonomy | null;
 }
 
+/**
+ * How a latest.json (or equivalent) was scored. Honest post-1.33 pass
+ * requires `from-run` on the evidence object — notes and caller opts
+ * cannot establish this.
+ */
+export type HonestPost133ScoreSource = "from-run" | "observations" | "unknown";
+
+/**
+ * Work-list identity for the skip-frg restore precondition. Honest
+ * post-1.33 pass requires `factory-gate-pack` on the evidence object.
+ */
+export type HonestPost133WorkList = "factory-gate-pack" | "product-milestone" | "other";
+
 export interface FrgEvidence {
   schema_version: number;
   version: string;
@@ -350,6 +363,16 @@ export interface FrgEvidence {
   integrity: FrgIntegrity;
   /** Structured fresh-pack and candidate-probe provenance. */
   pack_provenance: FrgPackProvenance | null;
+  /**
+   * Runner-stamped score path. Required `from-run` for honest post-1.33
+   * pass. Absent / `unknown` / `observations` reject.
+   */
+  score_source?: HonestPost133ScoreSource;
+  /**
+   * Runner-stamped work-list identity. Required `factory-gate-pack` for
+   * honest post-1.33 pass. Absent / `other` / `product-milestone` reject.
+   */
+  work_list?: HonestPost133WorkList;
 }
 
 export type FrgLookupResult =
@@ -1518,25 +1541,18 @@ export function isReleaseEligibleFrgPass(
   return true;
 }
 
-/**
- * How a latest.json (or equivalent) was scored. Later skip-frg / auto-tag /
- * pin children pass this when known; otherwise the checker infers `--from-run`
- * from {@link FRG_FROM_RUN_NOTE_PREFIX} in `notes`.
- */
-export type HonestPost133ScoreSource = "from-run" | "observations" | "unknown";
-
-/**
- * Work-list identity for the skip-frg restore precondition. The product
- * v1.39 milestone is never honest-pass evidence.
- */
-export type HonestPost133WorkList = "factory-gate-pack" | "product-milestone" | "other";
-
 export interface HonestPost133FrgPassOpts {
-  /** Explicit score path. `observations` always rejects. */
+  /**
+   * Caller-observed score path. May only *reject* (`observations`).
+   * `from-run` here does not establish honest-pass authority.
+   */
   scoreSource?: HonestPost133ScoreSource;
   /** Caller-authored `--observations` file used as score authority. */
   usedObservationsFile?: boolean;
-  /** Work-list identity. `product-milestone` always rejects. */
+  /**
+   * Caller-observed work-list. May only *reject* (`product-milestone` /
+   * `other`). `factory-gate-pack` here does not establish authority.
+   */
   workList?: HonestPost133WorkList;
 }
 
@@ -1563,6 +1579,8 @@ export type HonestPost133FrgPassEvidence = {
   pack_provenance?: FrgPackProvenance | null;
   run_id?: string;
   notes?: readonly string[];
+  score_source?: HonestPost133ScoreSource;
+  work_list?: HonestPost133WorkList;
 };
 
 function notesText(evidence: { notes?: readonly string[] }): string {
@@ -1570,36 +1588,36 @@ function notesText(evidence: { notes?: readonly string[] }): string {
 }
 
 function honestPassIsFromRun(
-  evidence: { notes?: readonly string[] },
+  evidence: { score_source?: HonestPost133ScoreSource },
   opts?: HonestPost133FrgPassOpts,
 ): boolean {
   if (opts?.scoreSource === "observations") return false;
-  if (opts?.scoreSource === "from-run") return true;
-  return (evidence.notes ?? []).some((note) => note.startsWith(FRG_FROM_RUN_NOTE_PREFIX));
+  return evidence.score_source === "from-run";
 }
 
 function honestPassUsedObservationsFile(
-  evidence: { notes?: readonly string[] },
+  evidence: { notes?: readonly string[]; score_source?: HonestPost133ScoreSource },
   opts?: HonestPost133FrgPassOpts,
 ): boolean {
   if (opts?.usedObservationsFile === true) return true;
   if (opts?.scoreSource === "observations") return true;
+  if (evidence.score_source === "observations") return true;
   const notes = notesText(evidence);
   return /(?:^|\s)--observations\b/.test(notes) || /scored from observations file/i.test(notes);
 }
 
-function honestPassIsProductMilestone(
-  evidence: { notes?: readonly string[] },
+function honestPassIsFactoryGatePack(
+  evidence: { notes?: readonly string[]; work_list?: HonestPost133WorkList },
   opts?: HonestPost133FrgPassOpts,
 ): boolean {
-  if (opts?.workList === "product-milestone") return true;
-  if (opts?.workList === "factory-gate-pack") return false;
+  if (opts?.workList === "product-milestone" || opts?.workList === "other") return false;
+  if (evidence.work_list !== "factory-gate-pack") return false;
   const notes = notesText(evidence);
-  if (/product v?1\.39 milestone/i.test(notes)) return true;
+  if (/product v?1\.39 milestone/i.test(notes)) return false;
   if (/\bproduct-milestone\b/i.test(notes) && !/not full product milestone/i.test(notes)) {
-    return true;
+    return false;
   }
-  return false;
+  return true;
 }
 
 function requiredLiveObserved(evidence: HonestPost133FrgPassEvidence): boolean {
@@ -1680,7 +1698,7 @@ export function isHonestPost133FrgPass(
   if (typeof candidateSha !== "string" || !GIT_SHA_RE.test(candidateSha)) return false;
   if (honestPassUsedObservationsFile(evidence, opts)) return false;
   if (!honestPassIsFromRun(evidence, opts)) return false;
-  if (honestPassIsProductMilestone(evidence, opts)) return false;
+  if (!honestPassIsFactoryGatePack(evidence, opts)) return false;
   if (!requiredLiveObserved(evidence)) return false;
   if (!layerAClaimsHaveCandidateTap(evidence)) return false;
   return isReleaseEligibleFrgPass(evidence, { requireAttestation: false });
@@ -1689,23 +1707,36 @@ export function isHonestPost133FrgPass(
 /**
  * Persist gate for `.agent-pipeline/frg/<ver>/latest.json`.
  *
- * A structurally honest unsigned from-run score is written as `pass: true`
- * (HMAC is not this issue's missing proof). A structural fail stays
- * `pass: false` and is never rewritten to pass.
+ * Stamps runner-supplied `score_source` / `work_list` when the scored
+ * object lacks them. Never rewrites `pass: false` to `pass: true`.
+ * Persist `pass: true` only when the actual scored result is true and
+ * the honest-pass checker accepts the stamped object.
  */
 export function latestJsonForHonestPost133Persist(
   scored: HonestPost133FrgPassEvidence,
   opts?: HonestPost133FrgPassOpts,
 ): HonestPost133FrgPassEvidence {
-  const persistOpts: HonestPost133FrgPassOpts = {
-    scoreSource: opts?.scoreSource ?? "from-run",
-    usedObservationsFile: opts?.usedObservationsFile ?? false,
-    workList: opts?.workList ?? "factory-gate-pack",
-  };
-  if (isHonestPost133FrgPass({ ...scored, pass: true }, persistOpts)) {
-    return { ...scored, pass: true };
+  const next: HonestPost133FrgPassEvidence = { ...scored };
+  if (next.score_source === undefined && opts?.scoreSource !== undefined) {
+    next.score_source = opts.scoreSource;
   }
-  return { ...scored, pass: false };
+  if (next.work_list === undefined && opts?.workList !== undefined) {
+    next.work_list = opts.workList;
+  }
+  if (!scored.pass) {
+    return { ...next, pass: false };
+  }
+  const checkOpts: HonestPost133FrgPassOpts = {
+    usedObservationsFile: opts?.usedObservationsFile,
+  };
+  if (opts?.scoreSource === "observations") checkOpts.scoreSource = "observations";
+  if (opts?.workList === "product-milestone" || opts?.workList === "other") {
+    checkOpts.workList = opts.workList;
+  }
+  if (isHonestPost133FrgPass(next, checkOpts)) {
+    return { ...next, pass: true };
+  }
+  return { ...next, pass: false };
 }
 
 export interface HonestPost133LookupDeps {
@@ -1953,6 +1984,21 @@ export function enforceRequiredScenarioCriteria(
 }
 
 /** Parse and validate a machine-readable FRG evidence object (full expected schema). */
+const HONEST_POST133_SCORE_SOURCES = ["from-run", "observations", "unknown"] as const;
+const HONEST_POST133_WORK_LISTS = ["factory-gate-pack", "product-milestone", "other"] as const;
+
+function parseOptionalHonestEnum<T extends string>(
+  raw: unknown,
+  field: string,
+  allowed: readonly T[],
+): T | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== "string" || !(allowed as readonly string[]).includes(raw)) {
+    throw new Error(`FRG evidence.${field} must be one of ${allowed.join(", ")}`);
+  }
+  return raw as T;
+}
+
 export function parseFrgEvidence(raw: unknown): FrgEvidence {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
     throw new Error("FRG evidence must be a JSON object");
@@ -2055,6 +2101,16 @@ export function parseFrgEvidence(raw: unknown): FrgEvidence {
     );
   }
   const recovery_aggregates = parseFrgRecoveryAggregates(o.recovery_aggregates);
+  const scoreSource = parseOptionalHonestEnum(
+    o.score_source,
+    "score_source",
+    HONEST_POST133_SCORE_SOURCES,
+  );
+  const workList = parseOptionalHonestEnum(
+    o.work_list,
+    "work_list",
+    HONEST_POST133_WORK_LISTS,
+  );
 
   // Re-apply numeric/skip criteria so forged overrides cannot parse as pass.
   const enforced = enforceRequiredScenarioCriteria(scenarios, thresholds);
@@ -2117,6 +2173,8 @@ export function parseFrgEvidence(raw: unknown): FrgEvidence {
     pack_provenance: packProvenance,
   };
   if (recovery_aggregates) evidence.recovery_aggregates = recovery_aggregates;
+  if (scoreSource !== undefined) evidence.score_source = scoreSource;
+  if (workList !== undefined) evidence.work_list = workList;
   return evidence;
 }
 
@@ -3089,6 +3147,10 @@ export interface ComputeFrgInput {
    * `pass: true` cannot be minted (attestation required).
    */
   attestation_key?: string | null;
+  /** Runner-stamped score path for the honest-pass checker. */
+  score_source?: HonestPost133ScoreSource;
+  /** Runner-stamped work-list identity for the honest-pass checker. */
+  work_list?: HonestPost133WorkList;
 }
 
 function isReadyState(state: string): boolean {
@@ -3324,6 +3386,8 @@ export function computeFrgEvidence(input: ComputeFrgInput): FrgEvidence {
   if (input.recovery_aggregates) {
     evidence.recovery_aggregates = input.recovery_aggregates;
   }
+  if (input.score_source !== undefined) evidence.score_source = input.score_source;
+  if (input.work_list !== undefined) evidence.work_list = input.work_list;
   return evidence;
 }
 
@@ -3664,6 +3728,11 @@ export interface FactoryGateOpts {
    * {@link FRG_ATTESTATION_KEY_ENV}. Injected in tests; production CLI uses env.
    */
   attestationKey?: string | null;
+  /**
+   * True when the operator passed `--observations <file>`. Stamps
+   * `score_source: "observations"` so honest-pass cannot accept it.
+   */
+  usedObservationsFile?: boolean;
   stdout?: (msg: string) => void;
   stderr?: (msg: string) => void;
 }
@@ -3785,6 +3854,8 @@ export async function runFactoryGate(
       thresholds: opts.thresholds,
       now: opts.now,
       attestation_key: resolvedAttestationKey,
+      score_source: opts.usedObservationsFile ? "observations" : "from-run",
+      work_list: "factory-gate-pack",
     };
   } else if (opts.startLoop) {
     // Refuse non-pack selectors before starting a durable loop.
@@ -3879,6 +3950,10 @@ export async function runFactoryGate(
         "       pipeline factory-gate --for <X.Y.Z> --from-run <loop-run-id> [--json]\n" +
         "  See docs/factory-reliability-gate-runbook.md",
     );
+  }
+
+  if (opts.usedObservationsFile) {
+    computeInput = { ...computeInput, score_source: "observations" };
   }
 
   if (computeInput.pack_provenance) {
