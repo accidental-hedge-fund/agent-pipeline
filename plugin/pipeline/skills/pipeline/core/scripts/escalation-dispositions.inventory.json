@@ -515,7 +515,7 @@
       "disposition": "transient-retryable",
       "blocker_kind": "push-failed",
       "canonical_reason": "transient-infra",
-      "notes": "push after currency re-sync",
+      "notes": "default transient class is HTTP 5xx after currency re-sync; classifier emits workflow-state for non-fast-forward",
       "emitter": "setBlocked"
     },
     {

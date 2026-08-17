@@ -296,6 +296,7 @@ test("resumeFromImplementing: push failure returns the push-failed blocker kind"
     if (result.status === "blocked") {
       assert.equal(setBlockedKind, "push-failed");
       assert.equal(result.blockerKind, setBlockedKind, "returned blockerKind must match setBlocked");
+      assert.equal(result.diagnostic?.reason_code, "workflow-state");
     }
   }
 });

@@ -45,9 +45,9 @@ Constraints:
 
 ### D1 — Classify in the shared wrapper, not at the site
 
-**Decision:** `pushWithCurrencyCheck` sets `reason_code: "workflow-state"` and `head_drift: true` whenever `isTransientPushError` is false because the stderr contains `non-fast-forward`, `rejected`, or `fetch first`. The fail-closed `siteId` path uses the same classification. Fix (and any other caller) emits `pushResult.reason_code` instead of the `head_drift` ternary.
+**Decision:** Export one case-insensitive `classifyPushFailure(stderr)` and call it **before** retry eligibility on every `pushWithCurrencyCheck` path, including fail-closed `siteId`. Tokens `non-fast-forward`, `rejected`, or `fetch first` → `reason_code: "workflow-state"`, `head_drift: true`, not retryable. HTTP 5xx / connection-reset without those tokens stay `transient-infra` and may retry. Production callers today are `stages/fix.ts` and `stages/planning.ts`. Both SHALL emit `pushResult.reason_code` on `push-failed`. Fix SHALL delete `head_drift ? "workflow-state" : "transient-infra"`. Planning SHALL stop omitting the diagnostic.
 
-**Rationale:** The helper already knows the class and then throws it away. Planning already uses the same wrapper. A `fix.ts`-only remap would leave the next caller to re-park.
+**Rationale:** The helper already knows the class and then throws it away. A `fix.ts`-only remap would leave planning (and any later caller) to re-park. Classification must win over inventory default `transient-infra`.
 
 **Alternatives considered:**
 
@@ -57,11 +57,12 @@ Constraints:
 
 ### D2 — Teach `resync_workflow_state` currency for this evidence
 
-**Decision:** When the claimed diagnostic is `workflow-state` + `push-failed` (or equivalent stale-tip / non-fast-forward evidence), `resync_workflow_state` SHALL fetch the open-PR or verified remote tip and:
+**Decision:** When the claimed diagnostic is `workflow-state` + `push-failed` (or equivalent stale-tip / non-fast-forward evidence), `resync_workflow_state` SHALL resolve a verified target SHA, then move a present-but-stale managed worktree to that SHA when safety allows:
 
-1. Fast-forward the present managed worktree when local HEAD is an ancestor of that tip.
-2. Otherwise rematerialize onto that tip when rematerialize safety allows (no dirty / local-only unpushed product destroy).
-3. Then clear the mechanical blocked label (existing `resyncMechanicalBlock` postcondition) and return success.
+1. **Resolve target.** Prefer the open-PR head SHA (same order as `ensureManagedWorktree`: `prSha ?? remoteTip`). If no open PR exists, `git fetch origin <branch>` and verify `origin/<branch>` (or `FETCH_HEAD` from that fetch). If neither SHA can be verified, refuse typed (`unverified-remote-head`). Do not skip. Do not reset. Do not rematerialize.
+2. **Safety before mutate.** Only fast-forward or `reset --hard` a managed worktree that is clean and non-unique: porcelain empty, and `merge-base --is-ancestor HEAD <verified-head>` is true (equality included). Dirty product or local-only unique commits (not an ancestor) refuse typed. Never force-push.
+3. **Mutate.** Fast-forward (`merge --ff-only <verified-head>`) or hard-reset to the verified SHA. If the tree is absent, rematerialize via `ensureManagedWorktree` onto that same intended tip.
+4. **Then** clear the mechanical blocked label (existing `resyncMechanicalBlock` postcondition) and return success.
 
 Other `workflow-state` diagnostics keep today’s label-clear + re-enter behavior.
 
@@ -75,35 +76,54 @@ Other `workflow-state` diagnostics keep today’s label-clear + re-enter behavio
 
 ### D3 — Skip ancestor push after noop
 
-**Decision:** After a `fix-no-actionable-work` decision, compare local HEAD to `origin/<branch>` (after fetch, injected git seam). If local is an ancestor, skip `pushWithCurrencyCheck` and advance. If not an ancestor, keep the existing wrapper push.
+**Decision:** After a `fix-no-actionable-work` decision (empty effective blocking set, valid does-not-reproduce coverage, or #349 external-commit HEAD already past the reviewed SHA), resolve a verified target first, then test ancestry:
 
-**Rationale:** #349 already decided there is nothing to deliver. Pushing `8ea2d1a` cannot update `bb208ba`. The park is a self-inflicted stale-tip push.
+1. Verify target: open-PR head if present, else fetch and use `FETCH_HEAD` / `origin/<branch>` (same fail-closed pattern as `isCommitOnRemote` in `fix.ts`).
+2. If verification fails, do **not** skip the push and do **not** reset. Fall through to `pushWithCurrencyCheck`.
+3. If verification succeeds, run `git merge-base --is-ancestor HEAD <verified-head>`.
+   - Exit 0 (remote ahead **or** equal): skip `pushWithCurrencyCheck` and advance.
+   - Exit 1 (local ahead or diverged): keep the existing wrapper push; unique local commits stay.
+
+**Rationale:** #349 already decided there is nothing to deliver. Pushing `8ea2d1a` cannot update `bb208ba`. The park is a self-inflicted stale-tip push. Equality is already on the remote, so a no-op push is also wasted. A failed fetch must not pretend the older tip is current.
 
 **Alternatives considered:**
 
 - Always rematerialize then push after noop → rejected. There is nothing local to publish. Skip is smaller and never races the remote tip.
 - Push and let recovery rematerialize → rejected. That is the #1038 park.
+- Silent skip when fetch/PR lookup fails → rejected. That would advance on an unverified tip.
 
-### D4 — Fixture-first regression
+### D5 — Typed refuse when currency would destroy unique work
 
-**Decision:** One exported fixture string matching the #1038 git reject (`! [rejected] … (non-fast-forward)` plus the behind-remote / `fetch first` hint). Tests assert, without the classifier fix:
+**Decision:** When D2 would destroy dirty product or local-only unique commits, `resync_workflow_state` returns `{ succeeded: false }` with typed evidence (`dirty-worktree` or `local-only-unpushed`). It does not clear `pipeline:blocked`. It does not force-push. Class stays `workflow-state`. Default policy’s next recipe is `repair_pipeline_item`. It SHALL NOT become `wait_and_retry` or `transient-rate-limit`. Unverifiable local-only (`null` / `"unverifiable"`) also refuses, same as `#622` reclaim.
 
-- wrapper `reason_code === "transient-infra"` and loop recipe `wait_and_retry`
+**Rationale:** Waiting cannot preserve unique work. Force-push would overwrite the PR. `repair_pipeline_item` is the existing second `workflow-state` recipe.
 
-and with the fix:
+**Alternatives considered:**
 
-- wrapper `reason_code === "workflow-state"`, `head_drift === true`, durable class `workflow-state`, first recipe rematerialize / `resync_workflow_state`, not `wait_and_retry`.
+- Remap refuse to `transient-infra` → rejected. That is the #1038 class bug.
+- New durable class → rejected. `workflow-state` already owns this park.
 
-A second test covers fail-closed `siteId`. A third covers HTTP 502 still retrying. A fourth covers ancestor skip-push after noop.
+### D4 — Fixture-first regression plus one end-to-end chain
 
-**Rationale:** The issue names this fixture as the bite test.
+**Decision:** One exported fixture string matching the complete #1038 park stderr (`! [rejected] … (non-fast-forward)` plus the behind-remote / `fetch first` hint). Export one case-insensitive classifier (`classifyPushFailure`) and call it **before** retry eligibility on every wrapper path, including fail-closed `siteId`.
+
+One end-to-end unit test (injected deps only) proves the chain:
+
+`#1038 fixture` → wrapper `{ reason_code: "workflow-state", head_drift: true }` → fix `push-failed` diagnostic uses that reason → `projectPipelineReasonCode` is `workflow-state` (not `transient-rate-limit`) → `DEFAULT_RECOVERY_POLICY["workflow-state"].recipes[0] === "resync_workflow_state"` and the list does not contain `wait_and_retry`.
+
+Companion assertions document the pre-fix mapping that parked #1038: wrapper `reason_code: "transient-infra"` + `head_drift: false` plus the `head_drift ? workflow-state : transient-infra` ternary plus `projectPipelineReasonCode("transient-infra")` yields `transient-rate-limit` / `wait_and_retry`.
+
+Also required: fail-closed `siteId` on the same fixture; HTTP 502 / connection-reset still retries; noop ancestry (remote-ahead and equal skip; local-ahead / diverged uses the wrapper and keeps unique commits); recovery command construction never includes `--force` or `--force-with-lease`.
+
+**Rationale:** Isolated helper tests would not have caught the fix.ts remap. The issue names this fixture as the bite test.
 
 ## Risks / Trade-offs
 
-- **[Risk] Broad `rejected` token** → Mitigation: keep the existing `isTransientPushError` token set. Require `non-fast-forward` / `fetch first` / `rejected` as today. Do not add host-specific phrasing.
-- **[Risk] Fast-forward or rematerialize drops unique local commits** → Mitigation: reuse rematerialize dirty / local-only refuse. Fast-forward only when local is an ancestor. Unique unpushed product work fails typed, never force-push.
+- **[Risk] Broad `rejected` token** → Mitigation: one exported case-insensitive classifier runs **before** retry eligibility. Token set stays `non-fast-forward` / `fetch first` / `rejected`. Tests use the complete #1038 stderr, not a single token. HTTP 502 without those tokens stays transient. A hook reject that only says `rejected` becomes workflow-state (no wait), which is safer than treating it as a rate limit.
+- **[Risk] Fast-forward or rematerialize drops unique local commits** → Mitigation: reuse rematerialize dirty / local-only refuse. Fast-forward / hard-reset only when the tree is clean and HEAD is an ancestor of the verified tip. Unique unpushed product work fails typed (`dirty-worktree` / `local-only-unpushed`), never force-push, never `wait_and_retry`.
 - **[Risk] `resync_workflow_state` grows a second job** → Mitigation: D2 scopes the currency action to stale-tip / non-fast-forward evidence. Other workflow-state parks stay label-clear.
 - **[Risk] Inventory `canonical_reason: transient-infra` misleads metrics** → Mitigation: tests and notes treat inventory reason as the *default transient* class, not the only legal emission. Classifier wins.
+- **[Risk] Planning omits a diagnostic** → Mitigation: audit every `pushWithCurrencyCheck` caller. `planning.ts` must emit `pushResult.reason_code`. Do not rely on `mechanicalReasonCodeForKind("push-failed")` alone.
 
 ## Migration Plan
 

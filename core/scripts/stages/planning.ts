@@ -60,7 +60,7 @@ import {
   removeWorktree,
   slugify,
 } from "../worktree.ts";
-import { pushWithCurrencyCheck } from "../transient-wrappers.ts";
+import { pushWithCurrencyCheck, type PushWithCurrencyDeps } from "../transient-wrappers.ts";
 import {
   DEFAULT_GIT_PUSH_AUTH,
   formatPushAuthFailure,
@@ -1869,6 +1869,13 @@ export interface ResumeFromImplementingDeps {
   disposeSupersededIssuePrs?: typeof disposeSupersededIssuePrs;
   /** Deps forwarded into the default disposeSupersededIssuePrs implementation. */
   supersedeDeps?: DisposeSupersededIssuePrsDeps;
+  /**
+   * #760 / #1103: bounded push-with-currency wrapper. Injectable for unit
+   * tests; defaults to {@link pushWithCurrencyCheck}.
+   */
+  pushWithCurrency?: typeof pushWithCurrencyCheck;
+  /** Injectable sleep for push/backoff wrappers. */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 /**
@@ -1989,11 +1996,13 @@ export async function resumeFromImplementing(
   // HTTPS/gh PAT paths cannot false-block workflow-file pushes under SSH.
   const pushAuth = cfg.git?.push_auth ?? DEFAULT_GIT_PUSH_AUTH;
   const localHead = (await gitOp(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })).stdout.trim();
-  const pushResult = await pushWithCurrencyCheck(branch, {
+  const pushFn = deps.pushWithCurrency ?? pushWithCurrencyCheck;
+  const pushResult = await pushFn(branch, {
     // Planning push shares the transient-retryable push class. Site id gates
     // retry eligibility via the disposition inventory.
     siteId: "stages.fix:push-failed#0",
     expectedLocalSha: localHead || null,
+    sleep: deps.sleep,
     git: async (args) => {
       if (args[0] === "push") {
         // Route through the same injectable gitOp seam tests use, with
@@ -2019,7 +2028,7 @@ export async function resumeFromImplementing(
       }
       return gitOp(wt.path, args, { ignoreFailure: true });
     },
-  });
+  } satisfies PushWithCurrencyDeps);
   if (!pushResult.ok) {
     const pushMsg = formatPushAuthFailure(pushAuth, pushResult.reason);
     await blocker(
@@ -2029,7 +2038,16 @@ export async function resumeFromImplementing(
       "implementing",
       "push-failed",
     );
-    return blockedOutcome(pushMsg, "push-failed");
+    return blockedOutcome(
+      pushMsg,
+      "push-failed",
+      buildStageDiagnostic({
+        reasonCode: pushResult.reason_code,
+        blockerKind: "push-failed",
+        reason: pushMsg,
+        stage: "implementing",
+      }),
+    );
   }
 
   // ---- Create or find PR (exact-branch check first to avoid duplicates on resume) ----

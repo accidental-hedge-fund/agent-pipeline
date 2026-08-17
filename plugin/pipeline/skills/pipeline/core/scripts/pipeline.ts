@@ -66,7 +66,22 @@ import {
   REVIEW_MARKER_PREFIX_R2,
 } from "./stages/review-parsing.ts";
 import { makePipelineRunId } from "./traceability.ts";
-import { branchName, getForIssue, getOnDiskForIssue, gitInWorktree, removeWorktreeForIssue, sweepMergedWorktrees } from "./worktree.ts";
+import {
+  branchName,
+  ensureManagedWorktree,
+  getForIssue,
+  getOnDiskForIssue,
+  gitInWorktree,
+  removeWorktreeForIssue,
+  resolveOpenPrHeadForBranch,
+  sweepMergedWorktrees,
+  type EnsureManagedWorktreeResult,
+} from "./worktree.ts";
+import {
+  isAncestorOfVerifiedHead,
+  isStaleTipPushEvidence,
+  resolveVerifiedRemoteHead,
+} from "./transient-wrappers.ts";
 import { classifyPorcelainForScratchRecover } from "./worktree-dirt.ts";
 import {
   bundlePath,
@@ -1689,6 +1704,16 @@ export interface RealExecuteRecoveryDeps {
   }) => Promise<void>;
   getOnDiskForIssue?: typeof getOnDiskForIssue;
   /**
+   * Rematerialize an absent managed worktree onto the verified PR / remote
+   * tip during stale-tip `resync_workflow_state` (#1103). Tests inject fakes.
+   */
+  ensureManagedWorktree?: typeof ensureManagedWorktree;
+  /**
+   * Open-PR head resolver for stale-tip currency. Defaults to
+   * {@link resolveOpenPrHeadForBranch}. Tests inject fakes.
+   */
+  resolveOpenPrHeadForBranch?: typeof resolveOpenPrHeadForBranch;
+  /**
    * @deprecated Prefer probeImplementDeliverable. Kept so older test stubs
    * still type-check; recovery no longer treats non-empty listChangeDirs as
    * deliverable proof (#758 R2).
@@ -1753,6 +1778,8 @@ export function realExecuteRecovery(
   const clear = deps.clearBlocked ?? clearBlocked;
   const repairPipelineItem = deps.repairPipelineItem ?? createRepairPipelineItemExecutor(cfg);
   const getWorktree = deps.getOnDiskForIssue ?? getOnDiskForIssue;
+  const ensureWorktree = deps.ensureManagedWorktree ?? ensureManagedWorktree;
+  const resolvePrHead = deps.resolveOpenPrHeadForBranch ?? resolveOpenPrHeadForBranch;
   const post = deps.postComment ?? postComment;
   const gitInWt = deps.gitInWorktree ?? gitInWorktree;
   const gitHead =
@@ -1953,6 +1980,99 @@ export function realExecuteRecovery(
     };
   };
 
+  /**
+   * #1103: when resync_workflow_state is claimed for a stale-tip /
+   * non-fast-forward park, move a present-but-stale managed worktree to the
+   * verified PR / remote head (or rematerialize an absent tree). Never
+   * force-push. Dirty / local-only unique work refuses typed.
+   */
+  const resyncStaleTipWorktree = async (
+    issueNumber: number,
+  ): Promise<RepairPipelineItemResult> => {
+    const wt = await getWorktree(cfg, issueNumber);
+    if (!wt) {
+      const remat: EnsureManagedWorktreeResult = await ensureWorktree(cfg, issueNumber, {
+        getOnDiskForIssue: getWorktree,
+        resolveOpenPrHeadForBranch: resolvePrHead,
+        gitInWorktree: gitInWt,
+      });
+      if (remat.result === "fail") {
+        const missing =
+          remat.blockerKind === "worktree-missing" ||
+          /no recoverable remote|cannot rematerialize/i.test(remat.reason);
+        return failed(
+          missing
+            ? `unverified-remote-head: ${remat.reason}`
+            : `resync_workflow_state rematerialize failed (${remat.blockerKind}): ${remat.reason}`,
+        );
+      }
+      return {
+        succeeded: true,
+        evidence:
+          `resync_workflow_state rematerialized the absent managed worktree onto the ` +
+          `verified PR / remote tip (${remat.reason})`,
+      };
+    }
+
+    const branch = branchName(issueNumber, wt.slug);
+    const git = async (args: string[]) => gitInWt(wt.path, args, { ignoreFailure: true });
+    const verified = await resolveVerifiedRemoteHead(branch, {
+      git,
+      resolveOpenPrHead: async () => {
+        const pr = await resolvePrHead(cfg, branch);
+        return pr?.headSha ?? null;
+      },
+    });
+    if (!verified.ok) {
+      return failed(
+        `unverified-remote-head: neither an open-PR head nor origin/${branch} could be verified; refusing reset`,
+      );
+    }
+
+    const status = await git(["status", "--porcelain", "--untracked-files=all"]);
+    if (status.code !== 0 || status.stdout.trim() !== "") {
+      return failed(
+        `dirty-worktree: refusing rematerialize/reset of ${wt.path} (would destroy uncommitted work)`,
+      );
+    }
+
+    const ancestor = await isAncestorOfVerifiedHead(git, "HEAD", verified.sha);
+    if (ancestor !== true) {
+      return failed(
+        ancestor === null
+          ? `local-only-unpushed: cannot verify ancestry of HEAD vs ${verified.sha.slice(0, 7)}; refusing reset`
+          : `local-only-unpushed: HEAD is not an ancestor of verified tip ${verified.sha.slice(0, 7)}; refusing reset (no force-push)`,
+      );
+    }
+
+    const head = await git(["rev-parse", "HEAD"]);
+    const localSha = head.stdout.trim();
+    if (localSha && localSha === verified.sha) {
+      return {
+        succeeded: true,
+        evidence:
+          `resync_workflow_state: managed worktree HEAD already matches verified tip ` +
+          `${verified.sha.slice(0, 7)} (${verified.source})`,
+      };
+    }
+
+    const ff = await git(["merge", "--ff-only", verified.sha]);
+    if (ff.code !== 0) {
+      const reset = await git(["reset", "--hard", verified.sha]);
+      if (reset.code !== 0) {
+        return failed(
+          `resync_workflow_state: fast-forward and reset --hard to ${verified.sha.slice(0, 7)} failed; no force-push`,
+        );
+      }
+    }
+    return {
+      succeeded: true,
+      evidence:
+        `resync_workflow_state moved managed worktree HEAD to verified ` +
+        `${verified.source} tip ${verified.sha.slice(0, 7)}`,
+    };
+  };
+
   const resyncMechanicalBlock = async (
     input: ExecuteRecoveryInput,
   ): Promise<RepairPipelineItemResult> => {
@@ -1960,6 +2080,20 @@ export function realExecuteRecovery(
     if (!Number.isSafeInteger(issueNumber) || issueNumber <= 0) {
       return failed(`recovery action ${input.action} requires a positive numeric item id`);
     }
+
+    const staleTip =
+      input.action === "resync_workflow_state" &&
+      input.blockerClass === "workflow-state" &&
+      isStaleTipPushEvidence({
+        reasonCode: input.diagnostic.reason_code,
+        blockerKind: input.diagnostic.detail.blocker_kind,
+        reason: input.diagnostic.detail.reason,
+      });
+    if (staleTip) {
+      const currency = await resyncStaleTipWorktree(issueNumber);
+      if (!currency.succeeded) return currency;
+    }
+
     let before: Awaited<ReturnType<typeof getIssueDetail>>;
     try {
       before = await getDetail(cfg, issueNumber);
@@ -1986,7 +2120,9 @@ export function realExecuteRecovery(
     }
     return {
       succeeded: true,
-      evidence: `recovery action ${input.action} cleared the mechanical blocked state and verified normal whole-item redispatch is admissible`,
+      evidence: staleTip
+        ? `recovery action ${input.action} rematerialized or fast-forwarded the managed worktree to the verified PR / remote tip, cleared the mechanical blocked state, and verified normal whole-item redispatch is admissible`
+        : `recovery action ${input.action} cleared the mechanical blocked state and verified normal whole-item redispatch is admissible`,
     };
   };
 

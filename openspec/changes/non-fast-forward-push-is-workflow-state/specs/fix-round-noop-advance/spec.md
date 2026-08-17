@@ -14,3 +14,16 @@ When the fix stage has a `fix-no-actionable-work` advance decision (empty effect
 - **WHEN** a fix round produced new local commits that are not ancestors of `origin/<branch>`
 - **THEN** the stage SHALL push through the shared currency-check wrapper
 - **AND** a non-fast-forward reject SHALL follow `push-failure-classification` (workflow-state, never force-push)
+
+#### Scenario: Equal HEAD and verified remote skip push
+- **WHEN** a fix round returns `fix-no-actionable-work`
+- **AND** local HEAD equals the verified open-PR or remote head
+- **THEN** the fix stage SHALL skip the push
+- **AND** it SHALL advance to the round’s next stage
+
+#### Scenario: Unverified remote head does not skip or reset
+- **WHEN** a fix round returns `fix-no-actionable-work`
+- **AND** the open-PR head and `origin/<branch>` cannot be verified
+- **THEN** the stage SHALL NOT skip the push as if HEAD were current
+- **AND** it SHALL NOT reset or rematerialize the worktree
+- **AND** it SHALL fall through to the shared currency-check wrapper

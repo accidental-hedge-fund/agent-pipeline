@@ -39,6 +39,7 @@ import {
   gitInWorktree,
   reattachIfDetached,
   renderWorktreeStateSection,
+  resolveOpenPrHeadForBranch,
   type EnsureManagedWorktreeDeps,
   type EnsureManagedWorktreeResult,
 } from "../worktree.ts";
@@ -92,6 +93,7 @@ import {
   type ValidateFn,
 } from "../openspec-consistency.ts";
 import {
+  decideAncestorPushAfterNoop,
   prescribedFixCommitSubject,
   pushWithCurrencyCheck,
   selfFixPipelineFormat,
@@ -205,6 +207,16 @@ export interface AdvanceFixDeps {
    * {@link pushWithCurrencyCheck}.
    */
   pushWithCurrency?: typeof pushWithCurrencyCheck;
+  /**
+   * Git in the managed worktree. Used by the #1103 ancestor skip-push gate
+   * and the currency-check wrapper. Tests inject fakes so no real git runs.
+   */
+  gitInWorktree?: typeof gitInWorktree;
+  /**
+   * Open-PR head for the ancestor skip-push / verified-target resolve.
+   * Defaults to {@link resolveOpenPrHeadForBranch}. Tests inject fakes.
+   */
+  resolveOpenPrHeadForBranch?: typeof resolveOpenPrHeadForBranch;
   /** Injectable sleep for push/backoff wrappers (#760). */
   sleep?: (ms: number) => Promise<void>;
   /**
@@ -1434,57 +1446,77 @@ export async function advanceFix(
   // #760: transient-retryable push with currency re-sync (no force-push).
   // Authoritative delivery uses configured git.push_auth (#980).
   const pushAuth = cfg.git?.push_auth ?? DEFAULT_GIT_PUSH_AUTH;
+  const gitWt = deps.gitInWorktree ?? gitInWorktree;
   const localHead = (
-    await gitInWorktree(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
+    await gitWt(wt.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
   ).stdout.trim();
-  const pushFn = deps.pushWithCurrency ?? pushWithCurrencyCheck;
-  const pushResult = await pushFn(branch, {
-    siteId: "stages.fix:push-failed#0",
-    expectedLocalSha: localHead || null,
-    sleep: deps.sleep,
-    git: async (args) => {
-      // Currency-check uses fetch/rev-parse; push uses configured auth via the
-      // same injectable gitInWorktree seam unit tests already fake (#980).
-      if (args[0] === "push") {
-        const res = await runConfiguredGitPush({
-          cwd: wt.path,
-          auth: pushAuth,
-          args: ["push", "origin", branch],
-          deps: {
-            gitConfigGet: async (cwd, key) => {
-              const r = await gitInWorktree(cwd, ["config", "--get", key], {
-                ignoreFailure: true,
-              });
-              return r.code === 0 ? r.stdout.trim() || null : null;
+  // #1103: after fix-no-actionable-work, skip a behind-remote / equal-head
+  // push. Do not push the older tip. Verification failure falls through.
+  let skipAncestorPush = false;
+  if (externalAdvance) {
+    const resolvePr = deps.resolveOpenPrHeadForBranch ?? resolveOpenPrHeadForBranch;
+    const ancestorDecision = await decideAncestorPushAfterNoop(branch, {
+      localHead: localHead || "HEAD",
+      git: async (args) => gitWt(wt.path, args, { ignoreFailure: true }),
+      resolveOpenPrHead: async () => {
+        const pr = await resolvePr(cfg, branch);
+        return pr?.headSha ?? null;
+      },
+    });
+    if (ancestorDecision.action === "skip") {
+      skipAncestorPush = true;
+    }
+  }
+  if (!skipAncestorPush) {
+    const pushFn = deps.pushWithCurrency ?? pushWithCurrencyCheck;
+    const pushResult = await pushFn(branch, {
+      siteId: "stages.fix:push-failed#0",
+      expectedLocalSha: localHead || null,
+      sleep: deps.sleep,
+      git: async (args) => {
+        // Currency-check uses fetch/rev-parse; push uses configured auth via the
+        // same injectable gitInWorktree seam unit tests already fake (#980).
+        if (args[0] === "push") {
+          const res = await runConfiguredGitPush({
+            cwd: wt.path,
+            auth: pushAuth,
+            args: ["push", "origin", branch],
+            deps: {
+              gitConfigGet: async (cwd, key) => {
+                const r = await gitWt(cwd, ["config", "--get", key], {
+                  ignoreFailure: true,
+                });
+                return r.code === 0 ? r.stdout.trim() || null : null;
+              },
+              // Forward GIT_ASKPASS / token child env into the git process (#980).
+              gitExec: gitExecForwardingEnv(wt.path, gitWt),
             },
-            // Forward GIT_ASKPASS / token child env into the git process (#980).
-            gitExec: gitExecForwardingEnv(wt.path, gitInWorktree),
-          },
-        });
-        return {
-          code: res.code,
-          stdout: res.stdout,
-          stderr: res.errorMessage ?? res.stderr,
-        };
-      }
-      return gitInWorktree(wt.path, args, { ignoreFailure: true });
-    },
-  } satisfies PushWithCurrencyDeps);
-  if (!pushResult.ok) {
-    const pushFailedMsg = formatPushAuthFailure(pushAuth, `after fix: ${pushResult.reason}`);
-    await setBlocked(cfg, issueNumber, pushFailedMsg, stage, "push-failed");
-    return {
-      advanced: false,
-      status: "blocked",
-      reason: pushFailedMsg,
-      blockerKind: "push-failed",
-      diagnostic: buildStageDiagnostic({
-        reasonCode: pushResult.head_drift ? "workflow-state" : "transient-infra",
-        blockerKind: "push-failed",
+          });
+          return {
+            code: res.code,
+            stdout: res.stdout,
+            stderr: res.errorMessage ?? res.stderr,
+          };
+        }
+        return gitWt(wt.path, args, { ignoreFailure: true });
+      },
+    } satisfies PushWithCurrencyDeps);
+    if (!pushResult.ok) {
+      const pushFailedMsg = formatPushAuthFailure(pushAuth, `after fix: ${pushResult.reason}`);
+      await setBlocked(cfg, issueNumber, pushFailedMsg, stage, "push-failed");
+      return {
+        advanced: false,
+        status: "blocked",
         reason: pushFailedMsg,
-        stage,
-      }),
-    };
+        blockerKind: "push-failed",
+        diagnostic: buildStageDiagnostic({
+          reasonCode: pushResult.reason_code,
+          blockerKind: "push-failed",
+          reason: pushFailedMsg,
+          stage,
+        }),
+      };
+    }
   }
 
   if (externalAdvance) {

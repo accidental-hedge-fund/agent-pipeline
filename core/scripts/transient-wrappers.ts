@@ -110,6 +110,76 @@ export interface GitPushResult {
   code: number;
 }
 
+/**
+ * Complete #1038 park stderr (2026-08-17, v1.39.1, loop-73346e80c28e4e77-s1).
+ * Local tip `8ea2d1a` was behind remote PR head `bb208ba`. Git rejected
+ * non-fast-forward; waiting cannot make an older tip fast-forward.
+ */
+export const NON_FAST_FORWARD_PUSH_STDERR_1038 = [
+  "To github.com:example/repo.git",
+  " ! [rejected]        pipeline/1038-x -> pipeline/1038-x (non-fast-forward)",
+  "error: failed to push some refs to 'github.com:example/repo.git'",
+  "hint: Updates were rejected because the tip of your current branch is behind",
+  "hint: its remote counterpart. Fetch first.",
+].join("\n");
+
+export interface PushFailureClassification {
+  reason_code: StageDiagnosticReasonCode;
+  head_drift: boolean;
+  retryable: boolean;
+}
+
+/** Case-insensitive tokens that mark a stale-tip / non-fast-forward reject. */
+const NON_FAST_FORWARD_TOKENS = ["non-fast-forward", "rejected", "fetch first"] as const;
+
+function containsNonFastForwardToken(stderr: string): boolean {
+  const s = stderr.toLowerCase();
+  return NON_FAST_FORWARD_TOKENS.some((token) => s.includes(token));
+}
+
+function isTransientTransportPushError(stderr: string): boolean {
+  const s = stderr.toLowerCase();
+  if (isTransientGhError(stderr)) return true;
+  if (s.includes("could not read from remote") || s.includes("connection reset")) return true;
+  if (s.includes("rpc failed") || s.includes("early eof") || s.includes("http 5")) return true;
+  if (s.includes("timed out") || s.includes("timeout")) return true;
+  return false;
+}
+
+/**
+ * Classify git-push stderr before retry eligibility. Non-fast-forward /
+ * rejected / fetch-first is workflow-state with head_drift, never
+ * transient-infra. HTTP 5xx / connection-reset without those tokens stay
+ * transient-infra and may retry.
+ */
+export function classifyPushFailure(stderr: string): PushFailureClassification {
+  if (containsNonFastForwardToken(stderr)) {
+    return { reason_code: "workflow-state", head_drift: true, retryable: false };
+  }
+  if (isTransientTransportPushError(stderr)) {
+    return { reason_code: "transient-infra", head_drift: false, retryable: true };
+  }
+  return { reason_code: "transient-infra", head_drift: false, retryable: false };
+}
+
+/** True when stderr is a transient transport blip eligible for currency retry. */
+export function isTransientPushError(stderr: string): boolean {
+  return classifyPushFailure(stderr).retryable;
+}
+
+/** True when a parked diagnostic is the stale-tip / non-fast-forward class. */
+export function isStaleTipPushEvidence(opts: {
+  reasonCode?: string;
+  blockerKind?: string;
+  reason?: string;
+}): boolean {
+  const reason = (opts.reason ?? "").toLowerCase();
+  if (opts.blockerKind === "push-failed" && opts.reasonCode === "workflow-state") {
+    return true;
+  }
+  return containsNonFastForwardToken(reason);
+}
+
 export interface PushWithCurrencyDeps extends BackoffDeps {
   /** git in worktree: (args) => result */
   git: (args: string[]) => Promise<GitPushResult>;
@@ -131,22 +201,25 @@ export type PushWithCurrencyResult =
       head_drift: boolean;
     };
 
-function isTransientPushError(stderr: string): boolean {
-  const s = stderr.toLowerCase();
-  if (isTransientGhError(stderr)) return true;
-  if (s.includes("could not read from remote") || s.includes("connection reset")) return true;
-  if (s.includes("rpc failed") || s.includes("early eof") || s.includes("http 5")) return true;
-  if (s.includes("timed out") || s.includes("timeout")) return true;
-  // Reject non-fast-forward / rejected updates as non-transient.
-  if (s.includes("non-fast-forward") || s.includes("fetch first") || s.includes("rejected")) {
-    return false;
-  }
-  return false;
+function classifiedPushFailure(
+  stderr: string,
+  attempts: number,
+): Extract<PushWithCurrencyResult, { ok: false }> {
+  const classified = classifyPushFailure(stderr);
+  return {
+    ok: false,
+    attempts,
+    reason: stderr,
+    reason_code: classified.reason_code,
+    head_drift: classified.head_drift,
+  };
 }
 
 /**
- * Push with bounded retry. Before each retry, re-sync/fetch and verify local
- * HEAD still matches the owned/reviewed candidate. Never force-pushes.
+ * Push with bounded retry. Classify stderr before retry eligibility so a
+ * non-fast-forward is workflow-state on every path, including fail-closed
+ * siteId. Before each retry, re-sync/fetch and verify local HEAD still
+ * matches the owned/reviewed candidate. Never force-pushes.
  */
 export async function pushWithCurrencyCheck(
   branch: string,
@@ -156,13 +229,7 @@ export async function pushWithCurrencyCheck(
     // Still attempt once when called explicitly, but no retry loop for fail-closed sites.
     const once = await deps.git(["push", "origin", branch]);
     if (once.code === 0) return { ok: true, attempts: 1 };
-    return {
-      ok: false,
-      attempts: 1,
-      reason: once.stderr.trim() || "push failed",
-      reason_code: "transient-infra",
-      head_drift: false,
-    };
+    return classifiedPushFailure(once.stderr.trim() || "push failed", 1);
   }
 
   const retries = deps.retries ?? DEFAULT_TRANSIENT_RETRIES;
@@ -221,23 +288,118 @@ export async function pushWithCurrencyCheck(
     const push = await deps.git(["push", "origin", branch]);
     if (push.code === 0) return { ok: true, attempts: attempt + 1 };
     lastErr = push.stderr.trim() || push.stdout.trim() || "push failed";
-    if (!isTransientPushError(lastErr) || attempt >= retries - 1) {
-      return {
-        ok: false,
-        attempts: attempt + 1,
-        reason: lastErr,
-        reason_code: "transient-infra",
-        head_drift: false,
-      };
+    const classified = classifyPushFailure(lastErr);
+    if (!classified.retryable || attempt >= retries - 1) {
+      return classifiedPushFailure(lastErr, attempt + 1);
     }
   }
-  return {
-    ok: false,
-    attempts: retries,
-    reason: lastErr,
-    reason_code: "transient-infra",
-    head_drift: false,
-  };
+  return classifiedPushFailure(lastErr || "push failed", retries);
+}
+
+// ---------------------------------------------------------------------------
+// Verified remote head + ancestor skip-push (stale local tip)
+// ---------------------------------------------------------------------------
+
+export type VerifiedRemoteHead =
+  | { ok: true; sha: string; source: "open-pr" | "fetch-head" | "origin-branch" }
+  | { ok: false; reason: "unverified-remote-head" };
+
+export interface ResolveVerifiedRemoteHeadDeps {
+  git: (args: string[]) => Promise<GitPushResult>;
+  /** Open-PR head SHA for the managed branch, when an open PR exists. */
+  resolveOpenPrHead?: () => Promise<string | null>;
+}
+
+/**
+ * Resolve a verified target SHA: open-PR head first, else fetch and use
+ * FETCH_HEAD / origin/<branch>. Verification failure does not invent a tip.
+ */
+export async function resolveVerifiedRemoteHead(
+  branch: string,
+  deps: ResolveVerifiedRemoteHeadDeps,
+): Promise<VerifiedRemoteHead> {
+  let prSha: string | null = null;
+  if (deps.resolveOpenPrHead) {
+    try {
+      const raw = await deps.resolveOpenPrHead();
+      prSha = raw && raw.trim() ? raw.trim() : null;
+    } catch {
+      prSha = null;
+    }
+  }
+
+  const fetch = await deps.git(["fetch", "origin", branch]);
+  const fetchOk = fetch.code === 0;
+
+  if (prSha) {
+    if (fetchOk) {
+      const afterFetch = await deps.git(["rev-parse", "--verify", prSha]);
+      if (afterFetch.code === 0 && afterFetch.stdout.trim()) {
+        return { ok: true, sha: afterFetch.stdout.trim(), source: "open-pr" };
+      }
+    }
+    // PR head is still the preferred target when the lookup succeeded; the
+    // object may already be local even if fetch failed.
+    const local = await deps.git(["rev-parse", "--verify", prSha]);
+    if (local.code === 0 && local.stdout.trim()) {
+      return { ok: true, sha: local.stdout.trim(), source: "open-pr" };
+    }
+    if (!fetchOk) return { ok: false, reason: "unverified-remote-head" };
+    return { ok: false, reason: "unverified-remote-head" };
+  }
+
+  if (!fetchOk) return { ok: false, reason: "unverified-remote-head" };
+
+  const fetchHead = await deps.git(["rev-parse", "FETCH_HEAD"]);
+  const fetchSha = fetchHead.stdout.trim();
+  if (fetchHead.code === 0 && fetchSha) {
+    return { ok: true, sha: fetchSha, source: "fetch-head" };
+  }
+  const origin = await deps.git(["rev-parse", `origin/${branch}`]);
+  const originSha = origin.stdout.trim();
+  if (origin.code === 0 && originSha) {
+    return { ok: true, sha: originSha, source: "origin-branch" };
+  }
+  return { ok: false, reason: "unverified-remote-head" };
+}
+
+/** merge-base --is-ancestor: true, false, or null when git cannot decide. */
+export async function isAncestorOfVerifiedHead(
+  git: (args: string[]) => Promise<GitPushResult>,
+  ancestor: string,
+  verifiedHead: string,
+): Promise<boolean | null> {
+  const r = await git(["merge-base", "--is-ancestor", ancestor, verifiedHead]);
+  if (r.code === 0) return true;
+  if (r.code === 1) return false;
+  return null;
+}
+
+export type AncestorPushDecision =
+  | { action: "skip"; verifiedHead: string; source: "open-pr" | "fetch-head" | "origin-branch" }
+  | { action: "push"; reason: "local-ahead-or-diverged" | "unverified-remote-head" };
+
+/**
+ * After a fix-no-actionable-work decision: skip push when local HEAD is an
+ * ancestor of the verified open-PR / remote head (remote ahead or equal).
+ * Verification failure does not skip and does not reset.
+ */
+export async function decideAncestorPushAfterNoop(
+  branch: string,
+  deps: ResolveVerifiedRemoteHeadDeps & { localHead?: string },
+): Promise<AncestorPushDecision> {
+  const verified = await resolveVerifiedRemoteHead(branch, deps);
+  if (!verified.ok) return { action: "push", reason: "unverified-remote-head" };
+  const ancestor = await isAncestorOfVerifiedHead(
+    deps.git,
+    deps.localHead && deps.localHead.trim() ? deps.localHead.trim() : "HEAD",
+    verified.sha,
+  );
+  if (ancestor === true) {
+    return { action: "skip", verifiedHead: verified.sha, source: verified.source };
+  }
+  if (ancestor === null) return { action: "push", reason: "unverified-remote-head" };
+  return { action: "push", reason: "local-ahead-or-diverged" };
 }
 
 // ---------------------------------------------------------------------------

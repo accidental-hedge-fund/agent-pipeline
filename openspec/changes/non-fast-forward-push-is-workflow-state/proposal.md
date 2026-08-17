@@ -23,11 +23,14 @@ This is a class defect, not a fix-stage mole. `isTransientPushError` already ret
 
 - [ ] Fixture stderr from the #1038 park (`non-fast-forward` + behind-remote hint) classifies as `workflow-state` with `head_drift: true`. Without the fix the same fixture is `transient-infra` and the loop recipe is `wait_and_retry`.
 - [ ] The same fixture never projects to durable class `transient-rate-limit`.
-- [ ] Loop recovery for that diagnostic selects rematerialize / fast-forward to the PR or remote head, then continue. It does not select `wait_and_retry`.
-- [ ] After a `fix-no-actionable-work` noop, when local HEAD is an ancestor of `origin/<branch>`, the stage skips the push and advances.
+- [ ] One end-to-end unit test proves the chain: fixture → wrapper `workflow-state`/`head_drift` → `push-failed` diagnostic → durable `resync_workflow_state`, and the recipe list excludes `wait_and_retry`.
+- [ ] Loop recovery for that diagnostic resolves the open-PR head first, otherwise the verified remote tip, then rematerialize / fast-forward only a clean non-unique managed tree. It does not select `wait_and_retry`.
+- [ ] After a `fix-no-actionable-work` noop, when verified `merge-base --is-ancestor HEAD <verified-head>` holds (remote ahead or equal), the stage skips the push and advances. Verification failure does not skip or reset.
+- [ ] Dirty or local-only unique work refuses rematerialize/reset typed (`dirty-worktree` / `local-only-unpushed`) and does not become `wait_and_retry`.
 - [ ] No recovery or retry path issues `git push --force` or `--force-with-lease` for this class.
 - [ ] A true HTTP 5xx / connection-reset push still classifies as `transient-infra` and may still retry under the existing `transient-retryable` wrapper.
 - [ ] Fail-closed `siteId` path on the same wrapper still emits `workflow-state` / `head_drift: true` for the #1038 fixture (not blanket `transient-infra`).
+- [ ] Every `pushWithCurrencyCheck` caller emits the wrapper `reason_code` on `push-failed`.
 - [ ] Unit tests inject deps. They do no real network, git, or subprocess. `openspec validate` passes. Implementation later lands with `npm run ci` green and regenerated `plugin/` if `core/` changes.
 
 ## Capabilities

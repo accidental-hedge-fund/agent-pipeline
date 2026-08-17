@@ -17,4 +17,20 @@ When a durable item blocks with class `workflow-state` because a push was reject
 #### Scenario: Dirty or local-only unique work still refuses destroy
 - **WHEN** rematerialize or hard reset to the PR / remote head would destroy a dirty or local-only unpushed product candidate
 - **THEN** the recipe SHALL refuse that destroy
-- **AND** the attempt SHALL fail typed without a force-push
+- **AND** the attempt SHALL fail typed (`dirty-worktree` or `local-only-unpushed`) without a force-push
+- **AND** the mechanical blocked label SHALL remain
+- **AND** the durable class SHALL stay `workflow-state`
+- **AND** the next compiled recipe SHALL NOT be `wait_and_retry`
+
+#### Scenario: Recovery resolves open-PR head before origin branch
+- **WHEN** `resync_workflow_state` runs for a stale-tip / non-fast-forward diagnostic
+- **AND** an open PR exists for the managed branch
+- **THEN** the target SHA SHALL be that open-PR head
+- **AND** the recipe SHALL NOT reset or rematerialize until that SHA is verified
+- **AND** when no open PR exists, the recipe SHALL fetch and verify `origin/<branch>` (or `FETCH_HEAD` from that fetch) before any reset
+
+#### Scenario: Unverified remote head refuses without mutate
+- **WHEN** neither an open-PR head nor `origin/<branch>` can be verified
+- **THEN** the recipe SHALL fail typed (`unverified-remote-head`)
+- **AND** it SHALL NOT reset, rematerialize, or force-push
+- **AND** it SHALL NOT select `wait_and_retry`

@@ -720,7 +720,7 @@ export async function createWorktree(
   const writeManagedMarkerFn = deps.writeManagedMarker ?? writeManagedMarker;
   const dirtyFn = deps.hasDirtyWorkdir ?? hasDirtyWorkdir;
   const localOnlyFn = deps.hasLocalOnlyCommits ?? checkLocalOnlyCommits;
-  const resolveOpenPrHeadFn = deps.resolveOpenPrHeadForBranch ?? realResolveOpenPrHeadForBranch;
+  const resolveOpenPrHeadFn = deps.resolveOpenPrHeadForBranch ?? resolveOpenPrHeadForBranch;
 
   const wtPath = worktreePath(cfg, issueNumber, slug);
   const branch = branchName(issueNumber, slug);
@@ -1506,7 +1506,7 @@ export async function ensureManagedWorktree(
   const removeFn = deps.removeWorktree ?? removeWorktree;
   const getTitleFn = deps.getIssueTitle ?? defaultGetIssueTitle;
   const gitFn = deps.gitCmd ?? git;
-  const resolveOpenPrHeadFn = deps.resolveOpenPrHeadForBranch ?? realResolveOpenPrHeadForBranch;
+  const resolveOpenPrHeadFn = deps.resolveOpenPrHeadForBranch ?? resolveOpenPrHeadForBranch;
   const gitWtFn = deps.gitInWorktree ?? gitInWorktree;
   const existsFn = deps.existsSync ?? ((p: string) => fs.existsSync(p));
 
@@ -2049,7 +2049,7 @@ async function realHasRemoteBranchTip(cfg: PipelineConfig, branch: string): Prom
 }
 
 /** Resolve open same-repo PR head SHA for a branch (create + park-release). */
-async function realResolveOpenPrHeadForBranch(
+export async function resolveOpenPrHeadForBranch(
   cfg: PipelineConfig,
   branch: string,
 ): Promise<{ prNumber: number; headSha: string } | null> {
@@ -2087,7 +2087,7 @@ export async function releaseWorktreeForParkedIssue(
   const localOnlyFn = deps.hasLocalOnlyCommits ?? checkLocalOnlyCommits;
   const existsFn = deps.pathExists ?? fs.existsSync;
   const remoteTipFn = deps.hasRemoteBranchTip ?? realHasRemoteBranchTip;
-  const resolveOpenPrHeadFn = deps.resolveOpenPrHeadForBranch ?? realResolveOpenPrHeadForBranch;
+  const resolveOpenPrHeadFn = deps.resolveOpenPrHeadForBranch ?? resolveOpenPrHeadForBranch;
   const removeFn = deps.removeWorktree ?? realRemoveWorktreeOp;
 
   const records = await listFn(cfg);

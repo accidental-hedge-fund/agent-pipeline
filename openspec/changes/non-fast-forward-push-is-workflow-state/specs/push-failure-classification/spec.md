@@ -32,6 +32,11 @@ A stage that blocks after a shared-wrapper push failure SHALL emit the stage dia
 - **THEN** the emitted stage diagnostic `reason_code` SHALL be `workflow-state`
 - **AND** the durable loop recipe selected for that diagnostic SHALL NOT be `wait_and_retry`
 
+#### Scenario: Planning-stage push-failed diagnostic uses wrapper reason
+- **WHEN** the planning stage blocks with `blockerKind: "push-failed"` after the shared wrapper returns a classified failure
+- **THEN** the emitted stage diagnostic `reason_code` SHALL be the wrapper `reason_code`
+- **AND** the stage SHALL NOT omit the diagnostic or replace it with a site-default `transient-infra`
+
 ### Requirement: The engine SHALL never force-push to reconcile a non-fast-forward
 The engine SHALL NOT issue `git push --force` or `git push --force-with-lease` to make a stale or diverged local tip overwrite the PR or remote head. A non-fast-forward result SHALL recover by rematerialize or fast-forward of the managed worktree to that remote head, or by skipping a redundant ancestor push, never by rewriting the remote tip.
 
