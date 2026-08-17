@@ -1,18 +1,22 @@
-# #1099 Revised plan — needs-human only for operator scope-change text
+# #1041 Revised plan — refuse no-frg production pin
 
 ## Status
 - [x] Plan review feedback incorporated (see chat `## Feedback Incorporated`)
-- [x] Implementation (do not start until this revised plan is accepted)
+- [x] Implementation
+
+## Results
+- Default `promoteProductionPin` refuses `no-frg-*` / missing FRG / null evidence and does not mutate the pin.
+- Non-skip success writes the FRG `run_id` and a non-null evidence path.
+- `--skip-frg` / `allowWithoutFrg` still writes `no-frg-<version>` + null evidence.
+- Same-version `no-frg-*` is not already-current unless skip is active.
+- Factory pinned `evaluateEngineTrackCheck` fails a matching-version `no-frg-*` pin.
 
 ## Locked decisions (post-review)
 
-1. One exported classifier + one exported gate applicator. Both `fix.ts` and `review-routing.ts` consume the applicator. They do not call `findUnacknowledgedComments` alone.
-2. Three dispositions only. Untrusted free-form (including a neutral “LGTM”) is `operator-scope-change`.
-3. Deterministic recognizers only. No LLM. No “reads as operator-authored.”
-4. Heading + terminal artifact requires a recognized heading, a last-occurrence marker line, syntactic decode, and only whitespace after the last marker. Hash match is not required.
-5. Recover for `ambiguous-trusted` is an in-engine stage transition to `planning`. Fallback block uses `harness-failure`, never `needs-human`.
-6. Reuse `PIPELINE_COMMENT_KINDS`, `extractReviewArtifact`, `extractPipelineAttestation`, and `buildTrustedOverrideComments`. Do not add call-site regexes.
-7. Do not edit the #1098 hash-after-banner bind.
-8. OpenSpec change `openspec/changes/ack-gate-needs-human-only-for-operator-text/` is an implementation deliverable. Patch it in place to match these locks.
+1. Command split is not shared skip. `pipeline factory-pin promote` is FRG-only. `pipeline engine-promote` may use `resolveFrgSkip`.
+2. One exported predicate `isProductionQualityPin` is used by default promote, already-current, and factory pinned doctor.
+3. All FRG validation runs before any pin write. Every refusal leaves the pin file byte-for-byte unchanged.
+4. Doctor fail-closed uses `isFactoryControlRepo` + `resolveEngineTrackIntent`. Non-factory (`intent === null`) and candidate soak do not fail solely for a `no-frg-*` pin.
+5. OpenSpec change `openspec/changes/refuse-no-frg-production-pin/` is patched in place to match these locks.
 
-See the chat revised implementation plan for the full Approach, API, recognizers, call-site routing, tests, and acceptance criteria.
+See the chat revised implementation plan for Approach, API, tests, and acceptance criteria.

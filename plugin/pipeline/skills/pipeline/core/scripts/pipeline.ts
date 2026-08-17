@@ -801,7 +801,7 @@ export function buildCmd(): Command {
     )
     .option(
       "--skip-frg",
-      "release / engine-promote: thin-ship opt-out — do not require Factory Reliability Gate latest.json (FRG remains available via factory-gate)",
+      "release / engine-promote: explicit escape — skip Factory Reliability Gate latest.json and write a non-production-quality pin (no-frg-<version>, null evidence). Default promote requires a real FRG pass.",
     )
     .option("--description <text>", "intake/decompose: free-text description or decomposition seed")
     .option("--epic <n>", "decompose: parent epic issue number", Number)
@@ -5381,10 +5381,12 @@ async function main(): Promise<void> {
     if (!version) {
       console.error(
         "pipeline engine-promote: --for <X.Y.Z> is required.\n" +
-          "  Usage: pipeline engine-promote --for <X.Y.Z> [--host all|codex|claude|grok|opencode] [--dry-run] [--json] [--skip-install]\n" +
-          "  Verifies the GitHub Release, promotes the production pin (FRG-gated), installs the exact tag\n" +
+          "  Usage: pipeline engine-promote --for <X.Y.Z> [--host all|codex|claude|grok|opencode] [--dry-run] [--json] [--skip-install] [--skip-frg]\n" +
+          "  Verifies the GitHub Release, promotes a production-quality pin from a real FRG pass\n" +
+          "  (frg_run_id + frg_evidence_path; refuses no-frg-*), installs the exact tag\n" +
           "  to all configured hosts by default (override with --host), and verifies installed version.\n" +
-          "  Rolls the pin back if install/verify fails after promote. Never merges PRs or creates tags.",
+          "  --skip-frg writes a marked non-production-quality pin only. Rolls the pin back if\n" +
+          "  install/verify fails after promote. Never merges PRs or creates tags.",
       );
       process.exit(2);
     }
@@ -5520,7 +5522,9 @@ async function main(): Promise<void> {
         if (!version) {
           console.error(
             "pipeline factory-pin promote: --for <X.Y.Z> is required.\n" +
-              "  Usage: pipeline factory-pin promote --for <X.Y.Z> [--git-sha <sha>]",
+              "  Usage: pipeline factory-pin promote --for <X.Y.Z> [--git-sha <sha>]\n" +
+              "  Requires FRG pass:true with a real run_id (not no-frg-*) and writes frg_evidence_path.\n" +
+              "  There is no --skip-frg on this command. Never merges or tags.",
           );
           process.exit(2);
         }

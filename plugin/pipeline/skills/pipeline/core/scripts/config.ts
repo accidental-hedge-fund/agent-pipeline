@@ -716,7 +716,7 @@ const PartialConfigSchema = z.object({
     .boolean()
     .optional()
     .describe(
-      "Escape that skips Factory Reliability Gate (FRG) on pipeline release and pipeline engine-promote. Unset or false keeps FRG required. CLI --skip-frg still wins.",
+      "Escape that skips Factory Reliability Gate (FRG) on pipeline release and pipeline engine-promote. Unset or false keeps FRG required. CLI --skip-frg still wins. A skip promote writes a non-production-quality pin (no-frg-<version>, null evidence), not a production-quality FRG pin.",
     ),
   production_engine_pin_path: z
     .string()
@@ -3793,8 +3793,8 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
       : `# engine_track: pinned # ${sd("engine_track", 'optional: "pinned" | "candidate"; factory-gate forces candidate; non-factory unset leaves policy inactive')}`,
     // FRG skip escape (#1092) — optional; commented off so the default stays FRG-on.
     config.skip_frg !== undefined
-      ? `skip_frg: ${yamlScalar(config.skip_frg)} # ${sd("skip_frg", "Escape that skips Factory Reliability Gate (FRG) on pipeline release and pipeline engine-promote. Unset or false keeps FRG required. CLI --skip-frg still wins.")}`
-      : `# skip_frg: false # ${sd("skip_frg", "Escape that skips Factory Reliability Gate (FRG) on pipeline release and pipeline engine-promote. Unset or false keeps FRG required. CLI --skip-frg still wins.")}`,
+      ? `skip_frg: ${yamlScalar(config.skip_frg)} # ${sd("skip_frg", "Escape that skips Factory Reliability Gate (FRG) on pipeline release and pipeline engine-promote. Unset or false keeps FRG required. CLI --skip-frg still wins. A skip promote writes a non-production-quality pin (no-frg-<version>, null evidence), not a production-quality FRG pin.")}`
+      : `# skip_frg: false # ${sd("skip_frg", "Escape that skips Factory Reliability Gate (FRG) on pipeline release and pipeline engine-promote. Unset or false keeps FRG required. CLI --skip-frg still wins. A skip promote writes a non-production-quality pin (no-frg-<version>, null evidence), not a production-quality FRG pin.")}`,
     config.production_engine_pin_path !== undefined
       ? `production_engine_pin_path: ${yamlScalar(config.production_engine_pin_path)} # ${sd("production_engine_pin_path", "absolute override for factory production pin JSON")}`
       : `# production_engine_pin_path: /path/to/production-engine-pin.json # ${sd("production_engine_pin_path", "optional; factory control authority, not every product target")}`,

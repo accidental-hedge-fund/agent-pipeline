@@ -19,6 +19,8 @@ import {
   formatProductionPinSummary,
   initProductionPin,
   isFactoryControlRepo,
+  isNoFrgRunId,
+  isProductionQualityPin,
   parseInstallReceipt,
   parseProductionEnginePin,
   pinInstallProvenanceMatches,
@@ -284,6 +286,40 @@ test("parseProductionEnginePin: normalizes leading v on version", () => {
 test("parseProductionEnginePin: rejects missing frg_run_id", () => {
   const bad = { ...validPin(), frg_run_id: "" };
   assert.throws(() => parseProductionEnginePin(JSON.stringify(bad)), /frg_run_id/);
+});
+
+test("parseProductionEnginePin: still parses no-frg-* / null-evidence skip pins (#1041)", () => {
+  const pin = parseProductionEnginePin(
+    JSON.stringify(
+      validPin({
+        version: "1.37.0",
+        tag: "v1.37.0",
+        frg_run_id: "no-frg-1.37.0",
+        frg_evidence_path: null,
+      }),
+    ),
+  );
+  assert.equal(pin.frg_run_id, "no-frg-1.37.0");
+  assert.equal(pin.frg_evidence_path, null);
+  assert.equal(isProductionQualityPin(pin), false);
+});
+
+test("isProductionQualityPin: no-frg run_id or null/empty evidence is not production-quality (#1041)", () => {
+  assert.equal(isProductionQualityPin(validPin()), true);
+  assert.equal(isProductionQualityPin(validPin({ frg_run_id: "no-frg-1.37.0" })), false);
+  assert.equal(isProductionQualityPin(validPin({ frg_evidence_path: null })), false);
+  assert.equal(isProductionQualityPin(validPin({ frg_evidence_path: "" })), false);
+  assert.equal(isProductionQualityPin(validPin({ frg_evidence_path: "   " })), false);
+  assert.equal(isNoFrgRunId("no-frg-1.37.0"), true);
+  assert.equal(isNoFrgRunId("frg-abc"), false);
+  assert.equal(isProductionQualityPin({ run_id: "no-frg-1.37.0" }), false);
+  assert.equal(
+    isProductionQualityPin({
+      run_id: "frg-abc",
+      frg_evidence_path: ".agent-pipeline/frg/1.37.0/latest.json",
+    }),
+    true,
+  );
 });
 
 test("parseProductionEnginePin: rejects bad schema_version", () => {
@@ -807,6 +843,71 @@ test("evaluateEngineTrackCheck: reports sha unknown when absent", () => {
   assert.match(r.detail, /unknown/);
 });
 
+test("evaluateEngineTrackCheck: factory pinned fails matching-version no-frg pin (#1041)", () => {
+  const pin = validPin({
+    frg_run_id: "no-frg-1.29.1",
+    frg_evidence_path: null,
+  });
+  const r = evaluateEngineTrackCheck({
+    intent: "pinned",
+    pinLoad: { kind: "ok", pin, path: PIN_PATH },
+    runningVersion: "1.29.1",
+    installProvenance: pinProvenance(),
+  });
+  assert.equal(r.status, "fail");
+  assert.match(r.detail, /no-frg/);
+  assert.match(r.remediation ?? "", /factory-pin promote|engine-promote/);
+  assert.doesNotMatch(r.remediation ?? "", /^$/);
+});
+
+test("evaluateEngineTrackCheck: factory pinned fails matching-version null-evidence pin (#1041)", () => {
+  const pin = validPin({
+    frg_run_id: "frg-test-run-1",
+    frg_evidence_path: null,
+  });
+  const r = evaluateEngineTrackCheck({
+    intent: "pinned",
+    pinLoad: { kind: "ok", pin, path: PIN_PATH },
+    runningVersion: "1.29.1",
+    installProvenance: pinProvenance(),
+  });
+  assert.equal(r.status, "fail");
+  assert.match(r.detail, /frg_evidence_path|null/i);
+  assert.match(r.remediation ?? "", /FRG pass|factory-pin promote|engine-promote/);
+});
+
+test("evaluateEngineTrackCheck: non-factory does not fail solely for no-frg (#1041)", () => {
+  const pin = validPin({
+    version: "1.37.0",
+    tag: "v1.37.0",
+    frg_run_id: "no-frg-1.37.0",
+    frg_evidence_path: null,
+  });
+  const r = evaluateEngineTrackCheck({
+    intent: null,
+    pinLoad: { kind: "ok", pin, path: PIN_PATH },
+    runningVersion: "1.37.0",
+  });
+  assert.equal(r.status, "pass");
+  assert.match(r.detail, /no-frg|not production-quality/);
+});
+
+test("evaluateEngineTrackCheck: candidate soak reports no-frg without failing for it (#1041)", () => {
+  const pin = validPin({
+    version: "1.37.0",
+    tag: "v1.37.0",
+    frg_run_id: "no-frg-1.37.0",
+    frg_evidence_path: null,
+  });
+  const r = evaluateEngineTrackCheck({
+    intent: "candidate",
+    pinLoad: { kind: "ok", pin, path: PIN_PATH },
+    runningVersion: "1.37.0",
+  });
+  assert.equal(r.status, "pass");
+  assert.match(r.detail, /no-frg/);
+});
+
 // ---------------------------------------------------------------------------
 // Promote
 // ---------------------------------------------------------------------------
@@ -836,6 +937,8 @@ test("promoteProductionPin: success from FRG pass retains previous", async () =>
     assert.equal(result.pin.version, "1.30.0");
     assert.equal(result.pin.tag, "v1.30.0");
     assert.equal(result.pin.frg_run_id, "frg-new");
+    assert.ok(result.pin.frg_evidence_path);
+    assert.doesNotMatch(result.pin.frg_run_id, /^no-frg-/);
     assert.equal(result.pin.git_sha, "abc123def4567890abc123def4567890abc123de");
     assert.equal(result.pin.git_sha_source, "promote-arg");
     assert.equal(result.pin.previous?.version, "1.29.1");
@@ -863,6 +966,49 @@ test("promoteProductionPin: refuses missing FRG — no mutation", async () => {
   assert.equal(result.ok, false);
   if (!result.ok) assert.equal(result.code, "missing_frg");
   assert.equal(files.get(PIN_PATH), before);
+});
+
+test("promoteProductionPin: default refuses no-frg run_id — no mutation (#1041)", async () => {
+  const existing = validPin();
+  const before = JSON.stringify(existing);
+  const { deps, files } = memFs({ [PIN_PATH]: before });
+  const result = await promoteProductionPin({
+    repoDir: REPO,
+    version: "1.37.0",
+    fsDeps: deps,
+    env: {},
+    lookupFrg: async () => ({
+      kind: "pass",
+      evidence: passEvidence("1.37.0", "no-frg-1.37.0"),
+    }),
+  });
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.code, "no_frg_marker");
+  assert.equal(files.get(PIN_PATH), before);
+  assert.equal(files.has(`${PIN_PATH}.tmp`), false);
+});
+
+test("promoteProductionPin: default does not write no-frg marker without skip (#1041)", async () => {
+  const existing = validPin();
+  const before = JSON.stringify(existing);
+  const { deps, files } = memFs({ [PIN_PATH]: before });
+  const result = await promoteProductionPin({
+    repoDir: REPO,
+    version: "1.37.0",
+    fsDeps: deps,
+    env: {},
+    lookupFrg: async () => ({
+      kind: "missing",
+      version: "1.37.0",
+      path: "/repo/.agent-pipeline/frg/1.37.0/latest.json",
+    }),
+  });
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.code, "missing_frg");
+  assert.equal(files.get(PIN_PATH), before);
+  const written = files.get(PIN_PATH);
+  assert.ok(written);
+  assert.doesNotMatch(written, /no-frg-1\.37\.0/);
 });
 
 test("promoteProductionPin: allowWithoutFrg promotes without FRG evidence", async () => {

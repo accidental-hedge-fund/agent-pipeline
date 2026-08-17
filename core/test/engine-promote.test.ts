@@ -32,6 +32,7 @@ function pin(v: string, prev?: string): ProductionEnginePin {
     version: v,
     tag: `v${v}`,
     frg_run_id: `frg-${v}`,
+    frg_evidence_path: `.agent-pipeline/frg/${v}/latest.json`,
     promoted_at: "2026-08-09T00:00:00.000Z",
   };
   if (prev) {
@@ -311,6 +312,98 @@ test("engine-promote: skip install when pin already current", async () => {
   assert.equal(result.pin_promoted, false);
   assert.equal(result.install_ran, false);
   assert.ok(result.steps.some((s) => s.includes("pin_already_current")));
+});
+
+test("engine-promote: same-version no-frg pin is not already-current without skip (#1041)", async () => {
+  const noFrg: ProductionEnginePin = {
+    schema_version: 1,
+    version: "1.34.0",
+    tag: "v1.34.0",
+    frg_run_id: "no-frg-1.34.0",
+    frg_evidence_path: null,
+    promoted_at: "2026-08-09T00:00:00.000Z",
+  };
+  let promoteCalls = 0;
+  let seenAllow: boolean | undefined;
+  const deps = makeDeps({
+    async loadPin() {
+      return { kind: "ok", pin: noFrg, path: "/p" };
+    },
+    async promote({ allowWithoutFrg }) {
+      promoteCalls += 1;
+      seenAllow = allowWithoutFrg;
+      if (!allowWithoutFrg) {
+        return { ok: false, code: "missing_frg", message: "FRG pass missing for 1.34.0" };
+      }
+      return { ok: true, pin: pin("1.34.0"), path: "/pin.json", reinstall_hint: "npx #v1.34.0" };
+    },
+    readSkipFrg: () => false,
+  });
+  const result = await runEnginePromote(opts({ skipInstall: true }), deps);
+  assert.equal(promoteCalls, 1);
+  assert.equal(seenAllow, false);
+  assert.ok(!result.steps.some((s) => s.includes("pin_already_current")));
+  assert.match(result.error ?? "", /FRG pass missing/);
+  assert.equal(result.pin_promoted, false);
+});
+
+test("engine-promote: same-version no-frg re-promotes from real FRG (#1041)", async () => {
+  const noFrg: ProductionEnginePin = {
+    schema_version: 1,
+    version: "1.34.0",
+    tag: "v1.34.0",
+    frg_run_id: "no-frg-1.34.0",
+    frg_evidence_path: null,
+    promoted_at: "2026-08-09T00:00:00.000Z",
+  };
+  const promoted = pin("1.34.0");
+  promoted.frg_run_id = "frg-abc";
+  let promoteCalls = 0;
+  const deps = makeDeps({
+    async loadPin() {
+      return { kind: "ok", pin: noFrg, path: "/p" };
+    },
+    async promote({ allowWithoutFrg }) {
+      promoteCalls += 1;
+      assert.equal(allowWithoutFrg, false);
+      return { ok: true, pin: promoted, path: "/pin.json", reinstall_hint: "npx #v1.34.0" };
+    },
+    readSkipFrg: () => false,
+  });
+  const result = await runEnginePromote(opts({ skipInstall: true }), deps);
+  assert.equal(result.error, undefined);
+  assert.equal(promoteCalls, 1);
+  assert.equal(result.pin_promoted, true);
+  assert.equal(result.pin?.frg_run_id, "frg-abc");
+  assert.ok(result.pin?.frg_evidence_path);
+  assert.ok(!result.steps.some((s) => s.includes("pin_already_current")));
+});
+
+test("engine-promote: same-version no-frg is already-current when skip is active (#1041)", async () => {
+  const noFrg: ProductionEnginePin = {
+    schema_version: 1,
+    version: "1.34.0",
+    tag: "v1.34.0",
+    frg_run_id: "no-frg-1.34.0",
+    frg_evidence_path: null,
+    promoted_at: "2026-08-09T00:00:00.000Z",
+  };
+  let promoteCalls = 0;
+  const deps = makeDeps({
+    async loadPin() {
+      return { kind: "ok", pin: noFrg, path: "/p" };
+    },
+    async promote() {
+      promoteCalls += 1;
+      return { ok: true, pin: noFrg, path: "/pin.json", reinstall_hint: "npx #v1.34.0" };
+    },
+    readSkipFrg: () => false,
+  });
+  const result = await runEnginePromote(opts({ skipInstall: true, allowWithoutFrg: true }), deps);
+  assert.equal(result.error, undefined);
+  assert.equal(promoteCalls, 0);
+  assert.ok(result.steps.some((s) => s.includes("pin_already_current")));
+  assert.equal(result.pin?.frg_run_id, "no-frg-1.34.0");
 });
 
 test("engine-promote: unset or false skip_frg still requires FRG without --skip-frg (#1092)", async () => {
