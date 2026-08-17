@@ -123,6 +123,7 @@ test("tugboat is thin: no second ship brain / grant factory markers", () => {
   assert.match(body, /Tugboat — thin ship composer/);
   assert.doesNotMatch(body, /grant[\/_]factory|factory\.mjs/);
   assert.doesNotMatch(body, /pipeline ship /);
+  assert.match(body, /factory-release prepare --request/);
   assert.match(body, /engine-promote/);
   assert.match(body, /ENGINE_PROMOTE_HOST:-all/);
 });
@@ -178,14 +179,22 @@ test("tugboat supports serial multi-milestone and single-host lock", () => {
   assert.ok(shipOneStart >= 0 && shipOneEnd > shipOneStart);
   const shipOneBody = body.slice(shipOneStart, shipOneEnd);
   assert.match(shipOneBody, /engine-promote --for "\$version"/);
-  // #1038 keep-skip: default release/promote argv still include --skip-frg
-  // until isHonestPost133FrgPass accepts a post-1.33 from-run artifact.
-  assert.match(shipOneBody, /release "\$version" --no-edit --skip-frg/);
+  // #1039: default release/promote argv omit --skip-frg and compose FRG pack.
+  assert.match(shipOneBody, /release "\$version" --no-edit "\$\{SKIP_FRG_ARGS\[@\]\}"/);
+  assert.doesNotMatch(shipOneBody, /release "\$version" --no-edit --skip-frg/);
   assert.match(
+    shipOneBody,
+    /engine-promote --for "\$version" --host "\$ENGINE_PROMOTE_HOST" "\$\{SKIP_FRG_ARGS\[@\]\}" --json/,
+  );
+  assert.doesNotMatch(
     shipOneBody,
     /engine-promote --for "\$version" --host "\$ENGINE_PROMOTE_HOST" --skip-frg --json/,
   );
-  assert.doesNotMatch(shipOneBody, /factory-release prepare/);
+  assert.match(shipOneBody, /factory-release prepare --request/);
+  assert.match(shipOneBody, /write_factory_release_request/);
+  // Escape still passes --skip-frg via SKIP_FRG_ARGS; pack is omitted.
+  assert.match(shipOneBody, /SKIP_FRG_ARGS=\(--skip-frg\)/);
+  assert.match(shipOneBody, /phase frg-pack: omitted \(skip-frg escape\)/);
   // No parallel fan-out of milestones (ignore prose comments about "ship brain").
   assert.doesNotMatch(body, /xargs\s+-P/);
   assert.doesNotMatch(body, /&\s*ship_one\b/);
@@ -278,7 +287,7 @@ test("tugboat --status reads state without starting ship phases", () => {
   const statusBlock = body.slice(statusIdx, detachIdx);
   assert.match(statusBlock, /emit_status_json/);
   assert.match(statusBlock, /exit 0/);
-  assert.doesNotMatch(statusBlock, /ship_one|train --milestone|release finish/);
+  assert.doesNotMatch(statusBlock, /ship_one|train --milestone|release finish|factory-release/);
   assert.doesNotMatch(statusBlock, /"\$PIPELINE" train|"\$PIPELINE" release/);
   // Status rewrites dead-pid "running" → stale via live-ship probe (#1062).
   assert.match(body, /emit_status_json\s*\(/);
@@ -956,6 +965,225 @@ test("tugboat REPO_DIR (#1062): pin at start; refuse factory-control", () => {
   } finally {
     fs.rmSync(badRoot, { recursive: true, force: true });
   }
+});
+
+const frgHelpers = path.join(
+  repoRoot,
+  "examples/supervisor/shell/frg-pack-helpers.sh",
+);
+
+function extractNamedFn(src: string, name: string, label: string): string {
+  const m = src.match(new RegExp(`^${name}\\(\\) \\{[\\s\\S]*?\\n\\}`, "m"));
+  assert.ok(m, `${name}() not found in ${label}`);
+  return m[0];
+}
+
+test("playbook frg-pack-helpers.sh stays in sync with tugboat pack helpers", () => {
+  const tug = fs.readFileSync(tugboat, "utf8");
+  const help = fs.readFileSync(frgHelpers, "utf8");
+  for (const name of ["write_factory_release_request", "classify_frg_pack_tick"]) {
+    assert.equal(
+      extractNamedFn(tug, name, "tugboat.sh"),
+      extractNamedFn(help, name, "frg-pack-helpers.sh"),
+      `${name} drifted between tugboat.sh and frg-pack-helpers.sh`,
+    );
+  }
+});
+
+test("tugboat skip-frg without reason fails closed before ship mutation", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-skip-"));
+  try {
+    const r = spawnSync("bash", [tugboat, "--milestone", "v1.39.0", "--skip-frg"], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        SHIP_NOTIFY: "0",
+        PIPELINE_SUPERVISOR_STATE: path.join(dir, "state"),
+        REPO_DIR: "",
+        ALLOW_MERGE: "0",
+      },
+    });
+    assert.notEqual(r.status, 0, "skip without reason must fail closed");
+    assert.match(`${r.stdout}\n${r.stderr}`, /requires a non-empty/);
+    assert.doesNotMatch(`${r.stdout}\n${r.stderr}`, /phase train|detached tugboat/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("tugboat TUGBOAT_SKIP_FRG=1 without reason fails closed", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-skip-env-"));
+  try {
+    const r = spawnSync("bash", [tugboat, "--milestone", "v1.39.0"], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        SHIP_NOTIFY: "0",
+        PIPELINE_SUPERVISOR_STATE: path.join(dir, "state"),
+        REPO_DIR: "",
+        ALLOW_MERGE: "0",
+        TUGBOAT_SKIP_FRG: "1",
+      },
+    });
+    assert.notEqual(r.status, 0, "env skip without reason must fail closed");
+    assert.match(`${r.stdout}\n${r.stderr}`, /requires a non-empty/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("tugboat skip-frg with reason is accepted before status (no ship start)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-skip-ok-"));
+  try {
+    const r = spawnSync(
+      "bash",
+      [
+        tugboat,
+        "--milestone",
+        "v9.9.9",
+        "--skip-frg",
+        "--skip-frg-reason",
+        "operator test escape",
+        "--status",
+      ],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          SHIP_NOTIFY: "0",
+          PIPELINE_SUPERVISOR_STATE: path.join(dir, "state"),
+          REPO_DIR: "",
+        },
+      },
+    );
+    assert.equal(r.status, 0, `status+skip exited ${r.status}: ${r.stderr}`);
+    assert.match(r.stdout, /"status"\s*:\s*"none"/);
+    assert.doesNotMatch(r.stdout + r.stderr, /phase train|factory-release prepare/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("write_factory_release_request: secret-free identity only (injected I/O)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-req-"));
+  try {
+    const manifest = path.join(dir, "manifest.json");
+    fs.writeFileSync(
+      manifest,
+      JSON.stringify({ schema_version: 1, pack_id: "factory-gate-v1" }),
+    );
+    const dest = path.join(dir, "req.json");
+    const sha = "a".repeat(40);
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        `. ${JSON.stringify(frgHelpers)}`,
+        `write_factory_release_request ${JSON.stringify(dest)} "1.39.0" ${JSON.stringify(dir)}`,
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    const r = spawnSync("bash", [runner], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        TUGBOAT_CANDIDATE_SHA: sha,
+        TUGBOAT_REPOSITORY: "accidental-hedge-fund/agent-pipeline",
+        TUGBOAT_BASE_BRANCH: "main",
+        TUGBOAT_FRG_MANIFEST_PATH: manifest,
+      },
+    });
+    assert.equal(r.status, 0, `writer exited ${r.status}: ${r.stderr}`);
+    const req = JSON.parse(fs.readFileSync(dest, "utf8")) as Record<string, unknown>;
+    assert.equal(req.schema_version, 1);
+    assert.equal(req.kind, "factory_release_prepare_request");
+    assert.equal(req.target_version, "1.39.0");
+    assert.equal(req.action_id, "tugboat-ship-1.39.0");
+    assert.equal(req.repository, "accidental-hedge-fund/agent-pipeline");
+    assert.equal(req.base_branch, "main");
+    const cand = req.integrated_candidate as { git_sha: string };
+    assert.equal(cand.git_sha, sha);
+    const man = req.frg_manifest as { pack_id: string; sha256: string };
+    assert.equal(man.pack_id, "factory-gate-v1");
+    assert.match(man.sha256, /^[0-9a-f]{64}$/);
+    for (const forbidden of [
+      "pass",
+      "status",
+      "credential",
+      "credentials",
+      "secret",
+      "executable",
+      "attestation_key",
+    ]) {
+      assert.equal(req[forbidden], undefined, `request must not contain ${forbidden}`);
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("classify_frg_pack_tick: done / retry / fail without live pack", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-tick-"));
+  try {
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        `. ${JSON.stringify(frgHelpers)}`,
+        'classify_frg_pack_tick "$1" "$2" "$3"',
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    const run = (prep: unknown, latest: unknown | null, ec: number): string => {
+      const prepPath = path.join(dir, "prep.json");
+      const latestPath = path.join(dir, "latest.json");
+      fs.writeFileSync(prepPath, JSON.stringify(prep));
+      if (latest === null) {
+        if (fs.existsSync(latestPath)) fs.rmSync(latestPath);
+      } else {
+        fs.writeFileSync(latestPath, JSON.stringify(latest));
+      }
+      const r = spawnSync("bash", [runner, prepPath, latestPath, String(ec)], {
+        encoding: "utf8",
+      });
+      assert.equal(r.status, 0, `classifier exited ${r.status}: ${r.stderr}`);
+      return r.stdout.trim();
+    };
+    assert.equal(
+      run({ status: "awaiting_frg_attestation" }, null, 0),
+      "done",
+    );
+    assert.equal(run({ status: "in_progress" }, null, 0), "retry");
+    assert.equal(run({ status: "complete" }, null, 0), "done");
+    assert.equal(run({ status: "failed" }, null, 1), "fail");
+    assert.equal(run({ status: "in_progress" }, { pass: true }, 0), "done");
+    assert.equal(run({ status: "complete" }, { pass: false }, 0), "done");
+    assert.equal(run({ status: "failed" }, { pass: false }, 1), "fail");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("tugboat pack phase does not sign, merge, tag, promote, or install", () => {
+  const body = fs.readFileSync(tugboat, "utf8");
+  const shipOneStart = body.indexOf("ship_one() {");
+  const shipOneEnd = body.indexOf("\n# ---------- run serial multi-milestone");
+  const shipOneBody = body.slice(shipOneStart, shipOneEnd);
+  const packStart = shipOneBody.indexOf("A2: FRG pack");
+  const releaseStart = shipOneBody.indexOf("B: release prepare");
+  assert.ok(packStart >= 0 && releaseStart > packStart, "frg-pack phase missing");
+  const pack = shipOneBody.slice(packStart, releaseStart);
+  assert.match(pack, /factory-release prepare --request/);
+  assert.doesNotMatch(pack, /attestation_key|HMAC|grant[\/_]factory|factory\.mjs/);
+  assert.doesNotMatch(pack, /pipeline ship /);
+  assert.doesNotMatch(pack, /release finish|engine-promote|git tag|gh release create/);
+  assert.doesNotMatch(pack, /pass:\s*true|"pass": true/);
 });
 
 test("hermes env.example (#1062): REPO_DIR does not default to factory-control", () => {

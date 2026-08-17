@@ -68,6 +68,8 @@ export ALLOW_MERGE=1                        # required for mutating ship
 # export ENGINE_PROMOTE_HOST=all            # default all (codex/claude/grok/opencode)
 # export PIPELINE_SUPERVISOR_STATE=$HOME/.local/state/pipeline-supervisor
 # export PIPELINE_MATERIAL_FILTER=…/material-filter.mjs
+# export TUGBOAT_SKIP_FRG=1                 # escape only; requires TUGBOAT_SKIP_FRG_REASON
+# export TUGBOAT_SKIP_FRG_REASON="…"
 ```
 
 ## Operator usage
@@ -79,8 +81,11 @@ tugboat --milestone v1.37.0 --detach
 # Serial multi-milestone (promote between; no parallel fat state machine)
 tugboat --milestones v1.37.0 v1.38.0 --detach
 
-# Status (no train/release/promote side effects)
+# Status (no train/FRG pack/release/promote side effects)
 tugboat --milestone v1.37.0 --status
+
+# Operator escape only (requires a logged reason):
+# tugboat --milestone v1.37.0 --skip-frg --skip-frg-reason "hotfix without pack"
 ```
 
 State and logs:
@@ -108,11 +113,12 @@ Issues on the milestone must be `pipeline:ready` before train dispatch.
 ### Phase sequence (fixed)
 
 1. `pipeline train --milestone vX.Y.Z --merge --json` (complete gate + resume)
-2. `pipeline release X.Y.Z --no-edit --skip-frg` (**bare** version — leading `v` is invalid)
-3. Wait until open release PR checks are green (`gh pr checks --json name,state,bucket`)
-4. `pipeline release finish <pr>`
-5. Wait until GitHub Release `vX.Y.Z` is published (non-draft)
-6. `pipeline engine-promote --for X.Y.Z --host all --skip-frg` (or `ENGINE_PROMOTE_HOST` override)
+2. FRG pack: `pipeline factory-release prepare --request <abs.json> --json` (re-invoke until pack-done)
+3. `pipeline release X.Y.Z --no-edit` (**bare** version — leading `v` is invalid; **no** `--skip-frg`)
+4. Wait until open release PR checks are green (`gh pr checks --json name,state,bucket`)
+5. `pipeline release finish <pr>`
+6. Wait until GitHub Release `vX.Y.Z` is published (non-draft)
+7. `pipeline engine-promote --for X.Y.Z --host all` (or `ENGINE_PROMOTE_HOST` override; **no** `--skip-frg`)
 
 Hardened behaviors (preserve):
 
@@ -124,11 +130,20 @@ Hardened behaviors (preserve):
 | Idempotent | Existing open PR titled `release: X.Y.Z …` is reused |
 | Thinness | No grant factory / `pipeline ship` product path inside Tugboat |
 
-## FRG is not part of thin ship
+## FRG pack is part of thin ship
 
-Factory Reliability Gate is optional / advisory on this path (`--skip-frg` on
-release and engine-promote). To run FRG deliberately, use `pipeline factory-gate`
-or durable `factory-release prepare` outside Tugboat.
+Default Tugboat sequence is train → FRG pack → release (no `--skip-frg`) →
+finish → promote. The pack phase composes
+`pipeline factory-release prepare --request <abs.json> --json` and re-invokes
+the same request until pack-done (`awaiting_frg_attestation`, this version
+`latest.json` `pass: true`, or `complete` with an open release PR) or pack-fail.
+A failed or missing pack stops the ship **before** `pipeline release`.
+
+`--skip-frg` / `TUGBOAT_SKIP_FRG=1` is an operator escape only. It requires a
+non-empty `--skip-frg-reason` / `TUGBOAT_SKIP_FRG_REASON`. Missing reason fails
+closed and does not skip. A valid escape omits the pack phase, passes
+`--skip-frg` to release and promote, and writes the reason into ship state or
+log.
 
 ## Alternate / legacy paths (not primary Buzz)
 
@@ -142,6 +157,8 @@ pass doctor `supervisor:ship-playbook-promote-host` (#989).
 ```bash
 install -m 0755 "$ROOT/examples/supervisor/shell/pipeline-ship-playbook.sh" \
   "$HOME/.local/bin/pipeline-ship-playbook"
+install -m 0644 "$ROOT/examples/supervisor/shell/frg-pack-helpers.sh" \
+  "$HOME/.local/bin/frg-pack-helpers.sh"
 ```
 
 ### Authorized `ship-milestone.sh` / in-engine `pipeline ship`

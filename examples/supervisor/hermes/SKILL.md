@@ -109,10 +109,13 @@ tugboat --milestone vX.Y.Z --status
 
 State/logs: `~/.local/state/pipeline-supervisor/ship-vX.Y.Z/`.
 
-Tugboat composes: train → release (bare version) → wait CI green → release
-finish → wait GitHub Release → `engine-promote --host all`. Failure lines
-include phase reason (blocker / err tail). Do not reimplement those phases in
-Hermes.
+Tugboat composes: train → FRG pack (`factory-release prepare`) → release
+(bare version, **no** `--skip-frg`) → wait CI green → release finish → wait
+GitHub Release → `engine-promote --host all`. `--skip-frg` /
+`TUGBOAT_SKIP_FRG=1` is an operator escape and requires a logged reason
+(`--skip-frg-reason` or `TUGBOAT_SKIP_FRG_REASON`). Skip is not the default.
+Failure lines include phase reason (blocker / err tail). Do not reimplement
+those phases in Hermes.
 
 ### Release (manual steps — rarely needed when Tugboat runs)
 
