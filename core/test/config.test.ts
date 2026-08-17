@@ -3163,6 +3163,85 @@ test("resolveReleaseConfig: returns intake_effort — unset by default, pipeline
   assert.equal(auto.intake_effort, "low", "effort.intake: auto must resolve via the intake stage routing (Analytical/Ephemeral)");
 });
 
+test("resolveReleaseConfig: skip_frg is unset when absent, and preserved when true or false (#1092)", async () => {
+  const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-skip-frg`);
+  const dflt = cfgMod.resolveReleaseConfig(makeFakeRepo(null));
+  assert.equal(dflt.skip_frg, undefined, "missing file must not set skip_frg");
+  const omitted = cfgMod.resolveReleaseConfig(makeFakeRepo("base_branch: main\n"));
+  assert.equal(omitted.skip_frg, undefined, "unset key must not set skip_frg");
+  const off = cfgMod.resolveReleaseConfig(makeFakeRepo("skip_frg: false\n"));
+  assert.equal(off.skip_frg, false);
+  const on = cfgMod.resolveReleaseConfig(makeFakeRepo("skip_frg: true\n"));
+  assert.equal(on.skip_frg, true);
+});
+
+test("readSkipFrgFromPipelineYml: missing file, unset, false, and true (#1092)", async () => {
+  const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-read-skip-frg`);
+  assert.equal(cfgMod.readSkipFrgFromPipelineYml("/repo", { readFile: () => null }), undefined);
+  assert.equal(
+    cfgMod.readSkipFrgFromPipelineYml("/repo", { readFile: () => "base_branch: main\n" }),
+    undefined,
+  );
+  assert.equal(
+    cfgMod.readSkipFrgFromPipelineYml("/repo", { readFile: () => "skip_frg: false\n" }),
+    false,
+  );
+  assert.equal(
+    cfgMod.readSkipFrgFromPipelineYml("/repo", { readFile: () => "skip_frg: true\n" }),
+    true,
+  );
+});
+
+test("readSkipFrgFromPipelineYml: invalid skip_frg fails closed (#1092)", async () => {
+  const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-read-skip-frg-bad`);
+  assert.throws(
+    () => cfgMod.readSkipFrgFromPipelineYml("/repo", { readFile: () => "skip_frg: not-a-bool\n" }),
+    /skip_frg/,
+  );
+});
+
+test("resolveConfig: skip_frg merges when set and stays absent by default (#1092)", async () => {
+  const binDir = makeFakeGh("acme/skip-frg");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-resolve-skip-frg`);
+    const unset = cfgMod.resolveConfig({ repoPath: makeFakeRepo(null) });
+    assert.equal(unset.skip_frg, undefined);
+    assert.equal(
+      Object.prototype.hasOwnProperty.call(DEFAULT_CONFIG, "skip_frg"),
+      false,
+      "DEFAULT_CONFIG must not enable skip_frg",
+    );
+    const on = cfgMod.resolveConfig({ repoPath: makeFakeRepo("skip_frg: true\n") });
+    assert.equal(on.skip_frg, true);
+    const off = cfgMod.resolveConfig({ repoPath: makeFakeRepo("skip_frg: false\n") });
+    assert.equal(off.skip_frg, false);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("syncConfig: skip_frg is commented off when unset (#1092)", () => {
+  const repo = makeFakeRepo("base_branch: main\n");
+  const result = syncConfig(repo);
+  assert.equal(result.ok, true, `diagnostics: ${JSON.stringify(result.diagnostics)}`);
+  const candidate = result.candidate ?? "";
+  assert.match(candidate, /^# skip_frg: false #/m);
+  assert.match(candidate, /CLI --skip-frg still wins/);
+  assert.doesNotMatch(candidate, /^skip_frg:\s*true/m);
+});
+
+test("factory committed pipeline.yml does not enable skip_frg (#1092)", () => {
+  const factoryYml = fs.readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", ".github", "pipeline.yml"),
+    "utf8",
+  );
+  assert.doesNotMatch(factoryYml, /^skip_frg:\s*true\s*$/m);
+  const parsed = yaml.load(factoryYml) as Record<string, unknown> | null;
+  assert.notEqual(parsed?.skip_frg, true);
+});
+
 test("resolveReleaseConfig: returns intake_timeout — default when unset, pipeline.yml override when set (#248)", async () => {
   const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
   // resolveReleaseConfig does not shell out to gh, so no fake gh is needed.

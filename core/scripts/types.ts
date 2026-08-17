@@ -1312,6 +1312,13 @@ export interface PipelineConfig {
    */
   engine_track?: "pinned" | "candidate";
   /**
+   * Optional FRG skip escape (#1092). Unset or false keeps Factory Reliability
+   * Gate required on `pipeline release` and `pipeline engine-promote`. `true`
+   * skips when the operator did not pass `--skip-frg`. CLI `--skip-frg` still
+   * wins. Absence-default — not present on {@link DEFAULT_CONFIG}.
+   */
+  skip_frg?: boolean;
+  /**
    * Optional absolute path override for the production pin artifact (#762).
    * Default authority is the factory control checkout
    * (`AGENT_PIPELINE_FACTORY_CONTROL` or, for self-dogfood, `repo_dir`) at

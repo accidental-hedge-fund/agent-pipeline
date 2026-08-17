@@ -16,6 +16,8 @@ import {
   type ProductionEnginePin,
   type PromotePinResult,
 } from "../production-engine-pin.ts";
+import { readSkipFrgFromPipelineYml } from "../config.ts";
+import { formatFrgSkipReason, resolveFrgSkip } from "../frg-skip.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -91,6 +93,11 @@ export interface EnginePromoteDeps {
   installFromTag(tag: string, host: EnginePromoteHost): Promise<{ command: string; stdout: string }>;
   /** Read installed pipeline --version (semver without v). */
   installedVersion(): Promise<string | null>;
+  /**
+   * Optional gh-free `skip_frg` read. When omitted, the command reads
+   * `.github/pipeline.yml` via {@link readSkipFrgFromPipelineYml}.
+   */
+  readSkipFrg?: () => boolean | undefined;
 }
 
 function normalizeVersion(raw: string): string {
@@ -151,9 +158,22 @@ export async function runEnginePromote(
   const dryRun = !!opts.dryRun;
   const skipPromoteIfCurrent = opts.skipPromoteIfCurrent !== false;
   const skipInstall = !!opts.skipInstall;
+  const configSkip = deps.readSkipFrg
+    ? deps.readSkipFrg()
+    : readSkipFrgFromPipelineYml(opts.repoDir);
+  const frgSkip = resolveFrgSkip({
+    cliSkip: !!opts.allowWithoutFrg,
+    configSkip,
+  });
+  const allowWithoutFrg = frgSkip.skip;
   const steps: string[] = [];
   const startingLockPid = startingLockPidFromEnv(process.env.PIPELINE_STARTING_LOCK_PID);
   const installCmd = installCommandForTag(tag, host, startingLockPid);
+  if (frgSkip.source) {
+    deps.log(
+      `[engine-promote] skipping Factory Reliability Gate for ${version} (${formatFrgSkipReason(frgSkip.source)})`,
+    );
+  }
 
   const base: EnginePromoteResult = {
     schema_version: 1,
@@ -207,7 +227,7 @@ export async function runEnginePromote(
       version,
       gitSha: opts.gitSha,
       overridePath: opts.pinPath,
-      allowWithoutFrg: opts.allowWithoutFrg,
+      allowWithoutFrg,
     });
     if (!promo.ok) {
       return {

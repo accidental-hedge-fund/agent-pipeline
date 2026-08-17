@@ -2481,6 +2481,136 @@ test("runRelease: skipFrg proceeds without FRG and does not call requireFrgPass"
   );
 });
 
+test("runRelease: skip_frg false still requires FRG without --skip-frg (#1092)", async () => {
+  const written: string[] = [];
+  const deps = makeDeps({
+    readFile: (p) => {
+      if (p.endsWith("core/package.json")) return SAMPLE_CORE_PKG;
+      if (p.endsWith("package.json")) return SAMPLE_ROOT_PKG;
+      if (p.endsWith("ROADMAP.md")) return SAMPLE_ROADMAP;
+      throw new Error(`unexpected read: ${p}`);
+    },
+    writeFile: (p) => {
+      written.push(p);
+    },
+    requireFrgPass: async () => {
+      throw new Error(
+        "[pipeline release] Factory Reliability Gate pass missing for version 1.6.0 " +
+          "(expected /repo/.agent-pipeline/frg/1.6.0/latest.json). " +
+          "Unit CI alone is not sufficient. Run: pipeline factory-gate --for 1.6.0",
+      );
+    },
+  });
+  await assert.rejects(
+    () =>
+      runRelease(
+        "1.6.0",
+        { noEdit: true },
+        { repo_dir: "/repo", repo: "org/repo", skip_frg: false },
+        deps,
+      ),
+    /Factory Reliability Gate pass missing for version 1\.6\.0/,
+  );
+  assert.equal(written.length, 0, "must not write package files when FRG is required");
+});
+
+test("runRelease: skip_frg true skips FRG without --skip-frg and logs config (#1092)", async () => {
+  let frgCalls = 0;
+  const deps = liveReleaseDeps({
+    fetchPRClosingIssues: async (n) => (n === 204 ? [158, 170] : []),
+    requireFrgPass: async () => {
+      frgCalls += 1;
+      throw new Error("requireFrgPass must not run when skip_frg is true");
+    },
+    runCommand: (cmd, args) => {
+      if (cmd === "git" && args[0] === "log") {
+        return { code: 0, stdout: "a1b2c3d release: thing (#204)", stderr: "" };
+      }
+      if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
+      if (cmd === "git" && args[0] === "status") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "gh" && args[0] === "pr" && args[1] === "create") {
+        return { code: 0, stdout: "https://github.com/org/repo/pull/300", stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+  });
+  const result = await runRelease(
+    "1.6.0",
+    { noEdit: true },
+    { repo_dir: "/repo", repo: "org/repo", skip_frg: true },
+    deps,
+  );
+  assert.ok(result);
+  assert.equal(frgCalls, 0, "FRG gate must be skipped from config");
+  const stdout = getStdout(deps).join("\n");
+  assert.match(stdout, /skip_frg: true in \.github\/pipeline\.yml/);
+  assert.doesNotMatch(
+    stdout,
+    /skipping Factory Reliability Gate for 1\.6\.0 \(--skip-frg\)/,
+    "config-sourced skip must not present as only --skip-frg",
+  );
+});
+
+test("runRelease: --skip-frg still skips when skip_frg is unset or false (#1092)", async () => {
+  let frgCalls = 0;
+  const deps = liveReleaseDeps({
+    fetchPRClosingIssues: async (n) => (n === 204 ? [158, 170] : []),
+    requireFrgPass: async () => {
+      frgCalls += 1;
+      throw new Error("requireFrgPass must not run when --skip-frg is set");
+    },
+    runCommand: (cmd, args) => {
+      if (cmd === "git" && args[0] === "log") {
+        return { code: 0, stdout: "a1b2c3d release: thing (#204)", stderr: "" };
+      }
+      if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
+      if (cmd === "git" && args[0] === "status") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "gh" && args[0] === "pr" && args[1] === "create") {
+        return { code: 0, stdout: "https://github.com/org/repo/pull/300", stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+  });
+  const result = await runRelease(
+    "1.6.0",
+    { noEdit: true, skipFrg: true },
+    { repo_dir: "/repo", repo: "org/repo", skip_frg: false },
+    deps,
+  );
+  assert.ok(result);
+  assert.equal(frgCalls, 0);
+  const stdout = getStdout(deps).join("\n");
+  assert.match(stdout, /skipping Factory Reliability Gate for 1\.6\.0 \(--skip-frg\)/);
+});
+
+test("runRelease: CLI skip log stays CLI when both flag and skip_frg true (#1092)", async () => {
+  const deps = liveReleaseDeps({
+    fetchPRClosingIssues: async (n) => (n === 204 ? [158, 170] : []),
+    requireFrgPass: async () => {
+      throw new Error("requireFrgPass must not run when --skip-frg is set");
+    },
+    runCommand: (cmd, args) => {
+      if (cmd === "git" && args[0] === "log") {
+        return { code: 0, stdout: "a1b2c3d release: thing (#204)", stderr: "" };
+      }
+      if (cmd === "git" && args[0] === "describe") return { code: 0, stdout: "v1.5.0", stderr: "" };
+      if (cmd === "git" && args[0] === "status") return { code: 0, stdout: "", stderr: "" };
+      if (cmd === "gh" && args[0] === "pr" && args[1] === "create") {
+        return { code: 0, stdout: "https://github.com/org/repo/pull/300", stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+  });
+  await runRelease(
+    "1.6.0",
+    { noEdit: true, skipFrg: true },
+    { repo_dir: "/repo", repo: "org/repo", skip_frg: true },
+    deps,
+  );
+  const stdout = getStdout(deps).join("\n");
+  assert.match(stdout, /skipping Factory Reliability Gate for 1\.6\.0 \(--skip-frg\)/);
+});
+
 test("runRelease: failed FRG aborts and is distinguishable from missing", async () => {
   const deps = makeDeps({
     readFile: (p) => {

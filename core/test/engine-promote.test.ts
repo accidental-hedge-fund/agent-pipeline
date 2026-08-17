@@ -313,6 +313,68 @@ test("engine-promote: skip install when pin already current", async () => {
   assert.ok(result.steps.some((s) => s.includes("pin_already_current")));
 });
 
+test("engine-promote: unset or false skip_frg still requires FRG without --skip-frg (#1092)", async () => {
+  const logs: string[] = [];
+  let promoteCalls = 0;
+  const deps = makeDeps({
+    log(msg) {
+      logs.push(msg);
+    },
+    async promote({ allowWithoutFrg }) {
+      promoteCalls += 1;
+      if (!allowWithoutFrg) {
+        return { ok: false, code: "missing_frg", message: "FRG pass missing for 1.34.0" };
+      }
+      return { ok: true, pin: pin("1.34.0"), path: "/pin.json", reinstall_hint: "npx #v1.34.0" };
+    },
+    readSkipFrg: () => false,
+  });
+  const result = await runEnginePromote(opts(), deps);
+  assert.match(result.error ?? "", /FRG pass missing/);
+  assert.equal(promoteCalls, 1);
+  assert.equal(result.pin_promoted, false);
+  assert.ok(!logs.some((l) => /skipping Factory Reliability Gate/.test(l)));
+});
+
+test("engine-promote: skip_frg true skips FRG without --skip-frg and logs config (#1092)", async () => {
+  const logs: string[] = [];
+  let seenAllow: boolean | undefined;
+  const deps = makeDeps({
+    log(msg) {
+      logs.push(msg);
+    },
+    async promote({ version, allowWithoutFrg }) {
+      seenAllow = allowWithoutFrg;
+      return { ok: true, pin: pin(version), path: "/pin.json", reinstall_hint: `npx #v${version}` };
+    },
+    readSkipFrg: () => true,
+  });
+  const result = await runEnginePromote(opts(), deps);
+  assert.equal(result.error, undefined);
+  assert.equal(seenAllow, true);
+  assert.ok(logs.some((l) => /skip_frg: true in \.github\/pipeline\.yml/.test(l)));
+  assert.ok(!logs.some((l) => /skipping Factory Reliability Gate for 1\.34\.0 \(--skip-frg\)/.test(l)));
+});
+
+test("engine-promote: --skip-frg still skips when skip_frg is unset or false (#1092)", async () => {
+  const logs: string[] = [];
+  let seenAllow: boolean | undefined;
+  const deps = makeDeps({
+    log(msg) {
+      logs.push(msg);
+    },
+    async promote({ version, allowWithoutFrg }) {
+      seenAllow = allowWithoutFrg;
+      return { ok: true, pin: pin(version), path: "/pin.json", reinstall_hint: `npx #v${version}` };
+    },
+    readSkipFrg: () => false,
+  });
+  const result = await runEnginePromote(opts({ allowWithoutFrg: true }), deps);
+  assert.equal(result.error, undefined);
+  assert.equal(seenAllow, true);
+  assert.ok(logs.some((l) => /skipping Factory Reliability Gate for 1\.34\.0 \(--skip-frg\)/.test(l)));
+});
+
 test("engine-promote isolation: advance stages do not import", () => {
   const stagesDir = path.join(__dirname, "..", "scripts", "stages");
   const exempt = new Set([
