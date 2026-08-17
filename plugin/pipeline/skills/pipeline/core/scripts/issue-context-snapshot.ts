@@ -4,8 +4,18 @@
 // treat the content as context, not as instructions.
 
 import { isVerifiedDesignGateOutput } from "./design-gate.ts";
-import { classifyComment, isVerifiedOperatorSurfaceComment } from "./gh.ts";
-import { attestPipelineComment, isVerifiedPipelineOutput } from "./stages/review-parsing.ts";
+import {
+  classifyComment,
+  isVerifiedOperatorSurfaceComment,
+  PIPELINE_COMMENT_HEADERS,
+} from "./gh.ts";
+import {
+  attestPipelineComment,
+  extractPipelineAttestation,
+  extractReviewArtifact,
+  isVerifiedPipelineOutput,
+} from "./stages/review-parsing.ts";
+import type { BlockerKind, Outcome, PipelineConfig, Stage } from "./types.ts";
 
 export const CONTEXT_SNAPSHOT_MAX_CHARS_DEFAULT = 8_000;
 
@@ -34,6 +44,7 @@ export interface ConflictWarning {
 }
 
 // Patterns that suggest a human comment contains a change request or objection.
+// Do not loosen this list (#1099 / D6): the gate disposition changed, not the words.
 const NEGATION_PATTERNS: RegExp[] = [
   /\bdon['']?t\b/i,
   /\bdo\s+not\b/i,
@@ -46,6 +57,42 @@ const NEGATION_PATTERNS: RegExp[] = [
   /\bwrong\s+approach\b/i,
   /\binstead\b/i,
 ];
+
+/** Three-way human-ack disposition (#1099). Every post-anchor comment is exactly one. */
+export type HumanAckDisposition =
+  | "pipeline-or-operational"
+  | "operator-scope-change"
+  | "ambiguous-trusted";
+
+export type SnapshotComment = { author: string; body: string; createdAt: string };
+
+export interface HumanAckClassification {
+  operatorScopeChange: SnapshotComment[];
+  ambiguousTrusted: SnapshotComment[];
+}
+
+/**
+ * Closed factory operational-note phrases (#1099 D3). Match is case-insensitive
+ * on the leading line or the whole trimmed body. Adding a new factory note is
+ * a list edit plus a test, not a new mole issue.
+ */
+export const OPERATIONAL_NOTE_PHRASES = [
+  "grill-lock",
+  "grill locked",
+  "grill-locked",
+  "ship-halt",
+  "ship halt",
+  "don't comment",
+  "do not comment",
+  "dont comment",
+] as const;
+
+/** Explicit implementer-change phrasing that makes a mixed operational note a scope change. */
+const IMPLEMENTER_CHANGE_RE = /\bplease\s+(?:also|add|change|implement|fix)\b/i;
+
+const REVIEW_ROUND_HEADING_RE = /^## Review \d+\b/;
+const ARTIFACT_LINE_RE = /^<!-- (review-artifact|pipeline-attest): ([A-Za-z0-9_-]+) -->$/gm;
+const DESIGN_GATE_LINE_RE = /^<!-- design-gate-state: ([A-Za-z0-9_-]+) -->$/gm;
 
 /**
  * Build a context snapshot from an issue's comment list.
@@ -195,36 +242,140 @@ export function extractSnapshotComment<T extends { body: string }>(
   );
 }
 
+function hasNegationLanguage(body: string): boolean {
+  return NEGATION_PATTERNS.some((p) => p.test(body));
+}
+
+function hasImplementerChange(body: string): boolean {
+  return IMPLEMENTER_CHANGE_RE.test(body);
+}
+
+/** True when the leading heading is a registered pipeline header or `## Review N`. */
+export function hasRegisteredPipelineHeading(body: string): boolean {
+  const head = body.trimStart();
+  return (
+    PIPELINE_COMMENT_HEADERS.some((h) => head.startsWith(h)) ||
+    REVIEW_ROUND_HEADING_RE.test(head)
+  );
+}
+
+function lastArtifactLine(
+  body: string,
+): { index: number; length: number; kind: "review-artifact" | "pipeline-attest" } | null {
+  ARTIFACT_LINE_RE.lastIndex = 0;
+  let last: RegExpExecArray | null = null;
+  let cur: RegExpExecArray | null;
+  while ((cur = ARTIFACT_LINE_RE.exec(body)) !== null) last = cur;
+  ARTIFACT_LINE_RE.lastIndex = 0;
+  if (last === null) return null;
+  return {
+    index: last.index,
+    length: last[0].length,
+    kind: last[1] as "review-artifact" | "pipeline-attest",
+  };
+}
+
 /**
- * Find human comments posted after the most recent plan comment (revised plan
- * preferred, original plan as fallback). These are comments that the pipeline
- * has not yet acknowledged with a fix or revision round.
- *
- * @param trustedComments - Pre-filtered comments that are author-validated as
- *   posted by a trusted actor (produced by `buildTrustedOverrideComments`, i.e.
- *   the pipeline actor or a `trusted_override_actors` entry) — not only scope
- *   overrides. Two things depend on trust: (1) a structurally-pipeline comment
- *   (`classifyComment` === 'pipeline') is excluded from the unacknowledged count
- *   only when it is in this list AND (it is verified, untampered pipeline output
- *   per `isVerifiedPipelineOutput` — a review verdict's `review-artifact` OR any
- *   OTHER pipeline comment's generic `pipeline-attest` marker (#471), OR it
- *   carries no scope-changing language of its own) — a pipeline-styled body from
- *   an untrusted author, or one from a trusted author that still reads as an
- *   objection and isn't verified pipeline output (e.g. a quoted reply with a
- *   real comment appended), is counted as human input (#390, #390 review 2,
- *   #390 review 1, #471); (2) a comment in this list may act as an
- *   acknowledgement anchor, either via a verified operator-surface comment
- *   (`unblocked`/`finding-override`/`scope-override` — an engine-rendered body
- *   posted in direct response to an operator CLI invocation, so the operator has
- *   been heard by construction, #484) or, since #390, a plain acknowledgement
- *   with no scope-changing language. Defaults to [] — fail-closed: nothing is
- *   trusted unless the caller explicitly supplies the set (e.g. when
- *   `getGhActor()` returns null).
+ * True when the last `review-artifact` or `pipeline-attest` line decodes and
+ * nothing but whitespace follows it. Hash match is not required (#1099 D1).
  */
-export function findUnacknowledgedComments(
-  comments: { author: string; body: string; createdAt: string }[],
-  trustedComments: ReadonlyArray<{ author: string; body: string; createdAt: string }> = [],
-): { author: string; body: string; createdAt: string }[] {
+export function hasTerminalPipelineArtifact(body: string): boolean {
+  const last = lastArtifactLine(body);
+  if (last === null) return false;
+  if (body.slice(last.index + last.length).trim() !== "") return false;
+  if (last.kind === "review-artifact") return extractReviewArtifact(body) !== null;
+  return extractPipelineAttestation(body) !== null;
+}
+
+function lastDesignGateLine(
+  body: string,
+): { index: number; length: number } | null {
+  DESIGN_GATE_LINE_RE.lastIndex = 0;
+  let last: RegExpExecArray | null = null;
+  let cur: RegExpExecArray | null;
+  while ((cur = DESIGN_GATE_LINE_RE.exec(body)) !== null) last = cur;
+  DESIGN_GATE_LINE_RE.lastIndex = 0;
+  if (last === null) return null;
+  return { index: last.index, length: last[0].length };
+}
+
+function hasHumanSuffixAfterArtifact(body: string): boolean {
+  const last = lastArtifactLine(body);
+  if (last !== null && body.slice(last.index + last.length).trim() !== "") return true;
+  const dg = lastDesignGateLine(body);
+  if (dg !== null && body.slice(dg.index + dg.length).trim() !== "") return true;
+  return false;
+}
+
+/**
+ * Closed operational-note recognizer (#1099 D3). Matches a listed phrase as
+ * the whole trimmed body or as the prefix of the leading line.
+ */
+export function matchesOperationalNote(body: string): boolean {
+  const trimmed = body.trim();
+  if (!trimmed) return false;
+  const leading = (trimmed.split(/\r?\n/, 1)[0] ?? "").trim();
+  for (const phrase of OPERATIONAL_NOTE_PHRASES) {
+    const p = phrase.toLowerCase();
+    for (const candidate of [trimmed, leading]) {
+      const lower = candidate.toLowerCase();
+      if (lower === p) return true;
+      if (lower.startsWith(p) && (lower.length === p.length || /[\s,;:.!—'–-]/.test(lower[p.length]!))) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Classify one post-anchor comment. Trust is object-identity membership in
+ * `trustedComments` (same contract as `findUnacknowledgedComments`).
+ */
+export function classifyHumanAckComment(
+  comment: SnapshotComment,
+  trustedComments: ReadonlyArray<SnapshotComment>,
+): HumanAckDisposition {
+  const trusted = trustedComments.includes(comment);
+  const body = comment.body;
+  const verified =
+    isVerifiedPipelineOutput(body) || isVerifiedDesignGateOutput(body);
+
+  // Forge resistance: untrusted authors never receive heading/artifact/note exemptions.
+  if (!trusted) return "operator-scope-change";
+  if (verified) return "pipeline-or-operational";
+
+  // D1: trusted registered heading + terminal artifact blob is never human,
+  // even when bodyHash fails. Integrity miss, not operator authority.
+  if (hasRegisteredPipelineHeading(body) && hasTerminalPipelineArtifact(body)) {
+    return "pipeline-or-operational";
+  }
+
+  const operational = matchesOperationalNote(body);
+  const implementer = hasImplementerChange(body);
+  if (operational && implementer) return "operator-scope-change";
+  if (operational) return "pipeline-or-operational";
+  if (implementer) return "operator-scope-change";
+
+  // Human text after the last artifact is not the D1 shape. A product/scope
+  // suffix still counts as unacknowledged (#1099 suffix scenario).
+  if (hasHumanSuffixAfterArtifact(body) && hasNegationLanguage(body)) {
+    return "operator-scope-change";
+  }
+
+  // Trusted, no clear implementer-change, no negation: rule 1(b) / plain ack
+  // style — not a scope decision the implementer must park on.
+  if (!hasNegationLanguage(body)) return "pipeline-or-operational";
+
+  // Trusted + negation, not verified, not D1, not a closed operational note.
+  // Recover in-engine; do not needs-human (D4 / unmarked ambiguous note).
+  return "ambiguous-trusted";
+}
+
+function findAcknowledgementAnchorIndex(
+  comments: SnapshotComment[],
+  trustedComments: ReadonlyArray<SnapshotComment>,
+): number {
   let anchorIdx = -1;
 
   // Prefer the latest revised plan anchor.
@@ -244,8 +395,7 @@ export function findUnacknowledgedComments(
     }
   }
 
-  if (anchorIdx === -1) return [];
-
+  if (anchorIdx === -1) return -1;
 
   // If a trusted actor posted an acknowledgement comment after the plan anchor,
   // treat it as an acknowledgement anchor — human comments at or before it have
@@ -273,77 +423,165 @@ export function findUnacknowledgedComments(
     // scope-changing language) — otherwise routine pipeline output like
     // "## Pipeline: blocked" would spuriously anchor (#390).
     const isPlainAck =
-      classifyComment(body) === 'human' && !NEGATION_PATTERNS.some((p) => p.test(body));
+      classifyComment(body) === "human" &&
+      !hasNegationLanguage(body) &&
+      !hasImplementerChange(body) &&
+      !matchesOperationalNote(body);
     if (isPlainAck) {
       anchorIdx = i;
       break;
     }
   }
+  return anchorIdx;
+}
 
-  const result: { author: string; body: string; createdAt: string }[] = [];
+/**
+ * Classify every comment after the plan / acknowledgement anchor.
+ * `findUnacknowledgedComments` returns only `operator-scope-change`.
+ */
+export function classifyPostPlanComments(
+  comments: SnapshotComment[],
+  trustedComments: ReadonlyArray<SnapshotComment> = [],
+): HumanAckClassification {
+  const anchorIdx = findAcknowledgementAnchorIndex(comments, trustedComments);
+  const operatorScopeChange: SnapshotComment[] = [];
+  const ambiguousTrusted: SnapshotComment[] = [];
+  if (anchorIdx === -1) return { operatorScopeChange, ambiguousTrusted };
+
   for (let i = anchorIdx + 1; i < comments.length; i++) {
-    const c = comments[i];
-    if (classifyComment(c.body) === 'human') {
-      // #762 recovery / #784 defense-in-depth: a trusted, terminal, decodable
-      // design-gate-state (or other verified pipeline output) must self-exclude
-      // even when `classifyComment` returns `human`. That happens when a stale
-      // install's PIPELINE_COMMENT_HEADERS omits `## Design Interrogation`
-      // (v1.30.0-class) while the body still carries a valid design-gate-state
-      // artifact — the short-circuit below used to push it as unacknowledged
-      // human input and false-block review-1. Verification is still
-      // forge-resistant (decode/attestation + trusted author required).
-      if (
-        trustedComments.includes(c) &&
-        (isVerifiedDesignGateOutput(c.body) || isVerifiedPipelineOutput(c.body))
-      ) {
-        continue;
-      }
-      result.push(c);
-      continue;
-    }
-    // Structurally-pipeline comment: self-exclusion is granted only when the
-    // author is trusted AND (the body is verified pipeline output OR it
-    // carries no scope-changing language of its own). A pipeline-styled body
-    // from anyone else is a forged heading and must still gate (#390). A
-    // trusted actor's comment that merely carries pipeline structure (e.g. a
-    // quoted reply, or a copied heading/marker) alongside a genuine objection
-    // must also still gate — trust grants self-exclusion for the pipeline's
-    // own generated output, not for human content that happens to look like
-    // it (#390 review 2). Genuine review verdicts routinely use objection
-    // language in finding bodies/recommendations, and other pipeline comment
-    // types (e.g. the severity-policy advance notice, #471) routinely use it
-    // in their own explanatory prose, so a VERIFIED pipeline comment —
-    // `isVerifiedPipelineOutput`, true for a review verdict's
-    // `review-artifact` (#264/#390), any other registered comment kind's
-    // generic `pipeline-attest` marker (#471), or a terminal decodable
-    // design-gate `design-gate-state` artifact (#436 / #784 recovery) — is
-    // exempt from that scope-language scan (#390 review 1, #471). Appending
-    // human content after a terminal marker fails verification and still
-    // falls through to the scan. Review-verdict and generic pipeline-attest
-    // verification bind a bodyHash to the exact rendered body; there is
-    // deliberately no bodyHash-free legacy path for those kinds (#390 delta
-    // keys 06e32d8d, 7b445e1e, 37da0054). Design-gate is different: the
-    // stage's durable state artifact is the authoritative rehydration record
-    // (same decode the stage uses on resume), so a trusted, terminal,
-    // decodable design-gate-state is accepted as verified even when a stale
-    // install omitted pipeline-attest — forged/non-decodable design-gate
-    // shapes still gate. An unattested non-artifact pipeline comment with
-    // objection wording still gates once; a plain acknowledgment from the
-    // trusted actor clears it via the anchor mechanism above.
-    // Explicit design-gate OR: isVerifiedPipelineOutput already includes
-    // isVerifiedDesignGateOutput, but findUnacknowledgedComments must name both
-    // so terminal design-gate challenge prose cannot re-enter the human-input
-    // scan if the composite predicate drifts (#784 reviews 1–2, key 6539f7e0).
-    const verified =
-      isVerifiedPipelineOutput(c.body) || isVerifiedDesignGateOutput(c.body);
-    if (
-      !trustedComments.includes(c) ||
-      (!verified && NEGATION_PATTERNS.some((p) => p.test(c.body)))
-    ) {
-      result.push(c);
-    }
+    const disposition = classifyHumanAckComment(comments[i], trustedComments);
+    if (disposition === "operator-scope-change") operatorScopeChange.push(comments[i]);
+    else if (disposition === "ambiguous-trusted") ambiguousTrusted.push(comments[i]);
   }
-  return result;
+  return { operatorScopeChange, ambiguousTrusted };
+}
+
+/**
+ * Find operator-scope-change comments posted after the most recent plan
+ * comment (revised plan preferred, original plan as fallback).
+ *
+ * Returns only `operator-scope-change` so a non-empty list still means
+ * "human park" (#1099). Call sites inspect `ambiguous-trusted` via
+ * {@link classifyPostPlanComments} / {@link applyHumanAckGate}.
+ *
+ * @param trustedComments - Pre-filtered comments that are author-validated as
+ *   posted by a trusted actor (produced by `buildTrustedOverrideComments`, i.e.
+ *   the pipeline actor or a `trusted_override_actors` entry) — not only scope
+ *   overrides. Defaults to [] — fail-closed: nothing is trusted unless the
+ *   caller explicitly supplies the set (e.g. when `getGhActor()` returns null).
+ */
+export function findUnacknowledgedComments(
+  comments: SnapshotComment[],
+  trustedComments: ReadonlyArray<SnapshotComment> = [],
+): SnapshotComment[] {
+  return classifyPostPlanComments(comments, trustedComments).operatorScopeChange;
+}
+
+export interface HumanAckGateDeps {
+  postComment: (cfg: PipelineConfig, issueNumber: number, body: string) => Promise<unknown>;
+  setBlocked: (
+    cfg: PipelineConfig,
+    issueNumber: number,
+    reason: string,
+    stage: Stage | null,
+    kind: BlockerKind,
+  ) => Promise<unknown>;
+  transition: (
+    cfg: PipelineConfig,
+    issueNumber: number,
+    from: Stage,
+    to: Stage,
+    summary: string,
+  ) => Promise<unknown>;
+}
+
+/**
+ * Shared human-ack gate applicator (#1099). Both `fix.ts` and
+ * `review-routing.ts` consume this; they do not branch on the classifier
+ * themselves.
+ *
+ * - operator-scope-change → warning + park as human-ack needs-human
+ * - only ambiguous-trusted → in-engine re-plan to planning; fallback
+ *   harness-failure (never a human-ack park)
+ * - neither → null (proceed)
+ */
+export async function applyHumanAckGate(args: {
+  cfg: PipelineConfig;
+  issueNumber: number;
+  stage: Stage;
+  comments: SnapshotComment[];
+  trustedComments: ReadonlyArray<SnapshotComment>;
+  dryRun?: boolean;
+  warningFooter?: string;
+  deps: HumanAckGateDeps;
+}): Promise<Outcome | null> {
+  const classified = classifyPostPlanComments(args.comments, args.trustedComments);
+  const unacknowledged = classified.operatorScopeChange;
+  const ambiguous = classified.ambiguousTrusted;
+
+  if (unacknowledged.length > 0) {
+    console.log(
+      `[pipeline] #${args.issueNumber}: ${unacknowledged.length} unacknowledged human comment(s) detected before ${args.stage} — blocking`,
+    );
+    if (args.dryRun) {
+      console.log(
+        `[pipeline] #${args.issueNumber}: [dry-run] would post warning and set blocked for ${unacknowledged.length} unacknowledged human comment(s)`,
+      );
+      return { advanced: false, status: "blocked", reason: "unacknowledged human input" };
+    }
+    const warningExists = args.comments.some((c) =>
+      c.body.trimStart().startsWith("## Pipeline: New human input detected"),
+    );
+    if (!warningExists) {
+      await args.deps.postComment(
+        args.cfg,
+        args.issueNumber,
+        buildNewHumanInputWarningComment(unacknowledged, args.stage, args.warningFooter ?? ""),
+      );
+    }
+    await args.deps.setBlocked(
+      args.cfg,
+      args.issueNumber,
+      `${unacknowledged.length} unacknowledged human comment(s) after the latest plan — re-plan or post a scope override to proceed.`,
+      args.stage,
+      "needs-human",
+    );
+    return {
+      advanced: false,
+      status: "blocked",
+      reason: "unacknowledged human input",
+      blockerKind: "needs-human",
+    };
+  }
+
+  if (ambiguous.length === 0) return null;
+
+  const summary =
+    `${ambiguous.length} ambiguous trusted comment(s) after the latest plan — in-engine re-plan (not needs-human).`;
+  console.log(`[pipeline] #${args.issueNumber}: ${summary}`);
+  if (args.dryRun) {
+    console.log(`[pipeline] #${args.issueNumber}: [dry-run] would transition ${args.stage} → planning`);
+    return { advanced: true, from: args.stage, to: "planning", summary: `[dry-run] ${summary}` };
+  }
+  try {
+    await args.deps.transition(args.cfg, args.issueNumber, args.stage, "planning", summary);
+    return { advanced: true, from: args.stage, to: "planning", summary };
+  } catch (err) {
+    const errMsg = (err as Error).message;
+    await args.deps.setBlocked(
+      args.cfg,
+      args.issueNumber,
+      `Ambiguous trusted comments require in-engine re-plan; transition to planning failed: ${errMsg}`,
+      args.stage,
+      "harness-failure",
+    );
+    return {
+      advanced: false,
+      status: "blocked",
+      reason: errMsg,
+      blockerKind: "harness-failure",
+    };
+  }
 }
 
 /**

@@ -4243,6 +4243,49 @@ test("advanceReview: resuming after `pipeline unblock` does not re-block on the 
   );
 });
 
+test("advanceReview: ambiguous trusted unmarked note recovers to planning, not needs-human (#1099)", async (t) => {
+  const { deps, rec } = makeDeps([APPROVE]);
+  deps.getIssueDetail = async () =>
+    ({
+      ...detailWithComments([]),
+      comments: [
+        { author: TEST_ACTOR, body: "## Revised Implementation Plan\n\nDo X.", createdAt: "2026-01-01T00:00:00Z" },
+        { author: TEST_ACTOR, body: "this won't work in prod", createdAt: "2026-01-02T00:00:00Z" },
+      ],
+    }) as any;
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(cfg, 1, 1, {}, 0, deps);
+  });
+  assert.equal(outcome.advanced, true, "ambiguous-trusted must recover via in-engine re-plan");
+  assert.equal(outcome.to, "planning");
+  assert.deepEqual(rec.transitions, [{ to: "planning" }]);
+  assert.equal(rec.blockedKinds.includes("needs-human"), false);
+  assert.ok(
+    !rec.comments.some((c) => c.startsWith("## Pipeline: New human input detected")),
+    "must not post the human-input warning for ambiguous-trusted",
+  );
+});
+
+test("advanceReview: grill lock note after plan does not setBlocked needs-human (#1099)", async (t) => {
+  const { deps, rec } = makeDeps([APPROVE]);
+  deps.getIssueDetail = async () =>
+    ({
+      ...detailWithComments([]),
+      comments: [
+        { author: TEST_ACTOR, body: "## Revised Implementation Plan\n\nDo X.", createdAt: "2026-01-01T00:00:00Z" },
+        { author: TEST_ACTOR, body: "grill locked", createdAt: "2026-01-02T00:00:00Z" },
+      ],
+    }) as any;
+  let outcome: any;
+  await quiet(t, async () => {
+    outcome = await advanceReview(cfg, 1, 1, {}, 0, deps);
+  });
+  assert.equal(outcome.advanced, true, "closed operational note must not park");
+  assert.equal(rec.blockedKinds.includes("needs-human"), false);
+  assert.ok(!rec.transitions.some((x) => x.to === "planning"));
+});
+
 test("advanceReview: dry-run skips postComment and setBlocked for unacknowledged human input (#318 fix 937b9d25)", async (t) => {
   // Verify that --dry-run does not mutate GitHub state even when the
   // late-human-input gate would otherwise block.
