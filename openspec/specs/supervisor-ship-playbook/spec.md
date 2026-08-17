@@ -2,7 +2,9 @@
 
 ## Purpose
 Defines how the chain-to-existing-tools supervisor ship playbook evaluates captured `pipeline train --json` output for train completeness before later ship phases, so mixed prose-plus-JSON streams do not false-fail a truly complete train.
+
 ## Requirements
+
 ### Requirement: Train completion gate SHALL evaluate the last train_status even when non-JSON prose precedes it
 
 After the ship playbook runs `pipeline train` with JSON mode and captures stdout to the train capture file, the train completion gate SHALL decode JSON values from that capture without requiring the entire file to be a single pure JSON document. The gate SHALL locate `train_status` objects (objects whose `kind` is `train_status`) by scanning the stream, including cases where human-readable prose appears before the JSON. When more than one such object is present, the gate SHALL use the **last** one. When a decoded JSON value is an array, the gate SHALL consider objects inside that array the same way. The gate SHALL treat the train as complete only when that selected `train_status` has `complete` equal to true and has no blocker. When those conditions hold, the playbook SHALL NOT exit solely because whole-stream JSON parse of the capture file failed, and SHALL proceed past the train phase. When the selected status is incomplete or carries a blocker, the gate SHALL fail closed and SHALL NOT advance to later ship phases (release, publication wait, engine-promote).
@@ -44,7 +46,7 @@ After the ship playbook runs `pipeline train` with JSON mode and captures stdout
 
 ### Requirement: Ship playbook engine-promote phase SHALL default install host to all
 
-When the chain-to-existing-tools supervisor ship playbook reaches the engine-promote phase and the operator has not set `ENGINE_PROMOTE_HOST`, the playbook SHALL resolve the promote install host to `all` and SHALL invoke `pipeline engine-promote` with an explicit `--host all` (together with the existing promote flags such as `--for` and thin-ship FRG skip). The playbook SHALL NOT default `ENGINE_PROMOTE_HOST` or the promote `--host` argument to `codex` alone when the operator left the host unset.
+When the chain-to-existing-tools supervisor ship playbook reaches the engine-promote phase and the operator has not set `ENGINE_PROMOTE_HOST`, the playbook SHALL resolve the promote install host to `all` and SHALL invoke `pipeline engine-promote` with an explicit `--host all` (together with the existing promote flags such as `--for`). Default promote argv SHALL omit `--skip-frg`. The playbook SHALL NOT default `ENGINE_PROMOTE_HOST` or the promote `--host` argument to `codex` alone when the operator left the host unset.
 
 #### Scenario: Unset ENGINE_PROMOTE_HOST yields --host all
 
@@ -125,3 +127,25 @@ When documentation describes Option 1 thin ship for agent-box / Buzz (`Ship mile
 - **THEN** the existing `supervisor:ship-playbook-promote-host` doctor check SHALL continue to fail closed
 - **AND** that check SHALL NOT be removed solely because Tugboat is primary
 
+### Requirement: Ship playbook default release and promote argv SHALL omit skip-frg
+
+The documented alternate chain playbook SHALL invoke `pipeline release` and `pipeline engine-promote` without `--skip-frg` on the default path. If the playbook remains installed, it SHALL compose the same `factory-release prepare` request/re-invoke sequence before release, or fail closed when release finds no Factory Reliability Gate (FRG) evidence. The playbook SHALL NOT keep hard-coded `--skip-frg` as its default and SHALL NOT add a grant factory or a second pack protocol.
+
+#### Scenario: Default playbook release argv has no skip-frg
+
+- **WHEN** the ship playbook enters release prepare
+- **AND** no operator skip escape is active
+- **THEN** the release invocation SHALL NOT include `--skip-frg`
+
+#### Scenario: Default playbook promote argv has no skip-frg
+
+- **WHEN** the ship playbook enters engine-promote
+- **AND** no operator skip escape is active
+- **THEN** the promote invocation SHALL NOT include `--skip-frg`
+
+#### Scenario: Missing FRG fail-closes the alternate path
+
+- **WHEN** the playbook reaches release and no `latest.json` `pass: true` exists for that version
+- **AND** no operator skip escape is active
+- **THEN** release SHALL fail closed
+- **AND** the playbook SHALL NOT invent a pass or silently add `--skip-frg`
