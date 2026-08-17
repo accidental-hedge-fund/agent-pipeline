@@ -92,9 +92,9 @@ Operator-facing supervisor documentation and the Hermes skill map SHALL document
 
 ### Requirement: Tugboat SHALL run one FRG pack phase after train and before release
 
-After train is complete or resumed complete, and when the operator escape is not active, Tugboat SHALL run exactly one Factory Reliability Gate (FRG) pack phase before `pipeline release`. That phase SHALL compose `pipeline factory-release prepare --request <absolute-request.json> --json` (or the documented #1037 CLI sequence) with a secret-free request bound to the ship version and candidate. The request `integrated_candidate.git_sha` SHALL be the current remote tip of the configured integration `base_branch` after train (via `origin/<base>` `ls-remote` or fetch, or injected `TUGBOAT_CANDIDATE_SHA`). It SHALL NOT default to the local checkout `HEAD`, which remains at the pre-train SHA when train merges through GitHub. Tugboat SHALL re-invoke the unchanged request until pack-done or pack-fail. Tugboat SHALL NOT start a second unbound pack, SHALL NOT implement a second pack runner, and SHALL NOT sign attestation, merge, tag, promote, or install in this phase.
+After train is complete or resumed complete, and when the operator escape is not active, Tugboat SHALL run exactly one Factory Reliability Gate (FRG) pack phase before `pipeline release`. That phase SHALL compose `pipeline factory-release prepare --request <absolute-request.json> --json` (or the documented #1037 CLI sequence) with a secret-free request bound to the ship version and candidate. The request `base_branch` SHALL be the operator `TUGBOAT_BASE_BRANCH` when set, else the top-level `base_branch` from `.github/pipeline.yml` (the same source train and release use). It SHALL preserve slash-containing names such as `release/1.39`. It SHALL NOT guess `origin/HEAD` or take only the last path segment of a remote ref. When both the env override and the pipeline.yml source are unavailable, Tugboat SHALL fail before writing the request. The request `integrated_candidate.git_sha` SHALL be the current remote tip of the configured integration `base_branch` after train (via `origin/<base>` `ls-remote` or fetch, or injected `TUGBOAT_CANDIDATE_SHA`). It SHALL NOT default to the local checkout `HEAD`, which remains at the pre-train SHA when train merges through GitHub. Tugboat SHALL re-invoke the unchanged request until pack-done or pack-fail. Tugboat SHALL NOT start a second unbound pack, SHALL NOT implement a second pack runner, and SHALL NOT sign attestation, merge, tag, promote, or install in this phase.
 
-Pack-done SHALL mean prepare JSON `status` is `awaiting_frg_attestation`, or `.agent-pipeline/frg/<X.Y.Z>/latest.json` has `pass: true`, or prepare already returned `status: "complete"` with an open release PR for that version. Pack-fail SHALL mean a failed or missing FRG status, `latest.json` `pass: false` after a terminal score, or wait-budget exhaustion while status stays `in_progress`. On pack-fail Tugboat SHALL fail the frg-pack phase and SHALL NOT invoke `pipeline release` for that version.
+Pack-done SHALL mean prepare JSON `status` is `awaiting_frg_attestation`, or `.agent-pipeline/frg/<X.Y.Z>/latest.json` has `pass: true`, or prepare already returned `status: "complete"` with an open release PR for that version. A `latest.json` `pass: false` SHALL be evaluated before any success status: `awaiting_frg_attestation` or `complete` paired with `pass: false` is pack-fail. `status: "complete"` is pack-done only after an open release PR for that version is verified; a bare complete response with no open release PR is pack-fail. Pack-fail SHALL mean a failed or missing FRG status, `latest.json` `pass: false` after a terminal score, or wait-budget exhaustion while status stays `in_progress`. On pack-fail Tugboat SHALL fail the frg-pack phase and SHALL NOT invoke `pipeline release` for that version.
 
 #### Scenario: Request binds the post-train integration tip
 
@@ -103,6 +103,27 @@ Pack-done SHALL mean prepare JSON `status` is `awaiting_frg_attestation`, or `.a
 - **AND** the operator escape is not active
 - **THEN** the factory-release prepare request SHALL set `integrated_candidate.git_sha` to the current remote tip of the configured base branch
 - **AND** it SHALL NOT bind `integrated_candidate.git_sha` to the pre-train local `HEAD`
+
+#### Scenario: Request uses configured integration branch not origin HEAD
+
+- **WHEN** `TUGBOAT_BASE_BRANCH` is unset
+- **AND** `.github/pipeline.yml` sets `base_branch` to `staging`
+- **AND** `origin/HEAD` points at `main`
+- **THEN** the factory-release prepare request `base_branch` SHALL be `staging`
+- **AND** `integrated_candidate.git_sha` SHALL be the current remote tip of `origin/staging`
+
+#### Scenario: Slash-containing integration branch names are preserved
+
+- **WHEN** the configured base branch is `release/1.39`
+- **THEN** the request `base_branch` SHALL be `release/1.39`
+- **AND** the candidate SHALL bind the `origin/release/1.39` tip
+
+#### Scenario: Missing integration-branch source fails before write
+
+- **WHEN** `TUGBOAT_BASE_BRANCH` is unset
+- **AND** `.github/pipeline.yml` is absent
+- **THEN** Tugboat SHALL fail before writing the factory-release prepare request
+- **AND** it SHALL NOT guess `origin/HEAD` or default to `main` from that ref
 
 #### Scenario: Successful pack precedes release
 
@@ -124,6 +145,20 @@ Pack-done SHALL mean prepare JSON `status` is `awaiting_frg_attestation`, or `.a
 - **OR** `.agent-pipeline/frg/1.39.0/latest.json` has `pass: false` after a terminal score
 - **THEN** Tugboat SHALL fail the FRG pack phase
 - **AND** it SHALL NOT invoke `pipeline release` for `1.39.0`
+
+#### Scenario: Failed latest evidence blocks awaiting or complete
+
+- **WHEN** `.agent-pipeline/frg/1.39.0/latest.json` has `pass: false`
+- **AND** prepare status is `awaiting_frg_attestation` or `complete`
+- **THEN** Tugboat SHALL fail the FRG pack phase
+- **AND** it SHALL NOT invoke `pipeline release` for `1.39.0`
+
+#### Scenario: Complete without an open release PR is not pack-done
+
+- **WHEN** prepare returns `status: "complete"`
+- **AND** no open release PR exists for that version
+- **THEN** Tugboat SHALL fail the FRG pack phase
+- **AND** it SHALL NOT treat pack as done
 
 #### Scenario: Pack phase does not sign or finalize
 

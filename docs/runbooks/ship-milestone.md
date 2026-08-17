@@ -70,6 +70,10 @@ export ALLOW_MERGE=1                        # required for mutating ship
 # export PIPELINE_MATERIAL_FILTER=…/material-filter.mjs
 # export TUGBOAT_SKIP_FRG=1                 # escape only; requires TUGBOAT_SKIP_FRG_REASON
 # export TUGBOAT_SKIP_FRG_REASON="…"
+# export TUGBOAT_BASE_BRANCH=main           # optional override; default is
+#                                          # .github/pipeline.yml base_branch.
+#                                          # Required when that file is absent.
+#                                          # origin/HEAD is not used.
 ```
 
 ## Operator usage

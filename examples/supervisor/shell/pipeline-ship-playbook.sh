@@ -37,6 +37,8 @@
 #   FRG_WAIT_SLEEP_S           FRG pack sleep seconds (default RELEASE_WAIT_SLEEP_S)
 #   TUGBOAT_SKIP_FRG           1 to skip FRG pack (requires TUGBOAT_SKIP_FRG_REASON)
 #   TUGBOAT_SKIP_FRG_REASON    non-empty logged reason for skip escape
+#   TUGBOAT_BASE_BRANCH        integration branch override; else pipeline.yml
+#                              base_branch. Missing both fails closed.
 #
 set -euo pipefail
 

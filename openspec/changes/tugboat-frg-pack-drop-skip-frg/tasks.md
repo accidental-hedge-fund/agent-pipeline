@@ -19,6 +19,8 @@
 - [x] 3.3 Flip doctor / playbook source assertions that currently require default `--skip-frg` (`core/test/doctor.test.ts`, `core/test/engine-promote.test.ts`, and any sibling)
 - [x] 3.4 Tests inject I/O or inspect source/fixtures. They start no live pack, network, git, or subprocess ship
 - [x] 3.5 Regression: `write_factory_release_request` binds `origin/<base>` remote tip (injected fake git), not local `HEAD`, and fail-closes when the remote tip is missing
+- [x] 3.6 Review-2: `classify_frg_pack_tick` fails on `latest.json` `pass: false` before awaiting/complete, and `complete` is done only with a verified open release PR
+- [x] 3.7 Review-2: request writer uses `.github/pipeline.yml` / `TUGBOAT_BASE_BRANCH`, preserves slash names, and does not guess `origin/HEAD`
 
 ## 4. Docs and Hermes skill
 
