@@ -177,8 +177,9 @@ The check requires runner-stamped `score_source: from-run` and
 `work_list: factory-gate-pack` on the evidence object. Notes and caller
 options cannot establish those fields. Persist does not stamp those
 fields from caller options. The check also requires a runner-issued
-`integrity.score_receipt` that binds the computed `pass` to the run, so
-a hand-edited `pass: true` is not proof.
+HMAC-SHA256 `integrity.score_receipt` under `PIPELINE_FRG_ATTESTATION_KEY`
+that binds the computed `pass` to the run. A hand-edited `pass: true`
+or a reminted public hash of the same fields is not proof.
 
 The check **refuses**:
 
@@ -189,8 +190,10 @@ The check **refuses**:
 - required-live `not_observed`
 - an unknown `layer_a` id or a TAP bound to another commit
 
-HMAC attestation is **not** required for this precondition. A fail score
-stays `pass: false` and does not unlock the Tugboat `--skip-frg` flip.
+Full HMAC attestation (`integrity.attestation`) is **not** required for
+this precondition. The score receipt still requires the producer key.
+A fail score stays `pass: false` and does not unlock the Tugboat
+`--skip-frg` flip.
 This change does **not** drop `--skip-frg` from default release or promote
 argv and does **not** add an FRG pack phase to Tugboat.
 

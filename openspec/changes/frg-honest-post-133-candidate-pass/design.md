@@ -78,7 +78,9 @@ object):
 1. `version` is strictly after `1.33.0` (SemVer).
 2. `pass: true`.
 3. Structural eligibility via `isReleaseEligibleFrgPass` with
-   `requireAttestation: false` (HMAC is not this issue's missing proof).
+   `requireAttestation: false` (full HMAC attestation is not this
+   issue's missing proof). The skip-frg receipt is a runner HMAC
+   under `PIPELINE_FRG_ATTESTATION_KEY`, not a public hash.
 4. Non-empty `run_id`, bound `loop_run_id`, `pack_id: factory-gate-v1`,
    and `pack_provenance.candidate_git_sha`.
 5. Required-live scenario / composition ids are present and not

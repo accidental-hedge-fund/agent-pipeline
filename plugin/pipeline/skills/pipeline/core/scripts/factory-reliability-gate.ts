@@ -267,9 +267,11 @@ export interface FrgIntegrity {
   /** Present when structured pack provenance is part of the evidence. */
   pack_provenance_fingerprint?: string;
   /**
-   * Runner-issued binding of computed `pass` to the evidence run. Honest-pass
-   * requires this receipt to match; flipping `pass` alone cannot create proof.
-   * HMAC attestation remains optional for that check.
+   * Runner-issued HMAC-SHA256 binding of computed `pass` to the evidence run
+   * under {@link FRG_ATTESTATION_KEY_ENV}. Honest-pass requires this receipt
+   * to verify; flipping `pass` or reminting a public hash cannot create proof.
+   * Full HMAC attestation (`integrity.attestation`) remains optional for that
+   * check.
    */
   score_receipt?: string;
   /**
@@ -481,14 +483,10 @@ export function computePackProvenanceFingerprint(
   return frgStableFingerprint(provenance);
 }
 
-/** Runner-issued score receipt payload kind (public hash; not a substitute for HMAC). */
-const FRG_SCORE_RECEIPT_KIND = "frg-score-receipt-v1";
+/** Runner-issued score receipt payload kind (HMAC; not a public hash). */
+export const FRG_SCORE_RECEIPT_KIND = "frg-score-receipt-hmac-v1";
 
-/**
- * Bind the runner-computed `pass` to the evidence run. Flipping `pass`
- * without reminting this receipt fails {@link isHonestPost133FrgPass}.
- */
-export function computeFrgScoreReceipt(input: {
+export interface FrgScoreReceiptInput {
   pass: boolean;
   version?: string;
   run_id?: string;
@@ -499,8 +497,10 @@ export function computeFrgScoreReceipt(input: {
   scoreboard_fingerprint?: string;
   composition_fingerprint?: string;
   pack_provenance_fingerprint?: string;
-}): string {
-  return frgStableFingerprint({
+}
+
+function frgScoreReceiptPayload(input: FrgScoreReceiptInput): Record<string, unknown> {
+  return {
     kind: FRG_SCORE_RECEIPT_KIND,
     pass: input.pass,
     version: input.version ?? null,
@@ -512,7 +512,21 @@ export function computeFrgScoreReceipt(input: {
     scoreboard_fingerprint: input.scoreboard_fingerprint ?? null,
     composition_fingerprint: input.composition_fingerprint ?? null,
     pack_provenance_fingerprint: input.pack_provenance_fingerprint ?? null,
-  });
+  };
+}
+
+/**
+ * Bind the runner-computed `pass` to the evidence run with HMAC-SHA256 under
+ * the producer key. A public hash of the same fields is not a valid receipt.
+ */
+export function computeFrgScoreReceipt(
+  input: FrgScoreReceiptInput & { attestationKey: string },
+): string {
+  const key = input.attestationKey.trim();
+  if (key === "") {
+    throw new Error("computeFrgScoreReceipt requires a non-empty attestation key");
+  }
+  return computeFrgAttestationMac(frgScoreReceiptPayload(input), key);
 }
 
 export function buildFrgIntegrity(
@@ -1260,7 +1274,7 @@ function parseFrgIntegrity(raw: unknown): FrgIntegrity {
   if (i.score_receipt !== undefined && i.score_receipt !== null) {
     if (typeof i.score_receipt !== "string" || !/^[0-9a-f]{64}$/.test(i.score_receipt)) {
       throw new Error(
-        "FRG evidence.integrity.score_receipt must be a lowercase SHA-256 digest when present",
+        "FRG evidence.integrity.score_receipt must be a 64-char lowercase hex HMAC-SHA256 when present",
       );
     }
     integrity.score_receipt = i.score_receipt;
@@ -1602,6 +1616,12 @@ export interface HonestPost133FrgPassOpts {
    * `other`). `factory-gate-pack` here does not establish authority.
    */
   workList?: HonestPost133WorkList;
+  /**
+   * Producer key used to verify `integrity.score_receipt`. Explicit `null`
+   * or empty fails closed. When omitted, {@link resolveFrgAttestationKey}
+   * reads {@link FRG_ATTESTATION_KEY_ENV}.
+   */
+  attestationKey?: string | null;
 }
 
 /** Note prefix written by `runFactoryGate` on the `--from-run` path. */
@@ -1668,7 +1688,24 @@ function honestPassIsFactoryGatePack(
   return true;
 }
 
-function honestPassScoreReceiptMatches(evidence: HonestPost133FrgPassEvidence): boolean {
+function resolveHonestPassAttestationKey(
+  opts?: HonestPost133FrgPassOpts,
+): string | null {
+  if (opts && Object.prototype.hasOwnProperty.call(opts, "attestationKey")) {
+    const raw = opts.attestationKey;
+    if (typeof raw !== "string") return null;
+    const key = raw.trim();
+    return key === "" ? null : key;
+  }
+  return resolveFrgAttestationKey();
+}
+
+function honestPassScoreReceiptMatches(
+  evidence: HonestPost133FrgPassEvidence,
+  opts?: HonestPost133FrgPassOpts,
+): boolean {
+  const key = resolveHonestPassAttestationKey(opts);
+  if (!key) return false;
   const receipt = evidence.integrity?.score_receipt;
   if (typeof receipt !== "string" || !SHA256_RE.test(receipt)) return false;
   const expected = computeFrgScoreReceipt({
@@ -1682,6 +1719,7 @@ function honestPassScoreReceiptMatches(evidence: HonestPost133FrgPassEvidence): 
     scoreboard_fingerprint: evidence.integrity.scoreboard_fingerprint,
     composition_fingerprint: evidence.integrity.composition_fingerprint,
     pack_provenance_fingerprint: evidence.integrity.pack_provenance_fingerprint,
+    attestationKey: key,
   });
   return timingSafeEqualHex(receipt, expected);
 }
@@ -1743,10 +1781,11 @@ function layerAClaimsHaveCandidateTap(evidence: HonestPost133FrgPassEvidence): b
  * `factory-gate-v1` candidate pack, with required-live observed and Layer A
  * TAP hashes bound to the same candidate SHA.
  *
- * HMAC attestation is **not** required here (`requireAttestation: false`).
- * A runner-issued `integrity.score_receipt` **is** required so a hand-edited
- * `pass: true` cannot satisfy the skip-frg precondition. Auto-tag / pin
- * children may still require a MAC later.
+ * Full HMAC attestation (`integrity.attestation`) is **not** required here
+ * (`requireAttestation: false`). A runner-issued HMAC `integrity.score_receipt`
+ * **is** required so a hand-edited `pass: true` or a reminted public hash
+ * cannot satisfy the skip-frg precondition. Auto-tag / pin children may
+ * still require the full attestation MAC later.
  *
  * Later skip-frg restore work SHALL call this helper. It SHALL NOT invent a
  * second pass definition.
@@ -1769,7 +1808,7 @@ export function isHonestPost133FrgPass(
   if (!honestPassIsFactoryGatePack(evidence, opts)) return false;
   if (!requiredLiveObserved(evidence)) return false;
   if (!layerAClaimsHaveCandidateTap(evidence)) return false;
-  if (!honestPassScoreReceiptMatches(evidence)) return false;
+  if (!honestPassScoreReceiptMatches(evidence, opts)) return false;
   return isReleaseEligibleFrgPass(evidence, { requireAttestation: false });
 }
 
@@ -1794,6 +1833,9 @@ export function latestJsonForHonestPost133Persist(
   if (opts?.scoreSource === "observations") checkOpts.scoreSource = "observations";
   if (opts?.workList === "product-milestone" || opts?.workList === "other") {
     checkOpts.workList = opts.workList;
+  }
+  if (opts && Object.prototype.hasOwnProperty.call(opts, "attestationKey")) {
+    checkOpts.attestationKey = opts.attestationKey;
   }
   if (isHonestPost133FrgPass(scored, checkOpts)) {
     return { ...scored, pass: true };
@@ -3400,23 +3442,23 @@ export function computeFrgEvidence(input: ComputeFrgInput): FrgEvidence {
   // Claim pass:true only when structure is eligible and we will attach attestation.
   const pass = structuralPass && canSign;
 
-  integrity = {
-    ...integrity,
-    score_receipt: computeFrgScoreReceipt({
-      pass,
-      version,
-      run_id: runId,
-      loop_run_id: loopRunId,
-      pack_id: packId,
-      score_source: input.score_source,
-      work_list: input.work_list,
-      scoreboard_fingerprint: integrity.scoreboard_fingerprint,
-      composition_fingerprint: integrity.composition_fingerprint,
-      pack_provenance_fingerprint: integrity.pack_provenance_fingerprint,
-    }),
-  };
-
   if (canSign) {
+    integrity = {
+      ...integrity,
+      score_receipt: computeFrgScoreReceipt({
+        pass,
+        version,
+        run_id: runId,
+        loop_run_id: loopRunId,
+        pack_id: packId,
+        score_source: input.score_source,
+        work_list: input.work_list,
+        scoreboard_fingerprint: integrity.scoreboard_fingerprint,
+        composition_fingerprint: integrity.composition_fingerprint,
+        pack_provenance_fingerprint: integrity.pack_provenance_fingerprint,
+        attestationKey: attestationKey!,
+      }),
+    };
     integrity = signFrgIntegrity({
       integrity,
       schema_version: FRG_SCHEMA_VERSION,

@@ -1823,9 +1823,10 @@ export async function generateDurableUnsignedFrg(
   }));
 
   // Honest-pass latest.json: persist pass:true only when the skip-frg
-  // restore checker accepts a from-run candidate pack (HMAC not required).
-  // Provenance must already be on `scored`; persist does not stamp it.
-  // A structural fail MAY be written with pass:false. Never flip fail to pass.
+  // restore checker accepts a from-run candidate pack (full attestation
+  // optional; score_receipt is a runner HMAC). Provenance must already
+  // be on `scored`; persist does not stamp it. A structural fail MAY be
+  // written with pass:false. Never flip fail to pass.
   const latestPath = path.join(
     ctx.repoDir,
     ".agent-pipeline",

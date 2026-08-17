@@ -207,11 +207,15 @@ The pipeline SHALL expose one deterministic honest-pass check over a
 only evidence that meets the post-1.33, from-run, required-live,
 Layer A TAP, pack-identity, and no-observations rules in this change.
 The check SHALL require a runner-issued `integrity.score_receipt` that
-binds the computed `pass` to the evidence run. A hand-edited `pass: true`
-on an unsigned or failed score SHALL NOT match that receipt. HMAC
-attestation remains optional for this check. Later skip-frg restore,
-auto-tag, and pin work SHALL reuse this check. They SHALL NOT invent a
-second pass definition.
+binds the computed `pass` to the evidence run. That receipt SHALL be an
+HMAC-SHA256 under `PIPELINE_FRG_ATTESTATION_KEY` (or an explicit injected
+test key). A public hash of evidence fields SHALL NOT satisfy the check.
+A hand-edited `pass: true` on an unsigned or failed score SHALL NOT match
+that receipt, including when the editor also remints `score_receipt`
+without the producer key. Full HMAC attestation (`integrity.attestation`)
+remains optional for this check. Later skip-frg restore, auto-tag, and
+pin work SHALL reuse this check. They SHALL NOT invent a second pass
+definition.
 
 #### Scenario: Checker accepts a conforming post-1.33 from-run pass
 
@@ -233,6 +237,14 @@ second pass definition.
 #### Scenario: Checker rejects a hand-edited pass on an unsigned fail
 
 - **WHEN** the runner writes a structurally eligible unsigned score with
-  `pass: false` and a `score_receipt` bound to that fail
+  `pass: false`
 - **AND** a caller clones the object with `pass: true`
+- **THEN** the honest-pass check SHALL return reject
+
+#### Scenario: Checker rejects a reminted public receipt on an unsigned fail
+
+- **WHEN** the runner writes a structurally eligible unsigned score with
+  `pass: false`
+- **AND** a caller clones the object with `pass: true` and a recomputed
+  public `score_receipt` hash, or a MAC under a different key
 - **THEN** the honest-pass check SHALL return reject
