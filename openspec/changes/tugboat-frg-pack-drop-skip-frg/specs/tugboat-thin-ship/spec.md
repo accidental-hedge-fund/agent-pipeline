@@ -94,7 +94,7 @@ Operator-facing supervisor documentation and the Hermes skill map SHALL document
 
 After train is complete or resumed complete, and when the operator escape is not active, Tugboat SHALL run exactly one Factory Reliability Gate (FRG) pack phase before `pipeline release`. That phase SHALL compose `pipeline factory-release prepare --request <absolute-request.json> --json` (or the documented #1037 CLI sequence) with a secret-free request bound to the ship version and candidate. The request `base_branch` SHALL be the operator `TUGBOAT_BASE_BRANCH` when set, else the top-level `base_branch` from `.github/pipeline.yml` (the same source train and release use). It SHALL preserve slash-containing names such as `release/1.39`. It SHALL NOT guess `origin/HEAD` or take only the last path segment of a remote ref. When both the env override and the pipeline.yml source are unavailable, Tugboat SHALL fail before writing the request. The request `integrated_candidate.git_sha` SHALL be the current remote tip of the configured integration `base_branch` after train (via `origin/<base>` `ls-remote` or fetch, or injected `TUGBOAT_CANDIDATE_SHA`). It SHALL NOT default to the local checkout `HEAD`, which remains at the pre-train SHA when train merges through GitHub. Tugboat SHALL re-invoke the unchanged request until pack-done or pack-fail. Tugboat SHALL NOT start a second unbound pack, SHALL NOT implement a second pack runner, and SHALL NOT sign attestation, merge, tag, promote, or install in this phase.
 
-Pack-done SHALL mean prepare JSON `status` is `awaiting_frg_attestation`, or `.agent-pipeline/frg/<X.Y.Z>/latest.json` has `pass: true`, or prepare already returned `status: "complete"` with an open release PR for that version. A `latest.json` `pass: false` SHALL be evaluated before any success status: `awaiting_frg_attestation` or `complete` paired with `pass: false` is pack-fail. `status: "complete"` is pack-done only after an open release PR for that version is verified; a bare complete response with no open release PR is pack-fail. Pack-fail SHALL mean a failed or missing FRG status, `latest.json` `pass: false` after a terminal score, or wait-budget exhaustion while status stays `in_progress`. On pack-fail Tugboat SHALL fail the frg-pack phase and SHALL NOT invoke `pipeline release` for that version.
+Pack-done SHALL mean prepare JSON `status` is `awaiting_frg_attestation`, or `.agent-pipeline/frg/<X.Y.Z>/latest.json` has `pass: true` and records the request `target_version` and `integrated_candidate.git_sha` (and `action_id` when the artifact records one), or prepare already returned `status: "complete"` with an open release PR for that version. A `pass: true` artifact that lacks that binding, or that binds a different version or candidate SHA, SHALL NOT be pack-done; Tugboat SHALL re-invoke while prepare status is `in_progress`. A `latest.json` `pass: false` SHALL be evaluated before any success status: `awaiting_frg_attestation` or `complete` paired with `pass: false` is pack-fail. `status: "complete"` is pack-done only after an open release PR for that version is verified; a bare complete response with no open release PR is pack-fail. Pack-fail SHALL mean a failed or missing FRG status, `latest.json` `pass: false` after a terminal score, or wait-budget exhaustion while status stays `in_progress`. On pack-fail Tugboat SHALL fail the frg-pack phase and SHALL NOT invoke `pipeline release` for that version.
 
 #### Scenario: Request binds the post-train integration tip
 
@@ -143,9 +143,18 @@ Pack-done SHALL mean prepare JSON `status` is `awaiting_frg_attestation`, or `.a
 
 - **WHEN** train is complete for version `1.39.0`
 - **AND** the operator escape is not active
-- **AND** prepare returns `status: "awaiting_frg_attestation"` or `latest.json` for `1.39.0` has `pass: true`
+- **AND** prepare returns `status: "awaiting_frg_attestation"` or `latest.json` for `1.39.0` has `pass: true` for the requested candidate SHA
 - **THEN** Tugboat SHALL mark the FRG pack phase ok
 - **AND** it SHALL proceed to `pipeline release 1.39.0` without `--skip-frg`
+
+#### Scenario: Stale passing latest.json does not complete a newer candidate
+
+- **WHEN** train advances the integration branch to a new candidate SHA
+- **AND** `.agent-pipeline/frg/1.39.0/latest.json` has `pass: true` bound to a prior SHA
+- **AND** prepare returns `status: "in_progress"` for the new request
+- **THEN** Tugboat SHALL NOT treat pack as done
+- **AND** it SHALL re-invoke the same request
+- **AND** it SHALL NOT invoke `pipeline release` until pack-done for the new candidate
 
 #### Scenario: In-progress pack is re-invoked and does not release
 

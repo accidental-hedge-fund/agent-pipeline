@@ -1639,7 +1639,7 @@ test("classify_frg_pack_tick: done / retry / fail without live pack", () => {
         "#!/usr/bin/env bash",
         "set -euo pipefail",
         `. ${JSON.stringify(frgHelpers)}`,
-        'classify_frg_pack_tick "$1" "$2" "$3"',
+        'classify_frg_pack_tick "$1" "$2" "$3" "${4:-}"',
         "",
       ].join("\n"),
     );
@@ -1649,19 +1649,28 @@ test("classify_frg_pack_tick: done / retry / fail without live pack", () => {
       latest: unknown | null,
       ec: number,
       extraEnv: NodeJS.ProcessEnv = {},
+      request: unknown | null = null,
     ): string => {
       const prepPath = path.join(dir, "prep.json");
       const latestPath = path.join(dir, "latest.json");
+      const reqPath = path.join(dir, "request.json");
       fs.writeFileSync(prepPath, JSON.stringify(prep));
       if (latest === null) {
         if (fs.existsSync(latestPath)) fs.rmSync(latestPath);
       } else {
         fs.writeFileSync(latestPath, JSON.stringify(latest));
       }
+      if (request === null) {
+        if (fs.existsSync(reqPath)) fs.rmSync(reqPath);
+      } else {
+        fs.writeFileSync(reqPath, JSON.stringify(request));
+      }
       const env = { ...process.env, ...extraEnv };
       delete env.TUGBOAT_OPEN_RELEASE_PR;
       Object.assign(env, extraEnv);
-      const r = spawnSync("bash", [runner, prepPath, latestPath, String(ec)], {
+      const argv = [runner, prepPath, latestPath, String(ec)];
+      if (request !== null) argv.push(reqPath);
+      const r = spawnSync("bash", argv, {
         encoding: "utf8",
         env,
       });
@@ -1673,6 +1682,19 @@ test("classify_frg_pack_tick: done / retry / fail without live pack", () => {
       target_version: "1.39.0",
       release_pr: { number: 12, head_oid: "a".repeat(40), base_oid: "b".repeat(40) },
     };
+    const shaOld = "a".repeat(40);
+    const shaNew = "b".repeat(40);
+    const reqNew = {
+      target_version: "1.39.0",
+      action_id: "tugboat-ship-1.39.0",
+      integrated_candidate: { git_sha: shaNew },
+    };
+    const latestFor = (sha: string, extra: Record<string, unknown> = {}) => ({
+      pass: true,
+      version: "1.39.0",
+      pack_provenance: { candidate_git_sha: sha, release_version: "1.39.0" },
+      ...extra,
+    });
     assert.equal(
       run({ status: "awaiting_frg_attestation" }, null, 0),
       "done",
@@ -1689,7 +1711,18 @@ test("classify_frg_pack_tick: done / retry / fail without live pack", () => {
       "fail",
     );
     assert.equal(run({ status: "failed" }, null, 1), "fail");
-    assert.equal(run({ status: "in_progress" }, { pass: true }, 0), "done");
+    assert.equal(
+      run({ status: "in_progress" }, { pass: true }, 0, {}, reqNew),
+      "retry",
+    );
+    assert.equal(
+      run({ status: "in_progress" }, latestFor(shaOld), 0, {}, reqNew),
+      "retry",
+    );
+    assert.equal(
+      run({ status: "in_progress" }, latestFor(shaNew), 0, {}, reqNew),
+      "done",
+    );
     assert.equal(run({ status: "complete" }, { pass: false }, 0), "fail");
     assert.equal(
       run({ status: "awaiting_frg_attestation" }, { pass: false }, 0),

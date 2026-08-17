@@ -262,15 +262,20 @@ PY
 }
 
 # Classify one factory-release prepare tick. Prints done | retry | fail.
-# $1 prepare JSON path, $2 latest.json path, $3 prepare exit code.
-# pass: false is pack-fail before any success status. complete is done
-# only after an open release PR for the requested version is verified
-# (TUGBOAT_OPEN_RELEASE_PR injects that number; else gh pr list).
+# $1 prepare JSON path, $2 latest.json path, $3 prepare exit code,
+# $4 factory-release request JSON (version + candidate SHA binding).
+# pass: false is pack-fail before any success status. pass: true is
+# pack-done only when latest records the request target_version and
+# integrated_candidate.git_sha (and action_id when the artifact has it).
+# complete is done only after an open release PR for the requested
+# version is verified (TUGBOAT_OPEN_RELEASE_PR injects that number;
+# else gh pr list).
 classify_frg_pack_tick() {
-  python3 - "$1" "$2" "$3" <<'PY'
+  python3 - "$1" "$2" "$3" "${4:-}" <<'PY'
 import json, os, subprocess, sys
 
 prep_path, latest_path, ec_s = sys.argv[1], sys.argv[2], sys.argv[3]
+req_path = sys.argv[4] if len(sys.argv) > 4 else ""
 try:
     ec = int(ec_s)
 except ValueError:
@@ -290,6 +295,77 @@ def load_maybe(path):
             except Exception:
                 return None
         return None
+
+def as_dict(value):
+    return value if isinstance(value, dict) else {}
+
+def norm_ver(raw):
+    v = str(raw or "").strip()
+    if v.startswith("v") or v.startswith("V"):
+        v = v[1:]
+    return v
+
+def norm_sha(raw):
+    return str(raw or "").strip().lower()
+
+def request_binding(req):
+    if not isinstance(req, dict):
+        return None
+    version = norm_ver(req.get("target_version"))
+    sha = norm_sha(as_dict(req.get("integrated_candidate")).get("git_sha"))
+    action = str(req.get("action_id") or "").strip()
+    if not version or not sha:
+        return None
+    return (version, sha, action)
+
+def extract_factory_binding(latest):
+    frb = latest.get("factory_release_binding")
+    if isinstance(frb, dict):
+        return frb
+    notes = latest.get("notes")
+    if isinstance(notes, list):
+        prefix = "factory_release_binding:"
+        for note in notes:
+            if not isinstance(note, str) or not note.startswith(prefix):
+                continue
+            try:
+                parsed = json.loads(note[len(prefix):])
+            except Exception:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+    return {}
+
+def latest_binding(latest):
+    if not isinstance(latest, dict):
+        return None
+    frb = extract_factory_binding(latest)
+    prov = as_dict(latest.get("pack_provenance"))
+    version = norm_ver(
+        latest.get("version") or frb.get("target_version") or prov.get("release_version")
+    )
+    sha = norm_sha(
+        frb.get("candidate_git_sha")
+        or prov.get("candidate_git_sha")
+        or latest.get("candidate_git_sha")
+    )
+    action = str(
+        frb.get("action_id") or latest.get("action_id") or prov.get("action_id") or ""
+    ).strip()
+    if not version or not sha:
+        return None
+    return (version, sha, action)
+
+def pass_matches_request(latest, req):
+    want = request_binding(req)
+    got = latest_binding(latest)
+    if want is None or got is None:
+        return False
+    if want[0] != got[0] or want[1] != got[1]:
+        return False
+    if got[2] and want[2] and got[2] != want[2]:
+        return False
+    return True
 
 def complete_has_open_release_pr(prep):
     if not isinstance(prep, dict):
@@ -337,13 +413,14 @@ def complete_has_open_release_pr(prep):
 
 prep = load_maybe(prep_path)
 latest = load_maybe(latest_path)
+req = load_maybe(req_path)
 status = prep.get("status") if isinstance(prep, dict) else None
 pass_v = latest.get("pass") if isinstance(latest, dict) else None
 
 if pass_v is False:
     print("fail")
     raise SystemExit(0)
-if pass_v is True:
+if pass_v is True and pass_matches_request(latest, req):
     print("done")
     raise SystemExit(0)
 if status == "awaiting_frg_attestation":

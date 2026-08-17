@@ -692,7 +692,7 @@ if [[ "$SKIP_FRG" != "1" ]]; then
     pack_ec=$?
     set -e
     cat "$RUN_DIR/frg-pack.err" >>"$LOG_FILE" 2>/dev/null || true
-    pack_verdict=$(classify_frg_pack_tick "$RUN_DIR/frg-pack.json" "$latest_json" "$pack_ec")
+    pack_verdict=$(classify_frg_pack_tick "$RUN_DIR/frg-pack.json" "$latest_json" "$pack_ec" "$req")
     if [[ "$pack_verdict" == "done" ]]; then
       log "phase frg-pack: pack-done (attempt $i)"
       pack_done=1
