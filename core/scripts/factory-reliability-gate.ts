@@ -1518,6 +1518,259 @@ export function isReleaseEligibleFrgPass(
   return true;
 }
 
+/**
+ * How a latest.json (or equivalent) was scored. Later skip-frg / auto-tag /
+ * pin children pass this when known; otherwise the checker infers `--from-run`
+ * from {@link FRG_FROM_RUN_NOTE_PREFIX} in `notes`.
+ */
+export type HonestPost133ScoreSource = "from-run" | "observations" | "unknown";
+
+/**
+ * Work-list identity for the skip-frg restore precondition. The product
+ * v1.39 milestone is never honest-pass evidence.
+ */
+export type HonestPost133WorkList = "factory-gate-pack" | "product-milestone" | "other";
+
+export interface HonestPost133FrgPassOpts {
+  /** Explicit score path. `observations` always rejects. */
+  scoreSource?: HonestPost133ScoreSource;
+  /** Caller-authored `--observations` file used as score authority. */
+  usedObservationsFile?: boolean;
+  /** Work-list identity. `product-milestone` always rejects. */
+  workList?: HonestPost133WorkList;
+}
+
+/** Note prefix written by `runFactoryGate` on the `--from-run` path. */
+export const FRG_FROM_RUN_NOTE_PREFIX = "Projected from durable loop run ";
+
+/** Note written by `runFactoryGate` when the contract is the fixed pack. */
+export const FRG_NOT_PRODUCT_MILESTONE_NOTE =
+  "Scenario pack selection: reliability label/fixture pack (not full product milestone)";
+
+const GIT_SHA_RE = /^[0-9a-f]{40,64}$/;
+const SHA256_RE = /^[0-9a-f]{64}$/;
+
+export type HonestPost133FrgPassEvidence = {
+  version?: string;
+  pass: boolean;
+  scenarios: readonly FrgScenarioOutcome[];
+  loop_run_id: string | null;
+  pack_id: string | null;
+  thresholds: FrgThresholds;
+  scoreboard?: FrgScoreboard;
+  composition?: FrgComposition;
+  integrity?: FrgIntegrity;
+  pack_provenance?: FrgPackProvenance | null;
+  run_id?: string;
+  notes?: readonly string[];
+};
+
+function notesText(evidence: { notes?: readonly string[] }): string {
+  return (evidence.notes ?? []).join("\n");
+}
+
+function honestPassIsFromRun(
+  evidence: { notes?: readonly string[] },
+  opts?: HonestPost133FrgPassOpts,
+): boolean {
+  if (opts?.scoreSource === "observations") return false;
+  if (opts?.scoreSource === "from-run") return true;
+  return (evidence.notes ?? []).some((note) => note.startsWith(FRG_FROM_RUN_NOTE_PREFIX));
+}
+
+function honestPassUsedObservationsFile(
+  evidence: { notes?: readonly string[] },
+  opts?: HonestPost133FrgPassOpts,
+): boolean {
+  if (opts?.usedObservationsFile === true) return true;
+  if (opts?.scoreSource === "observations") return true;
+  const notes = notesText(evidence);
+  return /(?:^|\s)--observations\b/.test(notes) || /scored from observations file/i.test(notes);
+}
+
+function honestPassIsProductMilestone(
+  evidence: { notes?: readonly string[] },
+  opts?: HonestPost133FrgPassOpts,
+): boolean {
+  if (opts?.workList === "product-milestone") return true;
+  if (opts?.workList === "factory-gate-pack") return false;
+  const notes = notesText(evidence);
+  if (/product v?1\.39 milestone/i.test(notes)) return true;
+  if (/\bproduct-milestone\b/i.test(notes) && !/not full product milestone/i.test(notes)) {
+    return true;
+  }
+  return false;
+}
+
+function requiredLiveObserved(evidence: HonestPost133FrgPassEvidence): boolean {
+  for (const id of FRG_HYBRID_LIVE_SCENARIO_IDS) {
+    const scenario = evidence.scenarios.find((item) => item.id === id);
+    if (!scenario || scenario.status === "not_observed") return false;
+    if (scenario.source === "layer_a") return false;
+  }
+  const dimensions = evidence.composition?.dimensions ?? [];
+  for (const id of FRG_HYBRID_LIVE_COMPOSITION_IDS) {
+    const dimension = dimensions.find((item) => item.id === id);
+    if (!dimension || dimension.status === "not_observed") return false;
+    if (dimension.source === "layer_a") return false;
+  }
+  return true;
+}
+
+function layerAClaimsHaveCandidateTap(evidence: HonestPost133FrgPassEvidence): boolean {
+  const provenance = evidence.pack_provenance ?? null;
+  const candidateSha = provenance?.candidate_git_sha;
+  if (!provenance || typeof candidateSha !== "string" || !GIT_SHA_RE.test(candidateSha)) {
+    return false;
+  }
+  const probes = new Map(provenance.probes.map((probe) => [probe.id, probe] as const));
+  const proofs = new Map(provenance.proofs.map((proof) => [proof.id, proof] as const));
+
+  const checkLayerA = (id: string, source: string | undefined, proofIds: readonly string[] | undefined) => {
+    if (source !== "layer_a") return true;
+    if (isFrgRequiredLiveScenarioId(id) || isFrgRequiredLiveCompositionId(id)) return false;
+    if (!proofIds?.length) return false;
+    for (const proofId of proofIds) {
+      if (!proofId.startsWith("probe:")) return false;
+      const probeId = proofId.slice("probe:".length);
+      const probe = probes.get(probeId);
+      const proof = proofs.get(proofId);
+      if (!probe || !proof || proof.source !== "layer_a") return false;
+      if (probe.candidate_git_sha !== candidateSha) return false;
+      if (!SHA256_RE.test(probe.stdout_sha256) || !SHA256_RE.test(probe.command_argv_sha256)) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  for (const scenario of evidence.scenarios) {
+    if (!checkLayerA(scenario.id, scenario.source, scenario.proof_ids)) return false;
+  }
+  for (const dimension of evidence.composition?.dimensions ?? []) {
+    if (!checkLayerA(dimension.id, dimension.source, dimension.proof_ids)) return false;
+  }
+  return true;
+}
+
+/**
+ * Skip-frg restore precondition (#1038). True only for one post-1.33
+ * `latest.json` (or equivalent) scored via `--from-run` of a request-bound
+ * `factory-gate-v1` candidate pack, with required-live observed and Layer A
+ * TAP hashes bound to the same candidate SHA.
+ *
+ * HMAC attestation is **not** required here (`requireAttestation: false`).
+ * Auto-tag / pin children may still require a MAC later.
+ *
+ * Later skip-frg restore work SHALL call this helper. It SHALL NOT invent a
+ * second pass definition.
+ */
+export function isHonestPost133FrgPass(
+  evidence: HonestPost133FrgPassEvidence,
+  opts?: HonestPost133FrgPassOpts,
+): boolean {
+  if (!isPostHybridPilotVersion(evidence.version)) return false;
+  if (!evidence.pass) return false;
+  if (typeof evidence.run_id !== "string" || evidence.run_id.trim() === "") return false;
+  if (typeof evidence.loop_run_id !== "string" || evidence.loop_run_id.trim() === "") {
+    return false;
+  }
+  if (evidence.pack_id !== FRG_PACK_MANIFEST.pack_id) return false;
+  const candidateSha = evidence.pack_provenance?.candidate_git_sha;
+  if (typeof candidateSha !== "string" || !GIT_SHA_RE.test(candidateSha)) return false;
+  if (honestPassUsedObservationsFile(evidence, opts)) return false;
+  if (!honestPassIsFromRun(evidence, opts)) return false;
+  if (honestPassIsProductMilestone(evidence, opts)) return false;
+  if (!requiredLiveObserved(evidence)) return false;
+  if (!layerAClaimsHaveCandidateTap(evidence)) return false;
+  return isReleaseEligibleFrgPass(evidence, { requireAttestation: false });
+}
+
+/**
+ * Persist gate for `.agent-pipeline/frg/<ver>/latest.json`.
+ *
+ * A structurally honest unsigned from-run score is written as `pass: true`
+ * (HMAC is not this issue's missing proof). A structural fail stays
+ * `pass: false` and is never rewritten to pass.
+ */
+export function latestJsonForHonestPost133Persist(
+  scored: HonestPost133FrgPassEvidence,
+  opts?: HonestPost133FrgPassOpts,
+): HonestPost133FrgPassEvidence {
+  const persistOpts: HonestPost133FrgPassOpts = {
+    scoreSource: opts?.scoreSource ?? "from-run",
+    usedObservationsFile: opts?.usedObservationsFile ?? false,
+    workList: opts?.workList ?? "factory-gate-pack",
+  };
+  if (isHonestPost133FrgPass({ ...scored, pass: true }, persistOpts)) {
+    return { ...scored, pass: true };
+  }
+  return { ...scored, pass: false };
+}
+
+export interface HonestPost133LookupDeps {
+  readFile(p: string): Promise<string>;
+  readdir(p: string): Promise<string[]>;
+}
+
+const defaultHonestPost133LookupDeps: HonestPost133LookupDeps = {
+  readFile: (p) => fsp.readFile(p, "utf8"),
+  readdir: (p) => fsp.readdir(p),
+};
+
+function compareFrgSemver(left: string, right: string): number {
+  const a = left.split(".").map(Number);
+  const b = right.split(".").map(Number);
+  for (let i = 0; i < 3; i++) {
+    const d = (a[i] ?? 0) - (b[i] ?? 0);
+    if (d !== 0) return d;
+  }
+  return 0;
+}
+
+/**
+ * Scan `.agent-pipeline/frg/<version>/latest.json` and return the first
+ * post-1.33 artifact the honest-pass check accepts. Injectable I/O — tests
+ * never touch the real tree.
+ */
+export async function lookupHonestPost133FrgPass(
+  repoDir: string,
+  deps: HonestPost133LookupDeps = defaultHonestPost133LookupDeps,
+  opts?: HonestPost133FrgPassOpts,
+): Promise<{ version: string; path: string; evidence: FrgEvidence } | null> {
+  const root = path.join(repoDir, FRG_EVIDENCE_ROOT_REL);
+  let names: string[];
+  try {
+    names = await deps.readdir(root);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw err;
+  }
+  const versions = names
+    .filter((name) => /^\d+\.\d+\.\d+$/.test(name))
+    .sort(compareFrgSemver);
+  for (const version of versions) {
+    const latestPath = frgLatestPath(repoDir, version);
+    let text: string;
+    try {
+      text = await deps.readFile(latestPath);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw err;
+    }
+    let evidence: FrgEvidence;
+    try {
+      evidence = parseFrgEvidenceJson(text);
+    } catch {
+      continue;
+    }
+    if (isHonestPost133FrgPass(evidence, opts)) {
+      return { version, path: latestPath, evidence };
+    }
+  }
+  return null;
+}
+
 export interface FrgValidateOpts {
   /**
    * HMAC key for attestation verification. Defaults to

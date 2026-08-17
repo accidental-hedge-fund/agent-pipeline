@@ -178,6 +178,14 @@ test("tugboat supports serial multi-milestone and single-host lock", () => {
   assert.ok(shipOneStart >= 0 && shipOneEnd > shipOneStart);
   const shipOneBody = body.slice(shipOneStart, shipOneEnd);
   assert.match(shipOneBody, /engine-promote --for "\$version"/);
+  // #1038 keep-skip: default release/promote argv still include --skip-frg
+  // until isHonestPost133FrgPass accepts a post-1.33 from-run artifact.
+  assert.match(shipOneBody, /release "\$version" --no-edit --skip-frg/);
+  assert.match(
+    shipOneBody,
+    /engine-promote --for "\$version" --host "\$ENGINE_PROMOTE_HOST" --skip-frg --json/,
+  );
+  assert.doesNotMatch(shipOneBody, /factory-release prepare/);
   // No parallel fan-out of milestones (ignore prose comments about "ship brain").
   assert.doesNotMatch(body, /xargs\s+-P/);
   assert.doesNotMatch(body, /&\s*ship_one\b/);

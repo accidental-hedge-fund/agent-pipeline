@@ -102,12 +102,12 @@ They SHALL NOT use source `layer_a`.
 
 ### Requirement: Honest-pass Layer A-allowed ids SHALL cite candidate-SHA TAP hashes
 
-When an honest post-1.33 `latest.json` records a Layer A-allowed id with
-source `layer_a`, that outcome SHALL cite a named TAP hash bound to the
-same `pack_provenance.candidate_git_sha`. Hybrid Layer A provenance
-SHALL remain refused for ids that are not on the closed Layer A-allowed
-set. A missing, skipped, mismatched, or other-commit TAP SHALL fail that
-probe and SHALL fail the honest-pass check.
+An honest post-1.33 Layer A-allowed outcome SHALL cite a named TAP hash
+bound to the same `pack_provenance.candidate_git_sha` when source is
+`layer_a`. Hybrid Layer A provenance SHALL remain refused for ids that
+are not on the closed Layer A-allowed set. A missing, skipped,
+mismatched, or other-commit TAP SHALL fail that probe and SHALL fail the
+honest-pass check.
 
 #### Scenario: Layer A-allowed TAP on the candidate SHA can pass
 
