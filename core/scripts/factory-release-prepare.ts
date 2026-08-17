@@ -26,6 +26,7 @@ import {
   isAllowedFrgPackSelector,
   isReleaseEligibleFrgPass,
   itemsFromLoopLedger,
+  latestJsonForHonestPost133Persist,
   normalizeFrgVersion,
   parseFrgEvidenceJson,
   runFactoryGate,
@@ -1821,8 +1822,11 @@ export async function generateDurableUnsignedFrg(
     observed: d.observed ?? null,
   }));
 
-  // Release-eligible latest.json pass:true only on a genuine scorer pass.
-  // A fail MAY be written with pass:false. Never flip fail to pass.
+  // Honest-pass latest.json: persist pass:true only when the skip-frg
+  // restore checker accepts a from-run candidate pack (full attestation
+  // optional; score_receipt is a runner HMAC). Provenance must already
+  // be on `scored`; persist does not stamp it. A structural fail MAY be
+  // written with pass:false. Never flip fail to pass.
   const latestPath = path.join(
     ctx.repoDir,
     ".agent-pipeline",
@@ -1830,9 +1834,7 @@ export async function generateDurableUnsignedFrg(
     request.target_version,
     "latest.json",
   );
-  const latestEvidence = isReleaseEligibleFrgPass(scored)
-    ? scored
-    : { ...scored, pass: false };
+  const latestEvidence = latestJsonForHonestPost133Persist(scored);
   await mkdir(path.dirname(latestPath), { recursive: true, mode: 0o700 });
   await writeFile(latestPath, canonicalJson(latestEvidence), 0o600);
 

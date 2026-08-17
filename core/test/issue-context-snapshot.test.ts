@@ -7,6 +7,7 @@ import {
   buildContextSnapshot,
   classifyHumanAckComment,
   classifyPostPlanComments,
+  humanAckRecoveryAction,
   renderContextSnapshotBlock,
   detectConflicts,
   renderConflictWarningBlock,
@@ -1454,5 +1455,48 @@ test("applyHumanAckGate: ambiguous-trusted transition failure parks harness-fail
   assert.equal(outcome && "blockerKind" in outcome ? outcome.blockerKind : undefined, "harness-failure");
   assert.equal(rec.blocked.length, 1);
   assert.equal(rec.blocked[0].kind, "harness-failure");
+});
+
+test("humanAckRecoveryAction: #1038 Review-1 coverage banner + instead is clear, not keep-human", () => {
+  const heading = "## Review 1 (Standard) — needs-attention (commit 889e161)";
+  const banner =
+    "**Reviewer coverage (#694):** configured=1 attempted=1 usable=1 independent=1 required=0 outcome=`complete` (usable=1/1 independent=1 required=0)";
+  const rest =
+    "**Reviewer**: codex\n\nThis change accepts unbound evidence and can rewrite a failed score as a pass instead.";
+  const artifact: ReviewArtifact = {
+    round: 1,
+    reviewedSha: "889e16168df7dd346800d413b9891b09afa8cd9b",
+    diffHash: "9cf19f7cc5343e62",
+    blockingKeys: ["2483a1e1", "9a2daa69", "cac26b15"],
+    review1Risk: "standard",
+    bodyHash: "0".repeat(64),
+  };
+  const body = `${heading}\n\n${banner}\n${rest}\n${encodeReviewArtifact(artifact)}`;
+  const comments = [
+    makeComment("bot", "## Revised Implementation Plan\n\nDo X.", ts(0)),
+    makeComment("bot", body, ts(1)),
+  ];
+  const classified = classifyPostPlanComments(comments, [comments[1]]);
+  assert.equal(classifyHumanAckComment(comments[1], [comments[1]]), "pipeline-or-operational");
+  assert.equal(humanAckRecoveryAction(classified), "clear");
+});
+
+test("humanAckRecoveryAction: please-also stays keep-human; unmarked negation is replan", () => {
+  const scope = [
+    makeComment("bot", "## Revised Implementation Plan\n\nDo X.", ts(0)),
+    makeComment("alice", "please also change X", ts(1)),
+  ];
+  assert.equal(
+    humanAckRecoveryAction(classifyPostPlanComments(scope, [])),
+    "keep-human",
+  );
+  const ambiguous = [
+    makeComment("bot", "## Revised Implementation Plan\n\nDo X.", ts(0)),
+    makeComment("bot", "this won't work in prod", ts(1)),
+  ];
+  assert.equal(
+    humanAckRecoveryAction(classifyPostPlanComments(ambiguous, [ambiguous[1]])),
+    "replan",
+  );
 });
 

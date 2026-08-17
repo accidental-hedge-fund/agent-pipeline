@@ -154,6 +154,49 @@ This is an idempotent multi-tick protocol.
 
 Prepare never merges, tags, promotes a pin, or flips Tugboat `--skip-frg`.
 
+### Post-1.33 honest-pass precondition (skip-frg restore)
+
+Tugboat, `pipeline release`, and `pipeline engine-promote` **keep** the
+default `--skip-frg` flag until `isHonestPost133FrgPass` accepts at least
+one `.agent-pipeline/frg/<version>/latest.json` for a version **after**
+`1.33.0`. That helper is the single skip-frg restore predicate. Later
+children (#1039–#1041) reuse it. They do not invent a second pass
+definition.
+
+The check accepts only a genuine `factory-gate --for <version> --from-run
+<loop_run_id>` score (or the in-process equivalent) of a request-bound
+`factory-gate-v1` **candidate** pack. It requires `pass: true`, a non-empty
+`run_id` / `loop_run_id`, pack identity `factory-gate-v1`, and
+`pack_provenance.candidate_git_sha`. Required-live ids
+(`clean-item-throughput`, `blocker-taxonomy`,
+`empty-depends-on-stack-honesty`, `openspec-bearing-item`) must not be
+`not_observed`. Layer A-allowed ids must cite TAP hashes bound to that
+same candidate SHA.
+
+The check requires runner-stamped `score_source: from-run` and
+`work_list: factory-gate-pack` on the evidence object. Notes and caller
+options cannot establish those fields. Persist does not stamp those
+fields from caller options. The check also requires a runner-issued
+HMAC-SHA256 `integrity.score_receipt` under `PIPELINE_FRG_ATTESTATION_KEY`
+that binds the computed `pass` to the run. A hand-edited `pass: true`
+or a reminted public hash of the same fields is not proof.
+
+The check **refuses**:
+
+- a `1.33.0`-only (or earlier) artifact
+- `pass: false` (persist never rewrites a fail score to `pass: true`)
+- the product v1.39 milestone work-list, `work_list: other`, or a missing work-list
+- a caller-authored `--observations` file, or missing `score_source: from-run`
+- required-live `not_observed`
+- an unknown `layer_a` id or a TAP bound to another commit
+
+Full HMAC attestation (`integrity.attestation`) is **not** required for
+this precondition. The score receipt still requires the producer key.
+A fail score stays `pass: false` and does not unlock the Tugboat
+`--skip-frg` flip.
+This change does **not** drop `--skip-frg` from default release or promote
+argv and does **not** add an FRG pack phase to Tugboat.
+
 **Hard gate:** missing, stale, failed, mismatched, skipped, or waived
 required-live evidence, or a missing/mismatched Layer A TAP hash, yields
 non-zero exit / non-`complete` status and blocks release preparation. Synthetic

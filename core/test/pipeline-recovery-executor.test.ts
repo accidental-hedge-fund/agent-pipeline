@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { realExecuteRecovery } from "../scripts/pipeline.ts";
 import { buildStageDiagnostic } from "../scripts/stage-diagnostic.ts";
+import { encodeReviewArtifact, type ReviewArtifact } from "../scripts/stages/review-parsing.ts";
 import { DEFAULT_CONFIG, type PipelineConfig } from "../scripts/types.ts";
 
 function cfg(): PipelineConfig {
@@ -96,6 +97,149 @@ test("narrow recovery clears only a current mechanical block and verifies live s
   assert.equal(clears, 1);
   assert.equal(detailReads, 2);
   assert.match(result.evidence, /cleared.*verified/);
+});
+
+function needsHumanAckInput() {
+  const diagnostic = buildStageDiagnostic({
+    blockerKind: "needs-human",
+    reason: "1 unacknowledged human comment(s) after the latest plan — re-plan or post a scope override to proceed.",
+    stage: "fix-1",
+  });
+  return {
+    ...mechanicalInput(),
+    action: "resync_workflow_state" as const,
+    diagnostic,
+  };
+}
+
+function review1FalseHumanBody(): string {
+  const heading = "## Review 1 (Standard) — needs-attention (commit 889e161)";
+  const banner =
+    "**Reviewer coverage (#694):** configured=1 attempted=1 usable=1 independent=1 required=0 outcome=`complete` (usable=1/1 independent=1 required=0)";
+  const rest =
+    "**Reviewer**: codex\n\nThis change accepts unbound evidence and can rewrite a failed score as a pass instead.";
+  const artifact: ReviewArtifact = {
+    round: 1,
+    reviewedSha: "889e16168df7dd346800d413b9891b09afa8cd9b",
+    diffHash: "9cf19f7cc5343e62",
+    blockingKeys: ["2483a1e1", "9a2daa69", "cac26b15"],
+    review1Risk: "standard",
+    bodyHash: "0".repeat(64),
+  };
+  return `${heading}\n\n${banner}\n${rest}\n${encodeReviewArtifact(artifact)}`;
+}
+
+const ACK_WARNING = "## Pipeline: New human input detected\n\n1 human comment(s) were posted after the latest plan.";
+
+test("resync_workflow_state: #1038 Review-1 heading+artifact clears false needs-human", async () => {
+  let detailReads = 0;
+  let clears = 0;
+  const comments = [
+    { author: "bot", body: "## Revised Implementation Plan\n\nDo X.", createdAt: "2026-08-17T01:24:02Z" },
+    { author: "bot", body: review1FalseHumanBody(), createdAt: "2026-08-17T01:45:39Z" },
+    { author: "bot", body: ACK_WARNING, createdAt: "2026-08-17T01:45:45Z" },
+  ];
+  const execute = realExecuteRecovery(cfg(), {
+    getGhActor: async () => "bot",
+    getIssueDetail: async () => ({
+      number: 42,
+      type: "issue",
+      title: "ack",
+      body: "",
+      state: "open",
+      url: "https://example.test/42",
+      labels: detailReads++ === 0 ? ["blocked", "pipeline:fix-1"] : ["pipeline:fix-1"],
+      comments,
+    }),
+    clearBlocked: async () => {
+      clears++;
+    },
+    repairPipelineItem: async () => assert.fail("model repair must not run for false human-ack"),
+  });
+  const result = await execute(needsHumanAckInput());
+  assert.equal(result.succeeded, true);
+  assert.equal(clears, 1);
+  assert.match(result.evidence, /cleared.*verified/);
+});
+
+test("resync_workflow_state: operator-scope-change does not clear needs-human", async () => {
+  let clears = 0;
+  const comments = [
+    { author: "bot", body: "## Revised Implementation Plan\n\nDo X.", createdAt: "2026-08-17T01:24:02Z" },
+    { author: "alice", body: "please also change X", createdAt: "2026-08-17T01:45:39Z" },
+    { author: "bot", body: ACK_WARNING, createdAt: "2026-08-17T01:45:45Z" },
+  ];
+  const execute = realExecuteRecovery(cfg(), {
+    getGhActor: async () => "bot",
+    getIssueDetail: async () => ({
+      number: 42,
+      type: "issue",
+      title: "ack",
+      body: "",
+      state: "open",
+      url: "https://example.test/42",
+      labels: ["blocked", "pipeline:fix-1"],
+      comments,
+    }),
+    clearBlocked: async () => {
+      clears++;
+    },
+  });
+  const result = await execute(needsHumanAckInput());
+  assert.equal(result.succeeded, false);
+  assert.equal(clears, 0);
+  assert.match(result.error ?? "", /operator-scope-change remains/);
+});
+
+test("resync_workflow_state: needs-human without ack-gate warning still clears", async () => {
+  let detailReads = 0;
+  let clears = 0;
+  const comments = [
+    { author: "bot", body: "## Revised Implementation Plan\n\nDo X.", createdAt: "2026-08-17T01:24:02Z" },
+    { author: "bot", body: "## Pipeline: Review ceiling\n\nParked.", createdAt: "2026-08-17T01:45:39Z" },
+  ];
+  const execute = realExecuteRecovery(cfg(), {
+    getGhActor: async () => "bot",
+    getIssueDetail: async () => ({
+      number: 42,
+      type: "issue",
+      title: "ceiling",
+      body: "",
+      state: "open",
+      url: "https://example.test/42",
+      labels: detailReads++ === 0 ? ["blocked", "pipeline:fix-1"] : ["pipeline:fix-1"],
+      comments,
+    }),
+    clearBlocked: async () => {
+      clears++;
+    },
+  });
+  const result = await execute(needsHumanAckInput());
+  assert.equal(result.succeeded, true);
+  assert.equal(clears, 1);
+});
+
+test("resync_workflow_state: missing comments fail closed on needs-human", async () => {
+  let clears = 0;
+  const execute = realExecuteRecovery(cfg(), {
+    getGhActor: async () => "bot",
+    getIssueDetail: async () => ({
+      number: 42,
+      type: "issue",
+      title: "ack",
+      body: "",
+      state: "open",
+      url: "https://example.test/42",
+      labels: ["blocked", "pipeline:fix-1"],
+    }),
+    clearBlocked: async () => {
+      clears++;
+    },
+  });
+  const result = await execute(needsHumanAckInput());
+  assert.equal(result.succeeded, false);
+  assert.equal(clears, 0);
+  assert.match(result.error ?? "", /comments were not available/);
 });
 
 test("authentication recovery verifies live credentials before clearing the mechanical block", async () => {

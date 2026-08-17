@@ -894,6 +894,8 @@ test("runFactoryGate --from-run: accepts factory-gate label pack and scores", as
   assert.equal(result.evidence.pass, true);
   assert.equal(result.evidence.loop_run_id, "loop-frg");
   assert.equal(result.evidence.pack_id, FRG_PACK_MANIFEST.pack_id);
+  assert.equal(result.evidence.score_source, "from-run");
+  assert.equal(result.evidence.work_list, "factory-gate-pack");
   assert.ok(
     result.evidence.notes.some((n) => n.includes(FRG_PACK_MANIFEST.pack_id)),
   );

@@ -477,6 +477,27 @@ export function findUnacknowledgedComments(
   return classifyPostPlanComments(comments, trustedComments).operatorScopeChange;
 }
 
+/**
+ * Recovery action for a stale `needs-human` / unacknowledged-human-input
+ * block. Uses the same #1099 classifier as the live gate so the next
+ * identical false park does not need a new mole or a model repair.
+ *
+ * - `clear` — no operator-scope-change remains (pipeline/operational or
+ *   already acknowledged). Mechanical resync may drop `blocked`.
+ * - `keep-human` — real operator-scope-change remains. Do not clear.
+ * - `replan` — only ambiguous-trusted remains. In-engine re-plan; do not
+ *   treat as a mechanical label clear.
+ */
+export type HumanAckRecoveryAction = "clear" | "keep-human" | "replan";
+
+export function humanAckRecoveryAction(
+  classified: HumanAckClassification,
+): HumanAckRecoveryAction {
+  if (classified.operatorScopeChange.length > 0) return "keep-human";
+  if (classified.ambiguousTrusted.length > 0) return "replan";
+  return "clear";
+}
+
 export interface HumanAckGateDeps {
   postComment: (cfg: PipelineConfig, issueNumber: number, body: string) => Promise<unknown>;
   setBlocked: (

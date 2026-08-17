@@ -47,11 +47,16 @@ import {
 import { PipelineLock, isKillSwitchActive, isLivePlanningActive, tryAcquireLivePlanningMarker, runStateDir, withLock } from "./lock.ts";
 import { findWrapperPidForIssue, isCoexistenceFailureEvidence } from "./loop/live-advance.ts";
 import {
+  buildTrustedOverrideComments,
   govPayloadFromDecision,
   overrideComment,
   parseOverrideArg,
   scopedOverrideComment,
 } from "./review-policy.ts";
+import {
+  classifyPostPlanComments,
+  humanAckRecoveryAction,
+} from "./issue-context-snapshot.ts";
 import {
   buildOverrideDecision,
   buildOverrideEvent,
@@ -2108,6 +2113,49 @@ export function realExecuteRecovery(
         succeeded: true,
         evidence: `recovery action ${input.action} observed the mechanical blocked state already clear; normal whole-item redispatch may proceed`,
       };
+    }
+    // Stale needs-human from the human-ack gate only. Other needs-human
+    // parks (review ceiling, default setBlocked) do not post this warning
+    // and keep the existing mechanical clear. Pipeline review output is a
+    // false human; operator-scope-change stays parked.
+    if (input.diagnostic.detail.blocker_kind === "needs-human") {
+      const comments = Array.isArray(before.comments) ? before.comments : null;
+      if (comments === null) {
+        return failed(
+          `recovery action ${input.action} cannot re-evaluate human-ack: issue comments were not available`,
+        );
+      }
+      const hasAckWarning = comments.some((c) =>
+        c.body.trimStart().startsWith("## Pipeline: New human input detected"),
+      );
+      if (hasAckWarning) {
+        let actor: string | null;
+        try {
+          actor = await verifyAuthentication();
+        } catch (err) {
+          return failed(
+            `recovery action ${input.action} cannot re-evaluate human-ack: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        }
+        const trusted = buildTrustedOverrideComments(
+          comments,
+          actor,
+          cfg.trusted_override_actors,
+        );
+        const ackAction = humanAckRecoveryAction(classifyPostPlanComments(comments, trusted));
+        if (ackAction === "keep-human") {
+          return failed(
+            `recovery action ${input.action} re-evaluated human-ack: operator-scope-change remains (not a mechanical false human)`,
+          );
+        }
+        if (ackAction === "replan") {
+          return failed(
+            `recovery action ${input.action} re-evaluated human-ack: ambiguous-trusted requires in-engine re-plan (not a mechanical clear)`,
+          );
+        }
+      }
     }
     try {
       await clear(cfg, issueNumber);
@@ -5275,6 +5323,7 @@ async function main(): Promise<void> {
         falseHumanAuthorityCount,
         recoveryAggregates,
         packProvenance,
+        usedObservationsFile: Boolean(opts.observations),
         packCloseDeps: noClosePack
           ? undefined
           : {
