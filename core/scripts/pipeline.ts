@@ -718,7 +718,10 @@ export function maxPositionalsFor(command: string | undefined): number {
     command === "controls" ||
     // host-local store verbs with a subcommand: outcomes list|ingest, lineage export|impact|…
     command === "outcomes" ||
-    command === "lineage"
+    command === "lineage" ||
+    // factory-release prepare; factory-pin show|init|promote|rollback (#1114)
+    command === "factory-release" ||
+    command === "factory-pin"
   ) {
     return 2;
   }

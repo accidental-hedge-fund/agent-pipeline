@@ -499,6 +499,12 @@ test("maxPositionalsFor — other commands keep their existing positional caps (
   assert.equal(maxPositionalsFor("unblock"), 3);
   assert.equal(maxPositionalsFor("override"), 3);
   assert.equal(maxPositionalsFor("evals"), 3);
+  assert.equal(maxPositionalsFor("factory-release"), 2); // factory-release prepare (#1114)
+  assert.equal(maxPositionalsFor("factory-pin"), 2); // factory-pin show|init|…
+  assert.ok(["factory-release", "prepare"].length <= maxPositionalsFor("factory-release"));
+  assert.ok(
+    ["factory-release", "prepare", "extra"].length > maxPositionalsFor("factory-release"),
+  );
   assert.equal(maxPositionalsFor("doctor"), 1);
   assert.equal(maxPositionalsFor("sweep"), 1);
   assert.equal(maxPositionalsFor(undefined), 1);

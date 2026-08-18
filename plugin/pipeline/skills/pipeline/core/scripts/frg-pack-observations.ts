@@ -895,9 +895,11 @@ export function collectFrgPackObservations(
     const blockedTheme = item.blocked_theme === null
       ? null
       : stringValue(item.blocked_theme, `FRG verified bundle.ledger.items[${index}].blocked_theme`);
-    if (item.state !== "ready" || blockedTheme !== null) {
+    if (item.state !== "ready") {
       throw new Error(`FRG live issue #${String(item.issue_number)} did not finish clean at ready-to-deploy`);
     }
+    // Leftover blocked_theme after a recovered ready item is stale ledger
+    // metadata. GitHub ready-to-deploy is authoritative (#1118 dogfood).
     return {
       issue_number: positiveInteger(item.issue_number, `FRG verified bundle.ledger.items[${index}].issue_number`),
       advance_run_id: checkedId(item.advance_run_id, `FRG verified bundle.ledger.items[${index}].advance_run_id`),

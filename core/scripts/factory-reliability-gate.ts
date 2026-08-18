@@ -36,9 +36,14 @@ import {
   isFrgRequiredLiveCompositionId,
   isFrgRequiredLiveScenarioId,
   isPostHybridPilotVersion,
+  type CollectedFrgObservations,
   type FrgPackProofSource,
   type FrgPackProvenance,
 } from "./frg-pack-observations.ts";
+import {
+  defaultCollectHybridV2FromRun,
+  type HybridV2FromRunArgs,
+} from "./frg-hybrid-v2-from-run.ts";
 
 // ---------------------------------------------------------------------------
 // Schema + thresholds
@@ -3867,6 +3872,11 @@ export interface FactoryGateOpts {
   recoveryAggregates?: FrgRecoveryAggregates;
   /** Structured proof block from the closed hybrid pack runner (v1 or v2). */
   packProvenance?: FrgPackProvenance;
+  /**
+   * Post-1.33 --from-run collect. When omitted, production builds hybrid-v2
+   * provenance from the live pack + Layer A TAP (#1118). Tests inject a fake.
+   */
+  collectHybridV2?: (args: HybridV2FromRunArgs) => Promise<CollectedFrgObservations>;
   thresholds?: FrgThresholds;
   now?: () => Date;
   /**
@@ -3981,6 +3991,47 @@ export async function runFactoryGate(
       "Scenario pack selection: reliability label/fixture pack (not full product milestone)",
     ];
     let overrides = [...(opts.scenarioOverrides ?? [])];
+    let compositionOverrides = opts.compositionOverrides;
+    let falseHumanAuthorityCount = opts.falseHumanAuthorityCount;
+    let packProvenance = opts.packProvenance;
+    if (
+      !packProvenance &&
+      isPostHybridPilotVersion(version) &&
+      !opts.usedObservationsFile
+    ) {
+      const collected = await (opts.collectHybridV2 ?? defaultCollectHybridV2FromRun)({
+        repoDir: opts.repoDir,
+        version,
+        fromRun: opts.fromRun,
+        contract,
+        ledger,
+      });
+      packProvenance = collected.pack_provenance;
+      if (overrides.length === 0) {
+        overrides = collected.scenarios.map((s) => ({
+          id: s.id as FrgScenarioId,
+          status: s.status,
+          detail: s.detail,
+          observed: s.observed,
+          threshold: s.threshold,
+          source: s.source,
+          proof_ids: s.proof_ids,
+        }));
+      }
+      if (!compositionOverrides) {
+        compositionOverrides = collected.composition.map((d) => ({
+          id: d.id as FrgCompositionDimensionId,
+          status: d.status,
+          detail: d.detail,
+          source: d.source,
+          observed: d.observed,
+          proof_ids: d.proof_ids,
+        }));
+      }
+      if (falseHumanAuthorityCount === undefined) {
+        falseHumanAuthorityCount = collected.false_human_authority_count;
+      }
+    }
     const stackHonesty = detectEmptyDependsOnStackHonesty(contract, ledger);
     if (stackHonesty) overrides = mergeScenarioOverride(overrides, stackHonesty);
     // Unobserved required scenarios fail overall pass (not release evidence).
@@ -3992,10 +4043,10 @@ export async function runFactoryGate(
       pack_id: FRG_PACK_MANIFEST.pack_id,
       items,
       scenario_overrides: overrides,
-      composition_overrides: opts.compositionOverrides,
-      false_human_authority_count: opts.falseHumanAuthorityCount,
+      composition_overrides: compositionOverrides,
+      false_human_authority_count: falseHumanAuthorityCount,
       recovery_aggregates: opts.recoveryAggregates,
-      pack_provenance: opts.packProvenance,
+      pack_provenance: packProvenance,
       notes,
       thresholds: opts.thresholds,
       now: opts.now,

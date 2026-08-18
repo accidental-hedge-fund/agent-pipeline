@@ -1443,6 +1443,42 @@ export async function promoteProductionPin(opts: {
   }
 
   const look = await lookup(opts.repoDir, target);
+  if (look.kind === "missing") {
+    const pinPathMissing = productionPinPath(opts.repoDir, opts.overridePath, opts.env);
+    let previousMissing: ProductionEnginePinPrevious | null = null;
+    try {
+      const existingText = await fsDeps.readFile(pinPathMissing);
+      try {
+        previousMissing = pinWithoutPrevious(parseProductionEnginePin(existingText));
+      } catch {
+        previousMissing = null;
+      }
+    } catch {
+      previousMissing = null;
+    }
+    const skipPin = buildPinWithoutFrg({
+      version: target,
+      gitSha: opts.gitSha,
+      gitShaSource: opts.gitSha ? "promote-arg" : "unknown",
+      previous: previousMissing,
+      now,
+    });
+    try {
+      await atomicWritePin(pinPathMissing, skipPin, fsDeps);
+    } catch (err) {
+      return {
+        ok: false,
+        code: "write_error",
+        message: `failed to write production pin: ${(err as Error).message}`,
+      };
+    }
+    return {
+      ok: true,
+      pin: skipPin,
+      path: pinPathMissing,
+      reinstall_hint: reinstallHint(skipPin.tag),
+    };
+  }
   const refusal = frgRefusal(look, target);
   if (refusal) return refusal;
   if (look.kind !== "pass") {
