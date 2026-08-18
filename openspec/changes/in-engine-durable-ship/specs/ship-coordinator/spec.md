@@ -82,8 +82,8 @@ record. It SHALL NOT start a sibling plan or implement while an earlier
 
 ### Requirement: Host adapters SHALL use systemd only for process supervision
 
-A Hermes, OpenClaw, Claude, Codex, Grok, omp, OpenCode, or other host adapter
-SHALL map operator phrase `Ship milestone vX.Y.Z` to `pipeline ship --milestone vX.Y.Z`.
+Host adapters SHALL map operator phrase `Ship milestone vX.Y.Z` to `pipeline ship --milestone vX.Y.Z`.
+Hermes, OpenClaw, Claude, Codex, Grok, omp, OpenCode, and other hosts use that same mapping.
 If the CLI is blocking, the adapter MAY detach one process (systemd user unit or
 the host’s existing detach helper) without waiting for terminal completion.
 The adapter SHALL render typed `pipeline ship status` plus material-filtered

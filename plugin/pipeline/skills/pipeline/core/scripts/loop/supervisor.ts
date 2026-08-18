@@ -420,6 +420,23 @@ async function revertCapacityWaitItem(
 }
 
 /**
+ * Crash/kill signals that may take over a dead holder. Generic dispatch
+ * rejections stay on the existing defect-recovery path (#515 / #1020).
+ */
+function isDeadHolderInterruptSignal(errText: string, rawOutcome: unknown): boolean {
+  if (rawOutcome === "engine_internal_crash") return true;
+  return /harness-failure|engine_internal_crash|SIGTERM|SIGKILL/i.test(errText);
+}
+
+function alreadyTypedNonDefectBlock(item: LoopItemLedgerEntry | undefined): boolean {
+  return (
+    item?.state === "blocked" &&
+    typeof item.blocked_theme === "string" &&
+    item.blocked_theme !== "workflow-engine-defect"
+  );
+}
+
+/**
  * Dead-holder takeover (#1096): return the same item to pending without
  * recording coexistence_wait and without charging workflow-engine-defect.
  */
@@ -1575,22 +1592,6 @@ export async function runSupervisorCycle(
       }).catch(() => {});
       continue;
     }
-    if (
-      item.blocked_theme === "workflow-engine-defect" &&
-      classifyHolderInterrupt({
-        holderLive: false,
-        leftoverHarnessFailure: true,
-      }) === "resume-eligible-interrupt"
-    ) {
-      ledger = await takeoverDeadHolderItem(deps.store, {
-        runId,
-        token,
-        itemId: item.id,
-        engine,
-      });
-      recoveryProgress = true;
-      continue;
-    }
     const advanceLock = deps.acquireItemAdvanceLock
       ? await deps.acquireItemAdvanceLock(item.id)
       : undefined;
@@ -1872,6 +1873,12 @@ export async function runSupervisorCycle(
   // host's local clock is unsound under clock skew, so both snapshots here are GitHub-authored —
   // never compared against `deps.observe.now()`).
   const labelEventsBeforeDispatchByItem = new Map<string, { label: string; createdAt: string }[]>();
+  const preDispatchAdvanceRunIdByItem = new Map<string, string>();
+  const startLinkageByItem = new Map<string, string>();
+  for (const itemId of activeItemIds) {
+    const existing = ledger.items[itemId]?.advance_run_id;
+    if (existing) preDispatchAdvanceRunIdByItem.set(itemId, existing);
+  }
   await Promise.allSettled(
     activeItemIds.map(async (itemId) => {
       const events = await deps.observe.getLabelEvents(Number(itemId));
@@ -1941,6 +1948,7 @@ export async function runSupervisorCycle(
       try {
         const response = await deps.dispatchItem(buildRequest(itemId), {
           onAdvanceLinked: async (linkage) => {
+            startLinkageByItem.set(itemId, linkage.pipeline_run_id);
             startLinkage = linkage;
             await appendEvent(deps.store, runId, token, LOOP_ITEM_ADVANCE_LINKED, {
               item_id: linkage.item_id,
@@ -2380,7 +2388,14 @@ export async function runSupervisorCycle(
           const alreadyResumed = (itemEntry?.history ?? []).some((h) =>
             String(h.note ?? "").includes("dead-holder interrupt"),
           );
-          if (!alreadyResumed) {
+          const priorOrLinkedHolder =
+            preDispatchAdvanceRunIdByItem.has(itemId) || startLinkageByItem.has(itemId);
+          if (
+            !alreadyResumed &&
+            !alreadyTypedNonDefectBlock(itemEntry) &&
+            priorOrLinkedHolder &&
+            isDeadHolderInterruptSignal(errText, rawOutcomeByItem.get(itemId))
+          ) {
             coexistenceNoOp = true;
             ledger = await takeoverDeadHolderItem(deps.store, { runId, token, itemId, engine });
             evidenceOutcome = "dead_holder_takeover";

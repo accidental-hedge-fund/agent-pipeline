@@ -69,7 +69,6 @@ function hermeticSupervisorDeps(deps: SupervisorDeps): SupervisorDeps {
   return {
     probeLiveAdvance: () => ({ live: false as const }),
     acquireItemAdvanceLock: () => ({ release() {} }),
-    recoverySleep: async () => {},
     ...deps,
   };
 }
@@ -4078,8 +4077,6 @@ test("regression (#770 genuine defect): crash with no coexistence evidence still
       store: deps,
       observe,
       dispatchItem,
-      // Live crashed holder without lock/wrapper identity may stay defect (#1096).
-      probeLiveAdvance: async () => ({ live: true as const, evidence: "loop_linkage" as const }),
       executeRecovery: async () => ({ succeeded: false, evidence: "live crash remains defect" }),
     },
     { runId: "run-1", engine: "claude" },
@@ -5981,4 +5978,36 @@ test("dead holder + reused loop id is takeover, not coexistence_wait or supervis
     "dead holder must take over the same item",
   );
   assert.equal(finalLedger.items["1095"].state, "pending", "takeover returns the same item to pending");
+});
+
+test("dead-holder takeover does not cycle forever on a repeated crash after resume (#1096)", async () => {
+  const contract = testContract({ items: [{ id: "1095", depends_on: [] }] });
+  const entry = itemEntry("1095", "pending");
+  entry.advance_run_id = "loop-cd7bd53d94838204";
+  const ledger = testLedger({ "1095": entry });
+  const { deps } = await setup(contract, ledger);
+  const { observe } = coordinatedFakes();
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => ({
+    schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+    item_id: request.item_id,
+    run_id: request.run_id,
+    outcome: "engine_internal_crash" as LoopExecutionResponse["outcome"],
+    evidence: { pr_number: null, pipeline_run_id: "loop-cd7bd53d94838204" },
+  });
+
+  const result = await driveSupervisor(
+    {
+      store: deps,
+      observe,
+      dispatchItem,
+      executeRecovery: async () => ({ succeeded: false, evidence: "repeated crash after resume stays defect" }),
+    },
+    { runId: "run-1", engine: "claude", maxCyclesSafety: 25 },
+  );
+
+  const events = await readEvents(deps, "run-1");
+  const takeovers = events.filter((e) => e.kind === "loop_item_dead_holder_takeover");
+  assert.equal(takeovers.length, 1, "exactly one dead-holder takeover; a second cycle must not resume the corpse again");
+  assert.ok(result.cycles < 25, `drive must terminate before the safety cap (got ${result.cycles} cycles)`);
+  assert.ok(result.stop, "repeated crash after resume must reach a recorded stop, not spin");
 });
