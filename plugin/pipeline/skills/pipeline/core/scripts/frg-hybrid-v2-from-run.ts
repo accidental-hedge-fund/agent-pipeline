@@ -81,6 +81,20 @@ function itemNumbers(contract: LoopContract): number[] {
   return contract.items.map((item) => Number(item.id));
 }
 
+/** Prefer the titled pack PR; closed is valid after factory-gate auto-close. */
+export function selectPackPr<T extends { title?: string; state?: string }>(
+  issueNumber: number,
+  prs: readonly T[],
+): T | undefined {
+  const marker = `(#${issueNumber})`;
+  const titled = prs.filter((row) => (row.title ?? "").includes(marker));
+  const openTitled = titled.find((row) => String(row.state ?? "open").toLowerCase() === "open");
+  if (openTitled) return openTitled;
+  if (titled[0]) return titled[0];
+  const open = prs.find((row) => String(row.state ?? "open").toLowerCase() === "open");
+  return open ?? prs[0];
+}
+
 export async function defaultRunLayerAProbe(
   probe: { id: string; test_file: string; test_name: string },
   input: { repoDir: string; candidateGitSha: string },
@@ -209,11 +223,11 @@ export async function defaultCollectHybridV2FromRun(
       "-R",
       repository,
       "--state",
-      "open",
+      "all",
       "--search",
       `${issueNumber} in:title`,
       "--json",
-      "number,id,headRefOid,baseRefName,files,title",
+      "number,id,headRefOid,baseRefName,files,title,state",
     ])) as Array<{
       number: number;
       id: string;
@@ -221,9 +235,10 @@ export async function defaultCollectHybridV2FromRun(
       baseRefName: string;
       files?: Array<{ path?: string }>;
       title?: string;
+      state?: string;
     }>;
-    const pr = prs.find((row) => (row.title ?? "").includes(`(#${issueNumber})`)) ?? prs[0];
-    if (!pr) throw new Error(`pipeline factory-gate: issue #${issueNumber} has no open pack PR`);
+    const pr = selectPackPr(issueNumber, prs);
+    if (!pr) throw new Error(`pipeline factory-gate: issue #${issueNumber} has no pack PR`);
     const checkPages = (await ghJson([
       "api",
       "--paginate",
