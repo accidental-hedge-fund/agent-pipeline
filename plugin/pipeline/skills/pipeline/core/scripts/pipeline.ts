@@ -1165,10 +1165,13 @@ export function dispatchItemChildArgs(
   issueNumber: number,
   engine: LoopEngine,
   repoDir: string,
-  opts?: { runId?: string },
+  opts?: { runId?: string; engineTrack?: "pinned" | "candidate" },
 ): string[] {
   const args = [scriptPath, String(issueNumber), "--profile", engine, "--repo-path", repoDir];
   if (opts?.runId) args.push("--run-id", opts.runId);
+  if (opts?.engineTrack === "pinned" || opts?.engineTrack === "candidate") {
+    args.push("--engine-track", opts.engineTrack);
+  }
   return args;
 }
 
@@ -1470,7 +1473,12 @@ export function realDispatchItem(
       await new Promise<void>((resolve, reject) => {
         const child = spawnFn(
           execPath,
-          dispatchItemChildArgs(scriptPath, issueNumber, engine, cfg.repo_dir, pin ? { runId: pin.pipeline_run_id } : undefined),
+          dispatchItemChildArgs(scriptPath, issueNumber, engine, cfg.repo_dir, {
+            ...(pin ? { runId: pin.pipeline_run_id } : {}),
+            ...(cfg.engine_track === "pinned" || cfg.engine_track === "candidate"
+              ? { engineTrack: cfg.engine_track }
+              : {}),
+          }),
           { stdio: "inherit" },
         );
         let pollTimer: ReturnType<typeof setInterval> | undefined;

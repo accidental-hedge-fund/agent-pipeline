@@ -99,6 +99,50 @@ test("dispatchItemChildArgs includes pinned --run-id when provided (#667)", () =
   assert.equal(args[runIdIdx + 1], "623-2026-07-29T13-49-56-421Z");
 });
 
+test("dispatchItemChildArgs forwards --engine-track when the parent loop is on a two-track soak", () => {
+  const args = dispatchItemChildArgs("/path/to/pipeline.ts", 1121, "claude", "/repo", {
+    engineTrack: "candidate",
+  });
+  const idx = args.indexOf("--engine-track");
+  assert.ok(idx >= 0, "candidate pack children must inherit --engine-track");
+  assert.equal(args[idx + 1], "candidate");
+});
+
+test("realDispatchItem forwards cfg.engine_track onto the child advance argv", async () => {
+  const spawned: string[][] = [];
+  const fixedNow = new Date("2026-07-29T13:49:56.421Z");
+  const expectedPin = pinAdvanceRunIdentity("/repo", 1121, fixedNow);
+  const dispatch = realDispatchItem(
+    { repo_dir: "/repo", engine_track: "candidate" } as PipelineConfig,
+    "claude",
+    {
+      now: () => fixedNow,
+      scriptPath: "/path/to/pipeline.ts",
+      execPath: "/usr/bin/node",
+      eventsPathExists: (p) => p === expectedPin.events_path,
+      spawn: ((cmd: string, args: readonly string[]) => {
+        spawned.push([...args]);
+        return fakeSpawnChild();
+      }) as typeof import("node:child_process").spawn,
+      getIssueDetail: async () => ({ labels: ["pipeline:ready-to-deploy"], state: "open" }) as never,
+      getPrForIssue: async () => 99,
+    },
+  );
+  await dispatch({
+    schema: "pipeline/loop-execution@1",
+    item_id: "1121",
+    repo: { name: "acme/w", base_branch: "main" },
+    engine: "claude",
+    worktree_policy: "default",
+    done_definition: "pipeline:ready-to-deploy",
+    run_id: "loop-run-frg",
+  });
+  assert.equal(spawned.length, 1);
+  const idx = spawned[0].indexOf("--engine-track");
+  assert.ok(idx >= 0, "realDispatchItem must pass --engine-track from cfg");
+  assert.equal(spawned[0][idx + 1], "candidate");
+});
+
 // ---------------------------------------------------------------------------
 // Advance run-store pin + evidence pointer (#667).
 // ---------------------------------------------------------------------------

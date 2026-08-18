@@ -1205,9 +1205,20 @@ export async function defaultSpawnCandidateLoop(
   const spawnImpl = deps.spawn ?? (await import("node:child_process")).spawn;
   const sourceEnv = deps.env ?? process.env;
   const bin = sourceEnv.PIPELINE_BIN?.trim() || "pipeline";
+  // Codex has no native /goal floor (loop-preflight). The in-repo supervisor
+  // still runs that probe, so a profile-less spawn exits 1 after "dispatched".
+  // Claude is the only LoopEngine with a documented floor.
   const child = spawnImpl(
     bin,
-    ["loop", "--resume", args.loop_run_id, "--engine-track", "candidate"],
+    [
+      "loop",
+      "--resume",
+      args.loop_run_id,
+      "--engine-track",
+      "candidate",
+      "--profile",
+      "claude",
+    ],
     {
       cwd: args.repoDir,
       detached: true,

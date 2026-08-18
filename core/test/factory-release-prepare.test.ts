@@ -1699,6 +1699,8 @@ test("dispatch spawn strips FRG signing vars from the candidate loop environment
     "loop-env-dispatch",
     "--engine-track",
     "candidate",
+    "--profile",
+    "claude",
   ]);
 });
 
@@ -1724,5 +1726,7 @@ test("resume spawn strips FRG signing vars from the candidate loop environment",
     "loop-env-resume",
     "--engine-track",
     "candidate",
+    "--profile",
+    "claude",
   ]);
 });
