@@ -143,6 +143,37 @@ export async function verifyAnnotatedReleaseTag(
   }
 }
 
+/**
+ * After a merged release PR, if FRG latest.json is release-eligible and the
+ * annotated tag is missing, create and push it on the merge commit (#1115).
+ * Does not open a second release PR.
+ */
+export async function ensureAnnotatedReleaseTag(opts: {
+  version: string;
+  mergeCommitOid: string;
+  git: (args: string[]) => Promise<string>;
+  validateFrg: () => Promise<void>;
+}): Promise<"created" | "exists"> {
+  const tag = expectedTag(opts.version);
+  const merge = requireOid(opts.mergeCommitOid, "ship release merge commit");
+  try {
+    const objectType = (await opts.git(["cat-file", "-t", `refs/tags/${tag}`])).trim();
+    if (objectType === "tag") {
+      await verifyAnnotatedReleaseTag(tag, merge, opts.git);
+      return "exists";
+    }
+  } catch (err) {
+    const msg = (err as Error).message ?? "";
+    if (msg.includes("does not point to the release merge commit") || msg.includes("must be an annotated tag")) {
+      throw err;
+    }
+  }
+  await opts.validateFrg();
+  await opts.git(["tag", "-a", tag, merge, "-m", `${tag} — v${opts.version}`]);
+  await opts.git(["push", "origin", `refs/tags/${tag}`]);
+  return "created";
+}
+
 export async function alignReleaseCheckoutToCandidate(
   baseBranch: string,
   candidateHeadOid: string,
@@ -752,6 +783,12 @@ function realShipAdapterOperations(opts: RealShipCoordinatorDepsOptions): ShipAd
     },
     observePublication,
     async waitForPublication(intent, release) {
+      await ensureAnnotatedReleaseTag({
+        version: intent.version,
+        mergeCommitOid: release.merge_commit_oid,
+        git,
+        validateFrg: () => validateFrgEvidenceFileForTag(opts.repoDir, intent.version).then(() => undefined),
+      });
       for (let attempt = 0; attempt < RELEASE_WAIT_ATTEMPTS; attempt++) {
         const observed = await observePublication(intent, release);
         if (observed) return observed;

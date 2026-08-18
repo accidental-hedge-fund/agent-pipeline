@@ -638,6 +638,38 @@ test("historical v1 probe matrix stays frozen when the current v2 list is simula
   );
 });
 
+test("collector accepts pipeline:ready-to-deploy in place of pipeline:ready", async () => {
+  const pack = await loadFrgPack();
+  const bundle = makeEvidenceBundle(pack);
+  bundle.issues[0]!.labels = bundle.issues[0]!.labels
+    .filter((name) => name !== "pipeline:ready")
+    .concat("pipeline:ready-to-deploy");
+  const observations = collectFrgPackObservations(pack, bundle);
+  assert.equal(observations.pack_provenance.issues[0]?.issue_number, bundle.issues[0]!.issue_number);
+});
+
+test("collector accepts leftover blocked_theme on a ready ledger item (#1118)", async () => {
+  const pack = await loadFrgPack();
+  const bundle = makeEvidenceBundle(pack);
+  bundle.ledger.items[0]!.blocked_theme = "workflow-engine-defect";
+  const observations = collectFrgPackObservations(pack, bundle);
+  assert.equal(observations.pack_provenance.issues.length, 2);
+});
+
+test("every hybrid-v2 Layer A probe test_name exists in the named file (#1119)", async () => {
+  const pack = await loadFrgPack();
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const repoRoot = path.join(here, "../..");
+  for (const probe of pack.manifest.pilot_policy.layer_a_probes) {
+    const text = await fsp.readFile(path.join(repoRoot, probe.test_file), "utf8");
+    assert.ok(
+      text.includes(JSON.stringify(probe.test_name)) ||
+        text.includes(`'${probe.test_name.replace(/'/g, "\\'")}'`),
+      `probe ${probe.id} test_name missing from ${probe.test_file}: ${probe.test_name}`,
+    );
+  }
+});
+
 test("runbook states durable hybrid v2 as current policy", async () => {
   const here = path.dirname(fileURLToPath(import.meta.url));
   const runbook = await fsp.readFile(

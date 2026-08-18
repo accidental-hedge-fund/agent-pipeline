@@ -905,6 +905,135 @@ test("runFactoryGate --from-run: accepts factory-gate label pack and scores", as
   assert.ok((capacity?.observed ?? 0) >= DEFAULT_FRG_THRESHOLDS.capacity_stress_n);
 });
 
+test("runFactoryGate --from-run post-1.33: collects hybrid-v2 provenance when missing (#1118)", async () => {
+  const fs = memFs();
+  const packContract = {
+    schema: LOOP_CONTRACT_SCHEMA,
+    run_id: "loop-frg-1392",
+    selector: { type: "label", value: "factory-gate" },
+    items: [
+      { id: "1112", depends_on: [], external_depends_on: [] },
+      { id: "1113", depends_on: [], external_depends_on: [] },
+    ],
+  } as unknown as LoopContract;
+  const ledger = {
+    schema: LOOP_LEDGER_SCHEMA,
+    run_id: "loop-frg-1392",
+    items: {
+      "1112": { state: "ready", history: [], recovery_attempts: [], advance_run_id: "adv-1112" },
+      "1113": { state: "ready", history: [], recovery_attempts: [], advance_run_id: "adv-1113" },
+    },
+  } as unknown as LoopLedger;
+
+  const { loadFrgPack, collectFrgPackObservations, renderFrgPackIssues } = await import(
+    "../scripts/frg-pack-observations.ts"
+  );
+  const pack = await loadFrgPack();
+  const bundleBase = {
+    schema_version: 1 as const,
+    policy_id: pack.manifest.pilot_policy.id,
+    pack_id: pack.manifest.pack_id,
+    manifest_version: pack.manifest.manifest_version,
+    manifest_sha256: pack.manifest_sha256,
+    release_version: "1.39.2",
+    candidate_git_sha: "a".repeat(40),
+    pack_run_id: "pack-1392",
+    loop_run_id: "loop-frg-1392",
+    repository: "owner/repo",
+    base_branch: "main",
+    started_at: "2026-08-18T02:54:58.000Z",
+  };
+  const rendered = renderFrgPackIssues(pack, {
+    release_version: "1.39.2",
+    pack_run_id: "pack-1392",
+  });
+  const issueNumbers = [1112, 1113];
+  const observations = collectFrgPackObservations(pack, {
+    ...bundleBase,
+    contract: {
+      artifact_sha256: "b".repeat(64),
+      selector: { type: "label", value: "factory-gate" },
+      issue_numbers: issueNumbers,
+      items: issueNumbers.map((n) => ({ issue_number: n, depends_on: [] })),
+    },
+    ledger: {
+      artifact_sha256: "c".repeat(64),
+      items: issueNumbers.map((n, i) => ({
+        issue_number: n,
+        state: "ready",
+        advance_run_id: `adv-${n}`,
+        blocked_theme: i === 0 ? "workflow-engine-defect" : null,
+      })),
+    },
+    events: {
+      artifact_sha256: "d".repeat(64),
+      event_ids: issueNumbers.map((n) => `event:1:item-${n}`),
+      issue_numbers: issueNumbers,
+    },
+    action_evidence: {
+      artifact_sha256: "e".repeat(64),
+      action_ids: issueNumbers.map((n) => `action:1:item-${n}`),
+      issue_numbers: issueNumbers,
+    },
+    issues: rendered.map((issue, index) => {
+      const issueNumber = issueNumbers[index]!;
+      const head = String(index + 1).repeat(40);
+      const files =
+        issue.provenance.template_id === "clean-openspec"
+          ? ["openspec/changes/archive/2026-08-18-x/proposal.md", "openspec/specs/frg/spec.md"]
+          : ["docs/frg-fixture.md"];
+      return {
+        issue_number: issueNumber,
+        issue_node_id: `ISSUE_${issueNumber}`,
+        created_at: `2026-08-18T02:55:0${index}.000Z`,
+        title: issue.title,
+        body: issue.body,
+        labels: [...issue.labels, "pipeline:ready-to-deploy"],
+        template_id: issue.provenance.template_id,
+        template_sha256: issue.provenance.template_sha256,
+        pr: {
+          number: 2100 + index,
+          node_id: `PR_${2100 + index}`,
+          head_sha: head,
+          base_branch: "main",
+          files,
+          checks: [{ id: `CHECK_${issueNumber}`, name: "ci", head_sha: head, conclusion: "success" }],
+        },
+      };
+    }),
+    probes: pack.manifest.pilot_policy.layer_a_probes.map((probe, index) => ({
+      id: probe.id,
+      candidate_git_sha: "a".repeat(40),
+      test_file: probe.test_file,
+      test_name: probe.test_name,
+      command_argv_sha256: "1".repeat(64),
+      stdout_sha256: "2".repeat(64),
+      stderr_sha256: "3".repeat(64),
+      started_at: `2026-08-18T03:00:${String(index).padStart(2, "0")}.000Z`,
+      finished_at: `2026-08-18T03:00:${String(index).padStart(2, "0")}.500Z`,
+    })),
+  });
+
+  const result = await runFactoryGate(
+    {
+      version: "1.39.2",
+      repoDir: "/repo",
+      fromRun: "loop-frg-1392",
+      loadLedger: async () => ledger,
+      loadContract: async () => packContract,
+      collectHybridV2: async () => observations,
+      attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
+      stdout: () => {},
+      stderr: () => {},
+    },
+    fs,
+  );
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.evidence.pass, true);
+  assert.equal(result.evidence.pack_provenance?.policy_id, "factory-gate-v1-hybrid-v2");
+  assert.equal(result.evidence.score_source, "from-run");
+});
+
 test("runFactoryGate --from-run: requires loadContract (pack validation seam)", async () => {
   await assert.rejects(
     () =>

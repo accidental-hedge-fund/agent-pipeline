@@ -18,9 +18,13 @@
 // Never accepts caller-authored pass / status / metric / receipt claims.
 // Never invents pass: true. Never adopts an unbound newest factory-gate loop.
 
+import { execFile } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
 import {
   FRG_PACK_MANIFEST,
   isAllowedFrgPackSelector,
@@ -311,6 +315,13 @@ export interface FactoryReleasePrepareDeps {
     unsigned: FactoryReleaseFrgPayload,
     ctx: { repoDir: string; workDir: string },
   ): Promise<ObservedAttestation | null>;
+  /**
+   * Observe an already-opened or merged release/vX.Y.Z PR. When present,
+   * prepare MUST NOT open a second PR (#1115).
+   */
+  observeExistingRelease?(
+    request: FactoryReleasePrepareRequest,
+  ): Promise<{ pr: number; head_oid: string; version: string } | null>;
   /** Shared prepare-only release entry (runRelease). */
   runRelease(
     version: string,
@@ -618,6 +629,60 @@ async function defaultFileExists(p: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/**
+ * True when latest.json is a production-attested hybrid-v2 score of this
+ * request's exact candidate. Auto-tag and promote require that file; prepare
+ * must reuse it instead of starting a second pack or overwriting it.
+ */
+export function honestLatestJsonBindsRequest(
+  request: FactoryReleasePrepareRequest,
+  evidence: {
+    version?: string;
+    pass?: boolean;
+    pack_id?: string | null;
+    loop_run_id?: string | null;
+    run_id?: string;
+    integrity?: { attestation?: unknown } | null;
+    pack_provenance?: { candidate_git_sha?: string } | null;
+  },
+): boolean {
+  if (evidence.version !== request.target_version) return false;
+  if (evidence.pass !== true) return false;
+  if (evidence.pack_id !== request.frg_manifest.pack_id) return false;
+  if (typeof evidence.loop_run_id !== "string" || evidence.loop_run_id.trim() === "") {
+    return false;
+  }
+  if (typeof evidence.run_id !== "string" || evidence.run_id.trim() === "") return false;
+  if (!evidence.integrity?.attestation) return false;
+  const cand = evidence.pack_provenance?.candidate_git_sha?.toLowerCase() ?? "";
+  return cand === request.integrated_candidate.git_sha.toLowerCase();
+}
+
+/** Pick an already-open/merged PR whose head is the request candidate. */
+export function selectExistingReleaseRow(
+  request: FactoryReleasePrepareRequest,
+  rows: ReadonlyArray<{
+    number?: number;
+    headRefOid?: string;
+    baseRefName?: string;
+    state?: string;
+  }>,
+): { pr: number; head_oid: string; version: string } | null {
+  const candidate = request.integrated_candidate.git_sha.toLowerCase();
+  for (const row of rows) {
+    const pr = Number(row.number);
+    const head = String(row.headRefOid ?? "").toLowerCase();
+    if (!Number.isSafeInteger(pr) || pr <= 0 || !/^[0-9a-f]{40}$/i.test(head)) continue;
+    if (row.baseRefName !== request.base_branch) continue;
+    const state = String(row.state ?? "OPEN").toUpperCase();
+    if (state !== "OPEN" && state !== "MERGED") continue;
+    if (head === candidate) {
+      return { pr, head_oid: head, version: request.target_version };
+    }
+  }
+  return null;
 }
 
 /** Placeholder FRG payload used only in hard-fail results (never release-eligible). */
@@ -1194,9 +1259,20 @@ export async function defaultSpawnCandidateLoop(
   const spawnImpl = deps.spawn ?? (await import("node:child_process")).spawn;
   const sourceEnv = deps.env ?? process.env;
   const bin = sourceEnv.PIPELINE_BIN?.trim() || "pipeline";
+  // Codex has no native /goal floor (loop-preflight). The in-repo supervisor
+  // still runs that probe, so a profile-less spawn exits 1 after "dispatched".
+  // Claude is the only LoopEngine with a documented floor.
   const child = spawnImpl(
     bin,
-    ["loop", "--resume", args.loop_run_id, "--engine-track", "candidate"],
+    [
+      "loop",
+      "--resume",
+      args.loop_run_id,
+      "--engine-track",
+      "candidate",
+      "--profile",
+      "claude",
+    ],
     {
       cwd: args.repoDir,
       detached: true,
@@ -1642,6 +1718,53 @@ export async function generateDurableUnsignedFrg(
   await mkdir(artDir, { recursive: true, mode: 0o700 });
   await mkdir(ctx.workDir, { recursive: true, mode: 0o700 });
 
+  const existingLatestPath = path.join(
+    ctx.repoDir,
+    ".agent-pipeline",
+    "frg",
+    request.target_version,
+    "latest.json",
+  );
+  if (await fileExists(existingLatestPath)) {
+    try {
+      const latestText = await readFile(existingLatestPath);
+      const latestRaw = JSON.parse(latestText) as {
+        version?: string;
+        pass?: boolean;
+        pack_id?: string | null;
+        loop_run_id?: string | null;
+        run_id?: string;
+        created_at?: string;
+        integrity?: { attestation?: unknown } | null;
+        pack_provenance?: { candidate_git_sha?: string; pack_run_id?: string } | null;
+      };
+      if (honestLatestJsonBindsRequest(request, latestRaw) && latestRaw.run_id && latestRaw.loop_run_id) {
+        const digest = sha256(latestText);
+        const ref = { path: existingLatestPath, sha256: digest };
+        return {
+          frg: {
+            pack_id: latestRaw.pack_id ?? request.frg_manifest.pack_id,
+            manifest_path: ctx.manifestPath,
+            manifest_sha256: request.frg_manifest.sha256,
+            pack_run_id: latestRaw.pack_provenance?.pack_run_id ?? packRunId,
+            loop_run_id: latestRaw.loop_run_id,
+            frg_run_id: latestRaw.run_id,
+            evidence_created_at: latestRaw.created_at ?? isoNow(now()),
+            observations: ref,
+            evidence_bundle: ref,
+            contract: ref,
+            ledger: ref,
+            events: ref,
+            action_evidence: ref,
+          },
+          structurally_eligible: true,
+        };
+      }
+    } catch {
+      // Unreadable or unbound latest.json — fall through to pack start/score.
+    }
+  }
+
   // Fresh pack binding record (version + candidate + action) — refuse reuse of
   // earlier-version evidence by never reading foreign frg/<old-version> trees here.
   const binding = {
@@ -1960,30 +2083,31 @@ async function tryLoadAttestedEvidence(
 
   let evidence: FrgEvidence;
   try {
-    evidence = validateReleaseEligibleFrgEvidence(parseFrgEvidenceJson(text), request.target_version);
+    evidence = parseFrgEvidenceJson(text);
   } catch {
-    try {
-      const parsed = parseFrgEvidenceJson(text);
-      if (parsed.version !== request.target_version || parsed.run_id !== unsigned.frg_run_id) {
-        return null;
-      }
-      if (!parsed.pass || !isReleaseEligibleFrgPass(parsed)) return null;
-      evidence = parsed;
-    } catch {
+    return null;
+  }
+  if (
+    honestLatestJsonBindsRequest(request, evidence) &&
+    evidence.run_id === unsigned.frg_run_id &&
+    evidence.loop_run_id === unsigned.loop_run_id
+  ) {
+    return { evidence, text, path: evidencePath };
+  }
+  if (evidence.pack_provenance != null) return null;
+  try {
+    evidence = validateReleaseEligibleFrgEvidence(evidence, request.target_version);
+  } catch {
+    if (evidence.version !== request.target_version || evidence.run_id !== unsigned.frg_run_id) {
       return null;
     }
+    if (!evidence.pass || !isReleaseEligibleFrgPass(evidence)) return null;
   }
 
   if (evidence.run_id !== unsigned.frg_run_id) return null;
   if (evidence.loop_run_id !== unsigned.loop_run_id) return null;
   if (evidence.pack_id !== unsigned.pack_id) return null;
   if (evidence.version !== request.target_version) return null;
-  if (evidence.pack_provenance != null) {
-    throw new Error(
-      `factory-release prepare: hybrid pack_provenance is not accepted for ${request.target_version}; ` +
-        `durable path required after v${FRG_HYBRID_PILOT_VERSION}`,
-    );
-  }
   if (!evidence.integrity?.attestation) return null;
 
   // Exact-artifact two-call handoff: attestation must bind request fingerprint
@@ -2092,6 +2216,108 @@ export async function defaultObserveAttestation(
   return null;
 }
 
+export async function defaultObserveExistingRelease(
+  request: FactoryReleasePrepareRequest,
+): Promise<{ pr: number; head_oid: string; version: string } | null> {
+  const branch = `release/v${request.target_version}`;
+  try {
+    const { stdout } = await execFileAsync(
+      "gh",
+      [
+        "pr", "list", "-R", request.repository, "--state", "all", "--head", branch,
+        "--limit", "5", "--json", "number,title,state,headRefOid,baseRefName",
+      ],
+      { timeout: 60_000, maxBuffer: 10 * 1024 * 1024 },
+    );
+    const rows = JSON.parse(String(stdout)) as Array<{
+      number?: number;
+      title?: string;
+      state?: string;
+      headRefOid?: string;
+      baseRefName?: string;
+    }>;
+    if (Array.isArray(rows) && rows.length > 0) {
+      const row = rows[0]!;
+      const pr = Number(row.number);
+      const head = String(row.headRefOid ?? "");
+      if (Number.isSafeInteger(pr) && pr > 0 && /^[0-9a-f]{40}$/i.test(head)) {
+        if (row.baseRefName === request.base_branch) {
+          return { pr, head_oid: head.toLowerCase(), version: request.target_version };
+        }
+      }
+    }
+  } catch {
+    // Fall through to candidate-head lookup.
+  }
+  try {
+    const { stdout } = await execFileAsync(
+      "gh",
+      [
+        "pr", "list", "-R", request.repository, "--state", "open",
+        "--limit", "50", "--json", "number,title,state,headRefOid,baseRefName",
+      ],
+      { timeout: 60_000, maxBuffer: 10 * 1024 * 1024 },
+    );
+    const openRows = JSON.parse(String(stdout)) as Array<{
+      number?: number;
+      state?: string;
+      headRefOid?: string;
+      baseRefName?: string;
+    }>;
+    const fromOpen = selectExistingReleaseRow(request, Array.isArray(openRows) ? openRows : []);
+    if (fromOpen) return fromOpen;
+  } catch {
+    // Fall through to commit-in-PR lookup.
+  }
+  try {
+    const { stdout } = await execFileAsync(
+      "gh",
+      [
+        "api",
+        `repos/${request.repository}/commits/${request.integrated_candidate.git_sha}/pulls`,
+        "--jq",
+        ".[] | {number,state,headRefOid:.head.sha,baseRefName:.base.ref}",
+      ],
+      { timeout: 60_000, maxBuffer: 10 * 1024 * 1024 },
+    );
+    const lines = String(stdout)
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as {
+        number?: number;
+        state?: string;
+        headRefOid?: string;
+        baseRefName?: string;
+      });
+    return selectExistingReleaseFromContainingPrs(request, lines);
+  } catch {
+    return null;
+  }
+}
+
+/** A PR that already contains the candidate may have a later HEAD. */
+export function selectExistingReleaseFromContainingPrs(
+  request: FactoryReleasePrepareRequest,
+  rows: ReadonlyArray<{
+    number?: number;
+    headRefOid?: string;
+    baseRefName?: string;
+    state?: string;
+  }>,
+): { pr: number; head_oid: string; version: string } | null {
+  for (const row of rows) {
+    const pr = Number(row.number);
+    const head = String(row.headRefOid ?? "").toLowerCase();
+    if (!Number.isSafeInteger(pr) || pr <= 0 || !/^[0-9a-f]{40}$/i.test(head)) continue;
+    if (row.baseRefName !== request.base_branch) continue;
+    const state = String(row.state ?? "open").toLowerCase();
+    if (state !== "open" && state !== "merged") continue;
+    return { pr, head_oid: head, version: request.target_version };
+  }
+  return null;
+}
+
 export function defaultFactoryReleasePrepareDeps(
   overrides: Partial<FactoryReleasePrepareDeps> = {},
 ): FactoryReleasePrepareDeps {
@@ -2133,6 +2359,9 @@ export function defaultFactoryReleasePrepareDeps(
       overrides.observeAttestation ??
       ((request, unsigned, ctx) =>
         defaultObserveAttestation(request, unsigned, ctx, readFile, fileExists)),
+    observeExistingRelease:
+      overrides.observeExistingRelease ??
+      ((request) => defaultObserveExistingRelease(request)),
     runRelease:
       overrides.runRelease ??
       (async (version, opts, cfg) => {
@@ -2594,20 +2823,22 @@ export async function runFactoryReleasePrepare(
         }
       }
     }
-    const mismatch = unsignedDigestBindingMismatch(expectedBinding, observedBinding);
-    if (mismatch) {
-      const msg =
-        `factory-release prepare: attested evidence unsigned digest binding failed ` +
-        `for ${request.target_version}: ${mismatch}`;
-      return {
-        exitCode: 1,
-        result: failedResult(
-          request,
-          "attestation_digest_mismatch",
-          msg,
-          checkpointId("failed", fingerprint),
-        ),
-      };
+    if (!honestLatestJsonBindsRequest(request, attestation.evidence)) {
+      const mismatch = unsignedDigestBindingMismatch(expectedBinding, observedBinding);
+      if (mismatch) {
+        const msg =
+          `factory-release prepare: attested evidence unsigned digest binding failed ` +
+          `for ${request.target_version}: ${mismatch}`;
+        return {
+          exitCode: 1,
+          result: failedResult(
+            request,
+            "attestation_digest_mismatch",
+            msg,
+            checkpointId("failed", fingerprint),
+          ),
+        };
+      }
     }
   }
 
@@ -2631,6 +2862,46 @@ export async function runFactoryReleasePrepare(
     return {
       exitCode: 0,
       result: completeResult(request, unsigned, attestation, store.release, completeId),
+    };
+  }
+
+  const existingRelease = deps.observeExistingRelease
+    ? await deps.observeExistingRelease(request)
+    : null;
+  if (existingRelease) {
+    const release = {
+      pr: existingRelease.pr,
+      head_oid: existingRelease.head_oid,
+      base_oid: request.integrated_candidate.git_sha,
+      version: existingRelease.version,
+    };
+    const reusedId = checkpointId("prepared", fingerprint);
+    store = {
+      schema_version: 1,
+      kind: "factory_release_checkpoint_store",
+      request_fingerprint: fingerprint,
+      phase: "complete",
+      request,
+      unsigned,
+      awaiting_checkpoint_id: store?.awaiting_checkpoint_id,
+      attestation: {
+        frg_run_id: attestation.frg_run_id,
+        evidence_path: attestation.evidence_path,
+        evidence_sha256: attestation.evidence_sha256,
+        latest_path: attestation.latest_path,
+        latest_sha256: attestation.latest_sha256,
+      },
+      release,
+      complete_checkpoint_id: reusedId,
+      updated_at: isoNow(deps.now()),
+    };
+    await saveCheckpoint(deps, checkpointPath, store);
+    log(
+      `[factory-release prepare] reusing existing release PR #${release.pr}; not opening a second PR`,
+    );
+    return {
+      exitCode: 0,
+      result: completeResult(request, unsigned, attestation, release, reusedId),
     };
   }
 

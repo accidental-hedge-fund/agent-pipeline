@@ -456,7 +456,7 @@ function workflowMemFs(): FrgFsDeps & { files: Map<string, string> } {
   };
 }
 
-test("auto-tag-release workflow hard-gates tag create on FRG evidence before tag push", () => {
+test("auto-tag-release workflow has FRG verification step ordered before tag create/push", () => {
   const workflowSrc = readFileSync(WORKFLOW_PATH, "utf-8");
   const existsStep = workflowSrc.indexOf("- name: Check whether the tag already exists");
   const frgStep = workflowSrc.indexOf("- name: Verify Factory Reliability Gate evidence");

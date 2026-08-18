@@ -718,7 +718,10 @@ export function maxPositionalsFor(command: string | undefined): number {
     command === "controls" ||
     // host-local store verbs with a subcommand: outcomes list|ingest, lineage export|impact|…
     command === "outcomes" ||
-    command === "lineage"
+    command === "lineage" ||
+    // factory-release prepare; factory-pin show|init|promote|rollback (#1114)
+    command === "factory-release" ||
+    command === "factory-pin"
   ) {
     return 2;
   }
@@ -1162,10 +1165,13 @@ export function dispatchItemChildArgs(
   issueNumber: number,
   engine: LoopEngine,
   repoDir: string,
-  opts?: { runId?: string },
+  opts?: { runId?: string; engineTrack?: "pinned" | "candidate" },
 ): string[] {
   const args = [scriptPath, String(issueNumber), "--profile", engine, "--repo-path", repoDir];
   if (opts?.runId) args.push("--run-id", opts.runId);
+  if (opts?.engineTrack === "pinned" || opts?.engineTrack === "candidate") {
+    args.push("--engine-track", opts.engineTrack);
+  }
   return args;
 }
 
@@ -1467,7 +1473,12 @@ export function realDispatchItem(
       await new Promise<void>((resolve, reject) => {
         const child = spawnFn(
           execPath,
-          dispatchItemChildArgs(scriptPath, issueNumber, engine, cfg.repo_dir, pin ? { runId: pin.pipeline_run_id } : undefined),
+          dispatchItemChildArgs(scriptPath, issueNumber, engine, cfg.repo_dir, {
+            ...(pin ? { runId: pin.pipeline_run_id } : {}),
+            ...(cfg.engine_track === "pinned" || cfg.engine_track === "candidate"
+              ? { engineTrack: cfg.engine_track }
+              : {}),
+          }),
           { stdio: "inherit" },
         );
         let pollTimer: ReturnType<typeof setInterval> | undefined;
@@ -2562,6 +2573,8 @@ export function workListDiscoverDepsForCompile(
 
 export interface RunLoopEngineInput {
   engine: LoopEngine;
+  /** CLI `--engine-track` must reach per-item child advances (FRG candidate soak). */
+  engineTrack?: "pinned" | "candidate";
   selector?: LoopSelector;
   resumeRunId?: string;
   audit: boolean;
@@ -2704,6 +2717,9 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
     cfg = resolveConfig({ repoPath: input.repoDir, profile: input.engine });
   } catch (err) {
     return { kind: "error", message: `config error: ${(err as Error).message}` };
+  }
+  if (input.engineTrack === "pinned" || input.engineTrack === "candidate") {
+    cfg = { ...cfg, engine_track: input.engineTrack };
   }
 
   let runId: string;
@@ -2988,6 +3004,7 @@ export async function runLoopCommand(
   const writeLine = deps.writeStdoutLine ?? writeFlushedStdoutLine;
   const engineResult = await deps.runLoopEngine({
     engine,
+    engineTrack: opts.engineTrack === "pinned" || opts.engineTrack === "candidate" ? opts.engineTrack : undefined,
     selector: outcome.args.selector,
     resumeRunId: outcome.args.resumeRunId,
     audit: outcome.args.audit,
@@ -3182,6 +3199,7 @@ export async function runSingleIssueCommand(
   const engine: LoopEngine = opts.profile === "claude" ? "claude" : "codex";
   const engineResult = await deps.runLoopEngine({
     engine,
+    engineTrack: opts.engineTrack === "pinned" || opts.engineTrack === "candidate" ? opts.engineTrack : undefined,
     selector: { type: "work-list", value: [String(issueNumber)] },
     audit: false,
     autoSupersedeTerminal: true,
@@ -3513,6 +3531,7 @@ export async function advanceWaveThroughLoop(
   try {
     const engineResult = await runLoopEngine({
       engine,
+      engineTrack: opts.engineTrack === "pinned" || opts.engineTrack === "candidate" ? opts.engineTrack : undefined,
       selector: { type: "work-list", value: issues.map(String) },
       audit: false,
       autoSupersedeTerminal: true,

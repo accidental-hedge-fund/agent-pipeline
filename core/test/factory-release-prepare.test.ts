@@ -20,7 +20,10 @@ import {
   factoryReleaseRequestFingerprint,
   factoryReleaseWorkDir,
   generateDurableUnsignedFrg,
+  honestLatestJsonBindsRequest,
   isBoundPackLoopTerminal,
+  selectExistingReleaseFromContainingPrs,
+  selectExistingReleaseRow,
   isPendingLoopDispatch,
   isPostPilotReleaseVersion,
   observeDetachedChildStart,
@@ -343,6 +346,7 @@ function makeDeps(opts: {
   fs: ReturnType<typeof memoryFs>;
   generate?: FactoryReleasePrepareDeps["generateUnsignedFrg"];
   observe?: FactoryReleasePrepareDeps["observeAttestation"];
+  observeExistingRelease?: FactoryReleasePrepareDeps["observeExistingRelease"];
   runRelease?: FactoryReleasePrepareDeps["runRelease"];
   generateCalls?: { n: number };
   releaseCalls?: { n: number };
@@ -370,6 +374,7 @@ function makeDeps(opts: {
       if (opts.observe) return opts.observe(request, unsigned, ctx);
       return null;
     },
+    observeExistingRelease: opts.observeExistingRelease ?? (async () => null),
     runRelease: async (version, releaseOpts, cfg) => {
       releaseCalls.n++;
       if (opts.runRelease) return opts.runRelease(version, releaseOpts, cfg);
@@ -395,6 +400,166 @@ test("compareSemver and isPostPilotReleaseVersion", () => {
   assert.equal(compareSemver("1.32.0", "1.33.0"), -1);
   assert.equal(isPostPilotReleaseVersion("1.34.0"), true);
   assert.equal(isPostPilotReleaseVersion(FRG_HYBRID_PILOT_VERSION), false);
+});
+
+test("honestLatestJsonBindsRequest requires attested hybrid-v2 on this candidate", () => {
+  const request = baseRequest();
+  const bound = {
+    version: "1.34.0",
+    pass: true,
+    pack_id: "factory-gate-v1",
+    loop_run_id: "loop-bound",
+    run_id: "frg-bound",
+    integrity: { attestation: { alg: "hmac-sha256", mac: "ab" } },
+    pack_provenance: { candidate_git_sha: CANDIDATE },
+  };
+  assert.equal(honestLatestJsonBindsRequest(request, bound), true);
+  assert.equal(
+    honestLatestJsonBindsRequest(request, { ...bound, pass: false }),
+    false,
+  );
+  assert.equal(
+    honestLatestJsonBindsRequest(request, {
+      ...bound,
+      pack_provenance: { candidate_git_sha: "d".repeat(40) },
+    }),
+    false,
+  );
+  assert.equal(
+    honestLatestJsonBindsRequest(request, { ...bound, integrity: {} }),
+    false,
+  );
+});
+
+test("selectExistingReleaseRow matches an open PR whose head is the candidate", () => {
+  const request = baseRequest();
+  const hit = selectExistingReleaseRow(request, [
+    { number: 99, headRefOid: "e".repeat(40), baseRefName: "main", state: "OPEN" },
+    { number: 1120, headRefOid: CANDIDATE, baseRefName: "main", state: "OPEN" },
+  ]);
+  assert.deepEqual(hit, { pr: 1120, head_oid: CANDIDATE, version: "1.34.0" });
+  assert.equal(
+    selectExistingReleaseRow(request, [
+      { number: 1120, headRefOid: CANDIDATE, baseRefName: "other", state: "OPEN" },
+    ]),
+    null,
+  );
+});
+
+test("selectExistingReleaseFromContainingPrs reuses a later PR HEAD that still contains the candidate", () => {
+  const request = baseRequest();
+  const later = "f".repeat(40);
+  const hit = selectExistingReleaseFromContainingPrs(request, [
+    { number: 1120, headRefOid: later, baseRefName: "main", state: "open" },
+  ]);
+  assert.deepEqual(hit, { pr: 1120, head_oid: later, version: "1.34.0" });
+});
+
+test("generateDurableUnsignedFrg reuses candidate-bound latest.json and does not start a pack", async () => {
+  const request = baseRequest();
+  const latest = {
+    version: "1.34.0",
+    pass: true,
+    pack_id: "factory-gate-v1",
+    loop_run_id: "loop-reuse",
+    run_id: "frg-reuse",
+    created_at: "2026-08-18T00:00:00Z",
+    integrity: { attestation: { alg: "hmac-sha256", mac: "ab" } },
+    pack_provenance: { candidate_git_sha: CANDIDATE, pack_run_id: "pack-reuse" },
+  };
+  const files = new Map<string, string>([
+    ["/repo/.agent-pipeline/frg/1.34.0/latest.json", JSON.stringify(latest)],
+  ]);
+  let started = 0;
+  const result = await generateDurableUnsignedFrg(
+    request,
+    {
+      repoDir: "/repo",
+      workDir: "/repo/.agent-pipeline/factory-release/reuse",
+      pack: packWithTemplates(),
+      manifestPath: "/pack/factory-gate-v1/manifest.json",
+    },
+    {
+      now: () => new Date("2026-08-10T12:00:00Z"),
+      fileExists: async (p) => files.has(p),
+      readFile: async (p) => {
+        const v = files.get(p);
+        if (v === undefined) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+        return v;
+      },
+      writeFile: async (p, body) => {
+        files.set(p, body);
+      },
+      mkdir: async () => {},
+      startBoundPackLoop: async () => {
+        started += 1;
+        throw new Error("must not start a second pack");
+      },
+    },
+  );
+  assert.equal(started, 0);
+  assert.equal(result.structurally_eligible, true);
+  assert.equal(result.frg.frg_run_id, "frg-reuse");
+  assert.equal(result.frg.loop_run_id, "loop-reuse");
+  assert.equal(result.frg.pack_run_id, "pack-reuse");
+});
+
+test("prepare completes from candidate-bound latest.json without runRelease or a second pack", async () => {
+  const request = baseRequest();
+  const requestPath = "/tmp/req-reuse-latest.json";
+  const mem = memoryFs();
+  await mem.writeFile(requestPath, JSON.stringify(request));
+  const unsigned = unsignedPayload({
+    frg_run_id: "frg-reuse",
+    loop_run_id: "loop-reuse",
+  });
+  let releaseCalls = 0;
+  const deps = defaultFactoryReleasePrepareDeps({
+    env: {},
+    now: () => new Date("2026-08-10T12:00:00Z"),
+    readRequestText: (p) => mem.readRequestText(p),
+    readFile: (p) => mem.readFile(p),
+    writeFile: (p, body) => mem.writeFile(p, body),
+    mkdir: async () => {},
+    fileExists: (p) => mem.fileExists(p),
+    loadPack: async () => fakePack(),
+    generateUnsignedFrg: async () => ({
+      frg: unsigned,
+      structurally_eligible: true,
+    }),
+    observeAttestation: async () => ({
+      frg_run_id: "frg-reuse",
+      evidence_path: "/repo/.agent-pipeline/frg/1.34.0/latest.json",
+      evidence_sha256: "a".repeat(64),
+      latest_path: "/repo/.agent-pipeline/frg/1.34.0/latest.json",
+      latest_sha256: "a".repeat(64),
+      evidence: {
+        version: "1.34.0",
+        pass: true,
+        pack_id: "factory-gate-v1",
+        loop_run_id: "loop-reuse",
+        run_id: "frg-reuse",
+        integrity: { attestation: { alg: "hmac-sha256", mac: "ab" } },
+        pack_provenance: { candidate_git_sha: CANDIDATE },
+      } as never,
+    }),
+    observeExistingRelease: async () => ({
+      pr: 1120,
+      head_oid: CANDIDATE,
+      version: "1.34.0",
+    }),
+    runRelease: async () => {
+      releaseCalls += 1;
+      throw new Error("must not open a second release PR");
+    },
+  });
+  const outcome = await runFactoryReleasePrepare({ requestPath, repoDir: "/repo" }, deps);
+  assert.equal(outcome.exitCode, 0);
+  assert.equal(outcome.result.status, "complete");
+  if (outcome.result.status !== "complete") return;
+  assert.equal(outcome.result.release_pr.number, 1120);
+  assert.equal(outcome.result.release_pr.head_oid, CANDIDATE);
+  assert.equal(releaseCalls, 0);
 });
 
 test("rejectForbiddenRequestFields refuses pass claims and credentials", () => {
@@ -520,6 +685,33 @@ test("second call after attestation returns complete via shared runRelease", asy
   assert.equal(releaseCalls.n, 1);
   // Idempotent: generate only once across both calls
   assert.equal(generateCalls.n, 1);
+});
+
+test("post-attestation reuses an already-merged release PR and does not call runRelease (#1115)", async () => {
+  const mem = memoryFs();
+  const request = baseRequest();
+  const requestPath = "/tmp/req-134.json";
+  await mem.writeFile(requestPath, JSON.stringify(request));
+  const releaseCalls = { n: 0 };
+  const deps = makeDeps({
+    fs: mem,
+    releaseCalls,
+    observe: async (_req, unsigned) => observeForUnsigned(unsigned, request),
+    observeExistingRelease: async () => ({
+      pr: 1109,
+      head_oid: "f".repeat(40),
+      version: "1.34.0",
+    }),
+  });
+  const outcome = await runFactoryReleasePrepare(
+    { requestPath, repoDir: "/repo", json: true },
+    deps,
+  );
+  assert.equal(outcome.exitCode, 0);
+  assert.equal(outcome.result.status, "complete");
+  if (outcome.result.status !== "complete") return;
+  assert.equal(outcome.result.release_pr.number, 1109);
+  assert.equal(releaseCalls.n, 0);
 });
 
 test("idempotent re-entry at awaiting does not create a second pack", async () => {
@@ -1670,6 +1862,8 @@ test("dispatch spawn strips FRG signing vars from the candidate loop environment
     "loop-env-dispatch",
     "--engine-track",
     "candidate",
+    "--profile",
+    "claude",
   ]);
 });
 
@@ -1695,5 +1889,7 @@ test("resume spawn strips FRG signing vars from the candidate loop environment",
     "loop-env-resume",
     "--engine-track",
     "candidate",
+    "--profile",
+    "claude",
   ]);
 });
