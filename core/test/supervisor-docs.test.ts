@@ -98,8 +98,8 @@ test("supervisor examples exist and stay thin", () => {
   assert.doesNotMatch(shell, /ops\/hermes-factory|grant_fingerprint|auto_merge/);
   const hermes = read("examples/supervisor/hermes/SKILL.md");
   assert.match(hermes, /does not implement a second state machine|Not the removed/i);
-  // Option 1 (#927 / #1001): Ship milestone maps to Tugboat, not playbook-as-primary.
-  assert.match(hermes, /tugboat/i);
+  // #1096: Ship milestone maps to pipeline ship --milestone, not Tugboat-as-owner.
+  assert.match(hermes, /pipeline ship --milestone/);
   assert.match(hermes, /Ship milestone vX\.Y\.Z/i);
   // #1039: default is FRG pack then release; skip is escape only.
   assert.match(hermes, /FRG pack/i);
@@ -116,11 +116,11 @@ test("supervisor examples exist and stay thin", () => {
   const shipDoc = read("docs/runbooks/ship-milestone.md");
   assert.match(shipDoc, /exact.*events\.jsonl|events\.jsonl.*exact/i);
   assert.match(shipDoc, /material-filter\.mjs/);
-  assert.match(shipDoc, /tugboat\.sh|Option 1/i);
-  assert.match(shipDoc, /Alternate|legacy|non-primary/i);
+  assert.match(shipDoc, /pipeline ship --milestone/);
+  assert.doesNotMatch(shipDoc, /never in-engine ship|in-engine `pipeline ship` is parked/i);
   assert.match(shipDoc, /factory-release prepare/);
   assert.doesNotMatch(shipDoc, /FRG is not part of thin ship|optional \/ advisory/);
   const readme = read("examples/supervisor/README.md");
-  assert.match(readme, /tugboat\.sh/);
-  assert.match(readme, /Option 1 primary|primary ship composer/i);
+  assert.match(readme, /pipeline ship --milestone/);
+  assert.doesNotMatch(readme, /never in-engine ship/i);
 });

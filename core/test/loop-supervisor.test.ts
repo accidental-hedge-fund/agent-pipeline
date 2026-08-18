@@ -69,6 +69,7 @@ function hermeticSupervisorDeps(deps: SupervisorDeps): SupervisorDeps {
   return {
     probeLiveAdvance: () => ({ live: false as const }),
     acquireItemAdvanceLock: () => ({ release() {} }),
+    recoverySleep: async () => {},
     ...deps,
   };
 }
@@ -4012,7 +4013,10 @@ test("regression (#770 929fc0ac / lock evidence): failed dispatch with already-r
       observe,
       dispatchItem,
       getChangedFiles: async () => [],
-      probeLiveAdvance: async () => ({ live: false as const }),
+      probeLiveAdvance: async (itemId) =>
+        itemId === "675"
+          ? { live: true as const, evidence: "lock_held" as const, holder_pid: 4242 }
+          : { live: false as const },
     },
     "run-1",
     token,
@@ -4074,8 +4078,9 @@ test("regression (#770 genuine defect): crash with no coexistence evidence still
       store: deps,
       observe,
       dispatchItem,
-      // Probe reports not live so Pass-2 does not reclassify as coexistence
-      probeLiveAdvance: async () => ({ live: false as const }),
+      // Live crashed holder without lock/wrapper identity may stay defect (#1096).
+      probeLiveAdvance: async () => ({ live: true as const, evidence: "loop_linkage" as const }),
+      executeRecovery: async () => ({ succeeded: false, evidence: "live crash remains defect" }),
     },
     { runId: "run-1", engine: "claude" },
   );
@@ -4529,27 +4534,27 @@ test("regression (#770 12e4c0fd): freshly crashed linked advance escalates genui
   try {
     // Raw entry point + test-unique lock domain: exercises the production
     // default probe hermetically (no /tmp lock collision with a live advance).
-    const result = await driveSupervisorRaw(
+    const { token } = await acquireLock(deps, "run-1", "claude");
+    const result = await runSupervisorCycleRaw(
       {
         store: deps,
         observe,
         dispatchItem,
         repoDir: repo,
         lockDomain: "agent-pipeline-test-12e4c0fd-fresh",
-        // Default probe path — Pass-2 must ignore the failed attempt's own fresh
-        // linkage/run-store and still escalate without lock/wrapper holder.
+        recoverySleep: async () => {},
+        // Default probe path — dead-holder crash store is takeover, not coexistence.
       },
-      { runId: "run-1", engine: "claude" },
+      "run-1",
+      token,
+      "claude",
     );
 
-    assert.equal(
-      result.stop?.reason,
-      "run_fatal",
-      "fresh own crash linkage must not indefinitely reclassify as coexistence",
-    );
-    const finalLedger = await readLedger(deps, "run-1");
-    assert.equal(finalLedger.items["100"].blocked_theme, "workflow-engine-defect");
     const events = await readEvents(deps, "run-1");
+    assert.ok(
+      events.some((e) => e.kind === "loop_item_dead_holder_takeover"),
+      "dead-holder SIGTERM crash is takeover, not workflow-engine-defect",
+    );
     assert.ok(
       !events.some(
         (e) =>
@@ -4557,8 +4562,9 @@ test("regression (#770 12e4c0fd): freshly crashed linked advance escalates genui
           (e.data as { item_id?: string; reason?: string }).item_id === "100" &&
           (e.data as { reason?: string }).reason !== "pre_dispatch_live_advance",
       ),
-      "Pass-2 must not emit coexistence_wait for the genuine crash",
+      "Pass-2 must not emit coexistence_wait for a dead-holder crash",
     );
+    assert.notEqual(result.stop?.reason, "supervisor_no_progress");
   } finally {
     fs.rmSync(repo, { recursive: true, force: true });
   }
@@ -5927,4 +5933,52 @@ test("a mid-pass run stop before a sibling's unattested needs-human protocol rec
     ),
     "no waiting-hold event once the run is stopped",
   );
+});
+
+test("dead holder + reused loop id is takeover, not coexistence_wait or supervisor_no_progress (#1096)", async () => {
+  const contract = testContract({ items: [{ id: "1095", depends_on: [] }] });
+  const entry = itemEntry("1095", "pending");
+  entry.advance_run_id = "loop-cd7bd53d94838204";
+  const ledger = testLedger({ "1095": entry });
+  const { deps } = await setup(contract, ledger);
+  const { observe } = coordinatedFakes();
+  const claimed: string[] = [];
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => ({
+    schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+    item_id: request.item_id,
+    run_id: request.run_id,
+    outcome: "engine_internal_crash" as LoopExecutionResponse["outcome"],
+    evidence: { pr_number: null, pipeline_run_id: "loop-cd7bd53d94838204" },
+  });
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  const cycle = await runSupervisorCycle(
+    {
+      store: deps,
+      observe,
+      dispatchItem,
+      probeLiveAdvance: async () => ({ live: false as const }),
+      executeRecovery: async (input) => {
+        claimed.push(input.action);
+        return { succeeded: false, evidence: "should-not-claim-restart" };
+      },
+    },
+    "run-1",
+    token,
+    "claude",
+  );
+  const events = await readEvents(deps, "run-1");
+  const waits = events.filter((e) => e.kind === "loop_item_coexistence_wait");
+  assert.ok(waits.length < 2, `corpse must not cycle coexistence_wait (got ${waits.length})`);
+  assert.notEqual(cycle.stop?.reason, "supervisor_no_progress");
+  assert.ok(!claimed.includes("restart_workflow_engine"), "first recipe must not be restart_workflow_engine");
+  const finalLedger = await readLedger(deps, "run-1");
+  const defectBudget = finalLedger.items["1095"].recovery_budgets_remaining["workflow-engine-defect"];
+  if (defectBudget !== undefined) {
+    assert.ok(defectBudget > 0, "workflow-engine-defect budget must not burn to zero");
+  }
+  assert.ok(
+    events.some((e) => e.kind === "loop_item_dead_holder_takeover"),
+    "dead holder must take over the same item",
+  );
+  assert.equal(finalLedger.items["1095"].state, "pending", "takeover returns the same item to pending");
 });

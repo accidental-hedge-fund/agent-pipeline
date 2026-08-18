@@ -27,9 +27,10 @@ export const TUGBOAT_FAILURE_DETAIL = /failure_detail\s*\(/;
 export const TUGBOAT_CI_WAIT_BUCKET =
   /gh pr checks "\$pr" --json name,state,bucket,link/;
 
-/** Forbidden second-ship-brain / grant-factory product markers. */
+/** Forbidden second-ship-brain / grant-factory product markers.
+ *  `pipeline ship --milestone` is the product CLI and is allowed. */
 export const TUGBOAT_FORBIDDEN_SECOND_BRAIN =
-  /grant[\/_]factory|factory\.mjs|pipeline ship /;
+  /grant[\/_]factory|factory\.mjs/;
 
 /** Critical Option 1 pack members verified by content digest. */
 export const OPTION1_CRITICAL_PACK_IDS = [

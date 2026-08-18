@@ -6,6 +6,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
   ACTIVE_RUN_STORE_MAX_AGE_MS,
+  classifyHolderInterrupt,
   isCoexistenceFailureEvidence,
   isConcurrentHolderEvidence,
   isNonFatalMidStageExit,
@@ -149,7 +150,7 @@ test("probeLiveAdvance: dead PID lock → not live", () => {
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test("probeLiveAdvance: knownLinkage non-terminal + fresh → live loop_linkage (#770 dcfb0878)", () => {
+test("probeLiveAdvance: knownLinkage non-terminal + fresh without process is a corpse (#1096)", () => {
   const r = probeLiveAdvance({
     domain: "test",
     issueNumber: 1,
@@ -158,8 +159,7 @@ test("probeLiveAdvance: knownLinkage non-terminal + fresh → live loop_linkage 
     resolveLinkageTerminal: () => false,
     isLinkageFresh: () => true,
   });
-  assert.equal(r.live, true);
-  if (r.live) assert.equal(r.evidence, "loop_linkage");
+  assert.equal(r.live, false, "corpse linkage without lock/wrapper is not a live holder");
 });
 
 test("probeLiveAdvance: knownLinkage terminal → not live from linkage (#770 ce4794fb)", () => {
@@ -219,7 +219,7 @@ test("isConcurrentHolderEvidence: only lock_held / wrapper_pid", () => {
   assert.equal(isConcurrentHolderEvidence(undefined), false);
 });
 
-test("probeLiveAdvance: active_run_store evidence (#770 dcfb0878)", () => {
+test("probeLiveAdvance: active_run_store without process is a corpse (#1096)", () => {
   const r = probeLiveAdvance({
     domain: "test",
     issueNumber: 675,
@@ -229,11 +229,7 @@ test("probeLiveAdvance: active_run_store evidence (#770 dcfb0878)", () => {
         ? { pipeline_run_id: "675-active", events_path: "/tmp/e.jsonl" }
         : null,
   });
-  assert.equal(r.live, true);
-  if (r.live) {
-    assert.equal(r.evidence, "active_run_store");
-    assert.equal(r.pipeline_run_id, "675-active");
-  }
+  assert.equal(r.live, false, "crash run-store without lock/wrapper is not a live holder");
 });
 
 test("probeLiveAdvance: wrapper_pid evidence", () => {
@@ -355,7 +351,7 @@ test("default probe: fresh crashed linked advance ignored without concurrent hol
   fs.utimesSync(path.join(runs, crashId), now / 1000, now / 1000);
   fs.utimesSync(eventsPath, now / 1000, now / 1000);
 
-  // Without ignore: fresh linkage still looks live (pre-dispatch attach path).
+  // Without ignore: fresh linkage without lock/wrapper is still a corpse (#1096).
   const withoutIgnore = probeLiveAdvance({
     domain: "test",
     issueNumber: 770,
@@ -364,8 +360,7 @@ test("default probe: fresh crashed linked advance ignored without concurrent hol
     lockPathForTest: path.join(os.tmpdir(), "no-such-lock-770-fresh-crash"),
     nowMs: now,
   });
-  assert.equal(withoutIgnore.live, true);
-  if (withoutIgnore.live) assert.equal(withoutIgnore.evidence, "loop_linkage");
+  assert.equal(withoutIgnore.live, false, "dead-holder crash store is not a live wait");
 
   // Pass-2 shape: ignore the failed attempt's own run id → not live without lock/wrapper.
   const pass2 = probeLiveAdvance({
@@ -411,8 +406,7 @@ test("findActiveRunStoreForIssue: fresh non-terminal store is still active withi
     repoDir: repo,
     lockPathForTest: path.join(os.tmpdir(), "no-such-lock-770-fresh"),
   });
-  assert.equal(r.live, true);
-  if (r.live) assert.equal(r.evidence, "active_run_store");
+  assert.equal(r.live, false, "fresh run-store without lock/wrapper is a corpse");
 
   fs.rmSync(repo, { recursive: true, force: true });
 });
@@ -624,4 +618,26 @@ test("probeLiveAdvance: production-shaped wiring with findWrapperPid (#770 956d2
     assert.equal(r.evidence, "wrapper_pid");
     assert.equal(r.holder_pid, process.pid);
   }
+});
+
+test("classifyHolderInterrupt: dead holder is resume-eligible even with leftover harness-failure (#1096)", () => {
+  assert.equal(
+    classifyHolderInterrupt({ holderLive: false, leftoverHarnessFailure: true }),
+    "resume-eligible-interrupt",
+  );
+  assert.equal(
+    classifyHolderInterrupt({ holderLive: false, leftoverHarnessFailure: false }),
+    "resume-eligible-interrupt",
+  );
+});
+
+test("classifyHolderInterrupt: live concurrent holder waits; live crash may stay defect", () => {
+  assert.equal(
+    classifyHolderInterrupt({ holderLive: true, concurrentHolder: true }),
+    "coexistence_wait",
+  );
+  assert.equal(
+    classifyHolderInterrupt({ holderLive: true, concurrentHolder: false }),
+    "workflow-engine-defect",
+  );
 });

@@ -173,9 +173,9 @@ export const COMMAND_DOCS: Record<string, CommandDoc> = {
   },
   ship: {
     summary:
-      "Run or inspect one exact, Buzz-authorized release shipment through train, FRG, release, and engine promotion",
+      "Run or inspect one durable milestone shipment (train --merge, release, finish, promote). Operator product is pipeline ship --milestone vX.Y.Z; no grant file required.",
     usage:
-      "ship --milestone <m> --for <X.Y.Z> --authorization <absolute-json> --json | ship status --milestone <m> --for <X.Y.Z> --json",
+      "ship --milestone vX.Y.Z [--json] | ship status --milestone vX.Y.Z [--json]",
     documented: true,
     section: "lifecycle",
   },

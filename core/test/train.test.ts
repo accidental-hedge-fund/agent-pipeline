@@ -350,11 +350,118 @@ test("train (#1063): merge-first R2D before implementing newer sibling", async (
   deps.seedPr(599, 1058);
   deps.seedPr(1061, 1064);
 
+  const mutations: Array<{ kind: "merge" | "advance"; id: number }> = [];
+  const origMerge = deps.mergeIssuePr.bind(deps);
+  const origWave = deps.advanceWave.bind(deps);
+  deps.mergeIssuePr = async (pr) => {
+    mutations.push({ kind: "merge", id: pr });
+    return origMerge(pr);
+  };
+  deps.advanceWave = async (issues) => {
+    for (const n of issues) mutations.push({ kind: "advance", id: n });
+    return origWave(issues);
+  };
+
   const result = await runTrain(baseOpts({ issues: [1061, 599], merge: true }), deps);
   assert.equal(result.exitCode, 0, result.status.blocker ?? "ok");
+  assert.ok(mutations.length >= 1, "expected mutations");
+  assert.deepEqual(mutations[0], { kind: "merge", id: 1058 }, "first mutation must be merge of already-R2D #A");
+  const advanceB = mutations.findIndex((m) => m.kind === "advance" && m.id === 1061);
+  const mergeA = mutations.findIndex((m) => m.kind === "merge" && m.id === 1058);
+  assert.ok(mergeA !== -1 && (advanceB === -1 || mergeA < advanceB), "must not implement #B before merging #A");
   assert.ok(deps.mergeCalls[0] === 1058, "first merge is the already-R2D PR");
   assert.ok(deps.advanceCalls.includes(1061));
   assert.ok(!deps.advanceCalls.includes(599), "R2D item is not re-advanced");
+});
+
+test("train (#1096): merge-first fixture fails if ready sibling is implemented first", async () => {
+  const deps = makeDeps();
+  deps.seedIssue(snap(1037, "already r2d", ["pipeline:ready-to-deploy"]));
+  deps.seedIssue(snap(1095, "ready sibling", ["pipeline:ready"]));
+  deps.seedPr(1037, 1094);
+  deps.seedPr(1095, 1100);
+
+  const mutations: Array<{ kind: "merge" | "advance"; id: number }> = [];
+  const origMerge = deps.mergeIssuePr.bind(deps);
+  const origWave = deps.advanceWave.bind(deps);
+  deps.mergeIssuePr = async (pr) => {
+    mutations.push({ kind: "merge", id: pr });
+    return origMerge(pr);
+  };
+  deps.advanceWave = async (issues) => {
+    for (const n of issues) mutations.push({ kind: "advance", id: n });
+    return origWave(issues);
+  };
+
+  const result = await runTrain(baseOpts({ issues: [1037, 1095], merge: true }), deps);
+  assert.equal(result.exitCode, 0, result.status.blocker ?? "ok");
+  assert.deepEqual(mutations[0], { kind: "merge", id: 1094 });
+  const firstAdvance = mutations.find((m) => m.kind === "advance");
+  assert.ok(firstAdvance === undefined || firstAdvance.id !== 1037);
+  if (firstAdvance) {
+    assert.equal(mutations[0].kind, "merge");
+    assert.notEqual(firstAdvance.id, 1094);
+  }
+  assert.ok(!deps.advanceCalls.includes(1037));
+  assert.ok(deps.mergeCalls.includes(1094));
+});
+
+test("train (#1096): leftover implementation-ci + live R2D merges A and does not implement B first", async () => {
+  const { classifyTrainAdvanceLabels } = await import("../scripts/pipeline.ts");
+  const { extractTrainAdvanceLoopEvidence } = await import(
+    "../scripts/stages/train-advance-stop-reason.ts"
+  );
+  const mutations: Array<{ kind: "merge" | "advance"; id: number }> = [];
+  const deps = makeDeps({
+    async advanceWave(issueList) {
+      for (const n of issueList) mutations.push({ kind: "advance", id: n });
+      const evidence = extractTrainAdvanceLoopEvidence({
+        events: [
+          {
+            kind: "loop_item_blocked",
+            data: { item_id: "1037", class: "implementation-ci" },
+          },
+          {
+            kind: "loop_item_advance_finished",
+            data: { item_id: "1037", outcome: "ready_to_deploy" },
+          },
+          { kind: "loop_run_complete", data: { outcome: "all_done" } },
+        ],
+      });
+      const out: AdvanceWaveResult = new Map();
+      for (const n of issueList) {
+        const issues = (deps as unknown as { _issues: Map<number, TrainIssueSnapshot> })._issues;
+        issues.get(n)!.labels = ["pipeline:ready-to-deploy"];
+        out.set(
+          n,
+          classifyTrainAdvanceLabels(
+            { labels: ["pipeline:ready-to-deploy"] },
+            0,
+            evidence,
+            n,
+          ),
+        );
+      }
+      return out;
+    },
+  });
+  deps.seedIssue(snap(1037, "leftover ci then r2d", ["pipeline:ready-to-deploy"]));
+  deps.seedIssue(snap(1095, "ready sibling", ["pipeline:ready"]));
+  deps.seedPr(1037, 1094);
+  deps.seedPr(1095, 1100);
+  const origMerge = deps.mergeIssuePr.bind(deps);
+  deps.mergeIssuePr = async (pr) => {
+    mutations.push({ kind: "merge", id: pr });
+    return origMerge(pr);
+  };
+
+  const result = await runTrain(baseOpts({ issues: [1037, 1095], merge: true }), deps);
+  assert.equal(result.exitCode, 0, result.status.blocker ?? "ok");
+  assert.deepEqual(mutations[0], { kind: "merge", id: 1094 }, "first mutation must be merge of leftover-block R2D #A");
+  assert.doesNotMatch(result.status.blocker ?? "", /implementation-ci/);
+  const advanceB = mutations.findIndex((m) => m.kind === "advance" && m.id === 1095);
+  const mergeA = mutations.findIndex((m) => m.kind === "merge" && m.id === 1094);
+  assert.ok(mergeA !== -1 && (advanceB === -1 || mergeA < advanceB));
 });
 
 test("train (#1063): already-blocked sibling stops before implementing the next", async () => {

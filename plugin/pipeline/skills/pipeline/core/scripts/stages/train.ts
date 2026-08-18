@@ -1,9 +1,11 @@
-// Operator-authorized integrated train (#901 / #1023 / #1028 / #1063).
+// Operator-authorized integrated train (#901 / #1023 / #1028 / #1063 / #1096).
 //
 // Advance-only (`merge: false`): base-eligible frontier waves (loop recovery).
-// `--merge` / Tugboat ship: **serial** — merge-first R2D, at most one implement
-// at a time, STOP on blocked/needs-human. Never start a sibling. That is the
-// anti-PR-farm rule. `pipeline loop` keeps frontier parallelism.
+// `--merge` / ship: **serial** — merge-first prelude merges every already-R2D
+// open mergeable PR and proves base containment before any plan/implement.
+// A merge-first log line is not compliance. At most one implement at a time.
+// STOP on blocked/needs-human. Never start a sibling. That is the anti-PR-farm
+// rule. `pipeline loop` keeps frontier parallelism.
 //
 // Unit tests inject TrainDeps — no real network, git, or subprocess in tests.
 
@@ -187,6 +189,120 @@ export async function reconcileMergedPrIntegration(
     return { kind: "integrated", mergeCommitOid: obs.mergeCommitOid };
   }
   return { kind: "containment-failed", mergeCommitOid: obs.mergeCommitOid, tip };
+}
+
+/** Outcome of the shared merge+containment surface used by prelude and merge wave. */
+export type MergeReadyToDeployResult =
+  | { kind: "integrated"; pr: number; mergeCommitOid: string | null; already: boolean }
+  | { kind: "stop"; blocker: string; pr: number | null; mergeCommitOid: string | null };
+
+/**
+ * Existing issue-PR merge surface + base containment. Prelude and the
+ * post-advance merge wave both call this; it is not a second merge policy.
+ */
+export async function mergeReadyToDeployItem(
+  issue: number,
+  baseBranch: string,
+  deps: Pick<
+    TrainDeps,
+    | "getPrForIssue"
+    | "getPrForIssueAnyState"
+    | "observePr"
+    | "mergeIssuePr"
+    | "fetchBase"
+    | "baseTip"
+    | "isAncestor"
+    | "log"
+  >,
+): Promise<MergeReadyToDeployResult> {
+  const pr = await deps.getPrForIssue(issue);
+  if (pr == null) {
+    const anyPr = await deps.getPrForIssueAnyState(issue);
+    if (anyPr != null) {
+      const recon = await reconcileMergedPrIntegration(anyPr, baseBranch, deps);
+      if (recon.kind === "integrated") {
+        const oidNote =
+          recon.mergeCommitOid != null
+            ? ` merge ${recon.mergeCommitOid.slice(0, 12)}… in ${baseBranch}`
+            : "";
+        deps.log(`[train] #${issue}: already integrated (PR #${anyPr}${oidNote})`);
+        return {
+          kind: "integrated",
+          pr: anyPr,
+          mergeCommitOid: recon.mergeCommitOid,
+          already: true,
+        };
+      }
+      if (recon.kind === "containment-failed") {
+        return {
+          kind: "stop",
+          blocker:
+            `merge result ${recon.mergeCommitOid} for #${issue} PR #${anyPr} is not contained in ` +
+            `fetched ${baseBranch} tip ${recon.tip}`,
+          pr: anyPr,
+          mergeCommitOid: recon.mergeCommitOid,
+        };
+      }
+    }
+    return {
+      kind: "stop",
+      blocker: `issue #${issue} is ready-to-deploy but has no linked open PR`,
+      pr: null,
+      mergeCommitOid: null,
+    };
+  }
+
+  let obs = await deps.observePr(pr);
+  if (obs.state !== "merged") {
+    deps.log(`[train] #${issue}: merging PR #${pr}…`);
+    try {
+      await deps.mergeIssuePr(pr);
+    } catch (err) {
+      return {
+        kind: "stop",
+        blocker: `merge failed for #${issue} PR #${pr}: ${(err as Error).message}`,
+        pr,
+        mergeCommitOid: null,
+      };
+    }
+    obs = await deps.observePr(pr);
+  }
+
+  if (obs.state !== "merged" || !obs.mergeCommitOid) {
+    return {
+      kind: "stop",
+      blocker:
+        `PR #${pr} for #${issue} is not merged with an observable merge commit ` +
+        `(state=${obs.state}, mergeCommit=${obs.mergeCommitOid ?? "null"})`,
+      pr,
+      mergeCommitOid: obs.mergeCommitOid,
+    };
+  }
+
+  deps.log(
+    `[train] #${issue}: proving merge ${obs.mergeCommitOid.slice(0, 12)}… is in origin/${baseBranch}…`,
+  );
+  await deps.fetchBase(baseBranch);
+  const tip = await deps.baseTip(baseBranch);
+  const contained = await deps.isAncestor(obs.mergeCommitOid, tip);
+  if (!contained) {
+    return {
+      kind: "stop",
+      blocker:
+        `merge result ${obs.mergeCommitOid} for #${issue} PR #${pr} is not contained in ` +
+        `fetched ${baseBranch} tip ${tip}`,
+      pr,
+      mergeCommitOid: obs.mergeCommitOid,
+    };
+  }
+
+  deps.log(`[train] #${issue}: integrated (PR #${pr})`);
+  return {
+    kind: "integrated",
+    pr,
+    mergeCommitOid: obs.mergeCommitOid,
+    already: false,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -479,6 +595,81 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
     if (item.integrated) integrated.add(issue);
   };
 
+  const applyMergeReady = (
+    issue: number,
+    merged: MergeReadyToDeployResult,
+  ): TrainResult | null => {
+    if (merged.kind === "stop") {
+      blocker = merged.blocker;
+      nextAction = "stopped";
+      pushItem({
+        issue,
+        pr: merged.pr,
+        terminal: "ready-to-deploy",
+        merge_result_oid: merged.mergeCommitOid,
+        integrated: false,
+        error: blocker,
+      });
+      deps.log(`[train] STOP: ${blocker}`);
+      return { exitCode: 1, status: status() };
+    }
+    markFinished(issue, {
+      issue,
+      pr: merged.pr,
+      terminal: merged.already ? "already-integrated" : "ready-to-deploy",
+      merge_result_oid: merged.mergeCommitOid,
+      integrated: true,
+    });
+    nextAction = "next-item";
+    return null;
+  };
+
+  /**
+   * Merge every remaining already-R2D work-list item with a linked PR.
+   * Used as the merge-first prelude and as the post-advance merge wave.
+   */
+  const mergeReadyCandidates = async (
+    candidates: readonly number[],
+  ): Promise<TrainResult | null> => {
+    for (const issue of candidates) {
+      if (finished.has(issue) || held.has(issue) || integrated.has(issue)) continue;
+      const snap = byNumber.get(issue) ?? (await deps.getIssue(issue));
+      byNumber.set(issue, snap);
+      if (pipelineStageFromLabels(snap.labels) !== "ready-to-deploy") continue;
+
+      if (held.size > 0 && !isIndependentOfHeld(issue, held, codeDeps)) {
+        blocker =
+          `cannot merge #${issue}: independence from held item(s) ` +
+          `${[...held].map((h) => `#${h}`).join(", ")} is unproven`;
+        nextAction = "stopped";
+        deps.log(`[train] STOP: ${blocker}`);
+        return { exitCode: 1, status: status() };
+      }
+
+      currentIssue = issue;
+      currentIndex = ordered.indexOf(issue);
+      nextAction = "merge";
+      const merged = await mergeReadyToDeployItem(issue, opts.baseBranch, deps);
+      const stopped = applyMergeReady(issue, merged);
+      if (stopped) return stopped;
+    }
+    return null;
+  };
+
+  const openReadyToDeployPrs = async (): Promise<number[]> => {
+    const open: number[] = [];
+    for (const issue of ordered) {
+      if (finished.has(issue) || held.has(issue) || integrated.has(issue)) continue;
+      const snap = byNumber.get(issue);
+      if (!snap || pipelineStageFromLabels(snap.labels) !== "ready-to-deploy") continue;
+      const pr = await deps.getPrForIssue(issue);
+      if (pr == null) continue;
+      const obs = await deps.observePr(pr);
+      if (obs.state === "open") open.push(issue);
+    }
+    return open;
+  };
+
   // Safety bound: frontiers recompute; avoid infinite empty thrash.
   const maxWaves = ordered.length * 4 + 4;
   for (let wave = 0; wave < maxWaves; wave++) {
@@ -533,6 +724,10 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
           return { exitCode: 1, status: status() };
         }
       }
+
+      // Merge-first prelude: already-R2D open mergeable PRs before any implement.
+      const preludeStop = await mergeReadyCandidates(ordered);
+      if (preludeStop) return preludeStop;
     }
 
     const frontier = computeBaseEligibleFrontier({
@@ -591,6 +786,17 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
     }
 
     if (toAdvance.length > 0) {
+      if (mergeMode) {
+        const openR2d = await openReadyToDeployPrs();
+        if (openR2d.length > 0) {
+          blocker =
+            `merge-first violated: would implement #${toAdvance[0]} while ready-to-deploy ` +
+            `${openR2d.map((n) => `#${n}`).join(", ")} still has an open mergeable PR`;
+          nextAction = "stopped";
+          deps.log(`[train] STOP: ${blocker}`);
+          return { exitCode: 1, status: status() };
+        }
+      }
       currentIssue = toAdvance[0]!;
       currentIndex = ordered.indexOf(currentIssue);
       nextAction = "advance";
@@ -811,154 +1017,11 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
       }
     }
 
-    // ---- Merge wave (serial) ----
+    // ---- Merge wave (serial) for items that became R2D in this advance wave ----
     if (mergeMode) {
       nextAction = "merge";
-      // Merge R2D frontier members that are not held/finished/integrated.
-      // Independent sibling may merge while a peer is parked (no dep edge).
-      for (const issue of frontier) {
-        if (finished.has(issue) || held.has(issue) || integrated.has(issue)) continue;
-        const snap = byNumber.get(issue) ?? (await deps.getIssue(issue));
-        const stage = pipelineStageFromLabels(snap.labels);
-        if (stage !== "ready-to-deploy") continue;
-
-        // If any held peer exists and independence cannot be proven, fail closed.
-        if (held.size > 0 && !isIndependentOfHeld(issue, held, codeDeps)) {
-          blocker =
-            `cannot merge #${issue}: independence from held item(s) ` +
-            `${[...held].map((h) => `#${h}`).join(", ")} is unproven`;
-          nextAction = "stopped";
-          deps.log(`[train] STOP: ${blocker}`);
-          return { exitCode: 1, status: status() };
-        }
-
-        currentIssue = issue;
-        currentIndex = ordered.indexOf(issue);
-
-        const pr = await deps.getPrForIssue(issue);
-        if (pr == null) {
-          const anyPr = await deps.getPrForIssueAnyState(issue);
-          if (anyPr != null) {
-            const recon = await reconcileMergedPrIntegration(anyPr, opts.baseBranch, deps);
-            if (recon.kind === "integrated") {
-              const oidNote =
-                recon.mergeCommitOid != null
-                  ? ` merge ${recon.mergeCommitOid.slice(0, 12)}… in ${opts.baseBranch}`
-                  : "";
-              deps.log(`[train] #${issue}: already integrated (PR #${anyPr}${oidNote})`);
-              markFinished(issue, {
-                issue,
-                pr: anyPr,
-                terminal: "already-integrated",
-                merge_result_oid: recon.mergeCommitOid,
-                integrated: true,
-              });
-              continue;
-            }
-            if (recon.kind === "containment-failed") {
-              blocker =
-                `merge result ${recon.mergeCommitOid} for #${issue} PR #${anyPr} is not contained in ` +
-                `fetched ${opts.baseBranch} tip ${recon.tip}`;
-              nextAction = "stopped";
-              pushItem({
-                issue,
-                pr: anyPr,
-                terminal: "ready-to-deploy",
-                merge_result_oid: recon.mergeCommitOid,
-                integrated: false,
-                error: blocker,
-              });
-              deps.log(`[train] STOP: ${blocker}`);
-              return { exitCode: 1, status: status() };
-            }
-          }
-          blocker = `issue #${issue} is ready-to-deploy but has no linked open PR`;
-          nextAction = "stopped";
-          pushItem({
-            issue,
-            pr: null,
-            terminal: "ready-to-deploy",
-            merge_result_oid: null,
-            integrated: false,
-            error: blocker,
-          });
-          deps.log(`[train] STOP: ${blocker}`);
-          return { exitCode: 1, status: status() };
-        }
-
-        let obs = await deps.observePr(pr);
-        if (obs.state !== "merged") {
-          deps.log(`[train] #${issue}: merging PR #${pr}…`);
-          try {
-            await deps.mergeIssuePr(pr);
-          } catch (err) {
-            blocker = `merge failed for #${issue} PR #${pr}: ${(err as Error).message}`;
-            nextAction = "stopped";
-            pushItem({
-              issue,
-              pr,
-              terminal: "ready-to-deploy",
-              merge_result_oid: null,
-              integrated: false,
-              error: blocker,
-            });
-            deps.log(`[train] STOP: ${blocker}`);
-            return { exitCode: 1, status: status() };
-          }
-          obs = await deps.observePr(pr);
-        }
-
-        if (obs.state !== "merged" || !obs.mergeCommitOid) {
-          blocker =
-            `PR #${pr} for #${issue} is not merged with an observable merge commit ` +
-            `(state=${obs.state}, mergeCommit=${obs.mergeCommitOid ?? "null"})`;
-          nextAction = "stopped";
-          pushItem({
-            issue,
-            pr,
-            terminal: "ready-to-deploy",
-            merge_result_oid: obs.mergeCommitOid,
-            integrated: false,
-            error: blocker,
-          });
-          deps.log(`[train] STOP: ${blocker}`);
-          return { exitCode: 1, status: status() };
-        }
-
-        nextAction = "wait-for-base";
-        deps.log(
-          `[train] #${issue}: proving merge ${obs.mergeCommitOid.slice(0, 12)}… is in origin/${opts.baseBranch}…`,
-        );
-        await deps.fetchBase(opts.baseBranch);
-        const tip = await deps.baseTip(opts.baseBranch);
-        const contained = await deps.isAncestor(obs.mergeCommitOid, tip);
-        if (!contained) {
-          blocker =
-            `merge result ${obs.mergeCommitOid} for #${issue} PR #${pr} is not contained in ` +
-            `fetched ${opts.baseBranch} tip ${tip}`;
-          nextAction = "stopped";
-          pushItem({
-            issue,
-            pr,
-            terminal: "ready-to-deploy",
-            merge_result_oid: obs.mergeCommitOid,
-            integrated: false,
-            error: blocker,
-          });
-          deps.log(`[train] STOP: ${blocker}`);
-          return { exitCode: 1, status: status() };
-        }
-
-        deps.log(`[train] #${issue}: integrated (PR #${pr})`);
-        markFinished(issue, {
-          issue,
-          pr,
-          terminal: "ready-to-deploy",
-          merge_result_oid: obs.mergeCommitOid,
-          integrated: true,
-        });
-        nextAction = "next-item";
-      }
+      const mergeWaveStop = await mergeReadyCandidates(frontier);
+      if (mergeWaveStop) return mergeWaveStop;
     }
 
     // Progress check: if nothing finished this wave and no advance ran, stop thrashing

@@ -154,7 +154,7 @@ test("tugboat is thin: no second ship brain / grant factory markers", () => {
   const body = fs.readFileSync(tugboat, "utf8");
   assert.match(body, /Tugboat — thin ship composer/);
   assert.doesNotMatch(body, /grant[\/_]factory|factory\.mjs/);
-  assert.doesNotMatch(body, /pipeline ship /);
+  assert.doesNotMatch(body, /owns merge order|second ship ledger|never in-engine ship/i);
   assert.match(body, /factory-release prepare --request/);
   assert.match(body, /engine-promote/);
   assert.match(body, /ENGINE_PROMOTE_HOST:-all/);
@@ -398,7 +398,7 @@ test("tugboat install-parity helper: repo pack passes; content/helpers fail clos
   // Forbidden second brain → fail.
   const secondBrain: Option1PackBodies = {
     ...canon,
-    tugboat: canon.tugboat! + "\npipeline ship --milestone v1.0.0\n",
+    tugboat: canon.tugboat! + "\ngrant_factory\n",
   };
   const failBrain = evaluateOption1PackParity(secondBrain, canon);
   assert.equal(failBrain.status, "fail");
@@ -2772,7 +2772,6 @@ test("tugboat pack phase does not sign, merge, tag, promote, or install", () => 
   const pack = shipOneBody.slice(packStart, releaseStart);
   assert.match(pack, /factory-release prepare --request/);
   assert.doesNotMatch(pack, /attestation_key|HMAC|grant[\/_]factory|factory\.mjs/);
-  assert.doesNotMatch(pack, /pipeline ship /);
   assert.doesNotMatch(pack, /release finish|engine-promote|git tag|gh release create/);
   assert.doesNotMatch(pack, /pass:\s*true|"pass": true/);
 });

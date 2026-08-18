@@ -2,8 +2,9 @@
 name: pipeline-supervisor
 description: >
   Thin Hermes skill for the private pipeline-factory Buzz channel.
-  Maps operator messages to the agent-pipeline CLI and Option 1 Tugboat ship.
-  Does not use the removed hermes-factory grant wrapper.
+  Maps operator messages to the agent-pipeline CLI. Phrase Ship milestone
+  vX.Y.Z execs pipeline ship --milestone. Does not use the removed
+  hermes-factory grant wrapper.
 ---
 
 # Pipeline supervisor (Hermes production)
@@ -16,9 +17,10 @@ Ship runbook: [docs/runbooks/ship-milestone.md](../../../docs/runbooks/ship-mile
 
 ## Absolute rules
 
-1. Call only the installed **pipeline** CLI, `run-intent.sh`, or **Tugboat**
-   for ship. Never call `~/.local/lib/hermes-factory/factory.mjs` — that pilot
-   is retired. Never invent a grant factory or second ship brain.
+1. Call only the installed **pipeline** CLI (and leftover thin detach helpers).
+   Phrase `Ship milestone vX.Y.Z` execs `pipeline ship --milestone vX.Y.Z`.
+   Never call `~/.local/lib/hermes-factory/factory.mjs` — that pilot is retired.
+   Never invent a grant factory or second ship brain. Tugboat is not the owner.
 2. Do **not** invent models, effort, stage labels, or a second state machine.
 3. Do **not** default to merge. Only pass merge when the operator is explicit
    **and** `ALLOW_MERGE=1` is set in the host environment.
@@ -78,45 +80,38 @@ export REPO_DIR PIPELINE ALLOW_MERGE
 
 For long trains, wrap with `nohup` / systemd-run and post the log path.
 
-### Ship milestone (Option 1 — Tugboat primary)
+### Ship milestone (in-engine `pipeline ship`)
 
 Operator phrase: **`Ship milestone vX.Y.Z`** (case-insensitive variants OK).
 
-Map to **Tugboat only** — not `pipeline-ship-playbook` as primary, not
-`ship-milestone.sh` / authorized `pipeline ship` as the Option 1 default.
+Map to **`pipeline ship --milestone vX.Y.Z`**. Detach if the CLI is blocking.
+Do **not** start Tugboat as the ship owner. Tugboat may remain a thin
+notify/detach adapter only.
 
 ```bash
 export REPO_DIR PIPELINE ALLOW_MERGE
-# Prefer installed binary (refresh from repo examples after engine promote):
-tugboat --milestone vX.Y.Z --detach
-# Or versioned source:
-# "$AGENT_PIPELINE_ROOT/examples/supervisor/shell/tugboat.sh" --milestone vX.Y.Z --detach
+nohup "$PIPELINE" ship --milestone vX.Y.Z --json \
+  >"$HOME/.local/state/pipeline-supervisor/ship-vX.Y.Z.log" 2>&1 &
+echo "started pipeline ship --milestone vX.Y.Z pid $!"
 ```
 
-**Live ship (#1062):** Tugboat refuses a second detach only when a live process
-cmdline is `train --merge` for that milestone (or the owning tugboat). A bare
-`playbook.pid` / `kill -0`, a per-issue `pipeline N` lock, or stale `state.json`
-alone is **not** a live ship — still detach once. Buzz and TUI paste share this
-path; do not invent a paste detector. Second Ship while live → status + notify,
-no stack.
-
-Status (no side effect — does not start train/release/promote). Does **not**
-claim `running` from a dead pid alone:
+Status (no side effect — does not start train/release/promote):
 
 ```bash
-tugboat --milestone vX.Y.Z --status
-# Prefer this over raw state.json (status rewrites stale "running")
+"$PIPELINE" ship status --milestone vX.Y.Z --json
 ```
 
-State/logs: `~/.local/state/pipeline-supervisor/ship-vX.Y.Z/`.
+Read the Pipeline ship ledger. Do not treat Tugboat `ship-vX.Y.Z/state.json`
+as the product status surface.
 
-Tugboat composes: train → FRG pack (`factory-release prepare`) → release
-(bare version, **no** `--skip-frg`) → wait CI green → release finish → wait
-GitHub Release → `engine-promote --host all`. `--skip-frg` /
-`TUGBOAT_SKIP_FRG=1` is an operator escape and requires a logged reason
-(`--skip-frg-reason` or `TUGBOAT_SKIP_FRG_REASON`). Skip is not the default.
-Failure lines include phase reason (blocker / err tail). Do not reimplement
-those phases in Hermes.
+Default sequence is train `--merge` → FRG pack → release (no `--skip-frg`) →
+wait CI green → `release finish` → wait GitHub Release → `engine-promote`.
+`--skip-frg` is an operator escape with a logged reason, not the default.
+
+On notify of a **non-human** failure, re-invoke the same
+`pipeline ship --milestone vX.Y.Z` argv only. Do **not** classify, delete a
+run directory, wait a cooldown, or invent `pipeline single` / `pipeline loop`.
+If `pipeline ship status` reports human authority, stop and report that state.
 
 ### Release (manual steps — rarely needed when Tugboat runs)
 
@@ -152,8 +147,8 @@ report typed status and do not guess one.
 | `train milestone vX.Y.Z` | `run-intent.sh 'train milestone vX.Y.Z'` |
 | `train issues 1 2 3` | `run-intent.sh 'train issues 1,2,3'` |
 | same + `and merge` | only if `ALLOW_MERGE=1` |
-| `Ship milestone vX.Y.Z` / `ship milestone vX.Y.Z` | **Tugboat** `--milestone vX.Y.Z --detach` if `ALLOW_MERGE=1`. **Never** `pipeline single` / `pipeline loop` during ship (#1063). Train `--merge` is serial: STOP on block, do not start the next sibling. |
-| `ship status vX.Y.Z` / `Ship status vX.Y.Z` | **Tugboat** `--milestone vX.Y.Z --status` (state only) |
+| `Ship milestone vX.Y.Z` / `ship milestone vX.Y.Z` | `pipeline ship --milestone vX.Y.Z` (detach if blocking) if `ALLOW_MERGE=1`. **Never** `pipeline single` / `pipeline loop` during ship (#1063). Train `--merge` is serial: merge-first R2D, STOP on block, do not start the next sibling. |
+| `ship status vX.Y.Z` / `Ship status vX.Y.Z` | `pipeline ship status --milestone vX.Y.Z` (Pipeline ledger only) |
 | `release prepare 1.34.0` | `pipeline release 1.34.0 --no-edit` |
 | `release finish 123` | `pipeline release finish 123` if `ALLOW_MERGE=1` |
 | `stop` | stop the detached tugboat/ship process for that milestone if known; do not invent rollback |
@@ -162,6 +157,6 @@ report typed status and do not guess one.
 
 - Not the removed grant-envelope factory under `ops/hermes-factory`
 - Not a durable outer ledger — GitHub + pipeline run state are truth
-- Not Option 2 in-engine `pipeline ship` as the Buzz primary path (parked)
+- Not a Tugboat-owned ship state machine — Tugboat is not the product owner
 - Not MessagingPort / ship-auth issuer product work (#966–#968, #973)
 - Not a second merge policy — only `ALLOW_MERGE=1` + Pipeline CLI verbs

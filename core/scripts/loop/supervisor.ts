@@ -95,6 +95,7 @@ import {
   type StageProgressTableRow,
 } from "./stage-progress.ts";
 import {
+  classifyHolderInterrupt,
   isCoexistenceFailureEvidence,
   probeLiveAdvance,
   isConcurrentHolderEvidence,
@@ -413,6 +414,42 @@ async function revertCapacityWaitItem(
   const newLedger: LoopLedger = { ...ledger, items: { ...ledger.items, [input.itemId]: updated } };
   await writeLedger(store, newLedger, input.token);
   await appendEvent(store, input.runId, input.token, "loop_item_capacity_wait", {
+    item_id: input.itemId,
+  });
+  return newLedger;
+}
+
+/**
+ * Dead-holder takeover (#1096): return the same item to pending without
+ * recording coexistence_wait and without charging workflow-engine-defect.
+ */
+async function takeoverDeadHolderItem(
+  store: LoopStoreDeps,
+  input: { runId: string; token: string; itemId: string; engine: LoopEngineName },
+): Promise<LoopLedger> {
+  const ledger = await readLedger(store, input.runId);
+  const item = ledger.items[input.itemId];
+  if (!item) return ledger;
+  if (item.state !== "in_progress" && item.state !== "blocked") return ledger;
+  const time = store.now().toISOString();
+  const updated: LoopItemLedgerEntry = {
+    ...item,
+    state: "pending",
+    blocked_theme: undefined,
+    history: [
+      ...item.history,
+      {
+        time,
+        from: item.state,
+        to: "pending",
+        engine: input.engine,
+        note: "dead-holder interrupt — takeover of the same item (no coexistence wait, no restart_workflow_engine)",
+      },
+    ],
+  };
+  const newLedger: LoopLedger = { ...ledger, items: { ...ledger.items, [input.itemId]: updated } };
+  await writeLedger(store, newLedger, input.token);
+  await appendEvent(store, input.runId, input.token, "loop_item_dead_holder_takeover", {
     item_id: input.itemId,
   });
   return newLedger;
@@ -1538,6 +1575,22 @@ export async function runSupervisorCycle(
       }).catch(() => {});
       continue;
     }
+    if (
+      item.blocked_theme === "workflow-engine-defect" &&
+      classifyHolderInterrupt({
+        holderLive: false,
+        leftoverHarnessFailure: true,
+      }) === "resume-eligible-interrupt"
+    ) {
+      ledger = await takeoverDeadHolderItem(deps.store, {
+        runId,
+        token,
+        itemId: item.id,
+        engine,
+      });
+      recoveryProgress = true;
+      continue;
+    }
     const advanceLock = deps.acquireItemAdvanceLock
       ? await deps.acquireItemAdvanceLock(item.id)
       : undefined;
@@ -2306,7 +2359,15 @@ export async function runSupervisorCycle(
             });
         const concurrentHolder =
           probe.live && isConcurrentHolderEvidence(probe.evidence);
-        if (isCoexistenceFailureEvidence(errText) || concurrentHolder) {
+        const interrupt = classifyHolderInterrupt({
+          holderLive: probe.live,
+          concurrentHolder,
+          leftoverHarnessFailure: /harness-failure|engine_internal_crash/i.test(errText),
+        });
+        if (
+          interrupt === "coexistence_wait" ||
+          (probe.live && isCoexistenceFailureEvidence(errText))
+        ) {
           coexistenceNoOp = true;
           ledger = await revertCapacityWaitItem(deps.store, { runId, token, itemId, engine });
           evidenceOutcome = "coexistence_wait";
@@ -2315,6 +2376,15 @@ export async function runSupervisorCycle(
             evidence: concurrentHolder ? probe.evidence : "dispatch_text",
             raw_outcome: errText,
           }).catch(() => {});
+        } else if (interrupt === "resume-eligible-interrupt") {
+          const alreadyResumed = (itemEntry?.history ?? []).some((h) =>
+            String(h.note ?? "").includes("dead-holder interrupt"),
+          );
+          if (!alreadyResumed) {
+            coexistenceNoOp = true;
+            ledger = await takeoverDeadHolderItem(deps.store, { runId, token, itemId, engine });
+            evidenceOutcome = "dead_holder_takeover";
+          }
         }
       }
 

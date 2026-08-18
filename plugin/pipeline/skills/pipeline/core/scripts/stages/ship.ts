@@ -14,6 +14,23 @@ import { homedir } from "node:os";
 
 export const SHIP_SCHEMA_VERSION = 1;
 export const SHIP_AUTHORIZATION_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
+/** Stable identity for operator `pipeline ship --milestone` (no grant document). */
+export const OPERATOR_SHIP_SENDER = "operator-cli";
+export const OPERATOR_SHIP_FINGERPRINT = "operator-milestone";
+export const OPERATOR_SHIP_EVENT_ID = "0".repeat(64);
+
+export function operatorShipIntent(coordinates: ShipCoordinates): ShipIntent {
+  return {
+    repository: coordinates.repository,
+    base_branch: coordinates.base_branch,
+    milestone: coordinates.milestone,
+    version: coordinates.version,
+    event_id: OPERATOR_SHIP_EVENT_ID,
+    sender_id: OPERATOR_SHIP_SENDER,
+    channel_id: OPERATOR_SHIP_SENDER,
+    thread_id: OPERATOR_SHIP_SENDER,
+  };
+}
 
 export const SHIP_AUTHORIZED_ACTIONS = [
   "train_merge",
@@ -153,6 +170,10 @@ export interface ShipStatus extends ShipProgress {
   complete: boolean;
   updated_at: string;
   last_error: string | null;
+  /** True when the current stop is human authority (hosts must not re-invoke). */
+  human_authority?: boolean;
+  current_item?: number | null;
+  last_durable_stage?: string | null;
 }
 
 export interface ShipPhaseEvent {
@@ -615,6 +636,9 @@ async function persist(
 ): Promise<ShipStatus> {
   validateProgress(progress, status.intent, status.train_plan);
   const action = nextAction(progress);
+  const humanAuthority =
+    typeof lastError === "string" &&
+    /needs-human|missing-authority|human.authority|specification-decision/i.test(lastError);
   const updated: ShipStatus = {
     ...status,
     ...progress,
@@ -623,6 +647,7 @@ async function persist(
     complete: action === "complete",
     updated_at: deps.now().toISOString(),
     last_error: lastError,
+    ...(humanAuthority ? { human_authority: true as const } : {}),
   };
   await deps.state.writeAtomic(status.ship_key, updated);
   return updated;
@@ -648,26 +673,31 @@ async function persistTrainPlan(
 
 export async function runShipCoordinator(
   expectedRaw: ShipIntent,
-  authorizationRaw: unknown,
+  authorizationRaw: unknown | null,
   deps: ShipCoordinatorDeps,
 ): Promise<ShipStatus> {
   const expected = normalizeIntent(expectedRaw);
-  const authorization = validateBuzzShipAuthorization(
-    authorizationRaw,
-    expected,
-    deps.now(),
-    deps.authorizationPublicKey,
-  );
+  const operatorMode = authorizationRaw == null;
+  const authorization = operatorMode
+    ? null
+    : validateBuzzShipAuthorization(
+        authorizationRaw,
+        expected,
+        deps.now(),
+        deps.authorizationPublicKey,
+      );
   const coordinateKey = shipKey(expected);
   return deps.withRunLock(shipBaseLockKey(expected), async () => {
   // Recheck the signed grant after lock acquisition and before every phase.
-  const requireActiveAuthorization = (): BuzzShipAuthorization =>
+  const requireActiveAuthorization = (): void => {
+    if (operatorMode) return;
     validateBuzzShipAuthorization(
       authorizationRaw,
       expected,
       deps.now(),
       deps.authorizationPublicKey,
     );
+  };
   requireActiveAuthorization();
   const eventsFile = deps.state.eventsFile(coordinateKey);
   if (!path.isAbsolute(eventsFile)) throw new Error("ship state: events_file must be an absolute path");
@@ -686,8 +716,18 @@ export async function runShipCoordinator(
     if (status.events_file !== eventsFile) {
       throw new Error("ship status events_file does not match the active host state adapter");
     }
-    const sameAuthorization = sameIntent(status.intent, expected) &&
-      status.authorization_fingerprint === authorization.fingerprint;
+    const fingerprint = operatorMode
+      ? OPERATOR_SHIP_FINGERPRINT
+      : authorization!.fingerprint;
+    const sameCoordinates =
+      status.intent.repository === expected.repository &&
+      status.intent.base_branch === expected.base_branch &&
+      status.intent.milestone === expected.milestone &&
+      status.intent.version === expected.version;
+    const sameAuthorization = operatorMode
+      ? sameCoordinates
+      : sameIntent(status.intent, expected) &&
+        status.authorization_fingerprint === fingerprint;
     if (!sameAuthorization) {
       if (status.complete || deps.now().getTime() < Date.parse(status.authorization_expires_at)) {
         throw new Error("ship status belongs to a different active authorization");
@@ -697,9 +737,11 @@ export async function runShipCoordinator(
         ...status,
         run_id: shipRunId(expected),
         intent: expected,
-        authorization_fingerprint: authorization.fingerprint,
+        authorization_fingerprint: fingerprint,
         authorized_at: now,
-        authorization_expires_at: authorization.expires_at,
+        authorization_expires_at: operatorMode
+          ? "9999-12-31T00:00:00.000Z"
+          : authorization!.expires_at,
         revision: status.revision + 1,
         updated_at: now,
         last_error: null,
@@ -714,9 +756,13 @@ export async function runShipCoordinator(
       ship_key: coordinateKey,
       run_id: shipRunId(expected),
       intent: expected,
-      authorization_fingerprint: authorization.fingerprint,
+      authorization_fingerprint: operatorMode
+        ? OPERATOR_SHIP_FINGERPRINT
+        : authorization!.fingerprint,
       authorized_at: now,
-      authorization_expires_at: authorization.expires_at,
+      authorization_expires_at: operatorMode
+        ? "9999-12-31T00:00:00.000Z"
+        : authorization!.expires_at,
       events_file: eventsFile,
       train_plan: null,
       revision: 0,

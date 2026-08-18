@@ -65,8 +65,11 @@ advance loop never auto-advances from it to `ready-to-deploy`.
 ### Merge authority boundary
 
 `/pipeline`, `/pipeline single`, and `/pipeline loop` never invoke merge.
-`/pipeline merge <pr>` and `/pipeline merge-queue --apply` are loop-isolated,
-operator-authorized surfaces. `merge-queue` is dry-run by default.
+`/pipeline merge <pr>`, `/pipeline merge-queue --apply`, `pipeline train --merge`,
+and `pipeline ship --milestone` are loop-isolated, operator-authorized surfaces.
+`merge-queue` is dry-run by default. `pipeline ship --milestone` does not
+require a grant file. Phrase `Ship milestone vX.Y.Z` execs
+`pipeline ship --milestone vX.Y.Z`.
 
 External supervisors may invoke those same loop-isolated merge commands
 under operator authority. This repository does not ship a Hermes/Buzz factory
@@ -94,6 +97,7 @@ distinct `pipeline:<command>` entries in the skill/command menu.
 /pipeline override <n> "<key>: <reason>"        Disposition a review finding and auto-resume the advance loop
 /pipeline release <version> [--theme "..."] [--dry-run] Prepare a release PR for the given version (never tags, merges, or publishes)
 /pipeline remove-worktree <n> [--force]         Remove a managed pipeline worktree for an issue (optional --force)
+/pipeline ship --milestone vX.Y.Z [--json] | ship status --milestone vX.Y.Z [--json] Run or inspect one durable milestone shipment (train --merge, release, finish, promote). Phrase Ship milestone vX.Y.Z execs this command; no grant file required.
 /pipeline status <n>                            Read-only — print stage, blocker, PR, last review
 /pipeline unblock <n> "<answer>"                Post an answer and clear the blocked label
 /pipeline backfill [--apply] [--capability <name>] Preview or apply OpenSpec coverage for legacy behavior (spec-only PR)

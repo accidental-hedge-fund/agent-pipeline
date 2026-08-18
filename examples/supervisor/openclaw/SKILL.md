@@ -23,8 +23,11 @@ export PIPELINE="${PIPELINE_BIN:-pipeline}"
 ```
 
 Map operator natural language to the short intent strings in the wrapper
-(`single N`, `train issues …`, `train milestone …`). Prefer deterministic
-regex extraction of issue numbers and milestone titles over free-form CLI invention.
+(`single N`, `train issues …`, `train milestone …`). Phrase
+`Ship milestone vX.Y.Z` execs `pipeline ship --milestone vX.Y.Z` (detach if
+blocking). Status: `pipeline ship status --milestone vX.Y.Z`. Prefer
+deterministic regex extraction of issue numbers and milestone titles over
+free-form CLI invention.
 
 ## Isolation tips
 
