@@ -31,3 +31,7 @@ node_modules/
 # Durable control-attribution ledger written by `pipeline correction attribute`;
 # local-only, never committed.
 .agent-pipeline/control-attributions.jsonl
+
+# Local Factory Reliability Gate (FRG) evidence including latest.json;
+# engine-written, never committed on the factory control checkout.
+.agent-pipeline/frg/

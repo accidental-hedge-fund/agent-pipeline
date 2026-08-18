@@ -211,7 +211,7 @@ pipeline labels via `ensurePipelineLabels`, scaffolds a commented
 notice, if the file already exists), and ensures a sentinel-delimited
 engine-managed block in `.gitignore` covering every local-only artifact
 directory the engine writes — `.agent-pipeline/runs/`, `.agent-pipeline/roadmap/`,
-`.agent-pipeline/history/`, and `.agent-pipeline/evals/`. The `.gitignore` step creates the file if absent,
+`.agent-pipeline/history/`, `.agent-pipeline/evals/`, and `.agent-pipeline/frg/`. The `.gitignore` step creates the file if absent,
 appends the block if missing (preserving every pre-existing byte), or refreshes
 only the block's contents when it is present and stale. It is idempotent and
 additive — a normal `$pipeline N` run still self-creates any missing labels, so

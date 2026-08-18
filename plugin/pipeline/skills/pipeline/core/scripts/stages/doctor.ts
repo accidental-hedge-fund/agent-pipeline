@@ -48,6 +48,11 @@ import {
   evaluateInstalledShipPlaybookPromoteHost,
 } from "../ship-playbook-promote-host.ts";
 import {
+  defaultInstalledShipComposerPaths,
+  evaluateInstalledShipComposerSkipFrg,
+  type InstalledComposerBody,
+} from "../ship-composer-skip-frg.ts";
+import {
   canonicalOption1PackPaths,
   defaultInstalledOption1PackPaths,
   evaluateOption1PackParity,
@@ -1099,6 +1104,33 @@ export function buildPreflightChecks(
         pathLabel: playbookPath,
         enginePromoteHostEnv: process.env.ENGINE_PROMOTE_HOST,
       });
+      if (verdict.status === "pass") return pass(verdict.detail);
+      if (verdict.status === "skip") return skip(verdict.detail);
+      return fail(verdict.detail, verdict.remediation);
+    },
+  });
+
+  // 13b. Installed Tugboat / ship playbook default skip-FRG argv (#1127).
+  //      A copied ~/.local/bin composer that still hard-codes default skip
+  //      on release or promote silently bypasses FRG. Fail closed with refresh
+  //      remediation. Absence of both installed composers is skip.
+  checks.push({
+    id: "supervisor:ship-composer-skip-frg",
+    description:
+      "Installed Tugboat or pipeline-ship-playbook (if present) does not hard-code default --skip-frg",
+    run: async (deps) => {
+      const paths = defaultInstalledShipComposerPaths();
+      const load = async (
+        p: string,
+        kind: InstalledComposerBody["kind"],
+      ): Promise<InstalledComposerBody> => {
+        if (!(await deps.fsExists(p))) return { path: p, body: null, kind };
+        return { path: p, body: await deps.readTextFile(p), kind };
+      };
+      const verdict = evaluateInstalledShipComposerSkipFrg([
+        await load(paths.tugboat, "tugboat"),
+        await load(paths.playbook, "playbook"),
+      ]);
       if (verdict.status === "pass") return pass(verdict.detail);
       if (verdict.status === "skip") return skip(verdict.detail);
       return fail(verdict.detail, verdict.remediation);

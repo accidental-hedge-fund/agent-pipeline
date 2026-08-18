@@ -449,6 +449,42 @@ test("engine-promote: skip_frg true skips FRG without --skip-frg and logs config
   assert.ok(!logs.some((l) => /skipping Factory Reliability Gate for 1\.34\.0 \(--skip-frg\)/.test(l)));
 });
 
+test("engine-promote: non-skip promote records exported pin path not worktree repoDir (#1127)", async () => {
+  const factoryPin = "/factory/.agent-pipeline/production-engine-pin.json";
+  let seenOverride: string | null | undefined;
+  let seenRepoDir: string | undefined;
+  const promoted = pin("1.39.3");
+  promoted.frg_run_id = "frg-abc";
+  const deps = makeDeps({
+    async promote({ repoDir, overridePath, allowWithoutFrg, version }) {
+      seenRepoDir = repoDir;
+      seenOverride = overridePath ?? null;
+      assert.equal(allowWithoutFrg, false);
+      assert.doesNotMatch(version, /no-frg/);
+      return { ok: true, pin: promoted, path: factoryPin, reinstall_hint: "npx #v1.39.3" };
+    },
+    async loadPin() {
+      return { kind: "missing", path: factoryPin };
+    },
+  });
+  const result = await runEnginePromote(
+    opts({
+      version: "1.39.3",
+      repoDir: "/worktrees/pipeline-promote",
+      pinPath: factoryPin,
+      skipInstall: true,
+    }),
+    deps,
+  );
+  assert.equal(result.error, undefined);
+  assert.equal(seenRepoDir, "/worktrees/pipeline-promote");
+  assert.equal(seenOverride, factoryPin);
+  assert.equal(result.pin_path, factoryPin);
+  assert.equal(result.pin?.frg_run_id, "frg-abc");
+  assert.ok(result.pin?.frg_evidence_path);
+  assert.doesNotMatch(result.pin?.frg_run_id ?? "", /^no-frg-/);
+});
+
 test("engine-promote: --skip-frg still skips when skip_frg is unset or false (#1092)", async () => {
   const logs: string[] = [];
   let seenAllow: boolean | undefined;

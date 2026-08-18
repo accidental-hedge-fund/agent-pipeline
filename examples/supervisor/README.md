@@ -14,13 +14,13 @@ They only map intent → `pipeline` CLI. They are **not** a second control plane
 
 | Script | Purpose |
 |---|---|
-| **`tugboat.sh`** | **Option 1 primary ship composer (Buzz / agent-box):** train → FRG pack → release (no `--skip-frg`) → wait CI green → release finish → wait GitHub Release → `engine-promote --host all`. Detach + `--status`. `--skip-frg` is a logged-reason escape only. No grant factory, no second ship brain. |
+| **`tugboat.sh`** | **Option 1 primary ship composer (Buzz / agent-box):** train → FRG pack → release (no `--skip-frg`) → wait CI green → release finish → wait GitHub Release → `engine-promote --host all`. Detach + `--status`. Exports `AGENT_PIPELINE_PRODUCTION_PIN` to the factory pin when unset. `--skip-frg` is a logged-reason escape only. No grant factory, no second ship brain. |
 | `ship-notify.sh` | Optional Buzz status posts; **no-op** without messenger env (shared with Tugboat). Retries transient send failures; audits under `$PIPELINE_SUPERVISOR_STATE/notify/` (`audit.log`, `failed/*`); still exit 0 so ship never blocks on delivery. |
 | `ship-stage-watch.sh` | Stream one explicit run event file through `material-filter.mjs` (shared) |
 | `train-status-complete.py` | Pure helper: last `train_status` complete gate from mixed prose+JSON (`raw_decode`) |
 | `release-checks-green.py` | Pure helper: release PR checks green from `gh pr checks --json` (`bucket` schema) |
 | `run-intent.sh` | Map a short intent string → `pipeline train` / `single` |
-| `pipeline-launcher.sh` | Resolve installed `pipeline` without hardcoding host paths |
+| `pipeline-launcher.sh` | Resolve installed `pipeline` without hardcoding host paths. On the factory control plane, exports `AGENT_PIPELINE_PRODUCTION_PIN` when unset. |
 | `frg-pack-helpers.sh` | Secret-free `factory-release prepare` request writer + pack-tick classifier. Sourced by the playbook. Tugboat inlines the same helpers. |
 | `pipeline-ship-playbook.sh` | **Alternate / legacy** chain-to-existing-tools ship (same phase idea as Tugboat; not the primary Buzz path on agent-box after Option 1) |
 | `ship-milestone.sh` | **Non-primary / parked product surface:** authorized request adapter for in-engine `pipeline ship` (not Option 1 Buzz default) |

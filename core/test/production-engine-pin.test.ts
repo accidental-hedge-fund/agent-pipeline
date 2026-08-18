@@ -25,6 +25,8 @@ import {
   parseProductionEnginePin,
   pinInstallProvenanceMatches,
   productionPinPath,
+  defaultFactoryProductionPinPath,
+  resolveExportedFactoryProductionPin,
   promoteProductionPin,
   isFactoryControlPackageMeta,
   ownerRepoFromPackageRepository,
@@ -171,6 +173,37 @@ test("productionPinPath: env wins over default", () => {
   assert.equal(
     productionPinPath("/repo", null, { [PRODUCTION_PIN_ENV]: "/env/pin.json" }),
     path.resolve("/env/pin.json"),
+  );
+});
+
+test("resolveExportedFactoryProductionPin: unset env defaults to factory pin (#1127)", () => {
+  assert.equal(
+    resolveExportedFactoryProductionPin({
+      existing: null,
+      factoryControlCheckout: "/factory",
+    }),
+    defaultFactoryProductionPinPath("/factory"),
+  );
+  assert.equal(
+    defaultFactoryProductionPinPath("/factory"),
+    path.resolve("/factory", PRODUCTION_ENGINE_PIN_REL),
+  );
+});
+
+test("resolveExportedFactoryProductionPin: operator override is preserved (#1127)", () => {
+  assert.equal(
+    resolveExportedFactoryProductionPin({
+      existing: "/custom/pin.json",
+      factoryControlCheckout: "/factory",
+    }),
+    "/custom/pin.json",
+  );
+  assert.equal(
+    resolveExportedFactoryProductionPin({
+      existing: "   ",
+      factoryControlCheckout: "/factory",
+    }),
+    defaultFactoryProductionPinPath("/factory"),
   );
 });
 
@@ -988,6 +1021,47 @@ test("promoteProductionPin: default refuses no-frg run_id — no mutation (#1041
   assert.equal(files.has(`${PIN_PATH}.tmp`), false);
 });
 
+test("promoteProductionPin: exported pin path is written, not worktree pin (#1127)", async () => {
+  const factoryPin = "/factory/.agent-pipeline/production-engine-pin.json";
+  const worktreePin =
+    "/worktrees/pipeline-promote/.agent-pipeline/production-engine-pin.json";
+  const { deps, files } = memFs({
+    [worktreePin]: JSON.stringify(
+      validPin({
+        version: "1.39.1",
+        tag: "v1.39.1",
+        frg_run_id: "no-frg-1.39.1",
+        frg_evidence_path: null,
+      }),
+    ),
+  });
+  const result = await promoteProductionPin({
+    repoDir: "/worktrees/pipeline-promote",
+    version: "1.39.3",
+    overridePath: factoryPin,
+    fsDeps: deps,
+    env: { [PRODUCTION_PIN_ENV]: factoryPin },
+    lookupFrg: async () => ({
+      kind: "pass",
+      evidence: passEvidence("1.39.3", "frg-abc"),
+    }),
+    now: FIXED_NOW,
+  });
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.path, path.resolve(factoryPin));
+  assert.equal(result.pin.version, "1.39.3");
+  assert.equal(result.pin.frg_run_id, "frg-abc");
+  assert.ok(result.pin.frg_evidence_path);
+  assert.equal(isProductionQualityPin(result.pin), true);
+  assert.doesNotMatch(result.pin.frg_run_id, /^no-frg-/);
+  const written = parseProductionEnginePin(files.get(path.resolve(factoryPin))!);
+  assert.equal(written.frg_run_id, "frg-abc");
+  const worktree = parseProductionEnginePin(files.get(worktreePin)!);
+  assert.equal(worktree.frg_run_id, "no-frg-1.39.1");
+  assert.equal(worktree.version, "1.39.1");
+});
+
 test("promoteProductionPin: default does not write no-frg marker without skip (#1041)", async () => {
   const existing = validPin();
   const before = JSON.stringify(existing);
@@ -1020,6 +1094,7 @@ test("promoteProductionPin: allowWithoutFrg promotes without FRG evidence", asyn
     version: "1.34.0",
     allowWithoutFrg: true,
     fsDeps: deps,
+    env: {},
     lookupFrg: async () => {
       lookupCalls += 1;
       return { kind: "missing", path: "/nope" };

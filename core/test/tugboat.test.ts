@@ -195,6 +195,14 @@ test("tugboat supports serial multi-milestone and single-host lock", () => {
   // Escape still passes --skip-frg via SKIP_FRG_ARGS; pack is omitted.
   assert.match(shipOneBody, /SKIP_FRG_ARGS=\(--skip-frg\)/);
   assert.match(shipOneBody, /phase frg-pack: omitted \(skip-frg escape\)/);
+  // #1127: factory pin export so promote and next-train doctor share one path.
+  assert.match(body, /export_factory_production_pin/);
+  assert.match(
+    body,
+    /export AGENT_PIPELINE_PRODUCTION_PIN="\$REPO_DIR\/\.agent-pipeline\/production-engine-pin\.json"/,
+  );
+  assert.match(body, /if \[\[ -n "\$\{AGENT_PIPELINE_PRODUCTION_PIN:-\}" \]\]/);
+  assert.match(body, /AGENT_PIPELINE_PRODUCTION_PIN="\$\{AGENT_PIPELINE_PRODUCTION_PIN:-\}"/);
   // No parallel fan-out of milestones (ignore prose comments about "ship brain").
   assert.doesNotMatch(body, /xargs\s+-P/);
   assert.doesNotMatch(body, /&\s*ship_one\b/);
@@ -987,6 +995,127 @@ test("playbook frg-pack-helpers.sh stays in sync with tugboat pack helpers", () 
       extractNamedFn(help, name, "frg-pack-helpers.sh"),
       `${name} drifted between tugboat.sh and frg-pack-helpers.sh`,
     );
+  }
+});
+
+test("tugboat export_factory_production_pin sets factory pin when unset (#1127)", () => {
+  const src = fs.readFileSync(tugboat, "utf8");
+  const fn = extractNamedFn(src, "export_factory_production_pin", "tugboat.sh");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-pin-export-"));
+  try {
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        'REPO_DIR="/factory/control"',
+        "unset AGENT_PIPELINE_PRODUCTION_PIN",
+        fn,
+        "export_factory_production_pin",
+        'printf "%s" "$AGENT_PIPELINE_PRODUCTION_PIN"',
+        "",
+      ].join("\n"),
+    );
+    const r = spawnSync("bash", [runner], { encoding: "utf8" });
+    assert.equal(r.status, 0, `export runner exited ${r.status}: ${r.stderr}`);
+    assert.equal(
+      r.stdout,
+      "/factory/control/.agent-pipeline/production-engine-pin.json",
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("tugboat export_factory_production_pin preserves operator override (#1127)", () => {
+  const src = fs.readFileSync(tugboat, "utf8");
+  const fn = extractNamedFn(src, "export_factory_production_pin", "tugboat.sh");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-pin-keep-"));
+  try {
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        'REPO_DIR="/factory/control"',
+        'AGENT_PIPELINE_PRODUCTION_PIN="/custom/pin.json"',
+        fn,
+        "export_factory_production_pin",
+        'printf "%s" "$AGENT_PIPELINE_PRODUCTION_PIN"',
+        "",
+      ].join("\n"),
+    );
+    const r = spawnSync("bash", [runner], { encoding: "utf8" });
+    assert.equal(r.status, 0, `export runner exited ${r.status}: ${r.stderr}`);
+    assert.equal(r.stdout, "/custom/pin.json");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("scripts/pipeline-launcher.mjs exports factory pin when unset (#1127)", () => {
+  const launcher = path.join(repoRoot, "scripts/pipeline-launcher.mjs");
+  const body = fs.readFileSync(launcher, "utf8");
+  assert.match(body, /AGENT_PIPELINE_PRODUCTION_PIN/);
+  assert.match(body, /AGENT_PIPELINE_FACTORY_CONTROL/);
+  assert.match(body, /production-engine-pin\.json/);
+  assert.match(body, /Do not invent a pin for an ordinary product repo/);
+});
+
+test("host pipeline-launcher.sh exports factory pin when unset and preserves override (#1127)", () => {
+  const launcher = path.join(repoRoot, "examples/supervisor/shell/pipeline-launcher.sh");
+  const body = fs.readFileSync(launcher, "utf8");
+  assert.match(body, /AGENT_PIPELINE_PRODUCTION_PIN/);
+  assert.match(body, /AGENT_PIPELINE_FACTORY_CONTROL/);
+  assert.match(
+    body,
+    /export AGENT_PIPELINE_PRODUCTION_PIN="\$REPO_DIR\/\.agent-pipeline\/production-engine-pin\.json"/,
+  );
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "launcher-pin-"));
+  try {
+    const snippet = body.match(
+      /# Factory control plane[\s\S]*?fi\nfi/,
+    );
+    assert.ok(snippet, "launcher factory-pin export block missing");
+    const unsetRunner = path.join(dir, "unset.sh");
+    fs.writeFileSync(
+      unsetRunner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        "unset AGENT_PIPELINE_PRODUCTION_PIN",
+        'REPO_DIR="/factory/control"',
+        snippet[0],
+        'printf "%s" "$AGENT_PIPELINE_PRODUCTION_PIN"',
+        "",
+      ].join("\n"),
+    );
+    const unset = spawnSync("bash", [unsetRunner], { encoding: "utf8" });
+    assert.equal(unset.status, 0, unset.stderr);
+    assert.equal(
+      unset.stdout,
+      "/factory/control/.agent-pipeline/production-engine-pin.json",
+    );
+    const keepRunner = path.join(dir, "keep.sh");
+    fs.writeFileSync(
+      keepRunner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        'AGENT_PIPELINE_PRODUCTION_PIN="/custom/pin.json"',
+        'REPO_DIR="/factory/control"',
+        snippet[0],
+        'printf "%s" "$AGENT_PIPELINE_PRODUCTION_PIN"',
+        "",
+      ].join("\n"),
+    );
+    const keep = spawnSync("bash", [keepRunner], { encoding: "utf8" });
+    assert.equal(keep.status, 0, keep.stderr);
+    assert.equal(keep.stdout, "/custom/pin.json");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 

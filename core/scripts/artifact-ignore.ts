@@ -93,6 +93,15 @@ export const LINEAGE_ARTIFACT: ArtifactContractEntry = {
     "Intent-lineage evidence graph (nodes/edges; #599); host-local, never committed.",
 };
 
+/** Local Factory Reliability Gate (FRG) evidence (#1127), including
+ *  `<X.Y.Z>/latest.json`. Engine-written on the factory control checkout;
+ *  never committed there. Release MAY `git add -f` one version's evidence. */
+export const FRG_ARTIFACT: ArtifactContractEntry = {
+  name: "frg",
+  comment:
+    "Local FRG evidence including latest.json; engine-written, never committed on the factory control checkout.",
+};
+
 /** Ordered contract of every `.agent-pipeline/` directory (or file) the
  *  engine writes. No other module SHALL independently define an
  *  `.agent-pipeline/` artifact path — derive it from an entry here instead. */
@@ -106,6 +115,7 @@ export const ARTIFACT_CONTRACT: readonly ArtifactContractEntry[] = [
   HANDOFFS_ARTIFACT,
   OUTCOMES_ARTIFACT,
   LINEAGE_ARTIFACT,
+  FRG_ARTIFACT,
 ];
 
 /** Resolve `<repoDir>/.agent-pipeline/<entry.name>` for a contract entry. */

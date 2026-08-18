@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   ARTIFACT_CONTRACT,
   RUNS_ARTIFACT,
@@ -40,7 +41,7 @@ function makeFakeFs(initial: string | null): { deps: ArtifactIgnoreDeps; get(): 
 // Contract (drift guard, #5.1/#5.3)
 // ---------------------------------------------------------------------------
 
-test("ARTIFACT_CONTRACT: contains exactly runs/, roadmap/, history/, evals/, control-attributions.jsonl, product-fault-reports.jsonl, handoffs/, outcomes/, and lineage/ with non-empty comments", () => {
+test("ARTIFACT_CONTRACT: contains exactly runs/, roadmap/, history/, evals/, control-attributions.jsonl, product-fault-reports.jsonl, handoffs/, outcomes/, lineage/, and frg/ with non-empty comments", () => {
   const names = ARTIFACT_CONTRACT.map((e) => e.name);
   assert.deepEqual(names, [
     "runs",
@@ -52,10 +53,24 @@ test("ARTIFACT_CONTRACT: contains exactly runs/, roadmap/, history/, evals/, con
     "handoffs",
     "outcomes",
     "lineage",
+    "frg",
   ]);
   for (const entry of ARTIFACT_CONTRACT) {
     assert.ok(entry.comment.length > 0, `entry ${entry.name} must have a non-empty comment`);
   }
+});
+
+test("ARTIFACT_CONTRACT: includes .agent-pipeline/frg/ (regression for #1127)", () => {
+  assert.ok(
+    ARTIFACT_CONTRACT.some((e) => e.name === "frg"),
+    "contract must include the frg artifact directory",
+  );
+  const block = renderArtifactIgnoreBlock();
+  assert.ok(block.includes(".agent-pipeline/frg/"), "rendered block must list frg/");
+  assert.match(
+    ARTIFACT_CONTRACT.find((e) => e.name === "frg")!.comment,
+    /latest\.json|FRG/i,
+  );
 });
 
 test("ARTIFACT_CONTRACT: control-attributions.jsonl is a file entry, ignored without a trailing slash", () => {
@@ -63,6 +78,13 @@ test("ARTIFACT_CONTRACT: control-attributions.jsonl is a file entry, ignored wit
   const block = renderArtifactIgnoreBlock();
   assert.ok(block.includes(".agent-pipeline/control-attributions.jsonl\n"));
   assert.ok(!block.includes(".agent-pipeline/control-attributions.jsonl/"));
+});
+
+test("repo .gitignore lists .agent-pipeline/frg/ so uncommitted latest.json is ignored (#1127)", () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+  const gitignore = fs.readFileSync(path.join(repoRoot, ".gitignore"), "utf8");
+  assert.match(gitignore, /^\.agent-pipeline\/frg\/$/m);
+  assert.doesNotMatch(gitignore, /skip-worktree/);
 });
 
 test("ARTIFACT_CONTRACT: includes .agent-pipeline/history/ (regression for #452)", () => {

@@ -1444,6 +1444,51 @@ test("check install:engine-track — product pinned without factory authority �
   });
 });
 
+test("check install:engine-track — exported factory pin wins over worktree no-frg pin (#1127)", async () => {
+  const factoryPin = "/factory/.agent-pipeline/production-engine-pin.json";
+  const worktreePin = "/worktrees/pipeline-promote/.agent-pipeline/production-engine-pin.json";
+  const saved = process.env[PRODUCTION_PIN_ENV];
+  process.env[PRODUCTION_PIN_ENV] = factoryPin;
+  try {
+    const r = await getCheck(
+      makeConfig({
+        repo: "accidental-hedge-fund/agent-pipeline",
+        engine_track: "pinned",
+        repo_dir: "/worktrees/pipeline-promote",
+      }),
+      "install:engine-track",
+      "1.39.3",
+    ).run(
+      fakeDeps({
+        readTextFile: (p) => {
+          if (p === factoryPin) {
+            return pinJson("1.39.3");
+          }
+          if (p === worktreePin) {
+            return JSON.stringify({
+              schema_version: 1,
+              version: "1.39.1",
+              tag: "v1.39.1",
+              frg_run_id: "no-frg-1.39.1",
+              frg_evidence_path: null,
+              promoted_at: "2026-08-01T00:00:00Z",
+              previous: null,
+            });
+          }
+          if (p.endsWith(".pipeline-install-receipt.json")) return receiptJson("1.39.3");
+          return '{"version":"1.39.3"}';
+        },
+      }),
+    );
+    assert.equal(r.status, "pass");
+    assert.match(r.detail, /1\.39\.3/);
+    assert.doesNotMatch(r.detail, /no-frg-1\.39\.1/);
+  } finally {
+    if (saved === undefined) delete process.env[PRODUCTION_PIN_ENV];
+    else process.env[PRODUCTION_PIN_ENV] = saved;
+  }
+});
+
 test("check install:engine-track — product pinned with pin path override uses override", async () => {
   const pinPath = "/factory/control/.agent-pipeline/production-engine-pin.json";
   const r = await getCheck(
@@ -1554,6 +1599,71 @@ test("check supervisor:ship-playbook-promote-host — skips when playbook is not
 test("check supervisor:ship-playbook-promote-host — additive stable id", () => {
   const ids = buildPreflightChecks(makeConfig(), FAKE_VERSION, FAKE_INSTALL_ROOT).map((c) => c.id);
   assert.ok(ids.includes("supervisor:ship-playbook-promote-host"));
+});
+
+test("check supervisor:ship-composer-skip-frg — fails on hard-coded default skip-frg", async () => {
+  const check = getCheck(makeConfig(), "supervisor:ship-composer-skip-frg");
+  const legacy =
+    '"$PIPELINE" engine-promote --for "$version" --host "$HOST" --skip-frg --json\n';
+  const r = await check.run(
+    fakeDeps({
+      fsExists: (p) => p.includes("pipeline-ship-playbook"),
+      readTextFile: (p) => (p.includes("pipeline-ship-playbook") ? legacy : '{"version":"1.0.0"}'),
+    }),
+  );
+  assertFailWithRemediation(r);
+  assert.match(r.detail, /skip-frg/);
+  assert.match(r.remediation!, /pipeline-ship-playbook\.sh|#1127/i);
+});
+
+test("check supervisor:ship-composer-skip-frg — fails on installed Tugboat skip-frg default", async () => {
+  const check = getCheck(makeConfig(), "supervisor:ship-composer-skip-frg");
+  const legacy =
+    '"$PIPELINE" release "$version" --no-edit --skip-frg\n';
+  const r = await check.run(
+    fakeDeps({
+      option1PackInstalled: true,
+      fsExists: (p) => p.includes("/tugboat") && !p.includes("examples"),
+      readTextFile: (p) =>
+        p.includes("/tugboat") && !p.includes("examples") ? legacy : '{"version":"1.0.0"}',
+    }),
+  );
+  assertFailWithRemediation(r);
+  assert.match(r.detail, /skip-frg/);
+  assert.match(r.remediation!, /tugboat\.sh|#1127/i);
+});
+
+test("check supervisor:ship-composer-skip-frg — passes current escape-only argv", async () => {
+  const check = getCheck(makeConfig(), "supervisor:ship-composer-skip-frg");
+  const current = [
+    "SKIP_FRG_ARGS=()",
+    'SKIP_FRG_ARGS=(--skip-frg)',
+    '"$PIPELINE" release "$version" --no-edit "${SKIP_FRG_ARGS[@]}"',
+    '"$PIPELINE" engine-promote --for "$version" --host "$HOST" "${SKIP_FRG_ARGS[@]}" --json',
+    "",
+  ].join("\n");
+  const r = await check.run(
+    fakeDeps({
+      fsExists: (p) => p.includes("pipeline-ship-playbook") || p.endsWith(`${path.sep}tugboat`),
+      readTextFile: () => current,
+    }),
+  );
+  assert.equal(r.status, "pass");
+});
+
+test("check supervisor:ship-composer-skip-frg — skips when no composer is installed", async () => {
+  const check = getCheck(makeConfig(), "supervisor:ship-composer-skip-frg");
+  const r = await check.run(
+    fakeDeps({
+      fsExists: () => false,
+    }),
+  );
+  assert.equal(r.status, "skip");
+});
+
+test("check supervisor:ship-composer-skip-frg — additive stable id", () => {
+  const ids = buildPreflightChecks(makeConfig(), FAKE_VERSION, FAKE_INSTALL_ROOT).map((c) => c.id);
+  assert.ok(ids.includes("supervisor:ship-composer-skip-frg"));
 });
 
 /** fsExists for Option 1 pack: installed tugboat + helpers + install-root canon. */

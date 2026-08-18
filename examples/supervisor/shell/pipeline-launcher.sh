@@ -40,6 +40,17 @@ resolve() {
 
 resolved=$(resolve) || exit 2
 
+# Factory control plane (#1127): export the factory pin when unset so
+# engine-promote and the next train doctor share one path. Do not overwrite
+# an operator value. Do not invent a pin for an ordinary product repo.
+if [[ -z "${AGENT_PIPELINE_PRODUCTION_PIN:-}" ]]; then
+  if [[ -n "${AGENT_PIPELINE_FACTORY_CONTROL:-}" ]]; then
+    export AGENT_PIPELINE_PRODUCTION_PIN="$AGENT_PIPELINE_FACTORY_CONTROL/.agent-pipeline/production-engine-pin.json"
+  elif [[ -n "${REPO_DIR:-}" ]]; then
+    export AGENT_PIPELINE_PRODUCTION_PIN="$REPO_DIR/.agent-pipeline/production-engine-pin.json"
+  fi
+fi
+
 if [[ "${PIPELINE_LAUNCHER_PRINT:-0}" == "1" ]]; then
   printf '%s\n' "$resolved"
   exit 0
