@@ -105,7 +105,6 @@ jobs:
       - name: Verify Factory Reliability Gate evidence
         id: frg
         if: steps.exists.outputs.exists == 'false'
-        continue-on-error: true
         env:
           PIPELINE_FRG_ATTESTATION_KEY: ${{ secrets.PIPELINE_FRG_ATTESTATION_KEY }}
         run: |

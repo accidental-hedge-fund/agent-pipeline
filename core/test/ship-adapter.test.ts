@@ -257,15 +257,15 @@ test("ship adapter returns the one frozen train plan from its planning seam", as
   assert.deepEqual(await deps.planTrain(intent), { ordered_issues: [11, 10] });
 });
 
-test("ship adapter continues when FRG evidence is missing", async () => {
+test("ship adapter fails closed with the exact existing FRG next action", async () => {
   const deps = shipCoordinatorDepsFromOperations(operations({
     observeFrg: async () => null,
   }), { state });
 
-  const pack = await deps.convergeFrgPack(intent, train);
-  assert.equal(pack.complete, true);
-  assert.equal(pack.loop_run_id, `no-frg-${intent.version}`);
-  assert.equal(pack.candidate_head_oid, train.integrated_head_oid);
+  await assert.rejects(
+    deps.convergeFrgPack(intent, train),
+    /pipeline factory-release prepare --request <absolute-request\.json> --json/,
+  );
 });
 
 test("ship adapter never rebinds provenance-free FRG evidence to a candidate", () => {

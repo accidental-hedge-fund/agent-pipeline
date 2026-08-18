@@ -1,5 +1,9 @@
 # Lessons
 
+- When the operator says finish ship **including FRG**, a `--skip-frg` tag/promote
+  is not done. Optional-FRG / `no-frg-*` is not “rip FRG out.” Keep fixing the
+  score path until `latest.json` is `pass: true` and promote has no `--skip-frg`,
+  or delete FRG from the product. Do not pick a third path.
 - When several stage failures all become `blocked`, inspect the outer supervisor before adding
   stage-local retries. A configured recovery policy with untouched budgets is evidence that the
   orchestration contract is dead or bypassed.

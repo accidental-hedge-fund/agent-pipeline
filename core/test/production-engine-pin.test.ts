@@ -948,9 +948,10 @@ test("promoteProductionPin: success from FRG pass retains previous", async () =>
   }
 });
 
-test("promoteProductionPin: missing FRG writes no-frg pin (ship does not die on FRG)", async () => {
+test("promoteProductionPin: refuses missing FRG — no mutation", async () => {
   const existing = validPin();
-  const { deps, files } = memFs({ [PIN_PATH]: JSON.stringify(existing) });
+  const before = JSON.stringify(existing);
+  const { deps, files } = memFs({ [PIN_PATH]: before });
   const result = await promoteProductionPin({
     repoDir: REPO,
     version: "1.30.0",
@@ -962,14 +963,9 @@ test("promoteProductionPin: missing FRG writes no-frg pin (ship does not die on 
       path: "/repo/.agent-pipeline/frg/1.30.0/latest.json",
     }),
   });
-  assert.equal(result.ok, true);
-  if (result.ok) {
-    assert.equal(result.pin.frg_run_id, "no-frg-1.30.0");
-    assert.equal(result.pin.frg_evidence_path, null);
-  }
-  const written = files.get(PIN_PATH);
-  assert.ok(written);
-  assert.match(written, /no-frg-1\.30\.0/);
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.code, "missing_frg");
+  assert.equal(files.get(PIN_PATH), before);
 });
 
 test("promoteProductionPin: default refuses no-frg run_id — no mutation (#1041)", async () => {
@@ -992,9 +988,10 @@ test("promoteProductionPin: default refuses no-frg run_id — no mutation (#1041
   assert.equal(files.has(`${PIN_PATH}.tmp`), false);
 });
 
-test("promoteProductionPin: missing FRG on 1.37.0 writes no-frg marker so ship can promote", async () => {
+test("promoteProductionPin: default does not write no-frg marker without skip (#1041)", async () => {
   const existing = validPin();
-  const { deps, files } = memFs({ [PIN_PATH]: JSON.stringify(existing) });
+  const before = JSON.stringify(existing);
+  const { deps, files } = memFs({ [PIN_PATH]: before });
   const result = await promoteProductionPin({
     repoDir: REPO,
     version: "1.37.0",
@@ -1006,11 +1003,12 @@ test("promoteProductionPin: missing FRG on 1.37.0 writes no-frg marker so ship c
       path: "/repo/.agent-pipeline/frg/1.37.0/latest.json",
     }),
   });
-  assert.equal(result.ok, true);
-  if (result.ok) assert.equal(result.pin.frg_run_id, "no-frg-1.37.0");
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.code, "missing_frg");
+  assert.equal(files.get(PIN_PATH), before);
   const written = files.get(PIN_PATH);
   assert.ok(written);
-  assert.match(written, /no-frg-1\.37\.0/);
+  assert.doesNotMatch(written, /no-frg-1\.37\.0/);
 });
 
 test("promoteProductionPin: allowWithoutFrg promotes without FRG evidence", async () => {

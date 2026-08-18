@@ -367,13 +367,25 @@ export function shipCoordinatorDepsFromOperations(
       const retainedTrain = rememberTrain({ ...train, completed_at: trainEvidence.completed_at });
       const evidence = await observeValidatedFrg(intent, retainedTrain, true);
       if (!evidence) {
-        return {
-          version: intent.version,
-          complete: true,
-          loop_run_id: `no-frg-${intent.version}`,
-          pack_id: "factory-gate-v1",
-          candidate_head_oid: trainEvidence.integrated_head_oid,
-        };
+        if (isPostPilotReleaseVersion(intent.version)) {
+          throw new Error(
+            `ship FRG: no release-eligible candidate artifact for v${intent.version}. ` +
+              `Auto-generate genuine FRG via the durable path (not a synthetic trivial pack):\n` +
+              `  pipeline factory-release prepare --request <absolute-request.json> --json\n` +
+              `Multi-tick protocol: first call starts/resumes a bound pack loop and ` +
+              `returns in_progress; after the loop is scored --from-run (no --observations) ` +
+              `it returns awaiting_frg_attestation; after the production-owned attestor ` +
+              `stores the MAC, the next unchanged call returns complete (or write attested ` +
+              `latest.json and retry ship). ` +
+              `Hybrid pilot remains valid only for exactly v${FRG_HYBRID_PILOT_VERSION}.`,
+          );
+        }
+        throw new Error(
+          `ship FRG: no release-eligible candidate artifact for v${intent.version}. ` +
+            `Complete the shipped fixed pack, run ` +
+            `pipeline factory-gate --for ${intent.version} --from-run <loop-run-id> ` +
+            `--observations <file>, then retry the same ship command.`,
+        );
       }
       return projectFrgPack(intent, trainEvidence, evidence);
     },
@@ -384,16 +396,7 @@ export function shipCoordinatorDepsFromOperations(
         throw new Error("ship FRG: candidate base changed before scoring; run the same ship command to reconcile");
       }
       const evidence = await observeValidatedFrg(intent, train, true);
-      if (!evidence) {
-        return {
-          version: intent.version,
-          pass: true,
-          loop_run_id: pack.loop_run_id,
-          frg_run_id: pack.loop_run_id,
-          candidate_head_oid: pack.candidate_head_oid,
-        };
-      }
-      if (evidence.loop_run_id !== pack.loop_run_id || evidence.pack_id !== pack.pack_id) {
+      if (!evidence || evidence.loop_run_id !== pack.loop_run_id || evidence.pack_id !== pack.pack_id) {
         throw new Error("ship FRG: the release-eligible artifact changed between pack and score checks");
       }
       return projectFrg(intent, pack, evidence);
@@ -412,7 +415,8 @@ export function shipCoordinatorDepsFromOperations(
     async convergeReleaseFinish(intent, release) {
       const train = await reobserveRememberedTrain(intent, release.candidate_head_oid);
       if (!train) throw new Error("ship release: train candidate cannot be revalidated before finish");
-      await observeValidatedFrg(intent, train, true);
+      const frg = await observeValidatedFrg(intent, train, true);
+      if (!frg) throw new Error("ship release: FRG evidence is no longer valid before finish");
       const existing = await operations.observeRelease(intent, release.candidate_head_oid);
       if (existing?.finish) return existing.finish;
       if (existing && (existing.prepare.pr !== release.pr || existing.prepare.head_oid !== release.head_oid)) {
