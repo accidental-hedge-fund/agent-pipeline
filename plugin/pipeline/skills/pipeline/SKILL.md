@@ -58,10 +58,13 @@ advance loop never auto-advances from it to `ready-to-deploy`.
 ### Merge authority boundary
 
 `/pipeline`, `/pipeline:single`, and `/pipeline:loop` never invoke merge.
-`/pipeline:merge <pr>` and `/pipeline:merge-queue --apply` are loop-isolated,
-operator-authorized surfaces. `merge-queue` is dry-run by default.
+`/pipeline:merge <pr>`, `/pipeline:merge-queue --apply`, `pipeline train --merge`,
+and `pipeline ship --milestone` are loop-isolated, operator-authorized surfaces.
+`merge-queue` is dry-run by default. `pipeline ship --milestone` does not
+require a grant file. Phrase `Ship milestone vX.Y.Z` execs
+`pipeline ship --milestone vX.Y.Z`.
 
-External supervisors may invoke those same loop-isolated merge commands
+External supervisors may invoke those same loop-isolated merge and ship commands
 under operator authority. This repository does not ship a Hermes/Buzz factory
 control plane, grant schema, or second durable scheduler. Merge authority is
 not repository configuration (`.github/pipeline.yml` cannot authorize merges).
@@ -88,7 +91,7 @@ distinct `pipeline:<command>` entries in the skill/command menu.
 /pipeline recover-parked <n> [--json] [--dry-run] One supervisor pass for a parked issue: deterministic recover first, then reflow only stale/DNR/below-high residuals (never auto-override HIGH/CRITICAL/security); re-enter single if clear
 /pipeline release <version> [--theme "..."] [--dry-run|--json] [--no-edit] [--skip-frg] | release finish <pr> [--json] Prepare a release PR from the matching GitHub milestone plan (or finish-merge one); never tags or publishes (workflows do; auto-tag also refreshes tag-derived CHANGELOG); --dry-run reports milestone presence/open issues
 /pipeline remove-worktree <n> [--force]         Remove a managed pipeline worktree for an issue (optional --force)
-/pipeline ship --milestone <m> --for <X.Y.Z> --authorization <absolute-json> --json | ship status --milestone <m> --for <X.Y.Z> --json Run or inspect one exact, Buzz-authorized release shipment through train, FRG, release, and engine promotion
+/pipeline ship --milestone vX.Y.Z [--json] | ship status --milestone vX.Y.Z [--json] Run or inspect one durable milestone shipment (train --merge, release, finish, promote). Operator product is pipeline ship --milestone vX.Y.Z; no grant file required.
 /pipeline status <n>                            Read-only — print stage, blocker, PR, last review
 /pipeline train --milestone <m>|--issues <n,n> [--merge] [--json] Operator-authorized integrate train: base-eligible frontiers advance via one loop wave each (recovery inside the wave); optionally serial-merge with base containment; independent R2D siblings may merge while a peer is parked (never called by the advance loop)
 /pipeline unblock <n> "<answer>"                Post an answer and clear the blocked label

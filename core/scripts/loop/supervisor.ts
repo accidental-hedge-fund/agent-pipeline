@@ -53,7 +53,7 @@ import {
   transitionItem,
   type ReconcileObserveDeps,
 } from "./reconcile.ts";
-import { blockItem, completeRecoveryAttempt, startRecoveryAttempt, upgradeContractForRecovery, upgradeLedgerForRecovery } from "./recovery.ts";
+import { blockItem, completeRecoveryAttempt, fingerprintEvidence, startRecoveryAttempt, upgradeContractForRecovery, upgradeLedgerForRecovery } from "./recovery.ts";
 import { waitItem } from "./pause.ts";
 import { computeExternalDependencyStatuses, detectDependencyDeadlock, propagateSkips } from "./dependencies.ts";
 import { detectChangedFileOverlap, selectSchedulableSet } from "./schedule.ts";
@@ -95,6 +95,7 @@ import {
   type StageProgressTableRow,
 } from "./stage-progress.ts";
 import {
+  classifyHolderInterrupt,
   isCoexistenceFailureEvidence,
   probeLiveAdvance,
   isConcurrentHolderEvidence,
@@ -414,6 +415,133 @@ async function revertCapacityWaitItem(
   await writeLedger(store, newLedger, input.token);
   await appendEvent(store, input.runId, input.token, "loop_item_capacity_wait", {
     item_id: input.itemId,
+  });
+  return newLedger;
+}
+
+/**
+ * Crash/kill signals that may take over a dead holder. Generic dispatch
+ * rejections stay on the existing defect-recovery path (#515 / #1020).
+ */
+function isDeadHolderInterruptSignal(errText: string, rawOutcome: unknown): boolean {
+  if (rawOutcome === "engine_internal_crash") return true;
+  return /harness-failure|engine_internal_crash|SIGTERM|SIGKILL/i.test(errText);
+}
+
+function alreadyTypedNonDefectBlock(item: LoopItemLedgerEntry | undefined): boolean {
+  return (
+    item?.state === "blocked" &&
+    typeof item.blocked_theme === "string" &&
+    item.blocked_theme !== "workflow-engine-defect"
+  );
+}
+
+const DEAD_HOLDER_TAKEOVER_KIND = "dead-holder-interrupt";
+
+function encodeDeadHolderTakeoverEvidence(holderRunId: string, crashFingerprint: string): string {
+  return JSON.stringify({
+    kind: DEAD_HOLDER_TAKEOVER_KIND,
+    holder_run_id: holderRunId,
+    crash_fingerprint: crashFingerprint,
+  });
+}
+
+function parseDeadHolderTakeoverEvidence(
+  evidence: string | undefined,
+): { holderRunId: string; fingerprint: string } | null {
+  if (!evidence) return null;
+  try {
+    const parsed = JSON.parse(evidence) as {
+      kind?: unknown;
+      holder_run_id?: unknown;
+      crash_fingerprint?: unknown;
+    };
+    if (
+      parsed.kind !== DEAD_HOLDER_TAKEOVER_KIND ||
+      typeof parsed.holder_run_id !== "string" ||
+      parsed.holder_run_id.length === 0 ||
+      typeof parsed.crash_fingerprint !== "string" ||
+      parsed.crash_fingerprint.length === 0
+    ) {
+      return null;
+    }
+    return { holderRunId: parsed.holder_run_id, fingerprint: parsed.crash_fingerprint };
+  } catch {
+    return null;
+  }
+}
+
+/** True only for the same holder/run identity and crash fingerprint.
+ *  A leftover "dead-holder interrupt" note must not suppress a later independent kill. */
+function sameDeadHolderInterruptAlreadyTakenOver(
+  history: readonly { evidence?: string }[],
+  holderRunId: string,
+  crashFingerprint: string,
+): boolean {
+  if (!holderRunId || !crashFingerprint) return false;
+  return history.some((h) => {
+    const parsed = parseDeadHolderTakeoverEvidence(h.evidence);
+    return parsed?.holderRunId === holderRunId && parsed.fingerprint === crashFingerprint;
+  });
+}
+
+function currentDeadHolderIdentity(input: {
+  startLinkageRunId?: string;
+  responseRunId?: string;
+  itemAdvanceRunId?: string;
+  preDispatchRunId?: string;
+}): string {
+  return (
+    input.startLinkageRunId ||
+    input.responseRunId ||
+    input.itemAdvanceRunId ||
+    input.preDispatchRunId ||
+    ""
+  );
+}
+
+/**
+ * Dead-holder takeover (#1096): return the same item to pending without
+ * recording coexistence_wait and without charging workflow-engine-defect.
+ */
+async function takeoverDeadHolderItem(
+  store: LoopStoreDeps,
+  input: {
+    runId: string;
+    token: string;
+    itemId: string;
+    engine: LoopEngineName;
+    holderRunId: string;
+    crashFingerprint: string;
+  },
+): Promise<LoopLedger> {
+  const ledger = await readLedger(store, input.runId);
+  const item = ledger.items[input.itemId];
+  if (!item) return ledger;
+  if (item.state !== "in_progress" && item.state !== "blocked") return ledger;
+  const time = store.now().toISOString();
+  const updated: LoopItemLedgerEntry = {
+    ...item,
+    state: "pending",
+    blocked_theme: undefined,
+    history: [
+      ...item.history,
+      {
+        time,
+        from: item.state,
+        to: "pending",
+        engine: input.engine,
+        note: "dead-holder interrupt — takeover of the same item (no coexistence wait, no restart_workflow_engine)",
+        evidence: encodeDeadHolderTakeoverEvidence(input.holderRunId, input.crashFingerprint),
+      },
+    ],
+  };
+  const newLedger: LoopLedger = { ...ledger, items: { ...ledger.items, [input.itemId]: updated } };
+  await writeLedger(store, newLedger, input.token);
+  await appendEvent(store, input.runId, input.token, "loop_item_dead_holder_takeover", {
+    item_id: input.itemId,
+    holder_run_id: input.holderRunId,
+    crash_fingerprint: input.crashFingerprint,
   });
   return newLedger;
 }
@@ -1819,6 +1947,12 @@ export async function runSupervisorCycle(
   // host's local clock is unsound under clock skew, so both snapshots here are GitHub-authored —
   // never compared against `deps.observe.now()`).
   const labelEventsBeforeDispatchByItem = new Map<string, { label: string; createdAt: string }[]>();
+  const preDispatchAdvanceRunIdByItem = new Map<string, string>();
+  const startLinkageByItem = new Map<string, string>();
+  for (const itemId of activeItemIds) {
+    const existing = ledger.items[itemId]?.advance_run_id;
+    if (existing) preDispatchAdvanceRunIdByItem.set(itemId, existing);
+  }
   await Promise.allSettled(
     activeItemIds.map(async (itemId) => {
       const events = await deps.observe.getLabelEvents(Number(itemId));
@@ -1888,6 +2022,7 @@ export async function runSupervisorCycle(
       try {
         const response = await deps.dispatchItem(buildRequest(itemId), {
           onAdvanceLinked: async (linkage) => {
+            startLinkageByItem.set(itemId, linkage.pipeline_run_id);
             startLinkage = linkage;
             await appendEvent(deps.store, runId, token, LOOP_ITEM_ADVANCE_LINKED, {
               item_id: linkage.item_id,
@@ -2306,7 +2441,15 @@ export async function runSupervisorCycle(
             });
         const concurrentHolder =
           probe.live && isConcurrentHolderEvidence(probe.evidence);
-        if (isCoexistenceFailureEvidence(errText) || concurrentHolder) {
+        const interrupt = classifyHolderInterrupt({
+          holderLive: probe.live,
+          concurrentHolder,
+          leftoverHarnessFailure: /harness-failure|engine_internal_crash/i.test(errText),
+        });
+        if (
+          interrupt === "coexistence_wait" ||
+          (probe.live && isCoexistenceFailureEvidence(errText))
+        ) {
           coexistenceNoOp = true;
           ledger = await revertCapacityWaitItem(deps.store, { runId, token, itemId, engine });
           evidenceOutcome = "coexistence_wait";
@@ -2315,6 +2458,46 @@ export async function runSupervisorCycle(
             evidence: concurrentHolder ? probe.evidence : "dispatch_text",
             raw_outcome: errText,
           }).catch(() => {});
+        } else if (interrupt === "resume-eligible-interrupt") {
+          const responseRunId =
+            typeof response?.evidence.pipeline_run_id === "string" &&
+            response.evidence.pipeline_run_id.length > 0
+              ? response.evidence.pipeline_run_id
+              : undefined;
+          const currentHolderRunId = currentDeadHolderIdentity({
+            startLinkageRunId: startLinkageByItem.get(itemId),
+            responseRunId,
+            itemAdvanceRunId: itemEntry?.advance_run_id,
+            preDispatchRunId: preDispatchAdvanceRunIdByItem.get(itemId),
+          });
+          const crashFingerprint = fingerprintEvidence(
+            `${String(rawOutcomeByItem.get(itemId) ?? "")}\n${errText}`,
+          );
+          const alreadyResumed = sameDeadHolderInterruptAlreadyTakenOver(
+            itemEntry?.history ?? [],
+            currentHolderRunId,
+            crashFingerprint,
+          );
+          const priorOrLinkedHolder =
+            preDispatchAdvanceRunIdByItem.has(itemId) || startLinkageByItem.has(itemId);
+          if (
+            !alreadyResumed &&
+            !alreadyTypedNonDefectBlock(itemEntry) &&
+            priorOrLinkedHolder &&
+            currentHolderRunId.length > 0 &&
+            isDeadHolderInterruptSignal(errText, rawOutcomeByItem.get(itemId))
+          ) {
+            coexistenceNoOp = true;
+            ledger = await takeoverDeadHolderItem(deps.store, {
+              runId,
+              token,
+              itemId,
+              engine,
+              holderRunId: currentHolderRunId,
+              crashFingerprint,
+            });
+            evidenceOutcome = "dead_holder_takeover";
+          }
         }
       }
 

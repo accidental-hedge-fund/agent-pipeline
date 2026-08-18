@@ -1,13 +1,18 @@
-# Ship milestone (Option 1 — Tugboat)
+# Ship milestone (`pipeline ship --milestone`)
 
-**Primary path for agent-box / Buzz:** the thin host composer
-`examples/supervisor/shell/tugboat.sh`. It sequences existing Pipeline CLI verbs
-plus wait and notify. It is not a second control plane and not in-engine
-`pipeline ship`.
+**Primary path:** `pipeline ship --milestone vX.Y.Z`. That command is the
+in-engine ship product. It composes existing verbs: `train --merge` →
+(semver) `release` → wait checks → `release finish` → wait GitHub Release →
+`engine-promote`. It does not invent a second merge policy or grant schema.
 
-Phrase: **`Ship milestone vX.Y.Z`** → detach Tugboat for that milestone.  
-Status: **`tugboat --milestone vX.Y.Z --status`** (prefer over raw `state.json`;
-status does not claim `running` from a dead pid alone — #1062).
+Phrase: **`Ship milestone vX.Y.Z`** → `pipeline ship --milestone vX.Y.Z`
+(detach if the CLI is blocking).  
+Status: **`pipeline ship status --milestone vX.Y.Z`** (Pipeline ship ledger).
+Tugboat `--status` / `ship-vX.Y.Z/` is not the product status surface.
+
+Tugboat may remain a thin notify or detach adapter. It is **not** the product
+owner. Closed #1001 Option 1 and open #971 must not be read as a ban on
+in-engine `pipeline ship`.
 
 **Live ship (#1062):** a second detach is refused only when a live process
 cmdline is `train --merge` for that milestone, or the owning tugboat. Bare
@@ -26,14 +31,14 @@ no live flock holder do not block a later Ship.
 `*factory-control*` are refused.
 
 Contract: [supervisor.md](../supervisor.md)  
-Epic / hardening: #1001 / #927 / #1062
+Epic / hardening: #1096 (in-engine durable ship). #1001 / #971 do not ban this path.
 
 ## Ownership
 
 | Concern | Owner |
 |---|---|
 | Train, merge policy, release, promote decisions | Pipeline CLI (`train`, `release`, `release finish`, `engine-promote`) |
-| Phase sequence, wait CI / Release, failure detail, notify | **Tugboat** (host composer) |
+| Phase sequence, wait CI / Release, failure detail, notify | **Pipeline ship ledger** (hosts notify from exact child-run identities) |
 | Detached process, logs, state dir | host (`nohup` + `PIPELINE_SUPERVISOR_STATE`) |
 | Material progress during train (optional) | shared `ship-stage-watch.sh` + `material-filter.mjs` |
 | Buzz delivery | shared `ship-notify.sh` (no-op without messenger env; best-effort with retry + audit) |
@@ -146,7 +151,7 @@ Hardened behaviors (preserve):
 | #996 | Never call release-finish while checks are pending/failed |
 | #997 | Failed phase notify/state includes blocker or err tail (not only `exit N`) |
 | Idempotent | Existing open PR titled `release: X.Y.Z …` is reused |
-| Thinness | No grant factory / `pipeline ship` product path inside Tugboat |
+| Thinness | No grant factory or second merge policy inside Tugboat. Tugboat is not the ship owner. |
 
 ## FRG pack is part of thin ship
 
@@ -165,14 +170,14 @@ log. A skip promote writes `frg_run_id` `no-frg-<X.Y.Z>` and
 `frg_evidence_path` null. That pin is not production-quality. Default promote
 requires a real FRG `run_id` and evidence path.
 
-## Alternate / legacy paths (not primary Buzz)
+## Thin adapters (not the product owner)
 
 ### Chain playbook (`pipeline-ship-playbook.sh`)
 
 Documented **alternate** composition for hosts that still install it. Same
-general train → release → finish → promote idea. **Not** the Option 1 primary
-Buzz path after #1001 / #927. If installed, keep promote default `:-all` and
-pass doctor `supervisor:ship-playbook-promote-host` (#989).
+general train → release → finish → promote idea. **Not** the product owner.
+If installed, keep promote default `:-all` and pass doctor
+`supervisor:ship-playbook-promote-host` (#989).
 
 ```bash
 install -m 0755 "$ROOT/examples/supervisor/shell/pipeline-ship-playbook.sh" \
@@ -181,11 +186,10 @@ install -m 0644 "$ROOT/examples/supervisor/shell/frg-pack-helpers.sh" \
   "$HOME/.local/bin/frg-pack-helpers.sh"
 ```
 
-### Authorized `ship-milestone.sh` / in-engine `pipeline ship`
+### Grant-style `ship-milestone.sh --authorization`
 
-Parked / non-primary product surface (ship-auth issuer, grant-style admission).
-Not required for Option 1 Buzz. Do not present it as the default
-`Ship milestone vX.Y.Z` mapping on agent-box.
+Parked unused grant admission. **Not** the operator surface. Operator
+invocation is `pipeline ship --milestone vX.Y.Z` with no grant file.
 
 ## Doctor
 
@@ -219,6 +223,6 @@ failure is observational and must not stop or advance a ship.
 - Gateway/session heartbeat product tuning as a ship feature
 - Grant factory / MessagingPort / Slack / ship-auth issuer (#966–#968, #973)
 - Shared NL intent platform (#974 beyond phrase → argv)
-- Option 2 in-engine ship as the Buzz primary path
+- Grant factory / signed-authorization operator surface (parked)
 
 Historical context: [session-2026-08-ship-factory-lessons.md](./session-2026-08-ship-factory-lessons.md).

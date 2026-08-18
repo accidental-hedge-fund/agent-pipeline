@@ -33,6 +33,7 @@ test("golden rules keep advance isolated and deny a shipped factory plane", () =
     const source = read(relPath);
     assertMergeIsolation(source, relPath);
     assert.match(source, /merge-queue`?[\s\S]{0,80}dry-run\s+by default/i);
+    assert.match(source, /pipeline ship --milestone/, `${relPath}: must name milestone ship`);
   }
 });
 

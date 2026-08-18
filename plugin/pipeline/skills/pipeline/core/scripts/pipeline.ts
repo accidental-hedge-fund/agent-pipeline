@@ -620,6 +620,27 @@ export interface ShipCliInput {
   authorizationPath: string | null;
 }
 
+const SHIP_SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
+
+/** Derive X.Y.Z from --for or from a semver milestone title (vX.Y.Z / X.Y.Z). */
+export function deriveShipVersionFromMilestone(
+  milestone: string,
+  explicitFor?: string | null,
+): string {
+  const fromFor = String(explicitFor ?? "").trim().replace(/^[vV]/, "");
+  if (fromFor) {
+    if (!SHIP_SEMVER.test(fromFor)) {
+      throw new Error("--for <X.Y.Z> must be a semantic version");
+    }
+    return fromFor;
+  }
+  const fromMilestone = milestone.trim().replace(/^[vV]/, "");
+  if (SHIP_SEMVER.test(fromMilestone)) return fromMilestone;
+  throw new Error(
+    "milestone title is not a semantic version (vX.Y.Z or X.Y.Z); pass --for <X.Y.Z>",
+  );
+}
+
 export const DEFAULT_SHIP_AUTH_PUBLIC_KEY_FILE = "/etc/agent-pipeline/ship-authority.pem";
 
 export function validateShipAuthorizationPublicKeyFile(
@@ -648,21 +669,23 @@ export function normalizeShipCliInput(
   }
   const mode = verb === "status" ? "status" : "run";
   const milestone = String(opts.milestone ?? "").trim();
-  const version = String(opts.for ?? "").trim().replace(/^[vV]/, "");
   if (!milestone) throw new Error("--milestone <m> is required");
-  if (!/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(version)) {
-    throw new Error("--for <X.Y.Z> is required and must be a semantic version");
-  }
-  if (!opts.json) throw new Error("--json is required");
+  const version = deriveShipVersionFromMilestone(milestone, opts.for);
 
   const authorization = String(opts.authorization ?? "").trim();
   if (mode === "status") {
     if (authorization) throw new Error("status does not accept --authorization");
     return { mode, milestone, version, authorizationPath: null };
   }
-  if (!authorization) throw new Error("--authorization <absolute-json> is required");
-  if (!path.isAbsolute(authorization)) throw new Error("--authorization must be an absolute path");
-  return { mode, milestone, version, authorizationPath: authorization };
+  if (authorization && !path.isAbsolute(authorization)) {
+    throw new Error("--authorization must be an absolute path");
+  }
+  return {
+    mode,
+    milestone,
+    version,
+    authorizationPath: authorization || null,
+  };
 }
 
 export function validateReleaseMachineOutputMode(
@@ -3640,7 +3663,7 @@ export async function runTrainCommand(
         "  Usage: pipeline train --issues 10,11,12 [--merge] [--json]\n" +
         "         pipeline train --milestone v1.34.0 [--merge] [--json]\n" +
         "  Without --merge: advances base-eligible frontiers via one loop wave each.\n" +
-        "  With --merge: serial merge + base containment after each advance wave.\n" +
+        "  With --merge: merge-first prelude for already-R2D open PRs, then serial merge + base containment after each advance wave.\n" +
         "  Never called from the advance loop. No auto_merge config key.",
     );
     return 2;
@@ -4363,53 +4386,69 @@ async function main(): Promise<void> {
         runShipCoordinator,
         shipKey,
         validateBuzzShipAuthorization,
+        operatorShipIntent,
+        OPERATOR_SHIP_FINGERPRINT,
       } = await import("./stages/ship.ts");
 
       if (shipInput.mode === "status") {
         const key = shipKey(coordinates);
         const status = await defaultShipStateStore().read(key);
         if (!status || status.ship_key !== key) {
-          throw new Error(
-            `no status exists for ${coordinates.repository} ${coordinates.base_branch} ` +
-              `${coordinates.milestone} v${coordinates.version}`,
-          );
+          console.log(JSON.stringify({
+            schema_version: 1,
+            kind: "ship_status",
+            ship_key: key,
+            status: "none",
+            repository: coordinates.repository,
+            base_branch: coordinates.base_branch,
+            milestone: coordinates.milestone,
+            version: coordinates.version,
+          }, null, 2));
+          return;
         }
         console.log(JSON.stringify(status, null, 2));
         return;
       }
 
-      const authorizationText = await fsPromises.readFile(shipInput.authorizationPath!, "utf8");
-      let authorization: unknown;
-      try {
-        authorization = JSON.parse(authorizationText);
-      } catch (err) {
-        throw new Error(`authorization file is not valid JSON: ${(err as Error).message}`);
+      const operatorMode = !shipInput.authorizationPath;
+      let authorization: unknown = null;
+      let intent = operatorShipIntent(coordinates);
+      let authorizationPublicKey = "";
+      let admissionFingerprint = OPERATOR_SHIP_FINGERPRINT;
+      if (!operatorMode) {
+        const authorizationText = await fsPromises.readFile(shipInput.authorizationPath!, "utf8");
+        try {
+          authorization = JSON.parse(authorizationText);
+        } catch (err) {
+          throw new Error(`authorization file is not valid JSON: ${(err as Error).message}`);
+        }
+        if (!authorization || typeof authorization !== "object" || Array.isArray(authorization)) {
+          throw new Error("authorization file must contain one JSON object");
+        }
+        const authRecord = authorization as Record<string, unknown>;
+        intent = {
+          ...coordinates,
+          event_id: String(authRecord.event_id ?? ""),
+          sender_id: String(authRecord.sender_id ?? ""),
+          channel_id: String(authRecord.channel_id ?? ""),
+          thread_id: String(authRecord.thread_id ?? ""),
+        };
+        const authorizationPublicKeyPath =
+          String(process.env.PIPELINE_SHIP_AUTH_PUBLIC_KEY_FILE ?? DEFAULT_SHIP_AUTH_PUBLIC_KEY_FILE).trim();
+        const publicKeyMetadata = await fsPromises.lstat(authorizationPublicKeyPath);
+        validateShipAuthorizationPublicKeyFile(authorizationPublicKeyPath, publicKeyMetadata);
+        authorizationPublicKey = await fsPromises.readFile(authorizationPublicKeyPath, "utf8");
+        // Validate before admission so syntax, expiry, and identity failures do
+        // not cause an old coordinate status to be emitted as this request's
+        // failure result. The coordinator repeats this check at its trust edge.
+        const validatedAuthorization = validateBuzzShipAuthorization(
+          authorization,
+          intent,
+          new Date(),
+          authorizationPublicKey,
+        );
+        admissionFingerprint = validatedAuthorization.fingerprint;
       }
-      if (!authorization || typeof authorization !== "object" || Array.isArray(authorization)) {
-        throw new Error("authorization file must contain one JSON object");
-      }
-      const authRecord = authorization as Record<string, unknown>;
-      const intent = {
-        ...coordinates,
-        event_id: String(authRecord.event_id ?? ""),
-        sender_id: String(authRecord.sender_id ?? ""),
-        channel_id: String(authRecord.channel_id ?? ""),
-        thread_id: String(authRecord.thread_id ?? ""),
-      };
-      const authorizationPublicKeyPath =
-        String(process.env.PIPELINE_SHIP_AUTH_PUBLIC_KEY_FILE ?? DEFAULT_SHIP_AUTH_PUBLIC_KEY_FILE).trim();
-      const publicKeyMetadata = await fsPromises.lstat(authorizationPublicKeyPath);
-      validateShipAuthorizationPublicKeyFile(authorizationPublicKeyPath, publicKeyMetadata);
-      const authorizationPublicKey = await fsPromises.readFile(authorizationPublicKeyPath, "utf8");
-      // Validate before admission so syntax, expiry, and identity failures do
-      // not cause an old coordinate status to be emitted as this request's
-      // failure result. The coordinator repeats this check at its trust edge.
-      const validatedAuthorization = validateBuzzShipAuthorization(
-        authorization,
-        intent,
-        new Date(),
-        authorizationPublicKey,
-      );
       const { realShipCoordinatorDeps } = await import("./stages/ship-adapter.ts");
       const shipState = defaultShipStateStore();
       const shipTrainReadDeps = realTrainDeps({
@@ -4443,7 +4482,7 @@ async function main(): Promise<void> {
         const message = err instanceof Error ? err.message : String(err);
         const persistedFailure = selectPersistedShipFailureStatus(
           failedStatus,
-          validatedAuthorization.fingerprint,
+          admissionFingerprint,
           message,
         );
         if (persistedFailure) {

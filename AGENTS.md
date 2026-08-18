@@ -23,8 +23,9 @@ conventions. Keep it in sync with `CLAUDE.md`.
 4. **Advance never merges.** `pipeline advance`, `pipeline single`, and
    `pipeline loop` stop at `pipeline:ready-to-deploy` and never invoke a merge.
    Merging uses loop-isolated, operator-authorized commands only: `pipeline merge`
-   per PR, or `pipeline merge-queue --apply` for a batch (`merge-queue` is dry-run
-   by default). External supervisors may invoke those same commands under operator
+   per PR, `pipeline merge-queue --apply` for a batch (`merge-queue` is dry-run
+   by default), `pipeline train --merge`, or `pipeline ship --milestone` (no
+   grant file). External supervisors may invoke those same commands under operator
    authority. This repository does not ship a Hermes/Buzz factory control plane,
    grant schema, or second durable scheduler. Merge authority is not repository
    configuration (`.github/pipeline.yml` cannot authorize merges). Do not add an

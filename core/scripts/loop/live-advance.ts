@@ -274,6 +274,27 @@ export function isConcurrentHolderEvidence(
   return evidence === "lock_held" || evidence === "wrapper_pid";
 }
 
+export type HolderInterruptClass =
+  | "resume-eligible-interrupt"
+  | "workflow-engine-defect"
+  | "coexistence_wait";
+
+/**
+ * Dead holder + leftover harness-failure is a resume-eligible interrupt (#1096).
+ * A live lock/wrapper stays on the coexistence-wait path. A live holder without
+ * concurrent identity may still be a workflow-engine-defect.
+ */
+export function classifyHolderInterrupt(input: {
+  holderLive: boolean;
+  concurrentHolder?: boolean;
+  leftoverHarnessFailure?: boolean;
+}): HolderInterruptClass {
+  if (input.concurrentHolder) return "coexistence_wait";
+  if (input.holderLive) return "workflow-engine-defect";
+  void input.leftoverHarnessFailure;
+  return "resume-eligible-interrupt";
+}
+
 /**
  * Newest *fresh* non-terminal advance run-store for an issue under
  * `<repoDir>/.agent-pipeline/runs/<issue>-*`, or null when none.
@@ -472,9 +493,8 @@ export function probeLiveAdvance(input: {
   maxAgeMs?: number;
   statMtimeMs?: (p: string) => number;
 }): LiveAdvanceProbeResult {
-  const ignored = new Set(
-    (input.ignorePipelineRunIds ?? []).filter((id) => typeof id === "string" && id.length > 0),
-  );
+  // ignorePipelineRunIds is retained for call-site compatibility. Linkage /
+  // crash-store ids are never live without a process identity (#1096).
 
   // 1. Per-issue advisory lock held by a live process
   const lockPath = input.lockPathForTest ?? issueLockPath(input.domain, input.issueNumber);
@@ -483,64 +503,7 @@ export function probeLiveAdvance(input: {
     return { live: true, evidence: "lock_held", holder_pid: held.pid };
   }
 
-  // 2. Non-terminal + fresh loop linkage (never terminal; never aged crash forever)
-  if (input.knownLinkage?.pipeline_run_id) {
-    const linkId = input.knownLinkage.pipeline_run_id;
-    if (!ignored.has(linkId)) {
-      const terminal = input.resolveLinkageTerminal
-        ? input.resolveLinkageTerminal(input.knownLinkage)
-        : resolveLinkageTerminalState(input.knownLinkage, { repoDir: input.repoDir });
-      if (terminal === false) {
-        const fresh = input.isLinkageFresh
-          ? input.isLinkageFresh(input.knownLinkage)
-          : isNonTerminalLinkageFresh(input.knownLinkage, {
-              repoDir: input.repoDir,
-              nowMs: input.nowMs,
-              maxAgeMs: input.maxAgeMs,
-              statMtimeMs: input.statMtimeMs,
-            });
-        if (fresh) {
-          return {
-            live: true,
-            evidence: "loop_linkage",
-            pipeline_run_id: linkId,
-            events_path: input.knownLinkage.events,
-          };
-        }
-        // Stale non-terminal crash linkage: fall through
-      }
-      // terminal === true or null: fall through to other evidence sources
-    }
-  }
-
-  // 3. Active (fresh, non-terminal) advance run-store for this issue
-  if (input.findActiveRunStore) {
-    const active = input.findActiveRunStore(input.issueNumber);
-    if (active && !ignored.has(active.pipeline_run_id)) {
-      return {
-        live: true,
-        evidence: "active_run_store",
-        pipeline_run_id: active.pipeline_run_id,
-        events_path: active.events_path,
-      };
-    }
-  } else if (input.repoDir) {
-    const active = findActiveRunStoreForIssue(input.repoDir, input.issueNumber, {
-      nowMs: input.nowMs,
-      maxAgeMs: input.maxAgeMs,
-      statMtimeMs: input.statMtimeMs,
-    });
-    if (active && !ignored.has(active.pipeline_run_id)) {
-      return {
-        live: true,
-        evidence: "active_run_store",
-        pipeline_run_id: active.pipeline_run_id,
-        events_path: active.events_path,
-      };
-    }
-  }
-
-  // 4. Live wrapper / process identity for the issue
+  // 2. Live wrapper / process identity for the issue
   if (input.findWrapperPid) {
     const pid = input.findWrapperPid(input.issueNumber);
     if (pid != null && Number.isFinite(pid) && pid > 0) {
@@ -550,5 +513,7 @@ export function probeLiveAdvance(input: {
     }
   }
 
+  // 3–4. Fresh linkage / crash run-store without a live lock or live wrapper
+  // is a corpse (#1096). Do not treat it as a live holder.
   return { live: false };
 }

@@ -96,8 +96,9 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
     supportsJson: true,
   },
 
-  // Exact, event-authorized release shipment. Pipeline owns lifecycle
-  // convergence; the host process supervisor owns only restart policy.
+  // Operator milestone shipment. Pipeline owns lifecycle convergence;
+  // the host process supervisor owns only restart policy. Grant flags are
+  // parked and not required.
   ship: {
     needsIssueNumber: false,
     allowedFlags: new Set([

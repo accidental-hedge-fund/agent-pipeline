@@ -83,8 +83,8 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 
 #### `ship`
 
-- **Usage:** `pipeline ship --milestone <m> --for <X.Y.Z> --authorization <absolute-json> --json | ship status --milestone <m> --for <X.Y.Z> --json`
-- **Summary:** Run or inspect one exact, Buzz-authorized release shipment through train, FRG, release, and engine promotion
+- **Usage:** `pipeline ship --milestone vX.Y.Z [--json] | ship status --milestone vX.Y.Z [--json]`
+- **Summary:** Run or inspect one durable milestone shipment (train --merge, release, finish, promote). Operator product is pipeline ship --milestone vX.Y.Z; no grant file required.
 
 #### `status`
 

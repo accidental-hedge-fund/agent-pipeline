@@ -286,14 +286,22 @@ test("pipeline-cli: ship accepts exact authorization coordinates", () => {
 
 test("pipeline-cli: ship status is read-only by shape and needs no authorization flag", () => {
   const { opts, numArg } = parseCli([
-    "ship", "status", "--milestone", "v1.34.0", "--for", "1.34.0", "--json",
+    "ship", "status", "--milestone", "v1.34.0",
   ]);
   assert.equal(numArg, "ship");
   assert.equal(opts.authorization, undefined);
   assert.equal(opts.milestone, "v1.34.0");
-  assert.equal(opts.for, "1.34.0");
+  assert.deepEqual(
+    normalizeShipCliInput(["ship", "status"], { milestone: "v1.34.0" }),
+    {
+      mode: "status",
+      milestone: "v1.34.0",
+      version: "1.34.0",
+      authorizationPath: null,
+    },
+  );
   assert.deepEqual(roundTrip([
-    "ship", "status", "--milestone", "v1.34.0", "--for", "1.34.0", "--json",
+    "ship", "status", "--milestone", "v1.34.0",
   ]), []);
 });
 
@@ -310,7 +318,7 @@ test("pipeline-cli: ship rejects unrelated lifecycle flags", () => {
   );
 });
 
-test("pipeline-cli: ship input requires JSON and an absolute authorization path", () => {
+test("pipeline-cli: ship input derives version from milestone and does not require a grant", () => {
   assert.throws(
     () => normalizeShipCliInput(["ship"], {
       milestone: "v1.34.0",
@@ -320,14 +328,17 @@ test("pipeline-cli: ship input requires JSON and an absolute authorization path"
     }),
     /absolute path/,
   );
-  assert.throws(
-    () => normalizeShipCliInput(["ship"], {
+  assert.deepEqual(
+    normalizeShipCliInput(["ship"], {
       milestone: "v1.34.0",
-      for: "1.34.0",
-      authorization: "/run/user/1000/ship.json",
       json: false,
     }),
-    /--json is required/,
+    {
+      mode: "run",
+      milestone: "v1.34.0",
+      version: "1.34.0",
+      authorizationPath: null,
+    },
   );
   assert.deepEqual(
     normalizeShipCliInput(["ship"], {
@@ -342,6 +353,13 @@ test("pipeline-cli: ship input requires JSON and an absolute authorization path"
       version: "1.34.0",
       authorizationPath: "/run/user/1000/ship.json",
     },
+  );
+  assert.throws(
+    () => normalizeShipCliInput(["ship"], {
+      milestone: "not-a-semver",
+      json: false,
+    }),
+    /not a semantic version/,
   );
 });
 

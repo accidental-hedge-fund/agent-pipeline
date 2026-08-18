@@ -121,8 +121,11 @@ describe("command-docs metadata", () => {
   test("ship documents exact run and read-only status forms", () => {
     const doc = COMMAND_DOCS.ship;
     assert.equal(doc.documented, true);
-    assert.match(doc.usage, /--authorization <absolute-json> --json/);
-    assert.match(doc.usage, /ship status --milestone <m> --for <X\.Y\.Z> --json/);
+    assert.equal(
+      doc.usage,
+      "ship --milestone vX.Y.Z [--json] | ship status --milestone vX.Y.Z [--json]",
+    );
+    assert.doesNotMatch(doc.usage, /--authorization|--for /);
   });
 
   test("papercut is marked undocumented", () => {

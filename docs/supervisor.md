@@ -235,24 +235,23 @@ Does **not** create git tags or GitHub Releases. Existing `auto-tag-release` and
 Host runbook: [runbooks/hermes-supervisor-deployment.md](./runbooks/hermes-supervisor-deployment.md).  
 Skill template: [examples/supervisor/hermes/SKILL.md](../examples/supervisor/hermes/SKILL.md).
 
-## Ship milestone (Option 1 — Tugboat)
+## Ship milestone (`pipeline ship --milestone`)
 
-**Primary agent-box / Buzz path:** thin host composer
-`examples/supervisor/shell/tugboat.sh` sequences existing Pipeline CLI verbs
-(train → FRG pack → release → wait CI → release finish → wait Release → engine-promote)
-plus notify. Operator phrase: `Ship milestone vX.Y.Z`. Status:
-`tugboat --milestone vX.Y.Z --status` or
-`~/.local/state/pipeline-supervisor/ship-vX.Y.Z/`.
+**Primary path:** `pipeline ship --milestone vX.Y.Z`. Operator phrase:
+`Ship milestone vX.Y.Z`. Status: `pipeline ship status --milestone vX.Y.Z`
+(Pipeline ship ledger). Tugboat may remain a thin notify/detach adapter. It is
+not the product owner. #1001 / #971 do not ban in-engine ship.
 
 | Script | Role |
 |---|---|
-| `examples/supervisor/shell/tugboat.sh` | **Option 1 primary** thin ship composer; detach + status |
+| `pipeline ship --milestone vX.Y.Z` | **Product** durable ship (train `--merge` → release → finish → promote) |
+| `examples/supervisor/shell/tugboat.sh` | Thin notify/detach adapter only; not the ship owner |
 | `examples/supervisor/shell/ship-notify.sh` | Optional messenger posts; no-op without Buzz env |
-| `examples/supervisor/shell/ship-stage-watch.sh` | Optional per-issue posts during train; shared install with Tugboat |
+| `examples/supervisor/shell/ship-stage-watch.sh` | Optional exact-run posts; shared install |
 | `examples/supervisor/shell/train-status-complete.py` | Train complete gate helper |
 | `examples/supervisor/shell/release-checks-green.py` | Shared ship-release check waiter (`green`/`pending`/`rerun`/`fail`, `bucket`+`link` schema) |
-| `examples/supervisor/shell/pipeline-ship-playbook.sh` | **Alternate / legacy** chain playbook (not primary Buzz path) |
-| `examples/supervisor/shell/ship-milestone.sh` | **Non-primary** authorized adapter for in-engine `pipeline ship` |
+| `examples/supervisor/shell/pipeline-ship-playbook.sh` | Thin leftover chain adapter (not the owner) |
+| `examples/supervisor/shell/ship-milestone.sh` | Parked grant-style adapter; not the operator surface |
 
 Required env for mutating ship: `REPO_DIR`, `PIPELINE`, `ALLOW_MERGE=1`.  
 `REPO_DIR` is the live control checkout; Tugboat refuses `*factory-control*`
@@ -266,8 +265,8 @@ and the next `pipeline train` / `pipeline doctor` share one path (#1127).
 Runbooks: [runbooks/ship-milestone.md](./runbooks/ship-milestone.md),  
 [runbooks/frg-pack-checklist.md](./runbooks/frg-pack-checklist.md).
 
-Pipeline CLI owns train/merge/release/promote policy. Tugboat does not add a
-grant factory, second merge policy, or `pipeline ship` product stage. Doctor:
+Pipeline CLI owns train/merge/release/promote policy and the ship ledger.
+Tugboat does not add a grant factory or second merge policy. Doctor:
 `supervisor:tugboat-install-parity` (installed Tugboat + CI/train helpers match
 repo example content),
 `supervisor:ship-playbook-promote-host` (legacy playbook promote default),

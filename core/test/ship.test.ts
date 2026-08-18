@@ -6,7 +6,9 @@ import * as path from "node:path";
 import * as crypto from "node:crypto";
 import {
   SHIP_AUTHORIZED_ACTIONS,
+  OPERATOR_SHIP_FINGERPRINT,
   defaultShipStateStore,
+  operatorShipIntent,
   resolveShipStateHome,
   runShipCoordinator,
   shipAuthorizationFingerprint,
@@ -575,4 +577,50 @@ test("ship base lock serializes different milestones on one repository base", ()
 test("ship run identity is deterministic and changes with Buzz thread identity", () => {
   assert.equal(shipRunId(intent), shipRunId(intent));
   assert.notEqual(shipRunId(intent), shipRunId({ ...intent, thread_id: "another-thread" }));
+});
+
+test("operator milestone ship admits without a grant and resumes the same ledger (#1096)", async () => {
+  const store = memoryStore();
+  const operator = operatorShipIntent(intent);
+  const deps = makeDeps(store);
+  const first = await runShipCoordinator(operator, null, deps);
+  assert.equal(first.complete, true);
+  assert.equal(first.authorization_fingerprint, OPERATOR_SHIP_FINGERPRINT);
+  assert.deepEqual(deps.calls.filter((c) => c === "train"), ["train"]);
+  const secondDeps = makeDeps(store, completeProgress());
+  const second = await runShipCoordinator(operator, null, secondDeps);
+  assert.equal(second.ship_key, first.ship_key);
+  assert.ok(!secondDeps.calls.includes("train"), "second invoke must not start a sibling train");
+  assert.ok(!secondDeps.calls.includes("plan-train"));
+});
+
+test("ship persist writes the current human_authority bit so recovery is not stranded (#1096)", async () => {
+  const store = memoryStore();
+  const parked = makeDeps(store);
+  parked.convergeTrain = async () => {
+    throw new Error("needs-human: missing-authority for milestone release");
+  };
+  await assert.rejects(
+    runShipCoordinator(intent, authorization(), parked),
+    /needs-human/,
+  );
+  assert.equal(store.status?.human_authority, true);
+  assert.match(store.status?.last_error ?? "", /missing-authority/);
+
+  const nonHuman = makeDeps(store);
+  nonHuman.convergeTrain = async () => {
+    throw new Error("transient train crash");
+  };
+  await assert.rejects(
+    runShipCoordinator(intent, authorization(), nonHuman),
+    /transient train crash/,
+  );
+  assert.equal(store.status?.human_authority, false);
+  assert.equal(store.status?.last_error, "transient train crash");
+
+  const recovered = makeDeps(store);
+  const result = await runShipCoordinator(intent, authorization(), recovered);
+  assert.equal(result.complete, true);
+  assert.equal(result.human_authority, false);
+  assert.equal(result.last_error, null);
 });
