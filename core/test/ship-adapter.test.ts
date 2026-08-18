@@ -6,6 +6,7 @@ import test from "node:test";
 import {
   alignReleaseCheckoutToCandidate,
   assertFrgCandidateProvenance,
+  ensureAnnotatedReleaseTag,
   shipCoordinatorDepsFromOperations,
   verifyAnnotatedReleaseTag,
   type ShipAdapterOperations,
@@ -255,6 +256,45 @@ test("ship adapter returns the one frozen train plan from its planning seam", as
   }), { state });
 
   assert.deepEqual(await deps.planTrain(intent), { ordered_issues: [11, 10] });
+});
+
+test("ensureAnnotatedReleaseTag creates and pushes when FRG is eligible and tag is missing (#1115)", async () => {
+  const calls: string[][] = [];
+  const git = async (args: string[]) => {
+    calls.push(args);
+    if (args[0] === "cat-file") throw new Error("not a valid object");
+    return "";
+  };
+  let validated = 0;
+  const result = await ensureAnnotatedReleaseTag({
+    version: "1.34.0",
+    mergeCommitOid: mergeHead,
+    git,
+    validateFrg: async () => {
+      validated++;
+    },
+  });
+  assert.equal(result, "created");
+  assert.equal(validated, 1);
+  assert.ok(calls.some((args) => args[0] === "tag" && args[1] === "-a" && args[2] === "v1.34.0"));
+  assert.ok(calls.some((args) => args[0] === "push" && args.includes("refs/tags/v1.34.0")));
+});
+
+test("ensureAnnotatedReleaseTag is a no-op when the annotated tag already points at the merge (#1115)", async () => {
+  const git = async (args: string[]) => {
+    if (args[0] === "cat-file") return "tag";
+    if (args[0] === "rev-parse") return mergeHead;
+    throw new Error(`unexpected git ${args.join(" ")}`);
+  };
+  const result = await ensureAnnotatedReleaseTag({
+    version: "1.34.0",
+    mergeCommitOid: mergeHead,
+    git,
+    validateFrg: async () => {
+      throw new Error("must not re-validate when tag exists");
+    },
+  });
+  assert.equal(result, "exists");
 });
 
 test("ship adapter fails closed with the exact existing FRG next action", async () => {

@@ -18,9 +18,13 @@
 // Never accepts caller-authored pass / status / metric / receipt claims.
 // Never invents pass: true. Never adopts an unbound newest factory-gate loop.
 
+import { execFile } from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
 import {
   FRG_PACK_MANIFEST,
   isAllowedFrgPackSelector,
@@ -311,6 +315,13 @@ export interface FactoryReleasePrepareDeps {
     unsigned: FactoryReleaseFrgPayload,
     ctx: { repoDir: string; workDir: string },
   ): Promise<ObservedAttestation | null>;
+  /**
+   * Observe an already-opened or merged release/vX.Y.Z PR. When present,
+   * prepare MUST NOT open a second PR (#1115).
+   */
+  observeExistingRelease?(
+    request: FactoryReleasePrepareRequest,
+  ): Promise<{ pr: number; head_oid: string; version: string } | null>;
   /** Shared prepare-only release entry (runRelease). */
   runRelease(
     version: string,
@@ -2092,6 +2103,38 @@ export async function defaultObserveAttestation(
   return null;
 }
 
+export async function defaultObserveExistingRelease(
+  request: FactoryReleasePrepareRequest,
+): Promise<{ pr: number; head_oid: string; version: string } | null> {
+  const branch = `release/v${request.target_version}`;
+  try {
+    const { stdout } = await execFileAsync(
+      "gh",
+      [
+        "pr", "list", "-R", request.repository, "--state", "all", "--head", branch,
+        "--limit", "5", "--json", "number,title,state,headRefOid,baseRefName",
+      ],
+      { timeout: 60_000, maxBuffer: 10 * 1024 * 1024 },
+    );
+    const rows = JSON.parse(String(stdout)) as Array<{
+      number?: number;
+      title?: string;
+      state?: string;
+      headRefOid?: string;
+      baseRefName?: string;
+    }>;
+    if (!Array.isArray(rows) || rows.length === 0) return null;
+    const row = rows[0]!;
+    const pr = Number(row.number);
+    const head = String(row.headRefOid ?? "");
+    if (!Number.isSafeInteger(pr) || pr <= 0 || !/^[0-9a-f]{40}$/i.test(head)) return null;
+    if (row.baseRefName !== request.base_branch) return null;
+    return { pr, head_oid: head.toLowerCase(), version: request.target_version };
+  } catch {
+    return null;
+  }
+}
+
 export function defaultFactoryReleasePrepareDeps(
   overrides: Partial<FactoryReleasePrepareDeps> = {},
 ): FactoryReleasePrepareDeps {
@@ -2133,6 +2176,9 @@ export function defaultFactoryReleasePrepareDeps(
       overrides.observeAttestation ??
       ((request, unsigned, ctx) =>
         defaultObserveAttestation(request, unsigned, ctx, readFile, fileExists)),
+    observeExistingRelease:
+      overrides.observeExistingRelease ??
+      ((request) => defaultObserveExistingRelease(request)),
     runRelease:
       overrides.runRelease ??
       (async (version, opts, cfg) => {
@@ -2631,6 +2677,46 @@ export async function runFactoryReleasePrepare(
     return {
       exitCode: 0,
       result: completeResult(request, unsigned, attestation, store.release, completeId),
+    };
+  }
+
+  const existingRelease = deps.observeExistingRelease
+    ? await deps.observeExistingRelease(request)
+    : null;
+  if (existingRelease) {
+    const release = {
+      pr: existingRelease.pr,
+      head_oid: existingRelease.head_oid,
+      base_oid: request.integrated_candidate.git_sha,
+      version: existingRelease.version,
+    };
+    const reusedId = checkpointId("prepared", fingerprint);
+    store = {
+      schema_version: 1,
+      kind: "factory_release_checkpoint_store",
+      request_fingerprint: fingerprint,
+      phase: "complete",
+      request,
+      unsigned,
+      awaiting_checkpoint_id: store?.awaiting_checkpoint_id,
+      attestation: {
+        frg_run_id: attestation.frg_run_id,
+        evidence_path: attestation.evidence_path,
+        evidence_sha256: attestation.evidence_sha256,
+        latest_path: attestation.latest_path,
+        latest_sha256: attestation.latest_sha256,
+      },
+      release,
+      complete_checkpoint_id: reusedId,
+      updated_at: isoNow(deps.now()),
+    };
+    await saveCheckpoint(deps, checkpointPath, store);
+    log(
+      `[factory-release prepare] reusing existing release PR #${release.pr}; not opening a second PR`,
+    );
+    return {
+      exitCode: 0,
+      result: completeResult(request, unsigned, attestation, release, reusedId),
     };
   }
 

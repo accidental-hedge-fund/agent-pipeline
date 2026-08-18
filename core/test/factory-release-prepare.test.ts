@@ -343,6 +343,7 @@ function makeDeps(opts: {
   fs: ReturnType<typeof memoryFs>;
   generate?: FactoryReleasePrepareDeps["generateUnsignedFrg"];
   observe?: FactoryReleasePrepareDeps["observeAttestation"];
+  observeExistingRelease?: FactoryReleasePrepareDeps["observeExistingRelease"];
   runRelease?: FactoryReleasePrepareDeps["runRelease"];
   generateCalls?: { n: number };
   releaseCalls?: { n: number };
@@ -370,6 +371,7 @@ function makeDeps(opts: {
       if (opts.observe) return opts.observe(request, unsigned, ctx);
       return null;
     },
+    observeExistingRelease: opts.observeExistingRelease ?? (async () => null),
     runRelease: async (version, releaseOpts, cfg) => {
       releaseCalls.n++;
       if (opts.runRelease) return opts.runRelease(version, releaseOpts, cfg);
@@ -520,6 +522,33 @@ test("second call after attestation returns complete via shared runRelease", asy
   assert.equal(releaseCalls.n, 1);
   // Idempotent: generate only once across both calls
   assert.equal(generateCalls.n, 1);
+});
+
+test("post-attestation reuses an already-merged release PR and does not call runRelease (#1115)", async () => {
+  const mem = memoryFs();
+  const request = baseRequest();
+  const requestPath = "/tmp/req-134.json";
+  await mem.writeFile(requestPath, JSON.stringify(request));
+  const releaseCalls = { n: 0 };
+  const deps = makeDeps({
+    fs: mem,
+    releaseCalls,
+    observe: async (_req, unsigned) => observeForUnsigned(unsigned, request),
+    observeExistingRelease: async () => ({
+      pr: 1109,
+      head_oid: "f".repeat(40),
+      version: "1.34.0",
+    }),
+  });
+  const outcome = await runFactoryReleasePrepare(
+    { requestPath, repoDir: "/repo", json: true },
+    deps,
+  );
+  assert.equal(outcome.exitCode, 0);
+  assert.equal(outcome.result.status, "complete");
+  if (outcome.result.status !== "complete") return;
+  assert.equal(outcome.result.release_pr.number, 1109);
+  assert.equal(releaseCalls.n, 0);
 });
 
 test("idempotent re-entry at awaiting does not create a second pack", async () => {
