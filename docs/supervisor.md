@@ -250,7 +250,7 @@ plus notify. Operator phrase: `Ship milestone vX.Y.Z`. Status:
 | `examples/supervisor/shell/ship-notify.sh` | Optional messenger posts; no-op without Buzz env |
 | `examples/supervisor/shell/ship-stage-watch.sh` | Optional per-issue posts during train; shared install with Tugboat |
 | `examples/supervisor/shell/train-status-complete.py` | Train complete gate helper |
-| `examples/supervisor/shell/release-checks-green.py` | Release PR checks green helper (`bucket` schema) |
+| `examples/supervisor/shell/release-checks-green.py` | Shared ship-release check waiter (`green`/`pending`/`rerun`/`fail`, `bucket`+`link` schema) |
 | `examples/supervisor/shell/pipeline-ship-playbook.sh` | **Alternate / legacy** chain playbook (not primary Buzz path) |
 | `examples/supervisor/shell/ship-milestone.sh` | **Non-primary** authorized adapter for in-engine `pipeline ship` |
 

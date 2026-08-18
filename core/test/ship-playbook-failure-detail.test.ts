@@ -86,6 +86,36 @@ test("failure_detail train (#1074): preserves structured stop class from train b
   }
 });
 
+test("failure_detail release-finish: checks sidecar beats tester-evidence warn", () => {
+  const dir = makeRunDir();
+  try {
+    fs.writeFileSync(
+      path.join(dir, "release-checks.fail.json"),
+      JSON.stringify({
+        pr: "1109",
+        check_name: "test",
+        bucket: "fail",
+        link: "https://github.com/o/r/actions/runs/32075787450",
+        reason:
+          "PR #1109 check test fail https://github.com/o/r/actions/runs/32075787450",
+      }),
+    );
+    const logFile = path.join(dir, "playbook.log");
+    fs.writeFileSync(
+      logFile,
+      "[pipeline] tester-evidence: trusted-surface blocked prevents readiness subject emission (fail closed)\n",
+    );
+    const out = extractFailureDetail(dir, logFile, "release-finish");
+    assert.match(out, /PR #1109/);
+    assert.match(out, /\btest\b/);
+    assert.match(out, /32075787450/);
+    assert.doesNotMatch(out, /tester-evidence/);
+    assert.doesNotMatch(out, /trusted-surface blocked/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("failure_detail release-finish: surfaces pending checks line", () => {
   const dir = makeRunDir();
   try {

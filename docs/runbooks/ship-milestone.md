@@ -133,7 +133,7 @@ Issues on the milestone must be `pipeline:ready` before train dispatch.
 1. `pipeline train --milestone vX.Y.Z --merge --json` (complete gate + resume)
 2. FRG pack: `pipeline factory-release prepare --request <abs.json> --json` (re-invoke until pack-done)
 3. `pipeline release X.Y.Z --no-edit` (**bare** version — leading `v` is invalid; **no** `--skip-frg`)
-4. Wait until open release PR checks are green (`gh pr checks --json name,state,bucket`)
+4. Wait until open release PR checks are green (`gh pr checks --json name,state,bucket,link`). A first flake-eligible `test` fail requests `gh run rerun --failed` once, then waits again. Non-test product fails STOP. After merge, refresh installed Tugboat and `release-checks-green.py` from `examples/supervisor/shell/`.
 5. `pipeline release finish <pr>`
 6. Wait until GitHub Release `vX.Y.Z` is published (non-draft)
 7. `pipeline engine-promote --for X.Y.Z --host all` (or `ENGINE_PROMOTE_HOST` override; **no** `--skip-frg`)
