@@ -670,7 +670,7 @@ test("live-ship probe (#1062): train --merge cmdline is live; bare pid / single 
   );
 });
 
-test("ship lock (#1062): stale lock pid for other-milestone train is reclaimed", () => {
+test("ship lock (#1062): stale lock pid for other-milestone train is reclaimed", async () => {
   const body = fs.readFileSync(tugboat, "utf8");
   // Mutex must gate on argv_is_live_ship for the requested version (not any train --merge).
   const lockFn = body.match(/^try_acquire_ship_lock\(\) \{[\s\S]*?\n\}/m);
@@ -694,13 +694,15 @@ test("ship lock (#1062): stale lock pid for other-milestone train is reclaimed",
   try {
     fs.writeFileSync(
       fakeBin,
-      "#!/usr/bin/env bash\n# stub train holder for lock reclaim regression\nsleep 3600\n",
+      "#!/bin/bash\n# stub train holder for lock reclaim regression\nsleep 3600\n",
     );
     fs.chmodSync(fakeBin, 0o755);
     // Detached so the stub survives after spawn returns; argv must look like train --merge v1.40.0.
+    // Exec /bin/bash directly. A `#!/usr/bin/env bash` shebang briefly publishes
+    // cmdline as `env bash` with no `train` token (flake under full-suite load).
     const child = spawn(
-      fakeBin,
-      ["train", "--milestone", "v1.40.0", "--merge", "--json"],
+      "/bin/bash",
+      [fakeBin, "train", "--milestone", "v1.40.0", "--merge", "--json"],
       { detached: true, stdio: "ignore" },
     );
     child.unref();
@@ -710,12 +712,29 @@ test("ship lock (#1062): stale lock pid for other-milestone train is reclaimed",
       `bad stub pid: ${String(childPid)}`,
     );
 
-    // Confirm /proc cmdline is the other-milestone train (structured argv).
-    const raw = fs.readFileSync(`/proc/${childPid}/cmdline`);
-    const argv = raw
-      .toString("utf8")
-      .split("\0")
-      .filter((s) => s.length > 0);
+    // spawn() returns before exec. Wait for structured /proc argv, not the
+    // pre-exec cmdline.
+    let argv: string[] = [];
+    await waitUntil(
+      () => {
+        try {
+          argv = fs
+            .readFileSync(`/proc/${childPid}/cmdline`)
+            .toString("utf8")
+            .split("\0")
+            .filter((s) => s.length > 0);
+          return (
+            argv.includes("train") &&
+            argv.includes("--merge") &&
+            argv.includes("v1.40.0")
+          );
+        } catch {
+          return false;
+        }
+      },
+      5_000,
+      `stub train argv for pid ${childPid}`,
+    );
     assert.ok(argv.includes("train"));
     assert.ok(argv.includes("--merge"));
     assert.ok(argv.includes("v1.40.0"));
