@@ -5,6 +5,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -669,7 +670,7 @@ test("live-ship probe (#1062): train --merge cmdline is live; bare pid / single 
   );
 });
 
-test("ship lock (#1062): stale lock pid for other-milestone train is reclaimed", () => {
+test("ship lock (#1062): stale lock pid for other-milestone train is reclaimed", async () => {
   const body = fs.readFileSync(tugboat, "utf8");
   // Mutex must gate on argv_is_live_ship for the requested version (not any train --merge).
   const lockFn = body.match(/^try_acquire_ship_lock\(\) \{[\s\S]*?\n\}/m);
@@ -693,13 +694,15 @@ test("ship lock (#1062): stale lock pid for other-milestone train is reclaimed",
   try {
     fs.writeFileSync(
       fakeBin,
-      "#!/usr/bin/env bash\n# stub train holder for lock reclaim regression\nsleep 3600\n",
+      "#!/bin/bash\n# stub train holder for lock reclaim regression\nsleep 3600\n",
     );
     fs.chmodSync(fakeBin, 0o755);
     // Detached so the stub survives after spawn returns; argv must look like train --merge v1.40.0.
+    // Exec /bin/bash directly. A `#!/usr/bin/env bash` shebang briefly publishes
+    // cmdline as `env bash` with no `train` token (flake under full-suite load).
     const child = spawn(
-      fakeBin,
-      ["train", "--milestone", "v1.40.0", "--merge", "--json"],
+      "/bin/bash",
+      [fakeBin, "train", "--milestone", "v1.40.0", "--merge", "--json"],
       { detached: true, stdio: "ignore" },
     );
     child.unref();
@@ -709,12 +712,29 @@ test("ship lock (#1062): stale lock pid for other-milestone train is reclaimed",
       `bad stub pid: ${String(childPid)}`,
     );
 
-    // Confirm /proc cmdline is the other-milestone train (structured argv).
-    const raw = fs.readFileSync(`/proc/${childPid}/cmdline`);
-    const argv = raw
-      .toString("utf8")
-      .split("\0")
-      .filter((s) => s.length > 0);
+    // spawn() returns before exec. Wait for structured /proc argv, not the
+    // pre-exec cmdline.
+    let argv: string[] = [];
+    await waitUntil(
+      () => {
+        try {
+          argv = fs
+            .readFileSync(`/proc/${childPid}/cmdline`)
+            .toString("utf8")
+            .split("\0")
+            .filter((s) => s.length > 0);
+          return (
+            argv.includes("train") &&
+            argv.includes("--merge") &&
+            argv.includes("v1.40.0")
+          );
+        } catch {
+          return false;
+        }
+      },
+      5_000,
+      `stub train argv for pid ${childPid}`,
+    );
     assert.ok(argv.includes("train"));
     assert.ok(argv.includes("--merge"));
     assert.ok(argv.includes("v1.40.0"));
@@ -789,11 +809,28 @@ test("live-ship probe (#1062): detach path uses probe only; not bare playbook.pi
   assert.ok(detachFn, "detach_self missing");
   assert.match(detachFn[0], /live_ship_probe/);
   assert.match(detachFn[0], /emit_status_json/);
-  // Race-safe: short-lived detach.gate serializes probe-and-spawn; re-probe under gate.
-  assert.match(detachFn[0], /try_acquire_detach_gate/);
-  assert.match(detachFn[0], /release_detach_gate|release_held_detach_gates/);
-  assert.match(body, /try_acquire_detach_gate\(\)/);
-  assert.match(body, /detach\.gate/);
+  // Race-safe: flock admission lock serializes probe-and-spawn; re-probe under lock.
+  assert.match(detachFn[0], /acquire_admission_lock/);
+  assert.match(detachFn[0], /cleanup_detach_admission/);
+  assert.match(detachFn[0], /wait_until_live_ship/);
+  assert.match(detachFn[0], /reap_unconfirmed_detach_child/);
+  assert.match(detachFn[0], /record_pending_unconfirmed_child/);
+  assert.match(detachFn[0], /setsid nohup/);
+  assert.match(detachFn[0], /trap 'cleanup_detach_admission; exit 130' INT/);
+  assert.match(detachFn[0], /trap 'cleanup_detach_admission; exit 143' TERM/);
+  assert.match(body, /acquire_admission_lock\(\)/);
+  assert.match(body, /reap_unconfirmed_detach_child\(\)/);
+  assert.match(body, /cleanup_detach_admission\(\)/);
+  assert.match(body, /setsid is required to isolate the detached child process group/);
+  assert.match(body, /admission\/\$\{token\}\/v/);
+  assert.match(body, /flock -w/);
+  assert.match(body, /flock is required for detach admission \(no mkdir-gate fallback\)/);
+  assert.doesNotMatch(body, /try_acquire_detach_gate/);
+  // Empty-pid mkdir reclaim was the #1109 hole; must not remain as live code.
+  assert.doesNotMatch(
+    body,
+    /^\s*if \[\[ -z "\$holder" \]\] \|\| ! kill -0 "\$holder"/m,
+  );
   // Structured argv probe (not flattened tr '\\0' ' ' substring match).
   assert.match(body, /read_proc_argv/);
   assert.match(body, /argv_is_live_ship/);
@@ -839,21 +876,196 @@ function killPids(pids: number[]): void {
   }
 }
 
+function admissionLockPath(
+  stateRoot: string,
+  repoDir: string,
+  version: string,
+): string {
+  const real = fs.realpathSync(repoDir);
+  const token = createHash("sha256").update(real, "utf8").digest("hex");
+  return path.join(stateRoot, "admission", token, `v${version.toLowerCase()}.lock`);
+}
+
+function countDetachLines(combined: string): number {
+  return (combined.match(/detached tugboat ship/g) || []).length;
+}
+
+function countAlreadyRunningLines(combined: string): number {
+  return (combined.match(/already running.*not detaching a second copy/g) || [])
+    .length;
+}
+
+/** Processes whose cmdline contains NEEDLE (NUL-insensitive). */
+function procsWithNeedle(needle: string): Array<{ pid: number; argv: string[] }> {
+  const out: Array<{ pid: number; argv: string[] }> = [];
+  for (const ent of fs.readdirSync("/proc")) {
+    if (!/^\d+$/.test(ent)) continue;
+    try {
+      const raw = fs.readFileSync(`/proc/${ent}/cmdline`).toString("utf8");
+      if (!raw.includes(needle)) continue;
+      out.push({
+        pid: Number(ent),
+        argv: raw.split("\0").filter(Boolean),
+      });
+    } catch {
+      /* gone */
+    }
+  }
+  return out;
+}
+
+function isOwningTugboatArgv(argv: string[], version: string): boolean {
+  const tag = `v${version}`;
+  const isTug = argv.some((a) => {
+    const base = a.split("/").pop() || "";
+    return base === "tugboat" || base === "tugboat.sh";
+  });
+  if (!isTug || argv.includes("--detach") || argv.includes("--status")) {
+    return false;
+  }
+  for (let i = 0; i < argv.length; i++) {
+    if (
+      (argv[i] === "--milestone" || argv[i] === "-m") &&
+      (argv[i + 1] === tag || argv[i + 1] === version)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Shared assertion for the concurrent two-spawn fixture. Two detach lines fail. */
+function assertSingleDetachAdmission(opts: {
+  combined: string;
+  statuses: Array<number | null>;
+}): void {
+  const detachCount = countDetachLines(opts.combined);
+  const alreadyCount = countAlreadyRunningLines(opts.combined);
+  assert.equal(
+    detachCount,
+    1,
+    `expected exactly one detach, got ${detachCount}:\n${opts.combined}`,
+  );
+  assert.equal(
+    alreadyCount,
+    1,
+    `expected exactly one already-running line, got ${alreadyCount}:\n${opts.combined}`,
+  );
+  assert.doesNotMatch(
+    opts.combined,
+    /admission lock|lock file|detach\.gate/i,
+    `loser must refuse via live-ship probe, not lock presence:\n${opts.combined}`,
+  );
+  assert.equal(
+    opts.statuses[0],
+    0,
+    `first detach status: ${opts.statuses[0]}`,
+  );
+  assert.equal(
+    opts.statuses[1],
+    0,
+    `second detach status: ${opts.statuses[1]}`,
+  );
+}
+
+async function waitUntil(
+  pred: () => boolean,
+  ms: number,
+  label: string,
+): Promise<void> {
+  const start = Date.now();
+  while (Date.now() - start < ms) {
+    if (pred()) return;
+    await new Promise((r) => setTimeout(r, 15));
+  }
+  throw new Error(`timeout waiting for ${label}`);
+}
+
+function spawnDetachViaBarrier(opts: {
+  id: string;
+  barrierDir: string;
+  goFile: string;
+  version: string;
+  env: NodeJS.ProcessEnv;
+}): Promise<{ status: number | null; out: string }> {
+  const readyFile = path.join(opts.barrierDir, `${opts.id}.ready`);
+  const wrapper = path.join(opts.barrierDir, `${opts.id}.wrapper.sh`);
+  fs.writeFileSync(
+    wrapper,
+    [
+      "#!/usr/bin/env bash",
+      "set -euo pipefail",
+      `printf 'ready\\n' > ${JSON.stringify(readyFile)}`,
+      `while [[ ! -f ${JSON.stringify(opts.goFile)} ]]; do`,
+      "  # start barrier — not the admission pass condition",
+      "  sleep 0.01",
+      "done",
+      `exec bash ${JSON.stringify(tugboat)} --milestone ${JSON.stringify(`v${opts.version}`)} --detach`,
+      "",
+    ].join("\n"),
+  );
+  fs.chmodSync(wrapper, 0o755);
+  return new Promise((resolve) => {
+    const child = spawn("bash", [wrapper], {
+      env: opts.env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "";
+    child.stdout.on("data", (b) => {
+      out += String(b);
+    });
+    child.stderr.on("data", (b) => {
+      out += String(b);
+    });
+    child.on("close", (code) => {
+      resolve({ status: code, out });
+    });
+  });
+}
+
+function reapDetachFixture(dir: string, stateRoot: string, version: string): void {
+  killPids(pidsWithCmdlineNeedle(dir));
+  killPids(pidsWithCmdlineNeedle(`--milestone v${version}`));
+  try {
+    const shipDir = path.join(stateRoot, `ship-v${version}`);
+    const pidFile = path.join(shipDir, "playbook.pid");
+    if (fs.existsSync(pidFile)) {
+      const p = Number(fs.readFileSync(pidFile, "utf8").trim());
+      if (Number.isFinite(p) && p > 0) {
+        try {
+          process.kill(p, "SIGTERM");
+        } catch {
+          /* gone */
+        }
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+function writeLongLivedPipelineStub(fakePipeline: string): void {
+  fs.writeFileSync(
+    fakePipeline,
+    "#!/usr/bin/env bash\n# long-lived train stub for concurrent detach\nsleep 3600\n",
+  );
+  fs.chmodSync(fakePipeline, 0o755);
+}
+
 test("detach race (#1062 R2): concurrent Ship detaches exactly once", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-race-"));
   const stateRoot = path.join(dir, "state");
   const repo = path.join(dir, "repo");
   const fakePipeline = path.join(dir, "pipeline");
+  const barrierDir = path.join(dir, "barrier");
+  const goFile = path.join(barrierDir, "go");
   // live_ship_probe is host-global per milestone. A shared real version
   // (v1.39.0) collides with leftover test stubs and any live ship on the host.
   const version = `9.99.${process.pid}.${Date.now()}`;
   try {
     fs.mkdirSync(repo, { recursive: true });
-    fs.writeFileSync(
-      fakePipeline,
-      "#!/usr/bin/env bash\n# long-lived train stub for concurrent detach\nsleep 3600\n",
-    );
-    fs.chmodSync(fakePipeline, 0o755);
+    fs.mkdirSync(barrierDir, { recursive: true });
+    writeLongLivedPipelineStub(fakePipeline);
 
     const env = {
       ...process.env,
@@ -863,65 +1075,717 @@ test("detach race (#1062 R2): concurrent Ship detaches exactly once", async () =
       SHIP_NOTIFY: "0",
       PIPELINE_SUPERVISOR_STATE: stateRoot,
     };
-    const args = [tugboat, "--milestone", `v${version}`, "--detach"];
 
-    const runOne = () =>
-      new Promise<{ status: number | null; out: string }>((resolve) => {
-        const child = spawn("bash", args, {
-          env,
-          stdio: ["ignore", "pipe", "pipe"],
-        });
-        let out = "";
-        child.stdout.on("data", (b) => {
-          out += String(b);
-        });
-        child.stderr.on("data", (b) => {
-          out += String(b);
-        });
-        child.on("close", (code) => {
-          resolve({ status: code, out });
-        });
-      });
-
-    const [a, b] = await Promise.all([runOne(), runOne()]);
+    const pendingA = spawnDetachViaBarrier({
+      id: "a",
+      barrierDir,
+      goFile,
+      version,
+      env,
+    });
+    const pendingB = spawnDetachViaBarrier({
+      id: "b",
+      barrierDir,
+      goFile,
+      version,
+      env,
+    });
+    const readyA = path.join(barrierDir, "a.ready");
+    const readyB = path.join(barrierDir, "b.ready");
+    await waitUntil(
+      () => fs.existsSync(readyA) && fs.existsSync(readyB),
+      10_000,
+      "both detach wrappers ready",
+    );
+    fs.writeFileSync(goFile, "go\n");
+    const [a, b] = await Promise.all([pendingA, pendingB]);
     const combined = `${a.out}\n${b.out}`;
-    const detachCount = (combined.match(/detached tugboat ship/g) || []).length;
-    const alreadyCount = (
-      combined.match(/already running.*not detaching a second copy/g) || []
-    ).length;
-
-    assert.equal(
-      detachCount,
-      1,
-      `expected exactly one detach, got ${detachCount}:\n${combined}`,
-    );
-    assert.ok(
-      alreadyCount >= 1 || a.status === 0,
-      `expected second request to report already-running or exit 0:\n${combined}`,
-    );
-    assert.equal(a.status, 0, `first detach status: ${a.status} out=${a.out}`);
-    assert.equal(b.status, 0, `second detach status: ${b.status} out=${b.out}`);
+    assertSingleDetachAdmission({
+      combined,
+      statuses: [a.status, b.status],
+    });
   } finally {
     // Reap before rmSync. Collecting only after asserts leaked sleep 3600
     // stubs whose argv still matched train --merge for the old milestone.
-    killPids(pidsWithCmdlineNeedle(dir));
-    killPids(pidsWithCmdlineNeedle(`--milestone v${version}`));
-    try {
-      const shipDir = path.join(stateRoot, `ship-v${version}`);
-      const pidFile = path.join(shipDir, "playbook.pid");
-      if (fs.existsSync(pidFile)) {
-        const p = Number(fs.readFileSync(pidFile, "utf8").trim());
-        if (Number.isFinite(p) && p > 0) {
-          try {
-            process.kill(p, "SIGTERM");
-          } catch {
-            /* gone */
-          }
-        }
+    reapDetachFixture(dir, stateRoot, version);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("detach race fixture: two detach lines fail the assertion", () => {
+  assert.throws(
+    () =>
+      assertSingleDetachAdmission({
+        combined:
+          "detached tugboat ship 9.99.1 (pid 1)\ndetached tugboat ship 9.99.1 (pid 2)\n",
+        statuses: [0, 0],
+      }),
+    /expected exactly one detach, got 2/,
+  );
+});
+
+test("detach race fixture stays enabled (not skipped or flaky)", () => {
+  const src = fs.readFileSync(path.join(here, "tugboat.test.ts"), "utf8");
+  const needle =
+    'test("detach race (#1062 R2): concurrent Ship detaches exactly once"';
+  const idx = src.indexOf(needle);
+  assert.ok(idx >= 0, "concurrent detach fixture must remain in tugboat.test.ts");
+  const head = src.slice(Math.max(0, idx - 80), idx + needle.length);
+  assert.doesNotMatch(head, /test\.skip|describe\.skip|\.todo\(|flaky/i);
+  assert.match(src, /spawnDetachViaBarrier/);
+  assert.match(src, /assertSingleDetachAdmission/);
+});
+
+test("admission lock leftover file is not a live ship", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-stale-lock-"));
+  const stateRoot = path.join(dir, "state");
+  const repo = path.join(dir, "repo");
+  const fakePipeline = path.join(dir, "pipeline");
+  const version = `9.99.${process.pid}.${Date.now()}.stale`;
+  try {
+    fs.mkdirSync(repo, { recursive: true });
+    writeLongLivedPipelineStub(fakePipeline);
+    const lockPath = admissionLockPath(stateRoot, repo, version);
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+    // Dead/absent owner, no live flock holder.
+    fs.writeFileSync(lockPath, "1 0\n");
+
+    const r = spawnSync(
+      "bash",
+      [tugboat, "--milestone", `v${version}`, "--detach"],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          REPO_DIR: repo,
+          PIPELINE: fakePipeline,
+          ALLOW_MERGE: "1",
+          SHIP_NOTIFY: "0",
+          PIPELINE_SUPERVISOR_STATE: stateRoot,
+        },
+      },
+    );
+    const out = `${r.stdout}\n${r.stderr}`;
+    assert.equal(r.status, 0, `stale lock detach status=${r.status} out=${out}`);
+    assert.match(out, /detached tugboat ship/);
+    assert.doesNotMatch(out, /already running.*not detaching a second copy/);
+    assert.doesNotMatch(out, /admission lock|lock file/i);
+  } finally {
+    reapDetachFixture(dir, stateRoot, version);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("failed wait-for-live reaps delayed child so a later detach is the only ship", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "delay-reap-"));
+  const stateRoot = path.join(dir, "state");
+  const repo = path.join(dir, "repo");
+  const fakePipeline = path.join(dir, "pipeline");
+  const version = `9.99.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2, 10)}`;
+  const marker = `DELAY_REAP_MARKER=${version}`;
+  const delayMs = 1500;
+  const delayChild = path.join(dir, "delay-child.sh");
+  const patched = path.join(dir, "patched.sh");
+  try {
+    fs.mkdirSync(repo, { recursive: true });
+    writeLongLivedPipelineStub(fakePipeline);
+
+    const wokeFile = path.join(dir, "delay.woke");
+    const pidFile = path.join(dir, "delay.pid");
+    fs.writeFileSync(
+      delayChild,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        `export DELAY_REAP_MARKER=${JSON.stringify(version)}`,
+        `printf '%s\\n' "$$" > ${JSON.stringify(pidFile)}`,
+        `sleep ${delayMs / 1000}`,
+        `printf 'woke\\n' > ${JSON.stringify(wokeFile)}`,
+        `exec bash ${JSON.stringify(tugboat)} "$@"`,
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(delayChild, 0o755);
+
+    const src = fs.readFileSync(tugboat, "utf8");
+    const needle = 'self=$(readlink -f "$0")';
+    assert.ok(src.includes(needle), "detach_self self= assign missing");
+    const patchedSrc = src
+      .replace(needle, `self=${JSON.stringify(delayChild)}`)
+      .replace(
+        'ADMISSION_LIVE_WAIT_ATTEMPTS="${ADMISSION_LIVE_WAIT_ATTEMPTS:-50}"',
+        "ADMISSION_LIVE_WAIT_ATTEMPTS=2",
+      )
+      .replace(
+        'ADMISSION_LIVE_WAIT_SLEEP_S="${ADMISSION_LIVE_WAIT_SLEEP_S:-0.1}"',
+        "ADMISSION_LIVE_WAIT_SLEEP_S=0.05",
+      );
+    assert.notEqual(patchedSrc, src, "must patch detach child path and wait bound");
+    fs.writeFileSync(patched, patchedSrc);
+    fs.chmodSync(patched, 0o755);
+
+    const baseEnv = {
+      ...process.env,
+      REPO_DIR: repo,
+      PIPELINE: fakePipeline,
+      ALLOW_MERGE: "1",
+      SHIP_NOTIFY: "0",
+      PIPELINE_SUPERVISOR_STATE: stateRoot,
+    };
+
+    const firstStarted = Date.now();
+    const first = spawnSync(
+      "bash",
+      [patched, "--milestone", `v${version}`, "--detach"],
+      {
+        encoding: "utf8",
+        env: {
+          ...baseEnv,
+          ADMISSION_LIVE_WAIT_ATTEMPTS: "2",
+          ADMISSION_LIVE_WAIT_SLEEP_S: "0.05",
+        },
+      },
+    );
+    const firstOut = `${first.stdout}\n${first.stderr}`;
+    assert.notEqual(
+      first.status,
+      0,
+      `first detach must fail wait-for-live, status=${first.status} out=${firstOut}`,
+    );
+    assert.doesNotMatch(firstOut, /detached tugboat ship/);
+    assert.match(firstOut, /did not become a live ship/);
+
+    let delayedPid: number | undefined;
+    if (fs.existsSync(pidFile)) {
+      delayedPid = Number(fs.readFileSync(pidFile, "utf8").trim());
+      if (Number.isFinite(delayedPid) && delayedPid > 0) {
+        assert.throws(
+          () => process.kill(delayedPid, 0),
+          /ESRCH/,
+          `delayed child pid ${delayedPid} must be dead before later detach`,
+        );
+      } else {
+        delayedPid = undefined;
       }
-    } catch {
-      /* ignore */
     }
+
+    const second = spawnSync(
+      "bash",
+      [tugboat, "--milestone", `v${version}`, "--detach"],
+      { encoding: "utf8", env: baseEnv },
+    );
+    const secondOut = `${second.stdout}\n${second.stderr}`;
+    assert.equal(
+      second.status,
+      0,
+      `later detach status=${second.status} out=${secondOut}`,
+    );
+    assert.match(secondOut, /detached tugboat ship/);
+    assert.equal(
+      countDetachLines(secondOut),
+      1,
+      `later detach must emit one ship line:\n${secondOut}`,
+    );
+
+    const remaining = delayMs + 400 - (Date.now() - firstStarted);
+    if (remaining > 0) {
+      await new Promise((r) => setTimeout(r, remaining));
+    }
+
+    assert.equal(
+      fs.existsSync(wokeFile),
+      false,
+      "delayed child must be reaped before it becomes a live ship",
+    );
+    if (delayedPid !== undefined) {
+      assert.throws(
+        () => process.kill(delayedPid, 0),
+        /ESRCH/,
+        `delayed child pid ${delayedPid} must stay dead after the delay window`,
+      );
+    }
+    const marked = procsWithNeedle(version).filter((p) => {
+      try {
+        const env = fs.readFileSync(`/proc/${p.pid}/environ`).toString("utf8");
+        return env.includes(marker);
+      } catch {
+        return false;
+      }
+    });
+    const markedOwners = marked.filter((p) => isOwningTugboatArgv(p.argv, version));
+    assert.equal(
+      markedOwners.length,
+      0,
+      `delayed child must not become a live ship after admission release:\n${markedOwners
+        .map((p) => `${p.pid} ${JSON.stringify(p.argv)}`)
+        .join("\n")}`,
+    );
+    const owners = procsWithNeedle(version).filter((p) =>
+      isOwningTugboatArgv(p.argv, version),
+    );
+    assert.ok(
+      owners.length >= 1,
+      `later detach must leave a live owning tugboat for v${version}`,
+    );
+  } finally {
+    reapDetachFixture(dir, stateRoot, version);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("SIGTERM during wait-for-live reaps the unconfirmed child before unlock", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "term-reap-"));
+  const stateRoot = path.join(dir, "state");
+  const repo = path.join(dir, "repo");
+  const fakePipeline = path.join(dir, "pipeline");
+  const version = `9.99.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2, 10)}`;
+  const marker = `TERM_REAP_MARKER=${version}`;
+  const delayChild = path.join(dir, "delay-child.sh");
+  const patched = path.join(dir, "patched.sh");
+  try {
+    fs.mkdirSync(repo, { recursive: true });
+    writeLongLivedPipelineStub(fakePipeline);
+
+    const wokeFile = path.join(dir, "delay.woke");
+    const pidFile = path.join(dir, "delay.pid");
+    fs.writeFileSync(
+      delayChild,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        `export TERM_REAP_MARKER=${JSON.stringify(version)}`,
+        `printf '%s\\n' "$$" > ${JSON.stringify(pidFile)}`,
+        "sleep 30",
+        `printf 'woke\\n' > ${JSON.stringify(wokeFile)}`,
+        `exec bash ${JSON.stringify(tugboat)} "$@"`,
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(delayChild, 0o755);
+
+    const src = fs.readFileSync(tugboat, "utf8");
+    const needle = 'self=$(readlink -f "$0")';
+    assert.ok(src.includes(needle), "detach_self self= assign missing");
+    const patchedSrc = src.replace(needle, `self=${JSON.stringify(delayChild)}`);
+    assert.notEqual(patchedSrc, src, "must patch detach child path");
+    fs.writeFileSync(patched, patchedSrc);
+    fs.chmodSync(patched, 0o755);
+
+    const baseEnv = {
+      ...process.env,
+      REPO_DIR: repo,
+      PIPELINE: fakePipeline,
+      ALLOW_MERGE: "1",
+      SHIP_NOTIFY: "0",
+      PIPELINE_SUPERVISOR_STATE: stateRoot,
+    };
+
+    const child = spawn("bash", [patched, "--milestone", `v${version}`, "--detach"], {
+      env: baseEnv,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "";
+    child.stdout.on("data", (b) => {
+      out += String(b);
+    });
+    child.stderr.on("data", (b) => {
+      out += String(b);
+    });
+    const finished = new Promise<{ status: number | null; out: string }>((resolve) => {
+      child.on("close", (code) => resolve({ status: code, out }));
+    });
+
+    await waitUntil(() => fs.existsSync(pidFile), 10_000, "unconfirmed child pid file");
+    const detachPid = child.pid;
+    assert.ok(detachPid && detachPid > 0, "detach parent pid missing");
+    let delayedPid = Number(fs.readFileSync(pidFile, "utf8").trim());
+    assert.ok(Number.isFinite(delayedPid) && delayedPid > 0, "delayed child pid missing");
+    process.kill(delayedPid, 0);
+    process.kill(detachPid, "SIGTERM");
+    const first = await finished;
+    const firstOut = first.out;
+    assert.notEqual(
+      first.status,
+      0,
+      `SIGTERM detach must fail closed, status=${first.status} out=${firstOut}`,
+    );
+    assert.doesNotMatch(firstOut, /detached tugboat ship/);
+
+    assert.throws(
+      () => process.kill(delayedPid, 0),
+      /ESRCH/,
+      `unconfirmed child pid ${delayedPid} must be dead after SIGTERM cleanup`,
+    );
+    assert.equal(fs.existsSync(wokeFile), false, "signaled child must not become a live ship");
+
+    const second = spawnSync(
+      "bash",
+      [tugboat, "--milestone", `v${version}`, "--detach"],
+      { encoding: "utf8", env: baseEnv },
+    );
+    const secondOut = `${second.stdout}\n${second.stderr}`;
+    assert.equal(
+      second.status,
+      0,
+      `later detach status=${second.status} out=${secondOut}`,
+    );
+    assert.match(secondOut, /detached tugboat ship/);
+    assert.equal(
+      countDetachLines(secondOut),
+      1,
+      `later detach must emit one ship line:\n${secondOut}`,
+    );
+    const owners = procsWithNeedle(version).filter((p) =>
+      isOwningTugboatArgv(p.argv, version),
+    );
+    assert.ok(
+      owners.length >= 1,
+      `later detach must leave a live owning tugboat for v${version}`,
+    );
+    const marked = procsWithNeedle(version).filter((p) => {
+      try {
+        const env = fs.readFileSync(`/proc/${p.pid}/environ`).toString("utf8");
+        return env.includes(marker);
+      } catch {
+        return false;
+      }
+    });
+    assert.equal(
+      marked.length,
+      0,
+      `SIGTERM path must not leave the unconfirmed child:\n${marked
+        .map((p) => `${p.pid} ${JSON.stringify(p.argv)}`)
+        .join("\n")}`,
+    );
+  } finally {
+    reapDetachFixture(dir, stateRoot, version);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("wait-for-live expiry reaps a re-parented descendant before unlock", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "reparent-reap-"));
+  const stateRoot = path.join(dir, "state");
+  const repo = path.join(dir, "repo");
+  const fakePipeline = path.join(dir, "pipeline");
+  const version = `9.99.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2, 10)}`;
+  const marker = `REPARENT_REAP_MARKER=${version}`;
+  const delayChild = path.join(dir, "reparent-child.sh");
+  const patched = path.join(dir, "patched.sh");
+  try {
+    fs.mkdirSync(repo, { recursive: true });
+    writeLongLivedPipelineStub(fakePipeline);
+
+    const wokeFile = path.join(dir, "reparent.woke");
+    const pidFile = path.join(dir, "reparent.pid");
+    const startedFile = path.join(dir, "reparent.started");
+    // Sleep longer than wait-for-live + reap so a slow /proc probe cannot
+    // let the descendant write woke before cleanup runs.
+    const descendantSleepS = 8;
+    fs.writeFileSync(
+      delayChild,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        `export REPARENT_REAP_MARKER=${JSON.stringify(version)}`,
+        `export DELAY_PID_FILE=${JSON.stringify(pidFile)}`,
+        `export DELAY_WOKE_FILE=${JSON.stringify(wokeFile)}`,
+        `export DELAY_STARTED_FILE=${JSON.stringify(startedFile)}`,
+        `export REAL_TUGBOAT=${JSON.stringify(tugboat)}`,
+        "exec python3 - \"$@\" <<'PY'",
+        "import os, sys, time",
+        "pidfile = os.environ['DELAY_PID_FILE']",
+        "woke = os.environ['DELAY_WOKE_FILE']",
+        "started = os.environ['DELAY_STARTED_FILE']",
+        "tug = os.environ['REAL_TUGBOAT']",
+        "child = os.fork()",
+        "if child > 0:",
+        "    os._exit(0)",
+        "os.setpgrp()",
+        "with open(started, 'w', encoding='utf8') as f:",
+        "    f.write('started\\n')",
+        "with open(pidfile, 'w', encoding='utf8') as f:",
+        "    f.write('%d\\n' % os.getpid())",
+        `time.sleep(${descendantSleepS})`,
+        "with open(woke, 'w', encoding='utf8') as f:",
+        "    f.write('woke\\n')",
+        "os.execvp('bash', ['bash', tug, *sys.argv[1:]])",
+        "PY",
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(delayChild, 0o755);
+
+    const src = fs.readFileSync(tugboat, "utf8");
+    const needle = 'self=$(readlink -f "$0")';
+    assert.ok(src.includes(needle), "detach_self self= assign missing");
+    const patchedSrc = src
+      .replace(needle, `self=${JSON.stringify(delayChild)}`)
+      .replace(
+        'ADMISSION_LIVE_WAIT_ATTEMPTS="${ADMISSION_LIVE_WAIT_ATTEMPTS:-50}"',
+        "ADMISSION_LIVE_WAIT_ATTEMPTS=2",
+      )
+      .replace(
+        'ADMISSION_LIVE_WAIT_SLEEP_S="${ADMISSION_LIVE_WAIT_SLEEP_S:-0.1}"',
+        "ADMISSION_LIVE_WAIT_SLEEP_S=0.05",
+      );
+    assert.notEqual(patchedSrc, src, "must patch detach child path and wait bound");
+    fs.writeFileSync(patched, patchedSrc);
+    fs.chmodSync(patched, 0o755);
+
+    const baseEnv = {
+      ...process.env,
+      REPO_DIR: repo,
+      PIPELINE: fakePipeline,
+      ALLOW_MERGE: "1",
+      SHIP_NOTIFY: "0",
+      PIPELINE_SUPERVISOR_STATE: stateRoot,
+    };
+
+    const firstStarted = Date.now();
+    const first = spawnSync(
+      "bash",
+      [patched, "--milestone", `v${version}`, "--detach"],
+      {
+        encoding: "utf8",
+        env: {
+          ...baseEnv,
+          ADMISSION_LIVE_WAIT_ATTEMPTS: "2",
+          ADMISSION_LIVE_WAIT_SLEEP_S: "0.05",
+        },
+      },
+    );
+    const firstOut = `${first.stdout}\n${first.stderr}`;
+    assert.notEqual(
+      first.status,
+      0,
+      `first detach must fail wait-for-live, status=${first.status} out=${firstOut}`,
+    );
+    assert.doesNotMatch(firstOut, /detached tugboat ship/);
+    assert.match(firstOut, /did not become a live ship/);
+
+    let delayedPid: number | undefined;
+    if (!fs.existsSync(pidFile) && !fs.existsSync(startedFile)) {
+      await waitUntil(
+        () => fs.existsSync(pidFile) || fs.existsSync(startedFile),
+        500,
+        "re-parented descendant pid/started file (may already be reaped)",
+      ).catch(() => undefined);
+    }
+    if (fs.existsSync(pidFile)) {
+      delayedPid = Number(fs.readFileSync(pidFile, "utf8").trim());
+      if (Number.isFinite(delayedPid) && delayedPid > 0) {
+        assert.throws(
+          () => process.kill(delayedPid, 0),
+          /ESRCH/,
+          `re-parented descendant pid ${delayedPid} must be dead before later detach`,
+        );
+      } else {
+        delayedPid = undefined;
+      }
+    }
+    assert.equal(
+      fs.existsSync(wokeFile),
+      false,
+      "re-parented descendant must not reach woke before later detach",
+    );
+
+    const second = spawnSync(
+      "bash",
+      [tugboat, "--milestone", `v${version}`, "--detach"],
+      { encoding: "utf8", env: baseEnv },
+    );
+    const secondOut = `${second.stdout}\n${second.stderr}`;
+    assert.equal(
+      second.status,
+      0,
+      `later detach status=${second.status} out=${secondOut}`,
+    );
+    assert.match(secondOut, /detached tugboat ship/);
+    assert.equal(
+      countDetachLines(secondOut),
+      1,
+      `later detach must emit one ship line:\n${secondOut}`,
+    );
+
+    const remaining = descendantSleepS * 1000 + 400 - (Date.now() - firstStarted);
+    if (remaining > 0) {
+      await new Promise((r) => setTimeout(r, remaining));
+    }
+
+    assert.equal(
+      fs.existsSync(wokeFile),
+      false,
+      "re-parented descendant must be reaped before it becomes a live ship",
+    );
+    if (delayedPid !== undefined) {
+      assert.throws(
+        () => process.kill(delayedPid, 0),
+        /ESRCH/,
+        `re-parented descendant pid ${delayedPid} must stay dead after the delay window`,
+      );
+    }
+    const marked = procsWithNeedle(version).filter((p) => {
+      try {
+        const env = fs.readFileSync(`/proc/${p.pid}/environ`).toString("utf8");
+        return env.includes(marker);
+      } catch {
+        return false;
+      }
+    });
+    const markedOwners = marked.filter((p) => isOwningTugboatArgv(p.argv, version));
+    assert.equal(
+      markedOwners.length,
+      0,
+      `re-parented descendant must not become a live ship after admission release:\n${markedOwners
+        .map((p) => `${p.pid} ${JSON.stringify(p.argv)}`)
+        .join("\n")}`,
+    );
+    const owners = procsWithNeedle(version).filter((p) =>
+      isOwningTugboatArgv(p.argv, version),
+    );
+    assert.ok(
+      owners.length >= 1,
+      `later detach must leave a live owning tugboat for v${version}`,
+    );
+  } finally {
+    reapDetachFixture(dir, stateRoot, version);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("failed wait-for-live releases admission for a later detach", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-fail-wait-"));
+  const stateRoot = path.join(dir, "state");
+  const repo = path.join(dir, "repo");
+  const fakePipeline = path.join(dir, "pipeline");
+  const version = `9.99.${process.pid}.${Date.now()}.failwait`;
+  try {
+    fs.mkdirSync(repo, { recursive: true });
+    writeLongLivedPipelineStub(fakePipeline);
+
+    const src = fs.readFileSync(tugboat, "utf8");
+    const names = [
+      "safe_of",
+      "repo_admission_token",
+      "admission_lock_path",
+      "admission_owner_identity",
+      "acquire_admission_lock",
+      "release_admission_lock",
+      "release_held_admission_locks",
+      "wait_until_live_ship",
+      "read_proc_argv",
+      "argv_is_live_ship",
+      "live_ship_probe",
+    ];
+    const helpers: string[] = [];
+    for (const name of names) {
+      const m = src.match(new RegExp(`^${name}\\(\\) \\{[\\s\\S]*?\\n\\}`, "m"));
+      assert.ok(m, `${name}() not found in tugboat.sh`);
+      helpers.push(m[0]);
+    }
+    const runner = path.join(dir, "fail-wait.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        `STATE_ROOT=${JSON.stringify(stateRoot)}`,
+        `REPO_DIR=${JSON.stringify(fs.realpathSync(repo))}`,
+        "ADMISSION_LOCK_WAIT_S=2",
+        "ADMISSION_LIVE_WAIT_ATTEMPTS=1",
+        "ADMISSION_LIVE_WAIT_SLEEP_S=0.01",
+        "ADMISSION_LOCK_VERSIONS=()",
+        "ADMISSION_LOCK_FDS=()",
+        ...helpers,
+        `acquire_admission_lock ${JSON.stringify(version)}`,
+        // No ship exists; wait must fail closed. Trap-equivalent release.
+        `if wait_until_live_ship ${JSON.stringify(version)}; then`,
+        '  echo "UNEXPECTED_LIVE"',
+        "  release_held_admission_locks",
+        "  exit 2",
+        "fi",
+        "release_held_admission_locks",
+        'echo "WAIT_FAILED_RELEASED"',
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    const failed = spawnSync("bash", [runner], { encoding: "utf8" });
+    assert.equal(
+      failed.status,
+      0,
+      `fail-wait helper status=${failed.status} out=${failed.stdout} err=${failed.stderr}`,
+    );
+    assert.match(failed.stdout, /WAIT_FAILED_RELEASED/);
+    assert.doesNotMatch(failed.stdout, /detached tugboat ship/);
+
+    const r = spawnSync(
+      "bash",
+      [tugboat, "--milestone", `v${version}`, "--detach"],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          REPO_DIR: repo,
+          PIPELINE: fakePipeline,
+          ALLOW_MERGE: "1",
+          SHIP_NOTIFY: "0",
+          PIPELINE_SUPERVISOR_STATE: stateRoot,
+        },
+      },
+    );
+    const out = `${r.stdout}\n${r.stderr}`;
+    assert.equal(r.status, 0, `later detach status=${r.status} out=${out}`);
+    assert.match(out, /detached tugboat ship/);
+  } finally {
+    reapDetachFixture(dir, stateRoot, version);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("sequential second detach uses live-ship probe after first is live", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-seq-detach-"));
+  const stateRoot = path.join(dir, "state");
+  const repo = path.join(dir, "repo");
+  const fakePipeline = path.join(dir, "pipeline");
+  const version = `9.99.${process.pid}.${Date.now()}.seq`;
+  try {
+    fs.mkdirSync(repo, { recursive: true });
+    writeLongLivedPipelineStub(fakePipeline);
+    const env = {
+      ...process.env,
+      REPO_DIR: repo,
+      PIPELINE: fakePipeline,
+      ALLOW_MERGE: "1",
+      SHIP_NOTIFY: "0",
+      PIPELINE_SUPERVISOR_STATE: stateRoot,
+    };
+    const first = spawnSync(
+      "bash",
+      [tugboat, "--milestone", `v${version}`, "--detach"],
+      { encoding: "utf8", env },
+    );
+    const firstOut = `${first.stdout}\n${first.stderr}`;
+    assert.equal(first.status, 0, `first detach status=${first.status} out=${firstOut}`);
+    assert.match(firstOut, /detached tugboat ship/);
+
+    const second = spawnSync(
+      "bash",
+      [tugboat, "--milestone", `v${version}`, "--detach"],
+      { encoding: "utf8", env },
+    );
+    const secondOut = `${second.stdout}\n${second.stderr}`;
+    assert.equal(
+      second.status,
+      0,
+      `second detach status=${second.status} out=${secondOut}`,
+    );
+    assert.match(secondOut, /already running.*not detaching a second copy/);
+    assert.doesNotMatch(secondOut, /detached tugboat ship/);
+    assert.doesNotMatch(secondOut, /admission lock|lock file|detach\.gate/i);
+  } finally {
+    reapDetachFixture(dir, stateRoot, version);
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

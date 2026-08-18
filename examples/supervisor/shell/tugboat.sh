@@ -53,6 +53,12 @@
 # Bare playbook.pid + kill -0, per-issue pipeline N locks, and stale state.json
 # alone are NOT live ships and must not refuse detach.
 #
+# Concurrent --detach (#1111): probe-and-spawn for one (repo, milestone) is
+# serialized by a host-local flock at
+# $PIPELINE_SUPERVISOR_STATE/admission/<repo-token>/vX.Y.Z.lock
+# (repo-token = sha256 of pinned REPO_DIR realpath). Lock-file presence is
+# not a live ship. Refuse is still live_ship_probe after the loser acquires.
+#
 # Version rules (hard-won):
 #   train --milestone wants "vX.Y.Z"
 #   release <version> wants bare "X.Y.Z" (leading v is INVALID)
@@ -60,6 +66,7 @@
 #   gh release view wants "vX.Y.Z"
 #
 # State: $PIPELINE_SUPERVISOR_STATE/ship-vX.Y.Z/{state.json,playbook.log,...}
+# Detach admission lock: $PIPELINE_SUPERVISOR_STATE/admission/<repo-token>/vX.Y.Z.lock
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -79,6 +86,19 @@ ENGINE_PROMOTE_HOST="${ENGINE_PROMOTE_HOST:-all}"
 RELEASE_CHECKS_GREEN_BIN="${RELEASE_CHECKS_GREEN_BIN:-$SCRIPT_DIR/release-checks-green.py}"
 TRAIN_STATUS_COMPLETE_BIN="${TRAIN_STATUS_COMPLETE_BIN:-$SCRIPT_DIR/train-status-complete.py}"
 REPO_DIR_PINNED=0
+# flock wait (seconds). Loser blocks this long while the winner holds until
+# live_ship_probe sees the detached child (nohup + exec on Actions).
+ADMISSION_LOCK_WAIT_S="${ADMISSION_LOCK_WAIT_S:-15}"
+# After setsid+nohup, poll until the child is a live ship. 50 * 0.1s = 5s.
+# Expire, INT, or TERM fails closed: reap the unconfirmed child (recorded
+# process group and session) before release. Do not print "detached tugboat ship".
+ADMISSION_LIVE_WAIT_ATTEMPTS="${ADMISSION_LIVE_WAIT_ATTEMPTS:-50}"
+ADMISSION_LIVE_WAIT_SLEEP_S="${ADMISSION_LIVE_WAIT_SLEEP_S:-0.1}"
+ADMISSION_LOCK_VERSIONS=()
+ADMISSION_LOCK_FDS=()
+PENDING_UNCONFIRMED_PID=""
+PENDING_UNCONFIRMED_PGRP=""
+PENDING_UNCONFIRMED_SID=""
 
 milestones=()
 do_detach=0
@@ -915,42 +935,310 @@ try_acquire_ship_lock() {
   return 1
 }
 
-# Short-lived host mutex: serializes probe-and-spawn for one milestone so
-# concurrent Ship requests cannot both pass not-live and stack detached
-# tugboats. Refusing a second ship is still based on live_ship_probe while
-# holding the gate — not on gate presence alone (#1062 R2).
-try_acquire_detach_gate() {
+# Host-local detach admission (#1111). Flock on a regular lock file serializes
+# probe-and-spawn for (pinned REPO_DIR, milestone). The #1109 hole was mkdir
+# detach.gate + empty-pid reclaim: two waiters both treated an unpublished pid
+# as stale and both admitted. Do not reclaim on "pid file empty right now."
+# Flock is the mutex. File presence is not a live ship.
+repo_admission_token() {
+  local hex
+  if [[ -z "${REPO_DIR:-}" ]]; then
+    echo "FAIL: REPO_DIR required for detach admission lock" >&2
+    return 1
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    hex=$(printf '%s' "$REPO_DIR" | sha256sum)
+    hex=${hex%% *}
+  else
+    echo "FAIL: sha256sum is required to key the detach admission lock" >&2
+    return 1
+  fi
+  printf '%s\n' "$hex"
+}
+
+admission_lock_path() {
   local version=$1
-  local dir gate holder
-  local i
-  dir="$STATE_ROOT/ship-v$(safe_of "$version")"
-  gate="$dir/detach.gate"
+  local token
+  token=$(repo_admission_token) || return 1
+  printf '%s\n' "$STATE_ROOT/admission/${token}/v$(safe_of "$version").lock"
+}
+
+# Same class as formatProcessIdentityMarker: "pid starttime" when readable.
+admission_owner_identity() {
+  local pid=$$
+  local s rest
+  local st=""
+  if [[ -r "/proc/$pid/stat" ]]; then
+    s=$(cat "/proc/$pid/stat" 2>/dev/null || true)
+    rest=${s##*)}
+    # After comm: $1=state (field 3) … $20=starttime (field 22).
+    set -- $rest
+    st=${20:-}
+  fi
+  if [[ -n "$st" ]]; then
+    printf '%s %s\n' "$pid" "$st"
+  else
+    printf '%s\n' "$pid"
+  fi
+}
+
+acquire_admission_lock() {
+  local version=$1
+  local lockfile dir fd
+  if ! command -v flock >/dev/null 2>&1; then
+    echo "FAIL: flock is required for detach admission (no mkdir-gate fallback)" >&2
+    return 1
+  fi
+  lockfile=$(admission_lock_path "$version") || return 1
+  dir=$(dirname "$lockfile")
   mkdir -p "$dir"
-  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 \
-           21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 \
-           41 42 43 44 45 46 47 48 49 50; do
-    if mkdir "$gate" 2>/dev/null; then
-      printf '%s\n' "$$" >"$gate/pid"
+  exec {fd}>>"$lockfile" || {
+    echo "FAIL: cannot open admission lock $lockfile" >&2
+    return 1
+  }
+  if ! flock -w "$ADMISSION_LOCK_WAIT_S" "$fd"; then
+    eval "exec ${fd}>&-"
+    echo "FAIL: timed out waiting for detach admission lock for v$version" >&2
+    return 1
+  fi
+  # Write identity after flock. Flock is the mutex; the write is diagnostics.
+  admission_owner_identity >"$lockfile"
+  ADMISSION_LOCK_VERSIONS+=("$version")
+  ADMISSION_LOCK_FDS+=("$fd")
+  return 0
+}
+
+release_admission_lock() {
+  local version=$1
+  local i fd
+  if [[ ${#ADMISSION_LOCK_VERSIONS[@]} -eq 0 ]]; then
+    return 0
+  fi
+  for i in "${!ADMISSION_LOCK_VERSIONS[@]}"; do
+    if [[ "${ADMISSION_LOCK_VERSIONS[$i]}" == "$version" ]]; then
+      fd="${ADMISSION_LOCK_FDS[$i]:-}"
+      if [[ -n "$fd" ]]; then
+        flock -u "$fd" 2>/dev/null || true
+        eval "exec ${fd}>&-" 2>/dev/null || true
+      fi
+      unset "ADMISSION_LOCK_VERSIONS[$i]"
+      unset "ADMISSION_LOCK_FDS[$i]"
       return 0
     fi
-    holder=$(cat "$gate/pid" 2>/dev/null || true)
-    if [[ -z "$holder" ]] || ! kill -0 "$holder" 2>/dev/null; then
-      rm -rf "$gate" 2>/dev/null || true
-      continue
+  done
+  return 0
+}
+
+release_held_admission_locks() {
+  local i fd
+  if [[ ${#ADMISSION_LOCK_VERSIONS[@]} -eq 0 ]]; then
+    return 0
+  fi
+  for i in "${!ADMISSION_LOCK_VERSIONS[@]}"; do
+    fd="${ADMISSION_LOCK_FDS[$i]:-}"
+    if [[ -n "$fd" ]]; then
+      flock -u "$fd" 2>/dev/null || true
+      eval "exec ${fd}>&-" 2>/dev/null || true
     fi
-    sleep 0.1
+  done
+  ADMISSION_LOCK_VERSIONS=()
+  ADMISSION_LOCK_FDS=()
+}
+
+# Poll until live_ship_probe sees VERSION, or SPAWN_PID itself is a live ship.
+# Bound is documented next to ADMISSION_LIVE_WAIT_* above.
+wait_until_live_ship() {
+  local version=$1
+  local spawn_pid=${2:-}
+  local i=0
+  local attempts="${ADMISSION_LIVE_WAIT_ATTEMPTS:-50}"
+  local sleep_s="${ADMISSION_LIVE_WAIT_SLEEP_S:-0.1}"
+  while [[ "$i" -lt "$attempts" ]]; do
+    if live_ship_probe "$version" >/dev/null 2>&1; then
+      return 0
+    fi
+    if [[ -n "$spawn_pid" ]] && kill -0 "$spawn_pid" 2>/dev/null \
+      && read_proc_argv "$spawn_pid" \
+      && argv_is_live_ship "$version" "${__proc_argv[@]}"; then
+      return 0
+    fi
+    sleep "$sleep_s"
+    i=$((i + 1))
   done
   return 1
 }
 
-release_detach_gate() {
-  local version=$1
-  local gate="$STATE_ROOT/ship-v$(safe_of "$version")/detach.gate"
-  local holder
-  holder=$(cat "$gate/pid" 2>/dev/null || true)
-  if [[ -z "$holder" || "$holder" == "$$" ]]; then
-    rm -rf "$gate" 2>/dev/null || true
+# Record the just-spawned detach child so EXIT/INT/TERM can reap it before
+# unlocking. After setsid, pid == pgrp == session; /proc is the source if it
+# has already forked a new group in that same session.
+record_pending_unconfirmed_child() {
+  local spawn_pid=${1:-}
+  local s rest pgrp sid self_pgrp="" self_sid=""
+  # setsid makes pid == pgrp == session. Keep those defaults if /proc still
+  # shows our own group (setsid has not completed) so we never record self.
+  PENDING_UNCONFIRMED_PID=$spawn_pid
+  PENDING_UNCONFIRMED_PGRP=$spawn_pid
+  PENDING_UNCONFIRMED_SID=$spawn_pid
+  [[ -n "$spawn_pid" ]] || return 0
+  if [[ -r /proc/self/stat ]]; then
+    s=$(cat /proc/self/stat 2>/dev/null || true)
+    rest=${s##*)}
+    set -- $rest
+    self_pgrp=${3:-}
+    self_sid=${4:-}
   fi
+  if [[ -r "/proc/$spawn_pid/stat" ]]; then
+    s=$(cat "/proc/$spawn_pid/stat" 2>/dev/null || true)
+    rest=${s##*)}
+    set -- $rest
+    pgrp=${3:-}
+    sid=${4:-}
+    if [[ -n "$pgrp" && "$pgrp" != "0" && "$pgrp" != "$self_pgrp" ]]; then
+      PENDING_UNCONFIRMED_PGRP=$pgrp
+    fi
+    if [[ -n "$sid" && "$sid" != "0" && "$sid" != "$self_sid" ]]; then
+      PENDING_UNCONFIRMED_SID=$sid
+    fi
+  fi
+}
+
+clear_pending_unconfirmed_child() {
+  PENDING_UNCONFIRMED_PID=""
+  PENDING_UNCONFIRMED_PGRP=""
+  PENDING_UNCONFIRMED_SID=""
+}
+
+# Reap any still-unconfirmed child, then drop flock. Idempotent for EXIT after
+# INT/TERM. Must not unlock while an unconfirmed descendant can still become live.
+cleanup_detach_admission() {
+  local pid pgrp sid
+  pid=${PENDING_UNCONFIRMED_PID:-}
+  pgrp=${PENDING_UNCONFIRMED_PGRP:-}
+  sid=${PENDING_UNCONFIRMED_SID:-}
+  clear_pending_unconfirmed_child
+  if [[ -n "$pid" ]]; then
+    reap_unconfirmed_detach_child "$pid" "$pgrp" "$sid"
+  fi
+  release_held_admission_locks
+}
+
+# Terminate a spawned detach child that never became a live ship. Must run
+# while admission is still held so a later detach cannot stack a second ship.
+# Signals the recorded process group and session (survives intermediate-parent
+# exit / re-parent) plus SPAWN_PID and remaining /proc descendants. Does not
+# signal this process's own group or session.
+reap_unconfirmed_detach_child() {
+  local spawn_pid=${1:-}
+  local spawn_pgrp=${2:-}
+  local spawn_sid=${3:-}
+  local self=$$
+  local self_pgrp="" self_sid="" s rest ppid pgrp sid p dir match
+  local i=0
+  [[ -n "$spawn_pid" && "$spawn_pid" != "$self" ]] || return 0
+
+  if [[ -r /proc/self/stat ]]; then
+    s=$(cat /proc/self/stat 2>/dev/null || true)
+    rest=${s##*)}
+    set -- $rest
+    self_pgrp=${3:-}
+    self_sid=${4:-}
+  fi
+  if [[ -n "$spawn_pgrp" && "$spawn_pgrp" == "$self_pgrp" ]]; then
+    spawn_pgrp=""
+  fi
+  if [[ -n "$spawn_sid" && "$spawn_sid" == "$self_sid" ]]; then
+    spawn_sid=""
+  fi
+
+  if [[ -n "$spawn_pgrp" ]]; then
+    kill -TERM -- "-$spawn_pgrp" 2>/dev/null || true
+  fi
+  kill -TERM "$spawn_pid" 2>/dev/null || true
+  shopt -s nullglob
+  for dir in /proc/[0-9]*; do
+    p=${dir#/proc/}
+    [[ "$p" != "$self" ]] || continue
+    [[ -r "/proc/$p/stat" ]] || continue
+    s=$(cat "/proc/$p/stat" 2>/dev/null || true)
+    rest=${s##*)}
+    set -- $rest
+    ppid=${2:-}
+    pgrp=${3:-}
+    sid=${4:-}
+    match=0
+    if [[ "$p" == "$spawn_pid" || "$ppid" == "$spawn_pid" ]]; then
+      match=1
+    elif [[ -n "$spawn_pgrp" && "$pgrp" == "$spawn_pgrp" ]]; then
+      match=1
+    elif [[ -n "$spawn_sid" && "$sid" == "$spawn_sid" ]]; then
+      match=1
+    fi
+    if [[ "$match" -eq 1 ]]; then
+      if [[ -n "$pgrp" && "$pgrp" != "$self_pgrp" ]]; then
+        kill -TERM -- "-$pgrp" 2>/dev/null || true
+      elif [[ "$p" != "$spawn_pid" ]]; then
+        kill -TERM "$p" 2>/dev/null || true
+      fi
+    fi
+  done
+
+  while [[ "$i" -lt 20 ]]; do
+    kill -0 "$spawn_pid" 2>/dev/null || break
+    sleep 0.05
+    i=$((i + 1))
+  done
+
+  if [[ -n "$spawn_pgrp" ]]; then
+    kill -KILL -- "-$spawn_pgrp" 2>/dev/null || true
+  fi
+  kill -KILL "$spawn_pid" 2>/dev/null || true
+  for dir in /proc/[0-9]*; do
+    p=${dir#/proc/}
+    [[ "$p" != "$self" ]] || continue
+    [[ -r "/proc/$p/stat" ]] || continue
+    s=$(cat "/proc/$p/stat" 2>/dev/null || true)
+    rest=${s##*)}
+    set -- $rest
+    ppid=${2:-}
+    pgrp=${3:-}
+    sid=${4:-}
+    match=0
+    if [[ "$p" == "$spawn_pid" || "$ppid" == "$spawn_pid" ]]; then
+      match=1
+    elif [[ -n "$spawn_pgrp" && "$pgrp" == "$spawn_pgrp" ]]; then
+      match=1
+    elif [[ -n "$spawn_sid" && "$sid" == "$spawn_sid" ]]; then
+      match=1
+    fi
+    if [[ "$match" -eq 1 ]]; then
+      if [[ -n "$pgrp" && "$pgrp" != "$self_pgrp" ]]; then
+        kill -KILL -- "-$pgrp" 2>/dev/null || true
+      fi
+      kill -KILL "$p" 2>/dev/null || true
+    fi
+  done
+  wait "$spawn_pid" 2>/dev/null || true
+  # A child can _exit after fork before the descendant is visible in /proc.
+  # One more session scan after a short wait catches that re-parent.
+  sleep 0.05
+  for dir in /proc/[0-9]*; do
+    p=${dir#/proc/}
+    [[ "$p" != "$self" ]] || continue
+    [[ -r "/proc/$p/stat" ]] || continue
+    s=$(cat "/proc/$p/stat" 2>/dev/null || true)
+    rest=${s##*)}
+    set -- $rest
+    pgrp=${3:-}
+    sid=${4:-}
+    if [[ -n "$spawn_sid" && "$sid" == "$spawn_sid" ]] \
+      || [[ -n "$spawn_pgrp" && "$pgrp" == "$spawn_pgrp" ]]; then
+      if [[ -n "$pgrp" && "$pgrp" != "$self_pgrp" ]]; then
+        kill -KILL -- "-$pgrp" 2>/dev/null || true
+      fi
+      kill -KILL "$p" 2>/dev/null || true
+    fi
+  done
+  return 0
 }
 
 # Find open release PR for bare version X.Y.Z (title "release: X.Y.Z …").
@@ -1015,8 +1303,6 @@ detach_self() {
   self=$(readlink -f "$0")
   local args=()
   local m holder pid
-  local -a gates=()
-  local _wait
   pin_repo_dir
   if [[ -z "$REPO_DIR" || ! -d "$REPO_DIR" ]]; then
     echo "FAIL: REPO_DIR required and must be a directory (got: ${REPO_DIR:-<unset>})" >&2
@@ -1033,39 +1319,34 @@ detach_self() {
   # Bare playbook.pid + kill -0, issue-run locks, and stale state are NOT live.
   # Buzz and TUI paste share this path — no paste detector.
   #
-  # Serialize probe-and-spawn with a short-lived per-milestone detach.gate so
-  # two concurrent Ship requests cannot both observe not-live and stack
-  # detached tugboats. Second request is refused only when re-probe is live
-  # while holding the gate — not merely because the gate exists (#1062 R2).
-  release_held_detach_gates() {
-    local g
-    for g in "${gates[@]}"; do
-      release_detach_gate "$g"
-    done
-    gates=()
-  }
+  # Serialize probe-and-spawn with a host-local flock on
+  # $STATE_ROOT/admission/<repo-token>/v<milestone>.lock so two concurrent
+  # Ship requests cannot both observe not-live and stack detached tugboats.
+  # The loser waits, then re-probes. Lock-file presence is not already-running
+  # (#1111). Hold flock until live_ship_probe sees the child.
+  # Reap any still-unconfirmed child before unlock on RETURN/EXIT/INT/TERM.
+  trap 'cleanup_detach_admission' RETURN
+  trap 'cleanup_detach_admission' EXIT
+  trap 'cleanup_detach_admission; exit 130' INT
+  trap 'cleanup_detach_admission; exit 143' TERM
 
   for m in "${milestones[@]}"; do
-    if ! try_acquire_detach_gate "$m"; then
-      # Gate timeout: re-probe; if live, refuse as duplicate. Else fail closed
+    if ! acquire_admission_lock "$m"; then
+      # Wait timeout: re-probe; if live, refuse as duplicate. Else fail closed
       # rather than risk stacking another detached tugboat.
       if holder=$(live_ship_probe "$m" 2>/dev/null); then
-        release_held_detach_gates
         echo "ship v$m already running (pid $holder) — not detaching a second copy"
         emit_status_json "$m"
         notify "ship v$m already running (pid $holder) — ignored duplicate detach" "tug-dup-detach-$m-$$" --force
         return 0
       fi
-      release_held_detach_gates
-      echo "FAIL: could not acquire detach gate for v$m (concurrent ship in progress?)" >&2
+      echo "FAIL: timed out waiting for detach admission lock for v$m" >&2
       exit 1
     fi
-    gates+=("$m")
   done
 
   for m in "${milestones[@]}"; do
     if holder=$(live_ship_probe "$m" 2>/dev/null); then
-      release_held_detach_gates
       echo "ship v$m already running (pid $holder) — not detaching a second copy"
       emit_status_json "$m"
       notify "ship v$m already running (pid $holder) — ignored duplicate detach" "tug-dup-detach-$m-$$" --force
@@ -1073,7 +1354,14 @@ detach_self() {
     fi
   done
 
-  nohup env PIPELINE="$PIPELINE" REPO_DIR="$REPO_DIR" ALLOW_MERGE="$ALLOW_MERGE" \
+  if ! command -v setsid >/dev/null 2>&1; then
+    echo "FAIL: setsid is required to isolate the detached child process group" >&2
+    exit 1
+  fi
+
+  # Dedicated session/process group so cleanup can kill the whole tree after
+  # an intermediate parent exits (re-parented descendants keep this session).
+  setsid nohup env PIPELINE="$PIPELINE" REPO_DIR="$REPO_DIR" ALLOW_MERGE="$ALLOW_MERGE" \
     SHIP_NOTIFY="$SHIP_NOTIFY" SHIP_NOTIFY_BIN="$SHIP_NOTIFY_BIN" \
     SHIP_STAGE_WATCH_BIN="$SHIP_STAGE_WATCH_BIN" \
     RELEASE_WAIT_ATTEMPTS="$RELEASE_WAIT_ATTEMPTS" RELEASE_WAIT_SLEEP_S="$RELEASE_WAIT_SLEEP_S" \
@@ -1089,25 +1377,30 @@ detach_self() {
     TUGBOAT_FRG_MANIFEST_PATH="${TUGBOAT_FRG_MANIFEST_PATH:-}" \
     "$self" "${args[@]}" >/dev/null 2>&1 &
   pid=$!
-  echo "detached tugboat ship ${milestones[*]} (pid $pid)"
+  record_pending_unconfirmed_child "$pid"
   # Do NOT write playbook.pid here — the child acquires the lock then writes it.
   # Writing the parent/nohup pid here raced and let a second detach steal the lock.
 
-  # Hold gate until the new ship is visible to live_ship_probe (or brief timeout)
-  # so a concurrent waiter re-probes after we release and sees live.
-  for _wait in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-    if live_ship_probe "${milestones[0]}" >/dev/null 2>&1; then
-      break
-    fi
-    if kill -0 "$pid" 2>/dev/null && read_proc_argv "$pid" \
-      && argv_is_live_ship "${milestones[0]}" "${__proc_argv[@]}"; then
-      break
-    fi
-    sleep 0.05
-  done
+  if ! kill -0 "$pid" 2>/dev/null; then
+    echo "FAIL: tugboat detach spawn failed for v${milestones[0]}" >&2
+    exit 1
+  fi
 
+  # Hold flock until the new ship is visible to live_ship_probe (or bound).
+  # Emit "detached tugboat ship" only after that probe succeeds.
+  if ! wait_until_live_ship "${milestones[0]}" "$pid"; then
+    echo "FAIL: detached child did not become a live ship for v${milestones[0]}" >&2
+    # Reap before EXIT releases admission. A slow child must not become live
+    # after the lock drops and admit a second ship (#1111).
+    reap_unconfirmed_detach_child "$pid" \
+      "${PENDING_UNCONFIRMED_PGRP:-}" "${PENDING_UNCONFIRMED_SID:-}"
+    clear_pending_unconfirmed_child
+    exit 1
+  fi
+
+  clear_pending_unconfirmed_child
+  echo "detached tugboat ship ${milestones[*]} (pid $pid)"
   notify "detached ship ${milestones[*]} (pid $pid)" "tug-detach-$$" --force
-  release_held_detach_gates
 }
 
 # ---------- status / detach (before any single-milestone bind) --------------
