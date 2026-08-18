@@ -31,9 +31,7 @@ item.
 
 ### Requirement: The clean-docs fixture SHALL declare release_version 1.39.2
 
-The JSON object at
-`core/test/fixtures/frg/pack-1392-tugboat-ship-1.39.2/clean-docs.json` SHALL
-include a `release_version` field whose value is the string `1.39.2`.
+The JSON object at `core/test/fixtures/frg/pack-1392-tugboat-ship-1.39.2/clean-docs.json` SHALL include a `release_version` field whose value is the string `1.39.2`.
 
 #### Scenario: Fixture version matches the pack release
 

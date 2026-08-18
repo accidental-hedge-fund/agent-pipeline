@@ -18,17 +18,17 @@ This is not **BREAKING**.
 
 ## Acceptance Criteria
 
-- [ ] File `core/test/fixtures/frg/pack-1392-tugboat-ship-1.39.2/clean-docs.json`
+- [x] File `core/test/fixtures/frg/pack-1392-tugboat-ship-1.39.2/clean-docs.json`
       exists and is valid JSON.
-- [ ] That fixture sets `release_version` to the string `1.39.2`.
-- [ ] A unit test reads only that run-scoped path (no other pack-run
+- [x] That fixture sets `release_version` to the string `1.39.2`.
+- [x] A unit test reads only that run-scoped path (no other pack-run
       fixture path).
-- [ ] The unit test fails when `release_version` is missing or is not
+- [x] The unit test fails when `release_version` is missing or is not
       `1.39.2`.
-- [ ] The change does not alter production pipeline behavior (no edits
+- [x] The change does not alter production pipeline behavior (no edits
       under `core/scripts/` that change runtime logic).
-- [ ] After any `core/` edit, `plugin/` is regenerated in the same change.
-- [ ] `npm run ci` is green.
+- [x] After any `core/` edit, `plugin/` is regenerated in the same change.
+- [x] `npm run ci` is green.
 - [ ] The issue can reach `pipeline:ready-to-deploy`. FRG close-without-merge
       stays an FRG driver duty, not this change.
 
