@@ -631,6 +631,60 @@ async function defaultFileExists(p: string): Promise<boolean> {
   }
 }
 
+/**
+ * True when latest.json is a production-attested hybrid-v2 score of this
+ * request's exact candidate. Auto-tag and promote require that file; prepare
+ * must reuse it instead of starting a second pack or overwriting it.
+ */
+export function honestLatestJsonBindsRequest(
+  request: FactoryReleasePrepareRequest,
+  evidence: {
+    version?: string;
+    pass?: boolean;
+    pack_id?: string | null;
+    loop_run_id?: string | null;
+    run_id?: string;
+    integrity?: { attestation?: unknown } | null;
+    pack_provenance?: { candidate_git_sha?: string } | null;
+  },
+): boolean {
+  if (evidence.version !== request.target_version) return false;
+  if (evidence.pass !== true) return false;
+  if (evidence.pack_id !== request.frg_manifest.pack_id) return false;
+  if (typeof evidence.loop_run_id !== "string" || evidence.loop_run_id.trim() === "") {
+    return false;
+  }
+  if (typeof evidence.run_id !== "string" || evidence.run_id.trim() === "") return false;
+  if (!evidence.integrity?.attestation) return false;
+  const cand = evidence.pack_provenance?.candidate_git_sha?.toLowerCase() ?? "";
+  return cand === request.integrated_candidate.git_sha.toLowerCase();
+}
+
+/** Pick an already-open/merged PR whose head is the request candidate. */
+export function selectExistingReleaseRow(
+  request: FactoryReleasePrepareRequest,
+  rows: ReadonlyArray<{
+    number?: number;
+    headRefOid?: string;
+    baseRefName?: string;
+    state?: string;
+  }>,
+): { pr: number; head_oid: string; version: string } | null {
+  const candidate = request.integrated_candidate.git_sha.toLowerCase();
+  for (const row of rows) {
+    const pr = Number(row.number);
+    const head = String(row.headRefOid ?? "").toLowerCase();
+    if (!Number.isSafeInteger(pr) || pr <= 0 || !/^[0-9a-f]{40}$/i.test(head)) continue;
+    if (row.baseRefName !== request.base_branch) continue;
+    const state = String(row.state ?? "OPEN").toUpperCase();
+    if (state !== "OPEN" && state !== "MERGED") continue;
+    if (head === candidate) {
+      return { pr, head_oid: head, version: request.target_version };
+    }
+  }
+  return null;
+}
+
 /** Placeholder FRG payload used only in hard-fail results (never release-eligible). */
 function refusedFrgPayload(request: FactoryReleasePrepareRequest): FactoryReleaseFrgPayload {
   return {
@@ -1664,6 +1718,53 @@ export async function generateDurableUnsignedFrg(
   await mkdir(artDir, { recursive: true, mode: 0o700 });
   await mkdir(ctx.workDir, { recursive: true, mode: 0o700 });
 
+  const existingLatestPath = path.join(
+    ctx.repoDir,
+    ".agent-pipeline",
+    "frg",
+    request.target_version,
+    "latest.json",
+  );
+  if (await fileExists(existingLatestPath)) {
+    try {
+      const latestText = await readFile(existingLatestPath);
+      const latestRaw = JSON.parse(latestText) as {
+        version?: string;
+        pass?: boolean;
+        pack_id?: string | null;
+        loop_run_id?: string | null;
+        run_id?: string;
+        created_at?: string;
+        integrity?: { attestation?: unknown } | null;
+        pack_provenance?: { candidate_git_sha?: string; pack_run_id?: string } | null;
+      };
+      if (honestLatestJsonBindsRequest(request, latestRaw) && latestRaw.run_id && latestRaw.loop_run_id) {
+        const digest = sha256(latestText);
+        const ref = { path: existingLatestPath, sha256: digest };
+        return {
+          frg: {
+            pack_id: latestRaw.pack_id ?? request.frg_manifest.pack_id,
+            manifest_path: ctx.manifestPath,
+            manifest_sha256: request.frg_manifest.sha256,
+            pack_run_id: latestRaw.pack_provenance?.pack_run_id ?? packRunId,
+            loop_run_id: latestRaw.loop_run_id,
+            frg_run_id: latestRaw.run_id,
+            evidence_created_at: latestRaw.created_at ?? isoNow(now()),
+            observations: ref,
+            evidence_bundle: ref,
+            contract: ref,
+            ledger: ref,
+            events: ref,
+            action_evidence: ref,
+          },
+          structurally_eligible: true,
+        };
+      }
+    } catch {
+      // Unreadable or unbound latest.json — fall through to pack start/score.
+    }
+  }
+
   // Fresh pack binding record (version + candidate + action) — refuse reuse of
   // earlier-version evidence by never reading foreign frg/<old-version> trees here.
   const binding = {
@@ -1982,30 +2083,31 @@ async function tryLoadAttestedEvidence(
 
   let evidence: FrgEvidence;
   try {
-    evidence = validateReleaseEligibleFrgEvidence(parseFrgEvidenceJson(text), request.target_version);
+    evidence = parseFrgEvidenceJson(text);
   } catch {
-    try {
-      const parsed = parseFrgEvidenceJson(text);
-      if (parsed.version !== request.target_version || parsed.run_id !== unsigned.frg_run_id) {
-        return null;
-      }
-      if (!parsed.pass || !isReleaseEligibleFrgPass(parsed)) return null;
-      evidence = parsed;
-    } catch {
+    return null;
+  }
+  if (
+    honestLatestJsonBindsRequest(request, evidence) &&
+    evidence.run_id === unsigned.frg_run_id &&
+    evidence.loop_run_id === unsigned.loop_run_id
+  ) {
+    return { evidence, text, path: evidencePath };
+  }
+  if (evidence.pack_provenance != null) return null;
+  try {
+    evidence = validateReleaseEligibleFrgEvidence(evidence, request.target_version);
+  } catch {
+    if (evidence.version !== request.target_version || evidence.run_id !== unsigned.frg_run_id) {
       return null;
     }
+    if (!evidence.pass || !isReleaseEligibleFrgPass(evidence)) return null;
   }
 
   if (evidence.run_id !== unsigned.frg_run_id) return null;
   if (evidence.loop_run_id !== unsigned.loop_run_id) return null;
   if (evidence.pack_id !== unsigned.pack_id) return null;
   if (evidence.version !== request.target_version) return null;
-  if (evidence.pack_provenance != null) {
-    throw new Error(
-      `factory-release prepare: hybrid pack_provenance is not accepted for ${request.target_version}; ` +
-        `durable path required after v${FRG_HYBRID_PILOT_VERSION}`,
-    );
-  }
   if (!evidence.integrity?.attestation) return null;
 
   // Exact-artifact two-call handoff: attestation must bind request fingerprint
@@ -2134,13 +2236,35 @@ export async function defaultObserveExistingRelease(
       headRefOid?: string;
       baseRefName?: string;
     }>;
-    if (!Array.isArray(rows) || rows.length === 0) return null;
-    const row = rows[0]!;
-    const pr = Number(row.number);
-    const head = String(row.headRefOid ?? "");
-    if (!Number.isSafeInteger(pr) || pr <= 0 || !/^[0-9a-f]{40}$/i.test(head)) return null;
-    if (row.baseRefName !== request.base_branch) return null;
-    return { pr, head_oid: head.toLowerCase(), version: request.target_version };
+    if (Array.isArray(rows) && rows.length > 0) {
+      const row = rows[0]!;
+      const pr = Number(row.number);
+      const head = String(row.headRefOid ?? "");
+      if (Number.isSafeInteger(pr) && pr > 0 && /^[0-9a-f]{40}$/i.test(head)) {
+        if (row.baseRefName === request.base_branch) {
+          return { pr, head_oid: head.toLowerCase(), version: request.target_version };
+        }
+      }
+    }
+  } catch {
+    // Fall through to candidate-head lookup.
+  }
+  try {
+    const { stdout } = await execFileAsync(
+      "gh",
+      [
+        "pr", "list", "-R", request.repository, "--state", "open",
+        "--limit", "50", "--json", "number,title,state,headRefOid,baseRefName",
+      ],
+      { timeout: 60_000, maxBuffer: 10 * 1024 * 1024 },
+    );
+    const openRows = JSON.parse(String(stdout)) as Array<{
+      number?: number;
+      state?: string;
+      headRefOid?: string;
+      baseRefName?: string;
+    }>;
+    return selectExistingReleaseRow(request, Array.isArray(openRows) ? openRows : []);
   } catch {
     return null;
   }
@@ -2651,20 +2775,22 @@ export async function runFactoryReleasePrepare(
         }
       }
     }
-    const mismatch = unsignedDigestBindingMismatch(expectedBinding, observedBinding);
-    if (mismatch) {
-      const msg =
-        `factory-release prepare: attested evidence unsigned digest binding failed ` +
-        `for ${request.target_version}: ${mismatch}`;
-      return {
-        exitCode: 1,
-        result: failedResult(
-          request,
-          "attestation_digest_mismatch",
-          msg,
-          checkpointId("failed", fingerprint),
-        ),
-      };
+    if (!honestLatestJsonBindsRequest(request, attestation.evidence)) {
+      const mismatch = unsignedDigestBindingMismatch(expectedBinding, observedBinding);
+      if (mismatch) {
+        const msg =
+          `factory-release prepare: attested evidence unsigned digest binding failed ` +
+          `for ${request.target_version}: ${mismatch}`;
+        return {
+          exitCode: 1,
+          result: failedResult(
+            request,
+            "attestation_digest_mismatch",
+            msg,
+            checkpointId("failed", fingerprint),
+          ),
+        };
+      }
     }
   }
 
