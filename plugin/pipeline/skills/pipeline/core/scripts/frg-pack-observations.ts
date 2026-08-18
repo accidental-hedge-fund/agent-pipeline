@@ -936,7 +936,10 @@ export function collectFrgPackObservations(
     }
     const labels = stringArray(issue.labels, `${field}.labels`);
     for (const label of expected.labels) {
-      if (!labels.includes(label)) throw new Error(`${field} is missing required label ${label}`);
+      if (labels.includes(label)) continue;
+      // Terminal pack items replace pipeline:ready with pipeline:ready-to-deploy.
+      if (label === "pipeline:ready" && labels.includes("pipeline:ready-to-deploy")) continue;
+      throw new Error(`${field} is missing required label ${label}`);
     }
     const issueNumber = positiveInteger(issue.issue_number, `${field}.issue_number`);
     const pr = record(issue.pr, `${field}.pr`);

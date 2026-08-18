@@ -3,9 +3,6 @@
 
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { readFile } from "node:fs/promises";
-import { readdir } from "node:fs/promises";
-import path from "node:path";
 import {
   collectFrgPackObservations,
   defaultFrgPackRoot,
@@ -262,27 +259,19 @@ export async function defaultCollectHybridV2FromRun(
   const createdTimes = liveIssues.map((issue) => Date.parse(issue.created_at)).filter(Number.isFinite);
   const startedAt = new Date(Math.min(...createdTimes)).toISOString().replace(/\.\d{3}Z$/, "Z");
 
-  let packRunId = `pack-from-run-${args.fromRun}`;
-  try {
-    const root = path.join(args.repoDir, ".agent-pipeline", "factory-release");
-    const dirs = await readdir(root);
-    for (const dir of dirs) {
-      try {
-        const raw = JSON.parse(await readFile(path.join(root, dir, "pack-instance.json"), "utf8")) as {
-          pack_run_id?: string;
-          loop_run_id?: string;
-        };
-        if (raw.loop_run_id === args.fromRun && typeof raw.pack_run_id === "string") {
-          packRunId = raw.pack_run_id;
-          break;
-        }
-      } catch {
-        // ignore unreadable instance files
-      }
-    }
-  } catch {
-    // no factory-release dir
+  const packRunIds = [
+    ...new Set(
+      liveIssues
+        .map((issue) => /pack_run_id=([A-Za-z0-9._:-]+)/.exec(issue.body ?? "")?.[1])
+        .filter((id): id is string => Boolean(id)),
+    ),
+  ];
+  if (packRunIds.length !== 1) {
+    throw new Error(
+      `pipeline factory-gate: live pack issues must share one pack_run_id marker (got ${packRunIds.join(",") || "none"})`,
+    );
   }
+  const packRunId = packRunIds[0]!;
 
   const probes: VerifiedFrgPackRun["probes"] = [];
   for (const probe of pack.manifest.pilot_policy.layer_a_probes) {

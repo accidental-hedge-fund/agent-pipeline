@@ -638,6 +638,16 @@ test("historical v1 probe matrix stays frozen when the current v2 list is simula
   );
 });
 
+test("collector accepts pipeline:ready-to-deploy in place of pipeline:ready", async () => {
+  const pack = await loadFrgPack();
+  const bundle = makeEvidenceBundle(pack);
+  bundle.issues[0]!.labels = bundle.issues[0]!.labels
+    .filter((name) => name !== "pipeline:ready")
+    .concat("pipeline:ready-to-deploy");
+  const observations = collectFrgPackObservations(pack, bundle);
+  assert.equal(observations.pack_provenance.issues[0]?.issue_number, bundle.issues[0]!.issue_number);
+});
+
 test("collector accepts leftover blocked_theme on a ready ledger item (#1118)", async () => {
   const pack = await loadFrgPack();
   const bundle = makeEvidenceBundle(pack);
