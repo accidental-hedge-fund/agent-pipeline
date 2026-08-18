@@ -8,6 +8,7 @@ OpenSpec path is checkable without production behavior change.
 
 ### Requirement: The pack-1392-tugboat-ship-1.39.2 clean-openspec fixture SHALL name release 1.39.2
 
+The pack-1392-tugboat-ship-1.39.2 clean-openspec fixture SHALL name release 1.39.2.
 The run-scoped fixture at
 `core/test/fixtures/frg/pack-1392-tugboat-ship-1.39.2/clean-openspec.json`
 SHALL set `release_version` to the exact string `1.39.2`. A unit test
