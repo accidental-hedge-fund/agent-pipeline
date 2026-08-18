@@ -90,7 +90,8 @@ REPO_DIR_PINNED=0
 # live_ship_probe sees the detached child (nohup + exec on Actions).
 ADMISSION_LOCK_WAIT_S="${ADMISSION_LOCK_WAIT_S:-15}"
 # After nohup, poll until the child is a live ship. 50 * 0.1s = 5s. Expire
-# fails closed and does not print "detached tugboat ship".
+# fails closed: reap the unconfirmed child, then release admission, and do
+# not print "detached tugboat ship".
 ADMISSION_LIVE_WAIT_ATTEMPTS="${ADMISSION_LIVE_WAIT_ATTEMPTS:-50}"
 ADMISSION_LIVE_WAIT_SLEEP_S="${ADMISSION_LIVE_WAIT_SLEEP_S:-0.1}"
 ADMISSION_LOCK_VERSIONS=()
@@ -1064,6 +1065,71 @@ wait_until_live_ship() {
   return 1
 }
 
+# Terminate a spawned detach child that never became a live ship. Must run
+# while admission is still held so a later detach cannot stack a second ship.
+# Signals SPAWN_PID, one level of /proc descendants, and any process group the
+# child owns. Does not signal this process's own group (nohup often shares it).
+reap_unconfirmed_detach_child() {
+  local spawn_pid=${1:-}
+  local self=$$
+  local self_pgrp="" s rest ppid pgrp p dir
+  local i=0
+  [[ -n "$spawn_pid" && "$spawn_pid" != "$self" ]] || return 0
+
+  if [[ -r /proc/self/stat ]]; then
+    s=$(cat /proc/self/stat 2>/dev/null || true)
+    rest=${s##*)}
+    set -- $rest
+    self_pgrp=${3:-}
+  fi
+
+  kill -TERM "$spawn_pid" 2>/dev/null || true
+  shopt -s nullglob
+  for dir in /proc/[0-9]*; do
+    p=${dir#/proc/}
+    [[ "$p" != "$self" ]] || continue
+    [[ -r "/proc/$p/stat" ]] || continue
+    s=$(cat "/proc/$p/stat" 2>/dev/null || true)
+    rest=${s##*)}
+    set -- $rest
+    ppid=${2:-}
+    pgrp=${3:-}
+    if [[ "$p" == "$spawn_pid" || "$ppid" == "$spawn_pid" ]]; then
+      if [[ -n "$pgrp" && "$pgrp" == "$p" && "$pgrp" != "$self_pgrp" ]]; then
+        kill -TERM -- "-$pgrp" 2>/dev/null || true
+      elif [[ "$p" != "$spawn_pid" ]]; then
+        kill -TERM "$p" 2>/dev/null || true
+      fi
+    fi
+  done
+
+  while [[ "$i" -lt 20 ]]; do
+    kill -0 "$spawn_pid" 2>/dev/null || break
+    sleep 0.05
+    i=$((i + 1))
+  done
+
+  kill -KILL "$spawn_pid" 2>/dev/null || true
+  for dir in /proc/[0-9]*; do
+    p=${dir#/proc/}
+    [[ "$p" != "$self" ]] || continue
+    [[ -r "/proc/$p/stat" ]] || continue
+    s=$(cat "/proc/$p/stat" 2>/dev/null || true)
+    rest=${s##*)}
+    set -- $rest
+    ppid=${2:-}
+    pgrp=${3:-}
+    if [[ "$p" == "$spawn_pid" || "$ppid" == "$spawn_pid" ]]; then
+      if [[ -n "$pgrp" && "$pgrp" == "$p" && "$pgrp" != "$self_pgrp" ]]; then
+        kill -KILL -- "-$pgrp" 2>/dev/null || true
+      fi
+      kill -KILL "$p" 2>/dev/null || true
+    fi
+  done
+  wait "$spawn_pid" 2>/dev/null || true
+  return 0
+}
+
 # Find open release PR for bare version X.Y.Z (title "release: X.Y.Z …").
 find_open_release_pr() {
   local ver=$1
@@ -1204,6 +1270,9 @@ detach_self() {
   # Emit "detached tugboat ship" only after that probe succeeds.
   if ! wait_until_live_ship "${milestones[0]}" "$pid"; then
     echo "FAIL: detached child did not become a live ship for v${milestones[0]}" >&2
+    # Reap before EXIT releases admission. A slow child must not become live
+    # after the lock drops and admit a second ship (#1111).
+    reap_unconfirmed_detach_child "$pid"
     exit 1
   fi
 

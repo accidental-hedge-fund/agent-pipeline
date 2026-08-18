@@ -78,7 +78,7 @@ Keep the existing sequential / negative #1062 tests (bare `playbook.pid`, issue-
 
 - Loser waits on flock, then refuses after the winner is live (the concurrent fixture’s already-running line is this case).
 - Leftover admission lock file (dead or absent owner, no live flock) does not block a sequential `--detach`.
-- Failed spawn or expired wait-for-live releases admission so a later `--detach` can proceed.
+- Failed spawn or expired wait-for-live releases admission so a later `--detach` can proceed. Wait-for-live expiry reaps the unconfirmed child first so it cannot become live after release.
 
 ### 6. Scope stays Tugboat + tugboat tests + this OpenSpec change
 
@@ -91,7 +91,7 @@ Keep the existing sequential / negative #1062 tests (bare `playbook.pid`, issue-
   **Mitigation:** Hold flock until `live_ship_probe` succeeds. Print `detached tugboat ship` only after that. Loser acquires only after release, then re-probes.
 
 - **[Risk]** Wait bound expires before a slow child execs; winner fails closed and a later detach retries.  
-  **Mitigation:** Prefer that fail-closed over a second detach. Bound should cover `nohup` + child exec on Actions (document the bound next to the wait loop).
+  **Mitigation:** Prefer that fail-closed over a second detach. Before release, terminate and reap the unconfirmed child (and any process group it created) so it cannot become live after the lock drops. Bound should cover `nohup` + child exec on Actions (document the bound next to the wait loop).
 
 - **[Risk]** Stale lock file from a killed detach blocks later Ship.  
   **Mitigation:** Flock is released on process death. Leftover file is not a hold. Dead-owner unlink is allowed.

@@ -40,7 +40,7 @@ A process that does not acquire the lock immediately SHALL wait for release or a
 
 The winner SHALL hold the lock until the detached child is discoverable by `live_ship_probe` or the documented wait bound expires. Tugboat SHALL emit `detached tugboat ship` only after that probe succeeds. Tugboat SHALL NOT release the lock immediately after backgrounding the child.
 
-Tugboat SHALL release the lock on normal return, error, and signal via `trap`. A stale lock whose owner process is dead, or a leftover lock file with no live flock holder, SHALL be recoverable. A crashed winner SHALL NOT permanently block a later `--detach`. If spawn fails or the wait-for-live bound expires with no live ship, Tugboat SHALL NOT emit `detached tugboat ship`, SHALL release the lock, and SHALL fail closed so a later `--detach` can proceed.
+Tugboat SHALL release the lock on normal return, error, and signal via `trap`. A stale lock whose owner process is dead, or a leftover lock file with no live flock holder, SHALL be recoverable. A crashed winner SHALL NOT permanently block a later `--detach`. If spawn fails or the wait-for-live bound expires with no live ship, Tugboat SHALL NOT emit `detached tugboat ship`. When a child was spawned, Tugboat SHALL terminate and reap that child, including any process group it created, before releasing the admission lock. Tugboat SHALL then release the lock and fail closed so a later `--detach` can proceed. An unconfirmed child SHALL NOT become a live ship after admission is released.
 
 #### Scenario: Loser waits then refuses after the winner is live
 
@@ -68,6 +68,16 @@ Tugboat SHALL release the lock on normal return, error, and signal via `trap`. A
 - **THEN** Tugboat SHALL NOT emit `detached tugboat ship`
 - **AND** it SHALL release the admission lock
 - **AND** a later `--detach` for the same repo-token plus milestone SHALL be able to acquire and detach
+
+#### Scenario: Wait-for-live expiry reaps the unconfirmed child before release
+
+- **WHEN** a `--detach` acquires the admission lock
+- **AND** it spawns a child
+- **AND** the wait-for-live bound expires before that child is a live ship
+- **THEN** Tugboat SHALL NOT emit `detached tugboat ship`
+- **AND** it SHALL terminate and reap the spawned child (including any process group that child created) before releasing the admission lock
+- **AND** a later `--detach` for the same repo-token plus milestone SHALL be able to acquire and detach
+- **AND** exactly one live ship SHALL exist after that later detach
 
 ### Requirement: Concurrent detach regression SHALL stay enabled and fail closed
 

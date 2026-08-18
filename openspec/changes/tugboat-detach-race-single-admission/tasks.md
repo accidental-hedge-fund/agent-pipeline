@@ -12,7 +12,7 @@
 - [x] 2.5 Winner holds flock until `live_ship_probe` sees the detached child (or the wait bound expires). Emit `detached tugboat ship` only after that probe succeeds. Do not release immediately after `nohup`.
 - [x] 2.6 `trap` on `EXIT` / `INT` / `TERM` (and `RETURN` if function-scoped, matching `ship_one`) releases flock. Process death also drops flock.
 - [x] 2.7 Stale leftover file with no live flock holder, or a dead owner pid, is reclaimable. A crashed winner must not permanently block a later detach.
-- [x] 2.8 If spawn fails or the wait-for-live bound expires with no live ship: do not print `detached tugboat ship`, release, fail closed. A later `--detach` can proceed.
+- [x] 2.8 If spawn fails or the wait-for-live bound expires with no live ship: do not print `detached tugboat ship`. If a child was spawned, terminate and reap it (including any process group it created) before releasing admission. Then release, fail closed. A later `--detach` can proceed and cannot race a delayed first child.
 - [x] 2.9 If `flock` is missing: fail closed. Do not fall back to the empty-pid mkdir gate.
 - [x] 2.10 Preserve sequential #1062 behavior: live train `--merge` / owning tugboat still refuses; bare `playbook.pid` + `kill -0`, issue-run lock, and stale `state.json` still do not refuse.
 
@@ -30,6 +30,7 @@
 - [x] 4.2 Sequential `--detach` succeeds when a leftover admission lock file exists with a dead or absent owner and no live flock (stale artifact is not a live ship).
 - [x] 4.3 After failed spawn or expired wait-for-live (lock released / process dead), a later `--detach` for the same repo+milestone can acquire and detach.
 - [x] 4.4 Do not weaken existing #1062 negative cases (bare pid, pipeline lock, stale `state.json`). Keep those tests; add the admission-lock cases separately.
+- [x] 4.5 Wait-for-live expiry with an already-spawned delayed child: first `--detach` fails closed and reaps; a later `--detach` admits exactly one live ship.
 
 ## 5. Docs and OpenSpec
 
