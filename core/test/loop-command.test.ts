@@ -401,6 +401,22 @@ test("runLoopCommand — engine defaults to codex when --profile is absent (matc
   assert.equal(parsed.run_id, "run-1");
 });
 
+test("runLoopCommand — forwards --engine-track candidate to the in-repo supervisor", async () => {
+  let seen: string | undefined;
+  const deps: LoopCliDeps = {
+    runLoopPreflight: async () =>
+      ({ ok: true, args: { selector: undefined, resumeRunId: "run-1", audit: true } }) satisfies LoopPreflightOutcome,
+    runLoopEngine: async (input) => {
+      seen = input.engineTrack;
+      return { kind: "audit", report: fakeAuditReport("run-1") };
+    },
+  };
+  await withCapturedConsole(() =>
+    runLoopCommand({ resume: "run-1", audit: true, engineTrack: "candidate" } as CliOpts, [], deps),
+  );
+  assert.equal(seen, "candidate");
+});
+
 // ---------------------------------------------------------------------------
 // 6.8 — a host with no goal-loop skill installed at any root still starts and
 // runs, end to end through runLoopCommand (real runLoopPreflight, fake

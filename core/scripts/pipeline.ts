@@ -2573,6 +2573,8 @@ export function workListDiscoverDepsForCompile(
 
 export interface RunLoopEngineInput {
   engine: LoopEngine;
+  /** CLI `--engine-track` must reach per-item child advances (FRG candidate soak). */
+  engineTrack?: "pinned" | "candidate";
   selector?: LoopSelector;
   resumeRunId?: string;
   audit: boolean;
@@ -2715,6 +2717,9 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
     cfg = resolveConfig({ repoPath: input.repoDir, profile: input.engine });
   } catch (err) {
     return { kind: "error", message: `config error: ${(err as Error).message}` };
+  }
+  if (input.engineTrack === "pinned" || input.engineTrack === "candidate") {
+    cfg = { ...cfg, engine_track: input.engineTrack };
   }
 
   let runId: string;
@@ -2999,6 +3004,7 @@ export async function runLoopCommand(
   const writeLine = deps.writeStdoutLine ?? writeFlushedStdoutLine;
   const engineResult = await deps.runLoopEngine({
     engine,
+    engineTrack: opts.engineTrack === "pinned" || opts.engineTrack === "candidate" ? opts.engineTrack : undefined,
     selector: outcome.args.selector,
     resumeRunId: outcome.args.resumeRunId,
     audit: outcome.args.audit,
@@ -3193,6 +3199,7 @@ export async function runSingleIssueCommand(
   const engine: LoopEngine = opts.profile === "claude" ? "claude" : "codex";
   const engineResult = await deps.runLoopEngine({
     engine,
+    engineTrack: opts.engineTrack === "pinned" || opts.engineTrack === "candidate" ? opts.engineTrack : undefined,
     selector: { type: "work-list", value: [String(issueNumber)] },
     audit: false,
     autoSupersedeTerminal: true,
@@ -3524,6 +3531,7 @@ export async function advanceWaveThroughLoop(
   try {
     const engineResult = await runLoopEngine({
       engine,
+      engineTrack: opts.engineTrack === "pinned" || opts.engineTrack === "candidate" ? opts.engineTrack : undefined,
       selector: { type: "work-list", value: issues.map(String) },
       audit: false,
       autoSupersedeTerminal: true,
