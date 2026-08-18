@@ -1,18 +1,27 @@
-# #1111 Revised plan — tugboat detach-race single admission
+# #1137 — frg-1394-clean-openspec (implementation)
 
-## Status
+## Feedback Incorporated
 
-- [x] Plan review feedback incorporated (see chat `## Feedback Incorporated`)
-- [x] Implementation
+- [ADDRESSED] Name exact OpenSpec artifacts under `openspec/changes/frg-1394-clean-openspec/` — kept and scenario language clarified.
+- [ADDRESSED] Concrete test strategy: resolve and read only the run-scoped fixture path, parse JSON, assert `release_version === "1.39.4"`.
+- [ADDRESSED] Replace ambiguous “sole copy under a different `pack_run_id`” language with: this pack’s fixture lives only at the stated run-scoped path.
+- [ADDRESSED] Keep `SHALL` on the requirement first line; keep scenarios; validate with `openspec validate`.
+- [ADDRESSED] Scope stays fixture + unit test + this issue’s OpenSpec change only (no `core/scripts/` production edits).
+- [ADDRESSED] Resolve fixture path from the test file location (`fileURLToPath`), not process cwd.
+- [ADDRESSED] Require `npm run ci` green before handoff; make no suite-pass claim without that evidence.
 
-## Locked decisions (post plan-review)
+## Plan status
 
-1. Replace `mkdir` `detach.gate` + empty-pid reclaim with a regular lock file and exclusive `flock`.
-2. Loser waits for release, then re-probes `live_ship_probe`. Lock presence is not already-running.
-3. Winner holds flock until `live_ship_probe` sees the child. Print `detached tugboat ship` only after that.
-4. `trap` + process-death release. Dead-owner leftover file is reclaimable.
-5. Path: `$STATE_ROOT/admission/<repo-token>/v<safe-milestone>.lock` (pinned `REPO_DIR` hash + `safe_of`). Not `pwd`. Not issue-run lock.
-6. Concurrent fixture keeps two real `--detach` processes. Test-only start barrier. Wait for both exits. Exactly one detach line and one already-running line.
-7. Extra tests: stale leftover lock file; failed spawn / expired wait then later detach. Do not weaken #1062 negatives.
+- [x] OpenSpec change `frg-1394-clean-openspec` authored and committed
+- [x] Revise OpenSpec scenario language (fixture location)
+- [x] Add fixture JSON
+- [x] Add unit test
+- [x] Run `openspec validate` + `npm run ci`
+- [ ] Commit (no push) and hand off for review / pipeline advance
 
-See the chat revised implementation plan for Approach, files, tests, and acceptance criteria.
+## Review
+
+- Added `core/test/fixtures/frg/pack-1394-tugboat-ship-1.39.4/clean-openspec.json` with `release_version: "1.39.4"`.
+- Added `core/test/frg-1394-clean-openspec.test.ts` (path-scoped read + pass/fail assertion helpers).
+- No `core/scripts/` production edits. Mirror check reports plugin up to date.
+- Evidence: `openspec validate frg-1394-clean-openspec` passed; `npm run ci` exited 0.

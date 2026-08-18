@@ -20,11 +20,11 @@ fixture SHALL NOT live under any other pack-run directory.
 - **AND** that file SHALL parse as JSON
 - **AND** the parsed object's `release_version` SHALL equal `1.39.4`
 
-#### Scenario: Fixture is not stored under another pack run
+#### Scenario: Fixture lives only at the stated run-scoped path
 
 - **WHEN** the clean-openspec fixture for pack `pack-1394-tugboat-ship-1.39.4` is added
 - **THEN** the fixture path SHALL include the directory segment `pack-1394-tugboat-ship-1.39.4`
-- **AND** the fixture SHALL NOT be the sole copy under a different `pack_run_id` directory
+- **AND** that pack's fixture SHALL live only at `core/test/fixtures/frg/pack-1394-tugboat-ship-1.39.4/clean-openspec.json`
 
 ### Requirement: A unit test SHALL fail when the fixture version is not 1.39.4
 
