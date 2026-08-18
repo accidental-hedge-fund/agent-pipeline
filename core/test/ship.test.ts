@@ -593,3 +593,34 @@ test("operator milestone ship admits without a grant and resumes the same ledger
   assert.ok(!secondDeps.calls.includes("train"), "second invoke must not start a sibling train");
   assert.ok(!secondDeps.calls.includes("plan-train"));
 });
+
+test("ship persist writes the current human_authority bit so recovery is not stranded (#1096)", async () => {
+  const store = memoryStore();
+  const parked = makeDeps(store);
+  parked.convergeTrain = async () => {
+    throw new Error("needs-human: missing-authority for milestone release");
+  };
+  await assert.rejects(
+    runShipCoordinator(intent, authorization(), parked),
+    /needs-human/,
+  );
+  assert.equal(store.status?.human_authority, true);
+  assert.match(store.status?.last_error ?? "", /missing-authority/);
+
+  const nonHuman = makeDeps(store);
+  nonHuman.convergeTrain = async () => {
+    throw new Error("transient train crash");
+  };
+  await assert.rejects(
+    runShipCoordinator(intent, authorization(), nonHuman),
+    /transient train crash/,
+  );
+  assert.equal(store.status?.human_authority, false);
+  assert.equal(store.status?.last_error, "transient train crash");
+
+  const recovered = makeDeps(store);
+  const result = await runShipCoordinator(intent, authorization(), recovered);
+  assert.equal(result.complete, true);
+  assert.equal(result.human_authority, false);
+  assert.equal(result.last_error, null);
+});

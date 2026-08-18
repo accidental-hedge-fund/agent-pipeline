@@ -647,7 +647,7 @@ async function persist(
     complete: action === "complete",
     updated_at: deps.now().toISOString(),
     last_error: lastError,
-    ...(humanAuthority ? { human_authority: true as const } : {}),
+    human_authority: humanAuthority,
   };
   await deps.state.writeAtomic(status.ship_key, updated);
   return updated;
