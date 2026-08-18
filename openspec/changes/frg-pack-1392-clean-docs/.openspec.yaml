@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-08-18
+goal: Exercise one clean Pipeline path with a run-scoped documentation fixture
+  and its test without changing production behavior.
