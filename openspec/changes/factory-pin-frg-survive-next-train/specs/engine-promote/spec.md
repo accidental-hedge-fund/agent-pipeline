@@ -2,9 +2,9 @@
 
 ### Requirement: Non-skip engine-promote SHALL write the exported factory pin
 
-When `AGENT_PIPELINE_PRODUCTION_PIN` is set (including when factory ship exported the
-default factory pin file), a successful non-skip `pipeline engine-promote` SHALL write
-the production-quality pin to that path. The command SHALL NOT update only
+A successful non-skip `pipeline engine-promote` SHALL write the production-quality pin
+to `AGENT_PIPELINE_PRODUCTION_PIN` when that path is set (including when factory ship
+exported the default factory pin file). The command SHALL NOT update only
 `<repoDir>/.agent-pipeline/production-engine-pin.json` when `repoDir` is a worktree (or
 other directory) that is not the exported pin's directory.
 

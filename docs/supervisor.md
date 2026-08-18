@@ -258,6 +258,10 @@ Required env for mutating ship: `REPO_DIR`, `PIPELINE`, `ALLOW_MERGE=1`.
 `REPO_DIR` is the live control checkout; Tugboat refuses `*factory-control*`
 and treats only live `train --merge` (or owning tugboat) as an already-running
 ship (#1062). Promote defaults to all hosts (`ENGINE_PROMOTE_HOST` default `all`).
+Tugboat and the host `pipeline` launcher export `AGENT_PIPELINE_PRODUCTION_PIN`
+when unset to the factory pin file
+(`$REPO_DIR/.agent-pipeline/production-engine-pin.json`) so `engine-promote`
+and the next `pipeline train` / `pipeline doctor` share one path (#1127).
 
 Runbooks: [runbooks/ship-milestone.md](./runbooks/ship-milestone.md),  
 [runbooks/frg-pack-checklist.md](./runbooks/frg-pack-checklist.md).
@@ -265,8 +269,10 @@ Runbooks: [runbooks/ship-milestone.md](./runbooks/ship-milestone.md),
 Pipeline CLI owns train/merge/release/promote policy. Tugboat does not add a
 grant factory, second merge policy, or `pipeline ship` product stage. Doctor:
 `supervisor:tugboat-install-parity` (installed Tugboat + CI/train helpers match
-repo example content) and
-`supervisor:ship-playbook-promote-host` (legacy playbook promote default).
+repo example content),
+`supervisor:ship-playbook-promote-host` (legacy playbook promote default),
+and `supervisor:ship-composer-skip-frg` (installed Tugboat/playbook must not
+hard-code default `--skip-frg`).
 
 **Notify policy:** observational only; notification failures must not alter ship
 phase decisions. Prefer shared `ship-notify.sh` / `ship-stage-watch.sh` siblings

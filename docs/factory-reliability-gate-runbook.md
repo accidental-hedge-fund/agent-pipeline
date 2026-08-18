@@ -419,10 +419,18 @@ Under the **repository root**:
 
 `pipeline release` and `auto-tag-release.yml` read `latest.json` for the resolved version.
 
-**Commit bar:** `.agent-pipeline/frg/` is **not** gitignored. Operators **must** commit at
-least `.agent-pipeline/frg/<X.Y.Z>/latest.json` (and preferably the sibling
-`…/<run_id>/evidence.json`) on the **release PR** so auto-tag’s checkout sees the artifact.
-A worktree-local-only write that is never committed **correctly fails** auto-tag (fail closed).
+**Ignore bar (#1127):** `.agent-pipeline/frg/` **is** gitignored on the factory
+control checkout (engine artifact contract). A pack or promote write of
+`latest.json` must not fail the next train's `worktree-clean` check. Do **not**
+commit leftover `latest.json` onto the protected checkout. Host-only
+`git update-index --skip-worktree` is not the product fix.
+
+Local `latest.json` remains the ship-host lookup for `pipeline release` and
+`pipeline engine-promote` on the host that just packed. Auto-tag still requires
+release-eligible evidence for the version. Release MAY `git add -f` that
+version's evidence onto the **release PR** so CI/auto-tag sees it. That is
+release-branch attachment, not a reason to leave `frg/` unignored on the
+factory control checkout.
 
 ### Trend ledger
 
@@ -546,9 +554,9 @@ Optional repeated CLI tokens:
      --observations docs/frg-observations.example.json --json
    ```
 
-6. **Commit** `.agent-pipeline/frg/<X.Y.Z>/latest.json` (and run evidence) on the release
-   branch/PR. `pipeline release` embeds the FRG section; files must land in the tree for
-   auto-tag.
+6. **Attach** `.agent-pipeline/frg/<X.Y.Z>/latest.json` (and run evidence) to the
+   release PR. Release MAY `git add -f` that version's evidence so auto-tag sees
+   it. Do not leave `frg/` unignored on the factory control checkout.
 
 ### Concurrency settings (documented defaults for FRG)
 
@@ -596,8 +604,8 @@ pipeline factory-release prepare --request <absolute-request.json> --json
 ```
 
 Or re-run the Tugboat FRG pack phase so `.agent-pipeline/frg/<X.Y.Z>/latest.json`
-is a release-eligible `pass: true` artifact. Then retry the tag path after that
-evidence is committed.
+is a release-eligible `pass: true` artifact. Then attach that version's evidence
+to the release PR (`git add -f` is allowed) and retry the tag path.
 
 ### Open soak-defect override (audited only)
 
@@ -617,7 +625,8 @@ pipeline factory-gate --for <X.Y.Z> --from-run <loop-run-id> --observations <fil
 
 - [ ] FRG `run_id` visible on the PR body (or comment)
 - [ ] Result shows **pass** for the **same** version as the release
-- [ ] **Committed** `.agent-pipeline/frg/<version>/latest.json` on the release branch
+- [ ] **Attached** `.agent-pipeline/frg/<version>/latest.json` on the release branch
+      (`git add -f` allowed; do not un-ignore `frg/` on the factory control checkout)
 - [ ] Engine-class rate is numeric (item_count denom) and ≤ max
 - [ ] Composition dimensions all pass; `false_human_authority_count` is 0
 - [ ] Open engine-class soak defects closed **or** audited `--allow-open-soak-defects`

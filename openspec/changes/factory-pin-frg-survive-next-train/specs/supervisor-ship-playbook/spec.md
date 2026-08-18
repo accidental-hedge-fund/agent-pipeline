@@ -2,14 +2,15 @@
 
 ### Requirement: Installed skip-frg ship composer SHALL fail doctor preflight
 
-When an installed Tugboat or chain-to-existing-tools ship playbook is present at a
-documented install path (`~/.local/bin/tugboat`, `~/.local/bin/pipeline-ship-playbook`,
-or equivalent) and its default release or promote argv still hard-codes `--skip-frg`
-(the pre-#1039 skip-frg playbook), doctor preflight SHALL fail closed. Remediation
-SHALL require refreshing the composer from the repo example (or invoking the versioned
-repo path). Absence of an installed composer SHALL skip the check. When the operator
-escape is active for that doctor process (`--skip-frg` / documented env with a logged
-reason), the check SHALL NOT fail solely for the escape path existing in the source.
+Doctor preflight SHALL fail closed when an installed Tugboat or
+chain-to-existing-tools ship playbook is present at a documented install path
+(`~/.local/bin/tugboat`, `~/.local/bin/pipeline-ship-playbook`, or equivalent) and
+its default release or promote argv still hard-codes `--skip-frg` (the pre-#1039
+skip-frg playbook). Remediation SHALL require refreshing the composer from the repo
+example (or invoking the versioned repo path). Absence of an installed composer
+SHALL skip the check. When the operator escape is active for that doctor process
+(`--skip-frg` / documented env with a logged reason), the check SHALL NOT fail
+solely for the escape path existing in the source.
 
 A unit or doctor test SHALL fail if the installed-composer evaluator accepts a body
 whose default release or promote argv still contains `--skip-frg`.

@@ -2,13 +2,12 @@
 
 ### Requirement: Factory doctor SHALL accept a shared-path production-quality pin after promote
 
-On this factory control repository, after a non-skip promote of version `X.Y.Z` that
-wrote a production-quality pin (`frg_run_id` does not start with `no-frg-`;
-`frg_evidence_path` is non-null) to the shared factory pin path
-(`AGENT_PIPELINE_PRODUCTION_PIN` or the default factory pin file), `pipeline doctor`
-check `install:engine-track` SHALL pass under pinned-track intent when the install
-matches that pin under existing track-coherence rules and the factory control checkout
-is clean of unignored dirt.
+Factory `pipeline doctor` check `install:engine-track` SHALL pass under pinned-track
+intent after a non-skip promote of version `X.Y.Z` that wrote a production-quality pin
+(`frg_run_id` does not start with `no-frg-`; `frg_evidence_path` is non-null) to the
+shared factory pin path (`AGENT_PIPELINE_PRODUCTION_PIN` or the default factory pin
+file), when the install matches that pin under existing track-coherence rules and the
+factory control checkout is clean of unignored dirt.
 
 The check SHALL load the shared / exported pin path. It SHALL NOT fail solely because a
 promote worktree still holds a different pin file, or because committed `origin/main`

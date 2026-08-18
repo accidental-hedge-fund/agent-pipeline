@@ -37,6 +37,7 @@ Expect these on the Hermes process PATH / env (set by the deployment profile):
 | Variable | Purpose |
 |---|---|
 | `REPO_DIR` | Live control checkout (e.g. `ap-main-control`) — **required for ship**. Tugboat pins this at start and **refuses** `*factory-control*` (#1062). |
+| `AGENT_PIPELINE_PRODUCTION_PIN` | Factory pin file. Tugboat and the host `pipeline` launcher export this when unset to `$REPO_DIR/.agent-pipeline/production-engine-pin.json`. Do not overwrite an operator value. |
 | `PIPELINE` | Absolute launcher, e.g. `node …/pipeline.mjs` — **required** |
 | `ALLOW_MERGE` | `1` only if this channel may run `train --merge` / release finish — **required for ship** |
 | `AGENT_PIPELINE_ROOT` | Clone of agent-pipeline containing `examples/supervisor/shell/` |

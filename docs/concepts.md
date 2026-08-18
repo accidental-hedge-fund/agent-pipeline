@@ -40,7 +40,7 @@ Claude Code (`/pipeline`) and Codex (`$pipeline`) share one TypeScript engine un
 - Scaffolds `.github/pipeline.yml` with documented defaults
 - Ensures local-only paths under `.agent-pipeline/` are gitignored
 
-Ignored local paths (must never be committed): `.agent-pipeline/runs/`, `.agent-pipeline/roadmap/`, `.agent-pipeline/history/`. Without that gitignore block, the first run can leave the worktree dirty and fail `pipeline doctor`'s `worktree-clean` check.
+Ignored local paths (must never be committed): `.agent-pipeline/runs/`, `.agent-pipeline/roadmap/`, `.agent-pipeline/history/`, `.agent-pipeline/frg/`. Without that gitignore block, the first run can leave the worktree dirty and fail `pipeline doctor`'s `worktree-clean` check.
 
 After `init`, commit the config, label an issue `pipeline:ready`, and run `/pipeline N` or `$pipeline N`.
 

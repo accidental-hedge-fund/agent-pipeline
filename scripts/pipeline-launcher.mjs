@@ -180,6 +180,22 @@ if (!existsSync(join(coreDir, "node_modules"))) {
   process.exit(1);
 }
 
+// Factory control plane (#1127): export the factory pin when unset so
+// engine-promote and the next train doctor share one path. Do not overwrite
+// an operator value. Do not invent a pin for an ordinary product repo.
+if (!String(process.env.AGENT_PIPELINE_PRODUCTION_PIN ?? "").trim()) {
+  const factoryControl = String(process.env.AGENT_PIPELINE_FACTORY_CONTROL ?? "").trim();
+  const repoDir = String(process.env.REPO_DIR ?? "").trim();
+  const checkout = factoryControl || repoDir;
+  if (checkout) {
+    process.env.AGENT_PIPELINE_PRODUCTION_PIN = resolve(
+      checkout,
+      ".agent-pipeline",
+      "production-engine-pin.json",
+    );
+  }
+}
+
 const args = ["--experimental-strip-types", entry, ...rawArgs];
 const run = spawnSync(process.execPath, args, { stdio: "inherit" });
 process.exit(run.status ?? 1);

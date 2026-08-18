@@ -24,6 +24,11 @@
 #                          at start from install/env. Paths matching
 #                          *factory-control* are refused (#1062). Session/model
 #                          text cannot retarget after pin.
+#   AGENT_PIPELINE_PRODUCTION_PIN
+#                          factory pin file. When unset after REPO_DIR pin,
+#                          exported to $REPO_DIR/.agent-pipeline/production-engine-pin.json
+#                          so engine-promote and the next train doctor share one path.
+#                          An operator-set value is left unchanged.
 #   PIPELINE               pipeline launcher (default: pipeline)
 #   ALLOW_MERGE            must be 1 for train --merge / release finish
 #   SHIP_NOTIFY            1 to post phase status (default 1)
@@ -738,6 +743,19 @@ pin_repo_dir() {
   esac
   REPO_DIR_PINNED=1
   export REPO_DIR
+  export_factory_production_pin
+}
+
+# Factory pin path (#1127): promote and the next train doctor must share one file.
+# Default is the control-checkout pin. Do not overwrite an operator value.
+export_factory_production_pin() {
+  if [[ -n "${AGENT_PIPELINE_PRODUCTION_PIN:-}" ]]; then
+    return 0
+  fi
+  if [[ -z "${REPO_DIR:-}" ]]; then
+    return 0
+  fi
+  export AGENT_PIPELINE_PRODUCTION_PIN="$REPO_DIR/.agent-pipeline/production-engine-pin.json"
 }
 
 # Live ship = structured argv match only (#1062 R2): exact argument boundaries
@@ -1063,6 +1081,7 @@ detach_self() {
     ENGINE_PROMOTE_HOST="$ENGINE_PROMOTE_HOST" PIPELINE_SUPERVISOR_STATE="$STATE_ROOT" \
     RELEASE_CHECKS_GREEN_BIN="$RELEASE_CHECKS_GREEN_BIN" \
     TRAIN_STATUS_COMPLETE_BIN="$TRAIN_STATUS_COMPLETE_BIN" \
+    AGENT_PIPELINE_PRODUCTION_PIN="${AGENT_PIPELINE_PRODUCTION_PIN:-}" \
     TUGBOAT_SKIP_FRG="$SKIP_FRG" TUGBOAT_SKIP_FRG_REASON="$SKIP_FRG_REASON" \
     TUGBOAT_CANDIDATE_SHA="${TUGBOAT_CANDIDATE_SHA:-}" \
     TUGBOAT_REPOSITORY="${TUGBOAT_REPOSITORY:-}" \
@@ -1120,6 +1139,7 @@ if [[ -z "$REPO_DIR" || ! -d "$REPO_DIR" ]]; then
   echo "FAIL: REPO_DIR required and must be a directory (got: ${REPO_DIR:-<unset>})" >&2
   exit 1
 fi
+export_factory_production_pin
 if [[ ! -x "$PIPELINE" ]] && ! command -v "$PIPELINE" >/dev/null 2>&1; then
   echo "FAIL: PIPELINE not executable: $PIPELINE" >&2
   exit 1

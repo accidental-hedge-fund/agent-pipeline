@@ -21,6 +21,10 @@
 #
 # Environment:
 #   REPO_DIR                   Target git checkout (required)
+#   AGENT_PIPELINE_PRODUCTION_PIN
+#                              factory pin file. When unset, exported to
+#                              $REPO_DIR/.agent-pipeline/production-engine-pin.json.
+#                              An operator-set value is left unchanged.
 #   PIPELINE                   pipeline launcher (default: pipeline on PATH)
 #   ALLOW_MERGE                must be 1 for merge/release finish
 #   PIPELINE_SUPERVISOR_STATE  state root (default: ~/.local/state/pipeline-supervisor)
@@ -45,6 +49,10 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 PIPELINE="${PIPELINE:-pipeline}"
 REPO_DIR="${REPO_DIR:-}"
+# Factory pin path (#1127): promote and the next train doctor share one file.
+if [[ -z "${AGENT_PIPELINE_PRODUCTION_PIN:-}" && -n "$REPO_DIR" ]]; then
+  export AGENT_PIPELINE_PRODUCTION_PIN="$REPO_DIR/.agent-pipeline/production-engine-pin.json"
+fi
 ALLOW_MERGE="${ALLOW_MERGE:-0}"
 STATE_ROOT="${PIPELINE_SUPERVISOR_STATE:-$HOME/.local/state/pipeline-supervisor}"
 HOST="${ENGINE_PROMOTE_HOST:-all}"
@@ -312,6 +320,7 @@ if [[ "$do_detach" -eq 1 ]]; then
       PIPELINE_SUPERVISOR_STATE="$STATE_ROOT" ENGINE_PROMOTE_HOST="$HOST" \
       RELEASE_WAIT_ATTEMPTS="$RELEASE_WAIT_ATTEMPTS" RELEASE_WAIT_SLEEP_S="$RELEASE_WAIT_SLEEP_S" \
       FRG_WAIT_ATTEMPTS="$FRG_WAIT_ATTEMPTS" FRG_WAIT_SLEEP_S="$FRG_WAIT_SLEEP_S" \
+      AGENT_PIPELINE_PRODUCTION_PIN="${AGENT_PIPELINE_PRODUCTION_PIN:-}" \
       TUGBOAT_SKIP_FRG="$SKIP_FRG" TUGBOAT_SKIP_FRG_REASON="$SKIP_FRG_REASON" \
       SHIP_NOTIFY="$SHIP_NOTIFY" SHIP_NOTIFY_BIN="$SHIP_NOTIFY_BIN" \
       SHIP_NOTIFY_HEARTBEAT_S="$SHIP_NOTIFY_HEARTBEAT_S" \
@@ -340,6 +349,7 @@ if [[ "$do_detach" -eq 1 ]]; then
     PIPELINE_SUPERVISOR_STATE="$STATE_ROOT" ENGINE_PROMOTE_HOST="$HOST" \
     RELEASE_WAIT_ATTEMPTS="$RELEASE_WAIT_ATTEMPTS" RELEASE_WAIT_SLEEP_S="$RELEASE_WAIT_SLEEP_S" \
     FRG_WAIT_ATTEMPTS="$FRG_WAIT_ATTEMPTS" FRG_WAIT_SLEEP_S="$FRG_WAIT_SLEEP_S" \
+    AGENT_PIPELINE_PRODUCTION_PIN="${AGENT_PIPELINE_PRODUCTION_PIN:-}" \
     TUGBOAT_SKIP_FRG="$SKIP_FRG" TUGBOAT_SKIP_FRG_REASON="$SKIP_FRG_REASON" \
     SHIP_NOTIFY="$SHIP_NOTIFY" SHIP_NOTIFY_BIN="$SHIP_NOTIFY_BIN" \
     SHIP_NOTIFY_HEARTBEAT_S="$SHIP_NOTIFY_HEARTBEAT_S" \

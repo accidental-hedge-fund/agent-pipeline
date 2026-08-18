@@ -147,6 +147,25 @@ export function productionPinPath(
   return path.join(repoDir, PRODUCTION_ENGINE_PIN_REL);
 }
 
+/** Absolute factory pin file: `<factoryControlCheckout>/.agent-pipeline/production-engine-pin.json`. */
+export function defaultFactoryProductionPinPath(factoryControlCheckout: string): string {
+  return path.resolve(factoryControlCheckout, PRODUCTION_ENGINE_PIN_REL);
+}
+
+/**
+ * Factory ship / factory launcher pin export (#1127).
+ * An operator-set `AGENT_PIPELINE_PRODUCTION_PIN` is left unchanged.
+ * When unset/empty, default is the factory control checkout pin file.
+ */
+export function resolveExportedFactoryProductionPin(opts: {
+  existing?: string | null;
+  factoryControlCheckout: string;
+}): string {
+  const existing = typeof opts.existing === "string" ? opts.existing.trim() : "";
+  if (existing) return existing;
+  return defaultFactoryProductionPinPath(opts.factoryControlCheckout);
+}
+
 // ---------------------------------------------------------------------------
 // Version / tag helpers
 // ---------------------------------------------------------------------------
