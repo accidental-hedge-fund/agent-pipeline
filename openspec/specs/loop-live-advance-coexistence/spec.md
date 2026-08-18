@@ -2,7 +2,9 @@
 
 ## Purpose
 TBD - created by archiving change loop-live-advance-coexistence. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: Loop dispatch SHALL not start a second full advance while a host-local advance is already live
 
 Before the durable loop dispatches a full per-item advance through `pipeline/loop-execution@1`, the supervisor SHALL probe host-local evidence for whether an advance is already live for that issue **under the item's domain**. Live evidence SHALL include any of: a per-issue advisory lock held by a live process for that `(domain, issue)` key, a **fresh** non-terminal advance run-store for that issue (activity within the host-local freshness bound; a stale non-terminal crash artifact without recent activity and without live lock/wrapper evidence SHALL NOT count as live), a live wrapper/process identity for that issue under the same domain (production MUST wire a real host-local wrapper/process lookup into the default loop supervisor dependencies — unit tests inject the seam), or a **fresh** non-terminal advance linkage already recorded on the loop run for that item (same freshness bound as active run-stores; aged non-terminal crash linkage SHALL NOT count as live). Lock and detach-marker path resolution used by the probe SHALL use the same domain-scoped issue-run identity as `issue-run-lock` so a live run for issue `N` under domain `A` does not count as live evidence for issue `N` under domain `B`. When live evidence is present, the loop SHALL attach to the existing advance, skip the dispatch cycle for that item, or wait and re-probe — and SHALL NOT spawn a second full advance that can collide on the lock. The multi-item run SHALL NOT record a `run_fatal` stop solely because that item already had a live advance. The probe and disposition SHALL be injectable so unit tests drive them with no real network, git, or subprocess call. Cross-host advance liveness is out of scope; host-local single-host concurrency remains the supported scope.
@@ -142,3 +144,28 @@ The implementation SHALL provide unit / supervisor tests that inject observe, di
 - **WHEN** a unit test feeds a crashed or rejected dispatch with no coexistence evidence and no `pipeline:blocked` disposition
 - **THEN** the supervisor SHALL still record `workflow-engine-defect` and apply `run_fatal` per policy
 
+### Requirement: A dead prior holder SHALL be takeover of the same item
+
+When the live-advance or coexistence probe observes a recorded holder whose process is dead, whose lock is stale, or whose loop/run directory is a corpse (no live PID and no verifiable live wrapper identity), the supervisor SHALL treat that item as not live. It SHALL take over the same item and resume from the last durable stage (worktree + labels + ledger). It SHALL NOT record `coexistence_wait` for that dead holder. It SHALL NOT wait until a no-progress watchdog fires. A **live** holder (live lock or live wrapper/process identity for the same domain and issue) SHALL remain a non-fatal coexistence wait.
+
+#### Scenario: Dead lock after SIGTERM is takeover
+
+- **WHEN** issue N is `pipeline:implementing`
+- **AND** the recorded issue-run lock or wrapper PID is dead
+- **AND** no live process identity exists for `(domain, N)`
+- **THEN** the supervisor SHALL take over issue N and resume
+- **AND** it SHALL NOT record `coexistence_wait` for that dead holder
+- **AND** it SHALL NOT STOP the run with `supervisor_no_progress` solely for that evidence
+
+#### Scenario: Six waits on a corpse fail the fixture
+
+- **WHEN** a fixture replays a killed implementer, a recovered dead lock, and a reused loop run id whose holder is dead
+- **THEN** the supervisor SHALL take over the same item on the first cycle that observes the dead holder
+- **AND** the fixture SHALL fail if the run records two or more `coexistence_wait` outcomes for that corpse
+- **AND** the fixture SHALL fail if the run stops with `supervisor_no_progress`
+
+#### Scenario: Live holder still waits
+
+- **WHEN** the probe reports a live lock or live wrapper identity for issue N under its domain
+- **THEN** the supervisor SHALL keep the existing non-fatal coexistence wait
+- **AND** it SHALL NOT start a second full advance for issue N

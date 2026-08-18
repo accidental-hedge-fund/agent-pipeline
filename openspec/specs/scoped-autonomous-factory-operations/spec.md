@@ -54,52 +54,27 @@ keys. `.github/pipeline.yml` SHALL NOT authorize merges.
 
 ---
 
-### Requirement: Ship authority SHALL be authenticated, immutable, event-bound, and expiring
+### Requirement: Ship authority SHALL be operator invocation of the milestone command
 
-The explicit `pipeline ship` surface SHALL require `--authorization
-<absolute-json>`. A trusted channel adapter SHALL authenticate the signed Buzz
-event before it writes that document and SHALL sign the canonical document with
-its Ed25519 admission key. Pipeline SHALL verify that signature against a
-root-owned machine-local public key. Pipeline SHALL NOT implement a second
-Buzz/Nostr client or claim that the admission signature replaces transport
-verification. Pipeline SHALL validate that the document is immutable for the run, unexpired, and bound
-to the exact event identity, repository, base, milestone, release version,
-sender, channel, and thread requested by the command. It SHALL persist a stable
-fingerprint of those fields with the ship state.
+The explicit operator `pipeline ship` surface SHALL be `pipeline ship --milestone vX.Y.Z`. Invoking that command SHALL be sufficient authority to compose existing loop-isolated train-merge, merge, release-finish, and engine-promote surfaces. The surface SHALL NOT require `--authorization` or a signed grant document. Repository configuration, chat prose, a display name, or a later message SHALL NOT widen ship authority beyond that invocation’s milestone coordinates. A second invoke of the same repository, base, and milestone SHALL resume the existing ship record rather than start a sibling implement.
 
-Repository configuration, chat prose outside the authenticated event, a display
-name, or a later message SHALL NOT widen that authority. An expired, malformed,
-untrusted, or mismatched document SHALL fail before any mutation. A replay of
-the same authenticated event and coordinates SHALL reconcile the existing ship
-run rather than start a second run.
+External supervisors MAY invoke that command. They SHALL NOT be required to install a grant factory, MessagingPort, or ship-auth issuer from this repository.
 
-#### Scenario: Exact signed event authorizes one ship
+#### Scenario: Milestone command authorizes one ship
 
-- **WHEN** the trusted adapter accepts a signed Buzz event for repository R,
-  base B, milestone M, and version V and invokes `pipeline ship` with its bound
-  authorization document
-- **THEN** Pipeline SHALL record the event identity and authorization
-  fingerprint before the first mutation
-- **AND** every later ship phase SHALL remain bound to R, B, M, and V
+- **WHEN** an operator or host runs `pipeline ship --milestone v1.39.3` for the current repository and base
+- **THEN** Pipeline SHALL bind the ship to that repository, base, and milestone before the first mutation
+- **AND** every later ship phase SHALL remain bound to those coordinates
+- **AND** the command SHALL NOT require a grant file
 
-#### Scenario: Expired or mismatched authority fails closed
+#### Scenario: Replay of the same milestone is idempotent
 
-- **WHEN** the authorization is expired or any command coordinate differs from
-  its repository, base, milestone, or version binding
-- **THEN** `pipeline ship` SHALL exit non-zero before train, merge, release, or
-  promotion mutation
+- **WHEN** the same `pipeline ship --milestone v1.39.3` is invoked again
+- **THEN** Pipeline SHALL resume the existing ship record for those coordinates
+- **AND** it SHALL NOT create a second train, release PR, or merge mutation that farms a newer sibling while an earlier ready-to-deploy PR is open
 
-#### Scenario: Event replay is idempotent
+#### Scenario: Config still cannot authorize merge
 
-- **WHEN** the same authenticated event is delivered again with the same ship
-  coordinates
-- **THEN** the adapter and Pipeline SHALL return or resume the existing run
-- **AND** they SHALL NOT create a second train, release PR, or merge mutation
-
-#### Scenario: Transport authentication stays at the gateway boundary
-
-- **WHEN** Pipeline reads the authorization document
-- **THEN** it SHALL validate the trusted adapter's event-bound envelope, scope,
-  fingerprint, Ed25519 signature, and expiry
-- **AND** it SHALL NOT add a parallel relay client or accept an unauthenticated
-  caller assertion as signature proof
+- **WHEN** a repository sets `auto_merge` or a factory-authority key in `.github/pipeline.yml`
+- **THEN** strict configuration validation SHALL still reject the unknown key
+- **AND** `pipeline advance` SHALL still stop at `pipeline:ready-to-deploy` without merging
