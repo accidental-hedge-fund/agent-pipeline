@@ -5,8 +5,9 @@ CI on release PR **#1109** (`5606ec5b`, run `32075787450`) failed only `detach r
 ## What Changes
 
 - Close the concurrent-admission hole for Option 1 Tugboat `--detach`: two overlapping `--detach` invocations for the same milestone MUST admit exactly one live ship and send the other down the already-running / not-detaching path. They MUST NOT both emit `detached tugboat ship`.
-- Keep the #1062 live-ship probe as the meaning of “already running.” The admission lock serializes probe-and-spawn. Gate presence alone is not a live ship.
-- Keep the existing concurrent fixture in `core/test/tugboat.test.ts`. Make the outcome deterministic on GitHub Actions (no sleep-only race). Do not delete the test. Do not mark it flaky or skip it.
+- Keep the #1062 live-ship probe as the meaning of “already running.” A host-local `flock` admission lock serializes probe-and-spawn. The loser waits for release, then re-probes. Lock-file presence alone is not a live ship.
+- Hold the lock until `live_ship_probe` can see the winner’s child. Release on trap. Recover a stale leftover file keyed to a dead owner. Path is `STATE_ROOT` + repo-token + milestone (not `pwd`).
+- Keep the existing concurrent fixture in `core/test/tugboat.test.ts`. Release both children through a start barrier, wait for both exits, inspect combined output. Do not delete the test. Do not mark it flaky or skip it.
 - Keep the regression bite: the same two-spawn fixture MUST fail if both processes emit `detached tugboat ship`.
 
 ## Capabilities
@@ -22,12 +23,13 @@ CI on release PR **#1109** (`5606ec5b`, run `32075787450`) failed only `detach r
 ## Acceptance criteria
 
 - [ ] Two overlapping `tugboat --detach` processes for the same milestone produce exactly one `detached tugboat ship` line and exactly one live ship for that milestone.
-- [ ] The loser of that race takes the already-running / not-detaching path (or an equivalent documented refuse that does not spawn a second ship). It does not print `detached tugboat ship`.
-- [ ] Both processes still exit 0 in the success fixture (one detach + one refuse), matching the CI case that failed on #1109.
-- [ ] A second sequential `--detach` after a live ship exists still uses the #1062 live-ship probe (train `--merge` or owning tugboat). Bare `playbook.pid` + `kill -0`, a per-issue pipeline lock, and stale `state.json` still do not refuse detach.
-- [ ] `core/test/tugboat.test.ts` keeps a concurrent two-spawn fixture. The test is not deleted, skipped, or marked flaky.
+- [ ] The loser waits for lock release, then re-probes live-ship, then takes the already-running / not-detaching path. It does not print `detached tugboat ship`. It does not treat lock presence as already running.
+- [ ] Both processes still exit 0 in the success fixture (one detach + one refuse). Combined output has exactly one detach line and exactly one already-running line.
+- [ ] A second sequential `--detach` after a live ship exists still uses the #1062 live-ship probe (train `--merge` or owning tugboat). Bare `playbook.pid` + `kill -0`, a per-issue pipeline lock, stale `state.json`, and a leftover admission lock file still do not refuse detach.
+- [ ] After failed spawn or expired wait-for-live, the lock is released and a later `--detach` can proceed.
+- [ ] `core/test/tugboat.test.ts` keeps a concurrent two-spawn fixture. The test is not deleted, skipped, or marked flaky. Children start through a barrier/stub; the test waits for both exits.
 - [ ] That fixture fails if both processes emit `detached tugboat ship`.
-- [ ] The concurrent fixture does not use a sleep-only race as the pass condition. Admission is serialized in the lock/probe, or the test waits on a documented lock/gate artifact before it asserts.
+- [ ] The concurrent fixture does not use a sleep-only race as the pass condition. Admission is serialized by `flock` until the child is live.
 - [ ] `openspec validate tugboat-detach-race-single-admission` and `npm run ci` are green when implementation lands.
 
 ## Impact

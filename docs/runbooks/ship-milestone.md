@@ -15,6 +15,13 @@ cmdline is `train --merge` for that milestone, or the owning tugboat. Bare
 are **not** live ships — Ship still detaches once. Buzz and TUI paste share
 that path (no paste detector).
 
+**Concurrent Ship (#1111):** two overlapping `--detach` invocations for the
+same repo + milestone serialize on a host-local flock at
+`$PIPELINE_SUPERVISOR_STATE/admission/<repo-token>/vX.Y.Z.lock`. That lock
+is not a live ship. The loser waits, then refuses with the live-ship probe
+(`already running … not detaching a second copy`). Leftover lock files with
+no live flock holder do not block a later Ship.
+
 **`REPO_DIR`:** pin the live control checkout at tugboat start. Paths matching
 `*factory-control*` are refused.
 
@@ -103,6 +110,9 @@ State and logs:
   state.json      # phase, status, detail (failure reasons enriched)
   playbook.log
   train.json / release-*.err / engine-promote.err …
+
+~/.local/state/pipeline-supervisor/admission/<repo-token>/
+  vX.Y.Z.lock     # flock for concurrent --detach (not a live-ship probe)
 
 ~/.local/state/pipeline-supervisor/notify/   # shared ship-notify state
   <dedupe-key>    # TTL dedupe (epoch + content); not proof of remote delivery
