@@ -6011,3 +6011,93 @@ test("dead-holder takeover does not cycle forever on a repeated crash after resu
   assert.ok(result.cycles < 25, `drive must terminate before the safety cap (got ${result.cycles} cycles)`);
   assert.ok(result.stop, "repeated crash after resume must reach a recorded stop, not spin");
 });
+
+test("second independent dead-holder interrupt is takeover, not leftover history match (#1096 83e30467)", async () => {
+  const contract = testContract({ items: [{ id: "1095", depends_on: [] }] });
+  const entry = itemEntry("1095", "pending");
+  entry.advance_run_id = "kill-1-2026-08-18T00-00-01-000Z";
+  const ledger = testLedger({ "1095": entry });
+  const { deps } = await setup(contract, ledger);
+  const succeeded = new Set<string>();
+  const observe: ReconcileObserveDeps = {
+    async getIssueStateAndLabels(issueNumber) {
+      return {
+        state: "open",
+        labels: succeeded.has(String(issueNumber)) ? [READY_LABEL] : [PIPELINE_READY_LABEL],
+      };
+    },
+    async findPrForIssue(issueNumber) {
+      return succeeded.has(String(issueNumber)) ? 12 : null;
+    },
+    async getPrDetail() {
+      return { state: "open", head_ref: "pipeline/x-fix", head_sha: "abc123", merge_commit_sha: null };
+    },
+    async getPrChecks() {
+      return [{ bucket: "pass" }];
+    },
+    async getLocalHead() {
+      return null;
+    },
+    async baseBranchContainsSha() {
+      return null;
+    },
+    async getLabelEvents() {
+      return [];
+    },
+    now: () => new Date("2026-07-23T00:00:00.000Z"),
+  };
+  let n = 0;
+  const claimed: string[] = [];
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request, hooks) => {
+    n += 1;
+    if (n <= 2) {
+      const killId = `kill-${n}-2026-08-18T00-00-0${n}-000Z`;
+      await hooks?.onAdvanceLinked?.({
+        item_id: request.item_id,
+        pipeline_run_id: killId,
+        events: `/repo/.agent-pipeline/runs/${killId}/events.jsonl`,
+      });
+      return {
+        schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+        item_id: request.item_id,
+        run_id: request.run_id,
+        outcome: "engine_internal_crash" as LoopExecutionResponse["outcome"],
+        evidence: { pr_number: null, pipeline_run_id: killId },
+      };
+    }
+    succeeded.add(request.item_id);
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "ready_to_deploy",
+      evidence: { pr_number: null, pipeline_run_id: "resume-ok-2026-08-18T00-00-03-000Z" },
+    };
+  };
+
+  const result = await driveSupervisor(
+    {
+      store: deps,
+      observe,
+      dispatchItem,
+      executeRecovery: async (input) => {
+        claimed.push(input.action);
+        return { succeeded: false, evidence: "independent kill must not claim restart_workflow_engine" };
+      },
+    },
+    { runId: "run-1", engine: "claude", maxCyclesSafety: 25 },
+  );
+
+  const events = await readEvents(deps, "run-1");
+  const takeovers = events.filter((e) => e.kind === "loop_item_dead_holder_takeover");
+  assert.equal(takeovers.length, 2, "two independent kill/resume cycles must each take over");
+  assert.ok(!claimed.includes("restart_workflow_engine"), "second independent kill must not claim restart_workflow_engine");
+  const finalLedger = await readLedger(deps, "run-1");
+  const defectBudget = finalLedger.items["1095"].recovery_budgets_remaining["workflow-engine-defect"];
+  if (defectBudget !== undefined) {
+    assert.ok(defectBudget > 0, "workflow-engine-defect budget must not burn on independent kills");
+  }
+  assert.equal(finalLedger.items["1095"].state, "ready", "item completes after the second independent resume");
+  assert.equal(result.stop, null, "two independent kills must not stop the run as a defect");
+  assert.ok(result.cycles < 25, `drive must terminate before the safety cap (got ${result.cycles} cycles)`);
+});

@@ -25,3 +25,10 @@ The engine SHALL classify a mid-stage kill, crash, SIGTERM, host reboot, or netw
 - **AND** a live lock or live wrapper identity still exists for the item
 - **THEN** existing `workflow-engine-defect` policy MAY apply
 - **AND** this requirement SHALL NOT reclassify that live holder as an interrupt
+
+#### Scenario: Second independent dead-holder interrupt is still resume-eligible
+
+- **WHEN** issue N has already recovered from one dead-holder interrupt
+- **AND** a later observe finds a different dead holder or a different crash identity for the same item
+- **THEN** the durable class SHALL NOT be `workflow-engine-defect` solely because a prior takeover exists
+- **AND** recovery SHALL treat the item as resume-eligible again

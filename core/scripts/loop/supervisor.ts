@@ -53,7 +53,7 @@ import {
   transitionItem,
   type ReconcileObserveDeps,
 } from "./reconcile.ts";
-import { blockItem, completeRecoveryAttempt, startRecoveryAttempt, upgradeContractForRecovery, upgradeLedgerForRecovery } from "./recovery.ts";
+import { blockItem, completeRecoveryAttempt, fingerprintEvidence, startRecoveryAttempt, upgradeContractForRecovery, upgradeLedgerForRecovery } from "./recovery.ts";
 import { waitItem } from "./pause.ts";
 import { computeExternalDependencyStatuses, detectDependencyDeadlock, propagateSkips } from "./dependencies.ts";
 import { detectChangedFileOverlap, selectSchedulableSet } from "./schedule.ts";
@@ -436,13 +436,84 @@ function alreadyTypedNonDefectBlock(item: LoopItemLedgerEntry | undefined): bool
   );
 }
 
+const DEAD_HOLDER_TAKEOVER_KIND = "dead-holder-interrupt";
+
+function encodeDeadHolderTakeoverEvidence(holderRunId: string, crashFingerprint: string): string {
+  return JSON.stringify({
+    kind: DEAD_HOLDER_TAKEOVER_KIND,
+    holder_run_id: holderRunId,
+    crash_fingerprint: crashFingerprint,
+  });
+}
+
+function parseDeadHolderTakeoverEvidence(
+  evidence: string | undefined,
+): { holderRunId: string; fingerprint: string } | null {
+  if (!evidence) return null;
+  try {
+    const parsed = JSON.parse(evidence) as {
+      kind?: unknown;
+      holder_run_id?: unknown;
+      crash_fingerprint?: unknown;
+    };
+    if (
+      parsed.kind !== DEAD_HOLDER_TAKEOVER_KIND ||
+      typeof parsed.holder_run_id !== "string" ||
+      parsed.holder_run_id.length === 0 ||
+      typeof parsed.crash_fingerprint !== "string" ||
+      parsed.crash_fingerprint.length === 0
+    ) {
+      return null;
+    }
+    return { holderRunId: parsed.holder_run_id, fingerprint: parsed.crash_fingerprint };
+  } catch {
+    return null;
+  }
+}
+
+/** True only for the same holder/run identity and crash fingerprint.
+ *  A leftover "dead-holder interrupt" note must not suppress a later independent kill. */
+function sameDeadHolderInterruptAlreadyTakenOver(
+  history: readonly { evidence?: string }[],
+  holderRunId: string,
+  crashFingerprint: string,
+): boolean {
+  if (!holderRunId || !crashFingerprint) return false;
+  return history.some((h) => {
+    const parsed = parseDeadHolderTakeoverEvidence(h.evidence);
+    return parsed?.holderRunId === holderRunId && parsed.fingerprint === crashFingerprint;
+  });
+}
+
+function currentDeadHolderIdentity(input: {
+  startLinkageRunId?: string;
+  responseRunId?: string;
+  itemAdvanceRunId?: string;
+  preDispatchRunId?: string;
+}): string {
+  return (
+    input.startLinkageRunId ||
+    input.responseRunId ||
+    input.itemAdvanceRunId ||
+    input.preDispatchRunId ||
+    ""
+  );
+}
+
 /**
  * Dead-holder takeover (#1096): return the same item to pending without
  * recording coexistence_wait and without charging workflow-engine-defect.
  */
 async function takeoverDeadHolderItem(
   store: LoopStoreDeps,
-  input: { runId: string; token: string; itemId: string; engine: LoopEngineName },
+  input: {
+    runId: string;
+    token: string;
+    itemId: string;
+    engine: LoopEngineName;
+    holderRunId: string;
+    crashFingerprint: string;
+  },
 ): Promise<LoopLedger> {
   const ledger = await readLedger(store, input.runId);
   const item = ledger.items[input.itemId];
@@ -461,6 +532,7 @@ async function takeoverDeadHolderItem(
         to: "pending",
         engine: input.engine,
         note: "dead-holder interrupt — takeover of the same item (no coexistence wait, no restart_workflow_engine)",
+        evidence: encodeDeadHolderTakeoverEvidence(input.holderRunId, input.crashFingerprint),
       },
     ],
   };
@@ -468,6 +540,8 @@ async function takeoverDeadHolderItem(
   await writeLedger(store, newLedger, input.token);
   await appendEvent(store, input.runId, input.token, "loop_item_dead_holder_takeover", {
     item_id: input.itemId,
+    holder_run_id: input.holderRunId,
+    crash_fingerprint: input.crashFingerprint,
   });
   return newLedger;
 }
@@ -2385,8 +2459,24 @@ export async function runSupervisorCycle(
             raw_outcome: errText,
           }).catch(() => {});
         } else if (interrupt === "resume-eligible-interrupt") {
-          const alreadyResumed = (itemEntry?.history ?? []).some((h) =>
-            String(h.note ?? "").includes("dead-holder interrupt"),
+          const responseRunId =
+            typeof response?.evidence.pipeline_run_id === "string" &&
+            response.evidence.pipeline_run_id.length > 0
+              ? response.evidence.pipeline_run_id
+              : undefined;
+          const currentHolderRunId = currentDeadHolderIdentity({
+            startLinkageRunId: startLinkageByItem.get(itemId),
+            responseRunId,
+            itemAdvanceRunId: itemEntry?.advance_run_id,
+            preDispatchRunId: preDispatchAdvanceRunIdByItem.get(itemId),
+          });
+          const crashFingerprint = fingerprintEvidence(
+            `${String(rawOutcomeByItem.get(itemId) ?? "")}\n${errText}`,
+          );
+          const alreadyResumed = sameDeadHolderInterruptAlreadyTakenOver(
+            itemEntry?.history ?? [],
+            currentHolderRunId,
+            crashFingerprint,
           );
           const priorOrLinkedHolder =
             preDispatchAdvanceRunIdByItem.has(itemId) || startLinkageByItem.has(itemId);
@@ -2394,10 +2484,18 @@ export async function runSupervisorCycle(
             !alreadyResumed &&
             !alreadyTypedNonDefectBlock(itemEntry) &&
             priorOrLinkedHolder &&
+            currentHolderRunId.length > 0 &&
             isDeadHolderInterruptSignal(errText, rawOutcomeByItem.get(itemId))
           ) {
             coexistenceNoOp = true;
-            ledger = await takeoverDeadHolderItem(deps.store, { runId, token, itemId, engine });
+            ledger = await takeoverDeadHolderItem(deps.store, {
+              runId,
+              token,
+              itemId,
+              engine,
+              holderRunId: currentHolderRunId,
+              crashFingerprint,
+            });
             evidenceOutcome = "dead_holder_takeover";
           }
         }

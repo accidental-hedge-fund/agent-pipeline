@@ -11,6 +11,7 @@
 - [x] 2.2 Do not keep `workflow-engine-defect` as the current class solely because a leftover loop outcome says `harness-failure`.
 - [x] 2.3 Keep a live holder on the existing coexistence-wait path.
 - [x] 2.4 Unit-test 2.1–2.3 with injected process-liveness / lock / wrapper seams.
+- [x] 2.5 Scope dead-holder duplicate suppression to the current holder/run identity and crash fingerprint. A later independent kill for the same item remains resume-eligible. Fixture: two independent kill/resume cycles take over twice.
 
 ## 3. Coexistence takeover of a dead holder
 
