@@ -2264,10 +2264,58 @@ export async function defaultObserveExistingRelease(
       headRefOid?: string;
       baseRefName?: string;
     }>;
-    return selectExistingReleaseRow(request, Array.isArray(openRows) ? openRows : []);
+    const fromOpen = selectExistingReleaseRow(request, Array.isArray(openRows) ? openRows : []);
+    if (fromOpen) return fromOpen;
+  } catch {
+    // Fall through to commit-in-PR lookup.
+  }
+  try {
+    const { stdout } = await execFileAsync(
+      "gh",
+      [
+        "api",
+        `repos/${request.repository}/commits/${request.integrated_candidate.git_sha}/pulls`,
+        "--jq",
+        ".[] | {number,state,headRefOid:.head.sha,baseRefName:.base.ref}",
+      ],
+      { timeout: 60_000, maxBuffer: 10 * 1024 * 1024 },
+    );
+    const lines = String(stdout)
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as {
+        number?: number;
+        state?: string;
+        headRefOid?: string;
+        baseRefName?: string;
+      });
+    return selectExistingReleaseFromContainingPrs(request, lines);
   } catch {
     return null;
   }
+}
+
+/** A PR that already contains the candidate may have a later HEAD. */
+export function selectExistingReleaseFromContainingPrs(
+  request: FactoryReleasePrepareRequest,
+  rows: ReadonlyArray<{
+    number?: number;
+    headRefOid?: string;
+    baseRefName?: string;
+    state?: string;
+  }>,
+): { pr: number; head_oid: string; version: string } | null {
+  for (const row of rows) {
+    const pr = Number(row.number);
+    const head = String(row.headRefOid ?? "").toLowerCase();
+    if (!Number.isSafeInteger(pr) || pr <= 0 || !/^[0-9a-f]{40}$/i.test(head)) continue;
+    if (row.baseRefName !== request.base_branch) continue;
+    const state = String(row.state ?? "open").toLowerCase();
+    if (state !== "open" && state !== "merged") continue;
+    return { pr, head_oid: head, version: request.target_version };
+  }
+  return null;
 }
 
 export function defaultFactoryReleasePrepareDeps(

@@ -22,6 +22,7 @@ import {
   generateDurableUnsignedFrg,
   honestLatestJsonBindsRequest,
   isBoundPackLoopTerminal,
+  selectExistingReleaseFromContainingPrs,
   selectExistingReleaseRow,
   isPendingLoopDispatch,
   isPostPilotReleaseVersion,
@@ -443,6 +444,15 @@ test("selectExistingReleaseRow matches an open PR whose head is the candidate", 
     ]),
     null,
   );
+});
+
+test("selectExistingReleaseFromContainingPrs reuses a later PR HEAD that still contains the candidate", () => {
+  const request = baseRequest();
+  const later = "f".repeat(40);
+  const hit = selectExistingReleaseFromContainingPrs(request, [
+    { number: 1120, headRefOid: later, baseRefName: "main", state: "open" },
+  ]);
+  assert.deepEqual(hit, { pr: 1120, head_oid: later, version: "1.34.0" });
 });
 
 test("generateDurableUnsignedFrg reuses candidate-bound latest.json and does not start a pack", async () => {
