@@ -107,6 +107,37 @@ test("tugboat failure_detail release-finish: surfaces pending checks line", () =
   }
 });
 
+test("tugboat failure_detail release-finish: checks sidecar beats tester-evidence warn", () => {
+  const dir = makeRunDir();
+  try {
+    fs.writeFileSync(
+      path.join(dir, "release-checks.fail.json"),
+      JSON.stringify({
+        pr: "1109",
+        check_name: "test",
+        bucket: "fail",
+        link: "https://github.com/o/r/actions/runs/32075787450",
+        reason:
+          "PR #1109 check test fail https://github.com/o/r/actions/runs/32075787450",
+      }),
+    );
+    const logFile = path.join(dir, "playbook.log");
+    fs.writeFileSync(
+      logFile,
+      "[pipeline] tester-evidence: trusted-surface blocked prevents readiness subject emission (fail closed)\n",
+    );
+    const out = extractFailureDetail(dir, logFile, "release-finish");
+    assert.match(out, /PR #1109/);
+    assert.match(out, /\btest\b/);
+    assert.match(out, /32075787450/);
+    assert.doesNotMatch(out, /^\[pipeline\] tester-evidence:/);
+    assert.doesNotMatch(out, /^trusted-surface blocked/);
+    assert.doesNotMatch(out, /tester-evidence/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("tugboat failure_detail: empty when no capture", () => {
   const dir = makeRunDir();
   try {
@@ -155,6 +186,7 @@ test("tugboat CI-wait uses valid gh pr checks fields (bucket, not conclusion)", 
   assert.ok(m, "CI-wait gh pr checks line not found");
   assert.doesNotMatch(m[1], /conclusion/);
   assert.match(m[1], /\bbucket\b/);
+  assert.match(m[1], /\blink\b/);
 });
 
 test("tugboat supports serial multi-milestone and single-host lock", () => {
@@ -275,11 +307,13 @@ test("tugboat version rules: train v-prefix, release bare, promote bare, gh rele
 test("tugboat reuses existing open release PR (idempotent prepare)", () => {
   // Without find_open_release_pr + reuse branch, a second ship of the same
   // version would fail closed even when the release PR is already open.
+  // After a waiter STOP (#1110), Re-Ship still reuses that open PR.
   const body = fs.readFileSync(tugboat, "utf8");
   assert.match(body, /find_open_release_pr\(\)/);
   assert.match(body, /release: \{version\}|release: v\{version\}|startswith\(f"release: /);
   assert.match(body, /existing open release PR #\$pr reused \(idempotent\)/);
   assert.match(body, /could not determine release PR number/);
+  assert.match(body, /after a prior waiter STOP still reuses this PR/);
 });
 
 test("tugboat --status reads state without starting ship phases", () => {
@@ -376,8 +410,8 @@ test("tugboat install-parity helper: repo pack passes; content/helpers fail clos
     "# Tugboat — thin ship composer (Option 1, #1001).",
     'ENGINE_PROMOTE_HOST="${ENGINE_PROMOTE_HOST:-all}"',
     "failure_detail() { :; }",
-    '# dead/commented: gh pr checks "$pr" --json name,state,bucket',
-    'gh pr checks "$pr" --json name,state,bucket',
+    '# dead/commented: gh pr checks "$pr" --json name,state,bucket,link',
+    'gh pr checks "$pr" --json name,state,bucket,link',
     '"kind": "tugboat_ship"',
     'pipeline engine-promote --for "$version" --host codex --skip-frg',
     "",

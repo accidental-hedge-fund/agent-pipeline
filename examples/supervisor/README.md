@@ -18,7 +18,7 @@ They only map intent → `pipeline` CLI. They are **not** a second control plane
 | `ship-notify.sh` | Optional Buzz status posts; **no-op** without messenger env (shared with Tugboat). Retries transient send failures; audits under `$PIPELINE_SUPERVISOR_STATE/notify/` (`audit.log`, `failed/*`); still exit 0 so ship never blocks on delivery. |
 | `ship-stage-watch.sh` | Stream one explicit run event file through `material-filter.mjs` (shared) |
 | `train-status-complete.py` | Pure helper: last `train_status` complete gate from mixed prose+JSON (`raw_decode`) |
-| `release-checks-green.py` | Pure helper: release PR checks green from `gh pr checks --json` (`bucket` schema) |
+| `release-checks-green.py` | Shared ship-release check waiter: classify `gh pr checks --json` as green/pending/rerun/fail (`bucket`+`link`; bounded flake-eligible rerun) |
 | `run-intent.sh` | Map a short intent string → `pipeline train` / `single` |
 | `pipeline-launcher.sh` | Resolve installed `pipeline` without hardcoding host paths. On the factory control plane, exports `AGENT_PIPELINE_PRODUCTION_PIN` when unset. |
 | `frg-pack-helpers.sh` | Secret-free `factory-release prepare` request writer + pack-tick classifier. Sourced by the playbook. Tugboat inlines the same helpers. |

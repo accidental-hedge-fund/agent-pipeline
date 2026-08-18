@@ -37,6 +37,8 @@
 #                              unless the operator scopes to one host.
 #   RELEASE_WAIT_ATTEMPTS      default 30
 #   RELEASE_WAIT_SLEEP_S       default 40
+#   RELEASE_CHECKS_RERUN_BUDGET  flake-eligible test reruns per head SHA (default 1, max 2)
+#   RELEASE_CHECKS_FLAKE_ELIGIBLE  comma allowlist of check names (default test)
 #   FRG_WAIT_ATTEMPTS          FRG pack re-invoke attempts (default RELEASE_WAIT_ATTEMPTS)
 #   FRG_WAIT_SLEEP_S           FRG pack sleep seconds (default RELEASE_WAIT_SLEEP_S)
 #   TUGBOAT_SKIP_FRG           1 to skip FRG pack (requires TUGBOAT_SKIP_FRG_REASON)
@@ -71,6 +73,8 @@ SHIP_STAGE_WATCH_BIN="${SHIP_STAGE_WATCH_BIN:-$SCRIPT_DIR/ship-stage-watch.sh}"
 # Pure helper: last train_status from mixed prose+JSON capture (completion gate + resume)
 TRAIN_STATUS_COMPLETE_BIN="${TRAIN_STATUS_COMPLETE_BIN:-$SCRIPT_DIR/train-status-complete.py}"
 RELEASE_CHECKS_GREEN_BIN="${RELEASE_CHECKS_GREEN_BIN:-$SCRIPT_DIR/release-checks-green.py}"
+RELEASE_CHECKS_RERUN_BUDGET="${RELEASE_CHECKS_RERUN_BUDGET:-1}"
+RELEASE_CHECKS_FLAKE_ELIGIBLE="${RELEASE_CHECKS_FLAKE_ELIGIBLE:-test}"
 _HEARTBEAT_PID=""
 
 ship_notify() {
@@ -493,7 +497,24 @@ failure_detail() {
       f="$RUN_DIR/train.stderr"
       ;;
     release-prepare) f="$RUN_DIR/release-prepare.err" ;;
-    release-finish)  f="$RUN_DIR/release-finish.err" ;;
+    release-finish)
+      # Checks sidecar is the lead reason for a waiter STOP (#1110).
+      # Do not prefer leftover train tester-evidence / trusted-surface warns.
+      if [[ -s "$RUN_DIR/release-checks.fail.json" ]]; then
+        reason=$(python3 -c 'import json,sys
+try:
+    d=json.load(open(sys.argv[1],encoding="utf-8"))
+except Exception:
+    raise SystemExit(0)
+print((d.get("reason") or "")[:400])
+' "$RUN_DIR/release-checks.fail.json" 2>/dev/null || true)
+        if [[ -n "$reason" ]]; then
+          echo "$reason"
+          return
+        fi
+      fi
+      f="$RUN_DIR/release-finish.err"
+      ;;
     wait-release)    f="$RUN_DIR/gh-release.err" ;;
     engine-promote)  f="$RUN_DIR/engine-promote.err" ;;
     precheck)        f="" ;;
@@ -502,9 +523,9 @@ failure_detail() {
   # Extract the most specific failure line from the capture: prefer a line
   # mentioning error/fail/block/refus/denied/pending/not green; else last line.
   if [[ -s "$f" ]]; then
-    reason=$(grep -iE 'error|fail|block|refus|denied|pending|not green|invalid|missing|cannot|could not|exit [1-9]' "$f" 2>/dev/null | grep -viE '^\s*-' | tail -1)
+    reason=$(grep -iE 'error|fail|block|refus|denied|pending|not green|invalid|missing|cannot|could not|exit [1-9]' "$f" 2>/dev/null | grep -viE '^\s*-|tester-evidence|trusted-surface blocked' | tail -1)
     if [[ -z "$reason" ]]; then
-      reason=$(grep -iE 'error|fail|block|refus|denied|pending|not green|invalid|missing|cannot|could not|exit [1-9]' "$f" 2>/dev/null | tail -1)
+      reason=$(grep -iE 'error|fail|block|refus|denied|pending|not green|invalid|missing|cannot|could not|exit [1-9]' "$f" 2>/dev/null | grep -viE 'tester-evidence|trusted-surface blocked' | tail -1)
     fi
     if [[ -z "$reason" ]]; then
       reason=$(tail -1 "$f" 2>/dev/null)
@@ -515,7 +536,7 @@ failure_detail() {
   fi
   # Fallback: last error-ish line of the playbook log for this phase.
   if [[ -s "$LOG_FILE" ]]; then
-    reason=$(grep -iE '\[pipeline[^]]*\] .*(error|fail|block|refus|denied|not green|exit [1-9])' "$LOG_FILE" 2>/dev/null | tail -1)
+    reason=$(grep -iE '\[pipeline[^]]*\] .*(error|fail|block|refus|denied|not green|exit [1-9])' "$LOG_FILE" 2>/dev/null | grep -viE 'tester-evidence|trusted-surface blocked' | tail -1)
     [[ -n "$reason" ]] && echo "$reason" | sed 's/^\[[0-9TZ:-]*\] *//' | head -c 400
   fi
 }
@@ -562,6 +583,120 @@ JSON
   else
     ship_heartbeat_stop
   fi
+}
+
+# Shared ship-release check-wait recipe (#1110). Default 1 rerun, hard max 2.
+release_checks_rerun_budget() {
+  local n="${RELEASE_CHECKS_RERUN_BUDGET:-1}"
+  if ! [[ "$n" =~ ^[0-9]+$ ]]; then
+    n=1
+  fi
+  if (( n < 1 )); then n=1; fi
+  if (( n > 2 )); then n=2; fi
+  printf '%s\n' "$n"
+}
+
+release_pr_head_sha() {
+  local pr=$1
+  local sha
+  sha=$(gh pr view "$pr" --json headRefOid --jq .headRefOid 2>/dev/null || true)
+  printf '%s' "${sha//$'\n'/}"
+}
+
+release_checks_sidecar_field() {
+  local sidecar=$1 field=$2
+  python3 -c 'import json,sys
+try:
+    d=json.load(open(sys.argv[1],encoding="utf-8"))
+except Exception:
+    raise SystemExit(0)
+print(d.get(sys.argv[2]) or "")
+' "$sidecar" "$field" 2>/dev/null || true
+}
+
+# One poll: classify via the shared helper; on rerun record then gh run rerun --failed.
+# Prints: green | pending | fail
+apply_release_check_wait_tick() {
+  local pr=$1
+  local capture=$2
+  local sidecar="$RUN_DIR/release-checks.fail.json"
+  local budget_file="$RUN_DIR/release-checks.rerun"
+  local failed_log="$RUN_DIR/release-checks.failed-log"
+  local budget head_sha token run_id rec_ec rerun_ec
+
+  if [[ -z "${RUN_DIR:-}" || ! -d "$RUN_DIR" ]]; then
+    printf '%s\n' "fail"
+    return 0
+  fi
+  if [[ ! -f "$capture" ]]; then
+    printf '%s\n' "pending"
+    return 0
+  fi
+
+  budget=$(release_checks_rerun_budget)
+  head_sha=$(release_pr_head_sha "$pr")
+
+  token=$(python3 "$RELEASE_CHECKS_GREEN_BIN" "$capture" \
+    --sidecar "$sidecar" \
+    --pr "$pr" \
+    --head-sha "$head_sha" \
+    --budget "$budget" \
+    --budget-file "$budget_file" \
+    --allowlist "${RELEASE_CHECKS_FLAKE_ELIGIBLE:-test}")
+
+  if [[ "$token" == "1" ]]; then
+    printf '%s\n' "green"
+    return 0
+  fi
+  if [[ "$token" == "0" ]]; then
+    printf '%s\n' "pending"
+    return 0
+  fi
+  if [[ "$token" == "2" ]]; then
+    run_id=$(release_checks_sidecar_field "$sidecar" "run_id")
+    if [[ -z "$run_id" || -z "$head_sha" ]]; then
+      printf '%s\n' "fail"
+      return 0
+    fi
+    set +e
+    python3 "$RELEASE_CHECKS_GREEN_BIN" --record-attempt \
+      --budget-file "$budget_file" --pr "$pr" --head-sha "$head_sha" --run-id "$run_id"
+    rec_ec=$?
+    set -e
+    if [[ "$rec_ec" -ne 0 ]]; then
+      printf '%s\n' "fail"
+      return 0
+    fi
+    set +e
+    gh run rerun "$run_id" --failed
+    rerun_ec=$?
+    set -e
+    if [[ "$rerun_ec" -ne 0 ]]; then
+      printf '%s\n' "fail"
+      return 0
+    fi
+    printf '%s\n' "pending"
+    return 0
+  fi
+
+  run_id=$(release_checks_sidecar_field "$sidecar" "run_id")
+  if [[ -n "$run_id" ]]; then
+    set +e
+    gh run view "$run_id" --log-failed >"$failed_log" 2>/dev/null
+    set -e
+    if [[ -s "$failed_log" ]]; then
+      python3 "$RELEASE_CHECKS_GREEN_BIN" "$capture" \
+        --sidecar "$sidecar" \
+        --pr "$pr" \
+        --head-sha "$head_sha" \
+        --budget "$budget" \
+        --budget-file "$budget_file" \
+        --failed-log "$failed_log" \
+        --allowlist "${RELEASE_CHECKS_FLAKE_ELIGIBLE:-test}" >/dev/null || true
+    fi
+  fi
+  printf '%s\n' "fail"
+  return 0
 }
 
 log() {
@@ -773,16 +908,14 @@ write_state "release-prepare" "ok" "pr=$pr"
 echo "$pr" >"$RUN_DIR/release.pr"
 
 # C0: wait for the release PR's checks to go green before release-finish.
-# `pipeline release finish` refuses to merge while observable checks are
-# pending/failing ("No required checks configured, but observable checks are
-# not green"). The release PR is opened moments before this phase, so without
-# this wait the ship races CI and fails release-finish with exit 1. Poll until
-# green (or a hard fail), then proceed.
+# Shared ship-release check-wait recipe (#1110): flake-eligible `test` fail
+# requests one `gh run rerun --failed` then resumes wait. Terminal fail is
+# budget spent or a non-test product check. Re-Ship reuses the open PR.
 log "phase release-finish: waiting for PR #$pr checks to go green"
 checks_green=0
 for i in $(seq 1 "$RELEASE_WAIT_ATTEMPTS"); do
   set +e
-  gh pr checks "$pr" --json name,state,bucket >"$RUN_DIR/release-checks.json" 2>"$RUN_DIR/release-checks.err"
+  gh pr checks "$pr" --json name,state,bucket,link >"$RUN_DIR/release-checks.json" 2>"$RUN_DIR/release-checks.err"
   cec=$?
   set -e
   if [[ "$cec" -ne 0 ]]; then
@@ -791,12 +924,12 @@ for i in $(seq 1 "$RELEASE_WAIT_ATTEMPTS"); do
     sleep "$RELEASE_WAIT_SLEEP_S"
     continue
   fi
-  green=$(python3 "$RELEASE_CHECKS_GREEN_BIN" "$RUN_DIR/release-checks.json")
-  if [[ "$green" == "1" ]]; then
+  verdict=$(apply_release_check_wait_tick "$pr" "$RUN_DIR/release-checks.json")
+  if [[ "$verdict" == "green" ]]; then
     log "phase release-finish: PR #$pr checks green (attempt $i)"
     checks_green=1
     break
-  elif [[ "$green" == "-1" ]]; then
+  elif [[ "$verdict" == "fail" ]]; then
     log "phase release-finish: PR #$pr checks FAILED (attempt $i)"
     write_state "release-finish" "failed" "PR #$pr checks failed"
     log "FAIL: release PR #$pr checks failed"

@@ -53,7 +53,7 @@ const FAKE_OPTION1_TUGBOAT = [
   "# Tugboat — thin ship composer (Option 1, #1001).",
   'ENGINE_PROMOTE_HOST="${ENGINE_PROMOTE_HOST:-all}"',
   "failure_detail() { :; }",
-  'gh pr checks "$pr" --json name,state,bucket',
+  'gh pr checks "$pr" --json name,state,bucket,link',
   '"kind": "tugboat_ship"',
   'pipeline engine-promote --for "$version" --host "${ENGINE_PROMOTE_HOST}" --skip-frg',
   "",
@@ -1778,7 +1778,7 @@ test("check supervisor:tugboat-install-parity — fails on marker-complete diver
     "# Tugboat — thin ship composer (Option 1, #1001).",
     'ENGINE_PROMOTE_HOST="${ENGINE_PROMOTE_HOST:-all}"',
     "failure_detail() { :; }",
-    'gh pr checks "$pr" --json name,state,bucket',
+    'gh pr checks "$pr" --json name,state,bucket,link',
     '"kind": "tugboat_ship"',
     // Active promote forced to single host — behavioral divergence.
     "pipeline engine-promote --for \"$version\" --host codex --skip-frg",

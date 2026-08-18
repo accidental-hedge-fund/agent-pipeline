@@ -23,9 +23,9 @@ export const TUGBOAT_THIN_IDENTITY =
 /** Failure detail enrichment (#997). */
 export const TUGBOAT_FAILURE_DETAIL = /failure_detail\s*\(/;
 
-/** CI wait uses valid gh pr checks fields including bucket (#996). */
+/** CI wait uses valid gh pr checks fields including bucket + link (#996 / #1110). */
 export const TUGBOAT_CI_WAIT_BUCKET =
-  /gh pr checks "\$pr" --json name,state,bucket/;
+  /gh pr checks "\$pr" --json name,state,bucket,link/;
 
 /** Forbidden second-ship-brain / grant-factory product markers. */
 export const TUGBOAT_FORBIDDEN_SECOND_BRAIN =
