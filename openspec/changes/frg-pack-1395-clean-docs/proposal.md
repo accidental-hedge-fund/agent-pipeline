@@ -20,26 +20,26 @@ test. The path must not change production behavior.
 
 ## Acceptance Criteria
 
-- [ ] File `core/test/fixtures/frg/pack-1395-tugboat-ship-1.39.5/clean-docs.json`
+- [x] File `core/test/fixtures/frg/pack-1395-tugboat-ship-1.39.5/clean-docs.json`
       exists and is valid JSON.
-- [ ] That fixture's `release_version` field equals the string `1.39.5`.
-- [ ] File `core/test/frg-pack-1395-clean-docs.test.ts` exists and resolves
+- [x] That fixture's `release_version` field equals the string `1.39.5`.
+- [x] File `core/test/frg-pack-1395-clean-docs.test.ts` exists and resolves
       only `core/test/fixtures/frg/pack-1395-tugboat-ship-1.39.5/clean-docs.json`
       (no glob, no shared-pack lookup, no fallback path).
-- [ ] That test reads and parses the JSON, then uses a strict equality
+- [x] That test reads and parses the JSON, then uses a strict equality
       assertion `release_version === "1.39.5"`.
-- [ ] The same assertion fails when `release_version` is missing or is any
+- [x] The same assertion fails when `release_version` is missing or is any
       other value (for example `1.39.4`).
-- [ ] The fixture and test do not read or write any other
+- [x] The fixture and test do not read or write any other
       `core/test/fixtures/frg/<pack_run_id>/` directory.
-- [ ] `git diff -- core/scripts hosts plugin` is empty.
-- [ ] `cd core && npm test` includes the new test and exits 0 on the
+- [x] `git diff -- core/scripts hosts plugin` is empty.
+- [x] `cd core && npm test` includes the new test and exits 0 on the
       committed SHA.
-- [ ] `npm run ci` from the repo root exits 0 on the committed SHA.
-- [ ] `openspec validate --all` exits 0.
+- [x] `npm run ci` from the repo root exits 0 on the committed SHA.
+- [x] `openspec validate --all` exits 0.
 - [ ] Engine-recorded SHA-pinned tester evidence exists for that SHA
       before any claim of a suite pass.
-- [ ] Functional test-content additions are only the fixture and
+- [x] Functional test-content additions are only the fixture and
       `core/test/frg-pack-1395-clean-docs.test.ts`. OpenSpec change files
       under `openspec/changes/frg-pack-1395-clean-docs/` remain permitted.
 

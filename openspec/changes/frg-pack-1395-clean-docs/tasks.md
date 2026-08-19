@@ -24,11 +24,11 @@
       functional test-content additions are only the fixture and
       `core/test/frg-pack-1395-clean-docs.test.ts`. OpenSpec files under
       `openspec/changes/frg-pack-1395-clean-docs/` remain permitted.
-- [ ] 3.2 Run `cd core && npm test` on the committed SHA and confirm the
+- [x] 3.2 Run `cd core && npm test` on the committed SHA and confirm the
       new test is included and passing.
-- [ ] 3.3 Run `npm run ci` from the repo root and confirm it exits 0.
-- [ ] 3.4 Run `openspec validate --all` and confirm it exits 0.
-- [ ] 3.5 Do not claim a suite pass until the engine test-gate records
+- [x] 3.3 Run `npm run ci` from the repo root and confirm it exits 0.
+- [x] 3.4 Run `openspec validate --all` and confirm it exits 0.
+- [x] 3.5 Do not claim a suite pass until the engine test-gate records
       SHA-pinned tester evidence for that SHA.
 - [x] 3.6 Skip `node scripts/build.mjs` unless a copied `core/` entry was
       edited (not expected).
