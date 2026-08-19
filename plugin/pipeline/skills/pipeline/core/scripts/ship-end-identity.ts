@@ -80,7 +80,9 @@ export function isThinPlaybookLauncher(body: string): boolean {
 /**
  * Classify an installed playbook body.
  * Marker-only mention of tugboat.sh is not a launcher.
- * Unrecognized bodies are unused (doctor skip), not a silent pass.
+ * `unused` is absence only (null body). Any installed non-launcher body is
+ * noncompliant (`playbook-stale`), including unrecognized shell forms.
+ * Selection is a separate doctor/unit input — do not infer it from the body.
  */
 export function classifyPlaybookBody(body: string | null): PlaybookComposerKind {
   if (body == null) return "unused";
@@ -88,7 +90,7 @@ export function classifyPlaybookBody(body: string | null): PlaybookComposerKind 
   if (FULL_PLAYBOOK_COMPOSE_RE.test(body)) return "playbook-stale";
   const digest = contentDigest(body);
   if (digest.startsWith(STALE_PLAYBOOK_DIGEST_PREFIX)) return "playbook-stale";
-  return "unused";
+  return "playbook-stale";
 }
 
 export function shipEndCandidateRemediation(): string {

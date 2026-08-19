@@ -1189,9 +1189,11 @@ export function buildPreflightChecks(
   });
 
   // 15. Ship-end candidate-engine identity (#1151). Skip when no Tugboat,
-  //     no recognized playbook, and no in-engine ship-end. Fail a selected
-  //     stale full playbook. Bound SHA comparison is the unit helper
-  //     (injected strings); doctor fails the selected stale playbook at rest.
+  //     no installed playbook, and no in-engine ship-end. Selection is
+  //     independent of body classification: Tugboat present ⇒ playbook is
+  //     not selected; otherwise an installed playbook is selected. Fail a
+  //     selected non-launcher (including unrecognized bodies). Bound SHA
+  //     comparison is the unit helper (injected strings).
   checks.push({
     id: "supervisor:ship-end-candidate-engine",
     description:
@@ -1203,13 +1205,16 @@ export function buildPreflightChecks(
       const playbookInstalled = await deps.fsExists(playbookPath);
       const playbookBody = playbookInstalled ? await deps.readTextFile(playbookPath) : null;
       const playbookKind = classifyPlaybookBody(playbookBody);
-      const selectedPlaybookKind = tugboatInstalled ? "unused" as const : playbookKind;
-      const toolsInUse = tugboatInstalled || playbookKind !== "unused";
+      const playbookSelected = playbookInstalled && !tugboatInstalled;
+      const selectedPlaybookKind = playbookSelected
+        ? (playbookKind === "playbook-launcher" ? "playbook-launcher" as const : "playbook-stale" as const)
+        : "unused" as const;
+      const toolsInUse = tugboatInstalled || playbookInstalled;
       const composerKind = tugboatInstalled
         ? "tugboat-repo" as const
-        : playbookKind === "playbook-launcher"
+        : selectedPlaybookKind === "playbook-launcher"
           ? "playbook-launcher" as const
-          : playbookKind === "playbook-stale"
+          : selectedPlaybookKind === "playbook-stale"
             ? "playbook-stale" as const
             : "unused" as const;
       const verdict = evaluateShipEndIdentity({

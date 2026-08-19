@@ -42,6 +42,7 @@ import {
   defaultInstalledOption1PackPaths,
   defaultInstalledTugboatPath,
 } from "../scripts/tugboat-install-parity.ts";
+import { defaultInstalledShipPlaybookPath } from "../scripts/ship-playbook-promote-host.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 
 const FAKE_VERSION = "1.0.0";
@@ -151,6 +152,12 @@ interface FakeOverrides {
    * content parity (#927 r2).
    */
   option1PackInstalled?: boolean;
+  /**
+   * Opt-in: treat ~/.local/bin/pipeline-ship-playbook as present. Blanket
+   * `fsExists: () => true` must NOT select a phantom playbook — otherwise
+   * runPreflight all-pass tests fail the ship-end identity check.
+   */
+  playbookInstalled?: boolean;
   fileMtime?: (p: string) => number | null;
   readTextFile?: (p: string) => string | null;
   listDirNames?: (p: string) => string[] | null;
@@ -239,6 +246,12 @@ function fakeDeps(o: FakeOverrides = {}): DoctorDeps {
       if (isInstalledPackPath) {
         if (!o.option1PackInstalled) return false;
         // Pack opted in; allow per-path hide (missing helper regressions).
+        if (o.fsExists) return o.fsExists(p);
+        return true;
+      }
+      // Hermetic default: no installed playbook (identity check skips).
+      if (p === defaultInstalledShipPlaybookPath()) {
+        if (!o.playbookInstalled) return false;
         if (o.fsExists) return o.fsExists(p);
         return true;
       }
@@ -1560,6 +1573,7 @@ test("check supervisor:ship-playbook-promote-host — fails on legacy codex-only
     const legacy = 'HOST="${ENGINE_PROMOTE_HOST:-codex}"\n';
     const r = await check.run(
       fakeDeps({
+        playbookInstalled: true,
         fsExists: (p) => p.includes("pipeline-ship-playbook"),
         readTextFile: (p) => (p.includes("pipeline-ship-playbook") ? legacy : '{"version":"1.0.0"}'),
       }),
@@ -1578,6 +1592,7 @@ test("check supervisor:ship-playbook-promote-host — passes when playbook defau
   const current = 'HOST="${ENGINE_PROMOTE_HOST:-all}"\n';
   const r = await check.run(
     fakeDeps({
+      playbookInstalled: true,
       fsExists: (p) => p.includes("pipeline-ship-playbook"),
       readTextFile: (p) => (p.includes("pipeline-ship-playbook") ? current : '{"version":"1.0.0"}'),
     }),
@@ -1607,6 +1622,7 @@ test("check supervisor:ship-composer-skip-frg — fails on hard-coded default sk
     '"$PIPELINE" engine-promote --for "$version" --host "$HOST" --skip-frg --json\n';
   const r = await check.run(
     fakeDeps({
+      playbookInstalled: true,
       fsExists: (p) => p.includes("pipeline-ship-playbook"),
       readTextFile: (p) => (p.includes("pipeline-ship-playbook") ? legacy : '{"version":"1.0.0"}'),
     }),
@@ -1644,6 +1660,7 @@ test("check supervisor:ship-composer-skip-frg — passes current escape-only arg
   ].join("\n");
   const r = await check.run(
     fakeDeps({
+      playbookInstalled: true,
       fsExists: (p) => p.includes("pipeline-ship-playbook") || p.endsWith(`${path.sep}tugboat`),
       readTextFile: () => current,
     }),
@@ -1867,6 +1884,7 @@ test("check supervisor:ship-end-candidate-engine — fails selected stale full p
   ].join("\n");
   const r = await check.run(
     fakeDeps({
+      playbookInstalled: true,
       fsExists: (p) => p.includes("pipeline-ship-playbook"),
       readTextFile: (p) => (p.includes("pipeline-ship-playbook") ? stale : '{"version":"1.0.0"}'),
     }),
@@ -1881,11 +1899,31 @@ test("check supervisor:ship-end-candidate-engine — passes thin launcher playbo
   const launcher = 'exec "$REPO_DIR/examples/supervisor/shell/tugboat.sh" "$@"\n';
   const r = await check.run(
     fakeDeps({
+      playbookInstalled: true,
       fsExists: (p) => p.includes("pipeline-ship-playbook"),
       readTextFile: (p) => (p.includes("pipeline-ship-playbook") ? launcher : '{"version":"1.0.0"}'),
     }),
   );
   assert.equal(r.status, "pass");
+});
+
+test("check supervisor:ship-end-candidate-engine — fails selected unrecognized playbook", async () => {
+  const check = getCheck(makeConfig(), "supervisor:ship-end-candidate-engine");
+  const divergent = [
+    "#!/bin/zsh",
+    '~/.local/bin/pipeline ship --milestone "$1"',
+    "",
+  ].join("\n");
+  const r = await check.run(
+    fakeDeps({
+      playbookInstalled: true,
+      fsExists: (p) => p.includes("pipeline-ship-playbook"),
+      readTextFile: (p) => (p.includes("pipeline-ship-playbook") ? divergent : '{"version":"1.0.0"}'),
+    }),
+  );
+  assertFailWithRemediation(r);
+  assert.match(r.detail, /thin launcher/);
+  assert.match(r.remediation!, /pipeline-ship-playbook\.sh|tugboat\.sh/);
 });
 
 // Regression for the corrupt-install startup path (#186 review 2): if core/package.json

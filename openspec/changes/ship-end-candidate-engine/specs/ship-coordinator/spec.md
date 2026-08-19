@@ -4,7 +4,7 @@
 
 After `train --merge` is complete or resumed complete, in-engine `pipeline ship` SHALL run Factory Reliability Gate (FRG) pack (`factory-release prepare` and `factory-gate`), `pipeline release`, `release finish`, and any coordinator-invoked tag on the candidate engine bound to the SHA being released. The candidate engine SHALL be the control checkout at that SHA, or an explicit candidate install of that SHA.
 
-When the operator started `pipeline ship` from the previous production-pin CLI, the coordinator SHALL keep that pin process as the durable coordinator and SHALL spawn the candidate engine for leaf post-train verbs (`factory-release prepare`, `factory-gate`, `release`, `release finish`, and `ensureAnnotatedReleaseTag`). It SHALL NOT re-exec `pipeline ship`. It SHALL NOT rerun train. It SHALL NOT keep executing those leaf verbs inside the production-pin process when that process source SHA differs from the candidate. Train and `engine-promote` SHALL remain on the production pin.
+When the operator started `pipeline ship` from the previous production-pin CLI, the coordinator SHALL keep that pin process as the durable coordinator and SHALL spawn the candidate engine for leaf post-train verbs (`factory-release prepare`, `factory-gate`, `release`, `release finish`, and `release ensure-tag`). `release ensure-tag` SHALL run the candidate's `ensureAnnotatedReleaseTag`; it SHALL NOT import that helper from the production-pin process. It SHALL NOT re-exec `pipeline ship`. It SHALL NOT rerun train. It SHALL NOT keep executing those leaf verbs inside the production-pin process when that process source SHA differs from the candidate. Train and `engine-promote` SHALL remain on the production pin.
 
 The coordinator SHALL fail closed before those ship-end verbs if it cannot resolve a matching candidate engine. A failed resolution SHALL persist the train checkpoint and SHALL NOT start FRG pack or release mutation. This requirement does not authorize `--skip-frg` as the default. It does not authorize promote before GitHub Release publication.
 
@@ -29,3 +29,10 @@ The coordinator SHALL fail closed before those ship-end verbs if it cannot resol
 - **THEN** the spawned argv SHALL be a leaf CLI verb
 - **AND** it SHALL NOT be `pipeline ship --milestone`
 - **AND** it SHALL NOT be `pipeline train`
+
+#### Scenario: Coordinator-invoked tag runs candidate ensure-tag
+
+- **WHEN** the pin coordinator waits for publication after a merged release
+- **AND** the pin process SHA differs from the FRG-bound candidate SHA
+- **THEN** the coordinator SHALL spawn `release ensure-tag <X.Y.Z> <merge-commit-oid>` on the candidate launcher
+- **AND** it SHALL NOT call the production-pin process's imported `ensureAnnotatedReleaseTag`

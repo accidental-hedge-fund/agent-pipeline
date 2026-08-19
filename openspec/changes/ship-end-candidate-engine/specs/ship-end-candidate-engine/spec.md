@@ -46,7 +46,7 @@ This requirement does not authorize `--skip-frg` as the ship path. It does not a
 
 The documented installed `pipeline-ship-playbook` path SHALL be a thin launcher that execs `$REPO_DIR/examples/supervisor/shell/tugboat.sh`. It SHALL NOT retain a second ship-end compose implementation. Marker-only presence SHALL NOT count as parity.
 
-When the ship execs `$REPO_DIR/examples/supervisor/shell/tugboat.sh` directly and does not invoke a divergent installed playbook, that posture SHALL pass the playbook check. A selected installed playbook that is not that launcher SHALL fail.
+When the ship execs `$REPO_DIR/examples/supervisor/shell/tugboat.sh` directly and does not invoke a divergent installed playbook, that posture SHALL pass the playbook check. A selected installed playbook that is not that launcher SHALL fail. An installed playbook body that is neither the thin launcher nor a recognized stale compose SHALL be classified as noncompliant, not unused. Unused SHALL mean absence of the playbook or an explicit non-selection (for example Tugboat is the selected composer).
 
 #### Scenario: Stale installed playbook fails when used for ship-end
 
@@ -69,6 +69,15 @@ When the ship execs `$REPO_DIR/examples/supervisor/shell/tugboat.sh` directly an
 - **AND** that resolved `tugboat.sh` matches the candidate SHA tree
 - **THEN** the playbook check SHALL pass
 - **AND** ship-end CLI identity SHALL still be the candidate engine source SHA
+
+#### Scenario: Unrecognized selected installed playbook fails
+
+- **WHEN** `~/.local/bin/pipeline-ship-playbook` exists
+- **AND** its body is not the thin launcher to `$REPO_DIR/examples/supervisor/shell/tugboat.sh`
+- **AND** its body is not a known historical stale compose
+- **AND** that installed playbook is selected for ship-end
+- **THEN** the ship-end identity check SHALL fail
+- **AND** the body SHALL NOT be classified as unused
 
 ### Requirement: Doctor or unit check SHALL fail on ship-end identity mismatch
 

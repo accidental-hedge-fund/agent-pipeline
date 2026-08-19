@@ -16,19 +16,19 @@
 ## 3. Playbook launcher
 
 - [ ] 3.1 Replace `examples/supervisor/shell/pipeline-ship-playbook.sh` with a thin launcher that execs `$REPO_DIR/examples/supervisor/shell/tugboat.sh`. Document install of that launcher to `~/.local/bin/pipeline-ship-playbook`
-- [ ] 3.2 Doctor/identity helper fails a selected stale full playbook (including digest `2afe3c92…`) and names refresh-to-launcher or exec of repo `tugboat.sh`
+- [ ] 3.2 Doctor/identity helper fails a selected installed playbook that is not the thin launcher (known stale compose, digest `2afe3c92…`, or any unrecognized body) and names refresh-to-launcher or exec of repo `tugboat.sh`. `unused` is absence or explicit non-selection only
 
 ## 4. In-engine ship coordinator
 
-- [ ] 4.1 After train-complete, `pipeline ship` SHALL spawn candidate leaf verbs for FRG pack, `factory-gate`, `release`, `release finish`, and `ensureAnnotatedReleaseTag` when the starting process SHA ≠ candidate SHA. Do not re-exec `pipeline ship`. Do not rerun train. Recursion is impossible because argv is never `ship --milestone`
+- [ ] 4.1 After train-complete, `pipeline ship` SHALL spawn candidate leaf verbs for FRG pack, `factory-gate`, `release`, `release finish`, and `release ensure-tag` when the starting process SHA ≠ candidate SHA. Do not re-exec `pipeline ship`. Do not rerun train. Recursion is impossible because argv is never `ship --milestone`
 - [ ] 4.2 Do not call in-process pin `runRelease` / prepare / `ensureAnnotatedReleaseTag` when pin SHA ≠ candidate. Persist resolution failure before any FRG/release mutation. Promote stays in-process pin
 
 ## 5. Tests
 
 - [ ] 5.1 Regression: identity helper fails for CLI `commit_sha` of pin `1.39.4` vs candidate SHA `C` even when `--version` is forged equal to the candidate package version
-- [ ] 5.2 Regression: identity helper fails when installed playbook is a stale full compose (digest `2afe3c92…`) and that playbook is selected for ship-end
+- [ ] 5.2 Regression: identity helper fails when a selected installed playbook is a stale full compose (digest `2afe3c92…`) or any unrecognized non-launcher body
 - [ ] 5.3 Source/composer check: Tugboat post-train FRG/release/finish invoke sites fail the test if they still use process-start `$PIPELINE` with no `SHIP_END_CLI` rebinding. Playbook source is a launcher (exec repo `tugboat.sh`)
-- [ ] 5.4 Ship-adapter test: post-train release/prepare/tag is not invoked in-process from the pin when pin SHA ≠ candidate; spawn argv uses the candidate launcher. Handoff failure leaves train evidence and does not start FRG
+- [ ] 5.4 Ship-adapter test: post-train release/prepare/tag is not invoked in-process from the pin when pin SHA ≠ candidate; spawn argv uses the candidate launcher and `release ensure-tag`. Handoff failure leaves train evidence and does not start FRG
 - [ ] 5.5 Skip path: unused tools (no Tugboat, no playbook, no in-engine ship-end) skip rather than fail
 - [ ] 5.6 Repo-script launcher passes; candidate unavailable fails closed; prepare spawn has KEY unset while attestor spawn is separate
 - [ ] 5.7 Required fixture: production pin CLI `1.39.4` cannot execute the candidate `release.ts` fix; resolved candidate CLI can. Composer after train-complete records candidate argv, not pin argv (PATH stub / injected spawn, same family as `writeFakePipeline` in `tugboat.test.ts`)

@@ -750,9 +750,9 @@ export function maxPositionalsFor(command: string | undefined): number {
   ) {
     return 2;
   }
-  // release <version> OR release finish <pr>
+  // release <version> | release finish <pr> | release ensure-tag <version> <oid>
   if (command === "release") {
-    return 3;
+    return 4;
   }
   if (command === "unblock" || command === "override" || command === "evals") {
     return 3;
@@ -4204,8 +4204,8 @@ async function main(): Promise<void> {
       }
     }
   }
-  // Validate release args early. Subcommands: prepare (`release <version>`) or
-  // finish (`release finish <pr>`).
+  // Validate release args early. Subcommands: prepare (`release <version>`),
+  // finish (`release finish <pr>`), or candidate tag (`release ensure-tag`).
   if (isReleaseCommand) {
     const subEarly = cmd.args[1];
     if (!subEarly) {
@@ -4213,9 +4213,11 @@ async function main(): Promise<void> {
         "pipeline release: a version argument or 'finish <pr>' is required.\n" +
           "  Usage: pipeline release <X.Y.Z | major | minor | patch> [--theme \"...\"] [--dry-run|--json] [--no-edit] [--skip-frg]\n" +
           "         pipeline release finish <pr> [--json]\n" +
+          "         pipeline release ensure-tag <X.Y.Z> <merge-commit-oid>\n" +
           "         [--allow-open-soak-defects \"<reason>\"]\n" +
           "  Prepare stops at an open release PR (never tags/merges).\n" +
           "  finish merges an open release PR after checks (never tags — workflows do).\n" +
+          "  ensure-tag is the candidate-engine leaf for in-engine ship tagging (#1151).\n" +
           "  Tag-derived CHANGELOG refresh runs automatically after auto-tag (#978).",
       );
       process.exit(2);
@@ -4226,6 +4228,16 @@ async function main(): Promise<void> {
         console.error(
           "pipeline release finish: a positive PR number is required.\n" +
             "  Usage: pipeline release finish <pr> [--json]",
+        );
+        process.exit(2);
+      }
+    } else if (subEarly === "ensure-tag") {
+      const versionArg = cmd.args[2];
+      const oidArg = cmd.args[3];
+      if (!versionArg || !/^\d+\.\d+\.\d+$/.test(versionArg) || !oidArg || !/^[0-9a-f]{40}$/i.test(oidArg)) {
+        console.error(
+          "pipeline release ensure-tag: a bare X.Y.Z version and 40-hex merge commit OID are required.\n" +
+            "  Usage: pipeline release ensure-tag <X.Y.Z> <merge-commit-oid>",
         );
         process.exit(2);
       }
@@ -4517,6 +4529,39 @@ async function main(): Promise<void> {
       process.exit(2);
     }
     const localCfg = resolveReleaseConfig(repoDir, opts.base, opts.profile);
+
+    // Candidate-engine leaf: create/push the annotated release tag (#1151).
+    // Coordinator-side pin processes spawn this verb; they must not import
+    // ensureAnnotatedReleaseTag from the pin process.
+    if (cmd.args[1] === "ensure-tag") {
+      const tagVersion = String(cmd.args[2]);
+      const mergeCommitOid = String(cmd.args[3]).toLowerCase();
+      try {
+        const { runEnsureAnnotatedReleaseTagCli } = await import("./stages/ship-adapter.ts");
+        const result = await runEnsureAnnotatedReleaseTagCli({
+          repoDir,
+          version: tagVersion,
+          mergeCommitOid,
+        });
+        if (opts.json) {
+          console.log(JSON.stringify({
+            schema_version: 1,
+            kind: "release_ensure_tag",
+            version: tagVersion,
+            merge_commit_oid: mergeCommitOid,
+            result,
+          }, null, 2));
+        } else {
+          console.log(
+            `[pipeline release ensure-tag] v${tagVersion} ${result} merge=${mergeCommitOid.slice(0, 12)}`,
+          );
+        }
+      } catch (err) {
+        console.error(`pipeline release ensure-tag: ${(err as Error).message}`);
+        process.exit(1);
+      }
+      return;
+    }
 
     // finish: operator-authorized merge of a prepared release PR (no tag).
     if (cmd.args[1] === "finish") {

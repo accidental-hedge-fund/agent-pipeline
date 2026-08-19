@@ -8,10 +8,10 @@ import {
   alignReleaseCheckoutToCandidate,
   assertFrgCandidateProvenance,
   bindCandidateShipEndOperations,
-  defaultSpawnCandidateEnsureTag,
   ensureAnnotatedReleaseTag,
   persistShipFactoryReleaseRequest,
   persistedShipFactoryReleaseRequestPath,
+  runEnsureAnnotatedReleaseTagCli,
   shipCoordinatorDepsFromOperations,
   verifyAnnotatedReleaseTag,
   type ShipAdapterOperations,
@@ -508,7 +508,6 @@ function memoryShipStore(): ShipStateStore & { status: ShipStatus | null } {
 
 test("pin SHA ≠ candidate: post-train prepare/release/tag spawn candidate launcher, not in-process pin", async () => {
   const spawned: string[][] = [];
-  const tags: string[] = [];
   let preparedInProcess = false;
   let taggedInProcess = false;
   const pinOps = operations({
@@ -547,9 +546,6 @@ test("pin SHA ≠ candidate: post-train prepare/release/tag spawn candidate laun
       assert.ok(!argv.includes("train"));
       return { code: 0, stdout: "", stderr: "" };
     },
-    spawnEnsureTag: async (engine) => {
-      tags.push(engine.launcherPath);
-    },
   });
 
   await bound.runFrgPack!(intent, train);
@@ -560,7 +556,15 @@ test("pin SHA ≠ candidate: post-train prepare/release/tag spawn candidate laun
   assert.ok(spawned.some((argv) => argv.includes("factory-release") && argv.includes("/cand/scripts/pipeline-launcher.mjs")));
   assert.ok(spawned.some((argv) => argv.includes("factory-gate") && argv.includes("--from-run")));
   assert.ok(spawned.some((argv) => argv[argv.length - 2] === "release" || argv.includes("release")));
-  assert.deepEqual(tags, ["/cand/scripts/pipeline-launcher.mjs"]);
+  assert.ok(
+    spawned.some((argv) =>
+      argv.includes("ensure-tag") &&
+      argv.includes(intent.version) &&
+      argv.includes(mergeHead) &&
+      argv.includes("/cand/scripts/pipeline-launcher.mjs")
+    ),
+    "tag must spawn candidate release ensure-tag, not pin-process ensureAnnotatedReleaseTag",
+  );
   for (const argv of spawned) {
     assert.equal(argv[0], "/usr/bin/node");
     assert.equal(argv[1], "/cand/scripts/pipeline-launcher.mjs");
@@ -753,54 +757,50 @@ test("injected request resolver supplies the persisted prepare path when option 
   assert.equal(spawned.filter((argv) => argv.includes("factory-gate")).length, 0);
 });
 
-test("default candidate tag path tags from the resolved candidate checkout", async () => {
-  const gitCalls: string[][] = [];
+test("default candidate tag path spawns release ensure-tag on the candidate launcher", async () => {
+  const spawned: string[][] = [];
+  let taggedInProcess = false;
   const bound = bindCandidateShipEndOperations(operations({
     observePublication: async () => publication,
+    waitForPublication: async () => {
+      taggedInProcess = true;
+      return publication;
+    },
   }), {
     pinCommitSha: PIN_SHA,
     repoDir: "/repo",
     env: {},
+    nodeBin: "/usr/bin/node",
     resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
-    spawn: async () => {
-      throw new Error("spawn must not run for default tag");
+    spawn: async (argv) => {
+      spawned.push(argv);
+      return { code: 0, stdout: "", stderr: "" };
     },
-    spawnEnsureTag: (engine, tagOpts) => defaultSpawnCandidateEnsureTag(engine, tagOpts, "/repo", {
-      git: async (args) => {
-        gitCalls.push(args);
-        if (args[0] === "cat-file") throw new Error("not a valid object");
-        return "";
-      },
-      validateFrg: async () => {},
-    }),
   });
   const result = await bound.waitForPublication(intent, releaseFinish);
   assert.deepEqual(result, publication);
-  assert.ok(gitCalls.some((args) => args[0] === "tag" && args[1] === "-a" && args[2] === `v${intent.version}`));
-  assert.ok(gitCalls.some((args) => args[0] === "push" && args.includes(`refs/tags/v${intent.version}`)));
+  assert.equal(taggedInProcess, false);
+  assert.equal(spawned.length, 1);
+  assert.deepEqual(spawned[0], [
+    "/usr/bin/node",
+    "/cand/scripts/pipeline-launcher.mjs",
+    "release",
+    "ensure-tag",
+    intent.version,
+    mergeHead,
+  ]);
 });
 
-test("default candidate tag path fails closed without a candidate checkout", async () => {
-  await assert.rejects(
-    defaultSpawnCandidateEnsureTag(
-      { engineRoot: "", launcherPath: "", commitSha: "" },
-      { version: intent.version, mergeCommitOid: mergeHead },
-      "/repo",
-      {
-        git: async () => {
-          throw new Error("git must not run");
-        },
-      },
-    ),
-    /cannot run without a resolved candidate checkout/,
-  );
-});
-
-test("candidate waitForPublication fails closed when spawnEnsureTag is omitted", async () => {
+test("candidate ensure-tag leaf fails closed on non-zero spawn without pin-process tag", async () => {
   let observed = 0;
+  let taggedInProcess = false;
   const bound = bindCandidateShipEndOperations(operations({
     observePublication: async () => {
       observed++;
+      return publication;
+    },
+    waitForPublication: async () => {
+      taggedInProcess = true;
       return publication;
     },
   }), {
@@ -808,18 +808,49 @@ test("candidate waitForPublication fails closed when spawnEnsureTag is omitted",
     repoDir: "/repo",
     env: {},
     resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
-    spawn: async () => {
-      throw new Error("spawn must not run for tag");
-    },
+    spawn: async () => ({ code: 1, stdout: "", stderr: "candidate tag refused" }),
   });
   await assert.rejects(
     bound.waitForPublication(intent, releaseFinish),
-    /candidate ensureAnnotatedReleaseTag is required/,
+    /candidate ensure-tag failed/,
   );
   assert.equal(observed, 0);
+  assert.equal(taggedInProcess, false);
 });
 
-test("real coordinator defaults bind candidate tag and request persist (review 1)", () => {
+test("runEnsureAnnotatedReleaseTagCli tags via injected git, not ambient git", async () => {
+  const gitCalls: string[][] = [];
+  const result = await runEnsureAnnotatedReleaseTagCli(
+    { repoDir: "/repo", version: intent.version, mergeCommitOid: mergeHead },
+    {
+      git: async (args) => {
+        gitCalls.push(args);
+        if (args[0] === "cat-file") throw new Error("not a valid object");
+        return "";
+      },
+      validateFrg: async () => {},
+    },
+  );
+  assert.equal(result, "created");
+  assert.ok(gitCalls.some((args) => args[0] === "tag" && args[1] === "-a" && args[2] === `v${intent.version}`));
+  assert.ok(gitCalls.some((args) => args[0] === "push" && args.includes(`refs/tags/v${intent.version}`)));
+});
+
+test("runEnsureAnnotatedReleaseTagCli fails closed without a repo directory", async () => {
+  await assert.rejects(
+    runEnsureAnnotatedReleaseTagCli(
+      { repoDir: "", version: intent.version, mergeCommitOid: mergeHead },
+      {
+        git: async () => {
+          throw new Error("git must not run");
+        },
+      },
+    ),
+    /cannot run without a repository directory/,
+  );
+});
+
+test("real coordinator defaults spawn candidate ensure-tag leaf and persist request (review 2)", () => {
   const shipAdapter = fs.readFileSync(
     path.join(__dirname, "..", "scripts", "stages", "ship-adapter.ts"),
     "utf8",
@@ -829,12 +860,17 @@ test("real coordinator defaults bind candidate tag and request persist (review 1
     .replace(/\/\/[^\n]*/g, "");
   assert.match(
     shipCode,
-    /spawnEnsureTag:\s*opts\.spawnEnsureTag\s*\?\?/,
-    "realShipCoordinatorDeps must default spawnEnsureTag rather than forward undefined",
+    /shipEndLeafArgv\(\s*"ensure-tag"/,
+    "waitForPublication must spawn candidate release ensure-tag when pin SHA differs",
+  );
+  assert.doesNotMatch(
+    shipCode,
+    /spawnEnsureTag:\s*opts\.spawnEnsureTag\s*\?\?\s*\(\(engine,\s*tagOpts\)\s*=>\s*defaultSpawnCandidateEnsureTag/,
+    "real coordinator must not default tag to pin-process ensureAnnotatedReleaseTag",
   );
   assert.ok(
-    shipCode.includes("defaultSpawnCandidateEnsureTag"),
-    "real coordinator must bind defaultSpawnCandidateEnsureTag when spawnEnsureTag is omitted",
+    !shipCode.includes("defaultSpawnCandidateEnsureTag"),
+    "pin-process defaultSpawnCandidateEnsureTag must not remain as the candidate tag handoff",
   );
   assert.match(
     shipCode,

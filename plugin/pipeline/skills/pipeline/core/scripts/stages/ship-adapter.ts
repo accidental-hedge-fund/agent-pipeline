@@ -1092,42 +1092,50 @@ export async function persistShipFactoryReleaseRequest(
   return dest;
 }
 
-export async function defaultSpawnCandidateEnsureTag(
-  engine: CandidateEngine,
-  tagOpts: { version: string; mergeCommitOid: string },
-  repoDir: string,
+/**
+ * Candidate-process leaf for `pipeline release ensure-tag`.
+ * Runs this engine's `ensureAnnotatedReleaseTag` against `repoDir`.
+ * Coordinator-side pin processes must spawn this verb on the candidate CLI
+ * rather than importing this helper.
+ */
+export async function runEnsureAnnotatedReleaseTagCli(
+  opts: {
+    repoDir: string;
+    version: string;
+    mergeCommitOid: string;
+  },
   io?: {
     git?: (args: string[]) => Promise<string>;
     validateFrg?: () => Promise<void>;
   },
-): Promise<void> {
-  if (!engine.engineRoot || !engine.commitSha) {
+): Promise<"created" | "exists"> {
+  if (!opts.repoDir) {
     throw new Error(
-      "ship release: candidate ensureAnnotatedReleaseTag cannot run without a resolved candidate checkout",
+      "ship release: candidate ensure-tag cannot run without a repository directory",
     );
   }
   const git = io?.git ?? (async (args: string[]): Promise<string> => {
     const { stdout } = await execFileAsync("git", args, {
-      cwd: engine.engineRoot,
+      cwd: opts.repoDir,
       timeout: 120_000,
       maxBuffer: 10 * 1024 * 1024,
     });
     return String(stdout).trim();
   });
-  await ensureAnnotatedReleaseTag({
-    version: tagOpts.version,
-    mergeCommitOid: tagOpts.mergeCommitOid,
+  return ensureAnnotatedReleaseTag({
+    version: opts.version,
+    mergeCommitOid: opts.mergeCommitOid,
     git,
     validateFrg: io?.validateFrg ??
-      (() => validateFrgEvidenceFileForTag(repoDir, tagOpts.version).then(() => undefined)),
+      (() => validateFrgEvidenceFileForTag(opts.repoDir, opts.version).then(() => undefined)),
   });
 }
 
 /**
  * Pin process stays the coordinator. When pin SHA ≠ candidate SHA, leaf
  * post-train verbs spawn the candidate launcher instead of in-process pin
- * runRelease / prepare / ensureAnnotatedReleaseTag. Recursion is impossible:
- * argv is never `ship --milestone` or `train`.
+ * runRelease / prepare / ensureAnnotatedReleaseTag. Tag is `release ensure-tag`.
+ * Recursion is impossible: argv is never `ship --milestone` or `train`.
  */
 export function bindCandidateShipEndOperations(
   pinOps: ShipAdapterOperations,
@@ -1248,15 +1256,27 @@ export function bindCandidateShipEndOperations(
       if (!shouldSpawn(release.candidate_head_oid)) {
         return pinOps.waitForPublication(intent, release);
       }
-      if (typeof ctx.spawnEnsureTag !== "function") {
-        throw new Error(
-          "ship release: candidate ensureAnnotatedReleaseTag is required; will not skip tag or fall back to pin",
+      if (typeof ctx.spawnEnsureTag === "function") {
+        await ctx.spawnEnsureTag(engine, {
+          version: intent.version,
+          mergeCommitOid: release.merge_commit_oid,
+        });
+      } else {
+        const spawned = await spawnLeaf(
+          ctx,
+          engine,
+          shipEndLeafArgv("ensure-tag", {
+            version: intent.version,
+            mergeCommitOid: release.merge_commit_oid,
+          }),
+          uncredentialedPrepareEnv(ctx.env),
         );
+        if (spawned.code !== 0) {
+          throw new Error(
+            `ship release: candidate ensure-tag failed (exit ${spawned.code}): ${spawned.stderr || spawned.stdout}`,
+          );
+        }
       }
-      await ctx.spawnEnsureTag(engine, {
-        version: intent.version,
-        mergeCommitOid: release.merge_commit_oid,
-      });
       for (let attempt = 0; attempt < RELEASE_WAIT_ATTEMPTS; attempt++) {
         const observed = await pinOps.observePublication(intent, release);
         if (observed) return observed;
@@ -1396,9 +1416,7 @@ export function realShipCoordinatorDeps(opts: RealShipCoordinatorDepsOptions): S
       ((intent, train) => persistShipFactoryReleaseRequest(intent, train, { repoDir: opts.repoDir, env })),
     resolveCandidate: resolve,
     spawn,
-    spawnEnsureTag:
-      opts.spawnEnsureTag ??
-      ((engine, tagOpts) => defaultSpawnCandidateEnsureTag(engine, tagOpts, opts.repoDir)),
+    ...(opts.spawnEnsureTag ? { spawnEnsureTag: opts.spawnEnsureTag } : {}),
   });
   return shipCoordinatorDepsFromOperations(ops, {
     state: opts.state ?? defaultShipStateStore(opts.env),

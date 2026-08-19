@@ -129,7 +129,10 @@ export type ShipEndLeafVerb =
   | "factory-release-prepare"
   | "factory-gate"
   | "release"
-  | "release-finish";
+  | "release-finish"
+  | "ensure-tag";
+
+const BARE_VERSION_RE = /^\d+\.\d+\.\d+$/;
 
 /** Leaf argv after the launcher. Never `ship` / `train`. */
 export function shipEndLeafArgv(
@@ -139,6 +142,7 @@ export function shipEndLeafArgv(
     version?: string;
     loopRunId?: string;
     pr?: number;
+    mergeCommitOid?: string;
   } = {},
 ): string[] {
   switch (verb) {
@@ -158,6 +162,14 @@ export function shipEndLeafArgv(
     case "release-finish":
       if (!args.pr || args.pr <= 0) throw new Error("release finish requires a PR number");
       return ["release", "finish", String(args.pr), "--json"];
+    case "ensure-tag": {
+      if (!args.version || !BARE_VERSION_RE.test(args.version)) {
+        throw new Error("ensure-tag requires a bare X.Y.Z version");
+      }
+      const oid = parseExactGitSha(args.mergeCommitOid);
+      if (!oid) throw new Error("ensure-tag requires a 40-hex merge commit OID");
+      return ["release", "ensure-tag", args.version, oid];
+    }
     default: {
       const _exhaustive: never = verb;
       throw new Error(`unknown ship-end verb: ${_exhaustive}`);

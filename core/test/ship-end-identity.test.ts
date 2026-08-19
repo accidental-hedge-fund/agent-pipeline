@@ -61,9 +61,21 @@ test("thin launcher classifier requires exec of repo tugboat.sh", () => {
   assert.equal(classifyPlaybookBody(LAUNCHER), "playbook-launcher");
   assert.equal(
     classifyPlaybookBody("# mentions $REPO_DIR/examples/supervisor/shell/tugboat.sh\n"),
-    "unused",
+    "playbook-stale",
   );
   assert.equal(classifyPlaybookBody(STALE_FULL), "playbook-stale");
+  assert.equal(classifyPlaybookBody(null), "unused");
+});
+
+test("classifyPlaybookBody: unused is absence only; unrecognized installed bodies are stale", () => {
+  const divergent = [
+    "#!/bin/zsh",
+    "set -e",
+    '~/.local/bin/pipeline ship --milestone "$1"',
+    "",
+  ].join("\n");
+  assert.equal(classifyPlaybookBody(divergent), "playbook-stale");
+  assert.equal(classifyPlaybookBody("echo not a launcher\n"), "playbook-stale");
   assert.equal(classifyPlaybookBody(null), "unused");
 });
 
@@ -210,4 +222,19 @@ test("identity helper without bound SHA passes launcher / unused playbook", () =
     selectedPlaybookKind: "unused",
   });
   assert.equal(r.status, "pass");
+});
+
+test("identity helper fails selected unrecognized non-launcher playbook", () => {
+  const r = evaluateShipEndIdentity({
+    shipEndToolsInUse: true,
+    candidateSha: C,
+    invokedCommitSha: C,
+    composerKind: "playbook-stale",
+    selectedPlaybookKind: "playbook-stale",
+  });
+  assert.equal(r.status, "fail");
+  if (r.status === "fail") {
+    assert.match(r.detail, /thin launcher/);
+    assert.match(r.remediation, /pipeline-ship-playbook\.sh|tugboat\.sh/);
+  }
 });

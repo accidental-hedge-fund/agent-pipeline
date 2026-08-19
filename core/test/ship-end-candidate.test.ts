@@ -159,6 +159,18 @@ test("ship-end leaf argv never re-enters ship or train", () => {
   assert.deepEqual(gate, ["factory-gate", "--for", "1.39.5", "--from-run", "loop-L"]);
   assert.ok(!gate.includes("--observations"));
 
+  const tag = shipEndLeafArgv("ensure-tag", {
+    version: "1.39.5",
+    mergeCommitOid: SHA,
+  });
+  assert.deepEqual(tag, ["release", "ensure-tag", "1.39.5", SHA]);
+  assert.doesNotMatch(tag.join(" "), /\bship\b|\btrain\b/);
+  assertShipEndLeafArgv(tag);
+  assert.throws(
+    () => shipEndLeafArgv("ensure-tag", { version: "1.39.5", mergeCommitOid: SHA.slice(0, 12) }),
+    /40-hex/,
+  );
+
   assert.throws(
     () => assertShipEndLeafArgv(["ship", "--milestone", "v1.39.5"]),
     /must not re-enter/,
