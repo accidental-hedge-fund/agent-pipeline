@@ -1844,6 +1844,48 @@ test("check supervisor:tugboat-install-parity — additive stable id", () => {
   assert.ok(ids.includes("supervisor:tugboat-install-parity"));
   // Legacy playbook check remains for hosts that still install it (#989).
   assert.ok(ids.includes("supervisor:ship-playbook-promote-host"));
+  assert.ok(ids.includes("supervisor:ship-end-candidate-engine"));
+});
+
+test("check supervisor:ship-end-candidate-engine — skips when unused", async () => {
+  const check = getCheck(makeConfig(), "supervisor:ship-end-candidate-engine");
+  const r = await check.run(
+    fakeDeps({
+      fsExists: () => false,
+    }),
+  );
+  assert.equal(r.status, "skip");
+});
+
+test("check supervisor:ship-end-candidate-engine — fails selected stale full playbook", async () => {
+  const check = getCheck(makeConfig(), "supervisor:ship-end-candidate-engine");
+  const stale = [
+    "#!/usr/bin/env bash",
+    '"$PIPELINE" factory-release prepare --request "$req" --json',
+    '"$PIPELINE" release "$version" --no-edit',
+    "",
+  ].join("\n");
+  const r = await check.run(
+    fakeDeps({
+      fsExists: (p) => p.includes("pipeline-ship-playbook"),
+      readTextFile: (p) => (p.includes("pipeline-ship-playbook") ? stale : '{"version":"1.0.0"}'),
+    }),
+  );
+  assertFailWithRemediation(r);
+  assert.match(r.detail, /thin launcher/);
+  assert.match(r.remediation!, /pipeline-ship-playbook\.sh|tugboat\.sh/);
+});
+
+test("check supervisor:ship-end-candidate-engine — passes thin launcher playbook", async () => {
+  const check = getCheck(makeConfig(), "supervisor:ship-end-candidate-engine");
+  const launcher = 'exec "$REPO_DIR/examples/supervisor/shell/tugboat.sh" "$@"\n';
+  const r = await check.run(
+    fakeDeps({
+      fsExists: (p) => p.includes("pipeline-ship-playbook"),
+      readTextFile: (p) => (p.includes("pipeline-ship-playbook") ? launcher : '{"version":"1.0.0"}'),
+    }),
+  );
+  assert.equal(r.status, "pass");
 });
 
 // Regression for the corrupt-install startup path (#186 review 2): if core/package.json

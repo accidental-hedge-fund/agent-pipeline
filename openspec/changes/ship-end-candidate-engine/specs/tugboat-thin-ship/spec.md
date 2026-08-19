@@ -12,7 +12,7 @@ The thin ship composer SHALL sequence exactly these phases for one milestone ver
 6. Wait until GitHub Release `vX.Y.Z` is published (non-draft)
 7. `pipeline engine-promote --for X.Y.Z --host <resolved-host>` **without** `--skip-frg` unless the operator escape is active
 
-The composer SHALL NOT implement a second merge policy, grant factory, durable outer ledger, or `pipeline ship` product subcommand as its ship path. The composer SHALL run `gh` and relative path work from the configured ship target repository directory (`REPO_DIR`). After train-complete, Tugboat SHALL NOT keep `$PIPELINE` pointed at the previous production pin for phases 2, 3, and 5, or for any composer-invoked tag.
+The composer SHALL NOT implement a second merge policy, grant factory, durable outer ledger, or `pipeline ship` product subcommand as its ship path. The composer SHALL run `gh` and relative path work from the configured ship target repository directory (`REPO_DIR`). After train-complete, Tugboat SHALL NOT keep `$PIPELINE` pointed at the previous production pin for phases 2, 3, and 5. Tugboat SHALL NOT invoke `git tag` or `gh release create`; publication wait remains on the GitHub Release workflow.
 
 #### Scenario: Phase order is fixed for a successful ship
 
@@ -38,16 +38,16 @@ The composer SHALL NOT implement a second merge policy, grant factory, durable o
 
 ### Requirement: Tugboat SHALL resolve the candidate engine after train-complete
 
-After train is complete or resumed complete, Tugboat SHALL resolve the candidate engine as the control checkout at the FRG-bound `integrated_candidate.git_sha`, or as an explicit candidate install of that SHA, before the FRG pack phase. Tugboat SHALL invoke subsequent `factory-release prepare`, `factory-gate`, `pipeline release`, `release finish`, and any composer-invoked tag through that resolved candidate. If resolution fails or the resolved identity does not match the SHA being released, Tugboat SHALL fail closed and SHALL NOT fall back to the process-start `$PIPELINE` production pin for those verbs.
+After train is complete or resumed complete, Tugboat SHALL resolve the candidate engine as the control checkout at the FRG-bound `integrated_candidate.git_sha` (40-hex from the factory-release request JSON), or as an explicit candidate install of that SHA, before the FRG pack phase. Allowed roots are a clean `REPO_DIR` whose `HEAD` equals that SHA, `$REPO_DIR/.worktrees/ship-candidate-<sha>`, or `PIPELINE_CANDIDATE_ENGINE_ROOT` after the same `HEAD` and porcelain checks. The entrypoint SHALL be `node "$ENGINE_ROOT/scripts/pipeline-launcher.mjs"` with cwd `REPO_DIR`. Tugboat SHALL invoke subsequent `factory-release prepare`, `factory-gate`, `pipeline release`, and `release finish` through that resolved candidate. If resolution fails or the resolved `commit_sha` does not equal the SHA being released, Tugboat SHALL fail closed and SHALL NOT fall back to the process-start `$PIPELINE` production pin for those verbs. Train checkpoint SHALL remain so a retry does not retrain.
 
-Tugboat MAY keep process-start `$PIPELINE` for train. Tugboat SHALL NOT retarget train to the unpromoted candidate.
+Tugboat MAY keep process-start `$PIPELINE` for train and `engine-promote`. Tugboat SHALL NOT retarget train to the unpromoted candidate.
 
 #### Scenario: Candidate checkout at the FRG-bound SHA is used for release
 
 - **WHEN** train completes and the FRG-bound candidate SHA is `C`
 - **AND** a control checkout or candidate install of `C` is resolvable
 - **THEN** Tugboat SHALL invoke `pipeline release` through that candidate
-- **AND** `$PIPELINE --version` of that invocation SHALL match the candidate at `C`
+- **AND** that invocation's engine `commit_sha` SHALL equal `C`
 
 #### Scenario: Missing candidate engine fails before FRG pack
 
@@ -58,15 +58,15 @@ Tugboat MAY keep process-start `$PIPELINE` for train. Tugboat SHALL NOT retarget
 
 ### Requirement: Tugboat installed-composer parity SHALL bind the candidate SHA
 
-When Tugboat is the installed composer, its content digest SHALL match `examples/supervisor/shell/tugboat.sh` at the candidate SHA, or the ship SHALL exec that repo script from `REPO_DIR`. A doctor or unit check SHALL fail if ship-end still uses a stale `~/.local/bin/pipeline-ship-playbook` or a stale `$PIPELINE` whose `--version` / source identity does not match the candidate SHA being released. Absence of an installed Option 1 composer SHALL skip rather than fail hosts that do not use thin ship.
+When Tugboat is the installed composer, its content digest SHALL match `examples/supervisor/shell/tugboat.sh` at the candidate SHA, or the ship SHALL exec that repo script from `REPO_DIR`. A doctor or unit check SHALL fail if ship-end still uses a stale `~/.local/bin/pipeline-ship-playbook` that is not a thin launcher to that repo script, or a stale engine whose `commit_sha` does not equal the candidate SHA being released. Absence of an installed Option 1 composer SHALL skip rather than fail hosts that do not use thin ship.
 
 #### Scenario: Stale playbook used for ship-end fails
 
-- **WHEN** installed `pipeline-ship-playbook` digest is `2afe3c92…`
+- **WHEN** installed `pipeline-ship-playbook` is a stale full compose (digest `2afe3c92…`)
 - **AND** candidate `tugboat.sh` digest is `9b8063d1…`
 - **AND** the ship uses the installed playbook for release or FRG
 - **THEN** the check SHALL fail
-- **AND** remediation SHALL name refresh from candidate `examples/supervisor/shell/tugboat.sh` or exec of the repo script from `REPO_DIR`
+- **AND** remediation SHALL name refresh from candidate `examples/supervisor/shell/pipeline-ship-playbook.sh` or exec of the repo script from `REPO_DIR`
 
 #### Scenario: Source regression fails if ship-end still hard-codes process-start PIPELINE
 

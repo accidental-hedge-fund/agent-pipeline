@@ -58,6 +58,10 @@ import {
   evaluateOption1PackParity,
   type Option1PackBodies,
 } from "../tugboat-install-parity.ts";
+import {
+  classifyPlaybookBody,
+  evaluateShipEndIdentity,
+} from "../ship-end-identity.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -1177,6 +1181,43 @@ export function buildPreflightChecks(
       };
       const verdict = evaluateOption1PackParity(installed, canonical, {
         pathLabel: tugboatPath,
+      });
+      if (verdict.status === "pass") return pass(verdict.detail);
+      if (verdict.status === "skip") return skip(verdict.detail);
+      return fail(verdict.detail, verdict.remediation);
+    },
+  });
+
+  // 15. Ship-end candidate-engine identity (#1151). Skip when no Tugboat,
+  //     no recognized playbook, and no in-engine ship-end. Fail a selected
+  //     stale full playbook. Bound SHA comparison is the unit helper
+  //     (injected strings); doctor fails the selected stale playbook at rest.
+  checks.push({
+    id: "supervisor:ship-end-candidate-engine",
+    description:
+      "Ship-end CLI and playbook identity match the candidate SHA (skip when unused)",
+    run: async (deps) => {
+      const tugboatPath = defaultInstalledOption1PackPaths().tugboat;
+      const playbookPath = defaultInstalledShipPlaybookPath();
+      const tugboatInstalled = await deps.fsExists(tugboatPath);
+      const playbookInstalled = await deps.fsExists(playbookPath);
+      const playbookBody = playbookInstalled ? await deps.readTextFile(playbookPath) : null;
+      const playbookKind = classifyPlaybookBody(playbookBody);
+      const selectedPlaybookKind = tugboatInstalled ? "unused" as const : playbookKind;
+      const toolsInUse = tugboatInstalled || playbookKind !== "unused";
+      const composerKind = tugboatInstalled
+        ? "tugboat-repo" as const
+        : playbookKind === "playbook-launcher"
+          ? "playbook-launcher" as const
+          : playbookKind === "playbook-stale"
+            ? "playbook-stale" as const
+            : "unused" as const;
+      const verdict = evaluateShipEndIdentity({
+        shipEndToolsInUse: toolsInUse,
+        candidateSha: null,
+        invokedCommitSha: null,
+        composerKind,
+        selectedPlaybookKind,
       });
       if (verdict.status === "pass") return pass(verdict.detail);
       if (verdict.status === "skip") return skip(verdict.detail);

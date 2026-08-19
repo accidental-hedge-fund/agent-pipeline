@@ -30,7 +30,18 @@
 #                          exported to $REPO_DIR/.agent-pipeline/production-engine-pin.json
 #                          so engine-promote and the next train doctor share one path.
 #                          An operator-set value is left unchanged.
-#   PIPELINE               pipeline launcher (default: pipeline)
+#   PIPELINE               production-pin launcher (default: pipeline).
+#                          Train --merge and engine-promote use this binary.
+#                          After train-complete, FRG pack / release / finish
+#                          use the candidate engine (SHIP_END_CLI), not this
+#                          pin, when the pin SHA differs from the FRG-bound SHA.
+#   PIPELINE_CANDIDATE_ENGINE_ROOT
+#                          optional absolute candidate checkout (HEAD must
+#                          equal the FRG-bound SHA, porcelain empty, and
+#                          core/scripts/pipeline.ts + scripts/pipeline-launcher.mjs
+#                          present). Else Tugboat uses a clean REPO_DIR HEAD
+#                          or $REPO_DIR/.worktrees/ship-candidate-<sha>.
+#   SHIP_END_NODE          node binary for the candidate launcher (default: node)
 #   ALLOW_MERGE            must be 1 for train --merge / release finish
 #   SHIP_NOTIFY            1 to post phase status (default 1)
 #   SHIP_NOTIFY_BIN        notify helper (default: sibling ship-notify.sh)
@@ -77,6 +88,12 @@ STATE_ROOT="${PIPELINE_SUPERVISOR_STATE:-$HOME/.local/state/pipeline-supervisor}
 # Pin snapshot of env at process start — never re-read for retarget (#1062).
 REPO_DIR="${REPO_DIR:-}"
 PIPELINE="${PIPELINE:-pipeline}"
+SHIP_END_NODE="${SHIP_END_NODE:-node}"
+# Candidate CLI for post-train FRG / release / finish. Empty until resolved.
+# Never fall back to process-start $PIPELINE for those verbs (#1151).
+SHIP_END_CLI=()
+SHIP_END_ENGINE_ROOT=""
+SHIP_END_CANDIDATE_SHA=""
 ALLOW_MERGE="${ALLOW_MERGE:-0}"
 SHIP_NOTIFY="${SHIP_NOTIFY:-1}"
 SHIP_NOTIFY_BIN="${SHIP_NOTIFY_BIN:-$SCRIPT_DIR/ship-notify.sh}"
@@ -678,14 +695,109 @@ print("fail")
 PY
 }
 
+# True when $1 is an exact 40-hex git SHA (data, not a shell fragment).
+is_exact_git_sha() {
+  [[ "$1" =~ ^[0-9a-f]{40}$ ]]
+}
+
+# $1 engine root, $2 want SHA. Clean HEAD match + pipeline.ts + launcher.
+engine_root_ok() {
+  local root=$1
+  local want=$2
+  local head porcelain
+  [[ -d "$root" ]] || return 1
+  [[ -f "$root/core/scripts/pipeline.ts" ]] || return 1
+  [[ -f "$root/scripts/pipeline-launcher.mjs" ]] || return 1
+  head=$(git -C "$root" rev-parse --verify HEAD 2>/dev/null | tr 'A-F' 'a-f') || return 1
+  [[ "$head" == "$want" ]] || return 1
+  porcelain=$(git -C "$root" status --porcelain 2>/dev/null) || return 1
+  [[ -z "$porcelain" ]] || return 1
+  return 0
+}
+
+# 40-hex integrated_candidate.git_sha from the factory-release request JSON.
+read_candidate_sha_from_request() {
+  python3 - "$1" <<'PY'
+import json, re, sys
+path = sys.argv[1]
+try:
+    req = json.load(open(path, encoding="utf-8"))
+except Exception:
+    sys.stderr.write("FAIL: factory-release request is not JSON\n")
+    raise SystemExit(1)
+if not isinstance(req, dict):
+    sys.stderr.write("FAIL: factory-release request is not an object\n")
+    raise SystemExit(1)
+sha = str((req.get("integrated_candidate") or {}).get("git_sha") or "").strip().lower()
+if not re.fullmatch(r"[0-9a-f]{40}", sha):
+    sys.stderr.write("FAIL: integrated_candidate.git_sha is not an exact 40-hex SHA\n")
+    raise SystemExit(1)
+print(sha)
+PY
+}
+
+# After train-complete: bind SHIP_END_CLI to the candidate engine. Fail closed
+# (no production-pin fallback) when identity cannot be resolved (#1151).
+resolve_ship_end_cli() {
+  local req=$1
+  local sha root launcher worktree explicit
+  sha=$(read_candidate_sha_from_request "$req") || return 1
+  is_exact_git_sha "$sha" || return 1
+  worktree="$REPO_DIR/.worktrees/ship-candidate-$sha"
+  explicit="${PIPELINE_CANDIDATE_ENGINE_ROOT:-}"
+  root=""
+  if engine_root_ok "$REPO_DIR" "$sha"; then
+    root="$REPO_DIR"
+  elif engine_root_ok "$worktree" "$sha"; then
+    root="$worktree"
+  elif [[ -n "$explicit" ]]; then
+    case "$explicit" in
+      /*) ;;
+      *)
+        echo "FAIL: PIPELINE_CANDIDATE_ENGINE_ROOT must be an absolute directory" >&2
+        return 1
+        ;;
+    esac
+    if engine_root_ok "$explicit" "$sha"; then
+      root="$explicit"
+    fi
+  fi
+  if [[ -z "$root" ]]; then
+    mkdir -p "$REPO_DIR/.worktrees" 2>/dev/null || true
+    if git -C "$REPO_DIR" fetch --quiet origin "$sha" 2>/dev/null \
+      && git -C "$REPO_DIR" worktree add --detach "$worktree" "$sha" 2>/dev/null \
+      && engine_root_ok "$worktree" "$sha"; then
+      root="$worktree"
+    fi
+  fi
+  if [[ -z "$root" ]]; then
+    echo "FAIL: cannot resolve candidate engine at $sha (clean REPO_DIR HEAD, $worktree, or PIPELINE_CANDIDATE_ENGINE_ROOT)" >&2
+    return 1
+  fi
+  launcher="$root/scripts/pipeline-launcher.mjs"
+  SHIP_END_ENGINE_ROOT="$root"
+  SHIP_END_CANDIDATE_SHA="$sha"
+  SHIP_END_CLI=("$SHIP_END_NODE" "$launcher")
+  if [[ -n "${RUN_DIR:-}" ]]; then
+    printf '%s\n' "$launcher" >"$RUN_DIR/ship_end_cli"
+    printf '%s\n' "$sha" >"$RUN_DIR/ship_end_candidate_sha"
+    printf '%s\n' "$root" >"$RUN_DIR/ship_end_engine_root"
+  fi
+  return 0
+}
+
 # Invoke factory-release prepare with attestor env unset in THAT child.
-# Parent supervisor env is left unchanged (#1133).
+# Parent supervisor env is left unchanged (#1133). Candidate CLI only (#1151).
 invoke_factory_release_prepare() {
   local req=$1
   local out=$2
   local err=$3
+  if [[ ${#SHIP_END_CLI[@]} -eq 0 ]]; then
+    echo "missing_ship_end_cli" >"$err"
+    return 1
+  fi
   env -u PIPELINE_FRG_ATTESTATION_KEY -u PIPELINE_FRG_ATTESTATION_KEY_FILE \
-    "$PIPELINE" factory-release prepare --request "$req" --json >"$out" 2>"$err"
+    "${SHIP_END_CLI[@]}" factory-release prepare --request "$req" --json >"$out" 2>"$err"
 }
 
 # Bound pack loop_run_id from a prepare JSON result. Awaiting uses
@@ -734,13 +846,17 @@ invoke_frg_pack_attestor() {
   local loop=$2
   local out=$3
   local err=$4
+  if [[ ${#SHIP_END_CLI[@]} -eq 0 ]]; then
+    echo "missing_ship_end_cli" >"$err"
+    return 1
+  fi
   if [[ -z "$loop" ]]; then
     echo "missing_loop_run_id" >"$err"
     return 1
   fi
   if [[ -n "${PIPELINE_FRG_ATTESTATION_KEY:-}" ]]; then
     env -u PIPELINE_FRG_ATTESTATION_KEY_FILE \
-      "$PIPELINE" factory-gate --for "$ver" --from-run "$loop" >"$out" 2>"$err"
+      "${SHIP_END_CLI[@]}" factory-gate --for "$ver" --from-run "$loop" >"$out" 2>"$err"
     return $?
   fi
   if [[ -z "${PIPELINE_FRG_ATTESTATION_KEY_FILE:-}" ]]; then
@@ -757,7 +873,7 @@ invoke_frg_pack_attestor() {
   fi
   PIPELINE_FRG_ATTESTATION_KEY="$(cat -- "$PIPELINE_FRG_ATTESTATION_KEY_FILE")" \
     env -u PIPELINE_FRG_ATTESTATION_KEY_FILE \
-    "$PIPELINE" factory-gate --for "$ver" --from-run "$loop" >"$out" 2>"$err"
+    "${SHIP_END_CLI[@]}" factory-gate --for "$ver" --from-run "$loop" >"$out" 2>"$err"
 }
 
 log() {
@@ -1849,17 +1965,25 @@ ship_one() {
     fi
   fi
 
+  # ----- A1b: resolve candidate engine for ship-end (no pin fallback) ------
+  local req pack_done pack_ec pack_verdict latest_json loop_id attest_ec attest_reason
+  req="$RUN_DIR/factory-release-prepare-request.json"
+  if ! write_factory_release_request "$req" "$version" "$REPO_DIR"; then
+    write_state "frg-pack" "failed" "could not write factory-release prepare request"
+    log "FAIL: could not write factory-release prepare request"
+    exit 1
+  fi
+  if ! resolve_ship_end_cli "$req"; then
+    write_state "frg-pack" "failed" "candidate-engine identity defect"
+    log "FAIL: candidate-engine identity defect — will not fall back to production-pin \$PIPELINE"
+    exit 1
+  fi
+  log "phase ship-end-cli: engine=$SHIP_END_ENGINE_ROOT sha=$SHIP_END_CANDIDATE_SHA"
+
   # ----- A2: FRG pack (uncredentialed prepare + out-of-process attestor) ---
   if [[ "$SKIP_FRG" != "1" ]]; then
-    local req pack_done pack_ec pack_verdict latest_json loop_id attest_ec attest_reason
-    req="$RUN_DIR/factory-release-prepare-request.json"
     write_state "frg-pack" "running" "pipeline factory-release prepare --request $req --json"
     log "phase frg-pack: start request=$req"
-    if ! write_factory_release_request "$req" "$version" "$REPO_DIR"; then
-      write_state "frg-pack" "failed" "could not write factory-release prepare request"
-      log "FAIL: could not write factory-release prepare request"
-      exit 1
-    fi
     pack_done=0
     latest_json="$REPO_DIR/.agent-pipeline/frg/$version/latest.json"
     for i in $(seq 1 "$FRG_WAIT_ATTEMPTS"); do
@@ -1926,7 +2050,7 @@ ship_one() {
   write_state "release-prepare" "running" "pipeline release $version --no-edit ${SKIP_FRG_ARGS[*]}"
   log "phase release-prepare: start (bare version=$version)"
   set +e
-  "$PIPELINE" release "$version" --no-edit "${SKIP_FRG_ARGS[@]}" >"$RUN_DIR/release-prepare.out" 2>"$RUN_DIR/release-prepare.err"
+  "${SHIP_END_CLI[@]}" release "$version" --no-edit "${SKIP_FRG_ARGS[@]}" >"$RUN_DIR/release-prepare.out" 2>"$RUN_DIR/release-prepare.err"
   rel_ec=$?
   set -e
   cat "$RUN_DIR/release-prepare.err" >>"$LOG_FILE" 2>/dev/null || true
@@ -1989,7 +2113,7 @@ ship_one() {
   write_state "release-finish" "running" "pipeline release finish $pr --json"
   log "phase release-finish: start pr=$pr"
   set +e
-  "$PIPELINE" release finish "$pr" --json >"$RUN_DIR/release-finish.json" 2>"$RUN_DIR/release-finish.err"
+  "${SHIP_END_CLI[@]}" release finish "$pr" --json >"$RUN_DIR/release-finish.json" 2>"$RUN_DIR/release-finish.err"
   fin_ec=$?
   set -e
   cat "$RUN_DIR/release-finish.err" >>"$LOG_FILE" 2>/dev/null || true

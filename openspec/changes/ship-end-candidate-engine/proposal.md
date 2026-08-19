@@ -6,8 +6,8 @@ Tugboat ship-end always invokes `$PIPELINE` (`~/.local/bin/pipeline`), which is 
 
 - **Class law:** after train-complete, ship-end verbs that score or publish the candidate SHALL execute the **candidate** engine (control checkout at the FRG-bound SHA, or an explicit candidate install). They SHALL NOT execute the previous production pin.
 - **Ship-end set:** `factory-release prepare`, `factory-gate` (FRG pack attestor), `pipeline release`, `pipeline release finish`, and any composer-invoked tag. Train / implementer / review harnesses stay on the production pin.
-- **Playbook parity:** installed `pipeline-ship-playbook` SHALL match repo `examples/supervisor/shell/tugboat.sh` on that candidate SHA, **or** Tugboat SHALL run the repo script from `REPO_DIR`. Marker-only presence SHALL NOT count as parity.
-- **Gate:** a unit test or doctor check SHALL fail when ship-end `$PIPELINE --version` or playbook digest does not match the candidate SHA being released, whenever those tools are used for release / FRG / tag.
+- **Playbook:** installed `pipeline-ship-playbook` SHALL be a thin launcher that execs `$REPO_DIR/examples/supervisor/shell/tugboat.sh`. Marker-only presence SHALL NOT count as parity.
+- **Gate:** a unit test or doctor check SHALL fail when ship-end CLI `commit_sha` does not equal the candidate SHA being released, or when a selected playbook is not that launcher, whenever those tools are used for release / FRG / tag.
 - **Observable outcome:** a 1.39.x ship SHALL be able to land a `release.ts` fix on `main` and then open the release PR with that fix in the running CLI.
 - **BREAKING** for any ship composer, test, or doctor posture that still treats the production-pin CLI as the correct executor for post-train FRG / release / finish / tag.
 
@@ -17,8 +17,8 @@ Non-goals: running implementer/review harnesses on an unpromoted engine for the 
 
 - [ ] After train-complete, Tugboat (and the installed playbook copy, and in-engine `pipeline ship`) invoke `factory-release prepare`, `factory-gate`, `pipeline release`, `release finish`, and any composer-invoked tag using the candidate engine at the FRG-bound SHA (or an explicit candidate install), not `~/.local/bin/pipeline` when that binary is the previous production pin.
 - [ ] Train `--merge` still invokes the production-pin CLI. Implementer and review harnesses for train items do not switch to the unpromoted candidate.
-- [ ] Installed `pipeline-ship-playbook` content digest matches candidate `examples/supervisor/shell/tugboat.sh`, **or** the composer execs that repo script from `REPO_DIR`. A stale installed playbook used for ship-end fails the check.
-- [ ] A unit test or doctor check fails when ship-end `$PIPELINE --version` or playbook digest does not match the candidate SHA being released (skip when those tools are not used for release/FRG/tag).
+- [ ] Installed `pipeline-ship-playbook` is a thin launcher that execs `$REPO_DIR/examples/supervisor/shell/tugboat.sh`. A stale full playbook used for ship-end fails the check.
+- [ ] A unit test or doctor check fails when ship-end CLI `commit_sha` does not equal the candidate SHA being released, or when a selected playbook is not that launcher (skip when those tools are not used for release/FRG/tag).
 - [ ] A fixture of “production pin is 1.39.4, candidate SHA contains a `release.ts` fix, train is complete” opens (or would open) the release PR using the candidate CLI, not 1.39.4.
 - [ ] `--skip-frg` remains an operator escape with a logged reason. It is not the default ship path. Promote still waits for GitHub Release publication.
 - [ ] After any `core/` edit, `plugin/` is regenerated in the same change. `npm run ci` is green.

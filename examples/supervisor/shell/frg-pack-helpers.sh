@@ -477,13 +477,17 @@ PY
 }
 
 # Invoke factory-release prepare with attestor env unset in THAT child.
-# Parent supervisor env is left unchanged (#1133).
+# Parent supervisor env is left unchanged (#1133). Candidate CLI only (#1151).
 invoke_factory_release_prepare() {
   local req=$1
   local out=$2
   local err=$3
+  if [[ ${#SHIP_END_CLI[@]} -eq 0 ]]; then
+    echo "missing_ship_end_cli" >"$err"
+    return 1
+  fi
   env -u PIPELINE_FRG_ATTESTATION_KEY -u PIPELINE_FRG_ATTESTATION_KEY_FILE \
-    "$PIPELINE" factory-release prepare --request "$req" --json >"$out" 2>"$err"
+    "${SHIP_END_CLI[@]}" factory-release prepare --request "$req" --json >"$out" 2>"$err"
 }
 
 # Bound pack loop_run_id from a prepare JSON result. Awaiting uses
@@ -532,13 +536,17 @@ invoke_frg_pack_attestor() {
   local loop=$2
   local out=$3
   local err=$4
+  if [[ ${#SHIP_END_CLI[@]} -eq 0 ]]; then
+    echo "missing_ship_end_cli" >"$err"
+    return 1
+  fi
   if [[ -z "$loop" ]]; then
     echo "missing_loop_run_id" >"$err"
     return 1
   fi
   if [[ -n "${PIPELINE_FRG_ATTESTATION_KEY:-}" ]]; then
     env -u PIPELINE_FRG_ATTESTATION_KEY_FILE \
-      "$PIPELINE" factory-gate --for "$ver" --from-run "$loop" >"$out" 2>"$err"
+      "${SHIP_END_CLI[@]}" factory-gate --for "$ver" --from-run "$loop" >"$out" 2>"$err"
     return $?
   fi
   if [[ -z "${PIPELINE_FRG_ATTESTATION_KEY_FILE:-}" ]]; then
@@ -555,5 +563,5 @@ invoke_frg_pack_attestor() {
   fi
   PIPELINE_FRG_ATTESTATION_KEY="$(cat -- "$PIPELINE_FRG_ATTESTATION_KEY_FILE")" \
     env -u PIPELINE_FRG_ATTESTATION_KEY_FILE \
-    "$PIPELINE" factory-gate --for "$ver" --from-run "$loop" >"$out" 2>"$err"
+    "${SHIP_END_CLI[@]}" factory-gate --for "$ver" --from-run "$loop" >"$out" 2>"$err"
 }

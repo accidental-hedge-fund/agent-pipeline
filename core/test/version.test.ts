@@ -51,6 +51,24 @@ for (const flag of ["--version", "-V"]) {
   });
 }
 
+test("CLI: `pipeline --version --json` emits version and commit_sha without inventing SHA", () => {
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "--version", "--json"],
+    {
+      encoding: "utf8",
+      env: { ...process.env, PATH: path.dirname(process.execPath) },
+    },
+  );
+  assert.equal(result.status, 0, `expected exit 0; stderr:\n${result.stderr}`);
+  const parsed = JSON.parse(result.stdout) as { version?: string; commit_sha?: string | null };
+  assert.equal(parsed.version, pkgVersion());
+  assert.ok("commit_sha" in parsed);
+  if (parsed.commit_sha !== null) {
+    assert.match(parsed.commit_sha, /^[0-9a-f]{40}$/);
+  }
+});
+
 // Shim regression: --version must short-circuit BEFORE npm ci, so it works
 // even on a fresh install with no node_modules and no npm available.
 for (const flag of ["--version", "-V"]) {

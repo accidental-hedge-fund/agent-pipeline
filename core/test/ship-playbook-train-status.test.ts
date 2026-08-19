@@ -88,15 +88,19 @@ print("1" if complete and not blocker else "0")
   return (r.stdout ?? "").trim();
 }
 
-test("helper exists and playbook wires TRAIN_STATUS_COMPLETE_BIN", () => {
+test("helper exists and playbook launches repo tugboat (train gate lives there)", () => {
   assert.ok(fs.existsSync(helper), "missing train-status-complete.py");
   assert.ok(fs.existsSync(playbook), "missing pipeline-ship-playbook.sh");
   const body = fs.readFileSync(playbook, "utf8");
-  assert.match(body, /TRAIN_STATUS_COMPLETE_BIN/);
-  assert.match(body, /train-status-complete\.py/);
-  // Must not use whole-stream json.load on the train capture for the success gate.
+  assert.match(body, /exec "\$REPO_DIR\/examples\/supervisor\/shell\/tugboat\.sh" "\$@"/);
+  const tug = fs.readFileSync(
+    path.join(repoRoot, "examples/supervisor/shell/tugboat.sh"),
+    "utf8",
+  );
+  assert.match(tug, /TRAIN_STATUS_COMPLETE_BIN/);
+  assert.match(tug, /train-status-complete\.py/);
   assert.doesNotMatch(
-    body,
+    tug,
     /json\.load\(open\(p\)\).*complete|d=json\.load\(open\(p\)\)[\s\S]{0,120}complete=d\.get/,
   );
 });

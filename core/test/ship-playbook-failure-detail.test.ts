@@ -16,7 +16,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, "../..");
 const playbook = path.join(
   repoRoot,
-  "examples/supervisor/shell/pipeline-ship-playbook.sh",
+  "examples/supervisor/shell/tugboat.sh",
 );
 
 function extractFailureDetail(
@@ -29,7 +29,7 @@ function extractFailureDetail(
     // Extract just the failure_detail() function body from the playbook.
     const src = fs.readFileSync(playbook, "utf8");
     const m = src.match(/^failure_detail\(\) \{[\s\S]*?\n\}/m);
-    assert.ok(m, "failure_detail() function not found in playbook");
+    assert.ok(m, "failure_detail() function not found in tugboat.sh");
     const fn = m[0];
     const runner = path.join(dir, "run.sh");
     fs.writeFileSync(

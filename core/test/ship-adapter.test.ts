@@ -6,16 +6,18 @@ import test from "node:test";
 import {
   alignReleaseCheckoutToCandidate,
   assertFrgCandidateProvenance,
+  bindCandidateShipEndOperations,
   ensureAnnotatedReleaseTag,
   shipCoordinatorDepsFromOperations,
   verifyAnnotatedReleaseTag,
   type ShipAdapterOperations,
 } from "../scripts/stages/ship-adapter.ts";
-import type {
-  ShipIntent,
-  ShipStateStore,
-  ShipStatus,
-  ShipTrainEvidence,
+import {
+  runShipCoordinator,
+  type ShipIntent,
+  type ShipStateStore,
+  type ShipStatus,
+  type ShipTrainEvidence,
 } from "../scripts/stages/ship.ts";
 import type { FrgEvidence } from "../scripts/factory-reliability-gate.ts";
 
@@ -475,4 +477,138 @@ test("production ship adapter wires multi-item advanceWave, not N×single (revie
     !shipBlock.includes("advanceIssueThroughSingle") && !shipBlock.includes("advanceWaveFromSingle"),
     "pipeline ship must not wire N×single advance into the train production adapter",
   );
+});
+
+const PIN_SHA = "9".repeat(40);
+const candidateEngine = {
+  engineRoot: "/cand",
+  launcherPath: "/cand/scripts/pipeline-launcher.mjs",
+  commitSha: head,
+};
+
+function memoryShipStore(): ShipStateStore & { status: ShipStatus | null } {
+  let status: ShipStatus | null = null;
+  return {
+    get status() { return status; },
+    statusFile: () => "/state/status.json",
+    eventsFile: () => "/state/events.jsonl",
+    read: async () => status,
+    writeAtomic: async (_key, value) => {
+      status = value;
+    },
+    appendEvent: async () => {},
+  };
+}
+
+test("pin SHA ≠ candidate: post-train prepare/release/tag spawn candidate launcher, not in-process pin", async () => {
+  const spawned: string[][] = [];
+  const tags: string[] = [];
+  let preparedInProcess = false;
+  let taggedInProcess = false;
+  const pinOps = operations({
+    observeRelease: async () => ({ prepare: release, finish: null }),
+    prepareRelease: async () => {
+      preparedInProcess = true;
+      return release;
+    },
+    waitForPublication: async () => {
+      taggedInProcess = true;
+      return publication;
+    },
+  });
+  const bound = bindCandidateShipEndOperations(pinOps, {
+    pinCommitSha: PIN_SHA,
+    repoDir: "/repo",
+    env: { PIPELINE_FRG_ATTESTATION_KEY: "secret" },
+    nodeBin: "/usr/bin/node",
+    factoryReleaseRequestPath: "/abs/req.json",
+    resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+    spawn: async (argv, env) => {
+      spawned.push(argv);
+      assert.equal(env.PIPELINE_FRG_ATTESTATION_KEY, undefined);
+      assert.ok(!argv.includes("ship"));
+      assert.ok(!argv.includes("train"));
+      return { code: 0, stdout: JSON.stringify({ status: "in_progress", loop_run_id: "loop-1" }), stderr: "" };
+    },
+    spawnEnsureTag: async (engine) => {
+      tags.push(engine.launcherPath);
+    },
+  });
+
+  await bound.runFrgPack!(intent, train);
+  await bound.prepareRelease(intent, head);
+  await bound.waitForPublication(intent, releaseFinish);
+  assert.equal(preparedInProcess, false);
+  assert.equal(taggedInProcess, false);
+  assert.ok(spawned.some((argv) => argv.includes("factory-release") && argv.includes("/cand/scripts/pipeline-launcher.mjs")));
+  assert.ok(spawned.some((argv) => argv[argv.length - 2] === "release" || argv.includes("release")));
+  assert.deepEqual(tags, ["/cand/scripts/pipeline-launcher.mjs"]);
+  for (const argv of spawned) {
+    assert.equal(argv[0], "/usr/bin/node");
+    assert.equal(argv[1], "/cand/scripts/pipeline-launcher.mjs");
+  }
+});
+
+test("unresolvable candidate stops ship before FRG and leaves train evidence", async () => {
+  const store = memoryShipStore();
+  store.status = checkpoint({
+    next_action: "frg_pack",
+    train,
+    train_plan: { ordered_issues: [...train.ordered_issues] },
+  });
+  let preparedInProcess = false;
+  const bound = bindCandidateShipEndOperations(operations({
+    observeFrg: async () => null,
+    prepareRelease: async () => {
+      preparedInProcess = true;
+      return release;
+    },
+  }), {
+    pinCommitSha: PIN_SHA,
+    repoDir: "/repo",
+    env: {},
+    factoryReleaseRequestPath: "/abs/req.json",
+    resolveCandidate: async () => ({ ok: false, error: "no checkout at candidate SHA" }),
+    spawn: async () => {
+      throw new Error("spawn must not run");
+    },
+  });
+  const deps = shipCoordinatorDepsFromOperations(bound, { state: store });
+  const wrapped = {
+    ...deps,
+    authorizationPublicKey: "test",
+    withRunLock: async (_key: string, fn: () => Promise<unknown>) => fn(),
+  };
+  await assert.rejects(
+    runShipCoordinator(intent, null, wrapped),
+    /candidate-engine identity defect/,
+  );
+  assert.equal(preparedInProcess, false);
+  assert.equal(store.status?.train?.integrated_head_oid, head);
+  assert.equal(store.status?.frg_pack, null);
+  assert.match(store.status?.last_error ?? "", /candidate-engine identity defect/);
+  assert.equal(store.status?.next_action, "frg_pack");
+});
+
+test("matching pin SHA keeps in-process pin prepare", async () => {
+  let preparedInProcess = false;
+  const spawned: string[][] = [];
+  const bound = bindCandidateShipEndOperations(operations({
+    prepareRelease: async () => {
+      preparedInProcess = true;
+      return release;
+    },
+  }), {
+    pinCommitSha: head,
+    repoDir: "/repo",
+    env: {},
+    resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+    spawn: async (argv) => {
+      spawned.push(argv);
+      return { code: 0, stdout: "", stderr: "" };
+    },
+  });
+  await bound.prepareRelease(intent, head);
+  assert.equal(preparedInProcess, true);
+  assert.deepEqual(spawned, []);
 });

@@ -74,8 +74,13 @@ Host env (mode-0600 profile):
 
 ```bash
 export REPO_DIR=/path/to/control-checkout   # required; not *factory-control* (#1062)
-export PIPELINE=$HOME/.local/bin/pipeline   # required
+export PIPELINE=$HOME/.local/bin/pipeline   # production pin: train + engine-promote
 export ALLOW_MERGE=1                        # required for mutating ship
+# After train-complete, FRG pack / release / finish use the candidate engine
+# (clean REPO_DIR HEAD at the FRG-bound SHA, $REPO_DIR/.worktrees/ship-candidate-<sha>,
+# or PIPELINE_CANDIDATE_ENGINE_ROOT). They do not use the previous production pin.
+# optional:
+# export PIPELINE_CANDIDATE_ENGINE_ROOT=/path/to/candidate-checkout
 # Tugboat and the host pipeline launcher export AGENT_PIPELINE_PRODUCTION_PIN
 # when unset to $REPO_DIR/.agent-pipeline/production-engine-pin.json so
 # engine-promote and the next train doctor share one pin file (#1127).
@@ -156,7 +161,11 @@ Hardened behaviors (preserve):
 ## FRG pack is part of thin ship
 
 Default Tugboat sequence is train → FRG pack → release (no `--skip-frg`) →
-finish → promote. The pack phase composes
+finish → promote. **Train and engine-promote use the production-pin CLI**
+(`$PIPELINE`). **After train-complete, FRG pack, `pipeline release`, and
+`release finish` use the candidate engine** at the FRG-bound SHA (`SHIP_END_CLI`
+= `node "$ENGINE_ROOT/scripts/pipeline-launcher.mjs"`). Tugboat does not invoke
+`git tag` or `gh release create`. The pack phase composes
 `pipeline factory-release prepare --request <abs.json> --json` in a child that
 has `PIPELINE_FRG_ATTESTATION_KEY` and `PIPELINE_FRG_ATTESTATION_KEY_FILE`
 **unset** (the parent supervisor env may keep the credential). When prepare
@@ -168,7 +177,9 @@ Tugboat runs `pipeline factory-gate --for X.Y.Z --from-run <loop>` in a
 to the request candidate SHA (and `action_id` when recorded), or prepare
 `complete` with an open release PR. `awaiting_frg_attestation` alone is **not**
 pack-done. A failed or missing pack stops the ship **before** `pipeline release`.
-Tugboat does not write the key body into `state.json`.
+If the candidate engine cannot be resolved, Tugboat fails closed and does **not**
+fall back to the production-pin `$PIPELINE` for those verbs. Tugboat does not
+write the key body into `state.json`.
 
 `--skip-frg` / `TUGBOAT_SKIP_FRG=1` is an operator escape only. It requires a
 non-empty `--skip-frg-reason` / `TUGBOAT_SKIP_FRG_REASON`. Missing reason fails
@@ -182,16 +193,15 @@ requires a real FRG `run_id` and evidence path.
 
 ### Chain playbook (`pipeline-ship-playbook.sh`)
 
-Documented **alternate** composition for hosts that still install it. Same
-general train → release → finish → promote idea. **Not** the product owner.
-If installed, keep promote default `:-all` and pass doctor
-`supervisor:ship-playbook-promote-host` (#989).
+Documented **alternate** launcher for hosts that still install it. It execs
+`$REPO_DIR/examples/supervisor/shell/tugboat.sh` and must not retain a second
+ship-end compose. **Not** the product owner. After that exec, Tugboat uses the
+candidate engine for FRG / release / finish. A selected stale full playbook
+fails doctor `supervisor:ship-end-candidate-engine`.
 
 ```bash
 install -m 0755 "$ROOT/examples/supervisor/shell/pipeline-ship-playbook.sh" \
   "$HOME/.local/bin/pipeline-ship-playbook"
-install -m 0644 "$ROOT/examples/supervisor/shell/frg-pack-helpers.sh" \
-  "$HOME/.local/bin/frg-pack-helpers.sh"
 ```
 
 ### Grant-style `ship-milestone.sh --authorization`
@@ -205,9 +215,12 @@ invocation is `pipeline ship --milestone vX.Y.Z` with no grant file.
 pipeline doctor
 # Expect (when ~/.local/bin/tugboat is installed):
 #   supervisor:tugboat-install-parity → pass
-# When only legacy playbook is installed:
-#   supervisor:ship-playbook-promote-host → pass (or fail with refresh remediation)
-# Neither installed → both checks skip
+#   supervisor:ship-end-candidate-engine → pass (or skip with no bound SHA)
+# When only a thin launcher playbook is installed:
+#   supervisor:ship-end-candidate-engine → pass
+# When a stale full playbook is selected for ship-end:
+#   supervisor:ship-end-candidate-engine → fail (refresh launcher or exec repo tugboat.sh)
+# Neither installed → checks skip
 ```
 
 ## Exact-run progress (optional)

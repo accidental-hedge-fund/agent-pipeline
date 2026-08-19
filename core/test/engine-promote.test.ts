@@ -146,34 +146,19 @@ test("engine-promote: explicit --host codex stays scoped (#989)", async () => {
   assert.doesNotMatch(result.install_command, /--host all\b/);
 });
 
-test("ship playbook: ENGINE_PROMOTE_HOST defaults to all and passes --host (#989)", () => {
+test("ship playbook: thin launcher skips promote-host check; Tugboat defaults to all (#989 / #1151)", () => {
   const playbook = path.join(
     repoRoot,
     "examples/supervisor/shell/pipeline-ship-playbook.sh",
   );
+  const tugboat = path.join(repoRoot, "examples/supervisor/shell/tugboat.sh");
   assert.ok(fs.existsSync(playbook), "missing pipeline-ship-playbook.sh");
   const body = fs.readFileSync(playbook, "utf8");
-  // Unset default must be all — fail if someone restores codex-only ship default.
-  assert.match(body, /HOST="\$\{ENGINE_PROMOTE_HOST:-all\}"/);
-  assert.doesNotMatch(body, /HOST="\$\{ENGINE_PROMOTE_HOST:-codex\}"/);
-  // Header documents default all and valid values including single hosts.
-  assert.match(body, /ENGINE_PROMOTE_HOST\s+codex\|claude\|grok\|opencode\|all \(default all\)/);
-  // Promote always passes explicit --host (no silent omission).
-  assert.match(
-    body,
-    /engine-promote --for "\$version" --host "\$HOST" "\$\{SKIP_FRG_ARGS\[@\]\}" --json/,
-  );
-  assert.doesNotMatch(
-    body,
-    /engine-promote --for "\$version" --host "\$HOST" --skip-frg --json/,
-  );
-  assert.match(body, /factory-release prepare --request/);
-  assert.match(body, /release "\$version" --no-edit "\$\{SKIP_FRG_ARGS\[@\]\}"/);
-  assert.doesNotMatch(body, /release "\$version" --no-edit --skip-frg/);
-  // Pure helper agrees with the repo playbook shape (doctor uses the same helper).
-  assert.equal(shipPlaybookHasAllPromoteDefault(body), true);
-  assert.equal(shipPlaybookHasLegacyCodexOnlyPromoteDefault(body), false);
-  assert.equal(evaluateInstalledShipPlaybookPromoteHost(body).status, "pass");
+  assert.match(body, /exec "\$REPO_DIR\/examples\/supervisor\/shell\/tugboat\.sh" "\$@"/);
+  assert.equal(evaluateInstalledShipPlaybookPromoteHost(body).status, "skip");
+  const tug = fs.readFileSync(tugboat, "utf8");
+  assert.match(tug, /ENGINE_PROMOTE_HOST:-all/);
+  assert.doesNotMatch(tug, /ENGINE_PROMOTE_HOST:-codex/);
 });
 
 test("legacy installed ship playbook: codex-only default fails rollout preflight (#989)", () => {
@@ -203,12 +188,12 @@ test("legacy installed ship playbook: codex-only default fails rollout preflight
   });
   assert.equal(withAll.status, "pass");
 
-  // Current repo playbook must not fail the same check.
+  // Current repo playbook is a launcher — promote-host check skips (not a full playbook).
   const current = fs.readFileSync(
     path.join(repoRoot, "examples/supervisor/shell/pipeline-ship-playbook.sh"),
     "utf8",
   );
-  assert.equal(evaluateInstalledShipPlaybookPromoteHost(current).status, "pass");
+  assert.equal(evaluateInstalledShipPlaybookPromoteHost(current).status, "skip");
 
   // Missing install is skip, not fail (hosts without the chain playbook).
   assert.equal(evaluateInstalledShipPlaybookPromoteHost(null).status, "skip");

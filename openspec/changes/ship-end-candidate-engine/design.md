@@ -5,24 +5,25 @@ See `proposal.md` for why. Current law and code:
 - Tugboat pins `PIPELINE="${PIPELINE:-pipeline}"` at process start (`examples/supervisor/shell/tugboat.sh`). Every phase, including FRG pack, `pipeline release`, and `release finish`, uses that binary. Factory ship sets it to `~/.local/bin/pipeline`, which is the last promoted pin.
 - Living `tugboat-thin-ship` says the composer uses "the installed Pipeline CLI" for the whole sequence. Living `release-sub-command` says wrappers **MAY** invoke `factory-release prepare` from the exact integrated candidate when the pin is one release behind. Tugboat does not take that MAY.
 - Living `factory-two-track-engine-pinning` reserves the candidate track for FRG Layer B and eval soaks, and forbids silently running the candidate as pinned production. That is a different use than ship-end publishing.
-- Option 1 pack parity (`tugboat-install-parity.ts`) compares installed Tugboat to local repo examples. It does not bind the candidate SHA being released. It does not check `$PIPELINE --version`. 1.39.4 promote did not refresh `~/.local/bin/pipeline-ship-playbook`.
+- Option 1 pack parity (`tugboat-install-parity.ts`) compares installed Tugboat to local repo examples. It does not bind the candidate SHA being released. It does not check engine source SHA. 1.39.4 promote did not refresh `~/.local/bin/pipeline-ship-playbook`.
 - Tugboat already binds `integrated_candidate.git_sha` to the remote integration tip, not local `HEAD`. Local `REPO_DIR` often stays at the pre-train SHA. Candidate **code** and candidate **SHA** are therefore distinct from cwd.
+- `pipeline-ship-playbook.sh` is a second compose implementation. Digest-equality against `tugboat.sh` cannot hold while that file remains a fork. This change collapses the installed playbook to a thin launcher.
 
 **Conflict (do not average):** "use the installed Pipeline CLI for every phase" contradicts "MAY invoke prepare from the candidate when the pin is behind" and contradicts this issue. This change **supersedes** the installed-CLI rule for post-train FRG / release / finish / tag. Train stays on the pin. Two-track pinning is not averaged: ship-end is a documented candidate-track publishing use, not a silent dogfood reclassification.
 
 **Class vs site (engine-dogfood bar):**
 
 1. **Class vs site.** The site is 1.39.5 Tugboat invoking `PIPELINE=…/pipeline` version 1.39.4 for release, plus a stale playbook digest. The class is: any ship-end composer that scores or publishes the candidate while still executing the previous production-pin CLI.
-2. **Shared surfaces.** Candidate-engine resolution after train-complete; ship-end identity gate (`--version` / source SHA / playbook digest vs candidate SHA). Law lives in `ship-end-candidate-engine`, adopted by `tugboat-thin-ship`, `supervisor-ship-playbook`, `ship-coordinator`, `release-sub-command`, and `factory-two-track-engine-pinning`.
-3. **Next identical fault.** The next pin-behind-candidate ship runs ship-end on the candidate engine. Tests fail if FRG/release/finish still use process-start `$PIPELINE` when pin identity ≠ candidate. No new mole issue.
+2. **Shared surfaces.** Candidate-engine resolution after train-complete; ship-end identity gate (exact source SHA, not version alone; playbook launcher vs stale fork). Law lives in `ship-end-candidate-engine`, adopted by `tugboat-thin-ship`, `supervisor-ship-playbook`, `ship-coordinator`, `release-sub-command`, and `factory-two-track-engine-pinning`.
+3. **Next identical fault.** The next pin-behind-candidate ship runs ship-end on the candidate engine. Tests fail if FRG/release/finish/tag still use process-start `$PIPELINE` when pin SHA ≠ candidate. No new mole issue.
 
 ## Goals / Non-Goals
 
 **Goals:**
 
 - After train-complete, ship-end verbs execute candidate engine code at the FRG-bound SHA.
-- Installed playbook matches candidate `tugboat.sh`, or the composer execs the repo script from `REPO_DIR`.
-- A hermetic check fails on pin/playbook mismatch when those tools are used for ship-end.
+- Installed `pipeline-ship-playbook` is a thin launcher to `$REPO_DIR/examples/supervisor/shell/tugboat.sh`. Doctor validates that resolved script plus the candidate engine.
+- A hermetic check fails on pin SHA / stale-playbook mismatch when those tools are used for ship-end.
 - Keep Tugboat a thin composer of existing CLI verbs. Keep train on the production pin.
 
 **Non-Goals:**
@@ -33,76 +34,135 @@ See `proposal.md` for why. Current law and code:
 - Changing FRG attestor isolation, pack-done, or two-track pin write rules.
 - Making `engine-promote` switch engines in this change (promote consumes a published tag; it is not in the issue ship-end set).
 - Checking out or force-resetting operator `REPO_DIR` `HEAD` as the only resolution path.
+- Deduplicating Tugboat's inlined FRG helpers vs `frg-pack-helpers.sh` beyond candidate-CLI rebinding.
 
 ## Decisions
 
 ### 1. Switch after train-complete, not at process start
 
-Train `--merge` stays on process-start `$PIPELINE` (production pin). After train is complete or resumed complete, the composer resolves the candidate engine and uses it for FRG pack, release, finish, and any composer-invoked tag.
+Train `--merge` stays on process-start `$PIPELINE` (production pin). After train is complete or resumed complete, the composer resolves the candidate engine and uses it for the ship-end inventory in Decision 6. Promote stays on process-start `$PIPELINE`.
 
 **Why not switch `$PIPELINE` at Tugboat start:** the candidate SHA is not known until after train merges through GitHub. Switching early would run train on unpromoted engine, which is an explicit non-goal.
 
 **Alternative considered:** run the entire ship, including train, from a floating `main` checkout. Rejected: two-track pinning and the issue non-goals require train on the pin.
 
-### 2. Candidate engine identity is the FRG-bound SHA, not cwd HEAD
+### 2. Candidate-resolution contract (one, closed)
 
-Resolve the candidate as:
+**Source of `integrated_candidate.git_sha`:**
 
-1. A control checkout or managed worktree whose `HEAD` (or recorded source SHA) equals the FRG-bound `integrated_candidate.git_sha`, then invoke that tree's `core/scripts/pipeline.ts` (Node type-stripping, same as the installed CLI), **or**
-2. An explicit candidate install whose installer receipt / version identity names that SHA.
+| Composer | SHA source after train-complete |
+| --- | --- |
+| Tugboat | The 40-hex `integrated_candidate.git_sha` already written into `$RUN_DIR/factory-release-prepare-request.json` (remote `origin/<base_branch>` tip, or injected `TUGBOAT_CANDIDATE_SHA` in tests). Same binding Tugboat already uses today (`tugboat.sh` request writer). |
+| In-engine `pipeline ship` | `ShipTrainEvidence.integrated_head_oid` already persisted on ship status (same 40-hex OID `ship-adapter.ts` `requireOid` accepts). |
 
-Fail closed if neither matches. Do not fall back to `~/.local/bin/pipeline` when that binary's version or source SHA differs.
+Do not re-parse train stdout as a shell fragment. Read the SHA from the JSON field with a parser (Python/`JSON.parse`). Reject anything that does not match `^[0-9a-f]{40}$` after lowercase. Abbreviated SHAs fail closed. The existing `factory-release-prepare.ts` `GIT_SHA_RE` / `requireOid` stay the request validators.
 
-Cwd MAY remain `REPO_DIR` for `gh` and relative paths (existing Tugboat rule). The executing **module root** SHALL be the candidate tree. Release already must not bind candidate SHA to pre-train local `HEAD`.
+**Allowed engine roots (first match wins):**
 
-**Why not `cd` and reset `REPO_DIR`:** that mutates the operator checkout and races other host processes. A managed worktree or already-matching control checkout is enough to load candidate `release.ts`.
+1. `REPO_DIR` when `git -C "$REPO_DIR" rev-parse --verify HEAD` equals the SHA **and** `git -C "$REPO_DIR" status --porcelain` is empty.
+2. `$REPO_DIR/.worktrees/ship-candidate-<sha>` when that worktree exists, `rev-parse HEAD` equals the SHA, and porcelain is empty.
+3. Else create (2) with `git -C "$REPO_DIR" fetch --quiet origin <sha>` then `git worktree add --detach <path> <sha>`. Fail closed if fetch or add fails.
+4. `PIPELINE_CANDIDATE_ENGINE_ROOT` (absolute directory) when it exists, `rev-parse HEAD` equals the SHA, porcelain is empty, and `<root>/core/scripts/pipeline.ts` exists. This is the explicit candidate-install path.
 
-**Alternative considered:** `npx github:…#<sha>` on every ship-end verb. Allowed as the explicit candidate install path; not required if a checkout at that SHA already exists.
+After attach, re-check `git rev-parse --verify HEAD` equals the SHA. A dirty or mismatched tree fails closed. Do not reset operator `REPO_DIR` HEAD.
 
-### 3. Playbook: digest vs candidate `tugboat.sh`, or exec the repo script
+**Rejected as engine roots:**
 
-Two accepted postures:
+- `~/.local/bin/pipeline` when that binary's engine-root SHA ≠ candidate SHA
+- PATH lookup of `pipeline`
+- Any env/train field that is not an absolute directory passing the checks above
+- Shell-expanded fragments, newlines in paths, or `eval` of train JSON
 
-- Installed `pipeline-ship-playbook` (or installed Tugboat) content digest equals `examples/supervisor/shell/tugboat.sh` at the candidate SHA.
-- Composer execs `$REPO_DIR/examples/supervisor/shell/tugboat.sh` and does not use the divergent installed playbook for ship-end.
+**Candidate CLI entrypoint and CWD:**
 
-Reuse the existing `contentDigest` helper. Canonical bytes come from the candidate SHA (read from the resolved candidate tree), not from a stale local `HEAD` or a leftover install-root.
+- Entrypoint: `node "$ENGINE_ROOT/scripts/pipeline-launcher.mjs"` (same launcher as `scripts/pipeline-launcher.mjs`; Node 24 guard + `core/scripts/pipeline.ts`).
+- CWD for `gh` and relative paths: `REPO_DIR` (existing Tugboat rule). The executing **module root** is `ENGINE_ROOT`, not cwd HEAD.
+- Record the resolved entrypoint in ship state as `ship_end_cli` (absolute path). Subsequent verbs use that recorded path, not a later PATH lookup.
+
+**Identity is exact source SHA.** Package version is display-only. A matching `--version` string with a mismatched SHA SHALL fail. `--version` stays the `core/package.json` version for human text. `pipeline --version --json` SHALL emit `{ "version": "<semver>", "commit_sha": "<40hex>" | null }` using `resolveEngineCommitSha` (never invent a SHA). Doctor and unit helpers compare `commit_sha` to the FRG-bound SHA. They SHALL NOT pass on version equality alone.
+
+### 3. Installed playbook is a thin launcher (single design)
+
+Canonical composer source is `examples/supervisor/shell/tugboat.sh` at the candidate SHA.
+
+`examples/supervisor/shell/pipeline-ship-playbook.sh` SHALL become a thin launcher that execs that repo script:
+
+```bash
+exec "$REPO_DIR/examples/supervisor/shell/tugboat.sh" "$@"
+```
+
+`REPO_DIR` must already be set (existing playbook contract). Installed `~/.local/bin/pipeline-ship-playbook` is a copy of that launcher.
+
+Doctor / identity helper treats an installed playbook as:
+
+- **pass** when it is a thin launcher (exec of `$REPO_DIR/examples/supervisor/shell/tugboat.sh`) and the resolved `tugboat.sh` digest matches candidate `tugboat.sh`, **or** the ship execs `$REPO_DIR/examples/supervisor/shell/tugboat.sh` directly and does not invoke the installed playbook
+- **fail** when the installed playbook is selected for ship-end and is not that launcher (stale fork, including digest `2afe3c92…` vs candidate tugboat)
+- **skip** when no Tugboat, no playbook, and no in-engine ship-end is in use
+
+Marker-only presence SHALL NOT count as parity. Do not keep a second compose implementation in the installed playbook. Existing `supervisor:ship-playbook-promote-host` still applies to a leftover full playbook body; the launcher itself has no promote-host default, so that check skips a launcher body (not a recognized full playbook) unless the ship selected a stale full playbook — then fail with refresh-to-launcher remediation.
 
 ### 4. Identity gate is a pure helper plus doctor/source tests
 
-One pure helper evaluates:
+One pure helper (new, next to `tugboat-install-parity.ts`; reuse `contentDigest`) evaluates injected:
 
-- invoked ship-end CLI version or source SHA vs candidate SHA / candidate package version
-- playbook digest vs candidate `tugboat.sh`
-- skip when those tools are absent and unused
+- candidate SHA (40 hex)
+- invoked engine `commit_sha` (40 hex or null)
+- invoked `--version` string (advisory only)
+- playbook body or `composer_kind`: `tugboat-repo` | `playbook-launcher` | `playbook-stale` | `in-engine-ship` | `unused`
+- whether ship-end tools are in use
 
-Doctor calls it. Unit tests inject strings and digests (no live ship). A Tugboat/playbook source assertion fails if post-train invoke sites still use process-start `$PIPELINE` with no rebinding.
+Fail when tools are in use and engine `commit_sha` ≠ candidate SHA (including null). Fail when a stale playbook is selected. Skip when unused. Doctor calls it. Unit tests inject strings and digests (no live ship). A Tugboat source assertion fails if post-train invoke sites still use process-start `$PIPELINE` with no `SHIP_END_CLI` rebinding.
 
-`--version` vs SHA: fail when either the reported version does not match the candidate package version bound to that SHA, or the CLI source SHA does not match the candidate SHA. Pin `1.39.4` vs candidate `1.39.5` is the 1.39.5 fixture.
+Doctor skip is only when **no** thin/in-engine ship-end tool is in use: no installed Tugboat, no installed playbook, and no in-engine ship status whose `next_action` is a post-train phase. Bound SHA identity runs when a factory-release request or ship status carries `integrated_candidate.git_sha` / `integrated_head_oid`. Without a bound SHA, doctor still fails a selected stale full playbook.
 
-### 5. In-engine `pipeline ship` re-execs the candidate for post-train phases
+Remediation is deterministic: invoke the candidate engine at the FRG-bound SHA; refresh playbook from candidate `examples/supervisor/shell/pipeline-ship-playbook.sh` (launcher) or exec `$REPO_DIR/examples/supervisor/shell/tugboat.sh`.
 
-If the operator started production-pin `pipeline ship`, the coordinator SHALL spawn or re-exec the candidate `pipeline.ts` for FRG / release / finish / tag. In-process calls from the pin process are the same class bug as Tugboat `$PIPELINE`.
+### 5. In-engine `pipeline ship` spawn-per-verb handoff (no full re-exec)
 
-**Alternative considered:** document that operators must start ship from a candidate checkout. Rejected: Buzz / Tugboat start from the pin by design; class law must not depend on a human picking the binary.
+Do **not** re-exec the whole `pipeline ship` process. Full re-exec would inherit FRG credentials into the candidate and could re-enter train.
 
-### 6. engine-promote stays on the process-start CLI in this change
+The pin process stays the coordinator (`ship.ts` already persists per-phase evidence and resumes from `next_action`). After train is persisted:
 
-The issue ship-end set is prepare, release, finish, and tag. Promote consumes a published GitHub Release and updates the pin. Leave promote on process-start `$PIPELINE` unless a later change expands the set. Do not auto-promote before publication.
+1. Resolve the candidate via Decision 2. If resolution fails, persist `last_error` naming the candidate-engine identity defect, leave `train` evidence intact, do **not** start `frg_pack` / release mutation, return non-zero. Retry of the same `pipeline ship --milestone` resumes at `frg_pack` without retraining.
+2. For `frg_pack` / `frg_score` / `release_prepare` / `release_finish` / `release_wait` (tag), spawn the candidate CLI (`node "$ENGINE_ROOT/scripts/pipeline-launcher.mjs" <verb>…`) instead of in-process pin `runRelease` / `factory-release-prepare` / `ensureAnnotatedReleaseTag`.
+3. Recursion guard: the spawned argv is a leaf CLI verb (`factory-release prepare`, `factory-gate`, `release`, `release finish`), never `ship --milestone`. The pin coordinator does not spawn `pipeline ship`.
+4. Credential split (keep #1133): prepare child `env -u PIPELINE_FRG_ATTESTATION_KEY -u PIPELINE_FRG_ATTESTATION_KEY_FILE`. Attestor child is a **separate** spawn with `PIPELINE_FRG_ATTESTATION_KEY` only (KEY_FILE unset in that child). Candidate resolution MUST NOT copy those keys into the request JSON, `ship_end_cli` path, or prepare child env.
+5. `engine-promote` stays in-process on the pin (`runEnginePromote`). Publication wait still requires GitHub Release.
+
+If the starting process SHA already equals the candidate SHA, in-process calls on that process are allowed (this process **is** the candidate). Tests fail if pin SHA ≠ candidate and `prepareRelease` / `runRelease` / `ensureAnnotatedReleaseTag` still run in-process.
+
+### 6. Post-train invocation inventory (closed)
+
+Tugboat does not tag. In-engine ship tags via `ensureAnnotatedReleaseTag` (`ship-adapter.ts`, #1115). Do not say "any composer-invoked tag."
+
+| Phase | Command | Tugboat | Installed playbook | `pipeline ship` |
+| --- | --- | --- | --- | --- |
+| Train `--merge` | `pipeline train --milestone vX.Y.Z --merge --json` | process-start `$PIPELINE` | launcher → Tugboat, same | in-process pin `runTrain` |
+| FRG prepare | `pipeline factory-release prepare --request <abs.json> --json` | `SHIP_END_CLI`, uncredentialed child | same | candidate spawn, uncredentialed |
+| FRG attestor | `pipeline factory-gate --for X.Y.Z --from-run <loop>` | `SHIP_END_CLI`, separate credentialed child | same | candidate spawn, separate credentialed |
+| Release prepare | `pipeline release X.Y.Z --no-edit` | `SHIP_END_CLI` | same | candidate spawn of `release` (not pin `runRelease`) |
+| Release finish | `pipeline release finish <pr> --json` | `SHIP_END_CLI` | same | candidate spawn of `release finish` |
+| Tag | annotated `vX.Y.Z` on merge commit | **not invoked** (wait for GitHub Release workflow) | **not invoked** | candidate spawn/path of `ensureAnnotatedReleaseTag` inside `waitForPublication` |
+| Promote | `pipeline engine-promote --for X.Y.Z --host <host>` | process-start `$PIPELINE` | same | in-process pin `runEnginePromote` |
+
+`--skip-frg` remains an operator escape with a logged reason. It is not the default.
 
 ## Risks / Trade-offs
 
-- **[Risk] Candidate checkout missing on the host** → Fail closed with remediation (fetch SHA, attach worktree, or candidate install). Do not silently use the pin.
-- **[Risk] Cwd at pre-train HEAD while CLI is candidate** → Release and FRG request binding already use remote tip / fetch. Tests must cover invoke identity, not assume cwd SHA equals candidate SHA.
+- **[Risk] Candidate checkout missing on the host** → Fail closed with remediation (fetch SHA, attach `.worktrees/ship-candidate-<sha>`, or set `PIPELINE_CANDIDATE_ENGINE_ROOT`). Do not silently use the pin.
+- **[Risk] Cwd at pre-train HEAD while CLI is candidate** → Release and FRG request binding already use remote tip / fetch. Tests cover invoke identity, not assume cwd SHA equals candidate SHA.
 - **[Risk] Two-track pinning misread as "never run candidate in factory ship"** → Spec delta states ship-end is candidate-track publishing; pinned dogfood stays pinned.
-- **[Risk] Installed playbook vs Tugboat fork** → Digest against candidate `tugboat.sh` (issue text) or exec that script from `REPO_DIR`. Do not accept marker-only parity.
-- **[Risk] In-engine ship in-process pin** → Ship-adapter post-train phases spawn the candidate CLI; a test fails if they call in-process pin `runRelease` when pin SHA ≠ candidate.
+- **[Risk] Installed playbook vs Tugboat fork** → Collapse playbook to a launcher. Fail a selected stale full playbook. Do not accept marker-only parity.
+- **[Risk] In-engine ship in-process pin** → Spawn leaf candidate verbs; a test fails if they call in-process pin `runRelease` when pin SHA ≠ candidate.
+- **[Risk] FRG credential leak through candidate resolution** → Prepare spawn unsets KEY/KEY_FILE. Attestor is a different spawn. Resolution records only absolute paths and 40-hex SHA.
+- **[Risk] Train JSON / env as executable** → SHA and roots are validated as data (`^[0-9a-f]{40}$`, absolute directory, `pipeline.ts` exists). No `eval`.
+- **[Risk] Failed candidate release retrains** → `ship.ts` already resumes from persisted `train`. Tugboat already treats prior `train_status complete=true` as resume. Resolution/release failure must not clear that checkpoint.
 
 ## Migration Plan
 
-- Land composer + helper + tests on the candidate; this change is the ship-end fix that the next 1.39.x ship must run from a candidate checkout **once** (bootstrap). After promote of this version, later ships resolve the candidate automatically.
+- Land composer + helper + tests on the candidate; this change is the ship-end fix that the next 1.39.x ship must run from a candidate checkout **once** (bootstrap: `PIPELINE_CANDIDATE_ENGINE_ROOT` or worktree at the FRG-bound SHA). After promote of this version, later ships resolve the candidate automatically.
 - Rollback: revert the composer to process-start `$PIPELINE` for all phases (returns the 1.39.5 failure mode). No pin write occurs until promote.
 
 ## Open Questions
 
-None. Candidate resolution (checkout at FRG-bound SHA vs explicit install), train-vs-ship-end split, and playbook postures are decided. Implementation may pick worktree vs already-matching control checkout without changing the specs.
+None. Candidate-resolution contract, spawn-per-verb handoff, SHA identity, playbook launcher, and the invocation inventory are decided.

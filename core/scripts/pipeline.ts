@@ -88,6 +88,8 @@ import {
   resolveVerifiedRemoteHead,
 } from "./transient-wrappers.ts";
 import { classifyPorcelainForScratchRecover } from "./worktree-dirt.ts";
+import { resolveEngineCommitSha } from "./engine-attribution.ts";
+import { formatPipelineVersionJson } from "./ship-end-identity.ts";
 import {
   bundlePath,
   createBundle,
@@ -3880,6 +3882,13 @@ async function main(): Promise<void> {
   // indistinguishable by content. New installs print refine-spec-specific usage
   // mentioning --title and --body; old installs print generic help without them.
   const rawArgs = process.argv.slice(2);
+  // `--version --json` is identity (exact 40-hex commit_sha or null). Human
+  // `--version` stays Commander / package version. Never invent a SHA (#1151).
+  if ((rawArgs.includes("--version") || rawArgs.includes("-V")) && rawArgs.includes("--json")) {
+    const engineRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+    process.stdout.write(formatPipelineVersionJson(VERSION, resolveEngineCommitSha(engineRoot)));
+    process.exit(0);
+  }
   if (rawArgs[0] === "refine-spec" && (rawArgs.includes("--help") || rawArgs.includes("-h"))) {
     process.stdout.write(
       'Usage: pipeline refine-spec --title "<title>" --body "<markdown>" [--json]\n\n' +

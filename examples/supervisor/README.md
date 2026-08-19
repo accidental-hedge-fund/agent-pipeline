@@ -22,7 +22,7 @@ They only map intent → `pipeline` CLI. They are **not** a second control plane
 | `run-intent.sh` | Map a short intent string → `pipeline train` / `single` |
 | `pipeline-launcher.sh` | Resolve installed `pipeline` without hardcoding host paths. On the factory control plane, exports `AGENT_PIPELINE_PRODUCTION_PIN` when unset. |
 | `frg-pack-helpers.sh` | Secret-free `factory-release prepare` request writer, pack-tick classifier, uncredentialed prepare child, and `factory-gate --from-run` attestor compose. Sourced by the playbook. Tugboat inlines the same helpers. |
-| `pipeline-ship-playbook.sh` | Leftover thin chain adapter (not the product owner) |
+| `pipeline-ship-playbook.sh` | Thin launcher to `$REPO_DIR/examples/supervisor/shell/tugboat.sh` (not the product owner) |
 | `ship-milestone.sh` | Parked grant-style adapter; not the operator surface |
 
 Ship runbook: [docs/runbooks/ship-milestone.md](../../docs/runbooks/ship-milestone.md)  
@@ -30,7 +30,9 @@ FRG checklist: [docs/runbooks/frg-pack-checklist.md](../../docs/runbooks/frg-pac
 
 ## Rules for all examples
 
-1. Call the installed `pipeline` binary (or `node …/pipeline.mjs`).
+1. Call the installed `pipeline` binary (or `node …/pipeline.mjs`) for train
+   and promote. After train-complete, FRG pack / release / finish use the
+   candidate engine (`node "$ENGINE_ROOT/scripts/pipeline-launcher.mjs"`).
 2. Do not hardcode implementer models; use the target repo’s `.github/pipeline.yml`.
 3. Do not default to `--merge` unless the deployment config sets `ALLOW_MERGE=1` (or equivalent).
 4. Never put tokens, FRG keys, private channel IDs, or host home paths in the repository.
@@ -62,6 +64,8 @@ pipeline ship status --milestone v1.37.0 --json
 ```
 
 Required env for a mutating ship: `REPO_DIR`, `PIPELINE`, `ALLOW_MERGE=1`.  
+`$PIPELINE` is the production pin (train + engine-promote). Ship-end uses the
+candidate checkout at the FRG-bound SHA (or `PIPELINE_CANDIDATE_ENGINE_ROOT`).
 Optional: `ENGINE_PROMOTE_HOST` (default `all`), `SHIP_NOTIFY`, wait budgets.
 
 If Buzz is quiet during a ship, check

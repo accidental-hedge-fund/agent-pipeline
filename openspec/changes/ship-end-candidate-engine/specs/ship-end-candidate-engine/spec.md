@@ -6,7 +6,7 @@ Defines the shared ship-end class law: after train-complete, Factory Reliability
 
 ### Requirement: Ship-end composers SHALL execute the candidate engine
 
-A ship-end composer (Tugboat, the installed `pipeline-ship-playbook` copy, or in-engine `pipeline ship`) SHALL invoke `factory-release prepare`, `factory-gate`, `pipeline release`, `pipeline release finish`, and any composer-invoked tag using the **candidate** engine after train is complete or resumed complete. The candidate engine SHALL be the control checkout at the Factory Reliability Gate (FRG)-bound `integrated_candidate.git_sha`, or an explicit candidate install of that same SHA. The composer SHALL NOT use the previous production-pin CLI (`$PIPELINE` / `~/.local/bin/pipeline` when that binary is the last promoted pin and its version or source SHA differs from the candidate) for those verbs.
+A ship-end composer (Tugboat, the installed `pipeline-ship-playbook` launcher, or in-engine `pipeline ship`) SHALL invoke `factory-release prepare`, `factory-gate`, `pipeline release`, and `pipeline release finish` using the **candidate** engine after train is complete or resumed complete. In-engine `pipeline ship` SHALL also run `ensureAnnotatedReleaseTag` on that candidate. Tugboat SHALL NOT invoke `git tag` or `gh release create`. The candidate engine SHALL be the control checkout at the Factory Reliability Gate (FRG)-bound `integrated_candidate.git_sha`, or an explicit candidate install of that same SHA. Identity SHALL be that exact 40-hex SHA. The composer SHALL NOT use the previous production-pin CLI (`$PIPELINE` / `~/.local/bin/pipeline` when that binary is the last promoted pin and its source SHA differs from the candidate) for those verbs.
 
 Train `--merge` and implementer / review harnesses for the train items themselves SHALL continue to execute the production pin. The composer SHALL fail closed before those ship-end verbs if it cannot resolve a candidate engine whose identity matches the SHA being released.
 
@@ -32,7 +32,7 @@ This requirement does not authorize `--skip-frg` as the ship path. It does not a
 - **WHEN** train is complete
 - **AND** the composer cannot resolve a control checkout or candidate install whose identity matches the FRG-bound SHA
 - **THEN** the composer SHALL fail the ship-end phase
-- **AND** it SHALL NOT fall back to the previous production-pin CLI for `factory-release prepare`, `pipeline release`, `release finish`, or tag
+- **AND** it SHALL NOT fall back to the previous production-pin CLI for `factory-release prepare`, `pipeline release`, `release finish`, or in-engine tag
 
 #### Scenario: Next identical pin-behind-candidate fault needs no new mole
 
@@ -42,45 +42,60 @@ This requirement does not authorize `--skip-frg` as the ship path. It does not a
 - **AND** that ship SHALL be able to open the release PR with the candidate `release.ts` in the running CLI
 - **AND** the fault SHALL NOT require a new path-local mole issue
 
-### Requirement: Installed ship playbook SHALL match the candidate composer or yield to the repo script
+### Requirement: Installed ship playbook SHALL be a thin launcher to repo Tugboat
 
-When an installed `pipeline-ship-playbook` (or equivalent documented install path) is used for ship-end, its content digest SHALL match `examples/supervisor/shell/tugboat.sh` at the candidate SHA being released. Alternatively, the composer SHALL exec the repo script from `REPO_DIR` (`$REPO_DIR/examples/supervisor/shell/tugboat.sh`) and SHALL NOT use a divergent installed playbook for those phases. Marker-only presence SHALL NOT count as parity.
+The documented installed `pipeline-ship-playbook` path SHALL be a thin launcher that execs `$REPO_DIR/examples/supervisor/shell/tugboat.sh`. It SHALL NOT retain a second ship-end compose implementation. Marker-only presence SHALL NOT count as parity.
+
+When the ship execs `$REPO_DIR/examples/supervisor/shell/tugboat.sh` directly and does not invoke a divergent installed playbook, that posture SHALL pass the playbook check. A selected installed playbook that is not that launcher SHALL fail.
 
 #### Scenario: Stale installed playbook fails when used for ship-end
 
 - **WHEN** `~/.local/bin/pipeline-ship-playbook` exists
-- **AND** its content digest differs from candidate `examples/supervisor/shell/tugboat.sh`
+- **AND** its body is not a thin launcher to `$REPO_DIR/examples/supervisor/shell/tugboat.sh`
 - **AND** the ship uses that installed playbook for FRG pack, release, finish, or tag
 - **THEN** the ship-end identity check SHALL fail
-- **AND** remediation SHALL name refresh from the candidate repo script or exec of `$REPO_DIR/examples/supervisor/shell/tugboat.sh`
+- **AND** remediation SHALL name refresh from candidate `examples/supervisor/shell/pipeline-ship-playbook.sh` or exec of `$REPO_DIR/examples/supervisor/shell/tugboat.sh`
 
 #### Scenario: Repo script from REPO_DIR is an accepted composer
 
 - **WHEN** the ship execs `$REPO_DIR/examples/supervisor/shell/tugboat.sh` as the composer
 - **AND** it does not invoke a divergent `~/.local/bin/pipeline-ship-playbook` for ship-end
-- **THEN** the playbook-digest check SHALL accept that posture
-- **AND** ship-end `$PIPELINE` (or equivalent) SHALL still be the candidate engine
+- **THEN** the playbook check SHALL accept that posture
+- **AND** ship-end CLI identity SHALL still be the candidate engine source SHA
+
+#### Scenario: Thin launcher playbook passes
+
+- **WHEN** the installed playbook execs `$REPO_DIR/examples/supervisor/shell/tugboat.sh`
+- **AND** that resolved `tugboat.sh` matches the candidate SHA tree
+- **THEN** the playbook check SHALL pass
+- **AND** ship-end CLI identity SHALL still be the candidate engine source SHA
 
 ### Requirement: Doctor or unit check SHALL fail on ship-end identity mismatch
 
 A unit test or `pipeline doctor` check SHALL fail when ship-end tools are used for release, FRG pack, or tag and either of the following is true:
 
-1. The invoked ship-end CLI `--version` or source identity does not match the candidate SHA (or the candidate package version bound to that SHA) being released.
-2. The installed playbook digest does not match candidate `examples/supervisor/shell/tugboat.sh` and the composer is not execing the repo script from `REPO_DIR`.
+1. The invoked ship-end CLI source SHA (`commit_sha` from `pipeline --version --json` or `git rev-parse HEAD` at the engine root) does not equal the FRG-bound candidate SHA. Package `--version` equality alone SHALL NOT pass.
+2. The selected installed playbook is not a thin launcher to `$REPO_DIR/examples/supervisor/shell/tugboat.sh` and the composer is not execing that repo script.
 
-Absence of those tools (hosts that do not run thin ship or in-engine ship-end) SHALL skip the check. The check SHALL be hermetic in unit tests (injected version strings, digests, and SHA). It SHALL NOT start a live ship, network call, or subprocess release.
+Absence of those tools (hosts that do not run thin ship or in-engine ship-end) SHALL skip the check. Doctor SHALL skip only when no installed Tugboat, no installed playbook, and no in-engine ship-end is in use. A stale installed playbook SHALL fail only when it is selected. The check SHALL be hermetic in unit tests (injected version strings, digests, and SHA). It SHALL NOT start a live ship, network call, or subprocess release.
 
 #### Scenario: Production-pin CLI used for release fails the check
 
-- **WHEN** the check evaluates a ship-end invocation whose CLI `--version` is `1.39.4`
-- **AND** the candidate SHA being released reports version `1.39.5` (or source SHA ≠ that CLI)
+- **WHEN** the check evaluates a ship-end invocation whose CLI source SHA is the `1.39.4` pin
+- **AND** the candidate SHA being released is `C` at package version `1.39.5`
 - **THEN** the check SHALL fail
 - **AND** remediation SHALL name invoking the candidate engine at the FRG-bound SHA
 
+#### Scenario: Matching version with mismatched SHA fails
+
+- **WHEN** the invoked CLI `--version` equals the candidate package version
+- **AND** the invoked CLI `commit_sha` does not equal the FRG-bound candidate SHA
+- **THEN** the check SHALL fail
+
 #### Scenario: Matching candidate identity passes
 
-- **WHEN** the ship-end CLI identity matches the candidate SHA being released
-- **AND** the playbook digest matches candidate `tugboat.sh` or the composer is the repo script from `REPO_DIR`
+- **WHEN** the ship-end CLI `commit_sha` equals the candidate SHA being released
+- **AND** the playbook is a thin launcher or the composer is the repo script from `REPO_DIR`
 - **THEN** the check SHALL pass
 
 #### Scenario: Unused ship-end tools skip
