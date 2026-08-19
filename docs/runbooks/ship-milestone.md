@@ -136,7 +136,7 @@ Issues on the milestone must be `pipeline:ready` before train dispatch.
 ### Phase sequence (fixed)
 
 1. `pipeline train --milestone vX.Y.Z --merge --json` (complete gate + resume)
-2. FRG pack: `pipeline factory-release prepare --request <abs.json> --json` (re-invoke until pack-done)
+2. FRG pack: uncredentialed `pipeline factory-release prepare --request <abs.json> --json`, then (when unsigned) `pipeline factory-gate --for X.Y.Z --from-run <loop>` in a separate credentialed child; re-invoke until pack-done
 3. `pipeline release X.Y.Z --no-edit` (**bare** version — leading `v` is invalid; **no** `--skip-frg`)
 4. Wait until open release PR checks are green (`gh pr checks --json name,state,bucket,link`). A first flake-eligible `test` fail requests `gh run rerun --failed` once, then waits again. Non-test product fails STOP. After merge, refresh installed Tugboat and `release-checks-green.py` from `examples/supervisor/shell/`.
 5. `pipeline release finish <pr>`
@@ -157,10 +157,18 @@ Hardened behaviors (preserve):
 
 Default Tugboat sequence is train → FRG pack → release (no `--skip-frg`) →
 finish → promote. The pack phase composes
-`pipeline factory-release prepare --request <abs.json> --json` and re-invokes
-the same request until pack-done (`awaiting_frg_attestation`, this version
-`latest.json` `pass: true`, or `complete` with an open release PR) or pack-fail.
-A failed or missing pack stops the ship **before** `pipeline release`.
+`pipeline factory-release prepare --request <abs.json> --json` in a child that
+has `PIPELINE_FRG_ATTESTATION_KEY` and `PIPELINE_FRG_ATTESTATION_KEY_FILE`
+**unset** (the parent supervisor env may keep the credential). When prepare
+returns `awaiting_frg_attestation` or unsigned eligible artifacts exist,
+Tugboat runs `pipeline factory-gate --for X.Y.Z --from-run <loop>` in a
+**separate** child that has the producer credential (inherit `KEY`, or present
+`KEY_FILE` contents as `KEY` in that child only). It does not pass
+`--observations`. Pack-done is this version's `latest.json` `pass: true` bound
+to the request candidate SHA (and `action_id` when recorded), or prepare
+`complete` with an open release PR. `awaiting_frg_attestation` alone is **not**
+pack-done. A failed or missing pack stops the ship **before** `pipeline release`.
+Tugboat does not write the key body into `state.json`.
 
 `--skip-frg` / `TUGBOAT_SKIP_FRG=1` is an operator escape only. It requires a
 non-empty `--skip-frg-reason` / `TUGBOAT_SKIP_FRG_REASON`. Missing reason fails

@@ -818,8 +818,9 @@ if [[ "$SKIP_FRG" == "1" ]]; then
   log "skip-frg escape reason=$SKIP_FRG_REASON"
 fi
 
-# B0: FRG pack (compose factory-release prepare). Skip only on logged escape.
-# Default path fail-closes here or at release if pack evidence is missing.
+# B0: FRG pack (uncredentialed prepare + out-of-process attestor). Skip only
+# on logged escape. Default path fail-closes here or at release if pack
+# evidence is missing. awaiting_frg_attestation alone is not pack-done.
 if [[ "$SKIP_FRG" != "1" ]]; then
   req="$RUN_DIR/factory-release-prepare-request.json"
   write_state "frg-pack" "running" "pipeline factory-release prepare --request $req --json"
@@ -833,7 +834,7 @@ if [[ "$SKIP_FRG" != "1" ]]; then
   latest_json="$REPO_DIR/.agent-pipeline/frg/$version/latest.json"
   for i in $(seq 1 "$FRG_WAIT_ATTEMPTS"); do
     set +e
-    "$PIPELINE" factory-release prepare --request "$req" --json >"$RUN_DIR/frg-pack.json" 2>"$RUN_DIR/frg-pack.err"
+    invoke_factory_release_prepare "$req" "$RUN_DIR/frg-pack.json" "$RUN_DIR/frg-pack.err"
     pack_ec=$?
     set -e
     cat "$RUN_DIR/frg-pack.err" >>"$LOG_FILE" 2>/dev/null || true
@@ -842,6 +843,35 @@ if [[ "$SKIP_FRG" != "1" ]]; then
       log "phase frg-pack: pack-done (attempt $i)"
       pack_done=1
       break
+    elif [[ "$pack_verdict" == "attest" ]]; then
+      loop_id=$(frg_pack_loop_run_id "$RUN_DIR/frg-pack.json")
+      if [[ -z "$loop_id" ]]; then
+        write_state "frg-pack" "failed" "FRG pack failed (missing_loop_run_id)"
+        log "FAIL: FRG pack failed (attempt $i) missing_loop_run_id"
+        exit 1
+      fi
+      log "phase frg-pack: attest factory-gate --for $version --from-run $loop_id (attempt $i)"
+      set +e
+      invoke_frg_pack_attestor "$version" "$loop_id" "$RUN_DIR/frg-attest.json" "$RUN_DIR/frg-attest.err"
+      attest_ec=$?
+      set -e
+      cat "$RUN_DIR/frg-attest.err" >>"$LOG_FILE" 2>/dev/null || true
+      if [[ "$attest_ec" -ne 0 ]]; then
+        attest_reason=$(tail -1 "$RUN_DIR/frg-attest.err" 2>/dev/null || true)
+        [[ -z "$attest_reason" ]] && attest_reason="attestor child"
+        write_state "frg-pack" "failed" "FRG pack failed ($attest_reason)"
+        log "FAIL: FRG pack failed (attempt $i) $attest_reason"
+        exit 1
+      fi
+      pack_verdict=$(classify_frg_pack_tick "$RUN_DIR/frg-pack.json" "$latest_json" "$pack_ec" "$req")
+      if [[ "$pack_verdict" == "done" ]]; then
+        log "phase frg-pack: pack-done after attest (attempt $i)"
+        pack_done=1
+        break
+      fi
+      write_state "frg-pack" "failed" "FRG pack failed (attestor did not write bound latest.json)"
+      log "FAIL: FRG pack failed (attempt $i) attestor did not write bound latest.json"
+      exit 1
     elif [[ "$pack_verdict" == "retry" ]]; then
       log "phase frg-pack: in_progress (attempt $i); waiting"
       sleep "$FRG_WAIT_SLEEP_S"

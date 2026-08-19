@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Secret-free FRG pack compose helpers for Tugboat / playbook (#1039).
-# Not a second pack runner. Callers invoke `pipeline factory-release prepare`.
+# Secret-free FRG pack compose helpers for Tugboat / playbook (#1039 / #1133).
+# Not a second pack runner. Callers invoke uncredentialed
+# `pipeline factory-release prepare`, then (when unsigned) credentialed
+# `pipeline factory-gate --from-run` in a separate child.
 
 # dest=$1 version=$2 repo_dir=$3. Tests inject TUGBOAT_CANDIDATE_SHA,
 # TUGBOAT_REPOSITORY, TUGBOAT_BASE_BRANCH, TUGBOAT_FRG_MANIFEST_PATH,
@@ -261,12 +263,15 @@ print(dest)
 PY
 }
 
-# Classify one factory-release prepare tick. Prints done | retry | fail.
+# Classify one factory-release prepare tick. Prints done | attest | retry | fail.
 # $1 prepare JSON path, $2 latest.json path, $3 prepare exit code,
 # $4 factory-release request JSON (version + candidate SHA binding).
 # pass: false is pack-fail before any success status. pass: true is
 # pack-done only when latest records the request target_version and
 # integrated_candidate.git_sha (and action_id when the artifact has it).
+# awaiting_frg_attestation without that bound pass: true is attest, not done.
+# in_progress with unsigned eligible artifacts (closed frg/unsigned digests)
+# is attest so factory-gate --from-run can sign; bare in_progress is retry.
 # complete is done only after an open release PR for the requested
 # version is verified (TUGBOAT_OPEN_RELEASE_PR injects that number;
 # else gh pr list).
@@ -411,6 +416,33 @@ def complete_has_open_release_pr(prep):
     except Exception:
         return False
 
+def closed_artifact_ref(ref):
+    if not isinstance(ref, dict):
+        return False
+    p = str(ref.get("path") or "").strip()
+    sha = str(ref.get("sha256") or "").strip().lower()
+    if not p or p == "/dev/null":
+        return False
+    if len(sha) != 64 or sha == "0" * 64:
+        return False
+    return all(c in "0123456789abcdef" for c in sha)
+
+def unsigned_eligible_payload(payload):
+    if not isinstance(payload, dict):
+        return False
+    return closed_artifact_ref(payload.get("observations")) and closed_artifact_ref(
+        payload.get("evidence_bundle")
+    )
+
+def has_unsigned_eligible_artifacts(obj):
+    if not isinstance(obj, dict):
+        return False
+    if unsigned_eligible_payload(obj.get("frg")):
+        return True
+    if unsigned_eligible_payload(obj.get("unsigned")):
+        return True
+    return False
+
 prep = load_maybe(prep_path)
 latest = load_maybe(latest_path)
 req = load_maybe(req_path)
@@ -423,8 +455,10 @@ if pass_v is False:
 if pass_v is True and pass_matches_request(latest, req):
     print("done")
     raise SystemExit(0)
-if status == "awaiting_frg_attestation":
-    print("done")
+if status == "awaiting_frg_attestation" or (
+    status == "in_progress" and has_unsigned_eligible_artifacts(prep)
+):
+    print("attest")
     raise SystemExit(0)
 if status == "complete":
     if complete_has_open_release_pr(prep):
@@ -440,4 +474,86 @@ if status in ("failed", "error", "missing") or status is None or ec != 0:
     raise SystemExit(0)
 print("fail")
 PY
+}
+
+# Invoke factory-release prepare with attestor env unset in THAT child.
+# Parent supervisor env is left unchanged (#1133).
+invoke_factory_release_prepare() {
+  local req=$1
+  local out=$2
+  local err=$3
+  env -u PIPELINE_FRG_ATTESTATION_KEY -u PIPELINE_FRG_ATTESTATION_KEY_FILE \
+    "$PIPELINE" factory-release prepare --request "$req" --json >"$out" 2>"$err"
+}
+
+# Bound pack loop_run_id from a prepare JSON result. Awaiting uses
+# frg.loop_run_id; in_progress uses loop_run_id. Empty when missing.
+# Do not pick an unbound newest loop.
+frg_pack_loop_run_id() {
+  python3 - "$1" <<'PY'
+import json, os, sys
+
+path = sys.argv[1]
+if not path or not os.path.isfile(path) or os.path.getsize(path) == 0:
+    print("")
+    raise SystemExit(0)
+text = open(path, encoding="utf-8").read().strip()
+obj = None
+try:
+    obj = json.loads(text)
+except Exception:
+    i = text.rfind("{")
+    if i >= 0:
+        try:
+            obj = json.loads(text[i:])
+        except Exception:
+            obj = None
+if not isinstance(obj, dict):
+    print("")
+    raise SystemExit(0)
+status = obj.get("status")
+loop = ""
+if status == "awaiting_frg_attestation":
+    frg = obj.get("frg")
+    if isinstance(frg, dict):
+        loop = str(frg.get("loop_run_id") or "").strip()
+elif status == "in_progress":
+    loop = str(obj.get("loop_run_id") or "").strip()
+print(loop)
+PY
+}
+
+# factory-gate --from-run in a child other than prepare. Inherit KEY;
+# when only KEY_FILE is set, present the file as KEY in that child.
+# Unset KEY_FILE in the attestor child. Do not pass --observations.
+# Named stderr reason + non-zero when credential or loop id is missing.
+invoke_frg_pack_attestor() {
+  local ver=$1
+  local loop=$2
+  local out=$3
+  local err=$4
+  if [[ -z "$loop" ]]; then
+    echo "missing_loop_run_id" >"$err"
+    return 1
+  fi
+  if [[ -n "${PIPELINE_FRG_ATTESTATION_KEY:-}" ]]; then
+    env -u PIPELINE_FRG_ATTESTATION_KEY_FILE \
+      "$PIPELINE" factory-gate --for "$ver" --from-run "$loop" >"$out" 2>"$err"
+    return $?
+  fi
+  if [[ -z "${PIPELINE_FRG_ATTESTATION_KEY_FILE:-}" ]]; then
+    echo "missing_attestor_credential" >"$err"
+    return 1
+  fi
+  if [[ ! -r "$PIPELINE_FRG_ATTESTATION_KEY_FILE" ]]; then
+    echo "unreadable_attestor_key_file" >"$err"
+    return 1
+  fi
+  if [[ ! -s "$PIPELINE_FRG_ATTESTATION_KEY_FILE" ]]; then
+    echo "missing_attestor_credential" >"$err"
+    return 1
+  fi
+  PIPELINE_FRG_ATTESTATION_KEY="$(cat -- "$PIPELINE_FRG_ATTESTATION_KEY_FILE")" \
+    env -u PIPELINE_FRG_ATTESTATION_KEY_FILE \
+    "$PIPELINE" factory-gate --for "$ver" --from-run "$loop" >"$out" 2>"$err"
 }
