@@ -44,7 +44,7 @@ This requirement does not authorize `--skip-frg` as the ship path. It does not a
 
 ### Requirement: Installed ship playbook SHALL be a thin launcher to repo Tugboat
 
-The documented installed `pipeline-ship-playbook` path SHALL be a thin launcher that execs `$REPO_DIR/examples/supervisor/shell/tugboat.sh`. It SHALL NOT retain a second ship-end compose implementation. Marker-only presence SHALL NOT count as parity.
+The documented installed `pipeline-ship-playbook` path SHALL be a thin launcher that execs `$REPO_DIR/examples/supervisor/shell/tugboat.sh`. A thin-launcher body SHALL contain only an optional shebang, comment lines, blank lines, and exactly one executable statement: `exec "$REPO_DIR/examples/supervisor/shell/tugboat.sh" "$@"`. Any other shell statement — including a production-pin `"$PIPELINE" release` or other ship-end verb before or after that exec — SHALL classify the body as noncompliant, not as a thin launcher. It SHALL NOT retain a second ship-end compose implementation. Marker-only presence SHALL NOT count as parity.
 
 When the ship execs `$REPO_DIR/examples/supervisor/shell/tugboat.sh` directly and does not invoke a divergent installed playbook, that posture SHALL pass the playbook check. A selected installed playbook that is not that launcher SHALL fail. An installed playbook body that is neither the thin launcher nor a recognized stale compose SHALL be classified as noncompliant, not unused. Unused SHALL mean absence of the playbook or an explicit non-selection (for example Tugboat is the selected composer).
 
@@ -78,6 +78,13 @@ When the ship execs `$REPO_DIR/examples/supervisor/shell/tugboat.sh` directly an
 - **AND** that installed playbook is selected for ship-end
 - **THEN** the ship-end identity check SHALL fail
 - **AND** the body SHALL NOT be classified as unused
+
+#### Scenario: Embedded Tugboat exec does not certify a stale playbook
+
+- **WHEN** an installed playbook body contains `"$PIPELINE" release 1.39.5`
+- **AND** the same body later contains `exec "$REPO_DIR/examples/supervisor/shell/tugboat.sh" "$@"`
+- **THEN** the body SHALL be classified as noncompliant
+- **AND** it SHALL NOT be classified as a thin launcher
 
 ### Requirement: Doctor or unit check SHALL fail on ship-end identity mismatch
 

@@ -14,9 +14,9 @@ export const EXACT_GIT_SHA_RE = /^[0-9a-f]{40}$/;
 /** Known stale full-compose playbook digest prefix from the 1.39.4 pin (hex). */
 export const STALE_PLAYBOOK_DIGEST_PREFIX = "2afe3c92";
 
-/** Thin launcher: exec repo Tugboat with the caller's argv. */
+/** Approved executable statement of a thin launcher (one line; not whole-file). */
 export const PLAYBOOK_THIN_LAUNCHER_RE =
-  /^\s*exec\s+"\$REPO_DIR\/examples\/supervisor\/shell\/tugboat\.sh"\s+"\$@"\s*$/m;
+  /^\s*exec\s+"\$REPO_DIR\/examples\/supervisor\/shell\/tugboat\.sh"\s+"\$@"\s*$/;
 
 /** Recognizer for a leftover full playbook compose (not a launcher). */
 const FULL_PLAYBOOK_COMPOSE_RE =
@@ -72,9 +72,21 @@ export function formatPipelineVersionJson(
   }) + "\n";
 }
 
-/** True when the playbook body execs `$REPO_DIR/examples/supervisor/shell/tugboat.sh`. */
+/**
+ * True when the whole playbook body is a thin launcher: shebang, comments,
+ * and blanks only, plus exactly one executable statement — the Tugboat exec.
+ * A matching exec line inside other shell does not count.
+ */
 export function isThinPlaybookLauncher(body: string): boolean {
-  return PLAYBOOK_THIN_LAUNCHER_RE.test(body);
+  let sawExec = false;
+  for (const raw of body.split(/\r\n|\n|\r/)) {
+    const line = raw.trim();
+    if (line === "" || line.startsWith("#")) continue;
+    if (!PLAYBOOK_THIN_LAUNCHER_RE.test(line)) return false;
+    if (sawExec) return false;
+    sawExec = true;
+  }
+  return sawExec;
 }
 
 /**

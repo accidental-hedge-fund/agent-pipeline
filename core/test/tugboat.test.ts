@@ -11,6 +11,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { isThinPlaybookLauncher } from "../scripts/ship-end-identity.ts";
 import {
   contentDigest,
   evaluateOption1PackParity,
@@ -3149,14 +3150,10 @@ test("playbook is a thin launcher to repo tugboat.sh (#1151)", () => {
     "examples/supervisor/shell/pipeline-ship-playbook.sh",
   );
   const body = fs.readFileSync(playbook, "utf8");
-  const executable = body
-    .split("\n")
-    .filter((line) => !/^\s*#/.test(line))
-    .join("\n");
-  assert.match(body, /exec "\$REPO_DIR\/examples\/supervisor\/shell\/tugboat\.sh" "\$@"/);
-  assert.doesNotMatch(executable, /factory-release prepare/);
-  assert.doesNotMatch(executable, /invoke_factory_release_prepare/);
-  assert.doesNotMatch(executable, /"\$PIPELINE" release/);
+  assert.equal(isThinPlaybookLauncher(body), true);
+  assert.doesNotMatch(body, /factory-release prepare/);
+  assert.doesNotMatch(body, /invoke_factory_release_prepare/);
+  assert.doesNotMatch(body, /"\$PIPELINE" release/);
 });
 
 test("tugboat after train-complete records candidate argv not pin argv (#1151)", () => {

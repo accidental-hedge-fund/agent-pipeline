@@ -16,7 +16,7 @@ const C = "c".repeat(40);
 const PIN = "a".repeat(40);
 const LAUNCHER = [
   "#!/usr/bin/env bash",
-  "set -euo pipefail",
+  "# thin launcher",
   'exec "$REPO_DIR/examples/supervisor/shell/tugboat.sh" "$@"',
   "",
 ].join("\n");
@@ -65,6 +65,30 @@ test("thin launcher classifier requires exec of repo tugboat.sh", () => {
   );
   assert.equal(classifyPlaybookBody(STALE_FULL), "playbook-stale");
   assert.equal(classifyPlaybookBody(null), "unused");
+});
+
+test("thin launcher classifier rejects pre-exec pinned release plus tugboat exec", () => {
+  const pinnedThenExec = [
+    "#!/usr/bin/env bash",
+    '"$PIPELINE" release 1.39.5',
+    'exec "$REPO_DIR/examples/supervisor/shell/tugboat.sh" "$@"',
+    "",
+  ].join("\n");
+  assert.equal(isThinPlaybookLauncher(pinnedThenExec), false);
+  assert.equal(classifyPlaybookBody(pinnedThenExec), "playbook-stale");
+});
+
+test("thin launcher classifier rejects exec embedded in divergent shell", () => {
+  const embedded = [
+    "#!/usr/bin/env bash",
+    "set -euo pipefail",
+    '~/.local/bin/pipeline ship --milestone "$1"',
+    'exec "$REPO_DIR/examples/supervisor/shell/tugboat.sh" "$@"',
+    "echo leftover",
+    "",
+  ].join("\n");
+  assert.equal(isThinPlaybookLauncher(embedded), false);
+  assert.equal(classifyPlaybookBody(embedded), "playbook-stale");
 });
 
 test("classifyPlaybookBody: unused is absence only; unrecognized installed bodies are stale", () => {

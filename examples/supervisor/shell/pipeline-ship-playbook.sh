@@ -13,16 +13,4 @@
 # on process-start $PIPELINE. Tugboat does not invoke git tag or gh release create.
 #
 # REPO_DIR must already be set (existing playbook contract).
-set -euo pipefail
-
-if [[ -z "${REPO_DIR:-}" ]]; then
-  echo "FAIL: REPO_DIR is required so the playbook can exec repo Tugboat" >&2
-  exit 1
-fi
-
-if [[ ! -f "$REPO_DIR/examples/supervisor/shell/tugboat.sh" ]]; then
-  echo "FAIL: missing $REPO_DIR/examples/supervisor/shell/tugboat.sh" >&2
-  exit 1
-fi
-
 exec "$REPO_DIR/examples/supervisor/shell/tugboat.sh" "$@"
