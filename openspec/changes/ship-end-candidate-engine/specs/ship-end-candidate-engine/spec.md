@@ -44,7 +44,7 @@ This requirement does not authorize `--skip-frg` as the ship path. It does not a
 
 ### Requirement: Installed ship playbook SHALL be a thin launcher to repo Tugboat
 
-The documented installed `pipeline-ship-playbook` path SHALL be a thin launcher that execs `$REPO_DIR/examples/supervisor/shell/tugboat.sh`. A thin-launcher body SHALL contain only an optional shebang, comment lines, blank lines, and exactly one executable statement: `exec "$REPO_DIR/examples/supervisor/shell/tugboat.sh" "$@"`. Any other shell statement — including a production-pin `"$PIPELINE" release` or other ship-end verb before or after that exec — SHALL classify the body as noncompliant, not as a thin launcher. It SHALL NOT retain a second ship-end compose implementation. Marker-only presence SHALL NOT count as parity.
+The documented installed `pipeline-ship-playbook` path SHALL be a thin launcher that execs `$REPO_DIR/examples/supervisor/shell/tugboat.sh`. A thin-launcher body SHALL contain only an optional first-physical-line shebang, later comment lines, blank lines, and exactly one executable statement: `exec "$REPO_DIR/examples/supervisor/shell/tugboat.sh" "$@"`. The optional shebang, when present, SHALL be the first physical line and SHALL be one of `#!/usr/bin/env bash`, `#!/bin/bash`, or `#!/usr/bin/bash`, with no interpreter arguments. A first-line shebang that uses `env -S`, `bash -c`, or any other interpreter or argument list SHALL classify the body as noncompliant, not as a thin launcher. A later `#` line is a comment and SHALL NOT count as a shebang. Any other shell statement — including a production-pin `"$PIPELINE" release` or other ship-end verb before or after that exec — SHALL classify the body as noncompliant, not as a thin launcher. It SHALL NOT retain a second ship-end compose implementation. Marker-only presence SHALL NOT count as parity.
 
 When the ship execs `$REPO_DIR/examples/supervisor/shell/tugboat.sh` directly and does not invoke a divergent installed playbook, that posture SHALL pass the playbook check. A selected installed playbook that is not that launcher SHALL fail. An installed playbook body that is neither the thin launcher nor a recognized stale compose SHALL be classified as noncompliant, not unused. Unused SHALL mean absence of the playbook or an explicit non-selection (for example Tugboat is the selected composer).
 
@@ -82,6 +82,13 @@ When the ship execs `$REPO_DIR/examples/supervisor/shell/tugboat.sh` directly an
 #### Scenario: Embedded Tugboat exec does not certify a stale playbook
 
 - **WHEN** an installed playbook body contains `"$PIPELINE" release 1.39.5`
+- **AND** the same body later contains `exec "$REPO_DIR/examples/supervisor/shell/tugboat.sh" "$@"`
+- **THEN** the body SHALL be classified as noncompliant
+- **AND** it SHALL NOT be classified as a thin launcher
+
+#### Scenario: Executable shebang preamble does not certify a thin launcher
+
+- **WHEN** an installed playbook body's first physical line is `#!/usr/bin/env -S bash -c '"$PIPELINE" release 1.39.5; exec bash "$0"'`
 - **AND** the same body later contains `exec "$REPO_DIR/examples/supervisor/shell/tugboat.sh" "$@"`
 - **THEN** the body SHALL be classified as noncompliant
 - **AND** it SHALL NOT be classified as a thin launcher

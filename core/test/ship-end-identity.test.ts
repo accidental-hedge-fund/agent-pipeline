@@ -91,6 +91,23 @@ test("thin launcher classifier rejects exec embedded in divergent shell", () => 
   assert.equal(classifyPlaybookBody(embedded), "playbook-stale");
 });
 
+test("thin launcher classifier rejects bash -c shebang preamble plus tugboat exec", () => {
+  const envDashS = [
+    `#!/usr/bin/env -S bash -c '"$PIPELINE" release 1.39.5; exec bash "$0"'`,
+    'exec "$REPO_DIR/examples/supervisor/shell/tugboat.sh" "$@"',
+    "",
+  ].join("\n");
+  const bashDashC = [
+    `#!/bin/bash -c '"$PIPELINE" release 1.39.5; exec bash "$0"'`,
+    'exec "$REPO_DIR/examples/supervisor/shell/tugboat.sh" "$@"',
+    "",
+  ].join("\n");
+  assert.equal(isThinPlaybookLauncher(envDashS), false);
+  assert.equal(classifyPlaybookBody(envDashS), "playbook-stale");
+  assert.equal(isThinPlaybookLauncher(bashDashC), false);
+  assert.equal(classifyPlaybookBody(bashDashC), "playbook-stale");
+});
+
 test("classifyPlaybookBody: unused is absence only; unrecognized installed bodies are stale", () => {
   const divergent = [
     "#!/bin/zsh",

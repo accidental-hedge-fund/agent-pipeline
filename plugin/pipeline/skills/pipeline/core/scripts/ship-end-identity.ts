@@ -18,6 +18,14 @@ export const STALE_PLAYBOOK_DIGEST_PREFIX = "2afe3c92";
 export const PLAYBOOK_THIN_LAUNCHER_RE =
   /^\s*exec\s+"\$REPO_DIR\/examples\/supervisor\/shell\/tugboat\.sh"\s+"\$@"\s*$/;
 
+/**
+ * Approved first-physical-line shebang: the generated launcher (`env bash`)
+ * or an argument-free bash interpreter. `env -S` and other interpreter
+ * arguments (including `bash -c`) are not comments — the kernel executes them.
+ */
+export const PLAYBOOK_THIN_LAUNCHER_SHEBANG_RE =
+  /^#!\s*(?:\/usr\/bin\/env\s+bash|\/bin\/bash|\/usr\/bin\/bash)\s*$/;
+
 /** Recognizer for a leftover full playbook compose (not a launcher). */
 const FULL_PLAYBOOK_COMPOSE_RE =
   /factory-release prepare|"\$PIPELINE"\s+release\s+|pipeline-ship-playbook\.sh --milestone|HOST="\$\{ENGINE_PROMOTE_HOST:-/;
@@ -73,13 +81,24 @@ export function formatPipelineVersionJson(
 }
 
 /**
- * True when the whole playbook body is a thin launcher: shebang, comments,
- * and blanks only, plus exactly one executable statement — the Tugboat exec.
- * A matching exec line inside other shell does not count.
+ * True when the whole playbook body is a thin launcher: optional first-line
+ * shebang from PLAYBOOK_THIN_LAUNCHER_SHEBANG_RE, later comments, and blanks
+ * only, plus exactly one executable statement — the Tugboat exec.
+ * A matching exec line inside other shell does not count. A first-line
+ * shebang with interpreter arguments is executable, not a comment.
  */
 export function isThinPlaybookLauncher(body: string): boolean {
   let sawExec = false;
+  let firstPhysical = true;
   for (const raw of body.split(/\r\n|\n|\r/)) {
+    if (firstPhysical) {
+      firstPhysical = false;
+      // Kernel shebang is the first two bytes of the file (`#!`).
+      if (raw.startsWith("#!")) {
+        if (!PLAYBOOK_THIN_LAUNCHER_SHEBANG_RE.test(raw)) return false;
+        continue;
+      }
+    }
     const line = raw.trim();
     if (line === "" || line.startsWith("#")) continue;
     if (!PLAYBOOK_THIN_LAUNCHER_RE.test(line)) return false;
