@@ -25,6 +25,16 @@ Shared pack helpers used by Tugboat and the playbook SHALL stay in sync for requ
 - **THEN** the playbook SHALL invoke `pipeline factory-gate --for 1.39.0 --from-run L` in a child other than prepare
 - **AND** that child SHALL have the producer credential
 
+#### Scenario: Playbook in-progress unsigned eligible artifacts are attested
+
+- **WHEN** prepare returns `status: "in_progress"` for version `1.39.0`
+- **AND** the prepare result includes unsigned eligible artifacts
+- **AND** the bound pack `loop_run_id` is `L`
+- **AND** no matching `latest.json` `pass: true` exists
+- **THEN** the playbook SHALL invoke `pipeline factory-gate --for 1.39.0 --from-run L` in a child other than prepare
+- **AND** that child SHALL have the producer credential
+- **AND** the classify helper SHALL NOT report wait-only retry for that tick
+
 #### Scenario: Playbook helpers stay in sync with Tugboat
 
 - **WHEN** an automated check compares Tugboat and `frg-pack-helpers.sh` pack helpers

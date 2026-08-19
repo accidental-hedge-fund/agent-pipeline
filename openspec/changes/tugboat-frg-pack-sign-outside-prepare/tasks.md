@@ -16,11 +16,13 @@
 - [x] 3.1 Change `classify_frg_pack_tick` so `awaiting_frg_attestation` without matching `latest.json` `pass: true` is not `done` (use `attest` or equivalent). Keep `pass: false` as fail-before-success. Keep complete-without-open-PR as fail
 - [x] 3.2 After the attestor child exits, re-read `latest.json` and require bound `pass: true` (version + candidate SHA, and `action_id` when recorded) before pack-done
 - [x] 3.3 Keep helper text in sync between `tugboat.sh` and `frg-pack-helpers.sh` for `write_factory_release_request`, `classify_frg_pack_tick`, and the new attestor compose
+- [x] 3.4 Change `classify_frg_pack_tick` so `in_progress` with unsigned eligible artifacts in the prepare result is `attest` (not wait-only `retry`). Bare `in_progress` stays `retry`
 
 ## 4. Tests
 
 - [x] 4.1 Regression: fail if prepare is invoked with `KEY` or `KEY_FILE` set in that child. Prove the test fails against current Tugboat (inherited env)
 - [x] 4.2 Regression: `classify_frg_pack_tick` must not print `done` for `awaiting_frg_attestation` when `latest.json` is missing or not bound `pass: true`. Prove it fails against the current `done` branch
+- [x] 4.6 Regression: `in_progress` plus closed unsigned artifact identities/digests prints `attest`. Bare `in_progress` still prints `retry`
 - [x] 4.3 Composer test: pack phase composes `factory-gate --from-run` and still does not merge/tag/promote/install, invent `pass: true`, or write the key body into `state.json`. Flip the old assertion that forbade all attestor markers
 - [x] 4.4 Sync test: Tugboat and `frg-pack-helpers.sh` pack helpers (including attestor compose) still match
 - [x] 4.5 Tests inject I/O or inspect source/fixtures. They start no live pack, network, git, or subprocess ship

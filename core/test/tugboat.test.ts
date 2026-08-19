@@ -2746,6 +2746,46 @@ test("classify_frg_pack_tick: done / retry / fail without live pack", () => {
       "done",
     );
     assert.equal(run({ status: "in_progress" }, null, 0), "retry");
+    const unsignedFrg = {
+      pack_id: "factory-gate-v1",
+      loop_run_id: "loop-L",
+      observations: { path: "/tmp/obs.json", sha256: "1".repeat(64) },
+      evidence_bundle: { path: "/tmp/ev.json", sha256: "2".repeat(64) },
+    };
+    assert.equal(
+      run(
+        { status: "in_progress", loop_run_id: "loop-L", frg: unsignedFrg },
+        null,
+        0,
+      ),
+      "attest",
+      "in_progress + closed unsigned frg must attest, not sleep as retry",
+    );
+    assert.equal(
+      run(
+        { status: "in_progress", loop_run_id: "loop-L", unsigned: unsignedFrg },
+        null,
+        0,
+      ),
+      "attest",
+    );
+    assert.equal(
+      run(
+        {
+          status: "in_progress",
+          loop_run_id: "loop-L",
+          frg: {
+            loop_run_id: "loop-L",
+            observations: { path: "/dev/null", sha256: "0".repeat(64) },
+            evidence_bundle: { path: "/dev/null", sha256: "0".repeat(64) },
+          },
+        },
+        null,
+        0,
+      ),
+      "retry",
+      "refused placeholder frg on in_progress is not unsigned-eligible",
+    );
     assert.equal(run({ status: "complete" }, null, 0), "fail");
     assert.equal(run(completePrep, null, 0), "fail");
     assert.equal(
@@ -2980,6 +3020,46 @@ test("attestor child fails closed without producer credential (#1133)", () => {
   }
 });
 
+test("classify_frg_pack_tick: in_progress unsigned eligible artifacts are attest (#1133)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-tick-inprog-"));
+  try {
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        `. ${JSON.stringify(frgHelpers)}`,
+        'classify_frg_pack_tick "$1" "$2" "$3" "${4:-}"',
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    const prepPath = path.join(dir, "prep.json");
+    const latestPath = path.join(dir, "latest.json");
+    fs.writeFileSync(
+      prepPath,
+      JSON.stringify({
+        status: "in_progress",
+        loop_run_id: "loop-from-in-progress",
+        frg: {
+          pack_id: "factory-gate-v1",
+          loop_run_id: "loop-from-in-progress",
+          observations: { path: "/work/unsigned/observations.json", sha256: "a".repeat(64) },
+          evidence_bundle: { path: "/work/unsigned/evidence-bundle.json", sha256: "b".repeat(64) },
+        },
+      }),
+    );
+    const r = spawnSync("bash", [runner, prepPath, latestPath, "0"], {
+      encoding: "utf8",
+    });
+    assert.equal(r.status, 0, `classifier exited ${r.status}: ${r.stderr}`);
+    assert.equal(r.stdout.trim(), "attest");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("frg_pack_loop_run_id reads awaiting frg.loop_run_id (#1133)", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-loop-id-"));
   try {
@@ -3012,6 +3092,43 @@ test("frg_pack_loop_run_id reads awaiting frg.loop_run_id (#1133)", () => {
     const r = spawnSync("bash", [runner], { encoding: "utf8" });
     assert.equal(r.status, 0, `loop-id helper exited ${r.status}: ${r.stderr}`);
     assert.equal(r.stdout.trim(), "loop-from-frg");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("frg_pack_loop_run_id reads in_progress loop_run_id (#1133)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-loop-id-inprog-"));
+  try {
+    const fn = extractNamedFn(
+      fs.readFileSync(frgHelpers, "utf8"),
+      "frg_pack_loop_run_id",
+      "frg-pack-helpers.sh",
+    );
+    const prep = path.join(dir, "prep.json");
+    fs.writeFileSync(
+      prep,
+      JSON.stringify({
+        status: "in_progress",
+        loop_run_id: "loop-from-in-progress",
+        frg: { loop_run_id: "should-not-win" },
+      }),
+    );
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        fn,
+        `frg_pack_loop_run_id ${JSON.stringify(prep)}`,
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    const r = spawnSync("bash", [runner], { encoding: "utf8" });
+    assert.equal(r.status, 0, `loop-id helper exited ${r.status}: ${r.stderr}`);
+    assert.equal(r.stdout.trim(), "loop-from-in-progress");
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

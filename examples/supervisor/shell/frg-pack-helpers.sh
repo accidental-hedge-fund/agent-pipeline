@@ -270,6 +270,8 @@ PY
 # pack-done only when latest records the request target_version and
 # integrated_candidate.git_sha (and action_id when the artifact has it).
 # awaiting_frg_attestation without that bound pass: true is attest, not done.
+# in_progress with unsigned eligible artifacts (closed frg/unsigned digests)
+# is attest so factory-gate --from-run can sign; bare in_progress is retry.
 # complete is done only after an open release PR for the requested
 # version is verified (TUGBOAT_OPEN_RELEASE_PR injects that number;
 # else gh pr list).
@@ -414,6 +416,33 @@ def complete_has_open_release_pr(prep):
     except Exception:
         return False
 
+def closed_artifact_ref(ref):
+    if not isinstance(ref, dict):
+        return False
+    p = str(ref.get("path") or "").strip()
+    sha = str(ref.get("sha256") or "").strip().lower()
+    if not p or p == "/dev/null":
+        return False
+    if len(sha) != 64 or sha == "0" * 64:
+        return False
+    return all(c in "0123456789abcdef" for c in sha)
+
+def unsigned_eligible_payload(payload):
+    if not isinstance(payload, dict):
+        return False
+    return closed_artifact_ref(payload.get("observations")) and closed_artifact_ref(
+        payload.get("evidence_bundle")
+    )
+
+def has_unsigned_eligible_artifacts(obj):
+    if not isinstance(obj, dict):
+        return False
+    if unsigned_eligible_payload(obj.get("frg")):
+        return True
+    if unsigned_eligible_payload(obj.get("unsigned")):
+        return True
+    return False
+
 prep = load_maybe(prep_path)
 latest = load_maybe(latest_path)
 req = load_maybe(req_path)
@@ -426,7 +455,9 @@ if pass_v is False:
 if pass_v is True and pass_matches_request(latest, req):
     print("done")
     raise SystemExit(0)
-if status == "awaiting_frg_attestation":
+if status == "awaiting_frg_attestation" or (
+    status == "in_progress" and has_unsigned_eligible_artifacts(prep)
+):
     print("attest")
     raise SystemExit(0)
 if status == "complete":

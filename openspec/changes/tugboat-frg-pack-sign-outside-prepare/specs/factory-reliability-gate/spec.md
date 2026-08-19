@@ -26,6 +26,15 @@ This requirement does not change prepare's refuse of attestor env. It does not a
 - **AND** that process SHALL have the producer credential
 - **AND** that process SHALL NOT pass `--observations`
 
+#### Scenario: In-progress unsigned eligible artifacts still get an attestor child
+
+- **WHEN** prepare returns `status: "in_progress"` with unsigned eligible artifacts for bound loop `L` and version `X.Y.Z`
+- **AND** no bound `latest.json` `pass: true` exists
+- **THEN** the composer SHALL invoke `pipeline factory-gate --for X.Y.Z --from-run L` in a process other than prepare
+- **AND** that process SHALL have the producer credential
+- **AND** that process SHALL NOT pass `--observations`
+- **AND** the composer SHALL NOT wait that tick as status-only retry
+
 #### Scenario: Next identical supervisor env fault needs no new mole
 
 - **WHEN** a later ship parent environment again sources `PIPELINE_FRG_ATTESTATION_KEY_FILE`

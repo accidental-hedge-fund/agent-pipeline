@@ -132,8 +132,20 @@ Pack-done SHALL mean `.agent-pipeline/frg/<X.Y.Z>/latest.json` has `pass: true` 
 #### Scenario: In-progress pack is re-invoked and does not release
 
 - **WHEN** prepare returns `status: "in_progress"` within the wait budget
+- **AND** the prepare result does not include unsigned eligible artifacts
 - **THEN** Tugboat SHALL re-invoke the same request
 - **AND** it SHALL NOT invoke `pipeline release` until pack-done
+
+#### Scenario: In-progress unsigned eligible artifacts are attested
+
+- **WHEN** prepare returns `status: "in_progress"` for version `1.39.0`
+- **AND** the prepare result includes unsigned eligible artifacts
+- **AND** the bound pack `loop_run_id` is `L`
+- **AND** no matching `latest.json` `pass: true` exists
+- **THEN** Tugboat SHALL invoke `pipeline factory-gate --for 1.39.0 --from-run L` in a child process other than prepare
+- **AND** that child SHALL have the producer credential
+- **AND** that child SHALL NOT pass `--observations`
+- **AND** Tugboat SHALL NOT treat that tick as wait-only retry
 
 #### Scenario: Failed pack stops the ship before release
 
@@ -180,6 +192,7 @@ Tugboat pack-phase isolation (uncredentialed prepare child, credentialed `factor
 
 - prepare is invoked with `PIPELINE_FRG_ATTESTATION_KEY` or `PIPELINE_FRG_ATTESTATION_KEY_FILE` set in that child,
 - pack-done is declared for `awaiting_frg_attestation` without a matching `pass: true` `latest.json`,
+- `in_progress` with unsigned eligible artifacts is classified as wait-only retry,
 - or the pack phase writes the key body into `state.json`.
 
 #### Scenario: Regression fails if prepare inherits KEY_FILE
@@ -192,3 +205,10 @@ Tugboat pack-phase isolation (uncredentialed prepare child, credentialed `factor
 - **WHEN** the automated pack-isolation checks classify a tick whose prepare status is `awaiting_frg_attestation` and whose `latest.json` is missing or not bound `pass: true`
 - **THEN** the checks SHALL NOT accept pack-done
 - **AND** the checks SHALL fail if the classifier still prints `done` for that tick
+
+#### Scenario: Regression fails if in-progress unsigned artifacts stay retry
+
+- **WHEN** the automated pack-isolation checks classify a tick whose prepare status is `in_progress` and whose prepare result includes unsigned eligible artifacts
+- **AND** `latest.json` is missing or is not bound `pass: true`
+- **THEN** the checks SHALL print `attest`
+- **AND** the checks SHALL fail if the classifier still prints `retry` for that tick

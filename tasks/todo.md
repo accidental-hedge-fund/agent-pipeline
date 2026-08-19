@@ -14,7 +14,7 @@
 1. Prepare child: `env -u PIPELINE_FRG_ATTESTATION_KEY -u PIPELINE_FRG_ATTESTATION_KEY_FILE`. Parent keeps supervisor env.
 2. Attestor child: only `PIPELINE_FRG_ATTESTATION_KEY`. Read `KEY_FILE` in memory when `KEY` is absent. Unset `KEY_FILE` in that child. Never write the key body to `state.json`, request JSON, or logs.
 3. Classifier: `awaiting_frg_attestation` without bound `latest.json` `pass: true` prints `attest`, not `done`.
-4. `loop_run_id` comes only from the parsed prepare result. Missing or empty id is pack-fail. Do not attest `in_progress`. Do not pick an unbound newest loop.
+4. `loop_run_id` comes only from the parsed prepare result. Missing or empty id is pack-fail. Bare `in_progress` is retry. `in_progress` with unsigned eligible artifacts is attest. Do not pick an unbound newest loop.
 5. After attestor, re-read `latest.json`. Pack-done requires bound `pass: true` (or `complete` + verified open matching release PR). Attestor success without a valid bound artifact is pack-fail.
 6. Tests are a runnable PATH stub of `pipeline`, not source-only greps. Source sync stays as a second check.
 7. Playbook source is `examples/supervisor/shell/pipeline-ship-playbook.sh` plus sibling `frg-pack-helpers.sh`. Install is a copy to `~/.local/bin`, not a generated mirror.
