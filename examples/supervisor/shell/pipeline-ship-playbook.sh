@@ -8,10 +8,9 @@
 # This file must not retain a second ship-end compose. Train, FRG pack,
 # release, finish, and promote live in:
 #   $REPO_DIR/examples/supervisor/shell/tugboat.sh
-# After train-complete, Tugboat invokes factory-release prepare, factory-gate,
-# pipeline release, and release finish on the candidate engine. Train and
-# engine-promote stay on process-start $PIPELINE. Tugboat does not invoke
-# git tag or gh release create.
+# After train-complete, Tugboat invokes FRG pack, factory-gate, release,
+# and release finish on the candidate engine. Train and engine-promote stay
+# on process-start $PIPELINE. Tugboat does not invoke git tag or gh release create.
 #
 # REPO_DIR must already be set (existing playbook contract).
 set -euo pipefail

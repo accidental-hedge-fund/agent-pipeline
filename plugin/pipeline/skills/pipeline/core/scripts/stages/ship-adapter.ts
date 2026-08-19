@@ -4,9 +4,28 @@
 // does not add another scheduler, retry model, merge implementation, or FRG
 // evidence producer. Each converge operation first observes external truth.
 
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
+import { statSync } from "node:fs";
 import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { resolveEngineCommitSha } from "../engine-attribution.ts";
+import {
+  parseExactGitSha,
+} from "../ship-end-identity.ts";
+import {
+  assertShipEndLeafArgv,
+  attestorChildEnv,
+  pinShaDiffersFromCandidate,
+  resolveCandidateEngine,
+  shipEndCliPrefix,
+  shipEndLeafArgv,
+  uncredentialedPrepareEnv,
+  type CandidateEngine,
+  type CandidateEngineResult,
+  type ResolveCandidateEngineDeps,
+} from "../ship-end-candidate.ts";
 import {
   validateFrgEvidenceFileForTag,
   type FrgEvidence,
@@ -98,6 +117,11 @@ export interface ShipAdapterOperations {
     intent: ShipIntent,
     publication: ShipPublicationEvidence,
   ): Promise<ShipPromotionEvidence>;
+  /**
+   * Optional candidate FRG pack. When present, convergeFrgPack runs this
+   * before observing evidence so a pin process can spawn candidate prepare/gate.
+   */
+  runFrgPack?(intent: ShipIntent, train: ShipTrainEvidence): Promise<void>;
 }
 
 export interface RealShipCoordinatorDepsOptions {
@@ -114,6 +138,18 @@ export interface RealShipCoordinatorDepsOptions {
   advanceWave(issues: readonly number[]): Promise<AdvanceWaveResult>;
   state?: ShipStateStore;
   env?: NodeJS.ProcessEnv;
+  /** Running process source SHA. Injected in tests; default is this engine checkout. */
+  pinCommitSha?: string | null;
+  resolveCandidateEngine?: (sha: string) => Promise<CandidateEngineResult>;
+  spawnShipEnd?: (
+    argv: string[],
+    env: NodeJS.ProcessEnv,
+  ) => Promise<{ code: number; stdout: string; stderr: string }>;
+  spawnEnsureTag?: (
+    engine: CandidateEngine,
+    opts: { version: string; mergeCommitOid: string },
+  ) => Promise<void>;
+  factoryReleaseRequestPath?: string;
 }
 
 function requireOid(value: string, field: string): string {
@@ -396,6 +432,9 @@ export function shipCoordinatorDepsFromOperations(
         throw new Error("ship FRG: integrated base changed after train; run the same ship command to reconcile");
       }
       const retainedTrain = rememberTrain({ ...train, completed_at: trainEvidence.completed_at });
+      if (typeof operations.runFrgPack === "function") {
+        await operations.runFrgPack(intent, retainedTrain);
+      }
       const evidence = await observeValidatedFrg(intent, retainedTrain, true);
       if (!evidence) {
         if (isPostPilotReleaseVersion(intent.version)) {
@@ -838,6 +877,246 @@ function realShipAdapterOperations(opts: RealShipCoordinatorDepsOptions): ShipAd
   };
 }
 
+export interface CandidateShipEndContext {
+  pinCommitSha: string | null;
+  repoDir: string;
+  env: NodeJS.ProcessEnv;
+  nodeBin?: string;
+  factoryReleaseRequestPath?: string;
+  resolveCandidate(sha: string): Promise<CandidateEngineResult>;
+  spawn(
+    argv: string[],
+    env: NodeJS.ProcessEnv,
+  ): Promise<{ code: number; stdout: string; stderr: string }>;
+  spawnEnsureTag?(
+    engine: CandidateEngine,
+    opts: { version: string; mergeCommitOid: string },
+  ): Promise<void>;
+}
+
+function candidateIdentityError(detail: string): Error {
+  return new Error(`ship candidate-engine identity defect: ${detail}`);
+}
+
+async function spawnLeaf(
+  ctx: CandidateShipEndContext,
+  engine: CandidateEngine,
+  leaf: string[],
+  env: NodeJS.ProcessEnv,
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  const argv = [...shipEndCliPrefix(engine, ctx.nodeBin ?? "node"), ...leaf];
+  assertShipEndLeafArgv(argv);
+  return ctx.spawn(argv, env);
+}
+
+/**
+ * Pin process stays the coordinator. When pin SHA ≠ candidate SHA, leaf
+ * post-train verbs spawn the candidate launcher instead of in-process pin
+ * runRelease / prepare / ensureAnnotatedReleaseTag. Recursion is impossible:
+ * argv is never `ship --milestone` or `train`.
+ */
+export function bindCandidateShipEndOperations(
+  pinOps: ShipAdapterOperations,
+  ctx: CandidateShipEndContext,
+): ShipAdapterOperations {
+  const requireCandidate = async (sha: string): Promise<CandidateEngine> => {
+    const resolved = await ctx.resolveCandidate(sha);
+    if (!resolved.ok) throw candidateIdentityError(resolved.error);
+    if (resolved.engine.commitSha !== parseExactGitSha(sha)) {
+      throw candidateIdentityError(
+        `resolved commit_sha ${resolved.engine.commitSha} does not equal candidate ${sha}`,
+      );
+    }
+    return resolved.engine;
+  };
+  const shouldSpawn = (candidateSha: string): boolean =>
+    pinShaDiffersFromCandidate(ctx.pinCommitSha, candidateSha);
+
+  return {
+    ...pinOps,
+    async runFrgPack(intent, train) {
+      const engine = await requireCandidate(train.integrated_head_oid);
+      if (!shouldSpawn(train.integrated_head_oid)) {
+        await pinOps.runFrgPack?.(intent, train);
+        return;
+      }
+      const requestPath = ctx.factoryReleaseRequestPath;
+      if (!requestPath) return;
+      const prep = await spawnLeaf(
+        ctx,
+        engine,
+        shipEndLeafArgv("factory-release-prepare", { requestPath }),
+        uncredentialedPrepareEnv(ctx.env),
+      );
+      if (prep.code !== 0 && !/awaiting_frg_attestation|in_progress|complete/.test(prep.stdout)) {
+        throw new Error(
+          `ship FRG: candidate factory-release prepare failed (exit ${prep.code}): ${prep.stderr || prep.stdout}`,
+        );
+      }
+      let loopRunId = "";
+      try {
+        const parsed = JSON.parse(prep.stdout) as { loop_run_id?: string; frg?: { loop_run_id?: string } };
+        loopRunId = String(parsed.frg?.loop_run_id || parsed.loop_run_id || "").trim();
+      } catch {
+        loopRunId = "";
+      }
+      if (loopRunId) {
+        const gate = await spawnLeaf(
+          ctx,
+          engine,
+          shipEndLeafArgv("factory-gate", { version: intent.version, loopRunId }),
+          attestorChildEnv(ctx.env),
+        );
+        if (gate.code !== 0) {
+          throw new Error(
+            `ship FRG: candidate factory-gate failed (exit ${gate.code}): ${gate.stderr || gate.stdout}`,
+          );
+        }
+      }
+    },
+    async prepareRelease(intent, candidateHeadOid) {
+      const engine = await requireCandidate(candidateHeadOid);
+      if (!shouldSpawn(candidateHeadOid)) {
+        return pinOps.prepareRelease(intent, candidateHeadOid);
+      }
+      const spawned = await spawnLeaf(
+        ctx,
+        engine,
+        shipEndLeafArgv("release", { version: intent.version }),
+        uncredentialedPrepareEnv(ctx.env),
+      );
+      if (spawned.code !== 0) {
+        const existing = await pinOps.observeRelease(intent, candidateHeadOid);
+        if (existing) return existing.prepare;
+        throw new Error(
+          `ship release: candidate release failed (exit ${spawned.code}): ${spawned.stderr || spawned.stdout}`,
+        );
+      }
+      const observed = await pinOps.observeRelease(intent, candidateHeadOid);
+      if (!observed) {
+        throw new Error("ship release: candidate release returned no live identity");
+      }
+      return observed.prepare;
+    },
+    async finishRelease(intent, release) {
+      const engine = await requireCandidate(release.candidate_head_oid);
+      if (!shouldSpawn(release.candidate_head_oid)) {
+        return pinOps.finishRelease(intent, release);
+      }
+      const spawned = await spawnLeaf(
+        ctx,
+        engine,
+        shipEndLeafArgv("release-finish", { pr: release.pr }),
+        uncredentialedPrepareEnv(ctx.env),
+      );
+      if (spawned.code !== 0) {
+        throw new Error(
+          `ship release: candidate release finish failed (exit ${spawned.code}): ${spawned.stderr || spawned.stdout}`,
+        );
+      }
+      const observed = await pinOps.observeRelease(intent, release.candidate_head_oid);
+      if (!observed?.finish) {
+        throw new Error("ship release: candidate release finish returned no merge identity");
+      }
+      return observed.finish;
+    },
+    async waitForPublication(intent, release) {
+      const engine = await requireCandidate(release.candidate_head_oid);
+      if (!shouldSpawn(release.candidate_head_oid)) {
+        return pinOps.waitForPublication(intent, release);
+      }
+      if (ctx.spawnEnsureTag) {
+        await ctx.spawnEnsureTag(engine, {
+          version: intent.version,
+          mergeCommitOid: release.merge_commit_oid,
+        });
+      }
+      for (let attempt = 0; attempt < RELEASE_WAIT_ATTEMPTS; attempt++) {
+        const observed = await pinOps.observePublication(intent, release);
+        if (observed) return observed;
+        if (attempt + 1 < RELEASE_WAIT_ATTEMPTS) {
+          await new Promise<void>((resolve) => setTimeout(resolve, RELEASE_WAIT_MS));
+        }
+      }
+      throw new Error(
+        `ship release: timed out waiting for published GitHub Release v${intent.version}; ` +
+          "verify the release workflow, then retry the same ship command",
+      );
+    },
+  };
+}
+
+function defaultResolveCandidateDeps(): ResolveCandidateEngineDeps {
+  return {
+    isDirectory: (p) => {
+      try {
+        return statSync(p).isDirectory();
+      } catch {
+        return false;
+      }
+    },
+    fileExists: (p) => {
+      try {
+        return statSync(p).isFile();
+      } catch {
+        return false;
+      }
+    },
+    revParseHead: (cwd) => {
+      try {
+        const out = execFileSync("git", ["-C", cwd, "rev-parse", "--verify", "HEAD"], {
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "ignore"],
+          timeout: 5_000,
+        });
+        return parseExactGitSha(String(out).trim());
+      } catch {
+        return null;
+      }
+    },
+    porcelain: (cwd) => {
+      try {
+        const out = execFileSync("git", ["-C", cwd, "status", "--porcelain"], {
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "ignore"],
+          timeout: 5_000,
+        });
+        return String(out);
+      } catch {
+        return null;
+      }
+    },
+    fetchSha: (dir, sha) => {
+      try {
+        execFileSync("git", ["-C", dir, "fetch", "--quiet", "origin", sha], {
+          stdio: "ignore",
+          timeout: 120_000,
+        });
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    worktreeAdd: (dir, dest, sha) => {
+      try {
+        execFileSync("git", ["-C", dir, "worktree", "add", "--detach", dest, sha], {
+          stdio: "ignore",
+          timeout: 120_000,
+        });
+        return true;
+      } catch {
+        return false;
+      }
+    },
+  };
+}
+
+function runningProcessPinSha(): string | null {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const engineRoot = path.resolve(here, "../..");
+  return parseExactGitSha(resolveEngineCommitSha(engineRoot));
+}
+
 /** Production factory used by the `pipeline ship` CLI. */
 export function realShipCoordinatorDeps(opts: RealShipCoordinatorDepsOptions): ShipCoordinatorDeps {
   if (!opts.repo || opts.repo.toLowerCase() !== opts.repo.trim().toLowerCase() ||
@@ -845,7 +1124,52 @@ export function realShipCoordinatorDeps(opts: RealShipCoordinatorDepsOptions): S
     throw new Error("pipeline ship: repository must be an explicit owner/name");
   }
   if (!opts.progress) throw new Error("pipeline ship: progress callback is required");
-  return shipCoordinatorDepsFromOperations(realShipAdapterOperations(opts), {
+  const env = opts.env ?? process.env;
+  const pinSha = opts.pinCommitSha !== undefined ? opts.pinCommitSha : runningProcessPinSha();
+  const resolve =
+    opts.resolveCandidateEngine ??
+    (async (sha: string) =>
+      resolveCandidateEngine(
+        {
+          repoDir: opts.repoDir,
+          candidateSha: sha,
+          candidateEngineRootEnv: env.PIPELINE_CANDIDATE_ENGINE_ROOT,
+        },
+        defaultResolveCandidateDeps(),
+      ));
+  const spawn =
+    opts.spawnShipEnd ??
+    (async (argv, spawnEnv) => {
+      const [bin, ...args] = argv;
+      try {
+        const { stdout, stderr } = await execFileAsync(bin!, args, {
+          cwd: opts.repoDir,
+          env: spawnEnv,
+          timeout: 600_000,
+          maxBuffer: 50 * 1024 * 1024,
+        });
+        return { code: 0, stdout: String(stdout), stderr: String(stderr) };
+      } catch (err) {
+        const e = err as { status?: number; stdout?: string; stderr?: string; message?: string };
+        return {
+          code: typeof e.status === "number" ? e.status : 1,
+          stdout: String(e.stdout ?? ""),
+          stderr: String(e.stderr ?? e.message ?? ""),
+        };
+      }
+    });
+  const pinOps = realShipAdapterOperations(opts);
+  const ops = bindCandidateShipEndOperations(pinOps, {
+    pinCommitSha: pinSha,
+    repoDir: opts.repoDir,
+    env,
+    nodeBin: process.execPath,
+    factoryReleaseRequestPath: opts.factoryReleaseRequestPath,
+    resolveCandidate: resolve,
+    spawn,
+    spawnEnsureTag: opts.spawnEnsureTag,
+  });
+  return shipCoordinatorDepsFromOperations(ops, {
     state: opts.state ?? defaultShipStateStore(opts.env),
   });
 }

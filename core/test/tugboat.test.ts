@@ -3149,10 +3149,14 @@ test("playbook is a thin launcher to repo tugboat.sh (#1151)", () => {
     "examples/supervisor/shell/pipeline-ship-playbook.sh",
   );
   const body = fs.readFileSync(playbook, "utf8");
+  const executable = body
+    .split("\n")
+    .filter((line) => !/^\s*#/.test(line))
+    .join("\n");
   assert.match(body, /exec "\$REPO_DIR\/examples\/supervisor\/shell\/tugboat\.sh" "\$@"/);
-  assert.doesNotMatch(body, /factory-release prepare/);
-  assert.doesNotMatch(body, /invoke_factory_release_prepare/);
-  assert.doesNotMatch(body, /"\$PIPELINE" release/);
+  assert.doesNotMatch(executable, /factory-release prepare/);
+  assert.doesNotMatch(executable, /invoke_factory_release_prepare/);
+  assert.doesNotMatch(executable, /"\$PIPELINE" release/);
 });
 
 test("tugboat after train-complete records candidate argv not pin argv (#1151)", () => {
@@ -3170,9 +3174,9 @@ test("tugboat after train-complete records candidate argv not pin argv (#1151)",
     fs.writeFileSync(
       launcher,
       [
-        "import { writeFileSync } from 'node:fs';",
+        "import { appendFileSync, writeFileSync } from 'node:fs';",
         `const rec = ${JSON.stringify(candRecord)};`,
-        "writeFileSync(rec + '/argv', process.argv.slice(2).join('\\n') + '\\n');",
+        "appendFileSync(rec + '/argv', process.argv.slice(2).join('\\n') + '\\n---\\n');",
         "const envLines = [];",
         "envLines.push(process.env.PIPELINE_FRG_ATTESTATION_KEY === undefined ? 'KEY_UNSET' : 'KEY=' + process.env.PIPELINE_FRG_ATTESTATION_KEY);",
         "envLines.push(process.env.PIPELINE_FRG_ATTESTATION_KEY_FILE === undefined ? 'KEY_FILE_UNSET' : 'KEY_FILE=' + process.env.PIPELINE_FRG_ATTESTATION_KEY_FILE);",

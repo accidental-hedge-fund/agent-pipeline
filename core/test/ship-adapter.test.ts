@@ -14,6 +14,7 @@ import {
 } from "../scripts/stages/ship-adapter.ts";
 import {
   runShipCoordinator,
+  shipKey,
   type ShipIntent,
   type ShipStateStore,
   type ShipStatus,
@@ -490,6 +491,7 @@ function memoryShipStore(): ShipStateStore & { status: ShipStatus | null } {
   let status: ShipStatus | null = null;
   return {
     get status() { return status; },
+    set status(value) { status = value; },
     statusFile: () => "/state/status.json",
     eventsFile: () => "/state/events.jsonl",
     read: async () => status,
@@ -525,7 +527,10 @@ test("pin SHA ≠ candidate: post-train prepare/release/tag spawn candidate laun
     resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
     spawn: async (argv, env) => {
       spawned.push(argv);
-      assert.equal(env.PIPELINE_FRG_ATTESTATION_KEY, undefined);
+      // Prepare must stay uncredentialed (#1133). The attestor child inherits KEY.
+      if (argv.includes("factory-release")) {
+        assert.equal(env.PIPELINE_FRG_ATTESTATION_KEY, undefined);
+      }
       assert.ok(!argv.includes("ship"));
       assert.ok(!argv.includes("train"));
       return { code: 0, stdout: JSON.stringify({ status: "in_progress", loop_run_id: "loop-1" }), stderr: "" };
@@ -552,6 +557,7 @@ test("pin SHA ≠ candidate: post-train prepare/release/tag spawn candidate laun
 test("unresolvable candidate stops ship before FRG and leaves train evidence", async () => {
   const store = memoryShipStore();
   store.status = checkpoint({
+    ship_key: shipKey(intent),
     next_action: "frg_pack",
     train,
     train_plan: { ordered_issues: [...train.ordered_issues] },
