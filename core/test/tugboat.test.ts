@@ -1887,13 +1887,24 @@ function extractNamedFn(src: string, name: string, label: string): string {
 test("playbook frg-pack-helpers.sh stays in sync with tugboat pack helpers", () => {
   const tug = fs.readFileSync(tugboat, "utf8");
   const help = fs.readFileSync(frgHelpers, "utf8");
-  for (const name of ["write_factory_release_request", "classify_frg_pack_tick"]) {
+  for (const name of [
+    "write_factory_release_request",
+    "classify_frg_pack_tick",
+    "invoke_factory_release_prepare",
+    "frg_pack_loop_run_id",
+    "invoke_frg_pack_attestor",
+  ]) {
     assert.equal(
       extractNamedFn(tug, name, "tugboat.sh"),
       extractNamedFn(help, name, "frg-pack-helpers.sh"),
       `${name} drifted between tugboat.sh and frg-pack-helpers.sh`,
     );
   }
+  assert.doesNotMatch(
+    extractNamedFn(help, "classify_frg_pack_tick", "frg-pack-helpers.sh"),
+    /status == "awaiting_frg_attestation":\s*\n\s*print\("done"\)/,
+    "playbook classifier must not treat awaiting_frg_attestation as done",
+  );
 });
 
 test("tugboat export_factory_production_pin sets factory pin when unset (#1127)", () => {
@@ -2724,6 +2735,14 @@ test("classify_frg_pack_tick: done / retry / fail without live pack", () => {
     });
     assert.equal(
       run({ status: "awaiting_frg_attestation" }, null, 0),
+      "attest",
+    );
+    assert.equal(
+      run({ status: "awaiting_frg_attestation" }, latestFor(shaOld), 0, {}, reqNew),
+      "attest",
+    );
+    assert.equal(
+      run({ status: "awaiting_frg_attestation" }, latestFor(shaNew), 0, {}, reqNew),
       "done",
     );
     assert.equal(run({ status: "in_progress" }, null, 0), "retry");
@@ -2761,7 +2780,7 @@ test("classify_frg_pack_tick: done / retry / fail without live pack", () => {
   }
 });
 
-test("tugboat pack phase does not sign, merge, tag, promote, or install", () => {
+test("tugboat pack phase composes factory-gate --from-run and does not finalize", () => {
   const body = fs.readFileSync(tugboat, "utf8");
   const shipOneStart = body.indexOf("ship_one() {");
   const shipOneEnd = body.indexOf("\n# ---------- run serial multi-milestone");
@@ -2771,9 +2790,244 @@ test("tugboat pack phase does not sign, merge, tag, promote, or install", () => 
   assert.ok(packStart >= 0 && releaseStart > packStart, "frg-pack phase missing");
   const pack = shipOneBody.slice(packStart, releaseStart);
   assert.match(pack, /factory-release prepare --request/);
-  assert.doesNotMatch(pack, /attestation_key|HMAC|grant[\/_]factory|factory\.mjs/);
+  assert.match(pack, /invoke_factory_release_prepare/);
+  assert.match(pack, /invoke_frg_pack_attestor/);
+  assert.match(pack, /factory-gate --for \$version --from-run/);
+  assert.doesNotMatch(pack, /--observations/);
+  assert.doesNotMatch(pack, /"\$PIPELINE" factory-release prepare/);
+  assert.doesNotMatch(pack, /grant[\/_]factory|factory\.mjs/);
   assert.doesNotMatch(pack, /release finish|engine-promote|git tag|gh release create/);
   assert.doesNotMatch(pack, /pass:\s*true|"pass": true/);
+  assert.doesNotMatch(pack, /HMAC/);
+  const stateFn = extractNamedFn(body, "write_state", "tugboat.sh");
+  assert.doesNotMatch(stateFn, /PIPELINE_FRG_ATTESTATION_KEY/);
+});
+
+function writeFakePipeline(binDir: string, recordDir: string): string {
+  fs.mkdirSync(binDir, { recursive: true });
+  fs.mkdirSync(recordDir, { recursive: true });
+  const bin = path.join(binDir, "pipeline");
+  const argvPath = JSON.stringify(path.join(recordDir, "argv"));
+  const envPath = JSON.stringify(path.join(recordDir, "env"));
+  fs.writeFileSync(
+    bin,
+    [
+      "#!/usr/bin/env bash",
+      "set -euo pipefail",
+      `printf '%s\\n' "$@" > ${argvPath}`,
+      "{",
+      '  if [[ -n "${PIPELINE_FRG_ATTESTATION_KEY+x}" ]]; then',
+      '    printf "KEY=%s\\n" "$PIPELINE_FRG_ATTESTATION_KEY"',
+      "  else",
+      '    printf "KEY_UNSET\\n"',
+      "  fi",
+      '  if [[ -n "${PIPELINE_FRG_ATTESTATION_KEY_FILE+x}" ]]; then',
+      '    printf "KEY_FILE=%s\\n" "$PIPELINE_FRG_ATTESTATION_KEY_FILE"',
+      "  else",
+      '    printf "KEY_FILE_UNSET\\n"',
+      "  fi",
+      `} > ${envPath}`,
+      "",
+    ].join("\n"),
+  );
+  fs.chmodSync(bin, 0o755);
+  return bin;
+}
+
+test("prepare child unsets KEY and KEY_FILE (#1133)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-prep-env-"));
+  try {
+    const binDir = path.join(dir, "bin");
+    const recordDir = path.join(dir, "record");
+    const pipeline = writeFakePipeline(binDir, recordDir);
+    const req = path.join(dir, "req.json");
+    const out = path.join(dir, "out.json");
+    const err = path.join(dir, "err.txt");
+    fs.writeFileSync(req, "{}\n");
+    const keyFile = path.join(dir, "key.file");
+    fs.writeFileSync(keyFile, "parent-file-secret\n");
+    const fn = extractNamedFn(
+      fs.readFileSync(frgHelpers, "utf8"),
+      "invoke_factory_release_prepare",
+      "frg-pack-helpers.sh",
+    );
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        fn,
+        `invoke_factory_release_prepare ${JSON.stringify(req)} ${JSON.stringify(out)} ${JSON.stringify(err)}`,
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    const r = spawnSync("bash", [runner], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
+        PIPELINE: pipeline,
+        PIPELINE_FRG_ATTESTATION_KEY: "parent-key-secret",
+        PIPELINE_FRG_ATTESTATION_KEY_FILE: keyFile,
+      },
+    });
+    assert.equal(r.status, 0, `prepare helper exited ${r.status}: ${r.stderr}`);
+    const childEnv = fs.readFileSync(path.join(recordDir, "env"), "utf8");
+    assert.match(childEnv, /^KEY_UNSET$/m);
+    assert.match(childEnv, /^KEY_FILE_UNSET$/m);
+    assert.doesNotMatch(childEnv, /parent-key-secret|parent-file-secret/);
+    const argv = fs.readFileSync(path.join(recordDir, "argv"), "utf8");
+    assert.match(argv, /^factory-release$/m);
+    assert.match(argv, /^prepare$/m);
+    assert.match(argv, /^--request$/m);
+    assert.match(argv, /^--json$/m);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("attestor child presents KEY_FILE as KEY and omits --observations (#1133)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-attest-env-"));
+  try {
+    const binDir = path.join(dir, "bin");
+    const recordDir = path.join(dir, "record");
+    const pipeline = writeFakePipeline(binDir, recordDir);
+    const out = path.join(dir, "out.json");
+    const err = path.join(dir, "err.txt");
+    const keyFile = path.join(dir, "key.file");
+    const keyBody = "unit-test-frg-key-body-not-for-production";
+    fs.writeFileSync(keyFile, `${keyBody}\n`);
+    const fn = extractNamedFn(
+      fs.readFileSync(frgHelpers, "utf8"),
+      "invoke_frg_pack_attestor",
+      "frg-pack-helpers.sh",
+    );
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        fn,
+        `invoke_frg_pack_attestor "1.39.0" "loop-L" ${JSON.stringify(out)} ${JSON.stringify(err)}`,
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
+      PIPELINE: pipeline,
+      PIPELINE_FRG_ATTESTATION_KEY_FILE: keyFile,
+    };
+    delete env.PIPELINE_FRG_ATTESTATION_KEY;
+    const r = spawnSync("bash", [runner], {
+      encoding: "utf8",
+      env,
+    });
+    assert.equal(r.status, 0, `attestor helper exited ${r.status}: ${r.stderr}`);
+    const childEnv = fs.readFileSync(path.join(recordDir, "env"), "utf8");
+    assert.match(childEnv, new RegExp(`^KEY=${keyBody}$`, "m"));
+    assert.match(childEnv, /^KEY_FILE_UNSET$/m);
+    const argv = fs.readFileSync(path.join(recordDir, "argv"), "utf8").trim().split("\n");
+    assert.deepEqual(argv, ["factory-gate", "--for", "1.39.0", "--from-run", "loop-L"]);
+    assert.ok(!argv.includes("--observations"));
+    const stray = fs
+      .readdirSync(dir, { recursive: true, encoding: "utf8" })
+      .filter((rel) => rel !== "key.file" && !rel.startsWith("record/"))
+      .map((rel) => path.join(dir, rel))
+      .filter((p) => fs.statSync(p).isFile())
+      .filter((p) => fs.readFileSync(p, "utf8").includes(keyBody));
+    assert.deepEqual(stray, [], "attestor must not persist the key body to pack files");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("attestor child fails closed without producer credential (#1133)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-attest-miss-"));
+  try {
+    const fn = extractNamedFn(
+      fs.readFileSync(frgHelpers, "utf8"),
+      "invoke_frg_pack_attestor",
+      "frg-pack-helpers.sh",
+    );
+    const err = path.join(dir, "err.txt");
+    const out = path.join(dir, "out.json");
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        fn,
+        `invoke_frg_pack_attestor "1.39.0" "loop-L" ${JSON.stringify(out)} ${JSON.stringify(err)}`,
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    const env = { ...process.env };
+    delete env.PIPELINE_FRG_ATTESTATION_KEY;
+    delete env.PIPELINE_FRG_ATTESTATION_KEY_FILE;
+    const r = spawnSync("bash", [runner], { encoding: "utf8", env });
+    assert.notEqual(r.status, 0, "missing credential must fail closed");
+    assert.match(fs.readFileSync(err, "utf8"), /missing_attestor_credential/);
+    assert.doesNotMatch(`${r.stdout}\n${r.stderr}`, /--skip-frg/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("frg_pack_loop_run_id reads awaiting frg.loop_run_id (#1133)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-loop-id-"));
+  try {
+    const fn = extractNamedFn(
+      fs.readFileSync(frgHelpers, "utf8"),
+      "frg_pack_loop_run_id",
+      "frg-pack-helpers.sh",
+    );
+    const prep = path.join(dir, "prep.json");
+    fs.writeFileSync(
+      prep,
+      JSON.stringify({
+        status: "awaiting_frg_attestation",
+        frg: { loop_run_id: "loop-from-frg" },
+        loop_run_id: "should-not-win",
+      }),
+    );
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        fn,
+        `frg_pack_loop_run_id ${JSON.stringify(prep)}`,
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    const r = spawnSync("bash", [runner], { encoding: "utf8" });
+    assert.equal(r.status, 0, `loop-id helper exited ${r.status}: ${r.stderr}`);
+    assert.equal(r.stdout.trim(), "loop-from-frg");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("playbook pack phase uses the same uncredentialed prepare + attestor compose", () => {
+  const playbook = path.join(
+    repoRoot,
+    "examples/supervisor/shell/pipeline-ship-playbook.sh",
+  );
+  const body = fs.readFileSync(playbook, "utf8");
+  assert.match(body, /invoke_factory_release_prepare/);
+  assert.match(body, /invoke_frg_pack_attestor/);
+  assert.match(body, /factory-gate --for \$version --from-run/);
+  assert.doesNotMatch(body, /"\$PIPELINE" factory-release prepare/);
+  assert.match(body, /pack_verdict" == "attest"/);
 });
 
 test("hermes env.example (#1062): REPO_DIR does not default to factory-control", () => {

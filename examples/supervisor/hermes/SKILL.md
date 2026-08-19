@@ -108,6 +108,13 @@ Default sequence is train `--merge` → FRG pack → release (no `--skip-frg`) �
 wait CI green → `release finish` → wait GitHub Release → `engine-promote`.
 `--skip-frg` is an operator escape with a logged reason, not the default.
 
+FRG pack unsets `PIPELINE_FRG_ATTESTATION_KEY` and
+`PIPELINE_FRG_ATTESTATION_KEY_FILE` in the `factory-release prepare` child.
+When prepare returns `awaiting_frg_attestation`, the composer runs
+`pipeline factory-gate --for X.Y.Z --from-run <loop>` in a separate
+credentialed process. Pack-done is bound `latest.json` `pass: true` (or
+`complete` with an open release PR). Unsigned wait is not pack-done.
+
 On notify of a **non-human** failure, re-invoke the same
 `pipeline ship --milestone vX.Y.Z` argv only. Do **not** classify, delete a
 run directory, wait a cooldown, or invent `pipeline single` / `pipeline loop`.

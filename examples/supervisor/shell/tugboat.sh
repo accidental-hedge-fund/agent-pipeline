@@ -2,7 +2,8 @@
 # Tugboat — thin ship composer (Option 1, #1001).
 #
 # Ship = compose existing Pipeline CLI verbs + wait + notify. Nothing more.
-#   train --milestone --merge  →  FRG pack (factory-release prepare)  →  release
+#   train --milestone --merge  →  FRG pack (uncredentialed prepare +
+#   factory-gate --from-run attestor)  →  release
 #   →  wait CI green  →  release finish  →  wait GitHub Release  →
 #   engine-promote --host all
 # Default release / promote argv omit --skip-frg. Skip is an operator escape
@@ -464,12 +465,13 @@ print(dest)
 PY
 }
 
-# Classify one factory-release prepare tick. Prints done | retry | fail.
+# Classify one factory-release prepare tick. Prints done | attest | retry | fail.
 # $1 prepare JSON path, $2 latest.json path, $3 prepare exit code,
 # $4 factory-release request JSON (version + candidate SHA binding).
 # pass: false is pack-fail before any success status. pass: true is
 # pack-done only when latest records the request target_version and
 # integrated_candidate.git_sha (and action_id when the artifact has it).
+# awaiting_frg_attestation without that bound pass: true is attest, not done.
 # complete is done only after an open release PR for the requested
 # version is verified (TUGBOAT_OPEN_RELEASE_PR injects that number;
 # else gh pr list).
@@ -627,7 +629,7 @@ if pass_v is True and pass_matches_request(latest, req):
     print("done")
     raise SystemExit(0)
 if status == "awaiting_frg_attestation":
-    print("done")
+    print("attest")
     raise SystemExit(0)
 if status == "complete":
     if complete_has_open_release_pr(prep):
@@ -643,6 +645,88 @@ if status in ("failed", "error", "missing") or status is None or ec != 0:
     raise SystemExit(0)
 print("fail")
 PY
+}
+
+# Invoke factory-release prepare with attestor env unset in THAT child.
+# Parent supervisor env is left unchanged (#1133).
+invoke_factory_release_prepare() {
+  local req=$1
+  local out=$2
+  local err=$3
+  env -u PIPELINE_FRG_ATTESTATION_KEY -u PIPELINE_FRG_ATTESTATION_KEY_FILE \
+    "$PIPELINE" factory-release prepare --request "$req" --json >"$out" 2>"$err"
+}
+
+# Bound pack loop_run_id from a prepare JSON result. Awaiting uses
+# frg.loop_run_id; in_progress uses loop_run_id. Empty when missing.
+# Do not pick an unbound newest loop.
+frg_pack_loop_run_id() {
+  python3 - "$1" <<'PY'
+import json, os, sys
+
+path = sys.argv[1]
+if not path or not os.path.isfile(path) or os.path.getsize(path) == 0:
+    print("")
+    raise SystemExit(0)
+text = open(path, encoding="utf-8").read().strip()
+obj = None
+try:
+    obj = json.loads(text)
+except Exception:
+    i = text.rfind("{")
+    if i >= 0:
+        try:
+            obj = json.loads(text[i:])
+        except Exception:
+            obj = None
+if not isinstance(obj, dict):
+    print("")
+    raise SystemExit(0)
+status = obj.get("status")
+loop = ""
+if status == "awaiting_frg_attestation":
+    frg = obj.get("frg")
+    if isinstance(frg, dict):
+        loop = str(frg.get("loop_run_id") or "").strip()
+elif status == "in_progress":
+    loop = str(obj.get("loop_run_id") or "").strip()
+print(loop)
+PY
+}
+
+# factory-gate --from-run in a child other than prepare. Inherit KEY;
+# when only KEY_FILE is set, present the file as KEY in that child.
+# Unset KEY_FILE in the attestor child. Do not pass --observations.
+# Named stderr reason + non-zero when credential or loop id is missing.
+invoke_frg_pack_attestor() {
+  local ver=$1
+  local loop=$2
+  local out=$3
+  local err=$4
+  if [[ -z "$loop" ]]; then
+    echo "missing_loop_run_id" >"$err"
+    return 1
+  fi
+  if [[ -n "${PIPELINE_FRG_ATTESTATION_KEY:-}" ]]; then
+    env -u PIPELINE_FRG_ATTESTATION_KEY_FILE \
+      "$PIPELINE" factory-gate --for "$ver" --from-run "$loop" >"$out" 2>"$err"
+    return $?
+  fi
+  if [[ -z "${PIPELINE_FRG_ATTESTATION_KEY_FILE:-}" ]]; then
+    echo "missing_attestor_credential" >"$err"
+    return 1
+  fi
+  if [[ ! -r "$PIPELINE_FRG_ATTESTATION_KEY_FILE" ]]; then
+    echo "unreadable_attestor_key_file" >"$err"
+    return 1
+  fi
+  if [[ ! -s "$PIPELINE_FRG_ATTESTATION_KEY_FILE" ]]; then
+    echo "missing_attestor_credential" >"$err"
+    return 1
+  fi
+  PIPELINE_FRG_ATTESTATION_KEY="$(cat -- "$PIPELINE_FRG_ATTESTATION_KEY_FILE")" \
+    env -u PIPELINE_FRG_ATTESTATION_KEY_FILE \
+    "$PIPELINE" factory-gate --for "$ver" --from-run "$loop" >"$out" 2>"$err"
 }
 
 log() {
@@ -1734,9 +1818,9 @@ ship_one() {
     fi
   fi
 
-  # ----- A2: FRG pack (compose factory-release prepare; no second runner) ---
+  # ----- A2: FRG pack (uncredentialed prepare + out-of-process attestor) ---
   if [[ "$SKIP_FRG" != "1" ]]; then
-    local req pack_done pack_ec pack_verdict latest_json
+    local req pack_done pack_ec pack_verdict latest_json loop_id attest_ec attest_reason
     req="$RUN_DIR/factory-release-prepare-request.json"
     write_state "frg-pack" "running" "pipeline factory-release prepare --request $req --json"
     log "phase frg-pack: start request=$req"
@@ -1749,7 +1833,7 @@ ship_one() {
     latest_json="$REPO_DIR/.agent-pipeline/frg/$version/latest.json"
     for i in $(seq 1 "$FRG_WAIT_ATTEMPTS"); do
       set +e
-      "$PIPELINE" factory-release prepare --request "$req" --json >"$RUN_DIR/frg-pack.json" 2>"$RUN_DIR/frg-pack.err"
+      invoke_factory_release_prepare "$req" "$RUN_DIR/frg-pack.json" "$RUN_DIR/frg-pack.err"
       pack_ec=$?
       set -e
       cat "$RUN_DIR/frg-pack.err" >>"$LOG_FILE" 2>/dev/null || true
@@ -1758,6 +1842,35 @@ ship_one() {
         log "phase frg-pack: pack-done (attempt $i)"
         pack_done=1
         break
+      elif [[ "$pack_verdict" == "attest" ]]; then
+        loop_id=$(frg_pack_loop_run_id "$RUN_DIR/frg-pack.json")
+        if [[ -z "$loop_id" ]]; then
+          write_state "frg-pack" "failed" "FRG pack failed (missing_loop_run_id)"
+          log "FAIL: FRG pack failed (attempt $i) missing_loop_run_id"
+          exit 1
+        fi
+        log "phase frg-pack: attest factory-gate --for $version --from-run $loop_id (attempt $i)"
+        set +e
+        invoke_frg_pack_attestor "$version" "$loop_id" "$RUN_DIR/frg-attest.json" "$RUN_DIR/frg-attest.err"
+        attest_ec=$?
+        set -e
+        cat "$RUN_DIR/frg-attest.err" >>"$LOG_FILE" 2>/dev/null || true
+        if [[ "$attest_ec" -ne 0 ]]; then
+          attest_reason=$(tail -1 "$RUN_DIR/frg-attest.err" 2>/dev/null || true)
+          [[ -z "$attest_reason" ]] && attest_reason="attestor child"
+          write_state "frg-pack" "failed" "FRG pack failed ($attest_reason)"
+          log "FAIL: FRG pack failed (attempt $i) $attest_reason"
+          exit 1
+        fi
+        pack_verdict=$(classify_frg_pack_tick "$RUN_DIR/frg-pack.json" "$latest_json" "$pack_ec" "$req")
+        if [[ "$pack_verdict" == "done" ]]; then
+          log "phase frg-pack: pack-done after attest (attempt $i)"
+          pack_done=1
+          break
+        fi
+        write_state "frg-pack" "failed" "FRG pack failed (attestor did not write bound latest.json)"
+        log "FAIL: FRG pack failed (attempt $i) attestor did not write bound latest.json"
+        exit 1
       elif [[ "$pack_verdict" == "retry" ]]; then
         log "phase frg-pack: in_progress (attempt $i); waiting"
         sleep "$FRG_WAIT_SLEEP_S"

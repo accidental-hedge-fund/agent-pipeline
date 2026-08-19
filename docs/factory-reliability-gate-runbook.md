@@ -172,7 +172,13 @@ Prepare never merges, tags, promotes a pin, or flips Tugboat `--skip-frg`.
 `latest.json` `pass: true`. That helper remains the single skip-frg restore
 predicate. #1039 consumed it: Tugboat default release and promote argv now
 **omit** `--skip-frg`, and Tugboat runs one FRG pack phase
-(`pipeline factory-release prepare`) after train and before release.
+after train and before release. #1133: that pack invokes
+`pipeline factory-release prepare` with attestor env **unset** in the
+prepare child. When prepare returns `awaiting_frg_attestation`, the
+composer runs `pipeline factory-gate --for <X.Y.Z> --from-run <loop>` in a
+**separate** credentialed process (no `--observations`). Pack-done is
+bound `latest.json` `pass: true` (or prepare `complete` with an open
+release PR). Unsigned `awaiting_frg_attestation` is **not** pack-done.
 Auto-tag (#1040) and pin (#1041) remain later children. They do not invent
 a second pass definition.
 

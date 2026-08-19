@@ -21,7 +21,7 @@ They only map intent → `pipeline` CLI. They are **not** a second control plane
 | `release-checks-green.py` | Shared ship-release check waiter: classify `gh pr checks --json` as green/pending/rerun/fail (`bucket`+`link`; bounded flake-eligible rerun) |
 | `run-intent.sh` | Map a short intent string → `pipeline train` / `single` |
 | `pipeline-launcher.sh` | Resolve installed `pipeline` without hardcoding host paths. On the factory control plane, exports `AGENT_PIPELINE_PRODUCTION_PIN` when unset. |
-| `frg-pack-helpers.sh` | Secret-free `factory-release prepare` request writer + pack-tick classifier. Sourced by the playbook. Tugboat inlines the same helpers. |
+| `frg-pack-helpers.sh` | Secret-free `factory-release prepare` request writer, pack-tick classifier, uncredentialed prepare child, and `factory-gate --from-run` attestor compose. Sourced by the playbook. Tugboat inlines the same helpers. |
 | `pipeline-ship-playbook.sh` | Leftover thin chain adapter (not the product owner) |
 | `ship-milestone.sh` | Parked grant-style adapter; not the operator surface |
 
