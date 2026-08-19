@@ -61,6 +61,7 @@ import {
 import {
   classifyPlaybookBody,
   evaluateShipEndIdentity,
+  resolveSelectedPlaybookKind,
 } from "../ship-end-identity.ts";
 
 const execFileAsync = promisify(execFile);
@@ -1190,10 +1191,11 @@ export function buildPreflightChecks(
 
   // 15. Ship-end candidate-engine identity (#1151). Skip when no Tugboat,
   //     no installed playbook, and no in-engine ship-end. Selection is
-  //     independent of body classification: Tugboat present ⇒ playbook is
-  //     not selected; otherwise an installed playbook is selected. Fail a
-  //     selected non-launcher (including unrecognized bodies). Bound SHA
-  //     comparison is the unit helper (injected strings).
+  //     independent of body classification and of Tugboat co-install:
+  //     an installed playbook is selected unless invocation/durable state
+  //     explicitly names another composer. Doctor preflight has no such
+  //     observation, so an installed non-launcher fails even when Tugboat
+  //     is also present. Bound SHA comparison is the unit helper.
   checks.push({
     id: "supervisor:ship-end-candidate-engine",
     description:
@@ -1205,18 +1207,17 @@ export function buildPreflightChecks(
       const playbookInstalled = await deps.fsExists(playbookPath);
       const playbookBody = playbookInstalled ? await deps.readTextFile(playbookPath) : null;
       const playbookKind = classifyPlaybookBody(playbookBody);
-      const playbookSelected = playbookInstalled && !tugboatInstalled;
-      const selectedPlaybookKind = playbookSelected
-        ? (playbookKind === "playbook-launcher" ? "playbook-launcher" as const : "playbook-stale" as const)
-        : "unused" as const;
+      // Unobserved composer: Tugboat file presence is not selection.
+      const selectedPlaybookKind = resolveSelectedPlaybookKind({
+        installedPlaybookKind: playbookKind,
+        observedComposer: null,
+      });
       const toolsInUse = tugboatInstalled || playbookInstalled;
-      const composerKind = tugboatInstalled
-        ? "tugboat-repo" as const
-        : selectedPlaybookKind === "playbook-launcher"
-          ? "playbook-launcher" as const
-          : selectedPlaybookKind === "playbook-stale"
-            ? "playbook-stale" as const
-            : "unused" as const;
+      const composerKind = selectedPlaybookKind !== "unused"
+        ? selectedPlaybookKind
+        : tugboatInstalled
+          ? "tugboat-repo" as const
+          : "unused" as const;
       const verdict = evaluateShipEndIdentity({
         shipEndToolsInUse: toolsInUse,
         candidateSha: null,

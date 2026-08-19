@@ -1926,6 +1926,41 @@ test("check supervisor:ship-end-candidate-engine — fails selected unrecognized
   assert.match(r.remediation!, /pipeline-ship-playbook\.sh|tugboat\.sh/);
 });
 
+test("check supervisor:ship-end-candidate-engine — co-installed Tugboat does not unselect a stale playbook", async () => {
+  const check = getCheck(makeConfig(), "supervisor:ship-end-candidate-engine");
+  const stale = [
+    "#!/usr/bin/env bash",
+    '"$PIPELINE" factory-release prepare --request "$req" --json',
+    '"$PIPELINE" release "$version" --no-edit',
+    "",
+  ].join("\n");
+  const r = await check.run(
+    fakeDeps({
+      option1PackInstalled: true,
+      playbookInstalled: true,
+      readTextFile: (p) =>
+        p.includes("pipeline-ship-playbook") ? stale : '{"version":"1.0.0"}',
+    }),
+  );
+  assertFailWithRemediation(r);
+  assert.match(r.detail, /thin launcher/);
+  assert.match(r.remediation!, /pipeline-ship-playbook\.sh|tugboat\.sh/);
+});
+
+test("check supervisor:ship-end-candidate-engine — thin launcher still passes when Tugboat is also installed", async () => {
+  const check = getCheck(makeConfig(), "supervisor:ship-end-candidate-engine");
+  const launcher = 'exec "$REPO_DIR/examples/supervisor/shell/tugboat.sh" "$@"\n';
+  const r = await check.run(
+    fakeDeps({
+      option1PackInstalled: true,
+      playbookInstalled: true,
+      readTextFile: (p) =>
+        p.includes("pipeline-ship-playbook") ? launcher : '{"version":"1.0.0"}',
+    }),
+  );
+  assert.equal(r.status, "pass");
+});
+
 // Regression for the corrupt-install startup path (#186 review 2): if core/package.json
 // is unreadable at startup, loadVersion() in pipeline.ts returns "" rather than throwing
 // at module load. This test proves runPreflight still executes (does not crash) and that

@@ -124,6 +124,29 @@ export function classifyPlaybookBody(body: string | null): PlaybookComposerKind 
   return "playbook-stale";
 }
 
+/**
+ * Resolve whether an installed playbook is selected.
+ * `unused` is absence, or an explicit observed non-selection (Tugboat or
+ * in-engine ship is the invoked composer). Co-installation of Tugboat is
+ * not that observation — pass `observedComposer` only from invocation or
+ * durable selection state. Unobserved + installed playbook is selected.
+ */
+export function resolveSelectedPlaybookKind(opts: {
+  installedPlaybookKind: PlaybookComposerKind;
+  observedComposer?: ShipEndComposerKind | null;
+}): PlaybookComposerKind {
+  if (opts.installedPlaybookKind === "unused") return "unused";
+  const observed = opts.observedComposer ?? null;
+  if (
+    observed === "tugboat-repo" ||
+    observed === "in-engine-ship" ||
+    observed === "unused"
+  ) {
+    return "unused";
+  }
+  return opts.installedPlaybookKind;
+}
+
 export function shipEndCandidateRemediation(): string {
   return (
     "Invoke factory-release prepare, factory-gate, pipeline release, and release finish " +

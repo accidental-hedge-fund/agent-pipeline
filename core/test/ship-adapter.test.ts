@@ -522,6 +522,7 @@ test("pin SHA ≠ candidate: post-train prepare/release/tag spawn candidate laun
   const spawned: string[][] = [];
   let preparedInProcess = false;
   let taggedInProcess = false;
+  let gated = false;
   const pinOps = operations({
     observeRelease: async () => ({ prepare: release, finish: null }),
     prepareRelease: async () => {
@@ -545,6 +546,9 @@ test("pin SHA ≠ candidate: post-train prepare/release/tag spawn candidate laun
       // Prepare must stay uncredentialed (#1133). The attestor child inherits KEY.
       if (argv.includes("factory-release")) {
         assert.equal(env.PIPELINE_FRG_ATTESTATION_KEY, undefined);
+        if (gated) {
+          return { code: 0, stdout: JSON.stringify({ status: "complete" }), stderr: "" };
+        }
         return {
           code: 0,
           stdout: JSON.stringify({
@@ -554,6 +558,7 @@ test("pin SHA ≠ candidate: post-train prepare/release/tag spawn candidate laun
           stderr: "",
         };
       }
+      if (argv.includes("factory-gate")) gated = true;
       assert.ok(!argv.includes("ship"));
       assert.ok(!argv.includes("train"));
       return { code: 0, stdout: "", stderr: "" };
@@ -651,6 +656,7 @@ test("matching pin SHA keeps in-process pin prepare", async () => {
 test("in_progress prepare re-invokes prepare and does not factory-gate until eligible", async () => {
   const spawned: string[][] = [];
   let prepareTicks = 0;
+  let gated = false;
   const bound = bindCandidateShipEndOperations(operations(), {
     pinCommitSha: PIN_SHA,
     repoDir: "/repo",
@@ -663,6 +669,9 @@ test("in_progress prepare re-invokes prepare and does not factory-gate until eli
       spawned.push(argv);
       if (argv.includes("factory-release")) {
         prepareTicks++;
+        if (gated) {
+          return { code: 0, stdout: JSON.stringify({ status: "complete" }), stderr: "" };
+        }
         if (prepareTicks < 3) {
           return {
             code: 0,
@@ -679,18 +688,24 @@ test("in_progress prepare re-invokes prepare and does not factory-gate until eli
           stderr: "",
         };
       }
+      if (argv.includes("factory-gate")) gated = true;
       return { code: 0, stdout: "", stderr: "" };
     },
   });
   await bound.runFrgPack!(intent, train);
   const prepares = spawned.filter((argv) => argv.includes("factory-release"));
   const gates = spawned.filter((argv) => argv.includes("factory-gate"));
-  assert.equal(prepares.length, 3);
+  assert.equal(prepares.length, 4);
   assert.equal(gates.length, 1);
   assert.ok(gates[0]!.includes("loop-1"));
   assert.ok(
     spawned.findIndex((argv) => argv.includes("factory-gate")) >
       spawned.findIndex((argv) => argv.includes("factory-release")),
+  );
+  const gateIdx = spawned.findIndex((argv) => argv.includes("factory-gate"));
+  assert.ok(
+    spawned.slice(gateIdx + 1).some((argv) => argv.includes("factory-release")),
+    "FRG pack must re-invoke prepare after factory-gate until complete",
   );
 });
 
@@ -715,7 +730,7 @@ test("in_progress prepare within wait budget does not invoke factory-gate", asyn
   });
   await assert.rejects(
     bound.runFrgPack!(intent, train),
-    /still in_progress/,
+    /did not reach complete/,
   );
   assert.equal(spawned.filter((argv) => argv.includes("factory-release")).length, 2);
   assert.equal(spawned.filter((argv) => argv.includes("factory-gate")).length, 0);
@@ -742,6 +757,49 @@ test("missing request path fails closed before candidate FRG prepare", async () 
     /missing factory-release prepare request path/,
   );
   assert.deepEqual(spawned, []);
+});
+
+test("candidate FRG pack re-invokes the same prepare request after factory-gate until complete", async () => {
+  const spawned: string[][] = [];
+  let gated = false;
+  const requestPath = "/abs/req.json";
+  const bound = bindCandidateShipEndOperations(operations(), {
+    pinCommitSha: PIN_SHA,
+    repoDir: "/repo",
+    env: {},
+    factoryReleaseRequestPath: requestPath,
+    frgWaitAttempts: 4,
+    delay: async () => {},
+    resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+    spawn: async (argv) => {
+      spawned.push(argv);
+      if (argv.includes("factory-release")) {
+        assert.ok(argv.includes(requestPath), "prepare must keep the bound request path");
+        if (!gated) {
+          return {
+            code: 0,
+            stdout: JSON.stringify({
+              status: "awaiting_frg_attestation",
+              frg: { loop_run_id: "loop-1" },
+            }),
+            stderr: "",
+          };
+        }
+        return { code: 0, stdout: JSON.stringify({ status: "complete" }), stderr: "" };
+      }
+      if (argv.includes("factory-gate")) {
+        gated = true;
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      throw new Error(`unexpected spawn ${argv.join(" ")}`);
+    },
+  });
+  await bound.runFrgPack!(intent, train);
+  const verbs = spawned.map((argv) =>
+    argv.includes("factory-gate") ? "gate" : argv.includes("factory-release") ? "prepare" : "other",
+  );
+  assert.deepEqual(verbs, ["prepare", "gate", "prepare"]);
+  assert.equal(spawned.filter((argv) => argv.includes(requestPath)).length, 2);
 });
 
 test("injected request resolver supplies the persisted prepare path when option is omitted", async () => {

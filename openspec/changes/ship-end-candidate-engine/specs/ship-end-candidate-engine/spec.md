@@ -46,7 +46,7 @@ This requirement does not authorize `--skip-frg` as the ship path. It does not a
 
 The documented installed `pipeline-ship-playbook` path SHALL be a thin launcher that execs `$REPO_DIR/examples/supervisor/shell/tugboat.sh`. A thin-launcher body SHALL contain only an optional first-physical-line shebang, later comment lines, blank lines, and exactly one executable statement: `exec "$REPO_DIR/examples/supervisor/shell/tugboat.sh" "$@"`. The optional shebang, when present, SHALL be the first physical line and SHALL be one of `#!/usr/bin/env bash`, `#!/bin/bash`, or `#!/usr/bin/bash`, with no interpreter arguments. A first-line shebang that uses `env -S`, `bash -c`, or any other interpreter or argument list SHALL classify the body as noncompliant, not as a thin launcher. A later `#` line is a comment and SHALL NOT count as a shebang. Any other shell statement — including a production-pin `"$PIPELINE" release` or other ship-end verb before or after that exec — SHALL classify the body as noncompliant, not as a thin launcher. It SHALL NOT retain a second ship-end compose implementation. Marker-only presence SHALL NOT count as parity.
 
-When the ship execs `$REPO_DIR/examples/supervisor/shell/tugboat.sh` directly and does not invoke a divergent installed playbook, that posture SHALL pass the playbook check. A selected installed playbook that is not that launcher SHALL fail. An installed playbook body that is neither the thin launcher nor a recognized stale compose SHALL be classified as noncompliant, not unused. Unused SHALL mean absence of the playbook or an explicit non-selection (for example Tugboat is the selected composer).
+When the ship execs `$REPO_DIR/examples/supervisor/shell/tugboat.sh` directly and does not invoke a divergent installed playbook, that posture SHALL pass the playbook check. A selected installed playbook that is not that launcher SHALL fail. An installed playbook body that is neither the thin launcher nor a recognized stale compose SHALL be classified as noncompliant, not unused. Unused SHALL mean absence of the playbook or an explicit non-selection from observed composer invocation state (for example Tugboat is the selected composer). Co-installation of Tugboat SHALL NOT count as that non-selection.
 
 #### Scenario: Stale installed playbook fails when used for ship-end
 
@@ -79,6 +79,15 @@ When the ship execs `$REPO_DIR/examples/supervisor/shell/tugboat.sh` directly an
 - **THEN** the ship-end identity check SHALL fail
 - **AND** the body SHALL NOT be classified as unused
 
+#### Scenario: Co-installed Tugboat does not mark a stale playbook unused
+
+- **WHEN** `~/.local/bin/pipeline-ship-playbook` exists
+- **AND** its body is not a thin launcher to `$REPO_DIR/examples/supervisor/shell/tugboat.sh`
+- **AND** Tugboat is also installed
+- **AND** there is no observed composer invocation that selects Tugboat instead of that playbook
+- **THEN** the ship-end identity check SHALL fail
+- **AND** the playbook SHALL NOT be classified as unused
+
 #### Scenario: Embedded Tugboat exec does not certify a stale playbook
 
 - **WHEN** an installed playbook body contains `"$PIPELINE" release 1.39.5`
@@ -100,7 +109,7 @@ A unit test or `pipeline doctor` check SHALL fail when ship-end tools are used f
 1. The invoked ship-end CLI source SHA (`commit_sha` from `pipeline --version --json` or `git rev-parse HEAD` at the engine root) does not equal the FRG-bound candidate SHA. Package `--version` equality alone SHALL NOT pass.
 2. The selected installed playbook is not a thin launcher to `$REPO_DIR/examples/supervisor/shell/tugboat.sh` and the composer is not execing that repo script.
 
-Absence of those tools (hosts that do not run thin ship or in-engine ship-end) SHALL skip the check. Doctor SHALL skip only when no installed Tugboat, no installed playbook, and no in-engine ship-end is in use. A stale installed playbook SHALL fail only when it is selected. The check SHALL be hermetic in unit tests (injected version strings, digests, and SHA). It SHALL NOT start a live ship, network call, or subprocess release.
+Absence of those tools (hosts that do not run thin ship or in-engine ship-end) SHALL skip the check. Doctor SHALL skip only when no installed Tugboat, no installed playbook, and no in-engine ship-end is in use. A stale installed playbook SHALL fail only when it is selected. Selection SHALL come from observed composer invocation state, not from co-installation of Tugboat. When doctor has no such observation, an installed playbook SHALL be treated as selected. The check SHALL be hermetic in unit tests (injected version strings, digests, and SHA). It SHALL NOT start a live ship, network call, or subprocess release.
 
 #### Scenario: Production-pin CLI used for release fails the check
 

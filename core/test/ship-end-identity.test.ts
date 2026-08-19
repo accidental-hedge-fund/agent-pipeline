@@ -9,6 +9,7 @@ import {
   formatPipelineVersionJson,
   isThinPlaybookLauncher,
   parseExactGitSha,
+  resolveSelectedPlaybookKind,
   STALE_PLAYBOOK_DIGEST_PREFIX,
 } from "../scripts/ship-end-identity.ts";
 
@@ -118,6 +119,60 @@ test("classifyPlaybookBody: unused is absence only; unrecognized installed bodie
   assert.equal(classifyPlaybookBody(divergent), "playbook-stale");
   assert.equal(classifyPlaybookBody("echo not a launcher\n"), "playbook-stale");
   assert.equal(classifyPlaybookBody(null), "unused");
+});
+
+test("resolveSelectedPlaybookKind: co-installed Tugboat is not playbook non-selection", () => {
+  assert.equal(
+    resolveSelectedPlaybookKind({
+      installedPlaybookKind: "playbook-stale",
+      observedComposer: null,
+    }),
+    "playbook-stale",
+  );
+  assert.equal(
+    resolveSelectedPlaybookKind({
+      installedPlaybookKind: "playbook-stale",
+    }),
+    "playbook-stale",
+  );
+  assert.equal(
+    resolveSelectedPlaybookKind({
+      installedPlaybookKind: "playbook-launcher",
+      observedComposer: null,
+    }),
+    "playbook-launcher",
+  );
+  assert.equal(
+    resolveSelectedPlaybookKind({
+      installedPlaybookKind: "unused",
+      observedComposer: null,
+    }),
+    "unused",
+  );
+});
+
+test("resolveSelectedPlaybookKind: unused only from absence or explicit observed composer", () => {
+  assert.equal(
+    resolveSelectedPlaybookKind({
+      installedPlaybookKind: "playbook-stale",
+      observedComposer: "tugboat-repo",
+    }),
+    "unused",
+  );
+  assert.equal(
+    resolveSelectedPlaybookKind({
+      installedPlaybookKind: "playbook-stale",
+      observedComposer: "in-engine-ship",
+    }),
+    "unused",
+  );
+  assert.equal(
+    resolveSelectedPlaybookKind({
+      installedPlaybookKind: "playbook-stale",
+      observedComposer: "playbook-stale",
+    }),
+    "playbook-stale",
+  );
 });
 
 test("identity helper fails pin 1.39.4 SHA vs candidate C even when version is forged 1.39.5", () => {

@@ -1303,7 +1303,9 @@ export function bindCandidateShipEndOperations(
               `ship FRG: candidate factory-gate failed (exit ${gate.code}): ${gate.stderr || gate.stdout}`,
             );
           }
-          return;
+          // Re-invoke the same request-bound prepare until it proves complete.
+          // Do not return at the attestation checkpoint (#1151).
+          continue;
         }
         if (verdict === "retry") {
           if (attempt + 1 < attempts) await delayMs(ctx, FRG_WAIT_MS);
@@ -1314,7 +1316,7 @@ export function bindCandidateShipEndOperations(
         );
       }
       throw new Error(
-        `ship FRG: candidate factory-release prepare still in_progress after ${attempts} ticks; ` +
+        `ship FRG: candidate factory-release prepare did not reach complete after ${attempts} ticks; ` +
           "retry the same ship command to resume the bound pack",
       );
     },

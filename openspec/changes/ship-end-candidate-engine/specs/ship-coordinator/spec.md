@@ -4,7 +4,7 @@
 
 After `train --merge` is complete or resumed complete, in-engine `pipeline ship` SHALL run Factory Reliability Gate (FRG) pack (`factory-release prepare` and `factory-gate`), `pipeline release`, `release finish`, and any coordinator-invoked tag on the candidate engine bound to the SHA being released. The candidate engine SHALL be the control checkout at that SHA, or an explicit candidate install of that SHA.
 
-When the operator started `pipeline ship` from the previous production-pin CLI, the coordinator SHALL keep that pin process as the durable coordinator and SHALL spawn the candidate engine for leaf post-train verbs (`factory-release prepare`, `factory-gate`, `release`, `release finish`, and `release ensure-tag`). `release ensure-tag` SHALL run the candidate's `ensureAnnotatedReleaseTag`; it SHALL NOT import that helper from the production-pin process. It SHALL NOT re-exec `pipeline ship`. It SHALL NOT rerun train. It SHALL NOT keep executing those leaf verbs inside the production-pin process when that process source SHA differs from the candidate. Train and `engine-promote` SHALL remain on the production pin.
+When the operator started `pipeline ship` from the previous production-pin CLI, the coordinator SHALL keep that pin process as the durable coordinator and SHALL spawn the candidate engine for leaf post-train verbs (`factory-release prepare`, `factory-gate`, `release`, `release finish`, and `release ensure-tag`). After a successful candidate `factory-gate`, the coordinator SHALL re-invoke the same candidate `factory-release prepare --request <absolute-request.json> --json` until that command returns `status: "complete"`. It SHALL NOT return from the FRG pack phase at the attestation checkpoint. It SHALL NOT treat the later standalone `pipeline release` leaf as a substitute for that complete checkpoint. `release ensure-tag` SHALL run the candidate's `ensureAnnotatedReleaseTag`; it SHALL NOT import that helper from the production-pin process. It SHALL NOT re-exec `pipeline ship`. It SHALL NOT rerun train. It SHALL NOT keep executing those leaf verbs inside the production-pin process when that process source SHA differs from the candidate. Train and `engine-promote` SHALL remain on the production pin.
 
 The coordinator SHALL fail closed before those ship-end verbs if it cannot resolve a matching candidate engine. A failed resolution SHALL persist the train checkpoint and SHALL NOT start FRG pack or release mutation. This requirement does not authorize `--skip-frg` as the default. It does not authorize promote before GitHub Release publication.
 
@@ -29,6 +29,14 @@ The coordinator SHALL fail closed before those ship-end verbs if it cannot resol
 - **THEN** the spawned argv SHALL be a leaf CLI verb
 - **AND** it SHALL NOT be `pipeline ship --milestone`
 - **AND** it SHALL NOT be `pipeline train`
+
+#### Scenario: Candidate FRG pack converges prepare after attestation
+
+- **WHEN** candidate `factory-release prepare --request <absolute-request.json> --json` returns `status: "awaiting_frg_attestation"`
+- **AND** candidate `factory-gate --for <X.Y.Z> --from-run <loop_run_id>` succeeds
+- **THEN** the coordinator SHALL re-invoke the same candidate `factory-release prepare` with that unchanged request
+- **AND** it SHALL NOT return from the FRG pack phase until that prepare returns `status: "complete"`
+- **AND** it SHALL NOT treat the later standalone `pipeline release` leaf as a substitute for that complete checkpoint
 
 #### Scenario: Coordinator-invoked tag runs candidate ensure-tag
 
