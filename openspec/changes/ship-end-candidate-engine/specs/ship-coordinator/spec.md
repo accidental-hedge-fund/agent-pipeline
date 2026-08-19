@@ -36,3 +36,15 @@ The coordinator SHALL fail closed before those ship-end verbs if it cannot resol
 - **AND** the pin process SHA differs from the FRG-bound candidate SHA
 - **THEN** the coordinator SHALL spawn `release ensure-tag <X.Y.Z> <merge-commit-oid>` on the candidate launcher
 - **AND** it SHALL NOT call the production-pin process's imported `ensureAnnotatedReleaseTag`
+
+### Requirement: Candidate ensure-tag SHALL prove the supplied OID is the merged release
+
+`pipeline release ensure-tag` SHALL re-observe the version's release PR before creating a missing annotated tag. It SHALL require that pull request to be merged with a merge commit exactly equal to the supplied OID. It SHALL fail closed and SHALL NOT create or push `v<X.Y.Z>` when that proof is absent.
+
+#### Scenario: Unrelated OID is rejected
+
+- **WHEN** `pipeline release ensure-tag 1.39.5 <oid>` runs
+- **AND** `<oid>` is a valid 40-hex commit
+- **AND** the v1.39.5 release PR merge commit is a different OID
+- **THEN** the command SHALL fail closed
+- **AND** it SHALL NOT create or push `v1.39.5`

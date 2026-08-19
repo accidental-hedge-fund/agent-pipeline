@@ -7,6 +7,7 @@ import test from "node:test";
 import {
   alignReleaseCheckoutToCandidate,
   assertFrgCandidateProvenance,
+  assertEnsureTagOidIsMergedRelease,
   bindCandidateShipEndOperations,
   ensureAnnotatedReleaseTag,
   persistShipFactoryReleaseRequest,
@@ -14,6 +15,7 @@ import {
   runEnsureAnnotatedReleaseTagCli,
   shipCoordinatorDepsFromOperations,
   verifyAnnotatedReleaseTag,
+  type ObservedEnsureTagReleasePr,
   type ShipAdapterOperations,
 } from "../scripts/stages/ship-adapter.ts";
 import {
@@ -31,6 +33,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const head = "a".repeat(40);
 const releaseHead = "b".repeat(40);
 const mergeHead = "c".repeat(40);
+const unrelatedOid = "e".repeat(40);
 
 const intent: ShipIntent = {
   repository: "accidental-hedge-fund/agent-pipeline",
@@ -42,6 +45,15 @@ const intent: ShipIntent = {
   channel_id: "pipeline-factory",
   thread_id: "release-1.34.0",
 };
+
+function mergedReleasePr(mergeCommitOid = mergeHead): ObservedEnsureTagReleasePr {
+  return {
+    pr: 945,
+    title: `release: ${intent.version} — factory`,
+    state: "MERGED",
+    mergeCommitOid,
+  };
+}
 
 const train: ShipTrainEvidence = {
   repository: intent.repository,
@@ -829,11 +841,56 @@ test("runEnsureAnnotatedReleaseTagCli tags via injected git, not ambient git", a
         return "";
       },
       validateFrg: async () => {},
+      observeMergedReleasePr: async () => mergedReleasePr(),
     },
   );
   assert.equal(result, "created");
   assert.ok(gitCalls.some((args) => args[0] === "tag" && args[1] === "-a" && args[2] === `v${intent.version}`));
   assert.ok(gitCalls.some((args) => args[0] === "push" && args.includes(`refs/tags/v${intent.version}`)));
+});
+
+test("runEnsureAnnotatedReleaseTagCli rejects a valid OID that is not the merged release (#1151)", async () => {
+  const gitCalls: string[][] = [];
+  let validated = 0;
+  await assert.rejects(
+    runEnsureAnnotatedReleaseTagCli(
+      { repoDir: "/repo", version: intent.version, mergeCommitOid: unrelatedOid },
+      {
+        git: async (args) => {
+          gitCalls.push(args);
+          if (args[0] === "cat-file") throw new Error("not a valid object");
+          if (args[0] === "tag" || args[0] === "push") {
+            throw new Error(`must not ${args[0]} an unrelated OID`);
+          }
+          return "";
+        },
+        validateFrg: async () => {
+          validated++;
+        },
+        observeMergedReleasePr: async () => mergedReleasePr(mergeHead),
+      },
+    ),
+    /not the merge commit of the v1\.34\.0 release PR/,
+  );
+  assert.equal(validated, 0);
+  assert.ok(!gitCalls.some((args) => args[0] === "tag"));
+  assert.ok(!gitCalls.some((args) => args[0] === "push"));
+});
+
+test("assertEnsureTagOidIsMergedRelease rejects an unrelated OID", () => {
+  assert.throws(
+    () => assertEnsureTagOidIsMergedRelease({
+      version: intent.version,
+      mergeCommitOid: unrelatedOid,
+      observed: mergedReleasePr(mergeHead),
+    }),
+    /not the merge commit of the v1\.34\.0 release PR/,
+  );
+  assert.doesNotThrow(() => assertEnsureTagOidIsMergedRelease({
+    version: intent.version,
+    mergeCommitOid: mergeHead,
+    observed: mergedReleasePr(mergeHead),
+  }));
 });
 
 test("runEnsureAnnotatedReleaseTagCli fails closed without a repo directory", async () => {

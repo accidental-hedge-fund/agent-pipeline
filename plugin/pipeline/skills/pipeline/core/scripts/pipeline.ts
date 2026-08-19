@@ -4540,6 +4540,7 @@ async function main(): Promise<void> {
         const { runEnsureAnnotatedReleaseTagCli } = await import("./stages/ship-adapter.ts");
         const result = await runEnsureAnnotatedReleaseTagCli({
           repoDir,
+          repo: localCfg.repo,
           version: tagVersion,
           mergeCommitOid,
         });

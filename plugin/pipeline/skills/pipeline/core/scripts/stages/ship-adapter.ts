@@ -1092,9 +1092,109 @@ export async function persistShipFactoryReleaseRequest(
   return dest;
 }
 
+/** Observed identity of the version's release PR for `release ensure-tag`. */
+export interface ObservedEnsureTagReleasePr {
+  pr: number;
+  title: string;
+  state: string;
+  mergeCommitOid: string | null;
+}
+
+/**
+ * Require the caller-supplied OID to be the merge commit of the version's
+ * completed release PR. Used by `release ensure-tag` before creating a tag.
+ */
+export function assertEnsureTagOidIsMergedRelease(opts: {
+  version: string;
+  mergeCommitOid: string;
+  observed: ObservedEnsureTagReleasePr;
+}): void {
+  const expected = requireOid(opts.mergeCommitOid, "ship release merge commit");
+  const parsed = parseReleasePrTitle(opts.observed.title);
+  if (!parsed || parsed.version !== opts.version) {
+    throw new Error(
+      `ship release: ensure-tag observed PR is not the v${opts.version} release PR`,
+    );
+  }
+  if (String(opts.observed.state ?? "").toUpperCase() !== "MERGED") {
+    throw new Error(
+      `ship release: ensure-tag requires the v${opts.version} release PR to be merged`,
+    );
+  }
+  if (!opts.observed.mergeCommitOid) {
+    throw new Error(
+      `ship release: ensure-tag OID is not the merge commit of the v${opts.version} release PR`,
+    );
+  }
+  const actual = requireOid(opts.observed.mergeCommitOid, "ship release merge commit");
+  if (actual !== expected) {
+    throw new Error(
+      `ship release: ensure-tag OID is not the merge commit of the v${opts.version} release PR`,
+    );
+  }
+}
+
+async function defaultObserveMergedReleasePr(
+  repoDir: string,
+  repo: string | undefined,
+  version: string,
+): Promise<ObservedEnsureTagReleasePr> {
+  if (!repo) {
+    throw new Error(
+      "ship release: candidate ensure-tag cannot re-observe the release PR without a repository",
+    );
+  }
+  const branch = `release/v${version}`;
+  const { stdout } = await execFileAsync(
+    "gh",
+    [
+      "pr", "list",
+      "--state", "all",
+      "--head", branch,
+      "--limit", "10",
+      "--json", "number,title,state,mergeCommit,isCrossRepository",
+      "-R", repo,
+    ],
+    {
+      cwd: repoDir,
+      timeout: 60_000,
+      maxBuffer: 50 * 1024 * 1024,
+    },
+  );
+  const rows = JSON.parse(String(stdout)) as Array<{
+    number?: unknown;
+    title?: unknown;
+    state?: unknown;
+    mergeCommit?: { oid?: unknown } | null;
+    isCrossRepository?: unknown;
+  }>;
+  if (!Array.isArray(rows) || rows.length === 0) {
+    throw new Error(`ship release: ensure-tag found no release PR for v${version}`);
+  }
+  if (rows.length > 1) {
+    throw new Error(`ship release: multiple PRs use head ${branch}`);
+  }
+  const row = rows[0]!;
+  const pr = Number(row.number);
+  if (row.isCrossRepository === true || !Number.isSafeInteger(pr) || pr <= 0) {
+    throw new Error("ship release: observed release PR identity does not match the shipment");
+  }
+  const mergeOid = row.mergeCommit && typeof row.mergeCommit.oid === "string"
+    ? String(row.mergeCommit.oid)
+    : null;
+  return {
+    pr,
+    title: String(row.title ?? ""),
+    state: String(row.state ?? ""),
+    mergeCommitOid: mergeOid,
+  };
+}
+
 /**
  * Candidate-process leaf for `pipeline release ensure-tag`.
  * Runs this engine's `ensureAnnotatedReleaseTag` against `repoDir`.
+ * Before creating a missing tag, re-observes the version's release PR and
+ * requires it to be merged with merge commit equal to `mergeCommitOid`.
  * Coordinator-side pin processes must spawn this verb on the candidate CLI
  * rather than importing this helper.
  */
@@ -1103,10 +1203,12 @@ export async function runEnsureAnnotatedReleaseTagCli(
     repoDir: string;
     version: string;
     mergeCommitOid: string;
+    repo?: string;
   },
   io?: {
     git?: (args: string[]) => Promise<string>;
     validateFrg?: () => Promise<void>;
+    observeMergedReleasePr?: (version: string) => Promise<ObservedEnsureTagReleasePr>;
   },
 ): Promise<"created" | "exists"> {
   if (!opts.repoDir) {
@@ -1122,12 +1224,23 @@ export async function runEnsureAnnotatedReleaseTagCli(
     });
     return String(stdout).trim();
   });
+  const observeMergedReleasePr = io?.observeMergedReleasePr
+    ?? ((version: string) => defaultObserveMergedReleasePr(opts.repoDir, opts.repo, version));
+  const validateFrg = async () => {
+    const observed = await observeMergedReleasePr(opts.version);
+    assertEnsureTagOidIsMergedRelease({
+      version: opts.version,
+      mergeCommitOid: opts.mergeCommitOid,
+      observed,
+    });
+    await (io?.validateFrg
+      ?? (() => validateFrgEvidenceFileForTag(opts.repoDir, opts.version).then(() => undefined)))();
+  };
   return ensureAnnotatedReleaseTag({
     version: opts.version,
     mergeCommitOid: opts.mergeCommitOid,
     git,
-    validateFrg: io?.validateFrg ??
-      (() => validateFrgEvidenceFileForTag(opts.repoDir, opts.version).then(() => undefined)),
+    validateFrg,
   });
 }
 
