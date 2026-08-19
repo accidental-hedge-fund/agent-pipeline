@@ -1371,10 +1371,11 @@ export interface PipelineConfig {
     auto_file_max_per_window: number;
     auto_file_min_occurrences: number;
   };
-  // Worktree bootstrap: dependency install step (#174).
+  // Worktree bootstrap: dependency install step (#174, #1132).
   // When set to a non-empty string, that shell command is run in the worktree
-  // instead of auto-detection. When set to "" the install step is skipped
-  // entirely. When absent (undefined), auto-detection runs from lockfile.
+  // root instead of auto-detection. When set to "" the install step is skipped
+  // entirely. When absent (undefined), auto-detection runs from a worktree-root
+  // lockfile, then from exactly one first-level nested lockfile.
   setup_command?: string;
   // Repo build command run after fix/auto-fix edits (#387). When declared, the
   // fix stage and the auto-fix (test-gate fix-loop) fold any generated-artifact

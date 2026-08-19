@@ -1012,7 +1012,7 @@ Nested fields:
 ### `setup_command`
 
 - **Type:** string
-- **Description:** Shell command to run in the worktree after creation, before the test gate.
+- **Description:** Shell command to run in the worktree root after creation, before the test gate. When unset, auto-detect from a worktree-root lockfile, or from exactly one first-level subdirectory lockfile (e.g. core/package-lock.json). Multiple first-level lockfile directories skip auto-detect; set this command instead. Empty string skips install.
 
 ### `shipcheck_gate`
 
