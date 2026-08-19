@@ -9,28 +9,39 @@ test. The path must not change production behavior.
 
 - Add a run-scoped JSON fixture at
   `core/test/fixtures/frg/pack-1395-tugboat-ship-1.39.5/clean-docs.json`.
-- Add a unit test that reads only that fixture and asserts
-  `release_version` is `1.39.5`.
+- Add exactly one unit test file,
+  `core/test/frg-pack-1395-clean-docs.test.ts`, that reads and parses only
+  that fixture path and asserts `release_version === "1.39.5"`.
 - Keep production engine, CLI, stage, and plugin behavior unchanged.
+- Keep the existing OpenSpec change under
+  `openspec/changes/frg-pack-1395-clean-docs/`. The fixture and test are
+  the only functional test-content additions. Required OpenSpec metadata
+  remains permitted.
 
 ## Acceptance Criteria
 
 - [ ] File `core/test/fixtures/frg/pack-1395-tugboat-ship-1.39.5/clean-docs.json`
       exists and is valid JSON.
 - [ ] That fixture's `release_version` field equals the string `1.39.5`.
-- [ ] A unit test under `core/test/` reads that exact run-scoped path and
-      asserts `release_version === "1.39.5"`.
-- [ ] The unit test fails when `release_version` is missing or is any
+- [ ] File `core/test/frg-pack-1395-clean-docs.test.ts` exists and resolves
+      only `core/test/fixtures/frg/pack-1395-tugboat-ship-1.39.5/clean-docs.json`
+      (no glob, no shared-pack lookup, no fallback path).
+- [ ] That test reads and parses the JSON, then uses a strict equality
+      assertion `release_version === "1.39.5"`.
+- [ ] The same assertion fails when `release_version` is missing or is any
       other value (for example `1.39.4`).
 - [ ] The fixture and test do not read or write any other
       `core/test/fixtures/frg/<pack_run_id>/` directory.
-- [ ] Production source under `core/scripts/`, `hosts/`, and `plugin/` is
-      unchanged.
-- [ ] `cd core && npm test` includes the new test and the suite passes.
-- [ ] `npm run ci` from the repo root exits 0.
-- [ ] The Pipeline for issue #1143 reaches `pipeline:ready-to-deploy`.
-- [ ] After the run is recorded, FRG closes the pull request and issue
-      without merge.
+- [ ] `git diff -- core/scripts hosts plugin` is empty.
+- [ ] `cd core && npm test` includes the new test and exits 0 on the
+      committed SHA.
+- [ ] `npm run ci` from the repo root exits 0 on the committed SHA.
+- [ ] `openspec validate --all` exits 0.
+- [ ] Engine-recorded SHA-pinned tester evidence exists for that SHA
+      before any claim of a suite pass.
+- [ ] Functional test-content additions are only the fixture and
+      `core/test/frg-pack-1395-clean-docs.test.ts`. OpenSpec change files
+      under `openspec/changes/frg-pack-1395-clean-docs/` remain permitted.
 
 ## Capabilities
 
@@ -52,9 +63,10 @@ test. The path must not change production behavior.
   The next identical pack instance uses the same `clean-docs` template, not
   a mole issue.
 - **Primary files:** `core/test/fixtures/frg/pack-1395-tugboat-ship-1.39.5/clean-docs.json`
-  and a co-located unit test under `core/test/`.
+  and `core/test/frg-pack-1395-clean-docs.test.ts`.
 - **Plugin mirror:** Not required. `scripts/build.mjs` copies `core/scripts`,
   `core/profiles`, and `core/package*.json` only. It does not copy
   `core/test/`.
 - **Out of scope:** production behavior; FRG driver or pack-template edits;
-  merge; other pack templates (`clean-openspec`); other pack run ids.
+  merge; FRG close-without-merge (pipeline lifecycle, not implementation);
+  other pack templates (`clean-openspec`); other pack run ids.

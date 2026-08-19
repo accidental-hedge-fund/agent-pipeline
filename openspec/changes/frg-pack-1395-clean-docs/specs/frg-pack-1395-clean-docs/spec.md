@@ -25,10 +25,14 @@ under that pack-run directory.
   directory
 
 ### Requirement: Pack 1395 clean-docs unit test SHALL fail on a version mismatch
-The unit-test suite SHALL include a test that reads only
+The unit-test suite SHALL include
+`core/test/frg-pack-1395-clean-docs.test.ts`. That file SHALL read and
+parse only
 `core/test/fixtures/frg/pack-1395-tugboat-ship-1.39.5/clean-docs.json` and
-asserts that `release_version` equals `1.39.5`. Replacing that field with any
-other value SHALL make the test fail.
+SHALL assert `release_version === "1.39.5"`. The test SHALL NOT glob
+fixtures, look up another pack-run directory, or use a fallback path.
+Replacing that field with any other value, or omitting it, SHALL make the
+test fail.
 
 #### Scenario: Test passes when the fixture version is 1.39.5
 - **WHEN** the fixture `release_version` is `1.39.5`
@@ -49,10 +53,20 @@ other value SHALL make the test fail.
 ### Requirement: Pack 1395 clean-docs change SHALL NOT alter production behavior
 The pack-1395 clean-docs change SHALL NOT modify production source under
 `core/scripts/`, `hosts/`, or `plugin/`. The change SHALL add only the
-run-scoped fixture and its unit test.
+run-scoped fixture and `core/test/frg-pack-1395-clean-docs.test.ts` as
+functional test content. Required OpenSpec change artifacts under
+`openspec/changes/frg-pack-1395-clean-docs/` remain permitted.
 
 #### Scenario: Production tree is unchanged
 - **WHEN** the change is implemented
 - **THEN** no file under `core/scripts/`, `hosts/`, or `plugin/` SHALL be
   added, removed, or edited
 - **AND** runtime pipeline behavior SHALL remain unchanged
+
+#### Scenario: OpenSpec metadata is permitted
+- **WHEN** the change tree is inspected
+- **THEN** files under `openspec/changes/frg-pack-1395-clean-docs/` MAY
+  exist
+- **AND** the only functional test-content additions SHALL be
+  `core/test/fixtures/frg/pack-1395-tugboat-ship-1.39.5/clean-docs.json`
+  and `core/test/frg-pack-1395-clean-docs.test.ts`
