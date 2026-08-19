@@ -1,4 +1,4 @@
-// Unit tests for worktree dependency install step (#174).
+// Unit tests for worktree dependency install step (#174, #1132).
 // All tests use deps injection — no real filesystem, network, or subprocess calls.
 
 import { test } from "node:test";
@@ -420,4 +420,208 @@ test("truncation(#174-f4): small output is not truncated", async () => {
       return true;
     },
   );
+});
+
+// ---------------------------------------------------------------------------
+// Nested first-level lockfile (#1132): after a root-lockfile miss, install in
+// exactly one first-level subdirectory (this repo: core/package-lock.json).
+// ---------------------------------------------------------------------------
+
+test("#1132: core/package-lock.json only → npm ci with CWD /wt/core", async () => {
+  let capturedCmd: string | undefined;
+  let capturedArgs: string[] | undefined;
+  let capturedCwd: string | undefined;
+  let capturedShell: boolean | undefined;
+  const deps: SetupDeps = {
+    existsSync: (p) => p === "/wt/core/package-lock.json",
+    spawnCommand: async (cmd, args, cwd, useShell) => {
+      capturedCmd = cmd;
+      capturedArgs = args;
+      capturedCwd = cwd;
+      capturedShell = useShell;
+      return { code: 0, stdout: "", stderr: "" };
+    },
+  };
+  const result = await detectAndInstall("/wt", cfg(undefined), deps);
+  assert.equal(result.skipped, false, "setup must not be skipped for a nested core/ lockfile");
+  assert.equal(result.command, "npm ci");
+  assert.equal(capturedCmd, "npm");
+  assert.deepEqual(capturedArgs, ["ci"]);
+  assert.equal(capturedCwd, "/wt/core");
+  assert.equal(capturedShell, false);
+});
+
+test("#1132: root lockfile wins over nested core/ lockfile", async () => {
+  let capturedCwd: string | undefined;
+  let spawnCount = 0;
+  const deps: SetupDeps = {
+    existsSync: (p) =>
+      p === "/wt/package-lock.json" || p === "/wt/core/package-lock.json",
+    listDir: () => {
+      throw new Error("listDir must not run when the worktree root has a lockfile");
+    },
+    spawnCommand: async (_cmd, _args, cwd) => {
+      spawnCount += 1;
+      capturedCwd = cwd;
+      return { code: 0, stdout: "", stderr: "" };
+    },
+  };
+  const result = await detectAndInstall("/wt", cfg(undefined), deps);
+  assert.equal(result.skipped, false);
+  assert.equal(result.command, "npm ci");
+  assert.equal(capturedCwd, "/wt");
+  assert.equal(spawnCount, 1, "must not run a second install in core/");
+});
+
+test("#1132: root node_modules does not skip nested core/ install", async () => {
+  let capturedCwd: string | undefined;
+  let capturedCmd: string | undefined;
+  const deps: SetupDeps = {
+    existsSync: (p) => p === "/wt/node_modules" || p === "/wt/core/package-lock.json",
+    spawnCommand: async (cmd, _args, cwd) => {
+      capturedCmd = cmd;
+      capturedCwd = cwd;
+      return { code: 0, stdout: "", stderr: "" };
+    },
+  };
+  const result = await detectAndInstall("/wt", cfg(undefined), deps);
+  assert.equal(result.skipped, false);
+  assert.equal(capturedCmd, "npm");
+  assert.equal(capturedCwd, "/wt/core");
+});
+
+test("#1132: core/node_modules present skips nested install", async () => {
+  const result = await detectAndInstall("/wt", cfg(undefined), {
+    existsSync: (p) =>
+      p === "/wt/core/package-lock.json" || p === "/wt/core/node_modules",
+    spawnCommand: async () => { throw new Error("should not spawn"); },
+  });
+  assert.equal(result.skipped, true);
+});
+
+test("#1132: empty setup_command skips nested core/ install", async () => {
+  const result = await detectAndInstall("/wt", cfg(""), {
+    existsSync: (p) => p === "/wt/core/package-lock.json",
+    listDir: () => ["core"],
+    spawnCommand: async () => { throw new Error("should not spawn"); },
+  });
+  assert.equal(result.skipped, true);
+});
+
+test("#1132: non-empty setup_command runs at /wt and does not auto-detect core/", async () => {
+  let capturedCmd: string | undefined;
+  let capturedCwd: string | undefined;
+  let capturedShell: boolean | undefined;
+  const deps: SetupDeps = {
+    existsSync: () => {
+      throw new Error("existsSync should not be called with setup_command");
+    },
+    listDir: () => {
+      throw new Error("listDir should not be called with setup_command");
+    },
+    spawnCommand: async (cmd, _args, cwd, useShell) => {
+      capturedCmd = cmd;
+      capturedCwd = cwd;
+      capturedShell = useShell;
+      return { code: 0, stdout: "", stderr: "" };
+    },
+  };
+  const result = await detectAndInstall("/wt", cfg("custom-setup"), deps);
+  assert.equal(result.skipped, false);
+  assert.equal(capturedCmd, "custom-setup");
+  assert.equal(capturedCwd, "/wt");
+  assert.equal(capturedShell, true);
+});
+
+test("#1132: two first-level lockfile dirs skip auto-detect", async () => {
+  const result = await detectAndInstall("/wt", cfg(undefined), {
+    existsSync: (p) =>
+      p === "/wt/core/package-lock.json" || p === "/wt/app/package-lock.json",
+    listDir: () => ["core", "app"],
+    spawnCommand: async () => { throw new Error("should not spawn"); },
+  });
+  assert.equal(result.skipped, true);
+});
+
+test("#1132: lockfile deeper than one directory is not auto-detected", async () => {
+  const result = await detectAndInstall("/wt", cfg(undefined), {
+    existsSync: (p) =>
+      p === "/wt/plugin/pipeline/skills/pipeline/core/package-lock.json",
+    listDir: () => ["plugin"],
+    spawnCommand: async () => { throw new Error("should not spawn"); },
+  });
+  assert.equal(result.skipped, true);
+});
+
+test("#1132: nested npm ci non-zero throw names npm ci", async () => {
+  const deps = spawnResult(["/wt/core/package-lock.json"], 1, "", "npm ERR! peer deps");
+  await assert.rejects(
+    () => detectAndInstall("/wt", cfg(undefined), deps),
+    (err: Error) => {
+      assert.ok(err.message.includes("npm ci"), `must name npm ci: ${err.message}`);
+      assert.ok(err.message.includes("code 1"), `must include exit code: ${err.message}`);
+      return true;
+    },
+  );
+});
+
+test("#1132: listDir first-level app/ lockfile installs in app/", async () => {
+  let capturedCwd: string | undefined;
+  const deps: SetupDeps = {
+    existsSync: (p) => p === "/wt/app/package-lock.json",
+    listDir: () => ["app"],
+    spawnCommand: async (_cmd, _args, cwd) => {
+      capturedCwd = cwd;
+      return { code: 0, stdout: "", stderr: "" };
+    },
+  };
+  const result = await detectAndInstall("/wt", cfg(undefined), deps);
+  assert.equal(result.skipped, false);
+  assert.equal(result.command, "npm ci");
+  assert.equal(capturedCwd, "/wt/app");
+});
+
+test("#1132: thrown listDir is treated as empty and still probes core/", async () => {
+  let capturedCwd: string | undefined;
+  const deps: SetupDeps = {
+    existsSync: (p) => p === "/wt/core/package-lock.json",
+    listDir: () => {
+      throw new Error("readdir failed");
+    },
+    spawnCommand: async (_cmd, _args, cwd) => {
+      capturedCwd = cwd;
+      return { code: 0, stdout: "", stderr: "" };
+    },
+  };
+  const result = await detectAndInstall("/wt", cfg(undefined), deps);
+  assert.equal(result.skipped, false);
+  assert.equal(capturedCwd, "/wt/core");
+});
+
+test("#1132: ignored first-level names (.git, node_modules, dot-dirs) do not count", async () => {
+  let capturedCwd: string | undefined;
+  const deps: SetupDeps = {
+    existsSync: (p) =>
+      p === "/wt/core/package-lock.json" ||
+      p === "/wt/.git/package-lock.json" ||
+      p === "/wt/node_modules/package-lock.json" ||
+      p === "/wt/.hidden/package-lock.json",
+    listDir: () => [".git", "node_modules", ".hidden", "core"],
+    spawnCommand: async (_cmd, _args, cwd) => {
+      capturedCwd = cwd;
+      return { code: 0, stdout: "", stderr: "" };
+    },
+  };
+  const result = await detectAndInstall("/wt", cfg(undefined), deps);
+  assert.equal(result.skipped, false);
+  assert.equal(capturedCwd, "/wt/core");
+});
+
+test("#1132: root lockfile + root node_modules still skips (#174 path)", async () => {
+  const result = await detectAndInstall("/wt", cfg(undefined), {
+    existsSync: (p) =>
+      p === "/wt/package-lock.json" || p === "/wt/node_modules",
+    spawnCommand: async () => { throw new Error("should not spawn"); },
+  });
+  assert.equal(result.skipped, true);
 });

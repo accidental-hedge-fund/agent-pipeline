@@ -2,7 +2,9 @@
 
 ## Purpose
 How the pipeline isolates each issue's work in a dedicated git worktree, bounds concurrency to active work, serializes runs with a PID lock, honors an emergency kill-switch, and bootstraps the GitHub labels the state machine depends on. (Removal of merged-PR worktrees is refined by `worktree-stale-cleanup`.)
+
 ## Requirements
+
 ### Requirement: Deterministic worktree path and branch naming
 Each issue SHALL get a worktree at `<repo>/<cfg.worktree_root>/pipeline-<issueN>-<slug>` on branch `pipeline/<issueN>-<slug>`, where `<slug>` is a URL-safe, length-bounded slug of the issue title.
 
@@ -53,7 +55,16 @@ Each issue SHALL get a worktree at `<repo>/<cfg.worktree_root>/pipeline-<issueN>
 #### Scenario: node_modules directory is not removed during bootstrap
 - **WHEN** a `node_modules` directory (not a symlink) exists at the worktree root at bootstrap time
 - **THEN** the pipeline SHALL NOT remove it
-- **AND** SHALL treat it as a legitimately-installed dependency tree and skip the install step per the idempotency rule in `worktree-dependency-install`
+- **AND** SHALL skip the install step only when the detected package root already has `node_modules`, per the idempotency rule in `worktree-dependency-install`
+
+#### Scenario: root node_modules does not suppress nested core/ install
+- **WHEN** a `node_modules` directory (not a symlink) exists at the worktree root at bootstrap time
+- **AND** the worktree root contains no recognized lockfile
+- **AND** `<worktree>/core/package-lock.json` exists
+- **AND** `<worktree>/core/node_modules` does not exist
+- **AND** `setup_command` is not set
+- **THEN** the pipeline SHALL NOT remove the root `node_modules` directory
+- **AND** SHALL still run `npm ci` with CWD `<worktree>/core`
 
 #### Scenario: worktree is dependency-installed before first use
 - **WHEN** a worktree is freshly created for an issue
@@ -205,4 +216,3 @@ reconcile SHALL NOT weaken those guards.
 - **WHEN** reconcile returns refuse-unsafe-remove for the existing managed candidate
 - **THEN** `createWorktree` SHALL abort without removing that worktree or its branch
 - **AND** SHALL NOT create a second worktree at the target path in the same call
-

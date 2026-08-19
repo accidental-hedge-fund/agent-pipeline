@@ -865,9 +865,11 @@ const PartialConfigSchema = z.object({
   conventions_md_path: z.string().optional().describe("Repo-root-relative path to the conventions file embedded in stage prompts."),
   domain_name: z.string().optional().describe("Human-readable project name used in prompts and logs."),
   domain_description: z.string().optional().describe("Short description of this repository for prompt context."),
-  // Worktree bootstrap: dependency install step (#174). Non-empty string →
-  // run that shell command; "" → skip entirely; absent → auto-detect from lockfile.
-  setup_command: z.string().optional().describe("Shell command to run in the worktree after creation, before the test gate."),
+  // Worktree bootstrap: dependency install step (#174, #1132). Non-empty
+  // string → run that shell command in the worktree root; "" → skip entirely;
+  // absent → auto-detect from a worktree-root lockfile, then from exactly one
+  // first-level nested lockfile. Multiple first-level lockfile dirs skip.
+  setup_command: z.string().optional().describe("Shell command to run in the worktree root after creation, before the test gate. When unset, auto-detect from a worktree-root lockfile, or from exactly one first-level subdirectory lockfile (e.g. core/package-lock.json). Multiple first-level lockfile directories skip auto-detect; set this command instead. Empty string skips install."),
   // Repo build command run after fix/auto-fix edits (#387). Mirrors setup_command:
   // a bare shell string, run via `bash -c`. Absent → inert, no build runs, no
   // default/guessed command, no auto-detection.
@@ -3859,8 +3861,10 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
     config.setup_command !== undefined
       ? `setup_command: ${yamlScalar(config.setup_command)} # SECURITY: runs an arbitrary shell command in the worktree with the harness's permissions, before the test gate; empty string skips`
       : [
-        '# setup_command: "pnpm install" # shell command to run in the worktree after creation, before the test gate (#174). SECURITY: runs with the harness\'s permissions — treat like any other repo-controlled build step.',
-        "#   Auto-detected from lockfile when absent (pnpm-lock.yaml -> pnpm install, yarn.lock -> yarn install, package-lock.json -> npm ci)",
+        '# setup_command: "pnpm install" # shell command to run in the worktree after creation, before the test gate (#174, #1132). SECURITY: runs with the harness\'s permissions — treat like any other repo-controlled build step.',
+        "#   Auto-detected from a worktree-root lockfile when absent (pnpm-lock.yaml -> pnpm install, yarn.lock -> yarn install, package-lock.json -> npm ci).",
+        "#   If the worktree root has no lockfile, auto-detect exactly one first-level subdirectory lockfile (e.g. core/package-lock.json) and install there.",
+        "#   Multiple first-level lockfile directories skip auto-detect — set setup_command instead. Deeper-than-first-level lockfiles are not auto-detected.",
         '#   Set to "" to skip the install step entirely (opt-out). Examples:',
         '#     setup_command: ""                                       # opt-out',
         '#     setup_command: "pnpm install --frozen-lockfile"         # override auto-detection',

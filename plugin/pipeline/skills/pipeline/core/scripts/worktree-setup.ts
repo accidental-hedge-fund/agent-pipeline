@@ -1,6 +1,6 @@
-// Worktree dependency install step (#174): detect and run the package manager
-// install (or a configured setup_command) in a freshly created worktree so
-// binaries are available before the test/build gate runs.
+// Worktree dependency install step (#174, #1132): detect and run the package
+// manager install (or a configured setup_command) in a freshly created
+// worktree so binaries are available before the test/build gate runs.
 //
 // Invoked immediately after createWorktree in the planning stage. Failures
 // throw an Error that the caller converts to a "worktree-setup-failed" block.
@@ -29,6 +29,10 @@ export interface SetupDeps {
     cwd: string,
     useShell: boolean,
   ) => Promise<{ code: number; stdout: string; stderr: string }>;
+  /** List first-level directory names under a path. Used after a root
+   *  lockfile miss to find exactly one nested package root. A thrown list
+   *  is treated as empty; `core/` is still probed. */
+  listDir?: (p: string) => string[];
 }
 
 function detectLockfile(
@@ -45,6 +49,64 @@ function detectLockfile(
     return { lockfile: "package-lock.json", cmd: "npm", args: ["ci"] };
   }
   return null;
+}
+
+function isIgnoredFirstLevelName(name: string): boolean {
+  return name === "node_modules" || name.startsWith(".");
+}
+
+function defaultListDir(dir: string): string[] {
+  return fs.readdirSync(dir, { withFileTypes: true })
+    .filter((e) => e.isDirectory())
+    .map((e) => e.name);
+}
+
+/** First-level subdirectory names to probe after a root-lockfile miss.
+ *  Listing is best-effort; a thrown list is treated as empty. `core/` is
+ *  always included so existsSync-only fakes still cover this repo. */
+function firstLevelCandidateNames(
+  worktreePath: string,
+  listDir?: (p: string) => string[],
+): string[] {
+  let listed: string[] = [];
+  const listFn = listDir ?? defaultListDir;
+  try {
+    listed = listFn(worktreePath);
+  } catch {
+    listed = [];
+  }
+  const names = new Set<string>();
+  for (const name of listed) {
+    if (!isIgnoredFirstLevelName(name)) names.add(name);
+  }
+  names.add("core");
+  return [...names];
+}
+
+function choosePackageRoot(
+  worktreePath: string,
+  existsFn: (p: string) => boolean,
+  listDir?: (p: string) => string[],
+): { packageRoot: string; lockfile: string; cmd: string; args: string[] } | null {
+  const rootDetected = detectLockfile(worktreePath, existsFn);
+  if (rootDetected) {
+    return { packageRoot: worktreePath, ...rootDetected };
+  }
+  const hits: { packageRoot: string; lockfile: string; cmd: string; args: string[] }[] = [];
+  for (const name of firstLevelCandidateNames(worktreePath, listDir)) {
+    const dir = path.join(worktreePath, name);
+    const detected = detectLockfile(dir, existsFn);
+    if (detected) {
+      hits.push({
+        packageRoot: dir,
+        lockfile: `${name}/${detected.lockfile}`,
+        cmd: detected.cmd,
+        args: detected.args,
+      });
+    }
+  }
+  if (hits.length !== 1) return null;
+  return hits[0];
 }
 
 const MAX_CAPTURED = 100_000;
@@ -154,12 +216,19 @@ async function defaultSpawnCommand(
  *
  * Precedence:
  *   1. `cfg.setup_command === ""` → skip (explicit opt-out)
- *   2. `cfg.setup_command` (non-empty) → run via shell (overrides all detection)
- *   3. `node_modules` already present AND no `setup_command` set → skip (idempotent)
- *   4. pnpm-lock.yaml → `pnpm install`
- *   5. yarn.lock → `yarn install`
- *   6. package-lock.json → `npm ci`
- *   7. No lockfile and no `setup_command` → skip
+ *   2. `cfg.setup_command` (non-empty) → run via shell at the worktree root
+ *      (overrides all detection)
+ *   3. Choose package root: worktree root if it has a lockfile; else exactly
+ *      one first-level subdirectory with a lockfile (always probe `core/`;
+ *      ignore `.git`, `node_modules`, and names that start with `.`; two or
+ *      more hits → skip)
+ *   4. `<packageRoot>/node_modules` already present AND no `setup_command`
+ *      set → skip (idempotent). A worktree-root `node_modules` does not skip
+ *      a nested install.
+ *   5. pnpm-lock.yaml → `pnpm install`
+ *   6. yarn.lock → `yarn install`
+ *   7. package-lock.json → `npm ci`
+ *   8. No package root and no `setup_command` → skip
  *
  * Throws on non-zero exit so the caller can surface the failure with a clear
  * error message and block the pipeline before any stage runs.
@@ -192,20 +261,20 @@ export async function detectAndInstall(
     return { skipped: false, command: label, stdout: res.stdout, stderr: res.stderr };
   }
 
-  // Idempotency: if node_modules already exists, skip auto-detection
-  if (existsFn(path.join(worktreePath, "node_modules"))) {
+  // Choose package root before the node_modules skip so a leftover root
+  // node_modules cannot suppress a nested core/ (or other first-level) install.
+  const chosen = choosePackageRoot(worktreePath, existsFn, deps.listDir);
+  if (!chosen) {
     return { skipped: true };
   }
 
-  // Auto-detect from lockfile
-  const detected = detectLockfile(worktreePath, existsFn);
-  if (!detected) {
+  if (existsFn(path.join(chosen.packageRoot, "node_modules"))) {
     return { skipped: true };
   }
 
-  const label = [detected.cmd, ...detected.args].join(" ");
-  console.log(`[pipeline] worktree setup: running \`${label}\` (detected from ${detected.lockfile})`);
-  const res = await spawnFn(detected.cmd, detected.args, worktreePath, false);
+  const label = [chosen.cmd, ...chosen.args].join(" ");
+  console.log(`[pipeline] worktree setup: running \`${label}\` (detected from ${chosen.lockfile})`);
+  const res = await spawnFn(chosen.cmd, chosen.args, chosen.packageRoot, false);
   if (res.code !== 0) {
     const combined = [res.stdout, res.stderr].map((s) => s.trim()).filter(Boolean).join("\n");
     throw new Error(
