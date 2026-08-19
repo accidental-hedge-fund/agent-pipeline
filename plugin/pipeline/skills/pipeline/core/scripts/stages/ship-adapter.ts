@@ -5,6 +5,7 @@
 // evidence producer. Each converge operation first observes external truth.
 
 import { execFile, execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { statSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -32,6 +33,7 @@ import {
 } from "../factory-reliability-gate.ts";
 import { FRG_HYBRID_PILOT_VERSION } from "../frg-pack-observations.ts";
 import {
+  FACTORY_RELEASE_REQUEST_KIND,
   factoryReleaseVersionIndexPath,
   isPostPilotReleaseVersion,
 } from "../factory-release-prepare.ts";
@@ -41,6 +43,8 @@ import { withLock } from "../lock.ts";
 import type { PipelineConfig } from "../types.ts";
 import {
   defaultShipStateStore,
+  shipKey,
+  shipStatePaths,
   type ShipCoordinatorDeps,
   type ShipFrgEvidence,
   type ShipFrgPackEvidence,
@@ -75,6 +79,8 @@ const execFileAsync = promisify(execFile);
 const OID_RE = /^[0-9a-f]{40}$/i;
 const RELEASE_WAIT_ATTEMPTS = 120;
 const RELEASE_WAIT_MS = 10_000;
+const FRG_WAIT_ATTEMPTS = 120;
+const FRG_WAIT_MS = 10_000;
 
 interface ObservedRelease {
   prepare: ShipReleaseEvidence;
@@ -150,6 +156,11 @@ export interface RealShipCoordinatorDepsOptions {
     opts: { version: string; mergeCommitOid: string },
   ) => Promise<void>;
   factoryReleaseRequestPath?: string;
+  /** Persist or resume the ship-bound factory-release request JSON. */
+  resolveFactoryReleaseRequestPath?(
+    intent: ShipIntent,
+    train: ShipTrainEvidence,
+  ): Promise<string>;
 }
 
 function requireOid(value: string, field: string): string {
@@ -883,6 +894,10 @@ export interface CandidateShipEndContext {
   env: NodeJS.ProcessEnv;
   nodeBin?: string;
   factoryReleaseRequestPath?: string;
+  resolveFactoryReleaseRequestPath?(
+    intent: ShipIntent,
+    train: ShipTrainEvidence,
+  ): Promise<string>;
   resolveCandidate(sha: string): Promise<CandidateEngineResult>;
   spawn(
     argv: string[],
@@ -892,6 +907,8 @@ export interface CandidateShipEndContext {
     engine: CandidateEngine,
     opts: { version: string; mergeCommitOid: string },
   ): Promise<void>;
+  delay?(ms: number): Promise<void>;
+  frgWaitAttempts?: number;
 }
 
 function candidateIdentityError(detail: string): Error {
@@ -907,6 +924,203 @@ async function spawnLeaf(
   const argv = [...shipEndCliPrefix(engine, ctx.nodeBin ?? "node"), ...leaf];
   assertShipEndLeafArgv(argv);
   return ctx.spawn(argv, env);
+}
+
+async function delayMs(ctx: CandidateShipEndContext, ms: number): Promise<void> {
+  if (ctx.delay) {
+    await ctx.delay(ms);
+    return;
+  }
+  await new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
+
+function parsePrepareStdout(stdout: string): Record<string, unknown> | null {
+  const text = String(stdout ?? "").trim();
+  if (!text) return null;
+  const tryParse = (raw: string): Record<string, unknown> | null => {
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  };
+  const direct = tryParse(text);
+  if (direct) return direct;
+  const brace = text.lastIndexOf("{");
+  return brace >= 0 ? tryParse(text.slice(brace)) : null;
+}
+
+function closedArtifactRef(ref: unknown): boolean {
+  if (!ref || typeof ref !== "object" || Array.isArray(ref)) return false;
+  const rec = ref as { path?: unknown; sha256?: unknown };
+  const p = String(rec.path ?? "").trim();
+  const sha = String(rec.sha256 ?? "").trim().toLowerCase();
+  if (!p || p === "/dev/null") return false;
+  if (sha.length !== 64 || sha === "0".repeat(64)) return false;
+  return /^[0-9a-f]{64}$/.test(sha);
+}
+
+function hasUnsignedEligibleArtifacts(parsed: Record<string, unknown> | null): boolean {
+  if (!parsed) return false;
+  const payloads = [parsed.frg, parsed.unsigned];
+  return payloads.some((payload) => {
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
+    const rec = payload as { observations?: unknown; evidence_bundle?: unknown };
+    return closedArtifactRef(rec.observations) && closedArtifactRef(rec.evidence_bundle);
+  });
+}
+
+type CandidatePrepareTick = "done" | "attest" | "retry" | "fail";
+
+function classifyCandidatePrepareTick(
+  parsed: Record<string, unknown> | null,
+  exitCode: number,
+): CandidatePrepareTick {
+  const status = typeof parsed?.status === "string" ? parsed.status : null;
+  if (status === "complete") return "done";
+  if (status === "awaiting_frg_attestation") return "attest";
+  if (status === "in_progress") {
+    return hasUnsignedEligibleArtifacts(parsed) ? "attest" : "retry";
+  }
+  if (status === "failed" || status === "error" || status === "missing" || !parsed || exitCode !== 0) {
+    return "fail";
+  }
+  return "fail";
+}
+
+function prepareLoopRunId(parsed: Record<string, unknown> | null): string {
+  if (!parsed) return "";
+  const top = typeof parsed.loop_run_id === "string" ? parsed.loop_run_id.trim() : "";
+  if (top) return top;
+  const frg = parsed.frg;
+  if (frg && typeof frg === "object" && !Array.isArray(frg)) {
+    const nested = (frg as { loop_run_id?: unknown }).loop_run_id;
+    if (typeof nested === "string") return nested.trim();
+  }
+  return "";
+}
+
+async function resolveCandidateFactoryReleaseRequestPath(
+  ctx: CandidateShipEndContext,
+  intent: ShipIntent,
+  train: ShipTrainEvidence,
+): Promise<string> {
+  const provided = ctx.factoryReleaseRequestPath?.trim();
+  if (provided) {
+    if (!path.isAbsolute(provided)) {
+      throw new Error("ship FRG: factory-release prepare request path must be absolute");
+    }
+    return provided;
+  }
+  if (typeof ctx.resolveFactoryReleaseRequestPath === "function") {
+    const resolved = String(await ctx.resolveFactoryReleaseRequestPath(intent, train) ?? "").trim();
+    if (!resolved || !path.isAbsolute(resolved)) {
+      throw new Error("ship FRG: resolved factory-release prepare request path must be absolute");
+    }
+    return resolved;
+  }
+  throw new Error(
+    "ship FRG: missing factory-release prepare request path; will not skip candidate factory-release prepare",
+  );
+}
+
+export function persistedShipFactoryReleaseRequestPath(
+  intent: ShipIntent,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  return path.join(
+    path.dirname(shipStatePaths(shipKey(intent), env).status_file),
+    "factory-release-prepare-request.json",
+  );
+}
+
+export async function persistShipFactoryReleaseRequest(
+  intent: ShipIntent,
+  train: ShipTrainEvidence,
+  opts: { repoDir: string; env: NodeJS.ProcessEnv },
+): Promise<string> {
+  const dest = persistedShipFactoryReleaseRequestPath(intent, opts.env);
+  try {
+    const existing = await fs.readFile(dest, "utf8");
+    if (existing.trim()) return dest;
+  } catch {
+    // Write a fresh request for this ship key.
+  }
+  const manifestPath = path.join(
+    opts.repoDir,
+    "core",
+    "scripts",
+    "frg-packs",
+    "factory-gate-v1",
+    "manifest.json",
+  );
+  let raw: Buffer;
+  try {
+    raw = await fs.readFile(manifestPath);
+  } catch {
+    throw new Error(
+      `ship FRG: cannot write factory-release request; manifest missing at ${manifestPath}`,
+    );
+  }
+  let packId = "factory-gate-v1";
+  try {
+    const pack = JSON.parse(raw.toString("utf8")) as { pack_id?: unknown };
+    if (typeof pack.pack_id === "string" && pack.pack_id.trim()) packId = pack.pack_id.trim();
+  } catch {
+    throw new Error(`ship FRG: factory-release request manifest is not JSON: ${manifestPath}`);
+  }
+  const request = {
+    schema_version: 1,
+    kind: FACTORY_RELEASE_REQUEST_KIND,
+    action_id: `pipeline-ship-${intent.version}`,
+    repository: intent.repository,
+    base_branch: intent.base_branch,
+    target_version: intent.version,
+    milestone: intent.milestone,
+    integrated_candidate: { git_sha: train.integrated_head_oid },
+    frg_manifest: {
+      pack_id: packId,
+      sha256: createHash("sha256").update(raw).digest("hex"),
+    },
+  };
+  await fs.mkdir(path.dirname(dest), { recursive: true, mode: 0o700 });
+  await fs.writeFile(dest, `${JSON.stringify(request, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  return dest;
+}
+
+export async function defaultSpawnCandidateEnsureTag(
+  engine: CandidateEngine,
+  tagOpts: { version: string; mergeCommitOid: string },
+  repoDir: string,
+  io?: {
+    git?: (args: string[]) => Promise<string>;
+    validateFrg?: () => Promise<void>;
+  },
+): Promise<void> {
+  if (!engine.engineRoot || !engine.commitSha) {
+    throw new Error(
+      "ship release: candidate ensureAnnotatedReleaseTag cannot run without a resolved candidate checkout",
+    );
+  }
+  const git = io?.git ?? (async (args: string[]): Promise<string> => {
+    const { stdout } = await execFileAsync("git", args, {
+      cwd: engine.engineRoot,
+      timeout: 120_000,
+      maxBuffer: 10 * 1024 * 1024,
+    });
+    return String(stdout).trim();
+  });
+  await ensureAnnotatedReleaseTag({
+    version: tagOpts.version,
+    mergeCommitOid: tagOpts.mergeCommitOid,
+    git,
+    validateFrg: io?.validateFrg ??
+      (() => validateFrgEvidenceFileForTag(repoDir, tagOpts.version).then(() => undefined)),
+  });
 }
 
 /**
@@ -940,39 +1154,48 @@ export function bindCandidateShipEndOperations(
         await pinOps.runFrgPack?.(intent, train);
         return;
       }
-      const requestPath = ctx.factoryReleaseRequestPath;
-      if (!requestPath) return;
-      const prep = await spawnLeaf(
-        ctx,
-        engine,
-        shipEndLeafArgv("factory-release-prepare", { requestPath }),
-        uncredentialedPrepareEnv(ctx.env),
-      );
-      if (prep.code !== 0 && !/awaiting_frg_attestation|in_progress|complete/.test(prep.stdout)) {
+      const requestPath = await resolveCandidateFactoryReleaseRequestPath(ctx, intent, train);
+      const attempts = ctx.frgWaitAttempts ?? FRG_WAIT_ATTEMPTS;
+      for (let attempt = 0; attempt < attempts; attempt++) {
+        const prep = await spawnLeaf(
+          ctx,
+          engine,
+          shipEndLeafArgv("factory-release-prepare", { requestPath }),
+          uncredentialedPrepareEnv(ctx.env),
+        );
+        const parsed = parsePrepareStdout(prep.stdout);
+        const verdict = classifyCandidatePrepareTick(parsed, prep.code);
+        if (verdict === "done") return;
+        if (verdict === "attest") {
+          const loopRunId = prepareLoopRunId(parsed);
+          if (!loopRunId) {
+            throw new Error("ship FRG: candidate factory-release prepare is eligible but missing loop_run_id");
+          }
+          const gate = await spawnLeaf(
+            ctx,
+            engine,
+            shipEndLeafArgv("factory-gate", { version: intent.version, loopRunId }),
+            attestorChildEnv(ctx.env),
+          );
+          if (gate.code !== 0) {
+            throw new Error(
+              `ship FRG: candidate factory-gate failed (exit ${gate.code}): ${gate.stderr || gate.stdout}`,
+            );
+          }
+          return;
+        }
+        if (verdict === "retry") {
+          if (attempt + 1 < attempts) await delayMs(ctx, FRG_WAIT_MS);
+          continue;
+        }
         throw new Error(
           `ship FRG: candidate factory-release prepare failed (exit ${prep.code}): ${prep.stderr || prep.stdout}`,
         );
       }
-      let loopRunId = "";
-      try {
-        const parsed = JSON.parse(prep.stdout) as { loop_run_id?: string; frg?: { loop_run_id?: string } };
-        loopRunId = String(parsed.frg?.loop_run_id || parsed.loop_run_id || "").trim();
-      } catch {
-        loopRunId = "";
-      }
-      if (loopRunId) {
-        const gate = await spawnLeaf(
-          ctx,
-          engine,
-          shipEndLeafArgv("factory-gate", { version: intent.version, loopRunId }),
-          attestorChildEnv(ctx.env),
-        );
-        if (gate.code !== 0) {
-          throw new Error(
-            `ship FRG: candidate factory-gate failed (exit ${gate.code}): ${gate.stderr || gate.stdout}`,
-          );
-        }
-      }
+      throw new Error(
+        `ship FRG: candidate factory-release prepare still in_progress after ${attempts} ticks; ` +
+          "retry the same ship command to resume the bound pack",
+      );
     },
     async prepareRelease(intent, candidateHeadOid) {
       const engine = await requireCandidate(candidateHeadOid);
@@ -1025,12 +1248,15 @@ export function bindCandidateShipEndOperations(
       if (!shouldSpawn(release.candidate_head_oid)) {
         return pinOps.waitForPublication(intent, release);
       }
-      if (ctx.spawnEnsureTag) {
-        await ctx.spawnEnsureTag(engine, {
-          version: intent.version,
-          mergeCommitOid: release.merge_commit_oid,
-        });
+      if (typeof ctx.spawnEnsureTag !== "function") {
+        throw new Error(
+          "ship release: candidate ensureAnnotatedReleaseTag is required; will not skip tag or fall back to pin",
+        );
       }
+      await ctx.spawnEnsureTag(engine, {
+        version: intent.version,
+        mergeCommitOid: release.merge_commit_oid,
+      });
       for (let attempt = 0; attempt < RELEASE_WAIT_ATTEMPTS; attempt++) {
         const observed = await pinOps.observePublication(intent, release);
         if (observed) return observed;
@@ -1165,9 +1391,14 @@ export function realShipCoordinatorDeps(opts: RealShipCoordinatorDepsOptions): S
     env,
     nodeBin: process.execPath,
     factoryReleaseRequestPath: opts.factoryReleaseRequestPath,
+    resolveFactoryReleaseRequestPath:
+      opts.resolveFactoryReleaseRequestPath ??
+      ((intent, train) => persistShipFactoryReleaseRequest(intent, train, { repoDir: opts.repoDir, env })),
     resolveCandidate: resolve,
     spawn,
-    spawnEnsureTag: opts.spawnEnsureTag,
+    spawnEnsureTag:
+      opts.spawnEnsureTag ??
+      ((engine, tagOpts) => defaultSpawnCandidateEnsureTag(engine, tagOpts, opts.repoDir)),
   });
   return shipCoordinatorDepsFromOperations(ops, {
     state: opts.state ?? defaultShipStateStore(opts.env),

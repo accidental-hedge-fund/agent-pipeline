@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -7,7 +8,10 @@ import {
   alignReleaseCheckoutToCandidate,
   assertFrgCandidateProvenance,
   bindCandidateShipEndOperations,
+  defaultSpawnCandidateEnsureTag,
   ensureAnnotatedReleaseTag,
+  persistShipFactoryReleaseRequest,
+  persistedShipFactoryReleaseRequestPath,
   shipCoordinatorDepsFromOperations,
   verifyAnnotatedReleaseTag,
   type ShipAdapterOperations,
@@ -530,10 +534,18 @@ test("pin SHA ≠ candidate: post-train prepare/release/tag spawn candidate laun
       // Prepare must stay uncredentialed (#1133). The attestor child inherits KEY.
       if (argv.includes("factory-release")) {
         assert.equal(env.PIPELINE_FRG_ATTESTATION_KEY, undefined);
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            status: "awaiting_frg_attestation",
+            frg: { loop_run_id: "loop-1" },
+          }),
+          stderr: "",
+        };
       }
       assert.ok(!argv.includes("ship"));
       assert.ok(!argv.includes("train"));
-      return { code: 0, stdout: JSON.stringify({ status: "in_progress", loop_run_id: "loop-1" }), stderr: "" };
+      return { code: 0, stdout: "", stderr: "" };
     },
     spawnEnsureTag: async (engine) => {
       tags.push(engine.launcherPath);
@@ -546,6 +558,7 @@ test("pin SHA ≠ candidate: post-train prepare/release/tag spawn candidate laun
   assert.equal(preparedInProcess, false);
   assert.equal(taggedInProcess, false);
   assert.ok(spawned.some((argv) => argv.includes("factory-release") && argv.includes("/cand/scripts/pipeline-launcher.mjs")));
+  assert.ok(spawned.some((argv) => argv.includes("factory-gate") && argv.includes("--from-run")));
   assert.ok(spawned.some((argv) => argv[argv.length - 2] === "release" || argv.includes("release")));
   assert.deepEqual(tags, ["/cand/scripts/pipeline-launcher.mjs"]);
   for (const argv of spawned) {
@@ -617,4 +630,247 @@ test("matching pin SHA keeps in-process pin prepare", async () => {
   await bound.prepareRelease(intent, head);
   assert.equal(preparedInProcess, true);
   assert.deepEqual(spawned, []);
+});
+
+test("in_progress prepare re-invokes prepare and does not factory-gate until eligible", async () => {
+  const spawned: string[][] = [];
+  let prepareTicks = 0;
+  const bound = bindCandidateShipEndOperations(operations(), {
+    pinCommitSha: PIN_SHA,
+    repoDir: "/repo",
+    env: {},
+    factoryReleaseRequestPath: "/abs/req.json",
+    frgWaitAttempts: 5,
+    delay: async () => {},
+    resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+    spawn: async (argv) => {
+      spawned.push(argv);
+      if (argv.includes("factory-release")) {
+        prepareTicks++;
+        if (prepareTicks < 3) {
+          return {
+            code: 0,
+            stdout: JSON.stringify({ status: "in_progress", loop_run_id: "loop-1" }),
+            stderr: "",
+          };
+        }
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            status: "awaiting_frg_attestation",
+            frg: { loop_run_id: "loop-1" },
+          }),
+          stderr: "",
+        };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+  });
+  await bound.runFrgPack!(intent, train);
+  const prepares = spawned.filter((argv) => argv.includes("factory-release"));
+  const gates = spawned.filter((argv) => argv.includes("factory-gate"));
+  assert.equal(prepares.length, 3);
+  assert.equal(gates.length, 1);
+  assert.ok(gates[0]!.includes("loop-1"));
+  assert.ok(
+    spawned.findIndex((argv) => argv.includes("factory-gate")) >
+      spawned.findIndex((argv) => argv.includes("factory-release")),
+  );
+});
+
+test("in_progress prepare within wait budget does not invoke factory-gate", async () => {
+  const spawned: string[][] = [];
+  const bound = bindCandidateShipEndOperations(operations(), {
+    pinCommitSha: PIN_SHA,
+    repoDir: "/repo",
+    env: {},
+    factoryReleaseRequestPath: "/abs/req.json",
+    frgWaitAttempts: 2,
+    delay: async () => {},
+    resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+    spawn: async (argv) => {
+      spawned.push(argv);
+      return {
+        code: 0,
+        stdout: JSON.stringify({ status: "in_progress", loop_run_id: "loop-1" }),
+        stderr: "",
+      };
+    },
+  });
+  await assert.rejects(
+    bound.runFrgPack!(intent, train),
+    /still in_progress/,
+  );
+  assert.equal(spawned.filter((argv) => argv.includes("factory-release")).length, 2);
+  assert.equal(spawned.filter((argv) => argv.includes("factory-gate")).length, 0);
+});
+
+test("missing request path fails closed before candidate FRG prepare", async () => {
+  const spawned: string[][] = [];
+  const bound = bindCandidateShipEndOperations(operations({
+    observeFrg: async () => {
+      throw new Error("observeFrg must not run from runFrgPack");
+    },
+  }), {
+    pinCommitSha: PIN_SHA,
+    repoDir: "/repo",
+    env: {},
+    resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+    spawn: async (argv) => {
+      spawned.push(argv);
+      return { code: 0, stdout: "", stderr: "" };
+    },
+  });
+  await assert.rejects(
+    bound.runFrgPack!(intent, train),
+    /missing factory-release prepare request path/,
+  );
+  assert.deepEqual(spawned, []);
+});
+
+test("injected request resolver supplies the persisted prepare path when option is omitted", async () => {
+  const spawned: string[][] = [];
+  const bound = bindCandidateShipEndOperations(operations(), {
+    pinCommitSha: PIN_SHA,
+    repoDir: "/repo",
+    env: {},
+    resolveFactoryReleaseRequestPath: async () => "/state/ships/ship-key/factory-release-prepare-request.json",
+    resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+    spawn: async (argv) => {
+      spawned.push(argv);
+      if (argv.includes("factory-release")) {
+        return {
+          code: 0,
+          stdout: JSON.stringify({ status: "complete" }),
+          stderr: "",
+        };
+      }
+      throw new Error(`unexpected spawn ${argv.join(" ")}`);
+    },
+  });
+  await bound.runFrgPack!(intent, train);
+  assert.ok(spawned.some((argv) => argv.includes("/state/ships/ship-key/factory-release-prepare-request.json")));
+  assert.equal(spawned.filter((argv) => argv.includes("factory-gate")).length, 0);
+});
+
+test("default candidate tag path tags from the resolved candidate checkout", async () => {
+  const gitCalls: string[][] = [];
+  const bound = bindCandidateShipEndOperations(operations({
+    observePublication: async () => publication,
+  }), {
+    pinCommitSha: PIN_SHA,
+    repoDir: "/repo",
+    env: {},
+    resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+    spawn: async () => {
+      throw new Error("spawn must not run for default tag");
+    },
+    spawnEnsureTag: (engine, tagOpts) => defaultSpawnCandidateEnsureTag(engine, tagOpts, "/repo", {
+      git: async (args) => {
+        gitCalls.push(args);
+        if (args[0] === "cat-file") throw new Error("not a valid object");
+        return "";
+      },
+      validateFrg: async () => {},
+    }),
+  });
+  const result = await bound.waitForPublication(intent, releaseFinish);
+  assert.deepEqual(result, publication);
+  assert.ok(gitCalls.some((args) => args[0] === "tag" && args[1] === "-a" && args[2] === `v${intent.version}`));
+  assert.ok(gitCalls.some((args) => args[0] === "push" && args.includes(`refs/tags/v${intent.version}`)));
+});
+
+test("default candidate tag path fails closed without a candidate checkout", async () => {
+  await assert.rejects(
+    defaultSpawnCandidateEnsureTag(
+      { engineRoot: "", launcherPath: "", commitSha: "" },
+      { version: intent.version, mergeCommitOid: mergeHead },
+      "/repo",
+      {
+        git: async () => {
+          throw new Error("git must not run");
+        },
+      },
+    ),
+    /cannot run without a resolved candidate checkout/,
+  );
+});
+
+test("candidate waitForPublication fails closed when spawnEnsureTag is omitted", async () => {
+  let observed = 0;
+  const bound = bindCandidateShipEndOperations(operations({
+    observePublication: async () => {
+      observed++;
+      return publication;
+    },
+  }), {
+    pinCommitSha: PIN_SHA,
+    repoDir: "/repo",
+    env: {},
+    resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+    spawn: async () => {
+      throw new Error("spawn must not run for tag");
+    },
+  });
+  await assert.rejects(
+    bound.waitForPublication(intent, releaseFinish),
+    /candidate ensureAnnotatedReleaseTag is required/,
+  );
+  assert.equal(observed, 0);
+});
+
+test("real coordinator defaults bind candidate tag and request persist (review 1)", () => {
+  const shipAdapter = fs.readFileSync(
+    path.join(__dirname, "..", "scripts", "stages", "ship-adapter.ts"),
+    "utf8",
+  );
+  const shipCode = shipAdapter
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/\/\/[^\n]*/g, "");
+  assert.match(
+    shipCode,
+    /spawnEnsureTag:\s*opts\.spawnEnsureTag\s*\?\?/,
+    "realShipCoordinatorDeps must default spawnEnsureTag rather than forward undefined",
+  );
+  assert.ok(
+    shipCode.includes("defaultSpawnCandidateEnsureTag"),
+    "real coordinator must bind defaultSpawnCandidateEnsureTag when spawnEnsureTag is omitted",
+  );
+  assert.match(
+    shipCode,
+    /resolveFactoryReleaseRequestPath:\s*opts\.resolveFactoryReleaseRequestPath\s*\?\?/,
+    "realShipCoordinatorDeps must default the factory-release request persist/resume path",
+  );
+  assert.ok(
+    shipCode.includes("persistShipFactoryReleaseRequest"),
+    "real coordinator must persist a ship-bound factory-release request when path is omitted",
+  );
+  const dest = persistedShipFactoryReleaseRequestPath(intent, { AGENT_PIPELINE_STATE_HOME: "/tmp/ap-state" });
+  assert.ok(path.isAbsolute(dest));
+  assert.match(dest, /factory-release-prepare-request\.json$/);
+  assert.ok(dest.includes("ships"));
+});
+
+test("persistShipFactoryReleaseRequest writes a secret-free request and reuses it", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ship-frg-req-"));
+  const repoDir = path.join(tmp, "repo");
+  const stateHome = path.join(tmp, "state");
+  const manifestDir = path.join(repoDir, "core/scripts/frg-packs/factory-gate-v1");
+  fs.mkdirSync(manifestDir, { recursive: true });
+  fs.writeFileSync(path.join(manifestDir, "manifest.json"), JSON.stringify({ pack_id: "factory-gate-v1" }));
+  const env = { AGENT_PIPELINE_STATE_HOME: stateHome };
+  try {
+    const first = await persistShipFactoryReleaseRequest(intent, train, { repoDir, env });
+    const second = await persistShipFactoryReleaseRequest(intent, train, { repoDir, env });
+    assert.equal(first, second);
+    const request = JSON.parse(fs.readFileSync(first, "utf8")) as Record<string, unknown>;
+    assert.equal(request.kind, "factory_release_prepare_request");
+    assert.equal(request.target_version, intent.version);
+    assert.deepEqual(request.integrated_candidate, { git_sha: head });
+    assert.equal(request.PIPELINE_FRG_ATTESTATION_KEY, undefined);
+    assert.equal(request.pass, undefined);
+    assert.equal(request.credential, undefined);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 });
