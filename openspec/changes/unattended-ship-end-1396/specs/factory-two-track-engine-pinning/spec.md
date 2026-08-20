@@ -24,3 +24,12 @@ Non-skip `pipeline engine-promote` SHALL set production pin `git_sha` to the pee
 - **WHEN** annotated tag `vX.Y.Z` cannot be peeled to a 40-hex commit
 - **THEN** non-skip engine-promote SHALL refuse
 - **AND** it SHALL NOT write `git_sha` null
+
+#### Scenario: Explicit packed gitSha does not replace peel
+
+- **WHEN** non-skip engine-promote is given an explicit `gitSha` equal to packed HMAC `candidate_git_sha`
+- **AND** that packed SHA is an ancestor of peeled `vX.Y.Z^{commit}`
+- **AND** `latest.json` `pass` is true
+- **THEN** the production pin SHALL write `git_sha` equal to the peeled tag commit
+- **AND** it SHALL NOT write the packed ancestor
+- **AND** it SHALL still resolve `${tag}^{commit}` rather than treating `gitSha` as the peel

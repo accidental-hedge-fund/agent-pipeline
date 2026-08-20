@@ -138,6 +138,7 @@ export function requirePeeledOid(raw: string, label: string): string {
 /**
  * Peel vX.Y.Z, require FRG pass:true, require packed candidate is peel or ancestor.
  * Returns the peeled 40-hex commit. Never returns null.
+ * `opts.gitSha` is a cross-check only: never used as the peel (#1162).
  */
 export async function resolvePeeledPromoteGitSha(
   opts: {
@@ -151,10 +152,19 @@ export async function resolvePeeledPromoteGitSha(
     readLatestJson?: (version: string) => { pass?: unknown; pack_provenance?: { candidate_git_sha?: unknown } } | null;
   },
 ): Promise<string> {
-  const peelRaw = opts.gitSha && String(opts.gitSha).trim()
-    ? String(opts.gitSha).trim()
-    : (await io.git(["rev-parse", "--verify", `${opts.tag}^{commit}`])).stdout;
-  const peel = requirePeeledOid(peelRaw, `peeled ${opts.tag}`);
+  const peeled = await io.git(["rev-parse", "--verify", `${opts.tag}^{commit}`]);
+  const peel = requirePeeledOid(peeled.stdout, `peeled ${opts.tag}`);
+  if (opts.gitSha && String(opts.gitSha).trim()) {
+    const provided = requirePeeledOid(String(opts.gitSha).trim(), "explicit gitSha");
+    if (provided !== peel) {
+      const ancestor = await io.git(["merge-base", "--is-ancestor", provided, peel]);
+      if (ancestor.status !== 0) {
+        throw new Error(
+          `engine-promote: explicit gitSha ${provided.slice(0, 12)} is not peeled ${opts.tag} and is not an ancestor of peel ${peel.slice(0, 12)}`,
+        );
+      }
+    }
+  }
   const latest = io.readLatestJson?.(opts.version) ?? null;
   if (!latest || latest.pass !== true) {
     throw new Error(

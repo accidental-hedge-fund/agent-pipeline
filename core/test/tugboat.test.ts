@@ -4526,6 +4526,92 @@ test("tugboat after train re-execs candidate tugboat.sh and skip-train omits tra
   }
 });
 
+test("tugboat composer re-exec retains ship lock held by same PID (#1164)", () => {
+  const src = fs.readFileSync(tugboat, "utf8");
+  const shipOne = tugboatShipOneBody();
+  const lockFn = src.match(/^try_acquire_ship_lock\(\) \{[\s\S]*?\n\}/m);
+  assert.ok(lockFn, "try_acquire_ship_lock missing");
+  assert.match(
+    shipOne,
+    /cat "\$lock_dir\/pid"[\s\S]*?== "\$\$"/,
+    "retain-lock must compare lock/pid to current $$",
+  );
+  assert.match(shipOne, /retained after composer re-exec pid=\$\$/);
+  assert.match(
+    lockFn[0],
+    /"\$holder" == "\$\$"/,
+    "try_acquire must retain a lock already held by $$",
+  );
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-lock-reexec-"));
+  try {
+    const runDir = path.join(dir, "ship-v1.39.6");
+    const lockDir = path.join(runDir, "lock");
+    fs.mkdirSync(lockDir, { recursive: true });
+    const logFile = path.join(runDir, "playbook.log");
+    const parent = path.join(dir, "parent.sh");
+    const child = path.join(dir, "tugboat.sh");
+    const helpers = [
+      extractLiveShipHelpers(src),
+      lockFn[0],
+    ].join("\n");
+    fs.writeFileSync(
+      child,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        `RUN_DIR=${JSON.stringify(runDir)}`,
+        `LOG_FILE=${JSON.stringify(logFile)}`,
+        "lock_dir=\"$RUN_DIR/lock\"",
+        "version=1.39.6",
+        "log() { printf '%s\\n' \"$*\" | tee -a \"$LOG_FILE\" >/dev/null; echo \"$*\"; }",
+        helpers,
+        "if [[ \"${TUGBOAT_SKIP_TRAIN:-}\" == \"1\" ]] && [[ -f \"$lock_dir/pid\" ]] \\",
+        "  && [[ \"$(cat \"$lock_dir/pid\" 2>/dev/null || true)\" == \"$$\" ]]; then",
+        "  log \"phase lock: retained after composer re-exec pid=$$\"",
+        "  echo \"RETAINED:$$:$(cat \"$lock_dir/pid\")\"",
+        "elif ! holder=$(try_acquire_ship_lock \"$RUN_DIR\" \"$version\"); then",
+        "  log \"another tugboat holds the lock (pid ${holder:-?}) — refusing duplicate ship\"",
+        "  echo \"REFUSED:${holder:-?}:$$\"",
+        "  exit 0",
+        "else",
+        "  echo \"ACQUIRED:$$:$(cat \"$lock_dir/pid\")\"",
+        "fi",
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(child, 0o755);
+    fs.writeFileSync(
+      parent,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        `RUN_DIR=${JSON.stringify(runDir)}`,
+        "mkdir -p \"$RUN_DIR/lock\"",
+        "printf '%s\\n' \"$$\" >\"$RUN_DIR/lock/pid\"",
+        "printf '%s\\n' \"$$\" >\"$RUN_DIR/playbook.pid\"",
+        "export TUGBOAT_SKIP_TRAIN=1",
+        `exec bash ${JSON.stringify(child)} --milestone v1.39.6`,
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(parent, 0o755);
+    const r = spawnSync("bash", [parent], { encoding: "utf8" });
+    assert.equal(r.status, 0, `re-exec lock path exited ${r.status}: ${r.stdout}\n${r.stderr}`);
+    assert.match(r.stdout, /^RETAINED:/m);
+    assert.doesNotMatch(r.stdout, /REFUSED:/);
+    assert.doesNotMatch(r.stdout, /ACQUIRED:/);
+    assert.match(r.stdout, /retained after composer re-exec pid=/);
+    const holder = fs.readFileSync(path.join(lockDir, "pid"), "utf8").trim();
+    const retained = r.stdout.match(/^RETAINED:(\d+):(\d+)/m);
+    assert.ok(retained, `expected RETAINED:pid:pid, got ${r.stdout}`);
+    assert.equal(retained[1], retained[2], "exec must keep the same PID as lock/pid");
+    assert.equal(holder, retained[1]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("tugboat wait-release polls gh release view and never creates the Release (#1167)", () => {
   const shipOne = tugboatShipOneBody();
   assert.match(shipOne, /gh release view "v\$version"/);

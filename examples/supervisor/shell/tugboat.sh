@@ -1636,6 +1636,11 @@ try_acquire_ship_lock() {
   fi
 
   holder=$(cat "$lock_dir/pid" 2>/dev/null || true)
+  # Same PID still owns the lock after candidate composer exec (#1164).
+  if [[ -n "$holder" && "$holder" == "$$" ]]; then
+    printf '%s\n' "$$" >"$run_dir/playbook.pid"
+    return 0
+  fi
   if [[ -n "$holder" && "$holder" != "$$" ]] && kill -0 "$holder" 2>/dev/null; then
     # Only refuse if the holder is still a live ship for THIS milestone —
     # bare kill -0, or a live train/tugboat for another milestone, is reclaimed.

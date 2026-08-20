@@ -563,6 +563,33 @@ test("resolvePeeledPromoteGitSha accepts packed ancestor of peel (#1166)", async
   assert.equal(sha, peel);
 });
 
+test("resolvePeeledPromoteGitSha does not use packed gitSha as peel (#1162)", async () => {
+  const peel = "1".repeat(40);
+  const packed = "2".repeat(40);
+  const gitCalls: string[][] = [];
+  const sha = await resolvePeeledPromoteGitSha(
+    { repoDir: "/repo", version: "1.39.5", tag: "v1.39.5", gitSha: packed },
+    {
+      git: async (args) => {
+        gitCalls.push(args);
+        if (args[0] === "rev-parse") return { stdout: peel, status: 0 };
+        if (args[0] === "merge-base") return { stdout: "", status: 0 };
+        return { stdout: "", status: 1 };
+      },
+      readLatestJson: () => ({
+        pass: true,
+        pack_provenance: { candidate_git_sha: packed },
+      }),
+    },
+  );
+  assert.equal(sha, peel);
+  assert.ok(
+    gitCalls.some((a) => a[0] === "rev-parse" && a.includes("v1.39.5^{commit}")),
+    `must peel v1.39.5^{commit}, git calls=${JSON.stringify(gitCalls)}`,
+  );
+  assert.notEqual(sha, packed);
+});
+
 test("resolvePeeledPromoteGitSha refuses latest.json pass not true (#1166)", async () => {
   await assert.rejects(
     () =>
