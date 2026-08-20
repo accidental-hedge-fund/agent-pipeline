@@ -166,6 +166,39 @@ function restoreInvoked(commands: string[][]): boolean {
   );
 }
 
+/** True when a recorded `git add` argv names `.agent-pipeline/frg` or any path under it. */
+function gitAddTouchesFrg(argv: string[] | undefined): boolean {
+  if (!argv) return false;
+  return argv.some(
+    (part) =>
+      part === ".agent-pipeline/frg" ||
+      part.startsWith(".agent-pipeline/frg/") ||
+      part.includes(".agent-pipeline/frg"),
+  );
+}
+
+/** True when restore `git checkout --` or `git clean` named the FRG tree. */
+function restoreTouchedFrg(commands: string[][]): boolean {
+  return commands.some(
+    (command) =>
+      command[0] === "git" &&
+      (command[1] === "clean" || (command[1] === "checkout" && command[2] === "--")) &&
+      command.some((part) => part.includes(".agent-pipeline/frg")),
+  );
+}
+
+function checkedOutBranch(commands: string[][], name: string): boolean {
+  return commands.some(
+    (c) => c[0] === "git" && c[1] === "checkout" && c[2] === name && !c.includes("-b"),
+  );
+}
+
+function deletedLocalBranch(commands: string[][], name: string): boolean {
+  return commands.some(
+    (c) => c[0] === "git" && c[1] === "branch" && c.includes("-d") && c.includes(name),
+  );
+}
+
 // ---------------------------------------------------------------------------
 // 10.2 resolveVersion
 // ---------------------------------------------------------------------------
@@ -2505,10 +2538,8 @@ test("runRelease: skipFrg proceeds without FRG and does not call requireFrgPass"
   assert.ok(!/Factory Reliability Gate/.test(prBody), "PR body should omit FRG section when skipped");
   const add = commands.find((c) => c[0] === "git" && c[1] === "add");
   assert.ok(add, "must stage release files");
-  assert.ok(
-    !add.some((a) => a.includes(".agent-pipeline/frg/")),
-    "must not stage FRG evidence dir when skipFrg",
-  );
+  assert.ok(!gitAddTouchesFrg(add), "must not stage FRG evidence dir when skipFrg");
+  assert.ok(!add.includes("-f"), "must not git add -f when skipFrg");
 });
 
 test("runRelease: skip_frg false still requires FRG without --skip-frg (#1092)", async () => {
@@ -2685,7 +2716,7 @@ test("runRelease: FRG pass attaches run_id to PR body (live path)", async () => 
   assert.match(prBody, /pass/);
 });
 
-test("runRelease: release commit stages only the validated version FRG directory", async () => {
+test("runRelease: git add after FRG pass must not include gitignored .agent-pipeline/frg (#1148)", async () => {
   const commands: string[][] = [];
   const deps = liveReleaseDeps({
     fetchPRClosingIssues: async (n) => (n === 204 ? [158, 170] : []),
@@ -2705,12 +2736,19 @@ test("runRelease: release commit stages only the validated version FRG directory
 
   const add = commands.find((command) => command[0] === "git" && command[1] === "add");
   assert.ok(add, "release must stage its commit inputs");
-  assert.ok(add.includes(".agent-pipeline/frg/1.6.0"));
-  assert.ok(!add.includes(".agent-pipeline/frg"), "must not stage evidence for every version");
-  assert.ok(!add.some((part) => part.includes("1.5.0")), "must not stage prior-version evidence");
+  assert.ok(
+    !gitAddTouchesFrg(add),
+    `git add must not name gitignored FRG, got: ${add.join(" ")}`,
+  );
+  assert.ok(!add.includes("-f"), "must not git add -f the FRG tree");
+  assert.ok(add.includes("package.json"));
+  assert.ok(add.includes("core/package.json"));
+  assert.ok(add.includes("ROADMAP.md"));
+  assert.ok(add.includes("plugin/"));
+  assert.ok(!add.includes("CHANGELOG.md"), "prepare must not stage CHANGELOG.md");
 });
 
-test("runRelease: a post-staging failure preserves the validated FRG input", async () => {
+test("runRelease: release commit does not stage gitignored FRG after a pass (#1148)", async () => {
   const commands: string[][] = [];
   const deps = liveReleaseDeps({
     fetchPRClosingIssues: async (n) => (n === 204 ? [158, 170] : []),
@@ -2722,8 +2760,98 @@ test("runRelease: a post-staging failure preserves the validated FRG input", asy
       if (cmd === "git" && args[0] === "describe") {
         return { code: 0, stdout: "v1.5.0", stderr: "" };
       }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+  });
+
+  await runRelease("1.6.0", { noEdit: true }, { repo_dir: "/repo", repo: "org/repo" }, deps);
+
+  const add = commands.find((command) => command[0] === "git" && command[1] === "add");
+  assert.ok(add, "release must stage its commit inputs");
+  assert.ok(!gitAddTouchesFrg(add), `git add must not include FRG, got: ${add.join(" ")}`);
+  assert.ok(!add.includes("-f"), "must not git add -f");
+  assert.ok(!add.some((part) => part.includes("1.5.0")), "must not stage prior-version evidence");
+});
+
+test("runRelease: git add failure after checkout -b restores the configured base (#1148)", async () => {
+  let head = "main";
+  const commands: string[][] = [];
+  const deps = liveReleaseDeps({
+    fetchPRClosingIssues: async (n) => (n === 204 ? [158, 170] : []),
+    runCommand: (cmd, args) => {
+      commands.push([cmd, ...args]);
+      if (cmd === "git" && args[0] === "log") {
+        return { code: 0, stdout: "a1b2c3d release: thing (#204)", stderr: "" };
+      }
+      if (cmd === "git" && args[0] === "describe") {
+        return { code: 0, stdout: "v1.5.0", stderr: "" };
+      }
+      if (cmd === "git" && args[0] === "checkout" && args[1] === "-b") {
+        head = args[2]!;
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      if (cmd === "git" && args[0] === "checkout" && args[1] !== "-b" && args[1] !== "--") {
+        head = args[1]!;
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      if (cmd === "git" && args[0] === "add") {
+        return {
+          code: 1,
+          stdout: "",
+          stderr:
+            "The following paths are ignored by one of your .gitignore files:\n.agent-pipeline/frg",
+        };
+      }
+      if (cmd === "git" && args[0] === "rev-list") {
+        return { code: 0, stdout: "0\n", stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+  });
+
+  await assert.rejects(
+    () => runRelease("1.6.0", { noEdit: true }, { repo_dir: "/repo", repo: "org/repo" }, deps),
+    /git add failed/,
+  );
+
+  assert.equal(head, "main", "HEAD must return to the configured base");
+  assert.notEqual(head, "release/v1.6.0");
+  assert.ok(restoreInvoked(commands), "version files must be restored from HEAD");
+  assert.ok(checkedOutBranch(commands, "main"), "must check out the configured base");
+  assert.ok(deletedLocalBranch(commands, "release/v1.6.0"), "must delete the uncommitted release branch");
+  assert.ok(!restoreTouchedFrg(commands), "must not clean or checkout FRG evidence");
+  assert.ok(
+    !commands.some((c) => c[0] === "git" && c[1] === "commit"),
+    "must not commit after a failed add",
+  );
+});
+
+test("runRelease: a post-staging failure preserves FRG and restores the configured base (#1148)", async () => {
+  let head = "main";
+  const commands: string[][] = [];
+  const deps = liveReleaseDeps({
+    fetchPRClosingIssues: async (n) => (n === 204 ? [158, 170] : []),
+    runCommand: (cmd, args) => {
+      commands.push([cmd, ...args]);
+      if (cmd === "git" && args[0] === "log") {
+        return { code: 0, stdout: "a1b2c3d release: thing (#204)", stderr: "" };
+      }
+      if (cmd === "git" && args[0] === "describe") {
+        return { code: 0, stdout: "v1.5.0", stderr: "" };
+      }
+      if (cmd === "git" && args[0] === "checkout" && args[1] === "-b") {
+        head = args[2]!;
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      if (cmd === "git" && args[0] === "checkout" && args[1] !== "-b" && args[1] !== "--") {
+        head = args[1]!;
+        return { code: 0, stdout: "", stderr: "" };
+      }
       if (cmd === "git" && args[0] === "commit") {
         return { code: 1, stdout: "", stderr: "commit failed" };
+      }
+      if (cmd === "git" && args[0] === "rev-list") {
+        return { code: 0, stdout: "0\n", stderr: "" };
       }
       return { code: 0, stdout: "", stderr: "" };
     },
@@ -2735,13 +2863,54 @@ test("runRelease: a post-staging failure preserves the validated FRG input", asy
   );
 
   const add = commands.find((command) => command[0] === "git" && command[1] === "add");
-  assert.ok(add?.includes(".agent-pipeline/frg/1.6.0"));
-  assert.ok(!commands.some((command) =>
-    command[0] === "git" && command[1] === "clean" &&
-    command.some((part) => part.includes(".agent-pipeline/frg"))));
-  assert.ok(!commands.some((command) =>
-    command[0] === "git" && command[1] === "checkout" && command[2] === "--" &&
-    command.some((part) => part.includes(".agent-pipeline/frg"))));
+  assert.ok(add, "release must have staged before commit");
+  assert.ok(!gitAddTouchesFrg(add), "must not have staged FRG before the failed commit");
+  assert.equal(head, "main", "HEAD must return to the configured base");
+  assert.notEqual(head, "release/v1.6.0");
+  assert.ok(restoreInvoked(commands), "version files must be restored from HEAD");
+  assert.ok(checkedOutBranch(commands, "main"));
+  assert.ok(deletedLocalBranch(commands, "release/v1.6.0"));
+  assert.ok(!restoreTouchedFrg(commands), "must not clean or checkout FRG evidence");
+});
+
+test("runRelease: successful commit is not restored on later push failure (#1148)", async () => {
+  let head = "main";
+  const commands: string[][] = [];
+  const deps = liveReleaseDeps({
+    fetchPRClosingIssues: async (n) => (n === 204 ? [158, 170] : []),
+    runCommand: (cmd, args) => {
+      commands.push([cmd, ...args]);
+      if (cmd === "git" && args[0] === "log") {
+        return { code: 0, stdout: "a1b2c3d release: thing (#204)", stderr: "" };
+      }
+      if (cmd === "git" && args[0] === "describe") {
+        return { code: 0, stdout: "v1.5.0", stderr: "" };
+      }
+      if (cmd === "git" && args[0] === "checkout" && args[1] === "-b") {
+        head = args[2]!;
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      if (cmd === "git" && args[0] === "checkout" && args[1] !== "-b" && args[1] !== "--") {
+        head = args[1]!;
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      if (cmd === "git" && args[0] === "push") {
+        return { code: 1, stdout: "", stderr: "push failed" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+  });
+
+  await assert.rejects(
+    () => runRelease("1.6.0", { noEdit: true }, { repo_dir: "/repo", repo: "org/repo" }, deps),
+    /git push failed/,
+  );
+
+  assert.equal(head, "release/v1.6.0", "push failure must leave HEAD on the release branch");
+  assert.ok(!restoreInvoked(commands), "must not restore version files after a successful commit");
+  assert.ok(!checkedOutBranch(commands, "main"), "must not check out the base after a successful commit");
+  assert.ok(!deletedLocalBranch(commands, "release/v1.6.0"), "must not delete the committed release branch");
+  assert.ok(!restoreTouchedFrg(commands));
 });
 
 test("runRelease: FRG check does not invoke merge or tag commands", async () => {

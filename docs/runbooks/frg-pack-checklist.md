@@ -70,11 +70,14 @@ python3 -c "import json; d=json.load(open('.agent-pipeline/frg/<X.Y.Z>/latest.js
 
 `pipeline release` and `pipeline release ensure-tag` read on-disk HMAC
 `.agent-pipeline/frg/<X.Y.Z>/latest.json` on the ship host. That directory is
-gitignored. Auto-tag must not stall the ship for a missing tree file.
+gitignored. `pipeline release` does not `git add` it. The release PR body
+carries `run_id`; evidence stays on disk. Auto-tag must not stall the ship
+for a missing tree file.
 
 - [ ] Leave the validated version directory in the control checkout
 - [ ] Do not merge a separate evidence PR into the base after the candidate is
       recorded; that would move the candidate before release prepare
+- [ ] Do not `git add` or commit `.agent-pipeline/frg/` so add succeeds
 
 ## 5. Resume the Pipeline-owned ship (after FRG is on disk)
 

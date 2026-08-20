@@ -427,8 +427,10 @@ Under the **repository root**:
 ```
 
 `pipeline release` and `auto-tag-release.yml` read `latest.json` for the resolved version.
+`pipeline release` does **not** `git add` this gitignored tree (including `git add -f`).
+Attachment is the release PR body `run_id` / pass summary. Evidence stays on disk.
 
-**Ignore bar (#1127):** `.agent-pipeline/frg/` **is** gitignored on the factory
+**Ignore bar (#1127 / #1148):** `.agent-pipeline/frg/` **is** gitignored on the factory
 control checkout (engine artifact contract). A pack or promote write of
 `latest.json` must not fail the next train's `worktree-clean` check. Do **not**
 commit leftover `latest.json` onto the protected checkout. Host-only
@@ -439,8 +441,9 @@ Local `latest.json` remains the ship-host lookup for `pipeline release`,
 just packed. Auto-tag must not block the ship when that path is gitignored.
 Local `release ensure-tag` creates `vX.Y.Z` from on-disk HMAC evidence.
 Release MAY still attach that version's evidence onto the **release PR**, but
-attachment is not required for auto-tag or for local ensure-tag. That is not
-a reason to leave `frg/` unignored on the factory control checkout.
+attachment is the PR-body `run_id` (not a committed tree). Attachment is not
+required for auto-tag or for local ensure-tag. That is not a reason to leave
+`frg/` unignored on the factory control checkout.
 
 ### Trend ledger
 
@@ -586,8 +589,15 @@ Optional repeated CLI tokens:
 3. **Open soak-defect preflight (#755)** — with FRG `loop_run_id` / `run_id` available,
    fails closed when open engine-class soak defects are attributable to that candidate.
 4. On success, includes an FRG section on the release PR body (`run_id`, numeric rate, composition).
+   Does **not** `git add` `.agent-pipeline/frg/` (that tree is gitignored). Evidence stays
+   on disk. The release commit is version / ROADMAP / plugin-mirror files only.
 5. Still runs `npm run ci` (additive). FRG, open-soak preflight, and CI are independent.
 6. Does **not** merge or tag because FRG/open-soak passed.
+7. If `git add` or `git commit` fails after `git checkout -b release/vX.Y.Z`, restores the
+   configured base (`base_branch`, default `main`), restores release-managed files from
+   HEAD, and deletes the local release branch when it has no unique commit. On-disk FRG
+   files remain. A successful commit is the point of no return (push failure stays on
+   the branch).
 
 ### Auto-tag FRG guard (#757 / #1040 / #1149)
 
