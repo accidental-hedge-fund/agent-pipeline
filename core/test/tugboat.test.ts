@@ -3162,7 +3162,7 @@ test("playbook is a thin launcher to repo tugboat.sh (#1151)", () => {
 
 function runFrgPackWaitDecision(
   tick: string,
-  live: "0" | "1",
+  live: "0" | "1" | "unknown",
   attempt: number,
   cap: number,
 ): string {
@@ -3206,6 +3206,11 @@ test("frg_pack_wait_decision: in_progress plus live loop at cap N is continue (#
     "fail",
     "not-live in_progress at cap remains fail-closed",
   );
+  assert.equal(
+    runFrgPackWaitDecision("retry", "unknown", cap, cap),
+    "continue",
+    "unreadable liveness at cap must not fail-closed",
+  );
   assert.equal(runFrgPackWaitDecision("retry", "0", 1, cap), "continue");
 });
 
@@ -3220,8 +3225,12 @@ test("frg_pack_loop_is_live: lock pid or non-terminal ledger (#1150)", () => {
     const home = path.join(dir, "state");
     const liveRun = path.join(home, "runs", "loop-live");
     const deadRun = path.join(home, "runs", "loop-dead");
+    const corruptRun = path.join(home, "runs", "loop-corrupt");
+    const ioFailRun = path.join(home, "runs", "loop-iofail");
     fs.mkdirSync(liveRun, { recursive: true });
     fs.mkdirSync(deadRun, { recursive: true });
+    fs.mkdirSync(corruptRun, { recursive: true });
+    fs.mkdirSync(ioFailRun, { recursive: true });
     fs.writeFileSync(
       path.join(liveRun, "ledger.json"),
       JSON.stringify({ schema: 1, run_id: "loop-live", stop: null }),
@@ -3238,6 +3247,8 @@ test("frg_pack_loop_is_live: lock pid or non-terminal ledger (#1150)", () => {
       path.join(deadRun, "lock.json"),
       JSON.stringify({ pid: 1_000_000_007, run_id: "loop-dead" }),
     );
+    fs.writeFileSync(path.join(corruptRun, "lock.json"), "{");
+    fs.mkdirSync(path.join(ioFailRun, "lock.json"));
     const runner = path.join(dir, "run.sh");
     fs.writeFileSync(
       runner,
@@ -3249,6 +3260,8 @@ test("frg_pack_loop_is_live: lock pid or non-terminal ledger (#1150)", () => {
         'printf "dead=%s\\n" "$(frg_pack_loop_is_live loop-dead)"',
         'printf "missing=%s\\n" "$(frg_pack_loop_is_live loop-missing)"',
         'printf "unsafe=%s\\n" "$(frg_pack_loop_is_live ../escape)"',
+        'printf "corrupt=%s\\n" "$(frg_pack_loop_is_live loop-corrupt)"',
+        'printf "iofail=%s\\n" "$(frg_pack_loop_is_live loop-iofail)"',
         "",
       ].join("\n"),
     );
@@ -3265,6 +3278,8 @@ test("frg_pack_loop_is_live: lock pid or non-terminal ledger (#1150)", () => {
     assert.match(r.stdout, /^dead=0$/m);
     assert.match(r.stdout, /^missing=0$/m);
     assert.match(r.stdout, /^unsafe=0$/m);
+    assert.match(r.stdout, /^corrupt=unknown$/m);
+    assert.match(r.stdout, /^iofail=unknown$/m);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

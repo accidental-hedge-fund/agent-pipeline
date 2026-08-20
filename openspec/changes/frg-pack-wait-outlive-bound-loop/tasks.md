@@ -24,6 +24,7 @@
 - [x] 4.4 Regression: ship-adapter live `in_progress` at cap is continue, not the resume-to-retry throw
 - [x] 4.5 Sync test: Tugboat and `frg-pack-helpers.sh` wait helpers still match when shared
 - [x] 4.6 Tests inject I/O or inspect source/fixtures. They start no live pack, network, git, or subprocess ship
+- [x] 4.7 Regression: unreadable or malformed lock/ledger at cap is continue, not wait-fail. I/O errors and corrupt JSON SHALL NOT classify as not-live
 
 ## 5. Docs, packaging, gate
 

@@ -880,7 +880,8 @@ invoke_frg_pack_attestor() {
 
 # Bound pack loop is live when lock.json pid is alive or ledger/events are not
 # terminal. Not live when lock pid is dead or missing AND ledger is terminal or
-# missing. Prints 1 or 0. Never kills the pid. $1 = prepare loop_run_id.
+# missing. Prints 1, 0, or unknown. Unreadable or malformed lock/ledger is
+# unknown, not 0. Never kills the pid. $1 = prepare loop_run_id.
 frg_pack_loop_is_live() {
   python3 - "${1:-}" <<'PY'
 import json, os, re, sys
@@ -904,24 +905,38 @@ lock_path = os.path.join(run_dir, "lock.json")
 ledger_path = os.path.join(run_dir, "ledger.json")
 events_path = os.path.join(run_dir, "events.jsonl")
 
+def read_text(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return ("ok", fh.read())
+    except FileNotFoundError:
+        return ("missing", "")
+    except OSError:
+        return ("unreadable", "")
+
 pid_alive = False
-try:
-    obj = json.loads(open(lock_path, encoding="utf-8").read())
-    pid = obj.get("pid") if isinstance(obj, dict) else None
-    if isinstance(pid, str) and pid.isdigit():
-        pid = int(pid)
-    if isinstance(pid, int) and pid > 0:
-        try:
-            os.kill(pid, 0)
-            pid_alive = True
-        except ProcessLookupError:
-            pid_alive = False
-        except PermissionError:
-            pid_alive = True
-        except OSError as exc:
-            pid_alive = getattr(exc, "errno", None) == 1
-except Exception:
-    pid_alive = False
+lock_unreadable = False
+lock_status, lock_text = read_text(lock_path)
+if lock_status == "unreadable":
+    lock_unreadable = True
+elif lock_status == "ok":
+    try:
+        obj = json.loads(lock_text)
+        pid = obj.get("pid") if isinstance(obj, dict) else None
+        if isinstance(pid, str) and pid.isdigit():
+            pid = int(pid)
+        if isinstance(pid, int) and pid > 0:
+            try:
+                os.kill(pid, 0)
+                pid_alive = True
+            except ProcessLookupError:
+                pid_alive = False
+            except PermissionError:
+                pid_alive = True
+            except OSError as exc:
+                pid_alive = getattr(exc, "errno", None) == 1
+    except Exception:
+        lock_unreadable = True
 
 if pid_alive:
     print("1")
@@ -929,15 +944,20 @@ if pid_alive:
 
 ledger_present = False
 ledger_stop = False
-if os.path.isfile(ledger_path) and os.path.getsize(ledger_path) > 0:
+ledger_unreadable = False
+ledger_status, ledger_text = read_text(ledger_path)
+if ledger_status == "unreadable":
+    ledger_unreadable = True
+elif ledger_status == "ok" and ledger_text.strip():
     try:
-        ledger = json.loads(open(ledger_path, encoding="utf-8").read())
+        ledger = json.loads(ledger_text)
         if isinstance(ledger, dict):
             ledger_present = True
             ledger_stop = bool(ledger.get("stop"))
+        else:
+            ledger_unreadable = True
     except Exception:
-        ledger_present = False
-        ledger_stop = False
+        ledger_unreadable = True
 
 events_terminal = False
 if os.path.isfile(events_path):
@@ -962,12 +982,15 @@ if os.path.isfile(events_path):
 if ledger_present and not ledger_stop and not events_terminal:
     print("1")
     raise SystemExit(0)
+if lock_unreadable or ledger_unreadable:
+    print("unknown")
+    raise SystemExit(0)
 print("0")
 PY
 }
 
-# Wait-continue vs wait-fail. $1 tick (retry|done|attest|fail) $2 live (1|0)
-# $3 attempt (1-based) $4 numeric cap. retry + live continues even at cap.
+# Wait-continue vs wait-fail. $1 tick (retry|done|attest|fail) $2 live (1|0|unknown)
+# $3 attempt (1-based) $4 numeric cap. retry + live or unknown continues even at cap.
 frg_pack_wait_decision() {
   local tick=${1:-}
   local live=${2:-0}
@@ -977,7 +1000,7 @@ frg_pack_wait_decision() {
     printf '%s\n' "continue"
     return 0
   fi
-  if [[ "$live" == "1" ]]; then
+  if [[ "$live" == "1" || "$live" == "unknown" ]]; then
     printf '%s\n' "continue"
     return 0
   fi

@@ -10,6 +10,7 @@ import {
   assertEnsureTagOidIsMergedRelease,
   bindCandidateShipEndOperations,
   boundPackLoopIsLive,
+  classifyBoundPackLoopLiveness,
   classifyFrgPackWaitDecision,
   ensureAnnotatedReleaseTag,
   persistShipFactoryReleaseRequest,
@@ -746,6 +747,10 @@ test("classifyFrgPackWaitDecision: live in_progress at cap is continue (#1150)",
     "continue",
   );
   assert.equal(
+    classifyFrgPackWaitDecision({ tick: "retry", live: "unknown", attempt: 2, cap: 2 }),
+    "continue",
+  );
+  assert.equal(
     classifyFrgPackWaitDecision({ tick: "retry", live: false, attempt: 2, cap: 2 }),
     "fail",
   );
@@ -777,11 +782,32 @@ test("classifyFrgPackWaitDecision: live in_progress at cap is continue (#1150)",
     ledgerStopPresent: true,
     eventsTerminal: false,
   }), false);
+  assert.equal(classifyBoundPackLoopLiveness({
+    lockPidAlive: false,
+    lockUnreadable: true,
+    ledgerPresent: false,
+    ledgerStopPresent: false,
+    eventsTerminal: false,
+  }), "unknown");
+  assert.equal(classifyBoundPackLoopLiveness({
+    lockPidAlive: false,
+    ledgerPresent: false,
+    ledgerStopPresent: false,
+    ledgerUnreadable: true,
+    eventsTerminal: false,
+  }), "unknown");
+  assert.equal(classifyBoundPackLoopLiveness({
+    lockPidAlive: false,
+    lockUnreadable: true,
+    ledgerPresent: true,
+    ledgerStopPresent: false,
+    eventsTerminal: false,
+  }), "live");
 });
 
 test("live in_progress at cap keeps re-invoking prepare (#1150)", async () => {
   const spawned: string[][] = [];
-  const heartbeats: Array<{ attempt: number; live: boolean }> = [];
+  const heartbeats: Array<{ attempt: number; live: string }> = [];
   let prepareTicks = 0;
   const bound = bindCandidateShipEndOperations(operations(), {
     pinCommitSha: PIN_SHA,
@@ -812,8 +838,45 @@ test("live in_progress at cap keeps re-invoking prepare (#1150)", async () => {
   assert.equal(spawned.filter((argv) => argv.includes("factory-release")).length, 3);
   assert.equal(spawned.filter((argv) => argv.includes("factory-gate")).length, 0);
   assert.deepEqual(heartbeats, [
-    { attempt: 1, live: true },
-    { attempt: 2, live: true },
+    { attempt: 1, live: "live" },
+    { attempt: 2, live: "live" },
+  ]);
+});
+
+test("unknown liveness at cap keeps re-invoking prepare (#1150)", async () => {
+  const spawned: string[][] = [];
+  const heartbeats: Array<{ attempt: number; live: string }> = [];
+  let prepareTicks = 0;
+  const bound = bindCandidateShipEndOperations(operations(), {
+    pinCommitSha: PIN_SHA,
+    repoDir: "/repo",
+    env: {},
+    factoryReleaseRequestPath: "/abs/req.json",
+    frgWaitAttempts: 2,
+    delay: async () => {},
+    isBoundPackLoopLive: async () => "unknown",
+    onFrgWaitTick: (tick) => {
+      heartbeats.push({ attempt: tick.attempt, live: tick.live });
+    },
+    resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+    spawn: async (argv) => {
+      spawned.push(argv);
+      prepareTicks++;
+      if (prepareTicks < 3) {
+        return {
+          code: 0,
+          stdout: JSON.stringify({ status: "in_progress", loop_run_id: "loop-1" }),
+          stderr: "",
+        };
+      }
+      return { code: 0, stdout: JSON.stringify({ status: "complete" }), stderr: "" };
+    },
+  });
+  await bound.runFrgPack!(intent, train);
+  assert.equal(spawned.filter((argv) => argv.includes("factory-release")).length, 3);
+  assert.deepEqual(heartbeats, [
+    { attempt: 1, live: "unknown" },
+    { attempt: 2, live: "unknown" },
   ]);
 });
 
@@ -858,19 +921,84 @@ test("probeBoundPackLoopLive reads injected lock/ledger fixtures (#1150)", async
   const readTextFile = (p: string) => files.get(p) ?? null;
   assert.equal(
     await probeBoundPackLoopLive("loop-live", { env, readTextFile, isPidAlive: () => false }),
-    true,
+    "live",
   );
   assert.equal(
     await probeBoundPackLoopLive("loop-dead", { env, readTextFile, isPidAlive: () => false }),
-    false,
+    "not-live",
   );
   assert.equal(
     await probeBoundPackLoopLive("loop-pid", { env, readTextFile, isPidAlive: (pid) => pid === 42 }),
-    true,
+    "live",
   );
   assert.equal(
     await probeBoundPackLoopLive("loop-missing", { env, readTextFile, isPidAlive: () => false }),
-    false,
+    "not-live",
+  );
+});
+
+test("probeBoundPackLoopLive treats read failures and corrupt state as unknown (#1150)", async () => {
+  const env = { AGENT_PIPELINE_STATE_HOME: "/home" } as NodeJS.ProcessEnv;
+  const eacces = (): never => {
+    const err = new Error("EACCES") as NodeJS.ErrnoException;
+    err.code = "EACCES";
+    throw err;
+  };
+  assert.equal(
+    await probeBoundPackLoopLive("loop-eacces", {
+      env,
+      isPidAlive: () => false,
+      readTextFile: (p) => (p.endsWith("lock.json") ? eacces() : null),
+    }),
+    "unknown",
+  );
+  assert.equal(
+    await probeBoundPackLoopLive("loop-eio-ledger", {
+      env,
+      isPidAlive: () => false,
+      readTextFile: (p) => {
+        if (p.endsWith("lock.json")) return JSON.stringify({ pid: 99 });
+        if (p.endsWith("ledger.json")) {
+          const err = new Error("EIO") as NodeJS.ErrnoException;
+          err.code = "EIO";
+          throw err;
+        }
+        return null;
+      },
+    }),
+    "unknown",
+  );
+  assert.equal(
+    await probeBoundPackLoopLive("loop-corrupt", {
+      env,
+      isPidAlive: () => false,
+      readTextFile: (p) => (p.endsWith("lock.json") ? "{" : null),
+    }),
+    "unknown",
+  );
+  assert.equal(
+    await probeBoundPackLoopLive("loop-corrupt-ledger", {
+      env,
+      isPidAlive: () => false,
+      readTextFile: (p) => {
+        if (p.endsWith("lock.json")) return JSON.stringify({ pid: 99 });
+        if (p.endsWith("ledger.json")) return "{";
+        return null;
+      },
+    }),
+    "unknown",
+  );
+  assert.equal(
+    await probeBoundPackLoopLive("loop-unreadable-lock-live-ledger", {
+      env,
+      isPidAlive: () => false,
+      readTextFile: (p) => {
+        if (p.endsWith("lock.json")) return eacces();
+        if (p.endsWith("ledger.json")) return JSON.stringify({ run_id: "loop", stop: null });
+        return null;
+      },
+    }),
+    "live",
   );
 });
 

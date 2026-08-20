@@ -896,6 +896,8 @@ function realShipAdapterOperations(opts: RealShipCoordinatorDepsOptions): ShipAd
   };
 }
 
+export type BoundPackLoopLiveness = "live" | "not-live" | "unknown";
+
 export interface CandidateShipEndContext {
   pinCommitSha: string | null;
   repoDir: string;
@@ -917,14 +919,16 @@ export interface CandidateShipEndContext {
   ): Promise<void>;
   delay?(ms: number): Promise<void>;
   frgWaitAttempts?: number;
-  isBoundPackLoopLive?(loopRunId: string): Promise<boolean> | boolean;
+  isBoundPackLoopLive?(
+    loopRunId: string,
+  ): Promise<boolean | BoundPackLoopLiveness> | boolean | BoundPackLoopLiveness;
   isPidAlive?(pid: number): Promise<boolean> | boolean;
   readTextFile?(p: string): Promise<string | null> | string | null;
   onFrgWaitTick?(tick: {
     intent: ShipIntent;
     attempt: number;
     loopRunId: string;
-    live: boolean;
+    live: BoundPackLoopLiveness;
   }): Promise<void> | void;
 }
 
@@ -1023,19 +1027,50 @@ function prepareLoopRunId(parsed: Record<string, unknown> | null): string {
 
 export type FrgPackWaitDecision = "continue" | "fail";
 
-/** retry + live continues even when attempt == cap. Cap applies only when not live. */
+function waitLivenessContinues(live: boolean | BoundPackLoopLiveness): boolean {
+  return live !== false && live !== "not-live";
+}
+
+function normalizeBoundPackLoopLiveness(
+  raw: boolean | BoundPackLoopLiveness,
+): BoundPackLoopLiveness {
+  if (raw === "live" || raw === "not-live" || raw === "unknown") return raw;
+  return raw ? "live" : "not-live";
+}
+
+/** retry + live or unknown continues even when attempt == cap. Cap applies only when not-live. */
 export function classifyFrgPackWaitDecision(input: {
   tick: CandidatePrepareTick;
-  live: boolean;
+  live: boolean | BoundPackLoopLiveness;
   attempt: number;
   cap: number;
 }): FrgPackWaitDecision {
   if (input.tick !== "retry") return "continue";
-  if (input.live) return "continue";
+  if (waitLivenessContinues(input.live)) return "continue";
   if (Number.isInteger(input.attempt) && Number.isInteger(input.cap) && input.attempt < input.cap) {
     return "continue";
   }
   return "fail";
+}
+
+/**
+ * Live when lock pid is alive OR ledger is present and not terminal.
+ * Unknown when lock or ledger state is unreadable or malformed and neither
+ * signal positively proves live. Not-live only after a dead-or-missing pid
+ * and a terminal-or-missing ledger.
+ */
+export function classifyBoundPackLoopLiveness(input: {
+  lockPidAlive: boolean;
+  lockUnreadable?: boolean;
+  ledgerPresent: boolean;
+  ledgerStopPresent: boolean;
+  ledgerUnreadable?: boolean;
+  eventsTerminal: boolean;
+}): BoundPackLoopLiveness {
+  if (input.lockPidAlive) return "live";
+  if (input.ledgerPresent && !input.ledgerStopPresent && !input.eventsTerminal) return "live";
+  if (input.lockUnreadable || input.ledgerUnreadable) return "unknown";
+  return "not-live";
 }
 
 /** Live when lock pid is alive OR ledger is present and not terminal. */
@@ -1045,10 +1080,7 @@ export function boundPackLoopIsLive(input: {
   ledgerStopPresent: boolean;
   eventsTerminal: boolean;
 }): boolean {
-  if (input.lockPidAlive) return true;
-  if (!input.ledgerPresent) return false;
-  if (input.ledgerStopPresent || input.eventsTerminal) return false;
-  return true;
+  return classifyBoundPackLoopLiveness(input) === "live";
 }
 
 function defaultIsPidAlive(pid: number): boolean {
@@ -1090,18 +1122,32 @@ function eventsAreTerminal(text: string): boolean {
   return false;
 }
 
+type TextFileRead =
+  | { status: "ok"; text: string }
+  | { status: "missing" }
+  | { status: "unreadable" };
+
 async function resolveTextFile(
   p: string,
   readTextFile?: (path: string) => Promise<string | null> | string | null,
-): Promise<string | null> {
+): Promise<TextFileRead> {
+  const asErrno = (err: unknown): string | undefined =>
+    (err as NodeJS.ErrnoException).code;
   if (typeof readTextFile === "function") {
-    return await readTextFile(p);
+    try {
+      const text = await readTextFile(p);
+      if (text == null) return { status: "missing" };
+      return { status: "ok", text };
+    } catch (err) {
+      if (asErrno(err) === "ENOENT") return { status: "missing" };
+      return { status: "unreadable" };
+    }
   }
   try {
-    return await fs.readFile(p, "utf8");
+    return { status: "ok", text: await fs.readFile(p, "utf8") };
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
-    return null;
+    if (asErrno(err) === "ENOENT") return { status: "missing" };
+    return { status: "unreadable" };
   }
 }
 
@@ -1112,47 +1158,57 @@ export async function probeBoundPackLoopLive(
     isPidAlive?: (pid: number) => Promise<boolean> | boolean;
     readTextFile?: (p: string) => Promise<string | null> | string | null;
   } = {},
-): Promise<boolean> {
+): Promise<BoundPackLoopLiveness> {
   const id = loopRunId.trim();
   if (!SAFE_LOOP_RUN_ID.test(id) || id === "." || id === ".." || id.includes("..")) {
-    return false;
+    return "not-live";
   }
   const env = opts.env ?? process.env;
   const home = resolveStateHome({ env, hostname: () => "unused" });
   const runDir = path.join(home, "runs", id);
-  const lockText = await resolveTextFile(path.join(runDir, "lock.json"), opts.readTextFile);
+  const lock = await resolveTextFile(path.join(runDir, "lock.json"), opts.readTextFile);
   let lockPidAlive = false;
-  if (lockText) {
+  let lockUnreadable = lock.status === "unreadable";
+  if (lock.status === "ok") {
     try {
-      const parsed = JSON.parse(lockText) as { pid?: unknown };
+      const parsed = JSON.parse(lock.text) as { pid?: unknown };
       const pid = parseLockPidField(parsed?.pid);
       if (pid !== null) {
-        lockPidAlive = Boolean(await (opts.isPidAlive ?? defaultIsPidAlive)(pid));
+        try {
+          lockPidAlive = Boolean(await (opts.isPidAlive ?? defaultIsPidAlive)(pid));
+        } catch {
+          lockUnreadable = true;
+        }
       }
     } catch {
-      lockPidAlive = false;
+      lockUnreadable = true;
     }
   }
-  const ledgerText = await resolveTextFile(path.join(runDir, "ledger.json"), opts.readTextFile);
+  const ledger = await resolveTextFile(path.join(runDir, "ledger.json"), opts.readTextFile);
   let ledgerPresent = false;
   let ledgerStopPresent = false;
-  if (ledgerText && ledgerText.trim()) {
+  let ledgerUnreadable = ledger.status === "unreadable";
+  if (ledger.status === "ok" && ledger.text.trim()) {
     try {
-      const ledger = JSON.parse(ledgerText) as { stop?: unknown };
-      if (ledger && typeof ledger === "object" && !Array.isArray(ledger)) {
+      const parsed = JSON.parse(ledger.text) as { stop?: unknown };
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
         ledgerPresent = true;
-        ledgerStopPresent = Boolean(ledger.stop);
+        ledgerStopPresent = Boolean(parsed.stop);
+      } else {
+        ledgerUnreadable = true;
       }
     } catch {
-      ledgerPresent = false;
+      ledgerUnreadable = true;
     }
   }
-  const eventsText = await resolveTextFile(path.join(runDir, "events.jsonl"), opts.readTextFile);
-  const eventsTerminal = eventsText ? eventsAreTerminal(eventsText) : false;
-  return boundPackLoopIsLive({
+  const events = await resolveTextFile(path.join(runDir, "events.jsonl"), opts.readTextFile);
+  const eventsTerminal = events.status === "ok" ? eventsAreTerminal(events.text) : false;
+  return classifyBoundPackLoopLiveness({
     lockPidAlive,
+    lockUnreadable,
     ledgerPresent,
     ledgerStopPresent,
+    ledgerUnreadable,
     eventsTerminal,
   });
 }
@@ -1160,9 +1216,9 @@ export async function probeBoundPackLoopLive(
 async function boundPackLoopLiveForWait(
   ctx: CandidateShipEndContext,
   loopRunId: string,
-): Promise<boolean> {
+): Promise<BoundPackLoopLiveness> {
   if (typeof ctx.isBoundPackLoopLive === "function") {
-    return Boolean(await ctx.isBoundPackLoopLive(loopRunId));
+    return normalizeBoundPackLoopLiveness(await ctx.isBoundPackLoopLive(loopRunId));
   }
   return probeBoundPackLoopLive(loopRunId, {
     env: ctx.env,
