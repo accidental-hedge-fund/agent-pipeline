@@ -244,10 +244,11 @@ numeric and checked.
 
 A completed FRG run SHALL produce evidence that can be linked or embedded on the release pull
 request for the same version: at minimum the `run_id` and a pass/fail summary (and preferably the
-artifact path or JSON digest). The attachment MAY be a PR comment, a section of the release PR body,
-or a checked-in/CI-uploaded artifact referenced from the PR. Absence of any linkable FRG evidence
-for the version SHALL leave the release FRG precondition unsatisfied even if a private local pass
-is claimed without a durable record.
+artifact path or JSON digest). The attachment SHALL be a PR comment or a section of the release PR
+body. When `.agent-pipeline/frg/` is gitignored, that attachment SHALL NOT be a `git add` of that
+tree, including `git add -f`. On-disk `.agent-pipeline/frg/<X.Y.Z>/latest.json` remains the durable
+local record. Absence of any linkable FRG evidence for the version SHALL leave the release FRG
+precondition unsatisfied even if a private local pass is claimed without a durable record.
 
 #### Scenario: Pass summary is linkable
 
@@ -261,7 +262,12 @@ is claimed without a durable record.
   and `pass: true` for the version
 - **THEN** the FRG attachment requirement SHALL be unsatisfied
 
----
+#### Scenario: Gitignored FRG is not attached by git add
+
+- **WHEN** `.agent-pipeline/frg/` is gitignored
+- **AND** `pipeline release` prepares a release PR after an FRG pass for `1.39.5`
+- **THEN** the release PR body or an attached comment SHALL include the FRG `run_id` and pass summary
+- **AND** the staging `git add` SHALL NOT include `.agent-pipeline/frg` or any path under it
 
 ### Requirement: FRG SHALL NOT introduce auto-merge
 
@@ -1582,7 +1588,8 @@ checkout. Host-only `skip-worktree` SHALL NOT be the product fix.
 Local `latest.json` SHALL remain the ship-host lookup for `pipeline release`,
 `pipeline engine-promote`, and `pipeline release ensure-tag` on the host that just packed.
 Release-eligible evidence SHALL NOT need to be committed, comment-attached, or
-`git add -f`'d so auto-tag can see it. Auto-tag SHALL NOT block the ship when that
+`git add -f`'d so auto-tag can see it. `pipeline release` SHALL NOT `git add` that
+gitignored tree in order to open a release PR. Auto-tag SHALL NOT block the ship when that
 path is gitignored. Local `release ensure-tag` SHALL create `vX.Y.Z` from on-disk HMAC
 evidence. That posture SHALL NOT require leaving `.agent-pipeline/frg/` unignored on the
 factory control checkout.
@@ -1620,6 +1627,15 @@ factory control checkout.
 - **THEN** ship-end SHALL create `v1.39.5` via `release ensure-tag` from disk
 - **AND** auto-tag SHALL NOT fail the job because the merged tree has no `latest.json`
 - **AND** the factory control checkout SHALL keep `.agent-pipeline/frg/` gitignored
+
+#### Scenario: Release prepare does not git add gitignored FRG
+
+- **WHEN** `.agent-pipeline/frg/` is gitignored
+- **AND** on-disk HMAC `latest.json` for `1.39.5` is release-eligible
+- **AND** `pipeline release 1.39.5 --no-edit` runs
+- **THEN** it SHALL NOT pass `.agent-pipeline/frg` to `git add`
+- **AND** it SHALL still require that on-disk `latest.json` (`pass: true`, HMAC)
+- **AND** `--skip-frg` SHALL NOT be the path
 
 ### Requirement: Ship-path FRG pack composers SHALL attest outside prepare
 
