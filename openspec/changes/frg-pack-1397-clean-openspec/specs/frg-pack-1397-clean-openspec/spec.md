@@ -9,6 +9,7 @@ not change.
 
 ### Requirement: The pack-1397-tugboat-ship-1.39.7 clean-openspec fixture SHALL name release 1.39.7
 
+The pack-1397-tugboat-ship-1.39.7 clean-openspec fixture SHALL name release 1.39.7.
 The run-scoped JSON fixture at
 `core/test/fixtures/frg/pack-1397-tugboat-ship-1.39.7/clean-openspec.json`
 SHALL exist, SHALL be valid JSON, and SHALL set `release_version` to
