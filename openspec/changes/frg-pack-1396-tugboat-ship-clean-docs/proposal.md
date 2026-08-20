@@ -17,13 +17,13 @@ new instance from the same template.
 
 ## Acceptance Criteria
 
-- [ ] File `core/test/fixtures/frg/pack-1396-tugboat-ship-1.39.6/clean-docs.json` exists and is valid JSON.
-- [ ] That fixture's `release_version` field equals the string `1.39.6`.
-- [ ] A unit test under `core/test/` reads only that run-scoped fixture path (no other pack-run directory).
-- [ ] That test fails when `release_version` is missing or is not `1.39.6`.
-- [ ] Production code under `core/scripts/` and host packaging is unchanged.
-- [ ] `cd core && npm test` includes the new test and the suite passes.
-- [ ] `npm run ci` is green (including `build.mjs --check` with no `plugin/` edit, because core production files are untouched).
+- [x] File `core/test/fixtures/frg/pack-1396-tugboat-ship-1.39.6/clean-docs.json` exists and is valid JSON.
+- [x] That fixture's `release_version` field equals the string `1.39.6`.
+- [x] A unit test under `core/test/` reads only that run-scoped fixture path (no other pack-run directory).
+- [x] That test fails when `release_version` is missing or is not `1.39.6`.
+- [x] Production code under `core/scripts/` and host packaging is unchanged.
+- [x] `cd core && npm test` includes the new test and the suite passes.
+- [x] `npm run ci` is green (including `build.mjs --check` with no `plugin/` edit, because core production files are untouched).
 - [ ] This issue's Pipeline run reaches `pipeline:ready-to-deploy`.
 - [ ] After FRG records the pack run, FRG closes this pull request and issue without merge (existing FRG disposition; this change does not add a merge path).
 
