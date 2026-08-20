@@ -41,6 +41,7 @@ import { resolveReleaseConfig } from "../config.ts";
 import { getPrForIssueAnyState } from "../gh.ts";
 import { withLock } from "../lock.ts";
 import { resolveStateHome } from "../loop/store.ts";
+import { LOOP_LEDGER_SCHEMA } from "../loop/types.ts";
 import type { PipelineConfig } from "../types.ts";
 import {
   defaultShipStateStore,
@@ -1143,6 +1144,19 @@ function parseLedgerStopField(raw: unknown): "open" | "stop" | "invalid" {
   return "stop";
 }
 
+/**
+ * A stop is terminal only on a durable ledger envelope: schema plus a run_id
+ * that matches the bound loop. Stop-only or identity-mismatched objects are
+ * malformed, not proof the bound loop is dead.
+ */
+function parseDurableLedger(raw: unknown, expectedRunId: string): "open" | "stop" | "invalid" {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return "invalid";
+  const rec = raw as { schema?: unknown; run_id?: unknown; stop?: unknown };
+  if (rec.schema !== LOOP_LEDGER_SCHEMA) return "invalid";
+  if (typeof rec.run_id !== "string" || rec.run_id !== expectedRunId) return "invalid";
+  return parseLedgerStopField(rec.stop);
+}
+
 function eventsAreTerminal(text: string): boolean {
   for (const line of text.split("\n")) {
     const trimmed = line.trim();
@@ -1236,17 +1250,13 @@ export async function probeBoundPackLoopLive(
       ledgerUnreadable = true;
     } else {
       try {
-        const parsed = JSON.parse(ledger.text) as { stop?: unknown };
-        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-          const stopKind = parseLedgerStopField(parsed.stop);
-          if (stopKind === "invalid") {
-            ledgerUnreadable = true;
-          } else {
-            ledgerPresent = true;
-            ledgerStopPresent = stopKind === "stop";
-          }
-        } else {
+        const parsed: unknown = JSON.parse(ledger.text);
+        const stopKind = parseDurableLedger(parsed, id);
+        if (stopKind === "invalid") {
           ledgerUnreadable = true;
+        } else {
+          ledgerPresent = true;
+          ledgerStopPresent = stopKind === "stop";
         }
       } catch {
         ledgerUnreadable = true;

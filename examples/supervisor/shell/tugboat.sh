@@ -959,6 +959,8 @@ STOP_REASONS = frozenset((
     "worktree_capacity",
 ))
 
+LEDGER_SCHEMA = "pipeline/loop-ledger@1"
+
 def parse_ledger_stop(raw):
     if raw is None:
         return "open"
@@ -976,6 +978,16 @@ def parse_ledger_stop(raw):
             return "invalid"
     return "stop"
 
+def parse_durable_ledger(obj, expected_run_id):
+    if not isinstance(obj, dict):
+        return "invalid"
+    if obj.get("schema") != LEDGER_SCHEMA:
+        return "invalid"
+    run_id = obj.get("run_id")
+    if not isinstance(run_id, str) or run_id != expected_run_id:
+        return "invalid"
+    return parse_ledger_stop(obj.get("stop"))
+
 ledger_present = False
 ledger_stop = False
 ledger_unreadable = False
@@ -988,16 +1000,12 @@ elif ledger_status == "ok":
     else:
         try:
             ledger = json.loads(ledger_text)
-            if isinstance(ledger, dict):
-                stop = ledger.get("stop") if "stop" in ledger else None
-                stop_kind = parse_ledger_stop(stop)
-                if stop_kind == "invalid":
-                    ledger_unreadable = True
-                else:
-                    ledger_present = True
-                    ledger_stop = stop_kind == "stop"
-            else:
+            stop_kind = parse_durable_ledger(ledger, loop_id)
+            if stop_kind == "invalid":
                 ledger_unreadable = True
+            else:
+                ledger_present = True
+                ledger_stop = stop_kind == "stop"
         except Exception:
             ledger_unreadable = True
 

@@ -20,6 +20,7 @@ import {
   tugboatHasForbiddenSecondBrainMarkers,
   type Option1PackBodies,
 } from "../scripts/tugboat-install-parity.ts";
+import { LOOP_LEDGER_SCHEMA } from "../scripts/loop/types.ts";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, "../..");
@@ -3233,12 +3234,12 @@ test("frg_pack_loop_is_live: lock pid or non-terminal ledger (#1150)", () => {
     fs.mkdirSync(ioFailRun, { recursive: true });
     fs.writeFileSync(
       path.join(liveRun, "ledger.json"),
-      JSON.stringify({ schema: 1, run_id: "loop-live", stop: null }),
+      JSON.stringify({ schema: LOOP_LEDGER_SCHEMA, run_id: "loop-live", stop: null }),
     );
     fs.writeFileSync(
       path.join(deadRun, "ledger.json"),
       JSON.stringify({
-        schema: 1,
+        schema: LOOP_LEDGER_SCHEMA,
         run_id: "loop-dead",
         stop: { reason: "supervisor_cycle_cap", time: "2026-08-20T00:00:00.000Z" },
       }),
@@ -3307,13 +3308,23 @@ test("frg_pack_loop_is_live: schema-invalid or undecodable state is unknown at c
     fs.writeFileSync(path.join(badPid, "lock.json"), JSON.stringify({ pid: "bad" }));
     fs.writeFileSync(path.join(blankLedger, "ledger.json"), "  \n\t");
     fs.writeFileSync(path.join(badStop, "lock.json"), JSON.stringify({ pid: 1_000_000_007 }));
-    fs.writeFileSync(path.join(badStop, "ledger.json"), JSON.stringify({ stop: true }));
+    fs.writeFileSync(
+      path.join(badStop, "ledger.json"),
+      JSON.stringify({ schema: LOOP_LEDGER_SCHEMA, run_id: "loop-bad-stop", stop: true }),
+    );
     fs.writeFileSync(path.join(emptyStop, "lock.json"), JSON.stringify({ pid: 1_000_000_007 }));
-    fs.writeFileSync(path.join(emptyStop, "ledger.json"), JSON.stringify({ stop: {} }));
+    fs.writeFileSync(
+      path.join(emptyStop, "ledger.json"),
+      JSON.stringify({ schema: LOOP_LEDGER_SCHEMA, run_id: "loop-empty-stop", stop: {} }),
+    );
     fs.writeFileSync(path.join(malformedStop, "lock.json"), JSON.stringify({ pid: 1_000_000_007 }));
     fs.writeFileSync(
       path.join(malformedStop, "ledger.json"),
-      JSON.stringify({ stop: { reason: "not-a-terminal-reason", time: "2026-08-20T00:00:00.000Z" } }),
+      JSON.stringify({
+        schema: LOOP_LEDGER_SCHEMA,
+        run_id: "loop-malformed-stop",
+        stop: { reason: "not-a-terminal-reason", time: "2026-08-20T00:00:00.000Z" },
+      }),
     );
     fs.writeFileSync(path.join(badUtf8Lock, "lock.json"), Buffer.from([0xff, 0xfe, 0x00, 0x7b]));
     fs.writeFileSync(path.join(badUtf8Ledger, "ledger.json"), Buffer.from([0x80, 0x81, 0x82]));
@@ -3383,6 +3394,10 @@ test("frg_pack_loop_is_live: explicit JSON null outstanding_ready is unknown, no
     const home = path.join(dir, "state");
     const nullReady = path.join(home, "runs", "loop-null-ready");
     const omittedReady = path.join(home, "runs", "loop-omitted-ready");
+    const terminalStop = {
+      reason: "supervisor_cycle_cap",
+      time: "2026-08-20T00:00:00.000Z",
+    };
     for (const p of [nullReady, omittedReady]) {
       fs.mkdirSync(p, { recursive: true });
       fs.writeFileSync(path.join(p, "lock.json"), JSON.stringify({ pid: 1_000_000_007 }));
@@ -3390,20 +3405,17 @@ test("frg_pack_loop_is_live: explicit JSON null outstanding_ready is unknown, no
     fs.writeFileSync(
       path.join(nullReady, "ledger.json"),
       JSON.stringify({
-        stop: {
-          reason: "supervisor_cycle_cap",
-          time: "2026-08-20T00:00:00.000Z",
-          outstanding_ready: null,
-        },
+        schema: LOOP_LEDGER_SCHEMA,
+        run_id: "loop-null-ready",
+        stop: { ...terminalStop, outstanding_ready: null },
       }),
     );
     fs.writeFileSync(
       path.join(omittedReady, "ledger.json"),
       JSON.stringify({
-        stop: {
-          reason: "supervisor_cycle_cap",
-          time: "2026-08-20T00:00:00.000Z",
-        },
+        schema: LOOP_LEDGER_SCHEMA,
+        run_id: "loop-omitted-ready",
+        stop: terminalStop,
       }),
     );
     const runner = path.join(dir, "run.sh");
@@ -3448,13 +3460,101 @@ test("frg_pack_loop_is_live: explicit JSON null outstanding_ready is unknown, no
     assert.match(
       r.stdout,
       /^loop-omitted-ready=0$/m,
-      "omitted outstanding_ready remains a terminal stop",
+      "omitted outstanding_ready on a valid ledger remains a terminal stop",
     );
     assert.match(
       r.stdout,
       /^loop-omitted-ready_wait=fail$/m,
-      "omitted outstanding_ready at cap remains fail-closed",
+      "omitted outstanding_ready on a valid ledger at cap remains fail-closed",
     );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("frg_pack_loop_is_live: missing or mismatched ledger identity is unknown at cap (#1150)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-loop-identity-"));
+  try {
+    const helpers = fs.readFileSync(frgHelpers, "utf8");
+    const fnLive = extractNamedFn(helpers, "frg_pack_loop_is_live", "frg-pack-helpers.sh");
+    const fnWait = extractNamedFn(helpers, "frg_pack_wait_decision", "frg-pack-helpers.sh");
+    const home = path.join(dir, "state");
+    const stopOnly = path.join(home, "runs", "loop-stop-only");
+    const missingSchema = path.join(home, "runs", "loop-missing-schema");
+    const numericSchema = path.join(home, "runs", "loop-numeric-schema");
+    const mismatchedId = path.join(home, "runs", "loop-mismatched-id");
+    const terminalStop = {
+      reason: "supervisor_cycle_cap",
+      time: "2026-08-20T00:00:00.000Z",
+    };
+    for (const p of [stopOnly, missingSchema, numericSchema, mismatchedId]) {
+      fs.mkdirSync(p, { recursive: true });
+      fs.writeFileSync(path.join(p, "lock.json"), JSON.stringify({ pid: 1_000_000_007 }));
+    }
+    fs.writeFileSync(
+      path.join(stopOnly, "ledger.json"),
+      JSON.stringify({ stop: terminalStop }),
+    );
+    fs.writeFileSync(
+      path.join(missingSchema, "ledger.json"),
+      JSON.stringify({ run_id: "loop-missing-schema", stop: terminalStop }),
+    );
+    fs.writeFileSync(
+      path.join(numericSchema, "ledger.json"),
+      JSON.stringify({ schema: 1, run_id: "loop-numeric-schema", stop: terminalStop }),
+    );
+    fs.writeFileSync(
+      path.join(mismatchedId, "ledger.json"),
+      JSON.stringify({
+        schema: LOOP_LEDGER_SCHEMA,
+        run_id: "other-loop",
+        stop: terminalStop,
+      }),
+    );
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        fnLive,
+        fnWait,
+        "probe_wait() {",
+        "  local id=$1",
+        "  local live",
+        '  live=$(frg_pack_loop_is_live "$id")',
+        '  printf "%s=%s\\n" "$id" "$live"',
+        '  printf "%s_wait=%s\\n" "$id" "$(frg_pack_wait_decision retry "$live" 2 2)"',
+        "}",
+        "probe_wait loop-stop-only",
+        "probe_wait loop-missing-schema",
+        "probe_wait loop-numeric-schema",
+        "probe_wait loop-mismatched-id",
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    const r = spawnSync("bash", [runner], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        AGENT_PIPELINE_STATE_HOME: home,
+      },
+    });
+    assert.equal(r.status, 0, `liveness helper exited ${r.status}: ${r.stderr}`);
+    for (const id of [
+      "loop-stop-only",
+      "loop-missing-schema",
+      "loop-numeric-schema",
+      "loop-mismatched-id",
+    ]) {
+      assert.match(r.stdout, new RegExp(`^${id}=unknown$`, "m"), `${id} must be unknown`);
+      assert.match(
+        r.stdout,
+        new RegExp(`^${id}_wait=continue$`, "m"),
+        `${id} must wait-continue at cap`,
+      );
+    }
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -3665,7 +3765,7 @@ test("tugboat live in_progress at cap 1 keeps ticking prepare (#1150)", () => {
     fs.mkdirSync(loopRun, { recursive: true });
     fs.writeFileSync(
       path.join(loopRun, "ledger.json"),
-      JSON.stringify({ run_id: "loop-live", stop: null }),
+      JSON.stringify({ schema: LOOP_LEDGER_SCHEMA, run_id: "loop-live", stop: null }),
     );
     const ticksPath = path.join(dir, "prepare-ticks");
     const fx = writeTugboatFrgFixture(dir, {

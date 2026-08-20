@@ -22,6 +22,7 @@ import {
   type ObservedEnsureTagReleasePr,
   type ShipAdapterOperations,
 } from "../scripts/stages/ship-adapter.ts";
+import { LOOP_LEDGER_SCHEMA } from "../scripts/loop/types.ts";
 import {
   runShipCoordinator,
   shipKey,
@@ -907,16 +908,22 @@ test("dead-loop in_progress at cap still throws resume-to-retry (#1150)", async 
   assert.equal(spawned.filter((argv) => argv.includes("factory-release")).length, 2);
 });
 
+const TERMINAL_LEDGER_STOP = {
+  reason: "supervisor_cycle_cap",
+  time: "2026-08-20T00:00:00.000Z",
+} as const;
+
+function durableLedgerJson(runId: string, stop: unknown): string {
+  return JSON.stringify({ schema: LOOP_LEDGER_SCHEMA, run_id: runId, stop });
+}
+
 test("probeBoundPackLoopLive reads injected lock/ledger fixtures (#1150)", async () => {
   const files = new Map<string, string>([
-    ["/home/runs/loop-live/ledger.json", JSON.stringify({ run_id: "loop-live", stop: null })],
+    ["/home/runs/loop-live/ledger.json", durableLedgerJson("loop-live", null)],
     ["/home/runs/loop-dead/lock.json", JSON.stringify({ pid: 99 })],
     [
       "/home/runs/loop-dead/ledger.json",
-      JSON.stringify({
-        run_id: "loop-dead",
-        stop: { reason: "supervisor_cycle_cap", time: "2026-08-20T00:00:00.000Z" },
-      }),
+      durableLedgerJson("loop-dead", TERMINAL_LEDGER_STOP),
     ],
     ["/home/runs/loop-pid/lock.json", JSON.stringify({ pid: 42 })],
   ]);
@@ -997,7 +1004,9 @@ test("probeBoundPackLoopLive treats read failures and corrupt state as unknown (
       isPidAlive: () => false,
       readTextFile: (p) => {
         if (p.endsWith("lock.json")) return eacces();
-        if (p.endsWith("ledger.json")) return JSON.stringify({ run_id: "loop", stop: null });
+        if (p.endsWith("ledger.json")) {
+          return durableLedgerJson("loop-unreadable-lock-live-ledger", null);
+        }
         return null;
       },
     }),
@@ -1017,7 +1026,7 @@ test("probeBoundPackLoopLive treats schema-invalid or blank state as unknown at 
     ],
     [
       "/home/runs/loop-bad-stop/ledger.json",
-      JSON.stringify({ run_id: "loop-bad-stop", stop: true }),
+      durableLedgerJson("loop-bad-stop", true),
     ],
     [
       "/home/runs/loop-bad-stop-str/lock.json",
@@ -1025,7 +1034,7 @@ test("probeBoundPackLoopLive treats schema-invalid or blank state as unknown at 
     ],
     [
       "/home/runs/loop-bad-stop-str/ledger.json",
-      JSON.stringify({ run_id: "loop-bad-stop-str", stop: "yes" }),
+      durableLedgerJson("loop-bad-stop-str", "yes"),
     ],
     [
       "/home/runs/loop-empty-stop/lock.json",
@@ -1033,7 +1042,7 @@ test("probeBoundPackLoopLive treats schema-invalid or blank state as unknown at 
     ],
     [
       "/home/runs/loop-empty-stop/ledger.json",
-      JSON.stringify({ run_id: "loop-empty-stop", stop: {} }),
+      durableLedgerJson("loop-empty-stop", {}),
     ],
     [
       "/home/runs/loop-malformed-stop/lock.json",
@@ -1041,9 +1050,9 @@ test("probeBoundPackLoopLive treats schema-invalid or blank state as unknown at 
     ],
     [
       "/home/runs/loop-malformed-stop/ledger.json",
-      JSON.stringify({
-        run_id: "loop-malformed-stop",
-        stop: { reason: "not-a-terminal-reason", time: "2026-08-20T00:00:00.000Z" },
+      durableLedgerJson("loop-malformed-stop", {
+        reason: "not-a-terminal-reason",
+        time: "2026-08-20T00:00:00.000Z",
       }),
     ],
   ]);
@@ -1057,6 +1066,52 @@ test("probeBoundPackLoopLive treats schema-invalid or blank state as unknown at 
     "loop-bad-stop-str",
     "loop-empty-stop",
     "loop-malformed-stop",
+  ]) {
+    const live = await probeBoundPackLoopLive(id, opts);
+    assert.equal(live, "unknown", `${id} must be unknown, not not-live`);
+    assert.equal(
+      classifyFrgPackWaitDecision({ tick: "retry", live, attempt: 2, cap: 2 }),
+      "continue",
+      `${id} must wait-continue at cap`,
+    );
+  }
+});
+
+test("probeBoundPackLoopLive treats missing or mismatched ledger identity as unknown at cap (#1150)", async () => {
+  const env = { AGENT_PIPELINE_STATE_HOME: "/home" } as NodeJS.ProcessEnv;
+  const files = new Map<string, string>([
+    ["/home/runs/loop-stop-only/lock.json", JSON.stringify({ pid: 99 })],
+    [
+      "/home/runs/loop-stop-only/ledger.json",
+      JSON.stringify({ stop: TERMINAL_LEDGER_STOP }),
+    ],
+    ["/home/runs/loop-missing-schema/lock.json", JSON.stringify({ pid: 99 })],
+    [
+      "/home/runs/loop-missing-schema/ledger.json",
+      JSON.stringify({ run_id: "loop-missing-schema", stop: TERMINAL_LEDGER_STOP }),
+    ],
+    ["/home/runs/loop-numeric-schema/lock.json", JSON.stringify({ pid: 99 })],
+    [
+      "/home/runs/loop-numeric-schema/ledger.json",
+      JSON.stringify({
+        schema: 1,
+        run_id: "loop-numeric-schema",
+        stop: TERMINAL_LEDGER_STOP,
+      }),
+    ],
+    ["/home/runs/loop-mismatched-id/lock.json", JSON.stringify({ pid: 99 })],
+    [
+      "/home/runs/loop-mismatched-id/ledger.json",
+      durableLedgerJson("other-loop", TERMINAL_LEDGER_STOP),
+    ],
+  ]);
+  const readTextFile = (p: string) => files.get(p) ?? null;
+  const opts = { env, readTextFile, isPidAlive: () => false };
+  for (const id of [
+    "loop-stop-only",
+    "loop-missing-schema",
+    "loop-numeric-schema",
+    "loop-mismatched-id",
   ]) {
     const live = await probeBoundPackLoopLive(id, opts);
     assert.equal(live, "unknown", `${id} must be unknown, not not-live`);
@@ -1089,7 +1144,7 @@ test("empty or malformed ledger stop at cap keeps re-invoking prepare (#1150)", 
       readTextFile: (p) => {
         if (p.endsWith("lock.json")) return JSON.stringify({ pid: 99 });
         if (p.endsWith("ledger.json")) {
-          return JSON.stringify({ run_id: "loop-1", stop });
+          return durableLedgerJson("loop-1", stop);
         }
         return null;
       },
@@ -1115,6 +1170,61 @@ test("empty or malformed ledger stop at cap keeps re-invoking prepare (#1150)", 
       spawned.filter((argv) => argv.includes("factory-release")).length,
       3,
       `stop=${JSON.stringify(stop)} must continue past the numeric cap`,
+    );
+    assert.deepEqual(heartbeats, [
+      { attempt: 1, live: "unknown" },
+      { attempt: 2, live: "unknown" },
+    ]);
+  }
+});
+
+test("missing or mismatched ledger identity at cap keeps re-invoking prepare (#1150)", async () => {
+  const env = { AGENT_PIPELINE_STATE_HOME: "/home" } as NodeJS.ProcessEnv;
+  const fixtures: unknown[] = [
+    { stop: TERMINAL_LEDGER_STOP },
+    { run_id: "loop-1", stop: TERMINAL_LEDGER_STOP },
+    { schema: 1, run_id: "loop-1", stop: TERMINAL_LEDGER_STOP },
+    { schema: LOOP_LEDGER_SCHEMA, run_id: "other-loop", stop: TERMINAL_LEDGER_STOP },
+  ];
+  for (const ledger of fixtures) {
+    const spawned: string[][] = [];
+    const heartbeats: Array<{ attempt: number; live: string }> = [];
+    let prepareTicks = 0;
+    const bound = bindCandidateShipEndOperations(operations(), {
+      pinCommitSha: PIN_SHA,
+      repoDir: "/repo",
+      env,
+      factoryReleaseRequestPath: "/abs/req.json",
+      frgWaitAttempts: 2,
+      delay: async () => {},
+      isPidAlive: () => false,
+      readTextFile: (p) => {
+        if (p.endsWith("lock.json")) return JSON.stringify({ pid: 99 });
+        if (p.endsWith("ledger.json")) return JSON.stringify(ledger);
+        return null;
+      },
+      onFrgWaitTick: (tick) => {
+        heartbeats.push({ attempt: tick.attempt, live: tick.live });
+      },
+      resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+      spawn: async (argv) => {
+        spawned.push(argv);
+        prepareTicks++;
+        if (prepareTicks < 3) {
+          return {
+            code: 0,
+            stdout: JSON.stringify({ status: "in_progress", loop_run_id: "loop-1" }),
+            stderr: "",
+          };
+        }
+        return { code: 0, stdout: JSON.stringify({ status: "complete" }), stderr: "" };
+      },
+    });
+    await bound.runFrgPack!(intent, train);
+    assert.equal(
+      spawned.filter((argv) => argv.includes("factory-release")).length,
+      3,
+      `ledger=${JSON.stringify(ledger)} must continue past the numeric cap`,
     );
     assert.deepEqual(heartbeats, [
       { attempt: 1, live: "unknown" },
