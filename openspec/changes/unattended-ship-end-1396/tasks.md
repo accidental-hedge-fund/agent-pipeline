@@ -21,7 +21,10 @@
 ## 4. GitHub overlay on stale ledger (#1165)
 
 - [ ] Overlay ledger `blocked` to `ready` when GitHub is R2D and checks are green
+- [ ] Overlay ledger `ready` still requires live GitHub R2D and green checks
 - [ ] Test: ledger blocked + GitHub R2D/green does not throw `did not finish clean`
+- [ ] Test: ready ledger + missing R2D label throws `did not finish clean`
+- [ ] Test: ready ledger + failed or pending check throws `did not finish clean`
 
 ## 5. Peeled pin SHA (#1166)
 

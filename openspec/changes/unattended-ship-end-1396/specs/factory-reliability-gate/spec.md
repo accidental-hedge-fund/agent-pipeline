@@ -17,3 +17,16 @@
 - **WHEN** the durable ledger item is `blocked`
 - **AND** live GitHub labels do not include `pipeline:ready-to-deploy`
 - **THEN** collect SHALL throw `did not finish clean at ready-to-deploy`
+
+#### Scenario: Ledger ready without GitHub ready still throws
+
+- **WHEN** the durable ledger item is `ready`
+- **AND** live GitHub labels do not include `pipeline:ready-to-deploy`
+- **THEN** collect SHALL throw `did not finish clean at ready-to-deploy`
+
+#### Scenario: Ledger ready with failed or pending checks still throws
+
+- **WHEN** the durable ledger item is `ready`
+- **AND** live GitHub labels include `pipeline:ready-to-deploy`
+- **AND** the bound PR checks include a failed or pending check
+- **THEN** collect SHALL throw `did not finish clean at ready-to-deploy`

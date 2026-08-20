@@ -109,14 +109,13 @@ export function githubReadyToDeployOverlay(opts: {
   return true;
 }
 
-/** Ledger state after GitHub overlay. Ready stays ready. Blocked becomes ready when GitHub is R2D+green. */
+/** Ledger state after GitHub overlay. R2D+green scores ready; a stale ready ledger demotes when GitHub is not live-ready. */
 export function overlayLedgerStateFromGitHub(
   ledgerState: string,
   opts: { labels: readonly string[]; checks: readonly { conclusion?: string | null }[] },
 ): string {
-  if (ledgerState === "ready") return "ready";
   if (githubReadyToDeployOverlay(opts)) return "ready";
-  return ledgerState;
+  return ledgerState === "ready" ? "blocked" : ledgerState;
 }
 
 /** Prefer the titled pack PR; closed is valid after factory-gate auto-close. */
