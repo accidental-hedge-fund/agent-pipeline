@@ -903,14 +903,51 @@ function pidsWithCmdlineNeedle(needle: string): number[] {
   return pids;
 }
 
-function killPids(pids: number[]): void {
+function killPids(pids: number[], signal: NodeJS.Signals = "SIGTERM"): void {
   for (const p of pids) {
+    if (p === process.pid) continue;
     try {
-      process.kill(p, "SIGTERM");
+      process.kill(p, signal);
     } catch {
       /* already gone */
     }
   }
+}
+
+/** PIDs whose cwd is the fixture dir (or a child of it). */
+function pidsWithCwdUnder(dir: string): number[] {
+  let root: string;
+  try {
+    root = fs.realpathSync(dir);
+  } catch {
+    return [];
+  }
+  const prefix = root.endsWith(path.sep) ? root : root + path.sep;
+  const pids: number[] = [];
+  for (const ent of fs.readdirSync("/proc")) {
+    if (!/^\d+$/.test(ent)) continue;
+    const pid = Number(ent);
+    if (pid === process.pid) continue;
+    try {
+      const cwd = fs.readlinkSync(path.join("/proc", ent, "cwd"));
+      if (cwd === root || cwd.startsWith(prefix)) pids.push(pid);
+    } catch {
+      /* gone or unreadable */
+    }
+  }
+  return pids;
+}
+
+function livePids(pids: number[]): number[] {
+  return pids.filter((p) => {
+    if (p === process.pid) return false;
+    try {
+      process.kill(p, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  });
 }
 
 function admissionLockPath(
@@ -1060,25 +1097,49 @@ function spawnDetachViaBarrier(opts: {
   });
 }
 
-function reapDetachFixture(dir: string, stateRoot: string, version: string): void {
-  killPids(pidsWithCmdlineNeedle(dir));
-  killPids(pidsWithCmdlineNeedle(`--milestone v${version}`));
+function collectFixturePids(dir: string, stateRoot: string, version: string): number[] {
+  const seen = new Set<number>();
+  const add = (pid: number): void => {
+    if (Number.isFinite(pid) && pid > 0 && pid !== process.pid) seen.add(pid);
+  };
+  for (const p of pidsWithCmdlineNeedle(dir)) add(p);
+  for (const p of pidsWithCmdlineNeedle(`--milestone v${version}`)) add(p);
+  // The fake $PIPELINE stub is `sleep 3600`. After tugboat is SIGTERM'd, that
+  // sleep keeps cwd in REPO_DIR and its cmdline no longer contains the fixture
+  // path — cmdline-only reap then rmSync throws ENOTEMPTY.
+  for (const p of pidsWithCwdUnder(dir)) add(p);
   try {
-    const shipDir = path.join(stateRoot, `ship-v${version}`);
-    const pidFile = path.join(shipDir, "playbook.pid");
+    const pidFile = path.join(stateRoot, `ship-v${version}`, "playbook.pid");
     if (fs.existsSync(pidFile)) {
-      const p = Number(fs.readFileSync(pidFile, "utf8").trim());
-      if (Number.isFinite(p) && p > 0) {
-        try {
-          process.kill(p, "SIGTERM");
-        } catch {
-          /* gone */
-        }
-      }
+      add(Number(fs.readFileSync(pidFile, "utf8").trim()));
     }
   } catch {
     /* ignore */
   }
+  return [...seen];
+}
+
+function reapDetachFixture(dir: string, stateRoot: string, version: string): void {
+  const collect = (): number[] => collectFixturePids(dir, stateRoot, version);
+  killPids(collect(), "SIGTERM");
+  const start = Date.now();
+  const killAt = start + 400;
+  const deadline = start + 2000;
+  for (;;) {
+    const live = livePids(collect());
+    if (live.length === 0) return;
+    if (Date.now() >= deadline) {
+      killPids(live, "SIGKILL");
+      spawnSync("sleep", ["0.05"], { stdio: "ignore" });
+      return;
+    }
+    if (Date.now() >= killAt) killPids(live, "SIGKILL");
+    spawnSync("sleep", ["0.02"], { stdio: "ignore" });
+  }
+}
+
+function rmFixtureDir(dir: string): void {
+  fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 20 });
 }
 
 function writeLongLivedPipelineStub(fakePipeline: string): void {
@@ -1088,6 +1149,42 @@ function writeLongLivedPipelineStub(fakePipeline: string): void {
   );
   fs.chmodSync(fakePipeline, 0o755);
 }
+
+test("reapDetachFixture reaps cwd-holders so fixture rm cannot ENOTEMPTY", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "reap-cwd-"));
+  const stateRoot = path.join(dir, "state");
+  const repo = path.join(dir, "repo");
+  fs.mkdirSync(repo, { recursive: true });
+  const version = `9.99.${process.pid}.${Date.now()}.reapcwd`;
+  const child = spawn("sleep", ["3600"], {
+    cwd: repo,
+    stdio: "ignore",
+    detached: true,
+  });
+  child.unref();
+  const pid = child.pid;
+  assert.ok(pid && pid > 0, "cwd-holder pid missing");
+  process.kill(pid, 0);
+  assert.ok(
+    pidsWithCwdUnder(dir).includes(pid),
+    "precondition: sleep stub cwd is under the fixture dir",
+  );
+  try {
+    reapDetachFixture(dir, stateRoot, version);
+    assert.equal(
+      pidsWithCwdUnder(dir).length,
+      0,
+      "sleep stub with cwd in the fixture dir must not hold the dir after reap",
+    );
+    rmFixtureDir(dir);
+  } finally {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      /* already gone or zombie */
+    }
+  }
+});
 
 test("detach race (#1062 R2): concurrent Ship detaches exactly once", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-race-"));
@@ -1145,7 +1242,7 @@ test("detach race (#1062 R2): concurrent Ship detaches exactly once", async () =
     // Reap before rmSync. Collecting only after asserts leaked sleep 3600
     // stubs whose argv still matched train --merge for the old milestone.
     reapDetachFixture(dir, stateRoot, version);
-    fs.rmSync(dir, { recursive: true, force: true });
+    rmFixtureDir(dir);
   }
 });
 
@@ -1209,7 +1306,7 @@ test("admission lock leftover file is not a live ship", () => {
     assert.doesNotMatch(out, /admission lock|lock file/i);
   } finally {
     reapDetachFixture(dir, stateRoot, version);
-    fs.rmSync(dir, { recursive: true, force: true });
+    rmFixtureDir(dir);
   }
 });
 
@@ -1366,7 +1463,7 @@ test("failed wait-for-live reaps delayed child so a later detach is the only shi
     );
   } finally {
     reapDetachFixture(dir, stateRoot, version);
-    fs.rmSync(dir, { recursive: true, force: true });
+    rmFixtureDir(dir);
   }
 });
 
@@ -1496,7 +1593,7 @@ test("SIGTERM during wait-for-live reaps the unconfirmed child before unlock", a
     );
   } finally {
     reapDetachFixture(dir, stateRoot, version);
-    fs.rmSync(dir, { recursive: true, force: true });
+    rmFixtureDir(dir);
   }
 });
 
@@ -1687,7 +1784,7 @@ test("wait-for-live expiry reaps a re-parented descendant before unlock", async 
     );
   } finally {
     reapDetachFixture(dir, stateRoot, version);
-    fs.rmSync(dir, { recursive: true, force: true });
+    rmFixtureDir(dir);
   }
 });
 
@@ -1777,7 +1874,7 @@ test("failed wait-for-live releases admission for a later detach", () => {
     assert.match(out, /detached tugboat ship/);
   } finally {
     reapDetachFixture(dir, stateRoot, version);
-    fs.rmSync(dir, { recursive: true, force: true });
+    rmFixtureDir(dir);
   }
 });
 
@@ -1823,7 +1920,7 @@ test("sequential second detach uses live-ship probe after first is live", () => 
     assert.doesNotMatch(secondOut, /admission lock|lock file|detach\.gate/i);
   } finally {
     reapDetachFixture(dir, stateRoot, version);
-    fs.rmSync(dir, { recursive: true, force: true });
+    rmFixtureDir(dir);
   }
 });
 
