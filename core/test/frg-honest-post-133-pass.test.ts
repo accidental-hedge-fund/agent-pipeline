@@ -263,6 +263,11 @@ test("isHonestPost133FrgPass accepts a fixture post-1.33 from-run pass (fails if
   assert.equal(unsigned.pass, false);
   assert.equal(unsigned.integrity.score_receipt, undefined);
   assert.equal(
+    isReleaseEligibleFrgPass(unsigned, { requireAttestation: false }),
+    true,
+    "HMAC-optional structural eligibility must ignore unsigned pass:false (#1147)",
+  );
+  assert.equal(
     isHonestPost133FrgPass({ ...unsigned, pass: true }, HONEST_KEY),
     false,
     "hand-edited pass:true on an unsigned fail must not satisfy honest-pass",

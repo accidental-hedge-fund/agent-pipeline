@@ -37,6 +37,7 @@ import {
   validateFrgPackContract,
   isAllowedFrgPackSelector,
   enforceRequiredScenarioCriteria,
+  frgAttestationPresent,
   isReleaseEligibleFrgPass,
   validateReleaseEligibleFrgEvidence,
   validateFrgEvidenceFileForTag,
@@ -314,6 +315,29 @@ test("enforceRequiredScenarioCriteria + isReleaseEligibleFrgPass: capacity N and
   assert.equal(isReleaseEligibleFrgPass({ ...full, loop_run_id: null }), false);
   assert.equal(isReleaseEligibleFrgPass({ ...full, pack_id: null }), false);
   assert.equal(isReleaseEligibleFrgPass({ ...full, pass: false }), false);
+
+  const unsigned = computeFrgEvidence(fullPackPassInput({ attestation_key: null }));
+  assert.equal(unsigned.pass, false, "unsigned mint must not invent pass:true");
+  assert.equal(frgAttestationPresent(unsigned.integrity), false);
+  assert.equal(
+    isReleaseEligibleFrgPass(unsigned),
+    false,
+    "default eligibility still requires attested pass",
+  );
+  assert.equal(
+    isReleaseEligibleFrgPass(unsigned, { requireAttestation: false }),
+    true,
+    "HMAC-optional structural eligibility must ignore unsigned pass:false (#1147)",
+  );
+  const missingComposition = {
+    ...unsigned,
+    composition: { dimensions: [], missing: ["openspec-bearing-item"] },
+  };
+  assert.equal(
+    isReleaseEligibleFrgPass(missingComposition, { requireAttestation: false }),
+    false,
+    "real ineligible scoreboards stay fail-closed when HMAC is omitted",
+  );
 });
 
 test("computeFrgEvidence: unobserved mandatory scenarios fail overall pass (not release evidence)", () => {

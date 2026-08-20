@@ -151,7 +151,9 @@ This is an idempotent multi-tick protocol.
    scoring applies: required-live from the candidate pack loop; Layer A TAP
    hashes on the same candidate SHA. Release-eligible
    `.agent-pipeline/frg/<version>/latest.json` with `pass: true` is written
-   only on a genuine scorer pass. Fail stays `pass: false`.
+   only on a genuine scorer pass with HMAC. Unsigned evidence MAY stay
+   `pass: false` when HMAC is omitted; that is attestor input, not pack-fail.
+   Real ineligible scores stay `pass: false` and `frg_not_eligible`.
 3. After unsigned artifacts exist and no verified production-owned attestation
    exists, the call returns `awaiting_frg_attestation` with unsigned artifact
    identities and digests. It does **not** open a release PR. Checkpoint state
@@ -180,6 +182,7 @@ composer runs `pipeline factory-gate --for <X.Y.Z> --from-run <loop>` in a
 **separate** credentialed process (no `--observations`). Pack-done is
 bound `latest.json` `pass: true` (or prepare `complete` with an open
 release PR). Unsigned `awaiting_frg_attestation` is **not** pack-done.
+Unsigned eligible omitted-HMAC `pass: false` is **attest**, not pack-fail.
 Ship-path composers wait until the bound pack loop is terminal (or a real
 pack-fail). Wait-budget expiry while that loop is live is **not** pack-fail.
 Auto-tag (#1040) and pin (#1041) remain later children. They do not invent

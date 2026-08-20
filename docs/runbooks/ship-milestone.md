@@ -187,8 +187,12 @@ Tugboat and in-engine `pipeline ship` keep re-invoking the same request and
 keep `state.json` at `frg-pack` / `running` (heartbeat). They do not fail the
 ship for wait-budget expiry and do not require a human re-detach. The numeric
 `FRG_WAIT_*` cap applies only when the bound loop is not live. CI /
-release-PR check wait (`RELEASE_WAIT_*`) stays a CI poll. A failed or missing
-pack stops the ship **before** `pipeline release`.
+release-PR check wait (`RELEASE_WAIT_*`) stays a CI poll. Unsigned eligible
+`latest.json` `pass: false` caused only by omitted HMAC is **attest**, not
+pack-fail: prepare returns `awaiting_frg_attestation` and Tugboat runs
+`factory-gate --from-run` in a separate child. Real ineligible scoreboards
+stay pack-fail. A failed or missing pack that is not omitted-HMAC-only
+stops the ship **before** `pipeline release`.
 If the candidate engine cannot be resolved, Tugboat fails closed and does **not**
 fall back to the production-pin `$PIPELINE` for those verbs. Tugboat does not
 write the key body into `state.json`.

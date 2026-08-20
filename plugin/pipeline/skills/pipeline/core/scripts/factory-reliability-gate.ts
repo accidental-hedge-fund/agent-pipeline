@@ -1572,12 +1572,19 @@ export function isReleaseEligibleFrgPass(
   opts?: {
     /**
      * When false, skip the attestation-presence check so the mint path can
-     * compute structural eligibility before attaching the HMAC. Default true.
+     * compute structural eligibility before attaching the HMAC. Also ignore
+     * attested `pass: false` when HMAC is absent so omitted HMAC is not
+     * treated as structural fail (#1147). Default true.
      */
     requireAttestation?: boolean;
   },
 ): boolean {
-  if (!evidence.pass) return false;
+  const hmacOptional = opts?.requireAttestation === false;
+  const hmacAbsent = !frgAttestationPresent(evidence.integrity);
+  // HMAC-optional structural eligibility ignores attested pass:false when
+  // HMAC is absent. Attested pass:true still requires HMAC (#757). Unsigned
+  // latest.json stays pass:false until the attestor child signs.
+  if (!evidence.pass && !(hmacOptional && hmacAbsent)) return false;
   const layerAProvenByTap = layerAIdsProvenByTap(
     evidence.pack_provenance,
     evidence.scenarios,

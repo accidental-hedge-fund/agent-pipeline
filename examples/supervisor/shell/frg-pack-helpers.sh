@@ -266,15 +266,17 @@ PY
 # Classify one factory-release prepare tick. Prints done | attest | retry | fail.
 # $1 prepare JSON path, $2 latest.json path, $3 prepare exit code,
 # $4 factory-release request JSON (version + candidate SHA binding).
-# pass: false is pack-fail before any success status. pass: true is
-# pack-done only when latest records the request target_version and
-# integrated_candidate.git_sha (and action_id when the artifact has it).
-# awaiting_frg_attestation without that bound pass: true is attest, not done.
-# in_progress with unsigned eligible artifacts (closed frg/unsigned digests)
-# is attest so factory-gate --from-run can sign; bare in_progress is retry.
-# complete is done only after an open release PR for the requested
-# version is verified (TUGBOAT_OPEN_RELEASE_PR injects that number;
-# else gh pr list).
+# Bound pass: true is pack-done first. awaiting_frg_attestation / unsigned
+# eligible artifacts (including omitted-HMAC latest.json pass: false) are
+# attest. Attested HMAC pass: false, or unsigned ineligible pass: false,
+# is pack-fail. pass: true is pack-done only when latest records the
+# request target_version and integrated_candidate.git_sha (and action_id
+# when the artifact has it). awaiting_frg_attestation without that bound
+# pass: true is attest, not done. in_progress with unsigned eligible
+# artifacts (closed frg/unsigned digests) is attest so factory-gate
+# --from-run can sign; bare in_progress is retry. complete is done only
+# after an open release PR for the requested version is verified
+# (TUGBOAT_OPEN_RELEASE_PR injects that number; else gh pr list).
 classify_frg_pack_tick() {
   python3 - "$1" "$2" "$3" "${4:-}" <<'PY'
 import json, os, subprocess, sys
@@ -443,22 +445,37 @@ def has_unsigned_eligible_artifacts(obj):
         return True
     return False
 
+def hmac_present(latest):
+    if not isinstance(latest, dict):
+        return False
+    att = as_dict(as_dict(latest.get("integrity")).get("attestation"))
+    alg = str(att.get("alg") or "").strip()
+    mac = str(att.get("mac") or "").strip().lower()
+    if alg != "hmac-sha256-v1":
+        return False
+    if len(mac) != 64:
+        return False
+    return all(c in "0123456789abcdef" for c in mac)
+
 prep = load_maybe(prep_path)
 latest = load_maybe(latest_path)
 req = load_maybe(req_path)
 status = prep.get("status") if isinstance(prep, dict) else None
 pass_v = latest.get("pass") if isinstance(latest, dict) else None
 
-if pass_v is False:
-    print("fail")
-    raise SystemExit(0)
 if pass_v is True and pass_matches_request(latest, req):
     print("done")
+    raise SystemExit(0)
+if pass_v is False and hmac_present(latest):
+    print("fail")
     raise SystemExit(0)
 if status == "awaiting_frg_attestation" or (
     status == "in_progress" and has_unsigned_eligible_artifacts(prep)
 ):
     print("attest")
+    raise SystemExit(0)
+if pass_v is False:
+    print("fail")
     raise SystemExit(0)
 if status == "complete":
     if complete_has_open_release_pr(prep):

@@ -7,9 +7,10 @@
 //      that factory-gate candidate pack loop and return status "in_progress"
 //      (no pass, no complete, no release PR).
 //   2) Bound loop terminal → score with factory-gate --from-run (no
-//      --observations). If unsigned artifacts are structurally eligible and
-//      no verified production-owned attestation exists →
-//      "awaiting_frg_attestation" (no release PR).
+//      --observations). If unsigned artifacts are structurally eligible
+//      (HMAC omitted is eligible, not frg_not_eligible) and no verified
+//      production-owned attestation exists → "awaiting_frg_attestation"
+//      (no release PR). latest.json MAY stay pass:false until attested.
 //   3) After the trusted attestor stores a valid attestation for those exact
 //      artifacts → verify, invoke shared runRelease, return status "complete".
 //
@@ -2649,7 +2650,15 @@ export async function runFactoryReleasePrepare(
   }
 
   // --- Failed terminal ---
-  if (store?.phase === "failed" && store.failure) {
+  // Omitted-HMAC `frg_not_eligible` is not a terminal pack-fail (#1147).
+  // Re-observe so a prior unsigned-eligible score can become
+  // awaiting_frg_attestation instead of replaying the stale checkpoint.
+  // Real ineligible scores fail again when generate re-scores.
+  if (
+    store?.phase === "failed" &&
+    store.failure &&
+    store.failure.defect_class !== "frg_not_eligible"
+  ) {
     return {
       exitCode: 1,
       result: failedResult(
@@ -2739,6 +2748,7 @@ export async function runFactoryReleasePrepare(
       phase: "awaiting_frg_attestation",
       unsigned,
       awaiting_checkpoint_id: awaitingId,
+      failure: undefined,
       updated_at: isoNow(deps.now()),
     };
     await saveCheckpoint(deps, checkpointPath, store);
@@ -3017,9 +3027,10 @@ prepare-only release handoff. Idempotent multi-tick protocol:
      factory-gate --for <version> --from-run <loop_run_id> (no --observations).
      If unsigned artifacts are structurally eligible and no verified
      production-owned attestation exists, it returns status
-     "awaiting_frg_attestation" with closed artifact identities and digests.
-     It does NOT open a release PR and must NOT see
-     PIPELINE_FRG_ATTESTATION_KEY in the candidate environment.
+     "awaiting_frg_attestation" with closed artifact identities and digests
+     (HMAC omitted is awaiting, not failed / frg_not_eligible). latest.json
+     MAY stay pass:false until attested. It does NOT open a release PR and
+     must NOT see PIPELINE_FRG_ATTESTATION_KEY in the candidate environment.
   3) After the trusted production-owned attestor stores a verified attestation
      for those exact artifacts, a later call with the UNCHANGED request
      verifies the attestation, invokes shared runRelease (prepare-only), and

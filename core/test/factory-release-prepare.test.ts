@@ -14,6 +14,7 @@ import {
   defaultResumeBoundPackLoop,
   defaultSpawnCandidateLoop,
   defaultStartBoundPackLoop,
+  factoryReleaseCheckpointPath,
   factoryReleaseLoopBindingPath,
   sanitizeCandidateLoopEnv,
   factoryReleasePackInstancePath,
@@ -46,6 +47,9 @@ import {
   FRG_SCENARIO_IDS,
   FRG_UNIT_TEST_ATTESTATION_KEY,
   computeFrgEvidence,
+  frgRequiredCompositionOverrides,
+  frgRequiredObservationOverrides,
+  isReleaseEligibleFrgPass,
   type FrgEvidence,
 } from "../scripts/factory-reliability-gate.ts";
 import {
@@ -106,6 +110,32 @@ function boundLoopArtifacts(over: {
     action_evidence_text: "{}\n",
     runner_observations_text: over.runner_observations_text,
   };
+}
+
+function unsignedEligibleScoreEvidence(
+  loopRunId: string,
+): import("../scripts/factory-reliability-gate.ts").FrgEvidence {
+  const evidence = computeFrgEvidence({
+    version: "1.29.1",
+    run_id: "frg-unsigned-eligible",
+    loop_run_id: loopRunId,
+    pack_id: FRG_PACK_MANIFEST.pack_id,
+    items: [
+      { item_id: "1", state: "ready", ready_clean: true },
+      { item_id: "2", state: "ready", ready_clean: true },
+    ],
+    scenario_overrides: frgRequiredObservationOverrides("pass"),
+    composition_overrides: frgRequiredCompositionOverrides("pass"),
+    false_human_authority_count: 0,
+    attestation_key: null,
+  });
+  assert.equal(evidence.pass, false, "unsigned mint must not invent pass:true");
+  assert.equal(
+    isReleaseEligibleFrgPass(evidence, { requireAttestation: false }),
+    true,
+    "omitted HMAC must still be structurally eligible",
+  );
+  return evidence;
 }
 
 function failScoreEvidence(loopRunId: string, version = "1.34.0"): import("../scripts/factory-reliability-gate.ts").FrgEvidence {
@@ -1402,6 +1432,140 @@ test("terminal score uses --from-run and does not pass --observations; fail stay
   assert.ok(latestPath, "fail MAY write latest.json");
   const latest = JSON.parse(files.get(latestPath!)!);
   assert.equal(latest.pass, false);
+});
+
+test("omitted HMAC on structurally eligible terminal pack is awaiting, not frg_not_eligible (#1147)", async () => {
+  const files = new Map<string, string>();
+  const request = baseRequest();
+  const workDir = "/tmp/frg-work-unsigned-eligible";
+  const scoreCalls: ScoreBoundPackLoopArgs[] = [];
+  const result = await generateDurableUnsignedFrg(
+    request,
+    {
+      repoDir: "/repo",
+      workDir,
+      pack: fakePack(),
+      manifestPath: "/pack/factory-gate-v1/manifest.json",
+    },
+    {
+      now: () => new Date("2026-08-10T12:00:00Z"),
+      writeFile: async (p, body) => {
+        files.set(p, body);
+      },
+      mkdir: async () => {},
+      readFile: async (p) => {
+        const v = files.get(p);
+        if (v === undefined) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+        return v;
+      },
+      fileExists: async (p) => files.has(p),
+      reconcilePackLoop: async () =>
+        boundLoopArtifacts({ loop_run_id: "loop-unsigned-eligible", item_state: "ready" }),
+      scoreBoundPackLoop: async (args) => {
+        scoreCalls.push(args);
+        return {
+          evidence: unsignedEligibleScoreEvidence(args.fromRun),
+          evidencePath: null,
+          latestPath: null,
+        };
+      },
+    },
+  );
+
+  assert.equal(scoreCalls.length, 1);
+  assert.equal("observations" in (scoreCalls[0] ?? {}), false);
+  assert.equal(result.structurally_eligible, true);
+  assert.notEqual(result.defect_class, "frg_not_eligible");
+  assert.equal(result.frg.loop_run_id, "loop-unsigned-eligible");
+  const latestPath = [...files.keys()].find((k) => k.endsWith("/latest.json"));
+  assert.ok(latestPath, "unsigned eligible score still writes latest.json");
+  const latest = JSON.parse(files.get(latestPath!)!);
+  assert.equal(latest.pass, false, "unsigned latest.json must stay pass:false");
+  assert.equal(latest.integrity?.attestation, undefined);
+
+  const mem = memoryFs();
+  const requestPath = "/tmp/req-unsigned-eligible.json";
+  await mem.writeFile(requestPath, JSON.stringify(request));
+  const generateCalls = { n: 0 };
+  const deps = makeDeps({
+    fs: mem,
+    generateCalls,
+    generate: async (req, ctx) => {
+      generateCalls.n++;
+      return generateDurableUnsignedFrg(req, ctx, {
+        now: () => new Date("2026-08-10T12:00:00Z"),
+        writeFile: (p, body) => mem.writeFile(p, body),
+        mkdir: () => mem.mkdir(),
+        readFile: (p) => mem.readFile(p),
+        fileExists: (p) => mem.fileExists(p),
+        reconcilePackLoop: async () =>
+          boundLoopArtifacts({ loop_run_id: "loop-unsigned-eligible-e2e", item_state: "ready" }),
+        scoreBoundPackLoop: async (args) => ({
+          evidence: unsignedEligibleScoreEvidence(args.fromRun),
+          evidencePath: null,
+          latestPath: null,
+        }),
+      });
+    },
+  });
+  const outcome = await runFactoryReleasePrepare({ requestPath, repoDir: "/repo" }, deps);
+  assert.equal(outcome.exitCode, 0);
+  assert.equal(outcome.result.status, "awaiting_frg_attestation");
+  if (outcome.result.status === "awaiting_frg_attestation") {
+    assert.equal(outcome.result.frg.loop_run_id, "loop-unsigned-eligible-e2e");
+    assert.ok(outcome.result.frg.observations.sha256);
+    assert.ok(outcome.result.frg.evidence_bundle.sha256);
+  }
+  assert.notEqual(outcome.result.status, "failed");
+  if (outcome.result.status === "failed") {
+    assert.notEqual(outcome.result.defect_class, "frg_not_eligible");
+  }
+});
+
+test("stale omitted-HMAC failed checkpoint is re-observed as awaiting (#1147)", async () => {
+  const mem = memoryFs();
+  const request = baseRequest();
+  const requestPath = "/tmp/req-stale-omitted-hmac.json";
+  await mem.writeFile(requestPath, JSON.stringify(request));
+  const fingerprint = factoryReleaseRequestFingerprint(request);
+  const checkpointPath = factoryReleaseCheckpointPath("/repo", fingerprint);
+  await mem.writeFile(
+    checkpointPath,
+    JSON.stringify({
+      schema_version: 1,
+      kind: "factory_release_checkpoint_store",
+      request_fingerprint: fingerprint,
+      phase: "failed",
+      request,
+      failure: {
+        defect_class: "frg_not_eligible",
+        message: "release-eligible attestation omitted",
+      },
+      updated_at: "2026-08-19T19:44:19Z",
+    }),
+  );
+  const generateCalls = { n: 0 };
+  const deps = makeDeps({
+    fs: mem,
+    generateCalls,
+    generate: async () => ({
+      frg: unsignedPayload({
+        loop_run_id: "loop-stale-omitted-hmac",
+        frg_run_id: "frg-stale-omitted-hmac",
+      }),
+      structurally_eligible: true,
+    }),
+  });
+  const outcome = await runFactoryReleasePrepare({ requestPath, repoDir: "/repo" }, deps);
+  assert.equal(generateCalls.n, 1, "stale omitted-HMAC failed checkpoint must re-generate");
+  assert.equal(outcome.exitCode, 0);
+  assert.equal(outcome.result.status, "awaiting_frg_attestation");
+  if (outcome.result.status === "awaiting_frg_attestation") {
+    assert.equal(outcome.result.frg.loop_run_id, "loop-stale-omitted-hmac");
+  }
+  const stored = JSON.parse(mem.files.get(checkpointPath)!);
+  assert.equal(stored.phase, "awaiting_frg_attestation");
+  assert.equal(stored.failure, undefined);
 });
 
 test("defaultStartBoundPackLoop creates pack issues and dispatches candidate loop", async () => {
