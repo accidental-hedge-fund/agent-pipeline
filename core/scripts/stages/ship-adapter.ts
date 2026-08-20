@@ -240,6 +240,9 @@ export function hmacPackedCandidateGitShaFromUnknown(raw: unknown): string | nul
 /**
  * After a merged release PR, if FRG latest.json is release-eligible and the
  * annotated tag is missing, create and push it on the peeled merge commit.
+ * Origin is the success authority: a locally missing tag is still `exists`
+ * when origin already has the correct annotated tag, without on-disk HMAC.
+ * HMAC evidence is required only before creating a tag origin lacks.
  * Does not open a second release PR. Never force-updates or deletes the tag.
  * `validateFrg` MUST return the HMAC-validated latest.json snapshot from the
  * same file read; packed-candidate binding uses that in-memory result.
@@ -297,6 +300,11 @@ export async function ensureAnnotatedReleaseTag(opts: {
   } catch (err) {
     if (isReleaseTagInvariantError(err)) throw err;
   }
+  // Origin is the success authority. A locally missing tag still exists when
+  // origin already has the correct annotated tag; HMAC evidence is required
+  // only before creating a tag origin lacks.
+  const remote = await observeRemote();
+  if (remote === "exists") return "exists";
   const snapshot = await opts.validateFrg();
   const hmacSha = parseExactGitSha(hmacPackedCandidateGitShaFromUnknown(snapshot));
   if (!hmacSha) {

@@ -294,6 +294,7 @@ test("ensureAnnotatedReleaseTag creates and pushes when FRG is eligible and tag 
     calls.push(args);
     if (args[0] === "rev-parse" && args.includes("--verify")) return mergeHead;
     if (args[0] === "cat-file") throw new Error("not a valid object");
+    if (args[0] === "fetch") throw new Error("couldn't find remote ref");
     return "";
   };
   let validated = 0;
@@ -1418,6 +1419,7 @@ test("runEnsureAnnotatedReleaseTagCli tags via injected git, not ambient git", a
         gitCalls.push(args);
         if (args[0] === "rev-parse" && args.includes("--verify")) return mergeHead;
         if (args[0] === "cat-file") throw new Error("not a valid object");
+        if (args[0] === "fetch") throw new Error("couldn't find remote ref");
         return "";
       },
       validateFrg: async () => hmacSnapshot(head),
@@ -1445,6 +1447,7 @@ test("runEnsureAnnotatedReleaseTagCli rejects a valid OID that is not the merged
           gitCalls.push(args);
           if (args[0] === "rev-parse" && args.includes("--verify")) return unrelatedOid;
           if (args[0] === "cat-file") throw new Error("not a valid object");
+          if (args[0] === "fetch") throw new Error("couldn't find remote ref");
           if (args[0] === "tag" || args[0] === "push") {
             throw new Error(`must not ${args[0]} an unrelated OID`);
           }
@@ -1504,7 +1507,8 @@ function missingTagGit(calls: string[][], peel = mergeHead) {
     calls.push(args);
     if (args[0] === "rev-parse" && args.includes("--verify")) return peel;
     if (args[0] === "cat-file") throw new Error("not a valid object");
-    if (args[0] === "tag" || args[0] === "push" || args[0] === "fetch") return "";
+    if (args[0] === "fetch") throw new Error("couldn't find remote ref");
+    if (args[0] === "tag" || args[0] === "push") return "";
     return "";
   };
 }
@@ -1629,6 +1633,72 @@ test("ensure-tag fails closed on wrong-target existing tag and does not force (#
     /does not point to the release merge commit/,
   );
   assert.ok(!calls.some((args) => args[0] === "tag" || args[0] === "push" || args.includes("--force")));
+});
+
+test("ensure-tag treats a correct origin tag as exists when the local ref is missing (#1149)", async () => {
+  const calls: string[][] = [];
+  let validated = 0;
+  const result = await ensureAnnotatedReleaseTag({
+    version: intent.version,
+    mergeCommitOid: mergeHead,
+    packedCandidate: head,
+    git: async (args) => {
+      calls.push(args);
+      if (args[0] === "rev-parse" && args.includes("--verify")) return mergeHead;
+      if (args[0] === "cat-file" && args[2] === `refs/tags/v${intent.version}`) {
+        throw new Error("not a valid object");
+      }
+      if (
+        args[0] === "fetch" &&
+        args.includes(`refs/tags/v${intent.version}:refs/tags/v${intent.version}-origin-observe`)
+      ) {
+        return "";
+      }
+      if (args[0] === "cat-file" && args[2] === `refs/tags/v${intent.version}-origin-observe`) {
+        return "tag";
+      }
+      if (args[0] === "rev-parse" && args[1] === `refs/tags/v${intent.version}-origin-observe^{}`) {
+        return mergeHead;
+      }
+      throw new Error(`unexpected git ${args.join(" ")}`);
+    },
+    validateFrg: async () => {
+      validated++;
+      throw new Error("must not require on-disk HMAC when origin already has the correct tag");
+    },
+  });
+  assert.equal(result, "exists");
+  assert.equal(validated, 0);
+  assert.ok(!calls.some((args) => args[0] === "tag" || args[0] === "push"));
+  assert.ok(!calls.some((args) => args.includes("-f") || args.includes("--force")));
+});
+
+test("ensure-tag fails closed on a wrong origin tag when the local ref is missing (#1149)", async () => {
+  const calls: string[][] = [];
+  await assert.rejects(
+    ensureAnnotatedReleaseTag({
+      version: intent.version,
+      mergeCommitOid: mergeHead,
+      packedCandidate: head,
+      git: async (args) => {
+        calls.push(args);
+        if (args[0] === "rev-parse" && args.includes("--verify")) return mergeHead;
+        if (args[0] === "cat-file" && args[2] === `refs/tags/v${intent.version}`) {
+          throw new Error("not a valid object");
+        }
+        if (args[0] === "fetch") return "";
+        if (args[0] === "cat-file") return "tag";
+        if (args[0] === "rev-parse") return unrelatedOid;
+        throw new Error(`must not ${args.join(" ")}`);
+      },
+      validateFrg: async () => {
+        throw new Error("must not validate FRG when origin tag is wrong");
+      },
+    }),
+    /does not point to the release merge commit/,
+  );
+  assert.ok(!calls.some((args) => args[0] === "tag" || args[0] === "push"));
+  assert.ok(!calls.some((args) => args.includes("-f") || args.includes("--force")));
 });
 
 test("ensure-tag concurrent push: correct remote tag is exists (#1149)", async () => {
