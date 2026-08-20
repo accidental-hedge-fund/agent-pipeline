@@ -100,7 +100,8 @@ examples/supervisor/shell/ship-milestone.sh \
 |--------|-----|
 | non-pack / work-list selector | Use factory-gate **label/milestone** pack, not product train run |
 | missing observations / scenarios | Add `--observations` / `--scenario` per runbook |
-| pass: false | Fix pack failures; re-run pack; re-score |
+| pass: false (omitted HMAC, structurally eligible) | Attest with `factory-gate --for <X.Y.Z> --from-run <loop>`; do not treat as pack-fail |
+| pass: false (composition missing / required scenario fail) | Fix pack failures; re-run pack; re-score |
 
 ## Pointers
 

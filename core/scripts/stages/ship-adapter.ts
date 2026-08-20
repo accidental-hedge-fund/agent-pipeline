@@ -1087,6 +1087,8 @@ function classifyCandidatePrepareTick(
   exitCode: number,
 ): CandidatePrepareTick {
   const status = typeof parsed?.status === "string" ? parsed.status : null;
+  // Prepare maps omitted-HMAC unsigned eligible scores to
+  // awaiting_frg_attestation (#1147). Do not re-parse latest.json here.
   if (status === "complete") return "done";
   if (status === "awaiting_frg_attestation") return "attest";
   if (status === "in_progress") {

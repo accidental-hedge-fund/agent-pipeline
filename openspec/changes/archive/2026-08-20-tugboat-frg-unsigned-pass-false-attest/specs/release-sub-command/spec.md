@@ -1,0 +1,89 @@
+## MODIFIED Requirements
+
+### Requirement: The candidate-native factory handoff SHALL use one stable prepare interface
+
+The engine SHALL expose the exact non-interactive command `pipeline factory-release prepare --request <absolute-request.json> --json` for durable FRG generation and prepare-only release handoff on every release after v1.33.0. Ship-end composers (Tugboat, the installed `pipeline-ship-playbook` launcher, and in-engine `pipeline ship`) SHALL invoke this command, `pipeline release`, and `release finish` from the clean exact integrated candidate when the installed production engine is one release behind the candidate that provides the command. In-engine `pipeline ship` SHALL also run `ensureAnnotatedReleaseTag` from that candidate. Tugboat SHALL NOT invoke `git tag` or `gh release create`. They SHALL NOT invoke those verbs from the previous production-pin CLI in that case. The request SHALL be versioned, secret-free, and bound to the verified installed production pin (when present), freshly observed base, exact integrated candidate, target release version, and stable action identity when supplied. The request SHALL NOT carry FRG credentials, executable paths, module names, network targets, or caller-authored pass claims.
+
+The command SHALL implement an idempotent multi-tick protocol. A call for a post-1.33 request with no request-bound pack loop, or with a bound loop that is not terminal, SHALL start or resume that bound candidate pack loop, persist `loop_run_id` and the matching request binding before spawn, and return JSON with `status: "in_progress"`, the bound `loop_run_id`, and a stable restart checkpoint. A failed detached spawn SHALL fail that tick and SHALL leave the request bound to the same `loop_run_id` so a later invoke can resume it. That call SHALL NOT invent `pass: true`, SHALL NOT return `status: "complete"`, and SHALL NOT open the release pull request. A repeat call with the **unchanged** request SHALL resume the same `loop_run_id` and SHALL NOT start a second unbound pack.
+
+When the bound pack loop is terminal, the command SHALL score it with `pipeline factory-gate --for <target-version> --from-run <loop_run_id>` (or the in-process equivalent) and SHALL NOT pass `--observations`. Complete unsigned FRG artifacts SHALL exist when scoreboard and composition meet release-eligibility except HMAC is absent, even if `.agent-pipeline/frg/<X.Y.Z>/latest.json` records `pass: false` solely because HMAC was omitted. Only after that score produces complete unsigned FRG artifacts, and no verified production-owned attestation exists, SHALL the command return JSON with `status: "awaiting_frg_attestation"`, closed unsigned artifact identities and digests, and a stable restart checkpoint. It SHALL NOT open the release pull request on that call. It SHALL NOT return `status: "failed"` or `defect_class: "frg_not_eligible"` when HMAC is the only missing piece. A re-observe of a prior omitted-HMAC `failed` checkpoint for the same unchanged request SHALL return `awaiting_frg_attestation` when the pack is still structurally eligible.
+
+After the wrapper stores a verified production-owned attestation for those exact artifacts, a later call with the **unchanged** request SHALL verify the bound attestation, invoke the existing prepare-only release implementation, and return `status: "complete"` with the exact FRG run identity, release pull request, release head, base commit, and restart checkpoint. Repeated calls at any proved checkpoint SHALL return the same proved state without creating a second pack, loop, attestation, branch, or pull request.
+
+The command SHALL grant no attestation signing, release-PR merge, publication, pin, install, rollback, or Tugboat `--skip-frg` authority. The v1.33.0 hybrid path SHALL NOT be used as a fallback when this command is missing or fails for a later release.
+
+#### Scenario: First call waits for trusted attestation
+
+- **WHEN** the unchanged request has produced complete unsigned FRG artifacts but no verified production-owned attestation exists
+- **THEN** the command SHALL return `status: "awaiting_frg_attestation"` with only the bound unsigned artifact identities, digests, and restart checkpoint
+- **AND** it SHALL NOT create the release pull request
+
+#### Scenario: Omitted HMAC is not frg_not_eligible
+
+- **WHEN** the bound pack loop is terminal
+- **AND** scoreboard and composition meet release-eligibility except HMAC is absent
+- **AND** `.agent-pipeline/frg/<X.Y.Z>/latest.json` records `pass: false` because HMAC was omitted
+- **THEN** the command SHALL return `status: "awaiting_frg_attestation"`
+- **AND** it SHALL NOT return `status: "failed"`
+- **AND** it SHALL NOT return `defect_class: "frg_not_eligible"`
+- **AND** it SHALL NOT invent `pass: true`
+
+#### Scenario: Stale omitted-HMAC failed checkpoint is re-observed as awaiting
+
+- **WHEN** a prior tick persisted `status: "failed"` and `defect_class: "frg_not_eligible"` because HMAC was omitted
+- **AND** a later call uses the unchanged request
+- **AND** the bound pack is still structurally eligible
+- **THEN** the command SHALL return `status: "awaiting_frg_attestation"`
+- **AND** it SHALL NOT replay that failed checkpoint as terminal pack-fail
+
+#### Scenario: Second call returns the complete release pull request
+
+- **WHEN** the trusted attestor has stored a valid attestation for the unchanged request and exact unsigned artifacts
+- **THEN** the next call SHALL prepare or reconcile one release pull request via shared `runRelease` and return `status: "complete"` with its exact identity and head
+- **AND** a repeat call SHALL return the same proved result without another pack, branch, or pull request mutation
+
+#### Scenario: Candidate prepare does not acquire signing or finalization authority
+
+- **WHEN** the candidate-native prepare command returns a successful JSON result
+- **THEN** the factory SHALL have passed no FRG signing credential or credential path through the candidate environment, inherited file descriptors, request, or result
+- **AND** a separate granted or operator action SHALL still be required for merge, publication verification, pin promotion, install, or rollback
+
+#### Scenario: Crash mid-protocol re-observes before mutate
+
+- **WHEN** the process stops after pack creation, after binding persist, after loop dispatch, after attestation storage, or after release PR creation but before checkpoint advancement
+- **THEN** a restart with the same request SHALL re-observe pack, loop, run, attestation, branch, PR, and head state
+- **AND** it SHALL continue from the proved checkpoint without creating a duplicate pack, loop, branch, or release PR
+
+#### Scenario: Missing or failed FRG blocks complete status
+
+- **WHEN** required FRG evidence is missing, stale, failed, mismatched, skipped, or waived without policy support
+- **THEN** the command SHALL NOT return `status: "complete"`
+- **AND** it SHALL exit non-zero or return a failure status that names the version and defect class
+
+#### Scenario: Structural ineligibility still fails
+
+- **WHEN** the bound pack loop is terminal
+- **AND** composition is missing or a required scenario fails
+- **THEN** the command SHALL NOT return `status: "awaiting_frg_attestation"`
+- **AND** it SHALL return a failure status that names `frg_not_eligible` or the structural defect
+
+#### Scenario: First call with no bound loop returns in-progress
+
+- **WHEN** a post-1.33 prepare request has no request-bound pack loop
+- **THEN** the command SHALL start a bound candidate pack loop and return `status: "in_progress"` with that `loop_run_id` and a restart checkpoint
+- **AND** it SHALL NOT return `status: "complete"` or invent `pass: true`
+- **AND** it SHALL NOT treat the missing pre-bound loop as `missing_generator`
+
+#### Scenario: Re-invoke resumes the same loop_run_id
+
+- **WHEN** a later call uses the unchanged request
+- **AND** the pack instance already records bound `loop_run_id` `L`
+- **THEN** the command SHALL resume `L` and return the same proved in-progress, awaiting, complete, or failed state
+- **AND** it SHALL NOT start a second unbound pack
+
+#### Scenario: Ship-end composers invoke prepare from the candidate when the pin is behind
+
+- **WHEN** the installed production engine is version `1.39.4`
+- **AND** the exact integrated candidate SHA provides `factory-release prepare` and `release` at `1.39.5`
+- **THEN** Tugboat, the installed playbook copy, and in-engine `pipeline ship` SHALL invoke those commands from that candidate
+- **AND** they SHALL NOT invoke them from the `1.39.4` production-pin CLI
