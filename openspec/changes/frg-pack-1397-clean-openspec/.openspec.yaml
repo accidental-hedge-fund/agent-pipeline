@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-08-20
+goal: "Exercise one clean OpenSpec path for synthetic issue #1177 with a
+  run-scoped fixture and unit test; no production behavior change"
