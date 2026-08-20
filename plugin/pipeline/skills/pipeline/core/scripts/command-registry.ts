@@ -89,7 +89,7 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
   release: {
     needsIssueNumber: false,
     // prepare: version + dryRun/edit; finish: pr number + json (positional finish <pr>)
-    allowedFlags: new Set(["repoPath", "base", "dryRun", "edit", "release", "json", "skipFrg", "allowOpenSoakDefects"]),
+    allowedFlags: new Set(["repoPath", "base", "dryRun", "edit", "release", "json", "skipFrg", "allowOpenSoakDefects", "packedCandidate"]),
     needsConfig: false,
     needsGhAuth: true,
     mutatesGitHub: true,

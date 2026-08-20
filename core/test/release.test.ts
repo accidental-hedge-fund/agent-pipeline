@@ -1844,6 +1844,21 @@ test("CLI: 'pipeline release ensure-tag' without version and oid exits non-zero"
   );
 });
 
+test("CLI: 'pipeline release ensure-tag' without --packed-candidate exits non-zero (#1149)", () => {
+  const oid = "a".repeat(40);
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "release", "ensure-tag", "1.39.5", oid],
+    { encoding: "utf8", env: { ...process.env, PATH: "" } },
+  );
+  assert.notEqual(result.status, 0, "should exit non-zero");
+  const combined = (result.stdout ?? "") + (result.stderr ?? "");
+  assert.ok(
+    combined.includes("packed-candidate") && combined.includes("40-hex"),
+    `got: ${combined}`,
+  );
+});
+
 test("CLI: 'pipeline release finish' without PR exits non-zero", () => {
   const result = spawnSync(
     process.execPath,

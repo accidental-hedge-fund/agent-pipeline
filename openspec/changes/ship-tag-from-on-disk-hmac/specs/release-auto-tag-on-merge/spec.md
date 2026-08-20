@@ -6,10 +6,14 @@ The auto-tag workflow SHALL verify that a **passing, release-eligible** Factory 
 (FRG) evidence artifact exists for version `X.Y.Z` in the checked-out tree before creating or
 pushing the annotated tag on a detected release merge (subject matches `release: X.Y.Z — …` and
 `core/package.json` version equals `X.Y.Z`, and tag `vX.Y.Z` does not already exist), **except**
-when `.agent-pipeline/frg/` (or that version's `latest.json` path) is gitignored and the tree file
-is absent. In that gitignored-absent case the workflow SHALL exit successfully without creating a
-tag and SHALL NOT fail the job. Local `pipeline release ensure-tag` remains the source of truth
-for tag create. Lookup for the tree-file case SHALL use the same stable path convention as the
+when the exact path `.agent-pipeline/frg/<X.Y.Z>/latest.json` is absent **and**
+`git check-ignore --quiet --` on that exact path is true. In that gitignored-absent case the
+workflow SHALL exit successfully without creating a tag, SHALL NOT run notes or tag-create,
+SHALL NOT fail docs-refresh solely because the tag is not yet visible, and SHALL NOT fail the
+job. Local `pipeline release ensure-tag` remains the source of truth for tag create. If the
+tree file exists, the workflow SHALL keep the shared `--validate-tag` fail-close path even when
+the path is gitignored. If the tree file is missing and is not ignored, the workflow SHALL keep
+today's fail-closed missing-file path. Lookup for the tree-file case SHALL use the same stable path convention as the
 release command (`.agent-pipeline/frg/<X.Y.Z>/latest.json` or the documented equivalent).
 Validation SHALL reject missing files, unparsable JSON, `pass: false`, empty `run_id`, missing
 live-loop provenance required for release-eligible pass, missing or invalid HMAC attestation
@@ -92,9 +96,19 @@ absent.
 #### Scenario: Gitignored missing tree latest.json does not fail the job
 
 - **WHEN** a release merge for `1.39.5` is detected
-- **AND** `.agent-pipeline/frg/` is gitignored
-- **AND** the Actions tree has no `.agent-pipeline/frg/1.39.5/latest.json`
+- **AND** `.agent-pipeline/frg/1.39.5/latest.json` is absent
+- **AND** `git check-ignore --quiet -- .agent-pipeline/frg/1.39.5/latest.json` is true
 - **AND** `v1.39.5` does not already exist
 - **THEN** the workflow SHALL exit 0
 - **AND** SHALL NOT create or push `v1.39.5` from Actions
 - **AND** SHALL NOT fail closed solely because tree-file `latest.json` is absent
+- **AND** SHALL NOT fail docs-refresh solely because that tag is not yet visible
+
+#### Scenario: Existing invalid tree latest.json still fail-closes when ignored
+
+- **WHEN** a release merge for `1.39.5` is detected
+- **AND** `.agent-pipeline/frg/1.39.5/latest.json` exists in the tree
+- **AND** that path is gitignored
+- **AND** the file is not release-eligible
+- **THEN** the workflow SHALL exit non-zero
+- **AND** SHALL NOT create or push `v1.39.5`

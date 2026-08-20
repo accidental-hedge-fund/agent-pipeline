@@ -302,10 +302,16 @@ npm run docs:generate
 
 `npm run docs:check` / `node scripts/generate-docs.mjs --check` fails when committed artifacts are stale (same idea as `build.mjs --check` for `plugin/`).
 
-**Release / tags:** `CHANGELOG.md` is derived from annotated `vX.Y.Z` tags. After a release merge, `auto-tag-release.yml` creates the tag and then runs `node scripts/release-docs-refresh.mjs` so the new version section is committed on the default branch. That is automatic — not a manual chore on the next PR. Operator heal if the workflow step failed:
+**Release / tags:** `CHANGELOG.md` is derived from annotated `vX.Y.Z` tags.
+After a release merge, ship-end `pipeline release ensure-tag` creates and
+pushes `vX.Y.Z` from on-disk HMAC `.agent-pipeline/frg/<X.Y.Z>/latest.json`.
+That path is gitignored, so `auto-tag-release.yml` must not fail the job when
+the merged tree has no `latest.json`. If the tag already exists, auto-tag is a
+successful no-op. After the tag is visible, `node scripts/release-docs-refresh.mjs`
+refreshes the CHANGELOG on the default branch. Operator heal if that step failed:
 
 ```bash
 node scripts/release-docs-refresh.mjs --version X.Y.Z --push
 ```
 
-Release prepare (`pipeline release <version>`) does not invent the shipped tag entry (the tag does not exist yet). `pipeline release finish` merges only; it does not tag or publish.
+Release prepare (`pipeline release <version>`) does not invent the shipped tag entry (the tag does not exist yet). `pipeline release finish` merges only; it does not tag or publish. Ship-end `pipeline release ensure-tag` owns `vX.Y.Z` when FRG is gitignored.

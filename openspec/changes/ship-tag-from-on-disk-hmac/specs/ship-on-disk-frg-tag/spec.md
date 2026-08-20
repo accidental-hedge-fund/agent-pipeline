@@ -6,7 +6,7 @@ Defines the shared ship-end class law that after a merged release pull request, 
 
 ### Requirement: Ship-end composers SHALL create the annotated tag from on-disk HMAC latest.json after merge
 
-After a ship-end composer has pack-done Factory Reliability Gate (FRG) evidence and has merged the version's release pull request, that composer SHALL invoke `pipeline release ensure-tag <X.Y.Z> <peeled-merge-oid>` (or the in-process `ensureAnnotatedReleaseTag` equivalent) on the **candidate** engine **before** publication wait (`wait-release` / `gh release view`). The helper SHALL read `.agent-pipeline/frg/<X.Y.Z>/latest.json` from **disk** on the ship host. It SHALL NOT require that file to exist in the git tree. When on-disk `latest.json` is release-eligible (`pass: true` and valid HMAC) and bound to this ship's packed candidate, the helper SHALL create and push annotated tag `vX.Y.Z` on the peeled merge commit of that merged release pull request if the tag is missing. If the annotated tag already points at that merge commit, the helper SHALL be a successful no-op.
+After a ship-end composer has pack-done Factory Reliability Gate (FRG) evidence and has merged the version's release pull request, that composer SHALL invoke `pipeline release ensure-tag <X.Y.Z> <peeled-merge-oid> --packed-candidate <packed-sha>` (or the in-process `ensureAnnotatedReleaseTag` equivalent) on the **candidate** engine **before** publication wait (`wait-release` / `gh release view`). Packed SHA SHALL be factory-release request `integrated_candidate.git_sha` or `ShipTrainEvidence.integrated_head_oid`. The helper SHALL read `.agent-pipeline/frg/<X.Y.Z>/latest.json` from **disk** on the ship host. It SHALL NOT require that file to exist in the git tree. When on-disk `latest.json` is release-eligible (`pass: true` and valid HMAC) and HMAC `candidate_git_sha` equals that independent packed SHA, the helper SHALL create and push annotated tag `vX.Y.Z` on the peeled merge commit of that merged release pull request if the tag is missing. If the annotated tag already points at that merge commit, the helper SHALL be a successful no-op. A lightweight or wrong-target existing tag SHALL fail closed. The helper SHALL NOT force-update or delete the tag.
 
 Tugboat and the installed playbook launcher SHALL invoke that CLI verb. They SHALL NOT shell `git tag` or `gh release create`. `pipeline release finish` SHALL remain merge-only. In-engine `pipeline ship` SHALL keep invoking the same helper during publication wait.
 
@@ -18,7 +18,7 @@ This requirement does not authorize `--skip-frg`. It does not authorize committi
 - **AND** `pipeline release finish` has merged the `1.39.5` release pull request with merge commit `M`
 - **AND** the git tree has no `.agent-pipeline/frg/1.39.5/latest.json`
 - **AND** on-disk `.agent-pipeline/frg/1.39.5/latest.json` is release-eligible
-- **THEN** Tugboat SHALL invoke candidate `pipeline release ensure-tag 1.39.5 <peeled M>` before `wait-release`
+- **THEN** Tugboat SHALL invoke candidate `pipeline release ensure-tag 1.39.5 <peeled M> --packed-candidate <C>` before `wait-release`
 - **AND** that helper SHALL create and push annotated tag `v1.39.5` on peeled `M` when the tag is missing
 
 #### Scenario: In-engine ship still tags from disk during publication wait

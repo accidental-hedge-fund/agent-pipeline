@@ -9,7 +9,7 @@ The thin ship composer SHALL sequence exactly these phases for one milestone ver
 3. `pipeline release X.Y.Z` with bare version (no leading `v`) and **without** `--skip-frg` unless the operator escape is active, invoked via the **candidate** engine
 4. Wait until the open release PR checks are green
 5. `pipeline release finish <pr>`, invoked via the **candidate** engine
-6. `pipeline release ensure-tag <X.Y.Z> <peeled-merge-oid>`, invoked via the **candidate** engine, using `mergeCommitOid` from finish JSON
+6. `pipeline release ensure-tag <X.Y.Z> <mergeCommitOid> --packed-candidate <integrated_candidate.git_sha>`, invoked via the **candidate** engine, using `mergeCommitOid` from finish JSON and packed SHA from the factory-release request
 7. Wait until GitHub Release `vX.Y.Z` is published (non-draft)
 8. `pipeline engine-promote --for X.Y.Z --host <resolved-host>` **without** `--skip-frg` unless the operator escape is active
 
@@ -59,18 +59,25 @@ Tugboat MAY keep process-start `$PIPELINE` for train and `engine-promote`. Tugbo
 
 ### Requirement: Tugboat SHALL invoke candidate release ensure-tag before wait-release
 
-After `pipeline release finish` returns success, Tugboat SHALL read `mergeCommitOid` from the finish JSON capture. If that field is missing or is not a 40-hex OID, Tugboat SHALL fail closed and SHALL NOT enter `wait-release`. Otherwise Tugboat SHALL invoke candidate `pipeline release ensure-tag <X.Y.Z> <mergeCommitOid>` and SHALL treat a non-zero exit as a failed ship. Tugboat SHALL then poll `gh release view vX.Y.Z` as today. Tugboat SHALL NOT skip ensure-tag because auto-tag-release is configured. Tugboat SHALL NOT skip ensure-tag because the git tree has no `latest.json`.
+After `pipeline release finish` returns success, Tugboat SHALL read `mergeCommitOid` from the finish JSON capture. If that field is missing or is not a 40-hex OID, Tugboat SHALL fail closed and SHALL NOT enter `wait-release`. Otherwise Tugboat SHALL invoke the recorded candidate CLI as `"${SHIP_END_CLI[@]}" release ensure-tag <X.Y.Z> <mergeCommitOid> --packed-candidate <SHIP_END_CANDIDATE_SHA>` where `SHIP_END_CANDIDATE_SHA` is factory-release request `integrated_candidate.git_sha`. A non-zero exit SHALL fail the ship before `wait-release`. Tugboat SHALL then poll `gh release view vX.Y.Z` as today. Tugboat SHALL NOT skip ensure-tag because auto-tag-release is configured. Tugboat SHALL NOT skip ensure-tag because the git tree has no `latest.json`. Tugboat SHALL NOT shell `git tag` or `gh release create`.
 
 #### Scenario: Finish JSON merge commit drives ensure-tag
 
 - **WHEN** `pipeline release finish` writes `mergeCommitOid` `M` for version `1.39.5`
+- **AND** request `integrated_candidate.git_sha` is `C`
 - **AND** on-disk HMAC `latest.json` is release-eligible
-- **THEN** Tugboat SHALL invoke `"${SHIP_END_CLI[@]}" release ensure-tag 1.39.5 M` (or the same argv through the recorded candidate CLI)
+- **THEN** Tugboat SHALL invoke `"${SHIP_END_CLI[@]}" release ensure-tag 1.39.5 M --packed-candidate C`
 - **AND** it SHALL NOT invoke `git tag`
 
 #### Scenario: Missing mergeCommitOid fails before wait-release
 
 - **WHEN** finish JSON has no 40-hex `mergeCommitOid`
+- **THEN** Tugboat SHALL fail the ship
+- **AND** it SHALL NOT poll `gh release view`
+
+#### Scenario: Ensure-tag failure prevents wait-release
+
+- **WHEN** candidate `release ensure-tag` exits non-zero
 - **THEN** Tugboat SHALL fail the ship
 - **AND** it SHALL NOT poll `gh release view`
 

@@ -143,6 +143,7 @@ export function shipEndLeafArgv(
     loopRunId?: string;
     pr?: number;
     mergeCommitOid?: string;
+    packedCandidate?: string;
   } = {},
 ): string[] {
   switch (verb) {
@@ -168,7 +169,9 @@ export function shipEndLeafArgv(
       }
       const oid = parseExactGitSha(args.mergeCommitOid);
       if (!oid) throw new Error("ensure-tag requires a 40-hex merge commit OID");
-      return ["release", "ensure-tag", args.version, oid];
+      const packed = parseExactGitSha(args.packedCandidate);
+      if (!packed) throw new Error("ensure-tag requires a 40-hex --packed-candidate");
+      return ["release", "ensure-tag", args.version, oid, "--packed-candidate", packed];
     }
     default: {
       const _exhaustive: never = verb;

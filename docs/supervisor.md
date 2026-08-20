@@ -227,8 +227,11 @@ not scrape human output or search for a title match.
 }
 ```
 
-Does **not** create git tags or GitHub Releases. Existing `auto-tag-release` and
-`release` workflows run after the merge lands on the base branch.
+Does **not** create git tags or GitHub Releases. After finish, ship-end
+composers invoke candidate `pipeline release ensure-tag` from on-disk HMAC
+`latest.json`. `.agent-pipeline/frg/` is gitignored, so auto-tag must not stall
+the ship for a missing tree file. `release.yml` still publishes the GitHub
+Release after the annotated `v*` tag exists.
 
 ## Hermes production (Phase 2b)
 
@@ -244,7 +247,7 @@ not the product owner. #1001 / #971 do not ban in-engine ship.
 
 | Script | Role |
 |---|---|
-| `pipeline ship --milestone vX.Y.Z` | **Product** durable ship (train `--merge` → release → finish → promote) |
+| `pipeline ship --milestone vX.Y.Z` | **Product** durable ship (train `--merge` → release → finish → ensure-tag → promote) |
 | `examples/supervisor/shell/tugboat.sh` | Thin notify/detach adapter only; not the ship owner |
 | `examples/supervisor/shell/ship-notify.sh` | Optional messenger posts; no-op without Buzz env |
 | `examples/supervisor/shell/ship-stage-watch.sh` | Optional exact-run posts; shared install |

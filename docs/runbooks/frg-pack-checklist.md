@@ -68,9 +68,9 @@ python3 -c "import json; d=json.load(open('.agent-pipeline/frg/<X.Y.Z>/latest.js
 
 ## 4. Keep FRG evidence for release prepare
 
-`pipeline release` and auto-tag expect FRG files **in the tree** that gets
-released. The ship coordinator stages only `.agent-pipeline/frg/<X.Y.Z>/` on
-the release branch.
+`pipeline release` and `pipeline release ensure-tag` read on-disk HMAC
+`.agent-pipeline/frg/<X.Y.Z>/latest.json` on the ship host. That directory is
+gitignored. Auto-tag must not stall the ship for a missing tree file.
 
 - [ ] Leave the validated version directory in the control checkout
 - [ ] Do not merge a separate evidence PR into the base after the candidate is

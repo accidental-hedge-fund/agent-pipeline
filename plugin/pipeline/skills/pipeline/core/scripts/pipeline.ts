@@ -416,6 +416,11 @@ export interface CliOpts {
    * `--allow-open-soak-defects <reason>` → `allowOpenSoakDefects`.
    */
   allowOpenSoakDefects?: string;
+  /**
+   * release ensure-tag: this ship's independent FRG-bound packed candidate 40-hex SHA.
+   * Commander maps `--packed-candidate` → `packedCandidate`.
+   */
+  packedCandidate?: string;
   /** Roadmap/sweep: gate GitHub write-backs (comments, PRs); default is dry-run. */
   apply?: boolean;
   /** Roadmap: emit top-N dependency-safe issues from an existing plan.json. */
@@ -830,6 +835,10 @@ export function buildCmd(): Command {
     .option(
       "--skip-frg",
       "release / engine-promote: explicit escape — skip Factory Reliability Gate latest.json and write a non-production-quality pin (no-frg-<version>, null evidence). Default promote requires a real FRG pass.",
+    )
+    .option(
+      "--packed-candidate <sha>",
+      "release ensure-tag: this ship's independent FRG-bound packed candidate 40-hex SHA",
     )
     .option("--description <text>", "intake/decompose: free-text description or decomposition seed")
     .option("--epic <n>", "decompose: parent epic issue number", Number)
@@ -4213,11 +4222,11 @@ async function main(): Promise<void> {
         "pipeline release: a version argument or 'finish <pr>' is required.\n" +
           "  Usage: pipeline release <X.Y.Z | major | minor | patch> [--theme \"...\"] [--dry-run|--json] [--no-edit] [--skip-frg]\n" +
           "         pipeline release finish <pr> [--json]\n" +
-          "         pipeline release ensure-tag <X.Y.Z> <merge-commit-oid>\n" +
+          "         pipeline release ensure-tag <X.Y.Z> <merge-commit-oid> --packed-candidate <40-hex>\n" +
           "         [--allow-open-soak-defects \"<reason>\"]\n" +
           "  Prepare stops at an open release PR (never tags/merges).\n" +
-          "  finish merges an open release PR after checks (never tags — workflows do).\n" +
-          "  ensure-tag is the candidate-engine leaf for in-engine ship tagging (#1151).\n" +
+          "  finish merges an open release PR after checks (never tags).\n" +
+          "  ensure-tag is the ship-end tag owner from on-disk HMAC latest.json when FRG is gitignored.\n" +
           "  Tag-derived CHANGELOG refresh runs automatically after auto-tag (#978).",
       );
       process.exit(2);
@@ -4234,10 +4243,18 @@ async function main(): Promise<void> {
     } else if (subEarly === "ensure-tag") {
       const versionArg = cmd.args[2];
       const oidArg = cmd.args[3];
+      const packedArg = typeof opts.packedCandidate === "string" ? opts.packedCandidate : "";
       if (!versionArg || !/^\d+\.\d+\.\d+$/.test(versionArg) || !oidArg || !/^[0-9a-f]{40}$/i.test(oidArg)) {
         console.error(
           "pipeline release ensure-tag: a bare X.Y.Z version and 40-hex merge commit OID are required.\n" +
-            "  Usage: pipeline release ensure-tag <X.Y.Z> <merge-commit-oid>",
+            "  Usage: pipeline release ensure-tag <X.Y.Z> <merge-commit-oid> --packed-candidate <40-hex>",
+        );
+        process.exit(2);
+      }
+      if (!/^[0-9a-f]{40}$/i.test(packedArg)) {
+        console.error(
+          "pipeline release ensure-tag: --packed-candidate <40-hex> is required.\n" +
+            "  Usage: pipeline release ensure-tag <X.Y.Z> <merge-commit-oid> --packed-candidate <40-hex>",
         );
         process.exit(2);
       }
@@ -4543,6 +4560,7 @@ async function main(): Promise<void> {
           repo: localCfg.repo,
           version: tagVersion,
           mergeCommitOid,
+          packedCandidate: String(opts.packedCandidate ?? "").toLowerCase(),
         });
         if (opts.json) {
           console.log(JSON.stringify({
@@ -4550,6 +4568,7 @@ async function main(): Promise<void> {
             kind: "release_ensure_tag",
             version: tagVersion,
             merge_commit_oid: mergeCommitOid,
+            packed_candidate: String(opts.packedCandidate ?? "").toLowerCase(),
             result,
           }, null, 2));
         } else {

@@ -94,14 +94,11 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # FRG guard (#757 / #1040): fail closed before any tag create/push when
-      # release-eligible evidence for this version is missing, unparsable,
-      # pass:false, or lacks a valid HMAC attestation. Uses the same shared
-      # --validate-tag validator as pipeline factory-gate. Evidence must be
-      # committed on the release PR under .agent-pipeline/frg/<version>/latest.json
-      # and signed with PIPELINE_FRG_ATTESTATION_KEY (hand-authored self-consistent
-      # JSON without the secret is rejected). Missing or failed evidence is
-      # remediable via factory-release prepare / the Tugboat FRG pack phase.
+      # FRG guard (#757 / #1040 / #1149): when the exact latest.json path is
+      # absent AND gitignored, skip tagging (local pipeline release ensure-tag
+      # owns vX.Y.Z from on-disk HMAC). If the file exists, keep shared
+      # --validate-tag fail-close even when the path is gitignored. Missing
+      # and not ignored stays fail-closed. Do not tag without HMAC.
       - name: Verify Factory Reliability Gate evidence
         id: frg
         if: steps.exists.outputs.exists == 'false'
@@ -109,6 +106,15 @@ jobs:
           PIPELINE_FRG_ATTESTATION_KEY: ${{ secrets.PIPELINE_FRG_ATTESTATION_KEY }}
         run: |
           version="${{ steps.detect.outputs.version }}"
+          path=".agent-pipeline/frg/${version}/latest.json"
+          if [ ! -e "$path" ] && git check-ignore --quiet -- "$path"; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "taggable=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::${path} is absent and gitignored — skip auto-tag; local pipeline release ensure-tag owns v${version}."
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "taggable=true" >> "$GITHUB_OUTPUT"
           if [ -z "${PIPELINE_FRG_ATTESTATION_KEY}" ]; then
             echo "::error::PIPELINE_FRG_ATTESTATION_KEY secret is required to verify FRG attestation before tagging. Remediation: run factory-release prepare or the Tugboat FRG pack phase so .agent-pipeline/frg/${version}/latest.json is a release-eligible pass, and provision PIPELINE_FRG_ATTESTATION_KEY."
             exit 1
@@ -119,7 +125,7 @@ jobs:
 
       - name: Resolve release notes
         id: notes
-        if: steps.exists.outputs.exists == 'false'
+        if: steps.exists.outputs.exists == 'false' && steps.frg.outputs.taggable == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -146,7 +152,7 @@ jobs:
           printf '%s\n' "$body" > /tmp/release-notes.md
 
       - name: Create and push annotated tag
-        if: steps.exists.outputs.exists == 'false'
+        if: steps.exists.outputs.exists == 'false' && steps.frg.outputs.taggable == 'true'
         env:
           RELEASE_TAG_TOKEN: ${{ secrets.RELEASE_TAG_TOKEN }}
         run: |
@@ -188,6 +194,10 @@ jobs:
           # this checkout can observe refs/tags/vX.Y.Z for the generator.
           git fetch --tags origin
           if ! git rev-parse -q --verify "refs/tags/v${version}" >/dev/null; then
+            if [ "${{ steps.frg.outputs.skip }}" = "true" ]; then
+              echo "::notice::Annotated tag v${version} is not visible and auto-tag skipped gitignored FRG — docs refresh no-op."
+              exit 0
+            fi
             echo "::error::Annotated tag v${version} is not visible after fetch — cannot regenerate tag-derived CHANGELOG. Tag was not deleted; heal after the tag is present."
             exit 1
           fi
