@@ -3285,6 +3285,82 @@ test("frg_pack_loop_is_live: lock pid or non-terminal ledger (#1150)", () => {
   }
 });
 
+test("frg_pack_loop_is_live: schema-invalid or undecodable state is unknown at cap (#1150)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-loop-schema-"));
+  try {
+    const helpers = fs.readFileSync(frgHelpers, "utf8");
+    const fnLive = extractNamedFn(helpers, "frg_pack_loop_is_live", "frg-pack-helpers.sh");
+    const fnWait = extractNamedFn(helpers, "frg_pack_wait_decision", "frg-pack-helpers.sh");
+    const home = path.join(dir, "state");
+    const emptyLock = path.join(home, "runs", "loop-empty-lock");
+    const badPid = path.join(home, "runs", "loop-bad-pid");
+    const blankLedger = path.join(home, "runs", "loop-blank-ledger");
+    const badStop = path.join(home, "runs", "loop-bad-stop");
+    const badUtf8Lock = path.join(home, "runs", "loop-bad-utf8-lock");
+    const badUtf8Ledger = path.join(home, "runs", "loop-bad-utf8-ledger");
+    for (const p of [emptyLock, badPid, blankLedger, badStop, badUtf8Lock, badUtf8Ledger]) {
+      fs.mkdirSync(p, { recursive: true });
+    }
+    fs.writeFileSync(path.join(emptyLock, "lock.json"), "{}");
+    fs.writeFileSync(path.join(badPid, "lock.json"), JSON.stringify({ pid: "bad" }));
+    fs.writeFileSync(path.join(blankLedger, "ledger.json"), "  \n\t");
+    fs.writeFileSync(path.join(badStop, "lock.json"), JSON.stringify({ pid: 1_000_000_007 }));
+    fs.writeFileSync(path.join(badStop, "ledger.json"), JSON.stringify({ stop: true }));
+    fs.writeFileSync(path.join(badUtf8Lock, "lock.json"), Buffer.from([0xff, 0xfe, 0x00, 0x7b]));
+    fs.writeFileSync(path.join(badUtf8Ledger, "ledger.json"), Buffer.from([0x80, 0x81, 0x82]));
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        fnLive,
+        fnWait,
+        "probe_wait() {",
+        '  local id=$1',
+        '  local live',
+        '  live=$(frg_pack_loop_is_live "$id")',
+        '  printf "%s=%s\\n" "$id" "$live"',
+        '  printf "%s_wait=%s\\n" "$id" "$(frg_pack_wait_decision retry "$live" 2 2)"',
+        "}",
+        "probe_wait loop-empty-lock",
+        "probe_wait loop-bad-pid",
+        "probe_wait loop-blank-ledger",
+        "probe_wait loop-bad-stop",
+        "probe_wait loop-bad-utf8-lock",
+        "probe_wait loop-bad-utf8-ledger",
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    const r = spawnSync("bash", [runner], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        AGENT_PIPELINE_STATE_HOME: home,
+      },
+    });
+    assert.equal(r.status, 0, `liveness helper exited ${r.status}: ${r.stderr}`);
+    for (const id of [
+      "loop-empty-lock",
+      "loop-bad-pid",
+      "loop-blank-ledger",
+      "loop-bad-stop",
+      "loop-bad-utf8-lock",
+      "loop-bad-utf8-ledger",
+    ]) {
+      assert.match(r.stdout, new RegExp(`^${id}=unknown$`, "m"), `${id} must be unknown`);
+      assert.match(
+        r.stdout,
+        new RegExp(`^${id}_wait=continue$`, "m"),
+        `${id} must wait-continue at cap`,
+      );
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("tugboat FRG wait: live in_progress is not pack-fail and heartbeats (#1150)", () => {
   const src = fs.readFileSync(tugboat, "utf8");
   const packStart = src.indexOf("# ----- A2: FRG pack");

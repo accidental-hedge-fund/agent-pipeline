@@ -1106,6 +1106,13 @@ function parseLockPidField(raw: unknown): number | null {
   return null;
 }
 
+/** null/absent stop is open; a non-array object is terminal; any other value is malformed. */
+function parseLedgerStopField(raw: unknown): "open" | "stop" | "invalid" {
+  if (raw == null) return "open";
+  if (typeof raw === "object" && !Array.isArray(raw)) return "stop";
+  return "invalid";
+}
+
 function eventsAreTerminal(text: string): boolean {
   for (const line of text.split("\n")) {
     const trimmed = line.trim();
@@ -1172,12 +1179,18 @@ export async function probeBoundPackLoopLive(
   if (lock.status === "ok") {
     try {
       const parsed = JSON.parse(lock.text) as { pid?: unknown };
-      const pid = parseLockPidField(parsed?.pid);
-      if (pid !== null) {
-        try {
-          lockPidAlive = Boolean(await (opts.isPidAlive ?? defaultIsPidAlive)(pid));
-        } catch {
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        lockUnreadable = true;
+      } else {
+        const pid = parseLockPidField(parsed.pid);
+        if (pid === null) {
           lockUnreadable = true;
+        } else {
+          try {
+            lockPidAlive = Boolean(await (opts.isPidAlive ?? defaultIsPidAlive)(pid));
+          } catch {
+            lockUnreadable = true;
+          }
         }
       }
     } catch {
@@ -1188,17 +1201,26 @@ export async function probeBoundPackLoopLive(
   let ledgerPresent = false;
   let ledgerStopPresent = false;
   let ledgerUnreadable = ledger.status === "unreadable";
-  if (ledger.status === "ok" && ledger.text.trim()) {
-    try {
-      const parsed = JSON.parse(ledger.text) as { stop?: unknown };
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        ledgerPresent = true;
-        ledgerStopPresent = Boolean(parsed.stop);
-      } else {
+  if (ledger.status === "ok") {
+    if (!ledger.text.trim()) {
+      ledgerUnreadable = true;
+    } else {
+      try {
+        const parsed = JSON.parse(ledger.text) as { stop?: unknown };
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          const stopKind = parseLedgerStopField(parsed.stop);
+          if (stopKind === "invalid") {
+            ledgerUnreadable = true;
+          } else {
+            ledgerPresent = true;
+            ledgerStopPresent = stopKind === "stop";
+          }
+        } else {
+          ledgerUnreadable = true;
+        }
+      } catch {
         ledgerUnreadable = true;
       }
-    } catch {
-      ledgerUnreadable = true;
     }
   }
   const events = await resolveTextFile(path.join(runDir, "events.jsonl"), opts.readTextFile);

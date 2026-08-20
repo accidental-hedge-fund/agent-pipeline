@@ -1002,6 +1002,48 @@ test("probeBoundPackLoopLive treats read failures and corrupt state as unknown (
   );
 });
 
+test("probeBoundPackLoopLive treats schema-invalid or blank state as unknown at cap (#1150)", async () => {
+  const env = { AGENT_PIPELINE_STATE_HOME: "/home" } as NodeJS.ProcessEnv;
+  const files = new Map<string, string>([
+    ["/home/runs/loop-empty-lock/lock.json", "{}"],
+    ["/home/runs/loop-bad-pid/lock.json", JSON.stringify({ pid: "bad" })],
+    ["/home/runs/loop-blank-ledger/ledger.json", "  \n\t"],
+    [
+      "/home/runs/loop-bad-stop/lock.json",
+      JSON.stringify({ pid: 99 }),
+    ],
+    [
+      "/home/runs/loop-bad-stop/ledger.json",
+      JSON.stringify({ run_id: "loop-bad-stop", stop: true }),
+    ],
+    [
+      "/home/runs/loop-bad-stop-str/lock.json",
+      JSON.stringify({ pid: 99 }),
+    ],
+    [
+      "/home/runs/loop-bad-stop-str/ledger.json",
+      JSON.stringify({ run_id: "loop-bad-stop-str", stop: "yes" }),
+    ],
+  ]);
+  const readTextFile = (p: string) => files.get(p) ?? null;
+  const opts = { env, readTextFile, isPidAlive: () => false };
+  for (const id of [
+    "loop-empty-lock",
+    "loop-bad-pid",
+    "loop-blank-ledger",
+    "loop-bad-stop",
+    "loop-bad-stop-str",
+  ]) {
+    const live = await probeBoundPackLoopLive(id, opts);
+    assert.equal(live, "unknown", `${id} must be unknown, not not-live`);
+    assert.equal(
+      classifyFrgPackWaitDecision({ tick: "retry", live, attempt: 2, cap: 2 }),
+      "continue",
+      `${id} must wait-continue at cap`,
+    );
+  }
+});
+
 test("missing request path fails closed before candidate FRG prepare", async () => {
   const spawned: string[][] = [];
   const bound = bindCandidateShipEndOperations(operations({

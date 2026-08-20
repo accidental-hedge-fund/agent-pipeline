@@ -599,7 +599,7 @@ def read_text(path):
             return ("ok", fh.read())
     except FileNotFoundError:
         return ("missing", "")
-    except OSError:
+    except (OSError, UnicodeError):
         return ("unreadable", "")
 
 pid_alive = False
@@ -611,9 +611,11 @@ elif lock_status == "ok":
     try:
         obj = json.loads(lock_text)
         pid = obj.get("pid") if isinstance(obj, dict) else None
+        if isinstance(pid, bool):
+            pid = None
         if isinstance(pid, str) and pid.isdigit():
             pid = int(pid)
-        if isinstance(pid, int) and pid > 0:
+        if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
             try:
                 os.kill(pid, 0)
                 pid_alive = True
@@ -623,6 +625,8 @@ elif lock_status == "ok":
                 pid_alive = True
             except OSError as exc:
                 pid_alive = getattr(exc, "errno", None) == 1
+        else:
+            lock_unreadable = True
     except Exception:
         lock_unreadable = True
 
@@ -636,16 +640,26 @@ ledger_unreadable = False
 ledger_status, ledger_text = read_text(ledger_path)
 if ledger_status == "unreadable":
     ledger_unreadable = True
-elif ledger_status == "ok" and ledger_text.strip():
-    try:
-        ledger = json.loads(ledger_text)
-        if isinstance(ledger, dict):
-            ledger_present = True
-            ledger_stop = bool(ledger.get("stop"))
-        else:
-            ledger_unreadable = True
-    except Exception:
+elif ledger_status == "ok":
+    if not ledger_text.strip():
         ledger_unreadable = True
+    else:
+        try:
+            ledger = json.loads(ledger_text)
+            if isinstance(ledger, dict):
+                stop = ledger.get("stop") if "stop" in ledger else None
+                if stop is None:
+                    ledger_present = True
+                    ledger_stop = False
+                elif isinstance(stop, dict):
+                    ledger_present = True
+                    ledger_stop = True
+                else:
+                    ledger_unreadable = True
+            else:
+                ledger_unreadable = True
+        except Exception:
+            ledger_unreadable = True
 
 events_terminal = False
 if os.path.isfile(events_path):
