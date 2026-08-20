@@ -21,7 +21,6 @@ import * as fs from "node:fs";
 import { spawnSync } from "node:child_process";
 import {
   classifyFrgBlocker,
-  FRG_EVIDENCE_ROOT_REL,
   formatFrgPrSection,
   requireFrgPassForRelease,
   type FrgEvidence,
@@ -1776,7 +1775,6 @@ export async function runRelease(
   const skipFrg = frgSkip.skip;
   const skipReason = frgSkip.source ? formatFrgSkipReason(frgSkip.source) : null;
   let frgEvidence: FrgEvidence | null = null;
-  const releaseFrgDir = path.join(FRG_EVIDENCE_ROOT_REL, resolvedVersion);
   if (skipFrg) {
     d.stdout(
       `[pipeline release] skipping Factory Reliability Gate for ${resolvedVersion} (${skipReason}); ` +
@@ -2044,35 +2042,87 @@ export async function runRelease(
   }
 
   // Restore every file the version bump + mirror regen + ROADMAP write touch FROM HEAD on
-  // ANY abort before the release branch is created (mirror-regen / CI / issue-discovery
-  // failure, or an editor abort). `git checkout --` recovers package.json, core/package.json,
-  // ROADMAP.md, AND the whole plugin/ mirror in one step — even if build.mjs deleted files
-  // mid-regen — so it does not depend on re-running the same (failing) build; `git clean -fd`
-  // then removes any untracked mirror debris build.mjs may have generated (safe because the
+  // abort before a successful release commit (mirror-regen / CI / issue-discovery / editor
+  // abort, or a failed `git add` / `git commit` after `checkout -b`). `git restore
+  // --source=HEAD --staged --worktree` resets both the index and the worktree from HEAD.
+  // `git checkout --` is not enough after a successful add: it copies the index into the
+  // worktree and would write the staged version bumps back (#1148). `git clean -fd` then
+  // removes any untracked mirror debris build.mjs may have generated (safe because the
   // clean-tree precondition above guaranteed plugin/ and .claude-plugin/ held no untracked
-  // files when the run began). Both exit codes are checked so a failed rollback is surfaced
-  // loudly, not silently claimed as restored. Otherwise a stranded bump poisons a retry whose
-  // previousVersion reads the bumped core (#170).
+  // files when the run began). Never pass `.agent-pipeline/frg` to restore/clean: evidence
+  // stays on disk (#1148). Both exit codes are checked so a failed rollback is surfaced
+  // loudly, not silently claimed as restored. Otherwise a stranded bump poisons a retry
+  // whose previousVersion reads the bumped core (#170). Point of no return is a successful
+  // release commit (#1148).
   const branch = `release/v${resolvedVersion}`;
-  const restoreCheckout = (): void => {
+  const baseBranch = cfg.base_branch ?? "main";
+  const restoreManagedFiles = (): boolean => {
     const r = d.runCommand(
       "git",
-      ["checkout", "--", "package.json", "core/package.json", "ROADMAP.md", "plugin", ".claude-plugin"],
+      [
+        "restore",
+        "--source=HEAD",
+        "--staged",
+        "--worktree",
+        "--",
+        "package.json",
+        "core/package.json",
+        "ROADMAP.md",
+        "plugin",
+        ".claude-plugin",
+      ],
       { cwd: repoDir },
     );
     const clean = d.runCommand("git", ["clean", "-fd", "plugin", ".claude-plugin"], { cwd: repoDir });
     if (r.code !== 0 || clean.code !== 0) {
       d.stderr(
-        `[pipeline release] ROLLBACK FAILED (git checkout exited ${r.code}: ${r.stderr.trim()}; ` +
+        `[pipeline release] ROLLBACK FAILED (git restore exited ${r.code}: ${r.stderr.trim()}; ` +
         `git clean exited ${clean.code}: ${clean.stderr.trim()}). ` +
         "The working tree may have a stranded version bump or partial mirror — run " +
-        "`git checkout -- package.json core/package.json ROADMAP.md plugin .claude-plugin && git clean -fd plugin .claude-plugin` manually before retrying.",
+        "`git restore --source=HEAD --staged --worktree -- package.json core/package.json ROADMAP.md plugin .claude-plugin && git clean -fd plugin .claude-plugin` manually before retrying.",
       );
-    } else {
+      return false;
+    }
+    return true;
+  };
+  const restoreCheckout = (): void => {
+    if (restoreManagedFiles()) {
       d.stderr("[pipeline release] aborted before branch creation — restored package.json, core/package.json, ROADMAP.md, and the plugin/ mirror from HEAD.");
     }
   };
+  const restoreBaseAfterFailedStage = (): void => {
+    restoreManagedFiles();
+    const checkoutBase = d.runCommand("git", ["checkout", baseBranch], { cwd: repoDir });
+    if (checkoutBase.code !== 0) {
+      d.stderr(
+        `[pipeline release] ROLLBACK FAILED (git checkout ${baseBranch} exited ${checkoutBase.code}: ${checkoutBase.stderr.trim()}). ` +
+        `HEAD may still be on ${branch} with a stranded version bump — run ` +
+        `\`git restore --source=HEAD --staged --worktree -- package.json core/package.json ROADMAP.md plugin .claude-plugin && git checkout ${baseBranch} && git branch -d ${branch}\` manually before retrying.`,
+      );
+      return;
+    }
+    const unique = d.runCommand(
+      "git",
+      ["rev-list", "--count", `${baseBranch}..${branch}`],
+      { cwd: repoDir },
+    );
+    const raw = unique.stdout.trim();
+    const uniqueCount = unique.code === 0 ? Number.parseInt(raw === "" ? "0" : raw, 10) : Number.NaN;
+    if (uniqueCount === 0) {
+      const del = d.runCommand("git", ["branch", "-d", branch], { cwd: repoDir });
+      if (del.code !== 0) {
+        d.stderr(
+          `[pipeline release] warning: could not delete local ${branch} (git branch -d exited ${del.code}: ${del.stderr.trim()}). ` +
+          `Delete it before retrying so \`git checkout -b ${branch}\` can succeed.`,
+        );
+      }
+    }
+    d.stderr(
+      `[pipeline release] aborted after branch creation — restored release-managed files and checked out ${baseBranch}.`,
+    );
+  };
 
+  let branchCreated = false;
   let prBody: string;
   try {
     // 6. Bump version in both package.json files.
@@ -2156,9 +2206,10 @@ export async function runRelease(
       }
     }
 
-    // 14a. Create the release branch. This is the rollback point of no return: once the
-    // branch exists the bumped/scaffolded files live on it (not stranded on the base
-    // branch), so the rollback guard ends here. A checkout failure still restores.
+    // 14a. Create the release branch. Add and commit still roll back if they fail:
+    // the branch has no unique commit until `git commit` succeeds. Point of no
+    // return is a successful release commit (#1148). A checkout-b failure still
+    // restores as a pre-branch abort.
     d.stdout(`[pipeline release] creating branch ${branch}...`);
     const checkoutResult = d.runCommand("git", ["checkout", "-b", branch], { cwd: repoDir });
     if (checkoutResult.code !== 0) {
@@ -2166,39 +2217,45 @@ export async function runRelease(
         `[pipeline release] git checkout -b ${branch} failed: ${checkoutResult.stderr.trim()}`,
       );
     }
+    branchCreated = true;
+
+    // FRG evidence is gitignored (#1127 / #1148). Do not pass `.agent-pipeline/frg`
+    // as an explicit pathspec — `git add` of an ignored path is a hard fail.
+    // Do not `git add -f`. Do not stage CHANGELOG.md here.
+    d.stdout("[pipeline release] staging release files...");
+    const addPaths = ["package.json", "core/package.json", "ROADMAP.md", "plugin/"];
+    const addResult = d.runCommand(
+      "git",
+      ["add", ...addPaths],
+      { cwd: repoDir },
+    );
+    if (addResult.code !== 0) {
+      throw new Error(`[pipeline release] git add failed: ${addResult.stderr.trim()}`);
+    }
+
+    const commitMsg = `release: ${resolvedVersion} — ${theme}\n\nIssue: #170\nPipeline-Run: 170/${today}T00:00:00Z`;
+    const commitResult = d.runCommand("git", ["commit", "-m", commitMsg], { cwd: repoDir });
+    if (commitResult.code !== 0) {
+      throw new Error(`[pipeline release] git commit failed: ${commitResult.stderr.trim()}`);
+    }
+    d.stdout("[pipeline release] committed release files.");
   } catch (err) {
-    restoreCheckout();
+    if (branchCreated) {
+      restoreBaseAfterFailedStage();
+    } else {
+      restoreCheckout();
+    }
     throw err;
   }
 
-  d.stdout("[pipeline release] staging release files...");
-  const addPaths = ["package.json", "core/package.json", "ROADMAP.md", "plugin/"];
-  // Only stage FRG evidence when the gate ran and produced a pass artifact.
-  if (frgEvidence) addPaths.push(releaseFrgDir);
-  const addResult = d.runCommand(
-    "git",
-    ["add", ...addPaths],
-    { cwd: repoDir },
-  );
-  if (addResult.code !== 0) {
-    throw new Error(`[pipeline release] git add failed: ${addResult.stderr.trim()}`);
-  }
-
-  const commitMsg = `release: ${resolvedVersion} — ${theme}\n\nIssue: #170\nPipeline-Run: 170/${today}T00:00:00Z`;
-  const commitResult = d.runCommand("git", ["commit", "-m", commitMsg], { cwd: repoDir });
-  if (commitResult.code !== 0) {
-    throw new Error(`[pipeline release] git commit failed: ${commitResult.stderr.trim()}`);
-  }
-  d.stdout("[pipeline release] committed release files.");
-
+  // Successful commit is the point of no return. A later push failure stays on
+  // the release branch so a retry can push the local commit (#1148).
   d.stdout("[pipeline release] pushing branch and opening release PR...");
   const pushResult = d.runCommand("git", ["push", "-u", "origin", branch], { cwd: repoDir });
   if (pushResult.code !== 0) {
     throw new Error(`[pipeline release] git push failed: ${pushResult.stderr.trim()}`);
   }
 
-  // Use configured base_branch (from .github/pipeline.yml or --base CLI flag), default "main".
-  const baseBranch = cfg.base_branch ?? "main";
   const prTitle = `release: ${resolvedVersion} — ${theme}`;
   const prResult = d.runCommand(
     "gh",
