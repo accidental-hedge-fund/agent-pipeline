@@ -307,12 +307,14 @@ test("release-checks-green: failed-log title is included in sidecar", () => {
 // which made every poll error and the wait loop exhaust its budget without
 // ever seeing green. gh's real schema uses `bucket`, not `conclusion`.
 test("playbook CI-wait uses valid gh pr checks fields", () => {
-  const body = fs.readFileSync(playbook, "utf8");
+  const body = fs.readFileSync(tugboat, "utf8");
   const m = body.match(/gh pr checks "\$pr" --json ([a-z,]+)/);
   assert.ok(m, "CI-wait gh pr checks line not found");
   assert.doesNotMatch(m[1], /conclusion/, "conclusion is not a valid gh field");
   assert.match(m[1], /\bbucket\b/, "gh pr checks --json should use bucket");
   assert.match(m[1], /\blink\b/, "gh pr checks --json should request link");
+  const launcher = fs.readFileSync(playbook, "utf8");
+  assert.match(launcher, /exec "\$REPO_DIR\/examples\/supervisor\/shell\/tugboat\.sh" "\$@"/);
 });
 
 function extractFn(src: string, name: string): string {
@@ -486,7 +488,7 @@ test("waiter non-test product fail does not request rerun", () => {
   const runDir = fs.mkdtempSync(path.join(os.tmpdir(), "ship-wait-product-"));
   try {
     const r = runWaitTick({
-      composer: "playbook",
+      composer: "tugboat",
       capture: [
         {
           name: "release-build",
@@ -507,28 +509,22 @@ test("waiter non-test product fail does not request rerun", () => {
 test("both composers share the wait-tick recipe and do not STOP on raw -1", () => {
   const tug = fs.readFileSync(tugboat, "utf8");
   const book = fs.readFileSync(playbook, "utf8");
-  assert.equal(
-    extractFn(tug, "apply_release_check_wait_tick"),
-    extractFn(book, "apply_release_check_wait_tick"),
+  assert.match(book, /exec "\$REPO_DIR\/examples\/supervisor\/shell\/tugboat\.sh" "\$@"/);
+  const body = tug;
+  const label = "tugboat";
+  assert.match(body, /apply_release_check_wait_tick/, label);
+  assert.match(body, /release-checks-green\.py/, label);
+  assert.match(body, /gh run rerun "\$run_id" --failed/, label);
+  assert.match(body, /verdict=\$\(apply_release_check_wait_tick/, label);
+  assert.doesNotMatch(
+    body,
+    /\[\[ "\$green" == "-1" \]\]/,
+    `${label} must not treat raw helper -1 as immediate exit 1`,
   );
-  for (const [label, body] of [
-    ["tugboat", tug],
-    ["playbook", book],
-  ] as const) {
-    assert.match(body, /apply_release_check_wait_tick/, label);
-    assert.match(body, /release-checks-green\.py/, label);
-    assert.match(body, /gh run rerun "\$run_id" --failed/, label);
-    assert.match(body, /verdict=\$\(apply_release_check_wait_tick/, label);
-    assert.doesNotMatch(
-      body,
-      /\[\[ "\$green" == "-1" \]\]/,
-      `${label} must not treat raw helper -1 as immediate exit 1`,
-    );
-    const waitIdx = body.indexOf("apply_release_check_wait_tick");
-    const waitSlice = body.slice(waitIdx);
-    assert.doesNotMatch(
-      waitSlice.slice(0, 2500),
-      /python3 "\$RELEASE_CHECKS_GREEN_BIN" "\$RUN_DIR\/release-checks\.json"\)\s*\n\s*if \[\[ "\$green" == "1"/,
-    );
-  }
+  const waitIdx = body.indexOf("apply_release_check_wait_tick");
+  const waitSlice = body.slice(waitIdx);
+  assert.doesNotMatch(
+    waitSlice.slice(0, 2500),
+    /python3 "\$RELEASE_CHECKS_GREEN_BIN" "\$RUN_DIR\/release-checks\.json"\)\s*\n\s*if \[\[ "\$green" == "1"/,
+  );
 });

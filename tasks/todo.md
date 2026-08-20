@@ -1,20 +1,22 @@
-# #1133 Revised plan — Tugboat FRG pack unsets attestor env and signs outside prepare
+# #1151 Revised plan — ship-end runs the candidate engine
 
 ## Status
 
 - [x] Plan review feedback incorporated (see chat `## Feedback Incorporated`)
-- [x] Implementation
-- [x] Tests (CLI-stub first; prove they fail on current compose)
-- [x] Docs + OpenSpec task/design precision
-- [x] `node scripts/build.mjs` if any `core/` file changes (test-only; no plugin regen)
-- [x] `npm run ci`
+- [ ] Implementation
+- [ ] Tests (PATH-stub / injected spawn first; prove they fail on current compose)
+- [ ] Docs + OpenSpec task/design precision
+- [ ] `node scripts/build.mjs` after any `core/` edit
+- [ ] `npm run ci`
 
 ## Locked decisions (post plan-review)
 
-1. Prepare child: `env -u PIPELINE_FRG_ATTESTATION_KEY -u PIPELINE_FRG_ATTESTATION_KEY_FILE`. Parent keeps supervisor env.
-2. Attestor child: only `PIPELINE_FRG_ATTESTATION_KEY`. Read `KEY_FILE` in memory when `KEY` is absent. Unset `KEY_FILE` in that child. Never write the key body to `state.json`, request JSON, or logs.
-3. Classifier: `awaiting_frg_attestation` without bound `latest.json` `pass: true` prints `attest`, not `done`.
-4. `loop_run_id` comes only from the parsed prepare result. Missing or empty id is pack-fail. Bare `in_progress` is retry. `in_progress` with unsigned eligible artifacts is attest. Do not pick an unbound newest loop.
-5. After attestor, re-read `latest.json`. Pack-done requires bound `pass: true` (or `complete` + verified open matching release PR). Attestor success without a valid bound artifact is pack-fail.
-6. Tests are a runnable PATH stub of `pipeline`, not source-only greps. Source sync stays as a second check.
-7. Playbook source is `examples/supervisor/shell/pipeline-ship-playbook.sh` plus sibling `frg-pack-helpers.sh`. Install is a copy to `~/.local/bin`, not a generated mirror.
+1. Candidate SHA is the 40-hex `integrated_candidate.git_sha` (Tugboat request JSON) or `ShipTrainEvidence.integrated_head_oid` (in-engine ship). Not cwd HEAD. Not version.
+2. Allowed roots: clean `REPO_DIR` HEAD==SHA, `$REPO_DIR/.worktrees/ship-candidate-<sha>`, or `PIPELINE_CANDIDATE_ENGINE_ROOT`. Entrypoint: `node "$ENGINE_ROOT/scripts/pipeline-launcher.mjs"`. CWD: `REPO_DIR`.
+3. Identity: exact source SHA. `--version --json` emits `{ version, commit_sha }`. Version match with SHA mismatch fails.
+4. Installed playbook is a thin launcher to repo `tugboat.sh`. No second compose.
+5. In-engine ship: pin process stays coordinator; spawn leaf candidate verbs. Do not re-exec `pipeline ship`. Do not rerun train. Fail before FRG/release mutation if resolution fails.
+6. Tugboat does not tag. In-engine tag is `ensureAnnotatedReleaseTag` on the candidate. Promote stays on the pin.
+7. Keep #1133 credential split. SHA and paths are data, not shell fragments.
+
+See `openspec/changes/ship-end-candidate-engine/design.md` for the full contract.

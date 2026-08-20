@@ -250,7 +250,7 @@ not the product owner. #1001 / #971 do not ban in-engine ship.
 | `examples/supervisor/shell/ship-stage-watch.sh` | Optional exact-run posts; shared install |
 | `examples/supervisor/shell/train-status-complete.py` | Train complete gate helper |
 | `examples/supervisor/shell/release-checks-green.py` | Shared ship-release check waiter (`green`/`pending`/`rerun`/`fail`, `bucket`+`link` schema) |
-| `examples/supervisor/shell/pipeline-ship-playbook.sh` | Thin leftover chain adapter (not the owner) |
+| `examples/supervisor/shell/pipeline-ship-playbook.sh` | Thin launcher to repo `tugboat.sh` (not the owner) |
 | `examples/supervisor/shell/ship-milestone.sh` | Parked grant-style adapter; not the operator surface |
 
 Required env for mutating ship: `REPO_DIR`, `PIPELINE`, `ALLOW_MERGE=1`.  
@@ -270,8 +270,10 @@ Tugboat does not add a grant factory or second merge policy. Doctor:
 `supervisor:tugboat-install-parity` (installed Tugboat + CI/train helpers match
 repo example content),
 `supervisor:ship-playbook-promote-host` (legacy playbook promote default),
-and `supervisor:ship-composer-skip-frg` (installed Tugboat/playbook must not
-hard-code default `--skip-frg`).
+`supervisor:ship-composer-skip-frg` (installed Tugboat/playbook must not
+hard-code default `--skip-frg`),
+and `supervisor:ship-end-candidate-engine` (ship-end uses the candidate engine;
+selected stale playbook fails). Train and promote stay on the production pin.
 
 **Notify policy:** observational only; notification failures must not alter ship
 phase decisions. Prefer shared `ship-notify.sh` / `ship-stage-watch.sh` siblings

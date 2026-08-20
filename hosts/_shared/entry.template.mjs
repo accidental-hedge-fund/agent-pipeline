@@ -176,7 +176,24 @@ try {
   pkgReadable = false;
 }
 
+function revParseHead(cwd) {
+  const r = spawnSync("git", ["-C", cwd, "rev-parse", "HEAD"], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+    timeout: 5000,
+  });
+  if (r.status !== 0) return null;
+  const sha = String(r.stdout ?? "").trim().toLowerCase();
+  return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
+}
+
+function resolveLauncherCommitSha(engineCoreDir) {
+  return revParseHead(engineCoreDir) ?? revParseHead(join(engineCoreDir, ".."));
+}
+
 // Short-circuit for --version / -V: works before dependency provisioning.
+// Human --version stays the package version. `--version --json` emits
+// `{ version, commit_sha }` (commit_sha is exact 40-hex or null; never invented).
 if (rawArgs.includes("--version") || rawArgs.includes("-V")) {
   if (!pkgReadable) {
     process.stderr.write(
@@ -184,6 +201,11 @@ if (rawArgs.includes("--version") || rawArgs.includes("-V")) {
       "         Reinstall with: npm install -g agent-pipeline\n",
     );
     process.exit(1);
+  }
+  if (rawArgs.includes("--json")) {
+    const commitSha = resolveLauncherCommitSha(coreDir);
+    process.stdout.write(JSON.stringify({ version: pkgVersion, commit_sha: commitSha }) + "\n");
+    process.exit(0);
   }
   process.stdout.write(pkgVersion + "\n");
   process.exit(0);

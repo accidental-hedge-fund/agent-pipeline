@@ -1475,6 +1475,7 @@ test("CLI: release usage documents prepare and finish surfaces", () => {
   assert.notEqual(result.status, 0);
   const combined = (result.stdout ?? "") + (result.stderr ?? "");
   assert.ok(combined.includes("pipeline release finish"), `got: ${combined}`);
+  assert.ok(combined.includes("ensure-tag"), `got: ${combined}`);
   assert.ok(
     combined.includes("X.Y.Z") || combined.includes("major") || combined.includes("Prepare"),
     `got: ${combined}`,
@@ -1825,6 +1826,20 @@ test("CLI: 'pipeline release 42' (numeric) exits non-zero with ambiguity message
   const combined = (result.stdout ?? "") + (result.stderr ?? "");
   assert.ok(
     combined.includes("issue") || combined.includes("PR number") || combined.includes("semver") || combined.includes("version"),
+    `got: ${combined}`,
+  );
+});
+
+test("CLI: 'pipeline release ensure-tag' without version and oid exits non-zero", () => {
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "release", "ensure-tag"],
+    { encoding: "utf8", env: { ...process.env, PATH: "" } },
+  );
+  assert.notEqual(result.status, 0, "should exit non-zero");
+  const combined = (result.stdout ?? "") + (result.stderr ?? "");
+  assert.ok(
+    combined.includes("ensure-tag") && combined.includes("X.Y.Z"),
     `got: ${combined}`,
   );
 });
