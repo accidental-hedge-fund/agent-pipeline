@@ -717,7 +717,7 @@ The engine SHALL expose the exact non-interactive command `pipeline factory-rele
 
 The command SHALL implement an idempotent multi-tick protocol. A call for a post-1.33 request with no request-bound pack loop, or with a bound loop that is not terminal, SHALL start or resume that bound candidate pack loop, persist `loop_run_id` and the matching request binding before spawn, and return JSON with `status: "in_progress"`, the bound `loop_run_id`, and a stable restart checkpoint. A failed detached spawn SHALL fail that tick and SHALL leave the request bound to the same `loop_run_id` so a later invoke can resume it. That call SHALL NOT invent `pass: true`, SHALL NOT return `status: "complete"`, and SHALL NOT open the release pull request. A repeat call with the **unchanged** request SHALL resume the same `loop_run_id` and SHALL NOT start a second unbound pack.
 
-When the bound pack loop is terminal, the command SHALL score it with `pipeline factory-gate --for <target-version> --from-run <loop_run_id>` (or the in-process equivalent) and SHALL NOT pass `--observations`. Only after that score produces complete unsigned FRG artifacts, and no verified production-owned attestation exists, SHALL the command return JSON with `status: "awaiting_frg_attestation"`, closed unsigned artifact identities and digests, and a stable restart checkpoint. It SHALL NOT open the release pull request on that call.
+When the bound pack loop is terminal, the command SHALL score it with `pipeline factory-gate --for <target-version> --from-run <loop_run_id>` (or the in-process equivalent) and SHALL NOT pass `--observations`. Complete unsigned FRG artifacts SHALL exist when scoreboard and composition meet release-eligibility except HMAC is absent, even if `.agent-pipeline/frg/<X.Y.Z>/latest.json` records `pass: false` solely because HMAC was omitted. Only after that score produces complete unsigned FRG artifacts, and no verified production-owned attestation exists, SHALL the command return JSON with `status: "awaiting_frg_attestation"`, closed unsigned artifact identities and digests, and a stable restart checkpoint. It SHALL NOT open the release pull request on that call. It SHALL NOT return `status: "failed"` or `defect_class: "frg_not_eligible"` when HMAC is the only missing piece. A re-observe of a prior omitted-HMAC `failed` checkpoint for the same unchanged request SHALL return `awaiting_frg_attestation` when the pack is still structurally eligible.
 
 After the wrapper stores a verified production-owned attestation for those exact artifacts, a later call with the **unchanged** request SHALL verify the bound attestation, invoke the existing prepare-only release implementation, and return `status: "complete"` with the exact FRG run identity, release pull request, release head, base commit, and restart checkpoint. Repeated calls at any proved checkpoint SHALL return the same proved state without creating a second pack, loop, attestation, branch, or pull request.
 
@@ -728,6 +728,24 @@ The command SHALL grant no attestation signing, release-PR merge, publication, p
 - **WHEN** the unchanged request has produced complete unsigned FRG artifacts but no verified production-owned attestation exists
 - **THEN** the command SHALL return `status: "awaiting_frg_attestation"` with only the bound unsigned artifact identities, digests, and restart checkpoint
 - **AND** it SHALL NOT create the release pull request
+
+#### Scenario: Omitted HMAC is not frg_not_eligible
+
+- **WHEN** the bound pack loop is terminal
+- **AND** scoreboard and composition meet release-eligibility except HMAC is absent
+- **AND** `.agent-pipeline/frg/<X.Y.Z>/latest.json` records `pass: false` because HMAC was omitted
+- **THEN** the command SHALL return `status: "awaiting_frg_attestation"`
+- **AND** it SHALL NOT return `status: "failed"`
+- **AND** it SHALL NOT return `defect_class: "frg_not_eligible"`
+- **AND** it SHALL NOT invent `pass: true`
+
+#### Scenario: Stale omitted-HMAC failed checkpoint is re-observed as awaiting
+
+- **WHEN** a prior tick persisted `status: "failed"` and `defect_class: "frg_not_eligible"` because HMAC was omitted
+- **AND** a later call uses the unchanged request
+- **AND** the bound pack is still structurally eligible
+- **THEN** the command SHALL return `status: "awaiting_frg_attestation"`
+- **AND** it SHALL NOT replay that failed checkpoint as terminal pack-fail
 
 #### Scenario: Second call returns the complete release pull request
 
@@ -752,6 +770,13 @@ The command SHALL grant no attestation signing, release-PR merge, publication, p
 - **WHEN** required FRG evidence is missing, stale, failed, mismatched, skipped, or waived without policy support
 - **THEN** the command SHALL NOT return `status: "complete"`
 - **AND** it SHALL exit non-zero or return a failure status that names the version and defect class
+
+#### Scenario: Structural ineligibility still fails
+
+- **WHEN** the bound pack loop is terminal
+- **AND** composition is missing or a required scenario fails
+- **THEN** the command SHALL NOT return `status: "awaiting_frg_attestation"`
+- **AND** it SHALL return a failure status that names `frg_not_eligible` or the structural defect
 
 #### Scenario: First call with no bound loop returns in-progress
 

@@ -358,7 +358,11 @@ The prepare child process SHALL have `PIPELINE_FRG_ATTESTATION_KEY` and `PIPELIN
 
 When prepare returns `status: "awaiting_frg_attestation"`, or when unsigned eligible artifacts exist for the bound request and no matching `latest.json` `pass: true` exists, Tugboat SHALL invoke `pipeline factory-gate --for <X.Y.Z> --from-run <loop>` in a **separate** child process. `<loop>` SHALL be the bound pack `loop_run_id` from the prepare result (`loop_run_id` on `in_progress`, or `frg.loop_run_id` on `awaiting_frg_attestation`). That attestor child SHALL NOT pass `--observations`. That attestor child SHALL have the producer credential available to factory-gate: inherit `PIPELINE_FRG_ATTESTATION_KEY` when set, and when the supervisor supplied only `PIPELINE_FRG_ATTESTATION_KEY_FILE`, present that file's contents as `PIPELINE_FRG_ATTESTATION_KEY` in the attestor child only. Tugboat SHALL NOT run that attestor inside the prepare process.
 
-Pack-done SHALL mean `.agent-pipeline/frg/<X.Y.Z>/latest.json` has `pass: true` and records the request `target_version` and `integrated_candidate.git_sha` (and `action_id` when the artifact records one), or prepare already returned `status: "complete"` with an open release PR for that version. Prepare JSON `status: "awaiting_frg_attestation"` alone SHALL NOT be pack-done. A `pass: true` artifact that lacks that binding, or that binds a different version or candidate SHA, SHALL NOT be pack-done; Tugboat SHALL re-invoke while prepare status is `in_progress`. A `latest.json` `pass: false` SHALL be evaluated before any success status: `awaiting_frg_attestation` or `complete` paired with `pass: false` is pack-fail. `status: "complete"` is pack-done only after an open release PR for that version is verified; a bare complete response with no open release PR is pack-fail. Pack-fail SHALL mean a failed or missing FRG status, `latest.json` `pass: false` after a terminal score, attestor child failure or missing producer credential after unsigned artifacts exist, or wait-budget exhaustion while status stays `in_progress` **and the bound pack loop is not live**. Wait-budget exhaustion while status stays `in_progress` and the bound pack loop is live SHALL NOT be pack-fail. Unreadable or malformed `lock.json` or `ledger.json` SHALL NOT count as not-live. Tugboat SHALL keep re-invoking and heartbeat while liveness is unknown. The bound loop is not live only after a positive dead-or-missing lock pid and a positive terminal-or-missing ledger. On pack-fail Tugboat SHALL fail the frg-pack phase and SHALL NOT invoke `pipeline release` for that version.
+Pack-done SHALL mean `.agent-pipeline/frg/<X.Y.Z>/latest.json` has `pass: true` and records the request `target_version` and `integrated_candidate.git_sha` (and `action_id` when the artifact records one), or prepare already returned `status: "complete"` with an open release PR for that version. Prepare JSON `status: "awaiting_frg_attestation"` alone SHALL NOT be pack-done. A `pass: true` artifact that lacks that binding, or that binds a different version or candidate SHA, SHALL NOT be pack-done; Tugboat SHALL re-invoke while prepare status is `in_progress`.
+
+When `latest.json` has `pass: false` because HMAC was omitted, and the bound pack is structurally eligible, Tugboat SHALL treat that tick as `attest`. It SHALL NOT treat omitted-HMAC `pass: false` as pack-fail. `status: "awaiting_frg_attestation"` or unsigned eligible artifacts paired with that omitted-HMAC `pass: false` SHALL be `attest`. Tugboat SHALL NOT fail-close on `pass: false` before those attest signals. A signed `latest.json` `pass: false` SHALL be pack-fail only when that artifact is bound to the current request and the current prepare result is not `in_progress` with unsigned eligible artifacts. A prior candidate's signed `pass: false` SHALL NOT fail a current in-progress unsigned-eligible tick.
+
+A `latest.json` `pass: false` caused by a real ineligible scoreboard (composition missing, required scenarios fail, wrong pack, engine-class over threshold) SHALL remain pack-fail. `status: "complete"` is pack-done only after an open release PR for that version is verified; a bare complete response with no open release PR is pack-fail. Pack-fail SHALL mean a failed or missing FRG status that is not omitted-HMAC-only, `latest.json` `pass: false` after a terminal **ineligible** score, attestor child failure or missing producer credential after unsigned artifacts exist, or wait-budget exhaustion while status stays `in_progress` **and the bound pack loop is not live**. Wait-budget exhaustion while status stays `in_progress` and the bound pack loop is live SHALL NOT be pack-fail. Unreadable or malformed `lock.json` or `ledger.json` SHALL NOT count as not-live. Tugboat SHALL keep re-invoking and heartbeat while liveness is unknown. The bound loop is not live only after a positive dead-or-missing lock pid and a positive terminal-or-missing ledger. On pack-fail Tugboat SHALL fail the frg-pack phase and SHALL NOT invoke `pipeline release` for that version.
 
 #### Scenario: Request binds the post-train integration tip
 
@@ -470,17 +474,39 @@ Pack-done SHALL mean `.agent-pipeline/frg/<X.Y.Z>/latest.json` has `pass: true` 
 - **AND** that child SHALL NOT pass `--observations`
 - **AND** Tugboat SHALL NOT treat that tick as wait-only retry
 
+#### Scenario: Stale signed failing latest.json does not fail a newer unsigned-eligible tick
+
+- **WHEN** `.agent-pipeline/frg/1.39.5/latest.json` has `pass: false` with HMAC present bound to a prior candidate SHA
+- **AND** prepare returns `status: "in_progress"` for a new request for version `1.39.5`
+- **AND** the prepare result includes unsigned eligible artifacts
+- **AND** the bound pack `loop_run_id` is `L`
+- **AND** no matching `latest.json` `pass: true` exists for the new candidate
+- **THEN** Tugboat SHALL classify that tick as `attest`
+- **AND** it SHALL invoke `pipeline factory-gate --for 1.39.5 --from-run L` in a child process other than prepare
+- **AND** it SHALL NOT fail the FRG pack phase on the stale signed `pass: false`
+
+#### Scenario: Unsigned eligible omitted-HMAC pass false is attest
+
+- **WHEN** prepare returns `status: "awaiting_frg_attestation"` for version `1.39.5`
+- **AND** `.agent-pipeline/frg/1.39.5/latest.json` has `pass: false` because HMAC was omitted
+- **AND** the bound pack is structurally eligible
+- **AND** the bound pack `loop_run_id` is `L`
+- **THEN** Tugboat SHALL classify that tick as `attest`
+- **AND** it SHALL invoke `pipeline factory-gate --for 1.39.5 --from-run L` in a child process other than prepare
+- **AND** that child SHALL have the producer credential
+- **AND** Tugboat SHALL NOT fail the FRG pack phase on that `pass: false`
+
 #### Scenario: Failed pack stops the ship before release
 
-- **WHEN** prepare reports a failed or missing FRG status
-- **OR** `.agent-pipeline/frg/1.39.0/latest.json` has `pass: false` after a terminal score
+- **WHEN** prepare reports a failed or missing FRG status that is not omitted-HMAC-only
+- **OR** `.agent-pipeline/frg/1.39.0/latest.json` has `pass: false` after a terminal ineligible score
 - **THEN** Tugboat SHALL fail the FRG pack phase
 - **AND** it SHALL NOT invoke `pipeline release` for `1.39.0`
 
 #### Scenario: Failed latest evidence blocks awaiting or complete
 
-- **WHEN** `.agent-pipeline/frg/1.39.0/latest.json` has `pass: false`
-- **AND** prepare status is `awaiting_frg_attestation` or `complete`
+- **WHEN** `.agent-pipeline/frg/1.39.0/latest.json` has `pass: false` because composition is missing or a required scenario failed
+- **AND** prepare status is `complete`
 - **THEN** Tugboat SHALL fail the FRG pack phase
 - **AND** it SHALL NOT invoke `pipeline release` for `1.39.0`
 
@@ -815,6 +841,9 @@ Tugboat pack-phase isolation (uncredentialed prepare child, credentialed `factor
 - prepare is invoked with `PIPELINE_FRG_ATTESTATION_KEY` or `PIPELINE_FRG_ATTESTATION_KEY_FILE` set in that child,
 - pack-done is declared for `awaiting_frg_attestation` without a matching `pass: true` `latest.json`,
 - `in_progress` with unsigned eligible artifacts is classified as wait-only retry,
+- unsigned eligible omitted-HMAC `pass: false` is classified as `fail`,
+- `in_progress` with unsigned eligible artifacts is classified as `fail` because a prior candidate's signed `pass: false` remains in `latest.json`,
+- prepare reports `failed` / `frg_not_eligible` when HMAC is the only missing piece,
 - or the pack phase writes the key body into `state.json`.
 
 #### Scenario: Regression fails if prepare inherits KEY_FILE
@@ -834,6 +863,28 @@ Tugboat pack-phase isolation (uncredentialed prepare child, credentialed `factor
 - **AND** `latest.json` is missing or is not bound `pass: true`
 - **THEN** the checks SHALL print `attest`
 - **AND** the checks SHALL fail if the classifier still prints `retry` for that tick
+
+#### Scenario: Regression fails if unsigned eligible pass false is classified fail
+
+- **WHEN** the automated pack-isolation checks classify a tick whose prepare status is `awaiting_frg_attestation`
+- **AND** `latest.json` has `pass: false` because HMAC was omitted
+- **AND** the bound pack is structurally eligible
+- **THEN** the checks SHALL print `attest`
+- **AND** the checks SHALL fail if the classifier still prints `fail` for that tick
+
+#### Scenario: Regression fails if stale signed pass false overrides current unsigned-eligible tick
+
+- **WHEN** the automated pack-isolation checks classify a tick whose prepare status is `in_progress`
+- **AND** the prepare result includes unsigned eligible artifacts
+- **AND** `latest.json` has signed `pass: false` bound to a prior candidate SHA
+- **THEN** the checks SHALL print `attest`
+- **AND** the checks SHALL fail if the classifier still prints `fail` for that tick
+
+#### Scenario: Regression fails if prepare reports failed for omitted HMAC only
+
+- **WHEN** the automated prepare checks score a terminal structurally eligible pack without HMAC
+- **THEN** the checks SHALL require `status: "awaiting_frg_attestation"`
+- **AND** the checks SHALL fail if the result is `status: "failed"` or `defect_class: "frg_not_eligible"`
 
 ### Requirement: Tugboat SHALL resolve the candidate engine after train-complete
 
