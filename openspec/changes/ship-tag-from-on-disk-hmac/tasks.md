@@ -6,6 +6,8 @@
 - [x] 1.4 Keep merge-OID proof (`assertEnsureTagOidIsMergedRelease`). Peel with `git rev-parse --verify ${oid}^{commit}`. Tag the peeled merge commit only
 - [x] 1.5 Existing-tag success only when annotated and peeled commit equals the merge. Lightweight or wrong-target tag fail-closes. Never force-update or delete
 - [x] 1.6 On concurrent push failure, re-observe origin `refs/tags/vX.Y.Z` and succeed only if it is the correct annotated tag on the merge commit
+- [x] 1.7 Bind `--packed-candidate` to HMAC SHA from the same validated latest.json snapshot. Do not reopen the file after validation
+- [x] 1.8 A local annotated tag is not evidence of remote publication. Observe origin and push if missing. Wrong or lightweight remote tag still fail-closes
 
 ## 2. Tugboat compose
 
@@ -30,6 +32,8 @@
 - [x] 4.4 Auto-tag extracted FRG-step: ignored-absent exits 0 and does not tag; non-ignored-absent fail-closes; existing-invalid fail-closes even if ignored. Notes/tag `if:` does not run on skip. Prove current workflow fails the ignored-absent case
 - [x] 4.5 Ensure-tag unit: packed SHA ≠ merge SHA still tags merge; wrong OID; missing / failed / invalid-HMAC / unbound disk evidence; correct vs lightweight vs wrong existing tag; concurrent correct vs wrong remote tag. Inject git/observe/validateFrg
 - [x] 4.6 Tests inject I/O or inspect source/workflow. They do not push real tags, call GitHub, or run a live ship
+- [x] 4.7 Regression: failed push then retry with no remote tag pushes the verified local tag
+- [x] 4.8 Regression: packed-candidate bind uses the HMAC-validated snapshot, not a second latest.json read
 
 ## 5. Docs and gate
 

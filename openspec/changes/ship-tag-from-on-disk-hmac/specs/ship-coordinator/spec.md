@@ -2,9 +2,9 @@
 
 ### Requirement: Candidate ensure-tag SHALL prove the supplied OID is the merged release
 
-`pipeline release ensure-tag` SHALL re-observe the version's release PR before creating a missing annotated tag. It SHALL require that pull request to be merged with a merge commit exactly equal to the supplied OID. It SHALL fail closed and SHALL NOT create or push `v<X.Y.Z>` when that proof is absent. Before creating a missing tag it SHALL also validate on-disk `.agent-pipeline/frg/<X.Y.Z>/latest.json` as release-eligible (`pass: true` and valid HMAC) and SHALL require HMAC `candidate_git_sha` (`factory_release_binding.candidate_git_sha` if present, else `pack_provenance.candidate_git_sha`) to equal the caller-supplied `--packed-candidate` 40-hex SHA. That packed SHA SHALL be this ship's independent Factory Reliability Gate (FRG)-bound identity: factory-release request `integrated_candidate.git_sha` or `ShipTrainEvidence.integrated_head_oid`. The HMAC artifact SHALL NOT be the authority for "this ship." The command SHALL fail closed when `--packed-candidate` is missing or is not 40-hex. It SHALL NOT require that packed candidate SHA to equal the merge commit. It SHALL NOT rewrite `latest.json`. It SHALL NOT require the file to exist in the git tree.
+`pipeline release ensure-tag` SHALL re-observe the version's release PR before creating a missing annotated tag. It SHALL require that pull request to be merged with a merge commit exactly equal to the supplied OID. It SHALL fail closed and SHALL NOT create or push `v<X.Y.Z>` when that proof is absent. Before creating a missing tag it SHALL also validate on-disk `.agent-pipeline/frg/<X.Y.Z>/latest.json` as release-eligible (`pass: true` and valid HMAC) and SHALL require HMAC `candidate_git_sha` (`factory_release_binding.candidate_git_sha` if present, else `pack_provenance.candidate_git_sha`) to equal the caller-supplied `--packed-candidate` 40-hex SHA. That packed SHA SHALL be this ship's independent Factory Reliability Gate (FRG)-bound identity: factory-release request `integrated_candidate.git_sha` or `ShipTrainEvidence.integrated_head_oid`. The HMAC artifact SHALL NOT be the authority for "this ship." The command SHALL fail closed when `--packed-candidate` is missing or is not 40-hex. It SHALL NOT require that packed candidate SHA to equal the merge commit. It SHALL NOT rewrite `latest.json`. It SHALL NOT require the file to exist in the git tree. HMAC `candidate_git_sha` SHALL be taken from the same HMAC-validated `latest.json` snapshot (one file read). The helper SHALL NOT reopen `latest.json` after validation to bind `--packed-candidate`.
 
-An existing `v<X.Y.Z>` SHALL succeed only when it is an annotated tag whose peeled commit equals the merge commit. A lightweight tag or a tag on a different commit SHALL fail closed. The command SHALL NOT force-update or delete the tag. If a concurrent push creates the remote tag, the command SHALL re-observe origin and succeed only if that tag is the correct annotated tag on the merge commit.
+An existing `v<X.Y.Z>` SHALL succeed only when origin has an annotated tag whose peeled commit equals the merge commit. A local-only annotated tag SHALL NOT be treated as published: the helper SHALL observe origin in a temporary ref and, if origin lacks the tag, SHALL push the verified local tag. A lightweight tag or a tag on a different commit (local or remote) SHALL fail closed. The command SHALL NOT force-update or delete the tag. If a concurrent push creates the remote tag, the command SHALL re-observe origin and succeed only if that tag is the correct annotated tag on the merge commit.
 
 #### Scenario: Unrelated OID is rejected
 
@@ -42,6 +42,27 @@ An existing `v<X.Y.Z>` SHALL succeed only when it is an annotated tag whose peel
 #### Scenario: Wrong existing tag fails closed
 
 - **WHEN** `refs/tags/v1.39.5` already exists as a lightweight tag or peels to a commit other than the merge
+- **THEN** the command SHALL fail closed
+- **AND** it SHALL NOT force-update or delete the tag
+
+#### Scenario: HMAC candidate SHA comes from the validated snapshot
+
+- **WHEN** `pipeline release ensure-tag` validates on-disk `latest.json`
+- **AND** a concurrent writer replaces that file after the HMAC-valid read
+- **THEN** `--packed-candidate` SHALL be compared to `candidate_git_sha` from the validated snapshot
+- **AND** the helper SHALL NOT reopen `latest.json` for that comparison
+
+#### Scenario: Local annotated tag with no remote tag is pushed
+
+- **WHEN** local `refs/tags/v1.39.5` is an annotated tag on the merge commit
+- **AND** origin has no `refs/tags/v1.39.5`
+- **THEN** the command SHALL push the verified local tag
+- **AND** SHALL NOT return success as if the tag were already published
+
+#### Scenario: Wrong remote tag still fails closed after a local tag exists
+
+- **WHEN** local `refs/tags/v1.39.5` is the correct annotated tag
+- **AND** origin has a lightweight tag or a tag on a different commit
 - **THEN** the command SHALL fail closed
 - **AND** it SHALL NOT force-update or delete the tag
 

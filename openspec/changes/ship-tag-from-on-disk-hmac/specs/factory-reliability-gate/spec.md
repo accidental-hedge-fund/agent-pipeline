@@ -57,6 +57,9 @@ is optional or advisory on the tag path. The local tag helper SHALL reuse this
 validator. Auto-tag SHALL reuse this validator when FRG is not gitignored. Auto-tag
 SHALL NOT use this validator to fail the job when FRG is gitignored and the tree
 file is absent. Callers SHALL NOT invent a second tag eligibility checker.
+The validator SHALL return the parsed HMAC-validated snapshot from that same
+file read so `release ensure-tag` can bind `--packed-candidate` without
+reopening `latest.json`.
 
 #### Scenario: Missing latest.json names path and remediation
 
@@ -80,6 +83,13 @@ file is absent. Callers SHALL NOT invent a second tag eligibility checker.
 - **AND** `.agent-pipeline/frg/1.39.0/latest.json` is release-eligible with `pass: true`
 - **THEN** validation SHALL succeed
 - **AND** SHALL NOT treat the artifact as a hard block
+
+#### Scenario: Tag binding uses the HMAC-validated snapshot
+
+- **WHEN** the shared tag validator reads `.agent-pipeline/frg/1.39.0/latest.json`
+- **AND** HMAC validation succeeds
+- **THEN** it SHALL return the parsed snapshot from that same read
+- **AND** a later replacement of the on-disk file SHALL NOT change the returned snapshot
 
 ### Requirement: FRG runtime files SHALL NOT dirty the factory control checkout
 

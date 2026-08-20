@@ -6,7 +6,7 @@ Defines the shared ship-end class law that after a merged release pull request, 
 
 ### Requirement: Ship-end composers SHALL create the annotated tag from on-disk HMAC latest.json after merge
 
-After a ship-end composer has pack-done Factory Reliability Gate (FRG) evidence and has merged the version's release pull request, that composer SHALL invoke `pipeline release ensure-tag <X.Y.Z> <peeled-merge-oid> --packed-candidate <packed-sha>` (or the in-process `ensureAnnotatedReleaseTag` equivalent) on the **candidate** engine **before** publication wait (`wait-release` / `gh release view`). Packed SHA SHALL be factory-release request `integrated_candidate.git_sha` or `ShipTrainEvidence.integrated_head_oid`. The helper SHALL read `.agent-pipeline/frg/<X.Y.Z>/latest.json` from **disk** on the ship host. It SHALL NOT require that file to exist in the git tree. When on-disk `latest.json` is release-eligible (`pass: true` and valid HMAC) and HMAC `candidate_git_sha` equals that independent packed SHA, the helper SHALL create and push annotated tag `vX.Y.Z` on the peeled merge commit of that merged release pull request if the tag is missing. If the annotated tag already points at that merge commit, the helper SHALL be a successful no-op. A lightweight or wrong-target existing tag SHALL fail closed. The helper SHALL NOT force-update or delete the tag.
+After a ship-end composer has pack-done Factory Reliability Gate (FRG) evidence and has merged the version's release pull request, that composer SHALL invoke `pipeline release ensure-tag <X.Y.Z> <peeled-merge-oid> --packed-candidate <packed-sha>` (or the in-process `ensureAnnotatedReleaseTag` equivalent) on the **candidate** engine **before** publication wait (`wait-release` / `gh release view`). Packed SHA SHALL be factory-release request `integrated_candidate.git_sha` or `ShipTrainEvidence.integrated_head_oid`. The helper SHALL read `.agent-pipeline/frg/<X.Y.Z>/latest.json` from **disk** on the ship host. It SHALL NOT require that file to exist in the git tree. When on-disk `latest.json` is release-eligible (`pass: true` and valid HMAC) and HMAC `candidate_git_sha` equals that independent packed SHA, the helper SHALL create and push annotated tag `vX.Y.Z` on the peeled merge commit of that merged release pull request if the tag is missing. HMAC `candidate_git_sha` SHALL be taken from the same HMAC-validated on-disk snapshot used for release-eligibility; the helper SHALL NOT reopen `latest.json` after that validation. If origin already has an annotated tag that points at that merge commit, the helper SHALL be a successful no-op. A local-only annotated tag SHALL be observed against origin and pushed when origin lacks it. A lightweight or wrong-target existing tag (local or remote) SHALL fail closed. The helper SHALL NOT force-update or delete the tag.
 
 Tugboat and the installed playbook launcher SHALL invoke that CLI verb. They SHALL NOT shell `git tag` or `gh release create`. `pipeline release finish` SHALL remain merge-only. In-engine `pipeline ship` SHALL keep invoking the same helper during publication wait.
 
@@ -42,6 +42,19 @@ This requirement does not authorize `--skip-frg`. It does not authorize committi
 - **AND** the composer never invokes `release ensure-tag` or `ensureAnnotatedReleaseTag`
 - **THEN** the test SHALL fail
 
+#### Scenario: Local annotated tag with no remote tag is pushed
+
+- **WHEN** local `refs/tags/v1.39.5` is an annotated tag on the merge commit
+- **AND** origin has no `refs/tags/v1.39.5`
+- **THEN** `release ensure-tag` SHALL push the verified local tag
+- **AND** SHALL NOT treat the local tag as already published
+
+#### Scenario: HMAC candidate SHA comes from the validated snapshot
+
+- **WHEN** `release ensure-tag` validates on-disk `latest.json`
+- **THEN** `--packed-candidate` SHALL be compared to `candidate_git_sha` from that HMAC-validated snapshot
+- **AND** the helper SHALL NOT reopen `latest.json` after validation
+
 ### Requirement: Tag create SHALL fail closed on missing, failed, or unbound on-disk HMAC evidence
 
 `pipeline release ensure-tag` SHALL fail closed and SHALL NOT create or push `vX.Y.Z` when any of these hold:
@@ -52,7 +65,7 @@ This requirement does not authorize `--skip-frg`. It does not authorize committi
 - the supplied OID is not the peeled merge commit of the version's merged release pull request
 - HMAC `candidate_git_sha` is missing or is not this ship's Factory Reliability Gate (FRG)-bound packed candidate
 
-The helper SHALL tag the peeled merge commit. It SHALL NOT retarget the tag to the packed candidate when those SHAs differ because the release pull request added commits. It SHALL NOT rewrite `latest.json` so `candidate_git_sha` equals the merge commit. A `candidate_git_sha` that equals neither this ship's packed candidate nor a recorded packed-candidate identity SHALL fail closed.
+The helper SHALL tag the peeled merge commit. It SHALL NOT retarget the tag to the packed candidate when those SHAs differ because the release pull request added commits. It SHALL NOT rewrite `latest.json` so `candidate_git_sha` equals the merge commit. A `candidate_git_sha` that equals neither this ship's packed candidate nor a recorded packed-candidate identity SHALL fail closed. HMAC `candidate_git_sha` SHALL be taken from the same HMAC-validated snapshot used for release-eligibility.
 
 #### Scenario: Missing on-disk latest.json fails closed
 

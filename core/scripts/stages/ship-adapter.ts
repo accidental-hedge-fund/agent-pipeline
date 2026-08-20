@@ -28,8 +28,8 @@ import {
   type ResolveCandidateEngineDeps,
 } from "../ship-end-candidate.ts";
 import {
-  frgLatestPath,
   validateFrgEvidenceFileForTag,
+  validateFrgEvidenceSnapshotForTag,
   type FrgEvidence,
 } from "../factory-reliability-gate.ts";
 import { FRG_HYBRID_PILOT_VERSION } from "../frg-pack-observations.ts";
@@ -200,6 +200,14 @@ export async function verifyAnnotatedReleaseTag(
   }
 }
 
+function isReleaseTagInvariantError(err: unknown): boolean {
+  const msg = (err as Error).message ?? "";
+  return (
+    msg.includes("does not point to the release merge commit") ||
+    msg.includes("must be an annotated tag")
+  );
+}
+
 function candidateShaFromRecord(raw: unknown): string | null {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
   return parseExactGitSha((raw as Record<string, unknown>).candidate_git_sha);
@@ -229,61 +237,68 @@ export function hmacPackedCandidateGitShaFromUnknown(raw: unknown): string | nul
   return candidateShaFromRecord(rec.pack_provenance);
 }
 
-export async function readHmacPackedCandidateGitSha(
-  repoDir: string,
-  version: string,
-): Promise<string | null> {
-  const latestPath = frgLatestPath(repoDir, version);
-  let text: string;
-  try {
-    text = await fs.readFile(latestPath, "utf8");
-  } catch {
-    return null;
-  }
-  try {
-    return hmacPackedCandidateGitShaFromUnknown(JSON.parse(text) as unknown);
-  } catch {
-    return null;
-  }
-}
-
 /**
  * After a merged release PR, if FRG latest.json is release-eligible and the
  * annotated tag is missing, create and push it on the peeled merge commit.
  * Does not open a second release PR. Never force-updates or deletes the tag.
+ * `validateFrg` MUST return the HMAC-validated latest.json snapshot from the
+ * same file read; packed-candidate binding uses that in-memory result.
  */
 export async function ensureAnnotatedReleaseTag(opts: {
   version: string;
   mergeCommitOid: string;
   packedCandidate: string;
   git: (args: string[]) => Promise<string>;
-  validateFrg: () => Promise<void>;
-  hmacCandidateGitSha: () => Promise<string | null>;
+  validateFrg: () => Promise<unknown>;
 }): Promise<"created" | "exists"> {
   const tag = expectedTag(opts.version);
+  const localRef = `refs/tags/${tag}`;
+  const observeRef = `refs/tags/${tag}-origin-observe`;
   const merge = requireOid(opts.mergeCommitOid, "ship release merge commit");
   const packed = requireOid(opts.packedCandidate, "ship packed candidate");
   const peeled = requireOid(
     await opts.git(["rev-parse", "--verify", `${merge}^{commit}`]),
     "ship release peeled merge commit",
   );
+
+  const observeRemote = async (): Promise<"exists" | "missing"> => {
+    try {
+      await opts.git(["fetch", "origin", `${localRef}:${observeRef}`]);
+    } catch (err) {
+      if (isReleaseTagInvariantError(err)) throw err;
+      return "missing";
+    }
+    await verifyAnnotatedReleaseTag(tag, peeled, opts.git, observeRef);
+    return "exists";
+  };
+
+  const pushOrConfirmRemote = async (): Promise<"created" | "exists"> => {
+    try {
+      await opts.git(["push", "origin", localRef]);
+      return "created";
+    } catch {
+      await opts.git(["fetch", "origin", `${localRef}:${observeRef}`]);
+      await verifyAnnotatedReleaseTag(tag, peeled, opts.git, observeRef);
+      return "exists";
+    }
+  };
+
   try {
-    const objectType = (await opts.git(["cat-file", "-t", `refs/tags/${tag}`])).trim();
+    const objectType = (await opts.git(["cat-file", "-t", localRef])).trim();
     if (objectType === "tag") {
       await verifyAnnotatedReleaseTag(tag, peeled, opts.git);
-      return "exists";
+      const remote = await observeRemote();
+      if (remote === "exists") return "exists";
+      return pushOrConfirmRemote();
     }
     if (objectType) {
       throw new Error(`ship release: ${tag} must be an annotated tag (got ${objectType})`);
     }
   } catch (err) {
-    const msg = (err as Error).message ?? "";
-    if (msg.includes("does not point to the release merge commit") || msg.includes("must be an annotated tag")) {
-      throw err;
-    }
+    if (isReleaseTagInvariantError(err)) throw err;
   }
-  await opts.validateFrg();
-  const hmacSha = parseExactGitSha(await opts.hmacCandidateGitSha());
+  const snapshot = await opts.validateFrg();
+  const hmacSha = parseExactGitSha(hmacPackedCandidateGitShaFromUnknown(snapshot));
   if (!hmacSha) {
     throw new Error(
       "ship release: on-disk HMAC latest.json has no candidate_git_sha bound to this ship's packed candidate",
@@ -295,15 +310,7 @@ export async function ensureAnnotatedReleaseTag(opts: {
     );
   }
   await opts.git(["tag", "-a", tag, peeled, "-m", `${tag} — v${opts.version}`]);
-  try {
-    await opts.git(["push", "origin", `refs/tags/${tag}`]);
-    return "created";
-  } catch {
-    const observeRef = `refs/tags/${tag}-origin-observe`;
-    await opts.git(["fetch", "origin", `refs/tags/${tag}:${observeRef}`]);
-    await verifyAnnotatedReleaseTag(tag, peeled, opts.git, observeRef);
-    return "exists";
-  }
+  return pushOrConfirmRemote();
 }
 
 export async function alignReleaseCheckoutToCandidate(
@@ -923,8 +930,8 @@ function realShipAdapterOperations(opts: RealShipCoordinatorDepsOptions): ShipAd
         mergeCommitOid: release.merge_commit_oid,
         packedCandidate: release.candidate_head_oid,
         git,
-        validateFrg: () => validateFrgEvidenceFileForTag(opts.repoDir, intent.version).then(() => undefined),
-        hmacCandidateGitSha: () => readHmacPackedCandidateGitSha(opts.repoDir, intent.version),
+        validateFrg: async () =>
+          (await validateFrgEvidenceSnapshotForTag(opts.repoDir, intent.version)).snapshot,
       });
       for (let attempt = 0; attempt < RELEASE_WAIT_ATTEMPTS; attempt++) {
         const observed = await observePublication(intent, release);
@@ -1571,8 +1578,7 @@ export async function runEnsureAnnotatedReleaseTagCli(
   },
   io?: {
     git?: (args: string[]) => Promise<string>;
-    validateFrg?: () => Promise<void>;
-    hmacCandidateGitSha?: () => Promise<string | null>;
+    validateFrg?: () => Promise<unknown>;
     observeMergedReleasePr?: (version: string) => Promise<ObservedEnsureTagReleasePr>;
   },
 ): Promise<"created" | "exists"> {
@@ -1599,8 +1605,8 @@ export async function runEnsureAnnotatedReleaseTagCli(
       mergeCommitOid: opts.mergeCommitOid,
       observed,
     });
-    await (io?.validateFrg
-      ?? (() => validateFrgEvidenceFileForTag(opts.repoDir, opts.version).then(() => undefined)))();
+    if (io?.validateFrg) return io.validateFrg();
+    return (await validateFrgEvidenceSnapshotForTag(opts.repoDir, opts.version)).snapshot;
   };
   return ensureAnnotatedReleaseTag({
     version: opts.version,
@@ -1608,8 +1614,6 @@ export async function runEnsureAnnotatedReleaseTagCli(
     packedCandidate,
     git,
     validateFrg,
-    hmacCandidateGitSha: io?.hmacCandidateGitSha
-      ?? (() => readHmacPackedCandidateGitSha(opts.repoDir, opts.version)),
   });
 }
 

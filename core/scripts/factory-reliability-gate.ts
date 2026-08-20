@@ -2009,13 +2009,17 @@ export function formatFrgTagPathFailure(version: string, reason: string): string
  * Fail closed on missing, unparsable, or not release-eligible evidence.
  * Every fail-closed path names `.agent-pipeline/frg/<X.Y.Z>/latest.json` and
  * the factory-release prepare / Tugboat FRG pack remediation.
+ *
+ * Returns the HMAC-validated evidence and the parsed snapshot from the **same**
+ * file read so tag binding can compare `--packed-candidate` without reopening
+ * `latest.json`.
  */
-export async function validateFrgEvidenceFileForTag(
+export async function validateFrgEvidenceSnapshotForTag(
   repoDir: string,
   version: string,
   deps: FrgFsDeps = defaultFsDeps,
   opts: FrgValidateOpts = {},
-): Promise<FrgEvidence> {
+): Promise<{ evidence: FrgEvidence; snapshot: unknown }> {
   const v = normalizeFrgVersion(version);
   const latestPath = frgLatestPath(repoDir, v);
   let text: string;
@@ -2030,10 +2034,26 @@ export async function validateFrgEvidenceFileForTag(
     );
   }
   try {
-    return validateReleaseEligibleFrgEvidence(text, v, opts);
+    const evidence = validateReleaseEligibleFrgEvidence(text, v, opts);
+    return { evidence, snapshot: JSON.parse(text) as unknown };
   } catch (err) {
     throw new Error(formatFrgTagPathFailure(v, (err as Error).message));
   }
+}
+
+/**
+ * Validate the on-disk latest.json for a version (auto-tag / release path).
+ * Fail closed on missing, unparsable, or not release-eligible evidence.
+ * Every fail-closed path names `.agent-pipeline/frg/<X.Y.Z>/latest.json` and
+ * the factory-release prepare / Tugboat FRG pack remediation.
+ */
+export async function validateFrgEvidenceFileForTag(
+  repoDir: string,
+  version: string,
+  deps: FrgFsDeps = defaultFsDeps,
+  opts: FrgValidateOpts = {},
+): Promise<FrgEvidence> {
+  return (await validateFrgEvidenceSnapshotForTag(repoDir, version, deps, opts)).evidence;
 }
 
 /** capacity-blocked-retain pass requires observed blocked-retain count ≥ N. */

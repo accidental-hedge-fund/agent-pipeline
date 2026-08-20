@@ -40,6 +40,7 @@ import {
   isReleaseEligibleFrgPass,
   validateReleaseEligibleFrgEvidence,
   validateFrgEvidenceFileForTag,
+  validateFrgEvidenceSnapshotForTag,
   frgLatestRelPath,
   formatFrgPackCloseComment,
   parseFrgItemIssueNumber,
@@ -2056,6 +2057,48 @@ test("validateFrgEvidenceFileForTag: release-eligible pass does not emit fail-cl
   });
   assert.equal(ok.pass, true);
   assert.equal(ok.version, "1.30.0");
+});
+
+test("validateFrgEvidenceSnapshotForTag returns HMAC SHA from the same file read (#1149)", async () => {
+  const fs = memFs();
+  const shaA = "a".repeat(40);
+  const shaB = "b".repeat(40);
+  const good = computeFrgEvidence(fullPackPassInput({ version: "1.30.0", run_id: "frg-snapshot" }));
+  assert.equal(good.pass, true);
+  await writeFrgEvidence("/repo", good, fs);
+  const latestPath = frgLatestPath("/repo", "1.30.0");
+  const original = JSON.parse(await fs.readFile(latestPath)) as Record<string, unknown>;
+  const snapshotA = {
+    ...original,
+    factory_release_binding: { candidate_git_sha: shaA },
+  };
+  const snapshotB = {
+    ...original,
+    factory_release_binding: { candidate_git_sha: shaB },
+  };
+  let reads = 0;
+  const mutating: FrgFsDeps = {
+    ...fs,
+    async readFile(p) {
+      if (p !== latestPath) return fs.readFile(p);
+      reads++;
+      if (reads === 1) return JSON.stringify(snapshotA);
+      return JSON.stringify(snapshotB);
+    },
+  };
+  const { evidence, snapshot } = await validateFrgEvidenceSnapshotForTag(
+    "/repo",
+    "1.30.0",
+    mutating,
+    { attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY },
+  );
+  assert.equal(reads, 1);
+  assert.equal(evidence.pass, true);
+  assert.equal(
+    (snapshot as { factory_release_binding: { candidate_git_sha: string } })
+      .factory_release_binding.candidate_git_sha,
+    shaA,
+  );
 });
 
 test("FRG composition inventory is frozen (#757)", () => {
