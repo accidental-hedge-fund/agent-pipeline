@@ -913,7 +913,10 @@ test("probeBoundPackLoopLive reads injected lock/ledger fixtures (#1150)", async
     ["/home/runs/loop-dead/lock.json", JSON.stringify({ pid: 99 })],
     [
       "/home/runs/loop-dead/ledger.json",
-      JSON.stringify({ run_id: "loop-dead", stop: { reason: "supervisor_cycle_cap" } }),
+      JSON.stringify({
+        run_id: "loop-dead",
+        stop: { reason: "supervisor_cycle_cap", time: "2026-08-20T00:00:00.000Z" },
+      }),
     ],
     ["/home/runs/loop-pid/lock.json", JSON.stringify({ pid: 42 })],
   ]);
@@ -1024,6 +1027,25 @@ test("probeBoundPackLoopLive treats schema-invalid or blank state as unknown at 
       "/home/runs/loop-bad-stop-str/ledger.json",
       JSON.stringify({ run_id: "loop-bad-stop-str", stop: "yes" }),
     ],
+    [
+      "/home/runs/loop-empty-stop/lock.json",
+      JSON.stringify({ pid: 99 }),
+    ],
+    [
+      "/home/runs/loop-empty-stop/ledger.json",
+      JSON.stringify({ run_id: "loop-empty-stop", stop: {} }),
+    ],
+    [
+      "/home/runs/loop-malformed-stop/lock.json",
+      JSON.stringify({ pid: 99 }),
+    ],
+    [
+      "/home/runs/loop-malformed-stop/ledger.json",
+      JSON.stringify({
+        run_id: "loop-malformed-stop",
+        stop: { reason: "not-a-terminal-reason", time: "2026-08-20T00:00:00.000Z" },
+      }),
+    ],
   ]);
   const readTextFile = (p: string) => files.get(p) ?? null;
   const opts = { env, readTextFile, isPidAlive: () => false };
@@ -1033,6 +1055,8 @@ test("probeBoundPackLoopLive treats schema-invalid or blank state as unknown at 
     "loop-blank-ledger",
     "loop-bad-stop",
     "loop-bad-stop-str",
+    "loop-empty-stop",
+    "loop-malformed-stop",
   ]) {
     const live = await probeBoundPackLoopLive(id, opts);
     assert.equal(live, "unknown", `${id} must be unknown, not not-live`);
@@ -1041,6 +1065,61 @@ test("probeBoundPackLoopLive treats schema-invalid or blank state as unknown at 
       "continue",
       `${id} must wait-continue at cap`,
     );
+  }
+});
+
+test("empty or malformed ledger stop at cap keeps re-invoking prepare (#1150)", async () => {
+  const env = { AGENT_PIPELINE_STATE_HOME: "/home" } as NodeJS.ProcessEnv;
+  const fixtures: unknown[] = [
+    {},
+    { reason: "not-a-terminal-reason", time: "2026-08-20T00:00:00.000Z" },
+  ];
+  for (const stop of fixtures) {
+    const spawned: string[][] = [];
+    const heartbeats: Array<{ attempt: number; live: string }> = [];
+    let prepareTicks = 0;
+    const bound = bindCandidateShipEndOperations(operations(), {
+      pinCommitSha: PIN_SHA,
+      repoDir: "/repo",
+      env,
+      factoryReleaseRequestPath: "/abs/req.json",
+      frgWaitAttempts: 2,
+      delay: async () => {},
+      isPidAlive: () => false,
+      readTextFile: (p) => {
+        if (p.endsWith("lock.json")) return JSON.stringify({ pid: 99 });
+        if (p.endsWith("ledger.json")) {
+          return JSON.stringify({ run_id: "loop-1", stop });
+        }
+        return null;
+      },
+      onFrgWaitTick: (tick) => {
+        heartbeats.push({ attempt: tick.attempt, live: tick.live });
+      },
+      resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+      spawn: async (argv) => {
+        spawned.push(argv);
+        prepareTicks++;
+        if (prepareTicks < 3) {
+          return {
+            code: 0,
+            stdout: JSON.stringify({ status: "in_progress", loop_run_id: "loop-1" }),
+            stderr: "",
+          };
+        }
+        return { code: 0, stdout: JSON.stringify({ status: "complete" }), stderr: "" };
+      },
+    });
+    await bound.runFrgPack!(intent, train);
+    assert.equal(
+      spawned.filter((argv) => argv.includes("factory-release")).length,
+      3,
+      `stop=${JSON.stringify(stop)} must continue past the numeric cap`,
+    );
+    assert.deepEqual(heartbeats, [
+      { attempt: 1, live: "unknown" },
+      { attempt: 2, live: "unknown" },
+    ]);
   }
 });
 

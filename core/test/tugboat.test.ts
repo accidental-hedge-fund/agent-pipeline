@@ -3296,9 +3296,11 @@ test("frg_pack_loop_is_live: schema-invalid or undecodable state is unknown at c
     const badPid = path.join(home, "runs", "loop-bad-pid");
     const blankLedger = path.join(home, "runs", "loop-blank-ledger");
     const badStop = path.join(home, "runs", "loop-bad-stop");
+    const emptyStop = path.join(home, "runs", "loop-empty-stop");
+    const malformedStop = path.join(home, "runs", "loop-malformed-stop");
     const badUtf8Lock = path.join(home, "runs", "loop-bad-utf8-lock");
     const badUtf8Ledger = path.join(home, "runs", "loop-bad-utf8-ledger");
-    for (const p of [emptyLock, badPid, blankLedger, badStop, badUtf8Lock, badUtf8Ledger]) {
+    for (const p of [emptyLock, badPid, blankLedger, badStop, emptyStop, malformedStop, badUtf8Lock, badUtf8Ledger]) {
       fs.mkdirSync(p, { recursive: true });
     }
     fs.writeFileSync(path.join(emptyLock, "lock.json"), "{}");
@@ -3306,6 +3308,13 @@ test("frg_pack_loop_is_live: schema-invalid or undecodable state is unknown at c
     fs.writeFileSync(path.join(blankLedger, "ledger.json"), "  \n\t");
     fs.writeFileSync(path.join(badStop, "lock.json"), JSON.stringify({ pid: 1_000_000_007 }));
     fs.writeFileSync(path.join(badStop, "ledger.json"), JSON.stringify({ stop: true }));
+    fs.writeFileSync(path.join(emptyStop, "lock.json"), JSON.stringify({ pid: 1_000_000_007 }));
+    fs.writeFileSync(path.join(emptyStop, "ledger.json"), JSON.stringify({ stop: {} }));
+    fs.writeFileSync(path.join(malformedStop, "lock.json"), JSON.stringify({ pid: 1_000_000_007 }));
+    fs.writeFileSync(
+      path.join(malformedStop, "ledger.json"),
+      JSON.stringify({ stop: { reason: "not-a-terminal-reason", time: "2026-08-20T00:00:00.000Z" } }),
+    );
     fs.writeFileSync(path.join(badUtf8Lock, "lock.json"), Buffer.from([0xff, 0xfe, 0x00, 0x7b]));
     fs.writeFileSync(path.join(badUtf8Ledger, "ledger.json"), Buffer.from([0x80, 0x81, 0x82]));
     const runner = path.join(dir, "run.sh");
@@ -3327,6 +3336,8 @@ test("frg_pack_loop_is_live: schema-invalid or undecodable state is unknown at c
         "probe_wait loop-bad-pid",
         "probe_wait loop-blank-ledger",
         "probe_wait loop-bad-stop",
+        "probe_wait loop-empty-stop",
+        "probe_wait loop-malformed-stop",
         "probe_wait loop-bad-utf8-lock",
         "probe_wait loop-bad-utf8-ledger",
         "",
@@ -3346,6 +3357,8 @@ test("frg_pack_loop_is_live: schema-invalid or undecodable state is unknown at c
       "loop-bad-pid",
       "loop-blank-ledger",
       "loop-bad-stop",
+      "loop-empty-stop",
+      "loop-malformed-stop",
       "loop-bad-utf8-lock",
       "loop-bad-utf8-ledger",
     ]) {

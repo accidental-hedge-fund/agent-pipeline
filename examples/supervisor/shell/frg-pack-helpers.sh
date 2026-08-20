@@ -634,6 +634,36 @@ if pid_alive:
     print("1")
     raise SystemExit(0)
 
+STOP_REASONS = frozenset((
+    "recovery_exhausted",
+    "consecutive_blocked",
+    "needs_human_classification",
+    "repeated_no_progress",
+    "human_authority",
+    "run_fatal",
+    "supervisor_no_progress",
+    "supervisor_cycle_cap",
+    "dependency_deadlock",
+    "worktree_capacity",
+))
+
+def parse_ledger_stop(raw):
+    if raw is None:
+        return "open"
+    if not isinstance(raw, dict):
+        return "invalid"
+    reason = raw.get("reason")
+    time = raw.get("time")
+    if not isinstance(reason, str) or reason not in STOP_REASONS:
+        return "invalid"
+    if not isinstance(time, str) or not time:
+        return "invalid"
+    ready = raw.get("outstanding_ready")
+    if ready is not None:
+        if not isinstance(ready, list) or any(not isinstance(x, str) for x in ready):
+            return "invalid"
+    return "stop"
+
 ledger_present = False
 ledger_stop = False
 ledger_unreadable = False
@@ -648,14 +678,12 @@ elif ledger_status == "ok":
             ledger = json.loads(ledger_text)
             if isinstance(ledger, dict):
                 stop = ledger.get("stop") if "stop" in ledger else None
-                if stop is None:
-                    ledger_present = True
-                    ledger_stop = False
-                elif isinstance(stop, dict):
-                    ledger_present = True
-                    ledger_stop = True
-                else:
+                stop_kind = parse_ledger_stop(stop)
+                if stop_kind == "invalid":
                     ledger_unreadable = True
+                else:
+                    ledger_present = True
+                    ledger_stop = stop_kind == "stop"
             else:
                 ledger_unreadable = True
         except Exception:

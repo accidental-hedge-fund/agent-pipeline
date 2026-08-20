@@ -1106,11 +1106,41 @@ function parseLockPidField(raw: unknown): number | null {
   return null;
 }
 
-/** null/absent stop is open; a non-array object is terminal; any other value is malformed. */
+/** Closed set of LoopStopRecord.reason values. Incomplete or unknown reasons are not terminal. */
+const DURABLE_LEDGER_STOP_REASONS = new Set([
+  "recovery_exhausted",
+  "consecutive_blocked",
+  "needs_human_classification",
+  "repeated_no_progress",
+  "human_authority",
+  "run_fatal",
+  "supervisor_no_progress",
+  "supervisor_cycle_cap",
+  "dependency_deadlock",
+  "worktree_capacity",
+]);
+
+/**
+ * Null/absent stop is open. A LoopStopRecord-shaped object (known reason plus
+ * non-empty time) is terminal. Incomplete or invalid stop values are malformed.
+ */
 function parseLedgerStopField(raw: unknown): "open" | "stop" | "invalid" {
   if (raw == null) return "open";
-  if (typeof raw === "object" && !Array.isArray(raw)) return "stop";
-  return "invalid";
+  if (typeof raw !== "object" || Array.isArray(raw)) return "invalid";
+  const rec = raw as { reason?: unknown; time?: unknown; outstanding_ready?: unknown };
+  if (typeof rec.reason !== "string" || !DURABLE_LEDGER_STOP_REASONS.has(rec.reason)) {
+    return "invalid";
+  }
+  if (typeof rec.time !== "string" || rec.time.length === 0) return "invalid";
+  if (rec.outstanding_ready !== undefined) {
+    if (
+      !Array.isArray(rec.outstanding_ready) ||
+      rec.outstanding_ready.some((id) => typeof id !== "string")
+    ) {
+      return "invalid";
+    }
+  }
+  return "stop";
 }
 
 function eventsAreTerminal(text: string): boolean {
