@@ -2,7 +2,9 @@
 
 ## Purpose
 TBD - created by archiving change release-yml-annotated-tag-notes. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: The release workflow SHALL read the annotated tag message explicitly and pass it as the Release body
 
 When a `v*` tag push triggers the release workflow, the workflow SHALL extract the tag annotation message using `git tag -l "$GITHUB_REF_NAME" --format='%(contents)'` and pass it to `gh release create` via `--notes-file`, rather than using `--notes-from-tag`.
@@ -65,3 +67,19 @@ Before executing any tag-type guard or annotation-extraction step, the release w
 - **WHEN** the workflow YAML is inspected
 - **THEN** the fetch step appears before the annotated-tag guard step and before the annotation-extraction step in the job's step list
 
+### Requirement: Annotated v-star tag push SHALL be sufficient to publish the GitHub Release
+
+The release workflow SHALL trigger on `push` of tags matching `v*` and SHALL publish a non-draft GitHub Release for that tag. After candidate `release ensure-tag` pushes the annotated tag, Tugboat wait-release SHALL succeed by polling `gh release view` without an operator `gh release create`. Tugboat SHALL NOT invoke `gh release create` or `git tag`.
+
+#### Scenario: Tag push publishes Release for wait-release
+
+- **WHEN** candidate `release ensure-tag` pushes annotated tag `v1.39.6`
+- **AND** `.github/workflows/release.yml` is triggered by that tag push
+- **THEN** a published non-draft GitHub Release `v1.39.6` SHALL appear
+- **AND** Tugboat wait-release SHALL observe it via `gh release view`
+
+#### Scenario: Tugboat does not create the Release
+
+- **WHEN** an automated check inspects Tugboat ship-end
+- **THEN** the composer SHALL NOT contain `gh release create`
+- **AND** the composer SHALL NOT contain `git tag` as the ship path
