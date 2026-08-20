@@ -178,7 +178,9 @@ has `PIPELINE_FRG_ATTESTATION_KEY` and `PIPELINE_FRG_ATTESTATION_KEY_FILE`
 returns `awaiting_frg_attestation` or unsigned eligible artifacts exist,
 Tugboat runs `pipeline factory-gate --for X.Y.Z --from-run <loop>` in a
 **separate** child that has the producer credential (inherit `KEY`, or present
-`KEY_FILE` contents as `KEY` in that child only). It does not pass
+`KEY_FILE` contents as `KEY` in that child only). After `release finish`,
+candidate `release ensure-tag` uses that same recipe so HMAC verify has `KEY`
+when the supervisor set only `KEY_FILE`. It does not pass
 `--observations`. Pack-done is this version's `latest.json` `pass: true` bound
 to the request candidate SHA (and `action_id` when recorded), or prepare
 `complete` with an open release PR. `awaiting_frg_attestation` alone is **not**

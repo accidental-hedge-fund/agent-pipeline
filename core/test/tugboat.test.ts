@@ -4287,6 +4287,7 @@ test("tugboat ensure-tag helper: pack-done merge invokes candidate ensure-tag (#
       env: {
         ...process.env,
         PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
+        PIPELINE_FRG_ATTESTATION_KEY: "unit-test-ensure-tag-key-not-for-production",
       },
     });
     assert.equal(r.status, 0, `ensure-tag helper exited ${r.status}: ${r.stderr}`);
@@ -4410,6 +4411,7 @@ test("tugboat ensure-tag helper: non-zero ensure-tag prevents wait-release (#114
       env: {
         ...process.env,
         PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
+        PIPELINE_FRG_ATTESTATION_KEY: "unit-test-ensure-tag-key-not-for-production",
       },
     });
     assert.equal(r.status, 7, `expected ensure-tag exit 7, got ${r.status}: ${r.stderr}`);
@@ -4472,6 +4474,270 @@ test("tugboat ensure-tag argv requires --repo-path (#1163)", () => {
   const fn = extractNamedFn(src, "invoke_release_ensure_tag", "tugboat.sh");
   assert.match(fn, /--repo-path "\$REPO_DIR"/);
   assert.match(fn, /REPO_DIR required for release ensure-tag --repo-path/);
+});
+
+function writeEnsureTagFinishJson(dir: string, mergeOid = "c".repeat(40)): string {
+  const finishJson = path.join(dir, "release-finish.json");
+  fs.writeFileSync(
+    finishJson,
+    JSON.stringify({
+      schema_version: 1,
+      kind: "release_finish",
+      mergeCommitOid: mergeOid,
+    }),
+  );
+  return finishJson;
+}
+
+function extractEnsureTagStack(src: string): string {
+  return [
+    extractNamedFn(src, "is_exact_git_sha", "tugboat.sh"),
+    extractNamedFn(src, "read_merge_commit_oid_from_finish_json", "tugboat.sh"),
+    extractNamedFn(src, "invoke_release_ensure_tag", "tugboat.sh"),
+  ].join("\n");
+}
+
+function spawnEnsureTagHelper(opts: {
+  dir: string;
+  env: NodeJS.ProcessEnv;
+}): {
+  status: number | null;
+  stdout: string;
+  stderr: string;
+  recordDir: string;
+  argvPath: string;
+  envPath: string;
+  finishJson: string;
+} {
+  const binDir = path.join(opts.dir, "bin");
+  const recordDir = path.join(opts.dir, "record");
+  const pipeline = writeFakePipeline(binDir, recordDir);
+  const packed = "a".repeat(40);
+  const finishJson = writeEnsureTagFinishJson(opts.dir);
+  const src = fs.readFileSync(tugboat, "utf8");
+  const runner = path.join(opts.dir, "run.sh");
+  fs.writeFileSync(
+    runner,
+    [
+      "#!/usr/bin/env bash",
+      "set -euo pipefail",
+      extractEnsureTagStack(src),
+      `SHIP_END_CLI=(${JSON.stringify(pipeline)})`,
+      `SHIP_END_CANDIDATE_SHA=${JSON.stringify(packed)}`,
+      `REPO_DIR=${JSON.stringify(opts.dir)}`,
+      `invoke_release_ensure_tag "1.39.6" ${JSON.stringify(finishJson)}`,
+      'printf "PARENT_KEY_FILE=%s\\n" "${PIPELINE_FRG_ATTESTATION_KEY_FILE-UNSET}"',
+      'printf "PARENT_KEY=%s\\n" "${PIPELINE_FRG_ATTESTATION_KEY-UNSET}"',
+      "",
+    ].join("\n"),
+  );
+  fs.chmodSync(runner, 0o755);
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    ...opts.env,
+    PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
+    PIPELINE: pipeline,
+  };
+  if (!Object.prototype.hasOwnProperty.call(opts.env, "PIPELINE_FRG_ATTESTATION_KEY")) {
+    delete env.PIPELINE_FRG_ATTESTATION_KEY;
+  }
+  if (!Object.prototype.hasOwnProperty.call(opts.env, "PIPELINE_FRG_ATTESTATION_KEY_FILE")) {
+    delete env.PIPELINE_FRG_ATTESTATION_KEY_FILE;
+  }
+  const r = spawnSync("bash", [runner], { encoding: "utf8", env });
+  return {
+    status: r.status,
+    stdout: r.stdout,
+    stderr: r.stderr,
+    recordDir,
+    argvPath: path.join(recordDir, "argv"),
+    envPath: path.join(recordDir, "env"),
+    finishJson,
+  };
+}
+
+function assertEnsureTagDidNotSpawn(argvPath: string, envPath: string): void {
+  assert.equal(fs.existsSync(argvPath), false, "must not spawn release ensure-tag");
+  assert.equal(fs.existsSync(envPath), false, "must not spawn the ship-end CLI");
+}
+
+test("ensure-tag and attestor children present KEY_FILE as KEY (#1174)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-hmac-key-file-"));
+  try {
+    const src = fs.readFileSync(tugboat, "utf8");
+    const attestorFn = extractNamedFn(src, "invoke_frg_pack_attestor", "tugboat.sh");
+    const keyFile = path.join(dir, "key.file");
+    const keyBody = "dummy-key";
+    fs.writeFileSync(keyFile, keyBody);
+    const attestBin = path.join(dir, "attest-bin");
+    const attestRecord = path.join(dir, "attest-record");
+    const attestCli = writeFakePipeline(attestBin, attestRecord);
+    const ensureBin = path.join(dir, "ensure-bin");
+    const ensureRecord = path.join(dir, "ensure-record");
+    const ensureCli = writeFakePipeline(ensureBin, ensureRecord);
+    const attestOut = path.join(dir, "attest-out.json");
+    const attestErr = path.join(dir, "attest-err.txt");
+    const packed = "a".repeat(40);
+    const merge = "c".repeat(40);
+    const finishJson = writeEnsureTagFinishJson(dir, merge);
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        attestorFn,
+        extractEnsureTagStack(src),
+        `SHIP_END_CLI=(${JSON.stringify(attestCli)})`,
+        `invoke_frg_pack_attestor "1.39.6" "loop-L" ${JSON.stringify(attestOut)} ${JSON.stringify(attestErr)}`,
+        `SHIP_END_CLI=(${JSON.stringify(ensureCli)})`,
+        `SHIP_END_CANDIDATE_SHA=${JSON.stringify(packed)}`,
+        `REPO_DIR=${JSON.stringify(dir)}`,
+        `invoke_release_ensure_tag "1.39.6" ${JSON.stringify(finishJson)}`,
+        'printf "PARENT_KEY_FILE=%s\\n" "${PIPELINE_FRG_ATTESTATION_KEY_FILE-UNSET}"',
+        'printf "PARENT_KEY=%s\\n" "${PIPELINE_FRG_ATTESTATION_KEY-UNSET}"',
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      PATH: `${attestBin}${path.delimiter}${ensureBin}${path.delimiter}${process.env.PATH ?? ""}`,
+      PIPELINE_FRG_ATTESTATION_KEY_FILE: keyFile,
+    };
+    delete env.PIPELINE_FRG_ATTESTATION_KEY;
+    const r = spawnSync("bash", [runner], { encoding: "utf8", env });
+    assert.equal(r.status, 0, `hmac helpers exited ${r.status}: ${r.stderr}`);
+    const attestEnv = fs.readFileSync(path.join(attestRecord, "env"), "utf8");
+    const ensureEnv = fs.readFileSync(path.join(ensureRecord, "env"), "utf8");
+    assert.match(attestEnv, new RegExp(`^KEY=${keyBody}$`, "m"));
+    assert.match(attestEnv, /^KEY_FILE_UNSET$/m);
+    assert.match(ensureEnv, new RegExp(`^KEY=${keyBody}$`, "m"));
+    assert.match(ensureEnv, /^KEY_FILE_UNSET$/m);
+    const hasKey = /^KEY=.+$/m.test(ensureEnv) && !/^KEY_UNSET$/m.test(ensureEnv);
+    const hasKeyFile = /^KEY_FILE=.+$/m.test(ensureEnv) && !/^KEY_FILE_UNSET$/m.test(ensureEnv);
+    assert.ok(
+      hasKey || hasKeyFile,
+      "ensure-tag child must present KEY or KEY_FILE (1.39.6 helper left HMAC verify with neither presented as KEY)",
+    );
+    const argv = fs.readFileSync(path.join(ensureRecord, "argv"), "utf8");
+    assert.match(argv, /^release\nensure-tag\n1\.39\.6\n/);
+    assert.match(argv, new RegExp(`^${merge}$`, "m"));
+    assert.match(argv, /^--packed-candidate$/m);
+    assert.match(argv, new RegExp(`^${packed}$`, "m"));
+    assert.match(argv, /^--repo-path$/m);
+    assert.match(argv, new RegExp(`^${dir}$`, "m"));
+    assert.match(r.stdout, new RegExp(`PARENT_KEY_FILE=${keyFile}`));
+    assert.match(r.stdout, /^PARENT_KEY=UNSET$/m);
+    assert.doesNotMatch(fs.readFileSync(finishJson, "utf8"), new RegExp(keyBody));
+    const stray = fs
+      .readdirSync(dir, { recursive: true, encoding: "utf8" })
+      .filter(
+        (rel) =>
+          rel !== "key.file" &&
+          !rel.startsWith("attest-record/") &&
+          !rel.startsWith("ensure-record/"),
+      )
+      .map((rel) => path.join(dir, rel))
+      .filter((p) => fs.statSync(p).isFile())
+      .filter((p) => fs.readFileSync(p, "utf8").includes(keyBody));
+    assert.deepEqual(stray, [], "ensure-tag must not persist the key body to finish JSON or ship files");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("ensure-tag inherits KEY and unsets KEY_FILE (#1174)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-ensure-tag-inherit-"));
+  try {
+    const keyFile = path.join(dir, "key.file");
+    fs.writeFileSync(keyFile, "file-body-must-not-win\n");
+    const r = spawnEnsureTagHelper({
+      dir,
+      env: {
+        PIPELINE_FRG_ATTESTATION_KEY: "inline-key",
+        PIPELINE_FRG_ATTESTATION_KEY_FILE: keyFile,
+      },
+    });
+    assert.equal(r.status, 0, `ensure-tag helper exited ${r.status}: ${r.stderr}`);
+    const childEnv = fs.readFileSync(r.envPath, "utf8");
+    assert.match(childEnv, /^KEY=inline-key$/m);
+    assert.match(childEnv, /^KEY_FILE_UNSET$/m);
+    assert.doesNotMatch(childEnv, /file-body-must-not-win/);
+    assert.match(r.stdout, /^PARENT_KEY=inline-key$/m);
+    assert.match(r.stdout, new RegExp(`PARENT_KEY_FILE=${keyFile}`));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("ensure-tag fails closed without producer credential (#1174)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-ensure-tag-miss-"));
+  try {
+    const r = spawnEnsureTagHelper({ dir, env: {} });
+    assert.notEqual(r.status, 0, "missing credential must fail closed");
+    assert.match(`${r.stdout}\n${r.stderr}`, /missing_attestor_credential/);
+    assertEnsureTagDidNotSpawn(r.argvPath, r.envPath);
+    assert.doesNotMatch(`${r.stdout}\n${r.stderr}`, /--skip-frg/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("ensure-tag fails closed on empty KEY_FILE env (#1174)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-ensure-tag-empty-env-"));
+  try {
+    const r = spawnEnsureTagHelper({
+      dir,
+      env: { PIPELINE_FRG_ATTESTATION_KEY_FILE: "" },
+    });
+    assert.notEqual(r.status, 0, "empty KEY_FILE env must fail closed");
+    assert.match(`${r.stdout}\n${r.stderr}`, /missing_attestor_credential/);
+    assertEnsureTagDidNotSpawn(r.argvPath, r.envPath);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("ensure-tag fails closed on unreadable KEY_FILE (#1174)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-ensure-tag-unreadable-"));
+  const keyFile = path.join(dir, "key.file");
+  try {
+    fs.writeFileSync(keyFile, "secret-must-not-be-read\n");
+    fs.chmodSync(keyFile, 0o000);
+    const r = spawnEnsureTagHelper({
+      dir,
+      env: { PIPELINE_FRG_ATTESTATION_KEY_FILE: keyFile },
+    });
+    assert.notEqual(r.status, 0, "unreadable KEY_FILE must fail closed");
+    assert.match(`${r.stdout}\n${r.stderr}`, /unreadable_attestor_key_file/);
+    assertEnsureTagDidNotSpawn(r.argvPath, r.envPath);
+    assert.doesNotMatch(`${r.stdout}\n${r.stderr}`, /secret-must-not-be-read/);
+  } finally {
+    try {
+      fs.chmodSync(keyFile, 0o644);
+    } catch {
+      // best-effort restore so rmSync can delete
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("ensure-tag fails closed on empty KEY_FILE (#1174)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-ensure-tag-empty-file-"));
+  try {
+    const keyFile = path.join(dir, "key.file");
+    fs.writeFileSync(keyFile, "");
+    const r = spawnEnsureTagHelper({
+      dir,
+      env: { PIPELINE_FRG_ATTESTATION_KEY_FILE: keyFile },
+    });
+    assert.notEqual(r.status, 0, "empty KEY_FILE must fail closed");
+    assert.match(`${r.stdout}\n${r.stderr}`, /missing_attestor_credential/);
+    assertEnsureTagDidNotSpawn(r.argvPath, r.envPath);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("tugboat after train re-execs candidate tugboat.sh and skip-train omits train (#1164)", () => {
