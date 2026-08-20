@@ -2059,31 +2059,75 @@ test("validateFrgEvidenceFileForTag: release-eligible pass does not emit fail-cl
   assert.equal(ok.version, "1.30.0");
 });
 
+test("HMAC rejects factory_release_binding overlay after sign (#1149)", () => {
+  const shaA = "a".repeat(40);
+  const shaB = "b".repeat(40);
+  const signed = computeFrgEvidence({
+    ...fullPackPassInput({ version: "1.30.0", run_id: "frg-binding-mac" }),
+    factory_release_binding: { candidate_git_sha: shaA },
+  });
+  assert.equal(signed.pass, true);
+  assert.equal(verifyFrgAttestation(signed, FRG_UNIT_TEST_ATTESTATION_KEY), true);
+
+  const overlaid = {
+    ...signed,
+    factory_release_binding: { candidate_git_sha: shaB },
+  };
+  assert.equal(
+    verifyFrgAttestation(overlaid, FRG_UNIT_TEST_ATTESTATION_KEY),
+    false,
+    "unsigned factory_release_binding overlay must fail HMAC",
+  );
+  assert.throws(
+    () =>
+      validateReleaseEligibleFrgEvidence(overlaid, "1.30.0", {
+        attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
+      }),
+    /attestation MAC|forged|does not match/i,
+  );
+
+  const addedAfterMint = computeFrgEvidence(
+    fullPackPassInput({ version: "1.30.0", run_id: "frg-binding-overlay" }),
+  );
+  assert.equal(addedAfterMint.pass, true);
+  assert.equal(verifyFrgAttestation(addedAfterMint, FRG_UNIT_TEST_ATTESTATION_KEY), true);
+  const retarget = {
+    ...addedAfterMint,
+    factory_release_binding: { candidate_git_sha: shaB },
+  };
+  assert.equal(verifyFrgAttestation(retarget, FRG_UNIT_TEST_ATTESTATION_KEY), false);
+  assert.throws(
+    () =>
+      validateReleaseEligibleFrgEvidence(retarget, "1.30.0", {
+        attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
+      }),
+    /attestation MAC|forged|does not match/i,
+  );
+});
+
 test("validateFrgEvidenceSnapshotForTag returns HMAC SHA from the same file read (#1149)", async () => {
   const fs = memFs();
   const shaA = "a".repeat(40);
   const shaB = "b".repeat(40);
-  const good = computeFrgEvidence(fullPackPassInput({ version: "1.30.0", run_id: "frg-snapshot" }));
-  assert.equal(good.pass, true);
-  await writeFrgEvidence("/repo", good, fs);
-  const latestPath = frgLatestPath("/repo", "1.30.0");
-  const original = JSON.parse(await fs.readFile(latestPath)) as Record<string, unknown>;
-  const snapshotA = {
-    ...original,
+  const signedA = computeFrgEvidence({
+    ...fullPackPassInput({ version: "1.30.0", run_id: "frg-snapshot" }),
     factory_release_binding: { candidate_git_sha: shaA },
-  };
-  const snapshotB = {
-    ...original,
+  });
+  const signedB = computeFrgEvidence({
+    ...fullPackPassInput({ version: "1.30.0", run_id: "frg-snapshot-b" }),
     factory_release_binding: { candidate_git_sha: shaB },
-  };
+  });
+  assert.equal(signedA.pass, true);
+  await writeFrgEvidence("/repo", signedA, fs);
+  const latestPath = frgLatestPath("/repo", "1.30.0");
   let reads = 0;
   const mutating: FrgFsDeps = {
     ...fs,
     async readFile(p) {
       if (p !== latestPath) return fs.readFile(p);
       reads++;
-      if (reads === 1) return JSON.stringify(snapshotA);
-      return JSON.stringify(snapshotB);
+      if (reads === 1) return JSON.stringify(signedA);
+      return JSON.stringify(signedB);
     },
   };
   const { evidence, snapshot } = await validateFrgEvidenceSnapshotForTag(

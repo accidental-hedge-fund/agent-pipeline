@@ -7,6 +7,7 @@
 - [x] 1.5 Existing-tag success only when annotated and peeled commit equals the merge. Lightweight or wrong-target tag fail-closes. Never force-update or delete
 - [x] 1.6 On concurrent push failure, re-observe origin `refs/tags/vX.Y.Z` and succeed only if it is the correct annotated tag on the merge commit
 - [x] 1.7 Bind `--packed-candidate` to HMAC SHA from the same validated latest.json snapshot. Do not reopen the file after validation
+- [x] 1.9 Include `factory_release_binding` in the FRG HMAC canonical payload when present. Reject unauthenticated overlays. Do not fall back from a present but invalid binding. Regression: mutating `factory_release_binding` after signing prevents tag create
 - [x] 1.8 A local annotated tag is not evidence of remote publication. Observe origin and push if missing. Wrong or lightweight remote tag still fail-closes
 
 ## 2. Tugboat compose

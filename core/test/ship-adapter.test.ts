@@ -32,7 +32,15 @@ import {
   type ShipStatus,
   type ShipTrainEvidence,
 } from "../scripts/stages/ship.ts";
-import type { FrgEvidence } from "../scripts/factory-reliability-gate.ts";
+import {
+  computeFrgEvidence,
+  FRG_PACK_MANIFEST,
+  FRG_UNIT_TEST_ATTESTATION_KEY,
+  frgRequiredCompositionOverrides,
+  frgRequiredObservationOverrides,
+  validateReleaseEligibleFrgEvidence,
+  type FrgEvidence,
+} from "../scripts/factory-reliability-gate.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -1859,6 +1867,68 @@ test("hmacPackedCandidateGitShaFromUnknown prefers factory_release_binding (#114
     unrelatedOid,
   );
   assert.equal(hmacPackedCandidateGitShaFromUnknown({}), null);
+});
+
+test("hmacPackedCandidateGitShaFromUnknown does not fall back from a present invalid binding (#1149)", () => {
+  assert.equal(
+    hmacPackedCandidateGitShaFromUnknown({
+      factory_release_binding: { candidate_git_sha: "not-a-sha" },
+      pack_provenance: { candidate_git_sha: head },
+    }),
+    null,
+  );
+  assert.equal(
+    hmacPackedCandidateGitShaFromUnknown({
+      factory_release_binding: {},
+      pack_provenance: { candidate_git_sha: head },
+    }),
+    null,
+  );
+  assert.equal(
+    hmacPackedCandidateGitShaFromUnknown({
+      factory_release_binding: { candidate_git_sha: head },
+      notes: [`factory_release_binding:${JSON.stringify({ candidate_git_sha: unrelatedOid })}`],
+      pack_provenance: { candidate_git_sha: unrelatedOid },
+    }),
+    head,
+  );
+});
+
+test("ensure-tag does not tag when factory_release_binding is overlaid after HMAC sign (#1149)", async () => {
+  const version = "1.30.0";
+  const signed = computeFrgEvidence({
+    version,
+    run_id: "frg-overlay-tag",
+    loop_run_id: "loop-overlay-tag",
+    pack_id: FRG_PACK_MANIFEST.pack_id,
+    items: [
+      { item_id: "1", state: "ready", ready_clean: true },
+      { item_id: "2", state: "ready", ready_clean: true },
+    ],
+    scenario_overrides: frgRequiredObservationOverrides("pass"),
+    composition_overrides: frgRequiredCompositionOverrides("pass"),
+    attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
+  });
+  assert.equal(signed.pass, true);
+  const overlaid = {
+    ...signed,
+    factory_release_binding: { candidate_git_sha: head },
+  };
+  const calls: string[][] = [];
+  await assert.rejects(
+    ensureAnnotatedReleaseTag({
+      version,
+      mergeCommitOid: mergeHead,
+      packedCandidate: head,
+      git: missingTagGit(calls),
+      validateFrg: async () =>
+        validateReleaseEligibleFrgEvidence(overlaid, version, {
+          attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
+        }),
+    }),
+    /attestation MAC|forged|does not match/i,
+  );
+  assert.ok(!calls.some((args) => args[0] === "tag" || args[0] === "push"));
 });
 
 test("runEnsureAnnotatedReleaseTagCli fails closed without --packed-candidate (#1149)", async () => {

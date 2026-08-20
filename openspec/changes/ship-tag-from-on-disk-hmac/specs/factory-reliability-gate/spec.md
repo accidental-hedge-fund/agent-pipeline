@@ -59,7 +59,11 @@ SHALL NOT use this validator to fail the job when FRG is gitignored and the tree
 file is absent. Callers SHALL NOT invent a second tag eligibility checker.
 The validator SHALL return the parsed HMAC-validated snapshot from that same
 file read so `release ensure-tag` can bind `--packed-candidate` without
-reopening `latest.json`.
+reopening `latest.json`. HMAC `candidate_git_sha` SHALL be an attested field:
+the canonical attestation payload SHALL include `factory_release_binding` when
+that field is present on the snapshot. An unauthenticated top-level
+`factory_release_binding` overlay SHALL fail HMAC verification. The validator
+SHALL NOT fall back from a present but invalid binding to another carrier.
 
 #### Scenario: Missing latest.json names path and remediation
 
@@ -90,6 +94,14 @@ reopening `latest.json`.
 - **AND** HMAC validation succeeds
 - **THEN** it SHALL return the parsed snapshot from that same read
 - **AND** a later replacement of the on-disk file SHALL NOT change the returned snapshot
+
+#### Scenario: Unauthenticated factory_release_binding overlay fails HMAC
+
+- **WHEN** `.agent-pipeline/frg/1.39.0/latest.json` is HMAC-valid for packed candidate `A`
+- **AND** a writer adds or changes `factory_release_binding.candidate_git_sha` to `B` after signing
+- **THEN** tag-path validation SHALL fail closed
+- **AND** SHALL NOT treat `B` as HMAC `candidate_git_sha`
+- **AND** SHALL NOT fall back to `pack_provenance.candidate_git_sha`
 
 ### Requirement: FRG runtime files SHALL NOT dirty the factory control checkout
 

@@ -377,6 +377,11 @@ export interface FrgEvidence {
   /** Structured fresh-pack and candidate-probe provenance. */
   pack_provenance: FrgPackProvenance | null;
   /**
+   * Optional ship-identity binding. When present it is an HMAC-attested
+   * field: unsigned overlays after mint fail `verifyFrgAttestation`.
+   */
+  factory_release_binding?: unknown;
+  /**
    * Runner-stamped score path. Required `from-run` for honest post-1.33
    * pass. Absent / `unknown` / `observations` reject.
    */
@@ -583,6 +588,7 @@ export function buildFrgAttestationPayload(input: {
   composition_fingerprint: string;
   pack_provenance: FrgPackProvenance | null;
   pack_provenance_fingerprint?: string;
+  factory_release_binding?: unknown;
 }): Record<string, unknown> {
   const payload: Record<string, unknown> = {
     producer: "pipeline-factory-gate",
@@ -606,6 +612,11 @@ export function buildFrgAttestationPayload(input: {
   if (input.pack_provenance) {
     payload.pack_provenance = input.pack_provenance;
     payload.pack_provenance_fingerprint = input.pack_provenance_fingerprint ?? null;
+  }
+  // Include only when present so artifacts minted without this field keep
+  // their MAC. A post-sign overlay is then a MAC mismatch, not a retarget.
+  if (input.factory_release_binding !== undefined) {
+    payload.factory_release_binding = input.factory_release_binding;
   }
   return payload;
 }
@@ -649,6 +660,7 @@ export interface FrgAttestationSignInput {
   composition: FrgComposition;
   recovery_aggregates?: FrgRecoveryAggregates | null;
   pack_provenance?: FrgPackProvenance | null;
+  factory_release_binding?: unknown;
   attestationKey: string;
 }
 
@@ -669,6 +681,7 @@ export function signFrgIntegrity(input: FrgAttestationSignInput): FrgIntegrity {
     composition_fingerprint: input.integrity.composition_fingerprint,
     pack_provenance: input.pack_provenance ?? null,
     pack_provenance_fingerprint: input.integrity.pack_provenance_fingerprint,
+    factory_release_binding: input.factory_release_binding,
   });
   return {
     ...input.integrity,
@@ -710,6 +723,7 @@ export function verifyFrgAttestation(
     composition: FrgComposition;
     recovery_aggregates?: FrgRecoveryAggregates | null;
     pack_provenance?: FrgPackProvenance | null;
+    factory_release_binding?: unknown;
     integrity: FrgIntegrity;
   },
   attestationKey: string,
@@ -742,6 +756,7 @@ export function verifyFrgAttestation(
     composition_fingerprint: evidence.integrity.composition_fingerprint,
     pack_provenance: evidence.pack_provenance ?? null,
     pack_provenance_fingerprint: evidence.integrity.pack_provenance_fingerprint,
+    factory_release_binding: evidence.factory_release_binding,
   });
   const expected = computeFrgAttestationMac(payload, attestationKey);
   return timingSafeEqualHex(expected, att.mac);
@@ -2330,6 +2345,9 @@ export function parseFrgEvidence(raw: unknown): FrgEvidence {
   if (recovery_aggregates) evidence.recovery_aggregates = recovery_aggregates;
   if (scoreSource !== undefined) evidence.score_source = scoreSource;
   if (workList !== undefined) evidence.work_list = workList;
+  if (Object.prototype.hasOwnProperty.call(o, "factory_release_binding")) {
+    evidence.factory_release_binding = o.factory_release_binding;
+  }
   return evidence;
 }
 
@@ -3294,6 +3312,8 @@ export interface ComputeFrgInput {
   recovery_aggregates?: FrgRecoveryAggregates;
   /** Candidate/run/manifest proof block from the closed pack runner. */
   pack_provenance?: FrgPackProvenance | null;
+  /** Optional HMAC-attested ship-identity binding (tag-path candidate SHA). */
+  factory_release_binding?: unknown;
   notes?: string[];
   now?: () => Date;
   /**
@@ -3524,6 +3544,7 @@ export function computeFrgEvidence(input: ComputeFrgInput): FrgEvidence {
       composition,
       recovery_aggregates: input.recovery_aggregates ?? null,
       pack_provenance: packProvenance,
+      factory_release_binding: input.factory_release_binding,
       attestationKey: attestationKey!,
     });
   }
@@ -3554,6 +3575,9 @@ export function computeFrgEvidence(input: ComputeFrgInput): FrgEvidence {
     integrity,
     pack_provenance: packProvenance,
   };
+  if (input.factory_release_binding !== undefined) {
+    evidence.factory_release_binding = input.factory_release_binding;
+  }
   if (input.recovery_aggregates) {
     evidence.recovery_aggregates = input.recovery_aggregates;
   }

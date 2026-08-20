@@ -215,24 +215,15 @@ function candidateShaFromRecord(raw: unknown): string | null {
 
 /**
  * HMAC recorded packed-candidate SHA from on-disk latest.json.
- * Prefer factory_release_binding.candidate_git_sha; else pack_provenance.
+ * Prefer factory_release_binding.candidate_git_sha when that field is present
+ * (HMAC-attested; do not fall back if the present binding is invalid).
+ * Else pack_provenance.candidate_git_sha.
  */
 export function hmacPackedCandidateGitShaFromUnknown(raw: unknown): string | null {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
   const rec = raw as Record<string, unknown>;
-  const fromBinding = candidateShaFromRecord(rec.factory_release_binding);
-  if (fromBinding) return fromBinding;
-  if (Array.isArray(rec.notes)) {
-    for (const note of rec.notes) {
-      if (typeof note !== "string" || !note.startsWith("factory_release_binding:")) continue;
-      try {
-        const parsed: unknown = JSON.parse(note.slice("factory_release_binding:".length));
-        const sha = candidateShaFromRecord(parsed);
-        if (sha) return sha;
-      } catch {
-        // malformed note carrier is not a second validator
-      }
-    }
+  if (Object.prototype.hasOwnProperty.call(rec, "factory_release_binding")) {
+    return candidateShaFromRecord(rec.factory_release_binding);
   }
   return candidateShaFromRecord(rec.pack_provenance);
 }
