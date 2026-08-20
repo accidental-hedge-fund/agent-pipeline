@@ -162,13 +162,25 @@ test("ship-end leaf argv never re-enters ship or train", () => {
   const tag = shipEndLeafArgv("ensure-tag", {
     version: "1.39.5",
     mergeCommitOid: SHA,
+    packedCandidate: OTHER,
   });
-  assert.deepEqual(tag, ["release", "ensure-tag", "1.39.5", SHA]);
+  assert.deepEqual(tag, [
+    "release",
+    "ensure-tag",
+    "1.39.5",
+    SHA,
+    "--packed-candidate",
+    OTHER,
+  ]);
   assert.doesNotMatch(tag.join(" "), /\bship\b|\btrain\b/);
   assertShipEndLeafArgv(tag);
   assert.throws(
-    () => shipEndLeafArgv("ensure-tag", { version: "1.39.5", mergeCommitOid: SHA.slice(0, 12) }),
+    () => shipEndLeafArgv("ensure-tag", { version: "1.39.5", mergeCommitOid: SHA.slice(0, 12), packedCandidate: OTHER }),
     /40-hex/,
+  );
+  assert.throws(
+    () => shipEndLeafArgv("ensure-tag", { version: "1.39.5", mergeCommitOid: SHA }),
+    /packed-candidate/,
   );
 
   assert.throws(

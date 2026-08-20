@@ -105,8 +105,10 @@ Read the Pipeline ship ledger. Do not treat Tugboat `ship-vX.Y.Z/state.json`
 as the product status surface.
 
 Default sequence is train `--merge` → FRG pack → release (no `--skip-frg`) →
-wait CI green → `release finish` → wait GitHub Release → `engine-promote`.
-`--skip-frg` is an operator escape with a logged reason, not the default.
+wait CI green → `release finish` → `release ensure-tag` → wait GitHub Release →
+`engine-promote`. `--skip-frg` is an operator escape with a logged reason, not
+the default. Finish does not tag. Candidate `release ensure-tag` owns `vX.Y.Z`
+from on-disk HMAC `latest.json` when FRG is gitignored.
 
 FRG pack unsets `PIPELINE_FRG_ATTESTATION_KEY` and
 `PIPELINE_FRG_ATTESTATION_KEY_FILE` in the `factory-release prepare` child.
@@ -126,8 +128,11 @@ If `pipeline ship status` reports human authority, stop and report that state.
 # Prepare only (opens PR; never merges)
 "$PIPELINE" release <X.Y.Z> --no-edit
 
-# Finish: merge the open release PR (never tags — GitHub workflows tag)
+# Finish: merge the open release PR (never tags)
 "$PIPELINE" release finish <pr> --json
+
+# Ship-end tag from on-disk HMAC latest.json (candidate engine)
+"$PIPELINE" release ensure-tag <X.Y.Z> <mergeCommitOid> --packed-candidate <40-hex>
 
 # After the published GitHub Release exists: pin + install (all hosts default)
 cd "$REPO_DIR"

@@ -4,8 +4,8 @@
 # Ship = compose existing Pipeline CLI verbs + wait + notify. Nothing more.
 #   train --milestone --merge  →  FRG pack (uncredentialed prepare +
 #   factory-gate --from-run attestor)  →  release
-#   →  wait CI green  →  release finish  →  wait GitHub Release  →
-#   engine-promote --host all
+#   →  wait CI green  →  release finish  →  release ensure-tag  →
+#   wait GitHub Release  →  engine-promote --host all
 # Default release / promote argv omit --skip-frg. Skip is an operator escape
 # with a logged reason (--skip-frg / TUGBOAT_SKIP_FRG + reason).
 #
@@ -32,9 +32,10 @@
 #                          An operator-set value is left unchanged.
 #   PIPELINE               production-pin launcher (default: pipeline).
 #                          Train --merge and engine-promote use this binary.
-#                          After train-complete, FRG pack / release / finish
-#                          use the candidate engine (SHIP_END_CLI), not this
-#                          pin, when the pin SHA differs from the FRG-bound SHA.
+#                          After train-complete, FRG pack / release / finish /
+#                          ensure-tag use the candidate engine (SHIP_END_CLI),
+#                          not this pin, when the pin SHA differs from the
+#                          FRG-bound SHA. Tugboat does not shell git tag.
 #   PIPELINE_CANDIDATE_ENGINE_ROOT
 #                          optional absolute candidate checkout (HEAD must
 #                          equal the FRG-bound SHA, porcelain empty, and
@@ -738,6 +739,44 @@ print(sha)
 PY
 }
 
+# 40-hex mergeCommitOid from pipeline release finish JSON (#1149).
+read_merge_commit_oid_from_finish_json() {
+  python3 - "$1" <<'PY'
+import json, re, sys
+path = sys.argv[1]
+try:
+    d = json.load(open(path, encoding="utf-8"))
+except Exception:
+    sys.stderr.write("FAIL: release finish JSON is missing or not JSON\n")
+    raise SystemExit(1)
+if not isinstance(d, dict):
+    sys.stderr.write("FAIL: release finish JSON is not an object\n")
+    raise SystemExit(1)
+oid = d.get("mergeCommitOid")
+if not isinstance(oid, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", oid):
+    sys.stderr.write("FAIL: mergeCommitOid is missing or is not an exact 40-hex OID\n")
+    raise SystemExit(1)
+print(oid.lower())
+PY
+}
+
+# Candidate-engine tag create from on-disk HMAC latest.json. Never git tag.
+invoke_release_ensure_tag() {
+  local version=$1
+  local finish_json=$2
+  local merge_oid
+  if [[ ${#SHIP_END_CLI[@]} -eq 0 ]]; then
+    echo "missing_ship_end_cli" >&2
+    return 1
+  fi
+  if ! is_exact_git_sha "$SHIP_END_CANDIDATE_SHA"; then
+    echo "FAIL: SHIP_END_CANDIDATE_SHA is not an exact 40-hex SHA" >&2
+    return 1
+  fi
+  merge_oid=$(read_merge_commit_oid_from_finish_json "$finish_json") || return 1
+  "${SHIP_END_CLI[@]}" release ensure-tag "$version" "$merge_oid" --packed-candidate "$SHIP_END_CANDIDATE_SHA"
+}
+
 # After train-complete: bind SHIP_END_CLI to the candidate engine. Fail closed
 # (no production-pin fallback) when identity cannot be resolved (#1151).
 resolve_ship_end_cli() {
@@ -1160,6 +1199,7 @@ print((d.get("reason") or "")[:400])
       fi
       f="$RUN_DIR/release-finish.err"
       ;;
+    ensure-tag) f="$RUN_DIR/ensure-tag.err" ;;
     wait-release) f="$RUN_DIR/gh-release.err" ;;
     engine-promote) f="$RUN_DIR/engine-promote.err" ;;
     *) f="$RUN_DIR/$phase.err" ;;
@@ -2314,6 +2354,22 @@ ship_one() {
   fi
   write_state "release-finish" "ok" "pr=$pr"
   log "phase release-finish: ok"
+
+  # ----- C2: ensure annotated tag from on-disk HMAC (#1149) -----------------
+  write_state "ensure-tag" "running" "pipeline release ensure-tag $version"
+  log "phase ensure-tag: start"
+  set +e
+  invoke_release_ensure_tag "$version" "$RUN_DIR/release-finish.json" >"$RUN_DIR/ensure-tag.out" 2>"$RUN_DIR/ensure-tag.err"
+  tag_ec=$?
+  set -e
+  cat "$RUN_DIR/ensure-tag.err" >>"$LOG_FILE" 2>/dev/null || true
+  if [[ "$tag_ec" -ne 0 ]]; then
+    write_state "ensure-tag" "failed" "exit $tag_ec"
+    log "FAIL: release ensure-tag exit $tag_ec"
+    exit "$tag_ec"
+  fi
+  write_state "ensure-tag" "ok" "v$version"
+  log "phase ensure-tag: ok"
 
   # ----- D: wait for GitHub Release -----------------------------------------
   write_state "wait-release" "running" "gh release view v$version"

@@ -2,8 +2,9 @@
 
 **Primary path:** `pipeline ship --milestone vX.Y.Z`. That command is the
 in-engine ship product. It composes existing verbs: `train --merge` →
-(semver) `release` → wait checks → `release finish` → wait GitHub Release →
-`engine-promote`. It does not invent a second merge policy or grant schema.
+(semver) `release` → wait checks → `release finish` →
+`release ensure-tag` → wait GitHub Release → `engine-promote`. It does not
+invent a second merge policy or grant schema.
 
 Phrase: **`Ship milestone vX.Y.Z`** → `pipeline ship --milestone vX.Y.Z`
 (detach if the CLI is blocking).  
@@ -145,8 +146,9 @@ Issues on the milestone must be `pipeline:ready` before train dispatch.
 3. `pipeline release X.Y.Z --no-edit` (**bare** version — leading `v` is invalid; **no** `--skip-frg`)
 4. Wait until open release PR checks are green (`gh pr checks --json name,state,bucket,link`). A first flake-eligible `test` fail requests `gh run rerun --failed` once, then waits again. Non-test product fails STOP. After merge, refresh installed Tugboat and `release-checks-green.py` from `examples/supervisor/shell/`.
 5. `pipeline release finish <pr>`
-6. Wait until GitHub Release `vX.Y.Z` is published (non-draft)
-7. `pipeline engine-promote --for X.Y.Z --host all` (or `ENGINE_PROMOTE_HOST` override; **no** `--skip-frg`)
+6. `pipeline release ensure-tag <X.Y.Z> <mergeCommitOid> --packed-candidate <integrated_candidate.git_sha>` (candidate engine; on-disk HMAC `latest.json`)
+7. Wait until GitHub Release `vX.Y.Z` is published (non-draft)
+8. `pipeline engine-promote --for X.Y.Z --host all` (or `ENGINE_PROMOTE_HOST` override; **no** `--skip-frg`)
 
 Hardened behaviors (preserve):
 
@@ -161,11 +163,15 @@ Hardened behaviors (preserve):
 ## FRG pack is part of thin ship
 
 Default Tugboat sequence is train → FRG pack → release (no `--skip-frg`) →
-finish → promote. **Train and engine-promote use the production-pin CLI**
-(`$PIPELINE`). **After train-complete, FRG pack, `pipeline release`, and
-`release finish` use the candidate engine** at the FRG-bound SHA (`SHIP_END_CLI`
-= `node "$ENGINE_ROOT/scripts/pipeline-launcher.mjs"`). Tugboat does not invoke
-`git tag` or `gh release create`. The pack phase composes
+finish → `release ensure-tag` → publication wait → promote. **Train and
+engine-promote use the production-pin CLI** (`$PIPELINE`). **After
+train-complete, FRG pack, `pipeline release`, `release finish`, and
+`release ensure-tag` use the candidate engine** at the FRG-bound SHA
+(`SHIP_END_CLI` = `node "$ENGINE_ROOT/scripts/pipeline-launcher.mjs"`).
+Tugboat does not invoke `git tag` or `gh release create`. Tag create is
+candidate `pipeline release ensure-tag` from on-disk HMAC `latest.json`.
+`.agent-pipeline/frg/` is gitignored, so auto-tag must not stall the ship for
+a missing tree file. `release finish` still does not tag. The pack phase composes
 `pipeline factory-release prepare --request <abs.json> --json` in a child that
 has `PIPELINE_FRG_ATTESTATION_KEY` and `PIPELINE_FRG_ATTESTATION_KEY_FILE`
 **unset** (the parent supervisor env may keep the credential). When prepare
@@ -202,7 +208,7 @@ requires a real FRG `run_id` and evidence path.
 Documented **alternate** launcher for hosts that still install it. It execs
 `$REPO_DIR/examples/supervisor/shell/tugboat.sh` and must not retain a second
 ship-end compose. **Not** the product owner. After that exec, Tugboat uses the
-candidate engine for FRG / release / finish. A selected stale full playbook
+candidate engine for FRG / release / finish / ensure-tag. A selected stale full playbook
 fails doctor `supervisor:ship-end-candidate-engine`.
 
 ```bash

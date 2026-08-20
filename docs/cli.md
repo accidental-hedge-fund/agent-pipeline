@@ -73,8 +73,8 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 
 #### `release`
 
-- **Usage:** `pipeline release <version> [--theme "..."] [--dry-run|--json] [--no-edit] [--skip-frg] | release finish <pr> [--json]`
-- **Summary:** Prepare a release PR from the matching GitHub milestone plan (or finish-merge one); never tags or publishes (workflows do; auto-tag also refreshes tag-derived CHANGELOG); --dry-run reports milestone presence/open issues
+- **Usage:** `pipeline release <version> [--theme "..."] [--dry-run|--json] [--no-edit] [--skip-frg] | release finish <pr> [--json] | release ensure-tag <X.Y.Z> <merge-oid> --packed-candidate <sha>`
+- **Summary:** Prepare a release PR from the matching GitHub milestone plan (or finish-merge one); finish never tags; ship-end ensure-tag creates vX.Y.Z from on-disk HMAC latest.json when FRG is gitignored; --dry-run reports milestone presence/open issues
 
 #### `remove-worktree`
 

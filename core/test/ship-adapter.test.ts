@@ -13,6 +13,7 @@ import {
   classifyBoundPackLoopLiveness,
   classifyFrgPackWaitDecision,
   ensureAnnotatedReleaseTag,
+  hmacPackedCandidateGitShaFromUnknown,
   persistShipFactoryReleaseRequest,
   persistedShipFactoryReleaseRequestPath,
   probeBoundPackLoopLive,
@@ -31,7 +32,15 @@ import {
   type ShipStatus,
   type ShipTrainEvidence,
 } from "../scripts/stages/ship.ts";
-import type { FrgEvidence } from "../scripts/factory-reliability-gate.ts";
+import {
+  computeFrgEvidence,
+  FRG_PACK_MANIFEST,
+  FRG_UNIT_TEST_ATTESTATION_KEY,
+  frgRequiredCompositionOverrides,
+  frgRequiredObservationOverrides,
+  validateReleaseEligibleFrgEvidence,
+  type FrgEvidence,
+} from "../scripts/factory-reliability-gate.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -39,6 +48,11 @@ const head = "a".repeat(40);
 const releaseHead = "b".repeat(40);
 const mergeHead = "c".repeat(40);
 const unrelatedOid = "e".repeat(40);
+
+function hmacSnapshot(sha: string | null): unknown {
+  if (!sha) return {};
+  return { factory_release_binding: { candidate_git_sha: sha } };
+}
 
 const intent: ShipIntent = {
   repository: "accidental-hedge-fund/agent-pipeline",
@@ -286,26 +300,35 @@ test("ensureAnnotatedReleaseTag creates and pushes when FRG is eligible and tag 
   const calls: string[][] = [];
   const git = async (args: string[]) => {
     calls.push(args);
+    if (args[0] === "rev-parse" && args.includes("--verify")) return mergeHead;
     if (args[0] === "cat-file") throw new Error("not a valid object");
+    if (args[0] === "fetch") throw new Error("couldn't find remote ref");
     return "";
   };
   let validated = 0;
   const result = await ensureAnnotatedReleaseTag({
     version: "1.34.0",
     mergeCommitOid: mergeHead,
+    packedCandidate: head,
     git,
     validateFrg: async () => {
       validated++;
+      return hmacSnapshot(head);
     },
   });
   assert.equal(result, "created");
   assert.equal(validated, 1);
-  assert.ok(calls.some((args) => args[0] === "tag" && args[1] === "-a" && args[2] === "v1.34.0"));
+  assert.ok(calls.some((args) => args[0] === "tag" && args[1] === "-a" && args[2] === "v1.34.0" && args[3] === mergeHead));
   assert.ok(calls.some((args) => args[0] === "push" && args.includes("refs/tags/v1.34.0")));
+  assert.ok(!calls.some((args) => args.includes("-f") || args.includes("--force")));
 });
 
-test("ensureAnnotatedReleaseTag is a no-op when the annotated tag already points at the merge (#1115)", async () => {
+test("ensureAnnotatedReleaseTag is a no-op when origin already has the annotated tag (#1115)", async () => {
+  const calls: string[][] = [];
   const git = async (args: string[]) => {
+    calls.push(args);
+    if (args[0] === "rev-parse" && args.includes("--verify")) return mergeHead;
+    if (args[0] === "fetch") return "";
     if (args[0] === "cat-file") return "tag";
     if (args[0] === "rev-parse") return mergeHead;
     throw new Error(`unexpected git ${args.join(" ")}`);
@@ -313,12 +336,15 @@ test("ensureAnnotatedReleaseTag is a no-op when the annotated tag already points
   const result = await ensureAnnotatedReleaseTag({
     version: "1.34.0",
     mergeCommitOid: mergeHead,
+    packedCandidate: head,
     git,
     validateFrg: async () => {
-      throw new Error("must not re-validate when tag exists");
+      throw new Error("must not re-validate when origin tag exists");
     },
   });
   assert.equal(result, "exists");
+  assert.ok(calls.some((args) => args[0] === "fetch"));
+  assert.ok(!calls.some((args) => args[0] === "push" || args[0] === "tag"));
 });
 
 test("ship adapter fails closed with the exact existing FRG next action", async () => {
@@ -1355,6 +1381,8 @@ test("default candidate tag path spawns release ensure-tag on the candidate laun
     "ensure-tag",
     intent.version,
     mergeHead,
+    "--packed-candidate",
+    head,
   ]);
 });
 
@@ -1388,19 +1416,26 @@ test("candidate ensure-tag leaf fails closed on non-zero spawn without pin-proce
 test("runEnsureAnnotatedReleaseTagCli tags via injected git, not ambient git", async () => {
   const gitCalls: string[][] = [];
   const result = await runEnsureAnnotatedReleaseTagCli(
-    { repoDir: "/repo", version: intent.version, mergeCommitOid: mergeHead },
+    {
+      repoDir: "/repo",
+      version: intent.version,
+      mergeCommitOid: mergeHead,
+      packedCandidate: head,
+    },
     {
       git: async (args) => {
         gitCalls.push(args);
+        if (args[0] === "rev-parse" && args.includes("--verify")) return mergeHead;
         if (args[0] === "cat-file") throw new Error("not a valid object");
+        if (args[0] === "fetch") throw new Error("couldn't find remote ref");
         return "";
       },
-      validateFrg: async () => {},
+      validateFrg: async () => hmacSnapshot(head),
       observeMergedReleasePr: async () => mergedReleasePr(),
     },
   );
   assert.equal(result, "created");
-  assert.ok(gitCalls.some((args) => args[0] === "tag" && args[1] === "-a" && args[2] === `v${intent.version}`));
+  assert.ok(gitCalls.some((args) => args[0] === "tag" && args[1] === "-a" && args[2] === `v${intent.version}` && args[3] === mergeHead));
   assert.ok(gitCalls.some((args) => args[0] === "push" && args.includes(`refs/tags/v${intent.version}`)));
 });
 
@@ -1409,11 +1444,18 @@ test("runEnsureAnnotatedReleaseTagCli rejects a valid OID that is not the merged
   let validated = 0;
   await assert.rejects(
     runEnsureAnnotatedReleaseTagCli(
-      { repoDir: "/repo", version: intent.version, mergeCommitOid: unrelatedOid },
+      {
+        repoDir: "/repo",
+        version: intent.version,
+        mergeCommitOid: unrelatedOid,
+        packedCandidate: head,
+      },
       {
         git: async (args) => {
           gitCalls.push(args);
+          if (args[0] === "rev-parse" && args.includes("--verify")) return unrelatedOid;
           if (args[0] === "cat-file") throw new Error("not a valid object");
+          if (args[0] === "fetch") throw new Error("couldn't find remote ref");
           if (args[0] === "tag" || args[0] === "push") {
             throw new Error(`must not ${args[0]} an unrelated OID`);
           }
@@ -1421,6 +1463,7 @@ test("runEnsureAnnotatedReleaseTagCli rejects a valid OID that is not the merged
         },
         validateFrg: async () => {
           validated++;
+          return hmacSnapshot(head);
         },
         observeMergedReleasePr: async () => mergedReleasePr(mergeHead),
       },
@@ -1451,7 +1494,12 @@ test("assertEnsureTagOidIsMergedRelease rejects an unrelated OID", () => {
 test("runEnsureAnnotatedReleaseTagCli fails closed without a repo directory", async () => {
   await assert.rejects(
     runEnsureAnnotatedReleaseTagCli(
-      { repoDir: "", version: intent.version, mergeCommitOid: mergeHead },
+      {
+        repoDir: "",
+        version: intent.version,
+        mergeCommitOid: mergeHead,
+        packedCandidate: head,
+      },
       {
         git: async () => {
           throw new Error("git must not run");
@@ -1459,6 +1507,446 @@ test("runEnsureAnnotatedReleaseTagCli fails closed without a repo directory", as
       },
     ),
     /cannot run without a repository directory/,
+  );
+});
+
+function missingTagGit(calls: string[][], peel = mergeHead) {
+  return async (args: string[]) => {
+    calls.push(args);
+    if (args[0] === "rev-parse" && args.includes("--verify")) return peel;
+    if (args[0] === "cat-file") throw new Error("not a valid object");
+    if (args[0] === "fetch") throw new Error("couldn't find remote ref");
+    if (args[0] === "tag" || args[0] === "push") return "";
+    return "";
+  };
+}
+
+test("ensure-tag tags the peeled merge when packed SHA differs from merge (#1149)", async () => {
+  const calls: string[][] = [];
+  const result = await ensureAnnotatedReleaseTag({
+    version: intent.version,
+    mergeCommitOid: mergeHead,
+    packedCandidate: head,
+    git: missingTagGit(calls),
+    validateFrg: async () => hmacSnapshot(head),
+  });
+  assert.equal(result, "created");
+  const tagCall = calls.find((args) => args[0] === "tag");
+  assert.deepEqual(tagCall?.slice(0, 4), ["tag", "-a", `v${intent.version}`, mergeHead]);
+  assert.notEqual(head, mergeHead);
+});
+
+test("ensure-tag fails closed on missing packed-candidate (#1149)", async () => {
+  const calls: string[][] = [];
+  await assert.rejects(
+    ensureAnnotatedReleaseTag({
+      version: intent.version,
+      mergeCommitOid: mergeHead,
+      packedCandidate: "",
+      git: missingTagGit(calls),
+      validateFrg: async () => hmacSnapshot(head),
+    }),
+    /packed candidate must be a 40-character git OID/,
+  );
+  assert.ok(!calls.some((args) => args[0] === "tag" || args[0] === "push"));
+});
+
+test("ensure-tag fails closed when HMAC candidate_git_sha is unbound (#1149)", async () => {
+  const calls: string[][] = [];
+  await assert.rejects(
+    ensureAnnotatedReleaseTag({
+      version: intent.version,
+      mergeCommitOid: mergeHead,
+      packedCandidate: head,
+      git: missingTagGit(calls),
+      validateFrg: async () => hmacSnapshot(unrelatedOid),
+    }),
+    /not this ship's packed candidate/,
+  );
+  assert.ok(!calls.some((args) => args[0] === "tag" || args[0] === "push"));
+});
+
+test("ensure-tag fails closed when on-disk FRG validation fails (#1149)", async () => {
+  const calls: string[][] = [];
+  await assert.rejects(
+    ensureAnnotatedReleaseTag({
+      version: intent.version,
+      mergeCommitOid: mergeHead,
+      packedCandidate: head,
+      git: missingTagGit(calls),
+      validateFrg: async () => {
+        throw new Error("FRG evidence is not release-eligible missing at .agent-pipeline/frg/1.34.0/latest.json");
+      },
+    }),
+    /missing at/,
+  );
+  assert.ok(!calls.some((args) => args[0] === "tag" || args[0] === "push"));
+});
+
+test("ensure-tag fails closed when HMAC candidate_git_sha is missing (#1149)", async () => {
+  const calls: string[][] = [];
+  await assert.rejects(
+    ensureAnnotatedReleaseTag({
+      version: intent.version,
+      mergeCommitOid: mergeHead,
+      packedCandidate: head,
+      git: missingTagGit(calls),
+      validateFrg: async () => hmacSnapshot(null),
+    }),
+    /no candidate_git_sha/,
+  );
+  assert.ok(!calls.some((args) => args[0] === "tag" || args[0] === "push"));
+});
+
+test("ensure-tag fails closed on lightweight existing tag and does not force (#1149)", async () => {
+  const calls: string[][] = [];
+  await assert.rejects(
+    ensureAnnotatedReleaseTag({
+      version: intent.version,
+      mergeCommitOid: mergeHead,
+      packedCandidate: head,
+      git: async (args) => {
+        calls.push(args);
+        if (args[0] === "rev-parse" && args.includes("--verify")) return mergeHead;
+        if (args[0] === "cat-file") return "commit";
+        throw new Error(`must not ${args.join(" ")}`);
+      },
+      validateFrg: async () => {
+        throw new Error("must not validate lightweight tag");
+      },
+    }),
+    /must be an annotated tag/,
+  );
+  assert.ok(!calls.some((args) => args[0] === "tag" || args[0] === "push" || args.includes("-f")));
+});
+
+test("ensure-tag fails closed on wrong-target existing tag and does not force (#1149)", async () => {
+  const calls: string[][] = [];
+  await assert.rejects(
+    ensureAnnotatedReleaseTag({
+      version: intent.version,
+      mergeCommitOid: mergeHead,
+      packedCandidate: head,
+      git: async (args) => {
+        calls.push(args);
+        if (args[0] === "rev-parse" && args.includes("--verify")) return mergeHead;
+        if (args[0] === "cat-file") return "tag";
+        if (args[0] === "rev-parse") return unrelatedOid;
+        throw new Error(`must not ${args.join(" ")}`);
+      },
+      validateFrg: async () => {
+        throw new Error("must not validate wrong existing tag");
+      },
+    }),
+    /does not point to the release merge commit/,
+  );
+  assert.ok(!calls.some((args) => args[0] === "tag" || args[0] === "push" || args.includes("--force")));
+});
+
+test("ensure-tag treats a correct origin tag as exists when the local ref is missing (#1149)", async () => {
+  const calls: string[][] = [];
+  let validated = 0;
+  const result = await ensureAnnotatedReleaseTag({
+    version: intent.version,
+    mergeCommitOid: mergeHead,
+    packedCandidate: head,
+    git: async (args) => {
+      calls.push(args);
+      if (args[0] === "rev-parse" && args.includes("--verify")) return mergeHead;
+      if (args[0] === "cat-file" && args[2] === `refs/tags/v${intent.version}`) {
+        throw new Error("not a valid object");
+      }
+      if (
+        args[0] === "fetch" &&
+        args.includes(`refs/tags/v${intent.version}:refs/tags/v${intent.version}-origin-observe`)
+      ) {
+        return "";
+      }
+      if (args[0] === "cat-file" && args[2] === `refs/tags/v${intent.version}-origin-observe`) {
+        return "tag";
+      }
+      if (args[0] === "rev-parse" && args[1] === `refs/tags/v${intent.version}-origin-observe^{}`) {
+        return mergeHead;
+      }
+      throw new Error(`unexpected git ${args.join(" ")}`);
+    },
+    validateFrg: async () => {
+      validated++;
+      throw new Error("must not require on-disk HMAC when origin already has the correct tag");
+    },
+  });
+  assert.equal(result, "exists");
+  assert.equal(validated, 0);
+  assert.ok(!calls.some((args) => args[0] === "tag" || args[0] === "push"));
+  assert.ok(!calls.some((args) => args.includes("-f") || args.includes("--force")));
+});
+
+test("ensure-tag fails closed on a wrong origin tag when the local ref is missing (#1149)", async () => {
+  const calls: string[][] = [];
+  await assert.rejects(
+    ensureAnnotatedReleaseTag({
+      version: intent.version,
+      mergeCommitOid: mergeHead,
+      packedCandidate: head,
+      git: async (args) => {
+        calls.push(args);
+        if (args[0] === "rev-parse" && args.includes("--verify")) return mergeHead;
+        if (args[0] === "cat-file" && args[2] === `refs/tags/v${intent.version}`) {
+          throw new Error("not a valid object");
+        }
+        if (args[0] === "fetch") return "";
+        if (args[0] === "cat-file") return "tag";
+        if (args[0] === "rev-parse") return unrelatedOid;
+        throw new Error(`must not ${args.join(" ")}`);
+      },
+      validateFrg: async () => {
+        throw new Error("must not validate FRG when origin tag is wrong");
+      },
+    }),
+    /does not point to the release merge commit/,
+  );
+  assert.ok(!calls.some((args) => args[0] === "tag" || args[0] === "push"));
+  assert.ok(!calls.some((args) => args.includes("-f") || args.includes("--force")));
+});
+
+test("ensure-tag concurrent push: correct remote tag is exists (#1149)", async () => {
+  const calls: string[][] = [];
+  const result = await ensureAnnotatedReleaseTag({
+    version: intent.version,
+    mergeCommitOid: mergeHead,
+    packedCandidate: head,
+    git: async (args) => {
+      calls.push(args);
+      if (args[0] === "rev-parse" && args.includes("--verify")) return mergeHead;
+      if (args[0] === "cat-file" && args[2] === `refs/tags/v${intent.version}`) {
+        throw new Error("not a valid object");
+      }
+      if (args[0] === "tag") return "";
+      if (args[0] === "push") throw new Error("rejected: already exists");
+      if (args[0] === "fetch") return "";
+      if (args[0] === "cat-file") return "tag";
+      if (args[0] === "rev-parse") return mergeHead;
+      return "";
+    },
+    validateFrg: async () => hmacSnapshot(head),
+  });
+  assert.equal(result, "exists");
+  assert.ok(calls.some((args) => args[0] === "fetch" && args.includes(`refs/tags/v${intent.version}:refs/tags/v${intent.version}-origin-observe`)));
+  assert.ok(!calls.some((args) => args.includes("-f") || args.includes("--force")));
+});
+
+test("ensure-tag concurrent push: wrong remote tag fails closed (#1149)", async () => {
+  const calls: string[][] = [];
+  await assert.rejects(
+    ensureAnnotatedReleaseTag({
+      version: intent.version,
+      mergeCommitOid: mergeHead,
+      packedCandidate: head,
+      git: async (args) => {
+        calls.push(args);
+        if (args[0] === "rev-parse" && args.includes("--verify")) return mergeHead;
+        if (args[0] === "cat-file" && args[2] === `refs/tags/v${intent.version}`) {
+          throw new Error("not a valid object");
+        }
+        if (args[0] === "tag") return "";
+        if (args[0] === "push") throw new Error("rejected: already exists");
+        if (args[0] === "fetch") return "";
+        if (args[0] === "cat-file") return "commit";
+        return "";
+      },
+      validateFrg: async () => hmacSnapshot(head),
+    }),
+    /must be an annotated tag/,
+  );
+  assert.ok(!calls.some((args) => args.includes("-f") || args.includes("--force")));
+});
+
+test("ensure-tag binds packed candidate to the HMAC-validated snapshot without a second latest.json read (#1149)", async () => {
+  const calls: string[][] = [];
+  let validateCalls = 0;
+  const result = await ensureAnnotatedReleaseTag({
+    version: intent.version,
+    mergeCommitOid: mergeHead,
+    packedCandidate: head,
+    git: missingTagGit(calls),
+    validateFrg: async () => {
+      validateCalls++;
+      return hmacSnapshot(head);
+    },
+  });
+  assert.equal(result, "created");
+  assert.equal(validateCalls, 1);
+  assert.ok(calls.some((args) => args[0] === "tag"));
+});
+
+test("ensure-tag retries push when local annotated tag exists but origin lacks it (#1149)", async () => {
+  const firstCalls: string[][] = [];
+  await assert.rejects(
+    ensureAnnotatedReleaseTag({
+      version: intent.version,
+      mergeCommitOid: mergeHead,
+      packedCandidate: head,
+      git: async (args) => {
+        firstCalls.push(args);
+        if (args[0] === "rev-parse" && args.includes("--verify")) return mergeHead;
+        if (args[0] === "cat-file") throw new Error("not a valid object");
+        if (args[0] === "tag") return "";
+        if (args[0] === "push") throw new Error("transient: failed to push");
+        if (args[0] === "fetch") throw new Error("couldn't find remote ref");
+        throw new Error(`unexpected git ${args.join(" ")}`);
+      },
+      validateFrg: async () => hmacSnapshot(head),
+    }),
+    /couldn't find remote ref/,
+  );
+  assert.ok(firstCalls.some((args) => args[0] === "tag"));
+  assert.ok(firstCalls.some((args) => args[0] === "push"));
+
+  const retryCalls: string[][] = [];
+  const result = await ensureAnnotatedReleaseTag({
+    version: intent.version,
+    mergeCommitOid: mergeHead,
+    packedCandidate: head,
+    git: async (args) => {
+      retryCalls.push(args);
+      if (args[0] === "rev-parse" && args.includes("--verify")) return mergeHead;
+      if (args[0] === "cat-file" && args[2] === `refs/tags/v${intent.version}`) return "tag";
+      if (args[0] === "rev-parse" && args[1] === `refs/tags/v${intent.version}^{}`) return mergeHead;
+      if (args[0] === "fetch") throw new Error("couldn't find remote ref");
+      if (args[0] === "push") return "";
+      throw new Error(`unexpected git ${args.join(" ")}`);
+    },
+    validateFrg: async () => {
+      throw new Error("must not re-validate HMAC when retrying an already-created local tag");
+    },
+  });
+  assert.equal(result, "created");
+  assert.ok(retryCalls.some((args) => args[0] === "push" && args.includes(`refs/tags/v${intent.version}`)));
+  assert.ok(!retryCalls.some((args) => args[0] === "tag"));
+  assert.ok(!retryCalls.some((args) => args.includes("-f") || args.includes("--force")));
+});
+
+test("ensure-tag fails closed when origin has a wrong tag even if local is correct (#1149)", async () => {
+  const calls: string[][] = [];
+  await assert.rejects(
+    ensureAnnotatedReleaseTag({
+      version: intent.version,
+      mergeCommitOid: mergeHead,
+      packedCandidate: head,
+      git: async (args) => {
+        calls.push(args);
+        if (args[0] === "rev-parse" && args.includes("--verify")) return mergeHead;
+        if (args[0] === "cat-file" && args[2] === `refs/tags/v${intent.version}`) return "tag";
+        if (args[0] === "rev-parse" && args[1] === `refs/tags/v${intent.version}^{}`) return mergeHead;
+        if (args[0] === "fetch") return "";
+        if (args[0] === "cat-file") return "tag";
+        if (args[0] === "rev-parse") return unrelatedOid;
+        throw new Error(`must not ${args.join(" ")}`);
+      },
+      validateFrg: async () => {
+        throw new Error("must not validate when origin tag is wrong");
+      },
+    }),
+    /does not point to the release merge commit/,
+  );
+  assert.ok(!calls.some((args) => args[0] === "push" || args[0] === "tag" || args.includes("-f")));
+});
+
+test("hmacPackedCandidateGitShaFromUnknown prefers factory_release_binding (#1149)", () => {
+  assert.equal(
+    hmacPackedCandidateGitShaFromUnknown({
+      factory_release_binding: { candidate_git_sha: head },
+      pack_provenance: { candidate_git_sha: unrelatedOid },
+    }),
+    head,
+  );
+  assert.equal(
+    hmacPackedCandidateGitShaFromUnknown({
+      pack_provenance: { candidate_git_sha: unrelatedOid },
+    }),
+    unrelatedOid,
+  );
+  assert.equal(hmacPackedCandidateGitShaFromUnknown({}), null);
+});
+
+test("hmacPackedCandidateGitShaFromUnknown does not fall back from a present invalid binding (#1149)", () => {
+  assert.equal(
+    hmacPackedCandidateGitShaFromUnknown({
+      factory_release_binding: { candidate_git_sha: "not-a-sha" },
+      pack_provenance: { candidate_git_sha: head },
+    }),
+    null,
+  );
+  assert.equal(
+    hmacPackedCandidateGitShaFromUnknown({
+      factory_release_binding: {},
+      pack_provenance: { candidate_git_sha: head },
+    }),
+    null,
+  );
+  assert.equal(
+    hmacPackedCandidateGitShaFromUnknown({
+      factory_release_binding: { candidate_git_sha: head },
+      notes: [`factory_release_binding:${JSON.stringify({ candidate_git_sha: unrelatedOid })}`],
+      pack_provenance: { candidate_git_sha: unrelatedOid },
+    }),
+    head,
+  );
+});
+
+test("ensure-tag does not tag when factory_release_binding is overlaid after HMAC sign (#1149)", async () => {
+  const version = "1.30.0";
+  const signed = computeFrgEvidence({
+    version,
+    run_id: "frg-overlay-tag",
+    loop_run_id: "loop-overlay-tag",
+    pack_id: FRG_PACK_MANIFEST.pack_id,
+    items: [
+      { item_id: "1", state: "ready", ready_clean: true },
+      { item_id: "2", state: "ready", ready_clean: true },
+    ],
+    scenario_overrides: frgRequiredObservationOverrides("pass"),
+    composition_overrides: frgRequiredCompositionOverrides("pass"),
+    attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
+  });
+  assert.equal(signed.pass, true);
+  const overlaid = {
+    ...signed,
+    factory_release_binding: { candidate_git_sha: head },
+  };
+  const calls: string[][] = [];
+  await assert.rejects(
+    ensureAnnotatedReleaseTag({
+      version,
+      mergeCommitOid: mergeHead,
+      packedCandidate: head,
+      git: missingTagGit(calls),
+      validateFrg: async () =>
+        validateReleaseEligibleFrgEvidence(overlaid, version, {
+          attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
+        }),
+    }),
+    /attestation MAC|forged|does not match/i,
+  );
+  assert.ok(!calls.some((args) => args[0] === "tag" || args[0] === "push"));
+});
+
+test("runEnsureAnnotatedReleaseTagCli fails closed without --packed-candidate (#1149)", async () => {
+  await assert.rejects(
+    runEnsureAnnotatedReleaseTagCli(
+      {
+        repoDir: "/repo",
+        version: intent.version,
+        mergeCommitOid: mergeHead,
+        packedCandidate: "not-a-sha",
+      },
+      {
+        git: async () => {
+          throw new Error("git must not run");
+        },
+      },
+    ),
+    /packed candidate must be a 40-character git OID/,
   );
 });
 

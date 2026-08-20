@@ -506,9 +506,140 @@ test("auto-tag FRG verify step script calls shared --validate-tag and does not t
   assert.match(script, /--validate-tag "\$\{version\}"/);
   assert.match(script, /factory-reliability-gate\.ts/);
   assert.match(script, /PIPELINE_FRG_ATTESTATION_KEY/);
+  assert.match(script, /git check-ignore --quiet -- "\$path"/);
   assert.equal(/git tag/.test(script), false);
   assert.equal(/git push/.test(script), false);
   assert.equal(/optional|advisory/i.test(script), false);
+  assert.doesNotMatch(script, /--skip-frg/);
+});
+
+function initFrgStepRepo(): string {
+  const repoDir = mkdtempSync(join(tmpdir(), "auto-tag-frg-step-"));
+  writeFileSync(join(repoDir, ".gitconfig-empty"), "");
+  const run = (args: string[]) => {
+    const r = spawnSync("git", args, {
+      cwd: repoDir,
+      encoding: "utf-8",
+      env: {
+        ...process.env,
+        HOME: repoDir,
+        GIT_CONFIG_GLOBAL: join(repoDir, ".gitconfig-empty"),
+        GIT_CONFIG_SYSTEM: "/dev/null",
+      },
+    });
+    assert.equal(r.status, 0, r.stderr);
+  };
+  run(["init", "-q"]);
+  run(["config", "user.email", "t@t.com"]);
+  run(["config", "user.name", "t"]);
+  return repoDir;
+}
+
+function runFrgVerifyStep(opts: {
+  repoDir: string;
+  version: string;
+  attestationKey?: string;
+}): { status: number | null; stdout: string; stderr: string; outputs: string } {
+  const repoRoot = join(__dirname, "../..");
+  const githubOutput = join(opts.repoDir, "github-output.txt");
+  const validator = join(repoRoot, "core/scripts/factory-reliability-gate.ts");
+  const script = extractStepScript("Verify Factory Reliability Gate evidence")
+    .replaceAll("${{ steps.detect.outputs.version }}", opts.version)
+    .replace(
+      "node --experimental-strip-types core/scripts/factory-reliability-gate.ts",
+      `node --experimental-strip-types ${JSON.stringify(validator)} --repo-dir .`,
+    );
+  const scriptPath = join(mkdtempSync(join(tmpdir(), "auto-tag-frg-script-")), "frg.sh");
+  writeFileSync(scriptPath, script);
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    GITHUB_OUTPUT: githubOutput,
+  };
+  if (opts.attestationKey !== undefined) {
+    env.PIPELINE_FRG_ATTESTATION_KEY = opts.attestationKey;
+  } else {
+    env.PIPELINE_FRG_ATTESTATION_KEY = FRG_UNIT_TEST_ATTESTATION_KEY;
+  }
+  const result = spawnSync("bash", ["-eo", "pipefail", scriptPath], {
+    cwd: opts.repoDir,
+    env: {
+      ...env,
+      HOME: opts.repoDir,
+      GIT_CONFIG_GLOBAL: join(opts.repoDir, ".gitconfig-empty"),
+      GIT_CONFIG_SYSTEM: "/dev/null",
+    },
+    encoding: "utf-8",
+  });
+  let outputs = "";
+  try {
+    outputs = readFileSync(githubOutput, "utf-8");
+  } catch {
+    outputs = "";
+  }
+  return {
+    status: result.status,
+    stdout: result.stdout,
+    stderr: result.stderr,
+    outputs,
+  };
+}
+
+test("auto-tag gitignored missing tree latest.json exits 0 and does not tag (#1149)", () => {
+  const repoDir = initFrgStepRepo();
+  writeFileSync(join(repoDir, ".gitignore"), ".agent-pipeline/frg/\n");
+  const r = runFrgVerifyStep({ repoDir, version: "1.39.5" });
+  assert.equal(r.status, 0, `ignored-absent must exit 0: ${r.stderr}`);
+  assert.match(r.outputs, /skip=true/);
+  assert.match(r.outputs, /taggable=false/);
+  const tags = spawnSync("git", ["tag"], { cwd: repoDir, encoding: "utf-8" });
+  assert.equal((tags.stdout ?? "").trim(), "");
+});
+
+test("auto-tag non-ignored missing tree latest.json fail-closes (#1149)", () => {
+  const repoDir = initFrgStepRepo();
+  const r = runFrgVerifyStep({ repoDir, version: "1.39.5" });
+  assert.notEqual(
+    r.status,
+    0,
+    `non-ignored missing latest.json must fail closed: stdout=${r.stdout} stderr=${r.stderr} outputs=${r.outputs}`,
+  );
+  assert.doesNotMatch(r.outputs, /taggable=false/);
+  const tags = spawnSync("git", ["tag"], { cwd: repoDir, encoding: "utf-8" });
+  assert.equal((tags.stdout ?? "").trim(), "");
+});
+
+test("auto-tag existing invalid tree latest.json fail-closes even if ignored (#1149)", () => {
+  const repoDir = initFrgStepRepo();
+  writeFileSync(join(repoDir, ".gitignore"), ".agent-pipeline/frg/\n");
+  mkdirSync(join(repoDir, ".agent-pipeline/frg/1.39.5"), { recursive: true });
+  writeFileSync(join(repoDir, ".agent-pipeline/frg/1.39.5/latest.json"), "{}\n");
+  const r = runFrgVerifyStep({ repoDir, version: "1.39.5" });
+  assert.notEqual(
+    r.status,
+    0,
+    `existing-invalid must fail closed even if ignored: stdout=${r.stdout} stderr=${r.stderr} outputs=${r.outputs}`,
+  );
+  assert.match(r.outputs, /taggable=true/);
+  const tags = spawnSync("git", ["tag"], { cwd: repoDir, encoding: "utf-8" });
+  assert.equal((tags.stdout ?? "").trim(), "");
+});
+
+test("auto-tag notes and tag-create are gated on taggable, not skip-frg (#1149)", () => {
+  const workflowSrc = readFileSync(WORKFLOW_PATH, "utf-8");
+  const notesIf = workflowSrc.match(
+    /- name: Resolve release notes\n\s+id: notes\n\s+if: ([^\n]+)/,
+  );
+  const tagIf = workflowSrc.match(
+    /- name: Create and push annotated tag\n\s+if: ([^\n]+)/,
+  );
+  assert.ok(notesIf, "notes step if: missing");
+  assert.ok(tagIf, "tag-create step if: missing");
+  assert.match(notesIf[1], /steps\.frg\.outputs\.taggable == 'true'/);
+  assert.match(tagIf[1], /steps\.frg\.outputs\.taggable == 'true'/);
+  assert.doesNotMatch(workflowSrc, /--skip-frg/);
+  const docsScript = extractStepScript("Regenerate tag-derived CHANGELOG");
+  assert.match(docsScript, /steps\.frg\.outputs\.skip/);
+  assert.match(docsScript, /docs refresh no-op/);
 });
 
 test("missing latest.json fails closed and names path plus pack remediation", async () => {

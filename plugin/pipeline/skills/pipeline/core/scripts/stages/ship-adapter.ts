@@ -29,6 +29,7 @@ import {
 } from "../ship-end-candidate.ts";
 import {
   validateFrgEvidenceFileForTag,
+  validateFrgEvidenceSnapshotForTag,
   type FrgEvidence,
 } from "../factory-reliability-gate.ts";
 import { FRG_HYBRID_PILOT_VERSION } from "../frg-pack-observations.ts";
@@ -162,7 +163,7 @@ export interface RealShipCoordinatorDepsOptions {
   ) => Promise<{ code: number; stdout: string; stderr: string }>;
   spawnEnsureTag?: (
     engine: CandidateEngine,
-    opts: { version: string; mergeCommitOid: string },
+    opts: { version: string; mergeCommitOid: string; packedCandidate: string },
   ) => Promise<void>;
   factoryReleaseRequestPath?: string;
   /** Persist or resume the ship-bound factory-release request JSON. */
@@ -186,10 +187,10 @@ export async function verifyAnnotatedReleaseTag(
   tag: string,
   expectedCommitOid: string,
   git: (args: string[]) => Promise<string>,
+  ref = `refs/tags/${tag}`,
 ): Promise<void> {
   const expected = requireOid(expectedCommitOid, "ship release merge commit");
-  const ref = `refs/tags/${tag}`;
-  const objectType = await git(["cat-file", "-t", ref]);
+  const objectType = (await git(["cat-file", "-t", ref])).trim();
   if (objectType !== "tag") {
     throw new Error(`ship release: ${tag} must be an annotated tag (got ${objectType || "missing"})`);
   }
@@ -199,35 +200,116 @@ export async function verifyAnnotatedReleaseTag(
   }
 }
 
+function isReleaseTagInvariantError(err: unknown): boolean {
+  const msg = (err as Error).message ?? "";
+  return (
+    msg.includes("does not point to the release merge commit") ||
+    msg.includes("must be an annotated tag")
+  );
+}
+
+function candidateShaFromRecord(raw: unknown): string | null {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
+  return parseExactGitSha((raw as Record<string, unknown>).candidate_git_sha);
+}
+
+/**
+ * HMAC recorded packed-candidate SHA from on-disk latest.json.
+ * Prefer factory_release_binding.candidate_git_sha when that field is present
+ * (HMAC-attested; do not fall back if the present binding is invalid).
+ * Else pack_provenance.candidate_git_sha.
+ */
+export function hmacPackedCandidateGitShaFromUnknown(raw: unknown): string | null {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const rec = raw as Record<string, unknown>;
+  if (Object.prototype.hasOwnProperty.call(rec, "factory_release_binding")) {
+    return candidateShaFromRecord(rec.factory_release_binding);
+  }
+  return candidateShaFromRecord(rec.pack_provenance);
+}
+
 /**
  * After a merged release PR, if FRG latest.json is release-eligible and the
- * annotated tag is missing, create and push it on the merge commit (#1115).
- * Does not open a second release PR.
+ * annotated tag is missing, create and push it on the peeled merge commit.
+ * Origin is the success authority: a locally missing tag is still `exists`
+ * when origin already has the correct annotated tag, without on-disk HMAC.
+ * HMAC evidence is required only before creating a tag origin lacks.
+ * Does not open a second release PR. Never force-updates or deletes the tag.
+ * `validateFrg` MUST return the HMAC-validated latest.json snapshot from the
+ * same file read; packed-candidate binding uses that in-memory result.
  */
 export async function ensureAnnotatedReleaseTag(opts: {
   version: string;
   mergeCommitOid: string;
+  packedCandidate: string;
   git: (args: string[]) => Promise<string>;
-  validateFrg: () => Promise<void>;
+  validateFrg: () => Promise<unknown>;
 }): Promise<"created" | "exists"> {
   const tag = expectedTag(opts.version);
+  const localRef = `refs/tags/${tag}`;
+  const observeRef = `refs/tags/${tag}-origin-observe`;
   const merge = requireOid(opts.mergeCommitOid, "ship release merge commit");
-  try {
-    const objectType = (await opts.git(["cat-file", "-t", `refs/tags/${tag}`])).trim();
-    if (objectType === "tag") {
-      await verifyAnnotatedReleaseTag(tag, merge, opts.git);
+  const packed = requireOid(opts.packedCandidate, "ship packed candidate");
+  const peeled = requireOid(
+    await opts.git(["rev-parse", "--verify", `${merge}^{commit}`]),
+    "ship release peeled merge commit",
+  );
+
+  const observeRemote = async (): Promise<"exists" | "missing"> => {
+    try {
+      await opts.git(["fetch", "origin", `${localRef}:${observeRef}`]);
+    } catch (err) {
+      if (isReleaseTagInvariantError(err)) throw err;
+      return "missing";
+    }
+    await verifyAnnotatedReleaseTag(tag, peeled, opts.git, observeRef);
+    return "exists";
+  };
+
+  const pushOrConfirmRemote = async (): Promise<"created" | "exists"> => {
+    try {
+      await opts.git(["push", "origin", localRef]);
+      return "created";
+    } catch {
+      await opts.git(["fetch", "origin", `${localRef}:${observeRef}`]);
+      await verifyAnnotatedReleaseTag(tag, peeled, opts.git, observeRef);
       return "exists";
     }
-  } catch (err) {
-    const msg = (err as Error).message ?? "";
-    if (msg.includes("does not point to the release merge commit") || msg.includes("must be an annotated tag")) {
-      throw err;
+  };
+
+  try {
+    const objectType = (await opts.git(["cat-file", "-t", localRef])).trim();
+    if (objectType === "tag") {
+      await verifyAnnotatedReleaseTag(tag, peeled, opts.git);
+      const remote = await observeRemote();
+      if (remote === "exists") return "exists";
+      return pushOrConfirmRemote();
     }
+    if (objectType) {
+      throw new Error(`ship release: ${tag} must be an annotated tag (got ${objectType})`);
+    }
+  } catch (err) {
+    if (isReleaseTagInvariantError(err)) throw err;
   }
-  await opts.validateFrg();
-  await opts.git(["tag", "-a", tag, merge, "-m", `${tag} — v${opts.version}`]);
-  await opts.git(["push", "origin", `refs/tags/${tag}`]);
-  return "created";
+  // Origin is the success authority. A locally missing tag still exists when
+  // origin already has the correct annotated tag; HMAC evidence is required
+  // only before creating a tag origin lacks.
+  const remote = await observeRemote();
+  if (remote === "exists") return "exists";
+  const snapshot = await opts.validateFrg();
+  const hmacSha = parseExactGitSha(hmacPackedCandidateGitShaFromUnknown(snapshot));
+  if (!hmacSha) {
+    throw new Error(
+      "ship release: on-disk HMAC latest.json has no candidate_git_sha bound to this ship's packed candidate",
+    );
+  }
+  if (hmacSha !== packed) {
+    throw new Error(
+      "ship release: HMAC candidate_git_sha is not this ship's packed candidate",
+    );
+  }
+  await opts.git(["tag", "-a", tag, peeled, "-m", `${tag} — v${opts.version}`]);
+  return pushOrConfirmRemote();
 }
 
 export async function alignReleaseCheckoutToCandidate(
@@ -845,8 +927,10 @@ function realShipAdapterOperations(opts: RealShipCoordinatorDepsOptions): ShipAd
       await ensureAnnotatedReleaseTag({
         version: intent.version,
         mergeCommitOid: release.merge_commit_oid,
+        packedCandidate: release.candidate_head_oid,
         git,
-        validateFrg: () => validateFrgEvidenceFileForTag(opts.repoDir, intent.version).then(() => undefined),
+        validateFrg: async () =>
+          (await validateFrgEvidenceSnapshotForTag(opts.repoDir, intent.version)).snapshot,
       });
       for (let attempt = 0; attempt < RELEASE_WAIT_ATTEMPTS; attempt++) {
         const observed = await observePublication(intent, release);
@@ -916,7 +1000,7 @@ export interface CandidateShipEndContext {
   ): Promise<{ code: number; stdout: string; stderr: string }>;
   spawnEnsureTag?(
     engine: CandidateEngine,
-    opts: { version: string; mergeCommitOid: string },
+    opts: { version: string; mergeCommitOid: string; packedCandidate: string },
   ): Promise<void>;
   delay?(ms: number): Promise<void>;
   frgWaitAttempts?: number;
@@ -1488,11 +1572,12 @@ export async function runEnsureAnnotatedReleaseTagCli(
     repoDir: string;
     version: string;
     mergeCommitOid: string;
+    packedCandidate: string;
     repo?: string;
   },
   io?: {
     git?: (args: string[]) => Promise<string>;
-    validateFrg?: () => Promise<void>;
+    validateFrg?: () => Promise<unknown>;
     observeMergedReleasePr?: (version: string) => Promise<ObservedEnsureTagReleasePr>;
   },
 ): Promise<"created" | "exists"> {
@@ -1501,6 +1586,7 @@ export async function runEnsureAnnotatedReleaseTagCli(
       "ship release: candidate ensure-tag cannot run without a repository directory",
     );
   }
+  const packedCandidate = requireOid(opts.packedCandidate, "ship packed candidate");
   const git = io?.git ?? (async (args: string[]): Promise<string> => {
     const { stdout } = await execFileAsync("git", args, {
       cwd: opts.repoDir,
@@ -1518,12 +1604,13 @@ export async function runEnsureAnnotatedReleaseTagCli(
       mergeCommitOid: opts.mergeCommitOid,
       observed,
     });
-    await (io?.validateFrg
-      ?? (() => validateFrgEvidenceFileForTag(opts.repoDir, opts.version).then(() => undefined)))();
+    if (io?.validateFrg) return io.validateFrg();
+    return (await validateFrgEvidenceSnapshotForTag(opts.repoDir, opts.version)).snapshot;
   };
   return ensureAnnotatedReleaseTag({
     version: opts.version,
     mergeCommitOid: opts.mergeCommitOid,
+    packedCandidate,
     git,
     validateFrg,
   });
@@ -1675,6 +1762,7 @@ export function bindCandidateShipEndOperations(
         await ctx.spawnEnsureTag(engine, {
           version: intent.version,
           mergeCommitOid: release.merge_commit_oid,
+          packedCandidate: release.candidate_head_oid,
         });
       } else {
         const spawned = await spawnLeaf(
@@ -1683,6 +1771,7 @@ export function bindCandidateShipEndOperations(
           shipEndLeafArgv("ensure-tag", {
             version: intent.version,
             mergeCommitOid: release.merge_commit_oid,
+            packedCandidate: release.candidate_head_oid,
           }),
           uncredentialedPrepareEnv(ctx.env),
         );

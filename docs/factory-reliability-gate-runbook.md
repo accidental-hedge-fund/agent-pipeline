@@ -15,8 +15,9 @@ conforming FRG evidence artifact for the target version.
 FRG **never** merges PRs, enables auto-merge, or creates git tags (golden rule #4).
 After a **release-eligible** pass, FRG **auto-closes** synthetic pack open PRs and
 linked open issues **without merging** as post-pass hygiene (#754). Close ≠ merge.
-Tag creation remains owned by `auto-tag-release.yml`, which **verifies FRG evidence
-before** creating or pushing a tag (#757).
+When `.agent-pipeline/frg/` is gitignored, ship-end `pipeline release ensure-tag`
+owns `vX.Y.Z` from on-disk HMAC `latest.json`. Auto-tag must not stall the ship
+for a missing tree file.
 
 ## Two-track engine pinning (#762)
 
@@ -433,12 +434,13 @@ control checkout (engine artifact contract). A pack or promote write of
 commit leftover `latest.json` onto the protected checkout. Host-only
 `git update-index --skip-worktree` is not the product fix.
 
-Local `latest.json` remains the ship-host lookup for `pipeline release` and
-`pipeline engine-promote` on the host that just packed. Auto-tag still requires
-release-eligible evidence for the version. Release MAY `git add -f` that
-version's evidence onto the **release PR** so CI/auto-tag sees it. That is
-release-branch attachment, not a reason to leave `frg/` unignored on the
-factory control checkout.
+Local `latest.json` remains the ship-host lookup for `pipeline release`,
+`pipeline engine-promote`, and `pipeline release ensure-tag` on the host that
+just packed. Auto-tag must not block the ship when that path is gitignored.
+Local `release ensure-tag` creates `vX.Y.Z` from on-disk HMAC evidence.
+Release MAY still attach that version's evidence onto the **release PR**, but
+attachment is not required for auto-tag or for local ensure-tag. That is not
+a reason to leave `frg/` unignored on the factory control checkout.
 
 ### Trend ledger
 
@@ -562,9 +564,9 @@ Optional repeated CLI tokens:
      --observations docs/frg-observations.example.json --json
    ```
 
-6. **Attach** `.agent-pipeline/frg/<X.Y.Z>/latest.json` (and run evidence) to the
-   release PR. Release MAY `git add -f` that version's evidence so auto-tag sees
-   it. Do not leave `frg/` unignored on the factory control checkout.
+6. Keep on-disk HMAC `.agent-pipeline/frg/<X.Y.Z>/latest.json` on the ship host
+   for `pipeline release ensure-tag`. Attachment to the release PR is optional.
+   Do not leave `frg/` unignored on the factory control checkout.
 
 ### Concurrency settings (documented defaults for FRG)
 
@@ -587,33 +589,41 @@ Optional repeated CLI tokens:
 5. Still runs `npm run ci` (additive). FRG, open-soak preflight, and CI are independent.
 6. Does **not** merge or tag because FRG/open-soak passed.
 
-### Auto-tag FRG guard (#757 / #1040)
+### Auto-tag FRG guard (#757 / #1040 / #1149)
 
 On a detected release merge (`release: X.Y.Z — …` subject + `core/package.json` version match,
 tag not already present), `.github/workflows/auto-tag-release.yml`:
 
-1. Verifies `.agent-pipeline/frg/<X.Y.Z>/latest.json` via the shared Node validator
-   (`factory-reliability-gate.ts --validate-tag <version>`).
-2. **Fails closed** (no tag create/push) when missing, unparsable, `pass: false`, or not
-   release-eligible. The fail-closed message names
-   `.agent-pipeline/frg/<X.Y.Z>/latest.json` and names `factory-release prepare` /
-   the Tugboat FRG pack phase as the remediation. FRG is not optional or advisory
-   on auto-tag.
-3. On success, proceeds to notes resolution and annotated tag push (existing rules).
-4. Non-release pushes remain successful no-ops without FRG.
-5. Existing tags remain successful no-ops.
+1. If `.agent-pipeline/frg/<X.Y.Z>/latest.json` is **absent and gitignored**,
+   exits 0 without creating a tag. Local `pipeline release ensure-tag` owns
+   `vX.Y.Z` from on-disk HMAC evidence.
+2. If that tree file **exists**, verifies it via the shared Node validator
+   (`factory-reliability-gate.ts --validate-tag <version>`), even when the path
+   is gitignored.
+3. **Fails closed** (no tag create/push) when the tree file is missing and not
+   ignored, or exists but is unparsable, `pass: false`, or not release-eligible.
+   The fail-closed message names `.agent-pipeline/frg/<X.Y.Z>/latest.json` and
+   names `factory-release prepare` / the Tugboat FRG pack phase as the
+   remediation. FRG is not optional or advisory on the local tag path.
+4. On validation success, proceeds to notes resolution and annotated tag push
+   (existing rules).
+5. Non-release pushes remain successful no-ops without FRG.
+6. Existing tags remain successful no-ops.
 
-FRG never creates tags itself; the workflow remains the tag owner.
+FRG never creates tags itself. When FRG is gitignored, ship-end
+`pipeline release ensure-tag` is the tag owner. Auto-tag must not stall the
+ship for a missing tree file.
 
-Remediation when auto-tag fail-closes:
+Remediation when the **local** tag helper fail-closes:
 
 ```bash
 pipeline factory-release prepare --request <absolute-request.json> --json
 ```
 
-Or re-run the Tugboat FRG pack phase so `.agent-pipeline/frg/<X.Y.Z>/latest.json`
-is a release-eligible `pass: true` artifact. Then attach that version's evidence
-to the release PR (`git add -f` is allowed) and retry the tag path.
+Or re-run the Tugboat FRG pack phase so on-disk
+`.agent-pipeline/frg/<X.Y.Z>/latest.json` is a release-eligible `pass: true`
+artifact. Then retry `pipeline release ensure-tag`. Do not commit `latest.json`
+onto the factory control checkout.
 
 ### Open soak-defect override (audited only)
 
@@ -633,8 +643,9 @@ pipeline factory-gate --for <X.Y.Z> --from-run <loop-run-id> --observations <fil
 
 - [ ] FRG `run_id` visible on the PR body (or comment)
 - [ ] Result shows **pass** for the **same** version as the release
-- [ ] **Attached** `.agent-pipeline/frg/<version>/latest.json` on the release branch
-      (`git add -f` allowed; do not un-ignore `frg/` on the factory control checkout)
+- [ ] On-disk HMAC `.agent-pipeline/frg/<version>/latest.json` present on the
+      ship host for `pipeline release ensure-tag` (attachment optional; do not
+      un-ignore `frg/` on the factory control checkout)
 - [ ] Engine-class rate is numeric (item_count denom) and ≤ max
 - [ ] Composition dimensions all pass; `false_human_authority_count` is 0
 - [ ] Open engine-class soak defects closed **or** audited `--allow-open-soak-defects`

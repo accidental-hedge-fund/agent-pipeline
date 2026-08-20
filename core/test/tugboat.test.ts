@@ -4000,3 +4000,242 @@ test("tugboat status (#1062): dead pid / stale running → not running", () => {
     fs.rmSync(stateRoot, { recursive: true, force: true });
   }
 });
+
+function tugboatShipOneBody(): string {
+  const body = fs.readFileSync(tugboat, "utf8");
+  const shipOneStart = body.indexOf("ship_one() {");
+  const shipOneEnd = body.indexOf("\n# ---------- run serial multi-milestone");
+  assert.ok(shipOneStart >= 0 && shipOneEnd > shipOneStart);
+  return body.slice(shipOneStart, shipOneEnd);
+}
+
+test("tugboat post-finish path invokes ensure-tag before wait-release (#1149)", () => {
+  const shipOneBody = tugboatShipOneBody();
+  const finishOk = shipOneBody.indexOf('write_state "release-finish" "ok"');
+  const ensure = shipOneBody.indexOf("invoke_release_ensure_tag");
+  const wait = shipOneBody.indexOf('write_state "wait-release" "running"');
+  assert.ok(finishOk >= 0, "release-finish ok write missing");
+  assert.ok(
+    ensure > finishOk,
+    "candidate release ensure-tag must run after release finish",
+  );
+  assert.ok(wait > ensure, "wait-release must run after ensure-tag");
+  assert.match(shipOneBody, /invoke_release_ensure_tag "\$version"/);
+  assert.doesNotMatch(shipOneBody, /\bgit tag\b/);
+  assert.doesNotMatch(shipOneBody, /gh release create/);
+  const packStart = shipOneBody.indexOf("A2: FRG pack");
+  const releaseStart = shipOneBody.indexOf("B: release prepare");
+  const pack = shipOneBody.slice(packStart, releaseStart);
+  assert.doesNotMatch(pack, /ensure-tag/);
+});
+
+test("playbook stays a thin launcher and does not shell git tag (#1149)", () => {
+  const playbook = fs.readFileSync(
+    path.join(repoRoot, "examples/supervisor/shell/pipeline-ship-playbook.sh"),
+    "utf8",
+  );
+  assert.equal(isThinPlaybookLauncher(playbook), true);
+  assert.match(playbook, /tugboat\.sh/);
+  const executable = playbook
+    .split("\n")
+    .filter((line) => !line.trim().startsWith("#"))
+    .join("\n");
+  assert.doesNotMatch(executable, /\bgit tag\b/);
+  assert.doesNotMatch(executable, /gh release create/);
+});
+
+test("tugboat ensure-tag helper: pack-done merge invokes candidate ensure-tag (#1149)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-ensure-tag-"));
+  try {
+    const binDir = path.join(dir, "bin");
+    const recordPath = path.join(dir, "cli.log");
+    fs.mkdirSync(binDir, { recursive: true });
+    const cli = path.join(binDir, "pipeline");
+    fs.writeFileSync(
+      cli,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        `printf '%s\\n' "$@" >> ${JSON.stringify(recordPath)}`,
+        `printf -- '---\\n' >> ${JSON.stringify(recordPath)}`,
+        'if [[ "${1:-}" == "release" && "${2:-}" == "ensure-tag" ]]; then',
+        `  exit "\${ENSURE_TAG_EXIT:-0}"`,
+        "fi",
+        "exit 0",
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(cli, 0o755);
+    const gh = path.join(binDir, "gh");
+    fs.writeFileSync(
+      gh,
+      [
+        "#!/usr/bin/env bash",
+        `printf '%s\\n' "$@" >> ${JSON.stringify(path.join(dir, "gh.log"))}`,
+        "exit 0",
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(gh, 0o755);
+
+    const packed = "a".repeat(40);
+    const merge = "c".repeat(40);
+    const finishJson = path.join(dir, "release-finish.json");
+    fs.writeFileSync(
+      finishJson,
+      JSON.stringify({
+        schema_version: 1,
+        kind: "release_finish",
+        mergeCommitOid: merge,
+      }),
+    );
+    const src = fs.readFileSync(tugboat, "utf8");
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        extractNamedFn(src, "is_exact_git_sha", "tugboat.sh"),
+        extractNamedFn(src, "read_merge_commit_oid_from_finish_json", "tugboat.sh"),
+        extractNamedFn(src, "invoke_release_ensure_tag", "tugboat.sh"),
+        `SHIP_END_CLI=(${JSON.stringify(cli)})`,
+        `SHIP_END_CANDIDATE_SHA=${JSON.stringify(packed)}`,
+        `invoke_release_ensure_tag "1.39.5" ${JSON.stringify(finishJson)}`,
+        'gh release view "v1.39.5"',
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    const r = spawnSync("bash", [runner], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
+      },
+    });
+    assert.equal(r.status, 0, `ensure-tag helper exited ${r.status}: ${r.stderr}`);
+    const argv = fs.readFileSync(recordPath, "utf8");
+    assert.match(argv, /^release\nensure-tag\n1\.39\.5\n/);
+    assert.match(argv, new RegExp(`^${merge}$`, "m"));
+    assert.match(argv, /^--packed-candidate$/m);
+    assert.match(argv, new RegExp(`^${packed}$`, "m"));
+    assert.match(fs.readFileSync(path.join(dir, "gh.log"), "utf8"), /release\nview/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("tugboat ensure-tag helper: missing mergeCommitOid fails before gh release view (#1149)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-ensure-tag-miss-"));
+  try {
+    const binDir = path.join(dir, "bin");
+    fs.mkdirSync(binDir, { recursive: true });
+    const gh = path.join(binDir, "gh");
+    fs.writeFileSync(
+      gh,
+      [
+        "#!/usr/bin/env bash",
+        `printf '%s\\n' "$@" >> ${JSON.stringify(path.join(dir, "gh.log"))}`,
+        "exit 0",
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(gh, 0o755);
+    const finishJson = path.join(dir, "release-finish.json");
+    fs.writeFileSync(finishJson, JSON.stringify({ kind: "release_finish" }));
+    const src = fs.readFileSync(tugboat, "utf8");
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        extractNamedFn(src, "is_exact_git_sha", "tugboat.sh"),
+        extractNamedFn(src, "read_merge_commit_oid_from_finish_json", "tugboat.sh"),
+        extractNamedFn(src, "invoke_release_ensure_tag", "tugboat.sh"),
+        'SHIP_END_CLI=("pipeline")',
+        `SHIP_END_CANDIDATE_SHA=${JSON.stringify("a".repeat(40))}`,
+        `invoke_release_ensure_tag "1.39.5" ${JSON.stringify(finishJson)}`,
+        'gh release view "v1.39.5"',
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    const r = spawnSync("bash", [runner], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
+      },
+    });
+    assert.notEqual(r.status, 0, "missing mergeCommitOid must fail closed");
+    assert.equal(fs.existsSync(path.join(dir, "gh.log")), false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("tugboat ensure-tag helper: non-zero ensure-tag prevents wait-release (#1149)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-ensure-tag-fail-"));
+  try {
+    const binDir = path.join(dir, "bin");
+    fs.mkdirSync(binDir, { recursive: true });
+    const cli = path.join(binDir, "pipeline");
+    fs.writeFileSync(
+      cli,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        "exit 7",
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(cli, 0o755);
+    const gh = path.join(binDir, "gh");
+    fs.writeFileSync(
+      gh,
+      [
+        "#!/usr/bin/env bash",
+        `printf '%s\\n' "$@" >> ${JSON.stringify(path.join(dir, "gh.log"))}`,
+        "exit 0",
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(gh, 0o755);
+    const finishJson = path.join(dir, "release-finish.json");
+    fs.writeFileSync(
+      finishJson,
+      JSON.stringify({ mergeCommitOid: "c".repeat(40) }),
+    );
+    const src = fs.readFileSync(tugboat, "utf8");
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        extractNamedFn(src, "is_exact_git_sha", "tugboat.sh"),
+        extractNamedFn(src, "read_merge_commit_oid_from_finish_json", "tugboat.sh"),
+        extractNamedFn(src, "invoke_release_ensure_tag", "tugboat.sh"),
+        `SHIP_END_CLI=(${JSON.stringify(cli)})`,
+        `SHIP_END_CANDIDATE_SHA=${JSON.stringify("a".repeat(40))}`,
+        `invoke_release_ensure_tag "1.39.5" ${JSON.stringify(finishJson)}`,
+        'gh release view "v1.39.5"',
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    const r = spawnSync("bash", [runner], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
+      },
+    });
+    assert.equal(r.status, 7, `expected ensure-tag exit 7, got ${r.status}: ${r.stderr}`);
+    assert.equal(fs.existsSync(path.join(dir, "gh.log")), false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
