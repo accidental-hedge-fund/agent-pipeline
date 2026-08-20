@@ -713,7 +713,7 @@ The ship coordinator and the durable factory-release prepare path SHALL invoke t
 
 ### Requirement: The candidate-native factory handoff SHALL use one stable prepare interface
 
-The engine SHALL expose the exact non-interactive command `pipeline factory-release prepare --request <absolute-request.json> --json` for durable FRG generation and prepare-only release handoff on every release after v1.33.0. Stable wrappers and ship adapters MAY invoke this command from the clean exact integrated candidate when the installed production engine is one release behind the candidate that provides the command. The request SHALL be versioned, secret-free, and bound to the verified installed production pin (when present), freshly observed base, exact integrated candidate, target release version, and stable action identity when supplied. The request SHALL NOT carry FRG credentials, executable paths, module names, network targets, or caller-authored pass claims.
+The engine SHALL expose the exact non-interactive command `pipeline factory-release prepare --request <absolute-request.json> --json` for durable FRG generation and prepare-only release handoff on every release after v1.33.0. Ship-end composers (Tugboat, the installed `pipeline-ship-playbook` launcher, and in-engine `pipeline ship`) SHALL invoke this command, `pipeline release`, and `release finish` from the clean exact integrated candidate when the installed production engine is one release behind the candidate that provides the command. In-engine `pipeline ship` SHALL also run `ensureAnnotatedReleaseTag` from that candidate. Tugboat SHALL NOT invoke `git tag` or `gh release create`. They SHALL NOT invoke those verbs from the previous production-pin CLI in that case. The request SHALL be versioned, secret-free, and bound to the verified installed production pin (when present), freshly observed base, exact integrated candidate, target release version, and stable action identity when supplied. The request SHALL NOT carry FRG credentials, executable paths, module names, network targets, or caller-authored pass claims.
 
 The command SHALL implement an idempotent multi-tick protocol. A call for a post-1.33 request with no request-bound pack loop, or with a bound loop that is not terminal, SHALL start or resume that bound candidate pack loop, persist `loop_run_id` and the matching request binding before spawn, and return JSON with `status: "in_progress"`, the bound `loop_run_id`, and a stable restart checkpoint. A failed detached spawn SHALL fail that tick and SHALL leave the request bound to the same `loop_run_id` so a later invoke can resume it. That call SHALL NOT invent `pass: true`, SHALL NOT return `status: "complete"`, and SHALL NOT open the release pull request. A repeat call with the **unchanged** request SHALL resume the same `loop_run_id` and SHALL NOT start a second unbound pack.
 
@@ -766,6 +766,13 @@ The command SHALL grant no attestation signing, release-PR merge, publication, p
 - **AND** the pack instance already records bound `loop_run_id` `L`
 - **THEN** the command SHALL resume `L` and return the same proved in-progress, awaiting, complete, or failed state
 - **AND** it SHALL NOT start a second unbound pack
+
+#### Scenario: Ship-end composers invoke prepare from the candidate when the pin is behind
+
+- **WHEN** the installed production engine is version `1.39.4`
+- **AND** the exact integrated candidate SHA provides `factory-release prepare` and `release` at `1.39.5`
+- **THEN** Tugboat, the installed playbook copy, and in-engine `pipeline ship` SHALL invoke those commands from that candidate
+- **AND** they SHALL NOT invoke them from the `1.39.4` production-pin CLI
 
 ### Requirement: Release prepare SHALL NOT be the sole writer of the shipped tag CHANGELOG entry
 
