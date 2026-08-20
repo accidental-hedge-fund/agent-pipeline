@@ -658,8 +658,8 @@ def parse_ledger_stop(raw):
         return "invalid"
     if not isinstance(time, str) or not time:
         return "invalid"
-    ready = raw.get("outstanding_ready")
-    if ready is not None:
+    if "outstanding_ready" in raw:
+        ready = raw["outstanding_ready"]
         if not isinstance(ready, list) or any(not isinstance(x, str) for x in ready):
             return "invalid"
     return "stop"

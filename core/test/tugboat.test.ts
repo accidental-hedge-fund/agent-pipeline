@@ -3374,6 +3374,92 @@ test("frg_pack_loop_is_live: schema-invalid or undecodable state is unknown at c
   }
 });
 
+test("frg_pack_loop_is_live: explicit JSON null outstanding_ready is unknown, not terminal (#1150)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-loop-null-ready-"));
+  try {
+    const helpers = fs.readFileSync(frgHelpers, "utf8");
+    const fnLive = extractNamedFn(helpers, "frg_pack_loop_is_live", "frg-pack-helpers.sh");
+    const fnWait = extractNamedFn(helpers, "frg_pack_wait_decision", "frg-pack-helpers.sh");
+    const home = path.join(dir, "state");
+    const nullReady = path.join(home, "runs", "loop-null-ready");
+    const omittedReady = path.join(home, "runs", "loop-omitted-ready");
+    for (const p of [nullReady, omittedReady]) {
+      fs.mkdirSync(p, { recursive: true });
+      fs.writeFileSync(path.join(p, "lock.json"), JSON.stringify({ pid: 1_000_000_007 }));
+    }
+    fs.writeFileSync(
+      path.join(nullReady, "ledger.json"),
+      JSON.stringify({
+        stop: {
+          reason: "supervisor_cycle_cap",
+          time: "2026-08-20T00:00:00.000Z",
+          outstanding_ready: null,
+        },
+      }),
+    );
+    fs.writeFileSync(
+      path.join(omittedReady, "ledger.json"),
+      JSON.stringify({
+        stop: {
+          reason: "supervisor_cycle_cap",
+          time: "2026-08-20T00:00:00.000Z",
+        },
+      }),
+    );
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        fnLive,
+        fnWait,
+        "probe_wait() {",
+        "  local id=$1",
+        "  local live",
+        '  live=$(frg_pack_loop_is_live "$id")',
+        '  printf "%s=%s\\n" "$id" "$live"',
+        '  printf "%s_wait=%s\\n" "$id" "$(frg_pack_wait_decision retry "$live" 2 2)"',
+        "}",
+        "probe_wait loop-null-ready",
+        "probe_wait loop-omitted-ready",
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    const r = spawnSync("bash", [runner], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        AGENT_PIPELINE_STATE_HOME: home,
+      },
+    });
+    assert.equal(r.status, 0, `liveness helper exited ${r.status}: ${r.stderr}`);
+    assert.match(
+      r.stdout,
+      /^loop-null-ready=unknown$/m,
+      "explicit null outstanding_ready must be unknown, not not-live",
+    );
+    assert.match(
+      r.stdout,
+      /^loop-null-ready_wait=continue$/m,
+      "explicit null outstanding_ready must wait-continue at cap",
+    );
+    assert.match(
+      r.stdout,
+      /^loop-omitted-ready=0$/m,
+      "omitted outstanding_ready remains a terminal stop",
+    );
+    assert.match(
+      r.stdout,
+      /^loop-omitted-ready_wait=fail$/m,
+      "omitted outstanding_ready at cap remains fail-closed",
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("tugboat FRG wait: live in_progress is not pack-fail and heartbeats (#1150)", () => {
   const src = fs.readFileSync(tugboat, "utf8");
   const packStart = src.indexOf("# ----- A2: FRG pack");
