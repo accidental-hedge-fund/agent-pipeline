@@ -7,7 +7,7 @@ Defines the shared ship-end class law: after train-complete, Factory Reliability
 
 ### Requirement: Ship-end composers SHALL execute the candidate engine
 
-A ship-end composer (Tugboat, the installed `pipeline-ship-playbook` launcher, or in-engine `pipeline ship`) SHALL invoke `factory-release prepare`, `factory-gate`, `pipeline release`, and `pipeline release finish` using the **candidate** engine after train is complete or resumed complete. In-engine `pipeline ship` SHALL also run `ensureAnnotatedReleaseTag` on that candidate. Tugboat SHALL NOT invoke `git tag` or `gh release create`. The candidate engine SHALL be the control checkout at the Factory Reliability Gate (FRG)-bound `integrated_candidate.git_sha`, or an explicit candidate install of that same SHA. Identity SHALL be that exact 40-hex SHA. The composer SHALL NOT use the previous production-pin CLI (`$PIPELINE` / `~/.local/bin/pipeline` when that binary is the last promoted pin and its source SHA differs from the candidate) for those verbs.
+A ship-end composer (Tugboat, the installed `pipeline-ship-playbook` launcher, or in-engine `pipeline ship`) SHALL invoke `factory-release prepare`, `factory-gate`, `pipeline release`, `pipeline release finish`, and `pipeline release ensure-tag` using the **candidate** engine after train is complete or resumed complete. In-engine `pipeline ship` SHALL also run `ensureAnnotatedReleaseTag` on that candidate (the same helper `release ensure-tag` wraps). Tugboat SHALL NOT invoke `git tag` or `gh release create`. Tugboat SHALL still invoke candidate `release ensure-tag` after a merged release and before publication wait. The candidate engine SHALL be the control checkout at the Factory Reliability Gate (FRG)-bound `integrated_candidate.git_sha`, or an explicit candidate install of that same SHA. Identity SHALL be that exact 40-hex SHA. The composer SHALL NOT use the previous production-pin CLI (`$PIPELINE` / `~/.local/bin/pipeline` when that binary is the last promoted pin and its source SHA differs from the candidate) for those verbs.
 
 Train `--merge` and implementer / review harnesses for the train items themselves SHALL continue to execute the production pin. The composer SHALL fail closed before those ship-end verbs if it cannot resolve a candidate engine whose identity matches the SHA being released.
 
@@ -136,3 +136,14 @@ Absence of those tools (hosts that do not run thin ship or in-engine ship-end) S
 - **WHEN** doctor runs on a host with no installed Tugboat, no installed playbook, and no in-engine ship-end in progress
 - **THEN** the identity check SHALL skip
 - **AND** doctor SHALL NOT fail solely because the host does not ship
+
+### Requirement: Tugboat skipping candidate ensure-tag SHALL fail the ship-end identity class
+
+A ship-end composer that can merge a release pull request SHALL invoke candidate `release ensure-tag` (or in-process `ensureAnnotatedReleaseTag`) after that merge. "Tugboat SHALL NOT invoke `git tag`" SHALL NOT be treated as permission to skip `release ensure-tag`. A doctor or unit check SHALL fail when Tugboat's post-finish path still goes to `wait-release` without that CLI verb while ship-end tools are in use.
+
+#### Scenario: Tugboat post-finish path without ensure-tag fails the check
+
+- **WHEN** an automated ship-end check inspects Tugboat
+- **AND** the post-`release finish` path has no candidate `release ensure-tag`
+- **THEN** the check SHALL fail
+- **AND** remediation SHALL name candidate `pipeline release ensure-tag <X.Y.Z> <mergeCommitOid>`

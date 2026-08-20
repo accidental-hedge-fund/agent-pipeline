@@ -1244,7 +1244,7 @@ into a pass, and SHALL NOT treat a fail `latest.json` as release-eligible.
 
 ### Requirement: Ship-path skip-frg default restore SHALL stay blocked until one post-1.33 honest FRG pass exists
 
-The pipeline SHALL treat a ship-path change that drops the default `--skip-frg` flag on Tugboat, `pipeline release`, or `engine-promote` as blocked until at least one release version after `1.33.0` has a `.agent-pipeline/frg/<version>/latest.json` that an honest-pass check accepts. After that check accepts, the factory Option 1 composer default SHALL omit `--skip-frg` and SHALL run the FRG pack phase before release. A `1.33.0`-only artifact, a `pass: false` artifact, a product-milestone loop, a caller-authored observations file, or a hand-edited `pass: true` SHALL NOT satisfy this precondition and SHALL NOT restore skip-as-default. The next identical skip-frg restore request SHALL reuse this same check and SHALL NOT require a new mole issue. Auto-tag fail-closed restore is the child of this unblock and SHALL require a release-eligible `latest.json` for the version being tagged. Pin default changes remain a sibling child.
+The pipeline SHALL treat a ship-path change that drops the default `--skip-frg` flag on Tugboat, `pipeline release`, or `engine-promote` as blocked until at least one release version after `1.33.0` has a `.agent-pipeline/frg/<version>/latest.json` that an honest-pass check accepts. After that check accepts, the factory Option 1 composer default SHALL omit `--skip-frg` and SHALL run the FRG pack phase before release. A `1.33.0`-only artifact, a `pass: false` artifact, a product-milestone loop, a caller-authored observations file, or a hand-edited `pass: true` SHALL NOT satisfy this precondition and SHALL NOT restore skip-as-default. The next identical skip-frg restore request SHALL reuse this same check and SHALL NOT require a new mole issue. Auto-tag fail-closed restore is the child of this unblock and SHALL require a release-eligible `latest.json` for the version being tagged **on the local tag path**. When `.agent-pipeline/frg/` is gitignored, auto-tag SHALL NOT fail the ship for a missing tree-file copy of that artifact. Pin default changes remain a sibling child.
 
 #### Scenario: Missing post-1.33 honest pass blocks skip-frg restore
 
@@ -1274,9 +1274,18 @@ The pipeline SHALL treat a ship-path change that drops the default `--skip-frg` 
 #### Scenario: Unblocked ship path fail-closes auto-tag without latest.json
 
 - **WHEN** the post-1.33 honest-pass check has already accepted and Tugboat default no-skip is in force
-- **AND** a detected release merge for version `X.Y.Z` has no release-eligible `.agent-pipeline/frg/<X.Y.Z>/latest.json`
+- **AND** a detected release merge for version `X.Y.Z` has no release-eligible `.agent-pipeline/frg/<X.Y.Z>/latest.json` in the tree
+- **AND** `.agent-pipeline/frg/` is not gitignored
 - **THEN** auto-tag SHALL fail closed
 - **AND** SHALL NOT create or push `vX.Y.Z`
+
+#### Scenario: Gitignored missing tree latest.json does not fail auto-tag
+
+- **WHEN** the post-1.33 honest-pass check has already accepted and Tugboat default no-skip is in force
+- **AND** a detected release merge for version `X.Y.Z` has no tree-file `.agent-pipeline/frg/<X.Y.Z>/latest.json`
+- **AND** `.agent-pipeline/frg/` is gitignored
+- **THEN** auto-tag SHALL NOT fail the job for that missing tree file
+- **AND** local `release ensure-tag` SHALL remain the fail-closed tag path for on-disk HMAC evidence
 
 ### Requirement: Honest post-1.33 FRG pass SHALL come from the bound candidate pack scored without observations
 
@@ -1508,12 +1517,21 @@ When a later milestone's FRG pack fails or writes `pass: false`, the pipeline SH
 
 The shared release-eligible tag validator SHALL fail closed when
 `.agent-pipeline/frg/<X.Y.Z>/latest.json` is missing, unparsable, `pass: false`,
-or otherwise not release-eligible for version `X.Y.Z`. The fail-closed message
-SHALL name that `latest.json` path and SHALL name `factory-release prepare` or
+or otherwise not release-eligible for version `X.Y.Z` on the **local on-disk** tag
+path (`pipeline release ensure-tag` / `ensureAnnotatedReleaseTag`). The fail-closed
+message SHALL name that `latest.json` path and SHALL name `factory-release prepare` or
 the Tugboat FRG pack phase as the remediation. The validator SHALL NOT say FRG
-is optional or advisory on the tag path. Auto-tag and any other tag-path
-caller SHALL reuse this validator. They SHALL NOT invent a second tag
-eligibility checker.
+is optional or advisory on the tag path. The local tag helper SHALL reuse this
+validator. Auto-tag SHALL reuse this validator when FRG is not gitignored. Auto-tag
+SHALL NOT use this validator to fail the job when FRG is gitignored and the tree
+file is absent. Callers SHALL NOT invent a second tag eligibility checker.
+The validator SHALL return the parsed HMAC-validated snapshot from that same
+file read so `release ensure-tag` can bind `--packed-candidate` without
+reopening `latest.json`. HMAC `candidate_git_sha` SHALL be an attested field:
+the canonical attestation payload SHALL include `factory_release_binding` when
+that field is present on the snapshot. An unauthenticated top-level
+`factory_release_binding` overlay SHALL fail HMAC verification. The validator
+SHALL NOT fall back from a present but invalid binding to another carrier.
 
 #### Scenario: Missing latest.json names path and remediation
 
@@ -1538,6 +1556,21 @@ eligibility checker.
 - **THEN** validation SHALL succeed
 - **AND** SHALL NOT treat the artifact as a hard block
 
+#### Scenario: Tag binding uses the HMAC-validated snapshot
+
+- **WHEN** the shared tag validator reads `.agent-pipeline/frg/1.39.0/latest.json`
+- **AND** HMAC validation succeeds
+- **THEN** it SHALL return the parsed snapshot from that same read
+- **AND** a later replacement of the on-disk file SHALL NOT change the returned snapshot
+
+#### Scenario: Unauthenticated factory_release_binding overlay fails HMAC
+
+- **WHEN** `.agent-pipeline/frg/1.39.0/latest.json` is HMAC-valid for packed candidate `A`
+- **AND** a writer adds or changes `factory_release_binding.candidate_git_sha` to `B` after signing
+- **THEN** tag-path validation SHALL fail closed
+- **AND** SHALL NOT treat `B` as HMAC `candidate_git_sha`
+- **AND** SHALL NOT fall back to `pack_provenance.candidate_git_sha`
+
 ### Requirement: FRG runtime files SHALL NOT dirty the factory control checkout
 
 `.agent-pipeline/frg/` (including `<X.Y.Z>/latest.json` and the rest of that tree) SHALL
@@ -1546,12 +1579,13 @@ or promote write of `latest.json` SHALL NOT fail the next train's `worktree-clea
 The FRG runbook SHALL NOT require that directory to stay unignored on the protected
 checkout. Host-only `skip-worktree` SHALL NOT be the product fix.
 
-Local `latest.json` SHALL remain the ship-host lookup for `pipeline release` and
-`pipeline engine-promote` on the host that just packed. Release-eligible evidence SHALL
-remain attachable to the release pull request (comment, body section, `git add -f` of
-that version's evidence, or an equivalent artifact) so auto-tag can still require a
-release-eligible pass for the version. That attachment SHALL NOT require leaving
-`.agent-pipeline/frg/` unignored on the factory control checkout.
+Local `latest.json` SHALL remain the ship-host lookup for `pipeline release`,
+`pipeline engine-promote`, and `pipeline release ensure-tag` on the host that just packed.
+Release-eligible evidence SHALL NOT need to be committed, comment-attached, or
+`git add -f`'d so auto-tag can see it. Auto-tag SHALL NOT block the ship when that
+path is gitignored. Local `release ensure-tag` SHALL create `vX.Y.Z` from on-disk HMAC
+evidence. That posture SHALL NOT require leaving `.agent-pipeline/frg/` unignored on the
+factory control checkout.
 
 #### Scenario: Pack write does not fail the next train worktree-clean
 
@@ -1573,12 +1607,19 @@ release-eligible pass for the version. That attachment SHALL NOT require leaving
 #### Scenario: Auto-tag evidence remains attachable
 
 - **WHEN** a release PR for version `1.39.3` is prepared after an FRG pack
-- **THEN** release-eligible evidence for `1.39.3` SHALL still be attachable so
-  auto-tag can require a pass
-- **AND** that attachment MAY force-add that version's `latest.json` onto the release
-  branch
+- **THEN** release-eligible evidence for `1.39.3` MAY still be attachable
+- **AND** that attachment SHALL NOT be required for auto-tag or for local `release ensure-tag`
 - **AND** SHALL NOT require the factory control checkout to keep `.agent-pipeline/frg/`
   unignored
+
+#### Scenario: Auto-tag does not require attached tree evidence when FRG is gitignored
+
+- **WHEN** a release PR for version `1.39.5` is merged after an FRG pack
+- **AND** `.agent-pipeline/frg/` is gitignored
+- **AND** on-disk HMAC `latest.json` is release-eligible
+- **THEN** ship-end SHALL create `v1.39.5` via `release ensure-tag` from disk
+- **AND** auto-tag SHALL NOT fail the job because the merged tree has no `latest.json`
+- **AND** the factory control checkout SHALL keep `.agent-pipeline/frg/` gitignored
 
 ### Requirement: Ship-path FRG pack composers SHALL attest outside prepare
 

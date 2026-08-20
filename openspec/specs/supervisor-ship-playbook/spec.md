@@ -272,7 +272,7 @@ Shared pack helpers used by Tugboat and the playbook SHALL stay in sync for requ
 
 ### Requirement: Ship playbook SHALL be a thin launcher that inherits Tugboat ship-end
 
-The documented alternate chain playbook SHALL exec `$REPO_DIR/examples/supervisor/shell/tugboat.sh` and SHALL NOT retain a second ship-end compose implementation. After that exec, Tugboat SHALL invoke `factory-release prepare`, `factory-gate`, `pipeline release`, and `release finish` using the candidate engine after train is complete or resumed complete. Tugboat SHALL NOT invoke `git tag` or `gh release create`. Train SHALL remain on the production-pin CLI.
+The documented alternate chain playbook SHALL exec `$REPO_DIR/examples/supervisor/shell/tugboat.sh` and SHALL NOT retain a second ship-end compose implementation. After that exec, Tugboat SHALL invoke `factory-release prepare`, `factory-gate`, `pipeline release`, `release finish`, and `release ensure-tag` using the candidate engine after train is complete or resumed complete. Tugboat SHALL NOT invoke `git tag` or `gh release create`. Train SHALL remain on the production-pin CLI.
 
 When the installed playbook is selected for ship-end and is not that launcher, doctor or the ship-end identity check SHALL fail closed.
 
@@ -290,6 +290,12 @@ When the installed playbook is selected for ship-end and is not that launcher, d
 - **AND** the ship still uses that installed playbook for FRG or release
 - **THEN** doctor or the ship-end identity check SHALL fail
 - **AND** remediation SHALL name refresh from the candidate launcher or exec of `$REPO_DIR/examples/supervisor/shell/tugboat.sh`
+
+#### Scenario: Inherited Tugboat path includes ensure-tag
+
+- **WHEN** the playbook execs repo Tugboat for a ship that has merged the release PR
+- **THEN** that Tugboat path SHALL invoke candidate `release ensure-tag` before `wait-release`
+- **AND** the playbook SHALL NOT keep a second compose that waits for GitHub Release without that invoke
 
 ### Requirement: Playbook ship-end identity check SHALL share the Tugboat gate
 
