@@ -42,7 +42,12 @@
 #                          core/scripts/pipeline.ts + scripts/pipeline-launcher.mjs
 #                          present). Else Tugboat uses a clean REPO_DIR HEAD
 #                          or $REPO_DIR/.worktrees/ship-candidate-<sha>.
-#   SHIP_END_NODE          node binary for the candidate launcher (default: node)
+#   SHIP_END_NODE          node binary for the candidate launcher. When unset
+#                          or major < 24, Tugboat walks PATH then /usr/bin/node.
+#                          systemd export is not required (#1162).
+#   TUGBOAT_SKIP_TRAIN     1 after candidate composer re-exec — skip train (#1164)
+#   TUGBOAT_CANDIDATE_COMPOSER
+#                          candidate SHA of the tugboat.sh already exec'd (#1164)
 #   ALLOW_MERGE            must be 1 for train --merge / release finish
 #   SHIP_NOTIFY            1 to post phase status (default 1)
 #   SHIP_NOTIFY_BIN        notify helper (default: sibling ship-notify.sh)
@@ -91,7 +96,8 @@ STATE_ROOT="${PIPELINE_SUPERVISOR_STATE:-$HOME/.local/state/pipeline-supervisor}
 # Pin snapshot of env at process start — never re-read for retarget (#1062).
 REPO_DIR="${REPO_DIR:-}"
 PIPELINE="${PIPELINE:-pipeline}"
-SHIP_END_NODE="${SHIP_END_NODE:-node}"
+# Do not default to PATH `node` here — gateway PATH may be Node 22 (#1162).
+SHIP_END_NODE="${SHIP_END_NODE:-}"
 # Candidate CLI for post-train FRG / release / finish. Empty until resolved.
 # Never fall back to process-start $PIPELINE for those verbs (#1151).
 SHIP_END_CLI=()
@@ -132,6 +138,8 @@ flag_skip_frg=0
 flag_skip_frg_reason=""
 SKIP_FRG=0
 SKIP_FRG_REASON=""
+# Original argv for candidate composer re-exec after train (#1164).
+TUGBOAT_INVOKE_ARGV=("$@")
 
 usage() {
   cat <<'USAGE'
@@ -797,8 +805,108 @@ invoke_release_ensure_tag() {
     echo "FAIL: SHIP_END_CANDIDATE_SHA is not an exact 40-hex SHA" >&2
     return 1
   fi
+  if [[ -z "${REPO_DIR:-}" ]]; then
+    echo "FAIL: REPO_DIR required for release ensure-tag --repo-path" >&2
+    return 1
+  fi
   merge_oid=$(read_merge_commit_oid_from_finish_json "$finish_json") || return 1
-  "${SHIP_END_CLI[@]}" release ensure-tag "$version" "$merge_oid" --packed-candidate "$SHIP_END_CANDIDATE_SHA"
+  "${SHIP_END_CLI[@]}" release ensure-tag "$version" "$merge_oid" \
+    --packed-candidate "$SHIP_END_CANDIDATE_SHA" --repo-path "$REPO_DIR"
+}
+
+# First Node binary whose major version is >= 24 (#1162).
+resolve_ship_end_node() {
+  local candidates=()
+  local seen=" "
+  local cand path major="" dir p
+  for p in "${SHIP_END_NODE:-}" ; do
+    [[ -n "$p" ]] || continue
+    case "$seen" in
+      *" $p "*) ;;
+      *) seen+="$p "; candidates+=("$p") ;;
+    esac
+  done
+  IFS=':' read -r -a _ship_end_path_dirs <<< "${PATH:-}"
+  for dir in "${_ship_end_path_dirs[@]}"; do
+    [[ -n "$dir" ]] || continue
+    p="$dir/node"
+    case "$seen" in
+      *" $p "*) ;;
+      *) seen+="$p "; candidates+=("$p") ;;
+    esac
+  done
+  for p in /usr/bin/node /usr/local/bin/node; do
+    case "$seen" in
+      *" $p "*) ;;
+      *) seen+="$p "; candidates+=("$p") ;;
+    esac
+  done
+  for cand in "${candidates[@]}"; do
+    path=""
+    if [[ -x "$cand" ]]; then
+      path=$cand
+    elif command -v "$cand" >/dev/null 2>&1; then
+      path=$(command -v "$cand")
+    else
+      continue
+    fi
+    major=$("$path" -p "process.versions.node.split('.')[0]" 2>/dev/null || true)
+    if [[ "$major" =~ ^[1-9][0-9]*$ ]] && [[ "$major" -ge 24 ]]; then
+      SHIP_END_NODE=$path
+      if [[ -n "${RUN_DIR:-}" ]]; then
+        printf '%s\n' "$path" >"$RUN_DIR/ship_end_node"
+      fi
+      echo "ship-end-node: $path (major=$major)" >&2
+      if declare -F log >/dev/null 2>&1; then
+        log "phase ship-end-node: $path (major=$major)"
+      fi
+      return 0
+    fi
+  done
+  echo "FAIL: no Node >= 24 for ship-end CLI (SHIP_END_NODE=${SHIP_END_NODE:-unset})" >&2
+  return 1
+}
+
+# Exec candidate tugboat.sh for FRG onward. Same PID keeps the ship lock (#1164).
+maybe_reexec_candidate_composer() {
+  local candidate_tug self cand
+  if [[ -z "${SHIP_END_ENGINE_ROOT:-}" ]]; then
+    echo "FAIL: SHIP_END_ENGINE_ROOT unset for candidate composer re-exec" >&2
+    return 1
+  fi
+  if ! is_exact_git_sha "$SHIP_END_CANDIDATE_SHA"; then
+    echo "FAIL: SHIP_END_CANDIDATE_SHA is not an exact 40-hex SHA" >&2
+    return 1
+  fi
+  candidate_tug="$SHIP_END_ENGINE_ROOT/examples/supervisor/shell/tugboat.sh"
+  if [[ ! -f "$candidate_tug" ]]; then
+    echo "FAIL: candidate tugboat.sh missing at $candidate_tug" >&2
+    return 1
+  fi
+  self=$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")
+  cand=$(readlink -f "$candidate_tug" 2>/dev/null || realpath "$candidate_tug" 2>/dev/null || echo "$candidate_tug")
+  if [[ "$self" == "$cand" ]]; then
+    return 0
+  fi
+  if [[ "${TUGBOAT_CANDIDATE_COMPOSER:-}" == "$SHIP_END_CANDIDATE_SHA" ]]; then
+    return 0
+  fi
+  if declare -F log >/dev/null 2>&1; then
+    log "phase composer-reexec: $self -> $cand sha=$SHIP_END_CANDIDATE_SHA"
+  else
+    echo "composer-reexec: $self -> $cand sha=$SHIP_END_CANDIDATE_SHA" >&2
+  fi
+  if [[ -n "${RUN_DIR:-}" ]]; then
+    printf '%s\n' "$cand" >"$RUN_DIR/ship_end_composer"
+    printf '%s\n' "$SHIP_END_CANDIDATE_SHA" >"$RUN_DIR/ship_end_composer_sha"
+  fi
+  export TUGBOAT_SKIP_TRAIN=1
+  export TUGBOAT_CANDIDATE_COMPOSER="$SHIP_END_CANDIDATE_SHA"
+  export RELEASE_CHECKS_GREEN_BIN TRAIN_STATUS_COMPLETE_BIN
+  export SHIP_NOTIFY_BIN SHIP_STAGE_WATCH_BIN
+  export PIPELINE ALLOW_MERGE ENGINE_PROMOTE_HOST
+  export SHIP_END_NODE
+  exec bash "$cand" "${TUGBOAT_INVOKE_ARGV[@]}"
 }
 
 # After train-complete: bind SHIP_END_CLI to the candidate engine. Fail closed
@@ -806,6 +914,7 @@ invoke_release_ensure_tag() {
 resolve_ship_end_cli() {
   local req=$1
   local sha root launcher worktree explicit
+  resolve_ship_end_node || return 1
   sha=$(read_candidate_sha_from_request "$req") || return 1
   is_exact_git_sha "$sha" || return 1
   worktree="$REPO_DIR/.worktrees/ship-candidate-$sha"
@@ -1527,6 +1636,11 @@ try_acquire_ship_lock() {
   fi
 
   holder=$(cat "$lock_dir/pid" 2>/dev/null || true)
+  # Same PID still owns the lock after candidate composer exec (#1164).
+  if [[ -n "$holder" && "$holder" == "$$" ]]; then
+    printf '%s\n' "$$" >"$run_dir/playbook.pid"
+    return 0
+  fi
   if [[ -n "$holder" && "$holder" != "$$" ]] && kill -0 "$holder" 2>/dev/null; then
     # Only refuse if the holder is still a live ship for THIS milestone —
     # bare kill -0, or a live train/tugboat for another milestone, is reclaimed.
@@ -1991,6 +2105,9 @@ detach_self() {
     TUGBOAT_REPOSITORY="${TUGBOAT_REPOSITORY:-}" \
     TUGBOAT_BASE_BRANCH="${TUGBOAT_BASE_BRANCH:-}" \
     TUGBOAT_FRG_MANIFEST_PATH="${TUGBOAT_FRG_MANIFEST_PATH:-}" \
+    TUGBOAT_SKIP_TRAIN="${TUGBOAT_SKIP_TRAIN:-}" \
+    TUGBOAT_CANDIDATE_COMPOSER="${TUGBOAT_CANDIDATE_COMPOSER:-}" \
+    SHIP_END_NODE="${SHIP_END_NODE:-}" \
     "$self" "${args[@]}" >/dev/null 2>&1 &
   pid=$!
   record_pending_unconfirmed_child "$pid"
@@ -2085,7 +2202,11 @@ ship_one() {
 
   # Acquire lock BEFORE writing playbook.pid (never steal from a live holder).
   # Pass version so a recycled lock pid for another milestone is reclaimed.
-  if ! holder=$(try_acquire_ship_lock "$RUN_DIR" "$version"); then
+  # After candidate composer re-exec, the same PID still owns lock/pid (#1164).
+  if [[ "${TUGBOAT_SKIP_TRAIN:-}" == "1" ]] && [[ -f "$lock_dir/pid" ]] \
+    && [[ "$(cat "$lock_dir/pid" 2>/dev/null || true)" == "$$" ]]; then
+    log "phase lock: retained after composer re-exec pid=$$"
+  elif ! holder=$(try_acquire_ship_lock "$RUN_DIR" "$version"); then
     # try_acquire prints holder pid on failure
     log "another tugboat holds the lock (pid ${holder:-?}) — refusing duplicate ship"
     # Do not clobber a live ship's state.json to failed.
@@ -2104,6 +2225,16 @@ ship_one() {
   fi
 
   # ----- A: train + merge ---------------------------------------------------
+  if [[ "${TUGBOAT_SKIP_TRAIN:-}" == "1" ]]; then
+    if [[ ! -s "$RUN_DIR/train.complete.json" ]] && [[ ! -s "$RUN_DIR/train.json" ]]; then
+      write_state "train" "failed" "TUGBOAT_SKIP_TRAIN set without a prior train artifact"
+      log "FAIL: TUGBOAT_SKIP_TRAIN without train.complete.json or train.json"
+      exit 1
+    fi
+    train_resumed=1
+    write_state "train" "ok" "skipped after candidate composer re-exec"
+    log "phase train: skipped (TUGBOAT_SKIP_TRAIN=1)"
+  else
   write_state "train" "running" "pipeline train --milestone v$version --merge --json"
   log "phase train: start"
 
@@ -2213,6 +2344,7 @@ ship_one() {
       log "stage-watch stopped pid=$swp"
     fi
   fi
+  fi
 
   # ----- A1b: resolve candidate engine for ship-end (no pin fallback) ------
   local req pack_done pack_ec pack_verdict latest_json loop_id attest_ec attest_reason
@@ -2228,6 +2360,12 @@ ship_one() {
     exit 1
   fi
   log "phase ship-end-cli: engine=$SHIP_END_ENGINE_ROOT sha=$SHIP_END_CANDIDATE_SHA"
+  if ! maybe_reexec_candidate_composer; then
+    write_state "frg-pack" "failed" "candidate composer re-exec failed"
+    log "FAIL: candidate composer re-exec failed"
+    exit 1
+  fi
+  log "phase composer: $0 sha=${TUGBOAT_CANDIDATE_COMPOSER:-$SHIP_END_CANDIDATE_SHA}"
 
   # ----- A2: FRG pack (uncredentialed prepare + out-of-process attestor) ---
   if [[ "$SKIP_FRG" != "1" ]]; then
