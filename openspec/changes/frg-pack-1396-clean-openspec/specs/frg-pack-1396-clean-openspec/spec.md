@@ -8,12 +8,7 @@ names release `1.39.6`.
 
 ### Requirement: The pack-1396 clean-openspec fixture SHALL name release 1.39.6
 
-The JSON fixture at
-`core/test/fixtures/frg/pack-1396-tugboat-ship-1.39.6/clean-openspec.json`
-SHALL set `release_version` to the exact string `1.39.6`. A unit test
-SHALL read only that run-scoped path and SHALL fail when the field is
-missing or is not `1.39.6`. Production modules under `core/scripts/`
-SHALL keep their existing runtime behavior.
+The pack-1396 clean-openspec fixture SHALL name release `1.39.6`. The JSON fixture at `core/test/fixtures/frg/pack-1396-tugboat-ship-1.39.6/clean-openspec.json` SHALL set `release_version` to the exact string `1.39.6`. A unit test SHALL read only that run-scoped path and SHALL fail when the field is missing or is not `1.39.6`. Production modules under `core/scripts/` SHALL keep their existing runtime behavior.
 
 #### Scenario: Fixture names the pack release
 
