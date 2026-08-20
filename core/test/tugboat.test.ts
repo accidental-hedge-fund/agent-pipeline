@@ -1915,6 +1915,16 @@ test("playbook frg-pack-helpers.sh stays in sync with tugboat pack helpers", () 
     /if pass_v is False:\s*\n\s*print\("fail"\)[\s\S]*status == "awaiting_frg_attestation"/,
     "must not fail-close on unsigned pass:false before awaiting/attest (#1147)",
   );
+  assert.match(
+    extractNamedFn(help, "classify_frg_pack_tick", "frg-pack-helpers.sh"),
+    /has_unsigned_eligible_artifacts\(prep\)[\s\S]*if pass_v is False and hmac_present\(latest\)/,
+    "in_progress unsigned-eligible must classify before signed latest pass:false (#1147)",
+  );
+  assert.doesNotMatch(
+    extractNamedFn(help, "classify_frg_pack_tick", "frg-pack-helpers.sh"),
+    /if pass_v is False and hmac_present\(latest\)[\s\S]*has_unsigned_eligible_artifacts/,
+    "must not fail-close on signed latest pass:false before in_progress unsigned-eligible (#1147)",
+  );
 });
 
 test("tugboat export_factory_production_pin sets factory pin when unset (#1127)", () => {
@@ -3107,6 +3117,75 @@ test("classify_frg_pack_tick: unsigned eligible omitted-HMAC pass false is attes
     assert.equal(r.stdout.trim(), "attest");
     assert.notEqual(r.stdout.trim(), "fail");
     assert.notEqual(r.stdout.trim(), "done");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("classify_frg_pack_tick: stale signed pass:false does not fail current unsigned-eligible tick (#1147)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-tick-stale-signed-"));
+  try {
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        `. ${JSON.stringify(frgHelpers)}`,
+        'classify_frg_pack_tick "$1" "$2" "$3" "${4:-}"',
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    const prepPath = path.join(dir, "prep.json");
+    const latestPath = path.join(dir, "latest.json");
+    const reqPath = path.join(dir, "request.json");
+    const shaOld = "a".repeat(40);
+    const shaNew = "b".repeat(40);
+    fs.writeFileSync(
+      prepPath,
+      JSON.stringify({
+        status: "in_progress",
+        loop_run_id: "loop-new",
+        frg: {
+          pack_id: "factory-gate-v1",
+          loop_run_id: "loop-new",
+          observations: { path: "/tmp/obs.json", sha256: "1".repeat(64) },
+          evidence_bundle: { path: "/tmp/ev.json", sha256: "2".repeat(64) },
+        },
+      }),
+    );
+    fs.writeFileSync(
+      latestPath,
+      JSON.stringify({
+        pass: false,
+        version: "1.39.5",
+        pack_provenance: {
+          candidate_git_sha: shaOld,
+          release_version: "1.39.5",
+        },
+        integrity: {
+          attestation: { alg: "hmac-sha256-v1", mac: "c".repeat(64) },
+        },
+      }),
+    );
+    fs.writeFileSync(
+      reqPath,
+      JSON.stringify({
+        target_version: "1.39.5",
+        integrated_candidate: { git_sha: shaNew },
+      }),
+    );
+    const r = spawnSync("bash", [runner, prepPath, latestPath, "0", reqPath], {
+      encoding: "utf8",
+    });
+    assert.equal(r.status, 0, `classifier exited ${r.status}: ${r.stderr}`);
+    assert.equal(
+      r.stdout.trim(),
+      "attest",
+      "stale signed pass:false latest must not fail current in_progress unsigned-eligible tick",
+    );
+    assert.notEqual(r.stdout.trim(), "fail");
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

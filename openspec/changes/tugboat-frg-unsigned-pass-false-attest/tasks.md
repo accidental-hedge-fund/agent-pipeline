@@ -30,6 +30,7 @@
 - [x] 5.4 Regression: pack-done still requires bound `latest.json` `pass: true`. `awaiting` alone is not done
 - [x] 5.5 Sync test: Tugboat and `frg-pack-helpers.sh` classify helpers still match
 - [x] 5.6 Tests inject I/O or inspect source/fixtures. They start no live pack, network, git, or subprocess ship
+- [x] 5.7 Regression: stale signed `latest.json` `pass: false` plus current `in_progress` unsigned eligible artifacts classifies `attest`, not `fail`
 
 ## 6. Docs, packaging, gate
 

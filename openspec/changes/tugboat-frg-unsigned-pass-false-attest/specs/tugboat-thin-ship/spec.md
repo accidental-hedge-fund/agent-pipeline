@@ -10,7 +10,7 @@ When prepare returns `status: "awaiting_frg_attestation"`, or when unsigned elig
 
 Pack-done SHALL mean `.agent-pipeline/frg/<X.Y.Z>/latest.json` has `pass: true` and records the request `target_version` and `integrated_candidate.git_sha` (and `action_id` when the artifact records one), or prepare already returned `status: "complete"` with an open release PR for that version. Prepare JSON `status: "awaiting_frg_attestation"` alone SHALL NOT be pack-done. A `pass: true` artifact that lacks that binding, or that binds a different version or candidate SHA, SHALL NOT be pack-done; Tugboat SHALL re-invoke while prepare status is `in_progress`.
 
-When `latest.json` has `pass: false` because HMAC was omitted, and the bound pack is structurally eligible, Tugboat SHALL treat that tick as `attest`. It SHALL NOT treat omitted-HMAC `pass: false` as pack-fail. `status: "awaiting_frg_attestation"` or unsigned eligible artifacts paired with that omitted-HMAC `pass: false` SHALL be `attest`. Tugboat SHALL NOT fail-close on `pass: false` before those attest signals.
+When `latest.json` has `pass: false` because HMAC was omitted, and the bound pack is structurally eligible, Tugboat SHALL treat that tick as `attest`. It SHALL NOT treat omitted-HMAC `pass: false` as pack-fail. `status: "awaiting_frg_attestation"` or unsigned eligible artifacts paired with that omitted-HMAC `pass: false` SHALL be `attest`. Tugboat SHALL NOT fail-close on `pass: false` before those attest signals. A signed `latest.json` `pass: false` SHALL be pack-fail only when that artifact is bound to the current request and the current prepare result is not `in_progress` with unsigned eligible artifacts. A prior candidate's signed `pass: false` SHALL NOT fail a current in-progress unsigned-eligible tick.
 
 A `latest.json` `pass: false` caused by a real ineligible scoreboard (composition missing, required scenarios fail, wrong pack, engine-class over threshold) SHALL remain pack-fail. `status: "complete"` is pack-done only after an open release PR for that version is verified; a bare complete response with no open release PR is pack-fail. Pack-fail SHALL mean a failed or missing FRG status that is not omitted-HMAC-only, `latest.json` `pass: false` after a terminal **ineligible** score, attestor child failure or missing producer credential after unsigned artifacts exist, or wait-budget exhaustion while status stays `in_progress` **and the bound pack loop is not live**. Wait-budget exhaustion while status stays `in_progress` and the bound pack loop is live SHALL NOT be pack-fail. Unreadable or malformed `lock.json` or `ledger.json` SHALL NOT count as not-live. Tugboat SHALL keep re-invoking and heartbeat while liveness is unknown. The bound loop is not live only after a positive dead-or-missing lock pid and a positive terminal-or-missing ledger. On pack-fail Tugboat SHALL fail the frg-pack phase and SHALL NOT invoke `pipeline release` for that version.
 
@@ -124,6 +124,17 @@ A `latest.json` `pass: false` caused by a real ineligible scoreboard (compositio
 - **AND** that child SHALL NOT pass `--observations`
 - **AND** Tugboat SHALL NOT treat that tick as wait-only retry
 
+#### Scenario: Stale signed failing latest.json does not fail a newer unsigned-eligible tick
+
+- **WHEN** `.agent-pipeline/frg/1.39.5/latest.json` has `pass: false` with HMAC present bound to a prior candidate SHA
+- **AND** prepare returns `status: "in_progress"` for a new request for version `1.39.5`
+- **AND** the prepare result includes unsigned eligible artifacts
+- **AND** the bound pack `loop_run_id` is `L`
+- **AND** no matching `latest.json` `pass: true` exists for the new candidate
+- **THEN** Tugboat SHALL classify that tick as `attest`
+- **AND** it SHALL invoke `pipeline factory-gate --for 1.39.5 --from-run L` in a child process other than prepare
+- **AND** it SHALL NOT fail the FRG pack phase on the stale signed `pass: false`
+
 #### Scenario: Unsigned eligible omitted-HMAC pass false is attest
 
 - **WHEN** prepare returns `status: "awaiting_frg_attestation"` for version `1.39.5`
@@ -207,6 +218,7 @@ Tugboat pack-phase isolation (uncredentialed prepare child, credentialed `factor
 - pack-done is declared for `awaiting_frg_attestation` without a matching `pass: true` `latest.json`,
 - `in_progress` with unsigned eligible artifacts is classified as wait-only retry,
 - unsigned eligible omitted-HMAC `pass: false` is classified as `fail`,
+- `in_progress` with unsigned eligible artifacts is classified as `fail` because a prior candidate's signed `pass: false` remains in `latest.json`,
 - prepare reports `failed` / `frg_not_eligible` when HMAC is the only missing piece,
 - or the pack phase writes the key body into `state.json`.
 
@@ -233,6 +245,14 @@ Tugboat pack-phase isolation (uncredentialed prepare child, credentialed `factor
 - **WHEN** the automated pack-isolation checks classify a tick whose prepare status is `awaiting_frg_attestation`
 - **AND** `latest.json` has `pass: false` because HMAC was omitted
 - **AND** the bound pack is structurally eligible
+- **THEN** the checks SHALL print `attest`
+- **AND** the checks SHALL fail if the classifier still prints `fail` for that tick
+
+#### Scenario: Regression fails if stale signed pass false overrides current unsigned-eligible tick
+
+- **WHEN** the automated pack-isolation checks classify a tick whose prepare status is `in_progress`
+- **AND** the prepare result includes unsigned eligible artifacts
+- **AND** `latest.json` has signed `pass: false` bound to a prior candidate SHA
 - **THEN** the checks SHALL print `attest`
 - **AND** the checks SHALL fail if the classifier still prints `fail` for that tick
 

@@ -115,11 +115,15 @@ awaiting protocol.
 ### 3. Classify does not fail-close on omitted-HMAC `pass: false`
 
 **Choice:** Shared `classify_frg_pack_tick` SHALL check bound
-`pass: true` first, then `awaiting_frg_attestation` / unsigned eligible
-artifacts (including when `latest.json` `pass` is false), then real
-ineligible `pass: false` / prepare `failed`. Omitted HMAC means HMAC
-fields are absent and structural eligibility holds. Classify SHALL
-NOT use free-form `notes` as the authority.
+`pass: true` first, then `in_progress` unsigned eligible artifacts,
+then attested HMAC `pass: false` only when that `latest.json` is bound
+to the current request (or no request is supplied), then
+`awaiting_frg_attestation` / omitted-HMAC `pass: false`, then unsigned
+ineligible `pass: false` / prepare `failed`. A version-scoped prior
+candidate signed `pass: false` SHALL NOT fail a current unsigned-eligible
+tick. Omitted HMAC means HMAC fields are absent and structural
+eligibility holds. Classify SHALL NOT use free-form `notes` as the
+authority.
 
 **Why:** Today's first line `if pass_v is False: fail` never reaches
 `attest`. Reorder plus omitted-HMAC discriminator matches #1147
