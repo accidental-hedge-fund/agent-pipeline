@@ -409,7 +409,9 @@ Integrity fingerprints are recomputed on parse; a minimal forged `{ "pass": true
 **Producer attestation (required for release-eligible pass / auto-tag):**
 
 - Env / secret: `PIPELINE_FRG_ATTESTATION_KEY` (same value as repo Actions secret used by
-  `auto-tag-release.yml`).
+  `auto-tag-release.yml`). Tugboat HMAC-verify children (`factory-gate --from-run`
+  and `release ensure-tag`) present `PIPELINE_FRG_ATTESTATION_KEY_FILE` as
+  `PIPELINE_FRG_ATTESTATION_KEY` in the child. The engine still reads `KEY` only.
 - Direct trusted operator use may export the key before `pipeline factory-gate …` so
   `integrity.attestation` is written. A release candidate must never use this path;
   its fixed scorer unit owns attestation.

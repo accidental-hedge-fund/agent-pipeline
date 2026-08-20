@@ -793,6 +793,7 @@ PY
 }
 
 # Candidate-engine tag create from on-disk HMAC latest.json. Never git tag.
+# Present KEY_FILE as KEY using the same recipe as invoke_frg_pack_attestor (#1174).
 invoke_release_ensure_tag() {
   local version=$1
   local finish_json=$2
@@ -810,7 +811,27 @@ invoke_release_ensure_tag() {
     return 1
   fi
   merge_oid=$(read_merge_commit_oid_from_finish_json "$finish_json") || return 1
-  "${SHIP_END_CLI[@]}" release ensure-tag "$version" "$merge_oid" \
+  if [[ -n "${PIPELINE_FRG_ATTESTATION_KEY:-}" ]]; then
+    env -u PIPELINE_FRG_ATTESTATION_KEY_FILE \
+      "${SHIP_END_CLI[@]}" release ensure-tag "$version" "$merge_oid" \
+      --packed-candidate "$SHIP_END_CANDIDATE_SHA" --repo-path "$REPO_DIR"
+    return $?
+  fi
+  if [[ -z "${PIPELINE_FRG_ATTESTATION_KEY_FILE:-}" ]]; then
+    echo "missing_attestor_credential" >&2
+    return 1
+  fi
+  if [[ ! -r "$PIPELINE_FRG_ATTESTATION_KEY_FILE" ]]; then
+    echo "unreadable_attestor_key_file" >&2
+    return 1
+  fi
+  if [[ ! -s "$PIPELINE_FRG_ATTESTATION_KEY_FILE" ]]; then
+    echo "missing_attestor_credential" >&2
+    return 1
+  fi
+  PIPELINE_FRG_ATTESTATION_KEY="$(cat -- "$PIPELINE_FRG_ATTESTATION_KEY_FILE")" \
+    env -u PIPELINE_FRG_ATTESTATION_KEY_FILE \
+    "${SHIP_END_CLI[@]}" release ensure-tag "$version" "$merge_oid" \
     --packed-candidate "$SHIP_END_CANDIDATE_SHA" --repo-path "$REPO_DIR"
 }
 

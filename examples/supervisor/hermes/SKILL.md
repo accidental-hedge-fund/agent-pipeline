@@ -114,8 +114,10 @@ FRG pack unsets `PIPELINE_FRG_ATTESTATION_KEY` and
 `PIPELINE_FRG_ATTESTATION_KEY_FILE` in the `factory-release prepare` child.
 When prepare returns `awaiting_frg_attestation`, the composer runs
 `pipeline factory-gate --for X.Y.Z --from-run <loop>` in a separate
-credentialed process. Pack-done is bound `latest.json` `pass: true` (or
-`complete` with an open release PR). Unsigned wait is not pack-done.
+credentialed process (inherit `KEY`, or present `KEY_FILE` as `KEY`).
+Candidate `release ensure-tag` uses the same credential recipe. Pack-done is
+bound `latest.json` `pass: true` (or `complete` with an open release PR).
+Unsigned wait is not pack-done.
 
 On notify of a **non-human** failure, re-invoke the same
 `pipeline ship --milestone vX.Y.Z` argv only. Do **not** classify, delete a
