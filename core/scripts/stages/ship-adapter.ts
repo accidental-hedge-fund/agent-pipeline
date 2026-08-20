@@ -40,6 +40,8 @@ import {
 import { resolveReleaseConfig } from "../config.ts";
 import { getPrForIssueAnyState } from "../gh.ts";
 import { withLock } from "../lock.ts";
+import { resolveStateHome } from "../loop/store.ts";
+import { LOOP_LEDGER_SCHEMA } from "../loop/types.ts";
 import type { PipelineConfig } from "../types.ts";
 import {
   defaultShipStateStore,
@@ -49,6 +51,7 @@ import {
   type ShipFrgEvidence,
   type ShipFrgPackEvidence,
   type ShipIntent,
+  type ShipPhaseEvent,
   type ShipProgress,
   type ShipPromotionEvidence,
   type ShipPublicationEvidence,
@@ -81,6 +84,12 @@ const RELEASE_WAIT_ATTEMPTS = 120;
 const RELEASE_WAIT_MS = 10_000;
 const FRG_WAIT_ATTEMPTS = 120;
 const FRG_WAIT_MS = 10_000;
+const SAFE_LOOP_RUN_ID = /^[A-Za-z0-9._-]+$/;
+const TERMINAL_LOOP_EVENT_KINDS = new Set([
+  "loop_run_complete",
+  "loop_run_stopped",
+  "run_complete",
+]);
 
 interface ObservedRelease {
   prepare: ShipReleaseEvidence;
@@ -888,6 +897,8 @@ function realShipAdapterOperations(opts: RealShipCoordinatorDepsOptions): ShipAd
   };
 }
 
+export type BoundPackLoopLiveness = "live" | "not-live" | "unknown";
+
 export interface CandidateShipEndContext {
   pinCommitSha: string | null;
   repoDir: string;
@@ -909,6 +920,17 @@ export interface CandidateShipEndContext {
   ): Promise<void>;
   delay?(ms: number): Promise<void>;
   frgWaitAttempts?: number;
+  isBoundPackLoopLive?(
+    loopRunId: string,
+  ): Promise<boolean | BoundPackLoopLiveness> | boolean | BoundPackLoopLiveness;
+  isPidAlive?(pid: number): Promise<boolean> | boolean;
+  readTextFile?(p: string): Promise<string | null> | string | null;
+  onFrgWaitTick?(tick: {
+    intent: ShipIntent;
+    attempt: number;
+    loopRunId: string;
+    live: BoundPackLoopLiveness;
+  }): Promise<void> | void;
 }
 
 function candidateIdentityError(detail: string): Error {
@@ -1002,6 +1024,269 @@ function prepareLoopRunId(parsed: Record<string, unknown> | null): string {
     if (typeof nested === "string") return nested.trim();
   }
   return "";
+}
+
+export type FrgPackWaitDecision = "continue" | "fail";
+
+function waitLivenessContinues(live: boolean | BoundPackLoopLiveness): boolean {
+  return live !== false && live !== "not-live";
+}
+
+function normalizeBoundPackLoopLiveness(
+  raw: boolean | BoundPackLoopLiveness,
+): BoundPackLoopLiveness {
+  if (raw === "live" || raw === "not-live" || raw === "unknown") return raw;
+  return raw ? "live" : "not-live";
+}
+
+/** retry + live or unknown continues even when attempt == cap. Cap applies only when not-live. */
+export function classifyFrgPackWaitDecision(input: {
+  tick: CandidatePrepareTick;
+  live: boolean | BoundPackLoopLiveness;
+  attempt: number;
+  cap: number;
+}): FrgPackWaitDecision {
+  if (input.tick !== "retry") return "continue";
+  if (waitLivenessContinues(input.live)) return "continue";
+  if (Number.isInteger(input.attempt) && Number.isInteger(input.cap) && input.attempt < input.cap) {
+    return "continue";
+  }
+  return "fail";
+}
+
+/**
+ * Live when lock pid is alive OR ledger is present and not terminal.
+ * Unknown when lock or ledger state is unreadable or malformed and neither
+ * signal positively proves live. Not-live only after a dead-or-missing pid
+ * and a terminal-or-missing ledger.
+ */
+export function classifyBoundPackLoopLiveness(input: {
+  lockPidAlive: boolean;
+  lockUnreadable?: boolean;
+  ledgerPresent: boolean;
+  ledgerStopPresent: boolean;
+  ledgerUnreadable?: boolean;
+  eventsTerminal: boolean;
+}): BoundPackLoopLiveness {
+  if (input.lockPidAlive) return "live";
+  if (input.ledgerPresent && !input.ledgerStopPresent && !input.eventsTerminal) return "live";
+  if (input.lockUnreadable || input.ledgerUnreadable) return "unknown";
+  return "not-live";
+}
+
+/** Live when lock pid is alive OR ledger is present and not terminal. */
+export function boundPackLoopIsLive(input: {
+  lockPidAlive: boolean;
+  ledgerPresent: boolean;
+  ledgerStopPresent: boolean;
+  eventsTerminal: boolean;
+}): boolean {
+  return classifyBoundPackLoopLiveness(input) === "live";
+}
+
+function defaultIsPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    return code === "EPERM";
+  }
+}
+
+function parseLockPidField(raw: unknown): number | null {
+  if (typeof raw === "number") {
+    if (!Number.isInteger(raw) || raw <= 0) return null;
+    return raw;
+  }
+  if (typeof raw === "string" && /^\d+$/.test(raw)) {
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n <= 0) return null;
+    return n;
+  }
+  return null;
+}
+
+/** Closed set of LoopStopRecord.reason values. Incomplete or unknown reasons are not terminal. */
+const DURABLE_LEDGER_STOP_REASONS = new Set([
+  "recovery_exhausted",
+  "consecutive_blocked",
+  "needs_human_classification",
+  "repeated_no_progress",
+  "human_authority",
+  "run_fatal",
+  "supervisor_no_progress",
+  "supervisor_cycle_cap",
+  "dependency_deadlock",
+  "worktree_capacity",
+]);
+
+/**
+ * Null/absent stop is open. A LoopStopRecord-shaped object (known reason plus
+ * non-empty time) is terminal. Incomplete or invalid stop values are malformed.
+ */
+function parseLedgerStopField(raw: unknown): "open" | "stop" | "invalid" {
+  if (raw == null) return "open";
+  if (typeof raw !== "object" || Array.isArray(raw)) return "invalid";
+  const rec = raw as { reason?: unknown; time?: unknown; outstanding_ready?: unknown };
+  if (typeof rec.reason !== "string" || !DURABLE_LEDGER_STOP_REASONS.has(rec.reason)) {
+    return "invalid";
+  }
+  if (typeof rec.time !== "string" || rec.time.length === 0) return "invalid";
+  if (rec.outstanding_ready !== undefined) {
+    if (
+      !Array.isArray(rec.outstanding_ready) ||
+      rec.outstanding_ready.some((id) => typeof id !== "string")
+    ) {
+      return "invalid";
+    }
+  }
+  return "stop";
+}
+
+/**
+ * A stop is terminal only on a durable ledger envelope: schema plus a run_id
+ * that matches the bound loop. Stop-only or identity-mismatched objects are
+ * malformed, not proof the bound loop is dead.
+ */
+function parseDurableLedger(raw: unknown, expectedRunId: string): "open" | "stop" | "invalid" {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return "invalid";
+  const rec = raw as { schema?: unknown; run_id?: unknown; stop?: unknown };
+  if (rec.schema !== LOOP_LEDGER_SCHEMA) return "invalid";
+  if (typeof rec.run_id !== "string" || rec.run_id !== expectedRunId) return "invalid";
+  return parseLedgerStopField(rec.stop);
+}
+
+function eventsAreTerminal(text: string): boolean {
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const ev = JSON.parse(trimmed) as { kind?: unknown; type?: unknown };
+      if (!ev || typeof ev !== "object" || Array.isArray(ev)) continue;
+      const kind = String(ev.kind ?? ev.type ?? "");
+      if (TERMINAL_LOOP_EVENT_KINDS.has(kind)) return true;
+    } catch {
+      continue;
+    }
+  }
+  return false;
+}
+
+type TextFileRead =
+  | { status: "ok"; text: string }
+  | { status: "missing" }
+  | { status: "unreadable" };
+
+async function resolveTextFile(
+  p: string,
+  readTextFile?: (path: string) => Promise<string | null> | string | null,
+): Promise<TextFileRead> {
+  const asErrno = (err: unknown): string | undefined =>
+    (err as NodeJS.ErrnoException).code;
+  if (typeof readTextFile === "function") {
+    try {
+      const text = await readTextFile(p);
+      if (text == null) return { status: "missing" };
+      return { status: "ok", text };
+    } catch (err) {
+      if (asErrno(err) === "ENOENT") return { status: "missing" };
+      return { status: "unreadable" };
+    }
+  }
+  try {
+    return { status: "ok", text: await fs.readFile(p, "utf8") };
+  } catch (err) {
+    if (asErrno(err) === "ENOENT") return { status: "missing" };
+    return { status: "unreadable" };
+  }
+}
+
+export async function probeBoundPackLoopLive(
+  loopRunId: string,
+  opts: {
+    env?: NodeJS.ProcessEnv;
+    isPidAlive?: (pid: number) => Promise<boolean> | boolean;
+    readTextFile?: (p: string) => Promise<string | null> | string | null;
+  } = {},
+): Promise<BoundPackLoopLiveness> {
+  const id = loopRunId.trim();
+  if (!SAFE_LOOP_RUN_ID.test(id) || id === "." || id === ".." || id.includes("..")) {
+    return "not-live";
+  }
+  const env = opts.env ?? process.env;
+  const home = resolveStateHome({ env, hostname: () => "unused" });
+  const runDir = path.join(home, "runs", id);
+  const lock = await resolveTextFile(path.join(runDir, "lock.json"), opts.readTextFile);
+  let lockPidAlive = false;
+  let lockUnreadable = lock.status === "unreadable";
+  if (lock.status === "ok") {
+    try {
+      const parsed = JSON.parse(lock.text) as { pid?: unknown };
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        lockUnreadable = true;
+      } else {
+        const pid = parseLockPidField(parsed.pid);
+        if (pid === null) {
+          lockUnreadable = true;
+        } else {
+          try {
+            lockPidAlive = Boolean(await (opts.isPidAlive ?? defaultIsPidAlive)(pid));
+          } catch {
+            lockUnreadable = true;
+          }
+        }
+      }
+    } catch {
+      lockUnreadable = true;
+    }
+  }
+  const ledger = await resolveTextFile(path.join(runDir, "ledger.json"), opts.readTextFile);
+  let ledgerPresent = false;
+  let ledgerStopPresent = false;
+  let ledgerUnreadable = ledger.status === "unreadable";
+  if (ledger.status === "ok") {
+    if (!ledger.text.trim()) {
+      ledgerUnreadable = true;
+    } else {
+      try {
+        const parsed: unknown = JSON.parse(ledger.text);
+        const stopKind = parseDurableLedger(parsed, id);
+        if (stopKind === "invalid") {
+          ledgerUnreadable = true;
+        } else {
+          ledgerPresent = true;
+          ledgerStopPresent = stopKind === "stop";
+        }
+      } catch {
+        ledgerUnreadable = true;
+      }
+    }
+  }
+  const events = await resolveTextFile(path.join(runDir, "events.jsonl"), opts.readTextFile);
+  const eventsTerminal = events.status === "ok" ? eventsAreTerminal(events.text) : false;
+  return classifyBoundPackLoopLiveness({
+    lockPidAlive,
+    lockUnreadable,
+    ledgerPresent,
+    ledgerStopPresent,
+    ledgerUnreadable,
+    eventsTerminal,
+  });
+}
+
+async function boundPackLoopLiveForWait(
+  ctx: CandidateShipEndContext,
+  loopRunId: string,
+): Promise<BoundPackLoopLiveness> {
+  if (typeof ctx.isBoundPackLoopLive === "function") {
+    return normalizeBoundPackLoopLiveness(await ctx.isBoundPackLoopLive(loopRunId));
+  }
+  return probeBoundPackLoopLive(loopRunId, {
+    env: ctx.env,
+    isPidAlive: ctx.isPidAlive,
+    readTextFile: ctx.readTextFile,
+  });
 }
 
 async function resolveCandidateFactoryReleaseRequestPath(
@@ -1277,7 +1562,9 @@ export function bindCandidateShipEndOperations(
       }
       const requestPath = await resolveCandidateFactoryReleaseRequestPath(ctx, intent, train);
       const attempts = ctx.frgWaitAttempts ?? FRG_WAIT_ATTEMPTS;
-      for (let attempt = 0; attempt < attempts; attempt++) {
+      let attempt = 0;
+      for (;;) {
+        attempt += 1;
         const prep = await spawnLeaf(
           ctx,
           engine,
@@ -1308,17 +1595,30 @@ export function bindCandidateShipEndOperations(
           continue;
         }
         if (verdict === "retry") {
-          if (attempt + 1 < attempts) await delayMs(ctx, FRG_WAIT_MS);
+          const loopRunId = prepareLoopRunId(parsed);
+          const live = await boundPackLoopLiveForWait(ctx, loopRunId);
+          const decision = classifyFrgPackWaitDecision({
+            tick: "retry",
+            live,
+            attempt,
+            cap: attempts,
+          });
+          if (decision === "fail") {
+            throw new Error(
+              `ship FRG: candidate factory-release prepare did not reach complete after ${attempts} ticks; ` +
+                "retry the same ship command to resume the bound pack",
+            );
+          }
+          if (typeof ctx.onFrgWaitTick === "function") {
+            await ctx.onFrgWaitTick({ intent, attempt, loopRunId, live });
+          }
+          await delayMs(ctx, FRG_WAIT_MS);
           continue;
         }
         throw new Error(
           `ship FRG: candidate factory-release prepare failed (exit ${prep.code}): ${prep.stderr || prep.stdout}`,
         );
       }
-      throw new Error(
-        `ship FRG: candidate factory-release prepare did not reach complete after ${attempts} ticks; ` +
-          "retry the same ship command to resume the bound pack",
-      );
     },
     async prepareRelease(intent, candidateHeadOid) {
       const engine = await requireCandidate(candidateHeadOid);
@@ -1520,6 +1820,7 @@ export function realShipCoordinatorDeps(opts: RealShipCoordinatorDepsOptions): S
       }
     });
   const pinOps = realShipAdapterOperations(opts);
+  const state = opts.state ?? defaultShipStateStore(opts.env);
   const ops = bindCandidateShipEndOperations(pinOps, {
     pinCommitSha: pinSha,
     repoDir: opts.repoDir,
@@ -1532,8 +1833,32 @@ export function realShipCoordinatorDeps(opts: RealShipCoordinatorDepsOptions): S
     resolveCandidate: resolve,
     spawn,
     ...(opts.spawnEnsureTag ? { spawnEnsureTag: opts.spawnEnsureTag } : {}),
+    async onFrgWaitTick(tick) {
+      opts.progress(
+        `ship FRG: wait heartbeat attempt=${tick.attempt} loop=${tick.loopRunId || "none"} live=${tick.live}`,
+      );
+      const key = shipKey(tick.intent);
+      const current = await state.read(key);
+      if (!current || current.next_action !== "frg_pack") return;
+      const now = new Date().toISOString();
+      await state.writeAtomic(key, {
+        ...current,
+        revision: current.revision + 1,
+        updated_at: now,
+        last_error: null,
+      });
+      const event: ShipPhaseEvent = {
+        schema_version: 1,
+        kind: "ship_phase",
+        run_id: current.run_id,
+        event_id: current.intent.event_id,
+        at: now,
+        phase: "frg_pack",
+        status: "started",
+        detail: `in_progress wait tick ${tick.attempt} loop=${tick.loopRunId || "none"} live=${tick.live}`,
+      };
+      await state.appendEvent(key, event);
+    },
   });
-  return shipCoordinatorDepsFromOperations(ops, {
-    state: opts.state ?? defaultShipStateStore(opts.env),
-  });
+  return shipCoordinatorDepsFromOperations(ops, { state });
 }

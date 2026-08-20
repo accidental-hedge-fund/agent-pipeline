@@ -179,6 +179,8 @@ composer runs `pipeline factory-gate --for <X.Y.Z> --from-run <loop>` in a
 **separate** credentialed process (no `--observations`). Pack-done is
 bound `latest.json` `pass: true` (or prepare `complete` with an open
 release PR). Unsigned `awaiting_frg_attestation` is **not** pack-done.
+Ship-path composers wait until the bound pack loop is terminal (or a real
+pack-fail). Wait-budget expiry while that loop is live is **not** pack-fail.
 Auto-tag (#1040) and pin (#1041) remain later children. They do not invent
 a second pass definition.
 

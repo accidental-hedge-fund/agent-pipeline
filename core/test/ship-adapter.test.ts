@@ -9,15 +9,20 @@ import {
   assertFrgCandidateProvenance,
   assertEnsureTagOidIsMergedRelease,
   bindCandidateShipEndOperations,
+  boundPackLoopIsLive,
+  classifyBoundPackLoopLiveness,
+  classifyFrgPackWaitDecision,
   ensureAnnotatedReleaseTag,
   persistShipFactoryReleaseRequest,
   persistedShipFactoryReleaseRequestPath,
+  probeBoundPackLoopLive,
   runEnsureAnnotatedReleaseTagCli,
   shipCoordinatorDepsFromOperations,
   verifyAnnotatedReleaseTag,
   type ObservedEnsureTagReleasePr,
   type ShipAdapterOperations,
 } from "../scripts/stages/ship-adapter.ts";
+import { LOOP_LEDGER_SCHEMA } from "../scripts/loop/types.ts";
 import {
   runShipCoordinator,
   shipKey,
@@ -718,6 +723,7 @@ test("in_progress prepare within wait budget does not invoke factory-gate", asyn
     factoryReleaseRequestPath: "/abs/req.json",
     frgWaitAttempts: 2,
     delay: async () => {},
+    isBoundPackLoopLive: async () => false,
     resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
     spawn: async (argv) => {
       spawned.push(argv);
@@ -734,6 +740,497 @@ test("in_progress prepare within wait budget does not invoke factory-gate", asyn
   );
   assert.equal(spawned.filter((argv) => argv.includes("factory-release")).length, 2);
   assert.equal(spawned.filter((argv) => argv.includes("factory-gate")).length, 0);
+});
+
+test("classifyFrgPackWaitDecision: live in_progress at cap is continue (#1150)", () => {
+  assert.equal(
+    classifyFrgPackWaitDecision({ tick: "retry", live: true, attempt: 2, cap: 2 }),
+    "continue",
+  );
+  assert.equal(
+    classifyFrgPackWaitDecision({ tick: "retry", live: "unknown", attempt: 2, cap: 2 }),
+    "continue",
+  );
+  assert.equal(
+    classifyFrgPackWaitDecision({ tick: "retry", live: false, attempt: 2, cap: 2 }),
+    "fail",
+  );
+  assert.equal(
+    classifyFrgPackWaitDecision({ tick: "retry", live: false, attempt: 1, cap: 2 }),
+    "continue",
+  );
+  assert.equal(boundPackLoopIsLive({
+    lockPidAlive: true,
+    ledgerPresent: false,
+    ledgerStopPresent: false,
+    eventsTerminal: false,
+  }), true);
+  assert.equal(boundPackLoopIsLive({
+    lockPidAlive: false,
+    ledgerPresent: true,
+    ledgerStopPresent: false,
+    eventsTerminal: false,
+  }), true);
+  assert.equal(boundPackLoopIsLive({
+    lockPidAlive: false,
+    ledgerPresent: false,
+    ledgerStopPresent: false,
+    eventsTerminal: false,
+  }), false);
+  assert.equal(boundPackLoopIsLive({
+    lockPidAlive: false,
+    ledgerPresent: true,
+    ledgerStopPresent: true,
+    eventsTerminal: false,
+  }), false);
+  assert.equal(classifyBoundPackLoopLiveness({
+    lockPidAlive: false,
+    lockUnreadable: true,
+    ledgerPresent: false,
+    ledgerStopPresent: false,
+    eventsTerminal: false,
+  }), "unknown");
+  assert.equal(classifyBoundPackLoopLiveness({
+    lockPidAlive: false,
+    ledgerPresent: false,
+    ledgerStopPresent: false,
+    ledgerUnreadable: true,
+    eventsTerminal: false,
+  }), "unknown");
+  assert.equal(classifyBoundPackLoopLiveness({
+    lockPidAlive: false,
+    lockUnreadable: true,
+    ledgerPresent: true,
+    ledgerStopPresent: false,
+    eventsTerminal: false,
+  }), "live");
+});
+
+test("live in_progress at cap keeps re-invoking prepare (#1150)", async () => {
+  const spawned: string[][] = [];
+  const heartbeats: Array<{ attempt: number; live: string }> = [];
+  let prepareTicks = 0;
+  const bound = bindCandidateShipEndOperations(operations(), {
+    pinCommitSha: PIN_SHA,
+    repoDir: "/repo",
+    env: {},
+    factoryReleaseRequestPath: "/abs/req.json",
+    frgWaitAttempts: 2,
+    delay: async () => {},
+    isBoundPackLoopLive: async () => true,
+    onFrgWaitTick: (tick) => {
+      heartbeats.push({ attempt: tick.attempt, live: tick.live });
+    },
+    resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+    spawn: async (argv) => {
+      spawned.push(argv);
+      prepareTicks++;
+      if (prepareTicks < 3) {
+        return {
+          code: 0,
+          stdout: JSON.stringify({ status: "in_progress", loop_run_id: "loop-1" }),
+          stderr: "",
+        };
+      }
+      return { code: 0, stdout: JSON.stringify({ status: "complete" }), stderr: "" };
+    },
+  });
+  await bound.runFrgPack!(intent, train);
+  assert.equal(spawned.filter((argv) => argv.includes("factory-release")).length, 3);
+  assert.equal(spawned.filter((argv) => argv.includes("factory-gate")).length, 0);
+  assert.deepEqual(heartbeats, [
+    { attempt: 1, live: "live" },
+    { attempt: 2, live: "live" },
+  ]);
+});
+
+test("unknown liveness at cap keeps re-invoking prepare (#1150)", async () => {
+  const spawned: string[][] = [];
+  const heartbeats: Array<{ attempt: number; live: string }> = [];
+  let prepareTicks = 0;
+  const bound = bindCandidateShipEndOperations(operations(), {
+    pinCommitSha: PIN_SHA,
+    repoDir: "/repo",
+    env: {},
+    factoryReleaseRequestPath: "/abs/req.json",
+    frgWaitAttempts: 2,
+    delay: async () => {},
+    isBoundPackLoopLive: async () => "unknown",
+    onFrgWaitTick: (tick) => {
+      heartbeats.push({ attempt: tick.attempt, live: tick.live });
+    },
+    resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+    spawn: async (argv) => {
+      spawned.push(argv);
+      prepareTicks++;
+      if (prepareTicks < 3) {
+        return {
+          code: 0,
+          stdout: JSON.stringify({ status: "in_progress", loop_run_id: "loop-1" }),
+          stderr: "",
+        };
+      }
+      return { code: 0, stdout: JSON.stringify({ status: "complete" }), stderr: "" };
+    },
+  });
+  await bound.runFrgPack!(intent, train);
+  assert.equal(spawned.filter((argv) => argv.includes("factory-release")).length, 3);
+  assert.deepEqual(heartbeats, [
+    { attempt: 1, live: "unknown" },
+    { attempt: 2, live: "unknown" },
+  ]);
+});
+
+test("dead-loop in_progress at cap still throws resume-to-retry (#1150)", async () => {
+  const spawned: string[][] = [];
+  const bound = bindCandidateShipEndOperations(operations(), {
+    pinCommitSha: PIN_SHA,
+    repoDir: "/repo",
+    env: {},
+    factoryReleaseRequestPath: "/abs/req.json",
+    frgWaitAttempts: 2,
+    delay: async () => {},
+    isBoundPackLoopLive: async () => false,
+    resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+    spawn: async (argv) => {
+      spawned.push(argv);
+      return {
+        code: 0,
+        stdout: JSON.stringify({ status: "in_progress", loop_run_id: "loop-1" }),
+        stderr: "",
+      };
+    },
+  });
+  await assert.rejects(
+    bound.runFrgPack!(intent, train),
+    /retry the same ship command to resume the bound pack/,
+  );
+  assert.equal(spawned.filter((argv) => argv.includes("factory-release")).length, 2);
+});
+
+const TERMINAL_LEDGER_STOP = {
+  reason: "supervisor_cycle_cap",
+  time: "2026-08-20T00:00:00.000Z",
+} as const;
+
+function durableLedgerJson(runId: string, stop: unknown): string {
+  return JSON.stringify({ schema: LOOP_LEDGER_SCHEMA, run_id: runId, stop });
+}
+
+test("probeBoundPackLoopLive reads injected lock/ledger fixtures (#1150)", async () => {
+  const files = new Map<string, string>([
+    ["/home/runs/loop-live/ledger.json", durableLedgerJson("loop-live", null)],
+    ["/home/runs/loop-dead/lock.json", JSON.stringify({ pid: 99 })],
+    [
+      "/home/runs/loop-dead/ledger.json",
+      durableLedgerJson("loop-dead", TERMINAL_LEDGER_STOP),
+    ],
+    ["/home/runs/loop-pid/lock.json", JSON.stringify({ pid: 42 })],
+  ]);
+  const env = { AGENT_PIPELINE_STATE_HOME: "/home" } as NodeJS.ProcessEnv;
+  const readTextFile = (p: string) => files.get(p) ?? null;
+  assert.equal(
+    await probeBoundPackLoopLive("loop-live", { env, readTextFile, isPidAlive: () => false }),
+    "live",
+  );
+  assert.equal(
+    await probeBoundPackLoopLive("loop-dead", { env, readTextFile, isPidAlive: () => false }),
+    "not-live",
+  );
+  assert.equal(
+    await probeBoundPackLoopLive("loop-pid", { env, readTextFile, isPidAlive: (pid) => pid === 42 }),
+    "live",
+  );
+  assert.equal(
+    await probeBoundPackLoopLive("loop-missing", { env, readTextFile, isPidAlive: () => false }),
+    "not-live",
+  );
+});
+
+test("probeBoundPackLoopLive treats read failures and corrupt state as unknown (#1150)", async () => {
+  const env = { AGENT_PIPELINE_STATE_HOME: "/home" } as NodeJS.ProcessEnv;
+  const eacces = (): never => {
+    const err = new Error("EACCES") as NodeJS.ErrnoException;
+    err.code = "EACCES";
+    throw err;
+  };
+  assert.equal(
+    await probeBoundPackLoopLive("loop-eacces", {
+      env,
+      isPidAlive: () => false,
+      readTextFile: (p) => (p.endsWith("lock.json") ? eacces() : null),
+    }),
+    "unknown",
+  );
+  assert.equal(
+    await probeBoundPackLoopLive("loop-eio-ledger", {
+      env,
+      isPidAlive: () => false,
+      readTextFile: (p) => {
+        if (p.endsWith("lock.json")) return JSON.stringify({ pid: 99 });
+        if (p.endsWith("ledger.json")) {
+          const err = new Error("EIO") as NodeJS.ErrnoException;
+          err.code = "EIO";
+          throw err;
+        }
+        return null;
+      },
+    }),
+    "unknown",
+  );
+  assert.equal(
+    await probeBoundPackLoopLive("loop-corrupt", {
+      env,
+      isPidAlive: () => false,
+      readTextFile: (p) => (p.endsWith("lock.json") ? "{" : null),
+    }),
+    "unknown",
+  );
+  assert.equal(
+    await probeBoundPackLoopLive("loop-corrupt-ledger", {
+      env,
+      isPidAlive: () => false,
+      readTextFile: (p) => {
+        if (p.endsWith("lock.json")) return JSON.stringify({ pid: 99 });
+        if (p.endsWith("ledger.json")) return "{";
+        return null;
+      },
+    }),
+    "unknown",
+  );
+  assert.equal(
+    await probeBoundPackLoopLive("loop-unreadable-lock-live-ledger", {
+      env,
+      isPidAlive: () => false,
+      readTextFile: (p) => {
+        if (p.endsWith("lock.json")) return eacces();
+        if (p.endsWith("ledger.json")) {
+          return durableLedgerJson("loop-unreadable-lock-live-ledger", null);
+        }
+        return null;
+      },
+    }),
+    "live",
+  );
+});
+
+test("probeBoundPackLoopLive treats schema-invalid or blank state as unknown at cap (#1150)", async () => {
+  const env = { AGENT_PIPELINE_STATE_HOME: "/home" } as NodeJS.ProcessEnv;
+  const files = new Map<string, string>([
+    ["/home/runs/loop-empty-lock/lock.json", "{}"],
+    ["/home/runs/loop-bad-pid/lock.json", JSON.stringify({ pid: "bad" })],
+    ["/home/runs/loop-blank-ledger/ledger.json", "  \n\t"],
+    [
+      "/home/runs/loop-bad-stop/lock.json",
+      JSON.stringify({ pid: 99 }),
+    ],
+    [
+      "/home/runs/loop-bad-stop/ledger.json",
+      durableLedgerJson("loop-bad-stop", true),
+    ],
+    [
+      "/home/runs/loop-bad-stop-str/lock.json",
+      JSON.stringify({ pid: 99 }),
+    ],
+    [
+      "/home/runs/loop-bad-stop-str/ledger.json",
+      durableLedgerJson("loop-bad-stop-str", "yes"),
+    ],
+    [
+      "/home/runs/loop-empty-stop/lock.json",
+      JSON.stringify({ pid: 99 }),
+    ],
+    [
+      "/home/runs/loop-empty-stop/ledger.json",
+      durableLedgerJson("loop-empty-stop", {}),
+    ],
+    [
+      "/home/runs/loop-malformed-stop/lock.json",
+      JSON.stringify({ pid: 99 }),
+    ],
+    [
+      "/home/runs/loop-malformed-stop/ledger.json",
+      durableLedgerJson("loop-malformed-stop", {
+        reason: "not-a-terminal-reason",
+        time: "2026-08-20T00:00:00.000Z",
+      }),
+    ],
+  ]);
+  const readTextFile = (p: string) => files.get(p) ?? null;
+  const opts = { env, readTextFile, isPidAlive: () => false };
+  for (const id of [
+    "loop-empty-lock",
+    "loop-bad-pid",
+    "loop-blank-ledger",
+    "loop-bad-stop",
+    "loop-bad-stop-str",
+    "loop-empty-stop",
+    "loop-malformed-stop",
+  ]) {
+    const live = await probeBoundPackLoopLive(id, opts);
+    assert.equal(live, "unknown", `${id} must be unknown, not not-live`);
+    assert.equal(
+      classifyFrgPackWaitDecision({ tick: "retry", live, attempt: 2, cap: 2 }),
+      "continue",
+      `${id} must wait-continue at cap`,
+    );
+  }
+});
+
+test("probeBoundPackLoopLive treats missing or mismatched ledger identity as unknown at cap (#1150)", async () => {
+  const env = { AGENT_PIPELINE_STATE_HOME: "/home" } as NodeJS.ProcessEnv;
+  const files = new Map<string, string>([
+    ["/home/runs/loop-stop-only/lock.json", JSON.stringify({ pid: 99 })],
+    [
+      "/home/runs/loop-stop-only/ledger.json",
+      JSON.stringify({ stop: TERMINAL_LEDGER_STOP }),
+    ],
+    ["/home/runs/loop-missing-schema/lock.json", JSON.stringify({ pid: 99 })],
+    [
+      "/home/runs/loop-missing-schema/ledger.json",
+      JSON.stringify({ run_id: "loop-missing-schema", stop: TERMINAL_LEDGER_STOP }),
+    ],
+    ["/home/runs/loop-numeric-schema/lock.json", JSON.stringify({ pid: 99 })],
+    [
+      "/home/runs/loop-numeric-schema/ledger.json",
+      JSON.stringify({
+        schema: 1,
+        run_id: "loop-numeric-schema",
+        stop: TERMINAL_LEDGER_STOP,
+      }),
+    ],
+    ["/home/runs/loop-mismatched-id/lock.json", JSON.stringify({ pid: 99 })],
+    [
+      "/home/runs/loop-mismatched-id/ledger.json",
+      durableLedgerJson("other-loop", TERMINAL_LEDGER_STOP),
+    ],
+  ]);
+  const readTextFile = (p: string) => files.get(p) ?? null;
+  const opts = { env, readTextFile, isPidAlive: () => false };
+  for (const id of [
+    "loop-stop-only",
+    "loop-missing-schema",
+    "loop-numeric-schema",
+    "loop-mismatched-id",
+  ]) {
+    const live = await probeBoundPackLoopLive(id, opts);
+    assert.equal(live, "unknown", `${id} must be unknown, not not-live`);
+    assert.equal(
+      classifyFrgPackWaitDecision({ tick: "retry", live, attempt: 2, cap: 2 }),
+      "continue",
+      `${id} must wait-continue at cap`,
+    );
+  }
+});
+
+test("empty or malformed ledger stop at cap keeps re-invoking prepare (#1150)", async () => {
+  const env = { AGENT_PIPELINE_STATE_HOME: "/home" } as NodeJS.ProcessEnv;
+  const fixtures: unknown[] = [
+    {},
+    { reason: "not-a-terminal-reason", time: "2026-08-20T00:00:00.000Z" },
+  ];
+  for (const stop of fixtures) {
+    const spawned: string[][] = [];
+    const heartbeats: Array<{ attempt: number; live: string }> = [];
+    let prepareTicks = 0;
+    const bound = bindCandidateShipEndOperations(operations(), {
+      pinCommitSha: PIN_SHA,
+      repoDir: "/repo",
+      env,
+      factoryReleaseRequestPath: "/abs/req.json",
+      frgWaitAttempts: 2,
+      delay: async () => {},
+      isPidAlive: () => false,
+      readTextFile: (p) => {
+        if (p.endsWith("lock.json")) return JSON.stringify({ pid: 99 });
+        if (p.endsWith("ledger.json")) {
+          return durableLedgerJson("loop-1", stop);
+        }
+        return null;
+      },
+      onFrgWaitTick: (tick) => {
+        heartbeats.push({ attempt: tick.attempt, live: tick.live });
+      },
+      resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+      spawn: async (argv) => {
+        spawned.push(argv);
+        prepareTicks++;
+        if (prepareTicks < 3) {
+          return {
+            code: 0,
+            stdout: JSON.stringify({ status: "in_progress", loop_run_id: "loop-1" }),
+            stderr: "",
+          };
+        }
+        return { code: 0, stdout: JSON.stringify({ status: "complete" }), stderr: "" };
+      },
+    });
+    await bound.runFrgPack!(intent, train);
+    assert.equal(
+      spawned.filter((argv) => argv.includes("factory-release")).length,
+      3,
+      `stop=${JSON.stringify(stop)} must continue past the numeric cap`,
+    );
+    assert.deepEqual(heartbeats, [
+      { attempt: 1, live: "unknown" },
+      { attempt: 2, live: "unknown" },
+    ]);
+  }
+});
+
+test("missing or mismatched ledger identity at cap keeps re-invoking prepare (#1150)", async () => {
+  const env = { AGENT_PIPELINE_STATE_HOME: "/home" } as NodeJS.ProcessEnv;
+  const fixtures: unknown[] = [
+    { stop: TERMINAL_LEDGER_STOP },
+    { run_id: "loop-1", stop: TERMINAL_LEDGER_STOP },
+    { schema: 1, run_id: "loop-1", stop: TERMINAL_LEDGER_STOP },
+    { schema: LOOP_LEDGER_SCHEMA, run_id: "other-loop", stop: TERMINAL_LEDGER_STOP },
+  ];
+  for (const ledger of fixtures) {
+    const spawned: string[][] = [];
+    const heartbeats: Array<{ attempt: number; live: string }> = [];
+    let prepareTicks = 0;
+    const bound = bindCandidateShipEndOperations(operations(), {
+      pinCommitSha: PIN_SHA,
+      repoDir: "/repo",
+      env,
+      factoryReleaseRequestPath: "/abs/req.json",
+      frgWaitAttempts: 2,
+      delay: async () => {},
+      isPidAlive: () => false,
+      readTextFile: (p) => {
+        if (p.endsWith("lock.json")) return JSON.stringify({ pid: 99 });
+        if (p.endsWith("ledger.json")) return JSON.stringify(ledger);
+        return null;
+      },
+      onFrgWaitTick: (tick) => {
+        heartbeats.push({ attempt: tick.attempt, live: tick.live });
+      },
+      resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+      spawn: async (argv) => {
+        spawned.push(argv);
+        prepareTicks++;
+        if (prepareTicks < 3) {
+          return {
+            code: 0,
+            stdout: JSON.stringify({ status: "in_progress", loop_run_id: "loop-1" }),
+            stderr: "",
+          };
+        }
+        return { code: 0, stdout: JSON.stringify({ status: "complete" }), stderr: "" };
+      },
+    });
+    await bound.runFrgPack!(intent, train);
+    assert.equal(
+      spawned.filter((argv) => argv.includes("factory-release")).length,
+      3,
+      `ledger=${JSON.stringify(ledger)} must continue past the numeric cap`,
+    );
+    assert.deepEqual(heartbeats, [
+      { attempt: 1, live: "unknown" },
+      { attempt: 2, live: "unknown" },
+    ]);
+  }
 });
 
 test("missing request path fails closed before candidate FRG prepare", async () => {
