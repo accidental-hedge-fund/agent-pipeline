@@ -3741,6 +3741,20 @@ test("tugboat FRG wait: live in_progress is not pack-fail and heartbeats (#1150)
   );
 });
 
+function installCandidateComposer(candRoot: string): void {
+  const dest = path.join(candRoot, "examples/supervisor/shell");
+  fs.mkdirSync(dest, { recursive: true });
+  for (const name of [
+    "tugboat.sh",
+    "release-checks-green.py",
+    "train-status-complete.py",
+    "ship-notify.sh",
+  ]) {
+    const src = path.join(repoRoot, "examples/supervisor/shell", name);
+    if (fs.existsSync(src)) fs.copyFileSync(src, path.join(dest, name));
+  }
+}
+
 test("tugboat after train-complete records candidate argv not pin argv (#1151)", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-ship-end-"));
   try {
@@ -3752,6 +3766,7 @@ test("tugboat after train-complete records candidate argv not pin argv (#1151)",
     fs.mkdirSync(path.join(candRoot, "core/scripts"), { recursive: true });
     fs.mkdirSync(path.join(candRoot, "scripts"), { recursive: true });
     fs.writeFileSync(path.join(candRoot, "core/scripts/pipeline.ts"), "// candidate\n");
+    installCandidateComposer(candRoot);
     const launcher = path.join(candRoot, "scripts/pipeline-launcher.mjs");
     fs.writeFileSync(
       launcher,
@@ -3864,6 +3879,7 @@ function writeTugboatFrgFixture(dir: string, opts: {
   fs.mkdirSync(path.join(candRoot, "core/scripts"), { recursive: true });
   fs.mkdirSync(path.join(candRoot, "scripts"), { recursive: true });
   fs.writeFileSync(path.join(candRoot, "core/scripts/pipeline.ts"), "// candidate\n");
+  installCandidateComposer(candRoot);
   const launcher = path.join(candRoot, "scripts/pipeline-launcher.mjs");
   fs.writeFileSync(launcher, opts.launcherBody.join("\n"));
   fs.mkdirSync(candRecord, { recursive: true });
@@ -4259,6 +4275,7 @@ test("tugboat ensure-tag helper: pack-done merge invokes candidate ensure-tag (#
         extractNamedFn(src, "invoke_release_ensure_tag", "tugboat.sh"),
         `SHIP_END_CLI=(${JSON.stringify(cli)})`,
         `SHIP_END_CANDIDATE_SHA=${JSON.stringify(packed)}`,
+        `REPO_DIR=${JSON.stringify(dir)}`,
         `invoke_release_ensure_tag "1.39.5" ${JSON.stringify(finishJson)}`,
         'gh release view "v1.39.5"',
         "",
@@ -4278,6 +4295,8 @@ test("tugboat ensure-tag helper: pack-done merge invokes candidate ensure-tag (#
     assert.match(argv, new RegExp(`^${merge}$`, "m"));
     assert.match(argv, /^--packed-candidate$/m);
     assert.match(argv, new RegExp(`^${packed}$`, "m"));
+    assert.match(argv, /^--repo-path$/m);
+    assert.match(argv, new RegExp(`^${dir}$`, "m"));
     assert.match(fs.readFileSync(path.join(dir, "gh.log"), "utf8"), /release\nview/);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -4314,6 +4333,7 @@ test("tugboat ensure-tag helper: missing mergeCommitOid fails before gh release 
         extractNamedFn(src, "invoke_release_ensure_tag", "tugboat.sh"),
         'SHIP_END_CLI=("pipeline")',
         `SHIP_END_CANDIDATE_SHA=${JSON.stringify("a".repeat(40))}`,
+        `REPO_DIR=${JSON.stringify(dir)}`,
         `invoke_release_ensure_tag "1.39.5" ${JSON.stringify(finishJson)}`,
         'gh release view "v1.39.5"',
         "",
@@ -4378,6 +4398,7 @@ test("tugboat ensure-tag helper: non-zero ensure-tag prevents wait-release (#114
         extractNamedFn(src, "invoke_release_ensure_tag", "tugboat.sh"),
         `SHIP_END_CLI=(${JSON.stringify(cli)})`,
         `SHIP_END_CANDIDATE_SHA=${JSON.stringify("a".repeat(40))}`,
+        `REPO_DIR=${JSON.stringify(dir)}`,
         `invoke_release_ensure_tag "1.39.5" ${JSON.stringify(finishJson)}`,
         'gh release view "v1.39.5"',
         "",
@@ -4396,4 +4417,121 @@ test("tugboat ensure-tag helper: non-zero ensure-tag prevents wait-release (#114
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("tugboat resolve_ship_end_node skips PATH node 22 for a later node 24 (#1162)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-node24-"));
+  try {
+    const bin22 = path.join(dir, "n22");
+    const bin24 = path.join(dir, "n24");
+    fs.mkdirSync(bin22);
+    fs.mkdirSync(bin24);
+    const writeNode = (file: string, major: string) => {
+      fs.writeFileSync(
+        file,
+        ["#!/usr/bin/env bash", `if [[ "$1" == "-p" ]]; then echo ${major}; exit 0; fi`, "exit 0", ""].join("\n"),
+      );
+      fs.chmodSync(file, 0o755);
+    };
+    writeNode(path.join(bin22, "node"), "22");
+    writeNode(path.join(bin24, "node"), "24");
+    const src = fs.readFileSync(tugboat, "utf8");
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        "SHIP_END_NODE=",
+        extractNamedFn(src, "resolve_ship_end_node", "tugboat.sh"),
+        "resolve_ship_end_node",
+        'printf "%s" "$SHIP_END_NODE"',
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    const r = spawnSync("/bin/bash", [runner], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${bin22}${path.delimiter}${bin24}${path.delimiter}${process.env.PATH ?? "/usr/bin"}`,
+        SHIP_END_NODE: "",
+      },
+    });
+    assert.equal(r.status, 0, `resolve_ship_end_node exited ${r.status}: ${r.stderr}\n${r.error ?? ""}`);
+    assert.equal(r.stdout, path.join(bin24, "node"));
+    assert.match(r.stderr, /ship-end-node: .*n24\/node \(major=24\)/);
+    assert.doesNotMatch(r.stdout, /n22/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("tugboat ensure-tag argv requires --repo-path (#1163)", () => {
+  const src = fs.readFileSync(tugboat, "utf8");
+  const fn = extractNamedFn(src, "invoke_release_ensure_tag", "tugboat.sh");
+  assert.match(fn, /--repo-path "\$REPO_DIR"/);
+  assert.match(fn, /REPO_DIR required for release ensure-tag --repo-path/);
+});
+
+test("tugboat after train re-execs candidate tugboat.sh and skip-train omits train (#1164)", () => {
+  const src = fs.readFileSync(tugboat, "utf8");
+  const shipOne = tugboatShipOneBody();
+  assert.match(shipOne, /maybe_reexec_candidate_composer/);
+  assert.match(shipOne, /TUGBOAT_SKIP_TRAIN/);
+  const reexec = extractNamedFn(src, "maybe_reexec_candidate_composer", "tugboat.sh");
+  assert.match(reexec, /examples\/supervisor\/shell\/tugboat\.sh/);
+  assert.match(reexec, /exec bash "\$cand"/);
+  assert.match(reexec, /TUGBOAT_SKIP_TRAIN=1/);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-reexec-"));
+  try {
+    const candRoot = path.join(dir, "candidate");
+    const dest = path.join(candRoot, "examples/supervisor/shell");
+    fs.mkdirSync(dest, { recursive: true });
+    const marker = path.join(dir, "reexec.marker");
+    fs.writeFileSync(
+      path.join(dest, "tugboat.sh"),
+      [
+        "#!/usr/bin/env bash",
+        "printf '%s\\n' \"reexec skip=${TUGBOAT_SKIP_TRAIN:-}\" > " + JSON.stringify(marker),
+        "exit 0",
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(path.join(dest, "tugboat.sh"), 0o755);
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        "TUGBOAT_INVOKE_ARGV=(--milestone v1.39.6)",
+        `SHIP_END_ENGINE_ROOT=${JSON.stringify(candRoot)}`,
+        `SHIP_END_CANDIDATE_SHA=${JSON.stringify("c".repeat(40))}`,
+        extractNamedFn(src, "is_exact_git_sha", "tugboat.sh"),
+        extractNamedFn(src, "maybe_reexec_candidate_composer", "tugboat.sh"),
+        "maybe_reexec_candidate_composer",
+        "echo DID_NOT_EXEC",
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    const r = spawnSync("bash", [runner], { encoding: "utf8" });
+    assert.equal(r.status, 0, `re-exec helper exited ${r.status}: ${r.stderr}`);
+    assert.doesNotMatch(r.stdout, /DID_NOT_EXEC/);
+    const markerText = fs.readFileSync(marker, "utf8");
+    assert.match(markerText, /reexec skip=1/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("tugboat wait-release polls gh release view and never creates the Release (#1167)", () => {
+  const shipOne = tugboatShipOneBody();
+  assert.match(shipOne, /gh release view "v\$version"/);
+  assert.doesNotMatch(shipOne, /gh release create/);
+  assert.doesNotMatch(shipOne, /\bgit tag\b/);
+  const wait = shipOne.slice(shipOne.indexOf("wait-release"));
+  assert.match(wait, /gh release view/);
+  assert.doesNotMatch(wait, /gh release create/);
 });

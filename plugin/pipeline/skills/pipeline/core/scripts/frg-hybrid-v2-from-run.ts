@@ -81,6 +81,44 @@ function itemNumbers(contract: LoopContract): number[] {
   return contract.items.map((item) => Number(item.id));
 }
 
+const GREEN_CHECK_CONCLUSIONS = new Set(["success", "neutral", "skipped"]);
+const FAILED_CHECK_CONCLUSIONS = new Set([
+  "failure",
+  "cancelled",
+  "timed_out",
+  "action_required",
+  "startup_failure",
+  "stale",
+]);
+
+/** True when live GitHub is ready-to-deploy with all-green PR checks (#1165). */
+export function githubReadyToDeployOverlay(opts: {
+  labels: readonly string[];
+  checks: readonly { conclusion?: string | null }[];
+}): boolean {
+  if (!opts.labels.includes("pipeline:ready-to-deploy")) return false;
+  if (opts.checks.length === 0) return false;
+  for (const check of opts.checks) {
+    const conclusion = String(check.conclusion ?? "").trim().toLowerCase();
+    if (!conclusion || conclusion === "pending" || conclusion === "queued" || conclusion === "in_progress") {
+      return false;
+    }
+    if (FAILED_CHECK_CONCLUSIONS.has(conclusion)) return false;
+    if (!GREEN_CHECK_CONCLUSIONS.has(conclusion)) return false;
+  }
+  return true;
+}
+
+/** Ledger state after GitHub overlay. Ready stays ready. Blocked becomes ready when GitHub is R2D+green. */
+export function overlayLedgerStateFromGitHub(
+  ledgerState: string,
+  opts: { labels: readonly string[]; checks: readonly { conclusion?: string | null }[] },
+): string {
+  if (ledgerState === "ready") return "ready";
+  if (githubReadyToDeployOverlay(opts)) return "ready";
+  return ledgerState;
+}
+
 /** Prefer the titled pack PR; closed is valid after factory-gate auto-close. */
 export function selectPackPr<T extends { title?: string; state?: string }>(
   issueNumber: number,
@@ -326,12 +364,20 @@ export async function defaultCollectHybridV2FromRun(
     },
     ledger: {
       artifact_sha256: sha256(JSON.stringify(args.ledger)),
-      items: Object.entries(args.ledger.items ?? {}).map(([id, item]) => ({
-        issue_number: Number(id),
-        state: item.state,
-        advance_run_id: item.advance_run_id ?? `advance-${id}`,
-        blocked_theme: item.blocked_theme ?? null,
-      })),
+      items: Object.entries(args.ledger.items ?? {}).map(([id, item]) => {
+        const issueNumber = Number(id);
+        const live = liveIssues.find((issue) => issue.issue_number === issueNumber);
+        const state = overlayLedgerStateFromGitHub(String(item.state ?? ""), {
+          labels: live?.labels ?? [],
+          checks: live?.pr.checks ?? [],
+        });
+        return {
+          issue_number: issueNumber,
+          state,
+          advance_run_id: item.advance_run_id ?? `advance-${id}`,
+          blocked_theme: item.blocked_theme ?? null,
+        };
+      }),
     },
     events: {
       artifact_sha256: sha256("events"),

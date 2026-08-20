@@ -17,6 +17,7 @@ import {
   persistShipFactoryReleaseRequest,
   persistedShipFactoryReleaseRequestPath,
   probeBoundPackLoopLive,
+  resolveEnsureTagOwnerRepo,
   runEnsureAnnotatedReleaseTagCli,
   shipCoordinatorDepsFromOperations,
   verifyAnnotatedReleaseTag,
@@ -1489,6 +1490,38 @@ test("assertEnsureTagOidIsMergedRelease rejects an unrelated OID", () => {
     mergeCommitOid: mergeHead,
     observed: mergedReleasePr(mergeHead),
   }));
+});
+
+test("resolveEnsureTagOwnerRepo uses origin remote when cfg.repo is empty (#1163)", () => {
+  assert.equal(resolveEnsureTagOwnerRepo("", "git@github.com:accidental-hedge-fund/agent-pipeline.git"),
+    "accidental-hedge-fund/agent-pipeline");
+  assert.equal(
+    resolveEnsureTagOwnerRepo("", "https://github.com/accidental-hedge-fund/agent-pipeline.git"),
+    "accidental-hedge-fund/agent-pipeline",
+  );
+  assert.equal(resolveEnsureTagOwnerRepo("cfg/repo", "git@github.com:other/x.git"), "cfg/repo");
+  assert.equal(resolveEnsureTagOwnerRepo("", null), "");
+  assert.equal(resolveEnsureTagOwnerRepo("", "not-a-github-url"), "");
+});
+
+test("runEnsureAnnotatedReleaseTagCli observes via origin remote when repo is empty (#1163)", async () => {
+  const calls: string[][] = [];
+  const result = await runEnsureAnnotatedReleaseTagCli(
+    {
+      repoDir: "/repo",
+      repo: "",
+      version: intent.version,
+      mergeCommitOid: mergeHead,
+      packedCandidate: head,
+    },
+    {
+      git: missingTagGit(calls),
+      validateFrg: async () => hmacSnapshot(head),
+      observeMergedReleasePr: async () => mergedReleasePr(),
+      gitRemoteUrl: async () => "git@github.com:accidental-hedge-fund/agent-pipeline.git",
+    },
+  );
+  assert.equal(result, "created");
 });
 
 test("runEnsureAnnotatedReleaseTagCli fails closed without a repo directory", async () => {

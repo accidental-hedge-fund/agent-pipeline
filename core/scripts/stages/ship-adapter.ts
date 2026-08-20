@@ -78,6 +78,7 @@ import {
   realReleaseFinishDeps,
 } from "./release-finish.ts";
 import { realEnginePromoteDeps, runEnginePromote } from "./engine-promote.ts";
+import { ownerRepoFromPackageRepository } from "../production-engine-pin.ts";
 
 const execFileAsync = promisify(execFile);
 const OID_RE = /^[0-9a-f]{40}$/i;
@@ -1505,16 +1506,60 @@ export function assertEnsureTagOidIsMergedRelease(opts: {
   }
 }
 
+export function resolveEnsureTagOwnerRepo(
+  cfgRepo: string | undefined,
+  originUrl: string | null | undefined,
+): string {
+  const fromCfg = typeof cfgRepo === "string" ? cfgRepo.trim() : "";
+  if (fromCfg) return fromCfg;
+  if (!originUrl) return "";
+  return ownerRepoFromPackageRepository(originUrl) ?? "";
+}
+
+export async function ownerRepoFromGitOrigin(
+  repoDir: string,
+  gitRemoteUrl?: () => Promise<string>,
+): Promise<string> {
+  const url = gitRemoteUrl
+    ? await gitRemoteUrl()
+    : await (async () => {
+      const { stdout } = await execFileAsync(
+        "git",
+        ["-C", repoDir, "remote", "get-url", "origin"],
+        { timeout: 15_000, maxBuffer: 1024 * 1024 },
+      );
+      return String(stdout).trim();
+    })();
+  return resolveEnsureTagOwnerRepo("", url);
+}
+
 async function defaultObserveMergedReleasePr(
   repoDir: string,
   repo: string | undefined,
   version: string,
+  gitRemoteUrl?: () => Promise<string>,
 ): Promise<ObservedEnsureTagReleasePr> {
-  if (!repo) {
+  let resolved = typeof repo === "string" ? repo.trim() : "";
+  if (!resolved) {
+    try {
+      const url = gitRemoteUrl
+        ? await gitRemoteUrl()
+        : (await execFileAsync(
+          "git",
+          ["-C", repoDir, "remote", "get-url", "origin"],
+          { timeout: 15_000, maxBuffer: 1024 * 1024 },
+        )).stdout;
+      resolved = resolveEnsureTagOwnerRepo("", String(url).trim());
+    } catch {
+      resolved = "";
+    }
+  }
+  if (!resolved) {
     throw new Error(
       "ship release: candidate ensure-tag cannot re-observe the release PR without a repository",
     );
   }
+  repo = resolved;
   const branch = `release/v${version}`;
   const { stdout } = await execFileAsync(
     "gh",
@@ -1524,7 +1569,7 @@ async function defaultObserveMergedReleasePr(
       "--head", branch,
       "--limit", "10",
       "--json", "number,title,state,mergeCommit,isCrossRepository",
-      "-R", repo,
+      "-R", resolved,
     ],
     {
       cwd: repoDir,
@@ -1581,6 +1626,7 @@ export async function runEnsureAnnotatedReleaseTagCli(
     git?: (args: string[]) => Promise<string>;
     validateFrg?: () => Promise<unknown>;
     observeMergedReleasePr?: (version: string) => Promise<ObservedEnsureTagReleasePr>;
+    gitRemoteUrl?: () => Promise<string>;
   },
 ): Promise<"created" | "exists"> {
   if (!opts.repoDir) {
@@ -1598,7 +1644,8 @@ export async function runEnsureAnnotatedReleaseTagCli(
     return String(stdout).trim();
   });
   const observeMergedReleasePr = io?.observeMergedReleasePr
-    ?? ((version: string) => defaultObserveMergedReleasePr(opts.repoDir, opts.repo, version));
+    ?? ((version: string) =>
+      defaultObserveMergedReleasePr(opts.repoDir, opts.repo, version, io?.gitRemoteUrl));
   const validateFrg = async () => {
     const observed = await observeMergedReleasePr(opts.version);
     assertEnsureTagOidIsMergedRelease({
