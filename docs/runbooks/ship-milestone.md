@@ -141,7 +141,7 @@ Issues on the milestone must be `pipeline:ready` before train dispatch.
 ### Phase sequence (fixed)
 
 1. `pipeline train --milestone vX.Y.Z --merge --json` (complete gate + resume)
-2. FRG pack: uncredentialed `pipeline factory-release prepare --request <abs.json> --json`, then (when unsigned) `pipeline factory-gate --for X.Y.Z --from-run <loop>` in a separate credentialed child; re-invoke until pack-done
+2. FRG pack: uncredentialed `pipeline factory-release prepare --request <abs.json> --json`, then (when unsigned) `pipeline factory-gate --for X.Y.Z --from-run <loop>` in a separate credentialed child; re-invoke until pack-done. While prepare is `in_progress` and the bound pack loop is live (`lock.json` pid alive or ledger not terminal), wait is wait-until-terminal with a heartbeat. A CI-length poll cap (about 20 minutes) is not pack-fail. Re-detach is not the resume path. Wait-budget expiry may fail the pack only when the bound loop is not live.
 3. `pipeline release X.Y.Z --no-edit` (**bare** version — leading `v` is invalid; **no** `--skip-frg`)
 4. Wait until open release PR checks are green (`gh pr checks --json name,state,bucket,link`). A first flake-eligible `test` fail requests `gh run rerun --failed` once, then waits again. Non-test product fails STOP. After merge, refresh installed Tugboat and `release-checks-green.py` from `examples/supervisor/shell/`.
 5. `pipeline release finish <pr>`
@@ -176,7 +176,13 @@ Tugboat runs `pipeline factory-gate --for X.Y.Z --from-run <loop>` in a
 `--observations`. Pack-done is this version's `latest.json` `pass: true` bound
 to the request candidate SHA (and `action_id` when recorded), or prepare
 `complete` with an open release PR. `awaiting_frg_attestation` alone is **not**
-pack-done. A failed or missing pack stops the ship **before** `pipeline release`.
+pack-done. While prepare stays `in_progress` and the bound pack loop is live,
+Tugboat and in-engine `pipeline ship` keep re-invoking the same request and
+keep `state.json` at `frg-pack` / `running` (heartbeat). They do not fail the
+ship for wait-budget expiry and do not require a human re-detach. The numeric
+`FRG_WAIT_*` cap applies only when the bound loop is not live. CI /
+release-PR check wait (`RELEASE_WAIT_*`) stays a CI poll. A failed or missing
+pack stops the ship **before** `pipeline release`.
 If the candidate engine cannot be resolved, Tugboat fails closed and does **not**
 fall back to the production-pin `$PIPELINE` for those verbs. Tugboat does not
 write the key body into `state.json`.

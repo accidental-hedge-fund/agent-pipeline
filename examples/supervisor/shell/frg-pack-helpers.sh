@@ -565,3 +565,113 @@ invoke_frg_pack_attestor() {
     env -u PIPELINE_FRG_ATTESTATION_KEY_FILE \
     "${SHIP_END_CLI[@]}" factory-gate --for "$ver" --from-run "$loop" >"$out" 2>"$err"
 }
+
+# Bound pack loop is live when lock.json pid is alive or ledger/events are not
+# terminal. Not live when lock pid is dead or missing AND ledger is terminal or
+# missing. Prints 1 or 0. Never kills the pid. $1 = prepare loop_run_id.
+frg_pack_loop_is_live() {
+  python3 - "${1:-}" <<'PY'
+import json, os, re, sys
+
+loop_id = sys.argv[1].strip() if len(sys.argv) > 1 else ""
+safe = re.compile(r"^[A-Za-z0-9._-]+$")
+if not loop_id or not safe.match(loop_id) or loop_id in (".", "..") or ".." in loop_id:
+    print("0")
+    raise SystemExit(0)
+
+home = os.environ.get("AGENT_PIPELINE_STATE_HOME") or os.environ.get("PIPELINE_STATE_HOME")
+if home:
+    home = os.path.abspath(home)
+elif os.environ.get("XDG_STATE_HOME"):
+    home = os.path.join(os.path.abspath(os.environ["XDG_STATE_HOME"]), "agent-pipeline", "loop")
+else:
+    home = os.path.join(os.path.expanduser("~"), ".local", "state", "agent-pipeline", "loop")
+
+run_dir = os.path.join(home, "runs", loop_id)
+lock_path = os.path.join(run_dir, "lock.json")
+ledger_path = os.path.join(run_dir, "ledger.json")
+events_path = os.path.join(run_dir, "events.jsonl")
+
+pid_alive = False
+try:
+    obj = json.loads(open(lock_path, encoding="utf-8").read())
+    pid = obj.get("pid") if isinstance(obj, dict) else None
+    if isinstance(pid, str) and pid.isdigit():
+        pid = int(pid)
+    if isinstance(pid, int) and pid > 0:
+        try:
+            os.kill(pid, 0)
+            pid_alive = True
+        except ProcessLookupError:
+            pid_alive = False
+        except PermissionError:
+            pid_alive = True
+        except OSError as exc:
+            pid_alive = getattr(exc, "errno", None) == 1
+except Exception:
+    pid_alive = False
+
+if pid_alive:
+    print("1")
+    raise SystemExit(0)
+
+ledger_present = False
+ledger_stop = False
+if os.path.isfile(ledger_path) and os.path.getsize(ledger_path) > 0:
+    try:
+        ledger = json.loads(open(ledger_path, encoding="utf-8").read())
+        if isinstance(ledger, dict):
+            ledger_present = True
+            ledger_stop = bool(ledger.get("stop"))
+    except Exception:
+        ledger_present = False
+        ledger_stop = False
+
+events_terminal = False
+if os.path.isfile(events_path):
+    try:
+        for line in open(events_path, encoding="utf-8"):
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                ev = json.loads(text)
+            except Exception:
+                continue
+            kind = ""
+            if isinstance(ev, dict):
+                kind = str(ev.get("kind") or ev.get("type") or "")
+            if kind in ("loop_run_complete", "loop_run_stopped", "run_complete"):
+                events_terminal = True
+                break
+    except Exception:
+        events_terminal = False
+
+if ledger_present and not ledger_stop and not events_terminal:
+    print("1")
+    raise SystemExit(0)
+print("0")
+PY
+}
+
+# Wait-continue vs wait-fail. $1 tick (retry|done|attest|fail) $2 live (1|0)
+# $3 attempt (1-based) $4 numeric cap. retry + live continues even at cap.
+frg_pack_wait_decision() {
+  local tick=${1:-}
+  local live=${2:-0}
+  local attempt=${3:-0}
+  local cap=${4:-0}
+  if [[ "$tick" != "retry" ]]; then
+    printf '%s\n' "continue"
+    return 0
+  fi
+  if [[ "$live" == "1" ]]; then
+    printf '%s\n' "continue"
+    return 0
+  fi
+  if [[ "$attempt" =~ ^[0-9]+$ && "$cap" =~ ^[0-9]+$ && "$attempt" -lt "$cap" ]]; then
+    printf '%s\n' "continue"
+    return 0
+  fi
+  printf '%s\n' "fail"
+}

@@ -40,6 +40,7 @@ import {
 import { resolveReleaseConfig } from "../config.ts";
 import { getPrForIssueAnyState } from "../gh.ts";
 import { withLock } from "../lock.ts";
+import { resolveStateHome } from "../loop/store.ts";
 import type { PipelineConfig } from "../types.ts";
 import {
   defaultShipStateStore,
@@ -49,6 +50,7 @@ import {
   type ShipFrgEvidence,
   type ShipFrgPackEvidence,
   type ShipIntent,
+  type ShipPhaseEvent,
   type ShipProgress,
   type ShipPromotionEvidence,
   type ShipPublicationEvidence,
@@ -81,6 +83,12 @@ const RELEASE_WAIT_ATTEMPTS = 120;
 const RELEASE_WAIT_MS = 10_000;
 const FRG_WAIT_ATTEMPTS = 120;
 const FRG_WAIT_MS = 10_000;
+const SAFE_LOOP_RUN_ID = /^[A-Za-z0-9._-]+$/;
+const TERMINAL_LOOP_EVENT_KINDS = new Set([
+  "loop_run_complete",
+  "loop_run_stopped",
+  "run_complete",
+]);
 
 interface ObservedRelease {
   prepare: ShipReleaseEvidence;
@@ -909,6 +917,15 @@ export interface CandidateShipEndContext {
   ): Promise<void>;
   delay?(ms: number): Promise<void>;
   frgWaitAttempts?: number;
+  isBoundPackLoopLive?(loopRunId: string): Promise<boolean> | boolean;
+  isPidAlive?(pid: number): Promise<boolean> | boolean;
+  readTextFile?(p: string): Promise<string | null> | string | null;
+  onFrgWaitTick?(tick: {
+    intent: ShipIntent;
+    attempt: number;
+    loopRunId: string;
+    live: boolean;
+  }): Promise<void> | void;
 }
 
 function candidateIdentityError(detail: string): Error {
@@ -1002,6 +1019,156 @@ function prepareLoopRunId(parsed: Record<string, unknown> | null): string {
     if (typeof nested === "string") return nested.trim();
   }
   return "";
+}
+
+export type FrgPackWaitDecision = "continue" | "fail";
+
+/** retry + live continues even when attempt == cap. Cap applies only when not live. */
+export function classifyFrgPackWaitDecision(input: {
+  tick: CandidatePrepareTick;
+  live: boolean;
+  attempt: number;
+  cap: number;
+}): FrgPackWaitDecision {
+  if (input.tick !== "retry") return "continue";
+  if (input.live) return "continue";
+  if (Number.isInteger(input.attempt) && Number.isInteger(input.cap) && input.attempt < input.cap) {
+    return "continue";
+  }
+  return "fail";
+}
+
+/** Live when lock pid is alive OR ledger is present and not terminal. */
+export function boundPackLoopIsLive(input: {
+  lockPidAlive: boolean;
+  ledgerPresent: boolean;
+  ledgerStopPresent: boolean;
+  eventsTerminal: boolean;
+}): boolean {
+  if (input.lockPidAlive) return true;
+  if (!input.ledgerPresent) return false;
+  if (input.ledgerStopPresent || input.eventsTerminal) return false;
+  return true;
+}
+
+function defaultIsPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    return code === "EPERM";
+  }
+}
+
+function parseLockPidField(raw: unknown): number | null {
+  if (typeof raw === "number") {
+    if (!Number.isInteger(raw) || raw <= 0) return null;
+    return raw;
+  }
+  if (typeof raw === "string" && /^\d+$/.test(raw)) {
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n <= 0) return null;
+    return n;
+  }
+  return null;
+}
+
+function eventsAreTerminal(text: string): boolean {
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const ev = JSON.parse(trimmed) as { kind?: unknown; type?: unknown };
+      if (!ev || typeof ev !== "object" || Array.isArray(ev)) continue;
+      const kind = String(ev.kind ?? ev.type ?? "");
+      if (TERMINAL_LOOP_EVENT_KINDS.has(kind)) return true;
+    } catch {
+      continue;
+    }
+  }
+  return false;
+}
+
+async function resolveTextFile(
+  p: string,
+  readTextFile?: (path: string) => Promise<string | null> | string | null,
+): Promise<string | null> {
+  if (typeof readTextFile === "function") {
+    return await readTextFile(p);
+  }
+  try {
+    return await fs.readFile(p, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+    return null;
+  }
+}
+
+export async function probeBoundPackLoopLive(
+  loopRunId: string,
+  opts: {
+    env?: NodeJS.ProcessEnv;
+    isPidAlive?: (pid: number) => Promise<boolean> | boolean;
+    readTextFile?: (p: string) => Promise<string | null> | string | null;
+  } = {},
+): Promise<boolean> {
+  const id = loopRunId.trim();
+  if (!SAFE_LOOP_RUN_ID.test(id) || id === "." || id === ".." || id.includes("..")) {
+    return false;
+  }
+  const env = opts.env ?? process.env;
+  const home = resolveStateHome({ env, hostname: () => "unused" });
+  const runDir = path.join(home, "runs", id);
+  const lockText = await resolveTextFile(path.join(runDir, "lock.json"), opts.readTextFile);
+  let lockPidAlive = false;
+  if (lockText) {
+    try {
+      const parsed = JSON.parse(lockText) as { pid?: unknown };
+      const pid = parseLockPidField(parsed?.pid);
+      if (pid !== null) {
+        lockPidAlive = Boolean(await (opts.isPidAlive ?? defaultIsPidAlive)(pid));
+      }
+    } catch {
+      lockPidAlive = false;
+    }
+  }
+  const ledgerText = await resolveTextFile(path.join(runDir, "ledger.json"), opts.readTextFile);
+  let ledgerPresent = false;
+  let ledgerStopPresent = false;
+  if (ledgerText && ledgerText.trim()) {
+    try {
+      const ledger = JSON.parse(ledgerText) as { stop?: unknown };
+      if (ledger && typeof ledger === "object" && !Array.isArray(ledger)) {
+        ledgerPresent = true;
+        ledgerStopPresent = Boolean(ledger.stop);
+      }
+    } catch {
+      ledgerPresent = false;
+    }
+  }
+  const eventsText = await resolveTextFile(path.join(runDir, "events.jsonl"), opts.readTextFile);
+  const eventsTerminal = eventsText ? eventsAreTerminal(eventsText) : false;
+  return boundPackLoopIsLive({
+    lockPidAlive,
+    ledgerPresent,
+    ledgerStopPresent,
+    eventsTerminal,
+  });
+}
+
+async function boundPackLoopLiveForWait(
+  ctx: CandidateShipEndContext,
+  loopRunId: string,
+): Promise<boolean> {
+  if (typeof ctx.isBoundPackLoopLive === "function") {
+    return Boolean(await ctx.isBoundPackLoopLive(loopRunId));
+  }
+  return probeBoundPackLoopLive(loopRunId, {
+    env: ctx.env,
+    isPidAlive: ctx.isPidAlive,
+    readTextFile: ctx.readTextFile,
+  });
 }
 
 async function resolveCandidateFactoryReleaseRequestPath(
@@ -1277,7 +1444,9 @@ export function bindCandidateShipEndOperations(
       }
       const requestPath = await resolveCandidateFactoryReleaseRequestPath(ctx, intent, train);
       const attempts = ctx.frgWaitAttempts ?? FRG_WAIT_ATTEMPTS;
-      for (let attempt = 0; attempt < attempts; attempt++) {
+      let attempt = 0;
+      for (;;) {
+        attempt += 1;
         const prep = await spawnLeaf(
           ctx,
           engine,
@@ -1308,17 +1477,30 @@ export function bindCandidateShipEndOperations(
           continue;
         }
         if (verdict === "retry") {
-          if (attempt + 1 < attempts) await delayMs(ctx, FRG_WAIT_MS);
+          const loopRunId = prepareLoopRunId(parsed);
+          const live = await boundPackLoopLiveForWait(ctx, loopRunId);
+          const decision = classifyFrgPackWaitDecision({
+            tick: "retry",
+            live,
+            attempt,
+            cap: attempts,
+          });
+          if (decision === "fail") {
+            throw new Error(
+              `ship FRG: candidate factory-release prepare did not reach complete after ${attempts} ticks; ` +
+                "retry the same ship command to resume the bound pack",
+            );
+          }
+          if (typeof ctx.onFrgWaitTick === "function") {
+            await ctx.onFrgWaitTick({ intent, attempt, loopRunId, live });
+          }
+          await delayMs(ctx, FRG_WAIT_MS);
           continue;
         }
         throw new Error(
           `ship FRG: candidate factory-release prepare failed (exit ${prep.code}): ${prep.stderr || prep.stdout}`,
         );
       }
-      throw new Error(
-        `ship FRG: candidate factory-release prepare did not reach complete after ${attempts} ticks; ` +
-          "retry the same ship command to resume the bound pack",
-      );
     },
     async prepareRelease(intent, candidateHeadOid) {
       const engine = await requireCandidate(candidateHeadOid);
@@ -1520,6 +1702,7 @@ export function realShipCoordinatorDeps(opts: RealShipCoordinatorDepsOptions): S
       }
     });
   const pinOps = realShipAdapterOperations(opts);
+  const state = opts.state ?? defaultShipStateStore(opts.env);
   const ops = bindCandidateShipEndOperations(pinOps, {
     pinCommitSha: pinSha,
     repoDir: opts.repoDir,
@@ -1532,8 +1715,32 @@ export function realShipCoordinatorDeps(opts: RealShipCoordinatorDepsOptions): S
     resolveCandidate: resolve,
     spawn,
     ...(opts.spawnEnsureTag ? { spawnEnsureTag: opts.spawnEnsureTag } : {}),
+    async onFrgWaitTick(tick) {
+      opts.progress(
+        `ship FRG: wait heartbeat attempt=${tick.attempt} loop=${tick.loopRunId || "none"} live=${tick.live}`,
+      );
+      const key = shipKey(tick.intent);
+      const current = await state.read(key);
+      if (!current || current.next_action !== "frg_pack") return;
+      const now = new Date().toISOString();
+      await state.writeAtomic(key, {
+        ...current,
+        revision: current.revision + 1,
+        updated_at: now,
+        last_error: null,
+      });
+      const event: ShipPhaseEvent = {
+        schema_version: 1,
+        kind: "ship_phase",
+        run_id: current.run_id,
+        event_id: current.intent.event_id,
+        at: now,
+        phase: "frg_pack",
+        status: "started",
+        detail: `in_progress wait tick ${tick.attempt} loop=${tick.loopRunId || "none"} live=${tick.live}`,
+      };
+      await state.appendEvent(key, event);
+    },
   });
-  return shipCoordinatorDepsFromOperations(ops, {
-    state: opts.state ?? defaultShipStateStore(opts.env),
-  });
+  return shipCoordinatorDepsFromOperations(ops, { state });
 }

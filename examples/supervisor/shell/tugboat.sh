@@ -50,8 +50,10 @@
 #   RELEASE_WAIT_SLEEP_S   wait sleep seconds (default 40)
 #   RELEASE_CHECKS_RERUN_BUDGET  flake-eligible test reruns per head SHA (default 1, max 2)
 #   RELEASE_CHECKS_FLAKE_ELIGIBLE  comma allowlist of check names (default test)
-#   FRG_WAIT_ATTEMPTS      FRG pack re-invoke attempts (default RELEASE_WAIT_ATTEMPTS)
-#   FRG_WAIT_SLEEP_S       FRG pack sleep seconds (default RELEASE_WAIT_SLEEP_S)
+#   FRG_WAIT_ATTEMPTS      not-live FRG pack wait cap (default RELEASE_WAIT_ATTEMPTS).
+#                          Live bound-loop wait is wait-until-terminal; this cap
+#                          is not the live-loop stop.
+#   FRG_WAIT_SLEEP_S       FRG pack wait heartbeat seconds (default RELEASE_WAIT_SLEEP_S)
 #   ENGINE_PROMOTE_HOST    promote host scope (default all)
 #   TUGBOAT_SKIP_FRG       1 to skip FRG pack (requires TUGBOAT_SKIP_FRG_REASON)
 #   TUGBOAT_SKIP_FRG_REASON  non-empty logged reason for skip escape
@@ -874,6 +876,116 @@ invoke_frg_pack_attestor() {
   PIPELINE_FRG_ATTESTATION_KEY="$(cat -- "$PIPELINE_FRG_ATTESTATION_KEY_FILE")" \
     env -u PIPELINE_FRG_ATTESTATION_KEY_FILE \
     "${SHIP_END_CLI[@]}" factory-gate --for "$ver" --from-run "$loop" >"$out" 2>"$err"
+}
+
+# Bound pack loop is live when lock.json pid is alive or ledger/events are not
+# terminal. Not live when lock pid is dead or missing AND ledger is terminal or
+# missing. Prints 1 or 0. Never kills the pid. $1 = prepare loop_run_id.
+frg_pack_loop_is_live() {
+  python3 - "${1:-}" <<'PY'
+import json, os, re, sys
+
+loop_id = sys.argv[1].strip() if len(sys.argv) > 1 else ""
+safe = re.compile(r"^[A-Za-z0-9._-]+$")
+if not loop_id or not safe.match(loop_id) or loop_id in (".", "..") or ".." in loop_id:
+    print("0")
+    raise SystemExit(0)
+
+home = os.environ.get("AGENT_PIPELINE_STATE_HOME") or os.environ.get("PIPELINE_STATE_HOME")
+if home:
+    home = os.path.abspath(home)
+elif os.environ.get("XDG_STATE_HOME"):
+    home = os.path.join(os.path.abspath(os.environ["XDG_STATE_HOME"]), "agent-pipeline", "loop")
+else:
+    home = os.path.join(os.path.expanduser("~"), ".local", "state", "agent-pipeline", "loop")
+
+run_dir = os.path.join(home, "runs", loop_id)
+lock_path = os.path.join(run_dir, "lock.json")
+ledger_path = os.path.join(run_dir, "ledger.json")
+events_path = os.path.join(run_dir, "events.jsonl")
+
+pid_alive = False
+try:
+    obj = json.loads(open(lock_path, encoding="utf-8").read())
+    pid = obj.get("pid") if isinstance(obj, dict) else None
+    if isinstance(pid, str) and pid.isdigit():
+        pid = int(pid)
+    if isinstance(pid, int) and pid > 0:
+        try:
+            os.kill(pid, 0)
+            pid_alive = True
+        except ProcessLookupError:
+            pid_alive = False
+        except PermissionError:
+            pid_alive = True
+        except OSError as exc:
+            pid_alive = getattr(exc, "errno", None) == 1
+except Exception:
+    pid_alive = False
+
+if pid_alive:
+    print("1")
+    raise SystemExit(0)
+
+ledger_present = False
+ledger_stop = False
+if os.path.isfile(ledger_path) and os.path.getsize(ledger_path) > 0:
+    try:
+        ledger = json.loads(open(ledger_path, encoding="utf-8").read())
+        if isinstance(ledger, dict):
+            ledger_present = True
+            ledger_stop = bool(ledger.get("stop"))
+    except Exception:
+        ledger_present = False
+        ledger_stop = False
+
+events_terminal = False
+if os.path.isfile(events_path):
+    try:
+        for line in open(events_path, encoding="utf-8"):
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                ev = json.loads(text)
+            except Exception:
+                continue
+            kind = ""
+            if isinstance(ev, dict):
+                kind = str(ev.get("kind") or ev.get("type") or "")
+            if kind in ("loop_run_complete", "loop_run_stopped", "run_complete"):
+                events_terminal = True
+                break
+    except Exception:
+        events_terminal = False
+
+if ledger_present and not ledger_stop and not events_terminal:
+    print("1")
+    raise SystemExit(0)
+print("0")
+PY
+}
+
+# Wait-continue vs wait-fail. $1 tick (retry|done|attest|fail) $2 live (1|0)
+# $3 attempt (1-based) $4 numeric cap. retry + live continues even at cap.
+frg_pack_wait_decision() {
+  local tick=${1:-}
+  local live=${2:-0}
+  local attempt=${3:-0}
+  local cap=${4:-0}
+  if [[ "$tick" != "retry" ]]; then
+    printf '%s\n' "continue"
+    return 0
+  fi
+  if [[ "$live" == "1" ]]; then
+    printf '%s\n' "continue"
+    return 0
+  fi
+  if [[ "$attempt" =~ ^[0-9]+$ && "$cap" =~ ^[0-9]+$ && "$attempt" -lt "$cap" ]]; then
+    printf '%s\n' "continue"
+    return 0
+  fi
+  printf '%s\n' "fail"
 }
 
 log() {
@@ -1986,7 +2098,9 @@ ship_one() {
     log "phase frg-pack: start request=$req"
     pack_done=0
     latest_json="$REPO_DIR/.agent-pipeline/frg/$version/latest.json"
-    for i in $(seq 1 "$FRG_WAIT_ATTEMPTS"); do
+    i=0
+    while [[ "$pack_done" -ne 1 ]]; do
+      i=$((i + 1))
       set +e
       invoke_factory_release_prepare "$req" "$RUN_DIR/frg-pack.json" "$RUN_DIR/frg-pack.err"
       pack_ec=$?
@@ -1996,7 +2110,6 @@ ship_one() {
       if [[ "$pack_verdict" == "done" ]]; then
         log "phase frg-pack: pack-done (attempt $i)"
         pack_done=1
-        break
       elif [[ "$pack_verdict" == "attest" ]]; then
         loop_id=$(frg_pack_loop_run_id "$RUN_DIR/frg-pack.json")
         if [[ -z "$loop_id" ]]; then
@@ -2021,13 +2134,22 @@ ship_one() {
         if [[ "$pack_verdict" == "done" ]]; then
           log "phase frg-pack: pack-done after attest (attempt $i)"
           pack_done=1
-          break
+        else
+          write_state "frg-pack" "failed" "FRG pack failed (attestor did not write bound latest.json)"
+          log "FAIL: FRG pack failed (attempt $i) attestor did not write bound latest.json"
+          exit 1
         fi
-        write_state "frg-pack" "failed" "FRG pack failed (attestor did not write bound latest.json)"
-        log "FAIL: FRG pack failed (attempt $i) attestor did not write bound latest.json"
-        exit 1
       elif [[ "$pack_verdict" == "retry" ]]; then
-        log "phase frg-pack: in_progress (attempt $i); waiting"
+        loop_id=$(frg_pack_loop_run_id "$RUN_DIR/frg-pack.json")
+        live=$(frg_pack_loop_is_live "$loop_id")
+        wait_decision=$(frg_pack_wait_decision "$pack_verdict" "$live" "$i" "$FRG_WAIT_ATTEMPTS")
+        if [[ "$wait_decision" == "fail" ]]; then
+          write_state "frg-pack" "failed" "FRG pack still in_progress within wait budget"
+          log "FAIL: FRG pack still in_progress within wait budget"
+          exit 1
+        fi
+        write_state "frg-pack" "running" "in_progress wait tick $i loop=${loop_id:-none} live=$live"
+        log "phase frg-pack: heartbeat in_progress (attempt $i) loop=${loop_id:-none} live=$live"
         sleep "$FRG_WAIT_SLEEP_S"
       else
         write_state "frg-pack" "failed" "FRG pack failed (prepare status or latest.json)"
@@ -2035,11 +2157,6 @@ ship_one() {
         exit 1
       fi
     done
-    if [[ "$pack_done" -ne 1 ]]; then
-      write_state "frg-pack" "failed" "FRG pack still in_progress within wait budget"
-      log "FAIL: FRG pack still in_progress within wait budget"
-      exit 1
-    fi
     write_state "frg-pack" "ok" "pack-done"
     log "phase frg-pack: ok"
   else

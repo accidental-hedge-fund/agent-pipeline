@@ -9,9 +9,12 @@ import {
   assertFrgCandidateProvenance,
   assertEnsureTagOidIsMergedRelease,
   bindCandidateShipEndOperations,
+  boundPackLoopIsLive,
+  classifyFrgPackWaitDecision,
   ensureAnnotatedReleaseTag,
   persistShipFactoryReleaseRequest,
   persistedShipFactoryReleaseRequestPath,
+  probeBoundPackLoopLive,
   runEnsureAnnotatedReleaseTagCli,
   shipCoordinatorDepsFromOperations,
   verifyAnnotatedReleaseTag,
@@ -718,6 +721,7 @@ test("in_progress prepare within wait budget does not invoke factory-gate", asyn
     factoryReleaseRequestPath: "/abs/req.json",
     frgWaitAttempts: 2,
     delay: async () => {},
+    isBoundPackLoopLive: async () => false,
     resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
     spawn: async (argv) => {
       spawned.push(argv);
@@ -734,6 +738,140 @@ test("in_progress prepare within wait budget does not invoke factory-gate", asyn
   );
   assert.equal(spawned.filter((argv) => argv.includes("factory-release")).length, 2);
   assert.equal(spawned.filter((argv) => argv.includes("factory-gate")).length, 0);
+});
+
+test("classifyFrgPackWaitDecision: live in_progress at cap is continue (#1150)", () => {
+  assert.equal(
+    classifyFrgPackWaitDecision({ tick: "retry", live: true, attempt: 2, cap: 2 }),
+    "continue",
+  );
+  assert.equal(
+    classifyFrgPackWaitDecision({ tick: "retry", live: false, attempt: 2, cap: 2 }),
+    "fail",
+  );
+  assert.equal(
+    classifyFrgPackWaitDecision({ tick: "retry", live: false, attempt: 1, cap: 2 }),
+    "continue",
+  );
+  assert.equal(boundPackLoopIsLive({
+    lockPidAlive: true,
+    ledgerPresent: false,
+    ledgerStopPresent: false,
+    eventsTerminal: false,
+  }), true);
+  assert.equal(boundPackLoopIsLive({
+    lockPidAlive: false,
+    ledgerPresent: true,
+    ledgerStopPresent: false,
+    eventsTerminal: false,
+  }), true);
+  assert.equal(boundPackLoopIsLive({
+    lockPidAlive: false,
+    ledgerPresent: false,
+    ledgerStopPresent: false,
+    eventsTerminal: false,
+  }), false);
+  assert.equal(boundPackLoopIsLive({
+    lockPidAlive: false,
+    ledgerPresent: true,
+    ledgerStopPresent: true,
+    eventsTerminal: false,
+  }), false);
+});
+
+test("live in_progress at cap keeps re-invoking prepare (#1150)", async () => {
+  const spawned: string[][] = [];
+  const heartbeats: Array<{ attempt: number; live: boolean }> = [];
+  let prepareTicks = 0;
+  const bound = bindCandidateShipEndOperations(operations(), {
+    pinCommitSha: PIN_SHA,
+    repoDir: "/repo",
+    env: {},
+    factoryReleaseRequestPath: "/abs/req.json",
+    frgWaitAttempts: 2,
+    delay: async () => {},
+    isBoundPackLoopLive: async () => true,
+    onFrgWaitTick: (tick) => {
+      heartbeats.push({ attempt: tick.attempt, live: tick.live });
+    },
+    resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+    spawn: async (argv) => {
+      spawned.push(argv);
+      prepareTicks++;
+      if (prepareTicks < 3) {
+        return {
+          code: 0,
+          stdout: JSON.stringify({ status: "in_progress", loop_run_id: "loop-1" }),
+          stderr: "",
+        };
+      }
+      return { code: 0, stdout: JSON.stringify({ status: "complete" }), stderr: "" };
+    },
+  });
+  await bound.runFrgPack!(intent, train);
+  assert.equal(spawned.filter((argv) => argv.includes("factory-release")).length, 3);
+  assert.equal(spawned.filter((argv) => argv.includes("factory-gate")).length, 0);
+  assert.deepEqual(heartbeats, [
+    { attempt: 1, live: true },
+    { attempt: 2, live: true },
+  ]);
+});
+
+test("dead-loop in_progress at cap still throws resume-to-retry (#1150)", async () => {
+  const spawned: string[][] = [];
+  const bound = bindCandidateShipEndOperations(operations(), {
+    pinCommitSha: PIN_SHA,
+    repoDir: "/repo",
+    env: {},
+    factoryReleaseRequestPath: "/abs/req.json",
+    frgWaitAttempts: 2,
+    delay: async () => {},
+    isBoundPackLoopLive: async () => false,
+    resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+    spawn: async (argv) => {
+      spawned.push(argv);
+      return {
+        code: 0,
+        stdout: JSON.stringify({ status: "in_progress", loop_run_id: "loop-1" }),
+        stderr: "",
+      };
+    },
+  });
+  await assert.rejects(
+    bound.runFrgPack!(intent, train),
+    /retry the same ship command to resume the bound pack/,
+  );
+  assert.equal(spawned.filter((argv) => argv.includes("factory-release")).length, 2);
+});
+
+test("probeBoundPackLoopLive reads injected lock/ledger fixtures (#1150)", async () => {
+  const files = new Map<string, string>([
+    ["/home/runs/loop-live/ledger.json", JSON.stringify({ run_id: "loop-live", stop: null })],
+    ["/home/runs/loop-dead/lock.json", JSON.stringify({ pid: 99 })],
+    [
+      "/home/runs/loop-dead/ledger.json",
+      JSON.stringify({ run_id: "loop-dead", stop: { reason: "supervisor_cycle_cap" } }),
+    ],
+    ["/home/runs/loop-pid/lock.json", JSON.stringify({ pid: 42 })],
+  ]);
+  const env = { AGENT_PIPELINE_STATE_HOME: "/home" } as NodeJS.ProcessEnv;
+  const readTextFile = (p: string) => files.get(p) ?? null;
+  assert.equal(
+    await probeBoundPackLoopLive("loop-live", { env, readTextFile, isPidAlive: () => false }),
+    true,
+  );
+  assert.equal(
+    await probeBoundPackLoopLive("loop-dead", { env, readTextFile, isPidAlive: () => false }),
+    false,
+  );
+  assert.equal(
+    await probeBoundPackLoopLive("loop-pid", { env, readTextFile, isPidAlive: (pid) => pid === 42 }),
+    true,
+  );
+  assert.equal(
+    await probeBoundPackLoopLive("loop-missing", { env, readTextFile, isPidAlive: () => false }),
+    false,
+  );
 });
 
 test("missing request path fails closed before candidate FRG prepare", async () => {
