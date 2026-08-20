@@ -7,10 +7,12 @@ recovery or ship-path fault. Class-over-site does not apply. The class
 this item exercises is the existing OpenSpec author → implement → archive
 path.
 
-`core/test/fixtures/frg/` does not exist yet. Tests already load
+`origin/main` does not ship `core/test/fixtures/frg/`. Tests already load
 repo-local files with `node:fs` (see `readme-landing-contract.test.ts`).
 That pattern needs no `deps` seam because it does not call network, git,
-or subprocesses.
+or subprocesses. `scripts/build.mjs` copies `core/scripts`, `core/profiles`,
+and package files only. A fixture and test under `core/test/` do not
+require a `plugin/` regen.
 
 ## Goals / Non-Goals
 
@@ -75,6 +77,21 @@ require them.
 
 **Why:** The issue asks for one named release. Extra required keys would
 expand the OpenSpec contract past the pack item.
+
+### 5. No plugin mirror for this change
+
+**Choice:** Do not run `node scripts/build.mjs` unless a mirrored
+`core/` path also changes.
+
+**Why:** `scripts/build.mjs` `CORE_ENTRIES` is `scripts`, `profiles`,
+`package.json`, and `package-lock.json`. `core/test/` is not copied
+into `plugin/`. A regen would be a no-op that looks like a production
+touch.
+
+**Alternative considered:** Always regen after any `core/` edit, matching
+the golden rule as written. Rejected for this pack item: the golden
+rule exists to keep the generated mirror in sync. This change does not
+edit a mirrored path.
 
 ## Risks / Trade-offs
 

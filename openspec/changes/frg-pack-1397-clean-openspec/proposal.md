@@ -27,7 +27,7 @@ This is not **BREAKING**.
 - [ ] Production pipeline code, Factory Reliability Gate (FRG) driver code, and pack scoring are unchanged.
 - [ ] The only active OpenSpec change for this work is `frg-pack-1397-clean-openspec`.
 - [ ] Pre-merge archives that change. No foreign active change remains.
-- [ ] After any `core/` edit, `plugin/` is regenerated in the same change. `npm run ci` is green.
+- [ ] `scripts/build.mjs` does not copy `core/test/`. This change does not require a `plugin/` regen unless a mirrored `core/` path also changes. `npm run ci` is green.
 
 ## Capabilities
 
@@ -51,5 +51,4 @@ This is not **BREAKING**.
   (`openspec/specs/frg-pack-1397-clean-openspec/spec.md`).
 - **Production:** none. No CLI, stage, label, merge, or Factory Reliability
   Gate (FRG) scoring change.
-- **Mirror:** if the test lives under `core/`, regenerate `plugin/` in the
-  same change.
+- **Mirror:** none. `core/test/` is not a `scripts/build.mjs` input.
