@@ -2043,31 +2043,43 @@ export async function runRelease(
 
   // Restore every file the version bump + mirror regen + ROADMAP write touch FROM HEAD on
   // abort before a successful release commit (mirror-regen / CI / issue-discovery / editor
-  // abort, or a failed `git add` / `git commit` after `checkout -b`). `git checkout --`
-  // recovers package.json, core/package.json, ROADMAP.md, AND the whole plugin/ mirror in
-  // one step — even if build.mjs deleted files mid-regen — so it does not depend on
-  // re-running the same (failing) build; `git clean -fd` then removes any untracked mirror
-  // debris build.mjs may have generated (safe because the clean-tree precondition above
-  // guaranteed plugin/ and .claude-plugin/ held no untracked files when the run began).
-  // Never pass `.agent-pipeline/frg` to checkout/clean: evidence stays on disk (#1148).
-  // Both exit codes are checked so a failed rollback is surfaced loudly, not silently
-  // claimed as restored. Otherwise a stranded bump poisons a retry whose previousVersion
-  // reads the bumped core (#170). Point of no return is a successful release commit (#1148).
+  // abort, or a failed `git add` / `git commit` after `checkout -b`). `git restore
+  // --source=HEAD --staged --worktree` resets both the index and the worktree from HEAD.
+  // `git checkout --` is not enough after a successful add: it copies the index into the
+  // worktree and would write the staged version bumps back (#1148). `git clean -fd` then
+  // removes any untracked mirror debris build.mjs may have generated (safe because the
+  // clean-tree precondition above guaranteed plugin/ and .claude-plugin/ held no untracked
+  // files when the run began). Never pass `.agent-pipeline/frg` to restore/clean: evidence
+  // stays on disk (#1148). Both exit codes are checked so a failed rollback is surfaced
+  // loudly, not silently claimed as restored. Otherwise a stranded bump poisons a retry
+  // whose previousVersion reads the bumped core (#170). Point of no return is a successful
+  // release commit (#1148).
   const branch = `release/v${resolvedVersion}`;
   const baseBranch = cfg.base_branch ?? "main";
   const restoreManagedFiles = (): boolean => {
     const r = d.runCommand(
       "git",
-      ["checkout", "--", "package.json", "core/package.json", "ROADMAP.md", "plugin", ".claude-plugin"],
+      [
+        "restore",
+        "--source=HEAD",
+        "--staged",
+        "--worktree",
+        "--",
+        "package.json",
+        "core/package.json",
+        "ROADMAP.md",
+        "plugin",
+        ".claude-plugin",
+      ],
       { cwd: repoDir },
     );
     const clean = d.runCommand("git", ["clean", "-fd", "plugin", ".claude-plugin"], { cwd: repoDir });
     if (r.code !== 0 || clean.code !== 0) {
       d.stderr(
-        `[pipeline release] ROLLBACK FAILED (git checkout exited ${r.code}: ${r.stderr.trim()}; ` +
+        `[pipeline release] ROLLBACK FAILED (git restore exited ${r.code}: ${r.stderr.trim()}; ` +
         `git clean exited ${clean.code}: ${clean.stderr.trim()}). ` +
         "The working tree may have a stranded version bump or partial mirror — run " +
-        "`git checkout -- package.json core/package.json ROADMAP.md plugin .claude-plugin && git clean -fd plugin .claude-plugin` manually before retrying.",
+        "`git restore --source=HEAD --staged --worktree -- package.json core/package.json ROADMAP.md plugin .claude-plugin && git clean -fd plugin .claude-plugin` manually before retrying.",
       );
       return false;
     }
@@ -2085,7 +2097,7 @@ export async function runRelease(
       d.stderr(
         `[pipeline release] ROLLBACK FAILED (git checkout ${baseBranch} exited ${checkoutBase.code}: ${checkoutBase.stderr.trim()}). ` +
         `HEAD may still be on ${branch} with a stranded version bump — run ` +
-        `\`git checkout -- package.json core/package.json ROADMAP.md plugin .claude-plugin && git checkout ${baseBranch} && git branch -d ${branch}\` manually before retrying.`,
+        `\`git restore --source=HEAD --staged --worktree -- package.json core/package.json ROADMAP.md plugin .claude-plugin && git checkout ${baseBranch} && git branch -d ${branch}\` manually before retrying.`,
       );
       return;
     }

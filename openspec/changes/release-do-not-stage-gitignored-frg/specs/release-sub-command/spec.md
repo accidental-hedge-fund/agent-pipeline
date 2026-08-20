@@ -39,7 +39,7 @@ This requirement does not change HMAC or pack policy. It does not authorize comm
 
 ### Requirement: Failed staging or commit after release-branch creation SHALL restore the configured base
 
-The live `pipeline release` path SHALL restore the configured base branch (`base_branch` from `.github/pipeline.yml`, default `main`) when `git add` or `git commit` fails after local branch `release/vX.Y.Z` exists and before a successful release commit exists on that branch. The command SHALL restore release-managed files (`package.json`, `core/package.json`, `ROADMAP.md`, `plugin/`, `.claude-plugin/`) to their pre-release HEAD contents. It SHALL NOT leave HEAD on `release/vX.Y.Z`. It SHALL NOT leave uncommitted version bumps in the working tree. It SHALL delete the local `release/vX.Y.Z` branch when that branch has no unique commit, so a retry can create it again. On-disk `.agent-pipeline/frg/` files SHALL remain. A successful release commit SHALL end this restore duty; a later push failure is out of scope.
+The live `pipeline release` path SHALL restore the configured base branch (`base_branch` from `.github/pipeline.yml`, default `main`) when `git add` or `git commit` fails after local branch `release/vX.Y.Z` exists and before a successful release commit exists on that branch. The command SHALL restore release-managed files (`package.json`, `core/package.json`, `ROADMAP.md`, `plugin/`, `.claude-plugin/`) to their pre-release HEAD contents in both the index and the working tree. It SHALL NOT leave HEAD on `release/vX.Y.Z`. It SHALL NOT leave uncommitted version bumps in the index or the working tree. It SHALL delete the local `release/vX.Y.Z` branch when that branch has no unique commit, so a retry can create it again. On-disk `.agent-pipeline/frg/` files SHALL remain. A successful release commit SHALL end this restore duty; a later push failure is out of scope.
 
 #### Scenario: git add of ignored FRG restores the base
 
@@ -56,7 +56,7 @@ The live `pipeline release` path SHALL restore the configured base branch (`base
 - **AND** `git add` succeeded
 - **AND** `git commit` exits non-zero
 - **THEN** HEAD SHALL be the configured base branch (default `main`)
-- **AND** uncommitted version bumps SHALL NOT remain in the working tree
+- **AND** uncommitted version bumps SHALL NOT remain in the index or the working tree
 - **AND** the local `release/v1.39.5` branch SHALL NOT remain if it has no unique commit
 
 #### Scenario: Successful commit is not rolled back by this rule

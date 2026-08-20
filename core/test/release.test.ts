@@ -147,18 +147,33 @@ function getStderr(deps: ReleaseDeps): string[] {
   return (deps as unknown as { _stderr: string[] })._stderr;
 }
 
+const RELEASE_MANAGED_PATHS = [
+  "package.json",
+  "core/package.json",
+  "ROADMAP.md",
+  "plugin",
+  ".claude-plugin",
+] as const;
+
+/** True when argv names a managed path (`plugin` or `plugin/`). */
+function argvNamesManagedPath(args: string[], path: string): boolean {
+  return args.includes(path) || args.includes(`${path}/`);
+}
+
 /**
- * True when the recorded runCommand calls include the rollback `git checkout -- ...`
- * that restores package.json, core/package.json, ROADMAP.md, and the plugin/ mirror
- * from HEAD on a pre-branch abort (#170). The branch-creation `git checkout -b` is
- * distinguished by its `--` separator: the restore has `--` at index 2, `-b` does not.
+ * True when the recorded runCommand calls restore managed files from HEAD
+ * into both the index and the worktree. `git checkout --` is NOT a match:
+ * after `git add` it copies the index into the worktree and leaves staged
+ * version bumps in place (#1148).
  */
 function restoreInvoked(commands: string[][]): boolean {
   return commands.some(
     (c) =>
       c[0] === "git" &&
-      c[1] === "checkout" &&
-      c[2] === "--" &&
+      c[1] === "restore" &&
+      c.includes("--source=HEAD") &&
+      c.includes("--staged") &&
+      c.includes("--worktree") &&
       c.includes("package.json") &&
       c.includes("core/package.json") &&
       c.includes("ROADMAP.md") &&
@@ -177,12 +192,14 @@ function gitAddTouchesFrg(argv: string[] | undefined): boolean {
   );
 }
 
-/** True when restore `git checkout --` or `git clean` named the FRG tree. */
+/** True when restore `git restore`, `git checkout --`, or `git clean` named the FRG tree. */
 function restoreTouchedFrg(commands: string[][]): boolean {
   return commands.some(
     (command) =>
       command[0] === "git" &&
-      (command[1] === "clean" || (command[1] === "checkout" && command[2] === "--")) &&
+      (command[1] === "clean" ||
+        command[1] === "restore" ||
+        (command[1] === "checkout" && command.includes("--"))) &&
       command.some((part) => part.includes(".agent-pipeline/frg")),
   );
 }
@@ -1681,7 +1698,7 @@ test("runRelease: editor abort before branch creation aborts AND rolls back via 
     // The editor launches AFTER the ROADMAP write but BEFORE `git checkout -b`. An editor
     // abort there must restore the working tree (the round-2 finding) and must NOT have
     // created the release branch.
-    assert.ok(restoreInvoked(commands), "git checkout rollback issued when the editor aborts");
+    assert.ok(restoreInvoked(commands), "HEAD restore rollback issued when the editor aborts");
     assert.ok(
       !commands.some((c) => c[0] === "git" && c[1] === "checkout" && c[2] === "-b"),
       "release branch is not created when the editor aborts",
@@ -2456,9 +2473,9 @@ test("runRelease: a post-bump abort (CI failure) restores the bumped files (#170
     () => runRelease("1.6.0", { noEdit: true }, { repo_dir: "/repo", repo: "org/repo" }, deps),
     /CI gate failed/,
   );
-  // The bumped files are reverted by `git checkout -- ...` from HEAD (build.mjs is not
+  // The bumped files are reverted from HEAD into index and worktree (build.mjs is not
   // re-run), so a retry reads the original previousVersion.
-  assert.ok(restoreInvoked(commands), "git checkout rollback issued after CI abort");
+  assert.ok(restoreInvoked(commands), "HEAD restore rollback issued after CI abort");
 });
 
 // ---------------------------------------------------------------------------
@@ -2829,6 +2846,17 @@ test("runRelease: git add failure after checkout -b restores the configured base
 test("runRelease: a post-staging failure preserves FRG and restores the configured base (#1148)", async () => {
   let head = "main";
   const commands: string[][] = [];
+  // Index/worktree seam: `git add` stages version bumps. `git checkout --` copies the
+  // index into the worktree and would leave those bumps after `git checkout main`.
+  // Restore must reset both sides from HEAD (#1148).
+  type TreeSource = "HEAD" | "bump";
+  const index: Record<string, TreeSource> = Object.fromEntries(
+    RELEASE_MANAGED_PATHS.map((path) => [path, "HEAD"]),
+  );
+  const worktree: Record<string, TreeSource> = Object.fromEntries(
+    RELEASE_MANAGED_PATHS.map((path) => [path, "HEAD"]),
+  );
+  let stagedAfterAdd = false;
   const deps = liveReleaseDeps({
     fetchPRClosingIssues: async (n) => (n === 204 ? [158, 170] : []),
     runCommand: (cmd, args) => {
@@ -2843,8 +2871,39 @@ test("runRelease: a post-staging failure preserves FRG and restores the configur
         head = args[2]!;
         return { code: 0, stdout: "", stderr: "" };
       }
+      if (cmd === "git" && args[0] === "checkout" && args[1] === "--") {
+        for (const path of RELEASE_MANAGED_PATHS) {
+          if (argvNamesManagedPath(args, path)) worktree[path] = index[path]!;
+        }
+        return { code: 0, stdout: "", stderr: "" };
+      }
       if (cmd === "git" && args[0] === "checkout" && args[1] !== "-b" && args[1] !== "--") {
         head = args[1]!;
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      if (cmd === "git" && args[0] === "add") {
+        for (const path of RELEASE_MANAGED_PATHS) {
+          if (argvNamesManagedPath(args, path)) {
+            index[path] = "bump";
+            worktree[path] = "bump";
+          }
+        }
+        stagedAfterAdd = RELEASE_MANAGED_PATHS.some((path) => index[path] === "bump");
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      if (
+        cmd === "git" &&
+        args[0] === "restore" &&
+        args.includes("--source=HEAD") &&
+        args.includes("--staged") &&
+        args.includes("--worktree")
+      ) {
+        for (const path of RELEASE_MANAGED_PATHS) {
+          if (argvNamesManagedPath(args, path)) {
+            index[path] = "HEAD";
+            worktree[path] = "HEAD";
+          }
+        }
         return { code: 0, stdout: "", stderr: "" };
       }
       if (cmd === "git" && args[0] === "commit") {
@@ -2868,6 +2927,17 @@ test("runRelease: a post-staging failure preserves FRG and restores the configur
   assert.equal(head, "main", "HEAD must return to the configured base");
   assert.notEqual(head, "release/v1.6.0");
   assert.ok(restoreInvoked(commands), "version files must be restored from HEAD");
+  assert.ok(stagedAfterAdd, "seam must observe staged version bumps after git add");
+  assert.deepEqual(
+    index,
+    Object.fromEntries(RELEASE_MANAGED_PATHS.map((path) => [path, "HEAD"])),
+    "index must be clean after commit failure — git checkout -- leaves staged bumps",
+  );
+  assert.deepEqual(
+    worktree,
+    Object.fromEntries(RELEASE_MANAGED_PATHS.map((path) => [path, "HEAD"])),
+    "worktree must be clean after commit failure — git checkout -- copies the index",
+  );
   assert.ok(checkedOutBranch(commands, "main"));
   assert.ok(deletedLocalBranch(commands, "release/v1.6.0"));
   assert.ok(!restoreTouchedFrg(commands), "must not clean or checkout FRG evidence");

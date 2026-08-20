@@ -64,11 +64,11 @@ Extend the rollback guard through `git add` and `git commit`. After `checkout -b
 
 Restore order:
 
-1. Restore release-managed files from HEAD (`git checkout -- package.json core/package.json ROADMAP.md plugin .claude-plugin` and `git clean -fd plugin .claude-plugin`), same as today's `restoreCheckout`.
+1. Restore release-managed files from HEAD (`git restore --source=HEAD --staged --worktree -- package.json core/package.json ROADMAP.md plugin .claude-plugin` and `git clean -fd plugin .claude-plugin`). `git checkout --` is not enough after a successful `git add`: it copies the index into the worktree and leaves staged version bumps.
 2. Check out the configured base (`cfg.base_branch ?? "main"`).
 3. Delete local `release/vX.Y.Z` only when it has no unique commit, so a retry can `git checkout -b` again.
 
-Do not `git clean` or `git checkout --` `.agent-pipeline/frg`. Evidence stays.
+Do not `git clean`, `git restore`, or `git checkout --` `.agent-pipeline/frg`. Evidence stays.
 
 After a successful commit, this restore SHALL NOT run. A push failure leaves a real local commit for retry.
 
@@ -97,7 +97,7 @@ Keep the existing fail-closed lookup. Missing / fail / unparsable still throw be
 ## Risks / Trade-offs
 
 - **[Risk] leftover local `release/vX.Y.Z` blocks retry** → Mitigation: delete that local branch only when it has no unique commit.
-- **[Risk] restore deletes on-disk HMAC `latest.json`** → Mitigation: restore pathspec stays the living release-managed files. Never pass `.agent-pipeline/frg` to `git checkout --` or `git clean`.
+- **[Risk] restore deletes on-disk HMAC `latest.json`** → Mitigation: restore pathspec stays the living release-managed files. Never pass `.agent-pipeline/frg` to `git restore`, `git checkout --`, or `git clean`.
 - **[Risk] restore after successful commit destroys a real release commit** → Mitigation: restore duty ends at successful commit. Push failure is out of scope.
 - **[Risk] consumers expected FRG in the release tree** → Mitigation: living #1127 / auto-tag / ensure-tag already treat disk as the lookup. PR body still carries `run_id`.
 
