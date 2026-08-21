@@ -19,15 +19,15 @@ then archive that change. Production engine behavior does not change.
 
 ## Acceptance criteria
 
-- [ ] File `core/test/fixtures/frg/pack-1398-tugboat-ship-1.39.8/clean-openspec.json`
+- [x] File `core/test/fixtures/frg/pack-1398-tugboat-ship-1.39.8/clean-openspec.json`
       exists and is valid JSON.
-- [ ] That fixture's `release_version` field equals the string `1.39.8`.
-- [ ] A unit test under `core/test/` reads only that run-scoped path and
+- [x] That fixture's `release_version` field equals the string `1.39.8`.
+- [x] A unit test under `core/test/` reads only that run-scoped path and
       fails if `release_version` is missing or not `1.39.8`.
-- [ ] The unit test does not read any other `core/test/fixtures/frg/` pack
+- [x] The unit test does not read any other `core/test/fixtures/frg/` pack
       directory.
-- [ ] No production module under `core/scripts/` changes behavior.
-- [ ] The only active OpenSpec change for this issue is
+- [x] No production module under `core/scripts/` changes behavior.
+- [x] The only active OpenSpec change for this issue is
       `frg-pack-1398-clean-openspec`.
 - [ ] Pre-merge archives that change into `openspec/changes/archive/` and
       `openspec/specs/`. No path under `openspec/changes/` other than

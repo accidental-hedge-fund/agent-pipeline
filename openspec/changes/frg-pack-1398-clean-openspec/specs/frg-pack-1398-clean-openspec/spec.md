@@ -9,13 +9,13 @@ behavior does not change.
 
 ### Requirement: The pack-1398 clean-openspec fixture SHALL name release 1.39.8
 
+The pack-1398 clean-openspec fixture SHALL name release `1.39.8`.
 The JSON fixture at
 `core/test/fixtures/frg/pack-1398-tugboat-ship-1.39.8/clean-openspec.json`
-SHALL name release `1.39.8`. The fixture SHALL expose that value on the
-`release_version` field as the string `1.39.8`. A unit test SHALL read
-only that run-scoped path and SHALL fail when `release_version` is
-missing or is not `1.39.8`. Production engine modules under
-`core/scripts/` SHALL keep their current behavior.
+SHALL expose that value on the `release_version` field as the string
+`1.39.8`. A unit test SHALL read only that run-scoped path and SHALL
+fail when `release_version` is missing or is not `1.39.8`. Production
+engine modules under `core/scripts/` SHALL keep their current behavior.
 
 #### Scenario: Fixture names release 1.39.8
 
