@@ -9,6 +9,7 @@
 - [x] 2.1 Add an additive factory-plane doctor check (stable `install:` id) that fails when `AGENT_PIPELINE_PRODUCTION_PIN` is a different readable file from `$REPO_DIR/.agent-pipeline/production-engine-pin.json` and `version` or `git_sha` disagree; verify a unit test with env pin `1.39.6` vs control pin `1.39.7` returns `"fail"` (not `"warn"` or `"pass"`)
 - [x] 2.2 Cover same-path / unset env / matching identity / non-factory skip in the same hermetic suite; verify unset env does not fail for split-pin disagreement and non-factory doctor skips
 - [x] 2.3 Include remediation that names both pin paths and instructs unset-or-point-at-control-pin; verify the fail result includes both paths
+- [x] 2.4 Resolve the doctor check's compared path with the same override → env → control order as `engine-promote`; verify a hermetic test fails (not skip/pass) for divergent `production_engine_pin_path` both when the env is unset and when the env points at the control-checkout pin
 
 ## 3. Promote single-write
 

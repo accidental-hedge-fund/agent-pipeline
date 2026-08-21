@@ -1571,12 +1571,13 @@ test("check install:engine-track — additive stable id alongside coherence and 
 const FACTORY_REPO = "accidental-hedge-fund/agent-pipeline";
 const CONTROL_PIN_PATH = "/repo/.agent-pipeline/production-engine-pin.json";
 const HERMES_PIN_PATH = "/home/user/.local/state/hermes-factory/production-engine-pin.json";
+const OVERRIDE_PIN_PATH = "/custom/production-engine-pin.json";
 
 function splitPinDeps(envPin: string | null, controlPin: string | null, o: FakeOverrides = {}): DoctorDeps {
   return fakeDeps({
     ...o,
     readTextFile: (p) => {
-      if (p === HERMES_PIN_PATH || p === "/env/pin.json") return envPin;
+      if (p === HERMES_PIN_PATH || p === "/env/pin.json" || p === OVERRIDE_PIN_PATH) return envPin;
       if (p === CONTROL_PIN_PATH) return controlPin;
       if (o.readTextFile) return o.readTextFile(p);
       if (p.endsWith("production-engine-pin.json")) return controlPin;
@@ -1664,6 +1665,56 @@ test("check install:production-pin-path — non-factory skips (#1183)", async ()
     );
     assert.equal(r.status, "skip");
     assert.notEqual(r.status, "fail");
+  });
+});
+
+test("check install:production-pin-path — config override vs control, unset env → fail (#1183 r2)", async () => {
+  await withoutHostPinAuthorityEnv(async () => {
+    const r = await getCheck(
+      makeConfig({
+        repo: FACTORY_REPO,
+        repo_dir: "/repo",
+        production_engine_pin_path: OVERRIDE_PIN_PATH,
+      }),
+      "install:production-pin-path",
+    ).run(
+      splitPinDeps(
+        pinJson("1.39.6", "a".repeat(40)),
+        pinJson("1.39.7", "e206cfdabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+      ),
+    );
+    assert.equal(r.status, "fail");
+    assert.notEqual(r.status, "warn");
+    assert.notEqual(r.status, "pass");
+    assert.match(r.detail, /1\.39\.6/);
+    assert.match(r.detail, /1\.39\.7/);
+    assert.ok(r.remediation && r.remediation.includes(OVERRIDE_PIN_PATH));
+    assert.ok(r.remediation && r.remediation.includes(CONTROL_PIN_PATH));
+    assert.match(r.remediation, /production_engine_pin_path/);
+  });
+});
+
+test("check install:production-pin-path — config override wins over env set to control pin → fail (#1183 r2)", async () => {
+  await withoutHostPinAuthorityEnv(async () => {
+    process.env[PRODUCTION_PIN_ENV] = CONTROL_PIN_PATH;
+    const r = await getCheck(
+      makeConfig({
+        repo: FACTORY_REPO,
+        repo_dir: "/repo",
+        production_engine_pin_path: OVERRIDE_PIN_PATH,
+      }),
+      "install:production-pin-path",
+    ).run(
+      splitPinDeps(
+        pinJson("1.39.6", "a".repeat(40)),
+        pinJson("1.39.7", "e206cfdabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+      ),
+    );
+    assert.equal(r.status, "fail");
+    assert.notEqual(r.status, "warn");
+    assert.notEqual(r.status, "pass");
+    assert.ok(r.remediation && r.remediation.includes(OVERRIDE_PIN_PATH));
+    assert.match(r.remediation, /production_engine_pin_path/);
   });
 });
 

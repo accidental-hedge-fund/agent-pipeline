@@ -1232,11 +1232,19 @@ export function evaluateEngineTrackCheck(input: {
 export interface ProductionPinPathCheckInput {
   /** True when config.repo is the factory control repository. */
   factoryControlContext: boolean;
+  /**
+   * Config `production_engine_pin_path`. Wins over env (same order as
+   * {@link productionPinPath} / engine-promote).
+   */
+  overridePinPath?: string | null;
   /** Resolved AGENT_PIPELINE_PRODUCTION_PIN, or null when unset/empty. */
   envPinPath: string | null;
   /** `$REPO_DIR/.agent-pipeline/production-engine-pin.json`. */
   controlPinPath: string;
-  /** Env pin file body from DoctorDeps.readTextFile, or null if unreadable. */
+  /**
+   * Body of the effective pin (override → env) from DoctorDeps.readTextFile,
+   * or null if unreadable. Not used when the effective path is the control pin.
+   */
   envPinText: string | null;
   /** Control pin file body from DoctorDeps.readTextFile, or null if unreadable. */
   controlPinText: string | null;
@@ -1249,9 +1257,28 @@ function pinIdentityFields(pin: ProductionEnginePin): { version: string; git_sha
 }
 
 /**
+ * Effective pin path for install:production-pin-path: override → env → null
+ * (null means promote would use the control-checkout pin). Same order as
+ * {@link productionPinPath} without requiring repoDir.
+ */
+function effectiveProductionPinPathForCheck(
+  overridePinPath: string | null | undefined,
+  envPinPath: string | null | undefined,
+): string | null {
+  if (typeof overridePinPath === "string" && overridePinPath.trim()) {
+    return path.resolve(overridePinPath.trim());
+  }
+  if (typeof envPinPath === "string" && envPinPath.trim()) {
+    return path.resolve(envPinPath.trim());
+  }
+  return null;
+}
+
+/**
  * Pure evaluation of install:production-pin-path. No filesystem, network,
- * git, or subprocess. Fail (never warn/pass) when factory-plane env pin
- * and control-checkout pin disagree on version or git_sha.
+ * git, or subprocess. Fail (never warn/pass) when the factory-plane
+ * effective pin (override → env) and control-checkout pin disagree on
+ * version or git_sha.
  */
 export function evaluateProductionPinPathCheck(
   input: ProductionPinPathCheckInput,
@@ -1262,39 +1289,43 @@ export function evaluateProductionPinPathCheck(
       detail: "non-factory host; split-pin check skipped",
     };
   }
-  const envPath =
-    typeof input.envPinPath === "string" && input.envPinPath.trim()
-      ? path.resolve(input.envPinPath.trim())
-      : null;
   const controlPath = path.resolve(input.controlPinPath);
-  if (!envPath) {
+  const overridePath =
+    typeof input.overridePinPath === "string" && input.overridePinPath.trim()
+      ? path.resolve(input.overridePinPath.trim())
+      : null;
+  const effectivePath = effectiveProductionPinPathForCheck(
+    input.overridePinPath,
+    input.envPinPath,
+  );
+  if (!effectivePath) {
     return {
       status: "skip",
       detail: `${PRODUCTION_PIN_ENV} unset; pin resolution uses ${controlPath}`,
     };
   }
-  if (envPath === controlPath) {
+  if (effectivePath === controlPath) {
     return {
       status: "skip",
-      detail: `env pin and control-checkout pin are the same path (${controlPath})`,
+      detail: `effective pin and control-checkout pin are the same path (${controlPath})`,
     };
   }
   if (input.envPinText === null || input.controlPinText === null) {
     return {
       status: "skip",
       detail:
-        `split-pin identity not compared (env ${envPath} readable=${input.envPinText !== null}; ` +
+        `split-pin identity not compared (effective ${effectivePath} readable=${input.envPinText !== null}; ` +
         `control ${controlPath} readable=${input.controlPinText !== null})`,
     };
   }
-  let envPin: ProductionEnginePin;
+  let effectivePin: ProductionEnginePin;
   let controlPin: ProductionEnginePin;
   try {
-    envPin = parseProductionEnginePin(input.envPinText);
+    effectivePin = parseProductionEnginePin(input.envPinText);
   } catch (err) {
     return {
       status: "skip",
-      detail: `env pin unreadable as pin JSON at ${envPath}: ${(err as Error).message}`,
+      detail: `effective pin unreadable as pin JSON at ${effectivePath}: ${(err as Error).message}`,
     };
   }
   try {
@@ -1305,27 +1336,32 @@ export function evaluateProductionPinPathCheck(
       detail: `control pin unreadable as pin JSON at ${controlPath}: ${(err as Error).message}`,
     };
   }
-  const envId = pinIdentityFields(envPin);
+  const effectiveId = pinIdentityFields(effectivePin);
   const controlId = pinIdentityFields(controlPin);
-  if (envId.version === controlId.version && envId.git_sha === controlId.git_sha) {
+  if (effectiveId.version === controlId.version && effectiveId.git_sha === controlId.git_sha) {
     return {
       status: "pass",
       detail:
-        `env pin ${envPath} matches control pin ${controlPath} ` +
+        `effective pin ${effectivePath} matches control pin ${controlPath} ` +
         `(v${controlId.version} sha=${controlId.git_sha || "empty"})`,
     };
   }
-  const envSha = envId.git_sha || "empty";
+  const effectiveSha = effectiveId.git_sha || "empty";
   const controlSha = controlId.git_sha || "empty";
+  const remediation = overridePath
+    ? `Unset production_engine_pin_path (it wins over ${PRODUCTION_PIN_ENV}) so ` +
+      `the control-checkout pin ${controlPath} is used, or set ` +
+      `production_engine_pin_path=${controlPath}. ` +
+      `Do not use a second live pin file. Effective pin: ${effectivePath}. Control pin: ${controlPath}.`
+    : `Unset ${PRODUCTION_PIN_ENV} so Tugboat binds the control-checkout pin ` +
+      `${controlPath}, or set ${PRODUCTION_PIN_ENV}=${controlPath}. ` +
+      `Do not use a second live pin file. Env pin: ${effectivePath}. Control pin: ${controlPath}.`;
   return {
     status: "fail",
     detail:
-      `env pin ${envPath} (v${envId.version} sha=${envSha}) disagrees with ` +
+      `effective pin ${effectivePath} (v${effectiveId.version} sha=${effectiveSha}) disagrees with ` +
       `control pin ${controlPath} (v${controlId.version} sha=${controlSha})`,
-    remediation:
-      `Unset ${PRODUCTION_PIN_ENV} so Tugboat binds the control-checkout pin ` +
-      `${controlPath}, or set ${PRODUCTION_PIN_ENV}=${controlPath}. ` +
-      `Do not use a second live pin file. Env pin: ${envPath}. Control pin: ${controlPath}.`,
+    remediation,
   };
 }
 

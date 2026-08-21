@@ -39,6 +39,7 @@ import {
   isFactoryControlRepo,
   PRODUCTION_ENGINE_PIN_REL,
   PRODUCTION_PIN_ENV,
+  productionPinPath,
   resolveEngineTrackIntent,
   resolveInstallProvenance,
   resolvePinAuthorityDir,
@@ -783,29 +784,36 @@ export function buildPreflightChecks(
     },
   });
 
-  // 6d. Factory-plane env pin vs control-checkout pin (#1183) — additive to
-  //     install:engine-track. That check compares the resolved pin to the
-  //     installed engine. This check fails when AGENT_PIPELINE_PRODUCTION_PIN
-  //     points at a different file whose version/git_sha disagree with the
-  //     control-checkout pin (Buzz SKILL default of a second path).
+  // 6d. Factory-plane effective pin vs control-checkout pin (#1183) — additive
+  //     to install:engine-track. That check compares the resolved pin to the
+  //     installed engine. This check uses the same override → env → control
+  //     resolver as productionPinPath and fails when the winning path is a
+  //     different file whose version/git_sha disagree with the control pin.
   checks.push({
     id: "install:production-pin-path",
     description:
-      "Factory env pin and control-checkout pin agree on version and git_sha",
+      "Factory effective pin and control-checkout pin agree on version and git_sha",
     run: async (deps) => {
       const factoryControlContext = isFactoryControlRepo(config.repo);
+      const overrideRaw = config.production_engine_pin_path ?? null;
+      const overridePinPath =
+        typeof overrideRaw === "string" && overrideRaw.trim()
+          ? path.resolve(overrideRaw.trim())
+          : null;
       const envRaw = process.env[PRODUCTION_PIN_ENV];
       const envPinPath =
         typeof envRaw === "string" && envRaw.trim() ? path.resolve(envRaw.trim()) : null;
       const controlPinPath = path.resolve(config.repo_dir, PRODUCTION_ENGINE_PIN_REL);
+      const effectivePinPath = productionPinPath(config.repo_dir, overrideRaw);
       let envPinText: string | null = null;
       let controlPinText: string | null = null;
-      if (factoryControlContext && envPinPath && envPinPath !== controlPinPath) {
-        envPinText = await deps.readTextFile(envPinPath);
+      if (factoryControlContext && path.resolve(effectivePinPath) !== controlPinPath) {
+        envPinText = await deps.readTextFile(effectivePinPath);
         controlPinText = await deps.readTextFile(controlPinPath);
       }
       const result = evaluateProductionPinPathCheck({
         factoryControlContext,
+        overridePinPath,
         envPinPath,
         controlPinPath,
         envPinText,

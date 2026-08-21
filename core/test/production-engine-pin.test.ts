@@ -1035,6 +1035,67 @@ test("evaluateProductionPinPathCheck: non-factory skips (#1183)", () => {
   assert.notEqual(r.status, "fail");
 });
 
+test("evaluateProductionPinPathCheck: override 1.39.6 vs control 1.39.7, unset env → fail (#1183 r2)", () => {
+  const overridePath = "/custom/production-engine-pin.json";
+  const controlPath = "/factory/.agent-pipeline/production-engine-pin.json";
+  const r = evaluateProductionPinPathCheck({
+    factoryControlContext: true,
+    overridePinPath: overridePath,
+    envPinPath: null,
+    controlPinPath: controlPath,
+    envPinText: JSON.stringify(
+      validPin({
+        version: "1.39.6",
+        tag: "v1.39.6",
+        git_sha: "a".repeat(40),
+      }),
+    ),
+    controlPinText: JSON.stringify(
+      validPin({
+        version: "1.39.7",
+        tag: "v1.39.7",
+        git_sha: "e206cfdabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      }),
+    ),
+  });
+  assert.equal(r.status, "fail");
+  assert.notEqual(r.status, "warn");
+  assert.notEqual(r.status, "pass");
+  assert.ok(r.remediation?.includes(overridePath), r.remediation);
+  assert.ok(r.remediation?.includes(controlPath), r.remediation);
+  assert.match(r.remediation!, /production_engine_pin_path/);
+});
+
+test("evaluateProductionPinPathCheck: override wins over env set to control pin → fail (#1183 r2)", () => {
+  const overridePath = "/custom/production-engine-pin.json";
+  const controlPath = "/factory/.agent-pipeline/production-engine-pin.json";
+  const r = evaluateProductionPinPathCheck({
+    factoryControlContext: true,
+    overridePinPath: overridePath,
+    envPinPath: controlPath,
+    controlPinPath: controlPath,
+    envPinText: JSON.stringify(
+      validPin({
+        version: "1.39.6",
+        tag: "v1.39.6",
+        git_sha: "a".repeat(40),
+      }),
+    ),
+    controlPinText: JSON.stringify(
+      validPin({
+        version: "1.39.7",
+        tag: "v1.39.7",
+        git_sha: "e206cfdabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      }),
+    ),
+  });
+  assert.equal(r.status, "fail");
+  assert.notEqual(r.status, "warn");
+  assert.notEqual(r.status, "pass");
+  assert.ok(r.remediation?.includes(overridePath), r.remediation);
+  assert.match(r.remediation!, /production_engine_pin_path/);
+});
+
 test("evaluateEngineTrackCheck: candidate soak reports no-frg without failing for it (#1041)", () => {
   const pin = validPin({
     version: "1.37.0",
