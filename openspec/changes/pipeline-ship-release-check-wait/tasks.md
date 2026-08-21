@@ -18,6 +18,7 @@
 - [x] 3.2 Add a unit test that fails if a settled flake-eligible `test` fail does not request `gh run rerun --failed` before a second wait
 - [x] 3.3 Inject `gh` and clock via `deps` in both tests, and verify they make no live network, git, or Actions calls
 - [x] 3.4 Keep the already-finished observation fixture green (no wait and no second merge when finish evidence is already observed)
+- [x] 3.5 Add a coordinator-state test that exhausts the pending wait cap and verifies the stored run remains resumable at `release_finish` without persisted ship failure
 
 ## 4. Docs, packaging, gate
 

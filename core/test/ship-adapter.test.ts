@@ -36,6 +36,7 @@ import {
   runShipCoordinator,
   shipKey,
   type ShipIntent,
+  type ShipPhaseEvent,
   type ShipStateStore,
   type ShipStatus,
   type ShipTrainEvidence,
@@ -620,6 +621,88 @@ test("convergeReleaseFinish persists fail without finish on a terminal product f
   assert.equal(reruns, 0);
 });
 
+test("coordinator wait-cap expiry keeps release_finish resumable (#1205)", async () => {
+  const store = memoryShipStore();
+  store.status = checkpoint({
+    ship_key: shipKey(intent),
+    next_action: "release_finish",
+    train,
+    train_plan: { ordered_issues: [...train.ordered_issues] },
+    frg_pack: {
+      version: intent.version,
+      complete: true,
+      loop_run_id: "loop-1",
+      pack_id: "factory-gate-v1",
+      candidate_head_oid: head,
+    },
+    frg: {
+      version: intent.version,
+      pass: true,
+      loop_run_id: "loop-1",
+      frg_run_id: "frg-1",
+      candidate_head_oid: head,
+    },
+    release,
+  });
+  let finishes = 0;
+  let checks = 0;
+  const pendingWait = memoryWait({
+    maxAttempts: 2,
+    getPrChecks: async () => {
+      checks++;
+      return [{ name: "test", state: "PENDING", bucket: "pending", link: "" }];
+    },
+  });
+  const wrap = (deps: ReturnType<typeof shipCoordinatorDepsFromOperations>) => ({
+    ...deps,
+    authorizationPublicKey: "test",
+    withRunLock: async (_key: string, fn: () => Promise<unknown>) => fn(),
+  });
+  const waiting = wrap(shipCoordinatorDepsFromOperations(operations({
+    observeRelease: async () => ({ prepare: release, finish: null }),
+    finishRelease: async () => {
+      finishes++;
+      return releaseFinish;
+    },
+  }), {
+    state: store,
+    releaseCheckWait: pendingWait,
+  }));
+  const checkpointed = await runShipCoordinator(intent, null, waiting);
+  assert.equal(checkpointed.complete, false);
+  assert.equal(checkpointed.next_action, "release_finish");
+  assert.equal(checkpointed.last_error, null);
+  assert.equal(checkpointed.release_finish, null);
+  assert.equal(finishes, 0);
+  assert.equal(checks, 2);
+  assert.ok(!store.events.some((event) => event.status === "failed"));
+
+  checks = 0;
+  const greenWait = memoryWait({
+    maxAttempts: 2,
+    getPrChecks: async () => {
+      checks++;
+      return [{ name: "test", state: "SUCCESS", bucket: "pass" }];
+    },
+  });
+  const resumed = wrap(shipCoordinatorDepsFromOperations(operations({
+    observeRelease: async () => ({ prepare: release, finish: null }),
+    finishRelease: async () => {
+      finishes++;
+      return releaseFinish;
+    },
+  }), {
+    state: store,
+    releaseCheckWait: greenWait,
+  }));
+  const result = await runShipCoordinator(intent, null, resumed);
+  assert.equal(result.complete, true);
+  assert.equal(result.next_action, "complete");
+  assert.equal(result.last_error, null);
+  assert.equal(finishes, 1);
+  assert.equal(checks, 1);
+});
+
 test("convergeReleaseFinish skips wait when finish evidence is already observed (#1205)", async () => {
   let checks = 0;
   let finishes = 0;
@@ -726,18 +809,22 @@ const candidateEngine = {
   commitSha: head,
 };
 
-function memoryShipStore(): ShipStateStore & { status: ShipStatus | null } {
+function memoryShipStore(): ShipStateStore & { status: ShipStatus | null; events: ShipPhaseEvent[] } {
   let status: ShipStatus | null = null;
+  const events: ShipPhaseEvent[] = [];
   return {
     get status() { return status; },
     set status(value) { status = value; },
+    events,
     statusFile: () => "/state/status.json",
     eventsFile: () => "/state/events.jsonl",
     read: async () => status,
     writeAtomic: async (_key, value) => {
       status = value;
     },
-    appendEvent: async () => {},
+    appendEvent: async (_key, event) => {
+      events.push(event);
+    },
   };
 }
 
