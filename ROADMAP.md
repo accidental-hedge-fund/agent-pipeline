@@ -45,6 +45,7 @@ This file is human-readable forward-looking documentation for open work. **GitHu
 | **v1.39.6** ✅ shipped | patch | v1.39.6 | #1162, #1163, #1164, #1165, #1166, #1167 | Shipped 2026-08-20 (tag `v1.39.6`). See CHANGELOG.md. |
 | **v1.39.7** ✅ shipped | patch | v1.39.7 | #1174 | Shipped 2026-08-20 (tag `v1.39.7`). See CHANGELOG.md. |
 | **v1.39.8** ✅ shipped | patch | v1.39.8 | #1181, #1182, #1183, #1192 | Shipped 2026-08-21 (tag `v1.39.8`). See CHANGELOG.md. |
+| **v1.39.9** ✅ shipped | patch | v1.39.9 | #1184 | Shipped 2026-08-21 (tag `v1.39.9`). See CHANGELOG.md. |
 | *(none)* | — | Unscheduled / no release | — | _Structural insertion anchor for `intake` and `sweep` — do not remove._ |
 
 ## Per-issue plan
