@@ -46,6 +46,8 @@
 #                          or major < 24, Tugboat walks PATH then /usr/bin/node.
 #                          systemd export is not required (#1162).
 #   TUGBOAT_SKIP_TRAIN     1 after candidate composer re-exec — skip train (#1164)
+#                          Accepts non-empty train.complete.json or train.json,
+#                          or RUN_DIR no-open-issues resume evidence (#1182).
 #   TUGBOAT_CANDIDATE_COMPOSER
 #                          candidate SHA of the tugboat.sh already exec'd (#1164)
 #   ALLOW_MERGE            must be 1 for train --merge / release finish
@@ -886,6 +888,103 @@ resolve_ship_end_node() {
   done
   echo "FAIL: no Node >= 24 for ship-end CLI (SHIP_END_NODE=${SHIP_END_NODE:-unset})" >&2
   return 1
+}
+
+# Skip-train proof for candidate re-exec (#1182). True when RUN_DIR has a
+# non-empty complete/success capture, or records empty-milestone resume.
+skip_train_has_proof() {
+  [[ -s "${RUN_DIR:-}/train.complete.json" ]] && return 0
+  [[ -s "${RUN_DIR:-}/train.json" ]] && return 0
+  if [[ -s "${RUN_DIR:-}/train.stderr" ]] \
+    && grep -qi 'has no open issues' "$RUN_DIR/train.stderr" 2>/dev/null; then
+    return 0
+  fi
+  if [[ -s "${RUN_DIR:-}/state.json" ]] \
+    && grep -qi '"status"[[:space:]]*:[[:space:]]*"ok"' "$RUN_DIR/state.json" 2>/dev/null \
+    && grep -qi 'no open issues' "$RUN_DIR/state.json" 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
+# Every already-complete train resume must leave a skip-train artifact (#1182).
+# Never copy a 0-byte train.json onto train.complete.json.
+ensure_train_complete_artifact() {
+  local complete="${RUN_DIR:-}/train.complete.json"
+  local capture="${RUN_DIR:-}/train.json"
+  local ok=0
+  [[ -n "${RUN_DIR:-}" ]] || return 0
+  mkdir -p "$RUN_DIR"
+  if [[ -s "$complete" ]]; then
+    return 0
+  fi
+  if [[ -s "$capture" && -n "${TRAIN_STATUS_COMPLETE_BIN:-}" && -f "$TRAIN_STATUS_COMPLETE_BIN" ]]; then
+    ok=$(python3 "$TRAIN_STATUS_COMPLETE_BIN" "$capture" 2>/dev/null || echo 0)
+    if [[ "$ok" == "1" ]]; then
+      cp -f "$capture" "$complete" 2>/dev/null || true
+      if [[ -s "$complete" ]]; then
+        return 0
+      fi
+    fi
+  fi
+  printf '%s\n' '{"kind":"train_status","complete":true,"detail":"empty-milestone or prior-complete resume"}' >"$complete"
+}
+
+# EXIT/RETURN lock release must no-op when lock_dir is unset under set -u (#1182).
+release_lock() {
+  local dir="${lock_dir:-}"
+  [[ -n "$dir" ]] || return 0
+  rmdir "$dir" 2>/dev/null || rm -rf "$dir" 2>/dev/null || true
+}
+
+# Optional porcelain-clean fast-forward of REPO_DIR to origin/<base> (#1182).
+# Same <base> as the factory-release request. Never force-ff dirty. Never
+# fail the ship. Never reset --hard.
+maybe_ff_repo_dir() {
+  local porcelain base self repo_abs before after yml
+  [[ -n "${REPO_DIR:-}" && -d "$REPO_DIR" ]] || return 0
+  porcelain=$(git -C "$REPO_DIR" status --porcelain 2>/dev/null || true)
+  if [[ -n "$porcelain" ]]; then
+    echo "repo-dir ff: skipped (dirty porcelain)" >&2
+    return 0
+  fi
+  base="${TUGBOAT_BASE_BRANCH:-}"
+  if [[ -z "$base" ]]; then
+    yml="$REPO_DIR/.github/pipeline.yml"
+    if [[ -f "$yml" ]]; then
+      base=$(grep -E '^base_branch:' "$yml" 2>/dev/null | head -1 || true)
+      base=${base#base_branch:}
+      base=${base%%#*}
+      base=${base//[[:space:]]/}
+      base=${base//\"/}
+      base=${base//\'/}
+    fi
+  fi
+  if [[ -z "$base" ]] || [[ "$base" =~ [[:space:]] ]]; then
+    echo "repo-dir ff: skipped (no base_branch)" >&2
+    return 0
+  fi
+  before=$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null || true)
+  if ! git -C "$REPO_DIR" fetch --quiet origin "$base" 2>/dev/null; then
+    echo "repo-dir ff: skipped (fetch failed)" >&2
+    return 0
+  fi
+  if ! git -C "$REPO_DIR" merge --ff-only "origin/$base" 2>/dev/null; then
+    echo "repo-dir ff: skipped (ff-only failed)" >&2
+    return 0
+  fi
+  after=$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null || true)
+  if [[ -n "$before" && -n "$after" && "$before" != "$after" ]]; then
+    self=$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")
+    repo_abs=$(cd "$REPO_DIR" && pwd -P)
+    case "$self" in
+      "$repo_abs"/*)
+        echo "repo-dir ff: HEAD moved $before -> $after; exec $self" >&2
+        exec bash "$self" "${TUGBOAT_INVOKE_ARGV[@]}"
+        ;;
+    esac
+  fi
+  return 0
 }
 
 # Exec candidate tugboat.sh for FRG onward. Same PID keeps the ship lock (#1164).
@@ -2200,14 +2299,16 @@ if [[ ! -f "$TRAIN_STATUS_COMPLETE_BIN" ]]; then
   exit 1
 fi
 
+# Best-effort: porcelain-clean control checkout may catch up to origin/<base>
+# so process-start Tugboat matches the candidate. Never fails the ship (#1182).
+maybe_ff_repo_dir
+
 # ---------- one milestone ship ----------------------------------------------
 
 ship_one() {
   version=$1
   local lock_dir pr train_ec rel_ec fin_ec pro_ec ok checks_green published i draft gec cec green ver_out
   local STAGE_WATCH_PID_FILE swp SHIP_SINCE train_resumed=0 holder
-  local release_lock
-  release_lock() { rmdir "$lock_dir" 2>/dev/null || rm -rf "$lock_dir" 2>/dev/null || true; }
 
   RUN_DIR="$STATE_ROOT/ship-v$(safe_of "$version")"
   STATE_FILE="$RUN_DIR/state.json"
@@ -2247,7 +2348,7 @@ ship_one() {
 
   # ----- A: train + merge ---------------------------------------------------
   if [[ "${TUGBOAT_SKIP_TRAIN:-}" == "1" ]]; then
-    if [[ ! -s "$RUN_DIR/train.complete.json" ]] && [[ ! -s "$RUN_DIR/train.json" ]]; then
+    if ! skip_train_has_proof; then
       write_state "train" "failed" "TUGBOAT_SKIP_TRAIN set without a prior train artifact"
       log "FAIL: TUGBOAT_SKIP_TRAIN without train.complete.json or train.json"
       exit 1
@@ -2352,8 +2453,6 @@ ship_one() {
   if [[ "$train_resumed" -eq 0 ]]; then
     write_state "train" "ok" "complete"
     log "phase train: ok"
-    # Keep a success artifact for resume.
-    cp -f "$RUN_DIR/train.json" "$RUN_DIR/train.complete.json" 2>/dev/null || true
   else
     log "phase train: ok (resumed)"
   fi
@@ -2366,6 +2465,10 @@ ship_one() {
     fi
   fi
   fi
+
+  # Resume (no-open-issues / prior-complete) and skip-train share one writer
+  # so candidate re-exec always sees a skip-train artifact (#1182).
+  ensure_train_complete_artifact
 
   # ----- A1b: resolve candidate engine for ship-end (no pin fallback) ------
   local req pack_done pack_ec pack_verdict latest_json loop_id attest_ec attest_reason
