@@ -418,9 +418,16 @@ Integrity fingerprints are recomputed on parse; a minimal forged `{ "pass": true
 **Producer attestation (required for release-eligible pass / auto-tag):**
 
 - Env / secret: `PIPELINE_FRG_ATTESTATION_KEY` (same value as repo Actions secret used by
-  `auto-tag-release.yml`). Tugboat HMAC-verify children (`factory-gate --from-run`
-  and `release ensure-tag`) present `PIPELINE_FRG_ATTESTATION_KEY_FILE` as
-  `PIPELINE_FRG_ATTESTATION_KEY` in the child. The engine still reads `KEY` only.
+  `auto-tag-release.yml`). Engine HMAC-verify (`factory-gate --from-run` and
+  `release ensure-tag`) and in-engine `pipeline ship` attestor / ensure-tag children
+  present `PIPELINE_FRG_ATTESTATION_KEY_FILE` as `PIPELINE_FRG_ATTESTATION_KEY`
+  using one recipe: inherit `KEY` and unset `KEY_FILE`; else fail closed on
+  missing, empty, or unreadable `KEY_FILE` (`missing_attestor_credential` /
+  `unreadable_attestor_key_file`); else set `KEY` from the file body and unset
+  `KEY_FILE`. HMAC mint and verify still authenticate with `KEY` after
+  presentation. Hosts keep a file; the engine loads it. A Tugboat wrap is not
+  required. Tugboat may keep the same recipe as defense in depth. GitHub Actions
+  auto-tag still uses repo secret `KEY`.
 - Direct trusted operator use may export the key before `pipeline factory-gate …` so
   `integrity.attestation` is written. A release candidate must never use this path;
   its fixed scorer unit owns attestation.
@@ -475,7 +482,9 @@ Ledger I/O failure after primary write is **fail-soft**: reported on stderr; evi
 ### Score an existing durable loop run (recommended after a pack loop finishes)
 
 ```bash
-export PIPELINE_FRG_ATTESTATION_KEY='…'   # same value as the repo Actions secret
+# Hosts keep a file; the engine presents KEY_FILE as KEY. Inline KEY also works.
+export PIPELINE_FRG_ATTESTATION_KEY_FILE=/path/to/frg-attestation-key
+# export PIPELINE_FRG_ATTESTATION_KEY='…'   # same value as the repo Actions secret
 pipeline factory-gate --for 1.30.0 --from-run <loop-run-id> \
   --observations path/to/observations.json \
   [--scenario id=status:detail[:observed=N]] \

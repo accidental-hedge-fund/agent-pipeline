@@ -22,6 +22,10 @@ import {
   type LoopItemState,
 } from "./loop/types.ts";
 import {
+  requirePresentedFrgAttestationKey,
+  type PresentFrgAttestorCredentialDeps,
+} from "./ship-end-candidate.ts";
+import {
   FRG_HYBRID_LIVE_COMPOSITION_IDS,
   FRG_HYBRID_LIVE_SCENARIO_IDS,
   FRG_HYBRID_PILOT_POLICY_ID,
@@ -1935,11 +1939,14 @@ export async function lookupHonestPost133FrgPass(
 
 export interface FrgValidateOpts {
   /**
-   * HMAC key for attestation verification. Defaults to
-   * {@link resolveFrgAttestationKey}(`process.env`). Required non-empty for
-   * release-eligibility validation (auto-tag fails closed when missing).
+   * HMAC key for attestation verification. When omitted, HMAC-verify presents
+   * `PIPELINE_FRG_ATTESTATION_KEY_FILE` as KEY then authenticates with KEY.
+   * Explicit `null` or empty fails closed (hand-authored JSON). Tests inject.
    */
   attestationKey?: string | null;
+  /** Parent env for KEY_FILE presentation. Defaults to `process.env`. Tests inject. */
+  env?: NodeJS.ProcessEnv;
+  presentAttestorCredential?: PresentFrgAttestorCredentialDeps;
 }
 
 /**
@@ -2043,6 +2050,13 @@ export async function validateFrgEvidenceSnapshotForTag(
   opts: FrgValidateOpts = {},
 ): Promise<{ evidence: FrgEvidence; snapshot: unknown }> {
   const v = normalizeFrgVersion(version);
+  const verifyOpts: FrgValidateOpts = { ...opts };
+  if (!Object.prototype.hasOwnProperty.call(opts, "attestationKey")) {
+    verifyOpts.attestationKey = requirePresentedFrgAttestationKey(
+      opts.env ?? process.env,
+      opts.presentAttestorCredential,
+    );
+  }
   const latestPath = frgLatestPath(repoDir, v);
   let text: string;
   try {
@@ -2056,7 +2070,7 @@ export async function validateFrgEvidenceSnapshotForTag(
     );
   }
   try {
-    const evidence = validateReleaseEligibleFrgEvidence(text, v, opts);
+    const evidence = validateReleaseEligibleFrgEvidence(text, v, verifyOpts);
     return { evidence, snapshot: JSON.parse(text) as unknown };
   } catch (err) {
     throw new Error(formatFrgTagPathFailure(v, (err as Error).message));
@@ -3931,10 +3945,14 @@ export interface FactoryGateOpts {
   thresholds?: FrgThresholds;
   now?: () => Date;
   /**
-   * HMAC key for release-eligible attestation. Defaults to env
-   * {@link FRG_ATTESTATION_KEY_ENV}. Injected in tests; production CLI uses env.
+   * HMAC key for release-eligible attestation. When omitted on `--from-run`,
+   * the engine presents KEY_FILE as KEY then authenticates with KEY.
+   * Injected in tests; production CLI uses env.
    */
   attestationKey?: string | null;
+  /** Parent env for KEY_FILE presentation on `--from-run`. Tests inject. */
+  env?: NodeJS.ProcessEnv;
+  presentAttestorCredential?: PresentFrgAttestorCredentialDeps;
   /**
    * True when the operator passed `--observations <file>`. Stamps
    * `score_source: "observations"` so honest-pass cannot accept it.
@@ -4031,6 +4049,13 @@ export async function runFactoryGate(
         `pipeline factory-gate: refused to score non-pack run ${opts.fromRun}: ${packCheck.detail}`,
       );
     }
+    const fromRunAttestationKey =
+      opts.attestationKey !== undefined
+        ? resolvedAttestationKey
+        : requirePresentedFrgAttestationKey(
+            opts.env ?? process.env,
+            opts.presentAttestorCredential,
+          );
     if (opts.packSelectorLabel === undefined) {
       packSelectorLabel = packLabelFromSelector(contract.selector);
     }
@@ -4101,7 +4126,7 @@ export async function runFactoryGate(
       notes,
       thresholds: opts.thresholds,
       now: opts.now,
-      attestation_key: resolvedAttestationKey,
+      attestation_key: fromRunAttestationKey,
       score_source: opts.usedObservationsFile ? "observations" : "from-run",
       work_list: "factory-gate-pack",
     };

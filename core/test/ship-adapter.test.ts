@@ -692,7 +692,7 @@ test("in_progress prepare re-invokes prepare and does not factory-gate until eli
   const bound = bindCandidateShipEndOperations(operations(), {
     pinCommitSha: PIN_SHA,
     repoDir: "/repo",
-    env: {},
+    env: { PIPELINE_FRG_ATTESTATION_KEY: "secret" },
     factoryReleaseRequestPath: "/abs/req.json",
     frgWaitAttempts: 5,
     delay: async () => {},
@@ -1290,7 +1290,7 @@ test("candidate FRG pack re-invokes the same prepare request after factory-gate 
   const bound = bindCandidateShipEndOperations(operations(), {
     pinCommitSha: PIN_SHA,
     repoDir: "/repo",
-    env: {},
+    env: { PIPELINE_FRG_ATTESTATION_KEY: "secret" },
     factoryReleaseRequestPath: requestPath,
     frgWaitAttempts: 4,
     delay: async () => {},
@@ -1363,7 +1363,7 @@ test("default candidate tag path spawns release ensure-tag on the candidate laun
   }), {
     pinCommitSha: PIN_SHA,
     repoDir: "/repo",
-    env: {},
+    env: { PIPELINE_FRG_ATTESTATION_KEY: "secret" },
     nodeBin: "/usr/bin/node",
     resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
     spawn: async (argv) => {
@@ -1402,7 +1402,7 @@ test("candidate ensure-tag leaf fails closed on non-zero spawn without pin-proce
   }), {
     pinCommitSha: PIN_SHA,
     repoDir: "/repo",
-    env: {},
+    env: { PIPELINE_FRG_ATTESTATION_KEY: "secret" },
     resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
     spawn: async () => ({ code: 1, stdout: "", stderr: "candidate tag refused" }),
   });
@@ -1412,6 +1412,160 @@ test("candidate ensure-tag leaf fails closed on non-zero spawn without pin-proce
   );
   assert.equal(observed, 0);
   assert.equal(taggedInProcess, false);
+});
+
+test("in-engine HMAC children present KEY_FILE as KEY and prepare stays uncredentialed (#1181)", async () => {
+  const dummy = "dummy-key";
+  const keyFile = "/keys/frg-dummy";
+  const parent: NodeJS.ProcessEnv = { PIPELINE_FRG_ATTESTATION_KEY_FILE: keyFile };
+  delete parent.PIPELINE_FRG_ATTESTATION_KEY;
+  const recorded: Array<{ verb: string; env: NodeJS.ProcessEnv }> = [];
+  let gated = false;
+  const bound = bindCandidateShipEndOperations(operations({
+    observePublication: async () => publication,
+  }), {
+    pinCommitSha: PIN_SHA,
+    repoDir: "/repo",
+    env: parent,
+    presentAttestorCredential: {
+      readFile(p) {
+        if (p !== keyFile) throw new Error(`unexpected KEY_FILE ${p}`);
+        return Buffer.from(dummy);
+      },
+    },
+    factoryReleaseRequestPath: "/abs/req.json",
+    resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+    spawn: async (argv, env) => {
+      const verb = argv.includes("factory-gate")
+        ? "attestor"
+        : argv.includes("ensure-tag")
+          ? "ensure-tag"
+          : argv.includes("factory-release")
+            ? "prepare"
+            : "other";
+      recorded.push({ verb, env: { ...env } });
+      if (verb === "prepare") {
+        if (gated) {
+          return { code: 0, stdout: JSON.stringify({ status: "complete" }), stderr: "" };
+        }
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            status: "awaiting_frg_attestation",
+            frg: { loop_run_id: "loop-1" },
+          }),
+          stderr: "",
+        };
+      }
+      if (verb === "attestor") gated = true;
+      return { code: 0, stdout: "", stderr: "" };
+    },
+  });
+  await bound.runFrgPack!(intent, train);
+  await bound.waitForPublication(intent, releaseFinish);
+  const attestor = recorded.find((r) => r.verb === "attestor");
+  const tag = recorded.find((r) => r.verb === "ensure-tag");
+  const prepare = recorded.find((r) => r.verb === "prepare");
+  assert.ok(attestor, "attestor child must spawn");
+  assert.ok(tag, "ensure-tag child must spawn");
+  assert.ok(prepare, "prepare child must spawn");
+  for (const child of [attestor, tag]) {
+    const hasKey = typeof child!.env.PIPELINE_FRG_ATTESTATION_KEY === "string"
+      && child!.env.PIPELINE_FRG_ATTESTATION_KEY !== "";
+    const hasKeyFile = typeof child!.env.PIPELINE_FRG_ATTESTATION_KEY_FILE === "string"
+      && child!.env.PIPELINE_FRG_ATTESTATION_KEY_FILE !== "";
+    assert.ok(
+      hasKey || hasKeyFile,
+      `${child!.verb} must present KEY or KEY_FILE when parent supplied a readable non-empty KEY_FILE`,
+    );
+    assert.equal(child!.env.PIPELINE_FRG_ATTESTATION_KEY, dummy);
+    assert.equal(child!.env.PIPELINE_FRG_ATTESTATION_KEY_FILE, undefined);
+  }
+  assert.equal(prepare.env.PIPELINE_FRG_ATTESTATION_KEY, undefined);
+  assert.equal(prepare.env.PIPELINE_FRG_ATTESTATION_KEY_FILE, undefined);
+  assert.equal(parent.PIPELINE_FRG_ATTESTATION_KEY, undefined);
+  assert.equal(parent.PIPELINE_FRG_ATTESTATION_KEY_FILE, keyFile);
+});
+
+test("in-engine HMAC-verify does not spawn without a credential (#1181)", async () => {
+  const spawned: string[][] = [];
+  const bound = bindCandidateShipEndOperations(operations({
+    observePublication: async () => publication,
+  }), {
+    pinCommitSha: PIN_SHA,
+    repoDir: "/repo",
+    env: {},
+    factoryReleaseRequestPath: "/abs/req.json",
+    resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+    spawn: async (argv) => {
+      spawned.push(argv);
+      if (argv.includes("factory-release")) {
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            status: "awaiting_frg_attestation",
+            frg: { loop_run_id: "loop-1" },
+          }),
+          stderr: "",
+        };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+  });
+  await assert.rejects(bound.runFrgPack!(intent, train), /missing_attestor_credential/);
+  assert.equal(spawned.filter((argv) => argv.includes("factory-gate")).length, 0);
+  await assert.rejects(
+    bound.waitForPublication(intent, releaseFinish),
+    /missing_attestor_credential/,
+  );
+  assert.equal(spawned.filter((argv) => argv.includes("ensure-tag")).length, 0);
+});
+
+test("in-engine HMAC-verify does not spawn on unreadable KEY_FILE (#1181)", async () => {
+  const spawned: string[][] = [];
+  const bound = bindCandidateShipEndOperations(operations({
+    observePublication: async () => publication,
+  }), {
+    pinCommitSha: PIN_SHA,
+    repoDir: "/repo",
+    env: { PIPELINE_FRG_ATTESTATION_KEY_FILE: "/keys/missing" },
+    presentAttestorCredential: {
+      readFile() {
+        throw new Error("EACCES");
+      },
+    },
+    factoryReleaseRequestPath: "/abs/req.json",
+    resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+    spawn: async (argv) => {
+      spawned.push(argv);
+      if (argv.includes("factory-release")) {
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            status: "awaiting_frg_attestation",
+            frg: { loop_run_id: "loop-1" },
+          }),
+          stderr: "",
+        };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+  });
+  await assert.rejects(bound.runFrgPack!(intent, train), /unreadable_attestor_key_file/);
+  assert.equal(spawned.filter((argv) => argv.includes("factory-gate")).length, 0);
+});
+
+test("candidate ensure-tag spawn does not use uncredentialedPrepareEnv (#1181)", () => {
+  const shipAdapter = fs.readFileSync(
+    path.join(__dirname, "..", "scripts", "stages", "ship-adapter.ts"),
+    "utf8",
+  );
+  const waitFn = shipAdapter.slice(
+    shipAdapter.lastIndexOf("async waitForPublication"),
+    shipAdapter.indexOf("function defaultResolveCandidateDeps"),
+  );
+  assert.match(waitFn, /hmacVerifyChildEnv/);
+  assert.doesNotMatch(waitFn, /uncredentialedPrepareEnv/);
 });
 
 test("runEnsureAnnotatedReleaseTagCli tags via injected git, not ambient git", async () => {

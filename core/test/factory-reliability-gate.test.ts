@@ -2169,6 +2169,162 @@ test("validateFrgEvidenceSnapshotForTag returns HMAC SHA from the same file read
   );
 });
 
+test("HMAC-verify presents KEY_FILE as KEY when KEY is unset (#1181)", async () => {
+  const dummy = "dummy-key";
+  const fs = memFs();
+  const good = computeFrgEvidence(
+    fullPackPassInput({
+      version: "1.30.0",
+      run_id: "frg-key-file",
+      attestation_key: dummy,
+    }),
+  );
+  assert.equal(good.pass, true);
+  await writeFrgEvidence("/repo", good, fs);
+  const ok = await validateFrgEvidenceFileForTag("/repo", "1.30.0", fs, {
+    env: { PIPELINE_FRG_ATTESTATION_KEY_FILE: "/keys/dummy" },
+    presentAttestorCredential: {
+      readFile: () => Buffer.from(dummy),
+    },
+  });
+  assert.equal(ok.pass, true);
+  assert.equal(verifyFrgAttestation(ok, dummy), true);
+});
+
+test("HMAC-verify inherits KEY and does not read KEY_FILE (#1181)", async () => {
+  const fs = memFs();
+  const good = computeFrgEvidence(
+    fullPackPassInput({ version: "1.30.0", run_id: "frg-inherit-key" }),
+  );
+  await writeFrgEvidence("/repo", good, fs);
+  let reads = 0;
+  const ok = await validateFrgEvidenceFileForTag("/repo", "1.30.0", fs, {
+    env: {
+      PIPELINE_FRG_ATTESTATION_KEY: FRG_UNIT_TEST_ATTESTATION_KEY,
+      PIPELINE_FRG_ATTESTATION_KEY_FILE: "/keys/must-not-read",
+    },
+    presentAttestorCredential: {
+      readFile() {
+        reads++;
+        throw new Error("KEY_FILE must not be read when KEY is set");
+      },
+    },
+  });
+  assert.equal(ok.pass, true);
+  assert.equal(reads, 0);
+});
+
+test("HMAC-verify fails closed without a credential before KEY-required (#1181)", async () => {
+  const fs = memFs();
+  const good = computeFrgEvidence(
+    fullPackPassInput({ version: "1.30.0", run_id: "frg-missing-cred" }),
+  );
+  await writeFrgEvidence("/repo", good, fs);
+  await assert.rejects(
+    () =>
+      validateFrgEvidenceFileForTag("/repo", "1.30.0", fs, {
+        env: {},
+      }),
+    (err: unknown) => {
+      const message = (err as Error).message;
+      assert.match(message, /missing_attestor_credential/);
+      assert.equal(
+        message.includes(`${FRG_ATTESTATION_KEY_ENV} is required to verify integrity.attestation`),
+        false,
+      );
+      return true;
+    },
+  );
+});
+
+test("HMAC-verify fails closed on unreadable or empty KEY_FILE (#1181)", async () => {
+  const fs = memFs();
+  await assert.rejects(
+    () =>
+      validateFrgEvidenceFileForTag("/repo", "1.30.0", fs, {
+        env: { PIPELINE_FRG_ATTESTATION_KEY_FILE: "/keys/missing" },
+        presentAttestorCredential: {
+          readFile() {
+            throw new Error("EACCES");
+          },
+        },
+      }),
+    /unreadable_attestor_key_file/,
+  );
+  await assert.rejects(
+    () =>
+      validateFrgEvidenceFileForTag("/repo", "1.30.0", fs, {
+        env: { PIPELINE_FRG_ATTESTATION_KEY_FILE: "/keys/empty" },
+        presentAttestorCredential: {
+          readFile: () => Buffer.alloc(0),
+        },
+      }),
+    /missing_attestor_credential/,
+  );
+});
+
+test("factory-gate --from-run presents KEY_FILE as KEY (#1181)", async () => {
+  const dummy = "dummy-key";
+  const fs = memFs();
+  const packContract = {
+    schema: LOOP_CONTRACT_SCHEMA,
+    run_id: "loop-frg-key-file",
+    selector: { type: "label", value: "factory-gate" },
+    items: [
+      { id: "10", depends_on: [], external_depends_on: [] },
+      { id: "20", depends_on: [], external_depends_on: [] },
+    ],
+  } as unknown as LoopContract;
+  const ledger = {
+    schema: LOOP_LEDGER_SCHEMA,
+    run_id: "loop-frg-key-file",
+    items: {
+      "10": { state: "ready", history: [], recovery_attempts: [] },
+      "20": { state: "ready", history: [], recovery_attempts: [] },
+    },
+  } as unknown as LoopLedger;
+  const result = await runFactoryGate(
+    {
+      version: "1.29.1",
+      repoDir: "/repo",
+      fromRun: "loop-frg-key-file",
+      loadLedger: async () => ledger,
+      loadContract: async () => packContract,
+      scenarioOverrides: frgRequiredObservationOverrides("pass"),
+      compositionOverrides: frgRequiredCompositionOverrides("pass"),
+      env: { PIPELINE_FRG_ATTESTATION_KEY_FILE: "/keys/dummy" },
+      presentAttestorCredential: {
+        readFile: () => Buffer.from(dummy),
+      },
+      stdout: () => {},
+      stderr: () => {},
+    },
+    fs,
+  );
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.evidence.pass, true);
+  assert.equal(verifyFrgAttestation(result.evidence, dummy), true);
+  await assert.rejects(
+    () =>
+      runFactoryGate(
+        {
+          version: "1.29.1",
+          repoDir: "/repo",
+          fromRun: "loop-frg-key-file",
+          loadLedger: async () => ledger,
+          loadContract: async () => packContract,
+          scenarioOverrides: frgRequiredObservationOverrides("pass"),
+          compositionOverrides: frgRequiredCompositionOverrides("pass"),
+          env: {},
+          stdout: () => {},
+          stderr: () => {},
+        },
+        fs,
+      ),
+    /missing_attestor_credential/,
+  );
+});
+
 test("FRG composition inventory is frozen (#757)", () => {
   assert.equal(FRG_COMPOSITION_DIMENSION_IDS.length, 11);
   assert.ok(FRG_COMPOSITION_DIMENSION_IDS.includes("openspec-bearing-item"));

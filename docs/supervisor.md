@@ -229,9 +229,10 @@ not scrape human output or search for a title match.
 
 Does **not** create git tags or GitHub Releases. After finish, ship-end
 composers invoke candidate `pipeline release ensure-tag` from on-disk HMAC
-`latest.json`. Tugboat presents `PIPELINE_FRG_ATTESTATION_KEY_FILE` as
-`PIPELINE_FRG_ATTESTATION_KEY` in that child (same recipe as the FRG pack
-attestor). `.agent-pipeline/frg/` is gitignored, so auto-tag must not stall
+`latest.json`. The engine presents `PIPELINE_FRG_ATTESTATION_KEY_FILE` as
+`PIPELINE_FRG_ATTESTATION_KEY` for HMAC-verify (`factory-gate --from-run`,
+`release ensure-tag`, and in-engine `pipeline ship` attestor / ensure-tag
+children). Tugboat may keep the same wrap as defense in depth. `.agent-pipeline/frg/` is gitignored, so auto-tag must not stall
 the ship for a missing tree file. `release.yml` still publishes the GitHub
 Release after the annotated `v*` tag exists.
 
