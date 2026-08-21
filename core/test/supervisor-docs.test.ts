@@ -6,6 +6,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildTrainStatus } from "../scripts/stages/train.ts";
+import { textDefaultsOrDocumentsHermesStateProductionPin } from "../scripts/production-engine-pin.ts";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, "../..");
@@ -123,4 +124,59 @@ test("supervisor examples exist and stay thin", () => {
   const readme = read("examples/supervisor/README.md");
   assert.match(readme, /pipeline ship --milestone/);
   assert.doesNotMatch(readme, /never in-engine ship/i);
+});
+
+// #1183: one live production pin. SKILL / env.example must not default or
+// document the Hermes-state path as a live pin.
+const HERMES_SUPERVISOR_PIN_SOURCES = [
+  "examples/supervisor/hermes/SKILL.md",
+  "examples/supervisor/hermes/env.example",
+] as const;
+
+test("hermes supervisor SKILL and env.example do not default a Hermes-state pin (#1183)", () => {
+  for (const rel of HERMES_SUPERVISOR_PIN_SOURCES) {
+    const body = read(rel);
+    assert.equal(
+      textDefaultsOrDocumentsHermesStateProductionPin(body),
+      false,
+      `${rel} must not default or document hermes-factory/production-engine-pin.json`,
+    );
+  }
+  const env = read("examples/supervisor/hermes/env.example");
+  const liveAssign = env
+    .split("\n")
+    .find((l) => /^\s*AGENT_PIPELINE_PRODUCTION_PIN=/.test(l) && !l.trim().startsWith("#"));
+  if (liveAssign) {
+    assert.match(
+      liveAssign,
+      /\$REPO_DIR\/\.agent-pipeline\/production-engine-pin\.json/,
+      "env.example live AGENT_PIPELINE_PRODUCTION_PIN must be the control-checkout pin",
+    );
+  }
+});
+
+test("hermes-state pin detector fails when the SKILL default is injected (#1183)", () => {
+  const injected =
+    'export AGENT_PIPELINE_PRODUCTION_PIN="${AGENT_PIPELINE_PRODUCTION_PIN:-$HOME/.local/state/hermes-factory/production-engine-pin.json}"';
+  assert.equal(textDefaultsOrDocumentsHermesStateProductionPin(injected), true);
+  assert.equal(
+    textDefaultsOrDocumentsHermesStateProductionPin(
+      "AGENT_PIPELINE_PRODUCTION_PIN=$REPO_DIR/.agent-pipeline/production-engine-pin.json",
+    ),
+    false,
+  );
+});
+
+test("supervisor docs name the forbidden Hermes-state pin and v1.40.1 packaging bar (#1183)", () => {
+  const supervisor = read("docs/supervisor.md");
+  assert.match(supervisor, /install:production-pin-path/);
+  assert.match(supervisor, /v1\.40\.1 packaging MAY template/);
+  assert.match(supervisor, /MUST NOT\s+reintroduce a second live pin/);
+  assert.match(supervisor, /hermes-factory\/production-engine-pin\.json/);
+  const env = read("examples/supervisor/hermes/env.example");
+  assert.match(env, /v1\.40\.1 packaging MAY template/);
+  assert.match(env, /MUST NOT reintroduce a second live pin/);
+  const deploy = read("docs/runbooks/hermes-supervisor-deployment.md");
+  assert.match(deploy, /v1\.40\.1 packaging MAY template/);
+  assert.match(deploy, /not pin authority/);
 });

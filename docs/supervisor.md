@@ -266,6 +266,13 @@ Tugboat and the host `pipeline` launcher export `AGENT_PIPELINE_PRODUCTION_PIN`
 when unset to the factory pin file
 (`$REPO_DIR/.agent-pipeline/production-engine-pin.json`) so `engine-promote`
 and the next `pipeline train` / `pipeline doctor` share one path (#1127).
+The factory plane has **one** live pin file. Host supervisor SKILL MUST NOT
+default that env to `~/.local/state/hermes-factory/production-engine-pin.json`
+(that leftover file is not pin authority). `pipeline doctor` check
+`install:production-pin-path` **fails** when the env pin `version` or `git_sha`
+disagrees with the control-checkout pin. v1.40.1 packaging MAY template
+supervisor env from `examples/supervisor/hermes/env.example` and MUST NOT
+reintroduce a second live pin path.
 
 Runbooks: [runbooks/ship-milestone.md](./runbooks/ship-milestone.md),  
 [runbooks/frg-pack-checklist.md](./runbooks/frg-pack-checklist.md).

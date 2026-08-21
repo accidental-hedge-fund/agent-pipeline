@@ -85,8 +85,10 @@ export ALLOW_MERGE=1                        # required for mutating ship
 # Tugboat and the host pipeline launcher export AGENT_PIPELINE_PRODUCTION_PIN
 # when unset to $REPO_DIR/.agent-pipeline/production-engine-pin.json so
 # engine-promote and the next train doctor share one pin file (#1127).
-# optional:
-# export AGENT_PIPELINE_PRODUCTION_PIN=/path/to/production-engine-pin.json
+# Do not default a second live pin
+# (~/.local/state/hermes-factory/production-engine-pin.json is not authority).
+# optional, and only if it is the control-checkout pin:
+# export AGENT_PIPELINE_PRODUCTION_PIN=$REPO_DIR/.agent-pipeline/production-engine-pin.json
 # export ENGINE_PROMOTE_HOST=all            # default all (codex/claude/grok/opencode)
 # export PIPELINE_SUPERVISOR_STATE=$HOME/.local/state/pipeline-supervisor
 # export PIPELINE_MATERIAL_FILTER=…/material-filter.mjs

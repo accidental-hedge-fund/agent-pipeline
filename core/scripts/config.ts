@@ -722,7 +722,7 @@ const PartialConfigSchema = z.object({
     .string()
     .optional()
     .describe(
-      "Absolute path override for the production engine pin JSON. Default authority is factory control checkout (.agent-pipeline/production-engine-pin.json), not every product target. Env AGENT_PIPELINE_PRODUCTION_PIN also overrides.",
+      "Absolute path override for the production engine pin JSON. Default authority is factory control checkout (.agent-pipeline/production-engine-pin.json), not every product target. Env AGENT_PIPELINE_PRODUCTION_PIN also overrides. One live pin on the factory plane; do not default that env to a Hermes-state file.",
     ),
   // `pipeline:loop` native-goal capability attestation (#506). Optional;
   // absent/"auto" leaves automatic detection (--help marker, then version

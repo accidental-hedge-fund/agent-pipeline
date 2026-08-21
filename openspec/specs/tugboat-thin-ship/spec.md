@@ -2,7 +2,9 @@
 
 ## Purpose
 Defines the Option 1 thin ship composer (Tugboat): host-side composition of existing Pipeline CLI verbs with wait and notify only, so Buzz milestone ships stay single-path, fail with real reasons, and promote every configured host without a second ship brain.
+
 ## Requirements
+
 ### Requirement: Tugboat SHALL compose only the fixed thin ship phase sequence
 
 The thin ship composer SHALL sequence exactly these phases for one milestone version, using Pipeline CLI verbs and wait helpers only:
@@ -1121,3 +1123,20 @@ Automated checks SHALL extract the real Tugboat ensure-tag HMAC-verify helper an
 - **AND** it SHALL contain `KEY_FILE_UNSET`
 }
 
+### Requirement: Tugboat SHALL NOT bind a Hermes-state pin file as the default
+
+Tugboat SHALL export `AGENT_PIPELINE_PRODUCTION_PIN` to `$REPO_DIR/.agent-pipeline/production-engine-pin.json` when that variable is unset or empty, even if `~/.local/state/hermes-factory/production-engine-pin.json` exists on the host. Tugboat SHALL NOT treat presence of that Hermes-state file as a reason to set the env to it. An already-set operator value SHALL still be left unchanged.
+
+#### Scenario: Unset env binds control pin while Hermes-state file exists
+
+- **WHEN** Tugboat starts a ship
+- **AND** `AGENT_PIPELINE_PRODUCTION_PIN` is unset
+- **AND** `~/.local/state/hermes-factory/production-engine-pin.json` exists on the host
+- **THEN** Tugboat SHALL export `AGENT_PIPELINE_PRODUCTION_PIN` to `$REPO_DIR/.agent-pipeline/production-engine-pin.json`
+- **AND** it SHALL NOT set the env to the Hermes-state path because that file exists
+
+#### Scenario: Operator override remains unchanged
+
+- **WHEN** Tugboat starts a ship
+- **AND** `AGENT_PIPELINE_PRODUCTION_PIN` is already set to `/custom/pin.json`
+- **THEN** Tugboat SHALL leave that value unchanged
