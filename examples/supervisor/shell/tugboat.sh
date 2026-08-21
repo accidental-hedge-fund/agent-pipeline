@@ -48,6 +48,8 @@
 #   TUGBOAT_SKIP_TRAIN     1 after candidate composer re-exec — skip train (#1164)
 #                          Accepts non-empty train.complete.json or train.json,
 #                          or RUN_DIR no-open-issues resume evidence (#1182).
+#                          Re-exec exports PIPELINE_SUPERVISOR_STATE and REPO_DIR
+#                          so the candidate reads the same RUN_DIR proof (#1192).
 #   TUGBOAT_CANDIDATE_COMPOSER
 #                          candidate SHA of the tugboat.sh already exec'd (#1164)
 #   ALLOW_MERGE            must be 1 for train --merge / release finish
@@ -1026,6 +1028,9 @@ maybe_reexec_candidate_composer() {
   export SHIP_NOTIFY_BIN SHIP_STAGE_WATCH_BIN
   export PIPELINE ALLOW_MERGE ENGINE_PROMOTE_HOST
   export SHIP_END_NODE
+  # Candidate process-start reads PIPELINE_SUPERVISOR_STATE for RUN_DIR (#1192).
+  export PIPELINE_SUPERVISOR_STATE="$STATE_ROOT"
+  export REPO_DIR
   exec bash "$cand" "${TUGBOAT_INVOKE_ARGV[@]}"
 }
 
