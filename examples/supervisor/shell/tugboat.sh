@@ -55,7 +55,10 @@
 #   ALLOW_MERGE            must be 1 for train --merge / release finish
 #   SHIP_NOTIFY            1 to post phase status (default 1)
 #   SHIP_NOTIFY_BIN        notify helper (default: sibling ship-notify.sh)
-#   SHIP_STAGE_WATCH_BIN   optional per-issue stage posts during train
+#   SHIP_STAGE_WATCH_BIN   optional per-issue stage posts during train.
+#                          Default: sibling ship-stage-watch.sh. Argv is
+#                          --events-file from this train's loop_run_handoff
+#                          (not --milestone / --since; not a PATH leftover).
 #   RELEASE_WAIT_ATTEMPTS  CI/release wait poll attempts (default 30)
 #   RELEASE_WAIT_SLEEP_S   wait sleep seconds (default 40)
 #   RELEASE_CHECKS_RERUN_BUDGET  flake-eligible test reruns per head SHA (default 1, max 2)
@@ -2308,12 +2311,107 @@ fi
 # so process-start Tugboat matches the candidate. Never fails the ship (#1182).
 maybe_ff_repo_dir
 
+# First absolute events.jsonl from a train stderr capture. No latest-run glob.
+extract_loop_run_handoff_events() {
+  python3 - "$1" <<'PY'
+import json, sys
+path = sys.argv[1]
+try:
+    text = open(path, encoding="utf-8", errors="replace").read()
+except OSError:
+    raise SystemExit(1)
+for line in text.splitlines():
+    s = line.strip()
+    if not s.startswith("{"):
+        continue
+    try:
+        obj = json.loads(s)
+    except json.JSONDecodeError:
+        continue
+    if not isinstance(obj, dict) or obj.get("kind") != "loop_run_handoff":
+        continue
+    events = obj.get("events")
+    if isinstance(events, str) and events.startswith("/"):
+        print(events)
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+# Poll this train's stderr until handoff events or the train pid exits.
+wait_for_loop_run_handoff_events() {
+  local stderr_file=$1
+  local train_pid=$2
+  local events=""
+  while true; do
+    if events=$(extract_loop_run_handoff_events "$stderr_file"); then
+      printf '%s\n' "$events"
+      return 0
+    fi
+    if ! kill -0 "$train_pid" 2>/dev/null; then
+      if events=$(extract_loop_run_handoff_events "$stderr_file"); then
+        printf '%s\n' "$events"
+        return 0
+      fi
+      return 1
+    fi
+    sleep 0.1
+  done
+}
+
+# After spawn: argv parse is immediate. Dead pid is a named failure, not started.
+observe_stage_watch_pid() {
+  local watch_pid=$1
+  sleep 0.2
+  if ! kill -0 "$watch_pid" 2>/dev/null; then
+    wait "$watch_pid" 2>/dev/null || true
+    log "stage-watch argv rejected"
+    rm -f "${STAGE_WATCH_PID_FILE:-}"
+    return 0
+  fi
+  log "stage-watch started pid=$watch_pid"
+}
+
+# Spawn bundled watch with --events-file from the live handoff. Never --milestone.
+start_train_stage_watch() {
+  local events=$1
+  local version=$2
+  local watch_pid
+  if [[ "$events" != /* ]]; then
+    log "stage-watch argv rejected"
+    return 0
+  fi
+  nohup env PATH="$(dirname "$SHIP_STAGE_WATCH_BIN"):${PATH:-/usr/bin}" \
+    REPO_DIR="$REPO_DIR" SHIP_NOTIFY_BIN="$SHIP_NOTIFY_BIN" \
+    PIPELINE_SUPERVISOR_STATE="$STATE_ROOT" \
+    "$SHIP_STAGE_WATCH_BIN" \
+    --events-file "$events" \
+    --label "ship v$version" \
+    --pid-file "$STAGE_WATCH_PID_FILE" \
+    >>"$RUN_DIR/stage-watch.log" 2>&1 &
+  watch_pid=$!
+  observe_stage_watch_pid "$watch_pid"
+}
+
+# Attach watch while train is still running. Watch spawn failure does not fail the ship.
+attach_train_stage_watch() {
+  local stderr_file=$1
+  local train_pid=$2
+  local version=$3
+  local events
+  events=$(wait_for_loop_run_handoff_events "$stderr_file" "$train_pid") || {
+    log "stage-watch skipped: no loop_run_handoff events path"
+    return 0
+  }
+  start_train_stage_watch "$events" "$version"
+}
+
 # ---------- one milestone ship ----------------------------------------------
 
 ship_one() {
   version=$1
   local lock_dir pr train_ec rel_ec fin_ec pro_ec ok checks_green published i draft gec cec green ver_out
-  local STAGE_WATCH_PID_FILE swp SHIP_SINCE train_resumed=0 holder
+  local STAGE_WATCH_PID_FILE swp train_resumed=0 holder train_pid
 
   RUN_DIR="$STATE_ROOT/ship-v$(safe_of "$version")"
   STATE_FILE="$RUN_DIR/state.json"
@@ -2365,22 +2463,17 @@ ship_one() {
   write_state "train" "running" "pipeline train --milestone v$version --merge --json"
   log "phase train: start"
 
-  # Optional stage-watch for per-issue Buzz posts during train.
-  if [[ -x "$SHIP_STAGE_WATCH_BIN" ]]; then
-    SHIP_SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    nohup env PATH="$(dirname "$SHIP_STAGE_WATCH_BIN"):${PATH:-/usr/bin}" \
-      REPO_DIR="$REPO_DIR" SHIP_NOTIFY_BIN="$SHIP_NOTIFY_BIN" \
-      PIPELINE_SUPERVISOR_STATE="$STATE_ROOT" \
-      "$SHIP_STAGE_WATCH_BIN" \
-      --milestone "v$version" \
-      --since "$SHIP_SINCE" \
-      --pid-file "$STAGE_WATCH_PID_FILE" \
-      >>"$RUN_DIR/stage-watch.log" 2>&1 &
-    log "stage-watch started pid=$! since=$SHIP_SINCE"
-  fi
-
+  # Capture stderr from the first byte so the handoff waiter cannot miss it.
+  : >"$RUN_DIR/train.json"
+  : >"$RUN_DIR/train.stderr"
   set +e
-  "$PIPELINE" train --milestone "v$version" --merge --json >"$RUN_DIR/train.json" 2>"$RUN_DIR/train.stderr"
+  "$PIPELINE" train --milestone "v$version" --merge --json >"$RUN_DIR/train.json" 2>"$RUN_DIR/train.stderr" &
+  train_pid=$!
+  # Optional stage-watch: bind --events-file to this train's live handoff.
+  if [[ -x "$SHIP_STAGE_WATCH_BIN" ]]; then
+    attach_train_stage_watch "$RUN_DIR/train.stderr" "$train_pid" "$version" || true
+  fi
+  wait "$train_pid"
   train_ec=$?
   set -e
   [[ -s "$RUN_DIR/train.stderr" ]] && cat "$RUN_DIR/train.stderr" >>"$LOG_FILE" || true

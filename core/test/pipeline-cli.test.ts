@@ -19,6 +19,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   advanceIssueThroughSingle,
   buildCmd,
@@ -1020,6 +1021,161 @@ test("advanceWaveThroughLoop (#1074): stop reason with ready-to-deploy stays non
   if (!outcome!.ok) {
     assert.match(outcome!.error, /supervisor_no_progress/);
     assert.match(outcome!.error, /88/);
+  }
+});
+
+test("advanceWaveThroughLoop onRunReady emits loop_run_handoff with absolute events on stderr (#1184)", async () => {
+  const { advanceWaveThroughLoop } = await import("../scripts/pipeline.ts");
+  const pipelineSrc = fs.readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), "../scripts/pipeline.ts"),
+    "utf8",
+  );
+  const fnStart = pipelineSrc.indexOf("export async function advanceWaveThroughLoop");
+  const fnEnd = pipelineSrc.indexOf("/** Production default: read loop events");
+  assert.ok(fnStart >= 0 && fnEnd > fnStart, "advanceWaveThroughLoop source not found");
+  const ready = pipelineSrc.slice(fnStart, fnEnd);
+  const readyBlock = ready.slice(
+    ready.indexOf("onRunReady:"),
+    ready.indexOf("if (engineResult.kind === \"error\")"),
+  );
+  assert.match(readyBlock, /formatLoopRunHandoff/);
+  assert.match(readyBlock, /writeStderrLine/);
+  assert.match(ready, /process\.stderr/);
+  assert.match(readyBlock, /ctx\.events|formatLoopRunHandoff\(ctx\)/);
+
+  const fakeCfg = {
+    repo_dir: "/tmp/repo",
+    repo: "o/r",
+    base_branch: "main",
+    domain: "o-r",
+  };
+  const stderrLines: string[] = [];
+  const stdoutLines: string[] = [];
+  const originalLog = console.log;
+  console.log = (...args: unknown[]) => {
+    stdoutLines.push(args.map(String).join(" "));
+  };
+  try {
+    await advanceWaveThroughLoop(
+      [10],
+      {},
+      async () => ({
+        number: 10,
+        title: "t",
+        body: "",
+        labels: ["pipeline:ready-to-deploy"],
+        state: "open",
+      }),
+      async (input) => {
+        assert.ok(input.onRunReady, "advance-wave must wire onRunReady");
+        await input.onRunReady!({
+          runId: "loop-ready-1184",
+          runDir: "/abs/state/runs/loop-ready-1184",
+          events: "/abs/state/runs/loop-ready-1184/events.jsonl",
+          engine: "codex",
+          resumed: false,
+          selector: { type: "work-list", value: ["10"] },
+        });
+        return {
+          kind: "drive",
+          result: {
+            runId: "loop-ready-1184",
+            cycles: 1,
+            stop: null,
+            holdOutstanding: false,
+            allDone: true,
+            resumed: false,
+            heldItemIds: [],
+            dispatched: 1,
+            excludedItemIds: [],
+            exclusionReason: null,
+            completion: "all_done",
+          },
+        };
+      },
+      () => fakeCfg as never,
+      async () => [],
+      async (line) => {
+        stderrLines.push(line.replace(/\n$/, ""));
+      },
+    );
+  } finally {
+    console.log = originalLog;
+  }
+  assert.equal(stderrLines.length, 1, "exactly one stderr handoff line");
+  const parsed = JSON.parse(stderrLines[0]) as {
+    kind?: string;
+    events?: string;
+  };
+  assert.equal(parsed.kind, "loop_run_handoff");
+  assert.equal(parsed.events, "/abs/state/runs/loop-ready-1184/events.jsonl");
+  assert.ok(parsed.events?.startsWith("/"), "events path must be absolute");
+  const stdout = stdoutLines.join("\n");
+  assert.doesNotMatch(stdout, /loop_run_handoff/);
+});
+
+test("pipeline-cli: train --json stdout stays one train_status when advance-wave handoff is on stderr (#1184)", async () => {
+  const { opts } = parseCli(["train", "--issues", "10", "--json"]);
+  const trainCfg = {
+    repo: "owner/repo",
+    repo_dir: "/repo",
+    base_branch: "main",
+  } as PipelineConfig;
+  const deps: TrainCommandDeps = {
+    makeTrainDeps: () => ({
+      log: () => {},
+      listMilestoneIssues: async () => [],
+      getIssue: async (issue) => ({
+        number: issue,
+        title: `Issue ${issue}`,
+        body: "",
+        labels: ["pipeline:ready-to-deploy"],
+        state: "open",
+      }),
+      advanceWave: async () => {
+        throw new Error("the command must replace the base advanceWave seam");
+      },
+      getPrForIssue: async () => null,
+      getPrForIssueAnyState: async () => null,
+      mergeIssuePr: async () => {},
+      observePr: async () => ({ state: "open", mergeCommitOid: null, headRefOid: null }),
+      fetchBase: async () => {},
+      baseTip: async () => "base-tip",
+      isAncestor: async () => false,
+    }),
+    async runSingleIssue() {
+      throw new Error("train production path uses advanceWave, not N×single");
+    },
+    async runAdvanceWave(issues, _opts, getIssue) {
+      const out = new Map<number, import("../scripts/stages/train.ts").AdvanceOutcome>();
+      for (const issue of issues) {
+        const snap = await getIssue(issue);
+        out.set(issue, {
+          ok: true,
+          terminal: "ready-to-deploy",
+          labels: snap.labels,
+        });
+      }
+      return out;
+    },
+  };
+  const stdout: string[] = [];
+  const originalLog = console.log;
+  const priorExitCode = process.exitCode;
+  console.log = (...args: unknown[]) => {
+    stdout.push(`${args.map(String).join(" ")}\n`);
+  };
+  process.exitCode = undefined;
+  try {
+    const exitCode = await runTrainCommand(opts, trainCfg, deps);
+    assert.equal(exitCode, 0);
+    const emitted = stdout.join("");
+    const document = JSON.parse(emitted) as { kind?: string };
+    assert.equal(document.kind, "train_status");
+    assert.doesNotMatch(emitted, /loop_run_handoff/);
+  } finally {
+    console.log = originalLog;
+    process.exitCode = priorExitCode;
   }
 });
 

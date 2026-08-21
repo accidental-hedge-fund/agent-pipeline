@@ -73,6 +73,14 @@ test("watcher streams only shared-filter output from the exact file", () => {
   assert.doesNotMatch(r.stdout, /global noise/);
 });
 
+test("watcher rejects --milestone (bundled contract is --events-file only)", () => {
+  const r = spawnSync("bash", [script, "--milestone", "v1.39.8"], { encoding: "utf8" });
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /unknown argument: --milestone/);
+  assert.match(r.stderr, /--events-file/);
+  assert.doesNotMatch(r.stderr, /--since /);
+});
+
 test("watcher fails visibly when the exact file is absent in once mode", () => {
   const { root, filter } = fixture();
   const absent = path.join(root, "missing", "events.jsonl");
