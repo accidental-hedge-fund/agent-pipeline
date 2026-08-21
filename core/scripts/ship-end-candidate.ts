@@ -5,6 +5,7 @@
 // PIPELINE_CANDIDATE_ENGINE_ROOT. Entrypoint is
 // node "$ENGINE_ROOT/scripts/pipeline-launcher.mjs". No eval of train JSON.
 
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { parseExactGitSha } from "./ship-end-identity.ts";
 
@@ -196,21 +197,110 @@ export function assertShipEndLeafArgv(argv: readonly string[]): void {
   }
 }
 
+export const FRG_ATTESTATION_KEY_ENV_NAME = "PIPELINE_FRG_ATTESTATION_KEY";
+export const FRG_ATTESTATION_KEY_FILE_ENV_NAME = "PIPELINE_FRG_ATTESTATION_KEY_FILE";
+
+export type PresentFrgAttestorCredentialReason =
+  | "missing_attestor_credential"
+  | "unreadable_attestor_key_file";
+
+export type PresentFrgAttestorCredentialResult =
+  | { ok: true; env: NodeJS.ProcessEnv }
+  | { ok: false; reason: PresentFrgAttestorCredentialReason };
+
+export interface PresentFrgAttestorCredentialDeps {
+  /** Read KEY_FILE bytes. Throw to signal unreadable. Tests inject. */
+  readFile?(path: string): Buffer;
+}
+
+function readAttestorKeyFile(
+  filePath: string,
+  deps?: PresentFrgAttestorCredentialDeps,
+): Buffer {
+  if (typeof deps?.readFile === "function") return deps.readFile(filePath);
+  return fs.readFileSync(filePath);
+}
+
+/**
+ * Present KEY_FILE as KEY for HMAC-verify children (Tugboat five-branch recipe).
+ * Copies `env`; does not mutate the parent.
+ */
+export function presentFrgAttestorCredential(
+  env: NodeJS.ProcessEnv,
+  deps?: PresentFrgAttestorCredentialDeps,
+): PresentFrgAttestorCredentialResult {
+  const next = { ...env };
+  const key = next[FRG_ATTESTATION_KEY_ENV_NAME];
+  if (typeof key === "string" && key !== "") {
+    delete next[FRG_ATTESTATION_KEY_FILE_ENV_NAME];
+    return { ok: true, env: next };
+  }
+  const keyFile = next[FRG_ATTESTATION_KEY_FILE_ENV_NAME];
+  if (typeof keyFile !== "string" || keyFile === "") {
+    return { ok: false, reason: "missing_attestor_credential" };
+  }
+  let body: Buffer;
+  try {
+    body = readAttestorKeyFile(keyFile, deps);
+  } catch {
+    return { ok: false, reason: "unreadable_attestor_key_file" };
+  }
+  if (body.length === 0) {
+    return { ok: false, reason: "missing_attestor_credential" };
+  }
+  // Tugboat KEY="$(cat -- "$KEY_FILE")" drops trailing LF via command substitution.
+  next[FRG_ATTESTATION_KEY_ENV_NAME] = body.toString("utf8").replace(/\n+$/, "");
+  delete next[FRG_ATTESTATION_KEY_FILE_ENV_NAME];
+  return { ok: true, env: next };
+}
+
+/** Fail closed with the Tugboat named reason. Returns presented KEY. */
+export function requirePresentedFrgAttestationKey(
+  env: NodeJS.ProcessEnv = process.env,
+  deps?: PresentFrgAttestorCredentialDeps,
+): string {
+  const presented = presentFrgAttestorCredential(env, deps);
+  if (!presented.ok) {
+    throw new Error(presented.reason);
+  }
+  const key = presented.env[FRG_ATTESTATION_KEY_ENV_NAME];
+  if (typeof key !== "string" || key === "") {
+    throw new Error("missing_attestor_credential");
+  }
+  return key;
+}
+
 /** Prepare child: KEY and KEY_FILE unset. Parent env is not mutated. */
 export function uncredentialedPrepareEnv(
   env: NodeJS.ProcessEnv,
 ): NodeJS.ProcessEnv {
   const next = { ...env };
-  delete next.PIPELINE_FRG_ATTESTATION_KEY;
-  delete next.PIPELINE_FRG_ATTESTATION_KEY_FILE;
+  delete next[FRG_ATTESTATION_KEY_ENV_NAME];
+  delete next[FRG_ATTESTATION_KEY_FILE_ENV_NAME];
   return next;
 }
 
-/** Attestor child: inherit KEY; KEY_FILE unset (caller may set KEY from file). */
-export function attestorChildEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const next = { ...env };
-  delete next.PIPELINE_FRG_ATTESTATION_KEY_FILE;
-  return next;
+/**
+ * HMAC-verify child (attestor and ensure-tag): KEY_FILE presented as KEY.
+ * Fails closed with a named reason and does not return a spawn env.
+ */
+export function hmacVerifyChildEnv(
+  env: NodeJS.ProcessEnv,
+  deps?: PresentFrgAttestorCredentialDeps,
+): NodeJS.ProcessEnv {
+  const presented = presentFrgAttestorCredential(env, deps);
+  if (!presented.ok) {
+    throw new Error(presented.reason);
+  }
+  return presented.env;
+}
+
+/** Same recipe as {@link hmacVerifyChildEnv} (attestor spawn). */
+export function attestorChildEnv(
+  env: NodeJS.ProcessEnv,
+  deps?: PresentFrgAttestorCredentialDeps,
+): NodeJS.ProcessEnv {
+  return hmacVerifyChildEnv(env, deps);
 }
 
 export function pinShaDiffersFromCandidate(

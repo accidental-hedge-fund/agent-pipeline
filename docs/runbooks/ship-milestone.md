@@ -180,7 +180,9 @@ has `PIPELINE_FRG_ATTESTATION_KEY` and `PIPELINE_FRG_ATTESTATION_KEY_FILE`
 returns `awaiting_frg_attestation` or unsigned eligible artifacts exist,
 Tugboat runs `pipeline factory-gate --for X.Y.Z --from-run <loop>` in a
 **separate** child that has the producer credential (inherit `KEY`, or present
-`KEY_FILE` contents as `KEY` in that child only). After `release finish`,
+`KEY_FILE` contents as `KEY` in that child only). The engine applies that same
+recipe for HMAC-verify, so Claude Code / Hermes hosts with only `KEY_FILE` do
+not need a Tugboat wrap. After `release finish`,
 candidate `release ensure-tag` uses that same recipe so HMAC verify has `KEY`
 when the supervisor set only `KEY_FILE`. It does not pass
 `--observations`. Pack-done is this version's `latest.json` `pass: true` bound

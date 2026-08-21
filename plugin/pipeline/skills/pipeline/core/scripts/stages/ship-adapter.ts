@@ -17,7 +17,7 @@ import {
 } from "../ship-end-identity.ts";
 import {
   assertShipEndLeafArgv,
-  attestorChildEnv,
+  hmacVerifyChildEnv,
   pinShaDiffersFromCandidate,
   resolveCandidateEngine,
   shipEndCliPrefix,
@@ -25,6 +25,7 @@ import {
   uncredentialedPrepareEnv,
   type CandidateEngine,
   type CandidateEngineResult,
+  type PresentFrgAttestorCredentialDeps,
   type ResolveCandidateEngineDeps,
 } from "../ship-end-candidate.ts";
 import {
@@ -999,6 +1000,7 @@ export interface CandidateShipEndContext {
     argv: string[],
     env: NodeJS.ProcessEnv,
   ): Promise<{ code: number; stdout: string; stderr: string }>;
+  presentAttestorCredential?: PresentFrgAttestorCredentialDeps;
   spawnEnsureTag?(
     engine: CandidateEngine,
     opts: { version: string; mergeCommitOid: string; packedCandidate: string },
@@ -1719,7 +1721,7 @@ export function bindCandidateShipEndOperations(
             ctx,
             engine,
             shipEndLeafArgv("factory-gate", { version: intent.version, loopRunId }),
-            attestorChildEnv(ctx.env),
+            hmacVerifyChildEnv(ctx.env, ctx.presentAttestorCredential),
           );
           if (gate.code !== 0) {
             throw new Error(
@@ -1822,7 +1824,7 @@ export function bindCandidateShipEndOperations(
             mergeCommitOid: release.merge_commit_oid,
             packedCandidate: release.candidate_head_oid,
           }),
-          uncredentialedPrepareEnv(ctx.env),
+          hmacVerifyChildEnv(ctx.env, ctx.presentAttestorCredential),
         );
         if (spawned.code !== 0) {
           throw new Error(

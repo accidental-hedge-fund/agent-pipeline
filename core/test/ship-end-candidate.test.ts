@@ -6,11 +6,15 @@ import * as path from "node:path";
 import {
   assertShipEndLeafArgv,
   attestorChildEnv,
+  hmacVerifyChildEnv,
   pinShaDiffersFromCandidate,
+  presentFrgAttestorCredential,
+  requirePresentedFrgAttestationKey,
   resolveCandidateEngine,
   shipEndCliPrefix,
   shipEndLeafArgv,
   uncredentialedPrepareEnv,
+  type PresentFrgAttestorCredentialDeps,
   type ResolveCandidateEngineDeps,
 } from "../scripts/ship-end-candidate.ts";
 
@@ -193,7 +197,40 @@ test("ship-end leaf argv never re-enters ship or train", () => {
   );
 });
 
-test("prepare env unsets KEY and KEY_FILE; attestor unsets KEY_FILE only", () => {
+const DUMMY_KEY = "dummy-key";
+const KEY_FILE_PATH = "/keys/frg-dummy";
+
+function dummyFileDeps(
+  files: Record<string, Buffer | "unreadable">,
+): PresentFrgAttestorCredentialDeps {
+  return {
+    readFile(p) {
+      const body = files[p];
+      if (body === undefined || body === "unreadable") {
+        throw new Error(`unreadable: ${p}`);
+      }
+      return body;
+    },
+  };
+}
+
+function assertHmacChildHasCredential(
+  child: NodeJS.ProcessEnv,
+  expectedKey: string,
+): void {
+  const hasKey = typeof child.PIPELINE_FRG_ATTESTATION_KEY === "string"
+    && child.PIPELINE_FRG_ATTESTATION_KEY !== "";
+  const hasKeyFile = typeof child.PIPELINE_FRG_ATTESTATION_KEY_FILE === "string"
+    && child.PIPELINE_FRG_ATTESTATION_KEY_FILE !== "";
+  assert.ok(
+    hasKey || hasKeyFile,
+    "HMAC child must present KEY or KEY_FILE when parent supplied a readable non-empty KEY_FILE",
+  );
+  assert.equal(child.PIPELINE_FRG_ATTESTATION_KEY, expectedKey);
+  assert.equal(child.PIPELINE_FRG_ATTESTATION_KEY_FILE, undefined);
+}
+
+test("prepare env unsets KEY and KEY_FILE; HMAC children inherit KEY and unset KEY_FILE", () => {
   const parent: NodeJS.ProcessEnv = {
     PIPELINE_FRG_ATTESTATION_KEY: "secret",
     PIPELINE_FRG_ATTESTATION_KEY_FILE: "/keys/frg",
@@ -203,9 +240,96 @@ test("prepare env unsets KEY and KEY_FILE; attestor unsets KEY_FILE only", () =>
   assert.equal(prep.PIPELINE_FRG_ATTESTATION_KEY, undefined);
   assert.equal(prep.PIPELINE_FRG_ATTESTATION_KEY_FILE, undefined);
   assert.equal(parent.PIPELINE_FRG_ATTESTATION_KEY, "secret");
+  assert.equal(parent.PIPELINE_FRG_ATTESTATION_KEY_FILE, "/keys/frg");
   const att = attestorChildEnv(parent);
   assert.equal(att.PIPELINE_FRG_ATTESTATION_KEY, "secret");
   assert.equal(att.PIPELINE_FRG_ATTESTATION_KEY_FILE, undefined);
+  const tag = hmacVerifyChildEnv(parent);
+  assert.equal(tag.PIPELINE_FRG_ATTESTATION_KEY, "secret");
+  assert.equal(tag.PIPELINE_FRG_ATTESTATION_KEY_FILE, undefined);
+});
+
+test("HMAC children present KEY_FILE as KEY when KEY is unset (#1181)", () => {
+  const parent: NodeJS.ProcessEnv = {
+    PATH: "/usr/bin",
+    PIPELINE_FRG_ATTESTATION_KEY_FILE: KEY_FILE_PATH,
+  };
+  delete parent.PIPELINE_FRG_ATTESTATION_KEY;
+  const deps = dummyFileDeps({ [KEY_FILE_PATH]: Buffer.from(DUMMY_KEY) });
+  const att = hmacVerifyChildEnv(parent, deps);
+  const tag = hmacVerifyChildEnv(parent, deps);
+  assertHmacChildHasCredential(att, DUMMY_KEY);
+  assertHmacChildHasCredential(tag, DUMMY_KEY);
+  assert.equal(parent.PIPELINE_FRG_ATTESTATION_KEY, undefined);
+  assert.equal(parent.PIPELINE_FRG_ATTESTATION_KEY_FILE, KEY_FILE_PATH);
+  const prep = uncredentialedPrepareEnv(parent);
+  assert.equal(prep.PIPELINE_FRG_ATTESTATION_KEY, undefined);
+  assert.equal(prep.PIPELINE_FRG_ATTESTATION_KEY_FILE, undefined);
+});
+
+test("HMAC children strip trailing LF from KEY_FILE like Tugboat cat (#1181)", () => {
+  const parent: NodeJS.ProcessEnv = {
+    PATH: "/usr/bin",
+    PIPELINE_FRG_ATTESTATION_KEY_FILE: KEY_FILE_PATH,
+  };
+  delete parent.PIPELINE_FRG_ATTESTATION_KEY;
+  const deps = dummyFileDeps({ [KEY_FILE_PATH]: Buffer.from(`${DUMMY_KEY}\n`) });
+  const att = hmacVerifyChildEnv(parent, deps);
+  const tag = hmacVerifyChildEnv(parent, deps);
+  assertHmacChildHasCredential(att, DUMMY_KEY);
+  assertHmacChildHasCredential(tag, DUMMY_KEY);
+  assert.equal(att.PIPELINE_FRG_ATTESTATION_KEY?.includes("\n"), false);
+});
+
+test("HMAC children inherit inline KEY over KEY_FILE body (#1181)", () => {
+  const parent: NodeJS.ProcessEnv = {
+    PIPELINE_FRG_ATTESTATION_KEY: "inline-key",
+    PIPELINE_FRG_ATTESTATION_KEY_FILE: KEY_FILE_PATH,
+  };
+  const deps = dummyFileDeps({ [KEY_FILE_PATH]: Buffer.from("file-body-must-not-win") });
+  const att = hmacVerifyChildEnv(parent, deps);
+  const tag = hmacVerifyChildEnv(parent, deps);
+  assertHmacChildHasCredential(att, "inline-key");
+  assertHmacChildHasCredential(tag, "inline-key");
+  assert.equal(parent.PIPELINE_FRG_ATTESTATION_KEY, "inline-key");
+});
+
+test("HMAC-verify fails closed without a credential and does not present env (#1181)", () => {
+  const parent: NodeJS.ProcessEnv = { PATH: "/usr/bin" };
+  delete parent.PIPELINE_FRG_ATTESTATION_KEY;
+  delete parent.PIPELINE_FRG_ATTESTATION_KEY_FILE;
+  const missing = presentFrgAttestorCredential(parent);
+  assert.equal(missing.ok, false);
+  if (!missing.ok) assert.equal(missing.reason, "missing_attestor_credential");
+  assert.throws(() => hmacVerifyChildEnv(parent), /missing_attestor_credential/);
+  assert.throws(() => hmacVerifyChildEnv({ PIPELINE_FRG_ATTESTATION_KEY_FILE: "" }), /missing_attestor_credential/);
+  assert.throws(() => requirePresentedFrgAttestationKey(parent), /missing_attestor_credential/);
+});
+
+test("HMAC-verify fails closed on unreadable KEY_FILE (#1181)", () => {
+  const parent: NodeJS.ProcessEnv = {
+    PIPELINE_FRG_ATTESTATION_KEY_FILE: KEY_FILE_PATH,
+  };
+  const deps = dummyFileDeps({ [KEY_FILE_PATH]: "unreadable" });
+  const presented = presentFrgAttestorCredential(parent, deps);
+  assert.equal(presented.ok, false);
+  if (!presented.ok) assert.equal(presented.reason, "unreadable_attestor_key_file");
+  assert.throws(() => hmacVerifyChildEnv(parent, deps), /unreadable_attestor_key_file/);
+  assert.throws(
+    () => requirePresentedFrgAttestationKey(parent, deps),
+    /unreadable_attestor_key_file/,
+  );
+});
+
+test("HMAC-verify fails closed on empty KEY_FILE (#1181)", () => {
+  const parent: NodeJS.ProcessEnv = {
+    PIPELINE_FRG_ATTESTATION_KEY_FILE: KEY_FILE_PATH,
+  };
+  const deps = dummyFileDeps({ [KEY_FILE_PATH]: Buffer.alloc(0) });
+  const presented = presentFrgAttestorCredential(parent, deps);
+  assert.equal(presented.ok, false);
+  if (!presented.ok) assert.equal(presented.reason, "missing_attestor_credential");
+  assert.throws(() => hmacVerifyChildEnv(parent, deps), /missing_attestor_credential/);
 });
 
 test("pinShaDiffersFromCandidate: matching version is irrelevant; SHA decides", () => {
