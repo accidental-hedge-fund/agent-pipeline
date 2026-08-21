@@ -19,6 +19,8 @@
 - [x] 3.3 Inject `gh` and clock via `deps` in both tests, and verify they make no live network, git, or Actions calls
 - [x] 3.4 Keep the already-finished observation fixture green (no wait and no second merge when finish evidence is already observed)
 - [x] 3.5 Add a coordinator-state test that exhausts the pending wait cap and verifies the stored run remains resumable at `release_finish` without persisted ship failure
+- [x] 3.6 Add a regression test that changes the observed release-PR head during a pending wait and proves no rerun and no finish under the stale identity
+- [x] 3.7 Add a regression test that unreadable persisted rerun-budget state is treated as exhausted and issues no additional rerun; persist writes through temp+rename
 
 ## 4. Docs, packaging, gate
 

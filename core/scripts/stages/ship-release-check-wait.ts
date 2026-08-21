@@ -84,6 +84,12 @@ export interface ShipReleaseCheckWaitDeps {
   sleep(ms: number): Promise<void>;
   loadAttemptCount(pr: number, headSha: string): Promise<number>;
   recordAttempt(pr: number, headSha: string, runId: string): Promise<void>;
+  /**
+   * Re-observe the live release-PR head after each checks capture.
+   * Return the current head SHA. A mismatch with `expectedHeadSha` stops
+   * the waiter without rerun or green-return.
+   */
+  verifyReleaseHead?(pr: number, expectedHeadSha: string): Promise<string>;
   onWaitTick?(tick: {
     pr: number;
     attempt: number;
@@ -414,6 +420,18 @@ function pendingCheckpointMessage(pr: number, attempts: number): string {
   );
 }
 
+function headChangedCheckpointMessage(
+  pr: number,
+  preparedHead: string,
+  liveHead: string,
+): string {
+  return (
+    `ship release: PR #${pr} head changed during wait ` +
+    `(prepared ${preparedHead}, live ${liveHead || "unknown"}); ` +
+    "retry the same ship command to resume"
+  );
+}
+
 function failMessage(pr: number, classified: ClassifyReleaseChecksResult): string {
   const reason = classified.sidecar?.reason;
   if (reason) return `ship release: ${reason}`;
@@ -440,10 +458,20 @@ export async function waitForReleasePrChecks(opts: {
 
   for (let attempt = 1; attempt <= attempts; attempt++) {
     const checks = await deps.getPrChecks(pr);
-    const used = !pr || !headSha
+    let liveHead = headSha;
+    if (deps.verifyReleaseHead) {
+      liveHead = await deps.verifyReleaseHead(pr, headSha);
+      if (!liveHead || liveHead !== headSha) {
+        throw new ShipReleaseCheckWaitError(
+          "pending",
+          headChangedCheckpointMessage(pr, headSha, liveHead),
+        );
+      }
+    }
+    const used = !pr || !liveHead
       ? budget
-      : await deps.loadAttemptCount(pr, headSha);
-    const remaining = !pr || !headSha ? 0 : Math.max(0, budget - used);
+      : await deps.loadAttemptCount(pr, liveHead);
+    const remaining = !pr || !liveHead ? 0 : Math.max(0, budget - used);
     const classified = classifyReleaseChecks(checks, {
       allowlist,
       remaining,
@@ -471,7 +499,7 @@ export async function waitForReleasePrChecks(opts: {
         throw new ShipReleaseCheckWaitError("fail", failMessage(pr, classified));
       }
       try {
-        await deps.recordAttempt(pr, headSha, runId);
+        await deps.recordAttempt(pr, liveHead, runId);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         throw new ShipReleaseCheckWaitError(

@@ -333,6 +333,42 @@ test("waitForReleasePrChecks: green after wait returns without fail", async () =
   assert.equal(polls.length, 0);
 });
 
+test("waitForReleasePrChecks: head change after a pending capture does not rerun", async () => {
+  const polls: ReleaseCheckCapture[][] = [
+    [{ name: "test", state: "PENDING", bucket: "pending" }],
+    [{ name: "test", state: "FAILURE", bucket: "fail", link: TEST_FAIL_LINK }],
+  ];
+  const heads = ["b".repeat(40), "c".repeat(40)];
+  let reruns = 0;
+  const recorded: string[] = [];
+  await assert.rejects(
+    () => waitForReleasePrChecks({
+      pr: 945,
+      headSha: "b".repeat(40),
+      deps: waitDeps({
+        maxAttempts: 5,
+        getPrChecks: async () => polls.shift() ?? [],
+        verifyReleaseHead: async () => heads.shift() ?? "c".repeat(40),
+        recordAttempt: async (_pr, headSha) => {
+          recorded.push(headSha);
+        },
+        rerunFailedWorkflows: async () => {
+          reruns++;
+          return { attempted: true, runIds: ["32075787450"] };
+        },
+      }),
+    }),
+    (err: unknown) => {
+      assert.ok(err instanceof ShipReleaseCheckWaitError);
+      assert.equal(err.outcome, "pending");
+      assert.match(err.message, /head changed during wait/);
+      return true;
+    },
+  );
+  assert.equal(reruns, 0);
+  assert.deepEqual(recorded, []);
+});
+
 test("waitForReleasePrChecks: second test fail after budget is terminal", async () => {
   const budget = memoryBudget();
   const polls = [

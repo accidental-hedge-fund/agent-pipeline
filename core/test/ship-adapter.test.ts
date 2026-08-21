@@ -14,9 +14,11 @@ import {
   classifyFrgPackWaitDecision,
   ensureAnnotatedReleaseTag,
   hmacPackedCandidateGitShaFromUnknown,
+  loadRerunAttemptCount,
   persistShipFactoryReleaseRequest,
   persistedShipFactoryReleaseRequestPath,
   probeBoundPackLoopLive,
+  recordRerunAttemptFile,
   resolveEnsureTagOwnerRepo,
   runEnsureAnnotatedReleaseTagCli,
   shipCoordinatorDepsFromOperations,
@@ -27,6 +29,7 @@ import {
 import {
   attemptCountFor,
   emptyRerunBudgetDoc,
+  MAX_RERUN_BUDGET,
   ShipReleaseCheckWaitError,
   withRecordedAttempt,
   type ShipReleaseCheckWaitDeps,
@@ -701,6 +704,163 @@ test("coordinator wait-cap expiry keeps release_finish resumable (#1205)", async
   assert.equal(result.last_error, null);
   assert.equal(finishes, 1);
   assert.equal(checks, 1);
+});
+
+test("convergeReleaseFinish does not rerun or finish when the release PR head changes during wait (#1205)", async () => {
+  const changed = { ...release, head_oid: "f".repeat(40) };
+  let observes = 0;
+  let finishes = 0;
+  let reruns = 0;
+  const captures = [
+    [{ name: "test", state: "PENDING", bucket: "pending", link: "" }],
+    [{ name: "test", state: "FAILURE", bucket: "fail", link: TEST_FAIL_LINK }],
+  ];
+  const deps = shipCoordinatorDepsFromOperations(operations({
+    observeRelease: async () => {
+      observes++;
+      if (observes >= 3) return { prepare: changed, finish: null };
+      return { prepare: release, finish: null };
+    },
+    finishRelease: async () => {
+      finishes++;
+      return releaseFinish;
+    },
+  }), {
+    state,
+    releaseCheckWait: memoryWait({
+      maxAttempts: 5,
+      getPrChecks: async () => captures.shift() ?? [{ name: "test", state: "FAILURE", bucket: "fail", link: TEST_FAIL_LINK }],
+      rerunFailedWorkflows: async () => {
+        reruns++;
+        return { attempted: true, runIds: ["32075787450"] };
+      },
+    }),
+  });
+  await deps.convergeTrain(intent, train.ordered_issues);
+  await assert.rejects(
+    () => deps.convergeReleaseFinish(intent, release),
+    (err: unknown) => {
+      assert.ok(err instanceof ShipReleaseCheckWaitError);
+      assert.equal(err.outcome, "pending");
+      assert.match(err.message, /head changed during wait/);
+      return true;
+    },
+  );
+  assert.equal(finishes, 0, "must not finish under a stale prepared head");
+  assert.equal(reruns, 0, "must not rerun workflows for a changed head");
+});
+
+test("convergeReleaseFinish does not finish when the release PR head changes after green checks (#1205)", async () => {
+  const changed = { ...release, head_oid: "f".repeat(40) };
+  let observes = 0;
+  let finishes = 0;
+  const deps = shipCoordinatorDepsFromOperations(operations({
+    observeRelease: async () => {
+      observes++;
+      if (observes >= 3) return { prepare: changed, finish: null };
+      return { prepare: release, finish: null };
+    },
+    finishRelease: async () => {
+      finishes++;
+      return releaseFinish;
+    },
+  }), {
+    state,
+    releaseCheckWait: memoryWait({
+      maxAttempts: 5,
+      getPrChecks: async () => [{ name: "test", state: "SUCCESS", bucket: "pass" }],
+    }),
+  });
+  await deps.convergeTrain(intent, train.ordered_issues);
+  await assert.rejects(
+    () => deps.convergeReleaseFinish(intent, release),
+    (err: unknown) => {
+      assert.ok(err instanceof ShipReleaseCheckWaitError);
+      assert.equal(err.outcome, "pending");
+      assert.match(err.message, /head changed during wait/);
+      return true;
+    },
+  );
+  assert.equal(finishes, 0);
+});
+
+test("loadRerunAttemptCount treats unreadable budget state as exhausted so no extra rerun is issued (#1205)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ship-rerun-budget-"));
+  const budgetFile = path.join(dir, "release-checks.rerun.json");
+  fs.writeFileSync(budgetFile, "{ \"schema_version\": 1, \"entries\": [");
+  try {
+    assert.equal(
+      await loadRerunAttemptCount(budgetFile, 945, releaseHead),
+      MAX_RERUN_BUDGET,
+      "malformed persisted state must fail closed",
+    );
+    let reruns = 0;
+    let finishes = 0;
+    const deps = shipCoordinatorDepsFromOperations(operations({
+      observeRelease: async () => ({ prepare: release, finish: null }),
+      finishRelease: async () => {
+        finishes++;
+        return releaseFinish;
+      },
+    }), {
+      state,
+      releaseCheckWait: memoryWait({
+        loadAttemptCount: (pr, headSha) => loadRerunAttemptCount(budgetFile, pr, headSha),
+        recordAttempt: (pr, headSha, runId) =>
+          recordRerunAttemptFile(budgetFile, pr, headSha, runId, "2026-08-21T00:00:00.000Z"),
+        getPrChecks: async () => [
+          { name: "test", state: "FAILURE", bucket: "fail", link: TEST_FAIL_LINK },
+        ],
+        rerunFailedWorkflows: async () => {
+          reruns++;
+          return { attempted: true, runIds: ["32075787450"] };
+        },
+      }),
+    });
+    await deps.convergeTrain(intent, train.ordered_issues);
+    await assert.rejects(
+      () => deps.convergeReleaseFinish(intent, release),
+      (err: unknown) => {
+        assert.ok(err instanceof ShipReleaseCheckWaitError);
+        assert.equal(err.outcome, "fail");
+        assert.match(err.message, /rerun budget spent/);
+        return true;
+      },
+    );
+    assert.equal(reruns, 0, "malformed budget must not issue another rerun");
+    assert.equal(finishes, 0);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("recordRerunAttemptFile writes through temp+rename and refuses to reset unreadable state (#1205)", async () => {
+  const src = fs.readFileSync(
+    path.join(__dirname, "../scripts/stages/ship-adapter.ts"),
+    "utf8",
+  );
+  const start = src.indexOf("async function writeRerunBudgetAtomic");
+  const next = src.indexOf("\nexport async function loadRerunAttemptCount");
+  assert.ok(start !== -1 && next !== -1 && start < next);
+  const body = src.slice(start, next);
+  assert.match(body, /rename/);
+  assert.match(body, /\.tmp/);
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ship-rerun-budget-write-"));
+  const budgetFile = path.join(dir, "release-checks.rerun.json");
+  try {
+    await recordRerunAttemptFile(budgetFile, 945, releaseHead, "32075787450", "2026-08-21T00:00:00.000Z");
+    assert.equal(await loadRerunAttemptCount(budgetFile, 945, releaseHead), 1);
+    fs.writeFileSync(budgetFile, "{ truncated");
+    await assert.rejects(
+      () => recordRerunAttemptFile(budgetFile, 945, releaseHead, "1", "2026-08-21T00:00:01.000Z"),
+      /unreadable rerun-budget state/,
+    );
+    assert.equal(fs.readFileSync(budgetFile, "utf8"), "{ truncated");
+    assert.equal(await loadRerunAttemptCount(budgetFile, 945, releaseHead), MAX_RERUN_BUDGET);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("convergeReleaseFinish skips wait when finish evidence is already observed (#1205)", async () => {
