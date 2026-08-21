@@ -166,6 +166,22 @@ export function resolveExportedFactoryProductionPin(opts: {
   return defaultFactoryProductionPinPath(opts.factoryControlCheckout);
 }
 
+/**
+ * Distinctive suffix of the retired Hermes-state pin file. Not live pin
+ * authority. Host supervisor SKILL / env templates MUST NOT default or
+ * document this path as a live pin (#1183).
+ */
+export const HERMES_STATE_PRODUCTION_PIN_MARKER =
+  "hermes-factory/production-engine-pin.json";
+
+/**
+ * True when text defaults or documents the Hermes-state production pin path
+ * (SKILL `${VAR:-hermes-state}` or env.example live value).
+ */
+export function textDefaultsOrDocumentsHermesStateProductionPin(text: string): boolean {
+  return text.includes(HERMES_STATE_PRODUCTION_PIN_MARKER);
+}
+
 // ---------------------------------------------------------------------------
 // Version / tag helpers
 // ---------------------------------------------------------------------------
@@ -1206,6 +1222,110 @@ export function evaluateEngineTrackCheck(input: {
     detail:
       `track=pinned; production pin v${pinVer} matches installed/running v${runVer}` +
       ` via tag-install ${pin!.tag}${shaPart}`,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Doctor: factory-plane env pin vs control-checkout pin (#1183)
+// ---------------------------------------------------------------------------
+
+export interface ProductionPinPathCheckInput {
+  /** True when config.repo is the factory control repository. */
+  factoryControlContext: boolean;
+  /** Resolved AGENT_PIPELINE_PRODUCTION_PIN, or null when unset/empty. */
+  envPinPath: string | null;
+  /** `$REPO_DIR/.agent-pipeline/production-engine-pin.json`. */
+  controlPinPath: string;
+  /** Env pin file body from DoctorDeps.readTextFile, or null if unreadable. */
+  envPinText: string | null;
+  /** Control pin file body from DoctorDeps.readTextFile, or null if unreadable. */
+  controlPinText: string | null;
+}
+
+function pinIdentityFields(pin: ProductionEnginePin): { version: string; git_sha: string } {
+  const version = normalizePinVersion(pin.version) ?? pin.version.trim();
+  const sha = typeof pin.git_sha === "string" ? pin.git_sha.trim().toLowerCase() : "";
+  return { version, git_sha: sha };
+}
+
+/**
+ * Pure evaluation of install:production-pin-path. No filesystem, network,
+ * git, or subprocess. Fail (never warn/pass) when factory-plane env pin
+ * and control-checkout pin disagree on version or git_sha.
+ */
+export function evaluateProductionPinPathCheck(
+  input: ProductionPinPathCheckInput,
+): EngineTrackCheckResult {
+  if (!input.factoryControlContext) {
+    return {
+      status: "skip",
+      detail: "non-factory host; split-pin check skipped",
+    };
+  }
+  const envPath =
+    typeof input.envPinPath === "string" && input.envPinPath.trim()
+      ? path.resolve(input.envPinPath.trim())
+      : null;
+  const controlPath = path.resolve(input.controlPinPath);
+  if (!envPath) {
+    return {
+      status: "skip",
+      detail: `${PRODUCTION_PIN_ENV} unset; pin resolution uses ${controlPath}`,
+    };
+  }
+  if (envPath === controlPath) {
+    return {
+      status: "skip",
+      detail: `env pin and control-checkout pin are the same path (${controlPath})`,
+    };
+  }
+  if (input.envPinText === null || input.controlPinText === null) {
+    return {
+      status: "skip",
+      detail:
+        `split-pin identity not compared (env ${envPath} readable=${input.envPinText !== null}; ` +
+        `control ${controlPath} readable=${input.controlPinText !== null})`,
+    };
+  }
+  let envPin: ProductionEnginePin;
+  let controlPin: ProductionEnginePin;
+  try {
+    envPin = parseProductionEnginePin(input.envPinText);
+  } catch (err) {
+    return {
+      status: "skip",
+      detail: `env pin unreadable as pin JSON at ${envPath}: ${(err as Error).message}`,
+    };
+  }
+  try {
+    controlPin = parseProductionEnginePin(input.controlPinText);
+  } catch (err) {
+    return {
+      status: "skip",
+      detail: `control pin unreadable as pin JSON at ${controlPath}: ${(err as Error).message}`,
+    };
+  }
+  const envId = pinIdentityFields(envPin);
+  const controlId = pinIdentityFields(controlPin);
+  if (envId.version === controlId.version && envId.git_sha === controlId.git_sha) {
+    return {
+      status: "pass",
+      detail:
+        `env pin ${envPath} matches control pin ${controlPath} ` +
+        `(v${controlId.version} sha=${controlId.git_sha || "empty"})`,
+    };
+  }
+  const envSha = envId.git_sha || "empty";
+  const controlSha = controlId.git_sha || "empty";
+  return {
+    status: "fail",
+    detail:
+      `env pin ${envPath} (v${envId.version} sha=${envSha}) disagrees with ` +
+      `control pin ${controlPath} (v${controlId.version} sha=${controlSha})`,
+    remediation:
+      `Unset ${PRODUCTION_PIN_ENV} so Tugboat binds the control-checkout pin ` +
+      `${controlPath}, or set ${PRODUCTION_PIN_ENV}=${controlPath}. ` +
+      `Do not use a second live pin file. Env pin: ${envPath}. Control pin: ${controlPath}.`,
   };
 }
 

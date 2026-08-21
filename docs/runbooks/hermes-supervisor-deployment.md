@@ -133,10 +133,14 @@ After a release PR is merged and GitHub has published the Release for `vX.Y.Z`:
 ```bash
 set -a && source "$HOME/.config/pipeline-supervisor/env" && set +a
 cd "$REPO_DIR"
-# Optional: pin path for factory layouts
-# export AGENT_PIPELINE_PRODUCTION_PIN=...
+# One live pin: leave AGENT_PIPELINE_PRODUCTION_PIN unset so Tugboat binds
+# $REPO_DIR/.agent-pipeline/production-engine-pin.json. Do not default
+# ~/.local/state/hermes-factory/production-engine-pin.json (not pin authority).
+# v1.40.1 packaging MAY template env from examples/supervisor/hermes/env.example
+# and MUST NOT reintroduce a second live pin path.
+# export AGENT_PIPELINE_PRODUCTION_PIN=$REPO_DIR/.agent-pipeline/production-engine-pin.json
 
-$PIPELINE engine-promote --for X.Y.Z --host codex --json
+$PIPELINE engine-promote --for X.Y.Z --host all --json
 ```
 
 This verifies the published release, promotes the production engine pin (requires

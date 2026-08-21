@@ -33,10 +33,12 @@ import {
 import { isElevatedWriteHealth, parseWriteHealthText } from "../run-store.ts";
 import {
   evaluateEngineTrackCheck,
+  evaluateProductionPinPathCheck,
   hasProductionPinPathOverride,
   installReceiptPath,
   isFactoryControlRepo,
   PRODUCTION_ENGINE_PIN_REL,
+  PRODUCTION_PIN_ENV,
   resolveEngineTrackIntent,
   resolveInstallProvenance,
   resolvePinAuthorityDir,
@@ -778,6 +780,46 @@ export function buildPreflightChecks(
       if (result.status === "warn") return warn(result.detail, result.remediation);
       if (result.status === "skip") return skip(result.detail);
       return fail(result.detail, result.remediation ?? "See docs/factory-reliability-gate-runbook.md (two-track engine pinning).");
+    },
+  });
+
+  // 6d. Factory-plane env pin vs control-checkout pin (#1183) — additive to
+  //     install:engine-track. That check compares the resolved pin to the
+  //     installed engine. This check fails when AGENT_PIPELINE_PRODUCTION_PIN
+  //     points at a different file whose version/git_sha disagree with the
+  //     control-checkout pin (Buzz SKILL default of a second path).
+  checks.push({
+    id: "install:production-pin-path",
+    description:
+      "Factory env pin and control-checkout pin agree on version and git_sha",
+    run: async (deps) => {
+      const factoryControlContext = isFactoryControlRepo(config.repo);
+      const envRaw = process.env[PRODUCTION_PIN_ENV];
+      const envPinPath =
+        typeof envRaw === "string" && envRaw.trim() ? path.resolve(envRaw.trim()) : null;
+      const controlPinPath = path.resolve(config.repo_dir, PRODUCTION_ENGINE_PIN_REL);
+      let envPinText: string | null = null;
+      let controlPinText: string | null = null;
+      if (factoryControlContext && envPinPath && envPinPath !== controlPinPath) {
+        envPinText = await deps.readTextFile(envPinPath);
+        controlPinText = await deps.readTextFile(controlPinPath);
+      }
+      const result = evaluateProductionPinPathCheck({
+        factoryControlContext,
+        envPinPath,
+        controlPinPath,
+        envPinText,
+        controlPinText,
+      });
+      if (result.status === "pass") return pass(result.detail);
+      if (result.status === "skip") return skip(result.detail);
+      // Fail-closed: never report warn for split-pin disagreement.
+      return fail(
+        result.detail,
+        result.remediation ??
+          `Unset ${PRODUCTION_PIN_ENV} so Tugboat binds the control-checkout pin, ` +
+            `or set ${PRODUCTION_PIN_ENV}=${controlPinPath}.`,
+      );
     },
   });
 

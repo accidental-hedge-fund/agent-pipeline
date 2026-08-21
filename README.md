@@ -74,7 +74,7 @@ candidate. FRG Layer B / eval soaks use the **candidate** track until promote:
 pipeline factory-pin show
 pipeline factory-pin promote --for X.Y.Z   # FRG pass:true + real run_id + evidence path
 npx -y github:accidental-hedge-fund/agent-pipeline#vX.Y.Z install
-pipeline doctor                            # install:engine-track (fails a no-frg-* pin)
+pipeline doctor                            # install:engine-track; install:production-pin-path fails a split env pin
 pipeline factory-pin rollback              # repoint to previous + reinstall
 ```
 

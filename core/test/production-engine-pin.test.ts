@@ -16,7 +16,9 @@ import {
   engineTrackEvidenceFields,
   enforcePinnedTrackPolicy,
   evaluateEngineTrackCheck,
+  evaluateProductionPinPathCheck,
   formatProductionPinSummary,
+  HERMES_STATE_PRODUCTION_PIN_MARKER,
   initProductionPin,
   isFactoryControlRepo,
   isNoFrgRunId,
@@ -37,6 +39,7 @@ import {
   resolveProductionPin,
   rollbackProductionPin,
   tagForVersion,
+  textDefaultsOrDocumentsHermesStateProductionPin,
   versionsMatch,
   type PinInstallProvenance,
   type ProductionEnginePin,
@@ -205,6 +208,22 @@ test("resolveExportedFactoryProductionPin: operator override is preserved (#1127
     }),
     defaultFactoryProductionPinPath("/factory"),
   );
+});
+
+test("textDefaultsOrDocumentsHermesStateProductionPin: bites the SKILL default (#1183)", () => {
+  assert.equal(
+    textDefaultsOrDocumentsHermesStateProductionPin(
+      'export AGENT_PIPELINE_PRODUCTION_PIN="${AGENT_PIPELINE_PRODUCTION_PIN:-$HOME/.local/state/hermes-factory/production-engine-pin.json}"',
+    ),
+    true,
+  );
+  assert.equal(
+    textDefaultsOrDocumentsHermesStateProductionPin(
+      "AGENT_PIPELINE_PRODUCTION_PIN=$REPO_DIR/.agent-pipeline/production-engine-pin.json",
+    ),
+    false,
+  );
+  assert.match(HERMES_STATE_PRODUCTION_PIN_MARKER, /hermes-factory\/production-engine-pin\.json/);
 });
 
 test("isFactoryControlRepo: only the canonical factory control owner/name", () => {
@@ -925,6 +944,97 @@ test("evaluateEngineTrackCheck: non-factory does not fail solely for no-frg (#10
   assert.match(r.detail, /no-frg|not production-quality/);
 });
 
+test("evaluateProductionPinPathCheck: env 1.39.6 vs control 1.39.7 → fail (#1183)", () => {
+  const envPath = "/home/user/.local/state/hermes-factory/production-engine-pin.json";
+  const controlPath = "/factory/.agent-pipeline/production-engine-pin.json";
+  const r = evaluateProductionPinPathCheck({
+    factoryControlContext: true,
+    envPinPath: envPath,
+    controlPinPath: controlPath,
+    envPinText: JSON.stringify(
+      validPin({
+        version: "1.39.6",
+        tag: "v1.39.6",
+        git_sha: "a".repeat(40),
+      }),
+    ),
+    controlPinText: JSON.stringify(
+      validPin({
+        version: "1.39.7",
+        tag: "v1.39.7",
+        git_sha: "e206cfdabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      }),
+    ),
+  });
+  assert.equal(r.status, "fail");
+  assert.notEqual(r.status, "warn");
+  assert.notEqual(r.status, "pass");
+  assert.ok(r.remediation?.includes(envPath), r.remediation);
+  assert.ok(r.remediation?.includes(controlPath), r.remediation);
+  assert.match(r.remediation!, /Unset AGENT_PIPELINE_PRODUCTION_PIN/);
+});
+
+test("evaluateProductionPinPathCheck: git_sha disagree at same version → fail (#1183)", () => {
+  const r = evaluateProductionPinPathCheck({
+    factoryControlContext: true,
+    envPinPath: "/env/pin.json",
+    controlPinPath: "/factory/.agent-pipeline/production-engine-pin.json",
+    envPinText: JSON.stringify(validPin({ version: "1.39.7", tag: "v1.39.7", git_sha: "a".repeat(40) })),
+    controlPinText: JSON.stringify(validPin({ version: "1.39.7", tag: "v1.39.7", git_sha: "b".repeat(40) })),
+  });
+  assert.equal(r.status, "fail");
+});
+
+test("evaluateProductionPinPathCheck: matching identity does not fail (#1183)", () => {
+  const sha = "c".repeat(40);
+  const r = evaluateProductionPinPathCheck({
+    factoryControlContext: true,
+    envPinPath: "/env/pin.json",
+    controlPinPath: "/factory/.agent-pipeline/production-engine-pin.json",
+    envPinText: JSON.stringify(validPin({ version: "1.39.7", tag: "v1.39.7", git_sha: sha })),
+    controlPinText: JSON.stringify(validPin({ version: "1.39.7", tag: "v1.39.7", git_sha: sha })),
+  });
+  assert.notEqual(r.status, "fail");
+  assert.equal(r.status, "pass");
+});
+
+test("evaluateProductionPinPathCheck: unset env skips split-pin fail (#1183)", () => {
+  const r = evaluateProductionPinPathCheck({
+    factoryControlContext: true,
+    envPinPath: null,
+    controlPinPath: "/factory/.agent-pipeline/production-engine-pin.json",
+    envPinText: JSON.stringify(validPin({ version: "1.39.6", tag: "v1.39.6" })),
+    controlPinText: JSON.stringify(validPin({ version: "1.39.7", tag: "v1.39.7" })),
+  });
+  assert.notEqual(r.status, "fail");
+  assert.equal(r.status, "skip");
+});
+
+test("evaluateProductionPinPathCheck: same path skips split-pin fail (#1183)", () => {
+  const p = "/factory/.agent-pipeline/production-engine-pin.json";
+  const r = evaluateProductionPinPathCheck({
+    factoryControlContext: true,
+    envPinPath: p,
+    controlPinPath: p,
+    envPinText: JSON.stringify(validPin({ version: "1.39.6", tag: "v1.39.6" })),
+    controlPinText: JSON.stringify(validPin({ version: "1.39.7", tag: "v1.39.7" })),
+  });
+  assert.notEqual(r.status, "fail");
+  assert.equal(r.status, "skip");
+});
+
+test("evaluateProductionPinPathCheck: non-factory skips (#1183)", () => {
+  const r = evaluateProductionPinPathCheck({
+    factoryControlContext: false,
+    envPinPath: "/home/user/.local/state/hermes-factory/production-engine-pin.json",
+    controlPinPath: "/product/.agent-pipeline/production-engine-pin.json",
+    envPinText: JSON.stringify(validPin({ version: "1.39.6", tag: "v1.39.6" })),
+    controlPinText: JSON.stringify(validPin({ version: "1.39.7", tag: "v1.39.7" })),
+  });
+  assert.equal(r.status, "skip");
+  assert.notEqual(r.status, "fail");
+});
+
 test("evaluateEngineTrackCheck: candidate soak reports no-frg without failing for it (#1041)", () => {
   const pin = validPin({
     version: "1.37.0",
@@ -1060,6 +1170,93 @@ test("promoteProductionPin: exported pin path is written, not worktree pin (#112
   const worktree = parseProductionEnginePin(files.get(worktreePin)!);
   assert.equal(worktree.frg_run_id, "no-frg-1.39.1");
   assert.equal(worktree.version, "1.39.1");
+});
+
+/** Final pin destinations from memFs writes (tmp files excluded). */
+function finalPinWritePaths(writes: string[]): string[] {
+  const dests: string[] = [];
+  for (const w of writes) {
+    const renamed = /^rename:(.+)->(.+)$/.exec(w);
+    if (renamed) {
+      dests.push(renamed[2]!);
+      continue;
+    }
+    if (w.endsWith(".tmp")) continue;
+    dests.push(w);
+  }
+  return dests;
+}
+
+function assertSingleResolvedPinWrite(writes: string[], expectedPath: string): void {
+  const dests = finalPinWritePaths(writes);
+  assert.deepEqual(dests, [path.resolve(expectedPath)], `pin writes: ${JSON.stringify(dests)}`);
+  assert.equal(
+    dests.some((p) => p.includes(HERMES_STATE_PRODUCTION_PIN_MARKER)),
+    false,
+    `Hermes-state pin must not be written: ${JSON.stringify(dests)}`,
+  );
+}
+
+test("promoteProductionPin: writes exactly one resolved pin file (#1183)", async () => {
+  const factoryPin = "/factory/.agent-pipeline/production-engine-pin.json";
+  const { deps, files, writes } = memFs();
+  const result = await promoteProductionPin({
+    repoDir: "/factory",
+    version: "1.39.7",
+    gitSha: "e206cfdabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    overridePath: factoryPin,
+    fsDeps: deps,
+    env: { [PRODUCTION_PIN_ENV]: factoryPin },
+    lookupFrg: async () => ({
+      kind: "pass",
+      evidence: passEvidence("1.39.7", "frg-abc"),
+    }),
+    now: FIXED_NOW,
+  });
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.path, path.resolve(factoryPin));
+  assert.equal(result.pin.version, "1.39.7");
+  assertSingleResolvedPinWrite(writes, factoryPin);
+  assert.equal(files.has("/home/user/.local/state/hermes-factory/production-engine-pin.json"), false);
+});
+
+test("promoteProductionPin: unset env writes the control-checkout pin only (#1183)", async () => {
+  const controlPin = "/factory/.agent-pipeline/production-engine-pin.json";
+  const hermesPin = "/home/user/.local/state/hermes-factory/production-engine-pin.json";
+  const { deps, files, writes } = memFs({
+    [hermesPin]: JSON.stringify(validPin({ version: "1.39.6", tag: "v1.39.6" })),
+  });
+  const result = await promoteProductionPin({
+    repoDir: "/factory",
+    version: "1.39.7",
+    gitSha: "e".repeat(40),
+    fsDeps: deps,
+    env: {},
+    lookupFrg: async () => ({
+      kind: "pass",
+      evidence: passEvidence("1.39.7", "frg-abc"),
+    }),
+    now: FIXED_NOW,
+  });
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.path, path.resolve(controlPin));
+  assertSingleResolvedPinWrite(writes, controlPin);
+  const leftover = parseProductionEnginePin(files.get(hermesPin)!);
+  assert.equal(leftover.version, "1.39.6");
+});
+
+test("promote single-write helper fails when a Hermes-state pin is also written (#1183)", () => {
+  assert.throws(() => {
+    assertSingleResolvedPinWrite(
+      [
+        "rename:/factory/.agent-pipeline/production-engine-pin.json.tmp->/factory/.agent-pipeline/production-engine-pin.json",
+        "rename:/home/user/.local/state/hermes-factory/production-engine-pin.json.tmp->/home/user/.local/state/hermes-factory/production-engine-pin.json",
+      ],
+      "/factory/.agent-pipeline/production-engine-pin.json",
+    );
+  });
 });
 
 test("promoteProductionPin: default does not write no-frg marker without skip (#1041)", async () => {

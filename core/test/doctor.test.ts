@@ -1561,6 +1561,110 @@ test("check install:engine-track — additive stable id alongside coherence and 
   assert.ok(ids.includes("install:version-coherence"));
   assert.ok(ids.includes("install:version-freshness"));
   assert.ok(ids.includes("install:engine-track"));
+  assert.ok(ids.includes("install:production-pin-path"));
+});
+
+// ---------------------------------------------------------------------------
+// install:production-pin-path check (#1183)
+// ---------------------------------------------------------------------------
+
+const FACTORY_REPO = "accidental-hedge-fund/agent-pipeline";
+const CONTROL_PIN_PATH = "/repo/.agent-pipeline/production-engine-pin.json";
+const HERMES_PIN_PATH = "/home/user/.local/state/hermes-factory/production-engine-pin.json";
+
+function splitPinDeps(envPin: string | null, controlPin: string | null, o: FakeOverrides = {}): DoctorDeps {
+  return fakeDeps({
+    ...o,
+    readTextFile: (p) => {
+      if (p === HERMES_PIN_PATH || p === "/env/pin.json") return envPin;
+      if (p === CONTROL_PIN_PATH) return controlPin;
+      if (o.readTextFile) return o.readTextFile(p);
+      if (p.endsWith("production-engine-pin.json")) return controlPin;
+      if (p.endsWith(".pipeline-install-receipt.json")) return receiptJson("1.39.7");
+      return '{"version":"1.39.7"}';
+    },
+  });
+}
+
+test("check install:production-pin-path — env 1.39.6 vs control 1.39.7 → fail (#1183)", async () => {
+  await withoutHostPinAuthorityEnv(async () => {
+    process.env[PRODUCTION_PIN_ENV] = HERMES_PIN_PATH;
+    const r = await getCheck(
+      makeConfig({ repo: FACTORY_REPO, repo_dir: "/repo" }),
+      "install:production-pin-path",
+    ).run(
+      splitPinDeps(
+        pinJson("1.39.6", "a".repeat(40)),
+        pinJson("1.39.7", "e206cfdabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+      ),
+    );
+    assert.equal(r.status, "fail");
+    assert.notEqual(r.status, "warn");
+    assert.notEqual(r.status, "pass");
+    assert.match(r.detail, /1\.39\.6/);
+    assert.match(r.detail, /1\.39\.7/);
+    assert.ok(r.remediation && r.remediation.includes(HERMES_PIN_PATH));
+    assert.ok(r.remediation && r.remediation.includes(CONTROL_PIN_PATH));
+    assert.match(r.remediation, /Unset AGENT_PIPELINE_PRODUCTION_PIN/);
+  });
+});
+
+test("check install:production-pin-path — git_sha disagree at same version → fail (#1183)", async () => {
+  await withoutHostPinAuthorityEnv(async () => {
+    process.env[PRODUCTION_PIN_ENV] = HERMES_PIN_PATH;
+    const r = await getCheck(
+      makeConfig({ repo: FACTORY_REPO, repo_dir: "/repo" }),
+      "install:production-pin-path",
+    ).run(splitPinDeps(pinJson("1.39.7", "a".repeat(40)), pinJson("1.39.7", "b".repeat(40))));
+    assert.equal(r.status, "fail");
+  });
+});
+
+test("check install:production-pin-path — matching identity does not fail (#1183)", async () => {
+  await withoutHostPinAuthorityEnv(async () => {
+    process.env[PRODUCTION_PIN_ENV] = HERMES_PIN_PATH;
+    const sha = "c".repeat(40);
+    const r = await getCheck(
+      makeConfig({ repo: FACTORY_REPO, repo_dir: "/repo" }),
+      "install:production-pin-path",
+    ).run(splitPinDeps(pinJson("1.39.7", sha), pinJson("1.39.7", sha)));
+    assert.notEqual(r.status, "fail");
+    assert.equal(r.status, "pass");
+  });
+});
+
+test("check install:production-pin-path — unset env skips split-pin fail (#1183)", async () => {
+  await withoutHostPinAuthorityEnv(async () => {
+    const r = await getCheck(
+      makeConfig({ repo: FACTORY_REPO, repo_dir: "/repo" }),
+      "install:production-pin-path",
+    ).run(splitPinDeps(pinJson("1.39.6", "a".repeat(40)), pinJson("1.39.7", "b".repeat(40))));
+    assert.notEqual(r.status, "fail");
+    assert.equal(r.status, "skip");
+  });
+});
+
+test("check install:production-pin-path — same path skips split-pin fail (#1183)", async () => {
+  await withoutHostPinAuthorityEnv(async () => {
+    process.env[PRODUCTION_PIN_ENV] = CONTROL_PIN_PATH;
+    const r = await getCheck(
+      makeConfig({ repo: FACTORY_REPO, repo_dir: "/repo" }),
+      "install:production-pin-path",
+    ).run(splitPinDeps(pinJson("1.39.6"), pinJson("1.39.7")));
+    assert.notEqual(r.status, "fail");
+    assert.equal(r.status, "skip");
+  });
+});
+
+test("check install:production-pin-path — non-factory skips (#1183)", async () => {
+  await withoutHostPinAuthorityEnv(async () => {
+    process.env[PRODUCTION_PIN_ENV] = HERMES_PIN_PATH;
+    const r = await getCheck(makeConfig({ repo_dir: "/repo" }), "install:production-pin-path").run(
+      splitPinDeps(pinJson("1.39.6", "a".repeat(40)), pinJson("1.39.7", "b".repeat(40))),
+    );
+    assert.equal(r.status, "skip");
+    assert.notEqual(r.status, "fail");
+  });
 });
 
 // #989: installed chain playbook that still defaults ENGINE_PROMOTE_HOST to codex

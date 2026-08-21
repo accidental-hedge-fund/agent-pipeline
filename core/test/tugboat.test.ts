@@ -1957,6 +1957,46 @@ test("tugboat export_factory_production_pin sets factory pin when unset (#1127)"
   }
 });
 
+test("tugboat export_factory_production_pin ignores an existing Hermes-state pin file (#1183)", () => {
+  const src = fs.readFileSync(tugboat, "utf8");
+  const fn = extractNamedFn(src, "export_factory_production_pin", "tugboat.sh");
+  assert.doesNotMatch(fn, /hermes-factory\/production-engine-pin/);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-pin-hermes-"));
+  try {
+    const home = path.join(dir, "home");
+    const hermesDir = path.join(home, ".local/state/hermes-factory");
+    fs.mkdirSync(hermesDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(hermesDir, "production-engine-pin.json"),
+      JSON.stringify({ version: "1.39.6", git_sha: "a".repeat(40) }),
+    );
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        `HOME=${JSON.stringify(home)}`,
+        'REPO_DIR="/factory/control"',
+        "unset AGENT_PIPELINE_PRODUCTION_PIN",
+        fn,
+        "export_factory_production_pin",
+        'printf "%s" "$AGENT_PIPELINE_PRODUCTION_PIN"',
+        "",
+      ].join("\n"),
+    );
+    const r = spawnSync("bash", [runner], { encoding: "utf8" });
+    assert.equal(r.status, 0, `export runner exited ${r.status}: ${r.stderr}`);
+    assert.equal(
+      r.stdout,
+      "/factory/control/.agent-pipeline/production-engine-pin.json",
+    );
+    assert.doesNotMatch(r.stdout, /hermes-factory/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("tugboat export_factory_production_pin preserves operator override (#1127)", () => {
   const src = fs.readFileSync(tugboat, "utf8");
   const fn = extractNamedFn(src, "export_factory_production_pin", "tugboat.sh");

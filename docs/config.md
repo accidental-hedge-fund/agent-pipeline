@@ -723,7 +723,7 @@ Nested fields:
 ### `production_engine_pin_path`
 
 - **Type:** string
-- **Description:** Absolute path override for the production engine pin JSON. Default authority is factory control checkout (.agent-pipeline/production-engine-pin.json), not every product target. Env AGENT_PIPELINE_PRODUCTION_PIN also overrides.
+- **Description:** Absolute path override for the production engine pin JSON. Default authority is factory control checkout (.agent-pipeline/production-engine-pin.json), not every product target. Env AGENT_PIPELINE_PRODUCTION_PIN also overrides. One live pin on the factory plane; do not default that env to a Hermes-state file.
 
 ### `queue`
 

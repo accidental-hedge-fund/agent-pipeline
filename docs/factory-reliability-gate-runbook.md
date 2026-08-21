@@ -51,6 +51,15 @@ On this factory repo, `pipeline doctor` check `install:engine-track` fails when
 the live pin is `no-frg-*` or has null evidence under pinned intent. Remediate
 with a non-skip promote from a real FRG pass.
 
+The factory plane has one live pin file:
+`$REPO_DIR/.agent-pipeline/production-engine-pin.json`. Do not default
+`AGENT_PIPELINE_PRODUCTION_PIN` to
+`~/.local/state/hermes-factory/production-engine-pin.json`. `pipeline doctor`
+check `install:production-pin-path` **fails** (not warn) when that env points
+at a different file whose `version` or `git_sha` disagrees with the
+control-checkout pin. v1.40.1 packaging MAY template supervisor env and MUST
+NOT reintroduce a second live pin path.
+
 | Action | Command |
 |--------|---------|
 | Show pin | `pipeline factory-pin show` |
@@ -58,7 +67,7 @@ with a non-skip promote from a real FRG pass.
 | Promote after FRG pass | `pipeline factory-pin promote --for <X.Y.Z> [--git-sha <sha>]` |
 | Optional promote after gate | `pipeline factory-gate --for <X.Y.Z> --from-run <id> --promote-pin-on-pass` |
 | Rollback | `pipeline factory-pin rollback` (uses `previous`) or `… rollback --to <X.Y.Z>` |
-| Verify | `pipeline doctor` → check `install:engine-track` |
+| Verify | `pipeline doctor` → checks `install:engine-track` and `install:production-pin-path` |
 
 After promote or rollback, **reinstall** the skill from the pin tag and re-run doctor:
 
