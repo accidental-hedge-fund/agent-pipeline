@@ -2230,8 +2230,25 @@ function writeFakeGit(binDir: string, body: string): void {
   fs.chmodSync(git, 0o755);
 }
 
+// Live Tugboat (FRG pack / composer re-exec) exports these. Child ships under
+// test must not inherit them unless a test sets them in `extra`.
+const TUGBOAT_PARENT_REEXEC_KEYS = [
+  "TUGBOAT_SKIP_TRAIN",
+  "TUGBOAT_CANDIDATE_COMPOSER",
+] as const;
+
+function dropTugboatParentReexecKeys(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const out = { ...env };
+  for (const key of TUGBOAT_PARENT_REEXEC_KEYS) delete out[key];
+  return out;
+}
+
+function tugboatSpawnEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  return { ...dropTugboatParentReexecKeys(process.env), ...extra };
+}
+
 function envWithoutCandidate(extra: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const env = { ...process.env, ...extra };
+  const env = tugboatSpawnEnv(extra);
   delete env.TUGBOAT_CANDIDATE_SHA;
   return env;
 }
@@ -2241,6 +2258,19 @@ function envWithoutBase(extra: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   delete env.TUGBOAT_BASE_BRANCH;
   return env;
 }
+
+test("dropTugboatParentReexecKeys removes skip-train unless the caller sets it", () => {
+  const dropped = dropTugboatParentReexecKeys({
+    TUGBOAT_SKIP_TRAIN: "1",
+    TUGBOAT_CANDIDATE_COMPOSER: "a".repeat(40),
+    PATH: "/bin",
+  });
+  assert.equal(dropped.TUGBOAT_SKIP_TRAIN, undefined);
+  assert.equal(dropped.TUGBOAT_CANDIDATE_COMPOSER, undefined);
+  assert.equal(dropped.PATH, "/bin");
+  const kept = { ...dropped, TUGBOAT_SKIP_TRAIN: "1" };
+  assert.equal(kept.TUGBOAT_SKIP_TRAIN, "1");
+});
 
 function writePipelineYml(repoDir: string, baseBranch: string): void {
   writePipelineYmlRaw(repoDir, `base_branch: ${baseBranch} # integration branch\n`);
@@ -3867,8 +3897,7 @@ test("tugboat after train-complete records candidate argv not pin argv (#1151)",
     const state = path.join(dir, "state");
     const r = spawnSync("bash", [tugboat, "--milestone", "v1.39.5"], {
       encoding: "utf8",
-      env: {
-        ...process.env,
+      env: tugboatSpawnEnv({
         PATH: `${dir}${path.delimiter}${pinDir}${path.delimiter}${process.env.PATH ?? ""}`,
         PIPELINE: pin,
         REPO_DIR: repo,
@@ -3885,7 +3914,7 @@ test("tugboat after train-complete records candidate argv not pin argv (#1151)",
         RELEASE_WAIT_ATTEMPTS: "1",
         RELEASE_WAIT_SLEEP_S: "0",
         FRG_WAIT_SLEEP_S: "0",
-      },
+      }),
     });
     const candArgv = fs.existsSync(path.join(candRecord, "argv"))
       ? fs.readFileSync(path.join(candRecord, "argv"), "utf8")
@@ -4005,8 +4034,7 @@ test("tugboat live in_progress at cap 1 keeps ticking prepare (#1150)", () => {
     });
     const r = spawnSync("bash", [tugboat, "--milestone", "v1.39.5"], {
       encoding: "utf8",
-      env: {
-        ...process.env,
+      env: tugboatSpawnEnv({
         PATH: `${dir}${path.delimiter}${path.dirname(fx.pin)}${path.delimiter}${process.env.PATH ?? ""}`,
         PIPELINE: fx.pin,
         REPO_DIR: fx.repo,
@@ -4024,7 +4052,7 @@ test("tugboat live in_progress at cap 1 keeps ticking prepare (#1150)", () => {
         RELEASE_WAIT_ATTEMPTS: "1",
         RELEASE_WAIT_SLEEP_S: "0",
         FRG_WAIT_SLEEP_S: "0",
-      },
+      }),
     });
     const log = fs.readFileSync(path.join(fx.state, "ship-v1.39.5", "playbook.log"), "utf8");
     const stateJson = JSON.parse(
@@ -4065,8 +4093,7 @@ test("tugboat not-live in_progress at cap 1 fails closed (#1150)", () => {
     });
     const r = spawnSync("bash", [tugboat, "--milestone", "v1.39.5"], {
       encoding: "utf8",
-      env: {
-        ...process.env,
+      env: tugboatSpawnEnv({
         PATH: `${dir}${path.delimiter}${path.dirname(fx.pin)}${path.delimiter}${process.env.PATH ?? ""}`,
         PIPELINE: fx.pin,
         REPO_DIR: fx.repo,
@@ -4084,7 +4111,7 @@ test("tugboat not-live in_progress at cap 1 fails closed (#1150)", () => {
         RELEASE_WAIT_ATTEMPTS: "1",
         RELEASE_WAIT_SLEEP_S: "0",
         FRG_WAIT_SLEEP_S: "0",
-      },
+      }),
     });
     const log = fs.existsSync(path.join(fx.state, "ship-v1.39.5", "playbook.log"))
       ? fs.readFileSync(path.join(fx.state, "ship-v1.39.5", "playbook.log"), "utf8")
@@ -4125,8 +4152,7 @@ test("tugboat fails closed when candidate engine is unavailable (#1151)", () => 
     );
     const r = spawnSync("bash", [tugboat, "--milestone", "v1.39.5"], {
       encoding: "utf8",
-      env: {
-        ...process.env,
+      env: tugboatSpawnEnv({
         PATH: `${pinDir}${path.delimiter}${process.env.PATH ?? ""}`,
         PIPELINE: pin,
         REPO_DIR: repo,
@@ -4136,7 +4162,7 @@ test("tugboat fails closed when candidate engine is unavailable (#1151)", () => 
         TUGBOAT_CANDIDATE_SHA: "c".repeat(40),
         TUGBOAT_REPOSITORY: "accidental-hedge-fund/agent-pipeline",
         TUGBOAT_BASE_BRANCH: "main",
-      },
+      }),
     });
     assert.notEqual(r.status, 0);
     assert.match(`${r.stdout}\n${r.stderr}`, /candidate-engine identity defect|cannot resolve candidate engine/);
