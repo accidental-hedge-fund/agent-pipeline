@@ -21,9 +21,6 @@ import {
   type Option1PackBodies,
 } from "../scripts/tugboat-install-parity.ts";
 import { LOOP_LEDGER_SCHEMA } from "../scripts/loop/types.ts";
-import { stripTugboatParentEnv } from "./strip-tugboat-parent-env.ts";
-
-stripTugboatParentEnv();
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, "../..");
