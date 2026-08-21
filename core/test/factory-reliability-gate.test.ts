@@ -59,6 +59,7 @@ import {
 } from "../scripts/factory-reliability-gate.ts";
 import type { LoopContract, LoopLedger } from "../scripts/loop/types.ts";
 import { LOOP_CONTRACT_SCHEMA, LOOP_LEDGER_SCHEMA } from "../scripts/loop/types.ts";
+import { presentFrgAttestorCredential } from "../scripts/ship-end-candidate.ts";
 
 /** Minimal full-pack pass scoring input (all scenarios + composition; K met; live loop). */
 function fullPackPassInput(
@@ -2185,6 +2186,38 @@ test("HMAC-verify presents KEY_FILE as KEY when KEY is unset (#1181)", async () 
     env: { PIPELINE_FRG_ATTESTATION_KEY_FILE: "/keys/dummy" },
     presentAttestorCredential: {
       readFile: () => Buffer.from(dummy),
+    },
+  });
+  assert.equal(ok.pass, true);
+  assert.equal(verifyFrgAttestation(ok, dummy), true);
+});
+
+test("HMAC-verify strips KEY_FILE trailing LF and verifies with KEY (#1181)", async () => {
+  const dummy = "dummy-key";
+  const presented = presentFrgAttestorCredential(
+    { PIPELINE_FRG_ATTESTATION_KEY_FILE: "/keys/dummy" },
+    { readFile: () => Buffer.from(`${dummy}\n`) },
+  );
+  assert.equal(presented.ok, true);
+  if (!presented.ok) return;
+  const presentedKey = presented.env.PIPELINE_FRG_ATTESTATION_KEY;
+  assert.equal(presentedKey, dummy);
+  assert.equal(presented.env.PIPELINE_FRG_ATTESTATION_KEY_FILE, undefined);
+  const fs = memFs();
+  const good = computeFrgEvidence(
+    fullPackPassInput({
+      version: "1.30.0",
+      run_id: "frg-key-file-lf",
+      attestation_key: dummy,
+    }),
+  );
+  assert.equal(good.pass, true);
+  assert.equal(verifyFrgAttestation(good, presentedKey!), true);
+  await writeFrgEvidence("/repo", good, fs);
+  const ok = await validateFrgEvidenceFileForTag("/repo", "1.30.0", fs, {
+    env: { PIPELINE_FRG_ATTESTATION_KEY_FILE: "/keys/dummy" },
+    presentAttestorCredential: {
+      readFile: () => Buffer.from(`${dummy}\n`),
     },
   });
   assert.equal(ok.pass, true);

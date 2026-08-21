@@ -6,7 +6,8 @@
 
 ## 2. Shared engine presentation helper
 
-- [x] 2.1 Add one engine helper that implements the Tugboat five-branch recipe against a parent env copy: inherit `KEY` and unset `KEY_FILE`; else fail closed on missing/empty/unreadable `KEY_FILE`; else set `KEY` from the file body and unset `KEY_FILE`. Do not mutate the parent env. Verify task 1.1 now passes when attestor and ensure-tag spawn use that helper
+- [x] 2.1 Add one engine helper that implements the Tugboat five-branch recipe against a parent env copy: inherit `KEY` and unset `KEY_FILE`; else fail closed on missing/empty/unreadable `KEY_FILE`; else set `KEY` from the file body after removing trailing LF bytes (`KEY="$(cat -- "$KEY_FILE")"`) and unset `KEY_FILE`. Do not mutate the parent env. Verify task 1.1 now passes when attestor and ensure-tag spawn use that helper
+- [x] 2.1a Regression: `dummy-key\n` KEY_FILE presents child `KEY=dummy-key` (no trailing LF) and HMAC attestation verifies with `dummy-key`
 - [x] 2.2 When `KEY` is already set, inherit it and still unset `KEY_FILE`. Verify both HMAC children record `KEY=<inline>` and `KEY_FILE` unset
 - [x] 2.3 Keep `uncredentialedPrepareEnv` for prepare. Verify prepare child env still has both `KEY` and `KEY_FILE` unset when the parent has `KEY_FILE` set. Do not persist the key body in ship state, finish JSON, request JSON, or logs
 

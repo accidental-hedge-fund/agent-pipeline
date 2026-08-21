@@ -267,6 +267,20 @@ test("HMAC children present KEY_FILE as KEY when KEY is unset (#1181)", () => {
   assert.equal(prep.PIPELINE_FRG_ATTESTATION_KEY_FILE, undefined);
 });
 
+test("HMAC children strip trailing LF from KEY_FILE like Tugboat cat (#1181)", () => {
+  const parent: NodeJS.ProcessEnv = {
+    PATH: "/usr/bin",
+    PIPELINE_FRG_ATTESTATION_KEY_FILE: KEY_FILE_PATH,
+  };
+  delete parent.PIPELINE_FRG_ATTESTATION_KEY;
+  const deps = dummyFileDeps({ [KEY_FILE_PATH]: Buffer.from(`${DUMMY_KEY}\n`) });
+  const att = hmacVerifyChildEnv(parent, deps);
+  const tag = hmacVerifyChildEnv(parent, deps);
+  assertHmacChildHasCredential(att, DUMMY_KEY);
+  assertHmacChildHasCredential(tag, DUMMY_KEY);
+  assert.equal(att.PIPELINE_FRG_ATTESTATION_KEY?.includes("\n"), false);
+});
+
 test("HMAC children inherit inline KEY over KEY_FILE body (#1181)", () => {
   const parent: NodeJS.ProcessEnv = {
     PIPELINE_FRG_ATTESTATION_KEY: "inline-key",

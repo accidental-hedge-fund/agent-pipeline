@@ -248,7 +248,8 @@ export function presentFrgAttestorCredential(
   if (body.length === 0) {
     return { ok: false, reason: "missing_attestor_credential" };
   }
-  next[FRG_ATTESTATION_KEY_ENV_NAME] = body.toString("utf8");
+  // Tugboat KEY="$(cat -- "$KEY_FILE")" drops trailing LF via command substitution.
+  next[FRG_ATTESTATION_KEY_ENV_NAME] = body.toString("utf8").replace(/\n+$/, "");
   delete next[FRG_ATTESTATION_KEY_FILE_ENV_NAME];
   return { ok: true, env: next };
 }

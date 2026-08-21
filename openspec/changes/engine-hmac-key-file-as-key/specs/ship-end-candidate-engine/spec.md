@@ -8,7 +8,7 @@ In-engine `pipeline ship` SHALL present the producer credential to HMAC-verify c
 2. Else if `PIPELINE_FRG_ATTESTATION_KEY_FILE` is unset or empty, fail closed with named reason `missing_attestor_credential` (or equivalent) and SHALL NOT spawn HMAC verify.
 3. Else if that file is unreadable, fail closed with named reason `unreadable_attestor_key_file` (or equivalent) and SHALL NOT spawn HMAC verify.
 4. Else if that file is empty (zero bytes), fail closed with named reason `missing_attestor_credential` (or equivalent) and SHALL NOT spawn HMAC verify.
-5. Else spawn the HMAC-verify child with `PIPELINE_FRG_ATTESTATION_KEY` set to the file body and `PIPELINE_FRG_ATTESTATION_KEY_FILE` unset.
+5. Else spawn the HMAC-verify child with `PIPELINE_FRG_ATTESTATION_KEY` set to the file body after removing trailing LF bytes (Tugboat `KEY="$(cat -- "$KEY_FILE")"` command substitution) and `PIPELINE_FRG_ATTESTATION_KEY_FILE` unset.
 
 Ensure-tag spawn SHALL NOT use the uncredentialed prepare env (the helper that deletes both `KEY` and `KEY_FILE`). Prepare / unsigned `factory-release prepare` SHALL still have `PIPELINE_FRG_ATTESTATION_KEY` and `PIPELINE_FRG_ATTESTATION_KEY_FILE` unset in that child. In-engine `pipeline ship` SHALL NOT leave HMAC verify without a credential when `PIPELINE_FRG_ATTESTATION_KEY_FILE` is a readable non-empty file. It SHALL NOT require a Tugboat-only env wrap or a human `env PIPELINE_FRG_ATTESTATION_KEY=…` as the ship path. It SHALL NOT persist the key body in ship state.
 
@@ -29,6 +29,14 @@ This requirement does not authorize `--skip-frg` as the ship path. It does not a
 - **AND** in-engine `pipeline ship` invokes candidate `release ensure-tag`
 - **THEN** that ensure-tag child SHALL have `PIPELINE_FRG_ATTESTATION_KEY` equal to `dummy-key`
 - **AND** that ensure-tag child SHALL have `PIPELINE_FRG_ATTESTATION_KEY_FILE` unset
+
+#### Scenario: In-engine KEY_FILE trailing LF is stripped like Tugboat command substitution
+
+- **WHEN** the parent environment sets `PIPELINE_FRG_ATTESTATION_KEY_FILE` to a readable non-empty file whose body is `dummy-key` followed by a trailing LF
+- **AND** `PIPELINE_FRG_ATTESTATION_KEY` is unset
+- **AND** in-engine `pipeline ship` invokes the FRG pack attestor child or candidate `release ensure-tag`
+- **THEN** that child SHALL have `PIPELINE_FRG_ATTESTATION_KEY` equal to `dummy-key` with no trailing LF
+- **AND** that child SHALL have `PIPELINE_FRG_ATTESTATION_KEY_FILE` unset
 
 #### Scenario: In-engine HMAC children inherit KEY and unset KEY_FILE
 

@@ -8,7 +8,7 @@ Engine HMAC-verify entries SHALL present the producer credential using one recip
 2. Else if `PIPELINE_FRG_ATTESTATION_KEY_FILE` is unset or empty, fail closed with named reason `missing_attestor_credential` (or equivalent) and SHALL NOT mint or verify HMAC.
 3. Else if that file is unreadable, fail closed with named reason `unreadable_attestor_key_file` (or equivalent) and SHALL NOT mint or verify HMAC.
 4. Else if that file is empty (zero bytes), fail closed with named reason `missing_attestor_credential` (or equivalent) and SHALL NOT mint or verify HMAC.
-5. Else set `PIPELINE_FRG_ATTESTATION_KEY` from the file body and unset `PIPELINE_FRG_ATTESTATION_KEY_FILE` for that HMAC operation.
+5. Else set `PIPELINE_FRG_ATTESTATION_KEY` from the file body after removing trailing LF bytes (Tugboat `KEY="$(cat -- "$KEY_FILE")"` command substitution) and unset `PIPELINE_FRG_ATTESTATION_KEY_FILE` for that HMAC operation.
 
 HMAC mint and verify SHALL still authenticate with `PIPELINE_FRG_ATTESTATION_KEY` after presentation. The engine SHALL NOT leave HMAC mint or verify without a credential when `PIPELINE_FRG_ATTESTATION_KEY_FILE` is a readable non-empty file. The engine SHALL NOT require a Tugboat-only env wrap or a human `env PIPELINE_FRG_ATTESTATION_KEY=…` as the product path. GitHub Actions auto-tag SHALL still use repo secret `PIPELINE_FRG_ATTESTATION_KEY`. Unsigned `factory-release prepare` SHALL still have `PIPELINE_FRG_ATTESTATION_KEY` and `PIPELINE_FRG_ATTESTATION_KEY_FILE` unset in that child. The engine SHALL NOT persist the key body in ship state.
 
@@ -31,6 +31,14 @@ This requirement does not authorize `--skip-frg` as the ship path. It does not a
 - **THEN** that HMAC operation SHALL use `PIPELINE_FRG_ATTESTATION_KEY` equal to `dummy-key`
 - **AND** it SHALL have `PIPELINE_FRG_ATTESTATION_KEY_FILE` unset
 - **AND** it SHALL NOT require a Tugboat env wrap
+
+#### Scenario: KEY_FILE trailing LF is stripped like Tugboat command substitution
+
+- **WHEN** the process environment has `PIPELINE_FRG_ATTESTATION_KEY_FILE` set to a readable non-empty file whose body is `dummy-key` followed by a trailing LF
+- **AND** `PIPELINE_FRG_ATTESTATION_KEY` is unset
+- **AND** `pipeline factory-gate --from-run` or `pipeline release ensure-tag` would mint or verify HMAC
+- **THEN** that HMAC operation SHALL use `PIPELINE_FRG_ATTESTATION_KEY` equal to `dummy-key` with no trailing LF
+- **AND** the resulting attestation SHALL verify with `dummy-key`
 
 #### Scenario: HMAC inherits KEY and unsets KEY_FILE
 
