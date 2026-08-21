@@ -5,7 +5,7 @@
 // evidence producer. Each converge operation first observes external truth.
 
 import { execFile, execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -40,11 +40,20 @@ import {
   isPostPilotReleaseVersion,
 } from "../factory-release-prepare.ts";
 import { resolveReleaseConfig } from "../config.ts";
-import { getPrForIssueAnyState } from "../gh.ts";
+import { getPrChecks, getPrForIssueAnyState, rerunFailedWorkflows } from "../gh.ts";
 import { withLock } from "../lock.ts";
+import {
+  attemptCountFor,
+  MAX_RERUN_BUDGET,
+  parseRerunBudgetDoc,
+  ShipReleaseCheckWaitError,
+  waitForReleasePrChecks,
+  withRecordedAttempt,
+  type ShipReleaseCheckWaitDeps,
+} from "./ship-release-check-wait.ts";
 import { resolveStateHome } from "../loop/store.ts";
 import { LOOP_LEDGER_SCHEMA } from "../loop/types.ts";
-import type { PipelineConfig } from "../types.ts";
+import type { CheckRun, PipelineConfig } from "../types.ts";
 import {
   defaultShipStateStore,
   shipKey,
@@ -429,6 +438,14 @@ export function shipCoordinatorDepsFromOperations(
   opts: {
     state: ShipStateStore;
     now?: () => Date;
+    authorizationPublicKey?: string;
+    /**
+     * Shared ship-release-check-wait loop. Required before finish when the
+     * release PR is still open. Tests inject `gh` and clock here.
+     */
+    releaseCheckWait?:
+      | ShipReleaseCheckWaitDeps
+      | ((intent: ShipIntent) => ShipReleaseCheckWaitDeps);
   },
 ): ShipCoordinatorDeps {
   const trainCheckpoints = new Map<string, ShipTrainEvidence>();
@@ -596,6 +613,41 @@ export function shipCoordinatorDepsFromOperations(
       if (existing && (existing.prepare.pr !== release.pr || existing.prepare.head_oid !== release.head_oid)) {
         throw new Error("ship release: observed release PR identity differs from prepared identity");
       }
+      const wait = typeof opts.releaseCheckWait === "function"
+        ? opts.releaseCheckWait(intent)
+        : opts.releaseCheckWait;
+      if (!wait) {
+        throw new Error("ship release: check waiter is required before finish");
+      }
+      const requirePreparedRelease = async () => {
+        const observed = await operations.observeRelease(intent, release.candidate_head_oid);
+        if (observed?.finish &&
+            observed.prepare.pr === release.pr &&
+            observed.prepare.head_oid === release.head_oid) {
+          return observed;
+        }
+        if (!observed ||
+            observed.prepare.pr !== release.pr ||
+            observed.prepare.head_oid !== release.head_oid) {
+          throw new ShipReleaseCheckWaitError(
+            "pending",
+            `ship release: PR #${release.pr} head changed during wait ` +
+              `(prepared ${release.head_oid}, live ${observed?.prepare.head_oid ?? "unknown"}); ` +
+              "retry the same ship command to resume",
+          );
+        }
+        return observed;
+      };
+      await waitForReleasePrChecks({
+        pr: release.pr,
+        headSha: release.head_oid,
+        deps: {
+          ...wait,
+          verifyReleaseHead: async () => (await requirePreparedRelease()).prepare.head_oid,
+        },
+      });
+      const latest = await requirePreparedRelease();
+      if (latest.finish) return latest.finish;
       return operations.finishRelease(intent, release);
     },
 
@@ -1918,6 +1970,124 @@ function runningProcessPinSha(): string | null {
   return parseExactGitSha(resolveEngineCommitSha(engineRoot));
 }
 
+function releaseCheckRerunBudgetFile(state: ShipStateStore, intent: ShipIntent): string {
+  return path.join(path.dirname(state.statusFile(shipKey(intent))), "release-checks.rerun.json");
+}
+
+async function writeRerunBudgetAtomic(file: string, value: unknown): Promise<void> {
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  const temporary = path.join(
+    path.dirname(file),
+    `.${path.basename(file)}.${randomUUID()}.tmp`,
+  );
+  const handle = await fs.open(temporary, "wx", 0o600);
+  try {
+    await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`, "utf8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  try {
+    await fs.rename(temporary, file);
+  } catch (err) {
+    await fs.rm(temporary, { force: true });
+    throw err;
+  }
+}
+
+function unreadableRerunBudgetError(file: string, cause: unknown): Error {
+  const msg = cause instanceof Error ? cause.message : String(cause);
+  return new Error(`ship release: unreadable rerun-budget state at ${file} (${msg})`);
+}
+
+export async function loadRerunAttemptCount(
+  file: string,
+  pr: number,
+  headSha: string,
+): Promise<number> {
+  let text: string;
+  try {
+    text = await fs.readFile(file, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return 0;
+    throw unreadableRerunBudgetError(file, err);
+  }
+  try {
+    return attemptCountFor(parseRerunBudgetDoc(JSON.parse(text) as unknown), pr, headSha);
+  } catch {
+    // Fail closed: truncated or unparsable state is treated as budget spent
+    // so a later retry cannot issue another rerun for this head.
+    return MAX_RERUN_BUDGET;
+  }
+}
+
+export async function recordRerunAttemptFile(
+  file: string,
+  pr: number,
+  headSha: string,
+  runId: string,
+  at: string,
+): Promise<void> {
+  let current = parseRerunBudgetDoc(null);
+  try {
+    current = parseRerunBudgetDoc(JSON.parse(await fs.readFile(file, "utf8")) as unknown);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw unreadableRerunBudgetError(file, err);
+    }
+  }
+  const next = withRecordedAttempt(current, pr, headSha, runId, at);
+  await writeRerunBudgetAtomic(file, next);
+}
+
+function productionReleaseCheckWait(
+  opts: RealShipCoordinatorDepsOptions,
+  state: ShipStateStore,
+): (intent: ShipIntent) => ShipReleaseCheckWaitDeps {
+  const ghCfg = { repo: opts.repo } as PipelineConfig;
+  return (intent) => {
+    const budgetFile = releaseCheckRerunBudgetFile(state, intent);
+    return {
+      getPrChecks: (pr) => getPrChecks(ghCfg, pr),
+      rerunFailedWorkflows: (failed) =>
+        rerunFailedWorkflows(ghCfg, failed as CheckRun[]),
+      sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+      loadAttemptCount: (pr, headSha) => loadRerunAttemptCount(budgetFile, pr, headSha),
+      recordAttempt: (pr, headSha, runId) =>
+        recordRerunAttemptFile(budgetFile, pr, headSha, runId, new Date().toISOString()),
+      async onWaitTick(tick) {
+        opts.progress(
+          `ship release: wait heartbeat attempt=${tick.attempt} pr=#${tick.pr} ` +
+            `outcome=${tick.outcome} ${tick.detail}`,
+        );
+        const key = shipKey(intent);
+        const current = await state.read(key);
+        if (!current || current.next_action !== "release_finish") return;
+        const now = new Date().toISOString();
+        await state.writeAtomic(key, {
+          ...current,
+          revision: current.revision + 1,
+          updated_at: now,
+          last_error: null,
+        });
+        const event: ShipPhaseEvent = {
+          schema_version: 1,
+          kind: "ship_phase",
+          run_id: current.run_id,
+          event_id: current.intent.event_id,
+          at: now,
+          phase: "release_finish",
+          status: "started",
+          detail: `checks ${tick.outcome} tick ${tick.attempt} ${tick.detail}`,
+        };
+        await state.appendEvent(key, event);
+      },
+      maxAttempts: RELEASE_WAIT_ATTEMPTS,
+      intervalMs: RELEASE_WAIT_MS,
+    };
+  };
+}
+
 /** Production factory used by the `pipeline ship` CLI. */
 export function realShipCoordinatorDeps(opts: RealShipCoordinatorDepsOptions): ShipCoordinatorDeps {
   if (!opts.repo || opts.repo.toLowerCase() !== opts.repo.trim().toLowerCase() ||
@@ -2000,5 +2170,9 @@ export function realShipCoordinatorDeps(opts: RealShipCoordinatorDepsOptions): S
       await state.appendEvent(key, event);
     },
   });
-  return shipCoordinatorDepsFromOperations(ops, { state });
+  return shipCoordinatorDepsFromOperations(ops, {
+    state,
+    authorizationPublicKey: opts.authorizationPublicKey,
+    releaseCheckWait: productionReleaseCheckWait(opts, state),
+  });
 }

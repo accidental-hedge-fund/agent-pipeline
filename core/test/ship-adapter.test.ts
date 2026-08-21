@@ -14,9 +14,11 @@ import {
   classifyFrgPackWaitDecision,
   ensureAnnotatedReleaseTag,
   hmacPackedCandidateGitShaFromUnknown,
+  loadRerunAttemptCount,
   persistShipFactoryReleaseRequest,
   persistedShipFactoryReleaseRequestPath,
   probeBoundPackLoopLive,
+  recordRerunAttemptFile,
   resolveEnsureTagOwnerRepo,
   runEnsureAnnotatedReleaseTagCli,
   shipCoordinatorDepsFromOperations,
@@ -24,11 +26,20 @@ import {
   type ObservedEnsureTagReleasePr,
   type ShipAdapterOperations,
 } from "../scripts/stages/ship-adapter.ts";
+import {
+  attemptCountFor,
+  emptyRerunBudgetDoc,
+  MAX_RERUN_BUDGET,
+  ShipReleaseCheckWaitError,
+  withRecordedAttempt,
+  type ShipReleaseCheckWaitDeps,
+} from "../scripts/stages/ship-release-check-wait.ts";
 import { LOOP_LEDGER_SCHEMA } from "../scripts/loop/types.ts";
 import {
   runShipCoordinator,
   shipKey,
   type ShipIntent,
+  type ShipPhaseEvent,
   type ShipStateStore,
   type ShipStatus,
   type ShipTrainEvidence,
@@ -452,6 +463,429 @@ test("ship adapter accepts already completed release, publication, and promotion
   assert.deepEqual(calls, []);
 });
 
+const TEST_FAIL_LINK = "https://github.com/o/r/actions/runs/32075787450";
+
+function memoryWait(
+  over: Partial<ShipReleaseCheckWaitDeps> & {
+    getPrChecks: ShipReleaseCheckWaitDeps["getPrChecks"];
+  },
+): ShipReleaseCheckWaitDeps {
+  let doc = emptyRerunBudgetDoc();
+  return {
+    rerunFailedWorkflows: async () => ({ attempted: true, runIds: ["32075787450"] }),
+    sleep: async () => {},
+    loadAttemptCount: async (pr, headSha) => attemptCountFor(doc, pr, headSha),
+    recordAttempt: async (pr, headSha, runId) => {
+      doc = withRecordedAttempt(doc, pr, headSha, runId, "2026-08-21T00:00:00.000Z");
+    },
+    maxAttempts: 3,
+    intervalMs: 0,
+    rerunBudget: 1,
+    ...over,
+  };
+}
+
+test("convergeReleaseFinish does not invoke finish while checks are pending (#1205)", async () => {
+  let finishes = 0;
+  let checks = 0;
+  const deps = shipCoordinatorDepsFromOperations(operations({
+    observeRelease: async () => ({ prepare: release, finish: null }),
+    finishRelease: async () => {
+      finishes++;
+      return releaseFinish;
+    },
+  }), {
+    state,
+    releaseCheckWait: memoryWait({
+      maxAttempts: 2,
+      getPrChecks: async () => {
+        checks++;
+        return [{ name: "test", state: "PENDING", bucket: "pending", link: "" }];
+      },
+    }),
+  });
+  await deps.convergeTrain(intent, train.ordered_issues);
+  await assert.rejects(
+    () => deps.convergeReleaseFinish(intent, release),
+    (err: unknown) => {
+      assert.ok(err instanceof ShipReleaseCheckWaitError);
+      assert.equal(err.outcome, "pending");
+      assert.doesNotMatch(err.message, /observable checks are not green/);
+      return true;
+    },
+  );
+  assert.equal(finishes, 0, "finish must not run on a pending snapshot");
+  assert.ok(checks >= 1, "waiter must poll gh pr checks");
+});
+
+test("convergeReleaseFinish requests gh run rerun --failed for a flake test fail before a second wait (#1205)", async () => {
+  const calls: string[] = [];
+  let finishes = 0;
+  const captures = [
+    [{ name: "test", state: "FAILURE", bucket: "fail", link: TEST_FAIL_LINK }],
+    [{ name: "test", state: "PENDING", bucket: "pending", link: TEST_FAIL_LINK }],
+  ];
+  const deps = shipCoordinatorDepsFromOperations(operations({
+    observeRelease: async () => ({ prepare: release, finish: null }),
+    finishRelease: async () => {
+      finishes++;
+      calls.push("finish");
+      return releaseFinish;
+    },
+  }), {
+    state,
+    releaseCheckWait: memoryWait({
+      maxAttempts: 2,
+      getPrChecks: async () => {
+        calls.push("checks");
+        return captures.shift() ?? [{ name: "test", state: "PENDING", bucket: "pending" }];
+      },
+      rerunFailedWorkflows: async () => {
+        calls.push("rerun");
+        return { attempted: true, runIds: ["32075787450"] };
+      },
+      sleep: async () => {
+        calls.push("sleep");
+      },
+    }),
+  });
+  await deps.convergeTrain(intent, train.ordered_issues);
+  await assert.rejects(
+    () => deps.convergeReleaseFinish(intent, release),
+    (err: unknown) => {
+      assert.ok(err instanceof ShipReleaseCheckWaitError);
+      assert.equal(err.outcome, "pending");
+      return true;
+    },
+  );
+  assert.equal(finishes, 0);
+  assert.ok(calls.includes("rerun"), "flake-eligible test fail must request gh run rerun --failed");
+  assert.ok(calls.indexOf("rerun") < calls.lastIndexOf("checks"), "rerun must happen before the second wait");
+  assert.ok(!calls.includes("finish"));
+});
+
+test("convergeReleaseFinish invokes finish only after green checks (#1205)", async () => {
+  let finishes = 0;
+  const captures = [
+    [{ name: "test", state: "PENDING", bucket: "pending" }],
+    [{ name: "test", state: "SUCCESS", bucket: "pass" }],
+  ];
+  const deps = shipCoordinatorDepsFromOperations(operations({
+    observeRelease: async () => ({ prepare: release, finish: null }),
+    finishRelease: async () => {
+      finishes++;
+      return releaseFinish;
+    },
+  }), {
+    state,
+    releaseCheckWait: memoryWait({
+      maxAttempts: 5,
+      getPrChecks: async () => captures.shift() ?? [{ name: "test", state: "SUCCESS", bucket: "pass" }],
+    }),
+  });
+  await deps.convergeTrain(intent, train.ordered_issues);
+  assert.deepEqual(await deps.convergeReleaseFinish(intent, release), releaseFinish);
+  assert.equal(finishes, 1);
+  assert.equal(captures.length, 0);
+});
+
+test("convergeReleaseFinish persists fail without finish on a terminal product fail (#1205)", async () => {
+  let finishes = 0;
+  let reruns = 0;
+  const deps = shipCoordinatorDepsFromOperations(operations({
+    observeRelease: async () => ({ prepare: release, finish: null }),
+    finishRelease: async () => {
+      finishes++;
+      return releaseFinish;
+    },
+  }), {
+    state,
+    releaseCheckWait: memoryWait({
+      getPrChecks: async () => [
+        { name: "release-build", state: "FAILURE", bucket: "fail", link: TEST_FAIL_LINK },
+      ],
+      rerunFailedWorkflows: async () => {
+        reruns++;
+        return { attempted: true, runIds: ["32075787450"] };
+      },
+    }),
+  });
+  await deps.convergeTrain(intent, train.ordered_issues);
+  await assert.rejects(
+    () => deps.convergeReleaseFinish(intent, release),
+    (err: unknown) => {
+      assert.ok(err instanceof ShipReleaseCheckWaitError);
+      assert.equal(err.outcome, "fail");
+      assert.match(err.message, /non-flake product fail/);
+      return true;
+    },
+  );
+  assert.equal(finishes, 0);
+  assert.equal(reruns, 0);
+});
+
+test("coordinator wait-cap expiry keeps release_finish resumable (#1205)", async () => {
+  const store = memoryShipStore();
+  store.status = checkpoint({
+    ship_key: shipKey(intent),
+    next_action: "release_finish",
+    train,
+    train_plan: { ordered_issues: [...train.ordered_issues] },
+    frg_pack: {
+      version: intent.version,
+      complete: true,
+      loop_run_id: "loop-1",
+      pack_id: "factory-gate-v1",
+      candidate_head_oid: head,
+    },
+    frg: {
+      version: intent.version,
+      pass: true,
+      loop_run_id: "loop-1",
+      frg_run_id: "frg-1",
+      candidate_head_oid: head,
+    },
+    release,
+  });
+  let finishes = 0;
+  let checks = 0;
+  const pendingWait = memoryWait({
+    maxAttempts: 2,
+    getPrChecks: async () => {
+      checks++;
+      return [{ name: "test", state: "PENDING", bucket: "pending", link: "" }];
+    },
+  });
+  const wrap = (deps: ReturnType<typeof shipCoordinatorDepsFromOperations>) => ({
+    ...deps,
+    authorizationPublicKey: "test",
+    withRunLock: async (_key: string, fn: () => Promise<unknown>) => fn(),
+  });
+  const waiting = wrap(shipCoordinatorDepsFromOperations(operations({
+    observeRelease: async () => ({ prepare: release, finish: null }),
+    finishRelease: async () => {
+      finishes++;
+      return releaseFinish;
+    },
+  }), {
+    state: store,
+    releaseCheckWait: pendingWait,
+  }));
+  const checkpointed = await runShipCoordinator(intent, null, waiting);
+  assert.equal(checkpointed.complete, false);
+  assert.equal(checkpointed.next_action, "release_finish");
+  assert.equal(checkpointed.last_error, null);
+  assert.equal(checkpointed.release_finish, null);
+  assert.equal(finishes, 0);
+  assert.equal(checks, 2);
+  assert.ok(!store.events.some((event) => event.status === "failed"));
+
+  checks = 0;
+  const greenWait = memoryWait({
+    maxAttempts: 2,
+    getPrChecks: async () => {
+      checks++;
+      return [{ name: "test", state: "SUCCESS", bucket: "pass" }];
+    },
+  });
+  const resumed = wrap(shipCoordinatorDepsFromOperations(operations({
+    observeRelease: async () => ({ prepare: release, finish: null }),
+    finishRelease: async () => {
+      finishes++;
+      return releaseFinish;
+    },
+  }), {
+    state: store,
+    releaseCheckWait: greenWait,
+  }));
+  const result = await runShipCoordinator(intent, null, resumed);
+  assert.equal(result.complete, true);
+  assert.equal(result.next_action, "complete");
+  assert.equal(result.last_error, null);
+  assert.equal(finishes, 1);
+  assert.equal(checks, 1);
+});
+
+test("convergeReleaseFinish does not rerun or finish when the release PR head changes during wait (#1205)", async () => {
+  const changed = { ...release, head_oid: "f".repeat(40) };
+  let observes = 0;
+  let finishes = 0;
+  let reruns = 0;
+  const captures = [
+    [{ name: "test", state: "PENDING", bucket: "pending", link: "" }],
+    [{ name: "test", state: "FAILURE", bucket: "fail", link: TEST_FAIL_LINK }],
+  ];
+  const deps = shipCoordinatorDepsFromOperations(operations({
+    observeRelease: async () => {
+      observes++;
+      if (observes >= 3) return { prepare: changed, finish: null };
+      return { prepare: release, finish: null };
+    },
+    finishRelease: async () => {
+      finishes++;
+      return releaseFinish;
+    },
+  }), {
+    state,
+    releaseCheckWait: memoryWait({
+      maxAttempts: 5,
+      getPrChecks: async () => captures.shift() ?? [{ name: "test", state: "FAILURE", bucket: "fail", link: TEST_FAIL_LINK }],
+      rerunFailedWorkflows: async () => {
+        reruns++;
+        return { attempted: true, runIds: ["32075787450"] };
+      },
+    }),
+  });
+  await deps.convergeTrain(intent, train.ordered_issues);
+  await assert.rejects(
+    () => deps.convergeReleaseFinish(intent, release),
+    (err: unknown) => {
+      assert.ok(err instanceof ShipReleaseCheckWaitError);
+      assert.equal(err.outcome, "pending");
+      assert.match(err.message, /head changed during wait/);
+      return true;
+    },
+  );
+  assert.equal(finishes, 0, "must not finish under a stale prepared head");
+  assert.equal(reruns, 0, "must not rerun workflows for a changed head");
+});
+
+test("convergeReleaseFinish does not finish when the release PR head changes after green checks (#1205)", async () => {
+  const changed = { ...release, head_oid: "f".repeat(40) };
+  let observes = 0;
+  let finishes = 0;
+  const deps = shipCoordinatorDepsFromOperations(operations({
+    observeRelease: async () => {
+      observes++;
+      if (observes >= 3) return { prepare: changed, finish: null };
+      return { prepare: release, finish: null };
+    },
+    finishRelease: async () => {
+      finishes++;
+      return releaseFinish;
+    },
+  }), {
+    state,
+    releaseCheckWait: memoryWait({
+      maxAttempts: 5,
+      getPrChecks: async () => [{ name: "test", state: "SUCCESS", bucket: "pass" }],
+    }),
+  });
+  await deps.convergeTrain(intent, train.ordered_issues);
+  await assert.rejects(
+    () => deps.convergeReleaseFinish(intent, release),
+    (err: unknown) => {
+      assert.ok(err instanceof ShipReleaseCheckWaitError);
+      assert.equal(err.outcome, "pending");
+      assert.match(err.message, /head changed during wait/);
+      return true;
+    },
+  );
+  assert.equal(finishes, 0);
+});
+
+test("loadRerunAttemptCount treats unreadable budget state as exhausted so no extra rerun is issued (#1205)", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ship-rerun-budget-"));
+  const budgetFile = path.join(dir, "release-checks.rerun.json");
+  fs.writeFileSync(budgetFile, "{ \"schema_version\": 1, \"entries\": [");
+  try {
+    assert.equal(
+      await loadRerunAttemptCount(budgetFile, 945, releaseHead),
+      MAX_RERUN_BUDGET,
+      "malformed persisted state must fail closed",
+    );
+    let reruns = 0;
+    let finishes = 0;
+    const deps = shipCoordinatorDepsFromOperations(operations({
+      observeRelease: async () => ({ prepare: release, finish: null }),
+      finishRelease: async () => {
+        finishes++;
+        return releaseFinish;
+      },
+    }), {
+      state,
+      releaseCheckWait: memoryWait({
+        loadAttemptCount: (pr, headSha) => loadRerunAttemptCount(budgetFile, pr, headSha),
+        recordAttempt: (pr, headSha, runId) =>
+          recordRerunAttemptFile(budgetFile, pr, headSha, runId, "2026-08-21T00:00:00.000Z"),
+        getPrChecks: async () => [
+          { name: "test", state: "FAILURE", bucket: "fail", link: TEST_FAIL_LINK },
+        ],
+        rerunFailedWorkflows: async () => {
+          reruns++;
+          return { attempted: true, runIds: ["32075787450"] };
+        },
+      }),
+    });
+    await deps.convergeTrain(intent, train.ordered_issues);
+    await assert.rejects(
+      () => deps.convergeReleaseFinish(intent, release),
+      (err: unknown) => {
+        assert.ok(err instanceof ShipReleaseCheckWaitError);
+        assert.equal(err.outcome, "fail");
+        assert.match(err.message, /rerun budget spent/);
+        return true;
+      },
+    );
+    assert.equal(reruns, 0, "malformed budget must not issue another rerun");
+    assert.equal(finishes, 0);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("recordRerunAttemptFile writes through temp+rename and refuses to reset unreadable state (#1205)", async () => {
+  const src = fs.readFileSync(
+    path.join(__dirname, "../scripts/stages/ship-adapter.ts"),
+    "utf8",
+  );
+  const start = src.indexOf("async function writeRerunBudgetAtomic");
+  const next = src.indexOf("\nexport async function loadRerunAttemptCount");
+  assert.ok(start !== -1 && next !== -1 && start < next);
+  const body = src.slice(start, next);
+  assert.match(body, /rename/);
+  assert.match(body, /\.tmp/);
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ship-rerun-budget-write-"));
+  const budgetFile = path.join(dir, "release-checks.rerun.json");
+  try {
+    await recordRerunAttemptFile(budgetFile, 945, releaseHead, "32075787450", "2026-08-21T00:00:00.000Z");
+    assert.equal(await loadRerunAttemptCount(budgetFile, 945, releaseHead), 1);
+    fs.writeFileSync(budgetFile, "{ truncated");
+    await assert.rejects(
+      () => recordRerunAttemptFile(budgetFile, 945, releaseHead, "1", "2026-08-21T00:00:01.000Z"),
+      /unreadable rerun-budget state/,
+    );
+    assert.equal(fs.readFileSync(budgetFile, "utf8"), "{ truncated");
+    assert.equal(await loadRerunAttemptCount(budgetFile, 945, releaseHead), MAX_RERUN_BUDGET);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("convergeReleaseFinish skips wait when finish evidence is already observed (#1205)", async () => {
+  let checks = 0;
+  let finishes = 0;
+  const deps = shipCoordinatorDepsFromOperations(operations({
+    finishRelease: async () => {
+      finishes++;
+      return releaseFinish;
+    },
+  }), {
+    state,
+    releaseCheckWait: memoryWait({
+      getPrChecks: async () => {
+        checks++;
+        return [{ name: "test", state: "PENDING", bucket: "pending" }];
+      },
+    }),
+  });
+  await deps.convergeTrain(intent, train.ordered_issues);
+  assert.deepEqual(await deps.convergeReleaseFinish(intent, release), releaseFinish);
+  assert.equal(checks, 0);
+  assert.equal(finishes, 0);
+});
+
 test("ship publication accepts only an annotated tag peeled to the release merge", async () => {
   const calls: string[] = [];
   await verifyAnnotatedReleaseTag("v1.34.0", mergeHead, async (args) => {
@@ -535,18 +969,22 @@ const candidateEngine = {
   commitSha: head,
 };
 
-function memoryShipStore(): ShipStateStore & { status: ShipStatus | null } {
+function memoryShipStore(): ShipStateStore & { status: ShipStatus | null; events: ShipPhaseEvent[] } {
   let status: ShipStatus | null = null;
+  const events: ShipPhaseEvent[] = [];
   return {
     get status() { return status; },
     set status(value) { status = value; },
+    events,
     statusFile: () => "/state/status.json",
     eventsFile: () => "/state/events.jsonl",
     read: async () => status,
     writeAtomic: async (_key, value) => {
       status = value;
     },
-    appendEvent: async () => {},
+    appendEvent: async (_key, event) => {
+      events.push(event);
+    },
   };
 }
 

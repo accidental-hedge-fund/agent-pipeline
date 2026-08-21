@@ -2,9 +2,9 @@
 
 **Primary path:** `pipeline ship --milestone vX.Y.Z`. That command is the
 in-engine ship product. It composes existing verbs: `train --merge` →
-(semver) `release` → wait checks → `release finish` →
-`release ensure-tag` → wait GitHub Release → `engine-promote`. It does not
-invent a second merge policy or grant schema.
+(semver) `release` → wait checks (`ship-release-check-wait`) →
+`release finish` → `release ensure-tag` → wait GitHub Release →
+`engine-promote`. It does not invent a second merge policy or grant schema.
 
 Phrase: **`Ship milestone vX.Y.Z`** → `pipeline ship --milestone vX.Y.Z`
 (detach if the CLI is blocking).  
@@ -146,8 +146,8 @@ Issues on the milestone must be `pipeline:ready` before train dispatch.
 1. `pipeline train --milestone vX.Y.Z --merge --json` (complete gate + resume)
 2. FRG pack: uncredentialed `pipeline factory-release prepare --request <abs.json> --json`, then (when unsigned) `pipeline factory-gate --for X.Y.Z --from-run <loop>` in a separate credentialed child; re-invoke until pack-done. While prepare is `in_progress` and the bound pack loop is live (`lock.json` pid alive or ledger not terminal), wait is wait-until-terminal with a heartbeat. A CI-length poll cap (about 20 minutes) is not pack-fail. Re-detach is not the resume path. Wait-budget expiry may fail the pack only when the bound loop is not live.
 3. `pipeline release X.Y.Z --no-edit` (**bare** version — leading `v` is invalid; **no** `--skip-frg`)
-4. Wait until open release PR checks are green (`gh pr checks --json name,state,bucket,link`). A first flake-eligible `test` fail requests `gh run rerun --failed` once, then waits again. Non-test product fails STOP. After merge, refresh installed Tugboat and `release-checks-green.py` from `examples/supervisor/shell/`.
-5. `pipeline release finish <pr>`
+4. In-engine `pipeline ship` waits until open release PR checks are green before `release finish` (`ship-release-check-wait`: `gh pr checks --json name,state,bucket,link`; never `conclusion`). Classification is `green` / `pending` / `rerun` / `fail`. `pending` keeps waiting in the coordinator (same-argv retry may resume). A first flake-eligible `test` fail requests one bounded `gh run rerun --failed` per head SHA (budget at most two), then waits again. Non-test product fails STOP and do not finish. Bare `pipeline release finish` stays one-shot fail-closed; **ship** owns the wait. Tugboat may keep calling `release-checks-green.py`; Tugboat is not the only waiter. After merge, refresh installed Tugboat and `release-checks-green.py` from `examples/supervisor/shell/`.
+5. `pipeline release finish <pr>` (only after the waiter classifies `green`, or when finish evidence is already observed)
 6. `pipeline release ensure-tag <X.Y.Z> <mergeCommitOid> --packed-candidate <integrated_candidate.git_sha>` (candidate engine; on-disk HMAC `latest.json`)
 7. Wait until GitHub Release `vX.Y.Z` is published (non-draft)
 8. `pipeline engine-promote --for X.Y.Z --host all` (or `ENGINE_PROMOTE_HOST` override; **no** `--skip-frg`)

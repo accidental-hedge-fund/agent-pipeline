@@ -26,6 +26,7 @@ import {
   type ShipStateStore,
   type ShipStatus,
 } from "../scripts/stages/ship.ts";
+import { ShipReleaseCheckWaitError } from "../scripts/stages/ship-release-check-wait.ts";
 
 const EVENT_ID = "a".repeat(64);
 const HEAD = "b".repeat(40);
@@ -623,4 +624,40 @@ test("ship persist writes the current human_authority bit so recovery is not str
   assert.equal(result.complete, true);
   assert.equal(result.human_authority, false);
   assert.equal(result.last_error, null);
+});
+
+test("ship coordinator pending wait-cap expiry stays resumable (#1205)", async () => {
+  const store = memoryStore();
+  const waiting = makeDeps(store);
+  waiting.convergeReleaseFinish = async () => {
+    throw new ShipReleaseCheckWaitError(
+      "pending",
+      "ship release: PR #1001 checks still pending after 2 polls; retry the same ship command to resume",
+    );
+  };
+  const checkpoint = await runShipCoordinator(intent, authorization(), waiting);
+  assert.equal(checkpoint.complete, false);
+  assert.equal(checkpoint.next_action, "release_finish");
+  assert.equal(checkpoint.last_error, null);
+  assert.equal(checkpoint.human_authority, false);
+  assert.equal(checkpoint.release_finish, null);
+  assert.equal(checkpoint.release?.pr, 1001);
+  assert.ok(!store.events.some((event) => event.status === "failed"));
+  assert.ok(store.events.some((event) =>
+    event.phase === "release_finish" &&
+    event.status === "started" &&
+    /still pending/.test(event.detail ?? ""),
+  ));
+
+  const observed = completeProgress();
+  observed.release_finish = null;
+  observed.publication = null;
+  observed.promotion = null;
+  const resumed = makeDeps(store, observed);
+  const result = await runShipCoordinator(intent, authorization(), resumed);
+  assert.equal(result.complete, true);
+  assert.equal(result.next_action, "complete");
+  assert.equal(result.last_error, null);
+  assert.ok(resumed.calls.includes("release-finish"));
+  assert.ok(!resumed.calls.includes("train"));
 });

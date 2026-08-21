@@ -628,6 +628,16 @@ async function recordEvent(
   });
 }
 
+/** Session-cap pending wait is a resumable checkpoint, not a terminal ship fail. */
+function isPendingReleaseCheckCheckpoint(err: unknown): boolean {
+  return Boolean(
+    err &&
+    typeof err === "object" &&
+    (err as { name?: unknown }).name === "ShipReleaseCheckWaitError" &&
+    (err as { outcome?: unknown }).outcome === "pending",
+  );
+}
+
 async function persist(
   deps: ShipCoordinatorDeps,
   status: ShipStatus,
@@ -780,6 +790,7 @@ export async function runShipCoordinator(
   status = await persist(deps, status, reconciled);
   await recordEvent(deps, status, status.next_action, "reconciled", "external truth applied");
   const wasComplete = status.complete;
+  let waitCheckpoint = false;
 
   const run = async <T>(phase: ShipNextAction, operation: () => Promise<T>, apply: (value: T) => ShipProgress) => {
     await recordEvent(deps, status, phase, "started");
@@ -789,6 +800,20 @@ export async function runShipCoordinator(
       status = await persist(deps, status, apply(value));
       await recordEvent(deps, status, phase, "completed");
     } catch (err) {
+      if (isPendingReleaseCheckCheckpoint(err)) {
+        const message = err instanceof Error ? err.message : String(err);
+        try {
+          status = await persist(deps, status, status, null);
+          await recordEvent(deps, status, phase, "started", message);
+        } catch (stateErr) {
+          throw new AggregateError(
+            [err, stateErr],
+            `ship ${phase} wait checkpoint persistence also failed`,
+          );
+        }
+        waitCheckpoint = true;
+        return;
+      }
       const message = err instanceof Error ? err.message : String(err);
       try {
         status = await persist(deps, status, status, message);
@@ -828,6 +853,7 @@ export async function runShipCoordinator(
   }
   if (!status.release_finish) {
     await run("release_finish", () => deps.convergeReleaseFinish(expected, status.release!), (release_finish) => ({ ...status, release_finish }));
+    if (waitCheckpoint) return status;
   }
   if (!status.publication) {
     await run("release_wait", () => deps.waitForRelease(expected, status.release_finish!), (publication) => ({ ...status, publication }));
