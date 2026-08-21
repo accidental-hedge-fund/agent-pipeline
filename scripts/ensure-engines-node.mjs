@@ -123,6 +123,27 @@ export function envPreferringNode(nodePath, base = process.env) {
   };
 }
 
+/** Composer-reexec flags. A parent Tugboat ship exports these; `npm run ci`
+ *  is not that re-exec. Inheriting them fail-closes tugboat tests
+ *  (`TUGBOAT_SKIP_TRAIN without train.complete.json or train.json`). */
+export const TUGBOAT_PARENT_CONTROL_KEYS = [
+  "TUGBOAT_SKIP_TRAIN",
+  "TUGBOAT_CANDIDATE_COMPOSER",
+];
+
+/**
+ * Drop inherited Tugboat composer-reexec flags from a child env.
+ * @param {NodeJS.ProcessEnv} [base]
+ * @returns {NodeJS.ProcessEnv}
+ */
+export function envWithoutTugboatParentControl(base = {}) {
+  const env = { ...base };
+  for (const key of TUGBOAT_PARENT_CONTROL_KEYS) {
+    delete env[key];
+  }
+  return env;
+}
+
 /**
  * Run argv under an engines-compliant Node (PATH rewritten).
  * @param {string[]} argv tokens after the script name
@@ -153,7 +174,9 @@ export function runUnderEnginesNode(argv, opts = {}) {
     return 1;
   }
 
-  const env = envPreferringNode(resolved.path, baseEnv);
+  const env = envWithoutTugboatParentControl(
+    envPreferringNode(resolved.path, baseEnv),
+  );
   const tokens = [...argv];
   if (tokens[0] === "--") tokens.shift();
 

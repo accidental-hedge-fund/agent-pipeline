@@ -9,7 +9,9 @@ import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   ENGINES_NODE_FLOOR_MAJOR,
+  TUGBOAT_PARENT_CONTROL_KEYS,
   envPreferringNode,
+  envWithoutTugboatParentControl,
   parseNodeMajor,
   probeNodeMajor,
   resolveEnginesNode,
@@ -118,6 +120,47 @@ test("envPreferringNode: puts node bin dir first on PATH", () => {
   assert.equal(env.AGENT_PIPELINE_ENGINES_NODE, "/usr/bin/node");
   assert.equal(env.AGENT_PIPELINE_ENGINES_NODE_OK, "1");
   assert.equal(env.HOME, "/h");
+});
+
+test("envWithoutTugboatParentControl: drops composer-reexec flags (#1188)", () => {
+  const env = envWithoutTugboatParentControl({
+    TUGBOAT_SKIP_TRAIN: "1",
+    TUGBOAT_CANDIDATE_COMPOSER: "deadbeef",
+    PATH: "/bin",
+    HOME: "/h",
+  });
+  assert.equal(env.TUGBOAT_SKIP_TRAIN, undefined);
+  assert.equal(env.TUGBOAT_CANDIDATE_COMPOSER, undefined);
+  assert.equal(env.PATH, "/bin");
+  assert.equal(env.HOME, "/h");
+  assert.deepEqual([...TUGBOAT_PARENT_CONTROL_KEYS], [
+    "TUGBOAT_SKIP_TRAIN",
+    "TUGBOAT_CANDIDATE_COMPOSER",
+  ]);
+});
+
+test("runUnderEnginesNode: inherited skip-train is not passed to CI children (#1188)", () => {
+  /** @type {Array<{ cmd: string, args: string[], opts: object }>} */
+  const calls = [];
+  const code = runUnderEnginesNode(["-c", "npm run ci:core"], {
+    resolve: () => ({ path: "/usr/bin/node", major: 24 }),
+    spawn: (cmd, args, opts) => {
+      calls.push({ cmd, args: [...args], opts });
+      return { status: 0 };
+    },
+    env: {
+      PATH: "/home/user/.local/bin:/usr/bin",
+      TUGBOAT_SKIP_TRAIN: "1",
+      TUGBOAT_CANDIDATE_COMPOSER: "000c1f6b",
+      HOME: "/h",
+    },
+  });
+  assert.equal(code, 0);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].opts.env.TUGBOAT_SKIP_TRAIN, undefined);
+  assert.equal(calls[0].opts.env.TUGBOAT_CANDIDATE_COMPOSER, undefined);
+  assert.equal(calls[0].opts.env.HOME, "/h");
+  assert.equal(calls[0].opts.env.PATH.split(":")[0], "/usr/bin");
 });
 
 test("runUnderEnginesNode: -c runs bash with PATH preferring engines node", () => {
