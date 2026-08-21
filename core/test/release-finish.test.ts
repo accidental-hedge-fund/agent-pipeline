@@ -183,6 +183,16 @@ test("finishReleasePr: refuses failing checks", async () => {
   assert.equal(deps.merges.length, 0);
 });
 
+test("finishReleasePr: refuses pending checks on one snapshot (not a poller)", async () => {
+  const deps = makeDeps({
+    async ghPrChecksRequired() {
+      return [{ name: "test", bucket: "pending" }];
+    },
+  });
+  await assert.rejects(() => finishReleasePr(1, deps), /failing or pending/);
+  assert.equal(deps.merges.length, 0);
+});
+
 test("finishReleasePr: already merged is idempotent", async () => {
   const deps = makeDeps({
     async ghPrView() {

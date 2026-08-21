@@ -24,6 +24,13 @@ import {
   type ObservedEnsureTagReleasePr,
   type ShipAdapterOperations,
 } from "../scripts/stages/ship-adapter.ts";
+import {
+  attemptCountFor,
+  emptyRerunBudgetDoc,
+  ShipReleaseCheckWaitError,
+  withRecordedAttempt,
+  type ShipReleaseCheckWaitDeps,
+} from "../scripts/stages/ship-release-check-wait.ts";
 import { LOOP_LEDGER_SCHEMA } from "../scripts/loop/types.ts";
 import {
   runShipCoordinator,
@@ -450,6 +457,190 @@ test("ship adapter accepts already completed release, publication, and promotion
   assert.deepEqual(await deps.waitForRelease(intent, releaseFinish), publication);
   assert.deepEqual(await deps.convergeEnginePromote(intent, publication), promotion);
   assert.deepEqual(calls, []);
+});
+
+const TEST_FAIL_LINK = "https://github.com/o/r/actions/runs/32075787450";
+
+function memoryWait(
+  over: Partial<ShipReleaseCheckWaitDeps> & {
+    getPrChecks: ShipReleaseCheckWaitDeps["getPrChecks"];
+  },
+): ShipReleaseCheckWaitDeps {
+  let doc = emptyRerunBudgetDoc();
+  return {
+    rerunFailedWorkflows: async () => ({ attempted: true, runIds: ["32075787450"] }),
+    sleep: async () => {},
+    loadAttemptCount: async (pr, headSha) => attemptCountFor(doc, pr, headSha),
+    recordAttempt: async (pr, headSha, runId) => {
+      doc = withRecordedAttempt(doc, pr, headSha, runId, "2026-08-21T00:00:00.000Z");
+    },
+    maxAttempts: 3,
+    intervalMs: 0,
+    rerunBudget: 1,
+    ...over,
+  };
+}
+
+test("convergeReleaseFinish does not invoke finish while checks are pending (#1205)", async () => {
+  let finishes = 0;
+  let checks = 0;
+  const deps = shipCoordinatorDepsFromOperations(operations({
+    observeRelease: async () => ({ prepare: release, finish: null }),
+    finishRelease: async () => {
+      finishes++;
+      return releaseFinish;
+    },
+  }), {
+    state,
+    releaseCheckWait: memoryWait({
+      maxAttempts: 2,
+      getPrChecks: async () => {
+        checks++;
+        return [{ name: "test", state: "PENDING", bucket: "pending", link: "" }];
+      },
+    }),
+  });
+  await deps.convergeTrain(intent, train.ordered_issues);
+  await assert.rejects(
+    () => deps.convergeReleaseFinish(intent, release),
+    (err: unknown) => {
+      assert.ok(err instanceof ShipReleaseCheckWaitError);
+      assert.equal(err.outcome, "pending");
+      assert.doesNotMatch(err.message, /observable checks are not green/);
+      return true;
+    },
+  );
+  assert.equal(finishes, 0, "finish must not run on a pending snapshot");
+  assert.ok(checks >= 1, "waiter must poll gh pr checks");
+});
+
+test("convergeReleaseFinish requests gh run rerun --failed for a flake test fail before a second wait (#1205)", async () => {
+  const calls: string[] = [];
+  let finishes = 0;
+  const captures = [
+    [{ name: "test", state: "FAILURE", bucket: "fail", link: TEST_FAIL_LINK }],
+    [{ name: "test", state: "PENDING", bucket: "pending", link: TEST_FAIL_LINK }],
+  ];
+  const deps = shipCoordinatorDepsFromOperations(operations({
+    observeRelease: async () => ({ prepare: release, finish: null }),
+    finishRelease: async () => {
+      finishes++;
+      calls.push("finish");
+      return releaseFinish;
+    },
+  }), {
+    state,
+    releaseCheckWait: memoryWait({
+      maxAttempts: 2,
+      getPrChecks: async () => {
+        calls.push("checks");
+        return captures.shift() ?? [{ name: "test", state: "PENDING", bucket: "pending" }];
+      },
+      rerunFailedWorkflows: async () => {
+        calls.push("rerun");
+        return { attempted: true, runIds: ["32075787450"] };
+      },
+      sleep: async () => {
+        calls.push("sleep");
+      },
+    }),
+  });
+  await deps.convergeTrain(intent, train.ordered_issues);
+  await assert.rejects(
+    () => deps.convergeReleaseFinish(intent, release),
+    (err: unknown) => {
+      assert.ok(err instanceof ShipReleaseCheckWaitError);
+      assert.equal(err.outcome, "pending");
+      return true;
+    },
+  );
+  assert.equal(finishes, 0);
+  assert.ok(calls.includes("rerun"), "flake-eligible test fail must request gh run rerun --failed");
+  assert.ok(calls.indexOf("rerun") < calls.lastIndexOf("checks"), "rerun must happen before the second wait");
+  assert.ok(!calls.includes("finish"));
+});
+
+test("convergeReleaseFinish invokes finish only after green checks (#1205)", async () => {
+  let finishes = 0;
+  const captures = [
+    [{ name: "test", state: "PENDING", bucket: "pending" }],
+    [{ name: "test", state: "SUCCESS", bucket: "pass" }],
+  ];
+  const deps = shipCoordinatorDepsFromOperations(operations({
+    observeRelease: async () => ({ prepare: release, finish: null }),
+    finishRelease: async () => {
+      finishes++;
+      return releaseFinish;
+    },
+  }), {
+    state,
+    releaseCheckWait: memoryWait({
+      maxAttempts: 5,
+      getPrChecks: async () => captures.shift() ?? [{ name: "test", state: "SUCCESS", bucket: "pass" }],
+    }),
+  });
+  await deps.convergeTrain(intent, train.ordered_issues);
+  assert.deepEqual(await deps.convergeReleaseFinish(intent, release), releaseFinish);
+  assert.equal(finishes, 1);
+  assert.equal(captures.length, 0);
+});
+
+test("convergeReleaseFinish persists fail without finish on a terminal product fail (#1205)", async () => {
+  let finishes = 0;
+  let reruns = 0;
+  const deps = shipCoordinatorDepsFromOperations(operations({
+    observeRelease: async () => ({ prepare: release, finish: null }),
+    finishRelease: async () => {
+      finishes++;
+      return releaseFinish;
+    },
+  }), {
+    state,
+    releaseCheckWait: memoryWait({
+      getPrChecks: async () => [
+        { name: "release-build", state: "FAILURE", bucket: "fail", link: TEST_FAIL_LINK },
+      ],
+      rerunFailedWorkflows: async () => {
+        reruns++;
+        return { attempted: true, runIds: ["32075787450"] };
+      },
+    }),
+  });
+  await deps.convergeTrain(intent, train.ordered_issues);
+  await assert.rejects(
+    () => deps.convergeReleaseFinish(intent, release),
+    (err: unknown) => {
+      assert.ok(err instanceof ShipReleaseCheckWaitError);
+      assert.equal(err.outcome, "fail");
+      assert.match(err.message, /non-flake product fail/);
+      return true;
+    },
+  );
+  assert.equal(finishes, 0);
+  assert.equal(reruns, 0);
+});
+
+test("convergeReleaseFinish skips wait when finish evidence is already observed (#1205)", async () => {
+  let checks = 0;
+  let finishes = 0;
+  const deps = shipCoordinatorDepsFromOperations(operations({
+    finishRelease: async () => {
+      finishes++;
+      return releaseFinish;
+    },
+  }), {
+    state,
+    releaseCheckWait: memoryWait({
+      getPrChecks: async () => {
+        checks++;
+        return [{ name: "test", state: "PENDING", bucket: "pending" }];
+      },
+    }),
+  });
+  await deps.convergeTrain(intent, train.ordered_issues);
+  assert.deepEqual(await deps.convergeReleaseFinish(intent, release), releaseFinish);
+  assert.equal(checks, 0);
+  assert.equal(finishes, 0);
 });
 
 test("ship publication accepts only an annotated tag peeled to the release merge", async () => {
