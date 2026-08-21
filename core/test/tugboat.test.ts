@@ -4927,3 +4927,353 @@ test("tugboat wait-release polls gh release view and never creates the Release (
   assert.match(wait, /gh release view/);
   assert.doesNotMatch(wait, /gh release create/);
 });
+
+/** Frozen 1.39.7 skip-train gate: `-s` only, no RUN_DIR evidence. */
+const SKIP_TRAIN_GATE_V1397 = [
+  'if [[ ! -s "$RUN_DIR/train.complete.json" ]] && [[ ! -s "$RUN_DIR/train.json" ]]; then',
+  '  echo "FAIL: TUGBOAT_SKIP_TRAIN without train.complete.json or train.json" >&2',
+  "  exit 1",
+  "fi",
+].join("\n");
+
+/** Frozen 1.39.7 ship_one nested release_lock (line 2210). */
+const RELEASE_LOCK_V1397 =
+  'release_lock() { rmdir "$lock_dir" 2>/dev/null || rm -rf "$lock_dir" 2>/dev/null || true; }';
+
+function writeEmptyMilestoneFixture(runDir: string): void {
+  fs.mkdirSync(runDir, { recursive: true });
+  fs.writeFileSync(path.join(runDir, "train.json"), "");
+  fs.writeFileSync(
+    path.join(runDir, "train.stderr"),
+    "pipeline train: milestone v1.39.7 has no open issues\n",
+  );
+}
+
+function spawnBash(dir: string, lines: string[]): ReturnType<typeof spawnSync> {
+  const runner = path.join(dir, "run.sh");
+  fs.writeFileSync(runner, ["#!/usr/bin/env bash", ...lines, ""].join("\n"));
+  fs.chmodSync(runner, 0o755);
+  return spawnSync("bash", [runner], { encoding: "utf8" });
+}
+
+test("empty-milestone 1.39.7 skip-train fails; helpers write and accept complete artifact (#1182)", () => {
+  const src = fs.readFileSync(tugboat, "utf8");
+  const ensureFn = extractNamedFn(
+    src,
+    "ensure_train_complete_artifact",
+    "tugboat.sh",
+  );
+  const skipFn = extractNamedFn(src, "skip_train_has_proof", "tugboat.sh");
+  const shipOne = tugboatShipOneBody();
+  assert.match(shipOne, /skip_train_has_proof/);
+  assert.match(shipOne, /ensure_train_complete_artifact/);
+  const ensureAt = shipOne.indexOf("ensure_train_complete_artifact");
+  const reexecAt = shipOne.indexOf("maybe_reexec_candidate_composer");
+  assert.ok(
+    ensureAt >= 0 && reexecAt > ensureAt,
+    "ensure_train_complete_artifact must run before candidate composer re-exec",
+  );
+  assert.doesNotMatch(
+    ensureFn,
+    /cp -f "\$RUN_DIR\/train\.json" "\$RUN_DIR\/train\.complete\.json"/,
+  );
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-empty-ms-"));
+  try {
+    const runDir = path.join(dir, "run");
+    writeEmptyMilestoneFixture(runDir);
+    const legacy = spawnBash(dir, [
+      "set -euo pipefail",
+      `RUN_DIR=${JSON.stringify(runDir)}`,
+      SKIP_TRAIN_GATE_V1397,
+      "echo SKIP_OK",
+    ]);
+    assert.notEqual(legacy.status, 0, "1.39.7 skip-train must fail on 0-byte train.json");
+    assert.match(
+      `${legacy.stdout}\n${legacy.stderr}`,
+      /TUGBOAT_SKIP_TRAIN without train.complete.json or train.json/,
+    );
+    assert.doesNotMatch(`${legacy.stdout}\n${legacy.stderr}`, /SKIP_OK/);
+    const completePath = path.join(runDir, "train.complete.json");
+    assert.equal(
+      fs.existsSync(completePath) && fs.statSync(completePath).size > 0,
+      false,
+      "1.39.7 resume left train.complete.json absent or 0 bytes",
+    );
+
+    const fixed = spawnBash(dir, [
+      "set -euo pipefail",
+      `RUN_DIR=${JSON.stringify(runDir)}`,
+      `TRAIN_STATUS_COMPLETE_BIN=${JSON.stringify(trainStatusComplete)}`,
+      ensureFn,
+      skipFn,
+      "ensure_train_complete_artifact",
+      "if skip_train_has_proof; then echo PROOF_OK; else echo PROOF_FAIL; exit 1; fi",
+    ]);
+    assert.equal(
+      fixed.status,
+      0,
+      `fixed helpers exited ${fixed.status}: ${fixed.stdout}\n${fixed.stderr}`,
+    );
+    assert.match(fixed.stdout, /PROOF_OK/);
+    const complete = fs.readFileSync(completePath, "utf8");
+    assert.ok(complete.length > 0, "train.complete.json must be non-empty");
+    assert.match(complete, /"kind"\s*:\s*"train_status"/);
+    assert.match(complete, /"complete"\s*:\s*true/);
+    assert.doesNotMatch(complete, /"blocker"\s*:\s*"[^"]+"/);
+    assert.equal(fs.statSync(path.join(runDir, "train.json")).size, 0);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("skip-train accepts RUN_DIR no-open-issues evidence without a complete file (#1182)", () => {
+  const src = fs.readFileSync(tugboat, "utf8");
+  const skipFn = extractNamedFn(src, "skip_train_has_proof", "tugboat.sh");
+  const shipOne = tugboatShipOneBody();
+  const skipStart = shipOne.indexOf('TUGBOAT_SKIP_TRAIN:-}" == "1"');
+  const elseTrain = shipOne.indexOf('"$PIPELINE" train --milestone');
+  assert.ok(skipStart >= 0 && elseTrain > skipStart);
+  const skipBranch = shipOne.slice(skipStart, elseTrain);
+  assert.match(skipBranch, /skip_train_has_proof/);
+  assert.doesNotMatch(skipBranch, /"\$PIPELINE" train/);
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-skip-evidence-"));
+  try {
+    const stderrOnly = path.join(dir, "stderr-only");
+    writeEmptyMilestoneFixture(stderrOnly);
+    const rStderr = spawnBash(dir, [
+      "set -euo pipefail",
+      `RUN_DIR=${JSON.stringify(stderrOnly)}`,
+      skipFn,
+      "if skip_train_has_proof; then echo PROOF_OK; else echo PROOF_FAIL; exit 1; fi",
+    ]);
+    assert.equal(
+      rStderr.status,
+      0,
+      `stderr evidence exited ${rStderr.status}: ${rStderr.stdout}\n${rStderr.stderr}`,
+    );
+    assert.match(rStderr.stdout, /PROOF_OK/);
+    assert.equal(fs.existsSync(path.join(stderrOnly, "train.complete.json")), false);
+    assert.equal(fs.statSync(path.join(stderrOnly, "train.json")).size, 0);
+
+    const stateOnly = path.join(dir, "state-only");
+    fs.mkdirSync(stateOnly, { recursive: true });
+    fs.writeFileSync(path.join(stateOnly, "train.json"), "");
+    fs.writeFileSync(
+      path.join(stateOnly, "state.json"),
+      JSON.stringify({
+        schema_version: 1,
+        kind: "tugboat_ship",
+        phase: "train",
+        status: "ok",
+        detail: "no open issues (already shipped)",
+      }),
+    );
+    const rState = spawnBash(dir, [
+      "set -euo pipefail",
+      `RUN_DIR=${JSON.stringify(stateOnly)}`,
+      skipFn,
+      "if skip_train_has_proof; then echo PROOF_OK; else echo PROOF_FAIL; exit 1; fi",
+    ]);
+    assert.equal(
+      rState.status,
+      0,
+      `state evidence exited ${rState.status}: ${rState.stdout}\n${rState.stderr}`,
+    );
+    assert.match(rState.stdout, /PROOF_OK/);
+
+    const none = path.join(dir, "none");
+    fs.mkdirSync(none, { recursive: true });
+    fs.writeFileSync(path.join(none, "train.json"), "");
+    const rNone = spawnBash(dir, [
+      "set -euo pipefail",
+      `RUN_DIR=${JSON.stringify(none)}`,
+      skipFn,
+      "if skip_train_has_proof; then echo PROOF_OK; exit 0; fi",
+      'echo "FAIL: TUGBOAT_SKIP_TRAIN without train.complete.json or train.json" >&2',
+      "exit 1",
+    ]);
+    assert.notEqual(rNone.status, 0, "skip-train must fail closed without proof");
+    assert.match(
+      `${rNone.stdout}\n${rNone.stderr}`,
+      /TUGBOAT_SKIP_TRAIN without train.complete.json or train.json/,
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("EXIT lock release 1.39.7 prints unbound lock_dir; fixed helper does not (#1182)", () => {
+  const src = fs.readFileSync(tugboat, "utf8");
+  const releaseFn = extractNamedFn(src, "release_lock", "tugboat.sh");
+  const shipOne = tugboatShipOneBody();
+  const lockAssign = shipOne.indexOf('lock_dir="$RUN_DIR/lock"');
+  const trapReturn = shipOne.indexOf("trap 'release_lock' RETURN");
+  const trapExit = shipOne.indexOf("trap 'release_lock' EXIT");
+  assert.ok(lockAssign >= 0, "lock_dir must be bound in ship_one");
+  assert.ok(
+    trapReturn > lockAssign && trapExit > lockAssign,
+    "RETURN/EXIT traps must be installed after lock_dir is bound",
+  );
+  assert.match(shipOne, /trap 'release_lock' RETURN/);
+  assert.match(shipOne, /trap 'release_lock' EXIT/);
+  assert.match(releaseFn, /\$\{lock_dir:-\}/);
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-lock-release-"));
+  try {
+    const legacy = spawnBash(dir, [
+      "set -u",
+      RELEASE_LOCK_V1397,
+      "unset lock_dir || true",
+      "trap 'release_lock' EXIT",
+      "exit 0",
+    ]);
+    assert.match(
+      `${legacy.stdout}\n${legacy.stderr}`,
+      /lock_dir: unbound variable/,
+      "1.39.7 EXIT trap must print unbound lock_dir under set -u",
+    );
+
+    const fixed = spawnBash(dir, [
+      "set -u",
+      releaseFn,
+      "unset lock_dir || true",
+      "trap 'release_lock' EXIT",
+      "echo FIXED_OK",
+      "exit 0",
+    ]);
+    assert.equal(
+      fixed.status,
+      0,
+      `fixed release_lock exited ${fixed.status}: ${fixed.stdout}\n${fixed.stderr}`,
+    );
+    assert.doesNotMatch(
+      `${fixed.stdout}\n${fixed.stderr}`,
+      /lock_dir: unbound variable/,
+    );
+    assert.match(fixed.stdout, /FIXED_OK/);
+
+    const lockDir = path.join(dir, "lock");
+    fs.mkdirSync(lockDir, { recursive: true });
+    fs.writeFileSync(path.join(lockDir, "pid"), "1\n");
+    const bound = spawnBash(dir, [
+      "set -u",
+      releaseFn,
+      `lock_dir=${JSON.stringify(lockDir)}`,
+      "trap 'release_lock' EXIT",
+      "exit 0",
+    ]);
+    assert.equal(
+      bound.status,
+      0,
+      `bound release_lock exited ${bound.status}: ${bound.stdout}\n${bound.stderr}`,
+    );
+    assert.equal(
+      fs.existsSync(lockDir),
+      false,
+      "bound lock_dir must still be released",
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("maybe_ff_repo_dir skips dirty porcelain and does not fail the ship (#1182)", () => {
+  const src = fs.readFileSync(tugboat, "utf8");
+  const ffFn = extractNamedFn(src, "maybe_ff_repo_dir", "tugboat.sh");
+  assert.doesNotMatch(ffFn, /reset --hard/);
+  assert.match(ffFn, /status --porcelain/);
+  assert.match(ffFn, /merge --ff-only/);
+  assert.match(ffFn, /dirty porcelain/);
+  assert.ok(ffFn.indexOf("status --porcelain") < ffFn.indexOf("merge --ff-only"));
+  const body = fs.readFileSync(tugboat, "utf8");
+  const shipStart = body.indexOf("ship_one() {");
+  const pre = body.slice(0, shipStart);
+  assert.match(pre, /^maybe_ff_repo_dir\(\) \{/m);
+  assert.match(pre, /^maybe_ff_repo_dir$/m);
+  assert.doesNotMatch(pre, /maybe_ff_repo_dir \|\| exit/);
+  const shipOne = tugboatShipOneBody();
+  assert.doesNotMatch(shipOne, /maybe_ff_repo_dir/);
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-ff-"));
+  try {
+    const repo = path.join(dir, "repo");
+    fs.mkdirSync(repo, { recursive: true });
+    const gitlog = path.join(dir, "git.log");
+    const fakeGit = [
+      "git() {",
+      `  printf '%s\\n' "$*" >> ${JSON.stringify(gitlog)}`,
+      '  if [[ "${1:-}" == "-C" ]]; then shift 2; fi',
+      '  case "${1:-}" in',
+      "    status)",
+      '      if [[ "${GIT_PORCELAIN:-}" == "dirty" ]]; then',
+      '        printf "%s\\n" " M examples/supervisor/shell/tugboat.sh"',
+      "      fi",
+      "      return 0",
+      "      ;;",
+      "    fetch)",
+      '      [[ "${GIT_FETCH_FAIL:-}" == "1" ]] && return 1',
+      "      return 0",
+      "      ;;",
+      "    merge)",
+      '      [[ "${GIT_MERGE_FAIL:-}" == "1" ]] && return 1',
+      "      return 0",
+      "      ;;",
+      "    rev-parse)",
+      '      printf "%s\\n" aaa',
+      "      return 0",
+      "      ;;",
+      "    *) return 0 ;;",
+      "  esac",
+      "}",
+    ].join("\n");
+
+    const dirty = spawnBash(dir, [
+      "set -euo pipefail",
+      fakeGit,
+      `REPO_DIR=${JSON.stringify(repo)}`,
+      "TUGBOAT_BASE_BRANCH=main",
+      "TUGBOAT_INVOKE_ARGV=(--milestone v1.39.7)",
+      "GIT_PORCELAIN=dirty",
+      ffFn,
+      "maybe_ff_repo_dir",
+      "echo FF_OK",
+    ]);
+    assert.equal(
+      dirty.status,
+      0,
+      `dirty ff exited ${dirty.status}: ${dirty.stdout}\n${dirty.stderr}`,
+    );
+    assert.match(dirty.stdout, /FF_OK/);
+    assert.match(`${dirty.stdout}\n${dirty.stderr}`, /dirty porcelain/);
+    const dirtyLog = fs.existsSync(gitlog) ? fs.readFileSync(gitlog, "utf8") : "";
+    assert.doesNotMatch(dirtyLog, /--ff-only/);
+    assert.doesNotMatch(dirtyLog, /\bfetch\b/);
+
+    fs.writeFileSync(gitlog, "");
+    const fetchFail = spawnBash(dir, [
+      "set -euo pipefail",
+      fakeGit,
+      `REPO_DIR=${JSON.stringify(repo)}`,
+      "TUGBOAT_BASE_BRANCH=main",
+      "TUGBOAT_INVOKE_ARGV=(--milestone v1.39.7)",
+      "GIT_FETCH_FAIL=1",
+      ffFn,
+      "maybe_ff_repo_dir",
+      "echo FF_OK",
+    ]);
+    assert.equal(
+      fetchFail.status,
+      0,
+      `fetch-fail ff exited ${fetchFail.status}: ${fetchFail.stdout}\n${fetchFail.stderr}`,
+    );
+    assert.match(fetchFail.stdout, /FF_OK/);
+    const fetchLog = fs.readFileSync(gitlog, "utf8");
+    assert.doesNotMatch(fetchLog, /--ff-only/);
+    assert.doesNotMatch(`${fetchFail.stdout}\n${fetchFail.stderr}`, /FAIL: train|FAIL: FRG/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
