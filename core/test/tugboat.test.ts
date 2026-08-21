@@ -34,40 +34,6 @@ const trainStatusComplete = path.join(
   "examples/supervisor/shell/train-status-complete.py",
 );
 
-/** Spawn env for tugboat helpers. FRG/tugboat parent processes leak
- *  TUGBOAT_SKIP_TRAIN=1 and TUGBOAT_CANDIDATE_COMPOSER into `npm test`.
- *  Inheriting them fail-closes ship_one before the scenario under test. */
-function tugboatTestEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env };
-  delete env.TUGBOAT_SKIP_TRAIN;
-  delete env.TUGBOAT_CANDIDATE_COMPOSER;
-  return { ...env, ...extra };
-}
-
-test("tugboatTestEnv strips inherited skip-train unless the caller opts in (#1188)", () => {
-  const prevSkip = process.env.TUGBOAT_SKIP_TRAIN;
-  const prevComposer = process.env.TUGBOAT_CANDIDATE_COMPOSER;
-  process.env.TUGBOAT_SKIP_TRAIN = "1";
-  process.env.TUGBOAT_CANDIDATE_COMPOSER = "deadbeef";
-  try {
-    const stripped = tugboatTestEnv({ PATH: "/bin" });
-    assert.equal(stripped.TUGBOAT_SKIP_TRAIN, undefined);
-    assert.equal(stripped.TUGBOAT_CANDIDATE_COMPOSER, undefined);
-    assert.equal(stripped.PATH, "/bin");
-    const opted = tugboatTestEnv({
-      TUGBOAT_SKIP_TRAIN: "1",
-      TUGBOAT_CANDIDATE_COMPOSER: "abc",
-    });
-    assert.equal(opted.TUGBOAT_SKIP_TRAIN, "1");
-    assert.equal(opted.TUGBOAT_CANDIDATE_COMPOSER, "abc");
-  } finally {
-    if (prevSkip === undefined) delete process.env.TUGBOAT_SKIP_TRAIN;
-    else process.env.TUGBOAT_SKIP_TRAIN = prevSkip;
-    if (prevComposer === undefined) delete process.env.TUGBOAT_CANDIDATE_COMPOSER;
-    else process.env.TUGBOAT_CANDIDATE_COMPOSER = prevComposer;
-  }
-});
-
 function repoOption1Pack(): Option1PackBodies {
   return {
     tugboat: fs.readFileSync(tugboat, "utf8"),
@@ -1139,7 +1105,7 @@ test("detach race (#1062 R2): concurrent Ship detaches exactly once", async () =
     writeLongLivedPipelineStub(fakePipeline);
 
     const env = {
-      ...tugboatTestEnv(),
+      ...process.env,
       REPO_DIR: repo,
       PIPELINE: fakePipeline,
       ALLOW_MERGE: "1",
@@ -1227,7 +1193,7 @@ test("admission lock leftover file is not a live ship", () => {
       {
         encoding: "utf8",
         env: {
-          ...tugboatTestEnv(),
+          ...process.env,
           REPO_DIR: repo,
           PIPELINE: fakePipeline,
           ALLOW_MERGE: "1",
@@ -1296,7 +1262,7 @@ test("failed wait-for-live reaps delayed child so a later detach is the only shi
     fs.chmodSync(patched, 0o755);
 
     const baseEnv = {
-      ...tugboatTestEnv(),
+      ...process.env,
       REPO_DIR: repo,
       PIPELINE: fakePipeline,
       ALLOW_MERGE: "1",
@@ -1443,7 +1409,7 @@ test("SIGTERM during wait-for-live reaps the unconfirmed child before unlock", a
     fs.chmodSync(patched, 0o755);
 
     const baseEnv = {
-      ...tugboatTestEnv(),
+      ...process.env,
       REPO_DIR: repo,
       PIPELINE: fakePipeline,
       ALLOW_MERGE: "1",
@@ -1605,7 +1571,7 @@ test("wait-for-live expiry reaps a re-parented descendant before unlock", async 
     fs.chmodSync(patched, 0o755);
 
     const baseEnv = {
-      ...tugboatTestEnv(),
+      ...process.env,
       REPO_DIR: repo,
       PIPELINE: fakePipeline,
       ALLOW_MERGE: "1",
@@ -1797,7 +1763,7 @@ test("failed wait-for-live releases admission for a later detach", () => {
       {
         encoding: "utf8",
         env: {
-          ...tugboatTestEnv(),
+          ...process.env,
           REPO_DIR: repo,
           PIPELINE: fakePipeline,
           ALLOW_MERGE: "1",
@@ -1825,7 +1791,7 @@ test("sequential second detach uses live-ship probe after first is live", () => 
     fs.mkdirSync(repo, { recursive: true });
     writeLongLivedPipelineStub(fakePipeline);
     const env = {
-      ...tugboatTestEnv(),
+      ...process.env,
       REPO_DIR: repo,
       PIPELINE: fakePipeline,
       ALLOW_MERGE: "1",
@@ -1886,7 +1852,7 @@ test("tugboat REPO_DIR (#1062): pin at start; refuse factory-control", () => {
       {
         encoding: "utf8",
         env: {
-          ...tugboatTestEnv(),
+          ...process.env,
           REPO_DIR: refuseDir,
           ALLOW_MERGE: "1",
           SHIP_NOTIFY: "0",
@@ -2128,7 +2094,7 @@ test("tugboat skip-frg without reason fails closed before ship mutation", () => 
     const r = spawnSync("bash", [tugboat, "--milestone", "v1.39.0", "--skip-frg"], {
       encoding: "utf8",
       env: {
-        ...tugboatTestEnv(),
+        ...process.env,
         SHIP_NOTIFY: "0",
         PIPELINE_SUPERVISOR_STATE: path.join(dir, "state"),
         REPO_DIR: "",
@@ -2149,7 +2115,7 @@ test("tugboat TUGBOAT_SKIP_FRG=1 without reason fails closed", () => {
     const r = spawnSync("bash", [tugboat, "--milestone", "v1.39.0"], {
       encoding: "utf8",
       env: {
-        ...tugboatTestEnv(),
+        ...process.env,
         SHIP_NOTIFY: "0",
         PIPELINE_SUPERVISOR_STATE: path.join(dir, "state"),
         REPO_DIR: "",
@@ -2181,7 +2147,7 @@ test("tugboat skip-frg with reason is accepted before status (no ship start)", (
       {
         encoding: "utf8",
         env: {
-          ...tugboatTestEnv(),
+          ...process.env,
           SHIP_NOTIFY: "0",
           PIPELINE_SUPERVISOR_STATE: path.join(dir, "state"),
           REPO_DIR: "",
@@ -2221,7 +2187,7 @@ test("write_factory_release_request: secret-free identity only (injected I/O)", 
     const r = spawnSync("bash", [runner], {
       encoding: "utf8",
       env: {
-        ...tugboatTestEnv(),
+        ...process.env,
         TUGBOAT_CANDIDATE_SHA: sha,
         TUGBOAT_REPOSITORY: "accidental-hedge-fund/agent-pipeline",
         TUGBOAT_BASE_BRANCH: "main",
@@ -2265,7 +2231,7 @@ function writeFakeGit(binDir: string, body: string): void {
 }
 
 function envWithoutCandidate(extra: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const env = { ...tugboatTestEnv(), ...extra };
+  const env = { ...process.env, ...extra };
   delete env.TUGBOAT_CANDIDATE_SHA;
   return env;
 }
@@ -2797,7 +2763,7 @@ test("classify_frg_pack_tick: done / retry / fail without live pack", () => {
       } else {
         fs.writeFileSync(reqPath, JSON.stringify(request));
       }
-      const env = { ...tugboatTestEnv(), ...extraEnv };
+      const env = { ...process.env, ...extraEnv };
       delete env.TUGBOAT_OPEN_RELEASE_PR;
       Object.assign(env, extraEnv);
       const argv = [runner, prepPath, latestPath, String(ec)];
@@ -3019,7 +2985,7 @@ test("prepare child unsets KEY and KEY_FILE (#1133)", () => {
     const r = spawnSync("bash", [runner], {
       encoding: "utf8",
       env: {
-        ...tugboatTestEnv(),
+        ...process.env,
         PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
         PIPELINE: pipeline,
         PIPELINE_FRG_ATTESTATION_KEY: "parent-key-secret",
@@ -3071,7 +3037,7 @@ test("attestor child presents KEY_FILE as KEY and omits --observations (#1133)",
     );
     fs.chmodSync(runner, 0o755);
     const env: NodeJS.ProcessEnv = {
-      ...tugboatTestEnv(),
+      ...process.env,
       PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
       PIPELINE: pipeline,
       PIPELINE_FRG_ATTESTATION_KEY_FILE: keyFile,
@@ -3123,7 +3089,7 @@ test("attestor child fails closed without producer credential (#1133)", () => {
       ].join("\n"),
     );
     fs.chmodSync(runner, 0o755);
-    const env = { ...tugboatTestEnv() };
+    const env = { ...process.env };
     delete env.PIPELINE_FRG_ATTESTATION_KEY;
     delete env.PIPELINE_FRG_ATTESTATION_KEY_FILE;
     const r = spawnSync("bash", [runner], { encoding: "utf8", env });
@@ -3502,7 +3468,7 @@ test("frg_pack_loop_is_live: lock pid or non-terminal ledger (#1150)", () => {
     const r = spawnSync("bash", [runner], {
       encoding: "utf8",
       env: {
-        ...tugboatTestEnv(),
+        ...process.env,
         AGENT_PIPELINE_STATE_HOME: home,
       },
     });
@@ -3590,7 +3556,7 @@ test("frg_pack_loop_is_live: schema-invalid or undecodable state is unknown at c
     const r = spawnSync("bash", [runner], {
       encoding: "utf8",
       env: {
-        ...tugboatTestEnv(),
+        ...process.env,
         AGENT_PIPELINE_STATE_HOME: home,
       },
     });
@@ -3674,7 +3640,7 @@ test("frg_pack_loop_is_live: explicit JSON null outstanding_ready is unknown, no
     const r = spawnSync("bash", [runner], {
       encoding: "utf8",
       env: {
-        ...tugboatTestEnv(),
+        ...process.env,
         AGENT_PIPELINE_STATE_HOME: home,
       },
     });
@@ -3769,7 +3735,7 @@ test("frg_pack_loop_is_live: missing or mismatched ledger identity is unknown at
     const r = spawnSync("bash", [runner], {
       encoding: "utf8",
       env: {
-        ...tugboatTestEnv(),
+        ...process.env,
         AGENT_PIPELINE_STATE_HOME: home,
       },
     });
@@ -3902,7 +3868,7 @@ test("tugboat after train-complete records candidate argv not pin argv (#1151)",
     const r = spawnSync("bash", [tugboat, "--milestone", "v1.39.5"], {
       encoding: "utf8",
       env: {
-        ...tugboatTestEnv(),
+        ...process.env,
         PATH: `${dir}${path.delimiter}${pinDir}${path.delimiter}${process.env.PATH ?? ""}`,
         PIPELINE: pin,
         REPO_DIR: repo,
@@ -4040,7 +4006,7 @@ test("tugboat live in_progress at cap 1 keeps ticking prepare (#1150)", () => {
     const r = spawnSync("bash", [tugboat, "--milestone", "v1.39.5"], {
       encoding: "utf8",
       env: {
-        ...tugboatTestEnv(),
+        ...process.env,
         PATH: `${dir}${path.delimiter}${path.dirname(fx.pin)}${path.delimiter}${process.env.PATH ?? ""}`,
         PIPELINE: fx.pin,
         REPO_DIR: fx.repo,
@@ -4100,7 +4066,7 @@ test("tugboat not-live in_progress at cap 1 fails closed (#1150)", () => {
     const r = spawnSync("bash", [tugboat, "--milestone", "v1.39.5"], {
       encoding: "utf8",
       env: {
-        ...tugboatTestEnv(),
+        ...process.env,
         PATH: `${dir}${path.delimiter}${path.dirname(fx.pin)}${path.delimiter}${process.env.PATH ?? ""}`,
         PIPELINE: fx.pin,
         REPO_DIR: fx.repo,
@@ -4160,7 +4126,7 @@ test("tugboat fails closed when candidate engine is unavailable (#1151)", () => 
     const r = spawnSync("bash", [tugboat, "--milestone", "v1.39.5"], {
       encoding: "utf8",
       env: {
-        ...tugboatTestEnv(),
+        ...process.env,
         PATH: `${pinDir}${path.delimiter}${process.env.PATH ?? ""}`,
         PIPELINE: pin,
         REPO_DIR: repo,
@@ -4228,7 +4194,7 @@ test("tugboat status (#1062): dead pid / stale running → not running", () => {
       {
         encoding: "utf8",
         env: {
-          ...tugboatTestEnv(),
+          ...process.env,
           PIPELINE_SUPERVISOR_STATE: stateRoot,
           SHIP_NOTIFY: "0",
           // Unset REPO_DIR so pin does not require a real checkout for status.
@@ -4359,7 +4325,7 @@ test("tugboat ensure-tag helper: pack-done merge invokes candidate ensure-tag (#
     const r = spawnSync("bash", [runner], {
       encoding: "utf8",
       env: {
-        ...tugboatTestEnv(),
+        ...process.env,
         PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
         PIPELINE_FRG_ATTESTATION_KEY: "unit-test-ensure-tag-key-not-for-production",
       },
@@ -4418,7 +4384,7 @@ test("tugboat ensure-tag helper: missing mergeCommitOid fails before gh release 
     const r = spawnSync("bash", [runner], {
       encoding: "utf8",
       env: {
-        ...tugboatTestEnv(),
+        ...process.env,
         PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
       },
     });
@@ -4483,7 +4449,7 @@ test("tugboat ensure-tag helper: non-zero ensure-tag prevents wait-release (#114
     const r = spawnSync("bash", [runner], {
       encoding: "utf8",
       env: {
-        ...tugboatTestEnv(),
+        ...process.env,
         PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
         PIPELINE_FRG_ATTESTATION_KEY: "unit-test-ensure-tag-key-not-for-production",
       },
@@ -4529,7 +4495,7 @@ test("tugboat resolve_ship_end_node skips PATH node 22 for a later node 24 (#116
     const r = spawnSync("/bin/bash", [runner], {
       encoding: "utf8",
       env: {
-        ...tugboatTestEnv(),
+        ...process.env,
         PATH: `${bin22}${path.delimiter}${bin24}${path.delimiter}${process.env.PATH ?? "/usr/bin"}`,
         SHIP_END_NODE: "",
       },
@@ -4607,7 +4573,7 @@ function spawnEnsureTagHelper(opts: {
   );
   fs.chmodSync(runner, 0o755);
   const env: NodeJS.ProcessEnv = {
-    ...tugboatTestEnv(),
+    ...process.env,
     ...opts.env,
     PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
     PIPELINE: pipeline,
@@ -4675,7 +4641,7 @@ test("ensure-tag and attestor children present KEY_FILE as KEY (#1174)", () => {
     );
     fs.chmodSync(runner, 0o755);
     const env: NodeJS.ProcessEnv = {
-      ...tugboatTestEnv(),
+      ...process.env,
       PATH: `${attestBin}${path.delimiter}${ensureBin}${path.delimiter}${process.env.PATH ?? ""}`,
       PIPELINE_FRG_ATTESTATION_KEY_FILE: keyFile,
     };
