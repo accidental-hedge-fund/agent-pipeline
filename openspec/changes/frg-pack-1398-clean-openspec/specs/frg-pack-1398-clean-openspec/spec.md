@@ -14,8 +14,10 @@ The JSON fixture at
 `core/test/fixtures/frg/pack-1398-tugboat-ship-1.39.8/clean-openspec.json`
 SHALL expose that value on the `release_version` field as the string
 `1.39.8`. A unit test SHALL read only that run-scoped path and SHALL
-fail when `release_version` is missing or is not `1.39.8`. Production
-engine modules under `core/scripts/` SHALL keep their current behavior.
+fail when `release_version` is missing or is not `1.39.8`. That unit
+test SHALL NOT import production modules under `core/scripts/`.
+Production engine modules under `core/scripts/` SHALL keep their
+current behavior.
 
 #### Scenario: Fixture names release 1.39.8
 
@@ -33,6 +35,8 @@ engine modules under `core/scripts/` SHALL keep their current behavior.
 - **THEN** that test SHALL fail
 - **AND** the test SHALL NOT read any other `core/test/fixtures/frg/`
   pack directory
+- **AND** the test SHALL NOT import production modules under
+  `core/scripts/`
 
 #### Scenario: Production engine behavior stays unchanged
 
