@@ -3540,6 +3540,8 @@ export async function advanceWaveThroughLoop(
   readLoopEvents: (
     runId: string,
   ) => Promise<readonly { kind?: string; data?: unknown }[]> = defaultReadLoopEventsForTrain,
+  writeStderrLine: (line: string) => Promise<void> = (line) =>
+    writeFlushedStdoutLine(line, process.stderr),
 ): Promise<import("./stages/train.ts").AdvanceWaveResult> {
   if (issues.length === 0) return new Map();
   let cfg: PipelineConfig;
@@ -3571,6 +3573,9 @@ export async function advanceWaveThroughLoop(
       autoSupersedeTerminal: true,
       repoDir: cfg.repo_dir,
       onRunReady: async (ctx) => {
+        // Live handoff for composers (Tugboat stage-watch). Stderr only —
+        // train --json stdout stays one train_status object (#1184).
+        await writeStderrLine(formatLoopRunHandoff(ctx));
         console.error(
           `[train] advance-wave loop ready ${ctx.runId}; issues ${issues.map((n) => `#${n}`).join(", ")}`,
         );

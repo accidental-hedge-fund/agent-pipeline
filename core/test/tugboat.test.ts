@@ -25,6 +25,10 @@ import { LOOP_LEDGER_SCHEMA } from "../scripts/loop/types.ts";
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, "../..");
 const tugboat = path.join(repoRoot, "examples/supervisor/shell/tugboat.sh");
+const stageWatch = path.join(
+  repoRoot,
+  "examples/supervisor/shell/ship-stage-watch.sh",
+);
 const releaseChecksGreen = path.join(
   repoRoot,
   "examples/supervisor/shell/release-checks-green.py",
@@ -365,6 +369,236 @@ test("tugboat version rules: train v-prefix, release bare, promote bare, gh rele
   assert.match(body, /release "\$version"/);
   assert.match(body, /engine-promote --for "\$version"/);
   assert.match(body, /gh release view "v\$version"/);
+});
+
+function stageWatchUsageAndParser(src: string): { usage: string; parser: string } {
+  const usageMatch = src.match(/cat <<'USAGE'\n([\s\S]*?)\nUSAGE\n/);
+  assert.ok(usageMatch, "ship-stage-watch.sh usage heredoc not found");
+  const whileStart = src.indexOf("while [[ $# -gt 0 ]]; do");
+  const whileEnd = src.indexOf("\ndone\n", whileStart);
+  assert.ok(whileStart >= 0 && whileEnd > whileStart, "ship-stage-watch.sh argv parser not found");
+  return { usage: usageMatch[1], parser: src.slice(whileStart, whileEnd) };
+}
+
+test("tugboat train stage-watch argv matches bundled ship-stage-watch.sh (#1184)", () => {
+  const tug = fs.readFileSync(tugboat, "utf8");
+  const watch = fs.readFileSync(stageWatch, "utf8");
+  const { usage, parser } = stageWatchUsageAndParser(watch);
+  assert.match(usage, /--events-file/);
+  assert.doesNotMatch(usage, /--milestone|--since/);
+  assert.match(parser, /--events-file\)/);
+  assert.doesNotMatch(parser, /--milestone\)|--since\)/);
+  assert.match(watch, /unknown argument/);
+
+  const startFn = extractNamedFn(tug, "start_train_stage_watch", "tugboat.sh");
+  assert.match(startFn, /--events-file "\$events"/);
+  assert.match(startFn, /--label "ship v\$version"/);
+  assert.match(startFn, /--pid-file "\$STAGE_WATCH_PID_FILE"/);
+  assert.doesNotMatch(startFn, /--milestone/);
+  assert.doesNotMatch(startFn, /--since/);
+  assert.doesNotMatch(
+    startFn,
+    /AGENT_PIPELINE_LOOP_ROOT|\.local\/state\/agent-pipeline|ls -t|find .*events\.jsonl/,
+  );
+
+  const attachFn = extractNamedFn(tug, "attach_train_stage_watch", "tugboat.sh");
+  assert.match(attachFn, /wait_for_loop_run_handoff_events/);
+  assert.match(attachFn, /start_train_stage_watch/);
+  assert.doesNotMatch(
+    attachFn,
+    /AGENT_PIPELINE_LOOP_ROOT|\.local\/state\/agent-pipeline|ls -t/,
+  );
+
+  const shipOne = tugboatShipOneBody();
+  const trainPhase = shipOne.slice(
+    shipOne.indexOf('write_state "train" "running"'),
+    shipOne.indexOf("ensure_train_complete_artifact"),
+  );
+  assert.match(trainPhase, /attach_train_stage_watch "\$RUN_DIR\/train\.stderr"/);
+  assert.match(trainPhase, /"\$PIPELINE" train --milestone "v\$version" --merge --json >"\$RUN_DIR\/train\.json" 2>"\$RUN_DIR\/train\.stderr" &/);
+  assert.match(trainPhase, /wait "\$train_pid"/);
+  assert.ok(
+    trainPhase.indexOf("attach_train_stage_watch") < trainPhase.indexOf('wait "$train_pid"'),
+    "watch attach must start before wait for train",
+  );
+  assert.doesNotMatch(trainPhase, /SHIP_STAGE_WATCH_BIN" \\\s*\n\s*--milestone/);
+  assert.doesNotMatch(trainPhase, /--since "\$SHIP_SINCE"/);
+});
+
+test("tugboat default SHIP_STAGE_WATCH_BIN is the repo sibling (#1184)", () => {
+  const body = fs.readFileSync(tugboat, "utf8");
+  assert.match(
+    body,
+    /SHIP_STAGE_WATCH_BIN="\$\{SHIP_STAGE_WATCH_BIN:-\$SCRIPT_DIR\/ship-stage-watch\.sh\}"/,
+  );
+  assert.doesNotMatch(body, /HOME\/\.local\/bin\/ship-stage-watch/);
+  assert.doesNotMatch(
+    extractNamedFn(body, "start_train_stage_watch", "tugboat.sh"),
+    /command -v ship-stage-watch/,
+  );
+});
+
+test("tugboat logs stage-watch argv rejected when bundled watch gets --milestone (#1184)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-watch-argv-"));
+  try {
+    const logFile = path.join(dir, "playbook.log");
+    const pidFile = path.join(dir, "stage-watch.pid");
+    const watchLog = path.join(dir, "stage-watch.log");
+    const src = fs.readFileSync(tugboat, "utf8");
+    const observe = extractNamedFn(src, "observe_stage_watch_pid", "tugboat.sh");
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        `LOG_FILE=${JSON.stringify(logFile)}`,
+        "log() { echo \"$*\" | tee -a \"$LOG_FILE\"; }",
+        `STAGE_WATCH_PID_FILE=${JSON.stringify(pidFile)}`,
+        observe,
+        `nohup env PATH=${JSON.stringify(`${path.dirname(stageWatch)}${path.delimiter}${process.env.PATH ?? "/usr/bin"}`)} \\`,
+        `  ${JSON.stringify(stageWatch)} --milestone "v1.39.8" --pid-file ${JSON.stringify(pidFile)} \\`,
+        `  >>${JSON.stringify(watchLog)} 2>&1 &`,
+        "watch_pid=$!",
+        'observe_stage_watch_pid "$watch_pid"',
+        "echo TRAIN_CONTINUED",
+        "exit 0",
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    const r = spawnSync("bash", [runner], { encoding: "utf8" });
+    assert.equal(r.status, 0, `fixture exited ${r.status}: ${r.stdout}\n${r.stderr}`);
+    const combined = `${r.stdout}\n${fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : ""}`;
+    assert.match(combined, /stage-watch argv rejected/);
+    assert.doesNotMatch(combined, /stage-watch started pid=/);
+    assert.match(r.stdout, /TRAIN_CONTINUED/);
+    const watchOut = fs.existsSync(watchLog) ? fs.readFileSync(watchLog, "utf8") : "";
+    assert.match(watchOut, /unknown argument: --milestone/);
+    if (fs.existsSync(pidFile)) {
+      const swp = fs.readFileSync(pidFile, "utf8").trim();
+      if (swp) {
+        try {
+          process.kill(Number(swp), 0);
+          assert.fail(`dead watch pid-file ${swp} must not be a live process`);
+        } catch {
+          // ESRCH — process is not live.
+        }
+      }
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("tugboat attaches --events-file watch from live loop_run_handoff while train runs (#1184)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-watch-handoff-"));
+  try {
+    const events = path.join(dir, "run", "events.jsonl");
+    fs.mkdirSync(path.dirname(events), { recursive: true });
+    const stderrFile = path.join(dir, "train.stderr");
+    const argvFile = path.join(dir, "watch.argv");
+    const logFile = path.join(dir, "playbook.log");
+    const pidFile = path.join(dir, "stage-watch.pid");
+    const fakeWatch = path.join(dir, "fake-watch");
+    fs.writeFileSync(
+      fakeWatch,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        `printf '%s\\n' "$@" > ${JSON.stringify(argvFile)}`,
+        'pid_file=""',
+        'while [[ $# -gt 0 ]]; do',
+        '  case "$1" in',
+        '    --pid-file) pid_file=$2; shift 2 ;;',
+        "    *) shift ;;",
+        "  esac",
+        "done",
+        'if [[ -n "$pid_file" ]]; then printf "%s\\n" "$$" >"$pid_file"; fi',
+        "while true; do sleep 0.1; done",
+        "",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const src = fs.readFileSync(tugboat, "utf8");
+    const helpers = [
+      extractNamedFn(src, "extract_loop_run_handoff_events", "tugboat.sh"),
+      extractNamedFn(src, "wait_for_loop_run_handoff_events", "tugboat.sh"),
+      extractNamedFn(src, "observe_stage_watch_pid", "tugboat.sh"),
+      extractNamedFn(src, "start_train_stage_watch", "tugboat.sh"),
+      extractNamedFn(src, "attach_train_stage_watch", "tugboat.sh"),
+    ].join("\n");
+    const runner = path.join(dir, "run.sh");
+    const handoff = JSON.stringify({
+      schema_version: "1",
+      kind: "loop_run_handoff",
+      run_id: "loop-x",
+      run_dir: path.dirname(events),
+      events,
+      engine: "codex",
+      resumed: false,
+      selector: null,
+    });
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        `LOG_FILE=${JSON.stringify(logFile)}`,
+        "log() { echo \"$*\" | tee -a \"$LOG_FILE\"; }",
+        `RUN_DIR=${JSON.stringify(dir)}`,
+        `STAGE_WATCH_PID_FILE=${JSON.stringify(pidFile)}`,
+        `SHIP_STAGE_WATCH_BIN=${JSON.stringify(fakeWatch)}`,
+        `STATE_ROOT=${JSON.stringify(dir)}`,
+        `REPO_DIR=${JSON.stringify(dir)}`,
+        "SHIP_NOTIFY_BIN=/bin/true",
+        helpers,
+        `stderr=${JSON.stringify(stderrFile)}`,
+        `: >"$stderr"`,
+        "(",
+        "  sleep 0.2",
+        `  printf '%s\\n' ${JSON.stringify(handoff)}`,
+        "  echo '[train] prose ready line'",
+        "  sleep 1.2",
+        `) >>"$stderr" &`,
+        "train_pid=$!",
+        `attach_train_stage_watch "$stderr" "$train_pid" "1.39.8"`,
+        "echo ATTACHED",
+        'wait "$train_pid"',
+        "echo TRAIN_DONE",
+        'if [[ -f "$STAGE_WATCH_PID_FILE" ]]; then',
+        '  swp=$(cat "$STAGE_WATCH_PID_FILE" 2>/dev/null || true)',
+        '  if [[ -n "$swp" ]] && kill -0 "$swp" 2>/dev/null; then kill "$swp" 2>/dev/null || true; fi',
+        "fi",
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    const r = spawnSync("bash", [runner], { encoding: "utf8", timeout: 10000 });
+    if (fs.existsSync(pidFile)) {
+      const swp = Number(fs.readFileSync(pidFile, "utf8").trim());
+      if (Number.isFinite(swp) && swp > 1) {
+        try {
+          process.kill(swp, "SIGTERM");
+        } catch {
+          // already reaped
+        }
+      }
+    }
+    assert.equal(r.status, 0, `fixture exited ${r.status}: ${r.stdout}\n${r.stderr}`);
+    assert.match(r.stdout, /ATTACHED[\s\S]*TRAIN_DONE/);
+    const argv = fs.readFileSync(argvFile, "utf8").trim().split("\n");
+    const eventsIdx = argv.indexOf("--events-file");
+    assert.ok(eventsIdx >= 0, `watch argv missing --events-file: ${argv.join(" ")}`);
+    assert.equal(argv[eventsIdx + 1], events);
+    assert.ok(!argv.includes("--milestone"), `watch argv must not pass --milestone: ${argv.join(" ")}`);
+    assert.ok(!argv.includes("--since"), `watch argv must not pass --since: ${argv.join(" ")}`);
+    const combined = `${r.stdout}\n${fs.readFileSync(logFile, "utf8")}`;
+    assert.match(combined, /stage-watch started pid=/);
+    assert.doesNotMatch(combined, /stage-watch argv rejected/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("tugboat reuses existing open release PR (idempotent prepare)", () => {
