@@ -9,9 +9,9 @@ unchanged.
 
 ### Requirement: Pack-13911 clean-docs fixture SHALL pin release 1.39.11
 
-The run-scoped JSON fixture at
+The run-scoped JSON fixture SHALL exist at
 `core/test/fixtures/frg/pack-13911-tugboat-ship-1.39.11/clean-docs.json`
-SHALL exist and SHALL set `release_version` to the string `1.39.11`.
+and SHALL set `release_version` to the string `1.39.11`.
 The fixture path SHALL be scoped to pack run
 `pack-13911-tugboat-ship-1.39.11` only.
 
