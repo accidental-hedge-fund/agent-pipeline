@@ -170,7 +170,9 @@ Env (already partially covered in §2):
 
 ```bash
 export SHIP_NOTIFY=1
-export PIPELINE_MATERIAL_FILTER="$HOME/.codex/skills/pipeline/scripts/material-filter.mjs"
+# Optional override. Tugboat presents the install-tree material-filter.mjs
+# when this is unset. engine-promote does not write supervisor env.
+# export PIPELINE_MATERIAL_FILTER="$HOME/.codex/skills/pipeline/scripts/material-filter.mjs"
 export PIPELINE_SHIP_AUTH_PUBLIC_KEY_FILE=/etc/agent-pipeline/ship-authority.pem
 # Optional Buzz — leave unset for silent no-op notify:
 # BUZZ_BIN BUZZ_RELAY_URL BUZZ_CHANNEL BUZZ_CREDENTIALS_FILE

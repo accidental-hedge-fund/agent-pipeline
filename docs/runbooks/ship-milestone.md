@@ -91,6 +91,8 @@ export ALLOW_MERGE=1                        # required for mutating ship
 # export AGENT_PIPELINE_PRODUCTION_PIN=$REPO_DIR/.agent-pipeline/production-engine-pin.json
 # export ENGINE_PROMOTE_HOST=all            # default all (codex/claude/grok/opencode)
 # export PIPELINE_SUPERVISOR_STATE=$HOME/.local/state/pipeline-supervisor
+# optional override; Tugboat presents <skillDir>/scripts/material-filter.mjs
+# when unset. engine-promote does not write supervisor env.
 # export PIPELINE_MATERIAL_FILTER=…/material-filter.mjs
 # export TUGBOAT_SKIP_FRG=1                 # escape only; requires TUGBOAT_SKIP_FRG_REASON
 # export TUGBOAT_SKIP_FRG_REASON="…"
