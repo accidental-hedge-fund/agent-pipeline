@@ -1,0 +1,16 @@
+## 1. Regression tests that bite the v1.39.10 spawn env
+
+- [ ] 1.1 Add a co-located test in `core/test/tugboat.test.ts` that fixtures `start_train_stage_watch` (extract helpers) with `PIPELINE_MATERIAL_FILTER` unset in the process env. Inject a fake pin/host skill tree containing an executable `<skillDir>/scripts/material-filter.mjs` (via `CODEX_HOME` / equivalent). Capture the watch spawn environment. Assert the spawn has `PIPELINE_MATERIAL_FILTER` pointing at that executable, or `material-filter.mjs` on the spawn PATH as an executable. Verify the test **fails** against current Tugboat (PATH is `dirname` of the sibling watch; no filter export)
+- [ ] 1.2 Add a second co-located test that drives the composer path (extracted `start_train_stage_watch` / `observe_stage_watch_pid`) with bundled `examples/supervisor/shell/ship-stage-watch.sh --events-file`, no filter env, and a PATH that does not contain `material-filter.mjs`. Assert the composer does not log `stage-watch started`. Verify this test **fails** if the composer still logs `stage-watch started` for that spawn. Host supervisor env remaining unset must not be required for either test to pass
+- [ ] 1.3 Keep existing `core/test/tugboat.test.ts` `--events-file` argv / sibling-default tests and `core/test/ship-stage-watch.test.ts` absolute-file / no-latest-run tests passing without changing the bundled watch argv contract. Verify those existing tests still pass
+
+## 2. Tugboat presents the installed filter
+
+- [ ] 2.1 In `examples/supervisor/shell/tugboat.sh`, resolve an executable `<skillDir>/scripts/material-filter.mjs` from pin/host skill install trees (same base-path env keys and default home segments `install.mjs` uses) when `PIPELINE_MATERIAL_FILTER` is unset. Do not use `examples/supervisor/shell/` or repo `hosts/_shared/material-filter.mjs` as the runtime filter. If the operator already set `PIPELINE_MATERIAL_FILTER`, leave it unchanged. Export the effective value (or equivalent PATH) on the `start_train_stage_watch` spawn. Verify task 1.1 now passes
+- [ ] 2.2 If the effective filter is missing or not executable, log `material filter missing` (or equivalent), do not log `stage-watch started pid=…`, do not claim a live watch pid, and continue train. Do not fail the ship. Do not relabel `stage-watch argv rejected` (#1213). Verify task 1.2 now passes with the named missing-filter log (or at least no `stage-watch started`)
+- [ ] 2.3 Document `PIPELINE_MATERIAL_FILTER` in the Tugboat environment comment block as an optional operator override whose default is the install-tree filter presented at watch spawn. Do not teach `engine-promote` to write supervisor env. Verify `examples/supervisor/hermes/env.example` may keep the var as an override and is not the owner
+
+## 3. Gate
+
+- [ ] 3.1 After any `core/` edit, run `node scripts/build.mjs` and include regenerated `plugin/` in the same change. Verify `node scripts/build.mjs --check` is clean
+- [ ] 3.2 Run `openspec validate tugboat-present-installed-material-filter` and `npm run ci` from the repo root. Verify both are green. Do not kill or restart an in-flight ship. Do not add `--skip-frg` as the default ship path. Do not require a live supervisor-env edit after promote
