@@ -260,7 +260,10 @@ ship-stage-watch \
 ```
 
 Do not guess a path or select the most recently modified run. Notification
-failure is observational and must not stop or advance a ship.
+failure is observational and must not stop or advance a ship. If Tugboat's
+stage-watch pid dies immediately, the playbook logs the watch stderr tail
+or exit status. `stage-watch argv rejected` is only for usage or parser
+reject. A relative events path is refused before spawn.
 
 ## Parked non-goals
 

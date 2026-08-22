@@ -457,6 +457,7 @@ test("tugboat logs stage-watch argv rejected when bundled watch gets --milestone
         "set -euo pipefail",
         `LOG_FILE=${JSON.stringify(logFile)}`,
         "log() { echo \"$*\" | tee -a \"$LOG_FILE\"; }",
+        `RUN_DIR=${JSON.stringify(dir)}`,
         `STAGE_WATCH_PID_FILE=${JSON.stringify(pidFile)}`,
         observe,
         `nohup env PATH=${JSON.stringify(`${path.dirname(stageWatch)}${path.delimiter}${process.env.PATH ?? "/usr/bin"}`)} \\`,
@@ -1014,6 +1015,132 @@ test("tugboat does not start watch when operator-set material-filter is not exec
     assert.doesNotMatch(combined, /SPAWNED/);
     assert.match(r.stdout, /TRAIN_CONTINUED/);
     assert.equal(fs.existsSync(envFilterFile), false);
+  } finally {
+    killPidFile(path.join(dir, "stage-watch.pid"));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("tugboat logs filter-not-found death from watch stderr, not argv rejected (#1213)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-watch-filter-death-"));
+  try {
+    const logFile = path.join(dir, "playbook.log");
+    const pidFile = path.join(dir, "stage-watch.pid");
+    const watchLog = path.join(dir, "stage-watch.log");
+    const fakeWatch = path.join(dir, "fake-watch");
+    fs.writeFileSync(
+      fakeWatch,
+      [
+        "#!/usr/bin/env bash",
+        "echo 'material filter not found on PATH: material-filter.mjs' >&2",
+        "exit 1",
+        "",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const src = fs.readFileSync(tugboat, "utf8");
+    const observe = extractNamedFn(src, "observe_stage_watch_pid", "tugboat.sh");
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        `LOG_FILE=${JSON.stringify(logFile)}`,
+        "log() { echo \"$*\" | tee -a \"$LOG_FILE\"; }",
+        `RUN_DIR=${JSON.stringify(dir)}`,
+        `STAGE_WATCH_PID_FILE=${JSON.stringify(pidFile)}`,
+        observe,
+        `nohup ${JSON.stringify(fakeWatch)} >>${JSON.stringify(watchLog)} 2>&1 &`,
+        "watch_pid=$!",
+        'observe_stage_watch_pid "$watch_pid"',
+        "echo TRAIN_CONTINUED",
+        "exit 0",
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    const r = spawnSync("bash", [runner], { encoding: "utf8", timeout: 10000 });
+    assert.equal(r.status, 0, `fixture exited ${r.status}: ${r.stdout}\n${r.stderr}`);
+    const combined = `${r.stdout}\n${fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : ""}`;
+    assert.match(combined, /material filter not found on PATH: material-filter\.mjs/);
+    assert.doesNotMatch(combined, /stage-watch argv rejected/);
+    assert.doesNotMatch(combined, /stage-watch started pid=/);
+    assert.match(r.stdout, /TRAIN_CONTINUED/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("tugboat refuses a relative events path before stage-watch spawn (#1213)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-watch-rel-events-"));
+  try {
+    const { home, codexHome, runnerEnv } = isolatedFilterHomes(dir);
+    const filterPath = path.join(
+      codexHome,
+      "skills",
+      "pipeline",
+      "scripts",
+      "material-filter.mjs",
+    );
+    writeStubFilter(filterPath);
+    const logFile = path.join(dir, "playbook.log");
+    const pidFile = path.join(dir, "stage-watch.pid");
+    const spawnMarker = path.join(dir, "watch.spawned");
+    const fakeWatch = path.join(dir, "fake-watch");
+    fs.writeFileSync(
+      fakeWatch,
+      [
+        "#!/usr/bin/env bash",
+        `echo SPAWNED > ${JSON.stringify(spawnMarker)}`,
+        "exit 0",
+        "",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const src = fs.readFileSync(tugboat, "utf8");
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        `HOME=${JSON.stringify(home)}`,
+        `CODEX_HOME=${JSON.stringify(codexHome)}`,
+        "export HOME CODEX_HOME",
+        `LOG_FILE=${JSON.stringify(logFile)}`,
+        "log() { echo \"$*\" | tee -a \"$LOG_FILE\"; }",
+        `RUN_DIR=${JSON.stringify(dir)}`,
+        `STAGE_WATCH_PID_FILE=${JSON.stringify(pidFile)}`,
+        `SHIP_STAGE_WATCH_BIN=${JSON.stringify(fakeWatch)}`,
+        `STATE_ROOT=${JSON.stringify(dir)}`,
+        `REPO_DIR=${JSON.stringify(dir)}`,
+        "SHIP_NOTIFY_BIN=/bin/true",
+        extractTrainWatchHelpers(src),
+        'start_train_stage_watch "run/events.jsonl" "1.39.10"',
+        "echo TRAIN_CONTINUED",
+        "exit 0",
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    const r = spawnSync("bash", [runner], {
+      encoding: "utf8",
+      timeout: 10000,
+      env: runnerEnv,
+    });
+    killPidFile(pidFile);
+    assert.equal(r.status, 0, `fixture exited ${r.status}: ${r.stdout}\n${r.stderr}`);
+    const combined = `${r.stdout}\n${fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : ""}`;
+    assert.match(combined, /events path is not absolute/);
+    assert.doesNotMatch(combined, /stage-watch argv rejected/);
+    assert.doesNotMatch(combined, /stage-watch started pid=/);
+    assert.equal(
+      fs.existsSync(spawnMarker),
+      false,
+      "watch must not spawn for a relative events path",
+    );
+    assert.match(r.stdout, /TRAIN_CONTINUED/);
   } finally {
     killPidFile(path.join(dir, "stage-watch.pid"));
     fs.rmSync(dir, { recursive: true, force: true });

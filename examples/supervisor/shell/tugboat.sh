@@ -59,6 +59,10 @@
 #                          Default: sibling ship-stage-watch.sh. Argv is
 #                          --events-file from this train's loop_run_handoff
 #                          (not --milestone / --since; not a PATH leftover).
+#                          A relative events path is refused before spawn.
+#                          A dead watch pid logs the watch stderr/exit;
+#                          "stage-watch argv rejected" is only usage/parser
+#                          reject (exit 2 plus usage text).
 #   PIPELINE_MATERIAL_FILTER  optional operator override for the watch
 #                          spawn. When unset, Tugboat presents the
 #                          pin/host skill install tree
@@ -2372,13 +2376,43 @@ wait_for_loop_run_handoff_events() {
   done
 }
 
-# After spawn: argv parse is immediate. Dead pid is a named failure, not started.
+# After spawn: argv parse and immediate runtime death are both named failures.
+# argv-rejected is only exit 2 plus usage/parser text. Other deaths log the
+# stderr tail and/or exit status. Dead pid is never "started".
 observe_stage_watch_pid() {
   local watch_pid=$1
+  local ec=0
+  local capture=""
+  local capture_body=""
+  local tail=""
+  local argv_reject=0
   sleep 0.2
   if ! kill -0 "$watch_pid" 2>/dev/null; then
-    wait "$watch_pid" 2>/dev/null || true
-    log "stage-watch argv rejected"
+    wait "$watch_pid" 2>/dev/null || ec=$?
+    if [[ -n "${RUN_DIR:-}" ]]; then
+      capture="$RUN_DIR/stage-watch.log"
+    fi
+    if [[ -n "$capture" && -f "$capture" ]]; then
+      capture_body=$(cat "$capture" 2>/dev/null || true)
+      tail=$(printf '%s\n' "$capture_body" | grep -v '^[[:space:]]*$' | tail -n 1 || true)
+    fi
+    if [[ "$ec" -eq 2 ]]; then
+      case "$capture_body" in
+        *"unknown argument:"*|*"Usage:"*|*"--events-file is required"*|*"missing value for"*)
+          case "$tail" in
+            *"material filter not found on PATH"*|*"material filter is not executable"*) ;;
+            *) argv_reject=1 ;;
+          esac
+          ;;
+      esac
+    fi
+    if [[ "$argv_reject" -eq 1 ]]; then
+      log "stage-watch argv rejected"
+    elif [[ -n "$tail" ]]; then
+      log "stage-watch failed: $tail (exit=$ec)"
+    else
+      log "stage-watch failed exit=$ec"
+    fi
     rm -f "${STAGE_WATCH_PID_FILE:-}"
     return 0
   fi
@@ -2431,7 +2465,7 @@ start_train_stage_watch() {
   local version=$2
   local watch_pid filter
   if [[ "$events" != /* ]]; then
-    log "stage-watch argv rejected"
+    log "events path is not absolute"
     return 0
   fi
   filter=$(resolve_installed_material_filter)
