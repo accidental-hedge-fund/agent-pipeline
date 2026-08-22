@@ -436,6 +436,9 @@ test("tugboat default SHIP_STAGE_WATCH_BIN is the repo sibling (#1184)", () => {
     extractNamedFn(body, "start_train_stage_watch", "tugboat.sh"),
     /command -v ship-stage-watch/,
   );
+  const startFn = extractNamedFn(body, "start_train_stage_watch", "tugboat.sh");
+  assert.match(startFn, /PIPELINE_MATERIAL_FILTER="\$filter"/);
+  assert.match(startFn, /material filter missing/);
 });
 
 test("tugboat logs stage-watch argv rejected when bundled watch gets --milestone (#1184)", () => {
@@ -524,6 +527,7 @@ test("tugboat attaches --events-file watch from live loop_run_handoff while trai
     const helpers = [
       extractNamedFn(src, "extract_loop_run_handoff_events", "tugboat.sh"),
       extractNamedFn(src, "wait_for_loop_run_handoff_events", "tugboat.sh"),
+      extractNamedFn(src, "resolve_installed_material_filter", "tugboat.sh"),
       extractNamedFn(src, "observe_stage_watch_pid", "tugboat.sh"),
       extractNamedFn(src, "start_train_stage_watch", "tugboat.sh"),
       extractNamedFn(src, "attach_train_stage_watch", "tugboat.sh"),
@@ -552,6 +556,7 @@ test("tugboat attaches --events-file watch from live loop_run_handoff while trai
         `STATE_ROOT=${JSON.stringify(dir)}`,
         `REPO_DIR=${JSON.stringify(dir)}`,
         "SHIP_NOTIFY_BIN=/bin/true",
+        `PIPELINE_MATERIAL_FILTER=${JSON.stringify(fakeWatch)}`,
         helpers,
         `stderr=${JSON.stringify(stderrFile)}`,
         `: >"$stderr"`,
@@ -597,6 +602,420 @@ test("tugboat attaches --events-file watch from live loop_run_handoff while trai
     assert.match(combined, /stage-watch started pid=/);
     assert.doesNotMatch(combined, /stage-watch argv rejected/);
   } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+function isExecutableFile(p: string): boolean {
+  try {
+    return fs.statSync(p).isFile() && (fs.statSync(p).mode & 0o111) !== 0;
+  } catch {
+    return false;
+  }
+}
+
+function spawnPresentsMaterialFilter(
+  filterEnv: string,
+  pathEnv: string,
+): string | null {
+  const filter = filterEnv.trim();
+  if (filter && filter !== "material-filter.mjs" && isExecutableFile(filter)) {
+    return filter;
+  }
+  for (const dir of pathEnv.split(path.delimiter)) {
+    if (!dir) continue;
+    const candidate = path.join(dir, "material-filter.mjs");
+    if (isExecutableFile(candidate)) return candidate;
+  }
+  return null;
+}
+
+function writeStubFilter(filterPath: string): void {
+  fs.mkdirSync(path.dirname(filterPath), { recursive: true });
+  fs.writeFileSync(filterPath, "#!/usr/bin/env bash\nexit 0\n");
+  fs.chmodSync(filterPath, 0o755);
+}
+
+function isolatedFilterHomes(root: string): {
+  home: string;
+  codexHome: string;
+  claudeDir: string;
+  opencodeDir: string;
+  runnerEnv: NodeJS.ProcessEnv;
+} {
+  const home = path.join(root, "home");
+  const codexHome = path.join(root, "codex-home");
+  const claudeDir = path.join(root, "claude-config");
+  const opencodeDir = path.join(root, "opencode-config");
+  fs.mkdirSync(home, { recursive: true });
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.mkdirSync(claudeDir, { recursive: true });
+  fs.mkdirSync(opencodeDir, { recursive: true });
+  const runnerEnv: NodeJS.ProcessEnv = { ...process.env };
+  delete runnerEnv.PIPELINE_MATERIAL_FILTER;
+  runnerEnv.HOME = home;
+  runnerEnv.CODEX_HOME = codexHome;
+  runnerEnv.CLAUDE_CONFIG_DIR = claudeDir;
+  runnerEnv.OPENCODE_CONFIG_DIR = opencodeDir;
+  runnerEnv.PATH = ["/usr/bin", "/bin"].join(path.delimiter);
+  return { home, codexHome, claudeDir, opencodeDir, runnerEnv };
+}
+
+function extractTrainWatchHelpers(src: string): string {
+  return [
+    extractNamedFn(src, "resolve_installed_material_filter", "tugboat.sh"),
+    extractNamedFn(src, "observe_stage_watch_pid", "tugboat.sh"),
+    extractNamedFn(src, "start_train_stage_watch", "tugboat.sh"),
+  ].join("\n");
+}
+
+function killPidFile(pidFile: string): void {
+  if (!fs.existsSync(pidFile)) return;
+  const swp = Number(fs.readFileSync(pidFile, "utf8").trim());
+  if (Number.isFinite(swp) && swp > 1) {
+    try {
+      process.kill(swp, "SIGTERM");
+    } catch {
+      // already reaped
+    }
+  }
+}
+
+test("tugboat watch spawn env presents install-tree material-filter without host env (#1212)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-filter-spawn-"));
+  try {
+    const { home, codexHome, runnerEnv } = isolatedFilterHomes(dir);
+    const filterPath = path.join(
+      codexHome,
+      "skills",
+      "pipeline",
+      "scripts",
+      "material-filter.mjs",
+    );
+    writeStubFilter(filterPath);
+    const events = path.join(dir, "events.jsonl");
+    fs.writeFileSync(events, "");
+    const logFile = path.join(dir, "playbook.log");
+    const pidFile = path.join(dir, "stage-watch.pid");
+    const envFilterFile = path.join(dir, "spawn.filter");
+    const envPathFile = path.join(dir, "spawn.path");
+    const fakeWatch = path.join(dir, "fake-watch");
+    fs.writeFileSync(
+      fakeWatch,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        `printf '%s\\n' "\${PIPELINE_MATERIAL_FILTER-}" > ${JSON.stringify(envFilterFile)}`,
+        `printf '%s\\n' "\${PATH-}" > ${JSON.stringify(envPathFile)}`,
+        'pid_file=""',
+        'while [[ $# -gt 0 ]]; do',
+        '  case "$1" in',
+        '    --pid-file) pid_file=$2; shift 2 ;;',
+        "    *) shift ;;",
+        "  esac",
+        "done",
+        'if [[ -n "$pid_file" ]]; then printf "%s\\n" "$$" >"$pid_file"; fi',
+        "while true; do sleep 0.1; done",
+        "",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const src = fs.readFileSync(tugboat, "utf8");
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        "unset PIPELINE_MATERIAL_FILTER",
+        `HOME=${JSON.stringify(home)}`,
+        `CODEX_HOME=${JSON.stringify(codexHome)}`,
+        `export HOME CODEX_HOME`,
+        `LOG_FILE=${JSON.stringify(logFile)}`,
+        "log() { echo \"$*\" | tee -a \"$LOG_FILE\"; }",
+        `RUN_DIR=${JSON.stringify(dir)}`,
+        `STAGE_WATCH_PID_FILE=${JSON.stringify(pidFile)}`,
+        `SHIP_STAGE_WATCH_BIN=${JSON.stringify(fakeWatch)}`,
+        `STATE_ROOT=${JSON.stringify(dir)}`,
+        `REPO_DIR=${JSON.stringify(dir)}`,
+        "SHIP_NOTIFY_BIN=/bin/true",
+        `PATH=${JSON.stringify(runnerEnv.PATH)}`,
+        "export PATH",
+        extractTrainWatchHelpers(src),
+        `start_train_stage_watch ${JSON.stringify(events)} "1.39.10"`,
+        "echo TRAIN_CONTINUED",
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    const r = spawnSync("bash", [runner], {
+      encoding: "utf8",
+      timeout: 10000,
+      env: runnerEnv,
+    });
+    killPidFile(pidFile);
+    assert.equal(r.status, 0, `fixture exited ${r.status}: ${r.stdout}\n${r.stderr}`);
+    assert.match(r.stdout, /TRAIN_CONTINUED/);
+    const filterEnv = fs.existsSync(envFilterFile)
+      ? fs.readFileSync(envFilterFile, "utf8")
+      : "";
+    const pathEnv = fs.existsSync(envPathFile)
+      ? fs.readFileSync(envPathFile, "utf8")
+      : "";
+    const presented = spawnPresentsMaterialFilter(filterEnv, pathEnv);
+    assert.ok(
+      presented,
+      `watch spawn env has neither PIPELINE_MATERIAL_FILTER pointing at an executable nor material-filter.mjs on PATH (filter=${JSON.stringify(filterEnv.trim())} path=${JSON.stringify(pathEnv.trim())})`,
+    );
+    assert.equal(presented, filterPath);
+    assert.equal(path.basename(presented!), "material-filter.mjs");
+    assert.ok(presented!.startsWith(codexHome + path.sep));
+    assert.ok(!presented!.includes(`${path.sep}examples${path.sep}supervisor${path.sep}shell`));
+    assert.ok(!presented!.includes(`${path.sep}hosts${path.sep}_shared${path.sep}`));
+    assert.notEqual(presented, "material-filter.mjs");
+    assert.notEqual(path.dirname(presented!), path.dirname(stageWatch));
+    const combined = `${r.stdout}\n${fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : ""}`;
+    assert.match(combined, /stage-watch started pid=/);
+    assert.doesNotMatch(combined, /material filter missing/);
+  } finally {
+    killPidFile(path.join(dir, "stage-watch.pid"));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("tugboat preserves operator-set PIPELINE_MATERIAL_FILTER on watch spawn (#1212)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-filter-override-"));
+  try {
+    const { home, codexHome, runnerEnv } = isolatedFilterHomes(dir);
+    const installFilter = path.join(
+      codexHome,
+      "skills",
+      "pipeline",
+      "scripts",
+      "material-filter.mjs",
+    );
+    writeStubFilter(installFilter);
+    const operatorFilter = path.join(dir, "operator-filter.mjs");
+    writeStubFilter(operatorFilter);
+    const events = path.join(dir, "events.jsonl");
+    fs.writeFileSync(events, "");
+    const logFile = path.join(dir, "playbook.log");
+    const pidFile = path.join(dir, "stage-watch.pid");
+    const envFilterFile = path.join(dir, "spawn.filter");
+    const envPathFile = path.join(dir, "spawn.path");
+    const fakeWatch = path.join(dir, "fake-watch");
+    fs.writeFileSync(
+      fakeWatch,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        `printf '%s\\n' "\${PIPELINE_MATERIAL_FILTER-}" > ${JSON.stringify(envFilterFile)}`,
+        `printf '%s\\n' "\${PATH-}" > ${JSON.stringify(envPathFile)}`,
+        'pid_file=""',
+        'while [[ $# -gt 0 ]]; do',
+        '  case "$1" in',
+        '    --pid-file) pid_file=$2; shift 2 ;;',
+        "    *) shift ;;",
+        "  esac",
+        "done",
+        'if [[ -n "$pid_file" ]]; then printf "%s\\n" "$$" >"$pid_file"; fi',
+        "while true; do sleep 0.1; done",
+        "",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const src = fs.readFileSync(tugboat, "utf8");
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        `HOME=${JSON.stringify(home)}`,
+        `CODEX_HOME=${JSON.stringify(codexHome)}`,
+        `PIPELINE_MATERIAL_FILTER=${JSON.stringify(operatorFilter)}`,
+        "export HOME CODEX_HOME PIPELINE_MATERIAL_FILTER",
+        `LOG_FILE=${JSON.stringify(logFile)}`,
+        "log() { echo \"$*\" | tee -a \"$LOG_FILE\"; }",
+        `RUN_DIR=${JSON.stringify(dir)}`,
+        `STAGE_WATCH_PID_FILE=${JSON.stringify(pidFile)}`,
+        `SHIP_STAGE_WATCH_BIN=${JSON.stringify(fakeWatch)}`,
+        `STATE_ROOT=${JSON.stringify(dir)}`,
+        `REPO_DIR=${JSON.stringify(dir)}`,
+        "SHIP_NOTIFY_BIN=/bin/true",
+        extractTrainWatchHelpers(src),
+        `start_train_stage_watch ${JSON.stringify(events)} "1.39.10"`,
+        "echo TRAIN_CONTINUED",
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    runnerEnv.PIPELINE_MATERIAL_FILTER = operatorFilter;
+    const r = spawnSync("bash", [runner], {
+      encoding: "utf8",
+      timeout: 10000,
+      env: runnerEnv,
+    });
+    killPidFile(pidFile);
+    assert.equal(r.status, 0, `fixture exited ${r.status}: ${r.stdout}\n${r.stderr}`);
+    const filterEnv = fs.readFileSync(envFilterFile, "utf8").trim();
+    assert.equal(filterEnv, operatorFilter);
+    assert.notEqual(filterEnv, installFilter);
+    assert.match(r.stdout, /TRAIN_CONTINUED/);
+  } finally {
+    killPidFile(path.join(dir, "stage-watch.pid"));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("tugboat does not log stage-watch started when bundled watch has no material-filter (#1212)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-filter-missing-"));
+  try {
+    const { home, codexHome, claudeDir, opencodeDir, runnerEnv } =
+      isolatedFilterHomes(dir);
+    const events = path.join(dir, "events.jsonl");
+    fs.writeFileSync(events, "");
+    const logFile = path.join(dir, "playbook.log");
+    const pidFile = path.join(dir, "stage-watch.pid");
+    const watchLog = path.join(dir, "stage-watch.log");
+    const src = fs.readFileSync(tugboat, "utf8");
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        "unset PIPELINE_MATERIAL_FILTER",
+        `HOME=${JSON.stringify(home)}`,
+        `CODEX_HOME=${JSON.stringify(codexHome)}`,
+        `CLAUDE_CONFIG_DIR=${JSON.stringify(claudeDir)}`,
+        `OPENCODE_CONFIG_DIR=${JSON.stringify(opencodeDir)}`,
+        "export HOME CODEX_HOME CLAUDE_CONFIG_DIR OPENCODE_CONFIG_DIR",
+        `LOG_FILE=${JSON.stringify(logFile)}`,
+        "log() { echo \"$*\" | tee -a \"$LOG_FILE\"; }",
+        `RUN_DIR=${JSON.stringify(dir)}`,
+        `STAGE_WATCH_PID_FILE=${JSON.stringify(pidFile)}`,
+        `SHIP_STAGE_WATCH_BIN=${JSON.stringify(stageWatch)}`,
+        `STATE_ROOT=${JSON.stringify(dir)}`,
+        `REPO_DIR=${JSON.stringify(dir)}`,
+        "SHIP_NOTIFY_BIN=/bin/true",
+        `PATH=${JSON.stringify(runnerEnv.PATH)}`,
+        "export PATH",
+        extractTrainWatchHelpers(src),
+        `start_train_stage_watch ${JSON.stringify(events)} "1.39.10"`,
+        "echo TRAIN_CONTINUED",
+        "exit 0",
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    const r = spawnSync("bash", [runner], {
+      encoding: "utf8",
+      timeout: 10000,
+      env: runnerEnv,
+    });
+    killPidFile(pidFile);
+    assert.equal(r.status, 0, `fixture exited ${r.status}: ${r.stdout}\n${r.stderr}`);
+    const combined = `${r.stdout}\n${fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : ""}`;
+    assert.match(combined, /material filter missing/);
+    assert.doesNotMatch(combined, /stage-watch started pid=/);
+    assert.doesNotMatch(combined, /stage-watch argv rejected/);
+    assert.match(r.stdout, /TRAIN_CONTINUED/);
+    const watchOut = fs.existsSync(watchLog) ? fs.readFileSync(watchLog, "utf8") : "";
+    assert.equal(watchOut, "", "bundled watch must not be spawned without a filter");
+    if (fs.existsSync(pidFile)) {
+      const swp = fs.readFileSync(pidFile, "utf8").trim();
+      if (swp) {
+        try {
+          process.kill(Number(swp), 0);
+          assert.fail(`missing-filter spawn must not claim live pid ${swp}`);
+        } catch {
+          // ESRCH — not live
+        }
+      }
+    }
+  } finally {
+    killPidFile(path.join(dir, "stage-watch.pid"));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("tugboat does not start watch when operator-set material-filter is not executable (#1212)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-filter-not-exec-"));
+  try {
+    const { home, codexHome, runnerEnv } = isolatedFilterHomes(dir);
+    const installFilter = path.join(
+      codexHome,
+      "skills",
+      "pipeline",
+      "scripts",
+      "material-filter.mjs",
+    );
+    writeStubFilter(installFilter);
+    const operatorFilter = path.join(dir, "not-exec-filter.mjs");
+    fs.writeFileSync(operatorFilter, "#!/usr/bin/env bash\nexit 0\n");
+    fs.chmodSync(operatorFilter, 0o644);
+    const events = path.join(dir, "events.jsonl");
+    fs.writeFileSync(events, "");
+    const logFile = path.join(dir, "playbook.log");
+    const pidFile = path.join(dir, "stage-watch.pid");
+    const envFilterFile = path.join(dir, "spawn.filter");
+    const fakeWatch = path.join(dir, "fake-watch");
+    fs.writeFileSync(
+      fakeWatch,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        `printf '%s\\n' "\${PIPELINE_MATERIAL_FILTER-}" > ${JSON.stringify(envFilterFile)}`,
+        'echo SPAWNED',
+        "exit 0",
+        "",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const src = fs.readFileSync(tugboat, "utf8");
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        `HOME=${JSON.stringify(home)}`,
+        `CODEX_HOME=${JSON.stringify(codexHome)}`,
+        `PIPELINE_MATERIAL_FILTER=${JSON.stringify(operatorFilter)}`,
+        "export HOME CODEX_HOME PIPELINE_MATERIAL_FILTER",
+        `LOG_FILE=${JSON.stringify(logFile)}`,
+        "log() { echo \"$*\" | tee -a \"$LOG_FILE\"; }",
+        `RUN_DIR=${JSON.stringify(dir)}`,
+        `STAGE_WATCH_PID_FILE=${JSON.stringify(pidFile)}`,
+        `SHIP_STAGE_WATCH_BIN=${JSON.stringify(fakeWatch)}`,
+        `STATE_ROOT=${JSON.stringify(dir)}`,
+        `REPO_DIR=${JSON.stringify(dir)}`,
+        "SHIP_NOTIFY_BIN=/bin/true",
+        extractTrainWatchHelpers(src),
+        `start_train_stage_watch ${JSON.stringify(events)} "1.39.10"`,
+        "echo TRAIN_CONTINUED",
+        "exit 0",
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    runnerEnv.PIPELINE_MATERIAL_FILTER = operatorFilter;
+    const r = spawnSync("bash", [runner], {
+      encoding: "utf8",
+      timeout: 10000,
+      env: runnerEnv,
+    });
+    killPidFile(pidFile);
+    assert.equal(r.status, 0, `fixture exited ${r.status}: ${r.stdout}\n${r.stderr}`);
+    const combined = `${r.stdout}\n${fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : ""}`;
+    assert.match(combined, /material filter missing/);
+    assert.doesNotMatch(combined, /stage-watch started pid=/);
+    assert.doesNotMatch(combined, /SPAWNED/);
+    assert.match(r.stdout, /TRAIN_CONTINUED/);
+    assert.equal(fs.existsSync(envFilterFile), false);
+  } finally {
+    killPidFile(path.join(dir, "stage-watch.pid"));
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

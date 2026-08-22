@@ -43,7 +43,7 @@ Expect these on the Hermes process PATH / env (set by the deployment profile):
 | `PIPELINE` | Absolute launcher, e.g. `node …/pipeline.mjs` — **required** |
 | `ALLOW_MERGE` | `1` only if this channel may run `train --merge` / release finish — **required for ship** |
 | `AGENT_PIPELINE_ROOT` | Clone of agent-pipeline containing `examples/supervisor/shell/` |
-| `PIPELINE_MATERIAL_FILTER` | Installed `material-filter.mjs` used for exact-run progress |
+| `PIPELINE_MATERIAL_FILTER` | Optional override. Tugboat presents the pin/host install-tree `material-filter.mjs` at watch spawn when unset. |
 | `ENGINE_PROMOTE_HOST` | Optional; default `all` (do not force codex-only) |
 
 ## Commands

@@ -59,6 +59,19 @@
 #                          Default: sibling ship-stage-watch.sh. Argv is
 #                          --events-file from this train's loop_run_handoff
 #                          (not --milestone / --since; not a PATH leftover).
+#   PIPELINE_MATERIAL_FILTER  optional operator override for the watch
+#                          spawn. When unset, Tugboat presents the
+#                          pin/host skill install tree
+#                          <skillDir>/scripts/material-filter.mjs (same
+#                          tree install.mjs / engine-promote write:
+#                          CODEX_HOME, CLAUDE_CONFIG_DIR,
+#                          OPENCODE_CONFIG_DIR, default home segments,
+#                          Grok symlink). Host supervisor env is not
+#                          the owner; engine-promote does not write it.
+#                          Tugboat does not overwrite an operator-set
+#                          value. Missing or non-executable filter logs
+#                          "material filter missing" and does not claim
+#                          a live watch pid; train continues.
 #   RELEASE_WAIT_ATTEMPTS  CI/release wait poll attempts (default 30)
 #   RELEASE_WAIT_SLEEP_S   wait sleep seconds (default 40)
 #   RELEASE_CHECKS_RERUN_BUDGET  flake-eligible test reruns per head SHA (default 1, max 2)
@@ -2372,18 +2385,64 @@ observe_stage_watch_pid() {
   log "stage-watch started pid=$watch_pid"
 }
 
+# First executable <skillDir>/scripts/material-filter.mjs in pin/host install
+# trees. Operator-set PIPELINE_MATERIAL_FILTER is returned unchanged.
+# Do not probe examples/supervisor/shell or repo hosts/_shared.
+resolve_installed_material_filter() {
+  local p dir home="${HOME:-}"
+  if [[ -n "${PIPELINE_MATERIAL_FILTER:-}" ]]; then
+    printf '%s\n' "$PIPELINE_MATERIAL_FILTER"
+    return 0
+  fi
+  local candidates=()
+  if [[ -n "${CODEX_HOME:-}" ]]; then
+    candidates+=("$CODEX_HOME/skills/pipeline/scripts/material-filter.mjs")
+  elif [[ -n "$home" ]]; then
+    candidates+=("$home/.codex/skills/pipeline/scripts/material-filter.mjs")
+    candidates+=("$home/.agents/skills/pipeline/scripts/material-filter.mjs")
+  fi
+  if [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then
+    candidates+=("$CLAUDE_CONFIG_DIR/skills/pipeline/scripts/material-filter.mjs")
+  elif [[ -n "$home" ]]; then
+    candidates+=("$home/.claude/skills/pipeline/scripts/material-filter.mjs")
+  fi
+  if [[ -n "$home" ]]; then
+    candidates+=("$home/.grok/skills/pipeline/scripts/material-filter.mjs")
+  fi
+  if [[ -n "${OPENCODE_CONFIG_DIR:-}" ]]; then
+    candidates+=("$OPENCODE_CONFIG_DIR/skills/pipeline/scripts/material-filter.mjs")
+  elif [[ -n "$home" ]]; then
+    candidates+=("$home/.config/opencode/skills/pipeline/scripts/material-filter.mjs")
+  fi
+  for p in "${candidates[@]}"; do
+    [[ -f "$p" && -x "$p" ]] || continue
+    if [[ "$p" != /* ]]; then
+      dir=$(cd "$(dirname "$p")" && pwd) || continue
+      p="$dir/$(basename "$p")"
+    fi
+    printf '%s\n' "$p"
+    return 0
+  done
+}
+
 # Spawn bundled watch with --events-file from the live handoff. Never --milestone.
 start_train_stage_watch() {
   local events=$1
   local version=$2
-  local watch_pid
+  local watch_pid filter
   if [[ "$events" != /* ]]; then
     log "stage-watch argv rejected"
+    return 0
+  fi
+  filter=$(resolve_installed_material_filter)
+  if [[ ! -f "$filter" || ! -x "$filter" ]]; then
+    log "material filter missing"
     return 0
   fi
   nohup env PATH="$(dirname "$SHIP_STAGE_WATCH_BIN"):${PATH:-/usr/bin}" \
     REPO_DIR="$REPO_DIR" SHIP_NOTIFY_BIN="$SHIP_NOTIFY_BIN" \
     PIPELINE_SUPERVISOR_STATE="$STATE_ROOT" \
+    PIPELINE_MATERIAL_FILTER="$filter" \
     "$SHIP_STAGE_WATCH_BIN" \
     --events-file "$events" \
     --label "ship v$version" \
