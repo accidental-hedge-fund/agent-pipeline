@@ -174,7 +174,8 @@ export SHIP_NOTIFY=1
 # when this is unset. engine-promote does not write supervisor env.
 # export PIPELINE_MATERIAL_FILTER="$HOME/.codex/skills/pipeline/scripts/material-filter.mjs"
 export PIPELINE_SHIP_AUTH_PUBLIC_KEY_FILE=/etc/agent-pipeline/ship-authority.pem
-# Optional Buzz — leave unset for silent no-op notify:
+# Optional Buzz. Empty BUZZ_BIN is a silent no-op. Executable BUZZ_BIN
+# with missing channel or credentials is audited (not a silent success).
 # BUZZ_BIN BUZZ_RELAY_URL BUZZ_CHANNEL BUZZ_CREDENTIALS_FILE
 ```
 

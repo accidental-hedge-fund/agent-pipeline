@@ -42,7 +42,7 @@ Epic / hardening: #1096 (in-engine durable ship). #1001 / #971 do not ban this p
 | Phase sequence, wait CI / Release, failure detail, notify | **Pipeline ship ledger** (hosts notify from exact child-run identities) |
 | Detached process, logs, state dir | host (`nohup` + `PIPELINE_SUPERVISOR_STATE`) |
 | Material progress during train (optional) | shared `ship-stage-watch.sh` + `material-filter.mjs` |
-| Buzz delivery | shared `ship-notify.sh` (no-op without messenger env; best-effort with retry + audit) |
+| Buzz delivery | shared `ship-notify.sh` (silent no-op when `BUZZ_BIN` is empty; intended Buzz with missing credentials writes audit; best-effort with retry + audit) |
 
 GitHub and Pipeline run state remain authoritative. Tugboat does not implement
 a grant factory, durable outer ledger, or merge-from-advance.

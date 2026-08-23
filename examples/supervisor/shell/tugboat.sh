@@ -55,6 +55,17 @@
 #   ALLOW_MERGE            must be 1 for train --merge / release finish
 #   SHIP_NOTIFY            1 to post phase status (default 1)
 #   SHIP_NOTIFY_BIN        notify helper (default: sibling ship-notify.sh)
+#   BUZZ_BIN / BUZZ_CHANNEL / BUZZ_RELAY_URL / BUZZ_CREDENTIALS_FILE
+#                          optional Buzz messenger. Tugboat presents the
+#                          last three into ship-notify and stage-watch
+#                          from parent env or the supervisor env file
+#                          ($XDG_CONFIG_HOME/pipeline-supervisor/env or
+#                          $HOME/.config/pipeline-supervisor/env). It
+#                          does not source that whole file and does not
+#                          overwrite an operator-set value. Intended
+#                          Buzz (SHIP_NOTIFY=1 and executable BUZZ_BIN)
+#                          with missing credentials logs
+#                          "buzz credentials missing"; train continues.
 #   SHIP_STAGE_WATCH_BIN   optional per-issue stage posts during train.
 #                          Default: sibling ship-stage-watch.sh. Argv is
 #                          --events-file from this train's loop_run_handoff
@@ -1383,7 +1394,91 @@ log() {
   echo "$line" | tee -a "$LOG_FILE"
 }
 
+# Read the last KEY=VALUE (or export KEY=VALUE) from a supervisor env file.
+# Does not source the file. Does not expand $ or backticks. Strips one
+# matching pair of surrounding quotes. Nested braces are avoided so
+# extractNamedFn can copy this helper.
+read_supervisor_env_key() {
+  local file=$1
+  local want=$2
+  local line raw val found=0
+  [[ -f "$file" && -r "$file" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    if [[ "$line" == export[[:space:]]* ]]; then
+      line="${line#export}"
+      line="${line#"${line%%[![:space:]]*}"}"
+    fi
+    case "$line" in
+      "${want}="*)
+        raw="${line#"${want}="}"
+        found=1
+        val=$raw
+        ;;
+      *) continue ;;
+    esac
+  done < "$file"
+  [[ "$found" -eq 1 ]] || return 1
+  if [[ "$val" == \"*\" ]]; then
+    val="${val#\"}"
+    val="${val%\"}"
+  elif [[ "$val" == \'*\' ]]; then
+    val="${val#\'}"
+    val="${val%\'}"
+  fi
+  printf '%s' "$val"
+  return 0
+}
+
+# Fill unset Buzz vars from the supervisor env file. Do not source it.
+# Do not overwrite a non-empty parent/operator value. Do not touch REPO_DIR.
+present_unset_buzz_vars() {
+  local file key val
+  file=""
+  if [[ -n "${XDG_CONFIG_HOME:-}" && -f "$XDG_CONFIG_HOME/pipeline-supervisor/env" ]]; then
+    file="$XDG_CONFIG_HOME/pipeline-supervisor/env"
+  elif [[ -n "${HOME:-}" && -f "$HOME/.config/pipeline-supervisor/env" ]]; then
+    file="$HOME/.config/pipeline-supervisor/env"
+  else
+    return 0
+  fi
+  for key in BUZZ_CREDENTIALS_FILE BUZZ_RELAY_URL BUZZ_CHANNEL BUZZ_BIN; do
+    if [[ -n "${!key:-}" ]]; then
+      continue
+    fi
+    val=$(read_supervisor_env_key "$file" "$key") || continue
+    [[ -n "$val" ]] || continue
+    # Host env files document BUZZ_CREDENTIALS_FILE=~/.hermes/... Quoted
+    # later expansion does not perform tilde expansion, so rewrite only a
+    # leading ~/ to $HOME/. Do not eval the rest of the value. Offset 2
+    # avoids ${val#~/} whose pattern is itself tilde-expanded.
+    if [[ "$key" == "BUZZ_CREDENTIALS_FILE" && "$val" == "~/"* && -n "${HOME:-}" ]]; then
+      val="${HOME}/${val:2}"
+    fi
+    printf -v "$key" '%s' "$val"
+    export "$key"
+  done
+  return 0
+}
+
+warn_if_buzz_credentials_missing() {
+  [[ "${SHIP_NOTIFY:-1}" == "1" ]] || return 0
+  [[ -n "${BUZZ_BIN:-}" && -x "$BUZZ_BIN" ]] || return 0
+  if [[ -n "${BUZZ_CREDENTIALS_FILE:-}" && -f "$BUZZ_CREDENTIALS_FILE" && -r "$BUZZ_CREDENTIALS_FILE" ]]; then
+    return 0
+  fi
+  if [[ -n "${LOG_FILE:-}" ]]; then
+    log "buzz credentials missing"
+  else
+    printf '%s\n' "buzz credentials missing" >&2 || true
+  fi
+  return 0
+}
+
 notify() {
+  present_unset_buzz_vars
+  warn_if_buzz_credentials_missing
   [[ "$SHIP_NOTIFY" == "1" ]] || return 0
   [[ -x "$SHIP_NOTIFY_BIN" ]] || return 0
   "$SHIP_NOTIFY_BIN" "$@" || true
@@ -2464,6 +2559,8 @@ start_train_stage_watch() {
   local events=$1
   local version=$2
   local watch_pid filter
+  present_unset_buzz_vars
+  warn_if_buzz_credentials_missing
   if [[ "$events" != /* ]]; then
     log "events path is not absolute"
     return 0
@@ -2477,6 +2574,9 @@ start_train_stage_watch() {
     REPO_DIR="$REPO_DIR" SHIP_NOTIFY_BIN="$SHIP_NOTIFY_BIN" \
     PIPELINE_SUPERVISOR_STATE="$STATE_ROOT" \
     PIPELINE_MATERIAL_FILTER="$filter" \
+    BUZZ_CREDENTIALS_FILE="${BUZZ_CREDENTIALS_FILE:-}" \
+    BUZZ_RELAY_URL="${BUZZ_RELAY_URL:-}" \
+    BUZZ_CHANNEL="${BUZZ_CHANNEL:-}" \
     "$SHIP_STAGE_WATCH_BIN" \
     --events-file "$events" \
     --label "ship v$version" \
