@@ -798,7 +798,10 @@ test("getPrDiff: omitted modified text materializes a replacement hunk (#1223)",
       };
     }
     if (args[0] === "api" && args[1] === "repos/acme/widget/pulls/14") {
-      return { stdout: JSON.stringify({ base: { sha: "basesha" } }) };
+      return { stdout: JSON.stringify({ base: { sha: "basesha" }, head: { sha: "headsha" } }) };
+    }
+    if (args[0] === "api" && args[1] === "repos/acme/widget/compare/basesha...headsha") {
+      return { stdout: JSON.stringify({ merge_base_commit: { sha: "basesha" } }) };
     }
     if (args[0] === "api" && typeof args[1] === "string" && args[1].startsWith("repos/acme/widget/contents/src/changed.ts")) {
       return { stdout: JSON.stringify({ sha: "oldblob" }) };
@@ -815,5 +818,69 @@ test("getPrDiff: omitted modified text materializes a replacement hunk (#1223)",
   assert.ok(result.includes("diff --git a/src/changed.ts b/src/changed.ts"));
   assert.ok(result.includes("-old line"));
   assert.ok(result.includes("+new line"));
+  assert.ok(calls.every((args) => args[0] !== "git"));
+});
+
+test("getPrDiff: omitted modified hunk uses merge-base, not base tip (#1223)", async () => {
+  const cfg = { repo: "acme/widget" } as PipelineConfig;
+  const calls: string[][] = [];
+  const runner = async (args: string[]) => {
+    calls.push(args);
+    if (isPrDiffArgs(args)) throwGh(LIVE_PR_DIFF_TOO_LARGE_STDERR);
+    if (isFilesListArgs(args)) {
+      return {
+        stdout: JSON.stringify([[
+          {
+            filename: "src/changed.ts",
+            status: "modified",
+            sha: "newblob",
+            additions: 1,
+            deletions: 1,
+            changes: 2,
+          },
+        ]]),
+      };
+    }
+    if (args[0] === "api" && args[1] === "repos/acme/widget/pulls/17") {
+      return {
+        stdout: JSON.stringify({
+          base: { sha: "basetip" },
+          head: { sha: "prhead" },
+        }),
+      };
+    }
+    if (args[0] === "api" && args[1] === "repos/acme/widget/compare/basetip...prhead") {
+      return { stdout: JSON.stringify({ merge_base_commit: { sha: "mergebase" } }) };
+    }
+    if (args[0] === "api" && args[1] === "repos/acme/widget/contents/src/changed.ts?ref=mergebase") {
+      return { stdout: JSON.stringify({ sha: "mergeblob" }) };
+    }
+    if (args[0] === "api" && args[1] === "repos/acme/widget/contents/src/changed.ts?ref=basetip") {
+      return { stdout: JSON.stringify({ sha: "tipblob" }) };
+    }
+    if (args[0] === "api" && args[1] === "repos/acme/widget/git/blobs/newblob") {
+      return { stdout: blobStdout("from-pr-head\n") };
+    }
+    if (args[0] === "api" && args[1] === "repos/acme/widget/git/blobs/mergeblob") {
+      return { stdout: blobStdout("from-merge-base\n") };
+    }
+    if (args[0] === "api" && args[1] === "repos/acme/widget/git/blobs/tipblob") {
+      return { stdout: blobStdout("from-base-tip\n") };
+    }
+    throw new Error(`unexpected gh args: ${args.join(" ")}`);
+  };
+  const result = await getPrDiff(cfg, 17, { runner, retries: 1 });
+  assert.ok(result.includes("-from-merge-base"), "old side must be the merge-base blob");
+  assert.ok(result.includes("+from-pr-head"), "new side must be the files-list blob");
+  assert.equal(result.includes("from-base-tip"), false, "base-tip blob must not appear in the hunk");
+  const contentsCalls = calls.filter(
+    (args) => args[0] === "api" && typeof args[1] === "string" && args[1].includes("/contents/"),
+  );
+  assert.equal(contentsCalls.length, 1);
+  assert.equal(contentsCalls[0][1], "repos/acme/widget/contents/src/changed.ts?ref=mergebase");
+  assert.ok(
+    calls.some((args) => args[0] === "api" && args[1] === "repos/acme/widget/compare/basetip...prhead"),
+    "merge-base must come from compare of captured base/head SHAs",
+  );
   assert.ok(calls.every((args) => args[0] !== "git"));
 });

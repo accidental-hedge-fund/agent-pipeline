@@ -851,11 +851,11 @@ async function fetchGitBlob(
   return decodeGitBlob(parsed, path, prNumber);
 }
 
-async function fetchPrBaseSha(
+async function fetchPrRevision(
   cfg: PipelineConfig,
   prNumber: number,
   opts: GhRunOptions | undefined,
-): Promise<string> {
+): Promise<{ baseSha: string; headSha: string }> {
   let stdout: string;
   try {
     stdout = await ghRun(
@@ -864,7 +864,7 @@ async function fetchPrBaseSha(
     );
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    throw new Error(`getPrDiff: failed to read PR #${prNumber} base SHA: ${msg}`);
+    throw new Error(`getPrDiff: failed to read PR #${prNumber} revision: ${msg}`);
   }
   let parsed: unknown;
   try {
@@ -872,11 +872,59 @@ async function fetchPrBaseSha(
   } catch {
     throw new Error(`getPrDiff: invalid PR JSON for PR #${prNumber}`);
   }
-  const sha = (parsed as { base?: { sha?: unknown } } | null)?.base?.sha;
-  if (typeof sha !== "string" || sha.length === 0) {
+  const obj = parsed as { base?: { sha?: unknown }; head?: { sha?: unknown } } | null;
+  const baseSha = obj?.base?.sha;
+  const headSha = obj?.head?.sha;
+  if (typeof baseSha !== "string" || baseSha.length === 0) {
     throw new Error(`getPrDiff: PR #${prNumber} has no base SHA`);
   }
+  if (typeof headSha !== "string" || headSha.length === 0) {
+    throw new Error(`getPrDiff: PR #${prNumber} has no head SHA`);
+  }
+  return { baseSha, headSha };
+}
+
+async function fetchCompareMergeBaseSha(
+  cfg: PipelineConfig,
+  baseSha: string,
+  headSha: string,
+  prNumber: number,
+  opts: GhRunOptions | undefined,
+): Promise<string> {
+  let stdout: string;
+  try {
+    stdout = await ghRun(
+      ["api", `repos/${cfg.repo}/compare/${baseSha}...${headSha}`],
+      prDiffRunOpts(opts, {}),
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `getPrDiff: failed to read PR #${prNumber} compare merge-base: ${msg}`,
+    );
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    throw new Error(`getPrDiff: invalid compare JSON for PR #${prNumber}`);
+  }
+  const sha = (parsed as { merge_base_commit?: { sha?: unknown } } | null)
+    ?.merge_base_commit?.sha;
+  if (typeof sha !== "string" || sha.length === 0) {
+    throw new Error(`getPrDiff: PR #${prNumber} compare has no merge-base SHA`);
+  }
   return sha;
+}
+
+/** Old-blob ref for omitted modified/renamed patches: three-dot merge-base, not the moving base tip. */
+async function fetchPrMergeBaseSha(
+  cfg: PipelineConfig,
+  prNumber: number,
+  opts: GhRunOptions | undefined,
+): Promise<string> {
+  const { baseSha, headSha } = await fetchPrRevision(cfg, prNumber, opts);
+  return fetchCompareMergeBaseSha(cfg, baseSha, headSha, prNumber, opts);
 }
 
 async function fetchContentsBlobSha(
@@ -919,7 +967,7 @@ async function materializeOmittedTextPatch(
   fromPath: string,
   toPath: string,
   opts: GhRunOptions | undefined,
-  getBaseSha: () => Promise<string>,
+  getMergeBaseSha: () => Promise<string>,
 ): Promise<string> {
   const sha = typeof entry.sha === "string" ? entry.sha : "";
   if (!sha) {
@@ -939,8 +987,8 @@ async function materializeOmittedTextPatch(
     return unifiedAddPatch(fromPath, toPath, decoded.text);
   }
   const newDecoded = await fetchGitBlob(cfg, sha, toPath, prNumber, opts);
-  const baseSha = await getBaseSha();
-  const oldSha = await fetchContentsBlobSha(cfg, fromPath, baseSha, prNumber, opts);
+  const mergeBaseSha = await getMergeBaseSha();
+  const oldSha = await fetchContentsBlobSha(cfg, fromPath, mergeBaseSha, prNumber, opts);
   const oldDecoded = await fetchGitBlob(cfg, oldSha, fromPath, prNumber, opts);
   if (newDecoded.kind === "binary" || oldDecoded.kind === "binary") {
     return binaryDifferLine(fromPath, toPath);
@@ -976,11 +1024,11 @@ async function composePrDiffFromFilesList(
     );
   }
 
-  let cachedBaseSha: string | undefined;
-  const getBaseSha = async (): Promise<string> => {
-    if (cachedBaseSha) return cachedBaseSha;
-    cachedBaseSha = await fetchPrBaseSha(cfg, prNumber, opts);
-    return cachedBaseSha;
+  let cachedMergeBaseSha: string | undefined;
+  const getMergeBaseSha = async (): Promise<string> => {
+    if (cachedMergeBaseSha) return cachedMergeBaseSha;
+    cachedMergeBaseSha = await fetchPrMergeBaseSha(cfg, prNumber, opts);
+    return cachedMergeBaseSha;
   };
 
   const blocks: string[] = [];
@@ -1004,7 +1052,7 @@ async function composePrDiffFromFilesList(
       fromPath,
       toPath,
       opts,
-      getBaseSha,
+      getMergeBaseSha,
     );
     blocks.push(`${header}\n${materialized}`);
   }
