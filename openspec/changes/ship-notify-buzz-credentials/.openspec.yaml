@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-08-23
+goal: "Issue #1221: ship-notify must audit when Buzz is intended but credentials
+  are missing; Tugboat must present Buzz vars to notify children"
