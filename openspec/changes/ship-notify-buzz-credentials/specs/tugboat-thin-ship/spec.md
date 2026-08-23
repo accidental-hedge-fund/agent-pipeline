@@ -2,7 +2,7 @@
 
 ### Requirement: Tugboat SHALL present Buzz credential vars into notify and stage-watch
 
-Tugboat SHALL present `BUZZ_CREDENTIALS_FILE`, `BUZZ_RELAY_URL`, and `BUZZ_CHANNEL` into `ship-notify` and into the bundled stage-watch child when those values are set on the parent process or on the supervisor env file (`$XDG_CONFIG_HOME/pipeline-supervisor/env` or `$HOME/.config/pipeline-supervisor/env`). Tugboat SHALL NOT overwrite a non-empty operator-set or parent value. Tugboat SHALL NOT `source` the whole supervisor env file. Watch spawn SHALL pass those Buzz vars on the spawn `env` line the same way it already passes `PIPELINE_MATERIAL_FILTER`. Existing `--events-file` argv, live-handoff binding, sibling default `SHIP_STAGE_WATCH_BIN`, and material-filter presentation SHALL remain in force.
+Tugboat SHALL present `BUZZ_CREDENTIALS_FILE`, `BUZZ_RELAY_URL`, and `BUZZ_CHANNEL` into `ship-notify` and into the bundled stage-watch child when those values are set on the parent process or on the supervisor env file (`$XDG_CONFIG_HOME/pipeline-supervisor/env` or `$HOME/.config/pipeline-supervisor/env`). When a supervisor-env `BUZZ_CREDENTIALS_FILE` value begins with `~/`, Tugboat SHALL expand that prefix to `$HOME/` without sourcing or evaluating the rest of the file, and SHALL present the expanded path rather than the literal `~/` prefix. Tugboat SHALL NOT overwrite a non-empty operator-set or parent value. Tugboat SHALL NOT `source` the whole supervisor env file. Watch spawn SHALL pass those Buzz vars on the spawn `env` line the same way it already passes `PIPELINE_MATERIAL_FILTER`. Existing `--events-file` argv, live-handoff binding, sibling default `SHIP_STAGE_WATCH_BIN`, and material-filter presentation SHALL remain in force.
 
 #### Scenario: Watch spawn env includes parent credentials file
 
@@ -19,6 +19,16 @@ Tugboat SHALL present `BUZZ_CREDENTIALS_FILE`, `BUZZ_RELAY_URL`, and `BUZZ_CHANN
 - **THEN** Tugboat SHALL present that path to `ship-notify` and to the stage-watch child
 - **AND** it SHALL NOT `source` the whole supervisor env file
 - **AND** it SHALL NOT change `REPO_DIR` from that file
+
+#### Scenario: Unset parent expands a leading-home supervisor-env credentials path
+
+- **WHEN** Tugboat starts a ship
+- **AND** `BUZZ_CREDENTIALS_FILE` is unset in the parent process
+- **AND** the supervisor env file sets `BUZZ_CREDENTIALS_FILE` to a path that begins with `~/`
+- **AND** `$HOME` plus the remainder of that path is a readable file
+- **THEN** Tugboat SHALL present the expanded `$HOME/` path to `ship-notify` and to the stage-watch child
+- **AND** it SHALL NOT present the literal `~/` prefix
+- **AND** it SHALL NOT `source` the whole supervisor env file
 
 #### Scenario: Operator-set Buzz vars are preserved
 
@@ -51,7 +61,7 @@ If `SHIP_NOTIFY` is `1` and `BUZZ_BIN` is executable and `BUZZ_CREDENTIALS_FILE`
 
 ### Requirement: Tugboat Buzz-var watch spawn env SHALL be regression-tested
 
-Automated checks SHALL fail if Tugboat’s train-phase stage-watch spawn environment omits `BUZZ_CREDENTIALS_FILE` when the parent process has that var set to a readable file. Those checks SHALL pass when the parent value is preserved on the spawn `env` line. Tests SHALL inspect Tugboat spawn env (and MAY extract helpers). Tests SHALL NOT start a live train, live messenger, or live ship.
+Automated checks SHALL fail if Tugboat’s train-phase stage-watch spawn environment omits `BUZZ_CREDENTIALS_FILE` when the parent process has that var set to a readable file. Those checks SHALL pass when the parent value is preserved on the spawn `env` line. Automated checks SHALL fail if a supervisor-env `BUZZ_CREDENTIALS_FILE=~/...` value is presented literally instead of as the expanded `$HOME/` path. Tests SHALL inspect Tugboat spawn env (and MAY extract helpers). Tests SHALL NOT start a live train, live messenger, or live ship.
 
 #### Scenario: Regression fails if watch spawn omits parent credentials file
 
@@ -66,3 +76,11 @@ Automated checks SHALL fail if Tugboat’s train-phase stage-watch spawn environ
 - **AND** the parent has `BUZZ_CREDENTIALS_FILE` set to a readable file
 - **AND** the spawn environment includes that same path
 - **THEN** the checks SHALL pass
+
+#### Scenario: Regression fails if a leading-home supervisor-env credentials path is passed literally
+
+- **WHEN** the automated checks run against a Tugboat train watch spawn
+- **AND** the parent has `BUZZ_CREDENTIALS_FILE` unset
+- **AND** the supervisor env file sets `BUZZ_CREDENTIALS_FILE` to a `~/...` path whose `$HOME/` expansion is a readable file
+- **AND** the spawn environment has the literal `~/` path or omits the expanded `$HOME/` path
+- **THEN** the checks SHALL fail

@@ -1362,6 +1362,79 @@ test("tugboat fills unset Buzz vars from supervisor env file without sourcing (#
   }
 });
 
+test("tugboat expands leading-home supervisor-env BUZZ_CREDENTIALS_FILE (#1221)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-buzz-tilde-"));
+  try {
+    const { home, codexHome, runnerEnv: baseEnv } = isolatedFilterHomes(dir);
+    const runnerEnv = withoutHostBuzzEnv(baseEnv);
+    const filterPath = path.join(
+      codexHome,
+      "skills",
+      "pipeline",
+      "scripts",
+      "material-filter.mjs",
+    );
+    writeStubFilter(filterPath);
+    const credsRel = ".hermes/profiles/pipeline-factory/buzz-credentials.json";
+    const creds = path.join(home, credsRel);
+    fs.mkdirSync(path.dirname(creds), { recursive: true });
+    fs.writeFileSync(creds, JSON.stringify({ nsec: "nsec1fixture-not-real" }));
+    const envDir = path.join(home, ".config", "pipeline-supervisor");
+    fs.mkdirSync(envDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(envDir, "env"),
+      `BUZZ_CREDENTIALS_FILE=~/${credsRel}\n`,
+    );
+    const events = path.join(dir, "events.jsonl");
+    fs.writeFileSync(events, "");
+    const logFile = path.join(dir, "playbook.log");
+    const pidFile = path.join(dir, "stage-watch.pid");
+    const envCredsFile = path.join(dir, "spawn.creds");
+    const fakeWatch = path.join(dir, "fake-watch");
+    writeFakeWatchEnvDump(fakeWatch, { BUZZ_CREDENTIALS_FILE: envCredsFile });
+    const src = fs.readFileSync(tugboat, "utf8");
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        "unset BUZZ_CREDENTIALS_FILE BUZZ_RELAY_URL BUZZ_CHANNEL BUZZ_BIN XDG_CONFIG_HOME",
+        `HOME=${JSON.stringify(home)}`,
+        `CODEX_HOME=${JSON.stringify(codexHome)}`,
+        "export HOME CODEX_HOME",
+        `LOG_FILE=${JSON.stringify(logFile)}`,
+        "log() { echo \"$*\" | tee -a \"$LOG_FILE\"; }",
+        `RUN_DIR=${JSON.stringify(dir)}`,
+        `STAGE_WATCH_PID_FILE=${JSON.stringify(pidFile)}`,
+        `SHIP_STAGE_WATCH_BIN=${JSON.stringify(fakeWatch)}`,
+        `STATE_ROOT=${JSON.stringify(dir)}`,
+        `REPO_DIR=${JSON.stringify(dir)}`,
+        "SHIP_NOTIFY=1",
+        "SHIP_NOTIFY_BIN=/bin/true",
+        extractTrainWatchHelpers(src),
+        `start_train_stage_watch ${JSON.stringify(events)} "1.40.0"`,
+        "echo TRAIN_CONTINUED",
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    const r = spawnSync("bash", [runner], {
+      encoding: "utf8",
+      timeout: 10000,
+      env: runnerEnv,
+    });
+    killPidFile(pidFile);
+    assert.equal(r.status, 0, `fixture exited ${r.status}: ${r.stdout}\n${r.stderr}`);
+    assert.equal(fs.readFileSync(envCredsFile, "utf8").trim(), creds);
+    assert.notEqual(fs.readFileSync(envCredsFile, "utf8").trim(), `~/${credsRel}`);
+    assert.match(r.stdout, /TRAIN_CONTINUED/);
+  } finally {
+    killPidFile(path.join(dir, "stage-watch.pid"));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("tugboat preserves operator-set BUZZ_CREDENTIALS_FILE over supervisor env file (#1221)", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-buzz-operator-"));
   try {

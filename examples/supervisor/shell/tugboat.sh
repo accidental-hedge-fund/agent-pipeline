@@ -1449,6 +1449,13 @@ present_unset_buzz_vars() {
     fi
     val=$(read_supervisor_env_key "$file" "$key") || continue
     [[ -n "$val" ]] || continue
+    # Host env files document BUZZ_CREDENTIALS_FILE=~/.hermes/... Quoted
+    # later expansion does not perform tilde expansion, so rewrite only a
+    # leading ~/ to $HOME/. Do not eval the rest of the value. Offset 2
+    # avoids ${val#~/} whose pattern is itself tilde-expanded.
+    if [[ "$key" == "BUZZ_CREDENTIALS_FILE" && "$val" == "~/"* && -n "${HOME:-}" ]]; then
+      val="${HOME}/${val:2}"
+    fi
     printf -v "$key" '%s' "$val"
     export "$key"
   done

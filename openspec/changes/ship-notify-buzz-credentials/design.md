@@ -49,7 +49,7 @@ See `proposal.md` for why. Current law and code:
 
 ### 2. Fill unset Buzz vars from the supervisor env file; do not source the whole file
 
-**Choice:** When Tugboat starts (and before notify/watch), if `BUZZ_CREDENTIALS_FILE`, `BUZZ_RELAY_URL`, or `BUZZ_CHANNEL` is unset or empty in the process, Tugboat SHALL read that key from the supervisor env file (`$XDG_CONFIG_HOME/pipeline-supervisor/env` or `$HOME/.config/pipeline-supervisor/env`) and export it. Tugboat SHALL NOT overwrite a non-empty operator/parent value. Tugboat SHALL NOT `source` the whole file. Parse only those keys (and MAY also fill unset `BUZZ_BIN` the same way). Do not eval unquoted values beyond `KEY=VALUE` assignment.
+**Choice:** When Tugboat starts (and before notify/watch), if `BUZZ_CREDENTIALS_FILE`, `BUZZ_RELAY_URL`, or `BUZZ_CHANNEL` is unset or empty in the process, Tugboat SHALL read that key from the supervisor env file (`$XDG_CONFIG_HOME/pipeline-supervisor/env` or `$HOME/.config/pipeline-supervisor/env`) and export it. Tugboat SHALL NOT overwrite a non-empty operator/parent value. Tugboat SHALL NOT `source` the whole file. Parse only those keys (and MAY also fill unset `BUZZ_BIN` the same way). Do not eval unquoted values beyond `KEY=VALUE` assignment. A leading `~/` on supervisor-env `BUZZ_CREDENTIALS_FILE` SHALL be rewritten to `$HOME/` as a prefix substitution only (quoted later expansion does not tilde-expand).
 
 **Why:** Hermes started the ship without that file path. Tugboat never sourced it. A catch-up that sourced the file delivered immediately. Sourcing the whole file can change `REPO_DIR` after pin (forbidden) or change `ALLOW_MERGE` / `PIPELINE`. Filling only Buzz keys is the surgical class fix. Parent/operator values still win.
 

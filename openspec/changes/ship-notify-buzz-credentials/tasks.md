@@ -17,6 +17,7 @@
 - [x] 3.2 Pass `BUZZ_CREDENTIALS_FILE`, `BUZZ_RELAY_URL`, and `BUZZ_CHANNEL` on the `start_train_stage_watch` `env` line the same way `PIPELINE_MATERIAL_FILTER` is already passed. `notify()` inherits process env after the fill. Verify task 1.3 now passes
 - [x] 3.3 When `SHIP_NOTIFY=1` and `BUZZ_BIN` is executable and credentials cannot be resolved, log `buzz credentials missing` (or equivalent). Do not fail train/ship. Do not log that line when `BUZZ_BIN` is empty. Verify task 1.4 now passes
 - [x] 3.4 Align `examples/supervisor/hermes/env.example` (and any supervisor comment that still says ship-notify no-ops if Buzz vars are unset) to the intended-Buzz audit split. Verify the template still documents `BUZZ_CREDENTIALS_FILE`, `BUZZ_RELAY_URL`, and `BUZZ_CHANNEL`
+- [x] 3.5 Expand a leading `~/` on supervisor-env `BUZZ_CREDENTIALS_FILE` to `$HOME/` without sourcing the file. Add a regression test whose env file uses `BUZZ_CREDENTIALS_FILE=~/.hermes/profiles/...`. Verify the spawn env has the expanded `$HOME/` path and not the literal `~/`
 
 ## 4. Gate
 
