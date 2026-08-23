@@ -8,6 +8,7 @@ import {
   ghChildEnv,
   isGithubAuthOrPermissionError,
   isHttp404Signal,
+  isPrDiffTooLargeError,
   isTransientGhError,
   shouldTreatContents404AsEmpty,
 } from "../scripts/gh.ts";
@@ -259,9 +260,10 @@ test("isTransientGhError: HTTP 403 without rate-limit body is deterministic", ()
 // This is added in gh.ts for this test module. If it's not present, the tests
 // below will fail at import time (proving the bite).
 
-import { getPrChecks, ghRunForTest, postComment } from "../scripts/gh.ts";
+import { getPrChecks, getPrDiff, ghRunForTest, postComment } from "../scripts/gh.ts";
 import type { GhRunOptions } from "../scripts/gh.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
+import { diffFilePaths } from "../scripts/stages/review-parsing.ts";
 
 test("ghRun retry loop: transient 401 fails once then succeeds → returns successfully, 2 invocations", async () => {
   let calls = 0;
@@ -446,4 +448,372 @@ test("getPrChecks: successful JSON stdout parses check runs (#882)", async () =>
   assert.equal(result.length, 1);
   assert.equal(result[0].name, "test");
   assert.equal(result[0].bucket, "pass");
+});
+
+// ---------------------------------------------------------------------------
+// getPrDiff — 406 / too-large files-API fallback (#1223)
+// ---------------------------------------------------------------------------
+
+const LIVE_PR_DIFF_TOO_LARGE_STDERR =
+  "could not find pull request diff: HTTP 406: Sorry, the diff exceeded the maximum number of files (300). Consider using 'List pull requests files' API or locally cloning the repository instead. (https://api.github.com/repos/accidental-hedge-fund/agent-pipeline/pulls/1222)\nPullRequest.diff too_large";
+
+const SMALL_PR_DIFF = "diff --git a/src/a.ts b/src/a.ts\n@@ -1 +1 @@\n-old\n+new\n";
+
+function throwGh(stderr: string): never {
+  const err = new Error("gh failed") as Error & { stderr: string };
+  err.stderr = stderr;
+  throw err;
+}
+
+function blobStdout(text: string): string {
+  const b64 = Buffer.from(text, "utf8").toString("base64");
+  const wrapped = b64.match(/.{1,60}/g)?.join("\n") ?? b64;
+  return JSON.stringify({ content: wrapped, encoding: "base64", size: text.length });
+}
+
+function isPrDiffArgs(args: string[]): boolean {
+  return args[0] === "pr" && args[1] === "diff";
+}
+
+function isFilesListArgs(args: string[]): boolean {
+  return args[0] === "api" && typeof args[1] === "string" && args[1].includes("/files");
+}
+
+test("isPrDiffTooLargeError: live PR #1222 stderr, status syntax, and wording (#1223)", () => {
+  assert.equal(isPrDiffTooLargeError(LIVE_PR_DIFF_TOO_LARGE_STDERR), true);
+  assert.equal(isPrDiffTooLargeError("non-200 OK status code: 406"), true);
+  assert.equal(isPrDiffTooLargeError("status code 406"), true);
+  assert.equal(
+    isPrDiffTooLargeError("gh: the diff is too large; use the files API"),
+    true,
+  );
+  assert.equal(isPrDiffTooLargeError("PullRequest.diff too_large"), true);
+  assert.equal(isTransientGhError(LIVE_PR_DIFF_TOO_LARGE_STDERR), false);
+});
+
+test("isPrDiffTooLargeError: bare 406 / SHA fragment / 404 are not too-large (#1223)", () => {
+  assert.equal(isPrDiffTooLargeError("406"), false);
+  assert.equal(isPrDiffTooLargeError("error: 406 Not Found"), false);
+  assert.equal(isPrDiffTooLargeError("a406bcafe"), false);
+  assert.equal(isPrDiffTooLargeError("HTTP 404: Not Found"), false);
+  assert.equal(
+    isPrDiffTooLargeError("HTTP 500: Internal Server Error ref=a406bcafe"),
+    false,
+  );
+});
+
+test("getPrDiff: HTTP 406 falls back to files-list composed diff (#1223)", async () => {
+  const cfg = { repo: "acme/widget" } as PipelineConfig;
+  const calls: string[][] = [];
+  const patch = "@@ -1,1 +1,1 @@\n-old\n+new\n";
+  const runner = async (args: string[]) => {
+    calls.push(args);
+    if (isPrDiffArgs(args)) throwGh(LIVE_PR_DIFF_TOO_LARGE_STDERR);
+    if (isFilesListArgs(args)) {
+      return {
+        stdout: JSON.stringify([
+          [
+            { filename: "src/a.ts", status: "modified", sha: "aaa", additions: 1, deletions: 1, changes: 2, patch },
+            { filename: "bin/empty.dat", status: "modified", sha: "bbb", additions: 0, deletions: 0, changes: 0 },
+          ],
+        ]),
+      };
+    }
+    throw new Error(`unexpected gh args: ${args.join(" ")}`);
+  };
+
+  const result = await getPrDiff(cfg, 1222, { runner, retries: 1 });
+  assert.match(result, /^diff --git a\/src\/a\.ts b\/src\/a\.ts/m);
+  assert.match(result, /^diff --git a\/bin\/empty\.dat b\/bin\/empty\.dat/m);
+  assert.ok(result.includes(patch.trim()), "supplied patch text must appear under its header");
+  assert.equal(calls.filter(isPrDiffArgs).length, 1, "pr diff must run once (406 is not retried)");
+  const filesCall = calls.find(isFilesListArgs);
+  assert.ok(filesCall, "files API must be called after 406");
+  assert.equal(filesCall![1], "repos/acme/widget/pulls/1222/files?per_page=100");
+  assert.ok(filesCall!.includes("--paginate"));
+  assert.ok(filesCall!.includes("--slurp"));
+  assert.ok(calls.every((args) => args[0] !== "git"), "fallback must not invoke local git");
+  assert.deepEqual(diffFilePaths(result).sort(), ["bin/empty.dat", "src/a.ts"]);
+});
+
+test("getPrDiff: small unified diff uses the fast path only (#1223)", async () => {
+  const cfg = { repo: "acme/widget" } as PipelineConfig;
+  const calls: string[][] = [];
+  const runner = async (args: string[]) => {
+    calls.push(args);
+    if (isPrDiffArgs(args)) return { stdout: SMALL_PR_DIFF };
+    throw new Error(`unexpected gh args: ${args.join(" ")}`);
+  };
+  const result = await getPrDiff(cfg, 42, { runner, retries: 1 });
+  assert.equal(result, SMALL_PR_DIFF);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0], ["pr", "diff", "42", "-R", "acme/widget"]);
+  assert.equal(calls.filter(isFilesListArgs).length, 0);
+});
+
+test("getPrDiff: HTTP 404 still throws and does not call the files list (#1223)", async () => {
+  const cfg = { repo: "acme/widget" } as PipelineConfig;
+  const calls: string[][] = [];
+  const runner = async (args: string[]) => {
+    calls.push(args);
+    if (isPrDiffArgs(args)) throwGh("HTTP 404: Not Found");
+    throw new Error(`unexpected gh args: ${args.join(" ")}`);
+  };
+  await assert.rejects(() => getPrDiff(cfg, 99, { runner, retries: 1 }), /404/);
+  assert.equal(calls.filter(isPrDiffArgs).length, 1);
+  assert.equal(calls.filter(isFilesListArgs).length, 0);
+});
+
+test("getPrDiff: SHA fragment 406 is not too-large and does not hit files API (#1223)", async () => {
+  const cfg = { repo: "acme/widget" } as PipelineConfig;
+  const calls: string[][] = [];
+  const runner = async (args: string[]) => {
+    calls.push(args);
+    if (isPrDiffArgs(args)) throwGh("HTTP 500: Internal Server Error ref=a406bcafe");
+    throw new Error(`unexpected gh args: ${args.join(" ")}`);
+  };
+  assert.equal(isPrDiffTooLargeError("HTTP 500: Internal Server Error ref=a406bcafe"), false);
+  await assert.rejects(() => getPrDiff(cfg, 7, { runner, retries: 1 }), /a406bcafe/);
+  assert.equal(calls.filter(isFilesListArgs).length, 0);
+});
+
+test("getPrDiff: patch-less binary/zero-change file still emits a path header (#1223)", async () => {
+  const cfg = { repo: "acme/widget" } as PipelineConfig;
+  const runner = async (args: string[]) => {
+    if (isPrDiffArgs(args)) throwGh(LIVE_PR_DIFF_TOO_LARGE_STDERR);
+    if (isFilesListArgs(args)) {
+      return {
+        stdout: JSON.stringify([[
+          { filename: "bin/app.bin", status: "modified", sha: "ccc", additions: 0, deletions: 0, changes: 0 },
+        ]]),
+      };
+    }
+    throw new Error(`unexpected gh args: ${args.join(" ")}`);
+  };
+  const result = await getPrDiff(cfg, 8, { runner, retries: 1 });
+  assert.match(result, /^diff --git a\/bin\/app\.bin b\/bin\/app\.bin/m);
+  assert.deepEqual(diffFilePaths(result), ["bin/app.bin"]);
+});
+
+test("getPrDiff: omitted removed text is materialized from the git blob (#1223)", async () => {
+  const cfg = { repo: "acme/widget" } as PipelineConfig;
+  const calls: string[][] = [];
+  const sourceLine = "export const DEFAULT_TIMEOUT_MS = 30_000;";
+  const runner = async (args: string[]) => {
+    calls.push(args);
+    if (isPrDiffArgs(args)) throwGh(LIVE_PR_DIFF_TOO_LARGE_STDERR);
+    if (isFilesListArgs(args)) {
+      return {
+        stdout: JSON.stringify([[
+          {
+            filename: "src/big.ts",
+            status: "removed",
+            sha: "deletedblob",
+            additions: 0,
+            deletions: 12,
+            changes: 12,
+          },
+        ]]),
+      };
+    }
+    if (args[0] === "api" && args[1] === "repos/acme/widget/git/blobs/deletedblob") {
+      return { stdout: blobStdout(`${sourceLine}\n`) };
+    }
+    throw new Error(`unexpected gh args: ${args.join(" ")}`);
+  };
+  const result = await getPrDiff(cfg, 1222, { runner, retries: 1 });
+  assert.match(result, /^diff --git a\/src\/big\.ts b\/src\/big\.ts/m);
+  assert.ok(result.includes(`-${sourceLine}`), "deleted source must appear as a unified-diff minus line");
+  assert.ok(calls.every((args) => args[0] !== "git"), "materialization must not invoke local git");
+  assert.equal(calls.filter(isPrDiffArgs).length, 1);
+});
+
+test("getPrDiff: omitted text blob failure throws naming the path (#1223)", async () => {
+  const cfg = { repo: "acme/widget" } as PipelineConfig;
+  const runner = async (args: string[]) => {
+    if (isPrDiffArgs(args)) throwGh(LIVE_PR_DIFF_TOO_LARGE_STDERR);
+    if (isFilesListArgs(args)) {
+      return {
+        stdout: JSON.stringify([[
+          { filename: "src/big.ts", status: "removed", sha: "deletedblob", additions: 0, deletions: 8, changes: 8 },
+        ]]),
+      };
+    }
+    if (args[0] === "api" && typeof args[1] === "string" && args[1].includes("/git/blobs/")) {
+      throwGh("HTTP 404: Not Found");
+    }
+    throw new Error(`unexpected gh args: ${args.join(" ")}`);
+  };
+  await assert.rejects(
+    () => getPrDiff(cfg, 1222, { runner, retries: 1 }),
+    /src\/big\.ts/,
+  );
+});
+
+test("getPrDiff: flattened list of 3000 files throws the files-list cap (#1223)", async () => {
+  const cfg = { repo: "acme/widget" } as PipelineConfig;
+  const runner = async (args: string[]) => {
+    if (isPrDiffArgs(args)) throwGh(LIVE_PR_DIFF_TOO_LARGE_STDERR);
+    if (isFilesListArgs(args)) {
+      const files = Array.from({ length: 3000 }, (_, i) => ({ filename: `f${i}.ts` }));
+      return { stdout: JSON.stringify([files]) };
+    }
+    throw new Error(`unexpected gh args: ${args.join(" ")}`);
+  };
+  await assert.rejects(
+    () => getPrDiff(cfg, 9, { runner, retries: 1 }),
+    /3000/,
+  );
+});
+
+test("getPrDiff: multi-page slurp flatten includes every file header (#1223)", async () => {
+  const cfg = { repo: "acme/widget" } as PipelineConfig;
+  const runner = async (args: string[]) => {
+    if (isPrDiffArgs(args)) throwGh(LIVE_PR_DIFF_TOO_LARGE_STDERR);
+    if (isFilesListArgs(args)) {
+      return {
+        stdout: JSON.stringify([
+          [{ filename: "src/a.ts", status: "modified", sha: "a", additions: 1, deletions: 0, changes: 1, patch: "@@ -0,0 +1 @@\n+a\n" }],
+          [{ filename: "src/b.ts", status: "modified", sha: "b", additions: 1, deletions: 0, changes: 1, patch: "@@ -0,0 +1 @@\n+b\n" }],
+        ]),
+      };
+    }
+    throw new Error(`unexpected gh args: ${args.join(" ")}`);
+  };
+  const result = await getPrDiff(cfg, 10, { runner, retries: 1 });
+  assert.ok(result.includes("diff --git a/src/a.ts b/src/a.ts"));
+  assert.ok(result.includes("diff --git a/src/b.ts b/src/b.ts"));
+  assert.deepEqual(diffFilePaths(result).sort(), ["src/a.ts", "src/b.ts"]);
+});
+
+test("getPrDiff: rename uses previous_filename on the a/ side (#1223)", async () => {
+  const cfg = { repo: "acme/widget" } as PipelineConfig;
+  const runner = async (args: string[]) => {
+    if (isPrDiffArgs(args)) throwGh(LIVE_PR_DIFF_TOO_LARGE_STDERR);
+    if (isFilesListArgs(args)) {
+      return {
+        stdout: JSON.stringify([[
+          {
+            filename: "new.ts",
+            previous_filename: "old.ts",
+            status: "renamed",
+            sha: "r1",
+            additions: 0,
+            deletions: 0,
+            changes: 0,
+          },
+        ]]),
+      };
+    }
+    throw new Error(`unexpected gh args: ${args.join(" ")}`);
+  };
+  const result = await getPrDiff(cfg, 11, { runner, retries: 1 });
+  assert.ok(result.includes("diff --git a/old.ts b/new.ts"));
+  assert.deepEqual(diffFilePaths(result), ["new.ts"]);
+});
+
+test("getPrDiff: space-containing path stays parseable by diffFilePaths (#1223)", async () => {
+  const cfg = { repo: "acme/widget" } as PipelineConfig;
+  const runner = async (args: string[]) => {
+    if (isPrDiffArgs(args)) throwGh(LIVE_PR_DIFF_TOO_LARGE_STDERR);
+    if (isFilesListArgs(args)) {
+      return {
+        stdout: JSON.stringify([[
+          {
+            filename: "foo bar.ts",
+            status: "modified",
+            sha: "s1",
+            additions: 1,
+            deletions: 1,
+            changes: 2,
+            patch: "@@ -1 +1 @@\n-a\n+b\n",
+          },
+        ]]),
+      };
+    }
+    throw new Error(`unexpected gh args: ${args.join(" ")}`);
+  };
+  const result = await getPrDiff(cfg, 12, { runner, retries: 1 });
+  assert.ok(result.includes("diff --git a/foo bar.ts b/foo bar.ts"));
+  assert.deepEqual(diffFilePaths(result), ["foo bar.ts"]);
+});
+
+test("getPrDiff: invalid files-list JSON after 406 throws (not empty string) (#1223)", async () => {
+  const cfg = { repo: "acme/widget" } as PipelineConfig;
+  const runner = async (args: string[]) => {
+    if (isPrDiffArgs(args)) throwGh(LIVE_PR_DIFF_TOO_LARGE_STDERR);
+    if (isFilesListArgs(args)) return { stdout: "not-json" };
+    throw new Error(`unexpected gh args: ${args.join(" ")}`);
+  };
+  await assert.rejects(
+    () => getPrDiff(cfg, 15, { runner, retries: 1 }),
+    /invalid JSON from files API/,
+  );
+});
+
+test("getPrDiff: empty files list after 406 throws (not empty string) (#1223)", async () => {
+  const cfg = { repo: "acme/widget" } as PipelineConfig;
+  const runner = async (args: string[]) => {
+    if (isPrDiffArgs(args)) throwGh(LIVE_PR_DIFF_TOO_LARGE_STDERR);
+    if (isFilesListArgs(args)) return { stdout: JSON.stringify([[]]) };
+    throw new Error(`unexpected gh args: ${args.join(" ")}`);
+  };
+  await assert.rejects(
+    () => getPrDiff(cfg, 16, { runner, retries: 1 }),
+    /empty files list/,
+  );
+});
+
+test("getPrDiff: files-list failure after 406 throws (not empty string) (#1223)", async () => {
+  const cfg = { repo: "acme/widget" } as PipelineConfig;
+  const runner = async (args: string[]) => {
+    if (isPrDiffArgs(args)) throwGh(LIVE_PR_DIFF_TOO_LARGE_STDERR);
+    if (isFilesListArgs(args)) throwGh("HTTP 403: Resource not accessible by integration");
+    throw new Error(`unexpected gh args: ${args.join(" ")}`);
+  };
+  await assert.rejects(
+    () => getPrDiff(cfg, 13, { runner, retries: 1 }),
+    /Resource not accessible|403/,
+  );
+});
+
+test("getPrDiff: omitted modified text materializes a replacement hunk (#1223)", async () => {
+  const cfg = { repo: "acme/widget" } as PipelineConfig;
+  const calls: string[][] = [];
+  const runner = async (args: string[]) => {
+    calls.push(args);
+    if (isPrDiffArgs(args)) throwGh(LIVE_PR_DIFF_TOO_LARGE_STDERR);
+    if (isFilesListArgs(args)) {
+      return {
+        stdout: JSON.stringify([[
+          {
+            filename: "src/changed.ts",
+            status: "modified",
+            sha: "newblob",
+            additions: 1,
+            deletions: 1,
+            changes: 2,
+          },
+        ]]),
+      };
+    }
+    if (args[0] === "api" && args[1] === "repos/acme/widget/pulls/14") {
+      return { stdout: JSON.stringify({ base: { sha: "basesha" } }) };
+    }
+    if (args[0] === "api" && typeof args[1] === "string" && args[1].startsWith("repos/acme/widget/contents/src/changed.ts")) {
+      return { stdout: JSON.stringify({ sha: "oldblob" }) };
+    }
+    if (args[0] === "api" && args[1] === "repos/acme/widget/git/blobs/newblob") {
+      return { stdout: blobStdout("new line\n") };
+    }
+    if (args[0] === "api" && args[1] === "repos/acme/widget/git/blobs/oldblob") {
+      return { stdout: blobStdout("old line\n") };
+    }
+    throw new Error(`unexpected gh args: ${args.join(" ")}`);
+  };
+  const result = await getPrDiff(cfg, 14, { runner, retries: 1 });
+  assert.ok(result.includes("diff --git a/src/changed.ts b/src/changed.ts"));
+  assert.ok(result.includes("-old line"));
+  assert.ok(result.includes("+new line"));
+  assert.ok(calls.every((args) => args[0] !== "git"));
 });

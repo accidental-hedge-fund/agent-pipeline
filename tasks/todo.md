@@ -1,21 +1,30 @@
-# #1149 Revised plan — Tugboat tags from on-disk HMAC latest.json
+# #1223 Revised plan — getPrDiff files-API fallback
 
 ## Status
 
 - [x] Plan review feedback incorporated (see chat `## Feedback Incorporated`)
-- [ ] Implementation
-- [ ] Tests (PATH-stub / injected git first; prove they fail on current compose)
-- [ ] Docs + OpenSpec task/design precision
-- [ ] `node scripts/build.mjs` after any `core/` edit
-- [ ] `npm run ci`
+- [x] Implementation (`core/scripts/gh.ts` only for helper + classifier)
+- [x] Tests in `core/test/gh.test.ts` (injectable runner; prove 406 + omitted-text tests fail on current helper)
+- [x] OpenSpec change `getprdiff-files-api-fallback` kept in sync
+- [x] `node scripts/build.mjs` after any `core/` edit
+- [x] `npm run ci`
 
 ## Locked decisions (post plan-review)
 
-1. Independent packed-candidate source is factory-release request `integrated_candidate.git_sha` (Tugboat / `SHIP_END_CANDIDATE_SHA`) or `ShipTrainEvidence.integrated_head_oid` (in-engine). HMAC `latest.json` is compared to that SHA. It is not the authority for "this ship."
-2. Living CLI gains required `--packed-candidate <40-hex>`. Positional args stay `<version> <mergeOid>`. Do not compare packed SHA to the merge commit.
-3. Existing `vX.Y.Z` succeeds only as an annotated tag whose peeled commit equals the merge. Never force-update or delete. Concurrent push: re-observe origin and succeed only if that tag is correct.
-4. Tugboat parses finish JSON `mergeCommitOid`, fails closed if not 40-hex, invokes recorded `SHIP_END_CLI` `release ensure-tag`, and stops before `wait-release` on any failure. Finish stays tag-free. Playbook stays exec of repo Tugboat.
-5. Auto-tag skip is exact-path absent **and** `git check-ignore --quiet -- "$path"`. That branch does not tag. Notes, tag-create, and docs-refresh must not fail the job on that skip.
-6. #1115/#1151 APIs that exist at this base are reused. Packed-candidate proof, Tugboat invoke, auto-tag skip-gating, and race re-observe are work in this change.
+1. Fast path stays `gh pr diff -R cfg.repo` with `retries: 1`. 406 is not transient.
+2. Fallback is `gh api repos/${cfg.repo}/pulls/${n}/files?per_page=100 --paginate --slurp`, flattened as `T[][]` (live PR #1222: 4 pages, 377 files).
+3. Omitted text (`patch` missing, `changes > 0`) is materialized from git blobs / contents. Header-only is only for `changes === 0`.
+4. Flattened length `>= 3000` throws. No silent prefix.
+5. Same `cfg.repo` as fast path. No `--hostname`. No `git diff`. No caller signature change.
+6. OpenSpec delta lives at `openspec/changes/getprdiff-files-api-fallback/`.
 
-See `openspec/changes/ship-tag-from-on-disk-hmac/design.md` for the full contract.
+See that change's `design.md` for the full contract.
+
+## Results
+
+- `getPrDiff` tries `gh pr diff` first (`retries: 1`). HTTP 406 / too-large falls back to paginated files-list composition.
+- Omitted text patches (`patch` absent, `changes > 0`) are materialized from git blobs / contents. A 3000-file list throws.
+- Tests: `core/test/gh.test.ts` (injectable runner; 50 passing including #1223 cases).
+- `openspec validate getprdiff-files-api-fallback`: valid.
+- `node scripts/build.mjs --check`: clean.
+- `npm run ci`: exit 0.
