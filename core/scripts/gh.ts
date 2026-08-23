@@ -701,6 +701,8 @@ interface PrDiffFileEntry {
 }
 
 const PR_FILES_LIST_CAP = 3000;
+/** Before/after files-list bookends; fail closed if the PR is still moving. */
+const PR_DIFF_FALLBACK_PIN_ATTEMPTS = 3;
 
 function prDiffRunOpts(opts: GhRunOptions | undefined, extra: GhRunOptions): GhRunOptions {
   return { ...opts, ...extra, wrapperName: "getPrDiff" };
@@ -917,16 +919,6 @@ async function fetchCompareMergeBaseSha(
   return sha;
 }
 
-/** Old-blob ref for omitted modified/renamed patches: three-dot merge-base, not the moving base tip. */
-async function fetchPrMergeBaseSha(
-  cfg: PipelineConfig,
-  prNumber: number,
-  opts: GhRunOptions | undefined,
-): Promise<string> {
-  const { baseSha, headSha } = await fetchPrRevision(cfg, prNumber, opts);
-  return fetchCompareMergeBaseSha(cfg, baseSha, headSha, prNumber, opts);
-}
-
 async function fetchContentsBlobSha(
   cfg: PipelineConfig,
   path: string,
@@ -1001,66 +993,97 @@ async function composePrDiffFromFilesList(
   prNumber: number,
   opts: GhRunOptions | undefined,
 ): Promise<string> {
-  const stdout = await ghRun(
-    ["api", `repos/${cfg.repo}/pulls/${prNumber}/files?per_page=100`, "--paginate", "--slurp"],
-    prDiffRunOpts(opts, { timeoutMs: 120_000 }),
+  let lastBefore: { baseSha: string; headSha: string } | undefined;
+  let lastAfter: { baseSha: string; headSha: string } | undefined;
+
+  for (let attempt = 1; attempt <= PR_DIFF_FALLBACK_PIN_ATTEMPTS; attempt++) {
+    const before = await fetchPrRevision(cfg, prNumber, opts);
+    const stdout = await ghRun(
+      ["api", `repos/${cfg.repo}/pulls/${prNumber}/files?per_page=100`, "--paginate", "--slurp"],
+      prDiffRunOpts(opts, { timeoutMs: 120_000 }),
+    );
+    const after = await fetchPrRevision(cfg, prNumber, opts);
+    if (before.baseSha !== after.baseSha || before.headSha !== after.headSha) {
+      lastBefore = before;
+      lastAfter = after;
+      continue;
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(stdout);
+    } catch {
+      throw new Error(`getPrDiff: invalid JSON from files API for PR #${prNumber}`);
+    }
+    const files = flattenPrFilesPages(parsed, prNumber);
+    if (files.length === 0) {
+      throw new Error(
+        `getPrDiff: empty files list after too-large diff for PR #${prNumber}`,
+      );
+    }
+    if (files.length >= PR_FILES_LIST_CAP) {
+      throw new Error(
+        `getPrDiff: PR #${prNumber} files list hit GitHub's 3000-file cap ` +
+          `(received ${files.length} files). Cannot claim a complete review from a partial list.`,
+      );
+    }
+
+    const pinnedBaseSha = after.baseSha;
+    const pinnedHeadSha = after.headSha;
+    let cachedMergeBaseSha: string | undefined;
+    const getMergeBaseSha = async (): Promise<string> => {
+      if (cachedMergeBaseSha) return cachedMergeBaseSha;
+      cachedMergeBaseSha = await fetchCompareMergeBaseSha(
+        cfg,
+        pinnedBaseSha,
+        pinnedHeadSha,
+        prNumber,
+        opts,
+      );
+      return cachedMergeBaseSha;
+    };
+
+    const blocks: string[] = [];
+    for (const entry of files) {
+      const toPath = entryFilename(entry, prNumber);
+      const fromPath = entryFromPath(entry, toPath);
+      const header = diffGitHeader(fromPath, toPath);
+      if (hasNonEmptyPatch(entry)) {
+        const patch = entry.patch as string;
+        blocks.push(patch.startsWith(header) ? patch : `${header}\n${patch}`);
+        continue;
+      }
+      if (!hasOmittedTextChange(entry)) {
+        blocks.push(header);
+        continue;
+      }
+      const materialized = await materializeOmittedTextPatch(
+        cfg,
+        prNumber,
+        entry,
+        fromPath,
+        toPath,
+        opts,
+        getMergeBaseSha,
+      );
+      blocks.push(`${header}\n${materialized}`);
+    }
+    const composed = blocks.join("\n");
+    if (!composed) {
+      throw new Error(`getPrDiff: composed empty diff for PR #${prNumber}`);
+    }
+    return composed.endsWith("\n") ? composed : `${composed}\n`;
+  }
+
+  const fromPair = lastBefore;
+  const toPair = lastAfter;
+  throw new Error(
+    `getPrDiff: PR #${prNumber} moved during files-list fallback` +
+      (fromPair && toPair
+        ? ` (base/head ${fromPair.baseSha}/${fromPair.headSha} then ${toPair.baseSha}/${toPair.headSha})`
+        : "") +
+      `. Cannot compose a consistent diff.`,
   );
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(stdout);
-  } catch {
-    throw new Error(`getPrDiff: invalid JSON from files API for PR #${prNumber}`);
-  }
-  const files = flattenPrFilesPages(parsed, prNumber);
-  if (files.length === 0) {
-    throw new Error(
-      `getPrDiff: empty files list after too-large diff for PR #${prNumber}`,
-    );
-  }
-  if (files.length >= PR_FILES_LIST_CAP) {
-    throw new Error(
-      `getPrDiff: PR #${prNumber} files list hit GitHub's 3000-file cap ` +
-        `(received ${files.length} files). Cannot claim a complete review from a partial list.`,
-    );
-  }
-
-  let cachedMergeBaseSha: string | undefined;
-  const getMergeBaseSha = async (): Promise<string> => {
-    if (cachedMergeBaseSha) return cachedMergeBaseSha;
-    cachedMergeBaseSha = await fetchPrMergeBaseSha(cfg, prNumber, opts);
-    return cachedMergeBaseSha;
-  };
-
-  const blocks: string[] = [];
-  for (const entry of files) {
-    const toPath = entryFilename(entry, prNumber);
-    const fromPath = entryFromPath(entry, toPath);
-    const header = diffGitHeader(fromPath, toPath);
-    if (hasNonEmptyPatch(entry)) {
-      const patch = entry.patch as string;
-      blocks.push(patch.startsWith(header) ? patch : `${header}\n${patch}`);
-      continue;
-    }
-    if (!hasOmittedTextChange(entry)) {
-      blocks.push(header);
-      continue;
-    }
-    const materialized = await materializeOmittedTextPatch(
-      cfg,
-      prNumber,
-      entry,
-      fromPath,
-      toPath,
-      opts,
-      getMergeBaseSha,
-    );
-    blocks.push(`${header}\n${materialized}`);
-  }
-  const composed = blocks.join("\n");
-  if (!composed) {
-    throw new Error(`getPrDiff: composed empty diff for PR #${prNumber}`);
-  }
-  return composed.endsWith("\n") ? composed : `${composed}\n`;
 }
 
 /**

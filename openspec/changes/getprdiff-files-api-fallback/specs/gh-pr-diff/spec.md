@@ -76,7 +76,7 @@ The composed fallback string SHALL include a `diff --git a/<path> b/<path>` head
 
 ### Requirement: getPrDiff SHALL materialize omitted text patches and SHALL NOT present them as complete header-only diffs
 
-When a files-list entry omits `patch` (or `patch` is empty) and reports a non-zero text change (`changes > 0` or `additions > 0` or `deletions > 0`), `getPrDiff` SHALL materialize reviewable hunk text from the Git blobs API (`GET /repos/{owner}/{repo}/git/blobs/{sha}`) and, for modified/renamed-with-edits entries, the contents API at the PR comparison merge-base SHA. `getPrDiff` SHALL capture `base.sha` and `head.sha` from one `GET /repos/{owner}/{repo}/pulls/{n}` JSON response and SHALL use `merge_base_commit.sha` from `GET /repos/{owner}/{repo}/compare/{base.sha}...{head.sha}` as that contents ref. It SHALL NOT use the base-branch tip (`base.sha`) as the old-blob ref when that SHA differs from the merge base. Materialization SHALL NOT require a local worktree. When materialization fails, `getPrDiff` SHALL throw an Error that names the pull request and the path. `getPrDiff` SHALL NOT return a header-only string as success for that file. When a files-list entry omits `patch` and reports zero changes, `getPrDiff` SHALL emit the path header (binary / empty / mode-only) and SHALL still resolve successfully.
+When a files-list entry omits `patch` (or `patch` is empty) and reports a non-zero text change (`changes > 0` or `additions > 0` or `deletions > 0`), `getPrDiff` SHALL materialize reviewable hunk text from the Git blobs API (`GET /repos/{owner}/{repo}/git/blobs/{sha}`) and, for modified/renamed-with-edits entries, the contents API at the PR comparison merge-base SHA. `getPrDiff` SHALL use `base.sha` and `head.sha` from the pinned matching before/after pair (see pin requirement) and SHALL use `merge_base_commit.sha` from `GET /repos/{owner}/{repo}/compare/{base.sha}...{head.sha}` of that captured pair as the contents ref. It SHALL NOT re-read the live pull request after the files list returns in order to pick a later head for merge-base. It SHALL NOT use the base-branch tip (`base.sha`) as the old-blob ref when that SHA differs from the merge base. Materialization SHALL NOT require a local worktree. When materialization fails, `getPrDiff` SHALL throw an Error that names the pull request and the path. `getPrDiff` SHALL NOT return a header-only string as success for that file. When a files-list entry omits `patch` and reports zero changes, `getPrDiff` SHALL emit the path header (binary / empty / mode-only) and SHALL still resolve successfully.
 
 #### Scenario: Missing per-file patch with zero changes contributes a path header
 
@@ -106,6 +106,25 @@ When a files-list entry omits `patch` (or `patch` is empty) and reports a non-ze
 - **THEN** `getPrDiff` SHALL fetch old contents at the merge-base SHA
 - **AND** the composed hunk SHALL include the merge-base file text as deleted lines
 - **AND** it SHALL NOT use the base-branch tip as the old-blob ref
+
+### Requirement: getPrDiff SHALL pin files-list fallback collection to one PR revision
+
+`getPrDiff` SHALL pin the files-list fallback to one pull-request revision. Before listing files it SHALL read `base.sha` and `head.sha` from `GET /repos/{owner}/{repo}/pulls/{n}`. After pagination it SHALL read `base.sha` and `head.sha` again from the same endpoint. It SHALL compose the fallback diff only when those two pairs are identical. It SHALL derive the merge-base contents ref from `GET /repos/{owner}/{repo}/compare/{base.sha}...{head.sha}` of that captured pair. It SHALL NOT compose a hunk that pairs files-list blob SHAs from one head with a merge-base derived from a different head. When the pair changes, `getPrDiff` SHALL retry the before-list-after collection, up to three attempts. If the pair still differs after those attempts, `getPrDiff` SHALL throw an Error that names the pull request and that the PR moved during collection. It SHALL NOT return a mixed-revision diff as success.
+
+#### Scenario: Head moves from H1 to H2 after the files list returns
+
+- **WHEN** `getPrDiff` takes the files-list fallback
+- **AND** the files list returns blob SHAs for head H1
+- **AND** a later pull-request read returns head H2
+- **THEN** `getPrDiff` SHALL NOT return a hunk that pairs H2's merge-base with H1 blob SHAs
+- **AND** it SHALL retry collection until a before/after pair matches or fail closed
+
+#### Scenario: Persistent movement during collection fails closed
+
+- **WHEN** `getPrDiff` takes the files-list fallback
+- **AND** `base.sha` or `head.sha` differs between the before-list and after-list reads on every attempt
+- **THEN** `getPrDiff` SHALL throw an Error that includes that the PR moved
+- **AND** it SHALL NOT return a composed mixed-revision diff
 
 ### Requirement: getPrDiff SHALL fail closed when the files list hits GitHub's 3000-file cap
 
@@ -143,7 +162,7 @@ After flattening the paginated files list, if the entry count is greater than or
 
 ### Requirement: getPrDiff too-large fallback SHALL be regression-tested via injectable I/O
 
-Automated checks SHALL fail if a fake `gh pr diff` HTTP 406 / too-large result does not produce a composed files-list diff. A second check SHALL fail if a successful small `gh pr diff` result still calls the files list. Checks SHALL also fail if omitted-text files (`patch` absent, `changes > 0`) succeed as header-only, if a modified omitted-text hunk is synthesized from the base-branch tip when the merge base differs, if a 3000-file flattened list returns a composed prefix, or if the fallback invokes `git`. Tests SHALL inject the `gh` runner (or equivalent `GhRunOptions` seam). Tests SHALL NOT perform real network, git, or subprocess calls.
+Automated checks SHALL fail if a fake `gh pr diff` HTTP 406 / too-large result does not produce a composed files-list diff. A second check SHALL fail if a successful small `gh pr diff` result still calls the files list. Checks SHALL also fail if omitted-text files (`patch` absent, `changes > 0`) succeed as header-only, if a modified omitted-text hunk is synthesized from the base-branch tip when the merge base differs, if a 3000-file flattened list returns a composed prefix, if the fallback invokes `git`, or if an H1 files-list snapshot is composed against an H2 merge-base when the head moves during collection. Tests SHALL inject the `gh` runner (or equivalent `GhRunOptions` seam). Tests SHALL NOT perform real network, git, or subprocess calls.
 
 #### Scenario: Regression fails if 406 does not compose a files-list diff
 
@@ -171,4 +190,12 @@ Automated checks SHALL fail if a fake `gh pr diff` HTTP 406 / too-large result d
 - **AND** the injected PR `base.sha` differs from compare `merge_base_commit.sha`
 - **AND** the injected merge-base and base-tip blobs contain different text
 - **AND** `getPrDiff` returns a string that includes the base-tip text or lacks the merge-base text
+- **THEN** the checks SHALL fail
+
+#### Scenario: Regression fails if H1 files compose with an H2 merge-base
+
+- **WHEN** the automated checks inject a 406 runner and a modified omitted-text file
+- **AND** the files list first returns H1 blob SHAs
+- **AND** a subsequent PR read returns H2
+- **AND** `getPrDiff` returns a hunk that pairs H2 merge-base text with H1 blob text
 - **THEN** the checks SHALL fail

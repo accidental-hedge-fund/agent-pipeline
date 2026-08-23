@@ -479,6 +479,14 @@ function isFilesListArgs(args: string[]): boolean {
   return args[0] === "api" && typeof args[1] === "string" && args[1].includes("/files");
 }
 
+function isPrRevisionArgs(args: string[]): boolean {
+  return args[0] === "api" && typeof args[1] === "string" && /\/pulls\/\d+$/.test(args[1]);
+}
+
+function stablePrRevision(headSha = "headsha", baseSha = "basesha"): { stdout: string } {
+  return { stdout: JSON.stringify({ base: { sha: baseSha }, head: { sha: headSha } }) };
+}
+
 test("isPrDiffTooLargeError: live PR #1222 stderr, status syntax, and wording (#1223)", () => {
   assert.equal(isPrDiffTooLargeError(LIVE_PR_DIFF_TOO_LARGE_STDERR), true);
   assert.equal(isPrDiffTooLargeError("non-200 OK status code: 406"), true);
@@ -509,6 +517,7 @@ test("getPrDiff: HTTP 406 falls back to files-list composed diff (#1223)", async
   const runner = async (args: string[]) => {
     calls.push(args);
     if (isPrDiffArgs(args)) throwGh(LIVE_PR_DIFF_TOO_LARGE_STDERR);
+    if (isPrRevisionArgs(args)) return stablePrRevision();
     if (isFilesListArgs(args)) {
       return {
         stdout: JSON.stringify([
@@ -581,6 +590,7 @@ test("getPrDiff: patch-less binary/zero-change file still emits a path header (#
   const cfg = { repo: "acme/widget" } as PipelineConfig;
   const runner = async (args: string[]) => {
     if (isPrDiffArgs(args)) throwGh(LIVE_PR_DIFF_TOO_LARGE_STDERR);
+    if (isPrRevisionArgs(args)) return stablePrRevision();
     if (isFilesListArgs(args)) {
       return {
         stdout: JSON.stringify([[
@@ -602,6 +612,7 @@ test("getPrDiff: omitted removed text is materialized from the git blob (#1223)"
   const runner = async (args: string[]) => {
     calls.push(args);
     if (isPrDiffArgs(args)) throwGh(LIVE_PR_DIFF_TOO_LARGE_STDERR);
+    if (isPrRevisionArgs(args)) return stablePrRevision();
     if (isFilesListArgs(args)) {
       return {
         stdout: JSON.stringify([[
@@ -632,6 +643,7 @@ test("getPrDiff: omitted text blob failure throws naming the path (#1223)", asyn
   const cfg = { repo: "acme/widget" } as PipelineConfig;
   const runner = async (args: string[]) => {
     if (isPrDiffArgs(args)) throwGh(LIVE_PR_DIFF_TOO_LARGE_STDERR);
+    if (isPrRevisionArgs(args)) return stablePrRevision();
     if (isFilesListArgs(args)) {
       return {
         stdout: JSON.stringify([[
@@ -654,6 +666,7 @@ test("getPrDiff: flattened list of 3000 files throws the files-list cap (#1223)"
   const cfg = { repo: "acme/widget" } as PipelineConfig;
   const runner = async (args: string[]) => {
     if (isPrDiffArgs(args)) throwGh(LIVE_PR_DIFF_TOO_LARGE_STDERR);
+    if (isPrRevisionArgs(args)) return stablePrRevision();
     if (isFilesListArgs(args)) {
       const files = Array.from({ length: 3000 }, (_, i) => ({ filename: `f${i}.ts` }));
       return { stdout: JSON.stringify([files]) };
@@ -670,6 +683,7 @@ test("getPrDiff: multi-page slurp flatten includes every file header (#1223)", a
   const cfg = { repo: "acme/widget" } as PipelineConfig;
   const runner = async (args: string[]) => {
     if (isPrDiffArgs(args)) throwGh(LIVE_PR_DIFF_TOO_LARGE_STDERR);
+    if (isPrRevisionArgs(args)) return stablePrRevision();
     if (isFilesListArgs(args)) {
       return {
         stdout: JSON.stringify([
@@ -690,6 +704,7 @@ test("getPrDiff: rename uses previous_filename on the a/ side (#1223)", async ()
   const cfg = { repo: "acme/widget" } as PipelineConfig;
   const runner = async (args: string[]) => {
     if (isPrDiffArgs(args)) throwGh(LIVE_PR_DIFF_TOO_LARGE_STDERR);
+    if (isPrRevisionArgs(args)) return stablePrRevision();
     if (isFilesListArgs(args)) {
       return {
         stdout: JSON.stringify([[
@@ -716,6 +731,7 @@ test("getPrDiff: space-containing path stays parseable by diffFilePaths (#1223)"
   const cfg = { repo: "acme/widget" } as PipelineConfig;
   const runner = async (args: string[]) => {
     if (isPrDiffArgs(args)) throwGh(LIVE_PR_DIFF_TOO_LARGE_STDERR);
+    if (isPrRevisionArgs(args)) return stablePrRevision();
     if (isFilesListArgs(args)) {
       return {
         stdout: JSON.stringify([[
@@ -742,6 +758,7 @@ test("getPrDiff: invalid files-list JSON after 406 throws (not empty string) (#1
   const cfg = { repo: "acme/widget" } as PipelineConfig;
   const runner = async (args: string[]) => {
     if (isPrDiffArgs(args)) throwGh(LIVE_PR_DIFF_TOO_LARGE_STDERR);
+    if (isPrRevisionArgs(args)) return stablePrRevision();
     if (isFilesListArgs(args)) return { stdout: "not-json" };
     throw new Error(`unexpected gh args: ${args.join(" ")}`);
   };
@@ -755,6 +772,7 @@ test("getPrDiff: empty files list after 406 throws (not empty string) (#1223)", 
   const cfg = { repo: "acme/widget" } as PipelineConfig;
   const runner = async (args: string[]) => {
     if (isPrDiffArgs(args)) throwGh(LIVE_PR_DIFF_TOO_LARGE_STDERR);
+    if (isPrRevisionArgs(args)) return stablePrRevision();
     if (isFilesListArgs(args)) return { stdout: JSON.stringify([[]]) };
     throw new Error(`unexpected gh args: ${args.join(" ")}`);
   };
@@ -768,6 +786,7 @@ test("getPrDiff: files-list failure after 406 throws (not empty string) (#1223)"
   const cfg = { repo: "acme/widget" } as PipelineConfig;
   const runner = async (args: string[]) => {
     if (isPrDiffArgs(args)) throwGh(LIVE_PR_DIFF_TOO_LARGE_STDERR);
+    if (isPrRevisionArgs(args)) return stablePrRevision();
     if (isFilesListArgs(args)) throwGh("HTTP 403: Resource not accessible by integration");
     throw new Error(`unexpected gh args: ${args.join(" ")}`);
   };
@@ -883,4 +902,112 @@ test("getPrDiff: omitted modified hunk uses merge-base, not base tip (#1223)", a
     "merge-base must come from compare of captured base/head SHAs",
   );
   assert.ok(calls.every((args) => args[0] !== "git"));
+});
+
+test("getPrDiff: H1→H2 files/head race retries and composes the stable H2 pair (#1223)", async () => {
+  const cfg = { repo: "acme/widget" } as PipelineConfig;
+  const calls: string[][] = [];
+  const events: string[] = [];
+  let filesListCount = 0;
+  const runner = async (args: string[]) => {
+    calls.push(args);
+    if (isPrDiffArgs(args)) throwGh(LIVE_PR_DIFF_TOO_LARGE_STDERR);
+    if (isFilesListArgs(args)) {
+      events.push("files");
+      filesListCount += 1;
+      const sha = filesListCount === 1 ? "h1blob" : "h2blob";
+      return {
+        stdout: JSON.stringify([[
+          {
+            filename: "src/changed.ts",
+            status: "modified",
+            sha,
+            additions: 1,
+            deletions: 1,
+            changes: 2,
+          },
+        ]]),
+      };
+    }
+    if (isPrRevisionArgs(args)) {
+      events.push("pr");
+      const head = events.includes("files") ? "h2" : "h1";
+      return { stdout: JSON.stringify({ base: { sha: "base" }, head: { sha: head } }) };
+    }
+    if (args[0] === "api" && args[1] === "repos/acme/widget/compare/base...h1") {
+      return { stdout: JSON.stringify({ merge_base_commit: { sha: "mb1" } }) };
+    }
+    if (args[0] === "api" && args[1] === "repos/acme/widget/compare/base...h2") {
+      return { stdout: JSON.stringify({ merge_base_commit: { sha: "mb2" } }) };
+    }
+    if (args[0] === "api" && args[1] === "repos/acme/widget/contents/src/changed.ts?ref=mb1") {
+      return { stdout: JSON.stringify({ sha: "old1" }) };
+    }
+    if (args[0] === "api" && args[1] === "repos/acme/widget/contents/src/changed.ts?ref=mb2") {
+      return { stdout: JSON.stringify({ sha: "old2" }) };
+    }
+    if (args[0] === "api" && args[1] === "repos/acme/widget/git/blobs/h1blob") {
+      return { stdout: blobStdout("from-h1\n") };
+    }
+    if (args[0] === "api" && args[1] === "repos/acme/widget/git/blobs/h2blob") {
+      return { stdout: blobStdout("from-h2\n") };
+    }
+    if (args[0] === "api" && args[1] === "repos/acme/widget/git/blobs/old1") {
+      return { stdout: blobStdout("old-h1\n") };
+    }
+    if (args[0] === "api" && args[1] === "repos/acme/widget/git/blobs/old2") {
+      return { stdout: blobStdout("old-h2\n") };
+    }
+    throw new Error(`unexpected gh args: ${args.join(" ")}`);
+  };
+
+  const result = await getPrDiff(cfg, 18, { runner, retries: 1 });
+  assert.ok(result.includes("-old-h2"), "old side must be the stable H2 merge-base");
+  assert.ok(result.includes("+from-h2"), "new side must be the stable H2 files-list blob");
+  assert.equal(result.includes("from-h1"), false, "must not compose H1 blob SHAs with an H2 merge-base");
+  assert.equal(result.includes("old-h1"), false, "must not use the H1 merge-base after the head moved");
+  assert.ok(filesListCount >= 2, "must retry files-list collection after H1→H2");
+  assert.equal(
+    calls.some((a) => a[0] === "api" && a[1] === "repos/acme/widget/compare/base...h1"),
+    false,
+    "must not derive merge-base from the pre-push H1 pair",
+  );
+  assert.ok(
+    calls.some((a) => a[0] === "api" && a[1] === "repos/acme/widget/compare/base...h2"),
+    "merge-base must come from the pinned H2 pair",
+  );
+  assert.ok(calls.every((args) => args[0] !== "git"));
+});
+
+test("getPrDiff: files-list fallback fails closed if the PR keeps moving (#1223)", async () => {
+  const cfg = { repo: "acme/widget" } as PipelineConfig;
+  let filesListCount = 0;
+  const runner = async (args: string[]) => {
+    if (isPrDiffArgs(args)) throwGh(LIVE_PR_DIFF_TOO_LARGE_STDERR);
+    if (isFilesListArgs(args)) {
+      filesListCount += 1;
+      return {
+        stdout: JSON.stringify([[
+          {
+            filename: "src/changed.ts",
+            status: "modified",
+            sha: `blob${filesListCount}`,
+            additions: 1,
+            deletions: 1,
+            changes: 2,
+          },
+        ]]),
+      };
+    }
+    if (isPrRevisionArgs(args)) {
+      const head = `h${filesListCount + 1}`;
+      return { stdout: JSON.stringify({ base: { sha: "base" }, head: { sha: head } }) };
+    }
+    throw new Error(`unexpected gh args: ${args.join(" ")}`);
+  };
+  await assert.rejects(
+    () => getPrDiff(cfg, 19, { runner, retries: 1 }),
+    /moved during files-list fallback/,
+  );
+  assert.equal(filesListCount, 3, "must exhaust the bounded pin attempts then fail closed");
 });

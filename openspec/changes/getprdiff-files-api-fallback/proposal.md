@@ -25,9 +25,10 @@ Non-goals: changing GitHub’s 300-file or 3,000-file policy; bumping `gh` behav
 - [ ] When a files-list entry omits `patch` and `changes > 0`, the composed string includes materialized hunk text from the Git blobs / contents API, or `getPrDiff` throws naming those paths. It does not succeed with header-only output for those files.
 - [ ] When a files-list entry omits `patch` and `changes === 0` (binary / empty / mode-only), the composed string still includes the path header and `getPrDiff` succeeds.
 - [ ] When the flattened files list has 3000 or more entries, `getPrDiff` throws an incompleteness error naming GitHub's 3000-file cap and does not return a composed prefix.
+- [ ] Files-list fallback collection is pinned to one PR revision: read `base.sha`/`head.sha` before listing files, verify the same pair after pagination, retry up to 3 times, and fail closed if the PR is still moving. A hunk MUST NOT pair H1 files-list blobs with an H2 merge-base.
 - [ ] The 406 fallback succeeds without a local worktree and does not invoke `git diff`.
 - [ ] A non-too-large `gh pr diff` failure still throws. A SHA/path fragment containing the digits `406` is not a too-large signal. An empty string is not a substitute for a failed retrieval. Files-list failure after 406 still throws.
-- [ ] Unit tests inject I/O; they do not use real network, git, or subprocess. Coverage includes: small fast path; HTTP 406 composed fallback; multi-page flatten; rename; patch-less binary; omitted-text materialization; 3000-cap throw; 404 propagation; digit-fragment 406; files-API failure; no git/worktree invocation.
+- [ ] Unit tests inject I/O; they do not use real network, git, or subprocess. Coverage includes: small fast path; HTTP 406 composed fallback; multi-page flatten; rename; patch-less binary; omitted-text materialization; 3000-cap throw; 404 propagation; digit-fragment 406; files-API failure; H1→H2 collection race; persistent-movement fail-closed; no git/worktree invocation.
 - [ ] After any `core/` edit, `plugin/` is regenerated in the same change. `npm run ci` is green.
 
 ## Capabilities
