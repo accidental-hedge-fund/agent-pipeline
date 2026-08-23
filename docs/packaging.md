@@ -16,11 +16,11 @@ Hosts are argv or JSON wrappers / short SKILL shims that exec the CLI. A host is
 
 The contributor path is: install the `pipeline` CLI, then add a short host SKILL that execs that CLI. Do not copy `core/` as the product. Do not treat the committed `plugin/` directory as the distribution product.
 
-## Slash commands are optional shims
+## No per-verb slash-command pack
 
-A `/pipeline:*` slash-command pack is not required as the product. Existing `pipeline:<command>` host entries are optional shims that exec the CLI. They are not a second product surface.
+A `/pipeline:*` slash-command pack is not part of the product. Build and install do not emit `pipeline:<command>.md` files or Codex per-verb YAML agents. Hosts exec the CLI through their short SKILL instead.
 
-This page does not delete those files. Stop of `/pipeline:*` file emission is issue #1048. Deletion of `plugin/` is issue #1050.
+Uninstall still removes installer-owned `pipeline:*.md` leftovers from older Claude installs. Whole-tree deletion of `plugin/` remains issue #1050.
 
 ## MCP is not required
 
@@ -30,13 +30,13 @@ An MCP server is not required. That surface is parked at issue #907.
 
 Merge is operator-authorized. This repository does not ship a grant factory, MessagingPort, or second control plane. `pipeline advance`, `pipeline single`, and `pipeline loop` stop at `pipeline:ready-to-deploy` and never merge.
 
-## Transitional mirror (until #1048 / #1050)
+## Transitional plugin shell (until #1050)
 
-`plugin/` is a generated mirror of `core/` (plus the Claude host overlay). It is scheduled for deletion in #1050. It is not the distribution product.
+`plugin/` contains the generated Claude SKILL overlay and marketplace catalog. It does not contain a copy of `core/scripts` or a per-verb command tree. The remaining shell is scheduled for deletion in #1050 and is not the distribution product.
 
-Until #1048, `node scripts/build.mjs --check` remains the CI gate for that mirror. After a `core/` edit, run `node scripts/build.mjs` and include the regenerated `plugin/` in the same commit. That is a transitional CI gate, not the product rule.
+`node scripts/build.mjs --check` asserts that the generated SKILL overlay and marketplace catalog are fresh. After a `core/` or Claude host-SKILL edit, run `node scripts/build.mjs` and include those generated outputs in the same commit.
 
-The current installer may still copy `core/` into a host config tree. That install behavior changes in #1048. This page states the product contract. It does not claim #1048 already shipped.
+The installer stages the CLI implementation from `core/` into its managed host install tree. That is the single CLI install path, not a committed `plugin/` mirror or a second engine.
 
 ## Related
 

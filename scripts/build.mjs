@@ -1,12 +1,14 @@
 #!/usr/bin/env node
-// Assembles the committed Claude Code plugin from the single source of truth
-// (core/ + hosts/claude/). Run after editing core or the Claude overlay:
+// Regenerates the committed SKILL overlay and marketplace catalog from
+// hosts/claude/ (+ hosts/_shared launcher template). Run after editing those
+// sources or when --check reports staleness:
 //
-//   node scripts/build.mjs           regenerate plugin/ and .claude-plugin/marketplace.json
-//   node scripts/build.mjs --check   verify the committed output is up to date (CI gate)
+//   node scripts/build.mjs           regenerate plugin/ SKILL overlay + .claude-plugin/marketplace.json
+//   node scripts/build.mjs --check   verify SKILL overlay and marketplace catalog freshness (CI gate)
 //
-// The plugin is committed so `/plugin marketplace add accidental-hedge-fund/agent-pipeline`
-// works directly off the repo with no build step on the user's machine.
+// The product install path is the pipeline CLI plus host SKILL (`install --host claude`).
+// This generator does not vendor core/scripts into plugin/ and does not emit a
+// per-verb /pipeline:* command pack (#1048). Whole-tree deletion of plugin/ is #1050.
 
 import {
   cpSync,
@@ -14,18 +16,17 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  readdirSync,
   rmSync,
-  statSync,
   writeFileSync,
   chmodSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, relative, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const CORE_ENTRIES = ["scripts", "profiles", "package.json", "package-lock.json"];
+export const SKILL_OVERLAY_REL = join("plugin", "pipeline", "skills", "pipeline", "SKILL.md");
+export const MARKETPLACE_CATALOG_REL = join(".claude-plugin", "marketplace.json");
 
 const MARKETPLACE = {
   $schema: "https://anthropic.com/claude-code/marketplace.schema.json",
@@ -51,13 +52,10 @@ const PLUGIN_MANIFEST = {
   repository: "https://github.com/accidental-hedge-fund/agent-pipeline",
 };
 
-// Single source of truth for the namespaced command surface (#273).
-// Each entry generates a `/pipeline:<name>` command file on the Claude host and
-// a `$pipeline:<name>` entry documented on the Codex host from the same source.
-// `argHint` appears in the command's argument-hint frontmatter.
-// `desc` is the one-line description shown in the skill/command menu.
-// `cliArgs` is the CLI argument string that the host command forwards to
-//   (injected after `pipeline.mjs`; `$ARGUMENTS` is replaced by user args).
+// Verb catalog for docs and the host SKILL table (#273, #1048).
+// Operators invoke `pipeline <verb>`. This listing is not a reason to emit one
+// host command file per verb. `argHint` / `desc` / `cliArgs` remain catalog
+// metadata for docs generators. `fast` / `inRepoLoop` classify orchestration.
 export const OPERATION_SURFACE = [
   {
     name: "status",
@@ -206,99 +204,6 @@ function renderShim(profile) {
   return tmpl.replaceAll("__PROFILE__", profile);
 }
 
-// Shared fast-path orch note for true seconds-long commands (status, doctor, …).
-// loop deliberately does not use this — multi-item drive/resume is long-running (#668).
-const FAST_ORCH_NOTE =
-  "Run synchronously (completes in seconds). No background process or Monitor needed.";
-
-// Loop-specific orch note: long-running drive/resume + event follow; --audit stays sync.
-// Mid-flight follow needs run_id before supervisor exit — early handoff (#665), --resume,
-// or race-safe state-home discovery; terminal printed JSON is final summary only (#668).
-const LOOP_ORCH_NOTE =
-  "Multi-item drive or resume is long-running (minutes to hours) and requires event following. " +
-  "Start or resume the loop non-blocking, obtain `run_id` and the loop events path before " +
-  "completion (early handoff when present; else `--resume` / known id; else race-safe " +
-  "state-home discovery of a newly published or lock-held run directory — do not rely solely " +
-  "on the terminal result JSON for mid-flight follow), follow the loop event stream with a " +
-  "Monitor or host-equivalent (`pipeline loop logs <run_id> --events --follow` exits 0 on " +
-  "`loop_run_stopped` by default), optionally follow an active item's advance events " +
-  "when that advance `run_id` is published, and on `loop_run_stopped` or supervisor process " +
-  "exit stop all run-scoped loop and advance follows in the same turn (do not wait for an " +
-  "operator kill; dual-follow scripts exit 0 after a final summary line). Then print a " +
-  "summary / `--audit` that includes the terminal reason and that follows stopped. " +
-  "See the pipeline SKILL.md loop orchestration section for material event kinds. " +
-  "`--audit` alone is read-only and synchronous (no Monitor).";
-
-// Generate a Claude command markdown file for one operation entry.
-// `skillPath` is the path prefix used in the Invoke line (differs between
-// personal install and plugin install).
-export function renderClaudeCommand(op, skillPath) {
-  // Single-quote the argHint value so YAML parsers don't misinterpret [ or : characters.
-  // None of the current argHint values contain single quotes, so '' escaping is not triggered.
-  const argHintLine = op.argHint ? `argument-hint: '${op.argHint.replace(/'/g, "''")}'` : "";
-  // Quote description when it contains YAML-significant characters (e.g. colons).
-  const descEscaped = String(op.desc ?? "").replace(/'/g, "''");
-  const descLine = `description: '${descEscaped}'`;
-  const invocation = op.specialCli
-    ? `\`node ${skillPath}/scripts/pipeline.mjs ${op.cliArgs}\``
-    : op.argHint
-    ? `\`node ${skillPath}/scripts/pipeline.mjs ${op.cliArgs}\``
-    : `\`node ${skillPath}/scripts/pipeline.mjs ${op.cliArgs}\``;
-  // inRepoLoop takes priority over fast: multi-item loop drive/resume is not the
-  // shared seconds/no-Monitor template (#668). LOOP_ORCH_NOTE covers early handoff
-  // (#665) plus long-running event-follow orchestration.
-  const orchNote = op.inRepoLoop
-    ? LOOP_ORCH_NOTE
-    : op.fast
-    ? FAST_ORCH_NOTE
-    : "See the pipeline SKILL.md for orchestration instructions when this command runs a model harness.";
-  const specialNote = op.specialCli
-    ? "\nNote: pass the issue number as the sole argument. `$1` is expanded to that number by this command."
-    : "";
-  const inRepoLoopNote = op.inRepoLoop
-    ? "\nThis command runs the durable loop entirely in-repo: a deterministic preflight (argument " +
-      "normalization, loop:store-schema-compatibility, native-/goal capability), then this skill's own " +
-      "durable loop supervisor (contract, ledger, lock, recovery, reconciliation, resume), executing each " +
-      "selected item through the pipeline's own state machine and evidence gates. It invokes no external " +
-      "orchestrator skill and never merges. After lock acquisition it prints an early `loop_run_handoff` " +
-      "JSON object (`run_id` + absolute `events` path) for progress follow, then the terminal run result " +
-      "as JSON when the supervisor returns. On a preflight failure it stops and reports the printed " +
-      "remediation; do not start any substitute loop."
-    : "";
-
-  return [
-    "---",
-    descLine,
-    ...(argHintLine ? [argHintLine] : []),
-    "---",
-    "",
-    `Invoke: ${invocation}`,
-    "",
-    orchNote,
-    ...(specialNote ? [specialNote] : []),
-    ...(inRepoLoopNote ? [inRepoLoopNote] : []),
-  ].join("\n") + "\n";
-}
-
-// Generate a Codex agent YAML file for one operation entry.
-// Written to <codexSkills>/pipeline/agents/pipeline-<name>.yaml at install time.
-export function renderCodexCommand(op) {
-  const hint = op.argHint ? ` ${op.argHint}` : "";
-  const escapedDesc = op.desc.replace(/"/g, '\\"');
-  const escapedHint = hint.replace(/"/g, '\\"');
-  return [
-    "interface:",
-    `  display_name: "pipeline:${op.name}"`,
-    `  short_description: "${escapedDesc}"`,
-    `  default_prompt: "$pipeline:${op.name}${escapedHint}"`,
-  ].join("\n") + "\n";
-}
-
-// Rewrite personal-skill paths in a command file to the plugin runtime path.
-function pluginifyCommandFile(content) {
-  return content.replaceAll("~/.claude/skills/pipeline", "${CLAUDE_PLUGIN_ROOT}/skills/pipeline");
-}
-
 // Rewrite the personal-skill paths in the Claude overlay to the plugin runtime
 // path. Claude Code expands ${CLAUDE_PLUGIN_ROOT} for plugin-context commands.
 function pluginSkillMd() {
@@ -310,21 +215,13 @@ function writeJson(path, obj) {
   writeFileSync(path, JSON.stringify(obj, null, 2) + "\n");
 }
 
-function buildInto(root) {
+export function buildInto(root) {
   const skillDir = join(root, "plugin", "pipeline", "skills", "pipeline");
-  const coreDst = join(skillDir, "core");
-  const commandsDir = join(root, "plugin", "pipeline", "commands");
-  mkdirSync(coreDst, { recursive: true });
   mkdirSync(join(skillDir, "scripts"), { recursive: true });
   mkdirSync(join(root, "plugin", "pipeline", ".claude-plugin"), { recursive: true });
   mkdirSync(join(root, ".claude-plugin"), { recursive: true });
-  mkdirSync(commandsDir, { recursive: true });
 
-  // Skill payload: core + rewritten SKILL.md + shim.
-  for (const entry of CORE_ENTRIES) {
-    const src = join(REPO_ROOT, "core", entry);
-    if (existsSync(src)) cpSync(src, join(coreDst, entry), { recursive: true });
-  }
+  // SKILL overlay + launcher shim only. Do not copy core/ into plugin/ (#1048).
   writeFileSync(join(skillDir, "SKILL.md"), pluginSkillMd());
   const shim = join(skillDir, "scripts", "pipeline.mjs");
   writeFileSync(shim, renderShim("claude"));
@@ -338,57 +235,20 @@ function buildInto(root) {
   cpSync(join(REPO_ROOT, "scripts", "ensure-engines-node.mjs"), enginesNode);
   chmodSync(enginesNode, 0o755);
 
-  // Namespaced command files: one `pipeline:<name>.md` per operation (#273).
-  // Generated from OPERATION_SURFACE so Claude and Codex stay symmetric.
-  for (const op of OPERATION_SURFACE) {
-    const raw = renderClaudeCommand(op, "~/.claude/skills/pipeline");
-    const pluginContent = pluginifyCommandFile(raw);
-    writeFileSync(join(commandsDir, `pipeline:${op.name}.md`), pluginContent);
-  }
-
-  // Manifests.
+  // Manifests. No per-verb plugin/pipeline/commands/ tree (#1048).
   writeJson(join(root, "plugin", "pipeline", ".claude-plugin", "plugin.json"), PLUGIN_MANIFEST);
   writeJson(join(root, ".claude-plugin", "marketplace.json"), MARKETPLACE);
 }
 
-// --- recursive compare for --check ---
-function listFiles(dir) {
-  const out = [];
-  if (!existsSync(dir)) return out;
-  for (const name of readdirSync(dir)) {
-    const p = join(dir, name);
-    if (statSync(p).isDirectory()) out.push(...listFiles(p));
-    else out.push(p);
-  }
-  return out;
-}
-
-function compare(generatedRoot) {
-  const targets = [
-    join("plugin", "pipeline"),
-    join("plugin", "pipeline", "commands"),
-    join(".claude-plugin", "marketplace.json"),
-  ];
+export function compare(generatedRoot, repoRoot = REPO_ROOT) {
+  const targets = [SKILL_OVERLAY_REL, MARKETPLACE_CATALOG_REL];
   const drift = [];
-  for (const t of targets) {
-    const genPath = join(generatedRoot, t);
-    const genFiles = statSync(genPath).isDirectory()
-      ? listFiles(genPath).map((f) => relative(generatedRoot, f))
-      : [t];
-    for (const rel of genFiles) {
-      const a = join(generatedRoot, rel);
-      const b = join(REPO_ROOT, rel);
-      if (!existsSync(b)) drift.push(`missing in repo: ${rel}`);
-      else if (readFileSync(a, "utf8") !== readFileSync(b, "utf8")) drift.push(`differs: ${rel}`);
-    }
-    // committed files that should no longer exist
-    const repoPath = join(REPO_ROOT, t);
-    if (existsSync(repoPath) && statSync(repoPath).isDirectory()) {
-      for (const f of listFiles(repoPath)) {
-        const rel = relative(REPO_ROOT, f);
-        if (!existsSync(join(generatedRoot, rel))) drift.push(`stale in repo: ${rel}`);
-      }
-    }
+  for (const rel of targets) {
+    const a = join(generatedRoot, rel);
+    const b = join(repoRoot, rel);
+    if (!existsSync(a)) drift.push(`missing in generated: ${rel}`);
+    else if (!existsSync(b)) drift.push(`missing in repo: ${rel}`);
+    else if (readFileSync(a, "utf8") !== readFileSync(b, "utf8")) drift.push(`differs: ${rel}`);
   }
   return drift;
 }
@@ -401,18 +261,20 @@ function main() {
       buildInto(tmp);
       const drift = compare(tmp);
       if (drift.length) {
-        console.error("✗ plugin/ is out of date — run `node scripts/build.mjs` and commit:");
+        console.error(
+          "✗ SKILL overlay or marketplace catalog is out of date — run `node scripts/build.mjs` and commit:",
+        );
         for (const d of drift) console.error(`  - ${d}`);
         process.exit(1);
       }
-      console.log("✓ plugin/ is up to date with core/ + hosts/claude/");
+      console.log("✓ SKILL overlay and marketplace catalog are up to date");
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }
   } else {
     rmSync(join(REPO_ROOT, "plugin"), { recursive: true, force: true });
     buildInto(REPO_ROOT);
-    console.log("✓ generated plugin/ and .claude-plugin/marketplace.json");
+    console.log("✓ generated SKILL overlay and .claude-plugin/marketplace.json");
   }
 }
 

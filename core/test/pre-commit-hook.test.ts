@@ -163,7 +163,7 @@ test("pre-commit hook: triggers regeneration when hosts/_shared/ change is stage
 
     const { status, stdout } = runHook(dir);
     assert.equal(status, 0, "hook must run regeneration for staged hosts/_shared/ changes");
-    assert.match(stdout, /regenerating plugin\/ mirror/i);
+    assert.match(stdout, /regenerating (plugin\/ mirror|SKILL overlay)/i);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -203,7 +203,7 @@ test("pre-commit hook: triggers regeneration when a core/ file is renamed out of
 
     const { status, stdout } = runHook(dir);
     assert.equal(status, 0, "hook must run regeneration when a core/ file is renamed out");
-    assert.match(stdout, /regenerating plugin\/ mirror/i, "hook must mention regeneration");
+    assert.match(stdout, /regenerating (plugin\/ mirror|SKILL overlay)/i, "hook must mention regeneration");
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -217,7 +217,7 @@ test("pre-commit hook: triggers regeneration when a hosts/_shared/ file is renam
 
     const { status, stdout } = runHook(dir);
     assert.equal(status, 0, "hook must run regeneration when a hosts/_shared/ file is renamed out");
-    assert.match(stdout, /regenerating plugin\/ mirror/i, "hook must mention regeneration");
+    assert.match(stdout, /regenerating (plugin\/ mirror|SKILL overlay)/i, "hook must mention regeneration");
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

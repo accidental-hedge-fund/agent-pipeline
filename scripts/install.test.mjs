@@ -50,7 +50,6 @@ import {
   acquireUpdateLock,
   releaseUpdateLock,
   verifyUpdateLockOwnership,
-  installClaudeCommands,
   uninstallClaudeCommands,
   installOpenCodeCommands,
   uninstallOpenCodeCommands,
@@ -1983,44 +1982,10 @@ test("uninstall --host grok: refuses to delete documented copy layout directory 
 //        Codex personal-skill shadow detection parity
 // ==========================================================================
 
-test("installClaudeCommands: config-dir skill path embedded, not ~/.claude hardcoded (#635)", () => {
-  const tmp = makeTmp();
-  try {
-    installClaudeCommands(tmp, false);
-    const commandsDir = join(tmp, "commands");
-    assert.ok(existsSync(commandsDir), "commands dir must be created");
-    const files = readdirSync(commandsDir).filter((f) => f.startsWith("pipeline:") && f.endsWith(".md"));
-    assert.ok(files.length > 0, "at least one pipeline:*.md command file");
-    const expectedSkill = join(tmp, "skills", "pipeline");
-    for (const f of files) {
-      const body = readFileSync(join(commandsDir, f), "utf8");
-      assert.ok(
-        body.includes(expectedSkill),
-        `${f} must embed config-dir skill path ${expectedSkill}`,
-      );
-      assert.ok(
-        !body.includes("~/.claude/skills/pipeline"),
-        `${f} must not hardcode ~/.claude/skills/pipeline when config dir is custom`,
-      );
-    }
-  } finally {
-    cleanup(tmp);
-  }
-});
-
-test("installClaudeCommands: dry-run writes nothing under commands/ (#635)", () => {
-  const tmp = makeTmp();
-  try {
-    installClaudeCommands(tmp, true);
-    assert.equal(
-      existsSync(join(tmp, "commands")),
-      false,
-      "dry-run must not create commands directory",
-    );
-  } finally {
-    cleanup(tmp);
-  }
-});
+function pipelineColonCommandFiles(commandsDir) {
+  if (!existsSync(commandsDir)) return [];
+  return readdirSync(commandsDir).filter((f) => f.startsWith("pipeline:") && f.endsWith(".md"));
+}
 
 test("install stages ensure-engines-node.mjs next to pipeline.mjs (#1236)", async () => {
   const claudeTmp = makeTmp();
@@ -2049,7 +2014,7 @@ test("install stages ensure-engines-node.mjs next to pipeline.mjs (#1236)", asyn
   }
 });
 
-test("install --host claude under CLAUDE_CONFIG_DIR: command Invoke paths use config-dir skill (#635)", () => {
+test("install --host claude: writes no pipeline:*.md command pack (#1048)", () => {
   const claudeTmp = makeTmp();
   const lockTmp = makeTmp();
   try {
@@ -2060,18 +2025,137 @@ test("install --host claude under CLAUDE_CONFIG_DIR: command Invoke paths use co
       TEMP: lockTmp,
     });
     assert.equal(result.status, 0, `install failed: ${result.stderr}\n${result.stdout}`);
-    const commandsDir = join(claudeTmp, "commands");
-    const expectedSkill = join(claudeTmp, "skills", "pipeline");
-    assert.ok(existsSync(expectedSkill), "skill tree must be installed");
-    const files = readdirSync(commandsDir).filter((f) => f.startsWith("pipeline:") && f.endsWith(".md"));
-    assert.ok(files.length > 0, "install must write pipeline:*.md commands");
-    for (const f of files) {
-      const body = readFileSync(join(commandsDir, f), "utf8");
-      assert.ok(body.includes(expectedSkill), `${f} must reference ${expectedSkill}`);
-      assert.ok(!body.includes("~/.claude/skills/pipeline"), `${f} must not hardcode default home path`);
-    }
+    const skillDir = join(claudeTmp, "skills", "pipeline");
+    assert.ok(existsSync(skillDir), "skill tree must be installed");
+    assert.ok(
+      existsSync(join(skillDir, "scripts", "pipeline.mjs")),
+      "Claude install must write a launcher",
+    );
+    assert.ok(
+      existsSync(join(skillDir, "core", "scripts", "pipeline.ts")),
+      "Claude install must provision core from the repository source, not plugin/",
+    );
+    assert.ok(
+      existsSync(join(skillDir, "SKILL.md")),
+      "Claude install must write the host SKILL overlay",
+    );
+    assert.deepEqual(
+      pipelineColonCommandFiles(join(claudeTmp, "commands")),
+      [],
+      "install --host claude must not write pipeline:*.md",
+    );
   } finally {
     cleanup(claudeTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("install --host claude --dry-run: writes no Claude skill tree (#1048)", () => {
+  const claudeTmp = makeTmp();
+  const lockTmp = makeTmp();
+  try {
+    const result = runInstaller(["install", "--host", "claude", "--dry-run"], {
+      CLAUDE_CONFIG_DIR: claudeTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(
+      existsSync(join(claudeTmp, "skills", "pipeline")),
+      false,
+      "dry-run must not create the Claude skill install tree",
+    );
+    assert.deepEqual(pipelineColonCommandFiles(join(claudeTmp, "commands")), []);
+  } finally {
+    cleanup(claudeTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("install --host claude: installed launcher dispatches doctor and status without slash files (#1048)", () => {
+  const claudeTmp = makeTmp();
+  const lockTmp = makeTmp();
+  try {
+    const install = runInstaller(["install", "--host", "claude"], {
+      CLAUDE_CONFIG_DIR: claudeTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    });
+    assert.equal(install.status, 0, `install failed: ${install.stderr}\n${install.stdout}`);
+    const shim = join(claudeTmp, "skills", "pipeline", "scripts", "pipeline.mjs");
+    assert.ok(existsSync(shim), "launcher must exist");
+    assert.deepEqual(pipelineColonCommandFiles(join(claudeTmp, "commands")), []);
+    assert.equal(
+      existsSync(join(claudeTmp, "skills", "pipeline", "plugin")),
+      false,
+    );
+
+    const env = {
+      ...process.env,
+      CLAUDE_CONFIG_DIR: claudeTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    };
+    const doctor = spawnSync(process.execPath, [shim, "doctor", "--is-ok"], {
+      encoding: "utf8",
+      timeout: 60_000,
+      env,
+    });
+    const doctorOut = `${doctor.stdout}${doctor.stderr}`;
+    assert.doesNotMatch(
+      doctorOut,
+      /unrecognized sub-command/,
+      `doctor must dispatch as a CLI verb: ${doctorOut}`,
+    );
+    assert.doesNotMatch(doctorOut, /pipeline:doctor\.md/);
+
+    const status = spawnSync(process.execPath, [shim, "status", "1"], {
+      encoding: "utf8",
+      timeout: 60_000,
+      env,
+    });
+    const statusOut = `${status.stdout}${status.stderr}`;
+    assert.doesNotMatch(
+      statusOut,
+      /unrecognized sub-command/,
+      `status must dispatch as a CLI verb: ${statusOut}`,
+    );
+    assert.doesNotMatch(statusOut, /pipeline:status\.md/);
+  } finally {
+    cleanup(claudeTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("install --host codex: writes no OPERATION_SURFACE yaml command agents (#1048)", () => {
+  const codexTmp = makeTmp();
+  const lockTmp = makeTmp();
+  try {
+    const result = runInstaller(["install", "--host", "codex"], {
+      CODEX_HOME: codexTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    });
+    assert.equal(result.status, 0, `install failed: ${result.stderr}\n${result.stdout}`);
+    const agentsDir = join(codexTmp, "skills", "pipeline", "agents");
+    const yamlAgents = existsSync(agentsDir)
+      ? readdirSync(agentsDir).filter((f) => f.startsWith("pipeline-") && f.endsWith(".yaml"))
+      : [];
+    assert.deepEqual(
+      yamlAgents,
+      [],
+      "install --host codex must not write pipeline-<name>.yaml agents from OPERATION_SURFACE",
+    );
+    assert.ok(
+      existsSync(join(codexTmp, "skills", "pipeline", "scripts", "pipeline.mjs")),
+      "Codex install must still provision the CLI launcher",
+    );
+  } finally {
+    cleanup(codexTmp);
     cleanup(lockTmp);
   }
 });
@@ -2097,7 +2181,7 @@ test("uninstallClaudeCommands: removes pipeline:*.md only; preserves siblings; d
   }
 });
 
-test("install then uninstall --host claude: skill + pipeline commands gone; sibling command remains (#635)", () => {
+test("install then uninstall --host claude: skill gone; leftover pipeline:*.md removed; sibling remains (#635 #1048)", () => {
   const claudeTmp = makeTmp();
   const lockTmp = makeTmp();
   try {
@@ -2111,10 +2195,9 @@ test("install then uninstall --host claude: skill + pipeline commands gone; sibl
     const skillDir = join(claudeTmp, "skills", "pipeline");
     const commandsDir = join(claudeTmp, "commands");
     assert.ok(existsSync(skillDir));
-    const pipelineCmdsBefore = readdirSync(commandsDir).filter(
-      (f) => f.startsWith("pipeline:") && f.endsWith(".md"),
-    );
-    assert.ok(pipelineCmdsBefore.length > 0);
+    assert.deepEqual(pipelineColonCommandFiles(commandsDir), [], "install must not write slash files");
+    mkdirSync(commandsDir, { recursive: true });
+    writeFileSync(join(commandsDir, "pipeline:status.md"), "leftover from prior install");
     writeFileSync(join(commandsDir, "other-tool.md"), "keep me");
 
     const uninstall = runInstaller(["uninstall", "--host", "claude"], {
@@ -2125,10 +2208,7 @@ test("install then uninstall --host claude: skill + pipeline commands gone; sibl
     });
     assert.equal(uninstall.status, 0, `uninstall failed: ${uninstall.stderr}`);
     assert.equal(existsSync(skillDir), false, "skill dir must be removed");
-    const remaining = existsSync(commandsDir)
-      ? readdirSync(commandsDir).filter((f) => f.startsWith("pipeline:") && f.endsWith(".md"))
-      : [];
-    assert.deepEqual(remaining, [], "no pipeline:*.md commands may remain");
+    assert.deepEqual(pipelineColonCommandFiles(commandsDir), [], "no pipeline:*.md commands may remain");
     assert.ok(existsSync(join(commandsDir, "other-tool.md")), "unrelated command preserved");
   } finally {
     cleanup(claudeTmp);
@@ -2136,7 +2216,7 @@ test("install then uninstall --host claude: skill + pipeline commands gone; sibl
   }
 });
 
-test("uninstall --host claude --dry-run: leaves skill and pipeline commands in place (#635)", () => {
+test("uninstall --host claude --dry-run: leaves skill and leftover pipeline commands in place (#635 #1048)", () => {
   const claudeTmp = makeTmp();
   const lockTmp = makeTmp();
   try {
@@ -2149,7 +2229,8 @@ test("uninstall --host claude --dry-run: leaves skill and pipeline commands in p
     assert.equal(install.status, 0, install.stderr);
     const skillDir = join(claudeTmp, "skills", "pipeline");
     const commandsDir = join(claudeTmp, "commands");
-    const cmds = readdirSync(commandsDir).filter((f) => f.startsWith("pipeline:") && f.endsWith(".md"));
+    mkdirSync(commandsDir, { recursive: true });
+    writeFileSync(join(commandsDir, "pipeline:status.md"), "leftover");
 
     const dry = runInstaller(["uninstall", "--host", "claude", "--dry-run"], {
       CLAUDE_CONFIG_DIR: claudeTmp,
@@ -2161,9 +2242,10 @@ test("uninstall --host claude --dry-run: leaves skill and pipeline commands in p
     const out = `${dry.stdout}${dry.stderr}`;
     assert.match(out, /dry-run/i);
     assert.ok(existsSync(skillDir), "dry-run must not remove skill");
-    for (const f of cmds) {
-      assert.ok(existsSync(join(commandsDir, f)), `dry-run must leave ${f}`);
-    }
+    assert.ok(
+      existsSync(join(commandsDir, "pipeline:status.md")),
+      "dry-run must leave leftover pipeline:status.md",
+    );
   } finally {
     cleanup(claudeTmp);
     cleanup(lockTmp);
@@ -2745,8 +2827,9 @@ test("OpenCode bridge argv safety: spaces and metacharacters not shell-expanded 
 test("HOSTS are built from co-located outer-host manifests (#784)", () => {
   assert.ok(HOSTS.claude.manifest, "claude must carry manifest");
   assert.equal(HOSTS.claude.manifest.manifestVersion, 1);
-  assert.equal(HOSTS.claude.commandsKind, "claude-slash");
-  assert.equal(HOSTS.codex.commandsKind, "codex-prompt");
+  assert.equal(HOSTS.claude.commandsKind, "none");
+  assert.equal(HOSTS.codex.commandsKind, "none");
+  assert.equal(HOSTS.claude.commandsGlob, "pipeline:*.md");
   assert.equal(HOSTS.opencode.commandsKind, "opencode-native");
   assert.equal(HOSTS.omp.commandsKind, "omp-native");
   assert.equal(HOSTS.grok.installMode, "symlink-claude");
@@ -3170,4 +3253,3 @@ test("install --host omp non-TTY relocates unmanaged personal skill (#1235)", ()
     cleanup(home);
   }
 });
-

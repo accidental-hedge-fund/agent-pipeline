@@ -17,7 +17,7 @@
 // post-install `shim --help` refuse with "install/update is in progress"
 // and flakes the test gate.
 
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -147,7 +147,35 @@ try {
     );
     process.exit(1);
   }
+  const commandsDir = join(configDir, "commands");
+  const slashFiles = existsSync(commandsDir)
+    ? readdirSync(commandsDir).filter((f) => f.startsWith("pipeline:") && f.endsWith(".md"))
+    : [];
+  if (slashFiles.length > 0) {
+    console.error(`install --host claude wrote pipeline:*.md: ${slashFiles.join(", ")}`);
+    process.exit(1);
+  }
   run([shimScript, "--help"], env);
+  const doctor = spawnSync(NODE, [shimScript, "doctor", "--is-ok"], {
+    cwd: REPO_ROOT,
+    env: { ...process.env, ...env },
+    encoding: "utf8",
+  });
+  const doctorOut = `${doctor.stdout ?? ""}${doctor.stderr ?? ""}`;
+  if (/unrecognized sub-command/.test(doctorOut)) {
+    console.error("installed launcher did not dispatch doctor:\n", doctorOut);
+    process.exit(1);
+  }
+  const status = spawnSync(NODE, [shimScript, "status", "1"], {
+    cwd: REPO_ROOT,
+    env: { ...process.env, ...env },
+    encoding: "utf8",
+  });
+  const statusOut = `${status.stdout ?? ""}${status.stderr ?? ""}`;
+  if (/unrecognized sub-command/.test(statusOut)) {
+    console.error("installed launcher did not dispatch status:\n", statusOut);
+    process.exit(1);
+  }
   // Documented host-skill material filter path must work from the installed tree.
   assertInstalledMaterialFilter(materialFilterScript, env);
   // `update` refreshes the installed skill in place; running it twice must be

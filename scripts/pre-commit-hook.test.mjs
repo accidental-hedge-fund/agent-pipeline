@@ -100,8 +100,12 @@ test("core/ edit triggers regeneration and stages the mirror in the same commit"
     assert.ok(existsSync(join(dir, "build-ran.marker")), "build.mjs should have run");
     const files = committedFiles(dir);
     assert.ok(files.includes("core/foo.ts"), "core edit committed");
-    assert.ok(files.includes("plugin/pipeline/generated.txt"), "regenerated mirror staged");
+    assert.ok(files.includes("plugin/pipeline/generated.txt"), "regenerated SKILL/catalog staged");
     assert.ok(files.includes(".claude-plugin/marketplace.json"), "marketplace.json staged");
+    assert.ok(
+      !files.some((f) => /(?:^|\/)core\/scripts\/pipeline\.ts$/.test(f)),
+      "hook must not stage a plugin/ core copy as required output",
+    );
   });
 });
 

@@ -58,7 +58,7 @@ import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawnSync } from "node:child_process";
-import { OPERATION_SURFACE, renderClaudeCommand, renderCodexCommand } from "./build.mjs";
+// OPERATION_SURFACE is catalog-only. Install does not emit per-verb command files (#1048).
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const HOME = homedir();
@@ -168,6 +168,7 @@ function buildHostsFromManifests(manifests) {
       overlayDirs: [...(install.overlayDirs || [])],
       installMode: install.mode || "tree",
       commandsKind: install.managedArtifacts?.commandsKind || "none",
+      commandsGlob: install.managedArtifacts?.commandsGlob || null,
       extraScriptFiles: [...(install.managedArtifacts?.extraScriptFiles || [])],
       userOwnedExclusion: install.userOwnedExclusion || "",
       postInstall: install.postInstall || "",
@@ -802,23 +803,39 @@ function stageInto(stagingDir, host) {
 /**
  * Install managed command surface from the host's commandsKind profile.
  * Extension path is the declared kind, not a new host-name branch.
+ * Claude slash packs and Codex yaml agents from OPERATION_SURFACE are not a
+ * product surface (#1048) — even an older profile that still says claude-slash
+ * or codex-prompt must not emit those files.
  */
-function installCommandsForHost(host, dest, dryRun) {
+function installCommandsForHost(host, _dest, dryRun) {
   const cfg = HOSTS[host];
   const kind = cfg.commandsKind || "none";
-  if (kind === "claude-slash") installClaudeCommands(cfg.baseDir(), dryRun);
-  else if (kind === "codex-prompt") installCodexCommands(join(dest, "agents"), dryRun);
-  else if (kind === "opencode-native") installOpenCodeCommands(cfg.baseDir(), dryRun);
+  if (kind === "opencode-native") installOpenCodeCommands(cfg.baseDir(), dryRun);
   else if (kind === "omp-native") installOmpCommands(cfg.baseDir(), dryRun);
+  // claude-slash / codex-prompt: no per-verb command pack (#1048).
+}
+
+function leftoverClaudeCommandGlob(cfg) {
+  const glob = cfg.commandsGlob;
+  return typeof glob === "string" && glob === "pipeline:*.md";
+}
+
+function hostHasExternalCommandCleanup(cfg) {
+  const kind = cfg.commandsKind || "none";
+  return kind === "opencode-native" || kind === "omp-native" || leftoverClaudeCommandGlob(cfg);
 }
 
 function uninstallCommandsForHost(host, dryRun) {
   const cfg = HOSTS[host];
   const kind = cfg.commandsKind || "none";
-  if (kind === "claude-slash") uninstallClaudeCommands(cfg.baseDir(), dryRun);
-  else if (kind === "opencode-native") uninstallOpenCodeCommands(cfg.baseDir(), dryRun);
+  if (kind === "opencode-native") uninstallOpenCodeCommands(cfg.baseDir(), dryRun);
   else if (kind === "omp-native") uninstallOmpCommands(cfg.baseDir(), dryRun);
-  // codex-prompt agents live under the skill tree and are removed with it.
+  // Leftover sweep for migrated Claude installs that still have pipeline:*.md.
+  if (leftoverClaudeCommandGlob(cfg)) {
+    uninstallClaudeCommands(cfg.baseDir(), dryRun);
+  }
+  // Codex yaml agents from OPERATION_SURFACE are not generated; overlay agents
+  // live under the skill tree and are removed with it.
 }
 
 /**
@@ -985,30 +1002,11 @@ function uninstallOmpCommands(ompBaseDir, dryRun) {
   log(`  ✓ removed OMP command pipeline/`);
 }
 
-// Install the namespaced pipeline:<command> command files for the Claude host (#273).
-// Each file is written to <claudeBase>/commands/pipeline:<name>.md.
-// Invoke lines embed the resolved skill path for this base (honors CLAUDE_CONFIG_DIR; #635).
-function installClaudeCommands(claudeBaseDir, dryRun) {
-  const commandsDir = join(claudeBaseDir, "commands");
-  // Absolute skill path so config-dir installs never hardcode ~/.claude/skills/pipeline.
-  const skillPath = join(claudeBaseDir, "skills", "pipeline");
-  if (dryRun) {
-    log(`  (dry-run) would write ${OPERATION_SURFACE.length} pipeline:<command> files to ${commandsDir}`);
-    return;
-  }
-  mkdirSync(commandsDir, { recursive: true });
-  for (const op of OPERATION_SURFACE) {
-    const content = renderClaudeCommand(op, skillPath);
-    writeFileSync(join(commandsDir, `pipeline:${op.name}.md`), content);
-  }
-  log(`  ✓ wrote ${OPERATION_SURFACE.length} pipeline:<command> files to ${commandsDir}`);
-}
-
 /**
- * Remove installer-written Claude command files (`pipeline:*.md`) under
+ * Remove leftover Claude command files (`pipeline:*.md`) under
  * `<claudeBase>/commands/`. Leaves non-pipeline command files untouched.
- * Runs even when the skill tree is already gone (orphan cleanup; #635).
- * Exported for unit tests.
+ * Install no longer writes these files (#1048); uninstall still sweeps leftovers
+ * from a previous install (orphan cleanup; #635). Exported for unit tests.
  */
 function uninstallClaudeCommands(claudeBaseDir, dryRun) {
   const commandsDir = join(claudeBaseDir, "commands");
@@ -1030,22 +1028,6 @@ function uninstallClaudeCommands(claudeBaseDir, dryRun) {
       log(`  ✓ removed command ${f}`);
     }
   }
-}
-
-// Install the namespaced pipeline:<command> agent YAML files for the Codex host (#273).
-// Each file is written to <codexSkillsDir>/pipeline/agents/pipeline-<name>.yaml so that
-// Codex's agent discovery surface includes each $pipeline:<command> as a distinct entry.
-function installCodexCommands(agentsDir, dryRun) {
-  if (dryRun) {
-    log(`  (dry-run) would write ${OPERATION_SURFACE.length} pipeline:<command> agent files to ${agentsDir}`);
-    return;
-  }
-  mkdirSync(agentsDir, { recursive: true });
-  for (const op of OPERATION_SURFACE) {
-    const content = renderCodexCommand(op);
-    writeFileSync(join(agentsDir, `pipeline-${op.name}.yaml`), content);
-  }
-  log(`  ✓ wrote ${OPERATION_SURFACE.length} pipeline:<command> agent files to ${agentsDir}`);
 }
 
 /** True when `p` exists or is a (possibly broken) symlink. */
@@ -1194,11 +1176,11 @@ function uninstallHost(host, dryRun) {
   const cfg = HOSTS[host];
   const dest = join(cfg.skillsDir(), "pipeline");
   const skillPresent = pathPresent(dest);
-  const kind = cfg.commandsKind || "none";
 
-  // Hosts with external command dirs (claude-slash, opencode-native, omp-native):
-  // always attempt command cleanup even when the skill tree is already gone.
-  if (kind === "claude-slash" || kind === "opencode-native" || kind === "omp-native") {
+  // Hosts with an external command dir (OpenCode native / leftover Claude
+  // pipeline:*.md / OMP native): always attempt command cleanup even when the
+  // skill tree is already gone.
+  if (hostHasExternalCommandCleanup(cfg)) {
     if (!skillPresent) {
       log(`→ ${cfg.label}: nothing installed at ${dest}`);
     } else {
@@ -1741,7 +1723,6 @@ export {
   opencodeSkillDir,
   installGrokHost,
   installHost,
-  installClaudeCommands,
   uninstallClaudeCommands,
   installOpenCodeCommands,
   uninstallOpenCodeCommands,

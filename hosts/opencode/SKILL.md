@@ -25,14 +25,14 @@ issue) through a 18-stage label-driven state machine, ending at
 when review ceilings / similar paths exhaust). The ordinary advance path never
 merges. Merge commands require separate operator authority.
 
-## Developing this skill itself (core/ → plugin/ mirror)
+## Developing this skill itself (CLI + SKILL)
 
 When the work target is the agent-pipeline repo — any implementation, fix, or
-test-fix step that edits a file under `core/` — `plugin/` is a generated mirror
-of `core/` (+ `hosts/claude`). After editing any file under `core/`, run
-`node scripts/build.mjs` from the repo root and include the regenerated
-`plugin/` in the same commit. A core-only commit fails CI's
-`build.mjs --check` gate and burns a fix-loop attempt on the stale mirror.
+test-fix step that edits a file under `core/` — the product install path is the
+pipeline CLI plus host SKILL. After editing any file under `core/`, run
+`node scripts/build.mjs` from the repo root so `build.mjs --check` can assert
+SKILL overlay and marketplace catalog freshness. Do not commit a `plugin/` copy
+of `core/scripts`. Whole-tree deletion of `plugin/` is #1050.
 
 ## State machine
 
