@@ -369,7 +369,10 @@ export async function advanceReview(
   } catch (err) {
     const e = err as Error;
     await setBlockedFn(cfg, issueNumber, `Could not retrieve PR diff: ${e.message}`, stage, "harness-failure");
-    return { advanced: false, status: "blocked", reason: e.message };
+    // Thread blockerKind: emitBlockedOutcomeEvents defaults a missing kind to
+    // needs-human → workflow-state, which parks a fetch failure as human
+    // judgment instead of engine-owned harness-failure.
+    return { advanced: false, status: "blocked", reason: e.message, blockerKind: "harness-failure" };
   }
   if (!diff.trim()) {
     await setBlockedFn(cfg, issueNumber, "PR has an empty diff.", stage, "harness-failure");

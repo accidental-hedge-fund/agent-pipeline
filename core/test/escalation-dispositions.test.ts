@@ -213,6 +213,22 @@ test("gh HTTP 422 is deterministic and not retried class", () => {
   assert.equal(c.class, "deterministic-client");
 });
 
+test("gh PR combined-diff HTTP 406 too_large is workflow-engine-defect, not workflow-state", () => {
+  const stderr =
+    "gh pr diff 1222 failed: could not find pull request diff: HTTP 406: " +
+    "Sorry, the diff exceeded the maximum number of files (300). " +
+    "PullRequest.diff too_large";
+  const c = classifyGhError(stderr);
+  assert.equal(c.transient, false);
+  assert.equal(c.class, "deterministic-client");
+  assert.equal(c.reason_code, "workflow-engine-defect");
+  assert.notEqual(c.reason_code, "workflow-state");
+  const proj = projectPipelineReasonCode(c.reason_code);
+  assert.equal(proj.blockerClass, "workflow-engine-defect");
+  assert.equal(proj.disposition, "recover");
+  assert.notEqual(proj.disposition, "human_authority");
+});
+
 test("gh capability refusal keeps a distinct canonical reason (not environment-auth)", () => {
   for (const stderr of [
     "HTTP 403: Resource not accessible by integration",
