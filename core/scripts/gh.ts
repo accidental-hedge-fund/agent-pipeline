@@ -667,12 +667,445 @@ export async function getPrChecks(
   }
 }
 
-export async function getPrDiff(cfg: PipelineConfig, prNumber: number): Promise<string> {
-  const stdout = await ghRun(
-    ["pr", "diff", String(prNumber), "-R", cfg.repo],
-    { timeoutMs: 60_000, wrapperName: "getPrDiff" },
+/**
+ * True when `gh pr diff` failed because GitHub refused the whole-PR diff as too
+ * large (HTTP 406 media-type cap, or GitHub too-large wording). Pure; exported
+ * for unit tests. A SHA/path/command fragment that only contains the digits
+ * `406` is not a too-large signal (#1223).
+ */
+export function isPrDiffTooLargeError(stderr: string): boolean {
+  const s = stderr.toLowerCase();
+  const hasHttp406 =
+    s.includes("http 406") ||
+    s.includes("status code: 406") ||
+    s.includes("status code 406");
+  const hasTooLargeWording =
+    s.includes("too_large") ||
+    s.includes("exceeded the maximum number of files") ||
+    s.includes("exceeded maximum number of files") ||
+    s.includes("diff is too large") ||
+    s.includes("pullrequest.diff too_large");
+  return hasHttp406 || hasTooLargeWording;
+}
+
+/** REST list-pull-request-files entry fields used by the 406 fallback (#1223). */
+interface PrDiffFileEntry {
+  filename?: unknown;
+  previous_filename?: unknown;
+  status?: unknown;
+  sha?: unknown;
+  additions?: unknown;
+  deletions?: unknown;
+  changes?: unknown;
+  patch?: unknown;
+}
+
+const PR_FILES_LIST_CAP = 3000;
+/** Before/after files-list bookends; fail closed if the PR is still moving. */
+const PR_DIFF_FALLBACK_PIN_ATTEMPTS = 3;
+
+function prDiffRunOpts(opts: GhRunOptions | undefined, extra: GhRunOptions): GhRunOptions {
+  return { ...opts, ...extra, wrapperName: "getPrDiff" };
+}
+
+function numericField(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function entryFilename(entry: PrDiffFileEntry, prNumber: number): string {
+  if (typeof entry.filename !== "string" || entry.filename.length === 0) {
+    throw new Error(`getPrDiff: files-list entry missing filename for PR #${prNumber}`);
+  }
+  return entry.filename;
+}
+
+function entryFromPath(entry: PrDiffFileEntry, toPath: string): string {
+  return typeof entry.previous_filename === "string" && entry.previous_filename.length > 0
+    ? entry.previous_filename
+    : toPath;
+}
+
+function hasNonEmptyPatch(entry: PrDiffFileEntry): boolean {
+  return typeof entry.patch === "string" && entry.patch.length > 0;
+}
+
+function hasOmittedTextChange(entry: PrDiffFileEntry): boolean {
+  return (
+    numericField(entry.changes) > 0 ||
+    numericField(entry.additions) > 0 ||
+    numericField(entry.deletions) > 0
   );
-  return stdout;
+}
+
+function splitTextLines(text: string): string[] {
+  if (text.length === 0) return [];
+  const parts = text.split("\n");
+  if (parts[parts.length - 1] === "") parts.pop();
+  return parts;
+}
+
+function diffGitHeader(fromPath: string, toPath: string): string {
+  return `diff --git a/${fromPath} b/${toPath}`;
+}
+
+function binaryDifferLine(fromPath: string, toPath: string): string {
+  return `Binary files a/${fromPath} and b/${toPath} differ`;
+}
+
+function unifiedDeletePatch(fromPath: string, _toPath: string, text: string): string {
+  const lines = splitTextLines(text);
+  const n = lines.length;
+  const hunk = n === 0 ? "@@ -0,0 +0,0 @@" : `@@ -1,${n} +0,0 @@`;
+  return [
+    `--- a/${fromPath}`,
+    "+++ /dev/null",
+    hunk,
+    ...lines.map((line) => `-${line}`),
+  ].join("\n");
+}
+
+function unifiedAddPatch(_fromPath: string, toPath: string, text: string): string {
+  const lines = splitTextLines(text);
+  const n = lines.length;
+  const hunk = n === 0 ? "@@ -0,0 +0,0 @@" : `@@ -0,0 +1,${n} @@`;
+  return [
+    "--- /dev/null",
+    `+++ b/${toPath}`,
+    hunk,
+    ...lines.map((line) => `+${line}`),
+  ].join("\n");
+}
+
+function unifiedReplacePatch(
+  fromPath: string,
+  toPath: string,
+  oldText: string,
+  newText: string,
+): string {
+  const oldLines = splitTextLines(oldText);
+  const newLines = splitTextLines(newText);
+  const oldN = oldLines.length;
+  const newN = newLines.length;
+  const hunk =
+    oldN === 0 && newN === 0
+      ? "@@ -0,0 +0,0 @@"
+      : `@@ -${oldN === 0 ? "0,0" : `1,${oldN}`} +${newN === 0 ? "0,0" : `1,${newN}`} @@`;
+  return [
+    `--- a/${fromPath}`,
+    `+++ b/${toPath}`,
+    hunk,
+    ...oldLines.map((line) => `-${line}`),
+    ...newLines.map((line) => `+${line}`),
+  ].join("\n");
+}
+
+function encodeContentsApiPath(path: string): string {
+  return path.split("/").map(encodeURIComponent).join("/");
+}
+
+type DecodedBlob = { kind: "text"; text: string } | { kind: "binary" };
+
+function decodeGitBlob(parsed: unknown, path: string, prNumber: number): DecodedBlob {
+  if (!parsed || typeof parsed !== "object") {
+    throw new Error(`getPrDiff: invalid blob JSON for PR #${prNumber} path ${path}`);
+  }
+  const blob = parsed as { content?: unknown; encoding?: unknown };
+  if (blob.encoding !== "base64" || typeof blob.content !== "string") {
+    throw new Error(`getPrDiff: blob for PR #${prNumber} path ${path} is not base64`);
+  }
+  const buf = Buffer.from(blob.content, "base64");
+  if (buf.includes(0)) return { kind: "binary" };
+  return { kind: "text", text: buf.toString("utf8") };
+}
+
+function flattenPrFilesPages(parsed: unknown, prNumber: number): PrDiffFileEntry[] {
+  if (!Array.isArray(parsed)) {
+    throw new Error(`getPrDiff: invalid files-list JSON for PR #${prNumber}`);
+  }
+  return (parsed as unknown[]).flat() as PrDiffFileEntry[];
+}
+
+async function fetchGitBlob(
+  cfg: PipelineConfig,
+  sha: string,
+  path: string,
+  prNumber: number,
+  opts: GhRunOptions | undefined,
+): Promise<DecodedBlob> {
+  let stdout: string;
+  try {
+    stdout = await ghRun(
+      ["api", `repos/${cfg.repo}/git/blobs/${sha}`],
+      prDiffRunOpts(opts, {}),
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `getPrDiff: blob retrieval failed for PR #${prNumber} path ${path}: ${msg}`,
+    );
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    throw new Error(`getPrDiff: invalid blob JSON for PR #${prNumber} path ${path}`);
+  }
+  return decodeGitBlob(parsed, path, prNumber);
+}
+
+async function fetchPrRevision(
+  cfg: PipelineConfig,
+  prNumber: number,
+  opts: GhRunOptions | undefined,
+): Promise<{ baseSha: string; headSha: string }> {
+  let stdout: string;
+  try {
+    stdout = await ghRun(
+      ["api", `repos/${cfg.repo}/pulls/${prNumber}`],
+      prDiffRunOpts(opts, {}),
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`getPrDiff: failed to read PR #${prNumber} revision: ${msg}`);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    throw new Error(`getPrDiff: invalid PR JSON for PR #${prNumber}`);
+  }
+  const obj = parsed as { base?: { sha?: unknown }; head?: { sha?: unknown } } | null;
+  const baseSha = obj?.base?.sha;
+  const headSha = obj?.head?.sha;
+  if (typeof baseSha !== "string" || baseSha.length === 0) {
+    throw new Error(`getPrDiff: PR #${prNumber} has no base SHA`);
+  }
+  if (typeof headSha !== "string" || headSha.length === 0) {
+    throw new Error(`getPrDiff: PR #${prNumber} has no head SHA`);
+  }
+  return { baseSha, headSha };
+}
+
+async function fetchCompareMergeBaseSha(
+  cfg: PipelineConfig,
+  baseSha: string,
+  headSha: string,
+  prNumber: number,
+  opts: GhRunOptions | undefined,
+): Promise<string> {
+  let stdout: string;
+  try {
+    stdout = await ghRun(
+      ["api", `repos/${cfg.repo}/compare/${baseSha}...${headSha}`],
+      prDiffRunOpts(opts, {}),
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `getPrDiff: failed to read PR #${prNumber} compare merge-base: ${msg}`,
+    );
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    throw new Error(`getPrDiff: invalid compare JSON for PR #${prNumber}`);
+  }
+  const sha = (parsed as { merge_base_commit?: { sha?: unknown } } | null)
+    ?.merge_base_commit?.sha;
+  if (typeof sha !== "string" || sha.length === 0) {
+    throw new Error(`getPrDiff: PR #${prNumber} compare has no merge-base SHA`);
+  }
+  return sha;
+}
+
+async function fetchContentsBlobSha(
+  cfg: PipelineConfig,
+  path: string,
+  ref: string,
+  prNumber: number,
+  opts: GhRunOptions | undefined,
+): Promise<string> {
+  const encodedPath = encodeContentsApiPath(path);
+  let stdout: string;
+  try {
+    stdout = await ghRun(
+      ["api", `repos/${cfg.repo}/contents/${encodedPath}?ref=${encodeURIComponent(ref)}`],
+      prDiffRunOpts(opts, {}),
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `getPrDiff: contents retrieval failed for PR #${prNumber} path ${path}: ${msg}`,
+    );
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    throw new Error(`getPrDiff: invalid contents JSON for PR #${prNumber} path ${path}`);
+  }
+  const sha = (parsed as { sha?: unknown } | null)?.sha;
+  if (typeof sha !== "string" || sha.length === 0) {
+    throw new Error(`getPrDiff: contents for PR #${prNumber} path ${path} has no blob sha`);
+  }
+  return sha;
+}
+
+async function materializeOmittedTextPatch(
+  cfg: PipelineConfig,
+  prNumber: number,
+  entry: PrDiffFileEntry,
+  fromPath: string,
+  toPath: string,
+  opts: GhRunOptions | undefined,
+  getMergeBaseSha: () => Promise<string>,
+): Promise<string> {
+  const sha = typeof entry.sha === "string" ? entry.sha : "";
+  if (!sha) {
+    throw new Error(
+      `getPrDiff: omitted text patch for PR #${prNumber} path ${toPath} has no blob sha`,
+    );
+  }
+  const status = typeof entry.status === "string" ? entry.status : "";
+  if (status === "removed" || status === "deleted") {
+    const decoded = await fetchGitBlob(cfg, sha, toPath, prNumber, opts);
+    if (decoded.kind === "binary") return binaryDifferLine(fromPath, toPath);
+    return unifiedDeletePatch(fromPath, toPath, decoded.text);
+  }
+  if (status === "added") {
+    const decoded = await fetchGitBlob(cfg, sha, toPath, prNumber, opts);
+    if (decoded.kind === "binary") return binaryDifferLine(fromPath, toPath);
+    return unifiedAddPatch(fromPath, toPath, decoded.text);
+  }
+  const newDecoded = await fetchGitBlob(cfg, sha, toPath, prNumber, opts);
+  const mergeBaseSha = await getMergeBaseSha();
+  const oldSha = await fetchContentsBlobSha(cfg, fromPath, mergeBaseSha, prNumber, opts);
+  const oldDecoded = await fetchGitBlob(cfg, oldSha, fromPath, prNumber, opts);
+  if (newDecoded.kind === "binary" || oldDecoded.kind === "binary") {
+    return binaryDifferLine(fromPath, toPath);
+  }
+  return unifiedReplacePatch(fromPath, toPath, oldDecoded.text, newDecoded.text);
+}
+
+async function composePrDiffFromFilesList(
+  cfg: PipelineConfig,
+  prNumber: number,
+  opts: GhRunOptions | undefined,
+): Promise<string> {
+  let lastBefore: { baseSha: string; headSha: string } | undefined;
+  let lastAfter: { baseSha: string; headSha: string } | undefined;
+
+  for (let attempt = 1; attempt <= PR_DIFF_FALLBACK_PIN_ATTEMPTS; attempt++) {
+    const before = await fetchPrRevision(cfg, prNumber, opts);
+    const stdout = await ghRun(
+      ["api", `repos/${cfg.repo}/pulls/${prNumber}/files?per_page=100`, "--paginate", "--slurp"],
+      prDiffRunOpts(opts, { timeoutMs: 120_000 }),
+    );
+    const after = await fetchPrRevision(cfg, prNumber, opts);
+    if (before.baseSha !== after.baseSha || before.headSha !== after.headSha) {
+      lastBefore = before;
+      lastAfter = after;
+      continue;
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(stdout);
+    } catch {
+      throw new Error(`getPrDiff: invalid JSON from files API for PR #${prNumber}`);
+    }
+    const files = flattenPrFilesPages(parsed, prNumber);
+    if (files.length === 0) {
+      throw new Error(
+        `getPrDiff: empty files list after too-large diff for PR #${prNumber}`,
+      );
+    }
+    if (files.length >= PR_FILES_LIST_CAP) {
+      throw new Error(
+        `getPrDiff: PR #${prNumber} files list hit GitHub's 3000-file cap ` +
+          `(received ${files.length} files). Cannot claim a complete review from a partial list.`,
+      );
+    }
+
+    const pinnedBaseSha = after.baseSha;
+    const pinnedHeadSha = after.headSha;
+    let cachedMergeBaseSha: string | undefined;
+    const getMergeBaseSha = async (): Promise<string> => {
+      if (cachedMergeBaseSha) return cachedMergeBaseSha;
+      cachedMergeBaseSha = await fetchCompareMergeBaseSha(
+        cfg,
+        pinnedBaseSha,
+        pinnedHeadSha,
+        prNumber,
+        opts,
+      );
+      return cachedMergeBaseSha;
+    };
+
+    const blocks: string[] = [];
+    for (const entry of files) {
+      const toPath = entryFilename(entry, prNumber);
+      const fromPath = entryFromPath(entry, toPath);
+      const header = diffGitHeader(fromPath, toPath);
+      if (hasNonEmptyPatch(entry)) {
+        const patch = entry.patch as string;
+        blocks.push(patch.startsWith(header) ? patch : `${header}\n${patch}`);
+        continue;
+      }
+      if (!hasOmittedTextChange(entry)) {
+        blocks.push(header);
+        continue;
+      }
+      const materialized = await materializeOmittedTextPatch(
+        cfg,
+        prNumber,
+        entry,
+        fromPath,
+        toPath,
+        opts,
+        getMergeBaseSha,
+      );
+      blocks.push(`${header}\n${materialized}`);
+    }
+    const composed = blocks.join("\n");
+    if (!composed) {
+      throw new Error(`getPrDiff: composed empty diff for PR #${prNumber}`);
+    }
+    return composed.endsWith("\n") ? composed : `${composed}\n`;
+  }
+
+  const fromPair = lastBefore;
+  const toPair = lastAfter;
+  throw new Error(
+    `getPrDiff: PR #${prNumber} moved during files-list fallback` +
+      (fromPair && toPair
+        ? ` (base/head ${fromPair.baseSha}/${fromPair.headSha} then ${toPair.baseSha}/${toPair.headSha})`
+        : "") +
+      `. Cannot compose a consistent diff.`,
+  );
+}
+
+/**
+ * Fetch PR patch text. Fast path: `gh pr diff`. On HTTP 406 / too-large,
+ * compose a unified diff from the paginated files list (worktree-independent).
+ * Optional `opts` is for unit tests (injectable runner); production callers omit it.
+ */
+export async function getPrDiff(
+  cfg: PipelineConfig,
+  prNumber: number,
+  opts?: GhRunOptions,
+): Promise<string> {
+  try {
+    return await ghRun(
+      ["pr", "diff", String(prNumber), "-R", cfg.repo],
+      prDiffRunOpts(opts, { timeoutMs: 60_000, retries: 1 }),
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!isPrDiffTooLargeError(msg)) throw err;
+    return await composePrDiffFromFilesList(cfg, prNumber, opts);
+  }
 }
 
 /**
