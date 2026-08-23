@@ -438,7 +438,15 @@ test("tugboat default SHIP_STAGE_WATCH_BIN is the repo sibling (#1184)", () => {
   );
   const startFn = extractNamedFn(body, "start_train_stage_watch", "tugboat.sh");
   assert.match(startFn, /PIPELINE_MATERIAL_FILTER="\$filter"/);
+  assert.match(startFn, /BUZZ_CREDENTIALS_FILE="\$\{BUZZ_CREDENTIALS_FILE:-\}"/);
+  assert.match(startFn, /BUZZ_RELAY_URL="\$\{BUZZ_RELAY_URL:-\}"/);
+  assert.match(startFn, /BUZZ_CHANNEL="\$\{BUZZ_CHANNEL:-\}"/);
   assert.match(startFn, /material filter missing/);
+  assert.doesNotMatch(
+    body,
+    /source\s+[^\n]*pipeline-supervisor\/env/,
+    "Tugboat must not source the whole supervisor env file",
+  );
 });
 
 test("tugboat logs stage-watch argv rejected when bundled watch gets --milestone (#1184)", () => {
@@ -526,6 +534,9 @@ test("tugboat attaches --events-file watch from live loop_run_handoff while trai
     );
     const src = fs.readFileSync(tugboat, "utf8");
     const helpers = [
+      extractNamedFn(src, "read_supervisor_env_key", "tugboat.sh"),
+      extractNamedFn(src, "present_unset_buzz_vars", "tugboat.sh"),
+      extractNamedFn(src, "warn_if_buzz_credentials_missing", "tugboat.sh"),
       extractNamedFn(src, "extract_loop_run_handoff_events", "tugboat.sh"),
       extractNamedFn(src, "wait_for_loop_run_handoff_events", "tugboat.sh"),
       extractNamedFn(src, "resolve_installed_material_filter", "tugboat.sh"),
@@ -662,8 +673,46 @@ function isolatedFilterHomes(root: string): {
   return { home, codexHome, claudeDir, opencodeDir, runnerEnv };
 }
 
+function withoutHostBuzzEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const next = { ...env };
+  delete next.BUZZ_BIN;
+  delete next.BUZZ_CHANNEL;
+  delete next.BUZZ_CREDENTIALS_FILE;
+  delete next.BUZZ_RELAY_URL;
+  delete next.XDG_CONFIG_HOME;
+  return next;
+}
+
+function writeFakeWatchEnvDump(
+  fakeWatch: string,
+  dumps: Record<string, string>,
+): void {
+  const lines = [
+    "#!/usr/bin/env bash",
+    "set -euo pipefail",
+    ...Object.entries(dumps).map(
+      ([envName, file]) =>
+        `printf '%s\\n' "\${${envName}-}" > ${JSON.stringify(file)}`,
+    ),
+    'pid_file=""',
+    "while [[ $# -gt 0 ]]; do",
+    '  case "$1" in',
+    '    --pid-file) pid_file=$2; shift 2 ;;',
+    "    *) shift ;;",
+    "  esac",
+    "done",
+    'if [[ -n "$pid_file" ]]; then printf "%s\\n" "$$" >"$pid_file"; fi',
+    "while true; do sleep 0.1; done",
+    "",
+  ];
+  fs.writeFileSync(fakeWatch, lines.join("\n"), { mode: 0o755 });
+}
+
 function extractTrainWatchHelpers(src: string): string {
   return [
+    extractNamedFn(src, "read_supervisor_env_key", "tugboat.sh"),
+    extractNamedFn(src, "present_unset_buzz_vars", "tugboat.sh"),
+    extractNamedFn(src, "warn_if_buzz_credentials_missing", "tugboat.sh"),
     extractNamedFn(src, "resolve_installed_material_filter", "tugboat.sh"),
     extractNamedFn(src, "observe_stage_watch_pid", "tugboat.sh"),
     extractNamedFn(src, "start_train_stage_watch", "tugboat.sh"),
@@ -1140,6 +1189,379 @@ test("tugboat refuses a relative events path before stage-watch spawn (#1213)", 
       false,
       "watch must not spawn for a relative events path",
     );
+    assert.match(r.stdout, /TRAIN_CONTINUED/);
+  } finally {
+    killPidFile(path.join(dir, "stage-watch.pid"));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("tugboat watch spawn env includes parent BUZZ_CREDENTIALS_FILE (#1221)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-buzz-parent-"));
+  try {
+    const { home, codexHome, runnerEnv: baseEnv } = isolatedFilterHomes(dir);
+    const runnerEnv = withoutHostBuzzEnv(baseEnv);
+    const filterPath = path.join(
+      codexHome,
+      "skills",
+      "pipeline",
+      "scripts",
+      "material-filter.mjs",
+    );
+    writeStubFilter(filterPath);
+    const creds = path.join(dir, "parent-creds.json");
+    fs.writeFileSync(creds, JSON.stringify({ nsec: "nsec1fixture-not-real" }));
+    const events = path.join(dir, "events.jsonl");
+    fs.writeFileSync(events, "");
+    const logFile = path.join(dir, "playbook.log");
+    const pidFile = path.join(dir, "stage-watch.pid");
+    const envCredsFile = path.join(dir, "spawn.creds");
+    const envRelayFile = path.join(dir, "spawn.relay");
+    const envChannelFile = path.join(dir, "spawn.channel");
+    const fakeWatch = path.join(dir, "fake-watch");
+    writeFakeWatchEnvDump(fakeWatch, {
+      BUZZ_CREDENTIALS_FILE: envCredsFile,
+      BUZZ_RELAY_URL: envRelayFile,
+      BUZZ_CHANNEL: envChannelFile,
+    });
+    const src = fs.readFileSync(tugboat, "utf8");
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        `HOME=${JSON.stringify(home)}`,
+        `CODEX_HOME=${JSON.stringify(codexHome)}`,
+        `BUZZ_CREDENTIALS_FILE=${JSON.stringify(creds)}`,
+        'BUZZ_RELAY_URL="wss://example.invalid"',
+        'BUZZ_CHANNEL="ch-parent"',
+        "export HOME CODEX_HOME BUZZ_CREDENTIALS_FILE BUZZ_RELAY_URL BUZZ_CHANNEL",
+        `LOG_FILE=${JSON.stringify(logFile)}`,
+        "log() { echo \"$*\" | tee -a \"$LOG_FILE\"; }",
+        `RUN_DIR=${JSON.stringify(dir)}`,
+        `STAGE_WATCH_PID_FILE=${JSON.stringify(pidFile)}`,
+        `SHIP_STAGE_WATCH_BIN=${JSON.stringify(fakeWatch)}`,
+        `STATE_ROOT=${JSON.stringify(dir)}`,
+        `REPO_DIR=${JSON.stringify(dir)}`,
+        "SHIP_NOTIFY=1",
+        "SHIP_NOTIFY_BIN=/bin/true",
+        extractTrainWatchHelpers(src),
+        `start_train_stage_watch ${JSON.stringify(events)} "1.40.0"`,
+        "echo TRAIN_CONTINUED",
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    runnerEnv.BUZZ_CREDENTIALS_FILE = creds;
+    runnerEnv.BUZZ_RELAY_URL = "wss://example.invalid";
+    runnerEnv.BUZZ_CHANNEL = "ch-parent";
+    const r = spawnSync("bash", [runner], {
+      encoding: "utf8",
+      timeout: 10000,
+      env: runnerEnv,
+    });
+    killPidFile(pidFile);
+    assert.equal(r.status, 0, `fixture exited ${r.status}: ${r.stdout}\n${r.stderr}`);
+    assert.equal(fs.readFileSync(envCredsFile, "utf8").trim(), creds);
+    assert.equal(fs.readFileSync(envRelayFile, "utf8").trim(), "wss://example.invalid");
+    assert.equal(fs.readFileSync(envChannelFile, "utf8").trim(), "ch-parent");
+    assert.match(r.stdout, /TRAIN_CONTINUED/);
+  } finally {
+    killPidFile(path.join(dir, "stage-watch.pid"));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("tugboat fills unset Buzz vars from supervisor env file without sourcing (#1221)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-buzz-envfile-"));
+  try {
+    const { home, codexHome, runnerEnv: baseEnv } = isolatedFilterHomes(dir);
+    const runnerEnv = withoutHostBuzzEnv(baseEnv);
+    const filterPath = path.join(
+      codexHome,
+      "skills",
+      "pipeline",
+      "scripts",
+      "material-filter.mjs",
+    );
+    writeStubFilter(filterPath);
+    const creds = path.join(dir, "env-creds.json");
+    fs.writeFileSync(creds, JSON.stringify({ nsec: "nsec1fixture-not-real" }));
+    const envDir = path.join(home, ".config", "pipeline-supervisor");
+    fs.mkdirSync(envDir, { recursive: true });
+    const pinnedRepo = path.join(dir, "pinned-repo");
+    fs.mkdirSync(pinnedRepo, { recursive: true });
+    fs.writeFileSync(
+      path.join(envDir, "env"),
+      [
+        `REPO_DIR=/should-not-apply-from-env-file`,
+        `BUZZ_CREDENTIALS_FILE=${creds}`,
+        "BUZZ_RELAY_URL=wss://from-env-file.invalid",
+        "BUZZ_CHANNEL=ch-from-env-file",
+        "",
+      ].join("\n"),
+    );
+    const events = path.join(dir, "events.jsonl");
+    fs.writeFileSync(events, "");
+    const logFile = path.join(dir, "playbook.log");
+    const pidFile = path.join(dir, "stage-watch.pid");
+    const envCredsFile = path.join(dir, "spawn.creds");
+    const envRelayFile = path.join(dir, "spawn.relay");
+    const envChannelFile = path.join(dir, "spawn.channel");
+    const fakeWatch = path.join(dir, "fake-watch");
+    writeFakeWatchEnvDump(fakeWatch, {
+      BUZZ_CREDENTIALS_FILE: envCredsFile,
+      BUZZ_RELAY_URL: envRelayFile,
+      BUZZ_CHANNEL: envChannelFile,
+    });
+    const src = fs.readFileSync(tugboat, "utf8");
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        "unset BUZZ_CREDENTIALS_FILE BUZZ_RELAY_URL BUZZ_CHANNEL BUZZ_BIN XDG_CONFIG_HOME",
+        `HOME=${JSON.stringify(home)}`,
+        `CODEX_HOME=${JSON.stringify(codexHome)}`,
+        "export HOME CODEX_HOME",
+        `LOG_FILE=${JSON.stringify(logFile)}`,
+        "log() { echo \"$*\" | tee -a \"$LOG_FILE\"; }",
+        `RUN_DIR=${JSON.stringify(dir)}`,
+        `STAGE_WATCH_PID_FILE=${JSON.stringify(pidFile)}`,
+        `SHIP_STAGE_WATCH_BIN=${JSON.stringify(fakeWatch)}`,
+        `STATE_ROOT=${JSON.stringify(dir)}`,
+        `REPO_DIR=${JSON.stringify(pinnedRepo)}`,
+        "SHIP_NOTIFY=1",
+        "SHIP_NOTIFY_BIN=/bin/true",
+        extractTrainWatchHelpers(src),
+        `start_train_stage_watch ${JSON.stringify(events)} "1.40.0"`,
+        'printf "REPO_DIR_AFTER=%s\\n" "$REPO_DIR"',
+        "echo TRAIN_CONTINUED",
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    const r = spawnSync("bash", [runner], {
+      encoding: "utf8",
+      timeout: 10000,
+      env: runnerEnv,
+    });
+    killPidFile(pidFile);
+    assert.equal(r.status, 0, `fixture exited ${r.status}: ${r.stdout}\n${r.stderr}`);
+    assert.equal(fs.readFileSync(envCredsFile, "utf8").trim(), creds);
+    assert.equal(fs.readFileSync(envRelayFile, "utf8").trim(), "wss://from-env-file.invalid");
+    assert.equal(fs.readFileSync(envChannelFile, "utf8").trim(), "ch-from-env-file");
+    assert.match(r.stdout, new RegExp(`REPO_DIR_AFTER=${pinnedRepo.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+    assert.doesNotMatch(r.stdout, /should-not-apply-from-env-file/);
+    assert.match(r.stdout, /TRAIN_CONTINUED/);
+  } finally {
+    killPidFile(path.join(dir, "stage-watch.pid"));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("tugboat preserves operator-set BUZZ_CREDENTIALS_FILE over supervisor env file (#1221)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-buzz-operator-"));
+  try {
+    const { home, codexHome, runnerEnv: baseEnv } = isolatedFilterHomes(dir);
+    const runnerEnv = withoutHostBuzzEnv(baseEnv);
+    const filterPath = path.join(
+      codexHome,
+      "skills",
+      "pipeline",
+      "scripts",
+      "material-filter.mjs",
+    );
+    writeStubFilter(filterPath);
+    const operatorCreds = path.join(dir, "operator-creds.json");
+    const fileCreds = path.join(dir, "file-creds.json");
+    fs.writeFileSync(operatorCreds, JSON.stringify({ nsec: "nsec1operator" }));
+    fs.writeFileSync(fileCreds, JSON.stringify({ nsec: "nsec1file" }));
+    const envDir = path.join(home, ".config", "pipeline-supervisor");
+    fs.mkdirSync(envDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(envDir, "env"),
+      `BUZZ_CREDENTIALS_FILE=${fileCreds}\n`,
+    );
+    const events = path.join(dir, "events.jsonl");
+    fs.writeFileSync(events, "");
+    const logFile = path.join(dir, "playbook.log");
+    const pidFile = path.join(dir, "stage-watch.pid");
+    const envCredsFile = path.join(dir, "spawn.creds");
+    const fakeWatch = path.join(dir, "fake-watch");
+    writeFakeWatchEnvDump(fakeWatch, { BUZZ_CREDENTIALS_FILE: envCredsFile });
+    const src = fs.readFileSync(tugboat, "utf8");
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        `HOME=${JSON.stringify(home)}`,
+        `CODEX_HOME=${JSON.stringify(codexHome)}`,
+        `BUZZ_CREDENTIALS_FILE=${JSON.stringify(operatorCreds)}`,
+        "export HOME CODEX_HOME BUZZ_CREDENTIALS_FILE",
+        `LOG_FILE=${JSON.stringify(logFile)}`,
+        "log() { echo \"$*\" | tee -a \"$LOG_FILE\"; }",
+        `RUN_DIR=${JSON.stringify(dir)}`,
+        `STAGE_WATCH_PID_FILE=${JSON.stringify(pidFile)}`,
+        `SHIP_STAGE_WATCH_BIN=${JSON.stringify(fakeWatch)}`,
+        `STATE_ROOT=${JSON.stringify(dir)}`,
+        `REPO_DIR=${JSON.stringify(dir)}`,
+        "SHIP_NOTIFY=1",
+        "SHIP_NOTIFY_BIN=/bin/true",
+        extractTrainWatchHelpers(src),
+        `start_train_stage_watch ${JSON.stringify(events)} "1.40.0"`,
+        "echo TRAIN_CONTINUED",
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    runnerEnv.BUZZ_CREDENTIALS_FILE = operatorCreds;
+    const r = spawnSync("bash", [runner], {
+      encoding: "utf8",
+      timeout: 10000,
+      env: runnerEnv,
+    });
+    killPidFile(pidFile);
+    assert.equal(r.status, 0, `fixture exited ${r.status}: ${r.stdout}\n${r.stderr}`);
+    assert.equal(fs.readFileSync(envCredsFile, "utf8").trim(), operatorCreds);
+    assert.notEqual(fs.readFileSync(envCredsFile, "utf8").trim(), fileCreds);
+    assert.match(r.stdout, /TRAIN_CONTINUED/);
+  } finally {
+    killPidFile(path.join(dir, "stage-watch.pid"));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("tugboat logs buzz credentials missing and does not fail train (#1221)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-buzz-missing-"));
+  try {
+    const { home, codexHome, runnerEnv: baseEnv } = isolatedFilterHomes(dir);
+    const runnerEnv = withoutHostBuzzEnv(baseEnv);
+    const filterPath = path.join(
+      codexHome,
+      "skills",
+      "pipeline",
+      "scripts",
+      "material-filter.mjs",
+    );
+    writeStubFilter(filterPath);
+    const buzzBin = path.join(dir, "fake-buzz");
+    fs.writeFileSync(buzzBin, "#!/usr/bin/env bash\nexit 0\n", { mode: 0o755 });
+    const events = path.join(dir, "events.jsonl");
+    fs.writeFileSync(events, "");
+    const logFile = path.join(dir, "playbook.log");
+    const pidFile = path.join(dir, "stage-watch.pid");
+    const fakeWatch = path.join(dir, "fake-watch");
+    writeFakeWatchEnvDump(fakeWatch, {});
+    const src = fs.readFileSync(tugboat, "utf8");
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        "unset BUZZ_CREDENTIALS_FILE XDG_CONFIG_HOME",
+        `HOME=${JSON.stringify(home)}`,
+        `CODEX_HOME=${JSON.stringify(codexHome)}`,
+        `BUZZ_BIN=${JSON.stringify(buzzBin)}`,
+        'BUZZ_CHANNEL="ch-fixture"',
+        "SHIP_NOTIFY=1",
+        "export HOME CODEX_HOME BUZZ_BIN BUZZ_CHANNEL SHIP_NOTIFY",
+        `LOG_FILE=${JSON.stringify(logFile)}`,
+        "log() { echo \"$*\" | tee -a \"$LOG_FILE\"; }",
+        `RUN_DIR=${JSON.stringify(dir)}`,
+        `STAGE_WATCH_PID_FILE=${JSON.stringify(pidFile)}`,
+        `SHIP_STAGE_WATCH_BIN=${JSON.stringify(fakeWatch)}`,
+        `STATE_ROOT=${JSON.stringify(dir)}`,
+        `REPO_DIR=${JSON.stringify(dir)}`,
+        "SHIP_NOTIFY_BIN=/bin/true",
+        extractTrainWatchHelpers(src),
+        `start_train_stage_watch ${JSON.stringify(events)} "1.40.0"`,
+        "echo TRAIN_CONTINUED",
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    runnerEnv.BUZZ_BIN = buzzBin;
+    runnerEnv.BUZZ_CHANNEL = "ch-fixture";
+    runnerEnv.SHIP_NOTIFY = "1";
+    const r = spawnSync("bash", [runner], {
+      encoding: "utf8",
+      timeout: 10000,
+      env: runnerEnv,
+    });
+    killPidFile(pidFile);
+    assert.equal(r.status, 0, `fixture exited ${r.status}: ${r.stdout}\n${r.stderr}`);
+    const combined = `${r.stdout}\n${fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : ""}`;
+    assert.match(combined, /buzz credentials missing/);
+    assert.match(r.stdout, /TRAIN_CONTINUED/);
+    assert.doesNotMatch(combined, /stage-watch argv rejected/);
+  } finally {
+    killPidFile(path.join(dir, "stage-watch.pid"));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("tugboat does not log buzz credentials missing when BUZZ_BIN is empty (#1221)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-buzz-emptybin-"));
+  try {
+    const { home, codexHome, runnerEnv: baseEnv } = isolatedFilterHomes(dir);
+    const runnerEnv = withoutHostBuzzEnv(baseEnv);
+    const filterPath = path.join(
+      codexHome,
+      "skills",
+      "pipeline",
+      "scripts",
+      "material-filter.mjs",
+    );
+    writeStubFilter(filterPath);
+    const events = path.join(dir, "events.jsonl");
+    fs.writeFileSync(events, "");
+    const logFile = path.join(dir, "playbook.log");
+    const pidFile = path.join(dir, "stage-watch.pid");
+    const fakeWatch = path.join(dir, "fake-watch");
+    writeFakeWatchEnvDump(fakeWatch, {});
+    const src = fs.readFileSync(tugboat, "utf8");
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        "unset BUZZ_BIN BUZZ_CREDENTIALS_FILE XDG_CONFIG_HOME",
+        `HOME=${JSON.stringify(home)}`,
+        `CODEX_HOME=${JSON.stringify(codexHome)}`,
+        "SHIP_NOTIFY=1",
+        "export HOME CODEX_HOME SHIP_NOTIFY",
+        `LOG_FILE=${JSON.stringify(logFile)}`,
+        "log() { echo \"$*\" | tee -a \"$LOG_FILE\"; }",
+        `RUN_DIR=${JSON.stringify(dir)}`,
+        `STAGE_WATCH_PID_FILE=${JSON.stringify(pidFile)}`,
+        `SHIP_STAGE_WATCH_BIN=${JSON.stringify(fakeWatch)}`,
+        `STATE_ROOT=${JSON.stringify(dir)}`,
+        `REPO_DIR=${JSON.stringify(dir)}`,
+        "SHIP_NOTIFY_BIN=/bin/true",
+        extractTrainWatchHelpers(src),
+        `start_train_stage_watch ${JSON.stringify(events)} "1.40.0"`,
+        "echo TRAIN_CONTINUED",
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    runnerEnv.SHIP_NOTIFY = "1";
+    const r = spawnSync("bash", [runner], {
+      encoding: "utf8",
+      timeout: 10000,
+      env: runnerEnv,
+    });
+    killPidFile(pidFile);
+    assert.equal(r.status, 0, `fixture exited ${r.status}: ${r.stdout}\n${r.stderr}`);
+    const combined = `${r.stdout}\n${fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : ""}`;
+    assert.doesNotMatch(combined, /buzz credentials missing/);
     assert.match(r.stdout, /TRAIN_CONTINUED/);
   } finally {
     killPidFile(path.join(dir, "stage-watch.pid"));

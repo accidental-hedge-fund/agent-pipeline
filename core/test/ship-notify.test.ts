@@ -118,6 +118,8 @@ test("script header documents retry/audit and no longer masks with || true alone
   // Old sole-path mask must not remain as the send outcome handling.
   assert.doesNotMatch(body, /\$BUZZ_BIN.*\|\|\s*true/);
   assert.match(body, /append_audit|audit\.log/);
+  assert.match(body, /intended Buzz|executable BUZZ_BIN/);
+  assert.match(body, /buzz credentials missing|unconfigured/);
 });
 
 test("transient 502 then success: three sends, success audit, no final-failure marker", () => {
@@ -214,6 +216,52 @@ test("SHIP_NOTIFY=0 / unconfigured / empty message: exit 0, no send, no invented
   assert.equal(failedMarkers(fx).length, 0);
   // No audit invented for unconfigured path
   assert.equal(auditLog(fx), "");
+
+  // Non-executable messenger stays silent (CI / unset-messenger path).
+  const notExec = path.join(fx.root, "not-exec-buzz");
+  fs.writeFileSync(notExec, "#!/usr/bin/env bash\nexit 0\n", { mode: 0o644 });
+  r = spawnSync("bash", [script, "would-post", "k-not-exec"], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      SHIP_NOTIFY: "1",
+      PIPELINE_SUPERVISOR_STATE: fx.state,
+      BUZZ_BIN: notExec,
+      BUZZ_CHANNEL: "ch",
+      BUZZ_CREDENTIALS_FILE: fx.creds,
+      SHIP_NOTIFY_BACKOFF_S: "0 0 0",
+    },
+  });
+  assert.equal(r.status, 0);
+  assert.equal(callCount(fx), 0);
+  assert.equal(failedMarkers(fx).length, 0);
+  assert.equal(auditLog(fx), "");
+});
+
+test("intended Buzz with missing credentials file audits and does not send (#1221)", () => {
+  const fx = makeFixture({ alwaysFail: true });
+  const r = runNotify(fx, ["stage #1048 planning", "stage-adv-start-1048-planning"], {
+    BUZZ_CREDENTIALS_FILE: "",
+  });
+  assert.equal(r.status, 0, `stderr=${r.stderr}`);
+  assert.equal(callCount(fx), 0, "must not invoke messenger send");
+  const audit = auditLog(fx);
+  assert.match(audit, /\t(fail|unconfigured)\t/);
+  assert.match(audit, /buzz credentials missing/);
+  assert.equal(failedMarkers(fx).length, 0);
+});
+
+test("intended Buzz with missing channel audits and does not send (#1221)", () => {
+  const fx = makeFixture({ alwaysFail: true });
+  const r = runNotify(fx, ["stage #1048 planning", "stage-adv-start-1048-planning"], {
+    BUZZ_CHANNEL: "",
+  });
+  assert.equal(r.status, 0, `stderr=${r.stderr}`);
+  assert.equal(callCount(fx), 0, "must not invoke messenger send");
+  const audit = auditLog(fx);
+  assert.match(audit, /\t(fail|unconfigured)\t/);
+  assert.match(audit, /buzz channel missing/);
+  assert.equal(failedMarkers(fx).length, 0);
 });
 
 test("success clears prior key-scoped failure marker", () => {

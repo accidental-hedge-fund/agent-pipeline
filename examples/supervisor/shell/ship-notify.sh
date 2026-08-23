@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Optional ship status notifier for thin supervisors.
-# Posts to Buzz when configured; otherwise no-ops (exit 0).
+# Posts to Buzz when configured.
+# Empty or non-executable BUZZ_BIN: silent no-op (exit 0, no audit, no
+# failed/ marker). Intended Buzz (SHIP_NOTIFY=1 and executable BUZZ_BIN)
+# with missing channel or credentials: append audit.log with status
+# unconfigured/fail and a named reason, then exit 0 (does not send).
 # Best-effort: messenger failures are retried, audited, and marked, but the
 # process still exits 0 so ship/train never block solely on channel delivery.
 #
@@ -26,8 +30,9 @@
 #   audit.log               append-only terminal outcomes (ok / fail)
 #   failed/<id>             supervisor-visible final-failure marker
 #
-# Without BUZZ_BIN + credentials + channel, this script exits 0 and does nothing
-# (no invented failure markers for unconfigured messenger).
+# Empty or non-executable BUZZ_BIN is the CI silent path (no invented audit
+# row, no failed/ marker). Executable BUZZ_BIN with missing channel or
+# credentials is not silent: it appends audit.log and still exits 0.
 set -euo pipefail
 
 SHIP_NOTIFY="${SHIP_NOTIFY:-1}"
@@ -93,11 +98,38 @@ elif [[ -n "$key" ]]; then
   fi
 fi
 
-# No-op when messenger is not configured (safe default for CI / local use)
+append_audit() {
+  # Best-effort: filesystem failures must not make the helper exit non-zero.
+  local status=$1 attempts=$2 reason=$3
+  local ts key_field
+  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%s)
+  key_field="${key:-}"
+  if ! mkdir -p "$DEDUP_DIR" 2>/dev/null; then
+    printf 'ship-notify: audit write failed (mkdir %s); status=%s reason=%s\n' \
+      "$DEDUP_DIR" "$status" "$reason" >&2 || true
+    return 0
+  fi
+  # Fields: ts status attempts key reason  (tab-separated; reason last)
+  if ! printf '%s\t%s\tattempts=%s\tkey=%s\t%s\n' \
+    "$ts" "$status" "$attempts" "$key_field" "$reason" >>"$AUDIT_LOG" 2>/dev/null; then
+    printf 'ship-notify: audit write failed (%s); status=%s reason=%s\n' \
+      "$AUDIT_LOG" "$status" "$reason" >&2 || true
+    return 0
+  fi
+  return 0
+}
+
+# Silent no-op when messenger is not configured (CI / unset-messenger hosts).
 if [[ -z "$BUZZ_BIN" || ! -x "$BUZZ_BIN" ]]; then
   exit 0
 fi
-if [[ -z "$BUZZ_CHANNEL" || -z "$BUZZ_CREDENTIALS_FILE" || ! -f "$BUZZ_CREDENTIALS_FILE" ]]; then
+# Intended Buzz: missing channel or credentials is not a silent success.
+if [[ -z "$BUZZ_CHANNEL" ]]; then
+  append_audit "unconfigured" "0" "buzz channel missing"
+  exit 0
+fi
+if [[ -z "$BUZZ_CREDENTIALS_FILE" || ! -f "$BUZZ_CREDENTIALS_FILE" || ! -r "$BUZZ_CREDENTIALS_FILE" ]]; then
+  append_audit "unconfigured" "0" "buzz credentials missing"
   exit 0
 fi
 
@@ -120,27 +152,6 @@ truncate_reason() {
     s="${s:0:497}..."
   fi
   printf '%s' "$s"
-}
-
-append_audit() {
-  # Best-effort: filesystem failures must not make the helper exit non-zero.
-  local status=$1 attempts=$2 reason=$3
-  local ts key_field
-  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%s)
-  key_field="${key:-}"
-  if ! mkdir -p "$DEDUP_DIR" 2>/dev/null; then
-    printf 'ship-notify: audit write failed (mkdir %s); status=%s reason=%s\n' \
-      "$DEDUP_DIR" "$status" "$reason" >&2 || true
-    return 0
-  fi
-  # Fields: ts status attempts key reason  (tab-separated; reason last)
-  if ! printf '%s\t%s\tattempts=%s\tkey=%s\t%s\n' \
-    "$ts" "$status" "$attempts" "$key_field" "$reason" >>"$AUDIT_LOG" 2>/dev/null; then
-    printf 'ship-notify: audit write failed (%s); status=%s reason=%s\n' \
-      "$AUDIT_LOG" "$status" "$reason" >&2 || true
-    return 0
-  fi
-  return 0
 }
 
 clear_key_failure_markers() {
