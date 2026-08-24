@@ -149,8 +149,11 @@ cd "$REPO_DIR"
   --events-file "$EXACT_EVENTS_FILE" --label "ship vX.Y.Z"
 ```
 
-The watcher uses the shared material filter. If status has no exact event path,
-report typed status and do not guess one.
+The watcher uses the shared material filter and exits on the bound file's
+identity-terminal (`loop_run_superseded` / `loop_run_complete` /
+`loop_run_stopped`, or ship_phase complete). Tugboat re-binds `--events-file`
+from a later train stderr `loop_run_handoff`. If status has no exact event
+path, report typed status and do not guess one. Do not glob latest runs.
 
 ## Operator message → intent
 

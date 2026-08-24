@@ -6,10 +6,17 @@
 #   ship-stage-watch.sh --events-file /absolute/run/events.jsonl \
 #     [--label "ship v1.34.0"] [--channel <id>] [--reply-to <event-id>] [--once]
 #
+# Follow mode exits on the bound stream's identity-terminal (loop_run_superseded,
+# loop_run_complete, loop_run_stopped on a loop file; ship_phase complete on a
+# ship file). It does not wait for ship_phase on a loop file, and it does not
+# open a superseded_by path. Tugboat re-binds --events-file to a later handoff.
+#
 # Environment:
 #   PIPELINE_MATERIAL_FILTER  installed material-filter.mjs executable
 #   SHIP_NOTIFY_BIN           messenger adapter (default: sibling script)
 #   SHIP_NOTIFY               0 disables messenger calls (default 1)
+#   SHIP_STAGE_WATCH_IDLE_SECS  inactivity bound after identity-terminal
+#                               (default 30). Does not kill a live quiet run.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -32,9 +39,12 @@ Usage:
     [--once] [--pid-file /absolute/watch.pid]
 
 The events file must identify one exact Pipeline run. Follow mode starts at
-the current cursor and exits on the completed ship phase. This command does
-not discover latest loop or advance runs. Set PIPELINE_MATERIAL_FILTER to the
-installed material-filter.mjs executable.
+the current cursor and exits on that file's identity-terminal event
+(loop_run_superseded / loop_run_complete / loop_run_stopped for a loop file;
+ship_phase complete for a ship file), or after SHIP_STAGE_WATCH_IDLE_SECS
+(default 30) of inactivity once that terminal was seen. This command does
+not discover latest loop or advance runs and does not follow superseded_by.
+Set PIPELINE_MATERIAL_FILTER to the installed material-filter.mjs executable.
 USAGE
 }
 
@@ -98,7 +108,28 @@ else
   }
 fi
 
+tail_pid=""
+watchdog_pid=""
+work_dir=""
+terminal_seen=""
+last_line_ts=""
+
 cleanup() {
+  local child
+  [[ "${cleanup_done:-0}" -eq 1 ]] && return 0
+  cleanup_done=1
+  for child in ${watchdog_pid:-} ${tail_pid:-} $(pgrep -P $$ 2>/dev/null || true); do
+    [[ -n "$child" && "$child" =~ ^[0-9]+$ ]] || continue
+    kill "$child" 2>/dev/null || true
+  done
+  sleep 0.05
+  for child in ${watchdog_pid:-} ${tail_pid:-} $(pgrep -P $$ 2>/dev/null || true); do
+    [[ -n "$child" && "$child" =~ ^[0-9]+$ ]] || continue
+    kill -KILL "$child" 2>/dev/null || true
+  done
+  if [[ -n "${work_dir:-}" && -d "$work_dir" ]]; then
+    rm -rf "$work_dir"
+  fi
   if [[ -n "$pid_file" && -f "$pid_file" ]] && [[ "$(cat "$pid_file" 2>/dev/null || true)" == "$$" ]]; then
     rm -f "$pid_file"
   fi
@@ -111,6 +142,22 @@ if [[ -n "$pid_file" ]]; then
   printf '%s\n' "$$" >"$pid_file"
 fi
 
+note_follow_line() {
+  local line=$1
+  [[ -n "${terminal_seen:-}" ]] || return 0
+  case "$line" in
+    *'[loop_run_superseded]'*|*'[loop_run_complete]'*|*'[loop_run_stopped]'*|*'[ship_phase] complete → completed'*)
+      date +%s >"$last_line_ts"
+      : >"$terminal_seen"
+      ;;
+    *)
+      if [[ -f "$terminal_seen" ]]; then
+        date +%s >"$last_line_ts"
+      fi
+      ;;
+  esac
+}
+
 emit() {
   local line key
   while IFS= read -r line; do
@@ -120,6 +167,7 @@ emit() {
       key=$(printf '%s' "$events_file|$line" | cksum | awk '{print $1}')
       "$SHIP_NOTIFY_BIN" "$label: $line" "material-$key" || true
     fi
+    note_follow_line "$line"
   done
 }
 
@@ -135,4 +183,97 @@ while [[ ! -f "$events_file" ]]; do
   sleep 1
 done
 
-tail -n 0 -F "$events_file" | "$MATERIAL_FILTER" --until-ship-terminal | emit
+idle_secs="${SHIP_STAGE_WATCH_IDLE_SECS:-30}"
+if ! [[ "$idle_secs" =~ ^[0-9]+$ ]]; then
+  idle_secs=30
+fi
+
+work_dir=$(mktemp -d "${TMPDIR:-/tmp}/ship-stage-watch.XXXXXX")
+fifo="$work_dir/events.fifo"
+terminal_seen="$work_dir/terminal.seen"
+last_line_ts="$work_dir/last.ts"
+mkfifo "$fifo"
+
+# Own the follow child. `tail -F | filter | emit` under pipefail hangs after
+# identity-terminal because a silent file never SIGPIPEs tail.
+tail -n 0 -F "$events_file" >"$fifo" &
+tail_pid=$!
+
+(
+  while true; do
+    if [[ -f "$terminal_seen" ]]; then
+      last=$(cat "$last_line_ts" 2>/dev/null || echo 0)
+      now=$(date +%s)
+      if [[ "$last" =~ ^[0-9]+$ ]] && [[ $((now - last)) -ge $idle_secs ]]; then
+        kill "$tail_pid" 2>/dev/null || true
+        exit 0
+      fi
+    fi
+    sleep 0.2
+  done
+) &
+watchdog_pid=$!
+
+# Forward JSONL, classify identity-terminal of THIS bound file, then stop so
+# pipefail cannot wait on silent tail -F. Do not open superseded_by or glob
+# host-global run directories.
+set +e
+python3 - "$fifo" "$terminal_seen" "$last_line_ts" "$tail_pid" <<'PY' | "$MATERIAL_FILTER" --until-identity-terminal | emit
+import json
+import os
+import signal
+import sys
+import time
+
+signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+
+fifo, marker, ts_path, tail_pid_s = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+loop_kinds = {"loop_run_superseded", "loop_run_complete", "loop_run_stopped"}
+
+def is_identity_terminal(obj):
+    if not isinstance(obj, dict):
+        return False
+    kind = obj.get("kind")
+    if kind in loop_kinds:
+        return True
+    return (
+        kind == "ship_phase"
+        and obj.get("phase") == "complete"
+        and obj.get("status") == "completed"
+    )
+
+def mark_and_stop_follow():
+    now = str(int(time.time()))
+    with open(ts_path, "w", encoding="utf-8") as fh:
+        fh.write(now)
+    with open(marker, "w", encoding="utf-8") as fh:
+        fh.write("1")
+    try:
+        os.kill(int(tail_pid_s), signal.SIGTERM)
+    except OSError:
+        pass
+
+try:
+    with open(fifo, encoding="utf-8", errors="replace") as src:
+        for line in src:
+            try:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+            except BrokenPipeError:
+                sys.exit(0)
+            s = line.strip()
+            if not s.startswith("{"):
+                continue
+            try:
+                obj = json.loads(s)
+            except json.JSONDecodeError:
+                continue
+            if is_identity_terminal(obj):
+                mark_and_stop_follow()
+                sys.exit(0)
+except BrokenPipeError:
+    sys.exit(0)
+PY
+kill "$tail_pid" 2>/dev/null || true
+kill "$watchdog_pid" 2>/dev/null || true
+exit 0

@@ -253,7 +253,7 @@ not the product owner. #1001 / #971 do not ban in-engine ship.
 | `pipeline ship --milestone vX.Y.Z` | **Product** durable ship (train `--merge` → release → finish → ensure-tag → promote) |
 | `examples/supervisor/shell/tugboat.sh` | Thin notify/detach adapter only; not the ship owner |
 | `examples/supervisor/shell/ship-notify.sh` | Optional messenger posts; silent no-op when `BUZZ_BIN` is empty; intended Buzz with missing credentials writes `audit.log` |
-| `examples/supervisor/shell/ship-stage-watch.sh` | Optional exact-run posts; shared install |
+| `examples/supervisor/shell/ship-stage-watch.sh` | Optional exact-run posts; follow exits on identity-terminal; Tugboat re-binds `--events-file` |
 | `examples/supervisor/shell/train-status-complete.py` | Train complete gate helper |
 | `examples/supervisor/shell/release-checks-green.py` | Shared ship-release check waiter (`green`/`pending`/`rerun`/`fail`, `bucket`+`link` schema) |
 | `examples/supervisor/shell/pipeline-ship-playbook.sh` | Thin launcher to repo `tugboat.sh` (not the owner) |

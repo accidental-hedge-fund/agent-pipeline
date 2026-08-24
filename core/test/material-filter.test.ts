@@ -3,21 +3,94 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { Readable } from "node:stream";
 import {
   ADVANCE_MATERIAL_KINDS,
+  LOOP_IDENTITY_TERMINAL_KINDS,
   LOOP_MATERIAL_KINDS,
   SHIP_MATERIAL_KINDS,
   createMaterialFilterState,
   filterMaterialLine,
   filterMaterialLines,
   filterMaterialText,
+  isIdentityTerminalEventLine,
   isShipTerminalEventLine,
+  pumpMaterialFilter,
 } from "../scripts/material-filter.ts";
 
 test("ship terminal detection stops only on the exact completed phase", () => {
   assert.equal(isShipTerminalEventLine(JSON.stringify({ kind: "ship_phase", phase: "complete", status: "completed" })), true);
   assert.equal(isShipTerminalEventLine(JSON.stringify({ kind: "ship_phase", phase: "engine_promote", status: "completed" })), false);
   assert.equal(isShipTerminalEventLine("not json"), false);
+});
+
+test("loop identity-terminal kinds end until-identity-terminal after emit (#1227)", async () => {
+  assert.deepEqual(LOOP_IDENTITY_TERMINAL_KINDS, [
+    "loop_run_superseded",
+    "loop_run_complete",
+    "loop_run_stopped",
+  ]);
+  for (const kind of LOOP_IDENTITY_TERMINAL_KINDS) {
+    assert.equal(
+      isIdentityTerminalEventLine(JSON.stringify({ kind, data: { superseded_by: "loop-new" } })),
+      true,
+      `${kind} is identity-terminal`,
+    );
+  }
+  assert.equal(
+    isIdentityTerminalEventLine(JSON.stringify({ kind: "ship_phase", phase: "complete", status: "completed" })),
+    true,
+  );
+  assert.equal(isIdentityTerminalEventLine(JSON.stringify({ kind: "loop_item_started" })), false);
+  assert.equal(isIdentityTerminalEventLine("not json"), false);
+
+  const lines = [
+    loop("loop_item_started", { item_id: "#1221" }),
+    loop("loop_run_superseded", { superseded_by: "loop-9d33dc88" }),
+    loop("loop_item_started", { item_id: "#1221-late" }),
+  ];
+  const out: string[] = [];
+  await pumpMaterialFilter(Readable.from(lines.map((l) => `${l}\n`)), (s) => out.push(s), {
+    untilIdentityTerminal: true,
+  });
+  const joined = out.join("");
+  assert.match(joined, /\[loop_run_superseded\]/);
+  assert.doesNotMatch(joined, /#1221-late/);
+});
+
+test("until-ship-terminal does not stop a loop stream on loop_run_superseded (#1227)", async () => {
+  const lines = [
+    loop("loop_item_started", { item_id: "#1221" }),
+    loop("loop_run_superseded", { superseded_by: "loop-9d33dc88" }),
+    loop("loop_item_started", { item_id: "#1221-late" }),
+  ];
+  const out: string[] = [];
+  await pumpMaterialFilter(Readable.from(lines.map((l) => `${l}\n`)), (s) => out.push(s), {
+    untilShipTerminal: true,
+  });
+  const joined = out.join("");
+  assert.match(joined, /\[loop_run_superseded\]/);
+  assert.match(joined, /#1221-late/);
+});
+
+test("until-identity-terminal still stops on ship_phase complete (#1227)", async () => {
+  const shipComplete = JSON.stringify({
+    kind: "ship_phase",
+    phase: "complete",
+    status: "completed",
+  });
+  const late = JSON.stringify({
+    kind: "ship_phase",
+    phase: "engine_promote",
+    status: "running",
+  });
+  const out: string[] = [];
+  await pumpMaterialFilter(Readable.from([`${shipComplete}\n`, `${late}\n`]), (s) => out.push(s), {
+    untilIdentityTerminal: true,
+  });
+  const joined = out.join("");
+  assert.match(joined, /\[ship_phase\] complete → completed/);
+  assert.doesNotMatch(joined, /engine_promote/);
 });
 
 function adv(type: string, extra: Record<string, unknown> = {}): string {

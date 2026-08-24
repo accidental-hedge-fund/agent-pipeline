@@ -16,7 +16,7 @@ They only map intent → `pipeline` CLI. They are **not** a second control plane
 |---|---|
 | **`tugboat.sh`** | Thin notify/detach adapter. Product ship is `pipeline ship --milestone`. Tugboat must not own merge order, classification, or a second ledger. |
 | `ship-notify.sh` | Optional Buzz status posts (shared with Tugboat). Empty/`BUZZ_BIN` unset is a silent no-op. Intended Buzz (executable `BUZZ_BIN`, missing channel or credentials) writes `audit.log` unconfigured/fail. Retries transient send failures; audits under `$PIPELINE_SUPERVISOR_STATE/notify/` (`audit.log`, `failed/*`); still exit 0 so ship never blocks on delivery. |
-| `ship-stage-watch.sh` | Stream one explicit run event file through `material-filter.mjs` (shared) |
+| `ship-stage-watch.sh` | Stream one explicit run event file through `material-filter.mjs` (shared). Follow exits on that file's identity-terminal; Tugboat re-binds `--events-file` from a later train handoff. |
 | `train-status-complete.py` | Pure helper: last `train_status` complete gate from mixed prose+JSON (`raw_decode`) |
 | `release-checks-green.py` | Shared ship-release check waiter: classify `gh pr checks --json` as green/pending/rerun/fail (`bucket`+`link`; bounded flake-eligible rerun) |
 | `run-intent.sh` | Map a short intent string → `pipeline train` / `single` |

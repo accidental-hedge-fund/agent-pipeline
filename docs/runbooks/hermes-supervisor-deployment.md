@@ -190,6 +190,7 @@ ship-milestone --milestone vX.Y.Z --for X.Y.Z \
 ship-milestone --milestone vX.Y.Z --status
 
 # Optional: use only an exact events_file returned by Pipeline status.
+# Follow exits on that file's identity-terminal; do not glob latest runs.
 ship-stage-watch --events-file "$EXACT_EVENTS_FILE" --label "ship vX.Y.Z" \
   --channel "$AUTH_CHANNEL_ID" --reply-to "$AUTH_EVENT_ID"
 ```

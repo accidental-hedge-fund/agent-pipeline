@@ -70,6 +70,14 @@
 #                          Default: sibling ship-stage-watch.sh. Argv is
 #                          --events-file from this train's loop_run_handoff
 #                          (not --milestone / --since; not a PATH leftover).
+#                          First live handoff attaches while train runs.
+#                          A later distinct loop_run_handoff events path on
+#                          this train's stderr re-binds --events-file to that
+#                          new absolute path (reap prior watch first). The
+#                          same dead path is not respawned after identity-
+#                          terminal. Next ship start reaps this RUN_DIR
+#                          stage-watch.pid leftover. No host-global kill of
+#                          every watch process and no latest-run glob.
 #                          A relative events path is refused before spawn.
 #                          A dead watch pid logs the watch stderr/exit;
 #                          "stage-watch argv rejected" is only usage/parser
@@ -2450,6 +2458,60 @@ raise SystemExit(1)
 PY
 }
 
+# Last distinct absolute events.jsonl on this stderr. Re-bind uses this so a
+# later handoff is visible; still no host-global latest-run glob.
+extract_latest_loop_run_handoff_events() {
+  python3 - "$1" <<'PY'
+import json, sys
+path = sys.argv[1]
+try:
+    text = open(path, encoding="utf-8", errors="replace").read()
+except OSError:
+    raise SystemExit(1)
+last = None
+for line in text.splitlines():
+    s = line.strip()
+    if not s.startswith("{"):
+        continue
+    try:
+        obj = json.loads(s)
+    except json.JSONDecodeError:
+        continue
+    if not isinstance(obj, dict) or obj.get("kind") != "loop_run_handoff":
+        continue
+    events = obj.get("events")
+    if isinstance(events, str) and events.startswith("/"):
+        last = events
+if last:
+    print(last)
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+# Kill the pid named by this ship's stage-watch.pid, then remove the file.
+# Does not pkill host-global ship-stage-watch; other RUN_DIRs stay untouched.
+reap_stage_watch_pid() {
+  local swp
+  [[ -n "${STAGE_WATCH_PID_FILE:-}" && -f "$STAGE_WATCH_PID_FILE" ]] || return 0
+  swp=$(cat "$STAGE_WATCH_PID_FILE" 2>/dev/null || true)
+  if [[ -n "$swp" ]] && kill -0 "$swp" 2>/dev/null; then
+    kill "$swp" 2>/dev/null || true
+    local i=0
+    while [[ "$i" -lt 20 ]] && kill -0 "$swp" 2>/dev/null; do
+      sleep 0.05
+      i=$((i + 1))
+    done
+    if kill -0 "$swp" 2>/dev/null; then
+      kill -KILL "$swp" 2>/dev/null || true
+    fi
+    if declare -F log >/dev/null 2>&1; then
+      log "stage-watch reaped pid=$swp"
+    fi
+  fi
+  rm -f "$STAGE_WATCH_PID_FILE"
+}
+
 # Poll this train's stderr until handoff events or the train pid exits.
 wait_for_loop_run_handoff_events() {
   local stderr_file=$1
@@ -2586,17 +2648,29 @@ start_train_stage_watch() {
   observe_stage_watch_pid "$watch_pid"
 }
 
-# Attach watch while train is still running. Watch spawn failure does not fail the ship.
+# Attach watch while train is still running. Re-bind when this train's stderr
+# later records a distinct loop_run_handoff events path. Do not respawn the
+# same path after identity-terminal exit. Watch spawn failure does not fail
+# the ship. No latest-run glob.
 attach_train_stage_watch() {
   local stderr_file=$1
   local train_pid=$2
   local version=$3
-  local events
+  local events latest
   events=$(wait_for_loop_run_handoff_events "$stderr_file" "$train_pid") || {
     log "stage-watch skipped: no loop_run_handoff events path"
     return 0
   }
   start_train_stage_watch "$events" "$version"
+  while kill -0 "$train_pid" 2>/dev/null; do
+    if latest=$(extract_latest_loop_run_handoff_events "$stderr_file") \
+      && [[ -n "$latest" && "$latest" != "$events" ]]; then
+      reap_stage_watch_pid || true
+      start_train_stage_watch "$latest" "$version" || true
+      events=$latest
+    fi
+    sleep 0.1
+  done
 }
 
 # ---------- one milestone ship ----------------------------------------------
@@ -2633,6 +2707,10 @@ ship_one() {
   fi
   trap 'release_lock' RETURN
   trap 'release_lock' EXIT
+
+  # Leftover nohup watch from a prior composer on this milestone RUN_DIR.
+  # Scoped to this pid-file; never host-global kill of every watch process.
+  reap_stage_watch_pid || true
 
   log "tugboat start milestone=v$version version=$version repo=$REPO_DIR host=$ENGINE_PROMOTE_HOST"
   SKIP_FRG_ARGS=()
