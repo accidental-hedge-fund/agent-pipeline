@@ -40,13 +40,19 @@ import {
   productDirtyPaths,
 } from "./worktree-dirt.ts";
 import {
+  boundExcerpt,
   buildTesterEvidence,
   DEFAULT_TESTER_EVIDENCE_CONFIG,
   normalizeCandidateSha,
+  normalizeTesterProducerObservation,
   runAllowlistedExtractors,
   writeTesterEvidence,
   type TesterCommandStatus,
   type TesterOverallStatus,
+  type TesterProducerObservation,
+  type TesterProducerPersistObservation,
+  type TesterEvidence,
+  type WriteTesterEvidenceResult,
 } from "./tester-evidence.ts";
 import {
   buildEngineFingerprint,
@@ -103,6 +109,25 @@ export interface TestGateResult {
    *  blocks are not wrapped as "failed after N fix attempt(s)" / "command is
    *  still failing". Scratch-only dirt does not set this flag. */
   dirtyWorktree?: boolean;
+  /**
+   * Typed producer observation (#1226): true only when the required suite
+   * command was observed to exit 0 in this invocation. Not inferred from
+   * `passed`, `summary.json`, or logs.
+   */
+  recorded_required_exit_0?: boolean;
+  required_command_exit_code?: number | null;
+  persist?: TesterProducerPersistObservation;
+}
+
+/** Pass `runTestGate`'s typed observation through review regeneration. */
+export function testerProducerObservationFromGate(
+  result: TestGateResult,
+): TesterProducerObservation {
+  return normalizeTesterProducerObservation({
+    recorded_required_exit_0: result.recorded_required_exit_0,
+    required_command_exit_code: result.required_command_exit_code ?? null,
+    persist: result.persist,
+  });
 }
 
 /** Signature of the harness `invoke` — injectable so the loop is unit-testable. */
@@ -145,6 +170,15 @@ export interface TestGateDeps {
    *  `cfg.build_command` is unset. Tests inject fakes so no real git/build
    *  subprocess is invoked. */
   buildSideEffects?: BuildSideEffectsDeps;
+  /**
+   * Atomic Tester evidence writer (#1226). Tests inject `{ ok: false }` to
+   * exercise persist_write_failed without a live filesystem failure.
+   */
+  writeTesterEvidence?: (
+    runDir: string,
+    evidence: TesterEvidence,
+    opts?: { maxArtifactChars?: number; runStoreDeps?: RunStoreDeps },
+  ) => Promise<WriteTesterEvidenceResult>;
 }
 
 // ---------------------------------------------------------------------------
@@ -255,16 +289,22 @@ export async function runTestGate(
   } | null = null;
   let commandIdentity: string | null = null;
 
+  const recordedRequiredExit0 = (): boolean => lastCmdForEvidence?.exitCode === 0;
+  const requiredExitCode = (): number | null => lastCmdForEvidence?.exitCode ?? null;
+
   const recordEvidence = async (
-    gate: TestGateResult,
+    _gate: TestGateResult,
     opts: {
       overallStatus: Exclude<TesterOverallStatus, "stale">;
       overallReason?: string;
       enabled: boolean;
       includeLastCommand?: boolean;
     },
-  ): Promise<void> => {
-    if (!runDir) return;
+  ): Promise<TesterProducerPersistObservation> => {
+    if (!runDir) {
+      return { ok: true, candidate_sha: null };
+    }
+    let pinned: string | null = null;
     try {
       let candidateSha = "";
       try {
@@ -272,9 +312,14 @@ export async function runTestGate(
       } catch {
         candidateSha = "";
       }
-      // Schema requires a full 40-char pin; without it acquisition sees missing.
-      const pinned = normalizeCandidateSha(candidateSha);
-      if (!pinned) return;
+      // Schema requires a full 40-char pin from worktree HEAD; never copy
+      // trusted-surface's decision SHA (including the all-zero sentinel).
+      pinned = normalizeCandidateSha(candidateSha);
+      if (!pinned) {
+        return recordedRequiredExit0()
+          ? { ok: false, candidate_sha: null, code: "unpinnable_candidate_sha" }
+          : { ok: false, candidate_sha: null };
+      }
       candidateSha = pinned;
       const endedAt = new Date();
       const durationMs = Math.max(0, endedAt.getTime() - gateStartedAt.getTime());
@@ -296,7 +341,8 @@ export async function runTestGate(
       }
       // evidence_subject (#692/#691): domain + engine identity; verifier
       // fingerprint prefers trusted-surface effective hash when the run has a
-      // decision. Blocked decisions skip subject emission (fail closed).
+      // decision. Blocked decisions omit subject emission (fail closed) but
+      // MUST still persist the suite record after a successful command (#1226).
       const engineId = resolvePinnedEngineIdentity();
       const engineFp = engineId
         ? buildEngineFingerprint({
@@ -326,14 +372,12 @@ export async function runTestGate(
             trustedSurface,
           })
         : null;
-      // When a decision exists and fingerprint is unusable (blocked / no pin),
-      // do not emit a readiness subject with a fabricated engine-only fingerprint.
-      if (trustedSurface && !verifierFp) {
+      const omitSubject = Boolean(trustedSurface && !verifierFp);
+      if (omitSubject) {
         console.warn(
-          `[pipeline] tester-evidence: trusted-surface ${trustedSurface.outcome} ` +
+          `[pipeline] tester-evidence: trusted-surface ${trustedSurface!.outcome} ` +
             `prevents readiness subject emission (fail closed)`,
         );
-        return;
       }
       const evidence = buildTesterEvidence({
         candidateSha: candidateSha.trim(),
@@ -354,27 +398,52 @@ export async function runTestGate(
             ? lastCmdForEvidence
             : undefined,
         tests: tests.tests.length > 0 ? tests.tests : undefined,
-        domain: (cfg.domain || cfg.repo || "").trim() || undefined,
+        // Omit domain + fingerprints so resolveTesterEvidenceSubject cannot
+        // invent a family-local verifier pin when trusted-surface is blocked.
+        domain: omitSubject ? undefined : ((cfg.domain || cfg.repo || "").trim() || undefined),
         engineVersion: engineId?.version,
-        engineFingerprint: engineFp,
-        verifierFingerprint: verifierFp ?? undefined,
-        requiredEvidenceSetRevision: buildRequiredEvidenceSetRevisionFromGates({
-          testGateEnabled: cfg.test_gate?.enabled,
-          evalGateEnabled: cfg.eval_gate?.enabled,
-          visualGateEnabled: cfg.visual_gate?.enabled,
-          shipcheckGateEnabled: cfg.shipcheck_gate?.enabled,
-        }),
+        engineFingerprint: omitSubject ? undefined : engineFp,
+        verifierFingerprint: omitSubject ? undefined : (verifierFp ?? undefined),
+        requiredEvidenceSetRevision: omitSubject
+          ? undefined
+          : buildRequiredEvidenceSetRevisionFromGates({
+              testGateEnabled: cfg.test_gate?.enabled,
+              evalGateEnabled: cfg.eval_gate?.enabled,
+              visualGateEnabled: cfg.visual_gate?.enabled,
+              shipcheckGateEnabled: cfg.shipcheck_gate?.enabled,
+            }),
       });
-      await writeTesterEvidence(runDir, evidence, {
+      const writeFn = deps.writeTesterEvidence ?? writeTesterEvidence;
+      const write = await writeFn(runDir, evidence, {
         maxArtifactChars,
         runStoreDeps,
       });
+      if (!write.ok) {
+        const error = boundExcerpt(write.error ?? "tester-evidence write failed", 500);
+        console.warn(
+          `[pipeline] tester-evidence: write failed after suite command (non-fatal): ${error}`,
+        );
+        return {
+          ok: false,
+          candidate_sha: candidateSha,
+          code: "persist_write_failed",
+          error,
+        };
+      }
+      return { ok: true, candidate_sha: candidateSha };
     } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
       console.warn(
-        `[pipeline] tester-evidence: producer failed (non-fatal): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
+        `[pipeline] tester-evidence: producer failed (non-fatal): ${message}`,
       );
+      return recordedRequiredExit0()
+        ? {
+            ok: false,
+            candidate_sha: pinned,
+            code: "persist_write_failed",
+            error: boundExcerpt(message, 500),
+          }
+        : { ok: false, candidate_sha: pinned };
     }
   };
 
@@ -387,8 +456,13 @@ export async function runTestGate(
       includeLastCommand?: boolean;
     },
   ): Promise<TestGateResult> => {
-    await recordEvidence(gate, evidence);
-    return gate;
+    const persist = await recordEvidence(gate, evidence);
+    return {
+      ...gate,
+      recorded_required_exit_0: recordedRequiredExit0(),
+      required_command_exit_code: requiredExitCode(),
+      persist,
+    };
   };
 
   if (!cfg.test_gate.enabled) {

@@ -96,7 +96,7 @@ import {
   loadOrRegenerateTesterEvidenceForReview,
   testerEvidenceWithholdResult,
 } from "../tester-evidence.ts";
-import { runTestGate } from "../testgate.ts";
+import { runTestGate, testerProducerObservationFromGate } from "../testgate.ts";
 import type { Outcome, PipelineConfig, ReviewFinding, Stage } from "../types.ts";
 import {
   appendDualShaEscalationDisclosure,
@@ -2246,7 +2246,7 @@ async function defaultRunDeltaReview(
     cfg,
     runDir
       ? async () => {
-          await runTestGate(
+          const gate = await runTestGate(
             { ...cfg, test_gate: { ...cfg.test_gate, max_attempts: 0 } },
             issueNumber,
             worktreePath,
@@ -2257,6 +2257,7 @@ async function defaultRunDeltaReview(
             runDir,
             accounting?.runStoreDeps,
           );
+          return testerProducerObservationFromGate(gate);
         }
       : undefined,
   );

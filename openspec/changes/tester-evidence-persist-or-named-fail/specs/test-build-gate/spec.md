@@ -13,7 +13,13 @@ SHALL remain authoritative for advance/block routing; the Tester artifact is
 the structured evidence form of that execution, not a parallel policy engine.
 A trusted-surface decision with `outcome: blocked` (including `repo_policy`
 `missing_base_sha` or an all-zero decision `candidate_sha`) SHALL NOT skip
-writing the suite artifact after a required command exits 0. Readiness
+writing the suite artifact after a required command exits 0. The written
+record's `candidate_sha` SHALL be the worktree HEAD observed by the gate,
+validated as a full 40-character hex SHA, and SHALL NOT be copied from
+trusted-surface's decision SHA. The gate result SHALL include a typed
+producer observation of whether the required command exited 0 and whether
+persist succeeded. An atomic write failure after exit 0 SHALL be reported on
+that observation and SHALL NOT manufacture a passed artifact. Readiness
 `evidence_subject` emission MAY stay fail-closed in that case.
 
 #### Scenario: passing gate run emits passed Tester evidence
@@ -67,3 +73,11 @@ writing the suite artifact after a required command exits 0. Readiness
 - **AND** the record SHALL NOT invent a readiness `evidence_subject` that claims
   a fabricated verifier-fingerprint match
 - **AND** `overall_status` SHALL remain `"passed"` for that suite command
+- **AND** `candidate_sha` SHALL equal the worktree HEAD, not the trusted-surface all-zero decision SHA
+
+#### Scenario: atomic write failure after exit 0 is reported and does not invent a pass
+
+- **WHEN** `runTestGate` records a required command exit 0
+- **AND** the atomic Tester evidence write fails
+- **THEN** the typed persist observation SHALL report failure with the original error in bounded redacted form
+- **AND** the gate SHALL NOT claim a stored passed `tester-evidence.json` from that failed write

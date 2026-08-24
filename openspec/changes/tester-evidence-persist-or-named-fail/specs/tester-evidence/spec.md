@@ -2,7 +2,7 @@
 
 ### Requirement: Successful producer SHALL persist SHA-matched Tester evidence or fail_closed SHALL name the persist/acquire cause
 
-The pipeline SHALL write a SHA-matched `tester-evidence.json` for the candidate HEAD into the current run directory, **or** withhold review with a named persist/acquire reason, when the code-review path invokes the deterministic Tester producer because `on_missing` is `fail_closed` and trustworthy SHA-matched evidence is missing, stale, or malformed, and that producer records a required test-gate command exit 0. The named reason SHALL NOT be the generic missing-file string (`No Tester suite evidence file for this run (missing tester-evidence.json)`). A present trusted-surface decision with `outcome: blocked`, `repo_policy` `failure_reason: missing_base_sha`, and/or all-zero `candidate_sha` SHALL NOT be the sole cause of both (a) no suite artifact and (b) that generic missing-file withhold. Acquisition after the producer attempt SHALL remain load-only and SHALL NOT invent a suite pass. Readiness `evidence_subject` emission MAY stay fail-closed when trusted-surface is blocked; omitting the subject SHALL NOT omit the suite artifact after a recorded exit 0.
+The pipeline SHALL write a SHA-matched `tester-evidence.json` for the candidate HEAD into the current run directory, **or** withhold review with a named persist/acquire reason, when the code-review path invokes the deterministic Tester producer because `on_missing` is `fail_closed` and trustworthy SHA-matched evidence is missing, stale, or malformed, and that producer records a required test-gate command exit 0. Whether the producer recorded that exit 0 SHALL be a typed result from `runTestGate` (or the equivalent regenerate observation), not an inference from `summary.json` or free-form logs. The artifact `candidate_sha` SHALL be the worktree HEAD passed to the gate, validated as a full 40-character hex SHA, and SHALL NOT be the trusted-surface decision `candidate_sha` (including an all-zero sentinel). SHA-matched Tester evidence that omits `evidence_subject` SHALL still be current suite evidence for review acquisition (`legacy_unbound` SHA fallback) and SHALL remain unusable as a readiness-pass subject. The named reason SHALL be a closed persist/acquire code stored on the acquisition result and in durable run/comment evidence, and SHALL NOT be the generic missing-file string (`No Tester suite evidence file for this run (missing tester-evidence.json)`). A present trusted-surface decision with `outcome: blocked`, `repo_policy` `failure_reason: missing_base_sha`, and/or all-zero `candidate_sha` SHALL NOT be the sole cause of both (a) no suite artifact and (b) that generic missing-file withhold. An atomic write failure after recorded exit 0 SHALL produce the named persist-write-failed code, SHALL preserve the original error in bounded redacted form, and SHALL NOT manufacture a passed artifact. Acquisition after the producer attempt SHALL remain load-only and SHALL NOT invent a suite pass. Readiness `evidence_subject` emission MAY stay fail-closed when trusted-surface is blocked; omitting the subject SHALL NOT omit the suite artifact after a recorded exit 0.
 
 #### Scenario: successful producer persists SHA-matched artifact
 
@@ -16,11 +16,27 @@ The pipeline SHALL write a SHA-matched `tester-evidence.json` for the candidate 
 
 #### Scenario: persist failure after exit 0 uses a named withhold
 
-- **WHEN** the deterministic producer records a required test-gate command exit 0
+- **WHEN** the deterministic producer records a required test-gate command exit 0 as a typed observation
 - **AND** no SHA-matched `tester-evidence.json` exists after that attempt
-- **THEN** `fail_closed` SHALL withhold with a named persist/acquire reason other than the generic missing-file string
-- **AND** that reason SHALL name the persist/acquire cause (for example trusted-surface blocked, `missing_base_sha`, or persist write failure)
+- **THEN** `fail_closed` SHALL withhold with a named persist/acquire code other than the generic missing-file string
+- **AND** that code SHALL be stored on the acquisition result and in durable run or comment evidence
 - **AND** acquisition SHALL NOT invent a suite pass
+
+#### Scenario: atomic write failure after exit 0 is named and does not invent a pass
+
+- **WHEN** the deterministic producer records a required test-gate command exit 0
+- **AND** the atomic Tester evidence write fails
+- **THEN** the persist observation SHALL report write failure with the original error in bounded redacted form
+- **AND** the run directory SHALL NOT contain a manufactured `overall_status: "passed"` artifact from that failed write
+- **AND** review SHALL withhold with persist-write-failed (or an equivalent named persist/acquire code)
+
+#### Scenario: SHA-matched evidence without evidence_subject is current for review
+
+- **WHEN** a SHA-matched `tester-evidence.json` exists for the candidate HEAD
+- **AND** the record omits `evidence_subject`
+- **THEN** review acquisition SHALL classify the artifact as current suite evidence under existing SHA-match / `legacy_unbound` rules
+- **AND** SHALL NOT withhold the review model invoke solely because the subject is absent
+- **AND** readiness consumers SHALL still treat the omitted subject as unusable for a readiness pass
 
 #### Scenario: trusted-surface missing_base_sha is not generic missing
 

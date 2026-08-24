@@ -21,6 +21,7 @@ import {
   type RecoverParkedDeps,
   type ResidualFindingRecord,
 } from "../scripts/recover-parked.ts";
+import { formatTesterPersistAcquireHtmlComment } from "../scripts/tester-evidence.ts";
 import { encodeReviewArtifact } from "../scripts/stages/review-parsing.ts";
 import { lookupCommand, validateFlags, COMMAND_REGISTRY } from "../scripts/command-registry.ts";
 import { runTrain, type TrainDeps, type AdvanceWaveResult } from "../scripts/stages/train.ts";
@@ -1335,4 +1336,135 @@ test("R2-2: re-entry passes skipRecoverParked; nested recover-parked refuses", a
   assert.equal(sawSkipOnAdvance, true);
   assert.equal(nestedCalls, 1);
   assert.equal(nestedStatus, "fail-closed");
+});
+
+function persistAcquireComment(args: {
+  sha?: string;
+  code?: "persist_write_failed" | "unpinnable_candidate_sha" | "producer_exit_0_artifact_missing";
+}): string {
+  const sha = args.sha ?? HEAD;
+  const code = args.code ?? "producer_exit_0_artifact_missing";
+  return [
+    "Tester suite evidence gate (fail_closed): withholding review model invoke.",
+    formatTesterPersistAcquireHtmlComment({
+      recorded_required_exit_0: true,
+      persist_acquire_code: code,
+      candidate_sha: sha,
+    }),
+  ].join("\n");
+}
+
+test("tester persist/acquire withhold with no review residual re-enters advance", async () => {
+  const h = makeHarness({
+    labels: ["pipeline:review-1", "blocked"],
+    comments: [
+      {
+        author: "bot",
+        body: persistAcquireComment({}),
+        createdAt: "2026-08-23T21:21:52Z",
+      },
+    ],
+  });
+  const result = await runRecoverParked(cfg(), 1061, {}, h.deps);
+  assert.equal(result.status, "recovered");
+  assert.equal(result.reentered, true);
+  assert.equal(h.reentries, 1);
+  assert.equal(h.overrides.length, 0, "must not invent a review residual override");
+  assert.ok(h.posts.some((p) => p.includes("pipeline-recover-parked-spent")));
+});
+
+test("tester persist/acquire same SHA is spent after one pass", async () => {
+  const comments = [
+    {
+      author: "bot",
+      body: persistAcquireComment({}),
+      createdAt: "2026-08-23T21:21:52Z",
+    },
+  ];
+  const h = makeHarness({
+    labels: ["pipeline:review-1", "blocked"],
+    comments,
+  });
+  const first = await runRecoverParked(cfg(), 1061, {}, h.deps);
+  assert.equal(first.status, "recovered");
+  assert.equal(h.reentries, 1);
+  // Re-park at the same SHA with the same persist/acquire marker (spent comment remains).
+  h.setLabels(["pipeline:review-1", "blocked"]);
+  h.addComment({
+    author: "bot",
+    body: persistAcquireComment({}),
+    createdAt: "2026-08-23T21:30:00Z",
+  });
+  const second = await runRecoverParked(cfg(), 1061, {}, h.deps);
+  assert.equal(second.status, "already-spent");
+  assert.equal(h.reentries, 1, "must not re-enter again for the same fingerprint");
+});
+
+test("tester persist/acquire at a new candidate SHA may take one new pass", async () => {
+  const h = makeHarness({
+    labels: ["pipeline:review-1", "blocked"],
+    comments: [
+      {
+        author: "bot",
+        body: persistAcquireComment({ sha: HEAD }),
+        createdAt: "2026-08-23T21:21:52Z",
+      },
+    ],
+  });
+  const first = await runRecoverParked(cfg(), 1061, {}, h.deps);
+  assert.equal(first.status, "recovered");
+  h.setLabels(["pipeline:review-1", "blocked"]);
+  h.setHead(HEAD2);
+  h.addComment({
+    author: "bot",
+    body: persistAcquireComment({ sha: HEAD2 }),
+    createdAt: "2026-08-23T22:00:00Z",
+  });
+  const second = await runRecoverParked(cfg(), 1061, {}, h.deps);
+  assert.equal(second.status, "recovered");
+  assert.equal(h.reentries, 2);
+});
+
+test("tester persist/acquire does not auto-override a HEAD-bound HIGH residual", async () => {
+  const h = makeHarness({
+    labels: ["pipeline:needs-human", "blocked"],
+    comments: [
+      {
+        author: "bot",
+        body: persistAcquireComment({}),
+        createdAt: "2026-08-23T21:21:52Z",
+      },
+      {
+        author: "bot",
+        body: reviewBody({
+          sha: HEAD,
+          findings: [{ key: KEY_HIGH, severity: "high", title: "real high" }],
+        }),
+        createdAt: "2026-08-23T21:22:00Z",
+      },
+    ],
+  });
+  const result = await runRecoverParked(cfg(), 1061, {}, h.deps);
+  assert.equal(result.status, "still-parked");
+  assert.equal(h.overrides.length, 0);
+  assert.equal(h.reentries, 0);
+});
+
+test("generic missing-file withhold without producer-success record stays fail-closed", async () => {
+  const h = makeHarness({
+    labels: ["pipeline:review-1", "blocked"],
+    comments: [
+      {
+        author: "bot",
+        body:
+          "Tester suite evidence gate (fail_closed): withholding review model invoke. " +
+          "No Tester suite evidence file for this run (missing tester-evidence.json).",
+        createdAt: "2026-08-23T21:21:52Z",
+      },
+    ],
+  });
+  const result = await runRecoverParked(cfg(), 1061, {}, h.deps);
+  assert.equal(result.status, "still-parked");
+  assert.equal(h.reentries, 0);
+  assert.match(result.message, /no HEAD-bound residual review artifact/);
 });

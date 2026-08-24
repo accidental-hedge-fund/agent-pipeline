@@ -7,7 +7,9 @@ v1.40.0 train STOPped on #1048 at review-1 after the deterministic tester produc
 - **Class law, not a #1048 mole.** After `loadOrRegenerateTesterEvidenceForReview` runs the producer and that producer records a test-gate command exit 0, the run directory SHALL contain a SHA-matched `tester-evidence.json` for the candidate HEAD, **or** review SHALL fail with a named persist/acquire reason other than `missing tester-evidence.json`.
 - A successful suite command SHALL persist the Tester family artifact even when trusted-surface is `blocked` (`missing_base_sha`, all-zero `candidate_sha`). Readiness subject emission MAY stay fail-closed. The suite record SHALL NOT be omitted for that reason.
 - `fail_closed` SHALL NOT collapse a present `trusted-surface.json` `repo_policy` `missing_base_sha` / all-zero `candidate_sha` into the generic missing-file withhold string.
-- Named persist/acquire fail SHALL be recoverable by `recover-parked` or a later same-argv review retry. It SHALL NOT be a dead park whose only residual is "no HEAD-bound review finding."
+- Named persist/acquire fail SHALL be a closed durable code (acquisition result + run/comment evidence), not only a different display string. `recover-parked` or a later same-argv review retry SHALL act on that code. It SHALL NOT be a dead park whose only residual is "no HEAD-bound review finding." Retry SHALL be bounded by candidate SHA and one spent-fingerprint pass.
+- Whether the producer recorded required-command exit 0 SHALL be a typed `runTestGate` observation passed through regeneration/acquisition, not inferred from `summary.json` or logs.
+- Artifact SHA SHALL be the worktree HEAD (full 40-hex), never trusted-surface's all-zero `candidate_sha`. SHA-matched evidence without `evidence_subject` SHALL be current for review and unusable as a readiness pass.
 - Unit tests inject I/O. They fail if withhold stays true solely because the file is missing after a producer that recorded test-gate exit 0, and if the trusted-surface blocked diagnostic is collapsed into the generic missing-file string.
 
 **BREAKING:** none. `on_missing` default stays `fail_closed`. Review still does not invent a suite pass.

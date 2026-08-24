@@ -37,6 +37,51 @@ export const TESTER_EVIDENCE_KIND = "tester_evidence" as const;
 export const TESTER_TARGETED_CHECK_KIND = "tester_targeted_check" as const;
 export const TESTER_EVIDENCE_FILENAME = "tester-evidence.json";
 export const TESTER_TARGETED_CHECKS_FILENAME = "targeted-checks.jsonl";
+export const TESTER_PERSIST_ACQUIRE_FILENAME = "tester-persist-acquire.json";
+export const TESTER_PERSIST_ACQUIRE_MARKER = "pipeline-tester-persist-acquire: v1";
+/** Generic fail_closed missing-file string. Forbidden after recorded test-gate exit 0. */
+export const TESTER_EVIDENCE_MISSING_FILE_REASON =
+  "No Tester suite evidence file for this run (missing tester-evidence.json).";
+
+export const TESTER_PERSIST_ACQUIRE_CODES = [
+  "persist_write_failed",
+  "unpinnable_candidate_sha",
+  "producer_exit_0_artifact_missing",
+] as const;
+
+export type TesterPersistAcquireCode = (typeof TESTER_PERSIST_ACQUIRE_CODES)[number];
+
+export function isTesterPersistAcquireCode(
+  value: unknown,
+): value is TesterPersistAcquireCode {
+  return (
+    typeof value === "string" &&
+    (TESTER_PERSIST_ACQUIRE_CODES as readonly string[]).includes(value)
+  );
+}
+
+/** Typed producer observation from `runTestGate` (never inferred from logs). */
+export interface TesterProducerPersistObservation {
+  ok: boolean;
+  candidate_sha: string | null;
+  code?: TesterPersistAcquireCode;
+  error?: string;
+}
+
+export interface TesterProducerObservation {
+  recorded_required_exit_0: boolean;
+  required_command_exit_code: number | null;
+  persist: TesterProducerPersistObservation;
+}
+
+export interface TesterPersistAcquireRecord {
+  recorded_required_exit_0: boolean;
+  persist_acquire_code: TesterPersistAcquireCode;
+  candidate_sha: string;
+}
+
+const PERSIST_ACQUIRE_MARKER_RE =
+  /<!--\s*pipeline-tester-persist-acquire:\s*v1\s+(\{.*?\})\s*-->/gs;
 
 export const DEFAULT_MAX_OUTPUT_CHARS = 4000;
 export const DEFAULT_MAX_ARTIFACT_CHARS = 48_000;
@@ -543,6 +588,11 @@ export interface TesterAcquisitionResult {
   withholdInvoke: boolean;
   /** Human/machine reason for non-current classifications. */
   reason: string;
+  /**
+   * Closed persist/acquire code after a producer that recorded test-gate exit 0
+   * still could not yield a current artifact. Absent on the generic missing path.
+   */
+  persist_acquire_code?: TesterPersistAcquireCode;
   /** Rendered prompt section (always present when review proceeds). */
   section: string;
   /**
@@ -920,8 +970,7 @@ export function loadTesterEvidenceForReviewSync(
   pinOpts: TesterAcquisitionPinOpts = {},
 ): TesterAcquisitionResult {
   if (readResult.status === "missing") {
-    const reason =
-      "No Tester suite evidence file for this run (missing tester-evidence.json).";
+    const reason = TESTER_EVIDENCE_MISSING_FILE_REASON;
     const base: TesterAcquisitionResult = {
       classification: "missing",
       artifact: null,
@@ -1150,6 +1199,222 @@ export function isTesterRegenerableClassification(
 }
 
 /**
+ * Normalize a regenerate callback result. `Promise<void>` and objects that
+ * omit `recorded_required_exit_0` are treated as "did not record exit 0".
+ * Never infers success from `passed`, `summary.json`, or logs.
+ */
+export function normalizeTesterProducerObservation(
+  raw: void | TesterProducerObservation | { recorded_required_exit_0?: unknown; required_command_exit_code?: unknown; persist?: unknown },
+): TesterProducerObservation {
+  if (!raw || typeof raw !== "object") {
+    return {
+      recorded_required_exit_0: false,
+      required_command_exit_code: null,
+      persist: { ok: false, candidate_sha: null },
+    };
+  }
+  const persistRaw =
+    raw.persist && typeof raw.persist === "object"
+      ? (raw.persist as TesterProducerPersistObservation)
+      : null;
+  const persist: TesterProducerPersistObservation = {
+    ok: persistRaw?.ok === true,
+    candidate_sha:
+      typeof persistRaw?.candidate_sha === "string" ? persistRaw.candidate_sha : null,
+  };
+  if (isTesterPersistAcquireCode(persistRaw?.code)) persist.code = persistRaw.code;
+  if (typeof persistRaw?.error === "string" && persistRaw.error) {
+    persist.error = boundExcerpt(persistRaw.error, 500);
+  }
+  const exitCode =
+    typeof raw.required_command_exit_code === "number" &&
+    Number.isFinite(raw.required_command_exit_code)
+      ? raw.required_command_exit_code
+      : null;
+  return {
+    recorded_required_exit_0: raw.recorded_required_exit_0 === true,
+    required_command_exit_code: exitCode,
+    persist,
+  };
+}
+
+export function persistAcquireCodeFromObservation(
+  obs: TesterProducerObservation,
+): TesterPersistAcquireCode {
+  if (isTesterPersistAcquireCode(obs.persist.code)) return obs.persist.code;
+  if (obs.persist.ok === false && obs.persist.error) return "persist_write_failed";
+  if (!normalizeCandidateSha(obs.persist.candidate_sha ?? "")) {
+    return "unpinnable_candidate_sha";
+  }
+  return "producer_exit_0_artifact_missing";
+}
+
+export function formatTesterPersistAcquireHtmlComment(
+  record: TesterPersistAcquireRecord,
+): string {
+  const payload = {
+    recorded_required_exit_0: record.recorded_required_exit_0,
+    persist_acquire_code: record.persist_acquire_code,
+    candidate_sha: record.candidate_sha,
+  };
+  return `<!-- ${TESTER_PERSIST_ACQUIRE_MARKER} ${JSON.stringify(payload)} -->`;
+}
+
+/** Latest well-formed persist/acquire marker from issue comments. */
+export function extractTesterPersistAcquire(
+  comments: readonly { body: string }[],
+): TesterPersistAcquireRecord | null {
+  let found: TesterPersistAcquireRecord | null = null;
+  for (const c of comments) {
+    PERSIST_ACQUIRE_MARKER_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = PERSIST_ACQUIRE_MARKER_RE.exec(c.body)) !== null) {
+      try {
+        const obj = JSON.parse(m[1]) as Record<string, unknown>;
+        if (obj.recorded_required_exit_0 !== true) continue;
+        if (!isTesterPersistAcquireCode(obj.persist_acquire_code)) continue;
+        if (typeof obj.candidate_sha !== "string") continue;
+        found = {
+          recorded_required_exit_0: true,
+          persist_acquire_code: obj.persist_acquire_code,
+          candidate_sha: obj.candidate_sha,
+        };
+      } catch {
+        /* malformed payload ignored */
+      }
+    }
+  }
+  PERSIST_ACQUIRE_MARKER_RE.lastIndex = 0;
+  return found;
+}
+
+function persistAcquirePath(runDir: string): string {
+  return path.join(runDir, TESTER_PERSIST_ACQUIRE_FILENAME);
+}
+
+async function writeTesterPersistAcquireRecord(
+  runDir: string,
+  record: Record<string, unknown>,
+  io: TesterEvidenceIoDeps,
+): Promise<void> {
+  const finalPath = persistAcquirePath(runDir);
+  const tmp = `${finalPath}.tmp.${process.pid}.${Date.now()}`;
+  const serialized = sanitize(
+    redactSecrets(`${JSON.stringify(record, null, 2)}\n`),
+  );
+  await io.mkdir(runDir, { recursive: true });
+  await io.writeFile(tmp, serialized);
+  await io.rename(tmp, finalPath);
+}
+
+async function trustedSurfacePersistHint(
+  runDir: string,
+  io: TesterEvidenceIoDeps,
+): Promise<{ outcome?: string; failure_reason?: string; candidate_sha?: string } | null> {
+  try {
+    const raw = await io.readFile(path.join(runDir, "trusted-surface.json"));
+    const o = JSON.parse(raw) as Record<string, unknown>;
+    if (!o || typeof o !== "object") return null;
+    const hint: { outcome?: string; failure_reason?: string; candidate_sha?: string } = {};
+    if (typeof o.outcome === "string") hint.outcome = o.outcome;
+    if (typeof o.candidate_sha === "string") hint.candidate_sha = o.candidate_sha;
+    const classes = Array.isArray(o.classes) ? o.classes : [];
+    for (const cls of classes) {
+      if (!cls || typeof cls !== "object") continue;
+      const rec = cls as Record<string, unknown>;
+      if (typeof rec.failure_reason === "string" && rec.failure_reason) {
+        hint.failure_reason = rec.failure_reason;
+        break;
+      }
+    }
+    if (!hint.failure_reason && o.reason && typeof o.reason === "object") {
+      const reason = o.reason as Record<string, unknown>;
+      if (typeof reason.failure_reason === "string") {
+        hint.failure_reason = reason.failure_reason;
+      } else if (typeof reason.detail === "string") {
+        hint.failure_reason = reason.detail;
+      }
+    }
+    return hint.outcome || hint.failure_reason ? hint : null;
+  } catch {
+    return null;
+  }
+}
+
+function namedPersistAcquireReason(
+  code: TesterPersistAcquireCode,
+  opts: {
+    persistError?: string;
+    trustedSurface?: { outcome?: string; failure_reason?: string } | null;
+  },
+): string {
+  let named = `Tester persist/acquire failed after required test-gate exit 0 (${code}).`;
+  if (opts.trustedSurface?.failure_reason) {
+    named += ` trusted-surface ${opts.trustedSurface.outcome ?? "blocked"}: ${opts.trustedSurface.failure_reason}`;
+  }
+  if (code === "persist_write_failed" && opts.persistError) {
+    named += ` ${opts.persistError}`;
+  }
+  if (code === "unpinnable_candidate_sha") {
+    named += " worktree HEAD is not a pinnable 40-character SHA.";
+  }
+  return named;
+}
+
+async function applyNamedPersistAcquireFail(
+  acq: TesterAcquisitionResult,
+  args: {
+    runDir: string;
+    candidateSha: string;
+    obs: TesterProducerObservation;
+    io: TesterEvidenceIoDeps;
+  },
+): Promise<TesterAcquisitionResult> {
+  const code = persistAcquireCodeFromObservation(args.obs);
+  const pinned = normalizeCandidateSha(args.obs.persist.candidate_sha ?? args.candidateSha) ??
+    (typeof args.candidateSha === "string" ? args.candidateSha : "");
+  const record: TesterPersistAcquireRecord = {
+    recorded_required_exit_0: true,
+    persist_acquire_code: code,
+    candidate_sha: pinned,
+  };
+  const tsHint = await trustedSurfacePersistHint(args.runDir, args.io);
+  const named = namedPersistAcquireReason(code, {
+    persistError: args.obs.persist.error,
+    trustedSurface: tsHint,
+  });
+  const marker = formatTesterPersistAcquireHtmlComment(record);
+  acq.persist_acquire_code = code;
+  acq.withholdInvoke = true;
+  // Marker first so formatStderrExcerpt's 500-char slice keeps the durable code.
+  acq.reason = `${marker}\n${named}`;
+  acq.section = renderTesterEvidenceSection(acq);
+  try {
+    await writeTesterPersistAcquireRecord(
+      args.runDir,
+      {
+        schema_version: 1,
+        recorded_required_exit_0: true,
+        persist_acquire_code: code,
+        candidate_sha: pinned,
+        required_command_exit_code: args.obs.required_command_exit_code,
+        persist_ok: args.obs.persist.ok,
+        error: args.obs.persist.error,
+        trusted_surface: tsHint,
+      },
+      args.io,
+    );
+  } catch (err) {
+    console.warn(
+      `[pipeline] tester-evidence: persist-acquire record write failed (non-fatal): ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
+  return acq;
+}
+
+/**
  * Load SHA-matched Tester evidence for review; when fail_closed would withhold
  * because the artifact is missing/stale/malformed, optionally invoke the
  * deterministic producer once and re-acquire.
@@ -1159,12 +1424,15 @@ export function isTesterRegenerableClassification(
  * Used by review-1 / review-2 / delta so a fresh runDir after design-gate or a
  * candidate-changing commit is not permanently parked solely for absent
  * `tester-evidence.json` in this run directory.
+ *
+ * After a producer that records required-command exit 0, missing re-acquire
+ * uses a named persist/acquire code instead of the generic missing-file string.
  */
 export async function loadOrRegenerateTesterEvidenceForReview(
   runDir: string | undefined,
   candidateSha: string,
   cfg: Pick<PipelineConfig, "tester_evidence"> | { tester_evidence?: TesterEvidenceConfig },
-  regenerate?: () => Promise<void>,
+  regenerate?: () => Promise<void | TesterProducerObservation>,
   io: TesterEvidenceIoDeps = defaultIoDeps,
   pinOpts: TesterAcquisitionPinOpts = {},
 ): Promise<TesterAcquisitionResult> {
@@ -1177,8 +1445,13 @@ export async function loadOrRegenerateTesterEvidenceForReview(
     `[pipeline] tester-evidence: ${acq.classification} under fail_closed — ` +
       `running deterministic producer once before withhold (candidate ${candidateSha.slice(0, 12) || "unknown"})`,
   );
+  let observation: TesterProducerObservation = {
+    recorded_required_exit_0: false,
+    required_command_exit_code: null,
+    persist: { ok: false, candidate_sha: null },
+  };
   try {
-    await regenerate();
+    observation = normalizeTesterProducerObservation(await regenerate());
   } catch (err) {
     console.warn(
       `[pipeline] tester-evidence: pre-review regeneration failed (non-fatal): ${
@@ -1186,7 +1459,19 @@ export async function loadOrRegenerateTesterEvidenceForReview(
       }`,
     );
   }
-  return loadTesterEvidenceForReview(runDir, candidateSha, cfg, io, pinOpts);
+  acq = await loadTesterEvidenceForReview(runDir, candidateSha, cfg, io, pinOpts);
+  if (
+    observation.recorded_required_exit_0 &&
+    acq.classification === "missing"
+  ) {
+    return applyNamedPersistAcquireFail(acq, {
+      runDir,
+      candidateSha,
+      obs: observation,
+      io,
+    });
+  }
+  return acq;
 }
 
 // ---------------------------------------------------------------------------

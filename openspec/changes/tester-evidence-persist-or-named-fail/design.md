@@ -22,8 +22,9 @@ Living `evidence-subject` already forbids a fabricated readiness subject on bloc
 
 - After a producer that recorded test-gate exit 0, persist SHA-matched `tester-evidence.json` for the real candidate HEAD.
 - Blocked trusted-surface / unusable verifier pin omits fabricated `evidence_subject`; it does not skip the suite write.
-- If persist still cannot happen, withhold names the persist/acquire cause. Generic missing-file string is forbidden on that path.
-- `recover-parked` retries named persist/acquire withholds that have no review residual.
+- SHA-matched suite evidence without `evidence_subject` is current for review acquisition and unusable as a readiness-pass subject.
+- If persist still cannot happen, withhold names a machine-readable persist/acquire code. Generic missing-file string is forbidden on that path.
+- `recover-parked` retries named persist/acquire withholds that have no review residual, bounded by candidate SHA and one spent-fingerprint pass.
 - Tests inject I/O and bite on the #1048 shape.
 
 **Non-Goals:**
@@ -32,15 +33,16 @@ Living `evidence-subject` already forbids a fabricated readiness subject on bloc
 - Inventing a readiness subject or verifier fingerprint on blocked trusted-surface.
 - Fully repairing every `missing_base_sha` / all-zero SHA trusted-surface computation (named diagnostic + persist the suite record is this class). A follow-up MAY pin trusted-surface to the real HEAD and base SHA; this change MUST NOT depend on that to unblock review.
 - Auto-overriding HIGH/CRITICAL/security.
+- Adding a new `BlockerKind` or stage-diagnostic reason code. Keep `harness-failure` for the withhold Outcome.
 - 300-file `getPrDiff` (#1223). Splitting #1048. Tugboat/Buzz. Merge inside advance/loop.
 
 ## Decisions
 
-### 1. Persist the suite record even when subject emission fail-closes
+### 1. Persist the suite record even when subject emission fail-closes (primary)
 
-**Choice:** After a required test-gate command exits 0 and HEAD is a full 40-char SHA, write `tester-evidence.json` with suite `overall_status: "passed"` (or the recorded non-pass class). If trusted-surface is blocked, omit `evidence_subject` (legacy_unbound / no fabricated verifier pin). Do not `return` before `writeTesterEvidence` solely because `resolveVerifierFingerprint` is null.
+**Choice:** After a required test-gate command exits 0 and HEAD is a full 40-char SHA, write `tester-evidence.json` with suite `overall_status: "passed"` (or the recorded non-pass class). If trusted-surface is blocked, omit `evidence_subject` (no fabricated verifier pin). Do not `return` before `writeTesterEvidence` solely because `resolveVerifierFingerprint` is null.
 
-**Why:** Review needs SHA-matched suite evidence, not a readiness subject. Deploy-ready / readiness already fail-closed on blocked trusted-surface. Skipping the family artifact turns a named trusted-surface block into a generic missing-file park that recover-parked cannot see.
+**Why:** Review needs SHA-matched suite evidence, not a readiness subject. Deploy-ready / readiness already fail-closed on blocked trusted-surface. Skipping the family artifact turns a named trusted-surface block into a generic missing-file park that recover-parked cannot see. A successful persist in the same invocation is how review-1 continues; named fail is only the fallback.
 
 **Alternatives considered:**
 
@@ -48,54 +50,94 @@ Living `evidence-subject` already forbids a fabricated readiness subject on bloc
 - Invent an engine-only verifier fingerprint so subject can be emitted on blocked TS → rejected. Violates living `evidence-subject`.
 - Mark `overall_status: unavailable` because TS is blocked even though CI exited 0 → rejected. That lies about the suite. Suite status is command authority.
 
-### 2. Named withhold is the fallback, not the happy path
+### 2. Artifact SHA is worktree HEAD, never trusted-surface `candidate_sha`
 
-**Choice:** If persist still cannot happen after recorded exit 0 (I/O failure, unpinnable HEAD), re-acquire MUST NOT use the generic missing-file string. The reason MUST name the persist/acquire cause (`trusted-surface blocked: missing_base_sha`, persist write failure, invalid candidate SHA). `withholdInvoke` MAY stay true in that fallback. Same-argv retry / recover-parked can act on the name.
+**Choice:** `recordEvidence` pins `TesterEvidence.candidate_sha` from the gate's worktree HEAD (`deps.gitHead(wtPath)`), then `normalizeCandidateSha` (full 40-hex). It SHALL NOT copy `trusted-surface.json`'s `candidate_sha` (including the all-zero sentinel from #1048). Unpinnable HEAD still MUST NOT write a fake SHA.
 
-**Why:** AC1 is persist **or** named fail. Persist is how review-1 continues in-process (unblocks v1.40.0 train). Named fail is how a true persist hole stays diagnosable.
+**Why:** Review acquisition matches the artifact to the candidate under review. The #1048 trusted-surface decision SHA was zeros; using it would make a written file stale against the real HEAD (`c7fe8128ffff…`). Existing `normalizeCandidateSha` in `core/scripts/tester-evidence.ts` is the pin function.
+
+### 3. Suite evidence without `evidence_subject` is review-current, not a readiness pass
+
+**Choice:** SHA-matched `TesterEvidence` that omits `evidence_subject` is valid suite evidence for review acquisition. `loadTesterEvidenceForReviewSync` already classifies that path `current` with `subject_outcome: "legacy_unbound"` and `withholdInvoke: false` when `candidate_sha` matches. Keep that. Do not invent a new acquisition class. Readiness / deploy-ready consumers still treat a missing or unusable subject as non-current and SHALL NOT treat this record as a readiness-pass subject.
+
+**Why:** Living tester-evidence already allows `legacy_unbound` SHA fallback. Newly produced records may omit the subject when subject emission fail-closes; they are not only historical. Review needs the suite row. Readiness still fail-closes on blocked trusted-surface.
+
+### 4. Typed producer observation, not logs or `summary.json`
+
+**Choice:** Extend `TestGateResult` with a typed producer observation:
+
+```ts
+recorded_required_exit_0: boolean
+required_command_exit_code: number | null
+persist: {
+  ok: boolean
+  candidate_sha: string | null  // 40-hex or null
+  code?: TesterPersistAcquireCode
+  error?: string                // bounded, redacted original write error
+}
+```
+
+Change `loadOrRegenerateTesterEvidenceForReview`'s regenerate callback from `() => Promise<void>` to `() => Promise<TesterProducerObservation>`. Review-routing and pre-merge SHA-gate pass through `runTestGate`'s typed result. Acquisition MUST NOT infer exit 0 from `summary.json`, `terminal.log`, or free-form stderr.
+
+**Why:** Plan review required an explicit typed result from `runTestGate` through regeneration/acquisition. The current callback is `Promise<void>` and discards `TestGateResult`. Inferring from logs is the class of bug this issue is about.
+
+**Pattern:** `TestGateResult` in `core/scripts/testgate.ts` already carries typed gate outcomes (`passed`, `toolingFailure`, `dirtyWorktree`) instead of parsing command output. Extend that object; do not add a parallel channel.
+
+### 5. Named withhold is the fallback; the code is durable and machine-readable
+
+**Choice:** If persist still cannot happen after recorded exit 0 (atomic write failure, unpinnable HEAD, or re-acquire still missing), re-acquire MUST NOT use the generic missing-file string. Set a closed `TesterPersistAcquireCode` on `TesterAcquisitionResult` (`persist_write_failed` | `unpinnable_candidate_sha` | `producer_exit_0_artifact_missing`). Persist that code in the run directory as `tester-persist-acquire.json` and as an HTML comment marker on the blocked comment (`<!-- pipeline-tester-persist-acquire: v1 {…} -->`), matching `RECOVER_PARKED_SPENT_MARKER` in `core/scripts/recover-parked.ts`. `withholdInvoke` stays true. Same-argv retry / recover-parked consume the code, not display prose.
+
+Do **not** add a new `BlockerKind`. Keep `harness-failure` for the withhold Outcome (`testerEvidenceWithholdResult` + existing #882 path). Display text may include trusted-surface `blocked` / `missing_base_sha` as context; the machine code is the persist/acquire enum.
+
+**Why:** AC1 is persist **or** named fail. Persist is how review-1 continues in-process (unblocks v1.40.0 train). Named fail is how a true persist hole stays diagnosable. A display-string-only change is not durable: recover-parked would have to parse prose.
 
 **Alternatives considered:**
 
 - Always withhold as missing when the file is absent, regardless of producer result → this is the bug.
 - Fail-open after producer success even without a file → rejected. Invents a path that implies the suite is reviewable without evidence.
+- New `BlockerKind` → rejected as extra closed-enum cascade (recipes, stage-diagnostic map). Persist-first usually eliminates the park. The HTML marker is the recover-parked signal.
 
-### 3. Producer callback contract for tests
+### 6. Atomic write failure after exit 0 never manufactures a passed artifact
 
-**Choice:** The biting unit test does not need a live `runTestGate`. It injects a regenerate callback that records test-gate exit 0 (in-memory command row / sidecar) and either writes the artifact or leaves a blocked `trusted-surface.json`. Assert: after `loadOrRegenerate`, either `withholdInvoke === false` with SHA-matched artifact, or withhold reason is not the generic missing-file string. A second test feeds `trusted-surface.json` `missing_base_sha` + all-zero SHA and fails on generic collapse.
+**Choice:** `writeTesterEvidence` already returns `{ ok: false, error }` and does not claim stored success (`core/scripts/tester-evidence.ts`). After recorded exit 0, `recordEvidence` MUST surface that result on `TestGateResult.persist` (`ok: false`, `code: persist_write_failed`, bounded redacted `error`). It MUST NOT write a substitute passed artifact. Acquisition then withholds with that named code.
 
-Existing test "regenerate that writes nothing still withholds" remains valid **only** when the callback does not record test-gate exit 0.
+**Why:** Plan review required an explicit persistence-error path. Today's `recordEvidence` swallows write errors as `console.warn` and returns void, so acquisition only sees generic missing.
 
-**Why:** Issue AC3/AC4. Inject I/O. No live network/git/subprocess.
+### 7. recover-parked retries named persist/acquire, bounded by SHA and one spent pass
 
-### 4. recover-parked retries named persist/acquire, not missing-review DNR
+**Choice:** Before the "no HEAD-bound residual review artifact" `still-parked` return, if the causal park carries a `pipeline-tester-persist-acquire` marker with `recorded_required_exit_0: true` and a named code, and there is no HEAD-bound review finding, re-enter `pipeline single` via existing `reenterAdvanceAfterRecoverParked`. Fingerprint is `(issue, stage, persist_acquire_code, candidate_sha)`. Reuse `isFingerprintSpent` / spent-comment ledger. One supervisor pass per fingerprint: a persistent write failure at the same SHA becomes `already-spent` and stays parked. A new candidate SHA is a new fingerprint. Keep the existing refuse for parks that are generic missing without a producer-success record, and for HIGH/CRITICAL/security residuals. Do not invent a review residual. Do not add a second recoverer.
 
-**Choice:** If the causal park reason is a named Tester persist/acquire withhold and there is no HEAD-bound review finding, re-enter `pipeline single`. Do not return `still-parked` solely for "no HEAD-bound residual review artifact." Keep the existing refuse for parks that are generic missing without a producer-success record, and for HIGH/CRITICAL/security residuals.
-
-**Why:** #1048 recover-parked refused because review never ran. After persist-in-process, that park should not occur. Named-fail fallback still needs a controller recipe: retry review, do not invent DNR.
+**Why:** #1048 recover-parked refused because review never ran. After persist-in-process, that park should not occur. Named-fail fallback still needs a controller recipe: retry review once per SHA, do not loop forever, do not invent DNR.
 
 **Alternatives considered:**
 
 - Teach recover-parked to override a synthetic finding → rejected. There is no review finding.
 - Leave recover-parked unchanged because persist-in-process is enough → incomplete class: named-fail fallback would still be a dead park.
+- Unbounded re-entry on every recover-parked invoke → rejected. Persistent write failure would loop.
 
-### 5. Do not fix trusted-surface `missing_base_sha` as a prerequisite
+### 8. Do not fix trusted-surface `missing_base_sha` as a prerequisite
 
-**Choice:** This change does not require trusted-surface to resolve base SHA or to stop writing all-zero `candidate_sha` sentinels. Review unblocks by persisting suite evidence (or naming the block). A later issue MAY pin trusted-surface evaluation to the real HEAD and merge-base.
+**Choice:** This change does not require trusted-surface to resolve base SHA or to stop writing all-zero `candidate_sha` sentinels. Review unblocks by persisting suite evidence (or naming the persist/acquire code). A later issue MAY pin trusted-surface evaluation to the real HEAD and merge-base.
 
 **Why:** Class is persist/acquire after successful producer. Coupling review to a full trusted-surface repair expands scope and still needs persist-or-named-fail if TS remains blocked for a real policy reason.
 
+### 9. Implementation order is persist, then named fail, then recover
+
+**Choice:** Ship in one PR, but implement and prove in this order: (1) successful-gate artifact persistence for the #1048 shape; (2) typed observation + named post-producer acquisition failure only as fallback; (3) recover-parked consumption of the durable code, SHA-bounded. A green persist test on blocked trusted-surface should normally eliminate the parked state.
+
 ## Risks / Trade-offs
 
-- **[Risk] Suite evidence without `evidence_subject` looks like a readiness pass.** → Mitigation: omit fabricated subject; readiness consumers already treat missing/unusable subject as non-current; deploy-ready still fail-closes on blocked trusted-surface. Tests assert no fabricated verifier-fingerprint match.
-- **[Risk] recover-parked re-entry loops on a persist hole that never writes.** → Mitigation: named reason stays; generic missing without producer success does not take this path; existing fingerprint / still-parked rules bound retries. Do not add a second recoverer.
+- **[Risk] Suite evidence without `evidence_subject` looks like a readiness pass.** → Mitigation: omit fabricated subject; `subject_outcome: legacy_unbound`; readiness consumers already treat missing/unusable subject as non-current; deploy-ready still fail-closes on blocked trusted-surface. Tests assert review-current + no fabricated verifier-fingerprint match.
+- **[Risk] recover-parked re-entry loops on a persist hole that never writes.** → Mitigation: spent fingerprint includes candidate SHA + persist code; one pass per fingerprint; generic missing without producer success does not take this path.
 - **[Risk] Existing "writes nothing still withholds" test is over-broad.** → Mitigation: keep it for callbacks that do not record exit 0; add the exit-0 persist-or-named-fail test that fails on generic missing.
+- **[Risk] Inferring producer success from summary.json.** → Mitigation: typed `TesterProducerObservation` from `runTestGate`; tests inject that object, not log text.
 
 ## Migration Plan
 
-- Ship in one PR with `core/` + regenerated `plugin/`. No config key. No artifact schema bump required (schema_version 1 records without subject remain `legacy_unbound`).
+- Ship in one PR with `core/` + regenerated `plugin/`. No config key. No artifact schema bump required (schema_version 1 records without subject remain `legacy_unbound` for review SHA fallback).
 - Rollback is revert. In-flight runs with missing files retry persist-or-named-fail on next review-1.
 - No data backfill.
 
 ## Open Questions
 
-None. Persist-after-exit-0 vs named-fail fallback is decided. Trusted-surface base-SHA repair is out of scope.
+None. Persist-after-exit-0 is primary. Named-fail fallback uses a durable code. Trusted-surface base-SHA repair is out of scope.

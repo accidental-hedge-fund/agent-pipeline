@@ -400,3 +400,85 @@ test("invokePromptHarnessReview: fail_closed still withholds when regenerate wri
     process.env.PATH = oldPath;
   }
 });
+
+test("invokePromptHarnessReview: #1048-shaped trusted-surface after exit 0 names persist/acquire code", async () => {
+  const binDir = makeFakeClaude();
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  const wt = fs.mkdtempSync(path.join(tmpRoot, "wt-"));
+  const runDir = fs.mkdtempSync(path.join(tmpRoot, "run-"));
+  const zeroSha = "0".repeat(40);
+  const headSha = "c".repeat(40);
+  let gateCalls = 0;
+  try {
+    fs.writeFileSync(
+      path.join(runDir, "trusted-surface.json"),
+      `${JSON.stringify({
+        schema_version: 1,
+        path_class_schema_version: 1,
+        outcome: "blocked",
+        candidate_sha: zeroSha,
+        base_sha: null,
+        triggering_paths: [".github/pipeline.yml"],
+        classes: [{ id: "repo_policy", status: "failed", failure_reason: "missing_base_sha" }],
+        effective_verifier_hash: null,
+        reason: { detail: "missing_base_sha" },
+      })}\n`,
+    );
+    const cfg = baseCfg({
+      tester_evidence: {
+        on_missing: "fail_closed",
+        max_output_chars: 4000,
+        max_artifact_chars: 48_000,
+        extractors: [],
+      },
+    });
+    const { result, effectiveReviewer } = await invokePromptHarnessReview(
+      cfg,
+      1048,
+      "Test issue",
+      "test body",
+      "plan text",
+      undefined,
+      undefined,
+      "diff text",
+      1,
+      wt,
+      {
+        runDir,
+        pipelineRunId: "1048-test",
+        runTestGate: async () => {
+          gateCalls += 1;
+          return {
+            skipped: false,
+            passed: true,
+            attempts: 0,
+            recorded_required_exit_0: true,
+            required_command_exit_code: 0,
+            persist: {
+              ok: false,
+              candidate_sha: headSha,
+              code: "producer_exit_0_artifact_missing" as const,
+            },
+          };
+        },
+      },
+    );
+    assert.equal(gateCalls, 1);
+    assert.equal(effectiveReviewer, "tester-evidence-gate");
+    assert.equal(result.success, false);
+    assert.doesNotMatch(
+      result.stderr,
+      /No Tester suite evidence file for this run \(missing tester-evidence\.json\)/,
+    );
+    assert.match(result.stderr, /pipeline-tester-persist-acquire: v1/);
+    assert.match(result.stderr, /producer_exit_0_artifact_missing/);
+    assert.match(result.stderr, /trusted-surface blocked: missing_base_sha/);
+    assert.ok(
+      fs.existsSync(path.join(runDir, "tester-persist-acquire.json")),
+      "durable persist/acquire record must be written",
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
