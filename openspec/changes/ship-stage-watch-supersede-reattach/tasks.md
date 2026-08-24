@@ -11,6 +11,7 @@
 - [x] 2.2 Change `examples/supervisor/shell/ship-stage-watch.sh` follow mode so the watcher process exits after bound-stream identity-terminal. Reap the follow child (`tail -F` or equivalent) so `pipefail` cannot hang on a silent file. Do not glob latest runs or open a `superseded_by` path. Verify task 1.1 now passes
 - [x] 2.3 Add a documented inactivity bound (default 30s, test-overridable env) that exits only after identity-terminal when no further parsed line arrives. Verify a live quiet file without identity-terminal does not exit solely on that bound. Verify an idle-after-supersede fixture exits even if the follow child would otherwise hang
 - [x] 2.4 Before follow, classify the exact bound file for a pre-existing identity-terminal. If present, emit that material line and exit (do not hang on unbounded `tail -n 0 -F`). Do not replay historical non-terminal material and do not open `superseded_by`. Verify a fixture whose terminal line predates watcher startup now passes
+- [x] 2.5 Use one cursor-aware reader so a terminal appended after scan EOF is still consumed from the same offset. Add a fixture that holds after scan EOF, appends `loop_run_superseded`, then continues follow. Verify the watcher exits and emits the identity-terminal line. Verify the fixture **fails** against a split scan plus `tail -n 0 -F` FIFO attach (process still alive, no terminal line)
 
 ## 3. Tugboat re-bind and leftover pid-file reap
 

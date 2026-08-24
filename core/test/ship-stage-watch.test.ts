@@ -116,6 +116,7 @@ function spawnFollow(opts: {
   filter: string;
   label?: string;
   idleSecs?: string;
+  extraEnv?: Record<string, string>;
 }): ChildProcess {
   return spawn("bash", [script, "--events-file", opts.events, "--label", opts.label ?? "ship v1.40.0"], {
     env: {
@@ -123,6 +124,7 @@ function spawnFollow(opts: {
       PIPELINE_MATERIAL_FILTER: opts.filter,
       SHIP_NOTIFY: "0",
       ...(opts.idleSecs != null ? { SHIP_STAGE_WATCH_IDLE_SECS: opts.idleSecs } : {}),
+      ...(opts.extraEnv ?? {}),
     },
     stdio: ["ignore", "pipe", "pipe"],
     detached: true,
@@ -271,6 +273,41 @@ test("follow mode still requires one absolute events file and does not glob late
   const body = fs.readFileSync(script, "utf8");
   assert.match(body, /--until-identity-terminal/);
   assert.match(body, /SHIP_STAGE_WATCH_IDLE_SECS/);
+  assert.match(body, /SHIP_STAGE_WATCH_SCAN_EOF_HOLD/);
   assert.doesNotMatch(body, /superseded_by.*events\.jsonl/);
   assert.doesNotMatch(body, /AGENT_PIPELINE_LOOP_ROOT|\.local\/state\/agent-pipeline|ls -t|find .*events\.jsonl/);
+});
+
+test("follow mode does not lose loop_run_superseded appended after scan EOF (#1227)", async () => {
+  const { root, events, filter } = fixture();
+  fs.writeFileSync(events, "");
+  const hold = path.join(root, "scan-eof-hold");
+  fs.mkdirSync(hold);
+  const child = spawnFollow({
+    events,
+    filter,
+    idleSecs: "2",
+    extraEnv: { SHIP_STAGE_WATCH_SCAN_EOF_HOLD: hold },
+  });
+  const ready = path.join(hold, "eof-reached");
+  const deadline = Date.now() + 4000;
+  while (!fs.existsSync(ready) && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  assert.equal(fs.existsSync(ready), true, "scan never reached EOF");
+  assert.equal(child.exitCode, null, "watcher must still be in the scan-to-follow hold");
+  fs.appendFileSync(
+    events,
+    JSON.stringify({
+      seq: 1,
+      time: "2026-08-23T21:19:00.000Z",
+      kind: "loop_run_superseded",
+      data: { superseded_by: "loop-9d33dc88" },
+    }) + "\n",
+  );
+  fs.writeFileSync(path.join(hold, "continue"), "1");
+  const result = await waitForExit(child, 4000);
+  assert.equal(result.code, 0, `stderr=${result.stderr} stdout=${result.stdout}`);
+  assert.match(result.stdout, /\[loop_run_superseded\]/);
+  fs.rmSync(root, { recursive: true, force: true });
 });

@@ -18,6 +18,8 @@
 #   SHIP_NOTIFY               0 disables messenger calls (default 1)
 #   SHIP_STAGE_WATCH_IDLE_SECS  inactivity bound after identity-terminal
 #                               (default 30). Does not kill a live quiet run.
+#   SHIP_STAGE_WATCH_SCAN_EOF_HOLD  test-only dir; after scan EOF write
+#                                   eof-reached and wait for continue.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -45,9 +47,10 @@ the current cursor and exits on that file's identity-terminal event
 ship_phase complete for a ship file), or after SHIP_STAGE_WATCH_IDLE_SECS
 (default 30) of inactivity once that terminal was seen. If the bound file
 already contains identity-terminal before follow starts, the observer emits
-that material line and exits instead of waiting on tail -n 0 -F. This
-command does not discover latest loop or advance runs and does not follow
-superseded_by.
+that material line and exits instead of waiting on a silent follow. A
+terminal appended after the initial scan reaches EOF is consumed from the
+same tracked offset. This command does not discover latest loop or advance
+runs and does not follow superseded_by.
 Set PIPELINE_MATERIAL_FILTER to the installed material-filter.mjs executable.
 USAGE
 }
@@ -112,7 +115,6 @@ else
   }
 fi
 
-tail_pid=""
 watchdog_pid=""
 work_dir=""
 terminal_seen=""
@@ -122,12 +124,12 @@ cleanup() {
   local child
   [[ "${cleanup_done:-0}" -eq 1 ]] && return 0
   cleanup_done=1
-  for child in ${watchdog_pid:-} ${tail_pid:-} $(pgrep -P $$ 2>/dev/null || true); do
+  for child in ${watchdog_pid:-} $(pgrep -P $$ 2>/dev/null || true); do
     [[ -n "$child" && "$child" =~ ^[0-9]+$ ]] || continue
     kill "$child" 2>/dev/null || true
   done
   sleep 0.05
-  for child in ${watchdog_pid:-} ${tail_pid:-} $(pgrep -P $$ 2>/dev/null || true); do
+  for child in ${watchdog_pid:-} $(pgrep -P $$ 2>/dev/null || true); do
     [[ -n "$child" && "$child" =~ ^[0-9]+$ ]] || continue
     kill -KILL "$child" 2>/dev/null || true
   done
@@ -193,25 +195,26 @@ if ! [[ "$idle_secs" =~ ^[0-9]+$ ]]; then
 fi
 
 work_dir=$(mktemp -d "${TMPDIR:-/tmp}/ship-stage-watch.XXXXXX")
-fifo="$work_dir/events.fifo"
 terminal_seen="$work_dir/terminal.seen"
 last_line_ts="$work_dir/last.ts"
-mkfifo "$fifo"
 
 # Own the follow child. `tail -F | filter | emit` under pipefail hangs after
-# identity-terminal because a silent file never SIGPIPEs tail. Start tail
-# before classifying existing lines so a terminal written during startup is
-# not lost between the scan and follow.
-tail -n 0 -F "$events_file" >"$fifo" &
-tail_pid=$!
-
+# identity-terminal because a silent file never SIGPIPEs tail. One offset-
+# tracked reader scans this exact bound file and continues from the same
+# cursor so an append during startup is not lost. Do not open a FIFO plus
+# `tail -n 0 -F`: that attach waits until the reader opens, so a terminal
+# written after scan EOF and before attach is missed.
 (
   while true; do
     if [[ -f "$terminal_seen" ]]; then
       last=$(cat "$last_line_ts" 2>/dev/null || echo 0)
       now=$(date +%s)
       if [[ "$last" =~ ^[0-9]+$ ]] && [[ $((now - last)) -ge $idle_secs ]]; then
-        kill "$tail_pid" 2>/dev/null || true
+        for child in $(pgrep -P $$ 2>/dev/null || true); do
+          [[ -n "$child" && "$child" =~ ^[0-9]+$ ]] || continue
+          [[ "$child" -eq "${BASHPID:-0}" ]] && continue
+          kill "$child" 2>/dev/null || true
+        done
         exit 0
       fi
     fi
@@ -221,11 +224,10 @@ tail_pid=$!
 watchdog_pid=$!
 
 # Forward JSONL, classify identity-terminal of THIS bound file, then stop so
-# pipefail cannot wait on silent tail -F. Scan the exact bound file first:
-# tail -n 0 -F would miss a terminal that already landed. Do not open
-# superseded_by or glob host-global run directories.
+# pipefail cannot wait on a silent follow. Do not open superseded_by or glob
+# host-global run directories.
 set +e
-python3 - "$fifo" "$terminal_seen" "$last_line_ts" "$tail_pid" "$events_file" <<'PY' | "$MATERIAL_FILTER" --until-identity-terminal | emit
+python3 - "$terminal_seen" "$last_line_ts" "$events_file" <<'PY' | "$MATERIAL_FILTER" --until-identity-terminal | emit
 import json
 import os
 import signal
@@ -234,7 +236,7 @@ import time
 
 signal.signal(signal.SIGPIPE, signal.SIG_IGN)
 
-fifo, marker, ts_path, tail_pid_s, events_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+marker, ts_path, events_path = sys.argv[1], sys.argv[2], sys.argv[3]
 loop_kinds = {"loop_run_superseded", "loop_run_complete", "loop_run_stopped"}
 
 def is_identity_terminal(obj):
@@ -255,10 +257,6 @@ def mark_and_stop_follow():
         fh.write(now)
     with open(marker, "w", encoding="utf-8") as fh:
         fh.write("1")
-    try:
-        os.kill(int(tail_pid_s), signal.SIGTERM)
-    except OSError:
-        pass
 
 def emit_line(line):
     out = line if line.endswith("\n") else line + "\n"
@@ -268,42 +266,63 @@ def emit_line(line):
     except BrokenPipeError:
         sys.exit(0)
 
-# Classify this exact bound file before follow. Do not replay historical
-# non-terminal material (follow starts at the current cursor).
+def classify_line(line, emit_all):
+    if emit_all:
+        emit_line(line)
+    s = line.strip()
+    if not s.startswith("{"):
+        return False
+    try:
+        obj = json.loads(s)
+    except json.JSONDecodeError:
+        return False
+    if not is_identity_terminal(obj):
+        return False
+    if not emit_all:
+        emit_line(line)
+    mark_and_stop_follow()
+    return True
+
+def consume(src, emit_all):
+    while True:
+        pos = src.tell()
+        line = src.readline()
+        if line == "" or not line.endswith("\n"):
+            return pos, False
+        if classify_line(line, emit_all):
+            return src.tell(), True
+
+offset = 0
 try:
     with open(events_path, encoding="utf-8", errors="replace") as existing:
-        for line in existing:
-            s = line.strip()
-            if not s.startswith("{"):
-                continue
-            try:
-                obj = json.loads(s)
-            except json.JSONDecodeError:
-                continue
-            if is_identity_terminal(obj):
-                emit_line(line)
-                mark_and_stop_follow()
-                sys.exit(0)
+        offset, terminal = consume(existing, False)
+        if terminal:
+            sys.exit(0)
 except OSError:
     pass
 
+# Test-only: pause after scan EOF so a fixture can append at this cursor.
+hold_dir = os.environ.get("SHIP_STAGE_WATCH_SCAN_EOF_HOLD", "")
+if hold_dir and os.path.isdir(hold_dir):
+    with open(os.path.join(hold_dir, "eof-reached"), "w", encoding="utf-8") as fh:
+        fh.write("1")
+    cont = os.path.join(hold_dir, "continue")
+    while not os.path.exists(cont):
+        time.sleep(0.05)
+
 try:
-    with open(fifo, encoding="utf-8", errors="replace") as src:
-        for line in src:
-            emit_line(line)
-            s = line.strip()
-            if not s.startswith("{"):
-                continue
-            try:
-                obj = json.loads(s)
-            except json.JSONDecodeError:
-                continue
-            if is_identity_terminal(obj):
-                mark_and_stop_follow()
-                sys.exit(0)
+    while True:
+        try:
+            with open(events_path, encoding="utf-8", errors="replace") as src:
+                src.seek(offset)
+                offset, terminal = consume(src, True)
+                if terminal:
+                    sys.exit(0)
+        except OSError:
+            pass
+        time.sleep(0.1)
 except BrokenPipeError:
     sys.exit(0)
 PY
-kill "$tail_pid" 2>/dev/null || true
 kill "$watchdog_pid" 2>/dev/null || true
 exit 0
