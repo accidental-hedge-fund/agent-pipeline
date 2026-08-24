@@ -48,7 +48,7 @@ import {
   resolveReviewPromptCharCeiling,
 } from "../review-prompt-ceiling.ts";
 import { resolveAdapter } from "../harness-adapters/index.ts";
-import { runTestGate, type TestGateDeps } from "../testgate.ts";
+import { runTestGate, testerProducerObservationFromGate, type TestGateDeps } from "../testgate.ts";
 import {
   buildPriorRoundDigest,
   settledFindings,
@@ -1580,16 +1580,16 @@ export async function invokePromptHarnessReview(
   }
   const shaForReview = candidateSha || "0".repeat(40);
   const gateRunner = opts.runTestGate ?? runTestGate;
+  const pipelineRunId =
+    opts.pipelineRunId ?? (opts.runDir ? path.basename(opts.runDir) : "");
   const testerAcq = await loadOrRegenerateTesterEvidenceForReview(
     opts.runDir,
     shaForReview,
     cfg,
     opts.runDir
       ? async () => {
-          const pipelineRunId =
-            opts.pipelineRunId ?? path.basename(opts.runDir!);
           // max_attempts: 0 → measure/produce only; no implementer fix loop.
-          await gateRunner(
+          const gate = await gateRunner(
             { ...cfg, test_gate: { ...cfg.test_gate, max_attempts: 0 } },
             issueNumber,
             cwd,
@@ -1600,8 +1600,17 @@ export async function invokePromptHarnessReview(
             opts.runDir,
             opts.runStoreDeps,
           );
+          return testerProducerObservationFromGate(gate);
         }
       : undefined,
+    undefined,
+    {
+      persistIdentity: {
+        issue: issueNumber,
+        stage: stageName,
+        pipeline_run_id: pipelineRunId,
+      },
+    },
   );
   prompt = appendTesterEvidenceSection(prompt, testerAcq);
   if (testerAcq.withholdInvoke) {

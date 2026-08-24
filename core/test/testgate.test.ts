@@ -458,7 +458,8 @@ test("gate: disabled → skipped, never runs tests", async () => {
     },
     detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
   });
-  assert.deepEqual(out, { skipped: true });
+  assert.equal(out.skipped, true);
+  assert.equal(out.recorded_required_exit_0, false);
   assert.equal(ran, false);
 });
 
@@ -467,7 +468,8 @@ test("gate: no command detected → skipped", async () => {
     detectTestCommand: () => null,
     runTests: async () => passResult,
   });
-  assert.deepEqual(out, { skipped: true });
+  assert.equal(out.skipped, true);
+  assert.equal(out.recorded_required_exit_0, false);
 });
 
 test("gate: initial run passes → attempts 0, no fix invoked", async () => {

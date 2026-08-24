@@ -1,0 +1,86 @@
+## ADDED Requirements
+
+### Requirement: Successful producer SHALL persist SHA-matched Tester evidence or fail_closed SHALL name the persist/acquire cause
+
+The pipeline SHALL write a SHA-matched `tester-evidence.json` for the candidate HEAD into the current run directory, **or** withhold review with a named persist/acquire reason, when the code-review path invokes the deterministic Tester producer because `on_missing` is `fail_closed` and trustworthy SHA-matched evidence is missing, stale, or malformed, and that producer records a required test-gate command exit 0. Whether the producer recorded that exit 0 SHALL be a typed result from `runTestGate` (or the equivalent regenerate observation), not an inference from `summary.json` or free-form logs. The artifact `candidate_sha` SHALL be the worktree HEAD passed to the gate, validated as a full 40-character hex SHA, and SHALL NOT be the trusted-surface decision `candidate_sha` (including an all-zero sentinel). SHA-matched Tester evidence that omits `evidence_subject` SHALL still be current suite evidence for review acquisition (`legacy_unbound` SHA fallback) and SHALL remain unusable as a readiness-pass subject. The named reason SHALL be a closed persist/acquire code stored on the acquisition result and in durable run/comment evidence, and SHALL NOT be the generic missing-file string (`No Tester suite evidence file for this run (missing tester-evidence.json)`). A present trusted-surface decision with `outcome: blocked`, `repo_policy` `failure_reason: missing_base_sha`, and/or all-zero `candidate_sha` SHALL NOT be the sole cause of both (a) no suite artifact and (b) that generic missing-file withhold. An atomic write failure after recorded exit 0 SHALL produce the named persist-write-failed code, SHALL preserve the original error in bounded redacted form, and SHALL NOT manufacture a passed artifact. Acquisition after the producer attempt SHALL remain load-only and SHALL NOT invent a suite pass. Readiness `evidence_subject` emission MAY stay fail-closed when trusted-surface is blocked; omitting the subject SHALL NOT omit the suite artifact after a recorded exit 0.
+
+#### Scenario: successful producer persists SHA-matched artifact
+
+- **WHEN** review re-entry finds no trustworthy SHA-matched `tester-evidence.json` under `fail_closed`
+- **AND** the deterministic producer runs once and records a required test-gate command exit 0
+- **AND** the candidate HEAD is a full 40-character SHA
+- **AND** a run directory is available
+- **THEN** the run directory SHALL contain a SHA-matched `tester-evidence.json` for that HEAD
+- **AND** acquisition SHALL treat that artifact as current (subject to existing SHA-match rules)
+- **AND** review SHALL NOT withhold the model invoke solely because the file was missing before the producer ran
+
+#### Scenario: persist failure after exit 0 uses a named withhold
+
+- **WHEN** the deterministic producer records a required test-gate command exit 0 as a typed observation
+- **AND** re-acquisition is still not current (`missing`, `stale`, or `malformed`)
+- **THEN** `fail_closed` SHALL withhold with a named persist/acquire code other than the generic missing-file string
+- **AND** that code SHALL be stored on the acquisition result and in durable run or comment evidence
+- **AND** the re-acquired classification SHALL be preserved in the rendered reason and section
+- **AND** acquisition SHALL NOT invent a suite pass
+
+#### Scenario: remaining stale or malformed after exit 0 uses named persist/acquire
+
+- **WHEN** the deterministic producer records a required test-gate command exit 0 as a typed observation
+- **AND** an old SHA-pinned or unreadable `tester-evidence.json` remains so re-acquisition is `stale` or `malformed`
+- **THEN** `fail_closed` SHALL withhold with a named persist/acquire code other than the generic missing-file string
+- **AND** the acquisition classification SHALL remain `stale` or `malformed` as re-acquired
+- **AND** the rendered reason and section SHALL preserve that classification
+- **AND** recover-parked SHALL be able to read the durable persist/acquire marker
+- **AND** acquisition SHALL NOT invent a suite pass
+
+#### Scenario: atomic write failure after exit 0 is named and does not invent a pass
+
+- **WHEN** the deterministic producer records a required test-gate command exit 0
+- **AND** the atomic Tester evidence write fails
+- **THEN** the persist observation SHALL report write failure with the original error in bounded redacted form
+- **AND** the run directory SHALL NOT contain a manufactured `overall_status: "passed"` artifact from that failed write
+- **AND** review SHALL withhold with persist-write-failed (or an equivalent named persist/acquire code)
+
+#### Scenario: SHA-matched evidence without evidence_subject is current for review
+
+- **WHEN** a SHA-matched `tester-evidence.json` exists for the candidate HEAD
+- **AND** the record omits `evidence_subject`
+- **THEN** review acquisition SHALL classify the artifact as current suite evidence under existing SHA-match / `legacy_unbound` rules
+- **AND** SHALL NOT withhold the review model invoke solely because the subject is absent
+- **AND** readiness consumers SHALL still treat the omitted subject as unusable for a readiness pass
+
+#### Scenario: trusted-surface missing_base_sha is not generic missing
+
+- **WHEN** the run directory contains `trusted-surface.json` with `outcome: blocked`
+- **AND** `repo_policy` `failure_reason` is `missing_base_sha`
+- **AND** trusted-surface `candidate_sha` is all zeros
+- **AND** the producer recorded a required test-gate command exit 0
+- **THEN** review SHALL NOT withhold using only the generic missing-file string
+- **AND** either SHA-matched Tester evidence SHALL be present for the real candidate HEAD or the withhold reason SHALL name the trusted-surface / persist cause
+
+#### Scenario: producer that did not record exit 0 may still withhold as missing
+
+- **WHEN** the optional producer is not invoked, throws before recording a command result, or records a non-zero test-gate exit
+- **AND** no trustworthy SHA-matched artifact exists
+- **AND** `on_missing` is `fail_closed`
+- **THEN** acquisition MAY still withhold
+- **AND** SHALL NOT claim that tests passed
+
+### Requirement: Persist-or-named-fail regressions SHALL fail the unit suite
+
+Automated tests covered by `npm run ci` SHALL inject I/O (no live network, git, or subprocess) and SHALL fail if: (1) a producer callback resolves after recording test-gate exit 0 and review still withholds solely because `tester-evidence.json` is missing, or still stale/malformed without a named persist/acquire code; (2) a `trusted-surface.json` `repo_policy` `missing_base_sha` with all-zero `candidate_sha` is collapsed into the generic missing-file withhold string with no distinct diagnostic.
+
+#### Scenario: missing-file withhold after recorded exit 0 fails the suite
+
+- **WHEN** a unit test drives review Tester acquisition with a producer that records test-gate exit 0 and does not leave a SHA-matched artifact under the generic missing classification
+- **THEN** the test SHALL fail unless withhold is false because a SHA-matched artifact was written, or withhold is true with a named persist/acquire reason other than the generic missing-file string
+
+#### Scenario: stale or malformed withhold after recorded exit 0 fails the suite
+
+- **WHEN** a unit test drives review Tester acquisition with a producer that records test-gate exit 0 and leaves a stale or malformed artifact
+- **THEN** the test SHALL fail unless withhold is true with a named persist/acquire reason and the re-acquired classification remains stale or malformed
+
+#### Scenario: missing_base_sha collapse fails the suite
+
+- **WHEN** a unit test supplies `trusted-surface.json` with `outcome: blocked`, `repo_policy` `missing_base_sha`, and all-zero `candidate_sha` after a producer that recorded test-gate exit 0
+- **THEN** the test SHALL fail if the withhold reason is only the generic missing-file string

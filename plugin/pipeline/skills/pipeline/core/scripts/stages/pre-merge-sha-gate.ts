@@ -96,7 +96,7 @@ import {
   loadOrRegenerateTesterEvidenceForReview,
   testerEvidenceWithholdResult,
 } from "../tester-evidence.ts";
-import { runTestGate } from "../testgate.ts";
+import { runTestGate, testerProducerObservationFromGate } from "../testgate.ts";
 import type { Outcome, PipelineConfig, ReviewFinding, Stage } from "../types.ts";
 import {
   appendDualShaEscalationDisclosure,
@@ -2240,25 +2240,35 @@ async function defaultRunDeltaReview(
   }
   const shaForReview = candidateSha || "0".repeat(40);
   const runDir = accounting?.runDir;
+  const pipelineRunId = runDir ? path.basename(runDir) : "";
   const testerAcq = await loadOrRegenerateTesterEvidenceForReview(
     runDir,
     shaForReview,
     cfg,
     runDir
       ? async () => {
-          await runTestGate(
+          const gate = await runTestGate(
             { ...cfg, test_gate: { ...cfg.test_gate, max_attempts: 0 } },
             issueNumber,
             worktreePath,
             {},
-            path.basename(runDir),
+            pipelineRunId,
             "pre-merge",
             undefined,
             runDir,
             accounting?.runStoreDeps,
           );
+          return testerProducerObservationFromGate(gate);
         }
       : undefined,
+    undefined,
+    {
+      persistIdentity: {
+        issue: issueNumber,
+        stage: "pre-merge",
+        pipeline_run_id: pipelineRunId,
+      },
+    },
   );
   prompt = appendTesterEvidenceSection(prompt, testerAcq);
   if (testerAcq.withholdInvoke) {

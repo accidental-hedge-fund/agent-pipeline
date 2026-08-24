@@ -56,6 +56,11 @@ import {
 } from "./types.ts";
 import { getOnDiskForIssue, gitInWorktree } from "./worktree.ts";
 import { classifyPorcelainForScratchRecover } from "./worktree-dirt.ts";
+import {
+  extractTesterPersistAcquire,
+  type TesterPersistAcquireCode,
+  type TesterPersistAcquireRecord,
+} from "./tester-evidence.ts";
 
 // ---------------------------------------------------------------------------
 // Result contract
@@ -236,6 +241,26 @@ export function computeFingerprintId(
   const sorted = canonicalKeys(keys);
   const raw = `${issue}\n${stageId}\n${sorted.join(",")}`;
   return createHash("sha256").update(raw).digest("hex").slice(0, 16);
+}
+
+/** One supervisor pass per (issue, stage, persist_acquire_code, candidate_sha). */
+export function computeTesterPersistAcquireFingerprintId(
+  issue: number,
+  stageId: string,
+  code: TesterPersistAcquireCode,
+  candidateSha: string,
+): string {
+  const raw = `${issue}\n${stageId}\n${code}\n${candidateSha.trim().toLowerCase()}`;
+  return createHash("sha256").update(raw).digest("hex").slice(0, 16);
+}
+
+export function testerPersistAcquireSpendKeys(
+  record: TesterPersistAcquireRecord,
+): string[] {
+  return canonicalKeys([
+    `tester-persist-acquire:${record.persist_acquire_code}`,
+    record.candidate_sha.trim().toLowerCase(),
+  ]);
 }
 
 export function formatRecoverParkedSpentComment(args: {
@@ -1386,6 +1411,114 @@ async function runRecoverParkedLocked(
     wholeParkAuthority,
   });
   if (!live.headBound) {
+    const getActor = deps.getGhActor ?? getGhActor;
+    let persistActor: string | null = null;
+    try {
+      persistActor = await getActor();
+    } catch {
+      persistActor = null;
+    }
+    const persistAcq = extractTesterPersistAcquire(detail.comments, {
+      actor: persistActor,
+      trustedActors: cfg.trusted_override_actors,
+      markerFooter: cfg.marker_footer,
+      issue: issueNumber,
+      stage: stageId,
+      candidateSha: headSha,
+    });
+    if (
+      persistAcq &&
+      persistAcq.recorded_required_exit_0 &&
+      persistAcq.persist_acquire_code
+    ) {
+      const persistKeys = testerPersistAcquireSpendKeys(persistAcq);
+      const persistFingerprint = computeTesterPersistAcquireFingerprintId(
+        issueNumber,
+        stageId,
+        persistAcq.persist_acquire_code,
+        persistAcq.candidate_sha,
+      );
+      const persistSpent = extractRecoverParkedSpent(detail.comments);
+      if (
+        isFingerprintSpent(
+          persistSpent,
+          issueNumber,
+          stageId,
+          persistFingerprint,
+          persistKeys,
+        )
+      ) {
+        log(
+          `[recover-parked] #${issueNumber}: already-spent tester persist/acquire fingerprint ${persistFingerprint}`,
+        );
+        return wrap({
+          status: "already-spent",
+          issue: issueNumber,
+          fingerprintId: persistFingerprint,
+          stageId,
+          keys: persistKeys,
+          message: `supervisor pass already spent for tester persist/acquire fingerprint ${persistFingerprint}`,
+        });
+      }
+      if (opts.dryRun) {
+        return wrap({
+          status: "still-parked",
+          issue: issueNumber,
+          fingerprintId: persistFingerprint,
+          stageId,
+          keys: persistKeys,
+          message:
+            "dry-run: tester persist/acquire withhold is retryable; no mutations",
+        });
+      }
+      const at = (deps.now ?? (() => new Date()))()
+        .toISOString()
+        .replace(/\.\d{3}Z$/, "Z");
+      const spendBody = formatRecoverParkedSpentComment({
+        fingerprint: persistFingerprint,
+        issue: issueNumber,
+        stage: stageId,
+        keys: persistKeys,
+        at,
+        footer: cfg.marker_footer,
+      });
+      try {
+        await post(cfg, issueNumber, spendBody);
+      } catch (err) {
+        return wrap({
+          status: "fail-closed",
+          issue: issueNumber,
+          fingerprintId: persistFingerprint,
+          stageId,
+          keys: persistKeys,
+          message: `spend marker post failed: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
+      if (isBlocked(detail.labels)) {
+        try {
+          await clear(cfg, issueNumber);
+        } catch {
+          /* re-entry will re-evaluate */
+        }
+      }
+      const wantReenter =
+        !opts.skipReentry && !opts.dryRun && !!deps.reenterAdvance;
+      log(
+        `[recover-parked] #${issueNumber}: recovered (tester persist/acquire ${persistAcq.persist_acquire_code} retry)`,
+      );
+      return wrap(
+        {
+          status: "recovered",
+          issue: issueNumber,
+          fingerprintId: persistFingerprint,
+          stageId,
+          keys: persistKeys,
+          reentered: false,
+          message: `recovered: tester persist/acquire ${persistAcq.persist_acquire_code} — re-enter review (no HEAD-bound residual)`,
+        },
+        wantReenter,
+      );
+    }
     return wrap({
       status: "still-parked",
       issue: issueNumber,

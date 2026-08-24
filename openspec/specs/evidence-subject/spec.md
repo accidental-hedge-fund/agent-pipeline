@@ -205,6 +205,8 @@ When a run has a computed trusted-surface decision with a resolved `effective_ve
 
 Family-local material (for example Tester toolchain identity) MAY still refine the fingerprint after the trusted-surface hash is included, provided the derivation is pure, documented, and changes when either the trusted surface or the family-local slice changes.
 
+Fail-closed readiness subject production SHALL NOT suppress the Tester family artifact after a successful suite command. The pipeline SHALL still persist SHA-matched `tester-evidence.json` (without a fabricated subject) or fail review with a named persist/acquire reason per `tester-evidence`.
+
 #### Scenario: passthrough and rebound subjects use effective verifier hash
 
 - **WHEN** a trusted-surface decision exists with `outcome` `passthrough` or `rebound` and non-empty `effective_verifier_hash` H
@@ -224,6 +226,14 @@ Family-local material (for example Tester toolchain identity) MAY still refine t
 - **AND** their trusted-surface `effective_verifier_hash` values differ
 - **THEN** their `verifier_fingerprint` values SHALL differ
 - **AND** comparison SHALL report a verifier mismatch
+
+#### Scenario: blocked subject does not suppress Tester family artifact after successful suite command
+
+- **WHEN** the trusted-surface decision `outcome` is `blocked` and no trustworthy effective verifier pin is available
+- **AND** the Tester producer recorded a required test-gate command exit 0
+- **AND** a run directory is available
+- **THEN** the producer SHALL NOT omit `tester-evidence.json` solely because subject emission failed closed
+- **AND** the written suite record, if present, SHALL omit a fabricated readiness subject rather than claim verifier-fingerprint match
 
 ### Requirement: Pre-code attestation and dossier evidence SHALL bind shared evidence_subject identity
 

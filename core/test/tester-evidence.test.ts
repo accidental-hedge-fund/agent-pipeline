@@ -19,15 +19,21 @@ import {
   extractTesterMetricsFromEvent,
   extractTesterMetricsFromEvidence,
   formatTesterEvidenceSummary,
+  extractTesterPersistAcquire,
+  formatTesterPersistAcquireHtmlComment,
+  parseTesterPersistAcquireFromBody,
   loadOrRegenerateTesterEvidenceForReview,
   loadTesterEvidenceForReview,
   loadTesterEvidenceForReviewSync,
   normalizeCandidateSha,
+  persistAcquireCodeFromObservation,
   renderTesterEvidenceSection,
   runAllowlistedExtractors,
   stableStringify,
   TESTER_EVIDENCE_KIND,
+  TESTER_EVIDENCE_MISSING_FILE_REASON,
   TESTER_EVIDENCE_SCHEMA_VERSION,
+  TESTER_PERSIST_ACQUIRE_FILENAME,
   testerEvidencePath,
   validateTesterEvidence,
   worktreeIdFromPath,
@@ -35,13 +41,57 @@ import {
   type TesterEvidence,
   type TesterEvidenceIoDeps,
   type TesterExtractor,
+  type TesterProducerObservation,
 } from "../scripts/tester-evidence.ts";
 import { runTestGate, type RunTestsResult, type TestGateDeps } from "../scripts/testgate.ts";
+import {
+  buildEvidenceSubjectDiagnostics,
+  collectDiagnosticArtifactsFromBundle,
+} from "../scripts/evidence-subject.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 import { DEFAULT_CONFIG } from "../scripts/types.ts";
+import { attestPipelineComment } from "../scripts/stages/review-parsing.ts";
 
 const SHA_A = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SHA_B = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const ZERO_SHA = "0".repeat(40);
+const PERSIST_IDENTITY = {
+  issue: 1226,
+  stage: "review-1",
+  pipeline_run_id: "1226/test-run",
+} as const;
+const PERSIST_PIN = { persistIdentity: PERSIST_IDENTITY };
+
+function blockedTrustedSurfaceMissingBaseSha(): Record<string, unknown> {
+  return {
+    schema_version: 1,
+    path_class_schema_version: 1,
+    outcome: "blocked",
+    candidate_sha: ZERO_SHA,
+    base_sha: null,
+    triggering_paths: [".github/pipeline.yml"],
+    classes: [
+      {
+        id: "repo_policy",
+        status: "failed",
+        failure_reason: "missing_base_sha",
+      },
+    ],
+    effective_verifier_hash: null,
+    reason: { detail: "missing_base_sha" },
+  };
+}
+
+function exit0Observation(
+  over: Partial<TesterProducerObservation> = {},
+): TesterProducerObservation {
+  return {
+    recorded_required_exit_0: true,
+    required_command_exit_code: 0,
+    persist: { ok: false, candidate_sha: SHA_A, code: "producer_exit_0_artifact_missing" },
+    ...over,
+  };
+}
 
 function memoryIo(files: Map<string, string> = new Map()): TesterEvidenceIoDeps & {
   files: Map<string, string>;
@@ -586,6 +636,118 @@ test("extractTesterMetricsFromEvidence structured fields", () => {
 // Producer via runTestGate (injected seams)
 // ---------------------------------------------------------------------------
 
+test("runTestGate producer: blocked trusted-surface still writes SHA-matched suite evidence without fabricated subject", async () => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const runDir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-te-1226-"));
+  const wt = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-te-wt-1226-"));
+  try {
+    fs.writeFileSync(
+      path.join(runDir, "trusted-surface.json"),
+      `${JSON.stringify(blockedTrustedSurfaceMissingBaseSha(), null, 2)}\n`,
+    );
+    const pass: RunTestsResult = {
+      passed: true,
+      output: "all good",
+      durationSec: 1.2,
+      toolingError: false,
+    };
+    const deps: TestGateDeps = {
+      runTests: async () => pass,
+      detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+      gitHead: async () => SHA_A,
+      gitDirty: async () => false,
+      gitStatusPorcelain: async () => "",
+    };
+    const res = await runTestGate(
+      cfgWith({ test_gate: { command: "npm test", max_attempts: 0 } }),
+      1226,
+      wt,
+      deps,
+      "1226/run",
+      "test-gate",
+      undefined,
+      runDir,
+    );
+    assert.equal(res.passed, true);
+    assert.equal(res.recorded_required_exit_0, true);
+    assert.equal(res.required_command_exit_code, 0);
+    assert.equal(res.persist?.ok, true);
+    assert.equal(res.persist?.candidate_sha, SHA_A);
+    const raw = fs.readFileSync(path.join(runDir, "tester-evidence.json"), "utf8");
+    const evidence = JSON.parse(raw) as TesterEvidence;
+    assert.equal(evidence.overall_status, "passed");
+    assert.equal(evidence.candidate_sha, SHA_A);
+    assert.notEqual(evidence.candidate_sha, ZERO_SHA);
+    assert.equal(evidence.evidence_subject, undefined);
+    const acq = await loadTesterEvidenceForReview(runDir, SHA_A, cfgWith());
+    assert.equal(acq.classification, "current");
+    assert.equal(acq.subject_outcome, "legacy_unbound");
+    assert.equal(acq.withholdInvoke, false);
+    const pin = sampleTesterSubject();
+    const diags = buildEvidenceSubjectDiagnostics(
+      pin,
+      collectDiagnosticArtifactsFromBundle({
+        tester_evidence_subject: evidence.evidence_subject,
+        include_tester_row: true,
+      }),
+    );
+    assert.equal(diags[0]?.outcome, "legacy_unbound");
+    assert.equal(diags[0]?.subject_present, false);
+  } finally {
+    fs.rmSync(runDir, { recursive: true, force: true });
+    fs.rmSync(wt, { recursive: true, force: true });
+  }
+});
+
+test("runTestGate producer: write failure after exit 0 is persist_write_failed and invents no pass", async () => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const runDir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-te-1226-wf-"));
+  const wt = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-te-wt-1226-wf-"));
+  try {
+    const deps: TestGateDeps = {
+      runTests: async () => ({
+        passed: true,
+        output: "ok",
+        durationSec: 1,
+        toolingError: false,
+      }),
+      gitHead: async () => SHA_A,
+      gitDirty: async () => false,
+      gitStatusPorcelain: async () => "",
+      writeTesterEvidence: async () => ({
+        ok: false,
+        error: "EACCES: simulated write fail token ghp_ABCDEFGHIJKLMNOPQRSTUV",
+      }),
+    };
+    const res = await runTestGate(
+      cfgWith({ test_gate: { command: "npm test", max_attempts: 0 } }),
+      1226,
+      wt,
+      deps,
+      "1226/run",
+      "test-gate",
+      undefined,
+      runDir,
+    );
+    assert.equal(res.recorded_required_exit_0, true);
+    assert.equal(res.persist?.ok, false);
+    assert.equal(res.persist?.code, "persist_write_failed");
+    assert.match(res.persist?.error ?? "", /EACCES: simulated write fail/);
+    assert.doesNotMatch(res.persist?.error ?? "", /ghp_ABCDEFGHIJKLMNOPQRSTUV/);
+    assert.equal(fs.existsSync(path.join(runDir, "tester-evidence.json")), false);
+    assert.equal(persistAcquireCodeFromObservation({
+      recorded_required_exit_0: true,
+      required_command_exit_code: 0,
+      persist: res.persist!,
+    }), "persist_write_failed");
+  } finally {
+    fs.rmSync(runDir, { recursive: true, force: true });
+    fs.rmSync(wt, { recursive: true, force: true });
+  }
+});
+
 test("runTestGate producer: passed writes SHA-pinned evidence", async () => {
   const ioFiles = new Map<string, string>();
   // Hijack write by using a real runDir under memory via intercepting writeTesterEvidence
@@ -900,14 +1062,282 @@ test("loadOrRegenerate: regenerate that writes nothing still withholds under fai
     { tester_evidence: DEFAULT_TESTER_EVIDENCE_CONFIG },
     async () => {
       regenerateCalls += 1;
-      // Intentionally do not write — producer/write failure path.
+      // Intentionally do not write — producer did not record test-gate exit 0.
     },
     io,
   );
   assert.equal(regenerateCalls, 1);
   assert.equal(acq.classification, "missing");
   assert.equal(acq.withholdInvoke, true);
+  assert.equal(acq.persist_acquire_code, undefined);
+  assert.equal(acq.reason, TESTER_EVIDENCE_MISSING_FILE_REASON);
   assert.doesNotMatch(acq.section, /Overall status:\*\* `passed`/);
+});
+
+test("loadOrRegenerate: recorded exit 0 without artifact uses named persist/acquire code not generic missing", async () => {
+  const io = memoryIo();
+  const runDir = "/runs/1226-exit0-missing";
+  const acq = await loadOrRegenerateTesterEvidenceForReview(
+    runDir,
+    SHA_A,
+    { tester_evidence: DEFAULT_TESTER_EVIDENCE_CONFIG },
+    async () => exit0Observation(),
+    io,
+    PERSIST_PIN,
+  );
+  assert.equal(acq.classification, "missing");
+  assert.equal(acq.withholdInvoke, true);
+  assert.equal(acq.persist_acquire_code, "producer_exit_0_artifact_missing");
+  assert.notEqual(acq.reason, TESTER_EVIDENCE_MISSING_FILE_REASON);
+  assert.doesNotMatch(acq.reason, /missing tester-evidence\.json/);
+  assert.match(acq.reason, /pipeline-tester-persist-acquire: v1/);
+  assert.match(acq.reason, /producer_exit_0_artifact_missing/);
+  const persistPath = path.join(runDir, TESTER_PERSIST_ACQUIRE_FILENAME);
+  assert.ok(io.files.has(persistPath), "must persist tester-persist-acquire.json");
+  const marker = parseTesterPersistAcquireFromBody(acq.reason);
+  assert.equal(marker?.persist_acquire_code, "producer_exit_0_artifact_missing");
+  assert.equal(marker?.recorded_required_exit_0, true);
+  assert.equal(marker?.issue, PERSIST_IDENTITY.issue);
+  assert.equal(marker?.stage, PERSIST_IDENTITY.stage);
+  assert.equal(marker?.pipeline_run_id, PERSIST_IDENTITY.pipeline_run_id);
+  assert.equal(marker?.candidate_sha, SHA_A);
+});
+
+test("loadOrRegenerate: missing_base_sha trusted-surface after exit 0 is not generic missing", async () => {
+  const io = memoryIo();
+  const runDir = "/runs/1226-missing-base-sha";
+  await io.writeFile(
+    path.join(runDir, "trusted-surface.json"),
+    JSON.stringify(blockedTrustedSurfaceMissingBaseSha()),
+  );
+  const acq = await loadOrRegenerateTesterEvidenceForReview(
+    runDir,
+    SHA_A,
+    { tester_evidence: DEFAULT_TESTER_EVIDENCE_CONFIG },
+    async () =>
+      exit0Observation({
+        persist: { ok: false, candidate_sha: SHA_A, code: "producer_exit_0_artifact_missing" },
+      }),
+    io,
+    PERSIST_PIN,
+  );
+  assert.equal(acq.withholdInvoke, true);
+  assert.ok(acq.persist_acquire_code, "must set a distinct persist/acquire code");
+  assert.notEqual(acq.reason, TESTER_EVIDENCE_MISSING_FILE_REASON);
+  assert.doesNotMatch(acq.reason, /missing tester-evidence\.json/);
+  assert.match(acq.reason, /trusted-surface blocked: missing_base_sha/);
+  assert.match(acq.reason, /pipeline-tester-persist-acquire: v1/);
+});
+
+test("loadOrRegenerate: persist_write_failed after exit 0 preserves redacted error and invents no pass", async () => {
+  const io = memoryIo();
+  const runDir = "/runs/1226-write-fail";
+  const acq = await loadOrRegenerateTesterEvidenceForReview(
+    runDir,
+    SHA_A,
+    { tester_evidence: DEFAULT_TESTER_EVIDENCE_CONFIG },
+    async () =>
+      exit0Observation({
+        persist: {
+          ok: false,
+          candidate_sha: SHA_A,
+          code: "persist_write_failed",
+          error: "EACCES: simulated write fail token ghp_ABCDEFGHIJKLMNOPQRSTUV",
+        },
+      }),
+    io,
+    PERSIST_PIN,
+  );
+  assert.equal(acq.classification, "missing");
+  assert.equal(acq.withholdInvoke, true);
+  assert.equal(acq.persist_acquire_code, "persist_write_failed");
+  assert.equal(acq.artifact, null);
+  assert.notEqual(acq.reason, TESTER_EVIDENCE_MISSING_FILE_REASON);
+  assert.match(acq.reason, /persist_write_failed/);
+  assert.match(acq.reason, /EACCES: simulated write fail/);
+  assert.doesNotMatch(acq.reason, /ghp_ABCDEFGHIJKLMNOPQRSTUV/);
+  assert.equal(io.files.has(path.join(runDir, "tester-evidence.json")), false);
+});
+
+test("loadOrRegenerate: recorded exit 0 leaving stale artifact uses named persist/acquire not ordinary stale", async () => {
+  const io = memoryIo();
+  const runDir = "/runs/1226-exit0-stale";
+  await writeTesterEvidence(runDir, baseEvidence({ candidate_sha: SHA_A }), {
+    io,
+    appendEvent: false,
+  });
+  const acq = await loadOrRegenerateTesterEvidenceForReview(
+    runDir,
+    SHA_B,
+    { tester_evidence: DEFAULT_TESTER_EVIDENCE_CONFIG },
+    async () =>
+      exit0Observation({
+        persist: {
+          ok: false,
+          candidate_sha: SHA_B,
+          code: "persist_write_failed",
+          error: "EACCES: cannot replace stale artifact",
+        },
+      }),
+    io,
+    PERSIST_PIN,
+  );
+  assert.equal(acq.classification, "stale");
+  assert.equal(acq.withholdInvoke, true);
+  assert.equal(acq.persist_acquire_code, "persist_write_failed");
+  assert.equal(acq.artifact?.candidate_sha, SHA_A);
+  assert.notEqual(acq.reason, TESTER_EVIDENCE_MISSING_FILE_REASON);
+  assert.doesNotMatch(acq.reason, /missing tester-evidence\.json/);
+  assert.match(acq.reason, /pipeline-tester-persist-acquire: v1/);
+  assert.match(acq.reason, /persist_write_failed/);
+  assert.match(acq.reason, /Re-acquired classification: stale/);
+  assert.match(acq.section, /stale/i);
+  assert.match(acq.section, /persist_write_failed/);
+  const persistPath = path.join(runDir, TESTER_PERSIST_ACQUIRE_FILENAME);
+  assert.ok(io.files.has(persistPath), "must persist tester-persist-acquire.json");
+  const marker = parseTesterPersistAcquireFromBody(acq.reason);
+  assert.equal(marker?.persist_acquire_code, "persist_write_failed");
+  assert.equal(marker?.recorded_required_exit_0, true);
+  assert.equal(marker?.candidate_sha, SHA_B);
+  assert.equal(marker?.issue, PERSIST_IDENTITY.issue);
+  assert.equal(marker?.stage, PERSIST_IDENTITY.stage);
+});
+
+test("loadOrRegenerate: recorded exit 0 leaving malformed artifact uses named persist/acquire not ordinary malformed", async () => {
+  const io = memoryIo();
+  const runDir = "/runs/1226-exit0-malformed";
+  await io.writeFile(testerEvidencePath(runDir), "{not-json");
+  const acq = await loadOrRegenerateTesterEvidenceForReview(
+    runDir,
+    SHA_A,
+    { tester_evidence: DEFAULT_TESTER_EVIDENCE_CONFIG },
+    async () =>
+      exit0Observation({
+        persist: {
+          ok: false,
+          candidate_sha: SHA_A,
+          code: "persist_write_failed",
+          error: "EACCES: cannot replace malformed artifact",
+        },
+      }),
+    io,
+    PERSIST_PIN,
+  );
+  assert.equal(acq.classification, "malformed");
+  assert.equal(acq.withholdInvoke, true);
+  assert.equal(acq.persist_acquire_code, "persist_write_failed");
+  assert.equal(acq.artifact, null);
+  assert.notEqual(acq.reason, TESTER_EVIDENCE_MISSING_FILE_REASON);
+  assert.doesNotMatch(acq.reason, /missing tester-evidence\.json/);
+  assert.match(acq.reason, /pipeline-tester-persist-acquire: v1/);
+  assert.match(acq.reason, /persist_write_failed/);
+  assert.match(acq.reason, /Re-acquired classification: malformed/);
+  assert.match(acq.section, /malformed/i);
+  assert.match(acq.section, /persist_write_failed/);
+  const persistPath = path.join(runDir, TESTER_PERSIST_ACQUIRE_FILENAME);
+  assert.ok(io.files.has(persistPath), "must persist tester-persist-acquire.json");
+  const marker = parseTesterPersistAcquireFromBody(acq.reason);
+  assert.equal(marker?.persist_acquire_code, "persist_write_failed");
+  assert.equal(marker?.recorded_required_exit_0, true);
+});
+
+function persistAcquireExtractOpts(over: Partial<{
+  actor: string | null;
+  trustedActors: readonly string[];
+  markerFooter: string | null;
+  issue: number;
+  stage: string;
+  candidateSha: string;
+}> = {}) {
+  return {
+    actor: "pipeline-bot",
+    markerFooter: "*Automated by Claude Code Pipeline Skill*",
+    issue: PERSIST_IDENTITY.issue,
+    stage: PERSIST_IDENTITY.stage,
+    candidateSha: SHA_A,
+    ...over,
+  };
+}
+
+function attestedPersistBody(over: Partial<{
+  sha: string;
+  issue: number;
+  stage: string;
+  pipeline_run_id: string;
+  footer: string;
+}> = {}): string {
+  const payload = formatTesterPersistAcquireHtmlComment({
+    recorded_required_exit_0: true,
+    persist_acquire_code: "producer_exit_0_artifact_missing",
+    candidate_sha: over.sha ?? SHA_A,
+    issue: over.issue ?? PERSIST_IDENTITY.issue,
+    stage: over.stage ?? PERSIST_IDENTITY.stage,
+    pipeline_run_id: over.pipeline_run_id ?? PERSIST_IDENTITY.pipeline_run_id,
+  });
+  const footer = over.footer ?? "*Automated by Claude Code Pipeline Skill*";
+  return attestPipelineComment(
+    "blocked",
+    ["## Pipeline: Blocked at review 1", payload, footer].join("\n"),
+  );
+}
+
+test("extractTesterPersistAcquire: untrusted commenter marker does not authorize recovery", () => {
+  const body = attestedPersistBody();
+  const found = extractTesterPersistAcquire(
+    [{ author: "attacker", body }],
+    persistAcquireExtractOpts(),
+  );
+  assert.equal(found, null);
+});
+
+test("extractTesterPersistAcquire: old-stage marker does not match current park", () => {
+  const body = attestedPersistBody({ stage: "review-1" });
+  const found = extractTesterPersistAcquire(
+    [{ author: "pipeline-bot", body }],
+    persistAcquireExtractOpts({ stage: "review-2" }),
+  );
+  assert.equal(found, null);
+});
+
+test("extractTesterPersistAcquire: old-SHA marker does not match current HEAD", () => {
+  const body = attestedPersistBody({ sha: SHA_A });
+  const found = extractTesterPersistAcquire(
+    [{ author: "pipeline-bot", body }],
+    persistAcquireExtractOpts({ candidateSha: SHA_B }),
+  );
+  assert.equal(found, null);
+});
+
+test("extractTesterPersistAcquire: marker without issue/stage/run identity is ignored", () => {
+  const body = attestPipelineComment(
+    "blocked",
+    [
+      "## Pipeline: Blocked at review 1",
+      `<!-- pipeline-tester-persist-acquire: v1 ${JSON.stringify({
+        recorded_required_exit_0: true,
+        persist_acquire_code: "producer_exit_0_artifact_missing",
+        candidate_sha: SHA_A,
+      })} -->`,
+      "*Automated by Claude Code Pipeline Skill*",
+    ].join("\n"),
+  );
+  const found = extractTesterPersistAcquire(
+    [{ author: "pipeline-bot", body }],
+    persistAcquireExtractOpts(),
+  );
+  assert.equal(found, null);
+});
+
+test("extractTesterPersistAcquire: trusted attested current-park marker is accepted", () => {
+  const body = attestedPersistBody();
+  const found = extractTesterPersistAcquire(
+    [{ author: "pipeline-bot", body }],
+    persistAcquireExtractOpts(),
+  );
+  assert.equal(found?.persist_acquire_code, "producer_exit_0_artifact_missing");
+  assert.equal(found?.candidate_sha, SHA_A);
+  assert.equal(found?.stage, "review-1");
+  assert.equal(found?.issue, 1226);
 });
 
 test("loadOrRegenerate: no regenerate callback keeps pure load-only fail_closed", async () => {
