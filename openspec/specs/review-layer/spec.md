@@ -223,6 +223,11 @@ stale/unavailable/missing classification per `tester-evidence`. The prompt
 SHALL distinguish authoritative engine suite evidence from any supplemental
 reviewer-targeted checks. Reviewers MAY run targeted checks, but those results
 SHALL NOT overwrite the authoritative Tester record used for the round.
+After a deterministic producer run that records a required test-gate command
+exit 0 as a typed `runTestGate` observation, review SHALL persist-or-named-fail
+per `tester-evidence` and SHALL NOT withhold solely with the generic
+missing-file string. SHA-matched Tester evidence without `evidence_subject`
+SHALL still be current suite input for the review prompt.
 
 #### Scenario: review-1 prompt includes current Tester evidence
 
@@ -270,6 +275,20 @@ SHALL NOT overwrite the authoritative Tester record used for the round.
 - **AND** SHALL re-acquire after production
 - **AND** SHALL still apply fail_closed (and SHALL NOT invent a pass) when
   regeneration fails to yield a current artifact
+
+#### Scenario: successful producer persist-or-named-fail before withhold
+
+- **WHEN** `review-1`, `review-2`, or delta re-review invokes the deterministic
+  producer once under `fail_closed`
+- **AND** that producer records a required test-gate command exit 0 as a typed observation
+- **THEN** the run directory SHALL contain SHA-matched Tester evidence for the
+  candidate HEAD, **or** review SHALL withhold with a named persist/acquire
+  code other than the generic missing-file string
+- **AND** when the remaining artifact is stale or malformed rather than missing,
+  the named withhold SHALL preserve that re-acquired classification
+- **AND** the review model SHALL run when the SHA-matched artifact is current
+  (including SHA-matched records that omit `evidence_subject`)
+- **AND** SHALL NOT invent a suite pass
 
 #### Scenario: targeted checks remain supplemental in the review path
 
