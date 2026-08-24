@@ -752,6 +752,7 @@ export function buildPreflightChecks(
         targetRepoDir: config.repo_dir,
         targetIsFactoryControl: factoryControlContext,
         allowTargetFallback: intent === null,
+        env,
       });
       const hasPinOverride = hasProductionPinPathOverride(pinPathOverride);
       if (intent === "pinned" && !pinAuthority.ok && !hasPinOverride) {

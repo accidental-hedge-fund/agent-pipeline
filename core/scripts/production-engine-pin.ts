@@ -688,26 +688,26 @@ function firstNonEmptyEnv(env: NodeJS.ProcessEnv, key: string): string | null {
 }
 
 /**
- * Checkout-role factory-control identity for two-track pin policy.
+ * Live factory-control authority root for this checkout, or null.
  *
- * True when `repoDir` is the live factory control checkout identified by
- * `AGENT_PIPELINE_FACTORY_CONTROL` or factory-plane `REPO_DIR` (that
- * directory, or a managed worktree of that directory). Optional
- * `factoryControlDir` is the same signal as the factory-control env.
+ * Returns the matching signal directory (`AGENT_PIPELINE_FACTORY_CONTROL`,
+ * `factoryControlDir`, or factory-plane `REPO_DIR`) when `repoDir` is that
+ * directory or a managed worktree of it. The return value is always the
+ * control root, never the nested worktree path.
  *
  * Never sufficient: GitHub owner/name, `package.json` `repository`, leftover
  * `.agent-pipeline/production-engine-pin.json`, Hermes-state pin, or path-name
  * heuristics (`ap-main-control`, `*factory-control*`).
  */
-export function isFactoryControlCheckout(opts: {
+export function resolveFactoryControlRoot(opts: {
   repoDir: string;
   env?: NodeJS.ProcessEnv;
   factoryControlDir?: string | null;
   worktreeRoot?: string;
-}): boolean {
+}): string | null {
   const env = opts.env ?? process.env;
   const repoDir = typeof opts.repoDir === "string" ? opts.repoDir.trim() : "";
-  if (!repoDir) return false;
+  if (!repoDir) return null;
   const worktreeRoot = opts.worktreeRoot?.trim() || DEFAULT_MANAGED_WORKTREE_ROOT;
 
   const signals: string[] = [];
@@ -720,9 +720,29 @@ export function isFactoryControlCheckout(opts: {
   if (fromRepoDir) signals.push(fromRepoDir);
 
   for (const signal of signals) {
-    if (isSameOrManagedWorktreeOf(repoDir, signal, worktreeRoot)) return true;
+    if (isSameOrManagedWorktreeOf(repoDir, signal, worktreeRoot)) {
+      return path.resolve(signal);
+    }
   }
-  return false;
+  return null;
+}
+
+/**
+ * Checkout-role factory-control identity for two-track pin policy.
+ *
+ * True when {@link resolveFactoryControlRoot} returns a root: `repoDir` is the
+ * live factory control checkout identified by `AGENT_PIPELINE_FACTORY_CONTROL`
+ * or factory-plane `REPO_DIR` (that directory, or a managed worktree of that
+ * directory). Optional `factoryControlDir` is the same signal as the
+ * factory-control env.
+ */
+export function isFactoryControlCheckout(opts: {
+  repoDir: string;
+  env?: NodeJS.ProcessEnv;
+  factoryControlDir?: string | null;
+  worktreeRoot?: string;
+}): boolean {
+  return resolveFactoryControlRoot(opts) !== null;
 }
 
 /**
@@ -795,6 +815,7 @@ export type FactoryPinAuthorityResult =
         | "pin-path-override"
         | "factory-control-env"
         | "factory-control-arg"
+        | "factory-plane-repo-dir"
         | "self-dogfood";
     }
   | {
@@ -811,6 +832,8 @@ export type FactoryPinAuthorityResult =
  * Product repositories are refused by default. Authority requires one of:
  * - explicit pin path (`pinPathOverride` / `AGENT_PIPELINE_PRODUCTION_PIN`)
  * - factory control dir (`factoryControlDir` / `AGENT_PIPELINE_FACTORY_CONTROL`)
+ * - factory-plane `REPO_DIR` when the invocation is that checkout or a
+ *   managed worktree of it (authority root is `REPO_DIR`, not the worktree)
  * - self-dogfood (`targetIsFactoryControl` on the invocation checkout)
  *
  * When a pin-path override is set without factory-control dir, `repoDir` stays
@@ -845,6 +868,18 @@ export function resolveFactoryPinAuthority(opts: {
       repoDir: path.resolve(opts.factoryControlDir.trim()),
       pinPathOverride: pinOverride,
       source: "factory-control-arg",
+    };
+  }
+  const fromPlaneRepoDir = firstNonEmptyEnv(env, FACTORY_PLANE_REPO_DIR_ENV);
+  if (
+    fromPlaneRepoDir &&
+    isSameOrManagedWorktreeOf(opts.invocationRepoDir, fromPlaneRepoDir)
+  ) {
+    return {
+      ok: true,
+      repoDir: path.resolve(fromPlaneRepoDir),
+      pinPathOverride: pinOverride,
+      source: "factory-plane-repo-dir",
     };
   }
   if (pinOverride) {
@@ -907,6 +942,8 @@ export function hasProductionPinPathOverride(
 /**
  * Directory used as production-pin authority (factory control checkout).
  * Precedence: env AGENT_PIPELINE_FACTORY_CONTROL → factoryControlDir arg →
+ * factory-plane REPO_DIR when the target is that checkout or a managed
+ * worktree of it (returns the REPO_DIR root, not the worktree) →
  * targetRepoDir when targetIsFactoryControl or allowTargetFallback.
  * Pin file override (production_engine_pin_path / AGENT_PIPELINE_PRODUCTION_PIN)
  * still wins inside {@link productionPinPath} and does not require this dir.
@@ -936,6 +973,13 @@ export function resolvePinAuthorityDir(opts: {
   }
   if (typeof opts.factoryControlDir === "string" && opts.factoryControlDir.trim()) {
     return { ok: true, dir: path.resolve(opts.factoryControlDir.trim()) };
+  }
+  const fromPlaneRepoDir = firstNonEmptyEnv(env, FACTORY_PLANE_REPO_DIR_ENV);
+  if (
+    fromPlaneRepoDir &&
+    isSameOrManagedWorktreeOf(opts.targetRepoDir, fromPlaneRepoDir)
+  ) {
+    return { ok: true, dir: path.resolve(fromPlaneRepoDir) };
   }
   if (opts.targetIsFactoryControl || opts.allowTargetFallback !== false) {
     return { ok: true, dir: opts.targetRepoDir };

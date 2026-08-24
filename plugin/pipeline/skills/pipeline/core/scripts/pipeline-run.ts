@@ -1079,6 +1079,7 @@ export async function runAdvance(
         targetIsFactoryControl: factoryControlContext,
         // Active two-track intent: product targets are not pin authority.
         allowTargetFallback: trackIntent === null,
+        env,
       });
       const hasPinOverride = hasProductionPinPathOverride(pinPathOverride);
       let trackForEvidence: "pinned" | "candidate" | undefined;

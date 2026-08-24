@@ -5600,19 +5600,22 @@ async function main(): Promise<void> {
       initProductionPin,
       rollbackProductionPin,
       resolveFactoryPinAuthority,
-      isFactoryControlCheckout,
+      resolveFactoryControlRoot,
       PRODUCTION_ENGINE_PIN_REL,
     } = await import("./production-engine-pin.ts");
     try {
       // Self-dogfood is checkout-role (live REPO_DIR / FACTORY_CONTROL), not
       // package.json GitHub owner/name. A developer clone of this repo must
       // not gain pin-write authority from repository identity (#1237).
-      const targetIsFactoryControl = isFactoryControlCheckout({
+      // Pass the control *root* so a managed worktree of REPO_DIR writes
+      // $REPO_DIR/.agent-pipeline/production-engine-pin.json, not the worktree.
+      const factoryControlRoot = resolveFactoryControlRoot({
         repoDir: invocationRepoDir,
       });
       const authority = resolveFactoryPinAuthority({
         invocationRepoDir,
-        targetIsFactoryControl,
+        targetIsFactoryControl: factoryControlRoot !== null,
+        factoryControlDir: factoryControlRoot,
       });
       if (!authority.ok) {
         console.error(

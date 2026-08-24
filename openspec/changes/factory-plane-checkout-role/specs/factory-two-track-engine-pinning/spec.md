@@ -62,6 +62,8 @@ Callers that currently treat GitHub owner/name as factory-plane identity SHALL u
 - **AND** no explicit `--engine-track` / `engine_track` is set
 - **THEN** factory-control context SHALL be true
 - **AND** default two-track intent for advance / train item execution SHALL be `pinned`
+- **AND** pin authority SHALL be `$REPO_DIR/.agent-pipeline/production-engine-pin.json`
+- **AND** SHALL NOT be `<worktree>/.agent-pipeline/production-engine-pin.json`
 
 #### Scenario: Managed worktree of a developer clone is not factory-control
 

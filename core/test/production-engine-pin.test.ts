@@ -36,6 +36,7 @@ import {
   isFactoryControlPackageMeta,
   ownerRepoFromPackageRepository,
   resolveEngineTrackIntent,
+  resolveFactoryControlRoot,
   resolveFactoryPinAuthority,
   resolveInstallProvenance,
   resolvePinAuthorityDir,
@@ -307,13 +308,19 @@ test("isFactoryControlCheckout: REPO_DIR / FACTORY_CONTROL match; absent signals
 test("isFactoryControlCheckout: managed worktree of live control stays factory-control", () => {
   const control = "/factory/ap-main-control";
   const wt = path.join(control, ".worktrees", "pipeline-1237-fixpin");
+  const env = { [FACTORY_PLANE_REPO_DIR_ENV]: control };
   assert.equal(isSameOrManagedWorktreeOf(wt, control), true);
   assert.equal(
     isFactoryControlCheckout({
       repoDir: wt,
-      env: { [FACTORY_PLANE_REPO_DIR_ENV]: control },
+      env,
     }),
     true,
+  );
+  assert.equal(
+    resolveFactoryControlRoot({ repoDir: wt, env }),
+    path.resolve(control),
+    "authority root is REPO_DIR, not the managed worktree",
   );
   assert.equal(
     isFactoryControlCheckout({
@@ -322,6 +329,13 @@ test("isFactoryControlCheckout: managed worktree of live control stays factory-c
     }),
     false,
     "managed worktree of a developer clone is not factory-control",
+  );
+  assert.equal(
+    resolveFactoryControlRoot({
+      repoDir: path.join("/home/dev/agent-pipeline", ".worktrees", "pipeline-1237-fixpin"),
+      env: {},
+    }),
+    null,
   );
 });
 
@@ -398,6 +412,23 @@ test("resolvePinAuthorityDir: refuses non-factory target under active intent", (
   });
   assert.equal(self.ok, true);
   if (self.ok) assert.equal(self.dir, "/factory/control");
+});
+
+test("resolvePinAuthorityDir: managed worktree with only REPO_DIR uses control root (#1237)", () => {
+  const control = "/factory/control";
+  const wt = path.join(control, ".worktrees", "pipeline-1237-fixpin");
+  const env = { [FACTORY_PLANE_REPO_DIR_ENV]: control };
+  const fromWt = resolvePinAuthorityDir({
+    targetRepoDir: wt,
+    env,
+    targetIsFactoryControl: true,
+    allowTargetFallback: false,
+  });
+  assert.equal(fromWt.ok, true);
+  if (fromWt.ok) {
+    assert.equal(fromWt.dir, path.resolve(control));
+    assert.notEqual(fromWt.dir, wt);
+  }
 });
 
 test("resolveProductionPin: pin authority can differ from target product repo", async () => {
@@ -873,20 +904,52 @@ test("resolveFactoryPinAuthority: GitHub-name clone is not self-dogfood (#1237)"
 
 test("resolveFactoryPinAuthority: live control checkout self-dogfoods without PRODUCTION_PIN (#1237)", () => {
   const control = "/factory/ap-main-control";
+  const env = { [FACTORY_PLANE_REPO_DIR_ENV]: control };
   const ok = resolveFactoryPinAuthority({
     invocationRepoDir: control,
     targetIsFactoryControl: isFactoryControlCheckout({
       repoDir: control,
-      env: { [FACTORY_PLANE_REPO_DIR_ENV]: control },
+      env,
     }),
-    env: { [FACTORY_PLANE_REPO_DIR_ENV]: control },
+    env,
   });
   assert.equal(ok.ok, true);
   if (ok.ok) {
-    assert.equal(ok.repoDir, control);
-    assert.equal(ok.source, "self-dogfood");
+    assert.equal(ok.repoDir, path.resolve(control));
+    assert.equal(ok.source, "factory-plane-repo-dir");
     assert.equal(ok.pinPathOverride, null);
   }
+});
+
+test("resolveFactoryPinAuthority: managed worktree with only REPO_DIR uses control root (#1237)", () => {
+  const control = "/factory/control";
+  const wt = path.join(control, ".worktrees", "pipeline-1237-fixpin");
+  const env = { [FACTORY_PLANE_REPO_DIR_ENV]: control };
+  const ok = resolveFactoryPinAuthority({
+    invocationRepoDir: wt,
+    targetIsFactoryControl: isFactoryControlCheckout({ repoDir: wt, env }),
+    env,
+  });
+  assert.equal(ok.ok, true);
+  if (ok.ok) {
+    assert.equal(ok.repoDir, path.resolve(control));
+    assert.notEqual(ok.repoDir, wt);
+    assert.equal(ok.source, "factory-plane-repo-dir");
+    assert.equal(ok.pinPathOverride, null);
+  }
+});
+
+test("resolveFactoryPinAuthority: leftover REPO_DIR on a product checkout is not authority", () => {
+  const refused = resolveFactoryPinAuthority({
+    invocationRepoDir: "/product/acme",
+    targetIsFactoryControl: isFactoryControlCheckout({
+      repoDir: "/product/acme",
+      env: { [FACTORY_PLANE_REPO_DIR_ENV]: "/factory/control" },
+    }),
+    env: { [FACTORY_PLANE_REPO_DIR_ENV]: "/factory/control" },
+  });
+  assert.equal(refused.ok, false);
+  if (!refused.ok) assert.equal(refused.code, "not_factory_pin_authority");
 });
 
 test("resolveFactoryPinAuthority: refuses product repository invocation", () => {
@@ -1516,6 +1579,41 @@ test("promoteProductionPin: writes exactly one resolved pin file (#1183)", async
   assert.equal(result.pin.version, "1.39.7");
   assertSingleResolvedPinWrite(writes, factoryPin);
   assert.equal(files.has("/home/user/.local/state/hermes-factory/production-engine-pin.json"), false);
+});
+
+test("promote from managed control worktree with only REPO_DIR writes root pin (#1237)", async () => {
+  const control = "/factory/control";
+  const wt = path.join(control, ".worktrees", "pipeline-1237-fixpin");
+  const env = { [FACTORY_PLANE_REPO_DIR_ENV]: control };
+  const authority = resolveFactoryPinAuthority({
+    invocationRepoDir: wt,
+    targetIsFactoryControl: isFactoryControlCheckout({ repoDir: wt, env }),
+    env,
+  });
+  assert.equal(authority.ok, true);
+  if (!authority.ok) return;
+  const rootPin = path.join(path.resolve(control), PRODUCTION_ENGINE_PIN_REL);
+  const worktreePin = path.join(wt, PRODUCTION_ENGINE_PIN_REL);
+  const { deps, files, writes } = memFs();
+  const result = await promoteProductionPin({
+    repoDir: authority.repoDir,
+    version: "1.39.7",
+    gitSha: "e".repeat(40),
+    overridePath: authority.pinPathOverride,
+    fsDeps: deps,
+    env,
+    lookupFrg: async () => ({
+      kind: "pass",
+      evidence: passEvidence("1.39.7", "frg-abc"),
+    }),
+    now: FIXED_NOW,
+  });
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.path, rootPin);
+  assert.notEqual(result.path, worktreePin);
+  assertSingleResolvedPinWrite(writes, rootPin);
+  assert.equal(files.has(worktreePin), false);
 });
 
 test("promoteProductionPin: unset env writes the control-checkout pin only (#1183)", async () => {

@@ -10,6 +10,7 @@
 - [x] 2.2 Wire pipeline-run / train two-track default to the same predicate, including managed worktrees of the live control checkout; verify a developer-clone worktree stays inactive and a control-checkout worktree stays pinned
 - [x] 2.3 Wire `factory-pin` self-dogfood to checkout-role instead of `package.json` GitHub identity; verify `factory-pin` from a non-control clone without factory-control dir or pin-path override refuses before write
 - [x] 2.4 On the live control checkout with unset `AGENT_PIPELINE_PRODUCTION_PIN`, keep promote writing `$REPO_DIR/.agent-pipeline/production-engine-pin.json` only; verify no Hermes-state dual-write
+- [x] 2.4a Promote from a managed worktree of that checkout with only `REPO_DIR` set writes the control-root pin, not `<worktree>/.agent-pipeline/production-engine-pin.json`
 - [x] 2.5 Switch any other factory-plane caller of the GitHub-name helper (including factory-owned work-list admission) to checkout-role; verify GitHub owner/name no longer implies factory plane
 
 ## 3. Regression tests

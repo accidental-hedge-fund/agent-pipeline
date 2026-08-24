@@ -22,6 +22,14 @@
 - **THEN** the written pin SHALL be `$REPO_DIR/.agent-pipeline/production-engine-pin.json`
 - **AND** the promote path SHALL NOT also write `~/.local/state/hermes-factory/production-engine-pin.json`
 
+#### Scenario: Managed worktree factory-pin promote writes the control-checkout pin
+
+- **WHEN** `pipeline factory-pin promote` succeeds from a managed worktree of the live factory control checkout
+- **AND** factory-plane `REPO_DIR` is that checkout
+- **AND** `AGENT_PIPELINE_PRODUCTION_PIN` is unset
+- **THEN** the written pin SHALL be `$REPO_DIR/.agent-pipeline/production-engine-pin.json`
+- **AND** SHALL NOT write `<worktree>/.agent-pipeline/production-engine-pin.json`
+
 #### Scenario: Skip-frg marker is not clone law
 
 - **WHEN** `--skip-frg` writes a pin with `frg_run_id` `no-frg-X.Y.Z`
