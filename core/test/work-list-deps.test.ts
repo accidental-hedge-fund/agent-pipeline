@@ -531,14 +531,17 @@ test("compile: factory-owned single-item refuses incomplete discovery (no contra
       "42": null, // native unobservable — incomplete, not observed-empty
     },
   });
+  const cfg = fakeCfg();
   await assert.rejects(
     () =>
       compileWorkListRunFresh(
-        fakeCfg(FACTORY_CONTROL_REPO),
+        cfg,
         "claude",
         ["42"],
         "run-factory-single-refuse",
         deps,
+        undefined,
+        { env: { REPO_DIR: cfg.repo_dir } },
       ),
     (err: unknown) => {
       assert.ok(err instanceof IncompleteDependencyDiscoveryError);
@@ -553,6 +556,30 @@ test("compile: factory-owned single-item refuses incomplete discovery (no contra
       return true;
     },
   );
+});
+
+test("compile: GitHub owner/name is not factory-owned admission (#1237)", async () => {
+  const deps = fakeDiscoverDeps({
+    bodies: {
+      "42": { title: "solo", body: "Depends on #99." },
+    },
+    blockedBy: {
+      "42": null,
+    },
+  });
+  const { contract, ledger, discovery } = await compileWorkListRunFresh(
+    fakeCfg(FACTORY_CONTROL_REPO),
+    "claude",
+    ["42"],
+    "run-github-name-not-factory",
+    deps,
+    undefined,
+    { env: {} },
+  );
+  assert.equal(discovery.has_incomplete, true);
+  assert.equal(contract.items.length, 1);
+  assert.equal(contract.items[0]!.id, "42");
+  assert.ok(ledger.items["42"]);
 });
 
 test("compile: non-factory single-item still admits when a source is incomplete (exploratory)", async () => {

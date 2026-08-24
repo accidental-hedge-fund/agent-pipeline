@@ -8,6 +8,7 @@ import type { FrgEvidence, FrgLookupResult } from "../scripts/factory-reliabilit
 import {
   FACTORY_CONTROL_DIR_ENV,
   FACTORY_CONTROL_REPO,
+  FACTORY_PLANE_REPO_DIR_ENV,
   INSTALL_RECEIPT_FILENAME,
   PRODUCTION_ENGINE_PIN_REL,
   PRODUCTION_PIN_ENV,
@@ -20,9 +21,11 @@ import {
   formatProductionPinSummary,
   HERMES_STATE_PRODUCTION_PIN_MARKER,
   initProductionPin,
+  isFactoryControlCheckout,
   isFactoryControlRepo,
   isNoFrgRunId,
   isProductionQualityPin,
+  isSameOrManagedWorktreeOf,
   parseInstallReceipt,
   parseProductionEnginePin,
   pinInstallProvenanceMatches,
@@ -226,13 +229,125 @@ test("textDefaultsOrDocumentsHermesStateProductionPin: bites the SKILL default (
   assert.match(HERMES_STATE_PRODUCTION_PIN_MARKER, /hermes-factory\/production-engine-pin\.json/);
 });
 
-test("isFactoryControlRepo: only the canonical factory control owner/name", () => {
+test("isFactoryControlRepo: GitHub owner/name matcher is not factory-control identity", () => {
   assert.equal(isFactoryControlRepo(FACTORY_CONTROL_REPO), true);
   assert.equal(isFactoryControlRepo(FACTORY_CONTROL_REPO.toUpperCase()), true);
   assert.equal(isFactoryControlRepo("acme/widget"), false);
   assert.equal(isFactoryControlRepo("other/agent-pipeline"), false);
   assert.equal(isFactoryControlRepo(""), false);
   assert.equal(isFactoryControlRepo(null), false);
+  // GitHub-name match MUST NOT default doctor/train to pinned (#1237).
+  assert.equal(
+    isFactoryControlCheckout({
+      repoDir: "/home/dev/agent-pipeline",
+      env: {},
+    }),
+    false,
+  );
+  assert.equal(
+    resolveEngineTrackIntent({
+      command: "doctor",
+      factoryControlContext: isFactoryControlCheckout({
+        repoDir: "/home/dev/agent-pipeline",
+        env: {},
+      }),
+    }),
+    null,
+  );
+  assert.equal(
+    resolveEngineTrackIntent({
+      command: "train",
+      factoryControlContext: isFactoryControlCheckout({
+        repoDir: "/home/dev/agent-pipeline",
+        env: {},
+      }),
+    }),
+    null,
+  );
+});
+
+test("isFactoryControlCheckout: REPO_DIR / FACTORY_CONTROL match; absent signals fail", () => {
+  const control = "/factory/ap-main-control";
+  assert.equal(
+    isFactoryControlCheckout({ repoDir: control, env: { [FACTORY_PLANE_REPO_DIR_ENV]: control } }),
+    true,
+  );
+  assert.equal(
+    isFactoryControlCheckout({
+      repoDir: control,
+      env: { [FACTORY_CONTROL_DIR_ENV]: control },
+    }),
+    true,
+  );
+  assert.equal(
+    isFactoryControlCheckout({ repoDir: control, factoryControlDir: control, env: {} }),
+    true,
+  );
+  assert.equal(isFactoryControlCheckout({ repoDir: control, env: {} }), false);
+  assert.equal(
+    isFactoryControlCheckout({
+      repoDir: "/home/dev/agent-pipeline",
+      env: { [FACTORY_PLANE_REPO_DIR_ENV]: control },
+    }),
+    false,
+    "REPO_DIR pointing at a different checkout is not this checkout",
+  );
+  assert.equal(
+    isFactoryControlCheckout({
+      repoDir: "/home/dev/agent-pipeline",
+      env: {
+        [PRODUCTION_PIN_ENV]: "/home/dev/agent-pipeline/.agent-pipeline/production-engine-pin.json",
+      },
+    }),
+    false,
+    "leftover pin path / PRODUCTION_PIN is not factory-control identity",
+  );
+});
+
+test("isFactoryControlCheckout: managed worktree of live control stays factory-control", () => {
+  const control = "/factory/ap-main-control";
+  const wt = path.join(control, ".worktrees", "pipeline-1237-fixpin");
+  assert.equal(isSameOrManagedWorktreeOf(wt, control), true);
+  assert.equal(
+    isFactoryControlCheckout({
+      repoDir: wt,
+      env: { [FACTORY_PLANE_REPO_DIR_ENV]: control },
+    }),
+    true,
+  );
+  assert.equal(
+    isFactoryControlCheckout({
+      repoDir: path.join("/home/dev/agent-pipeline", ".worktrees", "pipeline-1237-fixpin"),
+      env: {},
+    }),
+    false,
+    "managed worktree of a developer clone is not factory-control",
+  );
+});
+
+test("isFactoryControlCheckout: GitHub owner/name and hermes-state pin are never sufficient", () => {
+  assert.equal(
+    isFactoryControlCheckout({
+      repoDir: "/home/dev/agent-pipeline",
+      env: {},
+    }),
+    false,
+  );
+  assert.equal(
+    isFactoryControlCheckout({
+      repoDir: "/home/user/.local/state/hermes-factory",
+      env: {},
+    }),
+    false,
+  );
+  assert.equal(
+    isFactoryControlCheckout({
+      repoDir: "/home/dev/ap-main-control",
+      env: {},
+    }),
+    false,
+    "path-name heuristics are not factory-control identity",
+  );
 });
 
 test("resolvePinAuthorityDir: factory control env beats target repoDir", () => {
@@ -567,13 +682,34 @@ test("resolveEngineTrackIntent: defaults are factory-scoped (#762 review 2)", ()
     resolveEngineTrackIntent({ command: "doctor", factoryControlContext: true }),
     "pinned",
   );
+  assert.equal(
+    resolveEngineTrackIntent({ command: "train", factoryControlContext: true }),
+    "pinned",
+  );
   // Ordinary non-factory product repos: policy inactive (no pin required).
   assert.equal(resolveEngineTrackIntent({ command: "loop" }), null);
   assert.equal(resolveEngineTrackIntent({ command: "single" }), null);
   assert.equal(resolveEngineTrackIntent({ command: "advance" }), null);
   assert.equal(resolveEngineTrackIntent({ command: "doctor" }), null);
+  assert.equal(resolveEngineTrackIntent({ command: "train" }), null);
   assert.equal(
     resolveEngineTrackIntent({ command: "advance", factoryControlContext: false }),
+    null,
+  );
+});
+
+test("resolveEngineTrackIntent: non-control clone of this GitHub repo is inactive (#1237)", () => {
+  const cloneContext = isFactoryControlCheckout({
+    repoDir: "/home/dev/agent-pipeline",
+    env: {},
+  });
+  assert.equal(cloneContext, false);
+  assert.equal(
+    resolveEngineTrackIntent({ command: "doctor", factoryControlContext: cloneContext }),
+    null,
+  );
+  assert.equal(
+    resolveEngineTrackIntent({ command: "train", factoryControlContext: cloneContext }),
     null,
   );
 });
@@ -707,6 +843,50 @@ test("resolveInstallProvenance: working_tree is authoritative over receipt", () 
   assert.equal(wtOnly.kind, "working_tree");
 
   assert.equal(resolveInstallProvenance({ receiptText: null }).kind, "missing");
+});
+
+test("resolveFactoryPinAuthority: GitHub-name clone is not self-dogfood (#1237)", () => {
+  assert.equal(
+    isFactoryControlPackageMeta({
+      repository: {
+        type: "git",
+        url: "git+https://github.com/accidental-hedge-fund/agent-pipeline.git",
+      },
+    }),
+    true,
+    "package.json still names the origin GitHub repo",
+  );
+  const refused = resolveFactoryPinAuthority({
+    invocationRepoDir: "/home/dev/agent-pipeline",
+    targetIsFactoryControl: isFactoryControlCheckout({
+      repoDir: "/home/dev/agent-pipeline",
+      env: {},
+    }),
+    env: {},
+  });
+  assert.equal(refused.ok, false);
+  if (!refused.ok) {
+    assert.equal(refused.code, "not_factory_pin_authority");
+    assert.match(refused.remediation, /GitHub owner\/name is not factory-pin authority/);
+  }
+});
+
+test("resolveFactoryPinAuthority: live control checkout self-dogfoods without PRODUCTION_PIN (#1237)", () => {
+  const control = "/factory/ap-main-control";
+  const ok = resolveFactoryPinAuthority({
+    invocationRepoDir: control,
+    targetIsFactoryControl: isFactoryControlCheckout({
+      repoDir: control,
+      env: { [FACTORY_PLANE_REPO_DIR_ENV]: control },
+    }),
+    env: { [FACTORY_PLANE_REPO_DIR_ENV]: control },
+  });
+  assert.equal(ok.ok, true);
+  if (ok.ok) {
+    assert.equal(ok.repoDir, control);
+    assert.equal(ok.source, "self-dogfood");
+    assert.equal(ok.pinPathOverride, null);
+  }
 });
 
 test("resolveFactoryPinAuthority: refuses product repository invocation", () => {
@@ -942,6 +1122,62 @@ test("evaluateEngineTrackCheck: non-factory does not fail solely for no-frg (#10
   });
   assert.equal(r.status, "pass");
   assert.match(r.detail, /no-frg|not production-quality/);
+});
+
+test("evaluateEngineTrackCheck: non-control clone leftover no-frg-1.39.1 does not fail (#1237)", () => {
+  const cloneDir = "/home/dev/agent-pipeline";
+  const factoryControlContext = isFactoryControlCheckout({ repoDir: cloneDir, env: {} });
+  assert.equal(factoryControlContext, false);
+  const intent = resolveEngineTrackIntent({
+    command: "doctor",
+    factoryControlContext,
+  });
+  assert.equal(intent, null);
+  const pin = validPin({
+    version: "1.39.1",
+    tag: "v1.39.1",
+    frg_run_id: "no-frg-1.39.1",
+    frg_evidence_path: null,
+  });
+  const r = evaluateEngineTrackCheck({
+    intent,
+    pinLoad: {
+      kind: "ok",
+      pin,
+      path: path.join(cloneDir, PRODUCTION_ENGINE_PIN_REL),
+    },
+    runningVersion: "1.39.1",
+  });
+  assert.equal(r.status, "pass");
+  assert.notEqual(r.status, "fail");
+});
+
+test("evaluateEngineTrackCheck: factory-control checkout still fails no-frg pin (#1237)", () => {
+  const control = "/factory/ap-main-control";
+  const factoryControlContext = isFactoryControlCheckout({
+    repoDir: control,
+    env: { [FACTORY_PLANE_REPO_DIR_ENV]: control },
+  });
+  assert.equal(factoryControlContext, true);
+  const intent = resolveEngineTrackIntent({
+    command: "doctor",
+    factoryControlContext,
+  });
+  assert.equal(intent, "pinned");
+  const pin = validPin({
+    version: "1.39.1",
+    tag: "v1.39.1",
+    frg_run_id: "no-frg-1.39.1",
+    frg_evidence_path: null,
+  });
+  const r = evaluateEngineTrackCheck({
+    intent,
+    pinLoad: { kind: "ok", pin, path: path.join(control, PRODUCTION_ENGINE_PIN_REL) },
+    runningVersion: "1.39.1",
+    installProvenance: pinProvenance("v1.39.1"),
+  });
+  assert.equal(r.status, "fail");
+  assert.match(r.detail, /no-frg-1\.39\.1/);
 });
 
 test("evaluateProductionPinPathCheck: env 1.39.6 vs control 1.39.7 → fail (#1183)", () => {
@@ -1367,6 +1603,38 @@ test("promoteProductionPin: allowWithoutFrg promotes without FRG evidence", asyn
   const written = JSON.parse(files.get(PIN_PATH)!);
   assert.equal(written.version, "1.34.0");
   assert.equal(written.previous.version, "1.29.1");
+});
+
+test("skip-frg marker is not clone law: write no-frg-* then inactive clone doctor passes (#1237)", async () => {
+  const cloneDir = "/home/dev/agent-pipeline";
+  const clonePin = path.join(cloneDir, PRODUCTION_ENGINE_PIN_REL);
+  const { deps, files } = memFs();
+  const written = await promoteProductionPin({
+    repoDir: cloneDir,
+    version: "1.39.1",
+    allowWithoutFrg: true,
+    fsDeps: deps,
+    env: {},
+    lookupFrg: async () => ({ kind: "missing", path: "/nope" }),
+  });
+  assert.equal(written.ok, true);
+  if (!written.ok) return;
+  assert.equal(written.pin.frg_run_id, "no-frg-1.39.1");
+  assert.equal(written.pin.frg_evidence_path, null);
+  const onDisk = parseProductionEnginePin(files.get(clonePin)!);
+  assert.equal(onDisk.frg_run_id, "no-frg-1.39.1");
+  const intent = resolveEngineTrackIntent({
+    command: "doctor",
+    factoryControlContext: isFactoryControlCheckout({ repoDir: cloneDir, env: {} }),
+  });
+  assert.equal(intent, null);
+  const check = evaluateEngineTrackCheck({
+    intent,
+    pinLoad: { kind: "ok", pin: onDisk, path: clonePin },
+    runningVersion: "1.39.1",
+  });
+  assert.equal(check.status, "pass");
+  assert.notEqual(check.status, "fail");
 });
 
 test("promoteProductionPin: refuses pass:false — no mutation", async () => {

@@ -262,18 +262,21 @@ not the product owner. #1001 / #971 do not ban in-engine ship.
 Required env for mutating ship: `REPO_DIR`, `PIPELINE`, `ALLOW_MERGE=1`.  
 `REPO_DIR` is the live control checkout; Tugboat refuses `*factory-control*`
 and treats only live `train --merge` (or owning tugboat) as an already-running
-ship (#1062). Promote defaults to all hosts (`ENGINE_PROMOTE_HOST` default `all`).
-Tugboat and the host `pipeline` launcher export `AGENT_PIPELINE_PRODUCTION_PIN`
+ship (#1062). Factory-control identity for two-track pin policy is that
+checkout (or a managed worktree of it), not GitHub owner/name. A developer
+clone of `accidental-hedge-fund/agent-pipeline` is not the factory plane.
+Promote defaults to all hosts (`ENGINE_PROMOTE_HOST` default `all`).
+Tugboat and the host `pipeline` launcher MAY export `AGENT_PIPELINE_PRODUCTION_PIN`
 when unset to the factory pin file
 (`$REPO_DIR/.agent-pipeline/production-engine-pin.json`) so `engine-promote`
 and the next `pipeline train` / `pipeline doctor` share one path (#1127).
-The factory plane has **one** live pin file. Host supervisor SKILL MUST NOT
-default that env to `~/.local/state/hermes-factory/production-engine-pin.json`
-(that leftover file is not pin authority). `pipeline doctor` check
-`install:production-pin-path` **fails** when the env pin `version` or `git_sha`
-disagrees with the control-checkout pin. v1.40.1 packaging MAY template
-supervisor env from `examples/supervisor/hermes/env.example` and MUST NOT
-reintroduce a second live pin path.
+Ordinary host skill boot does **not** require that env. The factory plane has
+**one** live pin file. Host supervisor SKILL MUST NOT default that env to
+`~/.local/state/hermes-factory/production-engine-pin.json` (that leftover file
+is not pin authority). `pipeline doctor` check `install:production-pin-path`
+**fails** when the env pin `version` or `git_sha` disagrees with the
+control-checkout pin. v1.40.1 packaging MAY template supervisor env from
+`examples/supervisor/hermes/env.example` and MUST NOT reintroduce a second live pin path.
 
 Runbooks: [runbooks/ship-milestone.md](./runbooks/ship-milestone.md),  
 [runbooks/frg-pack-checklist.md](./runbooks/frg-pack-checklist.md).
