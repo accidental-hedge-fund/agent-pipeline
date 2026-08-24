@@ -72,6 +72,8 @@ SHALL still be current suite input for the review prompt.
 - **THEN** the run directory SHALL contain SHA-matched Tester evidence for the
   candidate HEAD, **or** review SHALL withhold with a named persist/acquire
   code other than the generic missing-file string
+- **AND** when the remaining artifact is stale or malformed rather than missing,
+  the named withhold SHALL preserve that re-acquired classification
 - **AND** the review model SHALL run when the SHA-matched artifact is current
   (including SHA-matched records that omit `evidence_subject`)
 - **AND** SHALL NOT invent a suite pass

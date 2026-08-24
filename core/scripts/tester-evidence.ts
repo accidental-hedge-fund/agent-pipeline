@@ -1379,10 +1379,16 @@ async function applyNamedPersistAcquireFail(
     candidate_sha: pinned,
   };
   const tsHint = await trustedSurfacePersistHint(args.runDir, args.io);
-  const named = namedPersistAcquireReason(code, {
+  let named = namedPersistAcquireReason(code, {
     persistError: args.obs.persist.error,
     trustedSurface: tsHint,
   });
+  // Keep stale/malformed classification in the reason so the rendered section
+  // still reports the re-acquired class, not a collapsed missing-file string.
+  if (acq.classification !== "missing") {
+    named += ` Re-acquired classification: ${acq.classification}.`;
+    if (acq.reason) named += ` ${acq.reason}`;
+  }
   const marker = formatTesterPersistAcquireHtmlComment(record);
   acq.persist_acquire_code = code;
   acq.withholdInvoke = true;
@@ -1425,8 +1431,10 @@ async function applyNamedPersistAcquireFail(
  * candidate-changing commit is not permanently parked solely for absent
  * `tester-evidence.json` in this run directory.
  *
- * After a producer that records required-command exit 0, missing re-acquire
- * uses a named persist/acquire code instead of the generic missing-file string.
+ * After a producer that records required-command exit 0, a still-non-current
+ * regenerable re-acquire (`missing`, `stale`, or `malformed`) uses a named
+ * persist/acquire code instead of the generic missing-file string or an
+ * ordinary stale/malformed withhold. Classification stays as re-acquired.
  */
 export async function loadOrRegenerateTesterEvidenceForReview(
   runDir: string | undefined,
@@ -1462,7 +1470,7 @@ export async function loadOrRegenerateTesterEvidenceForReview(
   acq = await loadTesterEvidenceForReview(runDir, candidateSha, cfg, io, pinOpts);
   if (
     observation.recorded_required_exit_0 &&
-    acq.classification === "missing"
+    isTesterRegenerableClassification(acq.classification)
   ) {
     return applyNamedPersistAcquireFail(acq, {
       runDir,

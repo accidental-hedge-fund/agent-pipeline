@@ -1143,6 +1143,84 @@ test("loadOrRegenerate: persist_write_failed after exit 0 preserves redacted err
   assert.equal(io.files.has(path.join(runDir, "tester-evidence.json")), false);
 });
 
+test("loadOrRegenerate: recorded exit 0 leaving stale artifact uses named persist/acquire not ordinary stale", async () => {
+  const io = memoryIo();
+  const runDir = "/runs/1226-exit0-stale";
+  await writeTesterEvidence(runDir, baseEvidence({ candidate_sha: SHA_A }), {
+    io,
+    appendEvent: false,
+  });
+  const acq = await loadOrRegenerateTesterEvidenceForReview(
+    runDir,
+    SHA_B,
+    { tester_evidence: DEFAULT_TESTER_EVIDENCE_CONFIG },
+    async () =>
+      exit0Observation({
+        persist: {
+          ok: false,
+          candidate_sha: SHA_B,
+          code: "persist_write_failed",
+          error: "EACCES: cannot replace stale artifact",
+        },
+      }),
+    io,
+  );
+  assert.equal(acq.classification, "stale");
+  assert.equal(acq.withholdInvoke, true);
+  assert.equal(acq.persist_acquire_code, "persist_write_failed");
+  assert.equal(acq.artifact?.candidate_sha, SHA_A);
+  assert.notEqual(acq.reason, TESTER_EVIDENCE_MISSING_FILE_REASON);
+  assert.doesNotMatch(acq.reason, /missing tester-evidence\.json/);
+  assert.match(acq.reason, /pipeline-tester-persist-acquire: v1/);
+  assert.match(acq.reason, /persist_write_failed/);
+  assert.match(acq.reason, /Re-acquired classification: stale/);
+  assert.match(acq.section, /stale/i);
+  assert.match(acq.section, /persist_write_failed/);
+  const persistPath = path.join(runDir, TESTER_PERSIST_ACQUIRE_FILENAME);
+  assert.ok(io.files.has(persistPath), "must persist tester-persist-acquire.json");
+  const marker = extractTesterPersistAcquire([{ body: acq.reason }]);
+  assert.equal(marker?.persist_acquire_code, "persist_write_failed");
+  assert.equal(marker?.recorded_required_exit_0, true);
+  assert.equal(marker?.candidate_sha, SHA_B);
+});
+
+test("loadOrRegenerate: recorded exit 0 leaving malformed artifact uses named persist/acquire not ordinary malformed", async () => {
+  const io = memoryIo();
+  const runDir = "/runs/1226-exit0-malformed";
+  await io.writeFile(testerEvidencePath(runDir), "{not-json");
+  const acq = await loadOrRegenerateTesterEvidenceForReview(
+    runDir,
+    SHA_A,
+    { tester_evidence: DEFAULT_TESTER_EVIDENCE_CONFIG },
+    async () =>
+      exit0Observation({
+        persist: {
+          ok: false,
+          candidate_sha: SHA_A,
+          code: "persist_write_failed",
+          error: "EACCES: cannot replace malformed artifact",
+        },
+      }),
+    io,
+  );
+  assert.equal(acq.classification, "malformed");
+  assert.equal(acq.withholdInvoke, true);
+  assert.equal(acq.persist_acquire_code, "persist_write_failed");
+  assert.equal(acq.artifact, null);
+  assert.notEqual(acq.reason, TESTER_EVIDENCE_MISSING_FILE_REASON);
+  assert.doesNotMatch(acq.reason, /missing tester-evidence\.json/);
+  assert.match(acq.reason, /pipeline-tester-persist-acquire: v1/);
+  assert.match(acq.reason, /persist_write_failed/);
+  assert.match(acq.reason, /Re-acquired classification: malformed/);
+  assert.match(acq.section, /malformed/i);
+  assert.match(acq.section, /persist_write_failed/);
+  const persistPath = path.join(runDir, TESTER_PERSIST_ACQUIRE_FILENAME);
+  assert.ok(io.files.has(persistPath), "must persist tester-persist-acquire.json");
+  const marker = extractTesterPersistAcquire([{ body: acq.reason }]);
+  assert.equal(marker?.persist_acquire_code, "persist_write_failed");
+  assert.equal(marker?.recorded_required_exit_0, true);
+});
+
 test("loadOrRegenerate: no regenerate callback keeps pure load-only fail_closed", async () => {
   const acq = await loadOrRegenerateTesterEvidenceForReview(
     "/runs/none",

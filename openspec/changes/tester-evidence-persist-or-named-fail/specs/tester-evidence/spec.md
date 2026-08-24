@@ -17,9 +17,20 @@ The pipeline SHALL write a SHA-matched `tester-evidence.json` for the candidate 
 #### Scenario: persist failure after exit 0 uses a named withhold
 
 - **WHEN** the deterministic producer records a required test-gate command exit 0 as a typed observation
-- **AND** no SHA-matched `tester-evidence.json` exists after that attempt
+- **AND** re-acquisition is still not current (`missing`, `stale`, or `malformed`)
 - **THEN** `fail_closed` SHALL withhold with a named persist/acquire code other than the generic missing-file string
 - **AND** that code SHALL be stored on the acquisition result and in durable run or comment evidence
+- **AND** the re-acquired classification SHALL be preserved in the rendered reason and section
+- **AND** acquisition SHALL NOT invent a suite pass
+
+#### Scenario: remaining stale or malformed after exit 0 uses named persist/acquire
+
+- **WHEN** the deterministic producer records a required test-gate command exit 0 as a typed observation
+- **AND** an old SHA-pinned or unreadable `tester-evidence.json` remains so re-acquisition is `stale` or `malformed`
+- **THEN** `fail_closed` SHALL withhold with a named persist/acquire code other than the generic missing-file string
+- **AND** the acquisition classification SHALL remain `stale` or `malformed` as re-acquired
+- **AND** the rendered reason and section SHALL preserve that classification
+- **AND** recover-parked SHALL be able to read the durable persist/acquire marker
 - **AND** acquisition SHALL NOT invent a suite pass
 
 #### Scenario: atomic write failure after exit 0 is named and does not invent a pass
@@ -57,12 +68,17 @@ The pipeline SHALL write a SHA-matched `tester-evidence.json` for the candidate 
 
 ### Requirement: Persist-or-named-fail regressions SHALL fail the unit suite
 
-Automated tests covered by `npm run ci` SHALL inject I/O (no live network, git, or subprocess) and SHALL fail if: (1) a producer callback resolves after recording test-gate exit 0 and review still withholds solely because `tester-evidence.json` is missing; (2) a `trusted-surface.json` `repo_policy` `missing_base_sha` with all-zero `candidate_sha` is collapsed into the generic missing-file withhold string with no distinct diagnostic.
+Automated tests covered by `npm run ci` SHALL inject I/O (no live network, git, or subprocess) and SHALL fail if: (1) a producer callback resolves after recording test-gate exit 0 and review still withholds solely because `tester-evidence.json` is missing, or still stale/malformed without a named persist/acquire code; (2) a `trusted-surface.json` `repo_policy` `missing_base_sha` with all-zero `candidate_sha` is collapsed into the generic missing-file withhold string with no distinct diagnostic.
 
 #### Scenario: missing-file withhold after recorded exit 0 fails the suite
 
 - **WHEN** a unit test drives review Tester acquisition with a producer that records test-gate exit 0 and does not leave a SHA-matched artifact under the generic missing classification
 - **THEN** the test SHALL fail unless withhold is false because a SHA-matched artifact was written, or withhold is true with a named persist/acquire reason other than the generic missing-file string
+
+#### Scenario: stale or malformed withhold after recorded exit 0 fails the suite
+
+- **WHEN** a unit test drives review Tester acquisition with a producer that records test-gate exit 0 and leaves a stale or malformed artifact
+- **THEN** the test SHALL fail unless withhold is true with a named persist/acquire reason and the re-acquired classification remains stale or malformed
 
 #### Scenario: missing_base_sha collapse fails the suite
 
