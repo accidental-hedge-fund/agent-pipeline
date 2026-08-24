@@ -8,8 +8,9 @@
 #
 # Follow mode exits on the bound stream's identity-terminal (loop_run_superseded,
 # loop_run_complete, loop_run_stopped on a loop file; ship_phase complete on a
-# ship file). It does not wait for ship_phase on a loop file, and it does not
-# open a superseded_by path. Tugboat re-binds --events-file to a later handoff.
+# ship file), including when that event already exists before follow starts.
+# It does not wait for ship_phase on a loop file, and it does not open a
+# superseded_by path. Tugboat re-binds --events-file to a later handoff.
 #
 # Environment:
 #   PIPELINE_MATERIAL_FILTER  installed material-filter.mjs executable
@@ -42,8 +43,11 @@ The events file must identify one exact Pipeline run. Follow mode starts at
 the current cursor and exits on that file's identity-terminal event
 (loop_run_superseded / loop_run_complete / loop_run_stopped for a loop file;
 ship_phase complete for a ship file), or after SHIP_STAGE_WATCH_IDLE_SECS
-(default 30) of inactivity once that terminal was seen. This command does
-not discover latest loop or advance runs and does not follow superseded_by.
+(default 30) of inactivity once that terminal was seen. If the bound file
+already contains identity-terminal before follow starts, the observer emits
+that material line and exits instead of waiting on tail -n 0 -F. This
+command does not discover latest loop or advance runs and does not follow
+superseded_by.
 Set PIPELINE_MATERIAL_FILTER to the installed material-filter.mjs executable.
 USAGE
 }
@@ -195,7 +199,9 @@ last_line_ts="$work_dir/last.ts"
 mkfifo "$fifo"
 
 # Own the follow child. `tail -F | filter | emit` under pipefail hangs after
-# identity-terminal because a silent file never SIGPIPEs tail.
+# identity-terminal because a silent file never SIGPIPEs tail. Start tail
+# before classifying existing lines so a terminal written during startup is
+# not lost between the scan and follow.
 tail -n 0 -F "$events_file" >"$fifo" &
 tail_pid=$!
 
@@ -215,10 +221,11 @@ tail_pid=$!
 watchdog_pid=$!
 
 # Forward JSONL, classify identity-terminal of THIS bound file, then stop so
-# pipefail cannot wait on silent tail -F. Do not open superseded_by or glob
-# host-global run directories.
+# pipefail cannot wait on silent tail -F. Scan the exact bound file first:
+# tail -n 0 -F would miss a terminal that already landed. Do not open
+# superseded_by or glob host-global run directories.
 set +e
-python3 - "$fifo" "$terminal_seen" "$last_line_ts" "$tail_pid" <<'PY' | "$MATERIAL_FILTER" --until-identity-terminal | emit
+python3 - "$fifo" "$terminal_seen" "$last_line_ts" "$tail_pid" "$events_file" <<'PY' | "$MATERIAL_FILTER" --until-identity-terminal | emit
 import json
 import os
 import signal
@@ -227,7 +234,7 @@ import time
 
 signal.signal(signal.SIGPIPE, signal.SIG_IGN)
 
-fifo, marker, ts_path, tail_pid_s = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+fifo, marker, ts_path, tail_pid_s, events_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 loop_kinds = {"loop_run_superseded", "loop_run_complete", "loop_run_stopped"}
 
 def is_identity_terminal(obj):
@@ -253,14 +260,37 @@ def mark_and_stop_follow():
     except OSError:
         pass
 
+def emit_line(line):
+    out = line if line.endswith("\n") else line + "\n"
+    try:
+        sys.stdout.write(out)
+        sys.stdout.flush()
+    except BrokenPipeError:
+        sys.exit(0)
+
+# Classify this exact bound file before follow. Do not replay historical
+# non-terminal material (follow starts at the current cursor).
+try:
+    with open(events_path, encoding="utf-8", errors="replace") as existing:
+        for line in existing:
+            s = line.strip()
+            if not s.startswith("{"):
+                continue
+            try:
+                obj = json.loads(s)
+            except json.JSONDecodeError:
+                continue
+            if is_identity_terminal(obj):
+                emit_line(line)
+                mark_and_stop_follow()
+                sys.exit(0)
+except OSError:
+    pass
+
 try:
     with open(fifo, encoding="utf-8", errors="replace") as src:
         for line in src:
-            try:
-                sys.stdout.write(line)
-                sys.stdout.flush()
-            except BrokenPipeError:
-                sys.exit(0)
+            emit_line(line)
             s = line.strip()
             if not s.startswith("{"):
                 continue

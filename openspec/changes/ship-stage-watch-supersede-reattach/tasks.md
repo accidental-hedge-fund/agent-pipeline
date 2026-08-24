@@ -10,6 +10,7 @@
 - [x] 2.1 Teach the shared material filter (or the watch-owned parser of the same kinds) to treat `loop_run_superseded`, `loop_run_complete`, and `loop_run_stopped` as identity-terminal for a loop stream, while `ship_phase` complete/completed remains terminal for a ship stream. Emit the terminal material line before stop. Verify filter unit coverage for those kinds, and that `--until-ship-terminal` is not the only stop used on a loop file
 - [x] 2.2 Change `examples/supervisor/shell/ship-stage-watch.sh` follow mode so the watcher process exits after bound-stream identity-terminal. Reap the follow child (`tail -F` or equivalent) so `pipefail` cannot hang on a silent file. Do not glob latest runs or open a `superseded_by` path. Verify task 1.1 now passes
 - [x] 2.3 Add a documented inactivity bound (default 30s, test-overridable env) that exits only after identity-terminal when no further parsed line arrives. Verify a live quiet file without identity-terminal does not exit solely on that bound. Verify an idle-after-supersede fixture exits even if the follow child would otherwise hang
+- [x] 2.4 Before follow, classify the exact bound file for a pre-existing identity-terminal. If present, emit that material line and exit (do not hang on unbounded `tail -n 0 -F`). Do not replay historical non-terminal material and do not open `superseded_by`. Verify a fixture whose terminal line predates watcher startup now passes
 
 ## 3. Tugboat re-bind and leftover pid-file reap
 

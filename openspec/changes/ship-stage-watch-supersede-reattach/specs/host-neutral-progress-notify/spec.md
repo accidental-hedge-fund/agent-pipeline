@@ -50,6 +50,15 @@ An exact-run ship progress observer SHALL exit when the bound file has already p
 - **THEN** the observer process SHALL exit
 - **AND** it SHALL NOT remain blocked on `tail -F` of that silent file
 
+#### Scenario: Identity-terminal already in the bound file at follow start
+
+- **WHEN** bundled `ship-stage-watch` follow mode is bound to one absolute loop `events.jsonl`
+- **AND** that file already contains `loop_run_superseded` (or `loop_run_complete` / `loop_run_stopped`) before the watcher process starts
+- **THEN** the observer SHALL emit the material line for that identity-terminal event
+- **AND** the observer process SHALL exit
+- **AND** it SHALL NOT remain blocked on `tail -n 0 -F` of that silent file
+- **AND** it SHALL NOT open a successor `events.jsonl`
+
 #### Scenario: Idle does not kill a live quiet run
 
 - **WHEN** follow mode is bound to a live loop file that has not emitted `loop_run_superseded`, `loop_run_complete`, or `loop_run_stopped`

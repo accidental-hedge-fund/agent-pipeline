@@ -209,6 +209,28 @@ test("follow mode exits after loop_run_superseded and emits the identity-termina
   fs.rmSync(root, { recursive: true, force: true });
 });
 
+test("follow mode exits when identity-terminal already exists before startup (#1227)", async () => {
+  const { root, events, filter } = fixture();
+  fs.writeFileSync(
+    events,
+    [
+      JSON.stringify({ material: true, message: "#1221 stage start → implementing" }),
+      JSON.stringify({
+        seq: 1,
+        time: "2026-08-23T21:19:00.000Z",
+        kind: "loop_run_superseded",
+        data: { superseded_by: "loop-9d33dc88" },
+      }),
+    ].join("\n") + "\n",
+  );
+  const child = spawnFollow({ events, filter, idleSecs: "1" });
+  const result = await waitForExit(child, 4000);
+  assert.equal(result.code, 0, `stderr=${result.stderr} stdout=${result.stdout}`);
+  assert.match(result.stdout, /\[loop_run_superseded\]/);
+  assert.doesNotMatch(result.stdout, /stage start/);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
 test("follow mode idle after supersede exits even if the filter would hang (#1227)", async () => {
   const { root, events } = fixture();
   const filter = hangFilter(root);
