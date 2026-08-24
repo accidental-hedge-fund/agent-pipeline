@@ -20,6 +20,8 @@ import {
   extractTesterMetricsFromEvidence,
   formatTesterEvidenceSummary,
   extractTesterPersistAcquire,
+  formatTesterPersistAcquireHtmlComment,
+  parseTesterPersistAcquireFromBody,
   loadOrRegenerateTesterEvidenceForReview,
   loadTesterEvidenceForReview,
   loadTesterEvidenceForReviewSync,
@@ -48,10 +50,17 @@ import {
 } from "../scripts/evidence-subject.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 import { DEFAULT_CONFIG } from "../scripts/types.ts";
+import { attestPipelineComment } from "../scripts/stages/review-parsing.ts";
 
 const SHA_A = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SHA_B = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const ZERO_SHA = "0".repeat(40);
+const PERSIST_IDENTITY = {
+  issue: 1226,
+  stage: "review-1",
+  pipeline_run_id: "1226/test-run",
+} as const;
+const PERSIST_PIN = { persistIdentity: PERSIST_IDENTITY };
 
 function blockedTrustedSurfaceMissingBaseSha(): Record<string, unknown> {
   return {
@@ -1074,6 +1083,7 @@ test("loadOrRegenerate: recorded exit 0 without artifact uses named persist/acqu
     { tester_evidence: DEFAULT_TESTER_EVIDENCE_CONFIG },
     async () => exit0Observation(),
     io,
+    PERSIST_PIN,
   );
   assert.equal(acq.classification, "missing");
   assert.equal(acq.withholdInvoke, true);
@@ -1084,9 +1094,13 @@ test("loadOrRegenerate: recorded exit 0 without artifact uses named persist/acqu
   assert.match(acq.reason, /producer_exit_0_artifact_missing/);
   const persistPath = path.join(runDir, TESTER_PERSIST_ACQUIRE_FILENAME);
   assert.ok(io.files.has(persistPath), "must persist tester-persist-acquire.json");
-  const marker = extractTesterPersistAcquire([{ body: acq.reason }]);
+  const marker = parseTesterPersistAcquireFromBody(acq.reason);
   assert.equal(marker?.persist_acquire_code, "producer_exit_0_artifact_missing");
   assert.equal(marker?.recorded_required_exit_0, true);
+  assert.equal(marker?.issue, PERSIST_IDENTITY.issue);
+  assert.equal(marker?.stage, PERSIST_IDENTITY.stage);
+  assert.equal(marker?.pipeline_run_id, PERSIST_IDENTITY.pipeline_run_id);
+  assert.equal(marker?.candidate_sha, SHA_A);
 });
 
 test("loadOrRegenerate: missing_base_sha trusted-surface after exit 0 is not generic missing", async () => {
@@ -1105,6 +1119,7 @@ test("loadOrRegenerate: missing_base_sha trusted-surface after exit 0 is not gen
         persist: { ok: false, candidate_sha: SHA_A, code: "producer_exit_0_artifact_missing" },
       }),
     io,
+    PERSIST_PIN,
   );
   assert.equal(acq.withholdInvoke, true);
   assert.ok(acq.persist_acquire_code, "must set a distinct persist/acquire code");
@@ -1131,6 +1146,7 @@ test("loadOrRegenerate: persist_write_failed after exit 0 preserves redacted err
         },
       }),
     io,
+    PERSIST_PIN,
   );
   assert.equal(acq.classification, "missing");
   assert.equal(acq.withholdInvoke, true);
@@ -1164,6 +1180,7 @@ test("loadOrRegenerate: recorded exit 0 leaving stale artifact uses named persis
         },
       }),
     io,
+    PERSIST_PIN,
   );
   assert.equal(acq.classification, "stale");
   assert.equal(acq.withholdInvoke, true);
@@ -1178,10 +1195,12 @@ test("loadOrRegenerate: recorded exit 0 leaving stale artifact uses named persis
   assert.match(acq.section, /persist_write_failed/);
   const persistPath = path.join(runDir, TESTER_PERSIST_ACQUIRE_FILENAME);
   assert.ok(io.files.has(persistPath), "must persist tester-persist-acquire.json");
-  const marker = extractTesterPersistAcquire([{ body: acq.reason }]);
+  const marker = parseTesterPersistAcquireFromBody(acq.reason);
   assert.equal(marker?.persist_acquire_code, "persist_write_failed");
   assert.equal(marker?.recorded_required_exit_0, true);
   assert.equal(marker?.candidate_sha, SHA_B);
+  assert.equal(marker?.issue, PERSIST_IDENTITY.issue);
+  assert.equal(marker?.stage, PERSIST_IDENTITY.stage);
 });
 
 test("loadOrRegenerate: recorded exit 0 leaving malformed artifact uses named persist/acquire not ordinary malformed", async () => {
@@ -1202,6 +1221,7 @@ test("loadOrRegenerate: recorded exit 0 leaving malformed artifact uses named pe
         },
       }),
     io,
+    PERSIST_PIN,
   );
   assert.equal(acq.classification, "malformed");
   assert.equal(acq.withholdInvoke, true);
@@ -1216,9 +1236,108 @@ test("loadOrRegenerate: recorded exit 0 leaving malformed artifact uses named pe
   assert.match(acq.section, /persist_write_failed/);
   const persistPath = path.join(runDir, TESTER_PERSIST_ACQUIRE_FILENAME);
   assert.ok(io.files.has(persistPath), "must persist tester-persist-acquire.json");
-  const marker = extractTesterPersistAcquire([{ body: acq.reason }]);
+  const marker = parseTesterPersistAcquireFromBody(acq.reason);
   assert.equal(marker?.persist_acquire_code, "persist_write_failed");
   assert.equal(marker?.recorded_required_exit_0, true);
+});
+
+function persistAcquireExtractOpts(over: Partial<{
+  actor: string | null;
+  trustedActors: readonly string[];
+  markerFooter: string | null;
+  issue: number;
+  stage: string;
+  candidateSha: string;
+}> = {}) {
+  return {
+    actor: "pipeline-bot",
+    markerFooter: "*Automated by Claude Code Pipeline Skill*",
+    issue: PERSIST_IDENTITY.issue,
+    stage: PERSIST_IDENTITY.stage,
+    candidateSha: SHA_A,
+    ...over,
+  };
+}
+
+function attestedPersistBody(over: Partial<{
+  sha: string;
+  issue: number;
+  stage: string;
+  pipeline_run_id: string;
+  footer: string;
+}> = {}): string {
+  const payload = formatTesterPersistAcquireHtmlComment({
+    recorded_required_exit_0: true,
+    persist_acquire_code: "producer_exit_0_artifact_missing",
+    candidate_sha: over.sha ?? SHA_A,
+    issue: over.issue ?? PERSIST_IDENTITY.issue,
+    stage: over.stage ?? PERSIST_IDENTITY.stage,
+    pipeline_run_id: over.pipeline_run_id ?? PERSIST_IDENTITY.pipeline_run_id,
+  });
+  const footer = over.footer ?? "*Automated by Claude Code Pipeline Skill*";
+  return attestPipelineComment(
+    "blocked",
+    ["## Pipeline: Blocked at review 1", payload, footer].join("\n"),
+  );
+}
+
+test("extractTesterPersistAcquire: untrusted commenter marker does not authorize recovery", () => {
+  const body = attestedPersistBody();
+  const found = extractTesterPersistAcquire(
+    [{ author: "attacker", body }],
+    persistAcquireExtractOpts(),
+  );
+  assert.equal(found, null);
+});
+
+test("extractTesterPersistAcquire: old-stage marker does not match current park", () => {
+  const body = attestedPersistBody({ stage: "review-1" });
+  const found = extractTesterPersistAcquire(
+    [{ author: "pipeline-bot", body }],
+    persistAcquireExtractOpts({ stage: "review-2" }),
+  );
+  assert.equal(found, null);
+});
+
+test("extractTesterPersistAcquire: old-SHA marker does not match current HEAD", () => {
+  const body = attestedPersistBody({ sha: SHA_A });
+  const found = extractTesterPersistAcquire(
+    [{ author: "pipeline-bot", body }],
+    persistAcquireExtractOpts({ candidateSha: SHA_B }),
+  );
+  assert.equal(found, null);
+});
+
+test("extractTesterPersistAcquire: marker without issue/stage/run identity is ignored", () => {
+  const body = attestPipelineComment(
+    "blocked",
+    [
+      "## Pipeline: Blocked at review 1",
+      `<!-- pipeline-tester-persist-acquire: v1 ${JSON.stringify({
+        recorded_required_exit_0: true,
+        persist_acquire_code: "producer_exit_0_artifact_missing",
+        candidate_sha: SHA_A,
+      })} -->`,
+      "*Automated by Claude Code Pipeline Skill*",
+    ].join("\n"),
+  );
+  const found = extractTesterPersistAcquire(
+    [{ author: "pipeline-bot", body }],
+    persistAcquireExtractOpts(),
+  );
+  assert.equal(found, null);
+});
+
+test("extractTesterPersistAcquire: trusted attested current-park marker is accepted", () => {
+  const body = attestedPersistBody();
+  const found = extractTesterPersistAcquire(
+    [{ author: "pipeline-bot", body }],
+    persistAcquireExtractOpts(),
+  );
+  assert.equal(found?.persist_acquire_code, "producer_exit_0_artifact_missing");
+  assert.equal(found?.candidate_sha, SHA_A);
+  assert.equal(found?.stage, "review-1");
+  assert.equal(found?.issue, 1226);
 });
 
 test("loadOrRegenerate: no regenerate callback keeps pure load-only fail_closed", async () => {

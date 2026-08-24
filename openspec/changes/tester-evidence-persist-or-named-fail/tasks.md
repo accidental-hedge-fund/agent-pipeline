@@ -30,6 +30,7 @@
 - [x] 5.1 When recover-parked sees a `pipeline-tester-persist-acquire` marker with `recorded_required_exit_0: true` and no HEAD-bound residual review finding, re-enter same-issue advance via `reenterAdvanceAfterRecoverParked`. Do not return `still-parked` solely because no HEAD-bound residual review artifact exists. Fingerprint is `(issue, stage, persist_acquire_code, candidate_sha)`. Spend that fingerprint. Add an injected test that fails if that park stays `still-parked` on the first pass
 - [x] 5.2 A second recover-parked on the same issue/stage/code/SHA after a spent marker SHALL return `already-spent` and SHALL NOT re-enter again. A new candidate SHA MAY take one new pass. Verify no unbounded loop
 - [x] 5.3 HIGH / CRITICAL / security residuals still refuse auto-override. Generic missing-file withhold with no producer-success record still follows existing residual fail-closed rules. Verify those tests still pass. Do not invent a review residual
+- [x] 5.4 Bind persist/acquire markers to issue, stage, candidate SHA, and pipeline run identity. recover-parked SHALL require a trusted pipeline-authored comment (actor or `trusted_override_actors`) with verified attestation or marker footer, and SHALL match the current parked stage and current PR HEAD. Add regressions for an old-stage/old-SHA marker and an untrusted commenter-supplied marker
 
 ## 6. Gate
 

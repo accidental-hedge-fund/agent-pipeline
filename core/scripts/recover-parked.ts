@@ -1411,7 +1411,21 @@ async function runRecoverParkedLocked(
     wholeParkAuthority,
   });
   if (!live.headBound) {
-    const persistAcq = extractTesterPersistAcquire(detail.comments);
+    const getActor = deps.getGhActor ?? getGhActor;
+    let persistActor: string | null = null;
+    try {
+      persistActor = await getActor();
+    } catch {
+      persistActor = null;
+    }
+    const persistAcq = extractTesterPersistAcquire(detail.comments, {
+      actor: persistActor,
+      trustedActors: cfg.trusted_override_actors,
+      markerFooter: cfg.marker_footer,
+      issue: issueNumber,
+      stage: stageId,
+      candidateSha: headSha,
+    });
     if (
       persistAcq &&
       persistAcq.recorded_required_exit_0 &&

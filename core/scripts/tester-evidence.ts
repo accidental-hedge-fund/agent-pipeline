@@ -26,6 +26,7 @@ import {
   recordWriteHealthFailure,
   type RunStoreDeps,
 } from "./run-store.ts";
+import { isVerifiedPipelineAttestation } from "./stages/review-parsing.ts";
 import type { PipelineConfig } from "./types.ts";
 
 // ---------------------------------------------------------------------------
@@ -74,10 +75,26 @@ export interface TesterProducerObservation {
   persist: TesterProducerPersistObservation;
 }
 
-export interface TesterPersistAcquireRecord {
+export interface TesterPersistAcquireIdentity {
+  issue: number;
+  stage: string;
+  pipeline_run_id: string;
+}
+
+export interface TesterPersistAcquireRecord extends TesterPersistAcquireIdentity {
   recorded_required_exit_0: boolean;
   persist_acquire_code: TesterPersistAcquireCode;
   candidate_sha: string;
+}
+
+/** Trust + current-park match required before recover-parked may retry. */
+export interface ExtractTesterPersistAcquireOpts {
+  actor: string | null;
+  trustedActors?: readonly string[];
+  markerFooter?: string | null;
+  issue: number;
+  stage: string;
+  candidateSha: string;
 }
 
 const PERSIST_ACQUIRE_MARKER_RE =
@@ -947,6 +964,11 @@ export interface TesterAcquisitionPinOpts {
    * over bare `candidate_sha` (#692).
    */
   evaluationPin?: EvidenceSubjectV1 | null;
+  /**
+   * Current review attempt identity written into the persist/acquire marker so
+   * recover-parked can refuse historical or cross-stage records.
+   */
+  persistIdentity?: TesterPersistAcquireIdentity;
 }
 
 /**
@@ -1256,36 +1278,104 @@ export function formatTesterPersistAcquireHtmlComment(
     recorded_required_exit_0: record.recorded_required_exit_0,
     persist_acquire_code: record.persist_acquire_code,
     candidate_sha: record.candidate_sha,
+    issue: record.issue,
+    stage: record.stage,
+    pipeline_run_id: record.pipeline_run_id,
   };
   return `<!-- ${TESTER_PERSIST_ACQUIRE_MARKER} ${JSON.stringify(payload)} -->`;
 }
 
-/** Latest well-formed persist/acquire marker from issue comments. */
-export function extractTesterPersistAcquire(
-  comments: readonly { body: string }[],
+function parseTesterPersistAcquirePayload(
+  body: string,
 ): TesterPersistAcquireRecord | null {
+  PERSIST_ACQUIRE_MARKER_RE.lastIndex = 0;
   let found: TesterPersistAcquireRecord | null = null;
-  for (const c of comments) {
-    PERSIST_ACQUIRE_MARKER_RE.lastIndex = 0;
-    let m: RegExpExecArray | null;
-    while ((m = PERSIST_ACQUIRE_MARKER_RE.exec(c.body)) !== null) {
-      try {
-        const obj = JSON.parse(m[1]) as Record<string, unknown>;
-        if (obj.recorded_required_exit_0 !== true) continue;
-        if (!isTesterPersistAcquireCode(obj.persist_acquire_code)) continue;
-        if (typeof obj.candidate_sha !== "string") continue;
-        found = {
-          recorded_required_exit_0: true,
-          persist_acquire_code: obj.persist_acquire_code,
-          candidate_sha: obj.candidate_sha,
-        };
-      } catch {
-        /* malformed payload ignored */
+  let m: RegExpExecArray | null;
+  while ((m = PERSIST_ACQUIRE_MARKER_RE.exec(body)) !== null) {
+    try {
+      const obj = JSON.parse(m[1]) as Record<string, unknown>;
+      if (obj.recorded_required_exit_0 !== true) continue;
+      if (!isTesterPersistAcquireCode(obj.persist_acquire_code)) continue;
+      if (typeof obj.candidate_sha !== "string") continue;
+      if (typeof obj.issue !== "number" || !Number.isInteger(obj.issue) || obj.issue <= 0) {
+        continue;
       }
+      if (typeof obj.stage !== "string" || !obj.stage.trim()) continue;
+      if (typeof obj.pipeline_run_id !== "string" || !obj.pipeline_run_id.trim()) {
+        continue;
+      }
+      found = {
+        recorded_required_exit_0: true,
+        persist_acquire_code: obj.persist_acquire_code,
+        candidate_sha: obj.candidate_sha,
+        issue: obj.issue,
+        stage: obj.stage.trim(),
+        pipeline_run_id: obj.pipeline_run_id.trim(),
+      };
+    } catch {
+      /* malformed payload ignored */
     }
   }
   PERSIST_ACQUIRE_MARKER_RE.lastIndex = 0;
   return found;
+}
+
+function persistAcquireAuthorIsTrusted(
+  author: string | null | undefined,
+  actor: string | null,
+  trustedActors?: readonly string[],
+): boolean {
+  if (!actor || !author) return false;
+  if (author === actor) return true;
+  return (trustedActors ?? []).includes(author);
+}
+
+function persistAcquireCommentHasMarkerAuthority(
+  body: string,
+  markerFooter?: string | null,
+): boolean {
+  if (isVerifiedPipelineAttestation(body)) return true;
+  const footer = markerFooter?.trim();
+  return Boolean(footer && body.includes(footer));
+}
+
+/**
+ * Latest trusted persist/acquire marker attributable to the current parked
+ * review attempt (issue, stage, candidate SHA). Untrusted authors and
+ * historical/cross-stage records are ignored.
+ */
+export function extractTesterPersistAcquire(
+  comments: readonly { body: string; author?: string | null }[],
+  opts: ExtractTesterPersistAcquireOpts,
+): TesterPersistAcquireRecord | null {
+  if (!opts.actor) return null;
+  const wantSha = normalizeCandidateSha(opts.candidateSha);
+  if (!wantSha) return null;
+  const wantStage = opts.stage.trim();
+  if (!wantStage) return null;
+  let found: TesterPersistAcquireRecord | null = null;
+  for (const c of comments) {
+    if (!persistAcquireAuthorIsTrusted(c.author, opts.actor, opts.trustedActors)) {
+      continue;
+    }
+    if (!persistAcquireCommentHasMarkerAuthority(c.body, opts.markerFooter)) {
+      continue;
+    }
+    const parsed = parseTesterPersistAcquirePayload(c.body);
+    if (!parsed) continue;
+    if (parsed.issue !== opts.issue) continue;
+    if (parsed.stage !== wantStage) continue;
+    if (normalizeCandidateSha(parsed.candidate_sha) !== wantSha) continue;
+    found = parsed;
+  }
+  return found;
+}
+
+/** Payload parser for writer tests — no author or current-park match. */
+export function parseTesterPersistAcquireFromBody(
+  body: string,
+): TesterPersistAcquireRecord | null {
+  return parseTesterPersistAcquirePayload(body);
 }
 
 function persistAcquirePath(runDir: string): string {
@@ -1361,6 +1451,18 @@ function namedPersistAcquireReason(
   return named;
 }
 
+function persistIdentityIsComplete(
+  identity: TesterPersistAcquireIdentity | undefined,
+): identity is TesterPersistAcquireIdentity {
+  return Boolean(
+    identity &&
+      Number.isInteger(identity.issue) &&
+      identity.issue > 0 &&
+      identity.stage.trim() &&
+      identity.pipeline_run_id.trim(),
+  );
+}
+
 async function applyNamedPersistAcquireFail(
   acq: TesterAcquisitionResult,
   args: {
@@ -1368,16 +1470,12 @@ async function applyNamedPersistAcquireFail(
     candidateSha: string;
     obs: TesterProducerObservation;
     io: TesterEvidenceIoDeps;
+    persistIdentity?: TesterPersistAcquireIdentity;
   },
 ): Promise<TesterAcquisitionResult> {
   const code = persistAcquireCodeFromObservation(args.obs);
   const pinned = normalizeCandidateSha(args.obs.persist.candidate_sha ?? args.candidateSha) ??
     (typeof args.candidateSha === "string" ? args.candidateSha : "");
-  const record: TesterPersistAcquireRecord = {
-    recorded_required_exit_0: true,
-    persist_acquire_code: code,
-    candidate_sha: pinned,
-  };
   const tsHint = await trustedSurfacePersistHint(args.runDir, args.io);
   let named = namedPersistAcquireReason(code, {
     persistError: args.obs.persist.error,
@@ -1389,11 +1487,26 @@ async function applyNamedPersistAcquireFail(
     named += ` Re-acquired classification: ${acq.classification}.`;
     if (acq.reason) named += ` ${acq.reason}`;
   }
-  const marker = formatTesterPersistAcquireHtmlComment(record);
   acq.persist_acquire_code = code;
   acq.withholdInvoke = true;
+  const identity = persistIdentityIsComplete(args.persistIdentity)
+    ? {
+        issue: args.persistIdentity.issue,
+        stage: args.persistIdentity.stage.trim(),
+        pipeline_run_id: args.persistIdentity.pipeline_run_id.trim(),
+      }
+    : null;
+  const record: TesterPersistAcquireRecord | null = identity
+    ? {
+        recorded_required_exit_0: true,
+        persist_acquire_code: code,
+        candidate_sha: pinned,
+        ...identity,
+      }
+    : null;
+  const marker = record ? formatTesterPersistAcquireHtmlComment(record) : "";
   // Marker first so formatStderrExcerpt's 500-char slice keeps the durable code.
-  acq.reason = `${marker}\n${named}`;
+  acq.reason = marker ? `${marker}\n${named}` : named;
   acq.section = renderTesterEvidenceSection(acq);
   try {
     await writeTesterPersistAcquireRecord(
@@ -1407,6 +1520,7 @@ async function applyNamedPersistAcquireFail(
         persist_ok: args.obs.persist.ok,
         error: args.obs.persist.error,
         trusted_surface: tsHint,
+        ...(identity ?? {}),
       },
       args.io,
     );
@@ -1477,6 +1591,7 @@ export async function loadOrRegenerateTesterEvidenceForReview(
       candidateSha,
       obs: observation,
       io,
+      persistIdentity: pinOpts.persistIdentity,
     });
   }
   return acq;
