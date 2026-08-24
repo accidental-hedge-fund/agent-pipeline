@@ -259,11 +259,18 @@ ship-stage-watch \
   --label "ship v1.37.0"
 ```
 
-Do not guess a path or select the most recently modified run. Notification
-failure is observational and must not stop or advance a ship. If Tugboat's
-stage-watch pid dies immediately, the playbook logs the watch stderr tail
-or exit status. `stage-watch argv rejected` is only for usage or parser
-reject. A relative events path is refused before spawn.
+Follow mode exits on that file's identity-terminal (`loop_run_superseded`,
+`loop_run_complete`, or `loop_run_stopped` on a loop file; `ship_phase`
+complete on a ship file). It does not wait for `ship_phase` on a loop file
+and does not open a `superseded_by` path. Tugboat attaches `--events-file`
+from this train's first `loop_run_handoff` and re-binds to a later distinct
+handoff while train is still running. The next ship start for this milestone
+reaps a leftover `$RUN_DIR/stage-watch.pid`. Do not guess a path or select
+the most recently modified run. Notification failure is observational and
+must not stop or advance a ship. If Tugboat's stage-watch pid dies
+immediately, the playbook logs the watch stderr tail or exit status.
+`stage-watch argv rejected` is only for usage or parser reject. A relative
+events path is refused before spawn.
 
 ## Parked non-goals
 

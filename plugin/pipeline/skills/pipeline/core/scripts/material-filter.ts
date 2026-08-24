@@ -73,6 +73,20 @@ export const LOOP_OPTIONAL_MATERIAL_KINDS = [
 
 export type LoopOptionalMaterialKind = (typeof LOOP_OPTIONAL_MATERIAL_KINDS)[number];
 
+/**
+ * Loop event `kind` values that end follow of one bound loop `events.jsonl`.
+ * A ship stream still ends on `ship_phase` complete/completed.
+ */
+export const LOOP_IDENTITY_TERMINAL_KINDS = [
+  "loop_run_superseded",
+  "loop_run_complete",
+  "loop_run_stopped",
+] as const;
+
+export type LoopIdentityTerminalKind = (typeof LOOP_IDENTITY_TERMINAL_KINDS)[number];
+
+const LOOP_IDENTITY_TERMINAL_SET = new Set<string>(LOOP_IDENTITY_TERMINAL_KINDS);
+
 /** Pipeline-owned shipment phase transitions. */
 export const SHIP_MATERIAL_KINDS = ["ship_phase"] as const;
 
@@ -111,6 +125,12 @@ export interface MaterialFilterOptions {
   jsonl?: boolean;
   /** Stop a streaming observer after the exact ship reports complete. */
   untilShipTerminal?: boolean;
+  /**
+   * Stop a streaming observer after the bound stream's identity-terminal.
+   * Loop files: loop_run_superseded / loop_run_complete / loop_run_stopped.
+   * Ship files: ship_phase complete/completed (same as untilShipTerminal).
+   */
+  untilIdentityTerminal?: boolean;
 }
 
 export interface MaterialFilterState {
@@ -542,6 +562,7 @@ export async function pumpMaterialFilter(
   for await (const line of rl) {
     const emitted = filterMaterialLine(line, state, opts);
     if (emitted != null) write(emitted.endsWith("\n") ? emitted : emitted + "\n");
+    if (opts.untilIdentityTerminal && isIdentityTerminalEventLine(line)) break;
     if (opts.untilShipTerminal && isShipTerminalEventLine(line)) break;
   }
 }
@@ -550,6 +571,18 @@ export function isShipTerminalEventLine(line: string): boolean {
   try {
     const event = JSON.parse(line) as Record<string, unknown>;
     return event?.kind === "ship_phase" && event.phase === "complete" && event.status === "completed";
+  } catch {
+    return false;
+  }
+}
+
+/** Identity-terminal of the bound stream: loop run end, or ship_phase complete. */
+export function isIdentityTerminalEventLine(line: string): boolean {
+  try {
+    const event = JSON.parse(line) as Record<string, unknown>;
+    if (typeof event?.kind !== "string") return false;
+    if (LOOP_IDENTITY_TERMINAL_SET.has(event.kind)) return true;
+    return event.kind === "ship_phase" && event.phase === "complete" && event.status === "completed";
   } catch {
     return false;
   }
@@ -570,15 +603,20 @@ async function main(argv: string[]): Promise<void> {
   const args = argv.slice(2);
   let jsonl = false;
   let untilShipTerminal = false;
+  let untilIdentityTerminal = false;
   let file: string | undefined;
   for (const a of args) {
     if (a === "--jsonl") jsonl = true;
     else if (a === "--until-ship-terminal") untilShipTerminal = true;
+    else if (a === "--until-identity-terminal") untilIdentityTerminal = true;
     else if (a === "-h" || a === "--help") {
       process.stdout.write(
-        "Usage: material-filter [--jsonl] [--until-ship-terminal] [file|-]\n" +
+        "Usage: material-filter [--jsonl] [--until-ship-terminal] [--until-identity-terminal] [file|-]\n" +
           "  Read advance/loop events.jsonl lines from file or stdin;\n" +
           "  print material one-liners (or JSONL with --jsonl).\n" +
+          "  --until-ship-terminal stops after ship_phase complete/completed.\n" +
+          "  --until-identity-terminal stops after the bound stream's identity-terminal\n" +
+          "  (loop_run_superseded / loop_run_complete / loop_run_stopped, or ship complete).\n" +
           "  Observation only — does not modify the source file.\n",
       );
       return;
@@ -587,7 +625,7 @@ async function main(argv: string[]): Promise<void> {
     }
   }
 
-  const opts: MaterialFilterOptions = { jsonl, untilShipTerminal };
+  const opts: MaterialFilterOptions = { jsonl, untilShipTerminal, untilIdentityTerminal };
   const write = (s: string) => {
     process.stdout.write(s);
   };
