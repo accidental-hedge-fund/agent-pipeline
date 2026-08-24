@@ -8,12 +8,7 @@ unit test fails if that value changes.
 
 ### Requirement: The pack-13912-tugboat-ship-1.39.12 clean-openspec fixture SHALL name release 1.39.12
 
-The JSON fixture at
-`core/test/fixtures/frg/pack-13912-tugboat-ship-1.39.12/clean-openspec.json`
-SHALL contain a `release_version` field whose value is the exact string
-`1.39.12`. A unit test in the `core/test/` suite SHALL read only that
-run-scoped path and SHALL fail when `release_version` is not `1.39.12`.
-Production pipeline behavior SHALL remain unchanged.
+The pack-13912-tugboat-ship-1.39.12 clean-openspec fixture SHALL name release 1.39.12. The JSON fixture at `core/test/fixtures/frg/pack-13912-tugboat-ship-1.39.12/clean-openspec.json` SHALL contain a `release_version` field whose value is the exact string `1.39.12`. A unit test in the `core/test/` suite SHALL read only that run-scoped path and SHALL fail when `release_version` is not `1.39.12`. Production pipeline behavior SHALL remain unchanged.
 
 #### Scenario: Fixture names release 1.39.12
 

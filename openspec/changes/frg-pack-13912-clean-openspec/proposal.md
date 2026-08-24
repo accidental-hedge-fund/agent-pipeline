@@ -21,15 +21,15 @@ advance/loop; a second active OpenSpec change; fixtures under any other
 
 ## Acceptance criteria
 
-- [ ] `core/test/fixtures/frg/pack-13912-tugboat-ship-1.39.12/clean-openspec.json`
+- [x] `core/test/fixtures/frg/pack-13912-tugboat-ship-1.39.12/clean-openspec.json`
       exists and is valid JSON.
-- [ ] That fixture object's `release_version` field is the exact string
+- [x] That fixture object's `release_version` field is the exact string
       `1.39.12`.
-- [ ] A unit test under `core/test/` reads only that run-scoped path and fails
+- [x] A unit test under `core/test/` reads only that run-scoped path and fails
       if `release_version` is not `1.39.12`.
-- [ ] No file under `core/scripts/` changes. Runtime pipeline behavior stays
+- [x] No file under `core/scripts/` changes. Runtime pipeline behavior stays
       the same.
-- [ ] The only active OpenSpec change for this issue is
+- [x] The only active OpenSpec change for this issue is
       `frg-pack-13912-clean-openspec`.
 - [ ] Pre-merge archives that change into living specs and leaves no foreign
       active change under `openspec/changes/` (other than archive).
