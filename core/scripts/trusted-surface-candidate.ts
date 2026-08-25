@@ -80,6 +80,33 @@ export function isTrustedSurfaceSentinelSha(sha: string | null | undefined): boo
 }
 
 /**
+ * Last-advanced product candidate pin from durable records (#1243).
+ * Order: prior-run non-sentinel trusted-surface SHAs (newest first), then
+ * last successful pre-merge candidate, then review SHA-gate pin.
+ * Sentinels and malformed values are skipped. Null when none remain.
+ */
+export type DurableLastAdvancedPinSources = {
+  priorTrustedSurfaceShas?: readonly (string | null | undefined)[];
+  preMergeCandidateSha?: string | null;
+  reviewedSha?: string | null;
+};
+
+export function selectDurableLastAdvancedPin(
+  sources: DurableLastAdvancedPinSources,
+): string | null {
+  const ordered = [
+    ...(sources.priorTrustedSurfaceShas ?? []),
+    sources.preMergeCandidateSha,
+    sources.reviewedSha,
+  ];
+  for (const raw of ordered) {
+    const sha = normalizeFullSha(raw);
+    if (sha && !isTrustedSurfaceSentinelSha(sha)) return sha;
+  }
+  return null;
+}
+
+/**
  * Late-stage SHA fallback applies at or after `pre-merge` (inclusive),
  * including ready-to-deploy. Early stages still require a managed worktree.
  * `needs-human` / `backlog` are not this fallback.

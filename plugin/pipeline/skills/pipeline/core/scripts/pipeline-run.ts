@@ -70,6 +70,7 @@ import {
   resolveRunEngineIdentity,
   runDirPath,
   runIdFor,
+  listRunIds,
   startTerminalLogTee,
   writeTrustedSurfaceInvalidation,
   type RunStoreDeps,
@@ -93,6 +94,7 @@ import {
   gitRepoObjectSource,
   isTrustedSurfaceSentinelSha,
   resolveTrustedSurfaceCandidateSha,
+  selectDurableLastAdvancedPin,
   type GitRunner,
   type LinkedPrHead,
   type TrustedSurfaceObjectSource,
@@ -595,8 +597,9 @@ export interface AdvanceDeps {
   dispatch?: typeof dispatch;
   /**
    * Last-advanced product candidate pin (#1243). Tests inject a SHA; omit to
-   * read this run's non-sentinel trusted-surface candidate. `null` means no pin
-   * (linked open PR head is then authoritative when present).
+   * load the durable pin (prior-run non-sentinel trusted-surface candidate,
+   * last successful pre-merge candidate, or review SHA-gate pin). `null` means
+   * no pin (linked open PR head is then authoritative when present).
    */
   lastAdvancedCandidateSha?: string | null;
   /**
@@ -1318,6 +1321,8 @@ export async function runAdvance(
     // produce a decision (fail closed) — missing inputs yield `blocked`.
     let lastTrustedSurfaceCandidateSha: string | null = null;
     let currentTrustedSurface: TrustedSurfaceDecision | null = null;
+    let durableLastAdvancedPinLoaded = false;
+    let durableLastAdvancedPin: string | null = null;
 
     async function persistDecision(
       decision: TrustedSurfaceDecision,
@@ -1521,8 +1526,40 @@ export async function runAdvance(
       return decision;
     }
 
+    async function loadDurableLastAdvancedPin(
+      comments?: { body: string }[],
+    ): Promise<string | null> {
+      const priorTrustedSurfaceShas: string[] = [];
+      if (runDir) {
+        const currentId = path.basename(runDir);
+        const ids = await listRunIds(cfg.repo_dir, runStoreDeps).catch(() => [] as string[]);
+        const prefix = `${issueNumber}-`;
+        for (const id of ids) {
+          if (!id.startsWith(prefix) || id === currentId) continue;
+          const prior = await readTrustedSurfaceDecision(
+            runDirPath(cfg.repo_dir, id),
+            runStoreDeps,
+          );
+          if (prior?.candidate_sha) priorTrustedSurfaceShas.push(prior.candidate_sha);
+        }
+      }
+      let bodies = comments;
+      if (!bodies) {
+        const detail = await (deps.getIssueDetail ?? getIssueDetail)(cfg, issueNumber).catch(
+          () => null,
+        );
+        bodies = detail?.comments;
+      }
+      const reviewedSha = reviewStage.extractReviewedSha(bodies ?? [])?.sha ?? null;
+      return selectDurableLastAdvancedPin({
+        priorTrustedSurfaceShas,
+        reviewedSha,
+      });
+    }
+
     async function ensureTrustedSurfaceDecision(
       stageName: string,
+      comments?: { body: string }[],
     ): Promise<TrustedSurfaceDecision | null> {
       // Dry-run / no run dir: not a readiness-authoritative path.
       if (!runDir) return currentTrustedSurface;
@@ -1605,10 +1642,18 @@ export async function runAdvance(
             !isTrustedSurfaceSentinelSha(currentTrustedSurface.candidate_sha)
           ? currentTrustedSurface.candidate_sha
           : null;
-      const lastAdvancedPin =
-        deps.lastAdvancedCandidateSha !== undefined
-          ? deps.lastAdvancedCandidateSha
-          : inRunPin;
+      let lastAdvancedPin: string | null;
+      if (deps.lastAdvancedCandidateSha !== undefined) {
+        lastAdvancedPin = deps.lastAdvancedCandidateSha;
+      } else if (wt) {
+        lastAdvancedPin = inRunPin;
+      } else {
+        if (!durableLastAdvancedPinLoaded) {
+          durableLastAdvancedPin = await loadDurableLastAdvancedPin(comments);
+          durableLastAdvancedPinLoaded = true;
+        }
+        lastAdvancedPin = inRunPin ?? durableLastAdvancedPin;
+      }
 
       const resolved = resolveTrustedSurfaceCandidateSha({
         worktreePresent: Boolean(wt),
@@ -1999,7 +2044,7 @@ export async function runAdvance(
       }
       finalStage = stage;
       await checkEngineDrift(evidenceStageName(stage));
-      await ensureTrustedSurfaceDecision(evidenceStageName(stage));
+      await ensureTrustedSurfaceDecision(evidenceStageName(stage), detail.comments);
 
       // Reconcile audit comments (#259): if a prior run's label write succeeded but its
       // comment post failed, the sentinel is missing. Detect and repair the gap.

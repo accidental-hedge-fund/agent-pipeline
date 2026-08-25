@@ -22,9 +22,15 @@ import {
 } from "../scripts/production-engine-pin.ts";
 import {
   resolveTrustedSurfaceCandidateSha,
+  selectDurableLastAdvancedPin,
   stageAtOrAfterPreMerge,
   TRUSTED_SURFACE_SENTINEL_SHA,
 } from "../scripts/trusted-surface-candidate.ts";
+import {
+  PATH_CLASS_SCHEMA_VERSION,
+  TRUSTED_SURFACE_DECISION_SCHEMA_VERSION,
+} from "../scripts/trusted-surface.ts";
+import { TRUSTED_SURFACE_FILE } from "../scripts/run-store.ts";
 import {
   buildEngineFingerprint,
   buildEvidenceSubject,
@@ -108,6 +114,9 @@ type DriveOpts = {
   worktree: { path: string; slug: string } | null;
   prHead: string | null;
   lastAdvancedPin?: string | null;
+  /** Prior-run trusted-surface candidate_sha; not injected as lastAdvancedCandidateSha. */
+  priorTrustedSurfaceSha?: string;
+  extraComments?: { author: string; body: string }[];
   overrideSha?: string | null;
   objectSourceError?: string;
   gitHeadSha?: string;
@@ -171,7 +180,7 @@ async function driveReentry(opts: DriveOpts): Promise<DriveResult> {
     state: "open",
     url: `https://example.test/${ISSUE}`,
     labels,
-    comments: auditComments(),
+    comments: [...auditComments(), ...(opts.extraComments ?? [])],
   };
 
   const deps: AdvanceDeps = {
@@ -219,7 +228,9 @@ async function driveReentry(opts: DriveOpts): Promise<DriveResult> {
     addLabelToPr: async (_cfg, _pr, label) => {
       prLabels.push(label);
     },
-    lastAdvancedCandidateSha: opts.lastAdvancedPin,
+    ...(opts.lastAdvancedPin !== undefined
+      ? { lastAdvancedCandidateSha: opts.lastAdvancedPin }
+      : {}),
     candidateShaOverride: opts.overrideSha,
     trustedSurfaceObjectSource: opts.objectSourceError
       ? {
@@ -241,6 +252,26 @@ async function driveReentry(opts: DriveOpts): Promise<DriveResult> {
       return { advanced: true, from: stage, to, summary: `${stage} → ${to}` };
     },
   };
+
+  if (opts.priorTrustedSurfaceSha) {
+    const priorId = `${ISSUE}-2026-08-24T00-00-00-000Z`;
+    const priorDir = runDirPath(repoDir, priorId);
+    fs.mkdirSync(priorDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(priorDir, TRUSTED_SURFACE_FILE),
+      JSON.stringify({
+        schema_version: TRUSTED_SURFACE_DECISION_SCHEMA_VERSION,
+        path_class_schema_version: PATH_CLASS_SCHEMA_VERSION,
+        outcome: "passthrough",
+        candidate_sha: opts.priorTrustedSurfaceSha,
+        base_sha: null,
+        triggering_paths: [],
+        classes: [],
+        effective_verifier_hash: "d".repeat(64),
+        reason: { code: "ok", summary: "prior run pin" },
+      }),
+    );
+  }
 
   try {
     await withoutHostPinAuthorityEnv(() => runAdvance(cfg, ISSUE, { runId }, deps));
@@ -529,4 +560,86 @@ test("advance dispatch still never merges (#1243)", () => {
   assert.doesNotMatch(slice, /mergePr\b/);
   assert.doesNotMatch(slice, /auto_merge/);
   assert.doesNotMatch(slice, /merge-queue/);
+});
+
+// ---------------------------------------------------------------------------
+// Durable last-advanced pin (fresh re-entry, no lastAdvancedCandidateSha)
+// ---------------------------------------------------------------------------
+
+test("selectDurableLastAdvancedPin: prior TS then pre-merge then review SHA-gate", () => {
+  assert.equal(
+    selectDurableLastAdvancedPin({
+      priorTrustedSurfaceShas: [TRUSTED_SURFACE_SENTINEL_SHA, PIN],
+      preMergeCandidateSha: OTHER,
+      reviewedSha: WT_HEAD,
+    }),
+    PIN,
+  );
+  assert.equal(
+    selectDurableLastAdvancedPin({
+      priorTrustedSurfaceShas: [TRUSTED_SURFACE_SENTINEL_SHA],
+      preMergeCandidateSha: OTHER,
+      reviewedSha: PIN,
+    }),
+    OTHER,
+  );
+  assert.equal(
+    selectDurableLastAdvancedPin({
+      reviewedSha: PIN,
+    }),
+    PIN,
+  );
+  assert.equal(
+    selectDurableLastAdvancedPin({
+      priorTrustedSurfaceShas: [TRUSTED_SURFACE_SENTINEL_SHA],
+      reviewedSha: "not-a-sha",
+    }),
+    null,
+  );
+});
+
+test("fresh re-entry loads prior trusted-surface pin without lastAdvancedCandidateSha", async () => {
+  const result = await driveReentry({
+    worktree: null,
+    prHead: OTHER,
+    priorTrustedSurfaceSha: PIN,
+  });
+  assert.ok(result.decision);
+  assert.equal(result.decision?.outcome, "blocked");
+  assert.equal(result.decision?.reason.code, "candidate_sha_mismatch");
+  assert.notEqual(result.decision?.candidate_sha, OTHER);
+  assert.equal(result.prLabels.includes("pipeline:ready-to-deploy"), false);
+});
+
+test("fresh re-entry loads review SHA-gate pin without lastAdvancedCandidateSha", async () => {
+  const result = await driveReentry({
+    worktree: null,
+    prHead: OTHER,
+    extraComments: [
+      {
+        author: "pipeline-bot",
+        body:
+          `## Review 1 (Standard) — approve (commit ${PIN.slice(0, 7)})\n\n` +
+          `ok\n\n<!-- reviewed-sha: ${PIN} -->`,
+      },
+    ],
+  });
+  assert.ok(result.decision);
+  assert.equal(result.decision?.outcome, "blocked");
+  assert.equal(result.decision?.reason.code, "candidate_sha_mismatch");
+  assert.notEqual(result.decision?.candidate_sha, OTHER);
+  assert.equal(result.prLabels.includes("pipeline:ready-to-deploy"), false);
+});
+
+test("fresh re-entry matching prior pin still tags ready-to-deploy", async () => {
+  const result = await driveReentry({
+    worktree: null,
+    prHead: PIN,
+    priorTrustedSurfaceSha: PIN,
+  });
+  assert.ok(result.decision);
+  assert.notEqual(result.decision?.reason.code, "worktree_unavailable");
+  assert.equal(result.decision?.candidate_sha, PIN);
+  assert.notEqual(result.decision?.outcome, "blocked");
+  assert.ok(result.prLabels.includes("pipeline:ready-to-deploy"));
 });
