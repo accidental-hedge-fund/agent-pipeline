@@ -49,6 +49,16 @@ When a candidate SHA is resolved this way, the engine SHALL still compute (or re
 - **AND** `candidate_sha` SHALL NOT be set to H
 - **AND** readiness composition SHALL NOT use H as the readiness subject
 
+#### Scenario: newest durable pin wins when an older run matches the PR head
+
+- **WHEN** issue N has no managed worktree on disk
+- **AND** more than one prior durable last-advanced record exists
+- **AND** an older record's SHA equals the linked open PR head H
+- **AND** a newer record's SHA P differs from H
+- **THEN** the last-advanced candidate pin SHALL be P
+- **AND** the trusted-surface decision outcome SHALL be `blocked`
+- **AND** `candidate_sha` SHALL NOT be set to H
+
 #### Scenario: mismatched override is not accepted
 
 - **WHEN** issue N has no managed worktree on disk
@@ -66,7 +76,7 @@ When a candidate SHA is resolved this way, the engine SHALL still compute (or re
 
 ### Requirement: Absent-worktree candidate SHA regressions SHALL fail the unit suite
 
-Automated tests covered by `npm run ci` SHALL inject I/O (no live network, git, or subprocess) and SHALL fail if: (1) a re-run at `pre-merge` with no on-disk managed worktree and a linked open PR whose head matches the last-advanced candidate still records trusted-surface `worktree_unavailable` or leaves the PR untagged at ready-to-deploy; (2) a PR head that is not the last-advanced candidate is accepted as the trusted-surface or readiness `candidate_sha`.
+Automated tests covered by `npm run ci` SHALL inject I/O (no live network, git, or subprocess) and SHALL fail if: (1) a re-run at `pre-merge` with no on-disk managed worktree and a linked open PR whose head matches the last-advanced candidate still records trusted-surface `worktree_unavailable` or leaves the PR untagged at ready-to-deploy; (2) a PR head that is not the last-advanced candidate is accepted as the trusted-surface or readiness `candidate_sha`; (3) an older durable pin that matches the live PR head is accepted when a newer authoritative pin differs.
 
 #### Scenario: matching PR head still reporting worktree_unavailable fails the suite
 
@@ -81,3 +91,12 @@ Automated tests covered by `npm run ci` SHALL inject I/O (no live network, git, 
 - **AND** the linked open PR head differs from the last-advanced candidate pin
 - **THEN** the test SHALL fail unless the decision is `blocked` with a named mismatch or unresolved outcome
 - **AND** SHALL fail if that PR head is stored as trusted-surface or readiness `candidate_sha`
+
+#### Scenario: older matching SHA accepted while a newer pin differs fails the suite
+
+- **WHEN** a unit test drives a `pre-merge` re-entry with no on-disk managed worktree
+- **AND** more than one prior durable last-advanced record exists
+- **AND** an older record's SHA equals the linked open PR head
+- **AND** a newer record's SHA differs
+- **THEN** the test SHALL fail unless the decision is `blocked` with a named mismatch or unresolved outcome
+- **AND** SHALL fail if that older PR head is stored as trusted-surface or readiness `candidate_sha`

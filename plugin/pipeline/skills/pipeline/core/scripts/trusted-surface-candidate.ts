@@ -81,57 +81,162 @@ export function isTrustedSurfaceSentinelSha(sha: string | null | undefined): boo
 
 /**
  * Last-advanced product candidate pin from durable records (#1243).
- * Order: prior-run non-sentinel trusted-surface SHAs (newest first), then
- * last successful pre-merge candidate, then review SHA-gate pin.
- * Sentinels and malformed values are skipped. Null when none remain.
+ * Timestamped `candidates` (trusted-surface and successful pre-merge) are
+ * compared by durable run/event time; the newest valid SHA wins. When no
+ * timestamped candidate remains, order is prior-run non-sentinel
+ * trusted-surface SHAs (iteration order), then last successful pre-merge
+ * candidate, then review SHA-gate pin. Sentinels and malformed values are
+ * skipped. Null when none remain.
  */
+export type DurablePinCandidate = {
+  sha?: string | null;
+  /** ISO-8601 time of the durable record (run start or event `at`). */
+  at?: string | null;
+};
+
 export type DurableLastAdvancedPinSources = {
+  /** Timestamped trusted-surface and pre-merge records; newest `at` wins. */
+  candidates?: readonly DurablePinCandidate[];
   priorTrustedSurfaceShas?: readonly (string | null | undefined)[];
   preMergeCandidateSha?: string | null;
   reviewedSha?: string | null;
 };
 
+export type DurablePriorRunPinInput = {
+  runId: string;
+  trustedSurfaceCandidateSha?: string | null;
+  events?: readonly DurablePriorRunEvent[];
+};
+
+export type DurablePriorRunEvent = {
+  type?: string;
+  stage?: string;
+  outcome?: string;
+  commits?: readonly string[];
+  at?: string;
+};
+
+/** Parse `<issue>-<YYYY-MM-DDTHH-MM-SS-mmmZ>` into an ISO-8601 timestamp. */
+export function startedAtFromRunId(runId: string): string | null {
+  const match = runId.match(
+    /(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})(?:-(\d{3}))?Z$/,
+  );
+  if (!match) return null;
+  const [, date, hh, mm, ss, ms] = match;
+  const iso = `${date}T${hh}:${mm}:${ss}${ms ? `.${ms}` : ""}Z`;
+  return Number.isFinite(Date.parse(iso)) ? iso : null;
+}
+
+function pinTimeMs(at: string | null | undefined): number | null {
+  if (typeof at !== "string") return null;
+  const ms = Date.parse(at);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function firstValidPinSha(
+  raw: string | null | undefined,
+): string | null {
+  const sha = normalizeFullSha(raw);
+  if (!sha || isTrustedSurfaceSentinelSha(sha)) return null;
+  return sha;
+}
+
 export function selectDurableLastAdvancedPin(
   sources: DurableLastAdvancedPinSources,
 ): string | null {
+  let bestSha: string | null = null;
+  let bestMs = Number.NEGATIVE_INFINITY;
+  let foundTimestamped = false;
+  for (const candidate of sources.candidates ?? []) {
+    const sha = firstValidPinSha(candidate.sha);
+    if (!sha) continue;
+    const ms = pinTimeMs(candidate.at);
+    if (ms === null) continue;
+    if (!foundTimestamped || ms > bestMs) {
+      bestSha = sha;
+      bestMs = ms;
+      foundTimestamped = true;
+    }
+  }
+  if (bestSha) return bestSha;
+
   const ordered = [
+    ...(sources.candidates ?? []).map((c) => c.sha),
     ...(sources.priorTrustedSurfaceShas ?? []),
     sources.preMergeCandidateSha,
     sources.reviewedSha,
   ];
   for (const raw of ordered) {
-    const sha = normalizeFullSha(raw);
-    if (sha && !isTrustedSurfaceSentinelSha(sha)) return sha;
+    const sha = firstValidPinSha(raw);
+    if (sha) return sha;
   }
   return null;
 }
 
 /**
  * Last SHA recorded on a successful (`advanced`) pre-merge `stage_complete`
- * event. Newest matching event in `events` wins. Skips sentinels and
- * malformed values. Null when none remain.
+ * event. Newest matching event `at` wins; equal or missing timestamps keep
+ * later file order. Skips sentinels and malformed values. Null when none remain.
  */
-export function extractPreMergeCandidateShaFromEvents(
-  events: readonly {
-    type?: string;
-    stage?: string;
-    outcome?: string;
-    commits?: readonly string[];
-  }[],
-): string | null {
-  let found: string | null = null;
+export function extractPreMergeCandidateFromEvents(
+  events: readonly DurablePriorRunEvent[],
+): DurablePinCandidate | null {
+  let found: DurablePinCandidate | null = null;
+  let foundMs = Number.NEGATIVE_INFINITY;
   for (const ev of events) {
     if (ev.type !== "stage_complete" || ev.stage !== "pre-merge") continue;
     if (ev.outcome !== "advanced") continue;
     for (const raw of ev.commits ?? []) {
-      const sha = normalizeFullSha(raw);
-      if (sha && !isTrustedSurfaceSentinelSha(sha)) {
-        found = sha;
-        break;
+      const sha = firstValidPinSha(raw);
+      if (!sha) continue;
+      const at = typeof ev.at === "string" ? ev.at : null;
+      const ms = pinTimeMs(at) ?? Number.NEGATIVE_INFINITY;
+      if (!found || ms >= foundMs) {
+        found = { sha, at };
+        foundMs = ms;
       }
+      break;
     }
   }
   return found;
+}
+
+export function extractPreMergeCandidateShaFromEvents(
+  events: readonly DurablePriorRunEvent[],
+): string | null {
+  return extractPreMergeCandidateFromEvents(events)?.sha ?? null;
+}
+
+/**
+ * Timestamped last-advanced candidates from one prior run. Trusted-surface
+ * uses run_start `at` or the run-id timestamp. Successful pre-merge uses the
+ * newest matching event `at`, falling back to the run timestamp.
+ */
+export function durablePinCandidatesFromPriorRun(
+  input: DurablePriorRunPinInput,
+): DurablePinCandidate[] {
+  const events = input.events ?? [];
+  const runAt = startedAtFromRunId(input.runId);
+  let runStartAt: string | null = runAt;
+  for (const ev of events) {
+    if (ev.type !== "run_start") continue;
+    const at = pinTimeMs(ev.at) !== null ? ev.at! : null;
+    if (at) {
+      runStartAt = at;
+      break;
+    }
+  }
+  const out: DurablePinCandidate[] = [];
+  const tsSha = firstValidPinSha(input.trustedSurfaceCandidateSha);
+  if (tsSha) out.push({ sha: tsSha, at: runStartAt });
+  const preMerge = extractPreMergeCandidateFromEvents(events);
+  if (preMerge?.sha) {
+    out.push({
+      sha: preMerge.sha,
+      at: pinTimeMs(preMerge.at) !== null ? preMerge.at : runStartAt,
+    });
+  }
+  return out;
 }
 
 /**

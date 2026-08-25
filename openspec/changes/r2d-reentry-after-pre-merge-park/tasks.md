@@ -21,6 +21,7 @@
 - [x] 3.4 Load the last successful pre-merge candidate from durable records (prior-run `stage_complete` and pre-merge delta-review SHA) into `lastAdvancedPin`. Verify mismatch rejection when that is the only prior pin
 - [x] 3.5 Immediately before ready-to-deploy tagging, re-fetch the linked PR head and require it to equal the trusted-surface candidate. Refuse with named `stale_pr_head` on mismatch
 - [x] 3.6 Wire `buildReadinessEvidenceSubjectFromDecision` to persist `evidence_subject` on the emitted bundle from the trusted-surface decision. Verify by reading the actual summary.json subject
+- [x] 3.7 Select the newest durable last-advanced pin by run/event timestamp across trusted-surface and pre-merge records. Verify a multi-run re-entry whose older SHA matches the live PR head and whose newest pin differs is mismatch-blocked and does not tag ready-to-deploy
 
 ## 4. Park-resume exception (late-stage only)
 

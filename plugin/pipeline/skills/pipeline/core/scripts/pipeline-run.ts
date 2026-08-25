@@ -92,11 +92,12 @@ import {
   type TrustedSurfaceDecision,
 } from "./trusted-surface.ts";
 import {
-  extractPreMergeCandidateShaFromEvents,
+  durablePinCandidatesFromPriorRun,
   gitRepoObjectSource,
   isTrustedSurfaceSentinelSha,
   resolveTrustedSurfaceCandidateSha,
   selectDurableLastAdvancedPin,
+  type DurablePinCandidate,
   type GitRunner,
   type LinkedPrHead,
   type TrustedSurfaceObjectSource,
@@ -1532,8 +1533,7 @@ export async function runAdvance(
     async function loadDurableLastAdvancedPin(
       comments?: { body: string }[],
     ): Promise<string | null> {
-      const priorTrustedSurfaceShas: string[] = [];
-      let preMergeCandidateSha: string | null = null;
+      const candidates: DurablePinCandidate[] = [];
       if (runDir) {
         const currentId = path.basename(runDir);
         const ids = await listRunIds(cfg.repo_dir, runStoreDeps).catch(() => [] as string[]);
@@ -1542,11 +1542,14 @@ export async function runAdvance(
           if (!id.startsWith(prefix) || id === currentId) continue;
           const priorDir = runDirPath(cfg.repo_dir, id);
           const prior = await readTrustedSurfaceDecision(priorDir, runStoreDeps);
-          if (prior?.candidate_sha) priorTrustedSurfaceShas.push(prior.candidate_sha);
-          if (!preMergeCandidateSha) {
-            const events = await readEvents(priorDir, runStoreDeps).catch(() => []);
-            preMergeCandidateSha = extractPreMergeCandidateShaFromEvents(events);
-          }
+          const events = await readEvents(priorDir, runStoreDeps).catch(() => []);
+          candidates.push(
+            ...durablePinCandidatesFromPriorRun({
+              runId: id,
+              trustedSurfaceCandidateSha: prior?.candidate_sha,
+              events,
+            }),
+          );
         }
       }
       let bodies = comments;
@@ -1563,14 +1566,13 @@ export async function runAdvance(
           c.body.startsWith(reviewStage.REVIEW_MARKER_PREFIX_R2),
       );
       const reviewedSha = reviewStage.extractReviewedSha(reviewRoundBodies)?.sha ?? null;
-      if (!preMergeCandidateSha) {
-        const deltaBodies = commentList.filter((c) =>
-          c.body.startsWith(reviewStage.DELTA_REVIEW_MARKER_PREFIX),
-        );
-        preMergeCandidateSha = reviewStage.extractReviewedSha(deltaBodies)?.sha ?? null;
-      }
+      const deltaBodies = commentList.filter((c) =>
+        c.body.startsWith(reviewStage.DELTA_REVIEW_MARKER_PREFIX),
+      );
+      const preMergeCandidateSha =
+        reviewStage.extractReviewedSha(deltaBodies)?.sha ?? null;
       return selectDurableLastAdvancedPin({
-        priorTrustedSurfaceShas,
+        candidates,
         preMergeCandidateSha,
         reviewedSha,
       });

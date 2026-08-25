@@ -21,9 +21,11 @@ import {
   PRODUCTION_PIN_ENV,
 } from "../scripts/production-engine-pin.ts";
 import {
+  durablePinCandidatesFromPriorRun,
   extractPreMergeCandidateShaFromEvents,
   resolveTrustedSurfaceCandidateSha,
   selectDurableLastAdvancedPin,
+  startedAtFromRunId,
   stageAtOrAfterPreMerge,
   TRUSTED_SURFACE_SENTINEL_SHA,
 } from "../scripts/trusted-surface-candidate.ts";
@@ -109,6 +111,15 @@ const ENGINE = {
   commit_sha: "f".repeat(40),
 };
 
+type PriorRunSeed = {
+  runId: string;
+  trustedSurfaceSha?: string;
+  preMergeSha?: string;
+  preMergeAt?: string;
+  /** Directory mtime in ms; used to invert listRunIds order vs recency. */
+  mtimeMs?: number;
+};
+
 type DriveOpts = {
   worktree: { path: string; slug: string } | null;
   prHead: string | null;
@@ -117,6 +128,8 @@ type DriveOpts = {
   priorTrustedSurfaceSha?: string;
   /** Prior-run successful pre-merge stage_complete SHA; not a trusted-surface record. */
   priorPreMergeSha?: string;
+  /** Multiple prior runs; when set, replaces the single priorTrustedSurfaceSha/preMergeSha seed. */
+  priorRuns?: PriorRunSeed[];
   extraComments?: { author: string; body: string }[];
   overrideSha?: string | null;
   objectSourceError?: string;
@@ -133,6 +146,44 @@ type DriveResult = {
   worktreeLookups: number;
   emittedSubject: EvidenceSubjectV1 | null;
 };
+
+function seedPriorRun(repoDir: string, seed: PriorRunSeed): void {
+  const priorDir = runDirPath(repoDir, seed.runId);
+  fs.mkdirSync(priorDir, { recursive: true });
+  if (seed.trustedSurfaceSha) {
+    fs.writeFileSync(
+      path.join(priorDir, TRUSTED_SURFACE_FILE),
+      JSON.stringify({
+        schema_version: TRUSTED_SURFACE_DECISION_SCHEMA_VERSION,
+        path_class_schema_version: PATH_CLASS_SCHEMA_VERSION,
+        outcome: "passthrough",
+        candidate_sha: seed.trustedSurfaceSha,
+        base_sha: null,
+        triggering_paths: [],
+        classes: [],
+        effective_verifier_hash: "d".repeat(64),
+        reason: { code: "ok", summary: "prior run pin" },
+      }),
+    );
+  }
+  if (seed.preMergeSha) {
+    fs.writeFileSync(
+      path.join(priorDir, "events.jsonl"),
+      `${JSON.stringify({
+        schema_version: 1,
+        type: "stage_complete",
+        at: seed.preMergeAt ?? "2026-08-24T00:00:00Z",
+        stage: "pre-merge",
+        outcome: "advanced",
+        commits: [seed.preMergeSha],
+      })}\n`,
+    );
+  }
+  if (seed.mtimeMs !== undefined) {
+    const t = new Date(seed.mtimeMs);
+    fs.utimesSync(priorDir, t, t);
+  }
+}
 
 async function driveReentry(opts: DriveOpts): Promise<DriveResult> {
   const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "r2d-reentry-"));
@@ -264,39 +315,19 @@ async function driveReentry(opts: DriveOpts): Promise<DriveResult> {
     },
   };
 
-  if (opts.priorTrustedSurfaceSha || opts.priorPreMergeSha) {
-    const priorId = `${ISSUE}-2026-08-24T00-00-00-000Z`;
-    const priorDir = runDirPath(repoDir, priorId);
-    fs.mkdirSync(priorDir, { recursive: true });
-    if (opts.priorTrustedSurfaceSha) {
-      fs.writeFileSync(
-        path.join(priorDir, TRUSTED_SURFACE_FILE),
-        JSON.stringify({
-          schema_version: TRUSTED_SURFACE_DECISION_SCHEMA_VERSION,
-          path_class_schema_version: PATH_CLASS_SCHEMA_VERSION,
-          outcome: "passthrough",
-          candidate_sha: opts.priorTrustedSurfaceSha,
-          base_sha: null,
-          triggering_paths: [],
-          classes: [],
-          effective_verifier_hash: "d".repeat(64),
-          reason: { code: "ok", summary: "prior run pin" },
-        }),
-      );
-    }
-    if (opts.priorPreMergeSha) {
-      fs.writeFileSync(
-        path.join(priorDir, "events.jsonl"),
-        `${JSON.stringify({
-          schema_version: 1,
-          type: "stage_complete",
-          at: "2026-08-24T00:00:00Z",
-          stage: "pre-merge",
-          outcome: "advanced",
-          commits: [opts.priorPreMergeSha],
-        })}\n`,
-      );
-    }
+  const priorSeeds: PriorRunSeed[] =
+    opts.priorRuns ??
+    (opts.priorTrustedSurfaceSha || opts.priorPreMergeSha
+      ? [
+          {
+            runId: `${ISSUE}-2026-08-24T00-00-00-000Z`,
+            trustedSurfaceSha: opts.priorTrustedSurfaceSha,
+            preMergeSha: opts.priorPreMergeSha,
+          },
+        ]
+      : []);
+  for (const seed of priorSeeds) {
+    seedPriorRun(repoDir, seed);
   }
 
   try {
@@ -622,6 +653,60 @@ test("selectDurableLastAdvancedPin: prior TS then pre-merge then review SHA-gate
   );
 });
 
+test("selectDurableLastAdvancedPin: newest timestamp wins across TS and pre-merge", () => {
+  assert.equal(
+    selectDurableLastAdvancedPin({
+      candidates: [
+        { sha: OTHER, at: "2026-08-23T00:00:00.000Z" },
+        { sha: PIN, at: "2026-08-24T12:00:00.000Z" },
+      ],
+    }),
+    PIN,
+  );
+  assert.equal(
+    selectDurableLastAdvancedPin({
+      candidates: [
+        { sha: PIN, at: "2026-08-24T12:00:00.000Z" },
+        { sha: OTHER, at: "2026-08-23T00:00:00.000Z" },
+      ],
+    }),
+    PIN,
+  );
+  assert.equal(
+    startedAtFromRunId(`${ISSUE}-2026-08-24T12-00-00-000Z`),
+    "2026-08-24T12:00:00.000Z",
+  );
+});
+
+test("durablePinCandidatesFromPriorRun: run-id and event timestamps", () => {
+  const fromTs = durablePinCandidatesFromPriorRun({
+    runId: `${ISSUE}-2026-08-23T00-00-00-000Z`,
+    trustedSurfaceCandidateSha: OTHER,
+  });
+  assert.deepEqual(fromTs, [
+    { sha: OTHER, at: "2026-08-23T00:00:00.000Z" },
+  ]);
+  const fromPreMerge = durablePinCandidatesFromPriorRun({
+    runId: `${ISSUE}-2026-08-24T12-00-00-000Z`,
+    events: [
+      {
+        type: "stage_complete",
+        stage: "pre-merge",
+        outcome: "advanced",
+        commits: [PIN],
+        at: "2026-08-24T12:05:00.000Z",
+      },
+    ],
+  });
+  assert.deepEqual(fromPreMerge, [
+    { sha: PIN, at: "2026-08-24T12:05:00.000Z" },
+  ]);
+  assert.equal(
+    selectDurableLastAdvancedPin({ candidates: [...fromTs, ...fromPreMerge] }),
+    PIN,
+  );
+});
+
 test("fresh re-entry loads prior trusted-surface pin without lastAdvancedCandidateSha", async () => {
   const result = await driveReentry({
     worktree: null,
@@ -704,6 +789,57 @@ test("extractPreMergeCandidateShaFromEvents: last successful pre-merge commit", 
       },
     ]),
     null,
+  );
+  assert.equal(
+    extractPreMergeCandidateShaFromEvents([
+      {
+        type: "stage_complete",
+        stage: "pre-merge",
+        outcome: "advanced",
+        commits: [PIN],
+        at: "2026-08-24T02:00:00Z",
+      },
+      {
+        type: "stage_complete",
+        stage: "pre-merge",
+        outcome: "advanced",
+        commits: [OTHER],
+        at: "2026-08-24T01:00:00Z",
+      },
+    ]),
+    PIN,
+  );
+});
+
+test("fresh re-entry rejects stale PR head when older run matches and newest pin differs", async () => {
+  const result = await driveReentry({
+    worktree: null,
+    prHead: OTHER,
+    priorRuns: [
+      {
+        runId: `${ISSUE}-2026-08-23T00-00-00-000Z`,
+        trustedSurfaceSha: OTHER,
+        preMergeSha: OTHER,
+        preMergeAt: "2026-08-23T00:05:00Z",
+        mtimeMs: 2_000_000_000_000,
+      },
+      {
+        runId: `${ISSUE}-2026-08-24T12-00-00-000Z`,
+        trustedSurfaceSha: PIN,
+        preMergeSha: PIN,
+        preMergeAt: "2026-08-24T12:05:00Z",
+        mtimeMs: 1_000_000_000_000,
+      },
+    ],
+  });
+  assert.ok(result.decision);
+  assert.equal(result.decision?.outcome, "blocked");
+  assert.equal(result.decision?.reason.code, "candidate_sha_mismatch");
+  assert.notEqual(result.decision?.candidate_sha, OTHER);
+  assert.equal(result.prLabels.includes("pipeline:ready-to-deploy"), false);
+  assert.ok(
+    !result.emittedSubject || result.emittedSubject.candidate_sha !== OTHER,
+    "emitted readiness subject must not claim the stale older PR head",
   );
 });
 
