@@ -802,3 +802,66 @@ test("finalize refuses ready-to-deploy tag when live PR head moved off trusted-s
     fs.rmSync(runDir, { recursive: true, force: true });
   }
 });
+
+test("finalize refuses ready-to-deploy tag when PR head changes after finalization work", async () => {
+  const runDir = fs.mkdtempSync(path.join(os.tmpdir(), "r2d-stale-head-race-"));
+  const prLabels: string[] = [];
+  fs.writeFileSync(
+    path.join(runDir, TRUSTED_SURFACE_FILE),
+    JSON.stringify({
+      schema_version: TRUSTED_SURFACE_DECISION_SCHEMA_VERSION,
+      path_class_schema_version: PATH_CLASS_SCHEMA_VERSION,
+      outcome: "passthrough",
+      candidate_sha: PIN,
+      base_sha: null,
+      triggering_paths: [],
+      classes: [],
+      effective_verifier_hash: "d".repeat(64),
+      reason: { code: "no_sensitive_paths", summary: "ok" },
+    }),
+  );
+  const cfg = {
+    repo: "owner/repo",
+    domain: "r2d-stale-head-race",
+    repo_dir: runDir,
+    base_branch: "main",
+    marker_footer: "*Automated by Claude Code Pipeline Skill*",
+    harnesses: {
+      implementer: "claude",
+      implementerSource: "default",
+      reviewer: "codex",
+      reviewerSource: "default",
+    },
+  } as unknown as PipelineConfig;
+  let liveHead = PIN;
+  try {
+    const out = await finalizeReadyToDeploy(cfg, ISSUE, runDir, undefined, {
+      getIssueDetail: async () =>
+        ({
+          number: ISSUE,
+          type: "issue",
+          title: "T",
+          body: "B",
+          state: "open",
+          url: `https://example.test/${ISSUE}`,
+          labels: ["pipeline:ready-to-deploy"],
+          comments: [],
+        }) as Awaited<ReturnType<NonNullable<AdvanceDeps["getIssueDetail"]>>>,
+      getPrForIssue: async () => PR,
+      getPrDetail: async () => prDetail(liveHead),
+      addLabelToPr: async (_cfg, _pr, label) => {
+        prLabels.push(label);
+      },
+      postComment: async () => {
+        liveHead = OTHER;
+      },
+      postPrComment: async () => {},
+      getOnDiskForIssue: async () => null,
+    });
+    assert.equal(out.status, "blocked");
+    assert.match(out.reason ?? "", /stale_pr_head/);
+    assert.equal(prLabels.includes("pipeline:ready-to-deploy"), false);
+  } finally {
+    fs.rmSync(runDir, { recursive: true, force: true });
+  }
+});

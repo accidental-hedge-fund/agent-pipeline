@@ -212,38 +212,6 @@ export async function finalize(
   const getOnDiskFn = deps.getOnDiskForIssue ?? getOnDiskForIssue;
   const safeRemoveFn = deps.removeManagedWorktreeSafely ?? removeManagedWorktreeSafely;
 
-  // Bind the ready-to-deploy tag to the SHA trusted-surface checked. Re-fetch
-  // immediately before the happy path so a push after the earlier getPrDetail
-  // cannot land ready-to-deploy on a new, unverified head (#1243).
-  if (runDir && prNumber) {
-    const expectedSha = normalizeFullSha(decision?.candidate_sha);
-    if (!expectedSha || isTrustedSurfaceSentinelSha(expectedSha)) {
-      const reason =
-        "stale_pr_head: trusted-surface candidate SHA is missing or sentinel; refusing ready-to-deploy tag";
-      console.log(`[pipeline] #${issueNumber}: ready-to-deploy refused — ${reason}`);
-      return {
-        advanced: false,
-        status: "blocked",
-        reason,
-        blockerKind: "needs-human",
-      };
-    }
-    const live = await getPrDetailFn(cfg, prNumber).catch(() => null);
-    const liveSha = normalizeFullSha(live?.head_sha);
-    if (!liveSha || liveSha !== expectedSha) {
-      const reason =
-        `stale_pr_head: linked PR #${prNumber} head ` +
-        `${liveSha ?? "unresolved"} does not match trusted-surface candidate ${expectedSha}`;
-      console.log(`[pipeline] #${issueNumber}: ready-to-deploy refused — ${reason}`);
-      return {
-        advanced: false,
-        status: "blocked",
-        reason,
-        blockerKind: "needs-human",
-      };
-    }
-  }
-
   // Idempotency: only post if no existing summary.
   const alreadyPosted = detail.comments.some((c) => c.body.startsWith(FINAL_SUMMARY_MARKER));
 
@@ -275,9 +243,39 @@ export async function finalize(
   }
 
   // Mirror the terminal label onto the linked PR. gh pr edit --add-label is
-  // idempotent, so re-running finalize is a no-op on the second pass. The SHA
-  // check above already required the live head to match the trusted-surface pin.
+  // idempotent, so re-running finalize is a no-op on the second pass.
   if (prNumber) {
+    // Bind the ready-to-deploy tag to the SHA trusted-surface checked. Re-fetch
+    // immediately before tagging so a push after earlier network work cannot
+    // land ready-to-deploy on a new, unverified head (#1243).
+    if (runDir) {
+      const expectedSha = normalizeFullSha(decision?.candidate_sha);
+      if (!expectedSha || isTrustedSurfaceSentinelSha(expectedSha)) {
+        const reason =
+          "stale_pr_head: trusted-surface candidate SHA is missing or sentinel; refusing ready-to-deploy tag";
+        console.log(`[pipeline] #${issueNumber}: ready-to-deploy refused — ${reason}`);
+        return {
+          advanced: false,
+          status: "blocked",
+          reason,
+          blockerKind: "needs-human",
+        };
+      }
+      const live = await getPrDetailFn(cfg, prNumber).catch(() => null);
+      const liveSha = normalizeFullSha(live?.head_sha);
+      if (!liveSha || liveSha !== expectedSha) {
+        const reason =
+          `stale_pr_head: linked PR #${prNumber} head ` +
+          `${liveSha ?? "unresolved"} does not match trusted-surface candidate ${expectedSha}`;
+        console.log(`[pipeline] #${issueNumber}: ready-to-deploy refused — ${reason}`);
+        return {
+          advanced: false,
+          status: "blocked",
+          reason,
+          blockerKind: "needs-human",
+        };
+      }
+    }
     try {
       await addLabelFn(cfg, prNumber, `${LABEL_PREFIX}ready-to-deploy`);
       console.log(`[pipeline] #${issueNumber}: PR #${prNumber} tagged pipeline:ready-to-deploy`);
