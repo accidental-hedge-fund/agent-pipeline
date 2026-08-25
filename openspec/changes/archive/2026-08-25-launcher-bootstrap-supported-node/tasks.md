@@ -1,0 +1,33 @@
+## 1. Biting regressions (launcher wiring)
+
+- [x] 1.1 Add `scripts/launcher-bootstrap.test.mjs` cases that drive **both** `hosts/_shared/entry.template.mjs` and `scripts/pipeline-launcher.mjs` (not only a helper) for `--version` and `-V` with injected `process.versions.node` `22.23.2`. Assert stdout equals `core/package.json` `version`, exit 0, and stderr does not contain `requires Node >= 24`. Run `node --test --test-isolation=none scripts/launcher-bootstrap.test.mjs` and confirm these cases **fail** against the current gate-first shims
+- [x] 1.2 Add `--version --json` cases for both launchers at injected `22.23.2`. Assert JSON `{ version, commit_sha }` with `version` matching `core/package.json` and `commit_sha` exact 40-hex or `null` (omit `git` from PATH so tests do not depend on a real repo SHA). Confirm they **fail** against the current shims
+- [x] 1.3 Add mixed-argv cases for both launchers: `status --version` still short-circuits as version (living `includes` detection); `path --json` and `status` do **not**. Confirm `--version` on Node 22 does not load the resolver. Confirm `path --json` on Node 22 with a fake Node 24 does not spawn `path-cli.ts` on the parent
+- [x] 1.4 Add injectable re-exec cases against the **actual launcher files**: Node 22 + `AGENT_PIPELINE_NODE` fake Node 24, argv `status`, `train --milestone data-integrity`, and `path --json`. Assert spawn of that 24 binary with `[scriptPath, ...userArgs]` in order, and child `PATH` starting with that binary's directory. Confirm they **fail** (current shims exit the gate and do not spawn)
+- [x] 1.5 Add installed-template resolution cases: copy the template to `<tmp>/scripts/pipeline.mjs` **with** a sibling `ensure-engines-node.mjs` and run `status` under the version patch (sibling load succeeds); copy **without** the sibling and run `--version` (exit 0, no module-load failure). Confirm the without-sibling `--version` case **passes** after version-first wiring and **fails** if the template static-imports a sibling resolver
+- [x] 1.6 Add source assertions on both launcher files: no static `import` of `ensure-engines-node.mjs`; version short-circuit appears before any `ensure-engines-node` load; no duplicated candidate walker (`~/.local/node-v24` / PATH-split list); no `nvm install 24` string; no `import.meta.dirname`. Confirm these **fail** on the current gate-first `nvm install 24` text
+
+## 2. Shared resolver helpers (DI seam)
+
+- [x] 2.1 Export `formatMissingEnginesNodeDiagnostic({ invokingVersion, floor })` from `scripts/ensure-engines-node.mjs`. Required substrings: invoking version, `/usr/bin/node`, `AGENT_PIPELINE_NODE`. SHALL NOT contain `nvm install 24`. `runUnderEnginesNode` miss path SHALL use it. Add a unit test in `scripts/ensure-engines-node.test.mjs` that asserts those substrings with injected `invokingVersion: "22.23.2"`. Verify `node --test --test-isolation=none scripts/ensure-engines-node.test.mjs` passes
+- [x] 2.2 Export `reexecOntoEnginesNode` that calls `resolveEnginesNode` / `envPreferringNode`, spawns `resolved.path` with `[scriptPath, ...argv]`, prepends (does not replace) PATH, and returns `{ action: "continue" }` when major ≥ 24 or `resolved.path === execPath`. Extend `scripts/ensure-engines-node.test.mjs` so Node 22 + fake 24 spawn is asserted, Node 18.20.0 / 20.19.0 TypeScript argv also spawn, a miss uses the diagnostic from 2.1, spawn `error` exits 1 naming the path, and a child `signal` is returned. Verify those tests pass without importing the launchers
+- [x] 2.3 Add helper tests for `AGENT_PIPELINE_NODE` precedence and `/usr/bin/node` fallback through `reexecOntoEnginesNode` (injected `resolve` / `pathExists` / `spawn`). Do not use the live CI `/usr/bin/node` as the only proof. Verify they pass
+- [x] 2.4 Confirm `resolveEnginesNode` candidate order is unchanged (execPath if ≥ 24, then `AGENT_PIPELINE_NODE`, `/usr/bin/node`, `~/.local/node-v24/bin/node`, PATH). Existing `scripts/ensure-engines-node.test.mjs` cases remain green
+
+## 3. Launcher bootstrap wiring
+
+- [x] 3.1 In `hosts/_shared/entry.template.mjs`, run the existing `--version` / `-V` / `--version --json` short-circuit (node builtins only) **before** any engines gate or resolver load. After that, if major < 24, dynamically import `ensure-engines-node.mjs` from sibling `scripts/` **or** repo `../../scripts/ensure-engines-node.mjs`, then re-exec or fail closed via the helpers from 2.x. Remove the early `nvm install 24` gate. Re-run task 1.x against the template and confirm they **pass**
+- [x] 3.2 Apply the same order and helpers in `scripts/pipeline-launcher.mjs` (sibling import of `./ensure-engines-node.mjs` is enough). `path` and `path --json` MUST re-exec before spawning `path-cli.ts`. Re-run task 1.x against the launcher and confirm they **pass**. Verify existing version, corrupt-install, and `path` tests still pass (`core/test/version.test.ts`, `scripts/launcher-smoke.mjs`)
+- [x] 3.3 Confirm neither launcher embeds a second `/usr/bin/node` / `PATH` / home-dir Node walker. Task 1.6 SHALL fail if a duplicated candidate list appears. Verify that assertion passes
+
+## 4. Staging
+
+- [x] 4.1 Update `scripts/install.mjs` `stageInto` to copy `scripts/ensure-engines-node.mjs` into the skill `scripts/` directory next to `pipeline.mjs` (same pattern as `material-filter.mjs`). Add an installer test that asserts the staged file exists and the generated shim can load it. Verify the installer test **fails** before the copy and **passes** after
+- [x] 4.2 Update `scripts/build.mjs` to copy `scripts/ensure-engines-node.mjs` into `plugin/pipeline/skills/pipeline/scripts/` next to `pipeline.mjs`. Verify `node scripts/build.mjs --check` fails until the file is staged, then passes after `node scripts/build.mjs`
+- [x] 4.3 Extend `scripts/ci-install-smoke.mjs` so a post-install skill tree contains `scripts/ensure-engines-node.mjs` next to `pipeline.mjs`. Verify the smoke **fails** without the copy
+
+## 5. Engines floor and gate
+
+- [x] 5.1 Leave root and `core/` `engines.node` at `>=24`. Verify `scripts/packaging-coherence.mjs` still fails a fixture root floor that admits majors below 24 (`packaging-coherence.test.mjs` `root engines >=18 with core >=24 fails`), and that the real package.json files remain `>=24`
+- [x] 5.2 After any `core/` or `hosts/_shared/` edit, run `node scripts/build.mjs` and include regenerated `plugin/` in the same change. Verify `node scripts/build.mjs --check` is clean
+- [x] 5.3 Run `openspec validate launcher-bootstrap-supported-node` and `npm run ci` from the repo root. Verify both are green. Do not lower `engines.node`. Do not compile `pipeline.ts` to JS. Do not add an `auto_merge` key or merge stage. Do not claim a tester-suite pass

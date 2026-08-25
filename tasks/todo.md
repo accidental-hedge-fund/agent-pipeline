@@ -1,3 +1,26 @@
+# #1236 Revised plan — launcher bootstrap on supported Node
+
+## Status
+
+- [x] Plan review NEEDS_REVISION incorporated (see chat `## Feedback Incorporated`)
+- [x] Implementation (launchers + `ensure-engines-node.mjs` helpers + staging)
+- [x] Tests in `scripts/launcher-bootstrap.test.mjs` and `scripts/ensure-engines-node.test.mjs`
+- [x] `node scripts/build.mjs` after `hosts/_shared/` edits; regenerated `plugin/`
+- [x] `npm run ci`
+
+## Locked decisions (post plan-review)
+
+1. Version short-circuit is sync, builtins-only, and runs before any resolver import or Node-floor check.
+2. Resolver load uses two module paths (installed sibling, then repo `hosts/_shared` → `../../scripts/`). No static sibling import.
+3. Shared DI seam: `reexecOntoEnginesNode` + `formatMissingEnginesNodeDiagnostic` in `ensure-engines-node.mjs`. Tests cover the helper **and** each launcher file.
+4. Every major `< 24` (including 18/20) re-execs or fails closed before TypeScript. Child argv is `[scriptPath, ...userArgs]`. PATH is prepended, not replaced.
+5. Miss diagnostic names invoking version, `/usr/bin/node`, and `AGENT_PIPELINE_NODE`. No `nvm install 24`.
+6. `engines.node` stays `>=24`. No tester-suite pass claim.
+
+See `openspec/changes/launcher-bootstrap-supported-node/design.md`.
+
+---
+
 # Grill-with-docs — #1235 OMP host and #1236 launcher bootstrap
 
 ## Plan

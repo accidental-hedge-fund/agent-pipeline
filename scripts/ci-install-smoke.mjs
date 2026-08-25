@@ -17,7 +17,7 @@
 // post-install `shim --help` refuse with "install/update is in progress"
 // and flakes the test gate.
 
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -134,6 +134,19 @@ try {
   const env = { CLAUDE_CONFIG_DIR: configDir, TMPDIR: lockTmpDir };
 
   run([installScript, "install", "--host", "claude"], env);
+  const enginesResolver = join(
+    configDir,
+    "skills",
+    "pipeline",
+    "scripts",
+    "ensure-engines-node.mjs",
+  );
+  if (!existsSync(enginesResolver)) {
+    console.error(
+      "ci-install-smoke: scripts/ensure-engines-node.mjs missing next to pipeline.mjs after install",
+    );
+    process.exit(1);
+  }
   run([shimScript, "--help"], env);
   // Documented host-skill material filter path must work from the installed tree.
   assertInstalledMaterialFilter(materialFilterScript, env);

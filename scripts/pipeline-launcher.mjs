@@ -18,19 +18,11 @@
 
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join, resolve } from "node:path";
 
-const nodeMajor = Number.parseInt(process.versions.node.split(".")[0], 10);
-if (!Number.isFinite(nodeMajor) || nodeMajor < 24) {
-  console.error(
-    `pipeline: requires Node >= 24 for native TypeScript execution (found ${process.versions.node}).\n` +
-      "         Install Node 24+ (e.g. `nvm install 24 && nvm use 24`) and re-run.",
-  );
-  process.exit(1);
-}
-
 const here = dirname(fileURLToPath(import.meta.url)); // agent-pipeline/scripts/
+const scriptPath = fileURLToPath(import.meta.url);
 const coreDir = resolve(here, "..", "core");           // agent-pipeline/core/
 const entry = join(coreDir, "scripts", "pipeline.ts");
 
@@ -139,6 +131,34 @@ if (rawArgs.includes("--version") || rawArgs.includes("-V")) {
   process.stdout.write(pkgVersion + "\n");
   process.exit(0);
 }
+
+async function reexecOntoEnginesNodeIfNeeded() {
+  const nodeMajor = Number.parseInt(String(process.versions.node).split(".")[0], 10);
+  if (Number.isFinite(nodeMajor) && nodeMajor >= 24) return;
+  const sibling = join(here, "ensure-engines-node.mjs");
+  const fromRepo = join(here, "..", "..", "scripts", "ensure-engines-node.mjs");
+  const resolverPath = existsSync(sibling) ? sibling : existsSync(fromRepo) ? fromRepo : null;
+  if (!resolverPath) {
+    process.stderr.write(
+      `pipeline: cannot load ensure-engines-node.mjs (tried ${sibling} and ${fromRepo}).\n` +
+        "         Re-install with: npm install -g agent-pipeline\n",
+    );
+    process.exit(1);
+  }
+  const mod = await import(pathToFileURL(resolverPath).href);
+  const result = mod.reexecOntoEnginesNode({ scriptPath, argv: rawArgs });
+  if (result.action === "continue") return;
+  if (result.signal) {
+    try {
+      process.kill(process.pid, result.signal);
+    } catch {
+      // ignore
+    }
+  }
+  process.exit(result.status ?? 1);
+}
+
+await reexecOntoEnginesNodeIfNeeded();
 
 // Corrupt install: a missing/malformed core/package.json makes Node throw
 // ERR_INVALID_PACKAGE_CONFIG when it loads ANY TypeScript entry (path-cli.ts or

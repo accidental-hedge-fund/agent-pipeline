@@ -5,13 +5,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { join, resolve, dirname } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   ENGINES_NODE_FLOOR_MAJOR,
   envPreferringNode,
+  formatMissingEnginesNodeDiagnostic,
   parseNodeMajor,
   probeNodeMajor,
+  reexecOntoEnginesNode,
   resolveEnginesNode,
   runUnderEnginesNode,
 } from "./ensure-engines-node.mjs";
@@ -171,4 +173,221 @@ test("package.json ci script routes through ensure-engines-node", () => {
 test("probeNodeMajor: live process.execPath reports a finite major", () => {
   const major = probeNodeMajor(process.execPath, {});
   assert.ok(major != null && major >= 1, `expected a real major; got ${major}`);
+});
+
+test("formatMissingEnginesNodeDiagnostic: names invoking version, /usr/bin/node, AGENT_PIPELINE_NODE", () => {
+  const text = formatMissingEnginesNodeDiagnostic({ invokingVersion: "22.23.2", floor: 24 });
+  assert.match(text, /22\.23\.2/);
+  assert.match(text, /\/usr\/bin\/node/);
+  assert.match(text, /AGENT_PIPELINE_NODE/);
+  assert.equal(text.includes("nvm install 24"), false);
+});
+
+test("runUnderEnginesNode miss path uses formatMissingEnginesNodeDiagnostic", () => {
+  let err = "";
+  const code = runUnderEnginesNode(["-c", "true"], {
+    resolve: () => null,
+    spawn: () => {
+      throw new Error("must not spawn");
+    },
+    stderr: (s) => {
+      err += s;
+    },
+  });
+  assert.equal(code, 1);
+  const expected = formatMissingEnginesNodeDiagnostic({
+    invokingVersion: process.versions.node,
+    floor: 24,
+  });
+  assert.equal(err, expected);
+});
+
+test("reexecOntoEnginesNode: Node 22 + fake 24 spawns with argv preserved and PATH prepended", () => {
+  /** @type {Array<{ cmd: string, args: string[], opts: object }>} */
+  const calls = [];
+  const result = reexecOntoEnginesNode({
+    execVersion: "22.23.2",
+    execPath: "/old/node",
+    scriptPath: "/skill/scripts/pipeline.mjs",
+    argv: ["status"],
+    env: { PATH: "/keep-me:/bin" },
+    resolve: () => ({ path: "/opt/node24/bin/node", major: 24 }),
+    spawn: (cmd, args, opts) => {
+      calls.push({ cmd, args: [...args], opts });
+      return { status: 0 };
+    },
+  });
+  assert.deepEqual(result, { action: "exit", status: 0 });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].cmd, "/opt/node24/bin/node");
+  assert.deepEqual(calls[0].args, ["/skill/scripts/pipeline.mjs", "status"]);
+  assert.equal(calls[0].opts.env.PATH.split(delimiter)[0], "/opt/node24/bin");
+  assert.match(calls[0].opts.env.PATH, /\/keep-me/);
+});
+
+test("reexecOntoEnginesNode: Node 18.20.0 and 20.19.0 TypeScript argv also spawn", () => {
+  for (const ver of ["18.20.0", "20.19.0"]) {
+    /** @type {string[][]} */
+    const spawns = [];
+    const result = reexecOntoEnginesNode({
+      execVersion: ver,
+      execPath: "/old/node",
+      scriptPath: "/shim.mjs",
+      argv: ["train", "--milestone", "data-integrity"],
+      resolve: () => ({ path: "/opt/node24/bin/node", major: 24 }),
+      spawn: (cmd, args) => {
+        spawns.push([cmd, ...args]);
+        return { status: 0 };
+      },
+    });
+    assert.equal(result.action, "exit", ver);
+    assert.deepEqual(spawns, [
+      ["/opt/node24/bin/node", "/shim.mjs", "train", "--milestone", "data-integrity"],
+    ]);
+  }
+});
+
+test("reexecOntoEnginesNode: miss uses formatMissingEnginesNodeDiagnostic", () => {
+  let err = "";
+  const result = reexecOntoEnginesNode({
+    execVersion: "22.23.2",
+    execPath: "/old/node",
+    scriptPath: "/shim.mjs",
+    argv: ["status"],
+    resolve: () => null,
+    spawn: () => {
+      throw new Error("must not spawn");
+    },
+    stderr: (s) => {
+      err += s;
+    },
+  });
+  assert.deepEqual(result, { action: "exit", status: 1 });
+  assert.equal(
+    err,
+    formatMissingEnginesNodeDiagnostic({ invokingVersion: "22.23.2", floor: 24 }),
+  );
+});
+
+test("reexecOntoEnginesNode: spawn error exits 1 naming the path", () => {
+  let err = "";
+  const result = reexecOntoEnginesNode({
+    execVersion: "22.23.2",
+    execPath: "/old/node",
+    scriptPath: "/shim.mjs",
+    argv: ["status"],
+    resolve: () => ({ path: "/opt/node24/bin/node", major: 24 }),
+    spawn: () => ({ error: Object.assign(new Error("ENOENT"), { code: "ENOENT" }) }),
+    stderr: (s) => {
+      err += s;
+    },
+  });
+  assert.deepEqual(result, { action: "exit", status: 1 });
+  assert.match(err, /\/opt\/node24\/bin\/node/);
+  assert.match(err, /ENOENT/);
+});
+
+test("reexecOntoEnginesNode: child signal is returned", () => {
+  const result = reexecOntoEnginesNode({
+    execVersion: "22.23.2",
+    execPath: "/old/node",
+    scriptPath: "/shim.mjs",
+    argv: ["status"],
+    resolve: () => ({ path: "/opt/node24/bin/node", major: 24 }),
+    spawn: () => ({ status: null, signal: "SIGTERM" }),
+  });
+  assert.deepEqual(result, { action: "exit", status: 1, signal: "SIGTERM" });
+});
+
+test("reexecOntoEnginesNode: major >= 24 continues without spawn", () => {
+  const result = reexecOntoEnginesNode({
+    execVersion: "24.18.0",
+    execPath: "/usr/bin/node",
+    scriptPath: "/shim.mjs",
+    argv: ["status"],
+    spawn: () => {
+      throw new Error("must not spawn");
+    },
+  });
+  assert.deepEqual(result, { action: "continue" });
+});
+
+test("reexecOntoEnginesNode: resolved.path === execPath continues (loop guard)", () => {
+  const result = reexecOntoEnginesNode({
+    execVersion: "22.23.2",
+    execPath: "/same/node",
+    scriptPath: "/shim.mjs",
+    argv: ["status"],
+    resolve: () => ({ path: "/same/node", major: 24 }),
+    spawn: () => {
+      throw new Error("must not spawn");
+    },
+  });
+  assert.deepEqual(result, { action: "continue" });
+});
+
+test("reexecOntoEnginesNode: AGENT_PIPELINE_NODE wins through injected pathExists/spawn", () => {
+  /** @type {string[]} */
+  const spawned = [];
+  const result = reexecOntoEnginesNode({
+    execVersion: "22.23.2",
+    execPath: "/old/node",
+    scriptPath: "/shim.mjs",
+    argv: ["status"],
+    env: { AGENT_PIPELINE_NODE: "/custom/node24", PATH: "/usr/bin" },
+    home: "/home/user",
+    pathExists: (p) => p === "/custom/node24" || p === "/usr/bin/node",
+    spawn: (cmd, args) => {
+      if (args[0] === "-p") {
+        if (cmd === "/custom/node24") return { status: 0, stdout: "24.0.0\n" };
+        if (cmd === "/usr/bin/node") return { status: 0, stdout: "24.18.0\n" };
+        return { status: 1, stdout: "" };
+      }
+      spawned.push(cmd);
+      return { status: 0 };
+    },
+  });
+  assert.equal(result.action, "exit");
+  assert.deepEqual(spawned, ["/custom/node24"]);
+});
+
+test("reexecOntoEnginesNode: /usr/bin/node fallback when AGENT_PIPELINE_NODE is unset", () => {
+  /** @type {string[]} */
+  const spawned = [];
+  const result = reexecOntoEnginesNode({
+    execVersion: "22.23.2",
+    execPath: "/old/node",
+    scriptPath: "/shim.mjs",
+    argv: ["status"],
+    env: { PATH: "/opt/old" },
+    home: "/home/user",
+    pathExists: (p) => p === "/usr/bin/node",
+    spawn: (cmd, args) => {
+      if (args[0] === "-p") {
+        if (cmd === "/usr/bin/node") return { status: 0, stdout: "24.18.0\n" };
+        return { status: 1, stdout: "" };
+      }
+      spawned.push(cmd);
+      return { status: 0 };
+    },
+  });
+  assert.equal(result.action, "exit");
+  assert.deepEqual(spawned, ["/usr/bin/node"]);
+});
+
+test("resolveEnginesNode candidate order is execPath, AGENT_PIPELINE_NODE, /usr/bin/node, ~/.local/node-v24, PATH", () => {
+  const src = readFileSync(join(REPO_ROOT, "scripts", "ensure-engines-node.mjs"), "utf8");
+  const start = src.indexOf("export function resolveEnginesNode");
+  const end = src.indexOf("export function envPreferringNode");
+  const body = src.slice(start, end);
+  const execIdx = body.indexOf("execMajor != null && execMajor >= floor");
+  const envIdx = body.indexOf("env.AGENT_PIPELINE_NODE");
+  const usrIdx = body.indexOf('"/usr/bin/node"');
+  const localIdx = body.indexOf("node-v24");
+  const pathIdx = body.indexOf("env.PATH");
+  assert.ok(execIdx >= 0, "execPath-if-satisfying must be first");
+  assert.ok(envIdx > execIdx, "AGENT_PIPELINE_NODE after execPath");
+  assert.ok(usrIdx > envIdx, "/usr/bin/node after AGENT_PIPELINE_NODE");
+  assert.ok(localIdx > usrIdx, "~/.local/node-v24 after /usr/bin/node");
+  assert.ok(pathIdx > localIdx, "PATH after ~/.local/node-v24");
 });

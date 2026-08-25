@@ -2011,6 +2011,33 @@ test("installClaudeCommands: dry-run writes nothing under commands/ (#635)", () 
   }
 });
 
+test("install stages ensure-engines-node.mjs next to pipeline.mjs (#1236)", async () => {
+  const claudeTmp = makeTmp();
+  const lockTmp = makeTmp();
+  try {
+    const result = runInstaller(["install", "--host", "claude"], {
+      CLAUDE_CONFIG_DIR: claudeTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    });
+    assert.equal(result.status, 0, `install failed: ${result.stderr}\n${result.stdout}`);
+    const scriptsDir = join(claudeTmp, "skills", "pipeline", "scripts");
+    const shim = join(scriptsDir, "pipeline.mjs");
+    const resolver = join(scriptsDir, "ensure-engines-node.mjs");
+    assert.ok(existsSync(shim), "pipeline.mjs must be staged");
+    assert.ok(existsSync(resolver), "ensure-engines-node.mjs must be staged next to pipeline.mjs");
+    const loaded = await import(pathToFileURL(resolver).href);
+    assert.equal(typeof loaded.resolveEnginesNode, "function");
+    assert.equal(typeof loaded.reexecOntoEnginesNode, "function");
+    const shimSrc = readFileSync(shim, "utf8");
+    assert.match(shimSrc, /ensure-engines-node/);
+  } finally {
+    cleanup(claudeTmp);
+    cleanup(lockTmp);
+  }
+});
+
 test("install --host claude under CLAUDE_CONFIG_DIR: command Invoke paths use config-dir skill (#635)", () => {
   const claudeTmp = makeTmp();
   const lockTmp = makeTmp();
