@@ -82,15 +82,15 @@ export function isTrustedSurfaceSentinelSha(sha: string | null | undefined): boo
 /**
  * Last-advanced product candidate pin from durable records (#1243).
  * Timestamped `candidates` (trusted-surface and successful pre-merge) are
- * compared by durable run/event time; the newest valid SHA wins. When no
- * timestamped candidate remains, order is prior-run non-sentinel
+ * compared by persisted decision time / event `at`; the newest valid SHA
+ * wins. When no timestamped candidate remains, order is prior-run non-sentinel
  * trusted-surface SHAs (iteration order), then last successful pre-merge
  * candidate, then review SHA-gate pin. Sentinels and malformed values are
  * skipped. Null when none remain.
  */
 export type DurablePinCandidate = {
   sha?: string | null;
-  /** ISO-8601 time of the durable record (run start or event `at`). */
+  /** ISO-8601 time of the durable record (decision persist, event `at`, or run start). */
   at?: string | null;
 };
 
@@ -105,6 +105,8 @@ export type DurableLastAdvancedPinSources = {
 export type DurablePriorRunPinInput = {
   runId: string;
   trustedSurfaceCandidateSha?: string | null;
+  /** Persist time of the trusted-surface decision; not run start. */
+  trustedSurfaceDecidedAt?: string | null;
   events?: readonly DurablePriorRunEvent[];
 };
 
@@ -209,8 +211,9 @@ export function extractPreMergeCandidateShaFromEvents(
 
 /**
  * Timestamped last-advanced candidates from one prior run. Trusted-surface
- * uses run_start `at` or the run-id timestamp. Successful pre-merge uses the
- * newest matching event `at`, falling back to the run timestamp.
+ * uses persisted `decided_at` when present; otherwise run_start `at` or the
+ * run-id timestamp. Successful pre-merge uses the newest matching event `at`,
+ * falling back to the run timestamp.
  */
 export function durablePinCandidatesFromPriorRun(
   input: DurablePriorRunPinInput,
@@ -228,7 +231,13 @@ export function durablePinCandidatesFromPriorRun(
   }
   const out: DurablePinCandidate[] = [];
   const tsSha = firstValidPinSha(input.trustedSurfaceCandidateSha);
-  if (tsSha) out.push({ sha: tsSha, at: runStartAt });
+  if (tsSha) {
+    const decidedAt =
+      pinTimeMs(input.trustedSurfaceDecidedAt) !== null
+        ? input.trustedSurfaceDecidedAt!
+        : runStartAt;
+    out.push({ sha: tsSha, at: decidedAt });
+  }
   const preMerge = extractPreMergeCandidateFromEvents(events);
   if (preMerge?.sha) {
     out.push({

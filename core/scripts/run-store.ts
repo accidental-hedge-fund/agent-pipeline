@@ -49,6 +49,7 @@ import {
 } from "./evidence-subject.ts";
 import {
   parseTrustedSurfaceDecision,
+  stampTrustedSurfaceDecision,
   type TrustedSurfaceDecision,
 } from "./trusted-surface.ts";
 
@@ -1407,7 +1408,7 @@ export async function writeTrustedSurfaceDecision(
   await deps.mkdir(runDir, { recursive: true });
   const finalPath = trustedSurfacePath(runDir);
   const tmp = `${finalPath}.tmp`;
-  const cleaned = sanitizeDeep(decision);
+  const cleaned = sanitizeDeep(stampTrustedSurfaceDecision(decision));
   const serialized = sanitize(redactSecrets(`${JSON.stringify(cleaned, null, 2)}\n`));
   await deps.writeFile(tmp, serialized);
   await deps.rename(tmp, finalPath);

@@ -177,6 +177,12 @@ export interface TrustedSurfaceDecision {
   /** Stable digest of trusted content map used for judging; null when blocked without pin. */
   effective_verifier_hash: string | null;
   reason: TrustedSurfaceReason;
+  /**
+   * ISO-8601 persist time of this decision write (#1243). Used to order
+   * last-advanced pins; not derived from run start. Optional for historical
+   * records that predate the field.
+   */
+  decided_at?: string;
 }
 
 /** Injectable inputs for pure decision computation. */
@@ -780,6 +786,17 @@ export function rebindDecisionAfterEngineDrift(
  * Historical bundles may omit this field — consumers must not invent passthrough.
  */
 export type TrustedSurfaceBundleRecord = TrustedSurfaceDecision;
+
+/**
+ * Stamp `decided_at` on a decision write. Recency is the persist time of
+ * this write, not the originating run start (#1243).
+ */
+export function stampTrustedSurfaceDecision(
+  decision: TrustedSurfaceDecision,
+  nowIso: string = new Date().toISOString(),
+): TrustedSurfaceDecision {
+  return { ...decision, decided_at: nowIso };
+}
 
 /** Parse a stored decision; returns null when absent/malformed (no invent). */
 export function parseTrustedSurfaceDecision(value: unknown): TrustedSurfaceDecision | null {

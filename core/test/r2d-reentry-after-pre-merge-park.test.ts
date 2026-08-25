@@ -114,6 +114,8 @@ const ENGINE = {
 type PriorRunSeed = {
   runId: string;
   trustedSurfaceSha?: string;
+  /** Persist time of the trusted-surface decision; independent of runId. */
+  trustedSurfaceDecidedAt?: string;
   preMergeSha?: string;
   preMergeAt?: string;
   /** Directory mtime in ms; used to invert listRunIds order vs recency. */
@@ -163,6 +165,9 @@ function seedPriorRun(repoDir: string, seed: PriorRunSeed): void {
         classes: [],
         effective_verifier_hash: "d".repeat(64),
         reason: { code: "ok", summary: "prior run pin" },
+        ...(seed.trustedSurfaceDecidedAt
+          ? { decided_at: seed.trustedSurfaceDecidedAt }
+          : {}),
       }),
     );
   }
@@ -707,6 +712,29 @@ test("durablePinCandidatesFromPriorRun: run-id and event timestamps", () => {
   );
 });
 
+test("durablePinCandidatesFromPriorRun: reused older run ID uses decision time not run start", () => {
+  const resumedOlder = durablePinCandidatesFromPriorRun({
+    runId: `${ISSUE}-2026-08-23T00-00-00-000Z`,
+    trustedSurfaceCandidateSha: PIN,
+    trustedSurfaceDecidedAt: "2026-08-24T18:00:00.000Z",
+  });
+  const laterStarted = durablePinCandidatesFromPriorRun({
+    runId: `${ISSUE}-2026-08-24T12-00-00-000Z`,
+    trustedSurfaceCandidateSha: OTHER,
+  });
+  assert.deepEqual(resumedOlder, [
+    { sha: PIN, at: "2026-08-24T18:00:00.000Z" },
+  ]);
+  assert.equal(
+    selectDurableLastAdvancedPin({ candidates: [...resumedOlder, ...laterStarted] }),
+    PIN,
+  );
+  assert.equal(
+    selectDurableLastAdvancedPin({ candidates: [...laterStarted, ...resumedOlder] }),
+    PIN,
+  );
+});
+
 test("fresh re-entry loads prior trusted-surface pin without lastAdvancedCandidateSha", async () => {
   const result = await driveReentry({
     worktree: null,
@@ -808,6 +836,36 @@ test("extractPreMergeCandidateShaFromEvents: last successful pre-merge commit", 
       },
     ]),
     PIN,
+  );
+});
+
+test("fresh re-entry rejects stale PR head when resumed older run ID is newer than later-started run", async () => {
+  const result = await driveReentry({
+    worktree: null,
+    prHead: OTHER,
+    priorRuns: [
+      {
+        runId: `${ISSUE}-2026-08-23T00-00-00-000Z`,
+        trustedSurfaceSha: PIN,
+        trustedSurfaceDecidedAt: "2026-08-24T18:00:00.000Z",
+        mtimeMs: 2_000_000_000_000,
+      },
+      {
+        runId: `${ISSUE}-2026-08-24T12-00-00-000Z`,
+        trustedSurfaceSha: OTHER,
+        trustedSurfaceDecidedAt: "2026-08-24T12:00:00.000Z",
+        mtimeMs: 1_000_000_000_000,
+      },
+    ],
+  });
+  assert.ok(result.decision);
+  assert.equal(result.decision?.outcome, "blocked");
+  assert.equal(result.decision?.reason.code, "candidate_sha_mismatch");
+  assert.notEqual(result.decision?.candidate_sha, OTHER);
+  assert.equal(result.prLabels.includes("pipeline:ready-to-deploy"), false);
+  assert.ok(
+    !result.emittedSubject || result.emittedSubject.candidate_sha !== OTHER,
+    "emitted readiness subject must not claim the stale later-started PR head",
   );
 });
 

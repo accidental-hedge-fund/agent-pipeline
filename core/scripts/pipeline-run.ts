@@ -1547,6 +1547,7 @@ export async function runAdvance(
             ...durablePinCandidatesFromPriorRun({
               runId: id,
               trustedSurfaceCandidateSha: prior?.candidate_sha,
+              trustedSurfaceDecidedAt: prior?.decided_at,
               events,
             }),
           );

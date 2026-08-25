@@ -17,6 +17,7 @@ import {
   hashEnginePin,
   parseTrustedSurfaceDecision,
   pathMatchesAnyGlob,
+  stampTrustedSurfaceDecision,
   rebindDecisionAfterEngineDrift,
   verifierFingerprintFromTrustedSurface,
   type TrustedEnginePin,
@@ -432,6 +433,17 @@ test("parseTrustedSurfaceDecision: valid round-trip; omission not invented as pa
   assert.equal(parseTrustedSurfaceDecision({}), null);
   // Missing field on a historical bundle is not treated as passthrough by parser.
   assert.equal(parseTrustedSurfaceDecision({ outcome: "passthrough" }), null);
+});
+
+test("stampTrustedSurfaceDecision: persist time is the write time, not a prior stamp", () => {
+  const d = decide(["src/x.ts"]);
+  const first = stampTrustedSurfaceDecision(d, "2026-08-23T00:00:00.000Z");
+  assert.equal(first.decided_at, "2026-08-23T00:00:00.000Z");
+  const resumed = stampTrustedSurfaceDecision(first, "2026-08-24T18:00:00.000Z");
+  assert.equal(resumed.decided_at, "2026-08-24T18:00:00.000Z");
+  assert.equal(resumed.candidate_sha, first.candidate_sha);
+  const parsed = parseTrustedSurfaceDecision(resumed);
+  assert.equal(parsed?.decided_at, "2026-08-24T18:00:00.000Z");
 });
 
 // ---------------------------------------------------------------------------

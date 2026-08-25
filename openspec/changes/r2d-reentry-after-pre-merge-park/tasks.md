@@ -22,6 +22,7 @@
 - [x] 3.5 Immediately before ready-to-deploy tagging, re-fetch the linked PR head and require it to equal the trusted-surface candidate. Refuse with named `stale_pr_head` on mismatch
 - [x] 3.6 Wire `buildReadinessEvidenceSubjectFromDecision` to persist `evidence_subject` on the emitted bundle from the trusted-surface decision. Verify by reading the actual summary.json subject
 - [x] 3.7 Select the newest durable last-advanced pin by run/event timestamp across trusted-surface and pre-merge records. Verify a multi-run re-entry whose older SHA matches the live PR head and whose newest pin differs is mismatch-blocked and does not tag ready-to-deploy
+- [x] 3.8 Persist an immutable trusted-surface decision timestamp on every decision write and order last-advanced pins by that time, not originating run start. Verify a reused older run ID whose decision is updated after a later-started run is the newest pin; a PR head matching the later-started SHA is mismatch-blocked
 
 ## 4. Park-resume exception (late-stage only)
 
