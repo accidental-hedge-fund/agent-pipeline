@@ -1,7 +1,15 @@
 // Terminal stage. Posts a final summary on the issue, removes the worktree.
 // Idempotent — safe to call multiple times.
 
-import { addLabelToPr, getIssueDetail, getPrForIssue, ghRunForTest, postComment, postPrComment, setBlocked } from "../gh.ts";
+import {
+  addLabelToPr,
+  getIssueDetail,
+  getPrForIssue,
+  ghRunForTest,
+  postComment,
+  postPrComment,
+  setBlocked,
+} from "../gh.ts";
 import { attestPipelineComment } from "./review-parsing.ts";
 import { LABEL_PREFIX } from "../types.ts";
 import {
@@ -28,11 +36,16 @@ import {
   type PolicyLifecycleState,
 } from "../stage-policy-lifecycle.ts";
 
-/** Injectable seams for {@link finalize} unit tests (#759). */
+/** Injectable seams for {@link finalize} unit tests (#759 / #1243). */
 export interface FinalizeDeps {
   getOnDiskForIssue?: typeof getOnDiskForIssue;
   removeManagedWorktreeSafely?: typeof removeManagedWorktreeSafely;
   safeRemoveDeps?: SafeRemoveDeps;
+  getIssueDetail?: typeof getIssueDetail;
+  getPrForIssue?: typeof getPrForIssue;
+  addLabelToPr?: typeof addLabelToPr;
+  postComment?: typeof postComment;
+  postPrComment?: typeof postPrComment;
 }
 
 const FINAL_SUMMARY_MARKER = "## Pipeline Complete";
@@ -183,8 +196,13 @@ export async function finalize(
     }
   }
 
-  const detail = await getIssueDetail(cfg, issueNumber);
-  const prNumber = await getPrForIssue(cfg, issueNumber);
+  const getIssueFn = deps.getIssueDetail ?? getIssueDetail;
+  const getPrFn = deps.getPrForIssue ?? getPrForIssue;
+  const addLabelFn = deps.addLabelToPr ?? addLabelToPr;
+  const postCommentFn = deps.postComment ?? postComment;
+  const postPrCommentFn = deps.postPrComment ?? postPrComment;
+  const detail = await getIssueFn(cfg, issueNumber);
+  const prNumber = await getPrFn(cfg, issueNumber);
   const getOnDiskFn = deps.getOnDiskForIssue ?? getOnDiskForIssue;
   const safeRemoveFn = deps.removeManagedWorktreeSafely ?? removeManagedWorktreeSafely;
 
@@ -200,13 +218,13 @@ export async function finalize(
       (c) => c.body.startsWith("## Pipeline: Review") && c.body.includes("advanced under severity policy"),
     ).length;
     const summary = buildPipelineCompleteComment(cfg, issueNumber, detail.title, prRef, advisoryRounds);
-    await postComment(cfg, issueNumber, summary);
+    await postCommentFn(cfg, issueNumber, summary);
     console.log(`[pipeline] #${issueNumber}: final summary posted`);
     // Mirror the summary onto the PR — the merge decision happens there, not
     // on the issue. Best-effort; the issue copy is authoritative.
     if (prNumber) {
       try {
-        await postPrComment(cfg, prNumber, summary);
+        await postPrCommentFn(cfg, prNumber, summary);
       } catch (err) {
         console.log(
           `[pipeline] #${issueNumber}: could not post final summary to PR #${prNumber} ` +
@@ -222,7 +240,7 @@ export async function finalize(
   // idempotent, so re-running finalize is a no-op on the second pass.
   if (prNumber) {
     try {
-      await addLabelToPr(cfg, prNumber, `${LABEL_PREFIX}ready-to-deploy`);
+      await addLabelFn(cfg, prNumber, `${LABEL_PREFIX}ready-to-deploy`);
       console.log(`[pipeline] #${issueNumber}: PR #${prNumber} tagged pipeline:ready-to-deploy`);
     } catch (err) {
       // Best-effort: if the label doesn't exist on the repo or gh is unhappy,

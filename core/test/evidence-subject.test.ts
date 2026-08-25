@@ -19,6 +19,7 @@ import {
   EVIDENCE_SUBJECT_SCHEMA_VERSION,
   parseEvidenceSubject,
   parseEvidenceSubjectDetailed,
+  readinessCandidateShaFromDecision,
   resolveRequiredEvidenceKinds,
   selectEvaluationPinSubject,
   serializeEvidenceSubjectCanonical,
@@ -75,6 +76,31 @@ test("schema_version 1 object carries the required field set", () => {
   assert.equal(typeof s.engine_fingerprint, "string");
   assert.equal(typeof s.verifier_fingerprint, "string");
   assert.equal(typeof s.required_evidence_set_revision, "string");
+});
+
+test("readinessCandidateShaFromDecision: fail-closed on blocked, sentinel, or missing", () => {
+  assert.equal(readinessCandidateShaFromDecision(null), null);
+  assert.equal(
+    readinessCandidateShaFromDecision({
+      outcome: "blocked",
+      candidate_sha: SHA_A,
+    }),
+    null,
+  );
+  assert.equal(
+    readinessCandidateShaFromDecision({
+      outcome: "passthrough",
+      candidate_sha: "0".repeat(40),
+    }),
+    null,
+  );
+  assert.equal(
+    readinessCandidateShaFromDecision({
+      outcome: "passthrough",
+      candidate_sha: SHA_A,
+    }),
+    SHA_A,
+  );
 });
 
 test("buildEvidenceSubject normalizes SHA case and rejects short SHA", () => {

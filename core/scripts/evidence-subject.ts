@@ -331,6 +331,23 @@ export function normalizeSubjectSha(sha: string | null | undefined): string | nu
   return t.toLowerCase();
 }
 
+const ALL_ZERO_SHA = "0".repeat(40);
+
+/**
+ * Readiness `candidate_sha` from a trusted-surface decision.
+ * Returns null (fail closed) when the decision is missing, blocked, sentinel,
+ * or not a full 40-hex SHA — producers MUST NOT emit a well-formed subject
+ * that claims a fabricated candidate.
+ */
+export function readinessCandidateShaFromDecision(
+  decision: { outcome: string; candidate_sha: string } | null | undefined,
+): string | null {
+  if (!decision || decision.outcome === "blocked") return null;
+  const sha = normalizeSubjectSha(decision.candidate_sha);
+  if (!sha || sha === ALL_ZERO_SHA) return null;
+  return sha;
+}
+
 /** Normalize a digest/hash string to lowercase hex, or null if empty/non-hex. */
 export function normalizeDigest(value: string | null | undefined): string | null {
   if (typeof value !== "string") return null;
