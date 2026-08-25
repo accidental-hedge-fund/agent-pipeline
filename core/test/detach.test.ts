@@ -694,6 +694,21 @@ test("handleRunSubcommand: detach forwards --dry-run so a detached dry-run stays
   assert.ok(capturedArgs.includes("--dry-run"), `--dry-run must reach the inner process; got ${JSON.stringify(capturedArgs)}`);
 });
 
+test("handleRunSubcommand: detach forwards --sha candidate override", async () => {
+  let capturedArgs: string[] = [];
+  const deps: RunSubcommandDeps = {
+    spawnDetached: async (_issue, pipelineArgs) => {
+      capturedArgs = pipelineArgs;
+      return { runDir: "/tmp/fake-run", pid: 42 };
+    },
+  };
+  const sha = "a".repeat(40);
+  await handleRunSubcommand("99", { detach: true, sha }, deps);
+  const i = capturedArgs.indexOf("--sha");
+  assert.ok(i >= 0, `missing --sha; got ${JSON.stringify(capturedArgs)}`);
+  assert.equal(capturedArgs[i + 1], sha);
+});
+
 test("handleRunSubcommand: detach forwards --once / --doctor / --fail-fast lifecycle flags", async () => {
   let capturedArgs: string[] = [];
   const deps: RunSubcommandDeps = {

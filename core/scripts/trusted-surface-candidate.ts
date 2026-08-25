@@ -29,7 +29,7 @@ export type ResolveTrustedSurfaceCandidateInput = {
   worktreePresent: boolean;
   worktreeHeadSha?: string | null;
   stage: string;
-  /** Explicit candidate-SHA override (injectable seam; not a new public CLI). */
+  /** Explicit candidate-SHA override from advance `--sha` or a test seam. */
   overrideSha?: string | null;
   linkedPrHead?: LinkedPrHead | null;
   /** Last-advanced product candidate pin, or null when unknown. */
@@ -287,11 +287,22 @@ export function resolveTrustedSurfaceCandidateSha(
     };
   }
 
-  const override = normalizeFullSha(input.overrideSha);
+  const overrideRaw =
+    input.overrideSha != null && String(input.overrideSha).trim() !== ""
+      ? String(input.overrideSha).trim()
+      : null;
+  const override = normalizeFullSha(overrideRaw);
   const prSha = normalizeFullSha(input.linkedPrHead?.headSha);
   const pin = normalizeFullSha(input.lastAdvancedPin);
 
-  if (override) {
+  if (overrideRaw) {
+    if (!override) {
+      return {
+        ok: false,
+        code: "invalid_candidate_sha",
+        summary: `Trusted-surface candidate-SHA override is not a full SHA: "${overrideRaw}"`,
+      };
+    }
     if (prSha && prSha !== override) {
       return {
         ok: false,

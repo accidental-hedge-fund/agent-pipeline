@@ -6,7 +6,7 @@ When an issue reaches `ready-to-deploy` after a re-entry at or after `pre-merge`
 
 If trusted-surface remains `blocked` because no matching SHA source exists, finalize SHALL refuse the PR tag and SHALL NOT invent ready-to-deploy on the PR.
 
-Immediately before tagging, finalize SHALL re-fetch the linked open PR and require its head SHA to equal the non-blocked trusted-surface `candidate_sha` persisted for this run. If the live head differs, is missing, or is not a full 40-character hex SHA, finalize SHALL refuse with a named `stale_pr_head` outcome and SHALL NOT tag the PR.
+Immediately before tagging, finalize SHALL re-fetch the linked open PR and require its head SHA to equal the non-blocked trusted-surface `candidate_sha` persisted for this run. This re-fetch SHALL run before posting the terminal `## Pipeline Complete` summary or applying the ready-to-deploy tag. If the live head differs, is missing, or is not a full 40-character hex SHA, finalize SHALL refuse with a named `stale_pr_head` outcome, SHALL NOT tag the PR, and SHALL NOT post the terminal summary.
 
 #### Scenario: matching PR head after pre-merge park is tagged
 
@@ -30,4 +30,5 @@ Immediately before tagging, finalize SHALL re-fetch the linked open PR and requi
 - **AND** immediately before ready-to-deploy tagging, the linked open PR head is not H
 - **THEN** the run SHALL NOT tag the PR `pipeline:ready-to-deploy`
 - **AND** finalize SHALL refuse with a named `stale_pr_head` outcome
+- **AND** finalize SHALL NOT post the `## Pipeline Complete` terminal summary
 - **AND** the PR SHALL NOT be merged by the advance loop

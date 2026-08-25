@@ -54,7 +54,7 @@ See `proposal.md` for why. Current law and code:
 
 - Always trust current PR head with no pin check → rejected by AC (bogus PR head test).
 - Fail whenever the pin is absent, even if a PR exists → over-closed; a first re-entry after park may not have a same-run pin because trusted-surface runs before pre-merge records SHA.
-- New public `--sha` CLI flag → only if one already exists. Today `candidateSha` is a handoff option, not an advance flag. Expose an injectable override seam for tests and callers; do not add a new public CLI in this change.
+- New public `--sha` CLI flag → adopted. The test-only seam was not operator-reachable, so advance now accepts `--sha <40-hex>` and maps it through `toAdvanceOpts` into `runAdvance`. A malformed value is refused; a valid override still must match the linked open PR head when a PR exists.
 
 ### 3. After SHA resolve, compute or reuse the decision; never invent passthrough
 
@@ -100,4 +100,4 @@ Rollback: revert the resolver fallback; `worktree_unavailable` returns. No store
 
 ## Open Questions
 
-None. Candidate override is an injectable seam, not a new public CLI, unless an advance `--sha` flag already exists at implementation time.
+None. Candidate override is the advance `--sha` flag (full 40-hex), mapped through the production caller into `runAdvance`.

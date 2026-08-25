@@ -211,6 +211,11 @@ export interface AdvanceOpts {
    * `reenterAdvanceAfterRecoverParked` only — not a public CLI flag.
    */
   skipRecoverParked?: boolean;
+  /**
+   * Explicit candidate-SHA override for trusted-surface when no worktree is
+   * on disk (#1243). Production CLI: `pipeline N --sha <40-hex>`.
+   */
+  candidateShaOverride?: string | null;
 }
 
 /** Pure + exported so the PIPELINE_COMMENT_KINDS drift guard exercises the real renderer. */
@@ -608,7 +613,8 @@ export interface AdvanceDeps {
   lastAdvancedCandidateSha?: string | null;
   /**
    * Explicit candidate-SHA override for trusted-surface when no worktree is
-   * on disk (#1243). Injectable seam only — not a new public CLI flag.
+   * on disk (#1243). Test seam; production supplies the same value via
+   * {@link AdvanceOpts.candidateShaOverride} from `--sha`.
    */
   candidateShaOverride?: string | null;
   /**
@@ -1681,7 +1687,10 @@ export async function runAdvance(
         worktreePresent: Boolean(wt),
         worktreeHeadSha,
         stage: stageName,
-        overrideSha: deps.candidateShaOverride ?? null,
+        overrideSha:
+          deps.candidateShaOverride !== undefined
+            ? deps.candidateShaOverride
+            : (opts.candidateShaOverride ?? null),
         linkedPrHead,
         lastAdvancedPin,
       });

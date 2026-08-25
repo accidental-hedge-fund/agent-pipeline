@@ -14,7 +14,9 @@ import { fileURLToPath } from "node:url";
 import {
   runAdvance,
   type AdvanceDeps,
+  type AdvanceOpts,
 } from "../scripts/pipeline-run.ts";
+import { toAdvanceOpts } from "../scripts/pipeline.ts";
 import { runDirPath } from "../scripts/run-store.ts";
 import {
   FACTORY_CONTROL_DIR_ENV,
@@ -134,6 +136,8 @@ type DriveOpts = {
   priorRuns?: PriorRunSeed[];
   extraComments?: { author: string; body: string }[];
   overrideSha?: string | null;
+  /** Production AdvanceOpts bag (e.g. from toAdvanceOpts / `--sha`). */
+  advanceOpts?: AdvanceOpts;
   objectSourceError?: string;
   gitHeadSha?: string;
 };
@@ -298,7 +302,9 @@ async function driveReentry(opts: DriveOpts): Promise<DriveResult> {
     ...(opts.lastAdvancedPin !== undefined
       ? { lastAdvancedCandidateSha: opts.lastAdvancedPin }
       : {}),
-    candidateShaOverride: opts.overrideSha,
+    ...(opts.overrideSha !== undefined
+      ? { candidateShaOverride: opts.overrideSha }
+      : {}),
     trustedSurfaceObjectSource: opts.objectSourceError
       ? {
           listChangedPaths: async () => ({ error: opts.objectSourceError! }),
@@ -336,7 +342,9 @@ async function driveReentry(opts: DriveOpts): Promise<DriveResult> {
   }
 
   try {
-    await withoutHostPinAuthorityEnv(() => runAdvance(cfg, ISSUE, { runId }, deps));
+    await withoutHostPinAuthorityEnv(() =>
+      runAdvance(cfg, ISSUE, { ...opts.advanceOpts, runId }, deps),
+    );
     const decisionPath = path.join(runDirPath(repoDir, runId), "trusted-surface.json");
     let decision: TrustedSurfaceDecision | null = null;
     if (fs.existsSync(decisionPath)) {
@@ -445,6 +453,19 @@ test("resolver: mismatched override is not accepted", () => {
   assert.equal(r.ok, false);
   if (!r.ok) {
     assert.equal(r.code, "candidate_sha_mismatch");
+  }
+});
+
+test("resolver: present but invalid override fails closed", () => {
+  const r = resolveTrustedSurfaceCandidateSha({
+    worktreePresent: false,
+    stage: "pre-merge",
+    overrideSha: "not-a-sha",
+    linkedPrHead: { prNumber: PR, headSha: PIN },
+  });
+  assert.equal(r.ok, false);
+  if (!r.ok) {
+    assert.equal(r.code, "invalid_candidate_sha");
   }
 });
 
@@ -600,6 +621,35 @@ test("explicit override that does not match PR head is refused", async () => {
   assert.notEqual(result.decision?.candidate_sha, PIN);
   assert.notEqual(result.decision?.candidate_sha, OTHER);
   assert.equal(result.prLabels.includes("pipeline:ready-to-deploy"), false);
+});
+
+test("operator --sha override is accepted with no worktree and matching PR head", async () => {
+  const mapped = toAdvanceOpts({ sha: PIN });
+  assert.equal(mapped.candidateShaOverride, PIN);
+  const result = await driveReentry({
+    worktree: null,
+    prHead: PIN,
+    lastAdvancedPin: null,
+    advanceOpts: mapped,
+  });
+  assert.ok(result.decision);
+  assert.equal(result.decision?.candidate_sha, PIN);
+  assert.notEqual(result.decision?.reason.code, "worktree_unavailable");
+  assert.ok(result.prLabels.includes("pipeline:ready-to-deploy"));
+});
+
+test("operator --sha override supplies candidate SHA when PR head is unavailable", async () => {
+  const mapped = toAdvanceOpts({ sha: PIN });
+  const result = await driveReentry({
+    worktree: null,
+    prHead: null,
+    lastAdvancedPin: null,
+    advanceOpts: mapped,
+  });
+  assert.ok(result.decision);
+  assert.equal(result.decision?.candidate_sha, PIN);
+  assert.notEqual(result.decision?.reason.code, "worktree_unavailable");
+  assert.notEqual(result.decision?.outcome, "blocked");
 });
 
 test("trusted-surface SHA fallback does not rematerialize a worktree", () => {
@@ -940,6 +990,8 @@ test("fresh re-entry loads pre-merge delta-review pin without lastAdvancedCandid
 test("finalize refuses ready-to-deploy tag when live PR head moved off trusted-surface SHA", async () => {
   const runDir = fs.mkdtempSync(path.join(os.tmpdir(), "r2d-stale-head-"));
   const prLabels: string[] = [];
+  const postedIssue: string[] = [];
+  const postedPr: string[] = [];
   fs.writeFileSync(
     path.join(runDir, TRUSTED_SURFACE_FILE),
     JSON.stringify({
@@ -985,21 +1037,35 @@ test("finalize refuses ready-to-deploy tag when live PR head moved off trusted-s
       addLabelToPr: async (_cfg, _pr, label) => {
         prLabels.push(label);
       },
-      postComment: async () => {},
-      postPrComment: async () => {},
+      postComment: async (_cfg, _n, body) => {
+        postedIssue.push(body);
+      },
+      postPrComment: async (_cfg, _pr, body) => {
+        postedPr.push(body);
+      },
       getOnDiskForIssue: async () => null,
     });
     assert.equal(out.status, "blocked");
     assert.match(out.reason ?? "", /stale_pr_head/);
     assert.equal(prLabels.includes("pipeline:ready-to-deploy"), false);
+    assert.equal(
+      postedIssue.some((b) => b.startsWith("## Pipeline Complete")),
+      false,
+      "stale-head must not post the terminal completion summary",
+    );
+    assert.equal(
+      postedPr.some((b) => b.startsWith("## Pipeline Complete")),
+      false,
+    );
   } finally {
     fs.rmSync(runDir, { recursive: true, force: true });
   }
 });
 
-test("finalize refuses ready-to-deploy tag when PR head changes after finalization work", async () => {
+test("finalize does not post Pipeline Complete when PR head changes before SHA check", async () => {
   const runDir = fs.mkdtempSync(path.join(os.tmpdir(), "r2d-stale-head-race-"));
   const prLabels: string[] = [];
+  const postedIssue: string[] = [];
   fs.writeFileSync(
     path.join(runDir, TRUSTED_SURFACE_FILE),
     JSON.stringify({
@@ -1030,8 +1096,9 @@ test("finalize refuses ready-to-deploy tag when PR head changes after finalizati
   let liveHead = PIN;
   try {
     const out = await finalizeReadyToDeploy(cfg, ISSUE, runDir, undefined, {
-      getIssueDetail: async () =>
-        ({
+      getIssueDetail: async () => {
+        liveHead = OTHER;
+        return {
           number: ISSUE,
           type: "issue",
           title: "T",
@@ -1040,14 +1107,15 @@ test("finalize refuses ready-to-deploy tag when PR head changes after finalizati
           url: `https://example.test/${ISSUE}`,
           labels: ["pipeline:ready-to-deploy"],
           comments: [],
-        }) as Awaited<ReturnType<NonNullable<AdvanceDeps["getIssueDetail"]>>>,
+        } as Awaited<ReturnType<NonNullable<AdvanceDeps["getIssueDetail"]>>>;
+      },
       getPrForIssue: async () => PR,
       getPrDetail: async () => prDetail(liveHead),
       addLabelToPr: async (_cfg, _pr, label) => {
         prLabels.push(label);
       },
-      postComment: async () => {
-        liveHead = OTHER;
+      postComment: async (_cfg, _n, body) => {
+        postedIssue.push(body);
       },
       postPrComment: async () => {},
       getOnDiskForIssue: async () => null,
@@ -1055,6 +1123,11 @@ test("finalize refuses ready-to-deploy tag when PR head changes after finalizati
     assert.equal(out.status, "blocked");
     assert.match(out.reason ?? "", /stale_pr_head/);
     assert.equal(prLabels.includes("pipeline:ready-to-deploy"), false);
+    assert.equal(
+      postedIssue.some((b) => b.startsWith("## Pipeline Complete")),
+      false,
+      "stale-head must not post the terminal completion summary",
+    );
   } finally {
     fs.rmSync(runDir, { recursive: true, force: true });
   }

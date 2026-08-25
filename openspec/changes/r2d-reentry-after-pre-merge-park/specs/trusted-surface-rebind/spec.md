@@ -5,7 +5,7 @@
 When a verification-relevant run computes a trusted-surface decision and no managed worktree is on disk for the issue, the engine SHALL still resolve `candidate_sha` from an authoritative source instead of failing closed solely because the worktree is absent. Resolution order SHALL be:
 
 1. Worktree HEAD when a managed worktree is present (existing path).
-2. Else an explicit candidate-SHA override, when it is a full 40-character hexadecimal SHA.
+2. Else an explicit candidate-SHA override from the advance `--sha` command input (or an equivalent production caller field), when it is a full 40-character hexadecimal SHA.
 3. Else the head SHA of the linked open pull request, when that head is a full 40-character hexadecimal SHA and it matches the last-advanced candidate pin when that pin is present.
 
 The last-advanced candidate pin is the SHA last recorded as the product candidate this issue successfully advanced under (review SHA-gate pin, last successful pre-merge candidate, or last non-sentinel trusted-surface `candidate_sha` for the issue). Recency SHALL be the persisted trusted-surface decision timestamp or successful pre-merge event `at`, not the originating run's `run_start` or run-id time. When that pin is absent and a linked open PR head is a full 40-hex SHA, the engine SHALL use that PR head. When the pin is present and the PR head differs, the engine SHALL NOT use the PR head.
@@ -26,6 +26,14 @@ When a candidate SHA is resolved this way, the engine SHALL still compute (or re
 
 - **WHEN** issue N has no managed worktree on disk
 - **AND** an explicit candidate-SHA override S is a full 40-character hex SHA
+- **AND** if a linked open PR exists, S equals that PR head
+- **THEN** the trusted-surface decision `candidate_sha` SHALL be S
+- **AND** the decision SHALL NOT use reason code `worktree_unavailable` solely because the worktree is absent
+
+#### Scenario: production advance --sha override supplies candidate SHA
+
+- **WHEN** issue N has no managed worktree on disk
+- **AND** the operator supplied `--sha S` on the advance command, where S is a full 40-character hexadecimal SHA
 - **AND** if a linked open PR exists, S equals that PR head
 - **THEN** the trusted-surface decision `candidate_sha` SHALL be S
 - **AND** the decision SHALL NOT use reason code `worktree_unavailable` solely because the worktree is absent

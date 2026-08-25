@@ -33,7 +33,7 @@ export interface CommandDoc {
 export const COMMAND_DOCS: Record<string, CommandDoc> = {
   advance: {
     summary: "Durable autonomous one-item drive (default when invoked with an issue number)",
-    usage: "N",
+    usage: "N [--sha <sha>]",
     documented: true,
     section: "advance",
   },

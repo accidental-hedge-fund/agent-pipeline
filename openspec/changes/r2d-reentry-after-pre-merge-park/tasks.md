@@ -23,6 +23,8 @@
 - [x] 3.6 Wire `buildReadinessEvidenceSubjectFromDecision` to persist `evidence_subject` on the emitted bundle from the trusted-surface decision. Verify by reading the actual summary.json subject
 - [x] 3.7 Select the newest durable last-advanced pin by run/event timestamp across trusted-surface and pre-merge records. Verify a multi-run re-entry whose older SHA matches the live PR head and whose newest pin differs is mismatch-blocked and does not tag ready-to-deploy
 - [x] 3.8 Persist an immutable trusted-surface decision timestamp on every decision write and order last-advanced pins by that time, not originating run start. Verify a reused older run ID whose decision is updated after a later-started run is the newest pin; a PR head matching the later-started SHA is mismatch-blocked
+- [x] 3.9 Re-fetch and validate the live PR head against the trusted-surface candidate before posting the terminal `## Pipeline Complete` summary. Verify a stale-head outcome posts no summary and does not tag ready-to-deploy
+- [x] 3.10 Wire advance `--sha <40-hex>` through `toAdvanceOpts` into `runAdvance`. Verify a no-worktree operator override path resolves that SHA (and a matching-PR / no-PR case), and a malformed `--sha` is refused
 
 ## 4. Park-resume exception (late-stage only)
 
