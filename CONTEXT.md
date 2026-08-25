@@ -14,6 +14,14 @@ _Avoid_: plugin engine, skill engine, core copy
 A thin argv or JSON wrapper that invokes the CLI (Claude, Codex, Grok, OpenCode, OMP, Tugboat).
 _Avoid_: second pipeline, per-host stage machine
 
+**Outer-host ID**:
+The install and lifecycle identity for a session surface (for example, `omp`). It is independent of a stage-adapter ID; `omp` does not replace or alias the `pi` adapter.
+_Avoid_: provider identity, implementer identity
+
+**Native host command**:
+A host-owned command that invokes the installed launcher as a process, forwarding the session working directory and exact argv. It does not turn command output into an LLM prompt. OMP's `/pipeline` uses this form.
+_Avoid_: prompt template, a second CLI, OpenCode command reuse
+
 **Shim**:
 A short host SKILL (or none) that tells the agent to exec `pipeline` on PATH.
 _Avoid_: `/pipeline:*` command pack, marketplace command files
@@ -25,6 +33,26 @@ _Avoid_: product surface
 **Plugin directory**:
 The committed `plugin/` tree (core mirror + generated `/pipeline:*` files). Deleted in #1050. Claude install writes a short SKILL next to the CLI, not a repo `plugin/` package.
 _Avoid_: marketplace listing, source of truth
+
+**Launcher bootstrap**:
+The dependency-free phase before loading TypeScript. It may answer version-only requests on its invoking Node; otherwise it resolves and re-execs an engines-compliant Node with the resolved binary's directory first on `PATH`.
+_Avoid_: treating PATH `node` as the engine, a per-host Node walker
+
+**Introspection compatibility**:
+Version-only launcher behavior available below the engine floor. It does not make that Node version a supported TypeScript runtime.
+_Avoid_: lowering `engines.node`, Node 22 engine support
+
+**Repository execution policy**:
+A runnable target has `.github/pipeline.yml` with both `harnesses.implementer` and `harnesses.reviewer`. That file selects stage workers; an outer host does not. Missing or partial policy fails before work begins.
+_Avoid_: host-selected workers, profile fallback for a runnable repository
+
+**Profile bootstrap**:
+Compatibility metadata supplied before repository configuration is read. An OMP profile keeps the current launcher/config interface intact; it must not determine live stage workers once repository execution policy is required.
+_Avoid_: treating a host profile as repository policy
+
+**Captured launcher executable**:
+The absolute `process.execPath` used to install a native host command. The command launches the installed shim with that executable and no shell/PATH `node` lookup; launcher bootstrap may still re-exec a compliant Node.
+_Avoid_: a hard-coded `node` command, a second resolver
 
 **OPERATION_SURFACE**:
 The single list of CLI verbs in `scripts/build.mjs`. Catalog for docs and the SKILL verb table. Does not justify emitting one markdown file per verb.

@@ -1,3 +1,34 @@
+# Grill-with-docs — #1235 OMP host and #1236 launcher bootstrap
+
+## Plan
+
+- [x] Ground the two issue contracts in the current launcher, installer, and OMP documentation.
+- [x] Resolve the first design frontier with the operator.
+- [x] Record the agreed host and launcher terms in `CONTEXT.md`.
+- [x] Test the remaining lifecycle and failure-boundary decisions with the operator.
+- [x] Open #1240 for separate cross-host repository-policy enforcement; it is not a #1235 dependency.
+- [x] Append locked decisions to #1235 and #1236.
+- [x] Review the documentation diff and run `npm run ci` (exit 0).
+
+## Review
+
+- Documentation terminology matches the locked issue decisions.
+- `npm run ci` passed on 2026-08-25.
+- The gate generated an unrelated `.gitignore` artifact block in this worktree; it was removed and is not part of this documentation change.
+
+## Locked decisions
+
+1. OMP installs only to the user-global `~/.omp/agent` root; project `.omp` is not installer-managed.
+2. OMP's `/pipeline` is a native, non-LLM TypeScript command. It invokes the installed launcher with the session working directory and exact user argv. Its initial lifecycle surface is `stdout_only`; existing CLI detach, run-store, and event commands remain the durable path.
+3. Node 18–23 compatibility is introspection-only: `--version`, `-V`, and version JSON run without Node 24. Every TypeScript-loading command, including `path`, resolves and re-execs Node >=24.
+4. `ensure-engines-node.mjs` remains the sole resolver. The installer stages it as a standard shared-launcher asset rather than duplicating resolver logic into host launchers.
+5. A runnable repository must declare both harness roles in `.github/pipeline.yml`; host profiles must not choose stage workers. The current profile fallback conflicts with this policy and needs an explicit implementation boundary.
+6. OMP's generated TypeScript command invokes `scripts/pipeline.mjs` with the absolute `process.execPath` captured by `install.mjs`; it uses neither a shell nor PATH `node`.
+7. OMP has an `omp` profile only because the current launcher/config interface requires one before repository configuration is read. Required repository policy means that profile cannot choose live workers.
+8. Strict repository-policy enforcement is a separate cross-host issue, not an execution dependency of #1235.
+
+---
+
 # #1223 Revised plan — getPrDiff files-API fallback
 
 ## Status
