@@ -20,6 +20,7 @@ import {
   parseEvidenceSubject,
   parseEvidenceSubjectDetailed,
   readinessCandidateShaFromDecision,
+  buildReadinessEvidenceSubjectFromDecision,
   resolveRequiredEvidenceKinds,
   selectEvaluationPinSubject,
   serializeEvidenceSubjectCanonical,
@@ -100,6 +101,39 @@ test("readinessCandidateShaFromDecision: fail-closed on blocked, sentinel, or mi
       candidate_sha: SHA_A,
     }),
     SHA_A,
+  );
+});
+
+test("buildReadinessEvidenceSubjectFromDecision: binds PR-head candidate, fails closed on blocked", () => {
+  const engine = { version: "1.0.0", templates_fingerprint: "t".repeat(64) };
+  const policy = { block_threshold: "high", min_confidence: 0.7 };
+  const subject = buildReadinessEvidenceSubjectFromDecision({
+    decision: {
+      outcome: "passthrough",
+      candidate_sha: SHA_A,
+      effective_verifier_hash: VERIFIER,
+    },
+    domain: "owner/repo",
+    issue: 1243,
+    pr: 1244,
+    runId: "1243/run",
+    engine,
+    reviewPolicy: policy,
+  });
+  assert.ok(subject);
+  assert.equal(subject.candidate_sha, SHA_A);
+  assert.equal(subject.pr, 1244);
+  assert.equal(
+    buildReadinessEvidenceSubjectFromDecision({
+      decision: { outcome: "blocked", candidate_sha: SHA_A },
+      domain: "owner/repo",
+      issue: 1243,
+      pr: 1244,
+      runId: "1243/run",
+      engine,
+      reviewPolicy: policy,
+    }),
+    null,
   );
 });
 

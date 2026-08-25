@@ -21,24 +21,23 @@ import {
   PRODUCTION_PIN_ENV,
 } from "../scripts/production-engine-pin.ts";
 import {
+  extractPreMergeCandidateShaFromEvents,
   resolveTrustedSurfaceCandidateSha,
   selectDurableLastAdvancedPin,
   stageAtOrAfterPreMerge,
   TRUSTED_SURFACE_SENTINEL_SHA,
 } from "../scripts/trusted-surface-candidate.ts";
+import { finalize as finalizeReadyToDeploy } from "../scripts/stages/deploy_ready.ts";
+import { DELTA_REVIEW_MARKER_PREFIX } from "../scripts/stages/review.ts";
 import {
   PATH_CLASS_SCHEMA_VERSION,
   TRUSTED_SURFACE_DECISION_SCHEMA_VERSION,
 } from "../scripts/trusted-surface.ts";
 import { TRUSTED_SURFACE_FILE } from "../scripts/run-store.ts";
 import {
-  buildEngineFingerprint,
-  buildEvidenceSubject,
-  buildPolicyHash,
-  buildRequiredEvidenceSetRevision,
-  DEFAULT_REQUIRED_EVIDENCE_KINDS,
   readinessCandidateShaFromDecision,
 } from "../scripts/evidence-subject.ts";
+import type { EvidenceSubjectV1 } from "../scripts/evidence-subject.ts";
 import { STAGES, type PipelineConfig, type Stage } from "../scripts/types.ts";
 import type { TrustedSurfaceDecision } from "../scripts/trusted-surface.ts";
 import type { PrDetail } from "../scripts/types.ts";
@@ -116,6 +115,8 @@ type DriveOpts = {
   lastAdvancedPin?: string | null;
   /** Prior-run trusted-surface candidate_sha; not injected as lastAdvancedCandidateSha. */
   priorTrustedSurfaceSha?: string;
+  /** Prior-run successful pre-merge stage_complete SHA; not a trusted-surface record. */
+  priorPreMergeSha?: string;
   extraComments?: { author: string; body: string }[];
   overrideSha?: string | null;
   objectSourceError?: string;
@@ -130,6 +131,7 @@ type DriveResult = {
   mergeCalls: number;
   createWorktreeCalls: number;
   worktreeLookups: number;
+  emittedSubject: EvidenceSubjectV1 | null;
 };
 
 async function driveReentry(opts: DriveOpts): Promise<DriveResult> {
@@ -170,6 +172,15 @@ async function driveReentry(opts: DriveOpts): Promise<DriveResult> {
     auto_loop: { enabled: false, max_rounds: 3, max_wallclock_minutes: 60, stages: [] },
     papercuts: { enabled: false, auto_file: false },
     corrections: { auto_file: false },
+    review_policy: {
+      block_threshold: "high",
+      min_confidence: 0.7,
+      max_adversarial_rounds: 3,
+      risk_proportional: false,
+      ceiling_action: "park",
+      surface_recurrence_rounds: 3,
+      max_delta_rounds: 4,
+    },
   } as unknown as PipelineConfig;
 
   const detail = {
@@ -253,24 +264,39 @@ async function driveReentry(opts: DriveOpts): Promise<DriveResult> {
     },
   };
 
-  if (opts.priorTrustedSurfaceSha) {
+  if (opts.priorTrustedSurfaceSha || opts.priorPreMergeSha) {
     const priorId = `${ISSUE}-2026-08-24T00-00-00-000Z`;
     const priorDir = runDirPath(repoDir, priorId);
     fs.mkdirSync(priorDir, { recursive: true });
-    fs.writeFileSync(
-      path.join(priorDir, TRUSTED_SURFACE_FILE),
-      JSON.stringify({
-        schema_version: TRUSTED_SURFACE_DECISION_SCHEMA_VERSION,
-        path_class_schema_version: PATH_CLASS_SCHEMA_VERSION,
-        outcome: "passthrough",
-        candidate_sha: opts.priorTrustedSurfaceSha,
-        base_sha: null,
-        triggering_paths: [],
-        classes: [],
-        effective_verifier_hash: "d".repeat(64),
-        reason: { code: "ok", summary: "prior run pin" },
-      }),
-    );
+    if (opts.priorTrustedSurfaceSha) {
+      fs.writeFileSync(
+        path.join(priorDir, TRUSTED_SURFACE_FILE),
+        JSON.stringify({
+          schema_version: TRUSTED_SURFACE_DECISION_SCHEMA_VERSION,
+          path_class_schema_version: PATH_CLASS_SCHEMA_VERSION,
+          outcome: "passthrough",
+          candidate_sha: opts.priorTrustedSurfaceSha,
+          base_sha: null,
+          triggering_paths: [],
+          classes: [],
+          effective_verifier_hash: "d".repeat(64),
+          reason: { code: "ok", summary: "prior run pin" },
+        }),
+      );
+    }
+    if (opts.priorPreMergeSha) {
+      fs.writeFileSync(
+        path.join(priorDir, "events.jsonl"),
+        `${JSON.stringify({
+          schema_version: 1,
+          type: "stage_complete",
+          at: "2026-08-24T00:00:00Z",
+          stage: "pre-merge",
+          outcome: "advanced",
+          commits: [opts.priorPreMergeSha],
+        })}\n`,
+      );
+    }
   }
 
   try {
@@ -280,6 +306,14 @@ async function driveReentry(opts: DriveOpts): Promise<DriveResult> {
     if (fs.existsSync(decisionPath)) {
       decision = JSON.parse(fs.readFileSync(decisionPath, "utf8")) as TrustedSurfaceDecision;
     }
+    const summaryPath = path.join(runDirPath(repoDir, runId), "summary.json");
+    let emittedSubject: EvidenceSubjectV1 | null = null;
+    if (fs.existsSync(summaryPath)) {
+      const summary = JSON.parse(fs.readFileSync(summaryPath, "utf8")) as {
+        evidence_subject?: EvidenceSubjectV1;
+      };
+      emittedSubject = summary.evidence_subject ?? null;
+    }
     return {
       decision,
       prLabels,
@@ -288,6 +322,7 @@ async function driveReentry(opts: DriveOpts): Promise<DriveResult> {
       mergeCalls,
       createWorktreeCalls,
       worktreeLookups,
+      emittedSubject,
     };
   } finally {
     console.log = origLog;
@@ -429,25 +464,9 @@ test("pre-merge re-entry with matching PR head tags ready-to-deploy (#1243)", as
   );
   const sha = readinessCandidateShaFromDecision(result.decision);
   assert.equal(sha, PIN);
-  const subject = buildEvidenceSubject({
-    domain: "owner/repo",
-    issue: ISSUE,
-    pr: PR,
-    run_id: `${ISSUE}/reentry`,
-    candidate_sha: sha!,
-    diff_hash: null,
-    policy_hash: buildPolicyHash({ k: "p" }),
-    engine_fingerprint: buildEngineFingerprint({
-      version: ENGINE.version,
-      templates_fingerprint: ENGINE.templates_fingerprint,
-    }),
-    verifier_fingerprint: "d".repeat(64),
-    required_evidence_set_revision: buildRequiredEvidenceSetRevision(
-      DEFAULT_REQUIRED_EVIDENCE_KINDS,
-    ),
-  });
-  assert.equal(subject.candidate_sha, PIN);
-  assert.equal(subject.pr, PR);
+  assert.ok(result.emittedSubject, "production must emit a readiness evidence_subject");
+  assert.equal(result.emittedSubject.candidate_sha, PIN);
+  assert.equal(result.emittedSubject.pr, PR);
   assert.equal(result.mergeCalls, 0);
   assert.equal(result.createWorktreeCalls, 0);
   assert.ok(result.worktreeLookups > 0);
@@ -466,6 +485,10 @@ test("mismatched PR head is not the readiness subject and is not tagged", async 
   assert.notEqual(result.decision?.candidate_sha, OTHER);
   assert.equal(readinessCandidateShaFromDecision(result.decision), null);
   assert.equal(result.prLabels.includes("pipeline:ready-to-deploy"), false);
+  assert.ok(
+    !result.emittedSubject || result.emittedSubject.candidate_sha !== OTHER,
+    "emitted readiness subject must not claim the mismatched PR head",
+  );
 });
 
 test("absent worktree and absent PR fail closed with named unresolved code", async () => {
@@ -485,6 +508,7 @@ test("absent worktree and absent PR fail closed with named unresolved code", asy
   );
   assert.equal(readinessCandidateShaFromDecision(result.decision), null);
   assert.equal(result.prLabels.includes("pipeline:ready-to-deploy"), false);
+  assert.equal(result.emittedSubject, null);
 });
 
 test("worktree HEAD wins over a different PR head", async () => {
@@ -642,4 +666,139 @@ test("fresh re-entry matching prior pin still tags ready-to-deploy", async () =>
   assert.equal(result.decision?.candidate_sha, PIN);
   assert.notEqual(result.decision?.outcome, "blocked");
   assert.ok(result.prLabels.includes("pipeline:ready-to-deploy"));
+  assert.equal(result.emittedSubject?.candidate_sha, PIN);
+  assert.equal(result.emittedSubject?.pr, PR);
+});
+
+test("extractPreMergeCandidateShaFromEvents: last successful pre-merge commit", () => {
+  assert.equal(
+    extractPreMergeCandidateShaFromEvents([
+      {
+        type: "stage_complete",
+        stage: "pre-merge",
+        outcome: "blocked",
+        commits: [OTHER],
+      },
+      {
+        type: "stage_complete",
+        stage: "pre-merge",
+        outcome: "advanced",
+        commits: [PIN],
+      },
+      {
+        type: "stage_complete",
+        stage: "eval-gate",
+        outcome: "advanced",
+        commits: [WT_HEAD],
+      },
+    ]),
+    PIN,
+  );
+  assert.equal(
+    extractPreMergeCandidateShaFromEvents([
+      {
+        type: "stage_complete",
+        stage: "pre-merge",
+        outcome: "advanced",
+        commits: [TRUSTED_SURFACE_SENTINEL_SHA],
+      },
+    ]),
+    null,
+  );
+});
+
+test("fresh re-entry loads pre-merge pin from prior stage_complete without lastAdvancedCandidateSha", async () => {
+  const result = await driveReentry({
+    worktree: null,
+    prHead: OTHER,
+    priorPreMergeSha: PIN,
+  });
+  assert.ok(result.decision);
+  assert.equal(result.decision?.outcome, "blocked");
+  assert.equal(result.decision?.reason.code, "candidate_sha_mismatch");
+  assert.notEqual(result.decision?.candidate_sha, OTHER);
+  assert.equal(result.prLabels.includes("pipeline:ready-to-deploy"), false);
+  assert.ok(
+    !result.emittedSubject || result.emittedSubject.candidate_sha !== OTHER,
+  );
+});
+
+test("fresh re-entry loads pre-merge delta-review pin without lastAdvancedCandidateSha", async () => {
+  const result = await driveReentry({
+    worktree: null,
+    prHead: OTHER,
+    extraComments: [
+      {
+        author: "pipeline-bot",
+        body:
+          `${DELTA_REVIEW_MARKER_PREFIX} — approve (commit ${PIN.slice(0, 7)})\n\n` +
+          `ok\n\n<!-- reviewed-sha: ${PIN} -->`,
+      },
+    ],
+  });
+  assert.ok(result.decision);
+  assert.equal(result.decision?.outcome, "blocked");
+  assert.equal(result.decision?.reason.code, "candidate_sha_mismatch");
+  assert.notEqual(result.decision?.candidate_sha, OTHER);
+  assert.equal(result.prLabels.includes("pipeline:ready-to-deploy"), false);
+});
+
+test("finalize refuses ready-to-deploy tag when live PR head moved off trusted-surface SHA", async () => {
+  const runDir = fs.mkdtempSync(path.join(os.tmpdir(), "r2d-stale-head-"));
+  const prLabels: string[] = [];
+  fs.writeFileSync(
+    path.join(runDir, TRUSTED_SURFACE_FILE),
+    JSON.stringify({
+      schema_version: TRUSTED_SURFACE_DECISION_SCHEMA_VERSION,
+      path_class_schema_version: PATH_CLASS_SCHEMA_VERSION,
+      outcome: "passthrough",
+      candidate_sha: PIN,
+      base_sha: null,
+      triggering_paths: [],
+      classes: [],
+      effective_verifier_hash: "d".repeat(64),
+      reason: { code: "no_sensitive_paths", summary: "ok" },
+    }),
+  );
+  const cfg = {
+    repo: "owner/repo",
+    domain: "r2d-stale-head",
+    repo_dir: runDir,
+    base_branch: "main",
+    marker_footer: "*Automated by Claude Code Pipeline Skill*",
+    harnesses: {
+      implementer: "claude",
+      implementerSource: "default",
+      reviewer: "codex",
+      reviewerSource: "default",
+    },
+  } as unknown as PipelineConfig;
+  try {
+    const out = await finalizeReadyToDeploy(cfg, ISSUE, runDir, undefined, {
+      getIssueDetail: async () =>
+        ({
+          number: ISSUE,
+          type: "issue",
+          title: "T",
+          body: "B",
+          state: "open",
+          url: `https://example.test/${ISSUE}`,
+          labels: ["pipeline:ready-to-deploy"],
+          comments: [],
+        }) as Awaited<ReturnType<NonNullable<AdvanceDeps["getIssueDetail"]>>>,
+      getPrForIssue: async () => PR,
+      getPrDetail: async () => prDetail(OTHER),
+      addLabelToPr: async (_cfg, _pr, label) => {
+        prLabels.push(label);
+      },
+      postComment: async () => {},
+      postPrComment: async () => {},
+      getOnDiskForIssue: async () => null,
+    });
+    assert.equal(out.status, "blocked");
+    assert.match(out.reason ?? "", /stale_pr_head/);
+    assert.equal(prLabels.includes("pipeline:ready-to-deploy"), false);
+  } finally {
+    fs.rmSync(runDir, { recursive: true, force: true });
+  }
 });

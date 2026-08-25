@@ -18,6 +18,9 @@
 - [x] 3.1 Keep `deploy_ready.finalize` as the single PR-tag path. After a non-blocked trusted-surface decision on the matching-PR-head fixture, the linked PR SHALL be tagged `pipeline:ready-to-deploy` and the log SHALL include `PR #<n> tagged pipeline:ready-to-deploy`. Verify task 1.1 now passes. Do not add a second tag helper
 - [x] 3.2 When a readiness producer emits `evidence_subject` on that path, `candidate_sha` SHALL be the resolved PR head (or override) and `pr` SHALL be that PR number. Missing or mismatched SHA still fail-closes subject production. Verify with an injected assertion on the matching-head fixture and on the mismatch fixture
 - [x] 3.3 Advance still never merges. Verify the matching-head fixture does not call merge. Do not add `auto_merge`
+- [x] 3.4 Load the last successful pre-merge candidate from durable records (prior-run `stage_complete` and pre-merge delta-review SHA) into `lastAdvancedPin`. Verify mismatch rejection when that is the only prior pin
+- [x] 3.5 Immediately before ready-to-deploy tagging, re-fetch the linked PR head and require it to equal the trusted-surface candidate. Refuse with named `stale_pr_head` on mismatch
+- [x] 3.6 Wire `buildReadinessEvidenceSubjectFromDecision` to persist `evidence_subject` on the emitted bundle from the trusted-surface decision. Verify by reading the actual summary.json subject
 
 ## 4. Park-resume exception (late-stage only)
 

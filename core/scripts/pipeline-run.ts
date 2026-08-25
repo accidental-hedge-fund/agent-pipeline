@@ -66,6 +66,7 @@ import {
   finalizeRun,
   initRunDir,
   persistTrustedSurfaceDecision,
+  readEvents,
   readTrustedSurfaceDecision,
   resolveRunEngineIdentity,
   runDirPath,
@@ -91,6 +92,7 @@ import {
   type TrustedSurfaceDecision,
 } from "./trusted-surface.ts";
 import {
+  extractPreMergeCandidateShaFromEvents,
   gitRepoObjectSource,
   isTrustedSurfaceSentinelSha,
   resolveTrustedSurfaceCandidateSha,
@@ -99,6 +101,7 @@ import {
   type LinkedPrHead,
   type TrustedSurfaceObjectSource,
 } from "./trusted-surface-candidate.ts";
+import { buildReadinessEvidenceSubjectFromDecision } from "./evidence-subject.ts";
 import { buildEventSinkDeps } from "./event-sink.ts";
 import {
   isEngineDriftTransition,
@@ -1530,17 +1533,20 @@ export async function runAdvance(
       comments?: { body: string }[],
     ): Promise<string | null> {
       const priorTrustedSurfaceShas: string[] = [];
+      let preMergeCandidateSha: string | null = null;
       if (runDir) {
         const currentId = path.basename(runDir);
         const ids = await listRunIds(cfg.repo_dir, runStoreDeps).catch(() => [] as string[]);
         const prefix = `${issueNumber}-`;
         for (const id of ids) {
           if (!id.startsWith(prefix) || id === currentId) continue;
-          const prior = await readTrustedSurfaceDecision(
-            runDirPath(cfg.repo_dir, id),
-            runStoreDeps,
-          );
+          const priorDir = runDirPath(cfg.repo_dir, id);
+          const prior = await readTrustedSurfaceDecision(priorDir, runStoreDeps);
           if (prior?.candidate_sha) priorTrustedSurfaceShas.push(prior.candidate_sha);
+          if (!preMergeCandidateSha) {
+            const events = await readEvents(priorDir, runStoreDeps).catch(() => []);
+            preMergeCandidateSha = extractPreMergeCandidateShaFromEvents(events);
+          }
         }
       }
       let bodies = comments;
@@ -1550,9 +1556,22 @@ export async function runAdvance(
         );
         bodies = detail?.comments;
       }
-      const reviewedSha = reviewStage.extractReviewedSha(bodies ?? [])?.sha ?? null;
+      const commentList = bodies ?? [];
+      const reviewRoundBodies = commentList.filter(
+        (c) =>
+          c.body.startsWith(reviewStage.REVIEW_MARKER_PREFIX_R1) ||
+          c.body.startsWith(reviewStage.REVIEW_MARKER_PREFIX_R2),
+      );
+      const reviewedSha = reviewStage.extractReviewedSha(reviewRoundBodies)?.sha ?? null;
+      if (!preMergeCandidateSha) {
+        const deltaBodies = commentList.filter((c) =>
+          c.body.startsWith(reviewStage.DELTA_REVIEW_MARKER_PREFIX),
+        );
+        preMergeCandidateSha = reviewStage.extractReviewedSha(deltaBodies)?.sha ?? null;
+      }
       return selectDurableLastAdvancedPin({
         priorTrustedSurfaceShas,
+        preMergeCandidateSha,
         reviewedSha,
       });
     }
@@ -2016,6 +2035,7 @@ export async function runAdvance(
           getOnDiskForIssue: deps.getOnDiskForIssue,
           getIssueDetail: deps.getIssueDetail,
           getPrForIssue: deps.getPrForIssue,
+          getPrDetail: deps.getPrDetail,
           addLabelToPr: deps.addLabelToPr,
           postComment: deps.postComment,
           postPrComment: deps.postPrComment,
@@ -2513,6 +2533,30 @@ export async function runAdvance(
             await patchBundleIdentity(stateDir, issueNumber, identityPatch).catch(() => {});
           }
           const finalized = await finalizeBundle(stateDir, issueNumber, finalStage);
+          const readinessSubject = buildReadinessEvidenceSubjectFromDecision({
+            decision: currentTrustedSurface,
+            domain: (cfg.domain || cfg.repo || "").trim(),
+            issue: issueNumber,
+            pr: latestPr,
+            runId: pipelineRunId,
+            engine: pinnedEngine
+              ? {
+                  version: pinnedEngine.version,
+                  templates_fingerprint: pinnedEngine.templates_fingerprint,
+                  commit_sha: pinnedEngine.commit_sha ?? null,
+                }
+              : null,
+            reviewPolicy: cfg.review_policy ?? null,
+            gates: {
+              testGateEnabled: cfg.test_gate?.enabled,
+              evalGateEnabled: cfg.eval_gate?.enabled,
+              visualGateEnabled: cfg.visual_gate?.enabled,
+              shipcheckGateEnabled: cfg.shipcheck_gate?.enabled,
+            },
+          });
+          if (readinessSubject) {
+            finalized.evidence_subject = readinessSubject;
+          }
           // Staged policies + repository-control drift evidence (#695): record when
           // configured. Best-effort live compare; never invents policies when absent.
           try {
@@ -2552,7 +2596,10 @@ export async function runAdvance(
           // Metrics are NOT passed here — gh_metrics_summary is emitted after notification
           // so that notification gh calls (getPrForIssue/postPrComment) are captured (#257).
           if (runDir) {
-            await finalizeRun(runDir, finalized, stateDir, issueNumber, runStartedAtIso, runStoreDeps).catch(() => {});
+            await finalizeRun(runDir, finalized, stateDir, issueNumber, runStartedAtIso, {
+              ...runStoreDeps,
+              evaluationPinSubject: readinessSubject ?? null,
+            }).catch(() => {});
           }
           // Opt-in papercut auto-file (#421): best-effort, gated on resolved
           // config, wrapped so a failure here can never alter the run's outcome.

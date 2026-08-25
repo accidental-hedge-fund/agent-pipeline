@@ -4,6 +4,7 @@
 import {
   addLabelToPr,
   getIssueDetail,
+  getPrDetail,
   getPrForIssue,
   ghRunForTest,
   postComment,
@@ -25,7 +26,8 @@ import {
   readTrustedSurfaceDecision,
   type RunStoreDeps,
 } from "../run-store.ts";
-import { allowsReadyToDeploy } from "../trusted-surface.ts";
+import { allowsReadyToDeploy, normalizeFullSha } from "../trusted-surface.ts";
+import { isTrustedSurfaceSentinelSha } from "../trusted-surface-candidate.ts";
 import {
   disposeCompareResult,
   parkFailClosedRepositoryControlDrift,
@@ -43,6 +45,7 @@ export interface FinalizeDeps {
   safeRemoveDeps?: SafeRemoveDeps;
   getIssueDetail?: typeof getIssueDetail;
   getPrForIssue?: typeof getPrForIssue;
+  getPrDetail?: typeof getPrDetail;
   addLabelToPr?: typeof addLabelToPr;
   postComment?: typeof postComment;
   postPrComment?: typeof postPrComment;
@@ -175,8 +178,10 @@ export async function finalize(
   // durable decision. Missing decision is not treated as historical passthrough
   // on the ready-to-deploy path — only external/historical consumers may opt
   // into `allowsReadyToDeploy(null, { enforcement: "historical" })`.
+  const decision = runDir
+    ? await readTrustedSurfaceDecision(runDir, storeDeps)
+    : null;
   if (runDir) {
-    const decision = await readTrustedSurfaceDecision(runDir, storeDeps);
     if (!allowsReadyToDeploy(decision)) {
       const reason =
         decision?.reason?.summary ??
@@ -198,6 +203,7 @@ export async function finalize(
 
   const getIssueFn = deps.getIssueDetail ?? getIssueDetail;
   const getPrFn = deps.getPrForIssue ?? getPrForIssue;
+  const getPrDetailFn = deps.getPrDetail ?? getPrDetail;
   const addLabelFn = deps.addLabelToPr ?? addLabelToPr;
   const postCommentFn = deps.postComment ?? postComment;
   const postPrCommentFn = deps.postPrComment ?? postPrComment;
@@ -205,6 +211,38 @@ export async function finalize(
   const prNumber = await getPrFn(cfg, issueNumber);
   const getOnDiskFn = deps.getOnDiskForIssue ?? getOnDiskForIssue;
   const safeRemoveFn = deps.removeManagedWorktreeSafely ?? removeManagedWorktreeSafely;
+
+  // Bind the ready-to-deploy tag to the SHA trusted-surface checked. Re-fetch
+  // immediately before the happy path so a push after the earlier getPrDetail
+  // cannot land ready-to-deploy on a new, unverified head (#1243).
+  if (runDir && prNumber) {
+    const expectedSha = normalizeFullSha(decision?.candidate_sha);
+    if (!expectedSha || isTrustedSurfaceSentinelSha(expectedSha)) {
+      const reason =
+        "stale_pr_head: trusted-surface candidate SHA is missing or sentinel; refusing ready-to-deploy tag";
+      console.log(`[pipeline] #${issueNumber}: ready-to-deploy refused — ${reason}`);
+      return {
+        advanced: false,
+        status: "blocked",
+        reason,
+        blockerKind: "needs-human",
+      };
+    }
+    const live = await getPrDetailFn(cfg, prNumber).catch(() => null);
+    const liveSha = normalizeFullSha(live?.head_sha);
+    if (!liveSha || liveSha !== expectedSha) {
+      const reason =
+        `stale_pr_head: linked PR #${prNumber} head ` +
+        `${liveSha ?? "unresolved"} does not match trusted-surface candidate ${expectedSha}`;
+      console.log(`[pipeline] #${issueNumber}: ready-to-deploy refused — ${reason}`);
+      return {
+        advanced: false,
+        status: "blocked",
+        reason,
+        blockerKind: "needs-human",
+      };
+    }
+  }
 
   // Idempotency: only post if no existing summary.
   const alreadyPosted = detail.comments.some((c) => c.body.startsWith(FINAL_SUMMARY_MARKER));
@@ -237,7 +275,8 @@ export async function finalize(
   }
 
   // Mirror the terminal label onto the linked PR. gh pr edit --add-label is
-  // idempotent, so re-running finalize is a no-op on the second pass.
+  // idempotent, so re-running finalize is a no-op on the second pass. The SHA
+  // check above already required the live head to match the trusted-surface pin.
   if (prNumber) {
     try {
       await addLabelFn(cfg, prNumber, `${LABEL_PREFIX}ready-to-deploy`);

@@ -107,6 +107,34 @@ export function selectDurableLastAdvancedPin(
 }
 
 /**
+ * Last SHA recorded on a successful (`advanced`) pre-merge `stage_complete`
+ * event. Newest matching event in `events` wins. Skips sentinels and
+ * malformed values. Null when none remain.
+ */
+export function extractPreMergeCandidateShaFromEvents(
+  events: readonly {
+    type?: string;
+    stage?: string;
+    outcome?: string;
+    commits?: readonly string[];
+  }[],
+): string | null {
+  let found: string | null = null;
+  for (const ev of events) {
+    if (ev.type !== "stage_complete" || ev.stage !== "pre-merge") continue;
+    if (ev.outcome !== "advanced") continue;
+    for (const raw of ev.commits ?? []) {
+      const sha = normalizeFullSha(raw);
+      if (sha && !isTrustedSurfaceSentinelSha(sha)) {
+        found = sha;
+        break;
+      }
+    }
+  }
+  return found;
+}
+
+/**
  * Late-stage SHA fallback applies at or after `pre-merge` (inclusive),
  * including ready-to-deploy. Early stages still require a managed worktree.
  * `needs-human` / `backlog` are not this fallback.
