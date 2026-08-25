@@ -36,7 +36,7 @@ import {
   evaluateProductionPinPathCheck,
   hasProductionPinPathOverride,
   installReceiptPath,
-  isFactoryControlRepo,
+  isFactoryControlCheckout,
   PRODUCTION_ENGINE_PIN_REL,
   PRODUCTION_PIN_ENV,
   productionPinPath,
@@ -130,6 +130,12 @@ export interface DoctorDeps {
   /** Permanently discard a lock file claimed via `claimStaleLockFile` (the
    *  claimed content was confirmed stale). */
   discardClaimedLockFile(claimPath: string): Promise<void>;
+  /**
+   * Env for checkout-role factory-control identity. Defaults to `process.env`.
+   * Unit tests inject `{}` so host `REPO_DIR` / `AGENT_PIPELINE_FACTORY_CONTROL`
+   * cannot activate pinned two-track policy.
+   */
+  env?: NodeJS.ProcessEnv;
 }
 
 export type CheckStatus = "pass" | "fail" | "skip" | "warn";
@@ -726,9 +732,14 @@ export function buildPreflightChecks(
     run: async (deps) => {
       // CLI --engine-track is threaded via config.engine_track when doctor is
       // invoked from pipeline.ts (resolveConfig merges CLI/config). Default
-      // pinned intent applies only for factory control context; ordinary
-      // product-repo doctor does not require a production pin.
-      const factoryControlContext = isFactoryControlRepo(config.repo);
+      // pinned intent applies only for checkout-role factory control (live
+      // REPO_DIR / AGENT_PIPELINE_FACTORY_CONTROL); ordinary product-repo
+      // doctor and non-control clones of this GitHub repo do not require a pin.
+      const env = deps.env ?? process.env;
+      const factoryControlContext = isFactoryControlCheckout({
+        repoDir: config.repo_dir,
+        env,
+      });
       const intent = resolveEngineTrackIntent({
         command: "doctor",
         configTrack: config.engine_track ?? null,
@@ -741,6 +752,7 @@ export function buildPreflightChecks(
         targetRepoDir: config.repo_dir,
         targetIsFactoryControl: factoryControlContext,
         allowTargetFallback: intent === null,
+        env,
       });
       const hasPinOverride = hasProductionPinPathOverride(pinPathOverride);
       if (intent === "pinned" && !pinAuthority.ok && !hasPinOverride) {
@@ -794,7 +806,11 @@ export function buildPreflightChecks(
     description:
       "Factory effective pin and control-checkout pin agree on version and git_sha",
     run: async (deps) => {
-      const factoryControlContext = isFactoryControlRepo(config.repo);
+      const env = deps.env ?? process.env;
+      const factoryControlContext = isFactoryControlCheckout({
+        repoDir: config.repo_dir,
+        env,
+      });
       const overrideRaw = config.production_engine_pin_path ?? null;
       const overridePinPath =
         typeof overrideRaw === "string" && overrideRaw.trim()

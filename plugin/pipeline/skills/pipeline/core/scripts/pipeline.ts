@@ -247,7 +247,7 @@ import {
   type RoadmapDeclaredEdge,
   type WorkListDependencyDiscoverDeps,
 } from "./loop/work-list-deps.ts";
-import { isFactoryControlRepo } from "./production-engine-pin.ts";
+import { isFactoryControlCheckout } from "./production-engine-pin.ts";
 import { LOOP_CONTRACT_SCHEMA, LOOP_LEDGER_SCHEMA, type LoopEngineName, type LoopLedger } from "./loop/types.ts";
 import {
   formatLoopRunHandoff,
@@ -1116,7 +1116,7 @@ export function compileWorkListRun(
  * re-discover overwrite). Run id remains {@link workListRunId} of the issue
  * list only (deps do not change run identity).
  *
- * Multi-item packs and factory-owned runs (factory control repo) refuse
+ * Multi-item packs and factory-owned runs (live factory control checkout) refuse
  * admission with {@link IncompleteDependencyDiscoveryError} when any enabled
  * authoritative source is unavailable or incomplete — no contract/ledger is
  * produced (#905). Successful compiles attach additive `dependency_discovery`
@@ -1129,7 +1129,7 @@ export async function compileWorkListRunFresh(
   runId: string,
   discoverDeps: WorkListDependencyDiscoverDeps = realWorkListDependencyDiscoverDeps(cfg),
   sourceSelector?: LoopSelector,
-  opts?: { forceRefuseIncomplete?: boolean },
+  opts?: { forceRefuseIncomplete?: boolean; env?: NodeJS.ProcessEnv },
 ): Promise<{
   contract: import("./loop/recovery.ts").LoopContractInit;
   ledger: LoopLedger;
@@ -1137,10 +1137,15 @@ export async function compileWorkListRunFresh(
 }> {
   const discovery = await discoverDeclaredDependencies(issues, discoverDeps);
   // Factory-owned fresh admission always refuses incomplete discovery, even
-  // for a single-item pack (spec: multi-item OR factory-owned). Callers may
-  // also force refuse via opts for non-factory exploratory paths.
+  // for a single-item pack (spec: multi-item OR factory-owned). Factory plane
+  // is checkout-role, not GitHub owner/name (#1237). Callers may also force
+  // refuse via opts for non-factory exploratory paths.
   const forceRefuseIncomplete =
-    opts?.forceRefuseIncomplete === true || isFactoryControlRepo(cfg.repo);
+    opts?.forceRefuseIncomplete === true ||
+    isFactoryControlCheckout({
+      repoDir: cfg.repo_dir,
+      env: opts?.env ?? process.env,
+    });
   assertDiscoveryCompleteForAdmission(issues, discovery, {
     forceRefuse: forceRefuseIncomplete,
   });
@@ -5595,25 +5600,22 @@ async function main(): Promise<void> {
       initProductionPin,
       rollbackProductionPin,
       resolveFactoryPinAuthority,
-      isFactoryControlPackageMeta,
+      resolveFactoryControlRoot,
       PRODUCTION_ENGINE_PIN_REL,
     } = await import("./production-engine-pin.ts");
     try {
-      // Identify self-dogfood without network: package.json repository field.
-      let targetIsFactoryControl = false;
-      try {
-        const pkgRaw = await fsPromises.readFile(
-          path.join(invocationRepoDir, "package.json"),
-          "utf8",
-        );
-        const pkg = JSON.parse(pkgRaw) as { name?: unknown; repository?: unknown };
-        targetIsFactoryControl = isFactoryControlPackageMeta(pkg);
-      } catch {
-        targetIsFactoryControl = false;
-      }
+      // Self-dogfood is checkout-role (live REPO_DIR / FACTORY_CONTROL), not
+      // package.json GitHub owner/name. A developer clone of this repo must
+      // not gain pin-write authority from repository identity (#1237).
+      // Pass the control *root* so a managed worktree of REPO_DIR writes
+      // $REPO_DIR/.agent-pipeline/production-engine-pin.json, not the worktree.
+      const factoryControlRoot = resolveFactoryControlRoot({
+        repoDir: invocationRepoDir,
+      });
       const authority = resolveFactoryPinAuthority({
         invocationRepoDir,
-        targetIsFactoryControl,
+        targetIsFactoryControl: factoryControlRoot !== null,
+        factoryControlDir: factoryControlRoot,
       });
       if (!authority.ok) {
         console.error(

@@ -142,6 +142,7 @@ function makeConfig(overrides: Partial<PipelineConfig> = {}): PipelineConfig {
 }
 
 interface FakeOverrides {
+  env?: NodeJS.ProcessEnv;
   execCheck?: (file: string, args: string[]) => boolean;
   exec?: (file: string, args: string[]) => ExecResult;
   fsExists?: (p: string) => boolean;
@@ -279,7 +280,14 @@ function fakeDeps(o: FakeOverrides = {}): DoctorDeps {
     discardClaimedLockFile: async (claimPath) => {
       o.discardClaimedLockFile?.(claimPath);
     },
+    // Hermetic default: empty env so host REPO_DIR cannot pin a clone.
+    env: o.env ?? {},
   };
+}
+
+/** Checkout-role factory-control env matching makeConfig().repo_dir. */
+function factoryCheckoutEnv(repoDir = "/repo"): NodeJS.ProcessEnv {
+  return { REPO_DIR: repoDir };
 }
 
 function getCheck(config: PipelineConfig, id: string, version = FAKE_VERSION): PreflightCheck {
@@ -1370,6 +1378,7 @@ function engineTrackDeps(
   receiptVersion: string | null = "1.29.1",
 ): DoctorDeps {
   return fakeDeps({
+    env: o.env,
     ...o,
     readTextFile: (p) => {
       if (p.endsWith("production-engine-pin.json")) return pinText;
@@ -1383,7 +1392,7 @@ function engineTrackDeps(
 }
 
 test("check install:engine-track — pin match + receipt under pinned intent → pass", async () => {
-  // Self-dogfood factory control: target is valid pin authority.
+  // Live control checkout: checkout-role identity is pin authority.
   const r = await getCheck(
     makeConfig({
       repo: "accidental-hedge-fund/agent-pipeline",
@@ -1391,7 +1400,7 @@ test("check install:engine-track — pin match + receipt under pinned intent →
     }),
     "install:engine-track",
     "1.29.1",
-  ).run(engineTrackDeps(pinJson("1.29.1"), {}, "1.29.1"));
+  ).run(engineTrackDeps(pinJson("1.29.1"), { env: factoryCheckoutEnv() }, "1.29.1"));
   assert.equal(r.status, "pass");
   assert.match(r.detail, /pinned/);
   assert.match(r.detail, /1\.29\.1/);
@@ -1405,7 +1414,7 @@ test("check install:engine-track — pin version match without receipt → fail"
     }),
     "install:engine-track",
     "1.29.1",
-  ).run(engineTrackDeps(pinJson("1.29.1"), {}, null));
+  ).run(engineTrackDeps(pinJson("1.29.1"), { env: factoryCheckoutEnv() }, null));
   assert.equal(r.status, "fail");
   assert.match(r.detail, /provenance|receipt|tag-install|unverified/i);
   assert.ok(r.remediation && /reinstall|candidate/i.test(r.remediation));
@@ -1419,7 +1428,7 @@ test("check install:engine-track — pin mismatch under production intent → fa
     }),
     "install:engine-track",
     "1.30.0",
-  ).run(engineTrackDeps(pinJson("1.29.1"), {}, "1.30.0"));
+  ).run(engineTrackDeps(pinJson("1.29.1"), { env: factoryCheckoutEnv() }, "1.30.0"));
   assert.equal(r.status, "fail");
   assert.match(r.detail, /1\.29\.1/);
   assert.match(r.detail, /1\.30\.0/);
@@ -1434,7 +1443,7 @@ test("check install:engine-track — missing pin under pinned intent → fail wi
     }),
     "install:engine-track",
     "1.0.0",
-  ).run(engineTrackDeps(null, {}, "1.0.0"));
+  ).run(engineTrackDeps(null, { env: factoryCheckoutEnv() }, "1.0.0"));
   assert.equal(r.status, "fail");
   assert.match(r.remediation!, /factory-pin init/);
 });
@@ -1533,13 +1542,73 @@ test("check install:engine-track — non-factory host with no pin → pass (poli
   assert.match(r.detail, /inactive|non-factory/i);
 });
 
-test("check install:engine-track — factory control repo defaults to pinned enforcement", async () => {
+test("check install:engine-track — GitHub-name clone does not default to pinned (#1237)", async () => {
   const cfg = makeConfig({ repo: "accidental-hedge-fund/agent-pipeline" });
   const r = await getCheck(cfg, "install:engine-track", "1.0.0").run(
-    engineTrackDeps(null, {}, "1.0.0"),
+    engineTrackDeps(null, { env: {} }, "1.0.0"),
+  );
+  assert.equal(r.status, "pass");
+  assert.match(r.detail, /inactive|non-factory/i);
+});
+
+test("check install:engine-track — live control checkout defaults to pinned enforcement (#1237)", async () => {
+  const cfg = makeConfig({
+    repo: "accidental-hedge-fund/agent-pipeline",
+    repo_dir: "/repo",
+  });
+  const r = await getCheck(cfg, "install:engine-track", "1.0.0").run(
+    engineTrackDeps(null, { env: factoryCheckoutEnv("/repo") }, "1.0.0"),
   );
   assert.equal(r.status, "fail");
   assert.match(r.remediation!, /factory-pin init/);
+});
+
+test("check install:engine-track — non-control clone leftover no-frg-1.39.1 passes (#1237)", async () => {
+  const leftover = JSON.stringify({
+    schema_version: 1,
+    version: "1.39.1",
+    tag: "v1.39.1",
+    git_sha: null,
+    git_sha_source: "unknown",
+    frg_run_id: "no-frg-1.39.1",
+    frg_evidence_path: null,
+    promoted_at: "2026-08-15T00:00:00Z",
+    previous: null,
+  });
+  const r = await getCheck(
+    makeConfig({
+      repo: "accidental-hedge-fund/agent-pipeline",
+      repo_dir: "/home/dev/agent-pipeline",
+    }),
+    "install:engine-track",
+    "1.39.1",
+  ).run(engineTrackDeps(leftover, { env: {} }, "1.39.1"));
+  assert.equal(r.status, "pass");
+  assert.notEqual(r.status, "fail");
+});
+
+test("check install:engine-track — live control checkout fails leftover no-frg-1.39.1 (#1237)", async () => {
+  const leftover = JSON.stringify({
+    schema_version: 1,
+    version: "1.39.1",
+    tag: "v1.39.1",
+    git_sha: null,
+    git_sha_source: "unknown",
+    frg_run_id: "no-frg-1.39.1",
+    frg_evidence_path: null,
+    promoted_at: "2026-08-15T00:00:00Z",
+    previous: null,
+  });
+  const r = await getCheck(
+    makeConfig({
+      repo: "accidental-hedge-fund/agent-pipeline",
+      repo_dir: "/repo",
+    }),
+    "install:engine-track",
+    "1.39.1",
+  ).run(engineTrackDeps(leftover, { env: factoryCheckoutEnv("/repo") }, "1.39.1"));
+  assert.equal(r.status, "fail");
+  assert.match(r.detail, /no-frg-1\.39\.1/);
 });
 
 test("check install:engine-track — candidate intent with mismatch does not fail for mismatch alone", async () => {
@@ -1597,6 +1666,7 @@ test("check install:production-pin-path — env 1.39.6 vs control 1.39.7 → fai
       splitPinDeps(
         pinJson("1.39.6", "a".repeat(40)),
         pinJson("1.39.7", "e206cfdabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        { env: factoryCheckoutEnv("/repo") },
       ),
     );
     assert.equal(r.status, "fail");
@@ -1616,7 +1686,11 @@ test("check install:production-pin-path — git_sha disagree at same version →
     const r = await getCheck(
       makeConfig({ repo: FACTORY_REPO, repo_dir: "/repo" }),
       "install:production-pin-path",
-    ).run(splitPinDeps(pinJson("1.39.7", "a".repeat(40)), pinJson("1.39.7", "b".repeat(40))));
+    ).run(
+      splitPinDeps(pinJson("1.39.7", "a".repeat(40)), pinJson("1.39.7", "b".repeat(40)), {
+        env: factoryCheckoutEnv("/repo"),
+      }),
+    );
     assert.equal(r.status, "fail");
   });
 });
@@ -1628,7 +1702,11 @@ test("check install:production-pin-path — matching identity does not fail (#11
     const r = await getCheck(
       makeConfig({ repo: FACTORY_REPO, repo_dir: "/repo" }),
       "install:production-pin-path",
-    ).run(splitPinDeps(pinJson("1.39.7", sha), pinJson("1.39.7", sha)));
+    ).run(
+      splitPinDeps(pinJson("1.39.7", sha), pinJson("1.39.7", sha), {
+        env: factoryCheckoutEnv("/repo"),
+      }),
+    );
     assert.notEqual(r.status, "fail");
     assert.equal(r.status, "pass");
   });
@@ -1639,7 +1717,11 @@ test("check install:production-pin-path — unset env skips split-pin fail (#118
     const r = await getCheck(
       makeConfig({ repo: FACTORY_REPO, repo_dir: "/repo" }),
       "install:production-pin-path",
-    ).run(splitPinDeps(pinJson("1.39.6", "a".repeat(40)), pinJson("1.39.7", "b".repeat(40))));
+    ).run(
+      splitPinDeps(pinJson("1.39.6", "a".repeat(40)), pinJson("1.39.7", "b".repeat(40)), {
+        env: factoryCheckoutEnv("/repo"),
+      }),
+    );
     assert.notEqual(r.status, "fail");
     assert.equal(r.status, "skip");
   });
@@ -1651,7 +1733,11 @@ test("check install:production-pin-path — same path skips split-pin fail (#118
     const r = await getCheck(
       makeConfig({ repo: FACTORY_REPO, repo_dir: "/repo" }),
       "install:production-pin-path",
-    ).run(splitPinDeps(pinJson("1.39.6"), pinJson("1.39.7")));
+    ).run(
+      splitPinDeps(pinJson("1.39.6"), pinJson("1.39.7"), {
+        env: factoryCheckoutEnv("/repo"),
+      }),
+    );
     assert.notEqual(r.status, "fail");
     assert.equal(r.status, "skip");
   });
@@ -1662,6 +1748,22 @@ test("check install:production-pin-path — non-factory skips (#1183)", async ()
     process.env[PRODUCTION_PIN_ENV] = HERMES_PIN_PATH;
     const r = await getCheck(makeConfig({ repo_dir: "/repo" }), "install:production-pin-path").run(
       splitPinDeps(pinJson("1.39.6", "a".repeat(40)), pinJson("1.39.7", "b".repeat(40))),
+    );
+    assert.equal(r.status, "skip");
+    assert.notEqual(r.status, "fail");
+  });
+});
+
+test("check install:production-pin-path — GitHub-name clone skips (#1237)", async () => {
+  await withoutHostPinAuthorityEnv(async () => {
+    process.env[PRODUCTION_PIN_ENV] = HERMES_PIN_PATH;
+    const r = await getCheck(
+      makeConfig({ repo: FACTORY_REPO, repo_dir: "/home/dev/agent-pipeline" }),
+      "install:production-pin-path",
+    ).run(
+      splitPinDeps(pinJson("1.39.6", "a".repeat(40)), pinJson("1.39.7", "b".repeat(40)), {
+        env: {},
+      }),
     );
     assert.equal(r.status, "skip");
     assert.notEqual(r.status, "fail");
@@ -1681,6 +1783,7 @@ test("check install:production-pin-path — config override vs control, unset en
       splitPinDeps(
         pinJson("1.39.6", "a".repeat(40)),
         pinJson("1.39.7", "e206cfdabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        { env: factoryCheckoutEnv("/repo") },
       ),
     );
     assert.equal(r.status, "fail");
@@ -1708,6 +1811,7 @@ test("check install:production-pin-path — config override wins over env set to
       splitPinDeps(
         pinJson("1.39.6", "a".repeat(40)),
         pinJson("1.39.7", "e206cfdabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        { env: factoryCheckoutEnv("/repo") },
       ),
     );
     assert.equal(r.status, "fail");

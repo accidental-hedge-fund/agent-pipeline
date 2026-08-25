@@ -98,7 +98,7 @@ import {
   enforcePinnedTrackPolicy,
   hasProductionPinPathOverride,
   installReceiptPath,
-  isFactoryControlRepo,
+  isFactoryControlCheckout,
   PRODUCTION_ENGINE_PIN_REL,
   resolveEngineTrackIntent,
   resolveInstallProvenance,
@@ -579,6 +579,11 @@ export interface AdvanceDeps {
   postComment?: typeof postComment;
   postPrComment?: typeof postPrComment;
   dispatch?: typeof dispatch;
+  /**
+   * Env for checkout-role factory-control identity. Defaults to `process.env`.
+   * Unit tests inject a hermetic env so host `REPO_DIR` cannot pin a clone.
+   */
+  env?: NodeJS.ProcessEnv;
 }
 
 /**
@@ -1046,13 +1051,19 @@ export async function runAdvance(
       // #762 two-track: resolve intent + pin before first init so evidence
       // captures track once and pinned intent can refuse a mislabeled run.
       // Policy is factory-scoped: ordinary non-factory advances (product
-      // repos without explicit --engine-track / engine_track) leave intent
-      // inactive and do not require a production pin. Factory control
-      // defaults to pinned and fail-closes on missing/invalid pin, version
-      // mismatch, or unverified install provenance. Pin authority is the
-      // factory control checkout (or explicit pin path), not every target
-      // product repoDir. Candidate intent never claims pin git_sha.
-      const factoryControlContext = isFactoryControlRepo(cfg.repo);
+      // repos without explicit --engine-track / engine_track, and non-control
+      // clones of this GitHub repo) leave intent inactive and do not require
+      // a production pin. Live factory control checkout defaults to pinned
+      // and fail-closes on missing/invalid pin, version mismatch, or
+      // unverified install provenance. Pin authority is the factory control
+      // checkout (or explicit pin path), not every target product repoDir.
+      // Candidate intent never claims pin git_sha. GitHub owner/name is not
+      // factory-control identity (#1237).
+      const env = deps.env ?? process.env;
+      const factoryControlContext = isFactoryControlCheckout({
+        repoDir: cfg.repo_dir,
+        env,
+      });
       const trackIntent: ResolvedEngineTrackIntent = resolveEngineTrackIntent({
         command: "advance",
         cliTrack: opts.engineTrack ?? null,
@@ -1068,6 +1079,7 @@ export async function runAdvance(
         targetIsFactoryControl: factoryControlContext,
         // Active two-track intent: product targets are not pin authority.
         allowTargetFallback: trackIntent === null,
+        env,
       });
       const hasPinOverride = hasProductionPinPathOverride(pinPathOverride);
       let trackForEvidence: "pinned" | "candidate" | undefined;

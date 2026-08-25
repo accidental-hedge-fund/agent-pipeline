@@ -631,14 +631,25 @@ export function classifyEngineTrack(input: ClassifyEngineTrackInput): ClassifyEn
 // ---------------------------------------------------------------------------
 
 /**
- * Canonical factory control repository (owner/name). Two-track pin policy
- * defaults apply only here (or when CLI/config explicitly set a track).
- * Downstream product repos that install the skill must not require a pin.
+ * GitHub owner/name of this engine's origin repository.
+ * Not factory-control identity. Two-track pin policy and factory-pin
+ * self-dogfood use {@link isFactoryControlCheckout} (live `REPO_DIR` /
+ * `AGENT_PIPELINE_FACTORY_CONTROL`, or a managed worktree of that root).
  */
 export const FACTORY_CONTROL_REPO = "accidental-hedge-fund/agent-pipeline";
 
 /** Env override for the factory control checkout root used as pin authority. */
 export const FACTORY_CONTROL_DIR_ENV = "AGENT_PIPELINE_FACTORY_CONTROL";
+
+/**
+ * Factory-plane live control checkout env (Tugboat / ship composer `REPO_DIR`).
+ * A positive identity signal only when it resolves to this checkout (or a
+ * managed worktree of that root). Unset `REPO_DIR` is not factory-control.
+ */
+export const FACTORY_PLANE_REPO_DIR_ENV = "REPO_DIR";
+
+/** Default managed-worktree directory name under a checkout. */
+export const DEFAULT_MANAGED_WORKTREE_ROOT = ".worktrees";
 
 export type TrackCommandFamily =
   | "factory-gate"
@@ -647,11 +658,97 @@ export type TrackCommandFamily =
   | "single"
   | "advance"
   | "doctor"
+  | "train"
   | "other";
 
 /**
- * True when `repo` is the factory control repository that owns the production
- * pin. Ordinary product-repo consumers of the skill are not factory control.
+ * True when `candidateDir` is `controlRoot` or a managed worktree of that
+ * root (`<controlRoot>/.worktrees/<slug>`). Pure path comparison; no I/O.
+ */
+export function isSameOrManagedWorktreeOf(
+  candidateDir: string,
+  controlRoot: string,
+  worktreeRootRel: string = DEFAULT_MANAGED_WORKTREE_ROOT,
+): boolean {
+  const candidate = path.resolve(candidateDir);
+  const control = path.resolve(controlRoot);
+  if (candidate === control) return true;
+  const rel = worktreeRootRel.trim() || DEFAULT_MANAGED_WORKTREE_ROOT;
+  const wtRoot = path.resolve(control, rel);
+  if (candidate === wtRoot) return true;
+  const prefix = wtRoot.endsWith(path.sep) ? wtRoot : wtRoot + path.sep;
+  return candidate.startsWith(prefix);
+}
+
+function firstNonEmptyEnv(env: NodeJS.ProcessEnv, key: string): string | null {
+  const raw = env[key];
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+/**
+ * Live factory-control authority root for this checkout, or null.
+ *
+ * Returns the matching signal directory (`AGENT_PIPELINE_FACTORY_CONTROL`,
+ * `factoryControlDir`, or factory-plane `REPO_DIR`) when `repoDir` is that
+ * directory or a managed worktree of it. The return value is always the
+ * control root, never the nested worktree path.
+ *
+ * Never sufficient: GitHub owner/name, `package.json` `repository`, leftover
+ * `.agent-pipeline/production-engine-pin.json`, Hermes-state pin, or path-name
+ * heuristics (`ap-main-control`, `*factory-control*`).
+ */
+export function resolveFactoryControlRoot(opts: {
+  repoDir: string;
+  env?: NodeJS.ProcessEnv;
+  factoryControlDir?: string | null;
+  worktreeRoot?: string;
+}): string | null {
+  const env = opts.env ?? process.env;
+  const repoDir = typeof opts.repoDir === "string" ? opts.repoDir.trim() : "";
+  if (!repoDir) return null;
+  const worktreeRoot = opts.worktreeRoot?.trim() || DEFAULT_MANAGED_WORKTREE_ROOT;
+
+  const signals: string[] = [];
+  const fromArg =
+    typeof opts.factoryControlDir === "string" ? opts.factoryControlDir.trim() : "";
+  if (fromArg) signals.push(fromArg);
+  const fromFactoryEnv = firstNonEmptyEnv(env, FACTORY_CONTROL_DIR_ENV);
+  if (fromFactoryEnv) signals.push(fromFactoryEnv);
+  const fromRepoDir = firstNonEmptyEnv(env, FACTORY_PLANE_REPO_DIR_ENV);
+  if (fromRepoDir) signals.push(fromRepoDir);
+
+  for (const signal of signals) {
+    if (isSameOrManagedWorktreeOf(repoDir, signal, worktreeRoot)) {
+      return path.resolve(signal);
+    }
+  }
+  return null;
+}
+
+/**
+ * Checkout-role factory-control identity for two-track pin policy.
+ *
+ * True when {@link resolveFactoryControlRoot} returns a root: `repoDir` is the
+ * live factory control checkout identified by `AGENT_PIPELINE_FACTORY_CONTROL`
+ * or factory-plane `REPO_DIR` (that directory, or a managed worktree of that
+ * directory). Optional `factoryControlDir` is the same signal as the
+ * factory-control env.
+ */
+export function isFactoryControlCheckout(opts: {
+  repoDir: string;
+  env?: NodeJS.ProcessEnv;
+  factoryControlDir?: string | null;
+  worktreeRoot?: string;
+}): boolean {
+  return resolveFactoryControlRoot(opts) !== null;
+}
+
+/**
+ * True when `repo` matches this engine's GitHub origin owner/name.
+ * Not factory-control identity for two-track pin policy or factory-pin
+ * self-dogfood. Use {@link isFactoryControlCheckout}.
  */
 export function isFactoryControlRepo(repo: string | null | undefined): boolean {
   if (typeof repo !== "string") return false;
@@ -694,9 +791,9 @@ export function ownerRepoFromPackageRepository(
 }
 
 /**
- * True when package.json metadata identifies the factory control repository.
- * Checks `repository` owner/name only — package `name` alone is not sufficient
- * (forks or unrelated packages may share a short name).
+ * True when package.json `repository` names this engine's GitHub origin.
+ * Not factory-control identity and not factory-pin self-dogfood. Use
+ * {@link isFactoryControlCheckout}. Package `name` alone is not sufficient.
  */
 export function isFactoryControlPackageMeta(pkg: {
   name?: unknown;
@@ -718,6 +815,7 @@ export type FactoryPinAuthorityResult =
         | "pin-path-override"
         | "factory-control-env"
         | "factory-control-arg"
+        | "factory-plane-repo-dir"
         | "self-dogfood";
     }
   | {
@@ -734,6 +832,8 @@ export type FactoryPinAuthorityResult =
  * Product repositories are refused by default. Authority requires one of:
  * - explicit pin path (`pinPathOverride` / `AGENT_PIPELINE_PRODUCTION_PIN`)
  * - factory control dir (`factoryControlDir` / `AGENT_PIPELINE_FACTORY_CONTROL`)
+ * - factory-plane `REPO_DIR` when the invocation is that checkout or a
+ *   managed worktree of it (authority root is `REPO_DIR`, not the worktree)
  * - self-dogfood (`targetIsFactoryControl` on the invocation checkout)
  *
  * When a pin-path override is set without factory-control dir, `repoDir` stays
@@ -742,7 +842,7 @@ export type FactoryPinAuthorityResult =
  */
 export function resolveFactoryPinAuthority(opts: {
   invocationRepoDir: string;
-  /** True when invocation checkout is the factory control repository. */
+  /** True when invocation checkout is the live factory control checkout. */
   targetIsFactoryControl?: boolean;
   factoryControlDir?: string | null;
   pinPathOverride?: string | null;
@@ -770,6 +870,18 @@ export function resolveFactoryPinAuthority(opts: {
       source: "factory-control-arg",
     };
   }
+  const fromPlaneRepoDir = firstNonEmptyEnv(env, FACTORY_PLANE_REPO_DIR_ENV);
+  if (
+    fromPlaneRepoDir &&
+    isSameOrManagedWorktreeOf(opts.invocationRepoDir, fromPlaneRepoDir)
+  ) {
+    return {
+      ok: true,
+      repoDir: path.resolve(fromPlaneRepoDir),
+      pinPathOverride: pinOverride,
+      source: "factory-plane-repo-dir",
+    };
+  }
   if (pinOverride) {
     // Explicit pin file authority without a control dir: allow the pin path,
     // keep FRG lookups relative to the invocation dir (operator responsibility).
@@ -795,10 +907,12 @@ export function resolveFactoryPinAuthority(opts: {
       `factory-pin refuses to use ${opts.invocationRepoDir} as production pin authority ` +
       `(not the factory control checkout and no pin-authority override)`,
     remediation:
-      `Run factory-pin from the factory control checkout (${FACTORY_CONTROL_REPO}), ` +
+      `Run factory-pin from the live factory control checkout ` +
+      `(${FACTORY_PLANE_REPO_DIR_ENV} / ${FACTORY_CONTROL_DIR_ENV}), ` +
       `or set ${FACTORY_CONTROL_DIR_ENV}=<factory-control-root>, ` +
       `or set ${PRODUCTION_PIN_ENV}=<absolute-pin.json path>. ` +
-      `Do not write a product-local production pin.`,
+      `Do not write a product-local production pin. ` +
+      `GitHub owner/name is not factory-pin authority.`,
   };
 }
 
@@ -828,6 +942,8 @@ export function hasProductionPinPathOverride(
 /**
  * Directory used as production-pin authority (factory control checkout).
  * Precedence: env AGENT_PIPELINE_FACTORY_CONTROL → factoryControlDir arg →
+ * factory-plane REPO_DIR when the target is that checkout or a managed
+ * worktree of it (returns the REPO_DIR root, not the worktree) →
  * targetRepoDir when targetIsFactoryControl or allowTargetFallback.
  * Pin file override (production_engine_pin_path / AGENT_PIPELINE_PRODUCTION_PIN)
  * still wins inside {@link productionPinPath} and does not require this dir.
@@ -841,7 +957,7 @@ export function resolvePinAuthorityDir(opts: {
   targetRepoDir: string;
   factoryControlDir?: string | null;
   env?: NodeJS.ProcessEnv;
-  /** True when target is the factory control repository (self-dogfood). */
+  /** True when target is the live factory control checkout (self-dogfood). */
   targetIsFactoryControl?: boolean;
   /**
    * When false, refuse non-factory target fallback. Use for active two-track
@@ -857,6 +973,13 @@ export function resolvePinAuthorityDir(opts: {
   }
   if (typeof opts.factoryControlDir === "string" && opts.factoryControlDir.trim()) {
     return { ok: true, dir: path.resolve(opts.factoryControlDir.trim()) };
+  }
+  const fromPlaneRepoDir = firstNonEmptyEnv(env, FACTORY_PLANE_REPO_DIR_ENV);
+  if (
+    fromPlaneRepoDir &&
+    isSameOrManagedWorktreeOf(opts.targetRepoDir, fromPlaneRepoDir)
+  ) {
+    return { ok: true, dir: path.resolve(fromPlaneRepoDir) };
   }
   if (opts.targetIsFactoryControl || opts.allowTargetFallback !== false) {
     return { ok: true, dir: opts.targetRepoDir };
@@ -889,9 +1012,10 @@ export type ResolvedEngineTrackIntent = EngineTrackIntent | null;
  * Command defaults:
  * - factory-gate → always candidate (Layer B soak; not overridable to pinned)
  * - evals → candidate
- * - loop / single / advance / doctor / other → **pinned only when factory
- *   control context** (self-dogfood of the control repo); otherwise `null`
- *   so ordinary product-repo advances do not require a production pin.
+ * - loop / single / advance / doctor / train / other → **pinned only when
+ *   factory-control checkout-role context** (live `REPO_DIR` /
+ *   `AGENT_PIPELINE_FACTORY_CONTROL`); otherwise `null` so ordinary
+ *   product-repo advances and non-control clones do not require a production pin.
  */
 export function resolveEngineTrackIntent(opts: {
   command: TrackCommandFamily;
@@ -900,9 +1024,10 @@ export function resolveEngineTrackIntent(opts: {
   /** When true (factory-gate), force candidate regardless of CLI/config. */
   forceCandidate?: boolean;
   /**
-   * True when this invocation is factory control production/dogfood
-   * (typically {@link isFactoryControlRepo} on config.repo). When false/omitted,
-   * ordinary commands default to inactive (`null`) rather than pinned.
+   * True when this invocation is the live factory control checkout
+   * ({@link isFactoryControlCheckout}). When false/omitted, ordinary
+   * commands default to inactive (`null`) rather than pinned. GitHub
+   * owner/name is never this flag.
    */
   factoryControlContext?: boolean;
 }): ResolvedEngineTrackIntent {
@@ -1230,7 +1355,7 @@ export function evaluateEngineTrackCheck(input: {
 // ---------------------------------------------------------------------------
 
 export interface ProductionPinPathCheckInput {
-  /** True when config.repo is the factory control repository. */
+  /** True when the invocation is the live factory control checkout. */
   factoryControlContext: boolean;
   /**
    * Config `production_engine_pin_path`. Wins over env (same order as

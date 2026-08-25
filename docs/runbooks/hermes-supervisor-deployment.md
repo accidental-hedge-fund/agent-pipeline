@@ -94,7 +94,9 @@ systemctl --user is-active hermes-gateway-pipeline-factory.service
 
 `REPO_DIR` must be the **live control checkout** (e.g. `ap-main-control`).
 Tugboat pins `REPO_DIR` at start and **refuses** paths matching `*factory-control*`
-(#1062). Do not point ship at the retired factory-control plane.
+(#1062). Do not point ship at the retired factory-control plane. Factory-control
+identity is this checkout (or a managed worktree of it), not GitHub owner/name.
+Ordinary host skill boot does not require `AGENT_PIPELINE_PRODUCTION_PIN`.
 
 ```bash
 CONTROL="${REPO_DIR:-$HOME/dev/ap-main-control}"

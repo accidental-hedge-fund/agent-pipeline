@@ -47,18 +47,24 @@ A **production-quality** pin after an FRG ship has a real `frg_run_id` (not
 `no-frg-<X.Y.Z>` and `frg_evidence_path` null. That marker is not
 production-quality. `pipeline factory-pin promote` has no skip and stays FRG-only.
 
-On this factory repo, `pipeline doctor` check `install:engine-track` fails when
+On the live factory control checkout (factory-plane `REPO_DIR` /
+`AGENT_PIPELINE_FACTORY_CONTROL`, or a managed worktree of that root — not
+GitHub owner/name), `pipeline doctor` check `install:engine-track` fails when
 the live pin is `no-frg-*` or has null evidence under pinned intent. Remediate
-with a non-skip promote from a real FRG pass.
+with a non-skip promote from a real FRG pass. A non-control clone of
+`accidental-hedge-fund/agent-pipeline` leaves two-track policy inactive; a
+leftover clone pin is not factory law. Host skill boot does not require
+`AGENT_PIPELINE_PRODUCTION_PIN`.
 
 The factory plane has one live pin file:
 `$REPO_DIR/.agent-pipeline/production-engine-pin.json`. Do not default
 `AGENT_PIPELINE_PRODUCTION_PIN` to
-`~/.local/state/hermes-factory/production-engine-pin.json`. `pipeline doctor`
-check `install:production-pin-path` **fails** (not warn) when that env points
+`~/.local/state/hermes-factory/production-engine-pin.json`. That Hermes-state
+file is not live pin authority. `pipeline doctor` check
+`install:production-pin-path` **fails** (not warn) when that env points
 at a different file whose `version` or `git_sha` disagrees with the
-control-checkout pin. v1.40.1 packaging MAY template supervisor env and MUST
-NOT reintroduce a second live pin path.
+control-checkout pin. v1.40.1 packaging MAY template supervisor env and
+MUST NOT reintroduce a second live pin path.
 
 | Action | Command |
 |--------|---------|
