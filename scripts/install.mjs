@@ -744,6 +744,10 @@ function stageInto(stagingDir, host) {
   const materialFilterPath = join(scriptsDst, "material-filter.mjs");
   cpSync(join(REPO_ROOT, "hosts", "_shared", "material-filter.mjs"), materialFilterPath);
   chmodSync(materialFilterPath, 0o755);
+  // Shared Node >=24 resolver loaded by the generated shim (#1236).
+  const enginesNodePath = join(scriptsDst, "ensure-engines-node.mjs");
+  cpSync(join(REPO_ROOT, "scripts", "ensure-engines-node.mjs"), enginesNodePath);
+  chmodSync(enginesNodePath, 0o755);
   // Extra host scripts from install profile (e.g. OpenCode argv-safe bridge #861).
   // Selected by managedArtifacts.extraScriptFiles — not host-name equality.
   for (const extra of cfg.extraScriptFiles || []) {

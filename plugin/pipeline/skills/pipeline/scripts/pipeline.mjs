@@ -3,15 +3,16 @@
 // Do not edit in place — re-run the installer to regenerate.
 //
 // Thin launcher for the shared pipeline core. Responsibilities:
-//   1. Gate on Node >= 24 (the core runs TypeScript directly via native
-//      type-stripping; this shim is plain JS so the gate message works on
-//      any Node version).
-//   2. Provision dependencies on first run (idempotent `npm ci` into core/).
-//   3. Exec the shared core with this host's profile baked in.
+//   1. Answer --version / -V / --version --json on the invoking Node (Node 18–23
+//      introspection; does not load TypeScript).
+//   2. Re-exec onto Node >= 24 for every TypeScript-loading route via the
+//      shared engines-node resolver. Fail closed if none exists.
+//   3. Provision dependencies on first run (idempotent `npm ci` into core/).
+//   4. Exec the shared core with this host's profile baked in.
 import { spawnSync } from "node:child_process";
 import { closeSync, existsSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join, resolve } from "node:path";
 
 const PROFILE = "claude";
@@ -88,18 +89,20 @@ function releaseRunSlot() {
   }
 }
 
-const nodeMajor = Number.parseInt(process.versions.node.split(".")[0], 10);
-if (!Number.isFinite(nodeMajor) || nodeMajor < 24) {
-  console.error(
-    `pipeline: requires Node >= 24 for native TypeScript execution (found ${process.versions.node}).\n` +
-      "         Install Node 24+ (e.g. `nvm install 24 && nvm use 24`) and re-run.",
-  );
-  process.exit(1);
+const here = dirname(fileURLToPath(import.meta.url)); // <skill>/scripts (or hosts/_shared in-repo)
+const scriptPath = fileURLToPath(import.meta.url);
+
+function resolveCoreDir(fromHere) {
+  const installed = resolve(fromHere, "..", "core");
+  if (existsSync(join(installed, "package.json"))) return installed;
+  const repo = resolve(fromHere, "..", "..", "core");
+  if (existsSync(join(repo, "package.json"))) return repo;
+  return installed;
 }
 
-const here = dirname(fileURLToPath(import.meta.url)); // <skill>/scripts
-const coreDir = resolve(here, "..", "core"); // <skill>/core
+const coreDir = resolveCoreDir(here);
 const entry = join(coreDir, "scripts", "pipeline.ts");
+const rawArgs = process.argv.slice(2);
 
 // Report a corrupt install (core/package.json missing or malformed) for the
 // pre-dispatch guard below. `doctor` has machine-output contracts that automated
@@ -140,18 +143,12 @@ function reportCorruptInstall(rawArgs, coreDir) {
   );
 }
 
-if (!existsSync(entry)) {
-  console.error(`pipeline: core not found at ${entry}. Re-run the installer.`);
-  process.exit(1);
-}
-
 // Read core/package.json once upfront.  Two reasons:
 //   (a) --version short-circuit needs it before dependency provisioning.
 //   (b) Node reads core/package.json to determine module type (ESM vs CJS)
 //       *before* executing any code in pipeline.ts, so a malformed file causes
 //       ERR_INVALID_PACKAGE_CONFIG before any try/catch or `doctor` check can
 //       run.  We detect the corrupt-install case here and surface it ourselves.
-const rawArgs = process.argv.slice(2);
 const pkgPath = join(coreDir, "package.json");
 let pkgVersion = "";
 let pkgReadable = true;
@@ -211,11 +208,44 @@ if (rawArgs.includes("--version") || rawArgs.includes("-V")) {
   process.exit(0);
 }
 
+async function reexecOntoEnginesNodeIfNeeded() {
+  const nodeMajor = Number.parseInt(String(process.versions.node).split(".")[0], 10);
+  if (Number.isFinite(nodeMajor) && nodeMajor >= 24) return;
+  const sibling = join(here, "ensure-engines-node.mjs");
+  const fromRepo = join(here, "..", "..", "scripts", "ensure-engines-node.mjs");
+  const resolverPath = existsSync(sibling) ? sibling : existsSync(fromRepo) ? fromRepo : null;
+  if (!resolverPath) {
+    process.stderr.write(
+      `pipeline: cannot load ensure-engines-node.mjs (tried ${sibling} and ${fromRepo}).\n` +
+        "         Reinstall the pipeline skill: npm install -g agent-pipeline\n",
+    );
+    process.exit(1);
+  }
+  const mod = await import(pathToFileURL(resolverPath).href);
+  const result = mod.reexecOntoEnginesNode({ scriptPath, argv: rawArgs });
+  if (result.action === "continue") return;
+  if (result.signal) {
+    try {
+      process.kill(process.pid, result.signal);
+    } catch {
+      // ignore
+    }
+  }
+  process.exit(result.status ?? 1);
+}
+
+await reexecOntoEnginesNodeIfNeeded();
+
 // Guard: malformed or missing core/package.json causes ERR_INVALID_PACKAGE_CONFIG
 // when Node tries to load the TypeScript entry (before any pipeline code runs).
 // Surface a coherent failure here rather than a raw Node startup error.
 if (!pkgReadable) {
   reportCorruptInstall(rawArgs, coreDir);
+  process.exit(1);
+}
+
+if (!existsSync(entry)) {
+  console.error(`pipeline: core not found at ${entry}. Re-run the installer.`);
   process.exit(1);
 }
 

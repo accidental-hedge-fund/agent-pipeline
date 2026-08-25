@@ -333,6 +333,10 @@ function buildInto(root) {
   const materialFilter = join(skillDir, "scripts", "material-filter.mjs");
   cpSync(join(REPO_ROOT, "hosts", "_shared", "material-filter.mjs"), materialFilter);
   chmodSync(materialFilter, 0o755);
+  // Shared Node >=24 resolver loaded by the generated shim (#1236).
+  const enginesNode = join(skillDir, "scripts", "ensure-engines-node.mjs");
+  cpSync(join(REPO_ROOT, "scripts", "ensure-engines-node.mjs"), enginesNode);
+  chmodSync(enginesNode, 0o755);
 
   // Namespaced command files: one `pipeline:<name>.md` per operation (#273).
   // Generated from OPERATION_SURFACE so Claude and Codex stay symmetric.

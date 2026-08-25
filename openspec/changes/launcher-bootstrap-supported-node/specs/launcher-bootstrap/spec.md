@@ -36,9 +36,22 @@ The host shim generated from `hosts/_shared/entry.template.mjs` and `scripts/pip
 - **WHEN** `node scripts/pipeline-launcher.mjs --version`, `-V`, or `--version --json` runs with Node major 18 through 23
 - **THEN** the stdout, exit code, and `requires Node >= 24` absence SHALL match the host-shim cases above
 
+#### Scenario: Mixed argv that includes --version still short-circuits on Node 22
+
+- **WHEN** either launcher runs with argv containing `--version` or `-V` (including `status --version`) and `process.versions.node` `22.23.2`
+- **THEN** the process SHALL print the version contract and exit 0
+- **AND** it SHALL NOT load TypeScript
+- **AND** it SHALL NOT require a Node ≥ 24 binary
+
+#### Scenario: --json without --version or -V is not version introspection
+
+- **WHEN** either launcher runs `path --json` with `process.versions.node` `22.23.2`
+- **THEN** the process SHALL NOT treat the argv as version-only
+- **AND** it SHALL re-exec onto Node ≥ 24 or fail closed
+
 ### Requirement: TypeScript-loading argv SHALL re-exec onto a resolved Node ≥ 24 binary
 
-Every command that loads TypeScript — including `status`, `train`, `path`, and a bare invoke — SHALL resolve a Node binary whose major is ≥ 24 and re-exec onto that binary before loading the TypeScript core. The re-exec SHALL preserve the original argv after the script path. The child environment SHALL put that binary's directory first on `PATH`. Node 18–23 introspection SHALL NOT extend to TypeScript execution.
+Every command that loads TypeScript — including `status`, `train`, `path`, `path --json`, and a bare invoke — SHALL resolve a Node binary whose major is ≥ 24 and re-exec onto that binary before loading the TypeScript core. This SHALL apply to every invoking Node major below 24, including 18 and 20, not only 22. The re-exec SHALL spawn the resolved absolute binary with argv equal to the script path plus the original user args in order. The child environment SHALL prepend that binary's directory to `PATH` and SHALL NOT replace `PATH`. The launcher SHALL propagate the child numeric exit status, re-send a child signal when the child is killed by a signal, and fail closed on spawn failure without loading TypeScript. Node 18–23 introspection SHALL NOT extend to TypeScript execution. TypeScript SHALL NOT load on the parent process.
 
 #### Scenario: status on Node 22 re-execs a fake Node 24 with argv preserved
 
@@ -60,6 +73,26 @@ Every command that loads TypeScript — including `status`, `train`, `path`, and
 - **WHEN** `path` or `path --json` runs with Node major 22 and a resolvable Node ≥ 24 binary
 - **THEN** the launcher SHALL re-exec onto that binary before spawning `path-cli.ts`
 - **AND** it SHALL NOT load TypeScript on the Node 22 process
+
+#### Scenario: path --json re-execs before path-cli.ts
+
+- **WHEN** `path --json` runs with Node major 22 and a resolvable Node ≥ 24 binary
+- **THEN** the launcher SHALL re-exec onto that binary before spawning `path-cli.ts`
+- **AND** the child argv SHALL preserve `path` and `--json` in order
+- **AND** it SHALL NOT load TypeScript on the Node 22 process
+
+#### Scenario: Node 18 and Node 20 TypeScript routes also re-exec or fail closed
+
+- **WHEN** a TypeScript-loading command runs with `process.versions.node` major 18 or 20
+- **AND** a Node ≥ 24 binary is resolvable
+- **THEN** the launcher SHALL re-exec onto that binary before loading TypeScript
+- **AND** if no such binary exists, it SHALL fail closed without loading TypeScript
+
+#### Scenario: Child PATH is prepended, not replaced
+
+- **WHEN** re-exec spawns a resolved Node ≥ 24 binary
+- **THEN** the child `PATH` SHALL start with that binary's directory
+- **AND** the remainder of the parent `PATH` SHALL still be present after that directory
 
 #### Scenario: pipeline-launcher.mjs TypeScript routes match the host shim
 
@@ -92,7 +125,7 @@ Launcher re-exec SHALL call `resolveEnginesNode` / `envPreferringNode` from `scr
 
 ### Requirement: Missing engines-compliant Node SHALL fail closed with a named diagnostic
 
-A TypeScript-loading command SHALL fail closed only when no engines-compliant Node can be resolved. The diagnostic SHALL name the found `process.versions.node`, `/usr/bin/node`, and `AGENT_PIPELINE_NODE`. The diagnostic SHALL NOT tell the operator to `nvm install 24` when a ≥ 24 binary is already on the box.
+A TypeScript-loading command SHALL fail closed only when no engines-compliant Node can be resolved. The diagnostic SHALL be produced by `formatMissingEnginesNodeDiagnostic` in `scripts/ensure-engines-node.mjs` (or an equivalent export from that same module). It SHALL name the found `process.versions.node`, `/usr/bin/node`, and `AGENT_PIPELINE_NODE` without a second probe list in the launchers. The diagnostic SHALL NOT tell the operator to `nvm install 24` when a ≥ 24 binary is already on the box. The launchers SHALL NOT probe `/usr/bin/node` or `AGENT_PIPELINE_NODE` themselves to build this text.
 
 #### Scenario: No ≥ 24 binary names all three sources
 

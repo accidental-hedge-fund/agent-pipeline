@@ -29,3 +29,17 @@ The `--version` and `-V` flags, including `--version --json`, SHALL complete on 
 - **WHEN** `node scripts/pipeline-launcher.mjs --version`, `-V`, or `--version --json` runs with `process.versions.node` `22.23.2`
 - **THEN** the stdout and exit code SHALL match the host-shim cases above
 - **AND** stderr SHALL NOT contain `requires Node >= 24`
+
+#### Scenario: Mixed argv that includes --version still short-circuits
+
+- **WHEN** either launcher runs with argv containing `--version` or `-V` (including `status --version`) and `process.versions.node` `22.23.2`
+- **THEN** the process SHALL print the version contract and exit 0
+- **AND** it SHALL NOT load TypeScript
+- **AND** it SHALL NOT require a Node ≥ 24 binary
+
+#### Scenario: --json without --version or -V is not version introspection
+
+- **WHEN** either launcher runs `path --json` with `process.versions.node` `22.23.2`
+- **THEN** the process SHALL NOT treat the argv as version-only
+- **AND** it SHALL re-exec onto Node ≥ 24 or fail closed
+- **AND** it SHALL NOT print the `core/package.json` version as the sole stdout payload for that invocation
