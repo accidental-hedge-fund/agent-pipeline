@@ -6,7 +6,7 @@
 - [x] Resolve the first design frontier with the operator.
 - [x] Record the agreed host and launcher terms in `CONTEXT.md`.
 - [x] Test the remaining lifecycle and failure-boundary decisions with the operator.
-- [x] Open #1240 for separate cross-host repository-policy enforcement; it is not a #1235 dependency.
+- [x] Open #1240 in milestone v1.39.13 for separate cross-host repository-policy enforcement; it is not a #1235 dependency.
 - [x] Append locked decisions to #1235 and #1236.
 - [x] Review the documentation diff and run `npm run ci` (exit 0).
 
