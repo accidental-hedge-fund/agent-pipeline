@@ -1,5 +1,8 @@
 # Lessons
 
+- A newly filed issue that belongs to the active milestone cannot be left unmilestoned. Assign its release milestone when creating it; do not wait for the operator to correct the omission.
+- When the operator identifies repository `pipeline.yml` as the source of execution policy, do not ask a host-level profile question before establishing whether the configuration explicitly declares the relevant harness roles. Separate a missing-config enforcement change from a host-install change.
+
 - When the operator says finish ship **including FRG**, a `--skip-frg` tag/promote
   is not done. Optional-FRG / `no-frg-*` is not “rip FRG out.” Keep fixing the
   score path until `latest.json` is `pass: true` and promote has no `--skip-frg`,
