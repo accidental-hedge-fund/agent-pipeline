@@ -133,6 +133,15 @@ function readRecord(dir) {
   };
 }
 
+// Child PATH for re-exec fixtures: keep the marker + invoking node dir first,
+// but carry the parent PATH so the fake node's /bin/sh can resolve mkdir etc.
+// A stripped PATH (marker + node dir only) breaks the fake's record write on
+// runners whose node dir lacks shell utilities (CI toolcache, ~/.local/bin).
+function reexecPath(marker = "") {
+  const head = marker ? `${marker}${delimiter}` : "";
+  return `${head}${dirname(process.execPath)}${delimiter}${process.env.PATH ?? ""}`;
+}
+
 function writeCoreStub(root, version = PKG_VERSION) {
   const coreScripts = join(root, "core", "scripts");
   mkdirSync(coreScripts, { recursive: true });
@@ -294,7 +303,7 @@ for (const launcher of LAUNCHERS) {
         const result = runPatched(launcher.path, userArgs, {
           AGENT_PIPELINE_NODE: fake,
           AGENT_PIPELINE_TEST_RECORD: recordDir,
-          PATH: `${pathMarker}${delimiter}${dirname(process.execPath)}`,
+          PATH: reexecPath(pathMarker),
         });
         assert.equal(result.status, 0, `${label} stderr:\n${result.stderr}`);
         assert.equal(
@@ -333,7 +342,7 @@ for (const launcher of LAUNCHERS) {
       const result = runPatched(launcher.path, ["path", "--json"], {
         AGENT_PIPELINE_NODE: fake,
         AGENT_PIPELINE_TEST_RECORD: recordDir,
-        PATH: dirname(process.execPath),
+        PATH: reexecPath(),
       });
       assert.notEqual(result.stdout.trim(), PKG_VERSION);
       const rec = readRecord(recordDir);
@@ -371,7 +380,7 @@ test("installed template with sibling resolver loads it for status", { skip: PAT
     const result = runPatched(dest, ["status"], {
       AGENT_PIPELINE_NODE: fake,
       AGENT_PIPELINE_TEST_RECORD: recordDir,
-      PATH: dirname(process.execPath),
+      PATH: reexecPath(),
     });
     assert.equal(result.status, 0, `installed status stderr:\n${result.stderr}`);
     const rec = readRecord(recordDir);
