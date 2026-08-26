@@ -1,7 +1,7 @@
 # configurable-harness-roles Specification
 
 ## Purpose
-TBD - created by archiving change repo-configurable-harness-roles. Update Purpose after archive.
+Repository-level declaration of the implementer and reviewer harness roles. Execution requires both keys in `.github/pipeline.yml`. Every primary and secondary path uses the resolved pair, with pre-run validation and evidence of the pairing.
 ## Requirements
 ### Requirement: The config schema SHALL accept a strict `harnesses` role block
 

@@ -1,7 +1,7 @@
 # cross-host-profiles Specification
 
 ## Purpose
-The host seam that lets one shared core ship as both `/pipeline` (Claude Code) and `$pipeline` (Codex): a JSON profile per host that fixes the harness roles, the review mode, and host-specific presentation defaults. Roles are harness-relative — the invoking host is always the implementer; the other harness reviews.
+The host seam that lets one shared core ship as both `/pipeline` (Claude Code) and `$pipeline` (Codex): a JSON profile per host that supplies bootstrap and presentation defaults (invocation, review mode, conventions filename, marker footer). Live implementer and reviewer workers come from repository `.github/pipeline.yml`, not from the profile.
 ## Requirements
 ### Requirement: Profiles are named JSON files loaded by name
 
