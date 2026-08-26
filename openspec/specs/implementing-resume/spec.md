@@ -2,10 +2,14 @@
 
 ## Purpose
 TBD - created by archiving change implementing-resume. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: implementing stage is resumable when commits exist in the worktree
 
-When the orchestrator dispatches stage `implementing` at the start of a run (re-entry, not mid-flight), it SHALL first consult the repo-stable live-planning marker for the issue. If a live process owns the marker, the dispatcher SHALL return a `waiting` outcome whose reason names the live concurrent owner. Otherwise it SHALL check whether an existing worktree for the issue has commits ahead of the base branch. If so, it SHALL resume the post-implementation steps — test gate → push → open-or-find PR → transition `implementing → review-1` — without re-planning or re-implementing. If no live process owns the marker AND no worktree with commits exists, the issue is crash-stranded and the dispatcher SHALL restart the planning arc from `ready` (see the crash-stranded recovery requirement) rather than returning `waiting`.
+When the orchestrator dispatches stage `implementing` at the start of a run (re-entry, not mid-flight), it SHALL first consult the repo-stable live-planning marker for the issue. If a live process owns the marker, the dispatcher SHALL return a `waiting` outcome whose reason names the live concurrent owner. Otherwise it SHALL check durable harness mutation ownership for an interrupted incomplete implement attempt (see `harness-mutation-ownership`). When ownership shows owned leftovers or an in-flight implement attempt whose holder is dead, the dispatcher SHALL NOT treat commits ahead of base as sufficient to skip the implementer. It SHALL checkpoint owned leftovers when present. After checkpoint, if unknown product dirt remains, the dispatcher SHALL set the established unknown-dirt block and SHALL NOT re-invoke the implementer or resume post-implementation steps. Otherwise it SHALL either re-invoke the implementer when the deliverable is unsatisfied, or, only when the shared implement-deliverable contract reports satisfied and the worktree is clean of unknown product dirt, resume post-implementation steps.
+
+If no live process owns the marker, no interrupted incomplete implement attempt is current, and an existing worktree for the issue has commits ahead of the base branch, it SHALL resume the post-implementation steps — test gate → push → open-or-find PR → transition `implementing → review-1` — without re-planning or re-implementing. If no live process owns the marker AND no worktree with commits exists AND no interrupted owned leftovers remain to checkpoint, the issue is crash-stranded and the dispatcher SHALL restart the planning arc from `ready` (see the crash-stranded recovery requirement) rather than returning `waiting`.
 
 The liveness check SHALL run before the commits-ahead check so that a live cross-domain implementer is never resume-raced.
 
@@ -14,6 +18,7 @@ The liveness check SHALL run before the commits-ahead check so that a live cross
 - **WHEN** a pipeline run starts with the current stage resolved as `implementing`
 - **AND** no live process owns the repo-stable live-planning marker for the issue
 - **AND** a worktree exists for the issue with at least one commit ahead of `cfg.base_branch`
+- **AND** durable ownership does not show an interrupted incomplete implement attempt with owned leftovers
 - **AND** the issue does not carry the `blocked` label
 - **THEN** the pipeline SHALL run the test gate, push the branch, create or find the PR, and transition the issue to `review-1`
 - **AND** SHALL NOT re-invoke the planning or implementing harness
@@ -36,6 +41,7 @@ The liveness check SHALL run before the commits-ahead check so that a live cross
 #### Scenario: resume when gate still fails — re-blocks
 
 - **WHEN** the pipeline resumes at `implementing` with commits in the worktree
+- **AND** durable ownership does not show an interrupted incomplete implement attempt with owned leftovers
 - **AND** the test gate fails again on the resume attempt
 - **THEN** the pipeline SHALL call `setBlocked` with kind `test-gate-exhausted` and SHALL NOT open a PR or transition the stage
 
@@ -154,3 +160,43 @@ When the pipeline re-enters the implementing stage or the implement phase of pla
 - **THEN** the shared evaluation SHALL not report implement-deliverable-present satisfaction
 - **AND** the path SHALL block or recover under existing no-commits / crash-stranded rules rather than advancing as complete
 
+### Requirement: Interrupted incomplete implement SHALL NOT skip the implementer because commits exist
+
+When implementing re-entry finds a dead holder and durable ownership shows an interrupted implement attempt with pipeline-owned leftovers, the dispatcher SHALL checkpoint those leftovers (or run the `checkpoint_owned_harness_dirt` recipe) and SHALL NOT skip the implementer solely because the worktree has commits ahead of `cfg.base_branch`. After checkpoint, if unknown product dirt remains, the pipeline SHALL set the established unknown-dirt block and SHALL NOT re-invoke the implementer or take the post-implementation path. After checkpoint, if the shared implement-deliverable contract reports unsatisfied and unknown product dirt is empty, the pipeline SHALL re-invoke the implementer. If the contract reports satisfied, the worktree is clean of unknown product dirt, and relevant gates are green, the pipeline MAY take the post-implementation path without a second empty implementer commit. If checkpoint fails and owned leftovers remain, the dispatcher SHALL NOT re-invoke a product-mutating harness and SHALL NOT take the post-implementation path; it SHALL block with kind `harness-failure` and SHALL preserve the existing ownership record. Format-gate unknown-dirt pre-flight SHALL NOT run against those owned leftovers before checkpoint. Terminal evidence SHALL use disposition `rejected` when unknown product dirt remains after checkpoint, `resumed` when the implementer is re-invoked, or `checkpointed` / `recovered` when checkpoint plus deliverable satisfaction continues post-implement.
+
+#### Scenario: Timeout leftovers with an intermediate commit re-invoke implement
+
+- **WHEN** a pipeline run starts at `implementing`
+- **AND** no live process owns the marker
+- **AND** the worktree has commits ahead of base including an intermediate implement commit
+- **AND** durable ownership classifies remaining uncommitted product files as owned leftovers
+- **AND** the implement deliverable is not yet satisfied
+- **THEN** the pipeline SHALL checkpoint the owned leftovers
+- **AND** SHALL re-invoke the implementer
+- **AND** SHALL NOT jump to format-gate unknown-dirt refusal without an implementer
+- **AND** SHALL NOT open or update the PR solely from the intermediate commit while the deliverable is unsatisfied
+
+#### Scenario: Checkpointed leftovers with satisfied deliverable may continue post-implement
+
+- **WHEN** owned leftovers are checkpointed
+- **AND** the shared implement-deliverable contract reports satisfied at HEAD
+- **AND** the worktree is clean of unknown product dirt
+- **AND** relevant gates pass
+- **THEN** the pipeline MAY resume post-implementation steps without re-invoking the implementer
+- **AND** SHALL NOT invent an empty implementer commit
+
+#### Scenario: Failed leftover checkpoint does not re-invoke implementer
+
+- **WHEN** implementing re-entry finds owned leftovers
+- **AND** checkpoint fails with those leftovers remaining
+- **THEN** the dispatcher SHALL NOT re-invoke the implementer
+- **AND** SHALL NOT skip to post-implementation solely because commits exist
+- **AND** SHALL block with kind `harness-failure`
+
+#### Scenario: Checkpointed leftovers with remaining unknown product dirt do not re-invoke implementer
+
+- **WHEN** owned leftovers are checkpointed
+- **AND** unknown product dirt remains
+- **THEN** the dispatcher SHALL NOT re-invoke the implementer
+- **AND** SHALL NOT skip to post-implementation solely because commits exist
+- **AND** SHALL set the established unknown-dirt block for the remaining unknown product paths

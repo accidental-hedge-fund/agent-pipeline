@@ -2,7 +2,9 @@
 
 ## Purpose
 TBD - created by archiving change format-lint-normalization-in-harness. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: Format gate runs after implementing and fix-round harnesses
 
 After the implementing harness exits (and after existing salvage/verify passes) and after each fix-round harness exits, the pipeline SHALL run every entry in `config.format_gate` (in declaration order) inside the worktree. If `format_gate` is absent or empty, this step is a no-op and the pipeline proceeds unchanged.
@@ -41,12 +43,24 @@ The format/lint gate SHALL run before the test/build gate, and the pipeline SHAL
 
 For each `format_gate` entry with `auto_fix: true`, the pipeline SHALL run the command, check the worktree for uncommitted changes, and if changes are present, commit them with the message `chore: auto-format (#<issue_number>)`. The pipeline SHALL then re-run the same command to verify the fix is stable; if the re-run exits non-zero, the pipeline SHALL block.
 
+Unknown pre-existing product dirt SHALL still block the gate before any auto-fix command runs. Pipeline-owned harness leftovers (see `harness-mutation-ownership`) SHALL NOT satisfy that unknown-dirt guard. The format gate SHALL NOT commit owned leftovers as `chore: auto-format`. Ownership recovery/checkpoint SHALL run before this pre-flight treats the worktree as unknown-dirty.
+
 #### Scenario: Pre-existing uncommitted changes block format gate before auto-fix runs
 
 - **WHEN** the worktree contains uncommitted changes before `runFormatGate` is invoked
+- **AND** those changes are unknown product dirt (no ownership record, or paths outside the owned leftover set)
 - **AND** at least one `format_gate` entry has `auto_fix: true`
 - **THEN** the pipeline SHALL block with reason containing "pre-existing uncommitted changes"
 - **AND** SHALL NOT run any format gate commands
+
+#### Scenario: Pipeline-owned harness leftovers do not trip the unknown-dirt pre-flight
+
+- **WHEN** the worktree contains uncommitted product paths classified as pipeline-owned harness leftovers
+- **AND** no unknown product dirt remains
+- **AND** at least one `format_gate` entry has `auto_fix: true`
+- **THEN** the pipeline SHALL NOT block with reason containing "pre-existing uncommitted changes" solely for those owned leftovers
+- **AND** SHALL NOT commit those leftovers as `chore: auto-format`
+- **AND** ownership checkpoint or equivalent recovery SHALL have already authored them, or SHALL run before auto-fix
 
 #### Scenario: Auto-fix command produces changes — commit is created
 
@@ -128,4 +142,3 @@ The `isPipelineInternalCommit` predicate (owned by the neutral pipeline-commits 
 - **WHEN** new commits include both a `chore: auto-format (#` commit and a developer fix commit (e.g. `fix:` prefix)
 - **THEN** the review-SHA gate SHALL treat both as non-internal
 - **AND** SHALL re-trigger review or delta evaluation as normal when the diff hash changes
-

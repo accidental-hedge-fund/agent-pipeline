@@ -7,8 +7,9 @@ TBD - created by archiving change implement-test-gate-non-product-dirty. Update 
 
 ### Requirement: Engine-known non-product scratch paths SHALL NOT hard-block gate trust alone
 
-The pipeline SHALL classify uncommitted paths into product dirt vs non-product
-scratch before format and test gates decide that a worktree is too dirty to trust
+The pipeline SHALL classify uncommitted paths into unknown product dirt vs non-product
+scratch vs pipeline-owned harness leftovers (see `harness-mutation-ownership`)
+before format and test gates decide that a worktree is too dirty to trust
 (pre-run dirty check) or that a passing command left untrusted artifacts
 (post-run dirty check). When the only uncommitted paths match the engine-known
 non-product scratch set (and any configured extensions of that set), the gate
@@ -22,10 +23,13 @@ proceed after restore). The engine-known set MUST include at least:
   `artifacts/challenge-response-*.json` (worktree-relative under `artifacts/`
   only).
 
-Product-relevant uncommitted paths (including source under product trees such as
+Unknown product-relevant uncommitted paths (including source under product trees such as
 `core/`, generated `plugin/`, OpenSpec product paths under `openspec/`, and any
-path not matching the non-product set) SHALL still cause a hard block with
-attempts 0 until committed. Recognized lockfiles remain handled by lockfile fold
+path not matching the non-product set and not classified as pipeline-owned
+harness leftovers) SHALL still cause a hard block with
+attempts 0 until committed. Pipeline-owned harness leftovers SHALL NOT hard-block
+gate trust as unknown product dirt; ownership checkpoint SHALL run first (see
+`harness-mutation-ownership`). Recognized lockfiles remain handled by lockfile fold
 (`implement-commit-lockfile-inclusion` / `fix-commit-lockfile-inclusion`) and
 SHALL NOT be reclassified as ignorable scratch by this capability. The engine
 SHALL NOT treat the entire `artifacts/**` tree as scratch solely because
@@ -47,6 +51,7 @@ challenge-response dumps live under `artifacts/`.
 #### Scenario: Product dirty still hard-blocks
 
 - **WHEN** the worktree has an uncommitted product path (e.g. `core/scripts/foo.ts`)
+- **AND** that path is unknown product dirt (not a pipeline-owned harness leftover)
 - **AND** the test or format gate evaluates the pre-run dirty trust check
 - **THEN** the gate SHALL block with attempts 0
 - **AND** SHALL NOT invoke the test/build fix harness for that dirt
@@ -56,6 +61,7 @@ challenge-response dumps live under `artifacts/`.
 
 - **WHEN** the worktree has both non-product scratch (e.g. `tasks/todo.md` or
   `artifacts/challenge-response-1010.json`) and a product path uncommitted
+- **AND** that product path is unknown product dirt
 - **THEN** the gate SHALL hard-block
 - **AND** the blocking reason SHALL identify the product path as the trust
   failure
@@ -77,8 +83,6 @@ challenge-response dumps live under `artifacts/`.
 - **THEN** this capability SHALL NOT classify that lock as ignorable scratch
 - **AND** the existing lockfile fold path SHALL remain responsible for including
   the lock before gates (per `implement-commit-lockfile-inclusion`)
-
----
 
 ### Requirement: Configured scratch extension globs SHALL NOT waive product dirt
 
@@ -279,3 +283,22 @@ When format-gate or test-gate dirty-trust checks classify porcelain as engine-kn
 - **AND** the format or test gate evaluates dirty trust
 - **THEN** the gate SHALL still hard-block with product-path disclosure
 - **AND** SHALL NOT waive the product block because engine scratch is also present
+
+### Requirement: Pipeline-owned harness leftovers SHALL NOT hard-block gate trust as unknown product dirt
+
+When format-gate or test-gate dirty-trust classification reports pipeline-owned harness leftovers and no unknown product dirt, the gate SHALL NOT hard-block with attempts 0 solely for those leftovers. The engine SHALL checkpoint or otherwise recover those leftovers under `harness-mutation-ownership` before treating the worktree as unknown-dirty. Unknown product dirt still hard-blocks with path disclosure. Owned leftovers SHALL NOT be reclassified as engine-known scratch.
+
+#### Scenario: Owned leftovers do not mint a dirty-trust hard block
+
+- **WHEN** porcelain lists uncommitted product paths classified as pipeline-owned harness leftovers
+- **AND** no unknown product path is uncommitted
+- **AND** the test or format gate evaluates the pre-run dirty trust check
+- **THEN** the gate SHALL NOT return a dirty-worktree hard block solely for those leftovers
+- **AND** SHALL NOT treat those paths as engine-known scratch
+
+#### Scenario: Unknown product dirt still hard-blocks beside leftovers
+
+- **WHEN** porcelain lists both owned leftover path `P` and unknown product path `U`
+- **AND** the test or format gate evaluates dirty trust after ownership checkpoint of `P`
+- **THEN** the gate SHALL still hard-block on `U` when `U` remains uncommitted
+- **AND** the block reason SHALL disclose `U`
