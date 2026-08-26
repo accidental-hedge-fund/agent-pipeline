@@ -272,7 +272,9 @@ export function porcelainProductDelta(
  * - No record ⇒ empty owned set (fail closed).
  * - Not in-flight ⇒ empty owned set (later dirt is unknown).
  * - Last-known or post present ⇒ product delta vs pre, intersected with current product dirt.
- * - In-flight with no last-known/post (hard kill) ⇒ current product porcelain is owned.
+ * - In-flight with no last-known/post (hard kill) ⇒ current product porcelain
+ *   minus pre-attempt product paths. Pre-existing dirt stays unknown unless a
+ *   later snapshot proves a content/status delta.
  */
 export function ownedLeftoverPathsFromRecord(
   record: HarnessMutationOwnershipRecord | null,
@@ -289,7 +291,14 @@ export function ownedLeftoverPathsFromRecord(
     return currentProduct.filter((p) => delta.has(p));
   }
   // Hard-kill: durable pre-snapshot exists, no last-known refresh yet.
-  return currentProduct;
+  // Path names alone cannot prove a pre-existing file changed, so those
+  // paths stay unknown. Newly dirty product paths are attributable as owned.
+  const preProduct = new Set(
+    record.pre_porcelain
+      .filter((e) => !isNonProductScratchPath(e.path, extraGlobs))
+      .map((e) => e.path),
+  );
+  return currentProduct.filter((p) => !preProduct.has(p));
 }
 
 export function classifyHarnessMutationDirt(input: {
@@ -436,7 +445,7 @@ export async function refreshLastKnownPorcelain(
   try {
     const lastKnown = await capturePorcelain(input.wtPath, input.extraGlobs ?? [], deps);
     // Skip a clean-as-pre snapshot so a first heartbeat cannot void the
-    // hard-kill rule (current product porcelain is owned when no last-known).
+    // hard-kill rule (new product porcelain vs pre is owned when no last-known).
     const extra = input.extraGlobs ?? [];
     const delta = porcelainProductDelta(rec.pre_porcelain, lastKnown, extra);
     if (delta.length === 0 && lastKnown.length === rec.pre_porcelain.length) return;

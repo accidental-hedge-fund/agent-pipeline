@@ -31,7 +31,7 @@ The engine SHALL write a durable mutation-ownership record for every product-mut
 
 ### Requirement: Interrupted attempts SHALL refresh last-known porcelain and classify leftovers versus unknown dirt
 
-While a product-mutating harness is in-flight, the engine SHALL refresh last-known porcelain on a bounded heartbeat and SHALL write a post-attempt snapshot on the timeout or crash path when the process can still run. Pipeline-owned leftovers SHALL be the product-path porcelain delta in the last-known or post snapshot versus the pre-attempt snapshot. Product paths that are dirty now and are not in that owned set SHALL be unknown product dirt. Engine-known scratch SHALL remain scratch and SHALL NOT be classified as owned leftovers. When no ownership record exists, the owned set SHALL be empty and product dirt SHALL be unknown. When the process is killed after a durable pre-snapshot but before any last-known refresh, the engine SHALL treat current product porcelain in that managed worktree as owned for that interrupted attempt.
+While a product-mutating harness is in-flight, the engine SHALL refresh last-known porcelain on a bounded heartbeat and SHALL write a post-attempt snapshot on the timeout or crash path when the process can still run. Pipeline-owned leftovers SHALL be the product-path porcelain delta in the last-known or post snapshot versus the pre-attempt snapshot. Product paths that are dirty now and are not in that owned set SHALL be unknown product dirt. Engine-known scratch SHALL remain scratch and SHALL NOT be classified as owned leftovers. When no ownership record exists, the owned set SHALL be empty and product dirt SHALL be unknown. When the process is killed after a durable pre-snapshot but before any last-known refresh, the engine SHALL treat current product porcelain that is not already present in the pre-attempt product snapshot as owned for that interrupted attempt. Product paths already present in the pre-attempt snapshot SHALL remain unknown product dirt unless durable content evidence proves they changed during the attempt.
 
 #### Scenario: Timeout after product edits yields owned leftovers
 
@@ -67,6 +67,15 @@ While a product-mutating harness is in-flight, the engine SHALL refresh last-kno
 - **WHEN** porcelain lists only engine-known non-product scratch
 - **THEN** classification SHALL treat those paths as scratch
 - **AND** SHALL NOT treat them as pipeline-owned leftovers or unknown product dirt
+
+#### Scenario: Hard-kill with pre-existing product dirt stays fail-closed
+
+- **WHEN** the durable pre-attempt snapshot already lists product path `U`
+- **AND** the process is killed after that pre-snapshot but before any last-known refresh
+- **AND** current porcelain lists `U` and a newly dirty product path `P` that was not in the pre-snapshot
+- **THEN** `P` SHALL be classified as a pipeline-owned leftover
+- **AND** `U` SHALL remain unknown product dirt
+- **AND** a checkpoint SHALL include `P` and SHALL NOT include `U`
 
 ---
 
@@ -120,7 +129,7 @@ Every ownership classification that drives a recover, checkpoint, resume, or unk
 
 ### Requirement: Ownership classification and checkpoint SHALL be injectable for unit tests
 
-The ownership record, leftover-vs-unknown classifier, and checkpoint path SHALL accept dependency seams so unit tests can inject fake porcelain, fake durable storage, and fake git without real network, git, or subprocess calls. The test suite SHALL cover: timeout after product edits with no intermediate commit; timeout after an intermediate commit plus later edits; retry recovery in a new process; unrelated-dirt refusal; missing-ownership fail-closed.
+The ownership record, leftover-vs-unknown classifier, and checkpoint path SHALL accept dependency seams so unit tests can inject fake porcelain, fake durable storage, and fake git without real network, git, or subprocess calls. The test suite SHALL cover: timeout after product edits with no intermediate commit; timeout after an intermediate commit plus later edits; retry recovery in a new process; unrelated-dirt refusal; missing-ownership fail-closed; hard-kill with pre-existing product dirt.
 
 #### Scenario: Timeout after product edits is a biting regression
 
@@ -133,6 +142,12 @@ The ownership record, leftover-vs-unknown classifier, and checkpoint path SHALL 
 - **WHEN** a hermetic test presents product dirt with no ownership record, or extra product paths after a post-snapshot
 - **THEN** the classifier SHALL report unknown product dirt
 - **AND** the dirt-trust path SHALL refuse auto-fix of those paths
+
+#### Scenario: Hard-kill with pre-existing dirt is a biting regression
+
+- **WHEN** a hermetic test presents an in-flight attempt with no last-known or post snapshot, pre-attempt product path `U`, and current porcelain listing `U` plus a new product path `P`
+- **AND** the hard-kill fallback claims every current product path as owned
+- **THEN** the test SHALL fail by observing `U` in the owned leftover set or in the checkpoint path set
 
 #### Scenario: New-process hydration is tested without a live harness
 

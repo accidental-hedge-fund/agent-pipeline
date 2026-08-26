@@ -52,7 +52,7 @@ See `proposal.md` for motivation and the lyric-utils `#758` deadlock.
 
 **Decision:** Write and durable-flush the pre-snapshot **before** the harness child is spawned. On the harness timeout/crash path, write post-snapshot then checkpoint when the process can still run. Also refresh last-known porcelain on a bounded heartbeat while the harness is in-flight so a SIGKILL still leaves a last-known post. Owned leftovers are the last-known (or post) product porcelain delta versus pre. Product paths dirty now that are not in that owned set are unknown.
 
-**Hard-kill with only pre-snapshot (no last-known after pre):** treat current product porcelain in the managed worktree as owned. The worktree is exclusive to the issue-run. Operator edits after death and before retry may be checkpointed. That is narrower than today's operator-must-inspect deadlock and is documented.
+**Hard-kill with only pre-snapshot (no last-known after pre):** treat current product porcelain that is **not** already in the pre-attempt snapshot as owned. Paths already present in `pre_porcelain` stay unknown product dirt unless durable content evidence (last-known/post identity or xy delta) proves they changed during the attempt. Operator edits that add new paths after death and before retry may still be checkpointed. That is narrower than today's operator-must-inspect deadlock and is documented.
 
 **Rationale:** Pre-only cannot distinguish post-timeout operator edits when a post-snapshot exists. Post/last-known is the ownership evidence the format gate lacks today. Heartbeat is the class fix for outer-process kill (the `#758` shape).
 

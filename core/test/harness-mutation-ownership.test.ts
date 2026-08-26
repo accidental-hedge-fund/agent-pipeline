@@ -501,6 +501,64 @@ test("hard-kill with only pre-snapshot treats current product porcelain as owned
   assert.deepEqual(c.ownedLeftover, ["core/scripts/foo.ts"]);
 });
 
+test("hard-kill with pre-existing product dirt checkpoints only new paths and leaves pre-existing unknown", async () => {
+  const store = memoryStore();
+  const rec = recordFixture({
+    in_flight: true,
+    pre_porcelain: [{ path: "core/operator.ts", xy: " M" }],
+  });
+  const classified = classifyHarnessMutationDirt({
+    porcelain: " M core/operator.ts\n M core/harness.ts\n",
+    record: rec,
+  });
+  assert.deepEqual(classified.ownedLeftover, ["core/harness.ts"]);
+  assert.deepEqual(classified.unknownProduct, ["core/operator.ts"]);
+
+  await saveVia(store, rec);
+  let porcelain = " M core/operator.ts\n M core/harness.ts\n";
+  const committed: string[][] = [];
+  const out = await recoverInterruptedImplement(
+    {
+      repoDir: "/repo",
+      domain: rec.domain,
+      issue: rec.issue,
+      wtPath: "/wt",
+      pipelineRunId: "run-1",
+      deliverablePresent: false,
+    },
+    {
+      ...store.deps,
+      gitStatusPorcelain: async () => porcelain,
+      now: () => new Date("2026-08-26T00:00:00Z"),
+      salvage: async (_wt, _i, _r, _l, salvageDeps) => {
+        committed.push([...(salvageDeps?.onlyPaths ?? [])]);
+        porcelain = " M core/operator.ts\n";
+        return { salvaged: true, message: "s" };
+      },
+    },
+  );
+  assert.deepEqual(committed[0], ["core/harness.ts"]);
+  assert.ok(!committed[0]?.includes("core/operator.ts"));
+  assert.deepEqual(out.classified.unknownProduct, ["core/operator.ts"]);
+  assert.equal(out.checkpointed, true);
+
+  const gate = await runFormatGate(
+    "/wt",
+    { format_gate: [{ command: "cargo fmt", auto_fix: true }] },
+    rec.issue,
+    {
+      execInWorktree: async () => {
+        throw new Error("should not run auto-fix on unknown pre-existing dirt");
+      },
+      gitStatusPorcelain: async () => porcelain,
+    },
+  );
+  assert.equal(gate.status, "blocked");
+  assert.ok(
+    gate.status === "blocked" && gate.reason.includes("pre-existing uncommitted changes"),
+  );
+});
+
 // ---------------------------------------------------------------------------
 // 3.1 Mixed owned+unknown checkpoints only owned paths
 // ---------------------------------------------------------------------------

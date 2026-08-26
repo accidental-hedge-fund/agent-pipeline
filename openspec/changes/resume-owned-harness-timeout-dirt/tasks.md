@@ -9,6 +9,7 @@
 - [x] 2.1 Write and durable-flush the pre-snapshot at the shared product-mutating harness-round / invoke seam (implement, fix-round, test-fix, pre-merge auto-fix) **before** child spawn, and verify a unit test fails if spawn occurs before the record exists.
 - [x] 2.2 Refresh last-known porcelain on a bounded in-flight heartbeat and write a post-snapshot on the timeout/crash path when the process can still run, and verify tests cover heartbeat last-known plus timeout post-snapshot using fake clocks/storage.
 - [x] 2.3 Clear in-flight only when the attempt completes with no owned leftovers, bound the record to attempt id and pre-HEAD, and verify a later dirty tree without a current in-flight record classifies as unknown.
+- [x] 2.4 Hard-kill with no last-known/post does not claim pre-attempt product porcelain as owned; only newly attributable paths checkpoint; pre-existing unknown dirt still blocks.
 
 ## 3. Checkpoint recipe and salvage scope
 
