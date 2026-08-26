@@ -331,6 +331,104 @@ export function normalizeSubjectSha(sha: string | null | undefined): string | nu
   return t.toLowerCase();
 }
 
+const ALL_ZERO_SHA = "0".repeat(40);
+
+/**
+ * Readiness `candidate_sha` from a trusted-surface decision.
+ * Returns null (fail closed) when the decision is missing, blocked, sentinel,
+ * or not a full 40-hex SHA — producers MUST NOT emit a well-formed subject
+ * that claims a fabricated candidate.
+ */
+export function readinessCandidateShaFromDecision(
+  decision: { outcome: string; candidate_sha: string } | null | undefined,
+): string | null {
+  if (!decision || decision.outcome === "blocked") return null;
+  const sha = normalizeSubjectSha(decision.candidate_sha);
+  if (!sha || sha === ALL_ZERO_SHA) return null;
+  return sha;
+}
+
+/**
+ * Production readiness `evidence_subject` from a trusted-surface decision.
+ * Fail-closed: returns null when the decision is blocked/malformed/sentinel
+ * or any required identity dimension is missing — never fabricates a SHA.
+ */
+export function buildReadinessEvidenceSubjectFromDecision(input: {
+  decision:
+    | {
+        outcome: string;
+        candidate_sha: string;
+        effective_verifier_hash?: string | null;
+      }
+    | null
+    | undefined;
+  domain: string;
+  issue: number;
+  pr: number | null;
+  runId: string;
+  engine: {
+    version: string;
+    templates_fingerprint: string;
+    commit_sha?: string | null;
+  } | null;
+  reviewPolicy: {
+    block_threshold: string;
+    min_confidence: number;
+    max_adversarial_rounds?: number;
+    max_delta_rounds?: number;
+    ceiling_action?: string;
+    surface_recurrence_rounds?: number | null;
+  } | null;
+  gates?: {
+    testGateEnabled?: boolean;
+    evalGateEnabled?: boolean;
+    visualGateEnabled?: boolean;
+    shipcheckGateEnabled?: boolean;
+  };
+}): EvidenceSubjectV1 | null {
+  const candidateSha = readinessCandidateShaFromDecision(input.decision);
+  if (!candidateSha) return null;
+  const domain = typeof input.domain === "string" ? input.domain.trim() : "";
+  if (!domain) return null;
+  const runId = typeof input.runId === "string" ? input.runId.trim() : "";
+  if (!runId) return null;
+  if (!input.engine) return null;
+  if (!input.reviewPolicy) return null;
+  const engineFp = buildEngineFingerprint({
+    version: input.engine.version,
+    templates_fingerprint: input.engine.templates_fingerprint,
+    ...(input.engine.commit_sha ? { commit_sha: input.engine.commit_sha } : {}),
+  });
+  const verifierFp = resolveVerifierFingerprint({
+    engineFingerprint: engineFp,
+    trustedSurface: input.decision
+      ? {
+          outcome: input.decision.outcome,
+          effective_verifier_hash: input.decision.effective_verifier_hash ?? null,
+        }
+      : null,
+  });
+  if (!verifierFp) return null;
+  try {
+    return buildEvidenceSubject({
+      domain,
+      issue: input.issue,
+      pr: input.pr,
+      run_id: runId,
+      candidate_sha: candidateSha,
+      diff_hash: null,
+      policy_hash: buildReviewPolicyHash(input.reviewPolicy),
+      engine_fingerprint: engineFp,
+      verifier_fingerprint: verifierFp,
+      required_evidence_set_revision: buildRequiredEvidenceSetRevisionFromGates(
+        input.gates ?? {},
+      ),
+    });
+  } catch {
+    return null;
+  }
+}
+
 /** Normalize a digest/hash string to lowercase hex, or null if empty/non-hex. */
 export function normalizeDigest(value: string | null | undefined): string | null {
   if (typeof value !== "string") return null;

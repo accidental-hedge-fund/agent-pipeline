@@ -2944,7 +2944,10 @@ test("persistTrustedSurfaceDecision: readback verifies durable decision", async 
   });
   const stored = await persistTrustedSurfaceDecision(RUN_DIR, decision, deps);
   assert.equal(stored.outcome, decision.outcome);
+  assert.equal(typeof stored.decided_at, "string");
+  assert.ok(Number.isFinite(Date.parse(stored.decided_at ?? "")));
   const again = await readTrustedSurfaceDecision(RUN_DIR, deps);
   assert.equal(again?.outcome, decision.outcome);
   assert.equal(again?.effective_verifier_hash, decision.effective_verifier_hash);
+  assert.equal(again?.decided_at, stored.decided_at);
 });

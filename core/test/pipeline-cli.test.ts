@@ -1268,6 +1268,18 @@ test("pipeline-cli 5.4: intake --status → validateFlags returns ['status']", (
 // 5.5  Valid: 123 --dry-run --once → advance entry, validateFlags returns []
 // ---------------------------------------------------------------------------
 
+test("pipeline-cli: advance --sha is parsed onto opts.sha", () => {
+  const sha = "a".repeat(40);
+  const { opts } = parseCli(["42", "--sha", sha]);
+  assert.equal(opts.sha, sha);
+  assert.deepEqual(roundTrip(["42", "--sha", sha]), []);
+});
+
+test("pipeline-cli: status --sha is rejected", () => {
+  const sha = "a".repeat(40);
+  assert.ok(roundTrip(["status", "42", "--sha", sha]).includes("sha"));
+});
+
 test("pipeline-cli 5.5: '123 --dry-run --once' → advance entry, validateFlags returns []", () => {
   const cmd = buildCmd();
   cmd.parse(["node", "pipeline", "123", "--dry-run", "--once"]);

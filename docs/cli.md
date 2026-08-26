@@ -16,7 +16,7 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 
 #### `advance`
 
-- **Usage:** `pipeline N`
+- **Usage:** `pipeline N [--sha <sha>]`
 - **Summary:** Durable autonomous one-item drive (default when invoked with an issue number)
 
 #### `loop`

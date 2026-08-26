@@ -1,7 +1,16 @@
 // Terminal stage. Posts a final summary on the issue, removes the worktree.
 // Idempotent — safe to call multiple times.
 
-import { addLabelToPr, getIssueDetail, getPrForIssue, ghRunForTest, postComment, postPrComment, setBlocked } from "../gh.ts";
+import {
+  addLabelToPr,
+  getIssueDetail,
+  getPrDetail,
+  getPrForIssue,
+  ghRunForTest,
+  postComment,
+  postPrComment,
+  setBlocked,
+} from "../gh.ts";
 import { attestPipelineComment } from "./review-parsing.ts";
 import { LABEL_PREFIX } from "../types.ts";
 import {
@@ -17,7 +26,8 @@ import {
   readTrustedSurfaceDecision,
   type RunStoreDeps,
 } from "../run-store.ts";
-import { allowsReadyToDeploy } from "../trusted-surface.ts";
+import { allowsReadyToDeploy, normalizeFullSha } from "../trusted-surface.ts";
+import { isTrustedSurfaceSentinelSha } from "../trusted-surface-candidate.ts";
 import {
   disposeCompareResult,
   parkFailClosedRepositoryControlDrift,
@@ -28,11 +38,17 @@ import {
   type PolicyLifecycleState,
 } from "../stage-policy-lifecycle.ts";
 
-/** Injectable seams for {@link finalize} unit tests (#759). */
+/** Injectable seams for {@link finalize} unit tests (#759 / #1243). */
 export interface FinalizeDeps {
   getOnDiskForIssue?: typeof getOnDiskForIssue;
   removeManagedWorktreeSafely?: typeof removeManagedWorktreeSafely;
   safeRemoveDeps?: SafeRemoveDeps;
+  getIssueDetail?: typeof getIssueDetail;
+  getPrForIssue?: typeof getPrForIssue;
+  getPrDetail?: typeof getPrDetail;
+  addLabelToPr?: typeof addLabelToPr;
+  postComment?: typeof postComment;
+  postPrComment?: typeof postPrComment;
 }
 
 const FINAL_SUMMARY_MARKER = "## Pipeline Complete";
@@ -162,8 +178,10 @@ export async function finalize(
   // durable decision. Missing decision is not treated as historical passthrough
   // on the ready-to-deploy path — only external/historical consumers may opt
   // into `allowsReadyToDeploy(null, { enforcement: "historical" })`.
+  const decision = runDir
+    ? await readTrustedSurfaceDecision(runDir, storeDeps)
+    : null;
   if (runDir) {
-    const decision = await readTrustedSurfaceDecision(runDir, storeDeps);
     if (!allowsReadyToDeploy(decision)) {
       const reason =
         decision?.reason?.summary ??
@@ -183,13 +201,66 @@ export async function finalize(
     }
   }
 
-  const detail = await getIssueDetail(cfg, issueNumber);
-  const prNumber = await getPrForIssue(cfg, issueNumber);
+  const getIssueFn = deps.getIssueDetail ?? getIssueDetail;
+  const getPrFn = deps.getPrForIssue ?? getPrForIssue;
+  const getPrDetailFn = deps.getPrDetail ?? getPrDetail;
+  const addLabelFn = deps.addLabelToPr ?? addLabelToPr;
+  const postCommentFn = deps.postComment ?? postComment;
+  const postPrCommentFn = deps.postPrComment ?? postPrComment;
+  const detail = await getIssueFn(cfg, issueNumber);
+  const prNumber = await getPrFn(cfg, issueNumber);
   const getOnDiskFn = deps.getOnDiskForIssue ?? getOnDiskForIssue;
   const safeRemoveFn = deps.removeManagedWorktreeSafely ?? removeManagedWorktreeSafely;
 
   // Idempotency: only post if no existing summary.
   const alreadyPosted = detail.comments.some((c) => c.body.startsWith(FINAL_SUMMARY_MARKER));
+
+  // Bind the ready-to-deploy tag (and the terminal completion summary) to the
+  // SHA trusted-surface checked. Re-fetch before any completion side effect so
+  // a push cannot publish "## Pipeline Complete" and then refuse the tag (#1243).
+  if (prNumber && runDir) {
+    const expectedSha = normalizeFullSha(decision?.candidate_sha);
+    if (!expectedSha || isTrustedSurfaceSentinelSha(expectedSha)) {
+      const reason =
+        "stale_pr_head: trusted-surface candidate SHA is missing or sentinel; refusing ready-to-deploy tag";
+      console.log(`[pipeline] #${issueNumber}: ready-to-deploy refused — ${reason}`);
+      return {
+        advanced: false,
+        status: "blocked",
+        reason,
+        blockerKind: "needs-human",
+      };
+    }
+    const live = await getPrDetailFn(cfg, prNumber).catch(() => null);
+    const liveSha = normalizeFullSha(live?.head_sha);
+    if (!liveSha || liveSha !== expectedSha) {
+      const reason =
+        `stale_pr_head: linked PR #${prNumber} head ` +
+        `${liveSha ?? "unresolved"} does not match trusted-surface candidate ${expectedSha}`;
+      console.log(`[pipeline] #${issueNumber}: ready-to-deploy refused — ${reason}`);
+      return {
+        advanced: false,
+        status: "blocked",
+        reason,
+        blockerKind: "needs-human",
+      };
+    }
+  }
+
+  // Mirror the terminal label onto the linked PR. gh pr edit --add-label is
+  // idempotent, so re-running finalize is a no-op on the second pass.
+  if (prNumber) {
+    try {
+      await addLabelFn(cfg, prNumber, `${LABEL_PREFIX}ready-to-deploy`);
+      console.log(`[pipeline] #${issueNumber}: PR #${prNumber} tagged pipeline:ready-to-deploy`);
+    } catch (err) {
+      // Best-effort: if the label doesn't exist on the repo or gh is unhappy,
+      // don't block finalize. The issue still carries the canonical label.
+      console.log(
+        `[pipeline] #${issueNumber}: could not tag PR #${prNumber} (${(err as Error).message}); skipping (non-blocking)`,
+      );
+    }
+  }
 
   if (!alreadyPosted) {
     const prRef = prNumber ? `PR #${prNumber}` : "(no PR found)";
@@ -200,13 +271,13 @@ export async function finalize(
       (c) => c.body.startsWith("## Pipeline: Review") && c.body.includes("advanced under severity policy"),
     ).length;
     const summary = buildPipelineCompleteComment(cfg, issueNumber, detail.title, prRef, advisoryRounds);
-    await postComment(cfg, issueNumber, summary);
+    await postCommentFn(cfg, issueNumber, summary);
     console.log(`[pipeline] #${issueNumber}: final summary posted`);
     // Mirror the summary onto the PR — the merge decision happens there, not
     // on the issue. Best-effort; the issue copy is authoritative.
     if (prNumber) {
       try {
-        await postPrComment(cfg, prNumber, summary);
+        await postPrCommentFn(cfg, prNumber, summary);
       } catch (err) {
         console.log(
           `[pipeline] #${issueNumber}: could not post final summary to PR #${prNumber} ` +
@@ -216,21 +287,6 @@ export async function finalize(
     }
   } else {
     console.log(`[pipeline] #${issueNumber}: final summary already exists`);
-  }
-
-  // Mirror the terminal label onto the linked PR. gh pr edit --add-label is
-  // idempotent, so re-running finalize is a no-op on the second pass.
-  if (prNumber) {
-    try {
-      await addLabelToPr(cfg, prNumber, `${LABEL_PREFIX}ready-to-deploy`);
-      console.log(`[pipeline] #${issueNumber}: PR #${prNumber} tagged pipeline:ready-to-deploy`);
-    } catch (err) {
-      // Best-effort: if the label doesn't exist on the repo or gh is unhappy,
-      // don't block finalize. The issue still carries the canonical label.
-      console.log(
-        `[pipeline] #${issueNumber}: could not tag PR #${prNumber} (${(err as Error).message}); skipping (non-blocking)`,
-      );
-    }
   }
 
   // Remove worktree through evaluateRemoveSafety (#759). Terminal ready-to-deploy

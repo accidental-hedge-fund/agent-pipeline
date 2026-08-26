@@ -2392,6 +2392,12 @@ export interface EvidenceBundle {
    */
   evidence_subject_diagnostics?: import("./evidence-subject.ts").EvidenceSubjectDiagnostic[];
   /**
+   * Run-level readiness evidence_subject (#1243). Written from the trusted-surface
+   * decision via readinessCandidateShaFromDecision. Absent when production fails
+   * closed (blocked/malformed/sentinel decision or missing identity). Additive.
+   */
+  evidence_subject?: import("./evidence-subject.ts").EvidenceSubjectV1;
+  /**
    * Trusted-surface decision for this run (#691). Written by deterministic
    * engine code when a decision was computed. Historical bundles MAY omit it;
    * consumers MUST NOT invent `passthrough` for a missing record.

@@ -19,6 +19,8 @@ import {
   EVIDENCE_SUBJECT_SCHEMA_VERSION,
   parseEvidenceSubject,
   parseEvidenceSubjectDetailed,
+  readinessCandidateShaFromDecision,
+  buildReadinessEvidenceSubjectFromDecision,
   resolveRequiredEvidenceKinds,
   selectEvaluationPinSubject,
   serializeEvidenceSubjectCanonical,
@@ -75,6 +77,64 @@ test("schema_version 1 object carries the required field set", () => {
   assert.equal(typeof s.engine_fingerprint, "string");
   assert.equal(typeof s.verifier_fingerprint, "string");
   assert.equal(typeof s.required_evidence_set_revision, "string");
+});
+
+test("readinessCandidateShaFromDecision: fail-closed on blocked, sentinel, or missing", () => {
+  assert.equal(readinessCandidateShaFromDecision(null), null);
+  assert.equal(
+    readinessCandidateShaFromDecision({
+      outcome: "blocked",
+      candidate_sha: SHA_A,
+    }),
+    null,
+  );
+  assert.equal(
+    readinessCandidateShaFromDecision({
+      outcome: "passthrough",
+      candidate_sha: "0".repeat(40),
+    }),
+    null,
+  );
+  assert.equal(
+    readinessCandidateShaFromDecision({
+      outcome: "passthrough",
+      candidate_sha: SHA_A,
+    }),
+    SHA_A,
+  );
+});
+
+test("buildReadinessEvidenceSubjectFromDecision: binds PR-head candidate, fails closed on blocked", () => {
+  const engine = { version: "1.0.0", templates_fingerprint: "t".repeat(64) };
+  const policy = { block_threshold: "high", min_confidence: 0.7 };
+  const subject = buildReadinessEvidenceSubjectFromDecision({
+    decision: {
+      outcome: "passthrough",
+      candidate_sha: SHA_A,
+      effective_verifier_hash: VERIFIER,
+    },
+    domain: "owner/repo",
+    issue: 1243,
+    pr: 1244,
+    runId: "1243/run",
+    engine,
+    reviewPolicy: policy,
+  });
+  assert.ok(subject);
+  assert.equal(subject.candidate_sha, SHA_A);
+  assert.equal(subject.pr, 1244);
+  assert.equal(
+    buildReadinessEvidenceSubjectFromDecision({
+      decision: { outcome: "blocked", candidate_sha: SHA_A },
+      domain: "owner/repo",
+      issue: 1243,
+      pr: 1244,
+      runId: "1243/run",
+      engine,
+      reviewPolicy: policy,
+    }),
+    null,
+  );
 });
 
 test("buildEvidenceSubject normalizes SHA case and rejects short SHA", () => {

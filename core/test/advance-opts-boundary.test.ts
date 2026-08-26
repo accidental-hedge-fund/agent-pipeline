@@ -108,6 +108,49 @@ test("toAdvanceOpts picks only advance-relevant fields", () => {
   assert.equal("maxIssues" in filtered, false);
 });
 
+test("toAdvanceOpts maps --sha onto candidateShaOverride", () => {
+  const sha = "a".repeat(40);
+  const mapped = toAdvanceOpts({
+    dryRun: false,
+    model: undefined,
+    once: false,
+    override: undefined,
+    jsonEvents: false,
+    profile: "codex",
+    runId: "r3",
+    sha,
+  });
+  assert.equal(mapped.candidateShaOverride, sha);
+  assert.equal("sha" in mapped, false);
+});
+
+test("toAdvanceOpts omits candidateShaOverride when --sha is absent", () => {
+  const mapped = toAdvanceOpts({
+    dryRun: false,
+    model: undefined,
+    once: false,
+    override: undefined,
+    jsonEvents: false,
+    profile: "codex",
+    runId: "r4",
+  });
+  assert.equal("candidateShaOverride" in mapped, false);
+});
+
+test("toAdvanceOpts forwards a malformed --sha so the resolver can fail closed", () => {
+  const mapped = toAdvanceOpts({
+    dryRun: false,
+    model: undefined,
+    once: false,
+    override: undefined,
+    jsonEvents: false,
+    profile: "codex",
+    runId: "r5",
+    sha: "not-a-sha",
+  });
+  assert.equal(mapped.candidateShaOverride, "not-a-sha");
+});
+
 test("AdvanceOpts type is importable from pipeline-run without CliOpts kitchen-sink", () => {
   // Compile-time / structural: a thin bag is enough for the advance contract.
   const opts: AdvanceOpts = { dryRun: true, once: true, runId: "x" };

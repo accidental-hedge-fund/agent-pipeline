@@ -9,11 +9,13 @@ import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import {
   GhMetricsCollector,
+  addLabelToPr,
   buildAuditSentinel,
   clearBlocked,
   ensurePipelineLabels,
   getGhActor,
   getIssueDetail,
+  getPrDetail,
   getPrForIssue,
   isBlocked,
   pickStage,
@@ -64,10 +66,12 @@ import {
   finalizeRun,
   initRunDir,
   persistTrustedSurfaceDecision,
+  readEvents,
   readTrustedSurfaceDecision,
   resolveRunEngineIdentity,
   runDirPath,
   runIdFor,
+  listRunIds,
   startTerminalLogTee,
   writeTrustedSurfaceInvalidation,
   type RunStoreDeps,
@@ -83,9 +87,22 @@ import {
   classifyPaths,
   computeTrustedSurfaceDecision,
   effectiveVerifierHashChanged,
+  normalizeFullSha,
   rebindDecisionAfterEngineDrift,
   type TrustedSurfaceDecision,
 } from "./trusted-surface.ts";
+import {
+  durablePinCandidatesFromPriorRun,
+  gitRepoObjectSource,
+  isTrustedSurfaceSentinelSha,
+  resolveTrustedSurfaceCandidateSha,
+  selectDurableLastAdvancedPin,
+  type DurablePinCandidate,
+  type GitRunner,
+  type LinkedPrHead,
+  type TrustedSurfaceObjectSource,
+} from "./trusted-surface-candidate.ts";
+import { buildReadinessEvidenceSubjectFromDecision } from "./evidence-subject.ts";
 import { buildEventSinkDeps } from "./event-sink.ts";
 import {
   isEngineDriftTransition,
@@ -194,6 +211,11 @@ export interface AdvanceOpts {
    * `reenterAdvanceAfterRecoverParked` only — not a public CLI flag.
    */
   skipRecoverParked?: boolean;
+  /**
+   * Explicit candidate-SHA override for trusted-surface when no worktree is
+   * on disk (#1243). Production CLI: `pipeline N --sha <40-hex>`.
+   */
+  candidateShaOverride?: string | null;
 }
 
 /** Pure + exported so the PIPELINE_COMMENT_KINDS drift guard exercises the real renderer. */
@@ -575,10 +597,32 @@ export interface AdvanceDeps {
   getIssueDetail?: typeof getIssueDetail;
   getGhActor?: typeof getGhActor;
   getPrForIssue?: typeof getPrForIssue;
+  getPrDetail?: typeof getPrDetail;
   getOnDiskForIssue?: typeof getOnDiskForIssue;
+  gitInWorktree?: typeof gitInWorktree;
   postComment?: typeof postComment;
   postPrComment?: typeof postPrComment;
+  addLabelToPr?: typeof addLabelToPr;
   dispatch?: typeof dispatch;
+  /**
+   * Last-advanced product candidate pin (#1243). Tests inject a SHA; omit to
+   * load the durable pin (prior-run non-sentinel trusted-surface candidate,
+   * last successful pre-merge candidate, or review SHA-gate pin). `null` means
+   * no pin (linked open PR head is then authoritative when present).
+   */
+  lastAdvancedCandidateSha?: string | null;
+  /**
+   * Explicit candidate-SHA override for trusted-surface when no worktree is
+   * on disk (#1243). Test seam; production supplies the same value via
+   * {@link AdvanceOpts.candidateShaOverride} from `--sha`.
+   */
+  candidateShaOverride?: string | null;
+  /**
+   * Changed-path / base-blob reader used after SHA resolve when the managed
+   * worktree is absent. Tests inject canned paths; production reads git objects
+   * from `cfg.repo_dir` without rematerializing a managed worktree.
+   */
+  trustedSurfaceObjectSource?: TrustedSurfaceObjectSource;
   /**
    * Env for checkout-role factory-control identity. Defaults to `process.env`.
    * Unit tests inject a hermetic env so host `REPO_DIR` cannot pin a clone.
@@ -1287,6 +1331,8 @@ export async function runAdvance(
     // produce a decision (fail closed) — missing inputs yield `blocked`.
     let lastTrustedSurfaceCandidateSha: string | null = null;
     let currentTrustedSurface: TrustedSurfaceDecision | null = null;
+    let durableLastAdvancedPinLoaded = false;
+    let durableLastAdvancedPin: string | null = null;
 
     async function persistDecision(
       decision: TrustedSurfaceDecision,
@@ -1490,8 +1536,58 @@ export async function runAdvance(
       return decision;
     }
 
+    async function loadDurableLastAdvancedPin(
+      comments?: { body: string }[],
+    ): Promise<string | null> {
+      const candidates: DurablePinCandidate[] = [];
+      if (runDir) {
+        const currentId = path.basename(runDir);
+        const ids = await listRunIds(cfg.repo_dir, runStoreDeps).catch(() => [] as string[]);
+        const prefix = `${issueNumber}-`;
+        for (const id of ids) {
+          if (!id.startsWith(prefix) || id === currentId) continue;
+          const priorDir = runDirPath(cfg.repo_dir, id);
+          const prior = await readTrustedSurfaceDecision(priorDir, runStoreDeps);
+          const events = await readEvents(priorDir, runStoreDeps).catch(() => []);
+          candidates.push(
+            ...durablePinCandidatesFromPriorRun({
+              runId: id,
+              trustedSurfaceCandidateSha: prior?.candidate_sha,
+              trustedSurfaceDecidedAt: prior?.decided_at,
+              events,
+            }),
+          );
+        }
+      }
+      let bodies = comments;
+      if (!bodies) {
+        const detail = await (deps.getIssueDetail ?? getIssueDetail)(cfg, issueNumber).catch(
+          () => null,
+        );
+        bodies = detail?.comments;
+      }
+      const commentList = bodies ?? [];
+      const reviewRoundBodies = commentList.filter(
+        (c) =>
+          c.body.startsWith(reviewStage.REVIEW_MARKER_PREFIX_R1) ||
+          c.body.startsWith(reviewStage.REVIEW_MARKER_PREFIX_R2),
+      );
+      const reviewedSha = reviewStage.extractReviewedSha(reviewRoundBodies)?.sha ?? null;
+      const deltaBodies = commentList.filter((c) =>
+        c.body.startsWith(reviewStage.DELTA_REVIEW_MARKER_PREFIX),
+      );
+      const preMergeCandidateSha =
+        reviewStage.extractReviewedSha(deltaBodies)?.sha ?? null;
+      return selectDurableLastAdvancedPin({
+        candidates,
+        preMergeCandidateSha,
+        reviewedSha,
+      });
+    }
+
     async function ensureTrustedSurfaceDecision(
       stageName: string,
+      comments?: { body: string }[],
     ): Promise<TrustedSurfaceDecision | null> {
       // Dry-run / no run dir: not a readiness-authoritative path.
       if (!runDir) return currentTrustedSurface;
@@ -1535,32 +1631,73 @@ export async function runAdvance(
         );
       }
 
+      const gitFn: GitRunner = deps.gitInWorktree ?? gitInWorktree;
       const wt = await (deps.getOnDiskForIssue ?? getOnDiskForIssue)(cfg, issueNumber).catch(
         () => null,
       );
-      if (!wt) {
-        return failAndPersist(
-          "worktree_unavailable",
-          "Trusted-surface could not resolve the managed worktree for this issue",
-        );
+
+      let worktreeHeadSha: string | null = null;
+      if (wt) {
+        const headRes = await gitFn(wt.path, ["rev-parse", "HEAD"], {
+          ignoreFailure: true,
+        });
+        if (headRes.code !== 0) {
+          return failAndPersist(
+            "candidate_sha_unresolved",
+            `Trusted-surface could not resolve worktree HEAD (git exit ${headRes.code})`,
+          );
+        }
+        worktreeHeadSha = headRes.stdout.trim().toLowerCase();
       }
 
-      const headRes = await gitInWorktree(wt.path, ["rev-parse", "HEAD"], {
-        ignoreFailure: true,
+      let linkedPrHead: LinkedPrHead | null = null;
+      if (!wt) {
+        const prNumber = await (deps.getPrForIssue ?? getPrForIssue)(cfg, issueNumber).catch(
+          () => null,
+        );
+        if (prNumber) {
+          const detail = await (deps.getPrDetail ?? getPrDetail)(cfg, prNumber).catch(
+            () => null,
+          );
+          const headSha = normalizeFullSha(detail?.head_sha);
+          if (headSha) linkedPrHead = { prNumber, headSha };
+        }
+      }
+
+      const inRunPin = !isTrustedSurfaceSentinelSha(lastTrustedSurfaceCandidateSha)
+        ? lastTrustedSurfaceCandidateSha
+        : currentTrustedSurface &&
+            !isTrustedSurfaceSentinelSha(currentTrustedSurface.candidate_sha)
+          ? currentTrustedSurface.candidate_sha
+          : null;
+      let lastAdvancedPin: string | null;
+      if (deps.lastAdvancedCandidateSha !== undefined) {
+        lastAdvancedPin = deps.lastAdvancedCandidateSha;
+      } else if (wt) {
+        lastAdvancedPin = inRunPin;
+      } else {
+        if (!durableLastAdvancedPinLoaded) {
+          durableLastAdvancedPin = await loadDurableLastAdvancedPin(comments);
+          durableLastAdvancedPinLoaded = true;
+        }
+        lastAdvancedPin = inRunPin ?? durableLastAdvancedPin;
+      }
+
+      const resolved = resolveTrustedSurfaceCandidateSha({
+        worktreePresent: Boolean(wt),
+        worktreeHeadSha,
+        stage: stageName,
+        overrideSha:
+          deps.candidateShaOverride !== undefined
+            ? deps.candidateShaOverride
+            : (opts.candidateShaOverride ?? null),
+        linkedPrHead,
+        lastAdvancedPin,
       });
-      if (headRes.code !== 0) {
-        return failAndPersist(
-          "candidate_sha_unresolved",
-          `Trusted-surface could not resolve worktree HEAD (git exit ${headRes.code})`,
-        );
+      if (!resolved.ok) {
+        return failAndPersist(resolved.code, resolved.summary);
       }
-      const candidateSha = headRes.stdout.trim().toLowerCase();
-      if (!/^[0-9a-f]{40}$/.test(candidateSha)) {
-        return failAndPersist(
-          "invalid_candidate_sha",
-          `Trusted-surface HEAD is not a full SHA: "${headRes.stdout.trim()}"`,
-        );
-      }
+      const candidateSha = resolved.candidateSha;
 
       // Reuse durable decision when candidate SHA is unchanged.
       if (lastTrustedSurfaceCandidateSha === candidateSha && currentTrustedSurface) {
@@ -1580,58 +1717,100 @@ export async function runAdvance(
         return currentTrustedSurface;
       }
 
-      const baseRef = `origin/${cfg.base_branch}`;
-      const baseRes = await gitInWorktree(wt.path, ["rev-parse", baseRef], {
-        ignoreFailure: true,
-      });
-      const baseShaRaw = baseRes.stdout.trim().toLowerCase();
-      const baseSha = /^[0-9a-f]{40}$/.test(baseShaRaw) ? baseShaRaw : null;
-
-      const diffRange = baseSha
-        ? `${baseSha}...${candidateSha}`
-        : `${baseRef}...HEAD`;
-      const diffRes = await gitInWorktree(wt.path, ["diff", "--name-only", diffRange], {
-        ignoreFailure: true,
-      });
-      if (diffRes.code !== 0) {
-        return failAndPersist(
-          "diff_unresolved",
-          `Trusted-surface changed-path diff failed (git exit ${diffRes.code})`,
-          candidateSha,
-        );
-      }
-      const candidatePaths = diffRes.stdout
-        .split("\n")
-        .map((l) => l.trim())
-        .filter(Boolean);
-
-      // Pre-fetch base blobs for touched sensitive paths. Distinguish confirmed
-      // absence from unreadable objects.
+      const extraPaths = cfg.trusted_surface?.extra_paths ?? [];
+      let candidatePaths: string[];
+      let baseSha: string | null;
       const baseBlobCache = new Map<string, string | null>();
       let baseReadUnreadable = false;
       let baseReadError = "";
-      if (baseSha) {
-        const classified = classifyPaths(
-          candidatePaths,
-          cfg.trusted_surface?.extra_paths ?? [],
-        );
-        const touched = [...new Set(classified.map((c) => c.path))];
-        for (const p of touched) {
-          const show = await gitInWorktree(wt.path, ["show", `${baseSha}:${p}`], {
-            ignoreFailure: true,
-          });
-          const kind = classifyGitShowResult(show);
-          if (kind === "content") {
-            baseBlobCache.set(p, show.stdout);
-          } else if (kind === "absent") {
-            baseBlobCache.set(p, null);
-          } else {
-            baseReadUnreadable = true;
-            baseReadError = `unreadable base blob ${baseSha}:${p} (git exit ${show.code})`;
-            break;
+
+      if (wt) {
+        const baseRef = `origin/${cfg.base_branch}`;
+        const baseRes = await gitFn(wt.path, ["rev-parse", baseRef], {
+          ignoreFailure: true,
+        });
+        const baseShaRaw = baseRes.stdout.trim().toLowerCase();
+        baseSha = /^[0-9a-f]{40}$/.test(baseShaRaw) ? baseShaRaw : null;
+
+        const diffRange = baseSha
+          ? `${baseSha}...${candidateSha}`
+          : `${baseRef}...HEAD`;
+        const diffRes = await gitFn(wt.path, ["diff", "--name-only", diffRange], {
+          ignoreFailure: true,
+        });
+        if (diffRes.code !== 0) {
+          return failAndPersist(
+            "diff_unresolved",
+            `Trusted-surface changed-path diff failed (git exit ${diffRes.code})`,
+            candidateSha,
+          );
+        }
+        candidatePaths = diffRes.stdout
+          .split("\n")
+          .map((l) => l.trim())
+          .filter(Boolean);
+
+        if (baseSha) {
+          const classified = classifyPaths(candidatePaths, extraPaths);
+          const touched = [...new Set(classified.map((c) => c.path))];
+          for (const p of touched) {
+            const show = await gitFn(wt.path, ["show", `${baseSha}:${p}`], {
+              ignoreFailure: true,
+            });
+            const kind = classifyGitShowResult(show);
+            if (kind === "content") {
+              baseBlobCache.set(p, show.stdout);
+            } else if (kind === "absent") {
+              baseBlobCache.set(p, null);
+            } else {
+              baseReadUnreadable = true;
+              baseReadError = `unreadable base blob ${baseSha}:${p} (git exit ${show.code})`;
+              break;
+            }
+          }
+        }
+      } else {
+        // Park-released late-stage path: compute from git objects / injected
+        // source. Do not rematerialize a managed worktree for SHA resolution.
+        const objectSource =
+          deps.trustedSurfaceObjectSource ??
+          gitRepoObjectSource(cfg.repo_dir, gitFn, cfg.base_branch);
+        const resolvedBase = objectSource.resolveBaseSha
+          ? await objectSource.resolveBaseSha(candidateSha).catch(() => null)
+          : null;
+        baseSha = normalizeFullSha(resolvedBase);
+        const listed = await objectSource.listChangedPaths(baseSha, candidateSha);
+        if ("error" in listed) {
+          return failAndPersist("diff_unresolved", listed.error, candidateSha);
+        }
+        candidatePaths = listed.paths;
+        if (baseSha && objectSource.readBaseBlob) {
+          const classified = classifyPaths(candidatePaths, extraPaths);
+          const touched = [...new Set(classified.map((c) => c.path))];
+          for (const p of touched) {
+            const blob = await objectSource.readBaseBlob(baseSha, p);
+            if (blob.kind === "content") {
+              baseBlobCache.set(p, blob.content);
+            } else if (blob.kind === "absent") {
+              baseBlobCache.set(p, null);
+            } else {
+              baseReadUnreadable = true;
+              baseReadError = blob.error;
+              break;
+            }
+          }
+        } else if (baseSha && !objectSource.readBaseBlob) {
+          const classified = classifyPaths(candidatePaths, extraPaths);
+          if (classified.length > 0) {
+            return failAndPersist(
+              "diff_unresolved",
+              "Trusted-surface object source cannot read base blobs for changed paths",
+              candidateSha,
+            );
           }
         }
       }
+
       let decision = computeTrustedSurfaceDecision({
         candidate_paths: candidatePaths,
         candidate_sha: candidateSha,
@@ -1643,7 +1822,7 @@ export async function runAdvance(
           root: pinnedEngine.root,
           commit_sha: pinnedEngine.commit_sha ?? null,
         },
-        extra_paths: cfg.trusted_surface?.extra_paths ?? [],
+        extra_paths: extraPaths,
         read_base_content: (p) => {
           if (!baseBlobCache.has(p)) {
             // Path not prefetched → treat as absent only when base was readable
@@ -1864,7 +2043,15 @@ export async function runAdvance(
       }
       let out: Outcome;
       try {
-        out = await deployReady.finalize(cfg, issueNumber, runDir, runStoreDeps);
+        out = await deployReady.finalize(cfg, issueNumber, runDir, runStoreDeps, {
+          getOnDiskForIssue: deps.getOnDiskForIssue,
+          getIssueDetail: deps.getIssueDetail,
+          getPrForIssue: deps.getPrForIssue,
+          getPrDetail: deps.getPrDetail,
+          addLabelToPr: deps.addLabelToPr,
+          postComment: deps.postComment,
+          postPrComment: deps.postPrComment,
+        });
       } catch (err) {
         if (runDir) {
           await appendEvent(runDir, { schema_version: RUN_SCHEMA_VERSION, type: "stage_complete", at: evidenceTimestamp(), stage: rtdStage, outcome: "error", commits: [] }, runStoreDeps).catch(() => {});
@@ -1889,7 +2076,7 @@ export async function runAdvance(
       }
       finalStage = stage;
       await checkEngineDrift(evidenceStageName(stage));
-      await ensureTrustedSurfaceDecision(evidenceStageName(stage));
+      await ensureTrustedSurfaceDecision(evidenceStageName(stage), detail.comments);
 
       // Reconcile audit comments (#259): if a prior run's label write succeeded but its
       // comment post failed, the sentinel is missing. Detect and repair the gap.
@@ -2031,8 +2218,9 @@ export async function runAdvance(
       if (!dispatchOwnsLifecycle && stateDir) {
         const wtBefore = await (deps.getOnDiskForIssue ?? getOnDiskForIssue)(cfg, issueNumber).catch(() => null);
         if (wtBefore) {
+          const gitFn: GitRunner = deps.gitInWorktree ?? gitInWorktree;
           headBeforeDispatch = (
-            await gitInWorktree(wtBefore.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
+            await gitFn(wtBefore.path, ["rev-parse", "HEAD"], { ignoreFailure: true })
           ).stdout.trim();
         }
       }
@@ -2133,7 +2321,8 @@ export async function runAdvance(
           // If no worktree existed before dispatch (e.g., planning creates it), fall
           // back to origin/<base_branch> so all planning commits are captured.
           const rangeStart = headBeforeDispatch || `origin/${cfg.base_branch}`;
-          const logResult = await gitInWorktree(
+          const gitFn: GitRunner = deps.gitInWorktree ?? gitInWorktree;
+          const logResult = await gitFn(
             wtAfter.path,
             ["log", "--pretty=format:%H", `${rangeStart}..HEAD`],
             { ignoreFailure: true },
@@ -2356,6 +2545,30 @@ export async function runAdvance(
             await patchBundleIdentity(stateDir, issueNumber, identityPatch).catch(() => {});
           }
           const finalized = await finalizeBundle(stateDir, issueNumber, finalStage);
+          const readinessSubject = buildReadinessEvidenceSubjectFromDecision({
+            decision: currentTrustedSurface,
+            domain: (cfg.domain || cfg.repo || "").trim(),
+            issue: issueNumber,
+            pr: latestPr,
+            runId: pipelineRunId,
+            engine: pinnedEngine
+              ? {
+                  version: pinnedEngine.version,
+                  templates_fingerprint: pinnedEngine.templates_fingerprint,
+                  commit_sha: pinnedEngine.commit_sha ?? null,
+                }
+              : null,
+            reviewPolicy: cfg.review_policy ?? null,
+            gates: {
+              testGateEnabled: cfg.test_gate?.enabled,
+              evalGateEnabled: cfg.eval_gate?.enabled,
+              visualGateEnabled: cfg.visual_gate?.enabled,
+              shipcheckGateEnabled: cfg.shipcheck_gate?.enabled,
+            },
+          });
+          if (readinessSubject) {
+            finalized.evidence_subject = readinessSubject;
+          }
           // Staged policies + repository-control drift evidence (#695): record when
           // configured. Best-effort live compare; never invents policies when absent.
           try {
@@ -2395,7 +2608,10 @@ export async function runAdvance(
           // Metrics are NOT passed here — gh_metrics_summary is emitted after notification
           // so that notification gh calls (getPrForIssue/postPrComment) are captured (#257).
           if (runDir) {
-            await finalizeRun(runDir, finalized, stateDir, issueNumber, runStartedAtIso, runStoreDeps).catch(() => {});
+            await finalizeRun(runDir, finalized, stateDir, issueNumber, runStartedAtIso, {
+              ...runStoreDeps,
+              evaluationPinSubject: readinessSubject ?? null,
+            }).catch(() => {});
           }
           // Opt-in papercut auto-file (#421): best-effort, gated on resolved
           // config, wrapped so a failure here can never alter the run's outcome.

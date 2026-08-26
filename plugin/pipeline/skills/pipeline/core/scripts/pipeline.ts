@@ -71,6 +71,7 @@ import {
   REVIEW_MARKER_PREFIX_R2,
 } from "./stages/review-parsing.ts";
 import { makePipelineRunId } from "./traceability.ts";
+import { normalizeFullSha } from "./trusted-surface.ts";
 import {
   branchName,
   ensureManagedWorktree,
@@ -305,8 +306,9 @@ export type { AdvanceDeps, AdvanceOpts, PlanningRecoveryDeps };
 /** Map Commander-facing {@link CliOpts} into the thin advance bag (#630). */
 export function toAdvanceOpts(opts: Pick<
   CliOpts,
-  "dryRun" | "model" | "once" | "override" | "jsonEvents" | "profile" | "runId"
+  "dryRun" | "model" | "once" | "override" | "jsonEvents" | "profile" | "runId" | "sha"
 >): AdvanceOpts {
+  const sha = typeof opts.sha === "string" ? opts.sha.trim() : "";
   return {
     dryRun: opts.dryRun,
     model: opts.model,
@@ -318,6 +320,7 @@ export function toAdvanceOpts(opts: Pick<
     ...(opts.engineTrack === "pinned" || opts.engineTrack === "candidate"
       ? { engineTrack: opts.engineTrack }
       : {}),
+    ...(sha ? { candidateShaOverride: sha } : {}),
   };
 }
 
@@ -373,6 +376,11 @@ export interface CliOpts {
   /** Internal: pre-allocated #155 run-store run id, set by the detached launcher so
    *  the inner run uses the same `.agent-pipeline/runs/<run-id>` the caller was told. */
   runId?: string;
+  /**
+   * Advance: explicit candidate-SHA override when no managed worktree is on
+   * disk (#1243). Commander maps `--sha` → `sha`. Must be a full 40-hex SHA.
+   */
+  sha?: string;
   /** Emit machine-readable JSON (for --status, the doctor command, `pipeline path`, and `pipeline config validate/sync`). */
   json?: boolean;
   /** controls check: non-zero exit on any drifted outcome (#695). */
@@ -802,6 +810,10 @@ export function buildCmd(): Command {
       'disposition a review finding so it no longer blocks, then auto-resume: "<key|scope>: [<class>:] <reason>" (class optional; bare reasons use default_class / implicit low_risk_deferred; evidence as kind=url tokens)',
     )
     .option("--once", "advance one stage and stop")
+    .option(
+      "--sha <sha>",
+      "advance: explicit candidate-SHA override (full 40-hex) when no managed worktree is on disk",
+    )
     .option("--dry-run", "log what would happen without invoking harnesses or modifying GitHub")
     .option("--domain <name>", "override domain name (default: repo dir basename)")
     .option("--repo-path <path>", "override the target repo working tree")
@@ -4196,6 +4208,12 @@ async function main(): Promise<void> {
         "Use a JSON-capable command (registry supportsJson), " +
         "`pipeline doctor --json`, or `pipeline <N> --status --json`.",
     );
+    process.exit(2);
+  }
+  // --sha is a full 40-hex candidate override. Reject malformed values before
+  // advance so an invalid override cannot fall through to the PR head (#1243).
+  if (opts.sha !== undefined && !normalizeFullSha(opts.sha)) {
+    console.error("pipeline: --sha must be a full 40-character hexadecimal SHA");
     process.exit(2);
   }
   // --force is scoped to --remove-worktree; using it alone is a usage error.
@@ -7717,6 +7735,7 @@ export async function handleRunSubcommand(
     // (or be rejected) so detached runs preserve dry-run/once/doctor semantics (#153).
     if (opts.dryRun) passArgs.push("--dry-run");
     if (opts.once) passArgs.push("--once");
+    if (opts.sha) passArgs.push("--sha", opts.sha);
     if (opts.doctor) passArgs.push("--doctor");
     if (opts.failFast) passArgs.push("--fail-fast");
     // Pin the inner run to the pre-allocated #155 run-store id, and forward
