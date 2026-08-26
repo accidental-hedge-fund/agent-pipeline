@@ -365,6 +365,13 @@ async function runEvalFixRound(
     issueNumber,
     pipelineRunId,
     salvageLabel: evalFixSalvageStageLabel(issueNumber),
+    mutationOwnership: {
+      repoDir: cfg.repo_dir,
+      domain: cfg.domain ?? "",
+      stage: "eval-fix",
+      extraGlobs: cfg.test_gate?.non_product_dirty_globs ?? [],
+      runDir: opts.runDir,
+    },
     shouldAttemptSalvage: ({ confirmedNoNewCommit, invokeResult }) =>
       Boolean(invokeResult.success && confirmedNoNewCommit),
     invoke: async () => {

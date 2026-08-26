@@ -607,6 +607,12 @@ export async function performPreMergeAutoFix(
     issueNumber,
     pipelineRunId,
     salvageLabel: repairIdentity.salvageLabel ?? PRE_MERGE_AUTOFIX_SALVAGE_LABEL,
+    mutationOwnership: {
+      repoDir: cfg.repo_dir,
+      domain: cfg.domain ?? "",
+      stage: "pre-merge-auto-fix",
+      extraGlobs: cfg.test_gate?.non_product_dirty_globs ?? [],
+    },
     // Reattach detached HEAD before the harness commits (#359 Finding 3): commits
     // made in a detached worktree don't move the branch ref, so the later push
     // would silently leave the PR branch unchanged while returning success.

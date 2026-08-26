@@ -812,6 +812,13 @@ async function runVisualFixRound(
     issueNumber,
     pipelineRunId,
     salvageLabel: visualFixSalvageStageLabel(issueNumber),
+    mutationOwnership: {
+      repoDir: cfg.repo_dir,
+      domain: cfg.domain ?? "",
+      stage: "visual-fix",
+      extraGlobs: cfg.test_gate?.non_product_dirty_globs ?? [],
+      runDir: opts.runDir,
+    },
     shouldAttemptSalvage: ({ confirmedNoNewCommit, invokeResult }) =>
       Boolean(invokeResult.success && confirmedNoNewCommit),
     invoke: async () => {

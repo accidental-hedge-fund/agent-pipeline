@@ -195,8 +195,14 @@ export const DEFAULT_RECOVERY_POLICY: RecoveryPolicy = compileRecoveryPolicy({
     repeated_evidence_limit: 3,
   },
   "workflow-engine-defect": {
-    // #1020: deterministic unlink of engine-owned scratch before implementer repair.
-    recipes: ["unlink_engine_scratch", "restart_workflow_engine", "repair_pipeline_item"],
+    // #1020 / #1246: unlink scratch, then checkpoint owned harness leftovers,
+    // then restart/repair. Checkpoint is before implementer repair.
+    recipes: [
+      "unlink_engine_scratch",
+      "checkpoint_owned_harness_dirt",
+      "restart_workflow_engine",
+      "repair_pipeline_item",
+    ],
     retry_budget: 2,
     backoff: { initial_seconds: 5, multiplier: 1, max_seconds: 5 },
     terminal_outcome: "retry",
@@ -245,6 +251,13 @@ const STALE_DEFAULT_POLICY_ENTRIES: Partial<Record<DurableBlockerClass, readonly
     // Pre-#1020 default (no unlink_engine_scratch first recipe).
     {
       recipes: ["restart_workflow_engine", "repair_pipeline_item"], retry_budget: 2,
+      backoff: { initial_seconds: 5, multiplier: 1, max_seconds: 5 },
+      terminal_outcome: "retry", run_fatal: true, repeated_evidence_limit: 2,
+    },
+    // Pre-#1246 default (unlink then restart/repair; no owned-leftover checkpoint).
+    {
+      recipes: ["unlink_engine_scratch", "restart_workflow_engine", "repair_pipeline_item"],
+      retry_budget: 2,
       backoff: { initial_seconds: 5, multiplier: 1, max_seconds: 5 },
       terminal_outcome: "retry", run_fatal: true, repeated_evidence_limit: 2,
     },

@@ -11,16 +11,22 @@ import { gitInWorktree } from "../worktree.ts";
 import { runTestGate, testGateBlockReason } from "../testgate.ts";
 import type { TestGateResult } from "../testgate.ts";
 import {
+  classifyOwnedWorktreeDirt,
   classifyWorktreeDirt,
   parsePorcelainPaths,
   productDirtyPaths,
 } from "../worktree-dirt.ts";
 import type { PipelineConfig, Stage } from "../types.ts";
 import type { RunStoreDeps } from "../run-store.ts";
+import {
+  checkpointOwnedHarnessDirt,
+  classifyHarnessMutationDirt,
+  loadOwnershipRecord,
+} from "../harness-mutation-ownership.ts";
 
 export type FormatGateResult =
   | { status: "ok"; committed: boolean }
-  | { status: "blocked"; reason: string };
+  | { status: "blocked"; reason: string; leftoverResidual?: boolean };
 
 export interface FormatGateDeps {
   /** Run a shell command in the worktree, capturing combined stdout+stderr. */
@@ -36,6 +42,16 @@ export interface FormatGateDeps {
   gitCommit?: (wtPath: string, message: string) => Promise<{ ok: true } | { ok: false; error: string }>;
   /** Raw `git status --porcelain` for product-dirt classification (#873). */
   gitStatusPorcelain?: (wtPath: string) => Promise<string>;
+  /**
+   * Pipeline-owned leftover paths (#1246). When present, those product paths
+   * do not trip the unknown-dirt pre-flight and are not committed as
+   * `chore: auto-format`.
+   */
+  ownedLeftoverPaths?: readonly string[] | ((wtPath: string) => Promise<readonly string[]>);
+  /** Checkpoint owned leftovers before auto-fix. */
+  checkpointOwnedLeftovers?: (
+    ownedPaths: readonly string[],
+  ) => Promise<{ checkpointed: boolean }>;
 }
 
 /**
@@ -58,31 +74,51 @@ export async function runFormatGate(
 
   const exec = deps.execInWorktree ?? defaultExecInWorktree;
   const porcelainFn = deps.gitStatusPorcelain ?? defaultGitStatusPorcelain;
+  const resolveOwned = async (): Promise<readonly string[]> => {
+    if (!deps.ownedLeftoverPaths) return [];
+    return typeof deps.ownedLeftoverPaths === "function"
+      ? await deps.ownedLeftoverPaths(wtPath)
+      : deps.ownedLeftoverPaths;
+  };
   // Product-dirt check: prefer porcelain classification when available; fall
   // back to the injectable gitIsDirty boolean (test seams / legacy).
-  const isProductDirty =
+  const isUnknownProductDirty =
     deps.gitIsDirty ??
     (async (p: string) => {
       const paths = parsePorcelainPaths(await porcelainFn(p));
-      return productDirtyPaths(paths, scratchExtraGlobs).length > 0;
+      const owned = await resolveOwned();
+      return classifyOwnedWorktreeDirt(paths, owned, scratchExtraGlobs).unknownProduct.length > 0;
     });
   const commitFn =
     deps.gitCommit ??
     ((p: string, message: string) => defaultGitCommit(p, message, scratchExtraGlobs, porcelainFn));
   let committed = false;
 
-  // Pre-flight: block if the worktree already has product dirt before any
-  // auto-fix command runs — we cannot distinguish pre-existing harness
-  // leftovers from command output, so sweeping them into an auto-format commit
-  // is incorrect. Scratch-only dirt is ignored for this trust check (#873).
+  // Pre-flight: block if the worktree already has **unknown** product dirt
+  // before any auto-fix command runs. Pipeline-owned harness leftovers (#1246)
+  // do not satisfy that unknown-dirt guard and must not be auto-formatted.
   const hasAutoFix = entries.some((e) => e.auto_fix);
-  if (hasAutoFix && (await isProductDirty(wtPath))) {
-    return {
-      status: "blocked",
-      reason:
-        "Format gate blocked: pre-existing uncommitted changes found in worktree before any format command ran " +
-        "(product paths only; engine-known scratch such as tasks/todo.md is ignored)",
-    };
+  if (hasAutoFix) {
+    const owned = await resolveOwned();
+    if (owned.length > 0 && deps.checkpointOwnedLeftovers) {
+      const ck = await deps.checkpointOwnedLeftovers(owned);
+      if (!ck.checkpointed && !(await isUnknownProductDirty(wtPath))) {
+        return {
+          status: "blocked",
+          leftoverResidual: true,
+          reason:
+            "Owned harness leftovers could not be checkpointed; residual pipeline-owned dirt remains",
+        };
+      }
+    }
+    if (await isUnknownProductDirty(wtPath)) {
+      return {
+        status: "blocked",
+        reason:
+          "Format gate blocked: pre-existing uncommitted changes found in worktree before any format command ran " +
+          "(product paths only; engine-known scratch such as tasks/todo.md is ignored)",
+      };
+    }
   }
 
   for (const entry of entries) {
@@ -97,9 +133,9 @@ export async function runFormatGate(
           reason: `Format gate command '${command}' failed:\n${r1.combined}`,
         };
       }
-      // Commit product changes the command produced (not scratch), then re-run
-      // to verify stability. Scratch-only dirt does not trigger a commit.
-      if (await isProductDirty(wtPath)) {
+      // Commit product changes the command produced (not scratch, not owned
+      // leftovers), then re-run to verify stability.
+      if (await isUnknownProductDirty(wtPath)) {
         const commitResult = await commitFn(wtPath, `chore: auto-format (#${issueNumber})`);
         if (!commitResult.ok) {
           return {
@@ -117,7 +153,7 @@ export async function runFormatGate(
         }
         // Verify the re-run itself did not produce more product changes
         // (non-stable formatter). Scratch-only residual is fine (#873).
-        if (await isProductDirty(wtPath)) {
+        if (await isUnknownProductDirty(wtPath)) {
           return {
             status: "blocked",
             reason: `Format gate command '${command}' is non-stable: re-run after auto-fix still produced uncommitted product changes`,
@@ -150,7 +186,7 @@ export type FormatTestGateResult =
   // declared build_command failed while rebuilding artifacts) → build-failed;
   // "format" (a format/lint failure) and "noconverge" (gates still mutating at
   // the round cap) → needs-human.
-  | { ok: false; reason: string; source: "format" | "test" | "noconverge" | "build" };
+  | { ok: false; reason: string; source: "format" | "test" | "noconverge" | "build" | "owned-leftover" };
 
 export interface FormatTestGateDeps {
   runFormatGate?: typeof runFormatGate;
@@ -200,10 +236,38 @@ export async function runFormatAndTestGates(
   let gate: TestGateResult = { skipped: true };
   let converged = false;
   const scratchExtraGlobs = cfg.test_gate?.non_product_dirty_globs ?? [];
+  const ownershipFormatDeps: FormatGateDeps = {
+    ownedLeftoverPaths: async (p) => {
+      const rec = await loadOwnershipRecord({
+        repoDir: cfg.repo_dir,
+        domain: cfg.domain ?? "",
+        issue: issueNumber,
+      });
+      const { gitInWorktree: gitWt } = await import("../worktree.ts");
+      const status = await gitWt(p, ["status", "--porcelain"], { ignoreFailure: true });
+      return classifyHarnessMutationDirt({
+        porcelain: status.stdout,
+        record: rec,
+        extraGlobs: scratchExtraGlobs,
+      }).ownedLeftover;
+    },
+    checkpointOwnedLeftovers: async (ownedPaths) =>
+      checkpointOwnedHarnessDirt({
+        wtPath,
+        issueNumber,
+        pipelineRunId,
+        stageLabel: stage,
+        ownedPaths,
+      }),
+  };
   for (let round = 0; round < MAX_FORMAT_TEST_ROUNDS; round++) {
-    const fmtResult = await fmt(wtPath, cfg, issueNumber, {}, scratchExtraGlobs);
+    const fmtResult = await fmt(wtPath, cfg, issueNumber, ownershipFormatDeps, scratchExtraGlobs);
     if (fmtResult.status === "blocked") {
-      return { ok: false, reason: fmtResult.reason, source: "format" };
+      return {
+        ok: false,
+        reason: fmtResult.reason,
+        source: fmtResult.leftoverResidual ? "owned-leftover" : "format",
+      };
     }
 
     // #387 review-2 finding 1: a format-gate auto-fix commit can modify source
@@ -217,7 +281,20 @@ export async function runFormatAndTestGates(
       }
     }
 
-    gate = await test(cfg, issueNumber, wtPath, {}, pipelineRunId, stage, stateDir, runDir, runStoreDeps);
+    gate = await test(
+      cfg,
+      issueNumber,
+      wtPath,
+      {
+        ownedLeftoverPaths: ownershipFormatDeps.ownedLeftoverPaths,
+        checkpointOwnedLeftovers: ownershipFormatDeps.checkpointOwnedLeftovers,
+      },
+      pipelineRunId,
+      stage,
+      stateDir,
+      runDir,
+      runStoreDeps,
+    );
     if (!gate.skipped && !gate.passed) {
       return { ok: false, reason: testGateBlockReason(gate), source: gate.buildFailure ? "build" : "test" };
     }

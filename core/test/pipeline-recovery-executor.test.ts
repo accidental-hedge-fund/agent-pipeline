@@ -460,6 +460,75 @@ test("DEFAULT_RECOVERY_POLICY recipe order: unlink before repair (#1020)", async
   );
 });
 
+test("checkpoint_owned_harness_dirt succeeds without repair or human hold (#1246)", async () => {
+  let clears = 0;
+  let repairs = 0;
+  const files = new Map<string, string>();
+  const rec = {
+    schema_version: 1,
+    issue: 42,
+    domain: "owner-repo",
+    stage: "implementing",
+    attempt_id: "a1",
+    worktree_path: "/wt/42",
+    pre_head: "h0",
+    pre_porcelain: [] as { path: string; xy: string }[],
+    in_flight: true,
+    last_known_porcelain: [{ path: "core/owned.ts", xy: " M" }],
+    updated_at: "2026-08-26T00:00:00Z",
+  };
+  const execute = realExecuteRecovery(cfg(), {
+    getOnDiskForIssue: async () => ({ path: "/wt/42", slug: "42-x", branch: "pipeline/42-x" } as never),
+    gitInWorktree: async (_path, args) => {
+      if (args[0] === "status") {
+        return { stdout: " M core/owned.ts\n", stderr: "", code: 0 };
+      }
+      return { stdout: "", stderr: "", code: 0 };
+    },
+    clearBlocked: async () => {
+      clears++;
+    },
+    repairPipelineItem: async () => {
+      repairs++;
+      return { succeeded: true, evidence: "should not run" };
+    },
+    ownership: {
+      readFile: async () => JSON.stringify(rec),
+      writeFileAtomic: async (p, c) => {
+        files.set(p, c);
+      },
+      mkdirp: async () => {},
+      gitStatusPorcelain: async () => " M core/owned.ts\n",
+      salvage: async () => ({ salvaged: true, message: "checkpoint" }),
+    },
+  });
+  const diagnostic = buildStageDiagnostic({
+    reasonCode: "workflow-engine-defect",
+    blockerKind: "harness-failure",
+    reason: "owned harness leftovers",
+  });
+  const result = await execute({
+    ...mechanicalInput(),
+    action: "checkpoint_owned_harness_dirt",
+    blockerClass: "workflow-engine-defect",
+    diagnostic,
+  });
+  assert.equal(result.succeeded, true, result.error ?? result.evidence);
+  assert.equal(repairs, 0, "must not invoke repair_pipeline_item when checkpoint clears leftovers");
+  assert.equal(clears, 1, "must not mint a human hold — clear blocked instead");
+  assert.match(result.evidence, /checkpointed owned leftover/);
+});
+
+test("DEFAULT_RECOVERY_POLICY recipe order: checkpoint owned leftovers before repair (#1246)", async () => {
+  const { DEFAULT_RECOVERY_POLICY } = await import("../scripts/loop/recovery.ts");
+  const recipes = DEFAULT_RECOVERY_POLICY["workflow-engine-defect"].recipes;
+  const unlinkIdx = recipes.indexOf("unlink_engine_scratch");
+  const checkpointIdx = recipes.indexOf("checkpoint_owned_harness_dirt");
+  const repairIdx = recipes.indexOf("repair_pipeline_item");
+  assert.ok(checkpointIdx >= 0, "checkpoint_owned_harness_dirt must be configured");
+  assert.ok(unlinkIdx < checkpointIdx && checkpointIdx < repairIdx, `got ${recipes.join(" → ")}`);
+});
+
 test("DEFAULT_RECOVERY_POLICY recipe order: review-findings unlink before repair (#1060)", async () => {
   const { DEFAULT_RECOVERY_POLICY } = await import("../scripts/loop/recovery.ts");
   const recipes = DEFAULT_RECOVERY_POLICY["review-findings"].recipes;
