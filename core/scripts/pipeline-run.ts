@@ -76,6 +76,7 @@ import {
   writeTrustedSurfaceInvalidation,
   type RunStoreDeps,
   type BlockerSetEvent,
+  type RunCompleteStopReason,
   type TerminalLogTee,
 } from "./run-store.ts";
 import {
@@ -321,6 +322,9 @@ export function buildAutoLoopExhaustedComment(
  * burn this budget on the transition *into* ready-to-deploy; terminal
  * finalize is guaranteed separately via {@link shouldRunDeferredTerminalFinalize}
  * so PR tagging / Pipeline Complete never depend on a free iteration slot (#773).
+ * Non-terminal fall-out is an incomplete invocation
+ * ({@link shouldHandleNonterminalIterationExhaustion}), not a successful
+ * `done` summary (#1245).
  */
 export const MAX_ITERATIONS = 12;
 
@@ -339,6 +343,31 @@ export function shouldRunDeferredTerminalFinalize(args: {
 }): boolean {
   if (args.dryRun || args.alreadyFinalized) return false;
   return args.finalStage === "ready-to-deploy";
+}
+
+/**
+ * Whether the advance loop's fall-through of {@link MAX_ITERATIONS} is an
+ * incomplete invocation (#1245). True only when the `for` loop completed
+ * without `break` (`iterationBudgetExhausted`) and the issue is not at a
+ * terminal stage. Not gated on `dryRun`: dry-run still prints the exhausted
+ * line; GitHub park/`setBlocked` stay gated at the call site.
+ *
+ * Pure; exported for unit tests.
+ */
+export function shouldHandleNonterminalIterationExhaustion(args: {
+  iterationBudgetExhausted: boolean;
+  finalStage: Stage | null | undefined;
+}): boolean {
+  if (!args.iterationBudgetExhausted) return false;
+  const stage = args.finalStage;
+  if (!stage) return false;
+  if (stage === "ready-to-deploy" || stage === "needs-human") return false;
+  return true;
+}
+
+/** Operator-visible exhausted line and pre-merge block reason (#1245). */
+export function iterationBudgetExhaustedMessage(stage: Stage, issueNumber: number): string {
+  return `iteration budget exhausted at ${stage}; re-run pipeline ${issueNumber} to continue`;
 }
 
 // ---------------------------------------------------------------------------
@@ -390,28 +419,36 @@ export function isHumanAuthorityBlocker(
 }
 
 /**
- * Preserve a stage's typed block when the in-process retry budget is exhausted.
- * Waiting outcomes have no blocker kind, so one is materialized: pre-merge
- * waits are CI-shaped (`ci-exhausted`); every other stage's wait keeps
- * `needs-human` — the closed BLOCKER_KINDS member that honestly names a
- * generic workflow-state block. It projects to `workflow-state` recovery
- * (see mechanicalReasonCodeForKind), not a human-authority hold — only an
- * attested `human-decision-required` decision is that (isHumanAuthorityBlocker).
+ * Stage → mechanical blocker shape for a budget-exhausted wait. Pre-merge
+ * waits are CI-shaped (`ci-exhausted` → implementation-ci, offramp `ci-failed`);
+ * any other stage's wait keeps `needs-human` (workflow-state, not a
+ * human-authority hold). Shared by auto-loop exhaustion and iteration-budget
+ * death so neither path invents a new `BlockerKind` (#1245).
  */
-export function autoLoopExhaustedBlockedOutcome(out: Outcome, stage: Stage): BlockedOutcome {
+export function exhaustedWaitBlockerMapping(stage: Stage): {
+  blockerKind: BlockerKind;
+  offrampPathTag?: "ci-failed";
+} {
+  if (stage === "pre-merge") {
+    return { blockerKind: "ci-exhausted", offrampPathTag: "ci-failed" };
+  }
+  return { blockerKind: "needs-human" };
+}
+
+/**
+ * Materialize a typed block for an expired wait, or preserve an existing
+ * typed block. `exhaustedReason` is the budget-specific prefix; callers
+ * choose auto-loop vs iteration-budget wording.
+ */
+export function materializeExhaustedBlockedOutcome(
+  out: Outcome,
+  stage: Stage,
+  exhaustedReason: string,
+): BlockedOutcome {
   if (!out.advanced && out.status === "blocked" && out.blockerKind) {
     return out;
   }
-  const reason = out.advanced ? out.summary : out.reason;
-  // An expired wait is workflow state, not evidence of an engine defect:
-  // pre-merge waits are CI-shaped (`ci-exhausted` → implementation-ci); any
-  // other stage's wait (cross-domain planning contention, triage) keeps the
-  // generic workflow-state kind so the durable supervisor recovers it
-  // (non-fatal) instead of run_fataling the loop as a `harness-failure`
-  // workflow-engine-defect it never was.
-  const blockerKind: BlockerKind = stage === "pre-merge" ? "ci-exhausted" : "needs-human";
-  const exhaustedReason = `auto-loop budget exhausted at ${stage}: ${reason}`;
-  const offrampPathTag = stage === "pre-merge" ? "ci-failed" as const : undefined;
+  const { blockerKind, offrampPathTag } = exhaustedWaitBlockerMapping(stage);
   return {
     advanced: false,
     status: "blocked",
@@ -425,6 +462,30 @@ export function autoLoopExhaustedBlockedOutcome(out: Outcome, stage: Stage): Blo
     }),
     ...(offrampPathTag ? { offrampPathTag } : {}),
   };
+}
+
+/**
+ * Preserve a stage's typed block when the in-process retry budget is exhausted.
+ * Waiting outcomes have no blocker kind, so one is materialized: pre-merge
+ * waits are CI-shaped (`ci-exhausted`); every other stage's wait keeps
+ * `needs-human` — the closed BLOCKER_KINDS member that honestly names a
+ * generic workflow-state block. It projects to `workflow-state` recovery
+ * (see mechanicalReasonCodeForKind), not a human-authority hold — only an
+ * attested `human-decision-required` decision is that (isHumanAuthorityBlocker).
+ */
+export function autoLoopExhaustedBlockedOutcome(out: Outcome, stage: Stage): BlockedOutcome {
+  const reason = out.advanced ? out.summary : out.reason;
+  // An expired wait is workflow state, not evidence of an engine defect:
+  // pre-merge waits are CI-shaped (`ci-exhausted` → implementation-ci); any
+  // other stage's wait (cross-domain planning contention, triage) keeps the
+  // generic workflow-state kind so the durable supervisor recovers it
+  // (non-fatal) instead of run_fataling the loop as a `harness-failure`
+  // workflow-engine-defect it never was.
+  return materializeExhaustedBlockedOutcome(
+    out,
+    stage,
+    `auto-loop budget exhausted at ${stage}: ${reason}`,
+  );
 }
 
 interface BlockedOutcomeEventDeps {
@@ -628,6 +689,11 @@ export interface AdvanceDeps {
    * Unit tests inject a hermetic env so host `REPO_DIR` cannot pin a clone.
    */
   env?: NodeJS.ProcessEnv;
+  /**
+   * Block-issue seam (#1245). Tests inject a spy so iteration-budget park
+   * does not call GitHub. Production default is module-level {@link setBlocked}.
+   */
+  setBlocked?: typeof setBlocked;
 }
 
 /**
@@ -996,6 +1062,7 @@ export async function runAdvance(
   deps: AdvanceDeps = {},
 ): Promise<void> {
   const nowFn = deps.now ?? (() => Date.now());
+  const setBlockedFn = deps.setBlocked ?? setBlocked;
   await withLock(
     cfg.domain,
     async () => {
@@ -2027,6 +2094,11 @@ export async function runAdvance(
     // can exhaust MAX_ITERATIONS on the advance that labels the issue R2D, leaving
     // PR tagging / Pipeline Complete unrun unless we defer-finalize after the loop.
     let deployReadyFinalized = false;
+    // Non-terminal MAX_ITERATIONS fall-through (#1245). Snapshot the stage
+    // before any park so run_complete.final_state stays the pre-park stage.
+    let iterationIncomplete = false;
+    let exhaustionStage: Stage | undefined;
+    let runCompleteStopReason: RunCompleteStopReason | undefined;
 
     /** Run terminal finalize + lifecycle events. Shared by in-loop R2D branch and post-loop guarantee. */
     async function runTerminalFinalize(reason: "in-loop" | "deferred"): Promise<Outcome> {
@@ -2067,7 +2139,8 @@ export async function runAdvance(
     }
 
     try {
-    for (let i = 0; i < MAX_ITERATIONS; i++) {
+    let i = 0;
+    for (; i < MAX_ITERATIONS; i++) {
       const detail = await (deps.getIssueDetail ?? getIssueDetail)(cfg, issueNumber);
       const stage = pickStage(detail.labels);
       if (!stage) {
@@ -2435,7 +2508,7 @@ export async function runAdvance(
             `(${roundsRemaining} rounds, ${minutesRemaining.toFixed(1)}m remaining)`,
           );
           if (!opts.dryRun) {
-            await postComment(
+            await (deps.postComment ?? postComment)(
               cfg,
               issueNumber,
               buildAutoLoopContinuationComment(cfg, autoLoopRoundsSpent, stage, out.reason, roundsRemaining, minutesRemaining),
@@ -2461,7 +2534,7 @@ export async function runAdvance(
           );
           if (!opts.dryRun) {
             if (out.status !== "blocked") {
-              await setBlocked(
+              await setBlockedFn(
                 cfg,
                 issueNumber,
                 exhaustedOutcome.reason,
@@ -2478,7 +2551,7 @@ export async function runAdvance(
                 );
               }
             }
-            await postComment(
+            await (deps.postComment ?? postComment)(
               cfg,
               issueNumber,
               buildAutoLoopExhaustedComment(cfg, autoLoopRoundsSpent, stage, out.status, out.reason, elapsedMinutes),
@@ -2512,6 +2585,7 @@ export async function runAdvance(
     // ready-to-deploy, leaving no free iteration for the in-loop R2D branch.
     // deploy_ready.finalize is idempotent (summary comment + PR label + worktree
     // removal); run it here so PR tagging never depends on spare budget.
+    const iterationBudgetExhausted = i === MAX_ITERATIONS;
     if (
       shouldRunDeferredTerminalFinalize({
         dryRun: !!opts.dryRun,
@@ -2520,6 +2594,51 @@ export async function runAdvance(
       })
     ) {
       await runTerminalFinalize("deferred");
+    } else if (
+      shouldHandleNonterminalIterationExhaustion({
+        iterationBudgetExhausted,
+        finalStage,
+      })
+    ) {
+      exhaustionStage = finalStage;
+      iterationIncomplete = true;
+      runCompleteStopReason = "iteration-budget-exhausted";
+      // Pre-merge only: reuse the extracted ci-exhausted mapping with an
+      // iteration-budget reason (never the auto-loop prefix) and park-release.
+      if (exhaustionStage === "pre-merge" && !opts.dryRun) {
+        const exhaustedReason = iterationBudgetExhaustedMessage(
+          exhaustionStage,
+          issueNumber,
+        );
+        const exhaustedOutcome = materializeExhaustedBlockedOutcome(
+          { advanced: false, status: "waiting", reason: exhaustedReason },
+          exhaustionStage,
+          exhaustedReason,
+        );
+        await setBlockedFn(
+          cfg,
+          issueNumber,
+          exhaustedOutcome.reason,
+          exhaustionStage,
+          exhaustedOutcome.blockerKind,
+        );
+        if (runDir) {
+          await emitBlockedOutcomeEvents(
+            runDir,
+            issueNumber,
+            exhaustionStage,
+            exhaustedOutcome,
+            runStoreDeps,
+          ).catch(() => {});
+        }
+        await maybeReleaseWorktreeOnPark(
+          cfg,
+          issueNumber,
+          exhaustedOutcome,
+          !!opts.dryRun,
+          deps,
+        );
+      }
     }
     } finally {
       // Finalize + notify however the loop ended — normal, blocked, or thrown.
@@ -2611,7 +2730,7 @@ export async function runAdvance(
             await finalizeRun(runDir, finalized, stateDir, issueNumber, runStartedAtIso, {
               ...runStoreDeps,
               evaluationPinSubject: readinessSubject ?? null,
-            }).catch(() => {});
+            }, undefined, runCompleteStopReason).catch(() => {});
           }
           // Opt-in papercut auto-file (#421): best-effort, gated on resolved
           // config, wrapped so a failure here can never alter the run's outcome.
@@ -2655,9 +2774,16 @@ export async function runAdvance(
     }
 
     const elapsed = Math.round((nowFn() - t0) / 1000);
-    tlog(
-      `\n[pipeline] #${issueNumber}: done — ${startStage} → ${lastStage} (${transitions} transitions, ${elapsed}s)`,
-    );
+    if (iterationIncomplete) {
+      tlog(
+        `[pipeline] #${issueNumber}: ${iterationBudgetExhaustedMessage(exhaustionStage ?? finalStage, issueNumber)}`,
+      );
+      process.exitCode = 1;
+    } else {
+      tlog(
+        `\n[pipeline] #${issueNumber}: done — ${startStage} → ${lastStage} (${transitions} transitions, ${elapsed}s)`,
+      );
+    }
 
     } finally {
       // Stop the terminal.log tee AFTER the final 'done' line above is written so

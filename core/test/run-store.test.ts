@@ -973,6 +973,38 @@ test("finalizeRun: appends run_complete event with final_state and elapsed_ms", 
   assert.equal(complete.final_state, "ready-to-deploy");
   assert.ok(typeof complete.elapsed_ms === "number", "elapsed_ms must be a number");
   assert.equal(complete.schema_version, 1);
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(complete, "stop_reason"),
+    false,
+    "omitted stop_reason must leave the field absent",
+  );
+});
+
+test("finalizeRun: omitted stop_reason leaves the field absent (#1245)", async () => {
+  const { deps, readFile } = memRunStore();
+  await finalizeRun(RUN_DIR, makeBundle(), STATE_DIR, ISSUE, STARTED_AT_ISO, deps);
+  const complete = JSON.parse(readFile(EVENTS_JSONL).trim().split("\n").pop()!);
+  assert.equal(complete.type, "run_complete");
+  assert.equal("stop_reason" in complete, false);
+});
+
+test("finalizeRun: stop_reason is copied onto run_complete when provided (#1245)", async () => {
+  const { deps, readFile } = memRunStore();
+  await finalizeRun(
+    RUN_DIR,
+    makeBundle("pre-merge"),
+    STATE_DIR,
+    ISSUE,
+    STARTED_AT_ISO,
+    deps,
+    undefined,
+    "iteration-budget-exhausted",
+  );
+  const complete = JSON.parse(readFile(EVENTS_JSONL).trim().split("\n").pop()!);
+  assert.equal(complete.type, "run_complete");
+  assert.equal(complete.final_state, "pre-merge");
+  assert.equal(complete.stop_reason, "iteration-budget-exhausted");
+  assert.equal(complete.schema_version, 1);
 });
 
 test("finalizeRun: writes summary.json to run directory", async () => {

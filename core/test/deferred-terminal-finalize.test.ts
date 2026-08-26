@@ -9,6 +9,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   MAX_ITERATIONS,
+  shouldHandleNonterminalIterationExhaustion,
   shouldRunDeferredTerminalFinalize,
 } from "../scripts/pipeline-run.ts";
 import type { Stage } from "../scripts/types.ts";
@@ -104,6 +105,97 @@ test("shouldRunDeferredTerminalFinalize: false when finalStage is null/undefined
  * the entire iteration budget without a free slot for the R2D terminal stage.
  * The deferred-finalize decision must still fire when finalStage is R2D.
  */
+test("shouldHandleNonterminalIterationExhaustion: true for exhausted non-terminal stages (#1245)", () => {
+  assert.equal(
+    shouldHandleNonterminalIterationExhaustion({
+      iterationBudgetExhausted: true,
+      finalStage: "pre-merge",
+    }),
+    true,
+  );
+  assert.equal(
+    shouldHandleNonterminalIterationExhaustion({
+      iterationBudgetExhausted: true,
+      finalStage: "review-1",
+    }),
+    true,
+  );
+  for (const finalStage of [
+    "fix-2",
+    "eval-gate",
+    "visual-gate",
+    "shipcheck-gate",
+    "implementing",
+  ] as Stage[]) {
+    assert.equal(
+      shouldHandleNonterminalIterationExhaustion({
+        iterationBudgetExhausted: true,
+        finalStage,
+      }),
+      true,
+      `expected true for finalStage=${finalStage}`,
+    );
+  }
+});
+
+test("shouldHandleNonterminalIterationExhaustion: false for R2D, needs-human, and no fall-through", () => {
+  assert.equal(
+    shouldHandleNonterminalIterationExhaustion({
+      iterationBudgetExhausted: true,
+      finalStage: "ready-to-deploy",
+    }),
+    false,
+  );
+  assert.equal(
+    shouldHandleNonterminalIterationExhaustion({
+      iterationBudgetExhausted: true,
+      finalStage: "needs-human",
+    }),
+    false,
+  );
+  assert.equal(
+    shouldHandleNonterminalIterationExhaustion({
+      iterationBudgetExhausted: false,
+      finalStage: "pre-merge",
+    }),
+    false,
+  );
+  assert.equal(
+    shouldHandleNonterminalIterationExhaustion({
+      iterationBudgetExhausted: false,
+      finalStage: "review-1",
+    }),
+    false,
+  );
+  assert.equal(
+    shouldHandleNonterminalIterationExhaustion({
+      iterationBudgetExhausted: true,
+      finalStage: null,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldHandleNonterminalIterationExhaustion({
+      iterationBudgetExhausted: true,
+      finalStage: undefined,
+    }),
+    false,
+  );
+});
+
+test("shouldHandleNonterminalIterationExhaustion: not gated on dryRun", () => {
+  const result = shouldHandleNonterminalIterationExhaustion({
+    iterationBudgetExhausted: true,
+    finalStage: "pre-merge",
+  });
+  assert.equal(result, true);
+  assert.equal(
+    shouldHandleNonterminalIterationExhaustion.length,
+    1,
+    "helper takes one args object; dryRun is not a parameter",
+  );
+});
+
 test("shouldRunDeferredTerminalFinalize: #770-shaped iteration burn still defers finalize", () => {
   // Stages that each consume one MAX_ITERATIONS slot on the dogfood path:
   const burn: Stage[] = [

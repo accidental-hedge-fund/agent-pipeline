@@ -1,3 +1,26 @@
+# #1245 Revised plan — MAX_ITERATIONS fall-through is incomplete
+
+## Status
+
+- [x] Plan review NEEDS_REVISION incorporated (see chat `## Feedback Incorporated`)
+- [x] Implementation (`runAdvance` post-loop + extracted blocker mapping + additive `stop_reason`)
+- [x] Injected tests (pre-merge, review-1, waiting-on-last-slot, deferred R2D, persisted JSONL)
+- [x] `node scripts/build.mjs` after `core/` edits; regenerated `plugin/`
+- [x] `npm run ci`
+
+## Locked decisions (post plan-review)
+
+1. Exhaustion is for-loop fall-through: `let i = 0; for (; i < MAX_ITERATIONS; i++)`; `iterationBudgetExhausted = (i === MAX_ITERATIONS)`. Every explicit `break` leaves the flag false.
+2. Extract the `pre-merge` → `ci-exhausted` mapping from `autoLoopExhaustedBlockedOutcome`. New reason names iteration-budget exhaustion. Auto-loop reason prefix stays on the auto-loop path only.
+3. Auto-loop in-loop continue/exhaust is unchanged. New handler runs only on fall-through. No double-park. Last-slot auto-loop `continue` then cap → iteration-budget path, not auto-loop exhausted comment.
+4. Snapshot `finalStage` before park. `run_complete.final_state` stays the pre-park stage (e.g. `pre-merge`), never `blocked`.
+5. Write `run_complete` first, then `process.exitCode = 1` at the current `done —` site. Never `process.exit()`.
+6. Tests read persisted `events.jsonl`. `#773` deferred R2D stays. `MAX_ITERATIONS` stays 12.
+
+See `openspec/changes/advance-iteration-budget-exhaustion/`.
+
+---
+
 # #1236 Revised plan — launcher bootstrap on supported Node
 
 ## Status

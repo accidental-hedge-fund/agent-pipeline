@@ -51,6 +51,18 @@
       "emitter": "setBlocked"
     },
     {
+      "site_id": "pipeline-run:dynamic#1",
+      "module": "scripts/pipeline-run.ts",
+      "line": 2617,
+      "occurrence": 1,
+      "match": "dynamic",
+      "disposition": "deliberately-fail-closed",
+      "blocker_kind": null,
+      "canonical_reason": "implementation-ci",
+      "notes": "MAX_ITERATIONS fall-through at pre-merge parks with ci-exhausted (#1245); not auto-loop budget",
+      "emitter": "setBlocked"
+    },
+    {
       "site_id": "porcelain-dirt-sites:dynamic#0",
       "module": "scripts/porcelain-dirt-sites.ts",
       "line": 88,
