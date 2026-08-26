@@ -811,6 +811,13 @@ export async function advanceFix(
     issueNumber,
     pipelineRunId,
     salvageLabel: fixSalvageStageLabel(round, issueNumber),
+    mutationOwnership: {
+      repoDir: cfg.repo_dir,
+      domain: cfg.domain ?? "",
+      stage: "fix",
+      extraGlobs: cfg.test_gate?.non_product_dirty_globs ?? [],
+      runDir: opts.runDir,
+    },
     // Ensure the worktree is on its pipeline branch before the harness commits.
     // The review stage may have checked out a specific SHA (detached HEAD); any
     // commits made while detached don't move the branch ref, so the later push
@@ -1337,9 +1344,9 @@ export async function advanceFix(
   );
   if (!gates.ok) {
     await setBlocked(cfg, issueNumber, gates.reason, stage,
-      gates.source === "test" ? "test-gate-exhausted" : gates.source === "build" ? "build-failed" : "needs-human");
+      gates.source === "test" ? "test-gate-exhausted" : gates.source === "build" ? "build-failed" : gates.source === "owned-leftover" ? "harness-failure" : "needs-human");
     return { advanced: false, status: "blocked", reason: gates.reason,
-      blockerKind: gates.source === "test" ? "test-gate-exhausted" : gates.source === "build" ? "build-failed" : "needs-human" };
+      blockerKind: gates.source === "test" ? "test-gate-exhausted" : gates.source === "build" ? "build-failed" : gates.source === "owned-leftover" ? "harness-failure" : "needs-human" };
   }
 
   // ---- Docs freshness (#716): after format/test, before push ----

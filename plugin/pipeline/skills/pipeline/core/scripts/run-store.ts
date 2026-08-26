@@ -365,6 +365,16 @@ export interface EngineDriftEvent extends RunEventBase {
   observed: RunEngineIdentity;
 }
 
+/** Durable leftover vs unknown-dirt disposition (#1246). Additive; schema_version stays 1. */
+export interface HarnessMutationOwnershipEvent extends RunEventBase {
+  type: "harness_mutation_ownership";
+  disposition: "recovered" | "checkpointed" | "resumed" | "rejected";
+  issue: number;
+  attempt_id: string;
+  owned_path_count: number;
+  unknown_paths?: string[];
+}
+
 /** A blocking finding was demoted to advisory because its `recommendation`
  *  reinstates a design alternative a settled finding's `rejected_alternatives`
  *  already required removed (#483) — the escape neither `matchSettledFinding`
@@ -477,6 +487,7 @@ export type RunEvent =
   | DeltaRoundCeilingEvent
   | DeltaChurnSuspectedEvent
   | EngineDriftEvent
+  | HarnessMutationOwnershipEvent
   | HumanInterventionEvent
   | CorrectionEvent
   | ProductFaultEvent

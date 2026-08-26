@@ -65,7 +65,7 @@ test("porcelain dirt drift-guard: every discovered production module has an inve
     discovered.length >= 4,
     `expected several porcelain-related modules, got ${discovered.length}: ${discovered.map((d) => d.module).join(", ")}`,
   );
-  const { missing, orphans, undeclaredBypass, ok } = diffPorcelainDirtInventory(discovered);
+  const { missing, orphans, undeclaredBypass, missingOwnership, ok } = diffPorcelainDirtInventory(discovered);
   assert.equal(
     missing.length,
     0,
@@ -80,6 +80,11 @@ test("porcelain dirt drift-guard: every discovered production module has an inve
     undeclaredBypass.length,
     0,
     `uses-shared-classifier without shared classifier symbols: ${undeclaredBypass.map((u) => u.site_id).join("; ")}`,
+  );
+  assert.equal(
+    missingOwnership.length,
+    0,
+    `dirt-trust sites missing ownership consultation: ${missingOwnership.map((u) => u.site_id).join("; ")}`,
   );
   assert.equal(ok, true);
 });
@@ -116,6 +121,15 @@ test("ad-hoc bypass of shared classifier fails closed in intent", () => {
 // ---------------------------------------------------------------------------
 // Residual engine-scratch block kind projection (#1020)
 // ---------------------------------------------------------------------------
+
+test("dirt-trust site without ownership consultation fails the guard", () => {
+  const row = PORCELAIN_DIRT_SITES.find((s) => s.module === "scripts/stages/format-gate.ts");
+  assert.ok(row);
+  assert.equal(row!.dirt_trust, true);
+  assert.equal(row!.ownership_consultation, "consults-harness-mutation-ownership");
+  const testgate = PORCELAIN_DIRT_SITES.find((s) => s.module === "scripts/testgate.ts");
+  assert.equal(testgate?.ownership_consultation, "consults-harness-mutation-ownership");
+});
 
 test("residual engine-scratch harness-failure projects workflow-engine-defect recover", () => {
   const diagnostic = buildStageDiagnostic({

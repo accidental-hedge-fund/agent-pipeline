@@ -32,6 +32,23 @@ export interface DirtClassification {
   scratch: string[];
 }
 
+/**
+ * Ternary porcelain classification (#1246): scratch vs pipeline-owned harness
+ * leftovers vs unknown product dirt. Owned leftovers are a caller-supplied path
+ * set (from durable mutation ownership); this helper never invents ownership.
+ */
+export interface TernaryDirtClassification {
+  scratch: string[];
+  ownedLeftover: string[];
+  unknownProduct: string[];
+}
+
+/** One `git status --porcelain` row after unquoting (rename/copy: both ends). */
+export interface PorcelainEntry {
+  path: string;
+  xy: string;
+}
+
 /** Unquote a porcelain path segment (`"path with space"` → path with space). */
 function unquotePorcelainPath(raw: string): string {
   const trimmed = raw.trim();
@@ -48,23 +65,31 @@ function unquotePorcelainPath(raw: string): string {
  * gate (#873 review 2). Pure — no I/O.
  */
 export function parsePorcelainPaths(statusOutput: string): string[] {
-  const paths: string[] = [];
+  return parsePorcelainEntries(statusOutput).map((e) => e.path);
+}
+
+/**
+ * Parse `git status --porcelain` into path + XY status. Rename/copy records
+ * contribute **both** endpoints (same XY). Pure — no I/O.
+ */
+export function parsePorcelainEntries(statusOutput: string): PorcelainEntry[] {
+  const entries: PorcelainEntry[] = [];
   for (const line of statusOutput.split("\n")) {
     if (line.length < 3) continue;
+    const xy = line.slice(0, 2);
     const rest = line.slice(3); // two-char status + space
     const arrow = rest.indexOf(" -> ");
     if (arrow >= 0) {
-      // Rename/copy: "old -> new" — keep both so either endpoint can be product.
       const src = unquotePorcelainPath(rest.slice(0, arrow));
       const dst = unquotePorcelainPath(rest.slice(arrow + 4));
-      if (src) paths.push(src);
-      if (dst) paths.push(dst);
+      if (src) entries.push({ path: src, xy });
+      if (dst) entries.push({ path: dst, xy });
     } else {
       const unquoted = unquotePorcelainPath(rest);
-      if (unquoted) paths.push(unquoted);
+      if (unquoted) entries.push({ path: unquoted, xy });
     }
   }
-  return paths;
+  return entries;
 }
 
 /**
@@ -90,6 +115,35 @@ export function productDirtyPaths(
   extraGlobs: readonly string[] = [],
 ): string[] {
   return classifyWorktreeDirt(paths, extraGlobs).product;
+}
+
+/**
+ * Classify porcelain paths into scratch | owned leftover | unknown product.
+ * Scratch wins over ownership. Paths in `ownedLeftoverPaths` that are not
+ * scratch become owned leftovers; every other product path is unknown.
+ * Missing/empty owned set ⇒ all product dirt is unknown (fail closed).
+ */
+export function classifyOwnedWorktreeDirt(
+  paths: readonly string[],
+  ownedLeftoverPaths: readonly string[] | ReadonlySet<string> = [],
+  extraGlobs: readonly string[] = [],
+): TernaryDirtClassification {
+  const ownedSet =
+    ownedLeftoverPaths instanceof Set
+      ? ownedLeftoverPaths
+      : new Set(ownedLeftoverPaths);
+  const scratch: string[] = [];
+  const ownedLeftover: string[] = [];
+  const unknownProduct: string[] = [];
+  for (const p of paths) {
+    if (isNonProductScratchPath(p, extraGlobs)) {
+      scratch.push(p);
+      continue;
+    }
+    if (ownedSet.has(p)) ownedLeftover.push(p);
+    else unknownProduct.push(p);
+  }
+  return { scratch, ownedLeftover, unknownProduct };
 }
 
 /**

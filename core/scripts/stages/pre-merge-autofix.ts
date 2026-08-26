@@ -10,7 +10,7 @@ import {
   extractSpecDivergenceDirection,
   findingKey,
 } from "../review-policy.ts";
-import { runHarnessRound } from "../harness-round.ts";
+import { OWNERSHIP_CHECKPOINT_FAILED_REASON, runHarnessRound } from "../harness-round.ts";
 import {
   evaluatePostHarnessNoNewCommit,
   formatNoopAdvanceEvidenceNote,
@@ -607,6 +607,12 @@ export async function performPreMergeAutoFix(
     issueNumber,
     pipelineRunId,
     salvageLabel: repairIdentity.salvageLabel ?? PRE_MERGE_AUTOFIX_SALVAGE_LABEL,
+    mutationOwnership: {
+      repoDir: cfg.repo_dir,
+      domain: cfg.domain ?? "",
+      stage: "pre-merge-auto-fix",
+      extraGlobs: cfg.test_gate?.non_product_dirty_globs ?? [],
+    },
     // Reattach detached HEAD before the harness commits (#359 Finding 3): commits
     // made in a detached worktree don't move the branch ref, so the later push
     // would silently leave the PR branch unchanged while returning success.
@@ -656,6 +662,9 @@ export async function performPreMergeAutoFix(
     afterRound: async (ctx) => {
       const result = ctx.invokeResult;
       const headBefore = ctx.headBefore;
+      if (ctx.ownershipCheckpointFailed) {
+        return { status: "error" as const, diagnostic: OWNERSHIP_CHECKPOINT_FAILED_REASON };
+      }
       // hasNewCommitHarness uses pre-salvage equality: when salvage ran, either
       // it created a commit (salvaged) or confirmed no-new-commit. When salvage
       // did not run, confirmedNoNewCommit is false only if HEAD advanced.

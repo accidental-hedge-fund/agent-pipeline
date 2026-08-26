@@ -80,7 +80,11 @@ import { runTestGate } from "../testgate.ts";
 import { runFormatGate, runFormatAndTestGates } from "./format-gate.ts";
 import { makePipelineRunId, withTrailers } from "../traceability.ts";
 import { trySalvageUncommittedWork } from "../salvage-harness-work.ts";
-import { runHarnessRound } from "../harness-round.ts";
+import { OWNERSHIP_CHECKPOINT_FAILED_REASON, runHarnessRound } from "../harness-round.ts";
+import {
+  recoverInterruptedImplement as defaultRecoverInterruptedImplement,
+  type OwnershipDeps,
+} from "../harness-mutation-ownership.ts";
 import {
   evaluatePostHarnessNoNewCommit,
   formatNoopAdvanceEvidenceNote,
@@ -296,6 +300,11 @@ export interface AdvanceOpts {
    * entitlement/throttle recovery does not re-run planning harness work.
    */
   resumePlanReview?: boolean;
+  /**
+   * #1246: re-enter the implementer after checkpointing owned leftovers.
+   * Skips planning/plan-review and uses the existing worktree.
+   */
+  resumeImplementing?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -439,6 +448,7 @@ type RunPlanningPhasesDeps = BootstrapWorktreeDeps &
      * (#588 / #758). Defaults to `openspec.listChangeDirs`.
      */
     listChangeDirs?: (dir: string) => string[];
+    getOnDiskForIssue?: typeof getOnDiskForIssue;
   };
 
 interface PlanningLifecycle {
@@ -577,16 +587,17 @@ export async function runPlanningPhases(
   const primary: Harness = cfg.harnesses.implementer;
   const reviewer: string = cfg.harnesses.reviewer;
   const resumePlanReview = opts.resumePlanReview === true;
+  const resumeImplementing = opts.resumeImplementing === true;
   let wt: { path: string; branch: string } | undefined;
   let activeLifecycle = await startPlanningLifecycle(
     cfg,
     issueNumber,
-    resumePlanReview ? "plan-review" : "planning",
+    resumeImplementing ? "implementing" : resumePlanReview ? "plan-review" : "planning",
     opts,
     deps,
   );
 
-  if (!opts.dryRun && !resumePlanReview) {
+  if (!opts.dryRun && !resumePlanReview && !resumeImplementing) {
     await doTransition(cfg, issueNumber, "ready", "planning", `Planning started by ${primary}.`);
   }
 
@@ -598,6 +609,36 @@ export async function runPlanningPhases(
   }
 
   try {
+
+  let planText: string;
+  let promptPlanText: string;
+  let specContext: string | undefined;
+  let planComment: string;
+  let revisedPlan: string;
+
+  if (resumeImplementing) {
+    const existing = await (deps.getOnDiskForIssue ?? getOnDiskForIssue)(cfg, issueNumber);
+    if (!existing) {
+      await doSetBlocked(
+        cfg,
+        issueNumber,
+        "implement resume requested but no managed worktree exists",
+        "implementing",
+        "worktree-missing",
+      );
+      await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked");
+      return blockedOutcome("no managed worktree for implement resume", "worktree-missing");
+    }
+    wt = { path: existing.path, branch: branchName(issueNumber, existing.slug) };
+    const detail = await (deps.getIssueDetail ?? getIssueDetail)(cfg, issueNumber);
+    const existingPlan = extractPlan(detail.comments ?? []);
+    planText =
+      existingPlan && existingPlan !== "(plan not found in comments)" ? existingPlan : "";
+    promptPlanText = planText;
+    specContext = undefined;
+    planComment = planText;
+    revisedPlan = planText;
+  } else {
 
   // ---- Step 0: optional carry-forward context (last30days) + cross-repo context ----
   const [carryForward, crossRepoContext] = await Promise.all([
@@ -631,12 +672,6 @@ export async function runPlanningPhases(
   // ---- Step 0b: pre-planning context snapshot (human comments) ----
   // Gathered after bootstrap so comments posted during the bootstrap window are included.
   const contextSnapshot = await gatherContextSnapshot(cfg, issueNumber, body, deps);
-
-  let planText: string;
-  let promptPlanText: string;
-  let specContext: string | undefined;
-  /** Body of the posted plan comment — used to detect human feedback deltas. */
-  let planComment: string;
 
   if (resumePlanReview) {
     // #870: reuse the completed plan — do not re-invoke the planning harness.
@@ -693,7 +728,7 @@ export async function runPlanningPhases(
   }
 
   // ---- Plan review + revision (skippable via steps.plan_review) ----
-  let revisedPlan = planText;
+  revisedPlan = planText;
   let preImplStage: Stage = resumePlanReview ? "plan-review" : "planning";
   if (cfg.steps.plan_review) {
     if (!resumePlanReview) {
@@ -1004,6 +1039,19 @@ export async function runPlanningPhases(
   );
   activeLifecycle = await startPlanningLifecycle(cfg, issueNumber, "implementing", opts, deps, wt.path);
 
+  } // !resumeImplementing
+
+  if (!wt) {
+    await doSetBlocked(
+      cfg,
+      issueNumber,
+      "implement stage has no managed worktree",
+      "implementing",
+      "worktree-missing",
+    );
+    return blockedOutcome("no managed worktree for implement", "worktree-missing");
+  }
+
   // ---- Build implementation plan and invoke implementer harness ----
   const implPlan = await hooks.buildImplPlan(wt, revisedPlan);
   // Pre-implement detection (#716): generator presence + steps.docs drives the
@@ -1029,6 +1077,13 @@ export async function runPlanningPhases(
     pipelineRunId,
     salvageLabel: "implement",
     shouldAttemptSalvage: ({ confirmedNoNewCommit }) => confirmedNoNewCommit,
+    mutationOwnership: {
+      repoDir: cfg.repo_dir,
+      domain: cfg.domain ?? "",
+      stage: "implementing",
+      extraGlobs: cfg.test_gate?.non_product_dirty_globs ?? [],
+      runDir: opts.runDir,
+    },
     invoke: () =>
       invokeImplementer(
         primary,
@@ -1072,6 +1127,18 @@ export async function runPlanningPhases(
     afterRound: async (ctx) => {
       const result = ctx.invokeResult;
       const implHeadBefore = ctx.headBefore;
+
+      if (ctx.ownershipCheckpointFailed) {
+        await doSetBlocked(
+          cfg,
+          issueNumber,
+          OWNERSHIP_CHECKPOINT_FAILED_REASON,
+          "implementing",
+          "harness-failure",
+        );
+        await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
+        return blockedOutcome(OWNERSHIP_CHECKPOINT_FAILED_REASON, "harness-failure");
+      }
 
       if (!result.success) {
         const reason = result.timed_out
@@ -1948,7 +2015,12 @@ export async function resumeFromImplementing(
     opts.runDir, opts.runStoreDeps,
   );
   if (!gates.ok) {
-    const blockerKind: BlockerKind = gates.source === "test" ? "test-gate-exhausted" : "needs-human";
+    const blockerKind: BlockerKind =
+      gates.source === "test"
+        ? "test-gate-exhausted"
+        : gates.source === "owned-leftover"
+          ? "harness-failure"
+          : "needs-human";
     await blocker(
       cfg, issueNumber, gates.reason, "implementing",
       blockerKind,
@@ -1976,7 +2048,12 @@ export async function resumeFromImplementing(
       opts.runDir, opts.runStoreDeps,
     );
     if (!postHealGates.ok) {
-      const blockerKind: BlockerKind = postHealGates.source === "test" ? "test-gate-exhausted" : "needs-human";
+      const blockerKind: BlockerKind =
+        postHealGates.source === "test"
+          ? "test-gate-exhausted"
+          : postHealGates.source === "owned-leftover"
+            ? "harness-failure"
+            : "needs-human";
       await blocker(
         cfg, issueNumber, postHealGates.reason, "implementing",
         blockerKind,
@@ -2148,6 +2225,13 @@ export interface DispatchResumeDeps {
   isLivePlanningActive?: typeof isLivePlanningActive;
   transition?: typeof transition;
   planningAdvance?: typeof advance;
+  recoverInterruptedImplement?: typeof defaultRecoverInterruptedImplement;
+  probeImplementDeliverable?: (
+    wtPath: string,
+    issueNumber: number,
+  ) => Promise<{ present: boolean }>;
+  ownershipDeps?: OwnershipDeps;
+  setBlocked?: typeof setBlocked;
 }
 
 /**
@@ -2173,6 +2257,9 @@ export async function dispatchResume(
   const checkLive = deps.isLivePlanningActive ?? isLivePlanningActive;
   const trans = deps.transition ?? transition;
   const planningAdvance = deps.planningAdvance ?? advance;
+  const recoverInterrupted =
+    deps.recoverInterruptedImplement ?? defaultRecoverInterruptedImplement;
+  const blocker = deps.setBlocked ?? setBlocked;
 
   if (opts.dryRun) {
     console.log(`[pipeline] #${issueNumber}: [dry-run] would resume from implementing: check gate + push + PR + review-1`);
@@ -2190,6 +2277,80 @@ export async function dispatchResume(
   }
 
   const wt = await getWt(cfg, issueNumber);
+  const pipelineRunIdEarly = opts.pipelineRunId ?? makePipelineRunId(issueNumber);
+  if (wt) {
+    const probe = deps.probeImplementDeliverable;
+    const deliverablePresent = probe
+      ? (await probe(wt.path, issueNumber)).present
+      : false;
+    let recovered: Awaited<ReturnType<typeof recoverInterrupted>> = {
+      action: "none",
+      classified: { scratch: [], ownedLeftover: [], unknownProduct: [] },
+      checkpointed: false,
+      record: null,
+    };
+    try {
+      recovered = await recoverInterrupted(
+        {
+          repoDir: cfg.repo_dir ?? "",
+          domain: cfg.domain ?? "",
+          issue: issueNumber,
+          wtPath: wt.path,
+          pipelineRunId: pipelineRunIdEarly,
+          extraGlobs: cfg.test_gate?.non_product_dirty_globs ?? [],
+          runDir: opts.runDir,
+          deliverablePresent,
+        },
+        deps.ownershipDeps,
+      );
+    } catch {
+      recovered = {
+        action: "none",
+        classified: { scratch: [], ownedLeftover: [], unknownProduct: [] },
+        checkpointed: false,
+        record: null,
+      };
+    }
+    if (recovered.action === "blocked") {
+      const reason = recovered.failureReason
+        ? `Owned harness leftovers could not be checkpointed: ${recovered.failureReason}`
+        : "Owned harness leftovers could not be checkpointed; residual pipeline-owned dirt remains";
+      console.log(`[pipeline] #${issueNumber}: ${reason}`);
+      await blocker(cfg, issueNumber, reason, "implementing", "harness-failure");
+      return blockedOutcome(reason, "harness-failure");
+    }
+    if (recovered.action === "rejected") {
+      const unknown = recovered.classified.unknownProduct;
+      const reason =
+        "Format gate blocked: pre-existing uncommitted changes found in worktree before any format command ran " +
+        "(product paths only; engine-known scratch such as tasks/todo.md is ignored)" +
+        (unknown.length > 0 ? `: ${unknown.join(", ")}` : "");
+      console.log(`[pipeline] #${issueNumber}: ${reason}`);
+      await blocker(cfg, issueNumber, reason, "implementing", "needs-human");
+      return blockedOutcome(reason, "needs-human");
+    }
+    if (recovered.action === "reinvoke") {
+      console.log(
+        `[pipeline] #${issueNumber}: interrupted implement with owned leftovers — checkpointed and re-invoking implementer`,
+      );
+      return planningAdvance(cfg, issueNumber, {
+        dryRun: opts.dryRun,
+        model: opts.model,
+        pipelineRunId: pipelineRunIdEarly,
+        stateDir: opts.stateDir,
+        runDir: opts.runDir,
+        runStoreDeps: opts.runStoreDeps,
+        resumeImplementing: true,
+      });
+    }
+    if (recovered.action === "post-implement") {
+      console.log(
+        `[pipeline] #${issueNumber}: owned leftovers checkpointed; implement deliverable present — resuming post-implement`,
+      );
+      // Fall through to resumeFromImplementing below (commits-ahead path).
+    }
+  }
+
   if (!wt || !(await commitsAhead(wt.path, cfg.base_branch))) {
     console.log(
       `[pipeline] #${issueNumber}: recovered stranded implementing attempt — restarting from ready`,

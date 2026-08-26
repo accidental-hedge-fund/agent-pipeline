@@ -41,7 +41,7 @@ function makeFakeFs(initial: string | null): { deps: ArtifactIgnoreDeps; get(): 
 // Contract (drift guard, #5.1/#5.3)
 // ---------------------------------------------------------------------------
 
-test("ARTIFACT_CONTRACT: contains exactly runs/, roadmap/, history/, evals/, control-attributions.jsonl, product-fault-reports.jsonl, handoffs/, outcomes/, lineage/, and frg/ with non-empty comments", () => {
+test("ARTIFACT_CONTRACT: contains exactly runs/, roadmap/, history/, evals/, control-attributions.jsonl, product-fault-reports.jsonl, handoffs/, outcomes/, lineage/, frg/, and harness-ownership/ with non-empty comments", () => {
   const names = ARTIFACT_CONTRACT.map((e) => e.name);
   assert.deepEqual(names, [
     "runs",
@@ -54,6 +54,7 @@ test("ARTIFACT_CONTRACT: contains exactly runs/, roadmap/, history/, evals/, con
     "outcomes",
     "lineage",
     "frg",
+    "harness-ownership",
   ]);
   for (const entry of ARTIFACT_CONTRACT) {
     assert.ok(entry.comment.length > 0, `entry ${entry.name} must have a non-empty comment`);

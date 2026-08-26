@@ -30,11 +30,13 @@ import {
 } from "./verify-harness-commits.ts";
 import { makePipelineRunId, validateCommitTrailers } from "./traceability.ts";
 import { trySalvageUncommittedWork } from "./salvage-harness-work.ts";
+import { runWithMutationOwnership } from "./harness-mutation-ownership.ts";
 import { makeCommandRecord, recordCommand } from "./evidence-bundle.ts";
 import { buildFailureBlockReason, includeBuildArtifacts, type BuildSideEffectsDeps } from "./build-side-effects.ts";
 import { buildStageAccountingRecord } from "./accounting.ts";
 import { emitStageAccounting, type RunStoreDeps } from "./run-store.ts";
 import {
+  classifyOwnedWorktreeDirt,
   formatProductDirtDisclosure,
   parsePorcelainPaths,
   productDirtyPaths,
@@ -164,6 +166,11 @@ export interface TestGateDeps {
   /** Return raw `git status --porcelain` output for dirty-path surfacing in block
    *  reasons (#352). Injectable so tests can verify path inclusion without real git. */
   gitStatusPorcelain?: (cwd: string) => Promise<string>;
+  /** Pipeline-owned leftover paths (#1246); not unknown product dirt. */
+  ownedLeftoverPaths?: readonly string[] | ((wtPath: string) => Promise<readonly string[]>);
+  checkpointOwnedLeftovers?: (
+    ownedPaths: readonly string[],
+  ) => Promise<{ checkpointed: boolean }>;
   /** Build-artifact side-effect inclusion deps (#387). Folds any uncommitted
    *  artifact changes produced by a repo-declared `build_command` into a
    *  fix-attempt's commit before the test command re-runs. A no-op when
@@ -501,6 +508,13 @@ export async function runTestGate(
    * 3. Dirty + empty porcelain → fail closed as product dirt without path
    *    disclosure (legacy pure-boolean dirty seams).
    */
+  const resolveOwned = async (): Promise<readonly string[]> => {
+    if (!deps.ownedLeftoverPaths) return [];
+    return typeof deps.ownedLeftoverPaths === "function"
+      ? await deps.ownedLeftoverPaths(wtPath)
+      : deps.ownedLeftoverPaths;
+  };
+
   const resolveProductDirt = async (): Promise<{
     productPaths: string[];
     dirty: boolean;
@@ -511,8 +525,22 @@ export async function runTestGate(
     const porcelain = await gitStatusPorcelainFn(wtPath);
     const paths = parsePorcelainPaths(porcelain);
     if (paths.length > 0) {
-      const productPaths = productDirtyPaths(paths, scratchExtraGlobs);
-      return { productPaths, dirty: productPaths.length > 0 };
+      const owned = await resolveOwned();
+      const ternary = classifyOwnedWorktreeDirt(paths, owned, scratchExtraGlobs);
+      if (ternary.ownedLeftover.length > 0 && deps.checkpointOwnedLeftovers) {
+        await deps.checkpointOwnedLeftovers(ternary.ownedLeftover);
+        const after = parsePorcelainPaths(await gitStatusPorcelainFn(wtPath));
+        const afterOwned = await resolveOwned();
+        const afterT = classifyOwnedWorktreeDirt(after, afterOwned, scratchExtraGlobs);
+        return {
+          productPaths: afterT.unknownProduct,
+          dirty: afterT.unknownProduct.length > 0,
+        };
+      }
+      return {
+        productPaths: ternary.unknownProduct,
+        dirty: ternary.unknownProduct.length > 0,
+      };
     }
     return { productPaths: [], dirty: true };
   };
@@ -766,21 +794,40 @@ export async function runTestGate(
     // Capture HEAD before the harness runs so we can inspect only its commits.
     const headBefore = await gitHeadFn(wtPath);
     const fixModel = cfg.models.fix;
-    const fixRes = await invokeFn(harness, wtPath, prompt, {
-      timeoutSec: cfg.fix_timeout,
-      model: fixModel,
-      sandbox: cfg.harness_sandbox,
-      accounting: runDir
-        ? {
-            runDir,
-            runStoreDeps,
-            issue: issueNumber,
-            stage: stageLabel,
-            modelSlot: "fix",
-            model: fixModel,
-          }
-        : undefined,
-    });
+    const invokeFix = () =>
+      invokeFn(harness, wtPath, prompt, {
+        timeoutSec: cfg.fix_timeout,
+        model: fixModel,
+        sandbox: cfg.harness_sandbox,
+        accounting: runDir
+          ? {
+              runDir,
+              runStoreDeps,
+              issue: issueNumber,
+              stage: stageLabel,
+              modelSlot: "fix",
+              model: fixModel,
+            }
+          : undefined,
+      });
+    // Production (default invoke) persists mutation ownership before spawn (#1246).
+    // Tests inject `invoke` and skip the durable write.
+    const fixRes =
+      deps.invoke === undefined
+        ? await runWithMutationOwnership(
+            {
+              repoDir: cfg.repo_dir,
+              domain: cfg.domain ?? "",
+              issue: issueNumber,
+              stage: "test-fix",
+              wtPath,
+              pipelineRunId,
+              extraGlobs: scratchExtraGlobs,
+              runDir,
+              invoke: invokeFix,
+            },
+          )
+        : await invokeFix();
     if (!fixRes.success) {
       const reason = fixRes.timed_out
         ? `Fix harness (${harness}) timed out after ${fixRes.duration.toFixed(0)}s on test-gate fix attempt ${attempt}.`

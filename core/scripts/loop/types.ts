@@ -152,6 +152,11 @@ export const RECOVERY_RECIPES = [
    * implementer repair on the workflow-engine / engine-scratch path.
    */
   "unlink_engine_scratch",
+  /**
+   * #1246: checkpoint pipeline-owned harness leftovers (owned paths only)
+   * before implementer repair. Ordered after unlink_engine_scratch.
+   */
+  "checkpoint_owned_harness_dirt",
   "repair_pipeline_item",
   "rerun_ci",
   "resync_workflow_state",

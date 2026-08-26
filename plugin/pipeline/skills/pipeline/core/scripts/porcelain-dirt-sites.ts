@@ -38,8 +38,17 @@ export interface PorcelainDirtSiteEntry {
   module: string;
   disposition: PorcelainDirtDisposition;
   /** How scratch is classified when disposition is uses-shared-classifier. */
-  classifier?: "classifyWorktreeDirt" | "productDirtyPaths" | "classifyPreArchiveDirt" | "classifyPorcelainForScratchRecover";
+  classifier?: "classifyWorktreeDirt" | "productDirtyPaths" | "classifyPreArchiveDirt" | "classifyPorcelainForScratchRecover" | "classifyOwnedWorktreeDirt";
   notes: string;
+  /**
+   * Dirt-trust sites can refuse auto-fix or implementing-resume on product
+   * porcelain. Those MUST consult harness mutation ownership (#1246).
+   */
+  dirt_trust?: boolean;
+  ownership_consultation?:
+    | "consults-harness-mutation-ownership"
+    | "not-applicable"
+    | "explicit-exception";
 }
 
 /**
@@ -62,7 +71,9 @@ export const PORCELAIN_DIRT_SITES: readonly PorcelainDirtSiteEntry[] = [
     disposition: "uses-shared-classifier",
     classifier: "productDirtyPaths",
     notes:
-      "Dirty-trust pre/post test run; productDirtyPaths; scratch-only does not mint dirtyWorktree block (#873 / #1013)",
+      "Dirty-trust pre/post test run; productDirtyPaths + classifyOwnedWorktreeDirt; scratch-only does not mint dirtyWorktree block (#873 / #1013 / #1246)",
+    dirt_trust: true,
+    ownership_consultation: "consults-harness-mutation-ownership",
   },
   {
     site_id: "stages.format-gate",
@@ -70,7 +81,9 @@ export const PORCELAIN_DIRT_SITES: readonly PorcelainDirtSiteEntry[] = [
     disposition: "uses-shared-classifier",
     classifier: "classifyWorktreeDirt",
     notes:
-      "Format auto-fix dirty trust + product-only commit; classifyWorktreeDirt / productDirtyPaths (#873)",
+      "Format auto-fix dirty trust + product-only commit; classifyWorktreeDirt / classifyOwnedWorktreeDirt (#873 / #1246)",
+    dirt_trust: true,
+    ownership_consultation: "consults-harness-mutation-ownership",
   },
   {
     site_id: "salvage-harness-work",
@@ -198,7 +211,18 @@ export const PORCELAIN_DIRT_SITES: readonly PorcelainDirtSiteEntry[] = [
     site_id: "stages.planning",
     module: "scripts/stages/planning.ts",
     disposition: "not-porcelain-dirt-gate",
-    notes: "Scoped openspec config / salvage; dirt gates for implement use testgate/format-gate classifiers",
+    notes:
+      "Scoped openspec config / salvage; implementing-resume consults harness mutation ownership before format-gate (#1246)",
+    dirt_trust: true,
+    ownership_consultation: "consults-harness-mutation-ownership",
+  },
+  {
+    site_id: "harness-mutation-ownership",
+    module: "scripts/harness-mutation-ownership.ts",
+    disposition: "uses-shared-classifier",
+    classifier: "classifyOwnedWorktreeDirt",
+    notes: "Durable leftover-vs-unknown classifier; not a setBlocked site itself (#1246)",
+    ownership_consultation: "consults-harness-mutation-ownership",
   },
   {
     site_id: "stages.release",
@@ -245,7 +269,7 @@ export function porcelainDirtSiteForModule(
 
 /** Patterns that mark a production file as a porcelain dirt-related site. */
 const PORCELAIN_SIGNAL =
-  /status",\s*"--porcelain|status',\s*'--porcelain|gitStatusPorcelain|parsePorcelainPaths|classifyWorktreeDirt|productDirtyPaths|classifyPreArchiveDirt|classifyPorcelainForScratchRecover|ENGINE_NON_PRODUCT_SCRATCH/;
+  /status",\s*"--porcelain|status',\s*'--porcelain|gitStatusPorcelain|parsePorcelainPaths|classifyWorktreeDirt|productDirtyPaths|classifyPreArchiveDirt|classifyPorcelainForScratchRecover|classifyOwnedWorktreeDirt|classifyHarnessMutationDirt|ENGINE_NON_PRODUCT_SCRATCH/;
 
 /** Modules that are pure helpers / inventory and always inventoried via worktree-dirt or this file. */
 const SELF_MODULES = new Set([
@@ -318,11 +342,13 @@ export interface PorcelainDirtInventoryDiff {
   orphans: PorcelainDirtSiteEntry[];
   /** uses-shared-classifier sites that do not reference the shared helper symbols. */
   undeclaredBypass: PorcelainDirtSiteEntry[];
+  /** Dirt-trust sites that omit harness mutation ownership consultation (#1246). */
+  missingOwnership: PorcelainDirtSiteEntry[];
   ok: boolean;
 }
 
 const SHARED_CLASSIFIER_SYMBOL =
-  /classifyWorktreeDirt|productDirtyPaths|classifyPreArchiveDirt|classifyPorcelainForScratchRecover|ENGINE_NON_PRODUCT_SCRATCH|isNonProductScratchPath/;
+  /classifyWorktreeDirt|productDirtyPaths|classifyPreArchiveDirt|classifyPorcelainForScratchRecover|classifyOwnedWorktreeDirt|classifyHarnessMutationDirt|ENGINE_NON_PRODUCT_SCRATCH|isNonProductScratchPath/;
 
 /**
  * Diff discovery against inventory. Missing production modules fail.
@@ -362,11 +388,27 @@ export function diffPorcelainDirtInventory(
     }
   }
 
+  const missingOwnership: PorcelainDirtSiteEntry[] = [];
+  for (const site of PORCELAIN_DIRT_SITES) {
+    if (!site.dirt_trust) continue;
+    if (
+      site.ownership_consultation !== "consults-harness-mutation-ownership" &&
+      site.ownership_consultation !== "explicit-exception"
+    ) {
+      missingOwnership.push(site);
+    }
+  }
+
   return {
     missing,
     orphans,
     undeclaredBypass,
-    ok: missing.length === 0 && orphans.length === 0 && undeclaredBypass.length === 0,
+    missingOwnership,
+    ok:
+      missing.length === 0 &&
+      orphans.length === 0 &&
+      undeclaredBypass.length === 0 &&
+      missingOwnership.length === 0,
   };
 }
 

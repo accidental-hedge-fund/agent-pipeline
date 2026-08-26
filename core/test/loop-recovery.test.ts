@@ -189,6 +189,7 @@ test("deterministic redispatch precedes provider-neutral model repair for mechan
   assert.equal(DEFAULT_RECOVERY_POLICY["review-findings"].repeated_evidence_limit, 2);
   assert.deepEqual(DEFAULT_RECOVERY_POLICY["workflow-engine-defect"].recipes, [
     "unlink_engine_scratch",
+    "checkpoint_owned_harness_dirt",
     "restart_workflow_engine",
     "repair_pipeline_item",
   ]);
@@ -936,6 +937,7 @@ test("upgradeContractForRecovery: exact pre-#787 defaults gain deterministic rep
   assert.deepEqual(upgraded.recovery_policy["review-findings"], DEFAULT_RECOVERY_POLICY["review-findings"]);
   assert.deepEqual(upgraded.recovery_policy["workflow-engine-defect"].recipes, [
     "unlink_engine_scratch",
+    "checkpoint_owned_harness_dirt",
     "restart_workflow_engine",
     "repair_pipeline_item",
   ]);

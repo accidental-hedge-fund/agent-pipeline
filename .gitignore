@@ -35,3 +35,6 @@ node_modules/
 # Local Factory Reliability Gate (FRG) evidence including latest.json;
 # engine-written, never committed on the factory control checkout.
 .agent-pipeline/frg/
+
+# Durable harness mutation-ownership records (#1246); host-local, never committed.
+.agent-pipeline/harness-ownership/

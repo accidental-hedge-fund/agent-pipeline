@@ -52,7 +52,7 @@ import {
 } from "../verify-harness-commits.ts";
 import { makePipelineRunId, validateCommitTrailers } from "../traceability.ts";
 import { trySalvageUncommittedWork } from "../salvage-harness-work.ts";
-import { runHarnessRound } from "../harness-round.ts";
+import { OWNERSHIP_CHECKPOINT_FAILED_REASON, runHarnessRound } from "../harness-round.ts";
 import { makeCommandRecord, makePromptRecord, recordCommand, recordPrompt } from "../evidence-bundle.ts";
 import { redactSecrets } from "../artifact-sanitize.ts";
 import type { BlockerKind, Harness, Outcome, PipelineConfig, Stage } from "../types.ts";
@@ -812,6 +812,13 @@ async function runVisualFixRound(
     issueNumber,
     pipelineRunId,
     salvageLabel: visualFixSalvageStageLabel(issueNumber),
+    mutationOwnership: {
+      repoDir: cfg.repo_dir,
+      domain: cfg.domain ?? "",
+      stage: "visual-fix",
+      extraGlobs: cfg.test_gate?.non_product_dirty_globs ?? [],
+      runDir: opts.runDir,
+    },
     shouldAttemptSalvage: ({ confirmedNoNewCommit, invokeResult }) =>
       Boolean(invokeResult.success && confirmedNoNewCommit),
     invoke: async () => {
@@ -838,6 +845,9 @@ async function runVisualFixRound(
     },
     afterRound: async (ctx) => {
       const fixRes = ctx.invokeResult;
+      if (ctx.ownershipCheckpointFailed) {
+        return { ok: false, reason: OWNERSHIP_CHECKPOINT_FAILED_REASON, blockerKind: "harness-failure" };
+      }
       if (!fixRes.success) {
         const reason = fixRes.timed_out
           ? `Fix harness (${harness}) timed out after ${fixRes.duration.toFixed(0)}s on visual-gate fix round ${attempt}.`

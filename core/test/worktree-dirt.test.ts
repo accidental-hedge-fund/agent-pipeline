@@ -3,6 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  classifyOwnedWorktreeDirt,
   classifyPorcelainForScratchRecover,
   classifyWorktreeDirt,
   ENGINE_NON_PRODUCT_SCRATCH_GLOBS,
@@ -11,6 +12,7 @@ import {
   isNonProductScratchPath,
   isSafeScratchExtensionGlob,
   matchScratchGlob,
+  parsePorcelainEntries,
   parsePorcelainPaths,
   PRODUCT_PATH_CANARIES,
   productDirtyPaths,
@@ -20,6 +22,29 @@ test("classifier: empty paths → empty product and scratch", () => {
   const c = classifyWorktreeDirt([]);
   assert.deepEqual(c.product, []);
   assert.deepEqual(c.scratch, []);
+});
+
+test("ternary classifier: missing owned set ⇒ product is unknown", () => {
+  const c = classifyOwnedWorktreeDirt(["core/scripts/foo.ts", "tasks/todo.md"]);
+  assert.deepEqual(c.unknownProduct, ["core/scripts/foo.ts"]);
+  assert.deepEqual(c.ownedLeftover, []);
+  assert.deepEqual(c.scratch, ["tasks/todo.md"]);
+});
+
+test("ternary classifier: owned leftover vs unknown vs scratch", () => {
+  const c = classifyOwnedWorktreeDirt(
+    ["core/owned.ts", "core/unknown.ts", "tasks/todo.md"],
+    ["core/owned.ts"],
+  );
+  assert.deepEqual(c.ownedLeftover, ["core/owned.ts"]);
+  assert.deepEqual(c.unknownProduct, ["core/unknown.ts"]);
+  assert.deepEqual(c.scratch, ["tasks/todo.md"]);
+});
+
+test("parsePorcelainEntries preserves XY", () => {
+  const entries = parsePorcelainEntries(" M core/scripts/foo.ts\n?? tasks/todo.md\n");
+  assert.equal(entries[0]?.xy, " M");
+  assert.equal(entries[0]?.path, "core/scripts/foo.ts");
 });
 
 test("classifier: scratch-only (tasks/todo.md + pipeline prompt) → no product dirt", () => {

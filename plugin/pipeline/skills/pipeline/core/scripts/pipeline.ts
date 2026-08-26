@@ -89,6 +89,13 @@ import {
   resolveVerifiedRemoteHead,
 } from "./transient-wrappers.ts";
 import { classifyPorcelainForScratchRecover } from "./worktree-dirt.ts";
+import {
+  checkpointOwnedHarnessDirt,
+  classifyHarnessMutationDirt,
+  loadOwnershipRecord,
+  emitOwnershipEvidence,
+  type OwnershipDeps,
+} from "./harness-mutation-ownership.ts";
 import { resolveEngineCommitSha } from "./engine-attribution.ts";
 import { formatPipelineVersionJson } from "./ship-end-identity.ts";
 import {
@@ -1831,6 +1838,7 @@ export interface RealExecuteRecoveryDeps {
     wtPath: string,
   ) => Promise<{ skipped: boolean; passed?: boolean }>;
   postComment?: typeof postComment;
+  ownership?: OwnershipDeps;
 }
 
 /** Production provider-neutral recovery registry. Substantive repair delegates
@@ -2393,6 +2401,84 @@ export function realExecuteRecovery(
     };
   };
 
+  const checkpointOwnedHarnessDirtRecipe = async (
+    input: ExecuteRecoveryInput,
+  ): Promise<RepairPipelineItemResult> => {
+    const issueNumber = Number(input.itemId);
+    if (!Number.isSafeInteger(issueNumber) || issueNumber <= 0) {
+      return failed(`checkpoint_owned_harness_dirt requires a positive numeric item id`);
+    }
+    if (input.blockerClass === "specification-decision" || input.blockerClass === "missing-authority") {
+      return failed(`checkpoint_owned_harness_dirt does not apply to human-authority class ${input.blockerClass}`);
+    }
+    const wt = await getWorktree(cfg, issueNumber);
+    if (!wt) {
+      return failed(`checkpoint_owned_harness_dirt: no managed worktree for #${issueNumber}`);
+    }
+    const extraGlobs = cfg.test_gate?.non_product_dirty_globs ?? [];
+    const rec = await loadOwnershipRecord({
+      repoDir: cfg.repo_dir,
+      domain: cfg.domain ?? "",
+      issue: issueNumber,
+    }, deps.ownership);
+    const status = await gitInWt(
+      wt.path,
+      ["status", "--porcelain", "--untracked-files=all"],
+      { ignoreFailure: true },
+    );
+    if (status.code !== 0) {
+      return failed(
+        `checkpoint_owned_harness_dirt: git status failed (exit ${status.code})`,
+      );
+    }
+    const classified = classifyHarnessMutationDirt({
+      porcelain: status.stdout,
+      record: rec,
+      extraGlobs,
+    });
+    if (classified.ownedLeftover.length === 0) {
+      return failed(
+        `checkpoint_owned_harness_dirt: no current owned leftovers — trying next recipe`,
+      );
+    }
+    const pipelineRunId = input.runId || makePipelineRunId(issueNumber);
+    const ck = await checkpointOwnedHarnessDirt({
+      wtPath: wt.path,
+      issueNumber,
+      pipelineRunId,
+      stageLabel: rec?.stage ?? "implement",
+      ownedPaths: classified.ownedLeftover,
+    }, deps.ownership);
+    if (!ck.checkpointed) {
+      return failed(
+        `checkpoint_owned_harness_dirt: salvage failed${ck.failureReason ? `: ${ck.failureReason}` : ""}`,
+      );
+    }
+    if (rec) {
+      await emitOwnershipEvidence({
+        repoDir: cfg.repo_dir,
+        domain: cfg.domain ?? "",
+        issue: issueNumber,
+        record: { ...rec, in_flight: false },
+        disposition: classified.unknownProduct.length > 0 ? "checkpointed" : "recovered",
+        ownedPathCount: classified.ownedLeftover.length,
+        unknownPaths: classified.unknownProduct,
+      }).catch(() => {});
+    }
+    try {
+      await clear(cfg, issueNumber);
+    } catch (err) {
+      return failed(
+        `checkpoint_owned_harness_dirt: could not clear blocked: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    return {
+      succeeded: true,
+      evidence:
+        `checkpoint_owned_harness_dirt: checkpointed owned leftover paths [${classified.ownedLeftover.slice(0, 8).join(", ")}]`,
+    };
+  };
+
   return async (input) => {
     const projection = projectStageDiagnostic(input.diagnostic);
     if (projection.disposition !== "recover" || projection.blockerClass !== input.blockerClass) {
@@ -2413,6 +2499,8 @@ export function realExecuteRecovery(
         return verifyHeadGoal(input);
       case "unlink_engine_scratch":
         return unlinkEngineScratch(input);
+      case "checkpoint_owned_harness_dirt":
+        return checkpointOwnedHarnessDirtRecipe(input);
       case "wait_and_retry":
       case "rerun_ci":
       case "resync_workflow_state":

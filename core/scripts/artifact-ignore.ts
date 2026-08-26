@@ -102,6 +102,15 @@ export const FRG_ARTIFACT: ArtifactContractEntry = {
     "Local FRG evidence including latest.json; engine-written, never committed on the factory control checkout.",
 };
 
+/** Host-local harness mutation-ownership records (#1246). Per-issue JSON under
+ *  `.agent-pipeline/harness-ownership/<domain>/`; survives process exit so a
+ *  later launcher can tell pipeline-owned leftovers from unknown dirt. */
+export const HARNESS_OWNERSHIP_ARTIFACT: ArtifactContractEntry = {
+  name: "harness-ownership",
+  comment:
+    "Durable harness mutation-ownership records (#1246); host-local, never committed.",
+};
+
 /** Ordered contract of every `.agent-pipeline/` directory (or file) the
  *  engine writes. No other module SHALL independently define an
  *  `.agent-pipeline/` artifact path — derive it from an entry here instead. */
@@ -116,6 +125,7 @@ export const ARTIFACT_CONTRACT: readonly ArtifactContractEntry[] = [
   OUTCOMES_ARTIFACT,
   LINEAGE_ARTIFACT,
   FRG_ARTIFACT,
+  HARNESS_OWNERSHIP_ARTIFACT,
 ];
 
 /** Resolve `<repoDir>/.agent-pipeline/<entry.name>` for a contract entry. */
