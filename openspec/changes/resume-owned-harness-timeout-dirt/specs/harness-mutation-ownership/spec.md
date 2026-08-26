@@ -34,6 +34,7 @@ The engine SHALL write a durable mutation-ownership record for every product-mut
 - **THEN** the owned leftover set SHALL include `dir/owned.ts`
 - **AND** SHALL NOT include `dir/unrelated.ts`
 - **AND** the checkpoint SHALL stage `dir/owned.ts` and SHALL NOT stage `dir/unrelated.ts`
+- **AND** the engine SHALL NOT re-invoke a product-mutating harness while `dir/unrelated.ts` remains unknown product dirt
 
 ---
 
@@ -103,7 +104,8 @@ When a later process (or the same process on the timeout path) observes pipeline
 - **WHEN** porcelain includes owned leftover path `P` and unknown product path `U`
 - **THEN** the checkpoint commit SHALL include `P`
 - **AND** SHALL NOT include `U`
-- **AND** unknown-dirt refusal MAY still apply to `U` after the checkpoint
+- **AND** unknown-dirt refusal SHALL apply to `U` after the checkpoint
+- **AND** the engine SHALL NOT re-invoke a product-mutating harness while `U` remains unknown product dirt
 
 #### Scenario: Same-process timeout checkpoints when the process can still run
 

@@ -734,8 +734,8 @@ export function interruptedIncompleteImplement(
 
 /**
  * Re-entry helper: checkpoint owned leftovers for an interrupted implement.
- * Returns whether the implementer must be re-invoked (deliverable unsatisfied)
- * or post-implement may continue.
+ * Returns whether the implementer must be re-invoked (deliverable unsatisfied),
+ * post-implement may continue, or unknown product dirt remains and must refuse.
  */
 export async function recoverInterruptedImplement(input: {
   repoDir: string;
@@ -747,7 +747,7 @@ export async function recoverInterruptedImplement(input: {
   runDir?: string;
   deliverablePresent: boolean;
 }, deps: OwnershipDeps = {}): Promise<{
-  action: "reinvoke" | "post-implement" | "none" | "blocked";
+  action: "reinvoke" | "post-implement" | "none" | "blocked" | "rejected";
   classified: TernaryDirtClassification;
   checkpointed: boolean;
   evidence?: OwnershipTerminalEvidence;
@@ -792,8 +792,27 @@ export async function recoverInterruptedImplement(input: {
         record: next,
         extraGlobs: input.extraGlobs,
       });
+      if (classified.unknownProduct.length > 0) {
+        evidence = await emitOwnershipEvidence(
+          {
+            ...input,
+            record: next,
+            disposition: "rejected",
+            ownedPathCount: 0,
+            unknownPaths: classified.unknownProduct,
+          },
+          deps,
+        );
+        return {
+          action: "rejected",
+          classified,
+          checkpointed: true,
+          evidence,
+          record: { ...next, last_evidence: evidence },
+        };
+      }
       const disposition: OwnershipDisposition = input.deliverablePresent
-        ? (classified.unknownProduct.length > 0 ? "checkpointed" : "recovered")
+        ? "recovered"
         : "resumed";
       evidence = await emitOwnershipEvidence(
         {
@@ -808,15 +827,6 @@ export async function recoverInterruptedImplement(input: {
       if (!input.deliverablePresent) {
         return {
           action: "reinvoke",
-          classified,
-          checkpointed: true,
-          evidence,
-          record: { ...next, last_evidence: evidence },
-        };
-      }
-      if (classified.unknownProduct.length === 0) {
-        return {
-          action: "post-implement",
           classified,
           checkpointed: true,
           evidence,

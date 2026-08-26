@@ -2307,6 +2307,16 @@ export async function dispatchResume(
       await blocker(cfg, issueNumber, reason, "implementing", "harness-failure");
       return blockedOutcome(reason, "harness-failure");
     }
+    if (recovered.action === "rejected") {
+      const unknown = recovered.classified.unknownProduct;
+      const reason =
+        "Format gate blocked: pre-existing uncommitted changes found in worktree before any format command ran " +
+        "(product paths only; engine-known scratch such as tasks/todo.md is ignored)" +
+        (unknown.length > 0 ? `: ${unknown.join(", ")}` : "");
+      console.log(`[pipeline] #${issueNumber}: ${reason}`);
+      await blocker(cfg, issueNumber, reason, "implementing", "needs-human");
+      return blockedOutcome(reason, "needs-human");
+    }
     if (recovered.action === "reinvoke") {
       console.log(
         `[pipeline] #${issueNumber}: interrupted implement with owned leftovers — checkpointed and re-invoking implementer`,

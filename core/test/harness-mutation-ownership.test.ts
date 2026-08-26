@@ -542,6 +542,8 @@ test("hard-kill with pre-existing product dirt checkpoints only new paths and le
   assert.ok(!committed[0]?.includes("core/operator.ts"));
   assert.deepEqual(out.classified.unknownProduct, ["core/operator.ts"]);
   assert.equal(out.checkpointed, true);
+  assert.equal(out.action, "rejected");
+  assert.notEqual(out.action, "reinvoke");
 
   const gate = await runFormatGate(
     "/wt",
@@ -1117,7 +1119,10 @@ test("untracked directory snapshot is file-granular; later operator file stays u
   assert.ok(!committed[0]?.includes("dir/unrelated.ts"));
   assert.deepEqual(out.classified.unknownProduct, ["dir/unrelated.ts"]);
   assert.equal(out.checkpointed, true);
-  assert.equal(out.action, "reinvoke");
+  assert.equal(out.action, "rejected");
+  assert.notEqual(out.action, "reinvoke");
+  assert.equal(out.evidence?.disposition, "rejected");
+  assert.deepEqual(out.evidence?.unknown_paths, ["dir/unrelated.ts"]);
 });
 
 test("failed checkpoint preserves ownership record and does not reinvoke", async () => {
@@ -1229,4 +1234,56 @@ test("dispatchResume: failed leftover checkpoint emits harness-failure and does 
   assert.equal(out.blockerKind, "harness-failure");
   assert.equal(blocked.kind, "harness-failure");
   assert.match(blocked.reason ?? "", /could not be checkpointed/);
+});
+
+test("dispatchResume: residual unknown product dirt after checkpoint does not reinvoke", async () => {
+  const cfg = makeCfg();
+  let implementerCalls = 0;
+  let resumePost = false;
+  const blocked: { kind?: string; reason?: string } = {};
+  const out = await dispatchResume(
+    cfg,
+    758,
+    { pipelineRunId: "run-unknown" },
+    {
+      isLivePlanningActive: () => false,
+      getForIssue: async () => ({ path: "/wt", branch: "pipeline/758-x", slug: "x" }),
+      hasCommitsAhead: async () => true,
+      getIssueDetail: async () => ({ title: "p0", body: "" }) as never,
+      resumeFromImplementing: async () => {
+        resumePost = true;
+        return { advanced: true, from: "implementing" as Stage, to: "design-gate" as Stage, summary: "PR" };
+      },
+      planningAdvance: async () => {
+        implementerCalls++;
+        return { advanced: true, from: "implementing" as Stage, to: "review-1" as Stage, summary: "reinvoked" };
+      },
+      setBlocked: async (_cfg, _n, reason, _stage, kind) => {
+        blocked.reason = reason;
+        blocked.kind = kind;
+      },
+      recoverInterruptedImplement: async () => ({
+        action: "rejected" as const,
+        classified: { scratch: [], ownedLeftover: [], unknownProduct: ["dir/unrelated.ts"] },
+        checkpointed: true,
+        evidence: {
+          disposition: "rejected" as const,
+          issue: 758,
+          attempt_id: "a1",
+          owned_path_count: 0,
+          unknown_paths: ["dir/unrelated.ts"],
+          at: "2026-08-26T00:00:00Z",
+        },
+        record: recordFixture({ in_flight: false }),
+      }),
+    },
+  );
+  assert.equal(implementerCalls, 0);
+  assert.equal(resumePost, false);
+  assert.equal(out.advanced, false);
+  assert.equal(out.status, "blocked");
+  assert.equal(out.blockerKind, "needs-human");
+  assert.equal(blocked.kind, "needs-human");
+  assert.match(blocked.reason ?? "", /pre-existing uncommitted changes/);
+  assert.match(blocked.reason ?? "", /dir\/unrelated\.ts/);
 });
