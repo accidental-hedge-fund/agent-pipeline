@@ -6,7 +6,7 @@ Persist mutation ownership for product-mutating harness attempts so a later proc
 
 ### Requirement: Product-mutating harness attempts SHALL persist durable mutation ownership before spawn
 
-The engine SHALL write a durable mutation-ownership record for every product-mutating harness attempt (implement, fix-round, test-fix, and pre-merge auto-fix) **before** the harness child is spawned. The record SHALL include at least: schema version, issue identity, stage, attempt identity, managed worktree path, pre-attempt HEAD, and pre-attempt product porcelain (path identity sufficient to detect later adds, deletes, and content changes). The write SHALL be durable across process exit (host-local run-store or equivalent run artifact, not in-memory only). The attempt SHALL be marked in-flight until the engine clears that flag after the attempt completes with no owned leftovers. The engine SHALL NOT spawn the harness when the pre-attempt record cannot be made durable; in that case it SHALL fail closed without claiming later dirt as owned.
+The engine SHALL write a durable mutation-ownership record for every product-mutating harness attempt (implement, fix-round, test-fix, and pre-merge auto-fix) **before** the harness child is spawned. The record SHALL include at least: schema version, issue identity, stage, attempt identity, managed worktree path, pre-attempt HEAD, and pre-attempt product porcelain (path identity sufficient to detect later adds, deletes, and content changes). Untracked porcelain in ownership snapshots and current-status reads SHALL be recorded at file granularity (`git status --porcelain --untracked-files=all` or equivalent). The engine SHALL NOT treat an untracked directory as a single owned path. The write SHALL be durable across process exit (host-local run-store or equivalent run artifact, not in-memory only). The attempt SHALL be marked in-flight until the engine clears that flag after the attempt completes with no owned leftovers. The engine SHALL NOT spawn the harness when the pre-attempt record cannot be made durable; in that case it SHALL fail closed without claiming later dirt as owned.
 
 #### Scenario: Pre-snapshot exists before the implement harness runs
 
@@ -26,6 +26,14 @@ The engine SHALL write a durable mutation-ownership record for every product-mut
 - **WHEN** the engine cannot durable-write the pre-attempt record
 - **THEN** it SHALL NOT spawn the harness
 - **AND** SHALL NOT classify later product dirt as pipeline-owned leftovers for that attempt
+
+#### Scenario: Untracked directory snapshot is file-granular
+
+- **WHEN** a harness creates untracked file `dir/owned.ts` in a new directory
+- **AND** a later process observes additional untracked file `dir/unrelated.ts` in the same directory
+- **THEN** the owned leftover set SHALL include `dir/owned.ts`
+- **AND** SHALL NOT include `dir/unrelated.ts`
+- **AND** the checkpoint SHALL stage `dir/owned.ts` and SHALL NOT stage `dir/unrelated.ts`
 
 ---
 
@@ -81,7 +89,7 @@ While a product-mutating harness is in-flight, the engine SHALL refresh last-kno
 
 ### Requirement: The engine SHALL checkpoint owned leftovers before dirt-trust unknown-dirt refusal
 
-When a later process (or the same process on the timeout path) observes pipeline-owned leftovers, the engine SHALL checkpoint those owned paths into a commit using the existing salvage authorship rules (salvage subject prefix, `Issue:` and `Pipeline-Run:` trailers, depth-agnostic `node_modules` exclusion, pipeline-internal marker exclusion) **scoped to the owned path set**. The engine SHALL NOT include unknown product dirt or engine-known scratch in that checkpoint. After checkpoint, the engine SHALL clear owned leftovers for those paths and SHALL emit terminal evidence with disposition `checkpointed` or `recovered`. The engine SHALL NOT require an operator to inspect or commit those owned paths.
+When a later process (or the same process on the timeout path) observes pipeline-owned leftovers, the engine SHALL checkpoint those owned paths into a commit using the existing salvage authorship rules (salvage subject prefix, `Issue:` and `Pipeline-Run:` trailers, depth-agnostic `node_modules` exclusion, pipeline-internal marker exclusion) **scoped to the owned path set**. The engine SHALL NOT include unknown product dirt or engine-known scratch in that checkpoint. After checkpoint, the engine SHALL clear owned leftovers for those paths and SHALL emit terminal evidence with disposition `checkpointed` or `recovered`. The engine SHALL NOT require an operator to inspect or commit those owned paths. When checkpoint fails and owned leftovers remain, the engine SHALL preserve the existing ownership record, SHALL NOT spawn another product-mutating harness for that attempt, and SHALL treat the residual as `harness-failure` (workflow-engine-defect recover).
 
 #### Scenario: Retry checkpoints owned leftovers without operator action
 
@@ -102,6 +110,14 @@ When a later process (or the same process on the timeout path) observes pipeline
 - **WHEN** the implement harness returns timeout and owned leftovers are present
 - **THEN** the engine SHALL checkpoint those owned paths before returning a dirt-trust unknown-dirt block
 - **AND** if the checkpoint leaves no unknown product dirt, the unknown-dirt block SHALL NOT fire for that leftover set
+
+#### Scenario: Failed checkpoint preserves ownership and does not re-invoke
+
+- **WHEN** checkpoint of owned leftovers fails
+- **AND** owned leftovers remain
+- **THEN** the durable ownership record SHALL keep the original attempt identity and owned leftover set
+- **AND** the engine SHALL NOT begin a new ownership attempt that would place those leftovers in pre-porcelain
+- **AND** the residual block SHALL be `harness-failure`
 
 ---
 

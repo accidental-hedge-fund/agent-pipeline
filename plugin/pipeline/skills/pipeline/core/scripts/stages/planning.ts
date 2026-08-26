@@ -2219,6 +2219,7 @@ export interface DispatchResumeDeps {
     issueNumber: number,
   ) => Promise<{ present: boolean }>;
   ownershipDeps?: OwnershipDeps;
+  setBlocked?: typeof setBlocked;
 }
 
 /**
@@ -2246,6 +2247,7 @@ export async function dispatchResume(
   const planningAdvance = deps.planningAdvance ?? advance;
   const recoverInterrupted =
     deps.recoverInterruptedImplement ?? defaultRecoverInterruptedImplement;
+  const blocker = deps.setBlocked ?? setBlocked;
 
   if (opts.dryRun) {
     console.log(`[pipeline] #${issueNumber}: [dry-run] would resume from implementing: check gate + push + PR + review-1`);
@@ -2296,6 +2298,14 @@ export async function dispatchResume(
         checkpointed: false,
         record: null,
       };
+    }
+    if (recovered.action === "blocked") {
+      const reason = recovered.failureReason
+        ? `Owned harness leftovers could not be checkpointed: ${recovered.failureReason}`
+        : "Owned harness leftovers could not be checkpointed; residual pipeline-owned dirt remains";
+      console.log(`[pipeline] #${issueNumber}: ${reason}`);
+      await blocker(cfg, issueNumber, reason, "implementing", "harness-failure");
+      return blockedOutcome(reason, "harness-failure");
     }
     if (recovered.action === "reinvoke") {
       console.log(

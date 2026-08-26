@@ -44,7 +44,7 @@ The liveness check SHALL run before the commits-ahead check so that a live cross
 
 ### Requirement: Interrupted incomplete implement SHALL NOT skip the implementer because commits exist
 
-When implementing re-entry finds a dead holder and durable ownership shows an interrupted implement attempt with pipeline-owned leftovers, the dispatcher SHALL checkpoint those leftovers (or run the `checkpoint_owned_harness_dirt` recipe) and SHALL NOT skip the implementer solely because the worktree has commits ahead of `cfg.base_branch`. After checkpoint, if the shared implement-deliverable contract reports unsatisfied, the pipeline SHALL re-invoke the implementer. If the contract reports satisfied, the worktree is clean of unknown product dirt, and relevant gates are green, the pipeline MAY take the post-implementation path without a second empty implementer commit. Format-gate unknown-dirt pre-flight SHALL NOT run against those owned leftovers before checkpoint. Terminal evidence SHALL use disposition `resumed` when the implementer is re-invoked, or `checkpointed` / `recovered` when checkpoint plus deliverable satisfaction continues post-implement.
+When implementing re-entry finds a dead holder and durable ownership shows an interrupted implement attempt with pipeline-owned leftovers, the dispatcher SHALL checkpoint those leftovers (or run the `checkpoint_owned_harness_dirt` recipe) and SHALL NOT skip the implementer solely because the worktree has commits ahead of `cfg.base_branch`. After checkpoint, if the shared implement-deliverable contract reports unsatisfied, the pipeline SHALL re-invoke the implementer. If the contract reports satisfied, the worktree is clean of unknown product dirt, and relevant gates are green, the pipeline MAY take the post-implementation path without a second empty implementer commit. If checkpoint fails and owned leftovers remain, the dispatcher SHALL NOT re-invoke a product-mutating harness and SHALL NOT take the post-implementation path; it SHALL block with kind `harness-failure` and SHALL preserve the existing ownership record. Format-gate unknown-dirt pre-flight SHALL NOT run against those owned leftovers before checkpoint. Terminal evidence SHALL use disposition `resumed` when the implementer is re-invoked, or `checkpointed` / `recovered` when checkpoint plus deliverable satisfaction continues post-implement.
 
 #### Scenario: Timeout leftovers with an intermediate commit re-invoke implement
 
@@ -66,3 +66,11 @@ When implementing re-entry finds a dead holder and durable ownership shows an in
 - **AND** relevant gates pass
 - **THEN** the pipeline MAY resume post-implementation steps without re-invoking the implementer
 - **AND** SHALL NOT invent an empty implementer commit
+
+#### Scenario: Failed leftover checkpoint does not re-invoke implementer
+
+- **WHEN** implementing re-entry finds owned leftovers
+- **AND** checkpoint fails with those leftovers remaining
+- **THEN** the dispatcher SHALL NOT re-invoke the implementer
+- **AND** SHALL NOT skip to post-implementation solely because commits exist
+- **AND** SHALL block with kind `harness-failure`

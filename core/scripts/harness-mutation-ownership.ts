@@ -195,8 +195,20 @@ export async function saveOwnershipRecord(
   await write(p, `${JSON.stringify(record, null, 2)}\n`);
 }
 
+/**
+ * Ownership snapshots and current-status reads must list untracked files
+ * individually. Default porcelain collapses an untracked directory to
+ * `?? dir/`, which would own the directory and later stage operator files
+ * created under it (#1246 review 2).
+ */
+export const OWNERSHIP_GIT_STATUS_ARGS = [
+  "status",
+  "--porcelain",
+  "--untracked-files=all",
+] as const;
+
 async function defaultGitStatusPorcelain(wtPath: string): Promise<string> {
-  const r = await gitInWorktree(wtPath, ["status", "--porcelain"], { ignoreFailure: true });
+  const r = await gitInWorktree(wtPath, [...OWNERSHIP_GIT_STATUS_ARGS], { ignoreFailure: true });
   return r.stdout;
 }
 
@@ -490,13 +502,18 @@ export async function checkpointOwnedHarnessDirt(
 ): Promise<{ checkpointed: boolean; failureReason?: string }> {
   if (input.ownedPaths.length === 0) return { checkpointed: false };
   const salvage = deps.salvage ?? salvageUncommittedWork;
+  const salvageGit: SalvageDeps = { ...(deps.salvageGit ?? {}) };
+  if (!salvageGit.gitStatus) {
+    const statusFn = deps.gitStatusPorcelain ?? defaultGitStatusPorcelain;
+    salvageGit.gitStatus = async (p) => statusFn(p);
+  }
   try {
     const result = await salvage(
       input.wtPath,
       input.issueNumber,
       input.pipelineRunId,
       input.stageLabel ?? "owned-harness-leftover",
-      { ...(deps.salvageGit ?? {}), onlyPaths: input.ownedPaths },
+      { ...salvageGit, onlyPaths: input.ownedPaths },
     );
     return { checkpointed: result.salvaged };
   } catch (err) {
@@ -730,11 +747,12 @@ export async function recoverInterruptedImplement(input: {
   runDir?: string;
   deliverablePresent: boolean;
 }, deps: OwnershipDeps = {}): Promise<{
-  action: "reinvoke" | "post-implement" | "none";
+  action: "reinvoke" | "post-implement" | "none" | "blocked";
   classified: TernaryDirtClassification;
   checkpointed: boolean;
   evidence?: OwnershipTerminalEvidence;
   record: HarnessMutationOwnershipRecord | null;
+  failureReason?: string;
 }> {
   const rec = await loadOwnershipRecord(input, deps);
   const statusFn = deps.gitStatusPorcelain ?? defaultGitStatusPorcelain;
@@ -813,6 +831,16 @@ export async function recoverInterruptedImplement(input: {
         record: { ...next, last_evidence: evidence },
       };
     }
+    // Checkpoint failed with remaining owned leftovers: preserve the record
+    // and stay engine-owned. Re-invoke would begin a new ownership attempt
+    // and place the leftovers in pre_porcelain (#1246 review 2).
+    return {
+      action: "blocked",
+      classified,
+      checkpointed: false,
+      record: rec,
+      failureReason: ck.failureReason,
+    };
   }
   if (!input.deliverablePresent) {
     if (rec) {

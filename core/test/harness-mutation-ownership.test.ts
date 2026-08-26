@@ -15,6 +15,7 @@ import {
   interruptedIncompleteImplement,
   loadOwnershipRecord,
   ownedLeftoverPathsFromRecord,
+  OWNERSHIP_GIT_STATUS_ARGS,
   OWNERSHIP_HEARTBEAT_MS,
   porcelainProductDelta,
   recoverInterruptedImplement,
@@ -1076,4 +1077,156 @@ test("recoverInterruptedImplement reinvokes when deliverable is unsatisfied", as
   assert.equal(out.action, "reinvoke");
   assert.equal(out.checkpointed, true);
   assert.equal(out.evidence?.disposition, "resumed");
+});
+
+test("ownership porcelain snapshots request untracked files at file granularity", () => {
+  assert.ok(OWNERSHIP_GIT_STATUS_ARGS.includes("--untracked-files=all"));
+  assert.ok(OWNERSHIP_GIT_STATUS_ARGS.includes("--porcelain"));
+});
+
+test("untracked directory snapshot is file-granular; later operator file stays unstaged", async () => {
+  const store = memoryStore();
+  const rec = recordFixture({
+    last_known_porcelain: [{ path: "dir/owned.ts", xy: "??" }],
+  });
+  await saveVia(store, rec);
+  let porcelain = "?? dir/owned.ts\n?? dir/unrelated.ts\n";
+  const committed: string[][] = [];
+  const out = await recoverInterruptedImplement(
+    {
+      repoDir: "/repo",
+      domain: rec.domain,
+      issue: rec.issue,
+      wtPath: "/wt",
+      pipelineRunId: "run-1",
+      deliverablePresent: false,
+    },
+    {
+      ...store.deps,
+      gitStatusPorcelain: async () => porcelain,
+      now: () => new Date("2026-08-26T00:00:00Z"),
+      salvage: async (_wt, _i, _r, _l, salvageDeps) => {
+        committed.push([...(salvageDeps?.onlyPaths ?? [])]);
+        porcelain = "?? dir/unrelated.ts\n";
+        return { salvaged: true, message: "s" };
+      },
+    },
+  );
+  assert.deepEqual(committed[0], ["dir/owned.ts"]);
+  assert.ok(!committed[0]?.includes("dir/"));
+  assert.ok(!committed[0]?.includes("dir/unrelated.ts"));
+  assert.deepEqual(out.classified.unknownProduct, ["dir/unrelated.ts"]);
+  assert.equal(out.checkpointed, true);
+  assert.equal(out.action, "reinvoke");
+});
+
+test("failed checkpoint preserves ownership record and does not reinvoke", async () => {
+  const store = memoryStore();
+  const rec = recordFixture({
+    attempt_id: "758-implementing-keep-me",
+    last_known_porcelain: [{ path: "core/owned.ts", xy: " M" }],
+  });
+  await saveVia(store, rec);
+  const porcelain = " M core/owned.ts\n";
+  const failed = await recoverInterruptedImplement(
+    {
+      repoDir: "/repo",
+      domain: rec.domain,
+      issue: rec.issue,
+      wtPath: "/wt",
+      pipelineRunId: "run-1",
+      deliverablePresent: false,
+    },
+    {
+      ...store.deps,
+      gitStatusPorcelain: async () => porcelain,
+      now: () => new Date("2026-08-26T00:00:00Z"),
+      salvage: async () => {
+        throw new Error("salvage exploded");
+      },
+    },
+  );
+  assert.equal(failed.action, "blocked");
+  assert.equal(failed.checkpointed, false);
+  assert.equal(failed.failureReason, "salvage exploded");
+  assert.deepEqual(failed.classified.ownedLeftover, ["core/owned.ts"]);
+
+  const preserved = await loadOwnershipRecord(
+    { repoDir: "/repo", domain: rec.domain, issue: rec.issue },
+    store.deps,
+  );
+  assert.equal(preserved?.attempt_id, "758-implementing-keep-me");
+  assert.equal(preserved?.in_flight, true);
+  assert.deepEqual(preserved?.last_known_porcelain, [{ path: "core/owned.ts", xy: " M" }]);
+
+  let porcelainRetry = " M core/owned.ts\n";
+  const committed: string[][] = [];
+  const retry = await recoverInterruptedImplement(
+    {
+      repoDir: "/repo",
+      domain: rec.domain,
+      issue: rec.issue,
+      wtPath: "/wt",
+      pipelineRunId: "run-2",
+      deliverablePresent: false,
+    },
+    {
+      ...store.deps,
+      gitStatusPorcelain: async () => porcelainRetry,
+      now: () => new Date("2026-08-26T00:00:01Z"),
+      salvage: async (_wt, _i, _r, _l, salvageDeps) => {
+        committed.push([...(salvageDeps?.onlyPaths ?? [])]);
+        porcelainRetry = "";
+        return { salvaged: true, message: "s" };
+      },
+    },
+  );
+  assert.deepEqual(committed[0], ["core/owned.ts"]);
+  assert.equal(retry.action, "reinvoke");
+  assert.equal(retry.checkpointed, true);
+  assert.equal(retry.record?.attempt_id, "758-implementing-keep-me");
+});
+
+test("dispatchResume: failed leftover checkpoint emits harness-failure and does not reinvoke", async () => {
+  const cfg = makeCfg();
+  let implementerCalls = 0;
+  let resumePost = false;
+  const blocked: { kind?: string; reason?: string } = {};
+  const out = await dispatchResume(
+    cfg,
+    758,
+    { pipelineRunId: "run-block" },
+    {
+      isLivePlanningActive: () => false,
+      getForIssue: async () => ({ path: "/wt", branch: "pipeline/758-x", slug: "x" }),
+      hasCommitsAhead: async () => true,
+      getIssueDetail: async () => ({ title: "p0", body: "" }) as never,
+      resumeFromImplementing: async () => {
+        resumePost = true;
+        return { advanced: true, from: "implementing" as Stage, to: "design-gate" as Stage, summary: "PR" };
+      },
+      planningAdvance: async () => {
+        implementerCalls++;
+        return { advanced: true, from: "implementing" as Stage, to: "review-1" as Stage, summary: "reinvoked" };
+      },
+      setBlocked: async (_cfg, _n, reason, _stage, kind) => {
+        blocked.reason = reason;
+        blocked.kind = kind;
+      },
+      recoverInterruptedImplement: async () => ({
+        action: "blocked" as const,
+        classified: { scratch: [], ownedLeftover: ["core/owned.ts"], unknownProduct: [] },
+        checkpointed: false,
+        failureReason: "salvage exploded",
+        record: recordFixture(),
+      }),
+    },
+  );
+  assert.equal(implementerCalls, 0);
+  assert.equal(resumePost, false);
+  assert.equal(out.advanced, false);
+  assert.equal(out.status, "blocked");
+  assert.equal(out.blockerKind, "harness-failure");
+  assert.equal(blocked.kind, "harness-failure");
+  assert.match(blocked.reason ?? "", /could not be checkpointed/);
 });
