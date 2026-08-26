@@ -195,6 +195,39 @@ export async function saveOwnershipRecord(
   await write(p, `${JSON.stringify(record, null, 2)}\n`);
 }
 
+/** Same-process serialize for heartbeat vs finish writes on one issue record. */
+const ownershipWriteTails = new Map<string, Promise<void>>();
+
+async function withOwnershipRecordLock<T>(
+  input: { repoDir: string; domain: string; issue: number },
+  fn: () => Promise<T>,
+): Promise<T> {
+  const key = ownershipRecordPath(input.repoDir, input.domain, input.issue);
+  const prev = ownershipWriteTails.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  ownershipWriteTails.set(
+    key,
+    prev.then(() => gate, () => gate),
+  );
+  await prev.catch(() => {});
+  try {
+    return await fn();
+  } finally {
+    release();
+  }
+}
+
+function ownershipAttemptFinalized(rec: HarnessMutationOwnershipRecord | null): boolean {
+  if (!rec) return true;
+  if (!rec.in_flight) return true;
+  if (rec.result_class) return true;
+  if (rec.post_porcelain) return true;
+  return false;
+}
+
 /**
  * Ownership snapshots and current-status reads must list untracked files
  * individually. Default porcelain collapses an untracked directory to
@@ -453,7 +486,7 @@ export async function refreshLastKnownPorcelain(
   deps: OwnershipDeps = {},
 ): Promise<void> {
   const rec = await loadOwnershipRecord(input, deps);
-  if (!rec || !rec.in_flight) return;
+  if (!rec || ownershipAttemptFinalized(rec)) return;
   try {
     const lastKnown = await capturePorcelain(input.wtPath, input.extraGlobs ?? [], deps);
     // Skip a clean-as-pre snapshot so a first heartbeat cannot void the
@@ -461,11 +494,18 @@ export async function refreshLastKnownPorcelain(
     const extra = input.extraGlobs ?? [];
     const delta = porcelainProductDelta(rec.pre_porcelain, lastKnown, extra);
     if (delta.length === 0 && lastKnown.length === rec.pre_porcelain.length) return;
-    await saveOwnershipRecord(input, {
-      ...rec,
-      last_known_porcelain: lastKnown,
-      updated_at: isoNow(deps),
-    }, deps);
+    await withOwnershipRecordLock(input, async () => {
+      const current = await loadOwnershipRecord(input, deps);
+      // A refresh loaded before finish must not persist over a completed
+      // record or claim later operator dirt as owned (#1246 review 2).
+      if (ownershipAttemptFinalized(current)) return;
+      if (!current || current.attempt_id !== rec.attempt_id) return;
+      await saveOwnershipRecord(input, {
+        ...current,
+        last_known_porcelain: lastKnown,
+        updated_at: isoNow(deps),
+      }, deps);
+    });
   } catch {
     // Heartbeat is fail-open: pre-snapshot still exists.
   }
@@ -480,14 +520,25 @@ export function startOwnershipHeartbeat(
     extraGlobs?: readonly string[];
   },
   deps: OwnershipDeps = {},
-): { stop: () => void } {
+): { stop: () => Promise<void> } {
   const ms = deps.heartbeatMs ?? OWNERSHIP_HEARTBEAT_MS;
   const setI = deps.setIntervalFn ?? setInterval;
   const clearI = deps.clearIntervalFn ?? clearInterval;
+  let stopped = false;
+  let inflight: Promise<void> | null = null;
   const id = setI(() => {
-    void refreshLastKnownPorcelain(input, deps);
+    if (stopped || inflight) return;
+    inflight = refreshLastKnownPorcelain(input, deps).finally(() => {
+      inflight = null;
+    });
   }, ms);
-  return { stop: () => clearI(id) };
+  return {
+    stop: async () => {
+      stopped = true;
+      clearI(id);
+      if (inflight) await inflight;
+    },
+  };
 }
 
 export async function checkpointOwnedHarnessDirt(
@@ -541,13 +592,14 @@ export async function finishOwnershipAttempt(
   record: HarnessMutationOwnershipRecord | null;
   classified: TernaryDirtClassification;
   checkpointed: boolean;
+  checkpointFailed: boolean;
   evidence?: OwnershipTerminalEvidence;
 }> {
   const extra = input.extraGlobs ?? [];
   const rec = await loadOwnershipRecord(input, deps);
   const empty: TernaryDirtClassification = { scratch: [], ownedLeftover: [], unknownProduct: [] };
   if (!rec) {
-    return { record: null, classified: empty, checkpointed: false };
+    return { record: null, classified: empty, checkpointed: false, checkpointFailed: false };
   }
   let post: PorcelainSnapshotEntry[] = rec.last_known_porcelain ?? rec.pre_porcelain;
   try {
@@ -555,20 +607,25 @@ export async function finishOwnershipAttempt(
   } catch {
     // Keep last-known when post capture fails.
   }
-  let next: HarnessMutationOwnershipRecord = {
-    ...rec,
-    post_porcelain: post,
-    last_known_porcelain: post,
-    result_class: input.resultClass,
-    updated_at: isoNow(deps),
-  };
-  await saveOwnershipRecord(input, next, deps);
+  let next: HarnessMutationOwnershipRecord = await withOwnershipRecordLock(input, async () => {
+    const current = (await loadOwnershipRecord(input, deps)) ?? rec;
+    const written: HarnessMutationOwnershipRecord = {
+      ...current,
+      post_porcelain: post,
+      last_known_porcelain: post,
+      result_class: input.resultClass,
+      updated_at: isoNow(deps),
+    };
+    await saveOwnershipRecord(input, written, deps);
+    return written;
+  });
 
   const statusFn = deps.gitStatusPorcelain ?? defaultGitStatusPorcelain;
   const porcelain = await statusFn(input.wtPath);
   let classified = classifyHarnessMutationDirt({ porcelain, record: next, extraGlobs: extra });
 
   let checkpointed = false;
+  let checkpointFailed = false;
   const shouldCheckpoint = input.checkpoint !== false && classified.ownedLeftover.length > 0;
   if (shouldCheckpoint) {
     const ck = await checkpointOwnedHarnessDirt(
@@ -590,7 +647,9 @@ export async function finishOwnershipAttempt(
         in_flight: false,
         updated_at: isoNow(deps),
       };
-      await saveOwnershipRecord(input, next, deps);
+      await withOwnershipRecordLock(input, async () => {
+        await saveOwnershipRecord(input, next, deps);
+      });
       classified = classifyHarnessMutationDirt({
         porcelain: after,
         record: next,
@@ -611,13 +670,22 @@ export async function finishOwnershipAttempt(
         },
         deps,
       );
-      return { record: { ...next, last_evidence: evidence }, classified, checkpointed: true, evidence };
+      return {
+        record: { ...next, last_evidence: evidence },
+        classified,
+        checkpointed: true,
+        checkpointFailed: false,
+        evidence,
+      };
     }
+    checkpointFailed = true;
   }
 
   if (classified.ownedLeftover.length === 0) {
     next = { ...next, in_flight: false, updated_at: isoNow(deps) };
-    await saveOwnershipRecord(input, next, deps);
+    await withOwnershipRecordLock(input, async () => {
+      await saveOwnershipRecord(input, next, deps);
+    });
   }
 
   if (classified.unknownProduct.length > 0) {
@@ -634,10 +702,16 @@ export async function finishOwnershipAttempt(
       },
       deps,
     );
-    return { record: { ...next, last_evidence: evidence }, classified, checkpointed, evidence };
+    return {
+      record: { ...next, last_evidence: evidence },
+      classified,
+      checkpointed,
+      checkpointFailed,
+      evidence,
+    };
   }
 
-  return { record: next, classified, checkpointed };
+  return { record: next, classified, checkpointed, checkpointFailed };
 }
 
 /**
@@ -675,7 +749,7 @@ export async function runWithMutationOwnership<T>(
     invoke: () => Promise<T>;
     resultClass?: (result: T) => HarnessMutationResultClass;
     checkpointOnFinish?: boolean;
-    onFinished?: (info: { checkpointed: boolean }) => void;
+    onFinished?: (info: { checkpointed: boolean; checkpointFailed: boolean }) => void;
   },
   deps: OwnershipDeps = {},
 ): Promise<T> {
@@ -693,7 +767,7 @@ export async function runWithMutationOwnership<T>(
     result = await input.invoke();
     resultClass = (input.resultClass ?? harnessResultClass)(result);
   } catch (err) {
-    beat.stop();
+    await beat.stop();
     const finished = await finishOwnershipAttempt(
       {
         ...input,
@@ -701,11 +775,14 @@ export async function runWithMutationOwnership<T>(
         checkpoint: input.checkpointOnFinish !== false,
       },
       deps,
-    ).catch(() => ({ checkpointed: false }));
-    input.onFinished?.({ checkpointed: Boolean(finished && "checkpointed" in finished && finished.checkpointed) });
+    ).catch(() => ({ checkpointed: false, checkpointFailed: false }));
+    input.onFinished?.({
+      checkpointed: Boolean(finished.checkpointed),
+      checkpointFailed: Boolean(finished.checkpointFailed),
+    });
     throw err;
   }
-  beat.stop();
+  await beat.stop();
   const finished = await finishOwnershipAttempt(
     {
       ...input,
@@ -714,7 +791,10 @@ export async function runWithMutationOwnership<T>(
     },
     deps,
   );
-  input.onFinished?.({ checkpointed: finished.checkpointed });
+  input.onFinished?.({
+    checkpointed: finished.checkpointed,
+    checkpointFailed: finished.checkpointFailed,
+  });
   return result;
 }
 

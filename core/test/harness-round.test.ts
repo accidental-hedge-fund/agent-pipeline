@@ -98,6 +98,7 @@ test("runHarnessRound: salvage on dirty no-commit when shouldAttemptSalvage is t
 
   assert.equal(ctx.salvaged, true);
   assert.equal(ctx.salvageAttempted, true);
+  assert.equal(ctx.ownershipCheckpointFailed, false);
   assert.equal(ctx.headAfter, "sha-salvaged");
   assert.ok(calls.includes("salvage"));
 });

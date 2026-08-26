@@ -40,7 +40,7 @@ The engine SHALL write a durable mutation-ownership record for every product-mut
 
 ### Requirement: Interrupted attempts SHALL refresh last-known porcelain and classify leftovers versus unknown dirt
 
-While a product-mutating harness is in-flight, the engine SHALL refresh last-known porcelain on a bounded heartbeat and SHALL write a post-attempt snapshot on the timeout or crash path when the process can still run. Pipeline-owned leftovers SHALL be the product-path porcelain delta in the last-known or post snapshot versus the pre-attempt snapshot. Product paths that are dirty now and are not in that owned set SHALL be unknown product dirt. Engine-known scratch SHALL remain scratch and SHALL NOT be classified as owned leftovers. When no ownership record exists, the owned set SHALL be empty and product dirt SHALL be unknown. When the process is killed after a durable pre-snapshot but before any last-known refresh, the engine SHALL treat current product porcelain that is not already present in the pre-attempt product snapshot as owned for that interrupted attempt. Product paths already present in the pre-attempt snapshot SHALL remain unknown product dirt unless durable content evidence proves they changed during the attempt.
+While a product-mutating harness is in-flight, the engine SHALL refresh last-known porcelain on a bounded heartbeat and SHALL write a post-attempt snapshot on the timeout or crash path when the process can still run. A heartbeat refresh that loaded the in-flight record SHALL NOT persist after the attempt has been finalized (`in_flight` cleared, or a post-attempt snapshot / result class written). The engine SHALL serialize in-flight heartbeat writes with the finish path and SHALL await an active refresh on heartbeat stop so a refresh started before completion cannot resurrect `in_flight` ownership or claim later operator dirt as owned. Pipeline-owned leftovers SHALL be the product-path porcelain delta in the last-known or post snapshot versus the pre-attempt snapshot. Product paths that are dirty now and are not in that owned set SHALL be unknown product dirt. Engine-known scratch SHALL remain scratch and SHALL NOT be classified as owned leftovers. When no ownership record exists, the owned set SHALL be empty and product dirt SHALL be unknown. When the process is killed after a durable pre-snapshot but before any last-known refresh, the engine SHALL treat current product porcelain that is not already present in the pre-attempt product snapshot as owned for that interrupted attempt. Product paths already present in the pre-attempt snapshot SHALL remain unknown product dirt unless durable content evidence proves they changed during the attempt.
 
 #### Scenario: Timeout after product edits yields owned leftovers
 
@@ -71,6 +71,13 @@ While a product-mutating harness is in-flight, the engine SHALL refresh last-kno
 - **THEN** the owned leftover set SHALL be empty
 - **AND** that product porcelain SHALL be unknown product dirt
 
+#### Scenario: Stale heartbeat does not overwrite a completed record
+
+- **WHEN** an in-flight heartbeat refresh has loaded the in-flight record
+- **AND** the finish path has persisted `in_flight` false or a post-attempt snapshot
+- **THEN** the stale refresh SHALL NOT persist over the completed record
+- **AND** SHALL NOT add later operator product paths to the owned leftover set
+
 #### Scenario: Scratch is not owned leftover
 
 - **WHEN** porcelain lists only engine-known non-product scratch
@@ -90,7 +97,7 @@ While a product-mutating harness is in-flight, the engine SHALL refresh last-kno
 
 ### Requirement: The engine SHALL checkpoint owned leftovers before dirt-trust unknown-dirt refusal
 
-When a later process (or the same process on the timeout path) observes pipeline-owned leftovers, the engine SHALL checkpoint those owned paths into a commit using the existing salvage authorship rules (salvage subject prefix, `Issue:` and `Pipeline-Run:` trailers, depth-agnostic `node_modules` exclusion, pipeline-internal marker exclusion) **scoped to the owned path set**. The engine SHALL NOT include unknown product dirt or engine-known scratch in that checkpoint. After checkpoint, the engine SHALL clear owned leftovers for those paths and SHALL emit terminal evidence with disposition `checkpointed` or `recovered`. The engine SHALL NOT require an operator to inspect or commit those owned paths. When checkpoint fails and owned leftovers remain, the engine SHALL preserve the existing ownership record, SHALL NOT spawn another product-mutating harness for that attempt, and SHALL treat the residual as `harness-failure` (workflow-engine-defect recover).
+When a later process (or the same process on the timeout path) observes pipeline-owned leftovers, the engine SHALL checkpoint those owned paths into a commit using the existing salvage authorship rules (salvage subject prefix, `Issue:` and `Pipeline-Run:` trailers, depth-agnostic `node_modules` exclusion, pipeline-internal marker exclusion) **scoped to the owned path set**. The engine SHALL NOT include unknown product dirt or engine-known scratch in that checkpoint. After checkpoint, the engine SHALL clear owned leftovers for those paths and SHALL emit terminal evidence with disposition `checkpointed` or `recovered`. The engine SHALL NOT require an operator to inspect or commit those owned paths. When checkpoint fails and owned leftovers remain, the engine SHALL preserve the existing ownership record, SHALL NOT spawn another product-mutating harness for that attempt, SHALL NOT fall through to unscoped salvage, and SHALL treat the residual as `harness-failure` (workflow-engine-defect recover).
 
 #### Scenario: Retry checkpoints owned leftovers without operator action
 
@@ -112,6 +119,15 @@ When a later process (or the same process on the timeout path) observes pipeline
 - **WHEN** the implement harness returns timeout and owned leftovers are present
 - **THEN** the engine SHALL checkpoint those owned paths before returning a dirt-trust unknown-dirt block
 - **AND** if the checkpoint leaves no unknown product dirt, the unknown-dirt block SHALL NOT fire for that leftover set
+
+#### Scenario: Failed scoped checkpoint does not fall through to unscoped salvage
+
+- **WHEN** checkpoint of owned leftover path `P` fails
+- **AND** unknown product path `U` is also dirty
+- **THEN** the engine SHALL NOT run unscoped salvage
+- **AND** SHALL NOT include `U` in a salvage commit
+- **AND** the durable ownership record SHALL keep the original attempt identity and owned leftover set
+- **AND** the residual block SHALL be `harness-failure`
 
 #### Scenario: Failed checkpoint preserves ownership and does not re-invoke
 

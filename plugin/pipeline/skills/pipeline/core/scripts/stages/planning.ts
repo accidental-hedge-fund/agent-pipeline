@@ -80,7 +80,7 @@ import { runTestGate } from "../testgate.ts";
 import { runFormatGate, runFormatAndTestGates } from "./format-gate.ts";
 import { makePipelineRunId, withTrailers } from "../traceability.ts";
 import { trySalvageUncommittedWork } from "../salvage-harness-work.ts";
-import { runHarnessRound } from "../harness-round.ts";
+import { OWNERSHIP_CHECKPOINT_FAILED_REASON, runHarnessRound } from "../harness-round.ts";
 import {
   recoverInterruptedImplement as defaultRecoverInterruptedImplement,
   type OwnershipDeps,
@@ -1127,6 +1127,18 @@ export async function runPlanningPhases(
     afterRound: async (ctx) => {
       const result = ctx.invokeResult;
       const implHeadBefore = ctx.headBefore;
+
+      if (ctx.ownershipCheckpointFailed) {
+        await doSetBlocked(
+          cfg,
+          issueNumber,
+          OWNERSHIP_CHECKPOINT_FAILED_REASON,
+          "implementing",
+          "harness-failure",
+        );
+        await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
+        return blockedOutcome(OWNERSHIP_CHECKPOINT_FAILED_REASON, "harness-failure");
+      }
 
       if (!result.success) {
         const reason = result.timed_out

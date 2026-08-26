@@ -26,6 +26,10 @@ import {
   type OwnershipDeps,
 } from "./harness-mutation-ownership.ts";
 
+/** Residual when owned leftovers were observed and the scoped checkpoint failed. */
+export const OWNERSHIP_CHECKPOINT_FAILED_REASON =
+  "Owned harness leftovers could not be checkpointed; residual pipeline-owned dirt remains";
+
 /** Re-export for shared-round consumers that need the single format-repair policy (#777). */
 export {
   DEFAULT_FORMAT_REPAIR_BUDGET,
@@ -85,6 +89,12 @@ export interface HarnessRoundContext<TInvoke> {
    * failure reason — i.e. the worktree was genuinely clean (#553).
    */
   salvageFoundNothing: boolean;
+  /**
+   * Owned leftovers were observed and the scoped ownership checkpoint failed.
+   * AfterRound must treat this as `harness-failure` residual and must not fall
+   * through to unscoped salvage or destructive rollback of those leftovers.
+   */
+  ownershipCheckpointFailed: boolean;
   /**
    * #758: when the consumer supplies `onCleanNoNewCommit` and the round is a
    * confirmed clean no-new-commit (salvage found nothing), the helper invokes
@@ -217,6 +227,7 @@ export async function runHarnessRound<TInvoke, TResult>(
   const headBefore = await deps.gitHead(options.wtPath);
   const invokeOnce = options.invoke;
   let ownershipCheckpointed = false;
+  let ownershipCheckpointFailed = false;
   const invokeResult = options.mutationOwnership
     ? await runWithMutationOwnership(
         {
@@ -231,6 +242,7 @@ export async function runHarnessRound<TInvoke, TResult>(
           invoke: invokeOnce,
           onFinished: (info) => {
             ownershipCheckpointed = info.checkpointed;
+            ownershipCheckpointFailed = info.checkpointFailed;
           },
         },
         options.mutationOwnership.deps,
@@ -254,9 +266,12 @@ export async function runHarnessRound<TInvoke, TResult>(
   });
 
   // Ownership finish already checkpoints owned leftovers (including after HEAD
-  // movement). Skip unscoped salvage only when that checkpoint authored them,
-  // so unknown dirt is not swept into the salvage commit.
-  if (shouldSalvage && !ownershipCheckpointed) {
+  // movement). Skip unscoped salvage when that checkpoint authored them, and
+  // also when owned leftovers were observed but the scoped checkpoint failed —
+  // unscoped salvage can sweep concurrent unknown operator dirt (#1246).
+  // Legacy salvage runs only when ownership was not applicable or no owned
+  // leftovers were observed.
+  if (shouldSalvage && !ownershipCheckpointed && !ownershipCheckpointFailed) {
     salvageAttempted = true;
     const salvageResult = await deps.salvage(
       options.wtPath,
@@ -298,6 +313,7 @@ export async function runHarnessRound<TInvoke, TResult>(
     salvaged,
     salvageFailureReason,
     salvageFoundNothing,
+    ownershipCheckpointFailed,
     cleanNoNewCommitHookResult,
   });
 }

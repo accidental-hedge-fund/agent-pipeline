@@ -8,6 +8,7 @@
 
 - [x] 2.1 Write and durable-flush the pre-snapshot at the shared product-mutating harness-round / invoke seam (implement, fix-round, test-fix, pre-merge auto-fix) **before** child spawn, and verify a unit test fails if spawn occurs before the record exists.
 - [x] 2.2 Refresh last-known porcelain on a bounded in-flight heartbeat and write a post-snapshot on the timeout/crash path when the process can still run, and verify tests cover heartbeat last-known plus timeout post-snapshot using fake clocks/storage.
+- [x] 2.5 Serialize heartbeat persistence with finish (stop awaits an active refresh; a stale refresh cannot overwrite a finalized record); verify a deterministic stale-refresh-versus-finish race test.
 - [x] 2.3 Clear in-flight only when the attempt completes with no owned leftovers, bound the record to attempt id and pre-HEAD, and verify a later dirty tree without a current in-flight record classifies as unknown.
 - [x] 2.4 Hard-kill with no last-known/post does not claim pre-attempt product porcelain as owned; only newly attributable paths checkpoint; pre-existing unknown dirt still blocks.
 
@@ -16,6 +17,7 @@
 - [x] 3.1 Add deterministic recipe `checkpoint_owned_harness_dirt` that salvages **owned paths only** (existing salvage subject, trailers, `node_modules` and marker exclusions), and verify mixed owned+unknown dirt commits only owned paths and leaves unknown unstaged (not discarded).
 - [x] 3.5 Record untracked ownership snapshots at file granularity (`--untracked-files=all`); verify a harness-owned file in a new untracked directory does not later checkpoint an operator file in that directory.
 - [x] 3.6 On checkpoint failure with remaining owned leftovers, preserve the ownership record and block as `harness-failure` without re-invoking a product-mutating harness; verify a failed salvage followed by retry still recovers the original owned set.
+- [x] 3.7 After a failed scoped leftover checkpoint, do not fall through to legacy unscoped salvage; verify mixed owned/unknown dirt leaves unknown unstaged and residual is `harness-failure`.
 - [x] 3.2 Apply checkpoint after HEAD movement (intermediate commit) and on new-process re-entry, and verify tests cover timeout after product edits, timeout after intermediate commit plus later edits, and a no-op when leftovers were already salvaged.
 - [x] 3.3 Wire the default engine-owned recovery policy to `unlink_engine_scratch` then `checkpoint_owned_harness_dirt` then `repair_pipeline_item`, and verify a policy-order unit test fails if implementer repair is first for owned-leftover evidence.
 - [x] 3.4 Execute the recipe from `realExecuteRecovery` when owned-leftover evidence is current (single, loop, and train share the executor), and verify success does not mint a human hold and does not invoke `repair_pipeline_item` for that attempt when unknown dirt is empty.

@@ -10,7 +10,7 @@ import {
   extractSpecDivergenceDirection,
   findingKey,
 } from "../review-policy.ts";
-import { runHarnessRound } from "../harness-round.ts";
+import { OWNERSHIP_CHECKPOINT_FAILED_REASON, runHarnessRound } from "../harness-round.ts";
 import {
   evaluatePostHarnessNoNewCommit,
   formatNoopAdvanceEvidenceNote,
@@ -662,6 +662,9 @@ export async function performPreMergeAutoFix(
     afterRound: async (ctx) => {
       const result = ctx.invokeResult;
       const headBefore = ctx.headBefore;
+      if (ctx.ownershipCheckpointFailed) {
+        return { status: "error" as const, diagnostic: OWNERSHIP_CHECKPOINT_FAILED_REASON };
+      }
       // hasNewCommitHarness uses pre-salvage equality: when salvage ran, either
       // it created a commit (salvaged) or confirmed no-new-commit. When salvage
       // did not run, confirmedNoNewCommit is false only if HEAD advanced.

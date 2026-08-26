@@ -396,6 +396,88 @@ test("heartbeat writes last-known porcelain using fake clock", async () => {
   assert.ok(rec?.last_known_porcelain?.some((e) => e.path === "core/scripts/foo.ts"));
 });
 
+test("stale heartbeat refresh cannot overwrite a completed ownership record", async () => {
+  const store = memoryStore();
+  let porcelain = "";
+  const base: OwnershipDeps = {
+    ...store.deps,
+    gitHead: async () => "h",
+    now: () => new Date("2026-08-26T00:00:00Z"),
+  };
+  const finishDeps: OwnershipDeps = {
+    ...base,
+    gitStatusPorcelain: async () => porcelain,
+    salvage: async () => {
+      porcelain = "";
+      return { salvaged: true, message: "s" };
+    },
+  };
+  let releaseHeartbeat: () => void = () => {};
+  const heartbeatGate = new Promise<void>((resolve) => {
+    releaseHeartbeat = resolve;
+  });
+  const heartbeatDeps: OwnershipDeps = {
+    ...base,
+    gitStatusPorcelain: async () => {
+      await heartbeatGate;
+      return " M core/owned.ts\n M core/operator.ts\n";
+    },
+  };
+  const started = await beginOwnershipAttempt(
+    { repoDir: "/repo", domain: "d", issue: 42, stage: "implementing", wtPath: "/wt" },
+    finishDeps,
+  );
+  assert.equal(started.ok, true);
+
+  porcelain = " M core/owned.ts\n";
+  const refreshP = refreshLastKnownPorcelain(
+    { repoDir: "/repo", domain: "d", issue: 42, wtPath: "/wt" },
+    heartbeatDeps,
+  );
+  const finish = await finishOwnershipAttempt(
+    {
+      repoDir: "/repo",
+      domain: "d",
+      issue: 42,
+      wtPath: "/wt",
+      pipelineRunId: "run-1",
+      resultClass: "timeout",
+    },
+    finishDeps,
+  );
+  assert.equal(finish.checkpointed, true);
+  const recAfterFinish = await loadOwnershipRecord(
+    { repoDir: "/repo", domain: "d", issue: 42 },
+    store.deps,
+  );
+  assert.equal(recAfterFinish?.in_flight, false);
+  assert.equal(recAfterFinish?.result_class, "timeout");
+
+  releaseHeartbeat();
+  await refreshP;
+
+  const recAfterStale = await loadOwnershipRecord(
+    { repoDir: "/repo", domain: "d", issue: 42 },
+    store.deps,
+  );
+  assert.equal(recAfterStale?.in_flight, false);
+  assert.equal(recAfterStale?.result_class, "timeout");
+  assert.ok(
+    !(recAfterStale?.last_known_porcelain ?? []).some((e) => e.path === "core/operator.ts"),
+    "stale heartbeat must not persist operator dirt as last-known",
+  );
+  assert.ok(
+    !(recAfterStale?.post_porcelain ?? []).some((e) => e.path === "core/operator.ts"),
+    "stale heartbeat must not persist operator dirt as post porcelain",
+  );
+  const classified = classifyHarnessMutationDirt({
+    porcelain: " M core/operator.ts\n",
+    record: recAfterStale,
+  });
+  assert.deepEqual(classified.unknownProduct, ["core/operator.ts"]);
+  assert.deepEqual(classified.ownedLeftover, []);
+});
+
 test("timeout after product edits checkpoints owned leftovers (no intermediate commit)", async () => {
   const store = memoryStore();
   let porcelain = "";
@@ -1286,4 +1368,57 @@ test("dispatchResume: residual unknown product dirt after checkpoint does not re
   assert.equal(blocked.kind, "needs-human");
   assert.match(blocked.reason ?? "", /pre-existing uncommitted changes/);
   assert.match(blocked.reason ?? "", /dir\/unrelated\.ts/);
+});
+
+test("failed scoped checkpoint does not fall through to unscoped salvage on mixed dirt", async () => {
+  const store = memoryStore();
+  let porcelain = " M core/operator.ts\n";
+  const unscopedCalls: Array<readonly string[] | undefined> = [];
+  const ctx = await runHarnessRound({
+    wtPath: "/wt",
+    issueNumber: 9,
+    pipelineRunId: "run-mixed",
+    salvageLabel: "implement",
+    shouldAttemptSalvage: ({ confirmedNoNewCommit }) => confirmedNoNewCommit,
+    mutationOwnership: {
+      repoDir: "/repo",
+      domain: "d",
+      stage: "implementing",
+      deps: {
+        ...store.deps,
+        gitHead: async () => "sha-before",
+        gitStatusPorcelain: async () => porcelain,
+        now: () => new Date("2026-08-26T00:00:00Z"),
+        salvage: async () => ({ salvaged: false, failureReason: "scoped checkpoint exploded" }),
+      },
+    },
+    invoke: async () => {
+      porcelain = " M core/operator.ts\n M core/owned.ts\n";
+      return { success: true, timed_out: false };
+    },
+    afterRound: async (c) => c,
+    deps: {
+      gitHead: async () => "sha-before",
+      salvage: async (_wt, _i, _r, _l, salvageDeps) => {
+        unscopedCalls.push(salvageDeps?.onlyPaths);
+        return { salvaged: true };
+      },
+    },
+  });
+  assert.equal(unscopedCalls.length, 0, "legacy unscoped salvage must not run after failed scoped checkpoint");
+  assert.equal(ctx.ownershipCheckpointFailed, true);
+  assert.equal(ctx.salvageAttempted, false);
+  assert.equal(ctx.salvaged, false);
+  const rec = await loadOwnershipRecord(
+    { repoDir: "/repo", domain: "d", issue: 9 },
+    store.deps,
+  );
+  assert.ok(rec, "ownership record must be preserved after failed checkpoint");
+  assert.equal(rec!.in_flight, true);
+  const classified = classifyHarnessMutationDirt({
+    porcelain,
+    record: rec,
+  });
+  assert.deepEqual(classified.ownedLeftover, ["core/owned.ts"]);
+  assert.deepEqual(classified.unknownProduct, ["core/operator.ts"]);
 });
