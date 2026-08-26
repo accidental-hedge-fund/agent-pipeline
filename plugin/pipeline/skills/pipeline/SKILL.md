@@ -1413,6 +1413,7 @@ When the loop ends, the skill prints:
 - For terminal: PR URL + ready-to-deploy summary
 - For blocked: latest blocker comment + the unblock command
 - For waiting: short reason + "re-run /pipeline N when ready"
+- For iteration-budget exhaustion at a non-terminal stage: `iteration budget exhausted at <stage>; re-run pipeline N to continue` (non-zero exit; not a `done` summary). At `pre-merge` this also parks with `ci-exhausted`.
 
 ## Failure modes
 

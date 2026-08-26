@@ -119,10 +119,19 @@ export interface RunStartEvent extends RunEventBase {
    */
   outer_host?: string;
 }
+export type RunCompleteStopReason = "iteration-budget-exhausted";
+
 export interface RunCompleteEvent extends RunEventBase {
   type: "run_complete";
   final_state: string;
   elapsed_ms: number;
+  /**
+   * Additive incomplete-invocation marker (#1245). Set when the advance loop
+   * falls through `MAX_ITERATIONS` at a non-terminal stage. Omitted on
+   * successful ready-to-deploy finalize and on in-loop waiting/blocked stops.
+   * `schema_version` stays 1.
+   */
+  stop_reason?: RunCompleteStopReason;
 }
 export interface StageStartEvent extends RunEventBase {
   type: "stage_start";
@@ -1518,6 +1527,7 @@ export async function finalizeRun(
   startedAt: string,
   deps: RunStoreDeps = defaultRunStoreDeps,
   ghMetrics?: GhMetricsSummary,
+  stopReason?: RunCompleteStopReason,
 ): Promise<void> {
   const now = nowIso();
   const startMs = Date.parse(startedAt);
@@ -1535,6 +1545,7 @@ export async function finalizeRun(
     at: now,
     final_state: bundle.finalState ?? "unknown",
     elapsed_ms: elapsedMs,
+    ...(stopReason ? { stop_reason: stopReason } : {}),
   };
   await appendEvent(runDir, completeEvent, deps);
 

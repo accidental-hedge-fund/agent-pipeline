@@ -8,7 +8,7 @@ When the loop exits because the iteration cap is exhausted and the final stage i
 
 A legitimate non-advancing stop inside the loop (`blocked`, `waiting`, `no-op`, `finalized`, `error`, `--once`, label removed) SHALL keep its existing stop semantics, including a non-error end on `waiting`. This requirement applies only when the `for` loop completes because the iteration cap is reached, not when the loop `break`s on a stage outcome.
 
-This requirement SHALL NOT raise or configure `MAX_ITERATIONS`. It SHALL NOT change `auto_loop` continuation behavior. It SHALL NOT merge.
+This requirement SHALL NOT raise or configure `MAX_ITERATIONS`. It SHALL NOT change in-loop `auto_loop` continuation or in-loop auto-loop budget-exhaustion park (`autoLoopExhaustedBlockedOutcome` + auto-loop exhausted comment). The new handler SHALL run only when the `for` loop falls through the iteration cap (`iterationBudgetExhausted === true`). An in-loop auto-loop exhaustion `break` SHALL NOT enter this handler and SHALL NOT be double-parked. If auto-loop `continue`s on the last iteration slot and the `for` condition then fails, that SHALL be iteration-budget exhaustion (not auto-loop budget exhaustion) and SHALL NOT post an auto-loop exhausted comment. This requirement SHALL NOT merge.
 
 #### Scenario: budget death at pre-merge is not a successful done summary
 
@@ -33,11 +33,25 @@ This requirement SHALL NOT raise or configure `MAX_ITERATIONS`. It SHALL NOT cha
 - **THEN** the loop SHALL break and the run SHALL end without this incomplete-invocation treatment
 - **AND** the run SHALL NOT print the iteration-budget exhausted line solely because of that waiting stop
 
+#### Scenario: waiting break on the last iteration slot is not exhaustion
+
+- **WHEN** the loop is on the last `MAX_ITERATIONS` slot
+- **AND** the stage returns `{ advanced: false, status: "waiting" }` so the loop `break`s
+- **THEN** the run SHALL end without this incomplete-invocation treatment
+- **AND** the process exit code SHALL NOT be set non-zero solely because that waiting stop used the last slot
+
+#### Scenario: in-loop auto-loop exhaustion is unchanged
+
+- **WHEN** `auto_loop` is enabled and the in-loop auto-loop budget is exhausted so the loop `break`s after `autoLoopExhaustedBlockedOutcome`
+- **THEN** the run SHALL keep the existing auto-loop exhausted park and comment
+- **AND** the run SHALL NOT print the iteration-budget exhausted line
+- **AND** the run SHALL NOT apply a second park from this requirement
+
 ### Requirement: Pre-merge iteration-budget exhaustion SHALL park with ci-exhausted and release a safe worktree
 
 When `MAX_ITERATIONS` is exhausted and the final stage is `pre-merge`, the orchestrator SHALL materialize a blocked outcome whose blocker kind is `ci-exhausted` (the existing pre-merge mechanical shape that projects to `implementation-ci`, not a human-authority hold). The block reason SHALL name iteration-budget exhaustion. The run SHALL apply that block on the issue (unless `--dry-run`) and SHALL attempt the existing durable park-release of a safe managed worktree so capacity is not stranded.
 
-The orchestrator SHALL reuse the existing pre-merge exhaustion kind mapping (`ci-exhausted`, offramp class `ci-failed` when that mapping already emits it). It SHALL NOT add a new `BlockerKind`. It SHALL NOT copy an `auto-loop budget exhausted` reason prefix onto this path: `auto_loop` is not the budget that died.
+The orchestrator SHALL reuse the existing pre-merge exhaustion kind mapping (`ci-exhausted`, offramp class `ci-failed` when that mapping already emits it), extracted so `autoLoopExhaustedBlockedOutcome` keeps its auto-loop reason. It SHALL NOT add a new `BlockerKind`. It SHALL NOT copy an `auto-loop budget exhausted` reason prefix onto this path: `auto_loop` is not the budget that died. After applying the block, `run_complete.final_state` SHALL remain the pre-park stage `pre-merge` (not `blocked`).
 
 Other non-terminal stages (`review-*`, `fix-*`, `visual-gate`, `eval-gate`, `shipcheck-gate`, and earlier stages) SHALL receive the incomplete-invocation treatment of the previous requirement and SHALL NOT be required to park with `ci-exhausted`.
 

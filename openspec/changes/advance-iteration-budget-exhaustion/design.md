@@ -18,9 +18,10 @@ See `proposal.md` for why. Current law and code:
 
 **Goals:**
 
-- Distinguish loop-exhausted from loop-broke in one shared predicate, exported for unit tests (same shape as `shouldRunDeferredTerminalFinalize`).
-- Make non-terminal exhaustion operator-visible (distinct line, no `done —`) and machine-visible (non-zero exit, typed `run_complete.stop_reason`).
-- At `pre-merge`, park with the existing `ci-exhausted` mechanical shape and attempt park-release.
+- Distinguish loop-exhausted from loop-broke with an explicit fall-through flag (`i === MAX_ITERATIONS` after a `for` that `break`s set the flag false). Export `shouldHandleNonterminalIterationExhaustion` next to `shouldRunDeferredTerminalFinalize`.
+- Make non-terminal exhaustion operator-visible (distinct line, no `done —`) and machine-visible (non-zero `process.exitCode` after `run_complete`, typed `stop_reason`).
+- At `pre-merge`, park with the existing `ci-exhausted` mechanical shape, an iteration-budget reason, and attempted park-release.
+- Keep in-loop auto-loop continuation and auto-loop exhaustion unchanged; do not double-park.
 - Keep #773 deferred finalize as the only post-loop success path.
 
 **Non-Goals:**
@@ -49,7 +50,7 @@ See `proposal.md` for why. Current law and code:
 
 ### 2. Exhaustion means the for-loop completed; a break is not exhaustion
 
-**Choice:** Track `iterationBudgetExhausted = true` only when the `for` loop ends because `i === MAX_ITERATIONS`, not when it `break`s. Export a pure helper `shouldHandleNonterminalIterationExhaustion({ dryRun, iterationBudgetExhausted, finalStage })` analogous to `shouldRunDeferredTerminalFinalize`.
+**Choice:** Hoist the loop index (`let i = 0; for (; i < MAX_ITERATIONS; i++)`) and set `iterationBudgetExhausted = (i === MAX_ITERATIONS)` after the loop. Every explicit `break` leaves `i < MAX_ITERATIONS`, so the flag is false. Export a pure helper `shouldHandleNonterminalIterationExhaustion({ iterationBudgetExhausted, finalStage })` analogous to `shouldRunDeferredTerminalFinalize`. Do **not** put `dryRun` on this helper: dry-run still prints the exhausted line; park/`setBlocked` stay gated on `!dryRun` at the call site.
 
 **Why:** An in-loop `waiting` at pre-merge (CI still running) is a legitimate stop and already specified to end without error. Treating that as budget death would block issues that are actually waiting on CI. The #1243 bug is specifically "no break, cap hit, remaining gates unrun."
 
@@ -60,7 +61,7 @@ See `proposal.md` for why. Current law and code:
 
 ### 3. Reuse the ci-exhausted kind mapping; do not reuse the auto-loop reason prefix
 
-**Choice:** At `pre-merge`, materialize a blocked outcome with kind `ci-exhausted`, diagnostic `implementation-ci`, and offramp `ci-failed` by calling the existing mapping in `autoLoopExhaustedBlockedOutcome` (or a thin shared extractor of that mapping). Then set the reason text to name **iteration-budget** exhaustion (issue number and stage). Call `setBlocked` and `maybeReleaseWorktreeOnPark` with that outcome, mirroring the auto-loop exhausted path's park-release. Do not add a `BlockerKind`.
+**Choice:** Extract the stage-to-blocker mapping from `autoLoopExhaustedBlockedOutcome` into a shared helper (pre-merge → `ci-exhausted` + offramp `ci-failed`; any other wait → `needs-human`). Keep `autoLoopExhaustedBlockedOutcome` on that mapping with its existing `auto-loop budget exhausted at <stage>: …` reason. The new pre-merge path calls the same mapping with a distinct reason that names **iteration-budget** exhaustion (issue number and stage). Call `setBlocked` and `maybeReleaseWorktreeOnPark` with that outcome. Do not add a `BlockerKind`. Do not call `autoLoopExhaustedBlockedOutcome` unchanged on this path.
 
 **Why:** AC requires the existing `ci-exhausted` / `implementation-ci` shape so durable recovery treats it as mechanical CI-class work, not a janitor hold. The current helper reason `auto-loop budget exhausted at pre-merge: …` is false when `auto_loop` is off (the observed run). Operators and recipes key on kind; the reason still must tell the truth about which budget died.
 
@@ -84,9 +85,32 @@ See `proposal.md` for why. Current law and code:
 
 ### 5. Tests inject the exhausted loop; prove they bite
 
-**Choice:** Add unit tests that drive `runAdvance` with injected `getIssueDetail` / stage deps so the loop advances until the cap at `pre-merge` and at `review-1` with `auto_loop` disabled. Assert: no `done —` line, exhausted line present, `process.exitCode !== 0`, `run_complete.stop_reason === "iteration-budget-exhausted"`. Second test: pre-merge path calls `setBlocked` with `ci-exhausted` and `releaseParkedWorktree` (or `maybeReleaseWorktreeOnPark` seam). Keep existing `deferred-terminal-finalize.test.ts` assertions. No live network, git, or subprocess.
+**Choice:** Add unit tests that drive `runAdvance` with injected `AdvanceDeps` so the loop advances until the cap at `pre-merge` and at `review-1` with `auto_loop` disabled. Assert against persisted `events.jsonl` (not only a mocked `finalizeRun` call): `schema_version` stays `1`, `final_state` is the pre-park stage, `stop_reason` is `iteration-budget-exhausted`. Also assert: no `done —` line, exhausted line present, `process.exitCode !== 0`. Second test: pre-merge path calls `setBlocked` with `ci-exhausted` and an iteration-budget reason, and `releaseParkedWorktree` is attempted. Keep existing `deferred-terminal-finalize.test.ts` assertions. No live network, git, or subprocess.
 
-**Why:** The #1243 log is exactly "12 transitions, done, exit 0, no blocker." A pure helper test is necessary but not sufficient; the wiring in `runAdvance` is the hole.
+**Why:** The #1243 log is exactly "12 transitions, done, exit 0, no blocker." A pure helper test is necessary but not sufficient; the wiring in `runAdvance` is the hole. `pipeline logs --events --follow` ends on a persisted `run_complete` line (`isAdvanceRunCompleteLine` keys on `type` only).
+
+### 6. Auto-loop in-loop path stays first; the new handler never double-parks it
+
+**Choice:** Leave the in-loop auto-loop block (`isAutoLoopEligible` / `canAutoLoopContinue` / `autoLoopExhaustedBlockedOutcome` / `buildAutoLoopExhaustedComment`) byte-behavior identical. The new handler runs only when `iterationBudgetExhausted === true` (for-loop fall-through). An in-loop auto-loop exhaustion `break` therefore never enters the new handler. Do not post auto-loop exhausted comments from the new path. If auto-loop `continue`s on the last slot and the `for` condition then fails, that is MAX_ITERATIONS death, not auto-loop budget death: apply the incomplete-invocation treatment (iteration-budget reason at pre-merge). That does not change auto-loop continuation while iterations remain.
+
+**Why:** The proposal said auto-loop is unchanged while stating a broad post-loop rule. Without an explicit gate, a second park or an auto-loop reason on a MAX_ITERATIONS death would alter `#149`. Fall-through after a last-slot `continue` is the iteration cap winning — that cap already consumes auto-loop continues today; only the silent `done` / exit 0 is the bug.
+
+**Alternatives considered:**
+
+- Skip the new handler whenever `auto_loop.enabled` is true → rejected. A #1243-shaped advance with auto-loop configured but never engaged (`autoLoopRoundsSpent === 0`) would still print `done` and exit 0.
+- Convert last-slot auto-loop continue into the auto-loop exhausted comment → rejected. Auto-loop rounds/wallclock may still have budget; MAX_ITERATIONS is the budget that died.
+
+### 7. Snapshot `finalStage` before park; `run_complete.final_state` stays the stage
+
+**Choice:** Capture `exhaustionStage = finalStage` before `setBlocked` / park-release. Pass that snapshot to `finalizeBundle` / `finalizeRun`. Never assign `finalStage = "blocked"`. `run_complete.final_state` on this path is the pre-park stage (`pre-merge`, `review-1`, …). `stop_reason: "iteration-budget-exhausted"` is the incomplete marker.
+
+**Why:** `finalizeRun` copies `bundle.finalState`. If park mutates labels and the controller re-reads them, consumers would see `blocked` and miss that gates at `pre-merge` never ran.
+
+### 8. Non-zero exit through `process.exitCode` after `run_complete`
+
+**Choice:** Use the existing `process.exitCode = 1` seam already used when a pipeline label is missing (`runAdvance` ~line 1020). Set it only after the inner `finally` writes `run_complete` (same place as today's `done —` line). Never call `process.exit()`. `shouldHandleNonterminalIterationExhaustion` does **not** take `dryRun`: dry-run still prints the exhausted line and skips GitHub park. `#773` remains independently false under dry-run.
+
+**Why:** Immediate `process.exit(1)` would skip `finalizeRun`, terminal-log tee stop, and collector cleanup. Tests already observe `process.exitCode` without a subprocess.
 
 ## Risks / Trade-offs
 
@@ -94,7 +118,9 @@ See `proposal.md` for why. Current law and code:
 - **[Risk] `ci-exhausted` recipes talk about failing checks, but pre-merge gates never ran.** → Mitigation: the block **reason** names iteration-budget exhaustion. Kind stays `ci-exhausted` so recovery class is unchanged. Do not invent a new kind this change.
 - **[Risk] A waiting stop on the 12th dispatch is misclassified as exhaustion.** → Mitigation: only the no-break fall-out is exhaustion (Decision 2). Covered by the in-loop waiting scenario.
 - **[Risk] Additive `stop_reason` is ignored by old consumers.** → Mitigation: non-zero `process.exitCode` and the exhausted console line are the operator-visible floor. The field is for new consumers and logs.
-- **[Risk] Dry-run still mutates GitHub if park is not gated.** → Mitigation: skip `setBlocked` / park-release under `--dry-run`, matching the auto-loop exhausted path. Still print the exhausted line so dry-run is honest.
+- **[Risk] Dry-run still mutates GitHub if park is not gated.** → Mitigation: skip `setBlocked` / park-release under `--dry-run`, matching the auto-loop exhausted path. Still print the exhausted line so dry-run is honest. The incomplete helper stays true under dry-run; only mutations are gated.
+- **[Risk] Auto-loop and the new handler both park the same issue.** → Mitigation: Decision 6. In-loop auto-loop exhaustion `break`s, so `iterationBudgetExhausted` is false. The new path never posts `buildAutoLoopExhaustedComment`.
+- **[Risk] Park label mutation reports `run_complete.final_state: "blocked"`.** → Mitigation: Decision 7. Snapshot `finalStage` before park; do not overwrite it.
 
 ## Migration Plan
 
