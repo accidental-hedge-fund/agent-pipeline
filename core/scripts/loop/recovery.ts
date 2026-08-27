@@ -37,7 +37,7 @@ import { mapLegacyThemeToBlockerClass } from "./import.ts";
 /** Classes that never get an automated recipe — their policy entry's
  *  `terminal_outcome` must be `human_authority` with no recipes, reinforcing
  *  (not bypassing) the engine's merge/release/credential/deploy gates. */
-const HUMAN_AUTHORITY_CLASSES: readonly DurableBlockerClass[] = ["missing-authority", "specification-decision"];
+export const HUMAN_AUTHORITY_CLASSES: readonly DurableBlockerClass[] = ["missing-authority", "specification-decision"];
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);

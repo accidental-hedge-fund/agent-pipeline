@@ -82,6 +82,11 @@ import {
   type StageDiagnostic,
 } from "../stage-diagnostic.ts";
 import {
+  evaluateRunFatalResumeEligibility,
+  formatRunFatalResumeRefusal,
+  supersedeRunFatalStop,
+} from "./run-fatal-resume.ts";
+import {
   armProgressMirror,
   LOOP_ITEM_PROGRESS,
   type LoopItemProgressPayload,
@@ -2814,12 +2819,14 @@ export interface DriveSupervisorResult {
  *  done/abandoned, a recorded stop, an outstanding paused/waiting hold, or the
  *  run-level watchdog stop. On resume, runs a reconciliation pass before
  *  continuing and appends a resume marker to the action-evidence trail (task
- *  4.2) before entering the cycle loop. The lock is held only while actively
- *  driving: it is released in a `finally` once the run reaches a terminal
- *  condition (or the drive throws), so a released-lock resume can proceed on
- *  another host/process without a takeover. `supervisor.json` (the process
- *  identity record) is left in place as the last-process record — releasing
- *  the lock does not touch it. */
+ *  4.2) before entering the cycle loop. A resume of `stop.reason = run_fatal`
+ *  either supersedes that stop and re-drives valid outstanding items at the
+ *  same run id, or throws a distinct refusal (never a silent zero-dispatch
+ *  success). The lock is held only while actively driving: it is released in
+ *  a `finally` once the run reaches a terminal condition (or the drive throws),
+ *  so a released-lock resume can proceed on another host/process without a
+ *  takeover. `supervisor.json` (the process identity record) is left in place
+ *  as the last-process record — releasing the lock does not touch it. */
 export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervisorInput): Promise<DriveSupervisorResult> {
   const attach = await attachSupervisor(deps, { runId: input.runId, engine: input.engine, resume: input.resume });
   const token = attach.token;
@@ -2829,6 +2836,24 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
   const cyclesSafetyCap = input.maxCyclesSafety ?? MAX_CYCLES_SAFETY;
 
   try {
+    if (input.resume) {
+      const attachedLedger = await readLedger(deps.store, input.runId);
+      if (attachedLedger.stop?.reason === "run_fatal") {
+        const decision = await evaluateRunFatalResumeEligibility(deps.store, deps.observe, input.runId);
+        if (!decision.eligible) {
+          throw new LoopError("stop", formatRunFatalResumeRefusal(input.runId, decision.stop, decision.observeError));
+        }
+        await supersedeRunFatalStop(deps.store, input.runId, token);
+        await appendActionEvidence(deps.store, input.runId, token, {
+          item_id: null,
+          action: "resume",
+          outcome: "run_fatal_superseded",
+          next_action: null,
+          progress: "progress",
+        });
+      }
+    }
+
     await appendEvent(deps.store, input.runId, token, "loop_drive_started", {
       drive_id: record.boot_id,
       engine: input.engine,
