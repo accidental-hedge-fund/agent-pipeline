@@ -46,6 +46,14 @@ function makeDeps(
 // 4.1 Happy path — set ready from backlog
 // ---------------------------------------------------------------------------
 
+test("triage: ready is a label write with no harness slot on TriageDeps", async () => {
+  const keys = Object.keys(makeDeps(["pipeline:needs-spec"])).filter((k) => !k.startsWith("_")).sort();
+  assert.deepEqual(keys, ["addLabel", "getIssueLabels", "log", "removeLabel"]);
+  const deps = makeDeps(["pipeline:needs-spec"]);
+  await runTriage({ issueArg: "42", stage: "ready" }, deps);
+  assert.equal(deps._addCalls[0].label, "pipeline:ready");
+});
+
 test("triage: sets pipeline:ready and removes pipeline:backlog", async () => {
   const deps = makeDeps(["pipeline:backlog", "bug"]);
   const input: TriageInput = { issueArg: "42", stage: "ready" };

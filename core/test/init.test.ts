@@ -232,6 +232,26 @@ test("scaffoldDefaultConfig: scaffolded file emits no inert-models warning on re
 // 3.5 CLI-level: `pipeline init` positional arg routes to init, not numeric error
 // ---------------------------------------------------------------------------
 
+test("scaffoldDefaultConfig: documents issue_readiness as default-off and round-trips disabled", async () => {
+  const repo = makeTempRepo();
+  const binDir = makeFakeGhBin({ repoSlug: "acme/ir-scaffold" });
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    await scaffoldDefaultConfig(repo);
+    const yml = fs.readFileSync(path.join(repo, ".github", "pipeline.yml"), "utf8");
+    assert.match(yml, /issue_readiness/);
+    assert.match(yml, /enabled:/);
+    assert.match(yml, /timeout:/);
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-ir-scaffold`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.issue_readiness.enabled, false);
+    assert.equal(cfg.issue_readiness.timeout, 600);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
 test("CLI: `pipeline init` (positional arg) runs init and does not emit the numeric-arg error", () => {
   const repo = makeTempRepo();
   const binDir = makeFakeGhBin({ repoSlug: "acme/cli-init-test" });

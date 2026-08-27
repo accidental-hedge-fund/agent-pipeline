@@ -196,6 +196,7 @@ export function validateQueueOpts(
 // of truth; callers and tests import STAGE_PRIORITY_SCORE to verify ordering.
 export const STAGE_PRIORITY_SCORE: Record<string, number> = {
   "ready": 100,
+  "needs-spec": 0,
   "planning": 90,
   "plan-review": 85,
   "pre-code-attestation": 82,
@@ -464,7 +465,11 @@ export function selectIssues(
   maxIssues: number,
 ): EligibleIssue[] {
   // Blocked issues are not autonomous-eligible regardless of pipeline stage.
-  let filtered = candidates.filter((issue) => !issue.labels.includes(BLOCKED_LABEL));
+  let filtered = candidates.filter((issue) => {
+    if (issue.labels.includes(BLOCKED_LABEL)) return false;
+    const pipeline = issue.labels.filter((label) => label.startsWith("pipeline:"));
+    return pipeline.length === 1 && pipeline[0] === "pipeline:ready";
+  });
 
   if (filters.labels && filters.labels.length > 0) {
     filtered = filtered.filter((issue) =>
@@ -527,7 +532,8 @@ export function buildBatchSummary(
   const succeeded = results.filter(
     (r) => r.finalState === "ready-to-deploy" || r.finalState === "needs-human",
   ).length;
-  const failed = results.length - succeeded;
+  const admissionHeld = results.filter((r) => r.finalState === "needs-spec").length;
+  const failed = results.length - succeeded - admissionHeld;
   const failureRate = results.length > 0 ? failed / results.length : 0;
   const totalCostUsd = results.reduce((sum, r) => sum + (r.costUsd ?? 0), 0);
   const totalDurationMs = results.reduce((sum, r) => sum + r.durationMs, 0);
@@ -708,7 +714,10 @@ async function runQueueUnlocked(opts: QueueOpts, deps: QueueDeps): Promise<void>
 
     const completedCount = results.length;
     const failedCount = results.filter(
-      (r) => r.finalState !== "ready-to-deploy" && r.finalState !== "needs-human",
+      (r) =>
+        r.finalState !== "ready-to-deploy" &&
+        r.finalState !== "needs-human" &&
+        r.finalState !== "needs-spec",
     ).length;
 
     deps.log(

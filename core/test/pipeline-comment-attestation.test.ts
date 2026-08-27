@@ -76,6 +76,7 @@ import { buildPipelineCompleteComment } from "../scripts/stages/deploy_ready.ts"
 import { buildDesignGateComment } from "../scripts/stages/design_gate.ts";
 import { buildPreCodeAttestationComment } from "../scripts/stages/pre_code_attestation.ts";
 import { formatEvidenceCommentBody } from "../scripts/evidence-bundle.ts";
+import { buildIssueReadinessComment } from "../scripts/issue-readiness.ts";
 import {
   buildAuditRepairBlockedComment,
   buildAuditRepairComment,
@@ -355,6 +356,25 @@ const KIND_RENDERERS: Record<string, () => string> = {
       note: "OpenSpec deliverable already present at HEAD",
       issueNumber: 758,
       at: ts(0),
+    }),
+  "issue-readiness-admission": () =>
+    buildIssueReadinessComment({
+      verdict: "ready",
+      hash: "a".repeat(64),
+      treatment: { implementer: "grok", model: "grok-4.6", effort: "high" },
+      deficiencies: [],
+      proposed_body: "",
+      evaluatedAt: ts(0),
+    }),
+  "issue-readiness-needs-spec": () =>
+    buildIssueReadinessComment({
+      verdict: "needs_spec",
+      hash: "a".repeat(64),
+      treatment: { implementer: "grok", model: "grok-4.6", effort: "high" },
+      deficiencies: ["Missing observable acceptance criteria"],
+      proposed_body:
+        "## Summary\nAdd retry.\n\n## User story\nAs an operator I want retries.\n\n## Acceptance criteria\n- [ ] retries happen\n\n## Out of scope\nWebhooks.\n\n## Open questions\nNone.",
+      evaluatedAt: ts(0),
     }),
   // Design-gate comments carry challenge prose that trips NEGATION_PATTERNS
   // ("instead", "do not", …). Without attestation they false-block review-1.

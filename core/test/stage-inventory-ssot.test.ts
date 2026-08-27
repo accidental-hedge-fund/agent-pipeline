@@ -302,9 +302,10 @@ export function assertLivingSpineInventory(specText: string, label: string): voi
 // ---------------------------------------------------------------------------
 
 test("stage-inventory-ssot: code STAGES length and membership are the inventory truth", () => {
-  assert.equal(STAGES.length, 17);
+  assert.equal(STAGES.length, 18);
   assert.deepEqual([...STAGES], [
     "backlog",
+    "needs-spec",
     "ready",
     "planning",
     "plan-review",
@@ -409,7 +410,7 @@ test("stage-inventory-ssot bite: host omitting plan-review fails", () => {
     "## State machine",
     `through a ${STAGES.length}-stage label-driven state machine`,
     "```",
-    "backlog → ready → planning → pre-code-attestation → implementing → design-gate",
+    "backlog → needs-spec → ready → planning → pre-code-attestation → implementing → design-gate",
     "→ review-1 → fix-1 → review-2 → fix-2",
     "→ pre-merge → visual-gate → eval-gate → shipcheck-gate",
     "→ ready-to-deploy",
@@ -431,7 +432,7 @@ test("stage-inventory-ssot bite: diagram-only omission fails even when stage app
     "## State machine",
     `through a ${STAGES.length}-stage label-driven state machine`,
     "```",
-    "backlog → ready → planning → pre-code-attestation → implementing → design-gate",
+    "backlog → needs-spec → ready → planning → pre-code-attestation → implementing → design-gate",
     "→ review-1 → fix-1 → review-2 → fix-2",
     "→ pre-merge → visual-gate → eval-gate → shipcheck-gate",
     "→ ready-to-deploy",
@@ -498,7 +499,7 @@ test("stage-inventory-ssot bite: README inventory omitting review-1 fails", () =
   const drifted = [
     "# agent-pipeline",
     "",
-    `**agent-pipeline** is a label-driven GitHub issue pipeline that advances an issue from backlog to \`pipeline:ready-to-deploy\` through a ${STAGES.length}-stage state machine — backlog → ready → planning → plan-review → pre-code-attestation → implementing → design-gate → review → fix → pre-merge → visual-gate → eval-gate → shipcheck-gate → ready-to-deploy, with \`needs-human\` as the terminal park off-ramp.`,
+    `**agent-pipeline** is a label-driven GitHub issue pipeline that advances an issue from backlog to \`pipeline:ready-to-deploy\` through a ${STAGES.length}-stage state machine — backlog → needs-spec → ready → planning → plan-review → pre-code-attestation → implementing → design-gate → review → fix → pre-merge → visual-gate → eval-gate → shipcheck-gate → ready-to-deploy, with \`needs-human\` as the terminal park off-ramp.`,
   ].join("\n");
   assert.throws(
     () => assertReadmeInventoryCoverage(drifted, "synthetic-readme"),

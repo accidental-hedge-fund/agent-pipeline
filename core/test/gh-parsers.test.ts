@@ -87,6 +87,7 @@ test("desiredPipelineLabels: includes harness labels for every built-in adapter 
   assert.ok(names.has("harness:opencode"));
   assert.ok(names.has("harness:pi"));
   assert.ok(names.has("blocked"));
+  assert.ok(names.has("pipeline:needs-spec"), "managed labels must include pipeline:needs-spec");
 });
 
 test("buildTransitionComment: shows parsed harness and config marker_footer (#954)", () => {

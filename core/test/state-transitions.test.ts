@@ -52,6 +52,13 @@ test("state machine: terminal stages set", async () => {
   const { TERMINAL_STAGES } = await import("../scripts/types.ts");
   assert.ok(TERMINAL_STAGES.has("ready-to-deploy"));
   assert.ok(TERMINAL_STAGES.has("needs-human"), "needs-human is a terminal off-ramp");
+  assert.equal(TERMINAL_STAGES.has("needs-spec" as never), false);
+});
+
+test("state machine: needs-spec sits between backlog and ready", () => {
+  const stages = [...STAGES];
+  assert.ok(stages.indexOf("needs-spec") > stages.indexOf("backlog"));
+  assert.ok(stages.indexOf("needs-spec") < stages.indexOf("ready"));
 });
 
 test("state machine: review verdict mapping", () => {
@@ -73,6 +80,7 @@ test("state machine: STAGES order is forward", () => {
   // Sanity: STAGES is in forward order so STAGE_PRIORITY logic in gh.ts works.
   const expected = [
     "backlog",
+    "needs-spec",
     "ready",
     "planning",
     "plan-review",

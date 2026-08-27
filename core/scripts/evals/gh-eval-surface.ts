@@ -38,7 +38,7 @@ export function createRecordingRefusalRecorder(): GhRefusalRecorder & { refusals
 /** The full set of mutating GitHub operations a stage might attempt. Named
  *  after their production counterparts in core/scripts/gh.ts (addLabel,
  *  addLabelToPr, removeLabel, postComment, createIssue, addIssueComment,
- *  postPrComment, transition, silentTransition, setBlocked, clearBlocked,
+ *  updateIssueComment, postPrComment, transition, silentTransition, setBlocked, clearBlocked,
  *  closePr, reopenPr, createPr, mergePr, ensurePipelineLabels,
  *  createMilestone) plus a production-branch push, which happens outside
  *  gh.ts (in worktree/git code). */
@@ -49,6 +49,7 @@ export const MUTATING_GH_OPERATIONS = [
   "postComment",
   "createIssue",
   "addIssueComment",
+  "updateIssueComment",
   "postPrComment",
   "transition",
   "silentTransition",

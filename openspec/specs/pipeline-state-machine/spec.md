@@ -8,6 +8,8 @@ The label-driven state machine at the heart of the pipeline: the canonical order
 ### Requirement: Canonical ordered stage sequence
 The pipeline SHALL define its stages as an ordered constant `STAGES` in `core/scripts/types.ts`. Each stage is represented on an issue by the label `pipeline:<stage>` (prefix `LABEL_PREFIX = "pipeline:"`), and an issue carries at most one `pipeline:<stage>` label at a time.
 
+`needs-spec` SHALL sit between `backlog` and `ready`. It is an admission hold, not a delivery stage: the orchestrator SHALL NOT start planning or implementation from it. Dispatch SHALL wait the way `backlog` waits. It SHALL NOT be a member of `TERMINAL_STAGES`. Gate behavior is specified by the `issue-implementation-readiness-gate` capability.
+
 `pre-code-attestation` (#575) SHALL sit between `plan-review` and `implementing`. It is always
 present in the graph, but it is inert unless `pre_code_attestation.enabled` is true and a risk
 trigger matches: when disabled or untriggered it SHALL advance toward `implementing` with a
@@ -27,7 +29,8 @@ surfaces are specified by the `needs-human-status-surface` and override-related 
 
 #### Scenario: STAGES order
 - **WHEN** the `STAGES` constant is inspected
-- **THEN** it SHALL list, in order: `backlog`, `ready`, `planning`, `plan-review`, `pre-code-attestation`, `implementing`, `design-gate`, `review-1`, `fix-1`, `review-2`, `fix-2`, `pre-merge`, `visual-gate`, `eval-gate`, `shipcheck-gate`, `ready-to-deploy`, `needs-human`
+- **THEN** it SHALL list, in order: `backlog`, `needs-spec`, `ready`, `planning`, `plan-review`, `pre-code-attestation`, `implementing`, `design-gate`, `review-1`, `fix-1`, `review-2`, `fix-2`, `pre-merge`, `visual-gate`, `eval-gate`, `shipcheck-gate`, `ready-to-deploy`, `needs-human`
+- **AND** `needs-spec` SHALL appear at an index greater than `backlog` and less than `ready`
 - **AND** `pre-code-attestation` SHALL appear at an index greater than `plan-review` and less than `implementing`
 - **AND** `design-gate` SHALL appear at an index greater than `implementing` and less than `review-1`
 - **AND** `visual-gate` SHALL appear at an index greater than `pre-merge` and less than `eval-gate`
@@ -35,6 +38,13 @@ surfaces are specified by the `needs-human-status-surface` and override-related 
 - **AND** `shipcheck-gate` SHALL appear at an index greater than `eval-gate` and less than `ready-to-deploy`
 - **AND** `needs-human` SHALL appear after `ready-to-deploy` in the constant order
 - **AND** `needs-human` SHALL be a member of `TERMINAL_STAGES`
+- **AND** `needs-spec` SHALL NOT be a member of `TERMINAL_STAGES`
+
+#### Scenario: dispatch routes needs-spec as a wait
+- **WHEN** the current stage label is `pipeline:needs-spec`
+- **THEN** the orchestrator SHALL NOT invoke planning or implementation
+- **AND** SHALL NOT create a worktree
+- **AND** the outcome SHALL be a non-advancing wait that tells the operator to apply a spec and re-admit with `pipeline triage <N> --stage ready`
 
 #### Scenario: dispatch routes pre-code-attestation
 - **WHEN** the current stage label is `pipeline:pre-code-attestation`
@@ -95,7 +105,7 @@ When an issue reaches `ready-to-deploy`, the run finalizes the happy path (taggi
 - **AND** it SHALL NOT contain any other stage name
 
 ### Requirement: Opt-in via the pipeline label gate
-The pipeline SHALL act only on issues that already carry a `pipeline:<stage>` label. An issue with no such label SHALL be refused — the run exits without dispatching any stage and explains how to opt in (add `pipeline:ready`). `backlog` is a triage marker only; the orchestrator starts work at `ready`.
+The pipeline SHALL act only on issues that already carry a `pipeline:<stage>` label. An issue with no such label SHALL be refused — the run exits without dispatching any stage and explains how to opt in (add `pipeline:ready`). `backlog` and `needs-spec` are triage/admission markers only; the orchestrator starts delivery work at `ready`. When `issue_readiness.enabled` is `true`, a `ready` issue still MUST pass the shared issue-implementation-readiness gate before that delivery work starts.
 
 #### Scenario: issue without a pipeline label
 - **WHEN** the orchestrator resolves an issue that carries no `pipeline:*` label
@@ -105,6 +115,11 @@ The pipeline SHALL act only on issues that already carry a `pipeline:<stage>` la
 #### Scenario: current stage resolved from the label
 - **WHEN** an issue carries `pipeline:review-1`
 - **THEN** the orchestrator SHALL begin at stage `review-1`
+
+#### Scenario: needs-spec does not start delivery
+- **WHEN** an issue carries only `pipeline:needs-spec`
+- **THEN** the orchestrator SHALL NOT start planning or implementation
+- **AND** SHALL NOT create a worktree
 
 ### Requirement: Bounded advance loop
 The orchestrator SHALL advance at most `MAX_ITERATIONS` (= 12) transitions per invocation. Each iteration dispatches the current stage and either advances (incrementing a transition count) or stops on a non-advancing outcome (`blocked`, `waiting`, `no-op`, `finalized`, or `error`). Under `--once`, it SHALL stop after a single transition.
@@ -366,8 +381,10 @@ After completing its existing checks, the `shipcheck-gate` handler SHALL invoke 
 ### Requirement: Planning label precedes harness invocation
 
 The planning stage SHALL transition the issue `ready → planning` (set the `pipeline:planning`
-label) BEFORE invoking any planning harness, so the label reflects active work for the entire
+label) BEFORE invoking any planning *authoring* harness, so the label reflects active work for the entire
 harness duration rather than leaving the issue on `pipeline:ready` until authoring finishes.
+
+When `issue_readiness.enabled` is `true`, ready dispatch SHALL complete the shared issue-implementation-readiness evaluation (or reuse a bound verdict) while the issue is still on `pipeline:ready`. That admission call uses the Implementer planning treatment and is not the planning authoring harness. After a `ready` verdict, the `ready → planning` transition SHALL still occur before authoring, worktree bootstrap, or the planning delivery harness. After `needs_spec`, `gate-unavailable`, or `mutation-failed`, the issue SHALL NOT transition to `planning`. A `stale-dispatch` result SHALL be a non-advancing wait: the issue SHALL NOT transition to `planning` and SHALL NOT gain `pipeline:needs-spec`.
 
 While the planning stage is executing — from the moment it begins until it transitions to
 `plan-review` (when plan review is enabled) or `implementing` (when it is not) — any block it
@@ -386,6 +403,21 @@ are unaffected.
 - **THEN** the stage SHALL transition `ready → planning` before calling the artifact-authoring
   harness
 - **AND** the authoring harness SHALL observe the issue already on `pipeline:planning`
+
+#### Scenario: admission evaluation may run on ready
+
+- **WHEN** `issue_readiness.enabled` is `true` and ready dispatch evaluates a freshly fetched issue
+- **THEN** the Implementer planning-treatment admission call MAY run while the issue still carries `pipeline:ready`
+- **AND** a `needs_spec` result SHALL NOT call the artifact-authoring harness
+- **AND** a `ready` result SHALL still transition `ready → planning` before the artifact-authoring harness
+
+#### Scenario: stale-dispatch does not start planning
+
+- **WHEN** `issue_readiness.enabled` is `true`
+- **AND** ready dispatch receives a `stale-dispatch` result because the live stage is no longer `ready`
+- **THEN** the issue SHALL NOT transition to `planning`
+- **AND** SHALL NOT gain `pipeline:needs-spec`
+- **AND** the outcome SHALL be a non-advancing wait
 
 #### Scenario: planning-stage blocks classify the stage as planning
 
@@ -442,7 +474,9 @@ The pipeline CLI dispatch block SHALL accept `queue` as a recognized positional 
 
 ### Requirement: Ready dispatch records planning substages separately
 
-When an issue starts at `pipeline:ready`, the pipeline SHALL transition the issue to `pipeline:planning` before any long-running planning work, worktree bootstrap, or harness invocation begins. The run artifacts SHALL record separate stage lifecycle entries for `planning`, `plan-review`, and `implementing` when those substages run inside the compound planning flow. The outer `ready` dispatch SHALL NOT record one wrapper lifecycle entry whose duration covers plan review and implementation.
+When an issue starts at `pipeline:ready` and is admitted for delivery, the pipeline SHALL transition the issue to `pipeline:planning` before any long-running planning work, worktree bootstrap, or planning-authoring harness invocation begins. When `issue_readiness.enabled` is `true`, ready dispatch SHALL finish the shared gate (fresh fetch, evaluate or reuse) before that transition. A `needs_spec`, `gate-unavailable`, or `mutation-failed` outcome SHALL NOT record planning substages and SHALL NOT create a worktree.
+
+The run artifacts SHALL record separate stage lifecycle entries for `planning`, `plan-review`, and `implementing` when those substages run inside the compound planning flow. The outer `ready` dispatch SHALL NOT record one wrapper lifecycle entry whose duration covers plan review and implementation.
 
 #### Scenario: Planning label set before authoring
 - **WHEN** an issue labelled `pipeline:ready` enters the planning flow
@@ -454,6 +488,12 @@ When an issue starts at `pipeline:ready`, the pipeline SHALL transition the issu
 - **THEN** `events.jsonl` SHALL contain separate `stage_start` and `stage_complete` pairs for `planning`, `plan-review`, and `implementing`
 - **AND** the evidence bundle SHALL contain separate stage records for those substages
 - **AND** it SHALL NOT contain a single `planning` stage record that wraps the whole compound flow
+
+#### Scenario: Rejected ready dispatch does not emit planning substages
+- **WHEN** `issue_readiness.enabled` is `true`
+- **AND** ready dispatch returns `needs_spec`
+- **THEN** the run SHALL NOT record `planning` stage_start
+- **AND** SHALL NOT create a worktree
 
 ### Requirement: Fix rounds enforce stale OpenSpec deltas before push
 

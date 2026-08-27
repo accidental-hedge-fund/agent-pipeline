@@ -64,6 +64,16 @@ export const LOOP_TERMINAL_OUTCOMES = [
    * block. Must never map to workflow-engine-defect / run_fatal.
    */
   "coexistence_wait",
+  /**
+   * Issue-implementation-readiness admission rejection (#1238): the item moved
+   * to pipeline:needs-spec. Not workflow-engine-defect and not run_fatal.
+   */
+  "needs_spec",
+  /**
+   * Issue-implementation-readiness mechanical failure (#1238): provider,
+   * harness, timeout, or schema. Item stays on pipeline:ready. Not run_fatal.
+   */
+  "gate_unavailable",
   "failed",
   "abandoned",
 ] as const;

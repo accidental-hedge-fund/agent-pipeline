@@ -456,6 +456,24 @@ Nested fields:
 - **Default:** `600`
 - **Description:** Seconds for the intake harness call before timing out.
 
+### `issue_readiness`
+
+- **Type:** object
+- **Default:** `{"enabled":false,"timeout":600}`
+- **Description:** Opt-in issue-implementation-readiness admission gate (#1238). Default off.
+
+Nested fields:
+
+#### `issue_readiness.enabled`
+
+- **Type:** boolean
+- **Description:** When true, run the shared issue-implementation-readiness gate before pickup of a pipeline:ready issue. Default false: omitted or disabled leaves every pickup path unchanged.
+
+#### `issue_readiness.timeout`
+
+- **Type:** integer
+- **Description:** Seconds allowed for the Implementer planning-treatment admission call (default 600).
+
 ### `last30days`
 
 - **Type:** object

@@ -1487,6 +1487,87 @@ export async function addIssueComment(
 }
 
 /**
+ * List issue comments with REST numeric ids.
+ * `gh issue view --json comments` returns GraphQL node ids (`IC_kw…`), which
+ * cannot PATCH `/issues/comments/{id}`. Confirmed on issue #1238: REST `id` is
+ * numeric; view JSON `id` is the node id.
+ */
+export async function listIssueCommentsWithIds(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  run: GhApiRunner = (args) => ghRun(args, { wrapperName: "listIssueCommentsWithIds" }),
+): Promise<{ id: number; body: string; author: string; createdAt: string }[]> {
+  const [owner, repo] = cfg.repo.split("/");
+  const stdout = await run([
+    "api",
+    `repos/${owner}/${repo}/issues/${issueNumber}/comments`,
+    "--paginate",
+    "--slurp",
+  ]);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout.trim() || "[]");
+  } catch (err) {
+    throw new Error(`listIssueCommentsWithIds: invalid JSON: ${(err as Error).message}`);
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error(`listIssueCommentsWithIds: expected an array, got ${typeof parsed}`);
+  }
+  // `--paginate --slurp` yields T[][] (array of pages). A single-page fake may
+  // still be T[]. `flat()` handles both.
+  const raw = (parsed as unknown[]).flat() as Array<{
+    id: number;
+    body?: string;
+    user?: { login?: string };
+    created_at?: string;
+  }>;
+  return raw.map((c) => ({
+    id: c.id,
+    body: c.body ?? "",
+    author: c.user?.login ?? "unknown",
+    createdAt: c.created_at ?? "",
+  }));
+}
+
+/**
+ * Update an existing issue comment by REST numeric id.
+ * `-f body=` keeps the injectable `GhApiRunner` argv-only (no stdin).
+ */
+export async function updateIssueComment(
+  cfg: PipelineConfig,
+  commentId: number,
+  body: string,
+  run: GhApiRunner = (args) => ghRun(args, { wrapperName: "updateIssueComment" }),
+): Promise<void> {
+  const [owner, repo] = cfg.repo.split("/");
+  await run([
+    "api",
+    "--method",
+    "PATCH",
+    `repos/${owner}/${repo}/issues/comments/${commentId}`,
+    "-f",
+    `body=${body}`,
+  ]);
+}
+
+/**
+ * Delete an existing issue comment by REST numeric id.
+ */
+export async function deleteIssueComment(
+  cfg: PipelineConfig,
+  commentId: number,
+  run: GhApiRunner = (args) => ghRun(args, { wrapperName: "deleteIssueComment" }),
+): Promise<void> {
+  const [owner, repo] = cfg.repo.split("/");
+  await run([
+    "api",
+    "--method",
+    "DELETE",
+    `repos/${owner}/${repo}/issues/comments/${commentId}`,
+  ]);
+}
+
+/**
  * Post a comment on the PULL REQUEST (not the linked issue). The pipeline does
  * its review bookkeeping on the issue, but merge authority is separate from the
  * advance path. Findings that advanced as advisory can be missed if they live
@@ -3201,6 +3282,16 @@ export const PIPELINE_COMMENT_KINDS: readonly {
   {
     kind: "noop-advance-evidence",
     heading: "## Pipeline: noop-advance evidence",
+    verify: "pipeline-attest",
+  },
+  {
+    kind: "issue-readiness-admission",
+    heading: "## Pipeline: issue-readiness admission",
+    verify: "pipeline-attest",
+  },
+  {
+    kind: "issue-readiness-needs-spec",
+    heading: "## Pipeline: issue-readiness — needs spec",
     verify: "pipeline-attest",
   },
   {

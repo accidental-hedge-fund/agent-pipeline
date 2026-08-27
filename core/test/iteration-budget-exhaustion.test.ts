@@ -49,7 +49,7 @@ function withoutHostPinAuthorityEnv<T>(fn: () => T | Promise<T>): Promise<T> {
 }
 
 function auditComments(runId: string): { author: string; body: string }[] {
-  return STAGES.filter((s) => s !== "ready" && s !== "backlog").map((s) => ({
+  return STAGES.filter((s) => s !== "ready" && s !== "backlog" && s !== "needs-spec").map((s) => ({
     author: "pipeline-bot",
     body: `## Pipeline: ${s}\n<!-- pipeline-audit: run=${runId} state=${s} -->`,
   }));

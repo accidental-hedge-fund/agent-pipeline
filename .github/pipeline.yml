@@ -55,6 +55,10 @@ last30days:
   enabled: false # opt-in pre-planning activity brief
   timeout: 600 # seconds
 
+issue_readiness:
+  enabled: true # dogfood the issue-implementation-readiness admission gate (#1238)
+  timeout: 600 # seconds for the Implementer planning-treatment admission call
+
 steps: # turn optional steps off for speed/preference (default: all on)
   plan_review: true # cross-harness review of the plan before coding
   standard_review: true # review-1 (and its fix round)

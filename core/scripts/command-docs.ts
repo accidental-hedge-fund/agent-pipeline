@@ -120,7 +120,7 @@ export const COMMAND_DOCS: Record<string, CommandDoc> = {
     section: "factory",
   },
   triage: {
-    summary: "Set a pre-pipeline stage label (ready or backlog) on an issue",
+    summary: "Set a pre-pipeline stage label (ready or backlog) on an issue. needs-spec is an admission hold: apply the spec, then triage --stage ready.",
     usage: "triage <n> --stage ready|backlog",
     documented: true,
     section: "factory",

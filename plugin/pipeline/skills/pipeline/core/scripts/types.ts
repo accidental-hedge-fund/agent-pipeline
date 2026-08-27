@@ -4,6 +4,7 @@ import type { StageDiagnostic } from "./stage-diagnostic.ts";
 
 export const STAGES = [
   "backlog",
+  "needs-spec",
   "ready",
   "planning",
   "plan-review",
@@ -1121,6 +1122,11 @@ export interface PipelineConfig {
   // last30days pre-planning brief (opt-in; default off). Adds external public
   // discourse for the issue topic as carry-forward context for planning.
   last30days: { enabled: boolean; timeout: number };
+  // Opt-in issue-implementation-readiness admission gate (#1238). Default off:
+  // omitted or enabled:false leaves every pickup path unchanged. When true,
+  // ready dispatch evaluates a freshly fetched issue through the Implementer
+  // planning treatment before worktree create or planning authoring.
+  issue_readiness: { enabled: boolean; timeout: number };
   // Configurable pipeline steps (#13). Per-repo on/off for the optional
   // "thoroughness" steps. Structural/safety steps (planning, implementing, and
   // the pre-merge CI + mergeability gates) have no toggle and are always on —
@@ -1629,6 +1635,7 @@ export const DEFAULT_CONFIG: Omit<
   plan_review_effort: "medium",
   openspec: { enabled: "auto", bootstrap: false },
   last30days: { enabled: false, timeout: 600 },
+  issue_readiness: { enabled: false, timeout: 600 },
   steps: { plan_review: true, standard_review: true, adversarial_review: true, docs: true },
   design_gate: {
     enabled: false,
@@ -1809,6 +1816,13 @@ export type Outcome =
   | { advanced: false; status: "error"; reason: string };
 
 // Issue/PR snapshot used by stage handlers.
+/** Structured admission verdict from the issue-implementation-readiness gate (#1238). */
+export interface IssueReadinessVerdict {
+  verdict: "ready" | "needs_spec";
+  deficiencies: string[];
+  proposed_body: string;
+}
+
 export interface ItemDetail {
   number: number;
   type: "issue" | "pull_request";

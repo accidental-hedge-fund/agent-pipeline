@@ -778,6 +778,80 @@ test("resolveConfig: pre_code_attestation enabled with a trigger subset", async 
   }
 });
 
+test("resolveConfig: issue_readiness.enabled true is accepted and timeout defaults to 600", async () => {
+  const repo = makeFakeRepo(`issue_readiness:\n  enabled: true\n`);
+  const binDir = makeFakeGh("acme/ir1");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-ir1`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.issue_readiness.enabled, true);
+    assert.equal(cfg.issue_readiness.timeout, 600);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: absent issue_readiness block defaults to disabled / timeout 600", async () => {
+  const repo = makeFakeRepo(`base_branch: main\n`);
+  const binDir = makeFakeGh("acme/ir2");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-ir2`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.issue_readiness.enabled, false);
+    assert.equal(cfg.issue_readiness.timeout, 600);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: unknown key under issue_readiness is rejected", async () => {
+  const repo = makeFakeRepo(`issue_readiness:\n  enabled: true\n  model: opus\n`);
+  const binDir = makeFakeGh("acme/ir3");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-ir3`);
+    assert.throws(() => cfgMod.resolveConfig({ repoPath: repo }), /Invalid.*model/s);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("this repository .github/pipeline.yml enables issue_readiness", async () => {
+  const repo = path.resolve(fileURLToPath(new URL("../..", import.meta.url)));
+  const binDir = makeFakeGh("accidental-hedge-fund/agent-pipeline");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-ir-dogfood`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.issue_readiness.enabled, true);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: agent-pipeline dogfood file can enable issue_readiness", async () => {
+  const repo = makeFakeRepo(
+    `harnesses:\n  implementer: grok\n  reviewer: codex\nissue_readiness:\n  enabled: true\n  timeout: 600\n`,
+    { exact: true },
+  );
+  const binDir = makeFakeGh("acme/ir4");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}-ir4`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.equal(cfg.issue_readiness.enabled, true);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
 test("resolveConfig: pre_code_attestation unknown key is rejected at parse time", async () => {
   const repo = makeFakeRepo(
     `pre_code_attestation:\n  enabled: true\n  silent_approve: true\n`,

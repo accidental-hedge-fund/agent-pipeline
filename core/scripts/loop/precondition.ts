@@ -20,12 +20,12 @@ export const PRECONDITION_REQUIRED_STAGE = `${LABEL_PREFIX}ready`;
 
 /** The closed set of stage suffixes (as recorded on {@link LoopExternalIdentity.pipeline_stage})
  *  that count as "not yet ready" — a deliberate operator hold, not a mid-pipeline stage. */
-const PRE_PIPELINE_STAGE_SUFFIXES = new Set(["backlog"]);
+const PRE_PIPELINE_STAGE_SUFFIXES = new Set(["backlog", "needs-spec"]);
 
 /** Stage suffixes that are NOT mid-flight advance work: pre-pipeline, precondition-only,
  *  and terminal off-ramps. Derived from the authoritative {@link STAGES} vocabulary; every
  *  other known stage is mid-flight. Used by reconciliation's open-PR repair gate (#712). */
-const NON_MID_FLIGHT_STAGE_SUFFIXES = new Set(["backlog", "ready", "ready-to-deploy", "needs-human"]);
+const NON_MID_FLIGHT_STAGE_SUFFIXES = new Set(["backlog", "needs-spec", "ready", "ready-to-deploy", "needs-human"]);
 
 /** Closed set of known mid-flight advance stages: every {@link STAGES} member except the
  *  non-mid-flight set above. Kept as a Set so membership checks stay O(1) and the table is
@@ -35,7 +35,7 @@ const MID_FLIGHT_STAGE_SUFFIXES = new Set(
 );
 
 /** True when `stage` — a `LoopExternalIdentity.pipeline_stage` value — is pre-pipeline: still
- *  `pipeline:backlog`, or no `pipeline:*` label at all (`null`). Every other stage (`ready`, any
+ *  `pipeline:backlog`, `pipeline:needs-spec`, or no `pipeline:*` label at all (`null`). Every other stage (`ready`, any
  *  mid-flight advance-loop stage, `ready-to-deploy`) is at-or-past the precondition. */
 export function isPrePipelineStage(stage: string | null): boolean {
   return stage === null || PRE_PIPELINE_STAGE_SUFFIXES.has(stage);

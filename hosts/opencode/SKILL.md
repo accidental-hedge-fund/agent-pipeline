@@ -20,7 +20,7 @@ so `/pipeline --version` injects the installed launcher version instead of
 embedding instructional skill text in the template.
 
 Self-contained TypeScript skill that advances a GitHub issue (or PR's linked
-issue) through a 17-stage label-driven state machine, ending at
+issue) through a 18-stage label-driven state machine, ending at
 `pipeline:ready-to-deploy` on the happy path (or parking at `pipeline:needs-human`
 when review ceilings / similar paths exhaust). The ordinary advance path never
 merges. Merge commands require separate operator authority.
@@ -36,10 +36,10 @@ of `core/` (+ `hosts/claude`). After editing any file under `core/`, run
 
 ## State machine
 
-Happy path (16 stages total in code `STAGES`, including the park off-ramp):
+Happy path (18 stages total in code `STAGES`, including the park off-ramp):
 
 ```
-backlog → ready → planning → plan-review → pre-code-attestation → implementing → design-gate
+backlog → needs-spec → ready → planning → plan-review → pre-code-attestation → implementing → design-gate
               → review-1 → fix-1 → review-2 → fix-2
               → pre-merge → visual-gate → eval-gate → shipcheck-gate
               → ready-to-deploy
@@ -57,10 +57,11 @@ handlers in `scripts/stages/`. The skill **owns** the labels — it sets,
 removes, and transitions them as side-effects of running the underlying
 stage logic. There is no separate orchestrator process.
 
-`backlog` is a triage marker (e.g. set by `/sweep`). `/pipeline` starts work
-at `ready` and only acts on items that already carry a `pipeline:*` label.
-`needs-human` is a terminal park state (review-ceiling punch list, etc.); the
-advance loop never auto-advances from it to `ready-to-deploy`.
+`backlog` is a triage marker (e.g. set by `/sweep`). `needs-spec` is an admission
+hold: apply a complete spec, then `pipeline triage <N> --stage ready`. `/pipeline`
+starts work at `ready` and only acts on items that already carry a `pipeline:*`
+label. `needs-human` is a terminal park state (review-ceiling punch list, etc.);
+the advance loop never auto-advances from it to `ready-to-deploy`.
 
 ### Merge authority boundary
 

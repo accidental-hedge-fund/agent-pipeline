@@ -161,6 +161,12 @@ test("buildStatusPayload: status is waiting when stage is backlog", () => {
   assert.equal(payload.status, "waiting");
 });
 
+test("buildStatusPayload: needs-spec is an admission hold", () => {
+  const payload = buildStatusPayload(makeDetail({ labels: ["pipeline:needs-spec"] }), null, null, CFG);
+  assert.equal(payload.status, "waiting");
+  assert.match(payload.next_action, /triage/);
+});
+
 // ---------------------------------------------------------------------------
 // 4.1 — last_event
 // ---------------------------------------------------------------------------
