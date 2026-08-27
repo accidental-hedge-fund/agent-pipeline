@@ -3011,7 +3011,7 @@ const ISSUE_TIMELINE_QUERY =
   "{issue(number:$num){timelineItems(last:50,before:$before,itemTypes:[CONNECTED_EVENT,CROSS_REFERENCED_EVENT])" +
   "{pageInfo{hasPreviousPage startCursor}nodes{__typename " +
   `... on ConnectedEvent{subject{__typename ... on PullRequest{${ISSUE_TIMELINE_PR_FIELDS}}}} ` +
-  `... on CrossReferencedEvent{willCloseTarget source{__typename ... on PullRequest{${ISSUE_TIMELINE_PR_FIELDS}}}}}}}}`;
+  `... on CrossReferencedEvent{willCloseTarget source{__typename ... on PullRequest{${ISSUE_TIMELINE_PR_FIELDS}}}}}}}}}`;
 
 /** Same issue-scoped resolution as {@link getPrForIssue} but across every PR
  *  state (open, closed, merged) — used by reconciliation (#511), ship train

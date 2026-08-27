@@ -1051,6 +1051,30 @@ test("getPrForIssueAnyState: resolves via GraphQL timeline query, not a repo-wid
   assert.ok(!joined.includes("pr list"), "must not fall back to a repo-wide pr list scan");
 });
 
+test("getPrForIssueAnyState: emitted timeline GraphQL query has balanced braces (#1269 review-1)", async () => {
+  let captured: string[] = [];
+  const run: GhApiRunner = async (args) => {
+    captured = args;
+    return timelinePageResponse([connectedEventNode(42)]);
+  };
+  await getPrForIssueAnyState(TIMELINE_CFG, 154, run);
+  const queryArg = captured.find((arg) => arg.startsWith("query="));
+  assert.ok(queryArg, "must pass a query= GraphQL document");
+  const query = queryArg.slice("query=".length);
+  let open = 0;
+  let close = 0;
+  for (const ch of query) {
+    if (ch === "{") open++;
+    else if (ch === "}") close++;
+  }
+  assert.equal(
+    close,
+    open,
+    `timeline query braces must balance (open=${open} close=${close}): ${query}`,
+  );
+  assert.equal(query.at(-1), "}", "operation selection must close");
+});
+
 test("getPrForIssueAnyState: non-closing pipeline (#N) CrossReferencedEvent resolves (#1269)", async () => {
   const run: GhApiRunner = async () =>
     timelinePageResponse([
