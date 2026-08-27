@@ -5,6 +5,10 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as crypto from "node:crypto";
 import { EventEmitter } from "node:events";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+import { artifactSubdir, FACTORY_RELEASE_ARTIFACT } from "../scripts/artifact-ignore.ts";
 import {
   buildFactoryReleaseUnsignedDigestBinding,
   compareSemver,
@@ -14,6 +18,8 @@ import {
   defaultResumeBoundPackLoop,
   defaultSpawnCandidateLoop,
   defaultStartBoundPackLoop,
+  FACTORY_RELEASE_PREPARE_HELP,
+  FACTORY_RELEASE_ROOT_REL,
   factoryReleaseCheckpointPath,
   factoryReleaseLoopBindingPath,
   sanitizeCandidateLoopEnv,
@@ -23,6 +29,10 @@ import {
   generateDurableUnsignedFrg,
   honestLatestJsonBindsRequest,
   isBoundPackLoopTerminal,
+  isPathInsideCheckout,
+  REQUEST_INSIDE_CHECKOUT_TOKEN,
+  resolveRequestPathForContainment,
+  runFactoryReleasePrepare,
   selectExistingReleaseFromContainingPrs,
   selectExistingReleaseRow,
   isPendingLoopDispatch,
@@ -33,7 +43,7 @@ import {
   productionCreateOrReusePackIssues,
   productionDispatchPackLoop,
   rejectForbiddenRequestFields,
-  runFactoryReleasePrepare,
+  targetCheckoutsForPrepare,
   unsignedDigestBindingMismatch,
   type FactoryReleaseFrgPayload,
   type FactoryReleasePrepareDeps,
@@ -2056,4 +2066,324 @@ test("resume spawn strips FRG signing vars from the candidate loop environment",
     "--profile",
     "claude",
   ]);
+});
+
+// ---------------------------------------------------------------------------
+// #1259: --request must not resolve inside the target checkout
+// ---------------------------------------------------------------------------
+
+function realpathThrowsEnoent(): (p: string) => string {
+  return (p: string) => {
+    const err = new Error(`ENOENT: ${p}`) as NodeJS.ErrnoException;
+    err.code = "ENOENT";
+    throw err;
+  };
+}
+
+function realpathMap(map: Record<string, string>): (p: string) => string {
+  return (p: string) => {
+    if (Object.hasOwn(map, p)) return map[p]!;
+    const err = new Error(`ENOENT: ${p}`) as NodeJS.ErrnoException;
+    err.code = "ENOENT";
+    throw err;
+  };
+}
+
+test("isPathInsideCheckout: descendant, checkout root, tmpdir outside, .. escape still inside", () => {
+  assert.equal(isPathInsideCheckout("/repo/.agent-pipeline/request.json", "/repo"), true);
+  assert.equal(isPathInsideCheckout("/repo", "/repo"), true);
+  assert.equal(isPathInsideCheckout("/tmp/factory-release-prepare-request.json", "/repo"), false);
+  assert.equal(
+    isPathInsideCheckout(
+      path.resolve("/repo/../repo/.agent-pipeline/request.json"),
+      "/repo",
+    ),
+    true,
+  );
+  assert.equal(isPathInsideCheckout("/repo-other/request.json", "/repo"), false);
+});
+
+test("resolveRequestPathForContainment: symlink into checkout is canonicalized", () => {
+  const resolved = resolveRequestPathForContainment(
+    "/tmp/outside-link.json",
+    realpathMap({
+      "/tmp/outside-link.json": "/repo/.agent-pipeline/request-1.39.13.json",
+    }),
+  );
+  assert.equal(resolved, "/repo/.agent-pipeline/request-1.39.13.json");
+  assert.equal(isPathInsideCheckout(resolved, "/repo"), true);
+});
+
+test("targetCheckoutsForPrepare includes distinct factory control from env", () => {
+  const roots = targetCheckoutsForPrepare({
+    repoDir: "/product",
+    env: { AGENT_PIPELINE_FACTORY_CONTROL: "/factory-control" },
+  });
+  assert.deepEqual(roots, ["/product", "/factory-control"]);
+});
+
+test("in-checkout --request is refused before pack-loop dispatch (#1259)", async () => {
+  const mem = memoryFs();
+  const request = baseRequest();
+  const requestPath = "/repo/.agent-pipeline/request-1.39.13.json";
+  await mem.writeFile(requestPath, JSON.stringify(request));
+  let startCalls = 0;
+  let generateCalls = 0;
+  const deps = defaultFactoryReleasePrepareDeps({
+    env: {},
+    now: () => new Date("2026-08-10T12:00:00Z"),
+    readRequestText: (p) => mem.readRequestText(p),
+    readFile: (p) => mem.readFile(p),
+    writeFile: (p, body) => mem.writeFile(p, body),
+    mkdir: async () => {},
+    fileExists: (p) => mem.fileExists(p),
+    loadPack: async () => fakePack(),
+    realpathSync: realpathThrowsEnoent(),
+    generateUnsignedFrg: async () => {
+      generateCalls += 1;
+      throw new Error("must not generate");
+    },
+    startBoundPackLoop: async () => {
+      startCalls += 1;
+      return { loop_run_id: "loop-must-not-start" };
+    },
+    observeAttestation: async () => null,
+    runRelease: async () => {
+      throw new Error("must not release");
+    },
+  });
+  await assert.rejects(
+    () => runFactoryReleasePrepare({ requestPath, repoDir: "/repo" }, deps),
+    (err: unknown) => {
+      const msg = (err as Error).message;
+      assert.match(msg, new RegExp(REQUEST_INSIDE_CHECKOUT_TOKEN));
+      assert.match(msg, /request-1\.39\.13\.json/);
+      assert.match(msg, /\/repo/);
+      assert.match(msg, /\$TMPDIR/);
+      assert.match(msg, /AGENT_PIPELINE_STATE_HOME/);
+      assert.match(msg, /\$RUN_DIR/);
+      return true;
+    },
+  );
+  assert.equal(startCalls, 0, "in-checkout request must not start a pack loop");
+  assert.equal(generateCalls, 0, "in-checkout request must not generate unsigned FRG");
+});
+
+test("request inside a distinct factory control checkout is refused (#1259)", async () => {
+  const mem = memoryFs();
+  const requestPath = "/factory-control/.agent-pipeline/request.json";
+  await mem.writeFile(requestPath, JSON.stringify(baseRequest()));
+  let startCalls = 0;
+  const deps = defaultFactoryReleasePrepareDeps({
+    env: { AGENT_PIPELINE_FACTORY_CONTROL: "/factory-control" },
+    now: () => new Date("2026-08-10T12:00:00Z"),
+    readRequestText: (p) => mem.readRequestText(p),
+    readFile: (p) => mem.readFile(p),
+    writeFile: (p, body) => mem.writeFile(p, body),
+    mkdir: async () => {},
+    fileExists: (p) => mem.fileExists(p),
+    loadPack: async () => fakePack(),
+    realpathSync: realpathThrowsEnoent(),
+    startBoundPackLoop: async () => {
+      startCalls += 1;
+      return { loop_run_id: "loop-must-not-start" };
+    },
+    observeAttestation: async () => null,
+    runRelease: async () => {
+      throw new Error("must not release");
+    },
+  });
+  await assert.rejects(
+    () => runFactoryReleasePrepare({ requestPath, repoDir: "/product" }, deps),
+    /request_inside_checkout.*\/factory-control/,
+  );
+  assert.equal(startCalls, 0);
+});
+
+test("gitignored descendant --request is still refused (#1259)", async () => {
+  const mem = memoryFs();
+  const requestPath = "/repo/.agent-pipeline/frg/request.json";
+  await mem.writeFile(requestPath, JSON.stringify(baseRequest()));
+  let startCalls = 0;
+  const deps = defaultFactoryReleasePrepareDeps({
+    env: {},
+    now: () => new Date("2026-08-10T12:00:00Z"),
+    readRequestText: (p) => mem.readRequestText(p),
+    readFile: (p) => mem.readFile(p),
+    writeFile: (p, body) => mem.writeFile(p, body),
+    mkdir: async () => {},
+    fileExists: (p) => mem.fileExists(p),
+    loadPack: async () => fakePack(),
+    realpathSync: realpathThrowsEnoent(),
+    startBoundPackLoop: async () => {
+      startCalls += 1;
+      return { loop_run_id: "loop-must-not-start" };
+    },
+    observeAttestation: async () => null,
+    runRelease: async () => {
+      throw new Error("must not release");
+    },
+  });
+  await assert.rejects(
+    () => runFactoryReleasePrepare({ requestPath, repoDir: "/repo" }, deps),
+    new RegExp(REQUEST_INSIDE_CHECKOUT_TOKEN),
+  );
+  assert.equal(startCalls, 0);
+});
+
+test("symlink --request into the checkout is refused (#1259)", async () => {
+  const mem = memoryFs();
+  const requestPath = "/tmp/outside-link.json";
+  await mem.writeFile(requestPath, JSON.stringify(baseRequest()));
+  let startCalls = 0;
+  const deps = defaultFactoryReleasePrepareDeps({
+    env: {},
+    now: () => new Date("2026-08-10T12:00:00Z"),
+    readRequestText: (p) => mem.readRequestText(p),
+    readFile: (p) => mem.readFile(p),
+    writeFile: (p, body) => mem.writeFile(p, body),
+    mkdir: async () => {},
+    fileExists: (p) => mem.fileExists(p),
+    loadPack: async () => fakePack(),
+    realpathSync: realpathMap({
+      "/tmp/outside-link.json": "/repo/.agent-pipeline/request.json",
+    }),
+    startBoundPackLoop: async () => {
+      startCalls += 1;
+      return { loop_run_id: "loop-must-not-start" };
+    },
+    observeAttestation: async () => null,
+    runRelease: async () => {
+      throw new Error("must not release");
+    },
+  });
+  await assert.rejects(
+    () => runFactoryReleasePrepare({ requestPath, repoDir: "/repo" }, deps),
+    new RegExp(REQUEST_INSIDE_CHECKOUT_TOKEN),
+  );
+  assert.equal(startCalls, 0);
+});
+
+test("off-repo --request under $TMPDIR is not rejected for location (#1259)", async () => {
+  const mem = memoryFs();
+  const request = baseRequest();
+  const requestPath = "/tmp/factory-release-prepare-request.json";
+  await mem.writeFile(requestPath, JSON.stringify(request));
+  const deps = defaultFactoryReleasePrepareDeps({
+    env: {},
+    now: () => new Date("2026-08-10T12:00:00Z"),
+    readRequestText: (p) => mem.readRequestText(p),
+    readFile: (p) => mem.readFile(p),
+    writeFile: (p, body) => mem.writeFile(p, body),
+    mkdir: async () => {},
+    fileExists: (p) => mem.fileExists(p),
+    loadPack: async () => fakePack(),
+    realpathSync: realpathThrowsEnoent(),
+    startBoundPackLoop: async () => ({ loop_run_id: "loop-off-repo" }),
+    observeAttestation: async () => null,
+    runRelease: async () => {
+      throw new Error("must not release");
+    },
+  });
+  const outcome = await runFactoryReleasePrepare({ requestPath, repoDir: "/repo" }, deps);
+  assert.equal(outcome.exitCode, 0);
+  assert.equal(outcome.result.status, "in_progress");
+});
+
+test("off-repo --request under AGENT_PIPELINE_STATE_HOME is not rejected for location (#1259)", async () => {
+  const mem = memoryFs();
+  const request = baseRequest();
+  const requestPath = "/state/home/factory-release-prepare-request.json";
+  await mem.writeFile(requestPath, JSON.stringify(request));
+  const deps = defaultFactoryReleasePrepareDeps({
+    env: { AGENT_PIPELINE_STATE_HOME: "/state/home" },
+    now: () => new Date("2026-08-10T12:00:00Z"),
+    readRequestText: (p) => mem.readRequestText(p),
+    readFile: (p) => mem.readFile(p),
+    writeFile: (p, body) => mem.writeFile(p, body),
+    mkdir: async () => {},
+    fileExists: (p) => mem.fileExists(p),
+    loadPack: async () => fakePack(),
+    realpathSync: realpathThrowsEnoent(),
+    startBoundPackLoop: async () => ({ loop_run_id: "loop-state-home" }),
+    observeAttestation: async () => null,
+    runRelease: async () => {
+      throw new Error("must not release");
+    },
+  });
+  const outcome = await runFactoryReleasePrepare({ requestPath, repoDir: "/repo" }, deps);
+  assert.equal(outcome.exitCode, 0);
+  assert.equal(outcome.result.status, "in_progress");
+});
+
+test("off-repo request dispatch writes only under contract factory-release/ (#1259)", async () => {
+  const mem = memoryFs();
+  const request = baseRequest();
+  const requestPath = "/tmp/factory-release-prepare-request.json";
+  await mem.writeFile(requestPath, JSON.stringify(request));
+  const deps = defaultFactoryReleasePrepareDeps({
+    env: {},
+    now: () => new Date("2026-08-10T12:00:00Z"),
+    readRequestText: (p) => mem.readRequestText(p),
+    readFile: (p) => mem.readFile(p),
+    writeFile: (p, body) => mem.writeFile(p, body),
+    mkdir: async () => {},
+    fileExists: (p) => mem.fileExists(p),
+    loadPack: async () => fakePack(),
+    realpathSync: realpathThrowsEnoent(),
+    startBoundPackLoop: async () => ({ loop_run_id: "loop-clean-dispatch" }),
+    observeAttestation: async () => null,
+    runRelease: async () => {
+      throw new Error("must not release");
+    },
+  });
+  const outcome = await runFactoryReleasePrepare({ requestPath, repoDir: "/repo" }, deps);
+  assert.equal(outcome.result.status, "in_progress");
+  const contractRoot = artifactSubdir("/repo", FACTORY_RELEASE_ARTIFACT);
+  assert.equal(FACTORY_RELEASE_ROOT_REL, ".agent-pipeline/factory-release");
+  const writtenUnderRepo = [...mem.files.keys()].filter(
+    (p) => p === "/repo" || p.startsWith("/repo/"),
+  );
+  assert.ok(writtenUnderRepo.length > 0, "prepare must persist a checkpoint under the contract dir");
+  for (const dest of writtenUnderRepo) {
+    assert.ok(
+      dest === contractRoot || dest.startsWith(`${contractRoot}/`),
+      `prepare left an unignored dest under repoDir: ${dest}`,
+    );
+  }
+  assert.ok(
+    !writtenUnderRepo.includes(requestPath),
+    "request file must not land under repoDir",
+  );
+});
+
+test("FACTORY_RELEASE_PREPARE_HELP names the location gate and off-repo dests (#1259)", () => {
+  assert.match(FACTORY_RELEASE_PREPARE_HELP, /absolute-off-repo-request\.json/);
+  assert.match(FACTORY_RELEASE_PREPARE_HELP, new RegExp(REQUEST_INSIDE_CHECKOUT_TOKEN));
+  assert.match(FACTORY_RELEASE_PREPARE_HELP, /outside the target checkout/);
+  assert.match(FACTORY_RELEASE_PREPARE_HELP, /\$TMPDIR/);
+  assert.match(FACTORY_RELEASE_PREPARE_HELP, /AGENT_PIPELINE_STATE_HOME/);
+  assert.match(FACTORY_RELEASE_PREPARE_HELP, /\$RUN_DIR/);
+});
+
+test("FRG runbook documents off-repo --request dests (#1259)", () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+  const runbook = fs.readFileSync(
+    path.join(repoRoot, "docs/factory-reliability-gate-runbook.md"),
+    "utf8",
+  );
+  const ship = fs.readFileSync(
+    path.join(repoRoot, "docs/runbooks/ship-milestone.md"),
+    "utf8",
+  );
+  assert.match(runbook, /\$TMPDIR|AGENT_PIPELINE_STATE_HOME|\$RUN_DIR/);
+  assert.match(runbook, /outside the target checkout/);
+  assert.doesNotMatch(
+    runbook,
+    /factory-release prepare --request \$REPO_DIR\/\.agent-pipeline\/request\.json/,
+  );
+  assert.doesNotMatch(
+    ship,
+    /factory-release prepare --request \$REPO_DIR\/\.agent-pipeline\/request\.json/,
+  );
 });

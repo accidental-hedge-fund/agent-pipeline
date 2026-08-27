@@ -365,7 +365,7 @@ export function assertFrgCandidateProvenance(
       if (!bound) {
         throw new Error(
           "ship FRG: post-pilot release evidence has no durable candidate binding; " +
-            "run pipeline factory-release prepare --request <absolute-request.json> --json " +
+            "run pipeline factory-release prepare --request <absolute-off-repo-request.json> --json " +
             "from the exact integrated candidate",
         );
       }
@@ -562,7 +562,7 @@ export function shipCoordinatorDepsFromOperations(
           throw new Error(
             `ship FRG: no release-eligible candidate artifact for v${intent.version}. ` +
               `Auto-generate genuine FRG via the durable path (not a synthetic trivial pack):\n` +
-              `  pipeline factory-release prepare --request <absolute-request.json> --json\n` +
+              `  pipeline factory-release prepare --request <absolute-off-repo-request.json> --json\n` +
               `Multi-tick protocol: first call starts/resumes a bound pack loop and ` +
               `returns in_progress; after the loop is scored --from-run (no --observations) ` +
               `it returns awaiting_frg_attestation; after the production-owned attestor ` +

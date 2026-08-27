@@ -146,8 +146,13 @@ Layer A-allowed. The set does not grow without a later spec change.
 Later releases still generate FRG through the durable engine command:
 
 ```text
-pipeline factory-release prepare --request <absolute-request.json> --json
+pipeline factory-release prepare --request "$TMPDIR/factory-release-prepare-request.json" --json
 ```
+
+`--request` MUST be an absolute path outside the target checkout (`$TMPDIR`,
+`AGENT_PIPELINE_STATE_HOME`, or the Tugboat `$RUN_DIR`). An in-checkout path
+dirties protected `main` and fails doctor `worktree-clean` on the pack loop.
+Tugboat already writes `$RUN_DIR/factory-release-prepare-request.json`.
 
 This is an idempotent multi-tick protocol.
 
@@ -656,7 +661,7 @@ ship for a missing tree file.
 Remediation when the **local** tag helper fail-closes:
 
 ```bash
-pipeline factory-release prepare --request <absolute-request.json> --json
+pipeline factory-release prepare --request "$TMPDIR/factory-release-prepare-request.json" --json
 ```
 
 Or re-run the Tugboat FRG pack phase so on-disk

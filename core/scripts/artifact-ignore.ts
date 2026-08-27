@@ -111,6 +111,15 @@ export const HARNESS_OWNERSHIP_ARTIFACT: ArtifactContractEntry = {
     "Durable harness mutation-ownership records (#1246); host-local, never committed.",
 };
 
+/** Factory-release prepare checkpoints and loop bindings (#1259). Under
+ *  `.agent-pipeline/factory-release/<fingerprint>/` on the prepared checkout;
+ *  engine-written, never committed on the factory control checkout. */
+export const FACTORY_RELEASE_ARTIFACT: ArtifactContractEntry = {
+  name: "factory-release",
+  comment:
+    "Factory-release prepare checkpoints and loop bindings; engine-written, never committed on the factory control checkout.",
+};
+
 /** Ordered contract of every `.agent-pipeline/` directory (or file) the
  *  engine writes. No other module SHALL independently define an
  *  `.agent-pipeline/` artifact path — derive it from an entry here instead. */
@@ -126,6 +135,7 @@ export const ARTIFACT_CONTRACT: readonly ArtifactContractEntry[] = [
   LINEAGE_ARTIFACT,
   FRG_ARTIFACT,
   HARNESS_OWNERSHIP_ARTIFACT,
+  FACTORY_RELEASE_ARTIFACT,
 ];
 
 /** Resolve `<repoDir>/.agent-pipeline/<entry.name>` for a contract entry. */

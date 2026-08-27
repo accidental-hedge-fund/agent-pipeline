@@ -38,3 +38,7 @@ node_modules/
 
 # Durable harness mutation-ownership records (#1246); host-local, never committed.
 .agent-pipeline/harness-ownership/
+
+# Factory-release prepare checkpoints and loop bindings; engine-written,
+# never committed on the factory control checkout.
+.agent-pipeline/factory-release/
