@@ -155,6 +155,7 @@ import { autoFileCorrections, autoFilePapercuts, realAutoFileDeps } from "./stag
 import {
   evaluateIssueReadiness,
   gateUnavailableSummary,
+  mutationFailedSummary,
   needsSpecSummary,
 } from "./issue-readiness.ts";
 import * as planningStage from "./stages/planning.ts";
@@ -978,6 +979,13 @@ export async function dispatch(
             advanced: false,
             status: "error",
             reason: gateUnavailableSummary(admission),
+          };
+        }
+        if (admission.kind === "mutation-failed") {
+          return {
+            advanced: false,
+            status: "error",
+            reason: mutationFailedSummary(admission),
           };
         }
       }

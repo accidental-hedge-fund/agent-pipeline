@@ -58,3 +58,8 @@
 - [x] 8.3 Reconcile concurrent first-create of owned comments down to one canonical comment and verify a simultaneous-rejection fake leaves exactly one
 - [x] 8.4 Treat pipeline-actor lookup failure as `gate-unavailable` with no model call or GitHub mutation
 - [x] 8.5 Restrict queue `selectIssues` to exactly `pipeline:ready` and verify planning/review/implementing issues are excluded
+
+## 9. Review-3 mutation verification
+
+- [x] 9.1 Treat comment persist plus the needs-spec label transition as a re-fetched write sequence: retry remaining writes while still on `ready`, compensate or skip labels when the live stage moved, and never report `gate-unavailable` after a GitHub mutation
+- [x] 9.2 Return typed `mutation-failed` (fence delivery, no planning) when a comment or label write cannot be completed or compensated, and verify comment-success/label-failure plus each individual label-operation failure

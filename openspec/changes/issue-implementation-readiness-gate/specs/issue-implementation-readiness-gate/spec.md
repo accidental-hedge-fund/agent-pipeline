@@ -268,7 +268,7 @@ After an author applies a proposed body, `pipeline triage <N> --stage ready` SHA
 
 ### Requirement: Provider, harness, timeout, or schema failure SHALL be typed gate-unavailable with no fallback
 
-When the Implementer cannot be invoked, times out, or returns a response that fails the verdict schema, the outcome SHALL be typed `gate-unavailable`. A `needs_spec` response whose `proposed_body` omits the required headings or lists them out of order SHALL fail the verdict schema. When pipeline-actor lookup fails or returns no actor, the outcome SHALL be typed `gate-unavailable`; the gate SHALL NOT invoke the Implementer and SHALL NOT write GitHub mutations until ownership can be verified. The gate SHALL NOT fall back to a structural heuristic, the Reviewer, another provider, or another model. Direct single invocation SHALL fail with a non-zero exit and SHALL NOT start delivery. Multi-item runs SHALL block the affected issue and its selected dependents for that run and SHALL continue independent selected issues. The gate SHALL NOT write GitHub mutations on `gate-unavailable`. The issue SHALL remain on `pipeline:ready`.
+When the Implementer cannot be invoked, times out, or returns a response that fails the verdict schema, the outcome SHALL be typed `gate-unavailable`. A `needs_spec` response whose `proposed_body` omits the required headings or lists them out of order SHALL fail the verdict schema. When pipeline-actor lookup fails or returns no actor, the outcome SHALL be typed `gate-unavailable`; the gate SHALL NOT invoke the Implementer and SHALL NOT write GitHub mutations until ownership can be verified. The gate SHALL NOT fall back to a structural heuristic, the Reviewer, another provider, or another model. Direct single invocation SHALL fail with a non-zero exit and SHALL NOT start delivery. Multi-item runs SHALL block the affected issue and its selected dependents for that run and SHALL continue independent selected issues. The gate SHALL NOT write GitHub mutations on `gate-unavailable`. The issue SHALL remain on `pipeline:ready`. The gate SHALL NOT report `gate-unavailable` after a GitHub comment or label write from this attempt has occurred.
 
 #### Scenario: Direct single fails visibly
 
@@ -311,6 +311,41 @@ When the Implementer cannot be invoked, times out, or returns a response that fa
 - **THEN** A and B SHALL be blocked for that run
 - **AND** C SHALL remain eligible
 - **AND** no reviewer or alternate-model fallback SHALL run for A
+
+### Requirement: A GitHub write sequence SHALL be re-fetched and SHALL NOT be reported as gate-unavailable after a mutation
+
+The gate SHALL treat the owned comment persist and the `ready` → `needs-spec` label transition as a verified write sequence. After a write attempt fails, the gate SHALL re-fetch GitHub state. When the desired comment and `pipeline:needs-spec` without `pipeline:ready` already hold, the gate SHALL return `needs_spec`. When the live stage is still `ready`, the gate SHALL retry remaining writes. The gate SHALL re-fetch labels immediately before each label write and SHALL NOT add `pipeline:needs-spec` when the live stage is no longer `ready`. `gate-unavailable` SHALL mean no GitHub mutation from this attempt remains. When a write cannot be completed or compensated, the gate SHALL return typed `mutation-failed`, which SHALL fence delivery and SHALL NOT start planning.
+
+#### Scenario: Comment write succeeds and first label add fails
+
+- **WHEN** persist of the owned comment succeeds
+- **AND** the first add of `pipeline:needs-spec` fails
+- **AND** a retry of the label transition succeeds
+- **THEN** the outcome SHALL be `needs_spec`
+- **AND** SHALL NOT be `gate-unavailable`
+
+#### Scenario: Comment write succeeds and label add does not complete
+
+- **WHEN** persist of the owned comment succeeds
+- **AND** adding `pipeline:needs-spec` keeps failing
+- **THEN** the outcome SHALL be `mutation-failed`
+- **AND** SHALL NOT be `gate-unavailable`
+- **AND** delivery SHALL NOT start
+
+#### Scenario: Label add succeeds and first label remove fails
+
+- **WHEN** adding `pipeline:needs-spec` succeeds
+- **AND** the first remove of `pipeline:ready` fails
+- **AND** a retry remove succeeds
+- **THEN** the outcome SHALL be `needs_spec`
+- **AND** SHALL NOT be `gate-unavailable`
+
+#### Scenario: Stage is no longer ready after comment persist
+
+- **WHEN** persist of the owned comment succeeds
+- **AND** the next live fetch shows a stage other than `pipeline:ready`
+- **THEN** the gate SHALL NOT add `pipeline:needs-spec`
+- **AND** SHALL NOT report `gate-unavailable`
 
 ### Requirement: Gate I/O SHALL be injectable so unit tests perform no real network, git, or subprocess calls
 

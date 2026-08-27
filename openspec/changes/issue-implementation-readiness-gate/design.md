@@ -119,6 +119,8 @@ On `ready` it may update the owned comment with the bound admission record. It S
 
 On `gate-unavailable` the gate writes no GitHub mutation. Direct single invocation fails visibly (non-zero exit). Multi-item runs record a typed hold for that issue and for selected dependents of that issue. Independent selected issues continue. The issue stays on `pipeline:ready` so a later run can retry. Do not move it to `needs-spec` (that would fake a spec-quality verdict). Do not fall back to the Reviewer, a structural heuristic, another provider, or another model.
 
+The owned comment and the `ready` → `needs-spec` labels are a verified write sequence. After a write failure the gate re-fetches. If the desired comment and labels already hold, it returns `needs_spec`. If the issue is still on `ready`, it retries remaining writes. `gate-unavailable` is only for attempts with no remaining GitHub mutation. A write that cannot be completed or compensated is typed `mutation-failed`: it fences delivery and does not start planning.
+
 `pipeline triage <N> --stage ready` stays a deterministic label write. It is the re-admission *request*. The next pickup re-fetches and must pass the gate. Unchanged thin text reuses `needs_spec` and moves the issue back to `needs-spec` with no extra model call.
 
 ### Decision 7 — `needs_spec` is human-authority, not engine recovery

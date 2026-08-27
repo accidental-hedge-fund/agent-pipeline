@@ -44,7 +44,12 @@ const MARKER_RE =
 /** First evaluation plus this many restarts when live title/body drifts mid-call. */
 const ISSUE_READINESS_INPUT_DRIFT_ATTEMPTS = 3;
 
-export type IssueReadinessKind = "ready" | "needs_spec" | "gate-unavailable" | "stale-dispatch";
+export type IssueReadinessKind =
+  | "ready"
+  | "needs_spec"
+  | "gate-unavailable"
+  | "stale-dispatch"
+  | "mutation-failed";
 
 const ISSUE_READINESS_ATTEST_KINDS = new Set([
   "issue-readiness-admission",
@@ -74,7 +79,8 @@ export type IssueReadinessResult =
       proposed_body: string;
     }
   | { kind: "gate-unavailable"; reason: string }
-  | { kind: "stale-dispatch"; observedStage: Stage | null };
+  | { kind: "stale-dispatch"; observedStage: Stage | null }
+  | { kind: "mutation-failed"; reason: string };
 
 export interface IssueReadinessComment {
   id: number;
@@ -424,15 +430,219 @@ async function persistOwnedComment(
   await reconcileOwnedReadinessComments(deps, issueNumber, actor, body);
 }
 
+const NEEDS_SPEC_LABEL = `${LABEL_PREFIX}needs-spec`;
+const READY_LABEL = `${LABEL_PREFIX}ready`;
+const LABEL_TRANSITION_ATTEMPTS = 2;
+
 async function applyNeedsSpecLabels(deps: IssueReadinessDeps, issueNumber: number, labels: string[]): Promise<void> {
-  const needsSpec = `${LABEL_PREFIX}needs-spec`;
-  const ready = `${LABEL_PREFIX}ready`;
-  if (!labels.includes(needsSpec)) {
-    await deps.addLabel(issueNumber, needsSpec);
+  if (!labels.includes(NEEDS_SPEC_LABEL)) {
+    await deps.addLabel(issueNumber, NEEDS_SPEC_LABEL);
   }
-  if (labels.includes(ready)) {
-    await deps.removeLabel(issueNumber, ready);
+  if (labels.includes(READY_LABEL)) {
+    await deps.removeLabel(issueNumber, READY_LABEL);
   }
+}
+
+function needsSpecTransitionComplete(labels: string[]): boolean {
+  return pickStage(labels) === "needs-spec";
+}
+
+function laterStageThanReady(labels: string[]): boolean {
+  const stage = pickStage(labels);
+  return stage !== null && stage !== "ready" && stage !== "needs-spec";
+}
+
+async function fetchIssueLabels(
+  deps: IssueReadinessDeps,
+  issueNumber: number,
+): Promise<{ labels: string[] } | { error: string }> {
+  try {
+    const live = await deps.fetchIssue(issueNumber);
+    return { labels: live.labels };
+  } catch (err) {
+    return { error: (err as Error).message };
+  }
+}
+
+async function persistOwnedCommentVerified(
+  deps: IssueReadinessDeps,
+  issueNumber: number,
+  actor: string,
+  owned: IssueReadinessComment | undefined,
+  body: string,
+): Promise<{ status: "ok" } | { status: "absent"; reason: string } | { status: "unconfirmed"; reason: string }> {
+  try {
+    await persistOwnedComment(deps, issueNumber, actor, owned, body);
+    return { status: "ok" };
+  } catch (err) {
+    const reason = (err as Error).message;
+    try {
+      const listed = ownedReadinessComments(await deps.listComments(issueNumber), actor);
+      if (listed.some((item) => item.comment.body === body)) return { status: "ok" };
+      await reconcileOwnedReadinessComments(deps, issueNumber, actor, body);
+      const again = ownedReadinessComments(await deps.listComments(issueNumber), actor);
+      if (again.some((item) => item.comment.body === body)) return { status: "ok" };
+      return again.length === 0
+        ? { status: "absent", reason }
+        : { status: "unconfirmed", reason };
+    } catch (verifyErr) {
+      return { status: "unconfirmed", reason: `${reason}; re-fetch failed: ${(verifyErr as Error).message}` };
+    }
+  }
+}
+
+async function compensateOwnedComment(
+  deps: IssueReadinessDeps,
+  issueNumber: number,
+  actor: string,
+  previous: IssueReadinessComment | undefined,
+  desiredBody: string,
+): Promise<boolean> {
+  try {
+    if (previous) {
+      await deps.updateComment(previous.id, previous.body);
+      return true;
+    }
+    const owned = ownedReadinessComments(await deps.listComments(issueNumber), actor);
+    for (const item of owned) {
+      if (item.comment.body !== desiredBody) continue;
+      try {
+        await deps.deleteComment(item.comment.id);
+      } catch (err) {
+        if (!isHttp404Signal((err as Error).message)) throw err;
+      }
+    }
+    const remaining = ownedReadinessComments(await deps.listComments(issueNumber), actor);
+    return !remaining.some((item) => item.comment.body === desiredBody);
+  } catch {
+    return false;
+  }
+}
+
+type LabelTransitionResult =
+  | { status: "ok" }
+  | { status: "stale"; observedStage: Stage | null }
+  | { status: "unavailable"; reason: string }
+  | { status: "incomplete"; reason: string };
+
+async function applyNeedsSpecLabelsVerified(
+  deps: IssueReadinessDeps,
+  issueNumber: number,
+): Promise<LabelTransitionResult> {
+  let lastReason = "label transition failed";
+  let wroteLabels = false;
+  for (let attempt = 1; attempt <= LABEL_TRANSITION_ATTEMPTS; attempt++) {
+    const fetched = await fetchIssueLabels(deps, issueNumber);
+    if ("error" in fetched) {
+      if (!wroteLabels && attempt === 1) {
+        return { status: "unavailable", reason: `live re-fetch failed: ${fetched.error}` };
+      }
+      return { status: "incomplete", reason: `live re-fetch failed: ${fetched.error}` };
+    }
+    if (needsSpecTransitionComplete(fetched.labels)) return { status: "ok" };
+    if (laterStageThanReady(fetched.labels)) {
+      if (fetched.labels.includes(NEEDS_SPEC_LABEL)) {
+        try {
+          await deps.removeLabel(issueNumber, NEEDS_SPEC_LABEL);
+        } catch (err) {
+          return {
+            status: "incomplete",
+            reason: `live stage is ${pickStage(fetched.labels)}; failed to drop needs-spec overlay: ${(err as Error).message}`,
+          };
+        }
+      }
+      return { status: "stale", observedStage: pickStage(fetched.labels) };
+    }
+    try {
+      await applyNeedsSpecLabels(deps, issueNumber, fetched.labels);
+      wroteLabels = true;
+    } catch (err) {
+      wroteLabels = true;
+      lastReason = (err as Error).message;
+      continue;
+    }
+    const verify = await fetchIssueLabels(deps, issueNumber);
+    if ("error" in verify) {
+      lastReason = `live re-fetch failed: ${verify.error}`;
+      continue;
+    }
+    if (needsSpecTransitionComplete(verify.labels)) return { status: "ok" };
+    if (laterStageThanReady(verify.labels)) {
+      return { status: "stale", observedStage: pickStage(verify.labels) };
+    }
+    lastReason = "label transition did not stick";
+  }
+  return { status: "incomplete", reason: lastReason };
+}
+
+type NeedsSpecCommit =
+  | { kind: "committed" }
+  | Extract<IssueReadinessResult, { kind: "gate-unavailable" | "stale-dispatch" | "mutation-failed" }>;
+
+async function finalizeNeedsSpecLabels(
+  deps: IssueReadinessDeps,
+  issueNumber: number,
+  actor: string,
+  comment:
+    | { mutated: false }
+    | { mutated: true; previous: IssueReadinessComment | undefined; desiredBody: string },
+): Promise<NeedsSpecCommit> {
+  const labels = await applyNeedsSpecLabelsVerified(deps, issueNumber);
+  if (labels.status === "ok") return { kind: "committed" };
+  if (labels.status === "stale") {
+    if (comment.mutated) {
+      const undone = await compensateOwnedComment(
+        deps,
+        issueNumber,
+        actor,
+        comment.previous,
+        comment.desiredBody,
+      );
+      if (!undone) {
+        return {
+          kind: "mutation-failed",
+          reason: `owned comment persisted but live stage is ${labels.observedStage ?? "none"}`,
+        };
+      }
+    }
+    return { kind: "stale-dispatch", observedStage: labels.observedStage };
+  }
+  if (!comment.mutated && (labels.status === "unavailable" || labels.status === "incomplete")) {
+    const fetched = await fetchIssueLabels(deps, issueNumber);
+    if (
+      "labels" in fetched &&
+      pickStage(fetched.labels) === "ready" &&
+      !fetched.labels.includes(NEEDS_SPEC_LABEL)
+    ) {
+      return {
+        kind: "gate-unavailable",
+        reason: labels.status === "unavailable" ? labels.reason : `GitHub mutation failed: ${labels.reason}`,
+      };
+    }
+  }
+  const detail = labels.status === "unavailable" || labels.status === "incomplete" ? labels.reason : "label transition failed";
+  return { kind: "mutation-failed", reason: `GitHub mutation incomplete: ${detail}` };
+}
+
+async function commitNeedsSpecWrites(
+  deps: IssueReadinessDeps,
+  issueNumber: number,
+  actor: string,
+  owned: IssueReadinessComment | undefined,
+  body: string,
+): Promise<NeedsSpecCommit> {
+  const persist = await persistOwnedCommentVerified(deps, issueNumber, actor, owned, body);
+  if (persist.status === "absent") {
+    return { kind: "gate-unavailable", reason: `GitHub mutation failed: ${persist.reason}` };
+  }
+  if (persist.status === "unconfirmed") {
+    return { kind: "mutation-failed", reason: `owned readiness comment write did not verify: ${persist.reason}` };
+  }
+  return finalizeNeedsSpecLabels(deps, issueNumber, actor, {
+    mutated: true,
+    previous: owned,
+    desiredBody: body,
+  });
 }
 
 /**
@@ -549,11 +759,8 @@ async function evaluateIssueReadinessAttempt(input: {
       const live = await confirmLiveInput(deps, issueNumber, hash, treatment);
       if ("kind" in live) return live;
       if (live.status !== "ready") return liveReadyToResult(live);
-      try {
-        await applyNeedsSpecLabels(deps, issueNumber, live.labels);
-      } catch (err) {
-        return { kind: "gate-unavailable", reason: `GitHub mutation failed: ${(err as Error).message}` };
-      }
+      const committed = await finalizeNeedsSpecLabels(deps, issueNumber, actor, { mutated: false });
+      if (committed.kind !== "committed") return committed;
     }
     return {
       kind: "needs_spec",
@@ -615,13 +822,32 @@ async function evaluateIssueReadinessAttempt(input: {
     const live = await confirmLiveInput(deps, issueNumber, hash, treatment);
     if ("kind" in live) return live;
     if (live.status !== "ready") return liveReadyToResult(live);
-    try {
-      await persistOwnedComment(deps, issueNumber, actor, owned?.comment, commentBody);
-      if (verdict.verdict === "needs_spec") {
-        await applyNeedsSpecLabels(deps, issueNumber, live.labels);
+    if (verdict.verdict === "needs_spec") {
+      const committed = await commitNeedsSpecWrites(
+        deps,
+        issueNumber,
+        actor,
+        owned?.comment,
+        commentBody,
+      );
+      if (committed.kind !== "committed") return committed;
+    } else {
+      const persist = await persistOwnedCommentVerified(
+        deps,
+        issueNumber,
+        actor,
+        owned?.comment,
+        commentBody,
+      );
+      if (persist.status === "absent") {
+        return { kind: "gate-unavailable", reason: `GitHub mutation failed: ${persist.reason}` };
       }
-    } catch (err) {
-      return { kind: "gate-unavailable", reason: `GitHub mutation failed: ${(err as Error).message}` };
+      if (persist.status === "unconfirmed") {
+        return {
+          kind: "mutation-failed",
+          reason: `owned readiness comment write did not verify: ${persist.reason}`,
+        };
+      }
     }
   }
 
@@ -645,6 +871,10 @@ export function needsSpecSummary(result: Extract<IssueReadinessResult, { kind: "
 
 export function gateUnavailableSummary(result: Extract<IssueReadinessResult, { kind: "gate-unavailable" }>): string {
   return `issue-readiness: gate-unavailable: ${result.reason}`;
+}
+
+export function mutationFailedSummary(result: Extract<IssueReadinessResult, { kind: "mutation-failed" }>): string {
+  return `issue-readiness: mutation-failed: ${result.reason}`;
 }
 
 export function eventsTextHasGateUnavailable(eventsText: string | null | undefined): boolean {

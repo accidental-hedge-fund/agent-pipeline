@@ -99,7 +99,7 @@ The planning stage SHALL transition the issue `ready → planning` (set the `pip
 label) BEFORE invoking any planning *authoring* harness, so the label reflects active work for the entire
 harness duration rather than leaving the issue on `pipeline:ready` until authoring finishes.
 
-When `issue_readiness.enabled` is `true`, ready dispatch SHALL complete the shared issue-implementation-readiness evaluation (or reuse a bound verdict) while the issue is still on `pipeline:ready`. That admission call uses the Implementer planning treatment and is not the planning authoring harness. After a `ready` verdict, the `ready → planning` transition SHALL still occur before authoring, worktree bootstrap, or the planning delivery harness. After `needs_spec` or `gate-unavailable`, the issue SHALL NOT transition to `planning`. A `stale-dispatch` result SHALL be a non-advancing wait: the issue SHALL NOT transition to `planning` and SHALL NOT gain `pipeline:needs-spec`.
+When `issue_readiness.enabled` is `true`, ready dispatch SHALL complete the shared issue-implementation-readiness evaluation (or reuse a bound verdict) while the issue is still on `pipeline:ready`. That admission call uses the Implementer planning treatment and is not the planning authoring harness. After a `ready` verdict, the `ready → planning` transition SHALL still occur before authoring, worktree bootstrap, or the planning delivery harness. After `needs_spec`, `gate-unavailable`, or `mutation-failed`, the issue SHALL NOT transition to `planning`. A `stale-dispatch` result SHALL be a non-advancing wait: the issue SHALL NOT transition to `planning` and SHALL NOT gain `pipeline:needs-spec`.
 
 While the planning stage is executing — from the moment it begins until it transitions to
 `plan-review` (when plan review is enabled) or `implementing` (when it is not) — any block it
@@ -152,7 +152,7 @@ are unaffected.
 
 ### Requirement: Ready dispatch records planning substages separately
 
-When an issue starts at `pipeline:ready` and is admitted for delivery, the pipeline SHALL transition the issue to `pipeline:planning` before any long-running planning work, worktree bootstrap, or planning-authoring harness invocation begins. When `issue_readiness.enabled` is `true`, ready dispatch SHALL finish the shared gate (fresh fetch, evaluate or reuse) before that transition. A `needs_spec` or `gate-unavailable` outcome SHALL NOT record planning substages and SHALL NOT create a worktree.
+When an issue starts at `pipeline:ready` and is admitted for delivery, the pipeline SHALL transition the issue to `pipeline:planning` before any long-running planning work, worktree bootstrap, or planning-authoring harness invocation begins. When `issue_readiness.enabled` is `true`, ready dispatch SHALL finish the shared gate (fresh fetch, evaluate or reuse) before that transition. A `needs_spec`, `gate-unavailable`, or `mutation-failed` outcome SHALL NOT record planning substages and SHALL NOT create a worktree.
 
 The run artifacts SHALL record separate stage lifecycle entries for `planning`, `plan-review`, and `implementing` when those substages run inside the compound planning flow. The outer `ready` dispatch SHALL NOT record one wrapper lifecycle entry whose duration covers plan review and implementation.
 

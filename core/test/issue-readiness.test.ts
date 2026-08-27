@@ -116,7 +116,7 @@ function makeDeps(opts: {
   comments?: Array<{ id: number; body: string; author?: string }>;
   harness?: IssueReadinessDeps["invokeImplementer"];
   actor?: string | null;
-}): IssueReadinessDeps & {
+} = {}): IssueReadinessDeps & {
   comments: IssueReadinessComment[];
   calls: {
     fetch: number;
@@ -143,21 +143,24 @@ function makeDeps(opts: {
     author: c.author ?? "unknown",
   }));
   let nextCommentId = Math.max(0, ...comments.map((c) => c.id)) + 1;
+  let labels = [...(opts.labels ?? ["pipeline:ready"])];
   return {
     calls,
     comments,
     fetchIssue: async () => {
       calls.fetch++;
-      const labels = opts.labelSequence
-        ? opts.labelSequence[Math.min(calls.fetch - 1, opts.labelSequence.length - 1)]
-        : (opts.labels ?? ["pipeline:ready"]);
+      if (opts.labelSequence) {
+        labels = [
+          ...opts.labelSequence[Math.min(calls.fetch - 1, opts.labelSequence.length - 1)],
+        ];
+      }
       const body = opts.bodySequence
         ? opts.bodySequence[Math.min(calls.fetch - 1, opts.bodySequence.length - 1)]
         : (opts.body ?? THIN_BODY);
       return {
         title: opts.title ?? "Thin issue",
         body,
-        labels,
+        labels: [...labels],
       };
     },
     listComments: async () => comments.slice(),
@@ -178,9 +181,11 @@ function makeDeps(opts: {
     },
     addLabel: async (_n, label) => {
       calls.addLabel.push(label);
+      if (!labels.includes(label)) labels.push(label);
     },
     removeLabel: async (_n, label) => {
       calls.removeLabel.push(label);
+      labels = labels.filter((name) => name !== label);
     },
     invokeImplementer: async (input) => {
       calls.invoke++;
@@ -733,8 +738,9 @@ test("gate: concurrent first needs_spec keeps one owned comment", async () => {
     releaseCreates = resolve;
   });
   const calls = { create: 0, delete: [] as number[] };
+  let labels = ["pipeline:ready"];
   const deps: IssueReadinessDeps = {
-    fetchIssue: async () => ({ title: "Thin issue", body: THIN_BODY, labels: ["pipeline:ready"] }),
+    fetchIssue: async () => ({ title: "Thin issue", body: THIN_BODY, labels: [...labels] }),
     listComments: async () => {
       if (calls.create === 0) {
         firstLists++;
@@ -764,8 +770,12 @@ test("gate: concurrent first needs_spec keeps one owned comment", async () => {
       const idx = comments.findIndex((c) => c.id === id);
       if (idx >= 0) comments.splice(idx, 1);
     },
-    addLabel: async () => {},
-    removeLabel: async () => {},
+    addLabel: async (_n, label) => {
+      if (!labels.includes(label)) labels.push(label);
+    },
+    removeLabel: async (_n, label) => {
+      labels = labels.filter((name) => name !== label);
+    },
     invokeImplementer: async () => ({
       success: true,
       stdout: needsSpecJson(),
@@ -783,6 +793,152 @@ test("gate: concurrent first needs_spec keeps one owned comment", async () => {
   assert.equal(calls.create, 2);
   assert.equal(comments.length, 1, "exactly one owned comment remains");
   assert.ok(calls.delete.includes(11));
+});
+
+test("gate: comment persist then transient label add still completes needs_spec", async () => {
+  const deps = makeDeps();
+  let addAttempts = 0;
+  const origAdd = deps.addLabel;
+  deps.addLabel = async (n, label) => {
+    addAttempts++;
+    if (addAttempts === 1) throw new Error("transient add");
+    return origAdd(n, label);
+  };
+  const result = await evaluateIssueReadiness(makeCfg(), 42, { deps });
+  assert.equal(result.kind, "needs_spec");
+  assert.equal(deps.calls.createComment.length, 1);
+  assert.equal(addAttempts, 2);
+  assert.deepEqual(deps.calls.addLabel, ["pipeline:needs-spec"]);
+  assert.deepEqual(deps.calls.removeLabel, ["pipeline:ready"]);
+});
+
+test("gate: comment persist then persistent label add is mutation-failed not gate-unavailable", async () => {
+  const deps = makeDeps();
+  deps.addLabel = async () => {
+    throw new Error("add failed");
+  };
+  const result = await evaluateIssueReadiness(makeCfg(), 42, { deps });
+  assert.equal(result.kind, "mutation-failed");
+  if (result.kind === "mutation-failed") {
+    assert.match(result.reason, /incomplete|add failed/);
+  }
+  assert.equal(deps.calls.createComment.length, 1);
+  assert.equal(deps.calls.addLabel.length, 0);
+  assert.equal(deps.calls.removeLabel.length, 0);
+});
+
+test("gate: label add succeeds and first remove failure retries to needs_spec", async () => {
+  const deps = makeDeps();
+  let removeAttempts = 0;
+  const origRemove = deps.removeLabel;
+  deps.removeLabel = async (n, label) => {
+    removeAttempts++;
+    if (removeAttempts === 1) throw new Error("transient remove");
+    return origRemove(n, label);
+  };
+  const result = await evaluateIssueReadiness(makeCfg(), 42, { deps });
+  assert.equal(result.kind, "needs_spec");
+  assert.equal(deps.calls.createComment.length, 1);
+  assert.deepEqual(deps.calls.addLabel, ["pipeline:needs-spec"]);
+  assert.equal(removeAttempts, 2);
+  assert.deepEqual(deps.calls.removeLabel, ["pipeline:ready"]);
+});
+
+test("gate: label add succeeds and persistent remove failure is mutation-failed", async () => {
+  const deps = makeDeps();
+  deps.removeLabel = async () => {
+    throw new Error("remove failed");
+  };
+  const result = await evaluateIssueReadiness(makeCfg(), 42, { deps });
+  assert.equal(result.kind, "mutation-failed");
+  if (result.kind === "mutation-failed") {
+    assert.match(result.reason, /incomplete|remove failed/);
+  }
+  assert.equal(deps.calls.createComment.length, 1);
+  assert.deepEqual(deps.calls.addLabel, ["pipeline:needs-spec"]);
+  assert.equal(deps.calls.removeLabel.length, 0);
+});
+
+test("gate: reused needs_spec retries a transient label add", async () => {
+  const cfg = makeCfg();
+  const treatment = resolvedPlanningTreatment(cfg);
+  const hash = hashIssueReadinessInput("Thin issue", THIN_BODY, treatment);
+  const deps = makeDeps({
+    comments: [ownedComment({ id: 3, verdict: "needs_spec", hash, treatment })],
+  });
+  let addAttempts = 0;
+  const origAdd = deps.addLabel;
+  deps.addLabel = async (n, label) => {
+    addAttempts++;
+    if (addAttempts === 1) throw new Error("transient add");
+    return origAdd(n, label);
+  };
+  const result = await evaluateIssueReadiness(cfg, 42, { deps });
+  assert.equal(result.kind, "needs_spec");
+  assert.equal(result.kind === "needs_spec" && result.reused, true);
+  assert.equal(deps.calls.invoke, 0);
+  assert.equal(addAttempts, 2);
+});
+
+test("gate: comment persist then live later stage does not add needs-spec", async () => {
+  const deps = makeDeps({
+    labelSequence: [["pipeline:ready"], ["pipeline:ready"], ["pipeline:planning"]],
+  });
+  const result = await evaluateIssueReadiness(makeCfg(), 42, { deps });
+  assert.equal(result.kind, "stale-dispatch");
+  if (result.kind === "stale-dispatch") {
+    assert.equal(result.observedStage, "planning");
+  }
+  assert.equal(deps.calls.createComment.length, 1);
+  assert.equal(deps.calls.deleteComment.length, 1);
+  assert.equal(deps.calls.addLabel.length, 0);
+});
+
+test("gate: reused needs_spec with persistent remove failure is mutation-failed", async () => {
+  const cfg = makeCfg();
+  const treatment = resolvedPlanningTreatment(cfg);
+  const hash = hashIssueReadinessInput("Thin issue", THIN_BODY, treatment);
+  const deps = makeDeps({
+    comments: [ownedComment({ id: 3, verdict: "needs_spec", hash, treatment })],
+  });
+  deps.removeLabel = async () => {
+    throw new Error("remove failed");
+  };
+  const result = await evaluateIssueReadiness(cfg, 42, { deps });
+  assert.equal(result.kind, "mutation-failed");
+  assert.equal(deps.calls.invoke, 0);
+  assert.equal(deps.calls.createComment.length, 0);
+  assert.deepEqual(deps.calls.addLabel, ["pipeline:needs-spec"]);
+});
+
+test("dispatch ready: mutation-failed is typed error and fences planning", async () => {
+  const cfg = makeCfg({ issue_readiness: { enabled: true, timeout: 600 } });
+  let planning = 0;
+  const out: Outcome = await dispatch(
+    cfg,
+    8,
+    "ready",
+    {},
+    "run",
+    undefined,
+    undefined,
+    undefined,
+    {
+      transition: async () => {},
+      planningAdvance: async () => {
+        planning++;
+        return { advanced: true, from: "ready" as Stage, to: "planning" as Stage, summary: "no" };
+      },
+      tryAcquireLivePlanningMarker: () => true,
+      evaluateIssueReadiness: async () => ({ kind: "mutation-failed", reason: "comment persisted; label add failed" }),
+    },
+  );
+  assert.equal(out.advanced, false);
+  if (!out.advanced) {
+    assert.equal(out.status, "error");
+    assert.match(out.reason, /mutation-failed/);
+  }
+  assert.equal(planning, 0);
 });
 
 test("dispatch ready: gate-unavailable is typed error", async () => {
