@@ -2271,6 +2271,23 @@ export async function runSupervisorCycle(
         item_id: itemId,
         raw_outcome: String(rawOutcomeByItem.get(itemId) ?? "coexistence_wait"),
       }).catch(() => {});
+    } else if (outcome === "needs_spec") {
+      // #1238: admission rejection — item is at pipeline:needs-spec. Re-queue
+      // pending so later triage-to-ready can re-admit; never engine-defect.
+      ledger = await revertCapacityWaitItem(deps.store, { runId, token, itemId, engine });
+      evidenceOutcome = "needs_spec";
+      await appendEvent(deps.store, runId, token, "loop_item_admission_rejected", {
+        item_id: itemId,
+        reason: "needs_spec",
+      }).catch(() => {});
+    } else if (outcome === "gate_unavailable") {
+      // #1238: mechanical admission failure. Item stays pipeline:ready.
+      // Re-queue pending; selected dependents wait; independents continue.
+      ledger = await revertCapacityWaitItem(deps.store, { runId, token, itemId, engine });
+      evidenceOutcome = "gate_unavailable";
+      await appendEvent(deps.store, runId, token, "loop_item_gate_unavailable", {
+        item_id: itemId,
+      }).catch(() => {});
     } else if (outcome === "blocked_recoverable") {
       const projection = projectStageDiagnostic(response?.diagnostic);
       const diagnostic =

@@ -46,6 +46,7 @@ import {
 } from "./gh.ts";
 import { PipelineLock, isKillSwitchActive, isLivePlanningActive, tryAcquireLivePlanningMarker, runStateDir, withLock } from "./lock.ts";
 import { findWrapperPidForIssue, isCoexistenceFailureEvidence } from "./loop/live-advance.ts";
+import { eventsTextHasGateUnavailable } from "./issue-readiness.ts";
 import {
   buildTrustedOverrideComments,
   govPayloadFromDecision,
@@ -442,7 +443,7 @@ export interface CliOpts {
   next?: number;
   /** Sweep: override the target GitHub repository (owner/repo). */
   repo?: string;
-  /** Triage: target pre-pipeline stage label (ready or backlog). */
+  /** Triage: target pre-pipeline stage label (ready or backlog). needs-spec is an admission hold. */
   stage?: string;
   /** papercut: run-store run id to record/scope a report to. */
   run?: string;
@@ -870,7 +871,7 @@ export function buildCmd(): Command {
     .option("--apply", "roadmap/sweep/backfill/improve/config sync/decompose: execute write-backs; default is dry-run/preview")
     .option("--next <n>", "roadmap: emit top-N dependency-safe issues from existing plan.json without re-running the engine", Number)
     .option("--repo <owner/repo>", "sweep/backfill: override the target GitHub repository (default: current repo from gh config)")
-    .option("--stage <stage>", "triage: target pre-pipeline stage label (ready or backlog)")
+    .option("--stage <stage>", "triage: target pre-pipeline stage label (ready or backlog). needs-spec is an admission hold: apply the spec, then triage --stage ready")
     // loop (#451): pipeline:loop deterministic preflight + delegation to goal-loop.
     .option("--range <spec>", "loop: issue-number range selector, e.g. 400-420")
     .option("--roadmap-slice <slice>", "loop: named roadmap slice selector")
@@ -1374,6 +1375,8 @@ export function classifyDispatchOutcome(
 ): LoopExecutionResponse["outcome"] {
   const readyLabel = `${LABEL_PREFIX}ready-to-deploy`;
   if (detail.labels.includes(readyLabel)) return "ready_to_deploy";
+  if (detail.labels.includes(`${LABEL_PREFIX}needs-spec`)) return "needs_spec";
+  if (eventsTextHasGateUnavailable(eventsText)) return "gate_unavailable";
   if (detail.labels.includes(BLOCKED_LABEL)) {
     const projection = projectStageDiagnostic(diagnostic);
     if (projection.disposition === "capacity") return "capacity_wait";

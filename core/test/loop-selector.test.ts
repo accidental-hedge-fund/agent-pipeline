@@ -68,6 +68,23 @@ test("classifyDispatchOutcome: ready-to-deploy, closed, and generic-failure mapp
   assert.equal(classifyDispatchOutcome({ labels: ["pipeline:ready-to-deploy", "blocked"], state: "open" }), "ready_to_deploy");
 });
 
+test("classifyDispatchOutcome: pipeline:needs-spec is a structured admission rejection", () => {
+  assert.equal(classifyDispatchOutcome({ labels: ["pipeline:needs-spec"], state: "open" }), "needs_spec");
+});
+
+test("classifyDispatchOutcome: issue-readiness gate-unavailable events map to gate_unavailable", () => {
+  const events = JSON.stringify({
+    type: "gate_result",
+    gate: "issue_readiness",
+    result: "fail",
+    reason: "gate-unavailable: timeout",
+  });
+  assert.equal(
+    classifyDispatchOutcome({ labels: ["pipeline:ready"], state: "open" }, null, events),
+    "gate_unavailable",
+  );
+});
+
 function fakeCfg(): PipelineConfig {
   return { repo: "acme/widget", repo_dir: "/tmp/does-not-exist" } as unknown as PipelineConfig;
 }

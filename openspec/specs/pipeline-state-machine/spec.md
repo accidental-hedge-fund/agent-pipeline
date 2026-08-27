@@ -8,6 +8,8 @@ The label-driven state machine at the heart of the pipeline: the canonical order
 ### Requirement: Canonical ordered stage sequence
 The pipeline SHALL define its stages as an ordered constant `STAGES` in `core/scripts/types.ts`. Each stage is represented on an issue by the label `pipeline:<stage>` (prefix `LABEL_PREFIX = "pipeline:"`), and an issue carries at most one `pipeline:<stage>` label at a time.
 
+`needs-spec` SHALL sit between `backlog` and `ready`. It is an admission hold, not a delivery stage: the orchestrator SHALL NOT start planning or implementation from it. Dispatch SHALL wait the way `backlog` waits. It SHALL NOT be a member of `TERMINAL_STAGES`. Gate behavior is specified by the `issue-implementation-readiness-gate` capability.
+
 `pre-code-attestation` (#575) SHALL sit between `plan-review` and `implementing`. It is always
 present in the graph, but it is inert unless `pre_code_attestation.enabled` is true and a risk
 trigger matches: when disabled or untriggered it SHALL advance toward `implementing` with a
@@ -27,7 +29,8 @@ surfaces are specified by the `needs-human-status-surface` and override-related 
 
 #### Scenario: STAGES order
 - **WHEN** the `STAGES` constant is inspected
-- **THEN** it SHALL list, in order: `backlog`, `ready`, `planning`, `plan-review`, `pre-code-attestation`, `implementing`, `design-gate`, `review-1`, `fix-1`, `review-2`, `fix-2`, `pre-merge`, `visual-gate`, `eval-gate`, `shipcheck-gate`, `ready-to-deploy`, `needs-human`
+- **THEN** it SHALL list, in order: `backlog`, `needs-spec`, `ready`, `planning`, `plan-review`, `pre-code-attestation`, `implementing`, `design-gate`, `review-1`, `fix-1`, `review-2`, `fix-2`, `pre-merge`, `visual-gate`, `eval-gate`, `shipcheck-gate`, `ready-to-deploy`, `needs-human`
+- **AND** `needs-spec` SHALL appear at an index greater than `backlog` and less than `ready`
 - **AND** `pre-code-attestation` SHALL appear at an index greater than `plan-review` and less than `implementing`
 - **AND** `design-gate` SHALL appear at an index greater than `implementing` and less than `review-1`
 - **AND** `visual-gate` SHALL appear at an index greater than `pre-merge` and less than `eval-gate`
@@ -35,6 +38,13 @@ surfaces are specified by the `needs-human-status-surface` and override-related 
 - **AND** `shipcheck-gate` SHALL appear at an index greater than `eval-gate` and less than `ready-to-deploy`
 - **AND** `needs-human` SHALL appear after `ready-to-deploy` in the constant order
 - **AND** `needs-human` SHALL be a member of `TERMINAL_STAGES`
+- **AND** `needs-spec` SHALL NOT be a member of `TERMINAL_STAGES`
+
+#### Scenario: dispatch routes needs-spec as a wait
+- **WHEN** the current stage label is `pipeline:needs-spec`
+- **THEN** the orchestrator SHALL NOT invoke planning or implementation
+- **AND** SHALL NOT create a worktree
+- **AND** the outcome SHALL be a non-advancing wait that tells the operator to apply a spec and re-admit with `pipeline triage <N> --stage ready`
 
 #### Scenario: dispatch routes pre-code-attestation
 - **WHEN** the current stage label is `pipeline:pre-code-attestation`
@@ -95,7 +105,7 @@ When an issue reaches `ready-to-deploy`, the run finalizes the happy path (taggi
 - **AND** it SHALL NOT contain any other stage name
 
 ### Requirement: Opt-in via the pipeline label gate
-The pipeline SHALL act only on issues that already carry a `pipeline:<stage>` label. An issue with no such label SHALL be refused — the run exits without dispatching any stage and explains how to opt in (add `pipeline:ready`). `backlog` is a triage marker only; the orchestrator starts work at `ready`.
+The pipeline SHALL act only on issues that already carry a `pipeline:<stage>` label. An issue with no such label SHALL be refused — the run exits without dispatching any stage and explains how to opt in (add `pipeline:ready`). `backlog` and `needs-spec` are triage/admission markers only; the orchestrator starts delivery work at `ready`. When `issue_readiness.enabled` is `true`, a `ready` issue still MUST pass the shared issue-implementation-readiness gate before that delivery work starts.
 
 #### Scenario: issue without a pipeline label
 - **WHEN** the orchestrator resolves an issue that carries no `pipeline:*` label
@@ -105,6 +115,11 @@ The pipeline SHALL act only on issues that already carry a `pipeline:<stage>` la
 #### Scenario: current stage resolved from the label
 - **WHEN** an issue carries `pipeline:review-1`
 - **THEN** the orchestrator SHALL begin at stage `review-1`
+
+#### Scenario: needs-spec does not start delivery
+- **WHEN** an issue carries only `pipeline:needs-spec`
+- **THEN** the orchestrator SHALL NOT start planning or implementation
+- **AND** SHALL NOT create a worktree
 
 ### Requirement: Bounded advance loop
 The orchestrator SHALL advance at most `MAX_ITERATIONS` (= 12) transitions per invocation. Each iteration dispatches the current stage and either advances (incrementing a transition count) or stops on a non-advancing outcome (`blocked`, `waiting`, `no-op`, `finalized`, or `error`). Under `--once`, it SHALL stop after a single transition.

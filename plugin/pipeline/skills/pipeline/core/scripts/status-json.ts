@@ -89,7 +89,7 @@ export function deriveStatus(
   if (stage === null) return "blocked";
   if (blocked) return "blocked";
   if (stage === "needs-human") return "needs-human";
-  if (stage === "backlog") return "waiting";
+  if (stage === "backlog" || stage === "needs-spec") return "waiting";
   return "ok";
 }
 
@@ -99,6 +99,8 @@ export function deriveNextAction(stage: string | null, blocked: boolean): string
   }
   const actions: Record<string, string> = {
     backlog: "Promote to `pipeline:ready` manually.",
+    "needs-spec":
+      "Admission hold — apply a complete spec, then re-admit with `pipeline triage <N> --stage ready`.",
     ready: "Pipeline will run planning and implementation.",
     planning: "Planning is in progress.",
     "plan-review": "Plan review is in progress.",

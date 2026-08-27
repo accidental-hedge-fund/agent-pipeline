@@ -78,6 +78,8 @@ test("command copy names operator authority and keeps dry-run default", () => {
   assert.doesNotMatch(COMMAND_DOCS.merge.summary, /human-only/i);
   assert.match(COMMAND_DOCS["merge-queue"].summary, /operator-authorized/i);
   assert.match(COMMAND_DOCS["merge-queue"].summary, /dry-run by default/i);
+  assert.match(COMMAND_DOCS.triage.summary, /needs-spec/);
+  assert.match(COMMAND_DOCS.triage.summary, /triage --stage ready/);
 
   const readyCopy = read("core/scripts/stages/deploy_ready.ts");
   assert.match(readyCopy, /advance path stops here/i);

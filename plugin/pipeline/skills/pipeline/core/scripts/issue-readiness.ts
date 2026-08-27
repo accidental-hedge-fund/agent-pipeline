@@ -1,0 +1,459 @@
+// Shared issue-implementation-readiness admission gate (#1238).
+//
+// One function in front of every GitHub issue pickup path. Disabled by default.
+// When enabled, re-fetches title/body/labels, reuses a hash-and-treatment-bound
+// owned comment when it matches, otherwise invokes the resolved Implementer
+// with the planning treatment. Writes only that comment and the
+// ready → needs-spec label transition.
+
+import { createHash } from "node:crypto";
+import {
+  addLabel as ghAddLabel,
+  getIssueDetail,
+  listIssueCommentsWithIds,
+  postComment,
+  removeLabel as ghRemoveLabel,
+  updateIssueComment,
+} from "./gh.ts";
+import { invoke, type HarnessResult } from "./harness.ts";
+import { buildIssueReadinessPrompt } from "./prompts/index.ts";
+import { attestPipelineComment } from "./stages/review-parsing.ts";
+import { LABEL_PREFIX, type IssueReadinessVerdict, type PipelineConfig } from "./types.ts";
+
+export const ISSUE_READINESS_MARKER_PREFIX = "<!-- pipeline-issue-readiness";
+
+export const ISSUE_READINESS_CANONICAL_HEADINGS = [
+  "Summary",
+  "User story",
+  "Acceptance criteria",
+  "Out of scope",
+  "Open questions",
+] as const;
+
+const MARKER_RE =
+  /<!-- pipeline-issue-readiness verdict=(ready|needs_spec) hash=([0-9a-f]{64}) implementer=(\S+) model=(\S+) effort=(\S+) -->/;
+
+export type IssueReadinessKind = "ready" | "needs_spec" | "gate-unavailable";
+
+export interface IssueReadinessTreatment {
+  implementer: string;
+  model: string;
+  effort: string;
+}
+
+export interface IssueReadinessRecord {
+  verdict: "ready" | "needs_spec";
+  hash: string;
+  treatment: IssueReadinessTreatment;
+}
+
+export type IssueReadinessResult =
+  | { kind: "ready"; reused: boolean; hash: string; treatment: IssueReadinessTreatment }
+  | {
+      kind: "needs_spec";
+      reused: boolean;
+      hash: string;
+      treatment: IssueReadinessTreatment;
+      deficiencies: string[];
+      proposed_body: string;
+    }
+  | { kind: "gate-unavailable"; reason: string };
+
+export interface IssueReadinessDeps {
+  fetchIssue(issueNumber: number): Promise<{
+    title: string;
+    body: string;
+    labels: string[];
+  }>;
+  listComments(issueNumber: number): Promise<{ id: number; body: string }[]>;
+  createComment(issueNumber: number, body: string): Promise<void>;
+  updateComment(commentId: number, body: string): Promise<void>;
+  addLabel(issueNumber: number, label: string): Promise<void>;
+  removeLabel(issueNumber: number, label: string): Promise<void>;
+  invokeImplementer(input: {
+    harness: string;
+    prompt: string;
+    model: string;
+    effort: string | undefined;
+    timeoutSec: number;
+  }): Promise<Pick<HarnessResult, "success" | "stdout" | "stderr" | "timed_out">>;
+  now(): Date;
+}
+
+export interface EvaluateIssueReadinessOpts {
+  dryRun?: boolean;
+  deps?: IssueReadinessDeps;
+}
+
+export function resolvedPlanningTreatment(cfg: PipelineConfig): IssueReadinessTreatment {
+  return {
+    implementer: cfg.harnesses.implementer,
+    model: cfg.models.planning,
+    effort: cfg.effort.planning && cfg.effort.planning.length > 0 ? cfg.effort.planning : "-",
+  };
+}
+
+export function hashIssueReadinessInput(
+  title: string,
+  body: string,
+  treatment: IssueReadinessTreatment,
+): string {
+  const payload = JSON.stringify({
+    title,
+    body,
+    implementer: treatment.implementer,
+    model: treatment.model,
+    effort: treatment.effort,
+  });
+  return createHash("sha256").update(payload).digest("hex");
+}
+
+export function formatIssueReadinessMarker(
+  verdict: "ready" | "needs_spec",
+  hash: string,
+  treatment: IssueReadinessTreatment,
+): string {
+  return `${ISSUE_READINESS_MARKER_PREFIX} verdict=${verdict} hash=${hash} implementer=${treatment.implementer} model=${treatment.model} effort=${treatment.effort} -->`;
+}
+
+export function parseIssueReadinessMarker(body: string): IssueReadinessRecord | null {
+  const m = body.match(MARKER_RE);
+  if (!m) return null;
+  return {
+    verdict: m[1] as "ready" | "needs_spec",
+    hash: m[2],
+    treatment: { implementer: m[3], model: m[4], effort: m[5] },
+  };
+}
+
+export function recordsMatch(
+  record: IssueReadinessRecord,
+  hash: string,
+  treatment: IssueReadinessTreatment,
+): boolean {
+  return (
+    record.hash === hash &&
+    record.treatment.implementer === treatment.implementer &&
+    record.treatment.model === treatment.model &&
+    record.treatment.effort === treatment.effort
+  );
+}
+
+export function realIssueReadinessDeps(cfg: PipelineConfig): IssueReadinessDeps {
+  return {
+    fetchIssue: async (issueNumber) => {
+      const detail = await getIssueDetail(cfg, issueNumber);
+      return { title: detail.title, body: detail.body, labels: detail.labels };
+    },
+    listComments: async (issueNumber) => listIssueCommentsWithIds(cfg, issueNumber),
+    createComment: async (issueNumber, body) => {
+      await postComment(cfg, issueNumber, body);
+    },
+    updateComment: async (commentId, body) => {
+      await updateIssueComment(cfg, commentId, body);
+    },
+    addLabel: async (issueNumber, label) => {
+      await ghAddLabel(cfg, issueNumber, label);
+    },
+    removeLabel: async (issueNumber, label) => {
+      await ghRemoveLabel(cfg, issueNumber, label);
+    },
+    invokeImplementer: async (input) => {
+      const result = await invoke(input.harness, cfg.repo_dir, input.prompt, {
+        stream: false,
+        model: input.model,
+        reasoningEffort: input.effort === "-" ? undefined : input.effort,
+        lean: true,
+        timeoutSec: input.timeoutSec,
+        role: "implementer",
+      });
+      return {
+        success: result.success,
+        stdout: result.stdout,
+        stderr: result.stderr,
+        timed_out: result.timed_out,
+      };
+    },
+    now: () => new Date(),
+  };
+}
+
+function extractJsonObject(text: string): unknown {
+  const trimmed = text.trim();
+  const fence = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = fence ? fence[1].trim() : trimmed;
+  const start = candidate.indexOf("{");
+  const end = candidate.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) {
+    throw new Error("no JSON object in harness output");
+  }
+  return JSON.parse(candidate.slice(start, end + 1));
+}
+
+export function parseIssueReadinessVerdict(output: string): IssueReadinessVerdict {
+  let parsed: unknown;
+  try {
+    parsed = extractJsonObject(output);
+  } catch (err) {
+    throw new Error(`issue-readiness schema: ${(err as Error).message}`);
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("issue-readiness schema: response is not a JSON object");
+  }
+  const obj = parsed as Record<string, unknown>;
+  if (obj.verdict !== "ready" && obj.verdict !== "needs_spec") {
+    throw new Error("issue-readiness schema: verdict must be ready or needs_spec");
+  }
+  if (!Array.isArray(obj.deficiencies) || !obj.deficiencies.every((d) => typeof d === "string")) {
+    throw new Error("issue-readiness schema: deficiencies must be a string array");
+  }
+  if (typeof obj.proposed_body !== "string") {
+    throw new Error("issue-readiness schema: proposed_body must be a string");
+  }
+  if (obj.verdict === "needs_spec") {
+    if (obj.deficiencies.length === 0) {
+      throw new Error("issue-readiness schema: needs_spec requires deficiencies");
+    }
+    if (obj.proposed_body.trim().length === 0) {
+      throw new Error("issue-readiness schema: needs_spec requires proposed_body");
+    }
+  }
+  return {
+    verdict: obj.verdict,
+    deficiencies: obj.deficiencies as string[],
+    proposed_body: obj.proposed_body,
+  };
+}
+
+export function proposedBodyHasCanonicalHeadings(body: string): boolean {
+  return ISSUE_READINESS_CANONICAL_HEADINGS.every((heading) =>
+    new RegExp(`^##\\s+${heading}\\s*$`, "im").test(body),
+  );
+}
+
+function renderOwnedComment(input: {
+  verdict: "ready" | "needs_spec";
+  hash: string;
+  treatment: IssueReadinessTreatment;
+  deficiencies: string[];
+  proposed_body: string;
+  evaluatedAt: string;
+}): string {
+  const marker = formatIssueReadinessMarker(input.verdict, input.hash, input.treatment);
+  if (input.verdict === "ready") {
+    return [
+      "## Pipeline: issue-readiness admission",
+      "",
+      "Verdict: **ready**.",
+      "",
+      `Evaluated at ${input.evaluatedAt}. Bound to title/body hash \`${input.hash.slice(0, 12)}\` and planning treatment \`${input.treatment.implementer}\` / \`${input.treatment.model}\` / \`${input.treatment.effort}\`.`,
+      "",
+      marker,
+    ].join("\n");
+  }
+  const deficiencies = input.deficiencies.map((d) => `- ${d}`).join("\n");
+  return [
+    "## Pipeline: issue-readiness — needs spec",
+    "",
+    "This issue is not executable as written. Apply the proposed body (or an equivalent complete spec), then re-admit with `pipeline triage <N> --stage ready`.",
+    "",
+    "### Deficiencies",
+    "",
+    deficiencies,
+    "",
+    "### Proposed revised body",
+    "",
+    input.proposed_body.trim(),
+    "",
+    `Evaluated at ${input.evaluatedAt}. Bound to title/body hash \`${input.hash.slice(0, 12)}\` and planning treatment \`${input.treatment.implementer}\` / \`${input.treatment.model}\` / \`${input.treatment.effort}\`.`,
+    "",
+    marker,
+  ].join("\n");
+}
+
+/** Pure + exported so the PIPELINE_COMMENT_KINDS drift guard exercises the real renderer. */
+export function buildIssueReadinessComment(input: {
+  verdict: "ready" | "needs_spec";
+  hash: string;
+  treatment: IssueReadinessTreatment;
+  deficiencies: string[];
+  proposed_body: string;
+  evaluatedAt: string;
+}): string {
+  const kind = input.verdict === "ready" ? "issue-readiness-admission" : "issue-readiness-needs-spec";
+  return attestPipelineComment(kind, renderOwnedComment(input));
+}
+
+async function persistOwnedComment(
+  deps: IssueReadinessDeps,
+  issueNumber: number,
+  comments: { id: number; body: string }[],
+  body: string,
+): Promise<"created" | "updated"> {
+  const existing = comments.find((c) => parseIssueReadinessMarker(c.body) !== null);
+  if (existing) {
+    await deps.updateComment(existing.id, body);
+    return "updated";
+  }
+  await deps.createComment(issueNumber, body);
+  return "created";
+}
+
+async function applyNeedsSpecLabels(deps: IssueReadinessDeps, issueNumber: number, labels: string[]): Promise<void> {
+  const needsSpec = `${LABEL_PREFIX}needs-spec`;
+  const ready = `${LABEL_PREFIX}ready`;
+  if (!labels.includes(needsSpec)) {
+    await deps.addLabel(issueNumber, needsSpec);
+  }
+  if (labels.includes(ready)) {
+    await deps.removeLabel(issueNumber, ready);
+  }
+}
+
+/**
+ * Shared admission gate. Callers skip this entirely when
+ * `cfg.issue_readiness.enabled` is false.
+ */
+export async function evaluateIssueReadiness(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  opts: EvaluateIssueReadinessOpts = {},
+): Promise<IssueReadinessResult> {
+  const deps = opts.deps ?? realIssueReadinessDeps(cfg);
+  const dryRun = !!opts.dryRun;
+  const treatment = resolvedPlanningTreatment(cfg);
+
+  let issue: { title: string; body: string; labels: string[] };
+  try {
+    issue = await deps.fetchIssue(issueNumber);
+  } catch (err) {
+    return { kind: "gate-unavailable", reason: `fresh fetch failed: ${(err as Error).message}` };
+  }
+
+  const hash = hashIssueReadinessInput(issue.title, issue.body, treatment);
+
+  let comments: { id: number; body: string }[] = [];
+  try {
+    comments = await deps.listComments(issueNumber);
+  } catch (err) {
+    return { kind: "gate-unavailable", reason: `comment list failed: ${(err as Error).message}` };
+  }
+
+  const owned = comments
+    .map((c) => ({ comment: c, record: parseIssueReadinessMarker(c.body) }))
+    .find((entry) => entry.record !== null);
+
+  if (owned?.record && recordsMatch(owned.record, hash, treatment)) {
+    if (owned.record.verdict === "ready") {
+      return { kind: "ready", reused: true, hash, treatment };
+    }
+    if (!dryRun) {
+      await applyNeedsSpecLabels(deps, issueNumber, issue.labels);
+    }
+    return {
+      kind: "needs_spec",
+      reused: true,
+      hash,
+      treatment,
+      deficiencies: [],
+      proposed_body: "",
+    };
+  }
+
+  const prompt = buildIssueReadinessPrompt({
+    title: issue.title,
+    body: issue.body,
+    labels: issue.labels,
+  });
+
+  let harness: Pick<HarnessResult, "success" | "stdout" | "stderr" | "timed_out">;
+  try {
+    harness = await deps.invokeImplementer({
+      harness: treatment.implementer,
+      prompt,
+      model: treatment.model,
+      effort: treatment.effort,
+      timeoutSec: cfg.issue_readiness.timeout,
+    });
+  } catch (err) {
+    return { kind: "gate-unavailable", reason: `harness invoke failed: ${(err as Error).message}` };
+  }
+
+  if (harness.timed_out) {
+    return { kind: "gate-unavailable", reason: "admission harness timed out" };
+  }
+  if (!harness.success) {
+    return {
+      kind: "gate-unavailable",
+      reason: `admission harness failed: ${(harness.stderr || harness.stdout || "no output").slice(0, 400)}`,
+    };
+  }
+
+  let verdict: IssueReadinessVerdict;
+  try {
+    verdict = parseIssueReadinessVerdict(harness.stdout);
+  } catch (err) {
+    return { kind: "gate-unavailable", reason: (err as Error).message };
+  }
+
+  const evaluatedAt = deps.now().toISOString().replace(/\.\d+Z$/, "Z");
+  const commentBody = buildIssueReadinessComment({
+    verdict: verdict.verdict,
+    hash,
+    treatment,
+    deficiencies: verdict.deficiencies,
+    proposed_body: verdict.proposed_body,
+    evaluatedAt,
+  });
+
+  if (verdict.verdict === "ready") {
+    if (!dryRun) {
+      await persistOwnedComment(deps, issueNumber, comments, commentBody);
+    }
+    return { kind: "ready", reused: false, hash, treatment };
+  }
+
+  if (!dryRun) {
+    await persistOwnedComment(deps, issueNumber, comments, commentBody);
+    await applyNeedsSpecLabels(deps, issueNumber, issue.labels);
+  }
+  return {
+    kind: "needs_spec",
+    reused: false,
+    hash,
+    treatment,
+    deficiencies: verdict.deficiencies,
+    proposed_body: verdict.proposed_body,
+  };
+}
+
+export function needsSpecSummary(result: Extract<IssueReadinessResult, { kind: "needs_spec" }>): string {
+  const listed = result.deficiencies.length > 0 ? result.deficiencies.join("; ") : "spec is not executable";
+  return `issue-readiness: needs_spec: ${listed}`;
+}
+
+export function gateUnavailableSummary(result: Extract<IssueReadinessResult, { kind: "gate-unavailable" }>): string {
+  return `issue-readiness: gate-unavailable: ${result.reason}`;
+}
+
+export function eventsTextHasGateUnavailable(eventsText: string | null | undefined): boolean {
+  if (!eventsText) return false;
+  for (const line of eventsText.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const event = JSON.parse(trimmed) as Record<string, unknown>;
+      if (
+        event.type === "gate_result" &&
+        event.gate === "issue_readiness" &&
+        typeof event.reason === "string" &&
+        event.reason.startsWith("gate-unavailable")
+      ) {
+        return true;
+      }
+    } catch {
+      /* skip corrupt lines */
+    }
+  }
+  return false;
+}

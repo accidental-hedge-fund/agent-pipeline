@@ -323,6 +323,24 @@ const PartialConfigSchema = z.object({
     .strict()
     .optional()
     .describe("Pre-planning activity brief from the last 30 days of git history."),
+  issue_readiness: z
+    .object({
+      enabled: z
+        .boolean()
+        .optional()
+        .describe(
+          "When true, run the shared issue-implementation-readiness gate before pickup of a pipeline:ready issue. Default false: omitted or disabled leaves every pickup path unchanged.",
+        ),
+      timeout: z
+        .number()
+        .int()
+        .min(1)
+        .optional()
+        .describe("Seconds allowed for the Implementer planning-treatment admission call (default 600)."),
+    })
+    .strict()
+    .optional()
+    .describe("Opt-in issue-implementation-readiness admission gate (#1238). Default off."),
   steps: z
     .object({
       plan_review: z.boolean().optional().describe("Cross-harness review of the plan before coding begins."),
@@ -2001,6 +2019,10 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
       enabled: fileConfig.last30days?.enabled ?? DEFAULT_CONFIG.last30days.enabled,
       timeout: fileConfig.last30days?.timeout ?? DEFAULT_CONFIG.last30days.timeout,
     },
+    issue_readiness: {
+      enabled: fileConfig.issue_readiness?.enabled ?? DEFAULT_CONFIG.issue_readiness.enabled,
+      timeout: fileConfig.issue_readiness?.timeout ?? DEFAULT_CONFIG.issue_readiness.timeout,
+    },
     steps: {
       plan_review: fileConfig.steps?.plan_review ?? DEFAULT_CONFIG.steps.plan_review,
       standard_review: fileConfig.steps?.standard_review ?? DEFAULT_CONFIG.steps.standard_review,
@@ -2341,6 +2363,12 @@ export function applyTrustedVerificationPolicy(
 
   cfg.pre_code_attestation = resolvePreCodeAttestationConfig(fileConfig.pre_code_attestation);
   applied.push("pre_code_attestation");
+
+  cfg.issue_readiness = {
+    enabled: fileConfig.issue_readiness?.enabled ?? DEFAULT_CONFIG.issue_readiness.enabled,
+    timeout: fileConfig.issue_readiness?.timeout ?? DEFAULT_CONFIG.issue_readiness.timeout,
+  };
+  applied.push("issue_readiness");
 
   cfg.override_governance = resolveOverrideGovernanceConfig(fileConfig.override_governance);
   applied.push("override_governance");
@@ -2882,6 +2910,7 @@ export const RIGOR_GATING_PATHS: readonly string[] = [
   "shipcheck_gate.mode",
   "shipcheck_gate.max_rounds",
   "shipcheck_gate.block_on_partial",
+  "issue_readiness.enabled",
 ];
 
 const RIGOR_GATING_SET = new Set(RIGOR_GATING_PATHS);
@@ -3443,6 +3472,7 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
   const d = DEFAULT_CONFIG;
   const openspec = { ...d.openspec, ...config.openspec };
   const last30days = { ...d.last30days, ...config.last30days };
+  const issueReadiness = { ...d.issue_readiness, ...config.issue_readiness };
   const steps = { ...d.steps, ...config.steps };
   const testGate = { ...d.test_gate, ...config.test_gate };
   const evalGate = { ...d.eval_gate, ...config.eval_gate };
@@ -3548,6 +3578,18 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
     "last30days:",
     `  enabled: ${yamlScalar(last30days.enabled)} # ${sd("last30days.enabled", "opt-in pre-planning activity brief")}`,
     `  timeout: ${yamlScalar(last30days.timeout)} # ${sd("last30days.timeout", "seconds")}`,
+    "",
+    config.issue_readiness !== undefined
+      ? [
+        "issue_readiness: # opt-in issue-implementation-readiness admission gate (#1238)",
+        `  enabled: ${yamlScalar(issueReadiness.enabled)} # ${sd("issue_readiness.enabled", "when true, evaluate a freshly fetched pipeline:ready issue before worktree or delivery harness")}`,
+        `  timeout: ${yamlScalar(issueReadiness.timeout)} # ${sd("issue_readiness.timeout", "seconds for the Implementer planning-treatment admission call")}`,
+      ].join("\n")
+      : [
+        "# issue_readiness: # opt-in issue-implementation-readiness admission gate (#1238). Disabled by default.",
+        `#   enabled: ${yamlScalar(d.issue_readiness.enabled)} # ${sd("issue_readiness.enabled", "when true, evaluate a freshly fetched pipeline:ready issue before worktree or delivery harness")}`,
+        `#   timeout: ${yamlScalar(d.issue_readiness.timeout)} # ${sd("issue_readiness.timeout", "seconds for the Implementer planning-treatment admission call")}`,
+      ].join("\n"),
     "",
     "steps: # turn optional steps off for speed/preference (default: all on)",
     `  plan_review: ${yamlScalar(steps.plan_review)} # ${sd("steps.plan_review", "cross-harness review of the plan before coding")}`,
@@ -3899,7 +3941,7 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
         `#   max_rounds: ${yamlScalar(d.auto_loop.max_rounds)} # ${sd("auto_loop.max_rounds", "maximum automatic continuations per run before parking at needs-human")}`,
         `#   max_wallclock_minutes: ${yamlScalar(d.auto_loop.max_wallclock_minutes)} # ${sd("auto_loop.max_wallclock_minutes", "wall-clock budget in minutes; independent of max_rounds")}`,
         "#   stages: [eval-gate, shipcheck-gate] # allowlisted stages eligible for automatic continuation",
-        "#   #   Known stages: backlog, ready, planning, plan-review, implementing,",
+        "#   #   Known stages: backlog, needs-spec, ready, planning, plan-review, implementing,",
         "#   #                 review-1, fix-1, review-2, fix-2, pre-merge, eval-gate,",
         "#   #                 shipcheck-gate, ready-to-deploy, needs-human",
       ].join("\n"),
@@ -4233,6 +4275,7 @@ function normalizeForSync(config: PartialConfig): unknown {
     models: { ...d.models, ...config.models },
     openspec: { ...d.openspec, ...config.openspec },
     last30days: { ...d.last30days, ...config.last30days },
+    issue_readiness: { ...d.issue_readiness, ...config.issue_readiness },
     steps: { ...d.steps, ...config.steps },
     design_gate: {
       ...d.design_gate,

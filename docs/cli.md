@@ -171,7 +171,7 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 #### `triage`
 
 - **Usage:** `pipeline triage <n> --stage ready|backlog`
-- **Summary:** Set a pre-pipeline stage label (ready or backlog) on an issue
+- **Summary:** Set a pre-pipeline stage label (ready or backlog) on an issue. needs-spec is an admission hold: apply the spec, then triage --stage ready.
 
 ### Observability
 

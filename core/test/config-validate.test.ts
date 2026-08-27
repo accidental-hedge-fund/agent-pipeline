@@ -212,6 +212,7 @@ test("RIGOR_GATING_PATHS: contains expected minimum set of paths", () => {
     "eval_gate.mode",
     "shipcheck_gate.enabled",
     "shipcheck_gate.mode",
+    "issue_readiness.enabled",
   ];
   for (const p of required) {
     assert.ok(RIGOR_GATING_PATHS.includes(p), `RIGOR_GATING_PATHS must include "${p}"`);

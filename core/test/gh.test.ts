@@ -10,8 +10,11 @@ import {
   isHttp404Signal,
   isPrDiffTooLargeError,
   isTransientGhError,
+  listIssueCommentsWithIds,
   shouldTreatContents404AsEmpty,
+  updateIssueComment,
 } from "../scripts/gh.ts";
+import type { PipelineConfig } from "../scripts/types.ts";
 
 // ---------------------------------------------------------------------------
 // activeChangeIdsFromContentsEntries — pure tip-tree listing parser (#714)
@@ -1010,4 +1013,31 @@ test("getPrDiff: files-list fallback fails closed if the PR keeps moving (#1223)
     /moved during files-list fallback/,
   );
   assert.equal(filesListCount, 3, "must exhaust the bounded pin attempts then fail closed");
+});
+
+test("listIssueCommentsWithIds: parses REST numeric ids via injected runner", async () => {
+  const cfg = { repo: "acme/widget" } as PipelineConfig;
+  const seen: string[][] = [];
+  const comments = await listIssueCommentsWithIds(cfg, 1238, async (args) => {
+    seen.push(args);
+    return JSON.stringify([
+      { id: 5433321980, body: "hello", user: { login: "alice" }, created_at: "2026-08-27T01:48:10Z" },
+    ]);
+  });
+  assert.equal(seen[0][0], "api");
+  assert.ok(String(seen[0][1]).includes("issues/1238/comments"));
+  assert.equal(comments[0].id, 5433321980);
+  assert.equal(comments[0].author, "alice");
+});
+
+test("updateIssueComment: PATCHes REST numeric id via injected runner", async () => {
+  const cfg = { repo: "acme/widget" } as PipelineConfig;
+  const seen: string[][] = [];
+  await updateIssueComment(cfg, 5433321980, "new body", async (args) => {
+    seen.push(args);
+    return "{}";
+  });
+  assert.equal(seen[0].includes("PATCH"), true);
+  assert.ok(String(seen[0].join(" ")).includes("issues/comments/5433321980"));
+  assert.ok(seen[0].some((a) => a.startsWith("body=")));
 });

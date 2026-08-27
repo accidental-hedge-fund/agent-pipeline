@@ -8,6 +8,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { domainContext, readConventions } from "../config.ts";
 import { REVIEW_VERDICT_SCHEMA_BLOCK, DESIGN_CHALLENGE_SCHEMA_BLOCK } from "../review-schema.ts";
+import { ISSUE_READINESS_SCHEMA_BLOCK } from "../issue-readiness-schema.ts";
 import {
   renderPriorRoundDigest,
   renderResolvedFindingVerification,
@@ -939,6 +940,23 @@ export function buildRefineSpecPrompt(a: BuildRefineSpecArgs): string {
   return substitute(loadTemplate("refine-spec"), {
     title: a.title,
     body: a.body,
+    ship_path_autonomy_preamble: shipPathAutonomyPreambleSection(),
+  });
+}
+
+export interface BuildIssueReadinessArgs {
+  title: string;
+  body: string;
+  labels: readonly string[];
+}
+
+export function buildIssueReadinessPrompt(a: BuildIssueReadinessArgs): string {
+  return substitute(loadTemplate("issue_readiness"), {
+    title: a.title,
+    body: a.body,
+    labels: a.labels.length > 0 ? a.labels.join(", ") : "(none)",
+    schema_block: ISSUE_READINESS_SCHEMA_BLOCK,
+    no_tools_instruction: SPEC_GENERATION_TOOL_FREE_BLOCK,
     ship_path_autonomy_preamble: shipPathAutonomyPreambleSection(),
   });
 }

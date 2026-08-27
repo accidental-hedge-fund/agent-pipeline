@@ -13,7 +13,7 @@ description: |
 # pipeline
 
 Self-contained TypeScript skill that advances a GitHub issue (or PR's linked
-issue) through a 17-stage label-driven state machine, ending at
+issue) through a 18-stage label-driven state machine, ending at
 `pipeline:ready-to-deploy` on the happy path (or parking at `pipeline:needs-human`
 when review ceilings / similar paths exhaust). The ordinary advance path never
 merges. Merge commands require separate operator authority.
@@ -29,10 +29,10 @@ of `core/` (+ `hosts/claude`). After editing any file under `core/`, run
 
 ## State machine
 
-Happy path (16 stages total in code `STAGES`, including the park off-ramp):
+Happy path (18 stages total in code `STAGES`, including the park off-ramp):
 
 ```
-backlog → ready → planning → plan-review → pre-code-attestation → implementing → design-gate
+backlog → needs-spec → ready → planning → plan-review → pre-code-attestation → implementing → design-gate
               → review-1 → fix-1 → review-2 → fix-2
               → pre-merge → visual-gate → eval-gate → shipcheck-gate
               → ready-to-deploy
@@ -50,10 +50,11 @@ handlers in `scripts/stages/`. The skill **owns** the labels — it sets,
 removes, and transitions them as side-effects of running the underlying
 stage logic. There is no separate orchestrator process.
 
-`backlog` is a triage marker (e.g. set by `/sweep`). `/pipeline` starts work
-at `ready` and only acts on items that already carry a `pipeline:*` label.
-`needs-human` is a terminal park state (review-ceiling punch list, etc.); the
-advance loop never auto-advances from it to `ready-to-deploy`.
+`backlog` is a triage marker (e.g. set by `/sweep`). `needs-spec` is an admission
+hold: apply a complete spec, then `pipeline triage <N> --stage ready`. `/pipeline`
+starts work at `ready` and only acts on items that already carry a `pipeline:*`
+label. `needs-human` is a terminal park state (review-ceiling punch list, etc.);
+the advance loop never auto-advances from it to `ready-to-deploy`.
 
 ### Merge authority boundary
 
@@ -108,7 +109,7 @@ distinct `pipeline:<command>` entries in the skill/command menu.
 /pipeline refine-spec --title "<t>" --body "<b>" Refine an existing issue's spec; non-mutating JSON output
 /pipeline roadmap [--apply] [--next <n>]        Analyze open backlog into a dependency-aware scored roadmap; under SemVer, dry-run lists full milestone reconciliation actions and --apply converges open issues to the reviewed manifest (fingerprint-gated)
 /pipeline sweep [--apply] [--repo owner/name]   Batch re-spec thin issues and reconcile ROADMAP.md
-/pipeline triage <n> --stage ready|backlog      Set a pre-pipeline stage label (ready or backlog) on an issue
+/pipeline triage <n> --stage ready|backlog      Set a pre-pipeline stage label (ready or backlog) on an issue. needs-spec is an admission hold: apply the spec, then triage --stage ready.
 /pipeline controls check [--json] [--strict]    Read-only repository-control drift check against configured desired state (#695); never mutates forge settings
 /pipeline correction record|attribute …         Record a correction event or attribute a control (append-only local ledger)
 /pipeline lineage export|impact|propose|ingest [--run-id <id>] [--node-id <id>] [--fixture <path>] [--retention-days <n>] [--dry-run] [--json] Export, impact-analyze, or propose updates on the intent-lineage evidence graph (host-local store; #599). Backward proposals never silently edit authority; free text is redacted; no GitHub mutations

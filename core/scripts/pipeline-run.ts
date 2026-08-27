@@ -152,6 +152,11 @@ import { resolvePlanningLeverageSelection } from "./planning-leverage/selection.
 import { toPreMergeOfframpClass } from "./pre-merge-offramp.ts";
 import { buildStageDiagnostic, projectStageDiagnostic } from "./stage-diagnostic.ts";
 import { autoFileCorrections, autoFilePapercuts, realAutoFileDeps } from "./stages/papercut.ts";
+import {
+  evaluateIssueReadiness,
+  gateUnavailableSummary,
+  needsSpecSummary,
+} from "./issue-readiness.ts";
 import * as planningStage from "./stages/planning.ts";
 import * as reviewStage from "./stages/review.ts";
 import * as fixStage from "./stages/fix.ts";
@@ -760,6 +765,8 @@ export interface PlanningRecoveryDeps {
    * comment so plan-review recovery can resume without re-planning.
    */
   hasCompletedPlan?: (cfg: PipelineConfig, issueNumber: number) => Promise<boolean>;
+  /** Shared issue-implementation-readiness gate (#1238). Injected in tests. */
+  evaluateIssueReadiness?: typeof evaluateIssueReadiness;
 }
 
 /** True when issue comments already include a completed plan artifact (#870). */
@@ -785,6 +792,7 @@ export function realPlanningRecoveryDeps(): PlanningRecoveryDeps {
     isLivePlanningActive,
     tryAcquireLivePlanningMarker,
     hasCompletedPlan: hasCompletedPlanComment,
+    evaluateIssueReadiness,
   };
 }
 
@@ -924,13 +932,53 @@ export async function dispatch(
   const model = opts.model;
   switch (stage) {
     case "ready": {
+      const readyDeps = recoveryDeps ?? realPlanningRecoveryDeps();
+      if (cfg.issue_readiness.enabled) {
+        const gate = readyDeps.evaluateIssueReadiness ?? evaluateIssueReadiness;
+        const admission = await gate(cfg, issueNumber, { dryRun });
+        if (admission.kind === "needs_spec") {
+          if (dryRun) {
+            return {
+              advanced: false,
+              status: "waiting",
+              reason: `[dry-run] ${needsSpecSummary(admission)}`,
+            };
+          }
+          return {
+            advanced: true,
+            from: "ready",
+            to: "needs-spec",
+            summary: needsSpecSummary(admission),
+          };
+        }
+        if (admission.kind === "gate-unavailable") {
+          if (runDir) {
+            await appendEvent(
+              runDir,
+              {
+                schema_version: RUN_SCHEMA_VERSION,
+                type: "gate_result",
+                at: evidenceTimestamp(),
+                gate: "issue_readiness",
+                result: "fail",
+                reason: `gate-unavailable: ${admission.reason}`,
+              },
+              runStoreDeps,
+            ).catch(() => {});
+          }
+          return {
+            advanced: false,
+            status: "error",
+            reason: gateUnavailableSummary(admission),
+          };
+        }
+      }
       // Atomically claim the live-planning marker before calling planningAdvance.
       // A plain check-then-call would be racy: two different-domain runs can
       // both observe no marker and both enter planningAdvance before either
       // writes it.  O_CREAT|O_EXCL inside tryAcquireLivePlanningMarker is
       // atomic at the OS level; only one caller gets true.  planningStage.advance()
       // will overwrite (same PID) and clear the marker in its own finally block.
-      const readyDeps = recoveryDeps ?? realPlanningRecoveryDeps();
       const tryAcquire = readyDeps.tryAcquireLivePlanningMarker ?? tryAcquireLivePlanningMarker;
       if (!tryAcquire(cfg.repo, issueNumber)) {
         return {
@@ -941,6 +989,13 @@ export async function dispatch(
       }
       return readyDeps.planningAdvance(cfg, issueNumber, { dryRun, model, pipelineRunId, stateDir, runDir, runStoreDeps });
     }
+    case "needs-spec":
+      return {
+        advanced: false,
+        status: "waiting",
+        reason:
+          "needs-spec is an admission hold; apply the spec and re-admit with pipeline triage <N> --stage ready",
+      };
     case "pre-code-attestation":
       return preCodeAttestationStage.advancePreCodeAttestation(cfg, issueNumber, {
         dryRun,
@@ -2574,6 +2629,9 @@ export async function runAdvance(
         // not stranded while this issue waits. Mid-process auto-loop continues
         // above never reach this path.
         await maybeReleaseWorktreeOnPark(cfg, issueNumber, out, !!opts.dryRun, deps);
+        if (out.status === "error") {
+          process.exitCode = 1;
+        }
         break;
       }
 

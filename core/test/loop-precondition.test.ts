@@ -97,6 +97,10 @@ test("isPrePipelineStage: backlog is pre-pipeline", () => {
   assert.equal(isPrePipelineStage("backlog"), true);
 });
 
+test("isPrePipelineStage: needs-spec is pre-pipeline", () => {
+  assert.equal(isPrePipelineStage("needs-spec"), true);
+});
+
 test("isPrePipelineStage: ready is admissible", () => {
   assert.equal(isPrePipelineStage("ready"), false);
 });
@@ -124,8 +128,8 @@ test("isMidFlightPipelineStage: known advance stages are mid-flight", () => {
   }
 });
 
-test("isMidFlightPipelineStage: null, backlog, ready, ready-to-deploy, needs-human are not mid-flight", () => {
-  for (const stage of [null, "backlog", "ready", "ready-to-deploy", "needs-human"] as const) {
+test("isMidFlightPipelineStage: null, backlog, needs-spec, ready, ready-to-deploy, needs-human are not mid-flight", () => {
+  for (const stage of [null, "backlog", "needs-spec", "ready", "ready-to-deploy", "needs-human"] as const) {
     assert.equal(isMidFlightPipelineStage(stage), false, `${stage} should not be mid-flight`);
   }
 });
@@ -258,6 +262,13 @@ test("classifyPreconditionExclusions: excludes a pending item observed at pipeli
   const ledger = testLedger({ "100": itemEntry("100", "pending") }, { "100": identity({ pipeline_stage: "backlog" }) });
   const exclusions = classifyPreconditionExclusions(contract, ledger);
   assert.deepEqual(exclusions, [{ item_id: "100", required_stage: "pipeline:ready", observed_stage: "pipeline:backlog" }]);
+});
+
+test("classifyPreconditionExclusions: excludes a pending item observed at pipeline:needs-spec", () => {
+  const contract = testContract();
+  const ledger = testLedger({ "100": itemEntry("100", "pending") }, { "100": identity({ pipeline_stage: "needs-spec" }) });
+  const exclusions = classifyPreconditionExclusions(contract, ledger);
+  assert.deepEqual(exclusions, [{ item_id: "100", required_stage: "pipeline:ready", observed_stage: "pipeline:needs-spec" }]);
 });
 
 test("classifyPreconditionExclusions: excludes a pending item observed with no pipeline:* label", () => {
