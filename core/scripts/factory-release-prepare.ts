@@ -1,6 +1,6 @@
 // Durable post-pilot FRG generation + prepare-only release handoff (#953 / #908 / #1037).
 //
-// CLI: pipeline factory-release prepare --request <absolute-request.json> --json
+// CLI: pipeline factory-release prepare --request <absolute-off-repo-request.json> --json
 //
 // Idempotent multi-tick protocol:
 //   1) No request-bound pack loop, or bound loop not terminal → start/resume
@@ -21,9 +21,14 @@
 
 import { execFile } from "node:child_process";
 import * as crypto from "node:crypto";
+import { realpathSync as fsRealpathSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { promisify } from "node:util";
+import {
+  artifactSubdir,
+  FACTORY_RELEASE_ARTIFACT,
+} from "./artifact-ignore.ts";
 
 const execFileAsync = promisify(execFile);
 import {
@@ -74,7 +79,13 @@ export const FACTORY_RELEASE_REQUEST_KIND = "factory_release_prepare_request";
 export const FACTORY_RELEASE_CHECKPOINT_KIND = "factory_release_frg_checkpoint";
 export const FACTORY_RELEASE_PREPARED_KIND = "factory_release_prepared";
 export const FACTORY_RELEASE_FAILED_KIND = "factory_release_failed";
-export const FACTORY_RELEASE_ROOT_REL = path.join(".agent-pipeline", "factory-release");
+export const FACTORY_RELEASE_ROOT_REL = path.join(
+  ".agent-pipeline",
+  FACTORY_RELEASE_ARTIFACT.name,
+);
+
+/** Stable defect token when `--request` resolves inside a target checkout. */
+export const REQUEST_INSIDE_CHECKOUT_TOKEN = "request_inside_checkout";
 
 const SEMVER_RE = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 const DIGEST_RE = /^[0-9a-f]{64}$/;
@@ -348,6 +359,12 @@ export interface FactoryReleasePrepareDeps {
   scoreBoundPackLoop?: ScoreBoundPackLoop;
   /** Optional log sink. */
   log?(msg: string): void;
+  /**
+   * Canonicalize an existing path (follow symlinks). Defaults to
+   * `fs.realpathSync`. Tests inject a map so symlink / missing-path cases
+   * never touch the real filesystem.
+   */
+  realpathSync?(absolutePath: string): string;
 }
 
 // ---------------------------------------------------------------------------
@@ -596,7 +613,7 @@ export function factoryReleaseRequestFingerprint(request: FactoryReleasePrepareR
 }
 
 export function factoryReleaseWorkDir(repoDir: string, fingerprint: string): string {
-  return path.join(repoDir, FACTORY_RELEASE_ROOT_REL, fingerprint);
+  return path.join(artifactSubdir(repoDir, FACTORY_RELEASE_ARTIFACT), fingerprint);
 }
 
 export function factoryReleaseCheckpointPath(repoDir: string, fingerprint: string): string {
@@ -604,7 +621,90 @@ export function factoryReleaseCheckpointPath(repoDir: string, fingerprint: strin
 }
 
 export function factoryReleaseVersionIndexPath(repoDir: string, version: string): string {
-  return path.join(repoDir, FACTORY_RELEASE_ROOT_REL, "by-version", `${normalizeFrgVersion(version)}.json`);
+  return path.join(
+    artifactSubdir(repoDir, FACTORY_RELEASE_ARTIFACT),
+    "by-version",
+    `${normalizeFrgVersion(version)}.json`,
+  );
+}
+
+function defaultRealpathSync(absolutePath: string): string {
+  return fsRealpathSync(absolutePath);
+}
+
+/**
+ * Resolve `--request` for containment: absolute path, then realpath of the
+ * file when it exists, else realpath of its parent joined with the basename.
+ * Missing file and missing parent fall back to `path.resolve`.
+ */
+export function resolveRequestPathForContainment(
+  requestPath: string,
+  realpathSync: (absolutePath: string) => string = defaultRealpathSync,
+): string {
+  const resolved = path.resolve(requestPath);
+  try {
+    return realpathSync(resolved);
+  } catch {
+    try {
+      return path.join(realpathSync(path.dirname(resolved)), path.basename(resolved));
+    } catch {
+      return resolved;
+    }
+  }
+}
+
+/** True when `candidate` is `checkoutRoot` or a descendant (after resolve). */
+export function isPathInsideCheckout(candidate: string, checkoutRoot: string): boolean {
+  const rel = path.relative(path.resolve(checkoutRoot), path.resolve(candidate));
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
+}
+
+/**
+ * Checkouts prepare must keep clean of operator `--request` files: `repoDir`
+ * plus a distinct factory control checkout from opts / env.
+ */
+export function targetCheckoutsForPrepare(opts: {
+  repoDir: string;
+  factoryControlDir?: string | null;
+  env?: NodeJS.ProcessEnv;
+}): string[] {
+  const roots: string[] = [path.resolve(opts.repoDir)];
+  const env = opts.env ?? {};
+  const extras = [opts.factoryControlDir, env.AGENT_PIPELINE_FACTORY_CONTROL, env.REPO_DIR];
+  for (const extra of extras) {
+    if (typeof extra !== "string" || extra.trim() === "") continue;
+    const resolved = path.resolve(extra.trim());
+    if (!roots.some((root) => root === resolved)) roots.push(resolved);
+  }
+  return roots;
+}
+
+export function requestInsideCheckoutMessage(requestPath: string, checkoutRoot: string): string {
+  return (
+    `factory-release prepare: ${REQUEST_INSIDE_CHECKOUT_TOKEN}: ` +
+    `--request ${requestPath} resolves inside the target checkout ${checkoutRoot}. ` +
+    `Place the request outside the checkout ($TMPDIR, AGENT_PIPELINE_STATE_HOME, or the Tugboat $RUN_DIR). ` +
+    `Gitignoring request-*.json or skip-worktree is not the product fix.`
+  );
+}
+
+/**
+ * Refuse `--request` when it resolves inside any target checkout (root,
+ * descendant, or symlink whose target is inside). Gitignored descendants
+ * are still refused.
+ */
+export function assertRequestOutsideCheckouts(
+  requestPath: string,
+  checkouts: readonly string[],
+  realpathSync: (absolutePath: string) => string = defaultRealpathSync,
+): void {
+  const resolvedRequest = resolveRequestPathForContainment(requestPath, realpathSync);
+  for (const checkout of checkouts) {
+    const resolvedCheckout = resolveRequestPathForContainment(checkout, realpathSync);
+    if (isPathInsideCheckout(resolvedRequest, resolvedCheckout)) {
+      throw new Error(requestInsideCheckoutMessage(resolvedRequest, resolvedCheckout));
+    }
+  }
 }
 
 function grantFingerprintOrAction(request: FactoryReleasePrepareRequest): string {
@@ -2379,6 +2479,7 @@ export function defaultFactoryReleasePrepareDeps(
     dispatchPackLoop: overrides.dispatchPackLoop ?? productionDispatchPackLoop,
     scoreBoundPackLoop: overrides.scoreBoundPackLoop,
     log: overrides.log,
+    realpathSync: overrides.realpathSync,
   };
 }
 
@@ -2441,6 +2542,11 @@ export interface RunFactoryReleasePrepareOpts {
   /** Absolute path to the request JSON. */
   requestPath: string;
   repoDir: string;
+  /**
+   * Factory control checkout when distinct from `repoDir`. Also read from
+   * `AGENT_PIPELINE_FACTORY_CONTROL` / `REPO_DIR` on `deps.env`.
+   */
+  factoryControlDir?: string | null;
   /** When true (CLI default with --json), result is returned for stdout. */
   json?: boolean;
   baseBranch?: string;
@@ -2564,8 +2670,18 @@ export async function runFactoryReleasePrepare(
     );
   }
 
-  // Refuse FRG credential material in the candidate environment.
   const env = deps.env ?? process.env;
+  assertRequestOutsideCheckouts(
+    requestPath,
+    targetCheckoutsForPrepare({
+      repoDir: opts.repoDir,
+      factoryControlDir: opts.factoryControlDir,
+      env,
+    }),
+    deps.realpathSync ?? defaultRealpathSync,
+  );
+
+  // Refuse FRG credential material in the candidate environment.
   for (const name of CANDIDATE_LOOP_DENIED_FRG_ENV) {
     const v = env[name];
     if (typeof v === "string" && v.trim() !== "") {
@@ -3010,10 +3126,18 @@ export async function runFactoryReleasePrepare(
 
 /** Help text for `pipeline factory-release prepare --help` / command-docs. */
 export const FACTORY_RELEASE_PREPARE_HELP = `
-pipeline factory-release prepare --request <absolute-request.json> --json
+pipeline factory-release prepare --request <absolute-off-repo-request.json> --json
 
 Durable post-pilot (versions after ${FRG_HYBRID_PILOT_VERSION}) FRG generation and
 prepare-only release handoff. Idempotent multi-tick protocol:
+
+--request MUST be an absolute path that resolves outside the target checkout
+(repoDir and, when distinct, the factory control checkout). An in-checkout
+path (for example $REPO_DIR/.agent-pipeline/request.json) is rejected with
+defect token ${REQUEST_INSIDE_CHECKOUT_TOKEN} before pack-loop dispatch: it
+dirties protected main and fails doctor worktree-clean on the pack loop.
+Place the file under $TMPDIR, AGENT_PIPELINE_STATE_HOME, or the Tugboat
+$RUN_DIR. Gitignoring request-*.json or skip-worktree is not the product fix.
 
   1) First call with no request-bound pack loop (or a bound loop that is not
      terminal) starts or resumes a factory-gate candidate pack loop

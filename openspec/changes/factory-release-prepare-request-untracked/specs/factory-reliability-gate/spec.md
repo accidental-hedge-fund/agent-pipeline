@@ -2,14 +2,14 @@
 
 ### Requirement: FRG runbook SHALL place factory-release prepare request files outside the target checkout
 
-The checked-in Factory Reliability Gate (FRG) runbook and
-`pipeline factory-release prepare` help SHALL document `--request` as an
+The Factory Reliability Gate (FRG) runbook SHALL document `--request` as an
 absolute path outside the target checkout (`$TMPDIR`,
-`AGENT_PIPELINE_STATE_HOME`, or the Tugboat `$RUN_DIR`). They SHALL NOT
-present `$REPO_DIR/.agent-pipeline/request.json` or another in-checkout
-path as the example dest. They SHALL state that an in-checkout request
-dirties protected `main` and fails doctor `worktree-clean` on the pack
-loop.
+`AGENT_PIPELINE_STATE_HOME`, or the Tugboat `$RUN_DIR`).
+`pipeline factory-release prepare` help SHALL use the same off-repo rule.
+They SHALL NOT present `$REPO_DIR/.agent-pipeline/request.json` or another
+in-checkout path as the example dest. They SHALL state that an in-checkout
+request dirties protected `main` and fails doctor `worktree-clean` on the
+pack loop.
 
 #### Scenario: Runbook names an off-repo request dest
 

@@ -146,7 +146,7 @@ Issues on the milestone must be `pipeline:ready` before train dispatch.
 ### Phase sequence (fixed)
 
 1. `pipeline train --milestone vX.Y.Z --merge --json` (complete gate + resume)
-2. FRG pack: uncredentialed `pipeline factory-release prepare --request <abs.json> --json`, then (when unsigned) `pipeline factory-gate --for X.Y.Z --from-run <loop>` in a separate credentialed child; re-invoke until pack-done. While prepare is `in_progress` and the bound pack loop is live (`lock.json` pid alive or ledger not terminal), wait is wait-until-terminal with a heartbeat. A CI-length poll cap (about 20 minutes) is not pack-fail. Re-detach is not the resume path. Wait-budget expiry may fail the pack only when the bound loop is not live.
+2. FRG pack: uncredentialed `pipeline factory-release prepare --request <abs-off-repo.json> --json` (`$TMPDIR`, `AGENT_PIPELINE_STATE_HOME`, or Tugboat `$RUN_DIR` — never `$REPO_DIR`), then (when unsigned) `pipeline factory-gate --for X.Y.Z --from-run <loop>` in a separate credentialed child; re-invoke until pack-done. While prepare is `in_progress` and the bound pack loop is live (`lock.json` pid alive or ledger not terminal), wait is wait-until-terminal with a heartbeat. A CI-length poll cap (about 20 minutes) is not pack-fail. Re-detach is not the resume path. Wait-budget expiry may fail the pack only when the bound loop is not live.
 3. `pipeline release X.Y.Z --no-edit` (**bare** version — leading `v` is invalid; **no** `--skip-frg`)
 4. In-engine `pipeline ship` waits until open release PR checks are green before `release finish` (`ship-release-check-wait`: `gh pr checks --json name,state,bucket,link`; never `conclusion`). Classification is `green` / `pending` / `rerun` / `fail`. `pending` keeps waiting in the coordinator (same-argv retry may resume). A first flake-eligible `test` fail requests one bounded `gh run rerun --failed` per head SHA (budget at most two), then waits again. Non-test product fails STOP and do not finish. Bare `pipeline release finish` stays one-shot fail-closed; **ship** owns the wait. Tugboat may keep calling `release-checks-green.py`; Tugboat is not the only waiter. After merge, refresh installed Tugboat and `release-checks-green.py` from `examples/supervisor/shell/`.
 5. `pipeline release finish <pr>` (only after the waiter classifies `green`, or when finish evidence is already observed)
@@ -176,7 +176,7 @@ Tugboat does not invoke `git tag` or `gh release create`. Tag create is
 candidate `pipeline release ensure-tag` from on-disk HMAC `latest.json`.
 `.agent-pipeline/frg/` is gitignored, so auto-tag must not stall the ship for
 a missing tree file. `release finish` still does not tag. The pack phase composes
-`pipeline factory-release prepare --request <abs.json> --json` in a child that
+`pipeline factory-release prepare --request <abs-off-repo.json> --json` in a child that
 has `PIPELINE_FRG_ATTESTATION_KEY` and `PIPELINE_FRG_ATTESTATION_KEY_FILE`
 **unset** (the parent supervisor env may keep the credential). When prepare
 returns `awaiting_frg_attestation` or unsigned eligible artifacts exist,

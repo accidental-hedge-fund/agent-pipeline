@@ -35,6 +35,7 @@ import {
   type ShipReleaseCheckWaitDeps,
 } from "../scripts/stages/ship-release-check-wait.ts";
 import { LOOP_LEDGER_SCHEMA } from "../scripts/loop/types.ts";
+import { isPathInsideCheckout } from "../scripts/factory-release-prepare.ts";
 import {
   runShipCoordinator,
   shipKey,
@@ -366,7 +367,7 @@ test("ship adapter fails closed with the exact existing FRG next action", async 
 
   await assert.rejects(
     deps.convergeFrgPack(intent, train),
-    /pipeline factory-release prepare --request <absolute-request\.json> --json/,
+    /pipeline factory-release prepare --request <absolute-off-repo-request\.json> --json/,
   );
 });
 
@@ -2610,6 +2611,19 @@ test("real coordinator defaults spawn candidate ensure-tag leaf and persist requ
   assert.ok(path.isAbsolute(dest));
   assert.match(dest, /factory-release-prepare-request\.json$/);
   assert.ok(dest.includes("ships"));
+  assert.ok(
+    dest.startsWith("/tmp/ap-state"),
+    "in-engine ship request dest must resolve under AGENT_PIPELINE_STATE_HOME",
+  );
+  assert.equal(
+    isPathInsideCheckout(dest, "/repo"),
+    false,
+    "in-engine ship request dest must not resolve inside the target checkout",
+  );
+  assert.ok(
+    !dest.includes(`${path.sep}.agent-pipeline${path.sep}`),
+    "in-engine ship must not write the request under REPO_DIR/.agent-pipeline/",
+  );
 });
 
 test("persistShipFactoryReleaseRequest writes a secret-free request and reuses it", async () => {
@@ -2624,6 +2638,11 @@ test("persistShipFactoryReleaseRequest writes a secret-free request and reuses i
     const first = await persistShipFactoryReleaseRequest(intent, train, { repoDir, env });
     const second = await persistShipFactoryReleaseRequest(intent, train, { repoDir, env });
     assert.equal(first, second);
+    assert.equal(
+      isPathInsideCheckout(first, repoDir),
+      false,
+      "in-engine ship request dest must not resolve inside REPO_DIR",
+    );
     const request = JSON.parse(fs.readFileSync(first, "utf8")) as Record<string, unknown>;
     assert.equal(request.kind, "factory_release_prepare_request");
     assert.equal(request.target_version, intent.version);

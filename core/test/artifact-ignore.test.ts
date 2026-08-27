@@ -41,7 +41,7 @@ function makeFakeFs(initial: string | null): { deps: ArtifactIgnoreDeps; get(): 
 // Contract (drift guard, #5.1/#5.3)
 // ---------------------------------------------------------------------------
 
-test("ARTIFACT_CONTRACT: contains exactly runs/, roadmap/, history/, evals/, control-attributions.jsonl, product-fault-reports.jsonl, handoffs/, outcomes/, lineage/, frg/, and harness-ownership/ with non-empty comments", () => {
+test("ARTIFACT_CONTRACT: contains exactly runs/, roadmap/, history/, evals/, control-attributions.jsonl, product-fault-reports.jsonl, handoffs/, outcomes/, lineage/, frg/, harness-ownership/, and factory-release/ with non-empty comments", () => {
   const names = ARTIFACT_CONTRACT.map((e) => e.name);
   assert.deepEqual(names, [
     "runs",
@@ -55,6 +55,7 @@ test("ARTIFACT_CONTRACT: contains exactly runs/, roadmap/, history/, evals/, con
     "lineage",
     "frg",
     "harness-ownership",
+    "factory-release",
   ]);
   for (const entry of ARTIFACT_CONTRACT) {
     assert.ok(entry.comment.length > 0, `entry ${entry.name} must have a non-empty comment`);
@@ -86,6 +87,70 @@ test("repo .gitignore lists .agent-pipeline/frg/ so uncommitted latest.json is i
   const gitignore = fs.readFileSync(path.join(repoRoot, ".gitignore"), "utf8");
   assert.match(gitignore, /^\.agent-pipeline\/frg\/$/m);
   assert.doesNotMatch(gitignore, /skip-worktree/);
+});
+
+test("ARTIFACT_CONTRACT: includes .agent-pipeline/factory-release/ (regression for #1259)", () => {
+  assert.ok(
+    ARTIFACT_CONTRACT.some((e) => e.name === "factory-release"),
+    "contract must include the factory-release artifact directory",
+  );
+  const block = renderArtifactIgnoreBlock();
+  assert.ok(
+    block.includes(".agent-pipeline/factory-release/"),
+    "rendered block must list factory-release/",
+  );
+  assert.match(
+    ARTIFACT_CONTRACT.find((e) => e.name === "factory-release")!.comment,
+    /checkpoint|loop binding/i,
+  );
+});
+
+test("repo .gitignore lists .agent-pipeline/factory-release/ so uncommitted checkpoint.json is ignored (#1259)", () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+  const gitignore = fs.readFileSync(path.join(repoRoot, ".gitignore"), "utf8");
+  assert.match(gitignore, /^\.agent-pipeline\/factory-release\/$/m);
+  assert.doesNotMatch(gitignore, /skip-worktree/);
+  assert.doesNotMatch(gitignore, /^\.agent-pipeline\/request-\*\.json$/m);
+  assert.doesNotMatch(
+    renderArtifactIgnoreBlock(),
+    /production-engine-pin/,
+  );
+  assert.ok(
+    !ARTIFACT_CONTRACT.some((e) => e.name === "production-engine-pin.json"),
+    "pin file is not a contract ignore path",
+  );
+  assert.ok(
+    ARTIFACT_CONTRACT.some((e) => e.name === "frg"),
+    "frg/ must stay on the contract",
+  );
+});
+
+test("README and host SKILL.md ignored-path lists include factory-release/ (#1259)", () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+  const required = [
+    ".agent-pipeline/runs/",
+    ".agent-pipeline/roadmap/",
+    ".agent-pipeline/history/",
+    ".agent-pipeline/frg/",
+    ".agent-pipeline/factory-release/",
+  ];
+  const docs = [
+    "README.md",
+    "docs/concepts.md",
+    "hosts/claude/SKILL.md",
+    "hosts/codex/SKILL.md",
+    "hosts/opencode/SKILL.md",
+    "hosts/omp/SKILL.md",
+  ];
+  for (const rel of docs) {
+    const body = fs.readFileSync(path.join(repoRoot, rel), "utf8");
+    for (const entry of required) {
+      assert.ok(
+        body.includes(entry),
+        `${rel} must list ${entry} wherever it enumerates ignored artifact paths`,
+      );
+    }
+  }
 });
 
 test("ARTIFACT_CONTRACT: includes .agent-pipeline/history/ (regression for #452)", () => {

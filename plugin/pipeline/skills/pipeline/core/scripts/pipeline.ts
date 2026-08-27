@@ -5413,7 +5413,8 @@ async function main(): Promise<void> {
     if (verb !== "prepare") {
       console.error(
         "pipeline factory-release: expected subcommand 'prepare'.\n" +
-          "  Usage: pipeline factory-release prepare --request <absolute-request.json> --json\n" +
+          "  Usage: pipeline factory-release prepare --request <absolute-off-repo-request.json> --json\n" +
+          "  --request must resolve outside the target checkout ($TMPDIR, AGENT_PIPELINE_STATE_HOME, or Tugboat $RUN_DIR).\n" +
           "  Idempotent multi-tick protocol for versions after 1.33.0:\n" +
           "    1) starts/resumes a bound factory-gate pack loop and returns status in_progress\n" +
           "    2) after the bound loop is terminal and scored --from-run (no --observations),\n" +
@@ -5432,8 +5433,9 @@ async function main(): Promise<void> {
     const requestPath = opts.request ? String(opts.request).trim() : "";
     if (!requestPath) {
       console.error(
-        "pipeline factory-release prepare: --request <absolute-request.json> is required.\n" +
-          "  Usage: pipeline factory-release prepare --request <absolute-request.json> --json",
+        "pipeline factory-release prepare: --request <absolute-off-repo-request.json> is required.\n" +
+          "  Usage: pipeline factory-release prepare --request <absolute-off-repo-request.json> --json\n" +
+          "  --request must resolve outside the target checkout ($TMPDIR, state dir, or Tugboat $RUN_DIR).",
       );
       process.exit(2);
     }

@@ -21,6 +21,7 @@ import {
   type Option1PackBodies,
 } from "../scripts/tugboat-install-parity.ts";
 import { LOOP_LEDGER_SCHEMA } from "../scripts/loop/types.ts";
+import { isPathInsideCheckout } from "../scripts/factory-release-prepare.ts";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, "../..");
@@ -292,6 +293,12 @@ test("tugboat supports serial multi-milestone and single-host lock", () => {
   );
   assert.match(shipOneBody, /factory-release prepare --request/);
   assert.match(shipOneBody, /write_factory_release_request/);
+  assert.match(shipOneBody, /req="\$RUN_DIR\/factory-release-prepare-request\.json"/);
+  assert.doesNotMatch(
+    shipOneBody,
+    /req="\$REPO_DIR\/\.agent-pipeline\//,
+    "Tugboat must not write the prepare request into REPO_DIR (#1259)",
+  );
   // Escape still passes --skip-frg via SKIP_FRG_ARGS; pack is omitted.
   assert.match(shipOneBody, /SKIP_FRG_ARGS=\(--skip-frg\)/);
   assert.match(shipOneBody, /phase frg-pack: omitted \(skip-frg escape\)/);
@@ -7041,5 +7048,29 @@ test("maybe_ff_repo_dir skips dirty porcelain and does not fail the ship (#1182)
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("Tugboat factory-release request dest is $RUN_DIR, not REPO_DIR (#1259)", () => {
+  const body = fs.readFileSync(tugboat, "utf8");
+  assert.match(
+    body,
+    /STATE_ROOT="\$\{PIPELINE_SUPERVISOR_STATE:-\$HOME\/\.local\/state\/pipeline-supervisor\}"/,
+  );
+  assert.match(body, /RUN_DIR="\$STATE_ROOT\/ship-v\$\(safe_of "\$version"\)"/);
+  assert.match(body, /req="\$RUN_DIR\/factory-release-prepare-request\.json"/);
+  const repoDir = "/home/op/dev/ap-main-control";
+  const runDir = "/home/op/.local/state/pipeline-supervisor/ship-v1.39.13";
+  const dest = path.join(runDir, "factory-release-prepare-request.json");
+  assert.equal(
+    isPathInsideCheckout(dest, repoDir),
+    false,
+    "Tugboat $RUN_DIR dest must resolve outside REPO_DIR",
+  );
+  const inCheckout = path.join(repoDir, ".agent-pipeline", "request-1.39.13.json");
+  assert.equal(
+    isPathInsideCheckout(inCheckout, repoDir),
+    true,
+    "the test bites when dest is $REPO_DIR/.agent-pipeline/...",
+  );
 });
 
