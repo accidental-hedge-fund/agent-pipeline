@@ -51,6 +51,26 @@ for (const flag of ["--version", "-V"]) {
   });
 }
 
+test("CLI: --version succeeds in a repo with no .github/pipeline.yml (#1240)", () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-version-nocfg-"));
+  fs.mkdirSync(path.join(repo, ".git"));
+  try {
+    const result = spawnSync(
+      process.execPath,
+      ["--experimental-strip-types", PIPELINE_SCRIPT, "--version"],
+      {
+        cwd: repo,
+        encoding: "utf8",
+        env: { ...process.env, PATH: path.dirname(process.execPath) },
+      },
+    );
+    assert.equal(result.status, 0, `expected exit 0; stderr:\n${result.stderr}`);
+    assert.equal(result.stdout.trim(), pkgVersion());
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
 test("CLI: `pipeline --version --json` emits version and commit_sha without inventing SHA", () => {
   const result = spawnSync(
     process.execPath,

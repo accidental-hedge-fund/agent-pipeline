@@ -105,6 +105,14 @@ function extractDocumentedPaths(template: string): Set<string> {
   return paths;
 }
 
+test("init template does not document live-role profile fallback (#1240)", () => {
+  const template = buildConfigTemplate();
+  assert.doesNotMatch(template, /falls back to the active profile/i);
+  assert.match(template, /^harnesses:/m);
+  assert.match(template, /^\s+implementer: /m);
+  assert.match(template, /^\s+reviewer: /m);
+});
+
 test("drift: every PartialConfigSchema property path is documented in the init template", () => {
   const schema = generateConfigSchema();
   const allPaths = collectSchemaPaths(schema, "");
@@ -331,7 +339,11 @@ for (const key of ADDED_KEYS) {
     const repo = makeTempRepo();
     const binDir = makeFakeGhBin("acme/uncomment-test");
     fs.mkdirSync(path.join(repo, ".github"), { recursive: true });
-    fs.writeFileSync(path.join(repo, ".github", "pipeline.yml"), `${uncommented}\n`, "utf8");
+    fs.writeFileSync(
+      path.join(repo, ".github", "pipeline.yml"),
+      `harnesses:\n  implementer: grok\n  reviewer: codex\n${uncommented}\n`,
+      "utf8",
+    );
 
     const oldPath = process.env.PATH;
     process.env.PATH = `${binDir}:${oldPath}`;

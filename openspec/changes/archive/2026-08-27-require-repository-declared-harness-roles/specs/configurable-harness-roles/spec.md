@@ -1,9 +1,4 @@
-# configurable-harness-roles Specification
-
-## Purpose
-Repository-level declaration of the implementer and reviewer harness roles. Execution requires both keys in `.github/pipeline.yml`. Every primary and secondary path uses the resolved pair, with pre-run validation and evidence of the pairing.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: The config schema SHALL accept a strict `harnesses` role block
 
@@ -59,97 +54,6 @@ The block SHALL appear in the generated config JSON Schema with a description fo
 - **THEN** execution-policy resolution SHALL fail with a diagnostic naming `harnesses.reviewer`
 - **AND** the live reviewer SHALL NOT be `my-reviewer` by fallback from `review_harness` or the profile
 
-### Requirement: Every primary-role execution path SHALL invoke the resolved implementer
-
-Every pipeline execution path whose work is implementation work SHALL invoke the resolved implementer
-harness and SHALL NOT name a harness literally. This SHALL cover, at minimum: planning and plan
-revision, implementation, each fix round, pre-merge repair, the eval fix round, the visual fix round,
-intake spec generation, sweep spec generation, spec refinement, coverage backfill, and roadmap
-dependency analysis.
-
-#### Scenario: Implementation paths target the configured implementer
-
-- **WHEN** the repository declares `implementer: grok` and the planning, implementing, fix,
-  pre-merge-repair, intake, and sweep paths each run with injected fakes
-- **THEN** each invocation SHALL target the `grok` harness
-
-#### Scenario: No primary path names a harness literally
-
-- **WHEN** a primary-role path constructs a harness invocation
-- **THEN** the harness SHALL be read from the resolved configuration
-- **AND** no primary-role path SHALL pass a literal harness name to the invocation
-
-#### Scenario: Spec-generation paths follow the role rather than a fixed harness
-
-- **WHEN** the repository declares an implementer that is not `claude` and intake or sweep generates a
-  spec
-- **THEN** the spec-generation invocation SHALL target the resolved implementer, not `claude`
-
----
-
-### Requirement: Every secondary-role execution path SHALL invoke the resolved reviewer
-
-Every pipeline execution path whose work is review work SHALL invoke the resolved reviewer harness. This
-SHALL cover, at minimum: plan review, each standard and adversarial review round, the pre-merge delta
-review, the shipcheck gate, and the design-interrogation gate. The existing same-harness self-review
-fallback SHALL be preserved: when the resolved reviewer cannot be spawned, the resolved implementer is
-attempted next, and the recorded reviewer identity SHALL mark that outcome as a same-harness fallback
-rather than as independent review.
-
-#### Scenario: Review paths target the configured reviewer
-
-- **WHEN** the repository declares `reviewer: codex` and plan review, review round 1, review round 2,
-  the pre-merge delta review, shipcheck, and the design gate each run with injected fakes
-- **THEN** each reviewer invocation SHALL target the `codex` harness
-
-#### Scenario: Independence is judged against the resolved roles
-
-- **WHEN** the resolved implementer and the resolved reviewer are different harnesses
-- **THEN** the recorded reviewer identity SHALL be marked independent
-
-#### Scenario: Same-harness fallback is preserved and labelled
-
-- **WHEN** the resolved reviewer cannot be spawned and the resolved implementer is used instead
-- **THEN** the review SHALL proceed on the implementer harness
-- **AND** the recorded reviewer identity SHALL be marked as a same-harness fallback
-
----
-
-### Requirement: Resolved role harnesses SHALL be validated before a run starts
-
-A harness name that resolves to no registered harness adapter SHALL be rejected at configuration-resolve
-time with a message naming the configuration key, the offending value, and the registered adapter names;
-no stage SHALL execute. For role names that do resolve, CLI presence, authentication state, and the
-ability to honor the requested model and effort SHALL be checked for **both** resolved roles by the
-existing harness-adapter readiness preflight before the first model invocation of a run. A readiness
-failure SHALL abort the run rather than substituting a different harness for the failing role.
-
-#### Scenario: Unregistered harness name is rejected at parse time
-
-- **WHEN** `harnesses.implementer` names a harness for which no adapter is registered
-- **THEN** configuration resolution SHALL fail with a message naming the key, the value, and the
-  registered adapter names
-- **AND** no stage SHALL execute
-
-#### Scenario: Both resolved roles are preflighted
-
-- **WHEN** the resolved implementer and reviewer are different harnesses and run-start preflight runs
-- **THEN** a readiness check SHALL be emitted for each of the two resolved role harnesses
-
-#### Scenario: An unauthenticated role harness blocks the run without substitution
-
-- **WHEN** a resolved role harness is installed but unauthenticated and run-start preflight is enabled
-- **THEN** the run SHALL abort before the first model invocation
-- **AND** no other harness SHALL be substituted for the failing role
-
-#### Scenario: A model or effort the role harness cannot honor is reported distinguishably
-
-- **WHEN** a resolved role harness is authenticated but cannot honor the configured model or effort
-- **THEN** the readiness outcome SHALL be distinguishable from the missing-CLI and unauthenticated
-  outcomes
-
----
-
 ### Requirement: Run evidence SHALL record the resolved roles, their sources, and treatment coordinates
 
 The run's evidence bundle SHALL record, for the run, the resolved implementer and the resolved reviewer, and for each role the source that determined it. For execution runs the live role source SHALL be the repository `harnesses` block (`repo-config`). Structured reviewer model, effort, and prompt-delivery MAY still be attributed to `review_harness` when that overlay is present and agrees. Execution-run evidence SHALL NOT record the active profile as the source of a live implementer or reviewer. Each harness invocation's recorded treatment coordinates — adapter name, CLI version, requested and resolved model, requested and resolved effort, and the native flags used — SHALL continue to be recorded, so a run's harness pairing and per-call treatment are auditable after the run ends. Recording SHALL remain non-fatal: a failure to record SHALL NOT fail the run.
@@ -176,42 +80,7 @@ The run's evidence bundle SHALL record, for the run, the resolved implementer an
 - **WHEN** writing the role or treatment record fails
 - **THEN** the run SHALL continue unaffected
 
-### Requirement: Harness role values SHALL resolve against the runtime registry and declared role capabilities
-
-`harnesses.implementer` and `harnesses.reviewer` values SHALL resolve against the runtime adapter
-registry rather than a fixed built-in name allowlist compiled into core. An implementer value
-SHALL name an adapter that is registered and that declares the implementer role capability. A
-reviewer value SHALL name either (a) a registered adapter that declares the reviewer role
-capability, or (b) a custom-reviewer command that is materialized through the extension
-compatibility path documented under `adapter-extension-registry` and
-`configurable-review-harness`. Config validation messages that list valid adapters SHALL use the
-runtime registry's current IDs.
-
-#### Scenario: Extension adapter assigned as implementer
-
-- **WHEN** a third-party adapter `ext-impl` is registered with the implementer role capability
-- **AND** `.github/pipeline.yml` sets `harnesses: { implementer: ext-impl }`
-- **THEN** `resolveConfig()` SHALL set the resolved implementer to `ext-impl`
-- **AND** validation SHALL succeed without core source changes
-
-#### Scenario: Extension adapter assigned as reviewer
-
-- **WHEN** a third-party adapter `ext-rev` is registered with the reviewer role capability
-- **AND** `.github/pipeline.yml` sets `harnesses: { reviewer: ext-rev }`
-- **THEN** `resolveConfig()` SHALL set the resolved reviewer to `ext-rev`
-
-#### Scenario: Unregistered implementer without compatibility path is rejected
-
-- **WHEN** `harnesses.implementer` names a string that is not registered and is not accepted as an
-  implementer via the documented compatibility rules
-- **THEN** configuration resolution SHALL fail with a message naming the value
-- **AND** the message SHALL list currently registered adapter IDs from the runtime registry
-
-#### Scenario: Error messages list runtime registry IDs including extensions
-
-- **WHEN** validation fails because an implementer name is unknown
-- **AND** an extension adapter is registered in addition to built-ins
-- **THEN** the error's registered-adapter list SHALL include the extension adapter ID
+## ADDED Requirements
 
 ### Requirement: Live implementer and reviewer roles SHALL resolve only from the repository harnesses block
 
@@ -233,3 +102,11 @@ Role resolution for execution SHALL set the live implementer from `harnesses.imp
 - **AND** configuration is resolved for execution
 - **THEN** resolution SHALL fail closed
 - **AND** the resolved reviewer SHALL NOT equal the active profile's reviewer
+
+## REMOVED Requirements
+
+### Requirement: Repository role configuration SHALL override the profile default per role
+
+**Reason**: Replaced by fail-closed repository declaration. Per-role profile fallback let an outer host select a live worker when either key was missing.
+
+**Migration**: Add both `harnesses.implementer` and `harnesses.reviewer` to `.github/pipeline.yml`. A partial block that previously inherited the missing role from the profile now fails until the omitted key is set. The replacement requirement is "Live implementer and reviewer roles SHALL resolve only from the repository harnesses block".

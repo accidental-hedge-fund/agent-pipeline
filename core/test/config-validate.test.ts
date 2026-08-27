@@ -19,14 +19,30 @@ import { DEFAULT_CONFIG } from "../scripts/types.ts";
 // ---------------------------------------------------------------------------
 
 /** Build ValidateConfigDeps that fakes a git root and a pipeline.yml. */
+const COMPLETE_HARNESSES = "harnesses:\n  implementer: grok\n  reviewer: codex\n";
+
+function withRequiredHarnesses(yamlContent: string): string {
+  if (/(?:^|\n)harnesses:/m.test(yamlContent)) return yamlContent;
+  if (!/^\s*[a-zA-Z_][\w.]*:/m.test(yamlContent)) return yamlContent;
+  const command =
+    yamlContent.match(/review_harness:\s*\n\s*command:\s*(\S+)/)?.[1] ??
+    yamlContent.match(/^review_harness:\s*(\S+)/m)?.[1];
+  const reviewer =
+    command && !/^(42|true|false)$/.test(command) ? command.replace(/['"]/g, "") : "codex";
+  const trimmed = yamlContent.endsWith("\n") ? yamlContent : `${yamlContent}\n`;
+  return `${trimmed}harnesses:\n  implementer: grok\n  reviewer: ${reviewer}\n`;
+}
+
 function makeDeps(
   yamlContent: string | null,
   harnesses = { implementer: "codex", reviewer: "claude" },
 ): ValidateConfigDeps {
+  const yaml =
+    yamlContent === null || yamlContent === "" ? yamlContent : withRequiredHarnesses(yamlContent);
   return {
     findGitRoot: (_start: string) => "/fake-repo",
     readFile: (fp: string) => {
-      if (fp.endsWith("pipeline.yml")) return yamlContent;
+      if (fp.endsWith("pipeline.yml")) return yaml;
       return null;
     },
     harnesses,
@@ -78,6 +94,29 @@ test("generateConfigSchema: openspec.enabled has correct enum", () => {
   const field = resolvePath(schema as Record<string, unknown>, "openspec.enabled") as Record<string, unknown> | undefined;
   assert.ok(field, "openspec.enabled must exist in schema");
   assert.deepEqual(field["enum"], ["auto", "on", "off"]);
+});
+
+test("generateConfigSchema: harnesses descriptions do not document live-role profile fallback (#1240)", () => {
+  const schema = generateConfigSchema() as Record<string, unknown>;
+  const harnesses = resolvePath(schema, "harnesses") as Record<string, unknown>;
+  const implementer = resolvePath(schema, "harnesses.implementer") as Record<string, unknown>;
+  const reviewer = resolvePath(schema, "harnesses.reviewer") as Record<string, unknown>;
+  assert.ok(harnesses);
+  assert.ok(implementer);
+  assert.ok(reviewer);
+  for (const [name, field] of [
+    ["harnesses", harnesses],
+    ["harnesses.implementer", implementer],
+    ["harnesses.reviewer", reviewer],
+  ] as const) {
+    const desc = String(field["description"] ?? "");
+    assert.ok(desc.length > 0, `${name} must have a description`);
+    assert.doesNotMatch(
+      desc,
+      /falls back to the active profile/i,
+      `${name} must not document live-role profile fallback`,
+    );
+  }
 });
 
 test("generateConfigSchema: all top-level properties carry a non-empty description", () => {
@@ -199,11 +238,59 @@ steps:
   assert.deepEqual(result.diagnostics, []);
 });
 
-test("validateConfig: empty file is valid (all defaults apply)", () => {
+test("validateConfig: empty file is an error naming both harness roles (#1240)", () => {
   const deps = makeDeps("");
   const result = validateConfig("/fake-repo", deps);
+  assert.equal(result.valid, false);
+  const err = result.diagnostics.find((d) => d.severity === "error");
+  assert.ok(err);
+  assert.match(err!.message, /harnesses\.implementer/);
+  assert.match(err!.message, /harnesses\.reviewer/);
+  assert.match(err!.message, /does not fill live workers/);
+});
+
+test("validateConfig: missing harnesses block is an error (#1240)", () => {
+  const raw: ValidateConfigDeps = {
+    findGitRoot: () => "/fake-repo",
+    readFile: (fp) => (fp.endsWith("pipeline.yml") ? "base_branch: main\n" : null),
+    harnesses: { implementer: "codex", reviewer: "claude" },
+  };
+  const result = validateConfig("/fake-repo", raw);
+  assert.equal(result.valid, false);
+  const err = result.diagnostics.find((d) => d.severity === "error");
+  assert.ok(err);
+  assert.match(err!.message, /harnesses\.implementer/);
+  assert.match(err!.message, /harnesses\.reviewer/);
+});
+
+test("validateConfig: missing implementer is an error (#1240)", () => {
+  const result = validateConfig("/fake-repo", makeDeps("harnesses:\n  reviewer: codex\n"));
+  assert.equal(result.valid, false);
+  const err = result.diagnostics.find((d) => d.severity === "error");
+  assert.ok(err);
+  assert.match(err!.message, /harnesses\.implementer/);
+  assert.match(err!.message, /does not fill live workers/);
+});
+
+test("validateConfig: missing reviewer is an error (#1240)", () => {
+  const result = validateConfig("/fake-repo", makeDeps("harnesses:\n  implementer: grok\n"));
+  assert.equal(result.valid, false);
+  const err = result.diagnostics.find((d) => d.severity === "error");
+  assert.ok(err);
+  assert.match(err!.message, /harnesses\.reviewer/);
+  assert.match(err!.message, /does not fill live workers/);
+});
+
+test("validateConfig: complete harness pair is valid for this class of diagnostic (#1240)", () => {
+  const result = validateConfig(
+    "/fake-repo",
+    makeDeps("harnesses:\n  implementer: grok\n  reviewer: codex\n"),
+  );
   assert.equal(result.valid, true);
-  assert.deepEqual(result.diagnostics, []);
+  assert.equal(
+    result.diagnostics.some((d) => d.severity === "error" && /harnesses\.(implementer|reviewer)/.test(d.message)),
+    false,
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -225,7 +312,8 @@ test("validateConfig: missing config file returns error diagnostic, does not thr
   assert.equal(diags.length, 1);
   assert.equal(diags[0]!.severity, "error");
   assert.equal(diags[0]!.path, "");
-  assert.ok(diags[0]!.message.includes("not found") || diags[0]!.message.includes("pipeline.yml"));
+  assert.ok(diags[0]!.message.includes("pipeline.yml"));
+  assert.ok(diags[0]!.message.includes("pipeline init"));
 });
 
 // ---------------------------------------------------------------------------
@@ -672,6 +760,44 @@ test("runConfigCommand: 'validate' subcommand with --json on non-existent repo w
   assert.ok("valid" in parsed, "output must have a 'valid' key");
   assert.ok("diagnostics" in parsed, "output must have a 'diagnostics' key");
   assert.equal(parsed["valid"], false); // no git root at /tmp/no-such-pipeline-repo-xyz
+});
+
+test("runConfigCommand: validate --json on missing reviewer exits 1 and names the key (#1240)", async () => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-validate-json-"));
+  fs.mkdirSync(path.join(dir, ".git"));
+  fs.mkdirSync(path.join(dir, ".github"));
+  fs.writeFileSync(
+    path.join(dir, ".github", "pipeline.yml"),
+    "harnesses:\n  implementer: grok\n",
+  );
+  const chunks: string[] = [];
+  const originalWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk: string | Uint8Array): boolean => {
+    chunks.push(String(chunk));
+    return true;
+  };
+  const prevExitCode = process.exitCode;
+  process.exitCode = undefined;
+  try {
+    await runConfigCommand(["validate"], { profile: "codex", json: true, repoPath: dir } as CliOpts);
+    const parsed = JSON.parse(chunks.join("")) as {
+      valid: boolean;
+      diagnostics: Array<{ severity: string; path: string; message: string }>;
+    };
+    assert.equal(parsed.valid, false);
+    assert.equal(process.exitCode, 1);
+    const err = parsed.diagnostics.find((d) => d.severity === "error");
+    assert.ok(err);
+    assert.match(err!.message, /harnesses\.reviewer/);
+    assert.match(err!.message, /does not fill live workers/);
+  } finally {
+    process.stdout.write = originalWrite;
+    process.exitCode = prevExitCode;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // ---------------------------------------------------------------------------

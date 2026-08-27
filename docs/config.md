@@ -430,19 +430,19 @@ Nested fields:
 ### `harnesses`
 
 - **Type:** object
-- **Description:** Repository-declared primary (implementer) and secondary (reviewer) harness roles. Either key may be omitted to keep the profile default for that role.
+- **Description:** Required repository execution policy: primary (implementer) and secondary (reviewer) harness roles. Both keys must be set before runnable work. The active profile does not fill a missing live role.
 
 Nested fields:
 
 #### `harnesses.implementer`
 
 - **Type:** string
-- **Description:** Primary harness that performs planning, implementation, and fixes. Must name a registered harness adapter that declares the implementer role (built-ins plus any adapter_extensions entries). Falls back to the active profile's implementer when omitted.
+- **Description:** Required repository execution policy: primary harness that performs planning, implementation, and fixes. Must name a registered harness adapter that declares the implementer role (built-ins plus any adapter_extensions entries). The active profile does not fill this role when omitted.
 
 #### `harnesses.reviewer`
 
 - **Type:** string
-- **Description:** Secondary harness that performs review. May name a registered adapter that declares the reviewer role, or an arbitrary custom reviewer CLI (compatibility path). Falls back to the active profile's reviewer (or review_harness, when set) when omitted.
+- **Description:** Required repository execution policy: secondary harness that performs review. May name a registered adapter that declares the reviewer role, or an arbitrary custom reviewer CLI (compatibility path). The active profile does not fill this role when omitted. review_harness is a structured overlay and does not replace this key.
 
 ### `implementation_timeout`
 
@@ -895,7 +895,7 @@ Nested fields:
 ### `review_harness`
 
 - **Type:** string | object
-- **Description:** Override the reviewer CLI for the review step (profile default when absent). Either a bare command string, or { command, model?, effort?, prompt_delivery? } for independent reviewer model/effort/prompt-delivery control. Unregistered names materialize through the adapter extension compatibility path (#783 / #40).
+- **Description:** Structured overlay on harnesses.reviewer for model/effort/prompt-delivery. Either a bare command string, or { command, model?, effort?, prompt_delivery? }. Does not replace harnesses.reviewer and does not take the live reviewer from the active profile. Unregistered names materialize through the adapter extension compatibility path (#783 / #40).
 
 ### `review_policy`
 

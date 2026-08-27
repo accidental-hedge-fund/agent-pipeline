@@ -28,6 +28,8 @@ function buildShimLayout(tmpDir: string, pipelineTsBody: string) {
   const shimSrc = fs.readFileSync(TEMPLATE_PATH, "utf8").replaceAll("__PROFILE__", "test");
   const shimPath = path.join(shimScriptsDir, "pipeline.mjs");
   fs.writeFileSync(shimPath, shimSrc);
+  const enginesNode = fileURLToPath(new URL("../../scripts/ensure-engines-node.mjs", import.meta.url));
+  fs.copyFileSync(enginesNode, path.join(shimScriptsDir, "ensure-engines-node.mjs"));
 
   fs.writeFileSync(path.join(tmpDir, "core", "package.json"), JSON.stringify({ version: "0.0.0-test" }));
   fs.writeFileSync(path.join(coreSrcDir, "pipeline.ts"), pipelineTsBody);

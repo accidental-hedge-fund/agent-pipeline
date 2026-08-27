@@ -625,15 +625,15 @@ domain_name: lyric-utils
 domain_description: a quantitative finance Python library
 ```
 
-If absent, defaults from `core/scripts/types.ts:DEFAULT_CONFIG` apply. By default the pipeline is harness-relative: the invoking host's profile supplies both roles (Claude Code primary + Codex secondary under the `claude` profile, and the reverse under `codex`). A repository can pin its own primary (implementer) and secondary (reviewer) harness pair, overriding the profile, via the optional `harnesses:` block:
+A runnable repository must commit `.github/pipeline.yml` with both live harness roles. Other omitted keys use `core/scripts/types.ts:DEFAULT_CONFIG`. The invoking host's profile does not select live workers. A missing file, missing `harnesses` block, or either missing role fails before any worktree, GitHub mutation, or harness spawn. `pipeline init` writes both keys as starter repository policy (copied from the active profile).
 
 ```yaml
 harnesses:
-  implementer: grok   # primary: planning, implementation, fixes, pre-merge repair, intake, sweep
-  reviewer: codex      # secondary: plan review, review rounds, pre-merge delta review, shipcheck, design gate
+  implementer: grok   # required: planning, implementation, fixes, pre-merge repair, intake, sweep
+  reviewer: codex      # required: plan review, review rounds, pre-merge delta review, shipcheck, design gate
 ```
 
-Either key may be omitted — an omitted role keeps the active profile's default for that role only. `implementer` must name a harness with a registered adapter that declares the **implementer** role capability (built-ins: `claude`, `codex`, `grok`, `opencode`, `pi`, plus any IDs from `adapter_extensions` below). An unregistered implementer name is rejected at config-parse time, naming the key, the value, and the **currently registered** adapter IDs from the runtime registry, before any worktree is created. `reviewer` may name a registered adapter that declares the **reviewer** role, or an arbitrary custom reviewer CLI (compatibility path), same as the older `review_harness` key below.
+Both keys are required repository execution policy. `implementer` must name a harness with a registered adapter that declares the **implementer** role capability (built-ins: `claude`, `codex`, `grok`, `opencode`, `pi`, plus any IDs from `adapter_extensions` below). An unregistered implementer name is rejected at config-parse time, naming the key, the value, and the **currently registered** adapter IDs from the runtime registry, before any worktree is created. `reviewer` may name a registered adapter that declares the **reviewer** role, or an arbitrary custom reviewer CLI (compatibility path). `review_harness` is a structured overlay and does not replace `harnesses.reviewer`.
 
 ### Outer-host lifecycle contract (#784)
 
@@ -665,10 +665,10 @@ Adapters declare role capabilities (`implementer` and/or `reviewer`), executable
 
 **Custom reviewer migration:** unregistered `review_harness` / `harnesses.reviewer` names still work via a thin **compatibility adapter** on the extension contract (PATH preflight, treatment identity marked `origin: compatibility`). A full package registration for the same ID wins over compatibility.
 
-The reviewer role MAY also be set (or overridden) via the optional `review_harness` key:
+The reviewer MAY also take structured overlay settings via `review_harness`. That key does not replace `harnesses.reviewer`; both must agree when they name a command:
 
 ```yaml
-review_harness: my-reviewer   # use a custom CLI as the reviewer instead of the profile default
+review_harness: my-reviewer   # must match harnesses.reviewer
 ```
 
 When `review_harness` is set, the pipeline invokes that command through the compatibility adapter (default `<value> "<prompt>"` on argv, or stdin when `prompt_delivery: stdin`) and expects a JSON verdict on stdout (same schema as the built-in reviewers). If the CLI cannot be spawned, the item is blocked with an error naming the CLI explicitly, and the implementing harness is tried as a self-review fallback (established by #39). When both `harnesses.reviewer` and `review_harness` are set, they must agree — naming the same command is accepted (and `review_harness`'s structured model/effort/prompt-delivery settings still apply); naming different commands is rejected at config-parse time, naming both keys and both values.

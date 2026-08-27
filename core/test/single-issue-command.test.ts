@@ -35,6 +35,47 @@ function driveResult(runId = "loop-single") {
   };
 }
 
+test("single fails closed on missing reviewer before issue, loop, or stdout work (#1240)", async () => {
+  let resolveCalls = 0;
+  let issueCalls = 0;
+  let loopCalls = 0;
+  let stdoutCalls = 0;
+  const deps: SingleIssueCommandDeps = {
+    resolveConfig: () => {
+      resolveCalls += 1;
+      throw new Error(
+        "Invalid /repo/.github/pipeline.yml: harnesses.reviewer is required repository execution policy. The active profile does not fill live workers.",
+      );
+    },
+    resolveIssueNumber: async () => {
+      issueCalls += 1;
+      throw new Error("should not resolve issue");
+    },
+    runLoopEngine: async () => {
+      loopCalls += 1;
+      throw new Error("should not run loop");
+    },
+    writeStdoutLine: () => {
+      stdoutCalls += 1;
+    },
+  };
+  const originalError = console.error;
+  const priorExitCode = process.exitCode;
+  console.error = () => {};
+  process.exitCode = undefined;
+  try {
+    const result = await runSingleIssueCommand("42", { profile: "claude" }, deps);
+    assert.equal(result.exitCode, 2);
+    assert.equal(resolveCalls, 1);
+    assert.equal(issueCalls, 0);
+    assert.equal(loopCalls, 0);
+    assert.equal(stdoutCalls, 0);
+  } finally {
+    console.error = originalError;
+    process.exitCode = priorExitCode;
+  }
+});
+
 test("single issue command routes the resolved issue through the durable one-item controller", async () => {
   let input: RunLoopEngineInput | undefined;
   const handoffs: string[] = [];

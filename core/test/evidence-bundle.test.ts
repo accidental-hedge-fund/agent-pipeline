@@ -119,12 +119,14 @@ test("createBundle: records resolved roles and their sources (#608)", async () =
       pr: null,
       branch: null,
       harnesses: ["grok", "codex"],
-      roles: { implementer: "grok", implementerSource: "repo-config", reviewer: "codex", reviewerSource: "profile" },
+      roles: { implementer: "grok", implementerSource: "repo-config", reviewer: "codex", reviewerSource: "repo-config" },
     },
     deps,
   );
   const onDisk = readState(files);
-  assert.deepEqual(onDisk.roles, { implementer: "grok", implementerSource: "repo-config", reviewer: "codex", reviewerSource: "profile" });
+  assert.deepEqual(onDisk.roles, { implementer: "grok", implementerSource: "repo-config", reviewer: "codex", reviewerSource: "repo-config" });
+  assert.notEqual(onDisk.roles?.implementerSource, "profile");
+  assert.notEqual(onDisk.roles?.reviewerSource, "profile");
 });
 
 test("createBundle: roles is absent from the persisted bundle when not supplied", async () => {
@@ -507,13 +509,14 @@ test("formatSummary: renders resolved roles and sources when present (#608)", as
       pr: null,
       branch: null,
       harnesses: ["grok", "codex"],
-      roles: { implementer: "grok", implementerSource: "repo-config", reviewer: "codex", reviewerSource: "profile" },
+      roles: { implementer: "grok", implementerSource: "repo-config", reviewer: "codex", reviewerSource: "repo-config" },
     },
     deps,
   );
   const out = formatSummary(readState(files));
   assert.match(out, /implementer=grok \(repo-config\)/);
-  assert.match(out, /reviewer=codex \(profile\)/);
+  assert.match(out, /reviewer=codex \(repo-config\)/);
+  assert.doesNotMatch(out, /reviewer=codex \(profile\)/);
 });
 
 test("formatSummary: partial run (no finalState) is labeled as such", () => {

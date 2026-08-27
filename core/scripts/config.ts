@@ -261,21 +261,22 @@ const PartialConfigSchema = z.object({
   ci_mode: z.enum(["github", "local"]).optional().describe("Source of pre-merge CI verification: github (default) waits on gh pr checks; local relies on the current run's local test-gate result and skips the GitHub Actions wait."),
   pre_merge_ci_assertion_fix: z.boolean().optional().describe("When true, allow one surgical implementer fix attempt per head SHA for assertion-classified pre-merge CI failures. Default false (opt-in)."),
   pre_merge_ci_rerun_enabled: z.boolean().optional().describe("When true (default), allow one automatic failed-workflow re-run per head SHA for infra/unknown pre-merge CI failures."),
-  // Repository-configurable primary/secondary harness roles (#608). Both keys
-  // are optional and independently fall back to the active profile's default
-  // when omitted — a repo can pin one role without the other. `implementer`
-  // must name a registered harness adapter (validated in resolveConfig, not
-  // here, since the registry is a runtime lookup); `reviewer` may additionally
-  // name an arbitrary custom reviewer CLI, same as `review_harness`. Strict so
-  // a typo'd key (e.g. `reviewr`) is rejected rather than silently ignored.
+  // Repository-declared primary/secondary harness roles (#608, #1240). Zod
+  // keys stay optional so omission is distinct from an unknown key or an
+  // empty string (`min(1)`). Execution-policy resolution requires both keys
+  // in a dedicated check — the active profile does not fill a missing role.
+  // `implementer` must name a registered harness adapter (validated in
+  // resolveConfig, not here); `reviewer` may additionally name an arbitrary
+  // custom reviewer CLI, same as `review_harness`. Strict so a typo'd key
+  // (e.g. `reviewr`) is rejected rather than silently ignored.
   harnesses: z
     .object({
-      implementer: z.string().min(1, "harnesses.implementer must not be empty").optional().describe("Primary harness that performs planning, implementation, and fixes. Must name a registered harness adapter that declares the implementer role (built-ins plus any adapter_extensions entries). Falls back to the active profile's implementer when omitted."),
-      reviewer: z.string().min(1, "harnesses.reviewer must not be empty").optional().describe("Secondary harness that performs review. May name a registered adapter that declares the reviewer role, or an arbitrary custom reviewer CLI (compatibility path). Falls back to the active profile's reviewer (or review_harness, when set) when omitted."),
+      implementer: z.string().min(1, "harnesses.implementer must not be empty").optional().describe("Required repository execution policy: primary harness that performs planning, implementation, and fixes. Must name a registered harness adapter that declares the implementer role (built-ins plus any adapter_extensions entries). The active profile does not fill this role when omitted."),
+      reviewer: z.string().min(1, "harnesses.reviewer must not be empty").optional().describe("Required repository execution policy: secondary harness that performs review. May name a registered adapter that declares the reviewer role, or an arbitrary custom reviewer CLI (compatibility path). The active profile does not fill this role when omitted. review_harness is a structured overlay and does not replace this key."),
     })
     .strict()
     .optional()
-    .describe("Repository-declared primary (implementer) and secondary (reviewer) harness roles. Either key may be omitted to keep the profile default for that role."),
+    .describe("Required repository execution policy: primary (implementer) and secondary (reviewer) harness roles. Both keys must be set before runnable work. The active profile does not fill a missing live role."),
   // Each alias is independently optional so a partial `models:` block (e.g.
   // only `review:`) is valid — resolveConfig fills the rest from DEFAULT_CONFIG
   // and the inert-alias warning keys off which sub-keys were explicitly set.
@@ -823,14 +824,13 @@ const PartialConfigSchema = z.object({
     .strict()
     .optional()
     .describe("Opt-in auto-file settings for durable-run-blocker clusters (#538). Typed blocker classification (#509) itself is unconditional; this block only controls auto-filing."),
-  // Optional override for the reviewer-role harness (#40). When set, the review
-  // step invokes this CLI instead of the profile's default reviewer. An arbitrary
-  // string (not an enum) because a custom reviewer CLI name is unconstrained;
-  // whether it actually exists is a runtime check (like test_gate/eval_gate
-  // `command`). The `harnesses.reviewer` key (#608) is an equivalent, more
-  // discoverable way to declare the same override; the two must agree when
-  // both are set (see `resolveHarnessRoles`) — see also `harnesses.implementer`
-  // for the primary role, which review_harness never touches.
+  // Structured overlay for the reviewer-role harness (#40, #1240). Does not
+  // replace `harnesses.reviewer` and does not take the live reviewer from the
+  // active profile. An arbitrary string (not an enum) because a custom reviewer
+  // CLI name is unconstrained; whether it actually exists is a runtime check
+  // (like test_gate/eval_gate `command`). When both name a command they must
+  // agree (see `resolveHarnessRoles`). `harnesses.reviewer` remains required
+  // for execution.
   // Structured form (#366) adds independent model/effort control for the
   // alternative reviewer harness, alongside the original string shorthand.
   // The string form leaves reviewerModel/reviewerEffort unset so review
@@ -840,7 +840,7 @@ const PartialConfigSchema = z.object({
       z.string(),
       z
         .object({
-          command: z.string().describe("Reviewer CLI command (profile default when the whole review_harness key is absent)."),
+          command: z.string().describe("Reviewer CLI command. Must agree with harnesses.reviewer when both are set; does not replace that required key."),
           model: modelOrAuto.optional().describe("Model override for the reviewer, or \"auto\"."),
           effort: modelOrAuto.optional().describe("Reasoning-effort override for the reviewer, or \"auto\" (resolved round-aware: review-1 Iterative, review-2/plan-review Definitive)."),
           // #492: prompt-delivery channel for a custom reviewer CLI. Default
@@ -853,7 +853,7 @@ const PartialConfigSchema = z.object({
         .strict(),
     ])
     .optional()
-    .describe("Override the reviewer CLI for the review step (profile default when absent). Either a bare command string, or { command, model?, effort?, prompt_delivery? } for independent reviewer model/effort/prompt-delivery control. Unregistered names materialize through the adapter extension compatibility path (#783 / #40)."),
+    .describe("Structured overlay on harnesses.reviewer for model/effort/prompt-delivery. Either a bare command string, or { command, model?, effort?, prompt_delivery? }. Does not replace harnesses.reviewer and does not take the live reviewer from the active profile. Unregistered names materialize through the adapter extension compatibility path (#783 / #40)."),
   // #783: explicit end-user adapter extension entry points. Only listed modules
   // are loaded — never auto-scanned from node_modules. Each entry is a
   // repo-relative path (./…), absolute path, or package name that exports a
@@ -1404,49 +1404,66 @@ export interface ResolvedHarnessRoles {
   reviewerSource: HarnessRoleSource;
 }
 
+const ACTIVE_PROFILE_DOES_NOT_FILL_LIVE_WORKERS =
+  "The active profile does not fill live workers.";
+
+/** Keys absent from a parsed `harnesses` block (omission, not empty string). */
+export function omittedHarnessRoleKeys(
+  fileConfig: Pick<PartialConfig, "harnesses">,
+): string[] {
+  const missing: string[] = [];
+  if (fileConfig.harnesses?.implementer === undefined) missing.push("harnesses.implementer");
+  if (fileConfig.harnesses?.reviewer === undefined) missing.push("harnesses.reviewer");
+  return missing;
+}
+
+export function omittedHarnessRolesMessage(missing: string[]): string {
+  return (
+    `${missing.join(" and ")} ${missing.length === 1 ? "is" : "are"} required repository execution policy. ` +
+    ACTIVE_PROFILE_DOES_NOT_FILL_LIVE_WORKERS
+  );
+}
+
+export function missingPipelineYmlMessage(configPath: string): string {
+  return (
+    `Missing required execution policy file: ${configPath}. ` +
+    `Run \`pipeline init\` to create it with both harnesses.implementer and harnesses.reviewer. ` +
+    `The active profile does not select live workers.`
+  );
+}
+
 /**
- * Resolve the implementer/reviewer harness roles (#608): the repository's
- * strict `harnesses:` block wins per-role over the active profile, and
- * `review_harness` may additionally supply the reviewer (agreeing with
- * `harnesses.reviewer` when both are set). Disagreement between
- * `harnesses.reviewer` and `review_harness` is a config bug the operator must
- * see, not a silent precedence pick — see design.md decision 3 of
- * `repo-configurable-harness-roles`.
+ * Resolve live implementer/reviewer roles (#608, #1240): both come from the
+ * repository `harnesses:` block. `review_harness` is a structured overlay that
+ * must agree with `harnesses.reviewer` when both name a command; it does not
+ * supply a missing live reviewer. The active profile never fills a missing
+ * live role. Disagreement is a config bug the operator must see, not a silent
+ * precedence pick.
  */
 function resolveHarnessRoles(
   fileConfig: Pick<PartialConfig, "harnesses" | "review_harness">,
-  profileHarnesses: { implementer: string; reviewer: string },
 ): ResolvedHarnessRoles {
-  const repoImplementer = fileConfig.harnesses?.implementer;
-  const repoReviewer = fileConfig.harnesses?.reviewer;
+  const missing = omittedHarnessRoleKeys(fileConfig);
+  if (missing.length > 0) {
+    throw new Error(omittedHarnessRolesMessage(missing));
+  }
+  const repoImplementer = fileConfig.harnesses!.implementer as string;
+  const repoReviewer = fileConfig.harnesses!.reviewer as string;
   const reviewHarnessCfg = fileConfig.review_harness;
   const reviewHarnessCommand = typeof reviewHarnessCfg === "string" ? reviewHarnessCfg : reviewHarnessCfg?.command;
 
-  let reviewer: string;
-  let reviewerSource: HarnessRoleSource;
-  if (repoReviewer !== undefined && reviewHarnessCommand !== undefined) {
-    if (repoReviewer !== reviewHarnessCommand) {
-      throw new Error(
-        `harnesses.reviewer ("${repoReviewer}") and review_harness ("${reviewHarnessCommand}") name different reviewer commands. Set them to the same command, or configure only one.`,
-      );
-    }
-    reviewer = repoReviewer;
-    reviewerSource = "repo-config";
-  } else if (repoReviewer !== undefined) {
-    reviewer = repoReviewer;
-    reviewerSource = "repo-config";
-  } else if (reviewHarnessCommand !== undefined) {
-    reviewer = reviewHarnessCommand;
-    reviewerSource = "review_harness";
-  } else {
-    reviewer = profileHarnesses.reviewer;
-    reviewerSource = "profile";
+  if (reviewHarnessCommand !== undefined && repoReviewer !== reviewHarnessCommand) {
+    throw new Error(
+      `harnesses.reviewer ("${repoReviewer}") and review_harness ("${reviewHarnessCommand}") name different reviewer commands. Set them to the same command, or configure only one.`,
+    );
   }
 
-  const implementer = repoImplementer ?? profileHarnesses.implementer;
-  const implementerSource: HarnessRoleSource = repoImplementer !== undefined ? "repo-config" : "profile";
-
-  return { implementer, reviewer, implementerSource, reviewerSource };
+  return {
+    implementer: repoImplementer,
+    reviewer: repoReviewer,
+    implementerSource: "repo-config",
+    reviewerSource: "repo-config",
+  };
 }
 
 /**
@@ -1612,13 +1629,6 @@ export interface ResolveOptions {
 }
 
 /**
- * Resolve a PipelineConfig from cwd or explicit repoPath:
- *   1. Walk up from repoPath / cwd to find a .git dir → that's the repo root.
- *   2. Discover owner/name via `gh repo view`.
- *   3. If `<repo>/.github/pipeline.yml` exists, parse + validate; merge with defaults.
- *   4. CLI overrides (baseBranch) win.
- */
-/**
  * Merge partial/omitted `pre_code_attestation` file config with defaults (#575).
  * Omitted block → enabled false and documented defaults for remaining fields.
  */
@@ -1719,6 +1729,14 @@ export function resolvePreCodeAttestationConfig(
   };
 }
 
+/**
+ * Resolve a PipelineConfig from cwd or explicit repoPath:
+ *   1. Walk up from repoPath / cwd to find a .git dir → that's the repo root.
+ *   2. Load `<repo>/.github/pipeline.yml`. Execution requires the file plus both
+ *      harnesses.implementer and harnesses.reviewer (init may tolerate absence).
+ *   3. Discover owner/name via `gh repo view`.
+ *   4. Merge remaining keys with defaults. CLI overrides (baseBranch) win.
+ */
 export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
   const profile = loadProfile(opts.profile ?? process.env.PIPELINE_PROFILE ?? "codex");
   const startDir = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
@@ -1733,9 +1751,13 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
   // detected and incorporated into tolerateGhFailure. Without this ordering a
   // repo with doctor.runOnStart: true would still exit via the generic config-
   // error path when gh is missing/auth-expired — before the preflight gate ran.
+  // The execution-policy harness-role gate also runs here, before gh, so a
+  // missing or partial declaration fails before any GitHub call, worktree, or
+  // harness spawn (#1240).
   const configPath = path.join(repoDir, ".github", "pipeline.yml");
+  const configExists = fs.existsSync(configPath);
   let fileConfig: z.infer<typeof PartialConfigSchema> = {};
-  if (fs.existsSync(configPath)) {
+  if (configExists) {
     const text = fs.readFileSync(configPath, "utf8");
     const parsed = yaml.load(text);
     if (parsed && typeof parsed === "object") {
@@ -1768,6 +1790,16 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
           }
         }
       }
+    }
+  }
+
+  if (!opts.tolerateInvalidConfig) {
+    if (!configExists) {
+      throw new Error(missingPipelineYmlMessage(configPath));
+    }
+    const missingRoles = omittedHarnessRoleKeys(fileConfig);
+    if (missingRoles.length > 0) {
+      throw new Error(`Invalid ${configPath}: ${omittedHarnessRolesMessage(missingRoles)}`);
     }
   }
 
@@ -1836,16 +1868,16 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
       }
     : undefined;
 
-  // Harness role resolution (#608): repo `harnesses:` block wins per-role over
-  // the active profile; `review_harness` may additionally supply the reviewer
-  // (agreeing with `harnesses.reviewer` when both are set). A conflicting
+  // Harness role resolution (#608, #1240): live implementer/reviewer come
+  // only from the repository `harnesses:` block. `review_harness` is a
+  // structured overlay that must agree with `harnesses.reviewer`. A conflicting
   // reviewer declaration or an implementer naming no registered adapter fails
-  // here, at config-resolve time, same as every other structural config error
-  // in this function — tolerated (warn + fall back to the profile pair) only
-  // when the caller opted into tolerateInvalidConfig.
+  // here, at config-resolve time. Init (`tolerateInvalidConfig`) may still
+  // scaffold from the active profile pair so it can create a missing file;
+  // that pair is never used as live workers on the execution path.
   let resolvedRoles: ResolvedHarnessRoles;
   try {
-    resolvedRoles = resolveHarnessRoles(fileConfig, profile.harnesses);
+    resolvedRoles = resolveHarnessRoles(fileConfig);
     validateImplementerHarness(resolvedRoles.implementer, resolvedRoles.implementerSource);
     validateReviewerHarness(resolvedRoles.reviewer, resolvedRoles.reviewerSource);
   } catch (err) {
@@ -1911,13 +1943,11 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
       fileConfig.pre_merge_ci_assertion_fix ?? DEFAULT_CONFIG.pre_merge_ci_assertion_fix,
     pre_merge_ci_rerun_enabled:
       fileConfig.pre_merge_ci_rerun_enabled ?? DEFAULT_CONFIG.pre_merge_ci_rerun_enabled,
-    // Harness roles are resolved per-role (#608): the repository's
-    // `harnesses:` block wins over the active profile for each of
-    // implementer/reviewer independently; `review_harness` may additionally
-    // supply the reviewer. `resolvedRoles` above already folds in that
-    // precedence (and rejects a conflicting `review_harness`/
-    // `harnesses.reviewer` pair), so every stage keeps reading only
-    // `cfg.harnesses.{implementer,reviewer}` with no profile awareness.
+    // Live harness roles come only from the repository `harnesses:` block
+    // (#1240). `review_harness` may overlay structured reviewer settings when
+    // it agrees with `harnesses.reviewer`. The active profile is not a live
+    // worker source. Every stage keeps reading only
+    // `cfg.harnesses.{implementer,reviewer}`.
     // reviewerModel is fully resolved (Adversarial `auto` is model-invariant
     // across rounds); reviewerEffort is left as-authored (possibly "auto")
     // since its resolution is round-aware and happens at each reviewer call site.
@@ -2997,7 +3027,7 @@ export function validateConfig(
     diagnostics.push({
       severity: "error",
       path: "",
-      message: `Config file not found: ${configPath}`,
+      message: missingPipelineYmlMessage(configPath),
     });
     return { valid: false, diagnostics };
   }
@@ -3021,10 +3051,16 @@ export function validateConfig(
     return { valid: false, diagnostics };
   }
 
-  // 4. Null YAML (empty file, "---", "~", "null") is valid (no overrides applied).
-  // Any other non-object root (scalar, boolean, number, sequence) is an error.
+  // 4. Null YAML (empty file, "---", "~", "null") has no harnesses block.
+  // Execution policy requires both live roles (#1240). Any other non-object
+  // root (scalar, boolean, number, sequence) is an error.
   if (parsed == null) {
-    return { valid: true, diagnostics: [] };
+    diagnostics.push({
+      severity: "error",
+      path: "harnesses",
+      message: omittedHarnessRolesMessage(["harnesses.implementer", "harnesses.reviewer"]),
+    });
+    return { valid: false, diagnostics };
   }
   if (typeof parsed !== "object" || Array.isArray(parsed)) {
     diagnostics.push({
@@ -3072,23 +3108,31 @@ export function validateConfig(
     return { valid: false, diagnostics };
   }
 
-  // 6. Harness role resolution + inert-model / inert-effort alias detection
+  // 6. Required live-role declaration + inert-model / inert-effort alias detection
   const fileConfig = result.data;
   {
+    const missingRoles = omittedHarnessRoleKeys(fileConfig);
+    if (missingRoles.length > 0) {
+      diagnostics.push({
+        severity: "error",
+        path: missingRoles.length === 2 ? "harnesses" : missingRoles[0]!,
+        message: omittedHarnessRolesMessage(missingRoles),
+      });
+    }
     let profileHarnesses = deps.harnesses;
     if (!profileHarnesses) {
       try {
         const profileName = deps.profile ?? process.env.PIPELINE_PROFILE ?? "codex";
         profileHarnesses = loadProfile(profileName).harnesses;
       } catch {
-        // Profile unavailable — skip role resolution and inert warnings rather than failing.
+        // Profile unavailable — skip inert warnings rather than failing.
         profileHarnesses = undefined;
       }
     }
-    if (profileHarnesses) {
+    if (profileHarnesses && missingRoles.length === 0) {
       let resolvedRoles: ResolvedHarnessRoles | undefined;
       try {
-        resolvedRoles = resolveHarnessRoles(fileConfig, profileHarnesses);
+        resolvedRoles = resolveHarnessRoles(fileConfig);
         validateImplementerHarness(resolvedRoles.implementer, resolvedRoles.implementerSource);
         validateReviewerHarness(resolvedRoles.reviewer, resolvedRoles.reviewerSource);
       } catch (err) {
@@ -3098,7 +3142,10 @@ export function validateConfig(
           message: (err as Error).message,
         });
       }
-      const harnesses = resolvedRoles ?? { implementer: profileHarnesses.implementer, reviewer: profileHarnesses.reviewer };
+      const harnesses = resolvedRoles ?? {
+        implementer: fileConfig.harnesses!.implementer as string,
+        reviewer: fileConfig.harnesses!.reviewer as string,
+      };
       if (fileConfig.models) {
         for (const { key, role } of MODEL_ALIAS_ROLES) {
           const value = fileConfig.models[key];
@@ -3308,32 +3355,31 @@ function renderEffortLines(effort: PartialConfig["effort"]): string {
   ].join("\n");
 }
 
-/** Render the `harnesses:` role block (#608) — implementer/reviewer, each
- *  independently active or commented-out, so a repo can pin one role while
- *  leaving the other at the profile default. Documented-inactive commentary
- *  when the block is entirely absent from the config, matching the pattern
- *  every other optional block in this template follows. */
+/** Render the `harnesses:` role block (#608, #1240). Both keys are required
+ *  repository execution policy. Init writes them as active starter values.
+ *  Sync preserves an existing complete pair and does not invent a missing
+ *  live role from the profile. */
 function renderHarnessesBlock(harnesses: PartialConfig["harnesses"]): string {
-  const topDescription = sd("harnesses", "Repository-declared primary (implementer) and secondary (reviewer) harness roles.");
-  const implementerDesc = sd("harnesses.implementer", "Primary harness that performs planning, implementation, and fixes.");
-  const reviewerDesc = sd("harnesses.reviewer", "Secondary harness that performs review.");
+  const topDescription = sd("harnesses", "Required repository execution policy: primary (implementer) and secondary (reviewer) harness roles.");
+  const implementerDesc = sd("harnesses.implementer", "Required repository execution policy: primary harness that performs planning, implementation, and fixes.");
+  const reviewerDesc = sd("harnesses.reviewer", "Required repository execution policy: secondary harness that performs review.");
   if (harnesses === undefined) {
     return [
-      `# harnesses: # ${topDescription}`,
-      `#   implementer: grok # ${implementerDesc} Falls back to the active profile's implementer when omitted.`,
-      `#   reviewer: codex # ${reviewerDesc} Falls back to the active profile's reviewer (or review_harness) when omitted.`,
+      `# harnesses: # ${topDescription} Both keys are required before runnable work. The active profile does not fill a missing live role.`,
+      `#   implementer: grok # ${implementerDesc}`,
+      `#   reviewer: codex # ${reviewerDesc}`,
     ].join("\n");
   }
   const lines = [`harnesses: # ${topDescription}`];
   lines.push(
     harnesses.implementer !== undefined
       ? `  implementer: ${yamlScalar(harnesses.implementer)} # ${implementerDesc}`
-      : `  # implementer: grok # ${implementerDesc} Falls back to the active profile's implementer when omitted.`,
+      : `  # implementer: grok # ${implementerDesc} Required; omitted roles fail closed rather than taking a profile value.`,
   );
   lines.push(
     harnesses.reviewer !== undefined
       ? `  reviewer: ${yamlScalar(harnesses.reviewer)} # ${reviewerDesc}`
-      : `  # reviewer: codex # ${reviewerDesc} Falls back to the active profile's reviewer (or review_harness) when omitted.`,
+      : `  # reviewer: codex # ${reviewerDesc} Required; omitted roles fail closed rather than taking a profile value.`,
   );
   return lines.join("\n");
 }
@@ -3365,7 +3411,7 @@ function renderAdapterExtensionsBlock(
 function renderReviewHarnessBlock(reviewHarness: PartialConfig["review_harness"]): string {
   const topDescription = sd(
     "review_harness",
-    "Override the reviewer CLI for the review step (profile default when absent).",
+    "Structured overlay on harnesses.reviewer (model/effort/prompt-delivery). Does not replace that required key.",
   );
   if (reviewHarness === undefined) {
     return `# review_harness: my-reviewer # ${topDescription} The CLI receives the JSON-verdict prompt as a positional arg and must print a fenced JSON verdict block on stdout. The implementer harness is not configurable.\n#   Or a structured form for independent reviewer model/effort/prompt-delivery control:\n# review_harness:\n#   command: my-reviewer\n#   model: auto # or an explicit alias\n#   effort: auto # or an explicit level (round-aware: review-1 Iterative, review-2/plan-review Definitive)\n#   prompt_delivery: argv # or \"stdin\" if the CLI reads its prompt from standard input (avoids the OS per-argument size limit)`;
@@ -4472,14 +4518,17 @@ export function syncConfig(
  * Uses exclusive-create (`flag: "wx"`) so a concurrent second call never
  * clobbers an existing file — EEXIST → { created: false }.
  */
-export async function scaffoldDefaultConfig(repoDir: string): Promise<{ created: boolean }> {
+export async function scaffoldDefaultConfig(
+  repoDir: string,
+  opts: { profile?: string; harnesses?: { implementer: string; reviewer: string } } = {},
+): Promise<{ created: boolean }> {
   const configDir = path.join(repoDir, ".github");
   const configPath = path.join(configDir, "pipeline.yml");
 
   fs.mkdirSync(configDir, { recursive: true });
 
   try {
-    fs.writeFileSync(configPath, buildConfigTemplate(), { flag: "wx" });
+    fs.writeFileSync(configPath, buildConfigTemplate(opts), { flag: "wx" });
     return { created: true };
   } catch (err) {
     const e = err as NodeJS.ErrnoException;
@@ -4488,8 +4537,16 @@ export async function scaffoldDefaultConfig(repoDir: string): Promise<{ created:
   }
 }
 
-export function buildConfigTemplate(): string {
-  return renderConfigTemplate({}, "init");
+export function buildConfigTemplate(
+  opts: { profile?: string; harnesses?: { implementer: string; reviewer: string } } = {},
+): string {
+  const pair =
+    opts.harnesses ??
+    loadProfile(opts.profile ?? process.env.PIPELINE_PROFILE ?? "codex").harnesses;
+  return renderConfigTemplate(
+    { harnesses: { implementer: pair.implementer, reviewer: pair.reviewer } },
+    "init",
+  );
 }
 
 // ---------------------------------------------------------------------------

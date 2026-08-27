@@ -242,6 +242,27 @@ test("handlePathSubcommand: npm-ENOENT probe error sets exit code 1", async (t) 
 // 5. pipeline path --json handler
 // ---------------------------------------------------------------------------
 
+test("handlePathSubcommand: succeeds without .github/pipeline.yml (#1240)", async (t) => {
+  const fakeResult: DiscoveryResult = {
+    corePath: FAKE_CORE_PATH,
+    version: FAKE_VERSION,
+    hostCoverage: "both",
+    hosts: {
+      claude: { available: true, cliBin: "/usr/bin/claude" },
+      codex: { available: true, cliBin: "/usr/bin/codex" },
+      opencode: { ...OPENCODE_ABSENT },
+    },
+  };
+  const logged: string[] = [];
+  t.mock.method(console, "log", (msg: string) => logged.push(msg));
+  const deps: PathSubcommandDeps = {
+    discoverHosts: async () => fakeResult,
+  };
+  await handlePathSubcommand({ json: true }, deps);
+  assert.equal(logged.length, 1);
+  assert.doesNotThrow(() => JSON.parse(logged[0]!));
+});
+
 test("handlePathSubcommand --json: serialises DiscoveryResult as valid JSON", async (t) => {
   const fakeResult: DiscoveryResult = {
     corePath: FAKE_CORE_PATH,
