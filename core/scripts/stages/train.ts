@@ -343,6 +343,51 @@ export function isReadyToDeploySnapshot(s: TrainIssueSnapshot): boolean {
   return pipelineStageFromLabels(s.labels) === "ready-to-deploy";
 }
 
+/** gh `issue list --limit` cap shared by train `--milestone` and ship freeze. */
+export const MILESTONE_ISSUE_DISCOVERY_LIMIT = 200;
+
+/**
+ * Freeze-eligible work-list members (#1252): open non-backlog issues plus
+ * closed `pipeline:ready-to-deploy`. Freeze admits; train merge-mode still
+ * classifies `already-integrated` vs no-open-PR / containment.
+ */
+export function isFreezeEligibleIssue(s: TrainIssueSnapshot): boolean {
+  const stage = pipelineStageFromLabels(s.labels);
+  if (s.state === "closed") return stage === "ready-to-deploy";
+  return stage !== "backlog";
+}
+
+export function selectFreezeEligibleIssues(
+  snapshots: readonly TrainIssueSnapshot[],
+): TrainIssueSnapshot[] {
+  return snapshots.filter(isFreezeEligibleIssue);
+}
+
+export function emptyFreezeEligibleMilestoneError(
+  milestone: string,
+  source: "train" | "ship" = "train",
+): string {
+  const prefix = source === "ship" ? "ship train: " : "";
+  return `${prefix}milestone ${JSON.stringify(milestone)} has no freeze-eligible issues`;
+}
+
+export function assertMilestoneIssueDiscoveryLimit(
+  listedCount: number,
+  milestone: string,
+  source: "train" | "ship" = "train",
+): void {
+  if (listedCount < MILESTONE_ISSUE_DISCOVERY_LIMIT) return;
+  const prefix = source === "ship" ? "ship train: " : "";
+  const suffix =
+    source === "ship"
+      ? "split the milestone or add paginated discovery before authorizing a shipment"
+      : "split the milestone or add paginated discovery";
+  throw new Error(
+    `${prefix}milestone ${JSON.stringify(milestone)} reached the 200-issue discovery limit; ` +
+      suffix,
+  );
+}
+
 export function isBlockedOrNeedsHumanSnapshot(s: TrainIssueSnapshot): boolean {
   return s.labels.includes("blocked") || pipelineStageFromLabels(s.labels) === "needs-human";
 }
@@ -506,9 +551,11 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
       snapshots.push(await deps.getIssue(n));
     }
   } else if (opts.milestone && opts.milestone.trim() !== "") {
-    snapshots = await deps.listMilestoneIssues(opts.milestone.trim());
+    snapshots = selectFreezeEligibleIssues(
+      await deps.listMilestoneIssues(opts.milestone.trim()),
+    );
     if (snapshots.length === 0) {
-      throw new Error(`milestone ${JSON.stringify(opts.milestone)} has no open issues`);
+      throw new Error(emptyFreezeEligibleMilestoneError(opts.milestone));
     }
   } else {
     throw new Error(
@@ -1114,9 +1161,9 @@ export function realTrainDeps(opts: {
           "--milestone",
           milestone,
           "--state",
-          "open",
+          "all",
           "--limit",
-          "200",
+          String(MILESTONE_ISSUE_DISCOVERY_LIMIT),
           "--json",
           "number,title,body,labels,state",
         ],
@@ -1129,13 +1176,16 @@ export function realTrainDeps(opts: {
         labels: Array<{ name: string }>;
         state: string;
       }>;
-      return rows.map((r) => ({
-        number: r.number,
-        title: r.title ?? "",
-        body: r.body ?? "",
-        labels: (r.labels ?? []).map((l) => l.name),
-        state: r.state === "CLOSED" || r.state === "closed" ? "closed" : "open",
-      }));
+      assertMilestoneIssueDiscoveryLimit(rows.length, milestone, "train");
+      return selectFreezeEligibleIssues(
+        rows.map((r) => ({
+          number: r.number,
+          title: r.title ?? "",
+          body: r.body ?? "",
+          labels: (r.labels ?? []).map((l) => l.name),
+          state: r.state === "CLOSED" || r.state === "closed" ? "closed" : "open",
+        })),
+      );
     },
 
     async getIssue(issue) {

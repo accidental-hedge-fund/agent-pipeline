@@ -141,7 +141,22 @@ never ran. Notify is still best-effort (exit 0 after failure); ship/train do
 not block solely on messenger delivery. Reinstall `ship-notify` from
 `examples/supervisor/shell/` after `main` moves (same install loop as Tugboat).
 
-Issues on the milestone must be `pipeline:ready` before train dispatch.
+Freeze-eligible issues are open non-backlog pipeline issues **and** closed
+issues labeled `pipeline:ready-to-deploy`. An all-integrated milestone does
+**not** stop at `no open issues to freeze`. Train records those closed items
+`already-integrated` and ship proceeds to FRG / release. Mixed milestones
+merge still-open ready-to-deploy PRs in the same run.
+
+Missing FRG evidence is recovered on a native-`/goal` engine:
+
+```bash
+pipeline loop --label factory-gate --profile claude
+pipeline factory-gate --for <X.Y.Z> --from-run <loop-run-id>
+```
+
+`--skip-frg` / `TUGBOAT_SKIP_FRG=1` is an operator escape only (non-production
+`no-frg-*` pin). It is not the default and is not the implied recovery for a
+non-claude profile.
 
 ### Phase sequence (fixed)
 

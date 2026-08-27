@@ -2556,9 +2556,101 @@ export async function lookupFrgPass(
   }
 }
 
+/** Documented native-`/goal` engine for the factory-gate pack loop (#1252). */
+export const FRG_PACK_LOOP_NATIVE_GOAL_PROFILE = "claude";
+
+export function frgPackLoopCommand(): string {
+  return `pipeline loop --label factory-gate --profile ${FRG_PACK_LOOP_NATIVE_GOAL_PROFILE}`;
+}
+
+export function frgScorerFromRunCommand(version: string): string {
+  return `pipeline factory-gate --for ${normalizeFrgVersion(version)} --from-run <loop-run-id>`;
+}
+
+/**
+ * Shared next-command block for missing / unparsable / ineligible FRG evidence.
+ * Pack loop + native-`/goal` profile first; scorer `--from-run` second.
+ * Optional extras (e.g. `factory-release prepare`) follow. `--skip-frg` last.
+ */
+export function formatMissingFrgRecoveryCommands(opts: {
+  version: string;
+  extraLines?: readonly string[];
+  includeSkipEscape?: boolean;
+}): string {
+  const v = normalizeFrgVersion(opts.version);
+  const lines = [
+    `    ${frgPackLoopCommand()}`,
+    `    ${frgScorerFromRunCommand(v)}`,
+    ...(opts.extraLines ?? []).map((line) =>
+      line.startsWith("    ") ? line : `    ${line}`,
+    ),
+  ];
+  if (opts.includeSkipEscape) {
+    lines.push(
+      "    Escape (non-production no-frg-* pin; not a substitute for the pack loop): pipeline release --skip-frg",
+    );
+  }
+  return lines.join("\n");
+}
+
+function frgRecoveryFooter(version: string, includeSkipEscape: boolean): string {
+  return (
+    `Run the factory-gate pack on a native-/goal engine, then score it:\n` +
+    formatMissingFrgRecoveryCommands({ version, includeSkipEscape }) +
+    `\nSee docs/factory-reliability-gate-runbook.md.`
+  );
+}
+
+export function missingFrgPassDiagnostic(opts: {
+  version: string;
+  path: string;
+}): string {
+  const v = normalizeFrgVersion(opts.version);
+  return (
+    `[pipeline release] Factory Reliability Gate pass missing for version ${v} ` +
+    `(expected ${opts.path}). ` +
+    `Unit CI alone is not sufficient. ` +
+    frgRecoveryFooter(v, true)
+  );
+}
+
+export function factoryGateMissingFromRunUsage(): string {
+  return (
+    "pipeline factory-gate: provide --from-run <loop-run-id> after a durable pack loop finishes.\n" +
+      "  1) Start the pack via shipped durable loop on a native-/goal engine (no second ledger):\n" +
+      `       ${frgPackLoopCommand()}\n` +
+      "     (or --milestone <reliability-pack> — not the full product milestone)\n" +
+      "  2) Score + write evidence:\n" +
+      "       pipeline factory-gate --for <X.Y.Z> --from-run <loop-run-id> [--json]\n" +
+      "  See docs/factory-reliability-gate-runbook.md"
+  );
+}
+
+export function shipMissingFrgDiagnostic(opts: {
+  version: string;
+  includePrepare?: boolean;
+}): string {
+  const v = normalizeFrgVersion(opts.version);
+  const extra = opts.includePrepare
+    ? [
+        "pipeline factory-release prepare --request <absolute-off-repo-request.json> --json",
+      ]
+    : [];
+  return (
+    `ship FRG: no release-eligible candidate artifact for v${v}. ` +
+    `Unit CI alone is not sufficient. ` +
+    `Run the factory-gate pack on a native-/goal engine, then score it:\n` +
+    formatMissingFrgRecoveryCommands({ version: v, extraLines: extra }) +
+    (opts.includePrepare
+      ? `\nPrepare is an additional durable path (it does not replace the loop + profile + --from-run commands). ` +
+        `Hybrid pilot remains valid only for exactly v${FRG_HYBRID_PILOT_VERSION}.`
+      : "")
+  );
+}
+
 /**
  * Release-path gate: require a pass artifact for the resolved version.
- * Throws with a message that names the version and how to run the FRG driver.
+ * Throws with a message that names the version and the runnable pack path.
  */
 export async function requireFrgPassForRelease(
   repoDir: string,
@@ -2572,24 +2664,17 @@ export async function requireFrgPassForRelease(
     throw new Error(
       `[pipeline release] Factory Reliability Gate FAILED for version ${v} ` +
         `(run_id=${result.evidence.run_id}). ` +
-        `See docs/factory-reliability-gate-runbook.md and re-run: ` +
-        `pipeline factory-gate --for ${v}`,
+        frgRecoveryFooter(v, true),
     );
   }
   if (result.kind === "unparsable") {
     throw new Error(
       `[pipeline release] Factory Reliability Gate evidence for version ${v} is unparsable ` +
         `(${result.path}): ${result.detail}. ` +
-        `See docs/factory-reliability-gate-runbook.md and re-run: ` +
-        `pipeline factory-gate --for ${v}`,
+        frgRecoveryFooter(v, true),
     );
   }
-  throw new Error(
-    `[pipeline release] Factory Reliability Gate pass missing for version ${v} ` +
-      `(expected ${result.path}). ` +
-      `Unit CI alone is not sufficient. Run: pipeline factory-gate --for ${v} ` +
-      `(see docs/factory-reliability-gate-runbook.md).`,
-  );
+  throw new Error(missingFrgPassDiagnostic({ version: v, path: result.path }));
 }
 
 /** Format engine-class rate for PR/CLI: never print n/a when item_count ≥ 1. */
@@ -4214,15 +4299,7 @@ export async function runFactoryGate(
       attestation_key: resolvedAttestationKey,
     };
   } else {
-    throw new Error(
-      "pipeline factory-gate: provide --from-run <loop-run-id> after a durable pack loop finishes.\n" +
-        "  1) Start the pack via shipped durable loop (no second ledger):\n" +
-        "       pipeline loop --label factory-gate\n" +
-        "     (or --milestone <reliability-pack> — not the full product milestone)\n" +
-        "  2) Score + write evidence:\n" +
-        "       pipeline factory-gate --for <X.Y.Z> --from-run <loop-run-id> [--json]\n" +
-        "  See docs/factory-reliability-gate-runbook.md",
-    );
+    throw new Error(factoryGateMissingFromRunUsage());
   }
 
   if (opts.usedObservationsFile) {

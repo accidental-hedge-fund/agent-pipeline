@@ -8,14 +8,18 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   advanceWaveFromSingle,
+  assertMilestoneIssueDiscoveryLimit,
   buildTrainStatus,
   computeBaseEligibleFrontier,
+  emptyFreezeEligibleMilestoneError,
   isIndependentOfHeld,
+  MILESTONE_ISSUE_DISCOVERY_LIMIT,
   orderIssuesByDeclaredDeps,
   orderIssuesForTrain,
   parseIssueList,
   pipelineStageFromLabels,
   runTrain,
+  selectFreezeEligibleIssues,
   type AdvanceOutcome,
   type AdvanceWaveResult,
   type TrainDeps,
@@ -994,6 +998,139 @@ test("train: missing selector fails", async () => {
   await assert.rejects(
     () => runTrain(baseOpts({ issues: undefined, milestone: undefined }), deps),
     /requires --issues|--milestone/,
+  );
+});
+
+test("selectFreezeEligibleIssues: open non-backlog plus closed ready-to-deploy (#1252)", () => {
+  const openReady = snap(1, "open", ["pipeline:ready"], "open ready", "open");
+  const openR2d = snap(2, "open r2d", ["pipeline:ready-to-deploy"], "open r2d", "open");
+  const openBacklog = snap(3, "backlog", ["pipeline:backlog"], "backlog", "open");
+  const closedR2d = snap(4, "closed r2d", ["pipeline:ready-to-deploy"], "closed r2d", "closed");
+  const closedCancelled = snap(5, "cancelled", [], "cancelled", "closed");
+  const closedReady = snap(6, "closed ready", ["pipeline:ready"], "closed ready", "closed");
+  const kept = selectFreezeEligibleIssues([
+    openReady,
+    openR2d,
+    openBacklog,
+    closedR2d,
+    closedCancelled,
+    closedReady,
+  ]);
+  assert.deepEqual(
+    kept.map((s) => s.number),
+    [1, 2, 4],
+    "closed cancelled / closed non-R2D / open backlog must not enter freeze",
+  );
+});
+
+test("train merge: all-closed R2D milestone is already-integrated, not no-open-issues (#1252)", async () => {
+  const deps = makeDeps();
+  deps.seedIssue(
+    snap(927, "shipped", ["pipeline:ready-to-deploy"], "Issue 927", "closed"),
+  );
+  deps.seedMergedPrAnyState(927, 1009, "merge1009" + "0".repeat(31));
+
+  const result = await runTrain(
+    baseOpts({ issues: undefined, milestone: "v1.39.13", merge: true }),
+    deps,
+  );
+  assert.equal(result.exitCode, 0, result.status.blocker ?? "ok");
+  assert.equal(result.status.items[0]!.terminal, "already-integrated");
+  assert.equal(result.status.items[0]!.integrated, true);
+  assert.equal(deps.mergeCalls.length, 0);
+  assert.doesNotMatch(result.status.blocker ?? "", /no open issues/);
+});
+
+test("train merge: mixed open mergeable + closed integrated in one milestone run (#1252)", async () => {
+  const deps = makeDeps();
+  deps.seedIssue(snap(10, "open r2d", ["pipeline:ready-to-deploy"], "A", "open"));
+  deps.seedIssue(
+    snap(11, "closed r2d", ["pipeline:ready-to-deploy"], "B", "closed"),
+  );
+  deps.seedIssue(snap(12, "cancelled", [], "C", "closed"));
+  deps.seedPr(10, 100);
+  deps.seedMergedPrAnyState(11, 101, "merge101" + "0".repeat(33));
+
+  const result = await runTrain(
+    baseOpts({ issues: undefined, milestone: "v1.39.13", merge: true }),
+    deps,
+  );
+  assert.equal(result.exitCode, 0, result.status.blocker ?? "ok");
+  assert.deepEqual([...result.status.ordered_issues].sort((a, b) => a - b), [10, 11]);
+  assert.deepEqual(deps.mergeCalls, [100], "open mergeable PR must merge");
+  const byIssue = new Map(result.status.items.map((item) => [item.issue, item]));
+  assert.equal(byIssue.get(11)!.terminal, "already-integrated");
+  assert.equal(byIssue.get(11)!.integrated, true);
+  assert.equal(byIssue.get(10)!.integrated, true);
+  assert.equal(
+    result.status.items.filter((item) => item.issue === 11).length,
+    1,
+    "already-integrated item must not be merged a second time",
+  );
+});
+
+test("train: empty freeze-eligible milestone fails closed, not open-only (#1252)", async () => {
+  const deps = makeDeps();
+  await assert.rejects(
+    () =>
+      runTrain(
+        baseOpts({ issues: undefined, milestone: "v-empty", merge: true }),
+        deps,
+      ),
+    (err: unknown) => {
+      const msg = (err as Error).message;
+      assert.match(msg, /no freeze-eligible issues/);
+      assert.doesNotMatch(msg, /no open issues/);
+      assert.equal(msg, emptyFreezeEligibleMilestoneError("v-empty"));
+      return true;
+    },
+  );
+});
+
+test("train: closed non-R2D-only milestone is empty freeze-eligible (#1252)", async () => {
+  const deps = makeDeps();
+  deps.seedIssue(snap(1, "cancelled", [], "cancelled", "closed"));
+  await assert.rejects(
+    () =>
+      runTrain(
+        baseOpts({ issues: undefined, milestone: "v-cancelled", merge: true }),
+        deps,
+      ),
+    /no freeze-eligible issues/,
+  );
+});
+
+test("train merge: closed R2D without merged PR is not skipped at freeze (#1252)", async () => {
+  const deps = makeDeps();
+  deps.seedIssue(
+    snap(8, "r2d no pr", ["pipeline:ready-to-deploy"], "no pr", "closed"),
+  );
+  const result = await runTrain(
+    baseOpts({ issues: undefined, milestone: "v1.39.13", merge: true }),
+    deps,
+  );
+  assert.equal(result.exitCode, 1);
+  assert.match(result.status.blocker ?? "", /no linked open PR/);
+  assert.equal(result.status.items[0]!.issue, 8);
+  assert.equal(result.status.items[0]!.integrated, false);
+});
+
+test("assertMilestoneIssueDiscoveryLimit: 200-issue cap still fail-closed (#1252)", () => {
+  assert.doesNotThrow(() =>
+    assertMilestoneIssueDiscoveryLimit(199, "v1.39.13", "ship"),
+  );
+  assert.throws(
+    () => assertMilestoneIssueDiscoveryLimit(200, "v1.39.13", "ship"),
+    /ship train: milestone "v1\.39\.13" reached the 200-issue discovery limit/,
+  );
+  assert.throws(
+    () =>
+      assertMilestoneIssueDiscoveryLimit(
+        MILESTONE_ISSUE_DISCOVERY_LIMIT,
+        "v1.39.13",
+        "train",
+      ),
+    /milestone "v1\.39\.13" reached the 200-issue discovery limit/,
   );
 });
 

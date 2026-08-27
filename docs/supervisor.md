@@ -250,7 +250,17 @@ not the product owner. #1001 / #971 do not ban in-engine ship.
 
 | Script | Role |
 |---|---|
-| `pipeline ship --milestone vX.Y.Z` | **Product** durable ship (train `--merge` → release → finish → ensure-tag → promote) |
+| `pipeline ship --milestone vX.Y.Z` | **Product** durable ship (train `--merge` → FRG pack → release → finish → ensure-tag → promote) |
+
+All-integrated milestones (every freeze-eligible issue closed at
+`pipeline:ready-to-deploy` with merged PRs contained in base) do **not** stop
+at `no open issues to freeze`. Freeze includes those closed ready-to-deploy
+items; train records `already-integrated` and ship continues to FRG / release.
+Missing FRG evidence is recovered with
+`pipeline loop --label factory-gate --profile claude` then
+`pipeline factory-gate --for <X.Y.Z> --from-run <loop-run-id>`. `--skip-frg` is
+an escape that writes `no-frg-*`; it is not the implied path for a non-claude
+profile.
 | `examples/supervisor/shell/tugboat.sh` | Thin notify/detach adapter only; not the ship owner |
 | `examples/supervisor/shell/ship-notify.sh` | Optional messenger posts; silent no-op when `BUZZ_BIN` is empty; intended Buzz with missing credentials writes `audit.log` |
 | `examples/supervisor/shell/ship-stage-watch.sh` | Optional exact-run posts; follow exits on identity-terminal; Tugboat re-binds `--events-file` |

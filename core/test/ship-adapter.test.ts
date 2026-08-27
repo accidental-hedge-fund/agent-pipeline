@@ -17,6 +17,7 @@ import {
   loadRerunAttemptCount,
   persistShipFactoryReleaseRequest,
   persistedShipFactoryReleaseRequestPath,
+  planTrainFromMilestoneIssues,
   probeBoundPackLoopLive,
   recordRerunAttemptFile,
   resolveEnsureTagOwnerRepo,
@@ -51,9 +52,11 @@ import {
   FRG_UNIT_TEST_ATTESTATION_KEY,
   frgRequiredCompositionOverrides,
   frgRequiredObservationOverrides,
+  shipMissingFrgDiagnostic,
   validateReleaseEligibleFrgEvidence,
   type FrgEvidence,
 } from "../scripts/factory-reliability-gate.ts";
+import type { TrainIssueSnapshot } from "../scripts/stages/train.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -367,8 +370,106 @@ test("ship adapter fails closed with the exact existing FRG next action", async 
 
   await assert.rejects(
     deps.convergeFrgPack(intent, train),
-    /pipeline factory-release prepare --request <absolute-off-repo-request\.json> --json/,
+    (err: unknown) => {
+      const msg = (err as Error).message;
+      assert.match(msg, /pipeline loop --label factory-gate --profile claude/);
+      assert.match(msg, /pipeline factory-gate --for 1\.34\.0 --from-run/);
+      assert.match(
+        msg,
+        /pipeline factory-release prepare --request <absolute-off-repo-request\.json> --json/,
+      );
+      const loopIdx = msg.indexOf("pipeline loop --label factory-gate --profile claude");
+      const prepareIdx = msg.indexOf("pipeline factory-release prepare");
+      assert.ok(loopIdx !== -1 && loopIdx < prepareIdx, "prepare must not replace loop + profile");
+      assert.doesNotMatch(msg, /non-claude[\s\S]*--skip-frg|--skip-frg[\s\S]*non-claude/);
+      return true;
+    },
   );
+});
+
+test("planTrainFromMilestoneIssues: all-closed R2D freezes instead of no-open-issues (#1252)", () => {
+  const issues: TrainIssueSnapshot[] = [
+    {
+      number: 10,
+      title: "done",
+      body: "",
+      labels: ["pipeline:ready-to-deploy"],
+      state: "closed",
+    },
+    {
+      number: 11,
+      title: "also done",
+      body: "Depends on: #10",
+      labels: ["pipeline:ready-to-deploy"],
+      state: "closed",
+    },
+  ];
+  const plan = planTrainFromMilestoneIssues("v1.39.13", issues);
+  assert.deepEqual(plan.ordered_issues, [10, 11]);
+});
+
+test("planTrainFromMilestoneIssues: mixed open + closed R2D stay in one freeze plan (#1252)", () => {
+  const issues: TrainIssueSnapshot[] = [
+    {
+      number: 20,
+      title: "open r2d",
+      body: "",
+      labels: ["pipeline:ready-to-deploy"],
+      state: "open",
+    },
+    {
+      number: 21,
+      title: "closed r2d",
+      body: "",
+      labels: ["pipeline:ready-to-deploy"],
+      state: "closed",
+    },
+    {
+      number: 22,
+      title: "cancelled",
+      body: "",
+      labels: [],
+      state: "closed",
+    },
+  ];
+  const plan = planTrainFromMilestoneIssues("v1.39.13", issues);
+  assert.deepEqual([...plan.ordered_issues].sort((a, b) => a - b), [20, 21]);
+});
+
+test("planTrainFromMilestoneIssues: empty freeze-eligible fails closed, not open-only (#1252)", () => {
+  assert.throws(
+    () => planTrainFromMilestoneIssues("v-empty", []),
+    (err: unknown) => {
+      const msg = (err as Error).message;
+      assert.match(msg, /no freeze-eligible issues/);
+      assert.doesNotMatch(msg, /no open issues/);
+      return true;
+    },
+  );
+  assert.throws(
+    () =>
+      planTrainFromMilestoneIssues("v-cancelled", [
+        { number: 1, title: "x", body: "", labels: [], state: "closed" },
+      ]),
+    /no freeze-eligible issues/,
+  );
+});
+
+test("shipMissingFrgDiagnostic names pack loop, profile, and from-run (#1252)", () => {
+  const text = shipMissingFrgDiagnostic({ version: "1.39.13" });
+  assert.match(text, /pipeline loop --label factory-gate --profile claude/);
+  assert.match(text, /pipeline factory-gate --for 1\.39\.13 --from-run/);
+  assert.doesNotMatch(text, /^[\s\S]*Run: pipeline factory-gate --for 1\.39\.13\s*$/);
+  const withPrepare = shipMissingFrgDiagnostic({
+    version: "1.39.13",
+    includePrepare: true,
+  });
+  const loopIdx = withPrepare.indexOf("pipeline loop --label factory-gate --profile claude");
+  const fromRunIdx = withPrepare.indexOf("pipeline factory-gate --for 1.39.13 --from-run");
+  const prepareIdx = withPrepare.indexOf("pipeline factory-release prepare");
+  assert.ok(loopIdx !== -1 && fromRunIdx !== -1 && prepareIdx !== -1);
+  assert.ok(loopIdx < prepareIdx && fromRunIdx < prepareIdx);
+  assert.ok(!withPrepare.includes("--skip-frg") || withPrepare.lastIndexOf("--skip-frg") > fromRunIdx);
 });
 
 test("ship adapter never rebinds provenance-free FRG evidence to a candidate", () => {

@@ -12,6 +12,31 @@ Green `npm run ci` is **necessary but not sufficient**. Two-item pilots and ad-h
 soaks do **not** substitute unless they run through this driver and produce a
 conforming FRG evidence artifact for the target version.
 
+## All-integrated milestone ship (#1252)
+
+`pipeline ship --milestone vX.Y.Z` (and `pipeline train --milestone vX.Y.Z --merge`)
+freeze **open non-backlog** issues **and** closed issues labeled
+`pipeline:ready-to-deploy`. An all-integrated milestone (every freeze-eligible
+issue closed at ready-to-deploy, linked PRs merged and contained in the fetched
+base) does **not** stop at `no open issues to freeze`. Train merge-mode records
+each item `already-integrated` and the ship run proceeds to the FRG / release
+phase. Mixed milestones merge the still-open ready-to-deploy PRs and skip the
+already-integrated set in the same run. Freeze does not invent a second
+integrated classifier; a closed ready-to-deploy issue without a merged contained
+PR still hits train merge-mode fail-closed law.
+
+A missing FRG pass is **not** recovered by `--skip-frg` on a non-claude profile.
+Run the pack on a native-`/goal` engine, then score it:
+
+```bash
+pipeline loop --label factory-gate --profile claude
+pipeline factory-gate --for <X.Y.Z> --from-run <loop-run-id>
+```
+
+`--skip-frg` remains an operator escape that writes a non-production `no-frg-*`
+pin. It is not the default and is not the implied path when the active profile
+lacks native `/goal`.
+
 FRG **never** merges PRs, enables auto-merge, or creates git tags (golden rule #4).
 After a **release-eligible** pass, FRG **auto-closes** synthetic pack open PRs and
 linked open issues **without merging** as post-pass hygiene (#754). Close ≠ merge.

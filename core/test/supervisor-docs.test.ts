@@ -15,6 +15,44 @@ function read(rel: string): string {
   return fs.readFileSync(path.join(repoRoot, rel), "utf8");
 }
 
+test("FRG runbook and supervisor ship text document all-integrated freeze and pack-loop profile (#1252)", () => {
+  const runbook = read("docs/factory-reliability-gate-runbook.md");
+  const supervisor = read("docs/supervisor.md");
+  const ship = read("docs/runbooks/ship-milestone.md");
+  for (const [name, text] of [
+    ["runbook", runbook],
+    ["supervisor", supervisor],
+    ["ship-milestone", ship],
+  ] as const) {
+    assert.match(
+      text,
+      /no open issues to freeze/,
+      `${name} must name the all-integrated freeze stop it no longer hits`,
+    );
+    assert.match(
+      text,
+      /already-integrated/,
+      `${name} must record already-integrated before FRG / release`,
+    );
+    assert.match(
+      text,
+      /pipeline loop --label factory-gate --profile claude/,
+      `${name} must name the native-/goal pack loop`,
+    );
+    assert.match(
+      text,
+      /pipeline factory-gate --for <X\.Y\.Z> --from-run <loop-run-id>/,
+      `${name} must name the --from-run scorer`,
+    );
+    assert.match(text, /escape/i, `${name} must label skip as an escape`);
+    assert.doesNotMatch(
+      text,
+      /use --skip-frg (when|if) .{0,60}non-claude|non-claude .{0,60}(should|must|use) --skip-frg/i,
+      `${name} must not imply skip is the non-claude recovery`,
+    );
+  }
+});
+
 test("supervisor.md documents train_status schema_version 1", () => {
   const doc = read("docs/supervisor.md");
   assert.match(doc, /schema_version:\s*1|"schema_version":\s*1/);
