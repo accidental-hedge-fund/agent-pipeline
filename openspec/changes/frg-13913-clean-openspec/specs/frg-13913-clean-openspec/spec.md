@@ -7,10 +7,10 @@ pack run `pack-13913-release-v1.39.13-frg-20260827-1530` and release `1.39.13`.
 
 ### Requirement: The pack-run clean-openspec fixture SHALL name release 1.39.13
 
-The JSON fixture at
-`core/test/fixtures/frg/pack-13913-release-v1.39.13-frg-20260827-1530/clean-openspec.json`
-SHALL exist, SHALL parse as JSON, and SHALL set `release_version` to the string
-`1.39.13`. The fixture and its unit test SHALL use only that run-scoped path.
+The pack-run clean-openspec fixture SHALL exist at
+`core/test/fixtures/frg/pack-13913-release-v1.39.13-frg-20260827-1530/clean-openspec.json`,
+SHALL parse as JSON, and SHALL set `release_version` to the string `1.39.13`.
+The fixture and its unit test SHALL use only that run-scoped path.
 They SHALL NOT read or write another pack-run directory under
 `core/test/fixtures/frg/`.
 
