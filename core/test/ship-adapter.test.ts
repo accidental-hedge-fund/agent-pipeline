@@ -17,6 +17,7 @@ import {
   loadRerunAttemptCount,
   persistShipFactoryReleaseRequest,
   persistedShipFactoryReleaseRequestPath,
+  observeTrainEvidence,
   planTrainFromMilestoneIssues,
   probeBoundPackLoopLive,
   recordRerunAttemptFile,
@@ -25,8 +26,14 @@ import {
   shipCoordinatorDepsFromOperations,
   verifyAnnotatedReleaseTag,
   type ObservedEnsureTagReleasePr,
+  type ObserveTrainEvidenceDeps,
   type ShipAdapterOperations,
 } from "../scripts/stages/ship-adapter.ts";
+import {
+  getPrForIssueAnyState,
+  type GhApiRunner,
+} from "../scripts/gh.ts";
+import type { PipelineConfig } from "../scripts/types.ts";
 import {
   attemptCountFor,
   emptyRerunBudgetDoc,
@@ -302,6 +309,222 @@ test("ship adapter converges train through the existing train seam only when obs
   assert.deepEqual(await deps.convergeTrain(intent, train.ordered_issues), train);
   assert.equal(runs, 1);
   assert.deepEqual(observedPlans, [[10, 11], [10, 11]]);
+});
+
+// ---------------------------------------------------------------------------
+// observeTrain: merged pipeline (#N) mentions (#1269)
+//
+// v1.39.14 ship merged three train PRs whose squash titles are `… (#N)`.
+// GitHub records CrossReferencedEvent with willCloseTarget=false. The shared
+// any-state picker must treat those as links so observation returns complete
+// evidence and ship does not re-enter runTrain.
+// ---------------------------------------------------------------------------
+
+const V13914_ISSUES = [1258, 1259, 1252] as const;
+const V13914_MAIN = "aa".repeat(20);
+const V13914_MERGED_AT = "2026-08-27T18:00:00.000Z";
+const V13914_NOW = new Date("2026-08-27T21:36:57.000Z");
+
+const V13914_PRS: Record<number, { pr: number; oid: string; head: string; title: string }> = {
+  1258: {
+    pr: 1262,
+    oid: "f71c4251" + "a".repeat(32),
+    head: "pipeline/1258-resume-after-run-fatal",
+    title: "fix(pipeline): resume after run fatal (#1258)",
+  },
+  1259: {
+    pr: 1263,
+    oid: "28e04331" + "b".repeat(32),
+    head: "pipeline/1259-ship-frg-wait",
+    title: "fix(ship): frg wait (#1259)",
+  },
+  1252: {
+    pr: 1267,
+    oid: "c75522cd" + "c".repeat(32),
+    head: "pipeline/1252-empty-freeze",
+    title: "fix(ship): freeze empty milestone (#1252)",
+  },
+};
+
+function graphqlIssueNumber(args: string[]): number {
+  const arg = args.find((a) => a.startsWith("num="));
+  if (!arg) throw new Error(`missing num= in GraphQL args: ${args.join(" ")}`);
+  return Number(arg.slice(4));
+}
+
+function timelineGraphql(nodes: unknown[]): string {
+  return JSON.stringify({
+    data: {
+      repository: {
+        issue: {
+          timelineItems: {
+            pageInfo: { hasPreviousPage: false, startCursor: null },
+            nodes,
+          },
+        },
+      },
+    },
+  });
+}
+
+function mentionCrossRef(pr: { pr: number; head: string; title: string }, fork = false) {
+  return {
+    __typename: "CrossReferencedEvent",
+    willCloseTarget: false,
+    source: {
+      __typename: "PullRequest",
+      number: pr.pr,
+      headRefName: pr.head,
+      title: pr.title,
+      isCrossRepository: fork,
+    },
+  };
+}
+
+function v13914TimelineRun(): GhApiRunner {
+  return async (args) => {
+    const joined = args.join(" ");
+    assert.ok(args.includes("graphql"), "observeTrain lookup must be issue-timeline GraphQL");
+    assert.ok(joined.includes("timelineItems"));
+    assert.ok(!joined.includes("pr list"), "must not fall back to gh pr list");
+    const issue = graphqlIssueNumber(args);
+    const row = V13914_PRS[issue];
+    if (!row) return timelineGraphql([]);
+    return timelineGraphql([mentionCrossRef(row)]);
+  };
+}
+
+function mergedView(oid: string): Record<string, unknown> {
+  return {
+    state: "MERGED",
+    mergedAt: V13914_MERGED_AT,
+    mergeCommit: { oid },
+  };
+}
+
+function v13914ObserveDeps(run: GhApiRunner = v13914TimelineRun()): ObserveTrainEvidenceDeps {
+  const cfg = { repo: intent.repository } as PipelineConfig;
+  const oids = new Set(Object.values(V13914_PRS).map((row) => row.oid));
+  const views = new Map(
+    Object.values(V13914_PRS).map((row) => [row.pr, mergedView(row.oid)] as const),
+  );
+  return {
+    getPrForIssueAnyState: (issue) => getPrForIssueAnyState(cfg, issue, run),
+    ghPrView: async (pr) => {
+      const row = views.get(pr);
+      if (!row) throw new Error(`unexpected ghPrView for PR #${pr}`);
+      return row;
+    },
+    observeBase: async () => V13914_MAIN,
+    isAncestor: async (ancestor, descendant) => {
+      if (ancestor === descendant) return true;
+      return descendant === V13914_MAIN && oids.has(ancestor);
+    },
+    now: () => V13914_NOW,
+  };
+}
+
+test("observeTrain: v1.39.14 merged (#N) pipeline PRs complete train evidence (#1269)", async () => {
+  const evidence = await observeTrainEvidence(
+    intent,
+    [...V13914_ISSUES],
+    v13914ObserveDeps(),
+  );
+  assert.ok(evidence, "must not return null for merged (#N) pipeline PRs");
+  assert.equal(evidence.complete, true);
+  assert.equal(evidence.integrated_head_oid, V13914_MAIN);
+  assert.deepEqual(evidence.ordered_issues, [...V13914_ISSUES]);
+  assert.equal(evidence.repository, intent.repository);
+  assert.equal(evidence.milestone, intent.milestone);
+});
+
+test("convergeTrain: merged (#N) observation does not invoke runTrain (#1269)", async () => {
+  let runs = 0;
+  const deps = shipCoordinatorDepsFromOperations(operations({
+    observeTrain: (i, planned, candidate) =>
+      observeTrainEvidence(i, planned, v13914ObserveDeps(), candidate),
+    runTrain: async () => {
+      runs++;
+      throw new Error("issue #1258 is ready-to-deploy but has no linked open PR");
+    },
+  }), { state });
+
+  const observed = await deps.convergeTrain(intent, [...V13914_ISSUES]);
+  assert.equal(runs, 0, "must not re-enter runTrain after observation succeeds");
+  assert.equal(observed.integrated_head_oid, V13914_MAIN);
+  assert.deepEqual(observed.ordered_issues, [...V13914_ISSUES]);
+});
+
+test("observeTrain: ConnectedEvent and willCloseTarget still prove integration (#1269)", async () => {
+  const row = V13914_PRS[1258]!;
+  const connectedRun: GhApiRunner = async () =>
+    timelineGraphql([
+      {
+        __typename: "ConnectedEvent",
+        subject: {
+          __typename: "PullRequest",
+          number: row.pr,
+          headRefName: "feat/manual-link",
+          title: "manual link",
+          isCrossRepository: false,
+        },
+      },
+    ]);
+  const closingRun: GhApiRunner = async () =>
+    timelineGraphql([
+      {
+        __typename: "CrossReferencedEvent",
+        willCloseTarget: true,
+        source: {
+          __typename: "PullRequest",
+          number: row.pr,
+          headRefName: "feat/fixes-keyword",
+          title: "Fixes #1258",
+          isCrossRepository: false,
+        },
+      },
+    ]);
+  const connected = await observeTrainEvidence(intent, [1258], v13914ObserveDeps(connectedRun));
+  const closing = await observeTrainEvidence(intent, [1258], v13914ObserveDeps(closingRun));
+  assert.equal(connected?.integrated_head_oid, V13914_MAIN);
+  assert.equal(closing?.integrated_head_oid, V13914_MAIN);
+});
+
+test("observeTrain: fork-only timeline is not integration proof (#1269)", async () => {
+  const row = V13914_PRS[1258]!;
+  const forkRun: GhApiRunner = async () => timelineGraphql([mentionCrossRef(row, true)]);
+  const evidence = await observeTrainEvidence(intent, [1258], v13914ObserveDeps(forkRun));
+  assert.equal(evidence, null);
+});
+
+test("ship coordinator: after (#N) observeTrain, next_action is frg_pack not train_merge (#1269)", async () => {
+  const store = memoryShipStore();
+  let runs = 0;
+  const wrap = (deps: ReturnType<typeof shipCoordinatorDepsFromOperations>) => ({
+    ...deps,
+    authorizationPublicKey: "test",
+    withRunLock: async (_key: string, fn: () => Promise<unknown>) => fn(),
+  });
+  const coordinator = wrap(shipCoordinatorDepsFromOperations(operations({
+    planTrain: async () => ({ ordered_issues: [...V13914_ISSUES] }),
+    observeTrain: (i, planned, candidate) =>
+      observeTrainEvidence(i, planned, v13914ObserveDeps(), candidate),
+    runTrain: async () => {
+      runs++;
+      throw new Error("issue #1258 is ready-to-deploy but has no linked open PR");
+    },
+    observeFrg: async () => null,
+  }), { state: store }));
+
+  await assert.rejects(
+    () => runShipCoordinator(intent, null, coordinator),
+    /ship FRG: no release-eligible/,
+  );
+  assert.equal(runs, 0, "must not invoke runTrain");
+  assert.ok(store.status?.train, "train evidence must be persisted");
+  assert.equal(store.status?.train?.integrated_head_oid, V13914_MAIN);
+  assert.equal(store.status?.next_action, "frg_pack");
+  assert.equal(store.status?.complete, false);
 });
 
 test("ship adapter returns the one frozen train plan from its planning seam", async () => {

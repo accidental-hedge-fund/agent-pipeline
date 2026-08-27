@@ -2937,58 +2937,97 @@ export async function disposeSupersededIssuePrs(
 
 /** One page of an issue's `CONNECTED_EVENT`/`CROSS_REFERENCED_EVENT` timeline,
  *  as returned by the GraphQL query in {@link getPrForIssueAnyState}. */
+interface IssueTimelinePr {
+  __typename?: string;
+  number?: number;
+  headRefName?: string;
+  title?: string;
+  isCrossRepository?: boolean;
+}
+
 interface IssueTimelinePage {
   hasPreviousPage: boolean;
   startCursor: string | null;
   nodes: {
     __typename: string;
     willCloseTarget?: boolean;
-    subject?: { __typename?: string; number?: number; headRefName?: string; isCrossRepository?: boolean } | null;
-    source?: { __typename?: string; number?: number; headRefName?: string; isCrossRepository?: boolean } | null;
+    subject?: IssueTimelinePr | null;
+    source?: IssueTimelinePr | null;
   }[];
 }
 
-/** Picks the most recent same-repo PR linked to the issue from one timeline
- *  page: a `ConnectedEvent` (manual link) always counts; a
- *  `CrossReferencedEvent` counts only when `willCloseTarget` is true (mirrors
- *  `closingIssuesReferences` semantics — a PR that merely mentions the issue
- *  does not match). Fork PRs (`isCrossRepository`) are excluded, same as
+function isSameRepoTimelinePr(pr: IssueTimelinePr | null | undefined): pr is IssueTimelinePr & { number: number } {
+  return Boolean(
+    pr &&
+    pr.__typename === "PullRequest" &&
+    typeof pr.number === "number" &&
+    !pr.isCrossRepository,
+  );
+}
+
+/** Pipeline squash identity for any-state lookup: head `pipeline/<N>-*` or
+ *  title parenthetical `(#N)`. Bare `#N` / `Fixes #N` in the title do not
+ *  count; those stay on `willCloseTarget`. Body text is not searched. */
+function matchesAnyStatePipelineMention(pr: IssueTimelinePr, issueNumber: number): boolean {
+  const prefix = `pipeline/${issueNumber}-`;
+  if (typeof pr.headRefName === "string" && pr.headRefName.startsWith(prefix)) {
+    return true;
+  }
+  return typeof pr.title === "string" && pr.title.includes(`(#${issueNumber})`);
+}
+
+/** Picks the most recent same-repo PR linked to issue N from one timeline
+ *  page. A `ConnectedEvent` (manual link) always counts. A
+ *  `CrossReferencedEvent` counts when `willCloseTarget` is true, or when the
+ *  source PR is a same-repo pipeline identity (`pipeline/<N>-*` head or title
+ *  parenthetical `(#N)`). Mere non-pipeline mentions stay unmatched. Fork PRs
+ *  (`isCrossRepository`) are excluded under every identity, same as
  *  {@link resolvePrForIssue}. Scans newest-first within the page. Exported for
  *  tests. */
-export function pickPrFromTimelinePage(nodes: IssueTimelinePage["nodes"]): number | null {
+export function pickPrFromTimelinePage(
+  nodes: IssueTimelinePage["nodes"],
+  issueNumber: number,
+): number | null {
   for (let i = nodes.length - 1; i >= 0; i--) {
-    const node = nodes[i];
-    const pr =
-      node.__typename === "ConnectedEvent"
-        ? node.subject
-        : node.__typename === "CrossReferencedEvent" && node.willCloseTarget
-          ? node.source
-          : null;
-    if (pr && pr.__typename === "PullRequest" && pr.number !== undefined && !pr.isCrossRepository) {
+    const node = nodes[i]!;
+    const pr = node.__typename === "ConnectedEvent"
+      ? node.subject
+      : node.__typename === "CrossReferencedEvent"
+        ? node.source
+        : null;
+    if (!isSameRepoTimelinePr(pr)) continue;
+    if (node.__typename === "ConnectedEvent") return pr.number;
+    if (node.willCloseTarget || matchesAnyStatePipelineMention(pr, issueNumber)) {
       return pr.number;
     }
   }
   return null;
 }
 
+const ISSUE_TIMELINE_PR_FIELDS = "number headRefName title isCrossRepository";
+
 const ISSUE_TIMELINE_QUERY =
   "query($owner:String!,$repo:String!,$num:Int!,$before:String){repository(owner:$owner,name:$repo)" +
   "{issue(number:$num){timelineItems(last:50,before:$before,itemTypes:[CONNECTED_EVENT,CROSS_REFERENCED_EVENT])" +
   "{pageInfo{hasPreviousPage startCursor}nodes{__typename " +
-  "... on ConnectedEvent{subject{__typename ... on PullRequest{number headRefName isCrossRepository}}} " +
-  "... on CrossReferencedEvent{willCloseTarget source{__typename ... on PullRequest{number headRefName isCrossRepository}}}}}}}}";
+  `... on ConnectedEvent{subject{__typename ... on PullRequest{${ISSUE_TIMELINE_PR_FIELDS}}}} ` +
+  `... on CrossReferencedEvent{willCloseTarget source{__typename ... on PullRequest{${ISSUE_TIMELINE_PR_FIELDS}}}}}}}}}`;
 
-/** Same resolution as {@link getPrForIssue} but across every PR state (open,
- *  closed, merged) — used by reconciliation (#511), which must still find a
- *  since-merged PR to observe `pr_state: "merged"` (an open-only lookup would
- *  never see it, defeating forward drift detection).
+/** Same issue-scoped resolution as {@link getPrForIssue} but across every PR
+ *  state (open, closed, merged) — used by reconciliation (#511), ship train
+ *  observation, and train merge-wave. An open-only lookup would miss a
+ *  since-merged PR (`pr_state: "merged"`).
  *
  *  Resolves via the issue's own `CONNECTED_EVENT`/`CROSS_REFERENCED_EVENT`
  *  timeline (paginated backward through history) rather than a repository-wide
  *  `gh pr list` scan: the timeline is scoped to this one issue, so it cannot
  *  lose a historical merged PR to an unrelated bounded-size repo-wide list
  *  (#511 review-2 finding — a fixed `-L 100` repo-wide scan silently drops
- *  older PRs once a repo has passed 100 total PRs). */
+ *  older PRs once a repo has passed 100 total PRs).
+ *
+ *  Match identities (#1269): `ConnectedEvent`, closing `willCloseTarget`,
+ *  same-repo head `pipeline/<N>-*`, or title parenthetical `(#N)`. Fork PRs
+ *  are ignored. Open-path {@link getPrForIssue} does not gain title search. */
 export async function getPrForIssueAnyState(
   cfg: PipelineConfig,
   issueNumber: number,
@@ -3018,7 +3057,7 @@ export async function getPrForIssueAnyState(
     };
     const timelineItems = data.data.repository.issue?.timelineItems;
     if (!timelineItems) return null;
-    const found = pickPrFromTimelinePage(timelineItems.nodes);
+    const found = pickPrFromTimelinePage(timelineItems.nodes, issueNumber);
     if (found !== null) return found;
     if (!timelineItems.pageInfo.hasPreviousPage) return null;
     before = timelineItems.pageInfo.startCursor;
