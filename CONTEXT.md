@@ -69,6 +69,26 @@ _Avoid_: Claude, Grok (as the name of the role)
 The configured independent harness that judges plans and diffs (`harnesses.reviewer`). A role, not a brand.
 _Avoid_: Codex (as the name of the role), self-review as the default product
 
+### Intake
+
+**Grill**:
+A one-shot intake interview that writes a Decisions frontier into the issue body. Not planning, not a comment, not a chat loop.
+_Avoid_: plan-review, mid-run interview, comment-as-spec
+
+**Decisions**:
+The issue-body section that is the spec for ready. Comments do not settle nodes.
+_Avoid_: review comment, blocker comment, lock comment
+
+**Authority node**:
+An unsettled question of scope, security, ship/no-ship, or human-attestation. It blocks `--stage ready`. Non-authority nodes take the recommended default in the body.
+_Avoid_: open question, TODO, parking everything
+
+### Diagnostics
+
+**Environment-auth**:
+An operator or third-party credential failure (revoked token, login required). Not an engine defect.
+_Avoid_: workflow-engine-defect, harness-contract (as the durable theme for a 401)
+
 ### Ship path
 
 **Live ship**:
