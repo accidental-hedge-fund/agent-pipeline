@@ -2,47 +2,60 @@
 
 ## Purpose
 TBD - created by archiving change configurable-review-harness. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: review_harness config key overrides the profile reviewer
 
-`PartialConfigSchema` SHALL accept an optional `review_harness` key that is either a bare `string` (the command shorthand) or a strict object `{ command: string, model?: string | "auto", effort?: string | "auto" }`. When present in either form, `resolveConfig()` SHALL use the command as `cfg.harnesses.reviewer` in place of the profile's default reviewer harness, applied after the profile/file/CLI merge step. For the object form, `resolveConfig()` SHALL additionally set `cfg.harnesses.reviewerModel` from `model` and `cfg.harnesses.reviewerEffort` from `effort`; for the string form, both SHALL remain unset. When `review_harness` is absent, the reviewer resolves from the repository `harnesses.reviewer` key when present and otherwise from the profile, and `reviewerModel`/`reviewerEffort` SHALL remain unset.
+`PartialConfigSchema` SHALL accept an optional `review_harness` key that is either a bare `string` (the command shorthand) or a strict object `{ command: string, model?: string | "auto", effort?: string | "auto" }`. `review_harness` SHALL be a structured overlay on the required repository `harnesses.reviewer` key. It SHALL NOT replace `harnesses.reviewer` and SHALL NOT take the live reviewer from the active profile.
 
-`PartialConfigSchema` SHALL also accept the strict repository `harnesses` role block (see `configurable-harness-roles`); a `harnesses:` block is no longer rejected outright, though a key inside it other than `implementer` or `reviewer` SHALL still be rejected by strict validation. When both `review_harness` and `harnesses.reviewer` are present, they SHALL agree: naming the same command is accepted and the structured `review_harness` model/effort/prompt-delivery settings continue to apply, while naming different commands SHALL be rejected with a message naming both keys and both values rather than silently selecting one.
+When `review_harness` is present in either form and `harnesses.reviewer` is absent, execution-policy resolution SHALL fail closed. When both are present they SHALL agree: naming the same command is accepted and the structured `review_harness` model/effort/prompt-delivery settings continue to apply, while naming different commands SHALL be rejected with a message naming both keys and both values rather than silently selecting one. For the object form, `resolveConfig()` SHALL set `cfg.harnesses.reviewerModel` from `model` and `cfg.harnesses.reviewerEffort` from `effort`; for the string form, both SHALL remain unset. When `review_harness` is absent and `harnesses.reviewer` is present, the live reviewer SHALL be `harnesses.reviewer` and `reviewerModel`/`reviewerEffort` SHALL remain unset.
+
+`PartialConfigSchema` SHALL continue to accept the strict repository `harnesses` role block (see `configurable-harness-roles`); a key inside it other than `implementer` or `reviewer` SHALL still be rejected by strict validation.
 
 #### Scenario: review_harness string form present
 
-- **WHEN** `.github/pipeline.yml` sets `review_harness: my-reviewer`
-- **THEN** `resolveConfig()` SHALL set `cfg.harnesses.reviewer` to `"my-reviewer"` regardless of the profile's default reviewer, and `cfg.harnesses.reviewerModel`/`reviewerEffort` SHALL be unset
+- **WHEN** `.github/pipeline.yml` sets `harnesses.reviewer: my-reviewer` and `review_harness: my-reviewer` and also declares `harnesses.implementer`
+- **THEN** `resolveConfig()` SHALL set `cfg.harnesses.reviewer` to `"my-reviewer"`, and `cfg.harnesses.reviewerModel`/`reviewerEffort` SHALL be unset
 
 #### Scenario: review_harness object form present
 
-- **WHEN** `.github/pipeline.yml` sets `review_harness: { command: claude, model: claude-fable-5, effort: max }`
+- **WHEN** `.github/pipeline.yml` sets `harnesses.reviewer: claude` and `review_harness: { command: claude, model: claude-fable-5, effort: max }` and also declares `harnesses.implementer`
 - **THEN** `cfg.harnesses.reviewer` SHALL be `"claude"`, `cfg.harnesses.reviewerModel` SHALL be `"claude-fable-5"`, and `cfg.harnesses.reviewerEffort` SHALL be `"max"`
 
 #### Scenario: review_harness key absent
 
 - **WHEN** `.github/pipeline.yml` does not include a `review_harness` key and no `harnesses` block
-- **THEN** `cfg.harnesses.reviewer` SHALL equal the profile's default reviewer harness with no warning or change in behavior, and `reviewerModel`/`reviewerEffort` SHALL be unset
+- **AND** configuration is resolved for execution
+- **THEN** resolution SHALL fail closed
+- **AND** `cfg.harnesses.reviewer` SHALL NOT equal the profile's default reviewer harness
 
 #### Scenario: review_harness key absent under claude profile
 
 - **WHEN** the `claude` profile is active and `.github/pipeline.yml` has no `review_harness` key and no `harnesses` block
-- **THEN** `cfg.harnesses.reviewer` SHALL be `"codex"` (the profile's cross-harness default)
+- **AND** configuration is resolved for execution
+- **THEN** resolution SHALL fail closed
+- **AND** `cfg.harnesses.reviewer` SHALL NOT be `"codex"` by profile default
 
 #### Scenario: harnesses.reviewer supplies the reviewer when review_harness is absent
 
-- **WHEN** `.github/pipeline.yml` sets `harnesses: { reviewer: codex }` and no `review_harness` key
+- **WHEN** `.github/pipeline.yml` sets `harnesses: { implementer: grok, reviewer: codex }` and no `review_harness` key
 - **THEN** `cfg.harnesses.reviewer` SHALL be `"codex"` and `reviewerModel`/`reviewerEffort` SHALL be unset
 
 #### Scenario: agreeing review_harness and harnesses.reviewer
 
-- **WHEN** `.github/pipeline.yml` sets `harnesses: { reviewer: codex }` and `review_harness: { command: codex, model: gpt-5.6-terra }`
+- **WHEN** `.github/pipeline.yml` sets `harnesses: { implementer: grok, reviewer: codex }` and `review_harness: { command: codex, model: gpt-5.6-terra }`
 - **THEN** `cfg.harnesses.reviewer` SHALL be `"codex"` and `cfg.harnesses.reviewerModel` SHALL be `"gpt-5.6-terra"`
 
 #### Scenario: conflicting review_harness and harnesses.reviewer
 
 - **WHEN** `.github/pipeline.yml` sets `harnesses: { reviewer: codex }` and `review_harness: claude`
 - **THEN** `resolveConfig()` SHALL fail with a message naming both keys and both values, and no stage SHALL run
+
+#### Scenario: review_harness without harnesses.reviewer fails closed
+
+- **WHEN** `.github/pipeline.yml` sets `review_harness: my-reviewer` and no `harnesses` block
+- **THEN** execution-policy resolution SHALL fail with a diagnostic naming `harnesses.reviewer`
 
 ### Requirement: invoke() accepts an arbitrary string harness name
 
@@ -230,4 +243,3 @@ registered full adapter, that adapter SHALL win over the compatibility path.
 - **THEN** the surfaced error SHALL name the CLI
 - **AND** the failure classification SHALL be compatible with the public missing-CLI vocabulary
   used for registered adapters
-
