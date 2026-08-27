@@ -217,6 +217,10 @@ The gate SHALL persist the bound verdict in the owned comment for both `ready` a
 
 The gate SHALL require the freshly fetched pipeline stage to be `ready` before evaluation or verdict reuse. Immediately before any GitHub mutation or `ready` admission, the gate SHALL re-fetch title, body, and labels. It SHALL require the live stage to still be `ready` and the live title/body hash (with the resolved planning treatment) to match the evaluated input. If the live stage is any other value, the gate SHALL return a typed `stale-dispatch` outcome. That outcome SHALL NOT write the owned comment and SHALL NOT add `pipeline:needs-spec`. When the first fetch already shows a non-ready stage, the gate SHALL NOT invoke the model. If the live hash does not match, the gate SHALL NOT persist that verdict and SHALL NOT start planning; it SHALL restart evaluation against the live input. Restarts SHALL be bounded to at most three evaluation attempts including the first. Exhausting that budget SHALL be typed `gate-unavailable` with no GitHub mutation.
 
+After a `needs_spec` label write, the gate SHALL re-fetch and inspect the complete set of pipeline stage labels, not only `pickStage()`. `needs_spec` is committed only when that set is exactly `pipeline:needs-spec`. Any simultaneous non-`needs-spec` pipeline stage SHALL be `stale-dispatch`, never `needs_spec`. On every stale result after a write, the gate SHALL remove the gate-added `pipeline:needs-spec` overlay and re-fetch to confirm cleanup. If cleanup cannot be confirmed, the outcome SHALL be typed `mutation-failed`.
+
+After every ready-comment write, the gate SHALL re-fetch and SHALL require both `pipeline:ready` and the evaluated title/body hash before returning `ready`. If the live hash differs, the gate SHALL restore or remove the stale bound record and SHALL restart evaluation within the existing restart budget; it SHALL NOT admit on that attempt. If the live stage differs, the gate SHALL restore or remove the stale bound record and SHALL return `stale-dispatch`.
+
 #### Scenario: Fresh fetch shows a later stage
 
 - **WHEN** the freshly fetched labels include `pipeline:planning` or any stage other than `pipeline:ready`
@@ -239,6 +243,23 @@ The gate SHALL require the freshly fetched pipeline stage to be `ready` before e
 - **THEN** the gate SHALL NOT persist a B0-bound `ready` record
 - **AND** SHALL NOT start planning on B1 without evaluating B1
 - **AND** SHALL evaluate B1 (or reuse a B1-bound record)
+
+#### Scenario: Stage changes between needs-spec label writes
+
+- **WHEN** the gate has added `pipeline:needs-spec`
+- **AND** a concurrent dispatcher has moved the issue to a later stage before the label transition is confirmed
+- **THEN** the outcome SHALL be `stale-dispatch`
+- **AND** the gate SHALL remove the `pipeline:needs-spec` overlay
+- **AND** the gate SHALL NOT return `needs_spec` while any other pipeline stage label remains
+- **AND** if overlay removal cannot be confirmed, the outcome SHALL be `mutation-failed`
+
+#### Scenario: Title or body changes during ready-comment persistence
+
+- **WHEN** the Implementer returns `ready` for body B0
+- **AND** a live re-fetch after the ready-comment write shows body B1 with stage still `ready`
+- **THEN** the gate SHALL NOT admit on that attempt
+- **AND** SHALL restore or remove the B0-bound record
+- **AND** SHALL evaluate B1 within the existing restart budget
 
 #### Scenario: Drift budget exhausted is gate-unavailable
 

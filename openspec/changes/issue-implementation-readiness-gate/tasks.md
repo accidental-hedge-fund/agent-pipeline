@@ -63,3 +63,5 @@
 
 - [x] 9.1 Treat comment persist plus the needs-spec label transition as a re-fetched write sequence: retry remaining writes while still on `ready`, compensate or skip labels when the live stage moved, and never report `gate-unavailable` after a GitHub mutation
 - [x] 9.2 Return typed `mutation-failed` (fence delivery, no planning) when a comment or label write cannot be completed or compensated, and verify comment-success/label-failure plus each individual label-operation failure
+- [x] 9.3 After a needs-spec label write, inspect the complete pipeline-stage label set; on a later-stage race remove the needs-spec overlay (mutation-failed if cleanup cannot be confirmed) and verify a between-label-writes fake does not leave `pipeline:needs-spec` on a later-stage issue
+- [x] 9.4 After every ready-comment write, re-fetch and require `pipeline:ready` plus the evaluated hash before admission; on mismatch restore/remove the stale record and restart within budget, and verify a persist-window body-change fake does not admit B0

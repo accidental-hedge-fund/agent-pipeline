@@ -26,7 +26,7 @@ import {
   extractPipelineAttestation,
   isVerifiedPipelineAttestation,
 } from "./stages/review-parsing.ts";
-import { LABEL_PREFIX, type IssueReadinessVerdict, type PipelineConfig, type Stage } from "./types.ts";
+import { LABEL_PREFIX, STAGES, type IssueReadinessVerdict, type PipelineConfig, type Stage } from "./types.ts";
 
 export const ISSUE_READINESS_MARKER_PREFIX = "<!-- pipeline-issue-readiness";
 
@@ -443,13 +443,80 @@ async function applyNeedsSpecLabels(deps: IssueReadinessDeps, issueNumber: numbe
   }
 }
 
-function needsSpecTransitionComplete(labels: string[]): boolean {
-  return pickStage(labels) === "needs-spec";
+function pipelineStageNames(labels: string[]): Stage[] {
+  const found: Stage[] = [];
+  for (const name of labels) {
+    if (!name.startsWith(LABEL_PREFIX)) continue;
+    const stage = name.slice(LABEL_PREFIX.length);
+    if ((STAGES as readonly string[]).includes(stage)) found.push(stage as Stage);
+  }
+  return found;
 }
 
-function laterStageThanReady(labels: string[]): boolean {
-  const stage = pickStage(labels);
-  return stage !== null && stage !== "ready" && stage !== "needs-spec";
+/** True only when the sole pipeline stage label is needs-spec. */
+function needsSpecTransitionComplete(labels: string[]): boolean {
+  const stages = pipelineStageNames(labels);
+  return stages.length === 1 && stages[0] === "needs-spec";
+}
+
+function simultaneousNonNeedsSpecStages(labels: string[]): Stage[] {
+  return pipelineStageNames(labels).filter((stage) => stage !== "needs-spec");
+}
+
+function readyOnlyForNeedsSpecTransition(labels: string[]): boolean {
+  const others = simultaneousNonNeedsSpecStages(labels);
+  return others.length === 1 && others[0] === "ready";
+}
+
+function observedConflictingStage(labels: string[]): Stage | null {
+  const others = simultaneousNonNeedsSpecStages(labels);
+  return others.find((stage) => stage !== "ready") ?? pickStage(labels);
+}
+
+async function dropNeedsSpecOverlayVerified(
+  deps: IssueReadinessDeps,
+  issueNumber: number,
+  labels: string[],
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  if (!labels.includes(NEEDS_SPEC_LABEL)) return { ok: true };
+  try {
+    await deps.removeLabel(issueNumber, NEEDS_SPEC_LABEL);
+  } catch (err) {
+    if (!isHttp404Signal((err as Error).message)) {
+      return {
+        ok: false,
+        reason: `live stage is ${observedConflictingStage(labels) ?? "none"}; failed to drop needs-spec overlay: ${(err as Error).message}`,
+      };
+    }
+  }
+  const verify = await fetchIssueLabels(deps, issueNumber);
+  if ("error" in verify) {
+    return {
+      ok: false,
+      reason: `live stage is ${observedConflictingStage(labels) ?? "none"}; failed to drop needs-spec overlay: live re-fetch failed: ${verify.error}`,
+    };
+  }
+  if (verify.labels.includes(NEEDS_SPEC_LABEL)) {
+    return {
+      ok: false,
+      reason: `live stage is ${observedConflictingStage(verify.labels) ?? "none"}; failed to drop needs-spec overlay`,
+    };
+  }
+  return { ok: true };
+}
+
+async function staleAfterNeedsSpecLabels(
+  deps: IssueReadinessDeps,
+  issueNumber: number,
+  labels: string[],
+  wroteLabels: boolean,
+): Promise<LabelTransitionResult> {
+  const observed = observedConflictingStage(labels);
+  if (wroteLabels || labels.includes(NEEDS_SPEC_LABEL)) {
+    const dropped = await dropNeedsSpecOverlayVerified(deps, issueNumber, labels);
+    if (!dropped.ok) return { status: "incomplete", reason: dropped.reason };
+  }
+  return { status: "stale", observedStage: observed };
 }
 
 async function fetchIssueLabels(
@@ -540,18 +607,8 @@ async function applyNeedsSpecLabelsVerified(
       return { status: "incomplete", reason: `live re-fetch failed: ${fetched.error}` };
     }
     if (needsSpecTransitionComplete(fetched.labels)) return { status: "ok" };
-    if (laterStageThanReady(fetched.labels)) {
-      if (fetched.labels.includes(NEEDS_SPEC_LABEL)) {
-        try {
-          await deps.removeLabel(issueNumber, NEEDS_SPEC_LABEL);
-        } catch (err) {
-          return {
-            status: "incomplete",
-            reason: `live stage is ${pickStage(fetched.labels)}; failed to drop needs-spec overlay: ${(err as Error).message}`,
-          };
-        }
-      }
-      return { status: "stale", observedStage: pickStage(fetched.labels) };
+    if (!readyOnlyForNeedsSpecTransition(fetched.labels)) {
+      return staleAfterNeedsSpecLabels(deps, issueNumber, fetched.labels, wroteLabels);
     }
     try {
       await applyNeedsSpecLabels(deps, issueNumber, fetched.labels);
@@ -567,8 +624,8 @@ async function applyNeedsSpecLabelsVerified(
       continue;
     }
     if (needsSpecTransitionComplete(verify.labels)) return { status: "ok" };
-    if (laterStageThanReady(verify.labels)) {
-      return { status: "stale", observedStage: pickStage(verify.labels) };
+    if (!readyOnlyForNeedsSpecTransition(verify.labels)) {
+      return staleAfterNeedsSpecLabels(deps, issueNumber, verify.labels, true);
     }
     lastReason = "label transition did not stick";
   }
@@ -847,6 +904,21 @@ async function evaluateIssueReadinessAttempt(input: {
           kind: "mutation-failed",
           reason: `owned readiness comment write did not verify: ${persist.reason}`,
         };
+      }
+      const after = await confirmLiveInput(deps, issueNumber, hash, treatment);
+      if ("kind" in after) {
+        await compensateOwnedComment(deps, issueNumber, actor, owned?.comment, commentBody);
+        return after;
+      }
+      if (after.status !== "ready") {
+        const undone = await compensateOwnedComment(deps, issueNumber, actor, owned?.comment, commentBody);
+        if (!undone) {
+          return {
+            kind: "mutation-failed",
+            reason: `owned ready comment persisted but live stage is ${after.status === "stale" ? (after.observedStage ?? "none") : "unconfirmed"}`,
+          };
+        }
+        return liveReadyToResult(after);
       }
     }
   }

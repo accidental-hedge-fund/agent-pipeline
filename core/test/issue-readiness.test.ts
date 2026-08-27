@@ -116,8 +116,10 @@ function makeDeps(opts: {
   comments?: Array<{ id: number; body: string; author?: string }>;
   harness?: IssueReadinessDeps["invokeImplementer"];
   actor?: string | null;
+  afterAddLabel?: (labels: string[]) => string[];
 } = {}): IssueReadinessDeps & {
   comments: IssueReadinessComment[];
+  liveLabels: string[];
   calls: {
     fetch: number;
     invoke: number;
@@ -147,6 +149,9 @@ function makeDeps(opts: {
   return {
     calls,
     comments,
+    get liveLabels() {
+      return labels.slice();
+    },
     fetchIssue: async () => {
       calls.fetch++;
       if (opts.labelSequence) {
@@ -182,6 +187,7 @@ function makeDeps(opts: {
     addLabel: async (_n, label) => {
       calls.addLabel.push(label);
       if (!labels.includes(label)) labels.push(label);
+      if (opts.afterAddLabel) labels = opts.afterAddLabel(labels.slice());
     },
     removeLabel: async (_n, label) => {
       calls.removeLabel.push(label);
@@ -878,6 +884,64 @@ test("gate: reused needs_spec retries a transient label add", async () => {
   assert.equal(result.kind === "needs_spec" && result.reused, true);
   assert.equal(deps.calls.invoke, 0);
   assert.equal(addAttempts, 2);
+});
+
+test("gate: stage change between needs-spec label writes drops overlay and is stale-dispatch", async () => {
+  const deps = makeDeps({
+    afterAddLabel: () => ["pipeline:planning", "pipeline:needs-spec"],
+  });
+  const result = await evaluateIssueReadiness(makeCfg(), 42, { deps });
+  assert.equal(result.kind, "stale-dispatch");
+  if (result.kind === "stale-dispatch") {
+    assert.equal(result.observedStage, "planning");
+  }
+  assert.equal(deps.calls.invoke, 1);
+  assert.ok(deps.calls.addLabel.includes("pipeline:needs-spec"));
+  assert.ok(deps.calls.removeLabel.includes("pipeline:needs-spec"));
+  assert.equal(deps.liveLabels.includes("pipeline:needs-spec"), false);
+  assert.ok(deps.liveLabels.includes("pipeline:planning"));
+});
+
+test("gate: overlay cleanup failure after later-stage race is mutation-failed", async () => {
+  const deps = makeDeps({
+    afterAddLabel: () => ["pipeline:planning", "pipeline:needs-spec"],
+  });
+  const origRemove = deps.removeLabel;
+  deps.removeLabel = async (n, label) => {
+    if (label === "pipeline:needs-spec") {
+      deps.calls.removeLabel.push(label);
+      return;
+    }
+    await origRemove(n, label);
+  };
+  const result = await evaluateIssueReadiness(makeCfg(), 42, { deps });
+  assert.equal(result.kind, "mutation-failed");
+  if (result.kind === "mutation-failed") {
+    assert.match(result.reason, /needs-spec overlay/);
+  }
+  assert.ok(deps.liveLabels.includes("pipeline:needs-spec"));
+  assert.ok(deps.liveLabels.includes("pipeline:planning"));
+});
+
+test("gate: title/body change during ready-comment persist restarts and does not admit B0", async () => {
+  const cfg = makeCfg();
+  const treatment = resolvedPlanningTreatment(cfg);
+  const hashB0 = hashIssueReadinessInput("Retry failed fetches", THIN_BODY, treatment);
+  const hashB1 = hashIssueReadinessInput("Retry failed fetches", COMPLETE_BODY, treatment);
+  const deps = makeDeps({
+    title: "Retry failed fetches",
+    bodySequence: [THIN_BODY, THIN_BODY, COMPLETE_BODY],
+    harness: async () => ({ success: true, stdout: readyJson(), stderr: "", timed_out: false }),
+  });
+  const result = await evaluateIssueReadiness(cfg, 42, { deps });
+  assert.equal(result.kind, "ready");
+  assert.equal(result.kind === "ready" && result.reused, false);
+  assert.equal(result.kind === "ready" && result.hash, hashB1);
+  assert.equal(deps.calls.invoke, 2);
+  assert.ok(deps.calls.deleteComment.length >= 1);
+  assert.equal(deps.comments.length, 1);
+  assert.ok(deps.comments[0].body.includes(`hash=${hashB1}`));
+  assert.equal(deps.comments[0].body.includes(`hash=${hashB0}`), false);
 });
 
 test("gate: comment persist then live later stage does not add needs-spec", async () => {
