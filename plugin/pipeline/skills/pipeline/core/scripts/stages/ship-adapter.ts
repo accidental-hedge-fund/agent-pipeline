@@ -686,6 +686,66 @@ function normalizeIssue(row: {
   };
 }
 
+/** Injectable seams for {@link observeTrainEvidence}. Production wires gh/git;
+ *  tests inject fakes (no network). */
+export interface ObserveTrainEvidenceDeps {
+  getPrForIssueAnyState(issue: number): Promise<number | null>;
+  ghPrView(pr: number, fields: string[]): Promise<Record<string, unknown>>;
+  observeBase(): Promise<string>;
+  isAncestor(ancestor: string, descendant: string): Promise<boolean>;
+  now?: () => Date;
+}
+
+/**
+ * Prove planned issues are already merged into the candidate head.
+ * Uses any-state issue→PR lookup (ConnectedEvent, closing willCloseTarget,
+ * pipeline head, or title `(#N)`), then requires MERGED + merge OID ancestor
+ * of the candidate. Does not require an open PR. Returns null when any
+ * planned issue lacks that proof.
+ */
+export async function observeTrainEvidence(
+  intent: ShipIntent,
+  plannedIssues: readonly number[],
+  deps: ObserveTrainEvidenceDeps,
+  candidateHeadOid?: string,
+): Promise<ShipTrainEvidence | null> {
+  if (plannedIssues.length === 0) return null;
+  const ordered = [...plannedIssues];
+  const baseTip = await deps.observeBase();
+  const candidate = candidateHeadOid
+    ? requireOid(candidateHeadOid, "ship train checkpoint candidate")
+    : baseTip;
+  if (!(await deps.isAncestor(candidate, baseTip))) return null;
+  for (const issue of ordered) {
+    const pr = await deps.getPrForIssueAnyState(issue);
+    if (pr === null) return null;
+    const data = await deps.ghPrView(pr, ["state", "mergedAt", "mergeCommit"]);
+    const mergedAt = Date.parse(String(data.mergedAt ?? ""));
+    const mergeCommit = data.mergeCommit as { oid?: string } | null | undefined;
+    const mergeOid = mergeCommit?.oid
+      ? requireOid(String(mergeCommit.oid), `ship train PR #${pr} merge commit`)
+      : null;
+    if (
+      String(data.state ?? "").toUpperCase() !== "MERGED" ||
+      !mergeOid ||
+      !(await deps.isAncestor(mergeOid, candidate)) ||
+      !Number.isFinite(mergedAt)
+    ) {
+      return null;
+    }
+  }
+  return {
+    repository: intent.repository,
+    base_branch: intent.base_branch,
+    milestone: intent.milestone,
+    complete: true,
+    ordered_issues: ordered,
+    run_id: null,
+    integrated_head_oid: candidate,
+    completed_at: (deps.now ?? (() => new Date()))().toISOString(),
+  };
+}
+
 function realShipAdapterOperations(opts: RealShipCoordinatorDepsOptions): ShipAdapterOperations {
   const mergeDeps = { ...realMergeDeps(opts.repo), log: opts.progress };
   const ghCfg = { repo: opts.repo } as PipelineConfig;
@@ -764,36 +824,17 @@ function realShipAdapterOperations(opts: RealShipCoordinatorDepsOptions): ShipAd
     plannedIssues: readonly number[],
     candidateHeadOid?: string,
   ): Promise<ShipTrainEvidence | null> => {
-    const deps = trainDeps();
-    if (plannedIssues.length === 0) return null;
-    const ordered = [...plannedIssues];
-    const baseTip = await observeBase();
-    const candidate = candidateHeadOid
-      ? requireOid(candidateHeadOid, "ship train checkpoint candidate")
-      : baseTip;
-    if (!(await isAncestor(candidate, baseTip))) return null;
-    for (const issue of ordered) {
-      const pr = await getPrForIssueAll(issue);
-      if (pr === null) return null;
-      const data = await mergeDeps.ghPrView(pr, ["state", "mergedAt", "mergeCommit"]);
-      const mergedAt = Date.parse(String(data.mergedAt ?? ""));
-      const mergeCommit = data.mergeCommit as { oid?: string } | null | undefined;
-      const mergeOid = mergeCommit?.oid ? requireOid(String(mergeCommit.oid), `ship train PR #${pr} merge commit`) : null;
-      if (String(data.state ?? "").toUpperCase() !== "MERGED" || !mergeOid ||
-          !(await deps.isAncestor(mergeOid, candidate)) || !Number.isFinite(mergedAt)) {
-        return null;
-      }
-    }
-    return {
-      repository: intent.repository,
-      base_branch: intent.base_branch,
-      milestone: intent.milestone,
-      complete: true,
-      ordered_issues: ordered,
-      run_id: null,
-      integrated_head_oid: candidate,
-      completed_at: new Date().toISOString(),
-    };
+    return observeTrainEvidence(
+      intent,
+      plannedIssues,
+      {
+        getPrForIssueAnyState: getPrForIssueAll,
+        ghPrView: mergeDeps.ghPrView,
+        observeBase,
+        isAncestor,
+      },
+      candidateHeadOid,
+    );
   };
 
   const observeFrg = async (

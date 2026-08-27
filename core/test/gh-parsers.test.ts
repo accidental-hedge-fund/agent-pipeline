@@ -910,18 +910,39 @@ test("addIssueComment: timeout surfaces as an error rather than hanging", async 
 
 const TIMELINE_CFG = { repo: "accidental-hedge-fund/agent-pipeline" } as PipelineConfig;
 
-function connectedEventNode(prNumber: number, isCrossRepository = false) {
+function connectedEventNode(
+  prNumber: number,
+  isCrossRepository = false,
+  opts: { headRefName?: string; title?: string } = {},
+) {
   return {
     __typename: "ConnectedEvent",
-    subject: { __typename: "PullRequest", number: prNumber, headRefName: `pr-${prNumber}`, isCrossRepository },
+    subject: {
+      __typename: "PullRequest",
+      number: prNumber,
+      headRefName: opts.headRefName ?? `pr-${prNumber}`,
+      title: opts.title ?? `PR ${prNumber}`,
+      isCrossRepository,
+    },
   };
 }
 
-function crossReferencedEventNode(prNumber: number, willCloseTarget: boolean, isCrossRepository = false) {
+function crossReferencedEventNode(
+  prNumber: number,
+  willCloseTarget: boolean,
+  isCrossRepository = false,
+  opts: { headRefName?: string; title?: string } = {},
+) {
   return {
     __typename: "CrossReferencedEvent",
     willCloseTarget,
-    source: { __typename: "PullRequest", number: prNumber, headRefName: `pr-${prNumber}`, isCrossRepository },
+    source: {
+      __typename: "PullRequest",
+      number: prNumber,
+      headRefName: opts.headRefName ?? `pr-${prNumber}`,
+      title: opts.title ?? `PR ${prNumber}`,
+      isCrossRepository,
+    },
   };
 }
 
@@ -935,21 +956,83 @@ function timelinePageResponse(
 }
 
 test("pickPrFromTimelinePage: a ConnectedEvent (manual link) resolves the PR", () => {
-  assert.equal(pickPrFromTimelinePage([connectedEventNode(9)]), 9);
+  assert.equal(pickPrFromTimelinePage([connectedEventNode(9)], 154), 9);
 });
 
-test("pickPrFromTimelinePage: a CrossReferencedEvent only resolves when willCloseTarget is true", () => {
-  assert.equal(pickPrFromTimelinePage([crossReferencedEventNode(9, false)]), null, "a mere mention must not match");
-  assert.equal(pickPrFromTimelinePage([crossReferencedEventNode(9, true)]), 9);
+test("pickPrFromTimelinePage: closing CrossReferencedEvent still resolves", () => {
+  assert.equal(pickPrFromTimelinePage([crossReferencedEventNode(9, true)], 154), 9);
+});
+
+test("pickPrFromTimelinePage: mere non-pipeline mention (willCloseTarget false) does not resolve", () => {
+  assert.equal(
+    pickPrFromTimelinePage([crossReferencedEventNode(9, false)], 9),
+    null,
+    "a mere mention must not match",
+  );
+  assert.equal(
+    pickPrFromTimelinePage([
+      crossReferencedEventNode(9, false, false, {
+        headRefName: "docs/changelog",
+        title: "docs: mention issue 9 and Fixes #9 without closing",
+      }),
+    ], 9),
+    null,
+    "bare #N / Fixes #N in title is not the parenthetical identity",
+  );
+});
+
+test("pickPrFromTimelinePage: non-closing pipeline-head CrossReferencedEvent resolves (#1269)", () => {
+  assert.equal(
+    pickPrFromTimelinePage([
+      crossReferencedEventNode(1262, false, false, {
+        headRefName: "pipeline/1258-resume-after-run-fatal",
+        title: "fix(pipeline): resume after run fatal",
+      }),
+    ], 1258),
+    1262,
+  );
+});
+
+test("pickPrFromTimelinePage: non-closing parenthetical title CrossReferencedEvent resolves (#1269)", () => {
+  assert.equal(
+    pickPrFromTimelinePage([
+      crossReferencedEventNode(1262, false, false, {
+        headRefName: "hotfix/not-pipeline-prefix",
+        title: "fix(pipeline): resume after run fatal (#1258)",
+      }),
+    ], 1258),
+    1262,
+  );
 });
 
 test("pickPrFromTimelinePage: a fork PR (isCrossRepository) is excluded", () => {
-  assert.equal(pickPrFromTimelinePage([connectedEventNode(9, true)]), null);
-  assert.equal(pickPrFromTimelinePage([crossReferencedEventNode(9, true, true)]), null);
+  assert.equal(pickPrFromTimelinePage([connectedEventNode(9, true)], 9), null);
+  assert.equal(pickPrFromTimelinePage([crossReferencedEventNode(9, true, true)], 9), null);
+});
+
+test("pickPrFromTimelinePage: fork cannot spoof pipeline-head or (#N) title identity (#1269)", () => {
+  assert.equal(
+    pickPrFromTimelinePage([
+      crossReferencedEventNode(99, false, true, {
+        headRefName: "pipeline/1258-spoofed",
+        title: "spoof (#1258)",
+      }),
+    ], 1258),
+    null,
+  );
+  assert.equal(
+    pickPrFromTimelinePage([
+      connectedEventNode(99, true, {
+        headRefName: "pipeline/1258-spoofed",
+        title: "spoof (#1258)",
+      }),
+    ], 1258),
+    null,
+  );
 });
 
 test("pickPrFromTimelinePage: scans newest-first when multiple links exist", () => {
-  assert.equal(pickPrFromTimelinePage([connectedEventNode(5), connectedEventNode(9)]), 9);
+  assert.equal(pickPrFromTimelinePage([connectedEventNode(5), connectedEventNode(9)], 154), 9);
 });
 
 test("getPrForIssueAnyState: resolves via GraphQL timeline query, not a repo-wide gh pr list scan", async () => {
@@ -963,7 +1046,20 @@ test("getPrForIssueAnyState: resolves via GraphQL timeline query, not a repo-wid
   const joined = captured.join(" ");
   assert.ok(captured.includes("graphql"), "must call the GraphQL endpoint");
   assert.ok(joined.includes("timelineItems"), "must query the issue timeline");
+  assert.ok(joined.includes("title"), "must fetch PR title for the (#N) identity");
+  assert.ok(joined.includes("headRefName"), "must fetch headRefName for pipeline/<N>-* identity");
   assert.ok(!joined.includes("pr list"), "must not fall back to a repo-wide pr list scan");
+});
+
+test("getPrForIssueAnyState: non-closing pipeline (#N) CrossReferencedEvent resolves (#1269)", async () => {
+  const run: GhApiRunner = async () =>
+    timelinePageResponse([
+      crossReferencedEventNode(1262, false, false, {
+        headRefName: "pipeline/1258-resume-after-run-fatal",
+        title: "fix(pipeline): resume after run fatal (#1258)",
+      }),
+    ]);
+  assert.equal(await getPrForIssueAnyState(TIMELINE_CFG, 1258, run), 1262);
 });
 
 test("getPrForIssueAnyState: an old merged PR beyond a 100-PR window is still found by paginating backward", async () => {
@@ -1154,6 +1250,30 @@ test("getPrForIssue: exhausted open pages with no match returns null", async () 
   const result = await getPrForIssue(OPEN_PR_CFG, 623, run);
   assert.equal(result, null);
   assert.equal(calls, 2, "must exhaust pages before returning null");
+});
+
+test("getPrForIssue: title-only (#N) or Fixes #N without branch/closing-ref still returns null (#1269)", async () => {
+  let captured: string[] = [];
+  const run: GhApiRunner = async (args) => {
+    captured = args;
+    return openPrsPageResponse([openPrNode(99, "feat/unrelated-mention")]);
+  };
+  assert.equal(await getPrForIssue(OPEN_PR_CFG, 42, run), null);
+  const joined = captured.join(" ");
+  assert.ok(captured.includes("graphql"), "open path stays on GraphQL pullRequests");
+  assert.ok(joined.includes("pullRequests"));
+  assert.ok(
+    !/\btitle\b/.test(joined),
+    "open-path GraphQL must not fetch title for title search",
+  );
+  assert.equal(
+    resolvePrForIssue(
+      [cand(99, "feat/unrelated-mention")],
+      42,
+      TARGET_REPO,
+    ),
+    null,
+  );
 });
 
 test("getPrForIssue: safety page bound fails visibly instead of silent null after truncation", async () => {

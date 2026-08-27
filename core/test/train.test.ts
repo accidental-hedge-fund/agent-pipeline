@@ -847,6 +847,46 @@ test("train merge: open R2D + since-merged PR (any-state only) is already-integr
   assert.equal(result.status.items[0]!.integrated, true);
 });
 
+test("train merge: ready-to-deploy with merged (#N) pipeline PR is already-integrated (#1269)", async () => {
+  // Bite: after ship train squash-merges `… (#N)` titles, open lookup is null
+  // and GitHub records willCloseTarget=false. Any-state must still classify
+  // the item already-integrated so resume does not STOP with no-open-PR.
+  const deps = makeDeps();
+  const items: Array<{ issue: number; pr: number; oid: string }> = [
+    { issue: 1258, pr: 1262, oid: "merge1262" + "0".repeat(31) },
+    { issue: 1259, pr: 1263, oid: "merge1263" + "0".repeat(31) },
+    { issue: 1252, pr: 1267, oid: "merge1267" + "0".repeat(31) },
+  ];
+  for (const item of items) {
+    deps.seedIssue(
+      snap(item.issue, "merged", ["pipeline:ready-to-deploy"], `Issue ${item.issue}`),
+    );
+    deps.seedMergedPrAnyState(item.issue, item.pr, item.oid);
+  }
+
+  const result = await runTrain(
+    baseOpts({ issues: items.map((i) => i.issue), merge: true }),
+    deps,
+  );
+  assert.equal(result.exitCode, 0, result.status.blocker ?? "ok");
+  assert.equal(deps.mergeCalls.length, 0, "must not invoke a merge mutation");
+  assert.equal(deps.advanceCalls.length, 0);
+  assert.ok(
+    !/no linked open PR/.test(result.status.blocker ?? ""),
+    "must not STOP with ready-to-deploy but has no linked open PR",
+  );
+  assert.equal(result.status.complete, true);
+  assert.equal(result.status.blocker, null);
+  assert.equal(result.status.items.length, 3);
+  for (const [i, item] of items.entries()) {
+    assert.equal(result.status.items[i]!.issue, item.issue);
+    assert.equal(result.status.items[i]!.pr, item.pr);
+    assert.equal(result.status.items[i]!.terminal, "already-integrated");
+    assert.equal(result.status.items[i]!.integrated, true);
+  }
+  assert.deepEqual(deps.anyStateCalls.slice(0, 3), [1258, 1259, 1252]);
+});
+
 test("train merge: reopened pre-R2D issue with only historical merged PR advances (#1014 review)", async () => {
   // Bite: unrestricted any-state early reconciliation treated a reopened
   // pipeline:ready issue as already-integrated from its prior merged PR and
