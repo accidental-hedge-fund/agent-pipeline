@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-08-27
+goal: In-place re-drive or explicit refusal for pipeline loop --resume after
+  terminal run_fatal
