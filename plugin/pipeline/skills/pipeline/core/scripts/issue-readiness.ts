@@ -9,8 +9,10 @@
 import { createHash } from "node:crypto";
 import {
   addLabel as ghAddLabel,
+  deleteIssueComment,
   getGhActor,
   getIssueDetail,
+  isHttp404Signal,
   listIssueCommentsWithIds,
   pickStage,
   postComment,
@@ -38,6 +40,9 @@ export const ISSUE_READINESS_CANONICAL_HEADINGS = [
 
 const MARKER_RE =
   /<!-- pipeline-issue-readiness verdict=(ready|needs_spec) hash=([0-9a-f]{64}) implementer=(\S+) model=(\S+) effort=(\S+) -->/;
+
+/** First evaluation plus this many restarts when live title/body drifts mid-call. */
+const ISSUE_READINESS_INPUT_DRIFT_ATTEMPTS = 3;
 
 export type IssueReadinessKind = "ready" | "needs_spec" | "gate-unavailable" | "stale-dispatch";
 
@@ -87,6 +92,7 @@ export interface IssueReadinessDeps {
   getPipelineActor(): Promise<string | null>;
   createComment(issueNumber: number, body: string): Promise<void>;
   updateComment(commentId: number, body: string): Promise<void>;
+  deleteComment(commentId: number): Promise<void>;
   addLabel(issueNumber: number, label: string): Promise<void>;
   removeLabel(issueNumber: number, label: string): Promise<void>;
   invokeImplementer(input: {
@@ -171,6 +177,9 @@ export function realIssueReadinessDeps(cfg: PipelineConfig): IssueReadinessDeps 
     },
     updateComment: async (commentId, body) => {
       await updateIssueComment(cfg, commentId, body);
+    },
+    deleteComment: async (commentId) => {
+      await deleteIssueComment(cfg, commentId);
     },
     addLabel: async (issueNumber, label) => {
       await ghAddLabel(cfg, issueNumber, label);
@@ -261,24 +270,37 @@ export function proposedBodyHasCanonicalHeadings(body: string): boolean {
   return true;
 }
 
+function isOwnedReadinessComment(comment: IssueReadinessComment, actor: string): boolean {
+  if (comment.author !== actor) return false;
+  if (!isVerifiedPipelineAttestation(comment.body)) return false;
+  const attestation = extractPipelineAttestation(comment.body);
+  if (!attestation || !ISSUE_READINESS_ATTEST_KINDS.has(attestation.kind)) return false;
+  return parseIssueReadinessMarker(comment.body) !== null;
+}
+
+function ownedReadinessComments(
+  comments: IssueReadinessComment[],
+  actor: string,
+): { comment: IssueReadinessComment; record: IssueReadinessRecord }[] {
+  const found: { comment: IssueReadinessComment; record: IssueReadinessRecord }[] = [];
+  for (const comment of comments) {
+    if (!isOwnedReadinessComment(comment, actor)) continue;
+    const record = parseIssueReadinessMarker(comment.body);
+    if (record) found.push({ comment, record });
+  }
+  found.sort((a, b) => a.comment.id - b.comment.id);
+  return found;
+}
+
 function findOwnedReadinessComment(
   comments: IssueReadinessComment[],
-  actor: string | null,
+  actor: string,
 ): { comment: IssueReadinessComment; record: IssueReadinessRecord } | undefined {
-  if (!actor) return undefined;
-  for (const comment of comments) {
-    if (comment.author !== actor) continue;
-    if (!isVerifiedPipelineAttestation(comment.body)) continue;
-    const attestation = extractPipelineAttestation(comment.body);
-    if (!attestation || !ISSUE_READINESS_ATTEST_KINDS.has(attestation.kind)) continue;
-    const record = parseIssueReadinessMarker(comment.body);
-    if (record) return { comment, record };
-  }
-  return undefined;
+  return ownedReadinessComments(comments, actor)[0];
 }
 
 type LiveReadyCheck =
-  | { status: "ready"; labels: string[] }
+  | { status: "ready"; title: string; body: string; labels: string[] }
   | { status: "stale"; observedStage: Stage | null }
   | { status: "unavailable"; reason: string };
 
@@ -296,7 +318,7 @@ async function requireLiveReady(
   if (observedStage !== "ready") {
     return { status: "stale", observedStage };
   }
-  return { status: "ready", labels: live.labels };
+  return { status: "ready", title: live.title, body: live.body, labels: live.labels };
 }
 
 function liveReadyToResult(
@@ -361,18 +383,45 @@ export function buildIssueReadinessComment(input: {
   return attestPipelineComment(kind, renderOwnedComment(input));
 }
 
+async function reconcileOwnedReadinessComments(
+  deps: IssueReadinessDeps,
+  issueNumber: number,
+  actor: string,
+  body: string,
+): Promise<void> {
+  const comments = await deps.listComments(issueNumber);
+  const owned = ownedReadinessComments(comments, actor);
+  if (owned.length === 0) {
+    throw new Error("owned readiness comment missing after persist");
+  }
+  const canonical = owned[0].comment;
+  if (canonical.body !== body) {
+    await deps.updateComment(canonical.id, body);
+  }
+  for (const extra of owned.slice(1)) {
+    try {
+      await deps.deleteComment(extra.comment.id);
+    } catch (err) {
+      if (!isHttp404Signal((err as Error).message)) {
+        throw err;
+      }
+    }
+  }
+}
+
 async function persistOwnedComment(
   deps: IssueReadinessDeps,
   issueNumber: number,
+  actor: string,
   owned: IssueReadinessComment | undefined,
   body: string,
-): Promise<"created" | "updated"> {
+): Promise<void> {
   if (owned) {
     await deps.updateComment(owned.id, body);
-    return "updated";
+  } else {
+    await deps.createComment(issueNumber, body);
   }
-  await deps.createComment(issueNumber, body);
-  return "created";
+  await reconcileOwnedReadinessComments(deps, issueNumber, actor, body);
 }
 
 async function applyNeedsSpecLabels(deps: IssueReadinessDeps, issueNumber: number, labels: string[]): Promise<void> {
@@ -390,6 +439,26 @@ async function applyNeedsSpecLabels(deps: IssueReadinessDeps, issueNumber: numbe
  * Shared admission gate. Callers skip this entirely when
  * `cfg.issue_readiness.enabled` is false.
  */
+type InputDrift = { kind: "input-changed"; issue: { title: string; body: string; labels: string[] } };
+
+async function confirmLiveInput(
+  deps: IssueReadinessDeps,
+  issueNumber: number,
+  hash: string,
+  treatment: IssueReadinessTreatment,
+): Promise<LiveReadyCheck | InputDrift> {
+  const live = await requireLiveReady(deps, issueNumber);
+  if (live.status !== "ready") return live;
+  const liveHash = hashIssueReadinessInput(live.title, live.body, treatment);
+  if (liveHash !== hash) {
+    return {
+      kind: "input-changed",
+      issue: { title: live.title, body: live.body, labels: live.labels },
+    };
+  }
+  return live;
+}
+
 export async function evaluateIssueReadiness(
   cfg: PipelineConfig,
   issueNumber: number,
@@ -411,6 +480,51 @@ export async function evaluateIssueReadiness(
     return { kind: "stale-dispatch", observedStage };
   }
 
+  let actor: string;
+  try {
+    const lookedUp = await deps.getPipelineActor();
+    if (!lookedUp) {
+      return { kind: "gate-unavailable", reason: "pipeline actor lookup failed" };
+    }
+    actor = lookedUp;
+  } catch (err) {
+    return { kind: "gate-unavailable", reason: `pipeline actor lookup failed: ${(err as Error).message}` };
+  }
+
+  for (let attempt = 1; attempt <= ISSUE_READINESS_INPUT_DRIFT_ATTEMPTS; attempt++) {
+    const result = await evaluateIssueReadinessAttempt({
+      cfg,
+      issueNumber,
+      deps,
+      dryRun,
+      treatment,
+      issue,
+      actor,
+    });
+    if (result.kind !== "input-changed") return result;
+    issue = result.issue;
+  }
+  return {
+    kind: "gate-unavailable",
+    reason: "issue title/body changed during admission evaluation",
+  };
+}
+
+async function evaluateIssueReadinessAttempt(input: {
+  cfg: PipelineConfig;
+  issueNumber: number;
+  deps: IssueReadinessDeps;
+  dryRun: boolean;
+  treatment: IssueReadinessTreatment;
+  issue: { title: string; body: string; labels: string[] };
+  actor: string;
+}): Promise<IssueReadinessResult | InputDrift> {
+  const { cfg, issueNumber, deps, dryRun, treatment, issue, actor } = input;
+  const observedStage = pickStage(issue.labels);
+  if (observedStage !== "ready") {
+    return { kind: "stale-dispatch", observedStage };
+  }
+
   const hash = hashIssueReadinessInput(issue.title, issue.body, treatment);
 
   let comments: IssueReadinessComment[] = [];
@@ -420,22 +534,26 @@ export async function evaluateIssueReadiness(
     return { kind: "gate-unavailable", reason: `comment list failed: ${(err as Error).message}` };
   }
 
-  let actor: string | null = null;
-  try {
-    actor = await deps.getPipelineActor();
-  } catch {
-    actor = null;
-  }
   const owned = findOwnedReadinessComment(comments, actor);
 
   if (owned?.record && recordsMatch(owned.record, hash, treatment)) {
     if (owned.record.verdict === "ready") {
+      if (!dryRun) {
+        const live = await confirmLiveInput(deps, issueNumber, hash, treatment);
+        if ("kind" in live) return live;
+        if (live.status !== "ready") return liveReadyToResult(live);
+      }
       return { kind: "ready", reused: true, hash, treatment };
     }
     if (!dryRun) {
-      const live = await requireLiveReady(deps, issueNumber);
+      const live = await confirmLiveInput(deps, issueNumber, hash, treatment);
+      if ("kind" in live) return live;
       if (live.status !== "ready") return liveReadyToResult(live);
-      await applyNeedsSpecLabels(deps, issueNumber, live.labels);
+      try {
+        await applyNeedsSpecLabels(deps, issueNumber, live.labels);
+      } catch (err) {
+        return { kind: "gate-unavailable", reason: `GitHub mutation failed: ${(err as Error).message}` };
+      }
     }
     return {
       kind: "needs_spec",
@@ -493,20 +611,22 @@ export async function evaluateIssueReadiness(
     evaluatedAt,
   });
 
-  if (verdict.verdict === "ready") {
-    if (!dryRun) {
-      const live = await requireLiveReady(deps, issueNumber);
-      if (live.status !== "ready") return liveReadyToResult(live);
-      await persistOwnedComment(deps, issueNumber, owned?.comment, commentBody);
+  if (!dryRun) {
+    const live = await confirmLiveInput(deps, issueNumber, hash, treatment);
+    if ("kind" in live) return live;
+    if (live.status !== "ready") return liveReadyToResult(live);
+    try {
+      await persistOwnedComment(deps, issueNumber, actor, owned?.comment, commentBody);
+      if (verdict.verdict === "needs_spec") {
+        await applyNeedsSpecLabels(deps, issueNumber, live.labels);
+      }
+    } catch (err) {
+      return { kind: "gate-unavailable", reason: `GitHub mutation failed: ${(err as Error).message}` };
     }
-    return { kind: "ready", reused: false, hash, treatment };
   }
 
-  if (!dryRun) {
-    const live = await requireLiveReady(deps, issueNumber);
-    if (live.status !== "ready") return liveReadyToResult(live);
-    await persistOwnedComment(deps, issueNumber, owned?.comment, commentBody);
-    await applyNeedsSpecLabels(deps, issueNumber, live.labels);
+  if (verdict.verdict === "ready") {
+    return { kind: "ready", reused: false, hash, treatment };
   }
   return {
     kind: "needs_spec",

@@ -140,6 +140,13 @@ On `needs_spec` the gate SHALL create or update exactly one Pipeline-authored Gi
 - **THEN** the gate SHALL post a new Pipeline-authored comment
 - **AND** SHALL NOT update the foreign comment
 
+#### Scenario: Concurrent first rejection retains one owned comment
+
+- **WHEN** two hosts both list comments before either creates the first owned comment
+- **AND** both evaluations produce `needs_spec`
+- **THEN** the gate SHALL reconcile to exactly one Pipeline-authored owned comment before returning a verdict
+- **AND** SHALL NOT leave two owned comments on the issue
+
 ### Requirement: A needs_spec result SHALL move the issue to pipeline:needs-spec and SHALL NOT start delivery
 
 On `needs_spec` the gate SHALL transition the issue from `pipeline:ready` to `pipeline:needs-spec`. It SHALL NOT create a worktree. It SHALL NOT invoke the planning authoring harness or the implementation delivery harness. Queue and loop output SHALL name the structured `needs_spec` reason. Independent eligible issues SHALL continue.
@@ -208,7 +215,7 @@ The gate SHALL persist the bound verdict in the owned comment for both `ready` a
 
 ### Requirement: The gate SHALL no-op when the live stage is no longer ready
 
-The gate SHALL require the freshly fetched pipeline stage to be `ready` before evaluation or verdict reuse. Immediately before any `needs_spec` GitHub mutation, the gate SHALL re-fetch labels and SHALL require the live stage to still be `ready`. If the live stage is any other value, the gate SHALL return a typed `stale-dispatch` outcome. That outcome SHALL NOT write the owned comment and SHALL NOT add `pipeline:needs-spec`. When the first fetch already shows a non-ready stage, the gate SHALL NOT invoke the model.
+The gate SHALL require the freshly fetched pipeline stage to be `ready` before evaluation or verdict reuse. Immediately before any GitHub mutation or `ready` admission, the gate SHALL re-fetch title, body, and labels. It SHALL require the live stage to still be `ready` and the live title/body hash (with the resolved planning treatment) to match the evaluated input. If the live stage is any other value, the gate SHALL return a typed `stale-dispatch` outcome. That outcome SHALL NOT write the owned comment and SHALL NOT add `pipeline:needs-spec`. When the first fetch already shows a non-ready stage, the gate SHALL NOT invoke the model. If the live hash does not match, the gate SHALL NOT persist that verdict and SHALL NOT start planning; it SHALL restart evaluation against the live input. Restarts SHALL be bounded to at most three evaluation attempts including the first. Exhausting that budget SHALL be typed `gate-unavailable` with no GitHub mutation.
 
 #### Scenario: Fresh fetch shows a later stage
 
@@ -224,6 +231,21 @@ The gate SHALL require the freshly fetched pipeline stage to be `ready` before e
 - **THEN** the outcome SHALL be `stale-dispatch`
 - **AND** the gate SHALL NOT write the owned comment
 - **AND** the gate SHALL NOT add `pipeline:needs-spec`
+
+#### Scenario: Body changes during evaluation
+
+- **WHEN** the first fetch is body B0 and the Implementer returns `ready` for B0
+- **AND** a live re-fetch before persist shows body B1 with stage still `ready`
+- **THEN** the gate SHALL NOT persist a B0-bound `ready` record
+- **AND** SHALL NOT start planning on B1 without evaluating B1
+- **AND** SHALL evaluate B1 (or reuse a B1-bound record)
+
+#### Scenario: Drift budget exhausted is gate-unavailable
+
+- **WHEN** live title or body changes on every re-fetch until the restart budget is exhausted
+- **THEN** the outcome SHALL be `gate-unavailable`
+- **AND** no owned comment SHALL be written
+- **AND** the issue SHALL remain on `pipeline:ready`
 
 ### Requirement: Triage to ready SHALL be an admission request, not a bypass of the gate
 
@@ -246,7 +268,7 @@ After an author applies a proposed body, `pipeline triage <N> --stage ready` SHA
 
 ### Requirement: Provider, harness, timeout, or schema failure SHALL be typed gate-unavailable with no fallback
 
-When the Implementer cannot be invoked, times out, or returns a response that fails the verdict schema, the outcome SHALL be typed `gate-unavailable`. A `needs_spec` response whose `proposed_body` omits the required headings or lists them out of order SHALL fail the verdict schema. The gate SHALL NOT fall back to a structural heuristic, the Reviewer, another provider, or another model. Direct single invocation SHALL fail with a non-zero exit and SHALL NOT start delivery. Multi-item runs SHALL block the affected issue and its selected dependents for that run and SHALL continue independent selected issues. The gate SHALL NOT write GitHub mutations on `gate-unavailable`. The issue SHALL remain on `pipeline:ready`.
+When the Implementer cannot be invoked, times out, or returns a response that fails the verdict schema, the outcome SHALL be typed `gate-unavailable`. A `needs_spec` response whose `proposed_body` omits the required headings or lists them out of order SHALL fail the verdict schema. When pipeline-actor lookup fails or returns no actor, the outcome SHALL be typed `gate-unavailable`; the gate SHALL NOT invoke the Implementer and SHALL NOT write GitHub mutations until ownership can be verified. The gate SHALL NOT fall back to a structural heuristic, the Reviewer, another provider, or another model. Direct single invocation SHALL fail with a non-zero exit and SHALL NOT start delivery. Multi-item runs SHALL block the affected issue and its selected dependents for that run and SHALL continue independent selected issues. The gate SHALL NOT write GitHub mutations on `gate-unavailable`. The issue SHALL remain on `pipeline:ready`.
 
 #### Scenario: Direct single fails visibly
 
@@ -260,6 +282,14 @@ When the Implementer cannot be invoked, times out, or returns a response that fa
 - **WHEN** the model returns JSON without a `verdict` field
 - **THEN** the outcome SHALL be `gate-unavailable`
 - **AND** the issue SHALL NOT be labeled `pipeline:needs-spec`
+
+#### Scenario: Actor lookup failure is gate-unavailable
+
+- **WHEN** pipeline-actor lookup throws or returns no actor
+- **AND** a Pipeline-authored readiness comment is already present
+- **THEN** the outcome SHALL be `gate-unavailable`
+- **AND** the Implementer SHALL NOT be invoked
+- **AND** no new comment SHALL be created
 
 #### Scenario: Draft missing a required heading is gate-unavailable
 

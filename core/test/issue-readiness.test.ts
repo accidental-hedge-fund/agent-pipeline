@@ -110,17 +110,20 @@ function ownedComment(input: {
 function makeDeps(opts: {
   title?: string;
   body?: string;
+  bodySequence?: string[];
   labels?: string[];
   labelSequence?: string[][];
   comments?: Array<{ id: number; body: string; author?: string }>;
   harness?: IssueReadinessDeps["invokeImplementer"];
   actor?: string | null;
 }): IssueReadinessDeps & {
+  comments: IssueReadinessComment[];
   calls: {
     fetch: number;
     invoke: number;
     createComment: string[];
     updateComment: Array<{ id: number; body: string }>;
+    deleteComment: number[];
     addLabel: string[];
     removeLabel: string[];
   };
@@ -130,6 +133,7 @@ function makeDeps(opts: {
     invoke: 0,
     createComment: [] as string[],
     updateComment: [] as Array<{ id: number; body: string }>,
+    deleteComment: [] as number[],
     addLabel: [] as string[],
     removeLabel: [] as string[],
   };
@@ -138,27 +142,39 @@ function makeDeps(opts: {
     body: c.body,
     author: c.author ?? "unknown",
   }));
+  let nextCommentId = Math.max(0, ...comments.map((c) => c.id)) + 1;
   return {
     calls,
+    comments,
     fetchIssue: async () => {
       calls.fetch++;
       const labels = opts.labelSequence
         ? opts.labelSequence[Math.min(calls.fetch - 1, opts.labelSequence.length - 1)]
         : (opts.labels ?? ["pipeline:ready"]);
+      const body = opts.bodySequence
+        ? opts.bodySequence[Math.min(calls.fetch - 1, opts.bodySequence.length - 1)]
+        : (opts.body ?? THIN_BODY);
       return {
         title: opts.title ?? "Thin issue",
-        body: opts.body ?? THIN_BODY,
+        body,
         labels,
       };
     },
-    listComments: async () => comments,
+    listComments: async () => comments.slice(),
     getPipelineActor: async () => (opts.actor === undefined ? PIPELINE_ACTOR : opts.actor),
     createComment: async (_n, body) => {
       calls.createComment.push(body);
-      comments.push({ id: comments.length + 1, body, author: PIPELINE_ACTOR });
+      comments.push({ id: nextCommentId++, body, author: PIPELINE_ACTOR });
     },
     updateComment: async (id, body) => {
       calls.updateComment.push({ id, body });
+      const existing = comments.find((c) => c.id === id);
+      if (existing) existing.body = body;
+    },
+    deleteComment: async (id) => {
+      calls.deleteComment.push(id);
+      const idx = comments.findIndex((c) => c.id === id);
+      if (idx >= 0) comments.splice(idx, 1);
     },
     addLabel: async (_n, label) => {
       calls.addLabel.push(label);
@@ -642,6 +658,131 @@ test("dispatch ready: stale-dispatch is a waiting no-op", async () => {
     assert.match(out.reason, /stale-dispatch/);
   }
   assert.equal(planning, 0);
+});
+
+test("gate: body change during evaluation restarts against live input", async () => {
+  const cfg = makeCfg();
+  const treatment = resolvedPlanningTreatment(cfg);
+  const hashB1 = hashIssueReadinessInput("Retry failed fetches", COMPLETE_BODY, treatment);
+  const deps = makeDeps({
+    title: "Retry failed fetches",
+    bodySequence: [THIN_BODY, COMPLETE_BODY, COMPLETE_BODY],
+    harness: async () => ({ success: true, stdout: readyJson(), stderr: "", timed_out: false }),
+  });
+  const result = await evaluateIssueReadiness(cfg, 42, { deps });
+  assert.equal(result.kind, "ready");
+  assert.equal(result.kind === "ready" && result.reused, false);
+  assert.equal(result.kind === "ready" && result.hash, hashB1);
+  assert.equal(deps.calls.invoke, 2);
+  assert.equal(deps.calls.createComment.length, 1);
+  assert.ok(deps.calls.createComment[0].includes(`hash=${hashB1}`));
+});
+
+test("gate: input drift budget exhausted is gate-unavailable with no writes", async () => {
+  const deps = makeDeps({
+    bodySequence: ["b0", "b1", "b2", "b3", "b4"],
+    harness: async () => ({ success: true, stdout: readyJson(), stderr: "", timed_out: false }),
+  });
+  const result = await evaluateIssueReadiness(makeCfg(), 42, { deps });
+  assert.equal(result.kind, "gate-unavailable");
+  if (result.kind === "gate-unavailable") {
+    assert.match(result.reason, /changed during admission evaluation/);
+  }
+  assert.equal(deps.calls.invoke, 3);
+  assert.equal(deps.calls.createComment.length, 0);
+  assert.equal(deps.calls.addLabel.length, 0);
+});
+
+test("gate: actor lookup failure is gate-unavailable with no invoke or writes", async () => {
+  const cfg = makeCfg();
+  const treatment = resolvedPlanningTreatment(cfg);
+  const hash = hashIssueReadinessInput("Thin issue", THIN_BODY, treatment);
+  for (const actorFn of [
+    async () => null,
+    async () => {
+      throw new Error("whoami failed");
+    },
+  ] as const) {
+    const deps = makeDeps({
+      comments: [ownedComment({ id: 3, verdict: "needs_spec", hash, treatment })],
+    });
+    deps.getPipelineActor = actorFn;
+    const result = await evaluateIssueReadiness(cfg, 42, { deps });
+    assert.equal(result.kind, "gate-unavailable");
+    if (result.kind === "gate-unavailable") {
+      assert.match(result.reason, /actor lookup failed/);
+    }
+    assert.equal(deps.calls.invoke, 0);
+    assert.equal(deps.calls.createComment.length, 0);
+    assert.equal(deps.calls.updateComment.length, 0);
+    assert.equal(deps.calls.addLabel.length, 0);
+  }
+});
+
+test("gate: concurrent first needs_spec keeps one owned comment", async () => {
+  const comments: IssueReadinessComment[] = [];
+  let nextId = 10;
+  let firstLists = 0;
+  let releaseFirstLists!: () => void;
+  const bothListed = new Promise<void>((resolve) => {
+    releaseFirstLists = resolve;
+  });
+  let createsStarted = 0;
+  let releaseCreates!: () => void;
+  const bothCreating = new Promise<void>((resolve) => {
+    releaseCreates = resolve;
+  });
+  const calls = { create: 0, delete: [] as number[] };
+  const deps: IssueReadinessDeps = {
+    fetchIssue: async () => ({ title: "Thin issue", body: THIN_BODY, labels: ["pipeline:ready"] }),
+    listComments: async () => {
+      if (calls.create === 0) {
+        firstLists++;
+        if (firstLists >= 2) releaseFirstLists();
+        await bothListed;
+      }
+      return comments.map((c) => ({ ...c }));
+    },
+    getPipelineActor: async () => PIPELINE_ACTOR,
+    createComment: async (_n, body) => {
+      createsStarted++;
+      if (createsStarted >= 2) releaseCreates();
+      await bothCreating;
+      comments.push({
+        id: nextId++,
+        body,
+        author: PIPELINE_ACTOR,
+      });
+      calls.create++;
+    },
+    updateComment: async (id, body) => {
+      const existing = comments.find((c) => c.id === id);
+      if (existing) existing.body = body;
+    },
+    deleteComment: async (id) => {
+      calls.delete.push(id);
+      const idx = comments.findIndex((c) => c.id === id);
+      if (idx >= 0) comments.splice(idx, 1);
+    },
+    addLabel: async () => {},
+    removeLabel: async () => {},
+    invokeImplementer: async () => ({
+      success: true,
+      stdout: needsSpecJson(),
+      stderr: "",
+      timed_out: false,
+    }),
+    now: () => new Date("2026-08-27T01:48:04Z"),
+  };
+  const [a, b] = await Promise.all([
+    evaluateIssueReadiness(makeCfg(), 42, { deps }),
+    evaluateIssueReadiness(makeCfg(), 42, { deps }),
+  ]);
+  assert.equal(a.kind, "needs_spec");
+  assert.equal(b.kind, "needs_spec");
+  assert.equal(calls.create, 2);
+  assert.equal(comments.length, 1, "exactly one owned comment remains");
+  assert.ok(calls.delete.includes(11));
 });
 
 test("dispatch ready: gate-unavailable is typed error", async () => {

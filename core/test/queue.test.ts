@@ -186,6 +186,7 @@ test("selectIssues: priority ordering — pipeline:ready scores higher than pipe
     makeIssue(3, ["pipeline:fix-1"]),
   ];
   const result = selectIssues(candidates, {}, 10);
+  assert.equal(result.length, 1);
   assert.equal(result[0].number, 2, "pipeline:ready should rank first");
 });
 
@@ -833,6 +834,42 @@ test("Finding 3 regression: aggregate.excluded_count is present in batch summary
 // ---------------------------------------------------------------------------
 // Review-2 regression tests
 // ---------------------------------------------------------------------------
+
+test("selectIssues: planning, review, and implementing are not autonomous-eligible", () => {
+  const candidates = [
+    makeIssue(1, ["pipeline:planning"]),
+    makeIssue(2, ["pipeline:review-1"]),
+    makeIssue(3, ["pipeline:implementing"]),
+    makeIssue(4, ["pipeline:ready"]),
+    makeIssue(5, ["pipeline:ready", "pipeline:planning"]),
+  ];
+  const result = selectIssues(candidates, {}, 10);
+  assert.deepEqual(result.map((i) => i.number), [4]);
+});
+
+test("runQueue: mid-flight stages are counted as excluded", async () => {
+  const launched: number[] = [];
+  const deps = makeDeps({
+    listEligibleIssues: async () => [
+      makeIssue(1, ["pipeline:review-1"]),
+      makeIssue(2, ["pipeline:review-1"]),
+      makeIssue(3, ["pipeline:review-1"]),
+      makeIssue(4, ["pipeline:review-1"]),
+      makeIssue(5, ["pipeline:ready"]),
+      makeIssue(6, ["pipeline:ready"]),
+      makeIssue(7, ["pipeline:ready"]),
+    ],
+    runPipeline: async (n) => {
+      launched.push(n);
+      return { issueNumber: n, finalState: "ready-to-deploy", costUsd: 0.1, durationMs: 50 };
+    },
+  });
+  await runQueue(makeOpts(), deps);
+  assert.deepEqual(launched, [5, 6, 7]);
+  const json = [...deps.written.values()][0];
+  const summary = JSON.parse(json) as { excluded_count: number };
+  assert.equal(summary.excluded_count, 4);
+});
 
 test("selectIssues: pipeline:needs-spec is not autonomous-eligible", () => {
   const candidates = [

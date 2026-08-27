@@ -10,6 +10,7 @@ import {
   isHttp404Signal,
   isPrDiffTooLargeError,
   isTransientGhError,
+  deleteIssueComment,
   listIssueCommentsWithIds,
   shouldTreatContents404AsEmpty,
   updateIssueComment,
@@ -1026,8 +1027,25 @@ test("listIssueCommentsWithIds: parses REST numeric ids via injected runner", as
   });
   assert.equal(seen[0][0], "api");
   assert.ok(String(seen[0][1]).includes("issues/1238/comments"));
+  assert.ok(seen[0].includes("--paginate"));
+  assert.ok(seen[0].includes("--slurp"));
   assert.equal(comments[0].id, 5433321980);
   assert.equal(comments[0].author, "alice");
+});
+
+test("listIssueCommentsWithIds: flattens --paginate --slurp multi-page arrays", async () => {
+  const cfg = { repo: "acme/widget" } as PipelineConfig;
+  const comments = await listIssueCommentsWithIds(cfg, 1238, async () =>
+    JSON.stringify([
+      [{ id: 1, body: "page-1", user: { login: "alice" }, created_at: "2026-08-27T01:00:00Z" }],
+      [{ id: 2, body: "page-2", user: { login: "bob" }, created_at: "2026-08-27T01:01:00Z" }],
+    ]),
+  );
+  assert.equal(comments.length, 2);
+  assert.equal(comments[0].id, 1);
+  assert.equal(comments[0].author, "alice");
+  assert.equal(comments[1].id, 2);
+  assert.equal(comments[1].author, "bob");
 });
 
 test("updateIssueComment: PATCHes REST numeric id via injected runner", async () => {
@@ -1040,4 +1058,15 @@ test("updateIssueComment: PATCHes REST numeric id via injected runner", async ()
   assert.equal(seen[0].includes("PATCH"), true);
   assert.ok(String(seen[0].join(" ")).includes("issues/comments/5433321980"));
   assert.ok(seen[0].some((a) => a.startsWith("body=")));
+});
+
+test("deleteIssueComment: DELETEs REST numeric id via injected runner", async () => {
+  const cfg = { repo: "acme/widget" } as PipelineConfig;
+  const seen: string[][] = [];
+  await deleteIssueComment(cfg, 5433321980, async (args) => {
+    seen.push(args);
+    return "";
+  });
+  assert.equal(seen[0].includes("DELETE"), true);
+  assert.ok(String(seen[0].join(" ")).includes("issues/comments/5433321980"));
 });

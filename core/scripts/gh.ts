@@ -1502,16 +1502,25 @@ export async function listIssueCommentsWithIds(
     "api",
     `repos/${owner}/${repo}/issues/${issueNumber}/comments`,
     "--paginate",
+    "--slurp",
   ]);
-  const raw = JSON.parse(stdout.trim() || "[]") as Array<{
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout.trim() || "[]");
+  } catch (err) {
+    throw new Error(`listIssueCommentsWithIds: invalid JSON: ${(err as Error).message}`);
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error(`listIssueCommentsWithIds: expected an array, got ${typeof parsed}`);
+  }
+  // `--paginate --slurp` yields T[][] (array of pages). A single-page fake may
+  // still be T[]. `flat()` handles both.
+  const raw = (parsed as unknown[]).flat() as Array<{
     id: number;
     body?: string;
     user?: { login?: string };
     created_at?: string;
   }>;
-  if (!Array.isArray(raw)) {
-    throw new Error(`listIssueCommentsWithIds: expected an array, got ${typeof raw}`);
-  }
   return raw.map((c) => ({
     id: c.id,
     body: c.body ?? "",
@@ -1538,6 +1547,23 @@ export async function updateIssueComment(
     `repos/${owner}/${repo}/issues/comments/${commentId}`,
     "-f",
     `body=${body}`,
+  ]);
+}
+
+/**
+ * Delete an existing issue comment by REST numeric id.
+ */
+export async function deleteIssueComment(
+  cfg: PipelineConfig,
+  commentId: number,
+  run: GhApiRunner = (args) => ghRun(args, { wrapperName: "deleteIssueComment" }),
+): Promise<void> {
+  const [owner, repo] = cfg.repo.split("/");
+  await run([
+    "api",
+    "--method",
+    "DELETE",
+    `repos/${owner}/${repo}/issues/comments/${commentId}`,
   ]);
 }
 

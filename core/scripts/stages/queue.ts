@@ -467,9 +467,8 @@ export function selectIssues(
   // Blocked issues are not autonomous-eligible regardless of pipeline stage.
   let filtered = candidates.filter((issue) => {
     if (issue.labels.includes(BLOCKED_LABEL)) return false;
-    if (issue.labels.includes("pipeline:needs-spec")) return false;
-    if (issue.labels.includes("pipeline:backlog")) return false;
-    return true;
+    const pipeline = issue.labels.filter((label) => label.startsWith("pipeline:"));
+    return pipeline.length === 1 && pipeline[0] === "pipeline:ready";
   });
 
   if (filters.labels && filters.labels.length > 0) {

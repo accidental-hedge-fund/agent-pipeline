@@ -50,3 +50,11 @@
 - [x] 7.1 Reuse or update only verified Pipeline-authored comments (actor + attestation + marker); ignore foreign or malformed marker-bearing comments
 - [x] 7.2 Treat a `needs_spec` draft that omits canonical headings or lists them out of order as `gate-unavailable` with no GitHub mutation
 - [x] 7.3 Return `stale-dispatch` when the live stage is no longer `ready` at fetch or immediately before a `needs_spec` mutation, with no comment or label writes
+
+## 8. Review-2 regressions
+
+- [x] 8.1 Re-fetch title and body before persist/admit, restart on hash mismatch with a bounded budget, and verify a body-change-during-evaluation test does not persist a B0 `ready` verdict
+- [x] 8.2 Parse `gh api --paginate --slurp` comment pages and verify a multi-page fake does not throw
+- [x] 8.3 Reconcile concurrent first-create of owned comments down to one canonical comment and verify a simultaneous-rejection fake leaves exactly one
+- [x] 8.4 Treat pipeline-actor lookup failure as `gate-unavailable` with no model call or GitHub mutation
+- [x] 8.5 Restrict queue `selectIssues` to exactly `pipeline:ready` and verify planning/review/implementing issues are excluded
