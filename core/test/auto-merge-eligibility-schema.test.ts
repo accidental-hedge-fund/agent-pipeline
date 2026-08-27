@@ -150,9 +150,12 @@ test("drift guard: prompt template uses {{schema_block}} placeholder, not embedd
 // Helper: run validateConfig with an injected YAML string and a fake git root
 async function validateYaml(yaml: string) {
   const { validateConfig } = await import("../scripts/config.ts");
+  const withRoles = /(?:^|\n)harnesses:/m.test(yaml)
+    ? yaml
+    : `${yaml.trimEnd()}\nharnesses:\n  implementer: grok\n  reviewer: codex\n`;
   return validateConfig("/fake/repo", {
     findGitRoot: () => "/fake/repo",
-    readFile: (p: string) => (p.includes("pipeline.yml") ? yaml : null),
+    readFile: (p: string) => (p.includes("pipeline.yml") ? withRoles : null),
   });
 }
 

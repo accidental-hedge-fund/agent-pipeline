@@ -41,10 +41,11 @@ export const HARNESS_LABEL_PREFIX = "harness:";
 // always was.
 export type Harness = string;
 
-// Where a resolved role's value came from (#608): the repository's strict
-// `harnesses:` block, the reviewer-only `review_harness` key, or the active
-// profile's default. Recorded alongside each resolved role so a run's
-// pairing is auditable after the fact.
+// Where a resolved live role's value came from (#608, #1240). Execution
+// runs record `repo-config` for both live workers. `review_harness` remains
+// a structured overlay (model/effort/prompt-delivery) and is not a live
+// reviewer source. `profile` is bootstrap metadata for init's
+// tolerateInvalidConfig path only — never a live-worker source for execution.
 export type HarnessRoleSource = "repo-config" | "review_harness" | "profile";
 
 // ---------------------------------------------------------------------------
@@ -1090,10 +1091,9 @@ export interface PipelineConfig {
   // into `invoke()`'s `InvokeOptions.promptDelivery`. `resolveConfig()`
   // always sets it explicitly; call sites still treat absent as "argv" (the
   // pre-#492 default) since there is no `tsc` step to enforce presence.
-  // `implementerSource`/`reviewerSource` (#608) record which layer supplied
-  // each resolved role — the repository's `harnesses:` block, the reviewer-
-  // only `review_harness` key, or the active profile default — for evidence
-  // and diagnostics.
+  // `implementerSource`/`reviewerSource` (#608, #1240) record which layer
+  // supplied each live role. Execution runs use the repository `harnesses:`
+  // block (`repo-config`). The active profile is not a live-worker source.
   harnesses: { implementer: Harness; reviewer: string; reviewerModel?: string; reviewerModelWasAuto?: boolean; reviewerEffort?: string; reviewerPromptDelivery?: "argv" | "stdin"; implementerSource: HarnessRoleSource; reviewerSource: HarnessRoleSource };
   // `reviewWasAuto` mirrors `reviewerModelWasAuto` for the `models.review`
   // fallback slot (#441): true when the file config explicitly set
@@ -2315,9 +2315,10 @@ export interface EvidenceBundle {
   branch: string | null;
   harnesses: string[];
   /** Resolved implementer/reviewer harness roles and each role's source
-   *  (#608), recorded once at run identity alongside `harnesses`. Absent for
-   *  pre-#608 bundles — additive and optional, consumers that do not
-   *  recognize it SHALL ignore it. */
+   *  (#608, #1240), recorded once at run identity alongside `harnesses`.
+   *  Execution-run live sources are `repo-config`. Absent for pre-#608
+   *  bundles — additive and optional, consumers that do not recognize it
+   *  SHALL ignore it. */
   roles?: {
     implementer: string;
     implementerSource: HarnessRoleSource;

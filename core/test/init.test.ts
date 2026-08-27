@@ -17,6 +17,29 @@ const PIPELINE_SCRIPT = fileURLToPath(new URL("../scripts/pipeline.ts", import.m
 
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-init-test-"));
 
+function initCfg(repo: string, repoSlug: string) {
+  return {
+    ...DEFAULT_CONFIG,
+    profile_name: "codex",
+    invocation: "$pipeline",
+    review_mode: "prompt-harness" as const,
+    marker_footer: "",
+    implementation_ready_message: "",
+    conventions_default: "CLAUDE.md",
+    domain: "test-init",
+    repo: repoSlug,
+    repo_dir: repo,
+    harnesses: {
+      implementer: "codex",
+      reviewer: "claude",
+      reviewerModelWasAuto: false,
+      reviewerPromptDelivery: "argv" as const,
+      implementerSource: "profile" as const,
+      reviewerSource: "profile" as const,
+    },
+  };
+}
+
 function makeTempRepo(): string {
   const dir = fs.mkdtempSync(path.join(tmpRoot, "repo-"));
   fs.mkdirSync(path.join(dir, ".git"), { recursive: true });
@@ -63,20 +86,7 @@ test("runInit: calls ensurePipelineLabels (label list + label create) without to
   process.env.PATH = `${binDir}:${oldPath}`;
 
   try {
-    const cfg = {
-      ...DEFAULT_CONFIG,
-      profile_name: "test",
-      invocation: "$pipeline",
-      review_mode: "prompt-harness" as const,
-      marker_footer: "",
-      implementation_ready_message: "",
-      conventions_default: "CLAUDE.md",
-      domain: "test-init",
-      repo: "acme/test-init",
-      repo_dir: repo,
-    };
-
-    await runInit(cfg);
+    await runInit(initCfg(repo, "acme/test-init"));
 
     // Label list must have been called (fake gh logs all args).
     const log = fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : "";
@@ -108,6 +118,10 @@ test("scaffoldDefaultConfig: creates .github/pipeline.yml when absent and return
   // Sanity: file looks like YAML (has a non-comment line with a colon).
   const yamlLines = content.split("\n").filter((l) => l.trim() && !l.trimStart().startsWith("#"));
   assert.ok(yamlLines.length > 0, "scaffolded file should have non-comment YAML lines");
+  assert.match(content, /^harnesses:/m);
+  assert.match(content, /^\s+implementer: \S+/m);
+  assert.match(content, /^\s+reviewer: \S+/m);
+  assert.doesNotMatch(content, /falls back to the active profile/i);
 });
 
 // ---------------------------------------------------------------------------
@@ -176,6 +190,10 @@ test("scaffoldDefaultConfig: scaffolded file round-trips through resolveConfig w
     assert.equal(cfg.eval_gate.timeout, DEFAULT_CONFIG.eval_gate.timeout);
     assert.equal(cfg.eval_gate.max_attempts, DEFAULT_CONFIG.eval_gate.max_attempts);
     assert.equal(cfg.eval_gate.command, undefined);
+    assert.ok(cfg.harnesses.implementer.length > 0);
+    assert.ok(cfg.harnesses.reviewer.length > 0);
+    assert.equal(cfg.harnesses.implementerSource, "repo-config");
+    assert.equal(cfg.harnesses.reviewerSource, "repo-config");
   } finally {
     process.env.PATH = oldPath;
   }
@@ -350,20 +368,7 @@ test("runInit: no .gitignore -> creates one containing the managed artifact bloc
   process.env.PATH = `${binDir}:${oldPath}`;
 
   try {
-    const cfg = {
-      ...DEFAULT_CONFIG,
-      profile_name: "test",
-      invocation: "$pipeline",
-      review_mode: "prompt-harness" as const,
-      marker_footer: "",
-      implementation_ready_message: "",
-      conventions_default: "CLAUDE.md",
-      domain: "test-init-gitignore",
-      repo: "acme/init-gitignore-create",
-      repo_dir: repo,
-    };
-
-    await runInit(cfg);
+    await runInit(initCfg(repo, "acme/init-gitignore-create"));
 
     const gitignorePath = path.join(repo, ".gitignore");
     assert.ok(fs.existsSync(gitignorePath), ".gitignore should exist after init");
@@ -384,20 +389,7 @@ test("runInit: existing .gitignore without the block -> appends it, preserving o
   process.env.PATH = `${binDir}:${oldPath}`;
 
   try {
-    const cfg = {
-      ...DEFAULT_CONFIG,
-      profile_name: "test",
-      invocation: "$pipeline",
-      review_mode: "prompt-harness" as const,
-      marker_footer: "",
-      implementation_ready_message: "",
-      conventions_default: "CLAUDE.md",
-      domain: "test-init-gitignore-append",
-      repo: "acme/init-gitignore-append",
-      repo_dir: repo,
-    };
-
-    await runInit(cfg);
+    await runInit(initCfg(repo, "acme/init-gitignore-append"));
 
     const content = fs.readFileSync(gitignorePath, "utf8");
     assert.ok(content.startsWith(operatorLines), "operator lines must be preserved byte-identical");
@@ -414,19 +406,7 @@ test("runInit: second run with an already-current block is a no-op (idempotent)"
   process.env.PATH = `${binDir}:${oldPath}`;
 
   try {
-    const cfg = {
-      ...DEFAULT_CONFIG,
-      profile_name: "test",
-      invocation: "$pipeline",
-      review_mode: "prompt-harness" as const,
-      marker_footer: "",
-      implementation_ready_message: "",
-      conventions_default: "CLAUDE.md",
-      domain: "test-init-gitignore-idempotent",
-      repo: "acme/init-gitignore-idempotent",
-      repo_dir: repo,
-    };
-
+    const cfg = initCfg(repo, "acme/init-gitignore-idempotent");
     await runInit(cfg);
     const gitignorePath = path.join(repo, ".gitignore");
     const afterFirst = fs.readFileSync(gitignorePath, "utf8");

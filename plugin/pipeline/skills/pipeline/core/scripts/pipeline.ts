@@ -6905,7 +6905,10 @@ export async function runRemoveWorktree(
 
 export async function runInit(cfg: PipelineConfig): Promise<void> {
   await ensurePipelineLabels(cfg);
-  const { created } = await scaffoldDefaultConfig(cfg.repo_dir);
+  const { created } = await scaffoldDefaultConfig(cfg.repo_dir, {
+    profile: cfg.profile_name,
+    harnesses: { implementer: cfg.harnesses.implementer, reviewer: cfg.harnesses.reviewer },
+  });
   if (created) {
     console.log(`[pipeline] init: created .github/pipeline.yml with default configuration.`);
   } else {

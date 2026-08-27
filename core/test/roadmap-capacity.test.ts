@@ -24,7 +24,10 @@ function makeFakeRepo(content: string): string {
   const dir = fs.mkdtempSync(path.join(tmpRoot, "repo-"));
   fs.mkdirSync(path.join(dir, ".git"), { recursive: true });
   fs.mkdirSync(path.join(dir, ".github"), { recursive: true });
-  fs.writeFileSync(path.join(dir, ".github", "pipeline.yml"), content);
+  const yaml = /(?:^|\n)harnesses:/m.test(content)
+    ? content
+    : `harnesses:\n  implementer: grok\n  reviewer: codex\n${content}`;
+  fs.writeFileSync(path.join(dir, ".github", "pipeline.yml"), yaml);
   return dir;
 }
 

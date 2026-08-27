@@ -57,8 +57,11 @@ const ADVANCED: Outcome = { advanced: true, from: "eval-gate" as Stage, to: "shi
 
 // validateConfig deps that inject YAML text without real filesystem.
 function makeValidateDeps(yamlText: string) {
+  const yaml = /(?:^|\n)harnesses:/m.test(yamlText)
+    ? yamlText
+    : `${yamlText.trimEnd()}\nharnesses:\n  implementer: grok\n  reviewer: codex\n`;
   return {
-    readFile: (p: string) => (p.endsWith("pipeline.yml") ? yamlText : null),
+    readFile: (p: string) => (p.endsWith("pipeline.yml") ? yaml : null),
     findGitRoot: (_startDir: string) => "/fake/repo",
   };
 }

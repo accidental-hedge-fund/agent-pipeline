@@ -12,6 +12,9 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   COMMAND_REGISTRY,
   allowsJsonFlag,
@@ -332,6 +335,19 @@ test("command-registry: merge-queue rejects unsupported flags via validateFlags"
 // ---------------------------------------------------------------------------
 // 2.10  UNIVERSAL_FLAGS: host-injected --profile tolerated on every command (#383)
 // ---------------------------------------------------------------------------
+
+test("host launcher templates inject --profile and do not set live harness roles (#1240)", () => {
+  const root = fileURLToPath(new URL("../..", import.meta.url));
+  const templatePath = path.join(root, "hosts/_shared/entry.template.mjs");
+  const launcherPath = path.join(root, "scripts/pipeline-launcher.mjs");
+  const template = fs.readFileSync(templatePath, "utf8");
+  const launcher = fs.readFileSync(launcherPath, "utf8");
+  assert.match(template, /--profile/);
+  assert.doesNotMatch(template, /harnesses\.implementer/);
+  assert.doesNotMatch(template, /harnesses\.reviewer/);
+  assert.doesNotMatch(launcher, /harnesses\.implementer/);
+  assert.doesNotMatch(launcher, /harnesses\.reviewer/);
+});
 
 test("command-registry: UNIVERSAL_FLAGS contains 'profile'", () => {
   assert.ok(

@@ -467,13 +467,19 @@ test("prepareWorktreePushAuthEnv: https-token with SSH origin sets single-destin
 // Config round-trip via resolveConfig
 // ---------------------------------------------------------------------------
 
+const COMPLETE_HARNESSES = "harnesses:\n  implementer: grok\n  reviewer: codex\n";
+
 function makeFakeRepo(content: string | null): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-git-auth-cfg-"));
   fs.mkdirSync(path.join(dir, ".git"), { recursive: true });
-  if (content !== null) {
-    fs.mkdirSync(path.join(dir, ".github"), { recursive: true });
-    fs.writeFileSync(path.join(dir, ".github", "pipeline.yml"), content);
-  }
+  const yaml =
+    content === null
+      ? COMPLETE_HARNESSES
+      : /(?:^|\n)harnesses:/m.test(content)
+        ? content
+        : `${COMPLETE_HARNESSES}${content}`;
+  fs.mkdirSync(path.join(dir, ".github"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".github", "pipeline.yml"), yaml);
   return dir;
 }
 
