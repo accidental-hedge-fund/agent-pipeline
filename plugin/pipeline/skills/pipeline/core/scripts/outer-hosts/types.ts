@@ -25,7 +25,8 @@ export type OuterHostCommandsKind =
   | "none"
   | "claude-slash" // ~/.claude/commands/pipeline:*.md
   | "codex-prompt" // skills/pipeline/agents/pipeline/*.md (Codex prompt agents)
-  | "opencode-native"; // <base>/commands/pipeline.md
+  | "opencode-native" // <base>/commands/pipeline.md
+  | "omp-native"; // <base>/commands/pipeline/index.ts (OMP TypeScript custom command)
 
 /** Material-progress notify surface identifiers (values of the mapping). */
 export type MaterialNotifySurface =
@@ -211,7 +212,7 @@ export const OUTER_HOST_CAPABILITY_AREAS = [
 export type OuterHostCapabilityArea = (typeof OUTER_HOST_CAPABILITY_AREAS)[number];
 
 /** Built-in outer host ids (golden install coverage may assert this set). */
-export const BUILTIN_OUTER_HOST_IDS = ["claude", "codex", "grok", "opencode"] as const;
+export const BUILTIN_OUTER_HOST_IDS = ["claude", "codex", "grok", "opencode", "omp"] as const;
 export type BuiltinOuterHostId = (typeof BUILTIN_OUTER_HOST_IDS)[number];
 
 /** Portable observation baseline named in fallbacks. */

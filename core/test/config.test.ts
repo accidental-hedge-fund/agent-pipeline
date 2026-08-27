@@ -132,7 +132,7 @@ test("resolveConfig: implementer grok / reviewer codex resolve identically under
   process.env.PATH = `${binDir}:${oldPath}`;
   try {
     const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
-    for (const profile of ["claude", "codex"] as const) {
+    for (const profile of ["claude", "codex", "omp"] as const) {
       const cfg = cfgMod.resolveConfig({ repoPath: repo, profile });
       assert.equal(cfg.harnesses.implementer, "grok", profile);
       assert.equal(cfg.harnesses.reviewer, "codex", profile);

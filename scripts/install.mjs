@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // agent-pipeline cross-tool installer.
 //
-//   node scripts/install.mjs install   [--host claude|codex|grok|opencode|all] [--dry-run]
+//   node scripts/install.mjs install   [--host claude|codex|grok|opencode|omp|all] [--dry-run]
 //   node scripts/install.mjs update    [--host …]            (alias for install; idempotent)
 //   node scripts/install.mjs uninstall [--host …]
 //
@@ -12,6 +12,7 @@
 //
 // Honors CLAUDE_CONFIG_DIR, CODEX_HOME, and OPENCODE_CONFIG_DIR for non-default
 // install locations. OPENCODE_CONFIG (single config file) is never used as a base.
+// OMP has no env override: --host omp always installs under ~/.omp/agent.
 //
 // Grok Build: --host grok materializes ~/.grok/skills/pipeline as a symlink to
 // the Claude-managed skill install (no separate hosts/grok SKILL.md overlay).
@@ -25,6 +26,12 @@
 // are LLM-mediated prompt templates; the installed command shell-injects an
 // argv-safe bridge (hosts/opencode/) so the launcher runs and its stdout is
 // injected into the prompt — not a pure no-LLM process-stdout host path.
+//
+// OMP (Oh My Pi): --host omp installs a full tree under ~/.omp/agent/skills/pipeline
+// plus a native TypeScript /pipeline command at ~/.omp/agent/commands/pipeline/index.ts.
+// The command execs the installed launcher with the install-time process.execPath
+// (no PATH node, no shell). Project .omp and named OMP profile agent dirs are
+// not installer-managed. Adapter id `pi` is not an install host.
 
 import {
   closeSync,
@@ -297,7 +304,8 @@ function selectedHosts(hostArg) {
       fail(
         `No host detected among registered outer hosts (${known}). ` +
           `Pass --host <id> to force one. ` +
-          `Grok requires a Claude skill install and materializes ~/.grok/skills/pipeline as a symlink to it.`,
+          `Grok requires a Claude skill install and materializes ~/.grok/skills/pipeline as a symlink to it. ` +
+        `OMP installs under ~/.omp/agent when that base exists (pass --host omp to create it).`,
       );
     }
     return present;
@@ -307,7 +315,8 @@ function selectedHosts(hostArg) {
     fail(
       `Unknown --host '${hostArg}'. Registered outer hosts: ${known}. ` +
         `Grok materializes ~/.grok/skills/pipeline → Claude skill (see README "Grok Build skill path"). ` +
-        `OpenCode installs under ~/.config/opencode (or OPENCODE_CONFIG_DIR).`,
+        `OpenCode installs under ~/.config/opencode (or OPENCODE_CONFIG_DIR). ` +
+        `OMP installs under ~/.omp/agent only (project .omp is not managed).`,
     );
   }
   return [hostArg];
@@ -800,6 +809,7 @@ function installCommandsForHost(host, dest, dryRun) {
   if (kind === "claude-slash") installClaudeCommands(cfg.baseDir(), dryRun);
   else if (kind === "codex-prompt") installCodexCommands(join(dest, "agents"), dryRun);
   else if (kind === "opencode-native") installOpenCodeCommands(cfg.baseDir(), dryRun);
+  else if (kind === "omp-native") installOmpCommands(cfg.baseDir(), dryRun);
 }
 
 function uninstallCommandsForHost(host, dryRun) {
@@ -807,6 +817,7 @@ function uninstallCommandsForHost(host, dryRun) {
   const kind = cfg.commandsKind || "none";
   if (kind === "claude-slash") uninstallClaudeCommands(cfg.baseDir(), dryRun);
   else if (kind === "opencode-native") uninstallOpenCodeCommands(cfg.baseDir(), dryRun);
+  else if (kind === "omp-native") uninstallOmpCommands(cfg.baseDir(), dryRun);
   // codex-prompt agents live under the skill tree and are removed with it.
 }
 
@@ -880,6 +891,98 @@ function uninstallOpenCodeCommands(opencodeBaseDir, dryRun) {
   }
   unlinkSync(cmdPath);
   log(`  ✓ removed OpenCode command pipeline.md`);
+}
+
+/**
+ * Render the OMP native TypeScript `/pipeline` custom command (#1235).
+ * Bakes absolute install-time process.execPath and the installed launcher path.
+ * Default export is a CustomCommandFactory: `{ name, description, execute }`.
+ * execute() returns void so OMP does not start an LLM prompt turn.
+ *
+ * Confirmed upstream (`@oh-my-pi/pi-coding-agent` custom-commands/types.ts):
+ * factory(api) → { name, description, execute(args, ctx) }.
+ *
+ * @param {string} skillDir Absolute path to <ompBase>/skills/pipeline
+ * @param {string} [execPath] Absolute Node binary captured at install time
+ * @returns {string}
+ */
+function renderOmpPipelineCommand(skillDir, execPath = process.execPath) {
+  const launcherPath = join(skillDir, "scripts", "pipeline.mjs");
+  const nodeLit = JSON.stringify(execPath);
+  const launcherLit = JSON.stringify(launcherPath);
+  return [
+    "/**",
+    " * Installer-owned OMP /pipeline command (native TypeScript custom command).",
+    " * execute() returns void so OMP does not start an LLM prompt turn.",
+    " * Spawn uses discrete argv — no shell, no PATH node.",
+    " */",
+    'import { spawnSync } from "node:child_process";',
+    "",
+    `export const PIPELINE_NODE = ${nodeLit};`,
+    `export const PIPELINE_LAUNCHER = ${launcherLit};`,
+    "",
+    "export function launcherArgv(userArgs) {",
+    "  const args = Array.isArray(userArgs) ? userArgs : [];",
+    "  return [PIPELINE_NODE, PIPELINE_LAUNCHER, ...args];",
+    "}",
+    "",
+    "export function runOmpPipeline(userArgs, cwd) {",
+    "  const argv = launcherArgv(userArgs);",
+    "  const result = spawnSync(argv[0], argv.slice(1), {",
+    "    cwd: cwd || process.cwd(),",
+    "    encoding: \"utf8\",",
+    "    shell: false,",
+    "    stdio: [\"inherit\", \"pipe\", \"pipe\"],",
+    "  });",
+    "  if (result.stdout) process.stdout.write(result.stdout);",
+    "  if (result.stderr) process.stderr.write(result.stderr);",
+    "  return result;",
+    "}",
+    "",
+    "export default function pipelineCommand(api) {",
+    "  return {",
+    "    name: \"pipeline\",",
+    "    description: \"Advance a GitHub issue/PR through agent-pipeline (native launcher)\",",
+    "    execute(args) {",
+    "      const cwd = typeof api?.cwd === \"string\" && api.cwd ? api.cwd : process.cwd();",
+    "      runOmpPipeline(args, cwd);",
+    "    },",
+    "  };",
+    "}",
+    "",
+  ].join("\n");
+}
+
+/**
+ * Install OMP native `/pipeline` command at <ompBase>/commands/pipeline/index.ts.
+ * Exported for unit tests.
+ */
+function installOmpCommands(ompBaseDir, dryRun) {
+  const cmdDir = join(ompBaseDir, "commands", "pipeline");
+  const cmdPath = join(cmdDir, "index.ts");
+  const skillDir = join(ompBaseDir, "skills", "pipeline");
+  if (dryRun) {
+    log(`  (dry-run) would write OMP /pipeline command to ${cmdPath}`);
+    return;
+  }
+  mkdirSync(cmdDir, { recursive: true });
+  writeFileSync(cmdPath, renderOmpPipelineCommand(skillDir, process.execPath));
+  log(`  ✓ wrote OMP /pipeline command to ${cmdPath}`);
+}
+
+/**
+ * Remove installer-owned OMP `commands/pipeline/` only; leave sibling commands.
+ * Exported for unit tests.
+ */
+function uninstallOmpCommands(ompBaseDir, dryRun) {
+  const cmdDir = join(ompBaseDir, "commands", "pipeline");
+  if (!existsSync(cmdDir)) return;
+  if (dryRun) {
+    log(`  (dry-run) would remove OMP command ${cmdDir}`);
+    return;
+  }
+  rmSync(cmdDir, { recursive: true, force: true });
+  log(`  ✓ removed OMP command pipeline/`);
 }
 
 // Install the namespaced pipeline:<command> command files for the Claude host (#273).
@@ -1093,9 +1196,9 @@ function uninstallHost(host, dryRun) {
   const skillPresent = pathPresent(dest);
   const kind = cfg.commandsKind || "none";
 
-  // Hosts with external command dirs (claude-slash, opencode-native): always
-  // attempt command cleanup even when the skill tree is already gone.
-  if (kind === "claude-slash" || kind === "opencode-native") {
+  // Hosts with external command dirs (claude-slash, opencode-native, omp-native):
+  // always attempt command cleanup even when the skill tree is already gone.
+  if (kind === "claude-slash" || kind === "opencode-native" || kind === "omp-native") {
     if (!skillPresent) {
       log(`→ ${cfg.label}: nothing installed at ${dest}`);
     } else {
@@ -1643,6 +1746,9 @@ export {
   installOpenCodeCommands,
   uninstallOpenCodeCommands,
   renderOpenCodePipelineCommand,
+  installOmpCommands,
+  uninstallOmpCommands,
+  renderOmpPipelineCommand,
   uninstallHost,
   findLiveRunLocks,
   formatLiveRunMessage,

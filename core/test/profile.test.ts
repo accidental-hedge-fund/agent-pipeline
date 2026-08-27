@@ -32,14 +32,25 @@ test("loadProfile: opencode profile loads with opencode implementer (#861)", () 
   assert.equal(profile.reviewMode, "prompt-harness");
 });
 
+test("loadProfile: omp profile is bootstrap metadata only (#1235)", () => {
+  const profile = loadProfile("omp");
+  assert.equal(profile.name, "omp");
+  assert.equal(profile.invocation, "/pipeline");
+  assert.deepEqual(profile.harnesses, { implementer: "claude", reviewer: "codex" });
+  assert.equal(profile.reviewMode, "prompt-harness");
+  assert.notEqual(profile.harnesses.implementer, "omp");
+  assert.notEqual(profile.harnesses.reviewer, "omp");
+  assert.notEqual(profile.harnesses.implementer, "pi");
+});
+
 test("loadProfile: openclaw was removed — unknown profile throws", () => {
   assert.throws(() => loadProfile("openclaw"), /Unknown pipeline profile 'openclaw'/);
 });
 
-test("loadProfile: claude, codex, and opencode profiles ship (#861)", () => {
+test("loadProfile: claude, codex, opencode, and omp profiles ship (#861/#1235)", () => {
   const profilesDir = path.resolve(import.meta.dirname, "..", "profiles");
   const shipped = fs.readdirSync(profilesDir).filter((f) => f.endsWith(".json")).sort();
-  assert.deepEqual(shipped, ["claude.json", "codex.json", "opencode.json"]);
+  assert.deepEqual(shipped, ["claude.json", "codex.json", "omp.json", "opencode.json"]);
 });
 
 test("loadProfile: a companion reviewMode is rejected at load time", () => {

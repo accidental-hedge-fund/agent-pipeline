@@ -1,0 +1,10 @@
+{
+  "name": "omp",
+  "displayName": "OMP pipeline",
+  "invocation": "/pipeline",
+  "harnesses": { "implementer": "claude", "reviewer": "codex" },
+  "reviewMode": "prompt-harness",
+  "markerFooter": "*Automated by OMP Pipeline Skill*",
+  "implementationReadyMessage": "Ready for Codex standard review.",
+  "conventionsDefault": "AGENTS.md"
+}

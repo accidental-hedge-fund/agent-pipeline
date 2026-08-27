@@ -42,6 +42,12 @@ export type OpenCodeHostEntry = HostEntry & {
   skillPath: string | null;
 };
 
+/** Additive OMP host entry (#1235). `available` means a managed skill
+ *  install is present. Does not affect `hostCoverage`. */
+export type OmpHostEntry = HostEntry & {
+  skillPath: string | null;
+};
+
 /** Generic registry-driven host entry for completeness listings (#784). */
 export type RegistryHostEntry = HostEntry & {
   /** When known (e.g. managed skill install path). */
@@ -61,12 +67,14 @@ export type DiscoveryResult = {
     codex: HostEntry;
     /** Additive OpenCode reporting — never changes hostCoverage meanings. */
     opencode: OpenCodeHostEntry;
+    /** Additive OMP reporting — never changes hostCoverage meanings. */
+    omp: OmpHostEntry;
     /**
      * Index signature for registry-registered hosts beyond the legacy trio.
      * Completeness listings iterate registry ids; synthetic hosts appear here
      * in tests without editing a built-in-only name table.
      */
-    [hostId: string]: HostEntry | OpenCodeHostEntry | RegistryHostEntry;
+    [hostId: string]: HostEntry | OpenCodeHostEntry | OmpHostEntry | RegistryHostEntry;
   };
   /**
    * Ordered outer-host ids from the runtime registry (completeness source).
@@ -82,6 +90,8 @@ export type DiscoverHostsDeps = {
   readVersion: (corePath: string) => Promise<string | null>;
   /** Optional seam for OpenCode skill path probe (#861). */
   probeOpenCodeSkill?: () => Promise<string | null>;
+  /** Optional seam for OMP skill path probe (#1235). */
+  probeOmpSkill?: () => Promise<string | null>;
   /**
    * Optional seam for registry-driven host id enumeration (#784).
    * Defaults to the outer-host runtime registry.
@@ -171,6 +181,8 @@ async function probeCandidatesDefault(): Promise<string | null> {
     ? process.env.OPENCODE_CONFIG_DIR.trim()
     : path.join(home, ".config", "opencode");
   candidates.push(path.join(opencodeBase, "skills", "pipeline", "core"));
+  // OMP skill tree (#1235) — additive candidate only; does not affect hostCoverage.
+  candidates.push(path.join(home, ".omp", "agent", "skills", "pipeline", "core"));
   candidates.push(path.join(".", "node_modules", "agent-pipeline", "core")); // local dev
   candidates.push(path.join(".", "node_modules", "pipeline", "core"));       // local dev legacy
 
@@ -192,6 +204,22 @@ async function probeOpenCodeSkillDefault(): Promise<string | null> {
     ? path.resolve(process.env.OPENCODE_CONFIG_DIR.trim())
     : path.join(home, ".config", "opencode");
   const skillDir = path.join(base, "skills", "pipeline");
+  const marker = path.join(skillDir, ".pipeline-installer-managed");
+  const launcher = path.join(skillDir, "scripts", "pipeline.mjs");
+  if (fs.existsSync(marker) || fs.existsSync(launcher)) {
+    return skillDir;
+  }
+  return null;
+}
+
+/**
+ * Probe for an OMP-managed skill install. Returns the skill directory when
+ * present (managed marker or launcher), else null. Additive for discovery only.
+ * No env override — always ~/.omp/agent.
+ */
+async function probeOmpSkillDefault(): Promise<string | null> {
+  const home = os.homedir();
+  const skillDir = path.join(home, ".omp", "agent", "skills", "pipeline");
   const marker = path.join(skillDir, ".pipeline-installer-managed");
   const launcher = path.join(skillDir, "scripts", "pipeline.mjs");
   if (fs.existsSync(marker) || fs.existsSync(launcher)) {
@@ -306,6 +334,7 @@ const defaultDeps: DiscoverHostsDeps = {
   probeCandidates: probeCandidatesDefault,
   readVersion: readVersionDefault,
   probeOpenCodeSkill: probeOpenCodeSkillDefault,
+  probeOmpSkill: probeOmpSkillDefault,
 };
 
 // ---------------------------------------------------------------------------
@@ -318,13 +347,15 @@ const defaultDeps: DiscoverHostsDeps = {
  * - Exits with code 0 for any resolved state (including `missing`).
  * - Throws on a probe error (e.g., `npm root -g` unavailable) so the CLI
  *   layer can exit non-zero with a diagnostic.
- * - `hostCoverage` remains Claude/Codex-only; OpenCode is additive under
- *   `hosts.opencode` and never flips coverage enum meanings (#861).
+ * - `hostCoverage` remains Claude/Codex-only; OpenCode and OMP are additive
+ *   under `hosts.opencode` / `hosts.omp` and never flip coverage enum
+ *   meanings (#861 / #1235).
  */
 export async function discoverHosts(
   deps: DiscoverHostsDeps = defaultDeps,
 ): Promise<DiscoveryResult> {
   const probeOpenCode = deps.probeOpenCodeSkill ?? (async () => null);
+  const probeOmp = deps.probeOmpSkill ?? (async () => null);
   const listIds =
     deps.listOuterHostIds ??
     (() => {
@@ -342,12 +373,13 @@ export async function discoverHosts(
   const envGet = deps.envGet ?? ((key: string) => process.env[key]);
   const pathDeps = { homeDir, envGet };
 
-  const [corePath, claudeBin, codexBin, opencodeBin, opencodeSkill] = await Promise.all([
+  const [corePath, claudeBin, codexBin, opencodeBin, opencodeSkill, ompSkill] = await Promise.all([
     deps.probeCandidates(),
     deps.which("claude"),
     deps.which("codex"),
     deps.which("opencode"),
     probeOpenCode(),
+    probeOmp(),
   ]);
 
   const version = corePath ? await deps.readVersion(corePath) : null;
@@ -358,7 +390,7 @@ export async function discoverHosts(
   let hostCoverage: HostCoverage;
   if (!corePath || (!claudeAvailable && !codexAvailable)) {
     // No resolved pipeline core, or no host CLIs reachable — not usable.
-    // OpenCode presence alone does not change this Claude/Codex contract (#861).
+    // OpenCode/OMP presence alone does not change this Claude/Codex contract (#861/#1235).
     hostCoverage = "missing";
   } else if (claudeAvailable && !codexAvailable) {
     hostCoverage = "claude-only";
@@ -375,6 +407,11 @@ export async function discoverHosts(
       available: opencodeSkill !== null,
       cliBin: opencodeBin,
       skillPath: opencodeSkill,
+    },
+    omp: {
+      available: ompSkill !== null,
+      cliBin: null,
+      skillPath: ompSkill,
     },
   };
 
@@ -460,8 +497,15 @@ export function formatDiscovery(result: DiscoveryResult, asJson: boolean): strin
       : "no";
     lines.push(`  opencode: ${detail}`);
   }
-  // Registry-driven extras (#784) beyond the legacy Claude/Codex/OpenCode lines.
-  const printed = new Set(["claude", "codex", "opencode"]);
+  if (result.hosts.omp) {
+    const omp = result.hosts.omp as OmpHostEntry;
+    const detail = omp.available
+      ? `yes${omp.skillPath ? ` (${omp.skillPath})` : ""}`
+      : "no";
+    lines.push(`  omp: ${detail}`);
+  }
+  // Registry-driven extras (#784) beyond Claude/Codex/OpenCode/OMP lines.
+  const printed = new Set(["claude", "codex", "opencode", "omp"]);
   for (const id of result.registeredOuterHosts ?? Object.keys(result.hosts)) {
     if (printed.has(id)) continue;
     const entry = result.hosts[id];

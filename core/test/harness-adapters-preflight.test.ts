@@ -230,6 +230,12 @@ test("built-in golden suite: each shipped adapter resolves to its module instanc
   assert.equal(resolveAdapter("pi"), piAdapter);
 });
 
+test("adapter pi remains resolvable and is not outer-host omp (#1235)", () => {
+  assert.equal(resolveAdapter("pi"), piAdapter);
+  assert.equal(resolveAdapter("omp"), null, "omp is an outer host, not a harness adapter");
+  assert.notEqual(piAdapter.name, "omp");
+});
+
 test("resolveAdapter: returns null for an unregistered name (custom reviewer CLI escape hatch, #40)", () => {
   assert.equal(resolveAdapter("my-reviewer"), null);
   assert.equal(resolveAdapter("grock"), null, "a typo of a registered name must not fuzzy-match");

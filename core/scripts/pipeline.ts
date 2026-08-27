@@ -888,7 +888,7 @@ export function buildCmd(): Command {
     .option("--authorization <path>", "ship: absolute path to the gateway-authenticated authorization JSON")
     .option(
       "--host <name>",
-      "engine-promote: skill install host (codex|claude|grok|opencode|all; default all)",
+      "engine-promote: skill install host (codex|claude|grok|opencode|omp|all; default all)",
     )
     .option("--skip-install", "engine-promote: promote pin only; do not run npx install")
     .option("--from-run <run-id>", "factory-gate: score an existing durable loop run id")
@@ -5632,7 +5632,7 @@ async function main(): Promise<void> {
     if (!version) {
       console.error(
         "pipeline engine-promote: --for <X.Y.Z> is required.\n" +
-          "  Usage: pipeline engine-promote --for <X.Y.Z> [--host all|codex|claude|grok|opencode] [--dry-run] [--json] [--skip-install] [--skip-frg]\n" +
+          "  Usage: pipeline engine-promote --for <X.Y.Z> [--host all|codex|claude|grok|opencode|omp] [--dry-run] [--json] [--skip-install] [--skip-frg]\n" +
           "  Verifies the GitHub Release, promotes a production-quality pin from a real FRG pass\n" +
           "  (frg_run_id + frg_evidence_path; refuses no-frg-*), installs the exact tag\n" +
           "  to all configured hosts by default (override with --host), and verifies installed version.\n" +
@@ -5656,7 +5656,7 @@ async function main(): Promise<void> {
         DEFAULT_ENGINE_PROMOTE_HOST,
       } = await import("./stages/engine-promote.ts");
       const hostRaw = opts.host ? String(opts.host).trim() : DEFAULT_ENGINE_PROMOTE_HOST;
-      const allowedHosts = new Set(["codex", "claude", "grok", "opencode", "all"]);
+      const allowedHosts = new Set(["codex", "claude", "grok", "opencode", "omp", "all"]);
       if (!allowedHosts.has(hostRaw)) {
         console.error(`pipeline engine-promote: invalid --host ${hostRaw}`);
         process.exit(2);
@@ -5665,7 +5665,7 @@ async function main(): Promise<void> {
         {
           version,
           repoDir: repoDirEp,
-          host: hostRaw as "codex" | "claude" | "grok" | "opencode" | "all",
+          host: hostRaw as "codex" | "claude" | "grok" | "opencode" | "omp" | "all",
           dryRun: !!opts.dryRun,
           skipInstall: !!opts.skipInstall,
           allowWithoutFrg: !!opts.skipFrg,

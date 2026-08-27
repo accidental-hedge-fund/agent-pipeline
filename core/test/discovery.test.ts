@@ -39,6 +39,7 @@ function makeDeps(overrides: Partial<DiscoverHostsDeps>): DiscoverHostsDeps {
 const FAKE_CORE_PATH = "/usr/local/lib/node_modules/pipeline/core";
 const FAKE_VERSION = "1.4.0";
 const OPENCODE_ABSENT = { available: false, cliBin: null, skillPath: null } as const;
+const OMP_ABSENT = { available: false, cliBin: null, skillPath: null } as const;
 
 // ---------------------------------------------------------------------------
 // 1. hostCoverage states
@@ -127,6 +128,51 @@ test("discoverHosts: OpenCode present with both CLIs keeps hostCoverage=both (#8
   assert.equal(result.hostCoverage, "both");
   assert.equal(result.hosts.opencode.available, true);
   assert.equal(result.hosts.opencode.cliBin, "/usr/local/bin/opencode");
+});
+
+test("discoverHosts: OMP skill alone does not invent Claude/Codex coverage (#1235)", async () => {
+  const result = await discoverHosts(
+    makeDeps({
+      probeCandidates: async () => null,
+      which: async () => null,
+      probeOmpSkill: async () => "/home/u/.omp/agent/skills/pipeline",
+    }),
+  );
+  assert.equal(result.hostCoverage, "missing");
+  assert.equal(result.hosts.omp.available, true);
+  assert.equal(result.hosts.omp.skillPath, "/home/u/.omp/agent/skills/pipeline");
+  assert.equal(result.hosts.claude.available, false);
+  assert.equal(result.hosts.codex.available, false);
+});
+
+test("discoverHosts: OMP present with both CLIs keeps hostCoverage=both (#1235)", async () => {
+  const result = await discoverHosts(
+    makeDeps({
+      probeCandidates: async () => FAKE_CORE_PATH,
+      readVersion: async () => FAKE_VERSION,
+      which: async (cmd) => `/usr/local/bin/${cmd}`,
+      probeOmpSkill: async () => "/tmp/omp/agent/skills/pipeline",
+    }),
+  );
+  assert.equal(result.hostCoverage, "both");
+  assert.equal(result.hosts.omp.available, true);
+  assert.equal(result.hosts.omp.skillPath, "/tmp/omp/agent/skills/pipeline");
+  assert.equal(result.hosts.claude.available, true);
+  assert.equal(result.hosts.codex.available, true);
+});
+
+test("discoverHosts: additive hosts.omp.available is false when OMP is absent (#1235)", async () => {
+  const result = await discoverHosts(
+    makeDeps({
+      probeCandidates: async () => FAKE_CORE_PATH,
+      readVersion: async () => FAKE_VERSION,
+      which: async (cmd) => `/usr/local/bin/${cmd}`,
+    }),
+  );
+  assert.equal(result.hosts.omp.available, false);
+  assert.equal(result.hosts.omp.skillPath, null);
+  assert.ok("claude" in result.hosts);
+  assert.ok("codex" in result.hosts);
 });
 
 // ---------------------------------------------------------------------------
@@ -251,6 +297,7 @@ test("handlePathSubcommand: succeeds without .github/pipeline.yml (#1240)", asyn
       claude: { available: true, cliBin: "/usr/bin/claude" },
       codex: { available: true, cliBin: "/usr/bin/codex" },
       opencode: { ...OPENCODE_ABSENT },
+      omp: { ...OMP_ABSENT },
     },
   };
   const logged: string[] = [];
@@ -272,6 +319,7 @@ test("handlePathSubcommand --json: serialises DiscoveryResult as valid JSON", as
       claude: { available: true, cliBin: "/usr/bin/claude" },
       codex: { available: true, cliBin: "/usr/bin/codex" },
       opencode: { ...OPENCODE_ABSENT },
+      omp: { ...OMP_ABSENT },
     },
   };
 
@@ -304,6 +352,7 @@ test("handlePathSubcommand --json: missing install JSON has null corePath", asyn
       claude: { available: false, cliBin: null },
       codex: { available: false, cliBin: null },
       opencode: { ...OPENCODE_ABSENT },
+      omp: { ...OMP_ABSENT },
     },
   };
 
@@ -329,6 +378,7 @@ test("handlePathSubcommand --json: exit code 0 for missing install (not an error
         claude: { available: false, cliBin: null },
         codex: { available: false, cliBin: null },
         opencode: { ...OPENCODE_ABSENT },
+        omp: { ...OMP_ABSENT },
       },
     }),
   };
@@ -364,6 +414,7 @@ test("handlePathSubcommand human-readable: prints core path and coverage", async
       claude: { available: true, cliBin: "/usr/bin/claude" },
       codex: { available: false, cliBin: null },
       opencode: { ...OPENCODE_ABSENT },
+      omp: { ...OMP_ABSENT },
     },
   };
 
