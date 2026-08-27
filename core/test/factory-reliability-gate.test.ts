@@ -27,6 +27,10 @@ import {
   trendLedgerEntryFromEvidence,
   lookupFrgPass,
   requireFrgPassForRelease,
+  factoryGateMissingFromRunUsage,
+  formatMissingFrgRecoveryCommands,
+  missingFrgPassDiagnostic,
+  shipMissingFrgDiagnostic,
   formatFrgPrSection,
   formatEngineClassRateDisplay,
   runFactoryGate,
@@ -670,11 +674,46 @@ test("lookupFrgPass: unparsable evidence is distinguishable", async () => {
   assert.equal(look.kind, "unparsable");
 });
 
+function assertRunnableFrgRecovery(text: string, version: string): void {
+  assert.match(text, /pipeline loop --label factory-gate --profile claude/);
+  assert.match(
+    text,
+    new RegExp(`pipeline factory-gate --for ${version.replace(/\./g, "\\.")} --from-run`),
+  );
+  const loopIdx = text.indexOf("pipeline loop --label factory-gate --profile claude");
+  const fromRunIdx = text.indexOf("--from-run");
+  const skipIdx = text.indexOf("--skip-frg");
+  assert.ok(loopIdx !== -1 && fromRunIdx !== -1);
+  if (skipIdx !== -1) {
+    assert.ok(
+      loopIdx < skipIdx && fromRunIdx < skipIdx,
+      "--skip-frg must not be the first or only named recovery",
+    );
+  }
+  assert.doesNotMatch(
+    text,
+    /non-claude[\s\S]{0,80}--skip-frg|--skip-frg[\s\S]{0,80}non-claude profile/,
+  );
+}
+
 test("requireFrgPassForRelease: missing / fail / empty run_id refuse; pass returns evidence", async () => {
   const fs = memFs();
   await assert.rejects(
     () => requireFrgPassForRelease("/repo", "1.29.1", fs),
-    /pass missing for version 1\.29\.1/,
+    (err: unknown) => {
+      const msg = (err as Error).message;
+      assert.match(msg, /pass missing for version 1\.29\.1/);
+      assertRunnableFrgRecovery(msg, "1.29.1");
+      assert.doesNotMatch(
+        msg,
+        /^[\s\S]*Run: pipeline factory-gate --for 1\.29\.1\s*$/,
+      );
+      const skipIdx = msg.indexOf("--skip-frg");
+      if (skipIdx !== -1) {
+        assert.match(msg.slice(0, skipIdx), /Escape/);
+      }
+      return true;
+    },
   );
 
   const failEv = computeFrgEvidence({
@@ -685,7 +724,12 @@ test("requireFrgPassForRelease: missing / fail / empty run_id refuse; pass retur
   await writeFrgEvidence("/repo", failEv, fs);
   await assert.rejects(
     () => requireFrgPassForRelease("/repo", "1.29.1", fs),
-    /Gate FAILED for version 1\.29\.1/,
+    (err: unknown) => {
+      const msg = (err as Error).message;
+      assert.match(msg, /Gate FAILED for version 1\.29\.1/);
+      assertRunnableFrgRecovery(msg, "1.29.1");
+      return true;
+    },
   );
 
   const passEv = computeFrgEvidence(fullPackPassInput({ version: "1.29.1", run_id: "frg-ok" }));
@@ -714,6 +758,52 @@ test("requireFrgPassForRelease: missing / fail / empty run_id refuse; pass retur
     /unparsable|run_id/,
   );
   void bad;
+});
+
+test("missing-FRG diagnostics name pack loop, profile, and from-run (#1252)", () => {
+  const missing = missingFrgPassDiagnostic({
+    version: "1.39.13",
+    path: "/repo/.agent-pipeline/frg/1.39.13/latest.json",
+  });
+  assertRunnableFrgRecovery(missing, "1.39.13");
+  assert.match(missing, /expected \/repo\/\.agent-pipeline\/frg\/1\.39\.13\/latest\.json/);
+
+  const usage = factoryGateMissingFromRunUsage();
+  assert.match(usage, /pipeline loop --label factory-gate --profile claude/);
+  assert.match(usage, /pipeline factory-gate --for <X\.Y\.Z> --from-run/);
+  assert.ok(!usage.includes("--skip-frg") || usage.indexOf("--skip-frg") > usage.indexOf("--from-run"));
+
+  const ship = shipMissingFrgDiagnostic({ version: "1.39.13", includePrepare: true });
+  assertRunnableFrgRecovery(ship, "1.39.13");
+  const loopIdx = ship.indexOf("pipeline loop --label factory-gate --profile claude");
+  const prepareIdx = ship.indexOf("pipeline factory-release prepare");
+  assert.ok(loopIdx !== -1 && prepareIdx !== -1 && loopIdx < prepareIdx);
+
+  const block = formatMissingFrgRecoveryCommands({
+    version: "1.39.13",
+    includeSkipEscape: true,
+  });
+  assertRunnableFrgRecovery(block, "1.39.13");
+  assert.match(block, /Escape \(non-production no-frg-\* pin/);
+});
+
+test("runFactoryGate without --from-run names pack loop and profile (#1252)", async () => {
+  await assert.rejects(
+    () =>
+      runFactoryGate({
+        version: "1.39.13",
+        repoDir: "/repo",
+        stdout: () => {},
+        stderr: () => {},
+      }),
+    (err: unknown) => {
+      const msg = (err as Error).message;
+      assert.match(msg, /pipeline loop --label factory-gate --profile claude/);
+      assert.match(msg, /pipeline factory-gate --for <X\.Y\.Z> --from-run/);
+      assert.equal(msg, factoryGateMissingFromRunUsage());
+      return true;
+    },
+  );
 });
 
 test("formatFrgPrSection includes run_id and pass for release PR surface", () => {

@@ -29,6 +29,7 @@ import {
   type ResolveCandidateEngineDeps,
 } from "../ship-end-candidate.ts";
 import {
+  shipMissingFrgDiagnostic,
   validateFrgEvidenceFileForTag,
   validateFrgEvidenceSnapshotForTag,
   type FrgEvidence,
@@ -73,9 +74,13 @@ import {
   type ShipTrainPlan,
 } from "./ship.ts";
 import {
+  assertMilestoneIssueDiscoveryLimit,
+  emptyFreezeEligibleMilestoneError,
+  MILESTONE_ISSUE_DISCOVERY_LIMIT,
   orderIssuesByDeclaredDeps,
   realTrainDeps,
   runTrain,
+  selectFreezeEligibleIssues,
   type AdvanceWaveResult,
   type TrainDeps,
   type TrainIssueSnapshot,
@@ -106,6 +111,21 @@ const TERMINAL_LOOP_EVENT_KINDS = new Set([
 interface ObservedRelease {
   prepare: ShipReleaseEvidence;
   finish: ShipReleaseFinishEvidence | null;
+}
+
+/**
+ * Ship freeze from a listed milestone snapshot (#1252). Admits freeze-eligible
+ * issues; does not classify already-integrated (train merge-mode owns that).
+ */
+export function planTrainFromMilestoneIssues(
+  milestone: string,
+  issues: readonly TrainIssueSnapshot[],
+): ShipTrainPlan {
+  const eligible = selectFreezeEligibleIssues(issues);
+  if (eligible.length === 0) {
+    throw new Error(emptyFreezeEligibleMilestoneError(milestone, "ship"));
+  }
+  return { ordered_issues: orderIssuesByDeclaredDeps(eligible) };
 }
 
 /**
@@ -558,24 +578,11 @@ export function shipCoordinatorDepsFromOperations(
       }
       const evidence = await observeValidatedFrg(intent, retainedTrain, true);
       if (!evidence) {
-        if (isPostPilotReleaseVersion(intent.version)) {
-          throw new Error(
-            `ship FRG: no release-eligible candidate artifact for v${intent.version}. ` +
-              `Auto-generate genuine FRG via the durable path (not a synthetic trivial pack):\n` +
-              `  pipeline factory-release prepare --request <absolute-off-repo-request.json> --json\n` +
-              `Multi-tick protocol: first call starts/resumes a bound pack loop and ` +
-              `returns in_progress; after the loop is scored --from-run (no --observations) ` +
-              `it returns awaiting_frg_attestation; after the production-owned attestor ` +
-              `stores the MAC, the next unchanged call returns complete (or write attested ` +
-              `latest.json and retry ship). ` +
-              `Hybrid pilot remains valid only for exactly v${FRG_HYBRID_PILOT_VERSION}.`,
-          );
-        }
         throw new Error(
-          `ship FRG: no release-eligible candidate artifact for v${intent.version}. ` +
-            `Complete the shipped fixed pack, run ` +
-            `pipeline factory-gate --for ${intent.version} --from-run <loop-run-id> ` +
-            `--observations <file>, then retry the same ship command.`,
+          shipMissingFrgDiagnostic({
+            version: intent.version,
+            includePrepare: isPostPilotReleaseVersion(intent.version),
+          }),
         );
       }
       return projectFrgPack(intent, trainEvidence, evidence);
@@ -707,15 +714,11 @@ function realShipAdapterOperations(opts: RealShipCoordinatorDepsOptions): ShipAd
     state: "open" | "all",
   ): Promise<TrainIssueSnapshot[]> => {
     const rows = await ghJson([
-      "issue", "list", "--milestone", milestone, "--state", state, "--limit", "200",
+      "issue", "list", "--milestone", milestone, "--state", state,
+      "--limit", String(MILESTONE_ISSUE_DISCOVERY_LIMIT),
       "--json", "number,title,body,labels,state",
     ]) as Array<Parameters<typeof normalizeIssue>[0]>;
-    if (rows.length >= 200) {
-      throw new Error(
-        `ship train: milestone ${JSON.stringify(milestone)} reached the 200-issue discovery limit; ` +
-          "split the milestone or add paginated discovery before authorizing a shipment",
-      );
-    }
+    assertMilestoneIssueDiscoveryLimit(rows.length, milestone, "ship");
     return rows.map(normalizeIssue);
   };
 
@@ -736,7 +739,8 @@ function realShipAdapterOperations(opts: RealShipCoordinatorDepsOptions): ShipAd
     return {
       ...base,
       log: opts.progress,
-      listMilestoneIssues: (milestone) => listMilestoneIssues(milestone, "all"),
+      listMilestoneIssues: async (milestone) =>
+        selectFreezeEligibleIssues(await listMilestoneIssues(milestone, "all")),
       getPrForIssue: getPrForIssueAll,
     };
   };
@@ -910,11 +914,8 @@ function realShipAdapterOperations(opts: RealShipCoordinatorDepsOptions): ShipAd
 
   return {
     async planTrain(intent) {
-      const issues = await listMilestoneIssues(intent.milestone, "open");
-      if (issues.length === 0) {
-        throw new Error(`ship train: milestone ${JSON.stringify(intent.milestone)} has no open issues to freeze`);
-      }
-      return { ordered_issues: orderIssuesByDeclaredDeps(issues) };
+      const issues = await listMilestoneIssues(intent.milestone, "all");
+      return planTrainFromMilestoneIssues(intent.milestone, issues);
     },
     observeTrain,
     async runTrain(intent, plannedIssues) {
