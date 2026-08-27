@@ -7,6 +7,10 @@ GitHub milestones own planned release membership; [ROADMAP.md](ROADMAP.md) is hu
 
 Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 
+## [1.39.13] - 2026-08-27
+
+v1.39.13
+
 ## [1.39.12] - 2026-08-24
 
 v1.39.12

@@ -154,7 +154,11 @@ the CLI emits an early machine-readable stdout JSON line
 harness can follow structured progress; a terminal summary JSON is printed
 when the supervisor finishes. `--resume <run-id>` takes over a run whose prior
 supervisor is provably gone; a run whose supervisor is still alive is refused
-rather than double-driven. `--audit` renders the run's process identity,
+rather than double-driven. When the ledger carries `stop.reason = run_fatal`,
+resume re-drives valid outstanding items at the same run id after a fresh
+reconcile, or refuses with the recorded fatal time/theme and
+`pipeline loop --resume <run-id> --audit` / `pipeline loop --new-run`; it never
+silently reports `resumed: true` with `dispatched: 0`. `--audit` renders the run's process identity,
 action-evidence timeline, watchdog/no-progress state, and a **per-item
 stage-progress table** (stage + optional round + advance run-id drill-down)
 with zero durable writes (no drive handoff). Combine with `--follow`

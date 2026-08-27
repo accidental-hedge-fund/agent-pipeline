@@ -325,6 +325,35 @@ test("runLoopCommand — a terminal outstanding hold names every held item on st
   assert.equal(parsed.completion, null, "an outstanding hold leaves completion null (#614)");
 });
 
+test("runLoopCommand — ineligible run_fatal resume is a kind:error refusal, not a zero-dispatch summary (#1258)", async () => {
+  const refusal =
+    'loop run "loop-68575cf7a09c849c" is stopped with run_fatal at 2026-08-27T15:27:13.000Z ' +
+    "(theme=workflow-engine-defect, item_id=1253); no valid outstanding item remains. " +
+    "Inspect with `pipeline loop --resume loop-68575cf7a09c849c --audit`. " +
+    "Start a replacement with `pipeline loop --new-run` for the same selector.";
+  const deps: LoopCliDeps = {
+    runLoopPreflight: async () =>
+      ({
+        ok: true,
+        args: { selector: undefined, resumeRunId: "loop-68575cf7a09c849c", audit: false },
+      }) satisfies LoopPreflightOutcome,
+    runLoopEngine: async () => ({ kind: "error", message: refusal }),
+  };
+  process.exitCode = undefined;
+  const { out, err } = await withCapturedConsole(() =>
+    runLoopCommand({ resume: "loop-68575cf7a09c849c", profile: "claude" } as CliOpts, [], deps),
+  );
+  assert.equal(process.exitCode, 1);
+  process.exitCode = 0;
+  assert.equal(out.length, 0, "must not print the terminal drive summary JSON");
+  assert.equal(err.join("\n").includes('"resumed":true'), false);
+  assert.equal(err.join("\n").includes('"dispatched":0'), false);
+  assert.match(err.join("\n"), /2026-08-27T15:27:13/);
+  assert.match(err.join("\n"), /workflow-engine-defect/);
+  assert.match(err.join("\n"), /pipeline loop --resume loop-68575cf7a09c849c --audit/);
+  assert.match(err.join("\n"), /pipeline loop --new-run/);
+});
+
 test("runLoopCommand — a run-engine error (e.g. an unsupported selector type) exits non-zero", async () => {
   const deps: LoopCliDeps = {
     runLoopPreflight: async () =>
@@ -985,6 +1014,8 @@ test("runLoopCommand — --resume path emits handoff with resumed:true before fi
   const terminal = JSON.parse(out[0]);
   assert.equal(terminal.resumed, true);
   assert.notEqual(terminal.kind, LOOP_RUN_HANDOFF_KIND);
+  assert.equal(terminal.dispatched, 1, "eligible re-drive must not echo dispatched: 0 (#1258)");
+  assert.equal(terminal.stop, null);
 });
 
 test("runLoopCommand — preflight failure emits no loop_run_handoff (#665)", async () => {
