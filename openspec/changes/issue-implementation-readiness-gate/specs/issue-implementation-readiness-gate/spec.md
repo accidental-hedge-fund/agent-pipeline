@@ -1,0 +1,248 @@
+## Purpose
+
+Opt-in admission gate that evaluates a freshly fetched GitHub issue through the resolved Implementer planning treatment before any delivery worktree or planning/implementation harness starts, and that holds thin issues at `pipeline:needs-spec` with one hash-bound refinement comment.
+
+## ADDED Requirements
+
+### Requirement: The issue-readiness gate SHALL be disabled by default and SHALL leave every pickup path unchanged while disabled
+
+When `issue_readiness.enabled` is `false` or the `issue_readiness` block is absent, every direct advance, queue, loop, train, and ship pickup path SHALL keep its current admission, worktree, and harness behavior. The gate SHALL NOT fetch for evaluation, SHALL NOT invoke a model, SHALL NOT write the owned comment, and SHALL NOT add `pipeline:needs-spec`.
+
+#### Scenario: Disabled config admits a thin issue the way current pickup does
+
+- **WHEN** `issue_readiness.enabled` is `false`
+- **AND** a thin `pipeline:ready` issue is picked up by direct advance
+- **THEN** the run SHALL proceed into the existing ready-to-planning flow
+- **AND** no issue-readiness model call SHALL occur
+- **AND** the issue SHALL NOT receive `pipeline:needs-spec`
+
+#### Scenario: Absent block equals disabled
+
+- **WHEN** `.github/pipeline.yml` omits `issue_readiness`
+- **AND** any pickup path starts a `pipeline:ready` issue
+- **THEN** behavior SHALL match `enabled: false`
+
+### Requirement: This repository SHALL enable the gate as the initial dogfood consumer
+
+The committed `.github/pipeline.yml` in the agent-pipeline repository SHALL set `issue_readiness.enabled` to `true`. A different repository that omits the block or sets `enabled: false` SHALL remain ungated.
+
+#### Scenario: agent-pipeline config opts in
+
+- **WHEN** this repository's `.github/pipeline.yml` is loaded
+- **THEN** `issue_readiness.enabled` SHALL be `true`
+
+#### Scenario: Another repository stays ungated unless it opts in
+
+- **WHEN** a repository has no `issue_readiness` block
+- **THEN** the gate SHALL NOT run
+
+### Requirement: Every GitHub issue pickup path SHALL call one shared gate before worktree create or delivery harness invoke
+
+Direct `pipeline <issue>` / advance / single, queue item dispatch, loop or supervisor redispatch, train, and ship SHALL invoke the same gate function before creating a worktree and before invoking the planning or implementation delivery harness. No pickup path SHALL start delivery of a `pipeline:ready` issue while the gate is enabled without that call. Mid-flight stages (`planning` and later) SHALL NOT re-run the gate.
+
+#### Scenario: Direct single hits the gate before planning
+
+- **WHEN** `issue_readiness.enabled` is `true`
+- **AND** the operator runs direct advance on a `pipeline:ready` issue
+- **THEN** the shared gate SHALL run before live-planning marker claim, worktree create, and planning authoring
+
+#### Scenario: Queue item dispatch hits the same gate
+
+- **WHEN** queue selects a `pipeline:ready` issue while the gate is enabled
+- **THEN** that item's run SHALL call the same gate function before worktree create or delivery harness invoke
+
+#### Scenario: Loop, train, and ship hit the same gate
+
+- **WHEN** loop redispatch, train, or ship starts a `pipeline:ready` issue while the gate is enabled
+- **THEN** that start SHALL call the same gate function before worktree create or delivery harness invoke
+
+#### Scenario: Mid-flight redispatch skips the gate
+
+- **WHEN** an issue already carries `pipeline:implementing` (or any stage after `ready`)
+- **THEN** the gate SHALL NOT evaluate the issue body
+- **AND** the existing stage handler SHALL run
+
+### Requirement: The gate SHALL evaluate a freshly fetched title, body, and labels
+
+Immediately before evaluation or verdict reuse, the gate SHALL re-fetch the authoritative GitHub issue title, body, and labels. It SHALL NOT evaluate stale queue inventory, a prior-run snapshot, or the text of an earlier comment as the issue body.
+
+#### Scenario: Stale queue text is not evaluated
+
+- **WHEN** queue inventory captured a thin body
+- **AND** the live GitHub issue body has since gained executable acceptance criteria
+- **THEN** the gate SHALL evaluate the live body
+- **AND** SHALL NOT use the inventory snapshot as the evaluated text
+
+#### Scenario: Prior comment is not the evaluated body
+
+- **WHEN** an owned refinement comment contains a proposed body
+- **AND** the live issue body is still the original text
+- **THEN** the gate SHALL hash and evaluate the live issue title and body, not the comment's proposed body
+
+### Requirement: The gate SHALL invoke the resolved Implementer with the active planning treatment
+
+When a model call is required, the gate SHALL invoke the resolved Implementer from `harnesses.implementer` using `models.planning` and `effort.planning`, including normal `auto` routing for those keys. The gate SHALL NOT invoke the Reviewer. The gate SHALL NOT hard-code a provider, model, or harness name.
+
+#### Scenario: Planning treatment is propagated
+
+- **WHEN** config sets `harnesses.implementer: grok`, `models.planning: grok-4.6`, and `effort.planning: high`
+- **AND** the gate makes a model call
+- **THEN** the invocation SHALL use implementer `grok` with planning model `grok-4.6` and effort `high`
+- **AND** the Reviewer SHALL NOT be invoked
+
+#### Scenario: Auto routing uses the planning stage expansion
+
+- **WHEN** `models.planning` or `effort.planning` is `auto`
+- **AND** the gate makes a model call
+- **THEN** the invoked model and effort SHALL equal the resolved `planning` auto-routing result for the implementer harness
+
+### Requirement: The gate SHALL accept only a structured ready or needs_spec verdict and SHALL admit on semantic completeness
+
+The model response SHALL be valid JSON whose `verdict` is exactly `ready` or `needs_spec`. Semantic readiness SHALL require a clear problem/outcome, observable acceptance criteria, scope constraints or non-goals, and no unresolved contradiction. Canonical headings SHALL NOT be required for admission. Missing headings MAY appear in a `needs_spec` proposed body.
+
+#### Scenario: Semantically complete issue without canonical headings is ready
+
+- **WHEN** the freshly fetched body states a clear outcome, checkable acceptance criteria, explicit non-goals, and no contradiction
+- **AND** it omits the Summary / User story headings
+- **THEN** the verdict SHALL be `ready`
+- **AND** the issue SHALL be admitted to the existing planning flow
+
+#### Scenario: Missing observable acceptance criteria is needs_spec
+
+- **WHEN** the body describes a problem but has no observable acceptance criteria
+- **THEN** the verdict SHALL be `needs_spec`
+
+#### Scenario: Unresolved contradiction is needs_spec
+
+- **WHEN** the body contains two acceptance criteria that cannot both be true
+- **THEN** the verdict SHALL be `needs_spec`
+
+### Requirement: A needs_spec result SHALL write or update exactly one hash-and-treatment-bound Pipeline-authored comment
+
+On `needs_spec` the gate SHALL create or update exactly one Pipeline-authored GitHub comment. The comment SHALL be bound to the evaluated title/body hash and the resolved planning treatment through an engine-owned marker. The comment body SHALL list concrete deficiencies and a proposed revised body that preserves author intent and contains the headings Summary, User story, Acceptance criteria, Out of scope, and Open questions. The gate SHALL NOT create a second owned comment for the same issue.
+
+#### Scenario: First rejection posts one owned comment
+
+- **WHEN** the gate returns `needs_spec` and no owned comment exists
+- **THEN** the gate SHALL post one comment containing deficiencies, the proposed revised body, and the binding marker
+
+#### Scenario: Later evaluation updates the same comment
+
+- **WHEN** an owned comment already exists
+- **AND** a new evaluation produces `needs_spec` under a new hash or treatment
+- **THEN** the gate SHALL update that comment in place
+- **AND** SHALL NOT post an additional owned comment
+
+### Requirement: A needs_spec result SHALL move the issue to pipeline:needs-spec and SHALL NOT start delivery
+
+On `needs_spec` the gate SHALL transition the issue from `pipeline:ready` to `pipeline:needs-spec`. It SHALL NOT create a worktree. It SHALL NOT invoke the planning authoring harness or the implementation delivery harness. Queue and loop output SHALL name the structured `needs_spec` reason. Independent eligible issues SHALL continue.
+
+#### Scenario: Rejected issue is labeled needs-spec with no worktree
+
+- **WHEN** the gate returns `needs_spec` for issue N
+- **THEN** issue N SHALL carry `pipeline:needs-spec` and SHALL NOT carry `pipeline:ready`
+- **AND** no worktree SHALL be created for N
+- **AND** planning and implementation delivery harnesses SHALL NOT be invoked for N
+
+#### Scenario: Independent sibling continues
+
+- **WHEN** a queue or loop batch contains rejected issue A and independent eligible issue B
+- **THEN** A SHALL move to `pipeline:needs-spec`
+- **AND** B SHALL remain eligible and SHALL continue
+
+### Requirement: The gate SHALL NOT edit the issue body, milestone, unrelated labels, or project files
+
+The gate's GitHub writes SHALL be only the owned comment and, on `needs_spec`, the `pipeline:needs-spec` label transition. It SHALL NOT patch the issue body, change the milestone, add or remove unrelated labels, or modify project files.
+
+#### Scenario: Rejection does not rewrite the issue body
+
+- **WHEN** the gate returns `needs_spec`
+- **THEN** the GitHub issue body SHALL be unchanged
+- **AND** the milestone SHALL be unchanged
+- **AND** no project file SHALL be written
+
+### Requirement: Unchanged title, body, and treatment SHALL reuse the recorded verdict without another model call or comment
+
+The gate SHALL persist the bound verdict in the owned comment for both `ready` and `needs_spec`. When a fresh fetch matches the recorded title/body hash and resolved planning treatment, the gate SHALL reuse that verdict and SHALL NOT invoke the model and SHALL NOT post a new comment. A change to title, body, or resolved planning treatment SHALL invalidate the record and SHALL evaluate again.
+
+#### Scenario: Unchanged thin issue reuses needs_spec
+
+- **WHEN** an owned comment records `needs_spec` for hash H and treatment T
+- **AND** a later pickup fetches the same title, body, and treatment
+- **THEN** the gate SHALL reuse `needs_spec`
+- **AND** SHALL NOT invoke the model
+- **AND** SHALL NOT post a new comment
+- **AND** the issue SHALL be at `pipeline:needs-spec`
+
+#### Scenario: Body change invalidates the record
+
+- **WHEN** the live body no longer matches the recorded hash
+- **THEN** the gate SHALL evaluate again with a model call
+
+#### Scenario: Treatment change invalidates the record
+
+- **WHEN** the resolved planning model, effort, or implementer harness differs from the recorded treatment
+- **AND** the title and body are unchanged
+- **THEN** the gate SHALL evaluate again with a model call
+
+#### Scenario: Unchanged ready verdict is reused
+
+- **WHEN** an owned comment records `ready` for the current hash and treatment
+- **AND** the issue is again at `pipeline:ready`
+- **THEN** the gate SHALL admit without a model call
+- **AND** SHALL NOT post a new comment
+
+### Requirement: Triage to ready SHALL be an admission request, not a bypass of the gate
+
+After an author applies a proposed body, `pipeline triage <N> --stage ready` SHALL remain the re-admission request. The next pickup SHALL re-fetch and SHALL require a `ready` verdict before any worktree or delivery harness starts. An unchanged thin body SHALL reuse `needs_spec` and return the issue to `pipeline:needs-spec`.
+
+#### Scenario: Fresh body must pass before delivery
+
+- **WHEN** an author updates the issue body and runs `pipeline triage N --stage ready`
+- **AND** the next pickup evaluates the new body as `ready`
+- **THEN** delivery MAY start
+- **AND** triage itself SHALL NOT have invoked the gate model
+
+#### Scenario: Unchanged body after triage is not a bypass
+
+- **WHEN** an issue at `pipeline:needs-spec` is triaged to `pipeline:ready` without a body change
+- **AND** the next pickup runs while the gate is enabled
+- **THEN** the gate SHALL reuse `needs_spec`
+- **AND** SHALL move the issue back to `pipeline:needs-spec`
+- **AND** SHALL NOT create a worktree
+
+### Requirement: Provider, harness, timeout, or schema failure SHALL be typed gate-unavailable with no fallback
+
+When the Implementer cannot be invoked, times out, or returns a response that fails the verdict schema, the outcome SHALL be typed `gate-unavailable`. The gate SHALL NOT fall back to a structural heuristic, the Reviewer, another provider, or another model. Direct single invocation SHALL fail with a non-zero exit and SHALL NOT start delivery. Multi-item runs SHALL block the affected issue and its selected dependents for that run and SHALL continue independent selected issues. The gate SHALL NOT write GitHub mutations on `gate-unavailable`. The issue SHALL remain on `pipeline:ready`.
+
+#### Scenario: Direct single fails visibly
+
+- **WHEN** the admission harness times out during `pipeline single` on issue N
+- **THEN** the process SHALL exit non-zero
+- **AND** N SHALL NOT gain a worktree
+- **AND** N SHALL NOT be labeled `pipeline:needs-spec`
+
+#### Scenario: Schema failure is gate-unavailable, not needs_spec
+
+- **WHEN** the model returns JSON without a `verdict` field
+- **THEN** the outcome SHALL be `gate-unavailable`
+- **AND** the issue SHALL NOT be labeled `pipeline:needs-spec`
+
+#### Scenario: Selected dependents are blocked; independents continue
+
+- **WHEN** a loop or train run has selected issue A, dependent B, and independent C
+- **AND** A's gate result is `gate-unavailable`
+- **THEN** A and B SHALL be blocked for that run
+- **AND** C SHALL remain eligible
+- **AND** no reviewer or alternate-model fallback SHALL run for A
+
+### Requirement: Gate I/O SHALL be injectable so unit tests perform no real network, git, or subprocess calls
+
+All GitHub reads and writes, time, and harness invocation used by the gate SHALL go through a `deps` seam. Unit tests SHALL supply fakes and SHALL perform no real network, git, or subprocess calls.
+
+#### Scenario: Fake deps prove rejection side effects
+
+- **WHEN** a unit test drives the gate with fake GitHub and harness deps and a `needs_spec` verdict
+- **THEN** the fakes SHALL record one owned comment write and the `ready` → `needs-spec` label transition
+- **AND** the fakes SHALL record zero worktree and zero planning-authoring calls
+- **AND** no real network, git, or subprocess call SHALL occur
