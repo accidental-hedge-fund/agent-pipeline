@@ -121,6 +121,7 @@ test("tagForVersion and installCommandForTag", () => {
   assert.equal(tagForVersion("v1.2.3"), "v1.2.3");
   assert.match(installCommandForTag("v1.2.3", "codex"), /#v1\.2\.3 install --host codex/);
   assert.match(installCommandForTag("v1.2.3", "all"), /#v1\.2\.3 install --host all/);
+  assert.match(installCommandForTag("v1.2.3", "omp"), /#v1\.2\.3 install --host omp/);
   assert.equal(DEFAULT_ENGINE_PROMOTE_HOST, "all");
 });
 
@@ -150,6 +151,14 @@ test("engine-promote: explicit --host codex stays scoped (#989)", async () => {
   const result = await runEnginePromote(opts({ host: "codex", dryRun: true }), deps);
   assert.match(result.install_command, /--host codex\b/);
   assert.doesNotMatch(result.install_command, /--host all\b/);
+});
+
+test("engine-promote: explicit --host omp stays scoped (#1235)", async () => {
+  const deps = makeDeps();
+  const result = await runEnginePromote(opts({ host: "omp", dryRun: true }), deps);
+  assert.match(result.install_command, /--host omp\b/);
+  assert.doesNotMatch(result.install_command, /--host all\b/);
+  assert.deepEqual(deps.installHosts, []);
 });
 
 test("ship playbook: thin launcher skips promote-host check; Tugboat defaults to all (#989 / #1151)", () => {

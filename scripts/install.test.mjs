@@ -55,6 +55,9 @@ import {
   installOpenCodeCommands,
   uninstallOpenCodeCommands,
   renderOpenCodePipelineCommand,
+  installOmpCommands,
+  uninstallOmpCommands,
+  renderOmpPipelineCommand,
   uninstallHost,
   opencodeBase,
   opencodeSkillDir,
@@ -1336,11 +1339,12 @@ function stubExistingCoreInstall(claudeConfigDir) {
   return dest;
 }
 
-function runInstaller(args, env) {
+function runInstaller(args, env, cwd) {
   return spawnSync(process.execPath, [INSTALL_SCRIPT, ...args], {
     env: { ...process.env, ...env },
     encoding: "utf8",
     timeout: 120_000,
+    cwd,
   });
 }
 
@@ -1692,27 +1696,33 @@ test("releaseUpdateLock: refuses to release a lock owned by another process (#45
 // Grok skill path (#731) — --host grok symlink materialization + help text
 // ---------------------------------------------------------------------------
 
-test("VALID_HOSTS and HOSTS include grok and opencode alongside claude and codex (#731/#861)", () => {
-  // installOrder: claude(10), codex(20), opencode(30), grok(40) then pseudo-host all (#784).
-  assert.deepEqual(VALID_HOSTS, ["claude", "codex", "opencode", "grok", "all"]);
+test("VALID_HOSTS and HOSTS include grok, opencode, and omp alongside claude and codex (#731/#861/#1235)", () => {
+  // installOrder: claude(10), codex(20), opencode(30), grok(40), omp(50) then pseudo-host all.
+  assert.deepEqual(VALID_HOSTS, ["claude", "codex", "opencode", "grok", "omp", "all"]);
   assert.ok(HOSTS.grok, "HOSTS.grok must exist");
   assert.ok(HOSTS.opencode, "HOSTS.opencode must exist");
+  assert.ok(HOSTS.omp, "HOSTS.omp must exist");
   assert.equal(HOSTS.grok.installMode, "symlink-claude");
   assert.equal(HOSTS.claude.installMode, "tree");
   assert.equal(HOSTS.codex.installMode, "tree");
   assert.equal(HOSTS.opencode.installMode, "tree");
+  assert.equal(HOSTS.omp.installMode, "tree");
   assert.equal(HOSTS.opencode.profile, "opencode");
+  assert.equal(HOSTS.omp.profile, "omp");
+  assert.equal(HOSTS.omp.commandsKind, "omp-native");
   // No hosts/grok overlay is required for this path target.
   assert.equal(HOSTS.grok.overlayFiles.length, 0);
   assert.ok(HOSTS.opencode.overlayFiles.includes("SKILL.md"));
+  assert.ok(HOSTS.omp.overlayFiles.includes("SKILL.md"));
 });
 
-test("usage header documents --host grok and opencode among implemented hosts (#731/#861)", () => {
+test("usage header documents --host grok, opencode, and omp among implemented hosts (#731/#861/#1235)", () => {
   const src = readFileSync(fileURLToPath(new URL("./install.mjs", import.meta.url)), "utf8");
-  assert.match(src, /--host claude\|codex\|grok\|opencode\|all/);
+  assert.match(src, /--host claude\|codex\|grok\|opencode\|omp\|all/);
   assert.match(src, /Grok Build/);
   assert.match(src, /~\/\.grok\/skills\/pipeline/);
   assert.match(src, /OPENCODE_CONFIG_DIR|~\/\.config\/opencode/);
+  assert.match(src, /~\/\.omp\/agent/);
   // Header must not claim a hosts/grok SKILL.md fork.
   assert.match(src, /no separate hosts\/grok SKILL\.md overlay/i);
 });
@@ -1733,6 +1743,7 @@ test("unknown --host error lists grok/opencode and points at Grok skill path (#7
     assert.match(out, /codex/);
     assert.match(out, /grok/);
     assert.match(out, /opencode/);
+    assert.match(out, /omp/);
     assert.match(out, /\ball\b/);
     assert.match(out, /~\/\.grok\/skills\/pipeline|Grok Build skill path/);
     assert.match(out, /opencode/i);
@@ -2296,10 +2307,11 @@ test("install --host codex: managed marker → normal overwrite, no personal-sha
   }
 });
 
-test("HOSTS tree-mode: claude, codex, and opencode share installMode tree for shadow gate (#635/#861)", () => {
+test("HOSTS tree-mode: claude, codex, opencode, and omp share installMode tree for shadow gate (#635/#861/#1235)", () => {
   assert.equal(HOSTS.claude.installMode, "tree");
   assert.equal(HOSTS.codex.installMode, "tree");
   assert.equal(HOSTS.opencode.installMode, "tree");
+  assert.equal(HOSTS.omp.installMode, "tree");
   assert.equal(HOSTS.grok.installMode, "symlink-claude");
 });
 
@@ -2736,6 +2748,7 @@ test("HOSTS are built from co-located outer-host manifests (#784)", () => {
   assert.equal(HOSTS.claude.commandsKind, "claude-slash");
   assert.equal(HOSTS.codex.commandsKind, "codex-prompt");
   assert.equal(HOSTS.opencode.commandsKind, "opencode-native");
+  assert.equal(HOSTS.omp.commandsKind, "omp-native");
   assert.equal(HOSTS.grok.installMode, "symlink-claude");
   assert.ok(HOSTS.claude.userOwnedExclusion.length > 0);
   const manifests = loadOuterHostManifests();
@@ -2758,3 +2771,403 @@ test("reloadHostsFromManifests: synthetic host appears without built-in module e
     reloadHostsFromManifests([]);
   }
 });
+
+// ---------------------------------------------------------------------------
+// OMP host (#1235) — tree install, native TypeScript /pipeline, isolation
+// ---------------------------------------------------------------------------
+
+function ompHomeEnv(home, extra = {}) {
+  return {
+    HOME: home,
+    TMPDIR: extra.lockTmp || extra.TMPDIR || home,
+    TMP: extra.lockTmp || extra.TMP || home,
+    TEMP: extra.lockTmp || extra.TEMP || home,
+    ...extra,
+  };
+}
+
+test("--host pi is rejected and does not install OMP (#1235)", () => {
+  const home = makeTmp();
+  try {
+    const result = runInstaller(["install", "--host", "pi"], ompHomeEnv(home));
+    assert.notEqual(result.status, 0);
+    const out = `${result.stdout}${result.stderr}`;
+    assert.match(out, /Unknown --host 'pi'/);
+    assert.match(out, /omp/);
+    assert.equal(existsSync(join(home, ".omp", "agent", "skills", "pipeline")), false);
+  } finally {
+    cleanup(home);
+  }
+});
+
+test("renderOmpPipelineCommand: bakes execPath and launcher; no PATH node or shell (#1235)", () => {
+  const skillDir = "/custom/omp/agent/skills/pipeline";
+  const execPath = "/opt/install-node/bin/node";
+  const content = renderOmpPipelineCommand(skillDir, execPath);
+  assert.ok(content.includes(execPath));
+  assert.ok(content.includes("/custom/omp/agent/skills/pipeline/scripts/pipeline.mjs"));
+  assert.match(content, /name:\s*"pipeline"/);
+  assert.ok(!content.includes('!`node '));
+  assert.ok(!/\bsh -c\b/.test(content));
+  assert.ok(!content.includes("PATH `node`"));
+  // Bare PATH node as launcher: the OpenCode template uses `!` `node <bridge>`.
+  assert.ok(!content.includes("!`node "));
+  assert.match(content, /shell:\s*false/);
+});
+
+test("installOmpCommands: writes commands/pipeline/index.ts (#1235)", () => {
+  const tmp = makeTmp();
+  try {
+    installOmpCommands(tmp, false);
+    const cmdPath = join(tmp, "commands", "pipeline", "index.ts");
+    assert.ok(existsSync(cmdPath), "OMP TypeScript /pipeline command must exist");
+    const content = readFileSync(cmdPath, "utf8");
+    assert.ok(content.includes(process.execPath));
+    assert.ok(content.includes(join(tmp, "skills", "pipeline", "scripts", "pipeline.mjs")));
+    assert.match(content, /name:\s*"pipeline"/);
+  } finally {
+    cleanup(tmp);
+  }
+});
+
+test("install --host omp: managed skill tree + command; isolation from other hosts and project .omp (#1235)", () => {
+  const home = makeTmp();
+  const claudeTmp = makeTmp();
+  const codexTmp = makeTmp();
+  const opencodeTmp = makeTmp();
+  const grokTmp = join(home, ".grok");
+  const project = makeTmp();
+  const profileAgent = join(home, ".omp", "profiles", "work", "agent");
+  mkdirSync(profileAgent, { recursive: true });
+  writeFileSync(join(profileAgent, "sentinel-profile.txt"), "keep-profile");
+  mkdirSync(join(project, ".omp", "skills"), { recursive: true });
+  writeFileSync(join(project, ".omp", "skills", "sentinel-project.txt"), "keep-project");
+  mkdirSync(join(opencodeTmp, "commands"), { recursive: true });
+  writeFileSync(join(opencodeTmp, "commands", "pipeline.md"), "opencode-surface\n");
+  const claudeSkill = join(claudeTmp, "skills", "pipeline");
+  mkdirSync(claudeSkill, { recursive: true });
+  writeFileSync(join(claudeSkill, "sentinel-claude.txt"), "keep-me");
+  const codexSkill = join(codexTmp, "skills", "pipeline");
+  mkdirSync(codexSkill, { recursive: true });
+  writeFileSync(join(codexSkill, "sentinel-codex.txt"), "keep-me");
+  mkdirSync(join(grokTmp, "skills"), { recursive: true });
+  writeFileSync(join(grokTmp, "skills", "sentinel-grok.txt"), "keep-grok");
+  try {
+    const result = runInstaller(
+      ["install", "--host", "omp"],
+      ompHomeEnv(home, {
+        CLAUDE_CONFIG_DIR: claudeTmp,
+        CODEX_HOME: codexTmp,
+        OPENCODE_CONFIG_DIR: opencodeTmp,
+        PI_CODING_AGENT_DIR: join(home, "pi-override"),
+        OMP_HOME: join(home, "omp-override"),
+        OMP_AGENT_DIR: join(home, "omp-agent-override"),
+      }),
+      project,
+    );
+    assert.equal(result.status, 0, `install failed: ${result.stderr}\n${result.stdout}`);
+
+    const skillDir = join(home, ".omp", "agent", "skills", "pipeline");
+    assert.ok(existsSync(join(skillDir, MANAGED_MARKER)), "managed marker required");
+    assert.ok(existsSync(join(skillDir, "SKILL.md")), "OMP SKILL.md required");
+    assert.ok(existsSync(join(skillDir, "scripts", "pipeline.mjs")), "launcher required");
+    assert.ok(existsSync(join(skillDir, "core", "package.json")), "core required");
+    assert.ok(existsSync(join(skillDir, "core", "profiles", "omp.json")), "omp profile required");
+    const shim = readFileSync(join(skillDir, "scripts", "pipeline.mjs"), "utf8");
+    assert.match(shim, /const PROFILE = "omp"/);
+
+    const cmdPath = join(home, ".omp", "agent", "commands", "pipeline", "index.ts");
+    assert.ok(existsSync(cmdPath), "native TypeScript /pipeline command required");
+    const cmd = readFileSync(cmdPath, "utf8");
+    assert.ok(cmd.includes(process.execPath));
+    assert.ok(cmd.includes(join(skillDir, "scripts", "pipeline.mjs")));
+    assert.ok(!cmd.includes("!`node "));
+    assert.ok(!/\bsh -c\b/.test(cmd));
+
+    assert.equal(readFileSync(join(claudeSkill, "sentinel-claude.txt"), "utf8"), "keep-me");
+    assert.equal(readFileSync(join(codexSkill, "sentinel-codex.txt"), "utf8"), "keep-me");
+    assert.equal(readFileSync(join(grokTmp, "skills", "sentinel-grok.txt"), "utf8"), "keep-grok");
+    assert.equal(readFileSync(join(opencodeTmp, "commands", "pipeline.md"), "utf8"), "opencode-surface\n");
+    assert.equal(existsSync(join(home, "pi-override")), false);
+    assert.equal(existsSync(join(home, "omp-override")), false);
+    assert.equal(existsSync(join(home, "omp-agent-override")), false);
+    assert.equal(readFileSync(join(profileAgent, "sentinel-profile.txt"), "utf8"), "keep-profile");
+    assert.equal(readFileSync(join(project, ".omp", "skills", "sentinel-project.txt"), "utf8"), "keep-project");
+    assert.equal(existsSync(join(project, ".omp", "commands")), false);
+  } finally {
+    cleanup(home);
+    cleanup(claudeTmp);
+    cleanup(codexTmp);
+    cleanup(opencodeTmp);
+    cleanup(project);
+  }
+});
+
+test("install --host omp --dry-run: writes nothing (#1235)", () => {
+  const home = makeTmp();
+  try {
+    const result = runInstaller(["install", "--host", "omp", "--dry-run"], ompHomeEnv(home));
+    assert.equal(result.status, 0, `dry-run failed: ${result.stderr}\n${result.stdout}`);
+    assert.equal(existsSync(join(home, ".omp", "agent", "skills", "pipeline")), false);
+    assert.equal(existsSync(join(home, ".omp", "agent", "commands", "pipeline")), false);
+    assert.match(`${result.stdout}${result.stderr}`, /dry-run/i);
+  } finally {
+    cleanup(home);
+  }
+});
+
+test("install --host omp creates missing ~/.omp/agent (#1235)", () => {
+  const home = makeTmp();
+  try {
+    assert.equal(existsSync(join(home, ".omp", "agent")), false);
+    const result = runInstaller(["install", "--host", "omp"], ompHomeEnv(home));
+    assert.equal(result.status, 0, `install failed: ${result.stderr}\n${result.stdout}`);
+    assert.ok(existsSync(join(home, ".omp", "agent", "skills", "pipeline", MANAGED_MARKER)));
+  } finally {
+    cleanup(home);
+  }
+});
+
+test("install --host all includes omp when ~/.omp/agent exists (#1235)", () => {
+  const home = makeTmp();
+  const claudeTmp = join(home, ".claude");
+  mkdirSync(join(home, ".omp", "agent"), { recursive: true });
+  mkdirSync(claudeTmp, { recursive: true });
+  try {
+    const result = runInstaller(["install", "--host", "all", "--dry-run"], ompHomeEnv(home, {
+      CLAUDE_CONFIG_DIR: claudeTmp,
+    }));
+    assert.equal(result.status, 0, `all dry-run failed: ${result.stderr}\n${result.stdout}`);
+    const out = `${result.stdout}${result.stderr}`;
+    assert.match(out, /omp/i);
+  } finally {
+    cleanup(home);
+  }
+});
+
+test("uninstall --host omp: removes skill + pipeline command; leaves siblings and other hosts (#1235)", () => {
+  const home = makeTmp();
+  const claudeTmp = makeTmp();
+  try {
+    const install = runInstaller(["install", "--host", "omp"], ompHomeEnv(home, {
+      CLAUDE_CONFIG_DIR: claudeTmp,
+    }));
+    assert.equal(install.status, 0, `install failed: ${install.stderr}\n${install.stdout}`);
+
+    const commandsDir = join(home, ".omp", "agent", "commands");
+    writeFileSync(join(commandsDir, "other.md"), "keep-sibling\n");
+    mkdirSync(join(commandsDir, "othercmd"), { recursive: true });
+    writeFileSync(join(commandsDir, "othercmd", "index.ts"), "export default {};\n");
+    const claudeSkill = join(claudeTmp, "skills", "pipeline");
+    mkdirSync(claudeSkill, { recursive: true });
+    writeFileSync(join(claudeSkill, "sentinel.txt"), "claude-alive");
+
+    const uninstall = runInstaller(["uninstall", "--host", "omp"], ompHomeEnv(home, {
+      CLAUDE_CONFIG_DIR: claudeTmp,
+    }));
+    assert.equal(uninstall.status, 0, `uninstall failed: ${uninstall.stderr}\n${uninstall.stdout}`);
+    assert.equal(existsSync(join(home, ".omp", "agent", "skills", "pipeline")), false);
+    assert.equal(existsSync(join(commandsDir, "pipeline")), false);
+    assert.ok(existsSync(join(commandsDir, "other.md")), "sibling command must remain");
+    assert.ok(existsSync(join(commandsDir, "othercmd", "index.ts")), "sibling TS command must remain");
+    assert.equal(readFileSync(join(claudeSkill, "sentinel.txt"), "utf8"), "claude-alive");
+  } finally {
+    cleanup(home);
+    cleanup(claudeTmp);
+  }
+});
+
+test("uninstall --host omp --dry-run: does not delete artifacts (#1235)", () => {
+  const home = makeTmp();
+  try {
+    const install = runInstaller(["install", "--host", "omp"], ompHomeEnv(home));
+    assert.equal(install.status, 0);
+    const dry = runInstaller(["uninstall", "--host", "omp", "--dry-run"], ompHomeEnv(home));
+    assert.equal(dry.status, 0);
+    assert.ok(existsSync(join(home, ".omp", "agent", "skills", "pipeline")));
+    assert.ok(existsSync(join(home, ".omp", "agent", "commands", "pipeline", "index.ts")));
+    assert.match(`${dry.stdout}${dry.stderr}`, /dry-run/i);
+  } finally {
+    cleanup(home);
+  }
+});
+
+test("uninstall --host omp: missing install is a no-op success (#1235)", () => {
+  const home = makeTmp();
+  try {
+    const result = runInstaller(["uninstall", "--host", "omp"], ompHomeEnv(home));
+    assert.equal(result.status, 0, `missing uninstall failed: ${result.stderr}\n${result.stdout}`);
+  } finally {
+    cleanup(home);
+  }
+});
+
+test("update --host omp: refreshes managed tree without personal shadow (#1235)", () => {
+  const home = makeTmp();
+  try {
+    const first = runInstaller(["install", "--host", "omp"], ompHomeEnv(home));
+    assert.equal(first.status, 0);
+    const skillDir = join(home, ".omp", "agent", "skills", "pipeline");
+    assert.ok(existsSync(join(skillDir, MANAGED_MARKER)));
+    const second = runInstaller(["update", "--host", "omp"], ompHomeEnv(home));
+    assert.equal(second.status, 0, `update failed: ${second.stderr}\n${second.stdout}`);
+    const out = `${second.stdout}${second.stderr}`;
+    assert.ok(!/Personal pipeline skill detected|auto-relocat|Relocate it/i.test(out));
+    assert.ok(existsSync(join(skillDir, MANAGED_MARKER)));
+    assert.ok(existsSync(join(home, ".omp", "agent", "commands", "pipeline", "index.ts")));
+  } finally {
+    cleanup(home);
+  }
+});
+
+test("OMP command routing: execPath spawn, cwd forward, argv safety, version (#1235)", async () => {
+  const dir = makeTmp();
+  try {
+    const skillDir = join(dir, "skills", "pipeline");
+    const scriptsDir = join(skillDir, "scripts");
+    mkdirSync(scriptsDir, { recursive: true });
+    writeFileSync(
+      join(scriptsDir, "pipeline.mjs"),
+      `#!/usr/bin/env node\nprocess.stdout.write(JSON.stringify({cwd:process.cwd(),argv:process.argv.slice(2)})+"\\n");\n`,
+    );
+    const ts = renderOmpPipelineCommand(skillDir, process.execPath);
+    const mjs = join(dir, "pipeline-cmd.mjs");
+    writeFileSync(mjs, ts);
+    const mod = await import(pathToFileURL(mjs).href);
+    assert.equal(mod.PIPELINE_NODE, process.execPath);
+    assert.equal(mod.PIPELINE_LAUNCHER, join(scriptsDir, "pipeline.mjs"));
+    assert.deepEqual(mod.launcherArgv(["train", "--milestone", "data-integrity"]), [
+      process.execPath,
+      join(scriptsDir, "pipeline.mjs"),
+      "train",
+      "--milestone",
+      "data-integrity",
+    ]);
+    const cwd = join(dir, "session cwd with spaces");
+    mkdirSync(cwd);
+    const cmd = mod.default({ cwd });
+    assert.equal(cmd.name, "pipeline");
+    const reason = "key: reason with spaces and * and $HOME";
+    const r = spawnSync(process.execPath, [
+      join(scriptsDir, "pipeline.mjs"),
+      "override",
+      "5",
+      reason,
+    ], { encoding: "utf8", shell: false, cwd });
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(JSON.parse(r.stdout.trim()), {
+      cwd,
+      argv: ["override", "5", reason],
+    });
+    const captured = [];
+    const origWrite = process.stdout.write.bind(process.stdout);
+    process.stdout.write = (chunk, ...rest) => {
+      captured.push(String(chunk));
+      return origWrite(chunk, ...rest);
+    };
+    try {
+      cmd.execute(["echo", "*", "$HOME"]);
+    } finally {
+      process.stdout.write = origWrite;
+    }
+    const routed = JSON.parse(captured.join("").trim());
+    assert.equal(routed.cwd, cwd);
+    assert.deepEqual(routed.argv, ["echo", "*", "$HOME"]);
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test("OMP /pipeline --version matches launcher and package.json (#1235)", () => {
+  const home = makeTmp();
+  try {
+    const install = runInstaller(["install", "--host", "omp"], ompHomeEnv(home));
+    assert.equal(install.status, 0, `install failed: ${install.stderr}\n${install.stdout}`);
+    const skillDir = join(home, ".omp", "agent", "skills", "pipeline");
+    const launcher = join(skillDir, "scripts", "pipeline.mjs");
+    const pkg = JSON.parse(readFileSync(join(skillDir, "core", "package.json"), "utf8"));
+    const expected = String(pkg.version).trim();
+    const launcherV = spawnSync(process.execPath, [launcher, "--version"], {
+      encoding: "utf8",
+      shell: false,
+    });
+    assert.equal(launcherV.status, 0, launcherV.stderr);
+    assert.equal(launcherV.stdout.trim(), expected);
+    const launcherShort = spawnSync(process.execPath, [launcher, "-V"], {
+      encoding: "utf8",
+      shell: false,
+    });
+    assert.equal(launcherShort.status, 0, launcherShort.stderr);
+    assert.equal(launcherShort.stdout.trim(), expected);
+    const cmd = readFileSync(join(home, ".omp", "agent", "commands", "pipeline", "index.ts"), "utf8");
+    assert.ok(cmd.includes(process.execPath));
+    assert.ok(cmd.includes(launcher));
+    assert.ok(!cmd.includes("## State machine"));
+    assert.ok(!cmd.includes("~/.config/opencode/commands/pipeline.md"));
+  } finally {
+    cleanup(home);
+  }
+});
+
+test("personal OMP skill non-TTY: auto-relocates under ~/.omp/agent then install proceeds (#1235)", async () => {
+  const base = makeTmp();
+  const dest = join(base, "skills", "pipeline");
+  mkdirSync(dest, { recursive: true });
+  writeFileSync(join(dest, "SKILL.md"), "personal-omp");
+  const action = await offerRelocationWith(dest, base, false, false);
+  assert.equal(action, "proceed");
+  assert.equal(existsSync(dest), false, "personal tree must be relocated");
+  const backups = readdirSync(base).filter((e) => e.startsWith("pipeline.") && e.includes(".bak"));
+  assert.equal(backups.length, 1);
+  assert.ok(existsSync(join(base, backups[0], "SKILL.md")));
+  cleanup(base);
+});
+
+test("personal OMP skill TTY decline: leaves tree and skips (#1235)", async () => {
+  const base = makeTmp();
+  const dest = join(base, "skills", "pipeline");
+  mkdirSync(dest, { recursive: true });
+  writeFileSync(join(dest, "SKILL.md"), "personal-omp");
+  const action = await offerRelocationWith(dest, base, false, true, async () => "n");
+  assert.equal(action, "skip");
+  assert.ok(existsSync(join(dest, "SKILL.md")));
+  const backups = readdirSync(base).filter((e) => e.startsWith("pipeline.") && e.includes(".bak"));
+  assert.deepEqual(backups, []);
+  cleanup(base);
+});
+
+test("personal OMP skill TTY accept: relocates uniquely and never overwrites backup (#1235)", async () => {
+  const base = makeTmp();
+  const dest = join(base, "skills", "pipeline");
+  mkdirSync(dest, { recursive: true });
+  writeFileSync(join(dest, "SKILL.md"), "personal-omp");
+  const existingBak = join(base, "pipeline.stamp.bak");
+  mkdirSync(existingBak);
+  writeFileSync(join(existingBak, "keep.txt"), "existing");
+  const action = await offerRelocationWith(dest, base, false, true, async () => "y");
+  assert.equal(action, "proceed");
+  assert.equal(existsSync(dest), false);
+  assert.equal(readFileSync(join(existingBak, "keep.txt"), "utf8"), "existing");
+  const backups = readdirSync(base).filter((e) => e.startsWith("pipeline.") && e.includes(".bak"));
+  assert.ok(backups.length >= 2);
+  cleanup(base);
+});
+
+test("install --host omp non-TTY relocates unmanaged personal skill (#1235)", () => {
+  const home = makeTmp();
+  const dest = join(home, ".omp", "agent", "skills", "pipeline");
+  mkdirSync(dest, { recursive: true });
+  writeFileSync(join(dest, "SKILL.md"), "personal-omp");
+  try {
+    const result = runInstaller(["install", "--host", "omp"], ompHomeEnv(home));
+    assert.equal(result.status, 0, `install failed: ${result.stderr}\n${result.stdout}`);
+    assert.ok(existsSync(join(dest, MANAGED_MARKER)));
+    const agent = join(home, ".omp", "agent");
+    const backups = readdirSync(agent).filter((e) => e.startsWith("pipeline.") && e.includes(".bak"));
+    assert.equal(backups.length, 1);
+    assert.ok(existsSync(join(agent, backups[0], "SKILL.md")));
+  } finally {
+    cleanup(home);
+  }
+});
+

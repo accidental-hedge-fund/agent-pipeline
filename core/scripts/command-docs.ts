@@ -206,7 +206,7 @@ export const COMMAND_DOCS: Record<string, CommandDoc> = {
     summary:
       "Self-host: verify published release, promote a production-quality pin from FRG, install exact tag to all hosts by default, verify version (rollback pin on install failure; --skip-frg writes a no-frg-* non-production marker only)",
     usage:
-      "engine-promote --for <X.Y.Z> [--host all|codex|claude|grok|opencode] [--dry-run] [--json] [--skip-install] [--skip-frg]",
+      "engine-promote --for <X.Y.Z> [--host all|codex|claude|grok|opencode|omp] [--dry-run] [--json] [--skip-install] [--skip-frg]",
     documented: true,
     section: "factory",
   },

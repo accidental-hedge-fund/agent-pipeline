@@ -24,7 +24,7 @@ import { formatFrgSkipReason, resolveFrgSkip } from "../frg-skip.ts";
 
 const execFileAsync = promisify(execFile);
 
-export type EnginePromoteHost = "codex" | "claude" | "grok" | "opencode" | "all";
+export type EnginePromoteHost = "codex" | "claude" | "grok" | "opencode" | "omp" | "all";
 
 /** Default install host when promote omits --host / host option (#989). */
 export const DEFAULT_ENGINE_PROMOTE_HOST: EnginePromoteHost = "all";

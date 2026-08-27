@@ -5,12 +5,21 @@ description: |
   through a label-driven dev pipeline toward `pipeline:ready-to-deploy`.
   Triggers include phrases like "pipeline issue 419", "push #360 forward",
   "advance this PR through review", "run the pipeline on <issue>", or the
-  `/pipeline` slash command. Do NOT use this skill for: general PR review
-  (use /review), backlog triage/cleanup (use /sweep), or deploying a finished
-  item (deployment is out of scope — the pipeline stops at ready-to-deploy).
+  `/pipeline` slash command in OMP (Oh My Pi). The native TypeScript command
+  execs the installed launcher — it is not an LLM prompt template. Do NOT use
+  this skill for: general PR review (use /review), backlog triage/cleanup
+  (use /sweep), or deploying a finished item (deployment is out of scope —
+  the pipeline stops at ready-to-deploy). This host overlay is not a
+  plugin-marketplace install.
 ---
 
 # pipeline
+
+OMP (Oh My Pi) host overlay for agent-pipeline. The native `/pipeline` command
+(installed under `~/.omp/agent/commands/pipeline/index.ts`) is a TypeScript
+custom command that execs the installed launcher with the install-time
+`process.execPath`. The handler returns void, so OMP does not start an LLM
+prompt turn. It does not load `~/.omp/agent/commands/pipeline.md`.
 
 Self-contained TypeScript skill that advances a GitHub issue (or PR's linked
 issue) through a 18-stage label-driven state machine, ending at
@@ -58,14 +67,14 @@ the advance loop never auto-advances from it to `ready-to-deploy`.
 
 ### Merge authority boundary
 
-`/pipeline`, `/pipeline:single`, and `/pipeline:loop` never invoke merge.
-`/pipeline:merge <pr>`, `/pipeline:merge-queue --apply`, `pipeline train --merge`,
+`/pipeline`, `/pipeline single`, and `/pipeline loop` never invoke merge.
+`/pipeline merge <pr>`, `/pipeline merge-queue --apply`, `pipeline train --merge`,
 and `pipeline ship --milestone` are loop-isolated, operator-authorized surfaces.
 `merge-queue` is dry-run by default. `pipeline ship --milestone` does not
 require a grant file. Phrase `Ship milestone vX.Y.Z` execs
 `pipeline ship --milestone vX.Y.Z`.
 
-External supervisors may invoke those same loop-isolated merge and ship commands
+External supervisors may invoke those same loop-isolated merge commands
 under operator authority. This repository does not ship a Hermes/Buzz factory
 control plane, grant schema, or second durable scheduler. Merge authority is
 not repository configuration (`.github/pipeline.yml` cannot authorize merges).
@@ -84,43 +93,33 @@ distinct `pipeline:<command>` entries in the skill/command menu.
 /pipeline run <n> [--detach]                    Advance alias; use with --detach for a legacy raw detached run (desktop launchers)
 /pipeline single <n>                            Canonical durable one-item autonomous drive (owns a durable loop; delegates stages to advance)
 /pipeline cleanup                               Sweep merged-PR worktrees and delete their local branches
-/pipeline doctor [--json|--is-ok] [--fail-fast] [--harness-smoke] Deterministic preflight check; print summary, exit 0/1. Opt-in --harness-smoke adds one cheap model call per unique configured harness treatment
+/pipeline doctor                                Deterministic preflight check; print summary, exit 0/1
 /pipeline init                                  Ensure pipeline labels and scaffold .github/pipeline.yml
 /pipeline merge <pr>                            Operator-authorized squash merge of a ready-to-deploy PR (never called by the advance loop)
 /pipeline merge-queue --milestone <m> [--apply] [--release-when-complete --release-version <ver>] Operator-authorized sequential merge of ready-to-deploy PRs; dry-run by default; optional prepare-only release-when-complete
 /pipeline override <n> "<key>: <reason>"        Disposition a review finding and auto-resume the advance loop
-/pipeline recover-parked <n> [--json] [--dry-run] One supervisor pass for a parked issue: deterministic recover first, then reflow only stale/DNR/below-high residuals (never auto-override HIGH/CRITICAL/security); re-enter single if clear
-/pipeline release <version> [--theme "..."] [--dry-run|--json] [--no-edit] [--skip-frg] | release finish <pr> [--json] | release ensure-tag <X.Y.Z> <merge-oid> --packed-candidate <sha> Prepare a release PR from the matching GitHub milestone plan (or finish-merge one); finish never tags; ship-end ensure-tag creates vX.Y.Z from on-disk HMAC latest.json when FRG is gitignored; --dry-run reports milestone presence/open issues
+/pipeline release <version> [--theme "..."] [--dry-run] Prepare a release PR for the given version (never tags, merges, or publishes)
 /pipeline remove-worktree <n> [--force]         Remove a managed pipeline worktree for an issue (optional --force)
-/pipeline ship --milestone vX.Y.Z [--json] | ship status --milestone vX.Y.Z [--json] Run or inspect one durable milestone shipment (train --merge, release, finish, promote). Operator product is pipeline ship --milestone vX.Y.Z; no grant file required.
+/pipeline ship --milestone vX.Y.Z [--json] | ship status --milestone vX.Y.Z [--json] Run or inspect one durable milestone shipment (train --merge, release, finish, promote). Phrase Ship milestone vX.Y.Z execs this command; no grant file required.
 /pipeline status <n>                            Read-only — print stage, blocker, PR, last review
-/pipeline train --milestone <m>|--issues <n,n> [--merge] [--json] Operator-authorized integrate train: base-eligible frontiers advance via one loop wave each (recovery inside the wave); optionally serial-merge with base containment; independent R2D siblings may merge while a peer is parked (never called by the advance loop)
 /pipeline unblock <n> "<answer>"                Post an answer and clear the blocked label
 /pipeline backfill [--apply] [--capability <name>] Preview or apply OpenSpec coverage for legacy behavior (spec-only PR)
-/pipeline decompose --epic <N> [--description "…"] [--apply] [--release vX.Y.Z] [--max-children N] [--max-effort S|M|L|XL] [--allow-xl] Break an epic issue into dependency-linked child issues and a ROADMAP PR (dry-run default; --apply writes; not intake / not roadmap-order-only / not loop-execute)
-/pipeline engine-promote --for <X.Y.Z> [--host all|codex|claude|grok|opencode|omp] [--dry-run] [--json] [--skip-install] [--skip-frg] Self-host: verify published release, promote a production-quality pin from FRG, install exact tag to all hosts by default, verify version (rollback pin on install failure; --skip-frg writes a no-frg-* non-production marker only)
 /pipeline evals plan|run|grade|report|harvest … Offline eval plan/run/grade/report/harvest (never writes to production GitHub)
-/pipeline factory-gate --for <version> [--from-run <run-id>] [--observations <file>] [--scenario id=status:detail] [--promote-pin-on-pass] Score a durable loop / fixture pack and write immutable FRG evidence (never merges or tags)
-/pipeline factory-pin show|init --from-frg <X.Y.Z>|promote --for <X.Y.Z>|rollback [--to <X.Y.Z>] [--git-sha <sha>] [--force] Show / init / promote / rollback the factory production engine pin (last FRG-passed release; promote writes a real frg_run_id + evidence path; never merges or tags)
-/pipeline factory-release prepare --request <absolute-request.json> --json Durable post-pilot FRG generation + prepare-only release handoff (in_progress → awaiting_frg_attestation → complete; never merges/tags)
+/pipeline factory-gate --for <version> [--from-run <run-id>] [--observations <file>] [--scenario id=status:detail] Score a durable loop / fixture pack and write immutable FRG evidence (never merges or tags)
 /pipeline improve [--apply] [--top <n>] [--json] Cluster papercuts / corrections / durable-run blockers into backlog candidates
 /pipeline intake --description "<text>" [--release vX.Y.Z] [--dry-run] Spec a rough description into a GitHub issue and ROADMAP PR
 /pipeline queue [--max-issues <n>] [--concurrency <n>] [--budget-dollars <d>] Batch factory: dispatch all pipeline:ready issues up to concurrency/budget limits
 /pipeline refine-spec --title "<t>" --body "<b>" Refine an existing issue's spec; non-mutating JSON output
-/pipeline roadmap [--apply] [--next <n>]        Analyze open backlog into a dependency-aware scored roadmap; under SemVer, dry-run lists full milestone reconciliation actions and --apply converges open issues to the reviewed manifest (fingerprint-gated)
+/pipeline roadmap [--apply] [--next <n>]        Analyze open backlog into a dependency-aware scored roadmap
 /pipeline sweep [--apply] [--repo owner/name]   Batch re-spec thin issues and reconcile ROADMAP.md
-/pipeline triage <n> --stage ready|backlog      Set a pre-pipeline stage label (ready or backlog) on an issue. needs-spec is an admission hold: apply the spec, then triage --stage ready.
-/pipeline controls check [--json] [--strict]    Read-only repository-control drift check against configured desired state (#695); never mutates forge settings
+/pipeline triage <n> --stage ready|backlog      Set a pre-pipeline stage label (ready or backlog) on an issue
 /pipeline correction record|attribute …         Record a correction event or attribute a control (append-only local ledger)
-/pipeline lineage export|impact|propose|ingest [--run-id <id>] [--node-id <id>] [--fixture <path>] [--retention-days <n>] [--dry-run] [--json] Export, impact-analyze, or propose updates on the intent-lineage evidence graph (host-local store; #599). Backward proposals never silently edit authority; free text is redacted; no GitHub mutations
 /pipeline logs [<run-id>] [--events] [-f] [--no-until-terminal] List or stream pipeline run logs (events --follow exits 0 on terminal run_complete)
-/pipeline outcomes ingest|list [--adapter github] [--fixture <path>] [--days <n>] [--retention-days <n>] [--dry-run] [--json] Ingest or list production/rework outcomes linked to pipeline runs (host-local store; #576). R2D alone is never production delivery; free text is redacted; no GitHub mutations
 /pipeline report [--yes]                        Privacy-safe product-fault report preview/submit (optional; off by default in config)
-/pipeline scoreboard [--days <n>|--since <iso>] [--until <iso>] [--bucket day|week] [--by <dim>] [--json] [--html <path>] Print read-only factory throughput/cost/reliability metrics from run artifacts (incl. human-touch, escape-recurrence, discovery-channel, stratified stabilization; #763; production outcomes #576; planning-leverage / material-rework #702)
+/pipeline scoreboard [--bucket day|week] [--by <dim>] [--html <path>] Print read-only factory throughput/cost/reliability metrics from run artifacts
 /pipeline summary <run-id>                      Print the run evidence bundle for an issue number or exact run-id
 /pipeline config schema|validate|sync|repo-map … Config schema, validate, sync scaffold, and repo-map mutations
 /pipeline path [--json]                         Discover installed host skill paths (JSON-friendly for desktop integrators)
-/pipeline handoff list|show|answer|reject|supersede … [--json] [--issue N] [--run-id id] [--status pending] List, inspect, answer, reject, or supersede durable human-question handoffs (#647)
 ```
 <!-- END GENERATED: cli-command-table -->
 
@@ -287,24 +286,6 @@ are deterministic. The roadmap update is opened as a PR for human review — the
 pipeline never merges. `--release vX.Y.Z` pins the target slot; omitting it
 proposes the first open lane from `ROADMAP.md`.
 
-`decompose` is the **epic work-breakdown** command: one parent epic → N small
-dependency-linked children + a ROADMAP PR. It is **not** intake (1→1), **not**
-roadmap (order existing inventory), and **not** loop (execute). Dry-run is the
-default; `--apply` creates children and opens a ROADMAP PR (never merges).
-
-```bash
-/pipeline decompose --epic 123                         # preview child graph (no writes)
-/pipeline decompose --epic 123 --description "prefer API slices"
-/pipeline decompose --epic 123 --apply --release v1.43.0
-/pipeline decompose --epic 123 --apply --max-children 12 --max-effort M
-```
-
-Child triage: decision-complete bodies get `pipeline:ready`; remaining open
-questions get `pipeline:backlog`. The parent stays open as umbrella, is labeled
-`pipeline:epic`, and is **excluded from default milestone/label loop selectors**
-(explicit issue lists may still name it). Compose next with
-`/pipeline loop --milestone <lane>` or merge-queue after children reach R2D.
-
 `refine-spec` is a **non-mutating** spec-refinement preview command. It accepts
 an existing issue's title and body and returns a refined spec as JSON — no GitHub
 writes, no git writes, no filesystem writes:
@@ -411,22 +392,6 @@ tokens, baseline/biting probes) and classifies failures as infrastructure.
 Empty-`grader_refs` fixtures must set `smoke_only: true` and never enter graded
 quality aggregates. Interrupting and re-running `evals run` never re-executes a
 completed cell or rewrites an existing `runs.jsonl`/`failures.jsonl` line.
-
-**Multi-change maintainability fixtures (#577):** fixtures with
-`kind: "multi_change"` declare ordered `checkpoints[]` (each with disclosed
-`task_input` + held-out verifiers). A multi-change cell keeps one worktree
-lineage across checkpoints while starting a **fresh model session** each step;
-only declared pipeline evidence is preserved (no chat, no held-out verifier
-bodies). At checkpoint *k* the runner runs new + inherited (1..k−1) held-out
-verifiers; **strict pass** requires both green. Quality non-strict failures
-continue the lineage; infra/auth/timeout abort as non-quality. Treatments may
-set a `profile` axis (`bare` / `just-solve` vs `pipeline-current`; optional
-`adversarial-review` / `quality-feedback` / `design-dossier`) without changing
-prompts or verifiers — `#575` does not gate bare-vs-pipeline. Sample:
-`core/evals/experiments/multi-change-bare-vs-pipeline.sample.json`. Grade with
-`grader: "multi-change"`; report emits a `multi_change` section with separate
-defect-state, effort, growth, and structural-telemetry dimensions — never a
-synthetic maintainability/slop score.
 
 Results land under `<output_dir>/<experiment-id>/`: `manifest.json` (the
 resolved manifest as executed), `plan.json`, `runs.jsonl` (append-only,
@@ -618,17 +583,16 @@ expands the promoted fixture into an executable cell plan to prove it works
 ## Setup (zero install after first run)
 
 The skill is a Node 24+ TypeScript codebase under
-`${CLAUDE_PLUGIN_ROOT}/skills/pipeline/core/scripts/`, run via native type-stripping (no
+`~/.omp/agent/skills/pipeline/core/scripts/`, run via native type-stripping (no
 build step). First-ever invocation runs `npm install` automatically.
 
 Required:
 - `gh` CLI authenticated against the target repo
-- `claude` CLI on PATH — the primary harness (planning, implementation, fixes)
-- `codex` CLI on PATH and authenticated — the reviewer harness (`prompt-harness` mode
-  invokes it directly with a JSON-returning prompt, so **no review plugin is required**)
+- A registered implementer harness on PATH (live roles come from
+  `.github/pipeline.yml`; the `omp` profile is bootstrap metadata only)
+- A registered reviewer harness on PATH
 - Node 24+
-- The user's Claude Code subscription provides the LLM budget — this skill
-  never reads `ANTHROPIC_API_KEY`
+- Authenticated provider credentials for the configured harnesses
 
 ## Per-repo config
 
@@ -676,19 +640,11 @@ Both keys are required repository execution policy. `implementer` must name a ha
 
 ### Outer-host lifecycle contract (#784)
 
-The **outer host** is the session host that launches and supervises the pipeline
-(install path, skill/command surface, durable handoff, event follow, reattach,
-material notify, terminal cleanup/summary). It is **independent** of stage
-adapter ID, provider/auth class, model, effort, and implementer/reviewer role
-assignment. Built-in and third-party outer hosts register through the same
-public registry (`core/scripts/outer-hosts/`) using co-located
-`hosts/<id>/outer-host.manifest.json` files. Shared advance/loop orchestration
-consumes declared capabilities and never branches on host name strings for
-lifecycle behavior. Every capability has an explicit unsupported/fallback path;
-the portable baseline is stdout JSON + `events.jsonl`. Install/update/uninstall
-read managed paths from the install profile and preserve user-owned content.
-A shared conformance kit gates complete declarations. See also identity
-separation under adapter extensions below.
+The **outer host** (this OMP skill session) is independent of stage
+adapter ID, provider, model, effort, and role. Lifecycle capabilities live on
+`hosts/<id>/outer-host.manifest.json` and the runtime outer-host registry.
+Shared orchestration consumes declared capabilities without host-name
+branching. Adapter id `pi` is not this outer host. See `core/scripts/outer-hosts/`.
 
 ### Third-party adapter extensions (#783)
 
@@ -866,20 +822,19 @@ On each **material** progress line (shared material filter — see §4.c),
 service; do not gate stages on delivery. `events.jsonl` remains the
 complete evidence stream.
 
-**Outer-host lifecycle contract (#784):** material-progress notify, handoff,
-event follow, reattach after cancelled wait, terminal cleanup, and terminal
-summary are declared on the active outer host's `outer-host.manifest.json`
-(capability `material_progress_notify` and peers). Shared orchestration
-selects steps from those declarations — not from host-name equality checks.
-Portable baseline is always stdout JSON + `events.jsonl` follow. Set
-`PIPELINE_OUTER_HOST=<id>` so run evidence records outer-host identity
-separately from implementer/reviewer adapter treatment.
+**Outer-host lifecycle contract (#784):** lifecycle steps (handoff, follow,
+reattach, material notify, cleanup, summary) are selected from the active
+outer host's declared capabilities in `outer-host.manifest.json`, not from
+host-name equality checks. OMP's material notify mapping is portable
+stdout/`events.jsonl` (`stdout_only`). Set `PIPELINE_OUTER_HOST=omp` so
+run evidence records outer-host identity separately from adapter treatment.
 
 | Host (declared mapping) | Follow / surface | Material path |
 | --- | --- | --- |
-| **Claude** (`claude_monitor_push`) | Monitor on material-filtered events; call `PushNotification` on each material one-liner | This file's §4.c–d |
+| **Claude** (`claude_monitor_push`) | Monitor on material-filtered events; call `PushNotification` on each material one-liner | `hosts/claude/SKILL.md` |
 | **Grok** (`grok_monitor_lines`) | Host `monitor` on the same material-filtered command (each stdout line = chat bubble). **Never** require Claude `PushNotification` | **Grok substitute** below |
 | **Codex** (`codex_chat_status`) | Poll/follow material stream; concise chat/status updates (no Claude-only tools) | `hosts/codex/SKILL.md` |
+| **OMP** (`stdout_only`) | Host event follow / chat status updates; native TypeScript `/pipeline` command runs the launcher | This file |
 
 **Grok substitute** (when this Claude overlay is the installed/symlink path Grok
 loads — first-class `--host grok` is #731): use host **`monitor`** (or
@@ -892,7 +847,7 @@ Re-arm material follow after wait cancel until `loop_run_complete` / `loop_run_s
 #### a. Status pre-check (fast, synchronous)
 
 ```bash
-node ${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/pipeline.mjs <N> --status
+node ~/.omp/agent/skills/pipeline/scripts/pipeline.mjs <N> --status
 ```
 
 Confirms the target exists and has a `pipeline:*` label. A `blocked` label is
@@ -903,7 +858,7 @@ only for an invalid target or a genuinely terminal issue state.
 
 ```bash
 cd <repo_dir>
-node ${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/pipeline.mjs single <N>
+node ~/.omp/agent/skills/pipeline/scripts/pipeline.mjs single <N>
 ```
 
 Start it with Claude's background Bash runner and retain its process/task id.
@@ -919,11 +874,11 @@ After the handoff, arm a persistent Monitor / host follow on the loop stream:
 
 ```bash
 # Preferred: material one-liners for Claude Monitor / Grok monitor
-node ${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/pipeline.mjs loop logs <run-id> --events --follow \
-  | node ${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/material-filter.mjs
+node ~/.omp/agent/skills/pipeline/scripts/pipeline.mjs loop logs <run-id> --events --follow \
+  | node ~/.omp/agent/skills/pipeline/scripts/material-filter.mjs
 
 # Diagnostic fallback: full loop events.jsonl
-node ${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/pipeline.mjs loop logs <run-id> --events --follow
+node ~/.omp/agent/skills/pipeline/scripts/pipeline.mjs loop logs <run-id> --events --follow
 # default until-terminal: exits 0 after loop_run_complete or loop_run_stopped
 ```
 
@@ -954,7 +909,7 @@ turn after checking the retained controller process and loop stream. If the
 process is live or neither terminal kind is present, run:
 
 ```bash
-node ${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/pipeline.mjs loop logs <run-id> --events --follow
+node ~/.omp/agent/skills/pipeline/scripts/pipeline.mjs loop logs <run-id> --events --follow
 ```
 
 Supervision ends only after `loop_run_complete` / `loop_run_stopped` and the
@@ -967,7 +922,7 @@ Surface the final JSON printed by `pipeline single`; optionally add the
 read-only durable audit:
 
 ```bash
-node ${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/pipeline.mjs loop --resume <run-id> --audit
+node ~/.omp/agent/skills/pipeline/scripts/pipeline.mjs loop --resume <run-id> --audit
 ```
 
 Include recovery actions attempted, final item state, linked advance/PR
@@ -1016,7 +971,7 @@ BEFORE=$(ls -1 "$RUNS" 2>/dev/null | grep -v '\.init-' || true)
 LOOP_RESULT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/pipeline-loop.XXXXXX")
 LOOP_OUT="$LOOP_RESULT_DIR/out.json"
 LOOP_ERR="$LOOP_RESULT_DIR/err.txt"
-node ${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/pipeline.mjs loop --milestone <name> \
+node ~/.omp/agent/skills/pipeline/scripts/pipeline.mjs loop --milestone <name> \
   >"$LOOP_OUT" 2>"$LOOP_ERR" &
 # or: ... loop --resume <run-id> ...
 # or: ... loop <N> <N> ...
@@ -1157,13 +1112,13 @@ for host notify (raw unfiltered events remain available for diagnostics):
 
 ```bash
 # Preferred — material one-liners for host notify (dual-follow uses the same filter)
-node ${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/pipeline.mjs loop logs <run_id> --events --follow \
-  | node ${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/material-filter.mjs
+node ~/.omp/agent/skills/pipeline/scripts/pipeline.mjs loop logs <run_id> --events --follow \
+  | node ~/.omp/agent/skills/pipeline/scripts/material-filter.mjs
 # default until-terminal: process exits 0 after loop_run_stopped/loop_run_complete
 # interrupt-only dashboards: add --no-until-terminal
 
 # Diagnostic fallback — full unfiltered loop events.jsonl
-node ${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/pipeline.mjs loop logs <run_id> --events --follow
+node ~/.omp/agent/skills/pipeline/scripts/pipeline.mjs loop logs <run_id> --events --follow
 ```
 
 If you arm a host Monitor / Grok `monitor` instead of (or around) that CLI, do
@@ -1247,8 +1202,8 @@ auto-fix, terminal blocked/advanced) while linkage is active — hosts do
 unfiltered JSONL:
 
 ```bash
-node ${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/pipeline.mjs logs <advance-run-id> --events --follow \
-  | node ${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/material-filter.mjs
+node ~/.omp/agent/skills/pipeline/scripts/pipeline.mjs logs <advance-run-id> --events --follow \
+  | node ~/.omp/agent/skills/pipeline/scripts/material-filter.mjs
 ```
 
 The absolute `events` path from the linkage record is an acceptable alternative
@@ -1352,9 +1307,9 @@ Surface the run's terminal state. Prefer the printed JSON result; for a
 read-only process/timeline report:
 
 ```bash
-node ${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/pipeline.mjs loop --resume <run-id> --audit
+node ~/.omp/agent/skills/pipeline/scripts/pipeline.mjs loop --resume <run-id> --audit
 # stage table + optional whole-run stage-progress follow (not harness stdout):
-node ${CLAUDE_PLUGIN_ROOT}/skills/pipeline/scripts/pipeline.mjs loop --resume <run-id> --audit --follow
+node ~/.omp/agent/skills/pipeline/scripts/pipeline.mjs loop --resume <run-id> --audit --follow
 ```
 
 The final operator summary **must** include (1) the run's **terminal reason**
@@ -1429,7 +1384,7 @@ When the loop ends, the skill prints:
 
 ## What this skill never does
 
-- Merge from the advance path — there is no `auto_merge` config key or merge stage. `/pipeline:merge <pr>` is a separate operator-authorized command after `pipeline:ready-to-deploy`; advance never calls it. `/pipeline:merge-queue --milestone <m>` is dry-run by default; only the separate `--apply` form can merge. External supervisors may call merge commands under operator authority; the repository does not ship a factory grant control plane.
+- Merge from the advance path — there is no `auto_merge` config key or merge stage. `/pipeline merge <pr>` is a separate operator-authorized command after `pipeline:ready-to-deploy`; advance never calls it. `/pipeline merge-queue --milestone <m>` is dry-run by default; only the separate `--apply` form can merge. External supervisors may call merge commands under operator authority; the repository does not ship a factory grant control plane.
 - Bypass the `pipeline:*` opt-in label gate.
 - Run more than one transition under `--once`.
 - Touch the GitHub repo in `--dry-run` mode.

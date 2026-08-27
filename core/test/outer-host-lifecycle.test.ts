@@ -161,6 +161,20 @@ test("golden: built-in install modes and lifecycle support match pre-change beha
     ),
   );
   assert.equal(opencode.material_progress_notify.mapping.surface, "stdout_only");
+
+  const omp = resolveOuterHost("omp")!;
+  assert.equal(omp.install.mode, "tree");
+  assert.equal(omp.install.managedArtifacts.commandsKind, "omp-native");
+  assert.notEqual(omp.install.managedArtifacts.commandsKind, "opencode-native");
+  assert.deepEqual(omp.install.basePath.defaultHomeSegments, [".omp", "agent"]);
+  assert.equal(omp.install.basePath.env, null);
+  assert.equal(omp.material_progress_notify.mapping.surface, "stdout_only");
+  assert.match(
+    omp.material_progress_notify.fallback ?? omp.event_follow.how ?? "",
+    /stdout|events\.jsonl/i,
+  );
+  assert.equal(omp.id, "omp");
+  assert.notEqual(omp.id, "pi");
 });
 
 test("co-located manifests exist for every builtin and match registry", () => {
@@ -408,6 +422,29 @@ test("lifecycle fixture: material progress uses declared mapping or portable bas
   assert.ok(surfaces.has("claude_monitor_push"));
   assert.ok(surfaces.has("codex_chat_status"));
   assert.ok(surfaces.has("grok_monitor_lines"));
+  assert.ok(surfaces.has("stdout_only"));
+});
+
+test("outer-host omp is distinct from adapter id pi (#1235)", () => {
+  _resetOuterHostRegistryForTests();
+  ensureBuiltinOuterHostsRegistered(repoRoot);
+  const omp = resolveOuterHost("omp");
+  assert.ok(omp, "builtin omp must resolve");
+  assert.equal(omp.id, "omp");
+  assert.equal(resolveOuterHost("pi"), null, "adapter id pi is not an outer host");
+  assert.ok(registeredOuterHostIds().includes("omp"));
+  assert.ok(!registeredOuterHostIds().includes("pi"));
+});
+
+test("evidence records omp not pi as the outer host (#1235)", () => {
+  const fields = outerHostEvidenceFields({
+    explicit: "omp",
+    implementerAdapterId: "claude",
+    reviewerAdapterId: "codex",
+  });
+  assert.equal(fields.outer_host, "omp");
+  assert.notEqual(fields.outer_host, "pi");
+  assert.notEqual(fields.outer_host, "claude");
 });
 
 // ---------------------------------------------------------------------------

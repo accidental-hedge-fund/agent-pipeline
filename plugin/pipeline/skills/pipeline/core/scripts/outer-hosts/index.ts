@@ -25,6 +25,7 @@ export {
   type OuterHostCapability,
   type OuterHostCapabilityArea,
   type OuterHostInstallMode,
+  type OuterHostCommandsKind,
   type OuterHostManifest,
   type OuterHostMaterialProgressNotify,
   type MaterialNotifySurface,
