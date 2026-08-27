@@ -2,16 +2,24 @@
 
 ## Purpose
 TBD - created by archiving change queue-and-budget-mode. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: The `queue` sub-command SHALL select only eligible issues for autonomous batch processing
 
-The `queue` handler SHALL fetch only issues that are currently in an autonomous-eligible label state (e.g. `pipeline:ready` or equivalent as configured) from the GitHub backlog. Issues in any other pipeline label state SHALL be excluded from the batch and counted as `excluded` in the summary. The handler SHALL further filter the eligible set by the caller-supplied filters: `--label` (intersection of label values; repeatable), `--milestone` (exact milestone title match), and `--risk` (issue risk classification at or below the specified level). After filtering, the handler SHALL rank the remaining issues by a deterministic priority score and select the top `--max-issues` for dispatch. The priority score formula SHALL be a static constant defined in `queue.ts`, auditable without a model call.
+The `queue` handler SHALL fetch only issues that are currently in an autonomous-eligible label state (e.g. `pipeline:ready` or equivalent as configured) from the GitHub backlog. Issues in any other pipeline label state, including `pipeline:needs-spec` and `pipeline:backlog`, SHALL be excluded from the batch and counted as `excluded` in the summary. The handler SHALL further filter the eligible set by the caller-supplied filters: `--label` (intersection of label values; repeatable), `--milestone` (exact milestone title match), and `--risk` (issue risk classification at or below the specified level). After filtering, the handler SHALL rank the remaining issues by a deterministic priority score and select the top `--max-issues` for dispatch. The priority score formula SHALL be a static constant defined in `queue.ts`, auditable without a model call.
 
 #### Scenario: Non-eligible issues are excluded
 
 - **WHEN** the GitHub backlog contains 4 issues with `pipeline:review-1` and 3 issues with `pipeline:ready`
 - **THEN** the handler SHALL include only the 3 `pipeline:ready` issues in the candidate set
 - **AND** the batch summary SHALL report 4 issues as `excluded`
+
+#### Scenario: needs-spec issues are not autonomous-eligible
+
+- **WHEN** the GitHub backlog contains 2 issues with `pipeline:needs-spec` and 3 issues with `pipeline:ready`
+- **THEN** the handler SHALL include only the 3 `pipeline:ready` issues in the candidate set
+- **AND** the batch summary SHALL report the 2 `pipeline:needs-spec` issues as `excluded`
 
 #### Scenario: Label filter narrows the eligible set
 
@@ -184,3 +192,19 @@ The `queue` sub-command's machine-readable batch summary and human-readable batc
 - **THEN** the queue SHALL be allowed to dispatch item B
 - **AND** SHALL NOT dispatch item A while it remains a waiting-human hold
 
+### Requirement: A queue pickup SHALL run the shared issue-readiness gate and SHALL NOT abort independent siblings on rejection
+
+When `issue_readiness.enabled` is `true`, each selected `pipeline:ready` issue SHALL pass through the shared issue-implementation-readiness gate at dispatch, using a freshly fetched title and body rather than the queue inventory snapshot. A `needs_spec` result SHALL be recorded as a structured rejection in the batch summary and SHALL NOT mark the batch as a handler crash. Independent remaining selected issues SHALL continue. A `gate-unavailable` result SHALL block that issue and its selected dependents and SHALL leave independent selected issues eligible.
+
+#### Scenario: Inventory snapshot is not the evaluated body
+
+- **WHEN** queue inventory captured body text B0
+- **AND** the live GitHub body at dispatch is B1
+- **THEN** the gate SHALL evaluate B1
+
+#### Scenario: One needs_spec rejection does not stop the batch
+
+- **WHEN** a selected issue is rejected as `needs_spec` and other selected issues remain eligible
+- **THEN** the batch summary SHALL name the structured `needs_spec` reason for the rejected issue
+- **AND** the handler SHALL continue launching or completing the remaining independent issues
+- **AND** the handler SHALL NOT exit solely because of that rejection

@@ -2,7 +2,9 @@
 
 ## Purpose
 TBD - created by archiving change triage-sub-command. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: The `triage` sub-command SHALL accept an issue number and a `--stage` flag
 
 The pipeline CLI SHALL accept `triage` as a positional sub-command keyword. When the first positional argument is the string `triage` (case-sensitive), the CLI SHALL dispatch to the triage handler. The triage handler SHALL require a second positional argument that is a positive integer issue number and a `--stage <value>` flag. Omitting either SHALL cause the handler to exit non-zero with a usage error.
@@ -124,3 +126,19 @@ All GitHub API calls and log output in the triage handler SHALL be routed throug
 - **THEN** no real GitHub API call, git command, or subprocess is executed
 - **AND** the fake's recorded calls can be inspected to verify correct behavior
 
+### Requirement: Triage to ready SHALL request admission and SHALL NOT bypass the issue-readiness gate
+
+`pipeline triage <N> --stage ready` SHALL remain a deterministic label write. It SHALL NOT invoke the issue-implementation-readiness gate, any other model harness, or a worktree create. When `issue_readiness.enabled` is `true`, that label write SHALL be an admission request only: the next pickup of issue N SHALL re-fetch the issue and SHALL require a `ready` verdict from the shared gate before any worktree or delivery harness starts.
+
+#### Scenario: Triage still makes no model call
+
+- **WHEN** the user runs `pipeline triage 42 --stage ready` while `issue_readiness.enabled` is `true`
+- **THEN** the handler SHALL set `pipeline:ready` as specified by the existing triage requirements
+- **AND** SHALL NOT invoke any model harness
+
+#### Scenario: Next pickup still evaluates the fresh body
+
+- **WHEN** triage has set `pipeline:ready` on an issue whose body is still thin
+- **AND** a later pickup path runs with the gate enabled
+- **THEN** that pickup SHALL run the shared gate
+- **AND** SHALL NOT start a worktree or delivery harness unless the fresh body is admitted

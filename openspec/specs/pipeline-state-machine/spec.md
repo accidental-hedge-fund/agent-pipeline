@@ -381,8 +381,10 @@ After completing its existing checks, the `shipcheck-gate` handler SHALL invoke 
 ### Requirement: Planning label precedes harness invocation
 
 The planning stage SHALL transition the issue `ready → planning` (set the `pipeline:planning`
-label) BEFORE invoking any planning harness, so the label reflects active work for the entire
+label) BEFORE invoking any planning *authoring* harness, so the label reflects active work for the entire
 harness duration rather than leaving the issue on `pipeline:ready` until authoring finishes.
+
+When `issue_readiness.enabled` is `true`, ready dispatch SHALL complete the shared issue-implementation-readiness evaluation (or reuse a bound verdict) while the issue is still on `pipeline:ready`. That admission call uses the Implementer planning treatment and is not the planning authoring harness. After a `ready` verdict, the `ready → planning` transition SHALL still occur before authoring, worktree bootstrap, or the planning delivery harness. After `needs_spec`, `gate-unavailable`, or `mutation-failed`, the issue SHALL NOT transition to `planning`. A `stale-dispatch` result SHALL be a non-advancing wait: the issue SHALL NOT transition to `planning` and SHALL NOT gain `pipeline:needs-spec`.
 
 While the planning stage is executing — from the moment it begins until it transitions to
 `plan-review` (when plan review is enabled) or `implementing` (when it is not) — any block it
@@ -401,6 +403,21 @@ are unaffected.
 - **THEN** the stage SHALL transition `ready → planning` before calling the artifact-authoring
   harness
 - **AND** the authoring harness SHALL observe the issue already on `pipeline:planning`
+
+#### Scenario: admission evaluation may run on ready
+
+- **WHEN** `issue_readiness.enabled` is `true` and ready dispatch evaluates a freshly fetched issue
+- **THEN** the Implementer planning-treatment admission call MAY run while the issue still carries `pipeline:ready`
+- **AND** a `needs_spec` result SHALL NOT call the artifact-authoring harness
+- **AND** a `ready` result SHALL still transition `ready → planning` before the artifact-authoring harness
+
+#### Scenario: stale-dispatch does not start planning
+
+- **WHEN** `issue_readiness.enabled` is `true`
+- **AND** ready dispatch receives a `stale-dispatch` result because the live stage is no longer `ready`
+- **THEN** the issue SHALL NOT transition to `planning`
+- **AND** SHALL NOT gain `pipeline:needs-spec`
+- **AND** the outcome SHALL be a non-advancing wait
 
 #### Scenario: planning-stage blocks classify the stage as planning
 
@@ -457,7 +474,9 @@ The pipeline CLI dispatch block SHALL accept `queue` as a recognized positional 
 
 ### Requirement: Ready dispatch records planning substages separately
 
-When an issue starts at `pipeline:ready`, the pipeline SHALL transition the issue to `pipeline:planning` before any long-running planning work, worktree bootstrap, or harness invocation begins. The run artifacts SHALL record separate stage lifecycle entries for `planning`, `plan-review`, and `implementing` when those substages run inside the compound planning flow. The outer `ready` dispatch SHALL NOT record one wrapper lifecycle entry whose duration covers plan review and implementation.
+When an issue starts at `pipeline:ready` and is admitted for delivery, the pipeline SHALL transition the issue to `pipeline:planning` before any long-running planning work, worktree bootstrap, or planning-authoring harness invocation begins. When `issue_readiness.enabled` is `true`, ready dispatch SHALL finish the shared gate (fresh fetch, evaluate or reuse) before that transition. A `needs_spec`, `gate-unavailable`, or `mutation-failed` outcome SHALL NOT record planning substages and SHALL NOT create a worktree.
+
+The run artifacts SHALL record separate stage lifecycle entries for `planning`, `plan-review`, and `implementing` when those substages run inside the compound planning flow. The outer `ready` dispatch SHALL NOT record one wrapper lifecycle entry whose duration covers plan review and implementation.
 
 #### Scenario: Planning label set before authoring
 - **WHEN** an issue labelled `pipeline:ready` enters the planning flow
@@ -469,6 +488,12 @@ When an issue starts at `pipeline:ready`, the pipeline SHALL transition the issu
 - **THEN** `events.jsonl` SHALL contain separate `stage_start` and `stage_complete` pairs for `planning`, `plan-review`, and `implementing`
 - **AND** the evidence bundle SHALL contain separate stage records for those substages
 - **AND** it SHALL NOT contain a single `planning` stage record that wraps the whole compound flow
+
+#### Scenario: Rejected ready dispatch does not emit planning substages
+- **WHEN** `issue_readiness.enabled` is `true`
+- **AND** ready dispatch returns `needs_spec`
+- **THEN** the run SHALL NOT record `planning` stage_start
+- **AND** SHALL NOT create a worktree
 
 ### Requirement: Fix rounds enforce stale OpenSpec deltas before push
 
