@@ -119,7 +119,7 @@ The model response SHALL be valid JSON whose `verdict` is exactly `ready` or `ne
 
 ### Requirement: A needs_spec result SHALL write or update exactly one hash-and-treatment-bound Pipeline-authored comment
 
-On `needs_spec` the gate SHALL create or update exactly one Pipeline-authored GitHub comment. The comment SHALL be bound to the evaluated title/body hash and the resolved planning treatment through an engine-owned marker. The comment body SHALL list concrete deficiencies and a proposed revised body that preserves author intent and contains the headings Summary, User story, Acceptance criteria, Out of scope, and Open questions. The gate SHALL NOT create a second owned comment for the same issue.
+On `needs_spec` the gate SHALL create or update exactly one Pipeline-authored GitHub comment. The comment SHALL be bound to the evaluated title/body hash and the resolved planning treatment through an engine-owned marker. The comment body SHALL list concrete deficiencies and a proposed revised body that preserves author intent and contains the headings Summary, User story, Acceptance criteria, Out of scope, and Open questions, in that order. The gate SHALL treat a comment as owned only when GitHub authorship matches the pipeline actor and the body carries a verified Pipeline attestation for an issue-readiness kind together with a well-formed binding marker. A foreign or malformed marker-bearing comment SHALL be ignored: the gate SHALL NOT reuse its verdict and SHALL NOT update that comment. The gate SHALL NOT create a second owned comment for the same issue.
 
 #### Scenario: First rejection posts one owned comment
 
@@ -132,6 +132,13 @@ On `needs_spec` the gate SHALL create or update exactly one Pipeline-authored Gi
 - **AND** a new evaluation produces `needs_spec` under a new hash or treatment
 - **THEN** the gate SHALL update that comment in place
 - **AND** SHALL NOT post an additional owned comment
+
+#### Scenario: Foreign marker is not patched
+
+- **WHEN** the only marker-bearing comment is not Pipeline-authored
+- **AND** a new evaluation produces `needs_spec`
+- **THEN** the gate SHALL post a new Pipeline-authored comment
+- **AND** SHALL NOT update the foreign comment
 
 ### Requirement: A needs_spec result SHALL move the issue to pipeline:needs-spec and SHALL NOT start delivery
 
@@ -163,7 +170,7 @@ The gate's GitHub writes SHALL be only the owned comment and, on `needs_spec`, t
 
 ### Requirement: Unchanged title, body, and treatment SHALL reuse the recorded verdict without another model call or comment
 
-The gate SHALL persist the bound verdict in the owned comment for both `ready` and `needs_spec`. When a fresh fetch matches the recorded title/body hash and resolved planning treatment, the gate SHALL reuse that verdict and SHALL NOT invoke the model and SHALL NOT post a new comment. A change to title, body, or resolved planning treatment SHALL invalidate the record and SHALL evaluate again.
+The gate SHALL persist the bound verdict in the owned comment for both `ready` and `needs_spec`. When a fresh fetch matches the recorded title/body hash and resolved planning treatment on a verified Pipeline-authored comment, the gate SHALL reuse that verdict and SHALL NOT invoke the model and SHALL NOT post a new comment. A foreign or malformed marker-bearing comment SHALL NOT satisfy this reuse. A change to title, body, or resolved planning treatment SHALL invalidate the record and SHALL evaluate again.
 
 #### Scenario: Unchanged thin issue reuses needs_spec
 
@@ -192,6 +199,32 @@ The gate SHALL persist the bound verdict in the owned comment for both `ready` a
 - **THEN** the gate SHALL admit without a model call
 - **AND** SHALL NOT post a new comment
 
+#### Scenario: Foreign ready marker is not reused
+
+- **WHEN** a collaborator comment contains a matching ready marker for the current hash and treatment
+- **AND** that comment is not a verified Pipeline-authored comment
+- **THEN** the gate SHALL NOT admit from that comment
+- **AND** SHALL invoke the Implementer
+
+### Requirement: The gate SHALL no-op when the live stage is no longer ready
+
+The gate SHALL require the freshly fetched pipeline stage to be `ready` before evaluation or verdict reuse. Immediately before any `needs_spec` GitHub mutation, the gate SHALL re-fetch labels and SHALL require the live stage to still be `ready`. If the live stage is any other value, the gate SHALL return a typed `stale-dispatch` outcome. That outcome SHALL NOT write the owned comment and SHALL NOT add `pipeline:needs-spec`. When the first fetch already shows a non-ready stage, the gate SHALL NOT invoke the model.
+
+#### Scenario: Fresh fetch shows a later stage
+
+- **WHEN** the freshly fetched labels include `pipeline:planning` or any stage other than `pipeline:ready`
+- **THEN** the outcome SHALL be `stale-dispatch`
+- **AND** the Implementer SHALL NOT be invoked
+- **AND** no comment or label write SHALL occur
+
+#### Scenario: Stage changes before needs_spec mutation
+
+- **WHEN** the first fetch shows `pipeline:ready` and evaluation returns `needs_spec`
+- **AND** a live re-fetch immediately before mutation shows a stage other than `pipeline:ready`
+- **THEN** the outcome SHALL be `stale-dispatch`
+- **AND** the gate SHALL NOT write the owned comment
+- **AND** the gate SHALL NOT add `pipeline:needs-spec`
+
 ### Requirement: Triage to ready SHALL be an admission request, not a bypass of the gate
 
 After an author applies a proposed body, `pipeline triage <N> --stage ready` SHALL remain the re-admission request. The next pickup SHALL re-fetch and SHALL require a `ready` verdict before any worktree or delivery harness starts. An unchanged thin body SHALL reuse `needs_spec` and return the issue to `pipeline:needs-spec`.
@@ -213,7 +246,7 @@ After an author applies a proposed body, `pipeline triage <N> --stage ready` SHA
 
 ### Requirement: Provider, harness, timeout, or schema failure SHALL be typed gate-unavailable with no fallback
 
-When the Implementer cannot be invoked, times out, or returns a response that fails the verdict schema, the outcome SHALL be typed `gate-unavailable`. The gate SHALL NOT fall back to a structural heuristic, the Reviewer, another provider, or another model. Direct single invocation SHALL fail with a non-zero exit and SHALL NOT start delivery. Multi-item runs SHALL block the affected issue and its selected dependents for that run and SHALL continue independent selected issues. The gate SHALL NOT write GitHub mutations on `gate-unavailable`. The issue SHALL remain on `pipeline:ready`.
+When the Implementer cannot be invoked, times out, or returns a response that fails the verdict schema, the outcome SHALL be typed `gate-unavailable`. A `needs_spec` response whose `proposed_body` omits the required headings or lists them out of order SHALL fail the verdict schema. The gate SHALL NOT fall back to a structural heuristic, the Reviewer, another provider, or another model. Direct single invocation SHALL fail with a non-zero exit and SHALL NOT start delivery. Multi-item runs SHALL block the affected issue and its selected dependents for that run and SHALL continue independent selected issues. The gate SHALL NOT write GitHub mutations on `gate-unavailable`. The issue SHALL remain on `pipeline:ready`.
 
 #### Scenario: Direct single fails visibly
 
@@ -227,6 +260,19 @@ When the Implementer cannot be invoked, times out, or returns a response that fa
 - **WHEN** the model returns JSON without a `verdict` field
 - **THEN** the outcome SHALL be `gate-unavailable`
 - **AND** the issue SHALL NOT be labeled `pipeline:needs-spec`
+
+#### Scenario: Draft missing a required heading is gate-unavailable
+
+- **WHEN** the model returns `needs_spec` with a `proposed_body` that omits one of Summary, User story, Acceptance criteria, Out of scope, or Open questions
+- **THEN** the outcome SHALL be `gate-unavailable`
+- **AND** the issue SHALL NOT be labeled `pipeline:needs-spec`
+- **AND** no owned comment SHALL be written
+
+#### Scenario: Draft with headings out of order is gate-unavailable
+
+- **WHEN** the model returns `needs_spec` with a `proposed_body` that contains the required headings in an order other than Summary, User story, Acceptance criteria, Out of scope, Open questions
+- **THEN** the outcome SHALL be `gate-unavailable`
+- **AND** no GitHub mutation SHALL occur
 
 #### Scenario: Selected dependents are blocked; independents continue
 

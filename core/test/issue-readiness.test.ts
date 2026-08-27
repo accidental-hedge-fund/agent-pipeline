@@ -5,16 +5,20 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { DEFAULT_CONFIG, type Outcome, type PipelineConfig, type Stage } from "../scripts/types.ts";
 import {
+  buildIssueReadinessComment,
   evaluateIssueReadiness,
   eventsTextHasGateUnavailable,
   formatIssueReadinessMarker,
   hashIssueReadinessInput,
+  ISSUE_READINESS_CANONICAL_HEADINGS,
   parseIssueReadinessMarker,
   parseIssueReadinessVerdict,
   proposedBodyHasCanonicalHeadings,
   recordsMatch,
   resolvedPlanningTreatment,
+  type IssueReadinessComment,
   type IssueReadinessDeps,
+  type IssueReadinessTreatment,
 } from "../scripts/issue-readiness.ts";
 import { dispatch, type PlanningRecoveryDeps } from "../scripts/pipeline-run.ts";
 
@@ -78,12 +82,39 @@ function readyJson(): string {
   return JSON.stringify({ verdict: "ready", deficiencies: [], proposed_body: "" });
 }
 
+const PIPELINE_ACTOR = "pipeline-bot";
+
+function ownedComment(input: {
+  id: number;
+  verdict: "ready" | "needs_spec";
+  hash: string;
+  treatment: IssueReadinessTreatment;
+  author?: string;
+  deficiencies?: string[];
+  proposed_body?: string;
+}): IssueReadinessComment {
+  return {
+    id: input.id,
+    author: input.author ?? PIPELINE_ACTOR,
+    body: buildIssueReadinessComment({
+      verdict: input.verdict,
+      hash: input.hash,
+      treatment: input.treatment,
+      deficiencies: input.deficiencies ?? (input.verdict === "needs_spec" ? ["thin"] : []),
+      proposed_body: input.proposed_body ?? (input.verdict === "needs_spec" ? FIVE_SECTION_BODY : ""),
+      evaluatedAt: "2026-08-27T01:48:04Z",
+    }),
+  };
+}
+
 function makeDeps(opts: {
   title?: string;
   body?: string;
   labels?: string[];
-  comments?: { id: number; body: string }[];
+  labelSequence?: string[][];
+  comments?: Array<{ id: number; body: string; author?: string }>;
   harness?: IssueReadinessDeps["invokeImplementer"];
+  actor?: string | null;
 }): IssueReadinessDeps & {
   calls: {
     fetch: number;
@@ -102,21 +133,29 @@ function makeDeps(opts: {
     addLabel: [] as string[],
     removeLabel: [] as string[],
   };
-  const comments = [...(opts.comments ?? [])];
+  const comments: IssueReadinessComment[] = (opts.comments ?? []).map((c) => ({
+    id: c.id,
+    body: c.body,
+    author: c.author ?? "unknown",
+  }));
   return {
     calls,
     fetchIssue: async () => {
       calls.fetch++;
+      const labels = opts.labelSequence
+        ? opts.labelSequence[Math.min(calls.fetch - 1, opts.labelSequence.length - 1)]
+        : (opts.labels ?? ["pipeline:ready"]);
       return {
         title: opts.title ?? "Thin issue",
         body: opts.body ?? THIN_BODY,
-        labels: opts.labels ?? ["pipeline:ready"],
+        labels,
       };
     },
     listComments: async () => comments,
+    getPipelineActor: async () => (opts.actor === undefined ? PIPELINE_ACTOR : opts.actor),
     createComment: async (_n, body) => {
       calls.createComment.push(body);
-      comments.push({ id: comments.length + 1, body });
+      comments.push({ id: comments.length + 1, body, author: PIPELINE_ACTOR });
     },
     updateComment: async (id, body) => {
       calls.updateComment.push({ id, body });
@@ -154,6 +193,45 @@ test("parseIssueReadinessVerdict: missing verdict is schema failure", () => {
   assert.throws(() => parseIssueReadinessVerdict('{"deficiencies":[]}'), /schema/);
 });
 
+test("parseIssueReadinessVerdict: needs_spec without canonical headings is schema failure", () => {
+  assert.throws(
+    () =>
+      parseIssueReadinessVerdict(
+        JSON.stringify({
+          verdict: "needs_spec",
+          deficiencies: ["thin"],
+          proposed_body: "just a paragraph",
+        }),
+      ),
+    /schema/,
+  );
+  const reversed = [...ISSUE_READINESS_CANONICAL_HEADINGS]
+    .reverse()
+    .map((heading) => `## ${heading}\ntext`)
+    .join("\n");
+  assert.throws(
+    () =>
+      parseIssueReadinessVerdict(
+        JSON.stringify({
+          verdict: "needs_spec",
+          deficiencies: ["thin"],
+          proposed_body: reversed,
+        }),
+      ),
+    /schema/,
+  );
+});
+
+test("proposedBodyHasCanonicalHeadings: requires all five headings in order", () => {
+  assert.equal(proposedBodyHasCanonicalHeadings(FIVE_SECTION_BODY), true);
+  assert.equal(proposedBodyHasCanonicalHeadings("## Summary\nonly one"), false);
+  const reversed = [...ISSUE_READINESS_CANONICAL_HEADINGS]
+    .reverse()
+    .map((heading) => `## ${heading}`)
+    .join("\n");
+  assert.equal(proposedBodyHasCanonicalHeadings(reversed), false);
+});
+
 test("gate: semantically complete issue without headings is ready", async () => {
   const deps = makeDeps({
     title: "Retry failed fetches",
@@ -186,9 +264,8 @@ test("gate: later needs_spec updates the same owned comment", async () => {
   const cfg = makeCfg();
   const treatment = resolvedPlanningTreatment(cfg);
   const oldHash = hashIssueReadinessInput("Thin issue", "old", treatment);
-  const marker = formatIssueReadinessMarker("needs_spec", oldHash, treatment);
   const deps = makeDeps({
-    comments: [{ id: 9, body: `old\n${marker}` }],
+    comments: [ownedComment({ id: 9, verdict: "needs_spec", hash: oldHash, treatment })],
     harness: async () => ({
       success: true,
       stdout: needsSpecJson(["unresolved contradiction"]),
@@ -207,9 +284,8 @@ test("gate: matching hash-and-treatment reuses needs_spec with zero invoke", asy
   const cfg = makeCfg();
   const treatment = resolvedPlanningTreatment(cfg);
   const hash = hashIssueReadinessInput("Thin issue", THIN_BODY, treatment);
-  const marker = formatIssueReadinessMarker("needs_spec", hash, treatment);
   const deps = makeDeps({
-    comments: [{ id: 3, body: `held\n${marker}` }],
+    comments: [ownedComment({ id: 3, verdict: "needs_spec", hash, treatment })],
   });
   const result = await evaluateIssueReadiness(cfg, 42, { deps });
   assert.equal(result.kind, "needs_spec");
@@ -224,11 +300,10 @@ test("gate: matching ready record is reused with zero invoke", async () => {
   const cfg = makeCfg();
   const treatment = resolvedPlanningTreatment(cfg);
   const hash = hashIssueReadinessInput("Retry failed fetches", COMPLETE_BODY, treatment);
-  const marker = formatIssueReadinessMarker("ready", hash, treatment);
   const deps = makeDeps({
     title: "Retry failed fetches",
     body: COMPLETE_BODY,
-    comments: [{ id: 4, body: `admitted\n${marker}` }],
+    comments: [ownedComment({ id: 4, verdict: "ready", hash, treatment })],
   });
   const result = await evaluateIssueReadiness(cfg, 42, { deps });
   assert.equal(result.kind, "ready");
@@ -236,6 +311,122 @@ test("gate: matching ready record is reused with zero invoke", async () => {
   assert.equal(deps.calls.invoke, 0);
   assert.equal(deps.calls.createComment.length, 0);
   assert.equal(deps.calls.updateComment.length, 0);
+});
+
+test("gate: foreign needs_spec marker is not patched", async () => {
+  const cfg = makeCfg();
+  const treatment = resolvedPlanningTreatment(cfg);
+  const oldHash = hashIssueReadinessInput("Thin issue", "old", treatment);
+  const deps = makeDeps({
+    comments: [
+      ownedComment({
+        id: 99,
+        verdict: "needs_spec",
+        hash: oldHash,
+        treatment,
+        author: "attacker",
+      }),
+    ],
+  });
+  const result = await evaluateIssueReadiness(cfg, 42, { deps });
+  assert.equal(result.kind, "needs_spec");
+  assert.equal(result.kind === "needs_spec" && result.reused, false);
+  assert.equal(deps.calls.updateComment.length, 0);
+  assert.equal(deps.calls.createComment.length, 1);
+});
+
+test("gate: untrusted ready marker is not reused and is not patched", async () => {
+  const cfg = makeCfg();
+  const treatment = resolvedPlanningTreatment(cfg);
+  const hash = hashIssueReadinessInput("Retry failed fetches", COMPLETE_BODY, treatment);
+  const deps = makeDeps({
+    title: "Retry failed fetches",
+    body: COMPLETE_BODY,
+    comments: [
+      ownedComment({
+        id: 99,
+        verdict: "ready",
+        hash,
+        treatment,
+        author: "attacker",
+      }),
+    ],
+    harness: async () => ({ success: true, stdout: readyJson(), stderr: "", timed_out: false }),
+  });
+  const result = await evaluateIssueReadiness(cfg, 42, { deps });
+  assert.equal(result.kind, "ready");
+  assert.equal(result.kind === "ready" && result.reused, false);
+  assert.equal(deps.calls.invoke, 1);
+  assert.equal(deps.calls.updateComment.length, 0);
+  assert.equal(deps.calls.createComment.length, 1);
+});
+
+test("gate: marker without pipeline attestation is ignored", async () => {
+  const cfg = makeCfg();
+  const treatment = resolvedPlanningTreatment(cfg);
+  const hash = hashIssueReadinessInput("Retry failed fetches", COMPLETE_BODY, treatment);
+  const marker = formatIssueReadinessMarker("ready", hash, treatment);
+  const deps = makeDeps({
+    title: "Retry failed fetches",
+    body: COMPLETE_BODY,
+    comments: [{ id: 4, author: PIPELINE_ACTOR, body: `admitted\n${marker}` }],
+    harness: async () => ({ success: true, stdout: readyJson(), stderr: "", timed_out: false }),
+  });
+  const result = await evaluateIssueReadiness(cfg, 42, { deps });
+  assert.equal(result.kind, "ready");
+  assert.equal(result.kind === "ready" && result.reused, false);
+  assert.equal(deps.calls.invoke, 1);
+  assert.equal(deps.calls.updateComment.length, 0);
+  assert.equal(deps.calls.createComment.length, 1);
+});
+
+test("gate: needs_spec draft missing headings is gate-unavailable with no writes", async () => {
+  const deps = makeDeps({
+    harness: async () => ({
+      success: true,
+      stdout: JSON.stringify({
+        verdict: "needs_spec",
+        deficiencies: ["thin"],
+        proposed_body: "just a paragraph",
+      }),
+      stderr: "",
+      timed_out: false,
+    }),
+  });
+  const result = await evaluateIssueReadiness(makeCfg(), 7, { deps });
+  assert.equal(result.kind, "gate-unavailable");
+  assert.equal(deps.calls.createComment.length, 0);
+  assert.equal(deps.calls.updateComment.length, 0);
+  assert.equal(deps.calls.addLabel.length, 0);
+  assert.equal(deps.calls.removeLabel.length, 0);
+});
+
+test("gate: live stage not ready is stale-dispatch with no invoke or writes", async () => {
+  const deps = makeDeps({ labels: ["pipeline:planning"] });
+  const result = await evaluateIssueReadiness(makeCfg(), 42, { deps });
+  assert.equal(result.kind, "stale-dispatch");
+  if (result.kind === "stale-dispatch") {
+    assert.equal(result.observedStage, "planning");
+  }
+  assert.equal(deps.calls.invoke, 0);
+  assert.equal(deps.calls.createComment.length, 0);
+  assert.equal(deps.calls.addLabel.length, 0);
+  assert.equal(deps.calls.removeLabel.length, 0);
+});
+
+test("gate: stage change before needs_spec mutation is stale-dispatch with no writes", async () => {
+  const deps = makeDeps({
+    labelSequence: [["pipeline:ready"], ["pipeline:planning"]],
+  });
+  const result = await evaluateIssueReadiness(makeCfg(), 42, { deps });
+  assert.equal(result.kind, "stale-dispatch");
+  if (result.kind === "stale-dispatch") {
+    assert.equal(result.observedStage, "planning");
+  }
+  assert.equal(deps.calls.invoke, 1);
+  assert.equal(deps.calls.createComment.length, 0);
+  assert.equal(deps.calls.addLabel.length, 0);
+  assert.equal(deps.calls.removeLabel.length, 0);
 });
 
 test("gate: timeout, harness fail, and schema fail are gate-unavailable with no writes", async () => {
@@ -421,6 +612,36 @@ test("pickup coordinators share ready-dispatch gate and have no private copy", a
   }
   assert.match(readFileSync(join(root, "stages/queue.ts"), "utf8"), /pipelineScript/);
   assert.match(readFileSync(join(root, "stages/train.ts"), "utf8"), /advanceWave/);
+});
+
+test("dispatch ready: stale-dispatch is a waiting no-op", async () => {
+  const cfg = makeCfg({ issue_readiness: { enabled: true, timeout: 600 } });
+  let planning = 0;
+  const out = await dispatch(
+    cfg,
+    8,
+    "ready",
+    {},
+    "run",
+    undefined,
+    undefined,
+    undefined,
+    {
+      transition: async () => {},
+      planningAdvance: async () => {
+        planning++;
+        return { advanced: true, from: "ready" as Stage, to: "planning" as Stage, summary: "no" };
+      },
+      tryAcquireLivePlanningMarker: () => true,
+      evaluateIssueReadiness: async () => ({ kind: "stale-dispatch", observedStage: "planning" }),
+    },
+  );
+  assert.equal(out.advanced, false);
+  if (!out.advanced) {
+    assert.equal(out.status, "waiting");
+    assert.match(out.reason, /stale-dispatch/);
+  }
+  assert.equal(planning, 0);
 });
 
 test("dispatch ready: gate-unavailable is typed error", async () => {

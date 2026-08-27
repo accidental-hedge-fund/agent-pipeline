@@ -99,7 +99,7 @@ The planning stage SHALL transition the issue `ready → planning` (set the `pip
 label) BEFORE invoking any planning *authoring* harness, so the label reflects active work for the entire
 harness duration rather than leaving the issue on `pipeline:ready` until authoring finishes.
 
-When `issue_readiness.enabled` is `true`, ready dispatch SHALL complete the shared issue-implementation-readiness evaluation (or reuse a bound verdict) while the issue is still on `pipeline:ready`. That admission call uses the Implementer planning treatment and is not the planning authoring harness. After a `ready` verdict, the `ready → planning` transition SHALL still occur before authoring, worktree bootstrap, or the planning delivery harness. After `needs_spec` or `gate-unavailable`, the issue SHALL NOT transition to `planning`.
+When `issue_readiness.enabled` is `true`, ready dispatch SHALL complete the shared issue-implementation-readiness evaluation (or reuse a bound verdict) while the issue is still on `pipeline:ready`. That admission call uses the Implementer planning treatment and is not the planning authoring harness. After a `ready` verdict, the `ready → planning` transition SHALL still occur before authoring, worktree bootstrap, or the planning delivery harness. After `needs_spec` or `gate-unavailable`, the issue SHALL NOT transition to `planning`. A `stale-dispatch` result SHALL be a non-advancing wait: the issue SHALL NOT transition to `planning` and SHALL NOT gain `pipeline:needs-spec`.
 
 While the planning stage is executing — from the moment it begins until it transitions to
 `plan-review` (when plan review is enabled) or `implementing` (when it is not) — any block it
@@ -125,6 +125,14 @@ are unaffected.
 - **THEN** the Implementer planning-treatment admission call MAY run while the issue still carries `pipeline:ready`
 - **AND** a `needs_spec` result SHALL NOT call the artifact-authoring harness
 - **AND** a `ready` result SHALL still transition `ready → planning` before the artifact-authoring harness
+
+#### Scenario: stale-dispatch does not start planning
+
+- **WHEN** `issue_readiness.enabled` is `true`
+- **AND** ready dispatch receives a `stale-dispatch` result because the live stage is no longer `ready`
+- **THEN** the issue SHALL NOT transition to `planning`
+- **AND** SHALL NOT gain `pipeline:needs-spec`
+- **AND** the outcome SHALL be a non-advancing wait
 
 #### Scenario: planning-stage blocks classify the stage as planning
 

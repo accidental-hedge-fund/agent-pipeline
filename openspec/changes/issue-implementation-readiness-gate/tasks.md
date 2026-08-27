@@ -44,3 +44,9 @@
 - [x] 6.3 Regenerate config docs (`docs/config.md`) from the schema after description changes and verify the docs freshness check is green
 - [x] 6.4 After any `core/` edit, run `node scripts/build.mjs` and commit the regenerated `plugin/` in the same change, and verify `node scripts/build.mjs --check` passes
 - [x] 6.5 Run `npm run ci` from the repo root and verify it passes, including `openspec validate --all`
+
+## 7. Review-1 provenance, draft schema, and stale dispatch
+
+- [x] 7.1 Reuse or update only verified Pipeline-authored comments (actor + attestation + marker); ignore foreign or malformed marker-bearing comments
+- [x] 7.2 Treat a `needs_spec` draft that omits canonical headings or lists them out of order as `gate-unavailable` with no GitHub mutation
+- [x] 7.3 Return `stale-dispatch` when the live stage is no longer `ready` at fetch or immediately before a `needs_spec` mutation, with no comment or label writes

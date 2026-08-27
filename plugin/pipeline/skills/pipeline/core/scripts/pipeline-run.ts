@@ -951,6 +951,14 @@ export async function dispatch(
             summary: needsSpecSummary(admission),
           };
         }
+        if (admission.kind === "stale-dispatch") {
+          const observed = admission.observedStage ?? "none";
+          return {
+            advanced: false,
+            status: "waiting",
+            reason: `issue-readiness: stale-dispatch: live stage is ${observed}`,
+          };
+        }
         if (admission.kind === "gate-unavailable") {
           if (runDir) {
             await appendEvent(
