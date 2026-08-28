@@ -7,6 +7,8 @@
 - [x] 1.5 Add injected classifier cases with a `gitCmd` seam (same pattern as `CreateWorktreeDeps.gitCmd`): (a) `ls-remote` code 0 + empty SHA, then `git log` non-empty or exit 1 → `"unverifiable"`, not `null`; (b) `ls-remote` code 0 + empty SHA, then log/command error (exit ≥ 128) → `"unverifiable"`, not `null`; (c) `ls-remote` non-zero (transport) → `null`. Verify (a)/(b) **fail** against current `checkLocalOnlyCommits` returning `null`. Do not collapse exit-status 1 (non-ancestry) with `ls-remote` transport failure.
 - [x] 1.6 Add ordering cases: matching proof MUST NOT bypass `underManagedRoot === false`, dirty, or `localOnly === true`. Remove is not called.
 - [x] 1.7 Add `createVerifiedMergeProof` runtime-validation tests: reject non-positive issue/PR, empty base, non-40-char OID. A raw `{ issue, pr, base, oid }` object or a log/label string is not accepted as proof by the gate.
+- [x] 1.8 Add an injected park-release case: matching bound proof + clean tree + unverifiable local-only, but `hasRemoteBranchTip` / `resolveOpenPrHeadForBranch` throw. Assert the worktree is **released** and those probes are not called.
+- [x] 1.9 Add an injected park-release / automatic-remove case: matching bound proof + remote deleted + unverifiable local-only + current HEAD differs from the merge-time worktree HEAD. Assert the worktree is **retained** (later local work) and remove is not called.
 
 ## 2. Shared classifier and ladder
 

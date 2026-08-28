@@ -1178,6 +1178,8 @@ export interface SafeRemoveDeps {
   prNumber?: number;
   /** Independently known merge-result OID for proof identity match. */
   expectedMergeResultOid?: string;
+  /** Current managed-worktree HEAD; injected in tests. Default: `git rev-parse HEAD`. */
+  resolveWorktreeHead?: (worktreePath: string) => Promise<string | null>;
 }
 
 /**
@@ -1207,7 +1209,20 @@ export async function removeManagedWorktreeSafely(
     dirty = await dirtyFn(wtPath);
   }
   const localOnly = await localOnlyFn(cfg, pathOnDisk ? wtPath : null, branch);
-  const proofMatches = boundProofMatchesAtWrapper(deps.verifiedMergeProof, issueNumber, cfg, deps);
+  const identityMatches = boundProofMatchesAtWrapper(deps.verifiedMergeProof, issueNumber, cfg, deps);
+  if (identityMatches && pathOnDisk && isVerifiedMergeProof(deps.verifiedMergeProof)) {
+    const headOk = await worktreeHeadMatchesProof(deps.verifiedMergeProof, wtPath, cfg, deps);
+    if (!headOk) {
+      return {
+        removed: false,
+        reason:
+          "worktree HEAD does not match merge-time head; retaining later local work",
+        path: wtPath,
+        branch,
+      };
+    }
+  }
+  const proofMatches = identityMatches;
   const safety = evaluateRemoveSafety({ dirty, localOnly, force, boundProofMatches: proofMatches });
   if (!safety.ok) {
     return {
@@ -1685,13 +1700,15 @@ const VERIFIED_MERGE_PROOF = Symbol.for("agent-pipeline.VerifiedMergeProof");
  * Runtime-validated in-process carrier for bound merge-result proof (#1274).
  * Only {@link createVerifiedMergeProof} (via {@link proveMergeResultInBase} in
  * production) may construct this object. Logs, labels, and untyped JSON are
- * not proof.
+ * not proof. `worktreeHead` is the managed-worktree HEAD observed at
+ * merge/proof time; a later different HEAD must not be deleted.
  */
 export type VerifiedMergeProof = {
   readonly issue: number;
   readonly pr: number;
   readonly base: string;
   readonly mergeResultOid: string;
+  readonly worktreeHead: string;
   readonly [typeof VERIFIED_MERGE_PROOF]: true;
 };
 
@@ -1707,6 +1724,8 @@ export type ProveMergeResultInput = {
   pr: number;
   base: string;
   mergeResultOid: string;
+  /** Managed-worktree HEAD at merge/proof time (PR head SHA or observed HEAD). */
+  worktreeHead: string;
 };
 
 export type ProveMergeResultDeps = {
@@ -1737,11 +1756,17 @@ export function createVerifiedMergeProof(input: ProveMergeResultInput): Verified
   if (!OID_RE.test(oid)) {
     throw new Error("VerifiedMergeProof: mergeResultOid must be a 40-char hex SHA");
   }
+  const worktreeHead =
+    typeof input.worktreeHead === "string" ? input.worktreeHead.trim().toLowerCase() : "";
+  if (!OID_RE.test(worktreeHead)) {
+    throw new Error("VerifiedMergeProof: worktreeHead must be a 40-char hex SHA");
+  }
   return Object.freeze({
     issue: input.issue,
     pr: input.pr,
     base,
     mergeResultOid: oid,
+    worktreeHead,
     [VERIFIED_MERGE_PROOF]: true as const,
   });
 }
@@ -1756,7 +1781,9 @@ export function isVerifiedMergeProof(value: unknown): value is VerifiedMergeProo
     typeof rec.base === "string" &&
     rec.base.trim() !== "" &&
     typeof rec.mergeResultOid === "string" &&
-    OID_RE.test(rec.mergeResultOid)
+    OID_RE.test(rec.mergeResultOid) &&
+    typeof rec.worktreeHead === "string" &&
+    OID_RE.test(rec.worktreeHead)
   );
 }
 
@@ -1792,6 +1819,34 @@ function boundProofMatchesAtWrapper(
     base: cfg.base_branch ?? "main",
     mergeResultOid: expectedOid,
   });
+}
+
+/** Default: `git rev-parse HEAD` in the managed worktree. Fail closed on error. */
+async function realResolveWorktreeHead(
+  cfg: PipelineConfig,
+  worktreePath: string,
+  gitCmd: GitCmd = git,
+): Promise<string | null> {
+  const r = await gitCmd(cfg, worktreePath, ["rev-parse", "HEAD"], { ignoreFailure: true });
+  if (r.code !== 0) return null;
+  const sha = r.stdout.trim().toLowerCase();
+  return OID_RE.test(sha) ? sha : null;
+}
+
+async function worktreeHeadMatchesProof(
+  proof: VerifiedMergeProof,
+  worktreePath: string,
+  cfg: PipelineConfig,
+  deps: {
+    resolveWorktreeHead?: (worktreePath: string) => Promise<string | null>;
+    gitCmd?: GitCmd;
+  },
+): Promise<boolean> {
+  const resolve =
+    deps.resolveWorktreeHead ??
+    ((p: string) => realResolveWorktreeHead(cfg, p, deps.gitCmd ?? git));
+  const current = await resolve(worktreePath);
+  return current !== null && current.toLowerCase() === proof.worktreeHead;
 }
 
 /** Prove `mergeResultOid` is contained in fetched `origin/<base>`, then mint bound proof. */
@@ -2245,6 +2300,8 @@ export interface ParkReleaseDeps {
   prNumber?: number;
   /** Independently known merge-result OID for proof identity match. */
   expectedMergeResultOid?: string;
+  /** Current managed-worktree HEAD; injected in tests. Default: `git rev-parse HEAD`. */
+  resolveWorktreeHead?: (worktreePath: string) => Promise<string | null>;
 }
 
 async function realHasRemoteBranchTip(cfg: PipelineConfig, branch: string): Promise<boolean> {
@@ -2354,8 +2411,22 @@ export async function releaseWorktreeForParkedIssue(
 
   // Single evaluateRemoveSafety decision for dirty/local-only (#759 parked
   // release). Identity matching happens here at the wrapper, then the boolean
-  // is passed into the pure table (#1274).
-  const proofMatches = boundProofMatchesAtWrapper(deps.verifiedMergeProof, issueNumber, cfg, deps);
+  // is passed into the pure table (#1274). Bound proof also requires the
+  // current HEAD to equal the merge-time worktree HEAD (finding 5142e8d3).
+  const identityMatches = boundProofMatchesAtWrapper(deps.verifiedMergeProof, issueNumber, cfg, deps);
+  if (identityMatches && pathOnDisk && isVerifiedMergeProof(deps.verifiedMergeProof)) {
+    const headOk = await worktreeHeadMatchesProof(deps.verifiedMergeProof, worktreeP, cfg, deps);
+    if (!headOk) {
+      return {
+        action: "retained",
+        reason:
+          `worktree HEAD does not match merge-time head; park-release retains later local work on ${branch}`,
+        branch,
+        worktree: worktreeP,
+      };
+    }
+  }
+  const proofMatches = identityMatches;
   const safety = evaluateRemoveSafety({
     dirty,
     localOnly,
@@ -2379,15 +2450,18 @@ export async function releaseWorktreeForParkedIssue(
     };
   }
 
-  const hasRemoteTip = await remoteTipFn(cfg, branch);
-  // Open PR is an alternate recoverability path only when we can resolve a
-  // non-empty PR head SHA — createWorktree reconstructs from that head when
-  // the remote branch tip is absent (#718 review ac32c448).
-  const openPrHead = hasRemoteTip ? null : await resolveOpenPrHeadFn(cfg, branch);
-  const hasRecoverableOpenPr = openPrHead !== null && openPrHead.headSha.length > 0;
-  // Bound merge-result proof is recoverability condition 2: skip remote-tip /
-  // open-PR retain after a proven squash merge (#1274).
+  // Bound proof is recoverability condition 2: skip remote-tip / open-PR
+  // probes entirely (finding 96347051). Those lookups can fail after merge
+  // proof is already established and must not retain a clean proven tree.
+  let hasRemoteTip = false;
+  let openPrHead: { prNumber: number; headSha: string } | null = null;
   if (!proofMatches) {
+    hasRemoteTip = await remoteTipFn(cfg, branch);
+    // Open PR is an alternate recoverability path only when we can resolve a
+    // non-empty PR head SHA — createWorktree reconstructs from that head when
+    // the remote branch tip is absent (#718 review ac32c448).
+    openPrHead = hasRemoteTip ? null : await resolveOpenPrHeadFn(cfg, branch);
+    const hasRecoverableOpenPr = openPrHead !== null && openPrHead.headSha.length > 0;
     // Open PR is an alternate recoverability path when remote-tip verification is
     // marginal (e.g. unverifiable after squash ambiguity) — still require no
     // definitive local-only commits (handled above via evaluateRemoveSafety).

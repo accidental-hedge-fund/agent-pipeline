@@ -32,7 +32,7 @@ Automatic park-release and ready-to-deploy removal SHALL consume this classifica
 
 ### Requirement: Automatic ready-to-deploy removal SHALL honor bound merge-result proof
 
-The shared automatic-removal path used at `pipeline:ready-to-deploy` and by park-release SHALL accept bound merge-result proof (same issue number, same PR number, same base branch, same proven `merge_result_oid` contained in `origin/<base>`). When that proof is present and the managed worktree is clean, the path SHALL remove the worktree even if local-only verification reports squash-merge unreachability. The path SHALL still evaluate the shared dirty/local-only ladder once. It SHALL NOT pass operator `--force` solely to bypass unverifiable state, because `--force` also discards dirty work.
+The shared automatic-removal path used at `pipeline:ready-to-deploy` and by park-release SHALL accept bound merge-result proof (same issue number, same PR number, same base branch, same proven `merge_result_oid` contained in `origin/<base>`, and current worktree HEAD equal to the HEAD bound at merge/proof time). When that proof is present, the HEAD still matches, and the managed worktree is clean, the path SHALL remove the worktree even if local-only verification reports squash-merge unreachability. The path SHALL still evaluate the shared dirty/local-only ladder once. It SHALL NOT pass operator `--force` solely to bypass unverifiable state, because `--force` also discards dirty work. When bound proof matches, park-release SHALL skip remote-tip and open-PR recoverability probes.
 
 #### Scenario: Deploy-ready removal releases a clean tree after proven squash merge
 
@@ -50,3 +50,10 @@ The shared automatic-removal path used at `pipeline:ready-to-deploy` and by park
 - **THEN** the worktree SHALL be retained
 - **AND** the reason SHALL name the dirty condition
 - **AND** the reason SHALL NOT be git/network/auth
+
+#### Scenario: Deploy-ready removal retains a post-merge local commit
+
+- **WHEN** `pipeline:ready-to-deploy` removal runs for issue N with bound merge-result proof
+- **AND** the managed worktree HEAD differs from the HEAD bound at merge/proof time
+- **THEN** the worktree SHALL be retained
+- **AND** the reason SHALL name the HEAD mismatch or later local work

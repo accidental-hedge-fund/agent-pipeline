@@ -316,6 +316,7 @@ export async function finalize(
               pr: prNumber,
               base: cfg.base_branch ?? "main",
               mergeResultOid: live.merge_commit_sha,
+              worktreeHead: live.head_sha ?? "",
             },
             proveDeps,
           )) ?? undefined;

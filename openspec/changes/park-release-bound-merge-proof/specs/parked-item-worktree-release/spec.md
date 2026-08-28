@@ -5,9 +5,9 @@
 When an issue reaches a durable non-transient park or hold — an advance outcome that leaves the issue waiting without further harness execution in its managed worktree (including needs-human holds and non-immediately-recoverable blocked outcomes) — the pipeline SHALL attempt to release that issue's managed worktree. Release SHALL succeed only when the worktree path is under a managed root, the working tree is clean, and **one** recoverability condition holds:
 
 1. local-only commit verification reports no unpushed commits, **and** the branch tip is present on the remote **or** an open PR with a resolvable head SHA exists for that head branch (so resume can reconstruct from that commit); **or**
-2. the engine holds **bound merge-result proof** for this same issue: the same issue number, the same PR number, the same configured base branch, and a `merge_result_oid` the engine has proven is contained in `origin/<base>` for that identity.
+2. the engine holds **bound merge-result proof** for this same issue: the same issue number, the same PR number, the same configured base branch, a `merge_result_oid` the engine has proven is contained in `origin/<base>` for that identity, and the managed worktree HEAD still equals the HEAD bound on that proof at merge/proof time.
 
-On successful release the worktree directory SHALL be deregistered and removed from disk so it no longer appears in the on-disk listing used by capacity counting; the remote branch and any open PR SHALL NOT be deleted by release. Release logic SHALL reuse the same dirty and local-only safety ladder as operator remove / create reclaim (no automatic force discard). Bound merge-result proof SHALL authorize release of a clean tree even when the remote head branch is already deleted and pre-merge commits are not reachable from the base (the usual squash-merge SHA mismatch). Bound proof SHALL NOT authorize discarding a dirty worktree.
+On successful release the worktree directory SHALL be deregistered and removed from disk so it no longer appears in the on-disk listing used by capacity counting; the remote branch and any open PR SHALL NOT be deleted by release. Release logic SHALL reuse the same dirty and local-only safety ladder as operator remove / create reclaim (no automatic force discard). Bound merge-result proof SHALL authorize release of a clean tree even when the remote head branch is already deleted and pre-merge commits are not reachable from the base (the usual squash-merge SHA mismatch). When bound proof matches, park-release SHALL NOT require remote-tip or open-PR lookups to succeed and SHALL NOT invoke those probes. Bound proof SHALL NOT authorize discarding a dirty worktree. Bound proof SHALL NOT authorize release when the current worktree HEAD differs from the HEAD bound at merge/proof time.
 
 #### Scenario: Clean parked worktree with remote branch is released
 
@@ -31,6 +31,21 @@ On successful release the worktree directory SHALL be deregistered and removed f
 - **THEN** the pipeline SHALL remove that managed worktree from disk and deregister it
 - **AND** operator-visible text SHALL NOT contain `commit verification failed (git/network/auth error)`
 - **AND** operator-visible text SHALL NOT tell the operator to check connectivity or retry
+
+#### Scenario: Bound-proof release does not probe remote tip or open PR
+
+- **WHEN** issue N durable-parks with bound merge-result proof for N, PR P, the configured base, proven OID R, and matching worktree HEAD
+- **AND** the managed worktree is clean
+- **THEN** park-release SHALL release that worktree
+- **AND** SHALL NOT invoke remote-tip or open-PR recoverability probes
+- **AND** a failure of those probes SHALL NOT retain the worktree
+
+#### Scenario: Post-merge local commit is retained despite bound proof
+
+- **WHEN** issue N's PR P was squash-merged with bound merge-result proof
+- **AND** the managed worktree HEAD differs from the HEAD bound at merge/proof time
+- **THEN** the pipeline SHALL retain that worktree
+- **AND** SHALL NOT remove it on the strength of bound proof
 
 #### Scenario: Out-of-managed-root worktree is never auto-released
 
@@ -80,7 +95,7 @@ Bound merge-result proof SHALL NOT convert a dirty worktree or a filesystem/clea
 
 ### Requirement: Bound merge-result proof SHALL be a runtime-validated in-process carrier
 
-Park-release SHALL accept bound merge-result proof only as a runtime-validated `VerifiedMergeProof` object that names this issue number, this PR number, the configured base branch, and the merge-result OID together. The engine SHALL create that object only after the in-base verifier has proven the OID is contained in `origin/<base>`. Park-release SHALL NOT reconstruct proof from run logs, GitHub labels, issue comments, or untyped persisted data.
+Park-release SHALL accept bound merge-result proof only as a runtime-validated `VerifiedMergeProof` object that names this issue number, this PR number, the configured base branch, the merge-result OID, and the managed worktree HEAD observed at merge/proof time together. The engine SHALL create that object only after the in-base verifier has proven the OID is contained in `origin/<base>`. Park-release SHALL NOT reconstruct proof from run logs, GitHub labels, issue comments, or untyped persisted data.
 
 #### Scenario: Proof is not reconstructed from logs or labels
 
@@ -92,7 +107,7 @@ Park-release SHALL accept bound merge-result proof only as a runtime-validated `
 
 ### Requirement: Bound merge-result proof SHALL match issue, PR, base, and OID
 
-Park-release SHALL treat merge-result proof as bound only when it names this issue number, this PR number, this configured base branch, and this verified merge-result OID together. Proof for a different issue, a different PR, a different base branch, or a different OID SHALL NOT authorize release of this worktree.
+Park-release SHALL treat merge-result proof as bound only when it names this issue number, this PR number, this configured base branch, and this verified merge-result OID together, and the current managed worktree HEAD equals the HEAD stored on that proof. Proof for a different issue, a different PR, a different base branch, a different OID, or a different worktree HEAD SHALL NOT authorize release of this worktree.
 
 #### Scenario: Proof for another issue does not release this worktree
 
@@ -106,6 +121,12 @@ Park-release SHALL treat merge-result proof as bound only when it names this iss
 - **WHEN** park-release runs for issue N and PR P on configured base `develop`
 - **AND** the only available proof is a `merge_result_oid` proven on a different base, or a different OID than the one proven contained in `origin/develop` for N and P
 - **THEN** park-release SHALL NOT remove the worktree on that unmatched proof
+
+#### Scenario: Proof for another worktree HEAD does not release this worktree
+
+- **WHEN** park-release runs for issue N and PR P with bound proof whose `worktreeHead` is SHA H
+- **AND** the managed worktree HEAD is a different SHA
+- **THEN** park-release SHALL NOT remove the worktree on that unmatched HEAD
 
 ### Requirement: Filesystem cleanup failure after proven merge SHALL keep the worktree and the pipeline state
 

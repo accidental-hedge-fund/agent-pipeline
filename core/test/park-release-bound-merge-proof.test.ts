@@ -24,6 +24,8 @@ const ISSUE = 42;
 const PR = 7;
 const OID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const OTHER_OID = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const HEAD_SHA = "cccccccccccccccccccccccccccccccccccccccc";
+const POST_MERGE_HEAD = "dddddddddddddddddddddddddddddddddddddddd";
 const AUTH_ERR = "commit verification failed (git/network/auth error)";
 const CONNECTIVITY = "check connectivity";
 
@@ -50,16 +52,24 @@ function makeRec(issueNumber = ISSUE, slug = "feat"): WorktreeRecord {
   };
 }
 
-function proof(over: Partial<{ issue: number; pr: number; base: string; mergeResultOid: string }> = {}): VerifiedMergeProof {
+function proof(
+  over: Partial<{ issue: number; pr: number; base: string; mergeResultOid: string; worktreeHead: string }> = {},
+): VerifiedMergeProof {
   return createVerifiedMergeProof({
     issue: over.issue ?? ISSUE,
     pr: over.pr ?? PR,
     base: over.base ?? "main",
     mergeResultOid: over.mergeResultOid ?? OID,
+    worktreeHead: over.worktreeHead ?? HEAD_SHA,
   });
 }
 
-function squashGitCmd(opts: { logCode: number; logStdout?: string; lsCode?: number }): GitCmd {
+function squashGitCmd(opts: {
+  logCode: number;
+  logStdout?: string;
+  lsCode?: number;
+  headSha?: string;
+}): GitCmd {
   return async (_cfg, _cwd, args) => {
     if (args[0] === "ls-remote") {
       return { code: opts.lsCode ?? 0, stdout: "", stderr: opts.lsCode ? "auth" : "" };
@@ -70,6 +80,9 @@ function squashGitCmd(opts: { logCode: number; logStdout?: string; lsCode?: numb
         stdout: opts.logStdout ?? "",
         stderr: opts.logCode !== 0 ? "fatal" : "",
       };
+    }
+    if (args[0] === "rev-parse" && args[1] === "HEAD") {
+      return { code: 0, stdout: `${opts.headSha ?? HEAD_SHA}\n`, stderr: "" };
     }
     return { code: 0, stdout: "", stderr: "" };
   };
@@ -83,6 +96,7 @@ function parkBase(over: Partial<ParkReleaseDeps> = {}): ParkReleaseDeps {
     pathExists: () => true,
     hasRemoteBranchTip: async () => false,
     resolveOpenPrHeadForBranch: async () => null,
+    resolveWorktreeHead: async () => HEAD_SHA,
     removeWorktree: async () => {},
     ...over,
   };
@@ -128,21 +142,27 @@ function denyAuth(text: string): void {
 // 1.7 createVerifiedMergeProof runtime validation
 // ---------------------------------------------------------------------------
 
-test("createVerifiedMergeProof: rejects non-positive issue/PR, empty base, non-40-char OID", () => {
-  assert.throws(() => createVerifiedMergeProof({ issue: 0, pr: PR, base: "main", mergeResultOid: OID }), /issue/);
-  assert.throws(() => createVerifiedMergeProof({ issue: -1, pr: PR, base: "main", mergeResultOid: OID }), /issue/);
-  assert.throws(() => createVerifiedMergeProof({ issue: ISSUE, pr: 0, base: "main", mergeResultOid: OID }), /pr/);
-  assert.throws(() => createVerifiedMergeProof({ issue: ISSUE, pr: PR, base: "", mergeResultOid: OID }), /base/);
-  assert.throws(() => createVerifiedMergeProof({ issue: ISSUE, pr: PR, base: "   ", mergeResultOid: OID }), /base/);
-  assert.throws(
-    () => createVerifiedMergeProof({ issue: ISSUE, pr: PR, base: "main", mergeResultOid: "abc" }),
-    /mergeResultOid/,
-  );
+test("createVerifiedMergeProof: rejects non-positive issue/PR, empty base, non-40-char OID/HEAD", () => {
+  const valid = { issue: ISSUE, pr: PR, base: "main", mergeResultOid: OID, worktreeHead: HEAD_SHA };
+  assert.throws(() => createVerifiedMergeProof({ ...valid, issue: 0 }), /issue/);
+  assert.throws(() => createVerifiedMergeProof({ ...valid, issue: -1 }), /issue/);
+  assert.throws(() => createVerifiedMergeProof({ ...valid, pr: 0 }), /pr/);
+  assert.throws(() => createVerifiedMergeProof({ ...valid, base: "" }), /base/);
+  assert.throws(() => createVerifiedMergeProof({ ...valid, base: "   " }), /base/);
+  assert.throws(() => createVerifiedMergeProof({ ...valid, mergeResultOid: "abc" }), /mergeResultOid/);
+  assert.throws(() => createVerifiedMergeProof({ ...valid, worktreeHead: "abc" }), /worktreeHead/);
+  assert.throws(() => createVerifiedMergeProof({ ...valid, worktreeHead: "" }), /worktreeHead/);
 });
 
 test("boundProofMatches: raw object or log/label string is not proof", () => {
   const expected = { issue: ISSUE, pr: PR, base: "main", mergeResultOid: OID };
-  assert.equal(boundProofMatches({ issue: ISSUE, pr: PR, base: "main", mergeResultOid: OID }, expected), false);
+  assert.equal(
+    boundProofMatches(
+      { issue: ISSUE, pr: PR, base: "main", mergeResultOid: OID, worktreeHead: HEAD_SHA },
+      expected,
+    ),
+    false,
+  );
   assert.equal(boundProofMatches(`train_merge_proven ${OID}`, expected), false);
   assert.equal(boundProofMatches("pipeline:ready-to-deploy", expected), false);
   assert.equal(boundProofMatches(proof(), expected), true);
@@ -150,28 +170,24 @@ test("boundProofMatches: raw object or log/label string is not proof", () => {
 
 test("proveMergeResultInBase: mints proof only after isAncestor succeeds", async () => {
   let ancestorCalls = 0;
-  const minted = await proveMergeResultInBase(
-    { issue: ISSUE, pr: PR, base: "main", mergeResultOid: OID },
-    {
-      fetchBase: async () => {},
-      baseTip: async () => "d".repeat(40),
-      isAncestor: async () => {
-        ancestorCalls += 1;
-        return true;
-      },
+  const input = { issue: ISSUE, pr: PR, base: "main", mergeResultOid: OID, worktreeHead: HEAD_SHA };
+  const minted = await proveMergeResultInBase(input, {
+    fetchBase: async () => {},
+    baseTip: async () => "d".repeat(40),
+    isAncestor: async () => {
+      ancestorCalls += 1;
+      return true;
     },
-  );
+  });
   assert.equal(ancestorCalls, 1);
   assert.ok(minted);
   assert.equal(minted!.mergeResultOid, OID);
-  const missed = await proveMergeResultInBase(
-    { issue: ISSUE, pr: PR, base: "main", mergeResultOid: OID },
-    {
-      fetchBase: async () => {},
-      baseTip: async () => "d".repeat(40),
-      isAncestor: async () => false,
-    },
-  );
+  assert.equal(minted!.worktreeHead, HEAD_SHA);
+  const missed = await proveMergeResultInBase(input, {
+    fetchBase: async () => {},
+    baseTip: async () => "d".repeat(40),
+    isAncestor: async () => false,
+  });
   assert.equal(missed, null);
 });
 
@@ -255,12 +271,94 @@ test("removeManagedWorktreeSafely: bound proof + clean + unverifiable → remove
     verifiedMergeProof: proof(),
     prNumber: PR,
     expectedMergeResultOid: OID,
+    resolveWorktreeHead: async () => HEAD_SHA,
     removeWorktree: async () => {
       removed = true;
     },
   } satisfies SafeRemoveDeps);
   assert.equal(result.removed, true);
   assert.equal(removed, true);
+});
+
+test("park-release: bound proof skips remote-tip and open-PR probes (finding 96347051)", async () => {
+  let removed = false;
+  let remoteCalls = 0;
+  let prCalls = 0;
+  const result = await releaseWorktreeForParkedIssue(
+    makeCfg(),
+    ISSUE,
+    boundPark({
+      hasLocalOnlyCommits: async () => "unverifiable",
+      hasRemoteBranchTip: async () => {
+        remoteCalls += 1;
+        throw new Error("git/network/auth error");
+      },
+      resolveOpenPrHeadForBranch: async () => {
+        prCalls += 1;
+        throw new Error("auth failed");
+      },
+      removeWorktree: async () => {
+        removed = true;
+      },
+    }),
+  );
+  assert.equal(result.action, "released");
+  assert.equal(removed, true);
+  assert.equal(remoteCalls, 0, "bound proof must not call hasRemoteBranchTip");
+  assert.equal(prCalls, 0, "bound proof must not call resolveOpenPrHeadForBranch");
+  denyAuth(result.reason);
+});
+
+test("park-release: post-merge local commit on deleted branch is retained (finding 5142e8d3)", async () => {
+  let removed = false;
+  let remoteCalls = 0;
+  const rec = makeRec();
+  const result = await releaseWorktreeForParkedIssue(
+    makeCfg(),
+    ISSUE,
+    boundPark({
+      listOnDisk: async () => [rec],
+      gitCmd: squashGitCmd({
+        logCode: 0,
+        logStdout: "eeeeeeee post-merge local commit\n",
+        headSha: POST_MERGE_HEAD,
+      }),
+      resolveWorktreeHead: undefined,
+      hasRemoteBranchTip: async () => {
+        remoteCalls += 1;
+        return false;
+      },
+      removeWorktree: async () => {
+        removed = true;
+      },
+    }),
+  );
+  assert.equal(result.action, "retained");
+  assert.equal(removed, false);
+  assert.equal(remoteCalls, 0, "HEAD mismatch must retain before remote probes");
+  assert.match(result.reason, /HEAD does not match merge-time head|later local work/i);
+  denyAuth(result.reason);
+});
+
+test("removeManagedWorktreeSafely: post-merge HEAD mismatch retains later local work", async () => {
+  let removed = false;
+  const rec = makeRec();
+  const result = await removeManagedWorktreeSafely(makeCfg(), ISSUE, "feat", rec.path, {
+    hasDirtyWorkdir: async () => false,
+    hasLocalOnlyCommits: async () => "unverifiable",
+    pathExists: () => true,
+    verifiedMergeProof: proof(),
+    prNumber: PR,
+    expectedMergeResultOid: OID,
+    resolveWorktreeHead: async () => POST_MERGE_HEAD,
+    removeWorktree: async () => {
+      removed = true;
+    },
+  });
+  assert.equal(result.removed, false);
+  assert.equal(removed, false);
+  assert.match(result.reason ?? "", /HEAD does not match merge-time head|later local work/i);
+  denyAuth(result.reason ?? "");
 });
 
 // ---------------------------------------------------------------------------
@@ -347,6 +445,7 @@ test("removeManagedWorktreeSafely: bound proof + remove throws → retain with c
     verifiedMergeProof: proof(),
     prNumber: PR,
     expectedMergeResultOid: OID,
+    resolveWorktreeHead: async () => HEAD_SHA,
     removeWorktree: async () => {
       throw new Error("git worktree remove failed: directory busy");
     },
@@ -555,6 +654,7 @@ test("deploy_ready.finalize: cleanup failure does not drop ready-to-deploy or ca
         hasDirtyWorkdir: async () => false,
         hasLocalOnlyCommits: async () => "unverifiable",
         pathExists: () => true,
+        resolveWorktreeHead: async () => HEAD_SHA,
         removeWorktree: async () => {
           throw new Error("EACCES: permission denied");
         },
@@ -598,6 +698,7 @@ test("deploy_ready.finalize: dirty + proof retains dirty, not git/network/auth",
         hasDirtyWorkdir: async () => true,
         hasLocalOnlyCommits: async () => "unverifiable",
         pathExists: () => true,
+        resolveWorktreeHead: async () => HEAD_SHA,
         removeWorktree: async () => {
           throw new Error("must not remove dirty");
         },

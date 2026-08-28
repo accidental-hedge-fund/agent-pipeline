@@ -798,6 +798,7 @@ async function mintVerifiedMergeProofForPark(
           pr,
           base: cfg.base_branch ?? "main",
           mergeResultOid: detail.merge_commit_sha,
+          worktreeHead: detail.head_sha ?? "",
         },
         proveDeps,
       )) ?? undefined

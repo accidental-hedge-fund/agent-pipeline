@@ -265,6 +265,7 @@ export async function reconcileMergedPrIntegration(
       pr,
       base: baseBranch,
       mergeResultOid: obs.mergeCommitOid,
+      worktreeHead: obs.headRefOid ?? "",
     },
     {
       fetchBase: deps.fetchBase,
@@ -398,6 +399,7 @@ export async function mergeReadyToDeployItem(
       pr,
       base: baseBranch,
       mergeResultOid: obs.mergeCommitOid,
+      worktreeHead: obs.headRefOid ?? "",
     },
     {
       fetchBase: deps.fetchBase,
