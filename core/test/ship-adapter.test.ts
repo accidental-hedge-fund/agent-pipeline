@@ -818,6 +818,26 @@ test("observeFrg: release-eligible HMAC pass returns evidence; identity defects 
   );
 });
 
+test("observeFrg: missing latest.json fail-closes when base advances during the read (#1271)", async () => {
+  let reads = 0;
+  await assert.rejects(
+    () =>
+      observeFrgEvidence(
+        intent13914,
+        train13914,
+        true,
+        observeFrgDeps(memFs(), {
+          observeBase: async () => {
+            reads += 1;
+            return reads === 1 ? head : unrelatedOid;
+          },
+        }),
+      ),
+    /base advanced while FRG evidence was checked/,
+  );
+  assert.equal(reads, 2, "must re-read base after the ENOENT evidence observation");
+});
+
 test("ship coordinator: proven train + missing latest.json sets next_action frg_pack (#1271)", async () => {
   const store = memoryShipStore();
   const emptyFs = memFs();

@@ -2,7 +2,7 @@
 
 ### Requirement: Ship FRG observation SHALL return null when latest.json is not yet release-eligible
 
-Ship FRG observation SHALL return null when `.agent-pipeline/frg/<X.Y.Z>/latest.json` is absent, unreadable, or not release-eligible for the ship version. After train observation has proven the integrated candidate and no later ship phase has run, coordinator `next_action` SHALL be `frg_pack`. Observation SHALL NOT throw the tag-path fail-closed message that names `Cannot create or push tag`. Observation returning null SHALL NOT skip a later ensure-tag or publication phase. Candidate-identity defects during observation (base advanced after the recorded train, recorded train not contained in base, HMAC candidate SHA mismatch after a valid eligible read) SHALL still fail closed.
+Ship FRG observation SHALL return null when `.agent-pipeline/frg/<X.Y.Z>/latest.json` is absent, unreadable, or not release-eligible for the ship version. After train observation has proven the integrated candidate and no later ship phase has run, coordinator `next_action` SHALL be `frg_pack`. Observation SHALL NOT throw the tag-path fail-closed message that names `Cannot create or push tag`. Observation returning null SHALL NOT skip a later ensure-tag or publication phase. Candidate-identity defects during observation (base advanced after the recorded train, recorded train not contained in base, HMAC candidate SHA mismatch after a valid eligible read, or base advanced after the initial observe read while latest.json is missing, unreadable, or not release-eligible) SHALL still fail closed.
 
 #### Scenario: Missing latest.json is not observed, not a tag-path throw
 
@@ -34,6 +34,15 @@ Ship FRG observation SHALL return null when `.agent-pipeline/frg/<X.Y.Z>/latest.
 
 - **WHEN** ship FRG observation runs against a recorded train candidate
 - **AND** base has advanced past that candidate, the candidate is no longer contained in base, or a valid eligible `latest.json` has HMAC `candidate_git_sha` that is not that candidate
+- **THEN** observation SHALL fail closed
+- **AND** it SHALL NOT return null
+- **AND** it SHALL NOT start FRG pack on that drifted identity
+
+#### Scenario: Observe-null still fail-closes when base advances during the evidence read
+
+- **WHEN** ship FRG observation has proven the recorded train on the first base read
+- **AND** `.agent-pipeline/frg/<X.Y.Z>/latest.json` is absent, unreadable, or not release-eligible
+- **AND** a later base read after that evidence observation shows the base has advanced
 - **THEN** observation SHALL fail closed
 - **AND** it SHALL NOT return null
 - **AND** it SHALL NOT start FRG pack on that drifted identity

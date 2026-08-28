@@ -9,6 +9,7 @@
 - [x] 2.2 Same seam: unreadable and `pass: false` / not-release-eligible `latest.json` return `null`; a release-eligible HMAC pass returns evidence; verify identity defects (base advanced, train not contained, HMAC candidate mismatch after a valid eligible read) still throw and do not return `null`.
 - [x] 2.3 After proven train evidence and observe-null, verify coordinator `next_action` is `frg_pack` (not `train_merge` with `train: null`) and FRG pack / `factory-release prepare` is the next mutation; use injected coordinator deps in `core/test/ship-adapter.test.ts`.
 - [x] 2.4 Verify `waitForPublication` / `ensureAnnotatedReleaseTag` still fail closed when `latest.json` is absent; an earlier observe-null does not skip ensure-tag once a later tick has (or still lacks) a release-eligible artifact.
+- [x] 2.5 After the observe-null mapping, re-read `observeBase()` and fail closed if it advanced during the evidence read; verify an injected race (first base matches train, `latest.json` ENOENT, second base advanced) throws and does not return null.
 
 ## 3. Mirror and CI
 

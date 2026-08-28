@@ -785,7 +785,13 @@ export async function observeFrgEvidence(
     deps.frgFs,
     deps.frgValidateOpts,
   );
-  if (!evidence) return null;
+  if (!evidence) {
+    const afterMissing = await deps.observeBase();
+    if (afterMissing !== before) {
+      throw new Error("ship FRG: base advanced while FRG evidence was checked");
+    }
+    return null;
+  }
   let durableCandidate: string | null = null;
   if (isPostPilotReleaseVersion(intent.version) && !evidence.pack_provenance) {
     const indexPath = factoryReleaseVersionIndexPath(deps.repoDir, intent.version);
