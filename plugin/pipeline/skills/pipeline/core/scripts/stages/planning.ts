@@ -86,6 +86,11 @@ import {
   type OwnershipDeps,
 } from "../harness-mutation-ownership.ts";
 import {
+  executePublishUnpublishedStageCommit,
+  resolveTimeoutParkForUnpublishedCommit,
+  type InspectUnpublishedDeps,
+} from "../unpublished-stage-commit.ts";
+import {
   evaluatePostHarnessNoNewCommit,
   formatNoopAdvanceEvidenceNote,
   implementDeliverablePresentGoalCheck,
@@ -449,6 +454,24 @@ type RunPlanningPhasesDeps = BootstrapWorktreeDeps &
      */
     listChangeDirs?: (dir: string) => string[];
     getOnDiskForIssue?: typeof getOnDiskForIssue;
+    /** Mutation-ownership seams for the implement harness round (#1246 / #1272). */
+    ownershipDeps?: OwnershipDeps;
+    /** Optional PR lookup for the unpublished-commit timeout classifier (#1272). */
+    getPrForIssue?: typeof getPrForIssue;
+    inspectUnpublishedDeps?: InspectUnpublishedDeps;
+    /**
+     * Shared unpublished-commit publish executor. Tests inject fakes.
+     * Same-process timeout publication must use this so push/PR failures
+     * remap to retryable `harness-failure` (#1272 review-2).
+     */
+    executePublishUnpublishedStageCommit?: typeof executePublishUnpublishedStageCommit;
+    /**
+     * Implement-deliverable probe required by the publish executor (#1272).
+     */
+    probeImplementDeliverable?: (
+      wtPath: string,
+      issueNumber: number,
+    ) => Promise<{ present: boolean; description?: string }>;
   };
 
 interface PlanningLifecycle {
@@ -1083,6 +1106,7 @@ export async function runPlanningPhases(
       stage: "implementing",
       extraGlobs: cfg.test_gate?.non_product_dirty_globs ?? [],
       runDir: opts.runDir,
+      deps: deps.ownershipDeps,
     },
     invoke: () =>
       invokeImplementer(
@@ -1145,29 +1169,205 @@ export async function runPlanningPhases(
           ? `timed out after ${result.duration.toFixed(0)}s`
           : `exit ${result.exit_code}`;
 
-        // Salvage (#547): before blocking, attempt to recover uncommitted implement
-        // harness work — mirroring the fix stage's crash-retry salvage (#486). A
-        // successful salvage falls through to the normal downstream verification.
-        if (!ctx.salvaged) {
-          // #521: disclose why nothing was salvaged so the operator can see that
-          // recoverable work may still exist without reading terminal.log.
-          const salvageNote = ctx.salvageFailureReason
-            ? ` Salvage of uncommitted work also failed: ${ctx.salvageFailureReason}`
-            : "";
+        // #547 salvage / #1246 checkpoint / #1272 unpublished publish:
+        // a timeout that left recovered work must consult the shared
+        // classifier before setBlocked. Legacy `salvaged` is not required
+        // when ownership checkpoint already authored the commit.
+        const porcelainR = await doGitInWorktree(
+          wt.path,
+          ["status", "--porcelain", "--untracked-files=all"],
+          { ignoreFailure: true },
+        );
+        const logR = await doGitInWorktree(
+          wt.path,
+          ["log", "-1", "--format=%s%n%n%b"],
+          { ignoreFailure: true },
+        );
+        const logText = logR.code === 0 ? logR.stdout : "";
+        const nl = logText.indexOf("\n");
+        const tipSubject = (nl === -1 ? logText : logText.slice(0, nl)).trim();
+        const tipBody = nl === -1 ? "" : logText.slice(nl + 1);
+        let linkedOpenPr = true;
+        let prLookupFailed = false;
+        try {
+          if (deps.getPrForIssue) {
+            linkedOpenPr = (await deps.getPrForIssue(cfg, issueNumber)) != null;
+          } else {
+            const getPrBranch = deps.getPrForBranch ?? getPrForBranch;
+            linkedOpenPr = (await getPrBranch(cfg, wt.branch)) != null;
+          }
+        } catch {
+          prLookupFailed = true;
+          linkedOpenPr = true;
+        }
+        const aheadForPublish = await doHasCommitsAhead(wt.path, cfg.base_branch);
+        const timeoutPark = resolveTimeoutParkForUnpublishedCommit(
+          {
+            issueNumber,
+            headBranch: wt.branch,
+            porcelain: porcelainR.code === 0 ? porcelainR.stdout : "",
+            extraGlobs: cfg.test_gate?.non_product_dirty_globs ?? [],
+            commitsAheadOfBase: aheadForPublish,
+            linkedOpenPr,
+            prLookupFailed,
+            tipSubject,
+            tipBody,
+          },
+          ctx,
+        );
+        if (prLookupFailed) {
           await doSetBlocked(
             cfg,
             issueNumber,
-            `Implementation harness (${primary}) failed: ${reason}.${salvageNote}`,
+            `Implementation harness (${primary}) failed: ${reason}. PR linkage is indeterminate; publication refused.`,
             "implementing",
             "harness-failure",
           );
           await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
-          return blockedOutcome(reason, "harness-failure");
+          return blockedOutcome("PR linkage is indeterminate", "harness-failure");
         }
-        console.log(
-          `[pipeline] #${issueNumber}: implementation harness (${primary}) failed (${reason}) but left ` +
-            `salvageable work — salvaged into a commit, proceeding to normal verification`,
-        );
+        if (timeoutPark.action === "publish") {
+          const activeChanges = doListChangeDirs(wt.path);
+          if (activeChanges.length === 0) {
+            console.log(
+              `[pipeline] #${issueNumber}: implementation harness (${primary}) failed (${reason}) ` +
+                `but left a publishable unpublished commit with unsatisfied deliverable — re-invoking implementer`,
+            );
+            if (opts.resumeImplementing) {
+              await doSetBlocked(
+                cfg,
+                issueNumber,
+                `Implementation harness (${primary}) failed: ${reason}. Checkpoint/salvage commit present but implement deliverable is unsatisfied.`,
+                "implementing",
+                "no-commits",
+              );
+              await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
+              return blockedOutcome("implement deliverable unsatisfied after timeout checkpoint", "no-commits");
+            }
+            return runPlanningPhases(
+              cfg,
+              issueNumber,
+              title,
+              body,
+              pipelineRunId,
+              { ...opts, resumeImplementing: true },
+              hooks,
+              deps,
+            );
+          }
+          console.log(
+            `[pipeline] #${issueNumber}: implementation harness (${primary}) failed (${reason}) but left ` +
+              `a publishable unpublished ${timeoutPark.classification.publishable ? timeoutPark.classification.tipKind : "stage"} commit — publishing via publish_unpublished_stage_commit`,
+          );
+          const executeFn =
+            deps.executePublishUnpublishedStageCommit ?? executePublishUnpublishedStageCommit;
+          const slugFromBranch = wt.branch.startsWith(`pipeline/${issueNumber}-`)
+            ? wt.branch.slice(`pipeline/${issueNumber}-`.length)
+            : wt.branch;
+          const published = await executeFn(cfg, issueNumber, {
+            pipelineRunId,
+            getIssueDetail: deps.getIssueDetail,
+            createPr: deps.createPr,
+            transition: doTransition,
+            setBlocked: doSetBlocked,
+            inspectDeps: {
+              getOnDiskForIssue:
+                deps.getOnDiskForIssue ??
+                (async () => ({ path: wt.path, slug: slugFromBranch })),
+              gitInWorktree: doGitInWorktree,
+              hasCommitsAhead: doHasCommitsAhead,
+              getPrForIssue:
+                deps.getPrForIssue ??
+                (async () => (deps.getPrForBranch ?? getPrForBranch)(cfg, wt.branch)),
+              getPrForBranch: deps.getPrForBranch,
+              extraGlobs: cfg.test_gate?.non_product_dirty_globs ?? [],
+              ...deps.inspectUnpublishedDeps,
+            },
+            resumeDeps: {
+              ...deps,
+              gitInWorktree: doGitInWorktree,
+              setBlocked: doSetBlocked,
+              transition: doTransition,
+            },
+            probeImplementDeliverable:
+              deps.probeImplementDeliverable ??
+              (async (wtPath) => {
+                const ids = doListChangeDirs(wtPath);
+                return ids.length > 0
+                  ? {
+                      present: true,
+                      description: `OpenSpec change(s) already present at HEAD: ${ids.join(", ")}`,
+                    }
+                  : { present: false };
+              }),
+          });
+          if (published.succeeded) {
+            await completePlanningLifecycle(
+              cfg,
+              issueNumber,
+              activeLifecycle,
+              opts,
+              deps,
+              "advanced",
+              wt.path,
+            );
+            return (
+              published.outcome ?? {
+                advanced: true,
+                from: "implementing",
+                to: "design-gate",
+                summary: published.evidence,
+              }
+            );
+          }
+          if (!published.outcome) {
+            await doSetBlocked(
+              cfg,
+              issueNumber,
+              published.error ?? published.evidence,
+              "implementing",
+              "harness-failure",
+            );
+          }
+          await completePlanningLifecycle(
+            cfg,
+            issueNumber,
+            activeLifecycle,
+            opts,
+            deps,
+            "blocked",
+            wt.path,
+          );
+          return (
+            published.outcome ??
+            blockedOutcome(published.error ?? published.evidence, "harness-failure")
+          );
+        } else {
+          // Salvage (#547): before blocking, attempt to recover uncommitted implement
+          // harness work — mirroring the fix stage's crash-retry salvage (#486). A
+          // successful salvage that is not publishable still falls through when
+          // `ctx.salvaged` (legacy) is true so existing verification can run.
+          if (!ctx.salvaged) {
+            // #521: disclose why nothing was salvaged so the operator can see that
+            // recoverable work may still exist without reading terminal.log.
+            const salvageNote = ctx.salvageFailureReason
+              ? ` Salvage of uncommitted work also failed: ${ctx.salvageFailureReason}`
+              : "";
+            await doSetBlocked(
+              cfg,
+              issueNumber,
+              `Implementation harness (${primary}) failed: ${reason}.${salvageNote}`,
+              "implementing",
+              "harness-failure",
+            );
+            await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
+            return blockedOutcome(reason, "harness-failure");
+          }
+          console.log(
+            `[pipeline] #${issueNumber}: implementation harness (${primary}) failed (${reason}) but left ` +
+              `salvageable work — salvaged into a commit, proceeding to normal verification`,
+          );
+        }
       }
 
       console.log(

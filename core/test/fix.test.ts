@@ -2283,7 +2283,7 @@ test("advanceFix source pin: on retry exhaustion, salvage is attempted before th
   const roundIdx = src.indexOf("runHarnessRound");
   const retryIdx = src.indexOf("const retryResult = await invokeFixHarnessWithRetry(");
   const salvageModeIdx = src.indexOf("shouldAttemptSalvage:", roundIdx);
-  const crashFailIdx = src.indexOf("if (!result.success && !ctx.salvaged)", retryIdx);
+  const crashFailIdx = src.indexOf("if (!result.success && !ctx.salvaged && !ctx.ownershipCheckpointed)", retryIdx);
   const blockIdx = src.indexOf('await setBlocked(cfg, issueNumber, reason, stage, "harness-failure");', retryIdx);
   assert.ok(roundIdx !== -1, "fix-round must use shared runHarnessRound (#629)");
   assert.ok(retryIdx !== -1 && salvageModeIdx !== -1 && crashFailIdx !== -1 && blockIdx !== -1);
@@ -2293,9 +2293,9 @@ test("advanceFix source pin: on retry exhaustion, salvage is attempted before th
 
 test("advanceFix source pin: a crash-retry salvage falls through the SAME downstream gates as a harness commit, skipping the #131 no-commit branch (#486/#629)", async () => {
   const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
-  const crashSalvagedSetIdx = src.indexOf("crashSalvaged: !result.success && ctx.salvaged");
+  const crashSalvagedSetIdx = src.indexOf("crashSalvaged: !result.success && (ctx.salvaged || ctx.ownershipCheckpointed)");
   const skipGuardIdx = src.indexOf(
-    "if (!crashSalvaged && headBefore && headAfter && headBefore === headAfter && !roundResult.ctx.salvaged)",
+    "if (!crashSalvaged && headBefore && headAfter && headBefore === headAfter && !roundResult.ctx.salvaged && !roundResult.ctx.ownershipCheckpointed)",
   );
   const commitGateIdx = src.indexOf("Verify fix-round commit message format (#68)", skipGuardIdx);
   assert.ok(crashSalvagedSetIdx !== -1, "expected crashSalvaged to be set on a successful crash-retry salvage");

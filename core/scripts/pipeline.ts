@@ -97,6 +97,11 @@ import {
   emitOwnershipEvidence,
   type OwnershipDeps,
 } from "./harness-mutation-ownership.ts";
+import {
+  executePublishUnpublishedStageCommit,
+  PUBLISH_UNPUBLISHED_STAGE_COMMIT,
+  type PublishUnpublishedExecutorDeps,
+} from "./unpublished-stage-commit.ts";
 import { resolveEngineCommitSha } from "./engine-attribution.ts";
 import { formatPipelineVersionJson } from "./ship-end-identity.ts";
 import {
@@ -1842,6 +1847,8 @@ export interface RealExecuteRecoveryDeps {
   ) => Promise<{ skipped: boolean; passed?: boolean }>;
   postComment?: typeof postComment;
   ownership?: OwnershipDeps;
+  /** #1272: inspect/execute unpublished stage-commit publish. */
+  publishUnpublished?: PublishUnpublishedExecutorDeps;
 }
 
 /** Production provider-neutral recovery registry. Substantive repair delegates
@@ -2504,6 +2511,37 @@ export function realExecuteRecovery(
         return unlinkEngineScratch(input);
       case "checkpoint_owned_harness_dirt":
         return checkpointOwnedHarnessDirtRecipe(input);
+      case "publish_unpublished_stage_commit": {
+        const issueNumber = Number(input.itemId);
+        if (!Number.isSafeInteger(issueNumber) || issueNumber <= 0) {
+          return failed(`${PUBLISH_UNPUBLISHED_STAGE_COMMIT} requires a positive numeric item id`);
+        }
+        if (input.blockerClass === "specification-decision" || input.blockerClass === "missing-authority") {
+          return failed(
+            `${PUBLISH_UNPUBLISHED_STAGE_COMMIT} does not apply to human-authority class ${input.blockerClass}`,
+          );
+        }
+        const published = await executePublishUnpublishedStageCommit(cfg, issueNumber, {
+          ...(deps.publishUnpublished ?? {}),
+          inspectDeps: {
+            ...(deps.publishUnpublished?.inspectDeps ?? {}),
+            getOnDiskForIssue: deps.getOnDiskForIssue ?? getOnDiskForIssue,
+            gitInWorktree: gitInWt,
+            extraGlobs: cfg.test_gate?.non_product_dirty_globs ?? [],
+          },
+          getIssueDetail: getDetail,
+          clearBlocked: clear,
+          probeImplementDeliverable:
+            deps.publishUnpublished?.probeImplementDeliverable ?? probeImplementDeliverable,
+        });
+        if (!published.succeeded) {
+          return failed(published.error ?? published.evidence);
+        }
+        return {
+          succeeded: true,
+          evidence: published.evidence,
+        };
+      }
       case "wait_and_retry":
       case "rerun_ci":
       case "resync_workflow_state":

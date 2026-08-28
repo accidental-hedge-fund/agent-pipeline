@@ -255,6 +255,21 @@ export const PORCELAIN_DIRT_SITES: readonly PorcelainDirtSiteEntry[] = [
     disposition: "not-porcelain-dirt-gate",
     notes: "Worktree list porcelain + dirty remove refuse; not item engine-scratch dirt gate",
   },
+  {
+    site_id: "unpublished-stage-commit",
+    module: "scripts/unpublished-stage-commit.ts",
+    disposition: "uses-shared-classifier",
+    classifier: "productDirtyPaths",
+    notes:
+      "Publishable-unpublished classifier refuses unknown product dirt via productDirtyPaths; engine scratch remains publishable (#1272)",
+  },
+  {
+    site_id: "stages.fix",
+    module: "scripts/stages/fix.ts",
+    disposition: "not-porcelain-dirt-gate",
+    notes:
+      "Fix afterRound reads porcelain for unpublished-commit timeout consult (#1272); not a product-vs-scratch setBlocked dirt gate",
+  },
 ];
 
 const SITE_BY_MODULE: ReadonlyMap<string, PorcelainDirtSiteEntry> = new Map(

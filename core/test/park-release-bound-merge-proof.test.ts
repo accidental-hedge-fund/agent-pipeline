@@ -97,6 +97,7 @@ function parkBase(over: Partial<ParkReleaseDeps> = {}): ParkReleaseDeps {
     pathExists: () => true,
     hasRemoteBranchTip: async () => false,
     resolveOpenPrHeadForBranch: async () => null,
+    hasLinkedMergedPr: async () => false,
     resolveWorktreeHead: async () => HEAD_SHA,
     removeWorktree: async () => {},
     ...over,
@@ -237,7 +238,9 @@ test("proveMergeResultInBase: failed fetch does not mint proof from stale origin
   );
   assert.equal(result?.action, "retained");
   assert.equal(removed, false);
-  assert.match(result?.reason ?? "", /not reachable from base/i);
+  // #1272: unverifiable without bound proof and without a linked merged PR
+  // classifies as local-only, not squash-merge unreachability.
+  assert.match(result?.reason ?? "", /local-only|not reachable from base|unverifiable/i);
   denyAuth(result?.reason ?? "");
 });
 
@@ -415,7 +418,7 @@ test("removeManagedWorktreeSafely: post-merge HEAD mismatch retains later local 
 // 1.2 no proof: retain with squash-merge / not-reachable wording, not git/network/auth
 // ---------------------------------------------------------------------------
 
-test("park-release: no proof + classifier unverifiable → retain not-reachable, not git/network/auth", async () => {
+test("park-release: no proof + classifier unverifiable → retain local-only, not squash-merge force wording", async () => {
   let removed = false;
   const rec = makeRec();
   const result = await releaseWorktreeForParkedIssue(
@@ -432,18 +435,21 @@ test("park-release: no proof + classifier unverifiable → retain not-reachable,
   );
   assert.equal(result.action, "retained");
   assert.equal(removed, false);
-  assert.match(result.reason, /not reachable from base/i);
+  assert.match(result.reason, /local-only/i);
+  assert.doesNotMatch(result.reason, /cannot verify all commits are merged/);
+  assert.doesNotMatch(result.reason, /use --force to proceed if work was squash-merged/);
   denyAuth(result.reason);
 });
 
-test("park-release: no proof + injected unverifiable → retain squash-merge wording", async () => {
+test("park-release: no proof + injected unverifiable → retain local-only, not squash-merge wording", async () => {
   const result = await releaseWorktreeForParkedIssue(
     makeCfg(),
     ISSUE,
     parkBase({ hasLocalOnlyCommits: async () => "unverifiable" }),
   );
   assert.equal(result.action, "retained");
-  assert.match(result.reason, /not reachable from base|--force/i);
+  assert.match(result.reason, /local-only/i);
+  assert.doesNotMatch(result.reason, /cannot verify all commits are merged/);
   denyAuth(result.reason);
 });
 

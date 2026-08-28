@@ -57,6 +57,15 @@ import {
 import { getOnDiskForIssue, gitInWorktree } from "./worktree.ts";
 import { classifyPorcelainForScratchRecover } from "./worktree-dirt.ts";
 import {
+  blockerKindFromComments,
+  createDefaultImplementDeliverableProbe,
+  executePublishUnpublishedStageCommit,
+  inspectPublishableUnpublishedStageCommit,
+  isPostPrResidualReviewStage,
+  isPrePrEngineDefectPark,
+  PUBLISH_UNPUBLISHED_STAGE_COMMIT,
+} from "./unpublished-stage-commit.ts";
+import {
   extractTesterPersistAcquire,
   type TesterPersistAcquireCode,
   type TesterPersistAcquireRecord,
@@ -853,7 +862,7 @@ export function stageIdForPark(labels: readonly string[]): string {
 // ---------------------------------------------------------------------------
 
 export interface RecoverParkedOpts {
-  /** When true, classify only — no spend marker, override, fix, or re-enter. */
+  /** When true, classify only — no spend marker, override, fix, publish, or re-enter. */
   dryRun?: boolean;
   /** Skip re-entry after successful clear (tests). */
   skipReentry?: boolean;
@@ -916,6 +925,15 @@ export interface RecoverParkedDeps {
     detail: IssueDetail,
   ) => Promise<DeterministicRecoverResult>;
   /**
+   * #1272: publish a pipeline-authored unpublished stage commit. Runs in
+   * deterministic recover **before** requiring a linked open PR.
+   */
+  tryPublishUnpublishedStageCommit?: (
+    cfg: PipelineConfig,
+    issue: number,
+    detail: IssueDetail,
+  ) => Promise<DeterministicRecoverResult>;
+  /**
    * Record one audited key override without re-entering advance.
    * Default uses overrideComment + governance (same ledger as runOverride).
    */
@@ -950,6 +968,8 @@ export interface RecoverParkedDeps {
   staleBlockedDeps?: StaleBlockedResumeDeps;
   /** Injectable seams for default scratch unlink (tests). */
   scratchUnlinkDeps?: DefaultScratchUnlinkDeps;
+  /** Injectable seams for default unpublished-commit publish (tests). */
+  publishUnpublishedDeps?: PublishUnpublishedRecoverDeps;
 }
 
 /** Injectable seams for the production engine-scratch unlink default. */
@@ -1080,6 +1100,75 @@ export async function defaultTryUnlinkEngineScratch(
     kind: "keep",
     reason: `unlinked engine scratch [${unlinked.join(", ")}] but park labels remain`,
   };
+}
+
+/**
+ * Production default for unpublished-commit publish (#1272).
+ * Claims `publish_unpublished_stage_commit` when the classifier matches.
+ */
+export async function defaultTryPublishUnpublishedStageCommit(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  _detail: IssueDetail,
+  publishDeps: PublishUnpublishedRecoverDeps = {},
+): Promise<DeterministicRecoverResult> {
+  const inspectFn = publishDeps.inspect ?? inspectPublishableUnpublishedStageCommit;
+  const executeFn = publishDeps.execute ?? executePublishUnpublishedStageCommit;
+  let inspected;
+  try {
+    inspected = await inspectFn(cfg, issueNumber, publishDeps.inspectDeps ?? {});
+  } catch (err) {
+    return {
+      kind: "no-op",
+      reason: `publish unpublished inspect failed: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+  if (inspected.facts?.prLookupFailed) {
+    return {
+      kind: "keep",
+      reason: "publish unpublished: PR linkage is indeterminate — retain park",
+    };
+  }
+  if (!inspected.classification.publishable) {
+    return {
+      kind: "no-op",
+      reason: `publish unpublished: ${inspected.classification.reason}`,
+    };
+  }
+  const executeDeps = publishDeps.executeDeps ?? {};
+  try {
+    const published = await executeFn(cfg, issueNumber, {
+      ...executeDeps,
+      probeImplementDeliverable:
+        executeDeps.probeImplementDeliverable ??
+        createDefaultImplementDeliverableProbe(
+          cfg,
+          publishDeps.inspectDeps?.gitInWorktree ?? gitInWorktree,
+        ),
+    });
+    if (published.succeeded) {
+      return {
+        kind: "cleared",
+        reason: published.evidence,
+      };
+    }
+    return {
+      kind: "keep",
+      reason: published.error ?? published.evidence,
+    };
+  } catch (err) {
+    return {
+      kind: "keep",
+      reason: `publish unpublished failed: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+}
+
+export interface PublishUnpublishedRecoverDeps {
+  inspect?: typeof inspectPublishableUnpublishedStageCommit;
+  execute?: typeof executePublishUnpublishedStageCommit;
+  inspectDeps?: Parameters<typeof inspectPublishableUnpublishedStageCommit>[2];
+  executeDeps?: Parameters<typeof executePublishUnpublishedStageCommit>[2];
 }
 
 /**
@@ -1273,6 +1362,9 @@ async function runRecoverParkedLocked(
   const unlinkScratch =
     deps.tryUnlinkEngineScratch ??
     ((c, n, d) => defaultTryUnlinkEngineScratch(c, n, d, deps.scratchUnlinkDeps));
+  const publishUnpublished =
+    deps.tryPublishUnpublishedStageCommit ??
+    ((c, n, d) => defaultTryPublishUnpublishedStageCommit(c, n, d, deps.publishUnpublishedDeps));
   const recordOverride =
     deps.recordKeyOverride ?? defaultRecordKeyOverrideFactory(deps);
   const wrap = (
@@ -1302,35 +1394,7 @@ async function runRecoverParkedLocked(
     });
   }
 
-  // ---- Live PR HEAD (fail closed if unreadable) ----
-  let prNumber: number | null;
-  let headSha: string;
-  try {
-    prNumber = await getPr(cfg, issueNumber);
-    if (prNumber == null) {
-      return wrap({
-        status: "fail-closed",
-        issue: issueNumber,
-        message: "no linked open PR; keep park",
-      });
-    }
-    headSha = (await getDetailPr(cfg, prNumber)).head_sha;
-    if (!headSha || typeof headSha !== "string") {
-      return wrap({
-        status: "fail-closed",
-        issue: issueNumber,
-        message: "PR HEAD unreadable; keep park",
-      });
-    }
-  } catch (err) {
-    return wrap({
-      status: "fail-closed",
-      issue: issueNumber,
-      message: `cannot read PR/HEAD: ${err instanceof Error ? err.message : String(err)}`,
-    });
-  }
-
-  // ---- Deterministic recover first (no senior budget) ----
+  // ---- Deterministic recover first (no senior budget, no PR required) ----
   const scratch = await unlinkScratch(cfg, issueNumber, detail);
   if (scratch.kind === "cleared") {
     const after = await getDetail(cfg, issueNumber).catch(() => detail);
@@ -1378,9 +1442,144 @@ async function runRecoverParkedLocked(
     }
   }
 
+  let published: DeterministicRecoverResult;
+  if (opts.dryRun) {
+    const inspectFn =
+      deps.publishUnpublishedDeps?.inspect ?? inspectPublishableUnpublishedStageCommit;
+    try {
+      const inspected = await inspectFn(
+        cfg,
+        issueNumber,
+        deps.publishUnpublishedDeps?.inspectDeps ?? {},
+      );
+      if (inspected.facts?.prLookupFailed) {
+        published = {
+          kind: "keep",
+          reason:
+            "dry-run: PR linkage is indeterminate — would retain park; no mutations",
+        };
+      } else if (inspected.classification.publishable) {
+        published = {
+          kind: "keep",
+          reason: `dry-run: would publish unpublished stage commit (${inspected.classification.tipKind}); no mutations`,
+        };
+      } else {
+        published = {
+          kind: "no-op",
+          reason: `dry-run: publish unpublished not applicable (${inspected.classification.reason})`,
+        };
+      }
+    } catch (err) {
+      published = {
+        kind: "no-op",
+        reason: `dry-run: publish unpublished inspect failed: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+  } else {
+    try {
+      published = await publishUnpublished(cfg, issueNumber, detail);
+    } catch (err) {
+      published = {
+        kind: "keep",
+        reason: `publish unpublished threw: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+  }
+  if (published.kind === "cleared") {
+    log(
+      `[recover-parked] #${issueNumber}: deterministic-cleared (${PUBLISH_UNPUBLISHED_STAGE_COMMIT}) — ${published.reason}`,
+    );
+    const wantReenter = !opts.skipReentry && !opts.dryRun && !!deps.reenterAdvance;
+    return wrap(
+      {
+        status: "deterministic-cleared",
+        issue: issueNumber,
+        message: `deterministic publish unpublished: ${published.reason}`,
+        reentered: false,
+      },
+      wantReenter,
+    );
+  }
+  if (published.kind === "keep" || published.kind === "failed") {
+    log(
+      `[recover-parked] #${issueNumber}: keep park after publish recover — ${published.reason}`,
+    );
+    return wrap({
+      status: "still-parked",
+      issue: issueNumber,
+      message: published.reason,
+    });
+  }
+
+  // ---- Live PR HEAD (after deterministic recover). Missing PR is fail-closed
+  // only for residual-review senior reflow. Pre-PR engine parks re-enter. ----
+  let prNumber: number | null = null;
+  let headSha = "";
+  try {
+    prNumber = await getPr(cfg, issueNumber);
+    if (prNumber != null) {
+      headSha = (await getDetailPr(cfg, prNumber)).head_sha;
+    }
+  } catch (err) {
+    prNumber = null;
+    headSha = "";
+    const stageNow = pickStage(detail.labels);
+    if (isPostPrResidualReviewStage(stageNow)) {
+      return wrap({
+        status: "fail-closed",
+        issue: issueNumber,
+        message: `cannot read PR/HEAD: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    }
+  }
+
+  if (prNumber == null || !headSha) {
+    const stageNow = pickStage(detail.labels);
+    const needsHuman = detail.labels.includes(`${LABEL_PREFIX}needs-human`);
+    const kind = blockerKindFromComments(detail.comments);
+    if (isPrePrEngineDefectPark({ stage: stageNow, blockerKind: kind, needsHumanLabel: needsHuman })) {
+      if (!opts.dryRun) {
+        try {
+          await clear(cfg, issueNumber);
+        } catch (err) {
+          return wrap({
+            status: "fail-closed",
+            issue: issueNumber,
+            message: `pre-PR re-entry could not clear blocked: ${err instanceof Error ? err.message : String(err)}`,
+          });
+        }
+      }
+      log(
+        `[recover-parked] #${issueNumber}: pre-PR engine park without linked PR — re-entering advance`,
+      );
+      const wantReenter = !opts.skipReentry && !opts.dryRun && !!deps.reenterAdvance;
+      return wrap(
+        {
+          status: "recovered",
+          issue: issueNumber,
+          message: "pre-PR engine-defect park: skipped residual-review reflow; re-enter advance",
+          reentered: false,
+        },
+        wantReenter,
+      );
+    }
+    return wrap({
+      status: "fail-closed",
+      issue: issueNumber,
+      message: "no linked open PR; keep park",
+    });
+  }
+
   // ---- Senior path: residual classification at live HEAD ----
   try {
     headSha = (await getDetailPr(cfg, prNumber)).head_sha;
+    if (!headSha || typeof headSha !== "string") {
+      return wrap({
+        status: "fail-closed",
+        issue: issueNumber,
+        message: "PR HEAD unreadable; keep park",
+      });
+    }
   } catch (err) {
     return wrap({
       status: "fail-closed",

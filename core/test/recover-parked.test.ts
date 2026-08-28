@@ -201,6 +201,8 @@ function makeHarness(state: {
       log: () => {},
       tryUnlinkEngineScratch: async () =>
         ({ kind: "no-op", reason: "no scratch" }) as const,
+      tryPublishUnpublishedStageCommit: async () =>
+        ({ kind: "no-op", reason: "not publishable" }) as const,
       tryResumeStaleBlocked: async () =>
         ({ kind: "no-op", reason: "not eligible" }) as const,
       runOneImplementerFixRound: undefined as

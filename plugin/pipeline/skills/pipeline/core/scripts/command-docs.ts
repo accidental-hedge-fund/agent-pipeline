@@ -69,7 +69,7 @@ export const COMMAND_DOCS: Record<string, CommandDoc> = {
   },
   "recover-parked": {
     summary:
-      "One supervisor pass for a parked issue: deterministic recover first, then reflow only stale/DNR/below-high residuals (never auto-override HIGH/CRITICAL/security); re-enter single if clear",
+      "One supervisor pass for a parked issue: deterministic recover first (including publish of an unpublished stage commit), then reflow only stale/DNR/below-high residuals (never auto-override HIGH/CRITICAL/security); pre-PR engine parks re-enter without a linked PR; re-enter single if clear",
     usage: "recover-parked <n> [--json] [--dry-run]",
     documented: true,
     section: "lifecycle",

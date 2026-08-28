@@ -69,7 +69,7 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 #### `recover-parked`
 
 - **Usage:** `pipeline recover-parked <n> [--json] [--dry-run]`
-- **Summary:** One supervisor pass for a parked issue: deterministic recover first, then reflow only stale/DNR/below-high residuals (never auto-override HIGH/CRITICAL/security); re-enter single if clear
+- **Summary:** One supervisor pass for a parked issue: deterministic recover first (including publish of an unpublished stage commit), then reflow only stale/DNR/below-high residuals (never auto-override HIGH/CRITICAL/security); pre-PR engine parks re-enter without a linked PR; re-enter single if clear
 
 #### `release`
 

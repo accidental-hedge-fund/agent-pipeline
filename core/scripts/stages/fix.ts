@@ -11,6 +11,7 @@ import {
   findLatestCommentMatching,
   getGhActor,
   getIssueDetail,
+  getPrForIssue,
   postComment,
   setBlocked,
   transition,
@@ -44,6 +45,11 @@ import {
   type EnsureManagedWorktreeResult,
 } from "../worktree.ts";
 import { buildFixPrompt } from "../prompts/index.ts";
+import {
+  createDefaultImplementDeliverableProbe,
+  executePublishUnpublishedStageCommit,
+  resolveTimeoutParkForUnpublishedCommit,
+} from "../unpublished-stage-commit.ts";
 import { runFormatGate, runFormatAndTestGates } from "./format-gate.ts";
 import {
   verifyHarnessCommits,
@@ -256,6 +262,22 @@ export interface AdvanceFixDeps {
    * without a real GitHub API call.
    */
   postComment?: typeof postComment;
+  /**
+   * Linked-open-PR lookup for the unpublished-commit timeout consult (#1272).
+   * Tests inject fakes so afterRound never hits the GitHub API.
+   */
+  getPrForIssue?: typeof getPrForIssue;
+  /**
+   * Shared unpublished-commit publish executor. Tests inject fakes.
+   */
+  executePublishUnpublishedStageCommit?: typeof executePublishUnpublishedStageCommit;
+  /**
+   * Implement-deliverable probe required by the publish executor (#1272).
+   */
+  probeImplementDeliverable?: (
+    wtPath: string,
+    issueNumber: number,
+  ) => Promise<{ present: boolean; description?: string }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -896,7 +918,76 @@ export async function advanceFix(
       const result = ctx.invokeResult.result;
       const retryResult = ctx.invokeResult.retryResult;
       // Crash salvage: retries exhausted; salvage of crashed attempts' work (#486).
-      if (!result.success && !ctx.salvaged) {
+      // #1272: consult the unpublished-commit classifier before timeout park so
+      // a pre-PR salvage/checkpoint commit claims publish_unpublished_stage_commit
+      // rather than an implementing-only afterRound branch.
+      const statusR = await gitInWorktree(
+        wt.path,
+        ["status", "--porcelain", "--untracked-files=all"],
+        { ignoreFailure: true },
+      );
+      const logR = await gitInWorktree(wt.path, ["log", "-1", "--format=%s%n%n%b"], { ignoreFailure: true });
+      const logText = logR.code === 0 ? logR.stdout : "";
+      const nl = logText.indexOf("\n");
+      let linkedOpenPr = true;
+      let prLookupFailed = false;
+      try {
+        const getPr = deps.getPrForIssue ?? getPrForIssue;
+        linkedOpenPr = (await getPr(cfg, issueNumber)) != null;
+      } catch {
+        prLookupFailed = true;
+        linkedOpenPr = true;
+      }
+      const timeoutPark = resolveTimeoutParkForUnpublishedCommit(
+        {
+          issueNumber,
+          headBranch: branchName(issueNumber, wt.slug),
+          porcelain: statusR.code === 0 ? statusR.stdout : "",
+          extraGlobs: cfg.test_gate?.non_product_dirty_globs ?? [],
+          commitsAheadOfBase: true,
+          linkedOpenPr,
+          prLookupFailed,
+          tipSubject: (nl === -1 ? logText : logText.slice(0, nl)).trim(),
+          tipBody: nl === -1 ? "" : logText.slice(nl + 1),
+        },
+        ctx,
+      );
+      if (timeoutPark.action === "publish") {
+        const executeFn =
+          deps.executePublishUnpublishedStageCommit ?? executePublishUnpublishedStageCommit;
+        const published = await executeFn(cfg, issueNumber, {
+          probeImplementDeliverable:
+            deps.probeImplementDeliverable ??
+            createDefaultImplementDeliverableProbe(cfg, deps.gitInWorktree),
+          inspectDeps: {
+            getOnDiskForIssue: deps.getOnDiskForIssue,
+            gitInWorktree: deps.gitInWorktree,
+            getPrForIssue: deps.getPrForIssue,
+            extraGlobs: cfg.test_gate?.non_product_dirty_globs ?? [],
+          },
+        });
+        if (published.succeeded) {
+          return {
+            kind: "early" as const,
+            outcome: published.outcome ?? {
+              advanced: true,
+              from: "implementing",
+              to: "review-1",
+              summary: published.evidence,
+            },
+          };
+        }
+        return {
+          kind: "early" as const,
+          outcome: published.outcome ?? {
+            advanced: false,
+            status: "blocked",
+            reason: published.error ?? published.evidence,
+            blockerKind: "harness-failure",
+          },
+        };
+      }
+      if (!result.success && !ctx.salvaged && !ctx.ownershipCheckpointed) {
         const finalReason = result.timed_out
           ? `timed out after ${result.duration.toFixed(0)}s`
           : `exit ${result.exit_code}`;
@@ -921,7 +1012,7 @@ export async function advanceFix(
       return {
         kind: "continue",
         ctx,
-        crashSalvaged: !result.success && ctx.salvaged,
+        crashSalvaged: !result.success && (ctx.salvaged || ctx.ownershipCheckpointed),
       };
     },
   });
@@ -953,7 +1044,7 @@ export async function advanceFix(
   // path) is correctly skipped — the crash-retry salvage already produced the
   // commit that path exists to create.
   let headAfter = roundResult.ctx.headAfter;
-  if (!crashSalvaged && headBefore && headAfter && headBefore === headAfter && !roundResult.ctx.salvaged) {
+  if (!crashSalvaged && headBefore && headAfter && headBefore === headAfter && !roundResult.ctx.salvaged && !roundResult.ctx.ownershipCheckpointed) {
     // #131 / #758: harness reported success without committing and salvage
     // found nothing. Order preserved: external-commit (#349) → human-decision
     // park (#473) → does-not-reproduce (#391) → no-commits. External and DNR

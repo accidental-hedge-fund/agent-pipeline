@@ -27,8 +27,9 @@ When a ship-path item fails, recover in this order:
 
 1. **Classify** the failure (scratch identity, stale labels, capacity, workflow
    engine, true human authority, product judgment).
-2. **Deterministic recipe** first: unlink scratch, resync, pin head, clear
-   stale block — engine-owned, not operator janitor work.
+2. **Deterministic recipe** first: unlink scratch, checkpoint owned leftovers,
+   publish an unpublished stage commit, resync, pin head, clear stale block —
+   engine-owned, not operator janitor work.
 3. **Verify** / re-review / rerun CI as the class requires.
 4. **Bounded model repair** (`repair_pipeline_item` / fix harness) only after
    the deterministic path is exhausted or inapplicable.

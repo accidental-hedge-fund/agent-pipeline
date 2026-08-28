@@ -157,6 +157,12 @@ export const RECOVERY_RECIPES = [
    * before implementer repair. Ordered after unlink_engine_scratch.
    */
   "checkpoint_owned_harness_dirt",
+  /**
+   * #1272: publish a pipeline-authored salvage/checkpoint/implement commit
+   * that exists on the managed issue branch with no push and no open PR.
+   * Ordered after checkpoint_owned_harness_dirt and before repair.
+   */
+  "publish_unpublished_stage_commit",
   "repair_pipeline_item",
   "rerun_ci",
   "resync_workflow_state",
