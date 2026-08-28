@@ -826,6 +826,7 @@ test("5.12 train invokes recover-parked once then holds if still parked", async 
     fetchBase: async () => {},
     baseTip: async () => HEAD,
     isAncestor: async () => false,
+    writeHandoff: () => {},
   };
   const result = await runTrain(
     {
@@ -895,6 +896,7 @@ test("5.12b train continues same issue when recover-parked recovers", async () =
     fetchBase: async () => {},
     baseTip: async () => HEAD,
     isAncestor: async () => false,
+    writeHandoff: () => {},
   };
   const result = await runTrain(
     {

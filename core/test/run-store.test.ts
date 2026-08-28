@@ -30,6 +30,7 @@ import {
   resolveRunEngineIdentity,
   runDirPath,
   runIdFor,
+  trainRunIdFor,
   runsDir,
   writeHealthPath,
   writeHealthTextForReadFailure,
@@ -56,6 +57,15 @@ test("runIdFor: produces <issue>-<YYYY-MM-DDTHH-MM-SS-mmmZ> with milliseconds", 
   const d = new Date("2026-06-16T21:11:35.000Z");
   const id = runIdFor(ISSUE, d);
   assert.equal(id, "155-2026-06-16T21-11-35-000Z");
+});
+
+test("trainRunIdFor: train- prefix cannot collide with <issue>-… advance ids", () => {
+  const d = new Date("2026-08-28T17:28:03.000Z");
+  const trainId = trainRunIdFor(d);
+  const advanceId = runIdFor(10, d);
+  assert.equal(trainId, "train-2026-08-28T17-28-03-000Z");
+  assert.notEqual(trainId, advanceId);
+  assert.ok(!/^\d+-/.test(trainId));
 });
 
 // Regression: two dispatches starting in the same second must produce different run directories.
@@ -248,6 +258,32 @@ test("initRunDir: non-fatal on I/O error (no throw)", async () => {
 
 // Regression: calling initRunDir twice for the same run-id must not overwrite
 // run.json or truncate events.jsonl — both are written-once / append-only.
+test("initRunDir: train kind does not set issue to the first work-list number", async () => {
+  const { deps, readFile } = memRunStore();
+  const runId = "train-2026-08-28T17-28-03-000Z";
+  const trainDir = path.join(REPO_DIR, ".agent-pipeline", "runs", runId);
+  await initRunDir(
+    {
+      runDir: trainDir,
+      runId,
+      repo: "owner/repo",
+      profile: null,
+      startedAt: STARTED_AT_ISO,
+      kind: "train",
+      mergeMode: false,
+      selector: { issues: [10, 11] },
+      orderedIssues: [10, 11],
+    },
+    deps,
+  );
+  const meta = JSON.parse(readFile(path.join(trainDir, "run.json")));
+  assert.equal(meta.kind, "train");
+  assert.notEqual(meta.issue, 10);
+  assert.equal(meta.issue, undefined);
+  assert.deepEqual(meta.ordered_issues, [10, 11]);
+  assert.equal(meta.merge_mode, false);
+});
+
 test("initRunDir: second call with same run-id is idempotent (run.json and events.jsonl unchanged)", async () => {
   const { deps, readFile } = memRunStore();
   const runId = `${ISSUE}-${STARTED_AT}`;

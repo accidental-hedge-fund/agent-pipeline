@@ -15,6 +15,11 @@ import { parseDeclaredDependencyIds } from "../declared-dependency-grammar.ts";
 import { getPrForIssueAnyState as ghGetPrForIssueAnyState } from "../gh.ts";
 import { compileContractItems, type RawContractItem } from "../loop/dependencies.ts";
 import { LoopError } from "../loop/types.ts";
+import type { RunStoreDeps } from "../run-store.ts";
+import {
+  flushTrainRunHandoff,
+  initTrainRunStore,
+} from "../train-events.ts";
 import type { PipelineConfig } from "../types.ts";
 import { mergePr, realMergeDeps, type MergeDeps } from "./merge.ts";
 
@@ -69,6 +74,8 @@ export interface TrainStatus {
   items: TrainItemResult[];
   blocker: string | null;
   complete: boolean;
+  /** Additive train-level run id when the generic run store was initialized. */
+  run_id?: string;
 }
 
 export interface TrainOpts {
@@ -104,7 +111,17 @@ export type AdvanceOutcome =
     }
   | { ok: false; error: string };
 
-export type AdvanceWaveResult = Map<number, AdvanceOutcome>;
+export interface LinkedLoopRun {
+  /** Real loop run directory basename (not a synthetic `pipeline-loop-…` string). */
+  runId: string;
+  /** Absolute loop `events.jsonl` path when the store is confirmed. */
+  eventsPath?: string;
+}
+
+export type AdvanceWaveResult = Map<number, AdvanceOutcome> & {
+  /** Confirmed wave loop store, when the production loop seam published one. */
+  loopRun?: LinkedLoopRun;
+};
 
 /** Result shape consumed from recover-parked (shared entrypoint). */
 export type TrainRecoverParkedStatus =
@@ -125,6 +142,12 @@ export interface TrainDeps {
   log(msg: string): void;
   listMilestoneIssues(milestone: string): Promise<TrainIssueSnapshot[]>;
   getIssue(issue: number): Promise<TrainIssueSnapshot>;
+  /** Injected generic run-store I/O. Tests supply an in-memory fake. */
+  runStore?: RunStoreDeps;
+  /** Clock for train run ids and event timestamps. */
+  now?: () => Date;
+  /** Early `train_run_handoff` JSON line (stderr in production). */
+  writeHandoff?: (line: string) => Promise<void> | void;
   /**
    * Advance one base-eligible frontier as a single multi-item wave
    * (production: one loop/advance-wave call — not N×single). Must not merge.
@@ -193,8 +216,21 @@ export async function reconcileMergedPrIntegration(
 
 /** Outcome of the shared merge+containment surface used by prelude and merge wave. */
 export type MergeReadyToDeployResult =
-  | { kind: "integrated"; pr: number; mergeCommitOid: string | null; already: boolean }
-  | { kind: "stop"; blocker: string; pr: number | null; mergeCommitOid: string | null };
+  | {
+      kind: "integrated";
+      pr: number;
+      mergeCommitOid: string | null;
+      already: boolean;
+      /** True when `mergeIssuePr` was invoked for this item. */
+      attempted: boolean;
+    }
+  | {
+      kind: "stop";
+      blocker: string;
+      pr: number | null;
+      mergeCommitOid: string | null;
+      attempted: boolean;
+    };
 
 /**
  * Existing issue-PR merge surface + base containment. Prelude and the
@@ -231,6 +267,7 @@ export async function mergeReadyToDeployItem(
           pr: anyPr,
           mergeCommitOid: recon.mergeCommitOid,
           already: true,
+          attempted: false,
         };
       }
       if (recon.kind === "containment-failed") {
@@ -241,6 +278,7 @@ export async function mergeReadyToDeployItem(
             `fetched ${baseBranch} tip ${recon.tip}`,
           pr: anyPr,
           mergeCommitOid: recon.mergeCommitOid,
+          attempted: false,
         };
       }
     }
@@ -249,20 +287,24 @@ export async function mergeReadyToDeployItem(
       blocker: `issue #${issue} is ready-to-deploy but has no linked open PR`,
       pr: null,
       mergeCommitOid: null,
+      attempted: false,
     };
   }
 
   let obs = await deps.observePr(pr);
+  let attempted = false;
   if (obs.state !== "merged") {
     deps.log(`[train] #${issue}: merging PR #${pr}…`);
     try {
       await deps.mergeIssuePr(pr);
+      attempted = true;
     } catch (err) {
       return {
         kind: "stop",
         blocker: `merge failed for #${issue} PR #${pr}: ${(err as Error).message}`,
         pr,
         mergeCommitOid: null,
+        attempted: true,
       };
     }
     obs = await deps.observePr(pr);
@@ -276,6 +318,7 @@ export async function mergeReadyToDeployItem(
         `(state=${obs.state}, mergeCommit=${obs.mergeCommitOid ?? "null"})`,
       pr,
       mergeCommitOid: obs.mergeCommitOid,
+      attempted,
     };
   }
 
@@ -293,6 +336,7 @@ export async function mergeReadyToDeployItem(
         `fetched ${baseBranch} tip ${tip}`,
       pr,
       mergeCommitOid: obs.mergeCommitOid,
+      attempted,
     };
   }
 
@@ -302,6 +346,7 @@ export async function mergeReadyToDeployItem(
     pr,
     mergeCommitOid: obs.mergeCommitOid,
     already: false,
+    attempted,
   };
 }
 
@@ -582,7 +627,76 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
         : " (advance only, frontier waves)"),
   );
 
+  const startedAt = deps.now?.() ?? new Date();
+  const session = await initTrainRunStore({
+    repoDir: opts.repoDir,
+    repo: opts.repo,
+    startedAt,
+    mergeMode,
+    orderedIssues: ordered,
+    selector: {
+      ...(opts.issues && opts.issues.length > 0 ? { issues: [...opts.issues] } : {}),
+      ...(opts.milestone && opts.milestone.trim() !== ""
+        ? { milestone: opts.milestone.trim() }
+        : {}),
+    },
+    store: deps.runStore,
+    now: deps.now,
+  });
+  await flushTrainRunHandoff(session, deps.writeHandoff);
+  await session.append("train_work_list_resolved", {
+    ordered_issues: ordered,
+    merge_mode: mergeMode,
+  });
 
+  const startedIssues = new Set<number>();
+  const announcedPrs = new Set<string>();
+  const emitItemStarted = async (issue: number): Promise<void> => {
+    if (startedIssues.has(issue)) return;
+    startedIssues.add(issue);
+    await session.append("train_item_started", { issue });
+  };
+  const emitPr = async (issue: number, pr: number | null): Promise<void> => {
+    if (pr == null) return;
+    const key = `${issue}:${pr}`;
+    if (announcedPrs.has(key)) return;
+    announcedPrs.add(key);
+    await session.append("train_pr_created", { issue, pr });
+  };
+  const emitItemCompleted = async (item: TrainItemResult): Promise<void> => {
+    await emitPr(item.issue, item.pr);
+    await session.append("train_item_completed", {
+      issue: item.issue,
+      terminal: item.terminal,
+      ...(item.pr != null ? { pr: item.pr } : {}),
+    });
+  };
+  const emitMergeCatalog = async (
+    issue: number,
+    merged: MergeReadyToDeployResult,
+  ): Promise<void> => {
+    if (merged.pr != null) await emitPr(issue, merged.pr);
+    if (merged.attempted && merged.pr != null) {
+      await session.append("train_merge_attempted", { issue, pr: merged.pr });
+    }
+    if (merged.kind !== "integrated") return;
+    if (!merged.already) {
+      await session.append("train_merge_proven", {
+        issue,
+        pr: merged.pr,
+        merge_result_oid: merged.mergeCommitOid,
+      });
+    }
+    await session.append("train_merge_integrated", {
+      issue,
+      pr: merged.pr,
+      merge_result_oid: merged.mergeCommitOid,
+    });
+  };
+
+  let result: TrainResult | undefined;
+  try {
+    result = await (async (): Promise<TrainResult> => {
   const items: TrainItemResult[] = [];
   const finished = new Set<number>();
   const held = new Set<number>();
@@ -605,7 +719,7 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
       if (!isBlockedOrNeedsHumanSnapshot(s)) continue;
       const needsHuman = pipelineStageFromLabels(s.labels) === "needs-human";
       held.add(s.number);
-      pushItem({
+      const parked: TrainItemResult = {
         issue: s.number,
         pr: null,
         terminal: needsHuman ? "needs-human" : "blocked",
@@ -614,7 +728,11 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
         error: needsHuman
           ? `issue #${s.number} parked at pipeline:needs-human`
           : `issue #${s.number} is blocked`,
-      });
+      };
+      pushItem(parked);
+      await emitItemStarted(s.number);
+      await emitItemCompleted(parked);
+      await session.append("train_sibling_halted", { issue: s.number });
       deps.log(
         `[train] #${s.number}: already ${needsHuman ? "needs-human" : "blocked"} — held (will not implement siblings)`,
       );
@@ -634,6 +752,7 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
         blocker === null &&
         ordered.every((n) => finished.has(n) || integrated.has(n)) &&
         held.size === 0,
+      run_id: session.runId,
     });
 
   const markFinished = (issue: number, item: TrainItemResult) => {
@@ -696,9 +815,17 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
       currentIssue = issue;
       currentIndex = ordered.indexOf(issue);
       nextAction = "merge";
+      await emitItemStarted(issue);
       const merged = await mergeReadyToDeployItem(issue, opts.baseBranch, deps);
+      await emitMergeCatalog(issue, merged);
       const stopped = applyMergeReady(issue, merged);
-      if (stopped) return stopped;
+      if (stopped) {
+        const last = items[items.length - 1];
+        if (last && last.issue === issue) await emitItemCompleted(last);
+        return stopped;
+      }
+      const finishedItem = itemByIssue.get(issue);
+      if (finishedItem) await emitItemCompleted(finishedItem);
     }
     return null;
   };
@@ -745,13 +872,22 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
               ? ` merge ${recon.mergeCommitOid.slice(0, 12)}… in ${opts.baseBranch}`
               : "";
           deps.log(`[train] #${issue}: already integrated (PR #${linkedPr}${oidNote})`);
-          markFinished(issue, {
+          await emitItemStarted(issue);
+          await emitPr(issue, linkedPr);
+          await session.append("train_merge_integrated", {
+            issue,
+            pr: linkedPr,
+            merge_result_oid: recon.mergeCommitOid,
+          });
+          const already: TrainItemResult = {
             issue,
             pr: linkedPr,
             terminal: "already-integrated",
             merge_result_oid: recon.mergeCommitOid,
             integrated: true,
-          });
+          };
+          markFinished(issue, already);
+          await emitItemCompleted(already);
           continue;
         }
         if (recon.kind === "containment-failed") {
@@ -851,6 +987,14 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
         `[train] advance wave: ${toAdvance.map((n) => `#${n}`).join(", ")} ` +
           `(frontier ${frontier.map((n) => `#${n}`).join(", ")})`,
       );
+      const waveNumber = wave + 1;
+      await session.append("train_wave_started", {
+        wave: waveNumber,
+        frontier: toAdvance,
+      });
+      for (const issue of toAdvance) {
+        await emitItemStarted(issue);
+      }
       let waveResult: AdvanceWaveResult;
       try {
         waveResult = await advanceWave(toAdvance);
@@ -858,7 +1002,19 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
         blocker = `advance wave failed: ${(err as Error).message}`;
         nextAction = "stopped";
         deps.log(`[train] STOP: ${blocker}`);
+        await session.append("train_wave_ended", {
+          wave: waveNumber,
+          frontier: toAdvance,
+        });
         return { exitCode: 1, status: status() };
+      }
+      const linked = waveResult.loopRun;
+      if (linked && linked.runId.trim() !== "") {
+        await session.append("train_loop_linked", {
+          wave: waveNumber,
+          loop_run_id: linked.runId,
+          ...(linked.eventsPath ? { events: linked.eventsPath } : {}),
+        });
       }
 
       for (const issue of toAdvance) {
@@ -867,24 +1023,35 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
           blocker = `advance wave omitted outcome for #${issue}`;
           nextAction = "stopped";
           deps.log(`[train] STOP: ${blocker}`);
+          await session.append("train_wave_ended", {
+            wave: waveNumber,
+            frontier: toAdvance,
+          });
           return { exitCode: 1, status: status() };
         }
         if (!advanced.ok) {
           held.add(issue);
-          pushItem({
+          const errItem: TrainItemResult = {
             issue,
             pr: await deps.getPrForIssue(issue),
             terminal: "error",
             merge_result_oid: null,
             integrated: false,
             error: advanced.error,
-          });
+          };
+          pushItem(errItem);
+          await emitItemCompleted(errItem);
           if (mergeMode) {
             blocker = advanced.error;
             nextAction = "stopped";
             deps.log(`[train] STOP: ${blocker} — will not implement another sibling`);
+            await session.append("train_wave_ended", {
+              wave: waveNumber,
+              frontier: toAdvance,
+            });
             return { exitCode: 1, status: status() };
           }
+          await session.append("train_sibling_halted", { issue });
           continue;
         }
         const labels = advanced.labels;
@@ -935,20 +1102,27 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
           held.add(issue);
           const err =
             advanced.diagnostic ?? `issue #${issue} parked at pipeline:needs-human`;
-          pushItem({
+          const parked: TrainItemResult = {
             issue,
             pr: await deps.getPrForIssue(issue),
             terminal: "needs-human",
             merge_result_oid: null,
             integrated: false,
             error: err,
-          });
+          };
+          pushItem(parked);
+          await emitItemCompleted(parked);
           if (mergeMode) {
             blocker = err;
             nextAction = "stopped";
             deps.log(`[train] STOP: ${blocker} — will not implement another sibling`);
+            await session.append("train_wave_ended", {
+              wave: waveNumber,
+              frontier: toAdvance,
+            });
             return { exitCode: 1, status: status() };
           }
+          await session.append("train_sibling_halted", { issue });
           deps.log(`[train] park #${issue}: needs-human (advance-only peers may continue)`);
           continue;
         }
@@ -990,20 +1164,27 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
           }
           held.add(issue);
           const err = advanced.diagnostic ?? `issue #${issue} is blocked`;
-          pushItem({
+          const blockedItem: TrainItemResult = {
             issue,
             pr: await deps.getPrForIssue(issue),
             terminal: "blocked",
             merge_result_oid: null,
             integrated: false,
             error: err,
-          });
+          };
+          pushItem(blockedItem);
+          await emitItemCompleted(blockedItem);
           if (mergeMode) {
             blocker = err;
             nextAction = "stopped";
             deps.log(`[train] STOP: ${blocker} — will not implement another sibling`);
+            await session.append("train_wave_ended", {
+              wave: waveNumber,
+              frontier: toAdvance,
+            });
             return { exitCode: 1, status: status() };
           }
+          await session.append("train_sibling_halted", { issue });
           deps.log(`[train] park #${issue}: blocked (advance-only peers may continue)`);
           continue;
         }
@@ -1012,33 +1193,42 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
           const err =
             advanced.diagnostic ??
             `issue #${issue} did not reach ready-to-deploy (stage=${stage ?? advanced.terminal})`;
-          pushItem({
+          const other: TrainItemResult = {
             issue,
             pr: await deps.getPrForIssue(issue),
             terminal: "error",
             merge_result_oid: null,
             integrated: false,
             error: err,
-          });
+          };
+          pushItem(other);
+          await emitItemCompleted(other);
           if (mergeMode) {
             blocker = err;
             nextAction = "stopped";
             deps.log(`[train] STOP: ${blocker} — will not implement another sibling`);
+            await session.append("train_wave_ended", {
+              wave: waveNumber,
+              frontier: toAdvance,
+            });
             return { exitCode: 1, status: status() };
           }
+          await session.append("train_sibling_halted", { issue });
           deps.log(`[train] park #${issue}: ${err}`);
           continue;
         }
         // Reached R2D — labels updated; not finished until merge wave (merge mode)
         // or non-merge complete.
         if (!mergeMode) {
-          markFinished(issue, {
+          const r2d: TrainItemResult = {
             issue,
             pr: await deps.getPrForIssue(issue),
             terminal: "ready-to-deploy",
             merge_result_oid: null,
             integrated: false,
-          });
+          };
+          markFinished(issue, r2d);
+          await emitItemCompleted(r2d);
         } else {
           // Leave in frontier for merge wave; refresh labels
           byNumber.set(issue, {
@@ -1049,17 +1239,24 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
           });
         }
       }
+      await session.append("train_wave_ended", {
+        wave: waveNumber,
+        frontier: toAdvance,
+      });
     } else {
       // Entire frontier already R2D (skip advance)
       for (const issue of frontier) {
         if (!mergeMode && !finished.has(issue)) {
-          markFinished(issue, {
+          await emitItemStarted(issue);
+          const r2d: TrainItemResult = {
             issue,
             pr: await deps.getPrForIssue(issue),
             terminal: "ready-to-deploy",
             merge_result_oid: null,
             integrated: false,
-          });
+          };
+          markFinished(issue, r2d);
+          await emitItemCompleted(r2d);
         }
       }
     }
@@ -1117,6 +1314,19 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
   nextAction = "complete";
   deps.log(`[train] complete (${items.length} item(s)${mergeMode ? ", all integrated" : ", ready-to-deploy"})`);
   return { exitCode: 0, status: status() };
+    })();
+    return result;
+  } finally {
+    const st = result?.status;
+    const ended = deps.now?.() ?? new Date();
+    await session.append("run_complete", {
+      final_state: st?.complete ? "complete" : st?.blocker ? "stopped" : "error",
+      elapsed_ms: Math.max(0, ended.getTime() - startedAt.getTime()),
+      complete: st?.complete ?? false,
+      blocker: st?.blocker ?? null,
+      item_count: st?.items.length ?? 0,
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------

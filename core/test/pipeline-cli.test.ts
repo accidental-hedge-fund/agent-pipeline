@@ -35,6 +35,41 @@ import {
 } from "../scripts/pipeline.ts";
 import { lookupCommand, validateFlags, COMMAND_REGISTRY } from "../scripts/command-registry.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
+import type { RunStoreDeps } from "../scripts/run-store.ts";
+
+function memTrainRunStore(): RunStoreDeps {
+  const files = new Map<string, string>();
+  const appends = new Map<string, string[]>();
+  const enoent = (p: string): NodeJS.ErrnoException => {
+    const e = new Error(`ENOENT: ${p}`) as NodeJS.ErrnoException;
+    e.code = "ENOENT";
+    return e;
+  };
+  return {
+    readFile: async (p) => {
+      const base = files.get(p) ?? "";
+      const parts = appends.get(p) ?? [];
+      if (!files.has(p) && parts.length === 0) throw enoent(p);
+      return base + parts.join("");
+    },
+    writeFile: async (p, data) => {
+      files.set(p, data);
+    },
+    appendFile: async (p, data) => {
+      if (!appends.has(p)) appends.set(p, []);
+      appends.get(p)!.push(data);
+    },
+    rename: async () => {
+      throw new Error("unused");
+    },
+    mkdir: async () => {},
+    readdir: async () => [],
+    stat: async (p) => {
+      if (!files.has(p) && !appends.has(p)) throw enoent(p);
+      return { mtime: new Date(0) };
+    },
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -225,6 +260,8 @@ test("pipeline-cli: train --json emits one train_status document after two neste
       fetchBase: async () => {},
       baseTip: async () => "base-tip",
       isAncestor: async () => false,
+      runStore: memTrainRunStore(),
+      writeHandoff: () => {},
     }),
     async runSingleIssue() {
       throw new Error("train production path uses advanceWave, not N×single");
@@ -1114,6 +1151,91 @@ test("advanceWaveThroughLoop onRunReady emits loop_run_handoff with absolute eve
   assert.doesNotMatch(stdout, /loop_run_handoff/);
 });
 
+test("pipeline-cli: train --json stdout stays one train_status with run_id; handoff is stderr-only (#1277)", async () => {
+  const { opts } = parseCli(["train", "--issues", "10,11", "--json"]);
+  const trainCfg = {
+    repo: "owner/repo",
+    repo_dir: "/repo",
+    base_branch: "main",
+  } as PipelineConfig;
+  const handoff: string[] = [];
+  let waveStarted = false;
+  let handoffBeforeWave = false;
+  const deps: TrainCommandDeps = {
+    makeTrainDeps: () => ({
+      log: () => {},
+      listMilestoneIssues: async () => [],
+      getIssue: async (issue) => ({
+        number: issue,
+        title: `Issue ${issue}`,
+        body: "",
+        labels: ["pipeline:ready"],
+        state: "open",
+      }),
+      advanceWave: async () => {
+        throw new Error("the command must replace the base advanceWave seam");
+      },
+      getPrForIssue: async () => 101,
+      getPrForIssueAnyState: async () => 101,
+      mergeIssuePr: async () => {},
+      observePr: async () => ({ state: "open", mergeCommitOid: null, headRefOid: null }),
+      fetchBase: async () => {},
+      baseTip: async () => "base-tip",
+      isAncestor: async () => false,
+      now: () => new Date("2026-08-28T17:28:03.000Z"),
+      runStore: memTrainRunStore(),
+      writeHandoff: (line) => {
+        if (!waveStarted) handoffBeforeWave = true;
+        handoff.push(line);
+      },
+    }),
+    async runSingleIssue() {
+      throw new Error("train production path uses advanceWave, not N×single");
+    },
+    async runAdvanceWave(issues, _opts, getIssue) {
+      waveStarted = true;
+      const out = new Map<number, import("../scripts/stages/train.ts").AdvanceOutcome>();
+      for (const issue of issues) {
+        const snap = await getIssue(issue);
+        out.set(issue, {
+          ok: true,
+          terminal: "ready-to-deploy",
+          labels: ["pipeline:ready-to-deploy"],
+        });
+      }
+      return out;
+    },
+  };
+  const stdout: string[] = [];
+  const originalLog = console.log;
+  const priorExitCode = process.exitCode;
+  console.log = (...args: unknown[]) => {
+    stdout.push(`${args.map(String).join(" ")}\n`);
+  };
+  process.exitCode = undefined;
+  try {
+    const exitCode = await runTrainCommand(opts, trainCfg, deps);
+    assert.equal(exitCode, 0);
+    const emitted = stdout.join("");
+    const document = JSON.parse(emitted) as { kind?: string; run_id?: string; schema_version?: number };
+    assert.equal(document.kind, "train_status");
+    assert.equal(document.schema_version, 1);
+    assert.equal(document.run_id, "train-2026-08-28T17-28-03-000Z");
+    assert.doesNotMatch(emitted, /train_run_handoff/);
+    assert.doesNotMatch(emitted, /loop_run_handoff/);
+    assert.ok(handoffBeforeWave, "handoff must flush before the first wave");
+    assert.equal(handoff.length, 1);
+    const parsed = JSON.parse(handoff[0]!) as { kind?: string; run_id?: string; events?: string };
+    assert.equal(parsed.kind, "train_run_handoff");
+    assert.equal(parsed.run_id, document.run_id);
+    assert.ok(typeof parsed.events === "string" && parsed.events.endsWith("events.jsonl"));
+    assert.ok(parsed.events?.startsWith("/"), "events path must be absolute");
+  } finally {
+    console.log = originalLog;
+    process.exitCode = priorExitCode;
+  }
+});
+
 test("pipeline-cli: train --json stdout stays one train_status when advance-wave handoff is on stderr (#1184)", async () => {
   const { opts } = parseCli(["train", "--issues", "10", "--json"]);
   const trainCfg = {
@@ -1142,6 +1264,8 @@ test("pipeline-cli: train --json stdout stays one train_status when advance-wave
       fetchBase: async () => {},
       baseTip: async () => "base-tip",
       isAncestor: async () => false,
+      runStore: memTrainRunStore(),
+      writeHandoff: () => {},
     }),
     async runSingleIssue() {
       throw new Error("train production path uses advanceWave, not N×single");

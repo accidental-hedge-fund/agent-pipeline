@@ -9,6 +9,7 @@ import {
   LOOP_IDENTITY_TERMINAL_KINDS,
   LOOP_MATERIAL_KINDS,
   SHIP_MATERIAL_KINDS,
+  TRAIN_MATERIAL_KINDS,
   createMaterialFilterState,
   filterMaterialLine,
   filterMaterialLines,
@@ -194,6 +195,56 @@ test("advance material kinds pass the filter among noise", () => {
   assert.match(joined, /\[run_complete\]/);
   assert.ok(!joined.includes("stage_accounting"));
   assert.ok(!joined.includes("worktree_created"));
+});
+
+test("TRAIN_MATERIAL_KINDS covers the issue allow-list", () => {
+  for (const k of [
+    "run_start",
+    "train_work_list_resolved",
+    "train_wave_started",
+    "train_loop_linked",
+    "train_item_started",
+    "train_item_completed",
+    "train_pr_created",
+    "train_merge_attempted",
+    "train_merge_proven",
+    "train_merge_integrated",
+    "train_sibling_halted",
+    "train_wave_ended",
+    "run_complete",
+  ]) {
+    assert.ok(
+      (TRAIN_MATERIAL_KINDS as readonly string[]).includes(k),
+      `missing train kind ${k}`,
+    );
+  }
+});
+
+test("train material kinds pass the filter among noise", () => {
+  const lines = [
+    adv("stage_accounting", { stage: "planning", tokens: 1 }),
+    adv("run_start", { run_id: "train-1" }),
+    adv("train_work_list_resolved", { ordered_issues: [10, 11] }),
+    adv("train_wave_started", { wave: 1, frontier: [10, 11] }),
+    adv("train_loop_linked", { wave: 1, loop_run_id: "abc", events: "/abs/events.jsonl" }),
+    adv("train_item_started", { issue: 10 }),
+    adv("train_item_completed", { issue: 10, terminal: "ready-to-deploy" }),
+    adv("train_pr_created", { issue: 10, pr: 20 }),
+    adv("train_merge_attempted", { issue: 10, pr: 20 }),
+    adv("train_merge_proven", { issue: 10, pr: 20 }),
+    adv("train_merge_integrated", { issue: 10, pr: 20 }),
+    adv("train_sibling_halted", { issue: 10 }),
+    adv("train_wave_ended", { wave: 1 }),
+    adv("train_heartbeat", { tick: 1 }),
+    adv("run_complete", { final_state: "complete", elapsed_ms: 1 }),
+  ];
+  const out = filterMaterialLines(lines);
+  const joined = out.join("\n");
+  for (const k of TRAIN_MATERIAL_KINDS) {
+    assert.ok(joined.includes(`[${k}]`), `expected ${k} in output`);
+  }
+  assert.ok(!joined.includes("train_heartbeat"));
+  assert.ok(!joined.includes("stage_accounting"));
 });
 
 test("loop material kinds pass the filter among noise", () => {

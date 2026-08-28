@@ -27,6 +27,16 @@ import {
   type TrainOpts,
 } from "../scripts/stages/train.ts";
 import {
+  createTrainEventSession,
+  TRAIN_EVENT_TYPES,
+} from "../scripts/train-events.ts";
+import {
+  initRunDir,
+  runIdFor,
+  trainRunIdFor,
+  type RunStoreDeps,
+} from "../scripts/run-store.ts";
+import {
   MERGEABILITY_UNKNOWN_RETRY_DELAY_MS,
   mergePr,
   type MergeDeps,
@@ -44,12 +54,70 @@ function snap(
   return { number: n, title, body, labels, state };
 }
 
+function memRunStore() {
+  const files = new Map<string, string>();
+  const appends = new Map<string, string[]>();
+  const enoent = (p: string): NodeJS.ErrnoException => {
+    const e = new Error(`ENOENT: ${p}`) as NodeJS.ErrnoException;
+    e.code = "ENOENT";
+    return e;
+  };
+  const deps: RunStoreDeps = {
+    readFile: async (p) => {
+      const base = files.get(p) ?? "";
+      const parts = appends.get(p) ?? [];
+      if (!files.has(p) && parts.length === 0) throw enoent(p);
+      return base + parts.join("");
+    },
+    writeFile: async (p, data) => {
+      files.set(p, data);
+    },
+    appendFile: async (p, data) => {
+      if (!appends.has(p)) appends.set(p, []);
+      appends.get(p)!.push(data);
+    },
+    rename: async () => {
+      throw new Error("unused");
+    },
+    mkdir: async () => {},
+    readdir: async () => [],
+    stat: async (p) => {
+      if (!files.has(p) && !appends.has(p)) throw enoent(p);
+      return { mtime: new Date(0) };
+    },
+  };
+  function readFile(p: string): string {
+    return (files.get(p) ?? "") + (appends.get(p) ?? []).join("");
+  }
+  return { files, appends, deps, readFile };
+}
+
+function trainEventsFromStore(store: ReturnType<typeof memRunStore>): Record<string, unknown>[] {
+  const eventsPath = [...store.appends.keys(), ...store.files.keys()].find((p) =>
+    /[/\\]train-[^/\\]+[/\\]events\.jsonl$/.test(p),
+  );
+  if (!eventsPath) return [];
+  return store
+    .readFile(eventsPath)
+    .split("\n")
+    .filter((line) => line.trim() !== "")
+    .map((line) => JSON.parse(line) as Record<string, unknown>);
+}
+
+function trainEventsPath(store: ReturnType<typeof memRunStore>): string | undefined {
+  return [...store.appends.keys(), ...store.files.keys()].find((p) =>
+    /[/\\]train-[^/\\]+[/\\]events\.jsonl$/.test(p),
+  );
+}
+
 function makeDeps(overrides: Partial<TrainDeps> = {}): TrainDeps & {
   advanceCalls: number[];
   waveCalls: number[][];
   mergeCalls: number[];
   fetchCalls: number;
   anyStateCalls: number[];
+  store: ReturnType<typeof memRunStore>;
+  handoffLines: string[];
 } {
   const advanceCalls: number[] = [];
   const waveCalls: number[][] = [];
@@ -72,9 +140,17 @@ function makeDeps(overrides: Partial<TrainDeps> = {}): TrainDeps & {
 
   const userAdvanceIssue = overrides.advanceIssue;
   const userAdvanceWave = overrides.advanceWave;
+  const store = memRunStore();
+  const handoffLines: string[] = [];
+  const defaultNow = () => new Date("2026-08-28T17:28:03.000Z");
 
   const base: TrainDeps = {
     log() {},
+    runStore: store.deps,
+    now: defaultNow,
+    writeHandoff: (line) => {
+      handoffLines.push(line.endsWith("\n") ? line : `${line}\n`);
+    },
     async listMilestoneIssues() {
       return [...issues.values()];
     },
@@ -151,6 +227,8 @@ function makeDeps(overrides: Partial<TrainDeps> = {}): TrainDeps & {
     waveCalls,
     mergeCalls,
     anyStateCalls,
+    store,
+    handoffLines,
     get fetchCalls() {
       return fetchCalls;
     },
@@ -186,6 +264,8 @@ function makeDeps(overrides: Partial<TrainDeps> = {}): TrainDeps & {
     seedIssue(s: TrainIssueSnapshot): void;
     seedPr(issue: number, pr: number, head?: string): void;
     seedMergedPrAnyState(issue: number, pr: number, oid?: string, head?: string): void;
+    store: ReturnType<typeof memRunStore>;
+    handoffLines: string[];
   };
 }
 
@@ -1451,4 +1531,301 @@ test("train (#1074): held aggregation preserves enriched per-item reason", async
     result.status.blocker ?? "",
     /^held: #1: pipeline advance exited with code 1; #2: pipeline advance exited with code 1$/,
   );
+});
+
+// ---------------------------------------------------------------------------
+// Train structured event stream (#1277)
+// ---------------------------------------------------------------------------
+
+test("trainRunIdFor: train- prefix, distinct from issue-prefixed advance ids", () => {
+  const at = new Date("2026-08-28T17:28:03.000Z");
+  const trainId = trainRunIdFor(at);
+  const advanceId = runIdFor(10, at);
+  assert.equal(trainId, "train-2026-08-28T17-28-03-000Z");
+  assert.equal(advanceId, "10-2026-08-28T17-28-03-000Z");
+  assert.notEqual(trainId, advanceId);
+  assert.ok(trainId.startsWith("train-"));
+  assert.ok(!/^\d+-/.test(trainId), "train id must not collide with <issue>-… ids");
+});
+
+test("initRunDir train: run.json is not a fake single-issue advance record", async () => {
+  const store = memRunStore();
+  const runId = trainRunIdFor(new Date("2026-08-28T17:28:03.000Z"));
+  const runDir = `/tmp/repo/.agent-pipeline/runs/${runId}`;
+  await initRunDir(
+    {
+      runDir,
+      runId,
+      repo: "o/r",
+      profile: null,
+      startedAt: "2026-08-28T17:28:03.000Z",
+      kind: "train",
+      mergeMode: true,
+      selector: { issues: [10, 11] },
+      orderedIssues: [10, 11],
+    },
+    store.deps,
+  );
+  const meta = JSON.parse(store.readFile(`${runDir}/run.json`));
+  assert.equal(meta.kind, "train");
+  assert.equal(meta.merge_mode, true);
+  assert.deepEqual(meta.ordered_issues, [10, 11]);
+  assert.notEqual(meta.issue, 10, "train run.json must not identify as issue 10");
+  assert.equal(meta.issue, undefined);
+});
+
+test("train appendEvent helper: monotonic seq 1,2,3 and unknown fields", async () => {
+  const store = memRunStore();
+  const runDir = "/tmp/repo/.agent-pipeline/runs/train-seq";
+  const session = createTrainEventSession({
+    runDir,
+    runId: "train-seq",
+    store: store.deps,
+    now: () => new Date("2026-08-28T17:28:03.000Z"),
+  });
+  await session.append("run_start", { extra: "keep-me" });
+  await session.append("train_work_list_resolved", { ordered_issues: [10, 11] });
+  await session.append("run_complete", { final_state: "complete", elapsed_ms: 1 });
+  const lines = store
+    .readFile(`${runDir}/events.jsonl`)
+    .split("\n")
+    .filter((l) => l.trim() !== "")
+    .map((l) => JSON.parse(l) as Record<string, unknown>);
+  assert.equal(lines.length, 3);
+  assert.equal(lines[0]!.seq, 1);
+  assert.equal(lines[1]!.seq, 2);
+  assert.equal(lines[2]!.seq, 3);
+  assert.equal(lines[0]!.extra, "keep-me");
+  assert.equal(lines[0]!.schema_version, 1);
+  assert.equal(lines[0]!.run_id, "train-seq");
+  assert.equal(lines[0]!.type, "run_start");
+});
+
+test("train events: events.jsonl exists before the first advanceWave (#1277 1.1)", async () => {
+  let sawEventsBeforeWave = false;
+  const deps = makeDeps({
+    async advanceWave(issueList) {
+      sawEventsBeforeWave = trainEventsPath(deps.store) != null;
+      const out: AdvanceWaveResult = new Map();
+      for (const n of issueList) {
+        out.set(n, { ok: true, terminal: "ready-to-deploy", labels: ["pipeline:ready-to-deploy"] });
+      }
+      return out;
+    },
+  });
+  deps.seedIssue(snap(1, "a"));
+  deps.seedIssue(snap(2, "b independent"));
+  deps.seedPr(1, 101);
+  deps.seedPr(2, 102);
+  const result = await runTrain(baseOpts({ issues: [1, 2], merge: false }), deps);
+  assert.equal(result.exitCode, 0);
+  assert.equal(deps.waveCalls.length, 1);
+  assert.ok(sawEventsBeforeWave, "train events.jsonl must exist before the first advanceWave");
+  const eventsPath = trainEventsPath(deps.store);
+  assert.ok(eventsPath, "expected a train-*/events.jsonl path");
+  assert.match(eventsPath!, /[/\\]train-[^/\\]+[/\\]events\.jsonl$/);
+});
+
+test("train events: train_loop_linked records a confirmed wave loop id (#1277 1.2)", async () => {
+  const loopId = "2026-08-28T17-28-03-000Z";
+  const loopEvents = `/abs/state/runs/${loopId}/events.jsonl`;
+  const deps = makeDeps({
+    async advanceWave(issueList) {
+      const out: AdvanceWaveResult = new Map();
+      for (const n of issueList) {
+        out.set(n, { ok: true, terminal: "ready-to-deploy", labels: ["pipeline:ready-to-deploy"] });
+      }
+      out.loopRun = { runId: loopId, eventsPath: loopEvents };
+      return out;
+    },
+  });
+  deps.seedIssue(snap(1, "a"));
+  deps.seedIssue(snap(2, "b independent"));
+  deps.seedPr(1, 101);
+  deps.seedPr(2, 102);
+  await runTrain(baseOpts({ issues: [1, 2], merge: false }), deps);
+  const events = trainEventsFromStore(deps.store);
+  const linked = events.find((e) => e.type === "train_loop_linked");
+  assert.ok(linked, "train stream must contain train_loop_linked");
+  assert.equal(linked!.loop_run_id, loopId);
+  assert.equal(linked!.events, loopEvents);
+  assert.ok(!events.some((e) => JSON.stringify(e).includes("/training")));
+  assert.ok(!events.some((e) => JSON.stringify(e).includes("0 errors")));
+});
+
+test("train events: omits train_loop_linked when the loop store is unconfirmed", async () => {
+  const deps = makeDeps();
+  deps.seedIssue(snap(1, "a"));
+  deps.seedIssue(snap(2, "b independent"));
+  deps.seedPr(1, 101);
+  deps.seedPr(2, 102);
+  await runTrain(baseOpts({ issues: [1, 2], merge: false }), deps);
+  const events = trainEventsFromStore(deps.store);
+  assert.ok(!events.some((e) => e.type === "train_loop_linked"));
+});
+
+test("train events: train_run_handoff on stderr before the first wave (#1277 1.3)", async () => {
+  let handoffBeforeWave = false;
+  const deps = makeDeps({
+    async advanceWave(issueList) {
+      handoffBeforeWave = deps.handoffLines.some((line) => {
+        try {
+          const obj = JSON.parse(line) as { kind?: string; run_id?: string; events?: string };
+          return obj.kind === "train_run_handoff" && typeof obj.run_id === "string" && typeof obj.events === "string";
+        } catch {
+          return false;
+        }
+      });
+      const out: AdvanceWaveResult = new Map();
+      for (const n of issueList) {
+        out.set(n, { ok: true, terminal: "ready-to-deploy", labels: ["pipeline:ready-to-deploy"] });
+      }
+      return out;
+    },
+  });
+  deps.seedIssue(snap(1, "a"));
+  deps.seedIssue(snap(2, "b independent"));
+  deps.seedPr(1, 101);
+  deps.seedPr(2, 102);
+  const result = await runTrain(baseOpts({ issues: [1, 2], merge: false }), deps);
+  assert.ok(handoffBeforeWave, "train_run_handoff must flush before the first wave");
+  assert.equal(result.status.run_id, "train-2026-08-28T17-28-03-000Z");
+  const parsed = JSON.parse(deps.handoffLines[0]!) as {
+    kind: string;
+    run_id: string;
+    events: string;
+  };
+  assert.equal(parsed.kind, "train_run_handoff");
+  assert.equal(parsed.run_id, result.status.run_id);
+  assert.ok(parsed.events.endsWith("events.jsonl"));
+});
+
+test("train events: STOP after init still writes run_complete (#1277 1.4)", async () => {
+  const deps = makeDeps({
+    async advanceIssue() {
+      return {
+        ok: true,
+        terminal: "needs-human",
+        labels: ["pipeline:needs-human"],
+      };
+    },
+  });
+  deps.seedIssue(snap(1, "a"));
+  const result = await runTrain(baseOpts({ issues: [1], merge: false }), deps);
+  assert.equal(result.exitCode, 1);
+  const events = trainEventsFromStore(deps.store);
+  const complete = events.find((e) => e.type === "run_complete");
+  assert.ok(complete, "events.jsonl must contain type run_complete after STOP");
+  assert.equal(complete!.final_state, "stopped");
+  assert.equal(typeof complete!.elapsed_ms, "number");
+});
+
+test("train events: missing selector creates no train run directory", async () => {
+  const deps = makeDeps();
+  await assert.rejects(
+    () => runTrain(baseOpts({ issues: undefined, milestone: undefined }), deps),
+    /requires --issues|--milestone/,
+  );
+  assert.equal(trainEventsPath(deps.store), undefined);
+});
+
+test("train events: non-merge catalog has work-list/wave/item types and no merge types", async () => {
+  const deps = makeDeps();
+  deps.seedIssue(snap(1, "a"));
+  deps.seedIssue(snap(2, "b independent"));
+  deps.seedPr(1, 101);
+  deps.seedPr(2, 102);
+  await runTrain(baseOpts({ issues: [1, 2], merge: false }), deps);
+  const events = trainEventsFromStore(deps.store);
+  const types = events.map((e) => e.type);
+  for (const required of [
+    "run_start",
+    "train_work_list_resolved",
+    "train_wave_started",
+    "train_item_started",
+    "train_item_completed",
+    "train_pr_created",
+    "train_wave_ended",
+    "run_complete",
+  ]) {
+    assert.ok(types.includes(required), `missing ${required}`);
+  }
+  assert.ok(!types.includes("train_merge_attempted"));
+  assert.ok(!types.includes("train_merge_proven"));
+  assert.ok(!types.includes("train_merge_integrated"));
+  const workList = events.find((e) => e.type === "train_work_list_resolved");
+  assert.deepEqual(workList!.ordered_issues, [1, 2]);
+  const started = events.find((e) => e.type === "train_item_started" && e.issue === 1);
+  assert.ok(started);
+  assert.equal(started!.schema_version, 1);
+  assert.equal(typeof started!.seq, "number");
+  assert.equal(started!.run_id, "train-2026-08-28T17-28-03-000Z");
+  assert.ok(typeof started!.at === "string" && started!.at.includes("T"));
+});
+
+test("train events: merge-mode catalog records attempted, proven, integrated", async () => {
+  const deps = makeDeps();
+  deps.seedIssue(snap(1, "a", ["pipeline:ready-to-deploy"]));
+  deps.seedPr(1, 20);
+  await runTrain(baseOpts({ issues: [1], merge: true }), deps);
+  const events = trainEventsFromStore(deps.store);
+  const types = events.map((e) => e.type);
+  assert.ok(types.includes("train_merge_attempted"), "missing train_merge_attempted");
+  assert.ok(types.includes("train_merge_proven"), "missing train_merge_proven");
+  assert.ok(types.includes("train_merge_integrated"), "missing train_merge_integrated");
+  const attempted = events.find((e) => e.type === "train_merge_attempted");
+  assert.equal(attempted!.issue, 1);
+  assert.equal(attempted!.pr, 20);
+});
+
+test("train events: sibling halt is recorded while independents continue", async () => {
+  const deps = makeDeps({
+    async advanceWave(issueList) {
+      const out: AdvanceWaveResult = new Map();
+      for (const n of issueList) {
+        if (n === 1) {
+          out.set(n, {
+            ok: true,
+            terminal: "needs-human",
+            labels: ["pipeline:needs-human"],
+          });
+        } else {
+          out.set(n, {
+            ok: true,
+            terminal: "ready-to-deploy",
+            labels: ["pipeline:ready-to-deploy"],
+          });
+        }
+      }
+      return out;
+    },
+  });
+  deps.seedIssue(snap(1, "a"));
+  deps.seedIssue(snap(2, "b independent"));
+  deps.seedPr(1, 101);
+  deps.seedPr(2, 102);
+  await runTrain(baseOpts({ issues: [1, 2], merge: false }), deps);
+  const events = trainEventsFromStore(deps.store);
+  const halted = events.find((e) => e.type === "train_sibling_halted");
+  assert.ok(halted, "expected train_sibling_halted");
+  assert.equal(halted!.issue, 1);
+  assert.ok(events.some((e) => e.type === "train_item_completed" && e.issue === 2));
+});
+
+test("train events: TRAIN_EVENT_TYPES catalog is closed", () => {
+  assert.deepEqual([...TRAIN_EVENT_TYPES], [
+    "run_start",
+    "train_work_list_resolved",
+    "train_wave_started",
+    "train_loop_linked",
+    "train_item_started",
+    "train_item_completed",
+    "train_pr_created",
+    "train_merge_attempted",
+    "train_merge_proven",
+    "train_merge_integrated",
+    "train_sibling_halted",
+    "train_wave_ended",
+    "run_complete",
+  ]);
 });

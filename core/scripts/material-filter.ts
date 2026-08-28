@@ -1,7 +1,7 @@
-// Shared material-event filter for host progress notify (#742).
+// Shared material-event filter for host progress notify (#742 / #1277).
 //
-// Pure observation layer over advance and loop `events.jsonl` lines. Prints
-// skill-material one-liners suitable for host Monitor / Grok `monitor` /
+// Pure observation layer over advance, loop, and train `events.jsonl` lines.
+// Prints skill-material one-liners suitable for host Monitor / Grok `monitor` /
 // Codex chat bubbles. Never rewrites the run-store file.
 //
 // Event field inventory (engine writers — do not invent shapes):
@@ -12,6 +12,11 @@
 //   loop_item_started, loop_item_transitioned, loop_item_blocked,
 //   loop_item_advance_linked, loop_item_advance_finished,
 //   loop_item_stage_progress, loop_item_progress, loop_run_stopped, …
+// - Train (`train-events.ts`): JSON objects with `type` (advance envelope):
+//   run_start, train_work_list_resolved, train_wave_started, train_loop_linked,
+//   train_item_started, train_item_completed, train_pr_created,
+//   train_merge_attempted, train_merge_proven, train_merge_integrated,
+//   train_sibling_halted, train_wave_ended, run_complete.
 // - Ship (`stages/ship.ts`): `ship_phase` objects bound to one ship run.
 
 import * as fs from "node:fs";
@@ -92,10 +97,30 @@ export const SHIP_MATERIAL_KINDS = ["ship_phase"] as const;
 
 export type ShipMaterialKind = (typeof SHIP_MATERIAL_KINDS)[number];
 
+/** Train event `type` values that warrant host progress notify (#1277). */
+export const TRAIN_MATERIAL_KINDS = [
+  "run_start",
+  "train_work_list_resolved",
+  "train_wave_started",
+  "train_loop_linked",
+  "train_item_started",
+  "train_item_completed",
+  "train_pr_created",
+  "train_merge_attempted",
+  "train_merge_proven",
+  "train_merge_integrated",
+  "train_sibling_halted",
+  "train_wave_ended",
+  "run_complete",
+] as const;
+
+export type TrainMaterialKind = (typeof TRAIN_MATERIAL_KINDS)[number];
+
 const ADVANCE_SET = new Set<string>(ADVANCE_MATERIAL_KINDS);
 const LOOP_MUST_SET = new Set<string>(LOOP_MATERIAL_KINDS);
 const LOOP_OPTIONAL_SET = new Set<string>(LOOP_OPTIONAL_MATERIAL_KINDS);
 const SHIP_SET = new Set<string>(SHIP_MATERIAL_KINDS);
+const TRAIN_SET = new Set<string>(TRAIN_MATERIAL_KINDS);
 
 /** Definitive pre-merge progress statuses (always material when on loop stream). */
 export const LOOP_PROGRESS_DEFINITIVE_STATUSES = [
@@ -180,12 +205,18 @@ export function filterMaterialLine(
   }
   if (obj == null || typeof obj !== "object") return null;
 
-  // Advance events use `type`; loop events use `kind`.
+  // Advance and train events use `type`; loop events use `kind`.
   const advanceType = typeof obj.type === "string" ? obj.type : null;
   const loopKind = typeof obj.kind === "string" ? obj.kind : null;
 
+  if (advanceType && advanceType.startsWith("train_") && TRAIN_SET.has(advanceType)) {
+    return emit(opts, trimmed, formatTrainOneLiner(advanceType, obj));
+  }
   if (advanceType && ADVANCE_SET.has(advanceType)) {
     return filterAdvance(advanceType, obj, state, opts, trimmed);
+  }
+  if (advanceType && TRAIN_SET.has(advanceType)) {
+    return emit(opts, trimmed, formatTrainOneLiner(advanceType, obj));
   }
   if (loopKind && LOOP_MUST_SET.has(loopKind)) {
     return filterLoopMust(loopKind, obj, state, opts, trimmed);
@@ -489,6 +520,52 @@ export function formatAdvanceOneLiner(
   }
 }
 
+export function formatTrainOneLiner(
+  type: string,
+  obj: Record<string, unknown>,
+): string {
+  const issue = obj.issue != null ? ` #${obj.issue}` : "";
+  const pr = obj.pr != null ? ` PR #${obj.pr}` : "";
+  switch (type) {
+    case "run_start":
+      return `[run_start] train run=${obj.run_id ?? "?"}`;
+    case "train_work_list_resolved": {
+      const issues = Array.isArray(obj.ordered_issues)
+        ? obj.ordered_issues.map((n) => `#${n}`).join(",")
+        : "?";
+      return `[train_work_list_resolved] ${issues}`;
+    }
+    case "train_wave_started": {
+      const frontier = Array.isArray(obj.frontier)
+        ? obj.frontier.map((n) => `#${n}`).join(",")
+        : "?";
+      return `[train_wave_started] wave=${obj.wave ?? "?"} ${frontier}`;
+    }
+    case "train_loop_linked":
+      return `[train_loop_linked] wave=${obj.wave ?? "?"} loop=${obj.loop_run_id ?? "?"}`;
+    case "train_item_started":
+      return `[train_item_started]${issue}`;
+    case "train_item_completed":
+      return `[train_item_completed]${issue} ${obj.terminal ?? "done"}`;
+    case "train_pr_created":
+      return `[train_pr_created]${issue}${pr}`;
+    case "train_merge_attempted":
+      return `[train_merge_attempted]${issue}${pr}`;
+    case "train_merge_proven":
+      return `[train_merge_proven]${issue}${pr}`;
+    case "train_merge_integrated":
+      return `[train_merge_integrated]${issue}${pr}`;
+    case "train_sibling_halted":
+      return `[train_sibling_halted]${issue}`;
+    case "train_wave_ended":
+      return `[train_wave_ended] wave=${obj.wave ?? "?"}`;
+    case "run_complete":
+      return `[run_complete] ${obj.final_state ?? "?"}`;
+    default:
+      return `[${type}]`;
+  }
+}
+
 export function formatLoopOneLiner(
   kind: string,
   data: Record<string, unknown>,
@@ -612,7 +689,7 @@ async function main(argv: string[]): Promise<void> {
     else if (a === "-h" || a === "--help") {
       process.stdout.write(
         "Usage: material-filter [--jsonl] [--until-ship-terminal] [--until-identity-terminal] [file|-]\n" +
-          "  Read advance/loop events.jsonl lines from file or stdin;\n" +
+          "  Read advance/loop/train events.jsonl lines from file or stdin;\n" +
           "  print material one-liners (or JSONL with --jsonl).\n" +
           "  --until-ship-terminal stops after ship_phase complete/completed.\n" +
           "  --until-identity-terminal stops after the bound stream's identity-terminal\n" +
