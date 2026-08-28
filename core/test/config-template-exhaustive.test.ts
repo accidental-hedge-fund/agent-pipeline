@@ -203,7 +203,7 @@ test("defaults-parity: context_snapshot documented absence-default matches the r
 
 test("defaults-parity: opt-in gate keys with no DEFAULT_CONFIG entry are documented as absent, not a placeholder value", () => {
   const template = buildConfigTemplate();
-  for (const key of ["roadmap", "sweep", "queue", "trusted_override_actors", "context_snapshot"]) {
+  for (const key of ["roadmap", "sweep", "queue", "trusted_override_actors", "trusted_audit_actors", "context_snapshot"]) {
     assert.equal(
       Object.prototype.hasOwnProperty.call(DEFAULT_CONFIG, key),
       false,
@@ -222,6 +222,7 @@ test("security-notes: every enumerated opt-in security-sensitive class carries a
   const blocks = template.split(/\n\n+/);
   const classes = [
     "trusted_override_actors",
+    "trusted_audit_actors",
     "executors",
     "setup_command",
     "build_command",
@@ -236,6 +237,21 @@ test("security-notes: every enumerated opt-in security-sensitive class carries a
     assert.ok(block, `expected a template block for ${key}`);
     assert.match(block!, /SECURITY:/, `${key} block must carry a SECURITY note`);
   }
+});
+
+test("security-notes: trusted_audit_actors is audit-sentinel trust only, not override authority (#1276)", () => {
+  const template = buildConfigTemplate();
+  const blocks = template.split(/\n\n+/);
+  const auditBlock = blocks.find((b) => /^#?\s*trusted_audit_actors:/m.test(b.split("\n")[0]));
+  const overrideBlock = blocks.find((b) => /^#?\s*trusted_override_actors:/m.test(b.split("\n")[0]));
+  assert.ok(auditBlock, "expected a template block for trusted_audit_actors");
+  assert.ok(overrideBlock, "expected a template block for trusted_override_actors");
+  assert.match(auditBlock!, /only the current actor is trusted for audit sentinels/i);
+  assert.match(auditBlock!, /SECURITY:/);
+  assert.match(auditBlock!, /does not grant override, merge, or finding-disposition authority/i);
+  assert.doesNotMatch(auditBlock!, /Grants override authority/);
+  assert.doesNotMatch(auditBlock!, /dispose of blocking review findings/);
+  assert.match(overrideBlock!, /override sentinels/i);
 });
 
 // ---------------------------------------------------------------------------
@@ -325,6 +341,7 @@ const ADDED_KEYS = [
   "sweep",
   "queue",
   "trusted_override_actors",
+  "trusted_audit_actors",
   "auto_merge_eligibility",
   "merge_queue",
   "context_snapshot",

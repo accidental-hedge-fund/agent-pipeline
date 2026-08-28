@@ -334,6 +334,37 @@ test("resolveConfig: auto_merge is rejected with an error naming the key", async
   }
 });
 
+test("resolveConfig: trusted_audit_actors array is accepted (#1276)", async () => {
+  const repo = makeFakeRepo(`trusted_audit_actors:\n  - claude-bot\n`);
+  const binDir = makeFakeGh("acme/audit-actors");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    const cfg = cfgMod.resolveConfig({ repoPath: repo });
+    assert.deepEqual(cfg.trusted_audit_actors, ["claude-bot"]);
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
+test("resolveConfig: trusted_audit_actors non-array is rejected (#1276)", async () => {
+  const repo = makeFakeRepo(`trusted_audit_actors: claude-bot\n`);
+  const binDir = makeFakeGh("acme/audit-actors-bad");
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${binDir}:${oldPath}`;
+  try {
+    const cfgMod = await import(`../scripts/config.ts?cb=${Date.now()}`);
+    assert.throws(
+      () => cfgMod.resolveConfig({ repoPath: repo }),
+      (err: Error) =>
+        /Invalid .*pipeline\.yml/.test(err.message) && err.message.includes("trusted_audit_actors"),
+    );
+  } finally {
+    process.env.PATH = oldPath;
+  }
+});
+
 test("resolveConfig: invalid yaml → throws with parse details", async () => {
   // Type error: max_concurrent_worktrees as string
   const repo = makeFakeRepo(`max_concurrent_worktrees: not-a-number\n`);

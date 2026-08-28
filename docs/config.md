@@ -1205,6 +1205,11 @@ Nested fields:
 
 - **Allowed values:** `fail_closed`, `fail_open`
 
+### `trusted_audit_actors`
+
+- **Type:** array of string
+- **Description:** Additional GitHub identities trusted only to suppress audit-repair comments besides the current pipeline actor; not override or merge authority.
+
 ### `trusted_override_actors`
 
 - **Type:** array of string

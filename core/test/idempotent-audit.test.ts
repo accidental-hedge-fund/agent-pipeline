@@ -141,17 +141,141 @@ test("reconcileAuditComment: forged '## Pipeline:' sentinel by an untrusted auth
   assert.equal(posted, 1, "a forged sentinel from an untrusted author must NOT suppress repair");
 });
 
-test("reconcileAuditComment: null trustedActor (actor unresolved) trusts nothing and posts repair (#259)", async () => {
+test("reconcileAuditComment: forged sentinel still posts when attacker is absent from trusted_audit_actors (#1276)", async () => {
+  let posted = 0;
+  const cfg = { ...fakeCfg, trusted_audit_actors: ["claude-bot"] } as unknown as PipelineConfig;
+  const deps: ReconcileAuditDeps = {
+    postComment: async () => { posted++; },
+    warn: () => {},
+  };
+  const comments = [
+    { author: "attacker", body: "## Pipeline: fix 1\ntransition body\n<!-- pipeline-audit: run=old-run state=fix-1 -->" },
+  ];
+  await reconcileAuditComment(cfg, 42, "fix-1", "new-run", "repair body", comments, "pipeline-bot", deps);
+  assert.equal(posted, 1, "an unlisted forger must NOT suppress repair even when an allowlist exists");
+});
+
+test("reconcileAuditComment: missing author on a matching sentinel does NOT suppress repair (#1276)", async () => {
   let posted = 0;
   const deps: ReconcileAuditDeps = {
     postComment: async () => { posted++; },
     warn: () => {},
   };
   const comments = [
+    { body: "## Pipeline: fix 1\n<!-- pipeline-audit: run=old-run state=fix-1 -->" },
+  ];
+  await reconcileAuditComment(fakeCfg, 42, "fix-1", "new-run", "repair body", comments, "pipeline-bot", deps);
+  assert.equal(posted, 1, "a comment whose author is missing must NOT be trusted");
+});
+
+test("reconcileAuditComment: null trustedActor skips repair even when a pipeline-bot sentinel is in-window (#1276)", async () => {
+  let posted = 0;
+  const warns: string[] = [];
+  const deps: ReconcileAuditDeps = {
+    postComment: async () => { posted++; },
+    warn: (msg) => warns.push(msg),
+  };
+  const comments = [
     { author: "pipeline-bot", body: "## Pipeline: fix 1\n<!-- pipeline-audit: run=old-run state=fix-1 -->" },
   ];
   await reconcileAuditComment(fakeCfg, 42, "fix-1", "new-run", "repair body", comments, null, deps);
-  assert.equal(posted, 1, "when the actor can't be resolved, fail toward repair (trust nothing)");
+  assert.equal(posted, 0, "unresolved actor must not post an audit-repair comment");
+  assert.ok(
+    warns.some((w) => /unresolved/i.test(w)),
+    `warning must name the unresolved-actor skip; got: ${JSON.stringify(warns)}`,
+  );
+  assert.ok(
+    warns.every((w) => !/posting repair/i.test(w)),
+    `skip warning must not claim a repair is being posted; got: ${JSON.stringify(warns)}`,
+  );
+});
+
+test("reconcileAuditComment: null trustedActor skips repair when no sentinel is visible (#1276)", async () => {
+  let posted = 0;
+  const warns: string[] = [];
+  const deps: ReconcileAuditDeps = {
+    postComment: async () => { posted++; },
+    warn: (msg) => warns.push(msg),
+  };
+  await reconcileAuditComment(fakeCfg, 42, "fix-1", "new-run", "repair body", [], null, deps);
+  assert.equal(posted, 0, "unresolved actor must skip even when no sentinel is visible (do not fail-open to repair)");
+  assert.ok(
+    warns.some((w) => /unresolved/i.test(w)),
+    `warning must name the unresolved-actor skip; got: ${JSON.stringify(warns)}`,
+  );
+  assert.ok(
+    warns.every((w) => !/posting repair/i.test(w)),
+    `skip warning must not claim a repair is being posted; got: ${JSON.stringify(warns)}`,
+  );
+});
+
+test("reconcileAuditComment: later resolved invocation still repairs a true gap after an unresolved skip (#1276)", async () => {
+  const posted: string[] = [];
+  const skipDeps: ReconcileAuditDeps = {
+    postComment: async (_cfg, _n, body) => { posted.push(body); },
+    warn: () => {},
+  };
+  await reconcileAuditComment(fakeCfg, 42, "fix-1", "new-run", "repair body", [], null, skipDeps);
+  assert.equal(posted.length, 0, "unresolved invocation must not post");
+
+  const repairDeps: ReconcileAuditDeps = {
+    postComment: async (_cfg, _n, body) => { posted.push(body); },
+    warn: () => {},
+  };
+  await reconcileAuditComment(fakeCfg, 42, "fix-1", "new-run", "repair body", [], "pipeline-bot", repairDeps);
+  assert.equal(posted.length, 1, "resolved invocation must still repair a true missing sentinel");
+  assert.equal(posted[0], "repair body");
+});
+
+test("reconcileAuditComment: trusted_override_actors does not grant audit-sentinel trust (#1276)", async () => {
+  let posted = 0;
+  const cfg = {
+    ...fakeCfg,
+    trusted_override_actors: ["claude-bot"],
+  } as unknown as PipelineConfig;
+  const deps: ReconcileAuditDeps = {
+    postComment: async () => { posted++; },
+    warn: () => {},
+  };
+  const comments = [
+    { author: "claude-bot", body: "## Pipeline: fix 1\n<!-- pipeline-audit: run=old-run state=fix-1 -->" },
+  ];
+  await reconcileAuditComment(cfg, 42, "fix-1", "new-run", "repair body", comments, "codex-bot", deps);
+  assert.equal(posted, 1, "override-only identities must not suppress audit repair");
+});
+
+test("reconcileAuditComment: trusted_audit_actors host sentinel suppresses repair (#1276)", async () => {
+  let posted = 0;
+  const cfg = {
+    ...fakeCfg,
+    trusted_audit_actors: ["claude-bot"],
+  } as unknown as PipelineConfig;
+  const deps: ReconcileAuditDeps = {
+    postComment: async () => { posted++; },
+    warn: () => {},
+  };
+  const comments = [
+    { author: "claude-bot", body: "## Pipeline: fix 1\n<!-- pipeline-audit: run=old-run state=fix-1 -->" },
+  ];
+  await reconcileAuditComment(cfg, 42, "fix-1", "new-run", "repair body", comments, "codex-bot", deps);
+  assert.equal(posted, 0, "an allowlisted pipeline host sentinel must suppress repair");
+});
+
+test("reconcileAuditComment: empty trusted_audit_actors does not trust another host (#1276)", async () => {
+  let posted = 0;
+  const cfg = {
+    ...fakeCfg,
+    trusted_audit_actors: [],
+  } as unknown as PipelineConfig;
+  const deps: ReconcileAuditDeps = {
+    postComment: async () => { posted++; },
+    warn: () => {},
+  };
+  const comments = [
+    { author: "claude-bot", body: "## Pipeline: fix 1\n<!-- pipeline-audit: run=old-run state=fix-1 -->" },
+  ];
+  await reconcileAuditComment(cfg, 42, "fix-1", "new-run", "repair body", comments, "codex-bot", deps);
+  assert.equal(posted, 1, "absent/empty allowlist means only the current actor is trusted");
 });
 
 test("reconcileAuditComment: posts repair when only a different-state sentinel is present", async () => {
@@ -180,6 +304,10 @@ test("reconcileAuditComment: posts repair comment when sentinel is absent", asyn
   assert.equal(posted.length, 1, "must post exactly one repair comment");
   assert.equal(posted[0], repairBody);
   assert.ok(warns.length > 0, "must warn when posting repair");
+  assert.ok(
+    warns.some((w) => /posting repair/i.test(w)),
+    `true-gap warning must keep the posting-repair wording; got: ${JSON.stringify(warns)}`,
+  );
 });
 
 test("reconcileAuditComment: only scans the last 20 comments", async () => {

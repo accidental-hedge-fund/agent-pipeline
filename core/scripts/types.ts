@@ -1454,6 +1454,11 @@ export interface PipelineConfig {
   // pipeline actor (#229). Useful for multi-actor setups (e.g., a CI bot and a
   // human operator share the same pipeline installation). Default: [] (actor-only).
   trusted_override_actors?: string[];
+  // Additional GitHub identities whose audit sentinels are trusted in addition
+  // to the current pipeline actor (#1276). Listed logins may suppress
+  // audit-repair comments only — this is not override or merge authority.
+  // Absent/empty: only the current actor is trusted.
+  trusted_audit_actors?: string[];
   /**
    * Governed override class taxonomy and per-class policy (#693). When omitted,
    * the engine applies an implicit low-risk compatibility class
