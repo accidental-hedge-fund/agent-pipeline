@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-08-28
+goal: Add a run-scoped clean-openspec JSON fixture and a unit test that asserts
+  release_version 1.39.14 without changing production behavior
