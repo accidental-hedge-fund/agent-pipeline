@@ -396,8 +396,12 @@ test("train (#1023): independent peers use one advance-wave call per frontier", 
   assert.deepEqual(deps.waveCalls[0]!.slice().sort((a, b) => a - b), [1, 2]);
 });
 
-test("train (#1063): merge-mode does not merge independent sibling while peer is parked", async () => {
+test("train (#1063 / #1273): merge-mode continues and merges independent sibling after a contained park", async () => {
+  const logs: string[] = [];
   const deps = makeDeps({
+    log(msg) {
+      logs.push(msg);
+    },
     async advanceIssue(n) {
       deps.advanceCalls.push(n);
       const issues = (deps as unknown as { _issues: Map<number, TrainIssueSnapshot> })._issues;
@@ -416,9 +420,20 @@ test("train (#1063): merge-mode does not merge independent sibling while peer is
 
   const result = await runTrain(baseOpts({ issues: [1, 2], merge: true }), deps);
   assert.equal(result.exitCode, 1);
-  assert.deepEqual(deps.advanceCalls, [1], "serial ship advances one item");
-  assert.equal(deps.mergeCalls.length, 0, "must not merge a sibling after a park");
-  assert.match(result.status.blocker ?? "", /needs-human|will not implement/i);
+  assert.ok(deps.advanceCalls.includes(1), "serial ship advances the first item");
+  assert.ok(deps.advanceCalls.includes(2), "must advance independent sibling after a contained park");
+  assert.ok(deps.mergeCalls.includes(102), "must merge independent sibling after a contained park");
+  assert.ok(!deps.mergeCalls.includes(101), "must not merge the parked item");
+  assert.ok(
+    !logs.some((line) => line.includes("will not implement another sibling")),
+    "must not abandon remaining work with will not implement another sibling",
+  );
+  const parked = result.status.items.find((item) => item.issue === 1);
+  const independent = result.status.items.find((item) => item.issue === 2);
+  assert.equal(parked?.terminal, "needs-human");
+  assert.equal(parked?.integrated, false);
+  assert.equal(independent?.integrated, true);
+  assert.equal(result.status.complete, false);
 });
 
 test("orderIssuesForTrain: merge-mode puts R2D before newer ready (#1063)", () => {
@@ -553,8 +568,13 @@ test("train (#1096): leftover implementation-ci + live R2D merges A and does not
   assert.ok(mergeA !== -1 && (advanceB === -1 || mergeA < advanceB));
 });
 
-test("train (#1063): already-blocked sibling stops before implementing the next", async () => {
-  const deps = makeDeps();
+test("train (#1063 / #1273): already-blocked sibling does not abandon independent next", async () => {
+  const logs: string[] = [];
+  const deps = makeDeps({
+    log(msg) {
+      logs.push(msg);
+    },
+  });
   deps.seedIssue(snap(1074, "parked", ["pipeline:pre-merge", "blocked"]));
   deps.seedIssue(snap(1073, "next ready", ["pipeline:ready"]));
   deps.seedPr(1074, 1079);
@@ -562,8 +582,20 @@ test("train (#1063): already-blocked sibling stops before implementing the next"
 
   const result = await runTrain(baseOpts({ issues: [1074, 1073], merge: true }), deps);
   assert.equal(result.exitCode, 1);
-  assert.equal(deps.advanceCalls.length, 0, "must not implement #1073");
-  assert.match(result.status.blocker ?? "", /1074|blocked|will not implement/i);
+  assert.ok(deps.advanceCalls.includes(1073), "must advance independent #1073");
+  assert.ok(deps.mergeCalls.includes(1082), "must merge independent #1073 after held #1074");
+  assert.doesNotMatch(
+    result.status.blocker ?? "",
+    /will not implement #1073 while #1074 is blocked\/parked/,
+  );
+  assert.ok(
+    !logs.some((line) => /will not implement #1073 while #1074 is blocked\/parked/.test(line)),
+  );
+  const held = result.status.items.find((item) => item.issue === 1074);
+  const independent = result.status.items.find((item) => item.issue === 1073);
+  assert.equal(held?.terminal, "blocked");
+  assert.equal(independent?.integrated, true);
+  assert.equal(result.status.complete, false);
 });
 
 test("computeBaseEligibleFrontier: code child waits for integrated parent", () => {
@@ -600,11 +632,29 @@ test("isIndependentOfHeld: edge fails closed", () => {
   assert.equal(isIndependentOfHeld(3, new Set([1]), new Map([[3, []], [1, []]])), true);
 });
 
+test("isIndependentOfHeld: transitive dependents vs reverse edge (#1273)", () => {
+  // A→B→C: hold A; B and C depend transitively on A.
+  const chain = new Map<number, number[]>([
+    [1, []],
+    [2, [1]],
+    [3, [2]],
+  ]);
+  assert.equal(isIndependentOfHeld(2, new Set([1]), chain), false);
+  assert.equal(isIndependentOfHeld(3, new Set([1]), chain), false);
+  assert.equal(isIndependentOfHeld(1, new Set([1]), chain), true);
+  // Reverse edge: held A depends on B; B has no path to A.
+  const reverse = new Map<number, number[]>([
+    [1, [2]],
+    [2, []],
+  ]);
+  assert.equal(isIndependentOfHeld(2, new Set([1]), reverse), true);
+  assert.equal(isIndependentOfHeld(1, new Set([1]), reverse), true);
+});
+
 test("train (#1023): unproven independence fails closed — dep-linked R2D not merged while peer held", async () => {
   // Bite: #1 parks; #2 declares Depends on #1 so independence is unproven.
   // #2 must not enter the frontier (code-dep barrier) and must not merge.
-  // Separately, isIndependentOfHeld fails closed on the reverse edge so the
-  // merge-wave guard never merges a dep-linked pair under the independent-sibling rule.
+  // Direct/transitive dependents of a held item are dependency-skipped (#1273).
   const deps = makeDeps({
     async advanceIssue(n) {
       deps.advanceCalls.push(n);
@@ -628,7 +678,9 @@ test("train (#1023): unproven independence fails closed — dep-linked R2D not m
   assert.ok(!deps.mergeCalls.includes(102));
   assert.equal(result.exitCode, 1);
   assert.match(result.status.blocker ?? "", /held|#1|needs-human|no base-eligible|waits on/i);
-  // Pure guard: if #2 were ever R2D alongside held #1, independence fails closed.
+  const skipped = result.status.items.find((item) => item.issue === 2);
+  assert.equal(skipped?.terminal, "dependency-skipped");
+  // Pure guard: a remaining item with a Depends-on path to a held item is not independent.
   assert.equal(
     isIndependentOfHeld(2, new Set([1]), new Map([[1, []], [2, [1]]])),
     false,
@@ -675,6 +727,249 @@ test("train (#1023): merge wave is serial with base proof between merges", async
   );
   // #1063: merge-mode advances one item at a time, then merges, then the next.
   assert.deepEqual(deps.waveCalls, [[1], [2]]);
+});
+
+test("train (#1273): merge-mode contained hold continues independent remaining issues", async () => {
+  const logs: string[] = [];
+  const deps = makeDeps({
+    log(msg) {
+      logs.push(msg);
+    },
+    async advanceIssue(n) {
+      deps.advanceCalls.push(n);
+      const issues = (deps as unknown as { _issues: Map<number, TrainIssueSnapshot> })._issues;
+      if (n === 268) {
+        issues.get(268)!.labels = ["blocked"];
+        return { ok: false, error: "run_fatal; workflow-engine-defect on #268" };
+      }
+      issues.get(n)!.labels = ["pipeline:ready-to-deploy"];
+      return { ok: true, terminal: "ready-to-deploy", labels: ["pipeline:ready-to-deploy"] };
+    },
+  });
+  deps.seedIssue(snap(268, "will hold"));
+  deps.seedIssue(snap(267, "independent schema"));
+  deps.seedIssue(snap(266, "independent service"));
+  deps.seedPr(268, 1268);
+  deps.seedPr(267, 1267);
+  deps.seedPr(266, 1266);
+
+  const result = await runTrain(baseOpts({ issues: [268, 267, 266], merge: true }), deps);
+  assert.ok(deps.advanceCalls.includes(267), "must advance independent #267 after contained hold of #268");
+  assert.ok(deps.advanceCalls.includes(266), "must advance independent #266 after contained hold of #268");
+  assert.ok(
+    !logs.some((line) => line.includes("will not implement another sibling")),
+    "must not abandon remaining work with will not implement another sibling",
+  );
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.status.complete, false);
+  const byIssue = new Map(result.status.items.map((item) => [item.issue, item]));
+  assert.equal(byIssue.get(268)?.terminal, "error");
+  assert.equal(byIssue.get(267)?.integrated, true);
+  assert.equal(byIssue.get(266)?.integrated, true);
+});
+
+test("train (#1273): transitive dependent is dependency-skipped and never advanced", async () => {
+  const deps = makeDeps({
+    async advanceIssue(n) {
+      deps.advanceCalls.push(n);
+      const issues = (deps as unknown as { _issues: Map<number, TrainIssueSnapshot> })._issues;
+      if (n === 268) {
+        issues.get(268)!.labels = ["blocked"];
+        return { ok: false, error: "run_fatal; workflow-engine-defect on #268" };
+      }
+      issues.get(n)!.labels = ["pipeline:ready-to-deploy"];
+      return { ok: true, terminal: "ready-to-deploy", labels: ["pipeline:ready-to-deploy"] };
+    },
+  });
+  deps.seedIssue(snap(268, "held ancestor"));
+  deps.seedIssue(snap(270, "Depends on: #268"));
+  deps.seedIssue(snap(271, "Depends on: #270"));
+  deps.seedIssue(snap(267, "independent peer"));
+  deps.seedPr(268, 1268);
+  deps.seedPr(270, 1270);
+  deps.seedPr(271, 1271);
+  deps.seedPr(267, 1267);
+
+  const result = await runTrain(
+    baseOpts({ issues: [268, 270, 271, 267], merge: true }),
+    deps,
+  );
+  assert.ok(!deps.advanceCalls.includes(270), "must not advance direct dependent #270");
+  assert.ok(!deps.advanceCalls.includes(271), "must not advance transitive dependent #271");
+  assert.ok(!deps.mergeCalls.includes(1270), "must not merge #270 while #268 is held");
+  assert.ok(!deps.mergeCalls.includes(1271), "must not merge #271 while #268 is held");
+  assert.ok(deps.advanceCalls.includes(267), "independent peer still advances");
+  const byIssue = new Map(result.status.items.map((item) => [item.issue, item]));
+  assert.ok(byIssue.has(271), "items must include never-started dependent #271");
+  assert.equal(byIssue.get(271)?.terminal, "dependency-skipped");
+  assert.equal(byIssue.get(270)?.terminal, "dependency-skipped");
+  assert.equal(byIssue.get(267)?.integrated, true);
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.status.complete, false);
+});
+
+test("train (#1273): prerequisite of a held item is not skipped for the reverse edge", async () => {
+  const deps = makeDeps({
+    async advanceIssue(n) {
+      deps.advanceCalls.push(n);
+      const issues = (deps as unknown as { _issues: Map<number, TrainIssueSnapshot> })._issues;
+      issues.get(n)!.labels = ["pipeline:ready-to-deploy"];
+      return { ok: true, terminal: "ready-to-deploy", labels: ["pipeline:ready-to-deploy"] };
+    },
+  });
+  deps.seedIssue(snap(268, "Depends on: #267", ["pipeline:pre-merge", "blocked"]));
+  deps.seedIssue(snap(267, "prerequisite still ready", ["pipeline:ready"]));
+  deps.seedPr(268, 1268);
+  deps.seedPr(267, 1267);
+
+  const result = await runTrain(baseOpts({ issues: [268, 267], merge: true }), deps);
+  assert.ok(deps.advanceCalls.includes(267), "prerequisite #267 must still advance");
+  const byIssue = new Map(result.status.items.map((item) => [item.issue, item]));
+  assert.notEqual(byIssue.get(267)?.terminal, "dependency-skipped");
+  assert.equal(byIssue.get(267)?.integrated, true);
+  assert.equal(byIssue.get(268)?.terminal, "blocked");
+  assert.equal(result.exitCode, 1);
+});
+
+test("train (#1273): JSON partial success lists every selected issue and exits non-zero", async () => {
+  const deps = makeDeps({
+    async advanceIssue(n) {
+      deps.advanceCalls.push(n);
+      const issues = (deps as unknown as { _issues: Map<number, TrainIssueSnapshot> })._issues;
+      if (n === 268) {
+        issues.get(268)!.labels = ["blocked"];
+        return {
+          ok: true,
+          terminal: "other",
+          labels: ["pipeline:implementing"],
+          diagnostic: "waiting: CI still running on #268",
+        };
+      }
+      issues.get(n)!.labels = ["pipeline:ready-to-deploy"];
+      return { ok: true, terminal: "ready-to-deploy", labels: ["pipeline:ready-to-deploy"] };
+    },
+  });
+  deps.seedIssue(snap(279, "first"));
+  deps.seedIssue(snap(269, "second"));
+  deps.seedIssue(snap(268, "will wait"));
+  deps.seedIssue(snap(267, "independent last"));
+  deps.seedPr(279, 1279);
+  deps.seedPr(269, 1269);
+  deps.seedPr(268, 1268);
+  deps.seedPr(267, 1267);
+
+  const result = await runTrain(
+    baseOpts({ issues: [279, 269, 268, 267], merge: true }),
+    deps,
+  );
+  assert.equal(result.status.schema_version, 1);
+  assert.equal(result.status.kind, "train_status");
+  assert.equal(result.exitCode, 1, "partial success must exit non-zero while #268 remains held");
+  assert.equal(result.status.complete, false);
+  assert.equal(result.status.next_action, "stopped");
+  const issues = result.status.items.map((item) => item.issue);
+  for (const n of [279, 269, 268, 267]) {
+    assert.ok(issues.includes(n), `items must include #${n}`);
+  }
+  const byIssue = new Map(result.status.items.map((item) => [item.issue, item]));
+  assert.equal(byIssue.get(279)?.integrated, true);
+  assert.equal(byIssue.get(269)?.integrated, true);
+  assert.equal(byIssue.get(268)?.integrated, false);
+  assert.ok(["error", "blocked", "parked"].includes(byIssue.get(268)?.terminal ?? ""));
+  assert.equal(byIssue.get(267)?.integrated, true);
+});
+
+test("train (#1273): milestone snapshot does not admit a mid-run sibling", async () => {
+  const first = snap(268, "will hold");
+  const second = snap(267, "independent");
+  const late = snap(1288, "engine-class live sibling filed mid-run");
+  let listCalls = 0;
+  const deps = makeDeps({
+    async listMilestoneIssues() {
+      listCalls += 1;
+      if (listCalls === 1) return [first, second];
+      return [first, second, late];
+    },
+    async advanceIssue(n) {
+      deps.advanceCalls.push(n);
+      const issues = (deps as unknown as { _issues: Map<number, TrainIssueSnapshot> })._issues;
+      if (n === 268) {
+        issues.get(268)!.labels = ["blocked"];
+        return { ok: false, error: "run_fatal; workflow-engine-defect on #268" };
+      }
+      issues.get(n)!.labels = ["pipeline:ready-to-deploy"];
+      return { ok: true, terminal: "ready-to-deploy", labels: ["pipeline:ready-to-deploy"] };
+    },
+  });
+  deps.seedIssue(first);
+  deps.seedIssue(second);
+  deps.seedIssue(late);
+  deps.seedPr(268, 1268);
+  deps.seedPr(267, 1267);
+  deps.seedPr(1288, 1288);
+
+  const result = await runTrain(
+    baseOpts({ issues: undefined, milestone: "v1.39.13", merge: true }),
+    deps,
+  );
+  assert.equal(listCalls, 1, "must not re-list --milestone after start");
+  assert.deepEqual(result.status.ordered_issues, [268, 267]);
+  assert.ok(!result.status.items.some((item) => item.issue === 1288));
+  assert.ok(!deps.advanceCalls.includes(1288));
+  assert.ok(deps.advanceCalls.includes(267));
+});
+
+test("train events (#1273): merge-mode contained hold records sibling halt then independent work", async () => {
+  const deps = makeDeps({
+    async advanceIssue(n) {
+      deps.advanceCalls.push(n);
+      const issues = (deps as unknown as { _issues: Map<number, TrainIssueSnapshot> })._issues;
+      if (n === 268) {
+        issues.get(268)!.labels = ["blocked"];
+        return { ok: false, error: "run_fatal; workflow-engine-defect on #268" };
+      }
+      issues.get(n)!.labels = ["pipeline:ready-to-deploy"];
+      return { ok: true, terminal: "ready-to-deploy", labels: ["pipeline:ready-to-deploy"] };
+    },
+  });
+  deps.seedIssue(snap(268, "held"));
+  deps.seedIssue(snap(270, "Depends on: #268"));
+  deps.seedIssue(snap(267, "independent"));
+  deps.seedPr(268, 1268);
+  deps.seedPr(270, 1270);
+  deps.seedPr(267, 1267);
+
+  const result = await runTrain(
+    baseOpts({ issues: [268, 270, 267], merge: true }),
+    deps,
+  );
+  const events = trainEventsFromStore(deps.store);
+  const haltIdx = events.findIndex(
+    (event) => event.type === "train_sibling_halted" && event.issue === 268,
+  );
+  assert.ok(haltIdx !== -1, "expected train_sibling_halted for #268");
+  assert.ok(
+    events.slice(haltIdx + 1).some(
+      (event) =>
+        event.issue === 267 &&
+        (event.type === "train_item_started" ||
+          event.type === "train_item_completed" ||
+          event.type === "train_wave_started"),
+    ),
+    "later events must still record work on independent #267",
+  );
+  assert.ok(
+    events.some(
+      (event) =>
+        event.type === "train_item_completed" &&
+        event.issue === 270 &&
+        event.terminal === "dependency-skipped",
+    ),
+  );
+  const completeIdx = events.findIndex((event) => event.type === "run_complete");
+  assert.ok(completeIdx > haltIdx, "run_complete must not end the stream at the hold of #268");
+  assert.equal(events[completeIdx]?.complete, false);
+  assert.equal(result.status.complete, false);
 });
 
 test("train (#1023): production wiring is multi-item loop, not N×single / advanceWaveFromSingle", () => {

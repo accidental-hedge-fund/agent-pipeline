@@ -94,12 +94,14 @@ export const SHIP_PATH_COMPOSITION_INVENTORY: readonly ShipPathCompositionClassE
     kind: "hard",
     covering_modules: ["test/train.test.ts"],
     covering_test_name_substrings: [
-      "merge-mode does not merge independent sibling while peer is parked",
-      "already-blocked sibling stops before implementing the next",
+      "merge-mode continues and merges independent sibling after a contained park",
+      "already-blocked sibling does not abandon independent next",
       "unproven independence fails closed — dep-linked R2D not merged while peer held",
+      "contained hold continues independent remaining issues",
+      "transitive dependent is dependency-skipped and never advanced",
     ],
     notes:
-      "#1063 serial ship: --merge does not implement or merge a sibling after a park/block. Unproven independence still fails closed.",
+      "#1273: merge-mode contained hold continues proven-independent remaining work and merges independent R2D siblings. Direct/transitive dependents are dependency-skipped. Unproven independence still fails closed.",
   },
   {
     id: "scratch-only-no-needs-human",
