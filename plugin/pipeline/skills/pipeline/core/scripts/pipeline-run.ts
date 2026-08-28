@@ -17,6 +17,7 @@ import {
   getIssueDetail,
   getPrDetail,
   getPrForIssue,
+  getPrForIssueAnyState,
   isBlocked,
   pickStage,
   postComment,
@@ -36,10 +37,14 @@ import {
 import {
   getOnDiskForIssue,
   gitInWorktree,
+  gitProveMergeResultDeps,
   branchName,
+  proveMergeResultInBase,
   releaseWorktreeForParkedIssue,
   type ParkReleaseDeps,
   type ParkReleaseResult,
+  type ProveMergeResultDeps,
+  type VerifiedMergeProof,
 } from "./worktree.ts";
 import {
   stageEligibleForStaleBlockedResume,
@@ -653,6 +658,13 @@ export interface AdvanceDeps {
     issueNumber: number,
     parkDeps?: ParkReleaseDeps,
   ) => Promise<ParkReleaseResult>;
+  /** Extra park-release deps (bound proof, gitCmd, remove seam). */
+  parkReleaseDeps?: ParkReleaseDeps;
+  /** Pre-minted bound merge-result proof (#1274). */
+  verifiedMergeProof?: VerifiedMergeProof;
+  getPrForIssueAnyState?: typeof getPrForIssueAnyState;
+  proveMergeResultInBase?: typeof proveMergeResultInBase;
+  proveMergeDeps?: ProveMergeResultDeps;
   /**
    * Hermetic-drive seams (#787): the gh/worktree/dispatch calls the advance
    * loop makes, injectable so a unit test can drive the REAL runAdvance —
@@ -733,7 +745,20 @@ export async function maybeReleaseWorktreeOnPark(
   // Still safe to call for other blocked kinds that may hold a tree.
   const releaseFn = deps.releaseParkedWorktree ?? releaseWorktreeForParkedIssue;
   try {
-    const result = await releaseFn(cfg, issueNumber);
+    const proof =
+      deps.verifiedMergeProof ??
+      (await mintVerifiedMergeProofForPark(cfg, issueNumber, deps));
+    const parkDeps: ParkReleaseDeps = {
+      ...(deps.parkReleaseDeps ?? {}),
+      ...(proof
+        ? {
+            verifiedMergeProof: proof,
+            prNumber: proof.pr,
+            expectedMergeResultOid: proof.mergeResultOid,
+          }
+        : {}),
+    };
+    const result = await releaseFn(cfg, issueNumber, parkDeps);
     if (result.action === "released") {
       console.log(`[pipeline] #${issueNumber}: park-release: ${result.reason}`);
     } else if (result.action === "retained") {
@@ -745,6 +770,41 @@ export async function maybeReleaseWorktreeOnPark(
       `[pipeline] #${issueNumber}: park-release failed (non-fatal): ${(err as Error).message}`,
     );
     return null;
+  }
+}
+
+async function mintVerifiedMergeProofForPark(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  deps: AdvanceDeps,
+): Promise<VerifiedMergeProof | undefined> {
+  // Tests that inject open-only getPrForIssue must not fall through to live GitHub.
+  const getAny =
+    deps.getPrForIssueAnyState ??
+    (deps.getPrForIssue ? undefined : getPrForIssueAnyState);
+  if (!getAny) return undefined;
+  const getDetail = deps.getPrDetail ?? getPrDetail;
+  const prove = deps.proveMergeResultInBase ?? proveMergeResultInBase;
+  try {
+    const pr = await getAny(cfg, issueNumber);
+    if (pr == null) return undefined;
+    const detail = await getDetail(cfg, pr);
+    if (detail.state !== "merged" || !detail.merge_commit_sha) return undefined;
+    const proveDeps = deps.proveMergeDeps ?? gitProveMergeResultDeps(cfg);
+    return (
+      (await prove(
+        {
+          issue: issueNumber,
+          pr,
+          base: cfg.base_branch ?? "main",
+          mergeResultOid: detail.merge_commit_sha,
+          worktreeHead: detail.head_sha ?? "",
+        },
+        proveDeps,
+      )) ?? undefined
+    );
+  } catch {
+    return undefined;
   }
 }
 

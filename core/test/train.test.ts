@@ -54,6 +54,11 @@ function snap(
   return { number: n, title, body, labels, state };
 }
 
+/** 40-char hex stand-in for a merge-result OID (must pass VerifiedMergeProof). */
+function hexOid(pr: number): string {
+  return `aa${String(pr)}${"c".repeat(40)}`.slice(0, 40);
+}
+
 function memRunStore() {
   const files = new Map<string, string>();
   const appends = new Map<string, string[]>();
@@ -182,7 +187,7 @@ function makeDeps(overrides: Partial<TrainDeps> = {}): TrainDeps & {
       if (!cur) throw new Error(`unknown pr ${pr}`);
       prState.set(pr, {
         state: "merged",
-        oid: `merge${pr}${"0".repeat(32)}`.slice(0, 40),
+        oid: hexOid(pr),
         head: cur.head,
       });
       // After merge, open lookup no longer sees the PR (production open-only).
@@ -206,7 +211,7 @@ function makeDeps(overrides: Partial<TrainDeps> = {}): TrainDeps & {
     },
     async isAncestor(ancestor, descendant) {
       // Contained when ancestor is a recorded merge oid and tip is our fixed tip
-      return descendant === "b".repeat(40) && ancestor.startsWith("merge");
+      return descendant === "b".repeat(40) && ancestor.startsWith("aa");
     },
     ...overrides,
     // Always keep our advanceWave wrapper (overrides.advanceWave handled inside).
@@ -248,7 +253,7 @@ function makeDeps(overrides: Partial<TrainDeps> = {}): TrainDeps & {
     seedMergedPrAnyState(
       issue: number,
       pr: number,
-      oid = `merge${pr}${"0".repeat(32)}`.slice(0, 40),
+      oid = hexOid(pr),
       head = "a".repeat(40),
     ) {
       anyPrByIssue.set(issue, pr);
@@ -731,7 +736,7 @@ test("train with merge: dependent does not start until prerequisite integrated",
   assert.equal(merge2Before1Integrated, false);
   assert.deepEqual(deps.mergeCalls, [101, 102]);
   assert.ok(result.status.items.every((i) => i.integrated));
-  assert.ok(result.status.items.every((i) => i.merge_result_oid?.startsWith("merge")));
+  assert.ok(result.status.items.every((i) => i.merge_result_oid?.startsWith("aa")));
 });
 
 // ---------------------------------------------------------------------------
@@ -809,7 +814,7 @@ test("train (#1071): first UNKNOWN then MERGEABLE via real mergePr — merges an
       if (!cur) throw new Error(`unknown pr ${pr}`);
       self._prState.set(pr, {
         state: "merged",
-        oid: `merge${pr}${"0".repeat(32)}`.slice(0, 40),
+        oid: hexOid(pr),
         head: cur.head,
       });
       for (const [issue, p] of self._openPrByIssue) {
@@ -867,7 +872,7 @@ test("train merge: already-merged contained PR is idempotent", async () => {
   deps.seedPr(1, 101);
   (deps as unknown as { _prState: Map<number, { state: string; oid: string; head: string }> })._prState.set(
     101,
-    { state: "merged", oid: "merge101" + "0".repeat(33), head: "a".repeat(40) },
+    { state: "merged", oid: hexOid(101), head: "a".repeat(40) },
   );
 
   const result = await runTrain(baseOpts({ issues: [1], merge: true }), deps);
@@ -885,7 +890,7 @@ test("train merge: closed issue + merged PR + stale R2D is already-integrated (#
   deps.seedIssue(
     snap(927, "shipped", ["pipeline:ready-to-deploy"], "Issue 927", "closed"),
   );
-  deps.seedMergedPrAnyState(927, 1009, "merge1009" + "0".repeat(31));
+  deps.seedMergedPrAnyState(927, 1009, hexOid(1009));
 
   const result = await runTrain(baseOpts({ issues: [927], merge: true }), deps);
   assert.equal(result.exitCode, 0, result.status.blocker ?? "ok");
@@ -904,7 +909,7 @@ test("train merge: closed+merged+R2D continues to next work-list item (#1014)", 
     snap(927, "shipped", ["pipeline:ready-to-deploy"], "Issue 927", "closed"),
   );
   deps.seedIssue(snap(1010, "next", ["pipeline:ready"]));
-  deps.seedMergedPrAnyState(927, 1009, "merge1009" + "0".repeat(31));
+  deps.seedMergedPrAnyState(927, 1009, hexOid(1009));
   deps.seedPr(1010, 1012);
 
   const result = await runTrain(baseOpts({ issues: [927, 1010], merge: true }), deps);
@@ -918,7 +923,7 @@ test("train merge: closed+merged+R2D continues to next work-list item (#1014)", 
 test("train merge: open R2D + since-merged PR (any-state only) is already-integrated (#1014)", async () => {
   const deps = makeDeps();
   deps.seedIssue(snap(1, "done", ["pipeline:ready-to-deploy"])); // open issue
-  deps.seedMergedPrAnyState(1, 55, "merge55" + "0".repeat(33));
+  deps.seedMergedPrAnyState(1, 55, hexOid(55));
 
   const result = await runTrain(baseOpts({ issues: [1], merge: true }), deps);
   assert.equal(result.exitCode, 0);
@@ -933,9 +938,9 @@ test("train merge: ready-to-deploy with merged (#N) pipeline PR is already-integ
   // the item already-integrated so resume does not STOP with no-open-PR.
   const deps = makeDeps();
   const items: Array<{ issue: number; pr: number; oid: string }> = [
-    { issue: 1258, pr: 1262, oid: "merge1262" + "0".repeat(31) },
-    { issue: 1259, pr: 1263, oid: "merge1263" + "0".repeat(31) },
-    { issue: 1252, pr: 1267, oid: "merge1267" + "0".repeat(31) },
+    { issue: 1258, pr: 1262, oid: hexOid(1262) },
+    { issue: 1259, pr: 1263, oid: hexOid(1263) },
+    { issue: 1252, pr: 1267, oid: hexOid(1267) },
   ];
   for (const item of items) {
     deps.seedIssue(
@@ -975,7 +980,7 @@ test("train merge: reopened pre-R2D issue with only historical merged PR advance
   const deps = makeDeps();
   deps.seedIssue(snap(42, "new work after reopen", ["pipeline:ready"]));
   // Only historical merged timeline PR — no open PR yet.
-  deps.seedMergedPrAnyState(42, 900, "merge900" + "0".repeat(32));
+  deps.seedMergedPrAnyState(42, 900, hexOid(900));
 
   const result = await runTrain(baseOpts({ issues: [42], merge: true }), deps);
   assert.equal(result.exitCode, 0, result.status.blocker ?? "ok");
@@ -1005,7 +1010,7 @@ test("train merge: reopened pre-R2D with historical merged + new open PR merges 
     },
   });
   deps.seedIssue(snap(42, "new work after reopen", ["pipeline:ready"]));
-  deps.seedMergedPrAnyState(42, 900, "merge900" + "0".repeat(32));
+  deps.seedMergedPrAnyState(42, 900, hexOid(900));
 
   const result = await runTrain(baseOpts({ issues: [42], merge: true }), deps);
   assert.equal(result.exitCode, 0, result.status.blocker ?? "ok");
@@ -1052,7 +1057,7 @@ test("train merge: open-lookup race to merged + uncontained stops before merge (
     }
   )._prState.set(101, {
     state: "merged",
-    oid: "merge101" + "0".repeat(33),
+    oid: hexOid(101),
     head: "a".repeat(40),
   });
 
@@ -1085,7 +1090,7 @@ test("train merge: pre-R2D open-lookup race merged uncontained stops before adva
     }
   )._prState.set(101, {
     state: "merged",
-    oid: "merge101" + "0".repeat(33),
+    oid: hexOid(101),
     head: "a".repeat(40),
   });
 
@@ -1148,7 +1153,7 @@ test("train merge: all-closed R2D milestone is already-integrated, not no-open-i
   deps.seedIssue(
     snap(927, "shipped", ["pipeline:ready-to-deploy"], "Issue 927", "closed"),
   );
-  deps.seedMergedPrAnyState(927, 1009, "merge1009" + "0".repeat(31));
+  deps.seedMergedPrAnyState(927, 1009, hexOid(1009));
 
   const result = await runTrain(
     baseOpts({ issues: undefined, milestone: "v1.39.13", merge: true }),
@@ -1169,7 +1174,7 @@ test("train merge: mixed open mergeable + closed integrated in one milestone run
   );
   deps.seedIssue(snap(12, "cancelled", [], "C", "closed"));
   deps.seedPr(10, 100);
-  deps.seedMergedPrAnyState(11, 101, "merge101" + "0".repeat(33));
+  deps.seedMergedPrAnyState(11, 101, hexOid(101));
 
   const result = await runTrain(
     baseOpts({ issues: undefined, milestone: "v1.39.13", merge: true }),
@@ -2036,6 +2041,65 @@ test("train events: sibling halt is recorded while independents continue", async
   assert.ok(halted, "expected train_sibling_halted");
   assert.equal(halted!.issue, 1);
   assert.ok(events.some((e) => e.type === "train_item_completed" && e.issue === 2));
+});
+
+test("train --merge: park-release after proven squash merge releases a clean worktree (#1274)", async () => {
+  const logs: string[] = [];
+  let capturedProof: { issue: number; pr: number; mergeResultOid: string } | undefined;
+  const deps = makeDeps({
+    log(msg) {
+      logs.push(msg);
+    },
+    releaseParkedWorktree: async (_cfg, issue, parkDeps) => {
+      const p = parkDeps?.verifiedMergeProof;
+      capturedProof = p
+        ? { issue: p.issue, pr: p.pr, mergeResultOid: p.mergeResultOid }
+        : undefined;
+      assert.equal(issue, 1);
+      return {
+        action: "released",
+        reason: "released managed worktree for #1 (clean + bound merge-result proof)",
+        branch: "pipeline/1-a",
+        worktree: "/tmp/repo/.worktrees/pipeline-1-a",
+      };
+    },
+  });
+  deps.seedIssue(snap(1, "a", ["pipeline:ready-to-deploy"]));
+  deps.seedPr(1, 20);
+  const result = await runTrain(baseOpts({ issues: [1], merge: true }), deps);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.status.items[0]!.integrated, true);
+  assert.ok(capturedProof, "train must pass bound proof into the shared park-release gate");
+  assert.equal(capturedProof!.issue, 1);
+  assert.equal(capturedProof!.pr, 20);
+  assert.match(capturedProof!.mergeResultOid, /^aa/);
+  const joined = logs.join("\n");
+  assert.doesNotMatch(joined, /commit verification failed \(git\/network\/auth error\)/);
+  assert.doesNotMatch(joined, /check connectivity/i);
+});
+
+test("train --merge: dirty retain does not clear integrated or emit connectivity (#1274)", async () => {
+  const logs: string[] = [];
+  const deps = makeDeps({
+    log(msg) {
+      logs.push(msg);
+    },
+    releaseParkedWorktree: async () => ({
+      action: "retained",
+      reason: "dirty worktree at /tmp/repo/.worktrees/pipeline-1-a; park-release retains uncommitted work",
+      branch: "pipeline/1-a",
+      worktree: "/tmp/repo/.worktrees/pipeline-1-a",
+    }),
+  });
+  deps.seedIssue(snap(1, "a", ["pipeline:ready-to-deploy"]));
+  deps.seedPr(1, 20);
+  const result = await runTrain(baseOpts({ issues: [1], merge: true }), deps);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.status.items[0]!.integrated, true);
+  const joined = logs.join("\n");
+  assert.match(joined, /dirty/i);
+  assert.doesNotMatch(joined, /commit verification failed \(git\/network\/auth error\)/);
+  assert.doesNotMatch(joined, /check connectivity/i);
 });
 
 test("train events: TRAIN_EVENT_TYPES catalog is closed", () => {

@@ -51,6 +51,12 @@ const CALL_SITE_POLICY: Array<{
     note: "park release evaluates evaluateRemoveSafety once",
   },
   {
+    file: "stages/train.ts",
+    pattern: /releaseWorktreeForParkedIssue/,
+    kind: "ladder",
+    note: "train --merge park-release after proven merge uses shared bound-proof gate",
+  },
+  {
     file: "pipeline.ts",
     pattern: /removeWorktreeForIssue/,
     kind: "ladder",
@@ -109,6 +115,29 @@ test("auto_recover and deploy_ready do not bare-call removeWorktree without safe
     deploy,
     /await removeWorktree\(cfg,\s*issueNumber,\s*wt\.slug\)/,
     "deploy_ready must not force-remove without safety wrapper",
+  );
+});
+
+test("train --merge does not invent a path-local worktree remover", () => {
+  const train = readFileSync(path.join(scriptsDir, "stages/train.ts"), "utf8");
+  assert.match(train, /releaseWorktreeForParkedIssue/);
+  const stripped = train
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/\/\/[^\n]*/g, "");
+  assert.doesNotMatch(
+    stripped,
+    /git worktree remove/,
+    "train must not add a git worktree remove path that bypasses the shared gate",
+  );
+  assert.doesNotMatch(
+    stripped,
+    /removeWorktree\s*\(/,
+    "train must not call removeWorktree; park-release goes through releaseWorktreeForParkedIssue",
+  );
+  assert.doesNotMatch(
+    train,
+    /removeManagedWorktreeSafely/,
+    "train park-release uses releaseWorktreeForParkedIssue (same bound-proof gate)",
   );
 });
 

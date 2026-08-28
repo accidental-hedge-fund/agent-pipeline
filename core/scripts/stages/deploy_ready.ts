@@ -15,8 +15,12 @@ import { attestPipelineComment } from "./review-parsing.ts";
 import { LABEL_PREFIX } from "../types.ts";
 import {
   getOnDiskForIssue,
+  gitProveMergeResultDeps,
+  proveMergeResultInBase,
   removeManagedWorktreeSafely,
+  type ProveMergeResultDeps,
   type SafeRemoveDeps,
+  type VerifiedMergeProof,
 } from "../worktree.ts";
 import type { Outcome, PipelineConfig } from "../types.ts";
 import {
@@ -38,7 +42,7 @@ import {
   type PolicyLifecycleState,
 } from "../stage-policy-lifecycle.ts";
 
-/** Injectable seams for {@link finalize} unit tests (#759 / #1243). */
+/** Injectable seams for {@link finalize} unit tests (#759 / #1243 / #1274). */
 export interface FinalizeDeps {
   getOnDiskForIssue?: typeof getOnDiskForIssue;
   removeManagedWorktreeSafely?: typeof removeManagedWorktreeSafely;
@@ -49,6 +53,9 @@ export interface FinalizeDeps {
   addLabelToPr?: typeof addLabelToPr;
   postComment?: typeof postComment;
   postPrComment?: typeof postPrComment;
+  setBlocked?: typeof setBlocked;
+  proveMergeResultInBase?: typeof proveMergeResultInBase;
+  proveMergeDeps?: ProveMergeResultDeps;
 }
 
 const FINAL_SUMMARY_MARKER = "## Pipeline Complete";
@@ -291,12 +298,40 @@ export async function finalize(
 
   // Remove worktree through evaluateRemoveSafety (#759). Terminal ready-to-deploy
   // still refuses local-only commits and (without force) dirty trees so
-  // uncommitted operator work is not destroyed.
+  // uncommitted operator work is not destroyed. After a proven squash merge,
+  // mint bound proof and pass it into the shared wrapper (#1274) — never
+  // force:true (that would discard dirty work).
   const wt = await getOnDiskFn(cfg, issueNumber);
   if (wt) {
+    let verifiedMergeProof: VerifiedMergeProof | undefined;
+    if (prNumber) {
+      const live = await getPrDetailFn(cfg, prNumber).catch(() => null);
+      if (live?.state === "merged" && live.merge_commit_sha) {
+        const prove = deps.proveMergeResultInBase ?? proveMergeResultInBase;
+        const proveDeps = deps.proveMergeDeps ?? gitProveMergeResultDeps(cfg);
+        verifiedMergeProof =
+          (await prove(
+            {
+              issue: issueNumber,
+              pr: prNumber,
+              base: cfg.base_branch ?? "main",
+              mergeResultOid: live.merge_commit_sha,
+              worktreeHead: live.head_sha ?? "",
+            },
+            proveDeps,
+          )) ?? undefined;
+      }
+    }
     const removed = await safeRemoveFn(cfg, issueNumber, wt.slug, wt.path, {
       force: false,
       ...(deps.safeRemoveDeps ?? {}),
+      ...(verifiedMergeProof
+        ? {
+            verifiedMergeProof,
+            prNumber,
+            expectedMergeResultOid: verifiedMergeProof.mergeResultOid,
+          }
+        : {}),
     });
     if (removed.removed) {
       console.log(`[pipeline] #${issueNumber}: worktree removed`);
