@@ -80,12 +80,12 @@ The train stream SHALL append these `type` values at the corresponding train lif
 - `train_wave_started` when an advance wave begins (payload includes the frontier issue numbers)
 - `train_loop_linked` when that wave's loop run ID is known and the loop store is confirmed (payload includes `loop_run_id` and the absolute loop `events.jsonl` path when known)
 - `train_item_started` when a work-list issue begins train work
-- `train_item_completed` when that issue reaches a train terminal (`ready-to-deploy`, `needs-human`, `blocked`, `already-integrated`, `error`, or `parked`)
+- `train_item_completed` when that issue reaches a train terminal (`ready-to-deploy`, `needs-human`, `blocked`, `already-integrated`, `error`, `parked`, or `dependency-skipped`)
 - `train_pr_created` when train observes a linked PR number for an item
 - `train_merge_attempted` when merge-mode invokes a merge mutation
 - `train_merge_proven` when merge-result containment in the fetched base is proven
 - `train_merge_integrated` when the item counts as integrated, including an already-integrated skip
-- `train_sibling_halted` when an item is held or parked while proven-independent siblings continue
+- `train_sibling_halted` when an item is held or parked while proven-independent siblings continue, including in `--merge` mode after a contained hold
 - `train_wave_ended` when that advance wave returns
 - `run_complete` when the train process finishes (see terminal requirement)
 
@@ -110,6 +110,19 @@ Train SHALL NOT copy child loop, advance, CI, harness, or compiler stdout into t
 - **WHEN** issue 10 is parked and proven-independent issue 11 continues
 - **THEN** `events.jsonl` SHALL contain `train_sibling_halted` naming issue 10
 - **AND** later events MAY still record work on issue 11
+
+#### Scenario: Merge-mode contained hold records sibling halt then independent work
+
+- **WHEN** a `--merge` train holds issue 268 after a contained block or wait
+- **AND** independent issue 267 continues
+- **THEN** `events.jsonl` SHALL contain `train_sibling_halted` naming 268
+- **AND** later events SHALL still record work on 267
+- **AND** the stream SHALL NOT end at the hold of 268 as if the train had abandoned 267
+
+#### Scenario: Dependency-skipped terminal is recorded
+
+- **WHEN** issue 270 is skipped because it depends on held issue 268
+- **THEN** `events.jsonl` SHALL contain `train_item_completed` for 270 whose terminal is `dependency-skipped`
 
 #### Scenario: Missing loop store does not fabricate linkage
 
