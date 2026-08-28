@@ -1,11 +1,13 @@
-// Operator-authorized integrated train (#901 / #1023 / #1028 / #1063 / #1096).
+// Operator-authorized integrated train (#901 / #1023 / #1028 / #1063 / #1096 / #1273).
 //
 // Advance-only (`merge: false`): base-eligible frontier waves (loop recovery).
 // `--merge` / ship: **serial** — merge-first prelude merges every already-R2D
 // open mergeable PR and proves base containment before any plan/implement.
 // A merge-first log line is not compliance. At most one implement at a time.
-// STOP on blocked/needs-human. Never start a sibling. That is the anti-PR-farm
-// rule. `pipeline loop` keeps frontier parallelism.
+// That merge-first rule is the anti-PR-farm rule. A contained per-item hold
+// (blocked / needs-human / waiting / non-ready) does not abandon independent
+// remaining work. Direct and transitive dependents of a held item are
+// dependency-skipped. `pipeline loop` keeps frontier parallelism.
 //
 // Unit tests inject TrainDeps — no real network, git, or subprocess in tests.
 
@@ -42,7 +44,8 @@ export type TrainItemTerminal =
   | "blocked"
   | "already-integrated"
   | "error"
-  | "parked";
+  | "parked"
+  | "dependency-skipped";
 
 export type TrainNextAction =
   | "resolve-work-list"
@@ -616,8 +619,10 @@ export function computeBaseEligibleFrontier(input: {
 }
 
 /**
- * True when S has no dependency edge to/from any held issue (declared deps only).
- * Fail closed: if any held issue shares an edge with S, independence is unproven.
+ * True when `issue` has no direct or transitive declared Depends-on path to any
+ * held item. Reverse edges (a held item depends on `issue`) do not skip it.
+ * Fail closed: {@link codeDependencyMap} already treats unknown declared edges
+ * as code dependencies; this helper walks that graph.
  */
 export function isIndependentOfHeld(
   issue: number,
@@ -625,10 +630,16 @@ export function isIndependentOfHeld(
   codeDeps: ReadonlyMap<number, readonly number[]>,
 ): boolean {
   if (held.size === 0) return true;
-  for (const h of held) {
-    const depsS = codeDeps.get(issue) ?? [];
-    const depsH = codeDeps.get(h) ?? [];
-    if (depsS.includes(h) || depsH.includes(issue)) return false;
+  const seen = new Set<number>();
+  const stack = [...(codeDeps.get(issue) ?? [])];
+  while (stack.length > 0) {
+    const cur = stack.pop()!;
+    if (seen.has(cur)) continue;
+    seen.add(cur);
+    if (held.has(cur)) return false;
+    for (const prereq of codeDeps.get(cur) ?? []) {
+      stack.push(prereq);
+    }
   }
   return true;
 }
@@ -1004,6 +1015,40 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
     itemByIssue.set(item.issue, item);
   };
 
+  const skipDependentsOfHeld = async (): Promise<void> => {
+    for (const n of ordered) {
+      if (finished.has(n) || held.has(n) || itemByIssue.has(n)) continue;
+      if (isIndependentOfHeld(n, held, codeDeps)) continue;
+      const ancestors = [...held].filter(
+        (h) => !isIndependentOfHeld(n, new Set([h]), codeDeps),
+      );
+      held.add(n);
+      const skipped: TrainItemResult = {
+        issue: n,
+        pr: await deps.getPrForIssue(n),
+        terminal: "dependency-skipped",
+        merge_result_oid: null,
+        integrated: false,
+        error:
+          `dependency-skipped: #${n} depends on held ` +
+          `${ancestors.map((h) => `#${h}`).join(", ")}`,
+      };
+      pushItem(skipped);
+      await emitItemCompleted(skipped);
+      deps.log(
+        `[train] #${n}: dependency-skipped (depends on ${ancestors.map((h) => `#${h}`).join(", ")})`,
+      );
+    }
+  };
+
+  const holdContainedItem = async (item: TrainItemResult): Promise<void> => {
+    held.add(item.issue);
+    pushItem(item);
+    await emitItemCompleted(item);
+    await session.append("train_sibling_halted", { issue: item.issue });
+    await skipDependentsOfHeld();
+  };
+
   if (mergeMode) {
     for (const s of snapshots) {
       if (!isBlockedOrNeedsHumanSnapshot(s)) continue;
@@ -1024,9 +1069,10 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
       await emitItemCompleted(parked);
       await session.append("train_sibling_halted", { issue: s.number });
       deps.log(
-        `[train] #${s.number}: already ${needsHuman ? "needs-human" : "blocked"} — held (will not implement siblings)`,
+        `[train] #${s.number}: already ${needsHuman ? "needs-human" : "blocked"} — held (independent remaining work continues)`,
       );
     }
+    await skipDependentsOfHeld();
   }
 
   const status = (): TrainStatus =>
@@ -1251,14 +1297,6 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
       return true;
     });
     if (mergeMode && toAdvance.length > 0) {
-      if (held.size > 0) {
-        blocker =
-          `will not implement #${toAdvance[0]} while ` +
-          `${[...held].map((h) => `#${h}`).join(", ")} is blocked/parked`;
-        nextAction = "stopped";
-        deps.log(`[train] STOP: ${blocker}`);
-        return { exitCode: 1, status: status() };
-      }
       toAdvance = [toAdvance[0]!];
     }
 
@@ -1324,7 +1362,6 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
           return { exitCode: 1, status: status() };
         }
         if (!advanced.ok) {
-          held.add(issue);
           const errItem: TrainItemResult = {
             issue,
             pr: await deps.getPrForIssue(issue),
@@ -1333,19 +1370,12 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
             integrated: false,
             error: advanced.error,
           };
-          pushItem(errItem);
-          await emitItemCompleted(errItem);
-          if (mergeMode) {
-            blocker = advanced.error;
-            nextAction = "stopped";
-            deps.log(`[train] STOP: ${blocker} — will not implement another sibling`);
-            await session.append("train_wave_ended", {
-              wave: waveNumber,
-              frontier: toAdvance,
-            });
-            return { exitCode: 1, status: status() };
-          }
-          await session.append("train_sibling_halted", { issue });
+          await holdContainedItem(errItem);
+          deps.log(
+            mergeMode
+              ? `[train] hold #${issue}: ${advanced.error} (independent remaining work continues)`
+              : `[train] park #${issue}: ${advanced.error}`,
+          );
           continue;
         }
         const labels = advanced.labels;
@@ -1393,7 +1423,6 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
               continue;
             }
           }
-          held.add(issue);
           const err =
             advanced.diagnostic ?? `issue #${issue} parked at pipeline:needs-human`;
           const parked: TrainItemResult = {
@@ -1404,20 +1433,12 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
             integrated: false,
             error: err,
           };
-          pushItem(parked);
-          await emitItemCompleted(parked);
-          if (mergeMode) {
-            blocker = err;
-            nextAction = "stopped";
-            deps.log(`[train] STOP: ${blocker} — will not implement another sibling`);
-            await session.append("train_wave_ended", {
-              wave: waveNumber,
-              frontier: toAdvance,
-            });
-            return { exitCode: 1, status: status() };
-          }
-          await session.append("train_sibling_halted", { issue });
-          deps.log(`[train] park #${issue}: needs-human (advance-only peers may continue)`);
+          await holdContainedItem(parked);
+          deps.log(
+            mergeMode
+              ? `[train] hold #${issue}: needs-human (independent remaining work continues)`
+              : `[train] park #${issue}: needs-human (advance-only peers may continue)`,
+          );
           continue;
         }
         if (advanced.terminal === "blocked" || labels.includes("blocked")) {
@@ -1456,7 +1477,6 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
               continue;
             }
           }
-          held.add(issue);
           const err = advanced.diagnostic ?? `issue #${issue} is blocked`;
           const blockedItem: TrainItemResult = {
             issue,
@@ -1466,24 +1486,15 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
             integrated: false,
             error: err,
           };
-          pushItem(blockedItem);
-          await emitItemCompleted(blockedItem);
-          if (mergeMode) {
-            blocker = err;
-            nextAction = "stopped";
-            deps.log(`[train] STOP: ${blocker} — will not implement another sibling`);
-            await session.append("train_wave_ended", {
-              wave: waveNumber,
-              frontier: toAdvance,
-            });
-            return { exitCode: 1, status: status() };
-          }
-          await session.append("train_sibling_halted", { issue });
-          deps.log(`[train] park #${issue}: blocked (advance-only peers may continue)`);
+          await holdContainedItem(blockedItem);
+          deps.log(
+            mergeMode
+              ? `[train] hold #${issue}: blocked (independent remaining work continues)`
+              : `[train] park #${issue}: blocked (advance-only peers may continue)`,
+          );
           continue;
         }
         if (stage !== "ready-to-deploy" && advanced.terminal !== "ready-to-deploy") {
-          held.add(issue);
           const err =
             advanced.diagnostic ??
             `issue #${issue} did not reach ready-to-deploy (stage=${stage ?? advanced.terminal})`;
@@ -1495,20 +1506,12 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
             integrated: false,
             error: err,
           };
-          pushItem(other);
-          await emitItemCompleted(other);
-          if (mergeMode) {
-            blocker = err;
-            nextAction = "stopped";
-            deps.log(`[train] STOP: ${blocker} — will not implement another sibling`);
-            await session.append("train_wave_ended", {
-              wave: waveNumber,
-              frontier: toAdvance,
-            });
-            return { exitCode: 1, status: status() };
-          }
-          await session.append("train_sibling_halted", { issue });
-          deps.log(`[train] park #${issue}: ${err}`);
+          await holdContainedItem(other);
+          deps.log(
+            mergeMode
+              ? `[train] hold #${issue}: ${err} (independent remaining work continues)`
+              : `[train] park #${issue}: ${err}`,
+          );
           continue;
         }
         // Reached R2D — labels updated; not finished until merge wave (merge mode)

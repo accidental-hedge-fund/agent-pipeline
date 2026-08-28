@@ -108,7 +108,7 @@ _Avoid_: live-ship probe, paste detector, second scheduler
 _Avoid_: `env.example` factory-control default, mid-ship model override
 
 **STOP**:
-`train --merge` will not implement or merge another sibling.
+`train --merge` stops on uncontained merge failure, merge-first violation, or when every remaining item is held or dependency-skipped. A contained hold does not abandon independent siblings.
 _Avoid_: park, blocked (as synonyms)
 
 **Park**:
@@ -116,7 +116,7 @@ The item is at `pipeline:needs-human`.
 _Avoid_: STOP, blocked
 
 **Blocked**:
-The item carries `blocked` (CI exhausted, etc.). Serial `--merge` STOPs on park or blocked. `pipeline loop` may still wave.
+The item carries `blocked` (CI exhausted, etc.). Merge-mode train holds that item and continues independent remaining work. Dependents are dependency-skipped. `pipeline loop` may still wave.
 _Avoid_: parked, needs-human
 
 **Hard wait**:
