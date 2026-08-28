@@ -185,7 +185,11 @@ export interface ReconcileAuditDeps {
 /** Scan the most-recent `comments` (up to 20) for an HTML audit sentinel whose
  *  `state` attribute matches `currentState`. If found, returns immediately (no-op).
  *  If not found, posts `commentBody` as a repair comment (with up to 3 retries) and
- *  logs a warning via `deps.warn`. Re-throws on exhaustion so the caller can surface the failure. */
+ *  logs a warning via `deps.warn`. Re-throws on exhaustion so the caller can surface the failure.
+ *
+ *  When the GitHub actor is unresolved, skip the post (do not fail-open to a
+ *  repair flood) and emit a distinct skip warning. A later invocation that can
+ *  resolve the actor still repairs a true gap. */
 export async function reconcileAuditComment(
   cfg: PipelineConfig,
   issueNumber: number,
@@ -196,23 +200,28 @@ export async function reconcileAuditComment(
   trustedActor: string | null,
   deps: ReconcileAuditDeps = { postComment, warn: (m) => console.warn(m) },
 ): Promise<void> {
+  if (trustedActor == null) {
+    deps.warn(
+      `[pipeline] #${issueNumber}: skipping audit repair for state=${currentState} (run=${runId}); GitHub actor unresolved`,
+    );
+    return;
+  }
   const marker = ` state=${currentState} -->`;
   const recent = comments.slice(-20);
+  const auditAllowlist = cfg.trusted_audit_actors ?? [];
   // Only trust a sentinel when the comment BOTH looks like a pipeline audit comment
-  // (starts with "## Pipeline:") AND was authored by the pipeline's own GitHub actor.
-  // Body-prefix alone is forgeable: anyone can post "## Pipeline: …<!-- pipeline-audit:
-  // state=X -->" to suppress a real audit-repair. When the actor can't be resolved
-  // (trustedActor null) we trust nothing and post the repair — failing toward an extra
-  // audit comment, never toward suppressing a genuine label-without-audit partial failure.
-  const found =
-    trustedActor != null &&
-    recent.some(
-      (c) =>
-        c.author === trustedActor &&
-        c.body.trimStart().startsWith("## Pipeline:") &&
-        c.body.includes("<!-- pipeline-audit:") &&
-        c.body.includes(marker),
-    );
+  // (starts with "## Pipeline:") AND was authored by the current actor or an
+  // identity in trusted_audit_actors. Body-prefix alone is forgeable. Override
+  // allowlist is a different grant and MUST NOT suppress audit repair.
+  const found = recent.some(
+    (c) =>
+      typeof c.author === "string" &&
+      c.author.length > 0 &&
+      (c.author === trustedActor || auditAllowlist.includes(c.author)) &&
+      c.body.trimStart().startsWith("## Pipeline:") &&
+      c.body.includes("<!-- pipeline-audit:") &&
+      c.body.includes(marker),
+  );
   if (found) return;
   deps.warn(
     `[pipeline] #${issueNumber}: audit sentinel for state=${currentState} (run=${runId}) missing from recent comments; posting repair`,

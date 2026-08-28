@@ -975,6 +975,12 @@ const PartialConfigSchema = z.object({
   // `## Pipeline: Finding override` and `## Pipeline: Scope override` comments
   // are trusted in addition to the current actor. Default: [] (actor-only).
   trusted_override_actors: z.array(z.string()).optional().describe("Additional GitHub identities whose override sentinels are trusted besides the current pipeline actor."),
+  // Audit-sentinel trust list (#1276). GitHub identities whose `## Pipeline:`
+  // audit comments may suppress audit-repair posting in addition to the current
+  // actor. Distinct from trusted_override_actors: this grant is bookkeeping
+  // only and MUST NOT be treated as override or merge authority. Default:
+  // absent (actor-only).
+  trusted_audit_actors: z.array(z.string()).optional().describe("Additional GitHub identities trusted only to suppress audit-repair comments besides the current pipeline actor; not override or merge authority."),
   // Governed override class taxonomy (#693). Optional; omitted → implicit
   // low-risk compatibility class. Strict: unknown keys fail parse.
   override_governance: z
@@ -2164,6 +2170,7 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
     format_gate: fileConfig.format_gate ?? DEFAULT_CONFIG.format_gate,
     harness_sandbox: fileConfig.harness_sandbox ?? DEFAULT_CONFIG.harness_sandbox,
     trusted_override_actors: fileConfig.trusted_override_actors,
+    trusted_audit_actors: fileConfig.trusted_audit_actors,
     override_governance: resolveOverrideGovernanceConfig(fileConfig.override_governance),
     auto_loop: {
       enabled: fileConfig.auto_loop?.enabled ?? DEFAULT_CONFIG.auto_loop.enabled,
@@ -4072,6 +4079,14 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
         "#   Grants override authority to each listed identity — SECURITY: it can dispose of blocking review findings without further review; keep this list minimal and audited.",
         '#   e.g. trusted_override_actors: ["octocat"]',
       ].join("\n"),
+    config.trusted_audit_actors !== undefined
+      ? `\ntrusted_audit_actors: # additional GitHub identities trusted to suppress audit-repair comments (#1276)\n${yamlBlock(config.trusted_audit_actors, 2)}`
+      : [
+        "",
+        `# trusted_audit_actors: [] # ${sd("trusted_audit_actors", "additional GitHub identities trusted only to suppress audit-repair comments besides the current pipeline actor; not override or merge authority")} (#1276). Absent (default): only the current actor is trusted for audit sentinels.`,
+        "#   Listed identities are trusted only to suppress audit-repair comments — SECURITY: this does not grant override, merge, or finding-disposition authority; keep this list to pipeline host logins that post ## Pipeline: comments.",
+        '#   e.g. trusted_audit_actors: ["claude-bot"]',
+      ].join("\n"),
     config.queue !== undefined
       ? `\nqueue: # queue batch factory operator defaults (#305) — CLI flags override these\n${yamlBlock(config.queue, 2)}`
       : [
@@ -4315,6 +4330,7 @@ function normalizeForSync(config: PartialConfig): unknown {
     format_gate: config.format_gate ?? d.format_gate,
     harness_sandbox: config.harness_sandbox ?? d.harness_sandbox,
     trusted_override_actors: config.trusted_override_actors,
+    trusted_audit_actors: config.trusted_audit_actors,
     auto_loop: { ...d.auto_loop, ...config.auto_loop },
     roadmap: config.roadmap
       ? { ...config.roadmap, release_model: config.roadmap.release_model ?? "semver" }
