@@ -848,4 +848,9 @@ test("timeout-park drift guard: implementing and fix afterRound consult the clas
   assert.doesNotMatch(fix, /linkedOpenPr:\s*true/);
   assert.ok(fix.includes("getPrForIssue"));
   assert.ok(fix.includes("executePublishUnpublishedStageCommit"));
+  assert.ok(
+    planning.includes("executePublishUnpublishedStageCommit"),
+    "planning timeout publish must use the shared executor",
+  );
+  assert.ok(planning.includes("prLookupFailed"), "planning timeout must fail closed on PR lookup errors");
 });

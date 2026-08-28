@@ -1230,6 +1230,46 @@ const harnessTimeout: HarnessResult = {
   timed_out: true,
 };
 
+/** Timeout + ownership-checkpoint salvage tip that is publishable unpublished. */
+function timeoutPublishableDeps(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  let callCount = 0;
+  let porcelain = "";
+  return {
+    invoke: async () => {
+      callCount++;
+      if (callCount >= 2) {
+        porcelain = " M core/foo.ts\n";
+        return harnessTimeout;
+      }
+      return revisionOkResult;
+    },
+    trySalvageUncommittedWork: async () => ({ salvaged: false }),
+    listChangeDirs: () => ["publish-unpublished-timeout-commit"],
+    getPrForBranch: async () => null,
+    gitInWorktree: async (_p: unknown, args: string[]) => {
+      if (Array.isArray(args) && args[0] === "log") {
+        return {
+          stdout: "salvage: stage harness work (#42)\n\nowned-harness-leftover\nIssue: #42\nPipeline-Run: run-42\n",
+          stderr: "",
+          code: 0,
+        };
+      }
+      if (Array.isArray(args) && args[0] === "status") return { stdout: "", stderr: "", code: 0 };
+      return { stdout: "", stderr: "", code: 0 };
+    },
+    ownershipDeps: {
+      gitStatusPorcelain: async () => porcelain,
+      gitHead: async () => "deadbeef",
+      salvage: async () => {
+        porcelain = "";
+        return { salvaged: true };
+      },
+      mkdirp: async () => {},
+    },
+    ...overrides,
+  };
+}
+
 test("runPlanningPhases #1272: timeout + checkpoint commit + salvaged false publishes (no timeout park)", async () => {
   let callCount = 0;
   let createdPr: { body: string } | null = null;
@@ -1424,6 +1464,64 @@ test("runPlanningPhases #1272: failing test gate on post-timeout path does not c
   assert.notEqual(captured.outcome.advanced === true ? captured.outcome.to : "", "review-1");
 });
 
+test("runPlanningPhases #1272: timeout PR lookup error parks harness-failure and does not publish", async () => {
+  let created = 0;
+  const captured = await runAndCaptureOutcome(
+    freeformHooks(),
+    timeoutPublishableDeps({
+      getPrForIssue: async () => {
+        throw new Error("API 401");
+      },
+      createPr: async () => {
+        created++;
+        return 1;
+      },
+    }),
+  );
+  assert.equal(created, 0, "must not create a PR while linkage is indeterminate");
+  assert.equal(captured.captured?.tag, "harness-failure");
+  assert.match(captured.captured?.reason ?? "", /indeterminate/);
+  assert.equal(captured.outcome.advanced, false);
+  if (!captured.outcome.advanced && captured.outcome.status === "blocked") {
+    assert.equal(captured.outcome.blockerKind, "harness-failure");
+  }
+});
+
+test("runPlanningPhases #1272: timeout publish push failure parks harness-failure not push-failed", async () => {
+  const captured = await runAndCaptureOutcome(
+    freeformHooks(),
+    timeoutPublishableDeps({
+      pushWithCurrency: async () => ({
+        ok: false,
+        attempts: 1,
+        reason: "origin rejected the unpublished tip",
+        reason_code: "workflow-state",
+        head_drift: false,
+      }),
+    }),
+  );
+  assert.equal(captured.captured?.tag, "harness-failure", `tag=${captured.captured?.tag}`);
+  assert.notEqual(captured.captured?.tag, "push-failed");
+  assert.equal(captured.outcome.advanced, false);
+  assert.match(captured.captured?.reason ?? "", /origin rejected|push/i);
+});
+
+test("runPlanningPhases #1272: timeout publish PR-creation failure parks harness-failure not pr-creation-failed", async () => {
+  const captured = await runAndCaptureOutcome(
+    freeformHooks(),
+    timeoutPublishableDeps({
+      getPrForBranch: async () => null,
+      createPr: async () => {
+        throw new Error("API rate limit exceeded");
+      },
+    }),
+  );
+  assert.equal(captured.captured?.tag, "harness-failure", `tag=${captured.captured?.tag}`);
+  assert.notEqual(captured.captured?.tag, "pr-creation-failed");
+  assert.equal(captured.outcome.advanced, false);
+  assert.match(captured.captured?.reason ?? "", /PR creation failed|rate limit/i);
+});
+
 test("runPlanningPhases #547: implement harness fails, salvage also fails → block comment discloses the salvage failure reason", async () => {
   let callCount = 0;
   const failOnSecondCall = {
@@ -1463,12 +1561,17 @@ test("planning.ts source pin #547/#629: implement path uses shared harness-round
   const salvageCheckIdx = src.indexOf("if (!ctx.salvaged) {", resultCheckIdx);
   const blockIdx = src.indexOf(
     '"implementing",\n              "harness-failure",\n            );',
-    resultCheckIdx,
+    salvageCheckIdx,
   );
   assert.ok(roundIdx !== -1, "implement path must call runHarnessRound");
   assert.ok(salvageModeIdx !== -1, "implement path must salvage on confirmed no-new-commit");
   assert.ok(resultCheckIdx !== -1 && salvageCheckIdx !== -1 && blockIdx !== -1);
   assert.ok(consultIdx !== -1 && resultCheckIdx < consultIdx, "timeout park must consult unpublished-commit classifier");
+  assert.ok(src.includes("prLookupFailed"), "timeout PR lookup failure must propagate as indeterminate");
+  assert.ok(
+    src.includes("executePublishUnpublishedStageCommit"),
+    "timeout publish path must use the shared executor",
+  );
   assert.ok(resultCheckIdx < salvageCheckIdx, "salvage outcome must be checked inside the harness-failure branch");
   assert.ok(salvageCheckIdx < blockIdx, "salvage failure disclosure must precede the terminal harness-failure block");
 });

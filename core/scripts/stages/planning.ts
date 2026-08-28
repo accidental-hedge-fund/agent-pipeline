@@ -86,6 +86,7 @@ import {
   type OwnershipDeps,
 } from "../harness-mutation-ownership.ts";
 import {
+  executePublishUnpublishedStageCommit,
   resolveTimeoutParkForUnpublishedCommit,
   type InspectUnpublishedDeps,
 } from "../unpublished-stage-commit.ts";
@@ -458,6 +459,19 @@ type RunPlanningPhasesDeps = BootstrapWorktreeDeps &
     /** Optional PR lookup for the unpublished-commit timeout classifier (#1272). */
     getPrForIssue?: typeof getPrForIssue;
     inspectUnpublishedDeps?: InspectUnpublishedDeps;
+    /**
+     * Shared unpublished-commit publish executor. Tests inject fakes.
+     * Same-process timeout publication must use this so push/PR failures
+     * remap to retryable `harness-failure` (#1272 review-2).
+     */
+    executePublishUnpublishedStageCommit?: typeof executePublishUnpublishedStageCommit;
+    /**
+     * Implement-deliverable probe required by the publish executor (#1272).
+     */
+    probeImplementDeliverable?: (
+      wtPath: string,
+      issueNumber: number,
+    ) => Promise<{ present: boolean; description?: string }>;
   };
 
 interface PlanningLifecycle {
@@ -1173,7 +1187,8 @@ export async function runPlanningPhases(
         const nl = logText.indexOf("\n");
         const tipSubject = (nl === -1 ? logText : logText.slice(0, nl)).trim();
         const tipBody = nl === -1 ? "" : logText.slice(nl + 1);
-        let linkedOpenPr = false;
+        let linkedOpenPr = true;
+        let prLookupFailed = false;
         try {
           if (deps.getPrForIssue) {
             linkedOpenPr = (await deps.getPrForIssue(cfg, issueNumber)) != null;
@@ -1182,7 +1197,8 @@ export async function runPlanningPhases(
             linkedOpenPr = (await getPrBranch(cfg, wt.branch)) != null;
           }
         } catch {
-          linkedOpenPr = false;
+          prLookupFailed = true;
+          linkedOpenPr = true;
         }
         const aheadForPublish = await doHasCommitsAhead(wt.path, cfg.base_branch);
         const timeoutPark = resolveTimeoutParkForUnpublishedCommit(
@@ -1193,11 +1209,23 @@ export async function runPlanningPhases(
             extraGlobs: cfg.test_gate?.non_product_dirty_globs ?? [],
             commitsAheadOfBase: aheadForPublish,
             linkedOpenPr,
+            prLookupFailed,
             tipSubject,
             tipBody,
           },
           ctx,
         );
+        if (prLookupFailed) {
+          await doSetBlocked(
+            cfg,
+            issueNumber,
+            `Implementation harness (${primary}) failed: ${reason}. PR linkage is indeterminate; publication refused.`,
+            "implementing",
+            "harness-failure",
+          );
+          await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
+          return blockedOutcome("PR linkage is indeterminate", "harness-failure");
+        }
         if (timeoutPark.action === "publish") {
           const activeChanges = doListChangeDirs(wt.path);
           if (activeChanges.length === 0) {
@@ -1229,7 +1257,90 @@ export async function runPlanningPhases(
           }
           console.log(
             `[pipeline] #${issueNumber}: implementation harness (${primary}) failed (${reason}) but left ` +
-              `a publishable unpublished ${timeoutPark.classification.publishable ? timeoutPark.classification.tipKind : "stage"} commit — proceeding to post-implement`,
+              `a publishable unpublished ${timeoutPark.classification.publishable ? timeoutPark.classification.tipKind : "stage"} commit — publishing via publish_unpublished_stage_commit`,
+          );
+          const executeFn =
+            deps.executePublishUnpublishedStageCommit ?? executePublishUnpublishedStageCommit;
+          const slugFromBranch = wt.branch.startsWith(`pipeline/${issueNumber}-`)
+            ? wt.branch.slice(`pipeline/${issueNumber}-`.length)
+            : wt.branch;
+          const published = await executeFn(cfg, issueNumber, {
+            pipelineRunId,
+            getIssueDetail: deps.getIssueDetail,
+            createPr: deps.createPr,
+            transition: doTransition,
+            setBlocked: doSetBlocked,
+            inspectDeps: {
+              getOnDiskForIssue:
+                deps.getOnDiskForIssue ??
+                (async () => ({ path: wt.path, slug: slugFromBranch })),
+              gitInWorktree: doGitInWorktree,
+              hasCommitsAhead: doHasCommitsAhead,
+              getPrForIssue:
+                deps.getPrForIssue ??
+                (async () => (deps.getPrForBranch ?? getPrForBranch)(cfg, wt.branch)),
+              getPrForBranch: deps.getPrForBranch,
+              extraGlobs: cfg.test_gate?.non_product_dirty_globs ?? [],
+              ...deps.inspectUnpublishedDeps,
+            },
+            resumeDeps: {
+              ...deps,
+              gitInWorktree: doGitInWorktree,
+              setBlocked: doSetBlocked,
+              transition: doTransition,
+            },
+            probeImplementDeliverable:
+              deps.probeImplementDeliverable ??
+              (async (wtPath) => {
+                const ids = doListChangeDirs(wtPath);
+                return ids.length > 0
+                  ? {
+                      present: true,
+                      description: `OpenSpec change(s) already present at HEAD: ${ids.join(", ")}`,
+                    }
+                  : { present: false };
+              }),
+          });
+          if (published.succeeded) {
+            await completePlanningLifecycle(
+              cfg,
+              issueNumber,
+              activeLifecycle,
+              opts,
+              deps,
+              "advanced",
+              wt.path,
+            );
+            return (
+              published.outcome ?? {
+                advanced: true,
+                from: "implementing",
+                to: "design-gate",
+                summary: published.evidence,
+              }
+            );
+          }
+          if (!published.outcome) {
+            await doSetBlocked(
+              cfg,
+              issueNumber,
+              published.error ?? published.evidence,
+              "implementing",
+              "harness-failure",
+            );
+          }
+          await completePlanningLifecycle(
+            cfg,
+            issueNumber,
+            activeLifecycle,
+            opts,
+            deps,
+            "blocked",
+            wt.path,
+          );
+          return (
+            published.outcome ??
+            blockedOutcome(published.error ?? published.evidence, "harness-failure")
           );
         } else {
           // Salvage (#547): before blocking, attempt to recover uncommitted implement
