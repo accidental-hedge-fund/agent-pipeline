@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import {
   ADVANCE_MATERIAL_KINDS,
   LOOP_MATERIAL_KINDS,
+  TRAIN_MATERIAL_KINDS,
 } from "../scripts/material-filter.ts";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -124,6 +125,21 @@ test("Claude and Codex share required advance material kinds", () => {
   }
 });
 
+test("Claude and Codex share required train material kinds", () => {
+  const claude = read(CLAUDE_SKILL);
+  const codex = read(CODEX_SKILL);
+  for (const kind of TRAIN_MATERIAL_KINDS) {
+    assert.ok(
+      claude.includes(kind),
+      `Claude skill missing train material kind ${kind}`,
+    );
+    assert.ok(
+      codex.includes(kind),
+      `Codex skill missing train material kind ${kind}`,
+    );
+  }
+});
+
 test("Claude and Codex share required loop material kinds", () => {
   const claude = read(CLAUDE_SKILL);
   const codex = read(CODEX_SKILL);
@@ -200,6 +216,28 @@ There is no monitor substitute.
     /Grok substitute/i.test(src) && /monitor/i.test(src),
     "live Claude skill must keep Grok monitor substitute",
   );
+});
+
+test("train skill follow uses logs plus material-filter, not stdout grep", () => {
+  for (const { label, p } of [
+    { label: "claude", p: CLAUDE_SKILL },
+    { label: "codex", p: CODEX_SKILL },
+  ]) {
+    const src = read(p);
+    assert.match(src, /train_run_handoff/, `${label}: must name train_run_handoff`);
+    assert.match(
+      src,
+      /logs <train-run-id> --events --follow/,
+      `${label}: must name pipeline logs train follow`,
+    );
+    assert.match(src, /material-filter\.mjs/, `${label}: must name material-filter`);
+    assert.match(src, /train_loop_linked/, `${label}: must name train_loop_linked`);
+    assert.doesNotMatch(
+      src,
+      /tail -F \| grep/,
+      `${label}: must not teach tail -F | grep of train stdout as the primary path`,
+    );
+  }
 });
 
 test("guard bites: material kind list drift from shared constant fails", () => {

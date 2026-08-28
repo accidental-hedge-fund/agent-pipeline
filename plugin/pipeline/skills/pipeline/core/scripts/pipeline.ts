@@ -3672,6 +3672,7 @@ export async function advanceWaveThroughLoop(
   let engineFailed: string | null = null;
   let driveStopReason: string | null = null;
   let driveRunId: string | null = null;
+  let linkedLoop: import("./stages/train.ts").LinkedLoopRun | undefined;
   try {
     const engineResult = await runLoopEngine({
       engine,
@@ -3687,6 +3688,14 @@ export async function advanceWaveThroughLoop(
         console.error(
           `[train] advance-wave loop ready ${ctx.runId}; issues ${issues.map((n) => `#${n}`).join(", ")}`,
         );
+        if (typeof ctx.runId === "string" && ctx.runId.trim() !== "") {
+          linkedLoop = {
+            runId: ctx.runId,
+            ...(typeof ctx.events === "string" && ctx.events.trim() !== ""
+              ? { eventsPath: ctx.events }
+              : {}),
+          };
+        }
       },
     });
     if (engineResult.kind === "error") {
@@ -3720,7 +3729,8 @@ export async function advanceWaveThroughLoop(
     engineMessage: engineFailed,
   });
 
-  const out = new Map<number, AdvanceOutcome>();
+  const out = new Map<number, AdvanceOutcome>() as import("./stages/train.ts").AdvanceWaveResult;
+  if (linkedLoop) out.loopRun = linkedLoop;
   for (const issue of issues) {
     const scoped = scopeTrainAdvanceEvidenceForIssue(waveEvidence, issue);
     const exitForClassify =

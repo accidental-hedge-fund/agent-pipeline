@@ -60,13 +60,26 @@ export const TRUSTED_SURFACE_FILE = "trusted-surface.json";
 
 export type RunId = string;
 
+/** Filesystem-safe UTC timestamp with millisecond precision.
+ *  Format: `YYYY-MM-DDTHH-MM-SS-mmmZ` (colons and the decimal point replaced
+ *  with hyphens) so two instants in the same second produce distinct ids. */
+export function filesystemSafeUtcTimestamp(startedAt: Date): string {
+  return startedAt.toISOString().replace(/:/g, "-").replace(/\.(\d+)Z$/, "-$1Z");
+}
+
 /** Produce the run-id from issue number and dispatch start time.
  *  Format: `<issue>-<YYYY-MM-DDTHH-MM-SS-mmmZ>` (filesystem-safe; colons and the
  *  decimal point replaced with hyphens). Milliseconds are preserved so that two
  *  dispatches starting in the same second produce distinct directories. */
 export function runIdFor(issue: number, startedAt: Date): RunId {
-  const iso = startedAt.toISOString().replace(/:/g, "-").replace(/\.(\d+)Z$/, "-$1Z");
-  return `${issue}-${iso}`;
+  return `${issue}-${filesystemSafeUtcTimestamp(startedAt)}`;
+}
+
+/** Produce a train-level run-id. Distinct from per-issue advance ids
+ *  (`<issue>-<timestamp>`): prefix `train-` plus the same filesystem-safe UTC
+ *  timestamp with milliseconds. */
+export function trainRunIdFor(startedAt: Date): RunId {
+  return `train-${filesystemSafeUtcTimestamp(startedAt)}`;
 }
 
 /** Root directory that holds all run subdirectories for a repo. */
@@ -111,7 +124,8 @@ interface RunEventBase {
 export interface RunStartEvent extends RunEventBase {
   type: "run_start";
   run_id: RunId;
-  issue: number;
+  /** Omitted on train runs — a train is not a one-issue advance. */
+  issue?: number;
   repo: string;
   /**
    * Outer-host session identity when known (#784). Independent of implementer
@@ -955,10 +969,29 @@ export interface RunEngineIdentity {
   commit_sha?: string | null;
 }
 
+export type RunKind = "advance" | "train";
+
+export interface TrainRunSelector {
+  issues?: number[];
+  milestone?: string;
+}
+
 export interface RunMeta {
   schema_version: number;
   run_id: RunId;
-  issue: number;
+  /**
+   * Advance runs identify one issue. Train runs omit this (or leave it null)
+   * so a multi-item train is not a fake one-issue advance record.
+   */
+  issue?: number | null;
+  /** Explicit run kind. Omitted on historical advance runs (treated as advance). */
+  kind?: RunKind;
+  /** Train merge mode when `kind` is `train`. */
+  merge_mode?: boolean;
+  /** Train selector when `kind` is `train`. */
+  selector?: TrainRunSelector;
+  /** Ordered work-list issue numbers when known at train init. */
+  ordered_issues?: number[];
   repo: string;
   profile: string | null;
   started_at: string;
@@ -983,7 +1016,16 @@ export interface RunMeta {
 export interface InitRunDirOpts {
   runDir: string;
   runId: RunId;
-  issue: number;
+  /**
+   * Required for advance runs. Train runs (`kind: "train"`) omit this so
+   * `run.json` is not a fake single-issue advance record.
+   */
+  issue?: number;
+  /** When `"train"`, write train identity (selector, merge mode, ordered issues). */
+  kind?: RunKind;
+  mergeMode?: boolean;
+  selector?: TrainRunSelector;
+  orderedIssues?: readonly number[];
   repo: string;
   profile: string | null;
   startedAt: string;
@@ -1033,13 +1075,21 @@ export async function initRunDir(
         : opts.discoveryChannel === null
           ? undefined
           : "live-run";
+    const isTrain = opts.kind === "train";
     const meta: RunMeta = {
       schema_version: RUN_SCHEMA_VERSION,
       run_id: opts.runId,
-      issue: opts.issue,
       repo: opts.repo,
       profile: opts.profile,
       started_at: opts.startedAt,
+      ...(isTrain
+        ? {
+            kind: "train" as const,
+            merge_mode: !!opts.mergeMode,
+            ...(opts.selector ? { selector: opts.selector } : {}),
+            ...(opts.orderedIssues ? { ordered_issues: [...opts.orderedIssues] } : {}),
+          }
+        : { issue: opts.issue }),
       ...(opts.engine ? { engine: opts.engine } : {}),
       ...(outerHost ? { outer_host: outerHost } : {}),
       ...(discoveryChannel ? { discovery_channel: discoveryChannel } : {}),
@@ -1054,17 +1104,25 @@ export async function initRunDir(
     // run_start and the terminal tee attaching does not fail on a missing file (#155).
     await deps.appendFile(path.join(opts.runDir, "terminal.log"), "");
 
-    // Append the run_start event (appendFile creates events.jsonl on first use)
-    const event: RunStartEvent = {
-      schema_version: RUN_SCHEMA_VERSION,
-      type: "run_start",
-      at: opts.startedAt,
-      run_id: opts.runId,
-      issue: opts.issue,
-      repo: opts.repo,
-      ...(outerHost ? { outer_host: outerHost } : {}),
-    };
-    await appendEvent(opts.runDir, event, deps);
+    // Append the run_start event (appendFile creates events.jsonl on first use).
+    // Train runs own seq via the train event session; skip here so seq stays 1-based
+    // without a duplicate run_start. Still create events.jsonl so hosts can follow
+    // immediately after init.
+    if (isTrain) {
+      await deps.appendFile(path.join(opts.runDir, "events.jsonl"), "");
+    }
+    if (!isTrain) {
+      const event: RunStartEvent = {
+        schema_version: RUN_SCHEMA_VERSION,
+        type: "run_start",
+        at: opts.startedAt,
+        run_id: opts.runId,
+        issue: opts.issue,
+        repo: opts.repo,
+        ...(outerHost ? { outer_host: outerHost } : {}),
+      };
+      await appendEvent(opts.runDir, event, deps);
+    }
   } catch (err) {
     console.warn(
       `[pipeline] run-store: initRunDir failed (non-fatal): ${(err as Error).message}`,

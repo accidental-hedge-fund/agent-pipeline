@@ -85,6 +85,7 @@ Document allowlists and tokens in the **host** config, not in repository files.
 {
   "schema_version": 1,
   "kind": "train_status",
+  "run_id": "train-2026-08-28T17-28-03-000Z",
   "ordered_issues": [1, 2],
   "current_issue": 2,
   "current_index": 1,
@@ -108,6 +109,7 @@ Document allowlists and tokens in the **host** config, not in repository files.
 |---|---|
 | `schema_version` | Always `1` for this shape |
 | `kind` | Always `"train_status"` |
+| `run_id` | Additive durable train run id (`train-<timestamp>`) when the run store was initialized |
 | `ordered_issues` | Dependency-ordered issue numbers |
 | `current_issue` / `current_index` | Item in progress, or `null` / last when complete |
 | `next_action` | `advance` \| `merge` \| `wait-for-base` \| `next-item` \| `complete` \| `stopped` \| … |
@@ -126,11 +128,17 @@ Exit codes: `0` success; non-zero stop (needs-human, merge failure, containment,
 Recommended pattern:
 
 1. Start train in a long-lived process (foreground, `systemd`, or host job runner).
-2. On a timer (e.g. 5–15 minutes) or on process exit, post a short summary:
+2. Parse stderr `train_run_handoff` for `run_id` and follow
+   `pipeline logs <train-run-id> --events --follow | material-filter.mjs`.
+   Dual-follow `train_loop_linked` loop run ids. Re-arm until train `run_complete`.
+3. On a timer (e.g. 5–15 minutes) or on process exit, post a short summary:
    - issue list / milestone
    - `complete` / `blocker` / current issue
    - link to PR if known
-3. Prefer `pipeline train --json` final output and/or `pipeline loop logs <run-id> --events --follow` for mid-flight detail when using `single`/`loop`.
+4. Prefer `pipeline train --json` final output (`run_id` is additive) for the
+   terminal object. Use `pipeline logs <train-run-id> --events --follow` for
+   mid-flight train detail, and `pipeline loop logs <run-id> --events --follow`
+   when using `single`/`loop` or a linked wave.
 
 Do not spam full logs or secrets into chat.
 

@@ -1321,6 +1321,49 @@ The final operator summary **must** include (1) the run's **terminal reason**
 explicit confirmation that run-scoped follows were stopped (e.g. **follows
 stopped**).
 
+### 4c. Orchestration pattern for `/pipeline:train`
+
+`pipeline train` (with or without `--merge`) is **long-running**. Hosts **must not** scrape unstructured train stdout. The primary notify path is `pipeline logs` piped through the shared material filter — not grepping captured train stdout.
+
+**Mandatory progress-notify:**
+
+1. Parse the early stderr JSON line `kind: "train_run_handoff"` for `run_id` and the absolute `events` path. Do not wait for the final `train_status` object.
+2. Follow the train generic run store with the shared material filter:
+
+```bash
+node ~/.omp/agent/skills/pipeline/scripts/pipeline.mjs logs <train-run-id> --events --follow \
+  | node ~/.omp/agent/skills/pipeline/scripts/material-filter.mjs
+```
+
+There is **no** `pipeline train logs` command. Until-terminal exits 0 on train `run_complete`.
+3. When `train_loop_linked` publishes a real loop `loop_run_id` (and absolute loop `events` path when known), **dual-follow** that loop stream the same way §4b dual-follows a linked advance run. Apply the material filter on **both** streams:
+
+```bash
+node ~/.omp/agent/skills/pipeline/scripts/pipeline.mjs loop logs <loop-run-id> --events --follow \
+  | node ~/.omp/agent/skills/pipeline/scripts/material-filter.mjs
+```
+
+4. Notify via the host map on material train lines. **Re-arm** material follow after wait cancel until train `run_complete`.
+5. Notify failure does **not** change train merge or advance state. Observation only.
+
+**Must notify** train material kinds (shared filter constant `TRAIN_MATERIAL_KINDS`):
+
+- `run_start`
+- `train_work_list_resolved`
+- `train_wave_started`
+- `train_loop_linked`
+- `train_item_started`
+- `train_item_completed`
+- `train_pr_created`
+- `train_merge_attempted`
+- `train_merge_proven`
+- `train_merge_integrated`
+- `train_sibling_halted`
+- `train_wave_ended`
+- `run_complete`
+
+Raw engine, CI, and harness stdout stay on the linked wave/advance logs — not the train material stream.
+
 ### 5. Modes that DON'T need this orchestration
 
 - `--status` — read-only, completes in seconds
@@ -1340,7 +1383,8 @@ follow, which streams until interrupt).
 **Not in this list:** multi-item `/pipeline:loop` drive or resume (with or without
 `--milestone` / issue lists / `--resume`) — those use §4b long-running
 orchestration. Do not apply the seconds-only / no-Monitor rule to drive/resume
-just because `--audit` is fast.
+just because `--audit` is fast. **`/pipeline:train`** (with or without `--merge`)
+uses §4c: `pipeline logs <train-run-id> --events --follow | material-filter.mjs`.
 
 `--once` still needs the orchestration because a single heavy stage
 (planning especially) can hit its 20-min timeout. Use the same
