@@ -78,6 +78,32 @@ export interface TrainStatus {
   run_id?: string;
 }
 
+/** Closed snapshot actions for `pipeline train --dry-run` (#1275). */
+export type TrainIntendedAction =
+  | "would-advance"
+  | "waiting-on-deps"
+  | "would-merge"
+  | "already-integrated"
+  | "would-block"
+  | "held";
+
+export interface TrainPlanItem {
+  issue: number;
+  stage: string | null;
+  pr: number | null;
+  intended_action: TrainIntendedAction;
+  on_frontier: boolean;
+}
+
+export interface TrainPlan {
+  schema_version: 1;
+  kind: "train_plan";
+  merge_mode: boolean;
+  ordered_issues: number[];
+  merge_first: number[];
+  items: TrainPlanItem[];
+}
+
 export interface TrainOpts {
   /** Explicit issue numbers (positive integers). Mutually exclusive with empty+milestone-only. */
   issues?: readonly number[];
@@ -85,6 +111,11 @@ export interface TrainOpts {
   milestone?: string;
   /** When true, merge each ready-to-deploy PR and prove base containment before dependents advance. */
   merge: boolean;
+  /**
+   * Opt-in read-only plan (#1275). Resolves order + GitHub PR/stage snapshot and
+   * returns without advance, merge, or a train run store. Not the default.
+   */
+  dryRun?: boolean;
   baseBranch: string;
   repoDir: string;
   repo: string;
@@ -95,6 +126,8 @@ export interface TrainOpts {
 export interface TrainResult {
   exitCode: number;
   status: TrainStatus;
+  /** Present when `opts.dryRun` produced a read-only plan. */
+  plan?: TrainPlan;
 }
 
 export type AdvanceOutcome =
@@ -569,6 +602,153 @@ export function buildTrainStatus(partial: Omit<TrainStatus, "schema_version" | "
   return { schema_version: 1, kind: "train_status", ...partial };
 }
 
+export function buildTrainPlan(partial: Omit<TrainPlan, "schema_version" | "kind">): TrainPlan {
+  return { schema_version: 1, kind: "train_plan", ...partial };
+}
+
+/** Shared `[train] ordered issues:` line used by live train and dry-run. */
+export function formatTrainOrderedIssuesLine(
+  ordered: readonly number[],
+  mergeMode: boolean,
+  mergeFirst: readonly number[],
+): string {
+  return (
+    `[train] ordered issues: ${ordered.map((n) => `#${n}`).join(" → ")}` +
+    (mergeMode
+      ? ` (merge mode, serial ship; merge-first ${mergeFirst.length ? mergeFirst.map((n) => `#${n}`).join(", ") : "none"})`
+      : " (advance only, frontier waves)")
+  );
+}
+
+async function linkedPrForPlan(
+  issue: number,
+  deps: TrainDeps,
+): Promise<{ pr: number | null; open: boolean; merged: boolean }> {
+  const openPr = await deps.getPrForIssue(issue);
+  if (openPr != null) {
+    return { pr: openPr, open: true, merged: false };
+  }
+  const anyPr = await deps.getPrForIssueAnyState(issue);
+  if (anyPr == null) {
+    return { pr: null, open: false, merged: false };
+  }
+  const obs = await deps.observePr(anyPr);
+  if (obs.state === "merged") {
+    return { pr: anyPr, open: false, merged: true };
+  }
+  if (obs.state === "open") {
+    return { pr: anyPr, open: true, merged: false };
+  }
+  return { pr: null, open: false, merged: false };
+}
+
+function classifyTrainIntendedAction(input: {
+  mergeMode: boolean;
+  stage: string | null;
+  held: boolean;
+  open: boolean;
+  merged: boolean;
+  waitingOnDeps: boolean;
+}): TrainIntendedAction {
+  if (input.held) return "held";
+  if (input.mergeMode && input.stage === "ready-to-deploy") {
+    if (input.open) return "would-merge";
+    if (input.merged) return "already-integrated";
+    return "would-block";
+  }
+  if (input.waitingOnDeps) return "waiting-on-deps";
+  return "would-advance";
+}
+
+async function planTrainDryRun(input: {
+  ordered: readonly number[];
+  byNumber: ReadonlyMap<number, TrainIssueSnapshot>;
+  codeDeps: ReadonlyMap<number, readonly number[]>;
+  mergeMode: boolean;
+  deps: TrainDeps;
+}): Promise<TrainPlan> {
+  const { ordered, byNumber, codeDeps, mergeMode, deps } = input;
+  const linked = new Map<number, { pr: number | null; open: boolean; merged: boolean }>();
+  for (const n of ordered) {
+    linked.set(n, await linkedPrForPlan(n, deps));
+  }
+
+  const held = new Set<number>();
+  const alreadyIntegrated = new Set<number>();
+  for (const n of ordered) {
+    const snap = byNumber.get(n)!;
+    if (isBlockedOrNeedsHumanSnapshot(snap)) held.add(n);
+    const stage = pipelineStageFromLabels(snap.labels);
+    const pr = linked.get(n)!;
+    if (mergeMode && stage === "ready-to-deploy" && pr.merged) {
+      alreadyIntegrated.add(n);
+    }
+  }
+
+  const frontier = new Set(
+    computeBaseEligibleFrontier({
+      ordered,
+      finished: alreadyIntegrated,
+      held,
+      integrated: alreadyIntegrated,
+      codeDeps,
+    }),
+  );
+
+  const items: TrainPlanItem[] = ordered.map((n) => {
+    const snap = byNumber.get(n)!;
+    const stage = pipelineStageFromLabels(snap.labels);
+    const pr = linked.get(n)!;
+    const prereqs = codeDeps.get(n) ?? [];
+    const waitingOnDeps = prereqs.some((p) => !alreadyIntegrated.has(p));
+    return {
+      issue: n,
+      stage,
+      pr: pr.pr,
+      intended_action: classifyTrainIntendedAction({
+        mergeMode,
+        stage,
+        held: held.has(n),
+        open: pr.open,
+        merged: pr.merged,
+        waitingOnDeps,
+      }),
+      on_frontier: frontier.has(n),
+    };
+  });
+
+  const mergeFirst = mergeMode
+    ? ordered.filter((n) => {
+        const snap = byNumber.get(n)!;
+        const pr = linked.get(n)!;
+        return pipelineStageFromLabels(snap.labels) === "ready-to-deploy" && pr.open;
+      })
+    : [];
+
+  return buildTrainPlan({
+    merge_mode: mergeMode,
+    ordered_issues: [...ordered],
+    merge_first: mergeFirst,
+    items,
+  });
+}
+
+function logTrainPlan(plan: TrainPlan, log: (msg: string) => void): void {
+  log(formatTrainOrderedIssuesLine(plan.ordered_issues, plan.merge_mode, plan.merge_first));
+  for (const item of plan.items) {
+    const prText = item.pr != null ? `PR #${item.pr}` : "PR none";
+    const mergeFirstNote =
+      plan.merge_mode && plan.merge_first.includes(item.issue) ? " merge-first" : "";
+    log(
+      `[train] #${item.issue}  stage=${item.stage ?? "none"}  ${prText}  ` +
+        `frontier=${item.on_frontier ? "yes" : "no"}  action=${item.intended_action}${mergeFirstNote}`,
+    );
+  }
+  log(
+    "[train] dry-run: no mutations performed (no advance, merge, push, comment, or run store)",
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Orchestrator
 // ---------------------------------------------------------------------------
@@ -616,16 +796,37 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
   const ordered = orderIssuesForTrain(snapshots, mergeMode);
   const byNumber = new Map(snapshots.map((s) => [s.number, s]));
   const codeDeps = codeDependencyMap(snapshots);
+
+  if (opts.dryRun) {
+    const plan = await planTrainDryRun({
+      ordered,
+      byNumber,
+      codeDeps,
+      mergeMode,
+      deps,
+    });
+    logTrainPlan(plan, deps.log);
+    return {
+      exitCode: 0,
+      status: buildTrainStatus({
+        ordered_issues: plan.ordered_issues,
+        current_issue: null,
+        current_index: 0,
+        next_action: "resolve-work-list",
+        merge_mode: plan.merge_mode,
+        items: [],
+        blocker: null,
+        complete: false,
+      }),
+      plan,
+    };
+  }
+
   const mergeFirst = mergeMode
     ? ordered.filter((n) => isReadyToDeploySnapshot(byNumber.get(n)!))
     : [];
 
-  deps.log(
-    `[train] ordered issues: ${ordered.map((n) => `#${n}`).join(" → ")}` +
-      (mergeMode
-        ? ` (merge mode, serial ship; merge-first ${mergeFirst.length ? mergeFirst.map((n) => `#${n}`).join(", ") : "none"})`
-        : " (advance only, frontier waves)"),
-  );
+  deps.log(formatTrainOrderedIssuesLine(ordered, mergeMode, mergeFirst));
 
   const startedAt = deps.now?.() ?? new Date();
   const session = await initTrainRunStore({

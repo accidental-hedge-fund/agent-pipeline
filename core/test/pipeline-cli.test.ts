@@ -220,6 +220,17 @@ test("pipeline-cli: train — --issues --merge --json → []", () => {
   assert.deepEqual(roundTrip(["train", "--issues", "870", "--merge", "--json"]), []);
 });
 
+test("pipeline-cli: train — --issues --dry-run is allowlisted (#1275)", () => {
+  assert.deepEqual(roundTrip(["train", "--issues", "10,11", "--dry-run"]), []);
+});
+
+test("pipeline-cli: train --dry-run parses onto opts.dryRun (#1275)", () => {
+  const { opts, numArg } = parseCli(["train", "--issues", "10,11", "--dry-run"]);
+  assert.equal(numArg, "train");
+  assert.equal(opts.dryRun, true);
+  assert.equal(opts.issues, "10,11");
+});
+
 test("pipeline-cli: train --json parses onto opts.json", () => {
   const { opts, numArg } = parseCli(["train", "--milestone", "v1.0.0", "--json"]);
   assert.equal(numArg, "train");
@@ -1300,6 +1311,234 @@ test("pipeline-cli: train --json stdout stays one train_status when advance-wave
   } finally {
     console.log = originalLog;
     process.exitCode = priorExitCode;
+  }
+});
+
+const UNSUPPORTED_TRAIN_DRY_RUN =
+  "pipeline train: --dry-run is not supported for train; omit it.";
+
+test("pipeline-cli: train --dry-run does not reject an allowlisted flag (#1275)", async () => {
+  assert.ok(
+    COMMAND_REGISTRY.train.allowedFlags instanceof Set &&
+      COMMAND_REGISTRY.train.allowedFlags.has("dryRun"),
+    "train allowedFlags must still include dryRun",
+  );
+  const { opts } = parseCli(["train", "--issues", "10,11", "--dry-run"]);
+  const trainCfg = {
+    repo: "owner/repo",
+    repo_dir: "/repo",
+    base_branch: "main",
+  } as PipelineConfig;
+  const deps: TrainCommandDeps = {
+    makeTrainDeps: () => ({
+      log: () => {},
+      listMilestoneIssues: async () => [],
+      getIssue: async (issue) => ({
+        number: issue,
+        title: `Issue ${issue}`,
+        body: "",
+        labels: ["pipeline:ready"],
+        state: "open",
+      }),
+      advanceWave: async () => {
+        throw new Error("dry-run must not call advanceWave");
+      },
+      getPrForIssue: async () => null,
+      getPrForIssueAnyState: async () => null,
+      mergeIssuePr: async () => {
+        throw new Error("dry-run must not call mergeIssuePr");
+      },
+      observePr: async () => ({ state: "open", mergeCommitOid: null, headRefOid: null }),
+      fetchBase: async () => {
+        throw new Error("dry-run must not fetchBase");
+      },
+      baseTip: async () => "base-tip",
+      isAncestor: async () => false,
+      runStore: memTrainRunStore(),
+      writeHandoff: () => {
+        throw new Error("dry-run must not write train_run_handoff");
+      },
+    }),
+    async runSingleIssue() {
+      throw new Error("train production path uses advanceWave, not N×single");
+    },
+    async runAdvanceWave() {
+      throw new Error("dry-run must not call runAdvanceWave");
+    },
+  };
+  const stderr: string[] = [];
+  const originalErr = console.error;
+  console.error = (...args: unknown[]) => {
+    stderr.push(`${args.map(String).join(" ")}`);
+  };
+  try {
+    const exitCode = await runTrainCommand(opts, trainCfg, deps);
+    assert.notEqual(exitCode, 2, "handler must not exit 2 for allowlisted --dry-run");
+    assert.equal(exitCode, 0);
+    assert.equal(stderr.includes(UNSUPPORTED_TRAIN_DRY_RUN), false);
+    assert.doesNotMatch(stderr.join("\n"), /--dry-run is not supported for train/);
+  } finally {
+    console.error = originalErr;
+  }
+});
+
+test("pipeline-cli: train --merge --dry-run does not merge or advance (#1275)", async () => {
+  const { opts } = parseCli(["train", "--issues", "10", "--merge", "--dry-run"]);
+  const trainCfg = {
+    repo: "owner/repo",
+    repo_dir: "/repo",
+    base_branch: "main",
+  } as PipelineConfig;
+  let mergeCalls = 0;
+  let waveCalls = 0;
+  const deps: TrainCommandDeps = {
+    makeTrainDeps: () => ({
+      log: () => {},
+      listMilestoneIssues: async () => [],
+      getIssue: async (issue) => ({
+        number: issue,
+        title: `Issue ${issue}`,
+        body: "",
+        labels: ["pipeline:ready-to-deploy"],
+        state: "open",
+      }),
+      advanceWave: async () => {
+        waveCalls += 1;
+        throw new Error("dry-run must not call advanceWave");
+      },
+      getPrForIssue: async () => 20,
+      getPrForIssueAnyState: async () => 20,
+      mergeIssuePr: async () => {
+        mergeCalls += 1;
+      },
+      observePr: async () => ({ state: "open", mergeCommitOid: null, headRefOid: null }),
+      fetchBase: async () => {
+        throw new Error("dry-run must not fetchBase");
+      },
+      baseTip: async () => "base-tip",
+      isAncestor: async () => false,
+      runStore: memTrainRunStore(),
+      writeHandoff: () => {
+        throw new Error("dry-run must not write train_run_handoff");
+      },
+    }),
+    async runSingleIssue() {
+      throw new Error("train production path uses advanceWave, not N×single");
+    },
+    async runAdvanceWave() {
+      waveCalls += 1;
+      throw new Error("dry-run must not call runAdvanceWave");
+    },
+  };
+  const exitCode = await runTrainCommand(opts, trainCfg, deps);
+  assert.equal(exitCode, 0);
+  assert.equal(mergeCalls, 0);
+  assert.equal(waveCalls, 0);
+});
+
+test("pipeline-cli: train --json --dry-run emits one train_plan object (#1275)", async () => {
+  const { opts } = parseCli(["train", "--issues", "10,11", "--dry-run", "--json"]);
+  const trainCfg = {
+    repo: "owner/repo",
+    repo_dir: "/repo",
+    base_branch: "main",
+  } as PipelineConfig;
+  const store = memTrainRunStore();
+  const handoff: string[] = [];
+  const deps: TrainCommandDeps = {
+    makeTrainDeps: () => ({
+      log: () => {},
+      listMilestoneIssues: async () => [],
+      getIssue: async (issue) => ({
+        number: issue,
+        title: `Issue ${issue}`,
+        body: "",
+        labels: ["pipeline:ready"],
+        state: "open",
+      }),
+      advanceWave: async () => {
+        throw new Error("dry-run must not call advanceWave");
+      },
+      getPrForIssue: async () => null,
+      getPrForIssueAnyState: async () => null,
+      mergeIssuePr: async () => {},
+      observePr: async () => ({ state: "open", mergeCommitOid: null, headRefOid: null }),
+      fetchBase: async () => {},
+      baseTip: async () => "base-tip",
+      isAncestor: async () => false,
+      runStore: store,
+      writeHandoff: (line) => {
+        handoff.push(line);
+      },
+    }),
+    async runSingleIssue() {
+      throw new Error("train production path uses advanceWave, not N×single");
+    },
+    async runAdvanceWave() {
+      throw new Error("dry-run must not call runAdvanceWave");
+    },
+  };
+  const stdout: string[] = [];
+  const originalLog = console.log;
+  const priorExitCode = process.exitCode;
+  console.log = (...args: unknown[]) => {
+    stdout.push(`${args.map(String).join(" ")}\n`);
+  };
+  process.exitCode = undefined;
+  try {
+    const exitCode = await runTrainCommand(opts, trainCfg, deps);
+    assert.equal(exitCode, 0);
+    const emitted = stdout.join("");
+    const document = JSON.parse(emitted) as {
+      kind?: string;
+      schema_version?: number;
+      ordered_issues?: number[];
+      merge_mode?: boolean;
+      items?: Array<{ issue?: number; stage?: string | null; pr?: number | null; intended_action?: string }>;
+    };
+    assert.equal(document.kind, "train_plan");
+    assert.notEqual(document.kind, "train_status");
+    assert.equal(document.schema_version, 1);
+    assert.deepEqual(document.ordered_issues, [10, 11]);
+    assert.equal(document.merge_mode, false);
+    assert.equal(document.items?.length, 2);
+    assert.equal(document.items?.[0]?.issue, 10);
+    assert.equal(document.items?.[0]?.intended_action, "would-advance");
+    assert.doesNotMatch(emitted, /"kind": "train_status"/);
+    assert.doesNotMatch(emitted, /train_run_handoff/);
+    assert.equal(handoff.length, 0);
+  } finally {
+    console.log = originalLog;
+    process.exitCode = priorExitCode;
+  }
+});
+
+test("pipeline-cli: train --dry-run without selector still fails before a plan (#1275)", async () => {
+  const { opts } = parseCli(["train", "--dry-run"]);
+  const trainCfg = {
+    repo: "owner/repo",
+    repo_dir: "/repo",
+    base_branch: "main",
+  } as PipelineConfig;
+  const stderr: string[] = [];
+  const originalErr = console.error;
+  console.error = (...args: unknown[]) => {
+    stderr.push(`${args.map(String).join(" ")}`);
+  };
+  try {
+    const exitCode = await runTrainCommand(opts, trainCfg, {
+      makeTrainDeps: () => {
+        throw new Error("missing selector must not build train deps");
+      },
+      async runSingleIssue() {
+        throw new Error("unused");
+      },
+    });
+    assert.equal(exitCode, 2);
+    assert.match(stderr.join("\n"), /--issues <n,n> and\/or --milestone/);
+    assert.doesNotMatch(stderr.join("\n"), /--dry-run is not supported for train/);
+  } finally {
+    console.error = originalErr;
   }
 });
 

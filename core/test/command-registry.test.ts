@@ -324,6 +324,13 @@ test("command-registry: merge-queue entry is an operator-authorized sequential m
   assert.equal(lookupCommand("merge-queue"), entry);
 });
 
+test("command-registry: train allowedFlags includes dryRun (#1275)", () => {
+  const flags = COMMAND_REGISTRY.train.allowedFlags;
+  assert.notEqual(flags, "all");
+  assert.ok((flags as Set<string>).has("dryRun"));
+  assert.deepEqual(validateFlags(COMMAND_REGISTRY.train, fakeCmdWithCliFlag("dryRun")), []);
+});
+
 test("command-registry: merge-queue rejects unsupported flags via validateFlags", () => {
   const entry = COMMAND_REGISTRY["merge-queue"];
   const offending = validateFlags(entry, fakeCmdWithCliFlag("jsonEvents"));
