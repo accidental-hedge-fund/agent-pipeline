@@ -724,12 +724,15 @@ test("default workflow-engine-defect policy orders unlink, checkpoint, then repa
   const recipes = DEFAULT_RECOVERY_POLICY["workflow-engine-defect"].recipes;
   const unlink = recipes.indexOf("unlink_engine_scratch");
   const checkpoint = recipes.indexOf("checkpoint_owned_harness_dirt");
+  const publish = recipes.indexOf("publish_unpublished_stage_commit");
   const repair = recipes.indexOf("repair_pipeline_item");
   assert.ok(unlink >= 0, "unlink_engine_scratch must be present");
   assert.ok(checkpoint >= 0, "checkpoint_owned_harness_dirt must be present");
+  assert.ok(publish >= 0, "publish_unpublished_stage_commit must be present");
   assert.ok(repair >= 0, "repair_pipeline_item must be present");
   assert.ok(unlink < checkpoint, "unlink before checkpoint");
-  assert.ok(checkpoint < repair, "checkpoint before implementer repair");
+  assert.ok(checkpoint < publish, "checkpoint before publish unpublished");
+  assert.ok(publish < repair, "publish unpublished before implementer repair");
 });
 
 test("policy-order bite: implementer repair must not be first for leftover evidence", () => {

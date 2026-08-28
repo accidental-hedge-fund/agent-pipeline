@@ -524,9 +524,14 @@ test("DEFAULT_RECOVERY_POLICY recipe order: checkpoint owned leftovers before re
   const recipes = DEFAULT_RECOVERY_POLICY["workflow-engine-defect"].recipes;
   const unlinkIdx = recipes.indexOf("unlink_engine_scratch");
   const checkpointIdx = recipes.indexOf("checkpoint_owned_harness_dirt");
+  const publishIdx = recipes.indexOf("publish_unpublished_stage_commit");
   const repairIdx = recipes.indexOf("repair_pipeline_item");
   assert.ok(checkpointIdx >= 0, "checkpoint_owned_harness_dirt must be configured");
-  assert.ok(unlinkIdx < checkpointIdx && checkpointIdx < repairIdx, `got ${recipes.join(" → ")}`);
+  assert.ok(publishIdx >= 0, "publish_unpublished_stage_commit must be configured");
+  assert.ok(
+    unlinkIdx < checkpointIdx && checkpointIdx < publishIdx && publishIdx < repairIdx,
+    `got ${recipes.join(" → ")}`,
+  );
 });
 
 test("DEFAULT_RECOVERY_POLICY recipe order: review-findings unlink before repair (#1060)", async () => {

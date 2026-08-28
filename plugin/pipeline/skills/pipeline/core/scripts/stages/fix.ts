@@ -44,6 +44,7 @@ import {
   type EnsureManagedWorktreeResult,
 } from "../worktree.ts";
 import { buildFixPrompt } from "../prompts/index.ts";
+import { resolveTimeoutParkForUnpublishedCommit } from "../unpublished-stage-commit.ts";
 import { runFormatGate, runFormatAndTestGates } from "./format-gate.ts";
 import {
   verifyHarnessCommits,
@@ -896,7 +897,40 @@ export async function advanceFix(
       const result = ctx.invokeResult.result;
       const retryResult = ctx.invokeResult.retryResult;
       // Crash salvage: retries exhausted; salvage of crashed attempts' work (#486).
-      if (!result.success && !ctx.salvaged) {
+      // #1272: consult the unpublished-commit classifier before timeout park so
+      // a pre-PR salvage/checkpoint commit claims publish_unpublished_stage_commit
+      // rather than an implementing-only afterRound branch.
+      const statusR = await gitInWorktree(
+        wt.path,
+        ["status", "--porcelain", "--untracked-files=all"],
+        { ignoreFailure: true },
+      );
+      const logR = await gitInWorktree(wt.path, ["log", "-1", "--format=%s%n%n%b"], { ignoreFailure: true });
+      const logText = logR.code === 0 ? logR.stdout : "";
+      const nl = logText.indexOf("\n");
+      const timeoutPark = resolveTimeoutParkForUnpublishedCommit(
+        {
+          issueNumber,
+          headBranch: branchName(issueNumber, wt.slug),
+          porcelain: statusR.code === 0 ? statusR.stdout : "",
+          extraGlobs: cfg.test_gate?.non_product_dirty_globs ?? [],
+          commitsAheadOfBase: true,
+          // Fix is typically post-PR. Pre-PR unpublished work still matches when
+          // the inspect path (recover-parked / executor) sets linkedOpenPr false.
+          linkedOpenPr: true,
+          tipSubject: (nl === -1 ? logText : logText.slice(0, nl)).trim(),
+          tipBody: nl === -1 ? "" : logText.slice(nl + 1),
+        },
+        ctx,
+      );
+      if (timeoutPark.action === "publish") {
+        return {
+          kind: "continue" as const,
+          ctx,
+          crashSalvaged: true,
+        };
+      }
+      if (!result.success && !ctx.salvaged && !ctx.ownershipCheckpointed) {
         const finalReason = result.timed_out
           ? `timed out after ${result.duration.toFixed(0)}s`
           : `exit ${result.exit_code}`;
@@ -921,7 +955,7 @@ export async function advanceFix(
       return {
         kind: "continue",
         ctx,
-        crashSalvaged: !result.success && ctx.salvaged,
+        crashSalvaged: !result.success && (ctx.salvaged || ctx.ownershipCheckpointed),
       };
     },
   });
@@ -953,7 +987,7 @@ export async function advanceFix(
   // path) is correctly skipped — the crash-retry salvage already produced the
   // commit that path exists to create.
   let headAfter = roundResult.ctx.headAfter;
-  if (!crashSalvaged && headBefore && headAfter && headBefore === headAfter && !roundResult.ctx.salvaged) {
+  if (!crashSalvaged && headBefore && headAfter && headBefore === headAfter && !roundResult.ctx.salvaged && !roundResult.ctx.ownershipCheckpointed) {
     // #131 / #758: harness reported success without committing and salvage
     // found nothing. Order preserved: external-commit (#349) → human-decision
     // park (#473) → does-not-reproduce (#391) → no-commits. External and DNR

@@ -1221,6 +1221,209 @@ test("salvageIfNoNewCommit: a failed salvage attempt's failureReason is passed t
   assert.deepEqual(result, { salvaged: false, failureReason: "git add failed: disk full" });
 });
 
+const harnessTimeout: HarnessResult = {
+  success: false,
+  stdout: "",
+  stderr: "",
+  exit_code: 1,
+  duration: 2405,
+  timed_out: true,
+};
+
+test("runPlanningPhases #1272: timeout + checkpoint commit + salvaged false publishes (no timeout park)", async () => {
+  let callCount = 0;
+  let createdPr: { body: string } | null = null;
+  let toStage: string | undefined;
+  const failTimeoutOnImplement = {
+    invoke: async () => {
+      callCount++;
+      return callCount >= 2 ? harnessTimeout : revisionOkResult;
+    },
+    trySalvageUncommittedWork: async () => ({ salvaged: false }),
+    listChangeDirs: () => ["publish-unpublished-timeout-commit"],
+    getPrForBranch: async () => null,
+    createPr: async (_c: unknown, spec: { body: string }) => {
+      createdPr = spec;
+      return 77;
+    },
+    transition: async (_c: unknown, _n: unknown, _from: string, to: string) => {
+      toStage = to;
+    },
+    gitInWorktree: async (_p: unknown, args: string[]) => {
+      if (Array.isArray(args) && args[0] === "log") {
+        return {
+          stdout: `salvage: stage harness work (#42)\n\nPipeline-salvaged commit: the owned-harness-leftover harness completed work.\n\nIssue: #42\nPipeline-Run: run-42\n`,
+          stderr: "",
+          code: 0,
+        };
+      }
+      if (Array.isArray(args) && args[0] === "status") return { stdout: "", stderr: "", code: 0 };
+      return { stdout: "", stderr: "", code: 0 };
+    },
+    ownershipDeps: {
+      gitStatusPorcelain: async () => "",
+      gitHead: async () => "deadbeef",
+      salvage: async () => ({ salvaged: true }),
+      mkdirp: async () => {},
+    },
+  };
+  // Authorship hint: ownershipCheckpointed is false (empty porcelain) so pass
+  // via salvage subject on git log + we also set salvaged false. Classifier
+  // matches salvage tip. Need recovered work: set trySalvage... wait, salvage
+  // skipped if not confirmedNoNewCommit (HEAD reads return deadbeef equal →
+  // confirmedNoNewCommit true → salvage attempted). trySalvage returns false.
+  // So recovered work is false unless classifier... resolveTimeoutPark requires
+  // recoveredWorkPresent. Empty checkpoint + salvaged false → BLOCK.
+  // Force recovered work by making salvage return true? Then salvaged is true,
+  // which is the legacy path. For salvaged===false + checkpoint we need
+  // ownershipCheckpointed. Drive porcelain dirt during invoke.
+  let porcelain = "";
+  const checkpointFixture = {
+    ...failTimeoutOnImplement,
+    ownershipDeps: {
+      gitStatusPorcelain: async () => porcelain,
+      gitHead: async () => "deadbeef",
+      salvage: async () => {
+        porcelain = "";
+        return { salvaged: true };
+      },
+      mkdirp: async () => {},
+    },
+    invoke: async () => {
+      callCount++;
+      if (callCount >= 2) {
+        porcelain = " M core/foo.ts\n";
+        return harnessTimeout;
+      }
+      return revisionOkResult;
+    },
+  };
+  callCount = 0;
+  const captured = await runAndCaptureOutcome(freeformHooks(), checkpointFixture);
+  assert.equal(captured.captured?.tag, undefined, `must not park: ${JSON.stringify(captured.captured)}`);
+  assert.equal(captured.outcome.advanced, true);
+  assert.ok(createdPr);
+  assert.match(createdPr!.body, /Closes #42/);
+  assert.ok(toStage === "design-gate" || toStage === "review-1", `to=${toStage}`);
+});
+
+test("runPlanningPhases #1272: timeout with clean tree and no new commit still blocks harness-failure", async () => {
+  let callCount = 0;
+  let created = 0;
+  const timeoutNoSalvage = {
+    invoke: async () => {
+      callCount++;
+      return callCount >= 2 ? harnessTimeout : revisionOkResult;
+    },
+    trySalvageUncommittedWork: async () => ({ salvaged: false }),
+    createPr: async () => {
+      created++;
+      return 1;
+    },
+    gitInWorktree: async () => ({ stdout: "deadbeef", stderr: "", code: 0 }),
+  };
+  callCount = 0;
+  const captured = await runAndCapture(freeformHooks(), timeoutNoSalvage);
+  assert.equal(captured?.tag, "harness-failure");
+  assert.match(captured?.reason ?? "", /timed out after 2405s/);
+  assert.equal(created, 0);
+});
+
+test("runPlanningPhases #1272: timeout checkpoint with unsatisfied deliverable does not open PR", async () => {
+  let callCount = 0;
+  let created = 0;
+  let porcelain = "";
+  const incomplete = {
+    invoke: async () => {
+      callCount++;
+      if (callCount >= 2) {
+        porcelain = " M core/foo.ts\n";
+        return harnessTimeout;
+      }
+      return revisionOkResult;
+    },
+    trySalvageUncommittedWork: async () => ({ salvaged: false }),
+    listChangeDirs: () => [],
+    getOnDiskForIssue: async () => ({ path: "/fake/wt", slug: "equiv" }),
+    createPr: async () => {
+      created++;
+      return 1;
+    },
+    gitInWorktree: async (_p: unknown, args: string[]) => {
+      if (Array.isArray(args) && args[0] === "log") {
+        return { stdout: "salvage: stage harness work (#42)\n\nowned-harness-leftover\n", stderr: "", code: 0 };
+      }
+      if (Array.isArray(args) && args[0] === "status") return { stdout: "", stderr: "", code: 0 };
+      return { stdout: "", stderr: "", code: 0 };
+    },
+    ownershipDeps: {
+      gitStatusPorcelain: async () => porcelain,
+      gitHead: async () => "deadbeef",
+      salvage: async () => {
+        porcelain = "";
+        return { salvaged: true };
+      },
+      mkdirp: async () => {},
+    },
+  };
+  callCount = 0;
+  const captured = await runAndCaptureOutcome(freeformHooks(), incomplete);
+  assert.equal(created, 0);
+  assert.ok(
+    captured.captured?.tag === "no-commits" || captured.outcome.advanced === true || captured.outcome.status === "waiting" || captured.outcome.status === "blocked",
+    JSON.stringify({ captured: captured.captured, outcome: captured.outcome }),
+  );
+  if (captured.outcome.advanced) {
+    assert.notEqual(captured.outcome.to, "review-1");
+    assert.notEqual(captured.outcome.to, "design-gate");
+  }
+});
+
+test("runPlanningPhases #1272: failing test gate on post-timeout path does not create PR", async () => {
+  let callCount = 0;
+  let created = 0;
+  let porcelain = "";
+  const gateFail = {
+    invoke: async () => {
+      callCount++;
+      if (callCount >= 2) {
+        porcelain = " M core/foo.ts\n";
+        return harnessTimeout;
+      }
+      return revisionOkResult;
+    },
+    trySalvageUncommittedWork: async () => ({ salvaged: false }),
+    listChangeDirs: () => ["publish-unpublished-timeout-commit"],
+    createPr: async () => {
+      created++;
+      return 1;
+    },
+    runTestGate: async () => ({ skipped: false, passed: false, reason: "suite red" }),
+    _runFormatAndTestGates: async () => ({ ok: false, source: "test" as const, reason: "tests failed" }),
+    gitInWorktree: async (_p: unknown, args: string[]) => {
+      if (Array.isArray(args) && args[0] === "log") {
+        return { stdout: "salvage: stage harness work (#42)\n\nowned-harness-leftover\n", stderr: "", code: 0 };
+      }
+      if (Array.isArray(args) && args[0] === "status") return { stdout: "", stderr: "", code: 0 };
+      return { stdout: "", stderr: "", code: 0 };
+    },
+    ownershipDeps: {
+      gitStatusPorcelain: async () => porcelain,
+      gitHead: async () => "deadbeef",
+      salvage: async () => {
+        porcelain = "";
+        return { salvaged: true };
+      },
+      mkdirp: async () => {},
+    },
+  };
+  callCount = 0;
+  const captured = await runAndCaptureOutcome(freeformHooks(), gateFail);
+  assert.equal(created, 0);
+  assert.equal(captured.captured?.tag, "test-gate-exhausted");
+  assert.notEqual(captured.outcome.advanced === true ? captured.outcome.to : "", "review-1");
+});
+
 test("runPlanningPhases #547: implement harness fails, salvage also fails → block comment discloses the salvage failure reason", async () => {
   let callCount = 0;
   const failOnSecondCall = {
@@ -1256,14 +1459,16 @@ test("planning.ts source pin #547/#629: implement path uses shared harness-round
     roundIdx,
   );
   const resultCheckIdx = src.indexOf("if (!result.success) {", roundIdx);
+  const consultIdx = src.indexOf("resolveTimeoutParkForUnpublishedCommit", resultCheckIdx);
   const salvageCheckIdx = src.indexOf("if (!ctx.salvaged) {", resultCheckIdx);
   const blockIdx = src.indexOf(
-    '"implementing",\n            "harness-failure",\n          );',
+    '"implementing",\n              "harness-failure",\n            );',
     resultCheckIdx,
   );
   assert.ok(roundIdx !== -1, "implement path must call runHarnessRound");
   assert.ok(salvageModeIdx !== -1, "implement path must salvage on confirmed no-new-commit");
   assert.ok(resultCheckIdx !== -1 && salvageCheckIdx !== -1 && blockIdx !== -1);
+  assert.ok(consultIdx !== -1 && resultCheckIdx < consultIdx, "timeout park must consult unpublished-commit classifier");
   assert.ok(resultCheckIdx < salvageCheckIdx, "salvage outcome must be checked inside the harness-failure branch");
   assert.ok(salvageCheckIdx < blockIdx, "salvage failure disclosure must precede the terminal harness-failure block");
 });

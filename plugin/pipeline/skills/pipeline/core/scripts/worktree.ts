@@ -2309,6 +2309,12 @@ export interface ParkReleaseDeps {
   expectedMergeResultOid?: string;
   /** Current managed-worktree HEAD; injected in tests. Default: `git rev-parse HEAD`. */
   resolveWorktreeHead?: (worktreePath: string) => Promise<string | null>;
+  /**
+   * #1272: true when a linked merged PR exists for the issue. Discriminates
+   * never-pushed unpublished commits (local-only) from squash-merge
+   * unreachability (unverifiable).
+   */
+  hasLinkedMergedPr?: (cfg: PipelineConfig, issueNumber: number) => Promise<boolean>;
 }
 
 async function realHasRemoteBranchTip(cfg: PipelineConfig, branch: string): Promise<boolean> {
@@ -2414,7 +2420,7 @@ export async function releaseWorktreeForParkedIssue(
   if (pathOnDisk) {
     dirty = await dirtyFn(worktreeP);
   }
-  const localOnly = await localOnlyFn(cfg, pathOnDisk ? worktreeP : null, branch);
+  let localOnly = await localOnlyFn(cfg, pathOnDisk ? worktreeP : null, branch);
 
   // Single evaluateRemoveSafety decision for dirty/local-only (#759 parked
   // release). Identity matching happens here at the wrapper, then the boolean
@@ -2434,6 +2440,23 @@ export async function releaseWorktreeForParkedIssue(
     }
   }
   const proofMatches = identityMatches;
+  // #1272: empty remote head + unreachable-from-base is local-only unless
+  // bound merge-result proof or a linked merged PR shows publication-then-delete.
+  if (localOnly === "unverifiable" && !proofMatches) {
+    const mergedFn = deps.hasLinkedMergedPr ?? (async (c: PipelineConfig, n: number) => {
+      const { getPrForIssueAnyState, getPrDetail } = await import("./gh.ts");
+      try {
+        const pr = await getPrForIssueAnyState(c, n);
+        if (pr == null) return false;
+        const d = await getPrDetail(c, pr);
+        return d.state === "merged";
+      } catch {
+        return false;
+      }
+    });
+    const linkedMerged = await mergedFn(cfg, issueNumber);
+    if (!linkedMerged) localOnly = true;
+  }
   const safety = evaluateRemoveSafety({
     dirty,
     localOnly,

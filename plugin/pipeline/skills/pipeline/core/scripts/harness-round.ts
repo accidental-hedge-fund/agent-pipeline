@@ -96,6 +96,12 @@ export interface HarnessRoundContext<TInvoke> {
    */
   ownershipCheckpointFailed: boolean;
   /**
+   * Scoped ownership checkpoint authored a salvage-equivalent commit (#1272).
+   * Distinct from `salvaged` (legacy unscoped helper). AfterRound must treat
+   * this as recovered work even when `salvaged` is false.
+   */
+  ownershipCheckpointed: boolean;
+  /**
    * #758: when the consumer supplies `onCleanNoNewCommit` and the round is a
    * confirmed clean no-new-commit (salvage found nothing), the helper invokes
    * that callback and attaches the result here for `afterRound`. Stages use
@@ -314,6 +320,7 @@ export async function runHarnessRound<TInvoke, TResult>(
     salvageFailureReason,
     salvageFoundNothing,
     ownershipCheckpointFailed,
+    ownershipCheckpointed,
     cleanNoNewCommitHookResult,
   });
 }

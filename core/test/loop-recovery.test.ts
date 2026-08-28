@@ -190,6 +190,7 @@ test("deterministic redispatch precedes provider-neutral model repair for mechan
   assert.deepEqual(DEFAULT_RECOVERY_POLICY["workflow-engine-defect"].recipes, [
     "unlink_engine_scratch",
     "checkpoint_owned_harness_dirt",
+    "publish_unpublished_stage_commit",
     "restart_workflow_engine",
     "repair_pipeline_item",
   ]);
@@ -938,6 +939,7 @@ test("upgradeContractForRecovery: exact pre-#787 defaults gain deterministic rep
   assert.deepEqual(upgraded.recovery_policy["workflow-engine-defect"].recipes, [
     "unlink_engine_scratch",
     "checkpoint_owned_harness_dirt",
+    "publish_unpublished_stage_commit",
     "restart_workflow_engine",
     "repair_pipeline_item",
   ]);
