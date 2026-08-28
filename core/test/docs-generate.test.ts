@@ -118,6 +118,15 @@ describe("command-docs metadata", () => {
     }
   });
 
+  test("train usage lists --dry-run (#1275)", () => {
+    const doc = COMMAND_DOCS.train;
+    assert.equal(doc.documented, true);
+    assert.equal(
+      doc.usage,
+      "train --milestone <m>|--issues <n,n> [--merge] [--json] [--dry-run]",
+    );
+  });
+
   test("ship documents exact run and read-only status forms", () => {
     const doc = COMMAND_DOCS.ship;
     assert.equal(doc.documented, true);

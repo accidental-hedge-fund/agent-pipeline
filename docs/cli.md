@@ -93,7 +93,7 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 
 #### `train`
 
-- **Usage:** `pipeline train --milestone <m>|--issues <n,n> [--merge] [--json]`
+- **Usage:** `pipeline train --milestone <m>|--issues <n,n> [--merge] [--json] [--dry-run]`
 - **Summary:** Operator-authorized integrate train: base-eligible frontiers advance via one loop wave each (recovery inside the wave); optionally serial-merge with base containment; independent R2D siblings may merge while a peer is parked (never called by the advance loop)
 
 #### `unblock`

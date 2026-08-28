@@ -210,6 +210,24 @@ test("array of statuses: last train_status in array wins", () => {
   assert.equal(r.stdout, "1");
 });
 
+test("train_plan JSON is not a completed train_status (#1275)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ship-train-status-"));
+  const plan = {
+    schema_version: 1,
+    kind: "train_plan",
+    merge_mode: true,
+    ordered_issues: [10, 11],
+    merge_first: [10],
+    items: [
+      { issue: 10, stage: "ready-to-deploy", pr: 20, intended_action: "would-merge" },
+    ],
+  };
+  const capture = writeCapture(dir, "train.json", JSON.stringify(plan, null, 2) + "\n");
+  const r = runHelper(capture);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout, "0");
+});
+
 test("no train_status → incomplete", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ship-train-status-"));
   const capture = writeCapture(dir, "train.json", "only prose, no status\n");

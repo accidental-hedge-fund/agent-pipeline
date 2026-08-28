@@ -114,7 +114,8 @@ control plane, grant schema, or second durable scheduler.
 
 Ordinary `pipeline advance`, `pipeline single`, and `pipeline loop` still stop at
 `pipeline:ready-to-deploy` and never merge. Multi-issue integrate trains use
-opt-in `pipeline train --merge`. Repository content in `.github/pipeline.yml`
+opt-in `pipeline train --merge`. Preview order, stages, and intended merges
+with `pipeline train --dry-run` (including `--merge --dry-run`). Repository content in `.github/pipeline.yml`
 cannot authorize merges and cannot set `auto_merge`.
 
 **Bootstrap for any platform:** [supervisor contract](docs/supervisor.md) and

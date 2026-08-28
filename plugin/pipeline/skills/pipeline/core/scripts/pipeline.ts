@@ -3794,16 +3794,13 @@ export async function runTrainCommand(
   if (issueNumbers.length === 0 && !milestone) {
     console.error(
       "pipeline train: --issues <n,n> and/or --milestone <title> is required.\n" +
-        "  Usage: pipeline train --issues 10,11,12 [--merge] [--json]\n" +
-        "         pipeline train --milestone v1.34.0 [--merge] [--json]\n" +
+        "  Usage: pipeline train --issues 10,11,12 [--merge] [--json] [--dry-run]\n" +
+        "         pipeline train --milestone v1.34.0 [--merge] [--json] [--dry-run]\n" +
         "  Without --merge: advances base-eligible frontiers via one loop wave each.\n" +
         "  With --merge: merge-first prelude for already-R2D open PRs, then serial merge + base containment after each advance wave.\n" +
+        "  --dry-run prints a read-only plan and does not advance or merge.\n" +
         "  Never called from the advance loop. No auto_merge config key.",
     );
-    return 2;
-  }
-  if (opts.dryRun) {
-    console.error("pipeline train: --dry-run is not supported for train; omit it.");
     return 2;
   }
 
@@ -3827,6 +3824,7 @@ export async function runTrainCommand(
       issues: issueNumbers.length > 0 ? issueNumbers : undefined,
       milestone: milestone || undefined,
       merge: !!opts.merge,
+      dryRun: !!opts.dryRun,
       baseBranch: trainCfg.base_branch,
       repoDir: trainCfg.repo_dir,
       repo: trainCfg.repo,
@@ -3886,8 +3884,16 @@ export async function runTrainCommand(
   }
 
   if (opts.json) {
-    console.log(JSON.stringify(trainResult.status, null, 2));
-  } else {
+    if (opts.dryRun) {
+      if (!trainResult.plan) {
+        console.error("pipeline train: --dry-run produced no plan");
+        return 2;
+      }
+      console.log(JSON.stringify(trainResult.plan, null, 2));
+    } else {
+      console.log(JSON.stringify(trainResult.status, null, 2));
+    }
+  } else if (!opts.dryRun) {
     const status = trainResult.status;
     console.log(
       `[train] complete=${status.complete} merge_mode=${status.merge_mode} ` +

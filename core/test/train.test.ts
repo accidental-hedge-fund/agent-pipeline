@@ -1264,6 +1264,232 @@ test("train merge: missing linked PR fails closed", async () => {
 });
 
 // ---------------------------------------------------------------------------
+// Dry-run plan (#1275)
+// ---------------------------------------------------------------------------
+
+test("train dry-run: --issues 10,11 is accepted and does not reject the flag", async () => {
+  const logs: string[] = [];
+  const deps = makeDeps({
+    log(msg) {
+      logs.push(msg);
+    },
+    async recoverParked() {
+      throw new Error("dry-run must not recover-parked");
+    },
+  });
+  deps.seedIssue(snap(10, "a"));
+  deps.seedIssue(snap(11, "b independent"));
+
+  const result = await runTrain(
+    baseOpts({ issues: [10, 11], merge: false, dryRun: true }),
+    deps,
+  );
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.plan?.kind, "train_plan");
+  assert.doesNotMatch(logs.join("\n"), /--dry-run is not supported/);
+  assert.equal(deps.waveCalls.length, 0);
+  assert.equal(deps.mergeCalls.length, 0);
+});
+
+test("train dry-run: merge-mode R2D with open PR does not merge or advance", async () => {
+  const deps = makeDeps({
+    async recoverParked() {
+      throw new Error("dry-run must not recover-parked");
+    },
+  });
+  deps.seedIssue(snap(10, "approved", ["pipeline:ready-to-deploy"]));
+  deps.seedPr(10, 20);
+
+  const result = await runTrain(
+    baseOpts({ issues: [10], merge: true, dryRun: true }),
+    deps,
+  );
+  assert.equal(result.exitCode, 0);
+  assert.equal(deps.mergeCalls.length, 0, "mergeIssuePr must not run");
+  assert.equal(deps.waveCalls.length, 0, "advanceWave must not run");
+  assert.equal(deps.fetchCalls, 0, "dry-run must not fetchBase");
+  assert.equal(result.plan?.items[0]?.intended_action, "would-merge");
+  assert.equal(result.plan?.items[0]?.pr, 20);
+  assert.deepEqual(result.plan?.merge_first, [10]);
+});
+
+test("train dry-run: does not mint a run store or train_run_handoff", async () => {
+  const deps = makeDeps();
+  deps.seedIssue(snap(10, "a"));
+  deps.seedIssue(snap(11, "b"));
+
+  const result = await runTrain(
+    baseOpts({ issues: [10, 11], merge: false, dryRun: true }),
+    deps,
+  );
+  assert.equal(result.exitCode, 0);
+  assert.equal(trainEventsPath(deps.store), undefined);
+  assert.deepEqual(trainEventsFromStore(deps.store), []);
+  assert.equal(deps.handoffLines.length, 0);
+  assert.equal(deps.store.files.size, 0);
+  assert.equal(deps.store.appends.size, 0);
+});
+
+test("train dry-run: merge-mode classifies would-merge vs waiting-on-deps", async () => {
+  const logs: string[] = [];
+  const deps = makeDeps({
+    log(msg) {
+      logs.push(msg);
+    },
+  });
+  deps.seedIssue(snap(279, "base", ["pipeline:ready-to-deploy"]));
+  deps.seedIssue(snap(269, "Depends on: #279", ["pipeline:ready"]));
+  deps.seedPr(279, 50);
+
+  const result = await runTrain(
+    baseOpts({ issues: [279, 269], merge: true, dryRun: true }),
+    deps,
+  );
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(result.plan?.ordered_issues, [279, 269]);
+  assert.deepEqual(result.plan?.merge_first, [279]);
+  const byIssue = new Map(result.plan!.items.map((i) => [i.issue, i]));
+  assert.equal(byIssue.get(279)?.intended_action, "would-merge");
+  assert.equal(byIssue.get(279)?.pr, 50);
+  assert.equal(byIssue.get(279)?.on_frontier, true);
+  assert.equal(byIssue.get(269)?.intended_action, "waiting-on-deps");
+  assert.equal(byIssue.get(269)?.on_frontier, false);
+
+  const human = logs.join("\n");
+  assert.match(human, /ordered issues: #279 → #269/);
+  assert.match(human, /#279[\s\S]*PR #50[\s\S]*would-merge/);
+  assert.match(human, /#269[\s\S]*waiting-on-deps/);
+  assert.match(human, /no mutations performed|no merges were performed/);
+});
+
+test("train dry-run: non-merge never advertises would-merge", async () => {
+  const deps = makeDeps();
+  deps.seedIssue(snap(10, "a"));
+  deps.seedIssue(snap(11, "b independent"));
+
+  const result = await runTrain(
+    baseOpts({ issues: [10, 11], merge: false, dryRun: true }),
+    deps,
+  );
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.plan?.merge_mode, false);
+  assert.deepEqual(result.plan?.merge_first, []);
+  for (const item of result.plan!.items) {
+    assert.ok(
+      item.intended_action === "would-advance" || item.intended_action === "waiting-on-deps",
+      `unexpected action ${item.intended_action} for #${item.issue}`,
+    );
+    assert.notEqual(item.intended_action, "would-merge");
+  }
+});
+
+test("train dry-run: already-merged R2D is already-integrated without fetchBase", async () => {
+  const deps = makeDeps();
+  deps.seedIssue(snap(10, "landed", ["pipeline:ready-to-deploy"]));
+  deps.seedMergedPrAnyState(10, 20);
+
+  const result = await runTrain(
+    baseOpts({ issues: [10], merge: true, dryRun: true }),
+    deps,
+  );
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.plan?.items[0]?.intended_action, "already-integrated");
+  assert.equal(result.plan?.items[0]?.pr, 20);
+  assert.deepEqual(result.plan?.merge_first, []);
+  assert.equal(deps.fetchCalls, 0);
+  assert.equal(deps.mergeCalls.length, 0);
+  assert.equal(deps.waveCalls.length, 0);
+});
+
+test("train dry-run: ready-to-deploy with no PR is would-block and still exits 0", async () => {
+  const deps = makeDeps();
+  deps.seedIssue(snap(10, "approved", ["pipeline:ready-to-deploy"]));
+
+  const result = await runTrain(
+    baseOpts({ issues: [10], merge: true, dryRun: true }),
+    deps,
+  );
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.plan?.items[0]?.intended_action, "would-block");
+  assert.equal(result.plan?.items[0]?.pr, null);
+  assert.equal(deps.mergeCalls.length, 0);
+});
+
+test("train dry-run: needs-human and blocked items are held", async () => {
+  const deps = makeDeps();
+  deps.seedIssue(snap(10, "parked", ["pipeline:needs-human"]));
+  deps.seedIssue(snap(11, "stuck", ["pipeline:ready", "blocked"]));
+
+  const result = await runTrain(
+    baseOpts({ issues: [10, 11], merge: false, dryRun: true }),
+    deps,
+  );
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(result.plan?.ordered_issues, [10, 11]);
+  const byIssue = new Map(result.plan!.items.map((i) => [i.issue, i]));
+  assert.equal(byIssue.get(10)?.intended_action, "held");
+  assert.equal(byIssue.get(11)?.intended_action, "held");
+});
+
+test("train dry-run: dependency cycle fails closed with no plan", async () => {
+  const deps = makeDeps();
+  deps.seedIssue(snap(10, "Depends on: #11"));
+  deps.seedIssue(snap(11, "Depends on: #10"));
+
+  await assert.rejects(
+    () => runTrain(baseOpts({ issues: [10, 11], merge: false, dryRun: true }), deps),
+    /dependency validation/,
+  );
+  assert.equal(deps.waveCalls.length, 0);
+  assert.equal(trainEventsPath(deps.store), undefined);
+});
+
+test("train dry-run: second snapshot matches the first", async () => {
+  const deps = makeDeps();
+  deps.seedIssue(snap(10, "a"));
+  deps.seedIssue(snap(11, "Depends on: #10"));
+
+  const first = await runTrain(
+    baseOpts({ issues: [10, 11], merge: false, dryRun: true }),
+    deps,
+  );
+  const second = await runTrain(
+    baseOpts({ issues: [10, 11], merge: false, dryRun: true }),
+    deps,
+  );
+  assert.deepEqual(second.plan?.ordered_issues, first.plan?.ordered_issues);
+  assert.deepEqual(
+    second.plan?.items.map((i) => i.intended_action),
+    first.plan?.items.map((i) => i.intended_action),
+  );
+});
+
+test("train dry-run: omitting the flag still advances", async () => {
+  const deps = makeDeps();
+  deps.seedIssue(snap(10, "a"));
+  deps.seedIssue(snap(11, "b independent"));
+
+  const result = await runTrain(baseOpts({ issues: [10, 11], merge: false }), deps);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.plan, undefined);
+  assert.ok(deps.waveCalls.length > 0, "live train must still call advanceWave");
+});
+
+test("train dry-run: milestone freeze-eligible list is planned", async () => {
+  const deps = makeDeps();
+  deps.seedIssue(snap(10, "a"));
+  deps.seedIssue(snap(11, "b independent"));
+
+  const result = await runTrain(
+    baseOpts({ issues: undefined, milestone: "v1.39.13", merge: false, dryRun: true }),
+    deps,
+  );
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(result.plan?.ordered_issues, [10, 11]);
+  assert.equal(deps.waveCalls.length, 0);
+});
+
+// ---------------------------------------------------------------------------
 // Isolation: advance stage handlers must not import train
 // ---------------------------------------------------------------------------
 

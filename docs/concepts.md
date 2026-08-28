@@ -96,7 +96,8 @@ release and status commands). The repository does not ship a Hermes/Buzz/Slack
 factory control plane, grant schema, or second durable scheduler. Ordinary
 `pipeline advance`, `pipeline single`, and `pipeline loop` still stop at
 `pipeline:ready-to-deploy` and never merge. Multi-issue integrate trains use
-opt-in `pipeline train --merge`.
+opt-in `pipeline train --merge`. `pipeline train --dry-run` prints a read-only
+plan in default and `--merge` modes; omitting `--dry-run` still runs the live train.
 
 `pipeline merge` keeps its normal ready-to-deploy, mergeability, required-check,
 and exact-head gates. `pipeline merge-queue` is dry-run by default; `--apply` is
