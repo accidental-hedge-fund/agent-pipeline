@@ -78,6 +78,18 @@ Bound merge-result proof SHALL NOT convert a dirty worktree or a filesystem/clea
 
 ## ADDED Requirements
 
+### Requirement: Bound merge-result proof SHALL be a runtime-validated in-process carrier
+
+Park-release SHALL accept bound merge-result proof only as a runtime-validated `VerifiedMergeProof` object that names this issue number, this PR number, the configured base branch, and the merge-result OID together. The engine SHALL create that object only after the in-base verifier has proven the OID is contained in `origin/<base>`. Park-release SHALL NOT reconstruct proof from run logs, GitHub labels, issue comments, or untyped persisted data.
+
+#### Scenario: Proof is not reconstructed from logs or labels
+
+- **WHEN** park-release runs
+- **AND** the only available merge evidence is a train log line, a GitHub label, or untyped persisted JSON
+- **AND** no in-process `VerifiedMergeProof` from the in-base verifier exists
+- **THEN** park-release SHALL NOT treat that evidence as bound proof
+- **AND** SHALL NOT release the worktree on that evidence alone
+
 ### Requirement: Bound merge-result proof SHALL match issue, PR, base, and OID
 
 Park-release SHALL treat merge-result proof as bound only when it names this issue number, this PR number, this configured base branch, and this verified merge-result OID together. Proof for a different issue, a different PR, a different base branch, or a different OID SHALL NOT authorize release of this worktree.

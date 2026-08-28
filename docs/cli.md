@@ -79,7 +79,7 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 #### `remove-worktree`
 
 - **Usage:** `pipeline remove-worktree <n> [--force]`
-- **Summary:** Remove a managed pipeline worktree for an issue (optional --force)
+- **Summary:** Remove a managed pipeline worktree for an issue (optional --force). After a proven merge, /pipeline and train --merge share bound-proof park-release; cleanup is not the required fix
 
 #### `ship`
 

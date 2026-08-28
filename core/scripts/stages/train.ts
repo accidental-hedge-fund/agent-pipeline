@@ -21,6 +21,13 @@ import {
   initTrainRunStore,
 } from "../train-events.ts";
 import type { PipelineConfig } from "../types.ts";
+import {
+  proveMergeResultInBase,
+  releaseWorktreeForParkedIssue,
+  type ParkReleaseDeps,
+  type ParkReleaseResult,
+  type VerifiedMergeProof,
+} from "../worktree.ts";
 import { mergePr, realMergeDeps, type MergeDeps } from "./merge.ts";
 
 const execFileAsync = promisify(execFile);
@@ -119,6 +126,8 @@ export interface TrainOpts {
   baseBranch: string;
   repoDir: string;
   repo: string;
+  /** Full pipeline config when available (park-release identity uses base_branch / worktree_root). */
+  pipelineConfig?: PipelineConfig;
   /** Skip live advance when the issue is already at ready-to-deploy (default true). */
   skipAdvanceIfReady?: boolean;
 }
@@ -215,12 +224,23 @@ export interface TrainDeps {
   baseTip(baseBranch: string): Promise<string>;
   /** True when `ancestor` is an ancestor of `descendant` (or equal). */
   isAncestor(ancestor: string, descendant: string): Promise<boolean>;
+  /**
+   * Shared park-release after a proven merge (#1274). Defaults to
+   * {@link releaseWorktreeForParkedIssue}. Tests inject a spy. Train MUST NOT
+   * add a path-local worktree-delete mole.
+   */
+  releaseParkedWorktree?: (
+    cfg: PipelineConfig,
+    issueNumber: number,
+    parkDeps?: ParkReleaseDeps,
+  ) => Promise<ParkReleaseResult>;
+  parkReleaseDeps?: ParkReleaseDeps;
 }
 
 /** Result of reconciling a linked PR against base containment for integration. */
 export type IntegratedReconcileResult =
   | { kind: "not-merged" }
-  | { kind: "integrated"; mergeCommitOid: string | null }
+  | { kind: "integrated"; mergeCommitOid: string | null; verifiedMergeProof?: VerifiedMergeProof }
   | { kind: "containment-failed"; mergeCommitOid: string; tip: string };
 
 /**
@@ -229,6 +249,7 @@ export type IntegratedReconcileResult =
  * (observe already proved merged — #1014 closed+merged without OID).
  */
 export async function reconcileMergedPrIntegration(
+  issue: number,
   pr: number,
   baseBranch: string,
   deps: Pick<TrainDeps, "observePr" | "fetchBase" | "baseTip" | "isAncestor">,
@@ -238,12 +259,23 @@ export async function reconcileMergedPrIntegration(
   if (!obs.mergeCommitOid) {
     return { kind: "integrated", mergeCommitOid: null };
   }
-  await deps.fetchBase(baseBranch);
-  const tip = await deps.baseTip(baseBranch);
-  const contained = await deps.isAncestor(obs.mergeCommitOid, tip);
-  if (contained) {
-    return { kind: "integrated", mergeCommitOid: obs.mergeCommitOid };
+  const proof = await proveMergeResultInBase(
+    {
+      issue,
+      pr,
+      base: baseBranch,
+      mergeResultOid: obs.mergeCommitOid,
+    },
+    {
+      fetchBase: deps.fetchBase,
+      baseTip: deps.baseTip,
+      isAncestor: deps.isAncestor,
+    },
+  );
+  if (proof) {
+    return { kind: "integrated", mergeCommitOid: obs.mergeCommitOid, verifiedMergeProof: proof };
   }
+  const tip = await deps.baseTip(baseBranch);
   return { kind: "containment-failed", mergeCommitOid: obs.mergeCommitOid, tip };
 }
 
@@ -256,6 +288,7 @@ export type MergeReadyToDeployResult =
       already: boolean;
       /** True when `mergeIssuePr` was invoked for this item. */
       attempted: boolean;
+      verifiedMergeProof?: VerifiedMergeProof;
     }
   | {
       kind: "stop";
@@ -288,7 +321,7 @@ export async function mergeReadyToDeployItem(
   if (pr == null) {
     const anyPr = await deps.getPrForIssueAnyState(issue);
     if (anyPr != null) {
-      const recon = await reconcileMergedPrIntegration(anyPr, baseBranch, deps);
+      const recon = await reconcileMergedPrIntegration(issue, anyPr, baseBranch, deps);
       if (recon.kind === "integrated") {
         const oidNote =
           recon.mergeCommitOid != null
@@ -301,6 +334,7 @@ export async function mergeReadyToDeployItem(
           mergeCommitOid: recon.mergeCommitOid,
           already: true,
           attempted: false,
+          verifiedMergeProof: recon.verifiedMergeProof,
         };
       }
       if (recon.kind === "containment-failed") {
@@ -358,10 +392,21 @@ export async function mergeReadyToDeployItem(
   deps.log(
     `[train] #${issue}: proving merge ${obs.mergeCommitOid.slice(0, 12)}… is in origin/${baseBranch}…`,
   );
-  await deps.fetchBase(baseBranch);
-  const tip = await deps.baseTip(baseBranch);
-  const contained = await deps.isAncestor(obs.mergeCommitOid, tip);
-  if (!contained) {
+  const proof = await proveMergeResultInBase(
+    {
+      issue,
+      pr,
+      base: baseBranch,
+      mergeResultOid: obs.mergeCommitOid,
+    },
+    {
+      fetchBase: deps.fetchBase,
+      baseTip: deps.baseTip,
+      isAncestor: deps.isAncestor,
+    },
+  );
+  if (!proof) {
+    const tip = await deps.baseTip(baseBranch);
     return {
       kind: "stop",
       blocker:
@@ -380,6 +425,7 @@ export async function mergeReadyToDeployItem(
     mergeCommitOid: obs.mergeCommitOid,
     already: false,
     attempted,
+    verifiedMergeProof: proof,
   };
 }
 
@@ -749,6 +795,47 @@ function logTrainPlan(plan: TrainPlan, log: (msg: string) => void): void {
   );
 }
 
+function trainPipelineConfig(opts: TrainOpts): PipelineConfig {
+  return (
+    opts.pipelineConfig ??
+    ({
+      repo: opts.repo,
+      repo_dir: opts.repoDir,
+      base_branch: opts.baseBranch,
+      worktree_root: ".worktrees",
+    } as PipelineConfig)
+  );
+}
+
+/** Shared bound-proof park-release after proven train merge. Never a train-only remover. */
+async function parkReleaseAfterProvenMerge(
+  issue: number,
+  proof: VerifiedMergeProof | undefined,
+  opts: TrainOpts,
+  deps: TrainDeps,
+): Promise<void> {
+  if (!proof) return;
+  const cfg = trainPipelineConfig(opts);
+  const releaseFn = deps.releaseParkedWorktree ?? releaseWorktreeForParkedIssue;
+  try {
+    const result = await releaseFn(cfg, issue, {
+      ...(deps.parkReleaseDeps ?? {}),
+      verifiedMergeProof: proof,
+      prNumber: proof.pr,
+      expectedMergeResultOid: proof.mergeResultOid,
+    });
+    if (result.action === "released") {
+      deps.log(`[train] #${issue}: park-release: ${result.reason}`);
+    } else if (result.action === "retained") {
+      deps.log(`[train] #${issue}: park-release retained: ${result.reason}`);
+    }
+  } catch (err) {
+    deps.log(
+      `[train] #${issue}: park-release failed (non-fatal): ${(err as Error).message}`,
+    );
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Orchestrator
 // ---------------------------------------------------------------------------
@@ -1019,6 +1106,9 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
       await emitItemStarted(issue);
       const merged = await mergeReadyToDeployItem(issue, opts.baseBranch, deps);
       await emitMergeCatalog(issue, merged);
+      if (merged.kind === "integrated") {
+        await parkReleaseAfterProvenMerge(issue, merged.verifiedMergeProof, opts, deps);
+      }
       const stopped = applyMergeReady(issue, merged);
       if (stopped) {
         const last = items[items.length - 1];
@@ -1066,7 +1156,7 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
           openPr ??
           (stage === "ready-to-deploy" ? await deps.getPrForIssueAnyState(issue) : null);
         if (linkedPr == null) continue;
-        const recon = await reconcileMergedPrIntegration(linkedPr, opts.baseBranch, deps);
+        const recon = await reconcileMergedPrIntegration(issue, linkedPr, opts.baseBranch, deps);
         if (recon.kind === "integrated") {
           const oidNote =
             recon.mergeCommitOid != null
@@ -1088,6 +1178,7 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
             integrated: true,
           };
           markFinished(issue, already);
+          await parkReleaseAfterProvenMerge(issue, recon.verifiedMergeProof, opts, deps);
           await emitItemCompleted(already);
           continue;
         }

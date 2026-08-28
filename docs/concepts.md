@@ -24,6 +24,7 @@ A newcomer who completed Prerequisites, Install, and Quickstart in the README ha
 - [Planning-leverage and material-rework telemetry](#planning-leverage-and-material-rework-telemetry)
 - [Risk-calibrated progressive planning (research)](#risk-calibrated-progressive-planning-research)
 - [Conventions & carry-forward lessons](#conventions--carry-forward-lessons)
+- [Park-release of managed worktrees](#park-release-of-managed-worktrees)
 - [Troubleshooting](#troubleshooting)
 - [Desktop / editor integration](#desktop--editor-integration)
 - [Repository layout](#repository-layout)
@@ -243,6 +244,19 @@ This is **not** an always-on router. Longer plans or longer planning wall time a
 ## Conventions & carry-forward lessons
 
 Stage prompts embed an excerpt of the target repo's conventions file (`CLAUDE.md` / `AGENTS.md`, or `conventions_md_path`). The pipeline **only reads** that file — never writes it. Maintainers curate carry-forward lessons by hand.
+
+## Park-release of managed worktrees
+
+`/pipeline` / `pipeline single` and `train --merge` share one park-release / automatic-remove gate. A clean managed worktree under `worktree_root` is released when **one** recoverability condition holds:
+
+1. No unpushed commits, and the branch tip is on the remote **or** an open PR has a resolvable head SHA; or
+2. **Bound merge-result proof** — the same issue, the same PR, the configured base branch, and a `merge_result_oid` the engine has proven is contained in `origin/<base>`.
+
+After a squash merge GitHub deletes the head branch and pre-merge SHAs are not reachable from the base. That is **squash-merge unreachability**, not a git/network/auth failure. With bound proof, park-release removes the clean worktree and does not tell the operator to check connectivity or retry. Without bound proof, the worktree is retained with the existing not-reachable / `--force` wording (`pipeline remove-worktree <n> --force` when the operator takes that responsibility).
+
+A true `ls-remote` transport or auth failure may still report git/network/auth. Dirty trees and filesystem cleanup failures retain **that** worktree, name the real cause, and do **not** change `pipeline:ready-to-deploy` or integrated state. `/pipeline:cleanup` only sweeps merged-PR worktrees and is **not** the required fix after a proven merge.
+
+`max_concurrent_worktrees` counts on-disk managed worktrees for open issues that are not `pipeline:ready-to-deploy`. Park-released trees drop out of that count.
 
 ## Troubleshooting
 

@@ -719,7 +719,9 @@ export async function createWorktree(
   const unlinkPathFn = deps.unlinkPath ?? realUnlinkPath;
   const writeManagedMarkerFn = deps.writeManagedMarker ?? writeManagedMarker;
   const dirtyFn = deps.hasDirtyWorkdir ?? hasDirtyWorkdir;
-  const localOnlyFn = deps.hasLocalOnlyCommits ?? checkLocalOnlyCommits;
+  const localOnlyFn =
+    deps.hasLocalOnlyCommits ??
+    ((c, p, b) => checkLocalOnlyCommits(c, p, b, { gitCmd: deps.gitCmd }));
   const resolveOpenPrHeadFn = deps.resolveOpenPrHeadForBranch ?? resolveOpenPrHeadForBranch;
 
   const wtPath = worktreePath(cfg, issueNumber, slug);
@@ -1169,6 +1171,13 @@ export interface SafeRemoveDeps {
    * site comment documenting why force is acceptable.
    */
   force?: boolean;
+  gitCmd?: GitCmd;
+  /** Bound merge-result proof for automatic release after a proven squash merge (#1274). */
+  verifiedMergeProof?: VerifiedMergeProof;
+  /** Independently known PR number for proof identity match. */
+  prNumber?: number;
+  /** Independently known merge-result OID for proof identity match. */
+  expectedMergeResultOid?: string;
 }
 
 /**
@@ -1184,7 +1193,9 @@ export async function removeManagedWorktreeSafely(
   deps: SafeRemoveDeps = {},
 ): Promise<SafeRemoveResult> {
   const dirtyFn = deps.hasDirtyWorkdir ?? hasDirtyWorkdir;
-  const localOnlyFn = deps.hasLocalOnlyCommits ?? checkLocalOnlyCommits;
+  const localOnlyFn =
+    deps.hasLocalOnlyCommits ??
+    ((c, p, b) => checkLocalOnlyCommits(c, p, b, { gitCmd: deps.gitCmd }));
   const existsFn = deps.pathExists ?? fs.existsSync;
   const removeFn = deps.removeWorktree ?? removeWorktree;
   const force = !!deps.force;
@@ -1196,7 +1207,8 @@ export async function removeManagedWorktreeSafely(
     dirty = await dirtyFn(wtPath);
   }
   const localOnly = await localOnlyFn(cfg, pathOnDisk ? wtPath : null, branch);
-  const safety = evaluateRemoveSafety({ dirty, localOnly, force });
+  const proofMatches = boundProofMatchesAtWrapper(deps.verifiedMergeProof, issueNumber, cfg, deps);
+  const safety = evaluateRemoveSafety({ dirty, localOnly, force, boundProofMatches: proofMatches });
   if (!safety.ok) {
     return {
       removed: false,
@@ -1206,7 +1218,16 @@ export async function removeManagedWorktreeSafely(
       blockReason: safety.blockReason,
     };
   }
-  await removeFn(cfg, issueNumber, slug, resolvedPath);
+  try {
+    await removeFn(cfg, issueNumber, slug, resolvedPath);
+  } catch (err) {
+    return {
+      removed: false,
+      reason: (err as Error).message,
+      path: wtPath,
+      branch,
+    };
+  }
   return { removed: true, path: wtPath, branch };
 }
 
@@ -1650,6 +1671,168 @@ export async function hasCommitsAhead(cwd: string, baseBranch: string): Promise<
  *  and create-time reclaim. */
 export type LocalOnlyCommitResult = boolean | "unverifiable" | null;
 
+/** Injectable git seam used by local-only classification and in-base proof. */
+export type GitCmd = (
+  cfg: PipelineConfig,
+  cwd: string,
+  args: string[],
+  opts?: { ignoreFailure?: boolean; timeoutMs?: number },
+) => Promise<{ stdout: string; stderr: string; code: number }>;
+
+const VERIFIED_MERGE_PROOF = Symbol.for("agent-pipeline.VerifiedMergeProof");
+
+/**
+ * Runtime-validated in-process carrier for bound merge-result proof (#1274).
+ * Only {@link createVerifiedMergeProof} (via {@link proveMergeResultInBase} in
+ * production) may construct this object. Logs, labels, and untyped JSON are
+ * not proof.
+ */
+export type VerifiedMergeProof = {
+  readonly issue: number;
+  readonly pr: number;
+  readonly base: string;
+  readonly mergeResultOid: string;
+  readonly [typeof VERIFIED_MERGE_PROOF]: true;
+};
+
+export type BoundProofExpected = {
+  issue: number;
+  pr: number;
+  base: string;
+  mergeResultOid: string;
+};
+
+export type ProveMergeResultInput = {
+  issue: number;
+  pr: number;
+  base: string;
+  mergeResultOid: string;
+};
+
+export type ProveMergeResultDeps = {
+  fetchBase: (base: string) => Promise<void>;
+  baseTip: (base: string) => Promise<string>;
+  isAncestor: (ancestor: string, descendant: string) => Promise<boolean>;
+};
+
+const OID_RE = /^[0-9a-f]{40}$/;
+
+function isPositiveInt(n: unknown): n is number {
+  return typeof n === "number" && Number.isInteger(n) && n > 0;
+}
+
+/** Runtime constructor for {@link VerifiedMergeProof}. Production callers use {@link proveMergeResultInBase}. */
+export function createVerifiedMergeProof(input: ProveMergeResultInput): VerifiedMergeProof {
+  if (!isPositiveInt(input.issue)) {
+    throw new Error("VerifiedMergeProof: issue must be a positive integer");
+  }
+  if (!isPositiveInt(input.pr)) {
+    throw new Error("VerifiedMergeProof: pr must be a positive integer");
+  }
+  const base = typeof input.base === "string" ? input.base.trim() : "";
+  if (base === "") {
+    throw new Error("VerifiedMergeProof: base must be a non-empty string");
+  }
+  const oid = typeof input.mergeResultOid === "string" ? input.mergeResultOid.trim().toLowerCase() : "";
+  if (!OID_RE.test(oid)) {
+    throw new Error("VerifiedMergeProof: mergeResultOid must be a 40-char hex SHA");
+  }
+  return Object.freeze({
+    issue: input.issue,
+    pr: input.pr,
+    base,
+    mergeResultOid: oid,
+    [VERIFIED_MERGE_PROOF]: true as const,
+  });
+}
+
+export function isVerifiedMergeProof(value: unknown): value is VerifiedMergeProof {
+  if (typeof value !== "object" || value === null) return false;
+  const rec = value as Record<PropertyKey, unknown>;
+  if (rec[VERIFIED_MERGE_PROOF] !== true) return false;
+  return (
+    isPositiveInt(rec.issue) &&
+    isPositiveInt(rec.pr) &&
+    typeof rec.base === "string" &&
+    rec.base.trim() !== "" &&
+    typeof rec.mergeResultOid === "string" &&
+    OID_RE.test(rec.mergeResultOid)
+  );
+}
+
+/**
+ * Identity match for bound proof. Compared at wrappers — not inside the pure
+ * remove-safety table. A raw `{ issue, pr, base, oid }` object is not proof.
+ */
+export function boundProofMatches(proof: unknown, expected: BoundProofExpected): boolean {
+  if (!isVerifiedMergeProof(proof)) return false;
+  const base = typeof expected.base === "string" ? expected.base.trim() : "";
+  const oid =
+    typeof expected.mergeResultOid === "string" ? expected.mergeResultOid.trim().toLowerCase() : "";
+  return (
+    proof.issue === expected.issue &&
+    proof.pr === expected.pr &&
+    proof.base === base &&
+    proof.mergeResultOid === oid
+  );
+}
+
+function boundProofMatchesAtWrapper(
+  proof: unknown,
+  issue: number,
+  cfg: PipelineConfig,
+  deps: { prNumber?: number; expectedMergeResultOid?: string },
+): boolean {
+  if (!isVerifiedMergeProof(proof)) return false;
+  if (!isPositiveInt(deps.prNumber)) return false;
+  const expectedOid = deps.expectedMergeResultOid ?? proof.mergeResultOid;
+  return boundProofMatches(proof, {
+    issue,
+    pr: deps.prNumber,
+    base: cfg.base_branch ?? "main",
+    mergeResultOid: expectedOid,
+  });
+}
+
+/** Prove `mergeResultOid` is contained in fetched `origin/<base>`, then mint bound proof. */
+export async function proveMergeResultInBase(
+  input: ProveMergeResultInput,
+  deps: ProveMergeResultDeps,
+): Promise<VerifiedMergeProof | null> {
+  await deps.fetchBase(input.base);
+  const tip = await deps.baseTip(input.base);
+  if (!tip) return null;
+  const contained = await deps.isAncestor(input.mergeResultOid, tip);
+  if (!contained) return null;
+  try {
+    return createVerifiedMergeProof(input);
+  } catch {
+    return null;
+  }
+}
+
+/** Default git-backed in-base verifier deps (inject `gitCmd` in tests). */
+export function gitProveMergeResultDeps(cfg: PipelineConfig, gitCmd: GitCmd = git): ProveMergeResultDeps {
+  return {
+    async fetchBase(base) {
+      await gitCmd(cfg, cfg.repo_dir, ["fetch", "origin", base], { ignoreFailure: true });
+    },
+    async baseTip(base) {
+      const r = await gitCmd(cfg, cfg.repo_dir, ["rev-parse", `origin/${base}`], { ignoreFailure: true });
+      return r.code === 0 ? r.stdout.trim() : "";
+    },
+    async isAncestor(ancestor, descendant) {
+      const r = await gitCmd(
+        cfg,
+        cfg.repo_dir,
+        ["merge-base", "--is-ancestor", ancestor, descendant],
+        { ignoreFailure: true },
+      );
+      return r.code === 0;
+    },
+  };
+}
+
 export type RemoveSafetyInput = {
   /** Whether the workdir is dirty (ignored when path is not on disk). */
   dirty: boolean;
@@ -1657,6 +1840,12 @@ export type RemoveSafetyInput = {
   localOnly: LocalOnlyCommitResult;
   /** Operator `--force`. Reclaim always passes false. */
   force: boolean;
+  /**
+   * Wrapper-computed identity match for {@link VerifiedMergeProof}. When true
+   * and the tree is clean, `"unverifiable"` / `null` do not retain. Never set
+   * `force: true` to skip unverifiable — force also discards dirty work.
+   */
+  boundProofMatches?: boolean;
 };
 
 export type RemoveSafetyResult =
@@ -1668,18 +1857,18 @@ export type RemoveSafetyResult =
  * create-time reclaim (#622). Encodes the operator remove tier table once so
  * the two paths cannot drift:
  *
- *  - localOnly `true` → always block (even with force)
- *  - localOnly `"unverifiable"` → block without force; allow with force
- *  - localOnly `null` → always block (verification hard-failure)
- *  - dirty without force → block
+ *  - localOnly `true` → always block (even with force, even with bound proof)
+ *  - localOnly `"unverifiable"` → block without force unless boundProofMatches
+ *  - localOnly `null` → always block unless boundProofMatches (verification hard-failure)
+ *  - dirty without force → block (bound proof does not discard dirty work)
  *  - otherwise → ok to remove
  *
  * Free of git/network side effects: consumes already-computed inputs only.
  * Order matches operator remove: local-only is evaluated before dirty so dirty
- * state does not hide unpushed commits.
+ * state does not hide unpushed commits. Identity matching is NOT in this table.
  */
 export function evaluateRemoveSafety(input: RemoveSafetyInput): RemoveSafetyResult {
-  const { dirty, localOnly, force } = input;
+  const { dirty, localOnly, force, boundProofMatches } = input;
   if (localOnly === true) {
     return {
       ok: false,
@@ -1687,7 +1876,9 @@ export function evaluateRemoveSafety(input: RemoveSafetyInput): RemoveSafetyResu
       blockReason: "local-only",
     };
   }
-  if (localOnly === "unverifiable" && !force) {
+  const proofAllowsUnverifiable =
+    !!boundProofMatches && (localOnly === "unverifiable" || localOnly === null);
+  if (localOnly === "unverifiable" && !force && !proofAllowsUnverifiable) {
     return {
       ok: false,
       error:
@@ -1696,7 +1887,7 @@ export function evaluateRemoveSafety(input: RemoveSafetyInput): RemoveSafetyResu
       blockReason: "unverifiable",
     };
   }
-  if (localOnly === null) {
+  if (localOnly === null && !proofAllowsUnverifiable) {
     return {
       ok: false,
       error: "commit verification failed (git/network/auth error); check connectivity and retry",
@@ -1736,6 +1927,7 @@ export interface RemoveWorktreeDeps {
    *  - null              → git/network/auth/stale-ref error (hard block, not bypassed by --force)
    *  worktreePath is null for stale registrations (path no longer on disk). */
   hasLocalOnlyCommits?: (cfg: PipelineConfig, worktreePath: string | null, branch: string) => Promise<boolean | "unverifiable" | null>;
+  gitCmd?: GitCmd;
   /** Check the ownership marker written by {@link writeManagedMarker}. Consulted
    *  only for a candidate discovered under a *different* checkout's managed root
    *  (cross-checkout removal, #472) — see {@link removeWorktreeForIssue}. */
@@ -1756,54 +1948,61 @@ export interface RemoveWorktreeDeps {
  *
  *  Remote-branch absent (e.g. GitHub deleted PR head after merge): falls back to
  *  reachability from origin/<base_branch>. All reachable → false (merged via regular
- *  merge). Some unreachable → "unverifiable" (squash-merge where SHAs differ). */
-async function checkLocalOnlyCommits(
+ *  merge). Some unreachable or a reachability probe that cannot prove ancestry
+ *  after a successful empty ls-remote → "unverifiable" (squash-merge). A failed
+ *  ls-remote (transport/auth) → null. Exit 1 (non-ancestry) is not transport
+ *  failure (#1274). */
+export async function checkLocalOnlyCommits(
   cfg: PipelineConfig,
   worktreePath: string | null,
   branch: string,
+  deps: { gitCmd?: GitCmd } = {},
 ): Promise<boolean | "unverifiable" | null> {
+  const gitFn = deps.gitCmd ?? git;
   // Verify the live remote ref (guards against stale local tracking refs).
-  const lsR = await git(cfg, cfg.repo_dir, ["ls-remote", "origin", `refs/heads/${branch}`], { ignoreFailure: true });
+  const lsR = await gitFn(cfg, cfg.repo_dir, ["ls-remote", "origin", `refs/heads/${branch}`], { ignoreFailure: true });
   if (lsR.code !== 0) return null; // network/auth failure — hard block
 
   const remoteSha = lsR.stdout.trim().split(/\s+/)[0] ?? "";
 
   if (remoteSha) {
     // Remote branch exists — confirm local tracking ref is current before trusting ranges.
-    const localRefR = await git(cfg, cfg.repo_dir, ["rev-parse", `refs/remotes/origin/${branch}`], { ignoreFailure: true });
+    const localRefR = await gitFn(cfg, cfg.repo_dir, ["rev-parse", `refs/remotes/origin/${branch}`], { ignoreFailure: true });
     if (localRefR.code !== 0 || localRefR.stdout.trim() !== remoteSha) return null; // stale — hard block
 
     if (worktreePath !== null) {
-      const headR = await git(cfg, worktreePath, ["log", "--oneline", `origin/${branch}..HEAD`], { ignoreFailure: true });
+      const headR = await gitFn(cfg, worktreePath, ["log", "--oneline", `origin/${branch}..HEAD`], { ignoreFailure: true });
       if (headR.code !== 0) return null;
       if (headR.stdout.trim().length > 0) return true;
-      const branchR = await git(cfg, cfg.repo_dir, ["log", "--oneline", `origin/${branch}..${branch}`], { ignoreFailure: true });
+      const branchR = await gitFn(cfg, cfg.repo_dir, ["log", "--oneline", `origin/${branch}..${branch}`], { ignoreFailure: true });
       if (branchR.code !== 0) return null;
       return branchR.stdout.trim().length > 0;
     }
-    const r = await git(cfg, cfg.repo_dir, ["log", "--oneline", `origin/${branch}..${branch}`], { ignoreFailure: true });
+    const r = await gitFn(cfg, cfg.repo_dir, ["log", "--oneline", `origin/${branch}..${branch}`], { ignoreFailure: true });
     if (r.code !== 0) return null;
     return r.stdout.trim().length > 0;
   }
 
-  // Remote branch absent (e.g. GitHub deleted PR head after merge).
-  // Check reachability from origin/<base_branch>:
-  //   all reachable  → false (regular merge, safe to delete)
-  //   some unreachable → "unverifiable" (squash-merge; soft block, --force allowed)
-  //   git error       → null (hard block)
+  // Remote branch absent — ls-remote succeeded with an empty SHA. After squash
+  // merge GitHub deletes the head ref; reachability against origin/<base> is
+  // squash-merge unreachability, not git/network/auth (#1274).
+  //   all reachable (code 0, empty stdout) → false
+  //   commits present, exit 1 (non-ancestry), or command error (exit ≥ 128) → "unverifiable"
   const baseBranch = cfg.base_branch ?? "main";
+  const classifyObservedAbsent = (code: number, stdout: string): LocalOnlyCommitResult => {
+    if (code === 0) return stdout.trim().length === 0 ? false : "unverifiable";
+    return "unverifiable";
+  };
   if (worktreePath !== null) {
-    const headR = await git(cfg, worktreePath, ["log", "--oneline", `origin/${baseBranch}..HEAD`], { ignoreFailure: true });
-    if (headR.code !== 0) return null;
-    const branchR = await git(cfg, cfg.repo_dir, ["log", "--oneline", `origin/${baseBranch}..${branch}`], { ignoreFailure: true });
-    if (branchR.code !== 0) return null;
-    if (headR.stdout.trim().length === 0 && branchR.stdout.trim().length === 0) return false;
-    return "unverifiable"; // squash-merge ambiguity — remote deleted, commits not in base
+    const headR = await gitFn(cfg, worktreePath, ["log", "--oneline", `origin/${baseBranch}..HEAD`], { ignoreFailure: true });
+    const headClass = classifyObservedAbsent(headR.code, headR.stdout);
+    if (headClass !== false) return headClass;
+    const branchR = await gitFn(cfg, cfg.repo_dir, ["log", "--oneline", `origin/${baseBranch}..${branch}`], { ignoreFailure: true });
+    return classifyObservedAbsent(branchR.code, branchR.stdout);
   }
   // Stale registration + remote absent
-  const r = await git(cfg, cfg.repo_dir, ["log", "--oneline", `origin/${baseBranch}..${branch}`], { ignoreFailure: true });
-  if (r.code !== 0) return null;
-  return r.stdout.trim().length === 0 ? false : "unverifiable";
+  const r = await gitFn(cfg, cfg.repo_dir, ["log", "--oneline", `origin/${baseBranch}..${branch}`], { ignoreFailure: true });
+  return classifyObservedAbsent(r.code, r.stdout);
 }
 
 /** Remove-worktree dep default: throws on failure so the caller can capture the message. */
@@ -1857,7 +2056,9 @@ export async function removeWorktreeForIssue(
   const dirtyFn = deps.hasDirtyWorkdir ?? hasDirtyWorkdir;
   const removeFn = deps.removeWorktree ?? realRemoveWorktreeOp;
   const existsFn = deps.pathExists ?? fs.existsSync;
-  const localOnlyFn = deps.hasLocalOnlyCommits ?? checkLocalOnlyCommits;
+  const localOnlyFn =
+    deps.hasLocalOnlyCommits ??
+    ((c, p, b) => checkLocalOnlyCommits(c, p, b, { gitCmd: deps.gitCmd }));
 
   const records = await listFn(cfg);
   // Legacy fallback for records with no underManagedRoot (test-injected, or a
@@ -2037,6 +2238,13 @@ export interface ParkReleaseDeps {
     resolvedPath?: string,
     force?: boolean,
   ) => Promise<void>;
+  gitCmd?: GitCmd;
+  /** Bound merge-result proof — recoverability condition 2 (#1274). */
+  verifiedMergeProof?: VerifiedMergeProof;
+  /** Independently known PR number for proof identity match. */
+  prNumber?: number;
+  /** Independently known merge-result OID for proof identity match. */
+  expectedMergeResultOid?: string;
 }
 
 async function realHasRemoteBranchTip(cfg: PipelineConfig, branch: string): Promise<boolean> {
@@ -2072,10 +2280,12 @@ export async function resolveOpenPrHeadForBranch(
  * `max_concurrent_worktrees` capacity frees for other items (#718 Policy A).
  *
  * Safety (fail-closed): under managed root, clean workdir, no definitive
- * local-only commits, and remote tip **or** open PR for recoverability.
- * Dirty / local-only / unverifiable / missing-remote parks retain the tree
- * with a visible reason. Idempotent when no managed worktree is on disk.
- * Never deletes the remote branch or open PR.
+ * local-only commits, and **one** recoverability condition:
+ * 1. remote tip **or** open PR with resolvable head; or
+ * 2. bound merge-result proof for this issue + PR + base + proven OID.
+ * Dirty / local-only / unverifiable-without-proof / missing-remote parks
+ * retain the tree with a visible reason. Idempotent when no managed worktree
+ * is on disk. Never deletes the remote branch or open PR.
  */
 export async function releaseWorktreeForParkedIssue(
   cfg: PipelineConfig,
@@ -2084,7 +2294,9 @@ export async function releaseWorktreeForParkedIssue(
 ): Promise<ParkReleaseResult> {
   const listFn = deps.listOnDisk ?? listOnDisk;
   const dirtyFn = deps.hasDirtyWorkdir ?? hasDirtyWorkdir;
-  const localOnlyFn = deps.hasLocalOnlyCommits ?? checkLocalOnlyCommits;
+  const localOnlyFn =
+    deps.hasLocalOnlyCommits ??
+    ((c, p, b) => checkLocalOnlyCommits(c, p, b, { gitCmd: deps.gitCmd }));
   const existsFn = deps.pathExists ?? fs.existsSync;
   const remoteTipFn = deps.hasRemoteBranchTip ?? realHasRemoteBranchTip;
   const resolveOpenPrHeadFn = deps.resolveOpenPrHeadForBranch ?? resolveOpenPrHeadForBranch;
@@ -2141,10 +2353,15 @@ export async function releaseWorktreeForParkedIssue(
   const localOnly = await localOnlyFn(cfg, pathOnDisk ? worktreeP : null, branch);
 
   // Single evaluateRemoveSafety decision for dirty/local-only (#759 parked
-  // release). Prior code re-checked the same policy via early returns and a
-  // second evaluateRemoveSafety call — those could disagree in wording and
-  // counted as two independent preflights.
-  const safety = evaluateRemoveSafety({ dirty, localOnly, force: false });
+  // release). Identity matching happens here at the wrapper, then the boolean
+  // is passed into the pure table (#1274).
+  const proofMatches = boundProofMatchesAtWrapper(deps.verifiedMergeProof, issueNumber, cfg, deps);
+  const safety = evaluateRemoveSafety({
+    dirty,
+    localOnly,
+    force: false,
+    boundProofMatches: proofMatches,
+  });
   if (!safety.ok) {
     const reason =
       safety.blockReason === "dirty"
@@ -2168,28 +2385,32 @@ export async function releaseWorktreeForParkedIssue(
   // the remote branch tip is absent (#718 review ac32c448).
   const openPrHead = hasRemoteTip ? null : await resolveOpenPrHeadFn(cfg, branch);
   const hasRecoverableOpenPr = openPrHead !== null && openPrHead.headSha.length > 0;
-  // Open PR is an alternate recoverability path when remote-tip verification is
-  // marginal (e.g. unverifiable after squash ambiguity) — still require no
-  // definitive local-only commits (handled above via evaluateRemoveSafety).
-  if (localOnly === "unverifiable" && !hasRecoverableOpenPr && !hasRemoteTip) {
-    return {
-      action: "retained",
-      reason:
-        `local-only verification unverifiable for ${branch} and no open PR with resolvable head; ` +
-        "park-release retains the worktree",
-      branch,
-      worktree: worktreeP,
-    };
-  }
-  if (!hasRemoteTip && !hasRecoverableOpenPr) {
-    return {
-      action: "retained",
-      reason:
-        `no remote branch tip and no open PR with resolvable head for ${branch}; ` +
-        "park-release retains the worktree (missing remote recoverability)",
-      branch,
-      worktree: worktreeP,
-    };
+  // Bound merge-result proof is recoverability condition 2: skip remote-tip /
+  // open-PR retain after a proven squash merge (#1274).
+  if (!proofMatches) {
+    // Open PR is an alternate recoverability path when remote-tip verification is
+    // marginal (e.g. unverifiable after squash ambiguity) — still require no
+    // definitive local-only commits (handled above via evaluateRemoveSafety).
+    if (localOnly === "unverifiable" && !hasRecoverableOpenPr && !hasRemoteTip) {
+      return {
+        action: "retained",
+        reason:
+          `local-only verification unverifiable for ${branch} and no open PR with resolvable head; ` +
+          "park-release retains the worktree",
+        branch,
+        worktree: worktreeP,
+      };
+    }
+    if (!hasRemoteTip && !hasRecoverableOpenPr) {
+      return {
+        action: "retained",
+        reason:
+          `no remote branch tip and no open PR with resolvable head for ${branch}; ` +
+          "park-release retains the worktree (missing remote recoverability)",
+        branch,
+        worktree: worktreeP,
+      };
+    }
   }
 
   try {
@@ -2205,8 +2426,10 @@ export async function releaseWorktreeForParkedIssue(
 
   return {
     action: "released",
-    reason: hasRemoteTip
-      ? `released managed worktree for #${issueNumber} (clean + remote tip on ${branch})`
+    reason: proofMatches
+      ? `released managed worktree for #${issueNumber} (clean + bound merge-result proof)`
+      : hasRemoteTip
+        ? `released managed worktree for #${issueNumber} (clean + remote tip on ${branch})`
       : `released managed worktree for #${issueNumber} (clean + open PR #${openPrHead!.prNumber} head ${openPrHead!.headSha.slice(0, 8)} for ${branch})`,
     branch,
     worktree: worktreeP,

@@ -3828,6 +3828,7 @@ export async function runTrainCommand(
       baseBranch: trainCfg.base_branch,
       repoDir: trainCfg.repo_dir,
       repo: trainCfg.repo,
+      pipelineConfig: trainCfg,
     },
     {
       ...baseDeps,

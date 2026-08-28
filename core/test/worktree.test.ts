@@ -1957,6 +1957,37 @@ test("evaluateRemoveSafety: pure tier table matches operator remove without forc
     assert.equal(hardFail.blockReason, "verification-failed");
     assert.match(hardFail.error, /verification failed/i);
   }
+
+  // Bound proof authorizes clean unverifiable/null; never dirty or local-only (#1274).
+  assert.equal(
+    evaluateRemoveSafety({
+      dirty: false,
+      localOnly: "unverifiable",
+      force: false,
+      boundProofMatches: true,
+    }).ok,
+    true,
+  );
+  assert.equal(
+    evaluateRemoveSafety({ dirty: false, localOnly: null, force: false, boundProofMatches: true }).ok,
+    true,
+  );
+  const dirtyProof = evaluateRemoveSafety({
+    dirty: true,
+    localOnly: "unverifiable",
+    force: false,
+    boundProofMatches: true,
+  });
+  assert.equal(dirtyProof.ok, false);
+  if (!dirtyProof.ok) assert.equal(dirtyProof.blockReason, "dirty");
+  const localOnlyProof = evaluateRemoveSafety({
+    dirty: false,
+    localOnly: true,
+    force: false,
+    boundProofMatches: true,
+  });
+  assert.equal(localOnlyProof.ok, false);
+  if (!localOnlyProof.ok) assert.equal(localOnlyProof.blockReason, "local-only");
 });
 
 /** Base deps for #622 reclaim-safety tests: no real git/fs; overrides per case. */

@@ -100,7 +100,8 @@ export const COMMAND_DOCS: Record<string, CommandDoc> = {
     section: "lifecycle",
   },
   "remove-worktree": {
-    summary: "Remove a managed pipeline worktree for an issue (optional --force)",
+    summary:
+      "Remove a managed pipeline worktree for an issue (optional --force). After a proven merge, /pipeline and train --merge share bound-proof park-release; cleanup is not the required fix",
     usage: "remove-worktree <n> [--force]",
     documented: true,
     section: "lifecycle",

@@ -119,9 +119,14 @@ const RECIPE_SNAPSHOTS: Record<(typeof BLOCKER_KINDS)[number], string> = {
     "Worktree capacity is full (`max_concurrent_worktrees` other active managed " +
     "worktrees). This is an ops/admission wait, not a product decision. Wait for " +
     "an active issue to complete (or for a durable park to release a clean parked " +
-    "worktree), then re-run `$pipeline 7`. If a parked issue still holds a " +
-    "worktree because it was dirty or unpushed, push or clean it and " +
-    "`$pipeline 7 --remove-worktree` when safe. `pipeline:cleanup` only sweeps " +
+    "worktree), then re-run `$pipeline 7`. After a proven squash merge, " +
+    "`/pipeline` and `train --merge` share a bound-proof park-release gate that " +
+    "frees a clean managed worktree; that path is not a git/network/auth failure " +
+    "and `pipeline:cleanup` is not the required fix. If a parked issue still holds a " +
+    "worktree because it was dirty or unpushed, or because commits are not " +
+    "reachable from the base without bound merge-result proof, push or clean it and " +
+    "`$pipeline 7 --remove-worktree` when safe (`--force` only for the " +
+    "squash-merge unreachability tier). `pipeline:cleanup` only sweeps " +
     "merged-PR worktrees and does not free open blocked PRs. Remove the `blocked` " +
     "label before re-running if it is still present.",
   "pr-creation-failed":

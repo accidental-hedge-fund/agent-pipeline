@@ -22,6 +22,14 @@ Automatic park-release and ready-to-deploy removal SHALL consume this classifica
 - **THEN** the shared ladder MAY retain the worktree with a git/network/auth reason
 - **AND** that reason SHALL still not be used when the remote-absent squash-merge condition was successfully observed
 
+#### Scenario: Expected non-ancestry exit is not a transport failure
+
+- **WHEN** `ls-remote` succeeds and the remote head ref is empty
+- **AND** the reachability probe reports non-ancestry with documented exit status 1 (or non-empty `git log origin/<base>..HEAD`)
+- **THEN** the shared ladder SHALL classify the result as squash-merge unreachability
+- **AND** SHALL NOT classify exit status 1 as a git/network/auth hard failure
+- **AND** SHALL still classify a failed `ls-remote` observation as transport/auth when bound proof is absent
+
 ### Requirement: Automatic ready-to-deploy removal SHALL honor bound merge-result proof
 
 The shared automatic-removal path used at `pipeline:ready-to-deploy` and by park-release SHALL accept bound merge-result proof (same issue number, same PR number, same base branch, same proven `merge_result_oid` contained in `origin/<base>`). When that proof is present and the managed worktree is clean, the path SHALL remove the worktree even if local-only verification reports squash-merge unreachability. The path SHALL still evaluate the shared dirty/local-only ladder once. It SHALL NOT pass operator `--force` solely to bypass unverifiable state, because `--force` also discards dirty work.

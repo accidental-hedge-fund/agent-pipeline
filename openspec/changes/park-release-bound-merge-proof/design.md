@@ -34,16 +34,19 @@ See `proposal.md` for motivation. Current law and code:
 
 ## Decisions
 
-### 1. Bound proof is an explicit identity tuple, not recency
+### 1. Bound proof is a runtime-validated `VerifiedMergeProof` carrier
 
-**Choice:** Park-release accepts bound proof only as `{ issue, pr, base, merge_result_oid }` where the engine has already proven that OID is contained in `origin/<base>` for that identity. A proof for another issue, PR, base, or OID does not release this tree.
+**Choice:** One in-process type `VerifiedMergeProof` with fields `{ issue, pr, base, mergeResultOid }`. The only constructor is `createVerifiedMergeProof`. It runtime-validates: issue and PR are positive integers; `base` is a non-empty string; `mergeResultOid` is a 40-char hex SHA. The only production caller of that constructor is `proveMergeResultInBase` (the in-base verifier) after `isAncestor(oid, fetchedBaseTip)` returns true. Callers pass that object directly into the shared release gate. Park-release SHALL NOT reconstruct proof from run logs, GitHub labels, issue comments, or untyped persisted JSON.
 
-**Why:** Temporal proximity ("we just merged something") cannot bind reliability evidence. The engine already records `merge_result_oid` on the train merge path; `/pipeline` can carry the same identity from the merge surface or from the just-proven observation.
+Identity match is exact: the proof's issue, PR, base, and OID must equal this worktree's issue, this PR, `cfg.base_branch`, and the OID the verifier just proved. A mismatch on any one field does not release this tree.
+
+**Why:** Temporal proximity ("we just merged something") cannot bind reliability evidence. Logs and labels are not a verifier. The engine already proves containment in `mergeReadyToDeployItem` / `reconcileMergedPrIntegration`; that success is the mint site.
 
 **Alternatives considered:**
 
 - "Any merged PR for this issue" → rejected. A historical merged PR must not release a live worktree for a different head.
 - "Base contains any commit from this branch" → rejected. Squash merge replaces those SHAs; that is the bug's reachability check.
+- Reconstruct from `train_merge_proven` events or `pipeline:ready-to-deploy` + merged PR state → rejected. Untyped persisted data is not a verifier result.
 
 ### 2. Extend the shared ladder; do not pass `--force`
 
@@ -57,34 +60,53 @@ See `proposal.md` for motivation. Current law and code:
 - `force: true` when proof is present → would delete dirty trees.
 - Only fix the `null` vs `"unverifiable"` string → correct diagnosis, but still retain after proven merge (open PR gone, remote tip gone).
 
-### 3. Classifier: observed remote-absent is not transport failure
+### 3. Classifier taxonomy: remote-head observation vs reachability vs transport
 
-**Choice:** When `ls-remote` (or equivalent) **succeeds** and the remote head ref is empty, the missing-head + not-in-base outcome is squash-merge unreachability (`"unverifiable"`), even if `git log origin/<base>..HEAD` then fails. `null` / git/network/auth remains only when the transport cannot tell whether the remote head exists (and bound proof is absent). Bound proof short-circuits the need to prove pre-squash SHAs are in the base.
+**Choice:** `checkLocalOnlyCommits` uses this exact table. Do not collapse `ls-remote` transport failure with expected non-ancestry.
 
-**Why:** That is the observed false diagnosis. One path already names the squash-merge case; the `null` path must not steal it after a successful empty `ls-remote`.
+| Remote-head observation | Reachability probe | Result |
+| --- | --- | --- |
+| `ls-remote` non-zero (git/network/auth/spawn) | not run | `null` (verification-failed). Bound proof absent → retain with git/network/auth. |
+| `ls-remote` code 0, non-empty SHA | existing remote-present logic | `true` / `false` / `null` as today |
+| `ls-remote` code 0, empty SHA (remote head absent) | `git log origin/<base>..HEAD` (and branch range) code 0, empty stdout | `false` (all reachable) |
+| `ls-remote` code 0, empty SHA | log code 0 with commits **or** `git merge-base --is-ancestor` / equivalent **exit 1** (documented non-ancestry) | `"unverifiable"` (squash-merge unreachability) |
+| `ls-remote` code 0, empty SHA | reachability command error (exit ≥ 128, spawn, timeout). Exit 1 after observed-absent is **not** this row. | `"unverifiable"`, not `null`. Keep the existing squash-merge / `--force` wording. Do not map to git/network/auth. Preserve the underlying command diagnostic in test seams / logs when the probe could not prove ancestry. |
+
+The shared ladder (`evaluateRemoveSafety`) maps `"unverifiable"` to the existing not-reachable message and `null` to git/network/auth. Bound matching proof authorizes release of a **clean** tree when localOnly is `"unverifiable"` (and also when it is `null`, so a leftover misclassification cannot revive the #290/#269 wording). Bound proof never bypasses managed-root validation, dirty detection, or `localOnly === true`. Implementation MUST NOT set `force: true` to skip unverifiable.
+
+**Why:** After squash, GitHub deletes the head ref. `ls-remote` succeeds with an empty SHA. `git log origin/<base>..HEAD` then often fails (missing `origin/<base>` in the worktree, exit 128) or reports non-ancestry. Today that becomes `null` and `commit verification failed (git/network/auth error)`. Exit 1 is the documented non-ancestry status for `merge-base --is-ancestor`; it must not be treated as transport failure.
 
 **Alternatives considered:**
 
 - Treat every `git log` failure as transport failure → status quo; false git/network/auth after squash.
-- Treat every `git log` failure as unverifiable → would hide a real missing `origin/<base>` fetch failure when no merge proof exists. Acceptable only after remote-absent was observed; still retain without bound proof.
+- Treat `ls-remote` exit 1 the same as empty remote head → rejected. A failed remote-head observation stays transport/auth.
 
-### 4. Cleanup is best-effort; labels do not roll back
+### 4. Cleanup is best-effort after merge/integration is recorded
 
-**Choice:** If remove fails after proven merge, keep that worktree, report the filesystem/cleanup error, leave `pipeline:ready-to-deploy` and integrated state unchanged.
+**Choice:** Record merge proof / `train_merge_proven` / `train_merge_integrated` / `pipeline:ready-to-deploy` first. Then attempt worktree cleanup. If remove fails or the tree is dirty, keep **only that** worktree, report the filesystem/cleanup or dirty reason, and **do not** invoke label or integration rollback (`setBlocked`, label removal, clearing `integrated`). Ready-to-deploy and integrated state stay as already recorded.
 
 **Why:** Merge already happened. Cleanup is not a merge gate. Rolling back labels would lie about integration.
 
-### 5. Train passes proof into the shared gate; it does not grow a second recoverer
+### 5. Authoritative callers pass the same proof into the same shared APIs
 
-**Choice:** After `train --merge` records `train_merge_proven` / `train_merge_integrated` with `merge_result_oid`, the train (or the pipeline finalize it already composes) calls the shared park-release helper with that bound tuple. No train-local worktree destroyer. No second recoverer in `train.ts`.
+**Choice:** Three callers, two shared functions, one ladder. No train-only remover.
 
-**Why:** Ship-path constitution: class over site; no second recoverer inside `train.ts`.
+1. `maybeReleaseWorktreeOnPark` (`/pipeline` / `pipeline single`) → `releaseWorktreeForParkedIssue(cfg, issue, { verifiedMergeProof })`.
+2. `deploy_ready.finalize` automatic removal → `removeManagedWorktreeSafely(..., { verifiedMergeProof, force: false })`.
+3. `train --merge` after `mergeReadyToDeployItem` / `reconcileMergedPrIntegration` returns `kind: "integrated"` with an OID → mint `VerifiedMergeProof` via `proveMergeResultInBase` (or `createVerifiedMergeProof` immediately after the existing successful `isAncestor` in that same call) → `releaseWorktreeForParkedIssue` with that object.
+
+`/pipeline` deploy_ready mints the same way when the linked PR is already merged: observe merge OID, fetch base, `isAncestor`, then `createVerifiedMergeProof`. If the PR is still open, there is no proof (pre-merge R2D path unchanged).
+
+Train SHALL NOT add a `git worktree remove` path, a second recoverer in `train.ts`, or a wrapper that re-implements dirty/proof checks. `core/test/worktree-remove-safety-registry.test.ts` must still classify train as ladder-backed if it gains a remove call (it must call `releaseWorktreeForParkedIssue`).
+
+**Why:** Ship-path constitution: class over site; no second recoverer inside `train.ts`. A train-only delete would leave `/pipeline` emitting git/network/auth.
 
 ## Risks / Trade-offs
 
 - **[Risk] Stale proof from a previous PR on the same issue releases a newer dirty or unpushed tree.** → Mitigation: bind PR number and OID; dirty and definitive local-only still retain.
 - **[Risk] Real network failure is reclassified as unverifiable and then released with weak proof.** → Mitigation: unverifiable-from-remote-absent still retains without bound proof; release requires the engine-proven OID in `origin/<base>`.
-- **[Risk] Passing bound proof only from train leaves `/pipeline` broken.** → Mitigation: the gate is shared; tests cover both caller seams.
+- **[Risk] Passing bound proof only from train leaves `/pipeline` broken.** → Mitigation: `deploy_ready.finalize` mints `VerifiedMergeProof` via the same in-base verifier when the linked PR is already merged; caller-seam tests assert both train and park/deploy_ready pass that object into the shared APIs.
+- **[Risk] Bound proof bypasses dirty or local-only safety.** → Mitigation: `evaluateRemoveSafety` still blocks `dirty` and `localOnly === true` when `boundProofMatches` is true; tests cover managed-root, dirty, and definitive local-only independently.
 - **[Risk] Operator `--remove-worktree` behavior drifts.** → Mitigation: that surface keeps the existing unverifiable / `--force` table unless the same bound proof is supplied; this change does not auto-force operator remove.
 
 ## Migration Plan
