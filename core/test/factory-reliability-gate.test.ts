@@ -46,6 +46,9 @@ import {
   validateReleaseEligibleFrgEvidence,
   validateFrgEvidenceFileForTag,
   validateFrgEvidenceSnapshotForTag,
+  FrgTagPathIneligibleError,
+  isFrgTagPathIneligibleError,
+  observeReleaseEligibleFrgEvidence,
   frgLatestRelPath,
   formatFrgPackCloseComment,
   parseFrgItemIssueNumber,
@@ -2172,6 +2175,159 @@ test("validateFrgEvidenceFileForTag: release-eligible pass does not emit fail-cl
   });
   assert.equal(ok.pass, true);
   assert.equal(ok.version, "1.30.0");
+});
+
+test("observe mapping: missing latest.json is not observed; tag path stays fail-closed (#1271)", async () => {
+  const fs = memFs();
+  const observed = await observeReleaseEligibleFrgEvidence("/repo", "1.39.14", fs, {
+    attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
+  });
+  assert.equal(observed, null);
+
+  await assert.rejects(
+    () =>
+      validateFrgEvidenceFileForTag("/repo", "1.39.14", fs, {
+        attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
+      }),
+    (err: unknown) => {
+      assert.equal(isFrgTagPathIneligibleError(err), true);
+      assert.equal((err as FrgTagPathIneligibleError).kind, "missing");
+      const message = (err as Error).message;
+      assert.equal(message.includes("evidence missing"), false);
+      assert.match(message, /missing at/);
+      assert.match(message, /Cannot create or push tag v1\.39\.14/);
+      assertTagPathRemediation(err, "1.39.14");
+      return true;
+    },
+  );
+});
+
+test("observe mapping: unreadable and not-release-eligible latest.json are not observed (#1271)", async () => {
+  const latestPath = frgLatestPath("/repo", "1.39.14");
+  const unreadable: FrgFsDeps = {
+    ...memFs(),
+    async readFile() {
+      const err = new Error("EACCES: permission denied") as NodeJS.ErrnoException;
+      err.code = "EACCES";
+      throw err;
+    },
+  };
+  assert.equal(
+    await observeReleaseEligibleFrgEvidence("/repo", "1.39.14", unreadable, {
+      attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
+    }),
+    null,
+  );
+  await assert.rejects(
+    () =>
+      validateFrgEvidenceFileForTag("/repo", "1.39.14", unreadable, {
+        attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
+      }),
+    (err: unknown) => {
+      assert.equal(isFrgTagPathIneligibleError(err), true);
+      assert.equal((err as FrgTagPathIneligibleError).kind, "unreadable");
+      assertTagPathRemediation(err, "1.39.14");
+      return true;
+    },
+  );
+
+  const fs = memFs();
+  await fs.writeFile(latestPath, "{not-json");
+  assert.equal(
+    await observeReleaseEligibleFrgEvidence("/repo", "1.39.14", fs, {
+      attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
+    }),
+    null,
+  );
+
+  const failEv = computeFrgEvidence({
+    version: "1.39.14",
+    run_id: "frg-observe-fail",
+    loop_run_id: "loop",
+    pack_id: FRG_PACK_MANIFEST.pack_id,
+    items: [{ item_id: "1", state: "ready", ready_clean: true }],
+    scenario_overrides: frgRequiredObservationOverrides("pass"),
+    composition_overrides: frgRequiredCompositionOverrides("pass"),
+    attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
+  });
+  assert.equal(failEv.pass, false);
+  await writeFrgEvidence("/repo", failEv, fs);
+  assert.equal(
+    await observeReleaseEligibleFrgEvidence("/repo", "1.39.14", fs, {
+      attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
+    }),
+    null,
+  );
+  await assert.rejects(
+    () =>
+      validateFrgEvidenceFileForTag("/repo", "1.39.14", fs, {
+        attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
+      }),
+    (err: unknown) => {
+      assert.equal(isFrgTagPathIneligibleError(err), true);
+      assert.equal((err as FrgTagPathIneligibleError).kind, "not_release_eligible");
+      assertTagPathRemediation(err, "1.39.14");
+      return true;
+    },
+  );
+});
+
+test("observe mapping: HMAC-invalid artifact is not observed; eligible pass is (#1271)", async () => {
+  const fs = memFs();
+  const signed = computeFrgEvidence({
+    ...fullPackPassInput({ version: "1.30.0", run_id: "frg-observe-hmac" }),
+    factory_release_binding: { candidate_git_sha: "a".repeat(40) },
+  });
+  assert.equal(signed.pass, true);
+  const forged = {
+    ...signed,
+    factory_release_binding: { candidate_git_sha: "b".repeat(40) },
+  };
+  await fs.writeFile(frgLatestPath("/repo", "1.30.0"), `${JSON.stringify(forged)}\n`);
+  assert.equal(
+    await observeReleaseEligibleFrgEvidence("/repo", "1.30.0", fs, {
+      attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
+    }),
+    null,
+  );
+
+  await writeFrgEvidence("/repo", signed, fs);
+  const ok = await observeReleaseEligibleFrgEvidence("/repo", "1.30.0", fs, {
+    attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
+  });
+  assert.equal(ok?.pass, true);
+  assert.equal(ok?.version, "1.30.0");
+});
+
+test("observe mapping: missing attestor still throws and is not not-observed (#1271)", async () => {
+  const fs = memFs();
+  const good = computeFrgEvidence(fullPackPassInput({ version: "1.30.0", run_id: "frg-observe-cred" }));
+  await writeFrgEvidence("/repo", good, fs);
+  await assert.rejects(
+    () => observeReleaseEligibleFrgEvidence("/repo", "1.30.0", fs, { env: {} }),
+    /missing_attestor_credential/,
+  );
+});
+
+test("observe mapping source does not substring-match tag-path formatter copy (#1271)", async () => {
+  const { readFileSync } = await import("node:fs");
+  const { fileURLToPath } = await import("node:url");
+  const src = readFileSync(
+    fileURLToPath(new URL("../scripts/factory-reliability-gate.ts", import.meta.url)),
+    "utf8",
+  );
+  const start = src.indexOf("export async function observeReleaseEligibleFrgEvidence");
+  const end = src.indexOf("export async function validateFrgEvidenceSnapshotForTag");
+  assert.ok(start !== -1 && end > start, "expected observe mapping helper");
+  const body = src.slice(start, end);
+  assert.equal(body.includes('includes("evidence missing")'), false);
+  assert.equal(body.includes("includes('evidence missing')"), false);
+  assert.equal(
+    /includes\s*\(/.test(body),
+    false,
+    "observe mapping must not classify by formatter substring",
+  );
+  assert.match(body, /isFrgTagPathIneligibleError/);
 });
 
 test("HMAC rejects factory_release_binding overlay after sign (#1149)", () => {

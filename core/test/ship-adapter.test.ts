@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -17,6 +18,7 @@ import {
   loadRerunAttemptCount,
   persistShipFactoryReleaseRequest,
   persistedShipFactoryReleaseRequestPath,
+  observeFrgEvidence,
   observeTrainEvidence,
   planTrainFromMilestoneIssues,
   probeBoundPackLoopLive,
@@ -60,9 +62,17 @@ import {
   frgRequiredCompositionOverrides,
   frgRequiredObservationOverrides,
   shipMissingFrgDiagnostic,
+  validateFrgEvidenceSnapshotForTag,
   validateReleaseEligibleFrgEvidence,
+  writeFrgEvidence,
   type FrgEvidence,
+  type FrgFsDeps,
 } from "../scripts/factory-reliability-gate.ts";
+import {
+  collectFrgPackObservations,
+  loadFrgPack,
+  renderFrgPackIssues,
+} from "../scripts/frg-pack-observations.ts";
 import type { TrainIssueSnapshot } from "../scripts/stages/train.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -497,6 +507,191 @@ test("observeTrain: fork-only timeline is not integration proof (#1269)", async 
   assert.equal(evidence, null);
 });
 
+function memFs(): FrgFsDeps & { files: Map<string, string> } {
+  const files = new Map<string, string>();
+  return {
+    files,
+    async readFile(p) {
+      const v = files.get(p);
+      if (v === undefined) {
+        const err = new Error(`ENOENT: ${p}`) as NodeJS.ErrnoException;
+        err.code = "ENOENT";
+        throw err;
+      }
+      return v;
+    },
+    async writeFile(p, data) {
+      files.set(p, data);
+    },
+    async mkdir() {},
+    async rename(from, to) {
+      const v = files.get(from);
+      if (v === undefined) throw new Error(`ENOENT rename ${from}`);
+      files.set(to, v);
+      files.delete(from);
+    },
+  };
+}
+
+const intent13914: ShipIntent = {
+  ...intent,
+  milestone: "v1.39.14",
+  version: "1.39.14",
+  thread_id: "release-1.39.14",
+};
+
+const train13914: ShipTrainEvidence = {
+  ...train,
+  milestone: intent13914.milestone,
+};
+
+function observeFrgDeps(
+  frgFs: FrgFsDeps,
+  overrides: {
+    observeBase?: () => Promise<string>;
+    isAncestor?: (ancestor: string, descendant: string) => Promise<boolean>;
+    readFile?: (path: string) => Promise<string>;
+  } = {},
+) {
+  return {
+    repoDir: "/repo",
+    observeBase: overrides.observeBase ?? (async () => head),
+    isAncestor: overrides.isAncestor ?? (async (ancestor: string, descendant: string) => ancestor === descendant),
+    frgFs,
+    frgValidateOpts: { attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY },
+    readFile: overrides.readFile ?? (async () => {
+      const err = new Error("ENOENT") as NodeJS.ErrnoException;
+      err.code = "ENOENT";
+      throw err;
+    }),
+  };
+}
+
+async function mintHybridEvidence(opts: {
+  version: string;
+  candidateGitSha: string;
+  repository: string;
+  baseBranch: string;
+}): Promise<FrgEvidence> {
+  const pack = await loadFrgPack();
+  const packRunId = "frg-pack-observe-1271";
+  const loopRunId = "loop-frg-observe-1271";
+  const startedAt = "2026-08-16T12:00:00.000Z";
+  const rendered = renderFrgPackIssues(pack, {
+    release_version: opts.version,
+    pack_run_id: packRunId,
+  });
+  const issueNumbers = rendered.map((_, index) => 1101 + index);
+  const digest = (value: string) => createHash("sha256").update(value).digest("hex");
+  const observations = collectFrgPackObservations(pack, {
+    schema_version: 1 as const,
+    policy_id: pack.manifest.pilot_policy.id,
+    pack_id: pack.manifest.pack_id,
+    manifest_version: pack.manifest.manifest_version,
+    manifest_sha256: pack.manifest_sha256,
+    release_version: opts.version,
+    candidate_git_sha: opts.candidateGitSha,
+    pack_run_id: packRunId,
+    loop_run_id: loopRunId,
+    repository: opts.repository,
+    base_branch: opts.baseBranch,
+    started_at: startedAt,
+    contract: {
+      artifact_sha256: digest("contract"),
+      selector: { ...pack.manifest.selector },
+      issue_numbers: issueNumbers,
+      items: issueNumbers.map((issueNumber) => ({ issue_number: issueNumber, depends_on: [] })),
+    },
+    ledger: {
+      artifact_sha256: digest("ledger"),
+      items: issueNumbers.map((issueNumber, index) => ({
+        issue_number: issueNumber,
+        state: "ready",
+        advance_run_id: `advance-${index + 1}`,
+        blocked_theme: null,
+      })),
+    },
+    events: {
+      artifact_sha256: digest("events"),
+      event_ids: issueNumbers.map((issueNumber, index) => `event:${index + 1}:item-${issueNumber}`),
+      issue_numbers: issueNumbers,
+    },
+    action_evidence: {
+      artifact_sha256: digest("actions"),
+      action_ids: issueNumbers.map((issueNumber, index) => `action:${index + 1}:item-${issueNumber}`),
+      issue_numbers: issueNumbers,
+    },
+    issues: rendered.map((issue, index) => {
+      const issueNumber = issueNumbers[index]!;
+      const prHead = String(index + 1).repeat(40);
+      const files = issue.provenance.template_id === "clean-openspec"
+        ? [
+            "openspec/changes/archive/2026-08-16-frg/proposal.md",
+            "openspec/specs/frg/spec.md",
+          ]
+        : ["docs/frg-fixture.md"];
+      return {
+        issue_number: issueNumber,
+        issue_node_id: `ISSUE_${issueNumber}`,
+        created_at: `2026-08-16T12:00:0${index + 1}.000Z`,
+        title: issue.title,
+        body: issue.body,
+        labels: [...issue.labels, "pipeline:ready-to-deploy"],
+        template_id: issue.provenance.template_id,
+        template_sha256: issue.provenance.template_sha256,
+        pr: {
+          number: 2101 + index,
+          node_id: `PR_${2101 + index}`,
+          head_sha: prHead,
+          base_branch: opts.baseBranch,
+          files,
+          checks: [
+            {
+              id: `CHECK_${issueNumber}`,
+              name: "ci",
+              head_sha: prHead,
+              conclusion: "success",
+            },
+          ],
+        },
+      };
+    }),
+    probes: pack.manifest.pilot_policy.layer_a_probes.map((probe, index) => ({
+      id: probe.id,
+      candidate_git_sha: opts.candidateGitSha,
+      test_file: probe.test_file,
+      test_name: probe.test_name,
+      command_argv_sha256: digest(`argv:${probe.id}`),
+      stdout_sha256: digest(`stdout:${probe.id}`),
+      stderr_sha256: digest(`stderr:${probe.id}`),
+      started_at: `2026-08-16T12:01:${String(index).padStart(2, "0")}.000Z`,
+      finished_at: `2026-08-16T12:01:${String(index).padStart(2, "0")}.500Z`,
+    })),
+  });
+  const issueIds = observations.pack_provenance!.issues.map((issue) => String(issue.issue_number));
+  const evidence = computeFrgEvidence({
+    version: opts.version,
+    run_id: `frg-observe-${opts.version}`,
+    loop_run_id: loopRunId,
+    pack_id: FRG_PACK_MANIFEST.pack_id,
+    items: issueIds.map((item_id) => ({ item_id, state: "ready", ready_clean: true })),
+    scenario_overrides: observations.scenarios,
+    composition_overrides: observations.composition,
+    false_human_authority_count: observations.false_human_authority_count,
+    pack_provenance: observations.pack_provenance,
+    notes: [
+      `Projected from durable loop run ${loopRunId}`,
+      `FRG fixed pack validated: pack_id=${FRG_PACK_MANIFEST.pack_id} selector=${JSON.stringify({ type: "label", value: "factory-gate" })}`,
+    ],
+    score_source: "from-run",
+    work_list: "factory-gate-pack",
+    attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
+    now: () => new Date("2026-08-16T12:10:00.000Z"),
+  });
+  assert.equal(evidence.pass, true);
+  return evidence;
+}
+
 test("ship coordinator: after (#N) observeTrain, next_action is frg_pack not train_merge (#1269)", async () => {
   const store = memoryShipStore();
   let runs = 0;
@@ -525,6 +720,215 @@ test("ship coordinator: after (#N) observeTrain, next_action is frg_pack not tra
   assert.equal(store.status?.train?.integrated_head_oid, V13914_MAIN);
   assert.equal(store.status?.next_action, "frg_pack");
   assert.equal(store.status?.complete, false);
+});
+
+test("observeFrg: missing latest.json for 1.39.14 returns null, not a tag-path throw (#1271)", async () => {
+  const observed = await observeFrgEvidence(
+    intent13914,
+    train13914,
+    true,
+    observeFrgDeps(memFs()),
+  );
+  assert.equal(observed, null);
+});
+
+test("observeFrg: unreadable and pass:false latest.json return null (#1271)", async () => {
+  const unreadable: FrgFsDeps = {
+    ...memFs(),
+    async readFile() {
+      const err = new Error("EACCES: permission denied") as NodeJS.ErrnoException;
+      err.code = "EACCES";
+      throw err;
+    },
+  };
+  assert.equal(
+    await observeFrgEvidence(intent13914, train13914, true, observeFrgDeps(unreadable)),
+    null,
+  );
+
+  const fsDeps = memFs();
+  const failEv = computeFrgEvidence({
+    version: "1.39.14",
+    run_id: "frg-observe-ship-fail",
+    loop_run_id: "loop",
+    pack_id: FRG_PACK_MANIFEST.pack_id,
+    items: [{ item_id: "1", state: "ready", ready_clean: true }],
+    scenario_overrides: frgRequiredObservationOverrides("pass"),
+    composition_overrides: frgRequiredCompositionOverrides("pass"),
+    attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
+  });
+  assert.equal(failEv.pass, false);
+  await writeFrgEvidence("/repo", failEv, fsDeps);
+  assert.equal(
+    await observeFrgEvidence(intent13914, train13914, true, observeFrgDeps(fsDeps)),
+    null,
+  );
+});
+
+test("observeFrg: release-eligible HMAC pass returns evidence; identity defects throw (#1271)", async () => {
+  const matching = await mintHybridEvidence({
+    version: "1.33.0",
+    candidateGitSha: head,
+    repository: intent.repository,
+    baseBranch: intent.base_branch,
+  });
+  const fsPass = memFs();
+  await writeFrgEvidence("/repo", matching, fsPass);
+  const intent133: ShipIntent = { ...intent, version: "1.33.0", milestone: "v1.33.0" };
+  const train133: ShipTrainEvidence = { ...train, milestone: "v1.33.0" };
+  const observed = await observeFrgEvidence(intent133, train133, true, observeFrgDeps(fsPass));
+  assert.equal(observed?.pass, true);
+  assert.equal(observed?.version, "1.33.0");
+
+  const mismatched = await mintHybridEvidence({
+    version: "1.33.0",
+    candidateGitSha: unrelatedOid,
+    repository: intent.repository,
+    baseBranch: intent.base_branch,
+  });
+  const fsMismatch = memFs();
+  await writeFrgEvidence("/repo", mismatched, fsMismatch);
+  await assert.rejects(
+    () => observeFrgEvidence(intent133, train133, true, observeFrgDeps(fsMismatch)),
+    /does not match the exact train candidate/,
+  );
+
+  await assert.rejects(
+    () =>
+      observeFrgEvidence(
+        intent13914,
+        train13914,
+        true,
+        observeFrgDeps(memFs(), { observeBase: async () => unrelatedOid }),
+      ),
+    /base advanced after the integrated train candidate was recorded/,
+  );
+  await assert.rejects(
+    () =>
+      observeFrgEvidence(
+        intent13914,
+        train13914,
+        false,
+        observeFrgDeps(memFs(), {
+          observeBase: async () => unrelatedOid,
+          isAncestor: async () => false,
+        }),
+      ),
+    /no longer contained in base/,
+  );
+});
+
+test("ship coordinator: proven train + missing latest.json sets next_action frg_pack (#1271)", async () => {
+  const store = memoryShipStore();
+  const emptyFs = memFs();
+  let packed = 0;
+  const wrap = (deps: ReturnType<typeof shipCoordinatorDepsFromOperations>) => ({
+    ...deps,
+    authorizationPublicKey: "test",
+    withRunLock: async (_key: string, fn: () => Promise<unknown>) => fn(),
+  });
+  const coordinator = wrap(shipCoordinatorDepsFromOperations(operations({
+    planTrain: async () => ({ ordered_issues: [...train13914.ordered_issues] }),
+    observeTrain: async () => train13914,
+    runTrain: async () => {
+      throw new Error("runTrain must not run after train is proven");
+    },
+    observeFrg: (i, t, requireCurrent) =>
+      observeFrgEvidence(i, t, requireCurrent, observeFrgDeps(emptyFs)),
+    runFrgPack: async () => {
+      packed++;
+    },
+  }), { state: store }));
+
+  await assert.rejects(
+    () => runShipCoordinator(intent13914, null, coordinator),
+    (err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      assert.equal(message.includes("Cannot create or push tag"), false, message);
+      assert.match(message, /ship FRG: no release-eligible/);
+      return true;
+    },
+  );
+  assert.equal(packed, 1, "FRG pack must be the next mutation");
+  assert.ok(store.status?.train, "train evidence must be persisted");
+  assert.equal(store.status?.train?.integrated_head_oid, head);
+  assert.equal(store.status?.next_action, "frg_pack");
+  assert.equal(store.status?.frg_pack, null);
+  assert.equal(store.status?.complete, false);
+});
+
+test("observe-null does not skip later ensure-tag; missing latest.json still fail-closes (#1271)", async () => {
+  const fsDeps = memFs();
+  assert.equal(
+    await observeFrgEvidence(intent13914, train13914, true, observeFrgDeps(fsDeps)),
+    null,
+  );
+  const calls: string[][] = [];
+  await assert.rejects(
+    () =>
+      ensureAnnotatedReleaseTag({
+        version: intent13914.version,
+        mergeCommitOid: mergeHead,
+        packedCandidate: head,
+        git: missingTagGit(calls),
+        validateFrg: async () =>
+          (await validateFrgEvidenceSnapshotForTag("/repo", intent13914.version, fsDeps, {
+            attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
+          })).snapshot,
+      }),
+    (err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      assert.match(message, /Cannot create or push tag v1\.39\.14/);
+      assert.match(message, /1\.39\.14\/latest\.json/);
+      return true;
+    },
+  );
+  assert.ok(!calls.some((args) => args[0] === "tag" || args[0] === "push"));
+
+  const matching = await mintHybridEvidence({
+    version: "1.33.0",
+    candidateGitSha: head,
+    repository: intent.repository,
+    baseBranch: intent.base_branch,
+  });
+  const laterFs = memFs();
+  await writeFrgEvidence("/repo", matching, laterFs);
+  const intent133: ShipIntent = { ...intent, version: "1.33.0", milestone: "v1.33.0" };
+  const train133: ShipTrainEvidence = { ...train, milestone: "v1.33.0" };
+  const later = await observeFrgEvidence(intent133, train133, true, observeFrgDeps(laterFs));
+  assert.equal(later?.pass, true);
+  const laterCalls: string[][] = [];
+  const tagged = await ensureAnnotatedReleaseTag({
+    version: "1.33.0",
+    mergeCommitOid: mergeHead,
+    packedCandidate: head,
+    git: missingTagGit(laterCalls),
+    validateFrg: async () =>
+      (await validateFrgEvidenceSnapshotForTag("/repo", "1.33.0", laterFs, {
+        attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
+      })).snapshot,
+  });
+  assert.equal(tagged, "created");
+  assert.ok(laterCalls.some((args) => args[0] === "tag"));
+});
+
+test("observeFrg source does not substring-match tag-path formatter copy (#1271)", () => {
+  const src = fs.readFileSync(
+    path.join(__dirname, "..", "scripts", "stages", "ship-adapter.ts"),
+    "utf8",
+  );
+  const start = src.indexOf("export async function observeFrgEvidence");
+  const end = src.indexOf("function realShipAdapterOperations");
+  assert.ok(start !== -1 && end > start, "expected observeFrgEvidence");
+  const body = src.slice(start, end);
+  assert.equal(body.includes('includes("evidence missing")'), false);
+  assert.equal(body.includes("includes('evidence missing')"), false);
+  assert.equal(
+    /message\.includes\s*\(/.test(body),
+    false,
+    "observeFrg must not classify by formatter substring",
+  );
+  assert.match(body, /observeReleaseEligibleFrgEvidence/);
 });
 
 test("ship adapter returns the one frozen train plan from its planning seam", async () => {

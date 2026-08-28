@@ -29,10 +29,12 @@ import {
   type ResolveCandidateEngineDeps,
 } from "../ship-end-candidate.ts";
 import {
+  observeReleaseEligibleFrgEvidence,
   shipMissingFrgDiagnostic,
-  validateFrgEvidenceFileForTag,
   validateFrgEvidenceSnapshotForTag,
   type FrgEvidence,
+  type FrgFsDeps,
+  type FrgValidateOpts,
 } from "../factory-reliability-gate.ts";
 import { FRG_HYBRID_PILOT_VERSION } from "../frg-pack-observations.ts";
 import {
@@ -746,6 +748,72 @@ export async function observeTrainEvidence(
   };
 }
 
+/** Injectable seams for {@link observeFrgEvidence}. Production wires git/fs;
+ *  tests inject fakes (no network, git, or subprocess). */
+export interface ObserveFrgEvidenceDeps {
+  repoDir: string;
+  observeBase(): Promise<string>;
+  isAncestor(ancestor: string, descendant: string): Promise<boolean>;
+  frgFs?: FrgFsDeps;
+  frgValidateOpts?: FrgValidateOpts;
+  readFile?: (path: string) => Promise<string>;
+}
+
+/**
+ * Observe on-disk FRG latest.json for the ship version. Missing, unreadable,
+ * or not-release-eligible evidence is not observed (`null`) so the coordinator
+ * runs FRG pack. Identity defects (base moved, train not contained, HMAC
+ * candidate mismatch after a valid eligible read) still fail closed.
+ */
+export async function observeFrgEvidence(
+  intent: ShipIntent,
+  train: ShipTrainEvidence,
+  requireCurrentCandidate: boolean,
+  deps: ObserveFrgEvidenceDeps,
+): Promise<FrgEvidence | null> {
+  const before = await deps.observeBase();
+  if (requireCurrentCandidate && before !== train.integrated_head_oid) {
+    throw new Error("ship FRG: base advanced after the integrated train candidate was recorded");
+  }
+  if (!requireCurrentCandidate &&
+      !(await deps.isAncestor(train.integrated_head_oid, before))) {
+    throw new Error("ship FRG: recorded train candidate is no longer contained in base");
+  }
+  const evidence = await observeReleaseEligibleFrgEvidence(
+    deps.repoDir,
+    intent.version,
+    deps.frgFs,
+    deps.frgValidateOpts,
+  );
+  if (!evidence) return null;
+  let durableCandidate: string | null = null;
+  if (isPostPilotReleaseVersion(intent.version) && !evidence.pack_provenance) {
+    const indexPath = factoryReleaseVersionIndexPath(deps.repoDir, intent.version);
+    try {
+      const read = deps.readFile ?? ((p: string) => fs.readFile(p, "utf8"));
+      const indexRaw = JSON.parse(await read(indexPath)) as {
+        candidate_git_sha?: string;
+        version?: string;
+      };
+      if (
+        indexRaw.version === intent.version &&
+        typeof indexRaw.candidate_git_sha === "string" &&
+        /^[0-9a-f]{40,64}$/i.test(indexRaw.candidate_git_sha)
+      ) {
+        durableCandidate = indexRaw.candidate_git_sha.toLowerCase();
+      }
+    } catch {
+      durableCandidate = null;
+    }
+  }
+  assertFrgCandidateProvenance(evidence, train, intent, {
+    durableCandidateGitSha: durableCandidate,
+  });
+  const after = await deps.observeBase();
+  if (after !== before) throw new Error("ship FRG: base advanced while FRG evidence was checked");
+  return evidence;
+}
+
 function realShipAdapterOperations(opts: RealShipCoordinatorDepsOptions): ShipAdapterOperations {
   const mergeDeps = { ...realMergeDeps(opts.repo), log: opts.progress };
   const ghCfg = { repo: opts.repo } as PipelineConfig;
@@ -842,46 +910,11 @@ function realShipAdapterOperations(opts: RealShipCoordinatorDepsOptions): ShipAd
     train: ShipTrainEvidence,
     requireCurrentCandidate: boolean,
   ): Promise<FrgEvidence | null> => {
-    const before = await observeBase();
-    if (requireCurrentCandidate && before !== train.integrated_head_oid) {
-      throw new Error("ship FRG: base advanced after the integrated train candidate was recorded");
-    }
-    if (!requireCurrentCandidate &&
-        !(await isAncestor(train.integrated_head_oid, before))) {
-      throw new Error("ship FRG: recorded train candidate is no longer contained in base");
-    }
-    let evidence: FrgEvidence;
-    try {
-      evidence = await validateFrgEvidenceFileForTag(opts.repoDir, intent.version);
-    } catch (err) {
-      if ((err as Error).message.includes("evidence missing")) return null;
-      throw err;
-    }
-    let durableCandidate: string | null = null;
-    if (isPostPilotReleaseVersion(intent.version) && !evidence.pack_provenance) {
-      const indexPath = factoryReleaseVersionIndexPath(opts.repoDir, intent.version);
-      try {
-        const indexRaw = JSON.parse(await fs.readFile(indexPath, "utf8")) as {
-          candidate_git_sha?: string;
-          version?: string;
-        };
-        if (
-          indexRaw.version === intent.version &&
-          typeof indexRaw.candidate_git_sha === "string" &&
-          /^[0-9a-f]{40,64}$/i.test(indexRaw.candidate_git_sha)
-        ) {
-          durableCandidate = indexRaw.candidate_git_sha.toLowerCase();
-        }
-      } catch {
-        durableCandidate = null;
-      }
-    }
-    assertFrgCandidateProvenance(evidence, train, intent, {
-      durableCandidateGitSha: durableCandidate,
+    return observeFrgEvidence(intent, train, requireCurrentCandidate, {
+      repoDir: opts.repoDir,
+      observeBase,
+      isAncestor,
     });
-    const after = await observeBase();
-    if (after !== before) throw new Error("ship FRG: base advanced while FRG evidence was checked");
-    return evidence;
   };
 
   const observeRelease = async (
