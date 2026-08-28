@@ -58,6 +58,7 @@ import { getOnDiskForIssue, gitInWorktree } from "./worktree.ts";
 import { classifyPorcelainForScratchRecover } from "./worktree-dirt.ts";
 import {
   blockerKindFromComments,
+  createDefaultImplementDeliverableProbe,
   executePublishUnpublishedStageCommit,
   inspectPublishableUnpublishedStageCommit,
   isPostPrResidualReviewStage,
@@ -861,7 +862,7 @@ export function stageIdForPark(labels: readonly string[]): string {
 // ---------------------------------------------------------------------------
 
 export interface RecoverParkedOpts {
-  /** When true, classify only — no spend marker, override, fix, or re-enter. */
+  /** When true, classify only — no spend marker, override, fix, publish, or re-enter. */
   dryRun?: boolean;
   /** Skip re-entry after successful clear (tests). */
   skipReentry?: boolean;
@@ -1122,14 +1123,29 @@ export async function defaultTryPublishUnpublishedStageCommit(
       reason: `publish unpublished inspect failed: ${err instanceof Error ? err.message : String(err)}`,
     };
   }
+  if (inspected.facts?.prLookupFailed) {
+    return {
+      kind: "keep",
+      reason: "publish unpublished: PR linkage is indeterminate — retain park",
+    };
+  }
   if (!inspected.classification.publishable) {
     return {
       kind: "no-op",
       reason: `publish unpublished: ${inspected.classification.reason}`,
     };
   }
+  const executeDeps = publishDeps.executeDeps ?? {};
   try {
-    const published = await executeFn(cfg, issueNumber, publishDeps.executeDeps ?? {});
+    const published = await executeFn(cfg, issueNumber, {
+      ...executeDeps,
+      probeImplementDeliverable:
+        executeDeps.probeImplementDeliverable ??
+        createDefaultImplementDeliverableProbe(
+          cfg,
+          publishDeps.inspectDeps?.gitInWorktree ?? gitInWorktree,
+        ),
+    });
     if (published.succeeded) {
       return {
         kind: "cleared",
@@ -1427,13 +1443,47 @@ async function runRecoverParkedLocked(
   }
 
   let published: DeterministicRecoverResult;
-  try {
-    published = await publishUnpublished(cfg, issueNumber, detail);
-  } catch (err) {
-    published = {
-      kind: "keep",
-      reason: `publish unpublished threw: ${err instanceof Error ? err.message : String(err)}`,
-    };
+  if (opts.dryRun) {
+    const inspectFn =
+      deps.publishUnpublishedDeps?.inspect ?? inspectPublishableUnpublishedStageCommit;
+    try {
+      const inspected = await inspectFn(
+        cfg,
+        issueNumber,
+        deps.publishUnpublishedDeps?.inspectDeps ?? {},
+      );
+      if (inspected.facts?.prLookupFailed) {
+        published = {
+          kind: "keep",
+          reason:
+            "dry-run: PR linkage is indeterminate — would retain park; no mutations",
+        };
+      } else if (inspected.classification.publishable) {
+        published = {
+          kind: "keep",
+          reason: `dry-run: would publish unpublished stage commit (${inspected.classification.tipKind}); no mutations`,
+        };
+      } else {
+        published = {
+          kind: "no-op",
+          reason: `dry-run: publish unpublished not applicable (${inspected.classification.reason})`,
+        };
+      }
+    } catch (err) {
+      published = {
+        kind: "no-op",
+        reason: `dry-run: publish unpublished inspect failed: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+  } else {
+    try {
+      published = await publishUnpublished(cfg, issueNumber, detail);
+    } catch (err) {
+      published = {
+        kind: "keep",
+        reason: `publish unpublished threw: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
   }
   if (published.kind === "cleared") {
     log(
@@ -1449,6 +1499,16 @@ async function runRecoverParkedLocked(
       },
       wantReenter,
     );
+  }
+  if (published.kind === "keep" || published.kind === "failed") {
+    log(
+      `[recover-parked] #${issueNumber}: keep park after publish recover — ${published.reason}`,
+    );
+    return wrap({
+      status: "still-parked",
+      issue: issueNumber,
+      message: published.reason,
+    });
   }
 
   // ---- Live PR HEAD (after deterministic recover). Missing PR is fail-closed

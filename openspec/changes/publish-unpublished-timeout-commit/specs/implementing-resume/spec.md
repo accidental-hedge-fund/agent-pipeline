@@ -13,6 +13,15 @@ When the implementing harness returns timeout (or equivalent failure) in the sam
 - **THEN** the engine SHALL run format and test gates, push, create or find the PR, and transition to `review-1`
 - **AND** SHALL NOT return a blocked timeout outcome that leaves the commit unpublished
 
+#### Scenario: Same-process timeout with a pipeline-authored implement tip publishes
+
+- **WHEN** implementing times out in the process that still holds the worktree
+- **AND** HEAD is a pipeline-authored implement commit (issue trailers present)
+- **AND** the classifier reports a publishable unpublished stage commit
+- **AND** this-round `salvaged` and `ownershipCheckpointed` are both false
+- **THEN** the engine SHALL take the post-implementation publish path
+- **AND** SHALL NOT require a legacy salvage or ownership-checkpoint flag to select publication
+
 #### Scenario: Re-entry after a prior timeout park still publishes
 
 - **WHEN** a prior run parked at `implementing` after timeout with a retained worktree holding the unpublished commit

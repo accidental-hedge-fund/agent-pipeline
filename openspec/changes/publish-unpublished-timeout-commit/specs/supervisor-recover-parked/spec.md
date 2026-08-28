@@ -31,6 +31,31 @@ The `recover-parked` command SHALL run deterministic recover for a parked issue 
 - **AND** SHALL NOT apply supervisor overrides
 - **AND** MAY report `fail-closed` because residual-review reflow cannot run without PR HEAD
 
+#### Scenario: Dry-run does not publish a branch or create a PR
+
+- **WHEN** `recover-parked` runs with `--dry-run`
+- **AND** a publishable unpublished stage commit is present
+- **THEN** the command SHALL NOT invoke the publish executor
+- **AND** SHALL NOT push, create a PR, clear `blocked`, or re-enter advance
+- **AND** SHALL report a non-mutating classification or preview
+
+#### Scenario: Failed publication keeps the park for a later retry
+
+- **WHEN** `recover-parked` claims `publish_unpublished_stage_commit`
+- **AND** push or PR creation fails
+- **THEN** the command SHALL keep the park and its publication-failure evidence
+- **AND** SHALL NOT clear `blocked`
+- **AND** SHALL NOT re-enter advance solely because no linked open PR exists yet
+
+#### Scenario: Missing or unknown blocker kind does not auto-re-enter a pre-PR park
+
+- **WHEN** the issue is parked at a pre-PR stage with `blocked`
+- **AND** no linked open PR exists
+- **AND** no publishable unpublished stage commit exists
+- **AND** the blocker kind is absent, malformed, or not an explicit engine-defect / environment-auth class
+- **THEN** `recover-parked` SHALL keep the park
+- **AND** SHALL NOT clear `blocked` or re-enter advance as a pre-PR engine-defect park
+
 ## MODIFIED Requirements
 
 ### Requirement: Deterministic engine recover SHALL run before any supervisor override or extra fix

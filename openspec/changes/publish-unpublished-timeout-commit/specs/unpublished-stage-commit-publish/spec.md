@@ -38,6 +38,14 @@ A timeout, harness failure, or process death that left that commit SHALL NOT by 
 - **THEN** the classifier SHALL NOT report a publishable unpublished stage commit
 - **AND** SHALL NOT adopt that commit as engine-owned publish work
 
+#### Scenario: Failed PR discovery is not treated as no open PR
+
+- **WHEN** linked-open-PR lookup throws (auth, network, or API error)
+- **AND** no fallback branch lookup succeeds
+- **THEN** the classifier SHALL NOT report a publishable unpublished stage commit
+- **AND** SHALL treat PR linkage as indeterminate
+- **AND** SHALL NOT start a new publish attempt solely because the lookup failed
+
 ---
 
 ### Requirement: The engine SHALL publish a matching commit through the existing post-implement path
@@ -73,6 +81,12 @@ When the deliverable is unsatisfied after checkpoint or salvage, the engine SHAL
 - **THEN** the engine SHALL NOT create a PR solely to recover the timeout
 - **AND** SHALL NOT transition to `review-1`
 - **AND** SHALL follow implementing-resume completeness instead of this publish recipe
+
+#### Scenario: Production publish requires the implement-deliverable probe
+
+- **WHEN** the production `publish_unpublished_stage_commit` executor runs
+- **THEN** it SHALL invoke the shared implement-deliverable check before gates, push, PR creation, or transition
+- **AND** SHALL refuse publish when that probe is absent or reports unsatisfied
 
 #### Scenario: Force-push is refused
 

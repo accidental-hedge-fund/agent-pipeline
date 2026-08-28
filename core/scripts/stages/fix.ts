@@ -11,6 +11,7 @@ import {
   findLatestCommentMatching,
   getGhActor,
   getIssueDetail,
+  getPrForIssue,
   postComment,
   setBlocked,
   transition,
@@ -44,7 +45,11 @@ import {
   type EnsureManagedWorktreeResult,
 } from "../worktree.ts";
 import { buildFixPrompt } from "../prompts/index.ts";
-import { resolveTimeoutParkForUnpublishedCommit } from "../unpublished-stage-commit.ts";
+import {
+  createDefaultImplementDeliverableProbe,
+  executePublishUnpublishedStageCommit,
+  resolveTimeoutParkForUnpublishedCommit,
+} from "../unpublished-stage-commit.ts";
 import { runFormatGate, runFormatAndTestGates } from "./format-gate.ts";
 import {
   verifyHarnessCommits,
@@ -257,6 +262,22 @@ export interface AdvanceFixDeps {
    * without a real GitHub API call.
    */
   postComment?: typeof postComment;
+  /**
+   * Linked-open-PR lookup for the unpublished-commit timeout consult (#1272).
+   * Tests inject fakes so afterRound never hits the GitHub API.
+   */
+  getPrForIssue?: typeof getPrForIssue;
+  /**
+   * Shared unpublished-commit publish executor. Tests inject fakes.
+   */
+  executePublishUnpublishedStageCommit?: typeof executePublishUnpublishedStageCommit;
+  /**
+   * Implement-deliverable probe required by the publish executor (#1272).
+   */
+  probeImplementDeliverable?: (
+    wtPath: string,
+    issueNumber: number,
+  ) => Promise<{ present: boolean; description?: string }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -908,6 +929,15 @@ export async function advanceFix(
       const logR = await gitInWorktree(wt.path, ["log", "-1", "--format=%s%n%n%b"], { ignoreFailure: true });
       const logText = logR.code === 0 ? logR.stdout : "";
       const nl = logText.indexOf("\n");
+      let linkedOpenPr = true;
+      let prLookupFailed = false;
+      try {
+        const getPr = deps.getPrForIssue ?? getPrForIssue;
+        linkedOpenPr = (await getPr(cfg, issueNumber)) != null;
+      } catch {
+        prLookupFailed = true;
+        linkedOpenPr = true;
+      }
       const timeoutPark = resolveTimeoutParkForUnpublishedCommit(
         {
           issueNumber,
@@ -915,19 +945,46 @@ export async function advanceFix(
           porcelain: statusR.code === 0 ? statusR.stdout : "",
           extraGlobs: cfg.test_gate?.non_product_dirty_globs ?? [],
           commitsAheadOfBase: true,
-          // Fix is typically post-PR. Pre-PR unpublished work still matches when
-          // the inspect path (recover-parked / executor) sets linkedOpenPr false.
-          linkedOpenPr: true,
+          linkedOpenPr,
+          prLookupFailed,
           tipSubject: (nl === -1 ? logText : logText.slice(0, nl)).trim(),
           tipBody: nl === -1 ? "" : logText.slice(nl + 1),
         },
         ctx,
       );
       if (timeoutPark.action === "publish") {
+        const executeFn =
+          deps.executePublishUnpublishedStageCommit ?? executePublishUnpublishedStageCommit;
+        const published = await executeFn(cfg, issueNumber, {
+          probeImplementDeliverable:
+            deps.probeImplementDeliverable ??
+            createDefaultImplementDeliverableProbe(cfg, deps.gitInWorktree),
+          inspectDeps: {
+            getOnDiskForIssue: deps.getOnDiskForIssue,
+            gitInWorktree: deps.gitInWorktree,
+            getPrForIssue: deps.getPrForIssue,
+            extraGlobs: cfg.test_gate?.non_product_dirty_globs ?? [],
+          },
+        });
+        if (published.succeeded) {
+          return {
+            kind: "early" as const,
+            outcome: published.outcome ?? {
+              advanced: true,
+              from: "implementing",
+              to: "review-1",
+              summary: published.evidence,
+            },
+          };
+        }
         return {
-          kind: "continue" as const,
-          ctx,
-          crashSalvaged: true,
+          kind: "early" as const,
+          outcome: published.outcome ?? {
+            advanced: false,
+            status: "blocked",
+            reason: published.error ?? published.evidence,
+            blockerKind: "harness-failure",
+          },
         };
       }
       if (!result.success && !ctx.salvaged && !ctx.ownershipCheckpointed) {

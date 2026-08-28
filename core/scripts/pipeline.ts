@@ -2531,6 +2531,8 @@ export function realExecuteRecovery(
           },
           getIssueDetail: getDetail,
           clearBlocked: clear,
+          probeImplementDeliverable:
+            deps.publishUnpublished?.probeImplementDeliverable ?? probeImplementDeliverable,
         });
         if (!published.succeeded) {
           return failed(published.error ?? published.evidence);

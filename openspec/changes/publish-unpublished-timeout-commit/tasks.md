@@ -35,7 +35,17 @@
 - [x] 6.1 Add a timeout-park-site drift guard that fails if a same-process harness-timeout `setBlocked` site can fire while a publishable unpublished commit is present without consulting the classifier. Verify the guard fails on a synthetic unguarded site.
 - [x] 6.2 Add an injected fixture for a pre-PR product-mutating timeout outside implementing (fix-round or equivalent) that matches the classifier, and verify it claims `publish_unpublished_stage_commit` rather than requiring an implementing-only branch.
 
-## 7. Mirror, validate, CI
+## 7. Review-1 fail-closed (fix round)
+
+- [x] 7.r1 Dry-run recover-parked inspects only and does not invoke the publish executor.
+- [x] 7.r2 Attempted-and-failed publish returns keep and does not clear/re-enter the park.
+- [x] 7.r3 Production publish executor requires the implement-deliverable probe.
+- [x] 7.r4 Classifier-proven implement tips publish without this-round salvage/checkpoint flags.
+- [x] 7.r5 Fix-stage timeout looks up linked-PR state and claims the shared publish recipe when no PR exists.
+- [x] 7.r6 Missing or unknown blocker kinds fail closed (no automatic pre-PR re-entry).
+- [x] 7.r7 Failed PR discovery is indeterminate, not proof that no PR exists.
+
+## 8. Mirror, validate, CI
 
 - [x] 7.1 After any `core/` edits, run `node scripts/build.mjs` and include regenerated `plugin/` in the same commit; verify `node scripts/build.mjs --check` passes.
 - [x] 7.2 Run `openspec validate publish-unpublished-timeout-commit` until clean, then `npm run ci` from the repo root, and verify both are green.

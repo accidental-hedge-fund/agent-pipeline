@@ -26,7 +26,11 @@ import { DEFAULT_RECOVERY_POLICY } from "../scripts/loop/recovery.ts";
 import { RECOVERY_RECIPES, isRecoveryRecipe } from "../scripts/loop/types.ts";
 import { realExecuteRecovery } from "../scripts/pipeline.ts";
 import { buildStageDiagnostic } from "../scripts/stage-diagnostic.ts";
-import { runRecoverParked, type RecoverParkedDeps } from "../scripts/recover-parked.ts";
+import {
+  defaultTryPublishUnpublishedStageCommit,
+  runRecoverParked,
+  type RecoverParkedDeps,
+} from "../scripts/recover-parked.ts";
 import { evaluateRemoveSafety, releaseWorktreeForParkedIssue } from "../scripts/worktree.ts";
 import { DEFAULT_CONFIG, type PipelineConfig } from "../scripts/types.ts";
 import { withTrailers } from "../scripts/traceability.ts";
@@ -194,6 +198,25 @@ test("timeout park: no recovered work blocks", () => {
   assert.equal(d.action, "block");
 });
 
+test("timeout park: classifier-proven implement tip publishes without salvage/checkpoint flags", () => {
+  const body = withTrailers("feat: close use case (#268)\n\nImplement the stage.", 268, "268/run");
+  const nl = body.indexOf("\n");
+  const d = resolveTimeoutParkForUnpublishedCommit(
+    facts({
+      tipSubject: body.slice(0, nl),
+      tipBody: body.slice(nl + 1),
+    }),
+    {
+      salvaged: false,
+      ownershipCheckpointed: false,
+      ownershipCheckpointFailed: false,
+    },
+  );
+  assert.equal(d.action, "publish");
+  assert.equal(d.classification.publishable, true);
+  if (d.classification.publishable) assert.equal(d.classification.tipKind, "implement");
+});
+
 test("timeout park: failed checkpoint blocks", () => {
   const d = resolveTimeoutParkForUnpublishedCommit(facts(), {
     salvaged: false,
@@ -287,6 +310,24 @@ test("executor: push failure parks as harness-failure and does not mint needs-hu
   assert.doesNotMatch(result.error ?? "", /needs-human|human-decision-required/);
 });
 
+test("executor: missing deliverable probe refuses publish", async () => {
+  let resumed = 0;
+  const result = await executePublishUnpublishedStageCommit(cfg(), 268, {
+    inspect: async () => ({
+      facts: facts(),
+      classification: { publishable: true as const, tipKind: "salvage" as const },
+      worktree: { path: "/wt/268", slug: "268-x", branch: "pipeline/268-x" },
+    }),
+    resumeFromImplementing: async () => {
+      resumed++;
+      return { advanced: true, from: "implementing", to: "review-1", summary: "no" };
+    },
+  });
+  assert.equal(result.succeeded, false);
+  assert.equal(resumed, 0);
+  assert.match(result.error ?? "", /probe required/);
+});
+
 test("executor: unsatisfied deliverable does not publish", async () => {
   let resumed = 0;
   const result = await executePublishUnpublishedStageCommit(cfg(), 268, {
@@ -321,6 +362,56 @@ test("inspect: injectable git/gh, no network", async () => {
     getPrForIssue: async () => null,
   });
   assert.equal(inspected.classification.publishable, true);
+});
+
+test("inspect: PR lookup error without fallback is indeterminate, not no-PR", async () => {
+  const inspected = await inspectPublishableUnpublishedStageCommit(cfg(), 268, {
+    getOnDiskForIssue: async () => ({ path: "/wt/268", slug: "268-x" }),
+    gitInWorktree: async (_p, args) => {
+      if (args[0] === "status") return { stdout: "", stderr: "", code: 0 };
+      if (args[0] === "rev-parse") return { stdout: "pipeline/268-x\n", stderr: "", code: 0 };
+      if (args[0] === "log") {
+        return { stdout: `${salvageSubject(268)}\n\n${salvageBody("implement")}\n`, stderr: "", code: 0 };
+      }
+      return { stdout: "", stderr: "", code: 0 };
+    },
+    hasCommitsAhead: async () => true,
+    getPrForIssue: async () => {
+      throw new Error("API 401");
+    },
+  });
+  assert.equal(inspected.facts?.prLookupFailed, true);
+  assert.equal(inspected.classification.publishable, false);
+  if (!inspected.classification.publishable) {
+    assert.match(inspected.classification.reason, /indeterminate/);
+  }
+});
+
+test("inspect: PR lookup error with successful branch fallback is not indeterminate", async () => {
+  const inspected = await inspectPublishableUnpublishedStageCommit(cfg(), 268, {
+    getOnDiskForIssue: async () => ({ path: "/wt/268", slug: "268-x" }),
+    gitInWorktree: async (_p, args) => {
+      if (args[0] === "status") return { stdout: "", stderr: "", code: 0 };
+      if (args[0] === "rev-parse") return { stdout: "pipeline/268-x\n", stderr: "", code: 0 };
+      if (args[0] === "log") {
+        return { stdout: `${salvageSubject(268)}\n\n${salvageBody("implement")}\n`, stderr: "", code: 0 };
+      }
+      return { stdout: "", stderr: "", code: 0 };
+    },
+    hasCommitsAhead: async () => true,
+    getPrForIssue: async () => {
+      throw new Error("API 401");
+    },
+    getPrForBranch: async () => null,
+  });
+  assert.equal(inspected.facts?.prLookupFailed, false);
+  assert.equal(inspected.classification.publishable, true);
+});
+
+test("classifier: prLookupFailed refuses even when linkedOpenPr is false", () => {
+  const c = classifyPublishableUnpublishedStageCommit(facts({ prLookupFailed: true, linkedOpenPr: false }));
+  assert.equal(c.publishable, false);
+  if (!c.publishable) assert.match(c.reason, /indeterminate/);
 });
 
 // ---------------------------------------------------------------------------
@@ -500,6 +591,89 @@ test("recover-parked: plan-review engine-defect without PR re-enters", async () 
   assert.equal(result.reentered, true);
 });
 
+test("recover-parked: failed publication keeps the park instead of re-entering", async () => {
+  const h = recoverHarness({
+    labels: ["pipeline:implementing", "blocked"],
+    pr: null,
+    publish: "keep",
+  });
+  const result = await runRecoverParked(cfg(), 268, {}, h.deps);
+  assert.equal(result.status, "still-parked");
+  assert.match(result.message, /push failed/);
+  assert.doesNotMatch(result.message, /no linked open PR; keep park/);
+  assert.equal(h.reentries, 0);
+  assert.ok(h.deps);
+});
+
+test("recover-parked: dry-run does not invoke the publish executor", async () => {
+  let executeCalls = 0;
+  const h = recoverHarness({
+    labels: ["pipeline:implementing", "blocked"],
+    pr: null,
+    publish: "cleared",
+  });
+  const result = await runRecoverParked(
+    cfg(),
+    268,
+    { dryRun: true },
+    {
+      ...h.deps,
+      tryPublishUnpublishedStageCommit: async () => {
+        executeCalls++;
+        return { kind: "cleared", reason: "should not run" };
+      },
+      publishUnpublishedDeps: {
+        inspect: async () => ({
+          facts: facts(),
+          classification: { publishable: true as const, tipKind: "salvage" as const },
+          worktree: { path: "/wt/268", slug: "268-x", branch: "pipeline/268-x" },
+        }),
+      },
+    },
+  );
+  assert.equal(executeCalls, 0);
+  assert.equal(result.status, "still-parked");
+  assert.match(result.message, /dry-run: would publish/);
+  assert.equal(result.reentered, undefined);
+});
+
+test("recover-parked: missing blocker kind does not auto-re-enter a pre-PR park", async () => {
+  const h = recoverHarness({
+    labels: ["pipeline:implementing", "blocked"],
+    pr: null,
+    publish: "no-op",
+  });
+  h.deps.getIssueDetail = async () => ({
+    number: 268,
+    type: "issue",
+    title: "t",
+    body: "",
+    state: "open",
+    url: "https://example/268",
+    labels: ["pipeline:implementing", "blocked"],
+    comments: [],
+  });
+  const result = await runRecoverParked(cfg(), 268, {}, h.deps);
+  assert.equal(result.status, "fail-closed");
+  assert.match(result.message, /no linked open PR; keep park/);
+  assert.equal(h.reentries, 0);
+});
+
+test("defaultTry: PR lookup failure keeps the park instead of no-op re-entry", async () => {
+  const result = await defaultTryPublishUnpublishedStageCommit(cfg(), 268, {} as never, {
+    inspect: async () => ({
+      facts: { ...facts(), prLookupFailed: true },
+      classification: { publishable: false as const, reason: "PR linkage is indeterminate" },
+      worktree: { path: "/wt/268", slug: "268-x", branch: "pipeline/268-x" },
+    }),
+    execute: async () => {
+      throw new Error("execute must not run when PR linkage is indeterminate");
+    },
+  });
+  assert.equal(result.kind, "keep");
+  assert.match(result.reason, /indeterminate/);
+});
+
 test("recover-parked: residual-review park without PR still fail-closes", async () => {
   const h = recoverHarness({
     labels: ["pipeline:review-1", "blocked"],
@@ -528,6 +702,10 @@ test("isPrePrEngineDefectPark / residual-review stage helpers", () => {
   assert.equal(isPrePrEngineDefectPark({ stage: "plan-review", blockerKind: "harness-failure" }), true);
   assert.equal(isPrePrEngineDefectPark({ stage: "review-1", blockerKind: "harness-failure" }), false);
   assert.equal(isPrePrEngineDefectPark({ stage: "implementing", needsHumanLabel: true }), false);
+  assert.equal(isPrePrEngineDefectPark({ stage: "implementing" }), false);
+  assert.equal(isPrePrEngineDefectPark({ stage: "implementing", blockerKind: null }), false);
+  assert.equal(isPrePrEngineDefectPark({ stage: "planning", blockerKind: "unknown-kind" }), false);
+  assert.equal(isPrePrEngineDefectPark({ stage: "plan-review", blockerKind: "environment-auth" }), true);
   assert.equal(isPostPrResidualReviewStage("review-1"), true);
   assert.equal(isPostPrResidualReviewStage("implementing"), false);
   assert.equal(blockerKindFromComments([{ body: "<!-- pipeline-blocker-kind: environment-auth -->" }]), "environment-auth");
@@ -667,4 +845,7 @@ test("timeout-park drift guard: implementing and fix afterRound consult the clas
   assert.equal(isUnguardedTimeoutParkSource(fix), false);
   assert.ok(planning.includes("resolveTimeoutParkForUnpublishedCommit"));
   assert.ok(fix.includes("resolveTimeoutParkForUnpublishedCommit"));
+  assert.doesNotMatch(fix, /linkedOpenPr:\s*true/);
+  assert.ok(fix.includes("getPrForIssue"));
+  assert.ok(fix.includes("executePublishUnpublishedStageCommit"));
 });

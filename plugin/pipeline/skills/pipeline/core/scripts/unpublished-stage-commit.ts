@@ -12,6 +12,7 @@
  */
 
 import { getIssueDetail, getPrForIssue, getPrForIssueAnyState, getPrDetail, createPr, setBlocked, clearBlocked, transition } from "./gh.ts";
+import * as openspec from "./openspec.ts";
 import { ISSUE_TRAILER_KEY, RUN_TRAILER_KEY } from "./traceability.ts";
 import type { Outcome, PipelineConfig } from "./types.ts";
 import { parsePorcelainPaths, productDirtyPaths } from "./worktree-dirt.ts";
@@ -32,6 +33,11 @@ export interface PublishableUnpublishedFacts {
   extraGlobs?: readonly string[];
   commitsAheadOfBase: boolean;
   linkedOpenPr: boolean;
+  /**
+   * True when PR discovery threw and no fallback lookup succeeded.
+   * Classifier MUST refuse publish — unknown linkage is not proof of no PR.
+   */
+  prLookupFailed?: boolean;
   tipSubject: string;
   tipBody?: string;
   /**
@@ -106,6 +112,9 @@ export function classifyPublishableUnpublishedStageCommit(
   if (!facts.commitsAheadOfBase) {
     return { publishable: false, reason: "no commits ahead of base" };
   }
+  if (facts.prLookupFailed) {
+    return { publishable: false, reason: "PR linkage is indeterminate" };
+  }
   if (facts.linkedOpenPr) {
     return { publishable: false, reason: "linked open PR already exists" };
   }
@@ -163,7 +172,10 @@ export function resolveTimeoutParkForUnpublishedCommit(
     ...facts,
     authorshipHint: facts.authorshipHint ?? authorshipHintFromRound(ctx),
   });
-  if (classification.publishable && recoveredWorkPresent(ctx)) {
+  // Classifier-proven tips (salvage/checkpoint/implement, including a
+  // pipeline-marked implement commit that the harness landed before timeout)
+  // select publish. Do not also require this-round salvage/checkpoint flags.
+  if (classification.publishable) {
     return { action: "publish", classification };
   }
   return { action: "block", classification };
@@ -229,14 +241,21 @@ export async function inspectPublishableUnpublishedStageCommit(
   const tipBody = nl === -1 ? "" : logText.slice(nl + 1);
   const ahead = await aheadFn(wt.path, cfg.base_branch);
   let linkedOpenPr = false;
+  let prLookupFailed = false;
   try {
     const getPr = deps.getPrForIssue ?? getPrForIssue;
     const pr = await getPr(cfg, issueNumber);
     linkedOpenPr = pr != null;
   } catch {
     if (deps.getPrForBranch) {
-      const pr = await deps.getPrForBranch(cfg, branch);
-      linkedOpenPr = pr != null;
+      try {
+        const pr = await deps.getPrForBranch(cfg, branch);
+        linkedOpenPr = pr != null;
+      } catch {
+        prLookupFailed = true;
+      }
+    } else {
+      prLookupFailed = true;
     }
   }
   const facts: PublishableUnpublishedFacts = {
@@ -246,6 +265,7 @@ export async function inspectPublishableUnpublishedStageCommit(
     extraGlobs: deps.extraGlobs ?? cfg.test_gate?.non_product_dirty_globs ?? [],
     commitsAheadOfBase: ahead,
     linkedOpenPr,
+    prLookupFailed,
     tipSubject,
     tipBody,
   };
@@ -298,6 +318,40 @@ function remapPublishBlockKind(kind: string): string {
 }
 
 /**
+ * Production implement-deliverable probe: branch-introduced OpenSpec change
+ * ids that still exist and have proposal.md. Callers inject git so tests
+ * never need a real worktree.
+ */
+export function createDefaultImplementDeliverableProbe(
+  cfg: Pick<PipelineConfig, "base_branch">,
+  git: typeof gitInWorktree = gitInWorktree,
+): NonNullable<PublishUnpublishedExecutorDeps["probeImplementDeliverable"]> {
+  return async (wtPath, _issueNumber) => {
+    const result = await git(
+      wtPath,
+      ["diff", "--name-only", `origin/${cfg.base_branch}...HEAD`],
+      { ignoreFailure: true },
+    );
+    if (result.code !== 0) return { present: false };
+    const branchPaths = result.stdout
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const branchChangeIds = openspec
+      .changeIdsFromPaths(branchPaths)
+      .filter((id) => openspec.changeDirExists(wtPath, id));
+    const acceptedIds = branchChangeIds.filter(
+      (id) => openspec.readChangeFile(wtPath, id, "proposal.md") !== null,
+    );
+    if (acceptedIds.length === 0) return { present: false };
+    return {
+      present: true,
+      description: `branch-introduced OpenSpec deliverable(s) at HEAD: ${acceptedIds.join(", ")}`,
+    };
+  };
+}
+
+/**
  * Thin executor over the existing post-implement helper. Does not force-push.
  * Does not write mid-flight labels through triage or raw issue-edit.
  */
@@ -313,13 +367,17 @@ export async function executePublishUnpublishedStageCommit(
       `publish_unpublished_stage_commit: not applicable (${inspected.classification.publishable === false ? inspected.classification.reason : "no worktree"}) — trying next recipe`,
     );
   }
-  if (deps.probeImplementDeliverable) {
-    const deliverable = await deps.probeImplementDeliverable(inspected.worktree.path, issueNumber);
-    if (!deliverable.present) {
-      return failedPublish(
-        "publish_unpublished_stage_commit: implement deliverable unsatisfied — completeness/re-invoke, not review-1",
-      );
-    }
+  const probe = deps.probeImplementDeliverable;
+  if (!probe) {
+    return failedPublish(
+      "publish_unpublished_stage_commit: implement deliverable probe required — refuse publish",
+    );
+  }
+  const deliverable = await probe(inspected.worktree.path, issueNumber);
+  if (!deliverable.present) {
+    return failedPublish(
+      "publish_unpublished_stage_commit: implement deliverable unsatisfied — completeness/re-invoke, not review-1",
+    );
   }
   const resume =
     deps.resumeFromImplementing ??
@@ -482,7 +540,7 @@ export function isPrePrEngineDefectPark(input: {
 }): boolean {
   if (input.needsHumanLabel) return false;
   if (!isPrePrStage(input.stage)) return false;
-  if (!input.blockerKind) return true;
+  if (!input.blockerKind) return false;
   return ENGINE_DEFECT_BLOCKER_KINDS.has(input.blockerKind);
 }
 
