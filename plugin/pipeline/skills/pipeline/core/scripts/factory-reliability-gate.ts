@@ -2033,6 +2033,50 @@ export function formatFrgTagPathFailure(version: string, reason: string): string
   );
 }
 
+/** Tag-validator ineligibility reasons that observe maps to not-observed. */
+export type FrgTagPathIneligibilityKind = "missing" | "unreadable" | "not_release_eligible";
+
+/**
+ * Typed tag-path fail-closed error. Message stays {@link formatFrgTagPathFailure}
+ * for tag/ensure-tag callers. Observe-path consumers classify with
+ * {@link isFrgTagPathIneligibleError} and MUST NOT match formatter copy.
+ */
+export class FrgTagPathIneligibleError extends Error {
+  readonly kind: FrgTagPathIneligibilityKind;
+  readonly version: string;
+
+  constructor(version: string, reason: string, kind: FrgTagPathIneligibilityKind) {
+    super(formatFrgTagPathFailure(version, reason));
+    this.name = "FrgTagPathIneligibleError";
+    this.kind = kind;
+    this.version = normalizeFrgVersion(version);
+  }
+}
+
+export function isFrgTagPathIneligibleError(err: unknown): err is FrgTagPathIneligibleError {
+  return err instanceof FrgTagPathIneligibleError;
+}
+
+/**
+ * Observe-path mapping over the shared tag validator. Missing, unreadable, or
+ * not-release-eligible `latest.json` is not observed (`null`). Classification
+ * uses {@link FrgTagPathIneligibleError}, not formatter substrings. Missing
+ * attestor and other non-ineligibility failures still throw.
+ */
+export async function observeReleaseEligibleFrgEvidence(
+  repoDir: string,
+  version: string,
+  deps: FrgFsDeps = defaultFsDeps,
+  opts: FrgValidateOpts = {},
+): Promise<FrgEvidence | null> {
+  try {
+    return await validateFrgEvidenceFileForTag(repoDir, version, deps, opts);
+  } catch (err) {
+    if (isFrgTagPathIneligibleError(err)) return null;
+    throw err;
+  }
+}
+
 /**
  * Validate the on-disk latest.json for a version (auto-tag / release path).
  * Fail closed on missing, unparsable, or not release-eligible evidence.
@@ -2063,17 +2107,19 @@ export async function validateFrgEvidenceSnapshotForTag(
     text = await deps.readFile(latestPath);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-      throw new Error(formatFrgTagPathFailure(v, `missing at ${latestPath}`));
+      throw new FrgTagPathIneligibleError(v, `missing at ${latestPath}`, "missing");
     }
-    throw new Error(
-      formatFrgTagPathFailure(v, `unreadable at ${latestPath}: ${(err as Error).message}`),
+    throw new FrgTagPathIneligibleError(
+      v,
+      `unreadable at ${latestPath}: ${(err as Error).message}`,
+      "unreadable",
     );
   }
   try {
     const evidence = validateReleaseEligibleFrgEvidence(text, v, verifyOpts);
     return { evidence, snapshot: JSON.parse(text) as unknown };
   } catch (err) {
-    throw new Error(formatFrgTagPathFailure(v, (err as Error).message));
+    throw new FrgTagPathIneligibleError(v, (err as Error).message, "not_release_eligible");
   }
 }
 
