@@ -9,6 +9,7 @@
 - [x] 1.7 Add `createVerifiedMergeProof` runtime-validation tests: reject non-positive issue/PR, empty base, non-40-char OID. A raw `{ issue, pr, base, oid }` object or a log/label string is not accepted as proof by the gate.
 - [x] 1.8 Add an injected park-release case: matching bound proof + clean tree + unverifiable local-only, but `hasRemoteBranchTip` / `resolveOpenPrHeadForBranch` throw. Assert the worktree is **released** and those probes are not called.
 - [x] 1.9 Add an injected park-release / automatic-remove case: matching bound proof + remote deleted + unverifiable local-only + current HEAD differs from the merge-time worktree HEAD. Assert the worktree is **retained** (later local work) and remove is not called.
+- [x] 1.10 Add an injected `gitProveMergeResultDeps` case: `git fetch origin <base>` exits non-zero while a stale local `origin/<base>` still contains the merge OID (ancestry would succeed). Assert `proveMergeResultInBase` returns null, ancestry is not tested, and park-release **retains** the worktree. Verify this test **fails** if fetch failure is ignored.
 
 ## 2. Shared classifier and ladder
 

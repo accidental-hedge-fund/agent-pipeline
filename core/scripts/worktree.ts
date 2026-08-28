@@ -1854,7 +1854,11 @@ export async function proveMergeResultInBase(
   input: ProveMergeResultInput,
   deps: ProveMergeResultDeps,
 ): Promise<VerifiedMergeProof | null> {
-  await deps.fetchBase(input.base);
+  try {
+    await deps.fetchBase(input.base);
+  } catch {
+    return null;
+  }
   const tip = await deps.baseTip(input.base);
   if (!tip) return null;
   const contained = await deps.isAncestor(input.mergeResultOid, tip);
@@ -1870,7 +1874,10 @@ export async function proveMergeResultInBase(
 export function gitProveMergeResultDeps(cfg: PipelineConfig, gitCmd: GitCmd = git): ProveMergeResultDeps {
   return {
     async fetchBase(base) {
-      await gitCmd(cfg, cfg.repo_dir, ["fetch", "origin", base], { ignoreFailure: true });
+      const r = await gitCmd(cfg, cfg.repo_dir, ["fetch", "origin", base], { ignoreFailure: true });
+      if (r.code !== 0) {
+        throw new Error(`git fetch origin ${base} failed (exit ${r.code})`);
+      }
     },
     async baseTip(base) {
       const r = await gitCmd(cfg, cfg.repo_dir, ["rev-parse", `origin/${base}`], { ignoreFailure: true });

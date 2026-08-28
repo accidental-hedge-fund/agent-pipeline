@@ -9,6 +9,7 @@ import {
   boundProofMatches,
   checkLocalOnlyCommits,
   createVerifiedMergeProof,
+  gitProveMergeResultDeps,
   proveMergeResultInBase,
   releaseWorktreeForParkedIssue,
   removeManagedWorktreeSafely,
@@ -189,6 +190,55 @@ test("proveMergeResultInBase: mints proof only after isAncestor succeeds", async
     isAncestor: async () => false,
   });
   assert.equal(missed, null);
+});
+
+test("proveMergeResultInBase: failed fetch does not mint proof from stale origin/<base>", async () => {
+  let fetchCalls = 0;
+  let ancestorCalls = 0;
+  const staleAfterFailedFetch: GitCmd = async (_cfg, _cwd, args) => {
+    if (args[0] === "fetch" && args[1] === "origin") {
+      fetchCalls += 1;
+      return { code: 128, stdout: "", stderr: "fatal: unable to access 'https://example.test': Could not resolve host" };
+    }
+    if (args[0] === "rev-parse" && args[1] === "origin/main") {
+      return { code: 0, stdout: `${OID}\n`, stderr: "" };
+    }
+    if (args[0] === "merge-base" && args[1] === "--is-ancestor") {
+      ancestorCalls += 1;
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const minted = await proveMergeResultInBase(
+    { issue: ISSUE, pr: PR, base: "main", mergeResultOid: OID, worktreeHead: HEAD_SHA },
+    gitProveMergeResultDeps(makeCfg(), staleAfterFailedFetch),
+  );
+  assert.equal(minted, null);
+  assert.equal(fetchCalls, 1);
+  assert.equal(ancestorCalls, 0, "must not ancestry-test stale refs after fetch failure");
+
+  let removed = false;
+  const result = await maybeReleaseWorktreeOnPark(
+    makeCfg(),
+    ISSUE,
+    { advanced: false, status: "finalized", reason: "needs-human" },
+    false,
+    {
+      getPrForIssueAnyState: async () => PR,
+      getPrDetail: async () => prDetail(),
+      proveMergeDeps: gitProveMergeResultDeps(makeCfg(), staleAfterFailedFetch),
+      parkReleaseDeps: parkBase({
+        hasLocalOnlyCommits: async () => "unverifiable",
+        removeWorktree: async () => {
+          removed = true;
+        },
+      }),
+    },
+  );
+  assert.equal(result?.action, "retained");
+  assert.equal(removed, false);
+  assert.match(result?.reason ?? "", /not reachable from base/i);
+  denyAuth(result?.reason ?? "");
 });
 
 // ---------------------------------------------------------------------------

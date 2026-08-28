@@ -95,7 +95,7 @@ Bound merge-result proof SHALL NOT convert a dirty worktree or a filesystem/clea
 
 ### Requirement: Bound merge-result proof SHALL be a runtime-validated in-process carrier
 
-Park-release SHALL accept bound merge-result proof only as a runtime-validated `VerifiedMergeProof` object that names this issue number, this PR number, the configured base branch, the merge-result OID, and the managed worktree HEAD observed at merge/proof time together. The engine SHALL create that object only after the in-base verifier has proven the OID is contained in `origin/<base>`. Park-release SHALL NOT reconstruct proof from run logs, GitHub labels, issue comments, or untyped persisted data.
+Park-release SHALL accept bound merge-result proof only as a runtime-validated `VerifiedMergeProof` object that names this issue number, this PR number, the configured base branch, the merge-result OID, and the managed worktree HEAD observed at merge/proof time together. The engine SHALL create that object only after the in-base verifier has fetched `origin/<base>` successfully and proven the OID is contained in that fetched ref. A failed fetch SHALL NOT mint proof from a stale local `origin/<base>` tracking ref. Park-release SHALL NOT reconstruct proof from run logs, GitHub labels, issue comments, or untyped persisted data.
 
 #### Scenario: Proof is not reconstructed from logs or labels
 
@@ -104,6 +104,13 @@ Park-release SHALL accept bound merge-result proof only as a runtime-validated `
 - **AND** no in-process `VerifiedMergeProof` from the in-base verifier exists
 - **THEN** park-release SHALL NOT treat that evidence as bound proof
 - **AND** SHALL NOT release the worktree on that evidence alone
+
+#### Scenario: Failed base fetch does not mint proof from stale refs
+
+- **WHEN** the in-base verifier fetches `origin/<base>` and the fetch exits non-zero
+- **AND** a stale local `origin/<base>` tracking ref still contains the merge-result OID
+- **THEN** the engine SHALL NOT create a `VerifiedMergeProof`
+- **AND** park-release SHALL retain the worktree
 
 ### Requirement: Bound merge-result proof SHALL match issue, PR, base, and OID
 
