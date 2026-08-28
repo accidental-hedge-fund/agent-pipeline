@@ -1,0 +1,134 @@
+## MODIFIED Requirements
+
+### Requirement: Durable park SHALL release a safe managed worktree
+
+When an issue reaches a durable non-transient park or hold — an advance outcome that leaves the issue waiting without further harness execution in its managed worktree (including needs-human holds and non-immediately-recoverable blocked outcomes) — the pipeline SHALL attempt to release that issue's managed worktree. Release SHALL succeed only when the worktree path is under a managed root, the working tree is clean, and **one** recoverability condition holds:
+
+1. local-only commit verification reports no unpushed commits, **and** the branch tip is present on the remote **or** an open PR with a resolvable head SHA exists for that head branch (so resume can reconstruct from that commit); **or**
+2. the engine holds **bound merge-result proof** for this same issue: the same issue number, the same PR number, the same configured base branch, and a `merge_result_oid` the engine has proven is contained in `origin/<base>` for that identity.
+
+On successful release the worktree directory SHALL be deregistered and removed from disk so it no longer appears in the on-disk listing used by capacity counting; the remote branch and any open PR SHALL NOT be deleted by release. Release logic SHALL reuse the same dirty and local-only safety ladder as operator remove / create reclaim (no automatic force discard). Bound merge-result proof SHALL authorize release of a clean tree even when the remote head branch is already deleted and pre-merge commits are not reachable from the base (the usual squash-merge SHA mismatch). Bound proof SHALL NOT authorize discarding a dirty worktree.
+
+#### Scenario: Clean parked worktree with remote branch is released
+
+- **WHEN** issue N durable-parks and its managed worktree is clean, has no local-only commits, and branch tip exists on the remote
+- **THEN** the pipeline SHALL remove that managed worktree from disk and deregister it
+- **AND** the remote branch SHALL remain
+- **AND** a subsequent capacity count SHALL NOT include a worktree for issue N
+
+#### Scenario: Clean parked worktree with open PR is released
+
+- **WHEN** issue N durable-parks and its managed worktree is clean with no local-only commits
+- **AND** an open PR with a resolvable head SHA exists for the pipeline head branch even if remote-tip verification is otherwise marginal
+- **THEN** the pipeline SHALL release the managed worktree without deleting the PR or remote branch
+
+#### Scenario: Clean parked worktree with bound merge-result proof is released after squash merge
+
+- **WHEN** issue N's PR P was squash-merged onto the configured base branch
+- **AND** the engine has proven `merge_result_oid` R is contained in `origin/<base>` for that same N, P, and base
+- **AND** the managed worktree for issue N is clean
+- **AND** the remote head branch is deleted and pre-merge commits are not reachable from the base
+- **THEN** the pipeline SHALL remove that managed worktree from disk and deregister it
+- **AND** operator-visible text SHALL NOT contain `commit verification failed (git/network/auth error)`
+- **AND** operator-visible text SHALL NOT tell the operator to check connectivity or retry
+
+#### Scenario: Out-of-managed-root worktree is never auto-released
+
+- **WHEN** issue N has a worktree record with `underManagedRoot === false`
+- **AND** issue N durable-parks
+- **THEN** the pipeline SHALL NOT remove that worktree via park-release
+
+### Requirement: Unsafe park SHALL retain the worktree with a visible reason
+
+When durable park would release a worktree but any safety precondition fails — dirty working tree, definitive local-only commits, unverifiable or failed local-only verification **without bound merge-result proof**, or neither remote branch tip nor open PR with resolvable head **and no bound merge-result proof** — the pipeline SHALL retain the worktree on disk, SHALL NOT force-delete it, and SHALL surface a retain reason to the operator (run log and/or blocker/hold text) so capacity occupancy is explainable.
+
+When the remote head branch is deleted and pre-merge commits are not reachable from the configured base, and bound merge-result proof is absent, the retain reason SHALL name that commits are not reachable from the base (the existing squash-merge / `--force` wording). That reason SHALL NOT state `commit verification failed (git/network/auth error)` and SHALL NOT tell the operator to check connectivity or retry.
+
+Bound merge-result proof SHALL NOT convert a dirty worktree or a filesystem/cleanup failure into an automatic discard.
+
+#### Scenario: Dirty worktree is retained on park
+
+- **WHEN** issue N durable-parks and `git status --porcelain` in its managed worktree is non-empty
+- **THEN** the worktree SHALL remain on disk
+- **AND** the operator-visible retain reason SHALL name the dirty condition
+
+#### Scenario: Local-only commits retain the worktree
+
+- **WHEN** issue N durable-parks and local-only commit verification reports definitive unpushed commits
+- **THEN** the worktree SHALL remain on disk
+- **AND** the retain reason SHALL name the local-only condition
+
+#### Scenario: Missing remote recoverability retains the worktree
+
+- **WHEN** issue N durable-parks and the branch tip is not on the remote and no open PR with resolvable head exists for that head
+- **AND** the engine does not hold bound merge-result proof for issue N
+- **THEN** the worktree SHALL remain on disk
+- **AND** the retain reason SHALL name missing remote/PR recoverability
+
+#### Scenario: Squash-merge unreachability without bound proof retains with the not-reachable reason
+
+- **WHEN** issue N durable-parks
+- **AND** the remote head branch is deleted
+- **AND** pre-merge commits are not reachable from the configured base (or that reachability check cannot prove they are in the base)
+- **AND** the engine does not hold bound merge-result proof for issue N, PR P, that base, and a proven `merge_result_oid`
+- **THEN** the worktree SHALL remain on disk
+- **AND** the retain reason SHALL name that commits are not reachable from the base
+- **AND** the retain reason SHALL NOT contain `commit verification failed (git/network/auth error)`
+- **AND** the retain reason SHALL NOT tell the operator to check connectivity or retry
+
+## ADDED Requirements
+
+### Requirement: Bound merge-result proof SHALL match issue, PR, base, and OID
+
+Park-release SHALL treat merge-result proof as bound only when it names this issue number, this PR number, this configured base branch, and this verified merge-result OID together. Proof for a different issue, a different PR, a different base branch, or a different OID SHALL NOT authorize release of this worktree.
+
+#### Scenario: Proof for another issue does not release this worktree
+
+- **WHEN** the engine holds proven `merge_result_oid` R for issue M and PR Q
+- **AND** park-release runs for issue N with PR P (N ≠ M or P ≠ Q)
+- **AND** issue N's managed worktree is otherwise in the post-squash-merge unreachability state
+- **THEN** park-release SHALL NOT remove issue N's worktree on the strength of M/Q's proof
+
+#### Scenario: Proof for another base or OID does not release this worktree
+
+- **WHEN** park-release runs for issue N and PR P on configured base `develop`
+- **AND** the only available proof is a `merge_result_oid` proven on a different base, or a different OID than the one proven contained in `origin/develop` for N and P
+- **THEN** park-release SHALL NOT remove the worktree on that unmatched proof
+
+### Requirement: Filesystem cleanup failure after proven merge SHALL keep the worktree and the pipeline state
+
+Park-release SHALL treat on-disk removal after a proven merge as best-effort. If filesystem or git-worktree cleanup fails after bound merge-result proof is present, park-release SHALL keep only that worktree, SHALL report the actual filesystem or cleanup error, SHALL NOT report git/network/auth, and SHALL NOT change `pipeline:ready-to-deploy` or integrated state for that issue.
+
+#### Scenario: Cleanup error after proven merge retains the tree and labels
+
+- **WHEN** bound merge-result proof is present for issue N and PR P
+- **AND** the managed worktree is clean
+- **AND** the remove operation fails with a filesystem or git-worktree cleanup error
+- **THEN** that worktree SHALL remain on disk
+- **AND** the operator-visible reason SHALL name the filesystem or cleanup error
+- **AND** the reason SHALL NOT contain `commit verification failed (git/network/auth error)`
+- **AND** issue N SHALL remain `pipeline:ready-to-deploy` (or integrated, if already recorded) without a label or integration rollback
+
+### Requirement: A dirty worktree after proven merge SHALL be retained with the dirty cause
+
+Park-release SHALL keep a managed worktree that is not clean after a proven merge. The retain reason SHALL name the dirty-worktree cause. The reason SHALL NOT report git/network/auth. Park-release SHALL NOT change `pipeline:ready-to-deploy` or integrated state.
+
+#### Scenario: Dirty tree after proven merge is kept
+
+- **WHEN** bound merge-result proof is present for issue N and PR P
+- **AND** `git status --porcelain` in the managed worktree is non-empty
+- **THEN** the worktree SHALL remain on disk
+- **AND** the retain reason SHALL name the dirty condition
+- **AND** the retain reason SHALL NOT contain `commit verification failed (git/network/auth error)`
+- **AND** `pipeline:ready-to-deploy` and integrated state SHALL NOT change because of the retain
+
+### Requirement: The same bound-proof park-release gate SHALL apply to pipeline single and train merge
+
+Park-release after `/pipeline` / `pipeline single` and after `train --merge` SHALL use the same bound-proof release gate. A later identical post-squash-merge case SHALL take that gate without a new mole issue or a caller-specific exception.
+
+#### Scenario: Pipeline single and train merge share the gate
+
+- **WHEN** issue N is squash-merged with bound merge-result proof and a clean managed worktree
+- **AND** park-release runs from `/pipeline` / `pipeline single` or from `train --merge`
+- **THEN** both callers SHALL release the worktree under the same bound-proof rule
+- **AND** neither caller SHALL emit git/network/auth wording for that proven-merge path
