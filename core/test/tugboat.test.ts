@@ -2511,56 +2511,10 @@ function pidsWithCmdlineNeedle(needle: string): number[] {
   return pids;
 }
 
-/** Processes whose cwd is the fixture dir or a subdirectory. */
-function pidsWithCwdUnder(root: string): number[] {
-  let real: string;
-  try {
-    real = fs.realpathSync(root);
-  } catch {
-    return [];
-  }
-  const prefix = real.endsWith(path.sep) ? real : real + path.sep;
-  const out: number[] = [];
-  for (const ent of fs.readdirSync("/proc")) {
-    if (!/^\d+$/.test(ent)) continue;
-    try {
-      const cwd = fs.readlinkSync(path.join("/proc", ent, "cwd"));
-      if (cwd === real || cwd.startsWith(prefix)) out.push(Number(ent));
-    } catch {
-      /* gone or unreadable */
-    }
-  }
-  return out;
-}
-
-function pgrpOf(pid: number): number | undefined {
-  try {
-    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-    const rparen = stat.lastIndexOf(")");
-    if (rparen < 0) return undefined;
-    const fields = stat.slice(rparen + 2).trim().split(/\s+/);
-    const pgrp = Number(fields[2]);
-    return Number.isFinite(pgrp) && pgrp > 1 ? pgrp : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function killPids(pids: number[], signal: NodeJS.Signals = "SIGTERM"): void {
-  const self = process.pid;
-  const selfPg = pgrpOf(self);
+function killPids(pids: number[]): void {
   for (const p of pids) {
-    if (!Number.isFinite(p) || p <= 1 || p === self) continue;
-    const pg = pgrpOf(p);
-    if (pg !== undefined && pg !== selfPg) {
-      try {
-        process.kill(-pg, signal);
-      } catch {
-        /* not a group leader / gone */
-      }
-    }
     try {
-      process.kill(p, signal);
+      process.kill(p, "SIGTERM");
     } catch {
       /* already gone */
     }
@@ -2714,38 +2668,24 @@ function spawnDetachViaBarrier(opts: {
   });
 }
 
-function collectDetachFixturePids(
-  dir: string,
-  stateRoot: string,
-  version: string,
-): number[] {
-  const seen = new Set<number>();
-  const add = (p: number): void => {
-    if (Number.isFinite(p) && p > 1 && p !== process.pid) seen.add(p);
-  };
-  for (const p of pidsWithCmdlineNeedle(dir)) add(p);
-  for (const p of pidsWithCmdlineNeedle(`--milestone v${version}`)) add(p);
-  for (const p of pidsWithCwdUnder(dir)) add(p);
+function reapDetachFixture(dir: string, stateRoot: string, version: string): void {
+  killPids(pidsWithCmdlineNeedle(dir));
+  killPids(pidsWithCmdlineNeedle(`--milestone v${version}`));
   try {
-    const pidFile = path.join(stateRoot, `ship-v${version}`, "playbook.pid");
+    const shipDir = path.join(stateRoot, `ship-v${version}`);
+    const pidFile = path.join(shipDir, "playbook.pid");
     if (fs.existsSync(pidFile)) {
-      add(Number(fs.readFileSync(pidFile, "utf8").trim()));
+      const p = Number(fs.readFileSync(pidFile, "utf8").trim());
+      if (Number.isFinite(p) && p > 0) {
+        try {
+          process.kill(p, "SIGTERM");
+        } catch {
+          /* gone */
+        }
+      }
     }
   } catch {
     /* ignore */
-  }
-  return [...seen];
-}
-
-function reapDetachFixture(dir: string, stateRoot: string, version: string): void {
-  killPids(collectDetachFixturePids(dir, stateRoot, version), "SIGTERM");
-  killPids(collectDetachFixturePids(dir, stateRoot, version), "SIGKILL");
-  const start = Date.now();
-  while (Date.now() - start < 250) {
-    const leftover = collectDetachFixturePids(dir, stateRoot, version);
-    if (leftover.length === 0) return;
-    killPids(leftover, "SIGKILL");
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
   }
 }
 
@@ -2756,59 +2696,6 @@ function writeLongLivedPipelineStub(fakePipeline: string): void {
   );
   fs.chmodSync(fakePipeline, 0o755);
 }
-
-test("reapDetachFixture reaps sleep children holding the fixture cwd", async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "term-reap-cwd-"));
-  const stateRoot = path.join(dir, "state");
-  const version = `9.99.${process.pid}.${Date.now()}.cwdreap`;
-  // Grandchild leftover: cmdline is only `sleep 3600` (no fixture path).
-  // nohup ignores SIGHUP, matching tugboat's setsid+nohup detach child.
-  const child = spawn("nohup", ["sleep", "3600"], {
-    cwd: dir,
-    stdio: "ignore",
-    detached: true,
-  });
-  child.unref();
-  assert.ok(child.pid && child.pid > 0, "sleep stub pid missing");
-  try {
-    await waitUntil(() => {
-      return pidsWithCwdUnder(dir).some((p) => {
-        try {
-          return fs.readFileSync(`/proc/${p}/cmdline`).toString("utf8").includes("sleep");
-        } catch {
-          return false;
-        }
-      });
-    }, 2_000, "sleep child with cwd under fixture");
-    reapDetachFixture(dir, stateRoot, version);
-    const leftover = pidsWithCwdUnder(dir);
-    assert.equal(
-      leftover.length,
-      0,
-      `cwd holders must be reaped before rmSync (overlayfs ENOTEMPTY): ${leftover.join(",")}`,
-    );
-    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-    assert.equal(fs.existsSync(dir), false, "fixture dir must be gone after teardown");
-  } finally {
-    if (child.pid) {
-      try {
-        process.kill(-child.pid, "SIGKILL");
-      } catch {
-        /* gone */
-      }
-      try {
-        process.kill(child.pid, "SIGKILL");
-      } catch {
-        /* gone */
-      }
-    }
-    try {
-      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
-    } catch {
-      /* already removed */
-    }
-  }
-});
 
 test("detach race (#1062 R2): concurrent Ship detaches exactly once", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-race-"));
@@ -2865,7 +2752,7 @@ test("detach race (#1062 R2): concurrent Ship detaches exactly once", async () =
     // Reap before rmSync. Collecting only after asserts leaked sleep 3600
     // stubs whose argv still matched train --merge for the old milestone.
     reapDetachFixture(dir, stateRoot, version);
-    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 
@@ -2928,7 +2815,7 @@ test("admission lock leftover file is not a live ship", () => {
     assert.doesNotMatch(out, /admission lock|lock file/i);
   } finally {
     reapDetachFixture(dir, stateRoot, version);
-    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 
@@ -3084,7 +2971,7 @@ test("failed wait-for-live reaps delayed child so a later detach is the only shi
     );
   } finally {
     reapDetachFixture(dir, stateRoot, version);
-    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 
@@ -3213,7 +3100,7 @@ test("SIGTERM during wait-for-live reaps the unconfirmed child before unlock", a
     );
   } finally {
     reapDetachFixture(dir, stateRoot, version);
-    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 
@@ -3403,7 +3290,7 @@ test("wait-for-live expiry reaps a re-parented descendant before unlock", async 
     );
   } finally {
     reapDetachFixture(dir, stateRoot, version);
-    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 
@@ -3492,7 +3379,7 @@ test("failed wait-for-live releases admission for a later detach", () => {
     assert.match(out, /detached tugboat ship/);
   } finally {
     reapDetachFixture(dir, stateRoot, version);
-    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 
@@ -3537,7 +3424,7 @@ test("sequential second detach uses live-ship probe after first is live", () => 
     assert.doesNotMatch(secondOut, /admission lock|lock file|detach\.gate/i);
   } finally {
     reapDetachFixture(dir, stateRoot, version);
-    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 
