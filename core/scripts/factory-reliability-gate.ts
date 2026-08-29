@@ -444,6 +444,34 @@ export function newFrgRunId(now: () => Date = () => new Date()): string {
   return `frg-${iso}-${suffix}`;
 }
 
+/** Domain separator for attested from-run identity B. Distinct from unsigned A (`frg-` + 24 hex). */
+export const FRG_ATTESTOR_RUN_ID_DOMAIN = "pipeline.factory-gate.attestor-run-id.v1";
+export const FRG_ATTESTOR_RUN_ID_PREFIX = "frg-attested-";
+
+/**
+ * Deterministic attestor `run_id` B for a complete unsigned checkpoint binding.
+ * Reprocessing unchanged A remints the same B. A changed binding remints B' ≠ B.
+ * Never uses {@link newFrgRunId} (timestamp + random).
+ */
+export function computeAttestorRunId(binding: unknown): string {
+  const digest = crypto
+    .createHash("sha256")
+    .update(FRG_ATTESTOR_RUN_ID_DOMAIN, "utf8")
+    .update("\0")
+    .update(frgCanonicalJson(binding), "utf8")
+    .digest("hex");
+  return `${FRG_ATTESTOR_RUN_ID_PREFIX}${digest.slice(0, 24)}`;
+}
+
+export type ShipPathFromRunResolution =
+  | { kind: "standalone" }
+  | {
+      kind: "bound";
+      binding: unknown;
+      unsigned_frg_run_id: string;
+    }
+  | { kind: "fail"; message: string };
+
 /**
  * Engine-class rate with item_count denominator (#757).
  * Returns null only when item_count === 0 (empty pack never release-eligible).
@@ -4112,6 +4140,18 @@ export interface FactoryGateOpts {
    * Forwarded to hybrid-v2 collect. CLI `--from-run` omits this.
    */
   requestCandidateGitSha?: string;
+  /**
+   * Ship-path unsigned checkpoint for credentialed `--from-run`.
+   * Production default loads version index + prepare checkpoint + loop binding.
+   * Tests inject this seam — no real filesystem.
+   */
+  resolveShipPathFromRun?: (args: {
+    version: string;
+    fromRun: string;
+    repoDir: string;
+    requestCandidateGitSha?: string;
+    readFile: (p: string) => Promise<string>;
+  }) => Promise<ShipPathFromRunResolution>;
   thresholds?: FrgThresholds;
   now?: () => Date;
   /**
@@ -4139,6 +4179,53 @@ export interface FactoryGateResult {
   exitCode: number;
   /** Post-pass pack close summary, or null when close did not run. */
   packClose: FrgPackCloseResult | null;
+}
+
+async function attachShipPathFromRunBinding(
+  opts: FactoryGateOpts,
+  computeInput: ComputeFrgInput,
+  fsDeps: FrgFsDeps,
+): Promise<ComputeFrgInput> {
+  const fromRun = opts.fromRun;
+  if (!fromRun) return computeInput;
+  const resolve =
+    opts.resolveShipPathFromRun ??
+    (async (args) => {
+      const { defaultResolveShipPathFromRun } = await import("./factory-release-prepare.ts");
+      return defaultResolveShipPathFromRun(args);
+    });
+  const resolution = await resolve({
+    version: computeInput.version,
+    fromRun,
+    repoDir: opts.repoDir,
+    requestCandidateGitSha: opts.requestCandidateGitSha,
+    readFile: (p) => fsDeps.readFile(p),
+  });
+  const willWriteHmac = Boolean(
+    computeInput.attestation_key &&
+      typeof computeInput.loop_run_id === "string" &&
+      computeInput.loop_run_id.trim() !== "" &&
+      typeof computeInput.pack_id === "string" &&
+      computeInput.pack_id.trim() !== "",
+  );
+  if (resolution.kind === "fail") {
+    if (willWriteHmac) throw new Error(resolution.message);
+    return computeInput;
+  }
+  if (resolution.kind !== "bound") {
+    return computeInput;
+  }
+  const attestorRunId = computeAttestorRunId(resolution.binding);
+  if (attestorRunId === resolution.unsigned_frg_run_id) {
+    throw new Error(
+      "pipeline factory-gate: attestor run_id B collided with unsigned frg_run_id A; refusing to collapse identities",
+    );
+  }
+  return {
+    ...computeInput,
+    run_id: attestorRunId,
+    factory_release_binding: resolution.binding,
+  };
 }
 
 /**
@@ -4428,6 +4515,10 @@ export async function runFactoryGate(
       `pipeline factory-gate: v${version} requires ${FRG_HYBRID_V2_POLICY_ID} ` +
         `pack provenance; missing provenance is not release evidence`,
     );
+  }
+
+  if (opts.fromRun) {
+    computeInput = await attachShipPathFromRunBinding(opts, computeInput, fsDeps);
   }
 
   const evidence = computeFrgEvidence(computeInput);
