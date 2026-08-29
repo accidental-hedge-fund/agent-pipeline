@@ -2,19 +2,24 @@
 
 ## Purpose
 TBD - created by archiving change readme-user-clarity. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: README opens with a purpose-first summary
-The README SHALL communicate — within the first visible screenful, before any configuration detail or repository layout — what the tool does, who it is for, the cross-harness model (both Claude Code and Codex are required), and the core prerequisites (Node ≥ 24, git, gh, both CLIs authenticated).
+
+The README SHALL communicate — within the first visible screenful, before any configuration detail or repository layout — what the tool does, who it is for, the implementer/reviewer pair declared in `.github/pipeline.yml`, and the core prerequisites (Node ≥ 24, git, gh, and the configured harness CLIs authenticated). It SHALL NOT state that both the Claude CLI and the Codex CLI are required as the product, regardless of which host is installed. Deeper harness-pair documentation remains issue #976.
 
 #### Scenario: First screenful is informative
+
 - **WHEN** a developer opens the README cold on GitHub
-- **THEN** the first screen SHALL contain the tool's purpose, the two-host model, and the prerequisite summary before any configuration block or repository layout
+- **THEN** the first screen SHALL contain the tool's purpose, the implementer/reviewer pair model, and the prerequisite summary before any configuration block or repository layout
+- **AND** it SHALL NOT say both Claude and Codex CLIs are required as the product
 
 #### Scenario: Cross-harness prerequisite is visible before install
-- **WHEN** a reader reaches the install section
-- **THEN** the requirement for both `claude` and `codex` CLIs SHALL have been stated earlier in the document, not only inside install sub-sections
 
----
+- **WHEN** a reader reaches the install section
+- **THEN** the implementer/reviewer pair from repository config SHALL have been stated earlier in the document, not only inside install sub-sections
+- **AND** that earlier text SHALL NOT require both `claude` and `codex` CLIs as the product
 
 ### Requirement: README contains a quickstart section
 The README SHALL include a dedicated quickstart (or "Getting Started") section that provides one clearly recommended install path and a minimal first-run example that takes a reader from install to advancing a single issue — without requiring the reader to parse optional or advanced sections first.
@@ -195,4 +200,3 @@ exists) so the Grok path is not left dangling or stale.
 - **THEN** the README SHALL state the follow-up step to refresh the Grok path
 - **AND** the step SHALL be runnable from documented commands without reading
   installer source
-
