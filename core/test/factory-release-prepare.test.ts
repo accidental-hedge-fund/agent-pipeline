@@ -77,6 +77,7 @@ import {
 const MANIFEST_SHA = "a".repeat(64);
 const CANDIDATE = "b".repeat(40);
 const ACTION_ID = "action-ship-1.34.0-001";
+const OBSERVE_HMAC = { attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY };
 
 function baseRequest(over: Partial<FactoryReleasePrepareRequest> = {}): FactoryReleasePrepareRequest {
   return {
@@ -2586,10 +2587,49 @@ test("HMAC from-run latest.json with binding and pack_provenance is accepted (#1
     { repoDir: "/repo", workDir: "/tmp/work" },
     (p) => mem.readFile(p),
     (p) => mem.fileExists(p),
+    OBSERVE_HMAC,
   );
   assert.equal(observed.status, "accepted");
   if (observed.status === "accepted") {
     assert.equal(observed.attestation.frg_run_id, runIdB);
+  }
+});
+
+test("observe rejects factory_release_binding overlay after sign (#1295)", async () => {
+  const request = baseRequest();
+  const unsigned = unsignedPayload();
+  const runIdB = computeAttestorRunId(buildFactoryReleaseUnsignedDigestBinding(request, unsigned));
+  const signed = await hybridFromRunEvidence({
+    request,
+    unsigned,
+    runId: runIdB,
+    includeBinding: false,
+  });
+  assert.equal(signed.factory_release_binding, undefined);
+  assert.equal(verifyFrgAttestation(signed, FRG_UNIT_TEST_ATTESTATION_KEY), true);
+  const overlaid = {
+    ...signed,
+    factory_release_binding: buildFactoryReleaseUnsignedDigestBinding(request, unsigned),
+  };
+  assert.equal(verifyFrgAttestation(overlaid, FRG_UNIT_TEST_ATTESTATION_KEY), false);
+
+  const mem = memoryFs();
+  const latestPath = `/repo/.agent-pipeline/frg/${request.target_version}/latest.json`;
+  await mem.writeFile(latestPath, JSON.stringify(overlaid));
+  const observed = await defaultObserveAttestation(
+    request,
+    unsigned,
+    { repoDir: "/repo", workDir: "/tmp/work" },
+    (p) => mem.readFile(p),
+    (p) => mem.fileExists(p),
+    OBSERVE_HMAC,
+  );
+  assert.notEqual(observed.status, "accepted");
+  assert.equal(observed.status, "rejected");
+  if (observed.status === "rejected") {
+    assert.equal(observed.reason, "hmac_invalid");
+    assert.equal(observed.expected_frg_run_id, unsigned.frg_run_id);
+    assert.equal(observed.observed_run_id, runIdB);
   }
 });
 
@@ -2647,7 +2687,14 @@ test("prepare completes on accepted bound B and records attested run_id (#1295)"
     releaseCalls,
     generate: async () => ({ frg: unsigned, structurally_eligible: true }),
     observe: (req, uns, ctx) =>
-      defaultObserveAttestation(req, uns, ctx, (p) => mem.readFile(p), (p) => mem.fileExists(p)),
+      defaultObserveAttestation(
+        req,
+        uns,
+        ctx,
+        (p) => mem.readFile(p),
+        (p) => mem.fileExists(p),
+        OBSERVE_HMAC,
+      ),
   });
   const outcome = await runFactoryReleasePrepare({ requestPath, repoDir: "/repo" }, deps);
   assert.equal(outcome.exitCode, 0);

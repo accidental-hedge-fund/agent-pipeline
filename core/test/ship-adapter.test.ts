@@ -2682,6 +2682,7 @@ test("candidate FRG pack re-invokes the same prepare request after factory-gate 
             return v;
           },
           async (p) => files.has(p),
+          { attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY },
         );
         if (observed.status === "accepted") {
           return { code: 0, stdout: JSON.stringify({ status: "complete" }), stderr: "" };

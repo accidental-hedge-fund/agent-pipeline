@@ -39,12 +39,15 @@ import {
   latestJsonForHonestPost133Persist,
   normalizeFrgVersion,
   parseFrgEvidenceJson,
+  resolveFrgAttestationKey,
   runFactoryGate,
   validateFrgPackContract,
+  validateReleaseEligibleFrgEvidence,
   type FactoryGateOpts,
   type FrgCompositionOverride,
   type FrgEvidence,
   type FrgScenarioOverride,
+  type FrgValidateOpts,
   type ShipPathFromRunResolution,
 } from "./factory-reliability-gate.ts";
 import {
@@ -2418,6 +2421,7 @@ async function tryLoadAttestedEvidence(
   unsigned: FactoryReleaseFrgPayload,
   readFile: (p: string) => Promise<string>,
   fileExists: (p: string) => Promise<boolean>,
+  validateOpts: FrgValidateOpts = {},
 ): Promise<LoadedAttestedEvidence> {
   if (!(await fileExists(evidencePath))) return { status: "absent", reason: "missing_file" };
   let text: string;
@@ -2488,6 +2492,18 @@ async function tryLoadAttestedEvidence(
     return reject("identity_mismatch", "candidate or honest-bind mismatch");
   }
 
+  try {
+    validateReleaseEligibleFrgEvidence(text, request.target_version, validateOpts);
+  } catch (err) {
+    const msg = (err as Error).message;
+    if (
+      /MAC|does not match|KEY is required|hand-authored|integrity\.attestation/i.test(msg)
+    ) {
+      return reject("hmac_invalid", msg);
+    }
+    return reject("not_release_eligible", msg);
+  }
+
   return { status: "accepted", evidence, text, path: evidencePath };
 }
 
@@ -2519,6 +2535,7 @@ export async function defaultObserveAttestation(
   ctx: { repoDir: string; workDir: string },
   readFile: (p: string) => Promise<string> = (p) => fs.readFile(p, "utf8"),
   fileExists: (p: string) => Promise<boolean> = defaultFileExists,
+  validateOpts: FrgValidateOpts = {},
 ): Promise<AttestationObserveResult> {
   const version = request.target_version;
   const latestPath = path.join(ctx.repoDir, ".agent-pipeline", "frg", version, "latest.json");
@@ -2535,7 +2552,14 @@ export async function defaultObserveAttestation(
   let firstRejected: Extract<LoadedAttestedEvidence, { status: "rejected" }> | null = null;
   let sawPresent = false;
   for (const p of tryPaths) {
-    const loaded = await tryLoadAttestedEvidence(p, request, unsigned, readFile, fileExists);
+    const loaded = await tryLoadAttestedEvidence(
+      p,
+      request,
+      unsigned,
+      readFile,
+      fileExists,
+      validateOpts,
+    );
     if (loaded.status === "accepted") {
       return {
         status: "accepted",
@@ -2573,7 +2597,14 @@ export async function defaultObserveAttestation(
       }
       for (const p of hintPaths) {
         if (p === evidencePath || p === latestPath) continue;
-        const loaded = await tryLoadAttestedEvidence(p, request, unsigned, readFile, fileExists);
+        const loaded = await tryLoadAttestedEvidence(
+          p,
+          request,
+          unsigned,
+          readFile,
+          fileExists,
+          validateOpts,
+        );
         if (loaded.status === "accepted") {
           const digest = sha256(loaded.text);
           return {
@@ -2751,7 +2782,9 @@ export function defaultFactoryReleasePrepareDeps(
     observeAttestation:
       overrides.observeAttestation ??
       ((request, unsigned, ctx) =>
-        defaultObserveAttestation(request, unsigned, ctx, readFile, fileExists)),
+        defaultObserveAttestation(request, unsigned, ctx, readFile, fileExists, {
+          attestationKey: resolveFrgAttestationKey(overrides.env ?? process.env),
+        })),
     observeExistingRelease:
       overrides.observeExistingRelease ??
       ((request) => defaultObserveExistingRelease(request)),
