@@ -363,15 +363,14 @@ is added.
 
 ### Requirement: Outer-host ship entry points SHALL exec the Pipeline ship CLI
 
-Every configured outer-host entry point that exposes the operator phrase
-`Ship milestone vX.Y.Z` SHALL map it to
-`pipeline ship --milestone vX.Y.Z`. Status and stop SHALL read the Pipeline ship
-ledger, and notify SHALL follow exact child-run identities through the shared
-material filter. The four generated short one-pagers MAY expose `ship` as a
-compact explicit-authority verb. They SHALL NOT be required to carry a
-host-by-host ship tutorial. OMP/Tugboat SHALL require no SKILL, and this change
-SHALL NOT materialize Hermes or OpenClaw install packs; later consumers MAY reuse
-the exported one-pager source.
+Every configured outer-host entry point SHALL map the operator phrase
+`Ship milestone vX.Y.Z` to `pipeline ship --milestone vX.Y.Z`. Status and stop
+SHALL read the Pipeline ship ledger, and notify SHALL follow exact child-run
+identities through the shared material filter. The four generated short
+one-pagers MAY expose `ship` as a compact explicit-authority verb. They SHALL
+NOT be required to carry a host-by-host ship tutorial. OMP/Tugboat SHALL require
+no SKILL, and this change SHALL NOT materialize Hermes or OpenClaw install
+packs; later consumers MAY reuse the exported one-pager source.
 
 #### Scenario: Phrase becomes the milestone CLI
 

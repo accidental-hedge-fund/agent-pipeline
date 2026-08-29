@@ -2,9 +2,9 @@
 //
 // Surfaces under guard:
 //   - README.md
-//   - hosts/claude/SKILL.md, hosts/codex/SKILL.md
 //   - openspec/project.md
 //   - living openspec/specs/pipeline-state-machine/spec.md
+// Generated host SKILLs are not the inventory surface (#1049).
 //
 // No network, git, or subprocess — local file reads + code constants only.
 
@@ -355,35 +355,19 @@ test("stage-inventory-ssot: openspec/project.md stage-count matches STAGES.lengt
   );
 });
 
-test("stage-inventory-ssot: Claude host SKILL documents full inventory", () => {
-  assertHostSkillInventory(readRepoFile("hosts/claude/SKILL.md"), "hosts/claude/SKILL.md");
-});
-
-test("stage-inventory-ssot: Codex host SKILL documents full inventory", () => {
-  assertHostSkillInventory(readRepoFile("hosts/codex/SKILL.md"), "hosts/codex/SKILL.md");
-});
-
-test("stage-inventory-ssot: host inventories stay stage-symmetric", () => {
-  const claude = readRepoFile("hosts/claude/SKILL.md");
-  const codex = readRepoFile("hosts/codex/SKILL.md");
-  const claudeSection = extractStateMachineSection(claude);
-  const codexSection = extractStateMachineSection(codex);
-  assert.ok(claudeSection, "claude missing state-machine section");
-  assert.ok(codexSection, "codex missing state-machine section");
-  assert.deepEqual(
-    extractCanonicalStageTokens(claudeSection!).sort(),
-    extractCanonicalStageTokens(codexSection!).sort(),
-    "Claude and Codex state-machine sections must document the same stage membership",
-  );
-  for (const stage of REQUIRED_HOST_STAGES) {
-    assert.ok(claude.includes(stage), `claude missing ${stage}`);
-    assert.ok(codex.includes(stage), `codex missing ${stage}`);
+test("stage-inventory-ssot: generated host SKILLs omit the state-machine essay", () => {
+  for (const host of ["claude", "codex", "grok", "opencode"] as const) {
+    const skill = readRepoFile(`hosts/${host}/SKILL.md`);
+    assert.equal(extractStateMachineSection(skill), null, `${host} SKILL must not carry ## State machine`);
+    assert.doesNotMatch(skill, /backlog → needs-spec → ready → planning/);
   }
-  assert.deepEqual(
-    extractStageCounts(claude),
-    extractStageCounts(codex),
-    "Claude and Codex host SKILLs must state the same N-stage counts",
-  );
+});
+
+test("stage-inventory-ssot: host SKILLs stay byte-identical (no host-specific stages)", () => {
+  const claude = readRepoFile("hosts/claude/SKILL.md");
+  for (const host of ["codex", "grok", "opencode"] as const) {
+    assert.equal(readRepoFile(`hosts/${host}/SKILL.md`), claude);
+  }
 });
 
 test("stage-inventory-ssot: living pipeline-state-machine spine matches STAGES / TERMINAL_STAGES", () => {

@@ -15,7 +15,7 @@
     "skillsRelative": ["skills"],
     "skillDirName": "pipeline",
     "overlayDir": "hosts/omp",
-    "overlayFiles": ["SKILL.md"],
+    "overlayFiles": [],
     "overlayDirs": [],
     "managedArtifacts": {
       "skillTree": true,

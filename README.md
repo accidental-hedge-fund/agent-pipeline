@@ -182,6 +182,8 @@ PIPELINE_INSTALL_DEPS=1 npx github:accidental-hedge-fund/agent-pipeline install 
 
 ### Grok (optional)
 
+The repository keeps a generated `hosts/grok/SKILL.md` that is byte-identical to the Claude one-pager. Install still uses `symlink-claude`: `install --host grok` creates a symlink at `~/.grok/skills/pipeline` to the Claude-managed skill tree. It does not overlay `hosts/grok/SKILL.md`. After a Claude skill update, re-run `install --host grok`.
+
 ```bash
 npx github:accidental-hedge-fund/agent-pipeline install --host grok
 # or from a clone:

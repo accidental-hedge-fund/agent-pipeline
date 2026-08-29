@@ -137,10 +137,6 @@ test("README and host SKILL.md ignored-path lists include factory-release/ (#125
   const docs = [
     "README.md",
     "docs/concepts.md",
-    "hosts/claude/SKILL.md",
-    "hosts/codex/SKILL.md",
-    "hosts/opencode/SKILL.md",
-    "hosts/omp/SKILL.md",
   ];
   for (const rel of docs) {
     const body = fs.readFileSync(path.join(repoRoot, rel), "utf8");

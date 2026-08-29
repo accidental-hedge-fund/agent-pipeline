@@ -5,8 +5,8 @@
 This page is generated from `COMMAND_REGISTRY`, `OPERATION_SURFACE`, and
 co-located metadata in `core/scripts/command-docs.ts`. Do not hand-edit the command inventory.
 
-Host skills use the same inventory with host-specific invocation tokens:
-`/pipeline` (Claude Code) and `$pipeline` (Codex). The Node CLI is `pipeline`.
+Host skills execute the in-scope catalog as `pipeline <verb>`. The Node CLI
+is `pipeline`. This page is the full documented inventory.
 
 Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 

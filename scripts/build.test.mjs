@@ -22,10 +22,14 @@ import { spawnSync } from "node:child_process";
 
 import {
   OPERATION_SURFACE,
+  SKILL_HOST_IDS,
   SKILL_OVERLAY_REL,
   MARKETPLACE_CATALOG_REL,
   buildInto,
   compare,
+  hostSkillWriteTargets,
+  skillAndCatalogTargets,
+  renderHostSkill,
 } from "./build.mjs";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -219,7 +223,8 @@ test("generated plugin bridge delegates to the managed Claude CLI without a plug
     );
 
     const skill = readFileSync(join(tmp, SKILL_OVERLAY_REL), "utf8");
-    assert.match(skill, /transitional marketplace overlay contains no engine core/i);
+    assert.equal(skill, renderHostSkill());
+    assert.doesNotMatch(skill, /## Setup \(zero install after first run\)/);
     assert.doesNotMatch(skill, /CLAUDE_PLUGIN_ROOT}\/skills\/pipeline\/core\/scripts/);
   } finally {
     cleanup(tmp);
@@ -274,13 +279,10 @@ test("--check: matching SKILL overlay + catalog pass without a plugin core tree 
   const repo = makeTmp();
   try {
     buildInto(gen);
-    mkdirSync(join(repo, dirname(SKILL_OVERLAY_REL)), { recursive: true });
-    mkdirSync(join(repo, dirname(MARKETPLACE_CATALOG_REL)), { recursive: true });
-    writeFileSync(join(repo, SKILL_OVERLAY_REL), readFileSync(join(gen, SKILL_OVERLAY_REL)));
-    writeFileSync(
-      join(repo, MARKETPLACE_CATALOG_REL),
-      readFileSync(join(gen, MARKETPLACE_CATALOG_REL)),
-    );
+    for (const rel of skillAndCatalogTargets()) {
+      mkdirSync(join(repo, dirname(rel)), { recursive: true });
+      writeFileSync(join(repo, rel), readFileSync(join(gen, rel)));
+    }
     assert.equal(
       existsSync(join(repo, "plugin", "pipeline", "skills", "pipeline", "core", "scripts")),
       false,
@@ -298,13 +300,11 @@ test("--check: stale SKILL overlay or marketplace catalog fails (#1048)", () => 
   const repo = makeTmp();
   try {
     buildInto(gen);
-    mkdirSync(join(repo, dirname(SKILL_OVERLAY_REL)), { recursive: true });
-    mkdirSync(join(repo, dirname(MARKETPLACE_CATALOG_REL)), { recursive: true });
+    for (const rel of skillAndCatalogTargets()) {
+      mkdirSync(join(repo, dirname(rel)), { recursive: true });
+      writeFileSync(join(repo, rel), readFileSync(join(gen, rel)));
+    }
     writeFileSync(join(repo, SKILL_OVERLAY_REL), "stale skill overlay\n");
-    writeFileSync(
-      join(repo, MARKETPLACE_CATALOG_REL),
-      readFileSync(join(gen, MARKETPLACE_CATALOG_REL)),
-    );
     const skillDrift = compare(gen, repo);
     assert.ok(
       skillDrift.some((d) => d.includes(SKILL_OVERLAY_REL)),
@@ -317,6 +317,61 @@ test("--check: stale SKILL overlay or marketplace catalog fails (#1048)", () => 
     assert.ok(
       catalogDrift.some((d) => d.includes(MARKETPLACE_CATALOG_REL)),
       `stale catalog must fail check; got: ${catalogDrift.join("; ")}`,
+    );
+  } finally {
+    cleanup(gen);
+    cleanup(repo);
+  }
+});
+
+test("write and check targets match SKILL_HOST_IDS plus plugin SKILL and catalog", () => {
+  const hostTargets = hostSkillWriteTargets();
+  assert.deepEqual([...hostTargets], [
+    "hosts/claude/SKILL.md",
+    "hosts/codex/SKILL.md",
+    "hosts/grok/SKILL.md",
+    "hosts/opencode/SKILL.md",
+  ]);
+  assert.deepEqual([...SKILL_HOST_IDS], ["claude", "codex", "grok", "opencode"]);
+  const check = skillAndCatalogTargets();
+  assert.deepEqual(check.slice(0, 4), hostTargets);
+  assert.ok(check.includes(SKILL_OVERLAY_REL));
+  assert.ok(check.includes(MARKETPLACE_CATALOG_REL));
+  assert.equal(
+    check.some((p) => p === "hosts/omp/SKILL.md"),
+    false,
+  );
+});
+
+test("buildInto writes four byte-identical host SKILLs from renderHostSkill", () => {
+  const tmp = makeTmp();
+  try {
+    buildInto(tmp);
+    const expected = renderHostSkill();
+    for (const rel of hostSkillWriteTargets()) {
+      assert.equal(readFileSync(join(tmp, rel), "utf8"), expected);
+    }
+    assert.equal(readFileSync(join(tmp, SKILL_OVERLAY_REL), "utf8"), expected);
+    assert.equal(existsSync(join(tmp, "hosts", "omp", "SKILL.md")), false);
+  } finally {
+    cleanup(tmp);
+  }
+});
+
+test("--check: one-byte stale host SKILL fails", () => {
+  const gen = makeTmp();
+  const repo = makeTmp();
+  try {
+    buildInto(gen);
+    for (const rel of skillAndCatalogTargets()) {
+      mkdirSync(join(repo, dirname(rel)), { recursive: true });
+      writeFileSync(join(repo, rel), readFileSync(join(gen, rel)));
+    }
+    writeFileSync(join(repo, "hosts/claude/SKILL.md"), "x");
+    const drift = compare(gen, repo);
+    assert.ok(
+      drift.some((d) => d.includes("hosts/claude/SKILL.md")),
+      `stale host SKILL must fail check; got: ${drift.join("; ")}`,
     );
   } finally {
     cleanup(gen);

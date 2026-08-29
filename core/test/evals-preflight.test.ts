@@ -104,6 +104,11 @@ test("generated packaging allowance accepts only exact SKILL or catalog outputs"
     allowsGeneratedPackagingOutput(["plugin/pipeline/skills/pipeline/SKILL.md"]),
     true,
   );
+  assert.equal(allowsGeneratedPackagingOutput(["hosts/claude/SKILL.md"]), true);
+  assert.equal(allowsGeneratedPackagingOutput(["hosts/codex/SKILL.md"]), true);
+  assert.equal(allowsGeneratedPackagingOutput(["hosts/grok/SKILL.md"]), true);
+  assert.equal(allowsGeneratedPackagingOutput(["hosts/opencode/SKILL.md"]), true);
+  assert.equal(allowsGeneratedPackagingOutput(["hosts/"]), false);
   assert.equal(allowsGeneratedPackagingOutput([".claude-plugin/marketplace.json"]), true);
   assert.equal(allowsGeneratedPackagingOutput(undefined), true);
   assert.deepEqual(
@@ -115,8 +120,41 @@ test("generated packaging allowance accepts only exact SKILL or catalog outputs"
   );
   assert.deepEqual(requiredGeneratedPackagingOutputs(["core/scripts/gh.ts"], null), []);
   assert.deepEqual(
-    requiredGeneratedPackagingOutputs(["core/scripts/command-registry.ts"], null),
-    ["plugin/pipeline/skills/pipeline/SKILL.md"],
+    requiredGeneratedPackagingOutputs(["core/scripts/command-registry.ts"], null).sort(),
+    [
+      "hosts/claude/SKILL.md",
+      "hosts/codex/SKILL.md",
+      "hosts/grok/SKILL.md",
+      "hosts/opencode/SKILL.md",
+      "plugin/pipeline/skills/pipeline/SKILL.md",
+    ].sort(),
+  );
+  assert.deepEqual(
+    requiredGeneratedPackagingOutputs(["core/scripts/host-skill.ts"], null).sort(),
+    [
+      "hosts/claude/SKILL.md",
+      "hosts/codex/SKILL.md",
+      "hosts/grok/SKILL.md",
+      "hosts/opencode/SKILL.md",
+      "plugin/pipeline/skills/pipeline/SKILL.md",
+    ].sort(),
+  );
+  assert.deepEqual(
+    requiredGeneratedPackagingOutputs(
+      ["hosts/claude/outer-host.manifest.json"],
+      null,
+    ).sort(),
+    [
+      "hosts/claude/SKILL.md",
+      "hosts/codex/SKILL.md",
+      "hosts/grok/SKILL.md",
+      "hosts/opencode/SKILL.md",
+      "plugin/pipeline/skills/pipeline/SKILL.md",
+    ].sort(),
+  );
+  assert.deepEqual(
+    requiredGeneratedPackagingOutputs(["core/scripts/docs-generate.ts"], null),
+    [],
   );
 });
 
@@ -177,6 +215,10 @@ test("static preflight: exact generated SKILL or catalog allowance passes", asyn
   for (const generatedPath of [
     "plugin/pipeline/skills/pipeline/SKILL.md",
     ".claude-plugin/marketplace.json",
+    "hosts/claude/SKILL.md",
+    "hosts/codex/SKILL.md",
+    "hosts/grok/SKILL.md",
+    "hosts/opencode/SKILL.md",
   ]) {
     const fixture = makeFixture({
       public_checks: ["npm run ci"],

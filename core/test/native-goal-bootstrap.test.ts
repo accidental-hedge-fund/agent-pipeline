@@ -1,7 +1,5 @@
-// Drift guard: both host SKILL docs must carry the operator-owned native
-// `/goal` bootstrap sequence with the correct per-host command token and the
-// required non-claim / host-owned-completion statements (#514). Reads the
-// checked-in host docs directly — no network, git, or subprocess call.
+// Drift guard: durable docs carry the operator-owned native `/goal`
+// bootstrap sequence (#514 / #1049). Generated SKILLs stay compact.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -11,85 +9,30 @@ import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, "..", "..");
+const CONCEPTS = path.join(repoRoot, "docs/concepts.md");
 
-const CLAUDE_DOC_PATH = path.join(repoRoot, "hosts/claude/SKILL.md");
-const CODEX_DOC_PATH = path.join(repoRoot, "hosts/codex/SKILL.md");
-
-function bootstrapSection(source, label) {
-  const match = source.match(
-    /#### Bootstrapping a durable run:[\s\S]*?once a run reports done\./,
-  );
-  assert.ok(match, `${label}: expected a "Bootstrapping a durable run" subsection`);
+function bootstrapSection(source: string, label: string): string {
+  const match = source.match(/### Native `\/goal` bootstrap[\s\S]*?(?=\n### |\n## |\n*$)/);
+  assert.ok(match, `${label}: expected a native /goal bootstrap subsection`);
   return match[0];
 }
 
-function assertOrderedBootstrap(section, loopToken, label) {
+test("durable docs document /goal then pipeline loop bootstrap", () => {
+  const section = bootstrapSection(fs.readFileSync(CONCEPTS, "utf8"), "concepts");
   const goalIndex = section.indexOf("`/goal`");
-  const loopIndex = section.indexOf(`\`${loopToken}`);
-  assert.ok(goalIndex !== -1, `${label}: bootstrap section must mention \`/goal\``);
-  assert.ok(loopIndex !== -1, `${label}: bootstrap section must mention \`${loopToken}\``);
-  assert.ok(
-    goalIndex < loopIndex,
-    `${label}: bootstrap must document /goal before ${loopToken}`,
-  );
-}
-
-function assertNonClaims(section, label) {
-  const flat = section.replace(/\*\*/g, "").replace(/\s+/g, " ");
-
-  assert.match(
-    flat,
-    /does not detect/,
-    `${label}: bootstrap must disclaim host \`/goal\` state detection`,
-  );
-  assert.match(
-    flat,
-    /does not (?:invoke|itself invoke) or re-enter/,
-    `${label}: bootstrap must disclaim recursive \`/goal\` invocation`,
-  );
-  assert.match(
-    flat,
-    /does not control the native `\/goal` session's lifecycle/,
-    `${label}: bootstrap must disclaim native lifecycle control`,
-  );
-  assert.match(
-    flat,
-    /(?:host\/user action|host or operator)/,
-    `${label}: bootstrap must place native completion with the host/operator`,
-  );
-  assert.match(
-    flat,
-    /neither ends the `\/goal` session nor merges/,
-    `${label}: bootstrap must state the skill neither ends the session nor merges`,
-  );
-}
-
-test("Claude host doc documents /goal then pipeline loop bootstrap", () => {
-  const source = fs.readFileSync(CLAUDE_DOC_PATH, "utf8");
-  const section = bootstrapSection(source, "claude");
-  assertOrderedBootstrap(section, "pipeline loop", "claude");
-  assertNonClaims(section, "claude");
+  const loopIndex = section.indexOf("`pipeline loop");
+  assert.ok(goalIndex !== -1, "bootstrap section must mention `/goal`");
+  assert.ok(loopIndex !== -1, "bootstrap section must mention `pipeline loop`");
+  assert.ok(goalIndex < loopIndex, "bootstrap must document /goal before pipeline loop");
+  assert.match(section, /does not invoke `\/goal` itself/i);
+  assert.match(section, /does not end the native `\/goal` session/i);
+  assert.doesNotMatch(section, /(?:\/|\$)pipeline:loop/);
 });
 
-test("Codex host doc documents /goal then pipeline loop bootstrap", () => {
-  const source = fs.readFileSync(CODEX_DOC_PATH, "utf8");
-  const section = bootstrapSection(source, "codex");
-  assertOrderedBootstrap(section, "pipeline loop", "codex");
-  assertNonClaims(section, "codex");
-});
-
-test("host bootstrap sections stay symmetric and omit removed per-verb tokens", () => {
-  const claudeSection = bootstrapSection(fs.readFileSync(CLAUDE_DOC_PATH, "utf8"), "claude");
-  const codexSection = bootstrapSection(fs.readFileSync(CODEX_DOC_PATH, "utf8"), "codex");
-
-  for (const [host, section] of [
-    ["claude", claudeSection],
-    ["codex", codexSection],
-  ]) {
-    assert.doesNotMatch(
-      section,
-      /(?:\/|\$)pipeline:loop/,
-      `${host}: bootstrap must use the direct pipeline loop CLI, not a removed per-verb token`,
-    );
+test("generated host SKILLs omit the /goal bootstrap essay", () => {
+  for (const host of ["claude", "codex", "grok", "opencode"] as const) {
+    const skill = fs.readFileSync(path.join(repoRoot, "hosts", host, "SKILL.md"), "utf8");
+    assert.doesNotMatch(skill, /Bootstrapping a durable run/);
+    assert.doesNotMatch(skill, /(?:\/|\$)pipeline:loop/);
   }
 });

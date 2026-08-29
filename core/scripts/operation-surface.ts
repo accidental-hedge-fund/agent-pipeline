@@ -156,6 +156,23 @@ export const OPERATION_SURFACE: readonly OperationSurfaceEntry[] = [
     fast: false,
   }),
   operation({
+    name: "train",
+    desc:
+      "Operator-authorized integrate train: base-eligible frontiers advance via one loop wave each (recovery inside the wave); optionally serial-merge with base containment; independent R2D siblings may merge while a peer is parked (never called by the advance loop)",
+    usage: "train --milestone <m>|--issues <n,n> [--merge] [--json] [--dry-run]",
+    section: "lifecycle",
+    fast: false,
+  }),
+  operation({
+    name: "ship",
+    desc:
+      "Run or inspect one durable milestone shipment (train --merge, release, finish, promote). Operator product is pipeline ship --milestone vX.Y.Z; no grant file required.",
+    usage:
+      "ship --milestone vX.Y.Z [--json] | ship status --milestone vX.Y.Z [--json]",
+    section: "lifecycle",
+    fast: false,
+  }),
+  operation({
     name: "release",
     desc:
       "Prepare a release PR from the matching GitHub milestone plan (or finish-merge one); finish never tags; ship-end ensure-tag creates vX.Y.Z from on-disk HMAC latest.json when FRG is gitignored; --dry-run reports milestone presence/open issues",

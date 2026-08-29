@@ -32,6 +32,7 @@ function makeRepo(): string {
   fs.writeFileSync(path.join(dir, "core/a.ts"), "export const a = 1;\n");
   fs.writeFileSync(path.join(dir, "core/b.ts"), "export const b = 1;\n");
   fs.writeFileSync(path.join(dir, "hosts/claude/SKILL.md"), "skill v1\n");
+  fs.writeFileSync(path.join(dir, "hosts/claude/outer-host.manifest.json"), "{}\n");
   // plugin/ and marketplace.json are staged by the hook; they must pre-exist so `git add` succeeds.
   fs.writeFileSync(path.join(dir, "plugin/.gitkeep"), "");
   fs.writeFileSync(path.join(dir, ".claude-plugin/marketplace.json"), "{}\n");
@@ -68,18 +69,19 @@ test("pre-commit hook: aborts when tracked core/ file has unstaged modifications
   }
 });
 
-test("pre-commit hook: aborts when tracked hosts/claude/ file has unstaged modifications", () => {
+test("pre-commit hook: aborts when tracked SKILL-host manifest has unstaged modifications", () => {
   const dir = makeRepo();
   try {
     // Stage a core/ change so the early-exit doesn't fire, then leave an
-    // unstaged modification under hosts/claude/.
+    // unstaged modification to the Claude outer-host manifest.
     fs.writeFileSync(path.join(dir, "core/a.ts"), "export const a = 2;\n");
     execSync("git add core/a.ts", { cwd: dir });
-    fs.writeFileSync(path.join(dir, "hosts/claude/SKILL.md"), "skill v2 — unstaged\n");
+    fs.writeFileSync(path.join(dir, "hosts/claude/outer-host.manifest.json"), "{\"id\":\"claude\"}\n");
 
     const { status, stdout } = runHook(dir);
-    assert.equal(status, 1, "hook must exit 1 when unstaged hosts/claude/ changes exist");
+    assert.equal(status, 1, "hook must exit 1 when unstaged outer-host manifest changes exist");
     assert.match(stdout, /unstaged changes/i);
+    assert.match(stdout, /hosts\/claude\/outer-host\.manifest\.json/);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -163,7 +165,7 @@ test("pre-commit hook: triggers regeneration when hosts/_shared/ change is stage
 
     const { status, stdout } = runHook(dir);
     assert.equal(status, 0, "hook must run regeneration for staged hosts/_shared/ changes");
-    assert.match(stdout, /regenerating SKILL overlay \/ marketplace catalog/i);
+    assert.match(stdout, /regenerating host SKILLs \/ plugin SKILL \/ marketplace catalog/i);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -203,7 +205,7 @@ test("pre-commit hook: triggers regeneration when a core/ file is renamed out of
 
     const { status, stdout } = runHook(dir);
     assert.equal(status, 0, "hook must run regeneration when a core/ file is renamed out");
-    assert.match(stdout, /regenerating SKILL overlay \/ marketplace catalog/i, "hook must mention regeneration");
+    assert.match(stdout, /regenerating host SKILLs \/ plugin SKILL \/ marketplace catalog/i, "hook must mention regeneration");
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -217,7 +219,7 @@ test("pre-commit hook: triggers regeneration when a hosts/_shared/ file is renam
 
     const { status, stdout } = runHook(dir);
     assert.equal(status, 0, "hook must run regeneration when a hosts/_shared/ file is renamed out");
-    assert.match(stdout, /regenerating SKILL overlay \/ marketplace catalog/i, "hook must mention regeneration");
+    assert.match(stdout, /regenerating host SKILLs \/ plugin SKILL \/ marketplace catalog/i, "hook must mention regeneration");
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
