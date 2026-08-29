@@ -2,11 +2,11 @@
 
 ### Requirement: The clean-docs pack instance for pack-13915-pipeline-ship-1.39.15 SHALL land a run-scoped fixture and pinning test
 
-The Factory Reliability Gate (FRG) `clean-docs` pack instance for pack run
-`pack-13915-pipeline-ship-1.39.15` (issue #1290, release `1.39.15`) SHALL add a
-JSON fixture at exactly
-`core/test/fixtures/frg/pack-13915-pipeline-ship-1.39.15/clean-docs.json`. That
-fixture SHALL declare a `release_version` field whose value is the string
+The Factory Reliability Gate (FRG) `clean-docs` pack instance SHALL add a JSON
+fixture at exactly
+`core/test/fixtures/frg/pack-13915-pipeline-ship-1.39.15/clean-docs.json` for
+pack run `pack-13915-pipeline-ship-1.39.15` (issue #1290, release `1.39.15`).
+That fixture SHALL declare a `release_version` field whose value is the string
 `1.39.15`. A hermetic unit test SHALL read only that run-scoped path and SHALL
 fail when `release_version` is not `1.39.15`. The fixture and test SHALL NOT
 read or write a fixture directory other than that pack-run path. The instance
@@ -47,13 +47,12 @@ schema, thresholds, or pack driver pass/fail logic.
 
 ### Requirement: The clean-docs pack instance for pack-13915-pipeline-ship-1.39.15 SHALL be eligible for ready-to-deploy as clean throughput
 
-The `clean-docs` pack instance for pack run `pack-13915-pipeline-ship-1.39.15`
-SHALL be scoped so a correct implementation can reach label
-`pipeline:ready-to-deploy` without an engine-class block. The pack-scored
-outcome for this item SHALL be clean ready-to-deploy throughput, not a product
-behavior change. This instance SHALL NOT add a merge path. Existing FRG
-post-pass disposition MAY close the pull request and linked issue without merge
-after it records the run.
+The `clean-docs` pack instance SHALL be scoped so a correct implementation can
+reach label `pipeline:ready-to-deploy` without an engine-class block, for pack
+run `pack-13915-pipeline-ship-1.39.15`. The pack-scored outcome for this item
+SHALL be clean ready-to-deploy throughput, not a product behavior change. This
+instance SHALL NOT add a merge path. Existing FRG post-pass disposition MAY
+close the pull request and linked issue without merge after it records the run.
 
 #### Scenario: Item reaches ready-to-deploy as clean throughput
 
