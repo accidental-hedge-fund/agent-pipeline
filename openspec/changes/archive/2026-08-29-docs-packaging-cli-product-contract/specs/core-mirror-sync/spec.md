@@ -1,9 +1,23 @@
-# core-mirror-sync Specification
+## ADDED Requirements
 
-## Purpose
-TBD - created by archiving change fix-harness-regenerate-mirror. Update Purpose after archive.
+### Requirement: Repo-root golden rule 1 SHALL name CLI plus SKILL as the product until the mirror is retired
 
-## Requirements
+Repo-root `AGENTS.md` and `CLAUDE.md` golden rule #1 SHALL state that the product is the `pipeline` CLI plus a short host SKILL. Those files SHALL NOT present “always commit the regenerated `plugin/` core mirror” as the forever packaging rule. Until issue #1048 lands, golden rule #1 or the immediately following sentence SHALL state that `node scripts/build.mjs --check` still applies. This requirement SHALL NOT rewrite host `SKILL.md` files (issue #1049).
+
+#### Scenario: AGENTS.md golden rule 1 is product-first
+
+- **WHEN** a contributor reads repo-root `AGENTS.md` golden rule #1
+- **THEN** the rule SHALL name CLI plus SKILL as the product
+- **AND** it SHALL state that `build.mjs --check` still applies until #1048
+- **AND** it SHALL NOT say always commit `plugin/` as the forever rule
+
+#### Scenario: CLAUDE.md stays in sync
+
+- **WHEN** a contributor reads repo-root `CLAUDE.md` golden rule #1
+- **THEN** the rule SHALL match `AGENTS.md` on CLI plus SKILL as the product
+- **AND** it SHALL carry the same transitional `build.mjs --check` until #1048 sentence
+
+## MODIFIED Requirements
 
 ### Requirement: Repo-local agent instructions SHALL direct harnesses to regenerate the plugin/ mirror after editing core/
 
@@ -44,20 +58,3 @@ Until issue #1048 lands, repo-local agent instructions SHALL still direct a harn
 - **WHEN** a harness commit edits `core/` but omits the regenerated `plugin/` mirror
 - **THEN** `npm run ci` (which runs `build.mjs --check`) SHALL still detect and fail on the stale mirror until #1048 retires that gate
 - **AND** the bounded fix loop SHALL self-heal the omission as before
-
-### Requirement: Repo-root golden rule 1 SHALL name CLI plus SKILL as the product until the mirror is retired
-
-Repo-root `AGENTS.md` and `CLAUDE.md` golden rule #1 SHALL state that the product is the `pipeline` CLI plus a short host SKILL. Those files SHALL NOT present “always commit the regenerated `plugin/` core mirror” as the forever packaging rule. Until issue #1048 lands, golden rule #1 or the immediately following sentence SHALL state that `node scripts/build.mjs --check` still applies. This requirement SHALL NOT rewrite host `SKILL.md` files (issue #1049).
-
-#### Scenario: AGENTS.md golden rule 1 is product-first
-
-- **WHEN** a contributor reads repo-root `AGENTS.md` golden rule #1
-- **THEN** the rule SHALL name CLI plus SKILL as the product
-- **AND** it SHALL state that `build.mjs --check` still applies until #1048
-- **AND** it SHALL NOT say always commit `plugin/` as the forever rule
-
-#### Scenario: CLAUDE.md stays in sync
-
-- **WHEN** a contributor reads repo-root `CLAUDE.md` golden rule #1
-- **THEN** the rule SHALL match `AGENTS.md` on CLI plus SKILL as the product
-- **AND** it SHALL carry the same transitional `build.mjs --check` until #1048 sentence

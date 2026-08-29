@@ -2,7 +2,7 @@
 
 **agent-pipeline** is a label-driven GitHub issue pipeline that advances an issue from backlog to `pipeline:ready-to-deploy` through a 18-stage state machine — backlog → needs-spec → ready → planning → plan-review → pre-code-attestation → implementing → design-gate → review-1 → fix-1 → review-2 → fix-2 → pre-merge → visual-gate → eval-gate → shipcheck-gate → ready-to-deploy, with `needs-human` as the terminal park off-ramp. The ordinary advance path does **not** merge. An operator must authorize a separate merge command.
 
-It ships as a skill for **both Claude Code (`/pipeline`) and Codex (`$pipeline`)** from a single shared TypeScript core. **Both harnesses are required for every run**: one implements, and the other cross-reviews. A runnable repository must declare both roles in `.github/pipeline.yml`. `pipeline init` writes a starter pair from the active profile; after that write, those values are repository policy. The invoking host profile does not select live workers. The pipeline is cross-harness by design — you cannot skip the reviewer install.
+The product is the `pipeline` CLI. Hosts are argv wrappers that exec it. A runnable repository declares an **implementer/reviewer pair** in `.github/pipeline.yml`. `pipeline init` writes a starter pair from the active profile; after that write, those values are repository policy. The invoking host profile does not select live workers. Core prerequisites: Node ≥ 24, `git`, `gh`, and the configured harness CLIs authenticated. Packaging contract: [docs/packaging.md](docs/packaging.md).
 
 ## Lifecycle
 
@@ -31,19 +31,20 @@ It ships as a skill for **both Claude Code (`/pipeline`) and Codex (`$pipeline`)
 - [Install](#install)
 - [External supervisors](#external-supervisors)
 - [Where to go next](#where-to-go-next)
+- [Packaging contract](docs/packaging.md)
 - [Onboarding a new repo](#onboarding-a-new-repo)
 - [Development](#development)
 - [License](#license)
 
 ## Prerequisites
 
-The pipeline is **cross-harness** — each run uses one CLI to implement and the *other* to review. **Both CLIs are required regardless of which host you install.**
+A runnable repository declares an **implementer/reviewer pair** in `.github/pipeline.yml`. Each run uses the configured implementer CLI to implement and the configured reviewer CLI to review.
 
 - **Node ≥ 24** with **`npm`** (npm ships with Node and installs the core's dependencies — commander, js-yaml, zod). The core runs TypeScript directly via native type-stripping; no build step. If PATH `node` is a still-supported major below 24 (for example Node 22 LTS), the launcher re-execs onto a Node ≥ 24 binary already on the machine (`AGENT_PIPELINE_NODE`, `/usr/bin/node`, or another resolver candidate). `--version` / `-V` work on Node 18–23 without that binary.
 - **`git`** and **`gh`** on PATH, with `gh auth status` authenticated against the target repo.
-- **Both `claude` and `codex` CLIs** on PATH and **authenticated** — each run uses one to implement and the other to review.
-- **Review runs on the *other* harness, invoked directly** (`reviewMode: prompt-harness`): the reviewer CLI is called with the pipeline's own JSON-returning review prompt. **No review plugin is required** — you just need the other harness's CLI installed and authenticated.
-- **Same-harness fallback (if the reviewer CLI is missing).** Cross-harness review is the design and the recommended setup — keep both CLIs installed. But if the configured reviewer CLI is *not installed / not spawnable* at review time, the pipeline does not stall: the implementing harness reviews its own work instead, and every such review is **prominently labeled as a same-harness self-review**. A self-reviewed item still advances normally. The advance path never merges. If *neither* harness is spawnable, the item blocks. A reviewer that runs but times out or errors is a genuine failure and still blocks — only a missing CLI triggers the fallback.
+- **The configured implementer and reviewer harness CLIs** on PATH and **authenticated** — declared in `.github/pipeline.yml`; each run uses the implementer to implement and the reviewer to review.
+- **Review runs on the configured reviewer harness, invoked directly** (`reviewMode: prompt-harness`): the reviewer CLI is called with the pipeline's own JSON-returning review prompt. **No review plugin is required** — you just need the configured reviewer CLI installed and authenticated.
+- **Same-harness fallback (if the reviewer CLI is missing).** Independent review is the design and the recommended setup — keep the configured implementer and reviewer CLIs installed. But if the configured reviewer CLI is *not installed / not spawnable* at review time, the pipeline does not stall: the implementing harness reviews its own work instead, and every such review is **prominently labeled as a same-harness self-review**. A self-reviewed item still advances normally. The advance path never merges. If *neither* harness is spawnable, the item blocks. A reviewer that runs but times out or errors is a genuine failure and still blocks — only a missing CLI triggers the fallback.
 - `~/.agent-operating-contract.md` and a per-repo conventions file: `CLAUDE.md` (Claude) or `AGENTS.md` (Codex).
 - **Optional:** the [OpenSpec](https://openspec.dev/) CLI (`npm i -g @fission-ai/openspec`) — only needed for repos that opt into the OpenSpec planning flow.
 - No API keys — LLM budget comes from your `claude` / `codex` subscriptions.
@@ -150,7 +151,7 @@ For a reproducible, non-interactive install — pin a released tag and auto-acce
 npx -y github:accidental-hedge-fund/agent-pipeline#v1.29.1 install --host claude --yes-deps
 ```
 
-The bare commands track the **latest** default branch; add `#<tag>` to pin a release. The pipeline is **cross-harness** regardless of which host you install — `--host claude` only controls where the skill lands; the *other* harness's CLI is still required for review.
+The bare commands track the **latest** default branch; add `#<tag>` to pin a release. `--host claude` (or another host) only controls where the skill/shim lands. Live implementer and reviewer come from `.github/pipeline.yml`, not from which host you install.
 
 **Outer-host lifecycle (#784):** installable hosts are declared by co-located
 `hosts/<id>/outer-host.manifest.json` files (install mode, skill/command surface,
@@ -231,10 +232,11 @@ node scripts/install.mjs uninstall --host all
 
 Uninstall removes the host skill tree. For Claude it also removes installer-written `pipeline:*.md` command files under the resolved Claude config `commands/` directory (same base as install / `CLAUDE_CONFIG_DIR`); other command files are left alone. For OpenCode it removes the managed skill tree and installer-owned `commands/pipeline.md` only (sibling OpenCode commands are left alone). For OMP it removes the managed skill tree and installer-owned `commands/pipeline/` TypeScript command only (sibling OMP commands are left alone).
 
-## Benchmark & Reliability Suite
+## Where to go next
 
 | Doc | What it covers |
 | --- | --- |
+| **[docs/packaging.md](docs/packaging.md)** | Packaging contract: CLI is the product; hosts are shims |
 | **[docs/cli.md](docs/cli.md)** | Full CLI command reference (generated from the command registry) |
 | **[docs/config.md](docs/config.md)** | `.github/pipeline.yml` config key reference (generated from the Zod schema) |
 | **[docs/concepts.md](docs/concepts.md)** | Advanced/optional topics: gates, OpenSpec, review policy, desktop integration, troubleshooting |
@@ -275,11 +277,13 @@ gh issue edit N --add-label "pipeline:ready"
 
 ## Development
 
+Product law (install the `pipeline` CLI plus a short host SKILL; `plugin/` is not the product) is in [docs/packaging.md](docs/packaging.md). Until #1048, `node scripts/build.mjs --check` remains the CI gate for the generated `plugin/` mirror.
+
 ```bash
 npm run setup-hooks               # one-time per clone: auto-regenerate plugin/ on core/ commits
 cd core && npm ci && npm test     # node --test
 node scripts/build.mjs            # regenerate plugin/ after editing core or the Claude overlay
-node scripts/build.mjs --check    # CI gate: fail if committed plugin/ is stale
+node scripts/build.mjs --check    # CI gate until #1048: fail if committed plugin/ is stale
 node scripts/generate-docs.mjs    # regenerate docs/cli.md, docs/config.md, CHANGELOG.md, SKILL tables
 node scripts/generate-docs.mjs --check
 npm run docs:generate             # same as generate-docs write mode
@@ -287,7 +291,7 @@ npm run docs:check                # same as generate-docs --check
 npm run ci                        # full CI gate (tests + mirror + install-smoke + openspec + docs + scripts)
 ```
 
-After changing anything under `core/` or `hosts/claude/SKILL.md`, re-run `build.mjs` and commit the regenerated `plugin/` (CI enforces this). After changing the command registry, config schema, or docs generator, re-run `generate-docs.mjs` and commit generated docs (CI enforces this via `ci:docs` once the generator is present).
+After changing anything under `core/` or `hosts/claude/SKILL.md`, re-run `build.mjs` and commit the regenerated `plugin/` (CI enforces this until #1048). After changing the command registry, config schema, or docs generator, re-run `generate-docs.mjs` and commit generated docs (CI enforces this via `ci:docs` once the generator is present).
 
 `npm run ci` always includes a **conditional** docs freshness step (`ci:docs`): it is a no-op when the docs generator is absent, and runs check-mode when `scripts/generate-docs.mjs` is present — so a stale generated artifact fails the same local command the pipeline test-gate runs.
 
