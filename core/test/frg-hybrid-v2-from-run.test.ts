@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import * as path from "node:path";
 import {
   defaultCollectHybridV2FromRun,
+  githubItemObservationsFromLiveIssues,
   overlayLedgerStateFromGitHub,
   resolvePackedCandidateIdentity,
   selectPackPr,
@@ -158,6 +159,21 @@ test("collect lists pack PRs with --state all so a post-score close can still bi
     assert.ok(stateIdx >= 0);
     assert.equal(args[stateIdx + 1], "all");
   }
+});
+
+test("githubItemObservationsFromLiveIssues threads bound PR checks by issue (#1297)", () => {
+  const observations = githubItemObservationsFromLiveIssues([
+    {
+      issue_number: 1290,
+      labels: ["factory-gate", "pipeline:ready-to-deploy"],
+      pr: {
+        number: 1292,
+        checks: [{ conclusion: "success" }],
+      },
+    } as never,
+  ]);
+  assert.equal(observations["1290"]?.pr_number, 1292);
+  assert.equal(observations["1290"]?.checks[0]?.conclusion, "success");
 });
 
 test("overlayLedgerStateFromGitHub promotes blocked to ready on R2D plus green checks (#1165)", () => {
