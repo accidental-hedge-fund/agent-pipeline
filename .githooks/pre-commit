@@ -52,4 +52,20 @@ if [ -n "$untracked_src" ]; then
 fi
 
 node scripts/build.mjs
-git add plugin/ .claude-plugin/marketplace.json
+
+# Stage only files owned by scripts/build.mjs. Do not use `git add plugin/`:
+# that would absorb unrelated plugin/ working-tree changes into this commit.
+for generated_path in \
+  .claude-plugin/marketplace.json \
+  plugin/pipeline/.claude-plugin/plugin.json \
+  plugin/pipeline/skills/pipeline/SKILL.md \
+  plugin/pipeline/skills/pipeline/scripts/pipeline.mjs \
+  plugin/pipeline/skills/pipeline/scripts/material-filter.mjs \
+  plugin/pipeline/skills/pipeline/scripts/ensure-engines-node.mjs
+do
+  # The real generator writes all six. The tracked check also makes a future
+  # generator-owned deletion stageable without broadening the path boundary.
+  if [ -e "$generated_path" ] || git ls-files --error-unmatch -- "$generated_path" >/dev/null 2>&1; then
+    git add -- "$generated_path"
+  fi
+done

@@ -26,10 +26,10 @@ review steps must follow.
    default-demote review steps to go faster. Speed work must be rigor-preserving (better
    prompts, removing dead/deterministic asks, fixing real convergence bugs) — never by
    removing review coverage.
-4. **Advance never merges.** `/pipeline`, `/pipeline:single`, and `/pipeline:loop`
+4. **Advance never merges.** `/pipeline N`, `pipeline single`, and `pipeline loop`
    stop at `pipeline:ready-to-deploy` and never invoke a merge. Merging uses
-   loop-isolated, operator-authorized commands only: `/pipeline:merge` per PR,
-   `/pipeline:merge-queue --apply` for a batch (`merge-queue` is dry-run by default),
+   loop-isolated, operator-authorized commands only: `pipeline merge` per PR,
+   `pipeline merge-queue --apply` for a batch (`merge-queue` is dry-run by default),
    `pipeline train --merge`, or `pipeline ship --milestone` (no grant file).
    External supervisors may invoke those same commands under operator authority.
    This repository does not ship a Hermes/Buzz factory control plane, grant schema,

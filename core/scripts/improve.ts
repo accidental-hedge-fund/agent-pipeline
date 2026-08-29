@@ -106,7 +106,7 @@ export interface ClusterEntry {
  *  `body` (#459 review 2, finding 582c19e6) carries the issue body so callers can check for a
  *  provenance marker before treating an issue as auto-filed — the `[pipeline-improve]` title
  *  prefix and `pipeline:backlog` label are both applied by legitimate non-auto-file paths too
- *  (`pipeline improve --apply`, and `/pipeline:triage` respectively), so neither alone proves an
+ *  (`pipeline improve --apply`, and `pipeline triage` respectively), so neither alone proves an
  *  issue was created by the papercut auto-file path. Optional/defaulted to "" so callers that
  *  never fetched a body (in-memory placeholders) degrade to "no provenance" rather than throwing. */
 export interface OpenImproveIssue {

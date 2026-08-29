@@ -8,9 +8,9 @@
 
 ## ADDED Requirements
 
-### Requirement: A fixture allowed-change boundary MAY admit exact generator-owned packaging outputs
+### Requirement: A fixture allowed-change boundary SHALL admit only explicitly listed generator-owned packaging outputs
 
-The fixture contract MAY list exact generator-owned SKILL overlay or marketplace catalog
+The fixture contract SHALL permit fixtures to list exact generator-owned SKILL overlay or marketplace catalog
 paths in an `allowed_change_paths` boundary. Fixture validation SHALL treat an explicitly
 listed generated output as in scope, but SHALL NOT grant a broad `plugin/**` exception and
 SHALL NOT admit a `plugin/` core-mirror path merely because a corresponding `core/` path was

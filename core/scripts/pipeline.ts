@@ -764,6 +764,7 @@ export function maxPositionalsFor(command: string | undefined): number {
     command === "train" ||
     command === "ship" ||
     command === "status" ||
+    command === "summary" ||
     command === "papercut" ||
     command === "correction" ||
     command === "controls" ||
@@ -4246,24 +4247,42 @@ async function main(): Promise<void> {
     return;
   }
 
-  // `pipeline summary <run-id>` — exact-selection form: print summary.json from a
-  // specific run directory without requiring domain config or an issue number (#261).
-  // Dispatched early (before config/gh resolution) like `logs`, since it is
-  // domain-independent and must work offline.
+  // `pipeline summary <selector>` supports the issue-scoped replacement for
+  // `pipeline N --summary` as well as exact run-id selection. Both routes are
+  // local/offline. Positive integers derive the same default domain as config
+  // resolution, while --domain preserves explicit legacy-fallback selection.
+  const summaryTarget = numArg === "summary" ? parseSummaryTarget(cmd.args[1]) : null;
   if (numArg === "summary") {
     const summaryStart = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
     const repoDir = findGitRoot(summaryStart) ?? summaryStart;
-    const summaryRunId = cmd.args[1];
-    if (!summaryRunId) {
+    if (!summaryTarget) {
       console.error(
-        "pipeline summary: a run-id argument is required.\n" +
-          "  Usage: pipeline summary <run-id>\n" +
-          "  Example: pipeline summary 147-2026-06-20T10-00-00-000Z\n" +
+        "pipeline summary: a positive issue number or run-id is required.\n" +
+          "  Usage: pipeline summary <issue-number|run-id>\n" +
+          "  Example (issue): pipeline summary 147\n" +
+          "  Example (run):   pipeline summary 147-2026-06-20T10-00-00-000Z\n" +
           "  Tip:    pipeline logs   (lists available run-ids)",
       );
       process.exit(2);
     }
-    await runSummaryByRunId(repoDir, summaryRunId);
+    const summaryEntry = lookupCommand("summary");
+    const unsupportedSummaryFlags = summaryEntry ? validateFlags(summaryEntry, cmd) : [];
+    if (unsupportedSummaryFlags.length > 0) {
+      const flags = unsupportedSummaryFlags
+        .map((key) => cmd.options.find((option) => option.attributeName() === key)?.long ?? `--${key}`)
+        .join(", ");
+      console.error(`pipeline: 'pipeline summary' does not support ${flags}.`);
+      process.exit(2);
+    }
+    if (summaryTarget.kind === "run") {
+      await runSummaryByRunId(repoDir, summaryTarget.runId);
+      return;
+    }
+    const summaryCfg = {
+      domain: opts.domain ?? path.basename(repoDir),
+      repo_dir: repoDir,
+    } as PipelineConfig;
+    await runSummary(summaryCfg, summaryTarget.issueNumber, repoDir);
     return;
   }
 
@@ -6541,11 +6560,10 @@ async function main(): Promise<void> {
     cfg = { ...cfg, engine_track: opts.engineTrack };
   }
 
-  // Legacy `--cleanup` flag form — deprecated; use `pipeline cleanup` or
-  // `/pipeline:cleanup` instead.
+  // Legacy `--cleanup` flag form — deprecated; use `pipeline cleanup` instead.
   if (opts.cleanup && isNumericOrAbsent) {
     process.stderr.write(
-      "Deprecated: `pipeline --cleanup` is deprecated. Use `pipeline cleanup` or `/pipeline:cleanup` instead.\n",
+      "Deprecated: `pipeline --cleanup` is deprecated. Use `pipeline cleanup` instead.\n",
     );
     await runCleanup(cfg);
     return;
@@ -6558,10 +6576,10 @@ async function main(): Promise<void> {
   }
 
   if (isInit) {
-    // Legacy `--init` flag form — deprecated; use `pipeline init` or `/pipeline:init` instead.
+    // Legacy `--init` flag form — deprecated; use `pipeline init` instead.
     if (opts.init && isNumericOrAbsent) {
       process.stderr.write(
-        "Deprecated: `pipeline --init` is deprecated. Use `pipeline init` or `/pipeline:init` instead.\n",
+        "Deprecated: `pipeline --init` is deprecated. Use `pipeline init` instead.\n",
       );
     }
     await runInit(cfg);
@@ -6778,7 +6796,7 @@ async function main(): Promise<void> {
   // number the bundle is keyed by.
   if (opts.summary) {
     process.stderr.write(
-      `Deprecated: \`pipeline ${number} --summary\` is deprecated. Use \`/pipeline:summary ${number}\` instead.\n`,
+      `Deprecated: \`pipeline ${number} --summary\` is deprecated. Use \`pipeline summary ${number}\` instead.\n`,
     );
     await runSummary(cfg, number, cfg.repo_dir);
     return;
@@ -6792,7 +6810,7 @@ async function main(): Promise<void> {
   // recovery, so they also bypass it (below).
   if (opts.status) {
     process.stderr.write(
-      `Deprecated: \`pipeline ${number} --status\` is deprecated. Use \`pipeline status ${number}\` or \`/pipeline:status\` instead.\n`,
+      `Deprecated: \`pipeline ${number} --status\` is deprecated. Use \`pipeline status ${number}\` instead.\n`,
     );
     let issueNumber: number;
     try {
@@ -6841,7 +6859,7 @@ async function main(): Promise<void> {
 
   if (opts.unblock !== undefined) {
     process.stderr.write(
-      `Deprecated: \`pipeline ${number} --unblock\` is deprecated. Use \`pipeline unblock ${number} "<answer>"\` or \`/pipeline:unblock\` instead.\n`,
+      `Deprecated: \`pipeline ${number} --unblock\` is deprecated. Use \`pipeline unblock ${number} "<answer>"\` instead.\n`,
     );
     let issueNumber: number;
     try {
@@ -6856,7 +6874,7 @@ async function main(): Promise<void> {
   }
   if (opts.override !== undefined) {
     process.stderr.write(
-      `Deprecated: \`pipeline ${number} --override\` is deprecated. Use \`pipeline override ${number} "<spec>"\` or \`/pipeline:override\` instead.\n`,
+      `Deprecated: \`pipeline ${number} --override\` is deprecated. Use \`pipeline override ${number} "<spec>"\` instead.\n`,
     );
     let issueNumber: number;
     try {
@@ -7586,6 +7604,20 @@ export interface RunSummaryDeps {
   readBundle: (stateDir: string, issueNumber: number) => Promise<EvidenceBundle | null>;
   /** Raw file read for exact-run-id lookup (runSummaryByRunId). */
   readFile: (p: string) => Promise<string>;
+}
+
+export type SummaryTarget =
+  | { kind: "issue"; issueNumber: number }
+  | { kind: "run"; runId: string };
+
+/** Distinguish the issue-scoped direct form from an exact run-id selector. */
+export function parseSummaryTarget(selector: string | undefined): SummaryTarget | null {
+  if (!selector) return null;
+  if (/^\d+$/.test(selector)) {
+    const issueNumber = Number.parseInt(selector, 10);
+    return issueNumber > 0 ? { kind: "issue", issueNumber } : null;
+  }
+  return { kind: "run", runId: selector };
 }
 
 const defaultRunSummaryDeps: RunSummaryDeps = {

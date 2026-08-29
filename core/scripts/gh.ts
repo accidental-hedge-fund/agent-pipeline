@@ -1063,6 +1063,12 @@ async function composePrDiffFromFilesList(
         continue;
       }
       if (!hasOmittedTextChange(entry)) {
+        if (entry.status === "modified") {
+          throw new Error(
+            `getPrDiff: patchless zero-line modified entry for PR #${prNumber} path ${toPath} ` +
+              "may be a file-mode change; refusing a header-only diff",
+          );
+        }
         blocks.push(header);
         continue;
       }

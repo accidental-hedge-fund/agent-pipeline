@@ -88,12 +88,9 @@ export const OPERATION_SURFACE = [
   },
   {
     name: "summary",
-    desc: "Print the evidence bundle for issue N",
-    argHint: "<N>",
-    // summary <N> is the issue-bundle form; the host command routes via --summary flag
-    // because `pipeline summary <run-id>` is the exact-run selector.
-    cliArgs: "$1 --summary",
-    specialCli: true,
+    desc: "Print the evidence bundle for an issue number or exact run-id",
+    argHint: "<issue-number|run-id>",
+    cliArgs: "summary $ARGUMENTS",
     fast: true,
   },
   {

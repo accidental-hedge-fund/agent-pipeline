@@ -212,7 +212,7 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 
 #### `summary`
 
-- **Usage:** `pipeline summary <run-id>`
+- **Usage:** `pipeline summary <issue-number|run-id>`
 - **Summary:** Print the run evidence bundle for an issue number or exact run-id
 
 ### Config & discovery

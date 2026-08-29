@@ -13,6 +13,12 @@ import { fileURLToPath } from "node:url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(__dirname, "..", "..");
 const COMMANDS_DIR = join(REPO_ROOT, "plugin", "pipeline", "commands");
+const HOST_SKILL_PATHS = [
+  join(REPO_ROOT, "hosts", "claude", "SKILL.md"),
+  join(REPO_ROOT, "hosts", "codex", "SKILL.md"),
+  join(REPO_ROOT, "hosts", "opencode", "SKILL.md"),
+  join(REPO_ROOT, "hosts", "omp", "SKILL.md"),
+];
 
 // Canonical operation names per the namespaced-command-surface spec.
 // run is intentionally absent — it is an undocumented alias only.
@@ -38,7 +44,7 @@ const EXPECTED_OPERATIONS = new Set([
 ]);
 
 // ---------------------------------------------------------------------------
-// 7.5a  Every expected operation has a generated command file
+// 7.5a  Every expected operation remains in the shared CLI catalog
 // ---------------------------------------------------------------------------
 
 test("namespaced-commands 7.5a: OPERATION_SURFACE catalogs expected ops; no slash-command tree", async () => {
@@ -62,6 +68,53 @@ test("namespaced-commands 7.5a: OPERATION_SURFACE catalogs expected ops; no slas
     ? readdirSync(COMMANDS_DIR).filter((f) => f.startsWith("pipeline:") && f.endsWith(".md"))
     : [];
   assert.deepEqual(files, [], "plugin/pipeline/commands/ must not contain pipeline:*.md");
+});
+
+test("namespaced-commands 7.5a2: live surfaces advertise direct CLI verbs only", () => {
+  const truthfulSurfacePaths = [
+    ...HOST_SKILL_PATHS,
+    join(REPO_ROOT, "CLAUDE.md"),
+    join(REPO_ROOT, "README.md"),
+    join(REPO_ROOT, "docs", "concepts.md"),
+    join(REPO_ROOT, "core", "scripts", "pipeline.ts"),
+  ];
+
+  for (const surfacePath of truthfulSurfacePaths) {
+    const content = readFileSync(surfacePath, "utf8");
+    assert.doesNotMatch(
+      content,
+      /(?:\/|\$)pipeline:[a-z]/,
+      `${surfacePath} must not advertise a removed per-verb host token`,
+    );
+  }
+
+  for (const skillPath of HOST_SKILL_PATHS) {
+    const content = readFileSync(skillPath, "utf8");
+    assert.doesNotMatch(
+      content,
+      /First-ever invocation runs `npm install`/,
+      `${skillPath} must not claim the launcher uses npm install`,
+    );
+    assert.match(content, /best-effort `npm ci`/, `${skillPath} must document installer prewarm`);
+    assert.match(
+      content,
+      /first non-version launcher invocation\s+retries `npm ci`/,
+      `${skillPath} must document first-run dependency self-heal`,
+    );
+    assert.match(content, /failed retry exits non-zero/, `${skillPath} must document fail-closed retry`);
+  }
+
+  const ompSkill = readFileSync(join(REPO_ROOT, "hosts", "omp", "SKILL.md"), "utf8");
+  assert.doesNotMatch(
+    ompSkill,
+    /generated mirror\s+of\s+`core\/`/i,
+    "OMP development guidance must not restore the retired core mirror",
+  );
+  assert.match(
+    ompSkill,
+    /product install path is the\s+pipeline CLI plus host SKILL/,
+    "OMP development guidance must name the CLI plus host SKILL contract",
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -149,8 +202,8 @@ test("namespaced-commands 7.5b4: loop SKILL packaging is long-running; generator
   assert.equal(loopOp.inRepoLoop, true, "loop must keep inRepoLoop packaging");
 
   const claudeSkill = readFileSync(join(REPO_ROOT, "hosts", "claude", "SKILL.md"), "utf8");
-  const driveSection = claudeSkill.includes("### 4b. Orchestration pattern for `/pipeline:loop`")
-    ? claudeSkill.slice(claudeSkill.indexOf("### 4b. Orchestration pattern for `/pipeline:loop`"))
+  const driveSection = claudeSkill.includes("### 4b. Orchestration pattern for `pipeline loop`")
+    ? claudeSkill.slice(claudeSkill.indexOf("### 4b. Orchestration pattern for `pipeline loop`"))
     : claudeSkill;
   assert.ok(
     /long-running/i.test(driveSection),
@@ -372,8 +425,8 @@ test("namespaced-commands 7.5b7: host advance skill re-attach + cancelled-wait-n
       `${skillPath} re-attach path must include logs <run-id> --events --follow (#725)`,
     );
     assert.ok(
-      /summary\s+<run-id>|summary <run-id>/i.test(body),
-      `${skillPath} re-attach path must include summary <run-id> (#725)`,
+      /summary\s+<[^>\n]*run-id[^>\n]*>/i.test(body),
+      `${skillPath} re-attach path must include a summary selector with run-id (#725)`,
     );
 
     // Advance events follow documents until-terminal default on run_complete

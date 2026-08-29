@@ -169,7 +169,7 @@ gh repo clone accidental-hedge-fund/agent-pipeline
 node agent-pipeline/scripts/install.mjs install        # --host claude|codex|grok|opencode|omp|all  (default: all)
 ```
 
-The installer copies the shared core and the right host overlay into `~/.claude/skills/pipeline`, `~/.codex/skills/pipeline`, `~/.config/opencode/skills/pipeline`, and/or `~/.omp/agent/skills/pipeline`, writes a launcher shim, and pre-installs the core's dependencies. It honors `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, and `OPENCODE_CONFIG_DIR`; the OpenCode `/pipeline` command embeds the resolved skill path under that config dir. Claude and Codex installs do not emit per-verb command files. `OPENCODE_CONFIG` (single config **file**) is not used as an install base. OMP always installs under `~/.omp/agent` (no env override; project `.omp` is not installer-managed). If a **personal** skill already exists at the host's skills path without the installer's managed marker, install offers relocation (or auto-relocates in non-TTY) for **Claude, Codex, OpenCode, and OMP** tree hosts so the personal tree is not silently overwritten. **Restart Codex** after a Codex install; Claude picks the skill up live. OpenCode and OMP may need a restart/reload if commands do not appear live.
+The installer copies the shared core and the right host overlay into `~/.claude/skills/pipeline`, `~/.codex/skills/pipeline`, `~/.config/opencode/skills/pipeline`, and/or `~/.omp/agent/skills/pipeline`, writes a launcher shim, and attempts a best-effort dependency prewarm with `npm ci`. If that prewarm fails, the first non-version launcher invocation retries and fails closed with manual remediation if dependencies still cannot be installed. It honors `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, and `OPENCODE_CONFIG_DIR`; the OpenCode `/pipeline` command embeds the resolved skill path under that config dir. Claude and Codex installs do not emit per-verb command files. `OPENCODE_CONFIG` (single config **file**) is not used as an install base. OMP always installs under `~/.omp/agent` (no env override; project `.omp` is not installer-managed). If a **personal** skill already exists at the host's skills path without the installer's managed marker, install offers relocation (or auto-relocates in non-TTY) for **Claude, Codex, OpenCode, and OMP** tree hosts so the personal tree is not silently overwritten. **Restart Codex** after a Codex install; Claude picks the skill up live. OpenCode and OMP may need a restart/reload if commands do not appear live.
 
 ### Optional dependency prompts
 
@@ -201,7 +201,7 @@ Default install locations (override the config base with `OPENCODE_CONFIG_DIR`):
 | Surface | Default path |
 | --- | --- |
 | Skill tree | `~/.config/opencode/skills/pipeline` |
-| Native `/pipeline` command | `~/.config/opencode/commands/pipeline.md` |
+| `/pipeline` markdown command | `~/.config/opencode/commands/pipeline.md` |
 
 The OpenCode `/pipeline` command is an **OpenCode markdown command** (LLM-mediated prompt template — OpenCode does not support pure no-LLM side-effect slash commands). The installer writes a template that **shell-injects** an argv-safe bridge so the installed launcher runs and its stdout is injected into the prompt before the agent turn. For `--version` / `-V`, the inject output equals `node ~/.config/opencode/skills/pipeline/scripts/pipeline.mjs --version` (from `core/package.json` at the install root), and the template instructs the agent to report only that version string without dumping generic skill instructional text.
 
@@ -266,7 +266,7 @@ loop selectors. Then run `pipeline loop --milestone <lane>` on the children.
 
 ```bash
 # From the target repo:
-/pipeline:init              # or: pipeline init
+pipeline init
 # Commit .github/pipeline.yml (edit as needed), then:
 gh issue edit N --add-label "pipeline:ready"
 /pipeline N

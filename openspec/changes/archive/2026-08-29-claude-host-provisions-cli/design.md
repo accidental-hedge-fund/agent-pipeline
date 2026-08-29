@@ -38,6 +38,8 @@ Keep `stageInto`: build the overlay + `core/` whitelist + launcher shim + materi
 
 The launcher keeps `--version` dependency-free. For the first non-version invocation whose dependencies are not ready, it resolves an engines-compliant Node, retries the same `npm ci`, and dispatches the original argv only after success. A failed prewarm or retry must remove or invalidate any partial dependency state so the next invocation remains retryable. A failed retry exits non-zero and names the manual `npm ci` command and installed `core/` path. That is how the managed Claude/Codex skill-tree install remains fail-soft at installation and fail-closed at execution.
 
+All non-dry-run mutating installer commands (`install`, `update`, and `uninstall`) share a process-owned installer-operation lock held from before destination inspection through tree mutation and any prewarm. This closes the two-fresh-installer case that the existing update lock cannot see before either destination exists and prevents uninstall from deleting a core beneath installer-owned npm. The operation lock is never reclaimed solely because its parent PID died: `spawnSync`'s npm child can survive that parent. It is separate from the launcher-visible update lock, so a launcher that observes a freshly published incomplete core waits on its core-local dependency owner. Replacement and removal also refuse any extant core-local dependency lock, covering a launcher parent that died while npm survived.
+
 - Alternative: a separate global `pipeline` on `PATH` only. Extra install shape. Not required. `#990` is not required.
 - Alternative: Claude keeps using `${CLAUDE_PLUGIN_ROOT}` marketplace copy. That is dual-ship. Rejected.
 - Alternative: make install-time `npm ci` a hard completion barrier. Rejected because it conflicts with #153's `npx … install` fail-soft contract for transient registry, offline, cache-permission, and engine-strict failures.
@@ -80,6 +82,8 @@ Minimum tests that bite current behavior:
 6. A stubbed failing install-time `npm ci` warns, exits 0, preserves the staged launcher/core/SKILL tree, and leaves dependencies retryable.
 7. A first non-version invocation retries when dependencies are absent or a prior attempt left partial state; success dispatches the original verb, while failure exits non-zero with manual remediation and remains retryable.
 8. Current-main `scripts/ensure-engines-node.mjs` stays next to the installed launcher and runs before TypeScript-loading routes.
+9. Two concurrent fresh installers produce one publisher and one dependency prewarm owner; the loser fails before tree mutation, while the existing installer-plus-launcher test still waits and dispatches.
+10. Uninstall racing live installer prewarm, or encountering an abandoned core-local dependency owner, fails before deleting the npm working tree and names exact recovery.
 
 Inject I/O in unit tests. Install smoke may use a temp `CLAUDE_CONFIG_DIR` as today. Do not require live GitHub for the “slash file missing” proof.
 

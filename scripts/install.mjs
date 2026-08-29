@@ -21,7 +21,7 @@
 // dangling. Manual layout is documented in the README ("Grok Build skill path").
 //
 // OpenCode: --host opencode installs a full tree under
-// ~/.config/opencode/skills/pipeline (or $OPENCODE_CONFIG_DIR/…) plus a native
+// ~/.config/opencode/skills/pipeline (or $OPENCODE_CONFIG_DIR/…) plus an LLM-mediated
 // /pipeline command at <base>/commands/pipeline.md. OpenCode custom commands
 // are LLM-mediated prompt templates; the installed command shell-injects an
 // argv-safe bridge (hosts/opencode/) so the launcher runs and its stdout is
@@ -329,9 +329,9 @@ function selectedHosts(hostArg) {
 
 const log = (msg) => console.log(msg);
 const warn = (msg) => console.warn(`⚠️  ${msg}`);
+class InstallFailure extends Error {}
 function fail(msg) {
-  console.error(`✗ ${msg}`);
-  process.exit(1);
+  throw new InstallFailure(msg);
 }
 
 function which(bin) {
@@ -368,10 +368,10 @@ function preflight() {
 // installer cannot diverge on external goal-loop discovery. External goal-loop
 // is optional/legacy after the in-repo durable loop (#512): absence is skip
 // (info), not a blocker; only an INCOMPATIBLE *discovered* pairing fails.
-// Durable loop (`/pipeline:loop` / `$pipeline:loop`) does not require the
+// Durable loop (`pipeline loop`) does not require the
 // external skill. Runs before any host install (external mutation) begins.
 // Returns { ok, message? } rather than calling fail() itself, so it stays
-// unit-testable (fail() calls process.exit); main() calls fail() on ok:false.
+// unit-testable; main() turns an incompatible result into an InstallFailure.
 async function checkLoopCoherence() {
   let loopPreflight;
   let doctor;
@@ -526,6 +526,119 @@ function formatLiveRunMessage(liveLocks, { asWarning }) {
 // ---------------------------------------------------------------------------
 
 const UPDATE_LOCK_PATH = join(tmpdir(), ".pipeline-installer-update.lock");
+// Serializes every mutating installer, including two processes that both start
+// before a fresh destination exists. This is intentionally distinct from the
+// update lock observed by launchers: a launcher racing a fresh install must be
+// able to wait on the published core-local dependency owner instead of failing
+// merely because that same installer is still prewarming dependencies.
+const INSTALLER_OPERATION_LOCK_PATH = join(tmpdir(), ".pipeline-installer-operation.lock");
+
+function installerOperationLockState(lockPath) {
+  let owner;
+  try {
+    owner = readFileSync(lockPath, "utf8").trim();
+  } catch (err) {
+    if (err.code === "ENOENT") return { state: "missing" };
+    return { state: "unreadable", error: err };
+  }
+  const pid = Number.parseInt(owner.split(/\s+/)[0] ?? "", 10);
+  if (!Number.isFinite(pid) || pid <= 0) return { state: "abandoned", owner };
+  try {
+    process.kill(pid, 0);
+    return { state: "live", pid, owner };
+  } catch (err) {
+    if (err.code === "ESRCH") return { state: "abandoned", pid, owner };
+    return { state: "live", pid, owner };
+  }
+}
+
+// Unlike UPDATE_LOCK_PATH, this lock is never reclaimed automatically from a
+// dead parent. The installer's blocking npm child can outlive that parent, so
+// PID death alone is not authority to replace its core or start another npm ci.
+function acquireInstallerOperationLock(lockPath = INSTALLER_OPERATION_LOCK_PATH) {
+  const token = `${process.pid} installer-${process.hrtime.bigint().toString(16)}`;
+  while (true) {
+    try {
+      const fd = openSync(lockPath, "wx");
+      try {
+        writeFileSync(fd, token);
+      } finally {
+        closeSync(fd);
+      }
+      return { ok: true, token };
+    } catch (err) {
+      if (err.code !== "EEXIST") return { ok: false, state: "error", error: err };
+      const observed = installerOperationLockState(lockPath);
+      if (observed.state === "missing") continue;
+      return { ok: false, ...observed };
+    }
+  }
+}
+
+function releaseInstallerOperationLock(
+  token,
+  lockPath = INSTALLER_OPERATION_LOCK_PATH,
+) {
+  try {
+    if (readFileSync(lockPath, "utf8") !== token) {
+      return { ok: false, error: new Error("the lock is missing or owned by another process") };
+    }
+    unlinkSync(lockPath);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err };
+  }
+}
+
+function beginInstallerOperation(lockPath = INSTALLER_OPERATION_LOCK_PATH) {
+  const acquired = acquireInstallerOperationLock(lockPath);
+  if (acquired.ok) return acquired.token;
+  if (acquired.state === "live") {
+    fail(
+      `Another installer (pid ${acquired.pid}) is publishing or prewarming dependencies. ` +
+        `Retry once it finishes. Lock: ${lockPath}`,
+    );
+  }
+  if (acquired.state === "abandoned") {
+    fail(
+      `Abandoned installer-operation lock at ${lockPath}; refusing to publish, uninstall, ` +
+        `or start npm ci. Confirm no npm ci child from the prior installer remains, then ` +
+        `remove that exact lock and retry.`,
+    );
+  }
+  const detail = acquired.error?.message ?? "the owner state could not be read";
+  fail(
+    `Could not acquire installer-operation lock at ${lockPath}: ${detail}. ` +
+      `Inspect that exact lock and retry; do not remove it until no prior npm ci child remains.`,
+  );
+}
+
+function endInstallerOperation(token, lockPath = INSTALLER_OPERATION_LOCK_PATH) {
+  const released = releaseInstallerOperationLock(token, lockPath);
+  if (released.ok) return;
+  warn(
+    `Could not release installer-operation lock at ${lockPath}: ${released.error.message}. ` +
+      `After this installer exits, confirm no npm ci child remains, then remove that exact ` +
+      `lock and retry.`,
+  );
+}
+
+function findDependencyInstallLocks(hosts) {
+  return hosts
+    .filter((host) => HOSTS[host].installMode === "tree")
+    .map((host) =>
+      join(HOSTS[host].skillsDir(), "pipeline", "core", ".pipeline-dependencies-installing.lock"),
+    )
+    .filter((lockPath) => existsSync(lockPath));
+}
+
+function formatDependencyInstallLockRefusal(lockPaths) {
+  return (
+    `Dependency provisioning may still be running; refusing to replace or remove its core. ` +
+    `Confirm no npm ci child remains, then remove the exact lock and retry:\n` +
+    lockPaths.map((lockPath) => `    ${lockPath}`).join("\n")
+  );
+}
 
 /** Acquire the installer's exclusive update lock. Returns false if another
  *  live installer instance already holds it. Reclaims a stale lock (dead
@@ -839,7 +952,7 @@ function uninstallCommandsForHost(host, dryRun) {
 }
 
 /**
- * Render the OpenCode native `/pipeline` command markdown (#861).
+ * Render the OpenCode LLM-mediated `/pipeline` command markdown (#861).
  * Embeds absolute bridge + launcher paths under the same opencodeBase as the skill tree.
  * Does NOT embed the full SKILL.md instructional body — version path stays short.
  *
@@ -879,7 +992,7 @@ function renderOpenCodePipelineCommand(skillDir) {
 }
 
 /**
- * Install OpenCode native `/pipeline` command at <opencodeBase>/commands/pipeline.md.
+ * Install OpenCode's LLM-mediated `/pipeline` command at <opencodeBase>/commands/pipeline.md.
  * Exported for unit tests.
  */
 function installOpenCodeCommands(opencodeBaseDir, dryRun) {
@@ -1139,15 +1252,28 @@ function installHost(host, dryRun) {
   const dest = join(skillsDir, "pipeline");
   log(`→ ${cfg.label}: ${dest}`);
   if (dryRun) {
-    log(`  (dry-run) would stage core + ${host} overlay, swap atomically, then npm ci in core/`);
+    log(`  (dry-run) would stage core + ${host} overlay, publish the complete tree, then npm ci in core/`);
     installCommandsForHost(host, dest, true);
     return;
   }
   mkdirSync(skillsDir, { recursive: true });
-  // Atomic staging: build a temp tree as a sibling of dest, then swap.
+  const prewarmNpm = which("npm");
+  const dependencyLockToken = `${process.pid} installer-${process.hrtime.bigint().toString(16)}`;
+  // Complete-tree staging: build a temp sibling before replacing dest.
   const staging = mkdtempSync(join(skillsDir, ".pipeline-staging-"));
   try {
     stageInto(staging, host);
+    if (prewarmNpm) {
+      // Publish marker + owner with the staged core. A launcher can observe
+      // neither before the rename and both after it, so fresh-install prewarm
+      // cannot race the launcher's first-run self-heal.
+      const stagedCoreDir = join(staging, "core");
+      writeFileSync(join(stagedCoreDir, ".pipeline-dependencies-incomplete"), "");
+      writeFileSync(
+        join(stagedCoreDir, ".pipeline-dependencies-installing.lock"),
+        dependencyLockToken,
+      );
+    }
     if (existsSync(dest)) rmSync(dest, { recursive: true, force: true });
     renameSync(staging, dest);
   } catch (err) {
@@ -1156,16 +1282,60 @@ function installHost(host, dryRun) {
   }
   // Pre-warm dependencies so the first invocation is instant (the shim also
   // self-heals if this is skipped or fails).
-  if (which("npm")) {
-    const ci = spawnSync("npm", ["ci", "--omit=dev", "--no-audit", "--no-fund"], {
-      cwd: join(dest, "core"),
-      stdio: "inherit",
-    });
-    if ((ci.status ?? 1) !== 0) {
-      warn(`npm ci failed in ${join(dest, "core")} — deps will install on first run instead.`);
+  const coreDir = join(dest, "core");
+  const nodeModulesDir = join(coreDir, "node_modules");
+  const incompleteDepsMarker = join(coreDir, ".pipeline-dependencies-incomplete");
+  const dependencyLockPath = join(coreDir, ".pipeline-dependencies-installing.lock");
+  if (prewarmNpm) {
+    try {
+      let ci;
+      try {
+        ci = spawnSync("npm", ["ci", "--omit=dev", "--no-audit", "--no-fund"], {
+          cwd: coreDir,
+          stdio: "inherit",
+        });
+      } catch (err) {
+        ci = { status: 1 };
+        warn(`Could not start npm ci in ${coreDir}: ${err.message}`);
+      }
+      if ((ci.status ?? 1) !== 0) {
+        try {
+          rmSync(nodeModulesDir, { recursive: true, force: true });
+        } catch (err) {
+          warn(
+            `Could not remove partial dependencies at ${nodeModulesDir}: ${err.message}. ` +
+              "The install remains marked incomplete so the launcher retries.",
+          );
+        }
+        warn(
+          `npm ci failed in ${coreDir} — deps will install on the first non-version launcher invocation instead.`,
+        );
+      } else {
+        try {
+          unlinkSync(incompleteDepsMarker);
+        } catch (err) {
+          warn(
+            `Could not clear the incomplete-dependencies marker at ${incompleteDepsMarker}: ` +
+              `${err.message}. The launcher will verify dependencies on its next invocation.`,
+          );
+        }
+      }
+    } finally {
+      try {
+        if (readFileSync(dependencyLockPath, "utf8") === dependencyLockToken) {
+          unlinkSync(dependencyLockPath);
+        }
+      } catch (err) {
+        if (err.code !== "ENOENT") {
+          warn(
+            `Could not release dependency install lock at ${dependencyLockPath}: ${err.message}. ` +
+              "After this installer exits, confirm no npm ci child remains, then remove that exact lock and retry, or reinstall.",
+          );
+        }
+      }
     }
   } else {
-    warn("npm not found — dependencies will install on first run.");
+    warn("npm not found — dependencies will install on the first non-version launcher invocation.");
   }
   // Managed command surface from install profile commandsKind (#784).
   installCommandsForHost(host, dest, false);
@@ -1177,7 +1347,7 @@ function uninstallHost(host, dryRun) {
   const dest = join(cfg.skillsDir(), "pipeline");
   const skillPresent = pathPresent(dest);
 
-  // Hosts with an external command dir (OpenCode native / leftover Claude
+  // Hosts with an external command dir (OpenCode LLM-mediated / leftover Claude
   // pipeline:*.md / OMP native): always attempt command cleanup even when the
   // skill tree is already gone.
   if (hostHasExternalCommandCleanup(cfg)) {
@@ -1613,37 +1783,40 @@ async function main() {
     const loopCheck = await checkLoopCoherence();
     if (!loopCheck.ok) fail(loopCheck.message);
 
-    // Live-run deferral (#450): only guards a host that already has an
-    // installed core — a first install onto a fresh host has nothing to race.
-    // Skipped under --dry-run, which never copies a file anyway.
-    const anyExistingInstall =
-      !dryRun && hosts.some((h) => existsSync(join(HOSTS[h].skillsDir(), "pipeline")));
+    // Serialize every mutating installer before checking whether a destination
+    // exists. This lock is separate from UPDATE_LOCK_PATH so a first launcher
+    // can wait on installer-owned dependency provisioning.
+    const installerOperationToken = dryRun ? null : beginInstallerOperation();
     let holdingUpdateLock = false;
-    if (anyExistingInstall) {
-      if (!acquireUpdateLock()) {
-        fail("Another install/update is already in progress. Retry once it finishes.");
-      }
-      // Pre-copy ownership verification (#450 delta f8bda4a3/cd279865): a
-      // concurrent stale-reclaim can displace a freshly acquired lock. Confirm
-      // the lock still carries our pid BEFORE marking it held — a failed
-      // verification must exit without cleanup releasing a lock now owned by
-      // a different installer (releaseUpdateLock is ownership-guarded too).
-      if (!verifyUpdateLockOwnership()) {
-        fail("Another install/update displaced the update lock. Retry once it finishes.");
-      }
-      holdingUpdateLock = true;
-      const liveLocks = findLiveRunLocks({ internalStartingLockPid });
-      if (liveLocks.length > 0) {
-        if (force) {
-          warn(formatLiveRunMessage(liveLocks, { asWarning: true }));
-        } else {
-          releaseUpdateLock();
-          fail(formatLiveRunMessage(liveLocks, { asWarning: false }));
+    try {
+      // Live-run deferral (#450): only guards a host that already has an
+      // installed core — a first install onto a fresh host has nothing to race.
+      const anyExistingInstall =
+        !dryRun && hosts.some((h) => existsSync(join(HOSTS[h].skillsDir(), "pipeline")));
+      if (anyExistingInstall) {
+        if (!acquireUpdateLock()) {
+          fail("Another install/update is already in progress. Retry once it finishes.");
+        }
+        // A failed verification must not release a lock that may now belong to
+        // another installer. The outer operation lock is exact-token owned.
+        if (!verifyUpdateLockOwnership()) {
+          fail("Another install/update displaced the update lock. Retry once it finishes.");
+        }
+        holdingUpdateLock = true;
+        const liveLocks = findLiveRunLocks({ internalStartingLockPid });
+        if (liveLocks.length > 0) {
+          if (force) {
+            warn(formatLiveRunMessage(liveLocks, { asWarning: true }));
+          } else {
+            fail(formatLiveRunMessage(liveLocks, { asWarning: false }));
+          }
+        }
+        const dependencyLocks = findDependencyInstallLocks(hosts);
+        if (dependencyLocks.length > 0) {
+          fail(formatDependencyInstallLockRefusal(dependencyLocks));
         }
       }
-    }
 
-    try {
       log(`Installing agent-pipeline → [${hosts.join(", ")}]${dryRun ? " (dry-run)" : ""}\n`);
       for (const h of hosts) {
         // Tree-mode hosts overwrite skillsDir/pipeline; protect unmanaged personal
@@ -1666,6 +1839,7 @@ async function main() {
       }
     } finally {
       if (holdingUpdateLock) releaseUpdateLock();
+      if (installerOperationToken) endInstallerOperation(installerOperationToken);
     }
 
     // Dependency-prompting phase: run after core install, never blocks completion.
@@ -1682,9 +1856,36 @@ async function main() {
 
     log("\nDone.");
   } else if (verb === "uninstall") {
-    log(`Uninstalling agent-pipeline ← [${hosts.join(", ")}]${dryRun ? " (dry-run)" : ""}\n`);
-    for (const h of hosts) uninstallHost(h, dryRun);
-    log("\nDone.");
+    const installerOperationToken = dryRun ? null : beginInstallerOperation();
+    let holdingUpdateLock = false;
+    try {
+      const anyExistingInstall =
+        !dryRun && hosts.some((h) => pathPresent(join(HOSTS[h].skillsDir(), "pipeline")));
+      if (anyExistingInstall) {
+        if (!acquireUpdateLock()) {
+          fail("Another install/update is already in progress. Retry once it finishes.");
+        }
+        if (!verifyUpdateLockOwnership()) {
+          fail("Another install/update displaced the update lock. Retry once it finishes.");
+        }
+        holdingUpdateLock = true;
+        const liveLocks = findLiveRunLocks({ internalStartingLockPid });
+        if (liveLocks.length > 0) {
+          fail(formatLiveRunMessage(liveLocks, { asWarning: false }));
+        }
+        const dependencyLocks = findDependencyInstallLocks(hosts);
+        if (dependencyLocks.length > 0) {
+          fail(formatDependencyInstallLockRefusal(dependencyLocks));
+        }
+      }
+
+      log(`Uninstalling agent-pipeline ← [${hosts.join(", ")}]${dryRun ? " (dry-run)" : ""}\n`);
+      for (const h of hosts) uninstallHost(h, dryRun);
+      log("\nDone.");
+    } finally {
+      if (holdingUpdateLock) releaseUpdateLock();
+      if (installerOperationToken) endInstallerOperation(installerOperationToken);
+    }
   } else {
     fail(`Unknown command '${verb}'. Use install, update, or uninstall.`);
   }
@@ -1748,5 +1949,9 @@ function _isMain() {
   }
 }
 if (_isMain()) {
-  main().catch((err) => { console.error(err); process.exit(1); });
+  main().catch((err) => {
+    if (err instanceof InstallFailure) console.error(`✗ ${err.message}`);
+    else console.error(err);
+    process.exitCode = 1;
+  });
 }

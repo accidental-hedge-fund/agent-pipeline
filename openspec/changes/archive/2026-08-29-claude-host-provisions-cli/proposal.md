@@ -6,7 +6,7 @@ This is v1.40.0 packaging class law under #1046: #1047 completed via PR #1304, t
 
 ## What Changes
 
-- **CLI install for Claude.** `install --host claude` SHALL stage the launcher, repository `core/` payload, current-main Node resolver, and Claude SKILL overlay as one install tree. It SHALL attempt `npm ci --omit=dev --no-audit --no-fund` as a best-effort dependency prewarm. Missing `npm` or a non-zero prewarm SHALL warn without failing installation. A failed prewarm SHALL leave dependencies retryable; the first non-version launcher invocation SHALL retry and SHALL fail visibly with manual `npm ci` remediation if that retry fails. Short SKILL prose remains #1049's downstream scope.
+- **CLI install for Claude.** `install --host claude` SHALL stage the launcher, repository `core/` payload, current-main Node resolver, and Claude SKILL overlay as one install tree. It SHALL attempt `npm ci --omit=dev --no-audit --no-fund` as a best-effort dependency prewarm. Missing `npm` or a non-zero prewarm SHALL warn without failing installation. A failed prewarm SHALL leave dependencies retryable; the first non-version launcher invocation SHALL retry and SHALL fail visibly with manual `npm ci` remediation if that retry fails. Concurrent installers SHALL have one tree publisher and prewarm owner without blocking a first launcher from waiting on that owner's core-local lock. Short SKILL prose remains #1049's downstream scope.
 - **No core copy in `plugin/`.** `scripts/build.mjs` SHALL NOT copy `core/scripts` (or any engine source under `core/`) into `plugin/`. **No dual-ship** of the core mirror.
 - **No `/pipeline:*` command pack.** Build and install SHALL NOT generate Claude `pipeline:<verb>.md` files or Codex `pipeline-<verb>.yaml` command agents from `OPERATION_SURFACE`. `OPERATION_SURFACE` remains the verb catalog for docs and the SKILL table. It is not a reason to emit one file per verb.
 - **No marketplace command pack.** The generator SHALL NOT emit a per-verb slash-command tree under `plugin/pipeline/commands/`.
@@ -25,6 +25,8 @@ This is v1.40.0 packaging class law under #1046: #1047 completed via PR #1304, t
 - [ ] `install --host claude` stages the launcher, repository `core/` payload, `scripts/ensure-engines-node.mjs`, and Claude SKILL as one tree, then attempts to prewarm `core/node_modules` (same CLI shape as Codex/Grok).
 - [ ] Missing `npm` or a non-zero install-time `npm ci` warns and exits 0 without discarding the installed tree or leaving partial dependencies classified as ready.
 - [ ] When dependencies are not ready, the first non-version launcher invocation retries the same `npm ci`; success dispatches the original verb, while failure exits non-zero, names the manual command and installed `core/` path, and remains retryable. `--version` stays dependency-free.
+- [ ] Concurrent fresh installers have one publisher and prewarm owner; a competing install or uninstall fails before replacing/removing the tree or starting another `npm ci`.
+- [ ] Abandoned installer or core-local dependency ownership fails closed with exact recovery and is never reclaimed until a surviving npm child has been ruled out.
 - [ ] After either install-time prewarm or a successful first-run retry, the installed launcher dispatches `doctor` and `status <N>` as CLI verbs. Those verbs do not require a generated slash-command tree or `plugin/**/core/scripts/pipeline.ts`.
 - [ ] Codex host install does not write `pipeline-<name>.yaml` command agents from `OPERATION_SURFACE`.
 - [ ] `pipeline doctor`, `pipeline status`, and `pipeline single` still dispatch as CLI keywords with unchanged operator-visible contracts.
@@ -51,6 +53,7 @@ This is v1.40.0 packaging class law under #1046: #1047 completed via PR #1304, t
 - `cli-product-packaging`: Retire #1047's temporary `plugin/`-mirror transition clauses after #1048 lands.
 - `eval-fixture-contract`: Admit exact generated SKILL/catalog outputs only; do not grant a broad plugin-core mirror exception.
 - `generated-cli-reference`: Compare docs freshness to the remaining generated SKILL/catalog freshness gate, not to a core mirror.
+- `gh-pr-diff`: Fail closed when the files-list fallback reports a patch-less zero-line `modified` entry without the mode metadata needed for a complete diff.
 - `launcher-bootstrap`: Keep resolver staging in the installed skill and generated plugin shell without a copied core tree.
 - `monitor-filter-guidance`: Keep host guidance aligned through the generated plugin SKILL overlay, not generated core mirrors.
 - `pipeline-loop-facade`: Preserve durable loop behavior while moving host packaging from per-verb command files to CLI/SKILL guidance.

@@ -233,7 +233,7 @@ export async function reportPapercuts(
 /** Machine-readable marker (#459 review 2, finding 582c19e6) embedded in every
  *  auto-filed issue body by `buildAutoFileBody`. Neither the `[pipeline-improve]`
  *  title prefix (also used by `pipeline improve --apply`) nor the `pipeline:backlog`
- *  label (also applied by `/pipeline:triage` to human-managed issues) alone proves an
+ *  label (also applied by `pipeline triage` to human-managed issues) alone proves an
  *  issue was created by this auto-file path — reconciliation below requires this marker
  *  in the body before treating an issue as a reconciliation candidate, so a human-managed
  *  or otherwise-provenanced `pipeline:backlog` issue is never closed as a dupe or cap

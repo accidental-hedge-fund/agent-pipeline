@@ -5,7 +5,7 @@ description: |
   through a label-driven dev pipeline toward `pipeline:ready-to-deploy`.
   Triggers include phrases like "pipeline issue 419", "push #360 forward",
   "advance this PR through review", "run the pipeline on <issue>", or the
-  `/pipeline` slash command in OpenCode (native command routes to the installed
+  `/pipeline` slash command in OpenCode (the markdown command routes to the installed
   launcher). Do NOT use this skill for: general PR review (use /review), backlog
   triage/cleanup (use /sweep), or deploying a finished item (deployment is out
   of scope — the pipeline stops at ready-to-deploy).
@@ -13,7 +13,7 @@ description: |
 
 # pipeline
 
-OpenCode host overlay for agent-pipeline. The native `/pipeline` command
+OpenCode host overlay for agent-pipeline. The `/pipeline` markdown command
 (installed under OpenCode `commands/pipeline.md`) is an LLM-mediated OpenCode
 markdown template that shell-injects an argv-safe bridge to the skill launcher
 so `/pipeline --version` injects the installed launcher version instead of
@@ -65,7 +65,7 @@ the advance loop never auto-advances from it to `ready-to-deploy`.
 
 ### Merge authority boundary
 
-`/pipeline`, `/pipeline single`, and `/pipeline loop` never invoke merge.
+`/pipeline N`, `/pipeline single`, and `/pipeline loop` never invoke merge.
 `/pipeline merge <pr>`, `/pipeline merge-queue --apply`, `pipeline train --merge`,
 and `pipeline ship --milestone` are loop-isolated, operator-authorized surfaces.
 `merge-queue` is dry-run by default. `pipeline ship --milestone` does not
@@ -81,8 +81,9 @@ profile, Grok planning, implementation, and fixes use only `grok-4.6`, with no G
 
 ## Modes
 
-The primary invocation is the advance loop; all other operations are available as
-distinct `pipeline:<command>` entries in the skill/command menu.
+The primary invocation is the single `/pipeline` markdown command. It forwards
+its argument string to the CLI operations cataloged below; there are no
+per-verb skill or command-menu entries.
 
 <!-- BEGIN GENERATED: cli-command-table -->
 ```
@@ -115,7 +116,7 @@ distinct `pipeline:<command>` entries in the skill/command menu.
 /pipeline logs [<run-id>] [--events] [-f] [--no-until-terminal] List or stream pipeline run logs (events --follow exits 0 on terminal run_complete)
 /pipeline report [--yes]                        Privacy-safe product-fault report preview/submit (optional; off by default in config)
 /pipeline scoreboard [--bucket day|week] [--by <dim>] [--html <path>] Print read-only factory throughput/cost/reliability metrics from run artifacts
-/pipeline summary <run-id>                      Print the run evidence bundle for an issue number or exact run-id
+/pipeline summary <issue-number|run-id>         Print the run evidence bundle for an issue number or exact run-id
 /pipeline config schema|validate|sync|repo-map … Config schema, validate, sync scaffold, and repo-map mutations
 /pipeline path [--json]                         Discover installed host skill paths (JSON-friendly for desktop integrators)
 ```
@@ -123,19 +124,19 @@ distinct `pipeline:<command>` entries in the skill/command menu.
 
 **Deprecated flag forms** (still work, emit a one-line deprecation notice to stderr):
 ```
-/pipeline N --status        → use /pipeline:status N
-/pipeline N --summary       → use /pipeline:summary N
-/pipeline N --unblock "…"   → use /pipeline:unblock N "…"
-/pipeline N --override "…"  → use /pipeline:override N "…"
-/pipeline --init            → use /pipeline:init
-/pipeline --cleanup         → use /pipeline:cleanup
+/pipeline N --status        → use pipeline status N
+/pipeline N --summary       → use pipeline summary N
+/pipeline N --unblock "…"   → use pipeline unblock N "…"
+/pipeline N --override "…"  → use pipeline override N "…"
+/pipeline --init            → use pipeline init
+/pipeline --cleanup         → use pipeline cleanup
 ```
 
 The number is auto-detected as an issue or PR via the GitHub API. PRs are
 resolved to their linked closing issue (the pipeline is issue-centric). PRs
 without a `Closes #N` reference are refused with an explanation.
 
-`/pipeline:loop` is the canonical command for a **durable** multi-item run —
+`pipeline loop` is the canonical command for a **durable** multi-item run —
 one that is expected to span sessions or engines. It runs a deterministic,
 read-only preflight in this skill (argument normalization,
 `loop:store-schema-compatibility`, native-`/goal` capability), then drives the
@@ -175,24 +176,24 @@ else) first, then a positive `--help` marker, then a documented version floor
 against `claude --version`. A failure names the detected version, the
 required floor, and the attestation key (#506).
 
-#### Bootstrapping a durable run: native `/goal` then `/pipeline:loop`
+#### Bootstrapping a durable run: native `/goal` then `pipeline loop`
 
 Starting a durable run is an **operator-owned, two-step bootstrap** performed
 inside a Claude Code session:
 
 1. Run `/goal` to enter Claude Code's built-in autonomous mode.
-2. Inside that `/goal` session, invoke `/pipeline:loop …` to start the durable
+2. Inside that `/goal` session, invoke `pipeline loop …` to start the durable
    run.
 
 This skill does **not** detect whether `/goal` is active — the native-`/goal`
 check above only probes the *capability* (attestation, `--help` marker,
 version floor), not live session state. This skill does **not** invoke or
 re-enter `/goal` itself; entering `/goal` is the operator's action, taken
-before `/pipeline:loop` is ever run. And this skill does **not** control the
+before `pipeline loop` is ever run. And this skill does **not** control the
 native `/goal` session's lifecycle: `/goal` is the outer autonomous driver,
-`/pipeline:loop` is the durable workload it runs inside that driver.
+`pipeline loop` is the durable workload it runs inside that driver.
 
-Native completion is likewise a **host/user action**. `/pipeline:loop` reports
+Native completion is likewise a **host/user action**. `pipeline loop` reports
 its own terminal done and reconciliation conditions from the durable loop
 engine (see `--audit` above); ending the native `/goal` session afterward is
 something the operator or Claude Code's `/goal` mode does, not something this
@@ -586,7 +587,10 @@ expands the promoted fixture into an executable cell plan to prove it works
 
 The skill is a Node 24+ TypeScript codebase under
 `~/.config/opencode/skills/pipeline/core/scripts/`, run via native type-stripping (no
-build step). First-ever invocation runs `npm install` automatically.
+build step). The installer attempts a best-effort `npm ci` when dependencies
+are absent. If that prewarm fails, the first non-version launcher invocation
+retries `npm ci` before dispatch; a failed retry exits non-zero with the
+installed `core/` path and manual remediation.
 
 Required:
 - `gh` CLI authenticated against the target repo
@@ -836,7 +840,7 @@ run evidence records outer-host identity separately from adapter treatment.
 | **Claude** (`claude_monitor_push`) | Monitor on material-filtered events; call `PushNotification` on each material one-liner | `hosts/claude/SKILL.md` |
 | **Grok** (`grok_monitor_lines`) | Host `monitor` on the same material-filtered command (each stdout line = chat bubble). **Never** require Claude `PushNotification` | **Grok substitute** below |
 | **Codex** (`codex_chat_status`) | Poll/follow material stream; concise chat/status updates (no Claude-only tools) | `hosts/codex/SKILL.md` |
-| **OpenCode** (`stdout_only`) | Host event follow / chat status updates; native `/pipeline` command runs the launcher | This file |
+| **OpenCode** (`stdout_only`) | Host event follow / chat status updates; the `/pipeline` markdown command injects launcher output | This file |
 
 **Grok substitute** (when this Claude overlay is the installed/symlink path Grok
 loads — first-class `--host grok` is #731): use host **`monitor`** (or
@@ -932,9 +936,9 @@ evidence, and the merge-next-step note that the pipeline does not auto-merge.
 Send one final host notification with the terminal state.
 
 
-### 4b. Orchestration pattern for `/pipeline:loop` (multi-item durable drive/resume)
+### 4b. Orchestration pattern for `pipeline loop` (multi-item durable drive/resume)
 
-Multi-item drive and resume via `/pipeline:loop` is **long-running** (minutes to
+Multi-item drive and resume via `pipeline loop` is **long-running** (minutes to
 hours). It is **not** a seconds-only synchronous command. Do **not** treat it as
 Monitor-free fire-and-forget — follow the same spirit as single-issue advance
 (§4), using the loop event stream.
@@ -1319,7 +1323,7 @@ The final operator summary **must** include (1) the run's **terminal reason**
 explicit confirmation that run-scoped follows were stopped (e.g. **follows
 stopped**).
 
-### 4c. Orchestration pattern for `/pipeline:train`
+### 4c. Orchestration pattern for `pipeline train`
 
 `pipeline train` (with or without `--merge`) is **long-running**. Hosts **must not** scrape unstructured train stdout. The primary notify path is `pipeline logs` piped through the shared material filter — not grepping captured train stdout.
 
@@ -1372,16 +1376,16 @@ Raw engine, CI, and harness stdout stay on the linked wave/advance logs — not 
 - `config sync` — previews/applies a validated `.github/pipeline.yml` scaffold refresh, completes in seconds
 - `config repo-map <add|remove|list>` — mutates/lists `repo_map` entries, completes in seconds
 - `doctor` — deterministic preflight by default (no model calls); opt-in `--harness-smoke` adds cheap runtime smoke, completes in seconds without the flag
-- `/pipeline:loop --audit` — read-only report (stage table) for a durable run; synchronous, no Monitor
-- `/pipeline:loop --resume <run-id> --audit --follow` — read-only stage-progress stream; no run-liveness lock
+- `pipeline loop --audit` — read-only report (stage table) for a durable run; synchronous, no Monitor
+- `pipeline loop --resume <run-id> --audit --follow` — read-only stage-progress stream; no run-liveness lock
 
 Run those synchronously, no Monitor, no background, no host-map notify (except
 follow, which streams until interrupt).
 
-**Not in this list:** multi-item `/pipeline:loop` drive or resume (with or without
+**Not in this list:** multi-item `pipeline loop` drive or resume (with or without
 `--milestone` / issue lists / `--resume`) — those use §4b long-running
 orchestration. Do not apply the seconds-only / no-Monitor rule to drive/resume
-just because `--audit` is fast. **`/pipeline:train`** (with or without `--merge`)
+just because `--audit` is fast. **`pipeline train`** (with or without `--merge`)
 uses §4c: `pipeline logs <train-run-id> --events --follow | material-filter.mjs`.
 
 `--once` still needs the orchestration because a single heavy stage

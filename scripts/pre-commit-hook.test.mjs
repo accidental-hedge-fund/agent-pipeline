@@ -25,15 +25,29 @@ import { spawnSync } from "node:child_process";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const HOOK_SRC = join(REPO_ROOT, ".githooks", "pre-commit");
+const GENERATED_OUTPUTS = [
+  ".claude-plugin/marketplace.json",
+  "plugin/pipeline/.claude-plugin/plugin.json",
+  "plugin/pipeline/skills/pipeline/SKILL.md",
+  "plugin/pipeline/skills/pipeline/scripts/pipeline.mjs",
+  "plugin/pipeline/skills/pipeline/scripts/material-filter.mjs",
+  "plugin/pipeline/skills/pipeline/scripts/ensure-engines-node.mjs",
+];
 
-// Stub build.mjs: drops a marker so a test can detect whether it ran, plus a
-// minimal mirror under the two generated paths the hook is contracted to stage.
+// Stub build.mjs: drops a marker so a test can detect whether it ran, then
+// writes the same six paths as the real generator. It intentionally does not
+// delete plugin/ so the staging-boundary regression can observe unrelated dirt.
 const BUILD_STUB = `import { mkdirSync, writeFileSync } from "node:fs";
-mkdirSync("plugin/pipeline", { recursive: true });
+mkdirSync("plugin/pipeline/.claude-plugin", { recursive: true });
+mkdirSync("plugin/pipeline/skills/pipeline/scripts", { recursive: true });
 mkdirSync(".claude-plugin", { recursive: true });
 writeFileSync("build-ran.marker", "ran\\n");
-writeFileSync("plugin/pipeline/generated.txt", "generated\\n");
 writeFileSync(".claude-plugin/marketplace.json", "{}\\n");
+writeFileSync("plugin/pipeline/.claude-plugin/plugin.json", "{}\\n");
+writeFileSync("plugin/pipeline/skills/pipeline/SKILL.md", "# generated skill\\n");
+writeFileSync("plugin/pipeline/skills/pipeline/scripts/pipeline.mjs", "// generated launcher\\n");
+writeFileSync("plugin/pipeline/skills/pipeline/scripts/material-filter.mjs", "// generated filter\\n");
+writeFileSync("plugin/pipeline/skills/pipeline/scripts/ensure-engines-node.mjs", "// generated resolver\\n");
 `;
 
 const FAILING_BUILD = `process.exit(1);\n`;
@@ -100,8 +114,9 @@ test("core/ edit triggers regeneration and stages the mirror in the same commit"
     assert.ok(existsSync(join(dir, "build-ran.marker")), "build.mjs should have run");
     const files = committedFiles(dir);
     assert.ok(files.includes("core/foo.ts"), "core edit committed");
-    assert.ok(files.includes("plugin/pipeline/generated.txt"), "regenerated SKILL/catalog staged");
-    assert.ok(files.includes(".claude-plugin/marketplace.json"), "marketplace.json staged");
+    for (const generatedPath of GENERATED_OUTPUTS) {
+      assert.ok(files.includes(generatedPath), `${generatedPath} staged`);
+    }
     assert.ok(
       !files.some((f) => /(?:^|\/)core\/scripts\/pipeline\.ts$/.test(f)),
       "hook must not stage a plugin/ core copy as required output",
@@ -115,7 +130,9 @@ test("hosts/claude/ edit also triggers regeneration", () => {
     git(dir, ["commit", "-q", "-m", "edit claude overlay"]);
 
     assert.ok(existsSync(join(dir, "build-ran.marker")), "build.mjs should have run");
-    assert.ok(committedFiles(dir).includes("plugin/pipeline/generated.txt"));
+    assert.ok(
+      committedFiles(dir).includes("plugin/pipeline/skills/pipeline/SKILL.md"),
+    );
   });
 });
 
@@ -150,17 +167,31 @@ test("hook stages only the generated paths, never unrelated working-tree changes
     stage(dir, "core/foo.ts", "export const x = 1;\n");
     // Unrelated, deliberately-unstaged working-tree file present at commit time.
     writeFileSync(join(dir, "unrelated.txt"), "do not stage me\n");
+    const unrelatedPluginPath = "plugin/pipeline/operator-note.txt";
+    mkdirSync(dirname(join(dir, unrelatedPluginPath)), { recursive: true });
+    writeFileSync(join(dir, unrelatedPluginPath), "do not stage plugin dirt\n");
 
     git(dir, ["commit", "-q", "-m", "edit core with a dirty working tree"]);
 
+    const files = committedFiles(dir);
     assert.ok(
-      !committedFiles(dir).includes("unrelated.txt"),
+      !files.includes("unrelated.txt"),
       "hook must not stage unrelated working-tree changes",
     );
+    assert.ok(
+      !files.includes(unrelatedPluginPath),
+      "hook must not stage unrelated plugin/ working-tree changes",
+    );
+    const status = git(dir, ["status", "--porcelain"]);
     assert.match(
-      git(dir, ["status", "--porcelain"]),
+      status,
       /^\?\? unrelated\.txt$/m,
       "unrelated file remains untracked after commit",
+    );
+    assert.match(
+      status,
+      /^\?\? plugin\/pipeline\/operator-note\.txt$/m,
+      "stub leaves unrelated plugin dirt untracked; the hook does not commit it",
     );
   });
 });

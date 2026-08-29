@@ -118,7 +118,7 @@ The `command-registry.ts` module SHALL export `CommandEntry`, `COMMAND_REGISTRY`
 
 ### Requirement: Legacy mode-selecting flags SHALL still work and SHALL emit a single deprecation notice
 
-For one major version, the legacy mode-selecting flag forms — `--status`, `--summary`, `--unblock`, `--override`, `--init`, and `--cleanup` — SHALL continue to perform their existing operation unchanged AND SHALL print exactly one deprecation notice naming the replacement `pipeline <command>` form. The notice SHALL be written to stderr so machine-readable stdout contracts (e.g. `--status --json`) are byte-for-byte unchanged, and the operation's exit code SHALL be unchanged. These flag forms are slated for removal in the next major version; this change SHALL NOT remove them. The `--doctor` preflight-gate flag is a behavior modifier (run preflight, then advance) and SHALL NOT be treated as deprecated.
+For one major version, the legacy mode-selecting flag forms — `--status`, `--summary`, `--unblock`, `--override`, `--init`, and `--cleanup` — SHALL continue to perform their existing operation unchanged AND SHALL print exactly one deprecation notice naming the replacement `pipeline <command>` form. The notice SHALL be written to stderr so machine-readable stdout contracts (e.g. `--status --json`) are byte-for-byte unchanged, and the operation's exit code SHALL be unchanged. `pipeline summary <positive-integer>` SHALL preserve the legacy issue-scoped behavior by selecting the latest summary for that issue (with the same legacy fallback), while a nonnumeric `pipeline summary <run-id>` SHALL retain exact-run selection. These flag forms are slated for removal in the next major version; this change SHALL NOT remove them. The `--doctor` preflight-gate flag is a behavior modifier (run preflight, then advance) and SHALL NOT be treated as deprecated.
 
 #### Scenario: Deprecated flag performs the operation and warns
 
@@ -132,6 +132,12 @@ For one major version, the legacy mode-selecting flag forms — `--status`, `--s
 - **WHEN** the user runs `pipeline 42 --status --json`
 - **THEN** stdout SHALL contain only the same JSON payload as before this change
 - **AND** the deprecation notice SHALL appear on stderr, not stdout
+
+#### Scenario: Direct numeric summary preserves issue-scoped selection
+
+- **WHEN** the user migrates `pipeline 42 --summary` to `pipeline summary 42`
+- **THEN** the CLI SHALL print the most recent summary for issue 42 with the same legacy fallback behavior
+- **AND** it SHALL NOT reinterpret `42` as an exact run-directory id
 
 #### Scenario: The preflight-gate flag is not deprecated
 

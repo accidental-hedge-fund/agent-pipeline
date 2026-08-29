@@ -76,7 +76,7 @@ export const COMMAND_DOCS: Record<string, CommandDoc> = {
   },
   summary: {
     summary: "Print the run evidence bundle for an issue number or exact run-id",
-    usage: "summary <run-id>",
+    usage: "summary <issue-number|run-id>",
     documented: true,
     section: "observability",
   },
