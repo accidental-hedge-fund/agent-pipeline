@@ -76,6 +76,18 @@ import {
   buildPlanReviewPrompt,
   buildPlanRevisionPrompt,
 } from "../prompts/index.ts";
+import {
+  emptyPlanningFactBundle,
+  extractPlanningFactClaims,
+  observePlanningFacts,
+  requiredFactIdentities,
+  requiredFactsChanged,
+  PLANNING_FACTS_CONTRACT_TAG,
+  type PlanningFactBundle,
+  type PlanningFactsDeps,
+  type PlanningFactsObservation,
+} from "../planning-facts.ts";
+import * as fs from "node:fs";
 import { runTestGate } from "../testgate.ts";
 import { runFormatGate, runFormatAndTestGates } from "./format-gate.ts";
 import { makePipelineRunId, withTrailers } from "../traceability.ts";
@@ -336,6 +348,7 @@ export interface PlanningPhaseHooks {
     deps: RunPlanningPhasesDeps,
     contextSnapshot?: string,
     crossRepoContext?: string,
+    planningFacts?: PlanningFactBundle | null,
   ): Promise<
     | {
         ok: true;
@@ -472,6 +485,10 @@ type RunPlanningPhasesDeps = BootstrapWorktreeDeps &
       wtPath: string,
       issueNumber: number,
     ) => Promise<{ present: boolean; description?: string }>;
+    /** Override planning-facts observation. Tests inject counters and fakes. */
+    observePlanningFacts?: typeof observePlanningFacts;
+    /** Seams forwarded into the default observer (trusted blob, spawn, clock). */
+    planningFactsDeps?: PlanningFactsDeps;
   };
 
 interface PlanningLifecycle {
@@ -482,6 +499,75 @@ interface PlanningLifecycle {
 
 function nowIso(): string {
   return new Date().toISOString().replace(/\.\d+Z$/, "Z");
+}
+
+function defaultNoopPlanningFactsObservation(
+  cfg: PipelineConfig,
+): PlanningFactsObservation {
+  return {
+    ok: true,
+    block: false,
+    bundle: emptyPlanningFactBundle(
+      cfg.repo,
+      "",
+      { head: "", tree: "", porcelain: "" },
+      nowIso(),
+    ),
+  };
+}
+
+async function observePlanningFactsForPhase(
+  cfg: PipelineConfig,
+  worktreeDir: string,
+  deps: RunPlanningPhasesDeps,
+  previousIntegrationBaseSha?: string,
+): Promise<PlanningFactsObservation> {
+  if (deps.observePlanningFacts) {
+    return deps.observePlanningFacts({
+      cfg,
+      worktreeDir,
+      deps: {
+        ...deps.planningFactsDeps,
+        previousIntegrationBaseSha,
+      },
+    });
+  }
+  if (!cfg.planning_facts?.providers?.length) {
+    return defaultNoopPlanningFactsObservation(cfg);
+  }
+  return observePlanningFacts({
+    cfg,
+    worktreeDir,
+    deps: {
+      ...deps.planningFactsDeps,
+      previousIntegrationBaseSha,
+    },
+  });
+}
+
+function planningFactsBlockDiagnostic(
+  reason: string,
+  stage: Stage,
+): ReturnType<typeof buildStageDiagnostic> {
+  return buildStageDiagnostic({
+    reasonCode: "workflow-engine-defect",
+    blockerKind: PLANNING_FACTS_CONTRACT_TAG,
+    reason,
+    stage,
+  });
+}
+
+function persistPlanningFactsArtifact(
+  runDir: string | undefined,
+  name: string,
+  payload: unknown,
+): void {
+  if (!runDir) return;
+  try {
+    fs.writeFileSync(path.join(runDir, name), JSON.stringify(payload, null, 2));
+  } catch {
+    /* best-effort */
+  }
 }
 
 async function currentHead(
@@ -638,6 +724,8 @@ export async function runPlanningPhases(
   let specContext: string | undefined;
   let planComment: string;
   let revisedPlan: string;
+  let boundPlanningFacts: PlanningFactBundle | undefined;
+  let lastPlanningFactsBaseSha: string | undefined;
 
   if (resumeImplementing) {
     const existing = await (deps.getOnDiskForIssue ?? getOnDiskForIssue)(cfg, issueNumber);
@@ -721,12 +809,30 @@ export async function runPlanningPhases(
     );
   } else {
     // ---- Author the planning artifact ----
-    const authorResult = await hooks.authorArtifact(cfg, issueNumber, wt, opts, carryForward, pipelineRunId, deps, contextSnapshot, crossRepoContext);
+    const authorFacts = await observePlanningFactsForPhase(cfg, wt.path, deps);
+    if (!authorFacts.ok) {
+      const diagnostic = planningFactsBlockDiagnostic(authorFacts.reason, "planning");
+      await doSetBlocked(cfg, issueNumber, authorFacts.reason, "planning", authorFacts.tag);
+      await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
+      return blockedOutcome(authorFacts.reason, authorFacts.tag, diagnostic);
+    }
+    persistPlanningFactsArtifact(opts.runDir, "planning-fact-bundle.json", authorFacts.bundle);
+    boundPlanningFacts = authorFacts.bundle;
+    lastPlanningFactsBaseSha = authorFacts.bundle.integration_base_sha || undefined;
+    const authorResult = await hooks.authorArtifact(cfg, issueNumber, wt, opts, carryForward, pipelineRunId, deps, contextSnapshot, crossRepoContext, authorFacts.bundle);
     if (!authorResult.ok) {
       await doSetBlocked(cfg, issueNumber, authorResult.reason, "planning", authorResult.tag);
       await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
       return blockedOutcome(authorResult.reason, authorResult.tag, authorResult.diagnostic);
     }
+    const authorClaims = extractPlanningFactClaims(authorResult.planText, authorFacts.bundle);
+    if (!authorClaims.ok) {
+      const diagnostic = planningFactsBlockDiagnostic(authorClaims.reason, "planning");
+      await doSetBlocked(cfg, issueNumber, authorClaims.reason, "planning", authorClaims.tag);
+      await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
+      return blockedOutcome(authorClaims.reason, authorClaims.tag, diagnostic);
+    }
+    persistPlanningFactsArtifact(opts.runDir, "planning-fact-claims.json", authorClaims.claims);
     planText = authorResult.planText;
     // `promptPlanText` is the version passed to review/revision prompts — for OpenSpec
     // the comment includes a decorative header that should not appear in prompts.
@@ -767,7 +873,41 @@ export async function runPlanningPhases(
     }
     preImplStage = "plan-review";
 
-    let reviewPrompt = buildPlanReviewPrompt({ cfg, issueNumber, title, body, plan: promptPlanText, reviewer, implementer: primary, specContext, contextSnapshot });
+    const reviewFacts = await observePlanningFactsForPhase(
+      cfg,
+      wt.path,
+      deps,
+      lastPlanningFactsBaseSha,
+    );
+    if (!reviewFacts.ok) {
+      const diagnostic = planningFactsBlockDiagnostic(reviewFacts.reason, "plan-review");
+      await doSetBlocked(cfg, issueNumber, reviewFacts.reason, "plan-review", reviewFacts.tag);
+      await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
+      return blockedOutcome(reviewFacts.reason, reviewFacts.tag, diagnostic);
+    }
+    persistPlanningFactsArtifact(opts.runDir, "planning-fact-bundle.json", reviewFacts.bundle);
+    lastPlanningFactsBaseSha = reviewFacts.bundle.integration_base_sha || lastPlanningFactsBaseSha;
+    const skipPlanReview = requiredFactsChanged(boundPlanningFacts, reviewFacts.bundle);
+    const identityChangePrevious = skipPlanReview && boundPlanningFacts
+      ? requiredFactIdentities(boundPlanningFacts)
+      : undefined;
+
+    let planReview = "";
+    let reviewPrompt = skipPlanReview
+      ? ""
+      : buildPlanReviewPrompt({
+          cfg,
+          issueNumber,
+          title,
+          body,
+          plan: promptPlanText,
+          reviewer,
+          implementer: primary,
+          specContext,
+          contextSnapshot,
+          planningFacts: reviewFacts.bundle,
+        });
+    if (!skipPlanReview) {
     // #39: same-harness fallback — if the reviewer CLI is unspawnable, the
     // implementing harness reviews the plan, clearly labeled below.
     // OpenSpec hooks supply planReviewCwd=wt.path so the reviewer can inspect
@@ -882,7 +1022,7 @@ export async function runPlanningPhases(
       await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
       return blockedOutcome(reason, "harness-failure", diagnostic);
     }
-    const planReview = reviewResult.stdout.trim();
+    planReview = reviewResult.stdout.trim();
     if (!planReview.includes("## Plan Review Verdict")) {
       const reason = `plan-review output missing required "## Plan Review Verdict" section — the reviewer returned prose instead of a structured verdict`;
       await doSetBlocked(cfg, issueNumber, reason, "plan-review", "needs-human");
@@ -905,6 +1045,10 @@ export async function runPlanningPhases(
       ? `**Reviewer**: ensemble (${ensembleMeta.usable}/${ensembleMeta.size} usable; effective ${planReviewer})`
       : `**Reviewer**: ${planReviewer}`;
     await doPostComment(cfg, issueNumber, `## Plan Review\n\n${planReviewBanner}${reviewerLine}\n**Implementer**: ${primary}\n\n${planReview}${footer(cfg)}`);
+    } else {
+      planReview =
+        "Required planning facts changed since the plan was bound. Skip plan-review on the stale plan and revise against the current engine-observed values.";
+    }
 
     // #26: re-fetch comments so any human feedback left on the posted plan
     // during the reviewer run flows into the revision alongside the reviewer's.
@@ -914,7 +1058,36 @@ export async function runPlanningPhases(
       planComment,
     );
 
-    const revisionPrompt = buildPlanRevisionPrompt({ cfg, issueNumber, title, body, plan: promptPlanText, feedback: planReview, reviewer, implementer: primary, humanFeedback: formatHumanFeedback(humanComments), specContext });
+    const revisionFacts = await observePlanningFactsForPhase(
+      cfg,
+      wt.path,
+      deps,
+      lastPlanningFactsBaseSha,
+    );
+    if (!revisionFacts.ok) {
+      const diagnostic = planningFactsBlockDiagnostic(revisionFacts.reason, "plan-review");
+      await doSetBlocked(cfg, issueNumber, revisionFacts.reason, "plan-review", revisionFacts.tag);
+      await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
+      return blockedOutcome(revisionFacts.reason, revisionFacts.tag, diagnostic);
+    }
+    persistPlanningFactsArtifact(opts.runDir, "planning-fact-bundle.json", revisionFacts.bundle);
+    lastPlanningFactsBaseSha = revisionFacts.bundle.integration_base_sha || lastPlanningFactsBaseSha;
+    const revisionPrompt = buildPlanRevisionPrompt({
+      cfg,
+      issueNumber,
+      title,
+      body,
+      plan: promptPlanText,
+      feedback: planReview,
+      reviewer,
+      implementer: primary,
+      humanFeedback: formatHumanFeedback(humanComments),
+      specContext,
+      planningFacts: revisionFacts.bundle,
+      planningFactIdentityChange: identityChangePrevious
+        ? { previous: identityChangePrevious }
+        : undefined,
+    });
     const invokeRevisionOnce = async (prompt: string) =>
       hooks.invokeRevision
         ? await hooks.invokeRevision(primary, wt, prompt, cfg, opts, deps, issueNumber)
@@ -973,6 +1146,16 @@ export async function runPlanningPhases(
     if (ackRepair.warning) {
       console.warn(`[pipeline] #${issueNumber}: plan-revision warning — ${ackRepair.warning}`);
     }
+
+    const revisionClaims = extractPlanningFactClaims(revisionResult.stdout, revisionFacts.bundle);
+    if (!revisionClaims.ok) {
+      const diagnostic = planningFactsBlockDiagnostic(revisionClaims.reason, "plan-review");
+      await doSetBlocked(cfg, issueNumber, revisionClaims.reason, "plan-review", revisionClaims.tag);
+      await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
+      return blockedOutcome(revisionClaims.reason, revisionClaims.tag, diagnostic);
+    }
+    persistPlanningFactsArtifact(opts.runDir, "planning-fact-claims.json", revisionClaims.claims);
+    boundPlanningFacts = revisionFacts.bundle;
 
     // Re-validate and re-read artifact after revision (OpenSpec re-reads proposal; freeform is a no-op).
     const rv = await hooks.revalidateArtifact(wt, revisionResult.stdout.trim());
@@ -1633,9 +1816,9 @@ async function advanceOpenspec(
  */
 export function makeFreeformPlanningHooks(cfg: PipelineConfig, title: string, body: string): PlanningPhaseHooks {
   return {
-    async authorArtifact(innerCfg, issueNumber, wt, opts, carryForward, _pipelineRunId, deps, contextSnapshot, crossRepoContext) {
+    async authorArtifact(innerCfg, issueNumber, wt, opts, carryForward, _pipelineRunId, deps, contextSnapshot, crossRepoContext, planningFacts) {
       const primary: Harness = innerCfg.harnesses.implementer;
-      const planPrompt = buildPlanningPrompt({ cfg: innerCfg, issueNumber, title, body, carryForward, contextSnapshot, crossRepoContext });
+      const planPrompt = buildPlanningPrompt({ cfg: innerCfg, issueNumber, title, body, carryForward, contextSnapshot, crossRepoContext, planningFacts });
       let planResult: HarnessResult;
       try {
         planResult = await invokePlanStep(primary, wt.path, planPrompt, innerCfg, opts, { invoke: deps.invoke }, { issue: issueNumber, stage: "planning" });
@@ -1718,7 +1901,7 @@ export function makeOpenspecPlanningHooks(
   let changeId = "";
 
   return {
-    async authorArtifact(innerCfg, issueNumber, wt, opts, carryForward, pipelineRunId, deps, contextSnapshot, crossRepoContext) {
+    async authorArtifact(innerCfg, issueNumber, wt, opts, carryForward, pipelineRunId, deps, contextSnapshot, crossRepoContext, planningFacts) {
       const primary: Harness = innerCfg.harnesses.implementer;
       const doGit = deps.gitInWorktree ?? gitInWorktree;
       const isInit = deps.openspecIsInitialized ?? openspec.isInitialized;
@@ -1763,7 +1946,7 @@ export function makeOpenspecPlanningHooks(
 
       const inv = deps.invoke ?? invoke;
       const planModel = opts.model ?? innerCfg.models.planning;
-      const openspecPlanPrompt = buildPlanningOpenspecPrompt({ cfg: innerCfg, issueNumber, title, body, carryForward, contextSnapshot, crossRepoContext, pipelineRunId });
+      const openspecPlanPrompt = buildPlanningOpenspecPrompt({ cfg: innerCfg, issueNumber, title, body, carryForward, contextSnapshot, crossRepoContext, pipelineRunId, planningFacts });
       // External stage executor delegation (#314) — see invokePlanStep's comment;
       // this is the OpenSpec-flow equivalent of the same "planning" call.
       const planResult =

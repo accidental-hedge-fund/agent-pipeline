@@ -270,6 +270,13 @@ export const PORCELAIN_DIRT_SITES: readonly PorcelainDirtSiteEntry[] = [
     notes:
       "Fix afterRound reads porcelain for unpublished-commit timeout consult (#1272); not a product-vs-scratch setBlocked dirt gate",
   },
+  {
+    site_id: "planning-facts",
+    module: "scripts/planning-facts.ts",
+    disposition: "not-porcelain-dirt-gate",
+    notes:
+      "Planning-facts providers require a clean worktree and compare HEAD/tree/porcelain around spawn (#1300). Any dirt is typed planning-facts-provider-contract, not a product-vs-scratch setBlocked gate.",
+  },
 ];
 
 const SITE_BY_MODULE: ReadonlyMap<string, PorcelainDirtSiteEntry> = new Map(

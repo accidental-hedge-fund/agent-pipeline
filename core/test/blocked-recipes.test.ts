@@ -236,6 +236,13 @@ const RECIPE_SNAPSHOTS: Record<(typeof BLOCKER_KINDS)[number], string> = {
     "higher declared ceiling when appropriate, or wait for a follow-up that " +
     "shrinks prompt assembly. Then remove the `blocked` label and re-run " +
     "`$pipeline 7`.",
+  "planning-facts-provider-contract":
+    "A required planning-facts provider failed its contract (timeout, non-zero " +
+    "exit, malformed JSON, mutation, dirty worktree, missing executable, type " +
+    "error, ceiling breach, base-update failure, or malformed claims — see the " +
+    "reason above). This is an engine-owned block, not a human-authority park. " +
+    "Fix the provider script or worktree, remove the `blocked` label, then " +
+    "re-run `$pipeline 7`.",
 };
 
 test("each kind's rendered recipe matches its pinned snapshot", () => {

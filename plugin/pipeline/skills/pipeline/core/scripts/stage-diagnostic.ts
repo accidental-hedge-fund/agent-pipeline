@@ -138,6 +138,9 @@ function mechanicalReasonCodeForKind(kind: BlockerKind): StageDiagnosticReasonCo
       // Mechanical payload/ceiling refusal — not a transient harness crash and
       // not human-authority. Same-payload auto-retry is forbidden (#1054).
       return "capability-refusal";
+    case "planning-facts-provider-contract":
+      // Engine-owned observation/contract failure (#1300). Not human-authority.
+      return "workflow-engine-defect";
     default:
       return assertNever(kind);
   }
