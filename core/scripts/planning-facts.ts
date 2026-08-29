@@ -131,6 +131,8 @@ export interface SpawnProviderRequest {
   env: NodeJS.ProcessEnv;
   shell: false;
   timeoutMs: number;
+  maxStdoutBytes: number;
+  maxStderrBytes: number;
 }
 
 export interface SpawnProviderResult {
@@ -140,6 +142,10 @@ export interface SpawnProviderResult {
   timed_out: boolean;
   duration_ms: number;
   spawn_error?: boolean;
+  /** True when capture stopped at maxStdoutBytes and the provider was terminated. */
+  stdout_exceeded?: boolean;
+  /** True when capture stopped at maxStderrBytes and the provider was terminated. */
+  stderr_exceeded?: boolean;
 }
 
 export interface PlanningFactsDeps {
@@ -238,24 +244,87 @@ function defaultMaterializeTrustedExecutable(bytes: Buffer, basename: string): s
   return dest;
 }
 
-function defaultSpawnProvider(req: SpawnProviderRequest): Promise<SpawnProviderResult> {
+const PROVIDER_KILL_GRACE_MS = 200;
+const PROVIDER_KILL_FOLLOWUP_MS = 200;
+
+function asBuffer(chunk: Buffer | string): Buffer {
+  return Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+}
+
+function appendBounded(current: Buffer, chunk: Buffer, maxBytes: number): { buf: Buffer; exceeded: boolean } {
+  if (maxBytes <= 0) return { buf: Buffer.alloc(0), exceeded: true };
+  if (current.length >= maxBytes) return { buf: current.subarray(0, maxBytes), exceeded: true };
+  const room = maxBytes - current.length;
+  if (chunk.length <= room) return { buf: Buffer.concat([current, chunk]), exceeded: false };
+  return { buf: Buffer.concat([current, chunk.subarray(0, room)]), exceeded: true };
+}
+
+function killProviderProcess(child: ChildProcess, signal: NodeJS.Signals): void {
+  if (child.pid != null && child.pid > 0) {
+    try {
+      process.kill(-child.pid, signal);
+      return;
+    } catch {
+      /* group missing or process is not a group leader */
+    }
+  }
+  try {
+    child.kill(signal);
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * Spawn a planning-facts provider with streaming byte caps and awaited
+ * termination. `spawnImpl` is injectable so tests can drive the real
+ * timeout/ceiling wiring without a live subprocess.
+ */
+export function defaultSpawnProvider(
+  req: SpawnProviderRequest,
+  spawnImpl: typeof spawn = spawn,
+): Promise<SpawnProviderResult> {
   return new Promise((resolve) => {
     const start = Date.now();
     let stdout = Buffer.alloc(0);
     let stderr = Buffer.alloc(0);
+    let stdoutExceeded = false;
+    let stderrExceeded = false;
+    let timedOut = false;
+    let terminating = false;
     let settled = false;
+    let timeoutTimer: NodeJS.Timeout | undefined;
+    let killTimer: NodeJS.Timeout | undefined;
+    let followupTimer: NodeJS.Timeout | undefined;
     const finish = (partial: Omit<SpawnProviderResult, "duration_ms">) => {
       if (settled) return;
       settled = true;
+      clearTimeout(timeoutTimer);
+      clearTimeout(killTimer);
+      clearTimeout(followupTimer);
       resolve({ ...partial, duration_ms: Date.now() - start });
     };
+    const snapshotResult = (extra: {
+      exit_code: number | null;
+      timed_out: boolean;
+      spawn_error?: boolean;
+    }): Omit<SpawnProviderResult, "duration_ms"> => ({
+      exit_code: extra.exit_code,
+      stdout,
+      stderr,
+      timed_out: extra.timed_out,
+      spawn_error: extra.spawn_error,
+      stdout_exceeded: stdoutExceeded,
+      stderr_exceeded: stderrExceeded,
+    });
     let child: ChildProcess;
     try {
-      child = spawn(req.command, req.args, {
+      child = spawnImpl(req.command, req.args, {
         cwd: req.cwd,
         env: req.env,
         shell: false,
         stdio: ["ignore", "pipe", "pipe"],
+        detached: true,
       });
     } catch (err) {
       finish({
@@ -267,50 +336,58 @@ function defaultSpawnProvider(req: SpawnProviderRequest): Promise<SpawnProviderR
       });
       return;
     }
-    child.stdout?.on("data", (chunk: Buffer) => {
-      stdout = Buffer.concat([stdout, chunk]);
-    });
-    child.stderr?.on("data", (chunk: Buffer) => {
-      stderr = Buffer.concat([stderr, chunk]);
-    });
-    const timer = setTimeout(() => {
-      try {
-        child.kill("SIGTERM");
-      } catch {
-        /* ignore */
+    const beginTerminate = (reason: "timeout" | "ceiling") => {
+      if (settled || terminating) return;
+      terminating = true;
+      if (reason === "timeout") timedOut = true;
+      killProviderProcess(child, "SIGTERM");
+      killTimer = setTimeout(() => {
+        killProviderProcess(child, "SIGKILL");
+        followupTimer = setTimeout(() => {
+          try {
+            child.stdout?.destroy?.();
+            child.stderr?.destroy?.();
+          } catch {
+            /* ignore */
+          }
+          finish(snapshotResult({ exit_code: child.exitCode, timed_out: timedOut }));
+        }, PROVIDER_KILL_FOLLOWUP_MS);
+      }, PROVIDER_KILL_GRACE_MS);
+    };
+    const onChunk = (which: "stdout" | "stderr", chunk: Buffer | string) => {
+      if (settled) return;
+      const max = which === "stdout" ? req.maxStdoutBytes : req.maxStderrBytes;
+      const current = which === "stdout" ? stdout : stderr;
+      const already = which === "stdout" ? stdoutExceeded : stderrExceeded;
+      if (already) return;
+      const next = appendBounded(current, asBuffer(chunk), max);
+      if (which === "stdout") {
+        stdout = next.buf;
+        if (next.exceeded) stdoutExceeded = true;
+      } else {
+        stderr = next.buf;
+        if (next.exceeded) stderrExceeded = true;
       }
-      setTimeout(() => {
-        try {
-          child.kill("SIGKILL");
-        } catch {
-          /* ignore */
-        }
-      }, 200).unref?.();
-      finish({
-        exit_code: child.exitCode,
-        stdout,
-        stderr,
-        timed_out: true,
-      });
+      if (next.exceeded) beginTerminate("ceiling");
+    };
+    child.stdout?.on("data", (chunk: Buffer | string) => onChunk("stdout", chunk));
+    child.stderr?.on("data", (chunk: Buffer | string) => onChunk("stderr", chunk));
+    timeoutTimer = setTimeout(() => {
+      beginTerminate("timeout");
     }, req.timeoutMs);
     child.on("error", (err) => {
-      clearTimeout(timer);
       finish({
         exit_code: -1,
         stdout,
-        stderr: Buffer.concat([stderr, Buffer.from(err.message)]),
-        timed_out: false,
+        stderr: Buffer.concat([stderr, Buffer.from(err.message)]).subarray(0, Math.max(req.maxStderrBytes, 0)),
+        timed_out: timedOut,
         spawn_error: true,
+        stdout_exceeded: stdoutExceeded,
+        stderr_exceeded: stderrExceeded,
       });
     });
     child.on("close", (code) => {
-      clearTimeout(timer);
-      finish({
-        exit_code: code,
-        stdout,
-        stderr,
-        timed_out: false,
-      });
+      finish(snapshotResult({ exit_code: code, timed_out: timedOut }));
     });
   });
 }
@@ -740,6 +817,8 @@ export async function observePlanningFacts(
       env,
       shell: false,
       timeoutMs: trustedCfg.timeout_ms,
+      maxStdoutBytes: trustedCfg.max_stdout_bytes,
+      maxStderrBytes: trustedCfg.max_stderr_bytes,
     });
 
     const post = await snapshotFn();
@@ -771,6 +850,28 @@ export async function observePlanningFacts(
           provider_id: provider.id,
           required: false,
           unavailable: { reason: `timeout: exceeded ${trustedCfg.timeout_ms}ms` },
+        });
+      }
+      continue;
+    }
+
+    if (spawned.stdout_exceeded || spawned.stderr_exceeded) {
+      const which = spawned.stdout_exceeded ? "stdout" : "stderr";
+      const limit = spawned.stdout_exceeded ? trustedCfg.max_stdout_bytes : trustedCfg.max_stderr_bytes;
+      if (provider.required) {
+        return fail("ceiling", `${which} exceeded ${limit} bytes`, provider.id, {
+          stdout: truncateUtf8(spawned.stdout, trustedCfg.max_stdout_bytes),
+          stderr: truncateUtf8(spawned.stderr, trustedCfg.max_stderr_bytes),
+          exit_code: spawned.exit_code,
+          duration_ms: spawned.duration_ms,
+        });
+      }
+      for (const id of Object.keys(provider.facts)) {
+        facts.push({
+          id,
+          provider_id: provider.id,
+          required: false,
+          unavailable: { reason: `ceiling: ${which} exceeded ${limit} bytes` },
         });
       }
       continue;

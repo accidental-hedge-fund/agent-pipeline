@@ -14,6 +14,7 @@
 - [x] 2.6 Apply `min(repo, pipeline)` ceilings and verify a repo-lowered timeout fails between the repo value and the pipeline max, and that a repo value above the max is already rejected at config parse (1.1)
 - [x] 2.7 Bind each bundle to `repo_id`, integration-base SHA, worktree HEAD/tree, providers digest, and `observed_at`, and verify two bundles that differ only in `observed_at` do not count as a required-fact change
 - [x] 2.8 Treat required provider failure as a block-before-model outcome and optional failure as `unavailable` records with no reuse of a prior success, and verify both with injected fakes
+- [x] 2.9 Bound stdout/stderr in the spawn stream handlers, terminate the provider when a byte cap is exceeded, wait for process close before resolving timeout or ceiling, and verify injected-spawn regressions for both paths
 
 ## 3. Prompts and claims
 

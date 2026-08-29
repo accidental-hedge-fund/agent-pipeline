@@ -111,6 +111,13 @@ The engine SHALL run a provider only when the planning worktree is clean. It SHA
 - **AND** the worktree SHALL still contain that mutation when the failure is recorded
 - **AND** the engine SHALL NOT run `git reset`, `git checkout --`, or `git clean` to hide it
 
+#### Scenario: Timeout snapshot runs after the provider has exited
+
+- **WHEN** a provider exceeds the effective runtime ceiling
+- **THEN** the engine SHALL wait until the provider process has exited
+- **AND** SHALL take the post-run worktree snapshot only after that exit
+- **AND** SHALL treat a mutation discovered in that snapshot as typed `planning-facts-provider-contract`
+
 #### Scenario: Non-mutating provider succeeds
 
 - **WHEN** a provider exits 0, writes valid JSON, and leaves `HEAD` and porcelain unchanged
@@ -183,11 +190,19 @@ A successful provider SHALL write versioned JSON to stdout. Trusted configuratio
 - **THEN** the provider SHALL fail as typed `planning-facts-provider-contract`
 - **AND** the truncated evidence SHALL be retained
 
+#### Scenario: Byte caps are enforced during capture
+
+- **WHEN** a provider writes more than `max_stdout_bytes` or `max_stderr_bytes` before it exits
+- **THEN** the engine SHALL retain only truncated diagnostic bytes
+- **AND** SHALL terminate the provider once the cap is exceeded
+- **AND** SHALL wait for that process to exit before returning the typed ceiling failure
+
 #### Scenario: Timeout is rejected
 
 - **WHEN** a provider exceeds the effective runtime ceiling
 - **THEN** the provider SHALL fail as typed `planning-facts-provider-contract`
 - **AND** the engine SHALL NOT wait for a later completion as success
+- **AND** the engine SHALL wait for the provider process to exit before taking the post-run worktree snapshot
 
 ### Requirement: Pipeline-owned ceilings SHALL apply and repository configuration SHALL only tighten them
 

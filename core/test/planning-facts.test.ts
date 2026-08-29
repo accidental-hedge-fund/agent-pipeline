@@ -3,6 +3,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -11,6 +12,7 @@ import { DEFAULT_CONFIG, type Outcome, type PipelineConfig } from "../scripts/ty
 import type { HarnessResult } from "../scripts/harness.ts";
 import {
   constructProviderEnv,
+  defaultSpawnProvider,
   digestValue,
   emptyPlanningFactBundle,
   extractPlanningFactClaims,
@@ -436,6 +438,139 @@ test("undeclared key, nested object, extra top-level, timeout, exit, missing exe
       assert.match(observation.reason, new RegExp(c.class), c.name);
       assert.match(observation.reason, /^planning-facts-provider-contract:/, c.name);
     }
+  }
+});
+
+function fakeProviderChild(): EventEmitter & {
+  stdout: EventEmitter;
+  stderr: EventEmitter;
+  pid: number;
+  exitCode: number | null;
+  signals: string[];
+  kill: (signal?: NodeJS.Signals) => boolean;
+} {
+  const child = Object.assign(new EventEmitter(), {
+    stdout: new EventEmitter(),
+    stderr: new EventEmitter(),
+    pid: 999999,
+    exitCode: null as number | null,
+    signals: [] as string[],
+    kill(signal?: NodeJS.Signals) {
+      this.signals.push(signal ?? "SIGTERM");
+      return true;
+    },
+  });
+  return child;
+}
+
+const boundedSpawnReq: SpawnProviderRequest = {
+  command: "/tmp/provider",
+  args: [],
+  cwd: "/wt",
+  env: {},
+  shell: false,
+  timeoutMs: 5_000,
+  maxStdoutBytes: 16,
+  maxStderrBytes: 8,
+};
+
+test("defaultSpawnProvider bounds stdout in the data handler, kills, and waits for close", async () => {
+  const child = fakeProviderChild();
+  let spawnOpts: { detached?: boolean; shell?: boolean } | undefined;
+  const spawnImpl = ((...args: unknown[]) => {
+    spawnOpts = args[2] as { detached?: boolean; shell?: boolean };
+    return child;
+  }) as unknown as typeof import("node:child_process").spawn;
+  const pending = defaultSpawnProvider(boundedSpawnReq, spawnImpl);
+  let resolved: SpawnProviderResult | undefined;
+  void pending.then((r) => {
+    resolved = r;
+  });
+  child.stdout.emit("data", Buffer.alloc(1_000, 0x61));
+  child.stdout.emit("data", Buffer.alloc(1_000, 0x62));
+  await new Promise((r) => setImmediate(r));
+  assert.equal(resolved, undefined, "must not resolve before the provider process closes");
+  assert.equal(spawnOpts?.shell, false);
+  assert.equal(spawnOpts?.detached, true);
+  assert.ok(child.signals.includes("SIGTERM"), `expected SIGTERM, got ${JSON.stringify(child.signals)}`);
+  child.emit("close", 1);
+  const result = await pending;
+  assert.equal(result.stdout.length, 16);
+  assert.equal(result.stdout.equals(Buffer.alloc(16, 0x61)), true);
+  assert.equal(result.stdout_exceeded, true);
+  assert.equal(result.timed_out, false);
+  assert.equal(result.exit_code, 1);
+});
+
+test("defaultSpawnProvider bounds stderr in the data handler", async () => {
+  const child = fakeProviderChild();
+  const spawnImpl = ((..._args: unknown[]) => child) as unknown as typeof import("node:child_process").spawn;
+  const pending = defaultSpawnProvider(boundedSpawnReq, spawnImpl);
+  child.stderr.emit("data", Buffer.alloc(500, 0x62));
+  await new Promise((r) => setImmediate(r));
+  child.emit("close", 1);
+  const result = await pending;
+  assert.equal(result.stderr.length, 8);
+  assert.equal(result.stderr_exceeded, true);
+});
+
+test("defaultSpawnProvider timeout waits for close and does not treat later exit 0 as success", async () => {
+  const child = fakeProviderChild();
+  const spawnImpl = ((..._args: unknown[]) => child) as unknown as typeof import("node:child_process").spawn;
+  const pending = defaultSpawnProvider({ ...boundedSpawnReq, timeoutMs: 20 }, spawnImpl);
+  let resolved: SpawnProviderResult | undefined;
+  void pending.then((r) => {
+    resolved = r;
+  });
+  const waitStart = Date.now();
+  while (!child.signals.includes("SIGTERM") && Date.now() - waitStart < 500) {
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  assert.equal(resolved, undefined, "timeout must not resolve before process close");
+  assert.ok(child.signals.includes("SIGTERM"), `expected SIGTERM on timeout, got ${JSON.stringify(child.signals)}`);
+  child.emit("close", 0);
+  const result = await pending;
+  assert.equal(result.timed_out, true);
+  assert.equal(result.exit_code, 0);
+});
+
+test("spawn request carries effective stdout/stderr byte caps", async () => {
+  let req: SpawnProviderRequest | undefined;
+  await observePlanningFacts({
+    cfg: cfg(),
+    worktreeDir: "/wt",
+    deps: baseDeps({
+      spawnImpl: (r) => {
+        req = r;
+        return successSpawn({ alembic_head: "0074" });
+      },
+    }),
+  });
+  assert.ok(req);
+  assert.equal(req!.maxStdoutBytes, DEFAULT_CONFIG.planning_facts.max_stdout_bytes);
+  assert.equal(req!.maxStderrBytes, DEFAULT_CONFIG.planning_facts.max_stderr_bytes);
+});
+
+test("stdout_exceeded with non-zero exit is ceiling, not exit", async () => {
+  const observation = await observePlanningFacts({
+    cfg: cfg(),
+    worktreeDir: "/wt",
+    deps: baseDeps({
+      spawnImpl: () => ({
+        exit_code: 143,
+        stdout: Buffer.alloc(16, 0x61),
+        stderr: Buffer.alloc(0),
+        timed_out: false,
+        duration_ms: 1,
+        stdout_exceeded: true,
+      }),
+    }),
+  });
+  assert.equal(observation.ok, false);
+  if (!observation.ok) {
+    assert.equal(observation.failureClass, "ceiling");
+    assert.match(observation.reason, /stdout exceeded/);
+    assert.equal(observation.evidence?.stdout?.length, 16);
   }
 });
 
