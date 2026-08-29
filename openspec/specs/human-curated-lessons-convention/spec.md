@@ -64,14 +64,27 @@ No pipeline code path — planning, review, fix, pre-merge, eval, deploy-ready, 
 - **THEN** every stage prompt builder SHALL complete without error
 - **AND** the pipeline SHALL NOT block, skip, or error due to absent conventions content
 
-### Requirement: The conventions / lessons convention SHALL be described in user-facing documentation
+### Requirement: The conventions / lessons convention SHALL be described in durable user-facing documentation
 
-The agent-pipeline README and SKILL.md SHALL include a section documenting: (a) that the pipeline reads the conventions file into every stage prompt, (b) that maintainers MAY add a lessons/gotchas section to carry forward recurring patterns, and (c) that the pipeline never writes to this file.
+The agent-pipeline README and/or linked durable operator documentation SHALL
+explain that Pipeline reads the conventions file into every stage prompt, that
+maintainers MAY add a lessons/gotchas section to carry recurring patterns, and
+that Pipeline never writes the file. Generated short host one-pagers MAY link to
+that documentation; they SHALL NOT be required to copy the conventions and
+lessons tutorial.
 
 #### Scenario: Documentation describes the lessons convention
 
-- **WHEN** a user reads the agent-pipeline README or SKILL.md
-- **THEN** they SHALL find an explanation of the conventions file injection
-- **AND** an explicit note that the file is read-only from the pipeline's perspective
-- **AND** guidance that a lessons / gotchas section is a supported pattern for carry-forward context
+- **WHEN** a user follows the generated one-pager's documentation links or reads
+  the README conventions guidance
+- **THEN** they SHALL find an explanation of conventions-file injection
+- **AND** an explicit note that the file is read-only from Pipeline's perspective
+- **AND** guidance that a lessons/gotchas section is a supported carry-forward
+  pattern
+
+#### Scenario: Generated one-pager does not duplicate the tutorial
+
+- **WHEN** a generated host one-pager is inspected
+- **THEN** it MAY point to the durable conventions documentation
+- **AND** it SHALL NOT be required to contain a conventions-file or lessons essay
 

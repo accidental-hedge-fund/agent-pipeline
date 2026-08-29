@@ -3,120 +3,104 @@
 ## Purpose
 TBD - created by archiving change document-native-goal-bootstrap. Update Purpose after archive.
 ## Requirements
-### Requirement: Host SKILLs SHALL document the operator-owned native `/goal` bootstrap sequence
-
-Each host's operator-facing SKILL documentation SHALL describe the canonical,
-operator-owned bootstrap for starting a durable `pipeline loop` run as an
-explicit, ordered two-step performed by the operator inside the engine's
-built-in autonomous `/goal` mode. On every host, the documented sequence SHALL
-be to enter the host's native goal mode first and then invoke `pipeline loop`
-through the Pipeline SKILL. The documents SHALL present the same ordering and
-meaning without requiring generated per-verb command files.
-
-#### Scenario: Claude host documents native goal mode then pipeline loop
-
-- **WHEN** the Claude host SKILL documentation is read
-- **THEN** it SHALL contain a bootstrap description that instructs the operator to
-  enter the native `/goal` mode and then invoke `pipeline loop` for a durable run
-- **AND** it SHALL present those two steps in that order
-
-#### Scenario: Codex host documents native goal mode then pipeline loop
-
-- **WHEN** the Codex host SKILL documentation is read
-- **THEN** it SHALL contain a bootstrap description that instructs the operator to
-  enter the native goal mode and then invoke `pipeline loop` for a durable run
-- **AND** it SHALL present those two steps in that order
-
-#### Scenario: The two host surfaces stay symmetric
-
-- **WHEN** the Claude and Codex bootstrap descriptions are compared
-- **THEN** they SHALL describe the same ordered two-step bootstrap
-- **AND** both SHALL name the same `pipeline loop` CLI invocation
-
----
-
 ### Requirement: The bootstrap documentation SHALL disclaim host-state detection, recursive invocation, and lifecycle control
 
-The bootstrap documentation on both host surfaces SHALL state explicitly that
-the skill does **not** detect whether the host's native `/goal` mode is active,
-does **not** invoke or re-enter `/goal` itself, and does **not** control the
-native `/goal` session's lifecycle. The documentation SHALL frame the engine's
-`/goal` mode as the outer autonomous driver and `pipeline loop` as the durable
-workload it runs, so no reader concludes the skill manages the session it runs
-inside. The documentation SHALL NOT claim any of those three capabilities in
-any other passage.
+The durable native-goal bootstrap docs SHALL state that the Pipeline skill does not detect whether a host's native goal mode is active, does not invoke or re-enter that mode, and does not control the native goal session's lifecycle. The docs SHALL frame the host's native goal mode as the outer autonomous driver and `pipeline loop` as its durable workload. Generated host SKILLs SHALL point to those docs and SHALL NOT be required to repeat the three disclaimers as an essay.
 
 #### Scenario: Docs deny host `/goal` state detection
 
-- **WHEN** either host's bootstrap documentation is read
-- **THEN** it SHALL state that the skill does not detect the host's native
-  `/goal` session state
+- **WHEN** the bootstrap docs are read
+- **THEN** they SHALL state that the Pipeline skill does not detect whether native goal mode is active
 
 #### Scenario: Docs deny recursive `/goal` invocation
 
-- **WHEN** either host's bootstrap documentation is read
-- **THEN** it SHALL state that the skill does not itself invoke or re-enter the
-  native `/goal` mode
-- **AND** it SHALL place responsibility for entering `/goal` on the operator
+- **WHEN** the bootstrap docs describe startup
+- **THEN** they SHALL state that the skill does not invoke or re-enter native goal mode
+- **AND** they SHALL place responsibility for entering it on the operator
 
 #### Scenario: Docs deny native lifecycle control
 
-- **WHEN** either host's bootstrap documentation is read
-- **THEN** it SHALL state that the skill does not control the native `/goal`
-  session's lifecycle
+- **WHEN** the bootstrap docs describe session ownership
+- **THEN** they SHALL state that the skill does not control the native goal session's lifecycle
+
+#### Scenario: The one-pager delegates the essay
+
+- **WHEN** a generated host SKILL is read
+- **THEN** it SHALL provide a durable link to the bootstrap docs
+- **AND** it SHALL NOT be required to repeat the state-detection, recursion, and lifecycle disclaimers
 
 ---
 
 ### Requirement: The bootstrap documentation SHALL place native completion with the host or operator
 
-The bootstrap documentation SHALL state that native completion of the `/goal`
-session is a host or operator action, taken **after** `pipeline loop` reports
-its own terminal done and reconciliation conditions from the durable loop
-engine. It SHALL make clear that reporting done is the skill's boundary: the
-skill neither ends the native `/goal` session nor merges, consistent with the
-pipeline stopping at `pipeline:ready-to-deploy` and a human owning the merge.
+The durable native-goal bootstrap docs SHALL state that ending the native goal session is a host or operator action taken after `pipeline loop` reports its own terminal and reconciliation conditions. They SHALL make the boundary explicit: the loop observer reports done and stops its run-scoped follows; it neither ends the outer native-goal session nor invokes a merge-capable command. The generated one-pager SHALL preserve the compact observer no-merge rule and SHALL NOT be required to restate the full native-session completion essay.
 
 #### Scenario: Completion is described as a host/user action after reported done
 
-- **WHEN** either host's bootstrap documentation is read
-- **THEN** it SHALL state that the durable run reports its own done and
-  reconciliation conditions
-- **AND** it SHALL state that ending the native `/goal` session afterward is a
-  host or operator action, not something the skill performs
+- **WHEN** the durable loop reports terminal and reconciliation conditions
+- **THEN** the bootstrap docs SHALL place ending the native goal session with the host or operator
+- **AND** they SHALL NOT claim that the Pipeline skill ends that session
 
 #### Scenario: The skill does not merge or end the session at the boundary
 
-- **WHEN** either host's bootstrap documentation is read
-- **THEN** it SHALL state that the skill neither ends the native `/goal` session
-  nor merges once the durable run reports done
+- **WHEN** the durable run reports done
+- **THEN** the bootstrap docs SHALL state that the skill neither ends the native goal session nor merges
+- **AND** any merge-capable next step SHALL remain an explicitly operator-authorized action
+
+#### Scenario: Generated one-pager keeps only the compact boundary
+
+- **WHEN** a generated host SKILL is read
+- **THEN** it SHALL forbid the follower from invoking merge-capable commands
+- **AND** it SHALL point to durable docs for native-session ownership detail
 
 ---
 
-### Requirement: A drift guard SHALL keep the bootstrap documentation correct and host-symmetric
+### Requirement: Durable operator docs SHALL document the operator-owned native `/goal` bootstrap sequence
 
-A co-located test SHALL assert that both host SKILL documents carry the
-bootstrap sequence with the shared `pipeline loop` CLI token and every required
-non-claim and completion-ownership statement. The test SHALL fail if either
-document drops the bootstrap sequence, advertises a generated per-verb command token, or
-omits any required non-claim, so the two operator surfaces cannot silently
-diverge or regress into an over-claim. The test SHALL read the checked-in host
-documentation directly and SHALL NOT perform any network, git, or subprocess
-call.
+`docs/cli.md` and/or `docs/packaging.md` SHALL describe the canonical operator-owned bootstrap for a durable `pipeline loop` run as an ordered two-step: enter the active engine's native goal mode, then invoke `pipeline loop` through the Pipeline SKILL. The generated Claude, Codex, Grok, and OpenCode SKILLs SHALL remain byte-identical one-pagers that list `pipeline loop` in the shared verb table and link to those durable docs; they SHALL NOT be required to repeat a host-specific native-goal essay or emit a generated per-verb command file.
+
+#### Scenario: Claude host documents native goal mode then pipeline loop
+
+- **WHEN** an operator reaches the durable bootstrap docs from the Claude one-pager
+- **THEN** it SHALL instruct the operator to enter the host's native goal mode and then invoke `pipeline loop`
+- **AND** it SHALL present those two steps in that order
+
+#### Scenario: Codex host documents native goal mode then pipeline loop
+
+- **WHEN** an operator reaches the durable bootstrap docs from the Codex one-pager
+- **THEN** the docs SHALL instruct entering native goal mode and then invoking `pipeline loop`
+- **AND** the Codex one-pager SHALL retain the shared loop row and doc pointer without a bootstrap essay
+
+#### Scenario: The two host surfaces stay symmetric
+
+- **WHEN** the generated Claude, Codex, Grok, and OpenCode SKILLs are compared
+- **THEN** they SHALL carry the same `pipeline loop` row and durable doc pointers
+- **AND** they SHALL NOT require `/pipeline:loop`, `$pipeline:loop`, a generated yaml-agent surface, or divergent bootstrap essays
+
+---
+
+### Requirement: A drift guard SHALL keep native-goal bootstrap docs and one-pager pointers correct
+
+A co-located offline test SHALL assert that the durable native-goal bootstrap docs contain the ordered native-goal-then-`pipeline loop` sequence, the three required non-claims, and host/operator completion ownership. Generation freshness SHALL separately ensure that all four committed one-pagers contain the same `pipeline loop` verb-table row and durable doc links. The guard SHALL fail if packaging advertises `/pipeline:loop`, `$pipeline:loop`, or a generated per-verb yaml agent as the bootstrap. It SHALL read checked-in files directly and SHALL make no network, git, or subprocess call.
 
 #### Scenario: Missing or generated-command bootstrap fails the guard
 
-- **WHEN** a host document lacks its bootstrap sequence or advertises `/pipeline:loop`
-  or `$pipeline:loop` instead of `pipeline loop`
-- **THEN** the drift-guard test SHALL fail identifying the offending host surface
+- **WHEN** the checked-in durable docs omit native-goal entry followed by `pipeline loop`, or packaging advertises a generated per-verb bootstrap
+- **THEN** the bootstrap guard SHALL fail and identify the offending checked-in surface
 
 #### Scenario: Dropped non-claim fails the guard
 
-- **WHEN** a host document omits the host-state-detection, recursive-invocation,
-  lifecycle-control, or host-owned-completion statement
-- **THEN** the drift-guard test SHALL fail
+- **WHEN** the durable docs omit state-detection, recursive-invocation, lifecycle-control, or host/operator-completion ownership
+- **THEN** the bootstrap guard SHALL fail
+
+#### Scenario: Stale one-pager link or loop verb fails generation freshness
+
+- **WHEN** a committed generated SKILL lacks the shared `pipeline loop` row or durable doc pointers emitted by `renderHostSkill()`
+- **THEN** the generation-freshness guard SHALL fail without requiring the bootstrap essay in that SKILL
 
 #### Scenario: The guard runs offline through checked-in files
 
-- **WHEN** the drift-guard test executes
-- **THEN** it SHALL read the checked-in host SKILL documents directly
-- **AND** it SHALL make no network, git, or subprocess call
+- **WHEN** the bootstrap guard executes
+- **THEN** it SHALL read checked-in docs and generated output without network, git, or subprocess calls
+- **AND** it SHALL reject `/pipeline:loop`, `$pipeline:loop`, and generated per-verb yaml-agent bootstrap files
+
