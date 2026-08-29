@@ -11,6 +11,7 @@ import {
   defaultFrgPackRoot,
   loadFrgPack,
   type CollectedFrgObservations,
+  type FrgGitHubItemObservation,
   type LoadedFrgPack,
   type VerifiedFrgPackRun,
 } from "./frg-pack-observations.ts";
@@ -199,6 +200,21 @@ export function overlayLedgerStateFromGitHub(
 ): string {
   if (githubReadyToDeployOverlay(opts)) return "ready";
   return ledgerState === "ready" ? "blocked" : ledgerState;
+}
+
+/** Thread collect's live issue/PR/check rows into overlay observations (#1297). */
+export function githubItemObservationsFromLiveIssues(
+  issues: VerifiedFrgPackRun["issues"],
+): Record<string, FrgGitHubItemObservation> {
+  const out: Record<string, FrgGitHubItemObservation> = {};
+  for (const issue of issues) {
+    out[String(issue.issue_number)] = {
+      labels: issue.labels,
+      pr_number: issue.pr.number,
+      checks: issue.pr.checks,
+    };
+  }
+  return out;
 }
 
 /** Prefer the titled pack PR; closed is valid after factory-gate auto-close. */
@@ -556,5 +572,9 @@ export async function defaultCollectHybridV2FromRun(
     probes,
   };
 
-  return collectFrgPackObservations(pack, bundle);
+  const collected = collectFrgPackObservations(pack, bundle);
+  return {
+    ...collected,
+    github_item_observations: githubItemObservationsFromLiveIssues(liveIssues),
+  };
 }

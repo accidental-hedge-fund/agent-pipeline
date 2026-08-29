@@ -41,11 +41,13 @@ import {
   isFrgRequiredLiveScenarioId,
   isPostHybridPilotVersion,
   type CollectedFrgObservations,
+  type FrgGitHubItemObservation,
   type FrgPackProofSource,
   type FrgPackProvenance,
 } from "./frg-pack-observations.ts";
 import {
   defaultCollectHybridV2FromRun,
+  overlayLedgerStateFromGitHub,
   type HybridV2FromRunArgs,
 } from "./frg-hybrid-v2-from-run.ts";
 
@@ -3751,10 +3753,38 @@ export function itemsFromLoopLedger(ledger: LoopLedger): FrgItemInput[] {
       item_id: itemId,
       state,
       blocker_theme: theme,
-      ready_clean: state === "ready" || state === "merged" || state === "released",
+      ready_clean: frgReadyCleanFromState(state),
     });
   }
   return out;
+}
+
+function frgReadyCleanFromState(state: string): boolean {
+  return state === "ready" || state === "merged" || state === "released";
+}
+
+/**
+ * Overlay GitHub ready-to-deploy + bound-PR green checks onto ledger-projected
+ * FRG items. Missing/unbound/unreadable observations keep the ledger row
+ * (fail closed). Pure; no GitHub I/O (#1297).
+ */
+export function projectFrgItemsWithGitHubOverlay(
+  items: readonly FrgItemInput[],
+  observations: Readonly<Record<string, FrgGitHubItemObservation | undefined>>,
+): FrgItemInput[] {
+  return items.map((item) => {
+    const obs = observations[item.item_id];
+    if (!obs || obs.pr_number == null) return { ...item };
+    const state = overlayLedgerStateFromGitHub(item.state, {
+      labels: obs.labels,
+      checks: obs.checks,
+    });
+    return {
+      ...item,
+      state,
+      ready_clean: frgReadyCleanFromState(state),
+    };
+  });
 }
 
 /**
@@ -4196,7 +4226,7 @@ export async function runFactoryGate(
       packSelectorLabel = packLabelFromSelector(contract.selector);
     }
     const ledger = await opts.loadLedger(opts.fromRun);
-    const items = itemsFromLoopLedger(ledger);
+    let items = itemsFromLoopLedger(ledger);
     const notes: string[] = [
       `Projected from durable loop run ${opts.fromRun}`,
       `FRG fixed pack validated: pack_id=${FRG_PACK_MANIFEST.pack_id} selector=${JSON.stringify(contract.selector)}`,
@@ -4244,12 +4274,17 @@ export async function runFactoryGate(
       if (falseHumanAuthorityCount === undefined) {
         falseHumanAuthorityCount = collected.false_human_authority_count;
       }
+      items = projectFrgItemsWithGitHubOverlay(
+        items,
+        collected.github_item_observations ?? {},
+      );
     }
     const stackHonesty = detectEmptyDependsOnStackHonesty(contract, ledger);
     if (stackHonesty) overrides = mergeScenarioOverride(overrides, stackHonesty);
     // Unobserved required scenarios fail overall pass (not release evidence).
-    // Throughput + taxonomy are always computed from the ledger; other pack
-    // scenarios need scenarioOverrides / live observation.
+    // Throughput + taxonomy on --from-run overlay GitHub R2D + bound-PR green
+    // checks over the ledger (#1297). Other pack scenarios need
+    // scenarioOverrides / live observation.
     computeInput = {
       version,
       loop_run_id: opts.fromRun,

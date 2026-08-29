@@ -749,6 +749,13 @@ export interface FrgPackProvenance {
   proofs: Array<{ id: string; source: FrgPackProofSource; artifact_sha256: string }>;
 }
 
+/** Per-item GitHub snapshot for FRG overlay (labels, bound PR, checks on that head). */
+export interface FrgGitHubItemObservation {
+  labels: readonly string[];
+  pr_number: number | null;
+  checks: readonly { conclusion?: string | null }[];
+}
+
 export interface CollectedFrgObservations {
   schema_version: 1;
   scenarios: Array<{
@@ -770,6 +777,11 @@ export interface CollectedFrgObservations {
   }>;
   false_human_authority_count: number;
   pack_provenance: FrgPackProvenance;
+  /**
+   * In-memory overlay input from the same collect fetch (#1297). Not release
+   * evidence. Absent when the caller did not thread live issue/PR/check rows.
+   */
+  github_item_observations?: Record<string, FrgGitHubItemObservation>;
 }
 
 function rejectCallerClaims(value: unknown, field = "FRG verified bundle"): void {

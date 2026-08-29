@@ -35,6 +35,7 @@ import {
   formatEngineClassRateDisplay,
   runFactoryGate,
   itemsFromLoopLedger,
+  projectFrgItemsWithGitHubOverlay,
   detectEmptyDependsOnStackHonesty,
   frgRequiredObservationOverrides,
   frgRequiredCompositionOverrides,
@@ -66,6 +67,14 @@ import {
 } from "../scripts/factory-reliability-gate.ts";
 import type { LoopContract, LoopLedger } from "../scripts/loop/types.ts";
 import { LOOP_CONTRACT_SCHEMA, LOOP_LEDGER_SCHEMA } from "../scripts/loop/types.ts";
+import {
+  collectFrgPackObservations,
+  loadFrgPack,
+  renderFrgPackIssues,
+  type CollectedFrgObservations,
+  type FrgGitHubItemObservation,
+} from "../scripts/frg-pack-observations.ts";
+import { defaultScoreBoundPackLoop } from "../scripts/factory-release-prepare.ts";
 import { presentFrgAttestorCredential } from "../scripts/ship-end-candidate.ts";
 
 /** Minimal full-pack pass scoring input (all scenarios + composition; K met; live loop). */
@@ -1366,6 +1375,298 @@ test("itemsFromLoopLedger projects ready/blocked themes", () => {
   assert.equal(items.length, 2);
   assert.ok(items.some((i) => i.item_id === "10" && i.ready_clean === true));
   assert.ok(items.some((i) => i.item_id === "20" && i.blocker_theme === "workflow-engine-defect"));
+});
+
+const STALE_PACK_SIBLING = "1289";
+const STALE_PACK_ITEM = "1290";
+const STALE_PACK_STOP_TIME = "2026-08-29T19:00:00.000Z";
+
+function staleBlockedPackLedger(): LoopLedger {
+  return {
+    schema: LOOP_LEDGER_SCHEMA,
+    run_id: "loop-15af2f73748bf10e",
+    items: {
+      [STALE_PACK_SIBLING]: { state: "ready", history: [], recovery_attempts: [] },
+      [STALE_PACK_ITEM]: {
+        state: "blocked",
+        blocked_theme: "implementation-ci",
+        history: [],
+        recovery_attempts: [],
+      },
+    },
+    stop: {
+      reason: "recovery_exhausted",
+      time: STALE_PACK_STOP_TIME,
+      item_id: STALE_PACK_ITEM,
+      theme: "implementation-ci",
+    },
+  } as unknown as LoopLedger;
+}
+
+function staleBlockedPackContract(runId = "loop-15af2f73748bf10e"): LoopContract {
+  return {
+    schema: LOOP_CONTRACT_SCHEMA,
+    run_id: runId,
+    selector: { type: "label", value: "factory-gate" },
+    items: [
+      { id: STALE_PACK_SIBLING, depends_on: [], external_depends_on: [] },
+      { id: STALE_PACK_ITEM, depends_on: [], external_depends_on: [] },
+    ],
+  } as unknown as LoopContract;
+}
+
+function r2dGreenObservation(prNumber: number): FrgGitHubItemObservation {
+  return {
+    labels: ["factory-gate", "pipeline:ready-to-deploy"],
+    pr_number: prNumber,
+    checks: [{ conclusion: "success" }],
+  };
+}
+
+async function hybridV2CollectForStaleBlockedPack(
+  observations: Record<string, FrgGitHubItemObservation>,
+): Promise<CollectedFrgObservations> {
+  const pack = await loadFrgPack();
+  const issueNumbers = [Number(STALE_PACK_SIBLING), Number(STALE_PACK_ITEM)];
+  const bundleBase = {
+    schema_version: 1 as const,
+    policy_id: pack.manifest.pilot_policy.id,
+    pack_id: pack.manifest.pack_id,
+    manifest_version: pack.manifest.manifest_version,
+    manifest_sha256: pack.manifest_sha256,
+    release_version: "1.39.6",
+    candidate_git_sha: "a".repeat(40),
+    pack_run_id: "pack-1297",
+    loop_run_id: "loop-15af2f73748bf10e",
+    repository: "owner/repo",
+    base_branch: "main",
+    started_at: "2026-08-29T18:00:00.000Z",
+  };
+  const rendered = renderFrgPackIssues(pack, {
+    release_version: "1.39.6",
+    pack_run_id: "pack-1297",
+  });
+  const collected = collectFrgPackObservations(pack, {
+    ...bundleBase,
+    contract: {
+      artifact_sha256: "b".repeat(64),
+      selector: { type: "label", value: "factory-gate" },
+      issue_numbers: issueNumbers,
+      items: issueNumbers.map((n) => ({ issue_number: n, depends_on: [] })),
+    },
+    ledger: {
+      artifact_sha256: "c".repeat(64),
+      items: issueNumbers.map((n) => ({
+        issue_number: n,
+        state: "ready",
+        advance_run_id: `adv-${n}`,
+        blocked_theme: n === Number(STALE_PACK_ITEM) ? "implementation-ci" : null,
+      })),
+    },
+    events: {
+      artifact_sha256: "d".repeat(64),
+      event_ids: issueNumbers.map((n) => `event:1:item-${n}`),
+      issue_numbers: issueNumbers,
+    },
+    action_evidence: {
+      artifact_sha256: "e".repeat(64),
+      action_ids: issueNumbers.map((n) => `action:1:item-${n}`),
+      issue_numbers: issueNumbers,
+    },
+    issues: rendered.map((issue, index) => {
+      const issueNumber = issueNumbers[index]!;
+      const head = String(index + 1).repeat(40);
+      const files =
+        issue.provenance.template_id === "clean-openspec"
+          ? ["openspec/changes/archive/2026-08-18-x/proposal.md", "openspec/specs/frg/spec.md"]
+          : ["docs/frg-fixture.md"];
+      return {
+        issue_number: issueNumber,
+        issue_node_id: `ISSUE_${issueNumber}`,
+        created_at: `2026-08-29T18:00:0${index}.000Z`,
+        title: issue.title,
+        body: issue.body,
+        labels: [...issue.labels, "pipeline:ready-to-deploy"],
+        template_id: issue.provenance.template_id,
+        template_sha256: issue.provenance.template_sha256,
+        pr: {
+          number: 2100 + index,
+          node_id: `PR_${2100 + index}`,
+          head_sha: head,
+          base_branch: "main",
+          files,
+          checks: [{ id: `CHECK_${issueNumber}`, name: "ci", head_sha: head, conclusion: "success" }],
+        },
+      };
+    }),
+    probes: pack.manifest.pilot_policy.layer_a_probes.map((probe, index) => ({
+      id: probe.id,
+      candidate_git_sha: "a".repeat(40),
+      test_file: probe.test_file,
+      test_name: probe.test_name,
+      command_argv_sha256: "1".repeat(64),
+      stdout_sha256: "2".repeat(64),
+      stderr_sha256: "3".repeat(64),
+      started_at: `2026-08-29T18:01:${String(index).padStart(2, "0")}.000Z`,
+      finished_at: `2026-08-29T18:01:${String(index).padStart(2, "0")}.500Z`,
+    })),
+  });
+  return { ...collected, github_item_observations: observations };
+}
+
+test("itemsFromLoopLedger stays a pure projector on blocked + recovery_exhausted (#1297)", () => {
+  const items = itemsFromLoopLedger(staleBlockedPackLedger());
+  const stale = items.find((i) => i.item_id === STALE_PACK_ITEM);
+  assert.equal(stale?.state, "blocked");
+  assert.equal(stale?.ready_clean, false);
+  const sibling = items.find((i) => i.item_id === STALE_PACK_SIBLING);
+  assert.equal(sibling?.ready_clean, true);
+});
+
+test("projectFrgItemsWithGitHubOverlay promotes blocked to ready_clean on bound R2D + green (#1297)", () => {
+  const overlaid = projectFrgItemsWithGitHubOverlay(itemsFromLoopLedger(staleBlockedPackLedger()), {
+    [STALE_PACK_SIBLING]: r2dGreenObservation(1288),
+    [STALE_PACK_ITEM]: r2dGreenObservation(1292),
+  });
+  assert.equal(overlaid.filter((i) => i.ready_clean).length, 2);
+  assert.equal(overlaid.find((i) => i.item_id === STALE_PACK_ITEM)?.state, "ready");
+});
+
+test("projectFrgItemsWithGitHubOverlay is fail-closed (#1297)", () => {
+  const ledgerItems = itemsFromLoopLedger(staleBlockedPackLedger());
+  const cases: Array<{ name: string; obs: FrgGitHubItemObservation | undefined }> = [
+    {
+      name: "missing R2D label",
+      obs: {
+        labels: ["factory-gate", "pipeline:ready"],
+        pr_number: 1292,
+        checks: [{ conclusion: "success" }],
+      },
+    },
+    {
+      name: "failed checks",
+      obs: {
+        labels: ["pipeline:ready-to-deploy"],
+        pr_number: 1292,
+        checks: [{ conclusion: "failure" }],
+      },
+    },
+    {
+      name: "pending checks",
+      obs: {
+        labels: ["pipeline:ready-to-deploy"],
+        pr_number: 1292,
+        checks: [{ conclusion: "pending" }],
+      },
+    },
+    {
+      name: "absent PR",
+      obs: {
+        labels: ["pipeline:ready-to-deploy"],
+        pr_number: null,
+        checks: [{ conclusion: "success" }],
+      },
+    },
+    {
+      name: "unreadable GitHub",
+      obs: undefined,
+    },
+    {
+      name: "needs-human without R2D",
+      obs: {
+        labels: ["pipeline:needs-human"],
+        pr_number: 1292,
+        checks: [{ conclusion: "success" }],
+      },
+    },
+  ];
+  for (const row of cases) {
+    const observations: Record<string, FrgGitHubItemObservation> = {
+      [STALE_PACK_SIBLING]: r2dGreenObservation(1288),
+    };
+    if (row.obs) observations[STALE_PACK_ITEM] = row.obs;
+    const overlaid = projectFrgItemsWithGitHubOverlay(ledgerItems, observations);
+    assert.equal(
+      overlaid.find((i) => i.item_id === STALE_PACK_ITEM)?.ready_clean,
+      false,
+      row.name,
+    );
+  }
+  const unboundOtherPr = projectFrgItemsWithGitHubOverlay(ledgerItems, {
+    [STALE_PACK_SIBLING]: r2dGreenObservation(1288),
+    "9999": r2dGreenObservation(9999),
+  });
+  assert.equal(unboundOtherPr.find((i) => i.item_id === STALE_PACK_ITEM)?.ready_clean, false);
+});
+
+test("factory-gate --from-run overlays GitHub R2D over recovery_exhausted blocked ledger (#1297)", async () => {
+  const fs = memFs();
+  const ledger = staleBlockedPackLedger();
+  const projected = itemsFromLoopLedger(ledger);
+  assert.equal(projected.filter((i) => i.ready_clean).length, 1);
+  const collected = await hybridV2CollectForStaleBlockedPack({
+    [STALE_PACK_SIBLING]: r2dGreenObservation(1288),
+    [STALE_PACK_ITEM]: r2dGreenObservation(1292),
+  });
+  const result = await runFactoryGate(
+    {
+      version: "1.39.6",
+      repoDir: "/repo",
+      fromRun: "loop-15af2f73748bf10e",
+      loadLedger: async () => ledger,
+      loadContract: async () => staleBlockedPackContract(),
+      collectHybridV2: async () => collected,
+      attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
+      stdout: () => {},
+      stderr: () => {},
+    },
+    fs,
+  );
+  const throughput = result.evidence.scenarios.find((s) => s.id === "clean-item-throughput");
+  assert.equal(result.evidence.scoreboard.ready_clean_count, 2);
+  assert.equal(throughput?.observed, 2);
+  assert.equal(throughput?.threshold, DEFAULT_FRG_THRESHOLDS.min_clean_ready_to_deploy);
+  assert.notEqual(throughput?.observed, 1);
+});
+
+test("defaultScoreBoundPackLoop overlays GitHub R2D over recovery_exhausted blocked ledger (#1297)", async () => {
+  const ledger = staleBlockedPackLedger();
+  const collected = await hybridV2CollectForStaleBlockedPack({
+    [STALE_PACK_SIBLING]: r2dGreenObservation(1288),
+    [STALE_PACK_ITEM]: r2dGreenObservation(1292),
+  });
+  const pack = await loadFrgPack();
+  const scored = await defaultScoreBoundPackLoop({
+    version: "1.39.6",
+    fromRun: "loop-15af2f73748bf10e",
+    repoDir: "/repo",
+    request: {
+      schema_version: 1,
+      kind: "factory_release_prepare_request",
+      action_id: "action-1297",
+      repository: "org/agent-pipeline",
+      base_branch: "main",
+      target_version: "1.39.6",
+      milestone: "v1.39.6",
+      integrated_candidate: { git_sha: "b".repeat(40), version: "1.39.5" },
+      production_pin: { version: "1.39.5", tag: "v1.39.5", git_sha: "c".repeat(40) },
+      frg_manifest: { pack_id: "factory-gate-v1", sha256: "a".repeat(64) },
+    },
+    loop: {
+      loop_run_id: "loop-15af2f73748bf10e",
+      contract_text: JSON.stringify(staleBlockedPackContract()),
+      ledger_text: JSON.stringify(ledger),
+      events_text: "\n",
+      action_evidence_text: "{}\n",
+    },
+    pack,
+    now: () => new Date("2026-08-29T19:00:00.000Z"),
+    collectHybridV2: async () => collected,
+  });
+  const throughput = scored.evidence.scenarios.find((s) => s.id === "clean-item-throughput");
+  assert.equal(scored.evidence.scoreboard.ready_clean_count, 2);
+  assert.equal(throughput?.observed, 2);
+  assert.notEqual(throughput?.observed, 1);
 });
 
 test("detectEmptyDependsOnStackHonesty warns on multi empty-depends_on", () => {

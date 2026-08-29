@@ -50,6 +50,7 @@ import type { LoopRunReadyContext } from "./handoff.ts";
 import {
   observeExternalIdentity,
   reconcile,
+  resumeRecoveryExhaustedTerminalCatchUp,
   transitionItem,
   type ReconcileObserveDeps,
 } from "./reconcile.ts";
@@ -2822,7 +2823,9 @@ export interface DriveSupervisorResult {
  *  4.2) before entering the cycle loop. A resume of `stop.reason = run_fatal`
  *  either supersedes that stop and re-drives valid outstanding items at the
  *  same run id, or throws a distinct refusal (never a silent zero-dispatch
- *  success). The lock is held only while actively driving: it is released in
+ *  success). A resume of `stop.reason = recovery_exhausted` runs a resume-only
+ *  terminal catch-up for verified `ready`/`merged` items and keeps that stop
+ *  as historical evidence (#1297). The lock is held only while actively driving: it is released in
  *  a `finally` once the run reaches a terminal condition (or the drive throws),
  *  so a released-lock resume can proceed on another host/process without a
  *  takeover. `supervisor.json` (the process identity record) is left in place
@@ -2850,6 +2853,12 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
           outcome: "run_fatal_superseded",
           next_action: null,
           progress: "progress",
+        });
+      } else if (attachedLedger.stop?.reason === "recovery_exhausted") {
+        await resumeRecoveryExhaustedTerminalCatchUp(deps.store, deps.observe, {
+          runId: input.runId,
+          token,
+          engine: input.engine,
         });
       }
     }

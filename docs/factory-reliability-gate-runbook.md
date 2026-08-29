@@ -555,6 +555,13 @@ pipeline factory-gate --for 1.30.0 --from-run <loop-run-id> \
   pack manifest (`pack_id=factory-gate-v1`: selector must be label `factory-gate` or milestone
   `factory-gate` / `frg-pack` / `reliability-pack`, and ≥2 items). Unrelated successful loops are
   refused and do not write release evidence.
+- **GitHub ready-to-deploy overlay (#1297):** `--from-run` (and prepare, which scores
+  through that path) counts a pack item as clean-ready when live GitHub shows
+  `pipeline:ready-to-deploy` and the **bound** PR checks are green, even if the
+  durable ledger still says `blocked` with `stop.reason=recovery_exhausted`.
+  Operators do not delete `ledger.stop` to score throughput. Missing GitHub,
+  an unbound PR, pending/failed checks, and `needs-human` without R2D stay
+  not clean-ready. `startLoop` scoring stays ledger-only.
 - **Observation required:** overall `pass: true` requires every **required-live**
   scenario (`clean-item-throughput`, `blocker-taxonomy`,
   `empty-depends-on-stack-honesty`) and the OpenSpec-bearing composition item to
