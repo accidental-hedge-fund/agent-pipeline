@@ -1631,6 +1631,70 @@ test("projectFrgItemsWithGitHubOverlay fail-closes ledger-ready without GitHub (
   assert.equal(unbound.find((i) => i.item_id === STALE_PACK_SIBLING)?.state, "blocked");
 });
 
+test("projectFrgItemsWithGitHubOverlay fail-closes ledger merged and released without GitHub proof (#1297)", () => {
+  const failClosed: Array<{ name: string; obs: FrgGitHubItemObservation | undefined }> = [
+    { name: "missing", obs: undefined },
+    {
+      name: "unbound",
+      obs: {
+        labels: ["factory-gate", "pipeline:ready-to-deploy"],
+        pr_number: null,
+        checks: [{ conclusion: "success" }],
+      },
+    },
+    {
+      name: "non-R2D",
+      obs: {
+        labels: ["factory-gate", "pipeline:ready"],
+        pr_number: 1292,
+        checks: [{ conclusion: "success" }],
+      },
+    },
+    {
+      name: "failed checks",
+      obs: {
+        labels: ["pipeline:ready-to-deploy"],
+        pr_number: 1292,
+        checks: [{ conclusion: "failure" }],
+      },
+    },
+    {
+      name: "pending checks",
+      obs: {
+        labels: ["pipeline:ready-to-deploy"],
+        pr_number: 1292,
+        checks: [{ conclusion: "pending" }],
+      },
+    },
+  ];
+  for (const ledgerState of ["merged", "released"] as const) {
+    const ledgerItems = itemsFromLoopLedger({
+      schema: LOOP_LEDGER_SCHEMA,
+      run_id: "loop-15af2f73748bf10e",
+      items: {
+        [STALE_PACK_ITEM]: { state: ledgerState, history: [], recovery_attempts: [] },
+      },
+    } as unknown as LoopLedger);
+    assert.equal(ledgerItems[0]?.ready_clean, true, `${ledgerState} ledger-only`);
+    for (const row of failClosed) {
+      const observations: Record<string, FrgGitHubItemObservation> = {};
+      if (row.obs) observations[STALE_PACK_ITEM] = row.obs;
+      const overlaid = projectFrgItemsWithGitHubOverlay(ledgerItems, observations);
+      assert.equal(
+        overlaid[0]?.ready_clean,
+        false,
+        `${ledgerState} ${row.name} ready_clean`,
+      );
+      assert.equal(overlaid[0]?.state, "blocked", `${ledgerState} ${row.name} state`);
+    }
+    const proven = projectFrgItemsWithGitHubOverlay(ledgerItems, {
+      [STALE_PACK_ITEM]: r2dGreenObservation(1292),
+    });
+    assert.equal(proven[0]?.ready_clean, true, `${ledgerState} proven ready_clean`);
+    assert.equal(proven[0]?.state, ledgerState, `${ledgerState} proven preserves terminal`);
+  }
+});
+
 test("factory-gate --from-run overlays GitHub R2D over recovery_exhausted blocked ledger (#1297)", async () => {
   const fs = memFs();
   const ledger = staleBlockedPackLedger();

@@ -2,7 +2,7 @@
 
 ### Requirement: FRG from-run throughput SHALL count GitHub ready-to-deploy as clean-ready over a stale blocked ledger
 
-FRG throughput scoring on `factory-gate --from-run` and `factory-release prepare` (which scores through that from-run path) SHALL count a pack item as clean-ready when live GitHub shows `pipeline:ready-to-deploy` and the bound PR checks are all green, even when the durable loop ledger still records that item as `blocked` and even when the run stop is `recovery_exhausted`. The overlay SHALL be the same GitHub ready-to-deploy plus green-checks class that FRG pack collect already uses (`githubReadyToDeployOverlay` / `overlayLedgerStateFromGitHub`). Collect overlay SHALL remain. The overlay SHALL consume injected per-item GitHub observations (labels, bound PR number, checks on that PR's head). `itemsFromLoopLedger` SHALL remain a pure ledger projector and SHALL NOT read GitHub. The factory-gate `startLoop` scoring path SHALL remain ledger-only. Throughput SHALL NOT require a human `ledger.json` edit, a `ledger.stop` delete, or `pipeline unblock` as the ship-end path. Throughput SHALL NOT count `needs-human` as clean-ready. Throughput SHALL still treat an item as not clean-ready when GitHub is not ready-to-deploy, the bound PR is absent, GitHub state is missing or unreadable, or checks are not green.
+FRG throughput scoring on `factory-gate --from-run` and `factory-release prepare` (which scores through that from-run path) SHALL count a pack item as clean-ready when live GitHub shows `pipeline:ready-to-deploy` and the bound PR checks are all green, even when the durable loop ledger still records that item as `blocked` and even when the run stop is `recovery_exhausted`. The overlay SHALL be the same GitHub ready-to-deploy plus green-checks class that FRG pack collect already uses (`githubReadyToDeployOverlay` / `overlayLedgerStateFromGitHub`). Collect overlay SHALL remain. The overlay SHALL consume injected per-item GitHub observations (labels, bound PR number, checks on that PR's head). The from-run projector SHALL decide that class independently of ledger state. When that proof is absent, the overlay SHALL NOT count a ledger `ready`, `merged`, or `released` item as clean-ready: it SHALL clear `ready_clean` and project an ineligible state. When that proof is present, a ledger `merged` or `released` item SHALL stay at that terminal state and count as clean-ready. `itemsFromLoopLedger` SHALL remain a pure ledger projector and SHALL NOT read GitHub. The factory-gate `startLoop` scoring path SHALL remain ledger-only. Throughput SHALL NOT require a human `ledger.json` edit, a `ledger.stop` delete, or `pipeline unblock` as the ship-end path. Throughput SHALL NOT count `needs-human` as clean-ready. Throughput SHALL still treat an item as not clean-ready when GitHub is not ready-to-deploy, the bound PR is absent, GitHub state is missing or unreadable, or checks are not green.
 
 #### Scenario: Sibling single finishes the pack item
 
@@ -53,6 +53,21 @@ FRG throughput scoring on `factory-gate --from-run` and `factory-release prepare
 - **AND** issue, PR, or check observations are missing or unreadable, or there is no bound pack PR
 - **THEN** `clean-item-throughput` SHALL NOT count that item as clean-ready
 - **AND** the overlay SHALL clear `ready_clean` and project an ineligible state
+
+#### Scenario: Missing or invalid GitHub does not count a ledger-merged or ledger-released item as clean-ready
+
+- **WHEN** the durable ledger item is `merged` or `released`
+- **AND** issue, PR, or check observations are missing or unreadable, or there is no bound pack PR, or labels do not include `pipeline:ready-to-deploy`, or bound-PR checks are not green
+- **THEN** `clean-item-throughput` SHALL NOT count that item as clean-ready
+- **AND** the overlay SHALL clear `ready_clean` and project an ineligible state
+
+#### Scenario: Proven GitHub class preserves ledger merged and released
+
+- **WHEN** the durable ledger item is `merged` or `released`
+- **AND** live GitHub labels include `pipeline:ready-to-deploy`
+- **AND** the bound PR checks are all green
+- **THEN** `clean-item-throughput` SHALL count that item as clean-ready
+- **AND** the overlay SHALL preserve the ledger terminal state
 
 #### Scenario: needs-human is not clean-ready
 

@@ -47,7 +47,7 @@ import {
 } from "./frg-pack-observations.ts";
 import {
   defaultCollectHybridV2FromRun,
-  overlayLedgerStateFromGitHub,
+  githubReadyToDeployOverlay,
   type HybridV2FromRunArgs,
 } from "./frg-hybrid-v2-from-run.ts";
 
@@ -3765,9 +3765,12 @@ function frgReadyCleanFromState(state: string): boolean {
 
 /**
  * Overlay GitHub ready-to-deploy + bound-PR green checks onto ledger-projected
- * FRG items. Missing/unbound/unreadable observations fail closed: they do not
- * count as clean-ready, and a ledger-ready row is projected ineligible.
- * Pure; no GitHub I/O (#1297).
+ * FRG items. The live observation proves the class independently of ledger
+ * state. Missing/unbound/unreadable observations, a missing R2D label, or
+ * non-green checks fail closed: they do not count as clean-ready, and every
+ * otherwise-clean ledger state (`ready`, `merged`, `released`) is projected
+ * ineligible. Terminal merged/released is preserved only when the observation
+ * proves the class. Pure; no GitHub I/O (#1297).
  */
 export function projectFrgItemsWithGitHubOverlay(
   items: readonly FrgItemInput[],
@@ -3775,18 +3778,16 @@ export function projectFrgItemsWithGitHubOverlay(
 ): FrgItemInput[] {
   return items.map((item) => {
     const obs = observations[item.item_id];
-    const state =
-      !obs || obs.pr_number == null
-        ? overlayLedgerStateFromGitHub(item.state, { labels: [], checks: [] })
-        : overlayLedgerStateFromGitHub(item.state, {
-            labels: obs.labels,
-            checks: obs.checks,
-          });
-    return {
-      ...item,
-      state,
-      ready_clean: frgReadyCleanFromState(state),
-    };
+    const provesClass =
+      obs != null &&
+      obs.pr_number != null &&
+      githubReadyToDeployOverlay({ labels: obs.labels, checks: obs.checks });
+    if (!provesClass) {
+      const state = frgReadyCleanFromState(item.state) ? "blocked" : item.state;
+      return { ...item, state, ready_clean: false };
+    }
+    const state = frgReadyCleanFromState(item.state) ? item.state : "ready";
+    return { ...item, state, ready_clean: true };
   });
 }
 
