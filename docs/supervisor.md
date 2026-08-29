@@ -8,10 +8,13 @@ machine, model matrix, or merge authority in chat.
 
 Related:
 
+- [Packaging contract](./packaging.md) (CLI is the product; hosts are shims)
 - [Ship-path autonomy doctrine](./ship-path-autonomy.md) (recovery ladder; false vs real human)
 - [Factory simplification plan](./factory-simplification-plan.md)
 - [CLI reference](./cli.md) (`train`, `single`, `merge`, `status`, `logs`)
 - Examples: [`examples/supervisor/`](../examples/supervisor/)
+
+Merge is operator-authorized. This repository does not ship a grant factory, MessagingPort, or second durable control plane.
 
 ## Goals
 

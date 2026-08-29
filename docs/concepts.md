@@ -1,11 +1,12 @@
 # Concepts & advanced topics
 
-Hand-authored companion to the lean [README](../README.md). For the full **CLI inventory** see [cli.md](cli.md); for **config keys** see [config.md](config.md). This page does not re-list every command or config field.
+Hand-authored companion to the lean [README](../README.md). For the **packaging contract** (CLI is the product; hosts are shims) see [packaging.md](packaging.md). For the full **CLI inventory** see [cli.md](cli.md); for **config keys** see [config.md](config.md). This page does not re-list every command or config field.
 
 A newcomer who completed Prerequisites, Install, and Quickstart in the README has a working setup **without** reading this page. Sections below are optional or advanced unless noted.
 
 ## Contents
 
+- [Packaging contract](packaging.md)
 - [How the two hosts share one core](#how-the-two-hosts-share-one-core)
 - [Onboarding details](#onboarding-details)
 - [Test/build gate](#testbuild-gate-optional-default-on)
@@ -31,7 +32,7 @@ A newcomer who completed Prerequisites, Install, and Quickstart in the README ha
 
 ## How the two hosts share one core
 
-Claude Code (`/pipeline`) and Codex (`$pipeline`) share one TypeScript engine under `core/`. Host-specific packaging lives in `hosts/claude` and `hosts/codex`; the Claude host also feeds the generated `plugin/` marketplace mirror. Dispatch, stages, review policy, and merge posture are identical across hosts — only the invocation token and install profile (who implements vs who reviews by default) differ.
+Hosts (Claude Code `/pipeline`, Codex `$pipeline`, and others) are shims around one TypeScript engine under `core/`. Host-specific packaging lives in `hosts/`. Dispatch, stages, review policy, and merge posture are identical across hosts — only the invocation token and install profile differ. The product is the `pipeline` CLI; see [packaging.md](packaging.md). `plugin/` is a generated mirror of `core/` plus the Claude host overlay. It is transitional until #1050 and is not the distribution product.
 
 ## Onboarding details
 
@@ -297,10 +298,10 @@ Machine-facing helpers (no change to human skill flows):
 | `core/scripts/` | Engine (TypeScript, native type-stripping) |
 | `core/test/` | Unit tests |
 | `hosts/` | Per-host packaging (`claude`, `codex`, …) |
-| `plugin/` | Generated mirror of `core/` + Claude host — do not hand-edit |
-| `scripts/build.mjs` | Generate/check the plugin mirror |
+| `plugin/` | Generated mirror of `core/` + Claude host — transitional until #1050; not the product; do not hand-edit |
+| `scripts/build.mjs` | Generate/check the plugin mirror (CI gate until #1048) |
 | `scripts/generate-docs.mjs` | Generate/check CLI, config, CHANGELOG, SKILL command tables |
-| `docs/` | Operator docs (`cli.md`, `config.md`, `concepts.md`) |
+| `docs/` | Operator docs (`packaging.md`, `cli.md`, `config.md`, `concepts.md`) |
 | `openspec/` | Living specs + in-flight changes |
 | `ROADMAP.md` | Human-readable forward plan (milestones own release plan membership) |
 | `CHANGELOG.md` | Generated release history |

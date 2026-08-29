@@ -7,11 +7,9 @@ review steps must follow.
 
 ## Golden rules (read first)
 
-1. **Edit `core/`, never `plugin/` directly.** `plugin/` is a generated mirror of `core/`
-   (+ `hosts/claude`). After any change under `core/`, regenerate it:
-   `node scripts/build.mjs`, and commit the regenerated `plugin/` in the same change. CI
-   fails the build if the mirror is stale (`node scripts/build.mjs --check`). A core-only
-   commit that forgets the mirror is the single most common wasted review/CI round.
+1. **The product is the `pipeline` CLI plus a short host SKILL.** Hosts are argv
+   wrappers that exec the CLI; do not treat `plugin/` as distribution. Until
+   #1048, `node scripts/build.mjs --check` still applies.
 2. **`npm run ci` must pass before a change is done.** It runs: `ci:core` (`cd core && npm ci
    && npm test`) → `build.mjs --check` (mirror in sync) → `ci:install-smoke` →
    `ci:openspec` (`openspec validate --all` when an `openspec/` directory is present) →
@@ -46,8 +44,11 @@ review steps must follow.
   `profile.ts`, `review-policy.ts`, `stages/*.ts` (one file per stage: planning, review, fix,
   pre_merge, eval, deploy_ready, auto_recover), `prompts/*.md` (templates with `{{placeholders}}`).
 - `core/test/` — co-located `*.test.ts`.
-- `hosts/` — per-host packaging (`claude`, `codex`, `_shared`); the SKILL.md variants live here.
-- `plugin/` — **generated** mirror (do not hand-edit).
+- `hosts/` — per-host packaging (`claude`, `codex`, `_shared`); short SKILL shims that exec the CLI.
+- `plugin/` — generated mirror (transitional until #1050); do not hand-edit.
+  Until #1048, after editing `core/`, run `node scripts/build.mjs` and include
+  the regenerated `plugin/` in the same commit. That is a transitional CI gate,
+  not the product rule.
 - `openspec/` — spec-driven-development specs (`specs/`) and in-flight changes (`changes/`).
 - `scripts/` — `build.mjs` (generate/check the mirror), `install.mjs`, `ci-install-smoke.mjs`.
 
