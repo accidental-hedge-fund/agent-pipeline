@@ -1,5 +1,8 @@
 # Lessons
 
+- Before dispatching any durable backlog item while a milestone train is live, compare exact issue identities and subtract every overlap from this run. The train owns overlapping issues; do not infer safety from separate processes or worktrees.
+- When the operator requires per-issue integration, `pipeline:ready-to-deploy` is not a batching point. Merge that issue through the Pipeline merge gate, prove `main` contains the merge, reconcile the ledger, and only then dispatch a dependent successor.
+
 - A newly filed issue that belongs to the active milestone cannot be left unmilestoned. Assign its release milestone when creating it; do not wait for the operator to correct the omission.
 - When the operator identifies repository `pipeline.yml` as the source of execution policy, do not ask a host-level profile question before establishing whether the configuration explicitly declares the relevant harness roles. Separate a missing-config enforcement change from a host-install change.
 

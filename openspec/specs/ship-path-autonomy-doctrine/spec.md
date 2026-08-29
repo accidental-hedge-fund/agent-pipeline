@@ -142,19 +142,20 @@ Instructions SHALL state that spot-fix-only / path-local-only plans are insuffic
 
 ---
 
-### Requirement: Doctrine presence and preamble injection SHALL be regression-tested with plugin mirror hygiene
+### Requirement: Doctrine presence and preamble injection SHALL be regression-tested with packaging freshness
 
-The change SHALL include unit tests that prove listed prompt builders emit the autonomy marker and critical invariant content. After any `core/` edit for this capability, the generated `plugin/` mirror SHALL be regenerated and committed in the same change so `build.mjs --check` and `npm run ci` pass.
+The change SHALL include unit tests that prove listed prompt builders emit the autonomy marker and critical invariant content. After any `core/` edit for this capability, `node scripts/build.mjs` SHALL run and any changed SKILL/catalog outputs SHALL be committed so `build.mjs --check` and `npm run ci` pass. No `plugin/` copy of `core/scripts/prompts` SHALL be generated.
 
 #### Scenario: CI-facing tests cover preamble injection
 
 - **WHEN** the core unit test suite runs
 - **THEN** at least one test SHALL fail if a listed builder omits the ship-path autonomy version marker
 
-#### Scenario: Plugin mirror stays in sync after core prompt changes
+#### Scenario: Packaging freshness stays green after core prompt changes
 
 - **WHEN** implementation edits files under `core/scripts/prompts/`
-- **THEN** the regenerated `plugin/` mirror for those prompts SHALL be included in the same change
+- **THEN** `node scripts/build.mjs` SHALL run without generating a `plugin/` prompt copy
+- **AND** changed SKILL/catalog outputs, if any, SHALL be included in the same change
 - **AND** `node scripts/build.mjs --check` SHALL pass
 
 ### Requirement: Outer supervisors SHALL reflow parked residuals only via recover-parked CLI

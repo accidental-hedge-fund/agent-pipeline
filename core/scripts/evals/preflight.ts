@@ -77,6 +77,8 @@ export interface StaticPreflightDeps {
   catFile?: (sha: string) => Promise<string | null>;
   /** Run a declared bootstrap command; only called when fixture declares one. */
   runBootstrap?: (command: string) => Promise<{ ok: boolean; error?: string }>;
+  /** Read one repository file at the fixture pin (`git show <sha>:<path>`). */
+  readFileAtCommit?: (sha: string, relPath: string) => Promise<string | null>;
   /** Repo root used for path-token policy (defaults unused when not probing fs). */
   repoDir?: string;
 }
@@ -90,6 +92,24 @@ export async function defaultCatFile(sha: string, repoDir?: string): Promise<str
     const args = repoDir ? ["-C", repoDir, "cat-file", "-t", sha] : ["cat-file", "-t", sha];
     const { stdout } = await execFileAsync("git", args, { timeout: 15_000 });
     return stdout.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+export async function defaultReadFileAtCommit(
+  sha: string,
+  relPath: string,
+  repoDir?: string,
+): Promise<string | null> {
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const execFileAsync = promisify(execFile);
+  try {
+    const object = `${sha}:${relPath}`;
+    const args = repoDir ? ["-C", repoDir, "show", object] : ["show", object];
+    const { stdout } = await execFileAsync("git", args, { timeout: 15_000 });
+    return stdout;
   } catch {
     return null;
   }
@@ -118,24 +138,72 @@ export function findDisallowedTestRootTokens(command: string): string[] {
   return tokens;
 }
 
-/** True when public checks imply the generator-owned plugin mirror must be
- *  regenerable (this repo's `npm run ci` includes `build.mjs --check`). */
-export function publicChecksRequirePluginMirror(publicChecks: string[]): boolean {
+/** Exact generated packaging outputs accepted by fixture boundaries (#1048). */
+export const GENERATED_PACKAGING_OUTPUT_PATHS = [
+  "plugin/pipeline/skills/pipeline/SKILL.md",
+  ".claude-plugin/marketplace.json",
+] as const;
+
+/** True when public checks exercise generated packaging freshness. */
+export function publicChecksRequireGeneratedPackagingOutputs(publicChecks: string[]): boolean {
   return publicChecks.some((c) => {
     const s = c.toLowerCase();
-    return (
-      s.includes("npm run ci") ||
-      s.includes("build.mjs") ||
-      s.includes("docs:check") ||
-      s.includes("generate-docs")
-    );
+    return s.includes("npm run ci") || s.includes("build.mjs");
   });
 }
 
-/** True when allowed_change_paths admits at least one generator-owned plugin path. */
-export function allowsPluginMirrorPaths(allowed: string[] | undefined): boolean {
+/** True when allowed_change_paths names an exact generated packaging output. */
+export function allowsGeneratedPackagingOutput(allowed: string[] | undefined): boolean {
   if (!allowed) return true; // no boundary declared — not our gate
-  return allowed.some((p) => p === "plugin" || p === "plugin/" || p.startsWith("plugin/"));
+  return allowed.some((candidate) =>
+    GENERATED_PACKAGING_OUTPUT_PATHS.some((generated) => candidate === generated),
+  );
+}
+
+/**
+ * Resolve only outputs that the fixture's permitted source edits can actually
+ * make stale at its pinned build implementation. Pre-#1048 pins mirrored a
+ * subset of core/; current pins generate only the SKILL/catalog check surface.
+ */
+export function requiredGeneratedPackagingOutputs(
+  allowed: string[] | undefined,
+  pinnedBuildSource: string | null,
+): string[] {
+  if (!allowed) return [];
+  const required = new Set<string>();
+  const mirrorsCore =
+    pinnedBuildSource?.includes("const CORE_ENTRIES") === true &&
+    pinnedBuildSource.includes("const coreDst");
+  if (mirrorsCore) {
+    for (const source of allowed) {
+      const mirrored =
+        source.startsWith("core/scripts/") ||
+        source.startsWith("core/profiles/") ||
+        source === "core/package.json" ||
+        source === "core/package-lock.json";
+      if (mirrored) {
+        required.add(`plugin/pipeline/skills/pipeline/core/${source.slice("core/".length)}`);
+      }
+    }
+    return [...required];
+  }
+
+  if (
+    allowed.some(
+      (source) =>
+        source.startsWith("hosts/claude/") ||
+        source === "core/scripts/command-registry.ts" ||
+        source === "core/scripts/command-docs.ts" ||
+        source === "core/scripts/docs-generate.ts" ||
+        source === "core/scripts/operation-surface.ts",
+    )
+  ) {
+    required.add("plugin/pipeline/skills/pipeline/SKILL.md");
+  }
+  if (allowed.includes("scripts/build.mjs")) {
+    for (const output of GENERATED_PACKAGING_OUTPUT_PATHS) required.add(output);
+  }
+  return [...required];
 }
 
 /** Static integrity checks for one fixture (no worktree, no model). */
@@ -258,18 +326,29 @@ export async function runStaticFixturePreflight(
     }
   }
 
-  // 3. Generator-owned allowed_change_paths completeness (static approximation).
-  if (
-    publicChecksRequirePluginMirror(fixture.public_checks) &&
-    fixture.allowed_change_paths !== undefined &&
-    !allowsPluginMirrorPaths(fixture.allowed_change_paths)
-  ) {
+  // 3. Exact, pin-aware generator-owned output allowance. A CI command alone
+  // does not imply every core edit changes today's SKILL/catalog outputs.
+  if (publicChecksRequireGeneratedPackagingOutputs(fixture.public_checks)) {
+    const allowed = fixture.allowed_change_paths;
+    const broadPluginAllowance =
+      allowed?.some((candidate) =>
+        ["plugin", "plugin/", "plugin/**", "plugin/**/*"].includes(candidate),
+      ) ?? false;
+    const readPinnedFile =
+      deps.readFileAtCommit ??
+      ((sha: string, relPath: string) => defaultReadFileAtCommit(sha, relPath, deps.repoDir));
+    const pinnedBuildSource = await readPinnedFile(fixture.base_commit, "scripts/build.mjs");
+    const required = requiredGeneratedPackagingOutputs(allowed, pinnedBuildSource);
+    const missing = required.filter((output) => !allowed?.includes(output));
+    if (!broadPluginAllowance && missing.length === 0) return { ok: failures.length === 0, failures };
     failures.push(
       fail(
         fixture.fixture_id,
         "plugin_allowance",
-        `public checks require plugin/ mirror regen but allowed_change_paths omits generator-owned plugin/ paths`,
-        `Add plugin/ (or specific plugin/... paths) to allowed_change_paths on fixture "${fixture.fixture_id}", ` +
+        broadPluginAllowance
+          ? `allowed_change_paths grants a broad plugin/** boundary instead of exact pinned generator outputs`
+          : `allowed_change_paths omits required pinned generator output(s): ${missing.join(", ")}`,
+        `List only the exact generator output path(s) required at base_commit ${fixture.base_commit} on fixture "${fixture.fixture_id}"; ` +
           `or document an explicit corpus exception.`,
       ),
     );

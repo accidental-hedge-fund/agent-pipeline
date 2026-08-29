@@ -935,10 +935,10 @@ test("check eval-command — env-prefixed command fails when the real binary is 
 });
 
 // ---------------------------------------------------------------------------
-// plugin-mirror check (conditional)
+// plugin-mirror check id / packaging-freshness semantics (conditional)
 // ---------------------------------------------------------------------------
 
-test("check plugin-mirror — skips when scripts/build.mjs is absent", async () => {
+test("check plugin-mirror — keeps the public id and skips when scripts/build.mjs is absent", async () => {
   const r = await getCheck(makeConfig(), "plugin-mirror").run(
     fakeDeps({ fsExists: (p) => !p.includes("build.mjs") }),
   );
@@ -952,14 +952,14 @@ test("check plugin-mirror — skips when plugin/ directory is absent", async () 
   assert.equal(r.status, "skip");
 });
 
-test("check plugin-mirror — passes when node scripts/build.mjs --check succeeds", async () => {
+test("check plugin-mirror — passes with packaging-freshness detail when build check succeeds", async () => {
   const r = await getCheck(makeConfig(), "plugin-mirror").run(
     fakeDeps({ execCheck: () => true, fsExists: () => true }),
   );
   assert.equal(r.status, "pass");
 });
 
-test("check plugin-mirror — fails with build.mjs remediation when the mirror is stale", async () => {
+test("check plugin-mirror — fails with build.mjs remediation when generated outputs are stale", async () => {
   const r = await getCheck(makeConfig(), "plugin-mirror").run(
     fakeDeps({ execCheck: () => false, fsExists: () => true }),
   );
@@ -2264,8 +2264,8 @@ test("runPreflight — all checks pass → ok true, no failures", async () => {
 
 test("runPreflight — one failing check with failFast:false runs every check, ok false", async () => {
   // node missing → cli:node fails; everything else passes/skips.
-  // Keep plugin-mirror skipped (build.mjs absent) so only cli:node fails — the
-  // plugin-mirror check also calls execCheck("node", ...) and would otherwise add
+  // Keep plugin-mirror skipped (build.mjs absent) so only cli:node fails — its
+  // packaging-freshness implementation also calls execCheck("node", ...) and would otherwise add
   // a second failure, obscuring the "exactly one failure" assertion.
   const cfg = makeConfig();
   const allChecks = buildPreflightChecks(cfg, FAKE_VERSION, FAKE_INSTALL_ROOT).length;

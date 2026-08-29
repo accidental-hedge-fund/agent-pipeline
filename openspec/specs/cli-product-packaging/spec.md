@@ -74,7 +74,7 @@ The repository root SHALL keep a committed `CONTEXT.md`. That file SHALL define 
 
 ### Requirement: Contributor docs SHALL present install CLI plus short SKILL, not copy core
 
-Contributor-facing packaging docs (at least `docs/packaging.md`, and README Development when it speaks about how the product is consumed) SHALL present the contributor path as installing the `pipeline` CLI plus a short host SKILL that execs that CLI. Those docs SHALL NOT present copying `core/` into a host config tree, or treating the committed `plugin/` directory, as the product distribution. Until issue #1048 and issue #1050 land, those docs MAY name `plugin/` and `build.mjs --check` as a transitional CI gate, not as the product.
+Contributor-facing packaging docs (at least `docs/packaging.md`, and README Development when it speaks about how the product is consumed) SHALL present the contributor path as installing the `pipeline` CLI plus a short host SKILL that execs that CLI. Those docs SHALL NOT present copying `core/` into a committed plugin mirror, or treating the committed `plugin/` directory, as the product distribution. Until issue #1050 removes the remaining plugin shell, docs MAY name its generated SKILL/catalog outputs and `build.mjs --check` freshness gate, but SHALL NOT describe it as a core mirror or as the product.
 
 #### Scenario: Contributor path names CLI plus SKILL
 
@@ -85,33 +85,33 @@ Contributor-facing packaging docs (at least `docs/packaging.md`, and README Deve
 #### Scenario: plugin/ is transitional, not the product
 
 - **WHEN** `docs/packaging.md` mentions `plugin/`
-- **THEN** it SHALL describe `plugin/` as a generated mirror scheduled for deletion in #1050
+- **THEN** it SHALL describe `plugin/` as a generated SKILL/catalog shell scheduled for deletion in #1050
 - **AND** it SHALL NOT describe `plugin/` as the distribution product
 
 ---
 
 ### Requirement: AGENTS.md and CLAUDE.md golden rule 1 SHALL name CLI plus SKILL as the product
 
-Repo-root `AGENTS.md` and `CLAUDE.md` golden rule #1 SHALL state that the product is the `pipeline` CLI plus a short host SKILL. Those files SHALL NOT state “always commit the regenerated `plugin/` core mirror” as the forever packaging rule. Until issue #1048 lands, golden rule #1 or the immediately following sentence SHALL state that `node scripts/build.mjs --check` still applies. `AGENTS.md` and `CLAUDE.md` SHALL stay in sync on this rule.
+Repo-root `AGENTS.md` and `CLAUDE.md` golden rule #1 SHALL state that the product is the `pipeline` CLI plus a short host SKILL. Those files SHALL NOT state “always commit the regenerated `plugin/` core mirror” as the packaging rule. They SHALL describe `node scripts/build.mjs --check` as a generated SKILL/catalog freshness gate. `AGENTS.md` and `CLAUDE.md` SHALL stay in sync on this rule.
 
 #### Scenario: AGENTS.md no longer states the forever mirror rule
 
 - **WHEN** a contributor reads `AGENTS.md` golden rule #1
 - **THEN** the rule SHALL name CLI plus SKILL as the product
 - **AND** it SHALL NOT say always commit `plugin/` as the forever rule
-- **AND** it SHALL state that `build.mjs --check` still applies until #1048
+- **AND** it SHALL state that `build.mjs --check` asserts SKILL/catalog freshness
 
 #### Scenario: CLAUDE.md matches AGENTS.md
 
 - **WHEN** a contributor compares repo-root `CLAUDE.md` golden rule #1 with `AGENTS.md` golden rule #1
 - **THEN** both files SHALL name CLI plus SKILL as the product
-- **AND** both SHALL carry the transitional `build.mjs --check` until #1048 sentence
+- **AND** both SHALL carry the same SKILL/catalog freshness instruction
 
 ---
 
 ### Requirement: openspec/project.md SHALL not claim Claude-plus-Codex-only or forever mirror commit
 
-`openspec/project.md` SHALL describe the product as the `pipeline` CLI with host shims. It SHALL NOT state that the product ships only for Claude Code and Codex. It SHALL NOT state “always commit the regenerated `plugin/`” as the forever packaging rule. Until #1048 it MAY mention `build.mjs --check` as a transitional CI gate.
+`openspec/project.md` SHALL describe the product as the `pipeline` CLI with host shims. It SHALL NOT state that the product ships only for Claude Code and Codex. It SHALL NOT require a regenerated `plugin/` core mirror. It MAY mention `build.mjs --check` only as a generated SKILL/catalog freshness gate.
 
 #### Scenario: project.md is not Claude-plus-Codex-only
 
@@ -147,15 +147,3 @@ Root `README.md` SHALL describe a runnable repository as declaring an implemente
 - **WHEN** a reader opens `docs/supervisor.md`
 - **THEN** the document SHALL contain a relative link to `docs/packaging.md`
 - **AND** it SHALL state that merge is operator-authorized with no grant factory or second control plane
-
----
-
-### Requirement: This slice SHALL not change engine, install, SKILL.md, or plugin/ deletion behavior
-
-This change SHALL be documentation and contributor-convention files only. It SHALL NOT delete `plugin/`. It SHALL NOT rewrite host `SKILL.md` files. It SHALL NOT implement an MCP server. It SHALL NOT change pipeline stage-machine, CLI verb, install, merge, or review-policy behavior.
-
-#### Scenario: plugin/ still exists after this slice
-
-- **WHEN** this change is implemented
-- **THEN** the committed `plugin/` tree SHALL still exist
-- **AND** host `SKILL.md` files SHALL remain unedited by this slice

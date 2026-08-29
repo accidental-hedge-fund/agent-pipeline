@@ -414,8 +414,8 @@ package `@mariozechner/pi-coding-agent`. The deprecated package's own npm notice
 users to the maintained package, so naming it in the pipeline's user-facing guidance would
 install an unmaintained package. This constraint applies to every user-facing occurrence of
 the package name in the executable adapter source (the `missing-cli` message and any
-provenance comment), and SHALL hold identically in both the `core/` source and its
-generated packaged-plugin mirror.
+provenance comment). The repository SHALL NOT require a generated packaged-plugin copy of
+that core adapter source.
 
 The change SHALL be backed by a regression assertion so the user-facing install guidance
 cannot drift back to the deprecated package name. Because the binary name (`pi`) and the
@@ -866,4 +866,3 @@ If product plain text itself exceeds an implemented bound, the pipeline SHALL fa
 - **WHEN** the adapter streams no acknowledgement section in any forwarded product delta
 - **THEN** reconstructed product text SHALL NOT fabricate a `## Feedback Incorporated` section
 - **AND** freeform contract validation SHALL see the true absence
-

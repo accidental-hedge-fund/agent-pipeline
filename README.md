@@ -169,7 +169,7 @@ gh repo clone accidental-hedge-fund/agent-pipeline
 node agent-pipeline/scripts/install.mjs install        # --host claude|codex|grok|opencode|omp|all  (default: all)
 ```
 
-The installer copies the shared core and the right host overlay into `~/.claude/skills/pipeline`, `~/.codex/skills/pipeline`, `~/.config/opencode/skills/pipeline`, and/or `~/.omp/agent/skills/pipeline`, writes a launcher shim, and pre-installs the core's dependencies. It honors `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, and `OPENCODE_CONFIG_DIR` (Claude `/pipeline:*` command files and the OpenCode `/pipeline` command embed the resolved skill path under that config dir). `OPENCODE_CONFIG` (single config **file**) is not used as an install base. OMP always installs under `~/.omp/agent` (no env override; project `.omp` is not installer-managed). If a **personal** skill already exists at the host's skills path without the installer's managed marker, install offers relocation (or auto-relocates in non-TTY) for **Claude, Codex, OpenCode, and OMP** tree hosts so the personal tree is not silently overwritten. **Restart Codex** after a Codex install; Claude picks the skill up live. OpenCode and OMP may need a restart/reload if commands do not appear live.
+The installer copies the shared core and the right host overlay into `~/.claude/skills/pipeline`, `~/.codex/skills/pipeline`, `~/.config/opencode/skills/pipeline`, and/or `~/.omp/agent/skills/pipeline`, writes a launcher shim, and attempts a best-effort dependency prewarm with `npm ci`. If that prewarm fails, the first non-version launcher invocation retries and fails closed with manual remediation if dependencies still cannot be installed. It honors `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, and `OPENCODE_CONFIG_DIR`; the OpenCode `/pipeline` command embeds the resolved skill path under that config dir. Claude and Codex installs do not emit per-verb command files. `OPENCODE_CONFIG` (single config **file**) is not used as an install base. OMP always installs under `~/.omp/agent` (no env override; project `.omp` is not installer-managed). If a **personal** skill already exists at the host's skills path without the installer's managed marker, install offers relocation (or auto-relocates in non-TTY) for **Claude, Codex, OpenCode, and OMP** tree hosts so the personal tree is not silently overwritten. **Restart Codex** after a Codex install; Claude picks the skill up live. OpenCode and OMP may need a restart/reload if commands do not appear live.
 
 ### Optional dependency prompts
 
@@ -201,7 +201,7 @@ Default install locations (override the config base with `OPENCODE_CONFIG_DIR`):
 | Surface | Default path |
 | --- | --- |
 | Skill tree | `~/.config/opencode/skills/pipeline` |
-| Native `/pipeline` command | `~/.config/opencode/commands/pipeline.md` |
+| `/pipeline` markdown command | `~/.config/opencode/commands/pipeline.md` |
 
 The OpenCode `/pipeline` command is an **OpenCode markdown command** (LLM-mediated prompt template — OpenCode does not support pure no-LLM side-effect slash commands). The installer writes a template that **shell-injects** an argv-safe bridge so the installed launcher runs and its stdout is injected into the prompt before the agent turn. For `--version` / `-V`, the inject output equals `node ~/.config/opencode/skills/pipeline/scripts/pipeline.mjs --version` (from `core/package.json` at the install root), and the template instructs the agent to report only that version string without dumping generic skill instructional text.
 
@@ -230,7 +230,7 @@ npx github:accidental-hedge-fund/agent-pipeline uninstall --host all   # or clau
 node scripts/install.mjs uninstall --host all
 ```
 
-Uninstall removes the host skill tree. For Claude it also removes installer-written `pipeline:*.md` command files under the resolved Claude config `commands/` directory (same base as install / `CLAUDE_CONFIG_DIR`); other command files are left alone. For OpenCode it removes the managed skill tree and installer-owned `commands/pipeline.md` only (sibling OpenCode commands are left alone). For OMP it removes the managed skill tree and installer-owned `commands/pipeline/` TypeScript command only (sibling OMP commands are left alone).
+Uninstall removes the host skill tree. For Claude it also removes legacy installer-owned `pipeline:*.md` leftovers under the resolved Claude config `commands/` directory (same base as install / `CLAUDE_CONFIG_DIR`); other command files are left alone. For OpenCode it removes the managed skill tree and installer-owned `commands/pipeline.md` only (sibling OpenCode commands are left alone). For OMP it removes the managed skill tree and installer-owned `commands/pipeline/` TypeScript command only (sibling OMP commands are left alone).
 
 ## Where to go next
 
@@ -246,11 +246,10 @@ Uninstall removes the host skill tree. For Claude it also removes installer-writ
 **Common commands** (see [docs/cli.md](docs/cli.md) for the full inventory):
 
 ```text
-/pipeline N                 # advance issue N (Claude)
-$pipeline N                 # advance issue N (Codex)
-/pipeline:status N          # stage, blocker, PR, last review
-/pipeline:doctor            # deterministic preflight (opt-in --harness-smoke)
-/pipeline:init              # labels + .github/pipeline.yml scaffold
+pipeline N                  # advance issue N
+pipeline status N           # stage, blocker, PR, last review
+pipeline doctor             # deterministic preflight (opt-in --harness-smoke)
+pipeline init               # labels + .github/pipeline.yml scaffold
 /pipeline decompose --epic N            # preview epic → child graph (no writes)
 /pipeline decompose --epic N --apply    # create children + ROADMAP PR (never merges)
 ```
@@ -267,7 +266,7 @@ loop selectors. Then run `pipeline loop --milestone <lane>` on the children.
 
 ```bash
 # From the target repo:
-/pipeline:init              # or: pipeline init
+pipeline init
 # Commit .github/pipeline.yml (edit as needed), then:
 gh issue edit N --add-label "pipeline:ready"
 /pipeline N
@@ -277,13 +276,13 @@ gh issue edit N --add-label "pipeline:ready"
 
 ## Development
 
-Product law (install the `pipeline` CLI plus a short host SKILL; `plugin/` is not the product) is in [docs/packaging.md](docs/packaging.md). Until #1048, `node scripts/build.mjs --check` remains the CI gate for the generated `plugin/` mirror.
+Product law (install the `pipeline` CLI plus a short host SKILL; `plugin/` is not the product) is in [docs/packaging.md](docs/packaging.md).
 
 ```bash
-npm run setup-hooks               # one-time per clone: auto-regenerate plugin/ on core/ commits
+npm run setup-hooks               # one-time per clone: auto-regenerate SKILL/catalog on core/ commits
 cd core && npm ci && npm test     # node --test
-node scripts/build.mjs            # regenerate plugin/ after editing core or the Claude overlay
-node scripts/build.mjs --check    # CI gate until #1048: fail if committed plugin/ is stale
+node scripts/build.mjs            # regenerate SKILL overlay + marketplace catalog after editing hosts/claude
+node scripts/build.mjs --check    # CI gate: fail if SKILL overlay or marketplace catalog is stale
 node scripts/generate-docs.mjs    # regenerate docs/cli.md, docs/config.md, CHANGELOG.md, SKILL tables
 node scripts/generate-docs.mjs --check
 npm run docs:generate             # same as generate-docs write mode
@@ -291,7 +290,7 @@ npm run docs:check                # same as generate-docs --check
 npm run ci                        # full CI gate (tests + mirror + install-smoke + openspec + docs + scripts)
 ```
 
-After changing anything under `core/` or `hosts/claude/SKILL.md`, re-run `build.mjs` and commit the regenerated `plugin/` (CI enforces this until #1048). After changing the command registry, config schema, or docs generator, re-run `generate-docs.mjs` and commit generated docs (CI enforces this via `ci:docs` once the generator is present).
+After changing anything under `core/` or `hosts/claude/SKILL.md`, re-run `build.mjs` so `--check` can assert SKILL overlay and marketplace catalog freshness. Do not commit a `plugin/` copy of `core/scripts`. After changing the command registry, config schema, or docs generator, re-run `generate-docs.mjs` and commit generated docs (CI enforces this via `ci:docs` once the generator is present).
 
 `npm run ci` always includes a **conditional** docs freshness step (`ci:docs`): it is a no-op when the docs generator is absent, and runs check-mode when `scripts/generate-docs.mjs` is present — so a stale generated artifact fails the same local command the pipeline test-gate runs.
 

@@ -901,25 +901,27 @@ export function buildPreflightChecks(
     },
   });
 
-  // 8. Plugin mirror check (conditional) — for repos that have a generated
-  //    `plugin/` mirror driven by `scripts/build.mjs` (the agent-pipeline golden
-  //    rule). Running `node scripts/build.mjs --check` without actually building
-  //    catches stale mirrors before CI does. The check is guarded by the presence
-  //    of both artifacts so it is a no-op in repos without this pattern.
+  // 8. Generated packaging freshness (conditional) — for repos whose
+  //    SKILL/catalog outputs are driven by `scripts/build.mjs`. Running
+  //    `node scripts/build.mjs --check` without writing files catches stale
+  //    generated outputs before CI does. The check is guarded by the presence of
+  //    both artifacts so it is a no-op in repos without this pattern.
   checks.push({
+    // Public compatibility: doctor --json exposes this id in checks[].name.
+    // Keep the legacy identifier while replacing its retired mirror semantics.
     id: "plugin-mirror",
-    description: "Generated plugin/ mirror is in sync with core/ (scripts/build.mjs --check)",
+    description: "Generated SKILL/catalog outputs are fresh (scripts/build.mjs --check)",
     run: async (deps) => {
       const buildScript = path.join(config.repo_dir, "scripts", "build.mjs");
       const pluginDir = path.join(config.repo_dir, "plugin");
       if (!(await deps.fsExists(buildScript)) || !(await deps.fsExists(pluginDir))) {
-        return skip("no scripts/build.mjs or plugin/ directory — plugin mirror check is not applicable");
+        return skip("no scripts/build.mjs or plugin/ directory — packaging freshness check is not applicable");
       }
       return (await deps.execCheck("node", [buildScript, "--check"]))
-        ? pass("plugin/ mirror is in sync with core/")
+        ? pass("generated SKILL/catalog outputs are fresh")
         : fail(
-            "plugin/ mirror is out of sync with core/",
-            "Run `node scripts/build.mjs` from the repo root to regenerate the plugin/ mirror, then commit the result.",
+            "generated SKILL/catalog outputs are stale",
+            "Run `node scripts/build.mjs` from the repo root to regenerate the SKILL/catalog outputs, then commit the result.",
           );
     },
   });
@@ -977,7 +979,7 @@ export function buildPreflightChecks(
       const detail = formatPreflightFailures(result.failures);
       return fail(
         `eval fixture integrity failed (${result.failures.length}): ${detail}`,
-        "Fetch missing base_commit objects (full clone), fix path tokens to core/test/..., mark empty grader_refs fixtures smoke_only, or repair allowed_change_paths for plugin/ mirror outputs.",
+        "Fetch missing base_commit objects (full clone), fix path tokens to core/test/..., mark empty grader_refs fixtures smoke_only, or explicitly list the required generated SKILL/catalog outputs in allowed_change_paths.",
       );
     },
   });

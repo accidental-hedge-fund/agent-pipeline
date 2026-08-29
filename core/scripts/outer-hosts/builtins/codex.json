@@ -22,7 +22,7 @@
       "skillTree": true,
       "commandsGlob": null,
       "commandsDirRelative": ["agents"],
-      "commandsKind": "codex-prompt"
+      "commandsKind": "none"
     },
     "userOwnedExclusion": "Only the installer-managed skill tree under skills/pipeline is removed on uninstall. Unrelated user skills and files outside the managed tree are preserved.",
     "postInstall": "Restart Codex to pick it up, then invoke with $pipeline.",

@@ -2,118 +2,7 @@
 
 ## Purpose
 TBD - created by archiving change namespaced-command-surface. Update Purpose after archive.
-
 ## Requirements
-
-### Requirement: Each in-scope operation SHALL be exposed as a distinct `pipeline:<command>` host entry
-
-The host packaging SHALL expose each in-scope pipeline operation as its own
-discoverable `pipeline:<command>` command entry, rather than as a flag on a single
-`/pipeline` command. The in-scope operation set SHALL be exactly: `status`,
-`unblock`, `override`, `summary`, `doctor`, `init`, `cleanup`, `intake`, `sweep`,
-`triage`, `merge`, `merge-queue`, `release`, `roadmap`, `logs`, `loop`,
-`recover-parked`. On the
-Claude host these entries SHALL be invocable as `/pipeline:<command>`; on the
-Codex host they SHALL be invocable as `$pipeline:<command>`. Each entry SHALL
-appear in that host's command/skill discovery surface.
-
-#### Scenario: Every in-scope operation has a host command entry
-
-- **WHEN** the host command surface generated for Claude is enumerated
-- **THEN** it SHALL contain a `pipeline:status`, `pipeline:unblock`,
-  `pipeline:override`, `pipeline:summary`, `pipeline:doctor`, `pipeline:init`,
-  `pipeline:cleanup`, `pipeline:intake`, `pipeline:sweep`, `pipeline:triage`,
-  `pipeline:merge`, `pipeline:merge-queue`, `pipeline:release`, `pipeline:roadmap`,
-  `pipeline:logs`, `pipeline:loop`, and `pipeline:recover-parked` entry
-- **AND** no in-scope operation SHALL be reachable only as a flag on the base
-  `/pipeline` command
-
-#### Scenario: A migrated operation is discoverable in the menu
-
-- **WHEN** a developer opens the Claude Code skill/command menu
-- **THEN** `pipeline:status` (and each other in-scope entry) SHALL be listed as a
-  named command with its own description, without the developer needing to know
-  any flag syntax
-
-#### Scenario: The loop entry is generated from the same single source
-
-- **WHEN** `loop` is present in the single-source operation list and
-  `scripts/build.mjs` is run
-- **THEN** the Claude `commands/` surface SHALL gain `pipeline:loop.md` and the Codex
-  overlay SHALL gain the matching agent entry
-- **AND** the `plugin/` mirror SHALL regenerate to match
-
-#### Scenario: recover-parked host entry is generated from the same single source
-
-- **WHEN** `recover-parked` is present in the single-source operation list and
-  `scripts/build.mjs` is run
-- **THEN** the Claude `commands/` surface SHALL gain `pipeline:recover-parked` (or
-  equivalent host entry) and the Codex overlay SHALL gain the matching agent entry
-- **AND** the `plugin/` mirror SHALL regenerate to match when host packaging is mirrored
-
-### Requirement: The host command set SHALL be symmetric across Claude and Codex
-
-The `pipeline:<command>` entries SHALL be generated from a single source so that
-the Claude host (`/pipeline:<command>`) and the Codex host (`$pipeline:<command>`)
-expose the identical operation set with identical argument contracts and identical
-target behavior. Neither host SHALL carry an in-scope entry the other lacks.
-
-#### Scenario: Codex exposes the same set as Claude
-
-- **WHEN** the host command surfaces for Claude and Codex are compared
-- **THEN** the set of in-scope operation names SHALL be identical on both hosts
-- **AND** `$pipeline:triage` (Codex) SHALL perform the same operation with the
-  same arguments as `/pipeline:triage` (Claude)
-
-#### Scenario: Adding an operation updates both hosts from one source
-
-- **WHEN** a new in-scope operation is added to the single source list and
-  `scripts/build.mjs` is run
-- **THEN** both the Claude `commands/` surface and the Codex overlay SHALL gain
-  the corresponding entry, and the `plugin/` mirror SHALL regenerate to match
-
----
-
-### Requirement: Each `pipeline:<command>` entry SHALL forward to the equivalent CLI invocation
-
-Each host command entry SHALL forward to the underlying pipeline CLI invocation
-for that operation, preserving the operation's existing behavior, arguments, and
-output. The mapping SHALL be: `pipeline:status <N>` → the read-only status mode;
-`pipeline:unblock <N> "<answer>"` → post-answer/clear-blocked; `pipeline:override
-<N> "<spec>"` → disposition-and-resume; `pipeline:summary <N>` → issue N's
-evidence-bundle dump; `pipeline:doctor` → standalone preflight; `pipeline:init` →
-label-ensure + config scaffold; `pipeline:cleanup` → merged-worktree sweep; and
-`pipeline:<intake|sweep|triage|merge|merge-queue|release|roadmap|logs>` → the
-existing identically-named keyword sub-command.
-
-`pipeline:loop` is the single documented exception: it is a **delegating** entry
-rather than a CLI forward. It SHALL normalize its arguments and run the deterministic
-loop preflight in the pipeline CLI, then hand off durable orchestration to the
-installed goal-loop skill. It SHALL NOT be expected to map onto a `pipeline <op>`
-keyword sub-command, and the host-surface drift guard SHALL account for it as a
-delegating entry.
-
-#### Scenario: Host entry runs the same operation as the underlying command
-
-- **WHEN** `/pipeline:status 42` is invoked
-- **THEN** it SHALL produce the same stage/blocker/PR/last-review status output as
-  the pre-existing read-only status mode for issue 42
-- **AND** it SHALL NOT advance any pipeline stage label
-
-#### Scenario: Issue-bundle summary entry targets the issue number
-
-- **WHEN** `/pipeline:summary 42` is invoked
-- **THEN** it SHALL print issue 42's evidence bundle (the per-issue dump), and the
-  pre-existing `pipeline summary <run-id>` exact-run selector SHALL remain
-  available and unchanged for run-id selection
-
-#### Scenario: merge-queue host entry forwards to the CLI keyword
-
-- **WHEN** `/pipeline:merge-queue --milestone "v1.28.2"` (or the Codex equivalent)
-  is invoked
-- **THEN** it SHALL forward to `pipeline merge-queue` with the same arguments
-- **AND** SHALL NOT perform a merge solely by virtue of the host entry being used
-
 ### Requirement: The advance loop SHALL remain the default invocation, unchanged
 
 The advance loop SHALL remain the default, no-sub-command invocation. `/pipeline N`
@@ -158,120 +47,64 @@ this change.
 
 ---
 
-### Requirement: The migrated documentation SHALL reflect the new invocation shapes
-
-The README and both hosts' SKILL.md mode/usage tables SHALL document each
-operation in its `pipeline:<command>` / `$pipeline:<command>` form and SHALL mark
-the legacy mode-selecting flag forms as deprecated. No in-scope operation SHALL be
-documented solely in its legacy `--flag` form.
-
-#### Scenario: Docs present the namespaced form
-
-- **WHEN** the README and the Claude/Codex SKILL.md mode tables are inspected
-- **THEN** each in-scope operation SHALL be shown as `/pipeline:<command>` /
-  `$pipeline:<command>`
-- **AND** the legacy flag forms (`--status`, `--summary`, `--unblock`,
-  `--override`, `--init`, `--cleanup`) SHALL be annotated as deprecated
-
----
-
-### Requirement: `renderClaudeCommand` SHALL produce YAML frontmatter that is syntactically valid
-
-The `renderClaudeCommand(op, skillPath)` function in `scripts/build.mjs` SHALL emit command markdown files whose YAML frontmatter block (between the opening and closing `---` delimiters) is syntactically valid and parseable by a standard YAML parser. Specifically, the `argument-hint` field value SHALL be single-quoted when present so that YAML-significant characters — including `:` and `[` — in the hint string are not misinterpreted by parsers. Any single-quote characters within the hint value SHALL be escaped using the YAML single-quote escape convention (`''`).
-
-#### Scenario: Generated command file frontmatter parses without error
-
-- **WHEN** `renderClaudeCommand` is called for any operation in `OPERATION_SURFACE` that has an `argHint`
-- **THEN** the emitted markdown file's YAML frontmatter SHALL parse without error
-- **AND** the parsed frontmatter SHALL contain a `description` key whose value matches the operation's description string
-- **AND** if `argHint` is present, the parsed `argument-hint` value SHALL equal the raw hint string with no extraneous quoting characters
-
-#### Scenario: `argument-hint` values containing `:` or `[` are safe in YAML
-
-- **WHEN** an operation's `argHint` contains a `:` or `[` character
-- **THEN** `renderClaudeCommand` SHALL wrap the value in single quotes in the emitted frontmatter
-- **AND** a conformant YAML parser SHALL return the plain string value (not a parse error or a mapping/sequence type)
-
----
-
-### Requirement: `renderCodexCommand` SHALL produce YAML agent files suitable for Codex host discovery
-
-The `scripts/build.mjs` module SHALL export a `renderCodexCommand(op)` function
-that returns a YAML string for each entry in `OPERATION_SURFACE`. The YAML SHALL
-contain an `interface:` block with `display_name`, `short_description`, and
-`default_prompt` fields. `scripts/install.mjs` SHALL write one such file per
-operation to `<codexSkillsDir>/pipeline/agents/pipeline-<name>.yaml` when
-installing the Codex host, so that Codex agent discovery surfaces each
-`$pipeline:<command>` as a distinct entry.
-
-To allow `renderCodexCommand` to be imported and unit-tested without triggering
-mirror-generation side effects, `scripts/build.mjs` SHALL guard its `main()`
-invocation behind an ESM entry-point check
-(`process.argv[1] === fileURLToPath(import.meta.url)`).
-
-#### Scenario: `renderCodexCommand` produces a YAML string with `interface:` block
-
-- **WHEN** `renderCodexCommand` is called for any operation in `OPERATION_SURFACE`
-- **THEN** it SHALL return a non-empty string
-- **AND** the string SHALL include an `interface:` key
-- **AND** the string SHALL reference `pipeline:<name>` in both the `display_name`
-  and `default_prompt` values
-
-#### Scenario: `build.mjs` can be safely imported without executing `main()`
-
-- **WHEN** `build.mjs` is imported as an ES module (e.g., via dynamic `import()`
-  in a test)
-- **THEN** the mirror-generation `main()` function SHALL NOT execute
-- **AND** `renderCodexCommand` SHALL be accessible as a named export
-
 ### Requirement: The `loop` operation SHALL use long-running packaging, not the shared fast template
 
-The single-source operation list used by `scripts/build.mjs` SHALL classify the
-`loop` operation so that `renderClaudeCommand` does not apply the shared
-“Run synchronously (completes in seconds). No background process or Monitor
-needed.” template to multi-item drive/resume packaging. Other true-fast
-operations (`status`, `doctor`, `cleanup`, and peers that remain seconds-long)
-SHALL continue to use that template.
+Host SKILL guidance for multi-item drive and resume of `pipeline loop` SHALL treat the
+operation as long-running. Host skill guidance for drive and resume SHALL NOT claim
+that the command “completes in seconds” and SHALL NOT instruct harnesses that “no
+background process or Monitor is needed.” Read-only `--audit` MAY remain documented
+as a short synchronous mode. This requirement SHALL NOT depend on a generated
+`pipeline:loop.md` command file.
 
 #### Scenario: Loop is not rendered with the fast template
 
-- **WHEN** `renderClaudeCommand` is invoked for the `loop` operation
-- **THEN** the result SHALL NOT include the shared fast-template sentence that
-  claims seconds-only completion and forbids Monitor
-- **AND** the result SHALL include a long-running or event-follow orchestration
-  note (or a pointer to host skill loop orchestration)
+- **WHEN** the Claude or Codex host SKILL describes `pipeline loop` drive or resume
+- **THEN** that guidance SHALL NOT contain the substring “completes in seconds”
+  (case-insensitive)
+- **AND** SHALL NOT contain the substring “No background process or Monitor needed”
+  (case-insensitive)
+- **AND** `scripts/build.mjs` SHALL NOT write `plugin/pipeline/commands/pipeline:loop.md`
 
 #### Scenario: True-fast peers still use the fast template
 
-- **WHEN** `renderClaudeCommand` is invoked for a true-fast operation such as
-  `status` or `doctor`
-- **THEN** the result MAY still include the shared seconds-only / no-Monitor
-  template
+- **WHEN** host SKILL or CLI docs describe a true-fast operation such as `status` or `doctor`
+- **THEN** they MAY still note that those CLI verbs complete in seconds
+- **AND** the generator SHALL NOT emit a `pipeline:status.md` or `pipeline:doctor.md` command file to carry that note
+
+#### Scenario: Audit mode stays synchronous
+
+- **WHEN** host or CLI docs describe `pipeline loop --audit`
+- **THEN** they MAY document that mode as read-only and seconds-long
+- **AND** they SHALL NOT use that audit guidance as the orchestration rule for
+  drive or resume
 
 ### Requirement: The merge-queue host entry SHALL document dry-run default and human authority
-The `pipeline:merge-queue` host command description SHALL state that the command
+
+The `pipeline merge-queue` CLI and host SKILL description SHALL state that the command
 plans an ordered ready-to-deploy merge queue under explicit operator invocation,
 defaults to dry-run, and is never called by the advance loop. It SHALL NOT
-describe autonomous or background merging.
+describe autonomous or background merging. This requirement SHALL NOT depend on a
+generated `pipeline:merge-queue.md` command file.
 
 #### Scenario: Host one-liner states dry-run and non-advance
-- **WHEN** the host command description for `pipeline:merge-queue` is inspected
+
+- **WHEN** the CLI or host SKILL description for `pipeline merge-queue` is inspected
 - **THEN** it SHALL mention dry-run (or default non-mutating plan) behavior
 - **AND** SHALL NOT claim the advance loop merges via this command
 
 ### Requirement: Host recover-parked entry SHALL only forward to the CLI
 
-The host `pipeline:recover-parked` entry SHALL forward exclusively to the engine CLI
-`pipeline recover-parked` (Claude `/pipeline:recover-parked`, Codex
-`$pipeline:recover-parked`, and any Tugboat/Hermes skill text that documents the
+Host SKILL packaging for recover-parked SHALL document invocation of the engine CLI
+`pipeline recover-parked` (and any Tugboat/Hermes skill text that documents the
 operation), or no-op + STOP when the host chooses not to invoke it. Host packaging
 and skill prose SHALL NOT instruct inventing `pipeline override` dispositions,
 dropping `blocked`/`needs-human` labels, or reclassifying structured
-HIGH/CRITICAL/security findings outside the CLI.
+HIGH/CRITICAL/security findings outside the CLI. This requirement SHALL NOT depend
+on a generated `pipeline:recover-parked.md` command file.
 
 #### Scenario: Host entry documents CLI-only reflow
 
-- **WHEN** an operator reads the host `pipeline:recover-parked` command or skill entry
+- **WHEN** an operator reads the host SKILL recover-parked guidance
 - **THEN** the documented action SHALL be invocation of `pipeline recover-parked`
 - **AND** it SHALL NOT document a host-local override or label-drop alternative for the same reflow
 
@@ -281,18 +114,17 @@ HIGH/CRITICAL/security findings outside the CLI.
 - **THEN** the host contract SHALL allow calling `pipeline recover-parked` once or STOP
 - **AND** SHALL forbid host-improvised `pipeline override` or silent removal of `blocked` for that reflow
 
-### Requirement: Host command entries SHALL be documented as CLI shims, not the product surface
+### Requirement: Hosts SHALL invoke CLI verbs rather than a generated command pack
 
-Operator and contributor packaging docs SHALL describe each `pipeline:<command>` host entry as a shim that execs the `pipeline` CLI. Those docs SHALL NOT present a `/pipeline:*` slash-command pack as the product or as a required install surface. This requirement SHALL NOT delete generated host command files in this slice. Deletion of `plugin/` and stop of `/pipeline:*` file emission remain issues #1050 and #1048.
+Claude, Codex, and Grok SHALL expose in-scope operations by exec of `pipeline <verb>` from the host SKILL. The in-scope operation set SHALL remain the CLI keywords (including `status`, `unblock`, `override`, `summary`, `doctor`, `init`, `cleanup`, `intake`, `sweep`, `triage`, `merge`, `merge-queue`, `release`, `roadmap`, `logs`, `loop`, `recover-parked`). Hosts SHALL NOT require a generated `pipeline:<command>` file per verb. Adding a verb to `OPERATION_SURFACE` SHALL update the catalog. It SHALL NOT emit a host command file.
 
-#### Scenario: Packaging docs reclassify slash commands
+#### Scenario: Status is a CLI verb not a slash file
 
-- **WHEN** a reader opens `docs/packaging.md`
-- **THEN** the page SHALL state that a `/pipeline:*` slash-command pack is not required as the product
-- **AND** it SHALL describe such entries as optional shims that exec the CLI
+- **WHEN** an operator wants issue 42 status
+- **THEN** the product invocation SHALL be `pipeline status 42`
+- **AND** a `pipeline:status.md` host command file SHALL NOT be required
 
-#### Scenario: Generated host command files still exist in this slice
+#### Scenario: Catalog change does not emit command files
 
-- **WHEN** this documentation change is implemented
-- **THEN** existing generated `pipeline:<command>` host entries MAY still be present
-- **AND** this slice SHALL NOT delete those files
+- **WHEN** a verb is present in `OPERATION_SURFACE` and `scripts/build.mjs` is run
+- **THEN** the generator SHALL NOT write `pipeline:<verb>.md` or Codex `pipeline-<verb>.yaml` command agents

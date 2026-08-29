@@ -668,6 +668,39 @@ test("advanceReview: SHA resolution failure → blocked, no review posted (#16)"
   assert.equal(rec.comments.length, 0, "no review comment may be posted without a valid SHA");
 });
 
+test("advanceReview: getPrDiff throw Outcome carries blockerKind harness-failure (not needs-human)", async (t) => {
+  // Combined-diff 406 too_large (or any getPrDiff throw) must not park as
+  // needs-human → workflow-state. emitBlockedOutcomeEvents defaults a missing
+  // Outcome.blockerKind to needs-human.
+  const { deps, rec } = makeDeps([APPROVE]);
+  const throwingDeps: AdvanceReviewDeps = {
+    ...deps,
+    getPrDiff: async () => {
+      throw new Error(
+        "gh pr diff 1222 failed: could not find pull request diff: HTTP 406: " +
+          "Sorry, the diff exceeded the maximum number of files (300). PullRequest.diff too_large",
+      );
+    },
+  };
+  let out: Awaited<ReturnType<typeof advanceReview>> | undefined;
+  await quiet(t, async () => {
+    out = await advanceReview(cfg, 1048, 1, {}, 0, throwingDeps);
+  });
+  assert.equal(out?.advanced, false);
+  assert.equal(out && !out.advanced ? out.status : undefined, "blocked");
+  assert.equal(out && !out.advanced ? out.blockerKind : undefined, "harness-failure");
+  assert.notEqual(out && !out.advanced ? out.blockerKind : undefined, "needs-human");
+  assert.ok(
+    rec.blockedKinds.includes("harness-failure"),
+    "setBlocked must still record harness-failure",
+  );
+  assert.ok(
+    rec.blocked.some((b) => /too_large|HTTP 406|Could not retrieve PR diff/i.test(b)),
+    "blocked comment must name the PR-diff fetch failure",
+  );
+  assert.equal(rec.runReviewCalls, 0, "reviewer must not run without a diff");
+});
+
 test("advanceReview: harness exit failure Outcome carries blockerKind harness-failure (#882)", async (t) => {
   // Without blockerKind, emitBlockedOutcomeEvents defaults to needs-human →
   // workflow-state, so durable recovery misroutes tester-evidence-gate /
