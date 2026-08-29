@@ -4,7 +4,7 @@
 
 Every repo-local contributor context file read by an agent harness (`AGENTS.md` and `CLAUDE.md`) SHALL state that after editing a file under `core/`, the harness SHALL run `node scripts/build.mjs` so `build.mjs --check` can assert generated SKILL overlay and marketplace catalog freshness. The instruction SHALL NOT tell harnesses to commit a `plugin/` copy of `core/scripts`. The product install path is the CLI plus a short host SKILL. Whole-tree deletion of the remaining `plugin/` shell is #1050. Generated host SKILLs SHALL NOT be required to repeat that contributor essay; they MAY point at `docs/packaging.md`.
 
-When the pre-commit hook (`.githooks/pre-commit`) is active, it SHALL fulfill the same SKILL/catalog freshness instruction automatically. The written harness instruction remains normative when hooks do not run.
+When the pre-commit hook (`.githooks/pre-commit`) is active, it SHALL fulfill the same SKILL/catalog freshness instruction automatically. After `node scripts/build.mjs`, it SHALL stage by exact path the four generated host SKILLs, `plugin/pipeline/skills/pipeline/SKILL.md`, and `.claude-plugin/marketplace.json`. It SHALL preserve the existing narrow-staging and unstaged/untracked-input guards. The written harness instruction remains normative when hooks do not run.
 
 #### Scenario: Repo context names the freshness command
 
@@ -31,12 +31,26 @@ When the pre-commit hook (`.githooks/pre-commit`) is active, it SHALL fulfill th
 
 - **WHEN** a contributor has activated the hook via `npm run setup-hooks` and stages a `core/` edit
 - **THEN** the hook SHALL run `node scripts/build.mjs`
-- **AND** SHALL stage only generator-owned SKILL/catalog outputs
+- **AND** SHALL stage `hosts/claude/SKILL.md`, `hosts/codex/SKILL.md`, `hosts/grok/SKILL.md`, `hosts/opencode/SKILL.md`, `plugin/pipeline/skills/pipeline/SKILL.md`, and `.claude-plugin/marketplace.json`
+- **AND** SHALL stage no unrelated `hosts/` or `plugin/` path
 - **AND** SHALL NOT stage a `plugin/` core copy as required output
+
+#### Scenario: Hook tests cover every generated host output
+
+- **WHEN** the isolated pre-commit fixture runs after a generator-input edit
+- **THEN** its stub generator SHALL write all four host SKILL outputs
+- **AND** the committed-file assertion SHALL prove all four exact paths were staged
+- **AND** a non-owned host or plugin working-tree change SHALL remain unstaged
 
 #### Scenario: Test gate remains the deterministic backstop
 
-- **WHEN** a commit leaves the generated SKILL overlay or marketplace catalog stale
+- **WHEN** a commit leaves any of the four host SKILLs, the generated plugin SKILL, or marketplace catalog stale
 - **THEN** `npm run ci` (which runs `build.mjs --check`) SHALL fail on that staleness
 - **AND** the bounded fix loop SHALL receive the failure for repair
 - **AND** `--check` SHALL NOT fail solely because `plugin/` has no byte-identical core tree
+
+#### Scenario: Eval boundaries account for the same exact outputs
+
+- **WHEN** an eval fixture allows a source path that can change `renderHostSkill` output and runs `build.mjs` or `npm run ci`
+- **THEN** generated-packaging accounting SHALL require all affected host SKILL paths by exact name
+- **AND** it SHALL NOT accept a broad `hosts/` or `plugin/` allowance in place of those paths

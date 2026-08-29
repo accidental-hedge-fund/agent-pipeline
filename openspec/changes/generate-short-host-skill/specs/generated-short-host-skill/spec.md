@@ -6,14 +6,15 @@ Generate one short host SKILL per in-repo SKILL host from `OPERATION_SURFACE` an
 
 ### Requirement: Repository SHALL keep one shared orchestration-contract source
 
-The repository SHALL keep one committed shared orchestration-contract source (a module, a doc, or both treated as one source) that is not a per-host essay. That source SHALL state the follow/notify contract: capture `run_id` from the durable handoff, follow `pipeline loop logs --events --follow` or the equivalent `pipeline logs <run-id> --events --follow` path, stop follow on a terminal run event, and forbid the follower or observer from invoking a merge-capable command. Issue #971 SHALL be able to consume that same source without copying a host SKILL essay. This change SHALL NOT add Hermes or OpenClaw install logic.
+The repository SHALL keep `core/scripts/host-skill.ts` as the single committed one-pager renderer. Its single deep interface SHALL include `renderHostSkill(options?)`, which returns the complete host-neutral SKILL bytes and MAY receive `operationSurface` and `manifests` for deterministic in-process tests. When omitted, those inputs SHALL default to `OPERATION_SURFACE` and `loadOuterHostManifestsPreferHosts()`. The module SHALL export one issue-locked `SKILL_HOST_IDS` tuple containing exactly `claude`, `codex`, `grok`, and `opencode`; that tuple SHALL be the sole generated-host membership source and SHALL NOT contain notify values or lifecycle behavior. The renderer SHALL select those IDs in tuple order, require exactly one manifest for each selected ID, fail closed on missing or duplicate selected IDs, and exclude non-selected manifests such as OMP. It SHALL derive the displayed notify values only from each selected manifest's `material_progress_notify.mapping`; it SHALL NOT own or hardcode a parallel host/surface/tool map. The module SHALL state the follow/notify contract: capture `run_id` from the durable handoff; use `pipeline logs <advance-run-id> --events --follow` for an advance and `pipeline loop logs <loop-run-id> --events --follow` for a loop; reattach after an interrupted follow; stop follow on a terminal run event or supervisor exit; surface the terminal reason and final summary; and forbid the follower or observer from invoking a merge-capable command. Issue #971 SHALL be able to call that same interface without copying a host SKILL essay. This change SHALL NOT add Hermes or OpenClaw install logic.
 
 #### Scenario: Shared contract names follow-until-terminal
 
 - **WHEN** a reader opens the shared orchestration-contract source
 - **THEN** the source SHALL name `run_id`
-- **AND** it SHALL name `pipeline loop logs --events --follow` or the equivalent logs follow
-- **AND** it SHALL require stop on a terminal run event
+- **AND** it SHALL name `pipeline logs <advance-run-id> --events --follow`
+- **AND** it SHALL name `pipeline loop logs <loop-run-id> --events --follow`
+- **AND** it SHALL require reattach after interruption, stop on a terminal run event or supervisor exit, and a terminal reason plus final summary
 
 #### Scenario: Shared contract forbids follower merge
 
@@ -27,11 +28,29 @@ The repository SHALL keep one committed shared orchestration-contract source (a 
 - **THEN** it SHALL be able to import or render the same committed source
 - **AND** this change SHALL NOT add Hermes or OpenClaw install paths
 
+#### Scenario: Notify rows come from outer-host manifests
+
+- **WHEN** the renderer builds the compact notify table
+- **THEN** each Claude, Codex, Grok, and OpenCode row SHALL equal that manifest's declared notify `surface`, `tools`, and `filter`
+- **AND** `host-skill.ts` SHALL NOT select notify behavior with a second hardcoded host-name map
+
+#### Scenario: Injected manifest fixtures change rendered rows
+
+- **WHEN** a test passes a complete selected-host manifest fixture to `renderHostSkill` and changes one fixture mapping
+- **THEN** the corresponding rendered row SHALL change without editing `host-skill.ts`
+- **AND** a missing or duplicate selected manifest ID SHALL fail generation
+
+#### Scenario: Issue-locked host membership excludes OMP
+
+- **WHEN** the default outer-host loader returns the repository manifest registry
+- **THEN** rendered row membership SHALL equal `SKILL_HOST_IDS` in tuple order
+- **AND** OMP or another non-selected manifest SHALL NOT add a row or generated target
+
 ---
 
 ### Requirement: Generator SHALL emit four short host SKILLs from the shared source
 
-A deterministic generator SHALL write `hosts/claude/SKILL.md`, `hosts/codex/SKILL.md`, `hosts/grok/SKILL.md`, and `hosts/opencode/SKILL.md` from `OPERATION_SURFACE` plus the shared orchestration-contract source. The four files SHALL differ only by host invocation token and host notify-tool names. They SHALL NOT encode host-specific stage-machine logic. The generator SHALL NOT write `/pipeline:*` markdown command files or Codex `$pipeline:*` yaml agents.
+`scripts/build.mjs` SHALL be the sole writer and freshness checker for the `hosts/<id>/SKILL.md` targets derived from `SKILL_HOST_IDS`, which SHALL resolve exactly to `hosts/claude/SKILL.md`, `hosts/codex/SKILL.md`, `hosts/grok/SKILL.md`, and `hosts/opencode/SKILL.md`. It SHALL write all four from one call contract through `renderHostSkill`; the four files SHALL be byte-identical. Its write and check target sets SHALL be derived from the same tuple, and a drift guard SHALL fail if ID, rendered-row, write-target, or check-target membership differs. Each SKILL SHALL retain the default numeric issue/PR drive as `pipeline <N>`, tell hosts to execute catalog operations as `pipeline <verb>`, and contain the same compact manifest-derived notify map. They SHALL NOT encode host-specific stage-machine logic. The generator SHALL NOT write `/pipeline:*` markdown command files or Codex `$pipeline:*` yaml agents. `core/scripts/docs-generate.ts` and `scripts/generate-docs.mjs` SHALL NOT read, require, rewrite, or emit any host SKILL.
 
 #### Scenario: Four generated SKILLs exist
 
@@ -39,10 +58,16 @@ A deterministic generator SHALL write `hosts/claude/SKILL.md`, `hosts/codex/SKIL
 - **THEN** it SHALL write `hosts/claude/SKILL.md`, `hosts/codex/SKILL.md`, `hosts/grok/SKILL.md`, and `hosts/opencode/SKILL.md`
 - **AND** each file SHALL be produced from the shared source plus `OPERATION_SURFACE`
 
+#### Scenario: Host ID and target membership cannot drift
+
+- **WHEN** generated notify rows, build write targets, and build check targets are enumerated
+- **THEN** each set SHALL correspond one-to-one with `SKILL_HOST_IDS`
+- **AND** no separately maintained target list SHALL admit OMP or omit a selected host
+
 #### Scenario: Hosts share one contract
 
-- **WHEN** the four generated SKILL bodies are compared with invocation tokens and notify-tool names stripped
-- **THEN** they SHALL carry the same verb set and the same follow/notify obligations
+- **WHEN** the four generated SKILL bodies are compared byte-for-byte
+- **THEN** they SHALL be identical and carry the same verb set and follow/notify obligations
 - **AND** they SHALL NOT contain different stage lists, stage handlers, or stage-order rules per host
 
 #### Scenario: Generator does not emit command packs
@@ -51,18 +76,32 @@ A deterministic generator SHALL write `hosts/claude/SKILL.md`, `hosts/codex/SKIL
 - **THEN** it SHALL NOT write `plugin/pipeline/commands/pipeline:<verb>.md`
 - **AND** it SHALL NOT write Codex `pipeline-<verb>.yaml` command agents from `OPERATION_SURFACE`
 
+#### Scenario: Plugin output calls the same renderer directly
+
+- **WHEN** `scripts/build.mjs` generates `plugin/pipeline/skills/pipeline/SKILL.md`
+- **THEN** plugin generation SHALL consume `renderHostSkill` directly
+- **AND** it SHALL NOT read a generated host SKILL or call a docs marked-region rewriter
+
+#### Scenario: Docs generation has no SKILL lifecycle
+
+- **WHEN** `scripts/generate-docs.mjs` runs in write or check mode
+- **THEN** it SHALL NOT read, require, compare, or write any host SKILL
+- **AND** it SHALL NOT check for `hosts/omp/SKILL.md` or generated table markers
+
 ---
 
 ### Requirement: Each generated SKILL SHALL be a one-pager of verb table, follow contract, and doc pointers
 
-Each generated host SKILL SHALL contain an `OPERATION_SURFACE` verb table, the shared follow/notify contract, and working pointers to `docs/packaging.md` and `docs/cli.md`. Each generated SKILL SHALL NOT contain the retired engine-essay sections: state-machine walkthrough, per-repo config dump, evals manifesto, or §4 / §4b / §4c bash discovery scripts. `train` and `ship` SHALL appear in `OPERATION_SURFACE` and in each generated verb table as explicit operator-authorized verbs. The follow contract SHALL NOT escalate into `train` or `ship`.
+Each generated host SKILL SHALL contain an `OPERATION_SURFACE` verb table, the shared follow/notify contract, and the absolute links `https://github.com/accidental-hedge-fund/agent-pipeline/blob/main/docs/packaging.md` and `https://github.com/accidental-hedge-fund/agent-pipeline/blob/main/docs/cli.md`, which remain usable when the SKILL is installed outside the repository. Each generated SKILL SHALL NOT contain the retired engine-essay sections: state-machine walkthrough, per-repo config dump, evals manifesto, or §4 / §4b / §4c bash discovery scripts. Compact policy text SHALL state that default advance/loop is autonomous through `pipeline:ready-to-deploy` and never merges or deploys. It SHALL identify `pipeline merge`, `pipeline merge-queue --apply` (with merge-queue dry-run as the default), `pipeline train --merge`, and `pipeline ship --milestone` as explicit operator-authorized, non-advance surfaces. It SHALL map `Ship milestone vX.Y.Z` to `pipeline ship --milestone vX.Y.Z` without requiring an authorization-file flag. `train` and `ship` SHALL appear in `OPERATION_SURFACE` and in each generated verb table. The follow contract SHALL NOT escalate into any of those merge-capable commands.
 
 #### Scenario: SKILL carries the required three parts
 
 - **WHEN** a reader opens any of the four generated SKILLs
 - **THEN** the file SHALL contain a verb table sourced from `OPERATION_SURFACE`
+- **AND** it SHALL retain the default numeric `pipeline <N>` issue/PR drive outside that verb table
 - **AND** it SHALL contain the follow/notify contract
 - **AND** it SHALL point at `docs/packaging.md` and `docs/cli.md`
+- **AND** both pointers SHALL be absolute GitHub URLs rather than checkout-relative paths
 
 #### Scenario: Retired essays are absent
 
@@ -77,6 +116,14 @@ Each generated host SKILL SHALL contain an `OPERATION_SURFACE` verb table, the s
 - **WHEN** `OPERATION_SURFACE` and a generated SKILL verb table are inspected
 - **THEN** both SHALL list `train` and `ship`
 - **AND** the follow/notify contract SHALL NOT instruct the follower to invoke `train` or `ship`
+
+#### Scenario: Compact policy preserves the merge-authority boundary
+
+- **WHEN** a reader inspects any generated host SKILL
+- **THEN** it SHALL state that default advance/loop ends at `pipeline:ready-to-deploy` without merge or deploy
+- **AND** it SHALL name per-PR merge, merge-queue apply, train merge, and milestone ship as explicit operator-authorized surfaces
+- **AND** it SHALL state that merge-queue is dry-run or plan-only unless `--apply` is explicit
+- **AND** it SHALL map `Ship milestone vX.Y.Z` to `pipeline ship --milestone vX.Y.Z`
 
 ---
 
@@ -100,7 +147,7 @@ The repository SHALL NOT keep `hosts/omp/SKILL.md`. The generator SHALL NOT emit
 
 ### Requirement: Tests SHALL pin generated SKILL freshness and forbid host-specific stage logic
 
-A co-located unit test SHALL fail when a committed generated host SKILL differs from a fresh generation. A co-located unit test SHALL fail when a generated SKILL encodes host-specific stage-machine logic. A co-located unit test SHALL fail when the generator writes a per-verb slash-command or yaml-agent file. Those tests SHALL perform no network, git, or subprocess calls beyond in-process generation.
+A co-located unit test SHALL fail when any committed generated host SKILL differs from a fresh generation. A co-located unit test SHALL fail when a generated SKILL encodes host-specific stage-machine logic, when a rendered notify row differs from an injected outer-host manifest fixture, when a selected manifest ID is missing or duplicated, or when `SKILL_HOST_IDS` differs from rendered-row or build-target membership. A co-located unit test SHALL fail when the generator writes a per-verb slash-command or yaml-agent file. Hook staging tests and eval fixture-boundary tests SHALL account for all four host SKILL outputs by exact path. Those tests SHALL perform no network, git, or subprocess calls beyond existing isolated hook fixtures and in-process generation.
 
 #### Scenario: Stale generated SKILL fails
 
@@ -116,3 +163,20 @@ A co-located unit test SHALL fail when a committed generated host SKILL differs 
 
 - **WHEN** the generator would write a `pipeline:<verb>.md` or Codex `pipeline-<verb>.yaml` command file
 - **THEN** the command-pack test SHALL fail
+
+#### Scenario: Manifest and render drift fails
+
+- **WHEN** a host manifest's notify `surface`, `tools`, or `filter` differs from the generated notify row
+- **THEN** the manifest/render parity test SHALL fail
+
+#### Scenario: Manifest selection and target drift fail
+
+- **WHEN** a selected manifest is missing or duplicated, or the rendered row and build target sets differ from `SKILL_HOST_IDS`
+- **THEN** generation or the set-parity test SHALL fail before stale output is accepted
+
+#### Scenario: Hook and eval accounting cover all four outputs
+
+- **WHEN** build inputs can change generated host SKILL bytes
+- **THEN** the pre-commit hook SHALL stage all four host SKILL paths by exact name
+- **AND** eval generated-packaging accounting SHALL recognize and require those same four exact outputs
+- **AND** neither boundary SHALL use a broad `hosts/` or `plugin/` allowance
