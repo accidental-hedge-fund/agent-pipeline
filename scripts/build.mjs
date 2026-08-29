@@ -27,18 +27,17 @@ import { fileURLToPath } from "node:url";
 import { OPERATION_SURFACE } from "../core/scripts/operation-surface.ts";
 import {
   SKILL_HOST_IDS,
-  hostSkillRelativePaths,
   renderHostSkill,
 } from "../core/scripts/host-skill.ts";
 
-export { OPERATION_SURFACE, SKILL_HOST_IDS, hostSkillRelativePaths, renderHostSkill };
+export { OPERATION_SURFACE, SKILL_HOST_IDS, renderHostSkill };
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 export const SKILL_OVERLAY_REL = join("plugin", "pipeline", "skills", "pipeline", "SKILL.md");
 export const MARKETPLACE_CATALOG_REL = join(".claude-plugin", "marketplace.json");
 
 export function hostSkillWriteTargets(ids = SKILL_HOST_IDS) {
-  return hostSkillRelativePaths(ids);
+  return ids.map((id) => `hosts/${id}/SKILL.md`);
 }
 
 /** Exact SKILL/catalog targets for write and --check (same list). */
@@ -176,24 +175,29 @@ export function compare(generatedRoot, repoRoot = REPO_ROOT) {
   return drift;
 }
 
+/** Real `--check` path: generate into a temp tree and compare to `repoRoot`. */
+export function checkSkillCatalogFreshness(repoRoot = REPO_ROOT) {
+  const tmp = mkdtempSync(join(tmpdir(), "agent-pipeline-build-"));
+  try {
+    buildInto(tmp);
+    return compare(tmp, repoRoot);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 function main() {
   const check = process.argv.includes("--check");
   if (check) {
-    const tmp = mkdtempSync(join(tmpdir(), "agent-pipeline-build-"));
-    try {
-      buildInto(tmp);
-      const drift = compare(tmp);
-      if (drift.length) {
-        console.error(
-          "✗ host SKILL, plugin SKILL overlay, or marketplace catalog is out of date — run `node scripts/build.mjs` and commit:",
-        );
-        for (const d of drift) console.error(`  - ${d}`);
-        process.exit(1);
-      }
-      console.log("✓ host SKILLs, plugin SKILL overlay, and marketplace catalog are up to date");
-    } finally {
-      rmSync(tmp, { recursive: true, force: true });
+    const drift = checkSkillCatalogFreshness();
+    if (drift.length) {
+      console.error(
+        "✗ host SKILL, plugin SKILL overlay, or marketplace catalog is out of date — run `node scripts/build.mjs` and commit:",
+      );
+      for (const d of drift) console.error(`  - ${d}`);
+      process.exit(1);
     }
+    console.log("✓ host SKILLs, plugin SKILL overlay, and marketplace catalog are up to date");
   } else {
     buildInto(REPO_ROOT);
     console.log("✓ generated host SKILLs, plugin SKILL overlay, and .claude-plugin/marketplace.json");

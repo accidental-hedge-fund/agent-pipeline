@@ -2,13 +2,14 @@
 
 ### Requirement: Host SKILL command tables SHALL be fed from the same CLI inventory
 
-`renderHostSkill` SHALL render the verb table that `scripts/build.mjs` writes to `hosts/claude/SKILL.md`, `hosts/codex/SKILL.md`, `hosts/grok/SKILL.md`, and `hosts/opencode/SKILL.md` so those four files list the same `OPERATION_SURFACE` verbs and are byte-identical. Usage lines SHALL invoke the installed product as `pipeline <verb>`; host discovery tokens such as `/pipeline` and `$pipeline` SHALL NOT fork the CLI table. `scripts/build.mjs` SHALL be the only SKILL writer. The docs generator SHALL NOT read, require, or rewrite `hosts/omp/SKILL.md` or any other host SKILL. `docs/cli.md` SHALL remain the full documented CLI inventory from `COMMAND_REGISTRY` plus `OPERATION_SURFACE`.
+`renderHostSkill` SHALL render the verb table that `scripts/build.mjs` writes to `hosts/claude/SKILL.md`, `hosts/codex/SKILL.md`, `hosts/grok/SKILL.md`, and `hosts/opencode/SKILL.md` so those four files list the same `OPERATION_SURFACE` verbs and are byte-identical. Usage lines SHALL invoke the installed product as `pipeline <verb>`; each `|` alternative SHALL be a complete `pipeline …` invocation. Host discovery tokens such as `/pipeline` and `$pipeline` SHALL NOT fork the CLI table. `scripts/build.mjs` SHALL be the only SKILL writer. The docs generator SHALL NOT read, require, or rewrite `hosts/omp/SKILL.md` or any other host SKILL. `docs/cli.md` SHALL remain the full documented CLI inventory from `COMMAND_REGISTRY` plus `OPERATION_SURFACE`.
 
 #### Scenario: All hosts list the same documented commands
 
 - **WHEN** the generator writes the SKILL verb tables for Claude, Codex, Grok, and OpenCode
 - **THEN** the set of `OPERATION_SURFACE` verb names in all four tables SHALL be identical
 - **AND** each table SHALL use the direct `pipeline <verb>` CLI form
+- **AND** each `|` alternative SHALL begin with `pipeline`
 
 #### Scenario: Generated regions are delimited and regenerable
 

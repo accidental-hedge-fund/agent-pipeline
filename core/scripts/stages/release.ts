@@ -20,7 +20,7 @@
 import * as path from "node:path";
 import * as fs from "node:fs";
 import { spawnSync } from "node:child_process";
-import { hostSkillRelativePaths } from "../host-skill.ts";
+import { SKILL_HOST_IDS } from "../host-skill.ts";
 import {
   classifyFrgBlocker,
   formatFrgPrSection,
@@ -48,6 +48,8 @@ import {
   type StageDiagnostic,
 } from "../stage-diagnostic.ts";
 import { formatFrgSkipReason, resolveFrgSkip } from "../frg-skip.ts";
+
+const HOST_SKILL_RELATIVE_PATHS = SKILL_HOST_IDS.map((id) => `hosts/${id}/SKILL.md`);
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -2031,7 +2033,7 @@ export async function runRelease(
     "ROADMAP.md",
     "plugin",
     ".claude-plugin",
-    ...hostSkillRelativePaths(),
+    ...HOST_SKILL_RELATIVE_PATHS,
   ];
   d.stdout("[pipeline release] checking working tree is clean in release-managed paths...");
   const statusResult = d.runCommand("git", ["status", "--porcelain", "--untracked-files=all", "--", ...releaseManagedPaths], { cwd: repoDir });
@@ -2079,7 +2081,7 @@ export async function runRelease(
         "ROADMAP.md",
         "plugin",
         ".claude-plugin",
-        ...hostSkillRelativePaths(),
+        ...HOST_SKILL_RELATIVE_PATHS,
       ],
       { cwd: repoDir },
     );
@@ -2239,7 +2241,7 @@ export async function runRelease(
       "ROADMAP.md",
       "plugin/",
       ".claude-plugin/",
-      ...hostSkillRelativePaths(),
+      ...HOST_SKILL_RELATIVE_PATHS,
     ];
     const addResult = d.runCommand(
       "git",

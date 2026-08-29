@@ -341,7 +341,15 @@ Generated host SKILLs carry the compact contract. This page keeps the operator d
 
 `pipeline status <N>` reports issue metadata (stage, blocker, PR). It does not discover a run id.
 
-Retain `loop_run_id` from the durable handoff. Follow:
+CLI dispatch is unchanged: `pipeline <N>` is a direct advance. `pipeline single <N>` and `pipeline loop` launch through the durable loop.
+
+Direct numeric advance retains `advance_run_id` from the advance handoff (`run_id`). Follow:
+
+```
+pipeline logs <advance-run-id> --events --follow
+```
+
+Loop and `pipeline single` retain `loop_run_id` from the durable handoff. Follow:
 
 ```
 pipeline loop logs <loop-run-id> --events --follow
@@ -353,11 +361,13 @@ After `loop_item_advance_linked` publishes `pipeline_run_id`, retain that value 
 pipeline logs <advance-run-id> --events --follow
 ```
 
-Keep the loop follow active. On a later linkage or a terminal advance, stop or replace the prior advance follow. Reattach an interrupted follow with the same retained ids. Interrupted follow is non-terminal. Cancelled wait is not completion.
+Keep the loop follow active. On a later linkage or a terminal advance, stop or replace the prior advance follow. Advance `run_complete` stops or replaces only that advance follow. Keep the loop follow active while the loop remains live. Stop the loop-scoped follow set only on `loop_run_complete`, `loop_run_stopped`, or supervisor exit, in the same turn. Reattach an interrupted follow with the same retained ids. Interrupted follow is non-terminal. Cancelled wait is not completion.
 
-Stop every run-scoped follow on confirmed terminal (`run_complete`, `loop_run_complete`, `loop_run_stopped`) or supervisor exit, in the same turn. After a confirmed terminal loop outcome, emit a final summary with the terminal reason, PR URL when present, starting-to-ending stage, and confirmation that follows stopped. Premature supervisor exit is non-terminal failure/recovery, never completion.
+After a confirmed terminal loop outcome, emit a final summary with starting-to-ending stage, elapsed time or transitions when available, PR URL when present, terminal state, the operator-authorized merge next step, and confirmation that follows stopped. After a confirmed terminal direct-advance outcome, emit the same fields for that advance. Merge is an operator-authorized next step, not an observer action. Premature supervisor exit is non-terminal failure/recovery, never completion.
 
 `pipeline loop --audit` is a short synchronous read-only report. Drive and resume are long-running.
+
+Supported loop selectors: `--milestone <name>`, `--label <label>`, `--range <spec>`, `--roadmap-slice <slice>`, and an explicit issue list (one or more issue numbers). Selector arguments are mutually exclusive with `--resume`. Combining a selector with `--resume` exits non-zero and names the conflict. `--audit` is read-only.
 
 Diagnostic fallback for the raw loop stream: `<state-home>/runs/<loop_run_id>/events.jsonl`. State-home resolution order: `AGENT_PIPELINE_STATE_HOME` (preferred) or legacy `PIPELINE_STATE_HOME`; then `$XDG_STATE_HOME/agent-pipeline/loop`; then `~/.local/state/agent-pipeline/loop`. Do not use an informal `/tmp/pipeline-*.log` as the evidence contract.
 
@@ -365,7 +375,7 @@ Linked-advance follow remains required for complete mid-item stage progress unti
 
 ### Material event kinds
 
-Use `scripts/material-filter.mjs` on follow streams. Unfiltered `events.jsonl` stays the complete evidence file.
+Use `scripts/material-filter.mjs` on follow streams. Unfiltered `events.jsonl` stays the complete evidence file. Human-visible notify uses that material filter so test-gate output cannot surface fixture transitions for unrelated issue numbers, broad stdout matching cannot treat those lines as progress, and rapid duplicate notifications cannot auto-stop a host Monitor. The filter is a notification projection. It does not rewrite the run store.
 
 Advance material kinds: `run_start`, `stage_start`, `stage_complete`, `pr_created`, `pr_updated`, `review_verdict`, `gate_result`, `blocker_set`, `blocker_cleared`, `run_complete`.
 
@@ -386,11 +396,32 @@ Starting a durable loop is an operator-owned two-step bootstrap inside a Claude 
 1. Run `/goal` to enter Claude Code's built-in autonomous mode.
 2. Inside that `/goal` session, invoke `pipeline loop …`.
 
-The engine does not invoke `/goal` itself and does not end the native `/goal` session.
+The Pipeline skill does not detect whether native goal mode is active. It does not invoke or re-enter that mode. It does not control the native goal session's lifecycle. Ending the native goal session is a host or operator action after `pipeline loop` reports its own terminal and reconciliation conditions. The skill neither ends that session nor merges.
 
 ### Adapters, update, lessons, artifacts, stages, release plan
 
-Five local-CLI adapters: `claude`, `codex`, `grok`, `opencode`, `pi`. Configure login for the live implementer and reviewer named in `.github/pipeline.yml`.
+Five local-CLI adapters: `claude`, `codex`, `grok`, `opencode`, `pi`. Login is operator-run before use. Similarly named effort levels are not comparable across harnesses.
+
+| Adapter | Login | Example stage assignment |
+| --- | --- | --- |
+| `claude` | Run `claude` once to complete login | `harnesses: { implementer: claude }` |
+| `codex` | `codex login` | `harnesses: { reviewer: codex }` |
+| `grok` | `grok login` | `stage_executors: { implementing: grok-impl }` with a local-cli executor bound to `grok` |
+| `opencode` | `opencode auth login` | `harnesses: { implementer: opencode }` |
+| `pi` | Run `pi` once and complete `/login` | `harnesses: { implementer: pi }` |
+
+Per-stage YAML example:
+
+```yaml
+harnesses:
+  implementer: claude
+  reviewer: codex
+effort:
+  implementing: medium
+  review: high
+```
+
+Grok notify uses its outer-host manifest mapping (`grok_monitor_lines` / `monitor`). Portable fallback is stdout material lines via `events.jsonl` plus `material-filter.mjs`. Do not require Claude `PushNotification` on Grok.
 
 Refresh an installed engine with:
 
@@ -400,10 +431,10 @@ npx github:accidental-hedge-fund/agent-pipeline update
 
 Carry-forward lessons live in a maintainer-curated `## Lessons / Gotchas` section of the conventions file (`conventions_md_path`, else `CLAUDE.md`). No stage writes that file.
 
-Local-only artifact paths (must stay gitignored): `.agent-pipeline/runs/`, `.agent-pipeline/roadmap/`, `.agent-pipeline/history/`, `.agent-pipeline/evals/`, `.agent-pipeline/frg/`, `.agent-pipeline/factory-release/`.
+Local-only artifact paths (must stay gitignored): `.agent-pipeline/runs/`, `.agent-pipeline/roadmap/`, `.agent-pipeline/history/`, `.agent-pipeline/evals/`, `.agent-pipeline/control-attributions.jsonl`, `.agent-pipeline/product-fault-reports.jsonl`, `.agent-pipeline/handoffs/`, `.agent-pipeline/outcomes/`, `.agent-pipeline/lineage/`, `.agent-pipeline/frg/`, `.agent-pipeline/harness-ownership/`, and `.agent-pipeline/factory-release/`.
 
-Full stage inventory lives in living specs and engine `STAGES`, not in the generated SKILL. Loop selectors (`--milestone`, `--label`, `--range`) are CLI flags; see [cli.md](cli.md).
+Full stage inventory lives in living specs and engine `STAGES`, not in the generated SKILL. Loop selectors are documented above; see [cli.md](cli.md) for the generated verb inventory.
 
-Release-plan rows live in `ROADMAP.md` (milestone membership). `pipeline release <version>` prepares a release PR from the matching GitHub milestone plan. `Ship milestone vX.Y.Z` maps to `pipeline ship --milestone vX.Y.Z`.
+Release-plan rows live in `ROADMAP.md`. Columns: Release, Bump, Theme, Issues, Why. The unshipped row shape is `| **vX.Y.Z** | bump | theme | issues | why |`. `pipeline release <version>` prepares a release PR from the matching GitHub milestone plan. Release scaffolds a missing unshipped row when the `| *(none)* |` insert sentinel is present, or fails with remediation (file, copy-paste row, restore the sentinel) when it is not. `Ship milestone vX.Y.Z` maps to `pipeline ship --milestone vX.Y.Z`.
 
 True-fast commands (`status`, `doctor`, read-only `pipeline loop --audit`) complete in seconds and need no Monitor. `status` completes in seconds. Loop drive/resume and `pipeline train` do not.

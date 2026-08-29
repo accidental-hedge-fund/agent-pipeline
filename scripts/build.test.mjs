@@ -26,6 +26,7 @@ import {
   SKILL_OVERLAY_REL,
   MARKETPLACE_CATALOG_REL,
   buildInto,
+  checkSkillCatalogFreshness,
   compare,
   hostSkillWriteTargets,
   skillAndCatalogTargets,
@@ -358,23 +359,22 @@ test("buildInto writes four byte-identical host SKILLs from renderHostSkill", ()
   }
 });
 
-test("--check: one-byte stale host SKILL fails", () => {
-  const gen = makeTmp();
+test("--check: one-byte stale host SKILL fails the real check path", () => {
   const repo = makeTmp();
   try {
-    buildInto(gen);
-    for (const rel of skillAndCatalogTargets()) {
-      mkdirSync(join(repo, dirname(rel)), { recursive: true });
-      writeFileSync(join(repo, rel), readFileSync(join(gen, rel)));
-    }
-    writeFileSync(join(repo, "hosts/claude/SKILL.md"), "x");
-    const drift = compare(gen, repo);
+    buildInto(repo);
+    const rel = "hosts/claude/SKILL.md";
+    const original = readFileSync(join(repo, rel), "utf8");
+    const oneByte = `${original.slice(0, -1)}X`;
+    assert.equal(oneByte.length, original.length);
+    assert.notEqual(oneByte, original);
+    writeFileSync(join(repo, rel), oneByte);
+    const drift = checkSkillCatalogFreshness(repo);
     assert.ok(
       drift.some((d) => d.includes("hosts/claude/SKILL.md")),
       `stale host SKILL must fail check; got: ${drift.join("; ")}`,
     );
   } finally {
-    cleanup(gen);
     cleanup(repo);
   }
 });

@@ -36,7 +36,7 @@ Merge is operator-authorized. This repository does not ship a grant factory, Mes
 
 `node scripts/build.mjs --check` asserts that the four generated host SKILLs (`hosts/claude/SKILL.md`, `hosts/codex/SKILL.md`, `hosts/grok/SKILL.md`, `hosts/opencode/SKILL.md`), the transitional plugin SKILL overlay, and the marketplace catalog are fresh. After a renderer, operation-surface, build, or SKILL-host manifest edit, run `node scripts/build.mjs` and include those generated outputs in the same commit. The docs generator does not read or write a SKILL.
 
-The generated `hosts/grok/SKILL.md` is a repository conformance output, byte-identical to the Claude one-pager. Grok install remains `symlink-claude` (`overlayDir: hosts/claude`, `overlayFiles: []`). The installed Grok path is the Claude-managed symlink, not a separate overlay of `hosts/grok/SKILL.md`.
+The generated `hosts/grok/SKILL.md` is a repository conformance output, byte-identical to the Claude one-pager. Grok install remains `symlink-claude` (`overlayDir: hosts/claude`, `overlayFiles: []`). The installed Grok path is the Claude-managed symlink, not a separate overlay of `hosts/grok/SKILL.md`. Grok notify comes from its outer-host manifest mapping (`grok_monitor_lines` / `monitor`). Portable fallback is stdout material lines via `events.jsonl` plus `material-filter.mjs`. Do not require Claude `PushNotification` on Grok.
 
 OMP/Tugboat is a tree/native-CLI install host. It has no SKILL overlay (`install.overlayFiles: []`).
 

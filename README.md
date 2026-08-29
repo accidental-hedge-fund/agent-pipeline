@@ -274,7 +274,7 @@ gh issue edit N --add-label "pipeline:ready"
 /pipeline N
 ```
 
-`init` ensures pipeline labels, scaffolds `.github/pipeline.yml`, and gitignores local-only `.agent-pipeline/` paths (including `.agent-pipeline/runs/`, `.agent-pipeline/roadmap/`, `.agent-pipeline/history/`, `.agent-pipeline/frg/`, and `.agent-pipeline/factory-release/`). For configuration detail, see [docs/config.md](docs/config.md). For optional gates, OpenSpec, and conventions, see [docs/concepts.md](docs/concepts.md).
+`init` ensures pipeline labels, scaffolds `.github/pipeline.yml`, and gitignores local-only `.agent-pipeline/` paths (including `.agent-pipeline/runs/`, `.agent-pipeline/roadmap/`, `.agent-pipeline/history/`, `.agent-pipeline/evals/`, `.agent-pipeline/control-attributions.jsonl`, `.agent-pipeline/product-fault-reports.jsonl`, `.agent-pipeline/handoffs/`, `.agent-pipeline/outcomes/`, `.agent-pipeline/lineage/`, `.agent-pipeline/frg/`, `.agent-pipeline/harness-ownership/`, and `.agent-pipeline/factory-release/`). For configuration detail, see [docs/config.md](docs/config.md). For optional gates, OpenSpec, and conventions, see [docs/concepts.md](docs/concepts.md).
 
 ## Development
 
@@ -283,16 +283,16 @@ Product law (install the `pipeline` CLI plus a short host SKILL; `plugin/` is no
 ```bash
 npm run setup-hooks               # one-time per clone: auto-regenerate SKILL/catalog on core/ commits
 cd core && npm ci && npm test     # node --test
-node scripts/build.mjs            # regenerate SKILL overlay + marketplace catalog after editing hosts/claude
+node scripts/build.mjs            # sole writer: regenerate four host SKILLs + plugin SKILL + catalog
 node scripts/build.mjs --check    # CI gate: fail if SKILL overlay or marketplace catalog is stale
-node scripts/generate-docs.mjs    # regenerate docs/cli.md, docs/config.md, CHANGELOG.md, SKILL tables
+node scripts/generate-docs.mjs    # regenerate docs/cli.md, docs/config.md, CHANGELOG.md (not host SKILLs)
 node scripts/generate-docs.mjs --check
 npm run docs:generate             # same as generate-docs write mode
 npm run docs:check                # same as generate-docs --check
 npm run ci                        # full CI gate (tests + mirror + install-smoke + openspec + docs + scripts)
 ```
 
-After changing anything under `core/` or `hosts/claude/SKILL.md`, re-run `build.mjs` so `--check` can assert SKILL overlay and marketplace catalog freshness. Do not commit a `plugin/` copy of `core/scripts`. After changing the command registry, config schema, or docs generator, re-run `generate-docs.mjs` and commit generated docs (CI enforces this via `ci:docs` once the generator is present).
+After changing renderer sources under `core/` (`host-skill.ts`, `operation-surface.ts`, outer-host manifests, or `scripts/build.mjs`), re-run `node scripts/build.mjs` so `--check` can assert generated SKILL overlay and marketplace catalog freshness. `build.mjs` is the sole SKILL writer; do not edit generated host SKILLs or assign SKILL regeneration to `generate-docs.mjs`. Do not commit a `plugin/` copy of `core/scripts`. After changing the command registry, config schema, or docs generator, re-run `generate-docs.mjs` and commit generated docs (CI enforces this via `ci:docs` once the generator is present).
 
 `npm run ci` always includes a **conditional** docs freshness step (`ci:docs`): it is a no-op when the docs generator is absent, and runs check-mode when `scripts/generate-docs.mjs` is present — so a stale generated artifact fails the same local command the pipeline test-gate runs.
 

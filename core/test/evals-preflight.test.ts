@@ -120,7 +120,15 @@ test("generated packaging allowance accepts only exact SKILL or catalog outputs"
   );
   assert.deepEqual(requiredGeneratedPackagingOutputs(["core/scripts/gh.ts"], null), []);
   assert.deepEqual(
-    requiredGeneratedPackagingOutputs(["core/scripts/command-registry.ts"], null).sort(),
+    requiredGeneratedPackagingOutputs(["core/scripts/command-registry.ts"], null),
+    [],
+  );
+  assert.deepEqual(
+    requiredGeneratedPackagingOutputs(["core/scripts/command-docs.ts"], null),
+    [],
+  );
+  assert.deepEqual(
+    requiredGeneratedPackagingOutputs(["core/scripts/host-skill.ts"], null).sort(),
     [
       "hosts/claude/SKILL.md",
       "hosts/codex/SKILL.md",
@@ -130,7 +138,10 @@ test("generated packaging allowance accepts only exact SKILL or catalog outputs"
     ].sort(),
   );
   assert.deepEqual(
-    requiredGeneratedPackagingOutputs(["core/scripts/host-skill.ts"], null).sort(),
+    requiredGeneratedPackagingOutputs(
+      ["core/scripts/outer-hosts/load-manifest.ts"],
+      null,
+    ).sort(),
     [
       "hosts/claude/SKILL.md",
       "hosts/codex/SKILL.md",
@@ -234,10 +245,24 @@ test("static preflight: exact generated SKILL or catalog allowance passes", asyn
   }
 });
 
-test("static preflight: current command-catalog edit requires the exact generated SKILL", async () => {
+test("static preflight: current command-catalog edit does not require generated SKILL", async () => {
   const fixture = makeFixture({
     public_checks: ["npm run ci"],
     allowed_change_paths: ["core/scripts/command-registry.ts"],
+    grader_refs: [{ grader: "implementation-fix", version: "1" }],
+    smoke_only: false,
+  });
+  const result = await runStaticFixturePreflight(fixture, {
+    catFile: async () => "commit",
+    readFileAtCommit: async () => null,
+  });
+  assert.equal(result.ok, true, formatPreflightFailures(result.failures));
+});
+
+test("static preflight: current manifest-loader edit requires the exact generated SKILL", async () => {
+  const fixture = makeFixture({
+    public_checks: ["npm run ci"],
+    allowed_change_paths: ["core/scripts/outer-hosts/load-manifest.ts"],
     grader_refs: [{ grader: "implementation-fix", version: "1" }],
     smoke_only: false,
   });

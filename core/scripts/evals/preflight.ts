@@ -15,7 +15,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { PipelineConfig } from "../types.ts";
-import { hostSkillRelativePaths } from "../host-skill.ts";
+import { SKILL_HOST_IDS } from "../host-skill.ts";
 import {
   evalIsolationEnv,
   installBoundaryShim as installBoundaryShimReal,
@@ -140,7 +140,7 @@ export function findDisallowedTestRootTokens(command: string): string[] {
 }
 
 /** Exact generated host SKILL outputs accepted by fixture boundaries (#1049). */
-export const GENERATED_HOST_SKILL_PATHS = hostSkillRelativePaths();
+export const GENERATED_HOST_SKILL_PATHS = SKILL_HOST_IDS.map((id) => `hosts/${id}/SKILL.md`);
 
 /** Exact generated packaging outputs accepted by fixture boundaries (#1048/#1049). */
 export const GENERATED_PACKAGING_OUTPUT_PATHS = [
@@ -152,8 +152,7 @@ export const GENERATED_PACKAGING_OUTPUT_PATHS = [
 const HOST_SKILL_SOURCE_PATHS = [
   "core/scripts/host-skill.ts",
   "core/scripts/operation-surface.ts",
-  "core/scripts/command-registry.ts",
-  "core/scripts/command-docs.ts",
+  "core/scripts/outer-hosts/load-manifest.ts",
   "scripts/build.mjs",
   "hosts/claude/outer-host.manifest.json",
   "hosts/codex/outer-host.manifest.json",

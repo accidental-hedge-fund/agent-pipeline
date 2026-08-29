@@ -6,7 +6,7 @@ Generate one short host SKILL per in-repo SKILL host from `OPERATION_SURFACE` an
 
 ### Requirement: Repository SHALL keep one shared orchestration-contract source
 
-The repository SHALL keep `core/scripts/host-skill.ts` as the single committed one-pager renderer. Its single deep interface SHALL include `renderHostSkill(options?)`, which returns the complete host-neutral SKILL bytes and MAY receive `operationSurface` and `manifests` for deterministic in-process tests. When omitted, those inputs SHALL default to `OPERATION_SURFACE` and `loadOuterHostManifestsPreferHosts()`. The module SHALL export one issue-locked `SKILL_HOST_IDS` tuple containing exactly `claude`, `codex`, `grok`, and `opencode`; that tuple SHALL be the sole generated-host membership source and SHALL NOT contain notify values or lifecycle behavior. The renderer SHALL select those IDs in tuple order, require exactly one manifest for each selected ID, fail closed on missing or duplicate selected IDs, and exclude non-selected manifests such as OMP. It SHALL derive the displayed notify values only from each selected manifest's `material_progress_notify.mapping`; it SHALL NOT own or hardcode a parallel host/surface/tool map. The module SHALL state the follow/notify contract: capture `run_id` from the durable handoff; use `pipeline logs <advance-run-id> --events --follow` for an advance and `pipeline loop logs <loop-run-id> --events --follow` for a loop; reattach after an interrupted follow; stop follow on a terminal run event or supervisor exit; surface the terminal reason and final summary; and forbid the follower or observer from invoking a merge-capable command. Issue #971 SHALL be able to call that same interface without copying a host SKILL essay. This change SHALL NOT add Hermes or OpenClaw install logic.
+The repository SHALL keep `core/scripts/host-skill.ts` as the single committed one-pager renderer. Its single deep interface SHALL include `renderHostSkill(options?)`, which returns the complete host-neutral SKILL bytes and MAY receive `operationSurface` and `manifests` for deterministic in-process tests. When omitted, those inputs SHALL default to `OPERATION_SURFACE` and `loadOuterHostManifestsPreferHosts()`. The module SHALL export one issue-locked `SKILL_HOST_IDS` tuple containing exactly `claude`, `codex`, `grok`, and `opencode`; that tuple SHALL be the sole generated-host membership source and SHALL NOT contain notify values or lifecycle behavior. The renderer SHALL select those IDs in tuple order, require exactly one manifest for each selected ID, fail closed on missing or duplicate selected IDs, and exclude non-selected manifests such as OMP. It SHALL derive the displayed notify values only from each selected manifest's `material_progress_notify.mapping`; it SHALL NOT own or hardcode a parallel host/surface/tool map. The module SHALL state the follow/notify contract: capture `run_id` from the durable handoff; use `pipeline logs <advance-run-id> --events --follow` for a direct numeric or linked advance and `pipeline loop logs <loop-run-id> --events --follow` for a loop; reattach after an interrupted follow; stop only the matching advance follow on advance `run_complete`; stop the loop-scoped set on `loop_run_complete`, `loop_run_stopped`, or supervisor exit; surface the terminal reason and final summary; and forbid the follower or observer from invoking a merge-capable command. This change SHALL NOT alter CLI dispatch. Issue #971 SHALL be able to call that same interface without copying a host SKILL essay. This change SHALL NOT add Hermes or OpenClaw install logic.
 
 #### Scenario: Shared contract names follow-until-terminal
 
@@ -124,6 +124,19 @@ Each generated host SKILL SHALL contain an `OPERATION_SURFACE` verb table, the s
 - **AND** it SHALL name per-PR merge, merge-queue apply, train merge, and milestone ship as explicit operator-authorized surfaces
 - **AND** it SHALL state that merge-queue is dry-run or plan-only unless `--apply` is explicit
 - **AND** it SHALL map `Ship milestone vX.Y.Z` to `pipeline ship --milestone vX.Y.Z`
+
+#### Scenario: Discovery frontmatter is host-neutral and includes ship
+
+- **WHEN** a reader inspects generated SKILL frontmatter
+- **THEN** it SHALL include the operator phrase `Ship milestone vX.Y.Z`
+- **AND** it SHALL NOT use Claude-only `/pipeline`, `/review`, or `/sweep` discovery tokens
+- **AND** it SHALL preserve that ordinary advance, single, and loop never merge or deploy
+
+#### Scenario: Verb-table alternatives are complete CLI invocations
+
+- **WHEN** a generated verb table lists a `|` alternative
+- **THEN** each alternative SHALL begin with `pipeline`
+- **AND** it SHALL include `pipeline ship status --milestone vX.Y.Z`
 
 ---
 

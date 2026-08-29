@@ -24,8 +24,11 @@ test("durable docs document /goal then pipeline loop bootstrap", () => {
   assert.ok(goalIndex !== -1, "bootstrap section must mention `/goal`");
   assert.ok(loopIndex !== -1, "bootstrap section must mention `pipeline loop`");
   assert.ok(goalIndex < loopIndex, "bootstrap must document /goal before pipeline loop");
-  assert.match(section, /does not invoke `\/goal` itself/i);
-  assert.match(section, /does not end the native `\/goal` session/i);
+  assert.match(section, /does not detect whether native goal mode is active/i);
+  assert.match(section, /does not invoke or re-enter that mode/i);
+  assert.match(section, /does not control the native goal session's lifecycle/i);
+  assert.match(section, /neither ends that session nor merges/i);
+  assert.match(section, /host or operator action/i);
   assert.doesNotMatch(section, /(?:\/|\$)pipeline:loop/);
 });
 

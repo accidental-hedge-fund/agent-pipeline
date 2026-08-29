@@ -4,7 +4,7 @@
 // load `OPERATION_SURFACE` and `loadOuterHostManifestsPreferHosts()`. Tests
 // inject both. Notify values come only from selected manifests' mapping
 // fields. `SKILL_HOST_IDS` is membership-only: no notify values, no lifecycle
-// dispatch.
+// dispatch. Path derivation lives in `scripts/build.mjs`.
 //
 // #971 may import this module and call `renderHostSkill` for the same bytes.
 // This file does not add Hermes or OpenClaw install logic.
@@ -20,12 +20,12 @@ import {
 export const SKILL_HOST_IDS = ["claude", "codex", "grok", "opencode"] as const;
 export type SkillHostId = (typeof SKILL_HOST_IDS)[number];
 
-export const HOST_SKILL_PACKAGING_DOC_URL =
+const HOST_SKILL_PACKAGING_DOC_URL =
   "https://github.com/accidental-hedge-fund/agent-pipeline/blob/main/docs/packaging.md";
-export const HOST_SKILL_CLI_DOC_URL =
+const HOST_SKILL_CLI_DOC_URL =
   "https://github.com/accidental-hedge-fund/agent-pipeline/blob/main/docs/cli.md";
 
-export interface SkillNotifyRow {
+interface SkillNotifyRow {
   id: SkillHostId;
   displayName: string;
   surface: string;
@@ -36,18 +36,6 @@ export interface SkillNotifyRow {
 export interface RenderHostSkillOptions {
   operationSurface?: readonly OperationSurfaceEntry[];
   manifests?: readonly OuterHostManifest[];
-}
-
-/** Repo-relative SKILL path for one generated host. */
-export function hostSkillRelativePath(id: SkillHostId): string {
-  return `hosts/${id}/SKILL.md`;
-}
-
-/** Repo-relative SKILL paths derived from membership, in tuple order. */
-export function hostSkillRelativePaths(
-  ids: readonly SkillHostId[] = SKILL_HOST_IDS,
-): readonly string[] {
-  return ids.map(hostSkillRelativePath);
 }
 
 function isSkillHostId(value: string): value is SkillHostId {
@@ -67,7 +55,7 @@ function portableFallback(fallback: unknown): fallback is string {
  * Fail closed on a missing or duplicate selected ID. Ignore non-selected
  * manifests such as OMP.
  */
-export function selectSkillHostManifests(
+function selectSkillHostManifests(
   manifests: readonly OuterHostManifest[],
 ): OuterHostManifest[] {
   const byId = new Map<string, OuterHostManifest[]>();
@@ -105,7 +93,7 @@ function assertNotifyCapability(manifest: OuterHostManifest): void {
 }
 
 /** Compact notify rows projected from selected manifests, in tuple order. */
-export function projectSkillNotifyRows(
+function projectSkillNotifyRows(
   manifests: readonly OuterHostManifest[],
 ): SkillNotifyRow[] {
   const selected = selectSkillHostManifests(manifests);
@@ -130,11 +118,20 @@ function padRight(s: string, width: number): string {
   return s + " ".repeat(width - s.length);
 }
 
+/** Prefix every top-level `|` alternative so each form is a complete `pipeline …` invocation.
+ *  Split only on spaced pipes so flag unions such as `[--json|--is-ok]` stay intact. */
+function prefixPipelineUsage(usage: string): string {
+  return usage
+    .split(/\s+\|\s+/)
+    .map((alt) => `pipeline ${alt}`)
+    .join(" | ");
+}
+
 function renderVerbTable(surface: readonly OperationSurfaceEntry[]): string {
   const pad = 52;
   const lines: string[] = ["```"];
   for (const op of surface) {
-    const usage = `pipeline ${op.usage}`;
+    const usage = prefixPipelineUsage(op.usage);
     lines.push(`${padRight(usage, pad)}${op.desc}`);
   }
   lines.push("```");
@@ -175,21 +172,26 @@ export function renderHostSkill(options: RenderHostSkillOptions = {}): string {
     "name: pipeline",
     "description: |",
     "  Use this skill whenever the user wants to advance a GitHub issue or PR",
-    "  through a label-driven dev pipeline toward `pipeline:ready-to-deploy`.",
-    "  Triggers include phrases like \"pipeline issue 419\", \"push #360 forward\",",
-    "  \"advance this PR through review\", \"run the pipeline on <issue>\", or the",
-    "  `/pipeline` slash command. Do NOT use this skill for: general PR review",
-    "  (use /review), backlog triage/cleanup (use /sweep), or deploying a finished",
-    "  item (deployment is out of scope — the pipeline stops at ready-to-deploy).",
+    "  through a label-driven dev pipeline toward `pipeline:ready-to-deploy`,",
+    "  or to run an operator-authorized train or ship. Triggers include",
+    "  \"pipeline issue 419\", \"push #360 forward\", \"advance this PR through",
+    "  review\", \"run the pipeline on <issue>\", and \"Ship milestone vX.Y.Z\".",
+    "  Do NOT use this skill for general PR review or backlog triage/cleanup.",
+    "  Ordinary advance, single, and loop never merge or deploy; merge,",
+    "  merge-queue --apply, train --merge, and ship are explicit",
+    "  operator-authorized surfaces.",
     "---",
     "",
     "# pipeline",
     "",
     "Host SKILL for the `pipeline` CLI. Execute catalog operations as `pipeline <verb>`.",
     "",
-    "Default numeric drive (outside the verb table): `pipeline <N>` starts durable",
-    "autonomous one-item work for issue or PR N. `pipeline status <N>` reports issue",
-    "metadata (stage, blocker, PR). It does not discover a run id.",
+    "Default numeric drive (outside the verb table): `pipeline <N>` starts a direct",
+    "advance for issue or PR N. Capture `run_id` from the advance handoff as",
+    "`advance_run_id`. Follow `pipeline logs <advance-run-id> --events --follow`.",
+    "`pipeline single <N>` and `pipeline loop` launch through the durable loop and",
+    "yield `loop_run_id`. `pipeline status <N>` reports issue metadata (stage,",
+    "blocker, PR). It does not discover a run id.",
     "",
     "## Operations",
     "",
@@ -202,24 +204,29 @@ export function renderHostSkill(options: RenderHostSkillOptions = {}): string {
     "Do not treat them as seconds-only or as fire-and-forget.",
     "",
     "1. Status pre-check: `pipeline status <N>`.",
-    "2. Launch default drive: `pipeline <N>` or `pipeline single <N>`.",
-    "3. Retain `loop_run_id` from the durable handoff (`run_id`).",
-    "4. Follow `pipeline loop logs <loop-run-id> --events --follow`.",
-    "5. After `loop_item_advance_linked` publishes `pipeline_run_id`, retain that",
+    "2. Direct numeric launch: `pipeline <N>`. Retain `advance_run_id` from the",
+    "   advance handoff (`run_id`). Follow",
+    "   `pipeline logs <advance-run-id> --events --follow`.",
+    "3. Loop launch: `pipeline single <N>` or `pipeline loop …`. Retain",
+    "   `loop_run_id` from the durable handoff (`run_id`). Follow",
+    "   `pipeline loop logs <loop-run-id> --events --follow`.",
+    "4. After `loop_item_advance_linked` publishes `pipeline_run_id`, retain that",
     "   value as the linked `advance_run_id` and also follow",
     "   `pipeline logs <advance-run-id> --events --follow`. Keep the loop follow",
     "   active. On a later linkage or a terminal advance, stop or replace the prior",
     "   advance follow. Do not guess an advance id before linkage.",
-    "6. Notify only material events through the active host row and the shared",
+    "5. Notify only material events through the active host row and the shared",
     "   material filter (`scripts/material-filter.mjs`). See the CLI event",
     "   reference rather than this one-pager for the complete kind inventory.",
-    "7. Reattach an interrupted follow with the same retained ids.",
+    "6. Reattach an interrupted follow with the same retained ids.",
     "   Interrupted follow is non-terminal. Cancelled wait is not completion.",
-    "8. Stop every run-scoped follow on confirmed terminal (`run_complete`,",
-    "   `loop_run_complete`, `loop_run_stopped`) or supervisor exit, in the same",
-    "   turn.",
+    "7. Advance `run_complete` stops or replaces only that advance follow.",
+    "   Keep the loop follow active while the loop remains live.",
+    "8. Stop the loop-scoped follow set on `loop_run_complete`,",
+    "   `loop_run_stopped`, or supervisor exit, in the same turn.",
     "9. After a confirmed terminal loop outcome, emit a final summary with the",
-    "   terminal reason and confirmation that follows stopped.",
+    "   terminal reason and confirmation that follows stopped. After a confirmed",
+    "   terminal direct-advance outcome, emit the same summary for that advance.",
     "10. Premature supervisor exit is non-terminal failure/recovery, never",
     "    completion. Tear down every run-scoped follow, then report recovery — do",
     "    not emit a completion summary.",
