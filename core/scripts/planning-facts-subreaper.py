@@ -10,7 +10,8 @@ import sys
 import time
 
 PR_SET_CHILD_SUBREAPER = 36
-REAP_GRACE_S = 0.4
+REAP_GRACE_S = 0.5
+REPARENT_WAIT_S = 0.05
 
 
 def become_subreaper():
@@ -70,12 +71,41 @@ def reap_zombies():
             return
 
 
+def kill_pid(pid):
+    for target in (-pid, pid):
+        try:
+            os.kill(target, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+
 def kill_live_children():
     for pid in live_child_pids():
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        kill_pid(pid)
+
+
+def reap_remaining():
+    # First poll can be empty: a setsid grandchild is reparented only after
+    # its parent exits. Wait for that before treating the tree as drained.
+    reparent_deadline = time.monotonic() + REPARENT_WAIT_S
+    while time.monotonic() < reparent_deadline:
+        reap_zombies()
+        if live_child_pids():
+            break
+        time.sleep(0.01)
+    deadline = time.monotonic() + REAP_GRACE_S
+    while True:
+        reap_zombies()
+        live = live_child_pids()
+        if not live:
+            reap_zombies()
+            return True
+        if time.monotonic() >= deadline:
+            kill_live_children()
+            reap_zombies()
+            return not live_child_pids()
+        kill_live_children()
+        time.sleep(0.01)
 
 
 def main():
@@ -91,24 +121,18 @@ def main():
                 child.kill()
             except ProcessLookupError:
                 pass
-        kill_live_children()
-        reap_zombies()
+            try:
+                child.wait(timeout=REAP_GRACE_S)
+            except subprocess.TimeoutExpired:
+                pass
+        reap_remaining()
         sys.exit(1)
 
     signal.signal(signal.SIGTERM, on_term)
     signal.signal(signal.SIGINT, on_term)
     code = child.wait()
-    deadline = time.monotonic() + REAP_GRACE_S
-    while True:
-        reap_zombies()
-        live = live_child_pids()
-        if not live:
-            break
-        if time.monotonic() >= deadline:
-            sys.exit(1)
-        kill_live_children()
-        time.sleep(0.01)
-    reap_zombies()
+    if not reap_remaining():
+        sys.exit(1)
     sys.exit(code if code is not None else 1)
 
 

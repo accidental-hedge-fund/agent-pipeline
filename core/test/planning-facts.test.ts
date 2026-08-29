@@ -13,6 +13,7 @@ import { DEFAULT_CONFIG, type Outcome, type PipelineConfig } from "../scripts/ty
 import type { HarnessResult } from "../scripts/harness.ts";
 import {
   constructProviderEnv,
+  createCgroupContainment,
   defaultSpawnProvider,
   digestValue,
   emptyPlanningFactBundle,
@@ -855,16 +856,30 @@ printf '%s\\n' '{"schema_version":1,"facts":{"alembic_head":"0074"}}'
 `,
     { mode: 0o755 },
   );
-  const result = await defaultSpawnProvider({
-    command: script,
-    args: [],
-    cwd: dir,
-    env: { PATH: "/usr/bin:/bin", LANG: "C.UTF-8", LC_ALL: "C.UTF-8", HOME: dir, TMPDIR: dir },
-    shell: false,
-    timeoutMs: 5_000,
-    maxStdoutBytes: 1_024,
-    maxStderrBytes: 1_024,
-  });
+  // GitHub Actions does not delegate nested cgroup.kill. The subreaper must
+  // still terminate the setsid descendant; do not skip this assertion there.
+  const inner = createCgroupContainment();
+  const containment: ProviderContainment = {
+    dir: inner.dir,
+    addPid: (pid) => inner.addPid(pid),
+    remainingPids: () => inner.remainingPids(),
+    killRemaining() {},
+    close: () => inner.close(),
+  };
+  const result = await defaultSpawnProvider(
+    {
+      command: script,
+      args: [],
+      cwd: dir,
+      env: { PATH: "/usr/bin:/bin", LANG: "C.UTF-8", LC_ALL: "C.UTF-8", HOME: dir, TMPDIR: dir },
+      shell: false,
+      timeoutMs: 5_000,
+      maxStdoutBytes: 1_024,
+      maxStderrBytes: 1_024,
+    },
+    spawn,
+    containment,
+  );
   await new Promise((r) => setTimeout(r, 600));
   assert.equal(fs.existsSync(path.join(dir, "pwned.txt")), false, "daemonized descendant must not write after observation");
   assert.equal(result.timed_out, false);
