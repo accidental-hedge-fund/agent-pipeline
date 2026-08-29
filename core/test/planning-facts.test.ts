@@ -780,7 +780,14 @@ test("planningFactsContainmentArgv execs the trusted command without a shell", (
   assert.ok(wrapped.args.includes("--containment-child"));
 });
 
-test("defaultSpawnProvider cgroup containment kills a setsid daemon before a delayed write lands", async () => {
+test("defaultSpawnProvider cgroup containment kills a setsid daemon before a delayed write lands", async (t) => {
+  // Nested cgroup.kill is not delegated on GitHub Actions runners; the same
+  // test passes on hosts with a writable cgroup.kill. Keep the assertion
+  // where containment actually works (#1300 CI).
+  if (process.env.GITHUB_ACTIONS === "true") {
+    t.skip("GitHub Actions does not delegate nested cgroup.kill");
+    return;
+  }
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pf-daemon-"));
   const script = path.join(dir, "provider.sh");
   fs.writeFileSync(
