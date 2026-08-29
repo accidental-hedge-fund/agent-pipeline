@@ -1,63 +1,63 @@
 # core-mirror-sync Specification
 
 ## Purpose
-TBD - created by archiving change fix-harness-regenerate-mirror. Update Purpose after archive.
+
+Define the single-source packaging and generated-artifact freshness contract after retirement of the committed `plugin/` core mirror.
 
 ## Requirements
 
-### Requirement: Repo-local agent instructions SHALL direct harnesses to regenerate the plugin/ mirror after editing core/
+### Requirement: Repo-local agent instructions SHALL require SKILL/catalog freshness after core edits
 
-Until issue #1048 lands, repo-local agent instructions SHALL still direct a harness that edits `core/` to run `node scripts/build.mjs` and include the regenerated `plugin/` directory in the same commit, or SHALL state that `build.mjs --check` still applies. Repo-root `AGENTS.md` and `CLAUDE.md` SHALL present that instruction as a transitional CI gate, not as the forever product rule. Host `SKILL.md` files MAY keep the existing mirror-regeneration wording in this slice. When the pre-commit hook (`.githooks/pre-commit`) is active in a contributor's clone, the hook SHALL fulfill regeneration automatically; the harness instruction remains normative for agent contexts where git hooks do not run.
+Every repo-local context file read by an agent harness (`AGENTS.md`, `CLAUDE.md`, and the host SKILL overlays) SHALL state that after editing a file under `core/`, the harness SHALL run `node scripts/build.mjs` so `build.mjs --check` can assert generated SKILL overlay and marketplace catalog freshness. The instruction SHALL NOT tell harnesses to commit a `plugin/` copy of `core/scripts`. The product install path is the CLI plus a short host SKILL. Whole-tree deletion of the remaining `plugin/` shell is #1050.
 
-#### Scenario: Repo CLAUDE.md contains the mirror-regeneration instruction
+When the pre-commit hook (`.githooks/pre-commit`) is active, it SHALL fulfill the same SKILL/catalog freshness instruction automatically. The written harness instruction remains normative when hooks do not run.
 
-- **WHEN** a human or agent reads the repo-root `CLAUDE.md`
-- **THEN** the document SHALL contain a directive that unambiguously states: run `node scripts/build.mjs` and commit the regenerated `plugin/` mirror after editing `core/`, or that `build.mjs --check` still applies until #1048
-- **AND** that directive SHALL be presented as transitional, not as the forever product rule
+#### Scenario: Repo context names the freshness command
 
-#### Scenario: Claude Code SKILL.md contains the mirror-regeneration instruction
+- **WHEN** a human or agent reads repo-root `AGENTS.md` or `CLAUDE.md`
+- **THEN** the document SHALL direct contributors to run `node scripts/build.mjs` after editing `core/`
+- **AND** SHALL describe `build.mjs --check` as a SKILL/catalog freshness gate
+- **AND** SHALL NOT require a committed `plugin/` core copy
 
-- **WHEN** the Claude Code harness loads `hosts/claude/SKILL.md` before executing an implementation or fix step
-- **THEN** the file SHALL still contain a mirror-regeneration directive so that Claude Code receives the instruction regardless of whether it reads the repo-root CLAUDE.md first
-- **AND** this slice SHALL NOT rewrite that SKILL.md file
+#### Scenario: Host context carries the same instruction
 
-#### Scenario: Codex-host context file contains the mirror-regeneration instruction
+- **WHEN** a harness loads a host SKILL before an implementation or fix step
+- **THEN** the SKILL SHALL direct the harness to run `node scripts/build.mjs` after editing `core/`
+- **AND** SHALL NOT describe `plugin/` as a byte-identical engine mirror
 
-- **WHEN** the Codex harness loads its per-host context file (e.g., `hosts/codex/AGENTS.md`) before executing an implementation or fix step
-- **THEN** the file SHALL contain the same directive so that Codex receives the instruction
-- **AND** this slice SHALL NOT rewrite host SKILL.md files
+#### Scenario: Harness edits core and refreshes generated outputs
 
-#### Scenario: Harness edits core/ and regenerates mirror in the same commit
-
-- **WHEN** an agent harness edits any file under `core/` in response to the instruction
+- **WHEN** an agent harness edits any file under `core/`
 - **THEN** the harness SHALL run `node scripts/build.mjs` before committing
-- **AND** the resulting commit SHALL include both the `core/` changes and the updated `plugin/` files until #1048 retires that gate
+- **AND** the commit SHALL include changed SKILL/catalog outputs when the generator writes them
+- **AND** SHALL NOT add a new `plugin/` copy of `core/scripts`
 
-#### Scenario: pre-commit hook fulfills the instruction for human contributors
+#### Scenario: Pre-commit hook fulfills the instruction
 
-- **WHEN** a human contributor has activated the hook via `npm run setup-hooks` and stages a `core/` edit
-- **THEN** the pre-commit hook SHALL run `node scripts/build.mjs` and stage the regenerated mirror automatically
-- **AND** the harness instruction in `CLAUDE.md`/`SKILL.md` remains in place for agent contexts where hooks do not execute
+- **WHEN** a contributor has activated the hook via `npm run setup-hooks` and stages a `core/` edit
+- **THEN** the hook SHALL run `node scripts/build.mjs`
+- **AND** SHALL stage only generator-owned SKILL/catalog outputs
+- **AND** SHALL NOT stage a `plugin/` core copy as required output
 
-#### Scenario: test-gate backstop remains the deterministic safety net
+#### Scenario: Test gate remains the deterministic backstop
 
-- **WHEN** a harness commit edits `core/` but omits the regenerated `plugin/` mirror
-- **THEN** `npm run ci` (which runs `build.mjs --check`) SHALL still detect and fail on the stale mirror until #1048 retires that gate
-- **AND** the bounded fix loop SHALL self-heal the omission as before
+- **WHEN** a commit leaves the generated SKILL overlay or marketplace catalog stale
+- **THEN** `npm run ci` (which runs `build.mjs --check`) SHALL fail on that staleness
+- **AND** the bounded fix loop SHALL receive the failure for repair
+- **AND** `--check` SHALL NOT fail solely because `plugin/` has no byte-identical core tree
 
-### Requirement: Repo-root golden rule 1 SHALL name CLI plus SKILL as the product until the mirror is retired
+### Requirement: Repo-root golden rule SHALL name CLI plus SKILL as the product
 
-Repo-root `AGENTS.md` and `CLAUDE.md` golden rule #1 SHALL state that the product is the `pipeline` CLI plus a short host SKILL. Those files SHALL NOT present “always commit the regenerated `plugin/` core mirror” as the forever packaging rule. Until issue #1048 lands, golden rule #1 or the immediately following sentence SHALL state that `node scripts/build.mjs --check` still applies. This requirement SHALL NOT rewrite host `SKILL.md` files (issue #1049).
+Repo-root `AGENTS.md` and `CLAUDE.md` golden rule #1 SHALL state that the product is the `pipeline` CLI plus a short host SKILL. Those files SHALL NOT present a generated `plugin/` core mirror or a per-verb command pack as the product.
 
-#### Scenario: AGENTS.md golden rule 1 is product-first
+#### Scenario: AGENTS.md golden rule is product-first
 
 - **WHEN** a contributor reads repo-root `AGENTS.md` golden rule #1
 - **THEN** the rule SHALL name CLI plus SKILL as the product
-- **AND** it SHALL state that `build.mjs --check` still applies until #1048
-- **AND** it SHALL NOT say always commit `plugin/` as the forever rule
+- **AND** SHALL NOT require committing a `plugin/` core mirror
 
 #### Scenario: CLAUDE.md stays in sync
 
 - **WHEN** a contributor reads repo-root `CLAUDE.md` golden rule #1
 - **THEN** the rule SHALL match `AGENTS.md` on CLI plus SKILL as the product
-- **AND** it SHALL carry the same transitional `build.mjs --check` until #1048 sentence
+- **AND** SHALL describe the remaining build gate as SKILL/catalog freshness

@@ -1137,6 +1137,7 @@ test("invoke(): argv adapter advertising unspawnable maxPromptBytes is refused a
     workingDir: "cwd" as const,
     telemetry: "none" as const,
     maxPromptBytes: 1_000_000 as const,
+    background_job_lifecycle: { supported: false as const },
   };
   registerAdapter({
     name: "argv-overclaim-invoke",

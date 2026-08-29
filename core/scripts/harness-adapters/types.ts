@@ -21,6 +21,67 @@
 export const EXTERNAL_SANDBOX_MODES = ["managed", "external-bypass"] as const;
 export type ExternalSandboxMode = (typeof EXTERNAL_SANDBOX_MODES)[number];
 
+/** Schema id for typed background-job lifecycle events (#1299). */
+export const BACKGROUND_JOB_LIFECYCLE_SCHEMA = "pipeline/background-job-lifecycle@1" as const;
+export type BackgroundJobLifecycleSchema = typeof BACKGROUND_JOB_LIFECYCLE_SCHEMA;
+
+/**
+ * Pipeline-owned maximum join grace for {@link BACKGROUND_JOB_LIFECYCLE_SCHEMA}
+ * (#1299). Effective grace is min(declared, this value). Changing the maximum
+ * requires a schema version bump. Adapter values above this fail conformance.
+ */
+export const BACKGROUND_JOB_LIFECYCLE_MAX_JOIN_GRACE_MS = 120_000;
+
+/** Explicit non-support. Omitted is invalid — adapters must declare this object. */
+export const BACKGROUND_JOB_LIFECYCLE_UNSUPPORTED = { supported: false as const };
+
+export type BackgroundJobLifecycleUnsupported = typeof BACKGROUND_JOB_LIFECYCLE_UNSUPPORTED;
+
+export interface BackgroundJobLifecycleSupported {
+  supported: true;
+  schema: BackgroundJobLifecycleSchema;
+  /** Optional tighter join grace in ms. Must not exceed the pipeline maximum. */
+  join_grace_ms?: number;
+}
+
+/** Versioned adapter capability for background-job lifecycle proof (#1299). */
+export type BackgroundJobLifecycleDeclaration =
+  | BackgroundJobLifecycleUnsupported
+  | BackgroundJobLifecycleSupported;
+
+/** Closed lifecycle event kinds for schema @1 (#1299). */
+export const BACKGROUND_JOB_LIFECYCLE_EVENT_KINDS = [
+  "job_started",
+  "job_completed",
+  "job_failed",
+  "notification_delivered",
+  "foreground_joined",
+] as const;
+export type BackgroundJobLifecycleEventKind =
+  (typeof BACKGROUND_JOB_LIFECYCLE_EVENT_KINDS)[number];
+
+/** Allowlisted fields persisted as lifecycle evidence. */
+export const BACKGROUND_JOB_LIFECYCLE_EVIDENCE_ALLOWLIST = [
+  "schema",
+  "kind",
+  "adapter",
+  "invocation_id",
+  "job_id",
+  "timestamp",
+  "state",
+] as const;
+
+/** Typed background-job lifecycle event. Extra keys are stripped before persist. */
+export interface BackgroundJobLifecycleEvent {
+  schema: BackgroundJobLifecycleSchema;
+  kind: BackgroundJobLifecycleEventKind;
+  adapter: string;
+  invocation_id: string;
+  job_id: string;
+  timestamp: string;
+  state: string;
+}
+
 /** Roles an adapter may declare eligibility for (#783). Assignment is config +
  *  declared capability, never a name allowlist or marketing-name heuristic. */
 export const ADAPTER_ROLES = ["implementer", "reviewer"] as const;
@@ -69,6 +130,11 @@ export interface AdapterCapabilities {
    * See {@link MaxPromptBytes}.
    */
   maxPromptBytes: MaxPromptBytes;
+  /**
+   * Whether this adapter can prove background-job start, complete/fail,
+   * notification delivery, and foreground-join (#1299). Omitted is invalid.
+   */
+  background_job_lifecycle: BackgroundJobLifecycleDeclaration;
 }
 
 /**
@@ -127,6 +193,11 @@ export interface AdapterExtensionDeclaration {
   versionProbe: "documented" | "none";
   /** Registration origin for treatment/doctor distinction. */
   origin: AdapterOrigin;
+  /**
+   * Versioned background-job lifecycle declaration (#1299). Must match
+   * `capabilities.background_job_lifecycle`. Omitted is invalid.
+   */
+  background_job_lifecycle: BackgroundJobLifecycleDeclaration;
 }
 
 /** The minimal per-call settings a stage requests of an adapter. Shared base
@@ -498,6 +569,15 @@ export interface HarnessAdapter {
   buildInvocation(ctx: AdapterInvocationContext): AdapterInvocation;
   preflight(deps: AdapterPreflightDeps, req: AdapterRequest): Promise<AdapterPreflightResult>;
   parseTelemetry(capturedStdout: string): HarnessTelemetry;
+  /**
+   * Optional: map a supporting adapter's raw CLI stream into typed lifecycle
+   * events (#1299). Required when `background_job_lifecycle.supported` is
+   * true. Must not invent events from transcript wording.
+   */
+  parseBackgroundJobLifecycle?(
+    chunk: string,
+    ctx: { adapter: string; invocationId: string },
+  ): BackgroundJobLifecycleEvent[];
   describeTreatment(req: AdapterRequest, inv: AdapterInvocation, probe: AdapterProbe): HarnessTreatment;
   /**
    * Cheap readiness probe distinct from full stage invocation (#783). Doctor
@@ -591,6 +671,8 @@ export function buildAdapterDeclaration(opts: {
     authProbe: opts.authProbe ?? "documented",
     versionProbe: opts.versionProbe ?? "documented",
     origin: opts.origin ?? "builtin",
+    background_job_lifecycle:
+      caps.background_job_lifecycle ?? BACKGROUND_JOB_LIFECYCLE_UNSUPPORTED,
   };
 }
 

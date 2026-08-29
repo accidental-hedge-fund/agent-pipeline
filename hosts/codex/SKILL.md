@@ -20,14 +20,14 @@ issue) through a 18-stage label-driven state machine, ending at
 when review ceilings / similar paths exhaust). The ordinary advance path never
 merges. Merge commands require separate operator authority.
 
-## Developing this skill itself (core/ → plugin/ mirror)
+## Developing this skill itself (CLI + SKILL)
 
 When the work target is the agent-pipeline repo — any implementation, fix, or
-test-fix step that edits a file under `core/` — `plugin/` is a generated mirror
-of `core/` (+ `hosts/claude`). After editing any file under `core/`, run
-`node scripts/build.mjs` from the repo root and include the regenerated
-`plugin/` in the same commit. A core-only commit fails CI's
-`build.mjs --check` gate and burns a fix-loop attempt on the stale mirror.
+test-fix step that edits a file under `core/` — the product install path is the
+pipeline CLI plus host SKILL. After editing any file under `core/`, run
+`node scripts/build.mjs` from the repo root so `build.mjs --check` can assert
+SKILL overlay and marketplace catalog freshness. Do not commit a `plugin/` copy
+of `core/scripts`. Whole-tree deletion of `plugin/` is #1050.
 
 ## State machine
 
@@ -60,8 +60,8 @@ the advance loop never auto-advances from it to `ready-to-deploy`.
 
 ### Merge authority boundary
 
-`$pipeline`, `$pipeline:single`, and `$pipeline:loop` never invoke merge.
-`$pipeline:merge <pr>`, `$pipeline:merge-queue --apply`, `pipeline train --merge`,
+`$pipeline N`, `pipeline single`, and `pipeline loop` never invoke merge.
+`pipeline merge <pr>`, `pipeline merge-queue --apply`, `pipeline train --merge`,
 and `pipeline ship --milestone` are loop-isolated, operator-authorized surfaces.
 `merge-queue` is dry-run by default. `pipeline ship --milestone` does not
 require a grant file. Phrase `Ship milestone vX.Y.Z` execs
@@ -76,14 +76,14 @@ profile, Grok planning, implementation, and fixes use only `grok-4.6`, with no G
 
 ## Modes
 
-The primary invocation is the advance loop; all other operations are available as
-distinct `$pipeline:<command>` entries in the skill menu.
+The primary invocation is the single `$pipeline` skill entry. It forwards its
+argument string to the CLI operations cataloged below; there are no per-verb
+skill-menu entries.
 
 <!-- BEGIN GENERATED: cli-command-table -->
 ```
 $pipeline N                                     durable autonomous one-item drive (default)
 $pipeline loop --milestone <m>|--label <l>|--range a-b [--resume <run-id>] [--audit] [--follow] Durable multi-item run — driven in-repo by the pipeline's own loop supervisor
-$pipeline run <n> [--detach]                    Advance alias; use with --detach for a legacy raw detached run (desktop launchers)
 $pipeline single <n>                            Canonical durable one-item autonomous drive (owns a durable loop; delegates stages to advance)
 $pipeline cleanup                               Sweep merged-PR worktrees and delete their local branches
 $pipeline doctor [--json|--is-ok] [--fail-fast] [--harness-smoke] Deterministic preflight check; print summary, exit 0/1. Opt-in --harness-smoke adds one cheap model call per unique configured harness treatment
@@ -119,7 +119,7 @@ $pipeline logs [<run-id>] [--events] [-f] [--no-until-terminal] List or stream p
 $pipeline outcomes ingest|list [--adapter github] [--fixture <path>] [--days <n>] [--retention-days <n>] [--dry-run] [--json] Ingest or list production/rework outcomes linked to pipeline runs (host-local store; #576). R2D alone is never production delivery; free text is redacted; no GitHub mutations
 $pipeline report [--yes]                        Privacy-safe product-fault report preview/submit (optional; off by default in config)
 $pipeline scoreboard [--days <n>|--since <iso>] [--until <iso>] [--bucket day|week] [--by <dim>] [--json] [--html <path>] Print read-only factory throughput/cost/reliability metrics from run artifacts (incl. human-touch, escape-recurrence, discovery-channel, stratified stabilization; #763; production outcomes #576; planning-leverage / material-rework #702)
-$pipeline summary <run-id>                      Print the run evidence bundle for an issue number or exact run-id
+$pipeline summary <issue-number|run-id>         Print the run evidence bundle for an issue number or exact run-id
 $pipeline config schema|validate|sync|repo-map … Config schema, validate, sync scaffold, and repo-map mutations
 $pipeline path [--json]                         Discover installed host skill paths (JSON-friendly for desktop integrators)
 $pipeline handoff list|show|answer|reject|supersede … [--json] [--issue N] [--run-id id] [--status pending] List, inspect, answer, reject, or supersede durable human-question handoffs (#647)
@@ -128,19 +128,19 @@ $pipeline handoff list|show|answer|reject|supersede … [--json] [--issue N] [--
 
 **Deprecated flag forms** (still work, emit a one-line deprecation notice to stderr):
 ```
-$pipeline N --status        → use $pipeline:status N
-$pipeline N --summary       → use $pipeline:summary N
-$pipeline N --unblock "…"   → use $pipeline:unblock N "…"
-$pipeline N --override "…"  → use $pipeline:override N "…"
-$pipeline --init            → use $pipeline:init
-$pipeline --cleanup         → use $pipeline:cleanup
+$pipeline N --status        → use pipeline status N
+$pipeline N --summary       → use pipeline summary N
+$pipeline N --unblock "…"   → use pipeline unblock N "…"
+$pipeline N --override "…"  → use pipeline override N "…"
+$pipeline --init            → use pipeline init
+$pipeline --cleanup         → use pipeline cleanup
 ```
 
 The number is auto-detected as an issue or PR via the GitHub API. PRs are
 resolved to their linked closing issue (the pipeline is issue-centric). PRs
 without a `Closes #N` reference are refused with an explanation.
 
-`$pipeline:loop` is the canonical command for a **durable** multi-item run —
+`pipeline loop` is the canonical command for a **durable** multi-item run —
 one that is expected to span sessions or engines. It runs a deterministic,
 read-only preflight in this skill (argument normalization,
 `loop:store-schema-compatibility`, native-`/goal` capability), then drives the
@@ -182,13 +182,13 @@ codex currently has no documented floor (no known native goal mode), so it
 fails closed on detection alone and needs an `available` attestation to run
 (#506).
 
-#### Bootstrapping a durable run: native `/goal` then `$pipeline:loop`
+#### Bootstrapping a durable run: native `/goal` then `pipeline loop`
 
 Starting a durable run is an **operator-owned, two-step bootstrap** performed
 inside a Codex session:
 
 1. Run `/goal` to enter Codex's built-in autonomous mode.
-2. Inside that `/goal` session, invoke `$pipeline:loop …` to start the durable
+2. Inside that `/goal` session, invoke `pipeline loop …` to start the durable
    run.
 
 This skill does **not** detect whether `/goal` is active — the native-`/goal`
@@ -196,11 +196,11 @@ check above only probes the *capability* (attestation, `--help` marker,
 version floor — and, as noted, Codex has no documented floor so it needs the
 `available` attestation), not live session state. This skill does **not**
 invoke or re-enter `/goal` itself; entering `/goal` is the operator's action,
-taken before `$pipeline:loop` is ever run. And this skill does **not** control
+taken before `pipeline loop` is ever run. And this skill does **not** control
 the native `/goal` session's lifecycle: `/goal` is the outer autonomous
-driver, `$pipeline:loop` is the durable workload it runs inside that driver.
+driver, `pipeline loop` is the durable workload it runs inside that driver.
 
-Native completion is likewise a **host/user action**. `$pipeline:loop` reports
+Native completion is likewise a **host/user action**. `pipeline loop` reports
 its own terminal done and reconciliation conditions from the durable loop
 engine (see `--audit` above); ending the native `/goal` session afterward is
 something the operator or Codex's `/goal` mode does, not something this skill
@@ -463,7 +463,10 @@ fixture loader (an invalid draft is rejected naming the offending field).
 
 The skill is a Node 24+ TypeScript codebase under
 `~/.codex/skills/pipeline/core/scripts/`, run via native type-stripping (no
-build step). First-ever invocation runs `npm install` automatically.
+build step). The installer attempts a best-effort `npm ci` when dependencies
+are absent. If that prewarm fails, the first non-version launcher invocation
+retries `npm ci` before dispatch; a failed retry exits non-zero with the
+installed `core/` path and manual remediation.
 
 Required:
 - `gh` CLI authenticated against the target repo
@@ -765,9 +768,9 @@ node ~/.codex/skills/pipeline/scripts/pipeline.mjs loop --resume <run-id> --audi
 Include recovery actions attempted, final item state, the linked advance/PR
 evidence, and the merge-next-step note that the pipeline does not auto-merge.
 
-### 4b. Orchestration pattern for `$pipeline:loop` (multi-item durable drive/resume)
+### 4b. Orchestration pattern for `pipeline loop` (multi-item durable drive/resume)
 
-Multi-item drive and resume via `$pipeline:loop` is **long-running** (minutes to
+Multi-item drive and resume via `pipeline loop` is **long-running** (minutes to
 hours). It is **not** a seconds-only synchronous command. Do **not** treat it as
 fire-and-forget without event following — use the same spirit as single-issue
 advance (§4), against the loop event stream.
@@ -1142,7 +1145,7 @@ The final operator summary **must** include (1) the run's **terminal reason**
 explicit confirmation that run-scoped follows were stopped (e.g. **follows
 stopped**).
 
-### 4c. Orchestration pattern for `$pipeline:train`
+### 4c. Orchestration pattern for `pipeline train`
 
 `pipeline train` (with or without `--merge`) is **long-running**. Hosts **must not** scrape unstructured train stdout. The primary notify path is `pipeline logs` piped through the shared material filter — not grepping captured train stdout.
 
@@ -1195,15 +1198,15 @@ Raw engine, CI, and harness stdout stay on the linked wave/advance logs — not 
 - `config sync` — previews/applies a validated `.github/pipeline.yml` scaffold refresh, completes in seconds
 - `config repo-map <add|remove|list>` — mutates/lists `repo_map` entries, completes in seconds
 - `doctor` — deterministic preflight by default (no model calls); opt-in `--harness-smoke` adds cheap runtime smoke, completes in seconds without the flag
-- `$pipeline:loop --audit` — read-only report (stage table) for a durable run; synchronous, no event-follow
-- `$pipeline:loop --resume <run-id> --audit --follow` — read-only stage-progress stream; no run-liveness lock
+- `pipeline loop --audit` — read-only report (stage table) for a durable run; synchronous, no event-follow
+- `pipeline loop --resume <run-id> --audit --follow` — read-only stage-progress stream; no run-liveness lock
 
 Run those synchronously without the PTY/log-polling orchestration.
 
-**Not in this list:** multi-item `$pipeline:loop` drive or resume (with or without
+**Not in this list:** multi-item `pipeline loop` drive or resume (with or without
 `--milestone` / issue lists / `--resume`) — those use §4b long-running
 orchestration. Do not apply the seconds-only / no-follow rule to drive/resume
-just because `--audit` is fast. **`$pipeline:train`** (with or without `--merge`)
+just because `--audit` is fast. **`pipeline train`** (with or without `--merge`)
 uses §4c: `pipeline logs <train-run-id> --events --follow | material-filter.mjs`.
 
 `--once` still needs the orchestration because a single heavy stage
@@ -1252,7 +1255,7 @@ When the loop ends, the skill prints:
 
 ## What this skill never does
 
-- Merge from the advance path — there is no `auto_merge` config key or merge stage. `$pipeline:merge <pr>` is a separate operator-authorized command after `pipeline:ready-to-deploy`; advance never calls it. `$pipeline:merge-queue --milestone <m>` is dry-run by default; only the separate `--apply` form can merge. External supervisors may call merge commands under operator authority; the repository does not ship a factory grant control plane.
+- Merge from the advance path — there is no `auto_merge` config key or merge stage. `pipeline merge <pr>` is a separate operator-authorized command after `pipeline:ready-to-deploy`; advance never calls it. `pipeline merge-queue --milestone <m>` is dry-run by default; only the separate `--apply` form can merge. External supervisors may call merge commands under operator authority; the repository does not ship a factory grant control plane.
 - Bypass the `pipeline:*` opt-in label gate.
 - Run more than one transition under `--once`.
 - Touch the GitHub repo in `--dry-run` mode.

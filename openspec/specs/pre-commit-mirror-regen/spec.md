@@ -3,16 +3,16 @@
 ## Purpose
 TBD - created by archiving change pre-commit-plugin-mirror-regen. Update Purpose after archive.
 ## Requirements
-### Requirement: A committed pre-commit hook SHALL auto-regenerate and stage the plugin/ mirror when core/, hosts/claude/, or hosts/_shared/ paths are staged
+### Requirement: A committed pre-commit hook SHALL refresh generated SKILL/catalog outputs when core/, hosts/claude/, or hosts/_shared/ paths are staged
 
-The repository SHALL include a `.githooks/pre-commit` shell script. When a contributor runs `git commit` and the staged file set includes at least one path under `core/`, `hosts/claude/`, or `hosts/_shared/`, the hook SHALL run `node scripts/build.mjs`, then stage `plugin/` and `.claude-plugin/marketplace.json` before the commit object is created. All three directories are build inputs: `core/` provides the skill payload, `hosts/claude/` provides the SKILL.md overlay, and `hosts/_shared/` provides `entry.template.mjs` used to generate the committed plugin shim.
+The repository SHALL include a `.githooks/pre-commit` shell script. When a contributor runs `git commit` and the staged file set includes at least one path under `core/`, `hosts/claude/`, or `hosts/_shared/`, the hook SHALL run `node scripts/build.mjs`. Until #1050 deletes `plugin/`, the hook MAY stage generated SKILL overlay and marketplace catalog outputs (`plugin/` SKILL/catalog paths and `.claude-plugin/marketplace.json`) before the commit object is created. The hook SHALL NOT regenerate or stage a `plugin/` copy of `core/scripts` as required output. `hosts/claude/` still provides the SKILL.md overlay. Shared plugin-shell assets such as `hosts/_shared/material-filter.mjs` remain generator inputs; the marketplace launcher is a managed-install bridge, not a copy of `entry.template.mjs`.
 
-#### Scenario: Core edit auto-regenerates mirror
+#### Scenario: Core edit refreshes generated packaging outputs
 
 - **WHEN** a contributor stages changes under `core/` and runs `git commit`
 - **THEN** the pre-commit hook SHALL run `node scripts/build.mjs`
-- **AND** the hook SHALL run `git add plugin/ .claude-plugin/marketplace.json`
-- **AND** the resulting commit SHALL include both the `core/` edits and the regenerated `plugin/` tree
+- **AND** the hook SHALL NOT stage a `plugin/` core copy as required output
+- **AND** the hook MAY stage generated SKILL overlay and marketplace catalog files when the generator still writes them
 
 #### Scenario: hosts/claude edit triggers regeneration
 
@@ -38,8 +38,9 @@ The repository SHALL include a `.githooks/pre-commit` shell script. When a contr
 #### Scenario: Hook stages only generated paths
 
 - **WHEN** the contributor has unrelated unstaged changes in the working tree at commit time
-- **THEN** the hook SHALL stage only `plugin/` and `.claude-plugin/marketplace.json`
+- **THEN** the hook SHALL stage only generator-owned SKILL/catalog outputs when it stages anything
 - **AND** SHALL NOT stage any other working-tree changes
+- **AND** SHALL NOT stage a `plugin/` core copy as required output
 
 #### Scenario: Untracked source files abort the hook
 
@@ -61,4 +62,3 @@ A `setup-hooks` entry in `package.json` scripts SHALL invoke `scripts/setup-hook
 
 - **WHEN** a contributor reads the `README.md`
 - **THEN** it SHALL contain a note directing contributors to run `npm run setup-hooks` to activate the pre-commit hook
-

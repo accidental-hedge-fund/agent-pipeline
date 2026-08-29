@@ -8,7 +8,7 @@ When `test_gate.command` is set in `.github/pipeline.yml`, the gate MUST execute
 
 #### Scenario: Script command covering multiple CI steps blocks the gate when any step fails
 - **WHEN** `test_gate.command` is set to an npm script that chains multiple steps (e.g., `npm run ci`)
-- **AND** the underlying script runs `npm test` (exits 0) followed by `node scripts/build.mjs --check` (exits non-zero, e.g., due to a stale generated mirror)
+- **AND** the underlying script runs `npm test` (exits 0) followed by `node scripts/build.mjs --check` (exits non-zero, e.g., due to a stale generated SKILL overlay)
 - **THEN** the gate SHALL report failure and block before opening a PR
 
 #### Scenario: Script command where all steps pass allows the pipeline to proceed
@@ -28,23 +28,35 @@ The pipeline documentation (README) SHALL include a section explaining that if a
 - **THEN** they SHALL see a comment on or near `test_gate.command` explaining that the value matches the repo's full CI command
 
 ### Requirement: This repo's pipeline config sets the full CI command
-This repo's `.github/pipeline.yml` SHALL set `test_gate.command` to `"npm run ci"`, where the `ci` npm script covers all steps run by this repo's CI pipeline: unit tests, the `plugin/` mirror sync check (`node scripts/build.mjs --check`), and the install smoke test. Because configured commands are now run through `bash -c` with `set -o pipefail`, multi-step operators (including pipes, where an early-stage failure correctly fails the gate) are also valid alternatives — but using `npm run ci` (which wraps all steps in a single npm script) remains the canonical form for this repo.
+
+This repo's `.github/pipeline.yml` SHALL set `test_gate.command` to `"npm run ci"`, where the `ci` npm script covers all steps run by this repo's CI pipeline: unit tests, the SKILL/catalog freshness check (`node scripts/build.mjs --check`), and the install smoke test. Because configured commands are now run through `bash -c` with `set -o pipefail`, multi-step operators (including pipes, where an early-stage failure correctly fails the gate) are also valid alternatives — but using `npm run ci` (which wraps all steps in a single npm script) remains the canonical form for this repo. `build.mjs --check` SHALL fail on a stale generated SKILL overlay or marketplace catalog. It SHALL NOT fail solely because `plugin/` has no byte-identical core tree.
 
 #### Scenario: pipeline.yml for agent-pipeline specifies the full CI command
+
 - **WHEN** the agent-pipeline repo's `.github/pipeline.yml` is read
 - **THEN** `test_gate.command` SHALL equal `"npm run ci"`
 
-#### Scenario: ci npm script covers the plugin-mirror staleness check
-- **WHEN** the `ci` npm script is inspected in `package.json`
-- **THEN** it SHALL invoke `node scripts/build.mjs --check` (directly or transitively) so that a stale `plugin/` mirror causes the script to exit non-zero
+#### Scenario: ci npm script covers generated-artifact staleness
 
-#### Scenario: stale plugin mirror is caught at the test gate, not at CI
-- **WHEN** a pipeline run edits `core/` source without regenerating the `plugin/` mirror
+- **WHEN** the `ci` npm script is inspected in `package.json`
+- **THEN** it SHALL invoke `node scripts/build.mjs --check` (directly or transitively) so that a stale generated SKILL overlay or marketplace catalog causes the script to exit non-zero
+
+#### Scenario: stale generated packaging artifact is caught at the test gate, not at CI
+
+- **WHEN** a pipeline run leaves the generated SKILL overlay or marketplace catalog stale
 - **AND** the test gate runs `npm run ci`
 - **THEN** the `node scripts/build.mjs --check` step SHALL exit non-zero and the test gate SHALL report failure — blocking before a PR is opened
 - **AND** the fix harness SHALL receive the build-check output and attempt to resolve the staleness within the bounded fix loop
 
+#### Scenario: missing plugin core copy does not fail the check
+
+- **WHEN** `plugin/` has no byte-identical `core/scripts` tree
+- **AND** generated SKILL overlay and marketplace catalog match
+- **AND** the test gate runs `npm run ci`
+- **THEN** `node scripts/build.mjs --check` SHALL NOT fail solely because the core copy is absent
+
 #### Scenario: ci npm script covers the install smoke test
+
 - **WHEN** the `ci` npm script is inspected in `package.json`
 - **THEN** it SHALL invoke the install smoke test (directly or via `npm run ci:install-smoke`) so that a broken installer is caught in-pipeline
 
@@ -107,7 +119,7 @@ The repo's full CI gate (`npm run ci`) SHALL run `openspec validate --all` whene
 `openspec/` directory exists at the repository root, and SHALL exit non-zero if any living
 spec under `openspec/specs/` or any active change under `openspec/changes/` is structurally
 invalid. The OpenSpec validation SHALL be a step within the `ci` npm script (alongside
-`ci:core`, the `plugin/` mirror check, the install smoke test, and the launcher smoke test),
+`ci:core`, the SKILL/catalog freshness check, the install smoke test, and the launcher smoke test),
 so that `.github/workflows/ci.yml` invoking `npm run ci` runs it without a separate bespoke
 workflow step.
 
@@ -188,7 +200,7 @@ fails the CI gate.
 
 ### Requirement: Full CI surface includes docs freshness when the docs generator is present
 
-When this repository includes the docs generator entry point (`scripts/generate-docs.mjs`) and/or a `docs:check` npm script that invokes it, the root `package.json` `ci` script SHALL invoke the docs freshness check (directly via `npm run docs:check` or `node scripts/generate-docs.mjs --check`, or transitively through an equivalent step) so that a stale generated docs artifact fails `npm run ci` the same way a stale `plugin/` mirror fails `node scripts/build.mjs --check`. Because this repo's `test_gate.command` is `"npm run ci"`, a green local test-gate SHALL imply a green docs freshness check for the committed tree whenever the generator is present.
+When this repository includes the docs generator entry point (`scripts/generate-docs.mjs`) and/or a `docs:check` npm script that invokes it, the root `package.json` `ci` script SHALL invoke the docs freshness check (directly via `npm run docs:check` or `node scripts/generate-docs.mjs --check`, or transitively through an equivalent step) so that a stale generated docs artifact fails `npm run ci` the same way a stale SKILL overlay fails `node scripts/build.mjs --check`. Because this repo's `test_gate.command` is `"npm run ci"`, a green local test-gate SHALL imply a green docs freshness check for the committed tree whenever the generator is present.
 
 #### Scenario: ci script wires docs:check when the generator exists
 
@@ -284,4 +296,3 @@ Guidance SHALL NOT claim an unconditional `docs:check` that is missing from `pac
 - **WHEN** a contributor reads README guidance about `npm run ci` / CI
 - **THEN** they SHALL find that Actions PR/main CI uses full history and tags (or equivalent language) for generator/local parity when tag-dependent generators exist
 - **AND** SHALL NOT be led to believe that a green local full clone can differ from Actions solely due to intentional shallow checkout for this gate
-

@@ -24,6 +24,10 @@ import {
   isFiniteMaxPromptBytes,
   promptLimitCoherenceFailure,
 } from "./types.ts";
+import {
+  backgroundJobLifecycleCoherenceFailure,
+  lifecycleDeclarationsMatch,
+} from "./background-job-lifecycle.ts";
 import { getVerifiedAgainst } from "./verified-against.ts";
 
 export interface ConformanceFailure {
@@ -69,6 +73,7 @@ const REQUIRED_DECLARATION_FIELDS = [
   "authProbe",
   "versionProbe",
   "origin",
+  "background_job_lifecycle",
 ] as const;
 
 const CONFORMANCE_WORKTREE = "/tmp/pipeline-conformance-worktree";
@@ -263,6 +268,59 @@ export function checkStructure(adapter: HarnessAdapter): ConformanceReport {
             name,
             "declaration.telemetry",
             `declaration.telemetry must match capabilities.telemetry`,
+          ),
+        );
+      }
+      // #1299: every registered adapter must declare background_job_lifecycle.
+      const capLifecycle = adapter.capabilities.background_job_lifecycle;
+      if (capLifecycle === undefined) {
+        failures.push(
+          fail(
+            name,
+            "capabilities.background_job_lifecycle",
+            `missing required field "background_job_lifecycle"`,
+          ),
+        );
+      } else {
+        const capFail = backgroundJobLifecycleCoherenceFailure(capLifecycle);
+        if (capFail) {
+          failures.push(fail(name, "capabilities.background_job_lifecycle", capFail));
+        }
+      }
+      const declLifecycle = decl.background_job_lifecycle;
+      if (declLifecycle === undefined) {
+        failures.push(
+          fail(
+            name,
+            "declaration.background_job_lifecycle",
+            `missing required field "background_job_lifecycle"`,
+          ),
+        );
+      } else {
+        const declFail = backgroundJobLifecycleCoherenceFailure(declLifecycle);
+        if (declFail) {
+          failures.push(fail(name, "declaration.background_job_lifecycle", declFail));
+        }
+      }
+      if (
+        capLifecycle !== undefined &&
+        declLifecycle !== undefined &&
+        !lifecycleDeclarationsMatch(capLifecycle, declLifecycle)
+      ) {
+        failures.push(
+          fail(
+            name,
+            "declaration.background_job_lifecycle",
+            `declaration.background_job_lifecycle must match capabilities.background_job_lifecycle`,
+          ),
+        );
+      }
+      if (capLifecycle?.supported === true && typeof adapter.parseBackgroundJobLifecycle !== "function") {
+        failures.push(
+          fail(
+            name,
+            "parseBackgroundJobLifecycle",
+            `supported background_job_lifecycle requires parseBackgroundJobLifecycle`,
           ),
         );
       }

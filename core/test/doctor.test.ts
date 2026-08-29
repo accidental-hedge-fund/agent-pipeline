@@ -480,6 +480,7 @@ test("check harness prompt-bytes — fails when assigned adapter declares unknow
     workingDir: "cwd" as const,
     telemetry: "none" as const,
     maxPromptBytes: "unknown" as const,
+    background_job_lifecycle: { supported: false as const },
   };
   registerAdapter({
     name: "unknown-limit-cli",
@@ -560,6 +561,7 @@ test("check harness prompt-bytes — fails when assigned argv adapter declares u
     telemetry: "none" as const,
     // Above the OS argv spawn ceiling — must fail doctor coherence (#779).
     maxPromptBytes: 1_000_000 as const,
+    background_job_lifecycle: { supported: false as const },
   };
   registerAdapter({
     name: "argv-overclaim-cli",
@@ -642,6 +644,7 @@ test("check harness prompt-bytes — fails when assigned stdin adapter declares 
     workingDir: "cwd" as const,
     telemetry: "none" as const,
     maxPromptBytes: 1_000_000 as const,
+    background_job_lifecycle: { supported: false as const },
   };
   registerAdapter({
     name: "stdin-finite-cli",
@@ -935,10 +938,10 @@ test("check eval-command — env-prefixed command fails when the real binary is 
 });
 
 // ---------------------------------------------------------------------------
-// plugin-mirror check (conditional)
+// plugin-mirror check id / packaging-freshness semantics (conditional)
 // ---------------------------------------------------------------------------
 
-test("check plugin-mirror — skips when scripts/build.mjs is absent", async () => {
+test("check plugin-mirror — keeps the public id and skips when scripts/build.mjs is absent", async () => {
   const r = await getCheck(makeConfig(), "plugin-mirror").run(
     fakeDeps({ fsExists: (p) => !p.includes("build.mjs") }),
   );
@@ -952,14 +955,14 @@ test("check plugin-mirror — skips when plugin/ directory is absent", async () 
   assert.equal(r.status, "skip");
 });
 
-test("check plugin-mirror — passes when node scripts/build.mjs --check succeeds", async () => {
+test("check plugin-mirror — passes with packaging-freshness detail when build check succeeds", async () => {
   const r = await getCheck(makeConfig(), "plugin-mirror").run(
     fakeDeps({ execCheck: () => true, fsExists: () => true }),
   );
   assert.equal(r.status, "pass");
 });
 
-test("check plugin-mirror — fails with build.mjs remediation when the mirror is stale", async () => {
+test("check plugin-mirror — fails with build.mjs remediation when generated outputs are stale", async () => {
   const r = await getCheck(makeConfig(), "plugin-mirror").run(
     fakeDeps({ execCheck: () => false, fsExists: () => true }),
   );
@@ -2264,8 +2267,8 @@ test("runPreflight — all checks pass → ok true, no failures", async () => {
 
 test("runPreflight — one failing check with failFast:false runs every check, ok false", async () => {
   // node missing → cli:node fails; everything else passes/skips.
-  // Keep plugin-mirror skipped (build.mjs absent) so only cli:node fails — the
-  // plugin-mirror check also calls execCheck("node", ...) and would otherwise add
+  // Keep plugin-mirror skipped (build.mjs absent) so only cli:node fails — its
+  // packaging-freshness implementation also calls execCheck("node", ...) and would otherwise add
   // a second failure, obscuring the "exactly one failure" assertion.
   const cfg = makeConfig();
   const allChecks = buildPreflightChecks(cfg, FAKE_VERSION, FAKE_INSTALL_ROOT).length;

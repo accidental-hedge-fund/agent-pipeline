@@ -13,6 +13,7 @@ const CAPABILITIES = {
   workingDir: "cwd",
   telemetry: "none",
   maxPromptBytes: "unlimited",
+  background_job_lifecycle: { supported: false },
 };
 
 const EMPTY_TELEMETRY = {
@@ -40,6 +41,7 @@ const extDemoAdapter = {
     authProbe: "none",
     versionProbe: "none",
     origin: "extension",
+    background_job_lifecycle: { supported: false },
   },
 
   buildInvocation(ctx) {

@@ -5,7 +5,8 @@
 // 2c. Failing closed on open candidate-linked engine-class soak defects (#755)
 //    (skipped when FRG skip is active — soak attribution is FRG-linked)
 // 3. Bumping both package.json files
-// 4. Regenerating the plugin/ mirror (node scripts/build.mjs)
+// 4. Regenerating the committed plugin packaging outputs (SKILL overlay,
+//    launcher shims, plugin manifest, and marketplace catalog)
 // 5. Running the CI gate (npm run ci)
 // 6. Scaffolding ROADMAP.md at four mutation sites
 // 7. Opening $EDITOR for human confirmation (skipped under --no-edit / --dry-run)
@@ -2019,11 +2020,10 @@ export async function runRelease(
   //
   // `--untracked-files=all` is REQUIRED: plain `git status` honors `status.showUntrackedFiles`,
   // so a maintainer with that set to `no` would slip an untracked file under `plugin/` past
-  // this guard — and `scripts/build.mjs` rm -rf's `plugin/` wholesale before regenerating, so
-  // that file would be destroyed. Forcing `=all` makes detection independent of user git config.
-  // Ignored files under the regenerated mirror dirs (`plugin/`, `.claude-plugin/`) are EXPLICITLY
-  // excluded from the lossless guarantee: those dirs are generated build output that build.mjs
-  // rewrites wholesale, so anything git-ignored there is disposable by repo convention.
+  // this guard. The abort rollback below cleans untracked files from the release-managed
+  // packaging directories, so forcing `=all` makes detection independent of user git config.
+  // Ignored files under `plugin/` and `.claude-plugin/` remain outside this precondition;
+  // `scripts/build.mjs` owns only its declared SKILL, launcher, manifest, and catalog outputs.
   const releaseManagedPaths = ["package.json", "core/package.json", "ROADMAP.md", "plugin", ".claude-plugin"];
   d.stdout("[pipeline release] checking working tree is clean in release-managed paths...");
   const statusResult = d.runCommand("git", ["status", "--porcelain", "--untracked-files=all", "--", ...releaseManagedPaths], { cwd: repoDir });
@@ -2036,18 +2036,19 @@ export async function runRelease(
     throw new Error(
       `[pipeline release] working tree has uncommitted changes in release-managed paths:\n${statusResult.stdout.trimEnd()}\n` +
       "Commit, stash, or discard them before cutting a release — the release command rewrites " +
-      "package.json, core/package.json, ROADMAP.md, and the plugin/ mirror, and its abort rollback " +
+      "package.json, core/package.json, ROADMAP.md, and generated packaging outputs under " +
+      "plugin/ and .claude-plugin/, and its abort rollback " +
       "restores those paths from HEAD (which would discard your local edits).",
     );
   }
 
-  // Restore every file the version bump + mirror regen + ROADMAP write touch FROM HEAD on
-  // abort before a successful release commit (mirror-regen / CI / issue-discovery / editor
+  // Restore every file the version bump + packaging generation + ROADMAP write touch FROM HEAD on
+  // abort before a successful release commit (packaging-generation / CI / issue-discovery / editor
   // abort, or a failed `git add` / `git commit` after `checkout -b`). `git restore
   // --source=HEAD --staged --worktree` resets both the index and the worktree from HEAD.
   // `git checkout --` is not enough after a successful add: it copies the index into the
   // worktree and would write the staged version bumps back (#1148). `git clean -fd` then
-  // removes any untracked mirror debris build.mjs may have generated (safe because the
+  // removes any untracked packaging debris build.mjs may have generated (safe because the
   // clean-tree precondition above guaranteed plugin/ and .claude-plugin/ held no untracked
   // files when the run began). Never pass `.agent-pipeline/frg` to restore/clean: evidence
   // stays on disk (#1148). Both exit codes are checked so a failed rollback is surfaced
@@ -2078,7 +2079,7 @@ export async function runRelease(
       d.stderr(
         `[pipeline release] ROLLBACK FAILED (git restore exited ${r.code}: ${r.stderr.trim()}; ` +
         `git clean exited ${clean.code}: ${clean.stderr.trim()}). ` +
-        "The working tree may have a stranded version bump or partial mirror — run " +
+        "The working tree may have a stranded version bump or partial packaging output — run " +
         "`git restore --source=HEAD --staged --worktree -- package.json core/package.json ROADMAP.md plugin .claude-plugin && git clean -fd plugin .claude-plugin` manually before retrying.",
       );
       return false;
@@ -2087,7 +2088,7 @@ export async function runRelease(
   };
   const restoreCheckout = (): void => {
     if (restoreManagedFiles()) {
-      d.stderr("[pipeline release] aborted before branch creation — restored package.json, core/package.json, ROADMAP.md, and the plugin/ mirror from HEAD.");
+      d.stderr("[pipeline release] aborted before branch creation — restored package.json, core/package.json, ROADMAP.md, and generated packaging outputs from HEAD.");
     }
   };
   const restoreBaseAfterFailedStage = (): void => {
@@ -2129,14 +2130,14 @@ export async function runRelease(
     d.stdout("[pipeline release] bumping version in package.json files...");
     bumpVersion(resolvedVersion, rootPkgPath, corePkgPath, d);
 
-    // 7. Regenerate plugin/ mirror.
-    d.stdout("[pipeline release] regenerating plugin/ mirror (node scripts/build.mjs)...");
+    // 7. Regenerate the committed plugin packaging outputs.
+    d.stdout("[pipeline release] regenerating SKILL, launcher, manifest, and catalog outputs (node scripts/build.mjs)...");
     const buildResult = d.runCommand("node", ["scripts/build.mjs"], { cwd: repoDir });
     if (buildResult.code !== 0) {
       d.stderr(buildResult.stdout);
       d.stderr(buildResult.stderr);
       throw new Error(
-        `[pipeline release] mirror regen failed: node scripts/build.mjs exited ${buildResult.code}`,
+        `[pipeline release] packaging generation failed: node scripts/build.mjs exited ${buildResult.code}`,
       );
     }
 
@@ -2223,7 +2224,13 @@ export async function runRelease(
     // as an explicit pathspec — `git add` of an ignored path is a hard fail.
     // Do not `git add -f`. Do not stage CHANGELOG.md here.
     d.stdout("[pipeline release] staging release files...");
-    const addPaths = ["package.json", "core/package.json", "ROADMAP.md", "plugin/"];
+    const addPaths = [
+      "package.json",
+      "core/package.json",
+      "ROADMAP.md",
+      "plugin/",
+      ".claude-plugin/",
+    ];
     const addResult = d.runCommand(
       "git",
       ["add", ...addPaths],

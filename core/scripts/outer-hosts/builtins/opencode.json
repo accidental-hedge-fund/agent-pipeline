@@ -25,7 +25,7 @@
       "extraScriptFiles": ["opencode-pipeline-bridge.mjs"]
     },
     "userOwnedExclusion": "Only managed pipeline skill tree and commands/pipeline.md are removed on uninstall. Unrelated user commands and files under the OpenCode config dir are preserved. OPENCODE_CONFIG (single file path) is never used as a base.",
-    "postInstall": "Invoke with /pipeline (native command routes to the launcher). Skill path: <OPENCODE_CONFIG_DIR or ~/.config/opencode>/skills/pipeline. Restart OpenCode if commands do not appear live.",
+    "postInstall": "Invoke with /pipeline (LLM-mediated markdown command routes to the launcher). Skill path: <OPENCODE_CONFIG_DIR or ~/.config/opencode>/skills/pipeline. Restart OpenCode if commands do not appear live.",
     "installOrder": 30
   },
   "invocation": {

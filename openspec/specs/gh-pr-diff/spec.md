@@ -77,13 +77,13 @@ The composed fallback string SHALL include a `diff --git a/<path> b/<path>` head
 
 ### Requirement: getPrDiff SHALL materialize omitted text patches and SHALL NOT present them as complete header-only diffs
 
-When a files-list entry omits `patch` (or `patch` is empty) and reports a non-zero text change (`changes > 0` or `additions > 0` or `deletions > 0`), `getPrDiff` SHALL materialize reviewable hunk text from the Git blobs API (`GET /repos/{owner}/{repo}/git/blobs/{sha}`) and, for modified/renamed-with-edits entries, the contents API at the PR comparison merge-base SHA. `getPrDiff` SHALL use `base.sha` and `head.sha` from the pinned matching before/after pair (see pin requirement) and SHALL use `merge_base_commit.sha` from `GET /repos/{owner}/{repo}/compare/{base.sha}...{head.sha}` of that captured pair as the contents ref. It SHALL NOT re-read the live pull request after the files list returns in order to pick a later head for merge-base. It SHALL NOT use the base-branch tip (`base.sha`) as the old-blob ref when that SHA differs from the merge base. Materialization SHALL NOT require a local worktree. When materialization fails, `getPrDiff` SHALL throw an Error that names the pull request and the path. `getPrDiff` SHALL NOT return a header-only string as success for that file. When a files-list entry omits `patch` and reports zero changes, `getPrDiff` SHALL emit the path header (binary / empty / mode-only) and SHALL still resolve successfully.
+When a files-list entry omits `patch` (or `patch` is empty) and reports a non-zero text change (`changes > 0` or `additions > 0` or `deletions > 0`), `getPrDiff` SHALL materialize reviewable hunk text from the Git blobs API (`GET /repos/{owner}/{repo}/git/blobs/{sha}`) and, for modified/renamed-with-edits entries, the contents API at the PR comparison merge-base SHA. `getPrDiff` SHALL use `base.sha` and `head.sha` from the pinned matching before/after pair (see pin requirement) and SHALL use `merge_base_commit.sha` from `GET /repos/{owner}/{repo}/compare/{base.sha}...{head.sha}` of that captured pair as the contents ref. It SHALL NOT re-read the live pull request after the files list returns in order to pick a later head for merge-base. It SHALL NOT use the base-branch tip (`base.sha`) as the old-blob ref when that SHA differs from the merge base. Materialization SHALL NOT require a local worktree. When materialization fails, `getPrDiff` SHALL throw an Error that names the pull request and the path. `getPrDiff` SHALL NOT return a header-only string as success for that file. When a files-list entry omits `patch`, has `status` `modified`, and reports zero line changes, `getPrDiff` SHALL throw an Error that names the pull request and path because the entry may represent a file-mode change and the files-list payload has no old/new mode metadata. It SHALL NOT return a header-only diff as success. This fail-closed behavior also covers ambiguous binary modifications. Other patch-less zero-change statuses SHALL continue to emit the path header and resolve successfully.
 
-#### Scenario: Missing per-file patch with zero changes contributes a path header
+#### Scenario: Patch-less zero-line modified entry fails closed
 
-- **WHEN** a files-list entry has `filename` `bin/app.bin`, no `patch` field, and `changes` `0`
-- **THEN** the composed string SHALL include `diff --git a/bin/app.bin b/bin/app.bin`
-- **AND** `getPrDiff` SHALL still resolve successfully
+- **WHEN** a files-list entry has `status` `modified`, `filename` `bin/app.bin`, no `patch` field, and `additions`, `deletions`, and `changes` all equal `0`
+- **THEN** `getPrDiff` SHALL throw an Error that names the pull request and `bin/app.bin` as a possible file-mode change
+- **AND** it SHALL NOT return a header-only diff as success
 
 #### Scenario: Omitted text patch is materialized from the git blob
 
@@ -163,7 +163,7 @@ After flattening the paginated files list, if the entry count is greater than or
 
 ### Requirement: getPrDiff too-large fallback SHALL be regression-tested via injectable I/O
 
-Automated checks SHALL fail if a fake `gh pr diff` HTTP 406 / too-large result does not produce a composed files-list diff. A second check SHALL fail if a successful small `gh pr diff` result still calls the files list. Checks SHALL also fail if omitted-text files (`patch` absent, `changes > 0`) succeed as header-only, if a modified omitted-text hunk is synthesized from the base-branch tip when the merge base differs, if a 3000-file flattened list returns a composed prefix, if the fallback invokes `git`, or if an H1 files-list snapshot is composed against an H2 merge-base when the head moves during collection. Tests SHALL inject the `gh` runner (or equivalent `GhRunOptions` seam). Tests SHALL NOT perform real network, git, or subprocess calls.
+Automated checks SHALL fail if a fake `gh pr diff` HTTP 406 / too-large result does not produce a composed files-list diff. A second check SHALL fail if a successful small `gh pr diff` result still calls the files list. Checks SHALL also fail if omitted-text files (`patch` absent, `changes > 0`) succeed as header-only, if a patch-less zero-line `modified` entry resolves successfully, if a modified omitted-text hunk is synthesized from the base-branch tip when the merge base differs, if a 3000-file flattened list returns a composed prefix, if the fallback invokes `git`, or if an H1 files-list snapshot is composed against an H2 merge-base when the head moves during collection. Tests SHALL inject the `gh` runner (or equivalent `GhRunOptions` seam). Tests SHALL NOT perform real network, git, or subprocess calls.
 
 #### Scenario: Regression fails if 406 does not compose a files-list diff
 
@@ -183,6 +183,12 @@ Automated checks SHALL fail if a fake `gh pr diff` HTTP 406 / too-large result d
 - **WHEN** the automated checks inject a 406 runner and a files-list entry with no `patch` and `changes > 0`
 - **AND** the injected blob API returns file text
 - **AND** `getPrDiff` returns a string that lacks that file text
+- **THEN** the checks SHALL fail
+
+#### Scenario: Regression fails if a patch-less zero-line modified entry succeeds
+
+- **WHEN** the automated checks inject a 406 runner and a files-list entry with `status` `modified`, no `patch`, and zero `additions`, `deletions`, and `changes`
+- **AND** `getPrDiff` returns any diff instead of throwing an Error that names the pull request and path
 - **THEN** the checks SHALL fail
 
 #### Scenario: Regression fails if omitted modified hunk uses the base tip

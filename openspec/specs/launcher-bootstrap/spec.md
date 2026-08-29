@@ -145,9 +145,9 @@ A TypeScript-loading command SHALL fail closed only when no engines-compliant No
 - **THEN** the launcher SHALL re-exec that binary
 - **AND** it SHALL NOT print `nvm install 24` as the outcome
 
-### Requirement: Installer and plugin mirror SHALL stage ensure-engines-node.mjs next to the shim
+### Requirement: Installer SHALL stage ensure-engines-node.mjs and the generated plugin shell SHALL delegate to that managed install
 
-`scripts/install.mjs` and `scripts/build.mjs` SHALL copy `scripts/ensure-engines-node.mjs` into the skill `scripts/` directory next to the generated `pipeline.mjs` so an installed skill tree (`…/skills/pipeline/scripts/`) and the generated `plugin/` tree can resolve the module the shim loads. Regenerated `plugin/` SHALL ship in the same change as the staging logic.
+`scripts/install.mjs` SHALL copy `scripts/ensure-engines-node.mjs` into the managed skill `scripts/` directory next to the generated `pipeline.mjs` so the installed launcher can resolve the module it loads. The generated marketplace plugin shell SHALL NOT load an adjacent engine or require a copied `core/`; its launcher SHALL require the installer ownership marker and delegate exact argv to the managed Claude launcher. `scripts/build.mjs` MAY retain a transitional resolver asset in the plugin shell until #1050, but the marketplace bridge SHALL NOT claim to load it.
 
 #### Scenario: Installed skill tree can resolve the resolver module
 
@@ -155,10 +155,12 @@ A TypeScript-loading command SHALL fail closed only when no engines-compliant No
 - **THEN** `…/skills/pipeline/scripts/ensure-engines-node.mjs` SHALL exist
 - **AND** the generated `pipeline.mjs` in that same directory SHALL be able to load it
 
-#### Scenario: plugin/ mirror stages the resolver module
+#### Scenario: Generated plugin shell delegates without a core copy
 
-- **WHEN** `node scripts/build.mjs` generates the plugin tree
-- **THEN** `plugin/pipeline/skills/pipeline/scripts/ensure-engines-node.mjs` SHALL exist next to `pipeline.mjs`
+- **WHEN** `node scripts/build.mjs` generates the plugin SKILL shell
+- **THEN** its `pipeline.mjs` SHALL delegate exact argv to an installer-managed Claude launcher
+- **AND** it SHALL fail with install remediation when that managed launcher or ownership marker is absent
+- **AND** `plugin/pipeline/skills/pipeline/core/` SHALL NOT exist or be required
 
 #### Scenario: Repo template --version still works without the installed layout
 

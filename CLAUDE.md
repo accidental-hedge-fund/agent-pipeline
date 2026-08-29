@@ -8,10 +8,13 @@ review steps must follow.
 ## Golden rules (read first)
 
 1. **The product is the `pipeline` CLI plus a short host SKILL.** Hosts are argv
-   wrappers that exec the CLI; do not treat `plugin/` as distribution. Until
-   #1048, `node scripts/build.mjs --check` still applies.
+   wrappers that exec the CLI; do not treat `plugin/` as distribution. Edit `core/`,
+   never `plugin/` directly. After any change under `core/`, run `node scripts/build.mjs` so `--check` can
+   assert SKILL overlay and marketplace catalog freshness. Do not commit a `plugin/` copy
+   of `core/scripts`. CI fails if the generated SKILL overlay or marketplace catalog is
+   stale (`node scripts/build.mjs --check`). Whole-tree deletion of `plugin/` is #1050.
 2. **`npm run ci` must pass before a change is done.** It runs: `ci:core` (`cd core && npm ci
-   && npm test`) → `build.mjs --check` (mirror in sync) → `ci:install-smoke` →
+   && npm test`) → `build.mjs --check` (SKILL/catalog freshness) → `ci:install-smoke` →
    `ci:openspec` (`openspec validate --all` when an `openspec/` directory is present) →
    **conditional docs freshness** (`ci:docs`: no-op when the generator is absent; real
    `docs:check` / `generate-docs --check` when `scripts/generate-docs.mjs` is present) →
@@ -23,10 +26,10 @@ review steps must follow.
    default-demote review steps to go faster. Speed work must be rigor-preserving (better
    prompts, removing dead/deterministic asks, fixing real convergence bugs) — never by
    removing review coverage.
-4. **Advance never merges.** `/pipeline`, `/pipeline:single`, and `/pipeline:loop`
+4. **Advance never merges.** `/pipeline N`, `pipeline single`, and `pipeline loop`
    stop at `pipeline:ready-to-deploy` and never invoke a merge. Merging uses
-   loop-isolated, operator-authorized commands only: `/pipeline:merge` per PR,
-   `/pipeline:merge-queue --apply` for a batch (`merge-queue` is dry-run by default),
+   loop-isolated, operator-authorized commands only: `pipeline merge` per PR,
+   `pipeline merge-queue --apply` for a batch (`merge-queue` is dry-run by default),
    `pipeline train --merge`, or `pipeline ship --milestone` (no grant file).
    External supervisors may invoke those same commands under operator authority.
    This repository does not ship a Hermes/Buzz factory control plane, grant schema,
@@ -44,13 +47,12 @@ review steps must follow.
   `profile.ts`, `review-policy.ts`, `stages/*.ts` (one file per stage: planning, review, fix,
   pre_merge, eval, deploy_ready, auto_recover), `prompts/*.md` (templates with `{{placeholders}}`).
 - `core/test/` — co-located `*.test.ts`.
-- `hosts/` — per-host packaging (`claude`, `codex`, `_shared`); short SKILL shims that exec the CLI.
-- `plugin/` — generated mirror (transitional until #1050); do not hand-edit.
-  Until #1048, after editing `core/`, run `node scripts/build.mjs` and include
-  the regenerated `plugin/` in the same commit. That is a transitional CI gate,
-  not the product rule.
+- `hosts/` — per-host packaging (`claude`, `codex`, `_shared`); the SKILL.md variants live here.
+- `plugin/` — generated Claude SKILL overlay, plugin manifest, and support scripts until
+  #1050; do not hand-edit. The companion marketplace catalog is
+  `.claude-plugin/marketplace.json`. Neither location contains a `core/scripts` copy.
 - `openspec/` — spec-driven-development specs (`specs/`) and in-flight changes (`changes/`).
-- `scripts/` — `build.mjs` (generate/check the mirror), `install.mjs`, `ci-install-smoke.mjs`.
+- `scripts/` — `build.mjs` (SKILL/catalog generate/check), `install.mjs`, `ci-install-smoke.mjs`.
 
 ## Build & test
 

@@ -452,6 +452,13 @@ test("pipeline --help output contains no papercut entry", async () => {
   );
 });
 
+test("pipeline --help omits the dispatchable legacy run alias (#1048)", () => {
+  assert.equal(lookupCommand("run"), COMMAND_REGISTRY.run);
+  const help = buildCmd().helpInformation();
+  const argumentBlock = help.slice(help.indexOf("Arguments:"), help.indexOf("Options:"));
+  assert.doesNotMatch(argumentBlock, /\brun\b/);
+});
+
 // ---------------------------------------------------------------------------
 // allowsJsonFlag — early --json guard must track registry supportsJson
 // (regression: train --json was rejected while supportsJson:true)

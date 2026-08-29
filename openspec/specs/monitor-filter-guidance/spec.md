@@ -73,7 +73,7 @@ Host skill orchestration guidance for long-running advance and loop runs SHALL d
 
 ### Requirement: Material filter guidance SHALL be consistent across host variants
 
-All host skill variants that document long-running progress notify (at least `hosts/claude/SKILL.md`, `hosts/codex/SKILL.md`, and the Grok-consumed path / `hosts/grok/SKILL.md` when present, plus generated plugin mirrors of those files) SHALL describe the **same** material kind set and spam-suppression rules for the events.jsonl material filter. Host variants SHALL differ only in the host notify map tool names used to surface filter output, not in which event kinds are material.
+All host skill variants that document long-running progress notify (at least `hosts/claude/SKILL.md`, `hosts/codex/SKILL.md`, and the Grok-consumed path / `hosts/grok/SKILL.md` when present, plus the generated plugin SKILL overlay) SHALL describe the **same** material kind set and spam-suppression rules for the events.jsonl material filter. Host variants SHALL differ only in the host notify map tool names used to surface filter output, not in which event kinds are material.
 
 #### Scenario: Claude and Codex share material kinds
 
@@ -88,4 +88,3 @@ All host skill variants that document long-running progress notify (at least `ho
 - **THEN** its material kind set SHALL match the shared filter contract
 - **AND** its surface SHALL be Grok `monitor` (or equivalent), not a divergent
   kind list
-

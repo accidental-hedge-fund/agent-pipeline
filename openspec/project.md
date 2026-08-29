@@ -14,12 +14,10 @@ surfaces, not a Claude-plus-Codex-only product.
 - Single source of truth is `core/`. Stages live in `core/scripts/stages/`,
   prompt templates in `core/scripts/prompts/*.md`, shared helpers in
   `core/scripts/` (`gh.ts`, `worktree.ts`, `openspec.ts`, …).
-- `plugin/` is a generated mirror of `core/` (plus the Claude host overlay),
-  scheduled for deletion in #1050. Do not hand-edit it. Until #1048,
-  `node scripts/build.mjs --check` remains a transitional CI gate: after
-  changing `core/` or `hosts/claude/SKILL.md`, run `node scripts/build.mjs`
-  and include the regenerated `plugin/` in the same commit. That is not the
-  forever packaging rule; the product is the CLI plus a short host SKILL.
+- The product is the pipeline CLI plus host SKILL. After changing `core/` or
+  `hosts/claude/SKILL.md`, run `node scripts/build.mjs` so `--check` can assert
+  SKILL overlay and marketplace catalog freshness. Do not commit a `plugin/`
+  copy of `core/scripts`. Whole-tree deletion of `plugin/` is #1050.
 - Tests are `node --test` under `core/test/` (run `cd core && npm test`).
 
 ## Conventions

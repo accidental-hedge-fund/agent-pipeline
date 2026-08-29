@@ -66,6 +66,7 @@ function makeRecordingAdapter(opts: {
     workingDir: "cwd" as const,
     telemetry: "none" as const,
     maxPromptBytes: opts.maxPromptBytes ?? ("unlimited" as const),
+    background_job_lifecycle: { supported: false as const },
   };
   const adapter: HarnessAdapter = {
     name: opts.name,

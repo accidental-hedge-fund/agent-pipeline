@@ -1748,9 +1748,9 @@ test("runRelease: aborts before any write when a release-managed path is dirty (
 
 test("runRelease: clean-tree guard forces --untracked-files=all (config-independent) (#170 review-2)", async () => {
   // Plain `git status` honors `status.showUntrackedFiles`, so a maintainer with that set to
-  // `no` could slip an untracked file under plugin/ past the guard — which build.mjs's rm -rf
-  // would then destroy. The guard MUST pass --untracked-files=all so detection does not depend
-  // on user git config. This asserts the flag is present on the status command.
+  // `no` could slip an untracked file under plugin/ past the guard. Release-abort rollback
+  // cleans untracked release-managed paths, so the guard MUST pass --untracked-files=all and
+  // not depend on user git config. This asserts the flag is present on the status command.
   const statusCalls: string[][] = [];
   const deps = makeDeps({
     readFile: (p) => {
@@ -2457,7 +2457,7 @@ test("runRelease dry-run: fetch failure reports unavailable without inventing me
 });
 
 test("runRelease: a post-bump abort (CI failure) restores the bumped files (#170)", async () => {
-  // CI fails AFTER the version bump + mirror regen. The checkout must be restored so a
+  // CI fails AFTER the version bump + packaging generation. The checkout must be restored so a
   // retry does not read the already-bumped version as previousVersion.
   const commands: string[][] = [];
   const deps = liveReleaseDeps({
@@ -2762,6 +2762,7 @@ test("runRelease: git add after FRG pass must not include gitignored .agent-pipe
   assert.ok(add.includes("core/package.json"));
   assert.ok(add.includes("ROADMAP.md"));
   assert.ok(add.includes("plugin/"));
+  assert.ok(add.includes(".claude-plugin/"));
   assert.ok(!add.includes("CHANGELOG.md"), "prepare must not stage CHANGELOG.md");
 });
 

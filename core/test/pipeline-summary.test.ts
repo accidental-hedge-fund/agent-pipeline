@@ -7,6 +7,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as path from "node:path";
 import {
+  maxPositionalsFor,
+  parseSummaryTarget,
   runSummary,
   runSummaryByRunId,
   type RunSummaryDeps,
@@ -75,6 +77,17 @@ function withCapture(fn: () => Promise<void>): Promise<{ errors: string[]; exitC
 // ---------------------------------------------------------------------------
 // runSummary — run-directory priority
 // ---------------------------------------------------------------------------
+
+test("parseSummaryTarget: positive integers select latest issue bundle; run ids stay exact", () => {
+  assert.ok(["summary", String(ISSUE)].length <= maxPositionalsFor("summary"));
+  assert.deepEqual(parseSummaryTarget("147"), { kind: "issue", issueNumber: 147 });
+  assert.deepEqual(parseSummaryTarget("147-2026-06-20T10-00-00-000Z"), {
+    kind: "run",
+    runId: "147-2026-06-20T10-00-00-000Z",
+  });
+  assert.equal(parseSummaryTarget("0"), null);
+  assert.equal(parseSummaryTarget(undefined), null);
+});
 
 test("runSummary: reads from run-directory summary.json when available (#261)", async () => {
   const runDirBundle = makeBundle({ runId: "run-dir-bundle" });

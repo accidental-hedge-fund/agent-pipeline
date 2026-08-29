@@ -88,6 +88,7 @@ import {
   stageDiagnosticFromBlockerSet,
   type StageDiagnostic,
 } from "../stage-diagnostic.ts";
+import { filterRecipesForHarnessBackgroundWait } from "../harness-adapters/background-job-lifecycle.ts";
 import {
   evaluateRunFatalResumeEligibility,
   formatRunFatalResumeRefusal,
@@ -956,9 +957,13 @@ async function executeBlockedRecovery(
       return { ledger, attempted: false };
     }
     const hasCandidateHead = Boolean(item.last_verified_identity?.head_sha.trim());
+    const reasonFiltered =
+      persisted.diagnostic.reason_code === "harness-background-wait"
+        ? filterRecipesForHarnessBackgroundWait(policy.recipes)
+        : policy.recipes;
     const executableRecipes = hasCandidateHead
-      ? policy.recipes
-      : policy.recipes.filter((recipe) => recipe !== "repair_pipeline_item");
+      ? reasonFiltered
+      : reasonFiltered.filter((recipe) => recipe !== "repair_pipeline_item");
     // #1060: same-sequence continuation forces repair after findings prep unlink.
     // Also prefer repair when the last matching attempt was already findings prep
     // unlink (avoids modulo re-picking free unlink after scratch is gone).

@@ -26,12 +26,12 @@ The repository SHALL provide a deterministic generator that emits the human CLI 
 
 ### Requirement: Host SKILL command tables SHALL be fed from the same CLI inventory
 
-The same generator (or a parameterized sibling using the same inventory) SHALL rewrite a clearly delimited generated region in both `hosts/claude/SKILL.md` and `hosts/codex/SKILL.md` so that both hosts list the same documented commands. The two surfaces SHALL differ only by host invocation token (`/pipeline` vs `$pipeline` or the host's documented equivalent), not by which commands are included.
+The same generator (or a parameterized sibling using the same inventory) SHALL rewrite a clearly delimited generated region in `hosts/claude/SKILL.md`, `hosts/codex/SKILL.md`, `hosts/omp/SKILL.md`, and `hosts/opencode/SKILL.md` so that all four hosts list the same documented commands. The surfaces SHALL differ only by host invocation token (`/pipeline` vs `$pipeline` or the host's documented equivalent), not by which commands are included.
 
-#### Scenario: Both hosts list the same documented commands
+#### Scenario: All hosts list the same documented commands
 
-- **WHEN** the generator rewrites the SKILL command-table regions for Claude and Codex
-- **THEN** the set of documented command keywords in both regions SHALL be identical
+- **WHEN** the generator rewrites the SKILL command-table regions for Claude, Codex, OMP, and OpenCode
+- **THEN** the set of documented command keywords in all four regions SHALL be identical
 - **AND** each region SHALL use only that host's invocation token form in usage lines
 
 #### Scenario: Generated regions are delimited and regenerable
@@ -43,7 +43,7 @@ The same generator (or a parameterized sibling using the same inventory) SHALL r
 
 ### Requirement: Committed CLI reference artifacts SHALL be staleness-gated in CI
 
-The repository SHALL provide a check mode for the CLI reference generator via `scripts/generate-docs.mjs --check` (or an equivalent `docs:check` script that invokes that check mode) that exits non-zero when the committed `docs/cli.md` or either host SKILL generated command-table region differs from a fresh generation. That check SHALL be reached from the root `npm run ci` gate through the existing conditional docs-freshness step (`ci:docs`) once the generator is present, so a stale committed reference fails CI the same way a stale `plugin/` mirror fails `build.mjs --check`.
+The repository SHALL provide a check mode for the CLI reference generator via `scripts/generate-docs.mjs --check` (or an equivalent `docs:check` script that invokes that check mode) that exits non-zero when the committed `docs/cli.md` or any of the four host SKILL generated command-table regions differs from a fresh generation. That check SHALL be reached from the root `npm run ci` gate through the existing conditional docs-freshness step (`ci:docs`) once the generator is present, so a stale committed reference fails CI the same way a stale generated SKILL/catalog output fails `build.mjs --check`.
 
 #### Scenario: Stale docs/cli.md fails the check
 
@@ -59,4 +59,3 @@ The repository SHALL provide a check mode for the CLI reference generator via `s
 
 - **WHEN** a contributor runs `npm run ci` from the repo root on a tree that contains `scripts/generate-docs.mjs`
 - **THEN** the CLI reference staleness check SHALL run as part of that gate (via `ci:docs` / `docs:check` / `generate-docs.mjs --check`)
-
