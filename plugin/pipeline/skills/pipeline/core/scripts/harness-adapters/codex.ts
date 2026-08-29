@@ -24,6 +24,7 @@
 // stdin-read unambiguous regardless of any other positional-looking argv.
 
 import {
+  BACKGROUND_JOB_LIFECYCLE_UNSUPPORTED,
   EMPTY_TELEMETRY,
   buildAdapterDeclaration,
   defaultRuntimeSmoke,
@@ -107,6 +108,9 @@ const CAPABILITIES: AdapterCapabilities = {
   telemetry: "jsonl",
   // stdin delivery — no OS per-argument ceiling on the prompt payload (#779).
   maxPromptBytes: "unlimited",
+  // exec --json proves item.completed / turn.completed telemetry, not background
+  // job identity, notification delivery, or foreground-join (#1299).
+  background_job_lifecycle: BACKGROUND_JOB_LIFECYCLE_UNSUPPORTED,
 };
 
 export const codexAdapter: HarnessAdapter = {

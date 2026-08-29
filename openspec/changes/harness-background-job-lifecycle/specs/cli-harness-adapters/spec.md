@@ -35,14 +35,14 @@ boolean non-support, not an omitted field.
 
 ### Requirement: Mutating implementation work SHALL refuse adapters that lack background_job_lifecycle
 
-Before spawning a local-CLI harness for product-mutating implementation work (implement,
-fix-round, test-fix, eval-fix, visual-fix), the pipeline SHALL require the assigned adapter to
-declare `background_job_lifecycle` supported. When the assigned adapter declares the capability
-unsupported or omits it, the pipeline SHALL refuse the invocation before any child process is
-spawned. The refusal SHALL be a typed `capability-refusal` distinguishable from missing-CLI,
-unauthenticated, unsupported model or effort, prompt-size refusal, and bare spawn errors. Planning
-and review invocations SHALL NOT require this capability and SHALL NOT be refused solely because
-the adapter declares `background_job_lifecycle` unsupported.
+The pipeline SHALL require `background_job_lifecycle` supported before spawning a local-CLI
+harness for product-mutating implementation work (implement, fix-round, test-fix, eval-fix,
+visual-fix). When the assigned adapter declares the capability unsupported or omits it, the
+pipeline SHALL refuse the invocation before any child process is spawned. The refusal SHALL be a
+typed `capability-refusal` distinguishable from missing-CLI, unauthenticated, unsupported model
+or effort, prompt-size refusal, and bare spawn errors. Planning and review invocations SHALL NOT
+require this capability and SHALL NOT be refused solely because the adapter declares
+`background_job_lifecycle` unsupported.
 
 #### Scenario: Unsupported implementer is refused before spawn
 

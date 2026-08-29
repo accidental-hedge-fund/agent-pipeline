@@ -2,8 +2,8 @@
 
 ### Requirement: Prompt single-turn text SHALL NOT be treated as lifecycle proof
 
-The existing single-turn prompt discipline in `implementing.md`, `fix.md`, `test_fix.md`,
-`eval_fix.md`, and `visual_fix.md` SHALL remain. The pipeline SHALL still permit a
+The existing single-turn prompt discipline SHALL remain in `implementing.md`, `fix.md`,
+`test_fix.md`, `eval_fix.md`, and `visual_fix.md`. The pipeline SHALL still permit a
 lifecycle-tracked background job on an adapter that declares `background_job_lifecycle`
 supported. The pipeline SHALL NOT treat prompt wording, a missing foreground instruction, or
 generic inactivity as proof of a background wait, as a protocol violation, or as

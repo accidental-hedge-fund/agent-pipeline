@@ -2,11 +2,10 @@
 
 ### Requirement: The capability hash SHALL include background_job_lifecycle
 
-The stable capability hash derived from an adapter's declared capability and declaration surface
-SHALL include the versioned `background_job_lifecycle` declaration (supported or unsupported,
-schema version, and declared join grace when present). Two adapters that differ only in that
-declaration SHALL NOT share a capability hash. Omitting the field from the hash payload SHALL
-fail the fingerprint or conformance test that pins hash inputs.
+The stable capability hash SHALL include the versioned `background_job_lifecycle` declaration
+(supported or unsupported, schema version, and declared join grace when present). Two adapters
+that differ only in that declaration SHALL NOT share a capability hash. Omitting the field from
+the hash payload SHALL fail the fingerprint or conformance test that pins hash inputs.
 
 #### Scenario: Support vs non-support changes the capability hash
 

@@ -16,6 +16,7 @@
 // be hit for this adapter, regardless of prompt size.
 
 import {
+  BACKGROUND_JOB_LIFECYCLE_UNSUPPORTED,
   EMPTY_TELEMETRY,
   buildAdapterDeclaration,
   defaultRuntimeSmoke,
@@ -120,6 +121,10 @@ const CAPABILITIES: AdapterCapabilities = {
   telemetry: "jsonl",
   // stdin delivery — no OS per-argument ceiling on the prompt payload (#779).
   maxPromptBytes: "unlimited",
+  // stream-json proves result/cost/usage, not job identity, start, complete/fail,
+  // notification delivery, or foreground-join. Host bash-notification never
+  // arrives in `claude --print` (#547 / lyric-utils #268). Do not invent events.
+  background_job_lifecycle: BACKGROUND_JOB_LIFECYCLE_UNSUPPORTED,
 };
 
 export const claudeAdapter: HarnessAdapter = {

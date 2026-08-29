@@ -29,6 +29,7 @@
 // (#492) — never silently truncated or guessed at.
 
 import {
+  BACKGROUND_JOB_LIFECYCLE_UNSUPPORTED,
   EMPTY_TELEMETRY,
   MAX_ARGV_PROMPT_BYTES,
   buildAdapterDeclaration,
@@ -58,6 +59,8 @@ const CAPABILITIES: AdapterCapabilities = {
   telemetry: "none",
   // argv delivery — finite limit aligned with #492 runCapped (>= MAX_ARG_STRLEN refuses).
   maxPromptBytes: MAX_ARGV_PROMPT_BYTES,
+  // telemetry none; no recorded fixture maps opencode events onto job lifecycle (#1299).
+  background_job_lifecycle: BACKGROUND_JOB_LIFECYCLE_UNSUPPORTED,
 };
 
 export const opencodeAdapter: HarnessAdapter = {

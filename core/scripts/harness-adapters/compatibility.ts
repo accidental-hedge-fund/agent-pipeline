@@ -10,6 +10,7 @@
 // is absent from the registry.
 
 import {
+  BACKGROUND_JOB_LIFECYCLE_UNSUPPORTED,
   EMPTY_TELEMETRY,
   MAX_ARGV_PROMPT_BYTES,
   buildAdapterDeclaration,
@@ -96,6 +97,7 @@ export function materializeCompatibilityAdapter(
     telemetry: "none" as const,
     maxPromptBytes:
       promptDelivery === "stdin" ? ("unlimited" as const) : MAX_ARGV_PROMPT_BYTES,
+    background_job_lifecycle: BACKGROUND_JOB_LIFECYCLE_UNSUPPORTED,
   };
   const declaration = buildAdapterDeclaration({
     roles: ["reviewer"],

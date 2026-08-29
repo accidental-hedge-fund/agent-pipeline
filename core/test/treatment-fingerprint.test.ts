@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import {
   ADAPTER_CONTRACT_VERSION,
+  adapterCapabilityHashPayload,
   buildTreatmentFingerprint,
   deriveTelemetryCoverage,
   hashAdapterCapabilities,
@@ -159,6 +160,23 @@ test("hashAdapterCapabilities: stable for identical declaration, changes when te
   const flippedCaps = { ...bits.capabilities, telemetry: "none" as const };
   const flippedDecl = { ...bits.declaration, telemetry: "none" as const, outputEnvelope: "text" as const };
   assert.notEqual(a, hashAdapterCapabilities(flippedCaps, flippedDecl));
+});
+
+test("hashAdapterCapabilities: background_job_lifecycle is a pin input and support flips the hash (#1299)", () => {
+  const bits = baseAdapterBits();
+  const payload = adapterCapabilityHashPayload(bits.capabilities, bits.declaration);
+  assert.ok("background_job_lifecycle" in payload);
+  assert.ok("background_job_lifecycle_decl" in payload);
+  const supported = {
+    supported: true as const,
+    schema: "pipeline/background-job-lifecycle@1" as const,
+  };
+  const flippedCaps = { ...bits.capabilities, background_job_lifecycle: supported };
+  const flippedDecl = { ...bits.declaration, background_job_lifecycle: supported };
+  assert.notEqual(
+    hashAdapterCapabilities(bits.capabilities, bits.declaration),
+    hashAdapterCapabilities(flippedCaps, flippedDecl),
+  );
 });
 
 test("sanitizeTreatmentFingerprint: round-trips and drops invalid costSource", () => {

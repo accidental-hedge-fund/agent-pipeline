@@ -33,6 +33,7 @@ import { randomUUID } from "node:crypto";
 import * as path from "node:path";
 import { harnessTelemetryEnabled } from "./claude.ts";
 import {
+  BACKGROUND_JOB_LIFECYCLE_UNSUPPORTED,
   EMPTY_TELEMETRY,
   buildAdapterDeclaration,
   defaultRuntimeSmoke,
@@ -160,6 +161,9 @@ const CAPABILITIES: AdapterCapabilities = {
   telemetry: "jsonl",
   // prompt-file delivery — no OS per-argument ceiling on the prompt payload (#779).
   maxPromptBytes: "unlimited",
+  // streaming-json / json envelopes prove text/cost/usage, not background-job
+  // identity, notification delivery, or foreground-join (#1299).
+  background_job_lifecycle: BACKGROUND_JOB_LIFECYCLE_UNSUPPORTED,
 };
 
 export const grokAdapter: HarnessAdapter = {

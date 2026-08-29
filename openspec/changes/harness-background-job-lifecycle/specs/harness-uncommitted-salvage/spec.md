@@ -2,15 +2,15 @@
 
 ### Requirement: Salvage after harness-background-wait SHALL retain evidence without a successful-stage outcome
 
-When a product-mutating harness step ends with reason `harness-background-wait` and the worktree
-contains uncommitted salvageable changes, the pipeline SHALL run the existing salvage path —
-including the depth-agnostic `node_modules` exclusion, pipeline-internal marker exclusion, owned-path
-scope when ownership is present, and `Issue:` / `Pipeline-Run:` trailers — and SHALL retain that
-salvage evidence. The pipeline SHALL NOT treat that salvage as a successful harness completion.
-The pipeline SHALL NOT proceed to the post-commit verification path as if the harness had
-committed normally, SHALL NOT reclassify the outcome as `harness-timeout`, SHALL NOT open a pull
-request, and SHALL NOT transition to `review-1` solely because salvage succeeded. Publication of
-salvaged work remains outside this requirement.
+The pipeline SHALL run the existing salvage path — including the depth-agnostic `node_modules`
+exclusion, pipeline-internal marker exclusion, owned-path scope when ownership is present, and
+`Issue:` / `Pipeline-Run:` trailers — and SHALL retain that salvage evidence when a
+product-mutating harness step ends with reason `harness-background-wait` and the worktree
+contains uncommitted salvageable changes. The pipeline SHALL NOT treat that salvage as a
+successful harness completion. The pipeline SHALL NOT proceed to the post-commit verification
+path as if the harness had committed normally, SHALL NOT reclassify the outcome as
+`harness-timeout`, SHALL NOT open a pull request, and SHALL NOT transition to `review-1` solely
+because salvage succeeded. Publication of salvaged work remains outside this requirement.
 
 #### Scenario: Dirty worktree after background-wait is salvaged and still background-wait
 

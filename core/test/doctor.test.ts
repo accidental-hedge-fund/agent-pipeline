@@ -480,6 +480,7 @@ test("check harness prompt-bytes — fails when assigned adapter declares unknow
     workingDir: "cwd" as const,
     telemetry: "none" as const,
     maxPromptBytes: "unknown" as const,
+    background_job_lifecycle: { supported: false as const },
   };
   registerAdapter({
     name: "unknown-limit-cli",
@@ -560,6 +561,7 @@ test("check harness prompt-bytes — fails when assigned argv adapter declares u
     telemetry: "none" as const,
     // Above the OS argv spawn ceiling — must fail doctor coherence (#779).
     maxPromptBytes: 1_000_000 as const,
+    background_job_lifecycle: { supported: false as const },
   };
   registerAdapter({
     name: "argv-overclaim-cli",
@@ -642,6 +644,7 @@ test("check harness prompt-bytes — fails when assigned stdin adapter declares 
     workingDir: "cwd" as const,
     telemetry: "none" as const,
     maxPromptBytes: 1_000_000 as const,
+    background_job_lifecycle: { supported: false as const },
   };
   registerAdapter({
     name: "stdin-finite-cli",

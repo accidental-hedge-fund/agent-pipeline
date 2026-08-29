@@ -143,6 +143,7 @@ export {
 // (shared with evals #653 / preflight #636; importable pure units).
 export {
   ADAPTER_CONTRACT_VERSION,
+  adapterCapabilityHashPayload,
   buildTreatmentFingerprint,
   deriveTelemetryCoverage,
   hashAdapterCapabilities,
@@ -153,6 +154,33 @@ export {
   type TelemetryCoverage,
   type TreatmentFingerprint,
 } from "./treatment-fingerprint.ts";
+export {
+  BACKGROUND_JOB_LIFECYCLE_MAX_JOIN_GRACE_MS,
+  BACKGROUND_JOB_LIFECYCLE_SCHEMA,
+  BACKGROUND_JOB_LIFECYCLE_UNSUPPORTED,
+  BackgroundJobLifecycleSupervisor,
+  MUTATING_IMPLEMENTER_STAGE_KINDS,
+  backgroundJobLifecycleCoherenceFailure,
+  backgroundWaitBlockReason,
+  capabilityRefusalMessage,
+  effectiveJoinGraceMs,
+  filterRecipesForHarnessBackgroundWait,
+  harnessInvocationFingerprint,
+  hashPromptForFingerprint,
+  isMutatingImplementerStageKind,
+  parseLifecycleJsonl,
+  protocolFixtureSupportIsHonest,
+  protocolProvesBackgroundJobLifecycle,
+  redactLifecycleEvent,
+  requiresBackgroundJobLifecycle,
+  runInjectedLifecycleSupervisor,
+  sameAdapterRetryForbidden,
+  supportedBackgroundJobLifecycle,
+  type BackgroundJobLifecycleEvidence,
+  type BackgroundJobProtocolFixture,
+  type InjectedLifecycleEvent,
+  type PreviousLifecycleInvocation,
+} from "./background-job-lifecycle.ts";
 export {
   createCliVersionProbeCache,
   parseCliVersionStdout,

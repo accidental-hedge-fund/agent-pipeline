@@ -21,6 +21,7 @@ import type { BlockerKind } from "./types.ts";
 /** Structured harness classification input (subset of HarnessResult flags). */
 export interface HarnessFailureSignals {
   timed_out?: boolean;
+  background_wait?: boolean;
   spawn_error?: boolean;
   capture_error?: boolean;
   oversize_argv?: boolean;
@@ -45,6 +46,7 @@ export function classifyHarnessFailure(
     HarnessResult,
     "timed_out" | "spawn_error" | "capture_error" | "code"
   > & {
+    background_wait?: boolean;
     oversize_argv?: boolean;
     stdin_error?: boolean;
     throttled?: boolean;
@@ -65,6 +67,7 @@ export function classifyHarnessFailure(
     return "model-entitlement-required";
   }
   if (result.throttled) return "transient-infra";
+  if ((result as HarnessFailureSignals).background_wait) return "harness-background-wait";
   if (result.timed_out) return "harness-timeout";
   if (result.oversize_argv || result.stdin_error || result.capture_error) {
     return "harness-contract";
@@ -197,6 +200,7 @@ export function interventionKindFromReason(
     case "model-entitlement-required":
       return "auth-tooling-preflight-failure";
     case "harness-timeout":
+    case "harness-background-wait":
     case "harness-contract":
     case "workflow-engine-defect":
       return "reviewer-unavailable";
@@ -248,6 +252,7 @@ export function isMechanicalInfrastructureReason(reasonCode: StageDiagnosticReas
   return (
     reasonCode === "transient-infra" ||
     reasonCode === "harness-timeout" ||
+    reasonCode === "harness-background-wait" ||
     reasonCode === "harness-contract" ||
     reasonCode === "external-wait" ||
     reasonCode === "repair-budget-exhausted" ||

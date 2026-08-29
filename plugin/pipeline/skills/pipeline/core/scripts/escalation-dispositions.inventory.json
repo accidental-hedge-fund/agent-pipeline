@@ -365,8 +365,20 @@
     {
       "site_id": "stages.fix:harness-failure#0",
       "module": "scripts/stages/fix.ts",
-      "line": 880,
+      "line": 956,
       "occurrence": 0,
+      "match": "harness-failure",
+      "disposition": "deliberately-fail-closed",
+      "blocker_kind": "harness-failure",
+      "canonical_reason": "harness-background-wait",
+      "notes": "typed complete/fail without delivery/join; same-adapter retry forbidden (#1299)",
+      "emitter": "setBlocked"
+    },
+    {
+      "site_id": "stages.fix:harness-failure#1",
+      "module": "scripts/stages/fix.ts",
+      "line": 1027,
+      "occurrence": 1,
       "match": "harness-failure",
       "disposition": "transient-retryable",
       "blocker_kind": "harness-failure",

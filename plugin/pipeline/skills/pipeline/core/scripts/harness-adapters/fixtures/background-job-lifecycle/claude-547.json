@@ -1,0 +1,18 @@
+{
+  "adapter": "claude",
+  "provenance": "github.com/anthropics/claude-code issue #547 (agent-pipeline v1.28.0 salvage)",
+  "raw_protocol": "claude --print --output-format stream-json",
+  "observed_event_types": [
+    "system",
+    "stream_event",
+    "rate_limit_event",
+    "result"
+  ],
+  "transcript_excerpt": "I'll wait for the background test run's notification before committing",
+  "proves_job_identity": false,
+  "proves_start": false,
+  "proves_complete_or_fail": false,
+  "proves_notification_delivery": false,
+  "proves_foreground_join": false,
+  "background_job_lifecycle": { "supported": false }
+}

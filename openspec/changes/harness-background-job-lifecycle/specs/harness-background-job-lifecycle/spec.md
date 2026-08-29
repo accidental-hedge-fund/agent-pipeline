@@ -90,8 +90,8 @@ SHALL classify as `harness-timeout` and SHALL NOT classify as `harness-backgroun
 
 ### Requirement: Completed or failed jobs SHALL join within a versioned grace period
 
-After a supporting adapter emits typed completion or failure for a background job, the pipeline
-SHALL require notification delivery and foreground-join within an effective grace period. The
+The pipeline SHALL require notification delivery and foreground-join within an effective grace
+period after a supporting adapter emits typed completion or failure for a background job. The
 pipeline SHALL own a versioned maximum join grace for `pipeline/background-job-lifecycle@1`. An
 adapter MAY declare a tighter join grace and SHALL NOT declare a looser one. The effective grace
 SHALL be the minimum of the pipeline maximum and the adapter declaration. `implementation_timeout`
@@ -166,9 +166,9 @@ fallback for this class.
 
 ### Requirement: Salvage SHALL run and the stage outcome SHALL remain harness-background-wait
 
-When a product-mutating harness ends as `harness-background-wait` and the worktree has
-uncommitted salvageable work, the pipeline SHALL run the existing bounded salvage path and SHALL
-retain that salvage evidence. The stage outcome SHALL remain `harness-background-wait`. Salvage
+The pipeline SHALL run the existing bounded salvage path and SHALL retain that salvage evidence
+when a product-mutating harness ends as `harness-background-wait` and the worktree has
+uncommitted salvageable work. The stage outcome SHALL remain `harness-background-wait`. Salvage
 SHALL NOT convert the outcome into a successful stage, SHALL NOT open a pull request, SHALL NOT
 transition the issue to `review-1`, and SHALL NOT reclassify the outcome as `harness-timeout`.
 Publication and recovery of salvaged work remain outside this capability.
