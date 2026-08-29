@@ -3765,8 +3765,9 @@ function frgReadyCleanFromState(state: string): boolean {
 
 /**
  * Overlay GitHub ready-to-deploy + bound-PR green checks onto ledger-projected
- * FRG items. Missing/unbound/unreadable observations keep the ledger row
- * (fail closed). Pure; no GitHub I/O (#1297).
+ * FRG items. Missing/unbound/unreadable observations fail closed: they do not
+ * count as clean-ready, and a ledger-ready row is projected ineligible.
+ * Pure; no GitHub I/O (#1297).
  */
 export function projectFrgItemsWithGitHubOverlay(
   items: readonly FrgItemInput[],
@@ -3774,11 +3775,13 @@ export function projectFrgItemsWithGitHubOverlay(
 ): FrgItemInput[] {
   return items.map((item) => {
     const obs = observations[item.item_id];
-    if (!obs || obs.pr_number == null) return { ...item };
-    const state = overlayLedgerStateFromGitHub(item.state, {
-      labels: obs.labels,
-      checks: obs.checks,
-    });
+    const state =
+      !obs || obs.pr_number == null
+        ? overlayLedgerStateFromGitHub(item.state, { labels: [], checks: [] })
+        : overlayLedgerStateFromGitHub(item.state, {
+            labels: obs.labels,
+            checks: obs.checks,
+          });
     return {
       ...item,
       state,

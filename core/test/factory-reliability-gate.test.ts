@@ -1141,6 +1141,10 @@ test("runFactoryGate --from-run post-1.33: collects hybrid-v2 provenance when mi
       finished_at: `2026-08-18T03:00:${String(index).padStart(2, "0")}.500Z`,
     })),
   });
+  observations.github_item_observations = {
+    "1112": r2dGreenObservation(2100),
+    "1113": r2dGreenObservation(2101),
+  };
 
   const result = await runFactoryGate(
     {
@@ -1272,6 +1276,10 @@ test("runFactoryGate --from-run forwards request packed candidate and writes lat
       finished_at: `2026-08-18T03:00:${String(index).padStart(2, "0")}.500Z`,
     })),
   });
+  observations.github_item_observations = {
+    "1112": r2dGreenObservation(2100),
+    "1113": r2dGreenObservation(2101),
+  };
 
   const result = await runFactoryGate(
     {
@@ -1597,6 +1605,30 @@ test("projectFrgItemsWithGitHubOverlay is fail-closed (#1297)", () => {
     "9999": r2dGreenObservation(9999),
   });
   assert.equal(unboundOtherPr.find((i) => i.item_id === STALE_PACK_ITEM)?.ready_clean, false);
+});
+
+test("projectFrgItemsWithGitHubOverlay fail-closes ledger-ready without GitHub (#1297)", () => {
+  const ledgerItems = itemsFromLoopLedger(staleBlockedPackLedger());
+  const sibling = ledgerItems.find((i) => i.item_id === STALE_PACK_SIBLING);
+  assert.equal(sibling?.state, "ready");
+  assert.equal(sibling?.ready_clean, true);
+
+  const missing = projectFrgItemsWithGitHubOverlay(ledgerItems, {
+    [STALE_PACK_ITEM]: r2dGreenObservation(1292),
+  });
+  assert.equal(missing.find((i) => i.item_id === STALE_PACK_SIBLING)?.ready_clean, false);
+  assert.equal(missing.find((i) => i.item_id === STALE_PACK_SIBLING)?.state, "blocked");
+
+  const unbound = projectFrgItemsWithGitHubOverlay(ledgerItems, {
+    [STALE_PACK_SIBLING]: {
+      labels: ["factory-gate", "pipeline:ready-to-deploy"],
+      pr_number: null,
+      checks: [{ conclusion: "success" }],
+    },
+    [STALE_PACK_ITEM]: r2dGreenObservation(1292),
+  });
+  assert.equal(unbound.find((i) => i.item_id === STALE_PACK_SIBLING)?.ready_clean, false);
+  assert.equal(unbound.find((i) => i.item_id === STALE_PACK_SIBLING)?.state, "blocked");
 });
 
 test("factory-gate --from-run overlays GitHub R2D over recovery_exhausted blocked ledger (#1297)", async () => {

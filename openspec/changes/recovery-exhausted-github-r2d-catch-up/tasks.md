@@ -4,6 +4,7 @@
 - [x] 1.2 Add a unit test that scores `factory-release prepare` / `defaultScoreBoundPackLoop` on that same ledger and GitHub overlay; verify it fails while observed is `1` / `K=2`
 - [x] 1.3 Add a unit test that resumes that same stopped ledger with verified ready identity; verify it fails while resume never repair-forwards / never persists ledger `ready` for the R2D item
 - [x] 1.4 Add fail-closed overlay tests: missing R2D label, failed checks, pending checks, absent PR, wrong/unbound PR, unreadable GitHub, and `needs-human` stay not clean-ready
+- [x] 1.6 Add fail-closed overlay tests for a ledger-ready item with missing or unbound GitHub observations (clear `ready_clean`, project ineligible)
 - [x] 1.5 Add a resume test that repair-forwards verified `merged` identity as well as `ready`
 
 ## 2. FRG throughput overlay

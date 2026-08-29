@@ -47,6 +47,13 @@ FRG throughput scoring on `factory-gate --from-run` and `factory-release prepare
 - **THEN** `clean-item-throughput` SHALL NOT count that item as clean-ready
 - **AND** the projector SHALL keep the ledger state for that item
 
+#### Scenario: Missing or unbound GitHub does not count a ledger-ready item as clean-ready
+
+- **WHEN** the durable ledger item is `ready`
+- **AND** issue, PR, or check observations are missing or unreadable, or there is no bound pack PR
+- **THEN** `clean-item-throughput` SHALL NOT count that item as clean-ready
+- **AND** the overlay SHALL clear `ready_clean` and project an ineligible state
+
 #### Scenario: needs-human is not clean-ready
 
 - **WHEN** live GitHub labels include `pipeline:needs-human`
