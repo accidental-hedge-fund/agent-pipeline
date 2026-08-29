@@ -15,6 +15,9 @@
 - [x] 2.7 Bind each bundle to `repo_id`, integration-base SHA, worktree HEAD/tree, providers digest, and `observed_at`, and verify two bundles that differ only in `observed_at` do not count as a required-fact change
 - [x] 2.8 Treat required provider failure as a block-before-model outcome and optional failure as `unavailable` records with no reuse of a prior success, and verify both with injected fakes
 - [x] 2.9 Bound stdout/stderr in the spawn stream handlers, terminate the provider when a byte cap is exceeded, wait for process close before resolving timeout or ceiling, and verify injected-spawn regressions for both paths
+- [x] 2.10 Capture enumerated ignored-path state (not collapsed directories) in the worktree snapshot, do not treat pre-existing ignored files as dirty, fail mutation on ignored write/delete/modify, and verify both write and delete regressions
+- [x] 2.11 Materialize the trusted executable directory as an isolated source bundle, overlay those bytes onto the planning worktree for spawn only, and verify a worktree-replaced same-directory helper is not executed
+- [x] 2.12 Run providers in cgroup containment, refuse success while descendants remain (including setsid/stdio-closed daemons), terminate leftovers before the post-run snapshot, and verify a daemonized delayed-write provider cannot land a write after observation
 
 ## 3. Prompts and claims
 

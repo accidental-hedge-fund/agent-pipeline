@@ -16,18 +16,25 @@ import {
   digestValue,
   emptyPlanningFactBundle,
   extractPlanningFactClaims,
+  canonicalizeIgnoredListing,
+  defaultMaterializeTrustedProviderBundle,
+  defaultOverlayTrustedProviderFiles,
   observePlanningFacts,
+  planningFactsContainmentArgv,
   planningFactsReasonPrefix,
   planningFactsSection,
   requiredFactIdentities,
   requiredFactsChanged,
+  worktreeSnapshotsDiffer,
   PLANNING_FACT_CLAIMS_SCHEMA_BLOCK,
   PLANNING_FACT_CLAIMS_SCHEMA_FIELDS,
   PLANNING_FACTS_CONTRACT_TAG,
   type PlanningFactBundle,
   type PlanningFactsDeps,
+  type ProviderContainment,
   type SpawnProviderRequest,
   type SpawnProviderResult,
+  type TrustedProviderFile,
   type WorktreeSnapshot,
 } from "../scripts/planning-facts.ts";
 import {
@@ -111,7 +118,7 @@ function successSpawn(facts: Record<string, unknown>): SpawnProviderResult {
 }
 
 function snapshot(over: Partial<WorktreeSnapshot> = {}): WorktreeSnapshot {
-  return { head: "aaa", tree: "bbb", porcelain: "", ...over };
+  return { head: "aaa", tree: "bbb", porcelain: "", ignored: "", ...over };
 }
 
 function baseDeps(over: Partial<PlanningFactsDeps> & {
@@ -138,11 +145,17 @@ function baseDeps(over: Partial<PlanningFactsDeps> & {
     },
     now: () => new Date("2026-08-29T15:46:05Z"),
     updateWorktreeOntoBase: async () => ({ ok: true }),
-    materializeTrustedExecutable: (bytes) => {
-      const dest = path.join(os.tmpdir(), `pf-exec-${digestValue(bytes.toString("utf8")).slice(0, 12)}`);
-      fs.writeFileSync(dest, bytes);
+    listTrustedPrefix: async (_sha, prefix) =>
+      Object.keys(blobs).filter((p) => p === prefix || p.startsWith(prefix.endsWith("/") ? prefix : `${prefix}/`)),
+    materializeTrustedProviderBundle: (files, entry) => {
+      const dest = path.join(
+        os.tmpdir(),
+        `pf-exec-${digestValue(files.find((f) => f.repoRelPath === entry)?.bytes.toString("utf8") ?? "x").slice(0, 12)}`,
+      );
+      fs.writeFileSync(dest, files.find((f) => f.repoRelPath === entry)?.bytes ?? Buffer.alloc(0));
       return dest;
     },
+    overlayTrustedProviderFiles: () => ({ restore() {} }),
     ...over,
   };
   (deps as PlanningFactsDeps & { recorded: SpawnProviderRequest[] }).recorded = recorded;
@@ -211,8 +224,8 @@ test("trusted executable bytes are spawned, not worktree rewrite bytes", async (
     cfg: cfg(),
     worktreeDir: "/wt",
     deps: baseDeps({
-      materializeTrustedExecutable: (bytes) => {
-        spawnedBytes = bytes.toString("utf8");
+      materializeTrustedProviderBundle: (files, entry) => {
+        spawnedBytes = (files.find((f) => f.repoRelPath === entry)?.bytes ?? Buffer.alloc(0)).toString("utf8");
         return "/tmp/trusted-exec";
       },
       spawnImpl: (req) => {
@@ -354,6 +367,151 @@ test("mutating provider fails and dirt is preserved (no reset/clean)", async () 
     assert.equal(observation.evidence?.porcelain, "?? mutated.txt\n");
   }
   assert.deepEqual(gitOps, []);
+});
+
+test("pre-existing ignored files do not count as a dirty worktree", async () => {
+  let spawned = 0;
+  const observation = await observePlanningFacts({
+    cfg: cfg(),
+    worktreeDir: "/wt",
+    deps: baseDeps({
+      snapshots: [
+        snapshot({ ignored: ".env\nabc" }),
+        snapshot({ ignored: ".env\nabc" }),
+        snapshot({ ignored: ".env\nabc" }),
+        snapshot({ ignored: ".env\nabc" }),
+      ],
+      spawnImpl: () => {
+        spawned += 1;
+        return successSpawn({ alembic_head: "0074" });
+      },
+    }),
+  });
+  assert.equal(observation.ok, true);
+  assert.equal(spawned, 1);
+});
+
+test("ignored-file write is mutation even when porcelain stays empty", async () => {
+  const observation = await observePlanningFacts({
+    cfg: cfg(),
+    worktreeDir: "/wt",
+    deps: baseDeps({
+      snapshots: [
+        snapshot({ ignored: ".env\nabc" }),
+        snapshot({ ignored: ".env\nabc" }),
+        snapshot({ ignored: ".env\ndef" }),
+      ],
+      spawnImpl: () => successSpawn({ alembic_head: "0074" }),
+    }),
+  });
+  assert.equal(observation.ok, false);
+  if (!observation.ok) {
+    assert.equal(observation.failureClass, "mutation");
+    assert.equal(observation.evidence?.ignored, ".env\ndef");
+    assert.equal(observation.evidence?.porcelain, "");
+  }
+});
+
+test("ignored-file delete is mutation even when porcelain stays empty", async () => {
+  const observation = await observePlanningFacts({
+    cfg: cfg(),
+    worktreeDir: "/wt",
+    deps: baseDeps({
+      snapshots: [
+        snapshot({ ignored: ".env\nsecret/a.txt\nabc" }),
+        snapshot({ ignored: ".env\nsecret/a.txt\nabc" }),
+        snapshot({ ignored: ".env\nabc" }),
+      ],
+      spawnImpl: () => successSpawn({ alembic_head: "0074" }),
+    }),
+  });
+  assert.equal(observation.ok, false);
+  if (!observation.ok) {
+    assert.equal(observation.failureClass, "mutation");
+    assert.equal(observation.evidence?.ignored, ".env\nabc");
+  }
+});
+
+test("canonicalizeIgnoredListing enumerates files and content, not collapsed directories", () => {
+  const files: Record<string, Buffer> = {
+    ".env": Buffer.from("secret"),
+    "secret/a.txt": Buffer.from("a"),
+    "secret/nested/b.txt": Buffer.from("b"),
+  };
+  const listing = [".env", "secret/a.txt", "secret/nested/b.txt"].join("\0") + "\0";
+  const snap = canonicalizeIgnoredListing(listing, (p) => files[p] ?? null);
+  assert.match(snap, /\.env/);
+  assert.match(snap, /secret\/a\.txt/);
+  assert.match(snap, /secret\/nested\/b\.txt/);
+  const afterWrite = canonicalizeIgnoredListing(listing, (p) =>
+    p === ".env" ? Buffer.from("changed") : files[p] ?? null,
+  );
+  assert.notEqual(snap, afterWrite);
+  const afterDelete = canonicalizeIgnoredListing([".env", "secret/a.txt"].join("\0") + "\0", (p) => files[p] ?? null);
+  assert.notEqual(snap, afterDelete);
+  assert.equal(worktreeSnapshotsDiffer(snapshot({ ignored: snap }), snapshot({ ignored: afterWrite })), true);
+});
+
+test("trusted bundle helpers overlay worktree-rewritten helpers before spawn", async () => {
+  const wt = fs.mkdtempSync(path.join(os.tmpdir(), "pf-helper-wt-"));
+  const helperDir = path.join(wt, "scripts", "pipeline", "planning-facts");
+  fs.mkdirSync(helperDir, { recursive: true });
+  fs.writeFileSync(path.join(helperDir, "helper.mjs"), "worktree-rewrite\n");
+  const trustedHelper = Buffer.from("trusted-helper\n");
+  const trustedEntry = Buffer.from("#!/bin/sh\nexec node scripts/pipeline/planning-facts/helper.mjs\n");
+  const overlaid: TrustedProviderFile[] = [];
+  const materialized: TrustedProviderFile[] = [];
+  let helperAtSpawn = "";
+  const yaml = `planning_facts:
+  providers:
+    - id: alembic-head
+      executable: scripts/pipeline/planning-facts/alembic-head
+      required: true
+      facts:
+        alembic_head: string
+`;
+  const observation = await observePlanningFacts({
+    cfg: cfg(),
+    worktreeDir: wt,
+    deps: baseDeps({
+      blobs: {
+        ".github/pipeline.yml": Buffer.from(yaml),
+        "scripts/pipeline/planning-facts/alembic-head": trustedEntry,
+        "scripts/pipeline/planning-facts/helper.mjs": trustedHelper,
+      },
+      materializeTrustedProviderBundle: (files, entry) => {
+        materialized.push(...files);
+        const dest = path.join(os.tmpdir(), "pf-bundle-entry");
+        fs.writeFileSync(dest, files.find((f) => f.repoRelPath === entry)?.bytes ?? Buffer.alloc(0));
+        return dest;
+      },
+      overlayTrustedProviderFiles: (worktreeDir, files) => {
+        overlaid.push(...files);
+        return defaultOverlayTrustedProviderFiles(worktreeDir, files);
+      },
+      spawnImpl: (req) => {
+        helperAtSpawn = fs.readFileSync(path.join(req.cwd, "scripts/pipeline/planning-facts/helper.mjs"), "utf8");
+        return successSpawn({ alembic_head: "0074" });
+      },
+    }),
+  });
+  assert.equal(observation.ok, true);
+  assert.ok(materialized.some((f) => f.repoRelPath.endsWith("helper.mjs") && f.bytes.equals(trustedHelper)));
+  assert.ok(overlaid.some((f) => f.repoRelPath.endsWith("helper.mjs") && f.bytes.equals(trustedHelper)));
+  assert.equal(helperAtSpawn, "trusted-helper\n");
+  assert.equal(fs.readFileSync(path.join(helperDir, "helper.mjs"), "utf8"), "worktree-rewrite\n");
+});
+
+test("defaultMaterializeTrustedProviderBundle writes helpers next to the entry", () => {
+  const entry = defaultMaterializeTrustedProviderBundle(
+    [
+      { repoRelPath: "scripts/pipeline/planning-facts/wrap", bytes: Buffer.from("entry") },
+      { repoRelPath: "scripts/pipeline/planning-facts/helper.mjs", bytes: Buffer.from("help") },
+    ],
+    "scripts/pipeline/planning-facts/wrap",
+  );
+  assert.equal(fs.readFileSync(entry, "utf8"), "entry");
+  assert.equal(fs.readFileSync(path.join(path.dirname(entry), "helper.mjs"), "utf8"), "help");
 });
 
 test("undeclared key, nested object, extra top-level, timeout, exit, missing executable, ceiling", async () => {
@@ -532,6 +690,102 @@ test("defaultSpawnProvider timeout waits for close and does not treat later exit
   const result = await pending;
   assert.equal(result.timed_out, true);
   assert.equal(result.exit_code, 0);
+});
+
+test("defaultSpawnProvider does not succeed while containment still has descendants", async () => {
+  const child = fakeProviderChild();
+  let remaining = [4242];
+  let killed = false;
+  const containment: ProviderContainment = {
+    dir: "/sys/fs/cgroup/fake",
+    addPid() {},
+    remainingPids: () => remaining,
+    killRemaining() {
+      killed = true;
+      remaining = [];
+    },
+    close() {},
+  };
+  const spawnImpl = ((..._args: unknown[]) => child) as unknown as typeof import("node:child_process").spawn;
+  const pending = defaultSpawnProvider(boundedSpawnReq, spawnImpl, containment);
+  child.emit("close", 0);
+  const result = await pending;
+  assert.equal(killed, true);
+  assert.equal(result.descendants_remaining, true);
+  assert.equal(result.exit_code, 0);
+});
+
+test("escaped descendants after a successful-looking spawn fail containment", async () => {
+  const observation = await observePlanningFacts({
+    cfg: cfg(),
+    worktreeDir: "/wt",
+    deps: baseDeps({
+      spawnImpl: () => ({
+        exit_code: 0,
+        stdout: Buffer.from(JSON.stringify({ schema_version: 1, facts: { alembic_head: "0074" } })),
+        stderr: Buffer.alloc(0),
+        timed_out: false,
+        duration_ms: 1,
+        descendants_remaining: true,
+      }),
+    }),
+  });
+  assert.equal(observation.ok, false);
+  if (!observation.ok) {
+    assert.equal(observation.failureClass, "containment");
+    assert.match(observation.reason, /escaped descendants/);
+  }
+});
+
+test("planningFactsContainmentArgv execs the trusted command without a shell", () => {
+  const wrapped = planningFactsContainmentArgv(
+    {
+      command: "/tmp/trusted-exec",
+      args: [";", "$HOME"],
+      cwd: "/wt",
+      env: {},
+      shell: false,
+      timeoutMs: 1,
+      maxStdoutBytes: 1,
+      maxStderrBytes: 1,
+    },
+    "/sys/fs/cgroup/fake",
+  );
+  assert.equal(wrapped.command, process.execPath);
+  assert.equal(wrapped.args.includes("/bin/sh"), false);
+  const dash = wrapped.args.indexOf("--");
+  assert.ok(dash > 0);
+  assert.equal(wrapped.args[dash + 1], "/tmp/trusted-exec");
+  assert.deepEqual(wrapped.args.slice(dash + 2), [";", "$HOME"]);
+  assert.ok(wrapped.args.includes("--containment-child"));
+});
+
+test("defaultSpawnProvider cgroup containment kills a setsid daemon before a delayed write lands", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pf-daemon-"));
+  const script = path.join(dir, "provider.sh");
+  fs.writeFileSync(
+    script,
+    `#!/bin/sh
+( setsid sh -c 'sleep 0.4; echo pwned > pwned.txt' < /dev/null > /dev/null 2>&1 & )
+printf '%s\\n' '{"schema_version":1,"facts":{"alembic_head":"0074"}}'
+`,
+    { mode: 0o755 },
+  );
+  const result = await defaultSpawnProvider({
+    command: script,
+    args: [],
+    cwd: dir,
+    env: { PATH: "/usr/bin:/bin", LANG: "C.UTF-8", LC_ALL: "C.UTF-8", HOME: dir, TMPDIR: dir },
+    shell: false,
+    timeoutMs: 5_000,
+    maxStdoutBytes: 1_024,
+    maxStderrBytes: 1_024,
+  });
+  await new Promise((r) => setTimeout(r, 600));
+  assert.equal(result.timed_out, false);
+  assert.equal(result.spawn_error ?? false, false);
+  assert.match(result.stdout.toString("utf8"), /alembic_head/);
+  assert.equal(fs.existsSync(path.join(dir, "pwned.txt")), false, "daemonized descendant must not write after observation");
 });
 
 test("spawn request carries effective stdout/stderr byte caps", async () => {

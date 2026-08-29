@@ -39,7 +39,7 @@ The engine SHALL NOT encode Alembic, migration-head, or any other repository-spe
 
 ### Requirement: The engine SHALL resolve provider configuration and executable content from the trusted integration-base revision
 
-Immediately before observation, the engine SHALL resolve the trusted integration-base SHA for the run. Provider configuration and provider executable bytes SHALL be read from that SHA. Bytes or YAML present only in the planning worktree SHALL NOT replace trusted configuration or the trusted executable during the run.
+Immediately before observation, the engine SHALL resolve the trusted integration-base SHA for the run. Provider configuration and provider executable bytes SHALL be read from that SHA. Bytes or YAML present only in the planning worktree SHALL NOT replace trusted configuration or the trusted executable during the run. The engine SHALL materialize the trusted executable together with every other file under `dirname(executable)` at that SHA as an isolated source bundle, overlay those trusted bytes onto the matching planning-worktree paths for the spawn only, and restore the overlay afterward unless the provider mutated those paths. Relative helper lookups from the entry file and from the planning-worktree cwd SHALL resolve to those trusted-base bytes. A repo-root executable (`dirname` is `.`) SHALL be a single-file bundle.
 
 #### Scenario: Worktree rewrite of pipeline.yml is ignored
 
@@ -55,6 +55,15 @@ Immediately before observation, the engine SHALL resolve the trusted integration
 - **THEN** the spawned program SHALL be the trusted-base bytes
 - **AND** SHALL NOT be the worktree bytes
 
+#### Scenario: Worktree rewrite of a same-directory helper is ignored
+
+- **WHEN** trusted configuration names `scripts/pipeline/planning-facts/alembic-head`
+- **AND** that directory at the trusted SHA also contains `helper.mjs`
+- **AND** the planning worktree replaces `helper.mjs` with different content
+- **AND** the trusted entry invokes that helper by a cwd-relative path
+- **THEN** observation SHALL execute the trusted-base helper bytes
+- **AND** SHALL NOT execute the worktree helper bytes
+
 #### Scenario: Missing trusted executable fails closed
 
 - **WHEN** trusted configuration names an executable path that is absent at the trusted integration-base SHA
@@ -63,7 +72,7 @@ Immediately before observation, the engine SHALL resolve the trusted integration
 
 ### Requirement: The engine SHALL spawn each provider as an argv-only process
 
-The engine SHALL spawn the trusted executable by absolute path with an argument vector. The spawn SHALL NOT use a shell. The spawn SHALL NOT resolve the provider executable through `PATH`. Optional configured arguments SHALL be passed as additional argv entries only.
+The engine SHALL spawn the trusted executable by absolute path with an argument vector. An engine-owned containment wrapper MAY be the direct child; that wrapper SHALL exec the trusted executable by absolute path with the configured argv and SHALL NOT use a shell. The spawn SHALL NOT resolve the provider executable through `PATH`. Optional configured arguments SHALL be passed as additional argv entries only.
 
 #### Scenario: Shell metacharacters are not interpreted
 
@@ -96,7 +105,7 @@ The provider process cwd SHALL be the managed planning worktree for the issue. T
 
 ### Requirement: The engine SHALL require a clean worktree and SHALL detect provider mutation
 
-The engine SHALL run a provider only when the planning worktree is clean. It SHALL record `HEAD` and porcelain before execution and compare them after. A dirty pre-run worktree or a post-run `HEAD` or porcelain change SHALL fail as typed `planning-facts-provider-contract`. The engine SHALL preserve the post-run evidence and SHALL NOT silently reset, clean, or discard it.
+The engine SHALL run a provider only when the planning worktree is clean. It SHALL record `HEAD`, porcelain, and enumerated ignored-path state before execution and compare them after. A dirty pre-run worktree or a post-run `HEAD`, porcelain, or ignored-path change SHALL fail as typed `planning-facts-provider-contract`. Pre-existing ignored files SHALL NOT by themselves make the worktree dirty. Ignored-path state SHALL enumerate files rather than collapsing ignored directories, and SHALL include content identity so a write, delete, or modify of an ignored file is detected. The engine SHALL preserve the post-run evidence and SHALL NOT silently reset, clean, or discard it.
 
 #### Scenario: Dirty worktree is not a run surface
 
@@ -104,12 +113,32 @@ The engine SHALL run a provider only when the planning worktree is clean. It SHA
 - **THEN** the engine SHALL NOT spawn that provider
 - **AND** the outcome SHALL be typed `planning-facts-provider-contract`
 
+#### Scenario: Pre-existing ignored files are not dirty
+
+- **WHEN** porcelain is empty before a provider would run
+- **AND** ignored files such as `.env` already exist
+- **THEN** the engine SHALL spawn the provider
+- **AND** SHALL NOT fail as `dirty-worktree` solely because those ignored files exist
+
 #### Scenario: Mutating provider fails and dirt is preserved
 
 - **WHEN** a provider writes or deletes a tracked or untracked file, or changes `HEAD`
 - **THEN** the outcome SHALL be typed `planning-facts-provider-contract`
 - **AND** the worktree SHALL still contain that mutation when the failure is recorded
 - **AND** the engine SHALL NOT run `git reset`, `git checkout --`, or `git clean` to hide it
+
+#### Scenario: Ignored-file write is mutation
+
+- **WHEN** a provider creates or modifies an ignored file such as `.env` or a file under an ignored directory
+- **AND** porcelain stays empty
+- **THEN** the outcome SHALL be typed `planning-facts-provider-contract`
+- **AND** the ignored-path snapshot SHALL differ from the pre-run snapshot
+
+#### Scenario: Ignored-file delete is mutation
+
+- **WHEN** a provider deletes an ignored file that existed before spawn
+- **AND** porcelain stays empty
+- **THEN** the outcome SHALL be typed `planning-facts-provider-contract`
 
 #### Scenario: Timeout snapshot runs after the provider has exited
 
@@ -120,8 +149,25 @@ The engine SHALL run a provider only when the planning worktree is clean. It SHA
 
 #### Scenario: Non-mutating provider succeeds
 
-- **WHEN** a provider exits 0, writes valid JSON, and leaves `HEAD` and porcelain unchanged
+- **WHEN** a provider exits 0, writes valid JSON, and leaves `HEAD`, porcelain, and ignored-path state unchanged
 - **THEN** observation SHALL accept its declared facts
+
+### Requirement: The engine SHALL contain provider descendants until the containment is empty
+
+The engine SHALL run each provider inside engine-owned containment that tracks the direct child and every descendant, including a descendant that calls `setsid` and closes inherited stdio. Observation SHALL NOT treat the run as success while that containment still holds a process. The engine SHALL terminate remaining descendants and SHALL take the post-run worktree snapshot only after containment is empty. A leftover descendant SHALL fail as typed `planning-facts-provider-contract` with failure class `containment`.
+
+#### Scenario: Daemonized descendant cannot write after a successful-looking exit
+
+- **WHEN** a provider spawns a child that calls `setsid`, closes inherited stdio, and plans to write a worktree file after the provider exits 0
+- **THEN** the engine SHALL terminate that descendant before the post-run snapshot
+- **AND** SHALL NOT report observation success if the descendant remained after the provider exit
+- **AND** the delayed write SHALL NOT land as an accepted clean worktree
+
+#### Scenario: Direct-child close alone is not success
+
+- **WHEN** the provider process group still has a living descendant after the direct child emits `close`
+- **THEN** observation SHALL fail as typed `planning-facts-provider-contract`
+- **AND** SHALL NOT inject facts from that run as engine-observed values
 
 ### Requirement: The engine SHALL recompute facts immediately before every planning, plan-revision, and plan-review invocation
 
@@ -226,7 +272,7 @@ The pipeline SHALL own hard ceilings for runtime, stdout bytes, stderr bytes, fa
 
 ### Requirement: Required provider failure SHALL block before the model is invoked
 
-A provider declared required SHALL block the planning, plan-revision, or plan-review invocation when it fails (timeout, non-zero exit, malformed JSON, mutation, dirty worktree, ceiling breach, missing executable, type error, or undeclared field). The engine SHALL record typed `planning-facts-provider-contract` evidence. The engine SHALL NOT invoke the model for that step. The failure SHALL be engine-owned and SHALL NOT be classified as human authority solely because a provider failed.
+A provider declared required SHALL block the planning, plan-revision, or plan-review invocation when it fails (timeout, non-zero exit, malformed JSON, mutation, dirty worktree, ceiling breach, missing executable, type error, undeclared field, or leftover contained descendants). The engine SHALL record typed `planning-facts-provider-contract` evidence. The engine SHALL NOT invoke the model for that step. The failure SHALL be engine-owned and SHALL NOT be classified as human authority solely because a provider failed.
 
 #### Scenario: Required failure skips the model
 

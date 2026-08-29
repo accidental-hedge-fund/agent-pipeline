@@ -72,9 +72,9 @@ Alternative considered: inherit `plan_review_timeout`. Rejected. A hung provider
 
 Resolve integration-base SHA the same way worktree create does: fetched `origin/<cfg.base_branch>` (or the run's recorded start-point SHA when that is already the trusted base). Read `.github/pipeline.yml` and each `executable` blob from that SHA.
 
-Write trusted executable bytes to a temp file **outside** the planning worktree (engine temp dir). Spawn that absolute path. Cwd is the planning worktree so the script observes current files (`alembic/versions/` in the fixture).
+Materialize every file under `dirname(executable)` at that SHA as an isolated source bundle **outside** the planning worktree (engine temp dir). Spawn the bundle entry by absolute path. Cwd remains the planning worktree so the script observes current data files (`alembic/versions/` in the fixture). Overlay the same trusted bytes onto the matching worktree paths for the spawn only, then restore them, so cwd-relative helper lookups (`node scripts/pipeline/planning-facts/helper.mjs`) and `$0`-relative imports resolve to trusted-base bytes rather than a worktree rewrite. A repo-root executable is single-file.
 
-If the worktree `pipeline.yml` or executable digest differs from the trusted blob, ignore the worktree copy. Do not fail solely because the files differ; the attack is substitution, and using trusted bytes already defeats it. Still fail if the trusted blob is missing.
+If the worktree `pipeline.yml`, executable, or same-directory helper digest differs from the trusted blob, ignore the worktree copy. Do not fail solely because the files differ; the attack is substitution, and using trusted bundle bytes already defeats it. Still fail if the trusted blob is missing.
 
 When the trusted integration-base SHA has advanced since this run's previous observation, update the planning worktree onto that SHA before spawn (merge the new base; do not reset away planning commits). Conflict or update failure is typed `planning-facts-provider-contract`. Do not inject the previous bundle.
 
@@ -84,7 +84,7 @@ Alternative considered: `git show SHA:path | sh`. Rejected. No shell, and piping
 
 ### Decision 4 — Argv-only spawn and sanitized env
 
-Spawn via an injectable `spawnProvider` / `runCapped` seam: `spawn(absPath, args, { cwd, env, shell: false })`. `args` are the configured string array only.
+Spawn via an injectable `spawnProvider` / `runCapped` seam. The direct child MAY be an engine-owned cgroup admission wrapper; that wrapper execs `absPath` with the configured argv, `{ cwd, env, shell: false }`. `args` are the configured string array only. The wrapper does not invoke `/bin/sh`.
 
 Child env is constructed, not inherited:
 
@@ -101,12 +101,15 @@ A denylist is not sufficient. Tests plant `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERP
 
 Before spawn:
 
-1. `git status --porcelain=v1` must be empty (including untracked).
+1. `git status --porcelain=v1` must be empty (including untracked). Pre-existing ignored files do not make this dirty.
 2. Record `HEAD` and `HEAD^{tree}`.
+3. Record enumerated ignored-path state (`git ls-files -z --others --ignored --exclude-standard` plus per-file content identity). Do not collapse ignored directories.
 
-After spawn, compare the same three. Any difference is contract failure. Do not `git reset --hard`, `git checkout --`, or `git clean`. Persist porcelain, diff, stdout/stderr (truncated to ceilings), exit, and duration in the typed diagnostic.
+After spawn, compare HEAD, tree, porcelain, and ignored-path state. Any difference is contract failure, including create/modify/delete of an ignored file. Do not `git reset --hard`, `git checkout --`, or `git clean`. Persist porcelain, ignored snapshot, stdout/stderr (truncated to ceilings), exit, and duration in the typed diagnostic.
 
 A pre-dirty tree does not spawn.
+
+Spawn inside engine-owned cgroup containment. Direct-child `close` is not success while the cgroup still has PIDs. Kill remaining descendants (`cgroup.kill`) and take the post-run snapshot only after the cgroup is empty. Leftover descendants are failure class `containment`.
 
 ### Decision 6 — Provider JSON and bundle identity
 
@@ -192,7 +195,7 @@ Cover at least: no-op config; schema reject; trusted-base vs worktree rewrite; a
 
 ### Decision 11 — Diagnostic tag
 
-Tag string: `planning-facts-provider-contract`. Reason prefix includes provider `id` when known, then the failure class (`timeout`, `exit`, `malformed-json`, `undeclared-key`, `type`, `ceiling`, `mutation`, `dirty-worktree`, `missing-executable`, `base-update`, `claims`). Same tag and prefix on freeform and OpenSpec.
+Tag string: `planning-facts-provider-contract`. Reason prefix includes provider `id` when known, then the failure class (`timeout`, `exit`, `malformed-json`, `undeclared-key`, `type`, `ceiling`, `mutation`, `dirty-worktree`, `missing-executable`, `base-update`, `claims`, `containment`). Same tag and prefix on freeform and OpenSpec.
 
 ## Risks / Trade-offs
 

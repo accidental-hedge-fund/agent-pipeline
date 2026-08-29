@@ -5,14 +5,16 @@
 // and plan-review. Agent Pipeline stays repository-neutral: repository-specific
 // schemas are fixtures, not built-in fact logic.
 //
-// Security: trusted-base config and executable bytes, argv-only spawn,
-// constructed env (no inherited credentials), clean-tree mutation detection.
+// Security: trusted-base config and source-bundle bytes, argv-only spawn,
+// constructed env (no inherited credentials), clean-tree + ignored-path
+// mutation detection, cgroup containment of provider descendants.
 
 import { createHash } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   parseTrustedPlanningFactsBlock,
   resolvePlanningFactsConfig,
@@ -60,7 +62,8 @@ export type PlanningFactsFailureClass =
   | "missing-executable"
   | "base-update"
   | "claims"
-  | "config";
+  | "config"
+  | "containment";
 
 export function planningFactsReasonPrefix(
   providerId: string | undefined,
@@ -104,6 +107,7 @@ export interface PlanningFactsContractFailure {
     stdout?: string;
     stderr?: string;
     porcelain?: string;
+    ignored?: string;
     exit_code?: number | null;
     duration_ms?: number;
   };
@@ -122,6 +126,8 @@ export interface WorktreeSnapshot {
   head: string;
   tree: string;
   porcelain: string;
+  /** Canonical ignored-path state (enumerated files + content identity). */
+  ignored: string;
 }
 
 export interface SpawnProviderRequest {
@@ -146,16 +152,33 @@ export interface SpawnProviderResult {
   stdout_exceeded?: boolean;
   /** True when capture stopped at maxStderrBytes and the provider was terminated. */
   stderr_exceeded?: boolean;
+  /** True when containment still held descendant PIDs after the direct child closed. */
+  descendants_remaining?: boolean;
+}
+
+export interface TrustedProviderFile {
+  repoRelPath: string;
+  bytes: Buffer;
+}
+
+export interface ProviderContainment {
+  dir?: string;
+  addPid: (pid: number) => void;
+  remainingPids: () => number[];
+  killRemaining: () => void;
+  close: () => void;
 }
 
 export interface PlanningFactsDeps {
   readTrustedBlob?: (sha: string, repoRelPath: string) => Promise<Buffer | null>;
+  listTrustedPrefix?: (sha: string, prefix: string) => Promise<string[]>;
   resolveIntegrationBaseSha?: () => Promise<string>;
   worktreeSnapshot?: () => Promise<WorktreeSnapshot>;
   spawnProvider?: (req: SpawnProviderRequest) => Promise<SpawnProviderResult>;
   now?: () => Date;
   updateWorktreeOntoBase?: (sha: string) => Promise<{ ok: true } | { ok: false; reason: string }>;
-  materializeTrustedExecutable?: (bytes: Buffer, basename: string) => string;
+  materializeTrustedProviderBundle?: (files: TrustedProviderFile[], entryRepoRelPath: string) => string;
+  overlayTrustedProviderFiles?: (worktreeDir: string, files: TrustedProviderFile[]) => { restore: () => void };
   mkdirp?: (dir: string) => void;
   previousIntegrationBaseSha?: string;
 }
@@ -237,11 +260,136 @@ function truncateUtf8(buf: Buffer, maxBytes: number): string {
   return buf.subarray(0, maxBytes).toString("utf8");
 }
 
-function defaultMaterializeTrustedExecutable(bytes: Buffer, basename: string): string {
+export function defaultMaterializeTrustedProviderBundle(
+  files: TrustedProviderFile[],
+  entryRepoRelPath: string,
+): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-planning-facts-"));
-  const dest = path.join(dir, basename.replace(/[^A-Za-z0-9._-]/g, "_") || "provider");
-  fs.writeFileSync(dest, bytes, { mode: 0o755 });
-  return dest;
+  const providerDir = path.posix.dirname(entryRepoRelPath);
+  let entryAbs = "";
+  for (const f of files) {
+    if (f.repoRelPath.split("/").includes("..") || path.isAbsolute(f.repoRelPath)) {
+      throw new Error(`refusing to materialize unsafe path ${f.repoRelPath}`);
+    }
+    const rel =
+      providerDir === "." ? path.posix.basename(f.repoRelPath) : path.posix.relative(providerDir, f.repoRelPath);
+    if (!rel || rel.split(/[/\\]/).includes("..")) {
+      throw new Error(`refusing to materialize path ${f.repoRelPath} outside provider directory`);
+    }
+    const dest = path.join(dir, rel);
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    const mode = f.repoRelPath === entryRepoRelPath ? 0o755 : 0o644;
+    fs.writeFileSync(dest, f.bytes, { mode });
+    if (f.repoRelPath === entryRepoRelPath) entryAbs = dest;
+  }
+  if (!entryAbs) {
+    throw new Error(`trusted provider bundle is missing entry ${entryRepoRelPath}`);
+  }
+  return entryAbs;
+}
+
+function pathIsInsideRoot(root: string, candidate: string): boolean {
+  const rootAbs = path.resolve(root);
+  const dest = path.resolve(candidate);
+  return dest === rootAbs || dest.startsWith(rootAbs + path.sep);
+}
+
+export function defaultOverlayTrustedProviderFiles(
+  worktreeDir: string,
+  files: TrustedProviderFile[],
+): { restore: () => void } {
+  const root = path.resolve(worktreeDir);
+  const backups: Array<{
+    dest: string;
+    existed: boolean;
+    original?: Buffer;
+    mode?: number;
+    wrote: Buffer;
+  }> = [];
+  const createdDirs: string[] = [];
+  for (const f of files) {
+    if (f.repoRelPath.split("/").includes("..") || path.isAbsolute(f.repoRelPath)) {
+      throw new Error(`refusing to overlay unsafe path ${f.repoRelPath}`);
+    }
+    const dest = path.resolve(root, f.repoRelPath);
+    if (!pathIsInsideRoot(root, dest)) {
+      throw new Error(`refusing to overlay outside worktree ${f.repoRelPath}`);
+    }
+    let parent = path.dirname(dest);
+    const toCreate: string[] = [];
+    while (parent.startsWith(root + path.sep) && !fs.existsSync(parent)) {
+      toCreate.push(parent);
+      parent = path.dirname(parent);
+    }
+    for (const d of toCreate.reverse()) {
+      fs.mkdirSync(d);
+      createdDirs.push(d);
+    }
+    const existed = fs.existsSync(dest);
+    backups.push({
+      dest,
+      existed,
+      original: existed ? fs.readFileSync(dest) : undefined,
+      mode: existed ? fs.statSync(dest).mode : undefined,
+      wrote: f.bytes,
+    });
+    fs.writeFileSync(dest, f.bytes, { mode: existed ? backups[backups.length - 1].mode : 0o644 });
+  }
+  return {
+    restore() {
+      for (const b of [...backups].reverse()) {
+        try {
+          if (!fs.existsSync(b.dest)) continue;
+          const current = fs.readFileSync(b.dest);
+          if (!current.equals(b.wrote)) continue;
+          if (b.existed && b.original) {
+            fs.writeFileSync(b.dest, b.original, { mode: b.mode });
+          } else {
+            fs.unlinkSync(b.dest);
+          }
+        } catch {
+          /* leave dest for mutation evidence */
+        }
+      }
+      for (const d of createdDirs.sort((a, b) => b.length - a.length)) {
+        try {
+          fs.rmdirSync(d);
+        } catch {
+          /* not empty — mutation evidence */
+        }
+      }
+    },
+  };
+}
+
+/** Canonical ignored-path state: enumerated paths plus per-file content identity. */
+export function canonicalizeIgnoredListing(
+  nulSeparated: string,
+  readFile: (repoRelPath: string) => Buffer | null,
+): string {
+  const paths = nulSeparated
+    .split("\0")
+    .map((p) => p.replace(/^\0/, "").trim())
+    .filter((p) => p.length > 0 && !p.split("/").includes("..") && !path.isAbsolute(p))
+    .sort();
+  const hash = createHash("sha256");
+  for (const p of paths) {
+    hash.update(p);
+    hash.update("\0");
+    const buf = readFile(p);
+    if (buf) hash.update(buf);
+    hash.update("\n");
+  }
+  return `${paths.join("\n")}\n${hash.digest("hex")}`;
+}
+
+export function worktreeSnapshotsDiffer(pre: WorktreeSnapshot, post: WorktreeSnapshot): boolean {
+  return (
+    post.head !== pre.head ||
+    post.tree !== pre.tree ||
+    post.porcelain !== pre.porcelain ||
+    post.ignored !== pre.ignored
+  );
 }
 
 const PROVIDER_KILL_GRACE_MS = 200;
@@ -275,17 +423,175 @@ function killProviderProcess(child: ChildProcess, signal: NodeJS.Signals): void 
   }
 }
 
+export const NOOP_PROVIDER_CONTAINMENT: ProviderContainment = {
+  addPid() {},
+  remainingPids: () => [],
+  killRemaining() {},
+  close() {},
+};
+
+function selfCgroupV2Dir(): string {
+  const text = fs.readFileSync("/proc/self/cgroup", "utf8");
+  const line = text.split("\n").find((l) => l.startsWith("0::"));
+  if (!line) throw new Error("cgroup v2 not available");
+  const rel = line.slice(3).trim();
+  return path.join("/sys/fs/cgroup", rel);
+}
+
+export function createCgroupContainment(): ProviderContainment {
+  const parent = selfCgroupV2Dir();
+  const id = `pipeline-pf-${process.pid}-${Date.now().toString(16)}-${Math.random().toString(16).slice(2, 10)}`;
+  const dir = path.join(parent, id);
+  fs.mkdirSync(dir);
+  const readPids = (): number[] => {
+    try {
+      return fs
+        .readFileSync(path.join(dir, "cgroup.procs"), "utf8")
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean)
+        .map((p) => Number(p))
+        .filter((n) => Number.isInteger(n) && n > 0);
+    } catch {
+      return [];
+    }
+  };
+  return {
+    dir,
+    addPid(pid: number) {
+      if (pid <= 0) return;
+      try {
+        fs.writeFileSync(path.join(dir, "cgroup.procs"), String(pid));
+      } catch {
+        /* process already exited */
+      }
+    },
+    remainingPids: readPids,
+    killRemaining() {
+      const killFile = path.join(dir, "cgroup.kill");
+      try {
+        if (fs.existsSync(killFile)) {
+          fs.writeFileSync(killFile, "1");
+          return;
+        }
+      } catch {
+        /* fall through to per-pid kill */
+      }
+      for (const pid of readPids()) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          /* already gone */
+        }
+      }
+    },
+    close() {
+      try {
+        fs.rmdirSync(dir);
+      } catch {
+        /* still busy; leftover empty dirs are host-local */
+      }
+    },
+  };
+}
+
+function waitUntilPidInCgroup(pid: number, cgroupDir: string, timeoutMs: number): void {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    try {
+      const text = fs.readFileSync(path.join(cgroupDir, "cgroup.procs"), "utf8");
+      const pids = text.trim().split(/\s+/).filter(Boolean);
+      if (pids.includes(String(pid))) return;
+    } catch {
+      /* retry */
+    }
+    const spinUntil = Date.now() + 5;
+    while (Date.now() < spinUntil) {
+      /* admission poll */
+    }
+  }
+  throw new Error(`containment: pid ${pid} was not admitted to ${cgroupDir}`);
+}
+
+export async function runPlanningFactsContainmentChild(argv: string[] = process.argv): Promise<void> {
+  const flag = argv.indexOf("--containment-child");
+  if (flag < 0) {
+    throw new Error("containment child missing --containment-child");
+  }
+  const cgroupDir = argv[flag + 1];
+  const dash = argv.indexOf("--", flag + 1);
+  if (!cgroupDir || dash < 0 || dash + 1 >= argv.length) {
+    throw new Error("containment child argv is malformed");
+  }
+  const command = argv[dash + 1];
+  const args = argv.slice(dash + 2);
+  waitUntilPidInCgroup(process.pid, cgroupDir, 1000);
+  const child = spawn(command, args, {
+    cwd: process.cwd(),
+    env: process.env,
+    shell: false,
+    stdio: ["ignore", "inherit", "inherit"],
+    detached: false,
+  });
+  const code = await new Promise<number | null>((resolve) => {
+    child.on("error", () => resolve(1));
+    child.on("close", (c) => resolve(c));
+  });
+  process.exit(code ?? 1);
+}
+
+const thisModulePath = fileURLToPath(import.meta.url);
+
+export function planningFactsContainmentArgv(req: SpawnProviderRequest, cgroupDir: string): {
+  command: string;
+  args: string[];
+} {
+  const stripTypes = thisModulePath.endsWith(".ts") ? ["--experimental-strip-types"] : [];
+  return {
+    command: process.execPath,
+    args: [
+      ...stripTypes,
+      thisModulePath,
+      "--containment-child",
+      cgroupDir,
+      "--",
+      req.command,
+      ...req.args,
+    ],
+  };
+}
+
+function resolveContainment(spawnImpl: typeof spawn): ProviderContainment {
+  return spawnImpl === spawn ? createCgroupContainment() : NOOP_PROVIDER_CONTAINMENT;
+}
+
 /**
- * Spawn a planning-facts provider with streaming byte caps and awaited
- * termination. `spawnImpl` is injectable so tests can drive the real
- * timeout/ceiling wiring without a live subprocess.
+ * Spawn a planning-facts provider with streaming byte caps, cgroup
+ * containment, and awaited termination. `spawnImpl` is injectable so tests
+ * can drive the real timeout/ceiling wiring without a live subprocess.
  */
 export function defaultSpawnProvider(
   req: SpawnProviderRequest,
   spawnImpl: typeof spawn = spawn,
+  containmentArg?: ProviderContainment,
 ): Promise<SpawnProviderResult> {
   return new Promise((resolve) => {
     const start = Date.now();
+    let containment: ProviderContainment;
+    try {
+      containment = containmentArg ?? resolveContainment(spawnImpl);
+    } catch (err) {
+      resolve({
+        exit_code: -1,
+        stdout: Buffer.alloc(0),
+        stderr: Buffer.from(err instanceof Error ? err.message : String(err)),
+        timed_out: false,
+        duration_ms: Date.now() - start,
+        spawn_error: true,
+        descendants_remaining: false,
+      });
+      return;
+    }
     let stdout = Buffer.alloc(0);
     let stderr = Buffer.alloc(0);
     let stdoutExceeded = false;
@@ -302,12 +608,18 @@ export function defaultSpawnProvider(
       clearTimeout(timeoutTimer);
       clearTimeout(killTimer);
       clearTimeout(followupTimer);
+      try {
+        containment.close();
+      } catch {
+        /* ignore */
+      }
       resolve({ ...partial, duration_ms: Date.now() - start });
     };
     const snapshotResult = (extra: {
       exit_code: number | null;
       timed_out: boolean;
       spawn_error?: boolean;
+      descendants_remaining?: boolean;
     }): Omit<SpawnProviderResult, "duration_ms"> => ({
       exit_code: extra.exit_code,
       stdout,
@@ -316,10 +628,24 @@ export function defaultSpawnProvider(
       spawn_error: extra.spawn_error,
       stdout_exceeded: stdoutExceeded,
       stderr_exceeded: stderrExceeded,
+      descendants_remaining: extra.descendants_remaining,
     });
+    const reapContainment = async (): Promise<boolean> => {
+      const remaining = containment.remainingPids();
+      if (remaining.length === 0) return false;
+      containment.killRemaining();
+      const deadline = Date.now() + PROVIDER_KILL_GRACE_MS + PROVIDER_KILL_FOLLOWUP_MS;
+      while (Date.now() < deadline && containment.remainingPids().length > 0) {
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      return true;
+    };
     let child: ChildProcess;
+    const wrap = spawnImpl === spawn && containment.dir;
+    const command = wrap ? process.execPath : req.command;
+    const args = wrap ? planningFactsContainmentArgv(req, containment.dir as string).args : req.args;
     try {
-      child = spawnImpl(req.command, req.args, {
+      child = spawnImpl(command, args, {
         cwd: req.cwd,
         env: req.env,
         shell: false,
@@ -336,12 +662,17 @@ export function defaultSpawnProvider(
       });
       return;
     }
+    if (child.pid != null && child.pid > 0) {
+      containment.addPid(child.pid);
+    }
     const beginTerminate = (reason: "timeout" | "ceiling") => {
       if (settled || terminating) return;
       terminating = true;
       if (reason === "timeout") timedOut = true;
+      containment.killRemaining();
       killProviderProcess(child, "SIGTERM");
       killTimer = setTimeout(() => {
+        containment.killRemaining();
         killProviderProcess(child, "SIGKILL");
         followupTimer = setTimeout(() => {
           try {
@@ -350,7 +681,10 @@ export function defaultSpawnProvider(
           } catch {
             /* ignore */
           }
-          finish(snapshotResult({ exit_code: child.exitCode, timed_out: timedOut }));
+          void (async () => {
+            const descendants_remaining = await reapContainment();
+            finish(snapshotResult({ exit_code: child.exitCode, timed_out: timedOut, descendants_remaining }));
+          })();
         }, PROVIDER_KILL_FOLLOWUP_MS);
       }, PROVIDER_KILL_GRACE_MS);
     };
@@ -376,18 +710,25 @@ export function defaultSpawnProvider(
       beginTerminate("timeout");
     }, req.timeoutMs);
     child.on("error", (err) => {
-      finish({
-        exit_code: -1,
-        stdout,
-        stderr: Buffer.concat([stderr, Buffer.from(err.message)]).subarray(0, Math.max(req.maxStderrBytes, 0)),
-        timed_out: timedOut,
-        spawn_error: true,
-        stdout_exceeded: stdoutExceeded,
-        stderr_exceeded: stderrExceeded,
-      });
+      void (async () => {
+        const descendants_remaining = await reapContainment();
+        finish({
+          exit_code: -1,
+          stdout,
+          stderr: Buffer.concat([stderr, Buffer.from(err.message)]).subarray(0, Math.max(req.maxStderrBytes, 0)),
+          timed_out: timedOut,
+          spawn_error: true,
+          stdout_exceeded: stdoutExceeded,
+          stderr_exceeded: stderrExceeded,
+          descendants_remaining,
+        });
+      })();
     });
     child.on("close", (code) => {
-      finish(snapshotResult({ exit_code: code, timed_out: timedOut }));
+      void (async () => {
+        const descendants_remaining = await reapContainment();
+        finish(snapshotResult({ exit_code: code, timed_out: timedOut, descendants_remaining }));
+      })();
     });
   });
 }
@@ -410,7 +751,7 @@ function isNestedObject(value: unknown): boolean {
 
 function canonicalProvidersPayload(
   providers: PlanningFactProviderConfig[],
-  executables: Array<{ id: string; bytes: Buffer }>,
+  executables: Array<{ id: string; bytes: Buffer; helpers?: TrustedProviderFile[] }>,
 ): Buffer {
   const cfgJson = JSON.stringify(
     providers.map((p) => ({
@@ -426,6 +767,10 @@ function canonicalProvidersPayload(
   for (const exec of [...executables].sort((a, b) => a.id.localeCompare(b.id))) {
     hash.update(exec.id);
     hash.update(exec.bytes);
+    for (const helper of [...(exec.helpers ?? [])].sort((a, b) => a.repoRelPath.localeCompare(b.repoRelPath))) {
+      hash.update(helper.repoRelPath);
+      hash.update(helper.bytes);
+    }
   }
   return hash.digest();
 }
@@ -685,12 +1030,45 @@ async function defaultResolveIntegrationBaseSha(cfg: PipelineConfig): Promise<st
   return sha;
 }
 
+async function defaultListTrustedPrefix(
+  cfg: PipelineConfig,
+  sha: string,
+  prefix: string,
+): Promise<string[]> {
+  if (!prefix || prefix === "." || prefix.split("/").includes("..") || path.isAbsolute(prefix)) {
+    return [];
+  }
+  const r = await gitInWorktree(cfg.repo_dir, ["ls-tree", "-r", "--name-only", sha, "--", prefix], {
+    ignoreFailure: true,
+  });
+  if (r.code !== 0) return [];
+  return r.stdout
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0 && !l.split("/").includes(".."));
+}
+
 async function defaultWorktreeSnapshot(worktreeDir: string): Promise<WorktreeSnapshot> {
   const porcelain = await gitInWorktree(worktreeDir, ["status", "--porcelain=v1"], { ignoreFailure: true });
+  const ignoredList = await gitInWorktree(
+    worktreeDir,
+    ["ls-files", "-z", "--others", "--ignored", "--exclude-standard"],
+    { ignoreFailure: true },
+  );
   const head = await gitInWorktree(worktreeDir, ["rev-parse", "HEAD"], { ignoreFailure: true });
   const tree = await gitInWorktree(worktreeDir, ["rev-parse", "HEAD^{tree}"], { ignoreFailure: true });
+  const ignored = canonicalizeIgnoredListing(ignoredList.stdout, (repoRelPath) => {
+    try {
+      const abs = path.resolve(worktreeDir, repoRelPath);
+      if (!pathIsInsideRoot(worktreeDir, abs)) return null;
+      return fs.readFileSync(abs);
+    } catch {
+      return null;
+    }
+  });
   return {
     porcelain: porcelain.stdout,
+    ignored,
     head: head.stdout.trim(),
     tree: tree.stdout.trim(),
   };
@@ -729,7 +1107,10 @@ export async function observePlanningFacts(
   const resolveSha = deps.resolveIntegrationBaseSha ?? (() => defaultResolveIntegrationBaseSha(cfg));
   const snapshotFn = deps.worktreeSnapshot ?? (() => defaultWorktreeSnapshot(worktreeDir));
   const spawnFn = deps.spawnProvider ?? defaultSpawnProvider;
-  const materialize = deps.materializeTrustedExecutable ?? defaultMaterializeTrustedExecutable;
+  const listPrefix =
+    deps.listTrustedPrefix ?? ((sha: string, prefix: string) => defaultListTrustedPrefix(cfg, sha, prefix));
+  const materialize = deps.materializeTrustedProviderBundle ?? defaultMaterializeTrustedProviderBundle;
+  const overlayFiles = deps.overlayTrustedProviderFiles ?? defaultOverlayTrustedProviderFiles;
   const updateBase =
     deps.updateWorktreeOntoBase ?? ((sha: string) => defaultUpdateWorktreeOntoBase(worktreeDir, sha));
 
@@ -778,7 +1159,7 @@ export async function observePlanningFacts(
     });
   }
 
-  const execBytes: Array<{ id: string; bytes: Buffer; absPath: string }> = [];
+  const execBytes: Array<{ id: string; bytes: Buffer; helpers: TrustedProviderFile[] }> = [];
   const facts: PlanningFactRecord[] = [];
 
   for (const provider of trustedCfg.providers) {
@@ -797,40 +1178,92 @@ export async function observePlanningFacts(
       }
       continue;
     }
-    const absPath = materialize(bytes, path.basename(provider.executable));
-    execBytes.push({ id: provider.id, bytes, absPath });
+    const bundleFiles: TrustedProviderFile[] = [{ repoRelPath: provider.executable, bytes }];
+    const providerDir = path.posix.dirname(provider.executable);
+    if (providerDir !== ".") {
+      const names = await listPrefix(integrationBaseSha, providerDir);
+      for (const name of names) {
+        if (name === provider.executable) continue;
+        if (name.split("/").includes("..") || path.isAbsolute(name)) continue;
+        const helperBytes = await readBlob(integrationBaseSha, name);
+        if (helperBytes) bundleFiles.push({ repoRelPath: name, bytes: helperBytes });
+      }
+    }
+    let absPath: string;
+    try {
+      absPath = materialize(bundleFiles, provider.executable);
+    } catch (err) {
+      return fail(
+        "missing-executable",
+        err instanceof Error ? err.message : String(err),
+        provider.id,
+      );
+    }
+    execBytes.push({
+      id: provider.id,
+      bytes,
+      helpers: bundleFiles.filter((f) => f.repoRelPath !== provider.executable),
+    });
 
     const preSpawn = await snapshotFn();
     if (preSpawn.porcelain.trim().length > 0) {
       return fail("dirty-worktree", "planning worktree is not clean", provider.id, {
         porcelain: preSpawn.porcelain,
+        ignored: preSpawn.ignored,
       });
+    }
+
+    let restoreOverlay = (): void => {};
+    try {
+      restoreOverlay = overlayFiles(worktreeDir, bundleFiles).restore;
+    } catch (err) {
+      return fail(
+        "missing-executable",
+        err instanceof Error ? err.message : String(err),
+        provider.id,
+      );
     }
 
     const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-pf-home-"));
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pipeline-pf-tmp-"));
     const env = constructProviderEnv(homeDir, tmpDir);
-    const spawned = await spawnFn({
-      command: absPath,
-      args: [...provider.args],
-      cwd: worktreeDir,
-      env,
-      shell: false,
-      timeoutMs: trustedCfg.timeout_ms,
-      maxStdoutBytes: trustedCfg.max_stdout_bytes,
-      maxStderrBytes: trustedCfg.max_stderr_bytes,
-    });
+    let spawned;
+    try {
+      spawned = await spawnFn({
+        command: absPath,
+        args: [...provider.args],
+        cwd: worktreeDir,
+        env,
+        shell: false,
+        timeoutMs: trustedCfg.timeout_ms,
+        maxStdoutBytes: trustedCfg.max_stdout_bytes,
+        maxStderrBytes: trustedCfg.max_stderr_bytes,
+      });
+    } finally {
+      try {
+        restoreOverlay();
+      } catch {
+        /* keep overlay leftovers as mutation evidence */
+      }
+    }
 
     const post = await snapshotFn();
-    const mutated =
-      post.head !== preSpawn.head ||
-      post.tree !== preSpawn.tree ||
-      post.porcelain !== preSpawn.porcelain;
-    if (mutated) {
-      return fail("mutation", "provider mutated HEAD, tree, or porcelain", provider.id, {
+    if (worktreeSnapshotsDiffer(preSpawn, post)) {
+      return fail("mutation", "provider mutated HEAD, tree, porcelain, or ignored paths", provider.id, {
         stdout: truncateUtf8(spawned.stdout, trustedCfg.max_stdout_bytes),
         stderr: truncateUtf8(spawned.stderr, trustedCfg.max_stderr_bytes),
         porcelain: post.porcelain,
+        ignored: post.ignored,
+        exit_code: spawned.exit_code,
+        duration_ms: spawned.duration_ms,
+      });
+    }
+    if (spawned.descendants_remaining) {
+      return fail("containment", "escaped descendants remained after provider exit", provider.id, {
+        stdout: truncateUtf8(spawned.stdout, trustedCfg.max_stdout_bytes),
+        stderr: truncateUtf8(spawned.stderr, trustedCfg.max_stderr_bytes),
+        porcelain: post.porcelain,
+        ignored: post.ignored,
         exit_code: spawned.exit_code,
         duration_ms: spawned.duration_ms,
       });
@@ -929,7 +1362,7 @@ export async function observePlanningFacts(
 
   const providersDigest = canonicalProvidersPayload(
     trustedCfg.providers,
-    execBytes.map((e) => ({ id: e.id, bytes: e.bytes })),
+    execBytes.map((e) => ({ id: e.id, bytes: e.bytes, helpers: e.helpers })),
   ).toString("hex");
   const postSnap = await snapshotFn();
   const bundle: PlanningFactBundle = {
@@ -956,3 +1389,10 @@ export function isRequiredPlanningFactsBlock(
 }
 
 export { resolvePlanningFactsConfig };
+
+const launchedAsContainmentChild =
+  process.argv[2] === "--containment-child" &&
+  path.resolve(process.argv[1] ?? "") === path.resolve(thisModulePath);
+if (launchedAsContainmentChild) {
+  void runPlanningFactsContainmentChild(process.argv);
+}
