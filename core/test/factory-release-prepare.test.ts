@@ -2291,6 +2291,240 @@ test("handoff SHA mismatch fails closed", async () => {
   assert.match(result.last_error ?? "", /handoff_mismatch|candidate_sha/);
 });
 
+test("malformed handoff stops a still-running child before return", async () => {
+  const captured: {
+    killed?: NodeJS.Signals | number;
+    unrefed: boolean;
+    pipesDestroyed: number;
+  } = { unrefed: false, pipesDestroyed: 0 };
+  const childFactory = (
+    _command: string,
+    _args: readonly string[],
+    _options: { env?: NodeJS.ProcessEnv },
+  ) => {
+    const child = new EventEmitter() as EventEmitter & {
+      unref: () => void;
+      kill: (signal?: NodeJS.Signals | number) => boolean;
+      stdout: EventEmitter & { destroy: () => void };
+      stderr: EventEmitter & { destroy: () => void };
+      pid: number;
+    };
+    child.unref = () => {
+      captured.unrefed = true;
+    };
+    child.kill = (signal) => {
+      captured.killed = signal ?? "SIGTERM";
+      queueMicrotask(() => child.emit("exit", null, "SIGTERM"));
+      return true;
+    };
+    child.stdout = new EventEmitter() as EventEmitter & { destroy: () => void };
+    child.stderr = new EventEmitter() as EventEmitter & { destroy: () => void };
+    child.stdout.destroy = () => {
+      captured.pipesDestroyed += 1;
+    };
+    child.stderr.destroy = () => {
+      captured.pipesDestroyed += 1;
+    };
+    child.pid = 77;
+    queueMicrotask(() => {
+      child.emit("spawn");
+      child.stderr.emit("data", "handoff identity mismatch from child\n");
+    });
+    return child;
+  };
+  const result = await defaultSpawnCandidateLoop(
+    {
+      repoDir: "/repo",
+      loop_run_id: "loop-malformed-running",
+      candidateInvocation: testInvocation("loop-malformed-running"),
+      requestCandidateSha: CANDIDATE,
+    },
+    {
+      spawn: childFactory as never,
+      env: { PATH: "/usr/bin" },
+      fileExists: () => true,
+      readHandoff: async () => validHandoff("loop-malformed-running", "f".repeat(40)),
+      readSupervisor: async () => validHandoff("loop-malformed-running").supervisor,
+      realpath: (p: string) => p,
+      storeRunDir: "/state/runs/loop-malformed-running",
+      sleep: async () => {},
+      now: () => new Date("2026-08-29T00:00:01.000Z"),
+    },
+  );
+  assert.equal(result.dispatch_state, "failed");
+  assert.match(result.last_error ?? "", /handoff_mismatch|candidate_sha/);
+  assert.equal(captured.killed, "SIGTERM");
+  assert.equal(captured.unrefed, true);
+  assert.equal(captured.pipesDestroyed, 2);
+});
+
+test("resume OS accept persists starting so a later invoke does not spawn a second child", async () => {
+  const files = new Map<string, string>();
+  const request = baseRequest();
+  const workDir = "/tmp/frg-work-resume-os-accept";
+  const loopRunId = "loop-resume-os-accept";
+  const fingerprint = factoryReleaseRequestFingerprint(request);
+  const packRunId = `pack-${request.target_version.replace(/\./g, "")}-${request.action_id}`.slice(
+    0,
+    200,
+  );
+  const invocation = testInvocation(loopRunId);
+  const bindingPath = factoryReleaseLoopBindingPath(loopRunId);
+  files.set(
+    bindingPath,
+    JSON.stringify({
+      schema_version: 1,
+      kind: "factory_release_loop_binding",
+      request_fingerprint: fingerprint,
+      target_version: request.target_version,
+      candidate_git_sha: CANDIDATE,
+      pack_id: "factory-gate-v1",
+      manifest_sha256: MANIFEST_SHA,
+      pack_run_id: packRunId,
+      frg_run_id: "frg-resume-os-accept",
+      loop_run_id: loopRunId,
+      dispatch_state: "dispatched",
+      candidate_invocation: {
+        executable: invocation.executable,
+        argv: [...invocation.argv],
+        candidateSha: invocation.candidateSha,
+      },
+    }),
+  );
+  files.set(
+    factoryReleasePackInstancePath(workDir),
+    JSON.stringify({
+      schema_version: 1,
+      kind: "factory_release_pack_instance",
+      request_fingerprint: fingerprint,
+      target_version: request.target_version,
+      candidate_git_sha: CANDIDATE,
+      pack_id: "factory-gate-v1",
+      manifest_sha256: MANIFEST_SHA,
+      pack_run_id: packRunId,
+      frg_run_id: "frg-resume-os-accept",
+      loop_run_id: loopRunId,
+      created_at: "2026-08-10T12:00:00Z",
+      updated_at: "2026-08-10T12:00:00Z",
+    }),
+  );
+  const fsOps = {
+    writeFile: async (p: string, body: string) => {
+      files.set(p, body);
+    },
+    readFile: async (p: string) => {
+      const v = files.get(p);
+      if (v === undefined) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+      return v;
+    },
+    fileExists: async (p: string) => files.has(p),
+  };
+  let spawnCount = 0;
+  const spawnResumeChild = () => {
+    spawnCount += 1;
+    const child = new EventEmitter() as EventEmitter & {
+      unref: () => void;
+      stdout: EventEmitter;
+      stderr: EventEmitter;
+      pid: number;
+    };
+    child.unref = () => {};
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.pid = 5150;
+    queueMicrotask(() => child.emit("spawn"));
+    return child;
+  };
+  const deadPid = {
+    schema_version: 1 as const,
+    kind: "pack_loop_liveness" as const,
+    loop_run_id: loopRunId,
+    status: "not-live" as const,
+    reason: "dead_pid" as const,
+    observed_at: "2026-08-10T12:00:00Z",
+  };
+  const first = await generateDurableUnsignedFrg(
+    request,
+    {
+      repoDir: "/repo",
+      workDir,
+      pack: packWithTemplates(),
+      manifestPath: "/pack/factory-gate-v1/manifest.json",
+    },
+    {
+      now: () => new Date("2026-08-10T12:00:00Z"),
+      writeFile: fsOps.writeFile,
+      mkdir: async () => {},
+      readFile: fsOps.readFile,
+      fileExists: fsOps.fileExists,
+      reconcilePackLoop: async () => boundLoopArtifacts({ loop_run_id: loopRunId }),
+      probePackLoopLiveness: async () => deadPid,
+      createOrReusePackIssues: async () => {
+        throw new Error("must not create pack issues during resume");
+      },
+      dispatchPackLoop: async () => {
+        throw new Error("must not dispatch a second pack");
+      },
+      spawnDeps: {
+        spawn: spawnResumeChild as never,
+        fileExists: () => true,
+        readHandoff: async () => null,
+        readSupervisor: async () => null,
+        sleep: async () => {},
+        observationMs: 30_000,
+        onAccepted: async () => {
+          throw new Error("simulated parent crash after OS accept");
+        },
+      },
+    },
+  );
+  assert.equal(first.defect_class, "pack_loop_start_failed");
+  assert.match(first.message ?? "", /simulated parent crash after OS accept/);
+  assert.equal(spawnCount, 1);
+  const afterAccept = JSON.parse(files.get(bindingPath)!);
+  assert.equal(afterAccept.dispatch_state, "starting");
+  assert.equal(afterAccept.resume_count, 1);
+  assert.equal(typeof afterAccept.observation_deadline, "string");
+  assert.equal(afterAccept.spawn_attempt.pid, 5150);
+
+  const second = await generateDurableUnsignedFrg(
+    request,
+    {
+      repoDir: "/repo",
+      workDir,
+      pack: packWithTemplates(),
+      manifestPath: "/pack/factory-gate-v1/manifest.json",
+    },
+    {
+      now: () => new Date("2026-08-10T12:00:00Z"),
+      writeFile: fsOps.writeFile,
+      mkdir: async () => {},
+      readFile: fsOps.readFile,
+      fileExists: fsOps.fileExists,
+      reconcilePackLoop: async () => boundLoopArtifacts({ loop_run_id: loopRunId }),
+      probePackLoopLiveness: async () => ({
+        ...deadPid,
+        status: "unknown" as const,
+        reason: "no_handoff" as const,
+      }),
+      createOrReusePackIssues: async () => {
+        throw new Error("must not create pack issues while observing starting");
+      },
+      dispatchPackLoop: async () => {
+        throw new Error("must not dispatch a second pack");
+      },
+      spawnDeps: {
+        spawn: spawnResumeChild as never,
+        fileExists: () => true,
+      },
+    },
+  );
+  assert.equal(second.in_progress, true);
+  assert.equal(second.loop_run_id, loopRunId);
+  assert.equal(spawnCount, 1, "in-window starting must not spawn a second child");
+  assert.equal(JSON.parse(files.get(bindingPath)!).dispatch_state, "starting");
+});
+
 test("assertCandidateInvocation rejects SHA mismatch", () => {
   const inv = testInvocation("loop-x");
   assert.throws(

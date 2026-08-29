@@ -1017,6 +1017,11 @@ export interface DurableGenerateOptions {
     loop_run_id: string;
     candidateInvocation?: CandidateInvocation;
   }) => Promise<void | PackLoopSpawnResult>;
+  /**
+   * Spawn seams for the default resume dispatcher. Tests inject fake Spawn /
+   * ChildProcess here; production omits and uses real `spawn`.
+   */
+  spawnDeps?: SpawnCandidateLoopDeps;
   /** Typed candidate invocation for pack-loop spawn. Tests inject; production resolves. */
   candidateInvocation?: CandidateInvocation;
   resolveCandidateEngine?: typeof resolveCandidateEngine;
@@ -1152,6 +1157,28 @@ export async function persistFactoryReleaseLoopBinding(
     } satisfies FactoryReleasePackInstance),
     0o600,
   );
+}
+
+/** Persist `starting` after OS accept, before the parent awaits handoff. */
+async function persistPackLoopOsAccepted(
+  ctx: DurableReconcilePackLoopCtx | undefined,
+  loopRunId: string,
+  info: { pid?: number; observation_deadline: string },
+  invocation?: CandidateInvocation,
+): Promise<void> {
+  if (!ctx) return;
+  const extras: FactoryReleaseLoopBindingFields = {
+    observation_deadline: info.observation_deadline,
+    spawn_attempt: { pid: info.pid, at: isoNow(ctx.now()) },
+  };
+  if (invocation) {
+    extras.candidate_invocation = {
+      executable: invocation.executable,
+      argv: [...invocation.argv],
+      candidateSha: invocation.candidateSha,
+    };
+  }
+  await persistFactoryReleaseLoopBinding(ctx, loopRunId, "starting", extras);
 }
 
 async function boundLoopNeedsDispatchRetry(
@@ -1427,8 +1454,15 @@ export type CandidateLoopChild = {
   once(event: "error", listener: (err: Error) => void): unknown;
   once(event: "spawn", listener: () => void): unknown;
   once?(event: "exit", listener: (code: number | null, signal: NodeJS.Signals | null) => void): unknown;
-  stdout?: { on(event: "data", listener: (chunk: Buffer | string) => void): unknown } | null;
-  stderr?: { on(event: "data", listener: (chunk: Buffer | string) => void): unknown } | null;
+  stdout?: {
+    on(event: "data", listener: (chunk: Buffer | string) => void): unknown;
+    destroy?: () => void;
+  } | null;
+  stderr?: {
+    on(event: "data", listener: (chunk: Buffer | string) => void): unknown;
+    destroy?: () => void;
+  } | null;
+  kill?: (signal?: NodeJS.Signals | number) => boolean | void;
   unref?: () => void;
   pid?: number;
 };
@@ -1570,6 +1604,32 @@ function drainChildPipes(child: CandidateLoopChild): { stdout: BoundedStreamBuff
   child.stdout?.on("data", (chunk) => stdout.push(chunk));
   child.stderr?.on("data", (chunk) => stderr.push(chunk));
   return { stdout, stderr };
+}
+
+const PACK_LOOP_FAILED_CHILD_SETTLE_MS = 1_000;
+
+/** Stop a still-running child whose dispatch already failed closed. */
+async function stopFailedPackLoopChild(
+  child: CandidateLoopChild,
+  alreadyExited: boolean,
+  sleep: (ms: number) => Promise<void>,
+): Promise<void> {
+  if (!alreadyExited) {
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+      child.once?.("exit", () => finish());
+      child.kill?.("SIGTERM");
+      void sleep(PACK_LOOP_FAILED_CHILD_SETTLE_MS).then(finish);
+    });
+  }
+  child.stdout?.destroy?.();
+  child.stderr?.destroy?.();
+  child.unref?.();
 }
 
 function redactPackLoopExcerpt(raw: string): string {
@@ -1757,6 +1817,7 @@ export async function defaultSpawnCandidateLoop(
           spawn_attempt: { pid: child.pid, at: isoNow(now()) },
         };
       }
+      await stopFailedPackLoopChild(child, exitCode !== undefined, sleep);
       const excerpt = await finishStderrEvidence(deps, evidencePath, pipes);
       return {
         dispatch_state: "failed",
@@ -2016,18 +2077,8 @@ export async function productionDispatchPackLoop(
           writeFile: input.persistCtx?.writeFile ?? deps.spawnDeps?.writeFile,
           now: input.persistCtx?.now ?? deps.spawnDeps?.now,
           onAccepted: async (info) => {
+            await persistPackLoopOsAccepted(input.persistCtx, spawnArgs.loop_run_id, info, invocation);
             if (deps.spawnDeps?.onAccepted) await deps.spawnDeps.onAccepted(info);
-            if (input.persistCtx) {
-              await persistFactoryReleaseLoopBinding(input.persistCtx, spawnArgs.loop_run_id, "starting", {
-                observation_deadline: info.observation_deadline,
-                spawn_attempt: { pid: info.pid, at: isoNow(input.persistCtx.now()) },
-                candidate_invocation: {
-                  executable: invocation.executable,
-                  argv: [...invocation.argv],
-                  candidateSha: invocation.candidateSha,
-                },
-              });
-            }
           },
         },
       ));
@@ -2413,7 +2464,7 @@ export async function generateDurableUnsignedFrg(
         dispatchPackLoop: opts.dispatchPackLoop,
         candidateInvocation: opts.candidateInvocation,
       }));
-  const resumeBoundPackLoop = opts.resumeBoundPackLoop ?? defaultResumeBoundPackLoop;
+  const injectedResumeBoundPackLoop = opts.resumeBoundPackLoop;
   const scoreBoundPackLoop = opts.scoreBoundPackLoop ?? defaultScoreBoundPackLoop;
 
   const requestFingerprint = factoryReleaseRequestFingerprint(request);
@@ -2503,6 +2554,36 @@ export async function generateDurableUnsignedFrg(
     fileExists,
     now,
   };
+
+  const resumeBoundPackLoop =
+    injectedResumeBoundPackLoop ??
+    ((args: {
+      repoDir: string;
+      loop_run_id: string;
+      candidateInvocation?: CandidateInvocation;
+    }) =>
+      defaultResumeBoundPackLoop(
+        {
+          repoDir: args.repoDir,
+          loop_run_id: args.loop_run_id,
+          candidateInvocation: args.candidateInvocation,
+          requestCandidateSha: request.integrated_candidate.git_sha,
+        },
+        {
+          ...opts.spawnDeps,
+          now: opts.spawnDeps?.now ?? now,
+          writeFile: opts.spawnDeps?.writeFile ?? writeFile,
+          onAccepted: async (info) => {
+            await persistPackLoopOsAccepted(
+              reconcileCtx,
+              args.loop_run_id,
+              info,
+              args.candidateInvocation,
+            );
+            if (opts.spawnDeps?.onAccepted) await opts.spawnDeps.onAccepted(info);
+          },
+        },
+      ));
 
   let loop = await reconcilePackLoop(reconcileCtx);
   if (!loop) {
@@ -2641,12 +2722,12 @@ export async function generateDurableUnsignedFrg(
             }
           } catch (err) {
             return {
-              ...refuseSyntheticTrivialPack(request, {
+              ...(await refuseSyntheticTrivialPack(request, {
                 defect_class: "pack_loop_start_failed",
                 message:
                   `factory-release prepare: failed to resume request-bound factory-gate pack loop ` +
                   `${loop.loop_run_id} for ${request.target_version}: ${(err as Error).message}`,
-              }),
+              })),
               loop_run_id: loop.loop_run_id,
             };
           }

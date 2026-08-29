@@ -6,7 +6,7 @@
 - [ ] 1.4 Expand binding `dispatch_state` to `bound | starting | dispatched | failed`; persist `observation_deadline` and `spawn_attempt` evidence; treat OS accept as `starting`, not `dispatched`
 - [ ] 1.5 Persist a durable atomic `loop-run-handoff.json` from `onRunReady` (token-guarded store write); validate exact `run_id`, realpath-contained `run_dir`/`events`, `candidate_sha`, and matching `supervisor.json` pid/start/boot before `dispatched`
 - [ ] 1.6 Drain stdout/stderr pipes; redact with `redactSecrets`+`sanitize`; bound 16 KiB head + 16 KiB tail; persist mode `0600`; on evidence-write failure still fail closed and name the write error in `last_error`
-- [ ] 1.7 Pre-handoff exit `0` and exit `1`, crash after OS accept, and handoff SHA mismatch all persist `failed` and do not retry; OS spawn throw/ENOENT leaves `bound`
+- [ ] 1.7 Pre-handoff exit `0` and exit `1`, crash after OS accept, and handoff SHA mismatch all persist `failed` and do not retry; OS spawn throw/ENOENT leaves `bound`. A mismatched or malformed handoff SHALL stop the spawned child and close owned pipes before return. Resume OS accept SHALL persist `starting` (same protocol as initial spawn) so a later invoke observes and does not spawn a second child.
 - [ ] 1.8 Reconcile before spawn: adopt valid dispatched holder, observe in-window `starting`, fail closed on `failed`, retry only `bound`; verify concurrent prepare does not spawn a second child
 - [ ] 1.9 Rewrite `captured.command === "/opt/pipeline"` tests in `core/test/factory-release-prepare.test.ts`; keep `sanitizeCandidateLoopEnv` FRG-strip tests green
 - [ ] 1.10 Keep `--engine-track candidate` on argv as intent metadata only; verify docs/spawn comments do not treat it as the binary selector

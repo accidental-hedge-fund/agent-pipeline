@@ -33,4 +33,5 @@ A factory-release pack-loop dispatcher SHALL treat a typed `loop_run_handoff` as
 - **OR** `supervisor.json` process identity does not match that handoff
 - **THEN** the dispatcher SHALL NOT persist `dispatched`
 - **AND** it SHALL persist `dispatch_state` `failed`
+- **AND** it SHALL stop the spawned child process and close owned pipes before returning
 - **AND** it SHALL fail closed with a typed identity error
