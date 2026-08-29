@@ -541,6 +541,8 @@ export async function runPlanningFactsContainmentChild(argv: string[] = process.
 }
 
 const thisModulePath = fileURLToPath(import.meta.url);
+const SUBREAPER_SCRIPT_PATH = path.join(path.dirname(thisModulePath), "planning-facts-subreaper.py");
+const SUBREAPER_PYTHON_PATH = "/usr/bin/python3";
 
 export function planningFactsContainmentArgv(req: SpawnProviderRequest, cgroupDir: string): {
   command: string;
@@ -561,6 +563,30 @@ export function planningFactsContainmentArgv(req: SpawnProviderRequest, cgroupDi
   };
 }
 
+/**
+ * Wrap the containment child so the direct spawn is a child-subreaper that
+ * stays alive to SIGKILL + waitpid setsid descendants. Nested cgroup.kill is
+ * not delegated on GitHub Actions; without this trampoline a daemonized child
+ * can outlive the provider. Missing interpreter or script is fail-closed.
+ */
+export function planningFactsSubreaperArgv(
+  innerCommand: string,
+  innerArgs: string[],
+  pythonPath: string = SUBREAPER_PYTHON_PATH,
+  scriptPath: string = SUBREAPER_SCRIPT_PATH,
+): { command: string; args: string[] } | { unavailable: string } {
+  if (!fs.existsSync(pythonPath)) {
+    return { unavailable: `containment: subreaper interpreter missing at ${pythonPath}` };
+  }
+  if (!fs.existsSync(scriptPath)) {
+    return { unavailable: `containment: subreaper script missing at ${scriptPath}` };
+  }
+  return {
+    command: pythonPath,
+    args: ["-I", scriptPath, innerCommand, ...innerArgs],
+  };
+}
+
 function resolveContainment(spawnImpl: typeof spawn): ProviderContainment {
   return spawnImpl === spawn ? createCgroupContainment() : NOOP_PROVIDER_CONTAINMENT;
 }
@@ -574,6 +600,7 @@ export function defaultSpawnProvider(
   req: SpawnProviderRequest,
   spawnImpl: typeof spawn = spawn,
   containmentArg?: ProviderContainment,
+  subreaper?: { pythonPath?: string; scriptPath?: string },
 ): Promise<SpawnProviderResult> {
   return new Promise((resolve) => {
     const start = Date.now();
@@ -644,8 +671,30 @@ export function defaultSpawnProvider(
     };
     let child: ChildProcess;
     const wrap = spawnImpl === spawn && containment.dir;
-    const command = wrap ? process.execPath : req.command;
-    const args = wrap ? planningFactsContainmentArgv(req, containment.dir as string).args : req.args;
+    let command = req.command;
+    let args = req.args;
+    if (wrap) {
+      const inner = planningFactsContainmentArgv(req, containment.dir as string);
+      const wrapped = planningFactsSubreaperArgv(
+        inner.command,
+        inner.args,
+        subreaper?.pythonPath,
+        subreaper?.scriptPath,
+      );
+      if ("unavailable" in wrapped) {
+        finish({
+          exit_code: -1,
+          stdout: Buffer.alloc(0),
+          stderr: Buffer.from(wrapped.unavailable),
+          timed_out: false,
+          spawn_error: true,
+          descendants_remaining: false,
+        });
+        return;
+      }
+      command = wrapped.command;
+      args = wrapped.args;
+    }
     try {
       child = spawnImpl(command, args, {
         cwd: req.cwd,

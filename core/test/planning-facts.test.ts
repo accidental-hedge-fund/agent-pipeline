@@ -3,6 +3,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -21,6 +22,7 @@ import {
   defaultOverlayTrustedProviderFiles,
   observePlanningFacts,
   planningFactsContainmentArgv,
+  planningFactsSubreaperArgv,
   planningFactsReasonPrefix,
   planningFactsSection,
   requiredFactIdentities,
@@ -780,14 +782,69 @@ test("planningFactsContainmentArgv execs the trusted command without a shell", (
   assert.ok(wrapped.args.includes("--containment-child"));
 });
 
-test("defaultSpawnProvider cgroup containment kills a setsid daemon before a delayed write lands", async (t) => {
-  // Nested cgroup.kill is not delegated on GitHub Actions runners; the same
-  // test passes on hosts with a writable cgroup.kill. Keep the assertion
-  // where containment actually works (#1300 CI).
-  if (process.env.GITHUB_ACTIONS === "true") {
-    t.skip("GitHub Actions does not delegate nested cgroup.kill");
-    return;
+test("planningFactsSubreaperArgv is argv-only and fail-closed when the interpreter is missing", () => {
+  const inner = planningFactsContainmentArgv(
+    {
+      command: "/tmp/trusted-exec",
+      args: [";", "$HOME"],
+      cwd: "/wt",
+      env: {},
+      shell: false,
+      timeoutMs: 1,
+      maxStdoutBytes: 1,
+      maxStderrBytes: 1,
+    },
+    "/sys/fs/cgroup/fake",
+  );
+  const wrapped = planningFactsSubreaperArgv(inner.command, inner.args);
+  assert.equal("unavailable" in wrapped, false);
+  if ("unavailable" in wrapped) return;
+  assert.equal(wrapped.command, "/usr/bin/python3");
+  assert.equal(wrapped.args[0], "-I");
+  assert.equal(wrapped.args.includes("/bin/sh"), false);
+  const dash = wrapped.args.lastIndexOf("--");
+  assert.ok(dash > 0);
+  assert.equal(wrapped.args[dash + 1], "/tmp/trusted-exec");
+  assert.deepEqual(wrapped.args.slice(dash + 2), [";", "$HOME"]);
+  const missing = planningFactsSubreaperArgv(inner.command, inner.args, "/no/such/python3");
+  assert.equal("unavailable" in missing, true);
+  if ("unavailable" in missing) {
+    assert.match(missing.unavailable, /subreaper interpreter missing/);
   }
+});
+
+test("defaultSpawnProvider fails closed without running the provider when the subreaper is missing", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pf-nosubreaper-"));
+  const script = path.join(dir, "provider.sh");
+  fs.writeFileSync(
+    script,
+    `#!/bin/sh
+echo ran > ran.txt
+printf '%s\\n' '{"schema_version":1,"facts":{"alembic_head":"0074"}}'
+`,
+    { mode: 0o755 },
+  );
+  const result = await defaultSpawnProvider(
+    {
+      command: script,
+      args: [],
+      cwd: dir,
+      env: { PATH: "/usr/bin:/bin", LANG: "C.UTF-8", LC_ALL: "C.UTF-8", HOME: dir, TMPDIR: dir },
+      shell: false,
+      timeoutMs: 5_000,
+      maxStdoutBytes: 1_024,
+      maxStderrBytes: 1_024,
+    },
+    spawn,
+    undefined,
+    { pythonPath: "/no/such/python3" },
+  );
+  assert.equal(result.spawn_error, true);
+  assert.match(result.stderr.toString("utf8"), /subreaper interpreter missing/);
+  assert.equal(fs.existsSync(path.join(dir, "ran.txt")), false, "provider must not run without a subreaper");
+});
+
+test("defaultSpawnProvider cgroup containment kills a setsid daemon before a delayed write lands", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pf-daemon-"));
   const script = path.join(dir, "provider.sh");
   fs.writeFileSync(
@@ -809,10 +866,10 @@ printf '%s\\n' '{"schema_version":1,"facts":{"alembic_head":"0074"}}'
     maxStderrBytes: 1_024,
   });
   await new Promise((r) => setTimeout(r, 600));
+  assert.equal(fs.existsSync(path.join(dir, "pwned.txt")), false, "daemonized descendant must not write after observation");
   assert.equal(result.timed_out, false);
   assert.equal(result.spawn_error ?? false, false);
   assert.match(result.stdout.toString("utf8"), /alembic_head/);
-  assert.equal(fs.existsSync(path.join(dir, "pwned.txt")), false, "daemonized descendant must not write after observation");
 });
 
 test("spawn request carries effective stdout/stderr byte caps", async () => {
