@@ -21,6 +21,7 @@ Operator and contributor docs still present `plugin/` as how the engine is distr
 ### Modified Capabilities
 
 - `docs-landing-split`: README and `docs/concepts.md` SHALL link `docs/packaging.md`. README SHALL describe an implementer/reviewer pair, not a Claude+Codex-only “both CLIs required” product.
+- `readme-user-clarity`: First-screenful README SHALL describe an implementer/reviewer pair from `.github/pipeline.yml`. It SHALL NOT say both Claude Code and Codex are required as the product.
 - `core-mirror-sync`: Repo-local golden-rule files SHALL stop teaching “always commit `plugin/`” as the forever product rule. Until #1048 they MAY keep one transitional `build.mjs --check` line.
 - `namespaced-command-surface`: Existing `/pipeline:*` host entries SHALL be documented as optional shims that exec the CLI, not as the product surface. This slice does not delete those files.
 
@@ -42,6 +43,7 @@ Operator and contributor docs still present `plugin/` as how the engine is distr
 - [ ] `openspec/project.md` does not say the product is Claude+Codex only.
 - [ ] `openspec/project.md` does not say “always commit the regenerated `plugin/`” as the forever packaging rule.
 - [ ] README does not say both Claude and Codex CLIs are required as the product. It describes a configured implementer/reviewer pair.
+- [ ] This change includes a `readme-user-clarity` MODIFIED delta. The purpose-first requirement names the implementer/reviewer pair and does not require both Claude and Codex CLIs as the product.
 - [ ] Contributor-facing docs (README Development and/or `docs/packaging.md`) present the contributor path as install the CLI + a short host SKILL, not “copy `core/`” or “ship `plugin/` as the product.”
 - [ ] `docs/supervisor.md` links `docs/packaging.md` and retains the operator-authorized merge / no grant-factory sentence.
 - [ ] Host SKILL.md files are not rewritten in this slice (#1049).
@@ -53,7 +55,7 @@ Operator and contributor docs still present `plugin/` as how the engine is distr
 
 - **Docs:** new `docs/packaging.md`; links from README, `docs/concepts.md`, and `docs/supervisor.md`; glossary retention in `CONTEXT.md`.
 - **Contributor conventions:** `AGENTS.md`, `CLAUDE.md`, `openspec/project.md`.
-- **Specs:** new `cli-product-packaging`; deltas for `docs-landing-split`, `core-mirror-sync`, `namespaced-command-surface`.
+- **Specs:** new `cli-product-packaging`; deltas for `docs-landing-split`, `readme-user-clarity`, `core-mirror-sync`, `namespaced-command-surface`.
 - **Engine / install / plugin tree:** none in this slice.
 - **Related later slices (out of scope):** #1048 Claude install provisions CLI (no core copy, no `/pipeline:*` files); #1049 short SKILL; #1050 delete `plugin/`; #976 deeper harness-pair docs; #907 MCP parked.
 - **Parent:** #1046 (unmiled tracker). Program: v1.40.0 first slice. No `Depends on`.

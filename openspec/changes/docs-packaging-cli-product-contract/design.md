@@ -16,6 +16,7 @@ Conflicts (do not average them):
 2. Living `core-mirror-sync` still requires a regenerate-and-commit-`plugin/` instruction. This slice makes that instruction transitional until #1048 in repo-root golden-rule files only.
 3. Issue #976 is a separate open harness-pair docs item on the same milestone. This slice only changes README pair language as the #1047 grill lock requires. It does not absorb #976.
 4. README install still documents that the current installer copies core. Packaging.md states the product contract (CLI + short SKILL) and names the installer/mirror as transitional until #1048 / #1050. Do not claim the installer already stopped copying core.
+5. Living `readme-user-clarity` currently requires “both Claude Code and Codex are required” in the first screenful. This slice MODIFIES that requirement so the README pair-language edit does not contradict a living spec. Deeper pair matrix remains #976.
 
 ## Goals / Non-Goals
 
@@ -100,6 +101,21 @@ Conflicts (do not average them):
 
 **Why:** Grill lock for #1047 names that README sentence. Absorbing #976 would broaden this docs slice.
 
+**Alternatives considered:**
+
+- Rewrite the full harness-pair matrix in README now — that is #976.
+
+### D8 — MODIFY `readme-user-clarity` instead of leaving the both-CLIs living requirement in force
+
+**Choice:** Copy the living “README opens with a purpose-first summary” requirement under `## MODIFIED Requirements` and replace “both Claude Code and Codex are required” with the implementer/reviewer pair. Keep the other `readme-user-clarity` requirements (quickstart, optional-section separation, Grok subsection as install-path docs).
+
+**Why:** A README edit that only lives in `docs-landing-split` / `cli-product-packaging` would still fail the archived `readme-user-clarity` first-screenful contract at archive time.
+
+**Alternatives considered:**
+
+- Leave `readme-user-clarity` unchanged — implementation would contradict a living spec.
+- Rewrite every `readme-user-clarity` requirement that mentions Claude or Codex — over-scope; those remaining lines are install-host docs, not the “both CLIs required as the product” sentence.
+
 ## Risks / Trade-offs
 
 - [Docs say CLI + SKILL while installer still copies core] → Mitigation: packaging.md names #1048 / #1050 as the install and deletion slices. Do not claim those already shipped.
@@ -107,6 +123,7 @@ Conflicts (do not average them):
 - [Living `core-mirror-sync` vs new golden rule] → Mitigation: MODIFIED requirement keeps regen until #1048; ADDED requirement forbids forever-rule wording in AGENTS.md / CLAUDE.md.
 - [README line budget] → Mitigation: add a short link and swap pair sentences; do not paste packaging.md into README.
 - [#976 still open on v1.40.0] → Mitigation: this slice only does the pair-language sentence. Remaining harness-pair docs stay on #976.
+- [Living `readme-user-clarity` still requires both CLIs] → Mitigation: MODIFY that first-screenful requirement in this change. Do not leave the old wording in force.
 
 ## Migration Plan
 

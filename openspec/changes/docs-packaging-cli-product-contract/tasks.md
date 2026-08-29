@@ -6,7 +6,7 @@
 ## 2. Landing pages and supervisor docs
 
 - [ ] 2.1 Add a working relative link to `docs/packaging.md` from root `README.md` (contents and/or Where to go next). Verify the markdown link resolves and `README.md` stays under 400 lines (`wc -l`).
-- [ ] 2.2 Rewrite README purpose and prerequisites so they describe an implementer/reviewer pair from `.github/pipeline.yml`, not “both Claude and Codex CLIs are required.” Verify those exact “both CLIs are required” / “Both \`claude\` and \`codex\` CLIs” product sentences are gone.
+- [ ] 2.2 Rewrite README purpose and prerequisites so they describe an implementer/reviewer pair from `.github/pipeline.yml`, not “both Claude and Codex CLIs are required.” Verify the first screenful satisfies the modified `readme-user-clarity` purpose-first requirement, and that the exact “both CLIs are required” / “Both \`claude\` and \`codex\` CLIs” product sentences are gone.
 - [ ] 2.3 Point README Development at the packaging contract for product law, while leaving current `build.mjs --check` commands as the still-true CI gate until #1048. Verify Development still documents `node scripts/build.mjs --check` and does not call `plugin/` the product.
 - [ ] 2.4 Add a working relative link to `docs/packaging.md` from `docs/concepts.md` (contents and the hosts/core section). Rewrite the “Claude host also feeds the generated `plugin/` marketplace mirror” product wording so `plugin/` is transitional, not the distribution product. Verify the link and that the layout table does not call `plugin/` the product.
 - [ ] 2.5 Add a working relative link to `docs/packaging.md` from `docs/supervisor.md`. Verify the page still states merge is operator-authorized and that this repository does not ship a grant factory or second control plane.
