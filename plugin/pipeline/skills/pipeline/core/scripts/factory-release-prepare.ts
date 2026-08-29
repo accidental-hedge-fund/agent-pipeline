@@ -1216,6 +1216,7 @@ export async function defaultScoreBoundPackLoop(
     loadContract: async () => contract,
     // Explicit: no --observations, no scenario/composition overrides, no
     // caller-authored pack provenance. Hybrid v2 inside the scorer applies.
+    requestCandidateGitSha: args.request.integrated_candidate.git_sha,
     attestationKey: null,
     stdout: () => {},
     stderr: () => {},

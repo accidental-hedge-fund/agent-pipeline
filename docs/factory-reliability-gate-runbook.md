@@ -135,6 +135,20 @@ an unsafe public injection switch only to green FRG.
 policy is not pinned to one SemVer. Proof binds to the pack id, manifest hash,
 **this candidate SHA**, the loop run, and the closed probe list.
 
+From-run collect (#1298) sets `pack_provenance.candidate_git_sha` to the packed
+candidate OID `C` from the scored loop's `factory-release-binding.json` and,
+when the in-process scorer holds the request, `integrated_candidate.git_sha`.
+Those values are exact 40-hex OIDs. When both are in hand they must be equal.
+A request-bound ship-path score (request SHA provided, or binding file present)
+fails closed before Layer A probes when the binding is missing, a present
+source is malformed, or the two OIDs conflict. It does **not** call
+`git rev-parse HEAD` of the factory control checkout `repoDir` for identity,
+and it does **not** fall back to control HEAD. Standalone `--from-run` with no
+request object and no binding file may still use `repoDir` HEAD. Layer A
+probes run with cwd at the resolved candidate engine for `C`. Fast-forwarding
+the operator control checkout is not the product fix. `--skip-frg` is not the
+product fix.
+
 Two disjoint proof sets. Every required scenario and composition id has exactly
 one owner.
 
@@ -194,7 +208,13 @@ This is an idempotent multi-tick protocol.
    `pipeline factory-gate --for <version> --from-run <loop_run_id>` (or the
    in-process equivalent). It does **not** pass `--observations`. Hybrid v2
    scoring applies: required-live from the candidate pack loop; Layer A TAP
-   hashes on the same candidate SHA. Release-eligible
+   hashes bound to the request packed candidate (loop
+   `factory-release-binding.json` `candidate_git_sha` and, when in hand,
+   request `integrated_candidate.git_sha`), not control-checkout HEAD.
+   Request-bound collect must not fall back to `repoDir` HEAD. Fast-forwarding
+   `REPO_DIR` is not the fix. `--skip-frg` is not the fix. HMAC `latest.json`
+   is still written under the control checkout
+   `.agent-pipeline/frg/<version>/`. Release-eligible
    `.agent-pipeline/frg/<version>/latest.json` with `pass: true` is written
    only on a genuine scorer pass with HMAC. Unsigned evidence MAY stay
    `pass: false` when HMAC is omitted; that is attestor input, not pack-fail.

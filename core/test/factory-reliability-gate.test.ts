@@ -1153,6 +1153,152 @@ test("runFactoryGate --from-run post-1.33: collects hybrid-v2 provenance when mi
   assert.equal(result.evidence.score_source, "from-run");
 });
 
+test("runFactoryGate --from-run forwards request packed candidate and writes latest.json under repoDir (#1298)", async () => {
+  const fs = memFs();
+  const packedC = "6670cee2b2659bc8350e98c1a2a34b53299b995b";
+  const captured: Array<{ repoDir: string; requestCandidateGitSha?: string; fromRun: string }> = [];
+  const packContract = {
+    schema: LOOP_CONTRACT_SCHEMA,
+    run_id: "loop-frg-1298",
+    selector: { type: "label", value: "factory-gate" },
+    items: [
+      { id: "1112", depends_on: [], external_depends_on: [] },
+      { id: "1113", depends_on: [], external_depends_on: [] },
+    ],
+  } as unknown as LoopContract;
+  const ledger = {
+    schema: LOOP_LEDGER_SCHEMA,
+    run_id: "loop-frg-1298",
+    items: {
+      "1112": { state: "ready", history: [], recovery_attempts: [], advance_run_id: "adv-1112" },
+      "1113": { state: "ready", history: [], recovery_attempts: [], advance_run_id: "adv-1113" },
+    },
+  } as unknown as LoopLedger;
+
+  const { loadFrgPack, collectFrgPackObservations, renderFrgPackIssues } = await import(
+    "../scripts/frg-pack-observations.ts"
+  );
+  const pack = await loadFrgPack();
+  const bundleBase = {
+    schema_version: 1 as const,
+    policy_id: pack.manifest.pilot_policy.id,
+    pack_id: pack.manifest.pack_id,
+    manifest_version: pack.manifest.manifest_version,
+    manifest_sha256: pack.manifest_sha256,
+    release_version: "1.39.15",
+    candidate_git_sha: packedC,
+    pack_run_id: "pack-1298",
+    loop_run_id: "loop-frg-1298",
+    repository: "owner/repo",
+    base_branch: "main",
+    started_at: "2026-08-18T02:54:58.000Z",
+  };
+  const rendered = renderFrgPackIssues(pack, {
+    release_version: "1.39.15",
+    pack_run_id: "pack-1298",
+  });
+  const issueNumbers = [1112, 1113];
+  const observations = collectFrgPackObservations(pack, {
+    ...bundleBase,
+    contract: {
+      artifact_sha256: "b".repeat(64),
+      selector: { type: "label", value: "factory-gate" },
+      issue_numbers: issueNumbers,
+      items: issueNumbers.map((n) => ({ issue_number: n, depends_on: [] })),
+    },
+    ledger: {
+      artifact_sha256: "c".repeat(64),
+      items: issueNumbers.map((n) => ({
+        issue_number: n,
+        state: "ready",
+        advance_run_id: `adv-${n}`,
+        blocked_theme: null,
+      })),
+    },
+    events: {
+      artifact_sha256: "d".repeat(64),
+      event_ids: issueNumbers.map((n) => `event:1:item-${n}`),
+      issue_numbers: issueNumbers,
+    },
+    action_evidence: {
+      artifact_sha256: "e".repeat(64),
+      action_ids: issueNumbers.map((n) => `action:1:item-${n}`),
+      issue_numbers: issueNumbers,
+    },
+    issues: rendered.map((issue, index) => {
+      const issueNumber = issueNumbers[index]!;
+      const head = String(index + 1).repeat(40);
+      const files =
+        issue.provenance.template_id === "clean-openspec"
+          ? ["openspec/changes/archive/2026-08-18-x/proposal.md", "openspec/specs/frg/spec.md"]
+          : ["docs/frg-fixture.md"];
+      return {
+        issue_number: issueNumber,
+        issue_node_id: `ISSUE_${issueNumber}`,
+        created_at: `2026-08-18T02:55:0${index}.000Z`,
+        title: issue.title,
+        body: issue.body,
+        labels: [...issue.labels, "pipeline:ready-to-deploy"],
+        template_id: issue.provenance.template_id,
+        template_sha256: issue.provenance.template_sha256,
+        pr: {
+          number: 2100 + index,
+          node_id: `PR_${2100 + index}`,
+          head_sha: head,
+          base_branch: "main",
+          files,
+          checks: [{ id: `CHECK_${issueNumber}`, name: "ci", head_sha: head, conclusion: "success" }],
+        },
+      };
+    }),
+    probes: pack.manifest.pilot_policy.layer_a_probes.map((probe, index) => ({
+      id: probe.id,
+      candidate_git_sha: packedC,
+      test_file: probe.test_file,
+      test_name: probe.test_name,
+      command_argv_sha256: "1".repeat(64),
+      stdout_sha256: "2".repeat(64),
+      stderr_sha256: "3".repeat(64),
+      started_at: `2026-08-18T03:00:${String(index).padStart(2, "0")}.000Z`,
+      finished_at: `2026-08-18T03:00:${String(index).padStart(2, "0")}.500Z`,
+    })),
+  });
+
+  const result = await runFactoryGate(
+    {
+      version: "1.39.15",
+      repoDir: "/control-repo",
+      fromRun: "loop-frg-1298",
+      requestCandidateGitSha: packedC,
+      loadLedger: async () => ledger,
+      loadContract: async () => packContract,
+      collectHybridV2: async (args) => {
+        captured.push({
+          repoDir: args.repoDir,
+          requestCandidateGitSha: args.requestCandidateGitSha,
+          fromRun: args.fromRun,
+        });
+        return observations;
+      },
+      attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
+      stdout: () => {},
+      stderr: () => {},
+    },
+    fs,
+  );
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(captured, [
+    {
+      repoDir: "/control-repo",
+      requestCandidateGitSha: packedC,
+      fromRun: "loop-frg-1298",
+    },
+  ]);
+  assert.equal(result.latestPath, "/control-repo/.agent-pipeline/frg/1.39.15/latest.json");
+  assert.ok(fs.files.has("/control-repo/.agent-pipeline/frg/1.39.15/latest.json"));
+  assert.equal(result.evidence.pack_provenance?.candidate_git_sha, packedC);
+});
+
 test("runFactoryGate --from-run: requires loadContract (pack validation seam)", async () => {
   await assert.rejects(
     () =>

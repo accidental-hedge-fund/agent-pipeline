@@ -29,45 +29,78 @@ Loop `factory-release-binding.json` already records `candidate_git_sha` from `in
 
 ## Decisions
 
-### 1. Identity comes from the request-bound packed candidate, not `repoDir` HEAD
+### 1. One identity resolver; ship-path never uses control HEAD
 
-**Choice:** `factory-gate --from-run` hybrid-v2 collect SHALL set `pack_provenance.candidate_git_sha` from the request-bound packed candidate: loop `factory-release-binding.json` `candidate_git_sha` (copy of factory-release request `integrated_candidate.git_sha`), or an equivalent injected collect argument in tests. When that 40-hex OID is present, collect SHALL NOT use `git rev-parse HEAD` of `repoDir`.
+**Choice:** Export a pure helper (for example `resolvePackedCandidateIdentity`) that returns packed candidate `C` or fails closed. Normalize every SHA with `parseExactGitSha` from `core/scripts/ship-end-identity.ts` (trim, lowercase, exact 40-hex). Abbreviated SHAs are malformed.
 
-**Why:** `repoDir` is the evidence write root (control checkout `.agent-pipeline/frg/`). It is not the packed-candidate identity. Binding is already persisted before pack spawn. Ensure-tag's packed SHA is the same field. Using HEAD of the "right" directory would still drift if cwd is control.
+**Inputs (two named sources, not “binding or request”):**
+
+| Source | When it is in hand |
+| --- | --- |
+| Loop binding | `factory-release-binding.json` exists on the scored loop. Field is `candidate_git_sha` (durable copy of request `integrated_candidate.git_sha`, written by `persistFactoryReleaseLoopBinding` before pack spawn). |
+| Request SHA | In-process scorer already holds `FactoryReleasePrepareRequest.integrated_candidate.git_sha` (`defaultScoreBoundPackLoop`). CLI `pipeline factory-gate --from-run` does not pass the request object. |
+
+**Ship-path vs standalone:**
+
+- **Ship-path** when the request SHA is provided **or** the loop binding file is present (even if unreadable).
+- **Standalone** when the request SHA is not provided **and** the binding file is absent. Local operator `--from-run` of an unbound pack loop keeps today’s `gitHead(repoDir)` identity.
+
+**Ship-path law (fail closed before probes or evidence write):**
+
+1. A present source that does not parse as an exact 40-hex OID fails closed. Do not fall back to the other source. Do not fall back to `repoDir` HEAD. This matches `hmacPackedCandidateGitShaFromUnknown` in `core/scripts/stages/ship-adapter.ts`: a present invalid binding does not fall back to `pack_provenance`.
+2. If the request SHA is provided, the binding file is required. A missing binding on that path fails closed (`Missing ship-path binding does not stamp control HEAD`).
+3. If both parse, they MUST be equal. Conflict fails closed.
+4. If only the binding is in hand (CLI `--from-run` on a bound loop), `C` is the binding SHA.
+5. Request-bound ship-path collect MUST NOT call `gitHead(args.repoDir)` / `git rev-parse HEAD` in `repoDir` for identity. Injected `gitHead` that throws on `repoDir` MUST still let the bite test pass after the fix, and MUST fail today’s collector.
+
+**Why:** `repoDir` is the evidence write root (control checkout `.agent-pipeline/frg/`). It is not packed-candidate identity. Binding is already persisted before pack spawn. Ensure-tag packed SHA is the same field. Using HEAD of “the right directory” still drifts when cwd is control.
 
 **Alternatives considered:**
 
 - Fast-forward `REPO_DIR` to `C` before collect → rejected: issue non-goal; next lag is another mole.
-- `gitHead(candidateEngineDir)` instead of `gitHead(repoDir)` with no request field → incomplete: identity still depends on which checkout cwd happens to be. Request/binding is the ship source of truth.
-- Pass `--packed-candidate` on every `factory-gate --from-run` from Tugboat only → site-local; in-engine ship and a later composer that forgets the flag recreate the mole. Binding on the scored loop is already shared.
-- Stamp `C` from binding but keep `gitHead(repoDir)` as a fallback when binding is missing → allowed only for unbound standalone `--from-run` (no factory-release binding). Ship-path attest is request-bound and MUST have the binding. A missing binding on that path SHALL fail closed rather than stamp control HEAD.
+- `gitHead(candidateEngineDir)` instead of `gitHead(repoDir)` with no request/binding field → incomplete: identity still depends on which checkout cwd happens to be.
+- Pass `--packed-candidate` on every Tugboat `factory-gate --from-run` only → site-local; in-engine ship and a later composer that forgets the flag recreate the mole.
+- Prefer request over binding, or binding over request, when they differ → rejected: conflict is a defect. Fail closed.
+- Use request alone when the binding file is missing on the in-process prepare path → rejected: prepare writes the binding before spawn; a missing file is a ship-path defect, not a reason to stamp HEAD or to skip the durable copy.
 
-### 2. Probe records and probe execution share OID `C`
+### 2. Probe cwd is an explicit candidate-engine path at `C`
 
-**Choice:** Every Layer A probe record SHALL set `candidate_git_sha` to the same packed candidate `C` as `pack_provenance`. Probe execution SHALL use candidate engine sources for `C` (the ship-end candidate engine checkout already resolved by #1151 / `SHIP_END_CLI`), not control HEAD `P`. Collect SHALL fail closed if it cannot run those probes against `C` sources (for example the executing candidate engine HEAD is not `C`). It SHALL NOT bind pin-source TAP hashes to `C`.
+**Choice:** After identity resolves to `C`, collect SHALL resolve a candidate engine checkout with existing `resolveCandidateEngine` from `core/scripts/ship-end-candidate.ts` (`repoDir`, `candidateSha: C`, `PIPELINE_CANDIDATE_ENGINE_ROOT`). First match stays: clean `REPO_DIR` HEAD == `C`, else `.worktrees/ship-candidate-<C>`, else `PIPELINE_CANDIDATE_ENGINE_ROOT`, else create that worktree when deps allow. Collect SHALL NOT reset operator `REPO_DIR` HEAD.
 
-**Why:** Acceptance requires HMAC bound to `C` "when the score ran on candidate engine sources for `C`". Stamping `C` while hashing pin tests is a dishonest rebind. Evidence persist MAY still write `latest.json` under control `repoDir` (gitignored FRG tree). Identity and TAP cwd are the candidate, not the write root.
+Pass the resolved `engine.engineRoot` into `runProbe` as an explicit `candidateEngineDir` (do not overload control `args.repoDir`). `defaultRunLayerAProbe` SHALL use `cwd: candidateEngineDir`. Every probe record `candidate_git_sha` SHALL equal provenance `C`.
+
+If `resolveCandidateEngine` cannot prove a clean checkout whose HEAD is `C`, collect SHALL fail closed **before** any TAP run and **before** evidence write. Collect SHALL NOT hash pin-source TAP from control `repoDir` (HEAD `P`) and label it `C`.
+
+**Why:** #1151 already launches ship-end CLI from the candidate engine, but Tugboat/in-engine spawn still uses control cwd (`execFile` `cwd: opts.repoDir` in `realShipCoordinatorDeps`). Launcher identity is not TAP cwd. Provenance must execute against sources for `C`, not relabel pin TAP.
 
 **Alternatives considered:**
 
-- Stamp `C` but keep probe `cwd = repoDir` (control at `P`) → rejected: TAP is pin sources labeled as `C`.
+- Stamp `C` but keep probe `cwd = args.repoDir` (control at `P`) → rejected: SHA-only relabel.
 - Require control HEAD === `C` before collect → rejected: that is fast-forward-as-fix.
-- Skip Layer A probes when HEAD ≠ `C` and still pass → rejected: honest-pass requires candidate-SHA TAP hashes.
+- Skip Layer A probes when HEAD ≠ `C` and still pass → rejected: honest-pass needs candidate-SHA TAP hashes.
+- Derive cwd only from the running launcher path and skip `resolveCandidateEngine` → rejected: tests and in-process `defaultScoreBoundPackLoop` must share the same #1151 resolver. Launcher path MAY be a future extra root; it is not this change.
 
 ### 3. Ensure-tag comparison stays fail-closed; producer is the fix
 
-**Choice:** Do not change `hmacPackedCandidateGitShaFromUnknown` vs `--packed-candidate`. HMAC `P` vs packed `C` still throws `HMAC candidate_git_sha is not this ship's packed candidate`. HMAC `C` vs packed `C` succeeds even when control HEAD is `P`. Do not rewrite `latest.json`. Do not skip HMAC.
+**Choice:** Do not change `hmacPackedCandidateGitShaFromUnknown` vs `--packed-candidate`. HMAC `P` vs packed `C` still throws `HMAC candidate_git_sha is not this ship's packed candidate`. HMAC `C` vs packed `C` succeeds even when control HEAD is `P`. The helper does not read control HEAD today; keep that. Do not rewrite `latest.json`. Do not skip HMAC.
 
-**Why:** The tag helper is already correct. Loosening it to accept pin SHA would ship unbound evidence. The class fix is collect identity.
+**Why:** The tag helper is already correct. Loosening it to accept pin SHA would ship unbound evidence. The class fix is collect identity plus honest probe cwd.
 
-**Testing seam:** Inject `gitHead` → `P`, request/binding candidate → `C`, assert collected `pack_provenance.candidate_git_sha === C` and every probe SHA === `C`. A second test (or existing ensure-tag case) keeps fail-closed when HMAC is `P` and packed is `C`. No real git, network, or subprocess.
+**Testing seams (inject I/O; no real git, network, or subprocess):**
+
+- Bite: `repoDir` HEAD `P`, binding and/or request `C`, `gitHead(repoDir)` throws if called. Provenance and every probe record equal `C`.
+- Probe invocation: captured `runProbe` `candidateEngineDir` / cwd / argv is the engine root for `C`, not control `repoDir`.
+- Missing or conflicting request/binding fails before probes and before `collectFrgPackObservations`.
+- Standalone (no request, no binding file) still uses `gitHead(repoDir)`.
+- `ensureAnnotatedReleaseTag`: HMAC `C` + packed `C` accepted (control HEAD `P` out of band). HMAC `P` + packed `C` still throws.
 
 ## Risks / Trade-offs
 
-- **[Risk] Unbound standalone `--from-run` without `factory-release-binding.json` loses HEAD identity.** → Mitigation: last-resort `repoDir` HEAD only when no request binding exists. Ship-path attest MUST load the binding and MUST NOT take that fallback.
-- **[Risk] Stamping `C` over pin TAP hashes.** → Mitigation: fail closed unless probe execution is the candidate engine sources for `C`. The regression asserts probe records equal `C`; implementation MUST NOT pass by rewriting SHA after hashing `P`.
-- **[Risk] Evidence write path moves off the control FRG directory.** → Mitigation: `repoDir` remains the persist root. Only identity and probe cwd change.
-- **[Risk] Tests keep injecting `gitHead` and miss production binding load.** → Mitigation: the bite test MUST fail when collect still calls `gitHead(repoDir)` for identity while binding/request `C` is present.
+- **[Risk] Standalone `--from-run` without a binding file loses HEAD identity.** → Mitigation: `gitHead(repoDir)` remains only for standalone (no request SHA and no binding file). Ship-path never takes that fallback.
+- **[Risk] SHA-only relabel of pin TAP as `C`.** → Mitigation: fail closed unless `resolveCandidateEngine` returns a clean checkout at `C`. Tests capture probe cwd/path/args. Do not pass by rewriting SHA after hashing `P`.
+- **[Risk] Evidence write path moves off the control FRG directory.** → Mitigation: `args.repoDir` remains the persist root. Only identity and probe cwd change.
+- **[Risk] Tests keep injecting `gitHead` and miss production binding load.** → Mitigation: request-bound bite injects `gitHead` that throws on `repoDir`. Collect must load binding/request and must not consult that seam for identity.
+- **[Risk] Candidate engine worktree missing on the attestor host.** → Mitigation: fail closed with the existing `resolveCandidateEngine` error. Do not probe control HEAD. Do not skip HMAC.
 
 ## Migration Plan
 
@@ -77,4 +110,4 @@ Loop `factory-release-binding.json` already records `candidate_git_sha` from `in
 
 ## Open Questions
 
-None. Identity source (request/binding `C`), probe/provenance same OID, no control ff, no HMAC skip, and ensure-tag fail-closed on `P` are settled by the v1.39.15 incident and the issue non-goals.
+None. Identity resolver (binding required on request-provided ship-path; equality when both parse; no HEAD fallback on ship-path), explicit `resolveCandidateEngine` probe cwd, standalone HEAD retained, no control ff, no HMAC skip, and ensure-tag fail-closed on `P` are settled.

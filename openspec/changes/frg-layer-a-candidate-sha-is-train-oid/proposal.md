@@ -30,15 +30,16 @@ This is a **class** defect: from-run collect binds Layer A / pack provenance to 
 
 ### Modified Capabilities
 
-- `factory-reliability-gate`: From-run hybrid-v2 collect SHALL stamp `pack_provenance.candidate_git_sha` and Layer A probe `candidate_git_sha` from the request-bound packed candidate (`integrated_candidate.git_sha` / loop `factory-release-binding.json`), not control-checkout `git rev-parse HEAD`. Probes SHALL run on that candidate's engine sources.
+- `factory-reliability-gate`: From-run hybrid-v2 collect SHALL stamp `pack_provenance.candidate_git_sha` and Layer A probe `candidate_git_sha` from one resolver: loop `factory-release-binding.json` `candidate_git_sha` and, when in hand, request `integrated_candidate.git_sha`. Both SHALL agree after exact-40-hex normalize. Collect SHALL NOT use control-checkout `git rev-parse HEAD` on that ship-path. Probes SHALL run with cwd from `resolveCandidateEngine` at that OID.
 - `ship-on-disk-frg-tag`: `release ensure-tag` SHALL accept HMAC evidence whose bound candidate SHA equals this ship's packed candidate `C` when control HEAD is a different pin `P`. It SHALL still fail closed when HMAC binds `P` instead of `C`.
 
 ## Impact
 
-- `core/scripts/frg-hybrid-v2-from-run.ts` — `defaultCollectHybridV2FromRun` / `defaultGitHead(repoDir)` is the live mole. Collect must take candidate identity from the request/binding, not control HEAD.
-- `core/scripts/factory-reliability-gate.ts` — `--from-run` collect seam; persist HMAC `latest.json` with the request candidate SHA.
-- `core/scripts/factory-release-prepare.ts` — loop `factory-release-binding.json` already records `candidate_git_sha`; collect SHALL use it (or the request field) as identity.
-- `core/scripts/stages/ship-adapter.ts` — `hmacPackedCandidateGitShaFromUnknown` vs `--packed-candidate` stays fail-closed on mismatch. No HMAC skip. No rewrite of `latest.json` to the merge commit.
-- Tests: `core/test/frg-hybrid-v2-from-run.test.ts` (primary bite: HEAD=`P`, request=`C`, stamps `C`); ensure-tag packed-candidate cases stay fail-closed when HMAC is `P`. Inject I/O.
+- `core/scripts/frg-hybrid-v2-from-run.ts` — `defaultCollectHybridV2FromRun` / `defaultGitHead(repoDir)` is the live mole. Collect must resolve packed candidate `C` from loop binding and (when in hand) request `integrated_candidate.git_sha`, never from control HEAD on ship-path. Probe cwd must be `resolveCandidateEngine` at `C`.
+- `core/scripts/factory-reliability-gate.ts` — `--from-run` collect seam; persist HMAC `latest.json` with packed candidate `C`.
+- `core/scripts/factory-release-prepare.ts` — loop `factory-release-binding.json` already records `candidate_git_sha`; `defaultScoreBoundPackLoop` SHALL pass request `integrated_candidate.git_sha` into collect so both sources can agree.
+- `core/scripts/ship-end-candidate.ts` — reuse `resolveCandidateEngine` for Layer A TAP cwd. Do not reset operator `REPO_DIR`.
+- `core/scripts/stages/ship-adapter.ts` — `hmacPackedCandidateGitShaFromUnknown` vs `--packed-candidate` stays fail-closed on mismatch. No HMAC skip. No rewrite of `latest.json` to the merge commit. No comparison-helper change.
+- Tests: `core/test/frg-hybrid-v2-from-run.test.ts` (primary bite: HEAD=`P`, request/binding=`C`, stamps `C`, `gitHead(repoDir)` not consulted, probe cwd is candidate engine for `C`); missing/malformed/conflict fail closed; standalone HEAD retained; ensure-tag packed-candidate cases stay fail-closed when HMAC is `P`. Inject I/O.
 - Generated `plugin/` mirror after any `core/` edit.
 - Docs: FRG runbook may name request candidate vs control HEAD. No `--skip-frg` restore. No `auto_merge`.
