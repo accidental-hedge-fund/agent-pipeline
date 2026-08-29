@@ -8,9 +8,9 @@
 
 **Absent** SHALL mean the evidence file is missing, unreadable, or unparsable.
 
-**Rejected** SHALL mean the file is present but HMAC fails, `factory_release_binding` is missing, the binding mismatches, the only binding carrier is notes or inferred provenance, or `pack_provenance` fails its own validation. Rejected SHALL carry a stable reason code plus expected unsigned `frg_run_id` `A` and observed `run_id` `B` when those identities are known.
+**Rejected** SHALL mean the file is present but HMAC fails, `factory_release_binding` is missing, the binding mismatches, the only binding carrier is notes or inferred provenance, `pack_provenance` fails its own validation, or a present `pack_provenance.candidate_git_sha` differs from the request integrated candidate. Rejected SHALL carry a stable reason code plus expected unsigned `frg_run_id` `A` and observed `run_id` `B` when those identities are known.
 
-Observation SHALL NOT accept solely because `pack_provenance` is present. Observation SHALL NOT require `evidence.run_id === unsigned.frg_run_id` when the HMAC-covered binding names `A`. A present invalid top-level binding SHALL NOT fall back to notes or `pack_provenance`.
+Observation SHALL NOT accept solely because `pack_provenance` is present. Observation SHALL NOT require `evidence.run_id === unsigned.frg_run_id` when the HMAC-covered binding names `A`. A present invalid top-level binding SHALL NOT fall back to notes or `pack_provenance`. Observation SHALL NOT accept HMAC-pass evidence whose `factory_release_binding` names candidate `C` while present `pack_provenance` names a different candidate `D`.
 
 Unsigned prepare SHALL NOT overlay `factory_release_binding` after sign in order to convert rejected into accepted.
 
@@ -43,6 +43,13 @@ Unsigned prepare SHALL NOT overlay `factory_release_binding` after sign in order
 - **AND** `.agent-pipeline/frg/<X.Y.Z>/latest.json` is missing
 - **THEN** observation SHALL return absent
 - **AND** prepare SHALL return `status: "awaiting_frg_attestation"`
+
+#### Scenario: Binding C with scored provenance D is rejected
+
+- **WHEN** HMAC `latest.json` has `factory_release_binding` matching unsigned `A` and candidate `C`
+- **AND** `pack_provenance.candidate_git_sha` is `D` distinct from `C`
+- **THEN** observation SHALL return rejected
+- **AND** it SHALL NOT return accepted
 
 ### Requirement: Factory-release prepare SHALL complete on accepted bound B
 

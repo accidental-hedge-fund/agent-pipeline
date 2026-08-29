@@ -969,10 +969,15 @@ export function honestLatestJsonBindsRequest(
   }
   if (typeof evidence.run_id !== "string" || evidence.run_id.trim() === "") return false;
   if (!evidence.integrity?.attestation) return false;
+  const expected = request.integrated_candidate.git_sha.toLowerCase();
   const bindingSha = evidence.factory_release_binding?.candidate_git_sha?.toLowerCase() ?? "";
   const provenanceSha = evidence.pack_provenance?.candidate_git_sha?.toLowerCase() ?? "";
+  // A present binding or provenance candidate must each equal the request
+  // candidate. Do not prefer binding C over scored provenance D.
+  if (bindingSha && bindingSha !== expected) return false;
+  if (provenanceSha && provenanceSha !== expected) return false;
   const cand = bindingSha || provenanceSha;
-  return cand === request.integrated_candidate.git_sha.toLowerCase();
+  return cand === expected;
 }
 
 function notesCarryFactoryReleaseBinding(notes: readonly string[] | undefined): boolean {

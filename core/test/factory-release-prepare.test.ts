@@ -366,9 +366,12 @@ async function hybridFromRunEvidence(opts: {
   runId: string;
   includeBinding?: boolean;
   notesBinding?: boolean;
+  /** Scored pack candidate; defaults to the request integrated candidate. */
+  packCandidateGitSha?: string;
 }): Promise<FrgEvidence> {
   const pack = await loadFrgPack();
   const issueNumbers = [1112, 1113];
+  const packCandidate = opts.packCandidateGitSha ?? opts.request.integrated_candidate.git_sha;
   const rendered = renderFrgPackIssues(pack, {
     release_version: opts.request.target_version,
     pack_run_id: opts.unsigned.pack_run_id,
@@ -380,7 +383,7 @@ async function hybridFromRunEvidence(opts: {
     manifest_version: pack.manifest.manifest_version,
     manifest_sha256: pack.manifest_sha256,
     release_version: opts.request.target_version,
-    candidate_git_sha: opts.request.integrated_candidate.git_sha,
+    candidate_git_sha: packCandidate,
     pack_run_id: opts.unsigned.pack_run_id,
     loop_run_id: opts.unsigned.loop_run_id,
     repository: opts.request.repository,
@@ -439,7 +442,7 @@ async function hybridFromRunEvidence(opts: {
     }),
     probes: pack.manifest.pilot_policy.layer_a_probes.map((probe, index) => ({
       id: probe.id,
-      candidate_git_sha: opts.request.integrated_candidate.git_sha,
+      candidate_git_sha: packCandidate,
       test_file: probe.test_file,
       test_name: probe.test_name,
       command_argv_sha256: "1".repeat(64),
@@ -598,6 +601,23 @@ test("honestLatestJsonBindsRequest requires attested hybrid-v2 on this candidate
       pack_provenance: { candidate_git_sha: "d".repeat(40) },
     }),
     false,
+  );
+  assert.equal(
+    honestLatestJsonBindsRequest(request, {
+      ...bound,
+      factory_release_binding: { candidate_git_sha: CANDIDATE },
+      pack_provenance: { candidate_git_sha: "d".repeat(40) },
+    }),
+    false,
+    "binding C must not hide scored provenance D",
+  );
+  assert.equal(
+    honestLatestJsonBindsRequest(request, {
+      ...bound,
+      factory_release_binding: { candidate_git_sha: CANDIDATE },
+      pack_provenance: { candidate_git_sha: CANDIDATE },
+    }),
+    true,
   );
   assert.equal(
     honestLatestJsonBindsRequest(request, { ...bound, integrity: {} }),
@@ -2592,6 +2612,45 @@ test("HMAC from-run latest.json with binding and pack_provenance is accepted (#1
   assert.equal(observed.status, "accepted");
   if (observed.status === "accepted") {
     assert.equal(observed.attestation.frg_run_id, runIdB);
+  }
+});
+
+test("observe rejects signed binding C when scored provenance is D (#1295)", async () => {
+  const request = baseRequest();
+  const unsigned = unsignedPayload();
+  const binding = buildFactoryReleaseUnsignedDigestBinding(request, unsigned);
+  const packedD = "d".repeat(40);
+  assert.equal(binding.candidate_git_sha, CANDIDATE);
+  assert.notEqual(packedD, CANDIDATE);
+  const runIdB = computeAttestorRunId(binding);
+  const evidence = await hybridFromRunEvidence({
+    request,
+    unsigned,
+    runId: runIdB,
+    includeBinding: true,
+    packCandidateGitSha: packedD,
+  });
+  assert.equal(evidence.pass, true);
+  assert.deepEqual(evidence.factory_release_binding, binding);
+  assert.equal(evidence.pack_provenance?.candidate_git_sha, packedD);
+  assert.equal(verifyFrgAttestation(evidence, FRG_UNIT_TEST_ATTESTATION_KEY), true);
+
+  const mem = memoryFs();
+  const latestPath = `/repo/.agent-pipeline/frg/${request.target_version}/latest.json`;
+  await mem.writeFile(latestPath, JSON.stringify(evidence));
+  const observed = await defaultObserveAttestation(
+    request,
+    unsigned,
+    { repoDir: "/repo", workDir: "/tmp/work" },
+    (p) => mem.readFile(p),
+    (p) => mem.fileExists(p),
+    OBSERVE_HMAC,
+  );
+  assert.equal(observed.status, "rejected");
+  if (observed.status === "rejected") {
+    assert.equal(observed.reason, "identity_mismatch");
+    assert.equal(observed.expected_frg_run_id, unsigned.frg_run_id);
+    assert.equal(observed.observed_run_id, runIdB);
   }
 });
 

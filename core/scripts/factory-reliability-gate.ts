@@ -4181,6 +4181,61 @@ export interface FactoryGateResult {
   packClose: FrgPackCloseResult | null;
 }
 
+function factoryReleaseBindingCandidateGitSha(binding: unknown): string | null {
+  if (binding === null || typeof binding !== "object" || Array.isArray(binding)) {
+    return null;
+  }
+  const sha = (binding as { candidate_git_sha?: unknown }).candidate_git_sha;
+  if (typeof sha !== "string") return null;
+  const normalized = sha.toLowerCase();
+  return GIT_SHA_RE.test(normalized) ? normalized : null;
+}
+
+function scoredCandidateIdentities(
+  provenance: FrgPackProvenance | null | undefined,
+): Array<{ field: string; sha: string }> {
+  if (!provenance) return [];
+  const out: Array<{ field: string; sha: string }> = [];
+  if (typeof provenance.candidate_git_sha === "string" && provenance.candidate_git_sha !== "") {
+    out.push({
+      field: "pack_provenance.candidate_git_sha",
+      sha: provenance.candidate_git_sha,
+    });
+  }
+  for (const [index, probe] of (provenance.probes ?? []).entries()) {
+    if (typeof probe.candidate_git_sha === "string" && probe.candidate_git_sha !== "") {
+      out.push({
+        field: `pack_provenance.probes[${index}].candidate_git_sha`,
+        sha: probe.candidate_git_sha,
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * Fail closed before HMAC when the scored pack (provenance + Layer A probes)
+ * names a different candidate than the checkpoint binding.
+ */
+function assertScoredCandidateMatchesBinding(
+  computeInput: ComputeFrgInput,
+  binding: unknown,
+): void {
+  const boundSha = factoryReleaseBindingCandidateGitSha(binding);
+  if (!boundSha) {
+    throw new Error(
+      "pipeline factory-gate: factory_release_binding.candidate_git_sha is missing or invalid; refusing HMAC latest.json",
+    );
+  }
+  for (const scored of scoredCandidateIdentities(computeInput.pack_provenance)) {
+    if (scored.sha.toLowerCase() !== boundSha) {
+      throw new Error(
+        `pipeline factory-gate: scored ${scored.field}=${scored.sha} does not match factory_release_binding.candidate_git_sha=${boundSha}; refusing HMAC latest.json`,
+      );
+    }
+  }
+}
+
 async function attachShipPathFromRunBinding(
   opts: FactoryGateOpts,
   computeInput: ComputeFrgInput,
@@ -4221,6 +4276,7 @@ async function attachShipPathFromRunBinding(
       "pipeline factory-gate: attestor run_id B collided with unsigned frg_run_id A; refusing to collapse identities",
     );
   }
+  assertScoredCandidateMatchesBinding(computeInput, resolution.binding);
   return {
     ...computeInput,
     run_id: attestorRunId,

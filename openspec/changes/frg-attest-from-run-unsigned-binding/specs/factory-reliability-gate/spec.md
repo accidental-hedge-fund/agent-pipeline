@@ -8,6 +8,8 @@ The HMAC-covered binding SHALL exactly match request fingerprint, target version
 
 `pack_provenance` SHALL remain subject to its normal validation. Its presence SHALL NOT substitute for `factory_release_binding`. Notes and inferred provenance SHALL NOT be authoritative binding carriers. A ship-path `--from-run` that cannot load a complete unsigned checkpoint, or that would write HMAC-pass `latest.json` without the binding, SHALL fail closed and SHALL NOT persist that file.
 
+Before HMAC, the attestor SHALL require every collected scored candidate identity (`pack_provenance.candidate_git_sha` and Layer-A `pack_provenance.probes[].candidate_git_sha` when present) to exactly equal `factory_release_binding.candidate_git_sha`. A mismatch SHALL fail closed and SHALL NOT persist evidence.
+
 Standalone unbound `--from-run` (no unsigned checkpoint / no version index / no request SHA) MAY omit the binding and MAY mint a fresh `run_id`. That standalone path SHALL NOT be the ship handoff.
 
 This requirement does not collapse production `A` and `B` into one `run_id`. It does not authorize `--skip-frg`. It does not change Layer A packed-candidate identity (#1298).
@@ -45,6 +47,13 @@ This requirement does not collapse production `A` and `B` into one `run_id`. It 
 - **AND** a writer adds or changes `factory_release_binding` after sign
 - **THEN** HMAC verification SHALL fail
 - **AND** unsigned prepare and ship SHALL NOT be the writers of that overlay
+
+#### Scenario: From-run refuses scored candidate that differs from the bound candidate
+
+- **WHEN** credentialed `--from-run` loads `factory_release_binding.candidate_git_sha` `C`
+- **AND** collected `pack_provenance.candidate_git_sha` is `D` distinct from `C`
+- **THEN** the attestor SHALL fail closed
+- **AND** it SHALL NOT persist HMAC-pass `latest.json`
 
 ### Requirement: Pack provenance presence SHALL NOT reject a bound from-run attestation
 
