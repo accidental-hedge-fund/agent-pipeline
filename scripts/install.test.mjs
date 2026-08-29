@@ -5,6 +5,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  appendFileSync,
+  chmodSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -17,10 +19,12 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, delimiter, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { resolveEnginesNode } from "./ensure-engines-node.mjs";
+import { makeInstalledDispatchFixture } from "./install-dispatch-fixture.mjs";
 
 import {
   MANAGED_MARKER,
@@ -47,10 +51,12 @@ import {
   parseArgs,
   findLiveRunLocks,
   formatLiveRunMessage,
+  endInstallerOperation,
+  appendCleanupFailure,
+  releaseDependencyInstallLock,
   acquireUpdateLock,
   releaseUpdateLock,
   verifyUpdateLockOwnership,
-  installClaudeCommands,
   uninstallClaudeCommands,
   installOpenCodeCommands,
   uninstallOpenCodeCommands,
@@ -1323,6 +1329,16 @@ test("formatLiveRunMessage: warning form names the overridden locks", () => {
   assert.match(msg, /111/);
 });
 
+test("formatLiveRunMessage: uninstall refusal never recommends unsupported --force", () => {
+  const msg = formatLiveRunMessage(
+    [{ path: "/tmp/pipeline-a-1.lock", pid: 111 }],
+    { asWarning: false, action: "uninstalling", allowForce: false },
+  );
+  assert.match(msg, /uninstalling would change files/);
+  assert.match(msg, /uninstall does not override/);
+  assert.doesNotMatch(msg, /--force/);
+});
+
 // ---------------------------------------------------------------------------
 // Wired guard — real CLI subprocess, fabricated "existing install" (no real
 // npm ci / core copy needed to exercise the pre-copy refusal path) and an
@@ -1346,6 +1362,31 @@ function runInstaller(args, env, cwd) {
     timeout: 120_000,
     cwd,
   });
+}
+
+function runChild(args, options = {}) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn(process.execPath, args, {
+      ...options,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.once("error", rejectPromise);
+    child.once("close", (status, signal) => resolvePromise({ status, signal, stdout, stderr }));
+  });
+}
+
+async function waitForPath(path, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!existsSync(path)) {
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${path}`);
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+  }
 }
 
 test("install update: refuses and copies nothing when a lock is held by a live PID", () => {
@@ -1692,6 +1733,51 @@ test("releaseUpdateLock: refuses to release a lock owned by another process (#45
   }
 });
 
+test("endInstallerOperation: release failure is terminal with exact recovery", () => {
+  assert.throws(
+    () =>
+      endInstallerOperation("owner", "/tmp/operation.lock", () => ({
+        ok: false,
+        error: new Error("injected unlink failure"),
+      })),
+    (error) => {
+      assert.match(error.message, /Could not release installer-operation lock/);
+      assert.match(error.message, /injected unlink failure/);
+      assert.match(error.message, /remove that exact lock and retry/);
+      return true;
+    },
+  );
+});
+
+test("releaseDependencyInstallLock: unlink or foreign ownership fails closed", () => {
+  const unlinkFailure = releaseDependencyInstallLock("owner", "/tmp/dependency.lock", {
+    readFile: () => "owner",
+    remove: () => {
+      throw new Error("injected unlink failure");
+    },
+  });
+  assert.equal(unlinkFailure.ok, false);
+  assert.match(unlinkFailure.error.message, /injected unlink failure/);
+
+  const foreign = releaseDependencyInstallLock("owner", "/tmp/dependency.lock", {
+    readFile: () => "foreign",
+    remove: () => assert.fail("foreign lock must not be removed"),
+  });
+  assert.equal(foreign.ok, false);
+  assert.match(foreign.error.message, /owned by another process/);
+});
+
+test("appendCleanupFailure preserves the primary failure and lock recovery", () => {
+  const combined = appendCleanupFailure(
+    new Error("primary install failure"),
+    new Error("operation lock recovery"),
+  );
+  assert.match(combined.message, /Installer failed and cleanup also failed/);
+  assert.match(combined.message, /operation lock recovery/);
+  assert.ok(combined instanceof AggregateError);
+  assert.match(combined.errors[0].message, /primary install failure/);
+});
+
 // ---------------------------------------------------------------------------
 // Grok skill path (#731) — --host grok symlink materialization + help text
 // ---------------------------------------------------------------------------
@@ -1983,44 +2069,10 @@ test("uninstall --host grok: refuses to delete documented copy layout directory 
 //        Codex personal-skill shadow detection parity
 // ==========================================================================
 
-test("installClaudeCommands: config-dir skill path embedded, not ~/.claude hardcoded (#635)", () => {
-  const tmp = makeTmp();
-  try {
-    installClaudeCommands(tmp, false);
-    const commandsDir = join(tmp, "commands");
-    assert.ok(existsSync(commandsDir), "commands dir must be created");
-    const files = readdirSync(commandsDir).filter((f) => f.startsWith("pipeline:") && f.endsWith(".md"));
-    assert.ok(files.length > 0, "at least one pipeline:*.md command file");
-    const expectedSkill = join(tmp, "skills", "pipeline");
-    for (const f of files) {
-      const body = readFileSync(join(commandsDir, f), "utf8");
-      assert.ok(
-        body.includes(expectedSkill),
-        `${f} must embed config-dir skill path ${expectedSkill}`,
-      );
-      assert.ok(
-        !body.includes("~/.claude/skills/pipeline"),
-        `${f} must not hardcode ~/.claude/skills/pipeline when config dir is custom`,
-      );
-    }
-  } finally {
-    cleanup(tmp);
-  }
-});
-
-test("installClaudeCommands: dry-run writes nothing under commands/ (#635)", () => {
-  const tmp = makeTmp();
-  try {
-    installClaudeCommands(tmp, true);
-    assert.equal(
-      existsSync(join(tmp, "commands")),
-      false,
-      "dry-run must not create commands directory",
-    );
-  } finally {
-    cleanup(tmp);
-  }
-});
+function pipelineColonCommandFiles(commandsDir) {
+  if (!existsSync(commandsDir)) return [];
+  return readdirSync(commandsDir).filter((f) => f.startsWith("pipeline:") && f.endsWith(".md"));
+}
 
 test("install stages ensure-engines-node.mjs next to pipeline.mjs (#1236)", async () => {
   const claudeTmp = makeTmp();
@@ -2049,7 +2101,7 @@ test("install stages ensure-engines-node.mjs next to pipeline.mjs (#1236)", asyn
   }
 });
 
-test("install --host claude under CLAUDE_CONFIG_DIR: command Invoke paths use config-dir skill (#635)", () => {
+test("install --host claude: writes no pipeline:*.md command pack (#1048)", () => {
   const claudeTmp = makeTmp();
   const lockTmp = makeTmp();
   try {
@@ -2060,18 +2112,846 @@ test("install --host claude under CLAUDE_CONFIG_DIR: command Invoke paths use co
       TEMP: lockTmp,
     });
     assert.equal(result.status, 0, `install failed: ${result.stderr}\n${result.stdout}`);
-    const commandsDir = join(claudeTmp, "commands");
-    const expectedSkill = join(claudeTmp, "skills", "pipeline");
-    assert.ok(existsSync(expectedSkill), "skill tree must be installed");
-    const files = readdirSync(commandsDir).filter((f) => f.startsWith("pipeline:") && f.endsWith(".md"));
-    assert.ok(files.length > 0, "install must write pipeline:*.md commands");
-    for (const f of files) {
-      const body = readFileSync(join(commandsDir, f), "utf8");
-      assert.ok(body.includes(expectedSkill), `${f} must reference ${expectedSkill}`);
-      assert.ok(!body.includes("~/.claude/skills/pipeline"), `${f} must not hardcode default home path`);
-    }
+    const skillDir = join(claudeTmp, "skills", "pipeline");
+    assert.ok(existsSync(skillDir), "skill tree must be installed");
+    assert.ok(
+      existsSync(join(skillDir, "scripts", "pipeline.mjs")),
+      "Claude install must write a launcher",
+    );
+    assert.ok(
+      existsSync(join(skillDir, "core", "scripts", "pipeline.ts")),
+      "Claude install must provision core from the repository source, not plugin/",
+    );
+    assert.ok(
+      existsSync(join(skillDir, "SKILL.md")),
+      "Claude install must write the host SKILL overlay",
+    );
+    assert.deepEqual(
+      pipelineColonCommandFiles(join(claudeTmp, "commands")),
+      [],
+      "install --host claude must not write pipeline:*.md",
+    );
   } finally {
     cleanup(claudeTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("install --host claude --dry-run: writes no Claude skill tree (#1048)", () => {
+  const claudeTmp = makeTmp();
+  const lockTmp = makeTmp();
+  try {
+    const result = runInstaller(["install", "--host", "claude", "--dry-run"], {
+      CLAUDE_CONFIG_DIR: claudeTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(
+      existsSync(join(claudeTmp, "skills", "pipeline")),
+      false,
+      "dry-run must not create the Claude skill install tree",
+    );
+    assert.deepEqual(pipelineColonCommandFiles(join(claudeTmp, "commands")), []);
+  } finally {
+    cleanup(claudeTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("install --host claude: installed launcher dispatches doctor and status without slash files (#1048)", () => {
+  const claudeTmp = makeTmp();
+  const lockTmp = makeTmp();
+  let doctorResult;
+  try {
+    const { repoDir, domain, fakeBin, fakeNode } = makeInstalledDispatchFixture(claudeTmp);
+    doctorResult = join(tmpdir(), `pipeline-${domain}-doctor-result.json`);
+    const install = runInstaller(["install", "--host", "claude"], {
+      CLAUDE_CONFIG_DIR: claudeTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    });
+    assert.equal(install.status, 0, `install failed: ${install.stderr}\n${install.stdout}`);
+    const shim = join(claudeTmp, "skills", "pipeline", "scripts", "pipeline.mjs");
+    assert.ok(existsSync(shim), "launcher must exist");
+    assert.deepEqual(pipelineColonCommandFiles(join(claudeTmp, "commands")), []);
+    assert.equal(
+      existsSync(join(claudeTmp, "skills", "pipeline", "plugin")),
+      false,
+    );
+
+    const env = {
+      ...process.env,
+      CLAUDE_CONFIG_DIR: claudeTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+      PATH: `${fakeBin}${delimiter}${process.env.PATH ?? ""}`,
+      AGENT_PIPELINE_NODE: fakeNode,
+    };
+    const ghProbe = spawnSync("gh", ["repo", "view", "example/repo"], {
+      encoding: "utf8",
+      env,
+      cwd: repoDir,
+    });
+    assert.equal(ghProbe.status, 0, `fake gh probe failed: ${ghProbe.stderr}`);
+    assert.equal(ghProbe.stdout.trim(), "example/repo");
+    const doctor = spawnSync(
+      process.execPath,
+      [shim, "doctor", "--json"],
+      {
+        encoding: "utf8",
+        timeout: 60_000,
+        env,
+        cwd: repoDir,
+      },
+    );
+    assert.equal(doctor.error, undefined, `doctor spawn failed: ${String(doctor.error)}`);
+    assert.equal(doctor.signal, null, `doctor was killed by ${String(doctor.signal)}`);
+    assert.notEqual(
+      doctor.stdout.trim(),
+      "",
+      `doctor returned no JSON payload (exit ${String(doctor.status)}): ${doctor.stderr}`,
+    );
+    const doctorPayload = JSON.parse(doctor.stdout);
+    assert.equal(doctorPayload.schema_version, "1");
+    assert.ok(["ok", "warnings"].includes(doctorPayload.status));
+    const doctorChecks = Object.fromEntries(
+      doctorPayload.checks.map((check) => [check.name, check]),
+    );
+    assert.equal(doctorChecks["cli:gh"]?.status, "pass");
+    assert.equal(doctorChecks["github-auth"]?.status, "pass");
+    assert.equal(
+      doctorChecks["repo-access"]?.status,
+      "pass",
+      JSON.stringify(doctorChecks["repo-access"]),
+    );
+    assert.equal(doctor.status, 0, `doctor handler failed: ${doctor.stdout}\n${doctor.stderr}`);
+    assert.doesNotMatch(`${doctor.stdout}${doctor.stderr}`, /pipeline:doctor\.md/);
+
+    const status = spawnSync(
+      process.execPath,
+      [shim, "status", "1", "--json"],
+      {
+        encoding: "utf8",
+        timeout: 60_000,
+        env,
+        cwd: repoDir,
+      },
+    );
+    assert.equal(status.error, undefined, `status spawn failed: ${String(status.error)}`);
+    assert.equal(status.signal, null, `status was killed by ${String(status.signal)}`);
+    assert.equal(status.status, 0, `status handler failed: ${status.stdout}\n${status.stderr}`);
+    const statusPayload = JSON.parse(status.stdout);
+    assert.equal(statusPayload.schema_version, "1");
+    assert.equal(statusPayload.status, "ok");
+    assert.deepEqual(statusPayload.issue, { number: 1, title: "Installed status fixture" });
+    assert.equal(statusPayload.stage, "ready");
+    assert.equal(statusPayload.config.repo, "example/repo");
+    assert.match(statusPayload.next_action, /planning and implementation/);
+    assert.doesNotMatch(`${status.stdout}${status.stderr}`, /pipeline:status\.md/);
+  } finally {
+    if (doctorResult) rmSync(doctorResult, { force: true });
+    cleanup(claudeTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("install --host claude: missing npm warns but leaves a retryable complete install (#1048)", () => {
+  const claudeTmp = makeTmp();
+  const lockTmp = makeTmp();
+  const emptyBin = join(claudeTmp, "empty-bin");
+  mkdirSync(emptyBin, { recursive: true });
+  try {
+    const install = runInstaller(["install", "--host", "claude"], {
+      CLAUDE_CONFIG_DIR: claudeTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+      PATH: emptyBin,
+    });
+    assert.equal(install.status, 0, `install failed: ${install.stderr}\n${install.stdout}`);
+    assert.match(
+      install.stderr,
+      /npm not found — dependencies will install on the first non-version launcher invocation/,
+    );
+    const skillDir = join(claudeTmp, "skills", "pipeline");
+    assert.ok(existsSync(join(skillDir, MANAGED_MARKER)), "the managed tree must be installed");
+    assert.ok(existsSync(join(skillDir, "scripts", "pipeline.mjs")), "the launcher must be installed");
+    assert.equal(existsSync(join(skillDir, "core", "node_modules")), false);
+    assert.deepEqual(
+      readdirSync(join(claudeTmp, "skills")).filter((name) => name.startsWith(".pipeline-staging-")),
+      [],
+    );
+  } finally {
+    cleanup(claudeTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("install --host claude: failed dependency prewarm remains retryable through the installed launcher (#1048)", () => {
+  const claudeTmp = makeTmp();
+  const lockTmp = makeTmp();
+  const fakeBin = join(claudeTmp, "fake-bin");
+  const npmAttempts = join(claudeTmp, "npm-attempts");
+  const npmArgv = join(claudeTmp, "npm-argv.jsonl");
+  const dispatchedArgs = join(claudeTmp, "dispatched-args.json");
+  mkdirSync(fakeBin, { recursive: true });
+  const enginesNode = resolveEnginesNode();
+  assert.ok(enginesNode, "test requires a Node binary that satisfies the package engines floor");
+  const fakeNode = join(fakeBin, "node");
+  symlinkSync(enginesNode.path, fakeNode);
+  const fakeNpm = join(fakeBin, "npm");
+  writeFileSync(
+    fakeNpm,
+    `#!${process.execPath}\n` +
+      `import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";\n` +
+      `import { join } from "node:path";\n` +
+      `const state = process.env.PIPELINE_TEST_NPM_ATTEMPTS;\n` +
+      `appendFileSync(process.env.PIPELINE_TEST_NPM_ARGV, JSON.stringify(process.argv.slice(2)) + "\\n");\n` +
+      `const attempt = existsSync(state) ? Number(readFileSync(state, "utf8")) + 1 : 1;\n` +
+      `writeFileSync(state, String(attempt));\n` +
+      `const modules = join(process.cwd(), "node_modules");\n` +
+      `rmSync(modules, { recursive: true, force: true });\n` +
+      `mkdirSync(modules, { recursive: true });\n` +
+      `if (attempt < 3) {\n` +
+      `  writeFileSync(join(modules, ".partial"), String(attempt));\n` +
+      `  process.exit(42);\n` +
+      `}\n` +
+      `writeFileSync(join(modules, ".ready"), "ready");\n`,
+  );
+  chmodSync(fakeNpm, 0o755);
+
+  const env = {
+    CLAUDE_CONFIG_DIR: claudeTmp,
+    TMPDIR: lockTmp,
+    TMP: lockTmp,
+    TEMP: lockTmp,
+    AGENT_PIPELINE_NODE: fakeNode,
+    PIPELINE_TEST_NPM_ATTEMPTS: npmAttempts,
+    PIPELINE_TEST_NPM_ARGV: npmArgv,
+    PATH: `${fakeBin}${delimiter}${dirname(process.execPath)}${delimiter}${process.env.PATH ?? ""}`,
+  };
+
+  try {
+    const install = runInstaller(["install", "--host", "claude"], env);
+    assert.equal(install.status, 0, `install failed: ${install.stderr}\n${install.stdout}`);
+    const skillDir = join(claudeTmp, "skills", "pipeline");
+    const coreDir = join(skillDir, "core");
+    const nodeModules = join(coreDir, "node_modules");
+    const incompleteDepsMarker = join(coreDir, ".pipeline-dependencies-incomplete");
+    const shim = join(skillDir, "scripts", "pipeline.mjs");
+    assert.match(install.stderr, new RegExp(`npm ci failed in ${coreDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+    assert.equal(readFileSync(npmAttempts, "utf8"), "1");
+    assert.equal(
+      existsSync(nodeModules),
+      false,
+      "a failed install-time prewarm must not leave a directory that suppresses first-run recovery",
+    );
+    assert.ok(
+      existsSync(incompleteDepsMarker),
+      "a failed install-time prewarm must leave an explicit incomplete-dependencies marker",
+    );
+    mkdirSync(nodeModules, { recursive: true });
+    writeFileSync(join(nodeModules, ".partial"), "simulated cleanup failure");
+    assert.ok(existsSync(shim), "the staged launcher must remain installed");
+    assert.deepEqual(
+      readdirSync(join(claudeTmp, "skills")).filter((name) => name.startsWith(".pipeline-staging-")),
+      [],
+      "tree publication must not leave a staging tree",
+    );
+
+    writeFileSync(
+      join(coreDir, "scripts", "pipeline.ts"),
+      `import { existsSync, writeFileSync } from "node:fs";\n` +
+        `import { join } from "node:path";\n` +
+        `if (!existsSync(join(import.meta.dirname, "..", "node_modules", ".ready"))) process.exit(73);\n` +
+        `writeFileSync(process.env.PIPELINE_TEST_DISPATCHED_ARGS, JSON.stringify(process.argv.slice(2)));\n`,
+    );
+
+    const launchEnv = { ...process.env, ...env, PIPELINE_TEST_DISPATCHED_ARGS: dispatchedArgs };
+    const firstRun = spawnSync(process.execPath, [shim, "status", "1048", "--json"], {
+      encoding: "utf8",
+      timeout: 30_000,
+      env: launchEnv,
+    });
+    assert.equal(firstRun.error, undefined, `first-run recovery spawn failed: ${String(firstRun.error)}`);
+    assert.equal(firstRun.signal, null, `first-run recovery was killed by ${String(firstRun.signal)}`);
+    assert.equal(firstRun.status, 1, `expected the launcher's fail-closed exit 1; stderr:\n${firstRun.stderr}`);
+    assert.match(firstRun.stderr, /dependency install failed/);
+    assert.match(firstRun.stderr, new RegExp(`npm ci.*${coreDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+    assert.equal(
+      existsSync(nodeModules),
+      false,
+      "a failed first-run recovery must remove partial dependencies so the next invocation retries",
+    );
+
+    const retry = spawnSync(process.execPath, [shim, "status", "1048", "--json"], {
+      encoding: "utf8",
+      timeout: 30_000,
+      env: launchEnv,
+    });
+    assert.equal(retry.status, 0, `retry failed: ${retry.stderr}\n${retry.stdout}`);
+    assert.equal(readFileSync(npmAttempts, "utf8"), "3");
+    assert.deepEqual(
+      readFileSync(npmArgv, "utf8").trim().split("\n").map((line) => JSON.parse(line)),
+      Array.from({ length: 3 }, () => ["ci", "--omit=dev", "--no-audit", "--no-fund"]),
+      "install prewarm and both launcher retries must preserve the exact npm ci contract",
+    );
+    assert.equal(existsSync(incompleteDepsMarker), false, "successful recovery must clear the incomplete marker");
+    assert.deepEqual(JSON.parse(readFileSync(dispatchedArgs, "utf8")), [
+      "status",
+      "1048",
+      "--json",
+      "--profile",
+      "claude",
+    ]);
+  } finally {
+    cleanup(claudeTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("installed launcher serializes concurrent first-run dependency recovery (#1048)", async () => {
+  const claudeTmp = makeTmp();
+  const lockTmp = makeTmp();
+  const fakeBin = join(claudeTmp, "fake-bin");
+  const npmCalls = join(claudeTmp, "npm-calls.jsonl");
+  const dispatchDir = join(claudeTmp, "dispatches");
+  mkdirSync(fakeBin, { recursive: true });
+  const enginesNode = resolveEnginesNode();
+  assert.ok(enginesNode, "test requires a Node binary that satisfies the package engines floor");
+  const fakeNode = join(fakeBin, "node");
+  symlinkSync(enginesNode.path, fakeNode);
+  const fakeNpm = join(fakeBin, "npm");
+  writeFileSync(
+    fakeNpm,
+    `#!${process.execPath}\n` +
+      `import { appendFileSync, mkdirSync, rmSync, writeFileSync } from "node:fs";\n` +
+      `import { join } from "node:path";\n` +
+      `appendFileSync(process.env.PIPELINE_TEST_NPM_CALLS, JSON.stringify(process.argv.slice(2)) + "\\n");\n` +
+      `const modules = join(process.cwd(), "node_modules");\n` +
+      `rmSync(modules, { recursive: true, force: true });\n` +
+      `mkdirSync(modules, { recursive: true });\n` +
+      `if (process.env.PIPELINE_TEST_NPM_FAIL === "1") {\n` +
+      `  writeFileSync(join(modules, ".partial"), "partial");\n` +
+      `  process.exit(42);\n` +
+      `}\n` +
+      `Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1000);\n` +
+      `writeFileSync(join(modules, ".ready"), "ready");\n`,
+  );
+  chmodSync(fakeNpm, 0o755);
+
+  const baseEnv = {
+    CLAUDE_CONFIG_DIR: claudeTmp,
+    TMPDIR: lockTmp,
+    TMP: lockTmp,
+    TEMP: lockTmp,
+    AGENT_PIPELINE_NODE: fakeNode,
+    PIPELINE_TEST_NPM_CALLS: npmCalls,
+    PATH: `${fakeBin}${delimiter}${dirname(process.execPath)}${delimiter}${process.env.PATH ?? ""}`,
+  };
+
+  try {
+    const install = runInstaller(["install", "--host", "claude"], {
+      ...baseEnv,
+      PIPELINE_TEST_NPM_FAIL: "1",
+    });
+    assert.equal(install.status, 0, `install failed: ${install.stderr}\n${install.stdout}`);
+    const skillDir = join(claudeTmp, "skills", "pipeline");
+    const coreDir = join(skillDir, "core");
+    const nodeModules = join(coreDir, "node_modules");
+    const incompleteDepsMarker = join(coreDir, ".pipeline-dependencies-incomplete");
+    const dependencyLock = join(coreDir, ".pipeline-dependencies-installing.lock");
+    const shim = join(skillDir, "scripts", "pipeline.mjs");
+
+    rmSync(npmCalls, { force: true });
+    mkdirSync(nodeModules, { recursive: true });
+    writeFileSync(join(nodeModules, ".partial"), "simulated cleanup failure");
+    mkdirSync(dispatchDir, { recursive: true });
+    writeFileSync(
+      join(coreDir, "scripts", "pipeline.ts"),
+      `import { mkdirSync, writeFileSync } from "node:fs";\n` +
+        `import { join } from "node:path";\n` +
+        `mkdirSync(process.env.PIPELINE_TEST_DISPATCH_DIR, { recursive: true });\n` +
+        `writeFileSync(join(process.env.PIPELINE_TEST_DISPATCH_DIR, process.pid + ".json"), JSON.stringify(process.argv.slice(2)));\n`,
+    );
+
+    const launchEnv = {
+      ...process.env,
+      ...baseEnv,
+      PIPELINE_TEST_NPM_FAIL: "0",
+      PIPELINE_TEST_DISPATCH_DIR: dispatchDir,
+    };
+    const launch = (issue) => runChild([shim, "status", issue, "--json"], { env: launchEnv });
+
+    const [first, second] = await Promise.all([launch("1048"), launch("1049")]);
+    for (const result of [first, second]) {
+      assert.equal(result.signal, null, `launcher was killed by ${String(result.signal)}`);
+      assert.equal(result.status, 0, `launcher failed: ${result.stderr}\n${result.stdout}`);
+    }
+    assert.deepEqual(
+      readFileSync(npmCalls, "utf8").trim().split("\n").map((line) => JSON.parse(line)),
+      [["ci", "--omit=dev", "--no-audit", "--no-fund"]],
+      "only one concurrent launcher may run dependency recovery",
+    );
+    const dispatched = readdirSync(dispatchDir).map((name) =>
+      JSON.parse(readFileSync(join(dispatchDir, name), "utf8")),
+    );
+    assert.equal(dispatched.length, 2, "both launchers must dispatch after dependency readiness");
+    assert.deepEqual(
+      dispatched.map((args) => args[1]).sort(),
+      ["1048", "1049"],
+    );
+    assert.equal(existsSync(incompleteDepsMarker), false, "successful recovery must clear the marker");
+    assert.equal(existsSync(dependencyLock), false, "the dependency owner lock must be released");
+  } finally {
+    cleanup(claudeTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("fresh install publishes dependency ownership before launcher-visible prewarm (#1048)", async () => {
+  const claudeTmp = makeTmp();
+  const lockTmp = makeTmp();
+  const fakeBin = join(claudeTmp, "fake-bin");
+  const npmCalls = join(claudeTmp, "npm-calls.jsonl");
+  const prewarmStarted = join(claudeTmp, "prewarm-started");
+  const dispatchedArgs = join(claudeTmp, "dispatched-args.json");
+  mkdirSync(fakeBin, { recursive: true });
+  const enginesNode = resolveEnginesNode();
+  assert.ok(enginesNode, "test requires a Node binary that satisfies the package engines floor");
+  const fakeNode = join(fakeBin, "node");
+  symlinkSync(enginesNode.path, fakeNode);
+  const fakeNpm = join(fakeBin, "npm");
+  writeFileSync(
+    fakeNpm,
+    `#!${process.execPath}\n` +
+      `import { appendFileSync, mkdirSync, rmSync, writeFileSync } from "node:fs";\n` +
+      `import { join } from "node:path";\n` +
+      `appendFileSync(process.env.PIPELINE_TEST_NPM_CALLS, JSON.stringify(process.argv.slice(2)) + "\\n");\n` +
+      `const modules = join(process.cwd(), "node_modules");\n` +
+      `rmSync(modules, { recursive: true, force: true });\n` +
+      `mkdirSync(modules, { recursive: true });\n` +
+      `writeFileSync(join(modules, ".partial"), "partial");\n` +
+      `writeFileSync(process.env.PIPELINE_TEST_PREWARM_STARTED, "started");\n` +
+      `Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1200);\n` +
+      `rmSync(join(modules, ".partial"), { force: true });\n` +
+      `writeFileSync(join(modules, ".ready"), "ready");\n` +
+      `writeFileSync(join(process.cwd(), "scripts", "pipeline.ts"), ` +
+        "`import { existsSync, writeFileSync } from \\\"node:fs\\\";\\n` +\n" +
+        "`import { join } from \\\"node:path\\\";\\n` +\n" +
+        "`if (!existsSync(join(import.meta.dirname, \\\"..\\\", \\\"node_modules\\\", \\\".ready\\\"))) process.exit(73);\\n` +\n" +
+        "`writeFileSync(process.env.PIPELINE_TEST_DISPATCHED_ARGS, JSON.stringify(process.argv.slice(2)));\\n`);\n",
+  );
+  chmodSync(fakeNpm, 0o755);
+
+  const env = {
+    ...process.env,
+    CLAUDE_CONFIG_DIR: claudeTmp,
+    TMPDIR: lockTmp,
+    TMP: lockTmp,
+    TEMP: lockTmp,
+    AGENT_PIPELINE_NODE: fakeNode,
+    PIPELINE_TEST_NPM_CALLS: npmCalls,
+    PIPELINE_TEST_PREWARM_STARTED: prewarmStarted,
+    PIPELINE_TEST_DISPATCHED_ARGS: dispatchedArgs,
+    PATH: `${fakeBin}${delimiter}${dirname(process.execPath)}${delimiter}${process.env.PATH ?? ""}`,
+  };
+
+  try {
+    const installPromise = runChild([INSTALL_SCRIPT, "install", "--host", "claude"], { env });
+    await waitForPath(prewarmStarted);
+    const skillDir = join(claudeTmp, "skills", "pipeline");
+    const coreDir = join(skillDir, "core");
+    const marker = join(coreDir, ".pipeline-dependencies-incomplete");
+    const lock = join(coreDir, ".pipeline-dependencies-installing.lock");
+    const shim = join(skillDir, "scripts", "pipeline.mjs");
+    assert.ok(existsSync(marker), "the incomplete marker must be visible while prewarm runs");
+    assert.ok(existsSync(lock), "the installer owner lock must be visible with the staged core");
+
+    const launchPromise = runChild([shim, "status", "1048", "--json"], { env });
+    const [install, launch] = await Promise.all([installPromise, launchPromise]);
+    assert.equal(install.status, 0, `install failed: ${install.stderr}\n${install.stdout}`);
+    assert.equal(launch.status, 0, `launcher failed: ${launch.stderr}\n${launch.stdout}`);
+    assert.deepEqual(
+      readFileSync(npmCalls, "utf8").trim().split("\n").map((line) => JSON.parse(line)),
+      [["ci", "--omit=dev", "--no-audit", "--no-fund"]],
+      "the fresh installer and first launcher must share one prewarm attempt",
+    );
+    assert.deepEqual(JSON.parse(readFileSync(dispatchedArgs, "utf8")), [
+      "status",
+      "1048",
+      "--json",
+      "--profile",
+      "claude",
+    ]);
+    assert.equal(existsSync(marker), false, "successful prewarm must clear the marker");
+    assert.equal(existsSync(lock), false, "successful prewarm must release installer ownership");
+  } finally {
+    cleanup(claudeTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("concurrent fresh installers permit only one publisher and dependency prewarm owner (#1048)", async () => {
+  const claudeTmp = makeTmp();
+  const lockTmp = makeTmp();
+  const fakeBin = join(claudeTmp, "fake-bin");
+  const npmCalls = join(claudeTmp, "npm-calls.jsonl");
+  const prewarmStarted = join(claudeTmp, "prewarm-started");
+  const releasePrewarm = join(claudeTmp, "release-prewarm");
+  mkdirSync(fakeBin, { recursive: true });
+  const fakeNpm = join(fakeBin, "npm");
+  writeFileSync(
+    fakeNpm,
+    `#!${process.execPath}\n` +
+      `import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";\n` +
+      `import { join } from "node:path";\n` +
+      `appendFileSync(process.env.PIPELINE_TEST_NPM_CALLS, JSON.stringify(process.argv.slice(2)) + "\\n");\n` +
+      `writeFileSync(process.env.PIPELINE_TEST_PREWARM_STARTED, "started");\n` +
+      `while (!existsSync(process.env.PIPELINE_TEST_RELEASE_PREWARM)) {\n` +
+      `  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);\n` +
+      `}\n` +
+      `mkdirSync(join(process.cwd(), "node_modules"), { recursive: true });\n` +
+      `writeFileSync(join(process.cwd(), "node_modules", ".ready"), "ready");\n`,
+  );
+  chmodSync(fakeNpm, 0o755);
+
+  const env = {
+    ...process.env,
+    CLAUDE_CONFIG_DIR: claudeTmp,
+    TMPDIR: lockTmp,
+    TMP: lockTmp,
+    TEMP: lockTmp,
+    PIPELINE_TEST_NPM_CALLS: npmCalls,
+    PIPELINE_TEST_PREWARM_STARTED: prewarmStarted,
+    PIPELINE_TEST_RELEASE_PREWARM: releasePrewarm,
+    PATH: `${fakeBin}${delimiter}${dirname(process.execPath)}${delimiter}${process.env.PATH ?? ""}`,
+  };
+  let firstPromise;
+  let first;
+
+  try {
+    firstPromise = runChild([INSTALL_SCRIPT, "install", "--host", "claude"], { env });
+    await waitForPath(prewarmStarted);
+
+    const second = await runChild([INSTALL_SCRIPT, "install", "--host", "claude"], { env });
+    assert.equal(second.status, 1, `competing installer must fail closed: ${second.stderr}\n${second.stdout}`);
+    assert.match(second.stderr, /Another installer .* is publishing or prewarming dependencies/);
+    assert.equal(
+      existsSync(join(claudeTmp, "skills", "pipeline", "core", ".pipeline-dependencies-installing.lock")),
+      true,
+      "the competing installer must not replace the first installer's published core",
+    );
+
+    const uninstall = await runChild([INSTALL_SCRIPT, "uninstall", "--host", "claude"], { env });
+    assert.equal(
+      uninstall.status,
+      1,
+      `uninstall racing dependency prewarm must fail closed: ${uninstall.stderr}\n${uninstall.stdout}`,
+    );
+    assert.match(uninstall.stderr, /Another installer .* is publishing or prewarming dependencies/);
+    assert.equal(
+      existsSync(join(claudeTmp, "skills", "pipeline", "core", ".pipeline-dependencies-installing.lock")),
+      true,
+      "uninstall must not remove the core while installer-owned npm ci is live",
+    );
+
+    writeFileSync(releasePrewarm, "release");
+    first = await firstPromise;
+    assert.equal(first.status, 0, `owning installer failed: ${first.stderr}\n${first.stdout}`);
+    assert.deepEqual(
+      readFileSync(npmCalls, "utf8").trim().split("\n").map((line) => JSON.parse(line)),
+      [["ci", "--omit=dev", "--no-audit", "--no-fund"]],
+      "only the installer-operation owner may start dependency prewarm",
+    );
+    const coreDir = join(claudeTmp, "skills", "pipeline", "core");
+    assert.ok(existsSync(join(coreDir, "node_modules", ".ready")));
+    assert.equal(existsSync(join(coreDir, ".pipeline-dependencies-incomplete")), false);
+    assert.equal(existsSync(join(coreDir, ".pipeline-dependencies-installing.lock")), false);
+    assert.equal(
+      existsSync(join(lockTmp, ".pipeline-installer-operation.lock")),
+      false,
+      "the successful owner must release installer serialization",
+    );
+  } finally {
+    if (!existsSync(releasePrewarm)) writeFileSync(releasePrewarm, "release");
+    if (firstPromise && !first) await firstPromise;
+    cleanup(claudeTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("abandoned installer-operation ownership blocks publication and npm until explicit recovery (#1048)", () => {
+  const claudeTmp = makeTmp();
+  const lockTmp = makeTmp();
+  const fakeBin = join(claudeTmp, "fake-bin");
+  const npmCalls = join(claudeTmp, "npm-calls.jsonl");
+  const operationLock = join(lockTmp, ".pipeline-installer-operation.lock");
+  mkdirSync(fakeBin, { recursive: true });
+  const fakeNpm = join(fakeBin, "npm");
+  writeFileSync(
+    fakeNpm,
+    `#!${process.execPath}\n` +
+      `import { appendFileSync } from "node:fs";\n` +
+      `appendFileSync(process.env.PIPELINE_TEST_NPM_CALLS, "called\\n");\n`,
+  );
+  chmodSync(fakeNpm, 0o755);
+
+  try {
+    const dead = spawnSync(process.execPath, ["-e", "process.exit(0)"]);
+    assert.equal(dead.status, 0);
+    writeFileSync(operationLock, `${dead.pid} installer-dead-owner`);
+
+    const install = runInstaller(["install", "--host", "claude"], {
+      CLAUDE_CONFIG_DIR: claudeTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+      PIPELINE_TEST_NPM_CALLS: npmCalls,
+      PATH: `${fakeBin}${delimiter}${dirname(process.execPath)}${delimiter}${process.env.PATH ?? ""}`,
+    });
+    assert.equal(install.status, 1, `abandoned operation owner must fail closed: ${install.stderr}`);
+    assert.match(install.stderr, /Abandoned installer-operation lock/);
+    assert.match(install.stderr, /Confirm no npm ci child from the prior installer remains/);
+    assert.match(
+      install.stderr,
+      new RegExp(operationLock.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+    );
+    assert.equal(existsSync(operationLock), true, "the abandoned lock must remain for explicit recovery");
+    assert.equal(existsSync(npmCalls), false, "an abandoned parent must not authorize npm ci");
+    assert.equal(
+      existsSync(join(claudeTmp, "skills", "pipeline")),
+      false,
+      "the installer must fail before publishing a tree",
+    );
+  } finally {
+    cleanup(claudeTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("installed launcher fails closed on an abandoned dependency owner (#1048)", () => {
+  const claudeTmp = makeTmp();
+  const lockTmp = makeTmp();
+  const emptyBin = join(claudeTmp, "empty-bin");
+  const fakeBin = join(claudeTmp, "fake-bin");
+  const npmCalls = join(claudeTmp, "npm-calls.jsonl");
+  const dispatchedArgs = join(claudeTmp, "dispatched-args.json");
+  mkdirSync(emptyBin, { recursive: true });
+  mkdirSync(fakeBin, { recursive: true });
+
+  try {
+    const install = runInstaller(["install", "--host", "claude"], {
+      CLAUDE_CONFIG_DIR: claudeTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+      PATH: emptyBin,
+    });
+    assert.equal(install.status, 0, `install failed: ${install.stderr}\n${install.stdout}`);
+
+    const enginesNode = resolveEnginesNode();
+    assert.ok(enginesNode, "test requires a Node binary that satisfies the package engines floor");
+    const fakeNode = join(fakeBin, "node");
+    symlinkSync(enginesNode.path, fakeNode);
+    const fakeNpm = join(fakeBin, "npm");
+    writeFileSync(
+      fakeNpm,
+      `#!${process.execPath}\n` +
+        `import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";\n` +
+        `import { join } from "node:path";\n` +
+        `appendFileSync(process.env.PIPELINE_TEST_NPM_CALLS, JSON.stringify(process.argv.slice(2)) + "\\n");\n` +
+        `mkdirSync(join(process.cwd(), "node_modules"), { recursive: true });\n` +
+        `writeFileSync(join(process.cwd(), "node_modules", ".ready"), "ready");\n`,
+    );
+    chmodSync(fakeNpm, 0o755);
+
+    const skillDir = join(claudeTmp, "skills", "pipeline");
+    const coreDir = join(skillDir, "core");
+    const nodeModules = join(coreDir, "node_modules");
+    const marker = join(coreDir, ".pipeline-dependencies-incomplete");
+    const lock = join(coreDir, ".pipeline-dependencies-installing.lock");
+    const shim = join(skillDir, "scripts", "pipeline.mjs");
+    mkdirSync(nodeModules, { recursive: true });
+    writeFileSync(join(nodeModules, ".partial"), "partial");
+    writeFileSync(marker, "");
+    const dead = spawnSync(process.execPath, ["-e", "process.exit(0)"]);
+    assert.equal(dead.status, 0);
+    writeFileSync(lock, `${dead.pid} dead-owner`);
+    writeFileSync(
+      join(coreDir, "scripts", "pipeline.ts"),
+      `import { existsSync, writeFileSync } from "node:fs";\n` +
+        `import { join } from "node:path";\n` +
+        `if (!existsSync(join(import.meta.dirname, "..", "node_modules", ".ready"))) process.exit(73);\n` +
+        `writeFileSync(process.env.PIPELINE_TEST_DISPATCHED_ARGS, JSON.stringify(process.argv.slice(2)));\n`,
+    );
+
+    const launchEnv = {
+      ...process.env,
+      CLAUDE_CONFIG_DIR: claudeTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+      AGENT_PIPELINE_NODE: fakeNode,
+      PIPELINE_TEST_NPM_CALLS: npmCalls,
+      PIPELINE_TEST_DISPATCHED_ARGS: dispatchedArgs,
+      PATH: `${fakeBin}${delimiter}${dirname(process.execPath)}${delimiter}${process.env.PATH ?? ""}`,
+    };
+    const launch = spawnSync(process.execPath, [shim, "status", "1048", "--json"], {
+      encoding: "utf8",
+      timeout: 30_000,
+      env: launchEnv,
+    });
+    assert.equal(launch.status, 1, `abandoned-owner path must fail closed: ${launch.stderr}\n${launch.stdout}`);
+    assert.match(launch.stderr, /abandoned dependency install lock/);
+    assert.match(launch.stderr, /refusing to start a second npm ci/);
+    assert.match(launch.stderr, /Confirm no prior npm ci child is still running/);
+    assert.equal(existsSync(npmCalls), false, "an abandoned parent must not authorize another npm ci");
+    assert.equal(existsSync(marker), true, "the incomplete marker must remain for explicit recovery");
+    assert.equal(existsSync(lock), true, "the abandoned lock must remain until its npm child is ruled out");
+    assert.equal(existsSync(dispatchedArgs), false, "the original command must not dispatch");
+
+    const uninstall = runInstaller(["uninstall", "--host", "claude"], launchEnv);
+    assert.equal(
+      uninstall.status,
+      1,
+      `uninstall must preserve an abandoned dependency owner: ${uninstall.stderr}\n${uninstall.stdout}`,
+    );
+    assert.match(uninstall.stderr, /Dependency provisioning may still be running/);
+    assert.match(uninstall.stderr, new RegExp(lock.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.equal(existsSync(lock), true, "uninstall must preserve the exact dependency lock");
+    assert.equal(existsSync(coreDir), true, "uninstall must not remove the possibly active npm cwd");
+  } finally {
+    cleanup(claudeTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("installed launcher preserves ownership when a successful npm ci cannot clear its marker (#1048)", () => {
+  const claudeTmp = makeTmp();
+  const lockTmp = makeTmp();
+  const emptyBin = join(claudeTmp, "empty-bin");
+  const fakeBin = join(claudeTmp, "fake-bin");
+  const npmCalls = join(claudeTmp, "npm-calls.jsonl");
+  const dispatchedArgs = join(claudeTmp, "dispatched-args.json");
+  mkdirSync(emptyBin, { recursive: true });
+  mkdirSync(fakeBin, { recursive: true });
+
+  try {
+    const install = runInstaller(["install", "--host", "claude"], {
+      CLAUDE_CONFIG_DIR: claudeTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+      PATH: emptyBin,
+    });
+    assert.equal(install.status, 0, `install failed: ${install.stderr}\n${install.stdout}`);
+
+    const enginesNode = resolveEnginesNode();
+    assert.ok(enginesNode, "test requires a Node binary that satisfies the package engines floor");
+    const fakeNode = join(fakeBin, "node");
+    symlinkSync(enginesNode.path, fakeNode);
+    const fakeNpm = join(fakeBin, "npm");
+    writeFileSync(
+      fakeNpm,
+      `#!${process.execPath}\n` +
+        `import { appendFileSync, mkdirSync, rmSync, writeFileSync } from "node:fs";\n` +
+        `import { join } from "node:path";\n` +
+        `appendFileSync(process.env.PIPELINE_TEST_NPM_CALLS, JSON.stringify(process.argv.slice(2)) + "\\n");\n` +
+        `const marker = join(process.cwd(), ".pipeline-dependencies-incomplete");\n` +
+        `rmSync(marker, { recursive: true, force: true });\n` +
+        `mkdirSync(marker);\n` +
+        `mkdirSync(join(process.cwd(), "node_modules"), { recursive: true });\n` +
+        `writeFileSync(join(process.cwd(), "node_modules", ".ready"), "ready");\n`,
+    );
+    chmodSync(fakeNpm, 0o755);
+
+    const skillDir = join(claudeTmp, "skills", "pipeline");
+    const coreDir = join(skillDir, "core");
+    const marker = join(coreDir, ".pipeline-dependencies-incomplete");
+    const lock = join(coreDir, ".pipeline-dependencies-installing.lock");
+    const shim = join(skillDir, "scripts", "pipeline.mjs");
+    writeFileSync(
+      join(coreDir, "scripts", "pipeline.ts"),
+      `import { writeFileSync } from "node:fs";\n` +
+        `writeFileSync(process.env.PIPELINE_TEST_DISPATCHED_ARGS, JSON.stringify(process.argv.slice(2)));\n`,
+    );
+
+    const launchEnv = {
+      ...process.env,
+      CLAUDE_CONFIG_DIR: claudeTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+      AGENT_PIPELINE_NODE: fakeNode,
+      PIPELINE_TEST_NPM_CALLS: npmCalls,
+      PIPELINE_TEST_DISPATCHED_ARGS: dispatchedArgs,
+      PATH: `${fakeBin}${delimiter}${dirname(process.execPath)}${delimiter}${process.env.PATH ?? ""}`,
+    };
+    const first = spawnSync(process.execPath, [shim, "status", "1048", "--json"], {
+      encoding: "utf8",
+      timeout: 30_000,
+      env: launchEnv,
+    });
+    assert.equal(first.status, 1, `marker-cleanup failure must fail closed: ${first.stderr}\n${first.stdout}`);
+    assert.match(first.stderr, /npm ci completed, but the incomplete dependency marker/);
+    assert.match(first.stderr, /Refusing to dispatch and preserving the owner lock/);
+    assert.match(first.stderr, new RegExp(marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.match(first.stderr, new RegExp(lock.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.equal(lstatSync(marker).isDirectory(), true, "the uncertain marker state must be preserved");
+    assert.equal(existsSync(lock), true, "the owner lock must remain for explicit recovery");
+    assert.equal(existsSync(dispatchedArgs), false, "the original command must not dispatch");
+    assert.deepEqual(JSON.parse(readFileSync(npmCalls, "utf8")), ["ci", "--omit=dev", "--no-audit", "--no-fund"]);
+
+    const second = spawnSync(process.execPath, [shim, "status", "1048", "--json"], {
+      encoding: "utf8",
+      timeout: 30_000,
+      env: launchEnv,
+    });
+    assert.equal(second.status, 1, `the preserved lock must fail closed: ${second.stderr}\n${second.stdout}`);
+    assert.match(second.stderr, /abandoned dependency install lock/);
+    assert.deepEqual(
+      readFileSync(npmCalls, "utf8").trim().split("\n").map((line) => JSON.parse(line)),
+      [["ci", "--omit=dev", "--no-audit", "--no-fund"]],
+      "explicit recovery must be required before a second npm ci",
+    );
+    assert.equal(existsSync(dispatchedArgs), false, "the retry must not dispatch");
+  } finally {
+    cleanup(claudeTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("install --host codex: writes no OPERATION_SURFACE yaml command agents (#1048)", () => {
+  const codexTmp = makeTmp();
+  const lockTmp = makeTmp();
+  try {
+    const result = runInstaller(["install", "--host", "codex"], {
+      CODEX_HOME: codexTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    });
+    assert.equal(result.status, 0, `install failed: ${result.stderr}\n${result.stdout}`);
+    const agentsDir = join(codexTmp, "skills", "pipeline", "agents");
+    const yamlAgents = existsSync(agentsDir)
+      ? readdirSync(agentsDir).filter((f) => f.startsWith("pipeline-") && f.endsWith(".yaml"))
+      : [];
+    assert.deepEqual(
+      yamlAgents,
+      [],
+      "install --host codex must not write pipeline-<name>.yaml agents from OPERATION_SURFACE",
+    );
+    assert.ok(
+      existsSync(join(codexTmp, "skills", "pipeline", "scripts", "pipeline.mjs")),
+      "Codex install must still provision the CLI launcher",
+    );
+  } finally {
+    cleanup(codexTmp);
     cleanup(lockTmp);
   }
 });
@@ -2097,7 +2977,7 @@ test("uninstallClaudeCommands: removes pipeline:*.md only; preserves siblings; d
   }
 });
 
-test("install then uninstall --host claude: skill + pipeline commands gone; sibling command remains (#635)", () => {
+test("install then uninstall --host claude: skill gone; leftover pipeline:*.md removed; sibling remains (#635 #1048)", () => {
   const claudeTmp = makeTmp();
   const lockTmp = makeTmp();
   try {
@@ -2111,10 +2991,9 @@ test("install then uninstall --host claude: skill + pipeline commands gone; sibl
     const skillDir = join(claudeTmp, "skills", "pipeline");
     const commandsDir = join(claudeTmp, "commands");
     assert.ok(existsSync(skillDir));
-    const pipelineCmdsBefore = readdirSync(commandsDir).filter(
-      (f) => f.startsWith("pipeline:") && f.endsWith(".md"),
-    );
-    assert.ok(pipelineCmdsBefore.length > 0);
+    assert.deepEqual(pipelineColonCommandFiles(commandsDir), [], "install must not write slash files");
+    mkdirSync(commandsDir, { recursive: true });
+    writeFileSync(join(commandsDir, "pipeline:status.md"), "leftover from prior install");
     writeFileSync(join(commandsDir, "other-tool.md"), "keep me");
 
     const uninstall = runInstaller(["uninstall", "--host", "claude"], {
@@ -2125,10 +3004,7 @@ test("install then uninstall --host claude: skill + pipeline commands gone; sibl
     });
     assert.equal(uninstall.status, 0, `uninstall failed: ${uninstall.stderr}`);
     assert.equal(existsSync(skillDir), false, "skill dir must be removed");
-    const remaining = existsSync(commandsDir)
-      ? readdirSync(commandsDir).filter((f) => f.startsWith("pipeline:") && f.endsWith(".md"))
-      : [];
-    assert.deepEqual(remaining, [], "no pipeline:*.md commands may remain");
+    assert.deepEqual(pipelineColonCommandFiles(commandsDir), [], "no pipeline:*.md commands may remain");
     assert.ok(existsSync(join(commandsDir, "other-tool.md")), "unrelated command preserved");
   } finally {
     cleanup(claudeTmp);
@@ -2136,7 +3012,46 @@ test("install then uninstall --host claude: skill + pipeline commands gone; sibl
   }
 });
 
-test("uninstall --host claude --dry-run: leaves skill and pipeline commands in place (#635)", () => {
+test("uninstall --host claude preserves an unmarked personal skill while cleaning leftover commands (#1048)", () => {
+  const claudeTmp = makeTmp();
+  const lockTmp = makeTmp();
+  try {
+    const skillDir = join(claudeTmp, "skills", "pipeline");
+    const commandsDir = join(claudeTmp, "commands");
+    mkdirSync(skillDir, { recursive: true });
+    mkdirSync(commandsDir, { recursive: true });
+    writeFileSync(join(skillDir, "SKILL.md"), "personal claude content");
+    writeFileSync(join(commandsDir, "pipeline:status.md"), "leftover from prior install");
+    writeFileSync(join(commandsDir, "other-tool.md"), "keep me");
+
+    const uninstall = runInstaller(["uninstall", "--host", "claude"], {
+      CLAUDE_CONFIG_DIR: claudeTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    });
+
+    assert.equal(uninstall.status, 0, `uninstall failed: ${uninstall.stderr}\n${uninstall.stdout}`);
+    assert.equal(
+      readFileSync(join(skillDir, "SKILL.md"), "utf8"),
+      "personal claude content",
+      "an unmarked personal skill is user-owned and must not be deleted",
+    );
+    assert.equal(
+      existsSync(join(commandsDir, "pipeline:status.md")),
+      false,
+      "leftover installer-owned commands must still be cleaned",
+    );
+    assert.ok(existsSync(join(commandsDir, "other-tool.md")), "unrelated command preserved");
+    assert.match(`${uninstall.stdout}${uninstall.stderr}`, /preserv/i);
+    assert.match(`${uninstall.stdout}${uninstall.stderr}`, new RegExp(MANAGED_MARKER));
+  } finally {
+    cleanup(claudeTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("uninstall --host claude --dry-run: leaves skill and leftover pipeline commands in place (#635 #1048)", () => {
   const claudeTmp = makeTmp();
   const lockTmp = makeTmp();
   try {
@@ -2149,7 +3064,8 @@ test("uninstall --host claude --dry-run: leaves skill and pipeline commands in p
     assert.equal(install.status, 0, install.stderr);
     const skillDir = join(claudeTmp, "skills", "pipeline");
     const commandsDir = join(claudeTmp, "commands");
-    const cmds = readdirSync(commandsDir).filter((f) => f.startsWith("pipeline:") && f.endsWith(".md"));
+    mkdirSync(commandsDir, { recursive: true });
+    writeFileSync(join(commandsDir, "pipeline:status.md"), "leftover");
 
     const dry = runInstaller(["uninstall", "--host", "claude", "--dry-run"], {
       CLAUDE_CONFIG_DIR: claudeTmp,
@@ -2161,9 +3077,10 @@ test("uninstall --host claude --dry-run: leaves skill and pipeline commands in p
     const out = `${dry.stdout}${dry.stderr}`;
     assert.match(out, /dry-run/i);
     assert.ok(existsSync(skillDir), "dry-run must not remove skill");
-    for (const f of cmds) {
-      assert.ok(existsSync(join(commandsDir, f)), `dry-run must leave ${f}`);
-    }
+    assert.ok(
+      existsSync(join(commandsDir, "pipeline:status.md")),
+      "dry-run must leave leftover pipeline:status.md",
+    );
   } finally {
     cleanup(claudeTmp);
     cleanup(lockTmp);
@@ -2745,8 +3662,9 @@ test("OpenCode bridge argv safety: spaces and metacharacters not shell-expanded 
 test("HOSTS are built from co-located outer-host manifests (#784)", () => {
   assert.ok(HOSTS.claude.manifest, "claude must carry manifest");
   assert.equal(HOSTS.claude.manifest.manifestVersion, 1);
-  assert.equal(HOSTS.claude.commandsKind, "claude-slash");
-  assert.equal(HOSTS.codex.commandsKind, "codex-prompt");
+  assert.equal(HOSTS.claude.commandsKind, "none");
+  assert.equal(HOSTS.codex.commandsKind, "none");
+  assert.equal(HOSTS.claude.commandsGlob, "pipeline:*.md");
   assert.equal(HOSTS.opencode.commandsKind, "opencode-native");
   assert.equal(HOSTS.omp.commandsKind, "omp-native");
   assert.equal(HOSTS.grok.installMode, "symlink-claude");
@@ -3170,4 +4088,3 @@ test("install --host omp non-TTY relocates unmanaged personal skill (#1235)", ()
     cleanup(home);
   }
 });
-

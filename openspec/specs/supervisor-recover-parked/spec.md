@@ -227,7 +227,7 @@ Every override recorded by `recover-parked` SHALL include the finding key from t
 
 ### Requirement: Unit coverage SHALL prove eligibility, budget, deterministic-first, and fix-vs-override with injected deps
 
-The change SHALL include unit tests that inject I/O via deps and perform no real network, git, or subprocess calls. Coverage SHALL include at least: stale/below-high reflow; structured CRITICAL refuse despite nit prose; same fingerprint after new commit refuses second pass; deterministic scratch/stale-SHA clear without override and without spending senior budget; extra fix allowed for HIGH/CRITICAL while override of those keys is refused. After any `core/` implementation edits, the generated `plugin/` mirror SHALL be regenerated in the same change when required by mirror rules.
+The change SHALL include unit tests that inject I/O via deps and perform no real network, git, or subprocess calls. Coverage SHALL include at least: stale/below-high reflow; structured CRITICAL refuse despite nit prose; same fingerprint after new commit refuses second pass; deterministic scratch/stale-SHA clear without override and without spending senior budget; extra fix allowed for HIGH/CRITICAL while override of those keys is refused. After any `core/` implementation edits, `node scripts/build.mjs` SHALL run and changed SKILL/catalog outputs SHALL be committed when required by the freshness gate; no copied core mirror is required.
 
 #### Scenario: CRITICAL-with-nit-prose fixture refuses override
 

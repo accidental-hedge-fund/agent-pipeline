@@ -1,17 +1,28 @@
 // Collect hybrid-v2 pack provenance for factory-gate --from-run (#1118).
 // Injectable I/O. Production default uses gh + TAP on the candidate checkout.
+// Packed-candidate identity is request/binding, not control-checkout HEAD (#1298).
 
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
+import * as fsp from "node:fs/promises";
+import * as path from "node:path";
 import {
   collectFrgPackObservations,
   defaultFrgPackRoot,
   loadFrgPack,
   type CollectedFrgObservations,
+  type FrgGitHubItemObservation,
   type LoadedFrgPack,
   type VerifiedFrgPackRun,
 } from "./frg-pack-observations.ts";
 import type { LoopContract, LoopLedger } from "./loop/types.ts";
+import { defaultLoopStoreDeps, runDir } from "./loop/store.ts";
+import {
+  defaultResolveCandidateEngineDeps,
+  resolveCandidateEngine,
+  type CandidateEngineResult,
+} from "./ship-end-candidate.ts";
+import { parseExactGitSha } from "./ship-end-identity.ts";
 
 function sha256(text: string): string {
   return createHash("sha256").update(text).digest("hex");
@@ -65,16 +76,89 @@ export interface HybridV2FromRunArgs {
   fromRun: string;
   contract: LoopContract;
   ledger: LoopLedger;
+  /**
+   * In-process factory-release request `integrated_candidate.git_sha`.
+   * Absent on CLI `--from-run` (collect then uses loop binding or standalone HEAD).
+   */
+  requestCandidateGitSha?: string;
 }
+
+export type LoopBindingPresence =
+  | { present: false }
+  | { present: true; candidateGitSha: unknown };
+
+export type PackedCandidateIdentity =
+  | { ok: true; mode: "ship-path"; sha: string }
+  | { ok: true; mode: "standalone" }
+  | { ok: false; error: string };
+
+export type LayerAProbeRunInput = {
+  /** Evidence write root (factory control checkout). */
+  repoDir: string;
+  candidateGitSha: string;
+  /** Resolved candidate-engine checkout for TAP cwd. */
+  candidateEngineDir: string;
+};
 
 export interface HybridV2FromRunDeps {
   loadPack?: () => Promise<LoadedFrgPack>;
   gitHead?: (repoDir: string) => Promise<string>;
   ghJson?: (args: string[]) => Promise<unknown>;
+  readLoopBinding?: (loopRunId: string) => Promise<LoopBindingPresence>;
+  resolveCandidateEngine?: (opts: {
+    repoDir: string;
+    candidateSha: string;
+  }) => CandidateEngineResult | Promise<CandidateEngineResult>;
   runProbe?: (
     probe: { id: string; test_file: string; test_name: string },
-    input: { repoDir: string; candidateGitSha: string },
+    input: LayerAProbeRunInput,
   ) => Promise<VerifiedFrgPackRun["probes"][number]>;
+}
+
+/**
+ * Packed-candidate identity for hybrid-v2 from-run collect (#1298).
+ * Ship-path (request SHA in hand, or binding file present) never uses control HEAD.
+ */
+export function resolvePackedCandidateIdentity(input: {
+  request?: { sha: unknown } | null;
+  binding: LoopBindingPresence;
+}): PackedCandidateIdentity {
+  if (!input.binding.present) {
+    if (input.request != null) {
+      return {
+        ok: false,
+        error:
+          "pipeline factory-gate: hybrid-v2 collect missing ship-path factory-release-binding.json; will not stamp control-checkout HEAD",
+      };
+    }
+    return { ok: true, mode: "standalone" };
+  }
+  const bindingSha = parseExactGitSha(input.binding.candidateGitSha);
+  if (!bindingSha) {
+    return {
+      ok: false,
+      error:
+        "pipeline factory-gate: hybrid-v2 collect factory-release-binding.json candidate_git_sha is not an exact 40-hex git OID",
+    };
+  }
+  if (input.request != null) {
+    const requestSha = parseExactGitSha(input.request.sha);
+    if (!requestSha) {
+      return {
+        ok: false,
+        error:
+          "pipeline factory-gate: hybrid-v2 collect request integrated_candidate.git_sha is not an exact 40-hex git OID",
+      };
+    }
+    if (requestSha !== bindingSha) {
+      return {
+        ok: false,
+        error:
+          "pipeline factory-gate: hybrid-v2 collect request and binding packed-candidate SHAs conflict",
+      };
+    }
+  }
+  return { ok: true, mode: "ship-path", sha: bindingSha };
 }
 
 function itemNumbers(contract: LoopContract): number[] {
@@ -118,6 +202,21 @@ export function overlayLedgerStateFromGitHub(
   return ledgerState === "ready" ? "blocked" : ledgerState;
 }
 
+/** Thread collect's live issue/PR/check rows into overlay observations (#1297). */
+export function githubItemObservationsFromLiveIssues(
+  issues: VerifiedFrgPackRun["issues"],
+): Record<string, FrgGitHubItemObservation> {
+  const out: Record<string, FrgGitHubItemObservation> = {};
+  for (const issue of issues) {
+    out[String(issue.issue_number)] = {
+      labels: issue.labels,
+      pr_number: issue.pr.number,
+      checks: issue.pr.checks,
+    };
+  }
+  return out;
+}
+
 /** Prefer the titled pack PR; closed is valid after factory-gate auto-close. */
 export function selectPackPr<T extends { title?: string; state?: string }>(
   issueNumber: number,
@@ -134,7 +233,7 @@ export function selectPackPr<T extends { title?: string; state?: string }>(
 
 export async function defaultRunLayerAProbe(
   probe: { id: string; test_file: string; test_name: string },
-  input: { repoDir: string; candidateGitSha: string },
+  input: LayerAProbeRunInput,
 ): Promise<VerifiedFrgPackRun["probes"][number]> {
   const pattern = `^${probe.test_name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`;
   const args = [
@@ -146,7 +245,7 @@ export async function defaultRunLayerAProbe(
     probe.test_file,
   ];
   const startedAt = new Date().toISOString();
-  const result = await runCommand(process.execPath, args, { cwd: input.repoDir });
+  const result = await runCommand(process.execPath, args, { cwd: input.candidateEngineDir });
   const finishedAt = new Date().toISOString();
   const tapEscaped = probe.test_name.replaceAll("#", "\\#");
   const names = [...new Set([probe.test_name, tapEscaped])];
@@ -197,6 +296,46 @@ async function defaultGitHead(repoDir: string): Promise<string> {
   return result.stdout.trim();
 }
 
+/** Same path as factory-release-prepare `factoryReleaseLoopBindingPath` (avoid import cycle). */
+export function hybridV2LoopBindingPath(loopRunId: string): string {
+  return path.join(runDir(defaultLoopStoreDeps(), loopRunId), "factory-release-binding.json");
+}
+
+async function defaultReadLoopBinding(loopRunId: string): Promise<LoopBindingPresence> {
+  const bindingPath = hybridV2LoopBindingPath(loopRunId);
+  try {
+    const text = await fsp.readFile(bindingPath, "utf8");
+    let raw: unknown;
+    try {
+      raw = JSON.parse(text);
+    } catch {
+      return { present: true, candidateGitSha: undefined };
+    }
+    const sha =
+      raw !== null && typeof raw === "object" && !Array.isArray(raw)
+        ? (raw as Record<string, unknown>).candidate_git_sha
+        : undefined;
+    return { present: true, candidateGitSha: sha };
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return { present: false };
+    return { present: true, candidateGitSha: undefined };
+  }
+}
+
+function defaultResolveCandidateEngineForCollect(opts: {
+  repoDir: string;
+  candidateSha: string;
+}): CandidateEngineResult {
+  return resolveCandidateEngine(
+    {
+      repoDir: opts.repoDir,
+      candidateSha: opts.candidateSha,
+      candidateEngineRootEnv: process.env.PIPELINE_CANDIDATE_ENGINE_ROOT,
+    },
+    defaultResolveCandidateEngineDeps(),
+  );
+}
+
 /**
  * Build hybrid-v2 observations from a terminal factory-gate pack loop.
  * Used by factory-gate --from-run when the caller did not pass provenance.
@@ -206,7 +345,6 @@ export async function defaultCollectHybridV2FromRun(
   deps: HybridV2FromRunDeps = {},
 ): Promise<CollectedFrgObservations> {
   const pack = await (deps.loadPack ?? (() => loadFrgPack(defaultFrgPackRoot())))();
-  const candidateGitSha = await (deps.gitHead ?? defaultGitHead)(args.repoDir);
   const ghJson = deps.ghJson ?? defaultGhJson;
   const runProbe = deps.runProbe ?? defaultRunLayerAProbe;
   const numbers = itemNumbers(args.contract);
@@ -216,6 +354,38 @@ export async function defaultCollectHybridV2FromRun(
         `does not match pack template count ${pack.manifest.templates.length}`,
     );
   }
+
+  const binding = await (deps.readLoopBinding ?? defaultReadLoopBinding)(args.fromRun);
+  const identity = resolvePackedCandidateIdentity({
+    request:
+      args.requestCandidateGitSha !== undefined
+        ? { sha: args.requestCandidateGitSha }
+        : null,
+    binding,
+  });
+  if (!identity.ok) throw new Error(identity.error);
+
+  let candidateGitSha: string;
+  if (identity.mode === "ship-path") {
+    candidateGitSha = identity.sha;
+  } else {
+    const rawHead = await (deps.gitHead ?? defaultGitHead)(args.repoDir);
+    const parsedHead = parseExactGitSha(rawHead);
+    if (!parsedHead) {
+      throw new Error(
+        "pipeline factory-gate: hybrid-v2 collect repoDir HEAD is not an exact 40-hex git OID",
+      );
+    }
+    candidateGitSha = parsedHead;
+  }
+
+  const engineResult = await (deps.resolveCandidateEngine ?? defaultResolveCandidateEngineForCollect)(
+    { repoDir: args.repoDir, candidateSha: candidateGitSha },
+  );
+  if (!engineResult.ok) {
+    throw new Error(`pipeline factory-gate: hybrid-v2 collect ${engineResult.error}`);
+  }
+  const candidateEngineDir = engineResult.engine.engineRoot;
 
   let repository = "";
   try {
@@ -327,7 +497,13 @@ export async function defaultCollectHybridV2FromRun(
 
   const probes: VerifiedFrgPackRun["probes"] = [];
   for (const probe of pack.manifest.pilot_policy.layer_a_probes) {
-    probes.push(await runProbe(probe, { repoDir: args.repoDir, candidateGitSha }));
+    probes.push(
+      await runProbe(probe, {
+        repoDir: args.repoDir,
+        candidateGitSha,
+        candidateEngineDir,
+      }),
+    );
   }
 
   const events: Array<{ seq?: number; kind?: string; item_id?: string; data?: { item_id?: string } }> = [];
@@ -396,5 +572,9 @@ export async function defaultCollectHybridV2FromRun(
     probes,
   };
 
-  return collectFrgPackObservations(pack, bundle);
+  const collected = collectFrgPackObservations(pack, bundle);
+  return {
+    ...collected,
+    github_item_observations: githubItemObservationsFromLiveIssues(liveIssues),
+  };
 }

@@ -16,7 +16,7 @@ exactly one issue at a time.
 
 #### Scenario: A loop run needs no external skill installed
 
-- **WHEN** `pipeline:loop` is invoked on a host with no goal-loop skill present at any
+- **WHEN** `pipeline loop` is invoked on a host with no goal-loop skill present at any
   install root
 - **THEN** the run SHALL compile a contract, initialize, lock, and report a run id
 - **AND** no install-remediation failure SHALL be produced on any path

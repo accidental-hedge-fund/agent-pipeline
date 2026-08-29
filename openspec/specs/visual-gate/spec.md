@@ -85,7 +85,7 @@ handler, and the `pre-merge` stage's success transition SHALL target `visual-gat
 
 ### Requirement: The pipeline:visual-gate label SHALL be created by init
 
-The `pipeline --init` / `pipeline:init` path SHALL create the `pipeline:visual-gate` label alongside
+The legacy `pipeline --init` path and canonical `pipeline init` command SHALL create the `pipeline:visual-gate` label alongside
 the other stage labels, and the stage SHALL be represented on an issue by that label through the
 normal single-stage-label lifecycle.
 
@@ -535,4 +535,3 @@ When `visual_gate.enabled` is true and the issue's managed worktree is not on di
 - **THEN** visual-gate SHALL `setBlocked` with that `blockerKind`
 - **AND** the reason SHALL include the typed kind and rematerialize failure text
 - **AND** the reason SHALL NOT contain `failed (undefined)`
-

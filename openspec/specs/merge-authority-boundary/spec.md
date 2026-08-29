@@ -57,7 +57,7 @@ CLAUDE.md golden rule 4 and the AGENTS.md twin SHALL state that the advance loop
 
 ### Requirement: Operator skill copy SHALL name merge and merge-queue --apply as explicit, non-advance surfaces
 
-Host skill documentation that lists merge-related commands SHALL present `pipeline merge` (or `/pipeline:merge`), `pipeline merge-queue` with `--apply`, `pipeline train --merge`, and `pipeline ship --milestone` as explicit authority surfaces that are never called by the advance loop. Merge-queue documentation SHALL keep dry-run as the default. If a host skill mentions external supervisors, it SHALL state that supervisors invoke those Pipeline-owned surfaces and that the repository does not ship a factory control plane. Skills SHALL map phrase `Ship milestone vX.Y.Z` to `pipeline ship --milestone vX.Y.Z`.
+Host skill documentation that lists merge-related commands SHALL present `pipeline merge`, `pipeline merge-queue` with `--apply`, `pipeline train --merge`, and `pipeline ship --milestone` as explicit authority surfaces that are never called by the advance loop. Merge-queue documentation SHALL keep dry-run as the default. If a host skill mentions external supervisors, it SHALL state that supervisors invoke those Pipeline-owned surfaces and that the repository does not ship a factory control plane. Skills SHALL map phrase `Ship milestone vX.Y.Z` to `pipeline ship --milestone vX.Y.Z`.
 
 #### Scenario: Skill lists explicit operator merge surfaces
 

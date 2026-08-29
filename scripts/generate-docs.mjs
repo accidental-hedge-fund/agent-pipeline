@@ -91,7 +91,14 @@ async function main() {
 
   const skillClaude = readText("hosts/claude/SKILL.md");
   const skillCodex = readText("hosts/codex/SKILL.md");
-  if (skillClaude === null || skillCodex === null) {
+  const skillOmp = readText("hosts/omp/SKILL.md");
+  const skillOpencode = readText("hosts/opencode/SKILL.md");
+  if (
+    skillClaude === null ||
+    skillCodex === null ||
+    skillOmp === null ||
+    skillOpencode === null
+  ) {
     console.error("generate-docs: host SKILL.md files are required");
     process.exit(1);
   }
@@ -111,6 +118,8 @@ async function main() {
 
   const claudeSrc = ensureMarkers(skillClaude, "hosts/claude");
   const codexSrc = ensureMarkers(skillCodex, "hosts/codex");
+  const ompSrc = ensureMarkers(skillOmp, "hosts/omp");
+  const opencodeSrc = ensureMarkers(skillOpencode, "hosts/opencode");
 
   const tagStdout = listGitTagReleases();
   const changelogReleases = parseGitTagListLines(tagStdout);
@@ -124,6 +133,8 @@ async function main() {
   const artifacts = buildGeneratedArtifacts({
     skillClaude: claudeSrc,
     skillCodex: codexSrc,
+    skillOmp: ompSrc,
+    skillOpencode: opencodeSrc,
     configSchema: schema,
     configDefaults: defaults,
     changelogReleases,

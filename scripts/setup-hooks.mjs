@@ -4,8 +4,8 @@
 //
 //   npm run setup-hooks
 //
-// The hook auto-regenerates and stages the plugin/ mirror whenever a commit
-// touches core/ or hosts/claude/, so contributors never have to remember to run
+// The hook refreshes and stages generator-owned SKILL/catalog outputs whenever a
+// commit touches core/ or hosts/claude/, so contributors never have to remember to run
 // `node scripts/build.mjs` by hand. It is convenience only — `node scripts/build.mjs
 // --check` in `npm run ci` / CI remains the authoritative, clone-independent gate.
 
@@ -26,5 +26,5 @@ if (result.status !== 0) {
 }
 
 console.log(
-  "✓ pre-commit hook active — plugin/ mirror auto-regenerates on core/ or hosts/claude/ commits",
+  "✓ pre-commit hook active — SKILL/catalog outputs refresh on core/ or hosts/claude/ commits",
 );

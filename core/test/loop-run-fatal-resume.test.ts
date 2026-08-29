@@ -676,6 +676,368 @@ test("resume of recovery_exhausted does not clear that stop or dispatch", async 
   await releaseLock(deps, RUN_ID, token);
 });
 
+function observeWithIdentities(byId: Record<string, LoopExternalIdentity>): ReconcileObserveDeps {
+  const byPr = new Map<number, LoopExternalIdentity>();
+  for (const row of Object.values(byId)) {
+    if (row.pr_number != null) byPr.set(row.pr_number, row);
+  }
+  const rowFor = (issueNumber: number) => byId[String(issueNumber)] ?? identity({ issue_number: issueNumber });
+  return {
+    async getIssueStateAndLabels(issueNumber) {
+      const row = rowFor(issueNumber);
+      const labels: string[] = [];
+      if (row.ready_label_present) labels.push(READY_LABEL);
+      else if (row.pipeline_stage) labels.push(`pipeline:${row.pipeline_stage}`);
+      if (row.blocked_label_present) labels.push("blocked");
+      return { state: row.issue_open ? "open" : "closed", labels };
+    },
+    async findPrForIssue(issueNumber) {
+      return rowFor(issueNumber).pr_number;
+    },
+    async getPrDetail(prNumber) {
+      const row = byPr.get(prNumber);
+      if (!row) return null;
+      return {
+        state: row.pr_state ?? "open",
+        head_ref: row.head_branch,
+        head_sha: row.head_sha,
+        merge_commit_sha: row.merge_commit_sha,
+      };
+    },
+    async getPrChecks() {
+      return [{ bucket: "pass" }];
+    },
+    async getLocalHead() {
+      return null;
+    },
+    async baseBranchContainsSha() {
+      return null;
+    },
+    async getLabelEvents() {
+      return [];
+    },
+    async getExternalDependencyIssueState() {
+      return null;
+    },
+    now: () => new Date("2026-08-27T16:00:00.000Z"),
+  };
+}
+
+const READY_1290 = identity({
+  issue_number: 1290,
+  ready_label_present: true,
+  pipeline_stage: "ready-to-deploy",
+  pr_number: 1292,
+  pr_state: "open",
+  checks_conclusion: "success",
+});
+
+test("resume of recovery_exhausted repair-forwards GitHub-ready blocked item (#1297)", async () => {
+  const contract = testContract({
+    items: [
+      { id: "1289", depends_on: [], external_depends_on: [] },
+      { id: "1290", depends_on: [], external_depends_on: [] },
+    ],
+  });
+  const stop: LoopStopRecord = {
+    reason: "recovery_exhausted",
+    time: ORIGINAL_STOP_TIME,
+    item_id: "1290",
+    theme: "implementation-ci",
+    outstanding_ready: [],
+  };
+  const ledger = testLedger(
+    {
+      "1289": itemEntry("1289", "ready"),
+      "1290": { ...itemEntry("1290", "blocked"), blocked_theme: "implementation-ci" },
+    },
+    stop,
+  );
+  const { deps } = await seedStoppedRun(contract, ledger);
+  const observe = observeWithIdentities({
+    "1289": identity({
+      issue_number: 1289,
+      ready_label_present: true,
+      pipeline_stage: "ready-to-deploy",
+      pr_number: 1288,
+      pr_state: "open",
+    }),
+    "1290": READY_1290,
+  });
+  const calls: LoopExecutionRequest[] = [];
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    calls.push(request);
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "ready_to_deploy",
+      evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+    };
+  };
+
+  const result = await driveSupervisor(
+    { store: deps, observe, dispatchItem },
+    { runId: RUN_ID, engine: "claude", resume: true },
+  );
+  assert.equal(result.resumed, true);
+  assert.equal(result.stop?.reason, "recovery_exhausted");
+  assert.equal(result.stop?.time, ORIGINAL_STOP_TIME);
+  assert.equal(calls.length, 0);
+  const finalLedger = await readLedger(deps, RUN_ID);
+  assert.equal(finalLedger.items["1290"].state, "ready");
+  assert.equal(finalLedger.stop?.reason, "recovery_exhausted");
+  assert.equal(finalLedger.stop?.time, ORIGINAL_STOP_TIME);
+});
+
+test("resume of recovery_exhausted repair-forwards verified merged identity (#1297)", async () => {
+  const contract = testContract({ items: [{ id: "1290", depends_on: [], external_depends_on: [] }] });
+  const stop: LoopStopRecord = {
+    reason: "recovery_exhausted",
+    time: ORIGINAL_STOP_TIME,
+    item_id: "1290",
+    theme: "implementation-ci",
+    outstanding_ready: [],
+  };
+  const ledger = testLedger(
+    { "1290": { ...itemEntry("1290", "blocked"), blocked_theme: "implementation-ci" } },
+    stop,
+  );
+  const { deps } = await seedStoppedRun(contract, ledger);
+  const observe = observeWithIdentities({
+    "1290": identity({
+      issue_number: 1290,
+      pr_number: 1292,
+      pr_state: "merged",
+      merge_commit_sha: "f".repeat(40),
+    }),
+  });
+  const calls: LoopExecutionRequest[] = [];
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    calls.push(request);
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "ready_to_deploy",
+      evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+    };
+  };
+  await driveSupervisor(
+    { store: deps, observe, dispatchItem },
+    { runId: RUN_ID, engine: "claude", resume: true },
+  );
+  const finalLedger = await readLedger(deps, RUN_ID);
+  assert.equal(finalLedger.items["1290"].state, "merged");
+  assert.equal(finalLedger.stop?.reason, "recovery_exhausted");
+  assert.equal(calls.length, 0);
+});
+
+test("resume of recovery_exhausted does not dispatch remaining non-ready blocked items (#1297)", async () => {
+  const contract = testContract({
+    items: [
+      { id: "1290", depends_on: [], external_depends_on: [] },
+      { id: "1291", depends_on: [], external_depends_on: [] },
+    ],
+  });
+  const stop: LoopStopRecord = {
+    reason: "recovery_exhausted",
+    time: ORIGINAL_STOP_TIME,
+    item_id: "1291",
+    theme: "implementation-ci",
+    outstanding_ready: [],
+  };
+  const ledger = testLedger(
+    {
+      "1290": { ...itemEntry("1290", "blocked"), blocked_theme: "implementation-ci" },
+      "1291": { ...itemEntry("1291", "blocked"), blocked_theme: "implementation-ci" },
+    },
+    stop,
+  );
+  const { deps } = await seedStoppedRun(contract, ledger);
+  const observe = observeWithIdentities({
+    "1290": READY_1290,
+    "1291": identity({
+      issue_number: 1291,
+      ready_label_present: false,
+      pipeline_stage: "implementing",
+      pr_number: 11,
+      pr_state: "open",
+    }),
+  });
+  const calls: LoopExecutionRequest[] = [];
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    calls.push(request);
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "ready_to_deploy",
+      evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+    };
+  };
+  await driveSupervisor(
+    { store: deps, observe, dispatchItem },
+    { runId: RUN_ID, engine: "claude", resume: true },
+  );
+  const finalLedger = await readLedger(deps, RUN_ID);
+  assert.equal(finalLedger.items["1290"].state, "ready");
+  assert.equal(finalLedger.items["1291"].state, "blocked");
+  assert.equal(finalLedger.stop?.reason, "recovery_exhausted");
+  assert.equal(calls.length, 0);
+});
+
+test("resume of recovery_exhausted does not repair-forward needs-human to ready (#1297)", async () => {
+  const contract = testContract({ items: [{ id: "1290", depends_on: [], external_depends_on: [] }] });
+  const stop: LoopStopRecord = {
+    reason: "recovery_exhausted",
+    time: ORIGINAL_STOP_TIME,
+    item_id: "1290",
+    theme: "implementation-ci",
+    outstanding_ready: [],
+  };
+  const ledger = testLedger(
+    { "1290": { ...itemEntry("1290", "blocked"), blocked_theme: "implementation-ci" } },
+    stop,
+  );
+  const { deps } = await seedStoppedRun(contract, ledger);
+  const observe = observeWithIdentities({
+    "1290": identity({
+      issue_number: 1290,
+      ready_label_present: false,
+      pipeline_stage: "needs-human",
+      pr_number: 12,
+      pr_state: "open",
+    }),
+  });
+  const calls: LoopExecutionRequest[] = [];
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    calls.push(request);
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "ready_to_deploy",
+      evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+    };
+  };
+  await driveSupervisor(
+    { store: deps, observe, dispatchItem },
+    { runId: RUN_ID, engine: "claude", resume: true },
+  );
+  const finalLedger = await readLedger(deps, RUN_ID);
+  assert.notEqual(finalLedger.items["1290"].state, "ready");
+  assert.equal(finalLedger.items["1290"].state, "blocked");
+  assert.equal(calls.length, 0);
+});
+
+test("repeated recovery_exhausted resume is idempotent (#1297)", async () => {
+  const contract = testContract({ items: [{ id: "1290", depends_on: [], external_depends_on: [] }] });
+  const stop: LoopStopRecord = {
+    reason: "recovery_exhausted",
+    time: ORIGINAL_STOP_TIME,
+    item_id: "1290",
+    theme: "implementation-ci",
+    outstanding_ready: [],
+  };
+  const ledger = testLedger(
+    { "1290": { ...itemEntry("1290", "blocked"), blocked_theme: "implementation-ci" } },
+    stop,
+  );
+  const { deps } = await seedStoppedRun(contract, ledger);
+  const observe = observeWithIdentities({ "1290": READY_1290 });
+  const calls: LoopExecutionRequest[] = [];
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    calls.push(request);
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "ready_to_deploy",
+      evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+    };
+  };
+  await driveSupervisor(
+    { store: deps, observe, dispatchItem },
+    { runId: RUN_ID, engine: "claude", resume: true },
+  );
+  await driveSupervisor(
+    { store: deps, observe, dispatchItem },
+    { runId: RUN_ID, engine: "claude", resume: true },
+  );
+  const finalLedger = await readLedger(deps, RUN_ID);
+  assert.equal(finalLedger.items["1290"].state, "ready");
+  assert.equal(finalLedger.stop?.reason, "recovery_exhausted");
+  assert.equal(finalLedger.stop?.time, ORIGINAL_STOP_TIME);
+  assert.equal(calls.length, 0);
+});
+
+test("live drive without --resume does not run recovery_exhausted terminal catch-up (#1297)", async () => {
+  const contract = testContract({ items: [{ id: "1290", depends_on: [], external_depends_on: [] }] });
+  const stop: LoopStopRecord = {
+    reason: "recovery_exhausted",
+    time: ORIGINAL_STOP_TIME,
+    item_id: "1290",
+    theme: "implementation-ci",
+    outstanding_ready: [],
+  };
+  const ledger = testLedger(
+    { "1290": { ...itemEntry("1290", "blocked"), blocked_theme: "implementation-ci" } },
+    stop,
+  );
+  const { deps } = await seedStoppedRun(contract, ledger);
+  const observe = observeWithIdentities({ "1290": READY_1290 });
+  const calls: LoopExecutionRequest[] = [];
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    calls.push(request);
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "ready_to_deploy",
+      evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+    };
+  };
+  await driveSupervisor(
+    { store: deps, observe, dispatchItem },
+    { runId: RUN_ID, engine: "claude" },
+  );
+  const finalLedger = await readLedger(deps, RUN_ID);
+  assert.equal(finalLedger.items["1290"].state, "blocked");
+  assert.equal(finalLedger.stop?.reason, "recovery_exhausted");
+  assert.equal(calls.length, 0);
+});
+
+test("default reconcile still throws stop when ledger.stop is recovery_exhausted (#1297)", async () => {
+  const contract = testContract({ items: [{ id: "1290", depends_on: [], external_depends_on: [] }] });
+  const stop: LoopStopRecord = {
+    reason: "recovery_exhausted",
+    time: ORIGINAL_STOP_TIME,
+    item_id: "1290",
+    theme: "implementation-ci",
+    outstanding_ready: [],
+  };
+  const ledger = testLedger(
+    { "1290": { ...itemEntry("1290", "blocked"), blocked_theme: "implementation-ci" } },
+    stop,
+  );
+  const { deps } = await seedStoppedRun(contract, ledger);
+  const observe = observeWithIdentities({ "1290": READY_1290 });
+  const { token } = await acquireLock(deps, RUN_ID, "claude");
+  await assert.rejects(
+    () => reconcile(deps, observe, { runId: RUN_ID, token, engine: "claude" }),
+    (err: unknown) => {
+      assert.ok(err instanceof LoopError);
+      assert.equal(err.loopFailureClass, "stop");
+      assert.match(err.message, /recovery_exhausted/);
+      return true;
+    },
+  );
+  const after = await readLedger(deps, RUN_ID);
+  assert.equal(after.items["1290"].state, "blocked");
+  await releaseLock(deps, RUN_ID, token);
+});
+
 test("formatRunFatalResumeRefusal names time, theme, item, and recovery commands", () => {
   const message = formatRunFatalResumeRefusal("loop-68575cf7a09c849c", runFatalStop());
   assert.match(message, /2026-08-27T15:27:13/);

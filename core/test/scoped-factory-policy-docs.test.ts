@@ -9,6 +9,7 @@ import yaml from "js-yaml";
 import { COMMAND_DOCS } from "../scripts/command-docs.ts";
 import { generateConfigSchema } from "../scripts/config.ts";
 import { renderConfigMarkdown } from "../scripts/docs-generate.ts";
+import { OPERATION_SURFACE } from "../scripts/operation-surface.ts";
 import { STAGES } from "../scripts/types.ts";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -86,10 +87,10 @@ test("command copy names operator authority and keeps dry-run default", () => {
   assert.match(readyCopy, /operator-authorized merge command/i);
   assert.doesNotMatch(readyCopy, /push the merge button/i);
 
-  const buildSource = read("scripts/build.mjs");
-  assert.match(buildSource, /Operator-authorized squash merge/i);
-  assert.match(buildSource, /Operator-authorized sequential merge/i);
-  assert.doesNotMatch(buildSource, /Human-only squash merge|Human-gated sequential merge/i);
+  const operationCopy = OPERATION_SURFACE.map((operation) => operation.desc).join("\n");
+  assert.match(operationCopy, /Operator-authorized squash merge/i);
+  assert.match(operationCopy, /Operator-authorized sequential merge/i);
+  assert.doesNotMatch(operationCopy, /Human-only squash merge|Human-gated sequential merge/i);
 
   for (const relPath of [
     "core/scripts/stages/intake.ts",

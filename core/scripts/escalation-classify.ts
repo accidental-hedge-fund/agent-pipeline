@@ -3,7 +3,7 @@
 // Derive pipeline/stage-diagnostic@1 reason codes from structured HarnessResult
 // flags and gh error shapes — never free-form prose as the primary signal.
 
-import { isTransientGhError } from "./gh.ts";
+import { isPrDiffTooLargeError, isTransientGhError } from "./gh.ts";
 import type { HarnessResult } from "./harness.ts";
 import {
   isClaudeModelEntitlementFailure,
@@ -136,6 +136,16 @@ export function classifyGhError(stderr: string): {
 
   if (isTransientGhError(stderr)) {
     return { class: "transient-infra", reason_code: "transient-infra", transient: true };
+  }
+
+  // Combined PR diff cap: GitHub 406 too_large. Engine-owned — getPrDiff falls
+  // back to the list-files API. Must not project as workflow-state / needs-human.
+  if (isPrDiffTooLargeError(stderr)) {
+    return {
+      class: "deterministic-client",
+      reason_code: "workflow-engine-defect",
+      transient: false,
+    };
   }
 
   // Deterministic client errors

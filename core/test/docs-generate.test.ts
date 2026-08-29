@@ -24,6 +24,7 @@ import {
   type CommandDoc,
 } from "../scripts/command-docs.ts";
 import { COMMAND_REGISTRY, lookupCommand, validateFlags } from "../scripts/command-registry.ts";
+import { OPERATION_SURFACE } from "../scripts/operation-surface.ts";
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -141,6 +142,28 @@ describe("command-docs metadata", () => {
     assert.equal(COMMAND_DOCS.papercut?.documented, false);
     const listed = listDocumentedCommands().map((c) => c.keyword);
     assert.ok(!listed.includes("papercut"));
+  });
+
+  test("legacy run alias remains dispatchable but is absent from documentation", () => {
+    assert.ok(lookupCommand("run"), "legacy run alias must remain registered");
+    assert.equal(COMMAND_DOCS.run?.documented, false);
+    const listed = listDocumentedCommands().map((c) => c.keyword);
+    assert.ok(!listed.includes("run"));
+  });
+
+  test("OPERATION_SURFACE drives the default CLI and SKILL catalog", () => {
+    const status = OPERATION_SURFACE.find((op) => op.name === "status");
+    assert.ok(status);
+    const mutableStatus = status as { desc: string };
+    const original = mutableStatus.desc;
+    const marker = "catalog-driven status marker";
+    try {
+      mutableStatus.desc = marker;
+      assert.match(renderCliMarkdown(), new RegExp(marker));
+      assert.match(renderSkillCommandTable({ hostToken: "/pipeline" }), new RegExp(marker));
+    } finally {
+      mutableStatus.desc = original;
+    }
   });
 
   test("doc metadata does not change flag validation", () => {
@@ -341,6 +364,8 @@ describe("buildGeneratedArtifacts", () => {
     const arts = buildGeneratedArtifacts({
       skillClaude: skill,
       skillCodex: skill,
+      skillOmp: skill,
+      skillOpencode: skill,
       configSchema: FIXTURE_SCHEMA,
       changelogReleases: [{ version: "1.0.0", date: "2026-06-10", subject: "first" }],
       registry: FIXTURE_REGISTRY,
@@ -353,10 +378,22 @@ describe("buildGeneratedArtifacts", () => {
       "docs/config.md",
       "hosts/claude/SKILL.md",
       "hosts/codex/SKILL.md",
+      "hosts/omp/SKILL.md",
+      "hosts/opencode/SKILL.md",
     ]);
     const cli = arts.find((a) => a.relPath === "docs/cli.md")!.content;
     assert.match(cli, /status/);
     assert.ok(!cli.includes("papercut"));
+    for (const relPath of [
+      "hosts/claude/SKILL.md",
+      "hosts/codex/SKILL.md",
+      "hosts/omp/SKILL.md",
+      "hosts/opencode/SKILL.md",
+    ]) {
+      const content = arts.find((artifact) => artifact.relPath === relPath)!.content;
+      assert.match(content, /status/);
+      assert.ok(!content.includes("papercut"));
+    }
   });
 
   test("staleness bite: corrupted content differs from fresh generation", () => {

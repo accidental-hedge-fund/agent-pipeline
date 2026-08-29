@@ -10,7 +10,16 @@
 //   3. Provision dependencies on first run (idempotent `npm ci` into core/).
 //   4. Exec the shared core with this host's profile baked in.
 import { spawnSync } from "node:child_process";
-import { closeSync, existsSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  linkSync,
+  openSync,
+  readFileSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join, resolve } from "node:path";
@@ -25,6 +34,10 @@ const PROFILE = "__PROFILE__";
 // that starts anytime during the run observes it.
 const UPDATE_LOCK_PATH = join(tmpdir(), ".pipeline-installer-update.lock");
 const STARTING_LOCK_PATH = join(tmpdir(), `pipeline-starting-${process.pid}.lock`);
+const DEPENDENCY_LOCK_NAME = ".pipeline-dependencies-installing.lock";
+const DEPENDENCY_LOCK_TIMEOUT_MS = 300_000;
+const DEPENDENCY_LOCK_POLL_MS = 50;
+const DEPENDENCY_LOCK_WAIT_ARRAY = new Int32Array(new SharedArrayBuffer(4));
 
 // Read-only commands are explicitly allowlisted (fail-safe default: anything
 // not listed here is treated as run-mutating and reserves a slot). `logs`
@@ -87,6 +100,199 @@ function releaseRunSlot() {
   } catch {
     // already gone
   }
+}
+
+function sleepSync(milliseconds) {
+  Atomics.wait(DEPENDENCY_LOCK_WAIT_ARRAY, 0, 0, milliseconds);
+}
+
+function dependenciesReady(nodeModulesDir, incompleteDepsMarker) {
+  return existsSync(nodeModulesDir) && !existsSync(incompleteDepsMarker);
+}
+
+function dependencyLockState(lockPath) {
+  let owner = "";
+  try {
+    owner = readFileSync(lockPath, "utf8").trim();
+  } catch (err) {
+    if (err?.code === "ENOENT") return "missing";
+    throw err;
+  }
+  const pid = Number.parseInt(owner.split(/\s+/)[0] ?? "", 10);
+  if (!Number.isFinite(pid) || pid <= 0) return "abandoned";
+  try {
+    process.kill(pid, 0);
+    return "live";
+  } catch (err) {
+    if (err?.code === "ESRCH") return "abandoned";
+    return "live";
+  }
+}
+
+function tryPublishDependencyLock(lockPath, token) {
+  const claimPath = `${lockPath}.claim-${process.pid}-${process.hrtime.bigint().toString(16)}`;
+  writeFileSync(claimPath, token);
+  try {
+    linkSync(claimPath, lockPath);
+    return true;
+  } catch (err) {
+    if (err?.code === "EEXIST") return false;
+    throw err;
+  } finally {
+    try {
+      unlinkSync(claimPath);
+    } catch {
+      // best-effort cleanup
+    }
+  }
+}
+
+function releaseDependencyLock(lockPath, token) {
+  try {
+    if (!dependencyLockOwned(lockPath, token)) {
+      return { ok: false, error: new Error("the lock is missing or owned by another process") };
+    }
+    unlinkSync(lockPath);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err };
+  }
+}
+
+function dependencyLockOwned(lockPath, token) {
+  try {
+    return readFileSync(lockPath, "utf8") === token;
+  } catch (err) {
+    if (err?.code === "ENOENT") return false;
+    throw err;
+  }
+}
+
+function acquireDependencyLock(lockPath, nodeModulesDir, incompleteDepsMarker) {
+  const deadline = Date.now() + DEPENDENCY_LOCK_TIMEOUT_MS;
+  const token = `${process.pid} ${process.hrtime.bigint().toString(16)}`;
+  while (true) {
+    if (dependenciesReady(nodeModulesDir, incompleteDepsMarker) && !existsSync(lockPath)) {
+      return null;
+    }
+
+    if (tryPublishDependencyLock(lockPath, token) && dependencyLockOwned(lockPath, token)) return token;
+
+    const state = dependencyLockState(lockPath);
+    if (state === "abandoned") {
+      throw new Error(
+        `abandoned dependency install lock at ${lockPath}; refusing to start a second npm ci. ` +
+          "Confirm no prior npm ci child is still running, then remove that exact lock and retry",
+      );
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`timed out waiting for ${lockPath}`);
+    }
+    sleepSync(DEPENDENCY_LOCK_POLL_MS);
+  }
+}
+
+function provisionDependencies(nodeModulesDir, incompleteDepsMarker) {
+  const lockPath = join(coreDir, DEPENDENCY_LOCK_NAME);
+  const recovery =
+    `After this launcher exits, confirm no npm ci child remains, then repair or remove ` +
+    `the exact marker ${incompleteDepsMarker} and lock ${lockPath}, and retry; ` +
+    `or reinstall the pipeline skill at ${coreDir}.`;
+  let token;
+  try {
+    token = acquireDependencyLock(lockPath, nodeModulesDir, incompleteDepsMarker);
+  } catch (err) {
+    console.error(
+      `[pipeline] could not acquire the dependency install lock: ${err.message}. ` +
+        `Retry after the other launcher finishes, or reinstall the pipeline skill at ${coreDir}.`,
+    );
+    return false;
+  }
+  if (token === null) return true;
+
+  let releaseOnExit = true;
+  let success = false;
+  try {
+    if (dependenciesReady(nodeModulesDir, incompleteDepsMarker)) {
+      success = true;
+    } else if (!dependencyLockOwned(lockPath, token)) {
+      console.error(
+        `[pipeline] dependency install lock ownership changed at ${lockPath}; ` +
+          `refusing npm ci and preserving the observed lock. ${recovery}`,
+      );
+      releaseOnExit = false;
+    } else {
+      try {
+        writeFileSync(incompleteDepsMarker, "");
+      } catch (err) {
+        console.error(
+          `[pipeline] could not write the incomplete dependency marker at ` +
+            `${incompleteDepsMarker}: ${err.message}. Refusing npm ci and preserving ` +
+            `the owner lock. ${recovery}`,
+        );
+        releaseOnExit = false;
+      }
+
+      if (releaseOnExit) {
+        console.error("[pipeline] dependencies missing or incomplete: installing (npm ci)…");
+        let ci;
+        try {
+          ci = spawnSync("npm", ["ci", "--omit=dev", "--no-audit", "--no-fund"], {
+            cwd: coreDir,
+            stdio: "inherit",
+          });
+        } catch (err) {
+          ci = { status: null, error: err };
+        }
+
+        if (ci.error || (ci.status ?? 1) !== 0) {
+          try {
+            rmSync(nodeModulesDir, { recursive: true, force: true });
+          } catch (err) {
+            console.error(
+              `[pipeline] could not remove partial dependencies at ${nodeModulesDir}: ` +
+                `${err.message}. The install remains marked incomplete so the next ` +
+                `invocation retries.`,
+            );
+          }
+          const detail = ci.error ? `: ${ci.error.message}` : "";
+          console.error(
+            `[pipeline] dependency install failed${detail}. Run \`npm ci\` in ${coreDir} and retry.`,
+          );
+        } else {
+          try {
+            unlinkSync(incompleteDepsMarker);
+            success = true;
+          } catch (err) {
+            console.error(
+              `[pipeline] npm ci completed, but the incomplete dependency marker at ` +
+                `${incompleteDepsMarker} could not be cleared: ${err.message}. ` +
+                `Refusing to dispatch and preserving the owner lock. ${recovery}`,
+            );
+            releaseOnExit = false;
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.error(
+      `[pipeline] dependency provisioning state became unreadable: ${err.message}. ` +
+        `Refusing to dispatch and preserving the owner lock. ${recovery}`,
+    );
+    releaseOnExit = false;
+  } finally {
+    if (releaseOnExit) {
+      const release = releaseDependencyLock(lockPath, token);
+      if (!release.ok) {
+        console.error(
+          `[pipeline] could not release the dependency install lock at ${lockPath}: ` +
+            `${release.error.message}. Refusing to dispatch. ${recovery}`,
+        );
+        success = false;
+      }
+    }
+  }
+  return success;
 }
 
 const here = dirname(fileURLToPath(import.meta.url)); // <skill>/scripts (or hosts/_shared in-repo)
@@ -249,25 +455,41 @@ if (!existsSync(entry)) {
   process.exit(1);
 }
 
-// First-run dependency provisioning. Skipped once core/node_modules exists, so
-// this is a no-op on every subsequent invocation.
-if (!existsSync(join(coreDir, "node_modules"))) {
-  console.error("[pipeline] first run: installing dependencies (npm ci)…");
-  const ci = spawnSync("npm", ["ci", "--omit=dev", "--no-audit", "--no-fund"], {
-    cwd: coreDir,
-    stdio: "inherit",
-  });
-  if ((ci.status ?? 1) !== 0) {
-    console.error(`[pipeline] dependency install failed. Run \`npm ci\` in ${coreDir} and retry.`);
+// First-run dependency provisioning. A marker distinguishes a complete npm ci
+// from a failed attempt that happened to leave a partial node_modules tree.
+// Reserve against installer updates before touching core/, then serialize npm
+// across concurrent launchers with a core-local owner lock.
+const nodeModulesDir = join(coreDir, "node_modules");
+const incompleteDepsMarker = join(coreDir, ".pipeline-dependencies-incomplete");
+const dependencyLockPath = join(coreDir, DEPENDENCY_LOCK_NAME);
+const readOnly = isReadOnlyCommand(rawArgs);
+let reserved = false;
+if (
+  !existsSync(nodeModulesDir) ||
+  existsSync(incompleteDepsMarker) ||
+  existsSync(dependencyLockPath)
+) {
+  if (!reserveRunSlot()) {
+    console.error(
+      "pipeline: an install/update is in progress — starting now risks loading a mixed " +
+        "old/new engine. Retry in a moment.",
+    );
     process.exit(1);
+  }
+  reserved = true;
+  if (!provisionDependencies(nodeModulesDir, incompleteDepsMarker)) {
+    releaseRunSlot();
+    process.exit(1);
+  }
+  if (readOnly) {
+    releaseRunSlot();
+    reserved = false;
   }
 }
 
 // Read-only commands never reserve or hold the run-liveness slot (#567) — they
 // only need the cheap, non-held courtesy check so they can decline to start
 // into an update that's already in progress.
-const readOnly = isReadOnlyCommand(rawArgs);
-let reserved = false;
 if (readOnly) {
   if (updateInProgress()) {
     console.error(
@@ -276,7 +498,7 @@ if (readOnly) {
     );
     process.exit(1);
   }
-} else if (!reserveRunSlot()) {
+} else if (!reserved && !reserveRunSlot()) {
   console.error(
     "pipeline: an install/update is in progress — starting now risks loading a mixed " +
       "old/new engine. Retry in a moment.",

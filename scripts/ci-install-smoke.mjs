@@ -17,11 +17,12 @@
 // post-install `shim --help` refuse with "install/update is in progress"
 // and flakes the test gate.
 
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve, dirname } from "node:path";
+import { delimiter, join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import { makeInstalledDispatchFixture } from "./install-dispatch-fixture.mjs";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const NODE = process.execPath;
@@ -121,7 +122,15 @@ const configDir = mkdtempSync(join(tmpdir(), "pipeline-smoke-"));
 // final rmSync of configDir cleans both skill files and locks.
 const lockTmpDir = join(configDir, "tmp");
 mkdirSync(lockTmpDir, { recursive: true });
+let doctorResultPath;
 try {
+  const {
+    repoDir: dispatchRepo,
+    domain: dispatchDomain,
+    fakeBin,
+    fakeNode,
+  } = makeInstalledDispatchFixture(configDir, { nodePath: NODE });
+  doctorResultPath = join(tmpdir(), `pipeline-${dispatchDomain}-doctor-result.json`);
   const installScript = join(REPO_ROOT, "scripts", "install.mjs");
   const shimScript = join(configDir, "skills", "pipeline", "scripts", "pipeline.mjs");
   const materialFilterScript = join(
@@ -131,7 +140,12 @@ try {
     "scripts",
     "material-filter.mjs",
   );
-  const env = { CLAUDE_CONFIG_DIR: configDir, TMPDIR: lockTmpDir };
+  const env = {
+    CLAUDE_CONFIG_DIR: configDir,
+    TMPDIR: lockTmpDir,
+    PATH: `${fakeBin}${delimiter}${process.env.PATH ?? ""}`,
+    AGENT_PIPELINE_NODE: fakeNode,
+  };
 
   run([installScript, "install", "--host", "claude"], env);
   const enginesResolver = join(
@@ -147,7 +161,65 @@ try {
     );
     process.exit(1);
   }
+  const commandsDir = join(configDir, "commands");
+  const slashFiles = existsSync(commandsDir)
+    ? readdirSync(commandsDir).filter((f) => f.startsWith("pipeline:") && f.endsWith(".md"))
+    : [];
+  if (slashFiles.length > 0) {
+    console.error(`install --host claude wrote pipeline:*.md: ${slashFiles.join(", ")}`);
+    process.exit(1);
+  }
   run([shimScript, "--help"], env);
+  const doctor = spawnSync(NODE, [shimScript, "doctor", "--json"], {
+    cwd: dispatchRepo,
+    env: { ...process.env, ...env },
+    encoding: "utf8",
+  });
+  if (doctor.error || doctor.signal || !doctor.stdout?.trim()) {
+    throw new Error(
+      `installed doctor did not return JSON (exit ${String(doctor.status)}, signal ${String(doctor.signal)}):\n` +
+        `${doctor.stdout ?? ""}${doctor.stderr ?? ""}`,
+    );
+  }
+  const doctorPayload = JSON.parse(doctor.stdout);
+  const doctorChecks = Object.fromEntries(doctorPayload.checks.map((check) => [check.name, check]));
+  for (const name of ["cli:gh", "github-auth", "repo-access"]) {
+    if (doctorChecks[name]?.status !== "pass") {
+      throw new Error(`installed doctor did not run ${name} successfully: ${JSON.stringify(doctorChecks[name])}`);
+    }
+  }
+  if (
+    doctorPayload.schema_version !== "1" ||
+    doctorPayload.status === "error" ||
+    doctor.status !== 0
+  ) {
+    throw new Error(
+      `installed doctor did not complete successfully (exit ${String(doctor.status)}): ${doctor.stdout}`,
+    );
+  }
+  const status = spawnSync(NODE, [shimScript, "status", "1", "--json"], {
+    cwd: dispatchRepo,
+    env: { ...process.env, ...env },
+    encoding: "utf8",
+  });
+  if (status.error || status.signal || status.status !== 0 || !status.stdout?.trim()) {
+    throw new Error(
+      `installed status handler failed (exit ${String(status.status)}, signal ${String(status.signal)}):\n` +
+        `${status.stdout ?? ""}${status.stderr ?? ""}`,
+    );
+  }
+  const statusPayload = JSON.parse(status.stdout);
+  if (
+    statusPayload.schema_version !== "1" ||
+    statusPayload.status !== "ok" ||
+    statusPayload.issue?.number !== 1 ||
+    statusPayload.issue?.title !== "Installed status fixture" ||
+    statusPayload.stage !== "ready" ||
+    statusPayload.config?.repo !== "example/repo" ||
+    !/planning and implementation/.test(statusPayload.next_action ?? "")
+  ) {
+    throw new Error(`installed status returned the wrong handler outcome: ${status.stdout}`);
+  }
   // Documented host-skill material filter path must work from the installed tree.
   assertInstalledMaterialFilter(materialFilterScript, env);
   // `update` refreshes the installed skill in place; running it twice must be
@@ -162,5 +234,6 @@ try {
   run([shimScript, "--help"], env);
   run([installScript, "uninstall", "--host", "claude"], env);
 } finally {
+  if (doctorResultPath) rmSync(doctorResultPath, { force: true });
   rmSync(configDir, { recursive: true, force: true });
 }

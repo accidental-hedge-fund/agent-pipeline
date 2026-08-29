@@ -1790,6 +1790,13 @@ test("pipeline-cli 5.8h: 'summary run-123 --dry-run' → summary entry, validate
   assert.deepEqual(roundTrip(["summary", "run-123", "--dry-run"]), ["dryRun"]);
 });
 
+test("pipeline-cli: numeric summary accepts repo and legacy-fallback domain selectors", () => {
+  assert.deepEqual(
+    roundTrip(["summary", "42", "--repo-path", "/tmp/repo", "--domain", "offline-test"]),
+    [],
+  );
+});
+
 // ---------------------------------------------------------------------------
 // 7.1  New positional keywords: status, unblock, override, cleanup
 // ---------------------------------------------------------------------------
