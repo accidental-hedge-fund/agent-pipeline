@@ -49,28 +49,21 @@ range, and an `npm audit` over the installed tree SHALL report no advisory attri
 - **WHEN** `core/package-lock.json` resolves `js-yaml` to a version below 4.3.0 (for example 4.1.1)
 - **THEN** `cd core && npm test` SHALL fail with a message naming `js-yaml` and the resolved version
 
-### Requirement: The generated plugin mirror SHALL carry the same dependency floor and resolution
+### Requirement: The installed CLI tree SHALL carry the core dependency floor and resolution
 
-The generated mirror under `plugin/pipeline/skills/pipeline/core/` SHALL declare the same `js-yaml`
-range in its `package.json` and resolve the same `js-yaml` version in its `package-lock.json` as
-`core/`. A mirror that disagrees with `core/` SHALL be reported as stale by
-`node scripts/build.mjs --check`, so an installed plugin can never provision the advisory-range
-parser that the source tree has already remediated.
+The `js-yaml` floor and lockfile resolution SHALL be enforced on `core/package.json` and `core/package-lock.json`. The installed CLI tree SHALL receive that same `core/` at install time. A committed `plugin/pipeline/skills/pipeline/core/` copy SHALL NOT be required to carry the floor. `node scripts/build.mjs --check` SHALL NOT report a missing or drifted `plugin/` core lockfile as staleness. Dual-ship of a plugin core lockfile is forbidden.
 
-#### Scenario: Mirror agrees with core after regeneration
+#### Scenario: Build freshness does not require a duplicate core manifest
 
 - **WHEN** `node scripts/build.mjs` runs and `node scripts/build.mjs --check` follows
-- **THEN** `plugin/pipeline/skills/pipeline/core/package.json` SHALL declare the same `js-yaml` range
-  as `core/package.json`
-- **AND** `plugin/pipeline/skills/pipeline/core/package-lock.json` SHALL resolve the same `js-yaml`
-  version as `core/package-lock.json`
-- **AND** `--check` SHALL exit zero
+- **THEN** `--check` SHALL exit zero without requiring `plugin/pipeline/skills/pipeline/core/package.json` to exist
+- **AND** SHALL NOT require `plugin/pipeline/skills/pipeline/core/package-lock.json` to resolve `js-yaml`
 
-#### Scenario: A stale mirror blocks the change
+#### Scenario: Core dependency enforcement remains single-sourced
 
-- **WHEN** `core/package.json` or `core/package-lock.json` is bumped without regenerating the mirror
-- **THEN** `node scripts/build.mjs --check` SHALL fail
-- **AND** `npm run ci` SHALL be red
+- **WHEN** `core/package.json` or `core/package-lock.json` is bumped
+- **THEN** `node scripts/build.mjs --check` SHALL NOT fail solely because a `plugin/` core copy was not regenerated
+- **AND** `cd core && npm test` SHALL still enforce the `js-yaml` floor on `core/`
 
 ### Requirement: Config YAML parsing behavior SHALL be unchanged by the version bump
 
@@ -95,6 +88,5 @@ carrying a 1-based line number derived from the parse exception's `mark.line`. N
 
 - **WHEN** the diff for this change is inspected
 - **THEN** it SHALL contain no modification under `core/scripts/`
-- **AND** it SHALL be limited to the core manifests, the generated `plugin/` mirror, the new
+- **AND** it SHALL be limited to the core manifests, generated SKILL/catalog outputs, the new
   floor-guard test, and OpenSpec artifacts
-

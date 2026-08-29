@@ -254,29 +254,26 @@ resolved surface SHALL produce different hashes.
   `simulated` versus `live`)
 - **THEN** their environment-and-surface provenance hashes SHALL differ
 
-### Requirement: A fixture allowed-change boundary SHALL admit generator-owned plugin mirror paths
+### Requirement: A fixture allowed-change boundary MAY admit exact generator-owned packaging outputs
 
-The fixture contract SHALL admit generator-owned `plugin/` mirror paths in an
-`allowed_change_paths` boundary. When a fixture declares that boundary, paths under the
-generated `plugin/` mirror that are produced by the repository's mirror generator for
-corresponding `core/` edits SHALL be acceptable members of that boundary. Fixture validation
-SHALL NOT reject a path solely because it lives under `plugin/`. The grading layer SHALL
-treat a generator-owned `plugin/` path listed in the boundary as in-scope, the same as any
-other listed path.
+The fixture contract MAY list exact generator-owned SKILL overlay or marketplace catalog
+paths in an `allowed_change_paths` boundary. Fixture validation SHALL treat an explicitly
+listed generated output as in scope, but SHALL NOT grant a broad `plugin/**` exception and
+SHALL NOT admit a `plugin/` core-mirror path merely because a corresponding `core/` path was
+edited.
 
-#### Scenario: Plugin mirror path listed in the boundary is accepted
+#### Scenario: Exact generated output listed in the boundary is accepted
 
-- **WHEN** a fixture's `allowed_change_paths` includes a path under `plugin/` that mirrors a
-  permitted `core/` edit
+- **WHEN** a fixture's `allowed_change_paths` includes the generated Claude SKILL overlay or marketplace catalog
 - **THEN** fixture validation SHALL succeed for that path
-- **AND** a candidate change to that path SHALL NOT be counted as out of scope solely for living
-  under `plugin/`
+- **AND** a candidate change to that exact path SHALL NOT be counted as out of scope
 
-#### Scenario: Unlisted plugin paths remain out of scope when a boundary is declared
+#### Scenario: Unlisted plugin paths and retired core mirrors remain out of scope
 
 - **WHEN** a fixture declares an allowed-change boundary that does not include a given `plugin/`
   path and a candidate result modifies that path
 - **THEN** the grading layer SHALL count that path as out of scope
+- **AND** listing a `core/` source path SHALL NOT implicitly admit a corresponding `plugin/` path
 
 ### Requirement: A fixture with empty grader references SHALL carry an explicit smoke-only mark
 
@@ -430,4 +427,3 @@ The multi-change fixture form SHALL admit optional role metadata so corpus and r
 
 - **WHEN** a multi-change fixture declares no shortcut-debt, portability, or canary role marks
 - **THEN** validation SHALL succeed if the rest of the multi-change contract is met
-

@@ -75,11 +75,10 @@ A co-located unit test under `core/test/` SHALL assert that the stage-inventory 
 
 ---
 
-### Requirement: Plugin mirror SHALL carry the Claude host stage inventory
-After the Claude host SKILL stage inventory is updated, the generated `plugin/` mirror SHALL be regenerated with `node scripts/build.mjs` and committed in the same change so installs receive the corrected inventory. CI's `build.mjs --check` gate SHALL pass.
+### Requirement: Generated Claude SKILL overlay SHALL carry the host stage inventory
+After the Claude host SKILL stage inventory is updated, the generated plugin SKILL overlay SHALL be regenerated with `node scripts/build.mjs` and committed in the same change so the remaining plugin shell receives the corrected inventory. CI's `build.mjs --check` gate SHALL pass without a copied core tree.
 
-#### Scenario: Mirror check passes after host skill update
+#### Scenario: SKILL overlay check passes after host skill update
 - **WHEN** `hosts/claude/SKILL.md` is updated for stage inventory alignment
 - **THEN** `node scripts/build.mjs` SHALL be run and the regenerated `plugin/` content committed with the same change
 - **AND** `node scripts/build.mjs --check` SHALL pass
-
