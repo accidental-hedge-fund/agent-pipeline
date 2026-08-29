@@ -358,7 +358,7 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
 
   summary: {
     needsIssueNumber: false,
-    allowedFlags: new Set(["repoPath"]),
+    allowedFlags: new Set(["repoPath", "domain"]),
     needsConfig: false,
     needsGhAuth: false,
     mutatesGitHub: false,

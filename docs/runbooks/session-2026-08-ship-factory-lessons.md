@@ -128,14 +128,14 @@ product work on milestone (train / loop / single)
 | Path | Role |
 |---|---|
 | `core/scripts/` | Engine (TypeScript, type-strip at runtime, no tsc build) |
-| `plugin/` | **Generated** mirror of `core/` (+ hosts/claude); never hand-edit |
+| `plugin/` | Transitional generated SKILL/catalog shell; it contains no copied `core/` engine |
 | `hosts/` | Per-host packaging (claude, codex, grok, …) |
 | `openspec/` | Living specs + in-flight changes |
 | `examples/supervisor/` | **Portable** thin-supervisor examples (not a second control plane) |
 
 **Golden rules (Agents.md / CLAUDE.md):**
 
-- Edit `core/`, then `node scripts/build.mjs`; commit `plugin/` with the same change.  
+- Edit `core/`, then run `node scripts/build.mjs`; commit only changed generated SKILL/catalog outputs.
 - `npm run ci` is the done gate.  
 - Worktrees for code changes; never edit on `main` in the shared checkout.  
 - `pipeline train` / `single` / `loop` stop at ready-to-deploy; merge is opt-in / operator-authorized.

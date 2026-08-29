@@ -42,6 +42,7 @@ import {
   runFactoryGate,
   validateFrgPackContract,
   validateReleaseEligibleFrgEvidence,
+  type FactoryGateOpts,
   type FrgCompositionOverride,
   type FrgEvidence,
   type FrgScenarioOverride,
@@ -913,6 +914,8 @@ export interface ScoreBoundPackLoopArgs {
   loop: DurablePackLoopArtifacts;
   pack: LoadedFrgPack;
   now: () => Date;
+  /** Tests inject collect; production `--from-run` uses the live hybrid-v2 fetch. */
+  collectHybridV2?: FactoryGateOpts["collectHybridV2"];
 }
 
 export interface ScoreBoundPackLoopResult {
@@ -1216,10 +1219,12 @@ export async function defaultScoreBoundPackLoop(
     loadContract: async () => contract,
     // Explicit: no --observations, no scenario/composition overrides, no
     // caller-authored pack provenance. Hybrid v2 inside the scorer applies.
+    requestCandidateGitSha: args.request.integrated_candidate.git_sha,
     attestationKey: null,
     stdout: () => {},
     stderr: () => {},
     now: args.now,
+    collectHybridV2: args.collectHybridV2,
   });
   return {
     evidence: result.evidence,

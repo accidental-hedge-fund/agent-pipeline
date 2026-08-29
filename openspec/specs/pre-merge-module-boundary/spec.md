@@ -107,15 +107,15 @@ Pre-merge domain modules SHALL form an acyclic graph relative to the facade: the
 
 ---
 
-### Requirement: Core changes SHALL keep the generated plugin mirror in sync
+### Requirement: Core changes SHALL keep generated packaging artifacts fresh
 
-Any edit under `core/` that participates in this split SHALL be accompanied by regenerating the `plugin/` mirror via `node scripts/build.mjs` in the same change. CI’s mirror check (`node scripts/build.mjs --check`) SHALL pass.
+Any edit under `core/` that participates in this split SHALL be accompanied by running `node scripts/build.mjs` in the same change. CI’s SKILL/catalog freshness check (`node scripts/build.mjs --check`) SHALL pass without requiring a generated `plugin/` core mirror.
 
-#### Scenario: Mirror check passes after the split
+#### Scenario: Packaging freshness check passes after the split
 
 - **WHEN** the split lands under `core/scripts/stages/`
-- **THEN** `node scripts/build.mjs --check` SHALL report the mirror in sync
-- **AND** regenerated `plugin/` contents for the moved modules SHALL be included in the same change set
+- **THEN** `node scripts/build.mjs --check` SHALL report generated SKILL/catalog outputs in sync
+- **AND** the change SHALL NOT add copies of the moved modules under `plugin/`
 
 ### Requirement: Pre-merge domain modules SHALL expose reconcile-shaped surfaces
 
@@ -145,4 +145,3 @@ reconcile-shaped APIs so a later split does not reintroduce private marker autho
 - **WHEN** the pre_merge facade advances an issue through pre-merge
 - **THEN** it MAY order domain reconcile results
 - **AND** attempt authority SHALL remain the stage-attempt ledger rather than facade-local maps
-

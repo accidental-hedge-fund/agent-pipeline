@@ -1,20 +1,24 @@
-// Host-surface drift-guard tests (#273).
+// Host-surface drift-guard tests (#273, #1048).
 //
 // Covers:
-//   7.5  The generated plugin/pipeline/commands/ directory contains exactly the
-//        operations defined by the namespaced-command-surface spec — no more,
-//        no less, and no pipeline:run entry.
+//   7.5  OPERATION_SURFACE is the verb catalog. Hosts exec `pipeline <verb>`.
+//        Build/install do not emit a per-verb command pack.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { load as yamlLoad } from "js-yaml";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-// core/test/ → ../../ = repo root, then plugin/pipeline/commands/
-const COMMANDS_DIR = join(__dirname, "..", "..", "plugin", "pipeline", "commands");
+const REPO_ROOT = join(__dirname, "..", "..");
+const COMMANDS_DIR = join(REPO_ROOT, "plugin", "pipeline", "commands");
+const HOST_SKILL_PATHS = [
+  join(REPO_ROOT, "hosts", "claude", "SKILL.md"),
+  join(REPO_ROOT, "hosts", "codex", "SKILL.md"),
+  join(REPO_ROOT, "hosts", "opencode", "SKILL.md"),
+  join(REPO_ROOT, "hosts", "omp", "SKILL.md"),
+];
 
 // Canonical operation names per the namespaced-command-surface spec.
 // run is intentionally absent — it is an undocumented alias only.
@@ -40,44 +44,76 @@ const EXPECTED_OPERATIONS = new Set([
 ]);
 
 // ---------------------------------------------------------------------------
-// 7.5a  Every expected operation has a generated command file
+// 7.5a  Every expected operation remains in the shared CLI catalog
 // ---------------------------------------------------------------------------
 
-test("namespaced-commands 7.5a: plugin/pipeline/commands/ exists and contains exactly the expected operations", () => {
-  let files: string[];
-  try {
-    files = readdirSync(COMMANDS_DIR).filter((f) => f.endsWith(".md"));
-  } catch (err) {
-    const e = err as NodeJS.ErrnoException;
-    assert.fail(
-      `plugin/pipeline/commands/ does not exist — run \`node scripts/build.mjs\` and commit the output. (${e.message})`,
-    );
-  }
-
-  // Extract operation names: "pipeline:status.md" → "status"
-  const actualOps = new Set(
-    files.map((f) => {
-      const match = /^pipeline:(.+)\.md$/.exec(f);
-      assert.ok(match, `Unexpected file name format in commands dir: ${f}`);
-      return match[1];
-    }),
-  );
-
-  // Every expected op must be present
+test("namespaced-commands 7.5a: OPERATION_SURFACE catalogs expected ops; no slash-command tree", async () => {
+  const buildMjs = await import("../../scripts/build.mjs");
+  const { OPERATION_SURFACE } = buildMjs;
+  const catalog = new Set(OPERATION_SURFACE.map((op: { name: string }) => op.name));
   for (const expected of EXPECTED_OPERATIONS) {
-    assert.ok(
-      actualOps.has(expected),
-      `Missing command file: pipeline:${expected}.md — run \`node scripts/build.mjs\` and commit`,
-    );
+    assert.ok(catalog.has(expected), `OPERATION_SURFACE missing catalog entry: ${expected}`);
   }
-
-  // No extra files beyond the expected set
-  for (const actual of actualOps) {
+  for (const actual of catalog) {
     assert.ok(
       EXPECTED_OPERATIONS.has(actual),
-      `Unexpected command file: pipeline:${actual}.md — remove it from OPERATION_SURFACE or add it to the spec`,
+      `OPERATION_SURFACE has unexpected operation: ${actual}`,
     );
   }
+
+  // Generate-into-temp is covered in scripts/build.test.mjs; here assert the
+  // committed plugin tree is not a slash-command pack.
+  const files = existsSync(COMMANDS_DIR)
+    ? readdirSync(COMMANDS_DIR).filter((f) => f.startsWith("pipeline:") && f.endsWith(".md"))
+    : [];
+  assert.deepEqual(files, [], "plugin/pipeline/commands/ must not contain pipeline:*.md");
+});
+
+test("namespaced-commands 7.5a2: live surfaces advertise direct CLI verbs only", () => {
+  const truthfulSurfacePaths = [
+    ...HOST_SKILL_PATHS,
+    join(REPO_ROOT, "CLAUDE.md"),
+    join(REPO_ROOT, "README.md"),
+    join(REPO_ROOT, "docs", "concepts.md"),
+    join(REPO_ROOT, "core", "scripts", "pipeline.ts"),
+  ];
+
+  for (const surfacePath of truthfulSurfacePaths) {
+    const content = readFileSync(surfacePath, "utf8");
+    assert.doesNotMatch(
+      content,
+      /(?:\/|\$)pipeline:[a-z]/,
+      `${surfacePath} must not advertise a removed per-verb host token`,
+    );
+  }
+
+  for (const skillPath of HOST_SKILL_PATHS) {
+    const content = readFileSync(skillPath, "utf8");
+    assert.doesNotMatch(
+      content,
+      /First-ever invocation runs `npm install`/,
+      `${skillPath} must not claim the launcher uses npm install`,
+    );
+    assert.match(content, /best-effort `npm ci`/, `${skillPath} must document installer prewarm`);
+    assert.match(
+      content,
+      /first non-version launcher invocation\s+retries `npm ci`/,
+      `${skillPath} must document first-run dependency self-heal`,
+    );
+    assert.match(content, /failed retry exits non-zero/, `${skillPath} must document fail-closed retry`);
+  }
+
+  const ompSkill = readFileSync(join(REPO_ROOT, "hosts", "omp", "SKILL.md"), "utf8");
+  assert.doesNotMatch(
+    ompSkill,
+    /generated mirror\s+of\s+`core\/`/i,
+    "OMP development guidance must not restore the retired core mirror",
+  );
+  assert.match(
+    ompSkill,
+    /product install path is the\s+pipeline CLI plus host SKILL/,
+    "OMP development guidance must name the CLI plus host SKILL contract",
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -97,32 +133,30 @@ test("namespaced-commands 7.5b: no pipeline:run.md command file exists", () => {
     false,
     "pipeline:run.md must not exist — run is an undocumented alias, not a surface command",
   );
+
+  for (const skillPath of HOST_SKILL_PATHS) {
+    assert.doesNotMatch(
+      readFileSync(skillPath, "utf8"),
+      /^(?:\/|\$)pipeline run\b/m,
+      `${skillPath} must not advertise the legacy run alias`,
+    );
+  }
 });
 
 // ---------------------------------------------------------------------------
 // 7.5b2  Codex and Claude operation sets are symmetric (both from OPERATION_SURFACE)
 // ---------------------------------------------------------------------------
 
-test("namespaced-commands 7.5b2: renderCodexCommand produces entries for every Claude operation", async () => {
-  // Safe to import now that build.mjs has an ESM main guard (Finding 1 fix).
+test("namespaced-commands 7.5b2: OPERATION_SURFACE is the shared catalog; no yaml agents generated", async () => {
   const buildMjs = await import("../../scripts/build.mjs");
   const { OPERATION_SURFACE, renderCodexCommand } = buildMjs;
-
-  for (const op of OPERATION_SURFACE) {
-    const content = renderCodexCommand(op);
-    assert.ok(typeof content === "string" && content.length > 0, `renderCodexCommand returned empty for operation ${op.name}`);
-    assert.ok(content.includes(`pipeline:${op.name}`), `renderCodexCommand output missing pipeline:${op.name}`);
-    // Must be valid YAML — at minimum it must contain the interface key
-    assert.ok(content.includes("interface:"), `renderCodexCommand output for ${op.name} missing 'interface:' key`);
-  }
-
-  // Codex operation names must match the Claude expected set
-  const codexNames = new Set(OPERATION_SURFACE.map((op) => op.name));
+  assert.equal(renderCodexCommand, undefined, "renderCodexCommand must not be exported");
+  const names = new Set(OPERATION_SURFACE.map((op: { name: string }) => op.name));
   for (const expected of EXPECTED_OPERATIONS) {
-    assert.ok(codexNames.has(expected), `OPERATION_SURFACE missing operation: ${expected} (Codex would be missing it too)`);
+    assert.ok(names.has(expected), `OPERATION_SURFACE missing operation: ${expected}`);
   }
-  for (const actual of codexNames) {
-    if (actual === "run") continue; // run is undocumented alias; excluded from both surfaces
+  for (const actual of names) {
+    if (actual === "run") continue;
     assert.ok(EXPECTED_OPERATIONS.has(actual), `OPERATION_SURFACE has unexpected operation: ${actual}`);
   }
 });
@@ -135,52 +169,26 @@ test("namespaced-commands 7.5b2: renderCodexCommand produces entries for every C
 //        causing a wrong external-skill invocation.
 // ---------------------------------------------------------------------------
 
-test("namespaced-commands 7.5b3: loop wrapper drives in-repo, never delegates to an external goal-loop skill", async () => {
-  const buildMjs = await import("../../scripts/build.mjs");
-  const { OPERATION_SURFACE, renderClaudeCommand, renderCodexCommand } = buildMjs;
-
-  const loopOp = OPERATION_SURFACE.find((op: { name: string }) => op.name === "loop");
-  assert.ok(loopOp, "OPERATION_SURFACE is missing the `loop` operation");
-
-  const claude = renderClaudeCommand(loopOp, "~/.claude/skills/pipeline");
-  const codex = renderCodexCommand(loopOp);
-
-  for (const [surface, content] of [["claude", claude], ["codex", codex]] as const) {
-    // The run is driven in-repo; no wrapper may instruct external delegation.
+test("namespaced-commands 7.5b3: host SKILL loop guidance drives in-repo, never an external goal-loop skill", () => {
+  const hostSkills = [
+    join(REPO_ROOT, "hosts", "claude", "SKILL.md"),
+    join(REPO_ROOT, "hosts", "codex", "SKILL.md"),
+  ];
+  for (const skillPath of hostSkills) {
+    const content = readFileSync(skillPath, "utf8");
     assert.ok(
-      !/goal-loop/i.test(content),
-      `loop ${surface} wrapper references an external goal-loop skill (internalized in #512): ${content}`,
+      !/delegate to the installed goal-loop/i.test(content),
+      `${skillPath} must not instruct external goal-loop delegation`,
     );
-    assert.ok(
-      !/delegate/i.test(content),
-      `loop ${surface} wrapper still instructs delegation — the loop runs in-repo: ${content}`,
-    );
-    // And it must never miscite the run-start preflight check name.
     assert.ok(
       !/loop:contract-coherence/.test(content),
-      `loop ${surface} wrapper miscites the run-start check; it is loop:store-schema-compatibility: ${content}`,
+      `${skillPath} must not miscite loop:contract-coherence`,
+    );
+    assert.ok(
+      /in-repo/i.test(content) && /supervisor/i.test(content),
+      `${skillPath} should describe the in-repo loop supervisor`,
     );
   }
-
-  // The Claude wrapper must positively describe in-repo supervisor execution.
-  assert.ok(
-    /in-repo/i.test(claude) && /supervisor/i.test(claude),
-    `loop Claude wrapper should describe the in-repo loop supervisor: ${claude}`,
-  );
-
-  // #665: multi-item durable drive must not claim "completes in seconds" / "No Monitor".
-  assert.ok(
-    !/completes in seconds/i.test(claude),
-    `loop Claude wrapper must not claim multi-item drive completes in seconds: ${claude}`,
-  );
-  assert.ok(
-    !/No Monitor needed/i.test(claude),
-    `loop Claude wrapper must not claim No Monitor is needed for multi-item drive: ${claude}`,
-  );
-  assert.ok(
-    /loop_run_handoff/.test(claude) && /events/.test(claude),
-    `loop Claude wrapper should document early handoff run_id + events path: ${claude}`,
-  );
 });
 
 // ---------------------------------------------------------------------------
@@ -189,9 +197,9 @@ test("namespaced-commands 7.5b3: loop wrapper drives in-repo, never delegates to
 //        (#668 / loop-skill-event-orchestration).
 // ---------------------------------------------------------------------------
 
-test("namespaced-commands 7.5b4: loop Claude command is long-running, not seconds/no-Monitor", async () => {
+test("namespaced-commands 7.5b4: loop SKILL packaging is long-running; generator writes no pipeline:loop.md", async () => {
   const buildMjs = await import("../../scripts/build.mjs");
-  const { OPERATION_SURFACE, renderClaudeCommand } = buildMjs;
+  const { OPERATION_SURFACE } = buildMjs;
 
   const loopOp = OPERATION_SURFACE.find(
     (op: { name: string; fast?: boolean; inRepoLoop?: boolean }) => op.name === "loop",
@@ -200,79 +208,61 @@ test("namespaced-commands 7.5b4: loop Claude command is long-running, not second
   assert.equal(loopOp.fast, false, "loop must not be classified as the shared fast template (#668)");
   assert.equal(loopOp.inRepoLoop, true, "loop must keep inRepoLoop packaging");
 
-  const claude = renderClaudeCommand(loopOp, "~/.claude/skills/pipeline");
+  const heading = "### 4b. Orchestration pattern for `pipeline loop`";
+  for (const host of ["claude", "codex"] as const) {
+    const skill = readFileSync(join(REPO_ROOT, "hosts", host, "SKILL.md"), "utf8");
+    const sectionStart = skill.indexOf(heading);
+    assert.notEqual(sectionStart, -1, `${host} SKILL must contain the pipeline loop section`);
+    const nextHeading = skill.indexOf("\n### ", sectionStart + heading.length);
+    const driveSection = skill.slice(
+      sectionStart,
+      nextHeading === -1 ? skill.length : nextHeading,
+    );
 
-  // Forbidden fast-path falsehoods (case-insensitive substring match).
-  assert.ok(
-    !/completes in seconds/i.test(claude),
-    `loop Claude command must not claim "completes in seconds": ${claude}`,
-  );
-  assert.ok(
-    !/no background process or monitor needed/i.test(claude),
-    `loop Claude command must not forbid Monitor/background process: ${claude}`,
-  );
-
-  // Positive long-running / event-follow orchestration signals.
-  assert.ok(
-    /long-running/i.test(claude),
-    `loop Claude command should state multi-item drive/resume is long-running: ${claude}`,
-  );
-  assert.ok(
-    /event/i.test(claude) && (/follow/i.test(claude) || /Monitor/i.test(claude)),
-    `loop Claude command should instruct event following / Monitor: ${claude}`,
-  );
-  assert.ok(
-    /run_id/i.test(claude),
-    `loop Claude command should mention run_id handoff: ${claude}`,
-  );
-  // --audit may remain documented as synchronous; must not redefine drive/resume.
-  assert.ok(
-    /--audit/i.test(claude),
-    `loop Claude command should still note --audit as a short/sync mode: ${claude}`,
-  );
-
-  // Generated plugin mirror must match the same classification after build.
-  const pluginLoopPath = join(COMMANDS_DIR, "pipeline:loop.md");
-  let pluginBody: string;
-  try {
-    pluginBody = readFileSync(pluginLoopPath, "utf8");
-  } catch (err) {
-    const e = err as NodeJS.ErrnoException;
-    assert.fail(
-      `plugin/pipeline/commands/pipeline:loop.md missing — run \`node scripts/build.mjs\` (${e.message})`,
+    assert.match(
+      driveSection,
+      /long-running/i,
+      `${host} SKILL must state multi-item drive/resume is long-running`,
+    );
+    assert.doesNotMatch(
+      driveSection,
+      /completes in seconds/i,
+      `${host} pipeline loop section must not use the fast-command completion claim`,
+    );
+    assert.doesNotMatch(
+      driveSection,
+      /No background process or Monitor needed/i,
+      `${host} pipeline loop section must not forbid its required background monitor`,
     );
   }
-  assert.ok(
-    !/completes in seconds/i.test(pluginBody),
-    `plugin pipeline:loop.md must not claim "completes in seconds": ${pluginBody}`,
-  );
-  assert.ok(
-    !/no background process or monitor needed/i.test(pluginBody),
-    `plugin pipeline:loop.md must not forbid Monitor: ${pluginBody}`,
-  );
-  assert.ok(
-    /long-running/i.test(pluginBody) || /event/i.test(pluginBody),
-    `plugin pipeline:loop.md should describe long-running / event-follow orchestration: ${pluginBody}`,
+  assert.equal(
+    existsSync(join(COMMANDS_DIR, "pipeline:loop.md")),
+    false,
+    "scripts/build.mjs must not write plugin/pipeline/commands/pipeline:loop.md",
   );
 });
 
-test("namespaced-commands 7.5b4b: true-fast peers may still use the shared seconds/no-Monitor template", async () => {
+test("namespaced-commands 7.5b4b: true-fast peers may still note seconds; no slash files emitted", async () => {
   const buildMjs = await import("../../scripts/build.mjs");
-  const { OPERATION_SURFACE, renderClaudeCommand } = buildMjs;
+  const { OPERATION_SURFACE } = buildMjs;
+  const skill = readFileSync(join(REPO_ROOT, "hosts", "claude", "SKILL.md"), "utf8");
 
   for (const name of ["status", "doctor"] as const) {
-    const op = OPERATION_SURFACE.find((o: { name: string }) => o.name === name);
+    const op = OPERATION_SURFACE.find((o: { name: string; fast?: boolean }) => o.name === name) as
+      | { name: string; fast?: boolean }
+      | undefined;
     assert.ok(op, `OPERATION_SURFACE is missing \`${name}\``);
-    const body = renderClaudeCommand(op, "~/.claude/skills/pipeline");
-    assert.ok(
-      /completes in seconds/i.test(body),
-      `${name} should still use the shared fast template (seconds): ${body}`,
-    );
-    assert.ok(
-      /no background process or monitor needed/i.test(body),
-      `${name} should still use the shared fast template (no Monitor): ${body}`,
+    assert.equal(op.fast, true, `${name} stays a fast catalog entry`);
+    assert.equal(
+      existsSync(join(COMMANDS_DIR, `pipeline:${name}.md`)),
+      false,
+      `generator must not emit pipeline:${name}.md`,
     );
   }
+  assert.ok(
+    /completes in seconds/i.test(skill),
+    "SKILL or CLI docs MAY still note that true-fast verbs complete in seconds",
+  );
 });
 
 // #699: host loop orchestration must stop run-scoped follows on terminal in the
@@ -461,8 +451,8 @@ test("namespaced-commands 7.5b7: host advance skill re-attach + cancelled-wait-n
       `${skillPath} re-attach path must include logs <run-id> --events --follow (#725)`,
     );
     assert.ok(
-      /summary\s+<run-id>|summary <run-id>/i.test(body),
-      `${skillPath} re-attach path must include summary <run-id> (#725)`,
+      /summary\s+<[^>\n]*run-id[^>\n]*>/i.test(body),
+      `${skillPath} re-attach path must include a summary selector with run-id (#725)`,
     );
 
     // Advance events follow documents until-terminal default on run_complete
@@ -494,19 +484,12 @@ test("namespaced-commands 7.5b7: host advance skill re-attach + cancelled-wait-n
   }
 });
 
-test("namespaced-commands 7.5b6b: LOOP_ORCH_NOTE requires same-turn stop + follows stopped (#699)", async () => {
-  const buildMjs = await import("../../scripts/build.mjs");
-  const { OPERATION_SURFACE, renderClaudeCommand } = buildMjs;
-  const loopOp = OPERATION_SURFACE.find((op: { name: string }) => op.name === "loop");
-  assert.ok(loopOp);
-  const claude = renderClaudeCommand(loopOp, "~/.claude/skills/pipeline");
-  assert.ok(
-    /loop_run_stopped/i.test(claude),
-    `loop command packaging must mention loop_run_stopped: ${claude}`,
-  );
+test("namespaced-commands 7.5b6b: host SKILL loop packaging requires same-turn stop + follows stopped (#699)", () => {
+  const claude = readFileSync(join(REPO_ROOT, "hosts", "claude", "SKILL.md"), "utf8");
+  assert.ok(/loop_run_stopped/i.test(claude), "loop SKILL packaging must mention loop_run_stopped");
   assert.ok(
     /same turn|same-turn|in the same/i.test(claude) || /stop.*follow/i.test(claude),
-    `loop command packaging must instruct stop of follows on terminal: ${claude}`,
+    "loop SKILL packaging must instruct stop of follows on terminal",
   );
 });
 
@@ -549,61 +532,10 @@ test("namespaced-commands 7.5b5: host loop skill ownership is exact PID, not gre
   }
 });
 
-// ---------------------------------------------------------------------------
-// 7.5c  Each command file starts with YAML front-matter referencing its operation name
-// ---------------------------------------------------------------------------
-
-test("namespaced-commands 7.5c: each command file's front-matter slug matches its file name", () => {
-  let files: string[];
-  try {
-    files = readdirSync(COMMANDS_DIR).filter((f) => f.endsWith(".md"));
-  } catch {
-    // Missing dir is already caught by 7.5a; skip this check so error message is clean
-    return;
-  }
-
-  for (const file of files) {
-    const match = /^pipeline:(.+)\.md$/.exec(file);
-    if (!match) continue;
-    const opName = match[1];
-    const content = readFileSync(join(COMMANDS_DIR, file), "utf8");
-    // The generated file should reference the operation name in its Invoke line.
-    // summary uses --summary rather than a positional, so we check the op name appears anywhere.
-    assert.ok(
-      content.includes(opName),
-      `${file}: content should reference the operation name "${opName}"`,
-    );
-  }
-});
-
-// ---------------------------------------------------------------------------
-// 7.5d  Every command file's YAML frontmatter parses without error (#273 review-2)
-// ---------------------------------------------------------------------------
-
-test("namespaced-commands 7.5d: every command file's YAML frontmatter is valid and parseable", () => {
-  let files: string[];
-  try {
-    files = readdirSync(COMMANDS_DIR).filter((f) => f.endsWith(".md"));
-  } catch {
-    // Missing dir caught by 7.5a; skip here to keep error messages clean
-    return;
-  }
-
-  for (const file of files) {
-    const content = readFileSync(join(COMMANDS_DIR, file), "utf8");
-    // Extract the YAML frontmatter block (between the first two `---` lines)
-    const match = /^---\n([\s\S]*?)\n---/m.exec(content);
-    assert.ok(match, `${file}: no YAML frontmatter found`);
-    const frontmatter = match[1];
-    let parsed: unknown;
-    assert.doesNotThrow(() => {
-      parsed = yamlLoad(frontmatter);
-    }, `${file}: frontmatter failed YAML parsing`);
-    assert.ok(
-      parsed !== null && typeof parsed === "object",
-      `${file}: frontmatter parsed to a non-object`,
-    );
-    const fm = parsed as Record<string, unknown>;
-    assert.ok(typeof fm["description"] === "string", `${file}: frontmatter missing 'description' key`);
-  }
+test("namespaced-commands 7.5c: status is a CLI catalog verb, not a required slash file", async () => {
+  const buildMjs = await import("../../scripts/build.mjs");
+  const { OPERATION_SURFACE } = buildMjs;
+  const status = OPERATION_SURFACE.find((op: { name: string }) => op.name === "status");
+  assert.ok(status, "catalog must list status");
+  assert.equal(existsSync(join(COMMANDS_DIR, "pipeline:status.md")), false);
 });

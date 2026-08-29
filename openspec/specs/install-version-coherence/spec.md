@@ -119,7 +119,7 @@ remediation.
 When **no** goal-loop install is discovered, the check SHALL **not** fail. It
 SHALL report status **`skip`** (preferred) or **`warn`**, with detail that an
 external goal-loop skill is optional/legacy and is **not** required for
-`pipeline:loop` / the in-repo durable loop. Absence of goal-loop SHALL NOT cause
+`pipeline loop` / the in-repo durable loop. Absence of goal-loop SHALL NOT cause
 `pipeline doctor` to exit non-zero solely on this check.
 
 #### Scenario: Supported goal-loop install — check passes
@@ -154,7 +154,7 @@ external goal-loop skill is optional/legacy and is **not** required for
 - **THEN** the `loop:contract-coherence` check SHALL have status `"skip"` or `"warn"`
 - **AND** the check SHALL NOT have status `"fail"`
 - **AND** the detail SHALL indicate that external goal-loop is optional/legacy and not
-  required for `pipeline:loop`
+  required for `pipeline loop`
 - **AND** doctor overall exit status SHALL NOT be non-zero solely because of this check
 
 ---
@@ -171,7 +171,7 @@ SHALL NOT modify, overwrite, or migrate the goal-loop install or its runs.
 
 When **no** goal-loop install is discovered, the installer SHALL complete
 successfully with respect to this check (info-level or silent is allowed). The
-installer SHALL NOT claim that `/pipeline:loop` or `$pipeline:loop` is unavailable
+installer SHALL NOT claim that `pipeline loop` is unavailable
 until goal-loop is installed — durable loop is provided in-repo and does not require
 the external skill.
 
@@ -194,7 +194,7 @@ the external skill.
 
 - **WHEN** the installer runs and no goal-loop skill is discoverable
 - **THEN** the installer SHALL NOT treat loop contract coherence as a hard failure
-- **AND** install output SHALL NOT state that `/pipeline:loop` or `$pipeline:loop`
+- **AND** install output SHALL NOT state that `pipeline loop`
   requires or is unavailable without goal-loop
 
 ---
@@ -209,7 +209,7 @@ filesystem, network, or subprocess access. The same check function SHALL be used
 `pipeline doctor` and by the installer so those two surfaces cannot diverge on
 external goal-loop discovery semantics.
 
-`pipeline:loop` run-start preflight SHALL NOT require external goal-loop discovery
+`pipeline loop` run-start preflight SHALL NOT require external goal-loop discovery
 for success; it SHALL use the in-repo durable loop store schema-compatibility check
 (and other in-repo loop preflight checks) instead. Unit tests for
 `loop:contract-coherence` SHALL cover at least: supported install → pass; unsupported

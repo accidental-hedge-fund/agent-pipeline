@@ -39,6 +39,7 @@
 // rather than letting an unverified auth state reach stage invocation.
 
 import {
+  BACKGROUND_JOB_LIFECYCLE_UNSUPPORTED,
   EMPTY_TELEMETRY,
   MAX_ARGV_PROMPT_BYTES,
   buildAdapterDeclaration,
@@ -68,6 +69,8 @@ const CAPABILITIES: AdapterCapabilities = {
   telemetry: "none",
   // argv delivery — finite limit aligned with #492 runCapped (>= MAX_ARG_STRLEN refuses).
   maxPromptBytes: MAX_ARGV_PROMPT_BYTES,
+  // telemetry none; no recorded fixture maps pi events onto job lifecycle (#1299).
+  background_job_lifecycle: BACKGROUND_JOB_LIFECYCLE_UNSUPPORTED,
 };
 
 // `--thinking <level>` documented enum (verified live, design.md decision 4)

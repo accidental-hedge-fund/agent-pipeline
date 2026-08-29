@@ -27,8 +27,7 @@
   "allowed_change_paths": [
     "core/scripts/gh.ts",
     "core/test/gh.test.ts",
-    "plugin/scripts/gh.ts",
-    "plugin/test/gh.test.ts"
+    "plugin/pipeline/skills/pipeline/core/scripts/gh.ts"
   ],
   "grader_refs": [
     {

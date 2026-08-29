@@ -3,25 +3,30 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { resolve } from "node:path";
 import {
   FIXTURE_PREFLIGHT_REASON_PREFIX,
   findDisallowedTestRootTokens,
   formatPreflightFailures,
   preflightReason,
-  publicChecksRequirePluginMirror,
-  allowsPluginMirrorPaths,
+  publicChecksRequireGeneratedPackagingOutputs,
+  allowsGeneratedPackagingOutput,
+  requiredGeneratedPackagingOutputs,
   runDeepExperimentPreflight,
   runDeepFixturePreflight,
   runStaticFixturePreflight,
   type DeepPreflightDeps,
 } from "../scripts/evals/preflight.ts";
-import { validateFixture } from "../scripts/evals/fixture.ts";
+import { loadFixture, validateFixture } from "../scripts/evals/fixture.ts";
 import type { Fixture } from "../scripts/evals/types.ts";
 
 /** Injectable cell-surface fakes for deep preflight unit tests (no real fs). */
 function cellSurfaceFakes(extra: DeepPreflightDeps = {}): DeepPreflightDeps {
   return {
-    staticDeps: { catFile: async () => "commit" },
+    staticDeps: {
+      catFile: async () => "commit",
+      readFileAtCommit: async () => null,
+    },
     createWorktree: async () => {},
     removeWorktree: async () => {},
     bootstrapWorktree: async () => {},
@@ -85,12 +90,34 @@ test("findDisallowedTestRootTokens: flags bare test/ roots, not core/test/", () 
   assert.deepEqual(findDisallowedTestRootTokens("node --test core/test/gh.test.ts"), []);
 });
 
-test("publicChecksRequirePluginMirror / allowsPluginMirrorPaths", () => {
-  assert.equal(publicChecksRequirePluginMirror(["npm run ci"]), true);
-  assert.equal(publicChecksRequirePluginMirror(["echo ok"]), false);
-  assert.equal(allowsPluginMirrorPaths(["core/scripts/gh.ts"]), false);
-  assert.equal(allowsPluginMirrorPaths(["core/scripts/gh.ts", "plugin/scripts/gh.ts"]), true);
-  assert.equal(allowsPluginMirrorPaths(undefined), true);
+test("generated packaging allowance accepts only exact SKILL or catalog outputs", () => {
+  assert.equal(publicChecksRequireGeneratedPackagingOutputs(["npm run ci"]), true);
+  assert.equal(publicChecksRequireGeneratedPackagingOutputs(["echo ok"]), false);
+  assert.equal(allowsGeneratedPackagingOutput(["core/scripts/gh.ts"]), false);
+  assert.equal(allowsGeneratedPackagingOutput(["plugin"]), false);
+  assert.equal(allowsGeneratedPackagingOutput(["plugin/"]), false);
+  assert.equal(
+    allowsGeneratedPackagingOutput(["plugin/pipeline/skills/pipeline/core/scripts/gh.ts"]),
+    false,
+  );
+  assert.equal(
+    allowsGeneratedPackagingOutput(["plugin/pipeline/skills/pipeline/SKILL.md"]),
+    true,
+  );
+  assert.equal(allowsGeneratedPackagingOutput([".claude-plugin/marketplace.json"]), true);
+  assert.equal(allowsGeneratedPackagingOutput(undefined), true);
+  assert.deepEqual(
+    requiredGeneratedPackagingOutputs(
+      ["core/scripts/gh.ts"],
+      "const CORE_ENTRIES = ['scripts'];\nconst coreDst = 'core';\n",
+    ),
+    ["plugin/pipeline/skills/pipeline/core/scripts/gh.ts"],
+  );
+  assert.deepEqual(requiredGeneratedPackagingOutputs(["core/scripts/gh.ts"], null), []);
+  assert.deepEqual(
+    requiredGeneratedPackagingOutputs(["core/scripts/command-registry.ts"], null),
+    ["plugin/pipeline/skills/pipeline/SKILL.md"],
+  );
 });
 
 test("static preflight: missing base_commit object fails naming fixture and SHA", async () => {
@@ -128,10 +155,10 @@ test("static preflight: bare test/ path token fails naming fixture", async () =>
   assert.match(result.failures.find((f) => f.check === "path_token")!.detail, /test\/gh/);
 });
 
-test("static preflight: missing plugin allowance when npm run ci + allowed_change_paths fails", async () => {
+test("static preflight: broad plugin allowance fails when generated packaging checks run", async () => {
   const fixture = makeFixture({
     public_checks: ["npm run ci"],
-    allowed_change_paths: ["core/scripts/gh.ts"],
+    allowed_change_paths: ["core/scripts/gh.ts", "plugin/"],
     grader_refs: [{ grader: "implementation-fix", version: "1" }],
     smoke_only: false,
   });
@@ -139,7 +166,64 @@ test("static preflight: missing plugin allowance when npm run ci + allowed_chang
     catFile: async () => "commit",
   });
   assert.equal(result.ok, false);
-  assert.ok(result.failures.some((f) => f.check === "plugin_allowance"));
+  const allowance = result.failures.find((f) => f.check === "plugin_allowance");
+  assert.ok(allowance);
+  assert.match(allowance!.detail, /broad plugin/);
+  assert.match(allowance!.remediation, /exact generator output path/);
+  assert.match(allowance!.remediation, new RegExp(SHA));
+});
+
+test("static preflight: exact generated SKILL or catalog allowance passes", async () => {
+  for (const generatedPath of [
+    "plugin/pipeline/skills/pipeline/SKILL.md",
+    ".claude-plugin/marketplace.json",
+  ]) {
+    const fixture = makeFixture({
+      public_checks: ["npm run ci"],
+      allowed_change_paths: ["core/scripts/gh.ts", generatedPath],
+      grader_refs: [{ grader: "implementation-fix", version: "1" }],
+      smoke_only: false,
+    });
+    const result = await runStaticFixturePreflight(fixture, {
+      catFile: async () => "commit",
+      readFileAtCommit: async () => null,
+    });
+    assert.equal(result.ok, true, formatPreflightFailures(result.failures));
+  }
+});
+
+test("static preflight: current command-catalog edit requires the exact generated SKILL", async () => {
+  const fixture = makeFixture({
+    public_checks: ["npm run ci"],
+    allowed_change_paths: ["core/scripts/command-registry.ts"],
+    grader_refs: [{ grader: "implementation-fix", version: "1" }],
+    smoke_only: false,
+  });
+  const result = await runStaticFixturePreflight(fixture, {
+    catFile: async () => "commit",
+    readFileAtCommit: async () => null,
+  });
+  assert.equal(result.ok, false);
+  const allowance = result.failures.find((failure) => failure.check === "plugin_allowance");
+  assert.ok(allowance);
+  assert.match(allowance.detail, /plugin\/pipeline\/skills\/pipeline\/SKILL\.md/);
+});
+
+test("static preflight: committed historical fixture allows its exact pinned core mirror", async () => {
+  const fixture = loadFixture(
+    resolve(import.meta.dirname, "../evals/fixtures/fix-graded-null-guard.json"),
+  );
+  const result = await runStaticFixturePreflight(fixture, {
+    catFile: async () => "commit",
+    readFileAtCommit: async () =>
+      "const CORE_ENTRIES = ['scripts'];\nconst coreDst = join(skillDir, 'core');\n",
+  });
+  assert.equal(result.ok, true, formatPreflightFailures(result.failures));
+  assert.ok(
+    fixture.allowed_change_paths?.includes(
+      "plugin/pipeline/skills/pipeline/core/scripts/gh.ts",
+    ),
+  );
 });
 
 test("deep preflight: red public baseline blocks treatments (infra)", async () => {
@@ -147,7 +231,10 @@ test("deep preflight: red public baseline blocks treatments (infra)", async () =
     public_checks: ["npm run ci"],
     grader_refs: [{ grader: "implementation-fix", version: "1" }],
     smoke_only: false,
-    allowed_change_paths: ["core/scripts/gh.ts", "plugin/scripts/gh.ts"],
+    allowed_change_paths: [
+      "core/scripts/gh.ts",
+      "plugin/pipeline/skills/pipeline/SKILL.md",
+    ],
   });
   const result = await runDeepFixturePreflight(
     cfg,

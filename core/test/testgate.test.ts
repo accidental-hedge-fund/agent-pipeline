@@ -919,14 +919,14 @@ test("gate (#384): at-or-under-cap failure output is verbatim (no elision marker
 
 test("gate (regression / #48, CI parity): explicit CI command fails on second step → gate blocks", async () => {
   // Models the #45 scenario: npm test passes locally, but the CI-only step
-  // (build.mjs --check, plugin-mirror sync) would fail on a stale artifact.
+  // (build.mjs --check, generated packaging freshness) would fail on a stale artifact.
   // With test_gate.command: "npm run ci", the gate runs the full CI command and
   // must block even though npm test alone would have passed.
   let seenCommand: ParsedCommand | null = null;
   const out = await runTestGate(cfgWith({ command: "npm run ci", max_attempts: 1 }), 48, "/wt", {
     runTests: async (_cwd, command) => {
       seenCommand = command;
-      return { passed: false, output: "Error: plugin mirror out of sync with core/", durationSec: 1 };
+      return { passed: false, output: "Error: generated SKILL/catalog outputs are stale", durationSec: 1 };
     },
     invoke: async () => okInvoke(),
     ...cleanGitDeps(),
@@ -936,7 +936,7 @@ test("gate (regression / #48, CI parity): explicit CI command fails on second st
   assert.deepEqual(seenCommand, { cmd: "bash", args: ["-c", "set -o pipefail\nnpm run ci"] });
   // Gate blocks: full CI command failed
   assert.equal(out.passed, false);
-  assert.match(out.blockReason ?? "", /plugin mirror/i);
+  assert.match(out.blockReason ?? "", /SKILL\/catalog outputs/i);
 });
 
 test("gate: explicit command override bypasses detection", async () => {

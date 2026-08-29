@@ -160,7 +160,7 @@ The skill packaging path that Grok agents load (first-class `hosts/grok` when in
 #### Scenario: Grok path documents monitor + material filter
 
 - **WHEN** a Grok agent follows installed skill guidance for `/pipeline` or
-  `/pipeline:loop` progress notify
+  `pipeline loop` progress notify
 - **THEN** the guidance SHALL name host `monitor` (or Grok-equivalent) on a
   material-filtered event stream
 - **AND** SHALL NOT state that `PushNotification` is required on Grok

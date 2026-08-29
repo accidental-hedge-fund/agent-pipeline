@@ -3,43 +3,39 @@
 ## Purpose
 TBD - created by archiving change loop-skill-event-orchestration. Update Purpose after archive.
 ## Requirements
-### Requirement: `pipeline:loop` packaging SHALL NOT claim seconds-only runs or forbid Monitor
+### Requirement: `pipeline loop` packaging SHALL NOT claim seconds-only runs or forbid Monitor
 
-Host packaging for multi-item drive and resume of `pipeline:loop` SHALL treat the
-operation as long-running. Generated Claude command docs, the single-source
-operation-surface renderer that produces them, and host skill guidance for drive
-and resume SHALL NOT claim that the command “completes in seconds” and SHALL NOT
-instruct harnesses that “no background process or Monitor is needed.” Read-only
-`--audit` MAY remain documented as a short synchronous mode.
+Host packaging for multi-item drive and resume of `pipeline loop` SHALL treat the
+operation as long-running. Host skill guidance for drive and resume SHALL NOT claim
+that the command “completes in seconds” and SHALL NOT instruct harnesses that “no
+background process or Monitor is needed.” Read-only `--audit` MAY remain documented
+as a short synchronous mode. This requirement SHALL NOT depend on generated Claude
+command docs or on `plugin/pipeline/commands/pipeline:loop.md`.
 
-#### Scenario: Generated loop command omits the fast-path falsehood
+#### Scenario: Host loop guidance omits the fast-path falsehood
 
-- **WHEN** `scripts/build.mjs` renders the Claude command for the `loop` operation
-- **THEN** the rendered body SHALL NOT contain the substring “completes in seconds”
+- **WHEN** the Claude or Codex host SKILL describes `pipeline loop` drive or resume
+- **THEN** that guidance SHALL NOT contain the substring “completes in seconds”
   (case-insensitive)
-- **AND** the rendered body SHALL NOT contain the substring “No background process
-  or Monitor needed” (case-insensitive)
+- **AND** SHALL NOT contain the substring “No background process or Monitor needed”
+  (case-insensitive)
 
 #### Scenario: Plugin command mirror matches the long-running classification
 
-- **WHEN** the generated `plugin/pipeline/commands/pipeline:loop.md` is inspected
-  after a successful build
-- **THEN** it SHALL omit the seconds-only / no-Monitor fast-path phrases
-- **AND** it SHALL state that multi-item drive or resume is long-running or requires
-  event following
+- **WHEN** `scripts/build.mjs` is run
+- **THEN** it SHALL NOT write `plugin/pipeline/commands/pipeline:loop.md`
+- **AND** long-running or event-follow guidance SHALL live on the host SKILL (or CLI docs), not on a slash-command file
 
 #### Scenario: Audit mode stays synchronous
 
-- **WHEN** host or command docs describe `pipeline:loop --audit`
+- **WHEN** host or command docs describe `pipeline loop --audit`
 - **THEN** they MAY document that mode as read-only and seconds-long
 - **AND** they SHALL NOT use that audit guidance as the orchestration rule for
   drive or resume
 
----
-
 ### Requirement: Loop orchestration docs SHALL specify handoff, follow, notify, stop, and summarize
 
-Host skill guidance for `pipeline:loop` drive and resume (Claude and Codex) SHALL specify an ordered harness orchestration protocol:
+Host skill guidance for `pipeline loop` drive and resume (Claude and Codex) SHALL specify an ordered harness orchestration protocol:
 
 1. Resolve state-home and start or resume the loop **non-blocking** (so mid-flight
    follow is possible; the loop CLI has no `--detach` yet).
@@ -62,7 +58,7 @@ Host skill guidance for `pipeline:loop` drive and resume (Claude and Codex) SHAL
    supervisor process exit — **in the same harness turn**, stopping all
    run-scoped loop and advance Monitors/follows for that `run_id` without
    waiting for an operator kill.
-6. Print a final summary (including `pipeline:loop --audit` or the documented
+6. Print a final summary (including `pipeline loop --audit` or the documented
    summary surface) that includes the terminal/stop reason and confirmation that
    follows were stopped.
 
@@ -160,24 +156,24 @@ a valid fallback.
 
 ### Requirement: A drift-guard SHALL fail if the seconds-only / no-Monitor loop guidance returns
 
-The repository’s automated tests (or an install/build check covered by `npm run ci`) SHALL fail if the shared fast-path packaging phrase claiming seconds-only completion and forbidding Monitor is reintroduced for the `loop` operation’s generated Claude command body.
+The repository’s automated tests (or an install/build check covered by `npm run ci`) SHALL fail if host SKILL guidance reintroduces a fast-path claim that `pipeline loop` drive/resume completes in seconds or forbids Monitor, background execution, or event following. This guard SHALL inspect the SKILL/CLI guidance and SHALL NOT depend on `renderClaudeCommand` or a generated per-verb command file.
 
 #### Scenario: Forbidden phrase fails the guard
 
-- **WHEN** `renderClaudeCommand` for the `loop` operation would emit “completes in
-  seconds” or “No background process or Monitor needed”
+- **WHEN** a Claude or Codex host SKILL describes `pipeline loop` drive/resume as
+  completing in seconds or says “No background process or Monitor needed”
 - **THEN** the drift-guard test or check SHALL fail
 
 #### Scenario: True-fast commands remain allowed to use the fast template
 
-- **WHEN** a non-loop operation such as `status` or `doctor` is rendered with the
-  shared fast template
+- **WHEN** CLI or SKILL guidance describes a true-fast operation such as `status` or `doctor`
 - **THEN** the loop drift-guard SHALL NOT fail solely because those operations
-  still use seconds-only guidance
+  use seconds-only guidance
+- **AND** no per-verb command renderer SHALL be required
 
 ### Requirement: Loop orchestration docs SHALL treat pre-merge gate progress as material loop events
 
-Host skill guidance for `pipeline:loop` drive and resume SHALL list the shared
+Host skill guidance for `pipeline loop` drive and resume SHALL list the shared
 loop progress event kind used for pre-merge gate sub-steps (default name
 `loop_item_progress`, or the single shared progress kind name if renamed to
 converge with stage progress) among material loop events that warrant a harness
@@ -230,7 +226,7 @@ while remaining useful for deeper diagnostics.
 
 ### Requirement: Host skill guidance SHALL mandate dual-follow lifecycle after advance linkage
 
-Host skill guidance for `pipeline:loop` drive and resume (Claude and Codex) SHALL
+Host skill guidance for `pipeline loop` drive and resume (Claude and Codex) SHALL
 require that, once advance linkage is published for an item, the harness follows
 both the loop event stream and that item’s advance event stream until a terminal
 condition applies. On a new item’s advance linkage, the guidance SHALL instruct
@@ -341,7 +337,7 @@ engine work, with host skill and living-spec updates together.
 ### Requirement: A drift-guard SHALL fail if post-linkage dual-follow regresses to optional-only wording
 
 Automated tests covered by `npm run ci` SHALL fail if host skill guidance for
-`pipeline:loop` drive/resume reintroduces optional-only advance follow as the
+`pipeline loop` drive/resume reintroduces optional-only advance follow as the
 sole post-linkage instruction (e.g. a §4b.d heading or body that says only
 “Optionally follow active item advance events when published” without mandatory
 dual-follow language after linkage). The guard MAY be a focused substring or
@@ -364,7 +360,7 @@ update the guard in the same change.
 
 ### Requirement: Host loop orchestration SHALL stop all run-scoped follows on terminal in the same turn
 
-Host skill guidance for `pipeline:loop` drive and resume (Claude and Codex) SHALL
+Host skill guidance for `pipeline loop` drive and resume (Claude and Codex) SHALL
 require that when a material `loop_run_stopped` event is observed for the followed
 loop `run_id`, **or** when the supervisor process for that run exits, the harness
 SHALL stop **all** loop event Monitors/follows and **all** advance event
@@ -422,7 +418,7 @@ example, printing `TERMINAL` inside `while true` and continuing without exit).
 
 Final loop summary SHALL report terminal reason and that follows stopped.
 Host skill guidance for the final operator summary after a completed or stopped
-`pipeline:loop` drive/resume SHALL require that the summary include (1) the run’s
+`pipeline loop` drive/resume SHALL require that the summary include (1) the run’s
 terminal reason (or equivalent stop reason from the terminal event / result JSON)
 and (2) an explicit confirmation that run-scoped follows were stopped (e.g.
 “follows stopped”).
@@ -463,7 +459,7 @@ default.
 
 ### Requirement: Loop skill packaging SHALL include Grok in host-notify and dual-follow guidance surfaces
 
-Host skill guidance for `pipeline:loop` drive and resume SHALL cover every
+Host skill guidance for `pipeline loop` drive and resume SHALL cover every
 operator host that installs pipeline skill packaging for long-running loop
 orchestration, including Claude, Codex, and the Grok-consumed path (first-class
 `hosts/grok` when present, or the documented Grok substitute). Dual-follow,
@@ -513,4 +509,3 @@ material-progress mapping or portable fallback.
 - **THEN** it SHALL use the outer host's declared material-progress notify mapping or fallback
 - **AND** SHALL NOT hard-require a single host's notify tool in shared loop prose consumed by
   other hosts
-

@@ -238,6 +238,13 @@ export const PORCELAIN_DIRT_SITES: readonly PorcelainDirtSiteEntry[] = [
       "Candidate-engine identity: git status --porcelain must be empty at the bound SHA. Not a product-vs-scratch setBlocked gate (#1151)",
   },
   {
+    site_id: "ship-end-candidate",
+    module: "scripts/ship-end-candidate.ts",
+    disposition: "not-porcelain-dirt-gate",
+    notes:
+      "Candidate-engine identity default deps: git status --porcelain must be empty at the bound SHA. Not a product-vs-scratch setBlocked gate (#1151 / #1298)",
+  },
+  {
     site_id: "stages.sweep",
     module: "scripts/stages/sweep.ts",
     disposition: "not-porcelain-dirt-gate",

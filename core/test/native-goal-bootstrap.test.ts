@@ -64,30 +64,32 @@ function assertNonClaims(section, label) {
   );
 }
 
-test("Claude host doc documents /goal then /pipeline:loop bootstrap", () => {
+test("Claude host doc documents /goal then pipeline loop bootstrap", () => {
   const source = fs.readFileSync(CLAUDE_DOC_PATH, "utf8");
   const section = bootstrapSection(source, "claude");
-  assertOrderedBootstrap(section, "/pipeline:loop", "claude");
+  assertOrderedBootstrap(section, "pipeline loop", "claude");
   assertNonClaims(section, "claude");
 });
 
-test("Codex host doc documents /goal then $pipeline:loop bootstrap", () => {
+test("Codex host doc documents /goal then pipeline loop bootstrap", () => {
   const source = fs.readFileSync(CODEX_DOC_PATH, "utf8");
   const section = bootstrapSection(source, "codex");
-  assertOrderedBootstrap(section, "$pipeline:loop", "codex");
+  assertOrderedBootstrap(section, "pipeline loop", "codex");
   assertNonClaims(section, "codex");
 });
 
-test("host bootstrap sections stay symmetric and use only their own command token", () => {
+test("host bootstrap sections stay symmetric and omit removed per-verb tokens", () => {
   const claudeSection = bootstrapSection(fs.readFileSync(CLAUDE_DOC_PATH, "utf8"), "claude");
   const codexSection = bootstrapSection(fs.readFileSync(CODEX_DOC_PATH, "utf8"), "codex");
 
-  assert.ok(
-    !claudeSection.includes("$pipeline:loop"),
-    "claude bootstrap section must not reference Codex's $pipeline:loop token",
-  );
-  assert.ok(
-    !codexSection.includes("/pipeline:loop"),
-    "codex bootstrap section must not reference Claude's /pipeline:loop token",
-  );
+  for (const [host, section] of [
+    ["claude", claudeSection],
+    ["codex", codexSection],
+  ]) {
+    assert.doesNotMatch(
+      section,
+      /(?:\/|\$)pipeline:loop/,
+      `${host}: bootstrap must use the direct pipeline loop CLI, not a removed per-verb token`,
+    );
+  }
 });

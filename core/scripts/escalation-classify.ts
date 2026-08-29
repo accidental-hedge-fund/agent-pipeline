@@ -3,7 +3,7 @@
 // Derive pipeline/stage-diagnostic@1 reason codes from structured HarnessResult
 // flags and gh error shapes — never free-form prose as the primary signal.
 
-import { isTransientGhError } from "./gh.ts";
+import { isPrDiffTooLargeError, isTransientGhError } from "./gh.ts";
 import type { HarnessResult } from "./harness.ts";
 import {
   isClaudeModelEntitlementFailure,
@@ -21,6 +21,7 @@ import type { BlockerKind } from "./types.ts";
 /** Structured harness classification input (subset of HarnessResult flags). */
 export interface HarnessFailureSignals {
   timed_out?: boolean;
+  background_wait?: boolean;
   spawn_error?: boolean;
   capture_error?: boolean;
   oversize_argv?: boolean;
@@ -45,6 +46,7 @@ export function classifyHarnessFailure(
     HarnessResult,
     "timed_out" | "spawn_error" | "capture_error" | "code"
   > & {
+    background_wait?: boolean;
     oversize_argv?: boolean;
     stdin_error?: boolean;
     throttled?: boolean;
@@ -65,6 +67,7 @@ export function classifyHarnessFailure(
     return "model-entitlement-required";
   }
   if (result.throttled) return "transient-infra";
+  if ((result as HarnessFailureSignals).background_wait) return "harness-background-wait";
   if (result.timed_out) return "harness-timeout";
   if (result.oversize_argv || result.stdin_error || result.capture_error) {
     return "harness-contract";
@@ -135,6 +138,16 @@ export function classifyGhError(stderr: string): {
     return { class: "transient-infra", reason_code: "transient-infra", transient: true };
   }
 
+  // Combined PR diff cap: GitHub 406 too_large. Engine-owned — getPrDiff falls
+  // back to the list-files API. Must not project as workflow-state / needs-human.
+  if (isPrDiffTooLargeError(stderr)) {
+    return {
+      class: "deterministic-client",
+      reason_code: "workflow-engine-defect",
+      transient: false,
+    };
+  }
+
   // Deterministic client errors
   if (
     s.includes("http 422") ||
@@ -197,6 +210,7 @@ export function interventionKindFromReason(
     case "model-entitlement-required":
       return "auth-tooling-preflight-failure";
     case "harness-timeout":
+    case "harness-background-wait":
     case "harness-contract":
     case "workflow-engine-defect":
       return "reviewer-unavailable";
@@ -248,6 +262,7 @@ export function isMechanicalInfrastructureReason(reasonCode: StageDiagnosticReas
   return (
     reasonCode === "transient-infra" ||
     reasonCode === "harness-timeout" ||
+    reasonCode === "harness-background-wait" ||
     reasonCode === "harness-contract" ||
     reasonCode === "external-wait" ||
     reasonCode === "repair-budget-exhausted" ||

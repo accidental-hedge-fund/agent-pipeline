@@ -21,10 +21,10 @@
       "skillTree": true,
       "commandsGlob": "pipeline:*.md",
       "commandsDirRelative": ["commands"],
-      "commandsKind": "claude-slash"
+      "commandsKind": "none"
     },
     "userOwnedExclusion": "Only managed pipeline artifacts are removed on uninstall: the installer-managed skill tree (when marked) and commands matching pipeline:*.md. Unrelated user command files and non-pipeline skill content are preserved.",
-    "postInstall": "Invoke with /pipeline. Live-detected this session (no restart).",
+    "postInstall": "Exec pipeline <verb> from the installed CLI. Live-detected this session (no restart).",
     "installOrder": 10
   },
   "invocation": {

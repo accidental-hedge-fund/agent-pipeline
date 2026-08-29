@@ -527,7 +527,15 @@ test("getPrDiff: HTTP 406 falls back to files-list composed diff (#1223)", async
         stdout: JSON.stringify([
           [
             { filename: "src/a.ts", status: "modified", sha: "aaa", additions: 1, deletions: 1, changes: 2, patch },
-            { filename: "bin/empty.dat", status: "modified", sha: "bbb", additions: 0, deletions: 0, changes: 0 },
+            {
+              filename: "bin/empty.dat",
+              previous_filename: "bin/old-empty.dat",
+              status: "renamed",
+              sha: "bbb",
+              additions: 0,
+              deletions: 0,
+              changes: 0,
+            },
           ],
         ]),
       };
@@ -537,7 +545,7 @@ test("getPrDiff: HTTP 406 falls back to files-list composed diff (#1223)", async
 
   const result = await getPrDiff(cfg, 1222, { runner, retries: 1 });
   assert.match(result, /^diff --git a\/src\/a\.ts b\/src\/a\.ts/m);
-  assert.match(result, /^diff --git a\/bin\/empty\.dat b\/bin\/empty\.dat/m);
+  assert.match(result, /^diff --git a\/bin\/old-empty\.dat b\/bin\/empty\.dat/m);
   assert.ok(result.includes(patch.trim()), "supplied patch text must appear under its header");
   assert.equal(calls.filter(isPrDiffArgs).length, 1, "pr diff must run once (406 is not retried)");
   const filesCall = calls.find(isFilesListArgs);
@@ -590,7 +598,7 @@ test("getPrDiff: SHA fragment 406 is not too-large and does not hit files API (#
   assert.equal(calls.filter(isFilesListArgs).length, 0);
 });
 
-test("getPrDiff: patch-less binary/zero-change file still emits a path header (#1223)", async () => {
+test("getPrDiff: patch-less zero-line modified file fails closed without mode metadata (#1223)", async () => {
   const cfg = { repo: "acme/widget" } as PipelineConfig;
   const runner = async (args: string[]) => {
     if (isPrDiffArgs(args)) throwGh(LIVE_PR_DIFF_TOO_LARGE_STDERR);
@@ -604,9 +612,10 @@ test("getPrDiff: patch-less binary/zero-change file still emits a path header (#
     }
     throw new Error(`unexpected gh args: ${args.join(" ")}`);
   };
-  const result = await getPrDiff(cfg, 8, { runner, retries: 1 });
-  assert.match(result, /^diff --git a\/bin\/app\.bin b\/bin\/app\.bin/m);
-  assert.deepEqual(diffFilePaths(result), ["bin/app.bin"]);
+  await assert.rejects(
+    () => getPrDiff(cfg, 8, { runner, retries: 1 }),
+    /PR #8 path bin\/app\.bin may be a file-mode change/,
+  );
 });
 
 test("getPrDiff: omitted removed text is materialized from the git blob (#1223)", async () => {

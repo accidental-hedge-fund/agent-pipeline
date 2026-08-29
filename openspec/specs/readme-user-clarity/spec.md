@@ -2,19 +2,24 @@
 
 ## Purpose
 TBD - created by archiving change readme-user-clarity. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: README opens with a purpose-first summary
-The README SHALL communicate — within the first visible screenful, before any configuration detail or repository layout — what the tool does, who it is for, the cross-harness model (both Claude Code and Codex are required), and the core prerequisites (Node ≥ 24, git, gh, both CLIs authenticated).
+
+The README SHALL communicate — within the first visible screenful, before any configuration detail or repository layout — what the tool does, who it is for, the implementer/reviewer pair declared in `.github/pipeline.yml`, and the core prerequisites (Node ≥ 24, git, gh, and the configured harness CLIs authenticated). It SHALL NOT state that both the Claude CLI and the Codex CLI are required as the product, regardless of which host is installed. Deeper harness-pair documentation remains issue #976.
 
 #### Scenario: First screenful is informative
+
 - **WHEN** a developer opens the README cold on GitHub
-- **THEN** the first screen SHALL contain the tool's purpose, the two-host model, and the prerequisite summary before any configuration block or repository layout
+- **THEN** the first screen SHALL contain the tool's purpose, the implementer/reviewer pair model, and the prerequisite summary before any configuration block or repository layout
+- **AND** it SHALL NOT say both Claude and Codex CLIs are required as the product
 
 #### Scenario: Cross-harness prerequisite is visible before install
-- **WHEN** a reader reaches the install section
-- **THEN** the requirement for both `claude` and `codex` CLIs SHALL have been stated earlier in the document, not only inside install sub-sections
 
----
+- **WHEN** a reader reaches the install section
+- **THEN** the implementer/reviewer pair from repository config SHALL have been stated earlier in the document, not only inside install sub-sections
+- **AND** that earlier text SHALL NOT require both `claude` and `codex` CLIs as the product
 
 ### Requirement: README contains a quickstart section
 The README SHALL include a dedicated quickstart (or "Getting Started") section that provides one clearly recommended install path and a minimal first-run example that takes a reader from install to advancing a single issue — without requiring the reader to parse optional or advanced sections first.
@@ -124,17 +129,17 @@ is on a later major/minor line.
 ### Requirement: README SHALL describe durable loop without requiring external goal-loop
 
 README SHALL describe durable multi-item loop without requiring external
-goal-loop. Text about `pipeline:loop` / durable multi-item runs and about the
+goal-loop. Text about `pipeline loop` / durable multi-item runs and about the
 doctor check `loop:contract-coherence` SHALL match in-repo loop reality: durable
 loop does not require an externally installed goal-loop skill. The README SHALL
-NOT state that goal-loop must be installed for `/pipeline:loop` or
-`$pipeline:loop` to work. Where `loop:contract-coherence` is documented, absence
+NOT state that goal-loop must be installed for `pipeline loop` to work. Where
+`loop:contract-coherence` is documented, absence
 of goal-loop SHALL be described as non-failing (skip/warn/optional), not as a
 hard doctor failure or install blocker.
 
 #### Scenario: Loop section does not require goal-loop
 
-- **WHEN** a reader reads the durable multi-item / `pipeline:loop` section
+- **WHEN** a reader reads the durable multi-item / `pipeline loop` section
 - **THEN** the section SHALL NOT require installing goal-loop as a prerequisite
   for loop
 - **AND** it SHALL be consistent with the in-repo durable loop supervisor
@@ -143,7 +148,7 @@ hard doctor failure or install blocker.
 
 - **WHEN** the README documents the `loop:contract-coherence` doctor check
 - **THEN** it SHALL NOT claim the check fails solely because goal-loop is absent
-- **AND** it SHALL NOT claim `pipeline:loop` itself requires that check to pass
+- **AND** it SHALL NOT claim `pipeline loop` itself requires that check to pass
   via an external goal-loop install
 
 ### Requirement: README SHALL document the Grok Build skill path
@@ -195,4 +200,3 @@ exists) so the Grok path is not left dangling or stale.
 - **THEN** the README SHALL state the follow-up step to refresh the Grok path
 - **AND** the step SHALL be runnable from documented commands without reading
   installer source
-

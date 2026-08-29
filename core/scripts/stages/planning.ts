@@ -1348,6 +1348,39 @@ export async function runPlanningPhases(
       }
 
       if (!result.success) {
+        if (result.background_wait) {
+          const waitReason = result.lifecycle_evidence
+            ? `missed delivery or foreground-join for job ${result.lifecycle_evidence.job_id}`
+            : "harness-background-wait";
+          const salvageNote = ctx.salvageFailureReason
+            ? ` Salvage of uncommitted work also failed: ${ctx.salvageFailureReason}`
+            : ctx.salvaged
+              ? " Uncommitted work was salvaged; the stage outcome remains harness-background-wait."
+              : "";
+          const blockMsg =
+            `Implementation harness (${primary}) failed: ${waitReason}.${salvageNote}`;
+          const diagnostic = buildStageDiagnostic({
+            reasonCode: classifyHarnessFailure({
+              background_wait: true,
+              timed_out: false,
+              spawn_error: result.spawn_error,
+              capture_error: result.capture_error,
+              oversize_argv: result.oversize_argv,
+              stdin_error: result.stdin_error,
+              throttled: result.throttled ?? undefined,
+              exit_code: result.exit_code,
+              stdout: result.stdout,
+              stderr: result.stderr,
+              success: result.success,
+            }),
+            blockerKind: "harness-failure",
+            reason: blockMsg,
+            stage: "implementing",
+          });
+          await doSetBlocked(cfg, issueNumber, blockMsg, "implementing", "harness-failure");
+          await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
+          return blockedOutcome(waitReason, "harness-failure", diagnostic);
+        }
         const reason = result.timed_out
           ? `timed out after ${result.duration.toFixed(0)}s`
           : `exit ${result.exit_code}`;
@@ -2883,6 +2916,8 @@ export async function invokeImplementer(
     model,
     reasoningEffort: cfg.effort?.implementing,
     sandbox: cfg.harness_sandbox,
+    role: "implementer",
+    stageKind: "implement",
     accounting: accounting
       ? accountingForInvoke(opts, accounting.issue, accounting.stage, "implementing", model)
       : undefined,
@@ -2948,6 +2983,8 @@ export async function invokePlanStep(
     model,
     reasoningEffort: cfg.effort?.planning,
     sandbox: cfg.harness_sandbox,
+    role: "implementer",
+    stageKind: "planning",
     accounting: accounting
       ? accountingForInvoke(opts, accounting.issue, accounting.stage, "planning", model)
       : undefined,

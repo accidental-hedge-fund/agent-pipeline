@@ -1,12 +1,13 @@
 # Concepts & advanced topics
 
-Hand-authored companion to the lean [README](../README.md). For the full **CLI inventory** see [cli.md](cli.md); for **config keys** see [config.md](config.md). This page does not re-list every command or config field.
+Hand-authored companion to the lean [README](../README.md). For the **packaging contract** (CLI is the product; hosts are shims) see [packaging.md](packaging.md). For the full **CLI inventory** see [cli.md](cli.md); for **config keys** see [config.md](config.md). This page does not re-list every command or config field.
 
 A newcomer who completed Prerequisites, Install, and Quickstart in the README has a working setup **without** reading this page. Sections below are optional or advanced unless noted.
 
 ## Contents
 
-- [How the two hosts share one core](#how-the-two-hosts-share-one-core)
+- [Packaging contract](packaging.md)
+- [How hosts share one CLI](#how-hosts-share-one-cli)
 - [Onboarding details](#onboarding-details)
 - [Test/build gate](#testbuild-gate-optional-default-on)
 - [Configurable steps (optional)](#configurable-steps-optional)
@@ -30,13 +31,13 @@ A newcomer who completed Prerequisites, Install, and Quickstart in the README ha
 - [Desktop / editor integration](#desktop--editor-integration)
 - [Repository layout](#repository-layout)
 
-## How the two hosts share one core
+## How hosts share one CLI
 
-Claude Code (`/pipeline`) and Codex (`$pipeline`) share one TypeScript engine under `core/`. Host-specific packaging lives in `hosts/claude` and `hosts/codex`; the Claude host also feeds the generated `plugin/` marketplace mirror. Dispatch, stages, review policy, and merge posture are identical across hosts — only the invocation token and install profile (who implements vs who reviews by default) differ.
+Hosts (Claude Code `/pipeline`, Codex `$pipeline`, and others) are shims around one TypeScript engine under `core/`. Host-specific packaging lives in `hosts/`. Dispatch, stages, review policy, and merge posture are identical across hosts — only the root invocation token and install profile differ. The product is the `pipeline` CLI; see [packaging.md](packaging.md). The transitional `plugin/` tree contains only the generated SKILL overlay until #1050; its companion catalog is `.claude-plugin/marketplace.json`. Neither is the distribution product or a copy of `core/`.
 
 ## Onboarding details
 
-`pipeline init` / `/pipeline:init`:
+`pipeline init`:
 
 - Creates the standard `pipeline:*` labels if missing
 - Scaffolds `.github/pipeline.yml` with documented defaults
@@ -50,7 +51,7 @@ After `init`, commit the config, label an issue `pipeline:ready`, and run `/pipe
 
 Before opening a PR, the pipeline can run the repo's own tests/build (`test_gate` in `.github/pipeline.yml`). Default **enabled**. On failure it routes to a bounded fix loop (`max_attempts`), then blocks with evidence. Set `test_gate.enabled: false` to disable. See [config.md](config.md) for keys.
 
-The repo's own `test_gate.command` is typically `npm run ci`, which includes core tests, the `plugin/` mirror check, install-smoke, OpenSpec validation when present, **conditional docs freshness** (`ci:docs`), and scripts tests.
+The repo's own `test_gate.command` is typically `npm run ci`, which includes core tests, generated SKILL/catalog freshness, install-smoke, OpenSpec validation when present, **conditional docs freshness** (`ci:docs`), and scripts tests.
 
 ## Git push authentication (`git.push_auth`)
 
@@ -261,7 +262,7 @@ Stage prompts embed an excerpt of the target repo's conventions file (`CLAUDE.md
 
 After a squash merge GitHub deletes the head branch and pre-merge SHAs are not reachable from the base. That is **squash-merge unreachability**, not a git/network/auth failure. With bound proof, park-release removes the clean worktree and does not tell the operator to check connectivity or retry. Without bound proof, the worktree is retained with the existing not-reachable / `--force` wording (`pipeline remove-worktree <n> --force` when the operator takes that responsibility).
 
-A true `ls-remote` transport or auth failure may still report git/network/auth. Dirty trees and filesystem cleanup failures retain **that** worktree, name the real cause, and do **not** change `pipeline:ready-to-deploy` or integrated state. `/pipeline:cleanup` only sweeps merged-PR worktrees and is **not** the required fix after a proven merge.
+A true `ls-remote` transport or auth failure may still report git/network/auth. Dirty trees and filesystem cleanup failures retain **that** worktree, name the real cause, and do **not** change `pipeline:ready-to-deploy` or integrated state. `pipeline cleanup` only sweeps merged-PR worktrees and is **not** the required fix after a proven merge.
 
 `max_concurrent_worktrees` counts on-disk managed worktrees for open issues that are not `pipeline:ready-to-deploy`. Park-released trees drop out of that count.
 
@@ -270,15 +271,15 @@ A true `ls-remote` transport or auth failure may still report git/network/auth. 
 ### Pipeline is blocked
 
 ```text
-/pipeline:status N
-/pipeline:doctor
+pipeline status N
+pipeline doctor
 ```
 
-Common outcomes: missing reviewer CLI (same-harness fallback or block), CI red, merge conflicts, review ceiling → `needs-human`, OpenSpec invalid. Use `/pipeline:unblock` or `/pipeline:override` as appropriate, or fix and re-label.
+Common outcomes: missing reviewer CLI (same-harness fallback or block), CI red, merge conflicts, review ceiling → `needs-human`, OpenSpec invalid. Use `pipeline unblock` or `pipeline override` as appropriate, or fix and re-label.
 
 ### Evidence bundle
 
-Each run writes a local evidence bundle under `.agent-pipeline/runs/`. `pipeline summary <run-id>` (or issue-scoped summary) prints it offline.
+Each run writes a local evidence bundle under `.agent-pipeline/runs/`. `pipeline summary <issue-number|run-id>` prints the latest issue bundle or one exact run offline.
 
 ### External event sink (optional)
 
@@ -304,10 +305,10 @@ Machine-facing helpers (no change to human skill flows):
 | `core/scripts/` | Engine (TypeScript, native type-stripping) |
 | `core/test/` | Unit tests |
 | `hosts/` | Per-host packaging (`claude`, `codex`, …) |
-| `plugin/` | Generated mirror of `core/` + Claude host — do not hand-edit |
-| `scripts/build.mjs` | Generate/check the plugin mirror |
+| `plugin/` | Generated SKILL overlay — transitional until #1050; not the product; do not hand-edit |
+| `scripts/build.mjs` | Generate/check the SKILL overlay and marketplace catalog |
 | `scripts/generate-docs.mjs` | Generate/check CLI, config, CHANGELOG, SKILL command tables |
-| `docs/` | Operator docs (`cli.md`, `config.md`, `concepts.md`) |
+| `docs/` | Operator docs (`packaging.md`, `cli.md`, `config.md`, `concepts.md`) |
 | `openspec/` | Living specs + in-flight changes |
 | `ROADMAP.md` | Human-readable forward plan (milestones own release plan membership) |
 | `CHANGELOG.md` | Generated release history |
@@ -322,7 +323,7 @@ node scripts/generate-docs.mjs
 npm run docs:generate
 ```
 
-`npm run docs:check` / `node scripts/generate-docs.mjs --check` fails when committed artifacts are stale (same idea as `build.mjs --check` for `plugin/`).
+`npm run docs:check` / `node scripts/generate-docs.mjs --check` fails when committed artifacts are stale (the same freshness contract `build.mjs --check` applies to its generated SKILL/catalog outputs).
 
 **Release / tags:** `CHANGELOG.md` is derived from annotated `vX.Y.Z` tags.
 After a release merge, ship-end `pipeline release ensure-tag` creates and

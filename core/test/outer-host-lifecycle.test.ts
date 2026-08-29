@@ -130,7 +130,8 @@ test("golden: built-in install modes and lifecycle support match pre-change beha
 
   const claude = resolveOuterHost("claude")!;
   assert.equal(claude.install.mode, "tree");
-  assert.equal(claude.install.managedArtifacts.commandsKind, "claude-slash");
+  assert.equal(claude.install.managedArtifacts.commandsKind, "none");
+  assert.equal(claude.install.managedArtifacts.commandsGlob, "pipeline:*.md");
   assert.equal(claude.profileDefault, "claude");
   assert.equal(claude.material_progress_notify.mapping.surface, "claude_monitor_push");
   assert.ok(claude.material_progress_notify.mapping.tools.includes("PushNotification"));
@@ -143,7 +144,7 @@ test("golden: built-in install modes and lifecycle support match pre-change beha
 
   const codex = resolveOuterHost("codex")!;
   assert.equal(codex.install.mode, "tree");
-  assert.equal(codex.install.managedArtifacts.commandsKind, "codex-prompt");
+  assert.equal(codex.install.managedArtifacts.commandsKind, "none");
   assert.equal(codex.material_progress_notify.mapping.surface, "codex_chat_status");
   assert.ok(!codex.material_progress_notify.mapping.tools.includes("PushNotification"));
 

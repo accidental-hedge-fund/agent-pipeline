@@ -14,6 +14,10 @@ flag existence in CLI help alone does not justify declaring
 | pi | _(none)_ | — | disposition: telemetry none (no verified fixture) |
 | opencode | _(none)_ | — | disposition: telemetry none (no verified fixture) |
 
+Background-job lifecycle protocol fixtures live in
+`background-job-lifecycle/` (#1299). Transcript wording is not lifecycle
+proof; historical Claude `#547` and lyric-utils `#268` stay unsupported.
+
 Production invoke uses the same `parseTelemetry` functions as evals (#653).
 Engine/discovery SHA stamping is out of scope (#763).
 

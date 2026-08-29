@@ -9,6 +9,7 @@ import {
   type DocumentedCommand,
 } from "./command-docs.ts";
 import { COMMAND_REGISTRY } from "./command-registry.ts";
+import type { OperationSurfaceEntry } from "./operation-surface.ts";
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -55,21 +56,26 @@ export function replaceMarkedRegion(
 export interface RenderCliOptions {
   registry?: Record<string, unknown>;
   docs?: Record<string, CommandDoc>;
+  operationSurface?: readonly OperationSurfaceEntry[];
   /** Display token in the intro (e.g. `pipeline` for the CLI binary form). */
   displayToken?: string;
 }
 
 /** Emit docs/cli.md from the registry + documentation metadata. */
 export function renderCliMarkdown(opts: RenderCliOptions = {}): string {
-  const commands = listDocumentedCommands(opts.registry ?? COMMAND_REGISTRY, opts.docs);
+  const commands = listDocumentedCommands(
+    opts.registry ?? COMMAND_REGISTRY,
+    opts.docs,
+    opts.operationSurface,
+  );
   const display = opts.displayToken ?? "pipeline";
   const lines: string[] = [
     "# CLI reference",
     "",
     GENERATED_BANNER,
     "",
-    "This page is generated from `COMMAND_REGISTRY` and co-located documentation",
-    "metadata (`core/scripts/command-docs.ts`). Do not hand-edit the command inventory.",
+    "This page is generated from `COMMAND_REGISTRY`, `OPERATION_SURFACE`, and",
+    "co-located metadata in `core/scripts/command-docs.ts`. Do not hand-edit the command inventory.",
     "",
     "Host skills use the same inventory with host-specific invocation tokens:",
     "`/pipeline` (Claude Code) and `$pipeline` (Codex). The Node CLI is `pipeline`.",
@@ -134,6 +140,7 @@ export interface RenderSkillTableOptions {
   hostToken: string;
   registry?: Record<string, unknown>;
   docs?: Record<string, CommandDoc>;
+  operationSurface?: readonly OperationSurfaceEntry[];
 }
 
 /**
@@ -141,7 +148,11 @@ export interface RenderSkillTableOptions {
  * Hosts differ only by invocation token.
  */
 export function renderSkillCommandTable(opts: RenderSkillTableOptions): string {
-  const commands = listDocumentedCommands(opts.registry ?? COMMAND_REGISTRY, opts.docs);
+  const commands = listDocumentedCommands(
+    opts.registry ?? COMMAND_REGISTRY,
+    opts.docs,
+    opts.operationSurface,
+  );
   const token = opts.hostToken.trim();
   const pad = 48;
   const lines: string[] = [
@@ -423,11 +434,14 @@ export type GeneratedArtifact = {
 export interface BuildArtifactsInput {
   skillClaude?: string;
   skillCodex?: string;
+  skillOmp?: string;
+  skillOpencode?: string;
   configSchema: JsonSchemaNode;
   configDefaults?: Record<string, unknown>;
   changelogReleases: ChangelogRelease[];
   registry?: Record<string, unknown>;
   docs?: Record<string, CommandDoc>;
+  operationSurface?: readonly OperationSurfaceEntry[];
 }
 
 /**
@@ -441,6 +455,7 @@ export function buildGeneratedArtifacts(input: BuildArtifactsInput): GeneratedAr
       content: renderCliMarkdown({
         registry: input.registry,
         docs: input.docs,
+        operationSurface: input.operationSurface,
       }),
     },
     {
@@ -456,24 +471,21 @@ export function buildGeneratedArtifacts(input: BuildArtifactsInput): GeneratedAr
     },
   ];
 
-  if (input.skillClaude !== undefined) {
+  const hostSkills = [
+    { relPath: "hosts/claude/SKILL.md", source: input.skillClaude, token: "/pipeline" },
+    { relPath: "hosts/codex/SKILL.md", source: input.skillCodex, token: "$pipeline" },
+    { relPath: "hosts/omp/SKILL.md", source: input.skillOmp, token: "/pipeline" },
+    { relPath: "hosts/opencode/SKILL.md", source: input.skillOpencode, token: "/pipeline" },
+  ];
+  for (const host of hostSkills) {
+    if (host.source === undefined) continue;
     artifacts.push({
-      relPath: "hosts/claude/SKILL.md",
+      relPath: host.relPath,
       content: normalizeTrailingNewline(
-        applySkillCommandTable(input.skillClaude, "/pipeline", {
+        applySkillCommandTable(host.source, host.token, {
           registry: input.registry,
           docs: input.docs,
-        }),
-      ),
-    });
-  }
-  if (input.skillCodex !== undefined) {
-    artifacts.push({
-      relPath: "hosts/codex/SKILL.md",
-      content: normalizeTrailingNewline(
-        applySkillCommandTable(input.skillCodex, "$pipeline", {
-          registry: input.registry,
-          docs: input.docs,
+          operationSurface: input.operationSurface,
         }),
       ),
     });

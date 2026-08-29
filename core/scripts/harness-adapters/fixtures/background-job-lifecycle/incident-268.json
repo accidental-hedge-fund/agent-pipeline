@@ -1,0 +1,17 @@
+{
+  "adapter": "claude",
+  "provenance": "lyric-utils#268 implementing hang (agent-pipeline v1.39.13, two caps 2405s/3605s)",
+  "raw_protocol": "claude --print --output-format stream-json",
+  "observed_event_types": [
+    "system",
+    "stream_event",
+    "result"
+  ],
+  "transcript_excerpt": "Let's check on the background test run.",
+  "proves_job_identity": false,
+  "proves_start": false,
+  "proves_complete_or_fail": false,
+  "proves_notification_delivery": false,
+  "proves_foreground_join": false,
+  "background_job_lifecycle": { "supported": false }
+}

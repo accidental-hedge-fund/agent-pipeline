@@ -284,7 +284,7 @@ function checksRegressed(bound: LoopExternalIdentity | null, identity: LoopExter
  *     heal will not restore this to `in_progress`)
  *
  *  Checks conclusion never influences this target. */
-function verifiedForwardTarget(identity: LoopExternalIdentity): LoopItemState | null {
+export function verifiedForwardTarget(identity: LoopExternalIdentity): LoopItemState | null {
   if (identity.pr_state === "merged") return "merged";
   if (identity.pr_number !== null && identity.pr_state === "open") {
     if (identity.ready_label_present) return "ready";
@@ -569,6 +569,68 @@ export async function reconcile(
     });
   }
   return reconciliation;
+}
+
+/**
+ * Resume-only terminal catch-up for a `recovery_exhausted` stop (#1297).
+ * Repair-forwards ledger-behind items whose verified identity is `ready` or
+ * `merged`. Keeps `ledger.stop` as historical evidence. Does not dispatch,
+ * mutate GitHub, reopen recovery budget, or run the stranded `pr_opened`
+ * heal. Default {@link reconcile} still throws when `ledger.stop` is set.
+ */
+export async function resumeRecoveryExhaustedTerminalCatchUp(
+  deps: LoopStoreDeps,
+  observeDeps: ReconcileObserveDeps,
+  input: ReconcileInput,
+): Promise<void> {
+  const ledger = await readLedger(deps, input.runId);
+  if (ledger.stop?.reason !== "recovery_exhausted") return;
+
+  const items: LoopLedger["items"] = { ...ledger.items };
+  const repaired: Array<{ id: string; from: LoopItemState; to: LoopItemState }> = [];
+
+  for (const [id, entry] of Object.entries(ledger.items)) {
+    const identity = await observeExternalIdentity(observeDeps, id);
+    const target = verifiedForwardTarget(identity);
+    if (target !== "ready" && target !== "merged") continue;
+    if (entry.state === target) continue;
+    const driftClass = classifyDrift(entry.state, identity, entry.last_verified_identity ?? null);
+    if (driftClass !== "ledger-behind") continue;
+
+    const time = deps.now().toISOString();
+    const from = entry.state;
+    const next: LoopItemLedgerEntry = {
+      ...entry,
+      state: target,
+      last_verified_identity: identity,
+      history: [
+        ...entry.history,
+        {
+          time,
+          from,
+          to: target,
+          engine: input.engine,
+          note: "resume terminal catch-up repaired forward on verified external identity",
+        },
+      ],
+    };
+    if (target === "ready") {
+      delete next.blocked_theme;
+    }
+    items[id] = next;
+    repaired.push({ id, from, to: target });
+  }
+
+  if (repaired.length === 0) return;
+
+  await writeLedger(deps, { ...ledger, items }, input.token);
+  for (const row of repaired) {
+    await appendEvent(deps, input.runId, input.token, "loop_item_transitioned", {
+      item_id: row.id,
+      from: row.from,
+      to: row.to,
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -799,6 +799,8 @@ export async function runTestGate(
         timeoutSec: cfg.fix_timeout,
         model: fixModel,
         sandbox: cfg.harness_sandbox,
+        role: "implementer",
+        stageKind: "test-fix",
         accounting: runDir
           ? {
               runDir,
@@ -829,6 +831,54 @@ export async function runTestGate(
           )
         : await invokeFix();
     if (!fixRes.success) {
+      if (fixRes.background_wait) {
+        const headAfterWait = await gitHeadFn(wtPath);
+        let salvageFailureReason: string | undefined;
+        let salvaged = false;
+        if (headBefore && headAfterWait === headBefore && (await gitDirtyFn(wtPath))) {
+          const salvageResult =
+            deps.salvage != null
+              ? await deps.salvage(
+                  wtPath,
+                  issueNumber,
+                  pipelineRunId,
+                  testFixSalvageStageLabel(issueNumber),
+                )
+              : await trySalvageUncommittedWork(
+                  wtPath,
+                  issueNumber,
+                  pipelineRunId,
+                  testFixSalvageStageLabel(issueNumber),
+                );
+          salvageFailureReason = salvageResult.failureReason;
+          salvaged = salvageResult.salvaged;
+        }
+        const waitReason = fixRes.lifecycle_evidence
+          ? `missed delivery or foreground-join for job ${fixRes.lifecycle_evidence.job_id}`
+          : "harness-background-wait";
+        const salvageNote = salvageFailureReason
+          ? ` Salvage of uncommitted work also failed: ${salvageFailureReason}`
+          : salvaged
+            ? " Uncommitted work was salvaged; the stage outcome remains harness-background-wait."
+            : "";
+        const reason =
+          `Fix harness (${harness}) failed (${waitReason}) on test-gate fix attempt ${attempt}.${salvageNote}`;
+        const overallStatus =
+          lastCmdForEvidence?.status === "timeout"
+            ? ("timeout" as const)
+            : lastCmdForEvidence?.status === "tooling_failure"
+              ? ("tooling_failure" as const)
+              : ("failed" as const);
+        return finish(
+          { skipped: false, passed: false, attempts: attempt, blockReason: reason },
+          {
+            overallStatus,
+            overallReason: reason,
+            enabled: true,
+            includeLastCommand: !!lastCmdForEvidence,
+          },
+        );
+      }
       const reason = fixRes.timed_out
         ? `Fix harness (${harness}) timed out after ${fixRes.duration.toFixed(0)}s on test-gate fix attempt ${attempt}.`
         : `Fix harness (${harness}) failed (exit ${fixRes.exit_code}) on test-gate fix attempt ${attempt}.`;

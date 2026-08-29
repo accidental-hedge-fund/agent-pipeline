@@ -4,17 +4,20 @@
 A label-driven pipeline that advances a GitHub issue (or a PR's linked issue)
 through a 18-stage state machine (code `STAGES` in `core/scripts/types.ts`,
 including the terminal park off-ramp `needs-human`) to `pipeline:ready-to-deploy`.
-It ships as a skill for **both Claude Code (`/pipeline`) and Codex (`$pipeline`)**
-from a single shared TypeScript core; the two hosts differ only by a JSON profile.
+The product is the `pipeline` CLI (`pipeline <verb> [--json]` plus event JSONL).
+Hosts are argv or JSON wrappers (short SKILL shims) around that CLI; they are
+not a second engine. Claude Code, Codex, Grok, OpenCode, and OMP are host
+surfaces, not a Claude-plus-Codex-only product.
 
 ## Tech & layout
 - Node ≥ 24. The core is TypeScript run via native type-stripping — no build step.
 - Single source of truth is `core/`. Stages live in `core/scripts/stages/`,
   prompt templates in `core/scripts/prompts/*.md`, shared helpers in
   `core/scripts/` (`gh.ts`, `worktree.ts`, `openspec.ts`, …).
-- `plugin/` is **generated** by `scripts/build.mjs` — never hand-edit it. After
-  changing `core/` or `hosts/claude/SKILL.md`, run `node scripts/build.mjs` and
-  commit the regenerated `plugin/` (CI enforces this via `build.mjs --check`).
+- The product is the pipeline CLI plus host SKILL. After changing `core/` or
+  `hosts/claude/SKILL.md`, run `node scripts/build.mjs` so `--check` can assert
+  SKILL overlay and marketplace catalog freshness. Do not commit a `plugin/`
+  copy of `core/scripts`. Whole-tree deletion of `plugin/` is #1050.
 - Tests are `node --test` under `core/test/` (run `cd core && npm test`).
 
 ## Conventions

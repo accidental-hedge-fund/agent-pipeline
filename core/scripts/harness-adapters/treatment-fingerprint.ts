@@ -97,20 +97,21 @@ export interface BuildTreatmentFingerprintInput {
 }
 
 /**
- * Stable capability hash over the declaration/capability surface that defines
- * treatment identity. Excludes volatile path and probe results.
+ * Canonical payload hashed for treatment identity. Exported so tests can pin
+ * that `background_job_lifecycle` is a hash input (#1299).
  */
-export function hashAdapterCapabilities(
+export function adapterCapabilityHashPayload(
   capabilities: AdapterCapabilities,
   declaration: AdapterExtensionDeclaration,
-): string {
-  const payload = {
+): Record<string, unknown> {
+  return {
     model: capabilities.model,
     effort: capabilities.effort,
     sandbox: capabilities.sandbox,
     workingDir: capabilities.workingDir,
     telemetry: capabilities.telemetry,
     maxPromptBytes: capabilities.maxPromptBytes,
+    background_job_lifecycle: capabilities.background_job_lifecycle,
     roles: [...declaration.roles].slice().sort(),
     promptDelivery: declaration.prompt.delivery,
     promptSizeLimit: declaration.prompt.sizeLimit,
@@ -121,8 +122,19 @@ export function hashAdapterCapabilities(
     authProbe: declaration.authProbe,
     versionProbe: declaration.versionProbe,
     origin: declaration.origin,
+    background_job_lifecycle_decl: declaration.background_job_lifecycle,
   };
-  const json = JSON.stringify(payload);
+}
+
+/**
+ * Stable capability hash over the declaration/capability surface that defines
+ * treatment identity. Excludes volatile path and probe results.
+ */
+export function hashAdapterCapabilities(
+  capabilities: AdapterCapabilities,
+  declaration: AdapterExtensionDeclaration,
+): string {
+  const json = JSON.stringify(adapterCapabilityHashPayload(capabilities, declaration));
   return createHash("sha256").update(json).digest("hex").slice(0, 16);
 }
 
