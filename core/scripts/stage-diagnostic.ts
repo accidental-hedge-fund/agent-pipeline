@@ -38,6 +38,9 @@ export const STAGE_DIAGNOSTIC_REASON_CODES = [
   // Distinct from environment-auth: missing forge capability/permission (e.g. 403
   // resource not accessible) vs credential/authentication failure.
   "capability-refusal",
+  // #1299: typed complete/fail without delivery or foreground-join inside grace.
+  // Distinct from harness-timeout; never inferred from silence or transcript.
+  "harness-background-wait",
   // #870: Claude model entitlement / usage-credit refusal (Fable credits).
   // Projects to environment-auth so metrics separate account entitlement from
   // forge credential failures, without collapsing to workflow-engine-defect.
@@ -225,6 +228,7 @@ export function projectPipelineReasonCode(reasonCode: unknown): StageDiagnosticP
     case "transient-infra":
       return { blockerClass: "transient-rate-limit", disposition: "recover" };
     case "harness-timeout":
+    case "harness-background-wait":
     case "harness-contract":
       return { blockerClass: "workflow-engine-defect", disposition: "recover" };
     case "repair-budget-exhausted":
@@ -324,6 +328,7 @@ export function projectStageDiagnostic(value: unknown): StageDiagnosticProjectio
     (
       candidate.reason_code === "transient-infra" ||
       candidate.reason_code === "harness-timeout" ||
+      candidate.reason_code === "harness-background-wait" ||
       candidate.reason_code === "harness-contract" ||
       candidate.reason_code === "repair-budget-exhausted" ||
       candidate.reason_code === "external-wait" ||

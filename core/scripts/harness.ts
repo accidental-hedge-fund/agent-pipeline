@@ -59,7 +59,19 @@ import {
   type AdapterRole,
   type ProductionPreflightDeps,
   type ProductionPreflightFailureClass,
+  type BackgroundJobLifecycleEvidence,
+  type InjectedLifecycleEvent,
+  type PreviousLifecycleInvocation,
 } from "./harness-adapters/index.ts";
+import {
+  BackgroundJobLifecycleSupervisor,
+  effectiveJoinGraceMs,
+  harnessInvocationFingerprint,
+  hashPromptForFingerprint,
+  parseLifecycleJsonl,
+  runInjectedLifecycleSupervisor,
+  sameAdapterRetryForbidden,
+} from "./harness-adapters/background-job-lifecycle.ts";
 import { makeClaudeForwardTransform } from "./harness-adapters/claude.ts";
 import { makeCodexForwardTransform } from "./harness-adapters/codex.ts";
 import { makeGrokForwardTransform } from "./harness-adapters/grok.ts";
@@ -243,6 +255,14 @@ export interface HarnessResult {
   exit_code: number;
   duration: number; // seconds
   timed_out: boolean;
+  /**
+   * True when a supporting adapter completed or failed a background job but
+   * did not deliver and foreground-join inside the effective grace (#1299).
+   * Distinct from `timed_out` — must not be set together for this class.
+   */
+  background_wait?: boolean;
+  /** Allowlisted lifecycle evidence when `background_wait` is true. */
+  lifecycle_evidence?: BackgroundJobLifecycleEvidence;
   spawn_error?: boolean; // true when the process could not be spawned at all
   // True when spawn_error is specifically the pre-spawn oversize-argv refusal
   // (#492) — an argv element exceeded MAX_ARG_STRLEN, so the process was never
@@ -412,6 +432,23 @@ export interface InvokeOptions {
    *  `PIPELINE_CODEX_NO_SANDBOX`) and passes that same value to preflight and
    *  `buildInvocation` so ambient policy cannot widen after the gate (#636). */
   sandboxMode?: ExternalSandboxMode;
+  /**
+   * Stage kind for #1299 mutating-implementer lifecycle preflight.
+   * Set by implement / fix-round / test-fix / eval-fix / visual-fix.
+   * Planning and review omit this.
+   */
+  stageKind?: string | null;
+  /**
+   * Injectable lifecycle supervisor seam (#1299). Tests inject event streams
+   * and a fake clock; production supporting adapters parse CLI JSONL.
+   */
+  lifecycle?: {
+    eventStream?: InjectedLifecycleEvent[];
+    nowMs?: () => number;
+    invocationId?: string;
+    skipSpawn?: boolean;
+    previous?: PreviousLifecycleInvocation | null;
+  };
 }
 
 /**
@@ -483,6 +520,34 @@ export async function invoke(
       return d;
     })();
 
+  const invocationFingerprint = harnessInvocationFingerprint({
+    adapter: adapter.name,
+    stageKind: opts.stageKind ?? null,
+    model: opts.model ?? null,
+    effort: opts.reasoningEffort ?? null,
+    promptHash: hashPromptForFingerprint(prompt),
+  });
+  if (
+    sameAdapterRetryForbidden({
+      adapter: adapter.name,
+      fingerprint: invocationFingerprint,
+      previous: opts.lifecycle?.previous,
+    })
+  ) {
+    return {
+      success: false,
+      stdout: "",
+      stderr:
+        `[harness ${adapter.name}] refusing same-adapter retry of invocation ` +
+        `${invocationFingerprint} after harness-background-wait. ` +
+        `Selecting another adapter requires existing explicit harness policy.`,
+      exit_code: -1,
+      duration: 0,
+      timed_out: false,
+      background_wait: true,
+    };
+  }
+
   const preflight = await runProductionPreflight(
     adapter,
     {
@@ -493,6 +558,7 @@ export async function invoke(
       role,
       // Exact resolved sandbox/tool policy that buildInvocation will apply (#636).
       sandboxMode,
+      stageKind: opts.stageKind ?? null,
     },
     preflightDeps,
   );
@@ -556,8 +622,67 @@ export async function invoke(
   if (promptFile) await fs.writeFile(promptFile.path, promptFile.content, "utf8");
 
   const startedAt = new Date();
+  const lifecycleDecl = adapter.capabilities.background_job_lifecycle;
+  const joinGraceMs = effectiveJoinGraceMs(lifecycleDecl);
+  const invocationId =
+    opts.lifecycle?.invocationId ??
+    `${adapter.name}:${invocationFingerprint}`;
+
+  if (opts.lifecycle?.skipSpawn || opts.lifecycle?.eventStream) {
+    const injected = runInjectedLifecycleSupervisor({
+      events: opts.lifecycle.eventStream ?? [],
+      joinGraceMs,
+      outerDeadlineMs: timeoutSec * 1000,
+      adapter: adapter.name,
+      invocationId,
+      transcript: prompt,
+    });
+    return {
+      success: injected.outcome === "joined",
+      stdout: "",
+      stderr:
+        injected.background_wait
+          ? `[harness ${adapter.name}] harness-background-wait: job ${injected.evidence?.job_id ?? "unknown"} completed without delivery/join`
+          : injected.timed_out
+            ? `[harness ${adapter.name}] timed out after ${(injected.durationMs / 1000).toFixed(0)}s`
+            : "",
+      exit_code: injected.outcome === "joined" ? 0 : -1,
+      duration: injected.durationMs / 1000,
+      timed_out: injected.timed_out,
+      background_wait: injected.background_wait,
+      ...(injected.evidence ? { lifecycle_evidence: injected.evidence } : {}),
+    };
+  }
+
   let result: HarnessResult;
   try {
+    let abortBackgroundWait:
+      | ((
+          evidence: import("./harness-adapters/background-job-lifecycle.ts").BackgroundJobLifecycleEvidence,
+        ) => void)
+      | undefined;
+    const abortPromise =
+      lifecycleDecl?.supported === true
+        ? new Promise<
+            import("./harness-adapters/background-job-lifecycle.ts").BackgroundJobLifecycleEvidence
+          >((resolve) => {
+            abortBackgroundWait = (evidence) => resolve(evidence);
+          })
+        : undefined;
+    const supervisor =
+      lifecycleDecl?.supported === true
+        ? new BackgroundJobLifecycleSupervisor({
+            joinGraceMs,
+            outerDeadlineMs: timeoutSec * 1000,
+            nowMs: opts.lifecycle?.nowMs ?? (() => Date.now()),
+            startedAtMs: Date.now(),
+          })
+        : null;
+    const parseLifecycle =
+      typeof adapter.parseBackgroundJobLifecycle === "function"
+        ? adapter.parseBackgroundJobLifecycle.bind(adapter)
+        : (chunk: string) =>
+            parseLifecycleJsonl(chunk, { adapter: adapter.name, invocationId });
     result = await runCapped(cmd, args, cwd, timeoutSec, stream, harness, {
       killProcessGroup: true,
       timeoutEvent: opts.accounting
@@ -573,7 +698,35 @@ export async function invoke(
       captureMode,
       transformForward,
       stdinPayload,
+      abortPromise,
+      onStdoutChunk:
+        supervisor == null
+          ? undefined
+          : (chunk) => {
+              for (const event of parseLifecycle(chunk, {
+                adapter: adapter.name,
+                invocationId,
+              })) {
+                supervisor.feed(event);
+              }
+              const outcome = supervisor.evaluate();
+              if (outcome.kind === "background_wait") {
+                abortBackgroundWait?.(outcome.evidence);
+              }
+            },
     });
+    if (supervisor) {
+      const outcome = supervisor.evaluate();
+      if (outcome.kind === "background_wait") {
+        result = {
+          ...result,
+          success: false,
+          timed_out: false,
+          background_wait: true,
+          lifecycle_evidence: outcome.evidence,
+        };
+      }
+    }
   } finally {
     // Remove exactly the file this call created (#492), spawn or not.
     if (promptFile) await fs.rm(promptFile.path, { force: true });
@@ -814,6 +967,7 @@ async function defaultFsExecutable(p: string): Promise<boolean> {
 
 function harnessOutcome(result: HarnessResult): string {
   if (result.success) return "success";
+  if (result.background_wait) return "background_wait";
   if (result.timed_out) return "timeout";
   if (result.spawn_error) return "spawn_error";
   return "failure";
@@ -899,6 +1053,13 @@ export async function runCapped(
     // which the child's stdin is opened, so every existing caller with no
     // stdin payload keeps stdin: "ignore" byte-for-byte.
     stdinPayload?: string;
+    /** Optional stdout observer used by the lifecycle supervisor (#1299). */
+    onStdoutChunk?: (chunk: string) => void;
+    /**
+     * When this promise resolves, kill the child like a timeout but settle
+     * with `background_wait` (not `timed_out`).
+     */
+    abortPromise?: Promise<import("./harness-adapters/background-job-lifecycle.ts").BackgroundJobLifecycleEvidence>;
   } = {},
 ): Promise<HarnessResult> {
   const start = Date.now();
@@ -1042,6 +1203,8 @@ export async function runCapped(
     // preserving so leading freeform contract sections survive large streams.
     let productBuf: string | undefined = opts.transformForward ? "" : undefined;
     let timedOut = false;
+    let backgroundWaitEvidence: import("./harness-adapters/background-job-lifecycle.ts").BackgroundJobLifecycleEvidence | null =
+      null;
     let lastExitCode: number | null = null;
     let settled = false;
     // Nested timers armed by the timeout escalation chain below — tracked so
@@ -1096,7 +1259,7 @@ export async function runCapped(
       // that outlived SIGTERM is left running forever even though runCapped has
       // already returned. Only clear them on a non-timeout settle, where they
       // were never armed anyway.
-      if (!timedOut) {
+      if (!timedOut && !backgroundWaitEvidence) {
         clearTimeout(reapTimer);
         clearTimeout(reapFollowupTimer);
       }
@@ -1153,6 +1316,43 @@ export async function runCapped(
     if (killProcessGroup) {
       process.on("SIGINT", sigintHandler);
       process.on("SIGTERM", sigtermHandler);
+    }
+
+    if (opts.abortPromise) {
+      void opts.abortPromise.then((evidence) => {
+        if (settled || timedOut || backgroundWaitEvidence) return;
+        backgroundWaitEvidence = evidence;
+        killGroup("SIGTERM");
+        failsafeTimer = setTimeout(() => {
+          const duration = (Date.now() - start) / 1000;
+          settle({
+            success: false,
+            stdout: stdoutBuf,
+            stderr: stderrBuf,
+            exit_code: lastExitCode ?? -1,
+            duration,
+            timed_out: false,
+            background_wait: true,
+            lifecycle_evidence: evidence,
+          });
+        }, (killGraceSec + hardDeadlineSec) * 1000);
+        reapTimer = setTimeout(() => {
+          killGroup("SIGKILL");
+          reapFollowupTimer = setTimeout(() => {
+            const duration = (Date.now() - start) / 1000;
+            settle({
+              success: false,
+              stdout: stdoutBuf,
+              stderr: stderrBuf,
+              exit_code: lastExitCode ?? -1,
+              duration,
+              timed_out: false,
+              background_wait: true,
+              lifecycle_evidence: evidence,
+            });
+          }, 200);
+        }, killGraceSec * 1000);
+      });
     }
 
     const timer = setTimeout(() => {
@@ -1219,6 +1419,7 @@ export async function runCapped(
     const captureMode = opts.captureMode ?? "head";
     child.stdout?.on("data", (chunk: Buffer) => {
       const text = chunk.toString("utf8");
+      opts.onStdoutChunk?.(text);
       if (captureMode === "tail") {
         stdoutBuf += text;
         if (stdoutBuf.length > MAX_OUTPUT) stdoutBuf = stdoutBuf.slice(stdoutBuf.length - MAX_OUTPUT);
@@ -1292,7 +1493,7 @@ export async function runCapped(
       lastExitCode = code;
       // When timed out, the direct child exiting is not sufficient — grandchildren
       // that ignored SIGTERM may still be alive. Defer to the SIGKILL timer above.
-      if (timedOut) return;
+      if (timedOut || backgroundWaitEvidence) return;
       clearTimeout(timer);
       // Force line-oriented forward transforms to emit any complete JSONL line
       // that lacked a trailing newline at EOF (#882: residual buffer otherwise

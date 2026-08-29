@@ -573,6 +573,7 @@ function makeMinimalExtension(
     telemetry: "none" as const,
     // argv-bound synthetic extension — finite ceiling (#779).
     maxPromptBytes: 131_071 as const,
+    background_job_lifecycle: { supported: false as const },
   };
   return {
     name,

@@ -28,6 +28,10 @@ import {
   type MaxPromptBytes,
   type PromptDeliveryChannel,
 } from "./types.ts";
+import {
+  capabilityRefusalMessage,
+  requiresBackgroundJobLifecycle,
+} from "./background-job-lifecycle.ts";
 
 /** Exact resolved treatment handed to production preflight-on-invoke. */
 export interface ProductionPreflightRequest extends AdapterRequest {
@@ -35,6 +39,11 @@ export interface ProductionPreflightRequest extends AdapterRequest {
   role?: AdapterRole | null;
   /** Fully materialized prompt text for the #779 size check. */
   prompt: string;
+  /**
+   * Stage kind for #1299 mutating-implementer lifecycle preflight.
+   * Planning and review omit this or use a non-mutating kind.
+   */
+  stageKind?: string | null;
 }
 
 /** Distinguishable production-gate failure classes (superset of adapter preflight). */
@@ -284,6 +293,28 @@ export async function runProductionPreflight(
       adapterRequest,
       role,
     };
+  }
+
+  // 1b. Mutating implementer work requires background_job_lifecycle (#1299).
+  if (requiresBackgroundJobLifecycle(req.stageKind)) {
+    const lifecycle =
+      adapter.capabilities.background_job_lifecycle ??
+      adapter.declaration.background_job_lifecycle;
+    if (!lifecycle || lifecycle.supported !== true) {
+      const msg = capabilityRefusalMessage(adapter.name);
+      return {
+        ok: false,
+        remediation: projectPreflightRemediation(adapter.name, "unsupported-setting", msg, {
+          setting: "background_job_lifecycle",
+          value: "unsupported",
+        }),
+        cliPath: null,
+        versionProbe: null,
+        promptBytes: limitCheck.measured,
+        adapterRequest,
+        role,
+      };
+    }
   }
 
   // 2. Role eligibility when the caller named a role.

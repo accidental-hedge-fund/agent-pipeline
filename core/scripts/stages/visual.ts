@@ -820,13 +820,15 @@ async function runVisualFixRound(
       runDir: opts.runDir,
     },
     shouldAttemptSalvage: ({ confirmedNoNewCommit, invokeResult }) =>
-      Boolean(invokeResult.success && confirmedNoNewCommit),
+      Boolean((invokeResult.success || invokeResult.background_wait) && confirmedNoNewCommit),
     invoke: async () => {
       const fixModel = cfg.models.fix;
       return deps.invoke(harness, wtPath, prompt, {
         timeoutSec: cfg.fix_timeout,
         model: fixModel,
         sandbox: cfg.harness_sandbox,
+        role: "implementer",
+        stageKind: "visual-fix",
         accounting: opts.runDir
           ? {
               runDir: opts.runDir,
@@ -849,9 +851,16 @@ async function runVisualFixRound(
         return { ok: false, reason: OWNERSHIP_CHECKPOINT_FAILED_REASON, blockerKind: "harness-failure" };
       }
       if (!fixRes.success) {
-        const reason = fixRes.timed_out
-          ? `Fix harness (${harness}) timed out after ${fixRes.duration.toFixed(0)}s on visual-gate fix round ${attempt}.`
-          : `Fix harness (${harness}) failed (exit ${fixRes.exit_code}) on visual-gate fix round ${attempt}.`;
+        const reason = fixRes.background_wait
+          ? `Fix harness (${harness}) missed delivery or foreground-join on visual-gate fix round ${attempt} (harness-background-wait).` +
+            (ctx.salvageFailureReason
+              ? ` Salvage of uncommitted work also failed: ${ctx.salvageFailureReason}`
+              : ctx.salvaged
+                ? " Uncommitted work was salvaged; the stage outcome remains harness-background-wait."
+                : "")
+          : fixRes.timed_out
+            ? `Fix harness (${harness}) timed out after ${fixRes.duration.toFixed(0)}s on visual-gate fix round ${attempt}.`
+            : `Fix harness (${harness}) failed (exit ${fixRes.exit_code}) on visual-gate fix round ${attempt}.`;
         return { ok: false, reason, blockerKind: "harness-failure" };
       }
 

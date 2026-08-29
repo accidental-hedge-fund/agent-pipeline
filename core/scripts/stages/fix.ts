@@ -392,6 +392,9 @@ export async function invokeFixHarnessWithRetry(
     if (result.success) {
       return { attempts, finalResult: result, budgetExhausted: false };
     }
+    if (result.background_wait) {
+      return { attempts, finalResult: result, budgetExhausted: false };
+    }
     priorReason = result.timed_out
       ? `timed out after ${debitSec.toFixed(0)}s`
       : `exit ${result.exit_code}`;
@@ -792,6 +795,8 @@ export async function advanceFix(
       model,
       reasoningEffort: cfg.effort?.fix,
       sandbox: cfg.harness_sandbox,
+      role: "implementer",
+      stageKind: "fix-round",
       accounting: opts.runDir
         ? {
             runDir: opts.runDir,
@@ -937,6 +942,19 @@ export async function advanceFix(
       } catch {
         prLookupFailed = true;
         linkedOpenPr = true;
+      }
+      if (result.background_wait) {
+        const waitReason = result.lifecycle_evidence
+          ? `missed delivery or foreground-join for job ${result.lifecycle_evidence.job_id}`
+          : "harness-background-wait";
+        const salvageNote = ctx.salvageFailureReason
+          ? ` Salvage of uncommitted work also failed: ${ctx.salvageFailureReason}`
+          : ctx.salvaged
+            ? " Uncommitted work was salvaged; the stage outcome remains harness-background-wait."
+            : "";
+        const baseReason = `Fix harness (${harness}) failed: ${waitReason}.${salvageNote}`;
+        await setBlocked(cfg, issueNumber, baseReason, stage, "harness-failure");
+        return { kind: "early", outcome: fixHarnessFailureOutcome(waitReason) };
       }
       const timeoutPark = resolveTimeoutParkForUnpublishedCommit(
         {

@@ -130,6 +130,7 @@ function fakeAdapter(
       workingDir: "cwd",
       telemetry,
       maxPromptBytes: "unlimited",
+      background_job_lifecycle: { supported: false },
     },
     declaration: {
       roles: [...roles],
@@ -144,6 +145,7 @@ function fakeAdapter(
       authProbe: "documented",
       versionProbe: "documented",
       origin: opts.origin ?? "builtin",
+      background_job_lifecycle: { supported: false },
     },
     buildInvocation: () => ({
       cmd: name,
