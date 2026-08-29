@@ -2,24 +2,25 @@
 
 ### Requirement: An acknowledged pack-loop process death SHALL allow one recorded resume
 
-When an acknowledged pack-loop supervisor process dies while its run remains resumable and non-terminal, the engine SHALL allow exactly one durably recorded resume for that exact loop id and failed process identity. The resumed process SHALL publish a new valid `loop_run_handoff` before it is treated as dispatched or live. A second liveness loss for that same loop SHALL be terminal. Unreadable identity evidence SHALL NOT authorize that resume. The resume record SHALL persist under the run lock so a later invoke cannot claim a second grant.
+When an acknowledged pack-loop supervisor process dies while its run remains resumable and non-terminal, the engine SHALL allow exactly one durably recorded resume for that exact loop id. The resume budget SHALL be run-lineage scoped: persist `resume_count` on the binding for that `loop_run_id`. The failed process identity SHALL be recorded as audit evidence only. A second acknowledged liveness loss for that same loop SHALL be terminal even when the dead process has a new PID. The resumed process SHALL publish a new valid `loop_run_handoff` before it is treated as dispatched or live. Unreadable identity evidence SHALL NOT authorize that resume. The resume record SHALL persist under the run lock so a later invoke cannot claim a second grant.
 
 #### Scenario: First acknowledged death resumes once
 
 - **WHEN** bound loop `L` has a valid `loop_run_handoff`
 - **AND** the acknowledged process is dead
 - **AND** the run is resumable and non-terminal
-- **AND** no resume has been recorded for that process identity
+- **AND** `resume_count` for `L` is 0
 - **THEN** the engine SHALL spawn exactly one resume of `L`
-- **AND** it SHALL persist that resume grant
+- **AND** it SHALL persist `resume_count` 1 and the failed process identity as audit evidence
 - **AND** the new process SHALL emit a new valid `loop_run_handoff` before `dispatch_state` is `dispatched`
 
 #### Scenario: Second liveness loss is terminal
 
-- **WHEN** loop `L` already has one recorded resume for the failed process identity
+- **WHEN** loop `L` already has `resume_count` 1
 - **AND** the resumed process dies or becomes not-live
 - **THEN** the engine SHALL treat that liveness loss as terminal
 - **AND** it SHALL NOT spawn another pack-loop child for `L`
+- **AND** it SHALL NOT mint a new grant because the dead process has a new PID
 
 #### Scenario: Unreadable identity does not grant resume
 
@@ -42,6 +43,11 @@ cycle is still in flight. The record SHALL be distinct from the run lock — the
 authority; the process record identifies which supervisor process is currently driving and whether
 it is still alive and progressing. The record SHALL be written through the store's injectable seam
 so a unit test drives it with no real process, network, or git call.
+Heartbeat writes SHALL require current lock ownership. A heartbeat timer
+SHALL be started after attach through an injectable timer seam and SHALL
+be cleared when the drive ends. Missing `heartbeat_at` after acknowledgement
+SHALL be not-live. A malformed or future `heartbeat_at` SHALL be unreadable
+identity: unknown inside the observation window, then fail closed.
 
 #### Scenario: The process record is written at attach and heartbeats each cycle
 
@@ -69,3 +75,23 @@ so a unit test drives it with no real process, network, or git call.
 - **WHEN** a supervisor holds the run
 - **THEN** both the run lock and the process-identity record SHALL be present
 - **AND** the process record SHALL NOT be treated as a second write-authority lock
+
+#### Scenario: Missing heartbeat after acknowledgement is not live
+
+- **WHEN** bound loop `L` has a valid `loop_run_handoff`
+- **AND** `supervisor.json` omits `heartbeat_at` or the field is empty
+- **THEN** liveness SHALL NOT be `live`
+
+#### Scenario: Malformed or future heartbeat fails closed after the observation window
+
+- **WHEN** `heartbeat_at` is not a parseable timestamp
+- **OR** `heartbeat_at` is more than one second in the future
+- **AND** the observation window has expired
+- **THEN** liveness SHALL be fail-closed identity error
+- **AND** it SHALL NOT count as fresh
+
+#### Scenario: Heartbeat timer is cleared when drive ends
+
+- **WHEN** `driveSupervisor` returns or throws
+- **THEN** the injected heartbeat timer SHALL be cleared
+- **AND** a later fake tick SHALL NOT write `supervisor.json`

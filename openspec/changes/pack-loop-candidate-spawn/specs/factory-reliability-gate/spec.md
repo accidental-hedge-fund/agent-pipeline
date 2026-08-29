@@ -41,7 +41,7 @@ After a valid `loop_run_handoff` for bound loop `L`, ship-path Factory Reliabili
 
 ### Requirement: Pack-loop spawn SHALL surface bounded child stderr in ship last_error
 
-Pack-loop spawn SHALL NOT ignore the child's stderr. A non-zero child exit SHALL capture bounded, redacted stderr in pipeline-owned evidence. Ship `last_error` SHALL include the exit status, a safe excerpt, and the evidence location. Catalogue validation text (or equivalent stderr) SHALL be visible in that diagnostic.
+Pack-loop spawn SHALL NOT ignore the child's stderr. Spawn SHALL drain stdout and stderr pipes so the child cannot block. A child exit (`0` or non-zero) before handoff, and a non-zero exit after, SHALL capture bounded (16 KiB head + 16 KiB tail), redacted stderr in pipeline-owned evidence before persist. Redaction SHALL use the existing artifact sanitize path. If evidence write fails, the tick SHALL still fail closed and `last_error` SHALL name the exit or spawn error and the write failure. Ship `last_error` SHALL include the exit status or error code, a safe excerpt, and the evidence location. Catalogue validation text (or equivalent stderr) SHALL be visible in that diagnostic.
 
 #### Scenario: Crash is visible and not false-live
 
@@ -57,17 +57,25 @@ Pack-loop spawn SHALL NOT ignore the child's stderr. A non-zero child exit SHALL
 - **THEN** the child's stderr SHALL NOT be `stdio: "ignore"`
 - **AND** a later non-zero exit SHALL still have a bounded redacted excerpt in pipeline-owned evidence
 
+#### Scenario: Evidence write failure still reports the exit
+
+- **WHEN** the pack child exits non-zero
+- **AND** the stderr evidence file cannot be written
+- **THEN** that tick SHALL fail closed
+- **AND** `last_error` SHALL still name the exit status
+- **AND** `last_error` SHALL name the evidence-write failure
+
 ### Requirement: Pack-loop dispatch tests SHALL bite mixed-binary spawn and false-live
 
-The test suite SHALL fail if candidate prepare writes `publish_unpublished_stage_commit` into the contract and the spawned loop binary is the pin catalogue that rejects that recipe. The suite SHALL fail if dead pid plus no `ledger.stop` plus no terminal events classifies as `live`. Coverage SHALL include candidate-versus-pin execution, pre-handoff failure, the spawn-before-handoff crash window, PID reuse, periodic heartbeat freshness during long work, one-resume enforcement, unreadable authority evidence, diagnostic propagation, and false-live rejection. Tests SHALL inject I/O through dependency seams and SHALL perform no real network, git, or subprocess calls.
+The test suite SHALL fail if candidate prepare writes `publish_unpublished_stage_commit` into the contract and the spawned loop binary is the pin catalogue that rejects that recipe. The mixed-binary test SHALL assert the actual spawned executable path, not only argv and not a mocked candidate catalogue in place of that path. The suite SHALL fail if dead pid plus no `ledger.stop` plus no terminal events classifies as `live`. Coverage SHALL include candidate-versus-pin execution, OS spawn error/throw, zero and nonzero pre-handoff exits, crash after OS accept, handoff SHA mismatch, valid handoff followed by immediate death, concurrent prepare reconciliation, PID reuse, fresh/stale/malformed/future heartbeat, unreadable evidence inside and outside the durable window, one-resume-then-terminal behavior, diagnostic propagation, and false-live rejection. Tests SHALL inject fake Spawn/ChildProcess, store, PID probe, clock, and timers. Tests SHALL perform no real network, git, or subprocess calls.
 
 #### Scenario: Mixed-binary spawn regression bites
 
 - **WHEN** a unit test supplies candidate SHA `C` whose catalogue includes `publish_unpublished_stage_commit`
 - **AND** PATH `pipeline` is pin `P` whose catalogue rejects that recipe
 - **AND** `PIPELINE_BIN` is unset
-- **THEN** the test SHALL fail if spawn execs pin `P`
-- **AND** it SHALL pass when spawn execs the candidate launcher for `C`
+- **THEN** the test SHALL fail if the captured spawn executable is pin `P` or PATH `pipeline`
+- **AND** it SHALL pass when the captured spawn executable is the candidate launcher for `C`
 
 #### Scenario: False-live regression bites
 
@@ -89,25 +97,32 @@ the pack manifest minimum, allocate the candidate-track run id, persist
 git SHA, target version, pack/manifest identity) together with a non-null
 `loop_run_id` on the pack instance, and only then spawn or resume the loop.
 Spawn SHALL exec the verified candidate launcher that wrote the contract
-(absolute executable, argv, and candidate SHA). PATH `pipeline` and
-`PIPELINE_BIN` SHALL NOT be production fallbacks. `--engine-track candidate`
-SHALL remain intent metadata and SHALL NOT select the binary. The generator
-SHALL persist binding `dispatch_state` `bound` before spawn. It SHALL persist
-`dispatched` only after a valid `loop_run_handoff` for that `loop_run_id` with
-absolute artifact paths and matching `supervisor.json` process identity.
-A failed OS spawn (child never started) SHALL fail that tick and SHALL leave
-the request bound to the same `loop_run_id` so a later invoke can retry spawn.
-A child that exits non-zero before the first valid handoff SHALL fail that
-tick closed and SHALL NOT be retried as a second blind spawn. While that
-bound loop is not terminal, the generator SHALL return a machine-readable
-in-progress status and SHALL NOT treat the missing terminal loop as
-`missing_generator` or `pack_loop_missing`. A re-invoke of the same request
-SHALL resume the same `loop_run_id` and SHALL NOT start a second unbound pack.
-Before spawning, the generator SHALL reconcile a persisted `bound` state:
-adopt a valid existing holder, observe an in-window startup, and fail closed
-on a proven pre-handoff failure. It SHALL NOT blindly create a second child.
-The generator SHALL NOT adopt an unbound newest `factory-gate` loop as the
-bound run or as release-eligible evidence.
+from a typed candidate invocation (absolute executable, immutable argv, and
+candidate SHA). PATH `pipeline` and `PIPELINE_BIN` SHALL NOT be production
+fallbacks. `--engine-track candidate` SHALL remain intent metadata and SHALL
+NOT select the binary. The generator SHALL persist a durable dispatch state
+machine on the binding: `bound` (never started or retryable OS spawn
+failure), `starting` (OS accepted, observation deadline set), `dispatched`
+(valid durable handoff), and `failed` (terminal pre-handoff failure). It
+SHALL persist `bound` before spawn. It SHALL persist `starting` plus the
+observation deadline after OS accept. It SHALL persist `dispatched` only
+after a valid `loop_run_handoff` for that `loop_run_id` with realpath-contained
+artifact paths, matching candidate SHA, and matching `supervisor.json`
+process identity. A failed OS spawn (child never started, including throw or
+ENOENT) SHALL fail that tick and SHALL leave the request `bound` to the same
+`loop_run_id` so a later invoke can retry spawn. A child that exits with
+status `0` or non-zero before the first valid handoff SHALL persist `failed`
+and SHALL NOT be retried as a second blind spawn. While that bound loop is
+not terminal, the generator SHALL return a machine-readable in-progress
+status that includes the authoritative pack-loop liveness object, and SHALL
+NOT treat the missing terminal loop as `missing_generator` or
+`pack_loop_missing`. A re-invoke of the same request SHALL resume the same
+`loop_run_id` and SHALL NOT start a second unbound pack. Before spawning, the
+generator SHALL reconcile persisted state: adopt a valid existing holder,
+observe an in-window `starting` child, retry only `bound`, and fail closed on
+`failed`. It SHALL NOT blindly create a second child. The generator SHALL NOT
+adopt an unbound newest `factory-gate` loop as the bound run or as
+release-eligible evidence.
 
 #### Scenario: First prepare with no bound loop dispatches a candidate pack loop
 
@@ -157,20 +172,28 @@ bound run or as release-eligible evidence.
 #### Scenario: Pre-handoff child exit is not retried
 
 - **WHEN** the OS accepted the child
-- **AND** the child exits non-zero before a valid `loop_run_handoff`
+- **AND** the child exits `0` or non-zero before a valid `loop_run_handoff`
 - **THEN** that tick SHALL fail closed
-- **AND** it SHALL NOT persist `dispatch_state` `dispatched`
+- **AND** it SHALL persist `dispatch_state` `failed`
 - **AND** a later invoke SHALL NOT blindly spawn a second child
 
 #### Scenario: OS accept does not mark dispatched
 
 - **WHEN** the OS reports spawn success for the pack child
 - **AND** no valid `loop_run_handoff` has been observed
-- **THEN** `dispatch_state` SHALL remain `bound`
+- **THEN** `dispatch_state` SHALL be `starting`
+- **AND** it SHALL NOT be `dispatched`
+
+#### Scenario: Concurrent prepare does not spawn a second child
+
+- **WHEN** a persisted binding for loop `L` is `starting` inside the observation window
+- **AND** a second prepare invoke of the same request runs
+- **THEN** the second invoke SHALL NOT spawn another pack-loop child
+- **AND** it SHALL observe `L`
 
 ### Requirement: Ship-path FRG pack composers SHALL wait until the bound pack loop is terminal
 
-A ship-path Factory Reliability Gate (FRG) pack composer (Tugboat, the installed `pipeline-ship-playbook` launcher, in-engine `pipeline ship`, or any later composer of the same durable prepare protocol) SHALL keep re-invoking the same `factory-release prepare` request while prepare status is `in_progress` and the bound pack loop is live. Live SHALL mean acknowledged-process liveness: a valid `loop_run_handoff` for that exact loop, plus the exact PID, process-start identity, boot identity, and a fresh heartbeat. A non-terminal ledger SHALL NOT prove live. Wait-budget expiry while that loop is live SHALL NOT be pack-fail. The composer SHALL heartbeat running ship state on each wait tick. The composer SHALL NOT kill the pack loop. The composer SHALL NOT treat a CI-length poll cap (about 20 minutes) as the live-loop stop. Wait-budget expiry MAY be pack-fail when the bound loop is not live. Unreadable identity evidence SHALL consume the bounded observation window and then fail closed with a typed observer or identity error. It SHALL NOT keep wait-budget from applying as not-live after that window. Real pack-fail (failed or missing FRG that is not omitted-HMAC-only, `latest.json` `pass: false` after a terminal **ineligible** score, attestor child failure) SHALL still fail closed. `latest.json` `pass: false` caused only by omitted HMAC on a structurally eligible pack SHALL NOT be pack-fail. The next identical 20-minute live-loop wait SHALL not require a new mole issue. The next identical dead-pack stall SHALL not require a new mole issue.
+A ship-path Factory Reliability Gate (FRG) pack composer (Tugboat, the installed `pipeline-ship-playbook` launcher, in-engine `pipeline ship`, or any later composer of the same durable prepare protocol) SHALL keep re-invoking the same `factory-release prepare` request while prepare status is `in_progress` and the bound pack loop is live. Live SHALL mean the authoritative pack-loop liveness status object (`live` only after a valid `loop_run_handoff` for that exact loop, plus the exact PID, process-start identity, boot identity, and a fresh heartbeat). TypeScript and Bash consumers SHALL NOT each keep a ledger-derived classifier. They SHALL consume that status from candidate prepare JSON (field `liveness`) or from the same TypeScript probe that produces it. A non-terminal ledger SHALL NOT prove live. Wait-budget expiry while that loop is live SHALL NOT be pack-fail. The composer SHALL heartbeat running ship state on each wait tick. The composer SHALL NOT kill the pack loop. The composer SHALL NOT treat a CI-length poll cap (about 20 minutes) as the live-loop stop. Wait-budget expiry MAY be pack-fail when the bound loop is not live. Unreadable identity evidence SHALL consume the bounded observation window and then fail closed with a typed observer or identity error. It SHALL NOT keep wait-budget from applying as not-live after that window. Real pack-fail (failed or missing FRG that is not omitted-HMAC-only, `latest.json` `pass: false` after a terminal **ineligible** score, attestor child failure) SHALL still fail closed. `latest.json` `pass: false` caused only by omitted HMAC on a structurally eligible pack SHALL NOT be pack-fail. The next identical 20-minute live-loop wait SHALL not require a new mole issue. The next identical dead-pack stall SHALL not require a new mole issue.
 
 This requirement does not raise the implementer 2400s cap. It does not authorize `--skip-frg` as the ship path. It does not change CI / release-PR check wait.
 

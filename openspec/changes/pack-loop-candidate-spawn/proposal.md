@@ -8,14 +8,15 @@ This is a **class** fix, not a 1.39.15 mole. The class is: a child that must int
 
 ## What Changes
 
-- **Candidate spawn, not PATH pin.** `defaultSpawnCandidateLoop` / `productionDispatchPackLoop` SHALL exec the same verified candidate launcher that ran `factory-release prepare` (absolute executable, argv, candidate SHA). PATH `pipeline` and `PIPELINE_BIN` SHALL NOT be production fallbacks when pin SHA ≠ candidate SHA, even when `PIPELINE_BIN` is unset.
-- **`--engine-track candidate` is not a binary selector.** It stays intent and diagnostic metadata. The spawn site SHALL take an explicit candidate invocation from the resolved candidate engine.
-- **Dispatch acknowledgement is `loop_run_handoff`, not OS accept.** Persist request binding as `"bound"` before spawn. Do not persist `"dispatched"` because the OS accepted the child. Validate the typed `loop_run_handoff` (loop ID, absolute artifact paths, matching `supervisor.json` process identity) after the child acquires the exact loop lock, then mark `"dispatched"`.
-- **Pre-handoff child exit fails closed.** A non-zero exit before the first valid handoff is terminal and is not retried. Reconcile a persisted `"bound"` state before spawning: adopt a valid existing holder, observe an in-window startup, fail closed on a proven pre-handoff failure. Never blindly create a second child. OS spawn reject (child never started, e.g. ENOENT) may still leave `"bound"` so a later invoke can retry the same `loop_run_id`.
-- **Acknowledged liveness is process identity plus a fresh heartbeat.** After acknowledgement, liveness requires the exact PID, process-start identity, boot identity, and a fresh heartbeat for the exact loop. A non-terminal ledger alone SHALL NOT prove live. False `live` SHALL NOT disable the wait cap. Unreadable identity evidence gets the bounded observation window, then fails closed with a typed observer or identity error. It does not authorize resume.
-- **One bounded resume after acknowledged death.** If an acknowledged process dies while the run remains resumable and non-terminal, allow one durably recorded resume for that exact loop and failed process identity. The resumed process MUST publish a new valid handoff. A second liveness loss is terminal.
-- **Periodic supervisor heartbeat.** The supervisor SHALL publish a process heartbeat independently of cycle completion. Cadence and stale threshold are versioned engine safety invariants that repository configuration cannot weaken.
-- **Visible stderr.** Pack-loop spawn SHALL NOT use `stdio: "ignore"` for the child's stderr. Capture bounded, redacted child stderr in pipeline-owned evidence. Ship `last_error` SHALL include the exit status, a safe excerpt, and the evidence location.
+- **Candidate spawn, not PATH pin.** Dispatch receives a typed `CandidateInvocation` (absolute executable, immutable argv, candidate SHA) from `resolveCandidateEngine`. PATH `pipeline`, `PIPELINE_BIN`, `process.argv`, and `--engine-track` SHALL NOT re-derive the binary.
+- **`--engine-track candidate` is not a binary selector.** It stays intent and diagnostic metadata.
+- **Durable dispatch state machine.** Persist `bound` before spawn, `starting` after OS accept (observation deadline), `dispatched` only after a valid durable `loop_run_handoff`, `failed` on any pre-handoff exit (`0` or non-zero) or mismatch.
+- **Durable handoff.** Acknowledgement is atomic `loop-run-handoff.json` that survives a detached parent. Validate loop ID, candidate SHA, realpath-contained paths, matching `supervisor.json` identity.
+- **Pre-handoff exit fails closed.** Exit `0` and non-zero before handoff are terminal. OS never-started (ENOENT/throw) stays `bound` and is retryable.
+- **One liveness status object.** TS probe produces versioned JSON. Prepare embeds it. Ship, Tugboat, and playbook consume it. They SHALL NOT keep a ledger-derived copy.
+- **One lineage-scoped resume.** `resume_count` on the loop binding. Failed process identity is audit evidence. A new PID does not mint a second grant.
+- **Periodic supervisor heartbeat.** Engine constants, token-guarded atomic writes, injectable timer/clock, cleanup on drive end.
+- **Visible stderr.** Drain pipes, redact, bound, persist. Evidence-write failure still reports the exit in `last_error`.
 
 ## Capabilities
 
@@ -36,30 +37,32 @@ _(none)_
 
 ## Impact
 
-- `core/scripts/factory-release-prepare.ts` — `defaultSpawnCandidateLoop`, `productionDispatchPackLoop`, `isPendingLoopDispatch`, `CandidateLoopSpawn` stdio, binding `"bound"` vs `"dispatched"`.
-- `core/scripts/ship-end-candidate.ts` — reuse `resolveCandidateEngine` (absolute `launcherPath`, candidate SHA). Do not fall back to PATH `pipeline`.
-- `core/scripts/stages/ship-adapter.ts` — `classifyBoundPackLoopLiveness` / `probeBoundPackLoopLive`; ship `last_error` for pre-handoff and dead-pack diagnostics.
-- `core/scripts/loop/handoff.ts` / `core/scripts/loop/supervisor.ts` — consume `loop_run_handoff`; periodic `heartbeat_at`; `supervisor.json` process identity.
-- `core/scripts/loop/types.ts` — heartbeat / resume-record fields if the durable record needs an explicit one-resume marker.
-- Tests: `core/test/factory-release-prepare.test.ts`, `core/test/ship-adapter.test.ts`, plus supervisor heartbeat tests. Inject I/O. No real network, git, or subprocess.
-- Generated `plugin/` after any later `core/` edit. This planning change does not edit `core/`.
+- `core/scripts/factory-release-prepare.ts` — `CandidateInvocation`, `defaultSpawnCandidateLoop`, `productionDispatchPackLoop`, `isPendingLoopDispatch`, four-state binding, stderr drain.
+- `core/scripts/ship-end-candidate.ts` — reuse `resolveCandidateEngine` / `shipEndCliPrefix`. Do not fall back to PATH `pipeline`.
+- `core/scripts/loop/pack-loop-liveness.ts` (new) — authoritative `PackLoopLivenessStatus`.
+- `core/scripts/stages/ship-adapter.ts` — consume that status; ship `last_error`.
+- `core/scripts/loop/handoff.ts` / `core/scripts/loop/store.ts` / `core/scripts/loop/supervisor.ts` — durable handoff write; periodic `heartbeat_at` timer seam.
+- `examples/supervisor/shell/frg-pack-helpers.sh` / `tugboat.sh` — stop ledger-derived `frg_pack_loop_is_live`; read prepare JSON `liveness`.
+- Tests: `core/test/factory-release-prepare.test.ts`, `core/test/ship-adapter.test.ts`, `core/test/tugboat.test.ts`, `core/test/loop-supervisor.test.ts`, new `core/test/pack-loop-liveness.test.ts`. Fake Spawn/store/clock/timer. No real network, git, or subprocess.
+- Generated `plugin/` after any later `core/` edit.
 - Docs: `--engine-track candidate` remains doctor/soak intent, not a binary selector. No `--skip-frg` restore. No `auto_merge`.
 
 ## Acceptance Criteria
 
 - [ ] When pin SHA `P` ≠ candidate SHA `C`, pack-loop spawn execs the candidate launcher for `C` even when `PIPELINE_BIN` is unset. It does not exec PATH `pipeline` / pin `P`.
-- [ ] `--engine-track candidate` on the child argv does not select the binary. Spawn takes an explicit candidate executable, argv, and SHA from the resolved candidate engine.
+- [ ] `--engine-track candidate` on the child argv does not select the binary. Spawn takes a typed `CandidateInvocation` and fails closed if it is missing or SHA-mismatched.
 - [ ] Candidate prepare that writes recovery recipe `publish_unpublished_stage_commit` into the contract does not spawn a pin catalogue that rejects that recipe.
-- [ ] Binding persists `"bound"` before spawn. `"dispatched"` is persisted only after a valid `loop_run_handoff` for the exact loop, with absolute artifact paths and matching `supervisor.json` process identity.
-- [ ] A pack child that exits non-zero before the first valid handoff does not leave `dispatch_state: "dispatched"` with no retry path that can succeed. That tick fails closed. The child exit and stderr surface in ship `last_error`.
+- [ ] Binding persists `bound` before spawn, `starting` after OS accept, `dispatched` only after a valid durable `loop_run_handoff` (realpath-contained paths, candidate SHA, matching `supervisor.json`).
+- [ ] A pack child that exits `0` or non-zero before the first valid handoff persists `failed` and does not leave `dispatch_state: "dispatched"`. That tick fails closed. The child exit and stderr surface in ship `last_error`.
 - [ ] `classifyBoundPackLoopLiveness` does not return `"live"` for a dead-or-missing lock pid plus a non-terminal ledger that has never dispatched an item, or whose supervisor heartbeat is stale.
 - [ ] False `"live"` does not disable the FRG pack wait cap. A dead pack does not stall ship for hours.
-- [ ] Pack-loop spawn does not use `stdio: "ignore"` for child stderr. Bounded redacted stderr lives in pipeline-owned evidence. `last_error` names exit status, a safe excerpt, and the evidence location.
-- [ ] After acknowledgement, one durably recorded resume is allowed for that exact loop and failed process identity. A second liveness loss is terminal. Unreadable identity does not authorize resume.
-- [ ] Supervisor heartbeat advances during a long in-flight cycle, not only after cycle completion. Repository config cannot weaken the engine stale threshold.
-- [ ] A unit test fails if candidate prepare writes `publish_unpublished_stage_commit` into the contract and the spawned loop binary is the pin catalogue that rejects that recipe.
+- [ ] Pack-loop spawn does not use `stdio: "ignore"` for child stderr. Pipes are drained. Bounded redacted stderr lives in pipeline-owned evidence. Evidence-write failure still reports the exit. `last_error` names exit status, a safe excerpt, and the evidence location.
+- [ ] After acknowledgement, one lineage-scoped `resume_count` is allowed for that `loop_run_id`. A second liveness loss is terminal even with a new PID. Unreadable identity does not authorize resume.
+- [ ] Supervisor heartbeat advances during a long in-flight cycle, not only after cycle completion. Repository config cannot weaken the engine stale threshold. The timer is cleared when drive ends.
+- [ ] Ship, Tugboat, and playbook consume the same `PackLoopLivenessStatus` from prepare JSON. `frg_pack_loop_is_live` no longer classifies live from a non-terminal ledger.
+- [ ] A unit test fails if candidate prepare writes `publish_unpublished_stage_commit` into the contract and the spawned executable is the pin launcher.
 - [ ] A unit test fails if dead pid + no `ledger.stop` + no terminal events classifies as `"live"`.
-- [ ] Tests cover candidate-versus-pin execution, pre-handoff failure, the spawn-before-handoff crash window, PID reuse, periodic heartbeat freshness during long work, one-resume enforcement, unreadable authority evidence, diagnostic propagation, and false-live rejection. Tests inject I/O.
+- [ ] Tests cover candidate-versus-pin execution, OS spawn throw, zero and nonzero pre-handoff exits, the spawn-before-handoff crash window, handoff SHA mismatch, concurrent prepare, PID reuse, periodic heartbeat freshness during long work, malformed/future heartbeat, one-resume-then-terminal, unreadable authority evidence, diagnostic propagation, and false-live rejection. Tests inject I/O.
 - [ ] After any later `core/` edit, `node scripts/build.mjs` regenerates `plugin/` in the same change. `npm run ci` is green.
 
 ## Non-goals
