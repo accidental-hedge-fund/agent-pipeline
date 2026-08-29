@@ -588,7 +588,14 @@ export function planningFactsSubreaperArgv(
 }
 
 function resolveContainment(spawnImpl: typeof spawn): ProviderContainment {
-  return spawnImpl === spawn ? createCgroupContainment() : NOOP_PROVIDER_CONTAINMENT;
+  if (spawnImpl !== spawn) return NOOP_PROVIDER_CONTAINMENT;
+  try {
+    return createCgroupContainment();
+  } catch {
+    // Nested cgroup mkdir is not delegated on GitHub Actions. The subreaper
+    // still tracks and SIGKILLs setsid descendants without cgroup.kill.
+    return NOOP_PROVIDER_CONTAINMENT;
+  }
 }
 
 /**
@@ -604,19 +611,37 @@ export function defaultSpawnProvider(
 ): Promise<SpawnProviderResult> {
   return new Promise((resolve) => {
     const start = Date.now();
-    let containment: ProviderContainment;
-    try {
-      containment = containmentArg ?? resolveContainment(spawnImpl);
-    } catch (err) {
+    const failSpawn = (message: string): void => {
       resolve({
         exit_code: -1,
         stdout: Buffer.alloc(0),
-        stderr: Buffer.from(err instanceof Error ? err.message : String(err)),
+        stderr: Buffer.from(message),
         timed_out: false,
         duration_ms: Date.now() - start,
         spawn_error: true,
         descendants_remaining: false,
       });
+    };
+    // Fail closed on a missing subreaper before nested-cgroup mkdir. GitHub
+    // Actions may refuse that mkdir (EACCES); the interpreter check must not
+    // depend on it.
+    if (spawnImpl === spawn) {
+      const probe = planningFactsSubreaperArgv(
+        req.command,
+        req.args,
+        subreaper?.pythonPath,
+        subreaper?.scriptPath,
+      );
+      if ("unavailable" in probe) {
+        failSpawn(probe.unavailable);
+        return;
+      }
+    }
+    let containment: ProviderContainment;
+    try {
+      containment = containmentArg ?? resolveContainment(spawnImpl);
+    } catch (err) {
+      failSpawn(err instanceof Error ? err.message : String(err));
       return;
     }
     let stdout = Buffer.alloc(0);
@@ -670,11 +695,12 @@ export function defaultSpawnProvider(
       return remaining.length > 0 || containment.remainingPids().length > 0;
     };
     let child: ChildProcess;
-    const wrap = spawnImpl === spawn && containment.dir;
     let command = req.command;
     let args = req.args;
-    if (wrap) {
-      const inner = planningFactsContainmentArgv(req, containment.dir as string);
+    if (spawnImpl === spawn) {
+      const inner = containment.dir
+        ? planningFactsContainmentArgv(req, containment.dir)
+        : { command: req.command, args: req.args };
       const wrapped = planningFactsSubreaperArgv(
         inner.command,
         inner.args,

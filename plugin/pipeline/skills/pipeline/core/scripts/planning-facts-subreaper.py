@@ -2,20 +2,35 @@
 # Engine-owned child-subreaper for planning-facts providers.
 # Node does not expose PR_SET_CHILD_SUBREAPER; this trampoline sets it,
 # execs nothing, waits for the inner wrapper, and reaps setsid descendants.
-import ctypes
+# Nested cgroup.kill is not delegated on GitHub Actions, so this process
+# records descendant PIDs from /proc while the inner child is alive and
+# SIGKILLs that set after the inner child exits. Reparenting is not required.
 import os
 import signal
 import subprocess
 import sys
+import threading
 import time
+
+try:
+    import ctypes
+except ImportError:  # pragma: no cover
+    ctypes = None
 
 PR_SET_CHILD_SUBREAPER = 36
 REAP_GRACE_S = 0.5
-REPARENT_WAIT_S = 0.05
+REPARENT_WAIT_S = 0.2
+SCAN_INTERVAL_S = 0.005
 
 
 def become_subreaper():
-    if ctypes.CDLL(None, use_errno=True).prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+    if ctypes is None:
+        return
+    try:
+        if ctypes.CDLL(None, use_errno=True).prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+            sys.stderr.write("containment: PR_SET_CHILD_SUBREAPER failed\n")
+            sys.exit(1)
+    except (OSError, AttributeError):
         sys.stderr.write("containment: PR_SET_CHILD_SUBREAPER failed\n")
         sys.exit(1)
 
@@ -39,7 +54,7 @@ def child_pids():
     return list(pids)
 
 
-def proc_state(pid):
+def proc_stat_fields(pid):
     try:
         with open("/proc/%d/stat" % pid) as fh:
             st = fh.read()
@@ -48,7 +63,51 @@ def proc_state(pid):
     comm_end = st.rfind(")")
     if comm_end == -1 or comm_end + 2 >= len(st):
         return None
-    return st[comm_end + 2]
+    return st[comm_end + 2].split()
+
+
+def proc_state(pid):
+    fields = proc_stat_fields(pid)
+    if not fields:
+        return None
+    return fields[0]
+
+
+def read_ppid(pid):
+    fields = proc_stat_fields(pid)
+    if not fields or len(fields) < 2:
+        return None
+    try:
+        return int(fields[1])
+    except ValueError:
+        return None
+
+
+def collect_descendants(root):
+    by_ppid = {}
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return set()
+    for name in names:
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        if pid == root:
+            continue
+        ppid = read_ppid(pid)
+        if ppid is None:
+            continue
+        by_ppid.setdefault(ppid, []).append(pid)
+    out = set()
+    stack = list(by_ppid.get(root, []))
+    while stack:
+        pid = stack.pop()
+        if pid in out or pid == root:
+            continue
+        out.add(pid)
+        stack.extend(by_ppid.get(pid, []))
+    return out
 
 
 def live_child_pids():
@@ -72,6 +131,8 @@ def reap_zombies():
 
 
 def kill_pid(pid):
+    if pid <= 1 or pid == os.getpid():
+        return
     for target in (-pid, pid):
         try:
             os.kill(target, signal.SIGKILL)
@@ -79,20 +140,18 @@ def kill_pid(pid):
             pass
 
 
-def kill_live_children():
-    for pid in live_child_pids():
+def kill_pids(pids):
+    for pid in pids:
         kill_pid(pid)
 
 
 def reap_remaining():
-    # First poll can be empty: a setsid grandchild is reparented only after
-    # its parent exits. Wait for that before treating the tree as drained.
     reparent_deadline = time.monotonic() + REPARENT_WAIT_S
     while time.monotonic() < reparent_deadline:
         reap_zombies()
         if live_child_pids():
             break
-        time.sleep(0.01)
+        time.sleep(SCAN_INTERVAL_S)
     deadline = time.monotonic() + REAP_GRACE_S
     while True:
         reap_zombies()
@@ -101,11 +160,57 @@ def reap_remaining():
             reap_zombies()
             return True
         if time.monotonic() >= deadline:
-            kill_live_children()
+            kill_pids(live)
             reap_zombies()
             return not live_child_pids()
-        kill_live_children()
-        time.sleep(0.01)
+        kill_pids(live)
+        time.sleep(SCAN_INTERVAL_S)
+
+
+def start_tracker(known):
+    self_pid = os.getpid()
+    stop = threading.Event()
+
+    def scan():
+        while not stop.is_set():
+            known.update(collect_descendants(self_pid))
+            time.sleep(SCAN_INTERVAL_S)
+
+    thread = threading.Thread(target=scan, daemon=True)
+    thread.start()
+    return stop, thread, self_pid
+
+
+def stop_tracker(stop, thread, known, self_pid, inner_pid):
+    deadline = time.monotonic() + REPARENT_WAIT_S
+    while time.monotonic() < deadline:
+        known.update(collect_descendants(self_pid))
+        known.update(live_child_pids())
+        time.sleep(SCAN_INTERVAL_S)
+    stop.set()
+    thread.join(timeout=REAP_GRACE_S)
+    known.discard(self_pid)
+    if inner_pid:
+        known.discard(inner_pid)
+
+
+def terminate_tree(child, known):
+    if child.poll() is None:
+        try:
+            child.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            child.wait(timeout=REAP_GRACE_S)
+        except subprocess.TimeoutExpired:
+            pass
+    known.update(collect_descendants(os.getpid()))
+    known.update(live_child_pids())
+    known.discard(os.getpid())
+    if child.pid:
+        known.discard(child.pid)
+    kill_pids(known)
+    reap_remaining()
 
 
 def main():
@@ -113,24 +218,20 @@ def main():
     if len(sys.argv) < 2:
         sys.stderr.write("containment: subreaper argv is malformed\n")
         sys.exit(1)
+    known = set()
+    stop, thread, self_pid = start_tracker(known)
     child = subprocess.Popen(sys.argv[1:], start_new_session=False)
 
     def on_term(_signum, _frame):
-        if child.poll() is None:
-            try:
-                child.kill()
-            except ProcessLookupError:
-                pass
-            try:
-                child.wait(timeout=REAP_GRACE_S)
-            except subprocess.TimeoutExpired:
-                pass
-        reap_remaining()
+        stop_tracker(stop, thread, known, self_pid, child.pid)
+        terminate_tree(child, known)
         sys.exit(1)
 
     signal.signal(signal.SIGTERM, on_term)
     signal.signal(signal.SIGINT, on_term)
     code = child.wait()
+    stop_tracker(stop, thread, known, self_pid, child.pid)
+    kill_pids(known)
     if not reap_remaining():
         sys.exit(1)
     sys.exit(code if code is not None else 1)

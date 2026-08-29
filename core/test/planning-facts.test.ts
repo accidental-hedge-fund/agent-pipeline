@@ -15,6 +15,7 @@ import {
   constructProviderEnv,
   createCgroupContainment,
   defaultSpawnProvider,
+  NOOP_PROVIDER_CONTAINMENT,
   digestValue,
   emptyPlanningFactBundle,
   extractPlanningFactClaims,
@@ -845,8 +846,7 @@ printf '%s\\n' '{"schema_version":1,"facts":{"alembic_head":"0074"}}'
   assert.equal(fs.existsSync(path.join(dir, "ran.txt")), false, "provider must not run without a subreaper");
 });
 
-test("defaultSpawnProvider cgroup containment kills a setsid daemon before a delayed write lands", async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pf-daemon-"));
+function spawnSetsIdDaemon(dir: string, containment?: ProviderContainment) {
   const script = path.join(dir, "provider.sh");
   fs.writeFileSync(
     script,
@@ -856,17 +856,7 @@ printf '%s\\n' '{"schema_version":1,"facts":{"alembic_head":"0074"}}'
 `,
     { mode: 0o755 },
   );
-  // GitHub Actions does not delegate nested cgroup.kill. The subreaper must
-  // still terminate the setsid descendant; do not skip this assertion there.
-  const inner = createCgroupContainment();
-  const containment: ProviderContainment = {
-    dir: inner.dir,
-    addPid: (pid) => inner.addPid(pid),
-    remainingPids: () => inner.remainingPids(),
-    killRemaining() {},
-    close: () => inner.close(),
-  };
-  const result = await defaultSpawnProvider(
+  return defaultSpawnProvider(
     {
       command: script,
       args: [],
@@ -880,8 +870,44 @@ printf '%s\\n' '{"schema_version":1,"facts":{"alembic_head":"0074"}}'
     spawn,
     containment,
   );
+}
+
+test("defaultSpawnProvider cgroup containment kills a setsid daemon before a delayed write lands", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pf-daemon-"));
+  // GitHub Actions does not delegate nested cgroup.kill. Nested cgroup mkdir
+  // may also return EACCES. The subreaper must still terminate the setsid
+  // descendant; do not skip this assertion there.
+  let containment: ProviderContainment = {
+    addPid() {},
+    remainingPids: () => [],
+    killRemaining() {},
+    close() {},
+  };
+  try {
+    const inner = createCgroupContainment();
+    containment = {
+      dir: inner.dir,
+      addPid: (pid) => inner.addPid(pid),
+      remainingPids: () => inner.remainingPids(),
+      killRemaining() {},
+      close: () => inner.close(),
+    };
+  } catch {
+    /* nested cgroup is optional; subreaper must contain without it */
+  }
+  const result = await spawnSetsIdDaemon(dir, containment);
   await new Promise((r) => setTimeout(r, 600));
   assert.equal(fs.existsSync(path.join(dir, "pwned.txt")), false, "daemonized descendant must not write after observation");
+  assert.equal(result.timed_out, false);
+  assert.equal(result.spawn_error ?? false, false);
+  assert.match(result.stdout.toString("utf8"), /alembic_head/);
+});
+
+test("defaultSpawnProvider kills a setsid daemon without a nested cgroup dir", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pf-daemon-nocgroup-"));
+  const result = await spawnSetsIdDaemon(dir, NOOP_PROVIDER_CONTAINMENT);
+  await new Promise((r) => setTimeout(r, 600));
+  assert.equal(fs.existsSync(path.join(dir, "pwned.txt")), false, "subreaper must contain setsid descendants without cgroup.kill");
   assert.equal(result.timed_out, false);
   assert.equal(result.spawn_error ?? false, false);
   assert.match(result.stdout.toString("utf8"), /alembic_head/);
