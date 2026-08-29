@@ -632,13 +632,15 @@ export function defaultSpawnProvider(
     });
     const reapContainment = async (): Promise<boolean> => {
       const remaining = containment.remainingPids();
-      if (remaining.length === 0) return false;
+      // Always send cgroup.kill (or per-pid SIGKILL). A setsid grandchild can
+      // sit in the nested cgroup while cgroup.procs looks empty for a tick.
+      // The empty-procs short-circuit skipped kill on GitHub Actions (#1300 CI).
       containment.killRemaining();
       const deadline = Date.now() + PROVIDER_KILL_GRACE_MS + PROVIDER_KILL_FOLLOWUP_MS;
       while (Date.now() < deadline && containment.remainingPids().length > 0) {
         await new Promise((r) => setTimeout(r, 10));
       }
-      return true;
+      return remaining.length > 0 || containment.remainingPids().length > 0;
     };
     let child: ChildProcess;
     const wrap = spawnImpl === spawn && containment.dir;

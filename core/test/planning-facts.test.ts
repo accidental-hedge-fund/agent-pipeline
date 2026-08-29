@@ -715,6 +715,26 @@ test("defaultSpawnProvider does not succeed while containment still has descenda
   assert.equal(result.exit_code, 0);
 });
 
+test("defaultSpawnProvider still kills containment when cgroup.procs looks empty", async () => {
+  const child = fakeProviderChild();
+  let killed = 0;
+  const containment: ProviderContainment = {
+    dir: "/sys/fs/cgroup/fake",
+    addPid() {},
+    remainingPids: () => [],
+    killRemaining() {
+      killed += 1;
+    },
+    close() {},
+  };
+  const spawnImpl = ((..._args: unknown[]) => child) as unknown as typeof import("node:child_process").spawn;
+  const pending = defaultSpawnProvider(boundedSpawnReq, spawnImpl, containment);
+  child.emit("close", 0);
+  const result = await pending;
+  assert.ok(killed >= 1, "empty cgroup.procs must not skip cgroup.kill");
+  assert.equal(result.descendants_remaining, false);
+});
+
 test("escaped descendants after a successful-looking spawn fail containment", async () => {
   const observation = await observePlanningFacts({
     cfg: cfg(),
