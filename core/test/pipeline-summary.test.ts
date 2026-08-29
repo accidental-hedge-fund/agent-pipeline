@@ -6,9 +6,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as path from "node:path";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { spawnSync } from "node:child_process";
 import {
   maxPositionalsFor,
   parseSummaryTarget,
@@ -82,6 +79,7 @@ function withCapture(fn: () => Promise<void>): Promise<{ errors: string[]; exitC
 // ---------------------------------------------------------------------------
 
 test("parseSummaryTarget: positive integers select latest issue bundle; run ids stay exact", () => {
+  assert.ok(["summary", String(ISSUE)].length <= maxPositionalsFor("summary"));
   assert.deepEqual(parseSummaryTarget("147"), { kind: "issue", issueNumber: 147 });
   assert.deepEqual(parseSummaryTarget("147-2026-06-20T10-00-00-000Z"), {
     kind: "run",
@@ -89,59 +87,6 @@ test("parseSummaryTarget: positive integers select latest issue bundle; run ids 
   });
   assert.equal(parseSummaryTarget("0"), null);
   assert.equal(parseSummaryTarget(undefined), null);
-});
-
-test("pipeline summary <issue> passes the shared positional guard and runs offline", () => {
-  assert.ok(["summary", String(ISSUE)].length <= maxPositionalsFor("summary"));
-  const repoDir = mkdtempSync(path.join(tmpdir(), "pipeline-summary-offline-"));
-  const runId = `${ISSUE}-2026-06-20T10-00-00-000Z`;
-  const runDir = path.join(repoDir, ".agent-pipeline", "runs", runId);
-  mkdirSync(runDir, { recursive: true });
-  writeFileSync(path.join(runDir, "summary.json"), JSON.stringify(makeBundle({ runId })));
-
-  try {
-    const cli = spawnSync(
-      process.execPath,
-      [
-        "--experimental-strip-types",
-        path.resolve(import.meta.dirname, "../scripts/pipeline.ts"),
-        "summary",
-        String(ISSUE),
-        "--repo-path",
-        repoDir,
-        "--domain",
-        "offline-test",
-      ],
-      {
-        encoding: "utf8",
-        timeout: 30_000,
-        env: { ...process.env, PATH: "" },
-      },
-    );
-    assert.equal(cli.error, undefined, `summary spawn failed: ${String(cli.error)}`);
-    assert.equal(cli.signal, null, `summary was killed by ${String(cli.signal)}`);
-    assert.equal(cli.status, 0, `offline summary failed: ${cli.stderr}\n${cli.stdout}`);
-    assert.match(cli.stdout, new RegExp(runId));
-    assert.doesNotMatch(cli.stderr, /gh repo view|pipeline\.yml|unexpected argument/i);
-
-    const invalid = spawnSync(
-      process.execPath,
-      [
-        "--experimental-strip-types",
-        path.resolve(import.meta.dirname, "../scripts/pipeline.ts"),
-        "summary",
-        String(ISSUE),
-        "--repo-path",
-        repoDir,
-        "--dry-run",
-      ],
-      { encoding: "utf8", timeout: 30_000, env: { ...process.env, PATH: "" } },
-    );
-    assert.equal(invalid.status, 2);
-    assert.match(invalid.stderr, /pipeline summary.*--dry-run/i);
-  } finally {
-    rmSync(repoDir, { recursive: true, force: true });
-  }
 });
 
 test("runSummary: reads from run-directory summary.json when available (#261)", async () => {

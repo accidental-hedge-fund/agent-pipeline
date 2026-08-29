@@ -503,14 +503,19 @@ function findLiveRunLocks({
 }
 
 /** Format the refusal/warning message naming every blocking lock and the remedy. */
-function formatLiveRunMessage(liveLocks, { asWarning }) {
+function formatLiveRunMessage(
+  liveLocks,
+  { asWarning, action = "updating", allowForce = true },
+) {
   const lines = liveLocks.map((l) => `    ${l.path} (pid ${l.pid})`);
   const header = asWarning
     ? "A pipeline run is in progress — updating would swap files underneath it. Proceeding anyway (--force):"
-    : "A pipeline run is in progress — updating would swap files underneath it. Blocking locks:";
+    : `A pipeline run is in progress — ${action} would change files underneath it. Blocking locks:`;
   const footer = asWarning
     ? ""
-    : "\n  Retry after those runs finish, or re-run with --force to override.";
+    : allowForce
+      ? "\n  Retry after those runs finish, or re-run with --force to override."
+      : "\n  Retry after those runs finish; uninstall does not override live-run protection.";
   return `${header}\n${lines.join("\n")}${footer}`;
 }
 
@@ -613,14 +618,47 @@ function beginInstallerOperation(lockPath = INSTALLER_OPERATION_LOCK_PATH) {
   );
 }
 
-function endInstallerOperation(token, lockPath = INSTALLER_OPERATION_LOCK_PATH) {
-  const released = releaseInstallerOperationLock(token, lockPath);
+function endInstallerOperation(
+  token,
+  lockPath = INSTALLER_OPERATION_LOCK_PATH,
+  release = releaseInstallerOperationLock,
+) {
+  const released = release(token, lockPath);
   if (released.ok) return;
-  warn(
+  fail(
     `Could not release installer-operation lock at ${lockPath}: ${released.error.message}. ` +
       `After this installer exits, confirm no npm ci child remains, then remove that exact ` +
       `lock and retry.`,
   );
+}
+
+function appendCleanupFailure(primary, cleanup) {
+  if (!primary) return cleanup;
+  const cleanupMessage = cleanup instanceof Error ? cleanup.message : String(cleanup);
+  if (primary instanceof InstallFailure) {
+    return new InstallFailure(`${primary.message}\nAdditionally, cleanup failed: ${cleanupMessage}`);
+  }
+  return new AggregateError(
+    [primary, cleanup],
+    `Installer failed and cleanup also failed: ${cleanupMessage}`,
+  );
+}
+
+function releaseDependencyInstallLock(
+  token,
+  lockPath,
+  { readFile = readFileSync, remove = unlinkSync } = {},
+) {
+  try {
+    const observed = readFile(lockPath, "utf8");
+    if (observed !== token) {
+      return { ok: false, error: new Error("the lock is owned by another process") };
+    }
+    remove(lockPath);
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error };
+  }
 }
 
 function findDependencyInstallLocks(hosts) {
@@ -1321,17 +1359,12 @@ function installHost(host, dryRun) {
         }
       }
     } finally {
-      try {
-        if (readFileSync(dependencyLockPath, "utf8") === dependencyLockToken) {
-          unlinkSync(dependencyLockPath);
-        }
-      } catch (err) {
-        if (err.code !== "ENOENT") {
-          warn(
-            `Could not release dependency install lock at ${dependencyLockPath}: ${err.message}. ` +
-              "After this installer exits, confirm no npm ci child remains, then remove that exact lock and retry, or reinstall.",
-          );
-        }
+      const released = releaseDependencyInstallLock(dependencyLockToken, dependencyLockPath);
+      if (!released.ok) {
+        fail(
+          `Could not release dependency install lock at ${dependencyLockPath}: ${released.error.message}. ` +
+            "After this installer exits, confirm no npm ci child remains, then remove that exact lock and retry, or reinstall.",
+        );
       }
     }
   } else {
@@ -1339,13 +1372,15 @@ function installHost(host, dryRun) {
   }
   // Managed command surface from install profile commandsKind (#784).
   installCommandsForHost(host, dest, false);
-  log(`  ✓ installed. ${cfg.postInstall}`);
+  log(`  ✓ host tree ready. ${cfg.postInstall}`);
 }
 
 function uninstallHost(host, dryRun) {
   const cfg = HOSTS[host];
   const dest = join(cfg.skillsDir(), "pipeline");
   const skillPresent = pathPresent(dest);
+  const unmarkedTree =
+    skillPresent && cfg.installMode === "tree" && !existsSync(join(dest, MANAGED_MARKER));
 
   // Hosts with an external command dir (OpenCode LLM-mediated / leftover Claude
   // pipeline:*.md / OMP native): always attempt command cleanup even when the
@@ -1353,6 +1388,11 @@ function uninstallHost(host, dryRun) {
   if (hostHasExternalCommandCleanup(cfg)) {
     if (!skillPresent) {
       log(`→ ${cfg.label}: nothing installed at ${dest}`);
+    } else if (unmarkedTree) {
+      log(
+        `→ ${cfg.label}: preserving unmarked skill at ${dest} ` +
+          `(no ${MANAGED_MARKER} ownership marker)`,
+      );
     } else {
       log(`→ ${cfg.label}: removing ${dest}`);
       if (dryRun) {
@@ -1369,6 +1409,13 @@ function uninstallHost(host, dryRun) {
   // pathPresent so a broken Grok symlink is still removable.
   if (!skillPresent) {
     log(`→ ${cfg.label}: nothing installed at ${dest}`);
+    return;
+  }
+  if (unmarkedTree) {
+    log(
+      `→ ${cfg.label}: preserving unmarked skill at ${dest} ` +
+        `(no ${MANAGED_MARKER} ownership marker)`,
+    );
     return;
   }
   log(`→ ${cfg.label}: removing ${dest}`);
@@ -1788,6 +1835,7 @@ async function main() {
     // can wait on installer-owned dependency provisioning.
     const installerOperationToken = dryRun ? null : beginInstallerOperation();
     let holdingUpdateLock = false;
+    let operationFailure = null;
     try {
       // Live-run deferral (#450): only guards a host that already has an
       // installed core — a first install onto a fresh host has nothing to race.
@@ -1837,10 +1885,19 @@ async function main() {
         }
         installHost(h, dryRun);
       }
+    } catch (error) {
+      operationFailure = error;
     } finally {
       if (holdingUpdateLock) releaseUpdateLock();
-      if (installerOperationToken) endInstallerOperation(installerOperationToken);
+      if (installerOperationToken) {
+        try {
+          endInstallerOperation(installerOperationToken);
+        } catch (cleanupError) {
+          operationFailure = appendCleanupFailure(operationFailure, cleanupError);
+        }
+      }
     }
+    if (operationFailure) throw operationFailure;
 
     // Dependency-prompting phase: run after core install, never blocks completion.
     const repoPath = findGitRoot(process.cwd());
@@ -1858,6 +1915,7 @@ async function main() {
   } else if (verb === "uninstall") {
     const installerOperationToken = dryRun ? null : beginInstallerOperation();
     let holdingUpdateLock = false;
+    let operationFailure = null;
     try {
       const anyExistingInstall =
         !dryRun && hosts.some((h) => pathPresent(join(HOSTS[h].skillsDir(), "pipeline")));
@@ -1871,7 +1929,13 @@ async function main() {
         holdingUpdateLock = true;
         const liveLocks = findLiveRunLocks({ internalStartingLockPid });
         if (liveLocks.length > 0) {
-          fail(formatLiveRunMessage(liveLocks, { asWarning: false }));
+          fail(
+            formatLiveRunMessage(liveLocks, {
+              asWarning: false,
+              action: "uninstalling",
+              allowForce: false,
+            }),
+          );
         }
         const dependencyLocks = findDependencyInstallLocks(hosts);
         if (dependencyLocks.length > 0) {
@@ -1881,11 +1945,20 @@ async function main() {
 
       log(`Uninstalling agent-pipeline ← [${hosts.join(", ")}]${dryRun ? " (dry-run)" : ""}\n`);
       for (const h of hosts) uninstallHost(h, dryRun);
-      log("\nDone.");
+    } catch (error) {
+      operationFailure = error;
     } finally {
       if (holdingUpdateLock) releaseUpdateLock();
-      if (installerOperationToken) endInstallerOperation(installerOperationToken);
+      if (installerOperationToken) {
+        try {
+          endInstallerOperation(installerOperationToken);
+        } catch (cleanupError) {
+          operationFailure = appendCleanupFailure(operationFailure, cleanupError);
+        }
+      }
     }
+    if (operationFailure) throw operationFailure;
+    log("\nDone.");
   } else {
     fail(`Unknown command '${verb}'. Use install, update, or uninstall.`);
   }
@@ -1934,6 +2007,10 @@ export {
   uninstallHost,
   findLiveRunLocks,
   formatLiveRunMessage,
+  releaseInstallerOperationLock,
+  endInstallerOperation,
+  appendCleanupFailure,
+  releaseDependencyInstallLock,
   acquireUpdateLock,
   releaseUpdateLock,
   verifyUpdateLockOwnership,

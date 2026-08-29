@@ -10,6 +10,9 @@
 - [x] Replace removed per-verb host tokens in source SKILLs, docs, deprecation output, and coupled tests; regenerate derived artifacts.
 - [x] Serialize all non-dry-run installers through publication and dependency prewarm; prove a concurrent fresh installer cannot replace an active tree or start a second `npm ci` while a first launcher can still wait on the core-local owner.
 - [x] Run targeted tests, `node scripts/build.mjs`, OpenSpec validation, and full `npm run ci`.
+- [x] Resolve current-head review blockers: preserve unmarked personal skills, constrain eval packaging allowances to exact outputs, preserve unrelated `plugin/` files during generation, remove `run` from advertised command catalogs, and prove real installed `doctor`/`status` dispatch.
+- [x] Reconcile remaining runtime and living-spec core-mirror terminology; rerun focused regressions and the Standards review axis.
+- [x] Complete the Spec review axis after archived-provenance validation.
 - [ ] Commit, rebase onto the latest train-updated `origin/main` if needed, and push PR #1222 with an exact force-with-lease.
 - [ ] Resume the existing Pipeline issue after deterministic evidence; require current-head review and green PR CI.
 - [ ] Merge PR #1222 into `main`, prove containment, and reconcile the durable goal-loop ledger.
@@ -17,10 +20,10 @@
 
 ## Review
 
-- Installer lifecycle coverage passes: 162 installer tests plus 6 pre-commit-hook tests (168/168), including concurrent fresh install, uninstall serialization, abandoned ownership, launcher self-heal, and cleanup-failure recovery.
+- Installer lifecycle coverage passes: 167 installer tests plus 6 pre-commit-hook tests, including concurrent fresh install, uninstall serialization, abandoned ownership, launcher self-heal, and cleanup-failure recovery.
 - OpenSpec passes 319/319 under the repository-required Node 24 runtime. The living and archived `eval-fixture-contract` requirement now use a normative `SHALL permit` statement accepted by the pinned/installed validators.
-- Full `npm run ci` exits 0 on 2026-08-29: 9,420 core tests, build freshness, install smoke, launcher smoke (19/19), OpenSpec, docs freshness, and script suites all pass.
-- Dependency/locking adversarial review approved the final operation-lock ordering and failure unwinding. Current-head standards/spec review, PR CI, merge, and base-containment proof remain pending.
+- Full `npm run ci` exits 0 on 2026-08-29: core tests, build freshness, install smoke, launcher smoke, OpenSpec, docs freshness, and script suites all pass.
+- Current-head Standards and Spec reviews both approve the #1048 delta with no unresolved P0/P1/P2 findings. PR CI, merge, and base-containment proof remain pending.
 
 ---
 

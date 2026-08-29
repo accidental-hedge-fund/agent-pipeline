@@ -1,10 +1,16 @@
 // Documentation metadata co-located with COMMAND_REGISTRY (#597).
 //
 // Dispatch fields live only in command-registry.ts. This module supplies the
-// human-facing summary/usage text consumed by the CLI reference generator.
-// Adding or editing entries here MUST NOT alter validateFlags / lookupCommand.
+// remaining human-facing summary/usage text consumed by the CLI reference
+// generator. In-scope host verbs come from operation-surface.ts (#1048).
+// Adding or editing either catalog MUST NOT alter validateFlags / lookupCommand.
 
 import { COMMAND_REGISTRY } from "./command-registry.ts";
+import {
+  OPERATION_SURFACE,
+  type OperationSurfaceEntry,
+  type OperationSection,
+} from "./operation-surface.ts";
 
 /** Per-command documentation metadata for the generated CLI reference. */
 export interface CommandDoc {
@@ -21,16 +27,16 @@ export interface CommandDoc {
    * docs and SKILL command tables (hidden / agent-only / legacy-only surface).
    * Defaults to true when omitted from a complete CommandDoc object.
    */
-  documented: boolean;
+  documented?: boolean;
   /** Optional grouping for docs/cli.md section order. */
-  section?: "advance" | "lifecycle" | "factory" | "observability" | "config" | "other";
+  section?: OperationSection;
 }
 
 /**
  * Documentation map keyed by COMMAND_REGISTRY keywords.
  * Every registry key SHOULD appear here; missing keys are treated as undocumented.
  */
-export const COMMAND_DOCS: Record<string, CommandDoc> = {
+const BASE_COMMAND_DOCS: Record<string, CommandDoc> = {
   advance: {
     summary: "Durable autonomous one-item drive (default when invoked with an issue number)",
     usage: "N [--sha <sha>]",
@@ -46,58 +52,8 @@ export const COMMAND_DOCS: Record<string, CommandDoc> = {
   run: {
     summary: "Advance alias; use with --detach for a legacy raw detached run (desktop launchers)",
     usage: "run <n> [--detach]",
-    documented: true,
+    documented: false,
     section: "advance",
-  },
-  status: {
-    summary: "Read-only — print stage, blocker, PR, last review",
-    usage: "status <n>",
-    documented: true,
-    section: "lifecycle",
-  },
-  unblock: {
-    summary: "Post an answer and clear the blocked label",
-    usage: 'unblock <n> "<answer>"',
-    documented: true,
-    section: "lifecycle",
-  },
-  override: {
-    summary: "Disposition a review finding and auto-resume the advance loop",
-    usage: 'override <n> "<key>: <reason>"',
-    documented: true,
-    section: "lifecycle",
-  },
-  "recover-parked": {
-    summary:
-      "One supervisor pass for a parked issue: deterministic recover first (including publish of an unpublished stage commit), then reflow only stale/DNR/below-high residuals (never auto-override HIGH/CRITICAL/security); pre-PR engine parks re-enter without a linked PR; re-enter single if clear",
-    usage: "recover-parked <n> [--json] [--dry-run]",
-    documented: true,
-    section: "lifecycle",
-  },
-  summary: {
-    summary: "Print the run evidence bundle for an issue number or exact run-id",
-    usage: "summary <issue-number|run-id>",
-    documented: true,
-    section: "observability",
-  },
-  doctor: {
-    summary:
-      "Deterministic preflight check; print summary, exit 0/1. Opt-in --harness-smoke adds one cheap model call per unique configured harness treatment",
-    usage: "doctor [--json|--is-ok] [--fail-fast] [--harness-smoke]",
-    documented: true,
-    section: "lifecycle",
-  },
-  init: {
-    summary: "Ensure pipeline labels and scaffold .github/pipeline.yml",
-    usage: "init",
-    documented: true,
-    section: "lifecycle",
-  },
-  cleanup: {
-    summary: "Sweep merged-PR worktrees and delete their local branches",
-    usage: "cleanup",
-    documented: true,
-    section: "lifecycle",
   },
   "remove-worktree": {
     summary:
@@ -106,69 +62,16 @@ export const COMMAND_DOCS: Record<string, CommandDoc> = {
     documented: true,
     section: "lifecycle",
   },
-  intake: {
-    summary: "Spec a rough description into a GitHub issue and ROADMAP PR",
-    usage: 'intake --description "<text>" [--release vX.Y.Z] [--dry-run]',
-    documented: true,
-    section: "factory",
-  },
-  decompose: {
-    summary:
-      "Break an epic issue into dependency-linked child issues and a ROADMAP PR (dry-run default; --apply writes; not intake / not roadmap-order-only / not loop-execute)",
-    usage:
-      'decompose --epic <N> [--description "…"] [--apply] [--release vX.Y.Z] [--max-children N] [--max-effort S|M|L|XL] [--allow-xl]',
-    documented: true,
-    section: "factory",
-  },
-  triage: {
-    summary: "Set a pre-pipeline stage label (ready or backlog) on an issue. needs-spec is an admission hold: apply the spec, then triage --stage ready.",
-    usage: "triage <n> --stage ready|backlog",
-    documented: true,
-    section: "factory",
-  },
-  sweep: {
-    summary: "Batch re-spec thin issues and reconcile ROADMAP.md",
-    usage: "sweep [--apply] [--repo owner/name]",
-    documented: true,
-    section: "factory",
-  },
   backfill: {
     summary: "Preview or apply OpenSpec coverage for legacy behavior (spec-only PR)",
     usage: "backfill [--apply] [--capability <name>]",
     documented: true,
     section: "factory",
   },
-  roadmap: {
-    summary:
-      "Analyze open backlog into a dependency-aware scored roadmap; under SemVer, dry-run lists full milestone reconciliation actions and --apply converges open issues to the reviewed manifest (fingerprint-gated)",
-    usage: "roadmap [--apply] [--next <n>]",
-    documented: true,
-    section: "factory",
-  },
-  merge: {
-    summary: "Operator-authorized squash merge of a ready-to-deploy PR (never called by the advance loop)",
-    usage: "merge <pr>",
-    documented: true,
-    section: "lifecycle",
-  },
-  "merge-queue": {
-    summary: "Operator-authorized sequential merge of ready-to-deploy PRs; dry-run by default; optional prepare-only release-when-complete",
-    usage: "merge-queue --milestone <m> [--apply] [--release-when-complete --release-version <ver>]",
-    documented: true,
-    section: "lifecycle",
-  },
   train: {
     summary:
       "Operator-authorized integrate train: base-eligible frontiers advance via one loop wave each (recovery inside the wave); optionally serial-merge with base containment; independent R2D siblings may merge while a peer is parked (never called by the advance loop)",
     usage: "train --milestone <m>|--issues <n,n> [--merge] [--json] [--dry-run]",
-    documented: true,
-    section: "lifecycle",
-  },
-  release: {
-    summary:
-      "Prepare a release PR from the matching GitHub milestone plan (or finish-merge one); finish never tags; ship-end ensure-tag creates vX.Y.Z from on-disk HMAC latest.json when FRG is gitignored; --dry-run reports milestone presence/open issues",
-    usage:
-      'release <version> [--theme "..."] [--dry-run|--json] [--no-edit] [--skip-frg] | release finish <pr> [--json] | release ensure-tag <X.Y.Z> <merge-oid> --packed-candidate <sha>',
     documented: true,
     section: "lifecycle",
   },
@@ -210,18 +113,6 @@ export const COMMAND_DOCS: Record<string, CommandDoc> = {
       "engine-promote --for <X.Y.Z> [--host all|codex|claude|grok|opencode|omp] [--dry-run] [--json] [--skip-install] [--skip-frg]",
     documented: true,
     section: "factory",
-  },
-  logs: {
-    summary: "List or stream pipeline run logs (events --follow exits 0 on terminal run_complete)",
-    usage: "logs [<run-id>] [--events] [-f] [--no-until-terminal]",
-    documented: true,
-    section: "observability",
-  },
-  loop: {
-    summary: "Durable multi-item run — driven in-repo by the pipeline's own loop supervisor",
-    usage: "loop --milestone <m>|--label <l>|--range a-b [--resume <run-id>] [--audit] [--follow]",
-    documented: true,
-    section: "advance",
   },
   scoreboard: {
     summary:
@@ -321,6 +212,48 @@ export const COMMAND_DOCS: Record<string, CommandDoc> = {
   },
 };
 
+/**
+ * Overlay catalog-owned documentation onto the broader registry metadata.
+ * Removing an in-scope operation hides that catalog entry; adding or editing
+ * one changes generated CLI and SKILL output without a second prose edit.
+ */
+export function commandDocsForOperationSurface(
+  surface: readonly OperationSurfaceEntry[],
+  baseDocs: Record<string, CommandDoc> = BASE_COMMAND_DOCS,
+): Record<string, CommandDoc> {
+  const docs = { ...baseDocs };
+  const supplied = new Set<string>();
+
+  for (const op of surface) {
+    if (!op.name.trim()) throw new Error("OPERATION_SURFACE contains an empty name");
+    if (supplied.has(op.name)) {
+      throw new Error(`OPERATION_SURFACE contains duplicate operation: ${op.name}`);
+    }
+    supplied.add(op.name);
+    docs[op.name] = {
+      summary: op.desc,
+      usage: op.usage,
+      documented: true,
+      section: op.section,
+    };
+  }
+
+  // A caller-provided surface is authoritative for the catalog-owned names.
+  // Registry-only commands outside this in-scope catalog keep their existing
+  // documentation metadata.
+  for (const op of OPERATION_SURFACE) {
+    if (supplied.has(op.name) || !docs[op.name]) continue;
+    docs[op.name] = { ...docs[op.name], documented: false };
+  }
+
+  return docs;
+}
+
+/** Documentation metadata with OPERATION_SURFACE as the authoritative overlay. */
+export const COMMAND_DOCS: Record<string, CommandDoc> = commandDocsForOperationSurface(
+  OPERATION_SURFACE,
+);
+
 const SECTION_ORDER: NonNullable<CommandDoc["section"]>[] = [
   "advance",
   "lifecycle",
@@ -345,10 +278,15 @@ export interface DocumentedCommand {
 export function listDocumentedCommands(
   registry: Record<string, unknown> = COMMAND_REGISTRY,
   docs: Record<string, CommandDoc> = COMMAND_DOCS,
+  operationSurface?: readonly OperationSurfaceEntry[],
 ): DocumentedCommand[] {
+  const effectiveSurface = operationSurface ?? (docs === COMMAND_DOCS ? OPERATION_SURFACE : undefined);
+  const effectiveDocs = effectiveSurface
+    ? commandDocsForOperationSurface(effectiveSurface, docs)
+    : docs;
   const out: DocumentedCommand[] = [];
   for (const keyword of Object.keys(registry)) {
-    const doc = docs[keyword];
+    const doc = effectiveDocs[keyword];
     if (!doc || doc.documented === false) continue;
     if (!doc.summary?.trim() || !doc.usage?.trim()) continue;
     out.push({

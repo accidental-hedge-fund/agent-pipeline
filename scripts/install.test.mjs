@@ -24,6 +24,7 @@ import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 import { resolveEnginesNode } from "./ensure-engines-node.mjs";
+import { makeInstalledDispatchFixture } from "./install-dispatch-fixture.mjs";
 
 import {
   MANAGED_MARKER,
@@ -50,6 +51,9 @@ import {
   parseArgs,
   findLiveRunLocks,
   formatLiveRunMessage,
+  endInstallerOperation,
+  appendCleanupFailure,
+  releaseDependencyInstallLock,
   acquireUpdateLock,
   releaseUpdateLock,
   verifyUpdateLockOwnership,
@@ -1325,6 +1329,16 @@ test("formatLiveRunMessage: warning form names the overridden locks", () => {
   assert.match(msg, /111/);
 });
 
+test("formatLiveRunMessage: uninstall refusal never recommends unsupported --force", () => {
+  const msg = formatLiveRunMessage(
+    [{ path: "/tmp/pipeline-a-1.lock", pid: 111 }],
+    { asWarning: false, action: "uninstalling", allowForce: false },
+  );
+  assert.match(msg, /uninstalling would change files/);
+  assert.match(msg, /uninstall does not override/);
+  assert.doesNotMatch(msg, /--force/);
+});
+
 // ---------------------------------------------------------------------------
 // Wired guard — real CLI subprocess, fabricated "existing install" (no real
 // npm ci / core copy needed to exercise the pre-copy refusal path) and an
@@ -1719,6 +1733,51 @@ test("releaseUpdateLock: refuses to release a lock owned by another process (#45
   }
 });
 
+test("endInstallerOperation: release failure is terminal with exact recovery", () => {
+  assert.throws(
+    () =>
+      endInstallerOperation("owner", "/tmp/operation.lock", () => ({
+        ok: false,
+        error: new Error("injected unlink failure"),
+      })),
+    (error) => {
+      assert.match(error.message, /Could not release installer-operation lock/);
+      assert.match(error.message, /injected unlink failure/);
+      assert.match(error.message, /remove that exact lock and retry/);
+      return true;
+    },
+  );
+});
+
+test("releaseDependencyInstallLock: unlink or foreign ownership fails closed", () => {
+  const unlinkFailure = releaseDependencyInstallLock("owner", "/tmp/dependency.lock", {
+    readFile: () => "owner",
+    remove: () => {
+      throw new Error("injected unlink failure");
+    },
+  });
+  assert.equal(unlinkFailure.ok, false);
+  assert.match(unlinkFailure.error.message, /injected unlink failure/);
+
+  const foreign = releaseDependencyInstallLock("owner", "/tmp/dependency.lock", {
+    readFile: () => "foreign",
+    remove: () => assert.fail("foreign lock must not be removed"),
+  });
+  assert.equal(foreign.ok, false);
+  assert.match(foreign.error.message, /owned by another process/);
+});
+
+test("appendCleanupFailure preserves the primary failure and lock recovery", () => {
+  const combined = appendCleanupFailure(
+    new Error("primary install failure"),
+    new Error("operation lock recovery"),
+  );
+  assert.match(combined.message, /Installer failed and cleanup also failed/);
+  assert.match(combined.message, /operation lock recovery/);
+  assert.ok(combined instanceof AggregateError);
+  assert.match(combined.errors[0].message, /primary install failure/);
+});
+
 // ---------------------------------------------------------------------------
 // Grok skill path (#731) — --host grok symlink materialization + help text
 // ---------------------------------------------------------------------------
@@ -2104,7 +2163,10 @@ test("install --host claude --dry-run: writes no Claude skill tree (#1048)", () 
 test("install --host claude: installed launcher dispatches doctor and status without slash files (#1048)", () => {
   const claudeTmp = makeTmp();
   const lockTmp = makeTmp();
+  let doctorResult;
   try {
+    const { repoDir, domain, fakeBin, fakeNode } = makeInstalledDispatchFixture(claudeTmp);
+    doctorResult = join(tmpdir(), `pipeline-${domain}-doctor-result.json`);
     const install = runInstaller(["install", "--host", "claude"], {
       CLAUDE_CONFIG_DIR: claudeTmp,
       TMPDIR: lockTmp,
@@ -2126,33 +2188,72 @@ test("install --host claude: installed launcher dispatches doctor and status wit
       TMPDIR: lockTmp,
       TMP: lockTmp,
       TEMP: lockTmp,
+      PATH: `${fakeBin}${delimiter}${process.env.PATH ?? ""}`,
+      AGENT_PIPELINE_NODE: fakeNode,
     };
-    const doctor = spawnSync(process.execPath, [shim, "doctor", "--is-ok"], {
+    const ghProbe = spawnSync("gh", ["repo", "view", "example/repo"], {
       encoding: "utf8",
-      timeout: 60_000,
       env,
+      cwd: repoDir,
     });
-    const doctorOut = `${doctor.stdout}${doctor.stderr}`;
-    assert.doesNotMatch(
-      doctorOut,
-      /unrecognized sub-command/,
-      `doctor must dispatch as a CLI verb: ${doctorOut}`,
+    assert.equal(ghProbe.status, 0, `fake gh probe failed: ${ghProbe.stderr}`);
+    assert.equal(ghProbe.stdout.trim(), "example/repo");
+    const doctor = spawnSync(
+      process.execPath,
+      [shim, "doctor", "--json"],
+      {
+        encoding: "utf8",
+        timeout: 60_000,
+        env,
+        cwd: repoDir,
+      },
     );
-    assert.doesNotMatch(doctorOut, /pipeline:doctor\.md/);
+    assert.equal(doctor.error, undefined, `doctor spawn failed: ${String(doctor.error)}`);
+    assert.equal(doctor.signal, null, `doctor was killed by ${String(doctor.signal)}`);
+    assert.notEqual(
+      doctor.stdout.trim(),
+      "",
+      `doctor returned no JSON payload (exit ${String(doctor.status)}): ${doctor.stderr}`,
+    );
+    const doctorPayload = JSON.parse(doctor.stdout);
+    assert.equal(doctorPayload.schema_version, "1");
+    assert.ok(["ok", "warnings"].includes(doctorPayload.status));
+    const doctorChecks = Object.fromEntries(
+      doctorPayload.checks.map((check) => [check.name, check]),
+    );
+    assert.equal(doctorChecks["cli:gh"]?.status, "pass");
+    assert.equal(doctorChecks["github-auth"]?.status, "pass");
+    assert.equal(
+      doctorChecks["repo-access"]?.status,
+      "pass",
+      JSON.stringify(doctorChecks["repo-access"]),
+    );
+    assert.equal(doctor.status, 0, `doctor handler failed: ${doctor.stdout}\n${doctor.stderr}`);
+    assert.doesNotMatch(`${doctor.stdout}${doctor.stderr}`, /pipeline:doctor\.md/);
 
-    const status = spawnSync(process.execPath, [shim, "status", "1"], {
-      encoding: "utf8",
-      timeout: 60_000,
-      env,
-    });
-    const statusOut = `${status.stdout}${status.stderr}`;
-    assert.doesNotMatch(
-      statusOut,
-      /unrecognized sub-command/,
-      `status must dispatch as a CLI verb: ${statusOut}`,
+    const status = spawnSync(
+      process.execPath,
+      [shim, "status", "1", "--json"],
+      {
+        encoding: "utf8",
+        timeout: 60_000,
+        env,
+        cwd: repoDir,
+      },
     );
-    assert.doesNotMatch(statusOut, /pipeline:status\.md/);
+    assert.equal(status.error, undefined, `status spawn failed: ${String(status.error)}`);
+    assert.equal(status.signal, null, `status was killed by ${String(status.signal)}`);
+    assert.equal(status.status, 0, `status handler failed: ${status.stdout}\n${status.stderr}`);
+    const statusPayload = JSON.parse(status.stdout);
+    assert.equal(statusPayload.schema_version, "1");
+    assert.equal(statusPayload.status, "ok");
+    assert.deepEqual(statusPayload.issue, { number: 1, title: "Installed status fixture" });
+    assert.equal(statusPayload.stage, "ready");
+    assert.equal(statusPayload.config.repo, "example/repo");
+    assert.match(statusPayload.next_action, /planning and implementation/);
+    assert.doesNotMatch(`${status.stdout}${status.stderr}`, /pipeline:status\.md/);
   } finally {
+    if (doctorResult) rmSync(doctorResult, { force: true });
     cleanup(claudeTmp);
     cleanup(lockTmp);
   }
@@ -2905,6 +3006,45 @@ test("install then uninstall --host claude: skill gone; leftover pipeline:*.md r
     assert.equal(existsSync(skillDir), false, "skill dir must be removed");
     assert.deepEqual(pipelineColonCommandFiles(commandsDir), [], "no pipeline:*.md commands may remain");
     assert.ok(existsSync(join(commandsDir, "other-tool.md")), "unrelated command preserved");
+  } finally {
+    cleanup(claudeTmp);
+    cleanup(lockTmp);
+  }
+});
+
+test("uninstall --host claude preserves an unmarked personal skill while cleaning leftover commands (#1048)", () => {
+  const claudeTmp = makeTmp();
+  const lockTmp = makeTmp();
+  try {
+    const skillDir = join(claudeTmp, "skills", "pipeline");
+    const commandsDir = join(claudeTmp, "commands");
+    mkdirSync(skillDir, { recursive: true });
+    mkdirSync(commandsDir, { recursive: true });
+    writeFileSync(join(skillDir, "SKILL.md"), "personal claude content");
+    writeFileSync(join(commandsDir, "pipeline:status.md"), "leftover from prior install");
+    writeFileSync(join(commandsDir, "other-tool.md"), "keep me");
+
+    const uninstall = runInstaller(["uninstall", "--host", "claude"], {
+      CLAUDE_CONFIG_DIR: claudeTmp,
+      TMPDIR: lockTmp,
+      TMP: lockTmp,
+      TEMP: lockTmp,
+    });
+
+    assert.equal(uninstall.status, 0, `uninstall failed: ${uninstall.stderr}\n${uninstall.stdout}`);
+    assert.equal(
+      readFileSync(join(skillDir, "SKILL.md"), "utf8"),
+      "personal claude content",
+      "an unmarked personal skill is user-owned and must not be deleted",
+    );
+    assert.equal(
+      existsSync(join(commandsDir, "pipeline:status.md")),
+      false,
+      "leftover installer-owned commands must still be cleaned",
+    );
+    assert.ok(existsSync(join(commandsDir, "other-tool.md")), "unrelated command preserved");
+    assert.match(`${uninstall.stdout}${uninstall.stderr}`, /preserv/i);
+    assert.match(`${uninstall.stdout}${uninstall.stderr}`, new RegExp(MANAGED_MARKER));
   } finally {
     cleanup(claudeTmp);
     cleanup(lockTmp);

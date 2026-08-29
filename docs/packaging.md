@@ -32,7 +32,7 @@ Merge is operator-authorized. This repository does not ship a grant factory, Mes
 
 ## Transitional plugin shell (until #1050)
 
-`plugin/` contains the generated Claude SKILL overlay and marketplace catalog. It does not contain a copy of `core/scripts` or a per-verb command tree. The remaining shell is scheduled for deletion in #1050 and is not the distribution product.
+`plugin/` contains the generated Claude SKILL overlay, plugin manifest, and support scripts. Its companion marketplace catalog is `.claude-plugin/marketplace.json` at the repository root. Neither location contains a copy of `core/scripts` or a per-verb command tree. The remaining shell is scheduled for deletion in #1050 and is not the distribution product.
 
 `node scripts/build.mjs --check` asserts that the generated SKILL overlay and marketplace catalog are fresh. After a `core/` or Claude host-SKILL edit, run `node scripts/build.mjs` and include those generated outputs in the same commit.
 

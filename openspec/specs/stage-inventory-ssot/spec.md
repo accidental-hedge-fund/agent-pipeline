@@ -80,5 +80,5 @@ After the Claude host SKILL stage inventory is updated, the generated plugin SKI
 
 #### Scenario: SKILL overlay check passes after host skill update
 - **WHEN** `hosts/claude/SKILL.md` is updated for stage inventory alignment
-- **THEN** `node scripts/build.mjs` SHALL be run and the regenerated `plugin/` content committed with the same change
+- **THEN** `node scripts/build.mjs` SHALL be run and the regenerated plugin SKILL overlay committed with the same change
 - **AND** `node scripts/build.mjs --check` SHALL pass

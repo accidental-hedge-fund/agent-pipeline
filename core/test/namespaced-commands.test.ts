@@ -55,7 +55,6 @@ test("namespaced-commands 7.5a: OPERATION_SURFACE catalogs expected ops; no slas
     assert.ok(catalog.has(expected), `OPERATION_SURFACE missing catalog entry: ${expected}`);
   }
   for (const actual of catalog) {
-    if (actual === "run") continue;
     assert.ok(
       EXPECTED_OPERATIONS.has(actual),
       `OPERATION_SURFACE has unexpected operation: ${actual}`,
@@ -134,6 +133,14 @@ test("namespaced-commands 7.5b: no pipeline:run.md command file exists", () => {
     false,
     "pipeline:run.md must not exist — run is an undocumented alias, not a surface command",
   );
+
+  for (const skillPath of HOST_SKILL_PATHS) {
+    assert.doesNotMatch(
+      readFileSync(skillPath, "utf8"),
+      /^(?:\/|\$)pipeline run\b/m,
+      `${skillPath} must not advertise the legacy run alias`,
+    );
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -201,14 +208,33 @@ test("namespaced-commands 7.5b4: loop SKILL packaging is long-running; generator
   assert.equal(loopOp.fast, false, "loop must not be classified as the shared fast template (#668)");
   assert.equal(loopOp.inRepoLoop, true, "loop must keep inRepoLoop packaging");
 
-  const claudeSkill = readFileSync(join(REPO_ROOT, "hosts", "claude", "SKILL.md"), "utf8");
-  const driveSection = claudeSkill.includes("### 4b. Orchestration pattern for `pipeline loop`")
-    ? claudeSkill.slice(claudeSkill.indexOf("### 4b. Orchestration pattern for `pipeline loop`"))
-    : claudeSkill;
-  assert.ok(
-    /long-running/i.test(driveSection),
-    "host SKILL must state multi-item drive/resume is long-running",
-  );
+  const heading = "### 4b. Orchestration pattern for `pipeline loop`";
+  for (const host of ["claude", "codex"] as const) {
+    const skill = readFileSync(join(REPO_ROOT, "hosts", host, "SKILL.md"), "utf8");
+    const sectionStart = skill.indexOf(heading);
+    assert.notEqual(sectionStart, -1, `${host} SKILL must contain the pipeline loop section`);
+    const nextHeading = skill.indexOf("\n### ", sectionStart + heading.length);
+    const driveSection = skill.slice(
+      sectionStart,
+      nextHeading === -1 ? skill.length : nextHeading,
+    );
+
+    assert.match(
+      driveSection,
+      /long-running/i,
+      `${host} SKILL must state multi-item drive/resume is long-running`,
+    );
+    assert.doesNotMatch(
+      driveSection,
+      /completes in seconds/i,
+      `${host} pipeline loop section must not use the fast-command completion claim`,
+    );
+    assert.doesNotMatch(
+      driveSection,
+      /No background process or Monitor needed/i,
+      `${host} pipeline loop section must not forbid its required background monitor`,
+    );
+  }
   assert.equal(
     existsSync(join(COMMANDS_DIR, "pipeline:loop.md")),
     false,

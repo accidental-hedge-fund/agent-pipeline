@@ -51,8 +51,10 @@ This is v1.40.0 packaging class law under #1046: #1047 completed via PR #1304, t
 - `loop-skill-orchestration`: Loop long-running follow/notify law stays. It SHALL NOT depend on generated `plugin/pipeline/commands/pipeline:loop.md`.
 - `dependency-advisory-hygiene`: The `js-yaml` floor SHALL be enforced on `core/` (and the installed CLI tree). It SHALL NOT require a `plugin/…/core/` lockfile copy.
 - `cli-product-packaging`: Retire #1047's temporary `plugin/`-mirror transition clauses after #1048 lands.
-- `eval-fixture-contract`: Admit exact generated SKILL/catalog outputs only; do not grant a broad plugin-core mirror exception.
-- `generated-cli-reference`: Compare docs freshness to the remaining generated SKILL/catalog freshness gate, not to a core mirror.
+- `eval-fixture-contract`: Admit exact pin-resolved generator outputs only. Current pins admit SKILL/catalog outputs; a historical pin may admit an exact core-mirror output only when pinned `scripts/build.mjs` proves it generated that path. Never grant a broad plugin-core mirror exception.
+- `eval-fixture-preflight`: Resolve required generator-owned allowances from the fixture's pinned `scripts/build.mjs`; reject broad `plugin/**` boundaries and avoid unrelated current SKILL/catalog requirements for ordinary core edits.
+- `generated-cli-reference`: Generate and staleness-check command tables for Claude, Codex, OMP, and OpenCode while comparing packaging freshness to the remaining generated SKILL/catalog gate, not to a core mirror.
+- `cli-harness-adapters`: Keep Pi missing-CLI guidance on the maintained npm package without requiring a generated copy of the core adapter source.
 - `gh-pr-diff`: Fail closed when the files-list fallback reports a patch-less zero-line `modified` entry without the mode metadata needed for a complete diff.
 - `launcher-bootstrap`: Keep resolver staging in the installed skill and generated plugin shell without a copied core tree.
 - `monitor-filter-guidance`: Keep host guidance aligned through the generated plugin SKILL overlay, not generated core mirrors.
@@ -70,6 +72,7 @@ This is v1.40.0 packaging class law under #1046: #1047 completed via PR #1304, t
 - `readme-user-clarity`: Document durable multi-item work through `pipeline loop` while leaving external goal-loop optional.
 - `visual-gate`: Document visual-gate label initialization through `pipeline init`.
 - `worktree-capacity-admission`: Document capacity recovery through `pipeline cleanup`.
+- `release-sub-command`: Regenerate and stage the exact remaining packaging outputs under both `plugin/` and `.claude-plugin/`, without staging FRG evidence or restoring a plugin core mirror.
 
 ## Impact
 

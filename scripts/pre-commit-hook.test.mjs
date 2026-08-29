@@ -27,8 +27,10 @@ const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const HOOK_SRC = join(REPO_ROOT, ".githooks", "pre-commit");
 const GENERATED_OUTPUTS = [
   ".claude-plugin/marketplace.json",
-  "plugin/pipeline/.claude-plugin/plugin.json",
   "plugin/pipeline/skills/pipeline/SKILL.md",
+];
+const UNSTAGED_BUILD_OUTPUTS = [
+  "plugin/pipeline/.claude-plugin/plugin.json",
   "plugin/pipeline/skills/pipeline/scripts/pipeline.mjs",
   "plugin/pipeline/skills/pipeline/scripts/material-filter.mjs",
   "plugin/pipeline/skills/pipeline/scripts/ensure-engines-node.mjs",
@@ -106,7 +108,7 @@ function withRepo(buildScript, fn) {
   }
 }
 
-test("core/ edit triggers regeneration and stages the mirror in the same commit", () => {
+test("core/ edit triggers regeneration and stages owned outputs in the same commit", () => {
   withRepo(BUILD_STUB, (dir) => {
     stage(dir, "core/foo.ts", "export const x = 1;\n");
     git(dir, ["commit", "-q", "-m", "edit core"]);
@@ -116,6 +118,9 @@ test("core/ edit triggers regeneration and stages the mirror in the same commit"
     assert.ok(files.includes("core/foo.ts"), "core edit committed");
     for (const generatedPath of GENERATED_OUTPUTS) {
       assert.ok(files.includes(generatedPath), `${generatedPath} staged`);
+    }
+    for (const generatedPath of UNSTAGED_BUILD_OUTPUTS) {
+      assert.ok(!files.includes(generatedPath), `${generatedPath} must remain unstaged`);
     }
     assert.ok(
       !files.some((f) => /(?:^|\/)core\/scripts\/pipeline\.ts$/.test(f)),
@@ -156,7 +161,7 @@ test("a hosts/ path outside hosts/claude/ does not trigger regeneration", () => 
 
     assert.ok(
       !existsSync(join(dir, "build-ran.marker")),
-      "only core/ and hosts/claude/ are mirror sources",
+      "only declared generator inputs trigger regeneration",
     );
     assert.deepEqual(committedFiles(dir), ["hosts/codex/SKILL.md"]);
   });

@@ -73,7 +73,7 @@ Install the pipeline CLI for Claude the same way as Codex and Grok: a staged lau
 
 ### Requirement: Build SHALL NOT vendor core engine source into plugin/
 
-`scripts/build.mjs` SHALL NOT copy `core/scripts` or any other engine source under `core/` into `plugin/`. After a successful generate run, no path matching `plugin/**/core/scripts/pipeline.ts` SHALL have been written by the generator. Dual-ship of a committed `plugin/` core mirror is forbidden. Physical deletion of leftover `plugin/` is #1050 and is not this requirement.
+`scripts/build.mjs` SHALL NOT copy `core/scripts` or any other engine source under `core/` into `plugin/`. After a successful generate run, no path matching `plugin/**/core/scripts/pipeline.ts` SHALL have been written by the generator. Dual-ship of a committed `plugin/` core mirror is forbidden. Until #1050 removes the remaining plugin shell, its generated launcher SHALL require the installer ownership marker, delegate the original argv to the managed Claude launcher, and propagate that launcher's result. If the marker or managed launcher is absent, the bridge SHALL fail non-zero with `install --host claude` remediation. It SHALL NOT load an adjacent engine. Physical deletion of leftover `plugin/` is #1050 and is not this requirement.
 
 #### Scenario: Generator does not write pipeline.ts under plugin/
 
@@ -87,6 +87,21 @@ Install the pipeline CLI for Claude the same way as Codex and Grok: a staged lau
 - **AND** `install --host claude` runs (not dry-run)
 - **THEN** install SHALL still provision the CLI from `core/` at the repository source
 - **AND** SHALL NOT fail solely because the plugin core copy is missing
+
+#### Scenario: Marketplace shell delegates exact argv to the managed Claude install
+
+- **WHEN** the generated marketplace launcher is invoked with CLI arguments
+- **AND** the managed Claude skill has its installer ownership marker and launcher
+- **THEN** the bridge SHALL invoke that managed launcher with the original arguments unchanged
+- **AND** SHALL propagate its exit result
+- **AND** SHALL NOT load an engine from the plugin shell
+
+#### Scenario: Marketplace shell without a managed install fails with remediation
+
+- **WHEN** the generated marketplace launcher cannot find the installer ownership marker or managed
+  Claude launcher
+- **THEN** it SHALL exit non-zero
+- **AND** SHALL instruct the operator to run `install --host claude`
 
 ### Requirement: Build and install SHALL NOT emit a per-verb command pack
 

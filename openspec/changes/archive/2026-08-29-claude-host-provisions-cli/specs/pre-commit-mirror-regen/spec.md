@@ -10,9 +10,9 @@
 
 ### Requirement: A committed pre-commit hook SHALL refresh generated SKILL/catalog outputs when core/, hosts/claude/, or hosts/_shared/ paths are staged
 
-The repository SHALL include a `.githooks/pre-commit` shell script. When a contributor runs `git commit` and the staged file set includes at least one path under `core/`, `hosts/claude/`, or `hosts/_shared/`, the hook SHALL run `node scripts/build.mjs`. Until #1050 deletes `plugin/`, the hook MAY stage generated SKILL overlay and marketplace catalog outputs (`plugin/` SKILL/catalog paths and `.claude-plugin/marketplace.json`) before the commit object is created. The hook SHALL NOT regenerate or stage a `plugin/` copy of `core/scripts` as required output. `hosts/claude/` still provides the SKILL.md overlay. `hosts/_shared/` still provides `entry.template.mjs` used to generate the installed launcher shim.
+The repository SHALL include a `.githooks/pre-commit` shell script. When a contributor runs `git commit` and the staged file set includes at least one path under `core/`, `hosts/claude/`, or `hosts/_shared/`, the hook SHALL run `node scripts/build.mjs`. Until #1050 deletes `plugin/`, the hook MAY stage generated SKILL overlay and marketplace catalog outputs (`plugin/` SKILL/catalog paths and `.claude-plugin/marketplace.json`) before the commit object is created. The hook SHALL NOT regenerate or stage a `plugin/` copy of `core/scripts` as required output. `hosts/claude/` still provides the SKILL.md overlay. Shared plugin-shell assets such as `hosts/_shared/material-filter.mjs` remain generator inputs; the marketplace launcher is a managed-install bridge, not a copy of `entry.template.mjs`.
 
-#### Scenario: Core edit auto-regenerates mirror
+#### Scenario: Core edit refreshes generated packaging outputs
 
 - **WHEN** a contributor stages changes under `core/` and runs `git commit`
 - **THEN** the pre-commit hook SHALL run `node scripts/build.mjs`

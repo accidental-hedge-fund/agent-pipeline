@@ -82,7 +82,6 @@ skill or command-menu entries.
 ```
 /pipeline N                                     durable autonomous one-item drive (default)
 /pipeline loop --milestone <m>|--label <l>|--range a-b [--resume <run-id>] [--audit] [--follow] Durable multi-item run — driven in-repo by the pipeline's own loop supervisor
-/pipeline run <n> [--detach]                    Advance alias; use with --detach for a legacy raw detached run (desktop launchers)
 /pipeline single <n>                            Canonical durable one-item autonomous drive (owns a durable loop; delegates stages to advance)
 /pipeline cleanup                               Sweep merged-PR worktrees and delete their local branches
 /pipeline doctor [--json|--is-ok] [--fail-fast] [--harness-smoke] Deterministic preflight check; print summary, exit 0/1. Opt-in --harness-smoke adds one cheap model call per unique configured harness treatment
@@ -622,13 +621,7 @@ expands the promoted fixture into an executable cell plan to prove it works
 
 ## Setup (zero install after first run)
 
-The skill is a Node 24+ TypeScript codebase under
-`${CLAUDE_PLUGIN_ROOT}/skills/pipeline/core/scripts/`, run via native type-stripping (no
-build step). The installer attempts a best-effort `npm ci` when dependencies
-are absent. If that prewarm fails, the first non-version launcher invocation
-retries `npm ci` before dispatch; a failed retry exits non-zero with the
-installed `core/` path and manual remediation.
-
+This transitional marketplace overlay contains no engine core. Its launcher delegates to the managed Claude CLI install under `$CLAUDE_CONFIG_DIR/skills/pipeline` (or `~/.claude/skills/pipeline`). Before first use, provision that install with `npx --yes github:accidental-hedge-fund/agent-pipeline install --host claude`.
 Required:
 - `gh` CLI authenticated against the target repo
 - `claude` CLI on PATH — the primary harness (planning, implementation, fixes)

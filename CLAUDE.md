@@ -48,7 +48,9 @@ review steps must follow.
   pre_merge, eval, deploy_ready, auto_recover), `prompts/*.md` (templates with `{{placeholders}}`).
 - `core/test/` — co-located `*.test.ts`.
 - `hosts/` — per-host packaging (`claude`, `codex`, `_shared`); the SKILL.md variants live here.
-- `plugin/` — generated SKILL overlay / marketplace catalog until #1050; do not hand-edit. Not a `core/scripts` copy.
+- `plugin/` — generated Claude SKILL overlay, plugin manifest, and support scripts until
+  #1050; do not hand-edit. The companion marketplace catalog is
+  `.claude-plugin/marketplace.json`. Neither location contains a `core/scripts` copy.
 - `openspec/` — spec-driven-development specs (`specs/`) and in-flight changes (`changes/`).
 - `scripts/` — `build.mjs` (SKILL/catalog generate/check), `install.mjs`, `ci-install-smoke.mjs`.
 

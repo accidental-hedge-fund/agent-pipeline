@@ -18,6 +18,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
 
 import {
   OPERATION_SURFACE,
@@ -90,14 +91,65 @@ test("generate does not write plugin/pipeline/commands/pipeline:<verb>.md (#1048
   }
 });
 
+test("production generate removes retired outputs without deleting unrelated plugin files (#1048)", () => {
+  const tmp = makeTmp();
+  try {
+    const retiredCommand = join(tmp, "plugin", "pipeline", "commands", "pipeline:status.md");
+    const retiredCore = join(
+      tmp,
+      "plugin",
+      "pipeline",
+      "skills",
+      "pipeline",
+      "core",
+      "scripts",
+      "pipeline.ts",
+    );
+    const operatorNote = join(tmp, "plugin", "pipeline", "operator-note.txt");
+    const scriptNote = join(
+      tmp,
+      "plugin",
+      "pipeline",
+      "skills",
+      "pipeline",
+      "scripts",
+      "operator-note.txt",
+    );
+    const otherPlugin = join(tmp, "plugin", "another-plugin", "README.md");
+
+    for (const path of [retiredCommand, retiredCore, operatorNote, scriptNote, otherPlugin]) {
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, `sentinel:${path}\n`);
+    }
+
+    // Exercise the same cleanup + build function used by the production CLI.
+    buildInto(tmp);
+
+    assert.equal(
+      existsSync(join(tmp, "plugin", "pipeline", "commands")),
+      false,
+      "retired per-verb command directory must be removed",
+    );
+    assert.equal(
+      existsSync(join(tmp, "plugin", "pipeline", "skills", "pipeline", "core")),
+      false,
+      "retired core mirror must be removed",
+    );
+    assert.match(readFileSync(operatorNote, "utf8"), /^sentinel:/);
+    assert.match(readFileSync(scriptNote, "utf8"), /^sentinel:/);
+    assert.match(readFileSync(otherPlugin, "utf8"), /^sentinel:/);
+    assert.equal(existsSync(join(tmp, SKILL_OVERLAY_REL)), true);
+    assert.equal(existsSync(join(tmp, MARKETPLACE_CATALOG_REL)), true);
+  } finally {
+    cleanup(tmp);
+  }
+});
+
 test("OPERATION_SURFACE remains a catalog and does not itself write command files (#1048)", () => {
   const tmp = makeTmp();
   try {
     buildInto(tmp);
     const names = new Set(OPERATION_SURFACE.map((op) => op.name));
-    for (const expected of ["status", "doctor", "single", "loop", "merge-queue", "recover-parked"]) {
-      if (expected === "single") continue; // single is CLI-only; not every catalog lists it
-    }
     assert.ok(names.has("status"), "catalog must list status");
     assert.ok(names.has("doctor"), "catalog must list doctor");
     assert.ok(names.has("loop"), "catalog must list loop");
@@ -112,6 +164,93 @@ test("OPERATION_SURFACE remains a catalog and does not itself write command file
     assert.equal("renderClaudeCommand" in globalThis, false);
   } finally {
     cleanup(tmp);
+  }
+});
+
+test("default build renders the plugin SKILL table from OPERATION_SURFACE (#1048)", () => {
+  const tmp = makeTmp();
+  const status = OPERATION_SURFACE.find((op) => op.name === "status");
+  assert.ok(status, "catalog must list status");
+  const original = status.desc;
+  const marker = "catalog-driven plugin status marker";
+  try {
+    status.desc = marker;
+    buildInto(tmp);
+    const skill = readFileSync(join(tmp, SKILL_OVERLAY_REL), "utf8");
+    assert.match(skill, new RegExp(marker));
+    assert.doesNotMatch(skill, /^\/pipeline run\b/m);
+  } finally {
+    status.desc = original;
+    cleanup(tmp);
+  }
+});
+
+test("generated plugin bridge delegates to the managed Claude CLI without a plugin core (#1048)", () => {
+  const tmp = makeTmp();
+  const claudeRoot = makeTmp();
+  try {
+    buildInto(tmp);
+    const managedLauncher = join(claudeRoot, "skills", "pipeline", "scripts", "pipeline.mjs");
+    mkdirSync(dirname(managedLauncher), { recursive: true });
+    writeFileSync(join(claudeRoot, "skills", "pipeline", ".pipeline-installer-managed"), "\n");
+    writeFileSync(
+      managedLauncher,
+      'console.log(JSON.stringify({ delegated: process.argv.slice(2) }));\n',
+    );
+
+    const pluginLauncher = join(
+      tmp,
+      "plugin",
+      "pipeline",
+      "skills",
+      "pipeline",
+      "scripts",
+      "pipeline.mjs",
+    );
+    const result = spawnSync(process.execPath, [pluginLauncher, "status", "1048"], {
+      encoding: "utf8",
+      env: { ...process.env, CLAUDE_CONFIG_DIR: claudeRoot },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), { delegated: ["status", "1048"] });
+    assert.equal(
+      existsSync(join(tmp, "plugin", "pipeline", "skills", "pipeline", "core")),
+      false,
+    );
+
+    const skill = readFileSync(join(tmp, SKILL_OVERLAY_REL), "utf8");
+    assert.match(skill, /transitional marketplace overlay contains no engine core/i);
+    assert.doesNotMatch(skill, /CLAUDE_PLUGIN_ROOT}\/skills\/pipeline\/core\/scripts/);
+  } finally {
+    cleanup(tmp);
+    cleanup(claudeRoot);
+  }
+});
+
+test("generated plugin bridge fails with install remediation when managed CLI is absent (#1048)", () => {
+  const tmp = makeTmp();
+  const claudeRoot = makeTmp();
+  try {
+    buildInto(tmp);
+    const pluginLauncher = join(
+      tmp,
+      "plugin",
+      "pipeline",
+      "skills",
+      "pipeline",
+      "scripts",
+      "pipeline.mjs",
+    );
+    const result = spawnSync(process.execPath, [pluginLauncher, "doctor"], {
+      encoding: "utf8",
+      env: { ...process.env, CLAUDE_CONFIG_DIR: claudeRoot },
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /install --host claude/);
+    assert.match(result.stderr, /managed Claude CLI install not found/);
+  } finally {
+    cleanup(tmp);
+    cleanup(claudeRoot);
   }
 });
 

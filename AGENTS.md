@@ -38,8 +38,9 @@ conventions. Keep it in sync with `CLAUDE.md`.
 ## Layout
 
 - `core/scripts/` — the engine (TypeScript, no build step).
-- `plugin/` — generated SKILL overlay / marketplace catalog until #1050; do not
-  hand-edit. Not a `core/scripts` copy.
+- `plugin/` — generated Claude SKILL overlay, plugin manifest, and support
+  scripts until #1050; do not hand-edit. The companion marketplace catalog is
+  `.claude-plugin/marketplace.json`. Neither location contains a `core/scripts` copy.
 - `hosts/` — per-host packaging (short SKILL shims that exec the CLI).
 - `scripts/build.mjs` — generates / checks the SKILL overlay and marketplace catalog.
 

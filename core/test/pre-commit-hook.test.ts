@@ -1,9 +1,9 @@
 // Regression tests for .githooks/pre-commit partial-staging guard.
 //
-// The guard must abort when a contributor stages core/ or hosts/claude/ changes
-// while leaving additional unstaged edits in those same directories — otherwise
-// build.mjs would generate a plugin/ mirror from the working tree and embed
-// uncommitted source changes into the committed mirror.
+// The guard must abort when a contributor stages generator-input changes while
+// leaving additional unstaged edits in those same directories. build.mjs reads
+// the working tree, so generated SKILL/catalog output must not incorporate
+// uncommitted source state.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -109,7 +109,7 @@ test("pre-commit hook: exits 0 when all core/ changes are staged with no unstage
   try {
     fs.writeFileSync(path.join(dir, "core/a.ts"), "export const a = 2;\n");
     execSync("git add core/a.ts", { cwd: dir });
-    // Unrelated unstaged change outside mirror sources — must not trigger abort.
+    // Unrelated unstaged change outside generator inputs — must not trigger abort.
     fs.writeFileSync(path.join(dir, "README.md"), "unrelated\n");
 
     const { status } = runHook(dir);
@@ -120,7 +120,7 @@ test("pre-commit hook: exits 0 when all core/ changes are staged with no unstage
 });
 
 // ---------------------------------------------------------------------------
-// Finding 1 regression: untracked source files must not leak into the mirror
+// Finding 1 regression: untracked source files must not affect generated output
 // ---------------------------------------------------------------------------
 
 test("pre-commit hook: aborts when untracked file exists under core/", () => {
@@ -129,7 +129,7 @@ test("pre-commit hook: aborts when untracked file exists under core/", () => {
     // Stage a change to core/a.ts ...
     fs.writeFileSync(path.join(dir, "core/a.ts"), "export const a = 2;\n");
     execSync("git add core/a.ts", { cwd: dir });
-    // ... while an untracked file exists under core/ (build.mjs would copy it into plugin/).
+    // ... while an untracked file exists under a guarded generator-input directory.
     fs.mkdirSync(path.join(dir, "core", "scripts"), { recursive: true });
     fs.writeFileSync(path.join(dir, "core", "scripts", "scratch.ts"), "// scratch\n");
 
@@ -163,7 +163,7 @@ test("pre-commit hook: triggers regeneration when hosts/_shared/ change is stage
 
     const { status, stdout } = runHook(dir);
     assert.equal(status, 0, "hook must run regeneration for staged hosts/_shared/ changes");
-    assert.match(stdout, /regenerating (plugin\/ mirror|SKILL overlay)/i);
+    assert.match(stdout, /regenerating SKILL overlay \/ marketplace catalog/i);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -203,7 +203,7 @@ test("pre-commit hook: triggers regeneration when a core/ file is renamed out of
 
     const { status, stdout } = runHook(dir);
     assert.equal(status, 0, "hook must run regeneration when a core/ file is renamed out");
-    assert.match(stdout, /regenerating (plugin\/ mirror|SKILL overlay)/i, "hook must mention regeneration");
+    assert.match(stdout, /regenerating SKILL overlay \/ marketplace catalog/i, "hook must mention regeneration");
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -217,7 +217,7 @@ test("pre-commit hook: triggers regeneration when a hosts/_shared/ file is renam
 
     const { status, stdout } = runHook(dir);
     assert.equal(status, 0, "hook must run regeneration when a hosts/_shared/ file is renamed out");
-    assert.match(stdout, /regenerating (plugin\/ mirror|SKILL overlay)/i, "hook must mention regeneration");
+    assert.match(stdout, /regenerating SKILL overlay \/ marketplace catalog/i, "hook must mention regeneration");
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

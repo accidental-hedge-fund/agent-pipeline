@@ -338,9 +338,9 @@ export function toAdvanceOpts(opts: Pick<
 }
 
 // Package version, single-sourced from package.json so a version bump is reflected
-// automatically. The path is `../package.json` (core/package.json) and is mirror-safe:
-// build.mjs copies `package.json` alongside `scripts/` into the generated plugin, so the
-// same relative path resolves in both the dev and installed layouts.
+// automatically. The path is `../package.json` (core/package.json). The installer stages
+// `scripts/` beside that core manifest, so the same relative path resolves in both the
+// repository and installed CLI layouts without a committed plugin core copy.
 // Returns "" on missing/malformed file so `pipeline doctor` can execute and surface the
 // install:version-coherence failure instead of crashing before the command dispatches.
 const require = createRequire(import.meta.url);
@@ -804,7 +804,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | recover-parked | cleanup | logs | path | config | controls | run | single | release | ship | factory-gate | factory-release | factory-pin | engine-promote | intake | decompose | triage | roadmap | sweep | merge | merge-queue | train | summary | improve | scoreboard | outcomes | lineage | queue | backfill | evals | loop | correction | handoff | report")
+    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | recover-parked | cleanup | logs | path | config | controls | single | release | ship | factory-gate | factory-release | factory-pin | engine-promote | intake | decompose | triage | roadmap | sweep | merge | merge-queue | train | summary | improve | scoreboard | outcomes | lineage | queue | backfill | evals | loop | correction | handoff | report")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -4253,6 +4253,12 @@ async function main(): Promise<void> {
   // resolution, while --domain preserves explicit legacy-fallback selection.
   const summaryTarget = numArg === "summary" ? parseSummaryTarget(cmd.args[1]) : null;
   if (numArg === "summary") {
+    const maxSummaryPositionals = maxPositionalsFor("summary");
+    if (cmd.args.length > maxSummaryPositionals) {
+      const extra = cmd.args.slice(maxSummaryPositionals).join(", ");
+      console.error(`pipeline: unexpected argument(s): ${extra}`);
+      process.exit(2);
+    }
     const summaryStart = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
     const repoDir = findGitRoot(summaryStart) ?? summaryStart;
     if (!summaryTarget) {

@@ -89,36 +89,45 @@ per-verb skill or command-menu entries.
 ```
 /pipeline N                                     durable autonomous one-item drive (default)
 /pipeline loop --milestone <m>|--label <l>|--range a-b [--resume <run-id>] [--audit] [--follow] Durable multi-item run — driven in-repo by the pipeline's own loop supervisor
-/pipeline run <n> [--detach]                    Advance alias; use with --detach for a legacy raw detached run (desktop launchers)
 /pipeline single <n>                            Canonical durable one-item autonomous drive (owns a durable loop; delegates stages to advance)
 /pipeline cleanup                               Sweep merged-PR worktrees and delete their local branches
-/pipeline doctor                                Deterministic preflight check; print summary, exit 0/1
+/pipeline doctor [--json|--is-ok] [--fail-fast] [--harness-smoke] Deterministic preflight check; print summary, exit 0/1. Opt-in --harness-smoke adds one cheap model call per unique configured harness treatment
 /pipeline init                                  Ensure pipeline labels and scaffold .github/pipeline.yml
 /pipeline merge <pr>                            Operator-authorized squash merge of a ready-to-deploy PR (never called by the advance loop)
 /pipeline merge-queue --milestone <m> [--apply] [--release-when-complete --release-version <ver>] Operator-authorized sequential merge of ready-to-deploy PRs; dry-run by default; optional prepare-only release-when-complete
 /pipeline override <n> "<key>: <reason>"        Disposition a review finding and auto-resume the advance loop
-/pipeline release <version> [--theme "..."] [--dry-run] Prepare a release PR for the given version (never tags, merges, or publishes)
-/pipeline remove-worktree <n> [--force]         Remove a managed pipeline worktree for an issue (optional --force)
-/pipeline ship --milestone vX.Y.Z [--json] | ship status --milestone vX.Y.Z [--json] Run or inspect one durable milestone shipment (train --merge, release, finish, promote). Phrase Ship milestone vX.Y.Z execs this command; no grant file required.
+/pipeline recover-parked <n> [--json] [--dry-run] One supervisor pass for a parked issue: deterministic recover first (including publish of an unpublished stage commit), then reflow only stale/DNR/below-high residuals (never auto-override HIGH/CRITICAL/security); pre-PR engine parks re-enter without a linked PR; re-enter single if clear
+/pipeline release <version> [--theme "..."] [--dry-run|--json] [--no-edit] [--skip-frg] | release finish <pr> [--json] | release ensure-tag <X.Y.Z> <merge-oid> --packed-candidate <sha> Prepare a release PR from the matching GitHub milestone plan (or finish-merge one); finish never tags; ship-end ensure-tag creates vX.Y.Z from on-disk HMAC latest.json when FRG is gitignored; --dry-run reports milestone presence/open issues
+/pipeline remove-worktree <n> [--force]         Remove a managed pipeline worktree for an issue (optional --force). After a proven merge, /pipeline and train --merge share bound-proof park-release; cleanup is not the required fix
+/pipeline ship --milestone vX.Y.Z [--json] | ship status --milestone vX.Y.Z [--json] Run or inspect one durable milestone shipment (train --merge, release, finish, promote). Operator product is pipeline ship --milestone vX.Y.Z; no grant file required.
 /pipeline status <n>                            Read-only — print stage, blocker, PR, last review
+/pipeline train --milestone <m>|--issues <n,n> [--merge] [--json] [--dry-run] Operator-authorized integrate train: base-eligible frontiers advance via one loop wave each (recovery inside the wave); optionally serial-merge with base containment; independent R2D siblings may merge while a peer is parked (never called by the advance loop)
 /pipeline unblock <n> "<answer>"                Post an answer and clear the blocked label
 /pipeline backfill [--apply] [--capability <name>] Preview or apply OpenSpec coverage for legacy behavior (spec-only PR)
+/pipeline decompose --epic <N> [--description "…"] [--apply] [--release vX.Y.Z] [--max-children N] [--max-effort S|M|L|XL] [--allow-xl] Break an epic issue into dependency-linked child issues and a ROADMAP PR (dry-run default; --apply writes; not intake / not roadmap-order-only / not loop-execute)
+/pipeline engine-promote --for <X.Y.Z> [--host all|codex|claude|grok|opencode|omp] [--dry-run] [--json] [--skip-install] [--skip-frg] Self-host: verify published release, promote a production-quality pin from FRG, install exact tag to all hosts by default, verify version (rollback pin on install failure; --skip-frg writes a no-frg-* non-production marker only)
 /pipeline evals plan|run|grade|report|harvest … Offline eval plan/run/grade/report/harvest (never writes to production GitHub)
-/pipeline factory-gate --for <version> [--from-run <run-id>] [--observations <file>] [--scenario id=status:detail] Score a durable loop / fixture pack and write immutable FRG evidence (never merges or tags)
+/pipeline factory-gate --for <version> [--from-run <run-id>] [--observations <file>] [--scenario id=status:detail] [--promote-pin-on-pass] Score a durable loop / fixture pack and write immutable FRG evidence (never merges or tags)
+/pipeline factory-pin show|init --from-frg <X.Y.Z>|promote --for <X.Y.Z>|rollback [--to <X.Y.Z>] [--git-sha <sha>] [--force] Show / init / promote / rollback the factory production engine pin (last FRG-passed release; promote writes a real frg_run_id + evidence path; never merges or tags)
+/pipeline factory-release prepare --request <absolute-off-repo-request.json> --json Durable post-pilot FRG generation + prepare-only release handoff (in_progress → awaiting_frg_attestation → complete; never merges/tags)
 /pipeline improve [--apply] [--top <n>] [--json] Cluster papercuts / corrections / durable-run blockers into backlog candidates
 /pipeline intake --description "<text>" [--release vX.Y.Z] [--dry-run] Spec a rough description into a GitHub issue and ROADMAP PR
 /pipeline queue [--max-issues <n>] [--concurrency <n>] [--budget-dollars <d>] Batch factory: dispatch all pipeline:ready issues up to concurrency/budget limits
 /pipeline refine-spec --title "<t>" --body "<b>" Refine an existing issue's spec; non-mutating JSON output
-/pipeline roadmap [--apply] [--next <n>]        Analyze open backlog into a dependency-aware scored roadmap
+/pipeline roadmap [--apply] [--next <n>]        Analyze open backlog into a dependency-aware scored roadmap; under SemVer, dry-run lists full milestone reconciliation actions and --apply converges open issues to the reviewed manifest (fingerprint-gated)
 /pipeline sweep [--apply] [--repo owner/name]   Batch re-spec thin issues and reconcile ROADMAP.md
-/pipeline triage <n> --stage ready|backlog      Set a pre-pipeline stage label (ready or backlog) on an issue
+/pipeline triage <n> --stage ready|backlog      Set a pre-pipeline stage label (ready or backlog) on an issue. needs-spec is an admission hold: apply the spec, then triage --stage ready.
+/pipeline controls check [--json] [--strict]    Read-only repository-control drift check against configured desired state (#695); never mutates forge settings
 /pipeline correction record|attribute …         Record a correction event or attribute a control (append-only local ledger)
+/pipeline lineage export|impact|propose|ingest [--run-id <id>] [--node-id <id>] [--fixture <path>] [--retention-days <n>] [--dry-run] [--json] Export, impact-analyze, or propose updates on the intent-lineage evidence graph (host-local store; #599). Backward proposals never silently edit authority; free text is redacted; no GitHub mutations
 /pipeline logs [<run-id>] [--events] [-f] [--no-until-terminal] List or stream pipeline run logs (events --follow exits 0 on terminal run_complete)
+/pipeline outcomes ingest|list [--adapter github] [--fixture <path>] [--days <n>] [--retention-days <n>] [--dry-run] [--json] Ingest or list production/rework outcomes linked to pipeline runs (host-local store; #576). R2D alone is never production delivery; free text is redacted; no GitHub mutations
 /pipeline report [--yes]                        Privacy-safe product-fault report preview/submit (optional; off by default in config)
-/pipeline scoreboard [--bucket day|week] [--by <dim>] [--html <path>] Print read-only factory throughput/cost/reliability metrics from run artifacts
+/pipeline scoreboard [--days <n>|--since <iso>] [--until <iso>] [--bucket day|week] [--by <dim>] [--json] [--html <path>] Print read-only factory throughput/cost/reliability metrics from run artifacts (incl. human-touch, escape-recurrence, discovery-channel, stratified stabilization; #763; production outcomes #576; planning-leverage / material-rework #702)
 /pipeline summary <issue-number|run-id>         Print the run evidence bundle for an issue number or exact run-id
 /pipeline config schema|validate|sync|repo-map … Config schema, validate, sync scaffold, and repo-map mutations
 /pipeline path [--json]                         Discover installed host skill paths (JSON-friendly for desktop integrators)
+/pipeline handoff list|show|answer|reject|supersede … [--json] [--issue N] [--run-id id] [--status pending] List, inspect, answer, reject, or supersede durable human-question handoffs (#647)
 ```
 <!-- END GENERATED: cli-command-table -->
 

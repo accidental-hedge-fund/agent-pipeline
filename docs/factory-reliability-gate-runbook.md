@@ -676,7 +676,7 @@ Optional repeated CLI tokens:
    fails closed when open engine-class soak defects are attributable to that candidate.
 4. On success, includes an FRG section on the release PR body (`run_id`, numeric rate, composition).
    Does **not** `git add` `.agent-pipeline/frg/` (that tree is gitignored). Evidence stays
-   on disk. The release commit is version / ROADMAP / plugin-mirror files only.
+   on disk. The release commit is version / ROADMAP / generated packaging files only.
 5. Still runs `npm run ci` (additive). FRG, open-soak preflight, and CI are independent.
 6. Does **not** merge or tag because FRG/open-soak passed.
 7. If `git add` or `git commit` fails after `git checkout -b release/vX.Y.Z`, restores the

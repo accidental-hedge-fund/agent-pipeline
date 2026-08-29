@@ -256,17 +256,28 @@ resolved surface SHALL produce different hashes.
 
 ### Requirement: A fixture allowed-change boundary SHALL admit only explicitly listed generator-owned packaging outputs
 
-The fixture contract SHALL permit fixtures to list exact generator-owned SKILL overlay or marketplace catalog
-paths in an `allowed_change_paths` boundary. Fixture validation SHALL treat an explicitly
-listed generated output as in scope, but SHALL NOT grant a broad `plugin/**` exception and
-SHALL NOT admit a `plugin/` core-mirror path merely because a corresponding `core/` path was
-edited.
+The fixture contract SHALL permit fixtures to list exact generator-owned packaging outputs in an
+`allowed_change_paths` boundary. For a post-#1048 pin, those outputs are the generated SKILL overlay
+or marketplace catalog. A historical fixture MAY list an exact `plugin/` core-mirror output only
+when the pinned `scripts/build.mjs` at its `base_commit` proves it generated that path from an
+allowed source.
+Fixture validation SHALL treat such an explicitly listed, pin-resolved output as in scope, but
+SHALL NOT grant a broad `plugin/**` exception and SHALL NOT admit a `plugin/` core-mirror path merely
+because a corresponding `core/` path was edited.
 
-#### Scenario: Exact generated output listed in the boundary is accepted
+#### Scenario: Exact current generated output listed in the boundary is accepted
 
 - **WHEN** a fixture's `allowed_change_paths` includes the generated Claude SKILL overlay or marketplace catalog
 - **THEN** fixture validation SHALL succeed for that path
 - **AND** a candidate change to that exact path SHALL NOT be counted as out of scope
+
+#### Scenario: Exact historical generated output is accepted only for its pin
+
+- **WHEN** the fixture's pinned `scripts/build.mjs` proves it generated an exact `plugin/`
+  core-mirror output from an allowed source
+- **AND** `allowed_change_paths` lists that exact output
+- **THEN** fixture validation SHALL accept that path for the historical fixture
+- **AND** SHALL NOT infer any broader core-mirror allowance
 
 #### Scenario: Unlisted plugin paths and retired core mirrors remain out of scope
 
