@@ -2940,6 +2940,39 @@ test("ensure-tag fails closed when HMAC candidate_git_sha is unbound (#1149)", a
   assert.ok(!calls.some((args) => args[0] === "tag" || args[0] === "push"));
 });
 
+test("ensure-tag fails closed when HMAC candidate_git_sha is pin P and packed is C (#1298)", async () => {
+  const packedC = "6670cee2b2659bc8350e98c1a2a34b53299b995b";
+  const pinP = "a884d1ed9303eb32bc486063d976c5ad28c74553";
+  const calls: string[][] = [];
+  await assert.rejects(
+    ensureAnnotatedReleaseTag({
+      version: intent.version,
+      mergeCommitOid: mergeHead,
+      packedCandidate: packedC,
+      git: missingTagGit(calls),
+      validateFrg: async () => hmacSnapshot(pinP),
+    }),
+    /HMAC candidate_git_sha is not this ship's packed candidate/,
+  );
+  assert.ok(!calls.some((args) => args[0] === "tag" || args[0] === "push"));
+});
+
+test("ensure-tag accepts HMAC bound to packed C while control HEAD is out of band (#1298)", async () => {
+  const packedC = "6670cee2b2659bc8350e98c1a2a34b53299b995b";
+  const calls: string[][] = [];
+  const result = await ensureAnnotatedReleaseTag({
+    version: intent.version,
+    mergeCommitOid: mergeHead,
+    packedCandidate: packedC,
+    git: missingTagGit(calls),
+    validateFrg: async () => hmacSnapshot(packedC),
+  });
+  assert.equal(result, "created");
+  assert.ok(!calls.some((args) => args[0] === "rev-parse" && args[1] === "HEAD"));
+  const tagCall = calls.find((args) => args[0] === "tag");
+  assert.deepEqual(tagCall?.slice(0, 4), ["tag", "-a", `v${intent.version}`, mergeHead]);
+});
+
 test("ensure-tag fails closed when on-disk FRG validation fails (#1149)", async () => {
   const calls: string[][] = [];
   await assert.rejects(

@@ -4073,6 +4073,11 @@ export interface FactoryGateOpts {
    * provenance from the live pack + Layer A TAP (#1118). Tests inject a fake.
    */
   collectHybridV2?: (args: HybridV2FromRunArgs) => Promise<CollectedFrgObservations>;
+  /**
+   * In-process factory-release request `integrated_candidate.git_sha`.
+   * Forwarded to hybrid-v2 collect. CLI `--from-run` omits this.
+   */
+  requestCandidateGitSha?: string;
   thresholds?: FrgThresholds;
   now?: () => Date;
   /**
@@ -4212,6 +4217,7 @@ export async function runFactoryGate(
         fromRun: opts.fromRun,
         contract,
         ledger,
+        requestCandidateGitSha: opts.requestCandidateGitSha,
       });
       packProvenance = collected.pack_provenance;
       if (overrides.length === 0) {

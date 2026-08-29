@@ -5,6 +5,7 @@
 // PIPELINE_CANDIDATE_ENGINE_ROOT. Entrypoint is
 // node "$ENGINE_ROOT/scripts/pipeline-launcher.mjs". No eval of train JSON.
 
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { parseExactGitSha } from "./ship-end-identity.ts";
@@ -116,6 +117,72 @@ export function resolveCandidateEngine(
     error:
       `cannot resolve candidate engine at ${sha}: need a clean checkout at that SHA ` +
       `(REPO_DIR, ${worktree}, or PIPELINE_CANDIDATE_ENGINE_ROOT)`,
+  };
+}
+
+/** Production git/fs deps for {@link resolveCandidateEngine}. Tests inject fakes. */
+export function defaultResolveCandidateEngineDeps(): ResolveCandidateEngineDeps {
+  return {
+    isDirectory: (p) => {
+      try {
+        return fs.statSync(p).isDirectory();
+      } catch {
+        return false;
+      }
+    },
+    fileExists: (p) => {
+      try {
+        return fs.statSync(p).isFile();
+      } catch {
+        return false;
+      }
+    },
+    revParseHead: (cwd) => {
+      try {
+        const out = execFileSync("git", ["-C", cwd, "rev-parse", "--verify", "HEAD"], {
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "ignore"],
+          timeout: 5_000,
+        });
+        return parseExactGitSha(String(out).trim());
+      } catch {
+        return null;
+      }
+    },
+    porcelain: (cwd) => {
+      try {
+        const out = execFileSync("git", ["-C", cwd, "status", "--porcelain"], {
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "ignore"],
+          timeout: 5_000,
+        });
+        return String(out);
+      } catch {
+        return null;
+      }
+    },
+    fetchSha: (dir, sha) => {
+      try {
+        execFileSync("git", ["-C", dir, "fetch", "--quiet", "origin", sha], {
+          stdio: "ignore",
+          timeout: 120_000,
+        });
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    worktreeAdd: (dir, dest, sha) => {
+      try {
+        execFileSync("git", ["-C", dir, "worktree", "add", "--detach", dest, sha], {
+          stdio: "ignore",
+          timeout: 120_000,
+        });
+        return true;
+      } catch {
+        return false;
+      }
+    },
   };
 }
 
