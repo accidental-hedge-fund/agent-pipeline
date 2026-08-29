@@ -45,6 +45,10 @@ import {
   rejectForbiddenRequestFields,
   targetCheckoutsForPrepare,
   unsignedDigestBindingMismatch,
+  assertCandidateInvocation,
+  freezeCandidateInvocation,
+  formatPackLoopLastError,
+  type CandidateInvocation,
   type FactoryReleaseFrgPayload,
   type FactoryReleasePrepareDeps,
   type FactoryReleasePrepareRequest,
@@ -1732,8 +1736,10 @@ test("productionDispatchPackLoop persists binding before spawn", async () => {
       engineTrack: "candidate",
       label: "factory-gate",
       persistCtx,
+      candidateInvocation: testInvocation("loop-persist-order"),
     },
     {
+      fileExists: () => true,
       initBoundLoop: async () => {
         events.push("init");
         return { loop_run_id: "loop-persist-order" };
@@ -1792,7 +1798,10 @@ test("crash after persist before spawn resumes the same bound run", async () => 
         return { issue_numbers: [101, 102] };
       },
       dispatchPackLoop: async (input) =>
-        productionDispatchPackLoop(input, {
+        productionDispatchPackLoop(
+          { ...input, candidateInvocation: testInvocation("loop-crash-window") },
+          {
+          fileExists: () => true,
           initBoundLoop: async () => ({ loop_run_id: "loop-crash-window" }),
           persistBinding: async (id) => {
             if (!input.persistCtx) throw new Error("missing persistCtx");
@@ -1889,7 +1898,10 @@ test("failed detached spawn is retried on the same bound run", async () => {
         return { issue_numbers: [101, 102] };
       },
       dispatchPackLoop: async (input) =>
-        productionDispatchPackLoop(input, {
+        productionDispatchPackLoop(
+          { ...input, candidateInvocation: testInvocation("loop-spawn-enoent") },
+          {
+          fileExists: () => true,
           initBoundLoop: async () => ({ loop_run_id: "loop-spawn-enoent" }),
           spawnCandidateLoop: async () => spawnOnce("first"),
         }),
@@ -1950,23 +1962,80 @@ function dirtyFrgSigningEnv(): NodeJS.ProcessEnv {
   };
 }
 
+const CANDIDATE_LAUNCHER = "/candidate-engine/scripts/pipeline-launcher.mjs";
+const PIN_LAUNCHER = "/opt/pipeline";
+
+function testInvocation(loopRunId: string, sha = CANDIDATE): CandidateInvocation {
+  return freezeCandidateInvocation({
+    executable: CANDIDATE_LAUNCHER,
+    loopRunId,
+    candidateSha: sha,
+  });
+}
+
 function capturingCandidateSpawn(captured: {
   env?: NodeJS.ProcessEnv;
   command?: string;
   args?: readonly string[];
+  stdio?: unknown;
 }) {
   return (
     command: string,
     args: readonly string[],
-    options: { env?: NodeJS.ProcessEnv },
+    options: { env?: NodeJS.ProcessEnv; stdio?: unknown },
   ) => {
     captured.command = command;
     captured.args = args;
     captured.env = options.env;
-    const child = new EventEmitter() as EventEmitter & { unref: () => void };
+    captured.stdio = options.stdio;
+    const child = new EventEmitter() as EventEmitter & {
+      unref: () => void;
+      stdout: EventEmitter;
+      stderr: EventEmitter;
+      pid: number;
+    };
     child.unref = () => {};
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.pid = 4242;
     queueMicrotask(() => child.emit("spawn"));
     return child;
+  };
+}
+
+function validHandoff(loopRunId: string, sha = CANDIDATE) {
+  return {
+    schema_version: "1",
+    kind: "loop_run_handoff",
+    run_id: loopRunId,
+    run_dir: `/state/runs/${loopRunId}`,
+    events: `/state/runs/${loopRunId}/events.jsonl`,
+    engine: "claude",
+    resumed: false,
+    selector: null,
+    candidate_sha: sha,
+    supervisor: {
+      pid: 4242,
+      boot_id: "boot-1",
+      started_at: "2026-08-29T00:00:00.000Z",
+      token: "tok",
+    },
+  };
+}
+
+function spawnDepsForHandoff(loopRunId: string, captured: Parameters<typeof capturingCandidateSpawn>[0]) {
+  const invocation = testInvocation(loopRunId);
+  return {
+    spawn: capturingCandidateSpawn(captured),
+    env: dirtyFrgSigningEnv(),
+    fileExists: () => true,
+    readHandoff: async () => validHandoff(loopRunId),
+    readSupervisor: async () => validHandoff(loopRunId).supervisor,
+    realpath: (p: string) => p,
+    storeRunDir: `/state/runs/${loopRunId}`,
+    sleep: async () => {},
+    now: () => new Date("2026-08-29T00:00:01.000Z"),
+    invocation,
   };
 }
 
@@ -2013,14 +2082,19 @@ test("dispatch spawn strips FRG signing vars from the candidate loop environment
       engineTrack: "candidate",
       label: "factory-gate",
       persistCtx,
+      candidateInvocation: testInvocation("loop-env-dispatch"),
     },
     {
+      fileExists: () => true,
       initBoundLoop: async () => ({ loop_run_id: "loop-env-dispatch" }),
       spawnCandidateLoop: (args) =>
-        defaultSpawnCandidateLoop(args, {
-          spawn: capturingCandidateSpawn(captured),
-          env: dirtyFrgSigningEnv(),
-        }),
+        defaultSpawnCandidateLoop(
+          { ...args, candidateInvocation: args.candidateInvocation, requestCandidateSha: CANDIDATE },
+          {
+            ...spawnDepsForHandoff("loop-env-dispatch", captured),
+            env: dirtyFrgSigningEnv(),
+          },
+        ),
     },
   );
   assert.ok(captured.env, "dispatch must pass an explicit child env");
@@ -2029,7 +2103,9 @@ test("dispatch spawn strips FRG signing vars from the candidate loop environment
     assert.equal(Object.hasOwn(captured.env!, name), false);
   }
   assert.equal(captured.env!.PATH, "/usr/bin");
-  assert.equal(captured.command, "/opt/pipeline");
+  assert.equal(captured.command, CANDIDATE_LAUNCHER);
+  assert.notEqual(captured.command, PIN_LAUNCHER);
+  assert.notEqual(captured.command, "pipeline");
   assert.deepEqual(captured.args, [
     "loop",
     "--resume",
@@ -2039,14 +2115,20 @@ test("dispatch spawn strips FRG signing vars from the candidate loop environment
     "--profile",
     "claude",
   ]);
+  assert.notEqual(captured.stdio, "ignore");
 });
 
 test("resume spawn strips FRG signing vars from the candidate loop environment", async () => {
   const captured: { env?: NodeJS.ProcessEnv; command?: string; args?: readonly string[] } = {};
   await defaultResumeBoundPackLoop(
-    { repoDir: "/repo", loop_run_id: "loop-env-resume" },
     {
-      spawn: capturingCandidateSpawn(captured),
+      repoDir: "/repo",
+      loop_run_id: "loop-env-resume",
+      candidateInvocation: testInvocation("loop-env-resume"),
+      requestCandidateSha: CANDIDATE,
+    },
+    {
+      ...spawnDepsForHandoff("loop-env-resume", captured),
       env: dirtyFrgSigningEnv(),
     },
   );
@@ -2056,7 +2138,8 @@ test("resume spawn strips FRG signing vars from the candidate loop environment",
     assert.equal(Object.hasOwn(captured.env!, name), false);
   }
   assert.equal(captured.env!.HOME, "/home/wrapper");
-  assert.equal(captured.command, "/opt/pipeline");
+  assert.equal(captured.command, CANDIDATE_LAUNCHER);
+  assert.notEqual(captured.command, PIN_LAUNCHER);
   assert.deepEqual(captured.args, [
     "loop",
     "--resume",
@@ -2066,6 +2149,166 @@ test("resume spawn strips FRG signing vars from the candidate loop environment",
     "--profile",
     "claude",
   ]);
+});
+
+test("pack-loop spawn execs the candidate launcher, not PATH pipeline, when PIPELINE_BIN is unset (#1296)", async () => {
+  const captured: { command?: string; args?: readonly string[]; env?: NodeJS.ProcessEnv; stdio?: unknown } = {};
+  const invocation = freezeCandidateInvocation({
+    executable: CANDIDATE_LAUNCHER,
+    loopRunId: "loop-mixed-binary",
+    candidateSha: CANDIDATE,
+  });
+  assert.equal(invocation.argv.includes("--engine-track"), true);
+  const result = await defaultSpawnCandidateLoop(
+    {
+      repoDir: "/repo",
+      loop_run_id: "loop-mixed-binary",
+      candidateInvocation: invocation,
+      requestCandidateSha: CANDIDATE,
+    },
+    {
+      ...spawnDepsForHandoff("loop-mixed-binary", captured),
+      env: { PATH: "/usr/bin", HOME: "/home/wrapper" },
+    },
+  );
+  assert.equal(captured.command, CANDIDATE_LAUNCHER);
+  assert.notEqual(captured.command, "pipeline");
+  assert.notEqual(captured.command, PIN_LAUNCHER);
+  assert.equal(captured.env?.PIPELINE_BIN, undefined);
+  assert.equal(result.dispatch_state, "dispatched");
+  assert.notEqual(captured.stdio, "ignore");
+});
+
+test("missing candidate invocation fails closed and does not exec PATH pipeline", async () => {
+  await assert.rejects(
+    () =>
+      defaultSpawnCandidateLoop(
+        { repoDir: "/repo", loop_run_id: "loop-missing-inv" },
+        { env: { PIPELINE_BIN: PIN_LAUNCHER }, fileExists: () => true },
+      ),
+    /missing typed candidate invocation/,
+  );
+});
+
+test("pre-handoff child exit 1 persists failed and surfaces stderr", async () => {
+  const captured: { command?: string } = {};
+  const childFactory = (
+    command: string,
+    _args: readonly string[],
+    options: { env?: NodeJS.ProcessEnv },
+  ) => {
+    captured.command = command;
+    const child = new EventEmitter() as EventEmitter & {
+      unref: () => void;
+      stdout: EventEmitter;
+      stderr: EventEmitter;
+      pid: number;
+    };
+    child.unref = () => {};
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.pid = 99;
+    queueMicrotask(() => {
+      child.emit("spawn");
+      child.stderr.emit(
+        "data",
+        'recovery policy for "workflow-engine-defect" names a recipe outside the permitted recovery-recipe catalogue\n',
+      );
+      child.emit("exit", 1);
+    });
+    return child;
+  };
+  let wrote: { path?: string; body?: string; mode?: number } = {};
+  let clock = Date.parse("2026-08-29T00:00:01.000Z");
+  const result = await defaultSpawnCandidateLoop(
+    {
+      repoDir: "/repo",
+      loop_run_id: "loop-pre-handoff",
+      candidateInvocation: testInvocation("loop-pre-handoff"),
+      requestCandidateSha: CANDIDATE,
+    },
+    {
+      spawn: childFactory as never,
+      env: { PATH: "/usr/bin" },
+      fileExists: () => true,
+      readHandoff: async () => null,
+      readSupervisor: async () => null,
+      sleep: async () => {
+        clock += 50;
+      },
+      now: () => new Date(clock),
+      observationMs: 1_000,
+      storeRunDir: "/state/runs/loop-pre-handoff",
+      writeFile: async (p, body, mode) => {
+        wrote = { path: p, body, mode };
+      },
+      evidencePath: "/state/runs/loop-pre-handoff/pack-loop-stderr.txt",
+    },
+  );
+  assert.equal(result.dispatch_state, "failed");
+  assert.match(result.last_error ?? "", /pack-loop child exit 1/);
+  assert.match(result.last_error ?? "", /recovery-recipe catalogue/);
+  assert.match(result.last_error ?? "", /evidence:/);
+  assert.equal(wrote.mode, 0o600);
+  assert.equal(captured.command, CANDIDATE_LAUNCHER);
+});
+
+test("OS spawn throw leaves dispatch_state bound", async () => {
+  const result = await defaultSpawnCandidateLoop(
+    {
+      repoDir: "/repo",
+      loop_run_id: "loop-enoent",
+      candidateInvocation: testInvocation("loop-enoent"),
+      requestCandidateSha: CANDIDATE,
+    },
+    {
+      spawn: () => {
+        throw Object.assign(new Error("spawn ENOENT"), { code: "ENOENT" });
+      },
+      fileExists: () => true,
+      env: {},
+    },
+  );
+  assert.equal(result.dispatch_state, "bound");
+  assert.match(result.last_error ?? "", /ENOENT/);
+});
+
+test("handoff SHA mismatch fails closed", async () => {
+  const captured: { command?: string } = {};
+  const result = await defaultSpawnCandidateLoop(
+    {
+      repoDir: "/repo",
+      loop_run_id: "loop-sha-mismatch",
+      candidateInvocation: testInvocation("loop-sha-mismatch"),
+      requestCandidateSha: CANDIDATE,
+    },
+    {
+      ...spawnDepsForHandoff("loop-sha-mismatch", captured),
+      readHandoff: async () => validHandoff("loop-sha-mismatch", "f".repeat(40)),
+    },
+  );
+  assert.equal(result.dispatch_state, "failed");
+  assert.match(result.last_error ?? "", /handoff_mismatch|candidate_sha/);
+});
+
+test("assertCandidateInvocation rejects SHA mismatch", () => {
+  const inv = testInvocation("loop-x");
+  assert.throws(
+    () => assertCandidateInvocation(inv, "c".repeat(40), () => true),
+    /does not match the request candidate SHA/,
+  );
+});
+
+test("formatPackLoopLastError names exit, excerpt, and evidence", () => {
+  const msg = formatPackLoopLastError({
+    exitCode: 1,
+    errorCode: "pre_handoff_exit",
+    excerpt: "catalogue",
+    evidencePath: "/tmp/err.txt",
+  });
+  assert.match(msg, /pack-loop child exit 1/);
+  assert.match(msg, /catalogue/);
+  assert.match(msg, /evidence: \/tmp\/err.txt/);
 });
 
 // ---------------------------------------------------------------------------

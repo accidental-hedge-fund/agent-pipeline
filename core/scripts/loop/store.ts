@@ -12,6 +12,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { homedir } from "node:os";
+import type { DurableLoopRunHandoff } from "./handoff.ts";
 import {
   isDurableBlockerClass,
   LOOP_CONTRACT_SCHEMA,
@@ -143,6 +144,9 @@ function supervisorPath(dir: string): string {
 }
 function actionEvidencePath(dir: string): string {
   return path.join(dir, "action-evidence.jsonl");
+}
+export function loopRunHandoffPath(dir: string): string {
+  return path.join(dir, "loop-run-handoff.json");
 }
 
 // ---------------------------------------------------------------------------
@@ -473,6 +477,31 @@ export async function writeSupervisorProcess(
 export async function readSupervisorProcess(deps: LoopStoreDeps, runId: string): Promise<LoopSupervisorProcess | null> {
   const text = await deps.readTextFile(supervisorPath(runDir(deps, runId)));
   return text ? (JSON.parse(text) as LoopSupervisorProcess) : null;
+}
+
+/**
+ * Token-guarded atomic write of the durable loop-run handoff acknowledgement.
+ * A detached parent reconciles this file; it does not require the original
+ * stdout pipe.
+ */
+export async function writeLoopRunHandoff(
+  deps: LoopStoreDeps,
+  payload: DurableLoopRunHandoff,
+  token: string,
+): Promise<void> {
+  await requireToken(deps, payload.run_id, token);
+  const dir = runDir(deps, payload.run_id);
+  await deps.writeFileAtomic(loopRunHandoffPath(dir), JSON.stringify(payload, null, 2));
+}
+
+/** Reads the durable loop-run handoff. Returns null when absent. */
+export async function readLoopRunHandoff(
+  deps: LoopStoreDeps,
+  runId: string,
+): Promise<DurableLoopRunHandoff | null> {
+  const text = await deps.readTextFile(loopRunHandoffPath(runDir(deps, runId)));
+  if (!text) return null;
+  return JSON.parse(text) as DurableLoopRunHandoff;
 }
 
 // ---------------------------------------------------------------------------

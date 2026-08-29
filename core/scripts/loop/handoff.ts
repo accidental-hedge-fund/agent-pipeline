@@ -40,6 +40,24 @@ export interface LoopRunHandoff {
   selector: LoopSelector | null;
 }
 
+/** Supervisor identity snapshot persisted with the durable pack-loop ack. */
+export interface LoopRunHandoffSupervisorSnapshot {
+  pid: number;
+  boot_id: string;
+  started_at: string;
+  token: string;
+}
+
+/**
+ * Durable acknowledgement written to `<run_dir>/loop-run-handoff.json`.
+ * Survives a detached parent. Stdout `LoopRunHandoff` remains the live-harness
+ * extra and does not include these fields.
+ */
+export interface DurableLoopRunHandoff extends LoopRunHandoff {
+  candidate_sha: string;
+  supervisor: LoopRunHandoffSupervisorSnapshot;
+}
+
 /**
  * Pure formatter: one JSON object (no trailing newline) with
  * `kind: "loop_run_handoff"`. No I/O.

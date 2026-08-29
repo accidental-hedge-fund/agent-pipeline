@@ -42,11 +42,17 @@ import {
   runDir,
   runEventsPath,
   writeLedger,
+  writeLoopRunHandoff,
   writeSupervisorProcess,
   type LoopStatus,
   type LoopStoreDeps,
 } from "./store.ts";
-import type { LoopRunReadyContext } from "./handoff.ts";
+import type { DurableLoopRunHandoff, LoopRunReadyContext } from "./handoff.ts";
+import { LOOP_RUN_HANDOFF_KIND, LOOP_RUN_HANDOFF_SCHEMA_VERSION } from "./handoff.ts";
+import {
+  PIPELINE_PACK_LOOP_CANDIDATE_SHA_ENV,
+  packLoopHeartbeatCadenceMs,
+} from "./pack-loop-liveness.ts";
 import {
   observeExternalIdentity,
   reconcile,
@@ -245,6 +251,16 @@ export interface SupervisorDeps {
    *  (i.e. concurrency is actually in effect) — absent by default, so the serialized default never
    *  requires it. */
   getChangedFiles?(itemId: string): Promise<string[]>;
+  /**
+   * Periodic process-heartbeat timer (#1296). Tests inject a fake; production
+   * uses `setInterval`. A tick without current lock ownership is a no-op.
+   */
+  setHeartbeatInterval?(
+    fn: () => void | Promise<void>,
+    ms: number,
+  ): unknown;
+  /** Clears the handle returned by {@link setHeartbeatInterval}. */
+  clearHeartbeatInterval?(handle: unknown): void;
   /** Best-effort hook invoked once `driveSupervisor` reaches a terminal stop
    *  or full completion — never on an outstanding pause/hold, since the run
    *  is not yet done there (capability `durable-run-blocker-auto-file`, #538).
@@ -2777,6 +2793,11 @@ export interface DriveSupervisorInput {
    * — the supervisor only knows run identity.
    */
   onRunReady?(ctx: LoopRunReadyContext): void | Promise<void>;
+  /**
+   * Frozen candidate SHA for the durable pack-loop handoff. When omitted,
+   * the supervisor reads {@link PIPELINE_PACK_LOOP_CANDIDATE_SHA_ENV}.
+   */
+  candidateSha?: string;
 }
 
 /** Names which of the three resolved shapes a run ended in (capability
@@ -2837,6 +2858,16 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
   const contract = await readContract(deps.store, input.runId);
   const limit = input.consecutiveNoProgressLimit ?? contract.consecutive_no_progress_limit ?? DEFAULT_CONSECUTIVE_NO_PROGRESS_LIMIT;
   const cyclesSafetyCap = input.maxCyclesSafety ?? MAX_CYCLES_SAFETY;
+  const heartbeatMs = packLoopHeartbeatCadenceMs();
+  const setHeartbeat =
+    deps.setHeartbeatInterval ??
+    ((fn: () => void | Promise<void>, ms: number) => setInterval(() => { void fn(); }, ms));
+  const clearHeartbeat =
+    deps.clearHeartbeatInterval ??
+    ((handle: unknown) => {
+      if (handle != null) clearInterval(handle as NodeJS.Timeout);
+    });
+  let heartbeatTimer: unknown;
 
   try {
     if (input.resume) {
@@ -2880,6 +2911,44 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
         resumed: attach.resumed,
       });
     }
+
+    const candidateSha =
+      (typeof input.candidateSha === "string" && /^[0-9a-f]{40}$/.test(input.candidateSha)
+        ? input.candidateSha
+        : null) ??
+      (typeof deps.store.env[PIPELINE_PACK_LOOP_CANDIDATE_SHA_ENV] === "string" &&
+      /^[0-9a-f]{40}$/.test(deps.store.env[PIPELINE_PACK_LOOP_CANDIDATE_SHA_ENV]!)
+        ? deps.store.env[PIPELINE_PACK_LOOP_CANDIDATE_SHA_ENV]!
+        : "");
+    const durableHandoff: DurableLoopRunHandoff = {
+      schema_version: LOOP_RUN_HANDOFF_SCHEMA_VERSION,
+      kind: LOOP_RUN_HANDOFF_KIND,
+      run_id: input.runId,
+      run_dir: runDir(deps.store, input.runId),
+      events: runEventsPath(deps.store, input.runId),
+      engine: input.engine,
+      resumed: attach.resumed,
+      selector: null,
+      candidate_sha: candidateSha,
+      supervisor: {
+        pid: record.pid,
+        boot_id: record.boot_id,
+        started_at: record.started_at,
+        token: record.token,
+      },
+    };
+    await writeLoopRunHandoff(deps.store, durableHandoff, token);
+
+    heartbeatTimer = setHeartbeat(async () => {
+      try {
+        const held = await readLock(deps.store, input.runId);
+        if (!held || held.token !== token) return;
+        record = { ...record, heartbeat_at: deps.store.now().toISOString() };
+        await writeSupervisorProcess(deps.store, record, token);
+      } catch {
+        // Tick without current lock ownership is a no-op.
+      }
+    }, heartbeatMs);
 
     if (attach.resumed) {
       try {
@@ -3082,6 +3151,7 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
     }
     return result;
   } finally {
+    if (heartbeatTimer != null) clearHeartbeat(heartbeatTimer);
     await releaseLock(deps.store, input.runId, token);
   }
 }
