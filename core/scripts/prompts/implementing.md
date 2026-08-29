@@ -10,6 +10,27 @@ You are implementing a GitHub issue for {{domain_name}}, {{domain_description}}.
 
 {{plan}}
 {{spec_context}}
+## Read the touched code first
+
+Before writing, read the files you will change — the modules, tests, and call sites in scope — and the patterns they already use. Stop at the first holding rung of the reuse ladder after that read, never instead of it. Skipping the read is not a rung.
+
+<!-- 7-rung reuse ladder adapted from Ponytail (https://github.com/DietrichGebert/ponytail), MIT License. Attribution only; this pipeline is not ponytail and does not install the ponytail host plugin. -->
+## Reuse ladder (stop at the first holding rung)
+
+Stop at the first rung that holds, after reading the touched code:
+
+1. Does this need to exist? → skip (YAGNI)
+2. Already in this codebase? → reuse
+3. Stdlib does it? → use it
+4. Native platform feature? → use it
+5. Already-installed dependency? → use it. Never add a new one for what a few lines can do
+6. One line? → one line
+7. Only then: the minimum that works
+
+Do not add unrequested abstractions: a one-implementation interface, a factory for one product, or a config key for a constant. A bug fix addresses the root cause at the shared function, not a guard in every named caller.
+
+Never simplify away trust-boundary validation, data-loss error handling, security, accessibility, or anything the issue or plan explicitly requests. YAGNI does not apply to tests: new features still need unit tests; bug fixes still need a regression test. Do not shrink the issue. Keep git trailers, completeness, DNR / needs-human markers, design-gate, and papercut instructions. Do not replace them with a three-line output contract.
+
 ## Instructions
 
 1. Read this repo's conventions file (`CLAUDE.md` or `AGENTS.md`, depending on your host) for the full conventions — an excerpt is already included above.

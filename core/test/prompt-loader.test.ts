@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   _testing,
   buildEvalFixPrompt,
@@ -28,7 +29,7 @@ import {
 } from "../scripts/prompts/index.ts";
 import { sanitizeBriefForPrompt } from "../scripts/stages/planning.ts";
 import { readConventions } from "../scripts/config.ts";
-import type { PipelineConfig } from "../scripts/types.ts";
+import { DEFAULT_CONFIG, type PipelineConfig } from "../scripts/types.ts";
 
 function dummyConfig(): PipelineConfig {
   return {
@@ -2430,4 +2431,254 @@ test("ship-path autonomy: planning and intake carry engine-dogfood class-vs-site
       `${name} must require non-recurrence without a new mole issue`,
     );
   }
+});
+
+// #1266: implement/plan YAGNI reuse ladder — presence on implementing + planning,
+// absence on fix-round builders. Each assertion bites if the matching instruction
+// is removed or wrongly copied into a fix-round template.
+
+const YAGNI_LADDER_RUNGS = [
+  "Does this need to exist?",
+  "Already in this codebase?",
+  "Stdlib does it?",
+  "Native platform feature?",
+  "Already-installed dependency?",
+  "One line?",
+  "Only then: the minimum that works",
+] as const;
+
+const FIRST_HOLDING_RUNG_ONELINER =
+  /Prefer the first holding rung of the reuse ladder after reading in-scope code, so the plan or OpenSpec proposal\/design does not invent a custom layer the implementer then has to build/;
+
+function sampleImplementingPrompt(): string {
+  return buildImplementingPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 1266,
+    title: "YAGNI ladder",
+    body: "b",
+    plan: "p",
+    pipelineRunId: "1266/2026-08-29T23:33:01Z",
+  });
+}
+
+test("implementing prompt: read-the-touched-code comes before the 7-rung ladder and before writing (#1266)", () => {
+  const out = sampleImplementingPrompt();
+  const readIdx = out.indexOf("## Read the touched code first");
+  const ladderIdx = out.indexOf("## Reuse ladder (stop at the first holding rung)");
+  const writeIdx = out.indexOf("## Instructions");
+  assert.ok(readIdx >= 0, "implementing prompt must instruct reading touched code first");
+  assert.ok(ladderIdx >= 0, "implementing prompt must contain the reuse ladder heading");
+  assert.ok(writeIdx >= 0, "implementing prompt must still have the write / implement Instructions section");
+  assert.ok(readIdx < ladderIdx, "read-first must appear before the ladder");
+  assert.ok(ladderIdx < writeIdx, "the ladder block must appear before the write / implement instructions");
+  assert.match(out, /read the files you will change/, "must tell the harness to read touched code");
+  assert.match(
+    out,
+    /after that read, never instead of it/,
+    "ladder must be applied after reading, never instead of reading",
+  );
+  assert.match(out, /Skipping the read is not a rung/, "skip-the-read must not be presented as a valid rung");
+  assert.doesNotMatch(out, /\{\{[a-zA-Z_]+\}\}/);
+});
+
+test("implementing prompt: lists all seven reuse-ladder rungs in order (#1266)", () => {
+  const out = sampleImplementingPrompt();
+  let prev = -1;
+  for (const rung of YAGNI_LADDER_RUNGS) {
+    const idx = out.indexOf(rung);
+    assert.ok(idx >= 0, `implementing prompt must contain rung: ${rung}`);
+    assert.ok(idx > prev, `rung "${rung}" must appear after the previous rung`);
+    prev = idx;
+  }
+  assert.match(out, /skip \(YAGNI\)/);
+  assert.match(out, /Never add a new one for what a few lines can do/);
+});
+
+test("implementing prompt: forbids unrequested abstractions and caller-local bug guards (#1266)", () => {
+  const out = sampleImplementingPrompt();
+  assert.match(out, /unrequested abstractions/);
+  assert.match(out, /one-implementation interface/);
+  assert.match(out, /factory for one product/);
+  assert.match(out, /config key for a constant/);
+  assert.match(out, /root cause at the shared function/);
+  assert.match(out, /not a guard in every named caller/);
+});
+
+test("implementing prompt: never-simplify-away surfaces, tests are not YAGNI, trailers and completeness stay (#1266)", () => {
+  const out = sampleImplementingPrompt();
+  assert.match(
+    out,
+    /trust-boundary validation, data-loss error handling, security, accessibility/,
+  );
+  assert.match(out, /anything the issue or plan explicitly requests/);
+  assert.match(out, /YAGNI does not apply to tests/);
+  assert.match(out, /new features still need unit tests/);
+  assert.match(out, /bug fixes still need a regression test/);
+  assert.match(out, /Do not shrink the issue/);
+  assert.match(out, /Keep git trailers/);
+  assert.match(out, /completeness/);
+  assert.match(out, /DNR \/ needs-human/);
+  assert.match(out, /design-gate/);
+  assert.match(out, /papercut/);
+  assert.match(out, /three-line output contract/);
+  assert.match(out, /Issue: #1266/);
+  assert.match(out, /Pipeline-Run: 1266\/2026-08-29T23:33:01Z/);
+  assert.match(out, /Write or update tests that cover the new or changed behavior/);
+  assert.doesNotMatch(out, /YAGNI applies to tests/);
+  assert.doesNotMatch(out, /ship the one-liner and challenge the rest/);
+  const template = _testing.loadTemplate("implementing");
+  assert.match(template, /\{\{papercut_instruction\}\}/, "papercut instruction slot must remain");
+  assert.match(template, /\{\{design_gate_instruction\}\}/, "design-gate instruction slot must remain");
+});
+
+test("implementing prompt: MIT attribution comment names Ponytail without rebranding (#1266)", () => {
+  const template = _testing.loadTemplate("implementing");
+  const out = sampleImplementingPrompt();
+  const attribution =
+    /<!--[\s\S]*Ponytail[\s\S]*https:\/\/github\.com\/DietrichGebert\/ponytail[\s\S]*MIT License[\s\S]*-->/;
+  assert.match(template, attribution, "implementing template must attribute the ladder MIT to Ponytail");
+  assert.match(out, attribution, "rendered implementing prompt must keep the MIT attribution comment");
+  assert.match(out, /this pipeline is not ponytail/);
+  assert.doesNotMatch(out, /this pipeline is ponytail/i);
+});
+
+test("planning prompts: first-holding-rung one-liner is present after read-in-scope-code (#1266)", () => {
+  const planning = buildPlanningPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 1266,
+    title: "t",
+    body: "b",
+  });
+  const openspec = buildPlanningOpenspecPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 1266,
+    title: "t",
+    body: "b",
+    pipelineRunId: "1266/x",
+  });
+  assert.match(planning, /Research first/);
+  const researchIdx = planning.indexOf("## Research first (before drafting)");
+  const oneLinerIdx = planning.search(FIRST_HOLDING_RUNG_ONELINER);
+  const taskIdx = planning.indexOf("## Task");
+  assert.ok(researchIdx >= 0, "freeform planning must keep the Research first block");
+  assert.ok(oneLinerIdx >= 0, "freeform planning must include the first-holding-rung one-liner");
+  assert.ok(researchIdx < oneLinerIdx, "one-liner must appear after Research first");
+  assert.ok(oneLinerIdx < taskIdx, "one-liner must appear before the Task / plan-draft section");
+  assert.match(openspec, FIRST_HOLDING_RUNG_ONELINER);
+  assert.match(openspec, /OpenSpec proposal\/design/);
+  assert.doesNotMatch(planning, /\{\{[a-zA-Z_]+\}\}/);
+  assert.doesNotMatch(openspec, /\{\{[a-zA-Z_]+\}\}/);
+});
+
+test("fix-round prompts: omit the 7-rung YAGNI ladder (#1266)", () => {
+  const cfg = dummyConfig();
+  const samples: [string, string][] = [
+    [
+      "buildFixPrompt",
+      buildFixPrompt({
+        cfg,
+        issueNumber: 1266,
+        title: "t",
+        reviewFindings: "f",
+        fixRound: 1,
+        pipelineRunId: "1266/x",
+      }),
+    ],
+    [
+      "buildTestFixPrompt",
+      buildTestFixPrompt({
+        cfg,
+        issueNumber: 1266,
+        command: "npm test",
+        attempt: 1,
+        maxAttempts: 3,
+        output: "fail",
+        pipelineRunId: "1266/x",
+      }),
+    ],
+    [
+      "buildEvalFixPrompt",
+      buildEvalFixPrompt({
+        cfg,
+        issueNumber: 1266,
+        command: "pnpm evals",
+        attempt: 1,
+        maxAttempts: 2,
+        output: "fail",
+        pipelineRunId: "1266/x",
+      }),
+    ],
+    [
+      "buildVisualFixPrompt",
+      buildVisualFixPrompt({
+        cfg,
+        issueNumber: 1266,
+        command: "npx playwright test",
+        attempt: 1,
+        maxAttempts: 3,
+        output: "fail",
+        artifacts: "none",
+        pipelineRunId: "1266/x",
+      }),
+    ],
+  ];
+  for (const [name, out] of samples) {
+    for (const rung of YAGNI_LADDER_RUNGS) {
+      assert.ok(
+        !out.includes(rung),
+        `${name} must not contain implementing-ladder rung "${rung}"`,
+      );
+    }
+    assert.doesNotMatch(
+      out,
+      /Reuse ladder \(stop at the first holding rung\)/,
+      `${name} must not contain the implementing reuse-ladder heading`,
+    );
+    assert.doesNotMatch(out, FIRST_HOLDING_RUNG_ONELINER, `${name} must not copy the planning one-liner`);
+  }
+});
+
+test("YAGNI ladder: no ponytail packaging, slash command, or intensity mode switch (#1266)", () => {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const repoRoot = path.resolve(here, "../..");
+  for (const rel of ["package.json", "core/package.json"]) {
+    const pkg = JSON.parse(fs.readFileSync(path.join(repoRoot, rel), "utf8")) as {
+      dependencies?: Record<string, string>;
+      devDependencies?: Record<string, string>;
+    };
+    assert.ok(
+      !pkg.dependencies?.["@dietrichgebert/ponytail"],
+      `${rel} must not add @dietrichgebert/ponytail as a dependency`,
+    );
+    assert.ok(
+      !pkg.devDependencies?.["@dietrichgebert/ponytail"],
+      `${rel} must not add @dietrichgebert/ponytail as a devDependency`,
+    );
+  }
+  for (const key of ["yagni", "ponytail", "yagni_intensity", "ladder_intensity"] as const) {
+    assert.ok(!(key in DEFAULT_CONFIG), `DEFAULT_CONFIG must not grow a ${key} intensity key`);
+  }
+  const implementing = sampleImplementingPrompt();
+  const planning = buildPlanningPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 1266,
+    title: "t",
+    body: "b",
+  });
+  for (const [name, out] of [
+    ["implementing", implementing],
+    ["planning", planning],
+  ] as const) {
+    assert.doesNotMatch(
+      out,
+      /\b(off|lite|ultra)\b[^\n]{0,40}\b(mode|intensity)\b|\b(mode|intensity)\b[^\n]{0,40}\b(off|lite|ultra)\b/i,
+      `${name} must not offer an off/lite/ultra intensity mode switch`,
+    );
+  }
+  const pipelineCli = fs.readFileSync(path.join(here, "../scripts/pipeline.ts"), "utf8");
+  assert.doesNotMatch(
+    pipelineCli,
+    /(?:^|\s)\/ponytail(?:\s|$)/m,
+    "pipeline CLI must not add a /ponytail command",
+  );
 });
