@@ -21,7 +21,7 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 
 #### `loop`
 
-- **Usage:** `pipeline loop --milestone <m>|--label <l>|--range a-b [--resume <run-id>] [--audit] [--follow]`
+- **Usage:** `pipeline loop --milestone <m> [--audit] [--follow] | loop --label <l> [--audit] [--follow] | loop --range a-b [--audit] [--follow] | loop --roadmap-slice <slice> [--audit] [--follow] | loop <N> [<N> ...] [--audit] [--follow] | loop --resume <run-id> [--audit] [--follow]`
 - **Summary:** Durable multi-item run — driven in-repo by the pipeline's own loop supervisor
 
 #### `single`

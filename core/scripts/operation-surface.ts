@@ -202,7 +202,7 @@ export const OPERATION_SURFACE: readonly OperationSurfaceEntry[] = [
     name: "loop",
     desc: "Durable multi-item run — driven in-repo by the pipeline's own loop supervisor",
     usage:
-      "loop --milestone <m>|--label <l>|--range a-b [--resume <run-id>] [--audit] [--follow]",
+      "loop --milestone <m> [--audit] [--follow] | loop --label <l> [--audit] [--follow] | loop --range a-b [--audit] [--follow] | loop --roadmap-slice <slice> [--audit] [--follow] | loop <N> [<N> ...] [--audit] [--follow] | loop --resume <run-id> [--audit] [--follow]",
     section: "advance",
     fast: false,
     inRepoLoop: true,

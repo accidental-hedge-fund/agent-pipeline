@@ -43,7 +43,7 @@ Hosts (Claude Code `/pipeline`, Codex `$pipeline`, and others) are shims around 
 - Scaffolds `.github/pipeline.yml` with documented defaults
 - Ensures local-only paths under `.agent-pipeline/` are gitignored
 
-Ignored local paths (must never be committed): `.agent-pipeline/runs/`, `.agent-pipeline/roadmap/`, `.agent-pipeline/history/`, `.agent-pipeline/frg/`, `.agent-pipeline/factory-release/`. Without that gitignore block, the first run can leave the worktree dirty and fail `pipeline doctor`'s `worktree-clean` check.
+Ignored local paths (must never be committed): `.agent-pipeline/runs/`, `.agent-pipeline/roadmap/`, `.agent-pipeline/history/`, `.agent-pipeline/evals/`, `.agent-pipeline/control-attributions.jsonl`, `.agent-pipeline/product-fault-reports.jsonl`, `.agent-pipeline/handoffs/`, `.agent-pipeline/outcomes/`, `.agent-pipeline/lineage/`, `.agent-pipeline/frg/`, `.agent-pipeline/harness-ownership/`, and `.agent-pipeline/factory-release/`. Without that gitignore block, the first run can leave the worktree dirty and fail `pipeline doctor`'s `worktree-clean` check.
 
 After `init`, commit the config, label an issue `pipeline:ready`, and run `/pipeline N` or `$pipeline N`.
 
@@ -343,7 +343,7 @@ Generated host SKILLs carry the compact contract. This page keeps the operator d
 
 CLI dispatch is unchanged: `pipeline <N>` is a direct advance. `pipeline single <N>` and `pipeline loop` launch through the durable loop.
 
-Direct numeric advance retains `advance_run_id` from the advance handoff (`run_id`). Follow:
+Direct numeric advance retains `advance_run_id` from the `advance_run_handoff` JSON line (`run_id`). That value is the run-store basename (`<issue>-<filesystem-safe-timestamp>`), not the commit-trailer `Pipeline-Run` id (`<issue>/<ISO>`). Follow:
 
 ```
 pipeline logs <advance-run-id> --events --follow
@@ -371,11 +371,13 @@ Supported loop selectors: `--milestone <name>`, `--label <label>`, `--range <spe
 
 Diagnostic fallback for the raw loop stream: `<state-home>/runs/<loop_run_id>/events.jsonl`. State-home resolution order: `AGENT_PIPELINE_STATE_HOME` (preferred) or legacy `PIPELINE_STATE_HOME`; then `$XDG_STATE_HOME/agent-pipeline/loop`; then `~/.local/state/agent-pipeline/loop`. Do not use an informal `/tmp/pipeline-*.log` as the evidence contract.
 
+When an early `loop_run_handoff` is missing and `--resume` is not in use, discover the run by contract, not by newest basename. Snapshot run directories present before launch. Then scan every candidate under `<state-home>/runs/` (ignore `.init-*` staging). Select only a directory that has `contract.json` and `events.jsonl` and a live `lock.json` whose `pid` is this launch (exact integer match) or a descendant of it, while the launcher process instance is still the same pid plus starttime. Do not treat the first newly published basename as ownership. Keep polling until a lock match appears or this launch instance is gone.
+
 Linked-advance follow remains required for complete mid-item stage progress until dense first-class loop progress ships (#611, #682). Re-attach after cancelled wait is #725. Loop-only follow covers schedule, hold, mirrored gate progress, and terminal loop events; it is insufficient alone for mid-item stage progress until those successors land.
 
 ### Material event kinds
 
-Use `scripts/material-filter.mjs` on follow streams. Unfiltered `events.jsonl` stays the complete evidence file. Human-visible notify uses that material filter so test-gate output cannot surface fixture transitions for unrelated issue numbers, broad stdout matching cannot treat those lines as progress, and rapid duplicate notifications cannot auto-stop a host Monitor. The filter is a notification projection. It does not rewrite the run store.
+Use `scripts/material-filter.mjs` on follow streams. Unfiltered `events.jsonl` stays the complete evidence file. Human-visible notify uses that material filter so test-gate output cannot surface fixture transitions for unrelated issue numbers, broad stdout matching cannot treat those lines as progress, and rapid duplicate notifications cannot auto-stop a host Monitor. The filter is a notification projection. It does not rewrite the run store. It suppresses heartbeats, accounting noise, kinds outside the material sets, skipped-stage start/complete, repeated identical schedule/reconcile evaluations in one burst, later identical CI `waiting` after the first in a stretch, and repeated CI `partial` / OpenSpec `skipped` outcomes.
 
 Advance material kinds: `run_start`, `stage_start`, `stage_complete`, `pr_created`, `pr_updated`, `review_verdict`, `gate_result`, `blocker_set`, `blocker_cleared`, `run_complete`.
 
@@ -391,10 +393,10 @@ Train follow: parse `train_run_handoff` for `run_id`, then `pipeline logs <train
 
 ### Native `/goal` bootstrap
 
-Starting a durable loop is an operator-owned two-step bootstrap inside a Claude Code session:
+Starting a durable loop is an operator-owned two-step bootstrap inside the host's native autonomous mode:
 
-1. Run `/goal` to enter Claude Code's built-in autonomous mode.
-2. Inside that `/goal` session, invoke `pipeline loop …`.
+- Claude: run `/goal`, then invoke `pipeline loop …` inside that session.
+- Codex: run `/goal`, then invoke `pipeline loop …` inside that session.
 
 The Pipeline skill does not detect whether native goal mode is active. It does not invoke or re-enter that mode. It does not control the native goal session's lifecycle. Ending the native goal session is a host or operator action after `pipeline loop` reports its own terminal and reconciliation conditions. The skill neither ends that session nor merges.
 
@@ -406,7 +408,7 @@ Five local-CLI adapters: `claude`, `codex`, `grok`, `opencode`, `pi`. Login is o
 | --- | --- | --- |
 | `claude` | Run `claude` once to complete login | `harnesses: { implementer: claude }` |
 | `codex` | `codex login` | `harnesses: { reviewer: codex }` |
-| `grok` | `grok login` | `stage_executors: { implementing: grok-impl }` with a local-cli executor bound to `grok` |
+| `grok` | `grok login` | `harnesses: { implementer: grok }` |
 | `opencode` | `opencode auth login` | `harnesses: { implementer: opencode }` |
 | `pi` | Run `pi` once and complete `/login` | `harnesses: { implementer: pi }` |
 
@@ -419,6 +421,14 @@ harnesses:
 effort:
   implementing: medium
   review: high
+```
+
+Grok as implementer (schema-valid local-CLI harness assignment, not a `stage_executors` name):
+
+```yaml
+harnesses:
+  implementer: grok
+  reviewer: codex
 ```
 
 Grok notify uses its outer-host manifest mapping (`grok_monitor_lines` / `monitor`). Portable fallback is stdout material lines via `events.jsonl` plus `material-filter.mjs`. Do not require Claude `PushNotification` on Grok.

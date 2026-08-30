@@ -8,6 +8,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { ARTIFACT_CONTRACT } from "../scripts/artifact-ignore.ts";
+import { validateConfig } from "../scripts/config.ts";
 import { BUILTIN_ADAPTER_NAMES } from "../scripts/harness-adapters/registry.ts";
 import { RELEASE_PLAN_ROW_SHAPE } from "../scripts/stages/release.ts";
 
@@ -45,13 +46,25 @@ test("durable docs cover login and stage assignment for every built-in adapter",
   assert.match(concepts, /Run `pi` once and complete `\/login`/);
   assert.match(concepts, /harnesses: \{ implementer: claude \}/);
   assert.match(concepts, /harnesses: \{ reviewer: codex \}/);
+  assert.match(concepts, /harnesses: \{ implementer: grok \}/);
   assert.match(concepts, /harnesses: \{ implementer: opencode \}/);
   assert.match(concepts, /harnesses: \{ implementer: pi \}/);
-  assert.match(concepts, /stage_executors: \{ implementing: grok-impl \}/);
+  assert.doesNotMatch(concepts, /stage_executors: \{ implementing: grok-impl \}/);
   assert.match(concepts, /effort levels are not comparable across harnesses/);
   for (const name of BUILTIN_ADAPTER_NAMES) {
     assert.ok(concepts.includes(`\`${name}\``), `concepts missing adapter ${name}`);
   }
+  const grokYaml = concepts.match(
+    /```yaml\n(harnesses:\n  implementer: grok\n  reviewer: codex\n)```/,
+  );
+  assert.ok(grokYaml, "concepts must include a schema-valid grok harness YAML fence");
+  const parsed = validateConfig("/fake-repo", {
+    findGitRoot: () => "/fake-repo",
+    readFile: (fp: string) => (fp.endsWith("pipeline.yml") ? grokYaml[1]! : null),
+    harnesses: { implementer: "grok", reviewer: "codex" },
+  });
+  assert.equal(parsed.valid, true, parsed.diagnostics.map((d) => d.message).join("; "));
+  assert.equal(parsed.diagnostics.some((d) => d.severity === "error"), false);
 });
 
 test("durable docs match ARTIFACT_CONTRACT inventory and release-plan row shape", () => {
@@ -83,6 +96,10 @@ test("durable docs name native-goal ownership, summary fields, filter rationale,
   assert.match(concepts, /operator-authorized merge next step/);
   assert.match(concepts, /fixture transitions for unrelated issue numbers/);
   assert.match(concepts, /auto-stop a host Monitor/);
+  assert.match(concepts, /suppresses heartbeats/);
+  assert.match(concepts, /discover the run by contract/);
+  assert.match(concepts, /Do not treat the first newly published basename as ownership/);
+  assert.match(concepts, /`advance_run_handoff`/);
   assert.match(packaging, /Portable fallback is stdout material lines/);
   assert.match(packaging, /Do not require Claude `PushNotification` on Grok/);
 });

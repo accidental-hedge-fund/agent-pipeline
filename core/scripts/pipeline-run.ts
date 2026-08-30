@@ -63,6 +63,7 @@ import {
   recordRecovery,
   recordStage,
 } from "./evidence-bundle.ts";
+import { flushAdvanceRunHandoff } from "./advance-handoff.ts";
 import {
   RUN_SCHEMA_VERSION,
   appendEvent,
@@ -712,6 +713,12 @@ export interface AdvanceDeps {
    * does not call GitHub. Production default is module-level {@link setBlocked}.
    */
   setBlocked?: typeof setBlocked;
+  /**
+   * Early `advance_run_handoff` JSON line (stdout in production). Injected so
+   * unit tests capture the run-store basename before first stage dispatch
+   * without writing to the process stdout.
+   */
+  writeHandoffLine?: (line: string) => Promise<void> | void;
 }
 
 /**
@@ -1497,6 +1504,7 @@ export async function runAdvance(
         explicit: opts.discoveryChannel,
         persisted: persistedDiscovery,
       });
+      let runStoreReady = false;
       await initRunDir(
         {
           runDir,
@@ -1510,7 +1518,23 @@ export async function runAdvance(
           discoveryChannel: activeDiscoveryChannel,
         },
         runStoreDeps,
-      ).catch(() => {});
+      )
+        .then(() => {
+          runStoreReady = true;
+        })
+        .catch(() => {});
+      // Flush the logs-compatible run-store basename before first stage
+      // dispatch. Distinct from the later commit-trailer `Pipeline-Run` id.
+      if (runStoreReady) {
+        await flushAdvanceRunHandoff(
+          {
+            runId,
+            runDir,
+            events: path.join(runDir, "events.jsonl"),
+          },
+          deps.writeHandoffLine,
+        );
+      }
       // Start the terminal.log tee (directory exists after initRunDir).
       try {
         terminalTee = startTerminalLogTee(path.join(runDir, "terminal.log"));

@@ -168,8 +168,20 @@ describe("SKILL_HOST_IDS membership", () => {
 
   test("public API is only renderHostSkill and SKILL_HOST_IDS", () => {
     const source = readFileSync(HOST_SKILL_SOURCE, "utf8");
-    assert.match(source, /^export const SKILL_HOST_IDS = /m);
-    assert.match(source, /^export function renderHostSkill\(/m);
+    const names: string[] = [];
+    for (const match of source.matchAll(
+      /^export\s+(?:async\s+)?(?:type|interface|function|const|class|enum|let|var)\s+(\w+)/gm,
+    )) {
+      names.push(match[1]!);
+    }
+    assert.deepEqual(
+      [...names].sort(),
+      ["SKILL_HOST_IDS", "renderHostSkill"].sort(),
+    );
+    assert.doesNotMatch(source, /^export type SkillHostId/m);
+    assert.doesNotMatch(source, /^export interface RenderHostSkillOptions/m);
+    assert.doesNotMatch(source, /^export \{/m);
+    assert.doesNotMatch(source, /^export type \{/m);
     assert.doesNotMatch(source, /^export function hostSkillRelativePath/m);
     assert.doesNotMatch(source, /^export function hostSkillRelativePaths/m);
     assert.doesNotMatch(source, /^export function selectSkillHostManifests/m);
@@ -338,6 +350,30 @@ describe("renderHostSkill contract", () => {
     assert.match(table, /pipeline ship --milestone vX\.Y\.Z/);
     assert.match(table, /pipeline ship status --milestone vX\.Y\.Z/);
     assert.doesNotMatch(table, /\| ship status/);
+    const loopOp = OPERATION_SURFACE.find((op) => op.name === "loop");
+    assert.ok(loopOp);
+    const loopAlts = loopOp.usage.split(/\s+\|\s+/);
+    for (const alt of loopAlts) {
+      assert.match(alt, /^loop /);
+      assert.match(table, new RegExp(`pipeline ${alt.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+      const hasSelector =
+        /--milestone|--label|--range|--roadmap-slice|<N>/.test(alt);
+      const hasResume = /--resume/.test(alt);
+      assert.equal(
+        hasSelector && hasResume,
+        false,
+        `loop alternative combines selector with resume: ${alt}`,
+      );
+    }
+    assert.ok(loopAlts.some((alt) => alt.includes("--roadmap-slice")));
+    assert.ok(loopAlts.some((alt) => /loop <N>/.test(alt)));
+    assert.ok(
+      loopAlts.some(
+        (alt) =>
+          alt.includes("--resume") &&
+          !/--milestone|--label|--range|--roadmap-slice|<N>/.test(alt),
+      ),
+    );
   });
 
   test("compact policy preserves merge-authority boundary", () => {
@@ -390,6 +426,10 @@ describe("renderHostSkill contract", () => {
   });
 });
 
+const SKILL_HOST_ID_ALT = "claude|codex|grok|opencode";
+const SKILL_HOST_IDS_TUPLE =
+  'SKILL_HOST_IDS = ["claude", "codex", "grok", "opencode"] as const';
+
 const HOST_DISPATCH_PATTERNS: Array<{ name: string; re: RegExp }> = [
   {
     name: "unquoted host-keyed notify map",
@@ -415,11 +455,37 @@ const HOST_DISPATCH_PATTERNS: Array<{ name: string; re: RegExp }> = [
     name: "switch on host id",
     re: /switch\s*\(\s*(?:id|hostId|host)\s*\)/,
   },
+  {
+    name: "switch on manifest.id",
+    re: /switch\s*\(\s*(?:manifest|row)\.id\s*\)/,
+  },
+  {
+    name: "metadata-first host map",
+    re: new RegExp(
+      String.raw`\{\s*(?:host|id|hostId)\s*:\s*["'](?:${SKILL_HOST_ID_ALT})["']`,
+    ),
+  },
+  {
+    name: "bracket-notation host lookup",
+    re: new RegExp(String.raw`\[\s*["'](?:${SKILL_HOST_ID_ALT})["']\s*\]`),
+  },
+  {
+    name: "arbitrary host-id comparison",
+    re: new RegExp(
+      String.raw`(?:===?|!==?)\s*["'](?:${SKILL_HOST_ID_ALT})["']|["'](?:${SKILL_HOST_ID_ALT})["']\s*(?:===?|!==?)`,
+    ),
+  },
 ];
 
+/** Membership tuple is the one allowed host-id listing; strip it before scanning. */
+function stripSkillHostIdTuple(source: string): string {
+  return source.replaceAll(SKILL_HOST_IDS_TUPLE, "SKILL_HOST_IDS = [] as const");
+}
+
 function assertNoHostDispatch(source: string, label = "source"): void {
+  const scanned = stripSkillHostIdTuple(source);
   for (const pattern of HOST_DISPATCH_PATTERNS) {
-    assert.doesNotMatch(source, pattern.re, `${label} must not contain ${pattern.name}`);
+    assert.doesNotMatch(scanned, pattern.re, `${label} must not contain ${pattern.name}`);
   }
 }
 
@@ -440,16 +506,34 @@ describe("source-of-truth bite", () => {
     const quoted = `const m = { "claude": { surface: "x" } };`;
     const mapLiteral = `const m = new Map([["claude", { tools: [] }]]);`;
     const manifestId = `if (manifest.id === "claude") notify();`;
+    const metadataFirst = `const rows = [{ host: "claude", surface: "x" }];`;
+    const bracket = `notify["codex"] = { tools: [] };`;
+    const arbitraryCompare = `if (active === "grok") push();`;
+    const switchManifest = `switch (manifest.id) { case "opencode": break; }`;
+    const fixtures: Array<[string, string]> = [
+      ["quoted", quoted],
+      ["map", mapLiteral],
+      ["manifest.id", manifestId],
+      ["metadata-first", metadataFirst],
+      ["bracket", bracket],
+      ["arbitrary-compare", arbitraryCompare],
+      ["switch-manifest.id", switchManifest],
+    ];
+    for (const [label, fixture] of fixtures) {
+      assert.throws(
+        () => assertNoHostDispatch(fixture, label),
+        (err: unknown) => err instanceof assert.AssertionError,
+        `${label} must fail the host-dispatch guard`,
+      );
+    }
+  });
+
+  test("SKILL_HOST_IDS membership tuple is exempt from the host-dispatch guard", () => {
+    const tupleOnly = `export const ${SKILL_HOST_IDS_TUPLE};`;
+    assertNoHostDispatch(tupleOnly, "tuple-only");
+    const tuplePlusBracket = `${tupleOnly}\nnotify["claude"] = 1;`;
     assert.throws(
-      () => assertNoHostDispatch(quoted, "quoted"),
-      (err: unknown) => err instanceof assert.AssertionError,
-    );
-    assert.throws(
-      () => assertNoHostDispatch(mapLiteral, "map"),
-      (err: unknown) => err instanceof assert.AssertionError,
-    );
-    assert.throws(
-      () => assertNoHostDispatch(manifestId, "manifest.id"),
+      () => assertNoHostDispatch(tuplePlusBracket, "tuple-plus-bracket"),
       (err: unknown) => err instanceof assert.AssertionError,
     );
   });
@@ -556,22 +640,55 @@ function applyFollowEvent(
   }
 }
 
+/** Renderer-connected follow contract. A reducer-only test cannot catch this. */
+function assertRenderedFollowContract(skill: string, label = "skill"): void {
+  assert.match(skill, /Direct numeric launch: `pipeline <N>`/, label);
+  assert.match(skill, /`advance_run_handoff`/, label);
+  assert.match(
+    skill,
+    /Retain `advance_run_id` from the\n   `advance_run_handoff`/,
+    label,
+  );
+  assert.match(skill, /Loop launch: `pipeline single <N>` or `pipeline loop …`/, label);
+  assert.match(
+    skill,
+    /Advance `run_complete` stops or replaces only that advance follow/,
+    label,
+  );
+  assert.match(skill, /Keep the loop follow active while the loop remains live/, label);
+  assert.match(skill, /Stop the loop-scoped follow set on `loop_run_complete`/, label);
+  assert.doesNotMatch(
+    skill,
+    /Stop every run-scoped follow on confirmed terminal \(`run_complete`/,
+    `${label} must not tear down loop follow on advance run_complete`,
+  );
+  assert.doesNotMatch(
+    skill,
+    /Launch default drive: `pipeline <N>` or `pipeline single <N>`/,
+    label,
+  );
+  assert.doesNotMatch(
+    skill,
+    /`pipeline <N>` yields `loop_run_id`/,
+    label,
+  );
+}
+
 describe("semantic follow contract fixtures", () => {
   test("rendered prose matches numeric vs loop follow and advance-vs-loop teardown", () => {
+    assertRenderedFollowContract(renderHostSkill());
+  });
+
+  test("hostile teardown wording fails the rendered-lifecycle validator", () => {
     const skill = renderHostSkill();
-    assert.match(skill, /Direct numeric launch: `pipeline <N>`/);
-    assert.match(skill, /Retain `advance_run_id` from the\n   advance handoff/);
-    assert.match(skill, /Loop launch: `pipeline single <N>` or `pipeline loop …`/);
-    assert.match(skill, /Advance `run_complete` stops or replaces only that advance follow/);
-    assert.match(skill, /Keep the loop follow active while the loop remains live/);
-    assert.match(skill, /Stop the loop-scoped follow set on `loop_run_complete`/);
-    assert.doesNotMatch(
-      skill,
-      /Stop every run-scoped follow on confirmed terminal \(`run_complete`/,
+    const hostile = skill.replace(
+      /Advance `run_complete` stops or replaces only that advance follow\.\n   Keep the loop follow active while the loop remains live\./,
+      "Stop every run-scoped follow on confirmed terminal (`run_complete` / `loop_run_complete` / `loop_run_stopped`).",
     );
-    assert.doesNotMatch(
-      skill,
-      /Launch default drive: `pipeline <N>` or `pipeline single <N>`/,
+    assert.notEqual(hostile, skill);
+    assert.throws(
+      () => assertRenderedFollowContract(hostile, "hostile-teardown"),
+      (err: unknown) => err instanceof assert.AssertionError,
     );
   });
 

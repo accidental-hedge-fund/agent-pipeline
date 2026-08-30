@@ -17,8 +17,8 @@ description: |
 Host SKILL for the `pipeline` CLI. Execute catalog operations as `pipeline <verb>`.
 
 Default numeric drive (outside the verb table): `pipeline <N>` starts a direct
-advance for issue or PR N. Capture `run_id` from the advance handoff as
-`advance_run_id`. Follow `pipeline logs <advance-run-id> --events --follow`.
+advance for issue or PR N. Capture `run_id` from the `advance_run_handoff`
+JSON line as `advance_run_id`. Follow `pipeline logs <advance-run-id> --events --follow`.
 `pipeline single <N>` and `pipeline loop` launch through the durable loop and
 yield `loop_run_id`. `pipeline status <N>` reports issue metadata (stage,
 blocker, PR). It does not discover a run id.
@@ -45,7 +45,7 @@ pipeline ship --milestone vX.Y.Z [--json] | pipeline ship status --milestone vX.
 pipeline release <version> [--theme "..."] [--dry-run|--json] [--no-edit] [--skip-frg] | pipeline release finish <pr> [--json] | pipeline release ensure-tag <X.Y.Z> <merge-oid> --packed-candidate <sha> Prepare a release PR from the matching GitHub milestone plan (or finish-merge one); finish never tags; ship-end ensure-tag creates vX.Y.Z from on-disk HMAC latest.json when FRG is gitignored; --dry-run reports milestone presence/open issues
 pipeline roadmap [--apply] [--next <n>]             Analyze open backlog into a dependency-aware scored roadmap; under SemVer, dry-run lists full milestone reconciliation actions and --apply converges open issues to the reviewed manifest (fingerprint-gated)
 pipeline logs [<run-id>] [--events] [-f] [--no-until-terminal] List or stream pipeline run logs (events --follow exits 0 on terminal run_complete)
-pipeline loop --milestone <m>|--label <l>|--range a-b [--resume <run-id>] [--audit] [--follow] Durable multi-item run — driven in-repo by the pipeline's own loop supervisor
+pipeline loop --milestone <m> [--audit] [--follow] | pipeline loop --label <l> [--audit] [--follow] | pipeline loop --range a-b [--audit] [--follow] | pipeline loop --roadmap-slice <slice> [--audit] [--follow] | pipeline loop <N> [<N> ...] [--audit] [--follow] | pipeline loop --resume <run-id> [--audit] [--follow] Durable multi-item run — driven in-repo by the pipeline's own loop supervisor
 ```
 
 ## Follow / notify
@@ -56,7 +56,7 @@ Do not treat them as seconds-only or as fire-and-forget.
 
 1. Status pre-check: `pipeline status <N>`.
 2. Direct numeric launch: `pipeline <N>`. Retain `advance_run_id` from the
-   advance handoff (`run_id`). Follow
+   `advance_run_handoff` (`run_id`). Follow
    `pipeline logs <advance-run-id> --events --follow`.
 3. Loop launch: `pipeline single <N>` or `pipeline loop …`. Retain
    `loop_run_id` from the durable handoff (`run_id`). Follow

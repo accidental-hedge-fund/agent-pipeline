@@ -18,7 +18,7 @@ import {
 
 /** Issue-locked generated-host membership. Contains no notify values. */
 export const SKILL_HOST_IDS = ["claude", "codex", "grok", "opencode"] as const;
-export type SkillHostId = (typeof SKILL_HOST_IDS)[number];
+type SkillHostId = (typeof SKILL_HOST_IDS)[number];
 
 const HOST_SKILL_PACKAGING_DOC_URL =
   "https://github.com/accidental-hedge-fund/agent-pipeline/blob/main/docs/packaging.md";
@@ -33,7 +33,7 @@ interface SkillNotifyRow {
   filter: string;
 }
 
-export interface RenderHostSkillOptions {
+interface RenderHostSkillOptions {
   operationSurface?: readonly OperationSurfaceEntry[];
   manifests?: readonly OuterHostManifest[];
 }
@@ -187,8 +187,8 @@ export function renderHostSkill(options: RenderHostSkillOptions = {}): string {
     "Host SKILL for the `pipeline` CLI. Execute catalog operations as `pipeline <verb>`.",
     "",
     "Default numeric drive (outside the verb table): `pipeline <N>` starts a direct",
-    "advance for issue or PR N. Capture `run_id` from the advance handoff as",
-    "`advance_run_id`. Follow `pipeline logs <advance-run-id> --events --follow`.",
+    "advance for issue or PR N. Capture `run_id` from the `advance_run_handoff`",
+    "JSON line as `advance_run_id`. Follow `pipeline logs <advance-run-id> --events --follow`.",
     "`pipeline single <N>` and `pipeline loop` launch through the durable loop and",
     "yield `loop_run_id`. `pipeline status <N>` reports issue metadata (stage,",
     "blocker, PR). It does not discover a run id.",
@@ -205,7 +205,7 @@ export function renderHostSkill(options: RenderHostSkillOptions = {}): string {
     "",
     "1. Status pre-check: `pipeline status <N>`.",
     "2. Direct numeric launch: `pipeline <N>`. Retain `advance_run_id` from the",
-    "   advance handoff (`run_id`). Follow",
+    "   `advance_run_handoff` (`run_id`). Follow",
     "   `pipeline logs <advance-run-id> --events --follow`.",
     "3. Loop launch: `pipeline single <N>` or `pipeline loop …`. Retain",
     "   `loop_run_id` from the durable handoff (`run_id`). Follow",
