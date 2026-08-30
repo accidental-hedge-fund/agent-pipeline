@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-08-30
+goal: Add a run-scoped clean-docs JSON fixture and a unit test that asserts
+  release_version 1.39.16 without changing production behavior
