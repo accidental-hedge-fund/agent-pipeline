@@ -328,7 +328,11 @@ export async function advanceReview(
     } catch (err) {
       const errMsg = (err as Error).message;
       await setBlockedFn(cfg, issueNumber, `Label transition failed: ${errMsg}`, stage, "harness-failure");
-      return { advanced: false, status: "blocked", reason: errMsg };
+      // Must thread blockerKind on the Outcome: emitBlockedOutcomeEvents defaults
+      // missing kind to needs-human → workflow-state, which parks a label-transition
+      // `gh issue view` timeout as human judgment instead of engine-owned
+      // harness-failure (#1342).
+      return { advanced: false, status: "blocked", reason: errMsg, blockerKind: "harness-failure" };
     }
   }
 
