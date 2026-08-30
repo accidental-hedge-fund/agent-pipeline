@@ -276,7 +276,7 @@ function handoffCfg(repoDir: string, domain: string): PipelineConfig {
 }
 
 test("shouldEmitAdvanceRunHandoff is false for nested env and explicit suppress", () => {
-  assert.equal(shouldEmitAdvanceRunHandoff({}), true);
+  assert.equal(shouldEmitAdvanceRunHandoff({ env: {} }), true);
   assert.equal(shouldEmitAdvanceRunHandoff({ emitAdvanceHandoff: false }), false);
   assert.equal(
     shouldEmitAdvanceRunHandoff({ env: nestedAdvanceChildEnv({}) }),
