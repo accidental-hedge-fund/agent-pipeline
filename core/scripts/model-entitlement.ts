@@ -8,6 +8,7 @@
 // single-retry subscription model for auto-sourced Claude reviewers only.
 
 import type { HarnessResult } from "./harness.ts";
+import { isProviderEnvironmentAuth, type ProviderAuthStatus } from "./provider-auth-status.ts";
 import type { StageDiagnosticReasonCode } from "./stage-diagnostic.ts";
 
 /** Allowlisted subscription-backed Claude model used for one auto-only retry. */
@@ -57,10 +58,24 @@ export function classifyReviewerHarnessFailure(
   result: Pick<
     HarnessResult,
     "stdout" | "stderr" | "exit_code" | "throttled" | "success" | "timed_out" | "spawn_error" | "capture_error" | "oversize_argv" | "stdin_error"
-  > & { code?: number | null },
+  > & {
+    code?: number | null;
+    preflight_reason_code?: HarnessResult["preflight_reason_code"] | string | null;
+    provider_auth_status?: ProviderAuthStatus | null;
+  },
 ): StageDiagnosticReasonCode {
   if (isClaudeModelEntitlementFailure(result.stdout, result.stderr, result)) {
     return "model-entitlement-required";
+  }
+  if (
+    isProviderEnvironmentAuth({
+      preflight_reason_code: result.preflight_reason_code,
+      provider_auth_status: result.provider_auth_status,
+      stdout: result.stdout,
+      stderr: result.stderr,
+    })
+  ) {
+    return "environment-auth";
   }
   if (result.throttled) return "transient-infra";
   if (result.timed_out) return "harness-timeout";

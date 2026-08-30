@@ -862,18 +862,7 @@ export async function runPlanningPhases(
         ? `Neither the cross-harness reviewer (${reviewer}) nor the implementing harness (${primary}) is installed/spawnable for a plan self-review — ${reason}${stderrExcerpt}${ensembleNote}`
         : `Plan-review harness (${reviewer}) failed: ${reason}${stderrExcerpt}${ensembleNote}`;
       const diagnostic = buildStageDiagnostic({
-        reasonCode: classifyHarnessFailure({
-          timed_out: reviewResult.timed_out,
-          spawn_error: reviewResult.spawn_error,
-          capture_error: reviewResult.capture_error,
-          oversize_argv: reviewResult.oversize_argv,
-          stdin_error: reviewResult.stdin_error,
-          throttled: reviewResult.throttled ?? undefined,
-          exit_code: reviewResult.exit_code,
-          stdout: reviewResult.stdout,
-          stderr: reviewResult.stderr,
-          success: reviewResult.success,
-        }),
+        reasonCode: classifyHarnessFailure(reviewResult),
         blockerKind: "harness-failure",
         reason: blockMsg,
         stage: "plan-review",
@@ -1178,17 +1167,9 @@ export async function runPlanningPhases(
             `Implementation harness (${primary}) failed: ${waitReason}.${salvageNote}`;
           const diagnostic = buildStageDiagnostic({
             reasonCode: classifyHarnessFailure({
+              ...result,
               background_wait: true,
               timed_out: false,
-              spawn_error: result.spawn_error,
-              capture_error: result.capture_error,
-              oversize_argv: result.oversize_argv,
-              stdin_error: result.stdin_error,
-              throttled: result.throttled ?? undefined,
-              exit_code: result.exit_code,
-              stdout: result.stdout,
-              stderr: result.stderr,
-              success: result.success,
             }),
             blockerKind: "harness-failure",
             reason: blockMsg,
@@ -1386,15 +1367,22 @@ export async function runPlanningPhases(
             const salvageNote = ctx.salvageFailureReason
               ? ` Salvage of uncommitted work also failed: ${ctx.salvageFailureReason}`
               : "";
+            const blockMsg = `Implementation harness (${primary}) failed: ${reason}.${salvageNote}`;
+            const diagnostic = buildStageDiagnostic({
+              reasonCode: classifyHarnessFailure(result),
+              blockerKind: "harness-failure",
+              reason: blockMsg,
+              stage: "implementing",
+            });
             await doSetBlocked(
               cfg,
               issueNumber,
-              `Implementation harness (${primary}) failed: ${reason}.${salvageNote}`,
+              blockMsg,
               "implementing",
               "harness-failure",
             );
             await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
-            return blockedOutcome(reason, "harness-failure");
+            return blockedOutcome(reason, "harness-failure", diagnostic);
           }
           console.log(
             `[pipeline] #${issueNumber}: implementation harness (${primary}) failed (${reason}) but left ` +
