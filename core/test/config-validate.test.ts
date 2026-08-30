@@ -248,6 +248,7 @@ test("validateConfig: empty file is an error naming both harness roles (#1240)",
   assert.match(err!.message, /harnesses\.implementer/);
   assert.match(err!.message, /harnesses\.reviewer/);
   assert.match(err!.message, /does not fill live workers/);
+  assert.match(err!.message, /pipeline config sync/);
 });
 
 test("validateConfig: missing harnesses block is an error (#1240)", () => {
@@ -262,6 +263,7 @@ test("validateConfig: missing harnesses block is an error (#1240)", () => {
   assert.ok(err);
   assert.match(err!.message, /harnesses\.implementer/);
   assert.match(err!.message, /harnesses\.reviewer/);
+  assert.match(err!.message, /pipeline config sync/);
 });
 
 test("validateConfig: missing implementer is an error (#1240)", () => {
@@ -271,6 +273,7 @@ test("validateConfig: missing implementer is an error (#1240)", () => {
   assert.ok(err);
   assert.match(err!.message, /harnesses\.implementer/);
   assert.match(err!.message, /does not fill live workers/);
+  assert.match(err!.message, /pipeline config sync/);
 });
 
 test("validateConfig: missing reviewer is an error (#1240)", () => {
@@ -280,6 +283,7 @@ test("validateConfig: missing reviewer is an error (#1240)", () => {
   assert.ok(err);
   assert.match(err!.message, /harnesses\.reviewer/);
   assert.match(err!.message, /does not fill live workers/);
+  assert.match(err!.message, /pipeline config sync/);
 });
 
 test("validateConfig: complete harness pair is valid for this class of diagnostic (#1240)", () => {
@@ -315,6 +319,7 @@ test("validateConfig: missing config file returns error diagnostic, does not thr
   assert.equal(diags[0]!.path, "");
   assert.ok(diags[0]!.message.includes("pipeline.yml"));
   assert.ok(diags[0]!.message.includes("pipeline init"));
+  assert.equal(diags[0]!.message.includes("config sync"), false);
 });
 
 // ---------------------------------------------------------------------------
@@ -794,6 +799,7 @@ test("runConfigCommand: validate --json on missing reviewer exits 1 and names th
     assert.ok(err);
     assert.match(err!.message, /harnesses\.reviewer/);
     assert.match(err!.message, /does not fill live workers/);
+    assert.match(err!.message, /pipeline config sync/);
   } finally {
     process.stdout.write = originalWrite;
     process.exitCode = prevExitCode;

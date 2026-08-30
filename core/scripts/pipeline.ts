@@ -7093,7 +7093,7 @@ export async function runConfigCommand(args: string[], opts: CliOpts): Promise<v
       console.log(`pipeline config sync: preview for ${result.configPath} (no writes; re-run with --apply to update)`);
       if (result.diff) process.stdout.write(result.diff);
     }
-    process.exitCode = result.ok ? 0 : 1;
+    process.exitCode = result.ok ? 0 : result.inferenceFailure ? 2 : 1;
     return;
   }
 
