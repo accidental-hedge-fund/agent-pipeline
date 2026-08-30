@@ -8,9 +8,9 @@ production pipeline behavior.
 
 ### Requirement: The pack-1400 clean-openspec fixture SHALL name release 1.40.0
 
-The JSON fixture at
-`core/test/fixtures/frg/pack-1400-pipeline-ship-1.40.0/clean-openspec.json`
-SHALL exist, SHALL parse as JSON, and SHALL set `release_version` to the exact
+The pack-1400 clean-openspec fixture SHALL exist at
+`core/test/fixtures/frg/pack-1400-pipeline-ship-1.40.0/clean-openspec.json`,
+SHALL parse as JSON, and SHALL set `release_version` to the exact
 string `1.40.0`. A unit test SHALL read only that run-scoped path and SHALL
 fail when `release_version` is missing or is not `1.40.0`. The fixture and
 test SHALL NOT change production CLI, stage, config, or FRG-driver behavior.
