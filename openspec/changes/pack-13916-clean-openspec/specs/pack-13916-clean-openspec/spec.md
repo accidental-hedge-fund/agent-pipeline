@@ -8,6 +8,7 @@ production pipeline behavior.
 
 ### Requirement: The pack-13916 clean-openspec fixture SHALL name release 1.39.16
 
+The pack-13916 clean-openspec fixture SHALL name release 1.39.16.
 The JSON fixture at
 `core/test/fixtures/frg/pack-13916-pipeline-ship-1.39.16/clean-openspec.json`
 SHALL exist, SHALL parse as JSON, and SHALL set `release_version` to the exact
