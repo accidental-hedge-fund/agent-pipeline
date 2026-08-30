@@ -1,7 +1,7 @@
 // Decisions artifact schema `decisions.v1` plus body embed/parse/render (#1072).
 // Pure: no network, git, or subprocess.
 
-import { canonicalJson, sha256Hex, sha256Prefixed, utf8ByteLength } from "./grill-hash.ts";
+import { canonicalJson, isSha256Prefixed, sha256Hex, sha256Prefixed, utf8ByteLength } from "./grill-hash.ts";
 import {
   classifyAuthority,
   isNonAuthorityClass,
@@ -52,6 +52,7 @@ export interface DecisionNode {
   input_digests: {
     question_sha256: string;
     recommendation_sha256: string;
+    definition_sha256: string;
   };
   term_id?: string;
   challenge_text?: string;
@@ -118,10 +119,50 @@ export function emptyProvenance(): DecisionProvenance {
   };
 }
 
-export function nodeInputDigests(question: string, recommendation: string): DecisionNode["input_digests"] {
+function nodeDefinitionFields(node: {
+  id: string;
+  question: string;
+  recommendation: string;
+  class: string;
+  term_id?: string;
+}): {
+  class: string;
+  id: string;
+  question: string;
+  recommendation: string;
+  term_id: string;
+} {
   return {
-    question_sha256: sha256Prefixed(question),
-    recommendation_sha256: sha256Prefixed(recommendation),
+    class: node.class,
+    id: node.id,
+    question: node.question,
+    recommendation: node.recommendation,
+    term_id: node.term_id ?? "",
+  };
+}
+
+/** Canonical digest of immutable decision-definition fields. */
+export function nodeDefinitionDigest(node: {
+  id: string;
+  question: string;
+  recommendation: string;
+  class: string;
+  term_id?: string;
+}): string {
+  return sha256Prefixed(canonicalJson(nodeDefinitionFields(node)));
+}
+
+export function nodeInputDigests(input: {
+  id: string;
+  question: string;
+  recommendation: string;
+  class: string;
+  term_id?: string;
+}): DecisionNode["input_digests"] {
+  return {
+    question_sha256: sha256Prefixed(input.question),
+    recommendation_sha256: sha256Prefixed(input.recommendation),
+    definition_sha256: nodeDefinitionDigest(input),
   };
 }
 
@@ -139,7 +180,7 @@ export function makeNode(input: {
     class: input.class,
     resolution: "unresolved",
     provenance: emptyProvenance(),
-    input_digests: nodeInputDigests(input.question, input.recommendation),
+    input_digests: nodeInputDigests(input),
     ...(input.term_id ? { term_id: input.term_id } : {}),
   };
 }
@@ -480,8 +521,37 @@ function parseNode(
     return { ok: false, reason: `node ${o.id} input_digests missing`, code: "invalid_shape" };
   }
   const d = digests as Record<string, unknown>;
-  if (typeof d.question_sha256 !== "string" || typeof d.recommendation_sha256 !== "string") {
+  if (
+    typeof d.question_sha256 !== "string" ||
+    typeof d.recommendation_sha256 !== "string" ||
+    typeof d.definition_sha256 !== "string"
+  ) {
     return { ok: false, reason: `node ${o.id} input_digests malformed`, code: "invalid_shape" };
+  }
+  if (
+    !isSha256Prefixed(d.question_sha256) ||
+    !isSha256Prefixed(d.recommendation_sha256) ||
+    !isSha256Prefixed(d.definition_sha256)
+  ) {
+    return { ok: false, reason: `node ${o.id} input_digests malformed`, code: "invalid_shape" };
+  }
+  const expected = nodeInputDigests({
+    id: o.id,
+    question: o.question,
+    recommendation: o.recommendation,
+    class: o.class,
+    term_id: typeof o.term_id === "string" && o.term_id.length > 0 ? o.term_id : undefined,
+  });
+  if (
+    d.question_sha256 !== expected.question_sha256 ||
+    d.recommendation_sha256 !== expected.recommendation_sha256 ||
+    d.definition_sha256 !== expected.definition_sha256
+  ) {
+    return {
+      ok: false,
+      reason: `node ${o.id} input_digests do not match the live definition`,
+      code: "digest_mismatch",
+    };
   }
   const node: DecisionNode = {
     id: o.id,
@@ -490,10 +560,7 @@ function parseNode(
     class: o.class,
     resolution: o.resolution,
     provenance: provenance.provenance,
-    input_digests: {
-      question_sha256: d.question_sha256,
-      recommendation_sha256: d.recommendation_sha256,
-    },
+    input_digests: expected,
   };
   if (typeof o.term_id === "string" && o.term_id.length > 0) node.term_id = o.term_id;
   if (typeof o.challenge_text === "string" && o.challenge_text.length > 0) {

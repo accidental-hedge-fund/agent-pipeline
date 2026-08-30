@@ -162,7 +162,7 @@ If any node in the proposal carries a reviewer verdict of `challenge`, apply SHA
 
 ### Requirement: The Decisions artifact SHALL be versioned, embedded, and the sole source of the readable Decisions section
 
-Pipeline SHALL embed a versioned Pipeline-owned Decisions artifact in the issue body. Each stable node SHALL record its question, recommendation, authority class, resolution, provenance reference, and input digests. Pipeline SHALL render the readable `## Decisions` section from that same artifact. Divergence between the artifact and the rendered section SHALL fail validation at apply, handoff materialize, and `--stage ready`. The issue body SHALL remain the specification. Comments and handoffs MAY prove provenance. They SHALL NOT replace the body.
+Pipeline SHALL embed a versioned Pipeline-owned Decisions artifact in the issue body. Each stable node SHALL record its question, recommendation, authority class, resolution, provenance reference, and input digests. Pipeline SHALL recompute those input digests from the live node definition fields (id, question, recommendation, class, and term_id) at parse, handoff materialize, and `--stage ready`. A stored digest that does not match the live fields SHALL fail closed. The canonical definition digest SHALL be bound on the grill-authority handoff declaration identity and `content_hashes`. `--stage ready` SHALL verify each live node against that binding. The Decisions fence checksum and model-written provenance SHALL NOT authorize a rewritten definition. Pipeline SHALL render the readable `## Decisions` section from that same artifact. Divergence between the artifact and the rendered section SHALL fail validation at apply, handoff materialize, and `--stage ready`. The issue body SHALL remain the specification. Comments and handoffs MAY prove provenance. They SHALL NOT replace the body.
 
 #### Scenario: Render matches artifact
 
@@ -186,6 +186,13 @@ Pipeline SHALL embed a versioned Pipeline-owned Decisions artifact in the issue 
 - **WHEN** the live body contains two `pipeline-decisions-v1` fences, or a digest that does not match the fence payload
 - **THEN** apply, handoff materialize, and `--stage ready` SHALL fail closed
 - **AND** labels and the body SHALL be unchanged on `--stage ready`
+
+#### Scenario: Rewritten authority definition fails ready
+
+- **WHEN** an applied body contains an unresolved operator-required node
+- **AND** an editor changes that node's class or provenance, then recomputes the Decisions fence checksum and rendered section
+- **THEN** `pipeline triage N --stage ready` SHALL exit 2
+- **AND** labels SHALL be unchanged
 
 ---
 
@@ -350,7 +357,7 @@ When shared terminology required for implementation is missing, preview SHALL in
 
 ### Requirement: Operator answers SHALL use hash-bound `pipeline handoff answer` and SHALL materialize into the body
 
-Pipeline SHALL extend the existing authenticated `pipeline handoff answer` boundary for pre-admission Decision nodes. It SHALL NOT create a second answer ledger or a new handoff CLI verb. Each handoff and answer SHALL bind repository, issue, node ID, frontier fingerprint, and source body hash. When no PR or worktree tip exists, `candidate_sha` MAY be omitted. Create for these nodes SHALL use a policy-bound authority gate whose evidence is that binding; it SHALL NOT weaken mid-flight human-decision-required SHA evidence. A successful answer SHALL deterministically patch that node in the issue body, record the handoff provenance reference, and keep render/artifact identity. Bound-hash drift SHALL exit 2 with no mutation, including when only the Decisions artifact or rendered section changed. Spec-core equality SHALL NOT authorize a drifted full body. After a successful materialize write, remaining pending sibling handoffs SHALL bind the new body hash. GitHub review comments and issue comments SHALL NOT settle nodes.
+Pipeline SHALL extend the existing authenticated `pipeline handoff answer` boundary for pre-admission Decision nodes. It SHALL NOT create a second answer ledger or a new handoff CLI verb. Each handoff and answer SHALL bind repository, issue, node ID, frontier fingerprint, source body hash, and the canonical node-definition digest (id, question, recommendation, class, term_id). When no PR or worktree tip exists, `candidate_sha` MAY be omitted. Create for these nodes SHALL use a policy-bound authority gate whose evidence is that binding; it SHALL NOT weaken mid-flight human-decision-required SHA evidence. A successful answer SHALL deterministically patch that node in the issue body, record the handoff provenance reference, and keep render/artifact identity. Bound-hash drift SHALL exit 2 with no mutation, including when only the Decisions artifact or rendered section changed. Spec-core equality SHALL NOT authorize a drifted full body. A live node whose definition digest does not match the bound digest SHALL fail closed. After a successful materialize write, remaining pending sibling handoffs SHALL bind the new body hash and SHALL keep the original definition digest. GitHub review comments and issue comments SHALL NOT settle nodes.
 
 #### Scenario: Authenticated answer settles an operator-required node
 

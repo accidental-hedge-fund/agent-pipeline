@@ -8,7 +8,11 @@ import {
 } from "./grill-decisions.ts";
 import { requiredContextSatisfied } from "./grill-context.ts";
 import { fingerprintStaleReasons, type GrillFingerprint } from "./grill-fingerprint.ts";
-import { isGrillAuthorityDeclaration, parseGrillDeclaration } from "./grill-handoff.ts";
+import {
+  isGrillAuthorityDeclaration,
+  liveNodeMatchesGrillBinding,
+  parseGrillDeclaration,
+} from "./grill-handoff.ts";
 import type { HumanQuestionHandoff } from "./human-question-handoff.ts";
 
 export interface GrillReadySnapshot {
@@ -47,6 +51,33 @@ export function validateDecisionsForReady(snapshot: GrillReadySnapshot): ReadyVa
     };
   }
   const artifact = parsed.artifact;
+  for (const h of snapshot.handoffs) {
+    if (!isGrillAuthorityDeclaration(h.declaration_identity)) continue;
+    if (h.status !== "pending" && h.status !== "answered") continue;
+    const decl = parseGrillDeclaration(h.declaration_identity ?? "");
+    if (!decl) {
+      return {
+        ok: false,
+        reason: "grill-authority handoff declaration is malformed",
+        code: "invalid_provenance",
+      };
+    }
+    const live = artifact.nodes.find((n) => n.id === decl.nodeId);
+    if (!live) {
+      return {
+        ok: false,
+        reason: `grill-authority node ${decl.nodeId} is missing from the live artifact`,
+        code: "invalid_provenance",
+      };
+    }
+    if (!liveNodeMatchesGrillBinding(live, decl.definitionSha256)) {
+      return {
+        ok: false,
+        reason: `node ${live.id} definition does not match the grill-authority binding`,
+        code: "invalid_provenance",
+      };
+    }
+  }
   const unresolved = unresolvedAuthorityNodes(artifact.nodes);
   if (unresolved.length > 0) {
     return {

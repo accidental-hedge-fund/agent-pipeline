@@ -12,6 +12,8 @@ import {
   applyReviewerVerdicts,
   implementerSelfAccepted,
   makeNode,
+  nodeDefinitionDigest,
+  nodeInputDigests,
   unresolvedAuthorityNodes,
   type DecisionsArtifact,
   type DecisionNode,
@@ -66,7 +68,7 @@ import {
   type GrillIssueApplyDeps,
   type GrillIssuePreviewDeps,
 } from "../scripts/grill-issue.ts";
-import { runTriage, type TriageDeps } from "../scripts/stages/triage.ts";
+import { runTriage, TriageReadyError, type TriageDeps } from "../scripts/stages/triage.ts";
 import { COMMAND_REGISTRY, validateFlags } from "../scripts/command-registry.ts";
 import { buildCmd, maxPositionalsFor } from "../scripts/pipeline.ts";
 import { sha256Prefixed } from "../scripts/grill-hash.ts";
@@ -193,6 +195,8 @@ function withExit(fn: () => Promise<void>): Promise<void> {
 
 function handoffForNode(node: DecisionNode, issue = 42): HumanQuestionHandoff {
   const id = `hqh_${node.id}`;
+  const definitionSha = nodeDefinitionDigest(node);
+  const definitionHex = definitionSha.slice("sha256:".length);
   return {
     schema_version: 1,
     handoff_id: id,
@@ -208,7 +212,7 @@ function handoffForNode(node: DecisionNode, issue = 42): HumanQuestionHandoff {
     authority_mode: "authority",
     human_decision_required: null,
     policy_bound_authority_gate: true,
-    scope: { candidate_sha: null, content_hashes: ["sha256:" + "a".repeat(64), "fp", node.id, "core"] },
+    scope: { candidate_sha: null, content_hashes: ["sha256:" + "a".repeat(64), "fp", node.id, definitionSha] },
     required_capability: ["authority"],
     resolution_evidence: {
       unresolved: false,
@@ -230,7 +234,7 @@ function handoffForNode(node: DecisionNode, issue = 42): HumanQuestionHandoff {
     },
     resume_target: "triage",
     resume_preconditions: [],
-    declaration_identity: `grill-v1:${node.id}:${"b".repeat(64)}:${"a".repeat(64)}`,
+    declaration_identity: `grill-v1:${node.id}:${"b".repeat(64)}:${"a".repeat(64)}:${definitionHex}`,
   };
 }
 
@@ -486,6 +490,26 @@ test("grill: parse rejects resolved non-authority without reviewer-accept", () =
   const parsed = parseDecisionsArtifact(artifact([node], spec));
   assert.equal(parsed.ok, false);
   if (!parsed.ok) assert.match(parsed.reason, /reviewer-accept/);
+});
+
+test("grill: parse rejects stored input_digests that do not match live definition fields", () => {
+  const spec = "## Summary\nX\n";
+  const node = makeNode({
+    id: "scope",
+    question: "What is in scope?",
+    recommendation: "keep it small",
+    class: "scope",
+  });
+  node.input_digests = {
+    ...node.input_digests,
+    question_sha256: sha256Prefixed("different question"),
+  };
+  const parsed = parseDecisionsArtifact(artifact([node], spec));
+  assert.equal(parsed.ok, false);
+  if (!parsed.ok) {
+    assert.equal(parsed.code, "digest_mismatch");
+    assert.match(parsed.reason, /input_digests do not match the live definition/);
+  }
 });
 
 test("grill: parse accepts resolved non-authority with reviewer-accept and eligibility reason", () => {
@@ -1094,9 +1118,12 @@ test("grill: artifact-only body edit refuses answer with no write and handoff st
   const created = await createAndPersistHandoff("/tmp/repo", input, store);
   assert.equal(created.ok, true);
   if (!created.ok) return;
-  const tamperedNodes = art.nodes.map((n, i) =>
-    i === 0 ? { ...n, recommendation: "tampered recommendation" } : n,
-  );
+  const tamperedNodes = art.nodes.map((n, i) => {
+    if (i !== 1) return n;
+    const next = { ...n, recommendation: "tampered recommendation" };
+    next.input_digests = nodeInputDigests(next);
+    return next;
+  });
   const tamperedBody = embedDecisionsInBody(spec, { ...art, nodes: tamperedNodes });
   assert.equal(extractSpecCore(body), extractSpecCore(tamperedBody));
   assert.notEqual(sha256Prefixed(body), sha256Prefixed(tamperedBody));
@@ -1187,7 +1214,10 @@ test("grill: successful materialize rebinds pending siblings to the new body has
   const reboundDecl = parseGrillDeclaration(rebound.handoff.declaration_identity ?? "");
   assert.ok(reboundDecl);
   assert.equal(reboundDecl?.bodySha256, sha256Prefixed(live).slice("sha256:".length));
+  const originalDecl = parseGrillDeclaration(siblingCreated.handoff.declaration_identity ?? "");
+  assert.equal(reboundDecl?.definitionSha256, originalDecl?.definitionSha256);
   assert.equal(rebound.handoff.scope.content_hashes?.[0], sha256Prefixed(live));
+  assert.equal(rebound.handoff.scope.content_hashes?.[3], siblingCreated.handoff.scope.content_hashes?.[3]);
   const second = await answerAndPersistHandoff(
     "/tmp/repo",
     42,
@@ -1332,6 +1362,139 @@ test("grill: answer does not add pipeline:ready", async () => {
 // ---------------------------------------------------------------------------
 // 7. Ready gate label writes
 // ---------------------------------------------------------------------------
+
+function rewriteAuthorityNodeAsReviewerDefault(
+  body: string,
+  regenerateDigests: boolean,
+): string {
+  const parsed = parseDecisionsFromBody(body);
+  assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+  if (!parsed.ok) return body;
+  const nodes = parsed.artifact.nodes.map((n) => {
+    if (n.id !== "scope") return n;
+    const next: DecisionNode = {
+      ...n,
+      class: "interface-contract",
+      resolution: "resolved",
+      provenance: {
+        settled_by: "reviewer-accept",
+        reference: null,
+        reviewer_verdict: "accept",
+        reviewer_reason: "self-rewritten",
+        eligibility_reason: NON_AUTHORITY_ELIGIBILITY_REASON,
+      },
+    };
+    if (regenerateDigests) {
+      next.input_digests = nodeInputDigests(next);
+    }
+    return next;
+  });
+  return embedDecisionsInBody(extractSpecCore(body), { ...parsed.artifact, nodes });
+}
+
+test("grill: rewritten authority class with recomputed fence fails ready without label writes", async () => {
+  const spec = "## Summary\nX\n";
+  const art = artifact(canonicalThinIssueNodes(), spec);
+  const body = embedDecisionsInBody(spec, art);
+  const inputs = grillAuthorityCreateInputs({
+    domain: "d",
+    repo: "acme/r",
+    issueNumber: 42,
+    artifact: art,
+    proposedBody: body,
+    frontierFp: art.fingerprint.planning_treatment_sha256,
+  });
+  const created = canCreateHandoff(inputs[0]!);
+  assert.equal(created.ok, true);
+  if (!created.ok) return;
+  const pending = inputs.map((input) => {
+    const r = canCreateHandoff(input);
+    assert.equal(r.ok, true);
+    return r.ok ? r.handoff : created.handoff;
+  });
+  const tampered = rewriteAuthorityNodeAsReviewerDefault(body, false);
+  assert.equal(extractSpecCore(body), extractSpecCore(tampered));
+  assert.notEqual(sha256Prefixed(body), sha256Prefixed(tampered));
+  const add: string[] = [];
+  const remove: string[] = [];
+  const deps: TriageDeps = {
+    getIssueLabels: async () => ["pipeline:backlog"],
+    addLabel: async (_n, l) => {
+      add.push(l);
+    },
+    removeLabel: async (_n, l) => {
+      remove.push(l);
+    },
+    log: () => {},
+    getReadySnapshot: async () => ({
+      title: "T",
+      body: tampered,
+      comments: [],
+      fingerprint: art.fingerprint,
+      contextMd: "**Grill**:\nA one-shot intake interview.\n",
+      integrationBaseSha: art.fingerprint.integration_base_sha,
+      handoffs: pending,
+    }),
+  };
+  await assert.rejects(() => runTriage({ issueArg: "42", stage: "ready" }, deps), (err: Error) => {
+    assert.equal(err instanceof TriageReadyError, true);
+    assert.equal((err as TriageReadyError).exitCode, 2);
+    return true;
+  });
+  assert.deepEqual(add, []);
+  assert.deepEqual(remove, []);
+});
+
+test("grill: rewritten authority class with regenerated digests still fails ready without label writes", async () => {
+  const spec = "## Summary\nX\n";
+  const art = artifact(canonicalThinIssueNodes(), spec);
+  const body = embedDecisionsInBody(spec, art);
+  const inputs = grillAuthorityCreateInputs({
+    domain: "d",
+    repo: "acme/r",
+    issueNumber: 42,
+    artifact: art,
+    proposedBody: body,
+    frontierFp: art.fingerprint.planning_treatment_sha256,
+  });
+  const pending = inputs.map((input) => {
+    const r = canCreateHandoff(input);
+    assert.equal(r.ok, true);
+    return r.ok ? r.handoff : (null as unknown as HumanQuestionHandoff);
+  });
+  const tampered = rewriteAuthorityNodeAsReviewerDefault(body, true);
+  const parsed = parseDecisionsFromBody(tampered);
+  assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+  const add: string[] = [];
+  const remove: string[] = [];
+  const deps: TriageDeps = {
+    getIssueLabels: async () => ["pipeline:backlog"],
+    addLabel: async (_n, l) => {
+      add.push(l);
+    },
+    removeLabel: async (_n, l) => {
+      remove.push(l);
+    },
+    log: () => {},
+    getReadySnapshot: async () => ({
+      title: "T",
+      body: tampered,
+      comments: [],
+      fingerprint: art.fingerprint,
+      contextMd: "**Grill**:\nA one-shot intake interview.\n",
+      integrationBaseSha: art.fingerprint.integration_base_sha,
+      handoffs: pending,
+    }),
+  };
+  await assert.rejects(() => runTriage({ issueArg: "42", stage: "ready" }, deps), (err: Error) => {
+    assert.equal(err instanceof TriageReadyError, true);
+    assert.equal((err as TriageReadyError).exitCode, 2);
+    assert.equal((err as TriageReadyError).code, "invalid_provenance");
+    return true;
+  });
+  assert.deepEqual(add, []);
+  assert.deepEqual(remove, []);
+});
 
 test("grill: --stage ready incomplete artifact makes zero label writes", async () => {
   const spec = "## Summary\nX\n";

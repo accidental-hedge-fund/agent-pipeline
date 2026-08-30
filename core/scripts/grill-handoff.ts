@@ -4,6 +4,7 @@
 import {
   embedDecisionsInBody,
   extractSpecCore,
+  nodeDefinitionDigest,
   parseDecisionsFromBody,
   patchNodeInArtifact,
   type DecisionNode,
@@ -44,16 +45,25 @@ export function grillDeclarationIdentity(input: {
   nodeId: string;
   frontierFp: string;
   bodySha256: string;
+  definitionSha256: string;
 }): string {
-  return `${GRILL_DECLARATION_PREFIX}${input.nodeId}:${hexDigest(input.frontierFp)}:${hexDigest(input.bodySha256)}`;
+  return `${GRILL_DECLARATION_PREFIX}${input.nodeId}:${hexDigest(input.frontierFp)}:${hexDigest(input.bodySha256)}:${hexDigest(input.definitionSha256)}`;
 }
 
 export function parseGrillDeclaration(
   identity: string,
-): { nodeId: string; frontierFp: string; bodySha256: string } | null {
-  const m = /^grill-v1:([a-z][a-z0-9-]{0,62}):([0-9a-f]{64}):([0-9a-f]{64})$/.exec(identity);
+): { nodeId: string; frontierFp: string; bodySha256: string; definitionSha256: string } | null {
+  const m =
+    /^grill-v1:([a-z][a-z0-9-]{0,62}):([0-9a-f]{64}):([0-9a-f]{64}):([0-9a-f]{64})$/.exec(identity);
   if (!m) return null;
-  return { nodeId: m[1]!, frontierFp: m[2]!, bodySha256: m[3]! };
+  return { nodeId: m[1]!, frontierFp: m[2]!, bodySha256: m[3]!, definitionSha256: m[4]! };
+}
+
+export function liveNodeMatchesGrillBinding(
+  node: DecisionNode,
+  definitionSha256: string,
+): boolean {
+  return hexDigest(nodeDefinitionDigest(node)) === hexDigest(definitionSha256);
 }
 
 export interface GrillHandoffCreateInput {
@@ -86,11 +96,12 @@ export function grillAuthorityCreateInputs(input: GrillHandoffCreateInput): Crea
       tip_present: false,
       policy_bound_authority_gate: true,
       human_decision_required: null,
-      content_hashes: [bodySha, input.frontierFp, node.id],
+      content_hashes: [bodySha, input.frontierFp, node.id, nodeDefinitionDigest(node)],
       declaration_identity: grillDeclarationIdentity({
         nodeId: node.id,
         frontierFp: input.frontierFp,
         bodySha256: bodySha,
+        definitionSha256: nodeDefinitionDigest(node),
       }),
       resume_target: "triage",
       resume_preconditions: ["grill-authority-answer"],
@@ -155,6 +166,13 @@ export function materializeGrillNode(input: {
   if (!node) {
     return { ok: false, reason: `node ${parsedDecl.nodeId} is missing from the live artifact`, code: "node_missing" };
   }
+  if (!liveNodeMatchesGrillBinding(node, parsedDecl.definitionSha256)) {
+    return {
+      ok: false,
+      reason: "live node definition does not match the grill-authority binding",
+      code: "invalid_artifact",
+    };
+  }
   const already = node.provenance.reference === `handoff:${input.handoff.handoff_id}`;
   if (already && node.resolution === "resolved") {
     return { ok: true, body: input.liveBody, wrote: false, artifact: parsed.artifact };
@@ -211,6 +229,7 @@ export async function refreshPendingSiblingGrillHandoffs(
       nodeId: decl.nodeId,
       frontierFp: decl.frontierFp,
       bodySha256: newBodySha,
+      definitionSha256: decl.definitionSha256,
     });
     const hashes = [...(h.scope.content_hashes ?? [])];
     if (h.declaration_identity === nextIdentity && hashes[0] === newBodySha) continue;
