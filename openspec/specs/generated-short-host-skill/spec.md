@@ -2,7 +2,9 @@
 
 ## Purpose
 TBD - created by archiving change generate-short-host-skill. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: Repository SHALL keep one shared orchestration-contract source
 
 The repository SHALL keep `core/scripts/host-skill.ts` as the single committed one-pager renderer. Its single deep interface SHALL include `renderHostSkill(options?)`, which returns the complete host-neutral SKILL bytes and MAY receive `operationSurface` and `manifests` for deterministic in-process tests. When omitted, those inputs SHALL default to `OPERATION_SURFACE` and `loadOuterHostManifestsPreferHosts()`. The module SHALL export one issue-locked `SKILL_HOST_IDS` tuple containing exactly `claude`, `codex`, `grok`, and `opencode`; that tuple SHALL be the sole generated-host membership source and SHALL NOT contain notify values or lifecycle behavior. The renderer SHALL select those IDs in tuple order, require exactly one manifest for each selected ID, fail closed on missing or duplicate selected IDs, and exclude non-selected manifests such as OMP. It SHALL derive the displayed notify values only from each selected manifest's `material_progress_notify.mapping`; it SHALL NOT own or hardcode a parallel host/surface/tool map. The module SHALL state the follow/notify contract: capture `run_id` from the durable handoff; use `pipeline logs <advance-run-id> --events --follow` for a direct numeric or linked advance and `pipeline loop logs <loop-run-id> --events --follow` for a loop; reattach after an interrupted follow; stop only the matching advance follow on advance `run_complete`; stop the loop-scoped set on `loop_run_complete`, `loop_run_stopped`, or supervisor exit; surface the terminal reason and final summary; and forbid the follower or observer from invoking a merge-capable command. This change SHALL NOT alter CLI dispatch. Issue #971 SHALL be able to call that same interface without copying a host SKILL essay. This change SHALL NOT add Hermes or OpenClaw install logic.
@@ -49,7 +51,7 @@ The repository SHALL keep `core/scripts/host-skill.ts` as the single committed o
 
 ### Requirement: Generator SHALL emit four short host SKILLs from the shared source
 
-`scripts/build.mjs` SHALL be the sole writer and freshness checker for the `hosts/<id>/SKILL.md` targets derived from `SKILL_HOST_IDS`, which SHALL resolve exactly to `hosts/claude/SKILL.md`, `hosts/codex/SKILL.md`, `hosts/grok/SKILL.md`, and `hosts/opencode/SKILL.md`. It SHALL write all four from one call contract through `renderHostSkill`; the four files SHALL be byte-identical. Its write and check target sets SHALL be derived from the same tuple, and a drift guard SHALL fail if ID, rendered-row, write-target, or check-target membership differs. Each SKILL SHALL retain the default numeric issue/PR drive as `pipeline <N>`, tell hosts to execute catalog operations as `pipeline <verb>`, and contain the same compact manifest-derived notify map. They SHALL NOT encode host-specific stage-machine logic. The generator SHALL NOT write `/pipeline:*` markdown command files or Codex `$pipeline:*` yaml agents. `core/scripts/docs-generate.ts` and `scripts/generate-docs.mjs` SHALL NOT read, require, rewrite, or emit any host SKILL.
+`scripts/build.mjs` SHALL be the sole writer and freshness checker for the `hosts/<id>/SKILL.md` targets derived from `SKILL_HOST_IDS`, which SHALL resolve exactly to `hosts/claude/SKILL.md`, `hosts/codex/SKILL.md`, `hosts/grok/SKILL.md`, and `hosts/opencode/SKILL.md`. It SHALL write all four from one call contract through `renderHostSkill`; the four files SHALL be byte-identical. Its write and check target sets SHALL be derived from the same tuple, and a drift guard SHALL fail if ID, rendered-row, write-target, or check-target membership differs. Each SKILL SHALL retain the default numeric issue/PR drive as `pipeline <N>`, tell hosts to execute catalog operations as `pipeline <verb>`, and contain the same compact manifest-derived notify map. They SHALL NOT encode host-specific stage-machine logic. The generator SHALL NOT write `/pipeline:*` markdown command files or Codex `$pipeline:*` yaml agents. The generator SHALL NOT write `plugin/pipeline/skills/pipeline/SKILL.md` or any other path under `plugin/`. `core/scripts/docs-generate.ts` and `scripts/generate-docs.mjs` SHALL NOT read, require, rewrite, or emit any host SKILL.
 
 #### Scenario: Four generated SKILLs exist
 
@@ -62,6 +64,7 @@ The repository SHALL keep `core/scripts/host-skill.ts` as the single committed o
 - **WHEN** generated notify rows, build write targets, and build check targets are enumerated
 - **THEN** each set SHALL correspond one-to-one with `SKILL_HOST_IDS`
 - **AND** no separately maintained target list SHALL admit OMP or omit a selected host
+- **AND** write and check target sets SHALL NOT include a `plugin/` path
 
 #### Scenario: Hosts share one contract
 
@@ -77,17 +80,16 @@ The repository SHALL keep `core/scripts/host-skill.ts` as the single committed o
 
 #### Scenario: Plugin output calls the same renderer directly
 
-- **WHEN** `scripts/build.mjs` generates `plugin/pipeline/skills/pipeline/SKILL.md`
-- **THEN** plugin generation SHALL consume `renderHostSkill` directly
-- **AND** it SHALL NOT read a generated host SKILL or call a docs marked-region rewriter
+- **WHEN** `scripts/build.mjs` runs
+- **THEN** it SHALL NOT write `plugin/pipeline/skills/pipeline/SKILL.md`
+- **AND** it SHALL NOT create a `plugin/` directory
+- **AND** host SKILL generation SHALL consume `renderHostSkill` directly
 
 #### Scenario: Docs generation has no SKILL lifecycle
 
 - **WHEN** `scripts/generate-docs.mjs` runs in write or check mode
 - **THEN** it SHALL NOT read, require, compare, or write any host SKILL
 - **AND** it SHALL NOT check for `hosts/omp/SKILL.md` or generated table markers
-
----
 
 ### Requirement: Each generated SKILL SHALL be a one-pager of verb table, follow contract, and doc pointers
 
@@ -159,7 +161,7 @@ The repository SHALL NOT keep `hosts/omp/SKILL.md`. The generator SHALL NOT emit
 
 ### Requirement: Tests SHALL pin generated SKILL freshness and forbid host-specific stage logic
 
-A co-located unit test SHALL fail when any committed generated host SKILL differs from a fresh generation. A co-located unit test SHALL fail when a generated SKILL encodes host-specific stage-machine logic, when a rendered notify row differs from an injected outer-host manifest fixture, when a selected manifest ID is missing or duplicated, or when `SKILL_HOST_IDS` differs from rendered-row or build-target membership. A co-located unit test SHALL fail when the generator writes a per-verb slash-command or yaml-agent file. Hook staging tests and eval fixture-boundary tests SHALL account for all four host SKILL outputs by exact path. Those tests SHALL perform no network, git, or subprocess calls beyond existing isolated hook fixtures and in-process generation.
+A co-located unit test SHALL fail when any committed generated host SKILL differs from a fresh generation. A co-located unit test SHALL fail when a generated SKILL encodes host-specific stage-machine logic, when a rendered notify row differs from an injected outer-host manifest fixture, when a selected manifest ID is missing or duplicated, or when `SKILL_HOST_IDS` differs from rendered-row or build-target membership. A co-located unit test SHALL fail when the generator writes a per-verb slash-command or yaml-agent file. A co-located unit test SHALL fail when the generator writes any path under `plugin/`. Hook staging tests and eval fixture-boundary tests SHALL account for all four host SKILL outputs by exact path. Those tests SHALL perform no network, git, or subprocess calls beyond existing isolated hook fixtures and in-process generation.
 
 #### Scenario: Stale generated SKILL fails
 
@@ -175,6 +177,11 @@ A co-located unit test SHALL fail when any committed generated host SKILL differ
 
 - **WHEN** the generator would write a `pipeline:<verb>.md` or Codex `pipeline-<verb>.yaml` command file
 - **THEN** the command-pack test SHALL fail
+
+#### Scenario: Plugin overlay generation fails the guard
+
+- **WHEN** the generator would write `plugin/pipeline/skills/pipeline/SKILL.md`
+- **THEN** the plugin-directory test SHALL fail
 
 #### Scenario: Manifest and render drift fails
 
@@ -192,4 +199,3 @@ A co-located unit test SHALL fail when any committed generated host SKILL differ
 - **THEN** the pre-commit hook SHALL stage all four host SKILL paths by exact name
 - **AND** eval generated-packaging accounting SHALL recognize and require those same four exact outputs
 - **AND** neither boundary SHALL use a broad `hosts/` or `plugin/` allowance
-

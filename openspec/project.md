@@ -16,8 +16,7 @@ surfaces, not a Claude-plus-Codex-only product.
   `core/scripts/` (`gh.ts`, `worktree.ts`, `openspec.ts`, …).
 - The product is the pipeline CLI plus host SKILL. After changing `core/` or
   `hosts/claude/SKILL.md`, run `node scripts/build.mjs` so `--check` can assert
-  SKILL overlay and marketplace catalog freshness. Do not commit a `plugin/`
-  copy of `core/scripts`. Whole-tree deletion of `plugin/` is #1050.
+  generated host SKILL freshness. Do not recreate or commit `plugin/`.
 - Tests are `node --test` under `core/test/` (run `cd core && npm test`).
 
 ## Conventions

@@ -26,26 +26,22 @@ import { spawnSync } from "node:child_process";
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const HOOK_SRC = join(REPO_ROOT, ".githooks", "pre-commit");
 const GENERATED_OUTPUTS = [
-  ".claude-plugin/marketplace.json",
-  "plugin/pipeline/skills/pipeline/SKILL.md",
   "hosts/claude/SKILL.md",
   "hosts/codex/SKILL.md",
   "hosts/grok/SKILL.md",
   "hosts/opencode/SKILL.md",
 ];
-const UNSTAGED_BUILD_OUTPUTS = [
-  "plugin/pipeline/.claude-plugin/plugin.json",
-  "plugin/pipeline/skills/pipeline/scripts/pipeline.mjs",
-  "plugin/pipeline/skills/pipeline/scripts/material-filter.mjs",
-  "plugin/pipeline/skills/pipeline/scripts/ensure-engines-node.mjs",
+const UNSTAGED_PLUGIN_OUTPUTS = [
+  "plugin/pipeline/skills/pipeline/SKILL.md",
+  ".claude-plugin/marketplace.json",
 ];
 
 // Stub build.mjs: drops a marker so a test can detect whether it ran, then
-// writes the same six paths as the real generator. It intentionally does not
-// delete plugin/ so the staging-boundary regression can observe unrelated dirt.
+// writes the four host SKILLs plus planted plugin/ catalog files. The real
+// generator does not write plugin/; the stub plants those files so the
+// staging-boundary regression can prove the hook leaves them unstaged.
 const BUILD_STUB = `import { mkdirSync, writeFileSync } from "node:fs";
-mkdirSync("plugin/pipeline/.claude-plugin", { recursive: true });
-mkdirSync("plugin/pipeline/skills/pipeline/scripts", { recursive: true });
+mkdirSync("plugin/pipeline/skills/pipeline", { recursive: true });
 mkdirSync(".claude-plugin", { recursive: true });
 for (const id of ["claude", "codex", "grok", "opencode"]) {
   mkdirSync("hosts/" + id, { recursive: true });
@@ -53,11 +49,7 @@ for (const id of ["claude", "codex", "grok", "opencode"]) {
 }
 writeFileSync("build-ran.marker", "ran\\n");
 writeFileSync(".claude-plugin/marketplace.json", "{}\\n");
-writeFileSync("plugin/pipeline/.claude-plugin/plugin.json", "{}\\n");
 writeFileSync("plugin/pipeline/skills/pipeline/SKILL.md", "# generated skill\\n");
-writeFileSync("plugin/pipeline/skills/pipeline/scripts/pipeline.mjs", "// generated launcher\\n");
-writeFileSync("plugin/pipeline/skills/pipeline/scripts/material-filter.mjs", "// generated filter\\n");
-writeFileSync("plugin/pipeline/skills/pipeline/scripts/ensure-engines-node.mjs", "// generated resolver\\n");
 `;
 
 const FAILING_BUILD = `process.exit(1);\n`;
@@ -127,12 +119,12 @@ test("core/ edit triggers regeneration and stages owned outputs in the same comm
     for (const generatedPath of GENERATED_OUTPUTS) {
       assert.ok(files.includes(generatedPath), `${generatedPath} staged`);
     }
-    for (const generatedPath of UNSTAGED_BUILD_OUTPUTS) {
+    for (const generatedPath of UNSTAGED_PLUGIN_OUTPUTS) {
       assert.ok(!files.includes(generatedPath), `${generatedPath} must remain unstaged`);
     }
     assert.ok(
-      !files.some((f) => /(?:^|\/)core\/scripts\/pipeline\.ts$/.test(f)),
-      "hook must not stage a plugin/ core copy as required output",
+      !files.some((f) => f === "plugin" || f.startsWith("plugin/")),
+      "hook must not stage a plugin/ path",
     );
   });
 });
@@ -143,9 +135,11 @@ test("hosts/claude/SKILL.md edit also triggers regeneration", () => {
     git(dir, ["commit", "-q", "-m", "edit claude overlay"]);
 
     assert.ok(existsSync(join(dir, "build-ran.marker")), "build.mjs should have run");
-    assert.ok(
-      committedFiles(dir).includes("plugin/pipeline/skills/pipeline/SKILL.md"),
-    );
+    const files = committedFiles(dir);
+    for (const generatedPath of GENERATED_OUTPUTS) {
+      assert.ok(files.includes(generatedPath), `${generatedPath} staged`);
+    }
+    assert.ok(!files.includes("plugin/pipeline/skills/pipeline/SKILL.md"));
   });
 });
 
@@ -230,7 +224,7 @@ test("hook stages only the generated paths, never unrelated working-tree changes
     );
     assert.match(
       status,
-      /^\?\? plugin\/pipeline\/operator-note\.txt$/m,
+      /^\?\? plugin\//m,
       "stub leaves unrelated plugin dirt untracked; the hook does not commit it",
     );
   });

@@ -576,6 +576,11 @@ test("runMergeQueue: --apply + --dry-run on already-complete queue still does no
   assert.equal(deps.mergeCalls.length, 0);
   assert.equal(deps.releaseCalls.length, 0, "would_prepare must not invoke runRelease");
   assert.equal(result.release.status, "would_prepare");
+  assert.equal(
+    deps.releaseCalls.length,
+    0,
+    "dry-run must not mutate plugin/ or other release-managed paths",
+  );
 });
 
 test("runMergeQueue: PR discovery failure during completion re-query skips release prepare", async () => {

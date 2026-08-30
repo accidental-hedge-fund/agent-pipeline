@@ -90,26 +90,27 @@ test("findDisallowedTestRootTokens: flags bare test/ roots, not core/test/", () 
   assert.deepEqual(findDisallowedTestRootTokens("node --test core/test/gh.test.ts"), []);
 });
 
-test("generated packaging allowance accepts only exact SKILL or catalog outputs", () => {
+test("generated packaging allowance accepts only exact host SKILL outputs", () => {
   assert.equal(publicChecksRequireGeneratedPackagingOutputs(["npm run ci"]), true);
   assert.equal(publicChecksRequireGeneratedPackagingOutputs(["echo ok"]), false);
   assert.equal(allowsGeneratedPackagingOutput(["core/scripts/gh.ts"]), false);
   assert.equal(allowsGeneratedPackagingOutput(["plugin"]), false);
   assert.equal(allowsGeneratedPackagingOutput(["plugin/"]), false);
+  assert.equal(allowsGeneratedPackagingOutput(["plugin/**"]), false);
   assert.equal(
     allowsGeneratedPackagingOutput(["plugin/pipeline/skills/pipeline/core/scripts/gh.ts"]),
     false,
   );
   assert.equal(
     allowsGeneratedPackagingOutput(["plugin/pipeline/skills/pipeline/SKILL.md"]),
-    true,
+    false,
   );
   assert.equal(allowsGeneratedPackagingOutput(["hosts/claude/SKILL.md"]), true);
   assert.equal(allowsGeneratedPackagingOutput(["hosts/codex/SKILL.md"]), true);
   assert.equal(allowsGeneratedPackagingOutput(["hosts/grok/SKILL.md"]), true);
   assert.equal(allowsGeneratedPackagingOutput(["hosts/opencode/SKILL.md"]), true);
   assert.equal(allowsGeneratedPackagingOutput(["hosts/"]), false);
-  assert.equal(allowsGeneratedPackagingOutput([".claude-plugin/marketplace.json"]), true);
+  assert.equal(allowsGeneratedPackagingOutput([".claude-plugin/marketplace.json"]), false);
   assert.equal(allowsGeneratedPackagingOutput(undefined), true);
   assert.deepEqual(
     requiredGeneratedPackagingOutputs(
@@ -134,7 +135,6 @@ test("generated packaging allowance accepts only exact SKILL or catalog outputs"
       "hosts/codex/SKILL.md",
       "hosts/grok/SKILL.md",
       "hosts/opencode/SKILL.md",
-      "plugin/pipeline/skills/pipeline/SKILL.md",
     ].sort(),
   );
   assert.deepEqual(
@@ -147,7 +147,6 @@ test("generated packaging allowance accepts only exact SKILL or catalog outputs"
       "hosts/codex/SKILL.md",
       "hosts/grok/SKILL.md",
       "hosts/opencode/SKILL.md",
-      "plugin/pipeline/skills/pipeline/SKILL.md",
     ].sort(),
   );
   assert.deepEqual(
@@ -160,7 +159,6 @@ test("generated packaging allowance accepts only exact SKILL or catalog outputs"
       "hosts/codex/SKILL.md",
       "hosts/grok/SKILL.md",
       "hosts/opencode/SKILL.md",
-      "plugin/pipeline/skills/pipeline/SKILL.md",
     ].sort(),
   );
   assert.deepEqual(
@@ -205,27 +203,27 @@ test("static preflight: bare test/ path token fails naming fixture", async () =>
 });
 
 test("static preflight: broad plugin allowance fails when generated packaging checks run", async () => {
-  const fixture = makeFixture({
-    public_checks: ["npm run ci"],
-    allowed_change_paths: ["core/scripts/gh.ts", "plugin/"],
-    grader_refs: [{ grader: "implementation-fix", version: "1" }],
-    smoke_only: false,
-  });
-  const result = await runStaticFixturePreflight(fixture, {
-    catFile: async () => "commit",
-  });
-  assert.equal(result.ok, false);
-  const allowance = result.failures.find((f) => f.check === "plugin_allowance");
-  assert.ok(allowance);
-  assert.match(allowance!.detail, /broad plugin/);
-  assert.match(allowance!.remediation, /exact generator output path/);
-  assert.match(allowance!.remediation, new RegExp(SHA));
+  for (const broad of ["plugin", "plugin/", "plugin/**", "plugin/**/*"]) {
+    const fixture = makeFixture({
+      public_checks: ["npm run ci"],
+      allowed_change_paths: ["core/scripts/gh.ts", broad],
+      grader_refs: [{ grader: "implementation-fix", version: "1" }],
+      smoke_only: false,
+    });
+    const result = await runStaticFixturePreflight(fixture, {
+      catFile: async () => "commit",
+    });
+    assert.equal(result.ok, false, `broad allowance ${broad} must fail`);
+    const allowance = result.failures.find((f) => f.check === "plugin_allowance");
+    assert.ok(allowance, `broad allowance ${broad} must emit plugin_allowance`);
+    assert.match(allowance!.detail, /broad plugin/);
+    assert.match(allowance!.remediation, /exact generator output path/);
+    assert.match(allowance!.remediation, new RegExp(SHA));
+  }
 });
 
-test("static preflight: exact generated SKILL or catalog allowance passes", async () => {
+test("static preflight: exact generated host SKILL allowance passes", async () => {
   for (const generatedPath of [
-    "plugin/pipeline/skills/pipeline/SKILL.md",
-    ".claude-plugin/marketplace.json",
     "hosts/claude/SKILL.md",
     "hosts/codex/SKILL.md",
     "hosts/grok/SKILL.md",
@@ -273,7 +271,7 @@ test("static preflight: current manifest-loader edit requires the exact generate
   assert.equal(result.ok, false);
   const allowance = result.failures.find((failure) => failure.check === "plugin_allowance");
   assert.ok(allowance);
-  assert.match(allowance.detail, /plugin\/pipeline\/skills\/pipeline\/SKILL\.md/);
+  assert.match(allowance.detail, /hosts\/claude\/SKILL\.md/);
 });
 
 test("static preflight: committed historical fixture allows its exact pinned core mirror", async () => {
@@ -300,7 +298,7 @@ test("deep preflight: red public baseline blocks treatments (infra)", async () =
     smoke_only: false,
     allowed_change_paths: [
       "core/scripts/gh.ts",
-      "plugin/pipeline/skills/pipeline/SKILL.md",
+      "hosts/claude/SKILL.md",
     ],
   });
   const result = await runDeepFixturePreflight(

@@ -142,11 +142,9 @@ export function findDisallowedTestRootTokens(command: string): string[] {
 /** Exact generated host SKILL outputs accepted by fixture boundaries (#1049). */
 export const GENERATED_HOST_SKILL_PATHS = SKILL_HOST_IDS.map((id) => `hosts/${id}/SKILL.md`);
 
-/** Exact generated packaging outputs accepted by fixture boundaries (#1048/#1049). */
+/** Exact generated packaging outputs accepted by fixture boundaries (#1050). */
 export const GENERATED_PACKAGING_OUTPUT_PATHS = [
   ...GENERATED_HOST_SKILL_PATHS,
-  "plugin/pipeline/skills/pipeline/SKILL.md",
-  ".claude-plugin/marketplace.json",
 ] as const;
 
 const HOST_SKILL_SOURCE_PATHS = [
@@ -179,7 +177,7 @@ export function allowsGeneratedPackagingOutput(allowed: string[] | undefined): b
 /**
  * Resolve only outputs that the fixture's permitted source edits can actually
  * make stale at its pinned build implementation. Pre-#1048 pins mirrored a
- * subset of core/; current pins generate only the SKILL/catalog check surface.
+ * subset of core/; current pins generate only the four host SKILLs.
  */
 export function requiredGeneratedPackagingOutputs(
   allowed: string[] | undefined,
@@ -210,7 +208,6 @@ export function requiredGeneratedPackagingOutputs(
     )
   ) {
     for (const output of GENERATED_HOST_SKILL_PATHS) required.add(output);
-    required.add("plugin/pipeline/skills/pipeline/SKILL.md");
   }
   if (allowed.includes("scripts/build.mjs")) {
     for (const output of GENERATED_PACKAGING_OUTPUT_PATHS) required.add(output);
@@ -339,7 +336,7 @@ export async function runStaticFixturePreflight(
   }
 
   // 3. Exact, pin-aware generator-owned output allowance. A CI command alone
-  // does not imply every core edit changes today's SKILL/catalog outputs.
+  // does not imply every core edit changes today's host SKILL outputs.
   if (publicChecksRequireGeneratedPackagingOutputs(fixture.public_checks)) {
     const allowed = fixture.allowed_change_paths;
     const broadPluginAllowance =

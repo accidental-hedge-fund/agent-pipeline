@@ -14,9 +14,7 @@
   "files": [
     "core",
     "hosts",
-    "plugin",
     "scripts",
-    ".claude-plugin",
     "README.md",
     "LICENSE"
   ],

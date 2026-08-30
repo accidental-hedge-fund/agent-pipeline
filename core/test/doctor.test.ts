@@ -983,11 +983,11 @@ test("check plugin-mirror — keeps the public id and skips when scripts/build.m
   assert.equal(r.status, "skip");
 });
 
-test("check plugin-mirror — skips when plugin/ directory is absent", async () => {
+test("check plugin-mirror — does not skip when plugin/ is absent if build.mjs exists (#1050)", async () => {
   const r = await getCheck(makeConfig(), "plugin-mirror").run(
-    fakeDeps({ fsExists: (p) => !p.endsWith("plugin") }),
+    fakeDeps({ fsExists: (p) => !p.endsWith("plugin"), execCheck: () => true }),
   );
-  assert.equal(r.status, "skip");
+  assert.equal(r.status, "pass");
 });
 
 test("check plugin-mirror — passes with packaging-freshness detail when build check succeeds", async () => {

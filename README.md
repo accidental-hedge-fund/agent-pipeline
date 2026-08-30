@@ -278,13 +278,13 @@ gh issue edit N --add-label "pipeline:ready"
 
 ## Development
 
-Product law (install the `pipeline` CLI plus a short host SKILL; `plugin/` is not the product) is in [docs/packaging.md](docs/packaging.md).
+Product law (install the `pipeline` CLI plus a short host SKILL) is in [docs/packaging.md](docs/packaging.md).
 
 ```bash
-npm run setup-hooks               # one-time per clone: auto-regenerate SKILL/catalog on core/ commits
+npm run setup-hooks               # one-time per clone: auto-regenerate host SKILLs on core/ commits
 cd core && npm ci && npm test     # node --test
-node scripts/build.mjs            # sole writer: regenerate four host SKILLs + plugin SKILL + catalog
-node scripts/build.mjs --check    # CI gate: fail if SKILL overlay or marketplace catalog is stale
+node scripts/build.mjs            # sole writer: regenerate four host SKILLs
+node scripts/build.mjs --check    # CI gate: fail if a generated host SKILL is stale
 node scripts/generate-docs.mjs    # regenerate docs/cli.md, docs/config.md, CHANGELOG.md (not host SKILLs)
 node scripts/generate-docs.mjs --check
 npm run docs:generate             # same as generate-docs write mode
@@ -292,7 +292,7 @@ npm run docs:check                # same as generate-docs --check
 npm run ci                        # full CI gate (tests + mirror + install-smoke + openspec + docs + scripts)
 ```
 
-After changing renderer sources under `core/` (`host-skill.ts`, `operation-surface.ts`, outer-host manifests, or `scripts/build.mjs`), re-run `node scripts/build.mjs` so `--check` can assert generated SKILL overlay and marketplace catalog freshness. `build.mjs` is the sole SKILL writer; do not edit generated host SKILLs or assign SKILL regeneration to `generate-docs.mjs`. Do not commit a `plugin/` copy of `core/scripts`. After changing the command registry, config schema, or docs generator, re-run `generate-docs.mjs` and commit generated docs (CI enforces this via `ci:docs` once the generator is present).
+After changing renderer sources under `core/` (`host-skill.ts`, `operation-surface.ts`, outer-host manifests, or `scripts/build.mjs`), re-run `node scripts/build.mjs` so `--check` can assert generated host SKILL freshness. `build.mjs` is the sole SKILL writer; do not edit generated host SKILLs or assign SKILL regeneration to `generate-docs.mjs`. Do not recreate or commit `plugin/`. If `CLAUDE_PLUGIN_ROOT` still points at a leftover core copy, run `install --host claude` or pin. After changing the command registry, config schema, or docs generator, re-run `generate-docs.mjs` and commit generated docs (CI enforces this via `ci:docs` once the generator is present).
 
 `npm run ci` always includes a **conditional** docs freshness step (`ci:docs`): it is a no-op when the docs generator is absent, and runs check-mode when `scripts/generate-docs.mjs` is present — so a stale generated artifact fails the same local command the pipeline test-gate runs.
 

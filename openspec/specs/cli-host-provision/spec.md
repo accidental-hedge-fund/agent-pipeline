@@ -2,7 +2,9 @@
 
 ## Purpose
 Install the pipeline CLI for Claude the same way as Codex and Grok: stage a complete launcher, core tree, and SKILL before publication; best-effort prewarm dependencies; and preserve first-run self-heal. Do not vendor engine source into `plugin/` and do not emit a `/pipeline:*` command pack.
+
 ## Requirements
+
 ### Requirement: Claude install SHALL provision the pipeline CLI
 
 `install --host claude` (not dry-run) SHALL build the pipeline CLI as a complete sibling staging tree before publishing it under the resolved Claude skill install: launcher, whitelisted `core/` tree, and Claude host SKILL overlay. After tree publication, the installer SHALL best-effort prewarm runtime dependencies with `npm ci` at `core/node_modules`. Missing npm or failed prewarm SHALL emit a named warning and SHALL NOT discard the completed install. Every non-dry-run mutating installer command (`install`, `update`, or `uninstall`) SHALL hold a process-owned installer-operation lock from before destination inspection through its tree mutation and any dependency prewarm; a competing command SHALL fail before replacing or removing an install tree or spawning `npm ci`. An abandoned installer-operation lock SHALL NOT be reclaimed automatically, because the prior installer's npm child can outlive its parent. That installer-only lock SHALL remain distinct from the update lock observed by launchers, so a first launcher can wait on the published core-local dependency owner. Before replacement or removal of an existing tree, the installer SHALL also refuse any extant core-local dependency-owner lock, including one whose parent died, until remediation rules out a surviving npm child. A fresh install that will prewarm SHALL publish its incomplete marker and dependency-owner lock with the rest of the tree in the same rename, so a first launcher cannot race installer-owned `npm ci`. A failed prewarm SHALL remove any partial `core/node_modules` or explicitly mark it incomplete so the launcher performs its documented first-run self-heal before a dependency-requiring verb dispatches. Concurrent first-run launchers SHALL serialize self-heal so at most one `npm ci` mutates the installed core while every successful waiter dispatches only after dependencies are ready. An abandoned dependency-owner lock SHALL fail closed without starting another `npm ci`, because a child install can outlive its recorded parent; remediation SHALL require ruling out that child before removing the exact lock or reinstalling. If self-heal otherwise fails, the invocation SHALL also fail closed with remediation. Claude SHALL get the engine the same way as Codex and Grok. The SKILL SHALL instruct the agent to exec `pipeline <verb>`. Short SKILL prose is owned by #1049; this requirement is satisfied by pointing install at the current host SKILL overlay. Dry-run SHALL NOT write the skill tree.
@@ -70,38 +72,6 @@ Install the pipeline CLI for Claude the same way as Codex and Grok: stage a comp
 - **WHEN** `install --host claude --dry-run` runs
 - **THEN** the installer SHALL NOT create or replace the Claude skill install tree
 
-### Requirement: Build SHALL NOT vendor core engine source into plugin/
-
-`scripts/build.mjs` SHALL NOT copy `core/scripts` or any other engine source under `core/` into `plugin/`. After a successful generate run, no path matching `plugin/**/core/scripts/pipeline.ts` SHALL have been written by the generator. Dual-ship of a committed `plugin/` core mirror is forbidden. Until #1050 removes the remaining plugin shell, its generated launcher SHALL require the installer ownership marker, delegate the original argv to the managed Claude launcher, and propagate that launcher's result. If the marker or managed launcher is absent, the bridge SHALL fail non-zero with `install --host claude` remediation. It SHALL NOT load an adjacent engine. Physical deletion of leftover `plugin/` is #1050 and is not this requirement.
-
-#### Scenario: Generator does not write pipeline.ts under plugin/
-
-- **WHEN** `node scripts/build.mjs` runs
-- **THEN** the generator SHALL NOT write `plugin/**/core/scripts/pipeline.ts`
-- **AND** SHALL NOT copy `core/scripts` into `plugin/`
-
-#### Scenario: Install does not require a plugin core copy
-
-- **WHEN** `plugin/**/core/scripts/pipeline.ts` is absent
-- **AND** `install --host claude` runs (not dry-run)
-- **THEN** install SHALL still provision the CLI from `core/` at the repository source
-- **AND** SHALL NOT fail solely because the plugin core copy is missing
-
-#### Scenario: Marketplace shell delegates exact argv to the managed Claude install
-
-- **WHEN** the generated marketplace launcher is invoked with CLI arguments
-- **AND** the managed Claude skill has its installer ownership marker and launcher
-- **THEN** the bridge SHALL invoke that managed launcher with the original arguments unchanged
-- **AND** SHALL propagate its exit result
-- **AND** SHALL NOT load an engine from the plugin shell
-
-#### Scenario: Marketplace shell without a managed install fails with remediation
-
-- **WHEN** the generated marketplace launcher cannot find the installer ownership marker or managed
-  Claude launcher
-- **THEN** it SHALL exit non-zero
-- **AND** SHALL instruct the operator to run `install --host claude`
-
 ### Requirement: Build and install SHALL NOT emit a per-verb command pack
 
 `scripts/build.mjs` and `scripts/install.mjs` SHALL NOT generate Claude `pipeline:<verb>.md` files or Codex `pipeline-<verb>.yaml` command agents from `OPERATION_SURFACE`. There SHALL be no marketplace per-verb slash-command pack. `OPERATION_SURFACE` SHALL remain the verb catalog for docs and the SKILL table. It SHALL NOT be a reason to emit one file per verb. OpenCode’s LLM-mediated `/pipeline` markdown command file is out of scope for this requirement. `#990` (splitting `pipeline.ts`) is not required.
@@ -127,31 +97,20 @@ Install the pipeline CLI for Claude the same way as Codex and Grok: stage a comp
 - **THEN** that listing SHALL be available as catalog input for docs and the SKILL verb table
 - **AND** SHALL NOT by itself cause a host command file to be generated
 
-### Requirement: build check SHALL assert SKILL and catalog freshness only
+### Requirement: build check SHALL assert generated host SKILL freshness only
 
-`node scripts/build.mjs --check` SHALL exit non-zero when any generated host
-SKILL (`hosts/claude/SKILL.md`, `hosts/codex/SKILL.md`,
-`hosts/grok/SKILL.md`, or `hosts/opencode/SKILL.md`), the transitional plugin
-SKILL, or the marketplace catalog differs from a fresh generation. Host and
-plugin SKILL freshness SHALL be resolved from `renderHostSkill`,
-`OPERATION_SURFACE`, and the manifest-declared notify mappings rather than by
-treating `hosts/claude/SKILL.md` as a handwritten source overlay. The check
-SHALL NOT require a byte-identical `plugin/` core tree. Absence of
-`plugin/**/core/scripts/**` SHALL NOT by itself fail `--check`.
+`node scripts/build.mjs --check` SHALL exit non-zero when any generated host SKILL (`hosts/claude/SKILL.md`, `hosts/codex/SKILL.md`, `hosts/grok/SKILL.md`, or `hosts/opencode/SKILL.md`) differs from a fresh generation. Host SKILL freshness SHALL be resolved from `renderHostSkill`, `OPERATION_SURFACE`, and the manifest-declared notify mappings rather than by treating `hosts/claude/SKILL.md` as a handwritten source overlay. The check SHALL NOT require a plugin SKILL overlay, a marketplace catalog that sources `plugin/`, or a byte-identical `plugin/` core tree. Absence of `plugin/` SHALL NOT by itself fail `--check`.
 
 #### Scenario: Matching SKILL and catalog pass without a core copy
 
-- **WHEN** all four generated host SKILLs, the transitional plugin SKILL, and
-  the marketplace catalog match their fresh generated bytes
-- **AND** `plugin/` has no byte-identical `core/scripts` tree
+- **WHEN** all four generated host SKILLs match their fresh generated bytes
+- **AND** `plugin/` is absent
 - **THEN** `node scripts/build.mjs --check` SHALL exit 0
 
 #### Scenario: Stale SKILL or catalog fails check
 
-- **WHEN** any committed generated host SKILL, the transitional plugin SKILL,
-  or the marketplace catalog differs from a fresh generation
-- **THEN** `node scripts/build.mjs --check` SHALL exit non-zero and name the
-  stale exact path
+- **WHEN** any committed generated host SKILL differs from a fresh generation
+- **THEN** `node scripts/build.mjs --check` SHALL exit non-zero and name the stale exact path
 
 ### Requirement: Operator-visible CLI verbs SHALL stay unchanged
 
@@ -161,14 +120,3 @@ The pipeline CLI SHALL keep the operator-visible keywords `doctor`, `status`, `s
 
 - **WHEN** an operator runs `pipeline doctor`, `pipeline status <N>`, or `pipeline single <N>`
 - **THEN** the CLI SHALL dispatch those verbs with the same argument contracts as before this change
-
-### Requirement: This change SHALL NOT delete the plugin directory
-
-This change SHALL NOT `git rm -r plugin/` or otherwise take deletion of the whole `plugin/` tree as its deliverable. That delete is #1050 on the same ship. Regenerating without a core copy MAY drop leftover `plugin/` core files as a side effect. The change MUST NOT restore a core copy.
-
-#### Scenario: plugin directory delete is not this deliverable
-
-- **WHEN** this change’s diff is inspected for a whole-tree `plugin/` delete
-- **THEN** it SHALL NOT claim `git rm -r plugin/` as done
-- **AND** #1050 SHALL remain the owner of deleting the `plugin/` directory
-

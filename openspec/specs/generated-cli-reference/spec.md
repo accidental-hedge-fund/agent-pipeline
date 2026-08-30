@@ -2,7 +2,9 @@
 
 ## Purpose
 TBD - created by archiving change docs-generate-cli-config-reference. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: CLI reference documentation SHALL be generated from the command registry
 
 The repository SHALL provide a deterministic generator that emits the human CLI reference document `docs/cli.md` from `COMMAND_REGISTRY` (and its co-located documentation metadata). Every registry command marked as documented SHALL appear in the generated reference with at least a usage synopsis and a one-line summary. Registry keywords marked undocumented or hidden SHALL NOT appear in the generated reference. The generator SHALL NOT invent commands that are absent from the registry.
@@ -53,7 +55,7 @@ The repository SHALL provide a deterministic generator that emits the human CLI 
 
 ### Requirement: Committed CLI reference artifacts SHALL be staleness-gated in CI
 
-The repository SHALL provide a check mode for the CLI reference generator via `scripts/generate-docs.mjs --check` (or an equivalent `docs:check` script that invokes that check mode) that exits non-zero when the committed `docs/cli.md` differs from a fresh generation. Generated host SKILL freshness SHALL be gated only by `build.mjs --check` for the four SKILL hosts (Claude, Codex, Grok, OpenCode). The root `npm run ci` gate SHALL reach both checks: `build.mjs --check` for SKILL/catalog outputs and the existing conditional `ci:docs` step for docs outputs. A stale CLI reference or host SKILL SHALL therefore fail its sole owning check without two generators claiming the same file.
+The repository SHALL provide a check mode for the CLI reference generator via `scripts/generate-docs.mjs --check` (or an equivalent `docs:check` script that invokes that check mode) that exits non-zero when the committed `docs/cli.md` differs from a fresh generation. Generated host SKILL freshness SHALL be gated only by `build.mjs --check` for the four SKILL hosts (Claude, Codex, Grok, OpenCode). The root `npm run ci` gate SHALL reach both checks: `build.mjs --check` for host SKILL outputs and the existing conditional `ci:docs` step for docs outputs. A stale CLI reference or host SKILL SHALL therefore fail its sole owning check without two generators claiming the same file. `build.mjs --check` SHALL NOT require a plugin SKILL overlay or a marketplace catalog that sources `plugin/`.
 
 #### Scenario: Stale docs/cli.md fails the check
 
@@ -76,3 +78,8 @@ The repository SHALL provide a check mode for the CLI reference generator via `s
 - **THEN** `node scripts/build.mjs --check` SHALL exit non-zero and name the stale path
 - **AND** `scripts/generate-docs.mjs --check` SHALL NOT compare or require that SKILL
 
+#### Scenario: absent plugin overlay is not a docs or SKILL check failure
+
+- **WHEN** `plugin/` is absent and the four host SKILLs match a fresh generation
+- **THEN** `node scripts/build.mjs --check` SHALL exit 0
+- **AND** the docs generator check SHALL NOT require a plugin SKILL overlay

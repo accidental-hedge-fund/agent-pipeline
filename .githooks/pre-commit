@@ -1,11 +1,10 @@
 #!/bin/sh
-# Auto-regenerate committed host SKILLs, the plugin SKILL overlay, and the
-# marketplace catalog when a commit touches their sources (#1049).
+# Auto-regenerate committed host SKILLs when a commit touches their sources
+# (#1049/#1050).
 #
 # The product is the pipeline CLI plus host SKILL. This hook runs
-# `node scripts/build.mjs` and stages exact SKILL/catalog outputs until #1050.
-# It does not regenerate or stage a plugin/ copy of core/scripts as required
-# output (#1048).
+# `node scripts/build.mjs` and stages exact generated host SKILL paths.
+# It does not write or stage any plugin/ path (#1050).
 #
 # Opt in per clone with `npm run setup-hooks`. This is convenience, not a gate:
 # `node scripts/build.mjs --check` in `npm run ci` / CI remains the authoritative,
@@ -18,8 +17,8 @@ cd "$(git rev-parse --show-toplevel)"
 
 # Only regenerate when the staged change set touches generator inputs.
 # (No --diff-filter: a staged deletion under core/ must also refresh owned outputs.)
-# hosts/_shared/ is included because build.mjs stages shared plugin-shell assets
-# such as material-filter.mjs. Exact outer-host manifests and generated SKILL
+# hosts/_shared/ is included because shared assets such as material-filter.mjs
+# are generator inputs. Exact outer-host manifests and generated SKILL
 # paths are inputs/outputs for the four SKILL hosts. Unrelated hosts/ dirt
 # (for example hosts/codex/agents or hosts/omp) must not trigger.
 GENERATOR_INPUT_GREP='^(core/|hosts/_shared/|scripts/build\.mjs$|hosts/(claude|codex|grok|opencode)/(SKILL\.md|outer-host\.manifest\.json)$)'
@@ -28,12 +27,12 @@ if ! printf '%s\n' "$staged" | grep -Eq "$GENERATOR_INPUT_GREP"; then
   exit 0
 fi
 
-echo "pre-commit: generator inputs staged — regenerating host SKILLs / plugin SKILL / marketplace catalog"
+echo "pre-commit: generator inputs staged — regenerating host SKILLs"
 
 # Guard: abort if the working tree has unstaged tracked edits under generator
 # *source* inputs. Generated SKILL outputs are rewritten and staged below.
 # build.mjs reads the working tree, not the index, so an unstaged source
-# change could produce SKILL/catalog output that doesn't match the staged
+# change could produce SKILL output that doesn't match the staged
 # source files, silently committing effects of unstaged work.
 unstaged_src=$(git diff --name-only -- \
   core/ \
@@ -52,7 +51,7 @@ fi
 
 # Guard: abort if untracked files exist under generator source inputs. The
 # generator reads from the working tree, so local scratch must not influence
-# committed SKILL/catalog output without being reviewed and staged.
+# committed SKILL output without being reviewed and staged.
 untracked_src=$(git ls-files --others --exclude-standard -- \
   core/ \
   hosts/_shared/ \
@@ -76,9 +75,7 @@ for generated_path in \
   hosts/claude/SKILL.md \
   hosts/codex/SKILL.md \
   hosts/grok/SKILL.md \
-  hosts/opencode/SKILL.md \
-  .claude-plugin/marketplace.json \
-  plugin/pipeline/skills/pipeline/SKILL.md
+  hosts/opencode/SKILL.md
 do
   if [ -e "$generated_path" ] || git ls-files --error-unmatch -- "$generated_path" >/dev/null 2>&1; then
     git add -- "$generated_path"

@@ -2,7 +2,9 @@
 
 ## Purpose
 TBD - created by archiving change merge-queue-optional-release-prepare. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: Release-when-complete SHALL be opt-in and default off
 
 The merge-queue command SHALL prepare a release only when release-when-complete
@@ -156,8 +158,9 @@ queue, missing version, or other gate). Dry-run SHALL evaluate completeness
 against **current** state (not projected post-merge emptiness of a non-empty
 queue): would-prepare only when the current queue is already complete. Dry-run
 SHALL NOT open a release PR, SHALL NOT write release-managed files
-(`package.json`, `core/package.json`, `ROADMAP.md`, `plugin/`, `.claude-plugin/`),
-and SHALL NOT tag, publish, or merge.
+(`package.json`, `core/package.json`, `ROADMAP.md`, the four generated host
+SKILLs),
+and SHALL NOT tag, publish, or merge. Dry-run SHALL NOT recreate `plugin/`.
 
 #### Scenario: Dry-run on an already-complete queue reports would-prepare
 
@@ -166,6 +169,7 @@ and SHALL NOT tag, publish, or merge.
 - **THEN** the output SHALL state that release prepare would run for that version
 - **AND** no release PR is created
 - **AND** no release-managed paths are mutated
+- **AND** `plugin/` SHALL NOT be created
 
 #### Scenario: Dry-run on a non-empty queue reports would-not-prepare
 
@@ -179,4 +183,3 @@ and SHALL NOT tag, publish, or merge.
 
 - **WHEN** dry-run runs without release-when-complete enabled
 - **THEN** the planned actions SHALL NOT include preparing a release PR
-

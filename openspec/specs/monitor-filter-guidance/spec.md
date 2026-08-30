@@ -2,7 +2,9 @@
 
 ## Purpose
 TBD - created by archiving change tighten-skillmd-monitor-filter. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: Run-store event follow SHALL be the primary host monitoring contract
 
 `core/scripts/host-skill.ts` and every generated host SKILL SHALL use structured run-store event follow as the primary monitoring contract. The default numeric `pipeline <N>` path SHALL retain `advance_run_id` from the advance handoff and follow `pipeline logs <advance-run-id> --events --follow`. The `pipeline single` / `pipeline loop` path SHALL retain the handoff `loop_run_id` and follow `pipeline loop logs <loop-run-id> --events --follow`; after `loop_item_advance_linked`, it SHALL retain that event's `pipeline_run_id` value as `advance_run_id` and also follow `pipeline logs <advance-run-id> --events --follow`. The compact contract SHALL direct human-visible progress from the applicable streams through the shared material filter or an equivalent `--material` surface. It SHALL NOT recommend the broad stdout alternation `"^\[pipeline\]|^\[exit code|FAILED|timed out|blocked label|approved|needs-attention|→ "` as the primary filter. Durable docs MAY retain the legacy issue-scoped stdout grep `^\[pipeline\] #<N>: ` as a diagnostic for legacy logs, but each generated one-pager SHALL carry only the structured retained-id follow guidance and a durable-doc pointer.
@@ -62,7 +64,7 @@ The shared follow/notify contract SHALL require follow-until-terminal over the r
 
 ### Requirement: Generated hosts SHALL share one compact event-follow contract
 
-`hosts/claude/SKILL.md`, `hosts/codex/SKILL.md`, `hosts/grok/SKILL.md`, and `hosts/opencode/SKILL.md` SHALL be byte-identical generated one-pagers containing the same retained `loop_run_id` and linked `advance_run_id` event-follow commands, material-filter obligation, durable-doc pointer, premature-exit failure/recovery rule, and compact host-notify map. The transitional plugin SKILL overlay SHALL derive from that same rendered output. Material-event membership and spam suppression SHALL come from the shared filter, while the active host selects only its notify-map row. No generated surface SHALL carry the broad stdout alternation or a host-specific material-kind inventory.
+`hosts/claude/SKILL.md`, `hosts/codex/SKILL.md`, `hosts/grok/SKILL.md`, and `hosts/opencode/SKILL.md` SHALL be byte-identical generated one-pagers containing the same retained `loop_run_id` and linked `advance_run_id` event-follow commands, material-filter obligation, durable-doc pointer, premature-exit failure/recovery rule, and compact host-notify map. Material-event membership and spam suppression SHALL come from the shared filter, while the active host selects only its notify-map row. No generated surface SHALL carry the broad stdout alternation or a host-specific material-kind inventory. The generator SHALL NOT write a plugin SKILL overlay to carry this contract.
 
 #### Scenario: Claude host filter matches spec
 
@@ -78,11 +80,10 @@ The shared follow/notify contract SHALL require follow-until-terminal over the r
 
 #### Scenario: Plugin SKILL.md filter matches spec
 
-- **WHEN** `plugin/pipeline/skills/pipeline/SKILL.md` is generated
-- **THEN** its compact follow/filter contract SHALL derive from the same shared renderer
-- **AND** it SHALL NOT restore the retired per-host filter essay
-
----
+- **WHEN** `scripts/build.mjs` runs
+- **THEN** it SHALL NOT write `plugin/pipeline/skills/pipeline/SKILL.md`
+- **AND** the four generated host SKILLs SHALL remain the compact filter surfaces
+- **AND** no plugin overlay SHALL restore the retired per-host filter essay
 
 ### Requirement: Shared renderer and durable docs SHALL document the events.jsonl material filter for progress notify
 
@@ -125,4 +126,3 @@ The shared filter and durable docs SHALL also agree on all suppression rules: sk
 - **WHEN** the advance, required-loop, optional-loop, definitive-status, and suppression inventories are compared between code and durable docs
 - **THEN** every exported entry and suppression rule SHALL match
 - **AND** a drift guard covered by `npm run ci` SHALL fail on omission or divergence
-

@@ -2,7 +2,9 @@
 
 ## Purpose
 TBD - created by archiving change evals-fixture-integrity-and-isolation-honesty. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: Fixture integrity preflight SHALL verify every committed fixture base_commit is a reachable git object
 
 The engine SHALL provide a fixture integrity preflight that, for every committed evaluation
@@ -131,13 +133,14 @@ Deep preflight SHALL reject a fixture whose public or hidden check commands
 resolve to missing paths under the cell worktree at the pin. When a fixture's
 checks exercise packaging freshness, preflight SHALL resolve the exact
 generator-owned outputs against the fixture's `base_commit`. A historical pin
-MAY require an exact `plugin/` core-mirror output only when the pinned
-`scripts/build.mjs` proves it generated that path. At a post-#1049 pin,
+MAY require an exact `plugin/` path only when the pinned
+`scripts/build.mjs` proves it generated that path. At a post-#1050 pin,
 renderer, `OPERATION_SURFACE`, the outer-host manifest loader, build, or manifest inputs MAY make the exact four
-host SKILLs, transitional plugin SKILL, and marketplace catalog required
+host SKILLs required
 outputs; preflight SHALL require only the exact paths that the pinned generator
 would make stale. An ordinary `core/` edit that is not a packaging-generator
-input SHALL NOT imply those outputs. When `allowed_change_paths` is declared,
+input SHALL NOT imply those outputs. A current pin SHALL NOT require a plugin
+SKILL overlay or a marketplace catalog that sources `plugin/`. When `allowed_change_paths` is declared,
 it SHALL include each required pin-resolved output or an explicit corpus policy
 SHALL document why it is omitted. Broad `hosts/**` and `plugin/**` allowances
 SHALL fail.
@@ -165,17 +168,17 @@ SHALL fail.
 - **WHEN** a fixture's pinned `scripts/build.mjs` copied an allowed `core/`
   source into a corresponding generated `plugin/` core-mirror path
 - **THEN** preflight SHALL require that exact historical generated path
-- **AND** SHALL NOT replace it with current host SKILL, plugin SKILL, or catalog
-  paths that the pinned build did not generate from that source
+- **AND** SHALL NOT replace it with current host SKILL paths that the pinned
+  build did not generate from that source
 
 #### Scenario: Current ordinary core edit does not require unrelated packaging output
 
-- **WHEN** a post-#1049 fixture permits an ordinary `core/` source edit that is
+- **WHEN** a post-#1050 fixture permits an ordinary `core/` source edit that is
   not an input to `renderHostSkill`, `OPERATION_SURFACE`, `load-manifest.ts`, build, a rendered
-  manifest mapping, or the marketplace catalog
+  manifest mapping
 - **AND** its public checks exercise packaging freshness
-- **THEN** preflight SHALL NOT require any generated host SKILL, plugin SKILL,
-  or catalog output solely because the edit is under `core/`
+- **THEN** preflight SHALL NOT require any generated host SKILL or retired
+  plugin overlay solely because the edit is under `core/`
 
 #### Scenario: Broad plugin allowance fails at every pin
 
@@ -205,4 +208,3 @@ record SHALL NOT be treated as a model quality signal.
 - **WHEN** a preflight failure is recorded
 - **THEN** its reason or class SHALL be explicitly identifiable as fixture preflight infrastructure
 - **AND** SHALL be distinguishable from a treatment `completed` outcome with a low grade
-

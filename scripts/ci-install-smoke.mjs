@@ -148,6 +148,10 @@ try {
   };
 
   run([installScript, "install", "--host", "claude"], env);
+  if (existsSync(join(REPO_ROOT, "plugin"))) {
+    console.error("ci-install-smoke: repo plugin/ must not exist after #1050");
+    process.exit(1);
+  }
   const enginesResolver = join(
     configDir,
     "skills",

@@ -31,7 +31,7 @@ A generated `/pipeline:status`-style wrapper that only execs the CLI. Not requir
 _Avoid_: product surface
 
 **Plugin directory**:
-The committed `plugin/` tree containing the generated SKILL overlay. Deleted in #1050. Its companion catalog is `.claude-plugin/marketplace.json`. It contains neither a core engine copy nor per-verb command files; Claude install writes a short SKILL next to the CLI, not a repo `plugin/` package.
+A retired packaging tree. The repo has no `plugin/` overlay and no marketplace catalog. Claude install writes a short SKILL next to the CLI via `install --host claude`. If `CLAUDE_PLUGIN_ROOT` still points at a leftover core copy, run `install --host claude` or pin.
 _Avoid_: marketplace listing, source of truth
 
 **Launcher bootstrap**:

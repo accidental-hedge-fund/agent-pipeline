@@ -5,8 +5,7 @@
 // 2c. Failing closed on open candidate-linked engine-class soak defects (#755)
 //    (skipped when FRG skip is active — soak attribution is FRG-linked)
 // 3. Bumping both package.json files
-// 4. Regenerating committed packaging outputs (four host SKILLs, plugin SKILL
-//    overlay, launcher shims, plugin manifest, and marketplace catalog)
+// 4. Regenerating committed packaging outputs (four host SKILLs)
 // 5. Running the CI gate (npm run ci)
 // 6. Scaffolding ROADMAP.md at four mutation sites
 // 7. Opening $EDITOR for human confirmation (skipped under --no-edit / --dry-run)
@@ -2022,17 +2021,13 @@ export async function runRelease(
   // release commit free of unrelated edits (#170 review-2).
   //
   // `--untracked-files=all` is REQUIRED: plain `git status` honors `status.showUntrackedFiles`,
-  // so a maintainer with that set to `no` would slip an untracked file under `plugin/` past
-  // this guard. The abort rollback below cleans untracked files from the release-managed
-  // packaging directories, so forcing `=all` makes detection independent of user git config.
-  // Ignored files under `plugin/` and `.claude-plugin/` remain outside this precondition;
-  // `scripts/build.mjs` owns only its declared SKILL, launcher, manifest, and catalog outputs.
+  // so a maintainer with that set to `no` would slip an untracked generated host SKILL past
+  // this guard. Forcing `=all` makes detection independent of user git config.
+  // `scripts/build.mjs` owns only the four generated host SKILLs (#1050).
   const releaseManagedPaths = [
     "package.json",
     "core/package.json",
     "ROADMAP.md",
-    "plugin",
-    ".claude-plugin",
     ...HOST_SKILL_RELATIVE_PATHS,
   ];
   d.stdout("[pipeline release] checking working tree is clean in release-managed paths...");
@@ -2046,8 +2041,7 @@ export async function runRelease(
     throw new Error(
       `[pipeline release] working tree has uncommitted changes in release-managed paths:\n${statusResult.stdout.trimEnd()}\n` +
       "Commit, stash, or discard them before cutting a release — the release command rewrites " +
-      "package.json, core/package.json, ROADMAP.md, and generated packaging outputs under " +
-      "plugin/ and .claude-plugin/, and its abort rollback " +
+      "package.json, core/package.json, ROADMAP.md, and the four generated host SKILLs, and its abort rollback " +
       "restores those paths from HEAD (which would discard your local edits).",
     );
   }
@@ -2057,12 +2051,10 @@ export async function runRelease(
   // abort, or a failed `git add` / `git commit` after `checkout -b`). `git restore
   // --source=HEAD --staged --worktree` resets both the index and the worktree from HEAD.
   // `git checkout --` is not enough after a successful add: it copies the index into the
-  // worktree and would write the staged version bumps back (#1148). `git clean -fd` then
-  // removes any untracked packaging debris build.mjs may have generated (safe because the
-  // clean-tree precondition above guaranteed plugin/ and .claude-plugin/ held no untracked
-  // files when the run began). Never pass `.agent-pipeline/frg` to restore/clean: evidence
-  // stays on disk (#1148). Both exit codes are checked so a failed rollback is surfaced
-  // loudly, not silently claimed as restored. Otherwise a stranded bump poisons a retry
+  // worktree and would write the staged version bumps back (#1148). Never restore or clean
+  // `plugin/` or `.claude-plugin/` (#1050). Never pass `.agent-pipeline/frg` to restore/clean:
+  // evidence stays on disk (#1148). The restore exit code is checked so a failed rollback is
+  // surfaced loudly, not silently claimed as restored. Otherwise a stranded bump poisons a retry
   // whose previousVersion reads the bumped core (#170). Point of no return is a successful
   // release commit (#1148).
   const branch = `release/v${resolvedVersion}`;
@@ -2076,22 +2068,15 @@ export async function runRelease(
         "--staged",
         "--worktree",
         "--",
-        "package.json",
-        "core/package.json",
-        "ROADMAP.md",
-        "plugin",
-        ".claude-plugin",
-        ...HOST_SKILL_RELATIVE_PATHS,
+        ...releaseManagedPaths,
       ],
       { cwd: repoDir },
     );
-    const clean = d.runCommand("git", ["clean", "-fd", "plugin", ".claude-plugin"], { cwd: repoDir });
-    if (r.code !== 0 || clean.code !== 0) {
+    if (r.code !== 0) {
       d.stderr(
-        `[pipeline release] ROLLBACK FAILED (git restore exited ${r.code}: ${r.stderr.trim()}; ` +
-        `git clean exited ${clean.code}: ${clean.stderr.trim()}). ` +
+        `[pipeline release] ROLLBACK FAILED (git restore exited ${r.code}: ${r.stderr.trim()}). ` +
         "The working tree may have a stranded version bump or partial packaging output — run " +
-        "`git restore --source=HEAD --staged --worktree -- package.json core/package.json ROADMAP.md plugin .claude-plugin && git clean -fd plugin .claude-plugin` manually before retrying.",
+        "`git restore --source=HEAD --staged --worktree -- package.json core/package.json ROADMAP.md hosts/claude/SKILL.md hosts/codex/SKILL.md hosts/grok/SKILL.md hosts/opencode/SKILL.md` manually before retrying.",
       );
       return false;
     }
@@ -2109,7 +2094,7 @@ export async function runRelease(
       d.stderr(
         `[pipeline release] ROLLBACK FAILED (git checkout ${baseBranch} exited ${checkoutBase.code}: ${checkoutBase.stderr.trim()}). ` +
         `HEAD may still be on ${branch} with a stranded version bump — run ` +
-        `\`git restore --source=HEAD --staged --worktree -- package.json core/package.json ROADMAP.md plugin .claude-plugin && git checkout ${baseBranch} && git branch -d ${branch}\` manually before retrying.`,
+        `\`git restore --source=HEAD --staged --worktree -- package.json core/package.json ROADMAP.md hosts/claude/SKILL.md hosts/codex/SKILL.md hosts/grok/SKILL.md hosts/opencode/SKILL.md && git checkout ${baseBranch} && git branch -d ${branch}\` manually before retrying.`,
       );
       return;
     }
@@ -2141,8 +2126,8 @@ export async function runRelease(
     d.stdout("[pipeline release] bumping version in package.json files...");
     bumpVersion(resolvedVersion, rootPkgPath, corePkgPath, d);
 
-    // 7. Regenerate the committed plugin packaging outputs.
-    d.stdout("[pipeline release] regenerating SKILL, launcher, manifest, and catalog outputs (node scripts/build.mjs)...");
+    // 7. Regenerate the committed host SKILL outputs.
+    d.stdout("[pipeline release] regenerating host SKILLs (node scripts/build.mjs)...");
     const buildResult = d.runCommand("node", ["scripts/build.mjs"], { cwd: repoDir });
     if (buildResult.code !== 0) {
       d.stderr(buildResult.stdout);
@@ -2235,14 +2220,7 @@ export async function runRelease(
     // as an explicit pathspec — `git add` of an ignored path is a hard fail.
     // Do not `git add -f`. Do not stage CHANGELOG.md here.
     d.stdout("[pipeline release] staging release files...");
-    const addPaths = [
-      "package.json",
-      "core/package.json",
-      "ROADMAP.md",
-      "plugin/",
-      ".claude-plugin/",
-      ...HOST_SKILL_RELATIVE_PATHS,
-    ];
+    const addPaths = [...releaseManagedPaths];
     const addResult = d.runCommand(
       "git",
       ["add", ...addPaths],
