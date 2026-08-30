@@ -53,6 +53,8 @@ export function validateDecisionsForReady(snapshot: GrillReadySnapshot): ReadyVa
   const artifact = parsed.artifact;
   for (const h of snapshot.handoffs) {
     if (!isGrillAuthorityDeclaration(h.declaration_identity)) continue;
+    // Ignore only explicitly superseded records. Pending/answered stay fail-closed.
+    if (h.status === "superseded" || h.superseded_by) continue;
     if (h.status !== "pending" && h.status !== "answered") continue;
     const decl = parseGrillDeclaration(h.declaration_identity ?? "");
     if (!decl) {

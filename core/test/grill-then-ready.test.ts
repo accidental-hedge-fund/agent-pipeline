@@ -51,16 +51,20 @@ import {
   canCreateHandoff,
   createAndPersistHandoff,
   answerAndPersistHandoff,
+  listHandoffs,
   loadHandoff,
+  saveHandoff,
   type HandoffStoreDeps,
   type HumanQuestionHandoff,
 } from "../scripts/human-question-handoff.ts";
 import {
+  createPendingGrillHandoffs,
   grillAuthorityCreateInputs,
   materializeGrillAnswer,
   materializeGrillNode,
   isGrillAuthorityDeclaration,
   parseGrillDeclaration,
+  supersedeStaleGrillHandoffs,
 } from "../scripts/grill-handoff.ts";
 import {
   runRefineSpecApply,
@@ -1156,6 +1160,187 @@ test("grill: artifact-only body edit refuses answer with no write and handoff st
   if (loaded.ok) assert.equal(loaded.handoff.status, "pending");
 });
 
+function readySnap(body: string, art: DecisionsArtifact, handoffs: HumanQuestionHandoff[]): GrillReadySnapshot {
+  return {
+    title: "T",
+    body,
+    comments: [],
+    fingerprint: art.fingerprint,
+    contextMd: "**Grill**:\nA one-shot intake interview.\n",
+    integrationBaseSha: art.fingerprint.integration_base_sha,
+    handoffs,
+  };
+}
+
+test("grill: applied refinement supersedes stale bindings so ready is not stranded", async () => {
+  const spec = "## Summary\nX\n";
+  const artA = artifact(canonicalThinIssueNodes(), spec);
+  const bodyA = embedDecisionsInBody(spec, artA);
+  const store = memoryHandoffStore();
+  const first = await createPendingGrillHandoffs(
+    "/tmp/repo",
+    {
+      domain: "d",
+      repo: "acme/r",
+      issueNumber: 42,
+      artifact: artA,
+      proposedBody: bodyA,
+      frontierFp: "fp",
+    },
+    store,
+  );
+  assert.equal(first.ok, true);
+  if (!first.ok) return;
+
+  const nodesB = canonicalThinIssueNodes().map((n) =>
+    n.id === "scope" ? makeNode({ id: n.id, question: "Revised scope question?", recommendation: n.recommendation, class: n.class }) : n,
+  );
+  const artB = artifact(nodesB, spec);
+  const bodyB = embedDecisionsInBody(spec, artB);
+  const second = await createPendingGrillHandoffs(
+    "/tmp/repo",
+    {
+      domain: "d",
+      repo: "acme/r",
+      issueNumber: 42,
+      artifact: artB,
+      proposedBody: bodyB,
+      frontierFp: "fp",
+    },
+    store,
+  );
+  assert.equal(second.ok, true);
+  if (!second.ok) return;
+
+  const listedBefore = await listHandoffs("/tmp/repo", { issue: 42 }, store);
+  const readyBefore = validateDecisionsForReady(readySnap(bodyB, artB, listedBefore));
+  assert.equal(readyBefore.ok, false, "stale pending records must strand ready before supersession");
+  if (!readyBefore.ok) assert.equal(readyBefore.code, "invalid_provenance");
+
+  const retired = await supersedeStaleGrillHandoffs(
+    "/tmp/repo",
+    {
+      issueNumber: 42,
+      artifact: artB,
+      proposedBody: bodyB,
+      frontierFp: "fp",
+      currentHandoffs: second.created,
+    },
+    store,
+  );
+  assert.equal(retired.ok, true, retired.ok ? "" : retired.reason);
+  if (!retired.ok) return;
+  assert.ok(retired.superseded.length >= 1);
+
+  const listedAfter = await listHandoffs("/tmp/repo", { issue: 42 }, store);
+  const readyAfter = validateDecisionsForReady(readySnap(bodyB, artB, listedAfter));
+  assert.equal(readyAfter.ok, false);
+  if (!readyAfter.ok) assert.equal(readyAfter.code, "unresolved_authority");
+
+  const old = await loadHandoff("/tmp/repo", 42, first.created[0]!.handoff_id, store);
+  assert.equal(old.ok, true);
+  if (old.ok) {
+    assert.equal(old.handoff.status, "superseded");
+    assert.ok(old.handoff.superseded_by);
+  }
+});
+
+test("grill: applied refinement keeps answered handoff that still binds the live node", async () => {
+  const spec = "## Summary\nX\n";
+  const nodes = settledOperatorNodes();
+  const art = artifact(nodes, spec);
+  const body = embedDecisionsInBody(spec, art);
+  const store = memoryHandoffStore();
+  for (const n of nodes) {
+    await saveHandoff("/tmp/repo", handoffForNode(n), store);
+  }
+  const retired = await supersedeStaleGrillHandoffs(
+    "/tmp/repo",
+    {
+      issueNumber: 42,
+      artifact: art,
+      proposedBody: body,
+      frontierFp: art.fingerprint.planning_treatment_sha256,
+      currentHandoffs: [],
+    },
+    store,
+  );
+  assert.equal(retired.ok, true, retired.ok ? "" : retired.reason);
+  if (!retired.ok) return;
+  assert.equal(retired.superseded.length, 0);
+  const loaded = await loadHandoff("/tmp/repo", 42, `hqh_${nodes[0]!.id}`, store);
+  assert.equal(loaded.ok, true);
+  if (loaded.ok) assert.equal(loaded.handoff.status, "answered");
+  const listed = await listHandoffs("/tmp/repo", { issue: 42 }, store);
+  const ready = validateDecisionsForReady(readySnap(body, art, listed));
+  assert.equal(ready.ok, true, ready.ok ? "" : ready.reason);
+});
+
+test("grill: applied refinement retires a dropped-node handoff without a replacement", async () => {
+  const spec = "## Summary\nX\n";
+  const artA = artifact(canonicalThinIssueNodes(), spec);
+  const bodyA = embedDecisionsInBody(spec, artA);
+  const store = memoryHandoffStore();
+  const first = await createPendingGrillHandoffs(
+    "/tmp/repo",
+    {
+      domain: "d",
+      repo: "acme/r",
+      issueNumber: 42,
+      artifact: artA,
+      proposedBody: bodyA,
+      frontierFp: "fp",
+    },
+    store,
+  );
+  assert.equal(first.ok, true);
+  if (!first.ok) return;
+  const nodesB = canonicalThinIssueNodes().filter((n) => n.id !== "scope");
+  const artB = artifact(nodesB, spec);
+  const bodyB = embedDecisionsInBody(spec, artB);
+  const second = await createPendingGrillHandoffs(
+    "/tmp/repo",
+    {
+      domain: "d",
+      repo: "acme/r",
+      issueNumber: 42,
+      artifact: artB,
+      proposedBody: bodyB,
+      frontierFp: "fp",
+    },
+    store,
+  );
+  assert.equal(second.ok, true);
+  if (!second.ok) return;
+  const scopePrior = first.created.find(
+    (h) => parseGrillDeclaration(h.declaration_identity ?? "")?.nodeId === "scope",
+  );
+  assert.ok(scopePrior);
+  const retired = await supersedeStaleGrillHandoffs(
+    "/tmp/repo",
+    {
+      issueNumber: 42,
+      artifact: artB,
+      proposedBody: bodyB,
+      frontierFp: "fp",
+      currentHandoffs: second.created,
+    },
+    store,
+  );
+  assert.equal(retired.ok, true, retired.ok ? "" : retired.reason);
+  if (!retired.ok) return;
+  const loaded = await loadHandoff("/tmp/repo", 42, scopePrior!.handoff_id, store);
+  assert.equal(loaded.ok, true);
+  if (loaded.ok) {
+    assert.equal(loaded.handoff.status, "superseded");
+    assert.equal(loaded.handoff.superseded_by, null);
+  }
+  const listed = await listHandoffs("/tmp/repo", { issue: 42 }, store);
+  const ready = validateDecisionsForReady(readySnap(bodyB, artB, listed));
+  assert.equal(ready.ok, false);
+  if (!ready.ok) assert.equal(ready.code, "unresolved_authority");
+});
+
 test("grill: successful materialize rebinds pending siblings to the new body hash", async () => {
   const spec = "## Summary\nX\n";
   const nodes = canonicalThinIssueNodes();
@@ -1494,6 +1679,67 @@ test("grill: rewritten authority class with regenerated digests still fails read
   });
   assert.deepEqual(add, []);
   assert.deepEqual(remove, []);
+});
+
+test("grill: second apply with a changed node definition supersedes first pending handoffs", async () => {
+  const env = await signedPreview();
+  const store = memoryHandoffStore();
+  await withExit(async () => {
+    const deps = applyDeps(env, { handoffStore: store });
+    await runRefineSpecApply(42, {}, deps);
+    assert.equal(process.exitCode, 0);
+  });
+  const parsed = parseDecisionsFromBody(env.proposal.body);
+  assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+  if (!parsed.ok) return;
+  const nodes = parsed.artifact.nodes.map((n) => {
+    if (n.id !== "scope") return n;
+    return makeNode({
+      id: n.id,
+      question: "Revised live scope question?",
+      recommendation: n.recommendation,
+      class: n.class,
+      term_id: n.term_id,
+    });
+  });
+  const spec = extractSpecCore(env.proposal.body);
+  const art2 = { ...parsed.artifact, nodes };
+  const body2 = embedDecisionsInBody(spec, art2);
+  const signed = issueGrillProposal({
+    now: new Date("2026-01-01T00:00:00Z"),
+    nonce: "c".repeat(32),
+    repo: env.repo,
+    issue: env.issue,
+    input: {
+      title: env.input.title,
+      body: env.proposal.body,
+      title_sha256: sha256Prefixed(env.input.title),
+      body_sha256: sha256Prefixed(env.proposal.body),
+      fingerprint: env.input.fingerprint,
+    },
+    proposal: {
+      ...env.proposal,
+      body: body2,
+      artifact: art2,
+    },
+    key: "test-key",
+  });
+  assert.equal(signed.ok, true);
+  if (!signed.ok) return;
+  await withExit(async () => {
+    const deps = applyDeps(signed.envelope, { handoffStore: store });
+    await runRefineSpecApply(42, {}, deps);
+    assert.equal(process.exitCode, 0);
+  });
+  const afterSecond = await listHandoffs("/tmp/repo", { issue: 42 }, store);
+  assert.ok(
+    afterSecond.some((h) => h.status === "superseded"),
+    "first-apply pending records must be superseded",
+  );
+  assert.ok(afterSecond.some((h) => h.status === "pending"));
+  const ready = validateDecisionsForReady(readySnap(body2, art2, afterSecond));
+  assert.equal(ready.ok, false);
+  if (!ready.ok) assert.equal(ready.code, "unresolved_authority");
 });
 
 test("grill: --stage ready incomplete artifact makes zero label writes", async () => {

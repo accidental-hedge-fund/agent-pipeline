@@ -162,7 +162,7 @@ If any node in the proposal carries a reviewer verdict of `challenge`, apply SHA
 
 ### Requirement: The Decisions artifact SHALL be versioned, embedded, and the sole source of the readable Decisions section
 
-Pipeline SHALL embed a versioned Pipeline-owned Decisions artifact in the issue body. Each stable node SHALL record its question, recommendation, authority class, resolution, provenance reference, and input digests. Pipeline SHALL recompute those input digests from the live node definition fields (id, question, recommendation, class, and term_id) at parse, handoff materialize, and `--stage ready`. A stored digest that does not match the live fields SHALL fail closed. The canonical definition digest SHALL be bound on the grill-authority handoff declaration identity and `content_hashes`. `--stage ready` SHALL verify each live node against that binding. The Decisions fence checksum and model-written provenance SHALL NOT authorize a rewritten definition. Pipeline SHALL render the readable `## Decisions` section from that same artifact. Divergence between the artifact and the rendered section SHALL fail validation at apply, handoff materialize, and `--stage ready`. The issue body SHALL remain the specification. Comments and handoffs MAY prove provenance. They SHALL NOT replace the body.
+Pipeline SHALL embed a versioned Pipeline-owned Decisions artifact in the issue body. Each stable node SHALL record its question, recommendation, authority class, resolution, provenance reference, and input digests. Pipeline SHALL recompute those input digests from the live node definition fields (id, question, recommendation, class, and term_id) at parse, handoff materialize, and `--stage ready`. A stored digest that does not match the live fields SHALL fail closed. The canonical definition digest SHALL be bound on the grill-authority handoff declaration identity and `content_hashes`. `--stage ready` SHALL verify each pending or answered grill-authority record against that binding. It SHALL ignore superseded records. A pending or answered record whose digest does not match SHALL fail closed. The Decisions fence checksum and model-written provenance SHALL NOT authorize a rewritten definition. Pipeline SHALL render the readable `## Decisions` section from that same artifact. Divergence between the artifact and the rendered section SHALL fail validation at apply, handoff materialize, and `--stage ready`. The issue body SHALL remain the specification. Comments and handoffs MAY prove provenance. They SHALL NOT replace the body.
 
 #### Scenario: Render matches artifact
 
@@ -390,6 +390,34 @@ Pipeline SHALL extend the existing authenticated `pipeline handoff answer` bound
 - **WHEN** an operator comments the answer on the GitHub issue and does not run `pipeline handoff answer`
 - **THEN** the node SHALL remain unresolved
 - **AND** `--stage ready` SHALL exit 2
+
+---
+
+### Requirement: Apply SHALL supersede grill-authority handoffs that an applied refinement replaces
+
+After a successful apply body write, Pipeline SHALL mark each pending or answered grill-authority handoff for that issue `superseded` unless that record is still the current binding for the applied artifact. A current binding SHALL be either a pending handoff whose declaration identity matches the applied body hash, frontier fingerprint, node id, and definition digest, or an answered handoff whose live node remains resolved with that handoff provenance and whose definition digest still matches. Apply SHALL link a superseded record to the current pending handoff for the same node when one exists. An editor rewrite of a node definition SHALL NOT itself supersede a handoff. `--stage ready` SHALL ignore superseded records and SHALL still fail closed on pending or answered definition mismatch.
+
+#### Scenario: Later apply with a changed node definition unblocks ready validation
+
+- **WHEN** apply has created pending grill-authority handoffs for an unresolved operator-required node
+- **AND** a later preview/apply writes a new body that changes that node's question, recommendation, class, or term_id
+- **THEN** the earlier pending or answered records SHALL be status `superseded`
+- **AND** `--stage ready` SHALL NOT fail `invalid_provenance` on those superseded records
+- **AND** `--stage ready` SHALL still require a current binding for any remaining unresolved operator-required node
+
+#### Scenario: Editor rewrite without apply does not supersede
+
+- **WHEN** an editor changes a live node's definition and recomputes the fence
+- **AND** no apply has superseded the existing pending or answered grill-authority handoff
+- **THEN** `pipeline triage N --stage ready` SHALL exit 2 with `invalid_provenance`
+- **AND** labels SHALL be unchanged
+
+#### Scenario: Answered binding that still matches the applied node is kept
+
+- **WHEN** apply writes a body whose live node stays resolved with an existing answered grill-authority handoff
+- **AND** that node's definition digest still matches the answered binding
+- **THEN** that handoff SHALL remain `answered`
+- **AND** `--stage ready` SHALL accept that provenance
 
 ---
 

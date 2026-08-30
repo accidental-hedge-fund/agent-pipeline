@@ -24,7 +24,7 @@ import {
   type GrillFingerprint,
   type ProviderConfigIdentity,
 } from "./grill-fingerprint.ts";
-import { createPendingGrillHandoffs } from "./grill-handoff.ts";
+import { createPendingGrillHandoffs, supersedeStaleGrillHandoffs } from "./grill-handoff.ts";
 import { sha256Prefixed } from "./grill-hash.ts";
 import {
   defaultGrillProposalKeyDeps,
@@ -449,6 +449,20 @@ export async function runRefineSpecApply(
     await deps.updateIssueBody(issueNumber, envelope.proposal.body);
   } catch (err) {
     return fail(deps, `GitHub body write failed: ${(err as Error).message}`, 1);
+  }
+  const superseded = await supersedeStaleGrillHandoffs(
+    deps.repoDir,
+    {
+      issueNumber,
+      artifact: envelope.proposal.artifact,
+      proposedBody: envelope.proposal.body,
+      frontierFp: envelope.proposal.artifact.fingerprint.planning_treatment_sha256,
+      currentHandoffs: created.created,
+    },
+    deps.handoffStore,
+  );
+  if (!superseded.ok) {
+    return fail(deps, `handoff supersede failed: ${superseded.reason}`, 1);
   }
   nonceStore.consume(envelope.nonce);
   deps.log(`[pipeline refine-spec] applied Decisions body to #${issueNumber}`);

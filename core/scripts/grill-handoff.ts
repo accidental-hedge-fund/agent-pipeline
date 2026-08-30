@@ -13,11 +13,13 @@ import {
 import { sha256Hex, sha256Prefixed } from "./grill-hash.ts";
 import { classifyAuthority, isOperatorRequiredClass } from "./grill-taxonomy.ts";
 import {
+  appendHandoffAudit,
   canCreateHandoff,
   createAndPersistHandoff,
   defaultHandoffStoreDeps,
   listHandoffs,
   saveHandoff,
+  supersedeHandoff,
   type CreateHandoffInput,
   type HandoffClass,
   type HandoffStoreDeps,
@@ -64,6 +66,134 @@ export function liveNodeMatchesGrillBinding(
   definitionSha256: string,
 ): boolean {
   return hexDigest(nodeDefinitionDigest(node)) === hexDigest(definitionSha256);
+}
+
+/** True when a pending/answered grill-authority record is the applied artifact's current binding. */
+export function isCurrentGrillAuthorityHandoff(
+  handoff: HumanQuestionHandoff,
+  artifact: DecisionsArtifact,
+  currentIdentities: ReadonlySet<string>,
+): boolean {
+  if (handoff.status === "superseded" || handoff.superseded_by) return false;
+  if (handoff.status !== "pending" && handoff.status !== "answered") return false;
+  if (!isGrillAuthorityDeclaration(handoff.declaration_identity)) return false;
+  const identity = handoff.declaration_identity ?? "";
+  if (currentIdentities.has(identity)) return true;
+  if (handoff.status !== "answered") return false;
+  const decl = parseGrillDeclaration(identity);
+  if (!decl) return false;
+  const live = artifact.nodes.find((n) => n.id === decl.nodeId);
+  if (!live) return false;
+  if (live.provenance.settled_by !== "handoff") return false;
+  if (live.provenance.reference !== `handoff:${handoff.handoff_id}`) return false;
+  return liveNodeMatchesGrillBinding(live, decl.definitionSha256);
+}
+
+function currentGrillDeclarationIdentities(input: {
+  artifact: DecisionsArtifact;
+  proposedBody: string;
+  frontierFp: string;
+  issueNumber: number;
+}): Set<string> {
+  const identities = new Set<string>();
+  for (const created of grillAuthorityCreateInputs({
+    domain: "unused",
+    repo: "unused",
+    issueNumber: input.issueNumber,
+    artifact: input.artifact,
+    proposedBody: input.proposedBody,
+    frontierFp: input.frontierFp,
+  })) {
+    if (created.declaration_identity) identities.add(created.declaration_identity);
+  }
+  return identities;
+}
+
+function nowIso(): string {
+  return new Date().toISOString().replace(/\.\d+Z$/, "Z");
+}
+
+/**
+ * After an applied refinement writes a new body, mark prior pending/answered
+ * grill-authority records superseded unless they are still the current binding.
+ * Pending/answered mismatches stay fail-closed until this explicit supersession.
+ */
+export async function supersedeStaleGrillHandoffs(
+  repoDir: string,
+  input: {
+    issueNumber: number;
+    artifact: DecisionsArtifact;
+    proposedBody: string;
+    frontierFp: string;
+    currentHandoffs: HumanQuestionHandoff[];
+  },
+  deps?: HandoffStoreDeps,
+): Promise<{ ok: true; superseded: HumanQuestionHandoff[] } | { ok: false; reason: string }> {
+  const store = deps ?? defaultHandoffStoreDeps;
+  const currentIdentities = currentGrillDeclarationIdentities(input);
+  for (const h of input.currentHandoffs) {
+    if (h.declaration_identity) currentIdentities.add(h.declaration_identity);
+  }
+  const replacementByNode = new Map<string, HumanQuestionHandoff>();
+  for (const h of input.currentHandoffs) {
+    const decl = parseGrillDeclaration(h.declaration_identity ?? "");
+    if (decl) replacementByNode.set(decl.nodeId, h);
+  }
+  try {
+    const existing = await listHandoffs(
+      repoDir,
+      { issue: input.issueNumber, status: ["pending", "answered"] },
+      store,
+    );
+    for (const h of existing) {
+      if (h.status !== "pending") continue;
+      if (!h.declaration_identity || !currentIdentities.has(h.declaration_identity)) continue;
+      const decl = parseGrillDeclaration(h.declaration_identity);
+      if (decl && !replacementByNode.has(decl.nodeId)) replacementByNode.set(decl.nodeId, h);
+    }
+    const superseded: HumanQuestionHandoff[] = [];
+    for (const prior of existing) {
+      if (!isGrillAuthorityDeclaration(prior.declaration_identity)) continue;
+      if (isCurrentGrillAuthorityHandoff(prior, input.artifact, currentIdentities)) continue;
+      const decl = parseGrillDeclaration(prior.declaration_identity ?? "");
+      const replacement = decl ? replacementByNode.get(decl.nodeId) : undefined;
+      if (replacement && replacement.handoff_id === prior.handoff_id) continue;
+      let nextPrior: HumanQuestionHandoff;
+      if (replacement) {
+        const linked = supersedeHandoff({ prior, replacement });
+        nextPrior = linked.prior;
+        await saveHandoff(repoDir, linked.prior, store);
+        await saveHandoff(repoDir, linked.replacement, store);
+        replacementByNode.set(decl!.nodeId, linked.replacement);
+      } else {
+        nextPrior = { ...prior, status: "superseded", superseded_by: null };
+        await saveHandoff(repoDir, nextPrior, store);
+      }
+      await appendHandoffAudit(
+        repoDir,
+        {
+          schema_version: 1,
+          at: nowIso(),
+          op: "supersede",
+          handoff_id: prior.handoff_id,
+          issue_number: input.issueNumber,
+          detail: replacement
+            ? `applied refinement superseded grill-authority binding with ${replacement.handoff_id}`
+            : "applied refinement superseded grill-authority binding with no replacement node",
+          status_after: "superseded",
+          evidence: {
+            superseded_by: replacement?.handoff_id ?? null,
+            node_id: decl?.nodeId ?? null,
+          },
+        },
+        store,
+      );
+      superseded.push(nextPrior);
+    }
+    return { ok: true, superseded };
+  } catch (err) {
+    return { ok: false, reason: (err as Error).message };
+  }
 }
 
 export interface GrillHandoffCreateInput {
