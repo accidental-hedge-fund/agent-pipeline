@@ -374,7 +374,7 @@ Pack-done SHALL mean `.agent-pipeline/frg/<X.Y.Z>/latest.json` has `pass: true` 
 
 When `latest.json` has `pass: false` because HMAC was omitted, and the bound pack is structurally eligible, Tugboat SHALL treat that tick as `attest`. It SHALL NOT treat omitted-HMAC `pass: false` as pack-fail. `status: "awaiting_frg_attestation"` or unsigned eligible artifacts paired with that omitted-HMAC `pass: false` SHALL be `attest`. Tugboat SHALL NOT fail-close on `pass: false` before those attest signals. A signed `latest.json` `pass: false` SHALL be pack-fail only when that artifact is bound to the current request and the current prepare result is not `in_progress` with unsigned eligible artifacts. A prior candidate's signed `pass: false` SHALL NOT fail a current in-progress unsigned-eligible tick.
 
-A `latest.json` `pass: false` caused by a real ineligible scoreboard (composition missing, required scenarios fail, wrong pack, engine-class over threshold) SHALL remain pack-fail. `status: "complete"` is pack-done only after an open release PR for that version is verified; a bare complete response with no open release PR is pack-fail. Pack-fail SHALL mean a failed or missing FRG status that is not omitted-HMAC-only, `latest.json` `pass: false` after a terminal **ineligible** score, attestor child failure or missing producer credential after unsigned artifacts exist, or wait-budget exhaustion while status stays `in_progress` **and the bound pack loop is not live**. Wait-budget exhaustion while status stays `in_progress` and the bound pack loop is live SHALL NOT be pack-fail. Unreadable or malformed `lock.json` or `ledger.json` SHALL NOT count as not-live. Tugboat SHALL keep re-invoking and heartbeat while liveness is unknown. The bound loop is not live only after a positive dead-or-missing lock pid and a positive terminal-or-missing ledger. On pack-fail Tugboat SHALL fail the frg-pack phase and SHALL NOT invoke `pipeline release` for that version.
+A `latest.json` `pass: false` caused by a real ineligible scoreboard (composition missing, required scenarios fail, wrong pack, engine-class over threshold) SHALL remain pack-fail. `status: "complete"` is pack-done only after an open release PR for that version is verified; a bare complete response with no open release PR is pack-fail. Pack-fail SHALL mean a failed or missing FRG status that is not omitted-HMAC-only, `latest.json` `pass: false` after a terminal **ineligible** score, attestor child failure or missing producer credential after unsigned artifacts exist, or wait-budget exhaustion while status stays `in_progress` **and the bound pack loop is not live**. Wait-budget exhaustion while status stays `in_progress` and the bound pack loop is live SHALL NOT be pack-fail. Live and not-live SHALL use acknowledged-process liveness: a valid `loop_run_handoff` for that exact loop, plus the exact PID, process-start identity, boot identity, and a fresh heartbeat. A non-terminal ledger SHALL NOT count as live. Unreadable identity evidence SHALL consume the bounded observation window and then fail closed; it SHALL NOT keep wait-budget from applying as not-live after that window. On pack-fail Tugboat SHALL fail the frg-pack phase and SHALL NOT invoke `pipeline release` for that version.
 
 #### Scenario: Request binds the post-train integration tip
 
@@ -548,7 +548,7 @@ A `latest.json` `pass: false` caused by a real ineligible scoreboard (compositio
 #### Scenario: Live-loop wait expiry is not pack-fail
 
 - **WHEN** prepare returns `status: "in_progress"` for bound loop `L`
-- **AND** `L` is live (`lock.json` pid alive or ledger not terminal)
+- **AND** `L` is live under acknowledged-process liveness
 - **AND** the numeric FRG wait attempt cap is exhausted
 - **THEN** Tugboat SHALL NOT fail the FRG pack phase for wait-budget exhaustion
 - **AND** it SHALL keep re-invoking the same request
@@ -558,7 +558,7 @@ A `latest.json` `pass: false` caused by a real ineligible scoreboard (compositio
 #### Scenario: Dead-loop wait expiry remains pack-fail
 
 - **WHEN** prepare returns `status: "in_progress"` for bound loop `L`
-- **AND** `L` is not live (lock pid dead or missing, and ledger terminal or missing)
+- **AND** `L` is not live
 - **AND** the numeric FRG wait attempt cap is exhausted
 - **THEN** Tugboat SHALL fail the FRG pack phase
 - **AND** it SHALL NOT invoke `pipeline release` for that version
@@ -566,11 +566,20 @@ A `latest.json` `pass: false` caused by a real ineligible scoreboard (compositio
 #### Scenario: Unreadable liveness at cap is not pack-fail
 
 - **WHEN** prepare returns `status: "in_progress"` for bound loop `L`
-- **AND** lock or ledger state for `L` is unreadable or malformed
-- **AND** the numeric FRG wait attempt cap is exhausted
+- **AND** identity evidence for `L` is unreadable or malformed
+- **AND** the bounded observation window has not expired
 - **THEN** Tugboat SHALL NOT fail the FRG pack phase for wait-budget exhaustion
-- **AND** it SHALL keep re-invoking the same request
-- **AND** it SHALL NOT invoke `pipeline release` until pack-done
+- **AND** it SHALL keep observing `L`
+- **AND** it SHALL NOT invoke `pipeline release` until pack-done or a later fail-closed identity error
+
+#### Scenario: Unreadable identity after the observation window is pack-fail
+
+- **WHEN** prepare returns `status: "in_progress"` for bound loop `L`
+- **AND** identity evidence for `L` is unreadable or malformed
+- **AND** the bounded observation window has expired
+- **THEN** Tugboat SHALL fail the FRG pack phase with a typed observer or identity error
+- **AND** it SHALL NOT keep re-invoking as if `L` were live
+- **AND** it SHALL NOT invoke `pipeline release` for that version
 
 ### Requirement: Tugboat default release and promote argv SHALL omit skip-frg
 
@@ -938,25 +947,43 @@ When Tugboat is the installed composer, its content digest SHALL match `examples
 
 ### Requirement: Tugboat FRG pack wait SHALL outlive the bound pack loop
 
-Tugboat SHALL treat a factory-gate pack wait as wait-until-terminal while the bound pack loop is live, not as a CI-length poll. The bound pack loop is live when the durable loop run `lock.json` for the prepare `loop_run_id` has a pid that is still alive, or the bound loop ledger is not terminal. While prepare status is `in_progress` and that loop is live, Tugboat SHALL keep re-invoking the same `factory-release prepare` request, SHALL rewrite `state.json` with `phase` `frg-pack` and `status` `running` on each wait tick (heartbeat), SHALL log a heartbeat, and SHALL NOT apply the numeric FRG attempt cap as pack-fail. Unreadable or malformed `lock.json` or `ledger.json` SHALL NOT count as not-live. Tugboat SHALL keep re-invoking and heartbeat while liveness is unknown. The bound loop is not live only after a positive dead-or-missing lock pid and a positive terminal-or-missing ledger. Default FRG wait SHALL NOT copy the CI wait fail cap (`RELEASE_WAIT_ATTEMPTS` × `RELEASE_WAIT_SLEEP_S`, 30×40s) as the live-loop stop. A numeric FRG attempt cap MAY remain only for the not-live case. Tugboat SHALL NOT require a human re-detach to finish an in-progress pack. Tugboat SHALL NOT kill the pack loop. CI / release-PR check wait SHALL stay a CI poll.
+Tugboat SHALL treat a factory-gate pack wait as wait-until-terminal while the bound pack loop is live, not as a CI-length poll. Live SHALL mean the authoritative pack-loop liveness status from candidate prepare JSON field `liveness` (acknowledged-process identity plus a fresh heartbeat). Tugboat SHALL NOT keep a Python ledger-or-pid classifier as a second law. A non-terminal ledger SHALL NOT prove live. While prepare status is `in_progress` and that loop is live, Tugboat SHALL keep re-invoking the same `factory-release prepare` request, SHALL rewrite `state.json` with `phase` `frg-pack` and `status` `running` on each wait tick (heartbeat), SHALL log a heartbeat, and SHALL NOT apply the numeric FRG attempt cap as pack-fail. Unreadable identity evidence SHALL consume the bounded observation window and then fail closed with a typed observer or identity error. It SHALL NOT count as live after that window. Default FRG wait SHALL NOT copy the CI wait fail cap (`RELEASE_WAIT_ATTEMPTS` × `RELEASE_WAIT_SLEEP_S`, 30×40s) as the live-loop stop. A numeric FRG attempt cap MAY remain only for the not-live case. Tugboat SHALL NOT require a human re-detach to finish an in-progress pack. Tugboat SHALL NOT kill the pack loop. CI / release-PR check wait SHALL stay a CI poll.
 
-A regression test SHALL fail if `in_progress` plus a live bound loop is classified as terminal fail after N short sleeps. Tests SHALL inject fixtures and SHALL NOT start a live pack.
+A regression test SHALL fail if `in_progress` plus a live bound loop is classified as terminal fail after N short sleeps. A regression test SHALL fail if dead pid plus no `ledger.stop` plus no terminal events classifies as live. Tests SHALL inject fixtures and SHALL NOT start a live pack.
 
 #### Scenario: In-progress plus live loop continues after N short sleeps
 
 - **WHEN** prepare status is `in_progress` for bound loop `L`
-- **AND** `L` is live
+- **AND** `L` is live under acknowledged-process liveness
 - **AND** the wait decision is evaluated after N short sleeps at a numeric attempt cap of N
 - **THEN** the decision SHALL be continue, not terminal fail
 - **AND** an automated check SHALL fail if that case is classified as pack-fail
+
+#### Scenario: In-progress plus dead pid and open ledger does not continue as live
+
+- **WHEN** prepare status is `in_progress` for bound loop `L`
+- **AND** lock pid for `L` is dead or missing
+- **AND** the ledger for `L` is present without `stop`
+- **AND** events for `L` are not terminal
+- **THEN** the wait decision SHALL NOT treat `L` as live
+- **AND** wait-budget expiry MAY be pack-fail
 
 #### Scenario: In-progress plus unreadable liveness continues after N short sleeps
 
 - **WHEN** prepare status is `in_progress` for bound loop `L`
-- **AND** lock or ledger state for `L` is unreadable or malformed
+- **AND** identity evidence for `L` is unreadable or malformed
+- **AND** the bounded observation window has not expired
 - **AND** the wait decision is evaluated after N short sleeps at a numeric attempt cap of N
 - **THEN** the decision SHALL be continue, not terminal fail
-- **AND** an automated check SHALL fail if that case is classified as pack-fail
+- **AND** an automated check SHALL fail if that in-window case is classified as pack-fail
+
+#### Scenario: In-progress plus unreadable identity fails closed after the observation window
+
+- **WHEN** prepare status is `in_progress` for bound loop `L`
+- **AND** identity evidence for `L` is unreadable or malformed
+- **AND** the bounded observation window has expired
+- **THEN** the decision SHALL be fail closed with a typed observer or identity error
+- **AND** an automated check SHALL fail if that case is classified as wait-continue-as-live
 
 #### Scenario: State stays frg-pack running while the bound loop is live
 
@@ -968,7 +995,7 @@ A regression test SHALL fail if `in_progress` plus a live bound loop is classifi
 #### Scenario: Re-detach is not required to finish a live pack
 
 - **WHEN** a 2-item factory-gate pack is still `in_progress` after 20 minutes
-- **AND** the bound loop is live
+- **AND** the bound loop is live under acknowledged-process liveness
 - **THEN** the same Tugboat process SHALL keep ticking prepare until pack-done or a real pack-fail
 - **AND** it SHALL NOT require a human to re-detach Tugboat
 
