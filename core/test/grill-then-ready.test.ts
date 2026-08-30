@@ -49,11 +49,13 @@ import {
   canCreateHandoff,
   createAndPersistHandoff,
   answerAndPersistHandoff,
+  loadHandoff,
   type HandoffStoreDeps,
   type HumanQuestionHandoff,
 } from "../scripts/human-question-handoff.ts";
 import {
   grillAuthorityCreateInputs,
+  materializeGrillAnswer,
   materializeGrillNode,
   isGrillAuthorityDeclaration,
   parseGrillDeclaration,
@@ -937,6 +939,148 @@ test("grill: materialize patches one node; drift refuses; heal skips rewrite", (
   });
   assert.equal(heal.ok, true);
   if (heal.ok) assert.equal(heal.wrote, false);
+});
+
+test("grill: artifact-only body edit refuses answer with no write and handoff stays pending", async () => {
+  const spec = "## Summary\nX\n";
+  const nodes = canonicalThinIssueNodes();
+  const art = artifact(nodes, spec);
+  const body = embedDecisionsInBody(spec, art);
+  const store = memoryHandoffStore();
+  const input = grillAuthorityCreateInputs({
+    domain: "d",
+    repo: "acme/r",
+    issueNumber: 42,
+    artifact: art,
+    proposedBody: body,
+    frontierFp: "fp",
+  })[0]!;
+  const created = await createAndPersistHandoff("/tmp/repo", input, store);
+  assert.equal(created.ok, true);
+  if (!created.ok) return;
+  const tamperedNodes = art.nodes.map((n, i) =>
+    i === 0 ? { ...n, recommendation: "tampered recommendation" } : n,
+  );
+  const tamperedBody = embedDecisionsInBody(spec, { ...art, nodes: tamperedNodes });
+  assert.equal(extractSpecCore(body), extractSpecCore(tamperedBody));
+  assert.notEqual(sha256Prefixed(body), sha256Prefixed(tamperedBody));
+  let writes = 0;
+  const result = await answerAndPersistHandoff(
+    "/tmp/repo",
+    42,
+    created.handoff.handoff_id,
+    {
+      decision: "answer",
+      actor: "alice",
+      identitySource: "gh",
+      authenticated: true,
+      answerText: "yes",
+    },
+    store,
+    {
+      materialize: async (h, text) => {
+        const r = materializeGrillNode({ liveBody: tamperedBody, handoff: h, answerText: text });
+        if (r.ok && r.wrote) writes++;
+        return r.ok ? { ok: true as const, wrote: r.wrote } : r;
+      },
+    },
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.code, "body_hash_drift");
+  assert.equal(writes, 0);
+  const loaded = await loadHandoff("/tmp/repo", 42, created.handoff.handoff_id, store);
+  assert.equal(loaded.ok, true);
+  if (loaded.ok) assert.equal(loaded.handoff.status, "pending");
+});
+
+test("grill: successful materialize rebinds pending siblings to the new body hash", async () => {
+  const spec = "## Summary\nX\n";
+  const nodes = canonicalThinIssueNodes();
+  const art = artifact(nodes, spec);
+  const body = embedDecisionsInBody(spec, art);
+  const store = memoryHandoffStore();
+  const inputs = grillAuthorityCreateInputs({
+    domain: "d",
+    repo: "acme/r",
+    issueNumber: 42,
+    artifact: art,
+    proposedBody: body,
+    frontierFp: "fp",
+  });
+  assert.ok(inputs.length >= 2);
+  const firstCreated = await createAndPersistHandoff("/tmp/repo", inputs[0]!, store);
+  const siblingCreated = await createAndPersistHandoff("/tmp/repo", inputs[1]!, store);
+  assert.equal(firstCreated.ok, true);
+  assert.equal(siblingCreated.ok, true);
+  if (!firstCreated.ok || !siblingCreated.ok) return;
+  let live = body;
+  let writes = 0;
+  const first = await answerAndPersistHandoff(
+    "/tmp/repo",
+    42,
+    firstCreated.handoff.handoff_id,
+    {
+      decision: "answer",
+      actor: "alice",
+      identitySource: "gh",
+      authenticated: true,
+      answerText: "yes",
+    },
+    store,
+    {
+      materialize: async (h, text) => {
+        const r = await materializeGrillAnswer(h, text, {
+          getIssueBody: async () => live,
+          updateIssueBody: async (_n, next) => {
+            writes++;
+            live = next;
+          },
+          repoDir: "/tmp/repo",
+          handoffStore: store,
+        });
+        return r.ok ? { ok: true as const, wrote: r.wrote } : r;
+      },
+    },
+  );
+  assert.equal(first.ok, true, first.ok ? "" : first.reason);
+  assert.equal(writes, 1);
+  const rebound = await loadHandoff("/tmp/repo", 42, siblingCreated.handoff.handoff_id, store);
+  assert.equal(rebound.ok, true);
+  if (!rebound.ok) return;
+  assert.equal(rebound.handoff.status, "pending");
+  const reboundDecl = parseGrillDeclaration(rebound.handoff.declaration_identity ?? "");
+  assert.ok(reboundDecl);
+  assert.equal(reboundDecl?.bodySha256, sha256Prefixed(live).slice("sha256:".length));
+  assert.equal(rebound.handoff.scope.content_hashes?.[0], sha256Prefixed(live));
+  const second = await answerAndPersistHandoff(
+    "/tmp/repo",
+    42,
+    siblingCreated.handoff.handoff_id,
+    {
+      decision: "answer",
+      actor: "alice",
+      identitySource: "gh",
+      authenticated: true,
+      answerText: "yes",
+    },
+    store,
+    {
+      materialize: async (h, text) => {
+        const r = await materializeGrillAnswer(h, text, {
+          getIssueBody: async () => live,
+          updateIssueBody: async (_n, next) => {
+            writes++;
+            live = next;
+          },
+          repoDir: "/tmp/repo",
+          handoffStore: store,
+        });
+        return r.ok ? { ok: true as const, wrote: r.wrote } : r;
+      },
+    },
+  );
+  assert.equal(second.ok, true, second.ok ? "" : second.reason);
+  assert.equal(writes, 2);
 });
 
 test("grill: persist-after-write failure heals on retry without a second write", async () => {

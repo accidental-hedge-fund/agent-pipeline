@@ -329,7 +329,7 @@ When shared terminology required for implementation is missing, preview SHALL in
 
 ### Requirement: Operator answers SHALL use hash-bound `pipeline handoff answer` and SHALL materialize into the body
 
-Pipeline SHALL extend the existing authenticated `pipeline handoff answer` boundary for pre-admission Decision nodes. It SHALL NOT create a second answer ledger or a new handoff CLI verb. Each handoff and answer SHALL bind repository, issue, node ID, frontier fingerprint, and source body hash. When no PR or worktree tip exists, `candidate_sha` MAY be omitted. Create for these nodes SHALL use a policy-bound authority gate whose evidence is that binding; it SHALL NOT weaken mid-flight human-decision-required SHA evidence. A successful answer SHALL deterministically patch that node in the issue body, record the handoff provenance reference, and keep render/artifact identity. Bound-hash drift SHALL exit 2 with no mutation. GitHub review comments and issue comments SHALL NOT settle nodes.
+Pipeline SHALL extend the existing authenticated `pipeline handoff answer` boundary for pre-admission Decision nodes. It SHALL NOT create a second answer ledger or a new handoff CLI verb. Each handoff and answer SHALL bind repository, issue, node ID, frontier fingerprint, and source body hash. When no PR or worktree tip exists, `candidate_sha` MAY be omitted. Create for these nodes SHALL use a policy-bound authority gate whose evidence is that binding; it SHALL NOT weaken mid-flight human-decision-required SHA evidence. A successful answer SHALL deterministically patch that node in the issue body, record the handoff provenance reference, and keep render/artifact identity. Bound-hash drift SHALL exit 2 with no mutation, including when only the Decisions artifact or rendered section changed. Spec-core equality SHALL NOT authorize a drifted full body. After a successful materialize write, remaining pending sibling handoffs SHALL bind the new body hash. GitHub review comments and issue comments SHALL NOT settle nodes.
 
 #### Scenario: Authenticated answer settles an operator-required node
 
@@ -343,6 +343,19 @@ Pipeline SHALL extend the existing authenticated `pipeline handoff answer` bound
 - **WHEN** the live body hash differs from the handoff binding
 - **THEN** the answer SHALL be refused
 - **AND** the issue body SHALL be unchanged
+
+#### Scenario: Artifact-only body edit refuses materialize
+
+- **WHEN** the live body SHA-256 differs from the handoff binding because only the Decisions artifact or rendered `## Decisions` section changed
+- **THEN** `pipeline handoff answer` SHALL exit 2
+- **AND** the issue body SHALL be unchanged
+- **AND** handoff status SHALL remain `pending`
+
+#### Scenario: Successful materialize rebinds pending siblings
+
+- **WHEN** a grill-authority answer writes a new issue body
+- **THEN** remaining pending grill-authority handoffs for that issue SHALL bind the new body SHA-256
+- **AND** the answered handoff SHALL keep the body hash it authorized
 
 #### Scenario: Comment-only answer does not settle
 

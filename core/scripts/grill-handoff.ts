@@ -6,7 +6,6 @@ import {
   extractSpecCore,
   parseDecisionsFromBody,
   patchNodeInArtifact,
-  specCoreSha256,
   type DecisionNode,
   type DecisionsArtifact,
 } from "./grill-decisions.ts";
@@ -15,6 +14,9 @@ import { classifyAuthority, isOperatorRequiredClass } from "./grill-taxonomy.ts"
 import {
   canCreateHandoff,
   createAndPersistHandoff,
+  defaultHandoffStoreDeps,
+  listHandoffs,
+  saveHandoff,
   type CreateHandoffInput,
   type HandoffClass,
   type HandoffStoreDeps,
@@ -65,7 +67,6 @@ export interface GrillHandoffCreateInput {
 
 export function grillAuthorityCreateInputs(input: GrillHandoffCreateInput): CreateHandoffInput[] {
   const bodySha = sha256Prefixed(input.proposedBody);
-  const specCore = specCoreSha256(input.proposedBody);
   const out: CreateHandoffInput[] = [];
   for (const node of input.artifact.nodes) {
     const classified = classifyAuthority(node.class);
@@ -85,7 +86,7 @@ export function grillAuthorityCreateInputs(input: GrillHandoffCreateInput): Crea
       tip_present: false,
       policy_bound_authority_gate: true,
       human_decision_required: null,
-      content_hashes: [bodySha, input.frontierFp, node.id, specCore],
+      content_hashes: [bodySha, input.frontierFp, node.id],
       declaration_identity: grillDeclarationIdentity({
         nodeId: node.id,
         frontierFp: input.frontierFp,
@@ -122,6 +123,9 @@ export async function createPendingGrillHandoffs(
 export interface GrillMaterializeDeps {
   getIssueBody(issueNumber: number): Promise<string>;
   updateIssueBody(issueNumber: number, body: string): Promise<void>;
+  /** When set, pending sibling grill-authority handoffs rebind to the new body hash. */
+  repoDir?: string;
+  handoffStore?: HandoffStoreDeps;
 }
 
 export type GrillMaterializeResult =
@@ -129,9 +133,8 @@ export type GrillMaterializeResult =
   | { ok: false; reason: string; code: "body_hash_drift" | "invalid_artifact" | "node_missing" | "write_failed" };
 
 /**
- * Deterministically patch one operator-required node. Exact body-hash match is
- * the first-answer path. Later sibling answers keep the apply-time spec core
- * and node identity; only resolution/provenance/render may change.
+ * Deterministically patch one operator-required node. Exact live-body SHA-256
+ * match is required. Spec-core equality does not authorize a drifted body.
  */
 export function materializeGrillNode(input: {
   liveBody: string;
@@ -144,7 +147,6 @@ export function materializeGrillNode(input: {
   }
   const liveHash = sha256Prefixed(input.liveBody);
   const boundHash = input.handoff.scope.content_hashes?.[0];
-  const boundSpecCore = input.handoff.scope.content_hashes?.[3];
   const parsed = parseDecisionsFromBody(input.liveBody);
   if (!parsed.ok) {
     return { ok: false, reason: parsed.reason, code: "invalid_artifact" };
@@ -158,14 +160,11 @@ export function materializeGrillNode(input: {
     return { ok: true, body: input.liveBody, wrote: false, artifact: parsed.artifact };
   }
   if (liveHash !== boundHash) {
-    const liveCore = specCoreSha256(input.liveBody);
-    if (!boundSpecCore || liveCore !== boundSpecCore) {
-      return {
-        ok: false,
-        reason: "live issue body hash does not match the grill-authority binding",
-        code: "body_hash_drift",
-      };
-    }
+    return {
+      ok: false,
+      reason: "live issue body hash does not match the grill-authority binding",
+      code: "body_hash_drift",
+    };
   }
   if (!isOperatorRequiredClass(node.class) && classifyAuthority(node.class).operatorRequired) {
     // unknown class still operator-required via classifyAuthority
@@ -188,6 +187,46 @@ export function materializeGrillNode(input: {
   return { ok: true, body: nextBody, wrote: true, artifact };
 }
 
+/**
+ * Rebind remaining pending grill-authority handoffs on the same issue to
+ * `newBody`'s SHA-256. The answered record keeps the hash it authorized.
+ */
+export async function refreshPendingSiblingGrillHandoffs(
+  repoDir: string,
+  input: { answeredHandoff: HumanQuestionHandoff; newBody: string },
+  deps: HandoffStoreDeps = defaultHandoffStoreDeps,
+): Promise<void> {
+  const newBodySha = sha256Prefixed(input.newBody);
+  const pending = await listHandoffs(
+    repoDir,
+    { issue: input.answeredHandoff.issue_number, status: "pending" },
+    deps,
+  );
+  for (const h of pending) {
+    if (h.handoff_id === input.answeredHandoff.handoff_id) continue;
+    if (!isGrillAuthorityDeclaration(h.declaration_identity)) continue;
+    const decl = parseGrillDeclaration(h.declaration_identity);
+    if (!decl) continue;
+    const nextIdentity = grillDeclarationIdentity({
+      nodeId: decl.nodeId,
+      frontierFp: decl.frontierFp,
+      bodySha256: newBodySha,
+    });
+    const hashes = [...(h.scope.content_hashes ?? [])];
+    if (h.declaration_identity === nextIdentity && hashes[0] === newBodySha) continue;
+    hashes[0] = newBodySha;
+    await saveHandoff(
+      repoDir,
+      {
+        ...h,
+        declaration_identity: nextIdentity,
+        scope: { ...h.scope, content_hashes: hashes },
+      },
+      deps,
+    );
+  }
+}
+
 export async function materializeGrillAnswer(
   handoff: HumanQuestionHandoff,
   answerText: string,
@@ -196,11 +235,27 @@ export async function materializeGrillAnswer(
   const liveBody = await deps.getIssueBody(handoff.issue_number);
   const planned = materializeGrillNode({ liveBody, handoff, answerText });
   if (!planned.ok) return planned;
-  if (!planned.wrote) return planned;
-  try {
-    await deps.updateIssueBody(handoff.issue_number, planned.body);
-  } catch (err) {
-    return { ok: false, reason: (err as Error).message, code: "write_failed" };
+  if (planned.wrote) {
+    try {
+      await deps.updateIssueBody(handoff.issue_number, planned.body);
+    } catch (err) {
+      return { ok: false, reason: (err as Error).message, code: "write_failed" };
+    }
+  }
+  if (deps.repoDir) {
+    try {
+      await refreshPendingSiblingGrillHandoffs(
+        deps.repoDir,
+        { answeredHandoff: handoff, newBody: planned.body },
+        deps.handoffStore,
+      );
+    } catch (err) {
+      return {
+        ok: false,
+        reason: `pending sibling rebind failed: ${(err as Error).message}`,
+        code: "write_failed",
+      };
+    }
   }
   return planned;
 }

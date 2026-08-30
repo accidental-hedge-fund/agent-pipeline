@@ -28,7 +28,7 @@ Pipeline SHALL represent operator-required pre-admission Decision nodes as human
 
 ### Requirement: A successful grill-authority answer SHALL materialize into the issue body
 
-When an eligible authenticated actor answers a pending grill-authority handoff, Pipeline SHALL re-fetch the issue body, SHALL require the live body hash to match the handoff binding, and SHALL deterministically patch only that node in the embedded Decisions artifact (resolution, provenance reference, and derived `## Decisions` render). Bound-hash drift SHALL refuse the answer with no body mutation. GitHub comments SHALL NOT perform this materialize. The item SHALL NOT transition to `pipeline:ready` solely because the answer was recorded; `--stage ready` remains a separate deterministic request.
+When an eligible authenticated actor answers a pending grill-authority handoff, Pipeline SHALL re-fetch the issue body, SHALL require the live full-body SHA-256 to match the handoff binding, and SHALL deterministically patch only that node in the embedded Decisions artifact (resolution, provenance reference, and derived `## Decisions` render). Matching an extracted spec-core hash SHALL NOT authorize a drifted full body. Bound-hash drift SHALL refuse the answer with no body mutation. GitHub comments SHALL NOT perform this materialize. The item SHALL NOT transition to `pipeline:ready` solely because the answer was recorded; `--stage ready` remains a separate deterministic request. After a successful GitHub body write, Pipeline SHALL refresh remaining pending grill-authority handoffs for that issue so each binds the new full-body SHA-256. The answered record SHALL keep the body hash it authorized.
 
 #### Scenario: Matching hash materializes the node
 
@@ -44,6 +44,19 @@ When an eligible authenticated actor answers a pending grill-authority handoff, 
 - **THEN** the answer SHALL be refused
 - **AND** the issue body SHALL be unchanged
 - **AND** handoff status SHALL remain `pending`
+
+#### Scenario: Artifact-only body edit refuses the answer
+
+- **WHEN** the live body SHA-256 differs from the handoff binding because only the Decisions artifact or rendered `## Decisions` section changed
+- **THEN** the answer SHALL be refused
+- **AND** the issue body SHALL be unchanged
+- **AND** handoff status SHALL remain `pending`
+
+#### Scenario: Successful materialize rebinds pending siblings
+
+- **WHEN** a grill-authority answer writes a new issue body
+- **THEN** remaining pending grill-authority handoffs for that issue SHALL bind the new body SHA-256
+- **AND** the answered handoff SHALL keep the body hash it authorized
 
 #### Scenario: Answer does not flip ready
 

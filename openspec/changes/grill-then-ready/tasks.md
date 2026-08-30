@@ -44,6 +44,7 @@
 - [x] 6.6 Verify concurrent different-payload answers refuse, same payload/`--client-request-id` is idempotent, and a persist-after-write failure heals on retry without a second body write
 - [x] 6.3 Ignore GitHub comments and review comments as settlement, and verify a comment-only fixture leaves the node unresolved and `--stage ready` exits 2
 - [x] 6.4 Do not add `pipeline:ready` as a side effect of answer, and verify labels are unchanged after a successful materialize
+- [x] 6.7 Require exact live-body SHA-256 match on grill-authority answer (no spec-core fallback), rebind pending sibling handoffs after a successful body write, and verify an artifact-only body edit exits 2 with no write and the handoff still pending
 
 ## 7. CONTEXT proposals and ready gate
 

@@ -5218,6 +5218,7 @@ async function main(): Promise<void> {
                       throw new Error(gh.stderr?.trim() || "gh issue edit failed");
                     }
                   },
+                  repoDir,
                 });
                 return out.ok
                   ? { ok: true as const, wrote: out.wrote }
