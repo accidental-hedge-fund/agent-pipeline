@@ -3089,6 +3089,30 @@ test("syncConfig: unknown sibling blocks implementer inference (#1264)", () => {
   assert.match(result.diagnostics.map((d) => d.message).join("\n"), /harnesses\.implementer/);
 });
 
+test("syncConfig: empty explicit implementer model blocks inference (#1264)", () => {
+  const cases = [
+    `models:
+  planning: sonnet
+  fix: ""
+  review: gpt-5.6-terra
+`,
+    `models:
+  planning: sonnet
+  fix: "   "
+  review: gpt-5.6-terra
+`,
+  ];
+  for (const original of cases) {
+    const repo = makeFakeRepo(original, { exact: true });
+    const configPath = path.join(repo, ".github", "pipeline.yml");
+    const result = syncConfig(repo, { apply: true });
+    assert.equal(result.ok, false, original);
+    assert.equal(result.inferenceFailure, true, original);
+    assert.match(result.diagnostics.map((d) => d.message).join("\n"), /harnesses\.implementer/);
+    assert.equal(fs.readFileSync(configPath, "utf8"), original);
+  }
+});
+
 test("syncConfig: review_harness built-in command infers that reviewer (#1264)", () => {
   const original = `models:
   planning: sonnet

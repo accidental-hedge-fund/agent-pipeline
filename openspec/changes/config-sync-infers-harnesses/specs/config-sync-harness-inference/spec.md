@@ -82,7 +82,7 @@ Lets `pipeline config sync` add omitted required harness roles from explicit mod
 
 ### Requirement: Implementer inference SHALL require unanimous classified implementer model evidence
 
-Implementer inference SHALL examine every explicitly configured `models.planning`, `models.implementing`, `models.fix`, `models.intake`, and `models.sweep` field. A missing implementer role SHALL require at least one classified non-`auto` value, and every explicit non-`auto` value for that role SHALL map to the same adapter. Absent fields and explicit `auto` SHALL be ignored. An unknown explicit non-`auto` value or two different classified adapters SHALL leave implementer unresolved.
+Implementer inference SHALL examine every explicitly configured `models.planning`, `models.implementing`, `models.fix`, `models.intake`, and `models.sweep` field. A missing implementer role SHALL require at least one classified non-`auto` value, and every explicit non-`auto` value for that role SHALL map to the same adapter. Absent fields and explicit `auto` SHALL be ignored. An empty or whitespace-only explicit value is unknown evidence, not an absent field. An unknown explicit non-`auto` value or two different classified adapters SHALL leave implementer unresolved.
 
 #### Scenario: One classified implementer field is enough
 
@@ -101,6 +101,13 @@ Implementer inference SHALL examine every explicitly configured `models.planning
 #### Scenario: Unknown sibling blocks implementer inference
 
 - **WHEN** `.github/pipeline.yml` omits `harnesses.implementer` and sets `models.planning: sonnet` and `models.fix` to an unknown alias
+- **AND** the user runs `pipeline config sync --apply`
+- **THEN** the command SHALL write nothing
+- **AND** it SHALL name `harnesses.implementer` as unresolved
+
+#### Scenario: Empty explicit implementer model blocks inference
+
+- **WHEN** `.github/pipeline.yml` omits `harnesses.implementer` and sets `models.planning: sonnet` and `models.fix` to an empty string
 - **AND** the user runs `pipeline config sync --apply`
 - **THEN** the command SHALL write nothing
 - **AND** it SHALL name `harnesses.implementer` as unresolved

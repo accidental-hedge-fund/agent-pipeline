@@ -12,7 +12,7 @@
 
 ## 3. Role inference rules
 
-- [x] 3.1 Infer implementer from unanimous classified `models.planning` / `implementing` / `fix` / `intake` / `sweep` values, and verify one classified field is enough and conflicting or unknown siblings leave implementer unresolved
+- [x] 3.1 Infer implementer from unanimous classified `models.planning` / `implementing` / `fix` / `intake` / `sweep` values, and verify one classified field is enough and conflicting, unknown, or empty explicit siblings leave implementer unresolved
 - [x] 3.2 Infer reviewer from `models.review` and explicit `review_harness.command`, and verify built-in command agreement, custom command without classified review model, and custom-or-built-in plus disagreeing review model all match the spec
 - [x] 3.3 Preserve every declared role and infer only omitted roles, and verify `implementer: grok` plus `models.review: gpt-5.6-terra` writes `reviewer: codex` without changing implementer
 - [x] 3.4 Treat a commented `# harnesses:` block as omitted policy, and verify unambiguous `models:` evidence still infers roles

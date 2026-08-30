@@ -4467,7 +4467,8 @@ function classifyExplicitNonAutoAlias(raw: string | undefined): {
 } {
   if (raw === undefined) return { skip: true, unknown: false };
   const value = raw.trim();
-  if (!value || value === "auto") return { skip: true, unknown: false };
+  // Empty/whitespace is explicit unknown evidence, not an absent field.
+  if (value === "auto") return { skip: true, unknown: false };
   const family = classifyMigrationModelAlias(value);
   if (family === null) return { skip: false, unknown: true };
   return { skip: false, family, unknown: false };
