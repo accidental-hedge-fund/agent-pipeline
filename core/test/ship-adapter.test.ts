@@ -45,7 +45,13 @@ import {
   type ShipReleaseCheckWaitDeps,
 } from "../scripts/stages/ship-release-check-wait.ts";
 import { LOOP_LEDGER_SCHEMA } from "../scripts/loop/types.ts";
-import { isPathInsideCheckout } from "../scripts/factory-release-prepare.ts";
+import {
+  buildFactoryReleaseUnsignedDigestBinding,
+  defaultObserveAttestation,
+  isPathInsideCheckout,
+  type FactoryReleaseFrgPayload,
+  type FactoryReleasePrepareRequest,
+} from "../scripts/factory-release-prepare.ts";
 import {
   runShipCoordinator,
   shipKey,
@@ -56,6 +62,7 @@ import {
   type ShipTrainEvidence,
 } from "../scripts/stages/ship.ts";
 import {
+  computeAttestorRunId,
   computeFrgEvidence,
   FRG_PACK_MANIFEST,
   FRG_UNIT_TEST_ATTESTATION_KEY,
@@ -1973,6 +1980,21 @@ test("classifyFrgPackWaitDecision: live in_progress at cap is continue (#1150)",
     classifyFrgPackWaitDecision({ tick: "retry", live: false, attempt: 1, cap: 2 }),
     "continue",
   );
+  assert.equal(
+    classifyFrgPackWaitDecision({ tick: "attest", live: false, attempt: 1, cap: 2 }),
+    "continue",
+  );
+  assert.equal(
+    classifyFrgPackWaitDecision({
+      tick: "attest",
+      live: false,
+      attempt: 1,
+      cap: 2,
+      attestAllowanceSpent: true,
+    }),
+    "fail",
+    "spent attest allowance must not continue",
+  );
   assert.equal(boundPackLoopIsLive({
     lockPidAlive: true,
     ledgerPresent: false,
@@ -2505,10 +2527,170 @@ test("missing request path fails closed before candidate FRG prepare", async () 
   assert.deepEqual(spawned, []);
 });
 
+function shipUnsignedPayload(over: Partial<FactoryReleaseFrgPayload> = {}): FactoryReleaseFrgPayload {
+  const art = (n: number) => ({ path: `/tmp/art-${n}.json`, sha256: String(n).repeat(64).slice(0, 64) });
+  return {
+    pack_id: "factory-gate-v1",
+    manifest_path: "/pack/manifest.json",
+    manifest_sha256: "a".repeat(64),
+    pack_run_id: "pack-1",
+    loop_run_id: "loop-1",
+    frg_run_id: "frg-A",
+    evidence_created_at: "2026-08-29T00:00:00Z",
+    observations: art(1),
+    evidence_bundle: art(2),
+    contract: art(3),
+    ledger: art(4),
+    events: art(5),
+    action_evidence: art(6),
+    ...over,
+  };
+}
+
+function shipPrepareRequest(): FactoryReleasePrepareRequest {
+  return {
+    schema_version: 1,
+    kind: "factory_release_prepare_request",
+    action_id: "action-ship-1.34.0",
+    repository: intent.repository,
+    base_branch: intent.base_branch,
+    target_version: intent.version,
+    integrated_candidate: { git_sha: head, version: "1.33.0" },
+    production_pin: { version: "1.33.0", tag: "v1.33.0", git_sha: PIN_SHA },
+    frg_manifest: { pack_id: "factory-gate-v1", sha256: "a".repeat(64) },
+  };
+}
+
+async function shipHybridFromRunEvidence(opts: {
+  unsigned: FactoryReleaseFrgPayload;
+  request: FactoryReleasePrepareRequest;
+  runId: string;
+  includeBinding: boolean;
+}): Promise<FrgEvidence> {
+  const pack = await loadFrgPack();
+  const issueNumbers = [1112, 1113];
+  const rendered = renderFrgPackIssues(pack, {
+    release_version: opts.request.target_version,
+    pack_run_id: opts.unsigned.pack_run_id,
+  });
+  const collected = collectFrgPackObservations(pack, {
+    schema_version: 1,
+    policy_id: pack.manifest.pilot_policy.id,
+    pack_id: pack.manifest.pack_id,
+    manifest_version: pack.manifest.manifest_version,
+    manifest_sha256: pack.manifest_sha256,
+    release_version: opts.request.target_version,
+    candidate_git_sha: opts.request.integrated_candidate.git_sha,
+    pack_run_id: opts.unsigned.pack_run_id,
+    loop_run_id: opts.unsigned.loop_run_id,
+    repository: opts.request.repository,
+    base_branch: opts.request.base_branch,
+    started_at: "2026-08-18T02:54:58.000Z",
+    contract: {
+      artifact_sha256: "b".repeat(64),
+      selector: { type: "label", value: "factory-gate" },
+      issue_numbers: issueNumbers,
+      items: issueNumbers.map((n) => ({ issue_number: n, depends_on: [] })),
+    },
+    ledger: {
+      artifact_sha256: "c".repeat(64),
+      items: issueNumbers.map((n) => ({
+        issue_number: n,
+        state: "ready",
+        advance_run_id: `adv-${n}`,
+        blocked_theme: null,
+      })),
+    },
+    events: {
+      artifact_sha256: "d".repeat(64),
+      event_ids: issueNumbers.map((n) => `event:1:item-${n}`),
+      issue_numbers: issueNumbers,
+    },
+    action_evidence: {
+      artifact_sha256: "e".repeat(64),
+      action_ids: issueNumbers.map((n) => `action:1:item-${n}`),
+      issue_numbers: issueNumbers,
+    },
+    issues: rendered.map((issue, index) => {
+      const issueNumber = issueNumbers[index]!;
+      const prHead = String(index + 1).repeat(40);
+      const files =
+        issue.provenance.template_id === "clean-openspec"
+          ? ["openspec/changes/archive/2026-08-18-x/proposal.md", "openspec/specs/frg/spec.md"]
+          : ["docs/frg-fixture.md"];
+      return {
+        issue_number: issueNumber,
+        issue_node_id: `ISSUE_${issueNumber}`,
+        created_at: `2026-08-18T02:55:0${index}.000Z`,
+        title: issue.title,
+        body: issue.body,
+        labels: [...issue.labels, "pipeline:ready-to-deploy"],
+        template_id: issue.provenance.template_id,
+        template_sha256: issue.provenance.template_sha256,
+        pr: {
+          number: 2100 + index,
+          node_id: `PR_${2100 + index}`,
+          head_sha: prHead,
+          base_branch: "main",
+          files,
+          checks: [{ id: `CHECK_${issueNumber}`, name: "ci", head_sha: prHead, conclusion: "success" }],
+        },
+      };
+    }),
+    probes: pack.manifest.pilot_policy.layer_a_probes.map((probe, index) => ({
+      id: probe.id,
+      candidate_git_sha: opts.request.integrated_candidate.git_sha,
+      test_file: probe.test_file,
+      test_name: probe.test_name,
+      command_argv_sha256: "1".repeat(64),
+      stdout_sha256: "2".repeat(64),
+      stderr_sha256: "3".repeat(64),
+      started_at: `2026-08-18T03:00:${String(index).padStart(2, "0")}.000Z`,
+      finished_at: `2026-08-18T03:00:${String(index).padStart(2, "0")}.500Z`,
+    })),
+  });
+  const binding = buildFactoryReleaseUnsignedDigestBinding(opts.request, opts.unsigned);
+  return computeFrgEvidence({
+    version: opts.request.target_version,
+    run_id: opts.runId,
+    loop_run_id: opts.unsigned.loop_run_id,
+    pack_id: FRG_PACK_MANIFEST.pack_id,
+    items: issueNumbers.map((n) => ({ item_id: String(n), state: "ready" as const, ready_clean: true })),
+    scenario_overrides: collected.scenarios.map((s) => ({
+      id: s.id as never,
+      status: s.status,
+      detail: s.detail,
+      observed: s.observed,
+      threshold: s.threshold,
+      source: s.source,
+      proof_ids: s.proof_ids,
+    })),
+    composition_overrides: collected.composition.map((d) => ({
+      id: d.id as never,
+      status: d.status,
+      detail: d.detail,
+      source: d.source,
+      observed: d.observed,
+      proof_ids: d.proof_ids,
+    })),
+    false_human_authority_count: collected.false_human_authority_count,
+    pack_provenance: collected.pack_provenance,
+    factory_release_binding: opts.includeBinding ? binding : undefined,
+    attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
+    score_source: "from-run",
+    work_list: "factory-gate-pack",
+  });
+}
+
 test("candidate FRG pack re-invokes the same prepare request after factory-gate until complete", async () => {
   const spawned: string[][] = [];
-  let gated = false;
   const requestPath = "/abs/req.json";
+  const request = shipPrepareRequest();
+  const unsigned = shipUnsignedPayload();
+  const binding = buildFactoryReleaseUnsignedDigestBinding(request, unsigned);
+  const runIdB = computeAttestorRunId(binding);
+  const files = new Map<string, string>();
+  const latestPath = `/repo/.agent-pipeline/frg/${request.target_version}/latest.json`;
   const bound = bindCandidateShipEndOperations(operations(), {
     pinCommitSha: PIN_SHA,
     repoDir: "/repo",
@@ -2521,20 +2703,50 @@ test("candidate FRG pack re-invokes the same prepare request after factory-gate 
       spawned.push(argv);
       if (argv.includes("factory-release")) {
         assert.ok(argv.includes(requestPath), "prepare must keep the bound request path");
-        if (!gated) {
-          return {
-            code: 0,
-            stdout: JSON.stringify({
-              status: "awaiting_frg_attestation",
-              frg: { loop_run_id: "loop-1" },
-            }),
-            stderr: "",
-          };
+        const observed = await defaultObserveAttestation(
+          request,
+          unsigned,
+          { repoDir: "/repo", workDir: "/tmp/work" },
+          async (p) => {
+            const v = files.get(p);
+            if (v === undefined) {
+              const err = new Error(`ENOENT ${p}`) as NodeJS.ErrnoException;
+              err.code = "ENOENT";
+              throw err;
+            }
+            return v;
+          },
+          async (p) => files.has(p),
+          { attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY },
+        );
+        if (observed.status === "accepted") {
+          return { code: 0, stdout: JSON.stringify({ status: "complete" }), stderr: "" };
         }
-        return { code: 0, stdout: JSON.stringify({ status: "complete" }), stderr: "" };
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            status: "awaiting_frg_attestation",
+            frg: { loop_run_id: unsigned.loop_run_id, frg_run_id: unsigned.frg_run_id },
+            observe_miss:
+              observed.status === "rejected"
+                ? {
+                    reason: observed.reason,
+                    expected_frg_run_id: observed.expected_frg_run_id,
+                    observed_run_id: observed.observed_run_id,
+                  }
+                : undefined,
+          }),
+          stderr: "",
+        };
       }
       if (argv.includes("factory-gate")) {
-        gated = true;
+        const evidence = await shipHybridFromRunEvidence({
+          unsigned,
+          request,
+          runId: runIdB,
+          includeBinding: true,
+        });
+        files.set(latestPath, JSON.stringify(evidence));
         return { code: 0, stdout: "", stderr: "" };
       }
       throw new Error(`unexpected spawn ${argv.join(" ")}`);
@@ -2546,6 +2758,101 @@ test("candidate FRG pack re-invokes the same prepare request after factory-gate 
   );
   assert.deepEqual(verbs, ["prepare", "gate", "prepare"]);
   assert.equal(spawned.filter((argv) => argv.includes(requestPath)).length, 2);
+  assert.ok(files.has(latestPath), "factory-gate must persist a real-shaped --from-run payload");
+});
+
+test("runFrgPack fails closed after one attest when observe stays rejected (#1295)", async () => {
+  const spawned: string[][] = [];
+  const requestPath = "/abs/req.json";
+  const unsigned = shipUnsignedPayload();
+  const bound = bindCandidateShipEndOperations(operations(), {
+    pinCommitSha: PIN_SHA,
+    repoDir: "/repo",
+    env: { PIPELINE_FRG_ATTESTATION_KEY: "secret" },
+    factoryReleaseRequestPath: requestPath,
+    frgWaitAttempts: 8,
+    delay: async () => {},
+    resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+    spawn: async (argv) => {
+      spawned.push(argv);
+      if (argv.includes("factory-release")) {
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            status: "awaiting_frg_attestation",
+            frg: { loop_run_id: unsigned.loop_run_id, frg_run_id: unsigned.frg_run_id },
+            observe_miss: {
+              reason: "missing_factory_release_binding",
+              expected_frg_run_id: unsigned.frg_run_id,
+              observed_run_id: "frg-B",
+            },
+          }),
+          stderr: "",
+        };
+      }
+      if (argv.includes("factory-gate")) {
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      throw new Error(`unexpected spawn ${argv.join(" ")}`);
+    },
+  });
+  const hung = new Promise<never>((_, reject) => {
+    setTimeout(() => reject(new Error("runFrgPack did not terminate")), 2000);
+  });
+  await assert.rejects(
+    Promise.race([bound.runFrgPack!(intent, train), hung]),
+    /unsigned_frg_run_id=frg-A[\s\S]*observed_run_id=frg-B[\s\S]*missing_factory_release_binding/,
+  );
+  assert.equal(spawned.filter((argv) => argv.includes("factory-gate")).length, 1);
+  assert.equal(spawned.filter((argv) => argv.includes("factory-release")).length, 2);
+});
+
+test("changed unsigned checkpoint resets the attest allowance (#1295)", async () => {
+  const spawned: string[][] = [];
+  let prepareTicks = 0;
+  const bound = bindCandidateShipEndOperations(operations(), {
+    pinCommitSha: PIN_SHA,
+    repoDir: "/repo",
+    env: { PIPELINE_FRG_ATTESTATION_KEY: "secret" },
+    factoryReleaseRequestPath: "/abs/req.json",
+    frgWaitAttempts: 4,
+    delay: async () => {},
+    resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
+    spawn: async (argv) => {
+      spawned.push(argv);
+      if (argv.includes("factory-release")) {
+        prepareTicks += 1;
+        if (prepareTicks === 1) {
+          return {
+            code: 0,
+            stdout: JSON.stringify({
+              status: "awaiting_frg_attestation",
+              frg: { loop_run_id: "loop-1", frg_run_id: "frg-A" },
+            }),
+            stderr: "",
+          };
+        }
+        if (prepareTicks === 2) {
+          return {
+            code: 0,
+            stdout: JSON.stringify({
+              status: "awaiting_frg_attestation",
+              frg: { loop_run_id: "loop-1", frg_run_id: "frg-A-prime" },
+            }),
+            stderr: "",
+          };
+        }
+        return { code: 0, stdout: JSON.stringify({ status: "complete" }), stderr: "" };
+      }
+      if (argv.includes("factory-gate")) {
+        return { code: 0, stdout: "", stderr: "" };
+      }
+      throw new Error(`unexpected spawn ${argv.join(" ")}`);
+    },
+  });
+  await bound.runFrgPack!(intent, train);
+  assert.equal(spawned.filter((argv) => argv.includes("factory-gate")).length, 2);
+  assert.equal(spawned.filter((argv) => argv.includes("factory-release")).length, 3);
 });
 
 test("injected request resolver supplies the persisted prepare path when option is omitted", async () => {

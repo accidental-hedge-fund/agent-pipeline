@@ -298,6 +298,11 @@ export const BLOCKER_KINDS = [
    * prompt-limit so auto-loop does not re-send the same oversize payload.
    */
   "review-prompt-too-large",
+  /**
+   * Planning-facts provider contract failure (#1300). Engine-owned; does not
+   * by itself park as needs-human. Durable projection is workflow-engine-defect.
+   */
+  "planning-facts-provider-contract",
 ] as const;
 export type BlockerKind = (typeof BLOCKER_KINDS)[number];
 
@@ -488,6 +493,13 @@ export const BLOCKER_RECIPES: Record<BlockerKind, string> = {
     "higher declared ceiling when appropriate, or wait for a follow-up that " +
     "shrinks prompt assembly. Then remove the `blocked` label and re-run " +
     "`$pipeline {{N}}`.",
+  "planning-facts-provider-contract":
+    "A required planning-facts provider failed its contract (timeout, non-zero " +
+    "exit, malformed JSON, mutation, dirty worktree, missing executable, type " +
+    "error, ceiling breach, base-update failure, or malformed claims — see the " +
+    "reason above). This is an engine-owned block, not a human-authority park. " +
+    "Fix the provider script or worktree, remove the `blocked` label, then " +
+    "re-run `$pipeline {{N}}`.",
 };
 
 // ---------------------------------------------------------------------------
@@ -1028,6 +1040,51 @@ export interface ReviewEnsembleConfig {
   allow_quorum_degrade?: boolean;
 }
 
+/** Closed fact-value types a planning-facts provider may return (#1300). */
+export const PLANNING_FACT_VALUE_TYPES = [
+  "string",
+  "number",
+  "boolean",
+  "string[]",
+  "number[]",
+  "boolean[]",
+] as const;
+export type PlanningFactValueType = (typeof PLANNING_FACT_VALUE_TYPES)[number];
+
+/**
+ * Pipeline-owned hard ceilings for planning-fact observation (#1300).
+ * Repository config may only set a lower positive integer.
+ */
+export const PLANNING_FACTS_PIPELINE_CEILINGS = {
+  timeout_ms: 10_000,
+  max_stdout_bytes: 32_768,
+  max_stderr_bytes: 8_192,
+  max_fact_count: 32,
+  max_key_chars: 64,
+  max_value_chars: 1_024,
+  max_prompt_chars: 8_192,
+} as const;
+
+export interface PlanningFactProviderConfig {
+  id: string;
+  executable: string;
+  args: string[];
+  required: boolean;
+  facts: Record<string, PlanningFactValueType>;
+}
+
+/** Resolved `planning_facts` block. Absent YAML equals empty `providers`. */
+export interface PlanningFactsConfig {
+  providers: PlanningFactProviderConfig[];
+  timeout_ms: number;
+  max_stdout_bytes: number;
+  max_stderr_bytes: number;
+  max_fact_count: number;
+  max_key_chars: number;
+  max_value_chars: number;
+  max_prompt_chars: number;
+}
+
 export interface PipelineConfig {
   profile_name: string;
   invocation: string;
@@ -1132,6 +1189,14 @@ export interface PipelineConfig {
   // ready dispatch evaluates a freshly fetched issue through the Implementer
   // planning treatment before worktree create or planning authoring.
   issue_readiness: { enabled: boolean; timeout: number };
+  /**
+   * Named planning-fact providers (#1300). Empty `providers` (the default)
+   * leaves planning, plan-revision, and plan-review unchanged: no spawn, no
+   * prompt section, no new blocking failure. Observation always re-reads
+   * trusted integration-base YAML rather than treating this host-resolved
+   * copy as the run-time provider list.
+   */
+  planning_facts: PlanningFactsConfig;
   // Configurable pipeline steps (#13). Per-repo on/off for the optional
   // "thoroughness" steps. Structural/safety steps (planning, implementing, and
   // the pre-merge CI + mergeability gates) have no toggle and are always on —
@@ -1646,6 +1711,16 @@ export const DEFAULT_CONFIG: Omit<
   openspec: { enabled: "auto", bootstrap: false },
   last30days: { enabled: false, timeout: 600 },
   issue_readiness: { enabled: false, timeout: 600 },
+  planning_facts: {
+    providers: [] as PlanningFactProviderConfig[],
+    timeout_ms: PLANNING_FACTS_PIPELINE_CEILINGS.timeout_ms,
+    max_stdout_bytes: PLANNING_FACTS_PIPELINE_CEILINGS.max_stdout_bytes,
+    max_stderr_bytes: PLANNING_FACTS_PIPELINE_CEILINGS.max_stderr_bytes,
+    max_fact_count: PLANNING_FACTS_PIPELINE_CEILINGS.max_fact_count,
+    max_key_chars: PLANNING_FACTS_PIPELINE_CEILINGS.max_key_chars,
+    max_value_chars: PLANNING_FACTS_PIPELINE_CEILINGS.max_value_chars,
+    max_prompt_chars: PLANNING_FACTS_PIPELINE_CEILINGS.max_prompt_chars,
+  },
   steps: { plan_review: true, standard_review: true, adversarial_review: true, docs: true },
   design_gate: {
     enabled: false,

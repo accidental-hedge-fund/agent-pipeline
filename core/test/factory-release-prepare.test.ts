@@ -15,6 +15,7 @@ import {
   CANDIDATE_LOOP_DENIED_FRG_ENV,
   defaultFactoryReleasePrepareDeps,
   defaultObserveAttestation,
+  defaultResolveShipPathFromRun,
   defaultResumeBoundPackLoop,
   defaultSpawnCandidateLoop,
   defaultStartBoundPackLoop,
@@ -22,9 +23,10 @@ import {
   FACTORY_RELEASE_ROOT_REL,
   factoryReleaseCheckpointPath,
   factoryReleaseLoopBindingPath,
+  factoryReleaseRequestFingerprint,
+  factoryReleaseVersionIndexPath,
   sanitizeCandidateLoopEnv,
   factoryReleasePackInstancePath,
-  factoryReleaseRequestFingerprint,
   factoryReleaseWorkDir,
   generateDurableUnsignedFrg,
   honestLatestJsonBindsRequest,
@@ -60,20 +62,26 @@ import {
   FRG_PACK_MANIFEST,
   FRG_SCENARIO_IDS,
   FRG_UNIT_TEST_ATTESTATION_KEY,
+  computeAttestorRunId,
   computeFrgEvidence,
   frgRequiredCompositionOverrides,
   frgRequiredObservationOverrides,
   isReleaseEligibleFrgPass,
+  verifyFrgAttestation,
   type FrgEvidence,
 } from "../scripts/factory-reliability-gate.ts";
 import {
+  collectFrgPackObservations,
   FRG_HYBRID_PILOT_VERSION,
+  loadFrgPack,
+  renderFrgPackIssues,
   type LoadedFrgPack,
 } from "../scripts/frg-pack-observations.ts";
 
 const MANIFEST_SHA = "a".repeat(64);
 const CANDIDATE = "b".repeat(40);
 const ACTION_ID = "action-ship-1.34.0-001";
+const OBSERVE_HMAC = { attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY };
 
 function baseRequest(over: Partial<FactoryReleasePrepareRequest> = {}): FactoryReleasePrepareRequest {
   return {
@@ -333,13 +341,11 @@ function releaseEligibleEvidence(
     })),
     false_human_authority_count: 0,
     attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
-    notes: [`factory_release_binding:${JSON.stringify(binding)}`],
+    factory_release_binding: binding,
   });
   assert.equal(evidence.pack_provenance, null);
   assert.equal(evidence.pass, false);
-  // Attach binding for prepare orchestration (notes also carry it for observers).
-  (evidence as FrgEvidence & { factory_release_binding?: unknown }).factory_release_binding =
-    binding;
+  assert.deepEqual(evidence.factory_release_binding, binding);
   return evidence;
 }
 
@@ -356,6 +362,137 @@ function observeForUnsigned(
     latest_sha256: crypto.createHash("sha256").update("e").digest("hex"),
     evidence,
   };
+}
+
+async function hybridFromRunEvidence(opts: {
+  request: FactoryReleasePrepareRequest;
+  unsigned: FactoryReleaseFrgPayload;
+  runId: string;
+  includeBinding?: boolean;
+  notesBinding?: boolean;
+  /** Scored pack candidate; defaults to the request integrated candidate. */
+  packCandidateGitSha?: string;
+}): Promise<FrgEvidence> {
+  const pack = await loadFrgPack();
+  const issueNumbers = [1112, 1113];
+  const packCandidate = opts.packCandidateGitSha ?? opts.request.integrated_candidate.git_sha;
+  const rendered = renderFrgPackIssues(pack, {
+    release_version: opts.request.target_version,
+    pack_run_id: opts.unsigned.pack_run_id,
+  });
+  const collected = collectFrgPackObservations(pack, {
+    schema_version: 1,
+    policy_id: pack.manifest.pilot_policy.id,
+    pack_id: pack.manifest.pack_id,
+    manifest_version: pack.manifest.manifest_version,
+    manifest_sha256: pack.manifest_sha256,
+    release_version: opts.request.target_version,
+    candidate_git_sha: packCandidate,
+    pack_run_id: opts.unsigned.pack_run_id,
+    loop_run_id: opts.unsigned.loop_run_id,
+    repository: opts.request.repository,
+    base_branch: opts.request.base_branch,
+    started_at: "2026-08-18T02:54:58.000Z",
+    contract: {
+      artifact_sha256: "b".repeat(64),
+      selector: { type: "label", value: "factory-gate" },
+      issue_numbers: issueNumbers,
+      items: issueNumbers.map((n) => ({ issue_number: n, depends_on: [] })),
+    },
+    ledger: {
+      artifact_sha256: "c".repeat(64),
+      items: issueNumbers.map((n) => ({
+        issue_number: n,
+        state: "ready",
+        advance_run_id: `adv-${n}`,
+        blocked_theme: null,
+      })),
+    },
+    events: {
+      artifact_sha256: "d".repeat(64),
+      event_ids: issueNumbers.map((n) => `event:1:item-${n}`),
+      issue_numbers: issueNumbers,
+    },
+    action_evidence: {
+      artifact_sha256: "e".repeat(64),
+      action_ids: issueNumbers.map((n) => `action:1:item-${n}`),
+      issue_numbers: issueNumbers,
+    },
+    issues: rendered.map((issue, index) => {
+      const issueNumber = issueNumbers[index]!;
+      const head = String(index + 1).repeat(40);
+      const files =
+        issue.provenance.template_id === "clean-openspec"
+          ? ["openspec/changes/archive/2026-08-18-x/proposal.md", "openspec/specs/frg/spec.md"]
+          : ["docs/frg-fixture.md"];
+      return {
+        issue_number: issueNumber,
+        issue_node_id: `ISSUE_${issueNumber}`,
+        created_at: `2026-08-18T02:55:0${index}.000Z`,
+        title: issue.title,
+        body: issue.body,
+        labels: [...issue.labels, "pipeline:ready-to-deploy"],
+        template_id: issue.provenance.template_id,
+        template_sha256: issue.provenance.template_sha256,
+        pr: {
+          number: 2100 + index,
+          node_id: `PR_${2100 + index}`,
+          head_sha: head,
+          base_branch: "main",
+          files,
+          checks: [{ id: `CHECK_${issueNumber}`, name: "ci", head_sha: head, conclusion: "success" }],
+        },
+      };
+    }),
+    probes: pack.manifest.pilot_policy.layer_a_probes.map((probe, index) => ({
+      id: probe.id,
+      candidate_git_sha: packCandidate,
+      test_file: probe.test_file,
+      test_name: probe.test_name,
+      command_argv_sha256: "1".repeat(64),
+      stdout_sha256: "2".repeat(64),
+      stderr_sha256: "3".repeat(64),
+      started_at: `2026-08-18T03:00:${String(index).padStart(2, "0")}.000Z`,
+      finished_at: `2026-08-18T03:00:${String(index).padStart(2, "0")}.500Z`,
+    })),
+  });
+  const binding = buildFactoryReleaseUnsignedDigestBinding(opts.request, opts.unsigned);
+  const evidence = computeFrgEvidence({
+    version: opts.request.target_version,
+    run_id: opts.runId,
+    loop_run_id: opts.unsigned.loop_run_id,
+    pack_id: FRG_PACK_MANIFEST.pack_id,
+    items: issueNumbers.map((n) => ({
+      item_id: String(n),
+      state: "ready" as const,
+      ready_clean: true,
+    })),
+    scenario_overrides: collected.scenarios.map((s) => ({
+      id: s.id as never,
+      status: s.status,
+      detail: s.detail,
+      observed: s.observed,
+      threshold: s.threshold,
+      source: s.source,
+      proof_ids: s.proof_ids,
+    })),
+    composition_overrides: collected.composition.map((d) => ({
+      id: d.id as never,
+      status: d.status,
+      detail: d.detail,
+      source: d.source,
+      observed: d.observed,
+      proof_ids: d.proof_ids,
+    })),
+    false_human_authority_count: collected.false_human_authority_count,
+    pack_provenance: collected.pack_provenance,
+    factory_release_binding: opts.includeBinding === false ? undefined : binding,
+    notes: opts.notesBinding ? [`factory_release_binding:${JSON.stringify(binding)}`] : undefined,
+    attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
+    score_source: "from-run",
+    work_list: "factory-gate-pack",
+  });
+  return evidence;
 }
 
 function memoryFs() {
@@ -468,6 +605,23 @@ test("honestLatestJsonBindsRequest requires attested hybrid-v2 on this candidate
       pack_provenance: { candidate_git_sha: "d".repeat(40) },
     }),
     false,
+  );
+  assert.equal(
+    honestLatestJsonBindsRequest(request, {
+      ...bound,
+      factory_release_binding: { candidate_git_sha: CANDIDATE },
+      pack_provenance: { candidate_git_sha: "d".repeat(40) },
+    }),
+    false,
+    "binding C must not hide scored provenance D",
+  );
+  assert.equal(
+    honestLatestJsonBindsRequest(request, {
+      ...bound,
+      factory_release_binding: { candidate_git_sha: CANDIDATE },
+      pack_provenance: { candidate_git_sha: CANDIDATE },
+    }),
+    true,
   );
   assert.equal(
     honestLatestJsonBindsRequest(request, { ...bound, integrity: {} }),
@@ -585,6 +739,7 @@ test("prepare completes from candidate-bound latest.json without runRelease or a
         run_id: "frg-reuse",
         integrity: { attestation: { alg: "hmac-sha256", mac: "ab" } },
         pack_provenance: { candidate_git_sha: CANDIDATE },
+        factory_release_binding: buildFactoryReleaseUnsignedDigestBinding(request, unsigned),
       } as never,
     }),
     observeExistingRelease: async () => ({
@@ -843,18 +998,17 @@ test("refuses attestation key in candidate environment", async () => {
   );
 });
 
-test("stale foreign evidence (wrong frg_run_id) is refused at attestation", async () => {
+test("stale foreign evidence (wrong loop_run_id) is refused at attestation", async () => {
   const mem = memoryFs();
   const request = baseRequest();
   const requestPath = "/tmp/req-134.json";
   await mem.writeFile(requestPath, JSON.stringify(request));
   const evidence = releaseEligibleEvidence();
-  // Mutate run id so binding fails
-  (evidence as { run_id: string }).run_id = "frg-FOREIGN";
+  (evidence as { loop_run_id: string }).loop_run_id = "loop-FOREIGN";
   const deps = makeDeps({
     fs: mem,
     observe: async () => ({
-      frg_run_id: "frg-FOREIGN",
+      frg_run_id: evidence.run_id,
       evidence_path: "/repo/e.json",
       evidence_sha256: "e".repeat(64),
       latest_path: "/repo/l.json",
@@ -1171,7 +1325,11 @@ test("attestation without unsigned digest binding is refused (5782ec4d)", async 
     (p) => mem.readFile(p),
     (p) => mem.fileExists(p),
   );
-  assert.equal(observed, null, "missing digest binding must not unlock prepare");
+  assert.equal(observed.status, "rejected");
+  if (observed.status === "rejected") {
+    assert.equal(observed.reason, "missing_factory_release_binding");
+    assert.equal(observed.expected_frg_run_id, unsigned.frg_run_id);
+  }
 });
 
 test("handoff without evidence returns awaiting null without recursion (90ccb9ff)", async () => {
@@ -1197,7 +1355,7 @@ test("handoff without evidence returns awaiting null without recursion (90ccb9ff
     (p) => mem.readFile(p),
     (p) => mem.fileExists(p),
   );
-  assert.equal(observed, null);
+  assert.equal(observed.status, "absent");
 });
 
 test("attestation with matching unsigned digests is accepted (5782ec4d positive)", async () => {
@@ -1223,7 +1381,7 @@ test("attestation with matching unsigned digests is accepted (5782ec4d positive)
   );
   // Matching digests are not enough: 1.34.0 without hybrid-v2 pack_provenance
   // is not release-eligible, so the observer must not accept the artifact.
-  assert.equal(observed, null);
+  assert.notEqual(observed.status, "accepted");
 });
 
 test("default generateUnsigned starts a bound loop and does not invent pass", async () => {
@@ -3243,4 +3401,321 @@ test("FRG runbook documents off-repo --request dests (#1259)", () => {
     ship,
     /factory-release prepare --request \$REPO_DIR\/\.agent-pipeline\/request\.json/,
   );
+});
+
+test("HMAC from-run latest.json without factory_release_binding is rejected (#1295)", async () => {
+  const request = baseRequest();
+  const unsigned = unsignedPayload();
+  const runIdB = computeAttestorRunId(buildFactoryReleaseUnsignedDigestBinding(request, unsigned));
+  assert.notEqual(runIdB, unsigned.frg_run_id);
+  const evidence = await hybridFromRunEvidence({
+    request,
+    unsigned,
+    runId: runIdB,
+    includeBinding: false,
+  });
+  assert.equal(evidence.pass, true);
+  assert.equal(evidence.pack_provenance != null, true);
+  assert.equal(evidence.factory_release_binding, undefined);
+  assert.equal(verifyFrgAttestation(evidence, FRG_UNIT_TEST_ATTESTATION_KEY), true);
+
+  const mem = memoryFs();
+  const latestPath = `/repo/.agent-pipeline/frg/${request.target_version}/latest.json`;
+  await mem.writeFile(latestPath, JSON.stringify(evidence));
+  const observed = await defaultObserveAttestation(
+    request,
+    unsigned,
+    { repoDir: "/repo", workDir: "/tmp/work" },
+    (p) => mem.readFile(p),
+    (p) => mem.fileExists(p),
+  );
+  assert.notEqual(observed.status, "accepted");
+  assert.equal(observed.status, "rejected");
+  if (observed.status === "rejected") {
+    assert.equal(observed.reason, "missing_factory_release_binding");
+    assert.equal(observed.expected_frg_run_id, unsigned.frg_run_id);
+    assert.equal(observed.observed_run_id, runIdB);
+  }
+});
+
+test("HMAC from-run latest.json with binding and pack_provenance is accepted (#1295)", async () => {
+  const request = baseRequest();
+  const unsigned = unsignedPayload();
+  const binding = buildFactoryReleaseUnsignedDigestBinding(request, unsigned);
+  const runIdB = computeAttestorRunId(binding);
+  const evidence = await hybridFromRunEvidence({
+    request,
+    unsigned,
+    runId: runIdB,
+    includeBinding: true,
+  });
+  assert.equal(evidence.pass, true);
+  assert.equal(evidence.pack_provenance != null, true);
+  assert.equal(evidence.run_id, runIdB);
+  assert.notEqual(evidence.run_id, unsigned.frg_run_id);
+  assert.equal(verifyFrgAttestation(evidence, FRG_UNIT_TEST_ATTESTATION_KEY), true);
+
+  const mem = memoryFs();
+  const latestPath = `/repo/.agent-pipeline/frg/${request.target_version}/latest.json`;
+  await mem.writeFile(latestPath, JSON.stringify(evidence));
+  const observed = await defaultObserveAttestation(
+    request,
+    unsigned,
+    { repoDir: "/repo", workDir: "/tmp/work" },
+    (p) => mem.readFile(p),
+    (p) => mem.fileExists(p),
+    OBSERVE_HMAC,
+  );
+  assert.equal(observed.status, "accepted");
+  if (observed.status === "accepted") {
+    assert.equal(observed.attestation.frg_run_id, runIdB);
+  }
+});
+
+test("observe rejects signed binding C when scored provenance is D (#1295)", async () => {
+  const request = baseRequest();
+  const unsigned = unsignedPayload();
+  const binding = buildFactoryReleaseUnsignedDigestBinding(request, unsigned);
+  const packedD = "d".repeat(40);
+  assert.equal(binding.candidate_git_sha, CANDIDATE);
+  assert.notEqual(packedD, CANDIDATE);
+  const runIdB = computeAttestorRunId(binding);
+  const evidence = await hybridFromRunEvidence({
+    request,
+    unsigned,
+    runId: runIdB,
+    includeBinding: true,
+    packCandidateGitSha: packedD,
+  });
+  assert.equal(evidence.pass, true);
+  assert.deepEqual(evidence.factory_release_binding, binding);
+  assert.equal(evidence.pack_provenance?.candidate_git_sha, packedD);
+  assert.equal(verifyFrgAttestation(evidence, FRG_UNIT_TEST_ATTESTATION_KEY), true);
+
+  const mem = memoryFs();
+  const latestPath = `/repo/.agent-pipeline/frg/${request.target_version}/latest.json`;
+  await mem.writeFile(latestPath, JSON.stringify(evidence));
+  const observed = await defaultObserveAttestation(
+    request,
+    unsigned,
+    { repoDir: "/repo", workDir: "/tmp/work" },
+    (p) => mem.readFile(p),
+    (p) => mem.fileExists(p),
+    OBSERVE_HMAC,
+  );
+  assert.equal(observed.status, "rejected");
+  if (observed.status === "rejected") {
+    assert.equal(observed.reason, "identity_mismatch");
+    assert.equal(observed.expected_frg_run_id, unsigned.frg_run_id);
+    assert.equal(observed.observed_run_id, runIdB);
+  }
+});
+
+test("observe rejects factory_release_binding overlay after sign (#1295)", async () => {
+  const request = baseRequest();
+  const unsigned = unsignedPayload();
+  const runIdB = computeAttestorRunId(buildFactoryReleaseUnsignedDigestBinding(request, unsigned));
+  const signed = await hybridFromRunEvidence({
+    request,
+    unsigned,
+    runId: runIdB,
+    includeBinding: false,
+  });
+  assert.equal(signed.factory_release_binding, undefined);
+  assert.equal(verifyFrgAttestation(signed, FRG_UNIT_TEST_ATTESTATION_KEY), true);
+  const overlaid = {
+    ...signed,
+    factory_release_binding: buildFactoryReleaseUnsignedDigestBinding(request, unsigned),
+  };
+  assert.equal(verifyFrgAttestation(overlaid, FRG_UNIT_TEST_ATTESTATION_KEY), false);
+
+  const mem = memoryFs();
+  const latestPath = `/repo/.agent-pipeline/frg/${request.target_version}/latest.json`;
+  await mem.writeFile(latestPath, JSON.stringify(overlaid));
+  const observed = await defaultObserveAttestation(
+    request,
+    unsigned,
+    { repoDir: "/repo", workDir: "/tmp/work" },
+    (p) => mem.readFile(p),
+    (p) => mem.fileExists(p),
+    OBSERVE_HMAC,
+  );
+  assert.notEqual(observed.status, "accepted");
+  assert.equal(observed.status, "rejected");
+  if (observed.status === "rejected") {
+    assert.equal(observed.reason, "hmac_invalid");
+    assert.equal(observed.expected_frg_run_id, unsigned.frg_run_id);
+    assert.equal(observed.observed_run_id, runIdB);
+  }
+});
+
+test("notes-only factory_release_binding is rejected (#1295)", async () => {
+  const request = baseRequest();
+  const unsigned = unsignedPayload();
+  const runIdB = computeAttestorRunId(buildFactoryReleaseUnsignedDigestBinding(request, unsigned));
+  const evidence = await hybridFromRunEvidence({
+    request,
+    unsigned,
+    runId: runIdB,
+    includeBinding: false,
+    notesBinding: true,
+  });
+  assert.equal(evidence.factory_release_binding, undefined);
+  assert.ok((evidence.notes ?? []).some((n) => n.startsWith("factory_release_binding:")));
+
+  const mem = memoryFs();
+  await mem.writeFile(
+    `/repo/.agent-pipeline/frg/${request.target_version}/latest.json`,
+    JSON.stringify(evidence),
+  );
+  const observed = await defaultObserveAttestation(
+    request,
+    unsigned,
+    { repoDir: "/repo", workDir: "/tmp/work" },
+    (p) => mem.readFile(p),
+    (p) => mem.fileExists(p),
+  );
+  assert.equal(observed.status, "rejected");
+  if (observed.status === "rejected") {
+    assert.equal(observed.reason, "notes_only_binding");
+  }
+});
+
+test("prepare completes on accepted bound B and records attested run_id (#1295)", async () => {
+  const request = baseRequest();
+  const requestPath = "/tmp/req-1295.json";
+  const unsigned = unsignedPayload();
+  const binding = buildFactoryReleaseUnsignedDigestBinding(request, unsigned);
+  const runIdB = computeAttestorRunId(binding);
+  const evidence = await hybridFromRunEvidence({
+    request,
+    unsigned,
+    runId: runIdB,
+    includeBinding: true,
+  });
+  const mem = memoryFs();
+  await mem.writeFile(requestPath, JSON.stringify(request));
+  const latestPath = `/repo/.agent-pipeline/frg/${request.target_version}/latest.json`;
+  await mem.writeFile(latestPath, JSON.stringify(evidence));
+  const releaseCalls = { n: 0 };
+  const deps = makeDeps({
+    fs: mem,
+    releaseCalls,
+    generate: async () => ({ frg: unsigned, structurally_eligible: true }),
+    observe: (req, uns, ctx) =>
+      defaultObserveAttestation(
+        req,
+        uns,
+        ctx,
+        (p) => mem.readFile(p),
+        (p) => mem.fileExists(p),
+        OBSERVE_HMAC,
+      ),
+  });
+  const outcome = await runFactoryReleasePrepare({ requestPath, repoDir: "/repo" }, deps);
+  assert.equal(outcome.exitCode, 0);
+  assert.equal(outcome.result.status, "complete");
+  if (outcome.result.status === "complete") {
+    assert.equal(outcome.result.frg.run_id, runIdB);
+  }
+  assert.equal(releaseCalls.n, 1);
+});
+
+test("rejected observe stays awaiting and names A, B, and the miss (#1295)", async () => {
+  const request = baseRequest();
+  const requestPath = "/tmp/req-1295-reject.json";
+  const unsigned = unsignedPayload();
+  const runIdB = computeAttestorRunId(buildFactoryReleaseUnsignedDigestBinding(request, unsigned));
+  const evidence = await hybridFromRunEvidence({
+    request,
+    unsigned,
+    runId: runIdB,
+    includeBinding: false,
+  });
+  const mem = memoryFs();
+  await mem.writeFile(requestPath, JSON.stringify(request));
+  await mem.writeFile(
+    `/repo/.agent-pipeline/frg/${request.target_version}/latest.json`,
+    JSON.stringify(evidence),
+  );
+  const deps = makeDeps({
+    fs: mem,
+    generate: async () => ({ frg: unsigned, structurally_eligible: true }),
+    observe: (req, uns, ctx) =>
+      defaultObserveAttestation(req, uns, ctx, (p) => mem.readFile(p), (p) => mem.fileExists(p)),
+    runRelease: async () => {
+      throw new Error("must not release on rejected observe");
+    },
+  });
+  const outcome = await runFactoryReleasePrepare({ requestPath, repoDir: "/repo" }, deps);
+  assert.equal(outcome.exitCode, 0);
+  assert.equal(outcome.result.status, "awaiting_frg_attestation");
+  if (outcome.result.status === "awaiting_frg_attestation") {
+    assert.equal(outcome.result.observe_miss?.reason, "missing_factory_release_binding");
+    assert.equal(outcome.result.observe_miss?.expected_frg_run_id, unsigned.frg_run_id);
+    assert.equal(outcome.result.observe_miss?.observed_run_id, runIdB);
+  }
+});
+
+test("defaultResolveShipPathFromRun loads the closed unsigned checkpoint (#1295)", async () => {
+  const request = baseRequest();
+  const unsigned = unsignedPayload();
+  const fingerprint = factoryReleaseRequestFingerprint(request);
+  const mem = memoryFs();
+  await mem.writeFile(
+    factoryReleaseVersionIndexPath("/repo", request.target_version),
+    JSON.stringify({
+      schema_version: 1,
+      version: request.target_version,
+      request_fingerprint: fingerprint,
+      candidate_git_sha: request.integrated_candidate.git_sha,
+      action_id: request.action_id,
+      pack_run_id: unsigned.pack_run_id,
+      loop_run_id: unsigned.loop_run_id,
+      frg_run_id: unsigned.frg_run_id,
+    }),
+  );
+  await mem.writeFile(
+    factoryReleaseCheckpointPath("/repo", fingerprint),
+    JSON.stringify({
+      schema_version: 1,
+      kind: "factory_release_checkpoint_store",
+      request_fingerprint: fingerprint,
+      phase: "awaiting_frg_attestation",
+      request,
+      unsigned,
+    }),
+  );
+  await mem.writeFile(
+    factoryReleaseLoopBindingPath(unsigned.loop_run_id),
+    JSON.stringify({
+      schema_version: 1,
+      kind: "factory_release_loop_binding",
+      candidate_git_sha: request.integrated_candidate.git_sha,
+      loop_run_id: unsigned.loop_run_id,
+    }),
+  );
+  const bound = await defaultResolveShipPathFromRun({
+    version: request.target_version,
+    fromRun: unsigned.loop_run_id,
+    repoDir: "/repo",
+    readFile: (p) => mem.readFile(p),
+  });
+  assert.equal(bound.kind, "bound");
+  if (bound.kind === "bound") {
+    assert.equal(bound.unsigned_frg_run_id, unsigned.frg_run_id);
+    assert.equal(
+      (bound.binding as { frg_run_id: string }).frg_run_id,
+      unsigned.frg_run_id,
+    );
+  }
+
+  const missing = await defaultResolveShipPathFromRun({
+    version: request.target_version,
+    fromRun: unsigned.loop_run_id,
+    repoDir: "/other",
+    requestCandidateGitSha: request.integrated_candidate.git_sha,
+    readFile: (p) => mem.readFile(p),
+  });
+  assert.equal(missing.kind, "fail");
 });

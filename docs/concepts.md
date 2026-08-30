@@ -21,6 +21,7 @@ A newcomer who completed Prerequisites, Install, and Quickstart in the README ha
 - [Shipcheck gate (optional, default off)](#shipcheck-gate-optional-default-off)
 - [OpenSpec integration (optional)](#openspec-integration-optional)
 - [last30days context (optional, default off)](#last30days-context-optional-default-off)
+- [Planning facts (optional, default off)](#planning-facts-optional-default-off)
 - [Commit traceability trailers (always on)](#commit-traceability-trailers-always-on)
 - [Planning-leverage and material-rework telemetry](#planning-leverage-and-material-rework-telemetry)
 - [Risk-calibrated progressive planning (research)](#risk-calibrated-progressive-planning-research)
@@ -182,6 +183,12 @@ If the target repo has an `openspec/` directory (or `openspec.enabled: on` / boo
 ## last30days context (optional, default off)
 
 When `last30days.enabled: true`, a pre-planning brief from the [last30days skill](https://github.com/mvanhorn/last30days-skill) is injected into planning. Always non-blocking if the skill is missing. **Do not enable for issues with sensitive customer data** — the research topic is forwarded to external data sources after redaction.
+
+## Planning facts (optional, default off)
+
+When `.github/pipeline.yml` omits `planning_facts` or sets `providers: []`, planning is unchanged: no provider spawn, no planning-facts prompt section, no new block. Repositories that need a mutable fact (for example a migration head) declare a named provider: a repo-relative executable that prints versioned JSON. The engine reads provider config and executable bytes from the trusted integration-base revision, runs the script in the managed planning worktree with a constructed environment (no inherited credentials), and injects the bound bundle immediately before planning, plan-revision, and plan-review.
+
+A required provider failure blocks before the model with tag `planning-facts-provider-contract`. Optional failure records the fact as unavailable. Prose verification is not engine-verified; only a typed claims artifact that names a fact id and the current value digest is. Implementers still re-read current worktree state before writing. See [config.md](config.md) for the block shape and ceilings.
 
 ## Commit traceability trailers (always on)
 

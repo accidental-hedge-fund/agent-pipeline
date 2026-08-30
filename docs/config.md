@@ -656,6 +656,54 @@ Nested fields:
 - **Default:** `300`
 - **Description:** Seconds for the plan-review harness before timing out.
 
+### `planning_facts`
+
+- **Type:** object
+- **Default:** `{"providers":[],"timeout_ms":10000,"max_stdout_bytes":32768,"max_stderr_bytes":8192,"max_fact_count":32,"max_key_chars":64,"max_value_chars":1024,"max_prompt_chars":8192}`
+- **Description:** Named planning-fact providers observed immediately before planning, plan-revision, and plan-review (#1300). Absent or empty providers: no spawn, no prompt section, no new blocking failure. SECURITY: each executable is spawned from trusted integration-base bytes with a constructed env (no inherited credentials).
+
+Nested fields:
+
+#### `planning_facts.max_fact_count`
+
+- **Type:** integer
+- **Description:** Combined fact-count ceiling across providers (pipeline max 32; repository may only lower).
+
+#### `planning_facts.max_key_chars`
+
+- **Type:** integer
+- **Description:** Fact-key character ceiling (pipeline max 64; repository may only lower).
+
+#### `planning_facts.max_prompt_chars`
+
+- **Type:** integer
+- **Description:** Total planning-facts prompt contribution ceiling (pipeline max 8192; repository may only lower).
+
+#### `planning_facts.max_stderr_bytes`
+
+- **Type:** integer
+- **Description:** Per-provider stderr ceiling in bytes (pipeline max 8192; repository may only lower).
+
+#### `planning_facts.max_stdout_bytes`
+
+- **Type:** integer
+- **Description:** Per-provider stdout ceiling in bytes (pipeline max 32768; repository may only lower).
+
+#### `planning_facts.max_value_chars`
+
+- **Type:** integer
+- **Description:** Fact-value character ceiling for strings and each array item (pipeline max 1024; repository may only lower).
+
+#### `planning_facts.providers`
+
+- **Type:** array of object
+- **Description:** Named providers. Empty (default): no spawn, no planning-facts prompt section.
+
+#### `planning_facts.timeout_ms`
+
+- **Type:** integer
+- **Description:** Per-provider runtime ceiling in milliseconds (pipeline max 10000; repository may only lower).
+
 ### `pre_code_attestation`
 
 - **Type:** object

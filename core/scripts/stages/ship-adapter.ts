@@ -1253,6 +1253,59 @@ function prepareLoopRunId(parsed: Record<string, unknown> | null): string {
   return "";
 }
 
+function prepareUnsignedFrgRunId(parsed: Record<string, unknown> | null): string {
+  if (!parsed) return "";
+  const frg = parsed.frg;
+  if (frg && typeof frg === "object" && !Array.isArray(frg)) {
+    const id = (frg as { frg_run_id?: unknown }).frg_run_id;
+    if (typeof id === "string") return id.trim();
+  }
+  return "";
+}
+
+function prepareObserveMiss(parsed: Record<string, unknown> | null): {
+  reason: string;
+  expected_frg_run_id: string;
+  observed_run_id: string | null;
+} {
+  const miss = parsed?.observe_miss;
+  if (miss && typeof miss === "object" && !Array.isArray(miss)) {
+    const rec = miss as {
+      reason?: unknown;
+      expected_frg_run_id?: unknown;
+      observed_run_id?: unknown;
+    };
+    return {
+      reason: typeof rec.reason === "string" && rec.reason.trim() !== "" ? rec.reason : "rejected",
+      expected_frg_run_id:
+        typeof rec.expected_frg_run_id === "string" ? rec.expected_frg_run_id : "",
+      observed_run_id: typeof rec.observed_run_id === "string" ? rec.observed_run_id : null,
+    };
+  }
+  return {
+    reason: "awaiting_frg_attestation",
+    expected_frg_run_id: prepareUnsignedFrgRunId(parsed),
+    observed_run_id: null,
+  };
+}
+
+function attestCheckpointKey(parsed: Record<string, unknown> | null, loopRunId: string): string {
+  return prepareUnsignedFrgRunId(parsed) || loopRunId;
+}
+
+function frgPackAttestFailMessage(
+  unsignedA: string,
+  observedB: string | null,
+  reason: string,
+): string {
+  const a = unsignedA.trim() !== "" ? unsignedA : "unknown";
+  const b = observedB && observedB.trim() !== "" ? observedB : "none";
+  return (
+    `ship FRG: attestation observe failed after one factory-gate spawn ` +
+    `(unsigned_frg_run_id=${a} observed_run_id=${b} reason=${reason})`
+  );
+}
+
 export type FrgPackWaitDecision = "continue" | "fail";
 
 function waitLivenessContinues(live: boolean | BoundPackLoopLiveness): boolean {
@@ -1266,13 +1319,20 @@ function normalizeBoundPackLoopLiveness(
   return raw ? "live" : "not-live";
 }
 
-/** retry + live or unknown continues even when attempt == cap. Cap applies only when not-live. */
+/**
+ * retry + live or unknown continues even when attempt == cap. Cap applies only when not-live.
+ * attest continues only while this complete checkpoint binding has received zero attestor spawns.
+ */
 export function classifyFrgPackWaitDecision(input: {
   tick: CandidatePrepareTick;
   live: boolean | BoundPackLoopLiveness;
   attempt: number;
   cap: number;
+  attestAllowanceSpent?: boolean;
 }): FrgPackWaitDecision {
+  if (input.tick === "attest") {
+    return input.attestAllowanceSpent ? "fail" : "continue";
+  }
   if (input.tick !== "retry") return "continue";
   if (waitLivenessContinues(input.live)) return "continue";
   if (Number.isInteger(input.attempt) && Number.isInteger(input.cap) && input.attempt < input.cap) {
@@ -1822,6 +1882,7 @@ export function bindCandidateShipEndOperations(
       const requestPath = await resolveCandidateFactoryReleaseRequestPath(ctx, intent, train);
       const attempts = ctx.frgWaitAttempts ?? FRG_WAIT_ATTEMPTS;
       let attempt = 0;
+      let attestedCheckpointKey: string | null = null;
       for (;;) {
         attempt += 1;
         const prep = await spawnLeaf(
@@ -1838,6 +1899,25 @@ export function bindCandidateShipEndOperations(
           if (!loopRunId) {
             throw new Error("ship FRG: candidate factory-release prepare is eligible but missing loop_run_id");
           }
+          const checkpointKey = attestCheckpointKey(parsed, loopRunId);
+          const spent = attestedCheckpointKey !== null && attestedCheckpointKey === checkpointKey;
+          const decision = classifyFrgPackWaitDecision({
+            tick: "attest",
+            live: false,
+            attempt,
+            cap: attempts,
+            attestAllowanceSpent: spent,
+          });
+          if (decision === "fail") {
+            const miss = prepareObserveMiss(parsed);
+            throw new Error(
+              frgPackAttestFailMessage(
+                miss.expected_frg_run_id || prepareUnsignedFrgRunId(parsed) || checkpointKey,
+                miss.observed_run_id,
+                miss.reason,
+              ),
+            );
+          }
           const gate = await spawnLeaf(
             ctx,
             engine,
@@ -1849,8 +1929,8 @@ export function bindCandidateShipEndOperations(
               `ship FRG: candidate factory-gate failed (exit ${gate.code}): ${gate.stderr || gate.stdout}`,
             );
           }
-          // Re-invoke the same request-bound prepare until it proves complete.
-          // Do not return at the attestation checkpoint (#1151).
+          attestedCheckpointKey = checkpointKey;
+          // Re-invoke the same request-bound prepare once. Do not spawn again for A.
           continue;
         }
         if (verdict === "retry") {
