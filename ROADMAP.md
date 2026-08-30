@@ -52,6 +52,7 @@ This file is human-readable forward-looking documentation for open work. **GitHu
 | **v1.39.13** ✅ shipped | patch | v1.39.13 | #1235, #1236, #1237, #1238, #1240, #1243, #1245, #1246 | Shipped 2026-08-27 (tag `v1.39.13`). See CHANGELOG.md. |
 | **v1.39.14** ✅ shipped | patch | v1.39.14 | #1252, #1258, #1259, #1269, #1271 | Shipped 2026-08-28 (tag `v1.39.14`). See CHANGELOG.md. |
 | **v1.39.15** ✅ shipped | patch | v1.39.15 | #1272, #1273, #1274, #1275, #1276, #1277 | Shipped 2026-08-29 (tag `v1.39.15`). See CHANGELOG.md. |
+| **v1.39.16** ✅ shipped | patch | v1.39.16 | #1047, #1048, #1049, #1072, #1147, #1264, #1265, #1266, #1295, #1296, #1297, #1298, #1299, #1300 | Shipped 2026-08-30 (tag `v1.39.16`). See CHANGELOG.md. |
 | *(none)* | — | Unscheduled / no release | — | _Structural insertion anchor for `intake` and `sweep` — do not remove._ |
 
 ## Per-issue plan
