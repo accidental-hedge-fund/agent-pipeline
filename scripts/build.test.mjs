@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// Tests for scripts/build.mjs packaging law (#1048): no vendored core, no slash
-// pack, --check is SKILL overlay + marketplace catalog only.
+// Tests for scripts/build.mjs packaging law (#1048/#1050): no plugin/ tree,
+// no slash pack, --check is the four generated host SKILLs only.
 // Run with: node --test scripts/build.test.mjs
 
 import { test } from "node:test";
@@ -18,7 +18,6 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawnSync } from "node:child_process";
 
 import {
   OPERATION_SURFACE,
@@ -54,6 +53,42 @@ function listRelFiles(dir, prefix = "") {
   }
   return out;
 }
+
+test("generate does not recreate plugin/ (#1050)", () => {
+  const tmp = makeTmp();
+  try {
+    buildInto(tmp);
+    assert.equal(
+      existsSync(join(tmp, "plugin")),
+      false,
+      "generator must not create a plugin/ directory",
+    );
+    assert.equal(
+      existsSync(join(tmp, SKILL_OVERLAY_REL)),
+      false,
+      "generator must not write plugin/pipeline/skills/pipeline/SKILL.md",
+    );
+    const hits = listRelFiles(join(tmp, "plugin"));
+    assert.deepEqual(hits, [], `generator must not write under plugin/; found: ${hits.join(", ")}`);
+  } finally {
+    cleanup(tmp);
+  }
+});
+
+test("generate does not write a marketplace catalog (#1050)", () => {
+  const tmp = makeTmp();
+  try {
+    buildInto(tmp);
+    assert.equal(
+      existsSync(join(tmp, MARKETPLACE_CATALOG_REL)),
+      false,
+      "generator must not write .claude-plugin/marketplace.json",
+    );
+    assert.equal(existsSync(join(tmp, ".claude-plugin")), false);
+  } finally {
+    cleanup(tmp);
+  }
+});
 
 test("generate does not vendor core/scripts/pipeline.ts into plugin/ (#1048)", () => {
   const tmp = makeTmp();
@@ -96,55 +131,15 @@ test("generate does not write plugin/pipeline/commands/pipeline:<verb>.md (#1048
   }
 });
 
-test("production generate removes retired outputs without deleting unrelated plugin files (#1048)", () => {
+test("generate does not mkdir, copy, or write leftover plugin/ paths (#1050)", () => {
   const tmp = makeTmp();
   try {
-    const retiredCommand = join(tmp, "plugin", "pipeline", "commands", "pipeline:status.md");
-    const retiredCore = join(
-      tmp,
-      "plugin",
-      "pipeline",
-      "skills",
-      "pipeline",
-      "core",
-      "scripts",
-      "pipeline.ts",
-    );
-    const operatorNote = join(tmp, "plugin", "pipeline", "operator-note.txt");
-    const scriptNote = join(
-      tmp,
-      "plugin",
-      "pipeline",
-      "skills",
-      "pipeline",
-      "scripts",
-      "operator-note.txt",
-    );
-    const otherPlugin = join(tmp, "plugin", "another-plugin", "README.md");
-
-    for (const path of [retiredCommand, retiredCore, operatorNote, scriptNote, otherPlugin]) {
-      mkdirSync(dirname(path), { recursive: true });
-      writeFileSync(path, `sentinel:${path}\n`);
-    }
-
-    // Exercise the same cleanup + build function used by the production CLI.
+    const leftover = join(tmp, "plugin", "pipeline", "operator-note.txt");
+    mkdirSync(dirname(leftover), { recursive: true });
+    writeFileSync(leftover, "sentinel\n");
     buildInto(tmp);
-
-    assert.equal(
-      existsSync(join(tmp, "plugin", "pipeline", "commands")),
-      false,
-      "retired per-verb command directory must be removed",
-    );
-    assert.equal(
-      existsSync(join(tmp, "plugin", "pipeline", "skills", "pipeline", "core")),
-      false,
-      "retired core mirror must be removed",
-    );
-    assert.match(readFileSync(operatorNote, "utf8"), /^sentinel:/);
-    assert.match(readFileSync(scriptNote, "utf8"), /^sentinel:/);
-    assert.match(readFileSync(otherPlugin, "utf8"), /^sentinel:/);
-    assert.equal(existsSync(join(tmp, SKILL_OVERLAY_REL)), true);
-    assert.equal(existsSync(join(tmp, MARKETPLACE_CATALOG_REL)), true);
+    assert.equal(existsSync(join(tmp, SKILL_OVERLAY_REL)), false);
+    assert.match(readFileSync(leftover, "utf8"), /^sentinel/);
   } finally {
     cleanup(tmp);
   }
@@ -172,91 +167,22 @@ test("OPERATION_SURFACE remains a catalog and does not itself write command file
   }
 });
 
-test("default build renders the plugin SKILL table from OPERATION_SURFACE (#1048)", () => {
+test("default build renders host SKILL tables from OPERATION_SURFACE (#1048/#1050)", () => {
   const tmp = makeTmp();
   const status = OPERATION_SURFACE.find((op) => op.name === "status");
   assert.ok(status, "catalog must list status");
   const original = status.desc;
-  const marker = "catalog-driven plugin status marker";
+  const marker = "catalog-driven host status marker";
   try {
     status.desc = marker;
     buildInto(tmp);
-    const skill = readFileSync(join(tmp, SKILL_OVERLAY_REL), "utf8");
+    const skill = readFileSync(join(tmp, "hosts", "claude", "SKILL.md"), "utf8");
     assert.match(skill, new RegExp(marker));
     assert.doesNotMatch(skill, /^\/pipeline run\b/m);
+    assert.equal(existsSync(join(tmp, SKILL_OVERLAY_REL)), false);
   } finally {
     status.desc = original;
     cleanup(tmp);
-  }
-});
-
-test("generated plugin bridge delegates to the managed Claude CLI without a plugin core (#1048)", () => {
-  const tmp = makeTmp();
-  const claudeRoot = makeTmp();
-  try {
-    buildInto(tmp);
-    const managedLauncher = join(claudeRoot, "skills", "pipeline", "scripts", "pipeline.mjs");
-    mkdirSync(dirname(managedLauncher), { recursive: true });
-    writeFileSync(join(claudeRoot, "skills", "pipeline", ".pipeline-installer-managed"), "\n");
-    writeFileSync(
-      managedLauncher,
-      'console.log(JSON.stringify({ delegated: process.argv.slice(2) }));\n',
-    );
-
-    const pluginLauncher = join(
-      tmp,
-      "plugin",
-      "pipeline",
-      "skills",
-      "pipeline",
-      "scripts",
-      "pipeline.mjs",
-    );
-    const result = spawnSync(process.execPath, [pluginLauncher, "status", "1048"], {
-      encoding: "utf8",
-      env: { ...process.env, CLAUDE_CONFIG_DIR: claudeRoot },
-    });
-    assert.equal(result.status, 0, result.stderr);
-    assert.deepEqual(JSON.parse(result.stdout), { delegated: ["status", "1048"] });
-    assert.equal(
-      existsSync(join(tmp, "plugin", "pipeline", "skills", "pipeline", "core")),
-      false,
-    );
-
-    const skill = readFileSync(join(tmp, SKILL_OVERLAY_REL), "utf8");
-    assert.equal(skill, renderHostSkill());
-    assert.doesNotMatch(skill, /## Setup \(zero install after first run\)/);
-    assert.doesNotMatch(skill, /CLAUDE_PLUGIN_ROOT}\/skills\/pipeline\/core\/scripts/);
-  } finally {
-    cleanup(tmp);
-    cleanup(claudeRoot);
-  }
-});
-
-test("generated plugin bridge fails with install remediation when managed CLI is absent (#1048)", () => {
-  const tmp = makeTmp();
-  const claudeRoot = makeTmp();
-  try {
-    buildInto(tmp);
-    const pluginLauncher = join(
-      tmp,
-      "plugin",
-      "pipeline",
-      "skills",
-      "pipeline",
-      "scripts",
-      "pipeline.mjs",
-    );
-    const result = spawnSync(process.execPath, [pluginLauncher, "doctor"], {
-      encoding: "utf8",
-      env: { ...process.env, CLAUDE_CONFIG_DIR: claudeRoot },
-    });
-    assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /install --host claude/);
-    assert.match(result.stderr, /managed Claude CLI install not found/);
-  } finally {
-    cleanup(tmp);
-    cleanup(claudeRoot);
   }
 });
 
@@ -275,28 +201,28 @@ test("build.mjs no longer exports per-verb command renderers (#1048)", async () 
   assert.ok(Array.isArray(buildMjs.OPERATION_SURFACE), "OPERATION_SURFACE stays the catalog");
 });
 
-test("--check: matching SKILL overlay + catalog pass without a plugin core tree (#1048)", () => {
-  const gen = makeTmp();
+test("--check: matching host SKILLs pass when plugin/ is absent (#1050)", () => {
   const repo = makeTmp();
   try {
-    buildInto(gen);
-    for (const rel of skillAndCatalogTargets()) {
-      mkdirSync(join(repo, dirname(rel)), { recursive: true });
-      writeFileSync(join(repo, rel), readFileSync(join(gen, rel)));
+    buildInto(repo);
+    rmSync(join(repo, "plugin"), { recursive: true, force: true });
+    rmSync(join(repo, ".claude-plugin"), { recursive: true, force: true });
+    for (const rel of hostSkillWriteTargets()) {
+      assert.equal(existsSync(join(repo, rel)), true, `host SKILL missing: ${rel}`);
     }
-    assert.equal(
-      existsSync(join(repo, "plugin", "pipeline", "skills", "pipeline", "core", "scripts")),
-      false,
+    assert.equal(existsSync(join(repo, SKILL_OVERLAY_REL)), false);
+    const drift = checkSkillCatalogFreshness(repo);
+    assert.deepEqual(
+      drift,
+      [],
+      `absent plugin overlay must not fail --check; got: ${drift.join("; ")}`,
     );
-    const drift = compare(gen, repo);
-    assert.deepEqual(drift, [], `expected no drift without a core copy; got: ${drift.join("; ")}`);
   } finally {
-    cleanup(gen);
     cleanup(repo);
   }
 });
 
-test("--check: stale SKILL overlay or marketplace catalog fails (#1048)", () => {
+test("--check: stale host SKILL fails (#1050)", () => {
   const gen = makeTmp();
   const repo = makeTmp();
   try {
@@ -305,19 +231,11 @@ test("--check: stale SKILL overlay or marketplace catalog fails (#1048)", () => 
       mkdirSync(join(repo, dirname(rel)), { recursive: true });
       writeFileSync(join(repo, rel), readFileSync(join(gen, rel)));
     }
-    writeFileSync(join(repo, SKILL_OVERLAY_REL), "stale skill overlay\n");
+    writeFileSync(join(repo, "hosts/claude/SKILL.md"), "stale host skill\n");
     const skillDrift = compare(gen, repo);
     assert.ok(
-      skillDrift.some((d) => d.includes(SKILL_OVERLAY_REL)),
-      `stale SKILL must fail check; got: ${skillDrift.join("; ")}`,
-    );
-
-    writeFileSync(join(repo, SKILL_OVERLAY_REL), readFileSync(join(gen, SKILL_OVERLAY_REL)));
-    writeFileSync(join(repo, MARKETPLACE_CATALOG_REL), "{}\n");
-    const catalogDrift = compare(gen, repo);
-    assert.ok(
-      catalogDrift.some((d) => d.includes(MARKETPLACE_CATALOG_REL)),
-      `stale catalog must fail check; got: ${catalogDrift.join("; ")}`,
+      skillDrift.some((d) => d.includes("hosts/claude/SKILL.md")),
+      `stale host SKILL must fail check; got: ${skillDrift.join("; ")}`,
     );
   } finally {
     cleanup(gen);
@@ -325,7 +243,7 @@ test("--check: stale SKILL overlay or marketplace catalog fails (#1048)", () => 
   }
 });
 
-test("write and check targets match SKILL_HOST_IDS plus plugin SKILL and catalog", () => {
+test("write and check targets are the four host SKILLs only (#1050)", () => {
   const hostTargets = hostSkillWriteTargets();
   assert.deepEqual([...hostTargets], [
     "hosts/claude/SKILL.md",
@@ -335,11 +253,15 @@ test("write and check targets match SKILL_HOST_IDS plus plugin SKILL and catalog
   ]);
   assert.deepEqual([...SKILL_HOST_IDS], ["claude", "codex", "grok", "opencode"]);
   const check = skillAndCatalogTargets();
-  assert.deepEqual(check.slice(0, 4), hostTargets);
-  assert.ok(check.includes(SKILL_OVERLAY_REL));
-  assert.ok(check.includes(MARKETPLACE_CATALOG_REL));
+  assert.deepEqual([...check], hostTargets);
+  assert.equal(check.includes(SKILL_OVERLAY_REL), false);
+  assert.equal(check.includes(MARKETPLACE_CATALOG_REL), false);
   assert.equal(
     check.some((p) => p === "hosts/omp/SKILL.md"),
+    false,
+  );
+  assert.equal(
+    check.some((p) => p.startsWith("plugin/")),
     false,
   );
 });
@@ -352,7 +274,7 @@ test("buildInto writes four byte-identical host SKILLs from renderHostSkill", ()
     for (const rel of hostSkillWriteTargets()) {
       assert.equal(readFileSync(join(tmp, rel), "utf8"), expected);
     }
-    assert.equal(readFileSync(join(tmp, SKILL_OVERLAY_REL), "utf8"), expected);
+    assert.equal(existsSync(join(tmp, SKILL_OVERLAY_REL)), false);
     assert.equal(existsSync(join(tmp, "hosts", "omp", "SKILL.md")), false);
   } finally {
     cleanup(tmp);
@@ -379,7 +301,7 @@ test("--check: one-byte stale host SKILL fails the real check path", () => {
   }
 });
 
-test("committed SKILL overlay and catalog match a fresh generate (live --check contract)", () => {
+test("committed host SKILLs match a fresh generate (live --check contract)", () => {
   const tmp = makeTmp();
   try {
     buildInto(tmp);
@@ -387,9 +309,16 @@ test("committed SKILL overlay and catalog match a fresh generate (live --check c
     assert.deepEqual(
       drift,
       [],
-      `committed SKILL/catalog stale — run node scripts/build.mjs: ${drift.join("; ")}`,
+      `committed host SKILLs stale — run node scripts/build.mjs: ${drift.join("; ")}`,
     );
   } finally {
     cleanup(tmp);
   }
+});
+
+test("root package.json files does not list plugin or .claude-plugin (#1050)", () => {
+  const pkg = JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8"));
+  assert.ok(Array.isArray(pkg.files), "root package.json must declare files");
+  assert.equal(pkg.files.includes("plugin"), false);
+  assert.equal(pkg.files.includes(".claude-plugin"), false);
 });

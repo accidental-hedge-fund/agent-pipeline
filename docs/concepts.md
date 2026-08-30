@@ -34,7 +34,7 @@ A newcomer who completed Prerequisites, Install, and Quickstart in the README ha
 
 ## How hosts share one CLI
 
-Hosts (Claude Code `/pipeline`, Codex `$pipeline`, and others) are shims around one TypeScript engine under `core/`. Host-specific packaging lives in `hosts/`. Dispatch, stages, review policy, and merge posture are identical across hosts — only the root invocation token and install profile differ. The product is the `pipeline` CLI; see [packaging.md](packaging.md). The transitional `plugin/` tree contains only the generated SKILL overlay until #1050; its companion catalog is `.claude-plugin/marketplace.json`. Neither is the distribution product or a copy of `core/`.
+Hosts (Claude Code `/pipeline`, Codex `$pipeline`, and others) are shims around one TypeScript engine under `core/`. Host-specific packaging lives in `hosts/`. Dispatch, stages, review policy, and merge posture are identical across hosts — only the root invocation token and install profile differ. The product is the `pipeline` CLI plus a short host SKILL; see [packaging.md](packaging.md). There is no committed `plugin/` overlay.
 
 ## Onboarding details
 
@@ -306,8 +306,7 @@ Machine-facing helpers (no change to human skill flows):
 | `core/scripts/` | Engine (TypeScript, native type-stripping) |
 | `core/test/` | Unit tests |
 | `hosts/` | Per-host packaging (`claude`, `codex`, …) |
-| `plugin/` | Generated SKILL overlay — transitional until #1050; not the product; do not hand-edit |
-| `scripts/build.mjs` | Generate/check the SKILL overlay and marketplace catalog |
+| `scripts/build.mjs` | Generate/check the four host SKILLs |
 | `scripts/generate-docs.mjs` | Generate/check CLI, config, and CHANGELOG (not host SKILLs) |
 | `docs/` | Operator docs (`packaging.md`, `cli.md`, `config.md`, `concepts.md`) |
 | `openspec/` | Living specs + in-flight changes |

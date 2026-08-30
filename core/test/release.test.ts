@@ -151,17 +151,27 @@ const RELEASE_MANAGED_PATHS = [
   "package.json",
   "core/package.json",
   "ROADMAP.md",
-  "plugin",
-  ".claude-plugin",
   "hosts/claude/SKILL.md",
   "hosts/codex/SKILL.md",
   "hosts/grok/SKILL.md",
   "hosts/opencode/SKILL.md",
 ] as const;
 
-/** True when argv names a managed path (`plugin` or `plugin/`). */
+/** True when argv names a managed path (`hosts/claude/SKILL.md` or trailing slash). */
 function argvNamesManagedPath(args: string[], path: string): boolean {
   return args.includes(path) || args.includes(`${path}/`);
+}
+
+function argvTouchesPluginOrCatalog(args: string[]): boolean {
+  return args.some(
+    (part) =>
+      part === "plugin" ||
+      part === "plugin/" ||
+      part === ".claude-plugin" ||
+      part === ".claude-plugin/" ||
+      part.startsWith("plugin/") ||
+      part.startsWith(".claude-plugin/"),
+  );
 }
 
 /**
@@ -181,8 +191,11 @@ function restoreInvoked(commands: string[][]): boolean {
       c.includes("package.json") &&
       c.includes("core/package.json") &&
       c.includes("ROADMAP.md") &&
-      c.includes("plugin") &&
-      c.includes("hosts/claude/SKILL.md"),
+      c.includes("hosts/claude/SKILL.md") &&
+      c.includes("hosts/codex/SKILL.md") &&
+      c.includes("hosts/grok/SKILL.md") &&
+      c.includes("hosts/opencode/SKILL.md") &&
+      !argvTouchesPluginOrCatalog(c),
   );
 }
 
@@ -1753,9 +1766,9 @@ test("runRelease: aborts before any write when a release-managed path is dirty (
 
 test("runRelease: clean-tree guard forces --untracked-files=all (config-independent) (#170 review-2)", async () => {
   // Plain `git status` honors `status.showUntrackedFiles`, so a maintainer with that set to
-  // `no` could slip an untracked file under plugin/ past the guard. Release-abort rollback
-  // cleans untracked release-managed paths, so the guard MUST pass --untracked-files=all and
-  // not depend on user git config. This asserts the flag is present on the status command.
+  // `no` could slip an untracked generated host SKILL past the guard. The guard MUST pass
+  // --untracked-files=all and not depend on user git config. This asserts the flag is present
+  // on the status command.
   const statusCalls: string[][] = [];
   const deps = makeDeps({
     readFile: (p) => {
@@ -2481,6 +2494,11 @@ test("runRelease: a post-bump abort (CI failure) restores the bumped files (#170
   // The bumped files are reverted from HEAD into index and worktree (build.mjs is not
   // re-run), so a retry reads the original previousVersion.
   assert.ok(restoreInvoked(commands), "HEAD restore rollback issued after CI abort");
+  assert.equal(
+    commands.some((c) => c[0] === "git" && argvTouchesPluginOrCatalog(c)),
+    false,
+    "rollback must not restore, add, or clean plugin/ or .claude-plugin",
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -2766,8 +2784,7 @@ test("runRelease: git add after FRG pass must not include gitignored .agent-pipe
   assert.ok(add.includes("package.json"));
   assert.ok(add.includes("core/package.json"));
   assert.ok(add.includes("ROADMAP.md"));
-  assert.ok(add.includes("plugin/"));
-  assert.ok(add.includes(".claude-plugin/"));
+  assert.equal(argvTouchesPluginOrCatalog(add), false, `git add must not name plugin/ or .claude-plugin, got: ${add.join(" ")}`);
   assert.ok(add.includes("hosts/claude/SKILL.md"));
   assert.ok(add.includes("hosts/codex/SKILL.md"));
   assert.ok(add.includes("hosts/grok/SKILL.md"));

@@ -909,26 +909,26 @@ export function buildPreflightChecks(
   });
 
   // 8. Generated packaging freshness (conditional) — for repos whose
-  //    SKILL/catalog outputs are driven by `scripts/build.mjs`. Running
+  //    host SKILL outputs are driven by `scripts/build.mjs`. Running
   //    `node scripts/build.mjs --check` without writing files catches stale
   //    generated outputs before CI does. The check is guarded by the presence of
-  //    both artifacts so it is a no-op in repos without this pattern.
+  //    the generator so it is a no-op in repos without this pattern. Absence of
+  //    plugin/ does not skip the check (#1050).
   checks.push({
     // Public compatibility: doctor --json exposes this id in checks[].name.
     // Keep the legacy identifier while replacing its retired mirror semantics.
     id: "plugin-mirror",
-    description: "Generated SKILL/catalog outputs are fresh (scripts/build.mjs --check)",
+    description: "Generated host SKILLs are fresh (scripts/build.mjs --check)",
     run: async (deps) => {
       const buildScript = path.join(config.repo_dir, "scripts", "build.mjs");
-      const pluginDir = path.join(config.repo_dir, "plugin");
-      if (!(await deps.fsExists(buildScript)) || !(await deps.fsExists(pluginDir))) {
-        return skip("no scripts/build.mjs or plugin/ directory — packaging freshness check is not applicable");
+      if (!(await deps.fsExists(buildScript))) {
+        return skip("no scripts/build.mjs — packaging freshness check is not applicable");
       }
       return (await deps.execCheck("node", [buildScript, "--check"]))
-        ? pass("generated SKILL/catalog outputs are fresh")
+        ? pass("generated host SKILLs are fresh")
         : fail(
-            "generated SKILL/catalog outputs are stale",
-            "Run `node scripts/build.mjs` from the repo root to regenerate the SKILL/catalog outputs, then commit the result.",
+            "generated host SKILLs are stale",
+            "Run `node scripts/build.mjs` from the repo root to regenerate the host SKILLs, then commit the result.",
           );
     },
   });

@@ -6,14 +6,12 @@ conventions. Keep it in sync with `CLAUDE.md`.
 ## Golden rules (read first)
 
 1. **The product is the `pipeline` CLI plus a short host SKILL.** Hosts are argv
-   wrappers that exec the CLI; do not treat `plugin/` as distribution. Edit
-   `core/`, never `plugin/` directly. After **any** edit under `core/`, run
-   `node scripts/build.mjs` from the repo root so `--check` can assert SKILL
-   overlay and marketplace catalog freshness. Do not commit a `plugin/` copy of
-   `core/scripts`. A stale SKILL overlay or marketplace catalog fails CI's
-   `build.mjs --check` gate. Whole-tree deletion of `plugin/` is #1050.
+   wrappers that exec the CLI. Edit `core/`. After **any** edit under `core/`,
+   run `node scripts/build.mjs` from the repo root so `--check` can assert
+   generated host SKILL freshness. Do not recreate or commit `plugin/`. A stale
+   host SKILL fails CI's `build.mjs --check` gate.
 2. **`npm run ci` must pass before a change is done.** It runs: `ci:core`
-   (`cd core && npm ci && npm test`) → `build.mjs --check` (SKILL/catalog freshness) →
+   (`cd core && npm ci && npm test`) → `build.mjs --check` (host SKILL freshness) →
    `ci:install-smoke` → `ci:openspec` (`openspec validate --all` when an
    `openspec/` directory is present) → **conditional docs freshness** (`ci:docs`:
    no-op when the generator is absent; real `docs:check` / `generate-docs --check`
@@ -38,11 +36,8 @@ conventions. Keep it in sync with `CLAUDE.md`.
 ## Layout
 
 - `core/scripts/` — the engine (TypeScript, no build step).
-- `plugin/` — generated Claude SKILL overlay, plugin manifest, and support
-  scripts until #1050; do not hand-edit. The companion marketplace catalog is
-  `.claude-plugin/marketplace.json`. Neither location contains a `core/scripts` copy.
 - `hosts/` — per-host packaging (short SKILL shims that exec the CLI).
-- `scripts/build.mjs` — generates / checks the SKILL overlay and marketplace catalog.
+- `scripts/build.mjs` — generates / checks the four host SKILLs.
 
 ## Build & test
 

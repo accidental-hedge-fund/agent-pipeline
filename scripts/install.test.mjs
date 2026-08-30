@@ -2181,6 +2181,12 @@ test("install --host claude: installed launcher dispatches doctor and status wit
       existsSync(join(claudeTmp, "skills", "pipeline", "plugin")),
       false,
     );
+    const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+    assert.equal(
+      existsSync(join(repoRoot, "plugin")),
+      false,
+      "install --host claude must not require a repo plugin/ tree",
+    );
 
     const env = {
       ...process.env,
