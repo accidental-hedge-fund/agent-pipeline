@@ -160,6 +160,10 @@ import {
 } from "./grill-issue.ts";
 import { materializeGrillAnswer } from "./grill-handoff.ts";
 import {
+  defaultGrillProposalKeyDeps,
+  resolveGrillProposalKey,
+} from "./grill-proposal.ts";
+import {
   recordPapercut,
   reportPapercuts,
   papercutsEnabled,
@@ -5207,6 +5211,14 @@ async function main(): Promise<void> {
                 } catch (err) {
                   return { ok: false as const, reason: (err as Error).message, code: "config" };
                 }
+                let frontierKey: string;
+                try {
+                  frontierKey = resolveGrillProposalKey(repoDir, defaultGrillProposalKeyDeps, {
+                    createIfMissing: false,
+                  });
+                } catch (err) {
+                  return { ok: false as const, reason: (err as Error).message, code: "config" };
+                }
                 const out = await materializeGrillAnswer(handoff, text, {
                   getIssueBody: async (n) => (await getIssueDetail(cfg, n)).body,
                   updateIssueBody: async (n, body) => {
@@ -5220,6 +5232,8 @@ async function main(): Promise<void> {
                     }
                   },
                   repoDir,
+                  keyDeps: defaultGrillProposalKeyDeps,
+                  frontierKey,
                 });
                 return out.ok
                   ? { ok: true as const, wrote: out.wrote }

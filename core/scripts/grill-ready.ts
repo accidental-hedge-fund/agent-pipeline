@@ -8,6 +8,8 @@ import {
 } from "./grill-decisions.ts";
 import { requiredContextSatisfied } from "./grill-context.ts";
 import { fingerprintStaleReasons, type GrillFingerprint } from "./grill-fingerprint.ts";
+import type { GrillFrontierBinding } from "./grill-frontier.ts";
+import { liveMatchesGrillFrontier } from "./grill-frontier.ts";
 import {
   isGrillAuthorityDeclaration,
   liveNodeMatchesGrillBinding,
@@ -23,6 +25,8 @@ export interface GrillReadySnapshot {
   integrationBaseSha: string;
   handoffs: HumanQuestionHandoff[];
   comments: Array<{ body: string }>;
+  /** Pipeline-produced HMAC-verified frontier. Null/omitted fails closed. */
+  frontier?: GrillFrontierBinding | null;
 }
 
 export type ReadyValidationFailure = {
@@ -51,6 +55,21 @@ export function validateDecisionsForReady(snapshot: GrillReadySnapshot): ReadyVa
     };
   }
   const artifact = parsed.artifact;
+  if (!snapshot.frontier) {
+    return {
+      ok: false,
+      reason: "authenticated Decisions frontier is missing",
+      code: "invalid_provenance",
+    };
+  }
+  const frontierMatch = liveMatchesGrillFrontier(snapshot.body, artifact.nodes, snapshot.frontier);
+  if (!frontierMatch.ok) {
+    return {
+      ok: false,
+      reason: frontierMatch.reason,
+      code: "invalid_provenance",
+    };
+  }
   for (const h of snapshot.handoffs) {
     if (!isGrillAuthorityDeclaration(h.declaration_identity)) continue;
     // Ignore only explicitly superseded records. Pending/answered stay fail-closed.

@@ -162,7 +162,7 @@ If any node in the proposal carries a reviewer verdict of `challenge`, apply SHA
 
 ### Requirement: The Decisions artifact SHALL be versioned, embedded, and the sole source of the readable Decisions section
 
-Pipeline SHALL embed a versioned Pipeline-owned Decisions artifact in the issue body. Each stable node SHALL record its question, recommendation, authority class, resolution, provenance reference, and input digests. Pipeline SHALL recompute those input digests from the live node definition fields (id, question, recommendation, class, and term_id) at parse, handoff materialize, and `--stage ready`. A stored digest that does not match the live fields SHALL fail closed. The canonical definition digest SHALL be bound on the grill-authority handoff declaration identity and `content_hashes`. `--stage ready` SHALL verify each pending or answered grill-authority record against that binding. It SHALL ignore superseded records. A pending or answered record whose digest does not match SHALL fail closed. The Decisions fence checksum and model-written provenance SHALL NOT authorize a rewritten definition. Pipeline SHALL render the readable `## Decisions` section from that same artifact. Divergence between the artifact and the rendered section SHALL fail validation at apply, handoff materialize, and `--stage ready`. The issue body SHALL remain the specification. Comments and handoffs MAY prove provenance. They SHALL NOT replace the body.
+Pipeline SHALL embed a versioned Pipeline-owned Decisions artifact in the issue body. Each stable node SHALL record its question, recommendation, authority class, resolution, provenance reference, and input digests. Pipeline SHALL recompute those input digests from the live node definition fields (id, question, recommendation, class, and term_id) at parse, handoff materialize, and `--stage ready`. A stored digest that does not match the live fields SHALL fail closed. The canonical definition digest SHALL be bound on the grill-authority handoff declaration identity and `content_hashes`. `--stage ready` SHALL verify each pending or answered grill-authority record against that binding. It SHALL ignore superseded records. A pending or answered record whose digest does not match SHALL fail closed. Body-local `input_digests` and the Decisions fence checksum SHALL NOT be the authority binding for the applied node set. Pipeline SHALL render the readable `## Decisions` section from that same artifact. Divergence between the artifact and the rendered section SHALL fail validation at apply, handoff materialize, and `--stage ready`. The issue body SHALL remain the specification. Comments and handoffs MAY prove provenance. They SHALL NOT replace the body.
 
 #### Scenario: Render matches artifact
 
@@ -193,6 +193,26 @@ Pipeline SHALL embed a versioned Pipeline-owned Decisions artifact in the issue 
 - **AND** an editor changes that node's class or provenance, then recomputes the Decisions fence checksum and rendered section
 - **THEN** `pipeline triage N --stage ready` SHALL exit 2
 - **AND** labels SHALL be unchanged
+
+---
+
+### Requirement: Apply SHALL persist an authenticated canonical Decisions frontier
+
+Pipeline SHALL persist a host-local HMAC-signed canonical frontier when apply writes a Decisions body. The record SHALL include each live node ID, taxonomy class, and canonical definition digest. The MAC SHALL use the grill proposal key. The editable issue body, recomputed `input_digests`, and fence checksum SHALL NOT be that record. `--stage ready` SHALL require a MAC-valid frontier and SHALL require every live node to match it. Removed, reclassified, or newly added nodes SHALL fail closed unless Pipeline produced the next frontier during a successful hash-bound handoff materialize. A missing, MAC-invalid, or mismatched frontier SHALL exit 2 with no label write, including when no grill-authority handoff remains in the snapshot.
+
+#### Scenario: Rewritten authority node with regenerated body-local digests fails ready
+
+- **WHEN** an applied body contains an unresolved operator-required node
+- **AND** an editor rewrites that node to a taxonomy-validated non-authority class with `resolution: resolved` and `settled-by: reviewer-accept`
+- **AND** recomputes every body-local digest, fence checksum, and rendered section
+- **THEN** `pipeline triage N --stage ready` SHALL exit 2
+- **AND** labels SHALL be unchanged
+
+#### Scenario: Handoff materialize writes the next frontier
+
+- **WHEN** a hash-bound `pipeline handoff answer` materializes an operator-required node
+- **THEN** Pipeline SHALL persist the next authenticated frontier for the written body
+- **AND** SHALL keep the same node IDs, classes, and definition digests
 
 ---
 

@@ -10,7 +10,15 @@ import {
   type DecisionNode,
   type DecisionsArtifact,
 } from "./grill-decisions.ts";
+import {
+  issueGrillFrontier,
+  persistGrillFrontier,
+} from "./grill-frontier.ts";
 import { sha256Hex, sha256Prefixed } from "./grill-hash.ts";
+import {
+  defaultGrillProposalKeyDeps,
+  type GrillProposalKeyDeps,
+} from "./grill-proposal.ts";
 import { classifyAuthority, isOperatorRequiredClass } from "./grill-taxonomy.ts";
 import {
   appendHandoffAudit,
@@ -267,6 +275,10 @@ export interface GrillMaterializeDeps {
   /** When set, pending sibling grill-authority handoffs rebind to the new body hash. */
   repoDir?: string;
   handoffStore?: HandoffStoreDeps;
+  /** When set with repoDir, Pipeline writes the next authenticated frontier. */
+  keyDeps?: GrillProposalKeyDeps;
+  frontierKey?: string;
+  now?: () => Date;
 }
 
 export type GrillMaterializeResult =
@@ -404,6 +416,28 @@ export async function materializeGrillAnswer(
         reason: `pending sibling rebind failed: ${(err as Error).message}`,
         code: "write_failed",
       };
+    }
+    if (deps.frontierKey) {
+      try {
+        persistGrillFrontier(
+          deps.repoDir,
+          issueGrillFrontier({
+            repo: handoff.repo,
+            issue: handoff.issue_number,
+            body: planned.body,
+            artifact: planned.artifact,
+            now: (deps.now ?? (() => new Date()))(),
+            key: deps.frontierKey,
+          }),
+          deps.keyDeps ?? defaultGrillProposalKeyDeps,
+        );
+      } catch (err) {
+        return {
+          ok: false,
+          reason: `frontier persist failed: ${(err as Error).message}`,
+          code: "write_failed",
+        };
+      }
     }
   }
   return planned;

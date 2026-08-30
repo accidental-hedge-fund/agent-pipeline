@@ -46,6 +46,15 @@ import {
   recordRequiredContextHashes,
   requiredContextSatisfied,
 } from "../scripts/grill-context.ts";
+import {
+  frontierNodesFromArtifact,
+  issueGrillFrontier,
+  liveMatchesGrillFrontier,
+  loadVerifiedGrillFrontier,
+  persistGrillFrontier,
+  verifyGrillFrontier,
+  type GrillFrontierBinding,
+} from "../scripts/grill-frontier.ts";
 import { validateDecisionsForReady } from "../scripts/grill-ready.ts";
 import {
   canCreateHandoff,
@@ -260,6 +269,20 @@ function settledOperatorNodes(): DecisionNode[] {
   });
 }
 
+function frontierFor(
+  body: string,
+  art: DecisionsArtifact,
+  repo = "acme/repo",
+  issue = 42,
+): GrillFrontierBinding {
+  return {
+    repo,
+    issue,
+    body_sha256: sha256Prefixed(body),
+    nodes: frontierNodesFromArtifact(art),
+  };
+}
+
 function completeReadySnapshot(body: string, title = "T"): GrillReadySnapshot {
   const spec = extractSpecCore(body);
   const parsed = parseDecisionsFromBody(body);
@@ -276,6 +299,7 @@ function completeReadySnapshot(body: string, title = "T"): GrillReadySnapshot {
     contextMd: "**Grill**:\nA one-shot intake interview.\n",
     integrationBaseSha: art.fingerprint.integration_base_sha,
     handoffs,
+    frontier: frontierFor(body, art),
   };
 }
 
@@ -803,6 +827,40 @@ async function signedPreview(): Promise<GrillProposalEnvelope> {
   return JSON.parse(raw) as GrillProposalEnvelope;
 }
 
+test("grill: apply persists a MAC-valid canonical frontier that ready requires", async () => {
+  const env = await signedPreview();
+  const keyDeps = memoryKeyDeps();
+  const store = memoryHandoffStore();
+  await withExit(async () => {
+    const deps = applyDeps(env, { handoffStore: store, keyDeps });
+    await runRefineSpecApply(42, {}, deps);
+    assert.equal(process.exitCode, 0);
+  });
+  const loaded = loadVerifiedGrillFrontier("/tmp/repo", 42, "test-key", env.repo, keyDeps);
+  assert.ok(loaded);
+  assert.equal(loaded?.issue, 42);
+  assert.equal(loaded?.body_sha256, sha256Prefixed(env.proposal.body));
+  assert.deepEqual(
+    loaded?.nodes.map((n) => n.id).sort(),
+    env.proposal.artifact.nodes.map((n) => n.id).sort(),
+  );
+  const match = liveMatchesGrillFrontier(env.proposal.body, env.proposal.artifact.nodes, loaded!);
+  assert.equal(match.ok, true);
+  const signed = issueGrillFrontier({
+    repo: env.repo,
+    issue: 42,
+    body: env.proposal.body,
+    artifact: env.proposal.artifact,
+    now: new Date("2026-01-01T00:00:00Z"),
+    key: "test-key",
+  });
+  const verified = verifyGrillFrontier(signed, "test-key", { repo: env.repo, issue: 42 });
+  assert.equal(verified.ok, true);
+  const tampered = { ...signed, nodes: signed.nodes.map((n) => ({ ...n, class: "docs-surface" })) };
+  const forged = verifyGrillFrontier(tampered, "test-key", { repo: env.repo, issue: 42 });
+  assert.equal(forged.ok, false);
+});
+
 test("grill: apply creates pending grill-authority handoffs; preview creates none", async () => {
   const env = await signedPreview();
   const store = memoryHandoffStore();
@@ -898,6 +956,7 @@ test("grill: thin issue artifact is non-ready", async () => {
     contextMd: "**Grill**:\nA one-shot intake interview.\n",
     integrationBaseSha: env.proposal.artifact.fingerprint.integration_base_sha,
     handoffs: [],
+    frontier: frontierFor(env.proposal.body, env.proposal.artifact),
   };
   const ready = validateDecisionsForReady(snap);
   assert.equal(ready.ok, false);
@@ -917,6 +976,7 @@ test("grill: comment-only answer does not settle a node", () => {
     contextMd: "**Grill**:\nA one-shot intake interview.\n",
     integrationBaseSha: art.fingerprint.integration_base_sha,
     handoffs: [],
+    frontier: frontierFor(body, art),
   });
   assert.equal(ready.ok, false);
   if (!ready.ok) assert.equal(ready.code, "unresolved_authority");
@@ -935,6 +995,7 @@ test("grill: model-authored handoff provenance without ledger fails ready", () =
     contextMd: "**Grill**:\nA one-shot intake interview.\n",
     integrationBaseSha: art.fingerprint.integration_base_sha,
     handoffs: [],
+    frontier: frontierFor(body, art),
   });
   assert.equal(ready.ok, false);
   if (!ready.ok) assert.equal(ready.code, "invalid_provenance");
@@ -1160,7 +1221,12 @@ test("grill: artifact-only body edit refuses answer with no write and handoff st
   if (loaded.ok) assert.equal(loaded.handoff.status, "pending");
 });
 
-function readySnap(body: string, art: DecisionsArtifact, handoffs: HumanQuestionHandoff[]): GrillReadySnapshot {
+function readySnap(
+  body: string,
+  art: DecisionsArtifact,
+  handoffs: HumanQuestionHandoff[],
+  frontier?: GrillFrontierBinding | null,
+): GrillReadySnapshot {
   return {
     title: "T",
     body,
@@ -1169,6 +1235,7 @@ function readySnap(body: string, art: DecisionsArtifact, handoffs: HumanQuestion
     contextMd: "**Grill**:\nA one-shot intake interview.\n",
     integrationBaseSha: art.fingerprint.integration_base_sha,
     handoffs,
+    frontier: frontier === undefined ? frontierFor(body, art) : frontier,
   };
 }
 
@@ -1434,6 +1501,62 @@ test("grill: successful materialize rebinds pending siblings to the new body has
   assert.equal(writes, 2);
 });
 
+test("grill: materialize persists the next authenticated frontier for the written body", async () => {
+  const spec = "## Summary\nX\n";
+  const nodes = canonicalThinIssueNodes();
+  const art = artifact(nodes, spec);
+  const body = embedDecisionsInBody(spec, art);
+  const keyDeps = memoryKeyDeps();
+  persistGrillFrontier(
+    "/tmp/repo",
+    issueGrillFrontier({
+      repo: "acme/r",
+      issue: 42,
+      body,
+      artifact: art,
+      now: new Date("2026-01-01T00:00:00Z"),
+      key: "test-key",
+    }),
+    keyDeps,
+  );
+  const store = memoryHandoffStore();
+  const input = grillAuthorityCreateInputs({
+    domain: "d",
+    repo: "acme/r",
+    issueNumber: 42,
+    artifact: art,
+    proposedBody: body,
+    frontierFp: "fp",
+  })[0]!;
+  const created = await createAndPersistHandoff("/tmp/repo", input, store);
+  assert.equal(created.ok, true);
+  if (!created.ok) return;
+  let live = body;
+  const result = await materializeGrillAnswer(created.handoff, "yes", {
+    getIssueBody: async () => live,
+    updateIssueBody: async (_n, next) => {
+      live = next;
+    },
+    repoDir: "/tmp/repo",
+    handoffStore: store,
+    keyDeps,
+    frontierKey: "test-key",
+    now: () => new Date("2026-01-01T00:00:01Z"),
+  });
+  assert.equal(result.ok, true, result.ok ? "" : result.reason);
+  if (!result.ok) return;
+  const next = loadVerifiedGrillFrontier("/tmp/repo", 42, "test-key", "acme/r", keyDeps);
+  assert.ok(next);
+  assert.equal(next?.body_sha256, sha256Prefixed(live));
+  assert.notEqual(next?.body_sha256, sha256Prefixed(body));
+  assert.deepEqual(
+    next?.nodes.map((n) => `${n.id}:${n.class}`).sort(),
+    art.nodes.map((n) => `${n.id}:${n.class}`).sort(),
+  );
+  const match = liveMatchesGrillFrontier(live, result.artifact.nodes, next!);
+  assert.equal(match.ok, true);
+});
+
 test("grill: persist-after-write failure heals on retry without a second write", async () => {
   const spec = "## Summary\nX\n";
   const nodes = canonicalThinIssueNodes();
@@ -1619,6 +1742,7 @@ test("grill: rewritten authority class with recomputed fence fails ready without
       contextMd: "**Grill**:\nA one-shot intake interview.\n",
       integrationBaseSha: art.fingerprint.integration_base_sha,
       handoffs: pending,
+      frontier: frontierFor(body, art),
     }),
   };
   await assert.rejects(() => runTriage({ issueArg: "42", stage: "ready" }, deps), (err: Error) => {
@@ -1669,12 +1793,92 @@ test("grill: rewritten authority class with regenerated digests still fails read
       contextMd: "**Grill**:\nA one-shot intake interview.\n",
       integrationBaseSha: art.fingerprint.integration_base_sha,
       handoffs: pending,
+      frontier: frontierFor(body, art),
     }),
   };
   await assert.rejects(() => runTriage({ issueArg: "42", stage: "ready" }, deps), (err: Error) => {
     assert.equal(err instanceof TriageReadyError, true);
     assert.equal((err as TriageReadyError).exitCode, 2);
     assert.equal((err as TriageReadyError).code, "invalid_provenance");
+    return true;
+  });
+  assert.deepEqual(add, []);
+  assert.deepEqual(remove, []);
+});
+
+test("grill: rewritten authority node with regenerated body-local values and no handoffs fails ready", async () => {
+  const spec = "## Summary\nX\n";
+  const art = artifact(canonicalThinIssueNodes(), spec);
+  const body = embedDecisionsInBody(spec, art);
+  const appliedFrontier = frontierFor(body, art);
+  const parsedOrig = parseDecisionsFromBody(body);
+  assert.equal(parsedOrig.ok, true);
+  if (!parsedOrig.ok) return;
+  const rewrittenNodes = parsedOrig.artifact.nodes.map((n) => {
+    const next: DecisionNode = {
+      ...n,
+      class: "docs-surface",
+      resolution: "resolved",
+      provenance: {
+        settled_by: "reviewer-accept",
+        reference: null,
+        reviewer_verdict: "accept",
+        reviewer_reason: "self-rewritten",
+        eligibility_reason: NON_AUTHORITY_ELIGIBILITY_REASON,
+      },
+    };
+    next.input_digests = nodeInputDigests(next);
+    return next;
+  });
+  const tampered = embedDecisionsInBody(extractSpecCore(body), {
+    ...parsedOrig.artifact,
+    nodes: rewrittenNodes,
+  });
+  const parsed = parseDecisionsFromBody(tampered);
+  assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+  if (parsed.ok) {
+    assert.ok(parsed.artifact.nodes.every((n) => n.class === "docs-surface"));
+    assert.ok(parsed.artifact.nodes.every((n) => n.provenance.settled_by === "reviewer-accept"));
+  }
+  const withoutFrontier = validateDecisionsForReady({
+    title: "T",
+    body: tampered,
+    comments: [],
+    fingerprint: art.fingerprint,
+    contextMd: "**Grill**:\nA one-shot intake interview.\n",
+    integrationBaseSha: art.fingerprint.integration_base_sha,
+    handoffs: [],
+    frontier: null,
+  });
+  assert.equal(withoutFrontier.ok, false);
+  if (!withoutFrontier.ok) assert.equal(withoutFrontier.code, "invalid_provenance");
+  const add: string[] = [];
+  const remove: string[] = [];
+  const deps: TriageDeps = {
+    getIssueLabels: async () => ["pipeline:backlog"],
+    addLabel: async (_n, l) => {
+      add.push(l);
+    },
+    removeLabel: async (_n, l) => {
+      remove.push(l);
+    },
+    log: () => {},
+    getReadySnapshot: async () => ({
+      title: "T",
+      body: tampered,
+      comments: [],
+      fingerprint: art.fingerprint,
+      contextMd: "**Grill**:\nA one-shot intake interview.\n",
+      integrationBaseSha: art.fingerprint.integration_base_sha,
+      handoffs: [],
+      frontier: appliedFrontier,
+    }),
+  };
+  await assert.rejects(() => runTriage({ issueArg: "42", stage: "ready" }, deps), (err: Error) => {
+    assert.equal(err instanceof TriageReadyError, true);
+    assert.equal((err as TriageReadyError).exitCode, 2);
+    assert.equal((err as TriageReadyError).code, "invalid_provenance");
+    assert.match((err as TriageReadyError).message, /frontier|class does not match/);
     return true;
   });
   assert.deepEqual(add, []);
@@ -1765,6 +1969,7 @@ test("grill: --stage ready incomplete artifact makes zero label writes", async (
       contextMd: "**Grill**:\nA one-shot intake interview.\n",
       integrationBaseSha: art.fingerprint.integration_base_sha,
       handoffs: [],
+      frontier: frontierFor(body, art),
     }),
   };
   await assert.rejects(() => runTriage({ issueArg: "42", stage: "ready" }, deps));

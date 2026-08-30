@@ -24,6 +24,11 @@ import {
   type GrillFingerprint,
   type ProviderConfigIdentity,
 } from "./grill-fingerprint.ts";
+import {
+  issueGrillFrontier,
+  loadVerifiedGrillFrontier,
+  persistGrillFrontier,
+} from "./grill-frontier.ts";
 import { createPendingGrillHandoffs, supersedeStaleGrillHandoffs } from "./grill-handoff.ts";
 import { sha256Prefixed } from "./grill-hash.ts";
 import {
@@ -445,6 +450,23 @@ export async function runRefineSpecApply(
     deps.handoffStore,
   );
   if (!created.ok) return fail(deps, `handoff create failed: ${created.reason}`, 2);
+  const keyFs = deps.keyDeps ?? defaultGrillProposalKeyDeps;
+  try {
+    persistGrillFrontier(
+      deps.repoDir,
+      issueGrillFrontier({
+        repo: deps.repo,
+        issue: issueNumber,
+        body: envelope.proposal.body,
+        artifact: bodyCheck.artifact,
+        now: deps.now(),
+        key,
+      }),
+      keyFs,
+    );
+  } catch (err) {
+    return fail(deps, `frontier persist failed: ${(err as Error).message}`, 2);
+  }
   try {
     await deps.updateIssueBody(issueNumber, envelope.proposal.body);
   } catch (err) {
@@ -633,6 +655,21 @@ export async function realGrillReadySnapshot(
     planningTreatment,
   });
   const handoffs = await listHandoffs(cfg.repo_dir, { issue: issueNumber });
+  let frontier = null;
+  try {
+    const key = resolveGrillProposalKey(cfg.repo_dir, defaultGrillProposalKeyDeps, {
+      createIfMissing: false,
+    });
+    frontier = loadVerifiedGrillFrontier(
+      cfg.repo_dir,
+      issueNumber,
+      key,
+      cfg.repo,
+      defaultGrillProposalKeyDeps,
+    );
+  } catch {
+    frontier = null;
+  }
   return {
     title: detail.title,
     body: detail.body,
@@ -641,5 +678,6 @@ export async function realGrillReadySnapshot(
     contextMd,
     integrationBaseSha,
     handoffs,
+    frontier,
   };
 }
