@@ -2,7 +2,7 @@
 
 ### Requirement: The `triage` sub-command SHALL set exactly one `pipeline:<stage>` label on the target issue
 
-After validating inputs, the triage handler SHALL fetch the target issue. For `--stage backlog`, it SHALL determine which `pipeline:*` labels the issue currently carries and update the issue so it carries exactly `pipeline:backlog` and no other `pipeline:*` label, with no Decisions-artifact requirement. For `--stage ready`, it SHALL validate the Decisions artifact as specified by `grill-then-ready-refinement` before any label write; on validation failure it SHALL exit 2 and SHALL NOT add or remove labels. On validation success it SHALL add `pipeline:ready` first (if not already present), then remove all current `pipeline:*` labels that differ from `ready`. This ordering ensures the issue is never left without a `pipeline:*` label if the process is interrupted between writes.
+After validating inputs, the triage handler SHALL fetch the target issue. For `--stage backlog`, it SHALL determine which `pipeline:*` labels the issue currently carries and update the issue so it carries exactly `pipeline:backlog` and no other `pipeline:*` label, with no Decisions-artifact requirement. For `--stage ready`, it SHALL validate the Decisions artifact as specified by `grill-then-ready-refinement` before any label write; on validation failure it SHALL exit 2 and SHALL NOT add or remove labels. On validation success it SHALL add `pipeline:ready` first (if not already present), then remove all current `pipeline:*` labels that differ from `ready`, then re-fetch labels. If more than one `pipeline:*` label remains, it SHALL retry the remove pass once. If extras still remain, it SHALL exit non-zero with `label_reconciliation_failed` and SHALL NOT remove `pipeline:ready`. This ordering ensures the issue is never left without a `pipeline:*` label if the process is interrupted between writes. Validation failure SHALL still make zero label-write API calls.
 
 #### Scenario: Sets `pipeline:ready` and removes `pipeline:backlog`
 
@@ -40,6 +40,24 @@ After validating inputs, the triage handler SHALL fetch the target issue. For `-
 - **THEN** the handler SHALL remove both `pipeline:ready` and `pipeline:planning`
 - **AND** SHALL add `pipeline:backlog`
 - **AND** the issue SHALL carry exactly one `pipeline:*` label after the operation
+
+#### Scenario: Ready write retries a partial remove failure
+
+- **WHEN** the Decisions artifact is complete, provenanced, and fingerprint-current
+- **AND** add `pipeline:ready` succeeds
+- **AND** the first remove of `pipeline:backlog` fails
+- **AND** the retry remove succeeds
+- **THEN** the issue SHALL carry exactly `pipeline:ready` among its `pipeline:*` labels
+- **AND** the command SHALL exit 0
+
+#### Scenario: Persistent extra labels fail closed without dropping ready
+
+- **WHEN** the Decisions artifact is complete, provenanced, and fingerprint-current
+- **AND** add `pipeline:ready` succeeds
+- **AND** remove of the previous stage label fails twice
+- **THEN** the command SHALL exit non-zero
+- **AND** the issue SHALL still carry `pipeline:ready`
+- **AND** validation-failure paths SHALL still make zero label-write calls
 
 ---
 

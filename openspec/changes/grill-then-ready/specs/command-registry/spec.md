@@ -2,7 +2,7 @@
 
 ### Requirement: The `refine-spec` registry entry SHALL allow `--issue` and `apply` without a positional issue number
 
-The `refine-spec` command-registry entry SHALL keep `needsIssueNumber: false`. Its `allowedFlags` SHALL include the existing `--title`, `--body`, `--json`, and `--repo-path` flags and SHALL also include `--issue`. Flag validation SHALL reject unknown flags with exit code 2 before config resolution or GitHub writes. The `apply` token SHALL be a refine-spec sub-verb, not a separate advance issue number. `--title/--body` preview SHALL remain usable without GitHub authentication. `--issue` preview and `apply` SHALL require GitHub authentication.
+The `refine-spec` command-registry entry SHALL keep `needsIssueNumber: false`. Its `allowedFlags` SHALL include the existing `--title`, `--body`, `--json`, and `--repo-path` flags and SHALL also include `--issue` and `--proposal-file`. Flag validation SHALL reject unknown flags with exit code 2 before config resolution or GitHub writes. The `apply` token SHALL be a refine-spec sub-verb, not a separate advance issue number. A positional proposal blob SHALL NOT be accepted. `--title/--body` preview SHALL remain usable without GitHub authentication. `--issue` preview and `apply` SHALL require GitHub authentication.
 
 #### Scenario: Title/body path stays positional-issue-free
 
@@ -21,3 +21,9 @@ The `refine-spec` command-registry entry SHALL keep `needsIssueNumber: false`. I
 - **WHEN** the operator runs `pipeline refine-spec --issue 42 --bogus`
 - **THEN** the CLI SHALL exit 2 naming the unsupported flag
 - **AND** no GitHub write SHALL occur
+
+#### Scenario: Proposal-file flag is allowed on apply
+
+- **WHEN** the operator runs `pipeline refine-spec apply --issue 42 --proposal-file /tmp/envelope.json`
+- **THEN** flag validation SHALL accept `--issue` and `--proposal-file`
+- **AND** SHALL NOT treat `apply` as an advance issue number

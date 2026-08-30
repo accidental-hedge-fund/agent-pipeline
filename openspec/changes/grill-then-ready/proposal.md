@@ -6,7 +6,7 @@ Thin or decision-incomplete GitHub issues still reach planning with product choi
 
 - Keep existing `pipeline refine-spec --title/--body` compatible and non-mutating.
 - Add `pipeline refine-spec --issue N`: one Implementer planning-treatment call, then one Reviewer call on the Decisions artifact only. Preview writes nothing.
-- Add `pipeline refine-spec apply --issue N <proposal>`: consume the exact previewed proposal, write only the issue body, invoke no model. Refuse drift (exit 2) and refuse any reviewer `challenge`.
+- Add `pipeline refine-spec apply --issue N` with stdin XOR `--proposal-file PATH`: verify the signed preview envelope, write only the issue body, invoke no model. Refuse drift, MAC failure, expiry, replay, oversize/empty/dual input, and any reviewer `challenge` (exit 2).
 - Embed a versioned Pipeline-owned Decisions artifact in the issue body. The readable `## Decisions` section is rendered from that artifact; divergence fails validation. The body remains the specification. Comments and handoffs prove provenance; they do not replace the body.
 - Closed authority taxonomy. Scope, security, irreversible operations, merge/release, and human-attestation require an authenticated hash-bound `pipeline handoff answer`. Reviewer `accept` is provenance of an automatic non-authority default, not operator authority.
 - `pipeline triage N --stage ready` stays model-free. It re-fetches and validates the Decisions artifact. Incomplete or stale artifacts exit 2 with no label change. A valid request changes only the pipeline stage label. Pickup still runs #1238 against fresh GitHub state.

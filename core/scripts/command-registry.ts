@@ -304,7 +304,7 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
 
   "refine-spec": {
     needsIssueNumber: false,
-    allowedFlags: new Set(["repoPath", "title", "body", "json"]),
+    allowedFlags: new Set(["repoPath", "title", "body", "json", "issue", "proposalFile"]),
     needsConfig: false,
     needsGhAuth: false,
     mutatesGitHub: false,

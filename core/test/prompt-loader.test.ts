@@ -19,6 +19,7 @@ import {
   buildPlanRevisionPrompt,
   buildDeltaReviewPrompt,
   buildRefineSpecPrompt,
+  buildGrillImplementerPrompt,
   buildReviewAdversarialPrompt,
   buildReviewStandardPrompt,
   buildSweepPrompt,
@@ -2321,6 +2322,16 @@ test("ship-path autonomy: authoring builders include versioned preamble (#1030)"
     "buildRefineSpecPrompt",
   );
   assertShipPathAutonomyPreamble(
+    buildGrillImplementerPrompt({
+      title: "t",
+      body: "b",
+      integrationBaseSha: "abc",
+      contextMd: "ctx",
+      dependencyFacts: "none",
+    }),
+    "buildGrillImplementerPrompt",
+  );
+  assertShipPathAutonomyPreamble(
     buildSweepPrompt({
       issueTitle: "t",
       existingBody: "b",
@@ -2403,6 +2414,13 @@ test("ship-path autonomy: planning and intake carry engine-dogfood class-vs-site
     roadmapContext: "v1.38.1",
   });
   const refine = buildRefineSpecPrompt({ title: "t", body: "b" });
+  const grillImpl = buildGrillImplementerPrompt({
+    title: "t",
+    body: "b",
+    integrationBaseSha: "abc",
+    contextMd: "ctx",
+    dependencyFacts: "none",
+  });
   const sweep = buildSweepPrompt({
     issueTitle: "t",
     existingBody: "b",
@@ -2412,6 +2430,7 @@ test("ship-path autonomy: planning and intake carry engine-dogfood class-vs-site
     ["planning", plan],
     ["intake", intake],
     ["refine-spec", refine],
+    ["refine-spec-issue", grillImpl],
     ["sweep", sweep],
   ] as const) {
     assert.match(out, /class vs site/i, `${name} must require class vs site answers`);

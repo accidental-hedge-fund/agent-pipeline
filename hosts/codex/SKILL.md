@@ -108,7 +108,7 @@ $pipeline factory-release prepare --request <absolute-off-repo-request.json> --j
 $pipeline improve [--apply] [--top <n>] [--json] Cluster papercuts / corrections / durable-run blockers into backlog candidates
 $pipeline intake --description "<text>" [--release vX.Y.Z] [--dry-run] Spec a rough description into a GitHub issue and ROADMAP PR
 $pipeline queue [--max-issues <n>] [--concurrency <n>] [--budget-dollars <d>] Batch factory: dispatch all pipeline:ready issues up to concurrency/budget limits
-$pipeline refine-spec --title "<t>" --body "<b>" Refine an existing issue's spec; non-mutating JSON output
+$pipeline refine-spec --title "<t>" --body "<b>" | refine-spec --issue N | refine-spec apply --issue N [--proposal-file PATH] Grill an issue spec: --title/--body preview, --issue preview, or apply a signed proposal
 $pipeline roadmap [--apply] [--next <n>]        Analyze open backlog into a dependency-aware scored roadmap; under SemVer, dry-run lists full milestone reconciliation actions and --apply converges open issues to the reviewed manifest (fingerprint-gated)
 $pipeline sweep [--apply] [--repo owner/name]   Batch re-spec thin issues and reconcile ROADMAP.md
 $pipeline triage <n> --stage ready|backlog      Set a pre-pipeline stage label (ready or backlog) on an issue. needs-spec is an admission hold: apply the spec, then triage --stage ready.
@@ -220,7 +220,7 @@ pipeline labels via `ensurePipelineLabels`, scaffolds a commented
 notice, if the file already exists), and ensures a sentinel-delimited
 engine-managed block in `.gitignore` covering every local-only artifact
 directory the engine writes — `.agent-pipeline/runs/`, `.agent-pipeline/roadmap/`,
-`.agent-pipeline/history/`, `.agent-pipeline/evals/`, `.agent-pipeline/frg/`, and `.agent-pipeline/factory-release/`. The `.gitignore` step creates the file if absent,
+`.agent-pipeline/history/`, `.agent-pipeline/evals/`, `.agent-pipeline/frg/`, `.agent-pipeline/factory-release/`, `.agent-pipeline/grill-proposal.key`, and `.agent-pipeline/grill-proposals/`. The `.gitignore` step creates the file if absent,
 appends the block if missing (preserving every pre-existing byte), or refreshes
 only the block's contents when it is present and stale. It is idempotent and
 additive — a normal `$pipeline N` run still self-creates any missing labels, so

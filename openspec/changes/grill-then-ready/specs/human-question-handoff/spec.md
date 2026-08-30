@@ -49,3 +49,30 @@ When an eligible authenticated actor answers a pending grill-authority handoff, 
 
 - **WHEN** a grill-authority answer materializes successfully
 - **THEN** Pipeline SHALL NOT add `pipeline:ready` as a side effect of the answer
+
+---
+
+### Requirement: Grill-authority create and answer SHALL use a documented failure order
+
+Apply SHALL create one pending grill-authority handoff per unresolved operator-required node after envelope verification and before the GitHub body write. Create SHALL bind repository, issue, node ID, frontier fingerprint, and the proposed-body SHA-256. Create SHALL be idempotent on `declaration_identity`. The operator surface SHALL remain `pipeline handoff answer <handoff-id> --issue N --text "…"`. Body-hash drift during answer SHALL leave the GitHub body unchanged and the handoff `pending`. A GitHub body-write failure during materialize SHALL leave the handoff `pending`. A ledger persist failure after a successful body write SHALL leave the body patched and the handoff `pending`; a later identical answer SHALL heal the ledger without a second body write when the live node already carries that handoff provenance.
+
+#### Scenario: Create happens on apply before the body write
+
+- **WHEN** apply verifies a challenge-free envelope with unresolved operator-required nodes
+- **THEN** one pending handoff SHALL exist per such node before the GitHub body write is attempted
+- **AND** preview SHALL NOT have created those records
+
+#### Scenario: Body-write failure leaves the ledger pending
+
+- **WHEN** answer authorization and body-hash checks pass
+- **AND** the GitHub body write then fails
+- **THEN** handoff status SHALL remain `pending`
+- **AND** the live issue body SHALL be unchanged
+
+#### Scenario: Duplicate answer is idempotent
+
+- **WHEN** an eligible actor repeats `pipeline handoff answer` with the same payload hash or `--client-request-id`
+- **AND** the handoff is already `answered`
+- **THEN** the command SHALL succeed as a duplicate
+- **AND** SHALL NOT rewrite the prior answer body
+- **AND** SHALL NOT add `pipeline:ready`

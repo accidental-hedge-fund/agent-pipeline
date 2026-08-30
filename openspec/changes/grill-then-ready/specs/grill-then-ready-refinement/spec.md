@@ -61,13 +61,13 @@ Issue preview SHALL invoke the resolved Implementer exactly once with the active
 
 ### Requirement: Issue preview SHALL emit one bounded typed proposal
 
-On success, issue preview SHALL write exactly one unfenced JSON object to stdout. That object SHALL contain the full refined body, the Decisions artifact, per-node reviewer verdicts, the input fingerprint, and advisory title and milestone suggestions. Title and milestone fields SHALL be advisory. Additional fields MAY exist. The proposal SHALL be size-bounded; content that exceeds the bound SHALL fail closed rather than silently truncate authority nodes.
+On success, issue preview SHALL write exactly one unfenced JSON object to stdout. That object SHALL be a `grill-proposal.v1` signed envelope: `schema_version`, `kind`, `issued_at`, `expires_at`, `nonce`, `repo`, `issue`, `input`, `proposal` (refined body, Decisions artifact, per-node reviewer verdicts, advisory title and milestone, typed CONTEXT proposals), and `mac`. Title and milestone fields SHALL be advisory. The MAC SHALL be HMAC-SHA256 over the canonical JSON of every field except `mac`, using the host-local grill proposal key. The envelope SHALL be size-bounded at 1 MiB UTF-8; content that exceeds the bound SHALL fail closed rather than silently truncate authority nodes. Preview SHALL NOT persist the envelope to GitHub, tracked files, or comments. Preview MAY create gitignored `.agent-pipeline/grill-proposal.key` when no key env/file exists.
 
 #### Scenario: Successful preview is parseable JSON
 
 - **WHEN** `pipeline refine-spec --issue N` succeeds
 - **THEN** stdout SHALL be one JSON object
-- **AND** the object SHALL include the refined body, Decisions artifact, reviewer verdicts, and input fingerprint
+- **AND** the object SHALL include `mac`, `input`, and a `proposal` object with the refined body, Decisions artifact, reviewer verdicts, and input fingerprint
 - **AND** stdout SHALL contain no surrounding prose or markdown fence
 
 #### Scenario: Over-size proposal fails closed
@@ -80,7 +80,7 @@ On success, issue preview SHALL write exactly one unfenced JSON object to stdout
 
 ### Requirement: Apply SHALL consume the exact previewed proposal with no model call
 
-`pipeline refine-spec apply --issue N` SHALL read the proposal from stdin or from a bounded file path. It SHALL consume that exact object. It SHALL NOT invoke any model harness. It SHALL re-fetch the current title and body and SHALL require them to match the proposal input identity. Drift SHALL exit 2 with no mutation. Apply SHALL change only the issue body. Title, milestone, labels, comments, and project files SHALL remain unchanged. An active pipeline kill-switch SHALL block apply writes. Preview SHALL NOT be blocked solely because it shares the `refine-spec` keyword.
+`pipeline refine-spec apply --issue N` SHALL read the signed envelope from stdin XOR `--proposal-file PATH`. It SHALL NOT accept a positional proposal token. Empty input, both stdin and `--proposal-file` present, or UTF-8 size above 1 MiB SHALL exit 2 with no mutation. Apply SHALL verify `mac`, schema version, `kind`, TTL, repo/issue binding, and challenge-free verdicts before any GitHub write. It SHALL consume that exact verified object. It SHALL NOT invoke any model harness. It SHALL re-fetch the current title and body and SHALL require them to match `input.title` and `input.body`. Drift, MAC failure, expiry, consumed nonce, or a forged verdict SHALL exit 2 with no mutation. Apply SHALL change only the issue body. Title, milestone, labels, comments, and project files SHALL remain unchanged. An active pipeline kill-switch SHALL block apply writes. Preview SHALL NOT be blocked solely because it shares the `refine-spec` keyword.
 
 #### Scenario: Apply writes the previewed body
 
@@ -107,6 +107,26 @@ On success, issue preview SHALL write exactly one unfenced JSON object to stdout
 - **AND** the operator runs `pipeline refine-spec --issue N`
 - **THEN** preview SHALL still run
 - **AND** SHALL NOT write GitHub state
+
+#### Scenario: Tampered envelope is refused
+
+- **WHEN** apply receives an envelope whose `proposal` or verdicts were edited after preview
+- **THEN** MAC verification SHALL fail
+- **AND** apply SHALL exit 2
+- **AND** the issue body SHALL be unchanged
+
+#### Scenario: Expired or replayed envelope is refused
+
+- **WHEN** apply receives a MAC-valid envelope past `expires_at`, or a nonce already recorded as consumed
+- **THEN** apply SHALL exit 2
+- **AND** the issue body SHALL be unchanged
+
+#### Scenario: Empty or dual proposal input is a usage error
+
+- **WHEN** apply runs with no stdin bytes and no `--proposal-file`
+- **OR** with both stdin bytes and `--proposal-file`
+- **THEN** the command SHALL exit 2
+- **AND** no GitHub write SHALL occur
 
 ---
 
@@ -146,11 +166,17 @@ Pipeline SHALL embed a versioned Pipeline-owned Decisions artifact in the issue 
 - **WHEN** an issue comment states a decision that is absent from the body artifact
 - **THEN** `--stage ready` SHALL NOT treat that comment as a settled node
 
+#### Scenario: Duplicate or colliding fence fails validation
+
+- **WHEN** the live body contains two `pipeline-decisions-v1` fences, or a digest that does not match the fence payload
+- **THEN** apply, handoff materialize, and `--stage ready` SHALL fail closed
+- **AND** labels and the body SHALL be unchanged on `--stage ready`
+
 ---
 
 ### Requirement: Pipeline SHALL validate authority class against a closed taxonomy
 
-The model MAY propose a class. Pipeline SHALL accept a class only when it is a member of a versioned closed taxonomy owned by Pipeline. Operator-required members SHALL include at least: `scope`, `security`, `irreversible-operations`, `merge-release`, and `human-attestation`. Non-authority members SHALL be the remaining taxonomy members. An unknown or disputed class SHALL remain unresolved authority. Only taxonomy-validated non-authority nodes MAY take recommended defaults automatically, and the eligibility reason SHALL be recorded on the node. Non-authority automatic defaults SHALL NOT be applied without that taxonomy validation.
+The model MAY propose a class. Pipeline SHALL accept a class only when it is a member of versioned closed taxonomy `grill-taxonomy.v1`. Operator-required members SHALL be: `scope`, `security`, `irreversible-operations`, `merge-release`, and `human-attestation`. Non-authority members SHALL be: `interface-contract`, `test-evidence`, `docs-surface`, and `operational-default`. An unknown or disputed class SHALL remain unresolved authority. Only taxonomy-validated non-authority nodes MAY take recommended defaults automatically, and the eligibility reason SHALL be recorded on the node. Non-authority automatic defaults SHALL NOT be applied without that taxonomy validation.
 
 #### Scenario: Unknown class stays unresolved
 
@@ -215,20 +241,22 @@ When the input issue is thin or decision-incomplete, issue preview SHALL still p
 
 ### Requirement: Facts and dependencies SHALL use the existing grammar and a bounded closure
 
-Preview SHALL read repository facts from the trusted integration-base revision and the exact refinement context. Dependency extraction SHALL call the existing declared-dependency grammar. Pipeline SHALL walk a versioned bounded dependency closure. Cycles, inaccessible or missing issues, malformed declarations, and closure-limit exhaustion SHALL be typed unresolved facts. Pipeline SHALL NOT silently truncate the closure. Pipeline SHALL NOT invent a second dependency parser. Comments SHALL NOT become settled specification decisions.
+Preview SHALL read repository facts from the trusted integration-base revision and the exact refinement context. Dependency extraction SHALL call `parseDeclaredDependencyIds` in `declared-dependency-grammar.ts`. Pipeline SHALL walk a versioned bounded dependency closure (max depth 8, max 32 issue ids). Cycles, inaccessible or missing issues, malformed declarations, and closure-limit exhaustion SHALL be typed unresolved facts with codes `dependency.cycle`, `dependency.missing`, `dependency.inaccessible`, `dependency.malformed`, and `dependency.closure_exhausted`. Any unresolved fact with one of those codes SHALL fail `--stage ready` with exit 2 and no label write. Pipeline SHALL NOT silently truncate the closure. Pipeline SHALL NOT invent a second dependency parser. Comments SHALL NOT become settled specification decisions.
 
 #### Scenario: Cycle is a typed unresolved fact
 
 - **WHEN** issue N declares a dependency cycle under the existing grammar
 - **THEN** preview SHALL record a typed unresolved fact naming the cycle
 - **AND** SHALL NOT drop edges to hide the cycle
-- **AND** `--stage ready` SHALL fail while that fact is unresolved if it blocks authority completeness
+- **AND** `--stage ready` SHALL exit 2 while that fact is unresolved
+- **AND** labels SHALL be unchanged
 
 #### Scenario: Missing dependency is visible
 
 - **WHEN** a declared dependency issue cannot be fetched
-- **THEN** preview SHALL record a typed unresolved fact
+- **THEN** preview SHALL record a typed unresolved fact with code `dependency.missing` or `dependency.inaccessible`
 - **AND** SHALL NOT invent a substitute issue body
+- **AND** `--stage ready` SHALL exit 2 while that fact is unresolved
 
 #### Scenario: Closure-limit exhaustion is visible
 
@@ -240,7 +268,7 @@ Preview SHALL read repository facts from the trusted integration-base revision a
 
 ### Requirement: Required CONTEXT proposals SHALL block ready and SHALL NOT write repository files
 
-When shared terminology required for implementation is missing, preview SHALL include a typed `CONTEXT.md` proposal in the proposal object. Refinement SHALL NOT edit `CONTEXT.md` or any other repository file. A context change required for implementation SHALL block `--stage ready` until a separate reviewed PR lands and its integration-base reference is recorded in the artifact. Advisory context proposals SHALL NOT block ready.
+When shared terminology required for implementation is missing, preview SHALL include a typed `CONTEXT.md` proposal in the envelope. Refinement SHALL NOT edit `CONTEXT.md` or any other repository file. Pipeline SHALL classify each proposal as `required` or `advisory` from the integration-base `CONTEXT.md` blob and operator-required node `term_id` references. A model-written necessity field SHALL NOT survive that classification. A `required` proposal SHALL block `--stage ready` until Pipeline records `required_context.integration_base_sha` and `required_context.context_md_sha256` from a trusted base whose blob contains every required term. Advisory context proposals SHALL NOT block ready. Model prose SHALL NOT set or clear those hashes.
 
 #### Scenario: Required context blocks ready
 
@@ -255,11 +283,18 @@ When shared terminology required for implementation is missing, preview SHALL in
 - **AND** all authority and fingerprint checks pass
 - **THEN** `--stage ready` SHALL change only the stage label
 
+#### Scenario: Model prose cannot force required context
+
+- **WHEN** the Implementer marks a CONTEXT proposal `required`
+- **AND** no operator-required node references a term missing from the integration-base `CONTEXT.md` blob
+- **THEN** Pipeline SHALL store the proposal as `advisory`
+- **AND** `--stage ready` SHALL NOT block on that proposal
+
 ---
 
 ### Requirement: `triage --stage ready` SHALL validate the Decisions artifact with no model
 
-`pipeline triage N --stage ready` SHALL re-fetch the issue and SHALL validate the Decisions artifact without invoking any model harness. It SHALL require: no unresolved authority, valid authority provenance, render/artifact identity, and current fingerprints for issue title, dependencies, integration base, required context, provider configuration, and resolved planning treatment. Any bound-input change SHALL make the artifact stale. Incomplete or stale artifacts SHALL exit 2 with no label change. A valid request SHALL change only the pipeline stage label. `--stage backlog` SHALL remain a label write and SHALL NOT require a Decisions artifact. This gate SHALL NOT invoke the issue-implementation-readiness-gate model. Pickup of `pipeline:ready` SHALL still run that #1238 gate against fresh GitHub state.
+`pipeline triage N --stage ready` SHALL re-fetch the issue and SHALL validate the Decisions artifact without invoking any model harness. It SHALL require: no unresolved authority, no unresolved typed dependency facts (`dependency.cycle`, `dependency.missing`, `dependency.inaccessible`, `dependency.malformed`, `dependency.closure_exhausted`), valid authority provenance, render/artifact identity, required-context hashes that match the current trusted base blob, and current fingerprints for issue title, applied body, dependencies, integration base, required context, provider configuration, and resolved planning treatment. Any bound-input change SHALL make the artifact stale. Incomplete or stale artifacts SHALL exit 2 with no label change. A valid request SHALL add `pipeline:ready` first, remove other `pipeline:*` labels, re-fetch, and retry one remove pass if more than one `pipeline:*` remains. Persistent extras SHALL exit non-zero with `label_reconciliation_failed` and SHALL NOT remove `pipeline:ready`. `--stage backlog` SHALL remain a label write and SHALL NOT require a Decisions artifact. This gate SHALL NOT invoke the issue-implementation-readiness-gate model. Pickup of `pipeline:ready` SHALL still run that #1238 gate against fresh GitHub state.
 
 #### Scenario: Incomplete artifact refuses ready
 
@@ -319,7 +354,7 @@ Pipeline SHALL extend the existing authenticated `pipeline handoff answer` bound
 
 ### Requirement: Grill-then-ready unit tests SHALL inject GitHub, dependency, harness, handoff, reviewer, clock, and drift seams
 
-Unit tests for issue preview, apply, handoff materialize, and `--stage ready` validation SHALL inject those I/O seams. No unit test SHALL perform a real network, git, or subprocess call. At least one test per refusal class (challenge, drift, self-accept, operator-required accept, stale fingerprint, comment-only answer) SHALL fail against the pre-change behavior.
+Unit tests for issue preview, apply, handoff materialize, and `--stage ready` validation SHALL inject those I/O seams, plus git/base-resolution, filesystem, HMAC-key, and clock seams. No unit test SHALL perform a real network, git, or subprocess call. At least one test per refusal class (challenge, drift, self-accept, operator-required accept, stale fingerprint, comment-only answer, MAC tamper, expired envelope, consumed nonce, empty/dual/oversize proposal input, delimiter collision, required-context miss, typed dependency fact, label-reconciliation retry) SHALL fail against the pre-change behavior. Existing `core/test/refine-spec.test.ts` `--title/--body` cases SHALL keep passing, including the exact `{ title, body, milestone }` stdout shape.
 
 #### Scenario: Injected tests cover refusal classes
 

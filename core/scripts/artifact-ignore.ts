@@ -120,6 +120,19 @@ export const FACTORY_RELEASE_ARTIFACT: ArtifactContractEntry = {
     "Factory-release prepare checkpoints and loop bindings; engine-written, never committed on the factory control checkout.",
 };
 
+/** Host-local HMAC key for grill-proposal.v1 envelopes (#1072). */
+export const GRILL_PROPOSAL_KEY_ARTIFACT: ArtifactContractEntry = {
+  name: "grill-proposal.key",
+  comment: "Host-local HMAC key for grill-proposal.v1 envelopes (#1072); never committed.",
+  isFile: true,
+};
+
+/** Consumed grill-proposal nonces (#1072). Host-local, never committed. */
+export const GRILL_PROPOSALS_ARTIFACT: ArtifactContractEntry = {
+  name: "grill-proposals",
+  comment: "Consumed grill-proposal nonces (#1072); host-local, never committed.",
+};
+
 /** Ordered contract of every `.agent-pipeline/` directory (or file) the
  *  engine writes. No other module SHALL independently define an
  *  `.agent-pipeline/` artifact path — derive it from an entry here instead. */
@@ -136,6 +149,8 @@ export const ARTIFACT_CONTRACT: readonly ArtifactContractEntry[] = [
   FRG_ARTIFACT,
   HARNESS_OWNERSHIP_ARTIFACT,
   FACTORY_RELEASE_ARTIFACT,
+  GRILL_PROPOSAL_KEY_ARTIFACT,
+  GRILL_PROPOSALS_ARTIFACT,
 ];
 
 /** Resolve `<repoDir>/.agent-pipeline/<entry.name>` for a contract entry. */

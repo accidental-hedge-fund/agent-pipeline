@@ -39,14 +39,14 @@ The pipeline CLI SHALL accept `refine-spec` as a positional sub-command keyword 
 
 ### Requirement: The `refine-spec` sub-command SHALL be discoverable via `--help` before invocation
 
-The `refine-spec` sub-command SHALL respond to `pipeline refine-spec --help` with exit code 0 and SHALL print usage text describing `--title`, `--body`, `--issue`, `apply`, and `--json`. Additionally, `pipeline --help` SHALL list `refine-spec` alongside other no-issue-number sub-commands. A caller (e.g. Pipeline Desk) MAY probe for the contract's presence by invoking `pipeline refine-spec --help` and checking that the output contains usage text mentioning both `--title` and `--body` in a refine-spec context; an install that does not support this contract prints generic top-level help without refine-spec-specific flag descriptions.
+The `refine-spec` sub-command SHALL respond to `pipeline refine-spec --help` with exit code 0 and SHALL print usage text describing `--title`, `--body`, `--issue`, `apply`, `--proposal-file`, and `--json`. Additionally, `pipeline --help` SHALL list `refine-spec` alongside other no-issue-number sub-commands. A caller (e.g. Pipeline Desk) MAY probe for the contract's presence by invoking `pipeline refine-spec --help` and checking that the output contains usage text mentioning both `--title` and `--body` in a refine-spec context; an install that does not support this contract prints generic top-level help without refine-spec-specific flag descriptions.
 
 #### Scenario: `--help` exits zero and prints usage
 
 - **WHEN** `pipeline refine-spec --help` is invoked on an install that supports this contract
 - **THEN** the command exits with code 0
 - **AND** stdout or stderr contains usage text that mentions `--title` and `--body`
-- **AND** the usage text SHALL mention `--issue` and `apply`
+- **AND** the usage text SHALL mention `--issue`, `apply`, and `--proposal-file`
 
 #### Scenario: Top-level help lists `refine-spec`
 

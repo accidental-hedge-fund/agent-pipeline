@@ -115,7 +115,7 @@ per-verb skill or command-menu entries.
 /pipeline improve [--apply] [--top <n>] [--json] Cluster papercuts / corrections / durable-run blockers into backlog candidates
 /pipeline intake --description "<text>" [--release vX.Y.Z] [--dry-run] Spec a rough description into a GitHub issue and ROADMAP PR
 /pipeline queue [--max-issues <n>] [--concurrency <n>] [--budget-dollars <d>] Batch factory: dispatch all pipeline:ready issues up to concurrency/budget limits
-/pipeline refine-spec --title "<t>" --body "<b>" Refine an existing issue's spec; non-mutating JSON output
+/pipeline refine-spec --title "<t>" --body "<b>" | refine-spec --issue N | refine-spec apply --issue N [--proposal-file PATH] Grill an issue spec: --title/--body preview, --issue preview, or apply a signed proposal
 /pipeline roadmap [--apply] [--next <n>]        Analyze open backlog into a dependency-aware scored roadmap; under SemVer, dry-run lists full milestone reconciliation actions and --apply converges open issues to the reviewed manifest (fingerprint-gated)
 /pipeline sweep [--apply] [--repo owner/name]   Batch re-spec thin issues and reconcile ROADMAP.md
 /pipeline triage <n> --stage ready|backlog      Set a pre-pipeline stage label (ready or backlog) on an issue. needs-spec is an admission hold: apply the spec, then triage --stage ready.
@@ -224,7 +224,7 @@ pipeline labels via `ensurePipelineLabels`, scaffolds a commented
 notice, if the file already exists), and ensures a sentinel-delimited
 engine-managed block in `.gitignore` covering every local-only artifact
 directory the engine writes — `.agent-pipeline/runs/`, `.agent-pipeline/roadmap/`,
-`.agent-pipeline/history/`, `.agent-pipeline/evals/`, `.agent-pipeline/frg/`, and `.agent-pipeline/factory-release/`. The `.gitignore` step creates the file if absent,
+`.agent-pipeline/history/`, `.agent-pipeline/evals/`, `.agent-pipeline/frg/`, `.agent-pipeline/factory-release/`, `.agent-pipeline/grill-proposal.key`, and `.agent-pipeline/grill-proposals/`. The `.gitignore` step creates the file if absent,
 appends the block if missing (preserving every pre-existing byte), or refreshes
 only the block's contents when it is present and stale. It is idempotent and
 additive — a normal `/pipeline N` run still self-creates any missing labels, so
@@ -302,34 +302,38 @@ are deterministic. The roadmap update is opened as a PR for human review — the
 pipeline never merges. `--release vX.Y.Z` pins the target slot; omitting it
 proposes the first open lane from `ROADMAP.md`.
 
-`refine-spec` is a **non-mutating** spec-refinement preview command. It accepts
-an existing issue's title and body and returns a refined spec as JSON — no GitHub
-writes, no git writes, no filesystem writes:
+`refine-spec` grills a spec. `--title`/`--body` is a gh-free single-call preview
+that emits `{ title, body, milestone }` JSON and writes nothing. `--issue N` fetches
+that GitHub issue, runs one Implementer planning-treatment call then one Reviewer
+call on the Decisions artifact only, and emits a signed `grill-proposal.v1` envelope.
+`refine-spec apply --issue N` consumes that envelope (stdin XOR `--proposal-file`)
+and writes only the issue body. Apply never calls a model. Title, milestone, labels,
+and comments stay unchanged.
 
 ```bash
 /pipeline refine-spec --title "Add retry logic" --body "## Summary\nA retry mechanism."
-# → {"title":"...","body":"## Summary\n...","milestone":null}
-
+/pipeline refine-spec --issue 42
+/pipeline refine-spec apply --issue 42 --proposal-file envelope.json
 pipeline refine-spec --help   # probe: exits 0 only on installs that support this contract
 ```
 
-The output object always contains `title` (string), `body` (string), and `milestone`
-(string or null). The `body` field follows the WHAT-not-HOW section contract: Summary,
-User story, Acceptance criteria, Out of scope, and Open questions only when genuinely
-ambiguous. `--json` is accepted for callers that pass it; behavior is identical (output
-is always JSON). Re-running on the same input leaves all repo and GitHub state unchanged.
+`--json` is accepted on preview; output is always JSON. Operator-required Decisions
+nodes stay unresolved until `pipeline handoff answer`. Reviewer `accept` is provenance
+of a non-authority default, not operator authority.
 
 `triage` sets a pre-pipeline stage label on an issue — no model call, fully
-deterministic:
+deterministic. `--stage ready` validates the Decisions artifact first (exit 2, no
+label change on incomplete or stale artifacts). `--stage backlog` is a label write
+with no artifact check. Pickup still runs the #1238 issue-implementation-readiness
+gate against fresh GitHub state.
 
 ```bash
-/pipeline triage 42 --stage ready     # promote to pipeline:ready
+/pipeline triage 42 --stage ready     # promote to pipeline:ready when the artifact is complete
 /pipeline triage 42 --stage backlog   # move back to pipeline:backlog
 ```
 
-Only `ready` and `backlog` are settable via `triage`. The command is idempotent
-(re-running when already set is a no-op). Mid-flight stages owned by the advance
-state machine are rejected with a clear error.
+Only `ready` and `backlog` are settable via `triage`. Mid-flight stages owned by the
+advance state machine are rejected with a clear error.
 
 `sweep` is the **batch** companion to `intake`: it re-specs every thin issue in
 the existing backlog and reconciles `ROADMAP.md` in one pass:

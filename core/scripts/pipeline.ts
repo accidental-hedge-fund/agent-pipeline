@@ -151,6 +151,15 @@ import {
 } from "./stages/decompose.ts";
 import { runRefineSpec, realRefineSpecDeps } from "./stages/refine-spec.ts";
 import {
+  realGrillIssueApplyDeps,
+  realGrillIssuePreviewDeps,
+  realGrillReadySnapshot,
+  runRefineSpecApply,
+  runRefineSpecIssuePreview,
+  usageError,
+} from "./grill-issue.ts";
+import { materializeGrillAnswer } from "./grill-handoff.ts";
+import {
   recordPapercut,
   reportPapercuts,
   papercutsEnabled,
@@ -159,7 +168,7 @@ import {
   realAutoFileDeps,
 } from "./stages/papercut.ts";
 import { runSweep, realSweepDeps } from "./stages/sweep.ts";
-import { runTriage, realTriageDeps, validateTriageInput } from "./stages/triage.ts";
+import { runTriage, realTriageDeps, validateTriageInput, TriageReadyError } from "./stages/triage.ts";
 import { mergePr, realMergeDeps } from "./stages/merge.ts";
 import { runMergeQueue, realMergeQueueDeps } from "./stages/merge-queue.ts";
 import {
@@ -428,6 +437,8 @@ export interface CliOpts {
   title?: string;
   /** refine-spec: existing issue body to refine. */
   body?: string;
+  /** refine-spec apply: path to a signed grill-proposal.v1 envelope. */
+  proposalFile?: string;
   /** Intake/release/decompose: pin the target release slot (e.g. "v1.6.0" or "1.6.0"). */
   release?: string;
   /** release: theme for a scaffolded release-plan row when missing (#730). */
@@ -791,7 +802,10 @@ export function maxPositionalsFor(command: string | undefined): number {
   if (command === "loop") {
     return 1 + MAX_RANGE_SPAN;
   }
-  return 1; // refine-spec and plain advance take only the keyword / issue number
+  if (command === "refine-spec") {
+    return 2; // refine-spec [apply]
+  }
+  return 1; // plain advance takes only the keyword / issue number
 }
 
 export function buildCmd(): Command {
@@ -873,6 +887,10 @@ export function buildCmd(): Command {
     .option("--allow-xl", "decompose: permit XL effort children despite max-effort")
     .option("--title <text>", "refine-spec: existing issue title to refine")
     .option("--body <markdown>", "refine-spec: existing issue body to refine")
+    .option(
+      "--proposal-file <path>",
+      "refine-spec apply: read the signed grill-proposal.v1 envelope from PATH instead of stdin",
+    )
     .option("--release <version>", "intake/release/decompose: pin the target release slot (e.g. v1.6.0)")
     .option("--apply", "roadmap/sweep/backfill/improve/config sync/decompose: execute write-backs; default is dry-run/preview")
     .option("--next <n>", "roadmap: emit top-N dependency-safe issues from existing plan.json without re-running the engine", Number)
@@ -987,7 +1005,11 @@ export function buildCmd(): Command {
     // correction_event against an existing run. No advance/unblock/override/
     // merge/deploy/code-mutation authority — its only side effect is one
     // appended, sanitized correction_event.
-    .option("--issue <n>", "correction record: issue number to record the correction against", Number)
+    .option(
+      "--issue <n>",
+      "refine-spec / handoff / correction: issue number",
+      Number,
+    )
     .option("--source-kind <kind>", `correction record: ${CORRECTION_HUMAN_SOURCE_KINDS.join("|")}`)
     .option("--failure-class <class>", `correction record: ${CORRECTION_FAILURE_CLASSES.join("|")}`)
     .option("--evidence-ref <kind:id>", `correction record: "<kind>:<id>" evidence pointer (kind one of ${EVIDENCE_REF_KINDS.join("|")})`)
@@ -4069,16 +4091,23 @@ async function main(): Promise<void> {
   }
   if (rawArgs[0] === "refine-spec" && (rawArgs.includes("--help") || rawArgs.includes("-h"))) {
     process.stdout.write(
-      'Usage: pipeline refine-spec --title "<title>" --body "<markdown>" [--json]\n\n' +
-      "Non-mutating spec refinement: given an existing issue title and body,\n" +
-      "runs a single model harness call and emits a JSON object to stdout.\n\n" +
+      'Usage: pipeline refine-spec --title "<title>" --body "<markdown>" [--json]\n' +
+      "       pipeline refine-spec --issue N [--json]\n" +
+      "       pipeline refine-spec apply --issue N [--proposal-file PATH]\n\n" +
+      "Grill / spec refinement. --title/--body is a gh-free single-call preview.\n" +
+      "--issue previews one GitHub issue (Implementer then Reviewer) and writes nothing.\n" +
+      "apply consumes a signed grill-proposal.v1 envelope and writes only the issue body.\n\n" +
       "Options:\n" +
-      "  --title <text>      existing issue title to refine (required)\n" +
-      "  --body <markdown>   existing issue body to refine (required)\n" +
-      "  --json              accepted; output is always JSON (no-op)\n" +
-      "  --repo-path <path>  override the target repo working tree\n\n" +
-      'Output: { "title": string, "body": string, "milestone": string|null }\n' +
-      "Exit code: 0 on success, non-zero on harness failure or missing --title/--body.\n",
+      "  --title <text>           existing issue title to refine (required with --body)\n" +
+      "  --body <markdown>        existing issue body to refine (required with --title)\n" +
+      "  --issue <n>              fetch and grill GitHub issue N\n" +
+      "  apply                    consume a signed preview envelope (stdin XOR --proposal-file)\n" +
+      "  --proposal-file <path>   apply: read the envelope from PATH\n" +
+      "  --json                   accepted; output is always JSON (no-op)\n" +
+      "  --repo-path <path>       override the target repo working tree\n\n" +
+      'Output (--title/--body): { "title": string, "body": string, "milestone": string|null }\n' +
+      "Output (--issue): one grill-proposal.v1 JSON envelope\n" +
+      "Exit code: 0 on success, 2 on usage/drift/challenge, non-zero on harness failure.\n",
     );
     process.exit(0);
   }
@@ -4944,14 +4973,56 @@ async function main(): Promise<void> {
     return;
   }
 
-  // Early refine-spec dispatch — no issue number, no `gh` call. Still resolves
-  // the implementer role locally (repo `harnesses:` block / profile, #608) so
-  // the harness invocation below routes through the same role every other
-  // implementer-role path uses — resolveReleaseConfig makes no network call.
-  // Non-mutating: no GitHub writes, no git writes, no filesystem writes.
+  // Early refine-spec dispatch — no advance loop, no stage-label writes.
+  // --title/--body stays gh-free. --issue preview and apply resolve GitHub
+  // in their own handlers after flag validation.
   if (isRefineSpecCommand) {
     const startDir = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
     const repoDir = findGitRoot(startDir) ?? startDir;
+    const subVerb = cmd.args[1];
+    if (subVerb && subVerb !== "apply") {
+      usageError(
+        `unexpected argument "${subVerb}" (apply is the only refine-spec sub-verb; a positional proposal blob is not accepted)`,
+        (t) => process.stderr.write(t),
+      );
+      return;
+    }
+    if (opts.issue && (opts.title || opts.body)) {
+      usageError("do not mix --issue with --title or --body", (t) => process.stderr.write(t));
+      return;
+    }
+    if (subVerb === "apply") {
+      if (!opts.issue) {
+        usageError("apply requires --issue N", (t) => process.stderr.write(t));
+        return;
+      }
+      let applyCfg;
+      try {
+        applyCfg = resolveConfig({ repoPath: repoDir, baseBranch: opts.base, profile: opts.profile });
+      } catch (err) {
+        console.error(`pipeline refine-spec: ${(err as Error).message}`);
+        process.exitCode = 1;
+        return;
+      }
+      await runRefineSpecApply(
+        opts.issue,
+        { proposalFile: opts.proposalFile },
+        realGrillIssueApplyDeps(applyCfg),
+      );
+      return;
+    }
+    if (opts.issue) {
+      let issueCfg;
+      try {
+        issueCfg = resolveConfig({ repoPath: repoDir, baseBranch: opts.base, profile: opts.profile });
+      } catch (err) {
+        console.error(`pipeline refine-spec: ${(err as Error).message}`);
+        process.exitCode = 1;
+        return;
+      }
+      await runRefineSpecIssuePreview(opts.issue, realGrillIssuePreviewDeps(issueCfg));
+      return;
+    }
     const refineSpecCfg = resolveReleaseConfig(repoDir, opts.base, opts.profile);
     await runRefineSpec(
       { title: opts.title ?? "", body: opts.body ?? "" },
@@ -5109,17 +5180,55 @@ async function main(): Promise<void> {
         process.exitCode = 2;
         return;
       }
-      const result = await answerAndPersistHandoff(repoDir, opts.issue, idOrFilter, {
-        decision: verb === "reject" ? "reject" : "answer",
-        actor,
-        identitySource: "gh",
-        authenticated: true,
-        answerText: verb === "answer" ? opts.text : opts.reason ?? "rejected",
-        clientRequestId: opts.clientRequestId ?? null,
-      });
+      const result = await answerAndPersistHandoff(
+        repoDir,
+        opts.issue,
+        idOrFilter,
+        {
+          decision: verb === "reject" ? "reject" : "answer",
+          actor,
+          identitySource: "gh",
+          authenticated: true,
+          answerText: verb === "answer" ? opts.text : opts.reason ?? "rejected",
+          clientRequestId: opts.clientRequestId ?? null,
+        },
+        undefined,
+        verb === "answer"
+          ? {
+              materialize: async (handoff, text) => {
+                let cfg;
+                try {
+                  cfg = resolveConfig({
+                    repoPath: repoDir,
+                    baseBranch: opts.base,
+                    profile: opts.profile,
+                  });
+                } catch (err) {
+                  return { ok: false as const, reason: (err as Error).message, code: "config" };
+                }
+                const out = await materializeGrillAnswer(handoff, text, {
+                  getIssueBody: async (n) => (await getIssueDetail(cfg, n)).body,
+                  updateIssueBody: async (n, body) => {
+                    const gh = spawnSync(
+                      "gh",
+                      ["issue", "edit", String(n), "-R", cfg.repo, "--body", body],
+                      { encoding: "utf8", stdio: "pipe", cwd: repoDir },
+                    );
+                    if (gh.status !== 0) {
+                      throw new Error(gh.stderr?.trim() || "gh issue edit failed");
+                    }
+                  },
+                });
+                return out.ok
+                  ? { ok: true as const, wrote: out.wrote }
+                  : { ok: false as const, reason: out.reason, code: out.code };
+              },
+            }
+          : undefined,
+      );
       if (!result.ok) {
         console.error(`pipeline handoff ${verb}: ${result.reason}`);
-        process.exitCode = 1;
+        process.exitCode = result.code === "body_hash_drift" ? 2 : 1;
         return;
       }
       if (opts.json) {
@@ -6364,9 +6473,16 @@ async function main(): Promise<void> {
       process.exit(1);
     }
     try {
-      await runTriage({ issueArg: cmd.args[1], stage: opts.stage }, realTriageDeps(triageCfg));
+      await runTriage(
+        { issueArg: cmd.args[1], stage: opts.stage },
+        {
+          ...realTriageDeps(triageCfg),
+          getReadySnapshot: (n) => realGrillReadySnapshot(triageCfg, n),
+        },
+      );
     } catch (err) {
       console.error(`pipeline triage: ${(err as Error).message}`);
+      if (err instanceof TriageReadyError) process.exit(err.exitCode);
       process.exit(1);
     }
     return;

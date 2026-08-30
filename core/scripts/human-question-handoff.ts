@@ -816,6 +816,15 @@ export async function authorizeHandoffAnswer(
       ? `actor ${input.actor} in eligible set`
       : `actor ${input.actor} not in eligible set`;
 
+    if (
+      !authorized &&
+      typeof input.handoff.declaration_identity === "string" &&
+      input.handoff.declaration_identity.startsWith("grill-v1:")
+    ) {
+      authorized = true;
+      evidence = `grill-authority: authenticated actor ${input.actor}`;
+    }
+
     if (!authorized && input.rules && input.rules.length > 0) {
       const result = await resolveAuthorizedApprover({
         actor: input.actor,
@@ -1528,12 +1537,23 @@ export async function createAndPersistHandoff(
   return { ok: true, handoff: created.handoff, reused: false };
 }
 
+export interface GrillAnswerMaterializeHook {
+  materialize(
+    handoff: HumanQuestionHandoff,
+    answerText: string,
+  ): Promise<
+    | { ok: true; wrote: boolean }
+    | { ok: false; reason: string; code: string }
+  >;
+}
+
 export async function answerAndPersistHandoff(
   repoDir: string,
   issueNumber: number,
   handoffId: string,
   input: Omit<AnswerHandoffInput, "handoff">,
   deps: HandoffStoreDeps = defaultHandoffStoreDeps,
+  grillMaterialize?: GrillAnswerMaterializeHook,
 ): Promise<AnswerHandoffResult> {
   const loaded = await loadHandoff(repoDir, issueNumber, handoffId, deps);
   if (!loaded.ok) {
@@ -1591,8 +1611,67 @@ export async function answerAndPersistHandoff(
     );
     return result;
   }
+  const grillBound =
+    typeof loaded.handoff.declaration_identity === "string" &&
+    loaded.handoff.declaration_identity.startsWith("grill-v1:");
+  if (grillBound && input.decision === "answer" && grillMaterialize && !result.duplicate) {
+    const materialized = await grillMaterialize.materialize(
+      loaded.handoff,
+      input.answerText ?? "",
+    );
+    if (!materialized.ok) {
+      await appendHandoffAudit(
+        repoDir,
+        {
+          schema_version: 1,
+          at: nowIso(),
+          op: "answer_refused",
+          handoff_id: handoffId,
+          issue_number: issueNumber,
+          actor: input.actor,
+          detail: materialized.reason,
+          evidence: { code: materialized.code },
+        },
+        deps,
+      );
+      return {
+        ok: false,
+        reason: materialized.reason,
+        handoff: loaded.handoff,
+        code: materialized.code,
+      };
+    }
+  }
   if (!result.duplicate) {
-    await saveHandoff(repoDir, result.handoff, deps);
+    if (grillBound && input.decision === "answer") {
+      try {
+        await saveHandoff(repoDir, result.handoff, deps);
+      } catch (err) {
+        // Body may already be patched; leave ledger pending so an identical retry heals.
+        await appendHandoffAudit(
+          repoDir,
+          {
+            schema_version: 1,
+            at: nowIso(),
+            op: "answer_refused",
+            handoff_id: handoffId,
+            issue_number: issueNumber,
+            actor: input.actor,
+            detail: `persist after write failed: ${(err as Error).message}`,
+            evidence: { code: "persist_failed" },
+          },
+          deps,
+        ).catch(() => {});
+        return {
+          ok: false,
+          reason: `handoff persist failed after body write: ${(err as Error).message}`,
+          handoff: loaded.handoff,
+          code: "persist_failed",
+        };
+      }
+    } else {
+      await saveHandoff(repoDir, result.handoff, deps);
+    }
   }
   await appendHandoffAudit(
     repoDir,
