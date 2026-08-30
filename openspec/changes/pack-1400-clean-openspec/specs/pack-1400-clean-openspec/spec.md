@@ -10,10 +10,11 @@ production pipeline behavior.
 
 The pack-1400 clean-openspec fixture SHALL exist at
 `core/test/fixtures/frg/pack-1400-pipeline-ship-1.40.0/clean-openspec.json`,
-SHALL parse as JSON, and SHALL set `release_version` to the exact
-string `1.40.0`. A unit test SHALL read only that run-scoped path and SHALL
-fail when `release_version` is missing or is not `1.40.0`. The fixture and
-test SHALL NOT change production CLI, stage, config, or FRG-driver behavior.
+SHALL parse as JSON, and SHALL set `release_version` to the exact string
+`1.40.0`. A unit test SHALL read only that run-scoped path and SHALL fail
+when `release_version` is missing or is not `1.40.0`. The fixture and test
+SHALL NOT read or write another pack-run directory under
+`core/test/fixtures/frg/`.
 
 #### Scenario: Fixture names release 1.40.0
 
@@ -30,10 +31,25 @@ test SHALL NOT change production CLI, stage, config, or FRG-driver behavior.
 - **AND** `release_version` is missing or is not `1.40.0`
 - **THEN** that test SHALL fail
 
-#### Scenario: Production behavior stays unchanged
+#### Scenario: Fixture and test stay on the run-scoped path
 
-- **WHEN** this change is implemented
-- **THEN** production modules under `core/scripts/` SHALL keep their existing
-  behavior
-- **AND** no production CLI, stage, config, or FRG-driver code SHALL gain new
-  runtime branches for this pack run
+- **WHEN** the unit test that verifies this fixture is inspected
+- **THEN** it SHALL load
+  `core/test/fixtures/frg/pack-1400-pipeline-ship-1.40.0/clean-openspec.json`
+- **AND** it SHALL NOT load a fixture from any other `core/test/fixtures/frg/`
+  pack-run directory
+
+### Requirement: Production pipeline behavior SHALL remain unchanged
+
+This change SHALL add only the run-scoped fixture, its unit test, and the
+OpenSpec artifacts for issue #1343. It SHALL NOT change production runtime,
+CLI, stages, config, or hosts. It SHALL NOT recreate `plugin/`.
+
+#### Scenario: No production engine files change
+
+- **WHEN** the implementation for this requirement is complete
+- **THEN** files under `core/scripts/` and `hosts/` SHALL be unchanged
+  relative to the issue's base
+- **AND** `plugin/` SHALL remain absent
+- **AND** `scripts/build.mjs --check` SHALL pass without a host SKILL
+  regeneration caused by this change

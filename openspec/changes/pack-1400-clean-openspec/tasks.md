@@ -8,11 +8,16 @@
 - [x] 1.2 Add `core/test/fixtures/frg/pack-1400-pipeline-ship-1.40.0/clean-openspec.json`
       with `release_version` set to the exact string `1.40.0`, and verify the
       unit test now passes
-- [x] 1.3 Leave production modules under `core/scripts/` unchanged, and verify
-      `git diff -- core/scripts` is empty
+- [x] 1.3 Confirm the test file path string is only that run-scoped fixture
+      (no other `core/test/fixtures/frg/` pack-run directory). Verify the
+      test performs no real network, git, or subprocess calls
+- [x] 1.4 Leave production modules under `core/scripts/` and `hosts/`
+      unchanged, and verify `git diff -- core/scripts hosts` is empty and
+      `plugin/` is not recreated
 
 ## 2. Gate
 
-- [ ] 2.1 After any `core/` edit run `node scripts/build.mjs`, then run
-      `openspec validate pack-1400-clean-openspec` and `npm run ci` from the
-      repo root, and verify both exit 0
+- [ ] 2.1 Confirm `openspec validate pack-1400-clean-openspec` exits 0, then
+      run `npm run ci` from the repo root and verify it is green. Run
+      `node scripts/build.mjs` only if a later `core/` edit happens; this
+      change does not require that edit
