@@ -317,7 +317,7 @@ When an eligible authenticated actor answers a pending grill-authority handoff, 
 
 ### Requirement: Grill-authority create and answer SHALL use a documented failure order
 
-Apply SHALL create one pending grill-authority handoff per unresolved operator-required node after envelope verification and before the GitHub body write. Create SHALL bind repository, issue, node ID, frontier fingerprint, and the proposed-body SHA-256. Create SHALL be idempotent on `declaration_identity`. The operator surface SHALL remain `pipeline handoff answer <handoff-id> --issue N --text "…"`. Body-hash drift during answer SHALL leave the GitHub body unchanged and the handoff `pending`. A GitHub body-write failure during materialize SHALL leave the handoff `pending`. A ledger persist failure after a successful body write SHALL leave the body patched and the handoff `pending`; a later identical answer SHALL heal the ledger without a second body write when the live node already carries that handoff provenance.
+Apply SHALL create one pending grill-authority handoff per unresolved operator-required node after envelope verification and before the GitHub body write. Create SHALL bind repository, issue, node ID, frontier fingerprint, and the proposed-body SHA-256. Create SHALL be idempotent on `declaration_identity`. The operator surface SHALL remain `pipeline handoff answer <handoff-id> --issue N --text "…"`. Body-hash drift during answer SHALL leave the GitHub body unchanged and the handoff `pending`. A GitHub body-write failure during materialize SHALL leave the handoff `pending`. Before a GitHub body write, Pipeline SHALL persist a Pipeline-authenticated recovery receipt for the exact expected body. A ledger persist failure after a successful body write SHALL leave the body patched and the handoff `pending`. A later identical answer SHALL heal the ledger without a second body write only when the live node already carries that handoff provenance AND the live full-body SHA-256 matches that receipt. Pipeline SHALL NOT persist a replacement frontier or record the answer when the live body does not match the receipt, including when the target node definition and `handoff:<id>` reference remain.
 
 #### Scenario: Create happens on apply before the body write
 
@@ -331,6 +331,21 @@ Apply SHALL create one pending grill-authority handoff per unresolved operator-r
 - **AND** the GitHub body write then fails
 - **THEN** handoff status SHALL remain `pending`
 - **AND** the live issue body SHALL be unchanged
+
+#### Scenario: Receipt-matching retry heals without a second write
+
+- **WHEN** a grill-authority answer writes the issue body and then ledger persist fails
+- **AND** the live body still matches the recovery receipt
+- **THEN** a later identical answer SHALL record the handoff as answered
+- **AND** SHALL NOT write the GitHub body a second time
+
+#### Scenario: Drift after a partial write refuses heal
+
+- **WHEN** a grill-authority answer writes the issue body and then ledger persist fails
+- **AND** an editor then changes the spec core and artifact fingerprint while retaining the target node definition and `handoff:<id>` reference
+- **THEN** a later identical answer SHALL be refused
+- **AND** the authenticated frontier SHALL be unchanged
+- **AND** the handoff SHALL remain `pending`
 
 #### Scenario: Duplicate answer is idempotent
 

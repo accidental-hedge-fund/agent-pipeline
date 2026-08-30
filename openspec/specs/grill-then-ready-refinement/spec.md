@@ -214,6 +214,13 @@ Pipeline SHALL persist a host-local HMAC-signed canonical frontier when apply wr
 - **THEN** Pipeline SHALL persist the next authenticated frontier for the written body
 - **AND** SHALL keep the same node IDs, classes, and definition digests
 
+#### Scenario: No-write recovery does not replace the frontier from a drifted body
+
+- **WHEN** a grill-authority answer has written the issue body and persisted a recovery receipt
+- **AND** the live body no longer matches that receipt
+- **THEN** retry SHALL NOT persist a replacement frontier
+- **AND** SHALL NOT record the handoff as answered
+
 ---
 
 ### Requirement: Pipeline SHALL validate authority class against a closed taxonomy
@@ -377,7 +384,7 @@ When shared terminology required for implementation is missing, preview SHALL in
 
 ### Requirement: Operator answers SHALL use hash-bound `pipeline handoff answer` and SHALL materialize into the body
 
-Pipeline SHALL extend the existing authenticated `pipeline handoff answer` boundary for pre-admission Decision nodes. It SHALL NOT create a second answer ledger or a new handoff CLI verb. Each handoff and answer SHALL bind repository, issue, node ID, frontier fingerprint, source body hash, and the canonical node-definition digest (id, question, recommendation, class, term_id). When no PR or worktree tip exists, `candidate_sha` MAY be omitted. Create for these nodes SHALL use a policy-bound authority gate whose evidence is that binding; it SHALL NOT weaken mid-flight human-decision-required SHA evidence. A successful answer SHALL deterministically patch that node in the issue body, record the handoff provenance reference, and keep render/artifact identity. Bound-hash drift SHALL exit 2 with no mutation, including when only the Decisions artifact or rendered section changed. Spec-core equality SHALL NOT authorize a drifted full body. A live node whose definition digest does not match the bound digest SHALL fail closed. After a successful materialize write, remaining pending sibling handoffs SHALL bind the new body hash and SHALL keep the original definition digest. GitHub review comments and issue comments SHALL NOT settle nodes.
+Pipeline SHALL extend the existing authenticated `pipeline handoff answer` boundary for pre-admission Decision nodes. It SHALL NOT create a second answer ledger or a new handoff CLI verb. Each handoff and answer SHALL bind repository, issue, node ID, frontier fingerprint, source body hash, and the canonical node-definition digest (id, question, recommendation, class, term_id). When no PR or worktree tip exists, `candidate_sha` MAY be omitted. Create for these nodes SHALL use a policy-bound authority gate whose evidence is that binding; it SHALL NOT weaken mid-flight human-decision-required SHA evidence. A successful answer SHALL deterministically patch that node in the issue body, record the handoff provenance reference, and keep render/artifact identity. Bound-hash drift SHALL exit 2 with no mutation, including when only the Decisions artifact or rendered section changed. Spec-core equality SHALL NOT authorize a drifted full body. Already-materialized recovery SHALL require that same exact live-body match, or a Pipeline-authenticated recovery receipt for the expected post-write body persisted before the GitHub write. A live node whose definition digest does not match the bound digest SHALL fail closed. After a successful materialize write, remaining pending sibling handoffs SHALL bind the new body hash and SHALL keep the original definition digest. GitHub review comments and issue comments SHALL NOT settle nodes.
 
 #### Scenario: Authenticated answer settles an operator-required node
 
@@ -410,6 +417,14 @@ Pipeline SHALL extend the existing authenticated `pipeline handoff answer` bound
 - **WHEN** an operator comments the answer on the GitHub issue and does not run `pipeline handoff answer`
 - **THEN** the node SHALL remain unresolved
 - **AND** `--stage ready` SHALL exit 2
+
+#### Scenario: Drift after a partial write refuses heal
+
+- **WHEN** a grill-authority answer writes the issue body and then ledger persist fails
+- **AND** an editor then changes the spec core and artifact fingerprint while retaining the target node definition and `handoff:<id>` reference
+- **THEN** `pipeline handoff answer` SHALL exit 2
+- **AND** the authenticated frontier SHALL be unchanged
+- **AND** the handoff SHALL remain `pending`
 
 ---
 

@@ -48,6 +48,7 @@ import {
 } from "../scripts/grill-context.ts";
 import {
   frontierNodesFromArtifact,
+  grillFrontierPath,
   issueGrillFrontier,
   liveMatchesGrillFrontier,
   loadVerifiedGrillFrontier,
@@ -1114,7 +1115,7 @@ test("grill: create succeeds without a PR tip for grill-authority", () => {
   }
 });
 
-test("grill: materialize patches one node; drift refuses; heal skips rewrite", () => {
+test("grill: materialize patches one node; drift refuses; already-resolved patched body requires receipt", () => {
   const spec = "## Summary\nX\n";
   const nodes = canonicalThinIssueNodes();
   const art = artifact(nodes, spec);
@@ -1157,13 +1158,13 @@ test("grill: materialize patches one node; drift refuses; heal skips rewrite", (
   assert.equal(drifted.ok, false);
   if (!drifted.ok) assert.equal(drifted.code, "body_hash_drift");
 
-  const heal = materializeGrillNode({
+  const alreadyResolved = materializeGrillNode({
     liveBody: first.body,
     handoff: created.handoff,
     answerText: "ship it",
   });
-  assert.equal(heal.ok, true);
-  if (heal.ok) assert.equal(heal.wrote, false);
+  assert.equal(alreadyResolved.ok, false);
+  if (!alreadyResolved.ok) assert.equal(alreadyResolved.code, "body_hash_drift");
 });
 
 test("grill: artifact-only body edit refuses answer with no write and handoff stays pending", async () => {
@@ -1563,6 +1564,19 @@ test("grill: persist-after-write failure heals on retry without a second write",
   const art = artifact(nodes, spec);
   const body = embedDecisionsInBody(spec, art);
   const store = memoryHandoffStore();
+  const keyDeps = memoryKeyDeps();
+  persistGrillFrontier(
+    "/tmp/repo",
+    issueGrillFrontier({
+      repo: "acme/r",
+      issue: 42,
+      body,
+      artifact: art,
+      now: new Date("2026-01-01T00:00:00Z"),
+      key: "test-key",
+    }),
+    keyDeps,
+  );
   const input = grillAuthorityCreateInputs({
     domain: "d",
     repo: "acme/r",
@@ -1578,13 +1592,19 @@ test("grill: persist-after-write failure heals on retry without a second write",
   let live = body;
   const hook = {
     materialize: async (h: HumanQuestionHandoff, text: string) => {
-      const r = materializeGrillNode({ liveBody: live, handoff: h, answerText: text });
-      if (!r.ok) return r;
-      if (r.wrote) {
-        writes++;
-        live = r.body;
-      }
-      return { ok: true as const, wrote: r.wrote };
+      const r = await materializeGrillAnswer(h, text, {
+        getIssueBody: async () => live,
+        updateIssueBody: async (_n, next) => {
+          writes++;
+          live = next;
+        },
+        repoDir: "/tmp/repo",
+        handoffStore: store,
+        keyDeps,
+        frontierKey: "test-key",
+        now: () => new Date("2026-01-01T00:00:01Z"),
+      });
+      return r.ok ? { ok: true as const, wrote: r.wrote } : r;
     },
   };
   const first = await answerAndPersistHandoff(
@@ -1625,6 +1645,136 @@ test("grill: persist-after-write failure heals on retry without a second write",
   );
   assert.equal(retry.ok, true, retry.ok ? "" : retry.reason);
   assert.equal(writes, 1);
+});
+
+test("grill: persist-after-write then drifted spec/fingerprint refuses retry without replacing frontier", async () => {
+  const spec = "## Summary\nX\n";
+  const nodes = canonicalThinIssueNodes();
+  const art = artifact(nodes, spec);
+  const body = embedDecisionsInBody(spec, art);
+  const store = memoryHandoffStore();
+  const keyDeps = memoryKeyDeps();
+  persistGrillFrontier(
+    "/tmp/repo",
+    issueGrillFrontier({
+      repo: "acme/r",
+      issue: 42,
+      body,
+      artifact: art,
+      now: new Date("2026-01-01T00:00:00Z"),
+      key: "test-key",
+    }),
+    keyDeps,
+  );
+  const input = grillAuthorityCreateInputs({
+    domain: "d",
+    repo: "acme/r",
+    issueNumber: 42,
+    artifact: art,
+    proposedBody: body,
+    frontierFp: "fp",
+  })[0]!;
+  const created = await createAndPersistHandoff("/tmp/repo", input, store);
+  assert.equal(created.ok, true);
+  if (!created.ok) return;
+  let writes = 0;
+  let live = body;
+  const hook = {
+    materialize: async (h: HumanQuestionHandoff, text: string) => {
+      const r = await materializeGrillAnswer(h, text, {
+        getIssueBody: async () => live,
+        updateIssueBody: async (_n, next) => {
+          writes++;
+          live = next;
+        },
+        repoDir: "/tmp/repo",
+        handoffStore: store,
+        keyDeps,
+        frontierKey: "test-key",
+        now: () => new Date("2026-01-01T00:00:01Z"),
+      });
+      return r.ok ? { ok: true as const, wrote: r.wrote } : r;
+    },
+  };
+  const first = await answerAndPersistHandoff(
+    "/tmp/repo",
+    42,
+    created.handoff.handoff_id,
+    {
+      decision: "answer",
+      actor: "alice",
+      identitySource: "gh",
+      authenticated: true,
+      answerText: "yes",
+    },
+    {
+      ...store,
+      writeFile: async (p, data) => {
+        if (p.endsWith(`${created.handoff.handoff_id}.json`)) throw new Error("persist boom");
+        await store.writeFile(p, data);
+      },
+    },
+    hook,
+  );
+  assert.equal(first.ok, false);
+  assert.equal(writes, 1);
+  const patched = parseDecisionsFromBody(live);
+  assert.equal(patched.ok, true);
+  if (!patched.ok) return;
+  const decl = parseGrillDeclaration(created.handoff.declaration_identity ?? "");
+  assert.ok(decl);
+  const target = patched.artifact.nodes.find((n) => n.id === decl?.nodeId);
+  assert.equal(target?.resolution, "resolved");
+  assert.equal(target?.provenance.reference, `handoff:${created.handoff.handoff_id}`);
+  const driftedSpec = "## Summary\nY\n";
+  const driftedArt: DecisionsArtifact = {
+    ...patched.artifact,
+    fingerprint: {
+      ...patched.artifact.fingerprint,
+      applied_body_sha256: sha256Prefixed(driftedSpec),
+      planning_treatment_sha256: sha256Prefixed("drifted-treatment"),
+    },
+  };
+  const driftedBody = embedDecisionsInBody(driftedSpec, driftedArt);
+  assert.notEqual(extractSpecCore(live), extractSpecCore(driftedBody));
+  assert.notEqual(
+    patched.artifact.fingerprint.planning_treatment_sha256,
+    driftedArt.fingerprint.planning_treatment_sha256,
+  );
+  const driftedParsed = parseDecisionsFromBody(driftedBody);
+  assert.equal(driftedParsed.ok, true);
+  if (!driftedParsed.ok) return;
+  const driftedNode = driftedParsed.artifact.nodes.find((n) => n.id === decl?.nodeId);
+  assert.equal(nodeDefinitionDigest(driftedNode!), nodeDefinitionDigest(target!));
+  assert.equal(driftedNode?.provenance.reference, `handoff:${created.handoff.handoff_id}`);
+  const frontierFile = grillFrontierPath("/tmp/repo", 42);
+  const frontierBefore = keyDeps.readFile(frontierFile);
+  const verifiedBefore = loadVerifiedGrillFrontier("/tmp/repo", 42, "test-key", "acme/r", keyDeps);
+  assert.equal(verifiedBefore?.body_sha256, sha256Prefixed(live));
+  live = driftedBody;
+  const retry = await answerAndPersistHandoff(
+    "/tmp/repo",
+    42,
+    created.handoff.handoff_id,
+    {
+      decision: "answer",
+      actor: "alice",
+      identitySource: "gh",
+      authenticated: true,
+      answerText: "yes",
+    },
+    store,
+    hook,
+  );
+  assert.equal(retry.ok, false);
+  assert.equal(retry.code, "body_hash_drift");
+  assert.equal(writes, 1);
+  assert.equal(keyDeps.readFile(frontierFile), frontierBefore);
+  const verifiedAfter = loadVerifiedGrillFrontier("/tmp/repo", 42, "test-key", "acme/r", keyDeps);
+  assert.equal(verifiedAfter?.body_sha256, verifiedBefore?.body_sha256);
+  const loaded = await loadHandoff("/tmp/repo", 42, created.handoff.handoff_id, store);
+  assert.equal(loaded.ok, true);
+  if (loaded.ok) assert.equal(loaded.handoff.status, "pending");
 });
 
 test("grill: answer does not add pipeline:ready", async () => {

@@ -1,6 +1,8 @@
 // Grill-authority handoff create + body materialize (#1072).
 // Reuses `pipeline handoff answer`; no second ledger.
 
+import * as path from "node:path";
+import { artifactSubdir, GRILL_PROPOSALS_ARTIFACT } from "./artifact-ignore.ts";
 import {
   embedDecisionsInBody,
   extractSpecCore,
@@ -14,7 +16,13 @@ import {
   issueGrillFrontier,
   persistGrillFrontier,
 } from "./grill-frontier.ts";
-import { sha256Hex, sha256Prefixed } from "./grill-hash.ts";
+import {
+  canonicalJson,
+  hmacEqual,
+  hmacSha256Hex,
+  sha256Hex,
+  sha256Prefixed,
+} from "./grill-hash.ts";
 import {
   defaultGrillProposalKeyDeps,
   type GrillProposalKeyDeps,
@@ -74,6 +82,125 @@ export function liveNodeMatchesGrillBinding(
   definitionSha256: string,
 ): boolean {
   return hexDigest(nodeDefinitionDigest(node)) === hexDigest(definitionSha256);
+}
+
+export const GRILL_RECOVERY_SCHEMA = "grill-recovery.v1" as const;
+export const GRILL_RECOVERY_KIND = "grill-recovery" as const;
+export const GRILL_RECOVERY_MAC_PREFIX = "hmac-sha256:";
+
+export interface GrillRecoveryReceipt {
+  schema_version: typeof GRILL_RECOVERY_SCHEMA;
+  kind: typeof GRILL_RECOVERY_KIND;
+  issued_at: string;
+  repo: string;
+  issue: number;
+  handoff_id: string;
+  expected_body_sha256: string;
+  mac: string;
+}
+
+export function grillRecoveryReceiptPath(
+  repoDir: string,
+  issueNumber: number,
+  handoffId: string,
+): string {
+  return path.join(
+    artifactSubdir(repoDir, GRILL_PROPOSALS_ARTIFACT),
+    `recovery-issue-${issueNumber}-handoff-${handoffId}.json`,
+  );
+}
+
+export function issueGrillRecoveryReceipt(input: {
+  repo: string;
+  issue: number;
+  handoffId: string;
+  expectedBody: string;
+  now: Date;
+  key: string;
+}): GrillRecoveryReceipt {
+  const issuedAt = input.now.toISOString().replace(/\.\d+Z$/, "Z");
+  const unsigned: Omit<GrillRecoveryReceipt, "mac"> = {
+    schema_version: GRILL_RECOVERY_SCHEMA,
+    kind: GRILL_RECOVERY_KIND,
+    issued_at: issuedAt,
+    repo: input.repo,
+    issue: input.issue,
+    handoff_id: input.handoffId,
+    expected_body_sha256: sha256Prefixed(input.expectedBody),
+  };
+  const mac = `${GRILL_RECOVERY_MAC_PREFIX}${hmacSha256Hex(input.key, canonicalJson(unsigned))}`;
+  return { ...unsigned, mac };
+}
+
+export function verifyGrillRecoveryReceipt(
+  record: GrillRecoveryReceipt,
+  key: string,
+  expected: { repo: string; issue: number; handoffId: string },
+): { ok: true; expected_body_sha256: string } | { ok: false; reason: string } {
+  if (record.schema_version !== GRILL_RECOVERY_SCHEMA || record.kind !== GRILL_RECOVERY_KIND) {
+    return { ok: false, reason: "unknown grill-recovery schema" };
+  }
+  if (record.issue !== expected.issue) {
+    return { ok: false, reason: "grill-recovery issue does not match" };
+  }
+  if (record.repo !== expected.repo) {
+    return { ok: false, reason: "grill-recovery repo does not match" };
+  }
+  if (record.handoff_id !== expected.handoffId) {
+    return { ok: false, reason: "grill-recovery handoff does not match" };
+  }
+  const { mac, ...unsigned } = record;
+  const expectedMac = hmacSha256Hex(key, canonicalJson(unsigned));
+  const actualMac =
+    typeof mac === "string" && mac.startsWith(GRILL_RECOVERY_MAC_PREFIX)
+      ? mac.slice(GRILL_RECOVERY_MAC_PREFIX.length)
+      : "";
+  if (!hmacEqual(expectedMac, actualMac)) {
+    return { ok: false, reason: "grill-recovery MAC verification failed" };
+  }
+  if (typeof record.expected_body_sha256 !== "string") {
+    return { ok: false, reason: "grill-recovery expected body hash missing" };
+  }
+  return { ok: true, expected_body_sha256: record.expected_body_sha256 };
+}
+
+export function persistGrillRecoveryReceipt(
+  repoDir: string,
+  record: GrillRecoveryReceipt,
+  deps: GrillProposalKeyDeps = defaultGrillProposalKeyDeps,
+): void {
+  const file = grillRecoveryReceiptPath(repoDir, record.issue, record.handoff_id);
+  deps.mkdir(path.dirname(file));
+  deps.writeFile(file, `${JSON.stringify(record)}\n`);
+}
+
+export function loadVerifiedGrillRecoveryReceipt(
+  repoDir: string,
+  handoff: HumanQuestionHandoff,
+  key: string,
+  deps: GrillProposalKeyDeps = defaultGrillProposalKeyDeps,
+): { expected_body_sha256: string } | null {
+  const file = grillRecoveryReceiptPath(repoDir, handoff.issue_number, handoff.handoff_id);
+  if (!deps.exists(file)) return null;
+  try {
+    const parsed: unknown = JSON.parse(deps.readFile(file));
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    const o = parsed as Record<string, unknown>;
+    if (o.schema_version !== GRILL_RECOVERY_SCHEMA || o.kind !== GRILL_RECOVERY_KIND) return null;
+    if (typeof o.mac !== "string" || typeof o.repo !== "string" || typeof o.issue !== "number") {
+      return null;
+    }
+    if (typeof o.handoff_id !== "string" || typeof o.expected_body_sha256 !== "string") return null;
+    if (typeof o.issued_at !== "string") return null;
+    const verified = verifyGrillRecoveryReceipt(o as unknown as GrillRecoveryReceipt, key, {
+      repo: handoff.repo,
+      issue: handoff.issue_number,
+      handoffId: handoff.handoff_id,
+    });
+    return verified.ok ? { expected_body_sha256: verified.expected_body_sha256 } : null;
+  } catch {
+    return null;
+  }
 }
 
 /** True when a pending/answered grill-authority record is the applied artifact's current binding. */
@@ -287,7 +414,9 @@ export type GrillMaterializeResult =
 
 /**
  * Deterministically patch one operator-required node. Exact live-body SHA-256
- * match is required. Spec-core equality does not authorize a drifted body.
+ * match is required before any already-materialized recovery. Spec-core
+ * equality does not authorize a drifted body. No-write healing of a post-write
+ * body is only permitted when a verified recovery receipt matches.
  */
 export function materializeGrillNode(input: {
   liveBody: string;
@@ -315,16 +444,16 @@ export function materializeGrillNode(input: {
       code: "invalid_artifact",
     };
   }
-  const already = node.provenance.reference === `handoff:${input.handoff.handoff_id}`;
-  if (already && node.resolution === "resolved") {
-    return { ok: true, body: input.liveBody, wrote: false, artifact: parsed.artifact };
-  }
   if (liveHash !== boundHash) {
     return {
       ok: false,
       reason: "live issue body hash does not match the grill-authority binding",
       code: "body_hash_drift",
     };
+  }
+  const already = node.provenance.reference === `handoff:${input.handoff.handoff_id}`;
+  if (already && node.resolution === "resolved") {
+    return { ok: true, body: input.liveBody, wrote: false, artifact: parsed.artifact };
   }
   if (!isOperatorRequiredClass(node.class) && classifyAuthority(node.class).operatorRequired) {
     // unknown class still operator-required via classifyAuthority
@@ -388,6 +517,63 @@ export async function refreshPendingSiblingGrillHandoffs(
   }
 }
 
+function healGrillAnswerFromReceipt(
+  liveBody: string,
+  handoff: HumanQuestionHandoff,
+  deps: GrillMaterializeDeps,
+): GrillMaterializeResult | null {
+  if (!deps.repoDir || !deps.frontierKey) return null;
+  const parsedDecl = parseGrillDeclaration(handoff.declaration_identity ?? "");
+  if (!parsedDecl) return null;
+  const parsed = parseDecisionsFromBody(liveBody);
+  if (!parsed.ok) return null;
+  const node = parsed.artifact.nodes.find((n) => n.id === parsedDecl.nodeId);
+  if (!node) return null;
+  if (node.provenance.reference !== `handoff:${handoff.handoff_id}`) return null;
+  if (node.resolution !== "resolved") return null;
+  if (!liveNodeMatchesGrillBinding(node, parsedDecl.definitionSha256)) return null;
+  const receipt = loadVerifiedGrillRecoveryReceipt(
+    deps.repoDir,
+    handoff,
+    deps.frontierKey,
+    deps.keyDeps ?? defaultGrillProposalKeyDeps,
+  );
+  if (!receipt) return null;
+  if (hexDigest(sha256Prefixed(liveBody)) !== hexDigest(receipt.expected_body_sha256)) {
+    return null;
+  }
+  return { ok: true, body: liveBody, wrote: false, artifact: parsed.artifact };
+}
+
+function persistPlannedFrontier(
+  handoff: HumanQuestionHandoff,
+  planned: { body: string; artifact: DecisionsArtifact },
+  deps: GrillMaterializeDeps,
+): GrillMaterializeResult | null {
+  if (!deps.repoDir || !deps.frontierKey) return null;
+  try {
+    persistGrillFrontier(
+      deps.repoDir,
+      issueGrillFrontier({
+        repo: handoff.repo,
+        issue: handoff.issue_number,
+        body: planned.body,
+        artifact: planned.artifact,
+        now: (deps.now ?? (() => new Date()))(),
+        key: deps.frontierKey,
+      }),
+      deps.keyDeps ?? defaultGrillProposalKeyDeps,
+    );
+    return null;
+  } catch (err) {
+    return {
+      ok: false,
+      reason: `frontier persist failed: ${(err as Error).message}`,
+      code: "write_failed",
+    };
+  }
+}
+
 export async function materializeGrillAnswer(
   handoff: HumanQuestionHandoff,
   answerText: string,
@@ -395,8 +581,37 @@ export async function materializeGrillAnswer(
 ): Promise<GrillMaterializeResult> {
   const liveBody = await deps.getIssueBody(handoff.issue_number);
   const planned = materializeGrillNode({ liveBody, handoff, answerText });
-  if (!planned.ok) return planned;
+  if (!planned.ok) {
+    if (planned.code !== "body_hash_drift") return planned;
+    const healed = healGrillAnswerFromReceipt(liveBody, handoff, deps);
+    if (!healed) return planned;
+    const frontierErr = persistPlannedFrontier(handoff, healed, deps);
+    if (frontierErr) return frontierErr;
+    return healed;
+  }
   if (planned.wrote) {
+    if (deps.repoDir && deps.frontierKey) {
+      try {
+        persistGrillRecoveryReceipt(
+          deps.repoDir,
+          issueGrillRecoveryReceipt({
+            repo: handoff.repo,
+            issue: handoff.issue_number,
+            handoffId: handoff.handoff_id,
+            expectedBody: planned.body,
+            now: (deps.now ?? (() => new Date()))(),
+            key: deps.frontierKey,
+          }),
+          deps.keyDeps ?? defaultGrillProposalKeyDeps,
+        );
+      } catch (err) {
+        return {
+          ok: false,
+          reason: `recovery receipt persist failed: ${(err as Error).message}`,
+          code: "write_failed",
+        };
+      }
+    }
     try {
       await deps.updateIssueBody(handoff.issue_number, planned.body);
     } catch (err) {
@@ -417,28 +632,8 @@ export async function materializeGrillAnswer(
         code: "write_failed",
       };
     }
-    if (deps.frontierKey) {
-      try {
-        persistGrillFrontier(
-          deps.repoDir,
-          issueGrillFrontier({
-            repo: handoff.repo,
-            issue: handoff.issue_number,
-            body: planned.body,
-            artifact: planned.artifact,
-            now: (deps.now ?? (() => new Date()))(),
-            key: deps.frontierKey,
-          }),
-          deps.keyDeps ?? defaultGrillProposalKeyDeps,
-        );
-      } catch (err) {
-        return {
-          ok: false,
-          reason: `frontier persist failed: ${(err as Error).message}`,
-          code: "write_failed",
-        };
-      }
-    }
+    const frontierErr = persistPlannedFrontier(handoff, planned, deps);
+    if (frontierErr) return frontierErr;
   }
   return planned;
 }
