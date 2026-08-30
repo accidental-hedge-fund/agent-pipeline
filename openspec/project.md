@@ -6,7 +6,9 @@ through a 18-stage state machine (code `STAGES` in `core/scripts/types.ts`,
 including the terminal park off-ramp `needs-human`) to `pipeline:ready-to-deploy`.
 The product is the `pipeline` CLI (`pipeline <verb> [--json]` plus event JSONL).
 Hosts are argv or JSON wrappers (short SKILL shims) around that CLI; they are
-not a second engine. Claude Code, Codex, Grok, OpenCode, and OMP are host
+not a second engine. Implementer and reviewer are config roles from
+`harnesses.*` in `.github/pipeline.yml`, not host-brand product names.
+Claude Code, Codex, Grok, OpenCode, and OMP are host
 surfaces, not a Claude-plus-Codex-only product.
 
 ## Tech & layout

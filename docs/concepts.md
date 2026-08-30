@@ -11,6 +11,7 @@ A newcomer who completed Prerequisites, Install, and Quickstart in the README ha
 - [Onboarding details](#onboarding-details)
 - [Test/build gate](#testbuild-gate-optional-default-on)
 - [Configurable steps (optional)](#configurable-steps-optional)
+- [Implementer and reviewer pair](#implementer-and-reviewer-pair)
 - [External supervisors (compose the CLI)](#external-supervisors-compose-the-cli)
 - [Ship-path autonomy](#ship-path-autonomy)
 - [Human plan feedback (optional)](#human-plan-feedback-optional)
@@ -46,7 +47,7 @@ Hosts (Claude Code `/pipeline`, Codex `$pipeline`, and others) are shims around 
 
 Ignored local paths (must never be committed): `.agent-pipeline/runs/`, `.agent-pipeline/roadmap/`, `.agent-pipeline/history/`, `.agent-pipeline/evals/`, `.agent-pipeline/control-attributions.jsonl`, `.agent-pipeline/product-fault-reports.jsonl`, `.agent-pipeline/handoffs/`, `.agent-pipeline/outcomes/`, `.agent-pipeline/lineage/`, `.agent-pipeline/frg/`, `.agent-pipeline/harness-ownership/`, `.agent-pipeline/factory-release/`, `.agent-pipeline/grill-proposal.key`, and `.agent-pipeline/grill-proposals/`. Without that gitignore block, the first run can leave the worktree dirty and fail `pipeline doctor`'s `worktree-clean` check.
 
-After `init`, commit the config, label an issue `pipeline:ready`, and run `/pipeline N` or `$pipeline N`.
+After `init`, commit the config, label an issue `pipeline:ready`, and run `pipeline N`.
 
 ## Test/build gate (optional, default on)
 
@@ -92,6 +93,15 @@ Structural safety steps (planning, implementing, pre-merge CI/mergeability) are 
 
 Review verdicts are pinned to the commit they evaluated. Before pre-merge acts on a prior approval it re-checks that SHA against HEAD; a developer/fix commit after the verdict invalidates it and re-enters review. Pipeline-internal commits (docs/chore archive, etc.) do not.
 
+## Implementer and reviewer pair
+
+A runnable repository must declare an **implementer** and an independent **reviewer** in `.github/pipeline.yml` (`harnesses.implementer`, `harnesses.reviewer`). Those keys are config roles, not product brand names. An independent reviewer is the default product. Same-harness self-review is a fallback, not the recommended setup. `steps.adversarial_review` turns review-2 on or off; see [config.md](config.md). `pipeline doctor` reports the configured harness binaries (`harness:<bin>` checks). It does not invent a new check id.
+
+| `harnesses.implementer` | `harnesses.reviewer` | `steps.adversarial_review` |
+|---|---|---|
+| grok (this repository) | codex | true |
+| codex | claude | true |
+
 ## External supervisors (compose the CLI)
 
 An external supervisor can compose the existing Pipeline CLI (`pipeline single`,
@@ -112,8 +122,9 @@ Repository content in `.github/pipeline.yml` cannot authorize merges or set
 Portable supervisor contract (intent → CLI, status JSON, multi-platform bootstrap):
 [supervisor.md](./supervisor.md). Thin examples: [`examples/supervisor/`](../examples/supervisor/).
 
-The current Grok profile must use exactly `grok-4.6` for planning,
-implementation, and fixes. It has no Grok fallback. Codex remains the reviewer.
+This repository’s configured pair is Grok implement / Codex review (see the
+matrix above). Planning, implementation, and fixes use exactly `grok-4.6`,
+with no Grok fallback.
 Product direction: [factory-simplification-plan.md](./factory-simplification-plan.md).
 
 ## Ship-path autonomy
@@ -146,9 +157,9 @@ When human comments are present, the revised plan comment attributes contributor
 **Overrides** disposition a specific blocking finding and auto-resume:
 
 ```text
-/pipeline N --override "<override-key>: rejected — <why>"
-/pipeline N --override "category:rollback-safety: deferred #90 — tracked separately"
-/pipeline N --override "<override-key>: high_risk_accept: accept residual remediation_issue_url=https://… risk_acceptance_ref=RA-1"
+pipeline N --override "<override-key>: rejected — <why>"
+pipeline N --override "category:rollback-safety: deferred #90 — tracked separately"
+pipeline N --override "<override-key>: high_risk_accept: accept residual remediation_issue_url=https://… risk_acceptance_ref=RA-1"
 ```
 
 Bare `"<key>: <reason>"` maps to `override_governance.default_class` when configured, or to the implicit `low_risk_deferred` class when the block is omitted (compatibility path). Optional class form: `"<key>: <class>: <reason>"`. Required evidence refs for a class are passed as `kind=value` tokens in the reason.
@@ -256,7 +267,7 @@ Stage prompts embed an excerpt of the target repo's conventions file (`CLAUDE.md
 
 ## Park-release of managed worktrees
 
-`/pipeline` / `pipeline single` and `train --merge` share one park-release / automatic-remove gate. A clean managed worktree under `worktree_root` is released when **one** recoverability condition holds:
+`pipeline` / `pipeline single` and `train --merge` share one park-release / automatic-remove gate. A clean managed worktree under `worktree_root` is released when **one** recoverability condition holds:
 
 1. No unpushed commits, and the branch tip is on the remote **or** an open PR has a resolvable head SHA; or
 2. **Bound merge-result proof** — the same issue, the same PR, the configured base branch, and a `merge_result_oid` the engine has proven is contained in `origin/<base>`.
