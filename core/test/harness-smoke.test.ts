@@ -45,6 +45,12 @@ import {
   type CliOpts,
   type PreflightCliDeps,
 } from "../scripts/pipeline.ts";
+import {
+  HARNESS_SMOKE_FAILURE_SCHEMA,
+  parseHarnessSmokeFailureArtifact,
+  serializeHarnessSmokeFailureArtifact,
+  buildHarnessSmokeFailureArtifact,
+} from "../scripts/harness-smoke-failure.ts";
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -193,6 +199,9 @@ interface FakeSmokeOpts {
   onInvoke?: (req: SmokeInvokeRequest) => void;
   onRuntimeSmoke?: (name: string) => void;
   createScratchRoots?: string[];
+  writeFailureArtifact?: HarnessSmokeDeps["writeFailureArtifact"];
+  onWriteArtifact?: (artifact: unknown) => void;
+  onCleanup?: (root: string) => void;
 }
 
 function fakeSmokeDeps(o: FakeSmokeOpts = {}): HarnessSmokeDeps {
@@ -223,7 +232,9 @@ function fakeSmokeDeps(o: FakeSmokeOpts = {}): HarnessSmokeDeps {
       scratchRoots.push(root);
       return root;
     },
-    cleanupScratchRepo: async () => {},
+    cleanupScratchRepo: async (root) => {
+      o.onCleanup?.(root);
+    },
     snapshotRepo: async () => {
       if (o.snapshots && o.snapshots.length > 0) {
         const snap = o.snapshots[Math.min(snapshotIdx, o.snapshots.length - 1)]!;
@@ -281,6 +292,14 @@ function fakeSmokeDeps(o: FakeSmokeOpts = {}): HarnessSmokeDeps {
     adapterPreflightDeps: {
       exec: async () => ({ ok: true, stdout: "", stderr: "" }),
       execCheck: async () => true,
+    },
+    writeFailureArtifact: async (domain, artifact) => {
+      if (o.writeFailureArtifact) return o.writeFailureArtifact(domain, artifact);
+      o.onWriteArtifact?.(artifact);
+      return {
+        path: `/tmp/pipeline-${domain}-doctor-harness-smoke/fake.json`,
+        content_hash: "0".repeat(64),
+      };
     },
   };
 }
@@ -1158,6 +1177,8 @@ test("drift-guard: harness-smoke module references registered contract ids", () 
   assert.match(src, /runtimeSmoke/);
   // No hardcoded built-in-only name list for plan building
   assert.doesNotMatch(src, /const BUILTIN_ONLY\s*=/);
+  // #1265: implementer smoke must not hardcode tool-disabling lean.
+  assert.doesNotMatch(src, /lean:\s*req\.role\s*===\s*"implementer"\s*\?\s*true/);
 });
 
 test("canned prompts mention trailers / read-only verdict", () => {
@@ -1187,4 +1208,200 @@ test("fail-fast stops after first failing treatment", async () => {
   assert.equal(outcomes.length, 1);
   assert.equal(outcomes[0]!.status, "fail");
   assert.equal(invokes, 0);
+});
+
+function collapsedConfig(): PipelineConfig {
+  return makeConfig({
+    models: {
+      planning: "x",
+      implementing: "x",
+      review: "y",
+      fix: "x",
+      intake: "x",
+      sweep: "x",
+    },
+    effort: {
+      planning: "low",
+      implementing: "low",
+      review: "high",
+      fix: "low",
+      intake: "low",
+      sweep: "low",
+    },
+    plan_review_effort: "high",
+  });
+}
+
+// ---------------------------------------------------------------------------
+// #1265 — implementer smoke is not lean; failure artifacts
+// ---------------------------------------------------------------------------
+
+test("runHarnessSmoke: implementer invoke is not lean; reviewer MAY be lean", async () => {
+  const invoked: SmokeInvokeRequest[] = [];
+  const deps = fakeSmokeDeps({
+    onInvoke: (req) => invoked.push(req),
+  });
+  const outcomes = await runHarnessSmoke(collapsedConfig(), deps);
+  assert.ok(outcomes.every((o) => o.status === "pass"), JSON.stringify(outcomes));
+  const impl = invoked.filter((r) => r.role === "implementer");
+  const rev = invoked.filter((r) => r.role === "reviewer");
+  assert.ok(impl.length >= 1);
+  assert.ok(impl.every((r) => r.lean !== true), JSON.stringify(impl));
+  assert.ok(rev.length >= 1);
+  assert.ok(rev.every((r) => r.lean === true), JSON.stringify(rev));
+});
+
+test("runHarnessSmoke: fake implementer that commits only without lean passes", async () => {
+  const leanByRoot = new Map<string, boolean | undefined>();
+  const deps = fakeSmokeDeps({
+    onInvoke: (req) => {
+      leanByRoot.set(req.worktreeDir, req.lean);
+    },
+    newCommitMessages: (root) => {
+      if (leanByRoot.get(root) === true) return [];
+      return ["smoke\n\nIssue: #0\nPipeline-Run: harness-smoke/0\n"];
+    },
+  });
+  const outcomes = await runHarnessSmoke(collapsedConfig(), deps);
+  const impl = outcomes.filter((o) => o.id.includes(":implementer"));
+  assert.ok(impl.length >= 1);
+  assert.ok(impl.every((o) => o.status === "pass"), JSON.stringify(impl));
+});
+
+test("parseHarnessSmokeFailureArtifact rejects missing required fields", () => {
+  const missingStdout = {
+    schema: HARNESS_SMOKE_FAILURE_SCHEMA,
+    treatment: { adapter: "claude", role: "implementer" },
+    stderr: "",
+    before_porcelain: "",
+    after_porcelain: "",
+    head: null,
+    log_excerpt: "",
+    exit_code: 0,
+    timed_out: false,
+    preflight_failed: false,
+  };
+  const parsed = parseHarnessSmokeFailureArtifact(missingStdout);
+  assert.equal(parsed.ok, false);
+  if (!parsed.ok) assert.match(parsed.reason, /stdout/);
+});
+
+test("runHarnessSmoke: trailer-miss writes evidence before scratch delete", async () => {
+  const events: string[] = [];
+  const deps = fakeSmokeDeps({
+    newCommitMessages: () => [],
+    invoke: async (req) => {
+      if (req.role === "implementer") {
+        return {
+          success: true,
+          exitCode: 0,
+          stdout: '{"ok":true,"smoke":"implementer"}',
+          stderr: "secret ghp_abcdefghijklmnopqrstuvwxyz012345",
+        };
+      }
+      return {
+        success: true,
+        exitCode: 0,
+        stdout: '{"verdict":"approve","summary":"ok","findings":[],"next_steps":[]}',
+        stderr: "",
+      };
+    },
+    writeFailureArtifact: async () => {
+      events.push("write");
+      return { path: "/tmp/pipeline-smoketest-doctor-harness-smoke/abc.json", content_hash: "abc" };
+    },
+    onCleanup: () => {
+      events.push("delete");
+    },
+  });
+  const outcomes = await runHarnessSmoke(collapsedConfig(), deps);
+  const impl = outcomes.filter((o) => o.id.includes(":implementer"));
+  assert.ok(impl.every((o) => o.status === "fail"));
+  assert.ok(impl.every((o) => o.evidence?.path.includes("abc.json")));
+  assert.ok(impl.every((o) => /digest abc/.test(o.detail)));
+  const env = formatDoctorJson({
+    schema_version: 1,
+    ok: false,
+    ranAt: "t",
+    checks: impl,
+  });
+  assert.equal(env.checks[0]!.evidence?.path, impl[0]!.evidence?.path);
+  assert.equal(env.checks[0]!.evidence?.content_hash, "abc");
+  const writeIdx = events.indexOf("write");
+  const deleteIdx = events.indexOf("delete");
+  assert.ok(writeIdx >= 0 && deleteIdx > writeIdx, JSON.stringify(events));
+});
+
+test("runHarnessSmoke: artifact write throw still status-fails", async () => {
+  const deps = fakeSmokeDeps({
+    newCommitMessages: () => [],
+    invoke: async (req) => {
+      if (req.role === "implementer") {
+        return {
+          success: true,
+          exitCode: 0,
+          stdout: '{"ok":true,"smoke":"implementer"}',
+          stderr: "",
+        };
+      }
+      return {
+        success: true,
+        exitCode: 0,
+        stdout: '{"verdict":"approve","summary":"ok","findings":[],"next_steps":[]}',
+        stderr: "",
+      };
+    },
+    writeFailureArtifact: async () => {
+      throw new Error("disk full");
+    },
+  });
+  const outcomes = await runHarnessSmoke(collapsedConfig(), deps);
+  const impl = outcomes.filter((o) => o.id.includes(":implementer"));
+  assert.ok(impl.every((o) => o.status === "fail"));
+  assert.ok(impl.every((o) => /trailer/i.test(o.detail)));
+  assert.ok(impl.every((o) => /evidence capture failed/i.test(o.detail)));
+  assert.ok(impl.every((o) => o.evidence === undefined));
+});
+
+test("runHarnessSmoke: spawn/contract/mutation/telemetry failures capture evidence", async () => {
+  const spawnDeps = fakeSmokeDeps({
+    invoke: async () => ({ success: false, exitCode: 1, stdout: "", stderr: "boom" }),
+  });
+  const spawnOut = await runHarnessSmoke(collapsedConfig(), spawnDeps);
+  assert.ok(spawnOut.some((o) => o.status === "fail" && o.evidence && /spawn failed/i.test(o.detail)));
+
+  const contractDeps = fakeSmokeDeps({
+    newCommitMessages: () => ["msg\n\nIssue: #0\nPipeline-Run: harness-smoke/0\n"],
+    invoke: async (req) => {
+      if (req.role === "implementer") {
+        return { success: true, exitCode: 0, stdout: "not-json", stderr: "" };
+      }
+      return {
+        success: true,
+        exitCode: 0,
+        stdout: '{"verdict":"approve","summary":"ok","findings":[],"next_steps":[]}',
+        stderr: "",
+      };
+    },
+  });
+  const contractOut = await runHarnessSmoke(collapsedConfig(), contractDeps);
+  assert.ok(contractOut.some((o) => o.id.includes(":implementer") && o.status === "fail" && o.evidence && /contract/i.test(o.detail)));
+});
+
+test("serializeHarnessSmokeFailureArtifact redacts secret-shaped tokens", () => {
+  const artifact = buildHarnessSmokeFailureArtifact({
+    treatment: { adapter: "claude", role: "implementer" },
+    stdout: "token ghp_abcdefghijklmnopqrstuvwxyz012345 in stdout",
+    stderr: "please log in",
+    beforePorcelain: "",
+    afterPorcelain: "",
+    head: null,
+    logExcerpt: "",
+    exitCode: 0,
+    timedOut: false,
+    preflightFailed: false,
+  });
+  const bytes = serializeHarnessSmokeFailureArtifact(artifact);
+  assert.equal(bytes.includes("ghp_abcdefghijklmnopqrstuvwxyz012345"), false);
+  assert.match(bytes, /REDACTED/);
 });

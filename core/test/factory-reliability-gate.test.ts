@@ -190,6 +190,45 @@ test("classifyFrgBlocker taxonomy buckets", () => {
   assert.equal(classifyFrgBlocker("totally-unknown-xyz"), "engine-class");
 });
 
+test("classifyFrgBlocker: environment-auth is product-class, not engine-class", () => {
+  assert.equal(classifyFrgBlocker("environment-auth"), "product-class");
+  assert.notEqual(classifyFrgBlocker("environment-auth"), "engine-class");
+  assert.notEqual(classifyFrgBlocker("environment-auth"), "human-authority");
+});
+
+test("computeFrgEvidence: environment-auth theme increments product-class, not engine_class_count", () => {
+  const evidence = computeFrgEvidence({
+    version: "1.39.13",
+    run_id: "frg-env-auth",
+    loop_run_id: "loop-env-auth",
+    pack_id: FRG_PACK_MANIFEST.pack_id,
+    items: [
+      { item_id: "1", state: "blocked", blocker_theme: "environment-auth" },
+      { item_id: "2", state: "ready", ready_clean: true },
+    ],
+    scenario_overrides: frgRequiredObservationOverrides("pass"),
+    composition_overrides: frgRequiredCompositionOverrides("pass"),
+  });
+  assert.equal(evidence.scoreboard.engine_class_count, 0);
+  assert.equal(evidence.scoreboard.product_class_count, 1);
+  assert.equal(evidence.scoreboard.engine_class_rate, 0);
+
+  const misThemed = computeFrgEvidence({
+    version: "1.39.13",
+    run_id: "frg-env-auth-mis",
+    loop_run_id: "loop-env-auth-mis",
+    pack_id: FRG_PACK_MANIFEST.pack_id,
+    items: [
+      { item_id: "1", state: "blocked", blocker_theme: "workflow-engine-defect" },
+      { item_id: "2", state: "ready", ready_clean: true },
+    ],
+    scenario_overrides: frgRequiredObservationOverrides("pass"),
+    composition_overrides: frgRequiredCompositionOverrides("pass"),
+  });
+  assert.equal(misThemed.scoreboard.engine_class_count, 1);
+  assert.equal(classifyFrgBlocker("workflow-engine-defect"), "engine-class");
+});
+
 // ---------------------------------------------------------------------------
 // Scoring
 // ---------------------------------------------------------------------------
