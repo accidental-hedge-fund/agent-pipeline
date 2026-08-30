@@ -69,6 +69,8 @@ function hermeticSupervisorDeps(deps: SupervisorDeps): SupervisorDeps {
   return {
     probeLiveAdvance: () => ({ live: false as const }),
     acquireItemAdvanceLock: () => ({ release() {} }),
+    setHeartbeatInterval: () => null,
+    clearHeartbeatInterval: () => {},
     ...deps,
   };
 }
@@ -491,6 +493,77 @@ test("supervisor.json is written at attach and its heartbeat advances per cycle 
     new Date(auditAfter.process!.heartbeat_at).getTime() > new Date(auditAfter.process!.started_at).getTime(),
     "heartbeat_at must have advanced past the initial attach time across cycles",
   );
+});
+
+test("heartbeat advances during a long in-flight cycle via the injected timer (#1296)", async () => {
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps, files } = await setup(contract, ledger);
+  const ticks: Array<() => void | Promise<void>> = [];
+  let releaseDispatch: () => void = () => {};
+  const blocked = new Promise<void>((resolve) => {
+    releaseDispatch = resolve;
+  });
+  const { observe, dispatchItem } = coordinatedFakes();
+  const drive = driveSupervisor(
+    {
+      store: deps,
+      observe,
+      dispatchItem: async (request, hooks) => {
+        await blocked;
+        return dispatchItem(request, hooks);
+      },
+      setHeartbeatInterval: (fn) => {
+        ticks.push(fn);
+        return "timer";
+      },
+      clearHeartbeatInterval: () => {},
+    },
+    { runId: "run-1", engine: "claude", candidateSha: "a".repeat(40) },
+  );
+  try {
+    for (let i = 0; i < 50 && ticks.length === 0; i++) {
+      await new Promise((r) => setImmediate(r));
+    }
+    const before = JSON.parse(files.get([...files.keys()].find((k) => k.endsWith("supervisor.json"))!)!);
+    const started = before.heartbeat_at;
+    assert.ok(ticks.length >= 1, "heartbeat timer must start after attach");
+    await ticks[0]!();
+    const mid = JSON.parse(files.get([...files.keys()].find((k) => k.endsWith("supervisor.json"))!)!);
+    assert.ok(
+      new Date(mid.heartbeat_at).getTime() > new Date(started).getTime(),
+      "heartbeat_at must advance during an in-flight cycle",
+    );
+    const handoffPath = [...files.keys()].find((k) => k.endsWith("loop-run-handoff.json"));
+    assert.ok(handoffPath, "durable loop-run-handoff.json must be written at attach");
+    const handoff = JSON.parse(files.get(handoffPath!)!);
+    assert.equal(handoff.kind, "loop_run_handoff");
+    assert.equal(handoff.candidate_sha, "a".repeat(40));
+  } finally {
+    releaseDispatch();
+    await drive;
+  }
+});
+
+test("heartbeat timer is cleared when drive ends (#1296)", async () => {
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const { observe, dispatchItem } = coordinatedFakes();
+  let cleared = 0;
+  await driveSupervisor(
+    {
+      store: deps,
+      observe,
+      dispatchItem,
+      setHeartbeatInterval: () => "handle",
+      clearHeartbeatInterval: () => {
+        cleared += 1;
+      },
+    },
+    { runId: "run-1", engine: "claude" },
+  );
+  assert.equal(cleared, 1);
 });
 
 // ---------------------------------------------------------------------------

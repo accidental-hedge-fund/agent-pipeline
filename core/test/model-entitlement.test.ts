@@ -135,6 +135,30 @@ test("classifyReviewerHarnessFailure prefers entitlement over throttled", () => 
   assert.equal(classifyReviewerHarnessFailure(ordinaryThrottle()), "transient-infra");
 });
 
+test("classifyReviewerHarnessFailure: environment-auth preflight is not harness-contract", () => {
+  assert.equal(
+    classifyReviewerHarnessFailure({
+      success: false,
+      exit_code: -1,
+      stdout: "",
+      stderr: "",
+      timed_out: false,
+      preflight_reason_code: "environment-auth",
+    }),
+    "environment-auth",
+  );
+  assert.equal(
+    classifyReviewerHarnessFailure({
+      success: false,
+      exit_code: 1,
+      stdout: "",
+      stderr: "please log in",
+      timed_out: false,
+    }),
+    "harness-contract",
+  );
+});
+
 test("recovery budgets: environment-auth and transient-rate-limit do not run_fatal on first attempt", () => {
   assert.equal(DEFAULT_RECOVERY_POLICY["environment-auth"].run_fatal, true);
   assert.ok(DEFAULT_RECOVERY_POLICY["environment-auth"].retry_budget >= 2);

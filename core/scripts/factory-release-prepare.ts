@@ -21,7 +21,7 @@
 
 import { execFile } from "node:child_process";
 import * as crypto from "node:crypto";
-import { realpathSync as fsRealpathSync } from "node:fs";
+import { existsSync, realpathSync as fsRealpathSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { promisify } from "node:util";
@@ -39,6 +39,7 @@ import {
   latestJsonForHonestPost133Persist,
   normalizeFrgVersion,
   parseFrgEvidenceJson,
+  resolveFrgAttestationKey,
   runFactoryGate,
   validateFrgPackContract,
   validateReleaseEligibleFrgEvidence,
@@ -46,6 +47,8 @@ import {
   type FrgCompositionOverride,
   type FrgEvidence,
   type FrgScenarioOverride,
+  type FrgValidateOpts,
+  type ShipPathFromRunResolution,
 } from "./factory-reliability-gate.ts";
 import {
   defaultFrgPackRoot,
@@ -55,16 +58,35 @@ import {
   type LoadedFrgPack,
   type RenderedFrgIssue,
 } from "./frg-pack-observations.ts";
+import { redactSecrets, sanitize } from "./artifact-sanitize.ts";
 import {
   defaultLoopStoreDeps,
+  loopRunHandoffPath,
   readActionEvidence,
   readContract,
   readEvents,
   readLedger,
+  readLoopRunHandoff,
+  readSupervisorProcess,
   resolveStateHome,
   runDir,
 } from "./loop/store.ts";
 import type { LoopContract } from "./loop/types.ts";
+import {
+  PACK_LOOP_STDERR_HEAD_BYTES,
+  PACK_LOOP_STDERR_TAIL_BYTES,
+  PIPELINE_PACK_LOOP_CANDIDATE_SHA_ENV,
+  isDurableLoopRunHandoff,
+  packLoopStartupObservationMs,
+  pathContainedIn,
+  probePackLoopLiveness,
+  type PackLoopLivenessStatus,
+} from "./loop/pack-loop-liveness.ts";
+import { parseExactGitSha } from "./ship-end-identity.ts";
+import {
+  defaultResolveCandidateEngineDeps,
+  resolveCandidateEngine,
+} from "./ship-end-candidate.ts";
 import {
   runRelease,
   type ReleaseOpts,
@@ -193,6 +215,7 @@ export interface FactoryReleaseInProgressResult {
   candidate_git_sha: string;
   loop_run_id: string;
   checkpoint: string;
+  liveness?: PackLoopLivenessStatus;
 }
 
 export interface FactoryReleaseAwaitingResult {
@@ -207,6 +230,8 @@ export interface FactoryReleaseAwaitingResult {
   candidate_git_sha: string;
   checkpoint: string;
   frg: FactoryReleaseFrgPayload;
+  /** Present when observation rejected the on-disk attestor result. */
+  observe_miss?: FactoryReleaseObserveMiss;
 }
 
 export interface FactoryReleaseCompleteResult {
@@ -244,6 +269,7 @@ export interface FactoryReleaseFailedResult {
   defect_class: string;
   message: string;
   checkpoint: string;
+  liveness?: PackLoopLivenessStatus;
 }
 
 export type FactoryReleaseResult =
@@ -291,6 +317,8 @@ export interface UnsignedFrgGenerationResult {
   in_progress?: boolean;
   /** Bound loop run id when started, resumed, or scored. */
   loop_run_id?: string;
+  /** Authoritative pack-loop liveness on in_progress and pre-handoff fail. */
+  liveness?: PackLoopLivenessStatus;
 }
 
 export interface ObservedAttestation {
@@ -327,7 +355,7 @@ export interface FactoryReleasePrepareDeps {
     request: FactoryReleasePrepareRequest,
     unsigned: FactoryReleaseFrgPayload,
     ctx: { repoDir: string; workDir: string },
-  ): Promise<ObservedAttestation | null>;
+  ): Promise<ObservedAttestation | AttestationObserveResult | null>;
   /**
    * Observe an already-opened or merged release/vX.Y.Z PR. When present,
    * prepare MUST NOT open a second PR (#1115).
@@ -629,6 +657,211 @@ export function factoryReleaseVersionIndexPath(repoDir: string, version: string)
   );
 }
 
+export type AttestationObserveReason =
+  | "missing_file"
+  | "unreadable"
+  | "unparsable"
+  | "hmac_invalid"
+  | "missing_factory_release_binding"
+  | "notes_only_binding"
+  | "binding_mismatch"
+  | "pack_provenance_invalid"
+  | "identity_mismatch"
+  | "not_release_eligible";
+
+export type AttestationObserveResult =
+  | { status: "accepted"; attestation: ObservedAttestation }
+  | { status: "absent"; reason: AttestationObserveReason }
+  | {
+      status: "rejected";
+      reason: AttestationObserveReason;
+      expected_frg_run_id: string;
+      observed_run_id: string | null;
+      detail?: string;
+    };
+
+export interface FactoryReleaseObserveMiss {
+  reason: AttestationObserveReason;
+  expected_frg_run_id: string;
+  observed_run_id: string | null;
+  detail?: string;
+}
+
+async function tryReadJsonFile(
+  readFile: (p: string) => Promise<string>,
+  filePath: string,
+): Promise<{ ok: true; value: unknown } | { ok: false; missing: boolean }> {
+  let text: string;
+  try {
+    text = await readFile(filePath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return { ok: false, missing: true };
+    }
+    return { ok: false, missing: false };
+  }
+  try {
+    return { ok: true, value: JSON.parse(text) as unknown };
+  } catch {
+    return { ok: false, missing: false };
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * Load the closed unsigned checkpoint for credentialed `--from-run`.
+ * Ship-path (version index, checkpoint, or request SHA in hand) fails closed
+ * when the unsigned payload is missing, malformed, or conflicts.
+ * Standalone unbound `--from-run` (none of those) omits the binding.
+ */
+export async function defaultResolveShipPathFromRun(args: {
+  version: string;
+  fromRun: string;
+  repoDir: string;
+  requestCandidateGitSha?: string;
+  readFile: (p: string) => Promise<string>;
+}): Promise<ShipPathFromRunResolution> {
+  const version = normalizeFrgVersion(args.version);
+  const requestSha = args.requestCandidateGitSha?.trim() ?? "";
+  const indexPath = factoryReleaseVersionIndexPath(args.repoDir, version);
+  const indexRead = await tryReadJsonFile(args.readFile, indexPath);
+
+  if (indexRead.missing && !requestSha) {
+    return { kind: "standalone" };
+  }
+  if (!indexRead.ok) {
+    return {
+      kind: "fail",
+      message:
+        `pipeline factory-gate: ship-path --from-run ${args.fromRun} has a malformed ` +
+        `factory-release version index for v${version}; refusing HMAC latest.json without factory_release_binding`,
+    };
+  }
+  if (indexRead.missing) {
+    return {
+      kind: "fail",
+      message:
+        `pipeline factory-gate: ship-path --from-run ${args.fromRun} has no unsigned checkpoint ` +
+        `for v${version}; refusing HMAC latest.json without factory_release_binding`,
+    };
+  }
+
+  const index = indexRead.value;
+  if (!isRecord(index)) {
+    return {
+      kind: "fail",
+      message:
+        `pipeline factory-gate: ship-path --from-run ${args.fromRun} version index is not an object`,
+    };
+  }
+  const fingerprint = typeof index.request_fingerprint === "string" ? index.request_fingerprint : "";
+  const indexFrg = typeof index.frg_run_id === "string" ? index.frg_run_id : "";
+  const indexLoop = typeof index.loop_run_id === "string" ? index.loop_run_id : "";
+  const indexPack = typeof index.pack_run_id === "string" ? index.pack_run_id : "";
+  const indexCandidate = typeof index.candidate_git_sha === "string" ? index.candidate_git_sha : "";
+  if (!fingerprint || !indexFrg || !indexLoop || !indexPack || !indexCandidate) {
+    return {
+      kind: "fail",
+      message:
+        `pipeline factory-gate: ship-path --from-run ${args.fromRun} version index is incomplete`,
+    };
+  }
+  if (indexLoop !== args.fromRun) {
+    return {
+      kind: "fail",
+      message:
+        `pipeline factory-gate: ship-path --from-run ${args.fromRun} does not match version-index loop_run_id ${indexLoop}`,
+    };
+  }
+  if (requestSha && requestSha.toLowerCase() !== indexCandidate.toLowerCase()) {
+    return {
+      kind: "fail",
+      message:
+        `pipeline factory-gate: ship-path --from-run request candidate SHA does not match version index`,
+    };
+  }
+
+  const checkpointPath = factoryReleaseCheckpointPath(args.repoDir, fingerprint);
+  const ckptRead = await tryReadJsonFile(args.readFile, checkpointPath);
+  if (!ckptRead.ok || ckptRead.missing) {
+    return {
+      kind: "fail",
+      message:
+        `pipeline factory-gate: ship-path --from-run ${args.fromRun} is missing a closed unsigned checkpoint ` +
+        `for v${version}; refusing HMAC latest.json without factory_release_binding`,
+    };
+  }
+  if (!isRecord(ckptRead.value)) {
+    return {
+      kind: "fail",
+      message: `pipeline factory-gate: ship-path --from-run unsigned checkpoint is not an object`,
+    };
+  }
+  const store = ckptRead.value;
+  const request = store.request;
+  const unsigned = store.unsigned;
+  if (!isRecord(request) || !isRecord(unsigned)) {
+    return {
+      kind: "fail",
+      message:
+        `pipeline factory-gate: ship-path --from-run unsigned checkpoint is missing request or unsigned payload`,
+    };
+  }
+  let parsedRequest: FactoryReleasePrepareRequest;
+  try {
+    parsedRequest = parseFactoryReleasePrepareRequest(request);
+  } catch (err) {
+    return {
+      kind: "fail",
+      message:
+        `pipeline factory-gate: ship-path --from-run unsigned checkpoint request is malformed: ${(err as Error).message}`,
+    };
+  }
+  const unsignedPayload = unsigned as unknown as FactoryReleaseFrgPayload;
+  if (
+    unsignedPayload.frg_run_id !== indexFrg ||
+    unsignedPayload.loop_run_id !== indexLoop ||
+    unsignedPayload.pack_run_id !== indexPack ||
+    parsedRequest.integrated_candidate.git_sha.toLowerCase() !== indexCandidate.toLowerCase() ||
+    factoryReleaseRequestFingerprint(parsedRequest) !== fingerprint
+  ) {
+    return {
+      kind: "fail",
+      message:
+        `pipeline factory-gate: ship-path --from-run unsigned checkpoint conflicts with the version index`,
+    };
+  }
+
+  const loopBindingPath = factoryReleaseLoopBindingPath(args.fromRun);
+  const loopRead = await tryReadJsonFile(args.readFile, loopBindingPath);
+  if (!loopRead.ok || loopRead.missing || !isRecord(loopRead.value)) {
+    return {
+      kind: "fail",
+      message:
+        `pipeline factory-gate: ship-path --from-run ${args.fromRun} is missing factory-release-binding.json`,
+    };
+  }
+  const loopCandidate =
+    typeof loopRead.value.candidate_git_sha === "string" ? loopRead.value.candidate_git_sha : "";
+  if (loopCandidate.toLowerCase() !== parsedRequest.integrated_candidate.git_sha.toLowerCase()) {
+    return {
+      kind: "fail",
+      message:
+        `pipeline factory-gate: ship-path --from-run loop binding candidate SHA does not match the unsigned request`,
+    };
+  }
+
+  const binding = buildFactoryReleaseUnsignedDigestBinding(parsedRequest, unsignedPayload);
+  return {
+    kind: "bound",
+    binding,
+    unsigned_frg_run_id: unsignedPayload.frg_run_id,
+  };
+}
+
 function defaultRealpathSync(absolutePath: string): string {
   return fsRealpathSync(absolutePath);
 }
@@ -748,6 +981,7 @@ export function honestLatestJsonBindsRequest(
     run_id?: string;
     integrity?: { attestation?: unknown } | null;
     pack_provenance?: { candidate_git_sha?: string } | null;
+    factory_release_binding?: { candidate_git_sha?: string } | null;
   },
 ): boolean {
   if (evidence.version !== request.target_version) return false;
@@ -758,8 +992,42 @@ export function honestLatestJsonBindsRequest(
   }
   if (typeof evidence.run_id !== "string" || evidence.run_id.trim() === "") return false;
   if (!evidence.integrity?.attestation) return false;
-  const cand = evidence.pack_provenance?.candidate_git_sha?.toLowerCase() ?? "";
-  return cand === request.integrated_candidate.git_sha.toLowerCase();
+  const expected = request.integrated_candidate.git_sha.toLowerCase();
+  const bindingSha = evidence.factory_release_binding?.candidate_git_sha?.toLowerCase() ?? "";
+  const provenanceSha = evidence.pack_provenance?.candidate_git_sha?.toLowerCase() ?? "";
+  // A present binding or provenance candidate must each equal the request
+  // candidate. Do not prefer binding C over scored provenance D.
+  if (bindingSha && bindingSha !== expected) return false;
+  if (provenanceSha && provenanceSha !== expected) return false;
+  const cand = bindingSha || provenanceSha;
+  return cand === expected;
+}
+
+function notesCarryFactoryReleaseBinding(notes: readonly string[] | undefined): boolean {
+  for (const note of notes ?? []) {
+    if (typeof note === "string" && note.startsWith("factory_release_binding:")) return true;
+  }
+  return false;
+}
+
+function topLevelFactoryReleaseBinding(raw: Record<string, unknown>, evidence: FrgEvidence): unknown {
+  if (Object.prototype.hasOwnProperty.call(raw, "factory_release_binding")) {
+    return raw.factory_release_binding;
+  }
+  if (Object.prototype.hasOwnProperty.call(evidence, "factory_release_binding")) {
+    return (evidence as FrgEvidence & { factory_release_binding?: unknown }).factory_release_binding;
+  }
+  return undefined;
+}
+
+export function normalizeObserveAttestation(
+  raw: ObservedAttestation | AttestationObserveResult | null,
+): AttestationObserveResult {
+  if (raw == null) return { status: "absent", reason: "missing_file" };
+  if ("status" in raw && (raw.status === "accepted" || raw.status === "absent" || raw.status === "rejected")) {
+    return raw;
+  }
+  return { status: "accepted", attestation: raw };
 }
 
 /** Pick an already-open/merged PR whose head is the request candidate. */
@@ -888,7 +1156,45 @@ export type CreateOrReusePackIssues = (
   input: CreateOrReusePackIssuesInput,
 ) => Promise<{ issue_numbers: number[] }>;
 
-export type FactoryReleaseLoopDispatchState = "bound" | "dispatched";
+export type FactoryReleaseLoopDispatchState = "bound" | "starting" | "dispatched" | "failed";
+
+/** Frozen candidate-engine spawn object. Never re-derived from PATH or PIPELINE_BIN. */
+export interface CandidateInvocation {
+  readonly executable: string;
+  readonly argv: readonly string[];
+  readonly candidateSha: string;
+}
+
+export interface FactoryReleaseSpawnAttempt {
+  error_code?: string;
+  pid?: number;
+  at: string;
+}
+
+export interface FactoryReleaseFailedProcessIdentity {
+  pid: number;
+  boot_id: string;
+  started_at: string;
+}
+
+export interface FactoryReleaseLoopBindingFields {
+  observation_deadline?: string;
+  spawn_attempt?: FactoryReleaseSpawnAttempt;
+  candidate_invocation?: { executable: string; argv: readonly string[]; candidateSha: string };
+  stderr_evidence_path?: string;
+  resume_count?: number;
+  failed_process_identity?: FactoryReleaseFailedProcessIdentity;
+  last_error?: string;
+}
+
+export interface PackLoopSpawnResult {
+  dispatch_state: FactoryReleaseLoopDispatchState;
+  pid?: number;
+  observation_deadline?: string;
+  stderr_evidence_path?: string;
+  last_error?: string;
+  spawn_attempt?: FactoryReleaseSpawnAttempt;
+}
 
 export interface DispatchPackLoopInput {
   repoDir: string;
@@ -900,6 +1206,8 @@ export interface DispatchPackLoopInput {
   label: string;
   /** When set, production dispatch persists the request binding before spawn. */
   persistCtx?: DurableReconcilePackLoopCtx;
+  /** Typed candidate spawn. Missing or SHA-mismatched fails closed. */
+  candidateInvocation?: CandidateInvocation;
 }
 
 export type DispatchPackLoop = (
@@ -953,7 +1261,17 @@ export interface DurableGenerateOptions {
   resumeBoundPackLoop?: (args: {
     repoDir: string;
     loop_run_id: string;
-  }) => Promise<void>;
+    candidateInvocation?: CandidateInvocation;
+  }) => Promise<void | PackLoopSpawnResult>;
+  /**
+   * Spawn seams for the default resume dispatcher. Tests inject fake Spawn /
+   * ChildProcess here; production omits and uses real `spawn`.
+   */
+  spawnDeps?: SpawnCandidateLoopDeps;
+  /** Typed candidate invocation for pack-loop spawn. Tests inject; production resolves. */
+  candidateInvocation?: CandidateInvocation;
+  resolveCandidateEngine?: typeof resolveCandidateEngine;
+  probePackLoopLiveness?: typeof probePackLoopLiveness;
   /**
    * Terminal score through factory-gate --from-run (no --observations).
    * Tests inject this seam.
@@ -995,38 +1313,84 @@ export function factoryReleaseLoopBindingPath(loopRunId: string): string {
   return path.join(runDir(defaultLoopStoreDeps(), loopRunId), "factory-release-binding.json");
 }
 
-/** True when the binding was persisted but spawn never confirmed. */
+/** True when the binding was persisted but the OS never started the child. */
 export function isPendingLoopDispatch(binding: Record<string, unknown>): boolean {
   return binding.dispatch_state === "bound";
 }
 
+export function parseDispatchState(raw: unknown): FactoryReleaseLoopDispatchState | null {
+  if (raw === "bound" || raw === "starting" || raw === "dispatched" || raw === "failed") return raw;
+  return null;
+}
+
+function isPackLoopSpawnResult(value: unknown): value is PackLoopSpawnResult {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  return parseDispatchState((value as { dispatch_state?: unknown }).dispatch_state) !== null;
+}
+
+function requirePackLoopSpawnResult(
+  value: unknown,
+  loopRunId: string,
+  action: "spawn" | "resume",
+): PackLoopSpawnResult {
+  if (!isPackLoopSpawnResult(value)) {
+    throw new Error(
+      `pack-loop ${action} returned no durable handoff acknowledgement for ${loopRunId}`,
+    );
+  }
+  return value;
+}
+
 /**
  * Persist pack-instance `loop_run_id` and the matching loop binding.
- * Callers write `bound` before spawn and `dispatched` after spawn confirms.
+ * Callers write `bound` before spawn, `starting` after OS accept, and
+ * `dispatched` only after a valid durable handoff.
  */
 export async function persistFactoryReleaseLoopBinding(
   ctx: DurableReconcilePackLoopCtx,
   loopRunId: string,
   dispatchState: FactoryReleaseLoopDispatchState,
+  extras: FactoryReleaseLoopBindingFields = {},
 ): Promise<void> {
   const loopBindingPath = factoryReleaseLoopBindingPath(loopRunId);
-  await ctx.writeFile(
-    loopBindingPath,
-    canonicalJson({
-      schema_version: 1,
-      kind: "factory_release_loop_binding",
-      request_fingerprint: ctx.requestFingerprint,
-      target_version: ctx.request.target_version,
-      candidate_git_sha: ctx.request.integrated_candidate.git_sha,
-      pack_id: ctx.request.frg_manifest.pack_id,
-      manifest_sha256: ctx.request.frg_manifest.sha256,
-      pack_run_id: ctx.packRunId,
-      frg_run_id: ctx.frgRunId,
-      loop_run_id: loopRunId,
-      dispatch_state: dispatchState,
-    }),
-    0o600,
-  );
+  let prior: Record<string, unknown> = {};
+  if (await ctx.fileExists(loopBindingPath)) {
+    try {
+      prior = JSON.parse(await ctx.readFile(loopBindingPath)) as Record<string, unknown>;
+    } catch {
+      prior = {};
+    }
+  }
+  const merged: Record<string, unknown> = {
+    schema_version: 1,
+    kind: "factory_release_loop_binding",
+    request_fingerprint: ctx.requestFingerprint,
+    target_version: ctx.request.target_version,
+    candidate_git_sha: ctx.request.integrated_candidate.git_sha,
+    pack_id: ctx.request.frg_manifest.pack_id,
+    manifest_sha256: ctx.request.frg_manifest.sha256,
+    pack_run_id: ctx.packRunId,
+    frg_run_id: ctx.frgRunId,
+    loop_run_id: loopRunId,
+    dispatch_state: dispatchState,
+  };
+  const keep = [
+    "observation_deadline",
+    "spawn_attempt",
+    "candidate_invocation",
+    "stderr_evidence_path",
+    "resume_count",
+    "failed_process_identity",
+    "last_error",
+  ] as const;
+  for (const key of keep) {
+    if (prior[key] !== undefined) merged[key] = prior[key];
+  }
+  for (const [key, value] of Object.entries(extras)) {
+    if (value !== undefined) merged[key] = value;
+  }
+  if (dispatchState !== "starting") delete merged.observation_deadline;
+  await ctx.writeFile(loopBindingPath, canonicalJson(merged), 0o600);
   const instancePath = factoryReleasePackInstancePath(ctx.workDir);
   let createdAt = isoNow(ctx.now());
   if (await ctx.fileExists(instancePath)) {
@@ -1057,6 +1421,28 @@ export async function persistFactoryReleaseLoopBinding(
     } satisfies FactoryReleasePackInstance),
     0o600,
   );
+}
+
+/** Persist `starting` after OS accept, before the parent awaits handoff. */
+async function persistPackLoopOsAccepted(
+  ctx: DurableReconcilePackLoopCtx | undefined,
+  loopRunId: string,
+  info: { pid?: number; observation_deadline: string },
+  invocation?: CandidateInvocation,
+): Promise<void> {
+  if (!ctx) return;
+  const extras: FactoryReleaseLoopBindingFields = {
+    observation_deadline: info.observation_deadline,
+    spawn_attempt: { pid: info.pid, at: isoNow(ctx.now()) },
+  };
+  if (invocation) {
+    extras.candidate_invocation = {
+      executable: invocation.executable,
+      argv: [...invocation.argv],
+      candidateSha: invocation.candidateSha,
+    };
+  }
+  await persistFactoryReleaseLoopBinding(ctx, loopRunId, "starting", extras);
 }
 
 async function boundLoopNeedsDispatchRetry(
@@ -1134,12 +1520,12 @@ function nonTerminalBoundStub(loopRunId: string): DurablePackLoopArtifacts {
 
 /**
  * Production start: render factory-gate-v1 templates, create or reuse pack
- * issues to the manifest minimum, dispatch `pipeline loop --engine-track
- * candidate` via the injected dispatch seam.
+ * issues to the manifest minimum, dispatch the candidate-engine pack loop
+ * (`--engine-track candidate` is intent metadata, not the binary selector).
  */
 export async function defaultStartBoundPackLoop(
   ctx: DurableReconcilePackLoopCtx,
-  opts: Pick<DurableGenerateOptions, "createOrReusePackIssues" | "dispatchPackLoop"> = {},
+  opts: Pick<DurableGenerateOptions, "createOrReusePackIssues" | "dispatchPackLoop" | "candidateInvocation"> = {},
 ): Promise<{ loop_run_id: string } | null> {
   const create = opts.createOrReusePackIssues;
   const dispatch = opts.dispatchPackLoop;
@@ -1184,6 +1570,7 @@ export async function defaultStartBoundPackLoop(
     engineTrack: "candidate",
     label,
     persistCtx: ctx,
+    candidateInvocation: opts.candidateInvocation,
   });
 }
 
@@ -1288,7 +1675,8 @@ export type SpawnCandidateLoop = (args: {
   issue_numbers: number[];
   engineTrack: "candidate";
   label: string;
-}) => Promise<void>;
+  candidateInvocation?: CandidateInvocation;
+}) => Promise<void | PackLoopSpawnResult>;
 
 /**
  * Wait for detached `spawn` or `error` before treating launch as confirmed.
@@ -1326,20 +1714,33 @@ export const CANDIDATE_LOOP_DENIED_FRG_ENV = [
   "PIPELINE_FRG_ATTESTATION_KEY_FILE",
 ] as const;
 
+export type CandidateLoopChild = {
+  once(event: "error", listener: (err: Error) => void): unknown;
+  once(event: "spawn", listener: () => void): unknown;
+  once?(event: "exit", listener: (code: number | null, signal: NodeJS.Signals | null) => void): unknown;
+  stdout?: {
+    on(event: "data", listener: (chunk: Buffer | string) => void): unknown;
+    destroy?: () => void;
+  } | null;
+  stderr?: {
+    on(event: "data", listener: (chunk: Buffer | string) => void): unknown;
+    destroy?: () => void;
+  } | null;
+  kill?: (signal?: NodeJS.Signals | number) => boolean | void;
+  unref?: () => void;
+  pid?: number;
+};
+
 export type CandidateLoopSpawn = (
   command: string,
   args: readonly string[],
   options: {
     cwd?: string;
     detached?: boolean;
-    stdio?: "ignore";
+    stdio?: "ignore" | Array<"ignore" | "pipe">;
     env?: NodeJS.ProcessEnv;
   },
-) => {
-  once(event: "error", listener: (err: Error) => void): unknown;
-  once(event: "spawn", listener: () => void): unknown;
-  unref?: () => void;
-};
+) => CandidateLoopChild;
 
 /** Copy `source` and drop every supported FRG signing credential / path var. */
 export function sanitizeCandidateLoopEnv(
@@ -1352,60 +1753,568 @@ export function sanitizeCandidateLoopEnv(
   return env;
 }
 
-export async function defaultSpawnCandidateLoop(
-  args: {
-    repoDir: string;
-    loop_run_id: string;
-  },
-  deps: {
-    spawn?: CandidateLoopSpawn;
-    env?: NodeJS.ProcessEnv;
-  } = {},
-): Promise<void> {
-  const spawnImpl = deps.spawn ?? (await import("node:child_process")).spawn;
-  const sourceEnv = deps.env ?? process.env;
-  const bin = sourceEnv.PIPELINE_BIN?.trim() || "pipeline";
-  // Codex has no native /goal floor (loop-preflight). The in-repo supervisor
-  // still runs that probe, so a profile-less spawn exits 1 after "dispatched".
-  // Claude is the only LoopEngine with a documented floor.
-  const child = spawnImpl(
-    bin,
-    [
+export function freezeCandidateInvocation(input: {
+  executable: string;
+  loopRunId: string;
+  candidateSha: string;
+}): CandidateInvocation {
+  const sha = parseExactGitSha(input.candidateSha);
+  if (!sha) {
+    throw new Error("pack-loop candidate SHA is not an exact 40-hex git OID");
+  }
+  if (!path.isAbsolute(input.executable)) {
+    throw new Error("pack-loop candidate executable must be an absolute launcher path");
+  }
+  return Object.freeze({
+    executable: input.executable,
+    argv: Object.freeze([
       "loop",
       "--resume",
-      args.loop_run_id,
+      input.loopRunId,
       "--engine-track",
       "candidate",
       "--profile",
       "claude",
-    ],
-    {
+    ]),
+    candidateSha: sha,
+  });
+}
+
+export function assertCandidateInvocation(
+  invocation: CandidateInvocation | null | undefined,
+  requestSha: string,
+  fileExists: (p: string) => boolean,
+): CandidateInvocation {
+  if (!invocation) {
+    throw new Error("pack-loop dispatch missing typed candidate invocation");
+  }
+  const want = parseExactGitSha(requestSha);
+  if (!want || invocation.candidateSha !== want) {
+    throw new Error("pack-loop candidate invocation SHA does not match the request candidate SHA");
+  }
+  if (!path.isAbsolute(invocation.executable)) {
+    throw new Error("pack-loop candidate executable must be an absolute launcher path");
+  }
+  if (!fileExists(invocation.executable)) {
+    throw new Error(`pack-loop candidate launcher does not exist: ${invocation.executable}`);
+  }
+  return invocation;
+}
+
+export function formatPackLoopLastError(input: {
+  exitCode?: number | null;
+  errorCode?: string;
+  excerpt: string;
+  evidencePath?: string | null;
+  writeError?: string;
+}): string {
+  const excerpt = input.excerpt.trim() || "(no stderr)";
+  if (typeof input.exitCode === "number") {
+    const code = input.errorCode ? ` (${input.errorCode})` : "";
+    const evidence = input.writeError
+      ? ` (evidence write failed: ${input.writeError})`
+      : input.evidencePath
+        ? ` (evidence: ${input.evidencePath})`
+        : " (evidence: none)";
+    return `pack-loop child exit ${input.exitCode}${code}: ${excerpt}${evidence}`;
+  }
+  const code = input.errorCode ?? "spawn_error";
+  const evidence = input.writeError
+    ? ` (evidence write failed: ${input.writeError})`
+    : input.evidencePath
+      ? ` (evidence: ${input.evidencePath})`
+      : " (evidence: none)";
+  return `pack-loop spawn error ${code}: ${excerpt}${evidence}`;
+}
+
+class BoundedStreamBuffer {
+  private head = Buffer.alloc(0);
+  private tail: Buffer[] = [];
+  private tailBytes = 0;
+  private overflow = false;
+
+  push(chunk: Buffer | string): void {
+    const buf = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+    let rest = buf;
+    if (this.head.length < PACK_LOOP_STDERR_HEAD_BYTES) {
+      const take = Math.min(PACK_LOOP_STDERR_HEAD_BYTES - this.head.length, rest.length);
+      this.head = Buffer.concat([this.head, rest.subarray(0, take)]);
+      rest = rest.subarray(take);
+    }
+    if (rest.length === 0) return;
+    this.overflow = true;
+    this.tail.push(rest);
+    this.tailBytes += rest.length;
+    while (this.tailBytes > PACK_LOOP_STDERR_TAIL_BYTES && this.tail.length > 1) {
+      const drop = this.tail.shift()!;
+      this.tailBytes -= drop.length;
+    }
+    if (this.tailBytes > PACK_LOOP_STDERR_TAIL_BYTES) {
+      const last = this.tail[this.tail.length - 1]!;
+      this.tail = [last.subarray(Math.max(0, last.length - PACK_LOOP_STDERR_TAIL_BYTES))];
+      this.tailBytes = this.tail[0]!.length;
+    }
+  }
+
+  text(): string {
+    if (!this.overflow) return this.head.toString("utf8");
+    return `${this.head.toString("utf8")}\n...[truncated]...\n${Buffer.concat(this.tail).toString("utf8")}`;
+  }
+}
+
+function drainChildPipes(child: CandidateLoopChild): { stdout: BoundedStreamBuffer; stderr: BoundedStreamBuffer } {
+  const stdout = new BoundedStreamBuffer();
+  const stderr = new BoundedStreamBuffer();
+  child.stdout?.on("data", (chunk) => stdout.push(chunk));
+  child.stderr?.on("data", (chunk) => stderr.push(chunk));
+  return { stdout, stderr };
+}
+
+const PACK_LOOP_FAILED_CHILD_SETTLE_MS = 1_000;
+
+/** Stop a still-running child whose dispatch already failed closed. */
+async function stopFailedPackLoopChild(
+  child: CandidateLoopChild,
+  alreadyExited: boolean,
+  sleep: (ms: number) => Promise<void>,
+): Promise<void> {
+  if (!alreadyExited) {
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+      child.once?.("exit", () => finish());
+      child.kill?.("SIGTERM");
+      void sleep(PACK_LOOP_FAILED_CHILD_SETTLE_MS).then(finish);
+    });
+  }
+  child.stdout?.destroy?.();
+  child.stderr?.destroy?.();
+  child.unref?.();
+}
+
+function redactPackLoopExcerpt(raw: string): string {
+  return sanitize(redactSecrets(raw));
+}
+
+export async function persistPackLoopStderrEvidence(
+  writeFile: (p: string, body: string, mode?: number) => Promise<void>,
+  evidencePath: string,
+  raw: string,
+): Promise<{ path: string } | { writeError: string }> {
+  const body = redactPackLoopExcerpt(raw);
+  try {
+    await writeFile(evidencePath, body, 0o600);
+    return { path: evidencePath };
+  } catch (err) {
+    return { writeError: (err as Error).message };
+  }
+}
+
+export function validateDurablePackLoopHandoff(input: {
+  handoff: unknown;
+  loopRunId: string;
+  candidateSha: string;
+  storeRunDir: string;
+  supervisor: { pid?: unknown; boot_id?: unknown; started_at?: unknown } | null;
+  realpath?: (p: string) => string;
+}): { ok: true } | { ok: false; error: string } {
+  if (!isDurableLoopRunHandoff(input.handoff)) {
+    return { ok: false, error: "pack-loop handoff missing or malformed" };
+  }
+  if (input.handoff.run_id !== input.loopRunId) {
+    return { ok: false, error: "pack-loop handoff run_id mismatch" };
+  }
+  if (input.handoff.candidate_sha !== input.candidateSha) {
+    return { ok: false, error: "pack-loop handoff candidate_sha mismatch" };
+  }
+  const realpath = input.realpath ?? path.resolve;
+  if (!pathContainedIn(input.handoff.run_dir, input.storeRunDir, realpath)) {
+    return { ok: false, error: "pack-loop handoff run_dir is not contained in the store run directory" };
+  }
+  if (!pathContainedIn(input.handoff.events, input.handoff.run_dir, realpath)) {
+    return { ok: false, error: "pack-loop handoff events path is not contained in run_dir" };
+  }
+  const sup = input.supervisor;
+  if (
+    !sup ||
+    sup.pid !== input.handoff.supervisor.pid ||
+    sup.boot_id !== input.handoff.supervisor.boot_id ||
+    sup.started_at !== input.handoff.supervisor.started_at
+  ) {
+    return { ok: false, error: "pack-loop handoff supervisor identity mismatch" };
+  }
+  return { ok: true };
+}
+
+export interface SpawnCandidateLoopDeps {
+  spawn?: CandidateLoopSpawn;
+  env?: NodeJS.ProcessEnv;
+  fileExists?: (p: string) => boolean;
+  now?: () => Date;
+  sleep?: (ms: number) => Promise<void>;
+  readHandoff?: (loopRunId: string) => Promise<unknown | null>;
+  readSupervisor?: (loopRunId: string) => Promise<{ pid?: unknown; boot_id?: unknown; started_at?: unknown } | null>;
+  realpath?: (p: string) => string;
+  writeFile?: (p: string, body: string, mode?: number) => Promise<void>;
+  evidencePath?: string;
+  observationMs?: number;
+  onAccepted?: (info: { pid?: number; observation_deadline: string }) => Promise<void>;
+  storeRunDir?: string;
+}
+
+function defaultFileExistsSync(p: string): boolean {
+  try {
+    return existsSync(p);
+  } catch {
+    return false;
+  }
+}
+
+export async function defaultSpawnCandidateLoop(
+  args: {
+    repoDir: string;
+    loop_run_id: string;
+    candidateInvocation?: CandidateInvocation;
+    requestCandidateSha?: string;
+  },
+  deps: SpawnCandidateLoopDeps = {},
+): Promise<PackLoopSpawnResult> {
+  const sourceEnv = deps.env ?? process.env;
+  const now = deps.now ?? (() => new Date());
+  const fileExists = deps.fileExists ?? defaultFileExistsSync;
+  const requestSha = args.requestCandidateSha ?? args.candidateInvocation?.candidateSha ?? "";
+  const invocation = assertCandidateInvocation(args.candidateInvocation, requestSha, fileExists);
+  const spawnImpl = deps.spawn ?? ((await import("node:child_process")).spawn as unknown as CandidateLoopSpawn);
+  const childEnv = sanitizeCandidateLoopEnv(sourceEnv);
+  childEnv[PIPELINE_PACK_LOOP_CANDIDATE_SHA_ENV] = invocation.candidateSha;
+  let child: CandidateLoopChild;
+  try {
+    child = spawnImpl(invocation.executable, invocation.argv, {
       cwd: args.repoDir,
       detached: true,
-      stdio: "ignore",
-      env: sanitizeCandidateLoopEnv(sourceEnv),
-    },
-  );
-  await observeDetachedChildStart(child);
+      stdio: ["ignore", "pipe", "pipe"],
+      env: childEnv,
+    });
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code ?? "spawn_throw";
+    return {
+      dispatch_state: "bound",
+      last_error: formatPackLoopLastError({
+        errorCode: String(code),
+        excerpt: (err as Error).message,
+      }),
+      spawn_attempt: { error_code: String(code), at: isoNow(now()) },
+    };
+  }
+  const pipes = drainChildPipes(child);
+  let exitCode: number | null | undefined;
+  child.once?.("exit", (code) => {
+    exitCode = code;
+  });
+  const started = observeDetachedChildStart({
+    once: (event, listener) => child.once(event as "error", listener as (err: Error) => void),
+    unref: undefined,
+  });
+  try {
+    await started;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code ?? "spawn_error";
+    return {
+      dispatch_state: "bound",
+      last_error: formatPackLoopLastError({
+        errorCode: String(code),
+        excerpt: redactPackLoopExcerpt(`${(err as Error).message}\n${pipes.stderr.text()}`),
+      }),
+      spawn_attempt: { error_code: String(code), at: isoNow(now()) },
+    };
+  }
+  const deadlineMs = packLoopStartupObservationMs(deps.observationMs);
+  const deadline = new Date(now().getTime() + deadlineMs).toISOString();
+  if (deps.onAccepted) {
+    await deps.onAccepted({ pid: child.pid, observation_deadline: deadline });
+  }
+  const sleep = deps.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const store = defaultLoopStoreDeps(sourceEnv);
+  const storeRunDir = deps.storeRunDir ?? runDir(store, args.loop_run_id);
+  const evidencePath =
+    deps.evidencePath ?? path.join(storeRunDir, "pack-loop-stderr.txt");
+  const readHandoff =
+    deps.readHandoff ??
+    (async (id: string) => readLoopRunHandoff(store, id));
+  const readSupervisor =
+    deps.readSupervisor ??
+    (async (id: string) => readSupervisorProcess(store, id));
+  const startedAt = now().getTime();
+  while (now().getTime() - startedAt < deadlineMs) {
+    if (exitCode !== undefined) break;
+    let handoff: unknown = null;
+    try {
+      handoff = await readHandoff(args.loop_run_id);
+    } catch {
+      handoff = null;
+    }
+    if (handoff) {
+      let supervisor: { pid?: unknown; boot_id?: unknown; started_at?: unknown } | null = null;
+      try {
+        supervisor = await readSupervisor(args.loop_run_id);
+      } catch {
+        supervisor = null;
+      }
+      const valid = validateDurablePackLoopHandoff({
+        handoff,
+        loopRunId: args.loop_run_id,
+        candidateSha: invocation.candidateSha,
+        storeRunDir,
+        supervisor,
+        realpath: deps.realpath,
+      });
+      if (valid.ok) {
+        child.unref?.();
+        return {
+          dispatch_state: "dispatched",
+          pid: child.pid,
+          observation_deadline: deadline,
+          spawn_attempt: { pid: child.pid, at: isoNow(now()) },
+        };
+      }
+      await stopFailedPackLoopChild(child, exitCode !== undefined, sleep);
+      const excerpt = await finishStderrEvidence(deps, evidencePath, pipes);
+      return {
+        dispatch_state: "failed",
+        pid: child.pid,
+        observation_deadline: deadline,
+        last_error: formatPackLoopLastError({
+          errorCode: "handoff_mismatch",
+          excerpt: excerpt.excerpt,
+          evidencePath: excerpt.path,
+          writeError: excerpt.writeError,
+        }),
+        stderr_evidence_path: excerpt.path,
+        spawn_attempt: { pid: child.pid, error_code: "handoff_mismatch", at: isoNow(now()) },
+      };
+    }
+    await sleep(50);
+  }
+  const excerpt = await finishStderrEvidence(deps, evidencePath, pipes);
+  child.unref?.();
+  if (exitCode !== undefined) {
+    return {
+      dispatch_state: "failed",
+      pid: child.pid,
+      last_error: formatPackLoopLastError({
+        exitCode: exitCode ?? 0,
+        excerpt: excerpt.excerpt,
+        evidencePath: excerpt.path,
+        writeError: excerpt.writeError,
+      }),
+      stderr_evidence_path: excerpt.path,
+      spawn_attempt: { pid: child.pid, error_code: "pre_handoff_exit", at: isoNow(now()) },
+    };
+  }
+  return {
+    dispatch_state: "failed",
+    pid: child.pid,
+    last_error: formatPackLoopLastError({
+      errorCode: "observation_expired",
+      excerpt: excerpt.excerpt,
+      evidencePath: excerpt.path,
+      writeError: excerpt.writeError,
+    }),
+    stderr_evidence_path: excerpt.path,
+    observation_deadline: deadline,
+    spawn_attempt: { pid: child.pid, error_code: "observation_expired", at: isoNow(now()) },
+  };
+}
+
+async function finishStderrEvidence(
+  deps: SpawnCandidateLoopDeps,
+  evidencePath: string,
+  pipes: { stdout: BoundedStreamBuffer; stderr: BoundedStreamBuffer },
+): Promise<{ excerpt: string; path?: string; writeError?: string }> {
+  const raw = pipes.stderr.text() || pipes.stdout.text();
+  const excerpt = redactPackLoopExcerpt(raw);
+  if (!deps.writeFile) return { excerpt };
+  const written = await persistPackLoopStderrEvidence(deps.writeFile, evidencePath, raw);
+  if ("writeError" in written) return { excerpt, writeError: written.writeError };
+  return { excerpt, path: written.path };
 }
 
 export async function defaultResumeBoundPackLoop(
   args: {
     repoDir: string;
     loop_run_id: string;
+    candidateInvocation?: CandidateInvocation;
+    requestCandidateSha?: string;
   },
-  deps: {
-    spawn?: CandidateLoopSpawn;
-    env?: NodeJS.ProcessEnv;
-  } = {},
+  deps: SpawnCandidateLoopDeps = {},
+): Promise<PackLoopSpawnResult> {
+  return defaultSpawnCandidateLoop(args, deps);
+}
+
+async function persistSpawnResult(
+  ctx: DurableReconcilePackLoopCtx | undefined,
+  loopRunId: string,
+  result: PackLoopSpawnResult,
+  invocation?: CandidateInvocation,
 ): Promise<void> {
-  await defaultSpawnCandidateLoop(args, deps);
+  if (!ctx) return;
+  const extras: FactoryReleaseLoopBindingFields = {
+    spawn_attempt: result.spawn_attempt,
+    stderr_evidence_path: result.stderr_evidence_path,
+    last_error: result.last_error,
+    observation_deadline: result.observation_deadline,
+  };
+  if (invocation) {
+    extras.candidate_invocation = {
+      executable: invocation.executable,
+      argv: [...invocation.argv],
+      candidateSha: invocation.candidateSha,
+    };
+  }
+  await persistFactoryReleaseLoopBinding(ctx, loopRunId, result.dispatch_state, extras);
+}
+
+function restoreInvocation(
+  binding: Record<string, unknown> | null,
+  loopRunId: string,
+  _request: FactoryReleasePrepareRequest,
+): CandidateInvocation | undefined {
+  const snap = binding?.candidate_invocation;
+  if (!snap || typeof snap !== "object" || Array.isArray(snap)) return undefined;
+  const o = snap as { executable?: unknown; argv?: unknown; candidateSha?: unknown };
+  if (typeof o.executable !== "string" || typeof o.candidateSha !== "string") return undefined;
+  if (!Array.isArray(o.argv) || !o.argv.every((a) => typeof a === "string")) {
+    return freezeCandidateInvocation({
+      executable: o.executable,
+      loopRunId,
+      candidateSha: o.candidateSha,
+    });
+  }
+  return Object.freeze({
+    executable: o.executable,
+    argv: Object.freeze([...o.argv] as string[]),
+    candidateSha: o.candidateSha,
+  });
+}
+
+function failedIdentityFromBinding(
+  binding: Record<string, unknown> | null,
+): FactoryReleaseFailedProcessIdentity | undefined {
+  const snap = binding?.failed_process_identity;
+  if (snap && typeof snap === "object" && !Array.isArray(snap)) {
+    const o = snap as { pid?: unknown; boot_id?: unknown; started_at?: unknown };
+    if (typeof o.pid === "number" && typeof o.boot_id === "string" && typeof o.started_at === "string") {
+      return { pid: o.pid, boot_id: o.boot_id, started_at: o.started_at };
+    }
+  }
+  return undefined;
+}
+
+async function probePrepareLiveness(
+  loopRunId: string,
+  opts: DurableGenerateOptions,
+  request: FactoryReleasePrepareRequest,
+  binding: Record<string, unknown> | null,
+): Promise<PackLoopLivenessStatus> {
+  const probe = opts.probePackLoopLiveness ?? probePackLoopLiveness;
+  const store = defaultLoopStoreDeps();
+  const deadline = typeof binding?.observation_deadline === "string" ? binding.observation_deadline : null;
+  const stderr = typeof binding?.stderr_evidence_path === "string" ? binding.stderr_evidence_path : null;
+  return probe(loopRunId, {
+    store,
+    now: opts.now,
+    observationDeadline: deadline,
+    candidateSha: request.integrated_candidate.git_sha,
+    stderrEvidencePath: stderr,
+  });
+}
+
+async function readStartingHandoffArtifact(
+  loopRunId: string,
+  ctx: DurableReconcilePackLoopCtx,
+  opts: DurableGenerateOptions,
+  storeRunDir: string,
+): Promise<{ handoff: unknown | null; supervisor: { pid?: unknown; boot_id?: unknown; started_at?: unknown } | null }> {
+  let handoff: unknown | null = null;
+  if (opts.spawnDeps?.readHandoff) {
+    handoff = await opts.spawnDeps.readHandoff(loopRunId);
+  } else {
+    const p = loopRunHandoffPath(storeRunDir);
+    if (await ctx.fileExists(p)) {
+      handoff = JSON.parse(await ctx.readFile(p));
+    }
+  }
+  let supervisor: { pid?: unknown; boot_id?: unknown; started_at?: unknown } | null = null;
+  if (opts.spawnDeps?.readSupervisor) {
+    supervisor = await opts.spawnDeps.readSupervisor(loopRunId);
+  } else {
+    const p = path.join(storeRunDir, "supervisor.json");
+    if (await ctx.fileExists(p)) {
+      supervisor = JSON.parse(await ctx.readFile(p)) as {
+        pid?: unknown;
+        boot_id?: unknown;
+        started_at?: unknown;
+      };
+    }
+  }
+  return { handoff, supervisor };
 }
 
 /**
- * Production dispatch: allocate/init the work-list run, persist the request
- * binding, then spawn a detached `pipeline loop --resume <id> --engine-track
- * candidate`. Spawn is startup-observable (error rejects; spawn confirms).
+ * Later prepare ticks must adopt a valid durable handoff written after OS
+ * accept, even when the original parent has already detached. Malformed
+ * evidence fails closed. Missing evidence stays `starting` until the deadline.
+ */
+async function reconcileStartingDurableHandoff(input: {
+  ctx: DurableReconcilePackLoopCtx;
+  loopRunId: string;
+  request: FactoryReleasePrepareRequest;
+  binding: Record<string, unknown> | null;
+  opts: DurableGenerateOptions;
+}): Promise<{ kind: "adopted" } | { kind: "absent" } | { kind: "failed"; error: string }> {
+  const invocation = restoreInvocation(input.binding, input.loopRunId, input.request);
+  const candidateSha = invocation?.candidateSha ?? input.request.integrated_candidate.git_sha;
+  const storeRunDir = input.opts.spawnDeps?.storeRunDir ?? runDir(defaultLoopStoreDeps(), input.loopRunId);
+  let evidence: { handoff: unknown | null; supervisor: { pid?: unknown; boot_id?: unknown; started_at?: unknown } | null };
+  try {
+    evidence = await readStartingHandoffArtifact(input.loopRunId, input.ctx, input.opts, storeRunDir);
+  } catch (err) {
+    return {
+      kind: "failed",
+      error: `pack-loop handoff unreadable: ${(err as Error).message}`,
+    };
+  }
+  if (!evidence.handoff) return { kind: "absent" };
+  const valid = validateDurablePackLoopHandoff({
+    handoff: evidence.handoff,
+    loopRunId: input.loopRunId,
+    candidateSha,
+    storeRunDir,
+    supervisor: evidence.supervisor,
+    realpath: input.opts.spawnDeps?.realpath,
+  });
+  if (!valid.ok) return { kind: "failed", error: valid.error };
+  const extras: FactoryReleaseLoopBindingFields = {};
+  if (invocation) {
+    extras.candidate_invocation = {
+      executable: invocation.executable,
+      argv: [...invocation.argv],
+      candidateSha: invocation.candidateSha,
+    };
+  }
+  await persistFactoryReleaseLoopBinding(input.ctx, input.loopRunId, "dispatched", extras);
+  return { kind: "adopted" };
+}
+
+/**
+ * Production dispatch: allocate/init the work-list run, persist `bound`, then
+ * spawn the resolved candidate launcher. OS accept is `starting`. Valid
+ * durable `loop_run_handoff` is `dispatched`. `--engine-track candidate` on
+ * argv is intent metadata, not the binary selector.
  */
 export async function productionDispatchPackLoop(
   input: DispatchPackLoopInput,
@@ -1416,8 +2325,12 @@ export async function productionDispatchPackLoop(
       issue_numbers: number[];
       label: string;
     }) => Promise<{ loop_run_id: string }>;
-    persistBinding?: (loop_run_id: string) => Promise<void>;
+    persistBinding?: (loop_run_id: string, state?: FactoryReleaseLoopDispatchState) => Promise<void>;
     markDispatched?: (loop_run_id: string) => Promise<void>;
+    fileExists?: (p: string) => boolean;
+    resolveCandidate?: typeof resolveCandidateEngine;
+    env?: NodeJS.ProcessEnv;
+    spawnDeps?: SpawnCandidateLoopDeps;
   } = {},
 ): Promise<{ loop_run_id: string }> {
   const init =
@@ -1450,26 +2363,103 @@ export async function productionDispatchPackLoop(
     issue_numbers: input.issue_numbers,
     label: input.label,
   });
-  const persist =
+  const fileExists = deps.fileExists ?? defaultFileExistsSync;
+  let invocation = input.candidateInvocation;
+  if (!invocation) {
+    const resolved = (deps.resolveCandidate ?? resolveCandidateEngine)(
+      {
+        repoDir: input.repoDir,
+        candidateSha: input.request.integrated_candidate.git_sha,
+        candidateEngineRootEnv: (deps.env ?? process.env).PIPELINE_CANDIDATE_ENGINE_ROOT,
+      },
+      defaultResolveCandidateEngineDeps(),
+    );
+    if (!resolved.ok) {
+      throw new Error(`pack-loop dispatch: ${resolved.error}`);
+    }
+    invocation = freezeCandidateInvocation({
+      executable: resolved.engine.launcherPath,
+      loopRunId: loop_run_id,
+      candidateSha: resolved.engine.commitSha,
+    });
+  }
+  invocation = assertCandidateInvocation(
+    invocation,
+    input.request.integrated_candidate.git_sha,
+    fileExists,
+  );
+  const persistBound =
     deps.persistBinding ??
     (input.persistCtx
-      ? (id: string) => persistFactoryReleaseLoopBinding(input.persistCtx!, id, "bound")
+      ? (id: string, state: FactoryReleaseLoopDispatchState = "bound") =>
+          persistFactoryReleaseLoopBinding(input.persistCtx!, id, state, {
+            candidate_invocation: {
+              executable: invocation!.executable,
+              argv: [...invocation!.argv],
+              candidateSha: invocation!.candidateSha,
+            },
+          })
       : null);
-  if (persist) await persist(loop_run_id);
-  const spawn = deps.spawnCandidateLoop ?? defaultSpawnCandidateLoop;
-  await spawn({
-    repoDir: input.repoDir,
-    loop_run_id,
-    issue_numbers: input.issue_numbers,
-    engineTrack: "candidate",
-    label: input.label,
-  });
-  const mark =
-    deps.markDispatched ??
-    (input.persistCtx
-      ? (id: string) => persistFactoryReleaseLoopBinding(input.persistCtx!, id, "dispatched")
-      : null);
-  if (mark) await mark(loop_run_id);
+  if (persistBound) await persistBound(loop_run_id, "bound");
+  const spawn =
+    deps.spawnCandidateLoop ??
+    ((spawnArgs) =>
+      defaultSpawnCandidateLoop(
+        {
+          repoDir: spawnArgs.repoDir,
+          loop_run_id: spawnArgs.loop_run_id,
+          candidateInvocation: spawnArgs.candidateInvocation ?? invocation,
+          requestCandidateSha: input.request.integrated_candidate.git_sha,
+        },
+        {
+          ...deps.spawnDeps,
+          env: deps.env ?? deps.spawnDeps?.env,
+          fileExists: deps.fileExists ?? deps.spawnDeps?.fileExists,
+          writeFile: input.persistCtx?.writeFile ?? deps.spawnDeps?.writeFile,
+          now: input.persistCtx?.now ?? deps.spawnDeps?.now,
+          onAccepted: async (info) => {
+            await persistPackLoopOsAccepted(input.persistCtx, spawnArgs.loop_run_id, info, invocation);
+            if (deps.spawnDeps?.onAccepted) await deps.spawnDeps.onAccepted(info);
+          },
+        },
+      ));
+  let spawnResult: void | PackLoopSpawnResult;
+  try {
+    spawnResult = await spawn({
+      repoDir: input.repoDir,
+      loop_run_id,
+      issue_numbers: input.issue_numbers,
+      engineTrack: "candidate",
+      label: input.label,
+      candidateInvocation: invocation,
+    });
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code ?? "spawn_throw";
+    const last_error = formatPackLoopLastError({
+      errorCode: String(code),
+      excerpt: (err as Error).message,
+    });
+    if (input.persistCtx) {
+      await persistFactoryReleaseLoopBinding(input.persistCtx, loop_run_id, "bound", {
+        last_error,
+        spawn_attempt: { error_code: String(code), at: isoNow(input.persistCtx.now()) },
+        candidate_invocation: {
+          executable: invocation.executable,
+          argv: [...invocation.argv],
+          candidateSha: invocation.candidateSha,
+        },
+      });
+    }
+    throw err;
+  }
+  const result = requirePackLoopSpawnResult(spawnResult, loop_run_id, "spawn");
+  await persistSpawnResult(input.persistCtx, loop_run_id, result, invocation);
+  if (result.dispatch_state === "failed") {
+    throw new Error(result.last_error ?? "pack-loop dispatch failed before handoff");
+  }
+  if (result.dispatch_state === "bound") {
+    throw new Error(result.last_error ?? "pack-loop spawn did not start");
+  }
   return { loop_run_id };
 }
 
@@ -1810,8 +2800,9 @@ export async function generateDurableUnsignedFrg(
       defaultStartBoundPackLoop(startCtx, {
         createOrReusePackIssues: opts.createOrReusePackIssues,
         dispatchPackLoop: opts.dispatchPackLoop,
+        candidateInvocation: opts.candidateInvocation,
       }));
-  const resumeBoundPackLoop = opts.resumeBoundPackLoop ?? defaultResumeBoundPackLoop;
+  const injectedResumeBoundPackLoop = opts.resumeBoundPackLoop;
   const scoreBoundPackLoop = opts.scoreBoundPackLoop ?? defaultScoreBoundPackLoop;
 
   const requestFingerprint = factoryReleaseRequestFingerprint(request);
@@ -1902,6 +2893,36 @@ export async function generateDurableUnsignedFrg(
     now,
   };
 
+  const resumeBoundPackLoop =
+    injectedResumeBoundPackLoop ??
+    ((args: {
+      repoDir: string;
+      loop_run_id: string;
+      candidateInvocation?: CandidateInvocation;
+    }) =>
+      defaultResumeBoundPackLoop(
+        {
+          repoDir: args.repoDir,
+          loop_run_id: args.loop_run_id,
+          candidateInvocation: args.candidateInvocation,
+          requestCandidateSha: request.integrated_candidate.git_sha,
+        },
+        {
+          ...opts.spawnDeps,
+          now: opts.spawnDeps?.now ?? now,
+          writeFile: opts.spawnDeps?.writeFile ?? writeFile,
+          onAccepted: async (info) => {
+            await persistPackLoopOsAccepted(
+              reconcileCtx,
+              args.loop_run_id,
+              info,
+              args.candidateInvocation,
+            );
+            if (opts.spawnDeps?.onAccepted) await opts.spawnDeps.onAccepted(info);
+          },
+        },
+      ));
+
   let loop = await reconcilePackLoop(reconcileCtx);
   if (!loop) {
     let started: { loop_run_id: string } | null = null;
@@ -1916,36 +2937,199 @@ export async function generateDurableUnsignedFrg(
       });
     }
     if (started?.loop_run_id) {
-      // Safety-net persist after a successful start. Production dispatch already
-      // wrote `bound` before spawn and `dispatched` after spawn confirmed.
-      await persistFactoryReleaseLoopBinding(reconcileCtx, started.loop_run_id, "dispatched");
+      const bindingPath = factoryReleaseLoopBindingPath(started.loop_run_id);
+      let existingState: FactoryReleaseLoopDispatchState | null = null;
+      if (await fileExists(bindingPath)) {
+        try {
+          const raw = JSON.parse(await readFile(bindingPath)) as Record<string, unknown>;
+          existingState = parseDispatchState(raw.dispatch_state);
+        } catch {
+          existingState = null;
+        }
+      }
+      // Injected start seams persist no binding; record the run as dispatched
+      // for that tick. Production dispatch already persisted starting/dispatched.
+      const persistState = existingState ?? "dispatched";
+      if (persistState !== "failed") {
+        await persistFactoryReleaseLoopBinding(reconcileCtx, started.loop_run_id, persistState);
+      }
       loop = await reconcilePackLoop(reconcileCtx);
       if (!loop) {
         loop = nonTerminalBoundStub(started.loop_run_id);
       }
     }
-  } else if (
-    await boundLoopNeedsDispatchRetry(
-      loop.loop_run_id,
-      request,
-      requestFingerprint,
-      readFile,
-      fileExists,
-    )
-  ) {
-    try {
-      await resumeBoundPackLoop({
-        repoDir: ctx.repoDir,
+  } else {
+    const bindingPath = factoryReleaseLoopBindingPath(loop.loop_run_id);
+    let binding: Record<string, unknown> | null = null;
+    if (await fileExists(bindingPath)) {
+      try {
+        binding = JSON.parse(await readFile(bindingPath)) as Record<string, unknown>;
+      } catch {
+        binding = null;
+      }
+    }
+    const dispatchState = parseDispatchState(binding?.dispatch_state);
+    if (dispatchState === "failed") {
+      const msg =
+        typeof binding?.last_error === "string" && binding.last_error
+          ? binding.last_error
+          : `factory-release prepare: bound pack loop ${loop.loop_run_id} failed before handoff`;
+      return {
+        ...refuseSyntheticTrivialPack(request, {
+          defect_class: "pack_loop_start_failed",
+          message: msg,
+        }),
         loop_run_id: loop.loop_run_id,
+        liveness: await probePrepareLiveness(loop.loop_run_id, opts, request, binding),
+      };
+    }
+    if (dispatchState === "starting") {
+      const adopted = await reconcileStartingDurableHandoff({
+        ctx: reconcileCtx,
+        loopRunId: loop.loop_run_id,
+        request,
+        binding,
+        opts,
       });
-      await persistFactoryReleaseLoopBinding(reconcileCtx, loop.loop_run_id, "dispatched");
-    } catch (err) {
-      return refuseSyntheticTrivialPack(request, {
-        defect_class: "pack_loop_start_failed",
-        message:
-          `factory-release prepare: failed to resume request-bound factory-gate pack loop ` +
-          `${loop.loop_run_id} for ${request.target_version}: ${(err as Error).message}`,
-      });
+      if (adopted.kind === "failed") {
+        await persistFactoryReleaseLoopBinding(reconcileCtx, loop.loop_run_id, "failed", {
+          last_error: adopted.error,
+        });
+        return {
+          ...(await refuseSyntheticTrivialPack(request, {
+            defect_class: "pack_loop_start_failed",
+            message: adopted.error,
+          })),
+          loop_run_id: loop.loop_run_id,
+        };
+      }
+      if (adopted.kind === "absent") {
+        const deadline = typeof binding?.observation_deadline === "string" ? binding.observation_deadline : "";
+        const expired = !deadline || now().getTime() >= Date.parse(deadline);
+        if (expired) {
+          const msg = `factory-release prepare: pack-loop observation window expired for ${loop.loop_run_id}`;
+          await persistFactoryReleaseLoopBinding(reconcileCtx, loop.loop_run_id, "failed", {
+            last_error: msg,
+          });
+          return {
+            ...(await refuseSyntheticTrivialPack(request, {
+              defect_class: "pack_loop_start_failed",
+              message: msg,
+            })),
+            loop_run_id: loop.loop_run_id,
+          };
+        }
+        // In-window starting with no handoff: observe, do not spawn a second child.
+      }
+      // Valid durable handoff: persist dispatched above and do not spawn.
+    } else if (
+      dispatchState === "dispatched" &&
+      typeof binding?.resume_count === "number" &&
+      binding.resume_count >= 1
+    ) {
+      const live = await probePrepareLiveness(loop.loop_run_id, opts, request, binding);
+      if (live.status !== "live" && live.status !== "unknown") {
+        const msg =
+          `factory-release prepare: pack loop ${loop.loop_run_id} lost liveness after one resume`;
+        await persistFactoryReleaseLoopBinding(reconcileCtx, loop.loop_run_id, "failed", {
+          last_error: msg,
+        });
+        return {
+          ...refuseSyntheticTrivialPack(request, {
+            defect_class: "pack_loop_start_failed",
+            message: msg,
+          }),
+          loop_run_id: loop.loop_run_id,
+          liveness: live,
+        };
+      }
+    } else if (dispatchState === "dispatched") {
+      const live = await probePrepareLiveness(loop.loop_run_id, opts, request, binding);
+      if (live.status === "not-live" && live.reason !== "unreadable_identity") {
+        const resumeCount = typeof binding?.resume_count === "number" ? binding.resume_count : 0;
+        if (resumeCount >= 1) {
+          const msg =
+            `factory-release prepare: pack loop ${loop.loop_run_id} lost liveness after one resume`;
+          await persistFactoryReleaseLoopBinding(reconcileCtx, loop.loop_run_id, "failed", {
+            last_error: msg,
+          });
+          return {
+            ...refuseSyntheticTrivialPack(request, {
+              defect_class: "pack_loop_start_failed",
+              message: msg,
+            }),
+            loop_run_id: loop.loop_run_id,
+            liveness: live,
+          };
+        }
+        if (live.reason === "dead_pid") {
+          try {
+            const invocation = restoreInvocation(binding, loop.loop_run_id, request);
+            await persistFactoryReleaseLoopBinding(reconcileCtx, loop.loop_run_id, "bound", {
+              resume_count: 1,
+              failed_process_identity: failedIdentityFromBinding(binding),
+            });
+            const resumed = requirePackLoopSpawnResult(
+              await resumeBoundPackLoop({
+                repoDir: ctx.repoDir,
+                loop_run_id: loop.loop_run_id,
+                candidateInvocation: invocation,
+              }),
+              loop.loop_run_id,
+              "resume",
+            );
+            await persistSpawnResult(reconcileCtx, loop.loop_run_id, resumed, invocation);
+            if (resumed.dispatch_state === "failed" || resumed.dispatch_state === "bound") {
+              throw new Error(resumed.last_error ?? "pack-loop resume failed");
+            }
+          } catch (err) {
+            return {
+              ...(await refuseSyntheticTrivialPack(request, {
+                defect_class: "pack_loop_start_failed",
+                message:
+                  `factory-release prepare: failed to resume request-bound factory-gate pack loop ` +
+                  `${loop.loop_run_id} for ${request.target_version}: ${(err as Error).message}`,
+              })),
+              loop_run_id: loop.loop_run_id,
+            };
+          }
+        }
+      }
+    } else if (
+      await boundLoopNeedsDispatchRetry(
+        loop.loop_run_id,
+        request,
+        requestFingerprint,
+        readFile,
+        fileExists,
+      )
+    ) {
+      try {
+        const invocation = restoreInvocation(binding, loop.loop_run_id, request) ?? opts.candidateInvocation;
+        const resumed = requirePackLoopSpawnResult(
+          await resumeBoundPackLoop({
+            repoDir: ctx.repoDir,
+            loop_run_id: loop.loop_run_id,
+            candidateInvocation: invocation,
+          }),
+          loop.loop_run_id,
+          "resume",
+        );
+        await persistSpawnResult(reconcileCtx, loop.loop_run_id, resumed, invocation);
+        if (resumed.dispatch_state === "failed") {
+          throw new Error(resumed.last_error ?? "pack-loop resume failed before handoff");
+        }
+        if (resumed.dispatch_state === "bound") {
+          throw new Error(resumed.last_error ?? "pack-loop resume did not start");
+        }
+      } catch (err) {
+        return refuseSyntheticTrivialPack(request, {
+          defect_class: "pack_loop_start_failed",
+          message:
+            `factory-release prepare: failed to resume request-bound factory-gate pack loop ` +
+            `${loop.loop_run_id} for ${request.target_version}: ${(err as Error).message}`,
+        });
+      }
     }
   }
 
@@ -1962,6 +3146,16 @@ export async function generateDurableUnsignedFrg(
   }
 
   if (!isBoundPackLoopTerminal(loop)) {
+    const bindingPath = factoryReleaseLoopBindingPath(loop.loop_run_id);
+    let binding: Record<string, unknown> | null = null;
+    if (await fileExists(bindingPath)) {
+      try {
+        binding = JSON.parse(await readFile(bindingPath)) as Record<string, unknown>;
+      } catch {
+        binding = null;
+      }
+    }
+    const liveness = await probePrepareLiveness(loop.loop_run_id, opts, request, binding);
     return {
       frg: {
         ...refusedFrgPayload(request),
@@ -1976,6 +3170,7 @@ export async function generateDurableUnsignedFrg(
       message:
         `factory-release prepare: bound pack loop ${loop.loop_run_id} is in progress for ` +
         `${request.target_version}; re-invoke the same request to resume.`,
+      liveness,
     };
   }
 
@@ -2160,9 +3355,20 @@ export async function generateDurableUnsignedFrg(
   return { frg, structurally_eligible: true };
 }
 
+type LoadedAttestedEvidence =
+  | { status: "accepted"; evidence: FrgEvidence; text: string; path: string }
+  | { status: "absent"; reason: AttestationObserveReason }
+  | {
+      status: "rejected";
+      reason: AttestationObserveReason;
+      observed_run_id: string | null;
+      detail?: string;
+    };
+
 /**
  * Try to load and validate release-eligible attested evidence from a path.
- * Requires factory_release_binding digests to match the unsigned payload.
+ * Accepts attested run_id B when HMAC-covered factory_release_binding names A.
+ * pack_provenance presence is not a miss. Notes are not a binding carrier.
  */
 async function tryLoadAttestedEvidence(
   evidencePath: string,
@@ -2170,80 +3376,113 @@ async function tryLoadAttestedEvidence(
   unsigned: FactoryReleaseFrgPayload,
   readFile: (p: string) => Promise<string>,
   fileExists: (p: string) => Promise<boolean>,
-): Promise<{ evidence: FrgEvidence; text: string; path: string } | null> {
-  if (!(await fileExists(evidencePath))) return null;
+  validateOpts: FrgValidateOpts = {},
+): Promise<LoadedAttestedEvidence> {
+  if (!(await fileExists(evidencePath))) return { status: "absent", reason: "missing_file" };
   let text: string;
   try {
     text = await readFile(evidencePath);
   } catch {
-    return null;
+    return { status: "absent", reason: "unreadable" };
   }
   let raw: unknown;
   try {
     raw = JSON.parse(text);
   } catch {
-    return null;
+    return { status: "absent", reason: "unparsable" };
   }
-  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    return { status: "absent", reason: "unparsable" };
+  }
   const rawObj = raw as Record<string, unknown>;
 
   let evidence: FrgEvidence;
   try {
     evidence = parseFrgEvidenceJson(text);
   } catch {
-    return null;
+    return { status: "absent", reason: "unparsable" };
   }
-  if (
-    honestLatestJsonBindsRequest(request, evidence) &&
-    evidence.run_id === unsigned.frg_run_id &&
-    evidence.loop_run_id === unsigned.loop_run_id
-  ) {
-    return { evidence, text, path: evidencePath };
+  const observedRunId = typeof evidence.run_id === "string" ? evidence.run_id : null;
+  const reject = (
+    reason: AttestationObserveReason,
+    detail?: string,
+  ): LoadedAttestedEvidence => ({
+    status: "rejected",
+    reason,
+    observed_run_id: observedRunId,
+    detail,
+  });
+
+  if (!evidence.integrity?.attestation) {
+    return reject("hmac_invalid", "integrity.attestation missing");
   }
-  if (evidence.pack_provenance != null) return null;
-  try {
-    evidence = validateReleaseEligibleFrgEvidence(evidence, request.target_version);
-  } catch {
-    if (evidence.version !== request.target_version || evidence.run_id !== unsigned.frg_run_id) {
-      return null;
-    }
-    if (!evidence.pass || !isReleaseEligibleFrgPass(evidence)) return null;
+  if (evidence.version !== request.target_version) {
+    return reject("identity_mismatch", "version mismatch");
+  }
+  if (evidence.loop_run_id !== unsigned.loop_run_id) {
+    return reject("identity_mismatch", "loop_run_id mismatch");
+  }
+  if (evidence.pack_id !== unsigned.pack_id) {
+    return reject("identity_mismatch", "pack_id mismatch");
   }
 
-  if (evidence.run_id !== unsigned.frg_run_id) return null;
-  if (evidence.loop_run_id !== unsigned.loop_run_id) return null;
-  if (evidence.pack_id !== unsigned.pack_id) return null;
-  if (evidence.version !== request.target_version) return null;
-  if (!evidence.integrity?.attestation) return null;
-
-  // Exact-artifact two-call handoff: attestation must bind request fingerprint
-  // and every unsigned artifact digest.
   const expected = buildFactoryReleaseUnsignedDigestBinding(request, unsigned);
-  const binding =
-    rawObj.factory_release_binding ??
-    // Allow notes entry as a last-resort carrier: factory_release_binding:<json>
-    (() => {
-      for (const note of evidence.notes ?? []) {
-        if (typeof note === "string" && note.startsWith("factory_release_binding:")) {
-          try {
-            return JSON.parse(note.slice("factory_release_binding:".length));
-          } catch {
-            return null;
-          }
-        }
-      }
-      return null;
-    })();
-  const mismatch = unsignedDigestBindingMismatch(expected, binding);
-  if (mismatch) return null;
+  const topLevel = topLevelFactoryReleaseBinding(rawObj, evidence);
+  if (topLevel === undefined) {
+    if (notesCarryFactoryReleaseBinding(evidence.notes)) {
+      return reject("notes_only_binding");
+    }
+    return reject("missing_factory_release_binding");
+  }
+  const mismatch = unsignedDigestBindingMismatch(expected, topLevel);
+  if (mismatch) {
+    return reject("binding_mismatch", mismatch);
+  }
 
-  return { evidence, text, path: evidencePath };
+  if (!evidence.pass || !isReleaseEligibleFrgPass(evidence, { requireAttestation: true })) {
+    return reject("not_release_eligible");
+  }
+
+  if (!honestLatestJsonBindsRequest(request, { ...evidence, factory_release_binding: topLevel })) {
+    return reject("identity_mismatch", "candidate or honest-bind mismatch");
+  }
+
+  try {
+    validateReleaseEligibleFrgEvidence(text, request.target_version, validateOpts);
+  } catch (err) {
+    const msg = (err as Error).message;
+    if (
+      /MAC|does not match|KEY is required|hand-authored|integrity\.attestation/i.test(msg)
+    ) {
+      return reject("hmac_invalid", msg);
+    }
+    return reject("not_release_eligible", msg);
+  }
+
+  return { status: "accepted", evidence, text, path: evidencePath };
+}
+
+function acceptedAttestation(
+  loaded: Extract<LoadedAttestedEvidence, { status: "accepted" }>,
+  latestPath: string,
+  evidencePath: string,
+  observedPath: string,
+): ObservedAttestation {
+  const digest = sha256(loaded.text);
+  return {
+    frg_run_id: loaded.evidence.run_id,
+    evidence_path: observedPath === latestPath ? evidencePath : loaded.path,
+    evidence_sha256: digest,
+    latest_path: latestPath,
+    latest_sha256: digest,
+    evidence: loaded.evidence,
+  };
 }
 
 /**
  * Observe release-eligible attested evidence under the version FRG tree.
- * Matches the unsigned frg_run_id and every closed unsigned artifact digest.
- * Handoff is a single non-recursive hint: re-read referenced paths once.
+ * Returns typed accepted / absent / rejected. Attested run_id MAY be B ≠ A
+ * when HMAC factory_release_binding names unsigned A.
  */
 export async function defaultObserveAttestation(
   request: FactoryReleasePrepareRequest,
@@ -2251,7 +3490,8 @@ export async function defaultObserveAttestation(
   ctx: { repoDir: string; workDir: string },
   readFile: (p: string) => Promise<string> = (p) => fs.readFile(p, "utf8"),
   fileExists: (p: string) => Promise<boolean> = defaultFileExists,
-): Promise<ObservedAttestation | null> {
+  validateOpts: FrgValidateOpts = {},
+): Promise<AttestationObserveResult> {
   const version = request.target_version;
   const latestPath = path.join(ctx.repoDir, ".agent-pipeline", "frg", version, "latest.json");
   const evidencePath = path.join(
@@ -2263,30 +3503,40 @@ export async function defaultObserveAttestation(
     "evidence.json",
   );
 
-  const tryPaths = [evidencePath, latestPath];
+  const tryPaths = [latestPath, evidencePath];
+  let firstRejected: Extract<LoadedAttestedEvidence, { status: "rejected" }> | null = null;
+  let sawPresent = false;
   for (const p of tryPaths) {
-    const loaded = await tryLoadAttestedEvidence(p, request, unsigned, readFile, fileExists);
-    if (!loaded) continue;
-    const digest = sha256(loaded.text);
-    return {
-      frg_run_id: loaded.evidence.run_id,
-      evidence_path: p === latestPath ? evidencePath : p,
-      evidence_sha256: digest,
-      latest_path: latestPath,
-      latest_sha256: digest,
-      evidence: loaded.evidence,
-    };
+    const loaded = await tryLoadAttestedEvidence(
+      p,
+      request,
+      unsigned,
+      readFile,
+      fileExists,
+      validateOpts,
+    );
+    if (loaded.status === "accepted") {
+      return {
+        status: "accepted",
+        attestation: acceptedAttestation(loaded, latestPath, evidencePath, p),
+      };
+    }
+    if (loaded.status === "rejected") {
+      sawPresent = true;
+      if (!firstRejected) firstRejected = loaded;
+      continue;
+    }
+    if (loaded.reason !== "missing_file") sawPresent = true;
   }
 
   // Optional handoff: single hint to re-observe referenced evidence paths once.
-  // Never recurse into defaultObserveAttestation (crash-window must return null).
   const handoffPath = path.join(ctx.workDir, "attestation-handoff.json");
   if (await fileExists(handoffPath)) {
     let handoff: Record<string, unknown>;
     try {
       handoff = JSON.parse(await readFile(handoffPath)) as Record<string, unknown>;
     } catch {
-      return null;
+      return { status: "absent", reason: "unparsable" };
     }
     if (
       handoff.kind === "frg_attestation_handoff" &&
@@ -2301,25 +3551,48 @@ export async function defaultObserveAttestation(
         hintPaths.push(handoff.frg_latest_path);
       }
       for (const p of hintPaths) {
-        // Skip paths already attempted above.
         if (p === evidencePath || p === latestPath) continue;
-        const loaded = await tryLoadAttestedEvidence(p, request, unsigned, readFile, fileExists);
-        if (!loaded) continue;
-        const digest = sha256(loaded.text);
-        return {
-          frg_run_id: loaded.evidence.run_id,
-          evidence_path: loaded.path,
-          evidence_sha256: digest,
-          latest_path: typeof handoff.frg_latest_path === "string" ? handoff.frg_latest_path : latestPath,
-          latest_sha256: digest,
-          evidence: loaded.evidence,
-        };
+        const loaded = await tryLoadAttestedEvidence(
+          p,
+          request,
+          unsigned,
+          readFile,
+          fileExists,
+          validateOpts,
+        );
+        if (loaded.status === "accepted") {
+          const digest = sha256(loaded.text);
+          return {
+            status: "accepted",
+            attestation: {
+              frg_run_id: loaded.evidence.run_id,
+              evidence_path: loaded.path,
+              evidence_sha256: digest,
+              latest_path:
+                typeof handoff.frg_latest_path === "string" ? handoff.frg_latest_path : latestPath,
+              latest_sha256: digest,
+              evidence: loaded.evidence,
+            },
+          };
+        }
+        if (loaded.status === "rejected" && !firstRejected) firstRejected = loaded;
       }
-      // Handoff present but evidence still absent/invalid — awaiting, not recurse.
-      return null;
     }
   }
-  return null;
+
+  if (firstRejected) {
+    return {
+      status: "rejected",
+      reason: firstRejected.reason,
+      expected_frg_run_id: unsigned.frg_run_id,
+      observed_run_id: firstRejected.observed_run_id,
+      detail: firstRejected.detail,
+    };
+  }
+  return {
+    status: "absent",
+    reason: sawPresent ? "unreadable" : "missing_file",
+  };
 }
 
 export async function defaultObserveExistingRelease(
@@ -2464,7 +3737,9 @@ export function defaultFactoryReleasePrepareDeps(
     observeAttestation:
       overrides.observeAttestation ??
       ((request, unsigned, ctx) =>
-        defaultObserveAttestation(request, unsigned, ctx, readFile, fileExists)),
+        defaultObserveAttestation(request, unsigned, ctx, readFile, fileExists, {
+          attestationKey: resolveFrgAttestationKey(overrides.env ?? process.env),
+        })),
     observeExistingRelease:
       overrides.observeExistingRelease ??
       ((request) => defaultObserveExistingRelease(request)),
@@ -2567,6 +3842,7 @@ function failedResult(
   defectClass: string,
   message: string,
   checkpoint: string,
+  liveness?: PackLoopLivenessStatus,
 ): FactoryReleaseFailedResult {
   return {
     schema_version: 1,
@@ -2580,6 +3856,7 @@ function failedResult(
     defect_class: defectClass,
     message,
     checkpoint,
+    ...(liveness ? { liveness } : {}),
   };
 }
 
@@ -2587,6 +3864,7 @@ function inProgressResult(
   request: FactoryReleasePrepareRequest,
   loopRunId: string,
   checkpoint: string,
+  liveness?: PackLoopLivenessStatus,
 ): FactoryReleaseInProgressResult {
   return {
     schema_version: 1,
@@ -2600,6 +3878,7 @@ function inProgressResult(
     candidate_git_sha: request.integrated_candidate.git_sha,
     loop_run_id: loopRunId,
     checkpoint,
+    ...(liveness ? { liveness } : {}),
   };
 }
 
@@ -2607,6 +3886,7 @@ function awaitingResult(
   request: FactoryReleasePrepareRequest,
   frg: FactoryReleaseFrgPayload,
   checkpoint: string,
+  observeMiss?: FactoryReleaseObserveMiss,
 ): FactoryReleaseAwaitingResult {
   return {
     schema_version: 1,
@@ -2620,6 +3900,7 @@ function awaitingResult(
     candidate_git_sha: request.integrated_candidate.git_sha,
     checkpoint,
     frg,
+    ...(observeMiss ? { observe_miss: observeMiss } : {}),
   };
 }
 
@@ -2738,10 +4019,13 @@ export async function runFactoryReleasePrepare(
 
   // --- Complete: re-observe and return without mutation ---
   if (store?.phase === "complete" && store.unsigned && store.attestation && store.release) {
-    const attestation = await deps.observeAttestation(request, store.unsigned, {
-      repoDir: opts.repoDir,
-      workDir,
-    });
+    const reobserved = normalizeObserveAttestation(
+      await deps.observeAttestation(request, store.unsigned, {
+        repoDir: opts.repoDir,
+        workDir,
+      }),
+    );
+    const attestation = reobserved.status === "accepted" ? reobserved.attestation : null;
     if (
       !attestation ||
       attestation.frg_run_id !== store.attestation.frg_run_id ||
@@ -2824,7 +4108,7 @@ export async function runFactoryReleasePrepare(
       );
       return {
         exitCode: 0,
-        result: inProgressResult(request, generated.loop_run_id, runningId),
+        result: inProgressResult(request, generated.loop_run_id, runningId, generated.liveness),
       };
     }
     if (!generated.structurally_eligible) {
@@ -2841,7 +4125,7 @@ export async function runFactoryReleasePrepare(
       await saveCheckpoint(deps, checkpointPath, store);
       return {
         exitCode: 1,
-        result: failedResult(request, defect, msg, checkpointId("failed", fingerprint)),
+        result: failedResult(request, defect, msg, checkpointId("failed", fingerprint), generated.liveness),
       };
     }
     unsigned = generated.frg;
@@ -2894,11 +4178,13 @@ export async function runFactoryReleasePrepare(
   }
 
   // --- Attestation observation ---
-  const attestation = await deps.observeAttestation(request, unsigned, {
-    repoDir: opts.repoDir,
-    workDir,
-  });
-  if (!attestation) {
+  const observed = normalizeObserveAttestation(
+    await deps.observeAttestation(request, unsigned, {
+      repoDir: opts.repoDir,
+      workDir,
+    }),
+  );
+  if (observed.status !== "accepted") {
     const awaitingId = store?.awaiting_checkpoint_id ?? checkpointId("unsigned", fingerprint);
     if (!store || store.phase !== "awaiting_frg_attestation") {
       store = {
@@ -2914,15 +4200,24 @@ export async function runFactoryReleasePrepare(
       await saveCheckpoint(deps, checkpointPath, store);
     }
     log("[factory-release prepare] awaiting production-owned FRG attestation");
+    const observeMiss: FactoryReleaseObserveMiss | undefined =
+      observed.status === "rejected"
+        ? {
+            reason: observed.reason,
+            expected_frg_run_id: observed.expected_frg_run_id,
+            observed_run_id: observed.observed_run_id,
+            detail: observed.detail,
+          }
+        : undefined;
     return {
       exitCode: 0,
-      result: awaitingResult(request, unsigned, awaitingId),
+      result: awaitingResult(request, unsigned, awaitingId, observeMiss),
     };
   }
+  const attestation = observed.attestation;
 
-  // Stale / foreign attestation binding (ids + exact unsigned artifact digests).
+  // Join is HMAC factory_release_binding.frg_run_id === unsigned A, not run_id === A.
   if (
-    attestation.frg_run_id !== unsigned.frg_run_id ||
     attestation.evidence.loop_run_id !== unsigned.loop_run_id ||
     attestation.evidence.version !== request.target_version
   ) {
@@ -2934,42 +4229,38 @@ export async function runFactoryReleasePrepare(
       result: failedResult(request, "attestation_mismatch", msg, checkpointId("failed", fingerprint)),
     };
   }
-  // Exact-artifact two-call handoff: attestation must bind request fingerprint
-  // and every closed unsigned artifact digest (even when observeAttestation is injected).
   {
     const expectedBinding = buildFactoryReleaseUnsignedDigestBinding(request, unsigned);
     const evidenceRec = attestation.evidence as FrgEvidence & {
       factory_release_binding?: unknown;
     };
-    let observedBinding: unknown = evidenceRec.factory_release_binding ?? null;
-    if (observedBinding == null) {
-      for (const note of attestation.evidence.notes ?? []) {
-        if (typeof note === "string" && note.startsWith("factory_release_binding:")) {
-          try {
-            observedBinding = JSON.parse(note.slice("factory_release_binding:".length));
-          } catch {
-            observedBinding = null;
-          }
-          break;
-        }
-      }
+    const observedBinding = evidenceRec.factory_release_binding;
+    if (observedBinding === undefined && notesCarryFactoryReleaseBinding(attestation.evidence.notes)) {
+      const awaitingId = store?.awaiting_checkpoint_id ?? checkpointId("unsigned", fingerprint);
+      return {
+        exitCode: 0,
+        result: awaitingResult(request, unsigned, awaitingId, {
+          reason: "notes_only_binding",
+          expected_frg_run_id: unsigned.frg_run_id,
+          observed_run_id: attestation.frg_run_id,
+        }),
+      };
     }
-    if (!honestLatestJsonBindsRequest(request, attestation.evidence)) {
-      const mismatch = unsignedDigestBindingMismatch(expectedBinding, observedBinding);
-      if (mismatch) {
-        const msg =
-          `factory-release prepare: attested evidence unsigned digest binding failed ` +
-          `for ${request.target_version}: ${mismatch}`;
-        return {
-          exitCode: 1,
-          result: failedResult(
-            request,
-            "attestation_digest_mismatch",
-            msg,
-            checkpointId("failed", fingerprint),
-          ),
-        };
-      }
+    const mismatch = unsignedDigestBindingMismatch(expectedBinding, observedBinding ?? null);
+    if (mismatch) {
+      const awaitingId = store?.awaiting_checkpoint_id ?? checkpointId("unsigned", fingerprint);
+      return {
+        exitCode: 0,
+        result: awaitingResult(request, unsigned, awaitingId, {
+          reason:
+            mismatch === "factory_release_binding missing or not an object"
+              ? "missing_factory_release_binding"
+              : "binding_mismatch",
+          expected_frg_run_id: unsigned.frg_run_id,
+          observed_run_id: attestation.frg_run_id,
+          detail: mismatch,
+        }),
+      };
     }
   }
 

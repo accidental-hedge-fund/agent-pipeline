@@ -16,6 +16,7 @@ import {
   type PriorRoundDigest,
   type SettledFindingVerification,
 } from "../review-history.ts";
+import { planningFactsSection, type PlanningFactBundle } from "../planning-facts.ts";
 import { DEFAULT_CONFIG } from "../types.ts";
 import type { PipelineConfig } from "../types.ts";
 
@@ -138,6 +139,10 @@ export interface BuildPlanArgs {
   contextSnapshot?: string;
   /** Cross-repo context summary from repo_map-declared repos. When absent, omitted. */
   crossRepoContext?: string;
+  /** Current planning-facts bundle. When absent or empty, the section is omitted. */
+  planningFacts?: PlanningFactBundle | null;
+  /** Previous vs current required-fact identities, injected into plan revision. */
+  planningFactIdentityChange?: { previous: Array<{ id: string; digest: string }> };
 }
 
 export function buildPlanningPrompt(a: BuildPlanArgs): string {
@@ -153,6 +158,7 @@ export function buildPlanningPrompt(a: BuildPlanArgs): string {
     context_snapshot: contextSnapshotSection(a.contextSnapshot),
     carry_forward_context: carryForwardSection(a.carryForward),
     cross_repo_context: crossRepoContextSection(a.crossRepoContext),
+    planning_facts: planningFactsSection(a.planningFacts, { role: "planner" }),
   });
 }
 
@@ -175,6 +181,7 @@ export function buildPlanningOpenspecPrompt(a: BuildPlanningOpenspecArgs): strin
     context_snapshot: contextSnapshotSection(a.contextSnapshot),
     carry_forward_context: carryForwardSection(a.carryForward),
     cross_repo_context: crossRepoContextSection(a.crossRepoContext),
+    planning_facts: planningFactsSection(a.planningFacts, { role: "planner" }),
     pipeline_run_id: a.pipelineRunId,
   });
 }
@@ -201,6 +208,7 @@ export function buildPlanReviewPrompt(a: BuildPlanReviewArgs): string {
     reviewer: a.reviewer,
     implementer: a.implementer,
     spec_context: specContextSection(a.specContext),
+    planning_facts: planningFactsSection(a.planningFacts, { role: "reviewer" }),
   });
 }
 
@@ -238,6 +246,10 @@ export function buildPlanRevisionPrompt(a: BuildPlanRevisionArgs): string {
     implementer: a.implementer,
     human_feedback: humanFeedback,
     spec_context: specContextSection(a.specContext),
+    planning_facts: planningFactsSection(a.planningFacts, {
+      role: "reviser",
+      previousIdentities: a.planningFactIdentityChange?.previous,
+    }),
   });
 }
 

@@ -32,6 +32,10 @@ import {
   type OverrideApproverRule,
   type OverrideClassPolicy,
   type OverrideGovernanceConfig,
+  PLANNING_FACT_VALUE_TYPES,
+  PLANNING_FACTS_PIPELINE_CEILINGS,
+  type PlanningFactProviderConfig,
+  type PlanningFactsConfig,
 } from "./types.ts";
 import { parseGitPushAuth, GitPushAuthConfigError } from "./git-push-auth.ts";
 import { loadProfile, type PipelineProfile } from "./profile.ts";
@@ -237,6 +241,187 @@ const ExecutorDefinitionSchema = z.discriminatedUnion("type", [
   ModelEndpointExecutorSchema,
 ]);
 
+const PLANNING_FACT_TYPE_ENUM = z.enum(PLANNING_FACT_VALUE_TYPES);
+
+/** Repo-relative provider path: no absolute, no `..` segment, no empty segment. */
+export function isSafePlanningFactsExecutable(value: string): boolean {
+  if (typeof value !== "string" || value.length === 0) return false;
+  if (value !== value.trim()) return false;
+  if (path.isAbsolute(value) || value.startsWith("~") || value.includes("\\")) return false;
+  const parts = value.split("/");
+  if (parts.some((seg) => seg === "" || seg === "." || seg === "..")) return false;
+  return true;
+}
+
+const PlanningFactProviderSchema = z
+  .object({
+    id: z.string().min(1).describe("Unique provider id within the planning_facts.providers list."),
+    executable: z
+      .string()
+      .min(1)
+      .describe("Repo-relative path to the provider executable. Absolute paths and `..` segments are rejected."),
+    args: z
+      .array(z.string())
+      .optional()
+      .describe("Additional argv entries passed to the provider. Literal bytes; never interpreted by a shell. Default empty."),
+    required: z
+      .boolean()
+      .describe("When true, provider failure blocks before the planning model is invoked. When false, failure emits unavailable records and planning may continue."),
+    facts: z
+      .record(z.string().min(1), PLANNING_FACT_TYPE_ENUM)
+      .describe("Non-empty map of allowed fact ids to primitive or array-of-primitive types."),
+  })
+  .strict()
+  .superRefine((provider, ctx) => {
+    if (!isSafePlanningFactsExecutable(provider.executable)) {
+      ctx.addIssue({
+        code: "custom",
+        message:
+          "executable must be a repo-relative path with no absolute prefix and no `..` segment",
+        path: ["executable"],
+      });
+    }
+    if (Object.keys(provider.facts).length === 0) {
+      ctx.addIssue({
+        code: "custom",
+        message: "facts must declare at least one fact id",
+        path: ["facts"],
+      });
+    }
+  });
+
+function planningFactsCeiling(key: keyof typeof PLANNING_FACTS_PIPELINE_CEILINGS, description: string) {
+  const max = PLANNING_FACTS_PIPELINE_CEILINGS[key];
+  return z
+    .number()
+    .int()
+    .positive()
+    .max(max, `${key} cannot exceed the pipeline-owned ceiling of ${max}`)
+    .optional()
+    .describe(description);
+}
+
+const PlanningFactsBlockSchema = z
+  .object({
+    providers: z
+      .array(PlanningFactProviderSchema)
+      .optional()
+      .describe("Named providers. Empty (default): no spawn, no planning-facts prompt section."),
+    timeout_ms: planningFactsCeiling(
+      "timeout_ms",
+      `Per-provider runtime ceiling in milliseconds (pipeline max ${PLANNING_FACTS_PIPELINE_CEILINGS.timeout_ms}; repository may only lower).`,
+    ),
+    max_stdout_bytes: planningFactsCeiling(
+      "max_stdout_bytes",
+      `Per-provider stdout ceiling in bytes (pipeline max ${PLANNING_FACTS_PIPELINE_CEILINGS.max_stdout_bytes}; repository may only lower).`,
+    ),
+    max_stderr_bytes: planningFactsCeiling(
+      "max_stderr_bytes",
+      `Per-provider stderr ceiling in bytes (pipeline max ${PLANNING_FACTS_PIPELINE_CEILINGS.max_stderr_bytes}; repository may only lower).`,
+    ),
+    max_fact_count: planningFactsCeiling(
+      "max_fact_count",
+      `Combined fact-count ceiling across providers (pipeline max ${PLANNING_FACTS_PIPELINE_CEILINGS.max_fact_count}; repository may only lower).`,
+    ),
+    max_key_chars: planningFactsCeiling(
+      "max_key_chars",
+      `Fact-key character ceiling (pipeline max ${PLANNING_FACTS_PIPELINE_CEILINGS.max_key_chars}; repository may only lower).`,
+    ),
+    max_value_chars: planningFactsCeiling(
+      "max_value_chars",
+      `Fact-value character ceiling for strings and each array item (pipeline max ${PLANNING_FACTS_PIPELINE_CEILINGS.max_value_chars}; repository may only lower).`,
+    ),
+    max_prompt_chars: planningFactsCeiling(
+      "max_prompt_chars",
+      `Total planning-facts prompt contribution ceiling (pipeline max ${PLANNING_FACTS_PIPELINE_CEILINGS.max_prompt_chars}; repository may only lower).`,
+    ),
+  })
+  .strict()
+  .superRefine((block, ctx) => {
+    const providers = block.providers ?? [];
+    const seenIds = new Set<string>();
+    const seenFacts = new Map<string, string>();
+    for (let i = 0; i < providers.length; i++) {
+      const p = providers[i];
+      if (seenIds.has(p.id)) {
+        ctx.addIssue({
+          code: "custom",
+          message: `duplicate provider id ${JSON.stringify(p.id)}`,
+          path: ["providers", i, "id"],
+        });
+      }
+      seenIds.add(p.id);
+      for (const factId of Object.keys(p.facts)) {
+        const owner = seenFacts.get(factId);
+        if (owner) {
+          ctx.addIssue({
+            code: "custom",
+            message: `duplicate fact id ${JSON.stringify(factId)} (also declared by provider ${JSON.stringify(owner)})`,
+            path: ["providers", i, "facts", factId],
+          });
+        } else {
+          seenFacts.set(factId, p.id);
+        }
+      }
+    }
+  });
+
+/** Resolve a parsed (or absent) planning_facts block to pipeline defaults. */
+export function resolvePlanningFactsConfig(
+  raw: z.infer<typeof PlanningFactsBlockSchema> | undefined,
+): PlanningFactsConfig {
+  const d = DEFAULT_CONFIG.planning_facts;
+  const providers: PlanningFactProviderConfig[] = (raw?.providers ?? []).map((p) => ({
+    id: p.id,
+    executable: p.executable,
+    args: [...(p.args ?? [])],
+    required: p.required,
+    facts: { ...p.facts },
+  }));
+  return {
+    providers,
+    timeout_ms: raw?.timeout_ms ?? d.timeout_ms,
+    max_stdout_bytes: raw?.max_stdout_bytes ?? d.max_stdout_bytes,
+    max_stderr_bytes: raw?.max_stderr_bytes ?? d.max_stderr_bytes,
+    max_fact_count: raw?.max_fact_count ?? d.max_fact_count,
+    max_key_chars: raw?.max_key_chars ?? d.max_key_chars,
+    max_value_chars: raw?.max_value_chars ?? d.max_value_chars,
+    max_prompt_chars: raw?.max_prompt_chars ?? d.max_prompt_chars,
+  };
+}
+
+/**
+ * Parse a trusted-base `.github/pipeline.yml` body for the planning_facts block
+ * only. Unknown sibling keys are ignored so a newer trusted file cannot fail
+ * observation solely for unrelated keys. Invalid planning_facts fails closed.
+ */
+export function parseTrustedPlanningFactsBlock(
+  yamlText: string,
+): { ok: true; config: PlanningFactsConfig } | { ok: false; error: string } {
+  let parsed: unknown;
+  try {
+    parsed = yaml.load(yamlText);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { ok: false, error: `trusted pipeline.yml is not valid YAML: ${message}` };
+  }
+  if (parsed == null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { ok: true, config: resolvePlanningFactsConfig(undefined) };
+  }
+  const block = (parsed as Record<string, unknown>).planning_facts;
+  if (block === undefined) {
+    return { ok: true, config: resolvePlanningFactsConfig(undefined) };
+  }
+  const result = PlanningFactsBlockSchema.safeParse(block);
+  if (!result.success) {
+    const errors = result.error.issues
+      .map((i) => `${["planning_facts", ...i.path].join(".")}: ${i.message}`)
+      .join("; ");
+    return { ok: false, error: errors };
+  }
+  return { ok: true, config: resolvePlanningFactsConfig(result.data) };
+}
+
 const PartialConfigSchema = z.object({
   repo: z.string().optional().describe("GitHub repository in 'owner/name' format (overrides auto-detected value)."),
   base_branch: z.string().optional().describe("Branch that PRs target and worktrees branch from."),
@@ -341,6 +526,9 @@ const PartialConfigSchema = z.object({
     .strict()
     .optional()
     .describe("Opt-in issue-implementation-readiness admission gate (#1238). Default off."),
+  planning_facts: PlanningFactsBlockSchema.optional().describe(
+    "Named planning-fact providers observed immediately before planning, plan-revision, and plan-review (#1300). Absent or empty providers: no spawn, no prompt section, no new blocking failure. SECURITY: each executable is spawned from trusted integration-base bytes with a constructed env (no inherited credentials).",
+  ),
   steps: z
     .object({
       plan_review: z.boolean().optional().describe("Cross-harness review of the plan before coding begins."),
@@ -1444,8 +1632,22 @@ export function omittedHarnessRoleKeys(
 export function omittedHarnessRolesMessage(missing: string[]): string {
   return (
     `${missing.join(" and ")} ${missing.length === 1 ? "is" : "are"} required repository execution policy. ` +
-    ACTIVE_PROFILE_DOES_NOT_FILL_LIVE_WORKERS
+    ACTIVE_PROFILE_DOES_NOT_FILL_LIVE_WORKERS +
+    " Run `pipeline config sync` to add omitted roles from explicit models."
   );
+}
+
+/** True when a diagnostic is the omitted-required-harness-role class (#1264). */
+export function isOmittedHarnessRoleDiagnostic(d: {
+  severity: string;
+  path: string;
+  message: string;
+}): boolean {
+  if (d.severity !== "error") return false;
+  if (d.path !== "harnesses" && d.path !== "harnesses.implementer" && d.path !== "harnesses.reviewer") {
+    return false;
+  }
+  return d.message.includes("required repository execution policy");
 }
 
 export function missingPipelineYmlMessage(configPath: string): string {
@@ -2029,6 +2231,7 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
       enabled: fileConfig.issue_readiness?.enabled ?? DEFAULT_CONFIG.issue_readiness.enabled,
       timeout: fileConfig.issue_readiness?.timeout ?? DEFAULT_CONFIG.issue_readiness.timeout,
     },
+    planning_facts: resolvePlanningFactsConfig(fileConfig.planning_facts),
     steps: {
       plan_review: fileConfig.steps?.plan_review ?? DEFAULT_CONFIG.steps.plan_review,
       standard_review: fileConfig.steps?.standard_review ?? DEFAULT_CONFIG.steps.standard_review,
@@ -2376,6 +2579,9 @@ export function applyTrustedVerificationPolicy(
     timeout: fileConfig.issue_readiness?.timeout ?? DEFAULT_CONFIG.issue_readiness.timeout,
   };
   applied.push("issue_readiness");
+
+  cfg.planning_facts = resolvePlanningFactsConfig(fileConfig.planning_facts);
+  applied.push("planning_facts");
 
   cfg.override_governance = resolveOverrideGovernanceConfig(fileConfig.override_governance);
   applied.push("override_governance");
@@ -2959,6 +3165,8 @@ export interface SyncConfigResult {
   candidate?: string;
   diff?: string;
   diagnostics: Diagnostic[];
+  /** True when sync refused because omitted harness roles could not be inferred (#1264). CLI exits 2. */
+  inferenceFailure?: boolean;
 }
 
 const defaultReadFile = (fp: string): string | null => {
@@ -3465,6 +3673,65 @@ function renderReviewHarnessBlock(reviewHarness: PartialConfig["review_harness"]
   return lines.join("\n");
 }
 
+function renderPlanningFactsTemplateBlock(config: PartialConfig, d: typeof DEFAULT_CONFIG): string {
+  const pf = resolvePlanningFactsConfig(config.planning_facts);
+  const ceilingLines = (commented: boolean): string[] => {
+    const p = commented ? "#   " : "  ";
+    return [
+      `${p}timeout_ms: ${yamlScalar(pf.timeout_ms)} # ${sd("planning_facts.timeout_ms", "per-provider runtime ceiling in milliseconds")}`,
+      `${p}max_stdout_bytes: ${yamlScalar(pf.max_stdout_bytes)} # ${sd("planning_facts.max_stdout_bytes", "per-provider stdout ceiling in bytes")}`,
+      `${p}max_stderr_bytes: ${yamlScalar(pf.max_stderr_bytes)} # ${sd("planning_facts.max_stderr_bytes", "per-provider stderr ceiling in bytes")}`,
+      `${p}max_fact_count: ${yamlScalar(pf.max_fact_count)} # ${sd("planning_facts.max_fact_count", "combined fact-count ceiling")}`,
+      `${p}max_key_chars: ${yamlScalar(pf.max_key_chars)} # ${sd("planning_facts.max_key_chars", "fact-key character ceiling")}`,
+      `${p}max_value_chars: ${yamlScalar(pf.max_value_chars)} # ${sd("planning_facts.max_value_chars", "fact-value character ceiling")}`,
+      `${p}max_prompt_chars: ${yamlScalar(pf.max_prompt_chars)} # ${sd("planning_facts.max_prompt_chars", "total planning-facts prompt contribution ceiling")}`,
+    ];
+  };
+  if (config.planning_facts !== undefined) {
+    const header =
+      "planning_facts: # named planning-fact providers (#1300). Empty providers: no spawn, no prompt section. SECURITY: each executable is spawned from trusted integration-base bytes with a constructed env (no inherited credentials).";
+    if (pf.providers.length === 0) {
+      return [
+        header,
+        "  providers: []",
+        "  # Example:",
+        "  # - id: alembic-head",
+        "  #   executable: scripts/pipeline/planning-facts/alembic-head",
+        "  #   args: []",
+        "  #   required: true",
+        "  #   facts:",
+        "  #     alembic_head: string",
+        ...ceilingLines(false),
+      ].join("\n");
+    }
+    const providerLines = pf.providers.flatMap((p) => {
+      const factLines = Object.entries(p.facts).map(
+        ([k, t]) => `        ${k}: ${t}`,
+      );
+      return [
+        `    - id: ${yamlScalar(p.id)}`,
+        `      executable: ${yamlScalar(p.executable)}`,
+        `      args: ${p.args.length ? yamlInline(p.args) : "[]"}`,
+        `      required: ${yamlScalar(p.required)}`,
+        "      facts:",
+        ...factLines,
+      ];
+    });
+    return [header, "  providers:", ...providerLines, ...ceilingLines(false)].join("\n");
+  }
+  return [
+    "# planning_facts: # named planning-fact providers (#1300). Empty providers (default): no spawn, no planning-facts prompt section. SECURITY: each executable is spawned from trusted integration-base bytes with a constructed env (no inherited credentials).",
+    "#   providers:",
+    "#     - id: alembic-head",
+    "#       executable: scripts/pipeline/planning-facts/alembic-head",
+    "#       args: []",
+    "#       required: true",
+    "#       facts:",
+    "#         alembic_head: string",
+    ...ceilingLines(true),
+  ].join("\n");
+}
+
 function renderMaybeScalar(key: string, value: unknown, comment: string): string {
   return `${key}: ${yamlScalar(value)} # ${comment}`;
 }
@@ -3597,6 +3864,8 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
         `#   enabled: ${yamlScalar(d.issue_readiness.enabled)} # ${sd("issue_readiness.enabled", "when true, evaluate a freshly fetched pipeline:ready issue before worktree or delivery harness")}`,
         `#   timeout: ${yamlScalar(d.issue_readiness.timeout)} # ${sd("issue_readiness.timeout", "seconds for the Implementer planning-treatment admission call")}`,
       ].join("\n"),
+    "",
+    renderPlanningFactsTemplateBlock(config, d),
     "",
     "steps: # turn optional steps off for speed/preference (default: all on)",
     `  plan_review: ${yamlScalar(steps.plan_review)} # ${sd("steps.plan_review", "cross-harness review of the plan before coding")}`,
@@ -4291,6 +4560,7 @@ function normalizeForSync(config: PartialConfig): unknown {
     openspec: { ...d.openspec, ...config.openspec },
     last30days: { ...d.last30days, ...config.last30days },
     issue_readiness: { ...d.issue_readiness, ...config.issue_readiness },
+    planning_facts: resolvePlanningFactsConfig(config.planning_facts),
     steps: { ...d.steps, ...config.steps },
     design_gate: {
       ...d.design_gate,
@@ -4351,6 +4621,7 @@ function normalizeForSync(config: PartialConfig): unknown {
     staged_policies: config.staged_policies,
     repository_control_desired_state: config.repository_control_desired_state,
     git: config.git,
+    harnesses: config.harnesses,
   };
 }
 
@@ -4417,6 +4688,180 @@ function splitTopLevelBlocks(text: string): Map<string, string> {
   }
   flush();
   return blocks;
+}
+
+/** Closed, versioned, migration-only alias table for `config sync` (#1264). */
+export const HARNESS_INFERENCE_ALIAS_TABLE_VERSION = 1 as const;
+
+const IMPLEMENTER_MODEL_KEYS = ["planning", "implementing", "fix", "intake", "sweep"] as const;
+const BUILTIN_REVIEWER_COMMANDS = new Set(["claude", "codex", "grok"]);
+
+export type HarnessInferenceAdapter = "claude" | "codex" | "grok";
+
+/**
+ * Classify an explicit model alias through the migration-only table.
+ * Never consults the host profile or runtime family detectors.
+ */
+export function classifyMigrationModelAlias(raw: string): HarnessInferenceAdapter | null {
+  const value = raw.trim();
+  if (!value || value === "auto") return null;
+  if (value === "sonnet" || value === "opus" || value === "haiku" || value === "claude-fable-5") {
+    return "claude";
+  }
+  if (value.startsWith("claude-")) return "claude";
+  if (value.startsWith("grok-")) return "grok";
+  if (value.startsWith("gpt-")) return "codex";
+  return null;
+}
+
+function classifyExplicitNonAutoAlias(raw: string | undefined): {
+  skip: boolean;
+  family?: HarnessInferenceAdapter;
+  unknown: boolean;
+} {
+  if (raw === undefined) return { skip: true, unknown: false };
+  const value = raw.trim();
+  // Empty/whitespace is explicit unknown evidence, not an absent field.
+  if (value === "auto") return { skip: true, unknown: false };
+  const family = classifyMigrationModelAlias(value);
+  if (family === null) return { skip: false, unknown: true };
+  return { skip: false, family, unknown: false };
+}
+
+function unanimousClassifiedFamily(
+  values: Array<string | undefined>,
+): { family?: HarnessInferenceAdapter; unresolved: boolean } {
+  const classified: HarnessInferenceAdapter[] = [];
+  for (const raw of values) {
+    const result = classifyExplicitNonAutoAlias(raw);
+    if (result.skip) continue;
+    if (result.unknown || result.family === undefined) return { unresolved: true };
+    classified.push(result.family);
+  }
+  if (classified.length === 0) return { unresolved: true };
+  const unique = new Set(classified);
+  if (unique.size !== 1) return { unresolved: true };
+  return { family: classified[0], unresolved: false };
+}
+
+function reviewHarnessCommandOf(config: PartialConfig): string | undefined {
+  const rh = config.review_harness;
+  if (typeof rh === "string") {
+    const trimmed = rh.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+  }
+  if (rh && typeof rh === "object" && typeof rh.command === "string") {
+    const trimmed = rh.command.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+  }
+  return undefined;
+}
+
+function reviewHarnessModelOf(config: PartialConfig): string | undefined {
+  const rh = config.review_harness;
+  if (rh && typeof rh === "object" && typeof rh.model === "string") return rh.model;
+  return undefined;
+}
+
+function inferImplementerAdapter(config: PartialConfig): string | undefined {
+  const models = config.models;
+  const result = unanimousClassifiedFamily(IMPLEMENTER_MODEL_KEYS.map((key) => models?.[key]));
+  return result.unresolved ? undefined : result.family;
+}
+
+function inferReviewerRole(config: PartialConfig): string | undefined {
+  const classified: HarnessInferenceAdapter[] = [];
+  for (const raw of [config.models?.review, reviewHarnessModelOf(config)]) {
+    const result = classifyExplicitNonAutoAlias(raw);
+    if (result.skip) continue;
+    if (result.unknown || result.family === undefined) return undefined;
+    classified.push(result.family);
+  }
+  if (new Set(classified).size > 1) return undefined;
+  const modelFamily = classified[0];
+
+  const command = reviewHarnessCommandOf(config);
+  if (command !== undefined) {
+    if (BUILTIN_REVIEWER_COMMANDS.has(command)) {
+      if (modelFamily !== undefined && modelFamily !== command) return undefined;
+      return command;
+    }
+    if (modelFamily !== undefined) return undefined;
+    return command;
+  }
+  return modelFamily;
+}
+
+export function unresolvedHarnessInferenceMessage(unresolved: string[]): string {
+  return (
+    `Could not infer ${unresolved.join(" and ")} from explicit models: / review_harness evidence. ` +
+    `Set ${unresolved.join(" and ")} in .github/pipeline.yml. ` +
+    `Inference never fills a role from the active profile.`
+  );
+}
+
+/**
+ * Infer omitted required harness roles from explicit models / review_harness.
+ * Declared non-empty roles are preserved. Does not read the host profile.
+ */
+export function inferOmittedHarnessRoles(config: PartialConfig): {
+  implementer?: string;
+  reviewer?: string;
+  unresolved: string[];
+} {
+  const implementer =
+    config.harnesses?.implementer !== undefined
+      ? config.harnesses.implementer
+      : inferImplementerAdapter(config);
+  const reviewer =
+    config.harnesses?.reviewer !== undefined ? config.harnesses.reviewer : inferReviewerRole(config);
+  const unresolved: string[] = [];
+  if (implementer === undefined) unresolved.push("harnesses.implementer");
+  if (reviewer === undefined) unresolved.push("harnesses.reviewer");
+  return { implementer, reviewer, unresolved };
+}
+
+function tryParseValidPartialConfig(text: string): PartialConfig | null {
+  try {
+    return parseValidPartialConfig(text);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Rewrite the named top-level YAML block (active or commented) in place, or
+ * append it when the key is absent. Other top-level blocks stay byte-identical.
+ */
+function replaceOrAppendTopLevelBlock(text: string, key: string, newBlock: string): string {
+  const block = newBlock.replace(/\n+$/, "");
+  const lines = text.split("\n");
+  let start = -1;
+  let end = lines.length;
+  for (let i = 0; i < lines.length; i++) {
+    const k = topLevelKeyOf(lines[i]!);
+    if (start === -1) {
+      if (k === key) start = i;
+    } else if (k !== null) {
+      end = i;
+      break;
+    }
+  }
+  if (start === -1) {
+    const trimmed = text.trimEnd();
+    return trimmed.length === 0 ? `${block}\n` : `${trimmed}\n\n${block}\n`;
+  }
+  while (end > start && (lines[end - 1] ?? "").trim() === "") end--;
+  const beforeText = start === 0 ? "" : `${lines.slice(0, start).join("\n")}\n`;
+  const afterLines = lines.slice(end);
+  while (afterLines.length > 0 && (afterLines[0] ?? "").trim() === "") afterLines.shift();
+  const afterText = afterLines.join("\n").replace(/^\n+/, "");
+  let result = `${beforeText}${block}`;
+  if (afterText.replace(/\n+$/, "").length > 0) {
+    result += `\n\n${afterText.replace(/^\n+/, "")}`;
+  }
+  if (!result.endsWith("\n")) result += "\n";
+  return result;
 }
 
 /**
@@ -4488,11 +4933,44 @@ export function syncConfig(
 
   const validation = validateConfig(gitRoot, deps);
   const blocking = validation.diagnostics.filter((d) => d.severity === "error");
-  if (blocking.length > 0) {
+  const parsedExisting = tryParseValidPartialConfig(current);
+  const omittedRoleOnly =
+    blocking.length > 0 &&
+    blocking.every(isOmittedHarnessRoleDiagnostic) &&
+    parsedExisting !== null;
+
+  let parsed = parsedExisting;
+  let inferredHarnessRoles = false;
+  if (omittedRoleOnly) {
+    const inference = inferOmittedHarnessRoles(parsedExisting);
+    if (inference.unresolved.length > 0 || inference.implementer === undefined || inference.reviewer === undefined) {
+      return {
+        ok: false,
+        changed: false,
+        applied: false,
+        inferenceFailure: true,
+        configPath,
+        diagnostics: [
+          {
+            severity: "error",
+            path: inference.unresolved.length === 1 ? inference.unresolved[0]! : "harnesses",
+            message: unresolvedHarnessInferenceMessage(inference.unresolved),
+          },
+        ],
+      };
+    }
+    parsed = {
+      ...parsedExisting,
+      harnesses: {
+        implementer: inference.implementer,
+        reviewer: inference.reviewer,
+      },
+    };
+    inferredHarnessRoles = true;
+  } else if (blocking.length > 0) {
     return { ok: false, changed: false, applied: false, configPath, diagnostics: validation.diagnostics };
   }
 
-  const parsed = parseValidPartialConfig(current);
   if (!parsed) {
     return { ok: false, changed: false, applied: false, configPath, diagnostics: validation.diagnostics };
   }
@@ -4537,7 +5015,14 @@ export function syncConfig(
     }
   }
 
-  const candidate = buildSyncCandidate(current, freshRender);
+  let mergeBase = current;
+  if (inferredHarnessRoles) {
+    const harnessesBlock = splitTopLevelBlocks(freshRender).get("harnesses");
+    if (harnessesBlock) {
+      mergeBase = replaceOrAppendTopLevelBlock(current, "harnesses", harnessesBlock);
+    }
+  }
+  const candidate = buildSyncCandidate(mergeBase, freshRender);
   const candidateValidation = validateConfig(gitRoot, {
     ...deps,
     readFile: (p) => (path.resolve(p) === path.resolve(configPath) ? candidate : readFileFn(p)),

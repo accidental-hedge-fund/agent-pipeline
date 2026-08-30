@@ -38,6 +38,12 @@ import {
 } from "../factory-reliability-gate.ts";
 import { FRG_HYBRID_PILOT_VERSION } from "../frg-pack-observations.ts";
 import {
+  livenessStatusFromUnknown,
+  probePackLoopLiveness,
+  type PackLoopLivenessStatus,
+} from "../loop/pack-loop-liveness.ts";
+import { defaultLoopStoreDeps } from "../loop/store.ts";
+import {
   FACTORY_RELEASE_REQUEST_KIND,
   factoryReleaseVersionIndexPath,
   isPostPilotReleaseVersion,
@@ -54,7 +60,6 @@ import {
   withRecordedAttempt,
   type ShipReleaseCheckWaitDeps,
 } from "./ship-release-check-wait.ts";
-import { resolveStateHome } from "../loop/store.ts";
 import { LOOP_LEDGER_SCHEMA } from "../loop/types.ts";
 import type { CheckRun, PipelineConfig } from "../types.ts";
 import {
@@ -1116,7 +1121,7 @@ function realShipAdapterOperations(opts: RealShipCoordinatorDepsOptions): ShipAd
   };
 }
 
-export type BoundPackLoopLiveness = "live" | "not-live" | "unknown";
+export type BoundPackLoopLiveness = "live" | "not-live" | "unknown" | "failed";
 
 export interface CandidateShipEndContext {
   pinCommitSha: string | null;
@@ -1248,26 +1253,86 @@ function prepareLoopRunId(parsed: Record<string, unknown> | null): string {
   return "";
 }
 
+function prepareUnsignedFrgRunId(parsed: Record<string, unknown> | null): string {
+  if (!parsed) return "";
+  const frg = parsed.frg;
+  if (frg && typeof frg === "object" && !Array.isArray(frg)) {
+    const id = (frg as { frg_run_id?: unknown }).frg_run_id;
+    if (typeof id === "string") return id.trim();
+  }
+  return "";
+}
+
+function prepareObserveMiss(parsed: Record<string, unknown> | null): {
+  reason: string;
+  expected_frg_run_id: string;
+  observed_run_id: string | null;
+} {
+  const miss = parsed?.observe_miss;
+  if (miss && typeof miss === "object" && !Array.isArray(miss)) {
+    const rec = miss as {
+      reason?: unknown;
+      expected_frg_run_id?: unknown;
+      observed_run_id?: unknown;
+    };
+    return {
+      reason: typeof rec.reason === "string" && rec.reason.trim() !== "" ? rec.reason : "rejected",
+      expected_frg_run_id:
+        typeof rec.expected_frg_run_id === "string" ? rec.expected_frg_run_id : "",
+      observed_run_id: typeof rec.observed_run_id === "string" ? rec.observed_run_id : null,
+    };
+  }
+  return {
+    reason: "awaiting_frg_attestation",
+    expected_frg_run_id: prepareUnsignedFrgRunId(parsed),
+    observed_run_id: null,
+  };
+}
+
+function attestCheckpointKey(parsed: Record<string, unknown> | null, loopRunId: string): string {
+  return prepareUnsignedFrgRunId(parsed) || loopRunId;
+}
+
+function frgPackAttestFailMessage(
+  unsignedA: string,
+  observedB: string | null,
+  reason: string,
+): string {
+  const a = unsignedA.trim() !== "" ? unsignedA : "unknown";
+  const b = observedB && observedB.trim() !== "" ? observedB : "none";
+  return (
+    `ship FRG: attestation observe failed after one factory-gate spawn ` +
+    `(unsigned_frg_run_id=${a} observed_run_id=${b} reason=${reason})`
+  );
+}
+
 export type FrgPackWaitDecision = "continue" | "fail";
 
 function waitLivenessContinues(live: boolean | BoundPackLoopLiveness): boolean {
-  return live !== false && live !== "not-live";
+  return live === true || live === "live" || live === "unknown";
 }
 
 function normalizeBoundPackLoopLiveness(
   raw: boolean | BoundPackLoopLiveness,
 ): BoundPackLoopLiveness {
-  if (raw === "live" || raw === "not-live" || raw === "unknown") return raw;
+  if (raw === "live" || raw === "not-live" || raw === "unknown" || raw === "failed") return raw;
   return raw ? "live" : "not-live";
 }
 
-/** retry + live or unknown continues even when attempt == cap. Cap applies only when not-live. */
+/**
+ * retry + live or unknown continues even when attempt == cap. Cap applies only when not-live.
+ * attest continues only while this complete checkpoint binding has received zero attestor spawns.
+ */
 export function classifyFrgPackWaitDecision(input: {
   tick: CandidatePrepareTick;
   live: boolean | BoundPackLoopLiveness;
   attempt: number;
   cap: number;
+  attestAllowanceSpent?: boolean;
 }): FrgPackWaitDecision {
+  if (input.tick === "attest") {
+    return input.attestAllowanceSpent ? "fail" : "continue";
+  }
   if (input.tick !== "retry") return "continue";
   if (waitLivenessContinues(input.live)) return "continue";
   if (Number.isInteger(input.attempt) && Number.isInteger(input.cap) && input.attempt < input.cap) {
@@ -1277,31 +1342,38 @@ export function classifyFrgPackWaitDecision(input: {
 }
 
 /**
- * Live when lock pid is alive OR ledger is present and not terminal.
- * Unknown when lock or ledger state is unreadable or malformed and neither
- * signal positively proves live. Not-live only after a dead-or-missing pid
- * and a terminal-or-missing ledger.
+ * Thin mapper over {@link PackLoopLivenessStatus}. A non-terminal ledger is
+ * not liveness proof. Dead pid plus open ledger is not live.
  */
 export function classifyBoundPackLoopLiveness(input: {
-  lockPidAlive: boolean;
+  status?: BoundPackLoopLiveness;
+  lockPidAlive?: boolean;
   lockUnreadable?: boolean;
-  ledgerPresent: boolean;
-  ledgerStopPresent: boolean;
+  ledgerPresent?: boolean;
+  ledgerStopPresent?: boolean;
   ledgerUnreadable?: boolean;
-  eventsTerminal: boolean;
+  eventsTerminal?: boolean;
+  handoffPresent?: boolean;
+  heartbeatFresh?: boolean;
+  pidMatches?: boolean;
 }): BoundPackLoopLiveness {
-  if (input.lockPidAlive) return "live";
-  if (input.ledgerPresent && !input.ledgerStopPresent && !input.eventsTerminal) return "live";
+  if (input.status) return input.status;
   if (input.lockUnreadable || input.ledgerUnreadable) return "unknown";
+  if (input.handoffPresent && input.lockPidAlive && input.pidMatches !== false && input.heartbeatFresh) {
+    return "live";
+  }
   return "not-live";
 }
 
-/** Live when lock pid is alive OR ledger is present and not terminal. */
+/** Live only after acknowledged-process identity plus a fresh heartbeat. */
 export function boundPackLoopIsLive(input: {
   lockPidAlive: boolean;
   ledgerPresent: boolean;
   ledgerStopPresent: boolean;
   eventsTerminal: boolean;
+  handoffPresent?: boolean;
+  heartbeatFresh?: boolean;
+  pidMatches?: boolean;
 }): boolean {
   return classifyBoundPackLoopLiveness(input) === "live";
 }
@@ -1430,6 +1502,9 @@ export async function probeBoundPackLoopLive(
     env?: NodeJS.ProcessEnv;
     isPidAlive?: (pid: number) => Promise<boolean> | boolean;
     readTextFile?: (p: string) => Promise<string | null> | string | null;
+    now?: () => Date;
+    observationDeadline?: string | null;
+    candidateSha?: string | null;
   } = {},
 ): Promise<BoundPackLoopLiveness> {
   const id = loopRunId.trim();
@@ -1437,70 +1512,43 @@ export async function probeBoundPackLoopLive(
     return "not-live";
   }
   const env = opts.env ?? process.env;
-  const home = resolveStateHome({ env, hostname: () => "unused" });
-  const runDir = path.join(home, "runs", id);
-  const lock = await resolveTextFile(path.join(runDir, "lock.json"), opts.readTextFile);
-  let lockPidAlive = false;
-  let lockUnreadable = lock.status === "unreadable";
-  if (lock.status === "ok") {
-    try {
-      const parsed = JSON.parse(lock.text) as { pid?: unknown };
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-        lockUnreadable = true;
-      } else {
-        const pid = parseLockPidField(parsed.pid);
-        if (pid === null) {
-          lockUnreadable = true;
-        } else {
+  const store = defaultLoopStoreDeps(env);
+  const status = await probePackLoopLiveness(id, {
+    store: {
+      ...store,
+      readTextFile: async (p) => {
+        if (typeof opts.readTextFile === "function") {
           try {
-            lockPidAlive = Boolean(await (opts.isPidAlive ?? defaultIsPidAlive)(pid));
-          } catch {
-            lockUnreadable = true;
+            const text = await opts.readTextFile(p);
+            return text;
+          } catch (err) {
+            if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+            throw err;
           }
         }
-      }
-    } catch {
-      lockUnreadable = true;
-    }
-  }
-  const ledger = await resolveTextFile(path.join(runDir, "ledger.json"), opts.readTextFile);
-  let ledgerPresent = false;
-  let ledgerStopPresent = false;
-  let ledgerUnreadable = ledger.status === "unreadable";
-  if (ledger.status === "ok") {
-    if (!ledger.text.trim()) {
-      ledgerUnreadable = true;
-    } else {
-      try {
-        const parsed: unknown = JSON.parse(ledger.text);
-        const stopKind = parseDurableLedger(parsed, id);
-        if (stopKind === "invalid") {
-          ledgerUnreadable = true;
-        } else {
-          ledgerPresent = true;
-          ledgerStopPresent = stopKind === "stop";
-        }
-      } catch {
-        ledgerUnreadable = true;
-      }
-    }
-  }
-  const events = await resolveTextFile(path.join(runDir, "events.jsonl"), opts.readTextFile);
-  const eventsTerminal = events.status === "ok" ? eventsAreTerminal(events.text) : false;
-  return classifyBoundPackLoopLiveness({
-    lockPidAlive,
-    lockUnreadable,
-    ledgerPresent,
-    ledgerStopPresent,
-    ledgerUnreadable,
-    eventsTerminal,
+        return store.readTextFile(p);
+      },
+    },
+    now: opts.now,
+    isPidAlive: opts.isPidAlive,
+    observationDeadline: opts.observationDeadline,
+    candidateSha: opts.candidateSha,
   });
+  return status.status;
+}
+
+function livenessFromPrepareJson(parsed: Record<string, unknown> | null): PackLoopLivenessStatus | null {
+  if (!parsed) return null;
+  return livenessStatusFromUnknown(parsed.liveness);
 }
 
 async function boundPackLoopLiveForWait(
   ctx: CandidateShipEndContext,
   loopRunId: string,
+  parsed: Record<string, unknown> | null = null,
 ): Promise<BoundPackLoopLiveness> {
+  const fromJson = livenessFromPrepareJson(parsed);
+  if (fromJson) return fromJson.status;
   if (typeof ctx.isBoundPackLoopLive === "function") {
     return normalizeBoundPackLoopLiveness(await ctx.isBoundPackLoopLive(loopRunId));
   }
@@ -1834,6 +1882,7 @@ export function bindCandidateShipEndOperations(
       const requestPath = await resolveCandidateFactoryReleaseRequestPath(ctx, intent, train);
       const attempts = ctx.frgWaitAttempts ?? FRG_WAIT_ATTEMPTS;
       let attempt = 0;
+      let attestedCheckpointKey: string | null = null;
       for (;;) {
         attempt += 1;
         const prep = await spawnLeaf(
@@ -1850,6 +1899,25 @@ export function bindCandidateShipEndOperations(
           if (!loopRunId) {
             throw new Error("ship FRG: candidate factory-release prepare is eligible but missing loop_run_id");
           }
+          const checkpointKey = attestCheckpointKey(parsed, loopRunId);
+          const spent = attestedCheckpointKey !== null && attestedCheckpointKey === checkpointKey;
+          const decision = classifyFrgPackWaitDecision({
+            tick: "attest",
+            live: false,
+            attempt,
+            cap: attempts,
+            attestAllowanceSpent: spent,
+          });
+          if (decision === "fail") {
+            const miss = prepareObserveMiss(parsed);
+            throw new Error(
+              frgPackAttestFailMessage(
+                miss.expected_frg_run_id || prepareUnsignedFrgRunId(parsed) || checkpointKey,
+                miss.observed_run_id,
+                miss.reason,
+              ),
+            );
+          }
           const gate = await spawnLeaf(
             ctx,
             engine,
@@ -1861,13 +1929,13 @@ export function bindCandidateShipEndOperations(
               `ship FRG: candidate factory-gate failed (exit ${gate.code}): ${gate.stderr || gate.stdout}`,
             );
           }
-          // Re-invoke the same request-bound prepare until it proves complete.
-          // Do not return at the attestation checkpoint (#1151).
+          attestedCheckpointKey = checkpointKey;
+          // Re-invoke the same request-bound prepare once. Do not spawn again for A.
           continue;
         }
         if (verdict === "retry") {
           const loopRunId = prepareLoopRunId(parsed);
-          const live = await boundPackLoopLiveForWait(ctx, loopRunId);
+          const live = await boundPackLoopLiveForWait(ctx, loopRunId, parsed);
           const decision = classifyFrgPackWaitDecision({
             tick: "retry",
             live,
@@ -1875,9 +1943,15 @@ export function bindCandidateShipEndOperations(
             cap: attempts,
           });
           if (decision === "fail") {
+            const fromJson = livenessFromPrepareJson(parsed);
+            const diagnostic =
+              (typeof parsed?.message === "string" && parsed.message) ||
+              fromJson?.stderr_evidence_path ||
+              "";
             throw new Error(
-              `ship FRG: candidate factory-release prepare did not reach complete after ${attempts} ticks; ` +
-                "retry the same ship command to resume the bound pack",
+              `ship FRG: candidate factory-release prepare did not reach complete after ${attempts} ticks` +
+                (diagnostic ? `: ${diagnostic}` : "") +
+                "; retry the same ship command to resume the bound pack",
             );
           }
           if (typeof ctx.onFrgWaitTick === "function") {
@@ -1886,8 +1960,12 @@ export function bindCandidateShipEndOperations(
           await delayMs(ctx, FRG_WAIT_MS);
           continue;
         }
+        const failMsg =
+          (typeof parsed?.message === "string" && parsed.message) ||
+          prep.stderr ||
+          prep.stdout;
         throw new Error(
-          `ship FRG: candidate factory-release prepare failed (exit ${prep.code}): ${prep.stderr || prep.stdout}`,
+          `ship FRG: candidate factory-release prepare failed (exit ${prep.code}): ${failMsg}`,
         );
       }
     },

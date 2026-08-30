@@ -219,7 +219,9 @@ The starter structure used by config sync SHALL be the same current structure us
 `pipeline init` creates a new `.github/pipeline.yml`, so `config sync` SHALL introduce
 newly-added commented options and refreshed guidance into an existing config while preserving the
 operator's explicitly set values and unrelated comments/formatting. Config sync SHALL refuse to
-write when the re-rendered candidate would change effective configuration. The init command SHALL
+write when the re-rendered candidate would change effective configuration, except that adding
+inferred omitted `harnesses.implementer` and/or `harnesses.reviewer` values as specified by
+`config-sync-harness-inference` SHALL be allowed. The init command SHALL
 continue to preserve existing config files without modifying them.
 
 #### Scenario: Sync baseline follows init scaffold
@@ -235,8 +237,15 @@ continue to preserve existing config files without modifying them.
 
 #### Scenario: Sync refuses to change effective configuration
 
-- **WHEN** `config sync` re-renders an existing config and the candidate would change the effective configuration
+- **WHEN** `config sync` re-renders an existing config and the candidate would change the effective configuration other than adding inferred omitted harness roles
 - **THEN** config sync SHALL refuse to write the candidate and report the condition
+
+#### Scenario: Sync may add inferred omitted harness roles
+
+- **WHEN** `config sync` is applied to a file whose only errors are omitted required harness roles
+- **AND** inference succeeds
+- **THEN** config sync SHALL be allowed to write the inferred roles
+- **AND** it SHALL NOT treat that addition as a refused effective-configuration change
 
 #### Scenario: Init still skips existing config
 

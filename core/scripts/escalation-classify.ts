@@ -9,6 +9,7 @@ import {
   isClaudeModelEntitlementFailure,
   classifyReviewerHarnessFailure,
 } from "./model-entitlement.ts";
+import { isProviderEnvironmentAuth, type ProviderAuthStatus } from "./provider-auth-status.ts";
 import {
   projectPipelineReasonCode,
   type StageDiagnosticReasonCode,
@@ -33,6 +34,8 @@ export interface HarnessFailureSignals {
   stderr?: string;
   exit_code?: number;
   success?: boolean;
+  preflight_reason_code?: HarnessResult["preflight_reason_code"] | string | null;
+  provider_auth_status?: ProviderAuthStatus | null;
 }
 
 /**
@@ -54,6 +57,8 @@ export function classifyHarnessFailure(
     stderr?: string;
     exit_code?: number;
     success?: boolean;
+    preflight_reason_code?: HarnessResult["preflight_reason_code"] | string | null;
+    provider_auth_status?: ProviderAuthStatus | null;
   },
 ): StageDiagnosticReasonCode {
   // Entitlement text wins over bare throttled so zero-token Fable 429s stay typed.
@@ -65,6 +70,19 @@ export function classifyHarnessFailure(
     )
   ) {
     return "model-entitlement-required";
+  }
+  // Provider credential failure is environment-auth, not harness-contract
+  // (#1265). Honor typed preflight reason, structured provider status, and
+  // allowlisted JSON codes before spawn_error / non-zero-exit mapping.
+  if (
+    isProviderEnvironmentAuth({
+      preflight_reason_code: (result as { preflight_reason_code?: string | null }).preflight_reason_code,
+      provider_auth_status: (result as { provider_auth_status?: ProviderAuthStatus | null }).provider_auth_status,
+      stdout: (result as { stdout?: string }).stdout,
+      stderr: (result as { stderr?: string }).stderr,
+    })
+  ) {
+    return "environment-auth";
   }
   if (result.throttled) return "transient-infra";
   if ((result as HarnessFailureSignals).background_wait) return "harness-background-wait";

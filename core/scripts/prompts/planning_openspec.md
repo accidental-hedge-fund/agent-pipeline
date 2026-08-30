@@ -6,7 +6,7 @@ You are a senior engineer authoring an OpenSpec change proposal for {{domain_nam
 
 {{body}}{{context_snapshot}}
 
-{{carry_forward_context}}{{cross_repo_context}}
+{{carry_forward_context}}{{cross_repo_context}}{{planning_facts}}
 
 ## Task
 
@@ -29,4 +29,5 @@ This repo uses **OpenSpec** (spec-driven development). Create a new OpenSpec cha
 ## Important
 - Capture INTENT (requirements / behavior), not code. No application code changes in this step.
 - Create exactly ONE change for this issue. Keep it focused on the issue scope.
+- Prefer the first holding rung of the reuse ladder after reading in-scope code, so the plan or OpenSpec proposal/design does not invent a custom layer the implementer then has to build.
 - If the issue is genuinely too ambiguous to spec, say so clearly in your final output instead of guessing.

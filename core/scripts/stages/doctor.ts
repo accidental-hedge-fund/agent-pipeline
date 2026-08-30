@@ -146,6 +146,8 @@ export interface CheckResult {
   detail: string;
   /** Actionable remediation text — required when status is "fail" or "warn". */
   remediation?: string;
+  /** Optional evidence locator (path + digest) for harness-smoke failures. */
+  evidence?: { path: string; content_hash: string };
 }
 
 export interface CheckOutcome extends CheckResult {
@@ -537,10 +539,15 @@ export function buildPreflightChecks(
       });
     checks.push({
       id: `harness:${bin}`,
-      description: `Configured harness \`${bin}\` is installed and authenticated`,
+      description:
+        adapter.declaration.origin === "compatibility"
+          ? `Configured harness \`${bin}\` is installed`
+          : `Configured harness \`${bin}\` is installed and has credentials or login-status present`,
       run: async (deps) => {
         // Prefer full preflight for registered adapters; smoke for a quick
         // PATH check is available on every adapter for cheap readiness.
+        // Default doctor is model-free: this is credentials / login-status
+        // present, not a live authentication probe (#1265).
         const result =
           adapter.declaration.origin === "compatibility"
             ? await adapter.runtimeSmoke(deps)
@@ -549,7 +556,7 @@ export function buildPreflightChecks(
           const suffix =
             adapter.declaration.origin === "compatibility"
               ? "is available"
-              : "is available and authenticated";
+              : "is available and credentials or login-status are present";
           return pass(`\`${bin}\` ${suffix}`);
         }
         const remediation =
@@ -1376,6 +1383,8 @@ export interface DoctorJsonCheck {
   ok: boolean;
   reason: string;
   fix: string;
+  /** Present when a harness-smoke assertion failure captured a typed artifact. */
+  evidence?: { path: string; content_hash: string };
 }
 
 export interface DoctorJsonEnvelope {
@@ -1401,6 +1410,7 @@ export function formatDoctorJson(result: PreflightResult): DoctorJsonEnvelope {
       ok: c.status !== "fail",
       reason: c.detail,
       fix: c.status === "fail" || c.status === "warn" ? (c.remediation ?? "") : "",
+      ...(c.evidence ? { evidence: c.evidence } : {}),
     })),
   };
 }

@@ -2,7 +2,7 @@
 
 **agent-pipeline** is a label-driven GitHub issue pipeline that advances an issue from backlog to `pipeline:ready-to-deploy` through a 18-stage state machine — backlog → needs-spec → ready → planning → plan-review → pre-code-attestation → implementing → design-gate → review-1 → fix-1 → review-2 → fix-2 → pre-merge → visual-gate → eval-gate → shipcheck-gate → ready-to-deploy, with `needs-human` as the terminal park off-ramp. The ordinary advance path does **not** merge. An operator must authorize a separate merge command.
 
-The product is the `pipeline` CLI. Hosts are argv wrappers that exec it. A runnable repository declares an **implementer/reviewer pair** in `.github/pipeline.yml`. `pipeline init` writes a starter pair from the active profile; after that write, those values are repository policy. The invoking host profile does not select live workers. Core prerequisites: Node ≥ 24, `git`, `gh`, and the configured harness CLIs authenticated. Packaging contract: [docs/packaging.md](docs/packaging.md).
+The product is the `pipeline` CLI. Hosts are argv wrappers that exec it. A runnable repository declares an **implementer/reviewer pair** in `.github/pipeline.yml`. `pipeline init` writes a starter pair from the active profile; after that write, those values are repository policy. The invoking host profile does not select live workers. An existing file that omits those keys can be migrated with `pipeline config sync`. Core prerequisites: Node ≥ 24, `git`, `gh`, and the configured harness CLIs authenticated. Packaging contract: [docs/packaging.md](docs/packaging.md).
 
 ## Lifecycle
 

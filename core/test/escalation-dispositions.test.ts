@@ -35,6 +35,7 @@ import {
   validateFixCommitSubject,
 } from "../scripts/transient-wrappers.ts";
 import { DURABLE_BLOCKER_CLASSES, isDurableBlockerClass } from "../scripts/loop/types.ts";
+import { DEFAULT_RECOVERY_POLICY } from "../scripts/loop/recovery.ts";
 import type { BlockerKind } from "../scripts/types.ts";
 
 /** Mirror of pipeline-run.isHumanAuthorityBlocker — kept local so this suite
@@ -198,6 +199,73 @@ test("capture_error / oversize_argv map to harness-contract", () => {
     classifyHarnessFailure({ oversize_argv: true, spawn_error: true, timed_out: false }),
     "harness-contract",
   );
+});
+
+test("preflight_reason_code environment-auth projects to environment-auth, not harness-contract", () => {
+  const code = classifyHarnessFailure({
+    spawn_error: true,
+    code: -1,
+    preflight_reason_code: "environment-auth",
+    stdout: "",
+    stderr: "",
+  });
+  assert.equal(code, "environment-auth");
+  assert.notEqual(code, "harness-contract");
+  assert.notEqual(code, "workflow-engine-defect");
+  const proj = projectPipelineReasonCode(code);
+  assert.equal(proj.blockerClass, "environment-auth");
+  assert.equal(proj.disposition, "recover");
+  assert.deepEqual(DEFAULT_RECOVERY_POLICY["environment-auth"].recipes, ["verify_authentication"]);
+});
+
+test("revoked refresh token JSON marker themes environment-auth", () => {
+  const stderr = [
+    "ERROR codex_login::auth::manager: Failed to refresh token: 401 Unauthorized: {",
+    '  "error": { "message": "Your session has ended. Please log in again.",',
+    '             "code": "refresh_token_invalidated" } }',
+  ].join("\n");
+  const code = classifyHarnessFailure({
+    code: 1,
+    stdout: "",
+    stderr,
+  });
+  assert.equal(code, "environment-auth");
+  assert.equal(durableClassForReasonCode(code), "environment-auth");
+  assert.equal(projectPipelineReasonCode(code).blockerClass, "environment-auth");
+});
+
+test("structured provider status 401 on the status object is environment-auth", () => {
+  const code = classifyHarnessFailure({
+    code: 1,
+    stdout: "",
+    stderr: "",
+    provider_auth_status: { session: "invalidated", http_status: 401 },
+  });
+  assert.equal(code, "environment-auth");
+});
+
+test("unallowlisted please log in prose is not environment-auth", () => {
+  const code = classifyHarnessFailure({
+    code: 1,
+    stdout: "",
+    stderr: "please log in",
+  });
+  assert.equal(code, "harness-contract");
+  assert.notEqual(code, "environment-auth");
+});
+
+test("DurableBlockerClass gains no new auth-specific theme token", () => {
+  assert.deepEqual([...DURABLE_BLOCKER_CLASSES], [
+    "transient-rate-limit",
+    "workflow-state",
+    "implementation-ci",
+    "review-findings",
+    "environment-auth",
+    "specification-decision",
+    "missing-authority",
+    "upstream-dependency",
+    "workflow-engine-defect",
+  ]);
 });
 
 test("gh HTTP 504 classifies as transient-infra", () => {
