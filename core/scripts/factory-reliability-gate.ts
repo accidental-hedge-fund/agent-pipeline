@@ -444,6 +444,34 @@ export function newFrgRunId(now: () => Date = () => new Date()): string {
   return `frg-${iso}-${suffix}`;
 }
 
+/** Domain separator for attested from-run identity B. Distinct from unsigned A (`frg-` + 24 hex). */
+export const FRG_ATTESTOR_RUN_ID_DOMAIN = "pipeline.factory-gate.attestor-run-id.v1";
+export const FRG_ATTESTOR_RUN_ID_PREFIX = "frg-attested-";
+
+/**
+ * Deterministic attestor `run_id` B for a complete unsigned checkpoint binding.
+ * Reprocessing unchanged A remints the same B. A changed binding remints B' ≠ B.
+ * Never uses {@link newFrgRunId} (timestamp + random).
+ */
+export function computeAttestorRunId(binding: unknown): string {
+  const digest = crypto
+    .createHash("sha256")
+    .update(FRG_ATTESTOR_RUN_ID_DOMAIN, "utf8")
+    .update("\0")
+    .update(frgCanonicalJson(binding), "utf8")
+    .digest("hex");
+  return `${FRG_ATTESTOR_RUN_ID_PREFIX}${digest.slice(0, 24)}`;
+}
+
+export type ShipPathFromRunResolution =
+  | { kind: "standalone" }
+  | {
+      kind: "bound";
+      binding: unknown;
+      unsigned_frg_run_id: string;
+    }
+  | { kind: "fail"; message: string };
+
 /**
  * Engine-class rate with item_count denominator (#757).
  * Returns null only when item_count === 0 (empty pack never release-eligible).
@@ -4112,6 +4140,18 @@ export interface FactoryGateOpts {
    * Forwarded to hybrid-v2 collect. CLI `--from-run` omits this.
    */
   requestCandidateGitSha?: string;
+  /**
+   * Ship-path unsigned checkpoint for credentialed `--from-run`.
+   * Production default loads version index + prepare checkpoint + loop binding.
+   * Tests inject this seam — no real filesystem.
+   */
+  resolveShipPathFromRun?: (args: {
+    version: string;
+    fromRun: string;
+    repoDir: string;
+    requestCandidateGitSha?: string;
+    readFile: (p: string) => Promise<string>;
+  }) => Promise<ShipPathFromRunResolution>;
   thresholds?: FrgThresholds;
   now?: () => Date;
   /**
@@ -4139,6 +4179,109 @@ export interface FactoryGateResult {
   exitCode: number;
   /** Post-pass pack close summary, or null when close did not run. */
   packClose: FrgPackCloseResult | null;
+}
+
+function factoryReleaseBindingCandidateGitSha(binding: unknown): string | null {
+  if (binding === null || typeof binding !== "object" || Array.isArray(binding)) {
+    return null;
+  }
+  const sha = (binding as { candidate_git_sha?: unknown }).candidate_git_sha;
+  if (typeof sha !== "string") return null;
+  const normalized = sha.toLowerCase();
+  return GIT_SHA_RE.test(normalized) ? normalized : null;
+}
+
+function scoredCandidateIdentities(
+  provenance: FrgPackProvenance | null | undefined,
+): Array<{ field: string; sha: string }> {
+  if (!provenance) return [];
+  const out: Array<{ field: string; sha: string }> = [];
+  if (typeof provenance.candidate_git_sha === "string" && provenance.candidate_git_sha !== "") {
+    out.push({
+      field: "pack_provenance.candidate_git_sha",
+      sha: provenance.candidate_git_sha,
+    });
+  }
+  for (const [index, probe] of (provenance.probes ?? []).entries()) {
+    if (typeof probe.candidate_git_sha === "string" && probe.candidate_git_sha !== "") {
+      out.push({
+        field: `pack_provenance.probes[${index}].candidate_git_sha`,
+        sha: probe.candidate_git_sha,
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * Fail closed before HMAC when the scored pack (provenance + Layer A probes)
+ * names a different candidate than the checkpoint binding.
+ */
+function assertScoredCandidateMatchesBinding(
+  computeInput: ComputeFrgInput,
+  binding: unknown,
+): void {
+  const boundSha = factoryReleaseBindingCandidateGitSha(binding);
+  if (!boundSha) {
+    throw new Error(
+      "pipeline factory-gate: factory_release_binding.candidate_git_sha is missing or invalid; refusing HMAC latest.json",
+    );
+  }
+  for (const scored of scoredCandidateIdentities(computeInput.pack_provenance)) {
+    if (scored.sha.toLowerCase() !== boundSha) {
+      throw new Error(
+        `pipeline factory-gate: scored ${scored.field}=${scored.sha} does not match factory_release_binding.candidate_git_sha=${boundSha}; refusing HMAC latest.json`,
+      );
+    }
+  }
+}
+
+async function attachShipPathFromRunBinding(
+  opts: FactoryGateOpts,
+  computeInput: ComputeFrgInput,
+  fsDeps: FrgFsDeps,
+): Promise<ComputeFrgInput> {
+  const fromRun = opts.fromRun;
+  if (!fromRun) return computeInput;
+  const resolve =
+    opts.resolveShipPathFromRun ??
+    (async (args) => {
+      const { defaultResolveShipPathFromRun } = await import("./factory-release-prepare.ts");
+      return defaultResolveShipPathFromRun(args);
+    });
+  const resolution = await resolve({
+    version: computeInput.version,
+    fromRun,
+    repoDir: opts.repoDir,
+    requestCandidateGitSha: opts.requestCandidateGitSha,
+    readFile: (p) => fsDeps.readFile(p),
+  });
+  const willWriteHmac = Boolean(
+    computeInput.attestation_key &&
+      typeof computeInput.loop_run_id === "string" &&
+      computeInput.loop_run_id.trim() !== "" &&
+      typeof computeInput.pack_id === "string" &&
+      computeInput.pack_id.trim() !== "",
+  );
+  if (resolution.kind === "fail") {
+    if (willWriteHmac) throw new Error(resolution.message);
+    return computeInput;
+  }
+  if (resolution.kind !== "bound") {
+    return computeInput;
+  }
+  const attestorRunId = computeAttestorRunId(resolution.binding);
+  if (attestorRunId === resolution.unsigned_frg_run_id) {
+    throw new Error(
+      "pipeline factory-gate: attestor run_id B collided with unsigned frg_run_id A; refusing to collapse identities",
+    );
+  }
+  assertScoredCandidateMatchesBinding(computeInput, resolution.binding);
+  return {
+    ...computeInput,
+    run_id: attestorRunId,
+    factory_release_binding: resolution.binding,
+  };
 }
 
 /**
@@ -4428,6 +4571,10 @@ export async function runFactoryGate(
       `pipeline factory-gate: v${version} requires ${FRG_HYBRID_V2_POLICY_ID} ` +
         `pack provenance; missing provenance is not release evidence`,
     );
+  }
+
+  if (opts.fromRun) {
+    computeInput = await attachShipPathFromRunBinding(opts, computeInput, fsDeps);
   }
 
   const evidence = computeFrgEvidence(computeInput);

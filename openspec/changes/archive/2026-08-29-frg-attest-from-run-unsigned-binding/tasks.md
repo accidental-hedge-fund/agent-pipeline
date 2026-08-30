@@ -1,0 +1,29 @@
+## 1. Bite tests that fail on today's handoff
+
+- [x] 1.1 Add a unit test that builds unsigned checkpoint `A`, persists a real-shaped HMAC `--from-run` `latest.json` with `run_id=B`, `pack_provenance`, and **no** `factory_release_binding`, then calls production `defaultObserveAttestation`; verify the test fails on today's code if that payload is treated as success (today: `pack_provenance != null` returns null, which is also not success — assert the typed **rejected** miss reason once observe is typed; until then assert not-accepted and that a sibling with matching top-level binding is also not-accepted solely because `run_id !== A` / `pack_provenance`). Inject I/O; no real git, network, or subprocess.
+- [x] 1.2 Add a unit test that `runFrgPack` keeps receiving prepare `awaiting_frg_attestation` after factory-gate exit 0; verify the test fails on today's `"attest"` → spawn → `continue` because the loop never terminates (watchdog: finite spawn budget or assertion that the promise settles). Inject spawn/prepare. Do not mock the next prepare as magically `complete`.
+- [x] 1.3 Rewrite `candidate FRG pack re-invokes the same prepare request after factory-gate until complete` so factory-gate writes a real-shaped `--from-run` payload and the next prepare `complete` is a consequence of accepted observe of that payload; verify the rewritten test fails on today's observe (`A≠B` + `pack_provenance` miss) instead of passing via a no-op gate.
+
+## 2. Credentialed from-run writer
+
+- [x] 2.1 Add a deterministic attestor `run_id` helper (domain-separated SHA-256 of the canonical complete checkpoint binding) and verify unchanged binding remints the same `B` and a changed binding remints `B' ≠ B`. Verify `B` is distinct from unsigned `A`. Do not use `newFrgRunId()` timestamp+random on the ship-path.
+- [x] 2.2 On ship-path `factory-gate --from-run` / `runFactoryGate`, load the closed unsigned checkpoint (version index + prepare checkpoint store + loop `factory-release-binding.json` candidate SHA). Build `factory_release_binding` with the existing unsigned-digest shape, set `run_id=B`, attach the binding on the evidence object, **then** HMAC. Verify a unit test reads persisted `latest.json` and finds HMAC-valid top-level binding naming `A` plus `run_id=B`. Verify the test fails if the binding is overlaid after sign.
+- [x] 2.3 Fail closed on ship-path `--from-run` when the unsigned checkpoint is missing, malformed, or conflicts with the loop binding / version index. Verify no HMAC-pass `latest.json` is written in those cases. Keep standalone unbound `--from-run` (no checkpoint, no version index, no request SHA) on today's mint path.
+- [x] 2.4 Before HMAC, require scored `pack_provenance.candidate_git_sha` and Layer-A probe candidate SHAs to equal `factory_release_binding.candidate_git_sha`. Verify a unit test with binding `C` plus collected provenance `D` fails closed and writes no `latest.json`.
+
+## 3. Typed observe and prepare complete
+
+- [x] 3.1 Change attestation observe to typed accepted / absent / rejected with stable reason codes and expected `A` / observed `B`. Remove the `pack_provenance != null` automatic miss. Stop treating notes `factory_release_binding:<json>` as an authoritative carrier. Verify task 1.1: payload with matching top-level HMAC binding is **accepted** even when `pack_provenance` is present and `run_id=B`; payload without the binding is **rejected**; notes-only is **rejected**; missing file is **absent**. Verify HMAC binding `C` plus valid scored provenance `D` is **rejected**.
+- [x] 3.2 Stop prepare from returning `attestation_mismatch` solely because `attestation.frg_run_id !== unsigned.frg_run_id` when the HMAC-covered binding names `A` and matches the closed digests. On accepted observe, verify prepare returns `status: "complete"` (injected `runRelease`) and records attested `run_id=B`. On rejected observe, verify prepare returns `awaiting_frg_attestation` **with** the miss payload (reason, `A`, `B`) and does not overlay the binding after sign.
+- [x] 3.3 Update fixtures that currently attach binding via notes and `run_id=A` so they use top-level HMAC binding. Verify existing “attestation without unsigned digest binding is refused” still fails closed.
+
+## 4. Bounded attest in runFrgPack
+
+- [x] 4.1 Extend `classifyFrgPackWaitDecision` (or the `runFrgPack` allowance next to it) so `"attest"` continues only while this complete checkpoint binding has received zero attestor spawns; after one exit-0 gate plus one prepare re-invoke, `"attest"` is fail. Verify `"retry"` live/unknown uncap (#1150) is unchanged. Verify a unit test fails if `"attest"` at spent allowance still returns continue.
+- [x] 4.2 Wire `runFrgPack` to spend the allowance, re-invoke the same request once, and throw naming unsigned `A`, observed `B` when present, and the observe miss reason. Verify task 1.2 now fails closed instead of hanging. Verify a changed unsigned `A'` resets the allowance. Verify one successful bound payload still yields prepare `complete` after a single gate spawn (task 1.3 green).
+
+## 5. Docs, mirror, CI
+
+- [x] 5.1 If the FRG runbook or ship-milestone doc describes the unsigned→attest handoff, state that production identities stay distinct (`A` vs `B`) and are joined by HMAC `factory_release_binding` written by `--from-run` before sign. Name that `"attest"` is once per unchanged checkpoint. Verify the docs do not present collapsing `A` into `B`, overlay-after-sign, `--skip-frg`, or leaf `release` as the product path.
+- [x] 5.2 After any `core/` edit, run `node scripts/build.mjs` and include regenerated `plugin/` in the same commit; verify `node scripts/build.mjs --check` passes.
+- [x] 5.3 Run `openspec validate frg-attest-from-run-unsigned-binding` and `npm run ci` from the repo root. Fix failures until green. Do not claim tester-suite pass; this run has no authoritative tester-suite evidence.

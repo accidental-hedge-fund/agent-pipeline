@@ -1376,12 +1376,23 @@ PY
 }
 
 # Wait-continue vs wait-fail. $1 tick (retry|done|attest|fail) $2 live (1|0|unknown)
-# $3 attempt (1-based) $4 numeric cap. retry + live or unknown continues even at cap.
+# $3 attempt (1-based) $4 numeric cap. $5 optional attest_allowance_spent (1|0).
+# retry + live or unknown continues even at cap.
+# attest continues only while this checkpoint has received zero attestor spawns.
 frg_pack_wait_decision() {
   local tick=${1:-}
   local live=${2:-0}
   local attempt=${3:-0}
   local cap=${4:-0}
+  local attest_spent=${5:-0}
+  if [[ "$tick" == "attest" ]]; then
+    if [[ "$attest_spent" == "1" ]]; then
+      printf '%s\n' "fail"
+      return 0
+    fi
+    printf '%s\n' "continue"
+    return 0
+  fi
   if [[ "$tick" != "retry" ]]; then
     printf '%s\n' "continue"
     return 0

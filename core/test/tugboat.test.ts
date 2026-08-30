@@ -5017,6 +5017,39 @@ test("frg_pack_wait_decision: in_progress plus live loop at cap N is continue (#
     "unreadable liveness at cap must not fail-closed",
   );
   assert.equal(runFrgPackWaitDecision("retry", "0", 1, cap), "continue");
+  assert.equal(
+    runFrgPackWaitDecision("attest", "0", 1, cap),
+    "continue",
+    "first attest spawn for a checkpoint is continue",
+  );
+});
+
+test("frg_pack_wait_decision: spent attest allowance is fail (#1295)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-wait-attest-"));
+  try {
+    const fn = extractNamedFn(
+      fs.readFileSync(frgHelpers, "utf8"),
+      "frg_pack_wait_decision",
+      "frg-pack-helpers.sh",
+    );
+    const runner = path.join(dir, "run.sh");
+    fs.writeFileSync(
+      runner,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        fn,
+        'frg_pack_wait_decision "attest" 0 2 2 1',
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(runner, 0o755);
+    const r = spawnSync("bash", [runner], { encoding: "utf8" });
+    assert.equal(r.status, 0, `wait decision exited ${r.status}: ${r.stderr}`);
+    assert.equal(r.stdout.trim(), "fail");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("frg_pack_loop_is_live: lock pid or non-terminal ledger (#1150)", () => {

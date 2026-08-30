@@ -39,6 +39,7 @@ import {
   latestJsonForHonestPost133Persist,
   normalizeFrgVersion,
   parseFrgEvidenceJson,
+  resolveFrgAttestationKey,
   runFactoryGate,
   validateFrgPackContract,
   validateReleaseEligibleFrgEvidence,
@@ -46,6 +47,8 @@ import {
   type FrgCompositionOverride,
   type FrgEvidence,
   type FrgScenarioOverride,
+  type FrgValidateOpts,
+  type ShipPathFromRunResolution,
 } from "./factory-reliability-gate.ts";
 import {
   defaultFrgPackRoot,
@@ -207,6 +210,8 @@ export interface FactoryReleaseAwaitingResult {
   candidate_git_sha: string;
   checkpoint: string;
   frg: FactoryReleaseFrgPayload;
+  /** Present when observation rejected the on-disk attestor result. */
+  observe_miss?: FactoryReleaseObserveMiss;
 }
 
 export interface FactoryReleaseCompleteResult {
@@ -327,7 +332,7 @@ export interface FactoryReleasePrepareDeps {
     request: FactoryReleasePrepareRequest,
     unsigned: FactoryReleaseFrgPayload,
     ctx: { repoDir: string; workDir: string },
-  ): Promise<ObservedAttestation | null>;
+  ): Promise<ObservedAttestation | AttestationObserveResult | null>;
   /**
    * Observe an already-opened or merged release/vX.Y.Z PR. When present,
    * prepare MUST NOT open a second PR (#1115).
@@ -629,6 +634,211 @@ export function factoryReleaseVersionIndexPath(repoDir: string, version: string)
   );
 }
 
+export type AttestationObserveReason =
+  | "missing_file"
+  | "unreadable"
+  | "unparsable"
+  | "hmac_invalid"
+  | "missing_factory_release_binding"
+  | "notes_only_binding"
+  | "binding_mismatch"
+  | "pack_provenance_invalid"
+  | "identity_mismatch"
+  | "not_release_eligible";
+
+export type AttestationObserveResult =
+  | { status: "accepted"; attestation: ObservedAttestation }
+  | { status: "absent"; reason: AttestationObserveReason }
+  | {
+      status: "rejected";
+      reason: AttestationObserveReason;
+      expected_frg_run_id: string;
+      observed_run_id: string | null;
+      detail?: string;
+    };
+
+export interface FactoryReleaseObserveMiss {
+  reason: AttestationObserveReason;
+  expected_frg_run_id: string;
+  observed_run_id: string | null;
+  detail?: string;
+}
+
+async function tryReadJsonFile(
+  readFile: (p: string) => Promise<string>,
+  filePath: string,
+): Promise<{ ok: true; value: unknown } | { ok: false; missing: boolean }> {
+  let text: string;
+  try {
+    text = await readFile(filePath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      return { ok: false, missing: true };
+    }
+    return { ok: false, missing: false };
+  }
+  try {
+    return { ok: true, value: JSON.parse(text) as unknown };
+  } catch {
+    return { ok: false, missing: false };
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * Load the closed unsigned checkpoint for credentialed `--from-run`.
+ * Ship-path (version index, checkpoint, or request SHA in hand) fails closed
+ * when the unsigned payload is missing, malformed, or conflicts.
+ * Standalone unbound `--from-run` (none of those) omits the binding.
+ */
+export async function defaultResolveShipPathFromRun(args: {
+  version: string;
+  fromRun: string;
+  repoDir: string;
+  requestCandidateGitSha?: string;
+  readFile: (p: string) => Promise<string>;
+}): Promise<ShipPathFromRunResolution> {
+  const version = normalizeFrgVersion(args.version);
+  const requestSha = args.requestCandidateGitSha?.trim() ?? "";
+  const indexPath = factoryReleaseVersionIndexPath(args.repoDir, version);
+  const indexRead = await tryReadJsonFile(args.readFile, indexPath);
+
+  if (indexRead.missing && !requestSha) {
+    return { kind: "standalone" };
+  }
+  if (!indexRead.ok) {
+    return {
+      kind: "fail",
+      message:
+        `pipeline factory-gate: ship-path --from-run ${args.fromRun} has a malformed ` +
+        `factory-release version index for v${version}; refusing HMAC latest.json without factory_release_binding`,
+    };
+  }
+  if (indexRead.missing) {
+    return {
+      kind: "fail",
+      message:
+        `pipeline factory-gate: ship-path --from-run ${args.fromRun} has no unsigned checkpoint ` +
+        `for v${version}; refusing HMAC latest.json without factory_release_binding`,
+    };
+  }
+
+  const index = indexRead.value;
+  if (!isRecord(index)) {
+    return {
+      kind: "fail",
+      message:
+        `pipeline factory-gate: ship-path --from-run ${args.fromRun} version index is not an object`,
+    };
+  }
+  const fingerprint = typeof index.request_fingerprint === "string" ? index.request_fingerprint : "";
+  const indexFrg = typeof index.frg_run_id === "string" ? index.frg_run_id : "";
+  const indexLoop = typeof index.loop_run_id === "string" ? index.loop_run_id : "";
+  const indexPack = typeof index.pack_run_id === "string" ? index.pack_run_id : "";
+  const indexCandidate = typeof index.candidate_git_sha === "string" ? index.candidate_git_sha : "";
+  if (!fingerprint || !indexFrg || !indexLoop || !indexPack || !indexCandidate) {
+    return {
+      kind: "fail",
+      message:
+        `pipeline factory-gate: ship-path --from-run ${args.fromRun} version index is incomplete`,
+    };
+  }
+  if (indexLoop !== args.fromRun) {
+    return {
+      kind: "fail",
+      message:
+        `pipeline factory-gate: ship-path --from-run ${args.fromRun} does not match version-index loop_run_id ${indexLoop}`,
+    };
+  }
+  if (requestSha && requestSha.toLowerCase() !== indexCandidate.toLowerCase()) {
+    return {
+      kind: "fail",
+      message:
+        `pipeline factory-gate: ship-path --from-run request candidate SHA does not match version index`,
+    };
+  }
+
+  const checkpointPath = factoryReleaseCheckpointPath(args.repoDir, fingerprint);
+  const ckptRead = await tryReadJsonFile(args.readFile, checkpointPath);
+  if (!ckptRead.ok || ckptRead.missing) {
+    return {
+      kind: "fail",
+      message:
+        `pipeline factory-gate: ship-path --from-run ${args.fromRun} is missing a closed unsigned checkpoint ` +
+        `for v${version}; refusing HMAC latest.json without factory_release_binding`,
+    };
+  }
+  if (!isRecord(ckptRead.value)) {
+    return {
+      kind: "fail",
+      message: `pipeline factory-gate: ship-path --from-run unsigned checkpoint is not an object`,
+    };
+  }
+  const store = ckptRead.value;
+  const request = store.request;
+  const unsigned = store.unsigned;
+  if (!isRecord(request) || !isRecord(unsigned)) {
+    return {
+      kind: "fail",
+      message:
+        `pipeline factory-gate: ship-path --from-run unsigned checkpoint is missing request or unsigned payload`,
+    };
+  }
+  let parsedRequest: FactoryReleasePrepareRequest;
+  try {
+    parsedRequest = parseFactoryReleasePrepareRequest(request);
+  } catch (err) {
+    return {
+      kind: "fail",
+      message:
+        `pipeline factory-gate: ship-path --from-run unsigned checkpoint request is malformed: ${(err as Error).message}`,
+    };
+  }
+  const unsignedPayload = unsigned as unknown as FactoryReleaseFrgPayload;
+  if (
+    unsignedPayload.frg_run_id !== indexFrg ||
+    unsignedPayload.loop_run_id !== indexLoop ||
+    unsignedPayload.pack_run_id !== indexPack ||
+    parsedRequest.integrated_candidate.git_sha.toLowerCase() !== indexCandidate.toLowerCase() ||
+    factoryReleaseRequestFingerprint(parsedRequest) !== fingerprint
+  ) {
+    return {
+      kind: "fail",
+      message:
+        `pipeline factory-gate: ship-path --from-run unsigned checkpoint conflicts with the version index`,
+    };
+  }
+
+  const loopBindingPath = factoryReleaseLoopBindingPath(args.fromRun);
+  const loopRead = await tryReadJsonFile(args.readFile, loopBindingPath);
+  if (!loopRead.ok || loopRead.missing || !isRecord(loopRead.value)) {
+    return {
+      kind: "fail",
+      message:
+        `pipeline factory-gate: ship-path --from-run ${args.fromRun} is missing factory-release-binding.json`,
+    };
+  }
+  const loopCandidate =
+    typeof loopRead.value.candidate_git_sha === "string" ? loopRead.value.candidate_git_sha : "";
+  if (loopCandidate.toLowerCase() !== parsedRequest.integrated_candidate.git_sha.toLowerCase()) {
+    return {
+      kind: "fail",
+      message:
+        `pipeline factory-gate: ship-path --from-run loop binding candidate SHA does not match the unsigned request`,
+    };
+  }
+
+  const binding = buildFactoryReleaseUnsignedDigestBinding(parsedRequest, unsignedPayload);
+  return {
+    kind: "bound",
+    binding,
+    unsigned_frg_run_id: unsignedPayload.frg_run_id,
+  };
+}
+
 function defaultRealpathSync(absolutePath: string): string {
   return fsRealpathSync(absolutePath);
 }
@@ -748,6 +958,7 @@ export function honestLatestJsonBindsRequest(
     run_id?: string;
     integrity?: { attestation?: unknown } | null;
     pack_provenance?: { candidate_git_sha?: string } | null;
+    factory_release_binding?: { candidate_git_sha?: string } | null;
   },
 ): boolean {
   if (evidence.version !== request.target_version) return false;
@@ -758,8 +969,42 @@ export function honestLatestJsonBindsRequest(
   }
   if (typeof evidence.run_id !== "string" || evidence.run_id.trim() === "") return false;
   if (!evidence.integrity?.attestation) return false;
-  const cand = evidence.pack_provenance?.candidate_git_sha?.toLowerCase() ?? "";
-  return cand === request.integrated_candidate.git_sha.toLowerCase();
+  const expected = request.integrated_candidate.git_sha.toLowerCase();
+  const bindingSha = evidence.factory_release_binding?.candidate_git_sha?.toLowerCase() ?? "";
+  const provenanceSha = evidence.pack_provenance?.candidate_git_sha?.toLowerCase() ?? "";
+  // A present binding or provenance candidate must each equal the request
+  // candidate. Do not prefer binding C over scored provenance D.
+  if (bindingSha && bindingSha !== expected) return false;
+  if (provenanceSha && provenanceSha !== expected) return false;
+  const cand = bindingSha || provenanceSha;
+  return cand === expected;
+}
+
+function notesCarryFactoryReleaseBinding(notes: readonly string[] | undefined): boolean {
+  for (const note of notes ?? []) {
+    if (typeof note === "string" && note.startsWith("factory_release_binding:")) return true;
+  }
+  return false;
+}
+
+function topLevelFactoryReleaseBinding(raw: Record<string, unknown>, evidence: FrgEvidence): unknown {
+  if (Object.prototype.hasOwnProperty.call(raw, "factory_release_binding")) {
+    return raw.factory_release_binding;
+  }
+  if (Object.prototype.hasOwnProperty.call(evidence, "factory_release_binding")) {
+    return (evidence as FrgEvidence & { factory_release_binding?: unknown }).factory_release_binding;
+  }
+  return undefined;
+}
+
+export function normalizeObserveAttestation(
+  raw: ObservedAttestation | AttestationObserveResult | null,
+): AttestationObserveResult {
+  if (raw == null) return { status: "absent", reason: "missing_file" };
+  if ("status" in raw && (raw.status === "accepted" || raw.status === "absent" || raw.status === "rejected")) {
+    return raw;
+  }
+  return { status: "accepted", attestation: raw };
 }
 
 /** Pick an already-open/merged PR whose head is the request candidate. */
@@ -2160,9 +2405,20 @@ export async function generateDurableUnsignedFrg(
   return { frg, structurally_eligible: true };
 }
 
+type LoadedAttestedEvidence =
+  | { status: "accepted"; evidence: FrgEvidence; text: string; path: string }
+  | { status: "absent"; reason: AttestationObserveReason }
+  | {
+      status: "rejected";
+      reason: AttestationObserveReason;
+      observed_run_id: string | null;
+      detail?: string;
+    };
+
 /**
  * Try to load and validate release-eligible attested evidence from a path.
- * Requires factory_release_binding digests to match the unsigned payload.
+ * Accepts attested run_id B when HMAC-covered factory_release_binding names A.
+ * pack_provenance presence is not a miss. Notes are not a binding carrier.
  */
 async function tryLoadAttestedEvidence(
   evidencePath: string,
@@ -2170,80 +2426,113 @@ async function tryLoadAttestedEvidence(
   unsigned: FactoryReleaseFrgPayload,
   readFile: (p: string) => Promise<string>,
   fileExists: (p: string) => Promise<boolean>,
-): Promise<{ evidence: FrgEvidence; text: string; path: string } | null> {
-  if (!(await fileExists(evidencePath))) return null;
+  validateOpts: FrgValidateOpts = {},
+): Promise<LoadedAttestedEvidence> {
+  if (!(await fileExists(evidencePath))) return { status: "absent", reason: "missing_file" };
   let text: string;
   try {
     text = await readFile(evidencePath);
   } catch {
-    return null;
+    return { status: "absent", reason: "unreadable" };
   }
   let raw: unknown;
   try {
     raw = JSON.parse(text);
   } catch {
-    return null;
+    return { status: "absent", reason: "unparsable" };
   }
-  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return null;
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    return { status: "absent", reason: "unparsable" };
+  }
   const rawObj = raw as Record<string, unknown>;
 
   let evidence: FrgEvidence;
   try {
     evidence = parseFrgEvidenceJson(text);
   } catch {
-    return null;
+    return { status: "absent", reason: "unparsable" };
   }
-  if (
-    honestLatestJsonBindsRequest(request, evidence) &&
-    evidence.run_id === unsigned.frg_run_id &&
-    evidence.loop_run_id === unsigned.loop_run_id
-  ) {
-    return { evidence, text, path: evidencePath };
+  const observedRunId = typeof evidence.run_id === "string" ? evidence.run_id : null;
+  const reject = (
+    reason: AttestationObserveReason,
+    detail?: string,
+  ): LoadedAttestedEvidence => ({
+    status: "rejected",
+    reason,
+    observed_run_id: observedRunId,
+    detail,
+  });
+
+  if (!evidence.integrity?.attestation) {
+    return reject("hmac_invalid", "integrity.attestation missing");
   }
-  if (evidence.pack_provenance != null) return null;
-  try {
-    evidence = validateReleaseEligibleFrgEvidence(evidence, request.target_version);
-  } catch {
-    if (evidence.version !== request.target_version || evidence.run_id !== unsigned.frg_run_id) {
-      return null;
-    }
-    if (!evidence.pass || !isReleaseEligibleFrgPass(evidence)) return null;
+  if (evidence.version !== request.target_version) {
+    return reject("identity_mismatch", "version mismatch");
+  }
+  if (evidence.loop_run_id !== unsigned.loop_run_id) {
+    return reject("identity_mismatch", "loop_run_id mismatch");
+  }
+  if (evidence.pack_id !== unsigned.pack_id) {
+    return reject("identity_mismatch", "pack_id mismatch");
   }
 
-  if (evidence.run_id !== unsigned.frg_run_id) return null;
-  if (evidence.loop_run_id !== unsigned.loop_run_id) return null;
-  if (evidence.pack_id !== unsigned.pack_id) return null;
-  if (evidence.version !== request.target_version) return null;
-  if (!evidence.integrity?.attestation) return null;
-
-  // Exact-artifact two-call handoff: attestation must bind request fingerprint
-  // and every unsigned artifact digest.
   const expected = buildFactoryReleaseUnsignedDigestBinding(request, unsigned);
-  const binding =
-    rawObj.factory_release_binding ??
-    // Allow notes entry as a last-resort carrier: factory_release_binding:<json>
-    (() => {
-      for (const note of evidence.notes ?? []) {
-        if (typeof note === "string" && note.startsWith("factory_release_binding:")) {
-          try {
-            return JSON.parse(note.slice("factory_release_binding:".length));
-          } catch {
-            return null;
-          }
-        }
-      }
-      return null;
-    })();
-  const mismatch = unsignedDigestBindingMismatch(expected, binding);
-  if (mismatch) return null;
+  const topLevel = topLevelFactoryReleaseBinding(rawObj, evidence);
+  if (topLevel === undefined) {
+    if (notesCarryFactoryReleaseBinding(evidence.notes)) {
+      return reject("notes_only_binding");
+    }
+    return reject("missing_factory_release_binding");
+  }
+  const mismatch = unsignedDigestBindingMismatch(expected, topLevel);
+  if (mismatch) {
+    return reject("binding_mismatch", mismatch);
+  }
 
-  return { evidence, text, path: evidencePath };
+  if (!evidence.pass || !isReleaseEligibleFrgPass(evidence, { requireAttestation: true })) {
+    return reject("not_release_eligible");
+  }
+
+  if (!honestLatestJsonBindsRequest(request, { ...evidence, factory_release_binding: topLevel })) {
+    return reject("identity_mismatch", "candidate or honest-bind mismatch");
+  }
+
+  try {
+    validateReleaseEligibleFrgEvidence(text, request.target_version, validateOpts);
+  } catch (err) {
+    const msg = (err as Error).message;
+    if (
+      /MAC|does not match|KEY is required|hand-authored|integrity\.attestation/i.test(msg)
+    ) {
+      return reject("hmac_invalid", msg);
+    }
+    return reject("not_release_eligible", msg);
+  }
+
+  return { status: "accepted", evidence, text, path: evidencePath };
+}
+
+function acceptedAttestation(
+  loaded: Extract<LoadedAttestedEvidence, { status: "accepted" }>,
+  latestPath: string,
+  evidencePath: string,
+  observedPath: string,
+): ObservedAttestation {
+  const digest = sha256(loaded.text);
+  return {
+    frg_run_id: loaded.evidence.run_id,
+    evidence_path: observedPath === latestPath ? evidencePath : loaded.path,
+    evidence_sha256: digest,
+    latest_path: latestPath,
+    latest_sha256: digest,
+    evidence: loaded.evidence,
+  };
 }
 
 /**
  * Observe release-eligible attested evidence under the version FRG tree.
- * Matches the unsigned frg_run_id and every closed unsigned artifact digest.
- * Handoff is a single non-recursive hint: re-read referenced paths once.
+ * Returns typed accepted / absent / rejected. Attested run_id MAY be B ≠ A
+ * when HMAC factory_release_binding names unsigned A.
  */
 export async function defaultObserveAttestation(
   request: FactoryReleasePrepareRequest,
@@ -2251,7 +2540,8 @@ export async function defaultObserveAttestation(
   ctx: { repoDir: string; workDir: string },
   readFile: (p: string) => Promise<string> = (p) => fs.readFile(p, "utf8"),
   fileExists: (p: string) => Promise<boolean> = defaultFileExists,
-): Promise<ObservedAttestation | null> {
+  validateOpts: FrgValidateOpts = {},
+): Promise<AttestationObserveResult> {
   const version = request.target_version;
   const latestPath = path.join(ctx.repoDir, ".agent-pipeline", "frg", version, "latest.json");
   const evidencePath = path.join(
@@ -2263,30 +2553,40 @@ export async function defaultObserveAttestation(
     "evidence.json",
   );
 
-  const tryPaths = [evidencePath, latestPath];
+  const tryPaths = [latestPath, evidencePath];
+  let firstRejected: Extract<LoadedAttestedEvidence, { status: "rejected" }> | null = null;
+  let sawPresent = false;
   for (const p of tryPaths) {
-    const loaded = await tryLoadAttestedEvidence(p, request, unsigned, readFile, fileExists);
-    if (!loaded) continue;
-    const digest = sha256(loaded.text);
-    return {
-      frg_run_id: loaded.evidence.run_id,
-      evidence_path: p === latestPath ? evidencePath : p,
-      evidence_sha256: digest,
-      latest_path: latestPath,
-      latest_sha256: digest,
-      evidence: loaded.evidence,
-    };
+    const loaded = await tryLoadAttestedEvidence(
+      p,
+      request,
+      unsigned,
+      readFile,
+      fileExists,
+      validateOpts,
+    );
+    if (loaded.status === "accepted") {
+      return {
+        status: "accepted",
+        attestation: acceptedAttestation(loaded, latestPath, evidencePath, p),
+      };
+    }
+    if (loaded.status === "rejected") {
+      sawPresent = true;
+      if (!firstRejected) firstRejected = loaded;
+      continue;
+    }
+    if (loaded.reason !== "missing_file") sawPresent = true;
   }
 
   // Optional handoff: single hint to re-observe referenced evidence paths once.
-  // Never recurse into defaultObserveAttestation (crash-window must return null).
   const handoffPath = path.join(ctx.workDir, "attestation-handoff.json");
   if (await fileExists(handoffPath)) {
     let handoff: Record<string, unknown>;
     try {
       handoff = JSON.parse(await readFile(handoffPath)) as Record<string, unknown>;
     } catch {
-      return null;
+      return { status: "absent", reason: "unparsable" };
     }
     if (
       handoff.kind === "frg_attestation_handoff" &&
@@ -2301,25 +2601,48 @@ export async function defaultObserveAttestation(
         hintPaths.push(handoff.frg_latest_path);
       }
       for (const p of hintPaths) {
-        // Skip paths already attempted above.
         if (p === evidencePath || p === latestPath) continue;
-        const loaded = await tryLoadAttestedEvidence(p, request, unsigned, readFile, fileExists);
-        if (!loaded) continue;
-        const digest = sha256(loaded.text);
-        return {
-          frg_run_id: loaded.evidence.run_id,
-          evidence_path: loaded.path,
-          evidence_sha256: digest,
-          latest_path: typeof handoff.frg_latest_path === "string" ? handoff.frg_latest_path : latestPath,
-          latest_sha256: digest,
-          evidence: loaded.evidence,
-        };
+        const loaded = await tryLoadAttestedEvidence(
+          p,
+          request,
+          unsigned,
+          readFile,
+          fileExists,
+          validateOpts,
+        );
+        if (loaded.status === "accepted") {
+          const digest = sha256(loaded.text);
+          return {
+            status: "accepted",
+            attestation: {
+              frg_run_id: loaded.evidence.run_id,
+              evidence_path: loaded.path,
+              evidence_sha256: digest,
+              latest_path:
+                typeof handoff.frg_latest_path === "string" ? handoff.frg_latest_path : latestPath,
+              latest_sha256: digest,
+              evidence: loaded.evidence,
+            },
+          };
+        }
+        if (loaded.status === "rejected" && !firstRejected) firstRejected = loaded;
       }
-      // Handoff present but evidence still absent/invalid — awaiting, not recurse.
-      return null;
     }
   }
-  return null;
+
+  if (firstRejected) {
+    return {
+      status: "rejected",
+      reason: firstRejected.reason,
+      expected_frg_run_id: unsigned.frg_run_id,
+      observed_run_id: firstRejected.observed_run_id,
+      detail: firstRejected.detail,
+    };
+  }
+  return {
+    status: "absent",
+    reason: sawPresent ? "unreadable" : "missing_file",
+  };
 }
 
 export async function defaultObserveExistingRelease(
@@ -2464,7 +2787,9 @@ export function defaultFactoryReleasePrepareDeps(
     observeAttestation:
       overrides.observeAttestation ??
       ((request, unsigned, ctx) =>
-        defaultObserveAttestation(request, unsigned, ctx, readFile, fileExists)),
+        defaultObserveAttestation(request, unsigned, ctx, readFile, fileExists, {
+          attestationKey: resolveFrgAttestationKey(overrides.env ?? process.env),
+        })),
     observeExistingRelease:
       overrides.observeExistingRelease ??
       ((request) => defaultObserveExistingRelease(request)),
@@ -2607,6 +2932,7 @@ function awaitingResult(
   request: FactoryReleasePrepareRequest,
   frg: FactoryReleaseFrgPayload,
   checkpoint: string,
+  observeMiss?: FactoryReleaseObserveMiss,
 ): FactoryReleaseAwaitingResult {
   return {
     schema_version: 1,
@@ -2620,6 +2946,7 @@ function awaitingResult(
     candidate_git_sha: request.integrated_candidate.git_sha,
     checkpoint,
     frg,
+    ...(observeMiss ? { observe_miss: observeMiss } : {}),
   };
 }
 
@@ -2738,10 +3065,13 @@ export async function runFactoryReleasePrepare(
 
   // --- Complete: re-observe and return without mutation ---
   if (store?.phase === "complete" && store.unsigned && store.attestation && store.release) {
-    const attestation = await deps.observeAttestation(request, store.unsigned, {
-      repoDir: opts.repoDir,
-      workDir,
-    });
+    const reobserved = normalizeObserveAttestation(
+      await deps.observeAttestation(request, store.unsigned, {
+        repoDir: opts.repoDir,
+        workDir,
+      }),
+    );
+    const attestation = reobserved.status === "accepted" ? reobserved.attestation : null;
     if (
       !attestation ||
       attestation.frg_run_id !== store.attestation.frg_run_id ||
@@ -2894,11 +3224,13 @@ export async function runFactoryReleasePrepare(
   }
 
   // --- Attestation observation ---
-  const attestation = await deps.observeAttestation(request, unsigned, {
-    repoDir: opts.repoDir,
-    workDir,
-  });
-  if (!attestation) {
+  const observed = normalizeObserveAttestation(
+    await deps.observeAttestation(request, unsigned, {
+      repoDir: opts.repoDir,
+      workDir,
+    }),
+  );
+  if (observed.status !== "accepted") {
     const awaitingId = store?.awaiting_checkpoint_id ?? checkpointId("unsigned", fingerprint);
     if (!store || store.phase !== "awaiting_frg_attestation") {
       store = {
@@ -2914,15 +3246,24 @@ export async function runFactoryReleasePrepare(
       await saveCheckpoint(deps, checkpointPath, store);
     }
     log("[factory-release prepare] awaiting production-owned FRG attestation");
+    const observeMiss: FactoryReleaseObserveMiss | undefined =
+      observed.status === "rejected"
+        ? {
+            reason: observed.reason,
+            expected_frg_run_id: observed.expected_frg_run_id,
+            observed_run_id: observed.observed_run_id,
+            detail: observed.detail,
+          }
+        : undefined;
     return {
       exitCode: 0,
-      result: awaitingResult(request, unsigned, awaitingId),
+      result: awaitingResult(request, unsigned, awaitingId, observeMiss),
     };
   }
+  const attestation = observed.attestation;
 
-  // Stale / foreign attestation binding (ids + exact unsigned artifact digests).
+  // Join is HMAC factory_release_binding.frg_run_id === unsigned A, not run_id === A.
   if (
-    attestation.frg_run_id !== unsigned.frg_run_id ||
     attestation.evidence.loop_run_id !== unsigned.loop_run_id ||
     attestation.evidence.version !== request.target_version
   ) {
@@ -2934,42 +3275,38 @@ export async function runFactoryReleasePrepare(
       result: failedResult(request, "attestation_mismatch", msg, checkpointId("failed", fingerprint)),
     };
   }
-  // Exact-artifact two-call handoff: attestation must bind request fingerprint
-  // and every closed unsigned artifact digest (even when observeAttestation is injected).
   {
     const expectedBinding = buildFactoryReleaseUnsignedDigestBinding(request, unsigned);
     const evidenceRec = attestation.evidence as FrgEvidence & {
       factory_release_binding?: unknown;
     };
-    let observedBinding: unknown = evidenceRec.factory_release_binding ?? null;
-    if (observedBinding == null) {
-      for (const note of attestation.evidence.notes ?? []) {
-        if (typeof note === "string" && note.startsWith("factory_release_binding:")) {
-          try {
-            observedBinding = JSON.parse(note.slice("factory_release_binding:".length));
-          } catch {
-            observedBinding = null;
-          }
-          break;
-        }
-      }
+    const observedBinding = evidenceRec.factory_release_binding;
+    if (observedBinding === undefined && notesCarryFactoryReleaseBinding(attestation.evidence.notes)) {
+      const awaitingId = store?.awaiting_checkpoint_id ?? checkpointId("unsigned", fingerprint);
+      return {
+        exitCode: 0,
+        result: awaitingResult(request, unsigned, awaitingId, {
+          reason: "notes_only_binding",
+          expected_frg_run_id: unsigned.frg_run_id,
+          observed_run_id: attestation.frg_run_id,
+        }),
+      };
     }
-    if (!honestLatestJsonBindsRequest(request, attestation.evidence)) {
-      const mismatch = unsignedDigestBindingMismatch(expectedBinding, observedBinding);
-      if (mismatch) {
-        const msg =
-          `factory-release prepare: attested evidence unsigned digest binding failed ` +
-          `for ${request.target_version}: ${mismatch}`;
-        return {
-          exitCode: 1,
-          result: failedResult(
-            request,
-            "attestation_digest_mismatch",
-            msg,
-            checkpointId("failed", fingerprint),
-          ),
-        };
-      }
+    const mismatch = unsignedDigestBindingMismatch(expectedBinding, observedBinding ?? null);
+    if (mismatch) {
+      const awaitingId = store?.awaiting_checkpoint_id ?? checkpointId("unsigned", fingerprint);
+      return {
+        exitCode: 0,
+        result: awaitingResult(request, unsigned, awaitingId, {
+          reason:
+            mismatch === "factory_release_binding missing or not an object"
+              ? "missing_factory_release_binding"
+              : "binding_mismatch",
+          expected_frg_run_id: unsigned.frg_run_id,
+          observed_run_id: attestation.frg_run_id,
+          detail: mismatch,
+        }),
+      };
     }
   }
 
