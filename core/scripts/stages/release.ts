@@ -5,8 +5,8 @@
 // 2c. Failing closed on open candidate-linked engine-class soak defects (#755)
 //    (skipped when FRG skip is active — soak attribution is FRG-linked)
 // 3. Bumping both package.json files
-// 4. Regenerating the committed plugin packaging outputs (SKILL overlay,
-//    launcher shims, plugin manifest, and marketplace catalog)
+// 4. Regenerating committed packaging outputs (four host SKILLs, plugin SKILL
+//    overlay, launcher shims, plugin manifest, and marketplace catalog)
 // 5. Running the CI gate (npm run ci)
 // 6. Scaffolding ROADMAP.md at four mutation sites
 // 7. Opening $EDITOR for human confirmation (skipped under --no-edit / --dry-run)
@@ -20,6 +20,7 @@
 import * as path from "node:path";
 import * as fs from "node:fs";
 import { spawnSync } from "node:child_process";
+import { SKILL_HOST_IDS } from "../host-skill.ts";
 import {
   classifyFrgBlocker,
   formatFrgPrSection,
@@ -47,6 +48,8 @@ import {
   type StageDiagnostic,
 } from "../stage-diagnostic.ts";
 import { formatFrgSkipReason, resolveFrgSkip } from "../frg-skip.ts";
+
+const HOST_SKILL_RELATIVE_PATHS = SKILL_HOST_IDS.map((id) => `hosts/${id}/SKILL.md`);
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -2024,7 +2027,14 @@ export async function runRelease(
   // packaging directories, so forcing `=all` makes detection independent of user git config.
   // Ignored files under `plugin/` and `.claude-plugin/` remain outside this precondition;
   // `scripts/build.mjs` owns only its declared SKILL, launcher, manifest, and catalog outputs.
-  const releaseManagedPaths = ["package.json", "core/package.json", "ROADMAP.md", "plugin", ".claude-plugin"];
+  const releaseManagedPaths = [
+    "package.json",
+    "core/package.json",
+    "ROADMAP.md",
+    "plugin",
+    ".claude-plugin",
+    ...HOST_SKILL_RELATIVE_PATHS,
+  ];
   d.stdout("[pipeline release] checking working tree is clean in release-managed paths...");
   const statusResult = d.runCommand("git", ["status", "--porcelain", "--untracked-files=all", "--", ...releaseManagedPaths], { cwd: repoDir });
   if (statusResult.code !== 0) {
@@ -2071,6 +2081,7 @@ export async function runRelease(
         "ROADMAP.md",
         "plugin",
         ".claude-plugin",
+        ...HOST_SKILL_RELATIVE_PATHS,
       ],
       { cwd: repoDir },
     );
@@ -2230,6 +2241,7 @@ export async function runRelease(
       "ROADMAP.md",
       "plugin/",
       ".claude-plugin/",
+      ...HOST_SKILL_RELATIVE_PATHS,
     ];
     const addResult = d.runCommand(
       "git",

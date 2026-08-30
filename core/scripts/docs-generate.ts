@@ -1,5 +1,6 @@
-// Pure docs generators for CLI reference, config reference, SKILL tables, and
-// CHANGELOG (#597). Unit-tested without network/git/subprocess; live I/O is
+// Pure docs generators for CLI reference, config reference, and CHANGELOG
+// (#597, #1049). Host SKILLs are owned by `scripts/build.mjs` via
+// `renderHostSkill`. Unit-tested without network/git/subprocess; live I/O is
 // injected via deps at the scripts/generate-docs.mjs boundary.
 
 import {
@@ -77,8 +78,8 @@ export function renderCliMarkdown(opts: RenderCliOptions = {}): string {
     "This page is generated from `COMMAND_REGISTRY`, `OPERATION_SURFACE`, and",
     "co-located metadata in `core/scripts/command-docs.ts`. Do not hand-edit the command inventory.",
     "",
-    "Host skills use the same inventory with host-specific invocation tokens:",
-    "`/pipeline` (Claude Code) and `$pipeline` (Codex). The Node CLI is `pipeline`.",
+    "Host skills execute the in-scope catalog as `pipeline <verb>`. The Node CLI",
+    "is `pipeline`. This page is the full documented inventory.",
     "",
     "Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).",
     "",
@@ -130,57 +131,6 @@ function sectionHeading(section: DocumentedCommand["section"]): string {
     default:
       return "Other";
   }
-}
-
-// ---------------------------------------------------------------------------
-// Host SKILL command tables
-// ---------------------------------------------------------------------------
-
-export interface RenderSkillTableOptions {
-  hostToken: string;
-  registry?: Record<string, unknown>;
-  docs?: Record<string, CommandDoc>;
-  operationSurface?: readonly OperationSurfaceEntry[];
-}
-
-/**
- * Emit the body of a SKILL command-table region (no markers).
- * Hosts differ only by invocation token.
- */
-export function renderSkillCommandTable(opts: RenderSkillTableOptions): string {
-  const commands = listDocumentedCommands(
-    opts.registry ?? COMMAND_REGISTRY,
-    opts.docs,
-    opts.operationSurface,
-  );
-  const token = opts.hostToken.trim();
-  const pad = 48;
-  const lines: string[] = [
-    "```",
-    `${padRight(`${token} N`, pad)}durable autonomous one-item drive (default)`,
-  ];
-  for (const cmd of commands) {
-    if (cmd.keyword === "advance") continue; // covered by the default N line
-    const usage = formatHostUsage(token, cmd.usage);
-    lines.push(`${padRight(usage, pad)}${cmd.summary}`);
-  }
-  lines.push("```", "");
-  return lines.join("\n");
-}
-
-function padRight(s: string, width: number): string {
-  if (s.length >= width) return `${s} `;
-  return s + " ".repeat(width - s.length);
-}
-
-/** Rewrite a host SKILL file's generated command-table region. */
-export function applySkillCommandTable(
-  skillSource: string,
-  hostToken: string,
-  opts: Omit<RenderSkillTableOptions, "hostToken"> = {},
-): string {
-  const body = renderSkillCommandTable({ ...opts, hostToken });
-  return replaceMarkedRegion(skillSource, CLI_BEGIN_MARKER, CLI_END_MARKER, body);
 }
 
 // ---------------------------------------------------------------------------
@@ -432,10 +382,6 @@ export type GeneratedArtifact = {
 };
 
 export interface BuildArtifactsInput {
-  skillClaude?: string;
-  skillCodex?: string;
-  skillOmp?: string;
-  skillOpencode?: string;
   configSchema: JsonSchemaNode;
   configDefaults?: Record<string, unknown>;
   changelogReleases: ChangelogRelease[];
@@ -445,11 +391,11 @@ export interface BuildArtifactsInput {
 }
 
 /**
- * Build the full set of generator-owned artifacts (pure).
- * SKILL paths are only included when source text is provided.
+ * Build the full set of docs-generator-owned artifacts (pure).
+ * Host SKILLs are owned by `scripts/build.mjs` (#1049) and are never emitted here.
  */
 export function buildGeneratedArtifacts(input: BuildArtifactsInput): GeneratedArtifact[] {
-  const artifacts: GeneratedArtifact[] = [
+  return [
     {
       relPath: "docs/cli.md",
       content: renderCliMarkdown({
@@ -470,26 +416,4 @@ export function buildGeneratedArtifacts(input: BuildArtifactsInput): GeneratedAr
       content: renderChangelogMarkdown(input.changelogReleases),
     },
   ];
-
-  const hostSkills = [
-    { relPath: "hosts/claude/SKILL.md", source: input.skillClaude, token: "/pipeline" },
-    { relPath: "hosts/codex/SKILL.md", source: input.skillCodex, token: "$pipeline" },
-    { relPath: "hosts/omp/SKILL.md", source: input.skillOmp, token: "/pipeline" },
-    { relPath: "hosts/opencode/SKILL.md", source: input.skillOpencode, token: "/pipeline" },
-  ];
-  for (const host of hostSkills) {
-    if (host.source === undefined) continue;
-    artifacts.push({
-      relPath: host.relPath,
-      content: normalizeTrailingNewline(
-        applySkillCommandTable(host.source, host.token, {
-          registry: input.registry,
-          docs: input.docs,
-          operationSurface: input.operationSurface,
-        }),
-      ),
-    });
-  }
-
-  return artifacts;
 }

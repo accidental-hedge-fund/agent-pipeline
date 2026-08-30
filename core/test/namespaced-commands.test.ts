@@ -16,8 +16,8 @@ const COMMANDS_DIR = join(REPO_ROOT, "plugin", "pipeline", "commands");
 const HOST_SKILL_PATHS = [
   join(REPO_ROOT, "hosts", "claude", "SKILL.md"),
   join(REPO_ROOT, "hosts", "codex", "SKILL.md"),
+  join(REPO_ROOT, "hosts", "grok", "SKILL.md"),
   join(REPO_ROOT, "hosts", "opencode", "SKILL.md"),
-  join(REPO_ROOT, "hosts", "omp", "SKILL.md"),
 ];
 
 // Canonical operation names per the namespaced-command-surface spec.
@@ -41,6 +41,8 @@ const EXPECTED_OPERATIONS = new Set([
   "roadmap",
   "logs",
   "loop",
+  "train",
+  "ship",
 ]);
 
 // ---------------------------------------------------------------------------
@@ -87,33 +89,16 @@ test("namespaced-commands 7.5a2: live surfaces advertise direct CLI verbs only",
     );
   }
 
-  for (const skillPath of HOST_SKILL_PATHS) {
-    const content = readFileSync(skillPath, "utf8");
-    assert.doesNotMatch(
-      content,
-      /First-ever invocation runs `npm install`/,
-      `${skillPath} must not claim the launcher uses npm install`,
-    );
-    assert.match(content, /best-effort `npm ci`/, `${skillPath} must document installer prewarm`);
-    assert.match(
-      content,
-      /first non-version launcher invocation\s+retries `npm ci`/,
-      `${skillPath} must document first-run dependency self-heal`,
-    );
-    assert.match(content, /failed retry exits non-zero/, `${skillPath} must document fail-closed retry`);
-  }
+  const readme = readFileSync(join(REPO_ROOT, "README.md"), "utf8");
+  assert.doesNotMatch(readme, /First-ever invocation runs `npm install`/);
+  assert.match(readme, /best-effort dependency prewarm with `npm ci`/);
+  assert.match(readme, /first non-version launcher invocation retries/);
+  assert.match(readme, /fails closed with manual remediation/);
 
-  const ompSkill = readFileSync(join(REPO_ROOT, "hosts", "omp", "SKILL.md"), "utf8");
-  assert.doesNotMatch(
-    ompSkill,
-    /generated mirror\s+of\s+`core\/`/i,
-    "OMP development guidance must not restore the retired core mirror",
-  );
-  assert.match(
-    ompSkill,
-    /product install path is the\s+pipeline CLI plus host SKILL/,
-    "OMP development guidance must name the CLI plus host SKILL contract",
-  );
+  const packaging = readFileSync(join(REPO_ROOT, "docs", "packaging.md"), "utf8");
+  assert.doesNotMatch(packaging, /generated mirror\s+of\s+`core\/`/i);
+  assert.match(packaging, /OMP\/Tugboat is a tree\/native-CLI install host/);
+  assert.match(packaging, /It has no SKILL overlay/);
 });
 
 // ---------------------------------------------------------------------------
@@ -188,6 +173,7 @@ test("namespaced-commands 7.5b3: host SKILL loop guidance drives in-repo, never 
       /in-repo/i.test(content) && /supervisor/i.test(content),
       `${skillPath} should describe the in-repo loop supervisor`,
     );
+    assert.match(content, /pipeline loop logs <loop-run-id> --events --follow/);
   }
 });
 
@@ -208,32 +194,24 @@ test("namespaced-commands 7.5b4: loop SKILL packaging is long-running; generator
   assert.equal(loopOp.fast, false, "loop must not be classified as the shared fast template (#668)");
   assert.equal(loopOp.inRepoLoop, true, "loop must keep inRepoLoop packaging");
 
-  const heading = "### 4b. Orchestration pattern for `pipeline loop`";
-  for (const host of ["claude", "codex"] as const) {
+  for (const host of ["claude", "codex", "grok", "opencode"] as const) {
     const skill = readFileSync(join(REPO_ROOT, "hosts", host, "SKILL.md"), "utf8");
-    const sectionStart = skill.indexOf(heading);
-    assert.notEqual(sectionStart, -1, `${host} SKILL must contain the pipeline loop section`);
-    const nextHeading = skill.indexOf("\n### ", sectionStart + heading.length);
-    const driveSection = skill.slice(
-      sectionStart,
-      nextHeading === -1 ? skill.length : nextHeading,
-    );
-
     assert.match(
-      driveSection,
+      skill,
       /long-running/i,
       `${host} SKILL must state multi-item drive/resume is long-running`,
     );
     assert.doesNotMatch(
-      driveSection,
+      skill,
       /completes in seconds/i,
-      `${host} pipeline loop section must not use the fast-command completion claim`,
+      `${host} SKILL must not use the fast-command completion claim`,
     );
     assert.doesNotMatch(
-      driveSection,
+      skill,
       /No background process or Monitor needed/i,
-      `${host} pipeline loop section must not forbid its required background monitor`,
+      `${host} SKILL must not forbid its required background monitor`,
     );
+    assert.match(skill, /pipeline loop logs <loop-run-id> --events --follow/);
   }
   assert.equal(
     existsSync(join(COMMANDS_DIR, "pipeline:loop.md")),
@@ -245,7 +223,6 @@ test("namespaced-commands 7.5b4: loop SKILL packaging is long-running; generator
 test("namespaced-commands 7.5b4b: true-fast peers may still note seconds; no slash files emitted", async () => {
   const buildMjs = await import("../../scripts/build.mjs");
   const { OPERATION_SURFACE } = buildMjs;
-  const skill = readFileSync(join(REPO_ROOT, "hosts", "claude", "SKILL.md"), "utf8");
 
   for (const name of ["status", "doctor"] as const) {
     const op = OPERATION_SURFACE.find((o: { name: string; fast?: boolean }) => o.name === name) as
@@ -259,9 +236,10 @@ test("namespaced-commands 7.5b4b: true-fast peers may still note seconds; no sla
       `generator must not emit pipeline:${name}.md`,
     );
   }
+  const concepts = readFileSync(join(REPO_ROOT, "docs", "concepts.md"), "utf8");
   assert.ok(
-    /completes in seconds/i.test(skill),
-    "SKILL or CLI docs MAY still note that true-fast verbs complete in seconds",
+    /completes in seconds/i.test(concepts),
+    "durable docs MAY still note that true-fast verbs complete in seconds",
   );
 });
 
@@ -270,218 +248,46 @@ test("namespaced-commands 7.5b4b: true-fast peers may still note seconds; no sla
 // "no auto-exit on terminal" without documenting until-terminal default.
 // Bare `tail -F …events.jsonl` is forbidden as a documented follow command —
 // it never exits on loop_run_stopped (zombie-follow failure mode).
-test("namespaced-commands 7.5b6: host loop skill stop-on-terminal + dual-follow exit (#699)", () => {
-  const repoRoot = join(__dirname, "..", "..");
-  const hostSkills = [
-    join(repoRoot, "hosts", "claude", "SKILL.md"),
-    join(repoRoot, "hosts", "codex", "SKILL.md"),
-  ];
-  for (const skillPath of hostSkills) {
+test("namespaced-commands 7.5b6: host loop skill stop-on-terminal (#699)", () => {
+  const concepts = readFileSync(join(REPO_ROOT, "docs", "concepts.md"), "utf8");
+  for (const skillPath of HOST_SKILL_PATHS) {
     const body = readFileSync(skillPath, "utf8");
+    assert.ok(/loop_run_stopped/i.test(body), `${skillPath} must mention loop_run_stopped`);
     assert.ok(
-      /loop_run_stopped/i.test(body),
-      `${skillPath} must mention loop_run_stopped`,
-    );
-    // Orchestration semantics: same-turn stop of run-scoped follows on terminal
-    // (loop_run_stopped and/or supervisor exit) — not unscoped "same turn" alone.
-    assert.ok(
-      /(?:loop_run_stopped|supervisor(?: process)? exit)[\s\S]{0,500}(?:same turn|same-turn|in the same harness turn)|(?:same turn|same-turn|in the same harness turn)[\s\S]{0,500}(?:loop_run_stopped|supervisor)/i.test(
-        body,
-      ),
-      `${skillPath} must require same-turn stop of run-scoped follows on loop_run_stopped / supervisor exit (#699)`,
+      /in the same\s+turn/i.test(body),
+      `${skillPath} must require same-turn stop of run-scoped follows`,
     );
     assert.ok(
-      /follows stopped|follow.*stopped/i.test(body),
-      `${skillPath} final summary must include follows-stopped confirmation (#699)`,
+      /follows stopped/i.test(body),
+      `${skillPath} final summary must include follows-stopped confirmation`,
     );
-    assert.ok(
-      /exit 0|exit with code 0|exits 0/i.test(body),
-      `${skillPath} dual-follow / multi-stream guidance must exit 0 on terminal (#699)`,
-    );
-    // Forbidden: primary one-liner that claims unconditional no-auto-exit without
-    // documenting until-terminal default-on.
-    const oneLiners = body
-      .split("\n")
-      .filter((l) => /loop logs/.test(l) && /--follow|-f\b/.test(l));
-    for (const line of oneLiners) {
-      if (/no auto-exit on terminal/i.test(line) && !/until-terminal/i.test(line)) {
-        assert.fail(
-          `${skillPath} loop logs one-liner claims unconditional no auto-exit without until-terminal docs: ${line}`,
-        );
-      }
-    }
-    assert.ok(
-      /until-terminal|exits on loop_run_stopped|exit.*loop_run_stopped/i.test(body),
-      `${skillPath} must document until-terminal / exit-on-loop_run_stopped for loop logs follow (#699)`,
-    );
-    // Forbidden: bare `tail -F` on events.jsonl as a standalone follow command.
-    // Allowed only when nested in a terminal-aware wrapper that (1) exit 0s on
-    // loop_run_stopped AND (2) explicitly tracks + TERM/KILLs the tail child.
-    // Process substitution + bare exit 0 orphans tail -F (zombie follow).
-    const lines = body.split("\n");
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      if (!/^\s*tail\s+(?:-n\s+\+1\s+)?-F\s+/.test(line) || !/events\.jsonl/.test(line)) {
-        continue;
-      }
-      // Standalone fence line: the whole code-fence command is only `tail -F …`
-      // (no while/read ownership on surrounding lines of the same fence).
-      let fenceStart = i;
-      while (fenceStart > 0 && !/^```/.test(lines[fenceStart - 1]!)) fenceStart--;
-      let fenceEnd = i;
-      while (fenceEnd < lines.length - 1 && !/^```/.test(lines[fenceEnd + 1]!)) fenceEnd++;
-      const fence = lines.slice(fenceStart, fenceEnd + 1).join("\n");
-      const hasExit =
-        /\bexit 0\b/.test(fence) &&
-        (/\bwhile\b/.test(fence) || /\bread\b/.test(fence)) &&
-        /loop_run_stopped/.test(fence);
-      // Child teardown: tracked PID + kill -TERM / kill -KILL (not process-sub alone).
-      const hasChildTeardown =
-        /TAIL_PID|tail_pid/.test(fence) &&
-        /kill\s+-TERM|kill\s+-KILL|kill\s+-\$?TERM|kill\s+-\$?KILL/.test(fence);
-      // Process-sub alone is explicitly insufficient (#699 review-2 f7ea742f).
-      const processSubOnly =
-        /<\s*<\s*\(\s*tail\b/.test(fence) && !hasChildTeardown;
-      if (!hasExit || !hasChildTeardown || processSubOnly) {
-        assert.fail(
-          `${skillPath} documents tail -F on events.jsonl without explicit child teardown ` +
-            `(must track TAIL_PID, kill -TERM/-KILL, and exit 0 after loop_run_stopped; ` +
-            `process substitution + exit 0 alone is not enough): ${line}`,
-        );
-      }
-    }
-    // Must explicitly forbid bare tail or document terminal-aware ownership with
-    // child teardown (not process-sub / exit-0-only).
-    assert.ok(
-      /bare `?tail -F`?|do \*\*not\*\* use a bare `?tail|TERM\/KILL|kill -TERM|explicit(?:ly)? track|child teardown|terminal-aware/i.test(
-        body,
-      ),
-      `${skillPath} must forbid bare tail -F or require explicit tail child teardown (#699)`,
-    );
-    // Guard: process-sub + exit 0 alone must not be presented as sufficient ownership.
-    assert.ok(
-      !/owns tail via process substitution/i.test(body),
-      `${skillPath} must not claim process substitution owns/terminates tail (#699 f7ea742f)`,
-    );
-    // Forbidden: mktemp -u as a live shell command for FIFO paths (TOCTOU
-    // clobber / data-loss hazard). Comments that name the ban are fine.
-    // Safe pattern: mktemp -d private dir, mkfifo inside it, abort if mkfifo fails.
-    for (const codeLine of body.split("\n")) {
-      const trimmed = codeLine.trim();
-      if (trimmed.startsWith("#")) continue; // prose / shell comment
-      if (/\bmktemp\s+-u\b/.test(trimmed)) {
-        assert.fail(
-          `${skillPath} documents mktemp -u as live code (TOCTOU FIFO clobber hazard; use mktemp -d + mkfifo inside) (#699 de4df498): ${trimmed}`,
-        );
-      }
-    }
-    // When a raw dual-follow fence uses mkfifo, require private-dir + fail-closed mkfifo.
-    const skillLines = body.split("\n");
-    for (let i = 0; i < skillLines.length; i++) {
-      const line = skillLines[i]!;
-      if (!/\bmkfifo\b/.test(line)) continue;
-      let fenceStart = i;
-      while (fenceStart > 0 && !/^```/.test(skillLines[fenceStart - 1]!)) fenceStart--;
-      let fenceEnd = i;
-      while (fenceEnd < skillLines.length - 1 && !/^```/.test(skillLines[fenceEnd + 1]!)) {
-        fenceEnd++;
-      }
-      const fence = skillLines.slice(fenceStart, fenceEnd + 1).join("\n");
-      const hasPrivateDir = /\bmktemp\s+-d\b/.test(fence);
-      const abortsOnMkfifoFail =
-        /mkfifo\s+"?\$[A-Za-z_][A-Za-z0-9_]*"?\s*\|\|/.test(fence) ||
-        /mkfifo[^\n]*\|\|\s*\{/.test(fence) ||
-        /mkfifo[^\n]*\|\|\s*exit/.test(fence);
-      if (!hasPrivateDir || !abortsOnMkfifoFail) {
-        assert.fail(
-          `${skillPath} raw-follow mkfifo fence must use mktemp -d and abort if mkfifo fails (#699 de4df498): ${line}`,
-        );
-      }
-    }
+    assert.doesNotMatch(body, /^\s*tail\s+-F\s+/m);
+    assert.doesNotMatch(body, /\bmktemp\s+-u\b/);
+    assert.doesNotMatch(body, /owns tail via process substitution/i);
   }
+  assert.match(concepts, /loop_run_stopped/);
+  assert.match(concepts, /<state-home>\/runs\/<loop_run_id>\/events\.jsonl/);
 });
 
 // #725: single-issue advance §4 must require re-attach after cancelled/lost
 // follow, treat cancelled wait as non-terminal, and document run-store
 // re-attach path (status + logs --events --follow + summary).
 test("namespaced-commands 7.5b7: host advance skill re-attach + cancelled-wait-not-terminal (#725)", () => {
-  const repoRoot = join(__dirname, "..", "..");
-  const hostSkills = [
-    join(repoRoot, "hosts", "claude", "SKILL.md"),
-    join(repoRoot, "hosts", "codex", "SKILL.md"),
-  ];
-  for (const skillPath of hostSkills) {
+  const concepts = readFileSync(join(REPO_ROOT, "docs", "concepts.md"), "utf8");
+  for (const skillPath of HOST_SKILL_PATHS) {
     const body = readFileSync(skillPath, "utf8");
-
-    // (a) re-attach / re-arm after cancelled or interrupted follow before terminal
-    assert.ok(
-      /re-?attach|re-?arm/i.test(body),
-      `${skillPath} must require re-attach/re-arm after lost advance follow (#725)`,
-    );
-    assert.ok(
-      /(?:cancelled|interrupted|timed-?out|lost)[\s\S]{0,400}(?:re-?attach|re-?arm)|(?:re-?attach|re-?arm)[\s\S]{0,400}(?:cancelled|interrupted|timed-?out|lost)/i.test(
-        body,
-      ),
-      `${skillPath} must tie re-attach to cancelled/interrupted/lost follow (#725)`,
-    );
-    assert.ok(
-      /same turn|same-turn|in the same harness turn/i.test(body),
-      `${skillPath} must require same-turn re-attach for advance follow recovery (#725)`,
-    );
-
-    // (b) cancelled wait is not a terminal pipeline outcome
-    assert.ok(
-      /(?:cancelled|interrupted|timed-?out).{0,120}(?:not|≠|is not).{0,40}terminal|not a terminal pipeline outcome/i.test(
-        body,
-      ),
-      `${skillPath} must state cancelled wait is not a terminal pipeline outcome (#725)`,
-    );
-    assert.ok(
-      /stop watching|must \*\*not\*\* be treated as|must not be treated as/i.test(body),
-      `${skillPath} must forbid treating cancelled wait as stop-watching (#725)`,
-    );
-
-    // (c) run-store re-attach path: status + logs --events --follow + summary
-    assert.ok(
-      /status\s+<N>|status <N>|pipeline status/i.test(body),
-      `${skillPath} re-attach path must include status <N> (#725)`,
-    );
-    assert.ok(
-      /logs\s+<run-id>\s+--events\s+--follow|logs <run-id> --events --follow/i.test(body),
-      `${skillPath} re-attach path must include logs <run-id> --events --follow (#725)`,
-    );
-    assert.ok(
-      /summary\s+<[^>\n]*run-id[^>\n]*>/i.test(body),
-      `${skillPath} re-attach path must include a summary selector with run-id (#725)`,
-    );
-
-    // Advance events follow documents until-terminal default on run_complete
-    assert.ok(
-      /until-terminal|exits 0 after a run_complete|exit 0 after a run_complete|exits 0 on run_complete/i.test(
-        body,
-      ),
-      `${skillPath} must document until-terminal / exit-on-run_complete for advance logs follow (#725)`,
-    );
-
-    // Forbidden: advance logs one-liner that claims unconditional no-auto-exit
-    // without documenting until-terminal / run_complete default.
-    const oneLiners = body
-      .split("\n")
-      .filter(
-        (l) =>
-          /logs\s/.test(l) &&
-          /--events/.test(l) &&
-          /--follow|-f\b/.test(l) &&
-          !/loop logs/.test(l),
-      );
-    for (const line of oneLiners) {
-      if (/no auto-exit on terminal/i.test(line) && !/until-terminal|run_complete/i.test(line)) {
-        assert.fail(
-          `${skillPath} advance logs one-liner claims unconditional no auto-exit without until-terminal docs: ${line}`,
-        );
-      }
-    }
+    assert.ok(/Reattach an interrupted follow/i.test(body), `${skillPath} must require reattach`);
+    assert.ok(/Interrupted follow is non-terminal/i.test(body));
+    assert.ok(/Cancelled wait is not completion/i.test(body));
+    assert.match(body, /pipeline status <N>/);
+    assert.match(body, /pipeline logs <advance-run-id> --events --follow/);
+    assert.match(body, /pipeline loop logs <loop-run-id> --events --follow/);
+    assert.ok(/terminal reason/i.test(body));
   }
+  assert.match(concepts, /pipeline status <N>/);
+  assert.match(concepts, /does not discover a run id/);
+  assert.match(concepts, /pipeline logs <advance-run-id> --events --follow/);
+  assert.match(concepts, /pipeline loop logs <loop-run-id> --events --follow/);
 });
 
 test("namespaced-commands 7.5b6b: host SKILL loop packaging requires same-turn stop + follows stopped (#699)", () => {
@@ -495,41 +301,16 @@ test("namespaced-commands 7.5b6b: host SKILL loop packaging requires same-turn s
 
 // #668 pre-merge: skill lock discovery must not use unanchored grep of $LOOP_PID
 // (pid 123 matching lock pid 12345).
-test("namespaced-commands 7.5b5: host loop skill ownership is exact PID, not grepped prefix", () => {
-  const repoRoot = join(__dirname, "..", "..");
-  const hostSkills = [
-    join(repoRoot, "hosts", "claude", "SKILL.md"),
-    join(repoRoot, "hosts", "codex", "SKILL.md"),
-  ];
-  // Forbidden: grep matching "\"pid\":$LOOP_PID" which prefix-matches 12345 when LOOP_PID=123.
+test("namespaced-commands 7.5b5: generated SKILL does not embed PID-grep discovery", () => {
   const badGrep = /grep\s+-q\s+"\\"pid\\"[^"]*\$LOOP_PID/;
-  for (const path of hostSkills) {
+  for (const path of HOST_SKILL_PATHS) {
     const body = readFileSync(path, "utf8");
-    assert.ok(
-      !badGrep.test(body),
-      `${path} must not use unanchored grep of $LOOP_PID against lock.json (#668)`,
-    );
-    assert.ok(
-      /lock_owned_by_launcher|numeric identity only|exact integer/i.test(body),
-      `${path} should document exact/numeric lock ownership (#668)`,
-    );
-    assert.ok(
-      /LOOP_START|starttime|launcher_instance_alive|PID reuse/i.test(body),
-      `${path} should bind discovery to process starttime against PID reuse (#668)`,
-    );
-    assert.ok(
-      /lstart|Darwin|macOS|portable/i.test(body) && /proc/i.test(body),
-      `${path} should document Linux /proc and Darwin/portable starttime backends (#668)`,
-    );
-    assert.ok(
-      /mktemp/i.test(body),
-      `${path} should use mktemp for per-invocation loop result files (#668)`,
-    );
-    assert.ok(
-      !/pipeline-loop-\$\.out|pipeline-loop-\$\.err|pipeline-loop-\$\$\.out/i.test(body),
-      `${path} must not use colliding /tmp/pipeline-loop-$ paths (#668)`,
-    );
+    assert.ok(!badGrep.test(body), `${path} must not use unanchored grep of $LOOP_PID`);
+    assert.doesNotMatch(body, /pipeline-loop-\$\.out|pipeline-loop-\$\$\.out/);
   }
+  const concepts = readFileSync(join(REPO_ROOT, "docs", "concepts.md"), "utf8");
+  assert.match(concepts, /AGENT_PIPELINE_STATE_HOME/);
+  assert.match(concepts, /<state-home>\/runs\/<loop_run_id>\/events\.jsonl/);
 });
 
 test("namespaced-commands 7.5c: status is a CLI catalog verb, not a required slash file", async () => {

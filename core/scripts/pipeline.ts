@@ -310,6 +310,7 @@ import {
   type AdvanceOpts,
   type PlanningRecoveryDeps,
 } from "./pipeline-run.ts";
+import { nestedAdvanceChildEnv } from "./advance-handoff.ts";
 
 // Re-export for backward compatibility with existing import paths.
 export { isAutoLoopRecoverable, isAutoLoopEligible, canAutoLoopContinue };
@@ -1546,7 +1547,7 @@ export function realDispatchItem(
               ? { engineTrack: cfg.engine_track }
               : {}),
           }),
-          { stdio: "inherit" },
+          { stdio: "inherit", env: nestedAdvanceChildEnv() },
         );
         let pollTimer: ReturnType<typeof setInterval> | undefined;
         let settled = false;

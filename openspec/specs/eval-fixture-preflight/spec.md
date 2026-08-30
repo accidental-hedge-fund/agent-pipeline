@@ -127,57 +127,64 @@ check or defect id. An unrelated hidden check SHALL NOT substitute for a seeded 
 
 ### Requirement: Deep preflight SHALL validate command path resolution and generator-owned allowed outputs
 
-Deep preflight SHALL reject a fixture whose public or hidden check commands resolve to missing
-paths under the cell worktree at the pin (including wrong test roots such as repository-root
-`test/` when tests live under `core/test/`). When a fixture's public checks exercise packaging
-freshness, preflight SHALL resolve the exact generator-owned outputs against the fixture's
-`base_commit`. A historical pin MAY require an exact `plugin/` core-mirror output only when the
-pinned `scripts/build.mjs` proves it generated that path. A post-#1048 pin SHALL require only the exact SKILL
-overlay or marketplace catalog outputs made stale by the fixture's permitted generator inputs;
-an ordinary `core/` edit SHALL NOT imply an unrelated SKILL or catalog output. When
-`allowed_change_paths` is declared, it SHALL include each pin-resolved output or an explicit corpus
-policy SHALL document why the output is omitted. Omission without policy SHALL fail preflight
-naming the fixture and the missing output. A broad `plugin`, `plugin/`, `plugin/**`, or
-`plugin/**/*` allowance SHALL fail this check at every pin.
+Deep preflight SHALL reject a fixture whose public or hidden check commands
+resolve to missing paths under the cell worktree at the pin. When a fixture's
+checks exercise packaging freshness, preflight SHALL resolve the exact
+generator-owned outputs against the fixture's `base_commit`. A historical pin
+MAY require an exact `plugin/` core-mirror output only when the pinned
+`scripts/build.mjs` proves it generated that path. At a post-#1049 pin,
+renderer, `OPERATION_SURFACE`, the outer-host manifest loader, build, or manifest inputs MAY make the exact four
+host SKILLs, transitional plugin SKILL, and marketplace catalog required
+outputs; preflight SHALL require only the exact paths that the pinned generator
+would make stale. An ordinary `core/` edit that is not a packaging-generator
+input SHALL NOT imply those outputs. When `allowed_change_paths` is declared,
+it SHALL include each required pin-resolved output or an explicit corpus policy
+SHALL document why it is omitted. Broad `hosts/**` and `plugin/**` allowances
+SHALL fail.
 
 #### Scenario: Unresolvable check path fails preflight
 
-- **WHEN** a fixture public or hidden check references a path that does not exist at the pin in
-  the cell worktree
+- **WHEN** a fixture public or hidden check references a path that does not
+  exist at the pin in the cell worktree
 - **THEN** preflight SHALL fail naming the fixture and the unresolved path
 
 #### Scenario: Missing exact generated-output allowance fails when regeneration is required
 
-- **WHEN** a fixture declares `allowed_change_paths` and its public checks require regenerating
-  an exact generator-owned output at the fixture's `base_commit`
-- **AND** the boundary omits that exact generated path without an explicit documented exception
-- **THEN** preflight SHALL fail naming the fixture and the missing generator-owned output
-- **AND** preflight SHALL NOT recommend or accept a broad `plugin/**` allowance
+- **WHEN** a fixture declares `allowed_change_paths` and its public checks
+  require regenerating an exact generator-owned output at the fixture's
+  `base_commit`
+- **AND** the boundary omits that exact generated path without an explicit
+  documented exception
+- **THEN** preflight SHALL fail naming the fixture and the missing
+  generator-owned output
+- **AND** preflight SHALL NOT recommend or accept a broad `hosts/**` or
+  `plugin/**` allowance
 
 #### Scenario: Historical build pin requires its exact generated core-mirror path
 
-- **WHEN** a fixture's pinned `scripts/build.mjs` copied an allowed `core/` source
-  into a corresponding generated `plugin/` core-mirror path
+- **WHEN** a fixture's pinned `scripts/build.mjs` copied an allowed `core/`
+  source into a corresponding generated `plugin/` core-mirror path
 - **THEN** preflight SHALL require that exact historical generated path
-- **AND** SHALL NOT replace it with a current SKILL or catalog path that the pinned build did not
-  generate from that source
+- **AND** SHALL NOT replace it with current host SKILL, plugin SKILL, or catalog
+  paths that the pinned build did not generate from that source
 
 #### Scenario: Current ordinary core edit does not require unrelated packaging output
 
-- **WHEN** a post-#1048 fixture permits an ordinary `core/` source edit that is not an input to the
-  generated SKILL overlay or marketplace catalog
+- **WHEN** a post-#1049 fixture permits an ordinary `core/` source edit that is
+  not an input to `renderHostSkill`, `OPERATION_SURFACE`, `load-manifest.ts`, build, a rendered
+  manifest mapping, or the marketplace catalog
 - **AND** its public checks exercise packaging freshness
-- **THEN** preflight SHALL NOT require either generated output solely because the edit is under
-  `core/`
+- **THEN** preflight SHALL NOT require any generated host SKILL, plugin SKILL,
+  or catalog output solely because the edit is under `core/`
 
 #### Scenario: Broad plugin allowance fails at every pin
 
-- **WHEN** packaging freshness checks run and `allowed_change_paths` contains `plugin`, `plugin/`,
-  `plugin/**`, or `plugin/**/*`
+- **WHEN** packaging freshness checks run and `allowed_change_paths` contains a
+  broad `plugin`, `plugin/`, `plugin/**`, `plugin/**/*`, `hosts/**`, or
+  `hosts/**/*` allowance
 - **THEN** preflight SHALL fail naming the broad boundary
-- **AND** remediation SHALL require only exact outputs generated at the fixture's `base_commit`
-
----
+- **AND** remediation SHALL require only exact outputs generated at the
+  fixture's `base_commit`
 
 ### Requirement: Fixture preflight failures SHALL be infrastructure-classified and excluded from quality statistics
 
@@ -198,3 +205,4 @@ record SHALL NOT be treated as a model quality signal.
 - **WHEN** a preflight failure is recorded
 - **THEN** its reason or class SHALL be explicitly identifiable as fixture preflight infrastructure
 - **AND** SHALL be distinguishable from a treatment `completed` outcome with a low grade
+

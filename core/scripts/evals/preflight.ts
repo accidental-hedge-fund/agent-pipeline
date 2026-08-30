@@ -15,6 +15,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { PipelineConfig } from "../types.ts";
+import { SKILL_HOST_IDS } from "../host-skill.ts";
 import {
   evalIsolationEnv,
   installBoundaryShim as installBoundaryShimReal,
@@ -138,10 +139,25 @@ export function findDisallowedTestRootTokens(command: string): string[] {
   return tokens;
 }
 
-/** Exact generated packaging outputs accepted by fixture boundaries (#1048). */
+/** Exact generated host SKILL outputs accepted by fixture boundaries (#1049). */
+export const GENERATED_HOST_SKILL_PATHS = SKILL_HOST_IDS.map((id) => `hosts/${id}/SKILL.md`);
+
+/** Exact generated packaging outputs accepted by fixture boundaries (#1048/#1049). */
 export const GENERATED_PACKAGING_OUTPUT_PATHS = [
+  ...GENERATED_HOST_SKILL_PATHS,
   "plugin/pipeline/skills/pipeline/SKILL.md",
   ".claude-plugin/marketplace.json",
+] as const;
+
+const HOST_SKILL_SOURCE_PATHS = [
+  "core/scripts/host-skill.ts",
+  "core/scripts/operation-surface.ts",
+  "core/scripts/outer-hosts/load-manifest.ts",
+  "scripts/build.mjs",
+  "hosts/claude/outer-host.manifest.json",
+  "hosts/codex/outer-host.manifest.json",
+  "hosts/grok/outer-host.manifest.json",
+  "hosts/opencode/outer-host.manifest.json",
 ] as const;
 
 /** True when public checks exercise generated packaging freshness. */
@@ -189,15 +205,11 @@ export function requiredGeneratedPackagingOutputs(
   }
 
   if (
-    allowed.some(
-      (source) =>
-        source.startsWith("hosts/claude/") ||
-        source === "core/scripts/command-registry.ts" ||
-        source === "core/scripts/command-docs.ts" ||
-        source === "core/scripts/docs-generate.ts" ||
-        source === "core/scripts/operation-surface.ts",
+    allowed.some((source) =>
+      (HOST_SKILL_SOURCE_PATHS as readonly string[]).includes(source),
     )
   ) {
+    for (const output of GENERATED_HOST_SKILL_PATHS) required.add(output);
     required.add("plugin/pipeline/skills/pipeline/SKILL.md");
   }
   if (allowed.includes("scripts/build.mjs")) {

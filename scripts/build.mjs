@@ -1,10 +1,11 @@
 #!/usr/bin/env node
-// Regenerates the committed SKILL overlay and marketplace catalog from
-// hosts/claude/ (+ shared launcher-adjacent assets). Run after editing those
-// sources or when --check reports staleness:
+// Regenerates committed host SKILLs, the transitional plugin SKILL overlay,
+// and the marketplace catalog (#1049). Run after editing renderer sources
+// (`core/scripts/host-skill.ts`, `core/scripts/operation-surface.ts`,
+// outer-host manifests) or when --check reports staleness:
 //
-//   node scripts/build.mjs           regenerate plugin/ SKILL overlay + .claude-plugin/marketplace.json
-//   node scripts/build.mjs --check   verify SKILL overlay and marketplace catalog freshness (CI gate)
+//   node scripts/build.mjs           regenerate four host SKILLs + plugin SKILL + catalog
+//   node scripts/build.mjs --check   verify those exact outputs (CI gate)
 //
 // The product install path is the pipeline CLI plus host SKILL (`install --host claude`).
 // This generator does not vendor core/scripts into plugin/ and does not emit a
@@ -23,14 +24,26 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { applySkillCommandTable } from "../core/scripts/docs-generate.ts";
 import { OPERATION_SURFACE } from "../core/scripts/operation-surface.ts";
+import {
+  SKILL_HOST_IDS,
+  renderHostSkill,
+} from "../core/scripts/host-skill.ts";
 
-export { OPERATION_SURFACE };
+export { OPERATION_SURFACE, SKILL_HOST_IDS, renderHostSkill };
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 export const SKILL_OVERLAY_REL = join("plugin", "pipeline", "skills", "pipeline", "SKILL.md");
 export const MARKETPLACE_CATALOG_REL = join(".claude-plugin", "marketplace.json");
+
+export function hostSkillWriteTargets(ids = SKILL_HOST_IDS) {
+  return ids.map((id) => `hosts/${id}/SKILL.md`);
+}
+
+/** Exact SKILL/catalog targets for write and --check (same list). */
+export function skillAndCatalogTargets(ids = SKILL_HOST_IDS) {
+  return [...hostSkillWriteTargets(ids), SKILL_OVERLAY_REL, MARKETPLACE_CATALOG_REL];
+}
 
 // These directories were wholly generated before #1048 and are no longer part
 // of the plugin package. Keep cleanup scoped to those retired outputs: plugin/
@@ -104,36 +117,23 @@ process.exit(child.status ?? 1);
 `;
 }
 
-// Rewrite the personal-skill paths in the Claude overlay to the plugin runtime
-// path. Claude Code expands ${CLAUDE_PLUGIN_ROOT} for plugin-context commands.
-function pluginSkillMd(operationSurface) {
-  const md = readFileSync(join(REPO_ROOT, "hosts", "claude", "SKILL.md"), "utf8");
-  const pluginMd = applySkillCommandTable(md, "/pipeline", { operationSurface }).replaceAll(
-    "~/.claude/skills/pipeline",
-    "${CLAUDE_PLUGIN_ROOT}/skills/pipeline",
-  );
-  const setupHeading = "## Setup (zero install after first run)";
-  const requiredHeading = "\nRequired:";
-  const setupStart = pluginMd.indexOf(setupHeading);
-  const requiredStart = pluginMd.indexOf(requiredHeading, setupStart);
-  if (setupStart < 0 || requiredStart < 0) {
-    throw new Error("hosts/claude/SKILL.md is missing the expected Setup/Required section");
-  }
-  const bridgeSetup = `${setupHeading}\n\n` +
-    "This transitional marketplace overlay contains no engine core. Its launcher delegates " +
-    "to the managed Claude CLI install under `$CLAUDE_CONFIG_DIR/skills/pipeline` (or " +
-    "`~/.claude/skills/pipeline`). Before first use, provision that install with " +
-    "`npx --yes github:accidental-hedge-fund/agent-pipeline install --host claude`.";
-  return pluginMd.slice(0, setupStart) + bridgeSetup + pluginMd.slice(requiredStart);
-}
-
 function writeJson(path, obj) {
   writeFileSync(path, JSON.stringify(obj, null, 2) + "\n");
 }
 
-export function buildInto(root, { operationSurface = OPERATION_SURFACE } = {}) {
+export function buildInto(
+  root,
+  { operationSurface = OPERATION_SURFACE, manifests } = {},
+) {
   for (const rel of RETIRED_GENERATED_DIRS) {
     rmSync(join(root, rel), { recursive: true, force: true });
+  }
+
+  const skill = renderHostSkill({ operationSurface, manifests });
+  for (const rel of hostSkillWriteTargets()) {
+    const abs = join(root, rel);
+    mkdirSync(dirname(abs), { recursive: true });
+    writeFileSync(abs, skill);
   }
 
   const skillDir = join(root, "plugin", "pipeline", "skills", "pipeline");
@@ -141,8 +141,9 @@ export function buildInto(root, { operationSurface = OPERATION_SURFACE } = {}) {
   mkdirSync(join(root, "plugin", "pipeline", ".claude-plugin"), { recursive: true });
   mkdirSync(join(root, ".claude-plugin"), { recursive: true });
 
-  // SKILL overlay + launcher shim only. Do not copy core/ into plugin/ (#1048).
-  writeFileSync(join(skillDir, "SKILL.md"), pluginSkillMd(operationSurface));
+  // Plugin SKILL calls the same renderer directly. Do not read a generated
+  // host file or restore the Setup/Required essay.
+  writeFileSync(join(skillDir, "SKILL.md"), skill);
   const shim = join(skillDir, "scripts", "pipeline.mjs");
   writeFileSync(shim, renderClaudePluginBridge());
   chmodSync(shim, 0o755);
@@ -162,7 +163,7 @@ export function buildInto(root, { operationSurface = OPERATION_SURFACE } = {}) {
 }
 
 export function compare(generatedRoot, repoRoot = REPO_ROOT) {
-  const targets = [SKILL_OVERLAY_REL, MARKETPLACE_CATALOG_REL];
+  const targets = skillAndCatalogTargets();
   const drift = [];
   for (const rel of targets) {
     const a = join(generatedRoot, rel);
@@ -174,27 +175,32 @@ export function compare(generatedRoot, repoRoot = REPO_ROOT) {
   return drift;
 }
 
+/** Real `--check` path: generate into a temp tree and compare to `repoRoot`. */
+export function checkSkillCatalogFreshness(repoRoot = REPO_ROOT) {
+  const tmp = mkdtempSync(join(tmpdir(), "agent-pipeline-build-"));
+  try {
+    buildInto(tmp);
+    return compare(tmp, repoRoot);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 function main() {
   const check = process.argv.includes("--check");
   if (check) {
-    const tmp = mkdtempSync(join(tmpdir(), "agent-pipeline-build-"));
-    try {
-      buildInto(tmp);
-      const drift = compare(tmp);
-      if (drift.length) {
-        console.error(
-          "✗ SKILL overlay or marketplace catalog is out of date — run `node scripts/build.mjs` and commit:",
-        );
-        for (const d of drift) console.error(`  - ${d}`);
-        process.exit(1);
-      }
-      console.log("✓ SKILL overlay and marketplace catalog are up to date");
-    } finally {
-      rmSync(tmp, { recursive: true, force: true });
+    const drift = checkSkillCatalogFreshness();
+    if (drift.length) {
+      console.error(
+        "✗ host SKILL, plugin SKILL overlay, or marketplace catalog is out of date — run `node scripts/build.mjs` and commit:",
+      );
+      for (const d of drift) console.error(`  - ${d}`);
+      process.exit(1);
     }
+    console.log("✓ host SKILLs, plugin SKILL overlay, and marketplace catalog are up to date");
   } else {
     buildInto(REPO_ROOT);
-    console.log("✓ generated SKILL overlay and .claude-plugin/marketplace.json");
+    console.log("✓ generated host SKILLs, plugin SKILL overlay, and .claude-plugin/marketplace.json");
   }
 }
 

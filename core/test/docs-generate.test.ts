@@ -3,7 +3,6 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  applySkillCommandTable,
   buildGeneratedArtifacts,
   CLI_BEGIN_MARKER,
   CLI_END_MARKER,
@@ -13,13 +12,14 @@ import {
   renderChangelogMarkdown,
   renderCliMarkdown,
   renderConfigMarkdown,
-  renderSkillCommandTable,
   replaceMarkedRegion,
   type ChangelogRelease,
   type JsonSchemaNode,
 } from "../scripts/docs-generate.ts";
+import { renderHostSkill } from "../scripts/host-skill.ts";
 import {
   COMMAND_DOCS,
+  formatHostUsage,
   listDocumentedCommands,
   type CommandDoc,
 } from "../scripts/command-docs.ts";
@@ -124,7 +124,7 @@ describe("command-docs metadata", () => {
     assert.equal(doc.documented, true);
     assert.equal(
       doc.usage,
-      "train --milestone <m>|--issues <n,n> [--merge] [--json] [--dry-run]",
+      "train --milestone <m> [--merge] [--json] [--dry-run] | train --issues <n,n> [--merge] [--json] [--dry-run]",
     );
   });
 
@@ -151,7 +151,7 @@ describe("command-docs metadata", () => {
     assert.ok(!listed.includes("run"));
   });
 
-  test("OPERATION_SURFACE drives the default CLI and SKILL catalog", () => {
+  test("OPERATION_SURFACE drives the default CLI catalog", () => {
     const status = OPERATION_SURFACE.find((op) => op.name === "status");
     assert.ok(status);
     const mutableStatus = status as { desc: string };
@@ -160,7 +160,7 @@ describe("command-docs metadata", () => {
     try {
       mutableStatus.desc = marker;
       assert.match(renderCliMarkdown(), new RegExp(marker));
-      assert.match(renderSkillCommandTable({ hostToken: "/pipeline" }), new RegExp(marker));
+      assert.match(renderHostSkill(), new RegExp(marker));
     } finally {
       mutableStatus.desc = original;
     }
@@ -217,33 +217,51 @@ describe("renderCliMarkdown", () => {
     });
     assert.ok(!md.includes("ghost"));
   });
+
+  test("formatHostUsage prefixes every spaced-pipe alternative", () => {
+    const loop = formatHostUsage(
+      "pipeline",
+      "loop --milestone <m> | loop --label <l> | loop --resume <run-id>",
+    );
+    assert.equal(
+      loop,
+      "pipeline loop --milestone <m> | pipeline loop --label <l> | pipeline loop --resume <run-id>",
+    );
+    const doctor = formatHostUsage("pipeline", "doctor [--json|--is-ok]");
+    assert.equal(doctor, "pipeline doctor [--json|--is-ok]");
+  });
+
+  test("every rendered CLI alternative is a complete pipeline invocation", () => {
+    const md = renderCliMarkdown();
+    const usages = [...md.matchAll(/- \*\*Usage:\*\* `([^`]+)`/g)].map((m) => m[1]!);
+    assert.ok(usages.length > 0, "cli markdown must contain usage lines");
+    for (const usage of usages) {
+      for (const alt of usage.split(/\s+\|\s+/)) {
+        assert.match(
+          alt.trim(),
+          /^pipeline /,
+          `rendered alternative is not a complete pipeline invocation: ${alt}`,
+        );
+      }
+    }
+    assert.ok(
+      usages.some((u) => u.includes("pipeline loop --label")),
+      "later loop alternatives must keep the pipeline prefix",
+    );
+    assert.doesNotMatch(
+      usages.find((u) => u.includes("pipeline loop")) ?? "",
+      / \| loop --/,
+      "copying a later loop alternative must not run `loop` as a separate command",
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------
-// SKILL tables
+// Marked-region helper (docs pages; SKILL tables are owned by build.mjs)
 // ---------------------------------------------------------------------------
 
-describe("renderSkillCommandTable", () => {
-  test("both hosts list the same documented commands; token differs", () => {
-    const claude = renderSkillCommandTable({
-      hostToken: "/pipeline",
-      registry: FIXTURE_REGISTRY,
-      docs: FIXTURE_DOCS,
-    });
-    const codex = renderSkillCommandTable({
-      hostToken: "$pipeline",
-      registry: FIXTURE_REGISTRY,
-      docs: FIXTURE_DOCS,
-    });
-    assert.match(claude, /\/pipeline status <n>/);
-    assert.match(codex, /\$pipeline status <n>/);
-    assert.ok(!claude.includes("$pipeline"));
-    assert.ok(!codex.includes("/pipeline status"));
-    assert.ok(!claude.includes("papercut"));
-    assert.ok(!codex.includes("papercut"));
-  });
-
-  test("replaceMarkedRegion rewrites only the generated block", () => {
+describe("replaceMarkedRegion", () => {
+  test("rewrites only the generated block", () => {
     const src = [
       "# Skill",
       "",
@@ -257,18 +275,15 @@ describe("renderSkillCommandTable", () => {
       "keep me",
       "",
     ].join("\n");
-    const out = applySkillCommandTable(src, "/pipeline", {
-      registry: FIXTURE_REGISTRY,
-      docs: FIXTURE_DOCS,
-    });
+    const out = replaceMarkedRegion(src, CLI_BEGIN_MARKER, CLI_END_MARKER, "new body\n");
     assert.ok(out.includes("## Setup\nkeep me"));
     assert.ok(out.includes(CLI_BEGIN_MARKER));
     assert.ok(out.includes(CLI_END_MARKER));
-    assert.ok(out.includes("/pipeline status <n>"));
+    assert.ok(out.includes("new body"));
     assert.ok(!out.includes("old body"));
   });
 
-  test("replaceMarkedRegion throws when markers missing", () => {
+  test("throws when markers missing", () => {
     assert.throws(
       () => replaceMarkedRegion("no markers", CLI_BEGIN_MARKER, CLI_END_MARKER, "x"),
       /markers not found/,
@@ -353,19 +368,8 @@ describe("renderChangelogMarkdown", () => {
 // ---------------------------------------------------------------------------
 
 describe("buildGeneratedArtifacts", () => {
-  test("produces cli, config, changelog; skill only when sources provided", () => {
-    const skill = [
-      "header",
-      CLI_BEGIN_MARKER,
-      "old",
-      CLI_END_MARKER,
-      "footer",
-    ].join("\n");
+  test("produces cli, config, changelog and never a host SKILL", () => {
     const arts = buildGeneratedArtifacts({
-      skillClaude: skill,
-      skillCodex: skill,
-      skillOmp: skill,
-      skillOpencode: skill,
       configSchema: FIXTURE_SCHEMA,
       changelogReleases: [{ version: "1.0.0", date: "2026-06-10", subject: "first" }],
       registry: FIXTURE_REGISTRY,
@@ -376,24 +380,15 @@ describe("buildGeneratedArtifacts", () => {
       "CHANGELOG.md",
       "docs/cli.md",
       "docs/config.md",
-      "hosts/claude/SKILL.md",
-      "hosts/codex/SKILL.md",
-      "hosts/omp/SKILL.md",
-      "hosts/opencode/SKILL.md",
     ]);
     const cli = arts.find((a) => a.relPath === "docs/cli.md")!.content;
     assert.match(cli, /status/);
     assert.ok(!cli.includes("papercut"));
-    for (const relPath of [
-      "hosts/claude/SKILL.md",
-      "hosts/codex/SKILL.md",
-      "hosts/omp/SKILL.md",
-      "hosts/opencode/SKILL.md",
-    ]) {
-      const content = arts.find((artifact) => artifact.relPath === relPath)!.content;
-      assert.match(content, /status/);
-      assert.ok(!content.includes("papercut"));
-    }
+    assert.equal(
+      arts.some((a) => a.relPath.includes("SKILL.md")),
+      false,
+      "docs generator must not emit a host SKILL",
+    );
   });
 
   test("staleness bite: corrupted content differs from fresh generation", () => {

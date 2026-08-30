@@ -29,6 +29,7 @@ const SHARED_ORCH_SOURCES = [
 const HOST_SKILLS = [
   "hosts/claude/SKILL.md",
   "hosts/codex/SKILL.md",
+  "hosts/grok/SKILL.md",
   "hosts/opencode/SKILL.md",
 ];
 

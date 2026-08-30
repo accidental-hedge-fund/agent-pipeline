@@ -14,6 +14,8 @@ const repoRoot = path.resolve(here, "..", "..");
 const HOST_SKILLS = [
   { label: "claude", path: path.join(repoRoot, "hosts/claude/SKILL.md") },
   { label: "codex", path: path.join(repoRoot, "hosts/codex/SKILL.md") },
+  { label: "grok", path: path.join(repoRoot, "hosts/grok/SKILL.md") },
+  { label: "opencode", path: path.join(repoRoot, "hosts/opencode/SKILL.md") },
 ] as const;
 
 /** Extract §4b.d through the next #### heading (e. or successor). */
@@ -121,8 +123,14 @@ function assertMandatoryDualFollow(section: string, label: string): void {
 for (const { label, path: skillPath } of HOST_SKILLS) {
   test(`loop dual-follow drift-guard: ${label} host skill mandates post-linkage advance follow (#684)`, () => {
     const source = fs.readFileSync(skillPath, "utf8");
-    const section = dualFollowSection(source, label);
-    assertMandatoryDualFollow(section, label);
+    assert.match(source, /loop_item_advance_linked/);
+    assert.match(source, /pipeline logs <advance-run-id> --events --follow/);
+    assert.match(source, /pipeline loop logs <loop-run-id> --events --follow/);
+    assert.match(source, /Keep the loop follow\s+active/);
+    assert.match(source, /stop or replace the prior\s+advance follow/);
+    assert.match(source, /Do not guess an advance id before linkage/);
+    assert.doesNotMatch(source, OPTIONAL_ONLY_POST_LINKAGE);
+    assert.doesNotMatch(source, OPTIONAL_ONLY_HEADING);
   });
 }
 

@@ -153,6 +153,10 @@ const RELEASE_MANAGED_PATHS = [
   "ROADMAP.md",
   "plugin",
   ".claude-plugin",
+  "hosts/claude/SKILL.md",
+  "hosts/codex/SKILL.md",
+  "hosts/grok/SKILL.md",
+  "hosts/opencode/SKILL.md",
 ] as const;
 
 /** True when argv names a managed path (`plugin` or `plugin/`). */
@@ -177,7 +181,8 @@ function restoreInvoked(commands: string[][]): boolean {
       c.includes("package.json") &&
       c.includes("core/package.json") &&
       c.includes("ROADMAP.md") &&
-      c.includes("plugin"),
+      c.includes("plugin") &&
+      c.includes("hosts/claude/SKILL.md"),
   );
 }
 
@@ -1780,7 +1785,7 @@ test("runRelease: clean-tree guard forces --untracked-files=all (config-independ
   // The pathspec covers all five release-managed paths (after the `--` separator).
   const sep = statusCalls[0].indexOf("--");
   const paths = statusCalls[0].slice(sep + 1);
-  for (const p of ["package.json", "core/package.json", "ROADMAP.md", "plugin", ".claude-plugin"]) {
+  for (const p of RELEASE_MANAGED_PATHS) {
     assert.ok(paths.includes(p), `pathspec includes ${p}, got: ${paths.join(" ")}`);
   }
 });
@@ -2763,6 +2768,10 @@ test("runRelease: git add after FRG pass must not include gitignored .agent-pipe
   assert.ok(add.includes("ROADMAP.md"));
   assert.ok(add.includes("plugin/"));
   assert.ok(add.includes(".claude-plugin/"));
+  assert.ok(add.includes("hosts/claude/SKILL.md"));
+  assert.ok(add.includes("hosts/codex/SKILL.md"));
+  assert.ok(add.includes("hosts/grok/SKILL.md"));
+  assert.ok(add.includes("hosts/opencode/SKILL.md"));
   assert.ok(!add.includes("CHANGELOG.md"), "prepare must not stage CHANGELOG.md");
 });
 

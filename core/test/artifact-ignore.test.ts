@@ -125,22 +125,14 @@ test("repo .gitignore lists .agent-pipeline/factory-release/ so uncommitted chec
   );
 });
 
-test("README and host SKILL.md ignored-path lists include factory-release/ (#1259)", () => {
+test("README and durable docs list every ARTIFACT_CONTRACT path", () => {
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
-  const required = [
-    ".agent-pipeline/runs/",
-    ".agent-pipeline/roadmap/",
-    ".agent-pipeline/history/",
-    ".agent-pipeline/frg/",
-    ".agent-pipeline/factory-release/",
-  ];
+  const required = ARTIFACT_CONTRACT.map((entry) =>
+    entry.isFile ? `.agent-pipeline/${entry.name}` : `.agent-pipeline/${entry.name}/`,
+  );
   const docs = [
     "README.md",
     "docs/concepts.md",
-    "hosts/claude/SKILL.md",
-    "hosts/codex/SKILL.md",
-    "hosts/opencode/SKILL.md",
-    "hosts/omp/SKILL.md",
   ];
   for (const rel of docs) {
     const body = fs.readFileSync(path.join(repoRoot, rel), "utf8");

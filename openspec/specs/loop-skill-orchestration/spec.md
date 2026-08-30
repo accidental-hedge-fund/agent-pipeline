@@ -5,507 +5,362 @@ TBD - created by archiving change loop-skill-event-orchestration. Update Purpose
 ## Requirements
 ### Requirement: `pipeline loop` packaging SHALL NOT claim seconds-only runs or forbid Monitor
 
-Host packaging for multi-item drive and resume of `pipeline loop` SHALL treat the
-operation as long-running. Host skill guidance for drive and resume SHALL NOT claim
-that the command “completes in seconds” and SHALL NOT instruct harnesses that “no
-background process or Monitor is needed.” Read-only `--audit` MAY remain documented
-as a short synchronous mode. This requirement SHALL NOT depend on generated Claude
-command docs or on `plugin/pipeline/commands/pipeline:loop.md`.
+The shared one-pager renderer and durable operator docs SHALL classify `pipeline loop` drive and resume as long-running and SHALL direct the observer to retain the handoff `loop_run_id` and use `pipeline loop logs <loop-run-id> --events --follow`. No generated host SKILL or durable loop guide SHALL claim that drive or resume completes in seconds or that no background follow or host-equivalent Monitor is needed. Read-only `pipeline loop --audit` MAY remain documented as a short synchronous mode. This requirement SHALL NOT depend on a generated per-verb command file.
 
 #### Scenario: Host loop guidance omits the fast-path falsehood
 
-- **WHEN** the Claude or Codex host SKILL describes `pipeline loop` drive or resume
-- **THEN** that guidance SHALL NOT contain the substring “completes in seconds”
-  (case-insensitive)
-- **AND** SHALL NOT contain the substring “No background process or Monitor needed”
-  (case-insensitive)
+- **WHEN** any generated host SKILL describes loop drive or resume
+- **THEN** it SHALL name `pipeline loop logs <loop-run-id> --events --follow`
+- **AND** it SHALL NOT contain the fast-path claims “completes in seconds” or “No background process or Monitor needed”
 
 #### Scenario: Plugin command mirror matches the long-running classification
 
-- **WHEN** `scripts/build.mjs` is run
-- **THEN** it SHALL NOT write `plugin/pipeline/commands/pipeline:loop.md`
-- **AND** long-running or event-follow guidance SHALL live on the host SKILL (or CLI docs), not on a slash-command file
+- **WHEN** packaging is generated
+- **THEN** it SHALL NOT write `plugin/pipeline/commands/pipeline:loop.md` or an equivalent per-verb agent file
+- **AND** loop follow guidance SHALL come from the shared one-pager and durable docs
 
 #### Scenario: Audit mode stays synchronous
 
-- **WHEN** host or command docs describe `pipeline loop --audit`
-- **THEN** they MAY document that mode as read-only and seconds-long
-- **AND** they SHALL NOT use that audit guidance as the orchestration rule for
-  drive or resume
-
-### Requirement: Loop orchestration docs SHALL specify handoff, follow, notify, stop, and summarize
-
-Host skill guidance for `pipeline loop` drive and resume (Claude and Codex) SHALL specify an ordered harness orchestration protocol:
-
-1. Resolve state-home and start or resume the loop **non-blocking** (so mid-flight
-   follow is possible; the loop CLI has no `--detach` yet).
-2. Obtain `run_id` and the loop events path **before supervisor completion**, in
-   this order of preference: (a) early handoff carrying at least `run_id` and a
-   loop events path when present; (b) `--resume <run-id>` or an operator-known id;
-   (c) race-safe state-home discovery — snapshot `<state-home>/runs/`, then scan
-   every candidate directory (ignore `.init-*` staging) and select **only** a run
-   that has `contract.json` + `events.jsonl` and a live lock held by the started
-   supervisor pid (covers newly published and pre-existing re-drive). Do **not**
-   select the first newly published directory by glob order when lock ownership
-   is unknown; keep polling until a lock-owned match appears or the supervisor
-   exits. The terminal printed result JSON SHALL be documented as a
-   final-summary surface only, not as the sole mid-flight source of `run_id` for
-   a newly started drive.
-3. Follow the loop event stream (persistent Monitor or host-equivalent follow).
-4. Optionally follow an active item’s advance event stream when that advance
-   `run_id` is published.
-5. Stop following on a terminal loop outcome (including `loop_run_stopped`) or
-   supervisor process exit — **in the same harness turn**, stopping all
-   run-scoped loop and advance Monitors/follows for that `run_id` without
-   waiting for an operator kill.
-6. Print a final summary (including `pipeline loop --audit` or the documented
-   summary surface) that includes the terminal/stop reason and confirmation that
-   follows were stopped.
-
-#### Scenario: Ordered steps are present in host skill guidance
-
-- **WHEN** an operator reads the loop orchestration section of `hosts/claude/SKILL.md`
-  or `hosts/codex/SKILL.md`
-- **THEN** the text SHALL list start/resume, handoff/`run_id`+events path, event
-  follow, stop on terminal outcome or process exit (same-turn teardown of
-  run-scoped follows), and summary/`--audit` as ordered steps
-
-#### Scenario: New drive obtains run_id before completion without early handoff
-
-- **WHEN** a harness starts a new multi-item drive and no early handoff is present
-- **THEN** the host skill guidance SHALL instruct non-blocking start plus race-safe
-  state-home discovery of the run directory before supervisor exit
-- **AND** SHALL NOT instruct relying solely on the terminal result JSON for
-  mid-flight event following of that new drive
-
-#### Scenario: Optional item-advance follow is not required before linkage exists
-
-- **WHEN** no advance `run_id` has been published for the active item
-- **THEN** the harness SHALL still follow the loop event stream
-- **AND** the docs SHALL NOT require a non-existent advance-linkage field
-
-#### Scenario: Stop step requires same-turn teardown
-
-- **WHEN** a terminal loop outcome (`loop_run_stopped`) or supervisor exit occurs
-- **THEN** the ordered protocol step for stop SHALL require ending run-scoped
-  loop and advance follows in the same turn
-- **AND** the subsequent summary step SHALL include terminal reason and follows
-  stopped confirmation
-
-### Requirement: Material loop event kinds SHALL be listed for harness notifications
-
-Loop orchestration guidance SHALL list material loop event kinds that warrant a
-harness notification via the **host notify map** (Claude `PushNotification`,
-Grok host `monitor` material lines, Codex chat/status — not a single universal
-Claude-only tool). The must-notify set SHALL include at least
-`loop_item_started`, `loop_item_transitioned`, `loop_item_blocked`,
-`loop_item_advance_linked` (or equivalent linkage kind), material
-`loop_item_stage_progress` when present, material `loop_item_progress`, and
-`loop_run_stopped`. The guidance SHALL also name schedule and reconcile event
-kinds that are appropriate to surface without requiring a notification on every
-identical repeated evaluation in a polling burst. Host skill text SHALL apply
-the shared material filter (or equivalent material-only rules) so dual raw
-unfiltered JSONL notify is not the preferred path.
-
-#### Scenario: Must-notify kinds are named
-
-- **WHEN** an operator reads the material-events list in host skill guidance
-- **THEN** the list SHALL include `loop_item_started`, `loop_item_transitioned`,
-  `loop_item_blocked`, and `loop_run_stopped`
-
-#### Scenario: Burst suppression is documented
-
-- **WHEN** the guidance describes schedule or reconcile notifications
-- **THEN** it SHALL instruct harnesses to suppress repeated identical evaluations
-  in the same burst rather than notify on every identical line
-
-#### Scenario: Notify is host-map based not Claude-only
-
-- **WHEN** an operator reads the loop material-notify step in Claude, Codex, or
-  Grok-consumed skill packaging
-- **THEN** the mandatory step SHALL refer to the host notify map (or host-local
-  equivalent)
-- **AND** non-Claude hosts SHALL NOT be required to call `PushNotification`
+- **WHEN** durable docs describe `pipeline loop --audit`
+- **THEN** they MAY call that read-only operation short and synchronous
+- **AND** they SHALL NOT apply that classification to drive or resume
 
 ---
 
-### Requirement: Docs SHALL provide an interim loop events follow path without forbidding monitoring
+### Requirement: Loop orchestration docs SHALL specify handoff, follow, notify, stop, and summarize
 
-Loop orchestration docs SHALL document following the loop store event log at
-`<state-home>/runs/<run_id>/events.jsonl` as the interim path until a dedicated
-loop logs-follow CLI is universally available, including the state-home
-resolution order (explicit Pipeline state-home override, then XDG state
-directory under `agent-pipeline/loop`, then the home-relative default). The docs
-SHALL NOT forbid Monitor or background following while waiting for a future CLI.
-When a loop logs CLI exists, docs MAY prefer it and SHALL keep the file path as
-a valid fallback.
+`core/scripts/host-skill.ts` and every generated host SKILL SHALL carry the same compact, ordered loop protocol: retain `loop_run_id` from the durable handoff; follow `pipeline loop logs <loop-run-id> --events --follow`; notify material events through the active host-notify row; after `loop_item_advance_linked` publishes `pipeline_run_id`, retain that value as the linked `advance_run_id` and also follow that item with `pipeline logs <advance-run-id> --events --follow`; re-attach any interrupted live follow with the retained id; and on `loop_run_complete`, `loop_run_stopped`, or any supervisor exit stop all follows scoped to that loop in the same turn. A confirmed terminal loop event SHALL lead to a final summary containing the terminal reason and confirmation that follows stopped. A supervisor exit before terminal SHALL instead be reported as a non-terminal failure/recovery condition and SHALL NOT be called completion. The follower SHALL NOT invoke a merge-capable command. Detailed state-home discovery, event inventories, and dual-follow scripts SHALL live in durable docs or the shared material filter rather than in a generated SKILL.
 
-#### Scenario: Interim path is concrete
+#### Scenario: Ordered steps are present in host skill guidance
 
-- **WHEN** a harness follows the interim guidance
-- **THEN** the docs SHALL name `events.jsonl` under `<state-home>/runs/<run_id>/`
-- **AND** SHALL describe how `<state-home>` is resolved
+- **WHEN** an operator reads any generated host SKILL
+- **THEN** it SHALL list retained `loop_run_id`, `pipeline loop logs <loop-run-id> --events --follow`, material notify, retained linked `advance_run_id`, linked advance follow, retained-id re-attach, terminal-or-exit teardown, and confirmed-terminal final summary as compact ordered obligations
+- **AND** it SHALL distinguish the loop command from `pipeline logs <advance-run-id> --events --follow`
+- **AND** it SHALL report premature supervisor exit as non-terminal failure/recovery rather than completion
 
-#### Scenario: Monitoring is never forbidden for drive/resume
+#### Scenario: New drive obtains run_id before completion without early handoff
 
-- **WHEN** drive or resume orchestration guidance is read
-- **THEN** it SHALL NOT instruct the harness to avoid Monitor, background process,
-  or event following
+- **WHEN** a harness starts a new drive
+- **THEN** the compact contract SHALL require retaining `loop_run_id` from the durable handoff before following
+- **AND** durable docs SHALL describe race-safe state-home discovery when an early handoff is unavailable
+
+#### Scenario: Optional item-advance follow is not required before linkage exists
+
+- **WHEN** the active item has not published a `loop_item_advance_linked` event
+  carrying `pipeline_run_id`
+- **THEN** the harness SHALL continue the loop logs follow
+- **AND** it SHALL NOT guess a linked advance id
+
+#### Scenario: Stop step requires same-turn teardown
+
+- **WHEN** the loop becomes terminal or its supervisor exits
+- **THEN** the compact contract SHALL require same-turn teardown of the loop follow and any linked advance follow
+- **AND** a confirmed terminal event SHALL produce the terminal reason and follows-stopped summary
+- **AND** an exit without confirmed terminal SHALL produce a non-terminal failure/recovery report and SHALL NOT claim completion
+
+#### Scenario: The follower does not merge
+
+- **WHEN** the loop follower reports progress or terminal state
+- **THEN** it SHALL NOT invoke `merge`, `merge-queue --apply`, `train --merge`, or `ship`
 
 ---
 
 ### Requirement: A drift-guard SHALL fail if the seconds-only / no-Monitor loop guidance returns
 
-The repository’s automated tests (or an install/build check covered by `npm run ci`) SHALL fail if host SKILL guidance reintroduces a fast-path claim that `pipeline loop` drive/resume completes in seconds or forbids Monitor, background execution, or event following. This guard SHALL inspect the SKILL/CLI guidance and SHALL NOT depend on `renderClaudeCommand` or a generated per-verb command file.
+Automated checks covered by `npm run ci` SHALL fail if `renderHostSkill()`, any generated host SKILL, or the durable loop docs classify loop drive/resume as seconds-only, forbid follow/Monitor, or omit the retained-id primary `pipeline loop logs <loop-run-id> --events --follow` contract. The guard SHALL inspect shared rendered output and durable docs and SHALL NOT depend on `renderClaudeCommand` or a generated per-verb command file.
 
 #### Scenario: Forbidden phrase fails the guard
 
-- **WHEN** a Claude or Codex host SKILL describes `pipeline loop` drive/resume as
-  completing in seconds or says “No background process or Monitor needed”
-- **THEN** the drift-guard test or check SHALL fail
+- **WHEN** the shared renderer or any generated host SKILL says loop drive/resume completes in seconds or needs no background follow
+- **THEN** the drift guard SHALL fail
 
 #### Scenario: True-fast commands remain allowed to use the fast template
 
-- **WHEN** CLI or SKILL guidance describes a true-fast operation such as `status` or `doctor`
-- **THEN** the loop drift-guard SHALL NOT fail solely because those operations
-  use seconds-only guidance
-- **AND** no per-verb command renderer SHALL be required
-
-### Requirement: Loop orchestration docs SHALL treat pre-merge gate progress as material loop events
-
-Host skill guidance for `pipeline loop` drive and resume SHALL list the shared
-loop progress event kind used for pre-merge gate sub-steps (default name
-`loop_item_progress`, or the single shared progress kind name if renamed to
-converge with stage progress) among material loop events that warrant a harness
-notification via the host notify map when `domain` is `pre_merge` and `status`
-is a definitive outcome (`pass`, `fail`, `approve`, `needs_attention`,
-`attempted`, `success`, `exhausted`, `blocked`, `advanced`) or the first
-`waiting` for a CI stretch. The guidance SHALL state that these events appear on
-the **loop** event stream while advance linkage is active so hosts are not
-forced to parse advance-only logs for major gate outcomes. Notify delivery SHALL
-use each host's map entry; guidance SHALL NOT hard-require Claude
-`PushNotification` on non-Claude hosts.
-
-#### Scenario: Material list includes progress kind
-
-- **WHEN** an operator reads the material-events list in host skill guidance
-- **THEN** the list SHALL include the shared progress event kind
-  (`loop_item_progress` or the converged shared name)
-
-#### Scenario: Docs state loop stream carries pre-merge gate outcomes
-
-- **WHEN** an operator reads loop orchestration guidance for mid-item progress
-- **THEN** the text SHALL state that material pre-merge gate outcomes (CI,
-  OpenSpec archive, delta review, auto-fix, terminal blocked/advanced) are
-  published on the loop event stream while the item is advance-linked
-
-#### Scenario: First waiting only per CI stretch
-
-- **WHEN** the guidance describes `loop_item_progress` CI `waiting` notifications
-- **THEN** it SHALL instruct notifying on the first waiting in a stretch and
-  suppressing subsequent identical waiting polls until a definitive outcome
+- **WHEN** docs classify `status`, `doctor`, or read-only loop audit as synchronous
+- **THEN** the loop drift guard SHALL NOT fail solely for that classification
 
 ---
-
-### Requirement: Loop orchestration docs SHALL keep optional advance follow for full fidelity
-
-Host skill guidance SHALL continue to document that following the linked
-advance `events.jsonl` path (from `loop_item_advance_linked`) remains available
-for full-fidelity stage and harness detail. After pre-merge gate progress is
-mirrored onto the loop stream, advance follow SHALL be documented as optional
-for gate outcomes (not required solely to learn CI/delta/auto-fix results),
-while remaining useful for deeper diagnostics.
-
-#### Scenario: Optional advance follow remains documented
-
-- **WHEN** an operator reads the loop orchestration section
-- **THEN** the text SHALL still describe how to obtain the advance `events`
-  path from linkage and optionally follow it
-- **AND** SHALL NOT claim that advance follow is the only way to observe
-  material pre-merge gate outcomes once loop progress mirroring is present
-
-### Requirement: Host skill guidance SHALL mandate dual-follow lifecycle after advance linkage
-
-Host skill guidance for `pipeline loop` drive and resume (Claude and Codex) SHALL
-require that, once advance linkage is published for an item, the harness follows
-both the loop event stream and that item’s advance event stream until a terminal
-condition applies. On a new item’s advance linkage, the guidance SHALL instruct
-the harness to switch or add follow for the new advance run. On a terminal
-advance outcome for the prior item, the guidance SHALL instruct stopping that
-prior advance follow. Loop-stream follow SHALL continue until a terminal loop
-outcome or supervisor process exit. Preference order for the advance follow
-target SHALL be: (1) `pipeline logs <advance-run-id> --events --follow` or
-host-packaged equivalent when `pipeline_run_id` is known; (2) absolute `events`
-path from the linkage record.
-
-#### Scenario: Skill names preferred advance follow command
-
-- **WHEN** an operator reads §4b.d (or successor) in `hosts/claude/SKILL.md` or
-  `hosts/codex/SKILL.md`
-- **THEN** the text SHALL show or name `logs … --events --follow` against the
-  advance run id as the preferred follow path
-- **AND** SHALL accept the absolute advance `events` path from linkage as a
-  valid alternative target
-
-#### Scenario: Item switch stops prior advance follow
-
-- **WHEN** a later item publishes a new advance linkage while a prior item’s
-  advance follow is active, or the prior item reaches a terminal advance outcome
-- **THEN** the guidance SHALL instruct stopping or replacing the prior item’s
-  advance follow rather than leaving an unbounded set of stale advance follows
-
-#### Scenario: Loop follow continues across item boundaries
-
-- **WHEN** an item’s advance follow ends after a terminal advance outcome but the
-  loop run is still live
-- **THEN** the guidance SHALL keep the loop event stream follow active until a
-  terminal loop outcome or supervisor exit
-
----
-
-### Requirement: Dual-follow guidance SHALL list material advance event kinds for operator surface
-
-Host skill guidance for mandatory dual-follow SHALL list material **advance**
-event kinds that warrant harness notification via the host notify map, in the
-same spirit as single-issue advance orchestration and aligned with the shared
-material filter. The must-surface set SHALL include at least `stage_start`,
-`stage_complete`, `pr_created`, `review_verdict`, `gate_result`, `blocker_set`,
-and `run_complete` (and SHOULD include `run_start`, `pr_updated`, and
-`blocker_cleared` when present on the advance stream). The guidance SHALL
-instruct suppressing pure CI poll spam (including repeated
-`pre_merge.advancePolling`-style updates and repeated CI `partial` / OpenSpec
-`skipped` spam in the same burst). Dual-follow SHALL apply material-only notify
-rules to **both** the loop stream and the linked advance stream.
-
-#### Scenario: Material advance kinds are named
-
-- **WHEN** an operator reads the dual-follow / advance material-events guidance
-  in host skill text
-- **THEN** the list SHALL include `stage_start`, `stage_complete`, `pr_created`,
-  `review_verdict`, `gate_result`, `blocker_set`, and `run_complete`
-
-#### Scenario: CI poll spam is suppressed
-
-- **WHEN** the advance stream emits repeated identical polling-loop sub-events
-  during pre-merge CI wait
-- **THEN** the guidance SHALL instruct the harness to suppress subsequent
-  identical polling updates in the same burst rather than notify on every line
-
-#### Scenario: Both dual-follow streams are material-filtered
-
-- **WHEN** dual-follow is active for a linked advance run
-- **THEN** host guidance SHALL prefer material-filtered notify on loop and
-  advance streams over dual raw unfiltered JSONL as the primary notify path
-
-### Requirement: Docs SHALL state loop-only follow is insufficient for mid-item stage progress until dense loop progress ships
-
-Host skill guidance SHALL document that following only the loop event stream
-remains valid for schedule, hold, and terminal **loop** event kinds, but is
-**insufficient alone** for mid-item stage progress (planning through pre-merge)
-until the engine emits first-class stage progress on the loop stream (tracked as
-#611, with pre-merge density as #682). The guidance SHALL cross-link those
-issues (or successor identifiers). When #611 is implemented and the loop stream
-carries first-class stage progress, this dual-follow mandate MAY be demoted to
-optional or “recommended for full fidelity” in the same change that lands that
-engine work, with host skill and living-spec updates together.
-
-#### Scenario: Loop-only insufficiency is explicit
-
-- **WHEN** an operator reads the dual-follow section of host skill guidance
-- **THEN** the text SHALL state that loop-only follow does not provide mid-item
-  stage progress until #611 (or documented successor) ships
-- **AND** SHALL still allow loop-only attention for schedule/hold/terminal loop
-  kinds
-
-#### Scenario: Cross-links to parent progress work are present
-
-- **WHEN** the dual-follow insufficiency or demotion note is present in host
-  skill guidance
-- **THEN** it SHALL name #611 and #682 (or documented successors) as the related
-  engine progress-surface work
-
-#### Scenario: Demotion is gated on engine progress density
-
-- **WHEN** #611 has not yet made the loop stream sufficient for mid-item stage
-  progress
-- **THEN** host skill guidance SHALL keep dual-follow after linkage mandatory
-- **AND** SHALL NOT demote dual-follow solely because an operator prefers quieter
-  notifications
-
----
-
-### Requirement: A drift-guard SHALL fail if post-linkage dual-follow regresses to optional-only wording
-
-Automated tests covered by `npm run ci` SHALL fail if host skill guidance for
-`pipeline loop` drive/resume reintroduces optional-only advance follow as the
-sole post-linkage instruction (e.g. a §4b.d heading or body that says only
-“Optionally follow active item advance events when published” without mandatory
-dual-follow language after linkage). The guard MAY be a focused substring or
-section assertion against `hosts/claude/SKILL.md` and `hosts/codex/SKILL.md`
-(and/or the generated plugin skill mirror). A deliberate demotion after #611 MAY
-update the guard in the same change.
-
-#### Scenario: Optional-only post-linkage wording fails the guard
-
-- **WHEN** host skill §4b.d (or successor) describes advance follow after linkage
-  only as optional and lacks mandatory dual-follow language
-- **THEN** the drift-guard test or check SHALL fail under `npm run ci`
-
-#### Scenario: Pre-linkage optional absence remains allowed
-
-- **WHEN** skill text states that advance follow is not required before linkage
-  exists
-- **THEN** the dual-follow drift-guard SHALL NOT fail solely because of that
-  pre-linkage caveat
 
 ### Requirement: Host loop orchestration SHALL stop all run-scoped follows on terminal in the same turn
 
-Host skill guidance for `pipeline loop` drive and resume (Claude and Codex) SHALL
-require that when a material `loop_run_stopped` event is observed for the followed
-loop `run_id`, **or** when the supervisor process for that run exits, the harness
-SHALL stop **all** loop event Monitors/follows and **all** advance event
-Monitors/follows that were started for that loop run (including dual-follow /
-multi-stream follows) **in the same harness turn**. The guidance SHALL NOT
-instruct the harness to leave those follows running until the operator requests
-a kill. The guidance SHALL NOT require stopping Monitors or follows that are not
-scoped to that loop `run_id` or its published advance `run_id`s.
+The compact shared loop contract and every generated host SKILL SHALL require same-turn teardown of the primary loop follow and every linked advance follow scoped to that loop when `loop_run_complete` or `loop_run_stopped` is observed, or when the supervisor exits. A supervisor exit without a confirmed terminal loop event SHALL be reported as non-terminal failure/recovery and SHALL NOT be treated as successful completion. The observer SHALL leave unrelated runs and host tools untouched. Durable docs MAY explain process and Monitor cleanup in detail; generated SKILLs SHALL NOT embed cleanup scripts.
 
 #### Scenario: Same-turn stop on loop_run_stopped
 
-- **WHEN** a harness following a durable loop observes a material
-  `loop_run_stopped` event for the active `run_id`
-- **THEN** host skill guidance SHALL instruct the harness to stop the loop
-  follow and any advance follows for that run in the same turn
-- **AND** SHALL NOT require an operator kill step to end those follows
+- **WHEN** the followed loop emits a terminal event
+- **THEN** the observer SHALL stop its loop follow and linked advance follow in the same turn
 
 #### Scenario: Same-turn stop on supervisor process exit
 
-- **WHEN** the supervisor process for the followed loop run exits without a
-  further need for mid-flight following
-- **THEN** host skill guidance SHALL instruct the harness to stop all
-  run-scoped loop and advance follows in the same turn
+- **WHEN** the loop supervisor exits
+- **THEN** the observer SHALL stop follows scoped to that loop without waiting for an operator kill
+- **AND** if terminal is not confirmed, it SHALL report non-terminal failure/recovery rather than completion
 
 #### Scenario: Unrelated Monitors are out of scope
 
-- **WHEN** the harness stops follows after a terminal loop outcome
-- **THEN** the guidance SHALL NOT require killing Monitors for other issues,
-  other run ids, or session tools unrelated to that loop run
+- **WHEN** terminal teardown runs
+- **THEN** it SHALL NOT stop follows belonging to another loop, issue, or unrelated host tool
 
 ---
 
 ### Requirement: Documented dual-follow patterns SHALL exit the follow process on loop_run_stopped
 
-Documented dual-follow patterns SHALL exit the follow process on
-`loop_run_stopped`. Host skill (or packaging) guidance that documents a
-dual-follow or multi-stream follow script for loop + advance events SHALL
-require that the follow process exits with code 0 after observing
-`loop_run_stopped` and after printing a final summary line. The documented
-pattern SHALL NOT keep looping indefinitely after terminal observation (for
-example, printing `TERMINAL` inside `while true` and continuing without exit).
+If durable operator docs include a dual-follow or multi-stream script, that pattern SHALL exit successfully after observing `loop_run_complete` or `loop_run_stopped`, printing the final summary line, and stopping its run-scoped follows. It SHALL NOT continue an infinite loop after printing a terminal marker. Generated host SKILLs SHALL NOT be required to contain such a script.
 
 #### Scenario: Dual-follow script exits after terminal
 
-- **WHEN** an operator or harness runs the documented dual-follow pattern for a
-  loop `run_id`
-- **AND** a `loop_run_stopped` event is observed on the loop stream
-- **THEN** the documented script SHALL exit 0 after a final summary line
-- **AND** SHALL NOT continue an infinite follow loop solely after printing a
-  terminal marker
+- **WHEN** a documented multi-stream example observes a terminal loop event
+- **THEN** it SHALL print its final summary and exit 0
+- **AND** it SHALL NOT continue a post-terminal `while true` loop
+
+#### Scenario: One-pager carries behavior without the script
+
+- **WHEN** a generated host SKILL is read
+- **THEN** it SHALL require terminal teardown and summary
+- **AND** it SHALL NOT be required to embed a FIFO or shell implementation
 
 ---
 
 ### Requirement: Final loop summary SHALL report terminal reason and that follows stopped
 
-Final loop summary SHALL report terminal reason and that follows stopped.
-Host skill guidance for the final operator summary after a completed or stopped
-`pipeline loop` drive/resume SHALL require that the summary include (1) the run’s
-terminal reason (or equivalent stop reason from the terminal event / result JSON)
-and (2) an explicit confirmation that run-scoped follows were stopped (e.g.
-“follows stopped”).
+The compact shared loop contract and every generated host SKILL SHALL require, after a confirmed terminal loop event, a final summary containing the loop's terminal or stop reason and explicit confirmation that its run-scoped follows stopped. When the supervisor exits before terminal, it SHALL instead require a non-terminal failure/recovery report with follows-stopped confirmation and SHALL forbid presenting that report as a completed-loop summary. Durable operator docs MAY define additional audit or result fields. The follower SHALL report any operator-authorized merge next step without invoking a merge-capable command.
 
 #### Scenario: Completed-loop summary includes both fields
 
-- **WHEN** a harness prints the final summary after `loop_run_stopped` or
-  supervisor exit for a multi-item drive/resume
-- **THEN** the summary SHALL include the terminal/stop reason
-- **AND** SHALL include confirmation that follows for that run were stopped
+- **WHEN** a loop reaches a confirmed terminal event
+- **THEN** the final summary SHALL include terminal reason and follows-stopped confirmation
+
+#### Scenario: Summary does not escalate authority
+
+- **WHEN** a terminal summary identifies a merge-capable next step
+- **THEN** the follower SHALL leave that step to an explicitly authorized operator surface
 
 ---
 
 ### Requirement: A drift-guard SHALL fail if stop-on-terminal loop follow guidance is weakened
 
-A drift-guard SHALL fail if stop-on-terminal loop follow guidance is weakened.
-The repository’s automated tests (or an install/build check covered by
-`npm run ci`) SHALL fail if host skill loop-orchestration guidance drops the
-requirement to stop run-scoped follows on `loop_run_stopped` (or supervisor
-exit) in the same turn, or if documented dual-follow guidance reintroduces an
-infinite post-terminal follow loop as the recommended pattern. The guard SHALL
-also fail if the primary documented `pipeline loop logs` follow one-liner claims
-unconditional “no auto-exit on terminal” without documenting the until-terminal
-default.
+Automated checks covered by `npm run ci` SHALL fail if `renderHostSkill()` or any generated host SKILL drops same-turn stop of loop and linked-advance follows on terminal/supervisor exit, confirmed-terminal reason and follows-stopped summary, premature-exit-is-non-terminal failure/recovery, or the until-terminal behavior of `pipeline loop logs <loop-run-id> --events --follow`. If durable docs contain a multi-stream example, a docs guard SHALL reject an infinite post-terminal pattern. The checks SHALL target shared rendered output and durable docs rather than a host-specific §4b section.
 
 #### Scenario: Missing stop-on-terminal language fails the guard
 
-- **WHEN** host skill §4b (or equivalent loop orchestration section) no longer
-  requires stopping run-scoped follows on `loop_run_stopped` / supervisor exit
-- **THEN** the drift-guard test or check SHALL fail
+- **WHEN** the shared renderer no longer requires same-turn run-scoped follow teardown
+- **THEN** the drift guard SHALL fail
 
 #### Scenario: Unconditional no-auto-exit one-liner fails the guard
 
-- **WHEN** the primary host skill or command-surface one-liner for
-  `pipeline loop logs … --follow` claims “no auto-exit on terminal” without
-  documenting until-terminal default-on behavior
-- **THEN** the drift-guard test or check SHALL fail
+- **WHEN** primary docs claim unconditional no-auto-exit for `pipeline loop logs ... --follow` without documenting its until-terminal behavior
+- **THEN** the documentation guard SHALL fail
 
-### Requirement: Loop skill packaging SHALL include Grok in host-notify and dual-follow guidance surfaces
+#### Scenario: Infinite durable example fails
 
-Host skill guidance for `pipeline loop` drive and resume SHALL cover every
-operator host that installs pipeline skill packaging for long-running loop
-orchestration, including Claude, Codex, and the Grok-consumed path (first-class
-`hosts/grok` when present, or the documented Grok substitute). Dual-follow,
-material notify, and same-turn stop requirements SHALL apply on the Grok path
-using Grok's host map entry, not Claude-only tools.
+- **WHEN** a documented multi-stream example continues after terminal observation
+- **THEN** the documentation guard SHALL fail without requiring that example in a generated SKILL
 
-#### Scenario: Grok-consumed loop section uses host map
-
-- **WHEN** a Grok agent reads loop orchestration §4b (or substitute) on the path
-  it loads
-- **THEN** the text SHALL require material progress notify via Grok's map entry
-- **AND** SHALL retain dual-follow after linkage and same-turn stop on
-  `loop_run_stopped`
-
-#### Scenario: Existing Claude and Codex loop contracts remain
-
-- **WHEN** `hosts/claude/SKILL.md` and `hosts/codex/SKILL.md` loop sections are
-  read after this change
-- **THEN** they SHALL still list ordered start/handoff/follow/notify/stop/summary
-  steps
-- **AND** SHALL still mandate dual-follow after linkage until #611 demotes it
+---
 
 ### Requirement: Default loop orchestration SHALL consume outer-host lifecycle capabilities without host-name branching
 
-Default multi-item loop host packaging SHALL be expressed against the active outer host's
-declared lifecycle capabilities. That packaging covers early run handoff observation, loop and
-linked-advance event follow, material notify, reattach after cancelled wait, terminal stop on
-`loop_run_stopped` / linked advance terminal conditions, final summary, and monitor cleanup.
-Shared loop orchestration text and helpers SHALL NOT encode lifecycle dispatch as host-name
-equality checks against a closed built-in set.
-
-Dual-follow and material-filter obligations remain; notify surfaces come from the host's declared
-material-progress mapping or portable fallback.
+The shared one-pager renderer SHALL express default loop orchestration through portable durable handoff with retained `loop_run_id`, retained linked `advance_run_id`, loop and linked-advance logs follow, material filtering, interrupted-follow re-attach, terminal-or-exit teardown, confirmed-terminal final summary, premature-exit non-terminal failure/recovery, and the compact host-notify map. The generated host files SHALL remain byte-identical and SHALL NOT encode lifecycle dispatch as equality checks against a closed host set. A supported outer host outside `SKILL_HOST_IDS` SHALL use the same lifecycle through durable operator guidance and its manifest-declared mapping or fallback without implicitly gaining a generated row or target.
 
 #### Scenario: Capability-driven loop supervision applies without host-name switch
 
-- **WHEN** a registered outer host declares early handoff, event follow, reattach, terminal
-  cleanup, and terminal summary (or portable fallbacks)
-- **AND** default loop orchestration is selected for that host
-- **THEN** the shared contract SHALL require handoff observation, follow, reattach after
-  cancelled wait, cleanup, and final summary from those declarations
-- **AND** SHALL NOT require a new shared host-name branch to enable those steps
+- **WHEN** a supported outer host provides the declared lifecycle operations or documented fallbacks
+- **THEN** the shared contract SHALL require retained handoff/linkage ids, both applicable follow commands, re-attach, terminal-or-exit cleanup, confirmed-terminal final summary, and premature-exit failure/recovery
+- **AND** material notification SHALL use the selected host-map row when the
+  host is in `SKILL_HOST_IDS`, otherwise its manifest-declared mapping or fallback
 
 #### Scenario: Loop material notify uses manifest mapping
 
-- **WHEN** loop orchestration emits or requires material progress notification
-- **THEN** it SHALL use the outer host's declared material-progress notify mapping or fallback
-- **AND** SHALL NOT hard-require a single host's notify tool in shared loop prose consumed by
-  other hosts
+- **WHEN** loop orchestration surfaces material progress
+- **THEN** it SHALL use the active outer host's notify-map row or declared fallback
+- **AND** shared prose SHALL NOT hard-require one host's notify tool on every host
+
+### Requirement: Shared material-event filtering and durable docs SHALL define loop notifications
+
+The shared material-event filter and durable operator docs SHALL define which loop events warrant notification through the compact host-notify map. The material set SHALL include `loop_item_started`, `loop_item_transitioned`, `loop_item_blocked`, `loop_item_advance_linked` (or its successor), material `loop_item_stage_progress`, material `loop_item_progress`, and `loop_run_stopped`, plus useful schedule and reconcile outcomes. Repeated identical evaluations in one polling burst SHALL be suppressed. Every generated SKILL SHALL state only the compact rule to notify material events through the active host row; it SHALL NOT be required to reproduce the event inventory.
+
+#### Scenario: Must-notify kinds are named
+
+- **WHEN** the material loop event set is inspected
+- **THEN** it SHALL include item start, transition, blocker, advance linkage, material progress, and terminal stop events
+
+#### Scenario: Burst suppression is documented
+
+- **WHEN** schedule, reconcile, or waiting events repeat identically in one polling burst
+- **THEN** the shared filter SHALL surface the first material occurrence and suppress the repeated noise
+
+#### Scenario: Notify is host-map based not Claude-only
+
+- **WHEN** any generated host SKILL is read
+- **THEN** it SHALL require material notification through the selected host-notify row
+- **AND** it SHALL point to durable docs rather than list every event kind or hard-require Claude `PushNotification`
+
+---
+
+### Requirement: Loop orchestration SHALL prefer the dedicated logs follow without forbidding monitoring
+
+The shared one-pager renderer SHALL use `pipeline loop logs <loop-run-id> --events --follow` with the retained handoff `loop_run_id` as the primary loop follow path. Durable operator docs SHALL retain `<state-home>/runs/<loop_run_id>/events.jsonl` and the state-home resolution order as a diagnostic fallback, but the generated SKILL SHALL NOT carry the fallback discovery essay or claim that `pipeline status` discovers the id. Neither shared nor durable guidance SHALL forbid a persistent host-equivalent Monitor or background follow for loop drive and resume.
+
+#### Scenario: Interim path is concrete
+
+- **WHEN** durable docs describe the raw loop-event diagnostic fallback
+- **THEN** they SHALL name `<state-home>/runs/<loop_run_id>/events.jsonl`
+- **AND** they SHALL describe the state-home resolution order while the generated one-pager uses `pipeline loop logs <loop-run-id> --events --follow` as primary
+
+#### Scenario: Monitoring is never forbidden for drive/resume
+
+- **WHEN** drive or resume guidance is read
+- **THEN** it SHALL use the dedicated logs follow or document the raw event path as a fallback
+- **AND** it SHALL NOT forbid a persistent Monitor, background process, or event follow
+
+---
+
+### Requirement: Shared material-event filtering SHALL treat pre-merge gate progress as material loop events
+
+The shared material-event filter and durable loop docs SHALL treat the shared loop progress kind (`loop_item_progress` or its successor) as material when `domain` is `pre_merge` and `status` is a definitive outcome (`pass`, `fail`, `approve`, `needs_attention`, `attempted`, `success`, `exhausted`, `blocked`, `advanced`, or `started`) or the first `waiting` event in a CI stretch. Durable docs SHALL explain that these outcomes are mirrored on the loop stream while advance linkage is active. The generated one-pager SHALL retain only the compact material-notify obligation.
+
+#### Scenario: Material list includes progress kind
+
+- **WHEN** a linked item emits a definitive pre-merge progress result
+- **THEN** the shared material filter SHALL surface it from the loop event stream
+
+#### Scenario: First waiting only per CI stretch
+
+- **WHEN** identical CI `waiting` progress repeats in a polling stretch
+- **THEN** the shared filter SHALL surface the first event and suppress subsequent identical waits until a definitive outcome
+
+#### Scenario: Docs state loop stream carries pre-merge gate outcomes
+
+- **WHEN** durable docs describe mid-item progress while advance linkage is active
+- **THEN** they SHALL state that material pre-merge gate outcomes are mirrored on the loop stream
+- **AND** generated host SKILLs SHALL retain the compact material-notify rule without enumerating every status
+
+---
+
+### Requirement: Durable loop docs SHALL preserve linked-advance full-fidelity guidance
+
+Durable operator docs SHALL explain that `pipeline logs <advance-run-id> --events --follow`, using the advance id published by loop linkage, provides full-fidelity stage and harness detail. They MAY describe linked advance follow as unnecessary solely for gate outcomes already mirrored onto the loop stream, while the compact shared loop contract continues to require the linked follow for the complete mid-item lifecycle until the dense loop-progress requirement permits demotion. Generated SKILLs SHALL NOT embed raw events-path or FIFO examples.
+
+#### Scenario: Optional advance follow remains documented
+
+- **WHEN** an operator needs full-fidelity detail for a linked item
+- **THEN** durable docs SHALL name `pipeline logs <advance-run-id> --events --follow`
+- **AND** they SHALL distinguish it from the primary loop logs command
+
+#### Scenario: Mirrored gate outcomes do not require advance-only parsing
+
+- **WHEN** a pre-merge gate outcome is already present on the loop stream
+- **THEN** durable docs SHALL NOT claim that the linked advance stream is the only way to observe that gate outcome
+
+---
+
+### Requirement: Shared loop contract SHALL mandate linked-advance follow lifecycle after linkage
+
+The compact shared loop contract and every generated host SKILL SHALL require that, after `loop_item_advance_linked` publishes `pipeline_run_id`, the observer retains that value as the linked `advance_run_id`, keeps `pipeline loop logs <loop-run-id> --events --follow` active with the handoff `loop_run_id`, and adds `pipeline logs <advance-run-id> --events --follow`. When a later item publishes a new linkage value or the prior advance becomes terminal, the observer SHALL stop or replace the prior advance follow rather than accumulating stale follows. The loop follow SHALL continue until the loop becomes terminal or its supervisor exits. A premature supervisor exit SHALL stop all run-scoped follows and yield non-terminal failure/recovery, not completion. Detailed dual-follow implementations SHALL live in durable docs, not in generated SKILL bash.
+
+#### Scenario: Skill names preferred advance follow command
+
+- **WHEN** a loop item publishes `pipeline_run_id` in
+  `loop_item_advance_linked`
+- **THEN** the compact contract SHALL retain that value as `<advance-run-id>` and
+  require `pipeline logs <advance-run-id> --events --follow` while retaining
+  `pipeline loop logs <loop-run-id> --events --follow`
+
+#### Scenario: Item switch stops prior advance follow
+
+- **WHEN** a later item publishes a new advance id or the prior advance reaches terminal
+- **THEN** the observer SHALL stop or replace the prior advance follow
+- **AND** it SHALL NOT leave an unbounded set of stale advance follows
+
+#### Scenario: Loop follow continues across item boundaries
+
+- **WHEN** a linked advance follow ends while the loop remains live
+- **THEN** the observer SHALL keep the loop logs follow active
+
+---
+
+### Requirement: Shared material-event filtering SHALL define linked-advance notifications
+
+The shared material-event filter and durable operator docs SHALL define the material linked-advance kinds, including `stage_start`, `stage_complete`, `pr_created`, `review_verdict`, `gate_result`, `blocker_set`, and `run_complete`, with `run_start`, `pr_updated`, and `blocker_cleared` when present. Repeated CI polling, repeated `partial` results, and repeated OpenSpec `skipped` noise in the same burst SHALL be suppressed. The generated one-pager SHALL apply the shared material-only rule to loop and linked-advance streams without reproducing the event inventory.
+
+#### Scenario: Material advance kinds are named
+
+- **WHEN** linked advance events pass through the shared material filter
+- **THEN** stage, PR, review, gate, blocker, and terminal events SHALL be eligible for notification
+
+#### Scenario: CI poll spam is suppressed
+
+- **WHEN** an advance emits repeated identical CI polling or skipped updates in one burst
+- **THEN** the shared filter SHALL suppress repeated noise after the first material line
+
+#### Scenario: Both dual-follow streams are material-filtered
+
+- **WHEN** linked-advance follow is active
+- **THEN** the observer SHALL notify material events from both streams through the active host row
+- **AND** raw unfiltered dual JSONL SHALL NOT be the preferred notification path
+
+---
+
+### Requirement: Durable loop docs SHALL explain linked-advance fidelity until dense loop progress ships
+
+Durable operator docs SHALL explain that the loop stream covers schedule, hold, mirrored gate progress, and terminal loop events, while linked advance follow remains required for complete mid-item stage progress until the loop stream provides the dense first-class progress tracked by #611 and #682 (or documented successors). Those historical and diagnostic details SHALL NOT be required in each generated SKILL. The compact shared contract SHALL retain linked-advance follow until the engine change and living spec deliberately demote it together.
+
+#### Scenario: Loop-only insufficiency is explicit
+
+- **WHEN** an operator reads the linked-follow documentation
+- **THEN** it SHALL explain what the loop stream covers and what detail still requires linked advance follow
+- **AND** it SHALL name #611 and #682 or their documented successors
+
+#### Scenario: Cross-links to parent progress work are present
+
+- **WHEN** durable docs explain the current linked-advance fidelity boundary
+- **THEN** they SHALL cross-link #611 and #682 or documented successor work
+- **AND** the generated one-pager SHALL NOT be required to carry those historical issue links
+
+#### Scenario: Demotion is gated on engine progress density
+
+- **WHEN** the loop stream still lacks dense mid-item stage progress
+- **THEN** the shared compact contract SHALL keep post-linkage advance follow mandatory
+- **AND** a generated SKILL SHALL NOT demote it to optional-only wording
+
+---
+
+### Requirement: A drift-guard SHALL fail if post-linkage advance follow regresses to optional-only wording
+
+Automated checks covered by `npm run ci` SHALL fail if `renderHostSkill()` or any generated host SKILL omits the compact post-linkage obligation to add `pipeline logs <advance-run-id> --events --follow` while retaining the loop follow, or describes it only as optional before the dense loop-progress requirement is met. The guard SHALL target the shared renderer and byte-identical outputs rather than host-specific §4b sections. A deliberate demotion after dense loop progress ships MAY update the renderer, docs, guard, and living spec together.
+
+#### Scenario: Optional-only post-linkage wording fails the guard
+
+- **WHEN** the shared renderer treats linked advance follow as optional-only after an advance id is published
+- **THEN** the drift guard SHALL fail under `npm run ci`
+
+#### Scenario: Pre-linkage optional absence remains allowed
+
+- **WHEN** no advance id has been published
+- **THEN** the guard SHALL permit loop-only follow and SHALL NOT require a guessed advance target
+
+---
+
+### Requirement: Generated loop skill packaging SHALL share host-neutral notify and linked-follow guidance
+
+Claude, Codex, Grok, and OpenCode SHALL receive byte-identical generated SKILLs containing the same compact loop and linked-advance follow contract plus the full compact host-notify map. The active host SHALL select its map row; shared loop prose SHALL NOT hard-require another host's tool. Grok's existing `symlink-claude` lifecycle MAY consume the same bytes without a divergent Grok SKILL implementation.
+
+#### Scenario: Existing Claude and Codex loop contracts remain
+
+- **WHEN** the generated Claude, Codex, Grok, and OpenCode SKILLs are compared
+- **THEN** their loop follow, linked-follow, terminal teardown, and notify-map text SHALL be byte-identical
+
+#### Scenario: Grok-consumed loop section uses host map
+
+- **WHEN** Grok consumes the shared generated one-pager
+- **THEN** material progress SHALL use Grok's `monitor` row or documented equivalent
+- **AND** Grok SHALL NOT be required to call Claude `PushNotification`
+
+#### Scenario: Host identity does not fork loop behavior
+
+- **WHEN** any generated host executes loop orchestration
+- **THEN** it SHALL use the same two CLI follow forms and terminal contract
+- **AND** only the selected notify-map row SHALL vary at runtime
+
+---
+

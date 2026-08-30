@@ -24,8 +24,6 @@ export const GENERATOR_OWNED_PATHS: readonly string[] = [
   "CHANGELOG.md",
   "docs/cli.md",
   "docs/config.md",
-  "hosts/claude/SKILL.md",
-  "hosts/codex/SKILL.md",
 ];
 
 const DOCS_TIMEOUT_SEC = 5 * 60;

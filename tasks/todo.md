@@ -1,3 +1,31 @@
+# #1049 — generated short host SKILL
+
+## Plan
+
+- [x] Prove #1047 and #1048 are merged prerequisites and #1049 does not overlap the v1.39.16 train.
+- [x] Start the Pipeline-owned worktree and complete the first OpenSpec proposal plus independent plan review.
+- [x] Stop before implementation when plan revision changed Grok's `symlink-claude` outer-host lifecycle despite the issue's lifecycle non-goal.
+- [x] Reconcile the OpenSpec artifacts around one host-neutral renderer: four committed generated SKILL files, unchanged Grok lifecycle, no OMP SKILL, and no per-verb command pack.
+- [x] Validate the reconciled OpenSpec change strictly and validate all 320 repository OpenSpec items.
+- [x] Commit the corrected plan and resume #1049 through implementation.
+- [x] Run focused generator/installer/spec tests, `node scripts/build.mjs --check`, strict OpenSpec validation, and full `npm run ci`.
+- [ ] Route the current-head independent P1/P2 findings through a Pipeline-owned Grok fix round, including the default-drive/spec conflict, follow teardown, renderer boundary, durable-doc migration, and biting guards.
+- [ ] Require current-head Standards and Spec approval plus green GitHub CI; fix every blocking finding.
+- [ ] Advance #1049 to `pipeline:ready-to-deploy`, merge PR through `pipeline merge`, and prove the squash tree is the reviewed tree on `main`.
+
+## Review
+
+- #1049 entered planning from `origin/main` at #1048's merge `212a0479` in the Pipeline-owned worktree.
+- First proposal commit: `71b7ca00`; `openspec validate generate-short-host-skill` passed.
+- Plan review returned `NEEDS_REVISION`. The revision expanded Grok install from `symlink-claude` to `tree`; the run was interrupted before application-code edits because repository specs call that install mode part of the outer-host lifecycle and #1049 names engine lifecycle changes as a non-goal.
+- Reconciliation now covers every living SKILL requirement plus build/hook/eval/release generated-output ownership. `openspec validate generate-short-host-skill --strict`, `openspec validate --all` (320/320), the repository-pinned `npm run ci:openspec` gate (320/320), and `git diff --check` pass.
+- Independent issue-lock and implementation-feasibility reviews both approved the final current-byte plan with no unresolved P0/P1/P2 findings.
+- Implementation commit `493f9e63` opened PR #1312. Local `npm run ci` and GitHub Actions run `33280845064` both passed.
+- Built-in review rounds reported three advisory findings below the repository's `high` threshold. Independent current-head review found two P1 contract defects and grouped P2 gaps that CI does not cover. Pipeline stopped before merge on the pre-existing task-file dirt; no merge occurred.
+- Positive evidence at `493f9e63`: four generated SKILLs are byte-identical, OMP SKILL is absent, Grok remains `symlink-claude`, manifest mirrors match, and `build.mjs --check` passes. Correction and fresh current-head review remain pending.
+
+---
+
 # #1048 / PR #1222 reconciliation and delivery
 
 ## Plan
@@ -13,17 +41,17 @@
 - [x] Resolve current-head review blockers: preserve unmarked personal skills, constrain eval packaging allowances to exact outputs, preserve unrelated `plugin/` files during generation, remove `run` from advertised command catalogs, and prove real installed `doctor`/`status` dispatch.
 - [x] Reconcile remaining runtime and living-spec core-mirror terminology; rerun focused regressions and the Standards review axis.
 - [x] Complete the Spec review axis after archived-provenance validation.
-- [ ] Commit, rebase onto the latest train-updated `origin/main` if needed, and push PR #1222 with an exact force-with-lease.
-- [ ] Resume the existing Pipeline issue after deterministic evidence; require current-head review and green PR CI.
-- [ ] Merge PR #1222 into `main`, prove containment, and reconcile the durable goal-loop ledger.
-- [ ] Update #1049's issue body with `Depends on: #1047, #1048` plus both merge OIDs, then dispatch #1049.
+- [x] Commit, rebase onto the latest train-updated `origin/main` if needed, and push PR #1222 with an exact force-with-lease.
+- [x] Resume the existing Pipeline issue after deterministic evidence; require current-head review and green PR CI.
+- [x] Merge PR #1222 into `main`, prove containment, and reconcile the durable goal-loop ledger.
+- [x] Update #1049's issue body with `Depends on: #1047, #1048` plus both merge OIDs, then dispatch #1049.
 
 ## Review
 
 - Installer lifecycle coverage passes: 167 installer tests plus 6 pre-commit-hook tests, including concurrent fresh install, uninstall serialization, abandoned ownership, launcher self-heal, and cleanup-failure recovery.
 - OpenSpec passes 319/319 under the repository-required Node 24 runtime. The living and archived `eval-fixture-contract` requirement now use a normative `SHALL permit` statement accepted by the pinned/installed validators.
 - Full `npm run ci` exits 0 on 2026-08-29: core tests, build freshness, install smoke, launcher smoke, OpenSpec, docs freshness, and script suites all pass.
-- Current-head Standards and Spec reviews both approve the #1048 delta with no unresolved P0/P1/P2 findings. PR CI, merge, and base-containment proof remain pending.
+- Current-head Standards and Spec reviews both approved the #1048 delta with no unresolved P0/P1/P2 findings. PR #1222 merged through Pipeline at `212a0479d5a6ec955a999d15921a5ef2b19adcb1`; its squash tree is byte-identical to reviewed head `520a0a5ec05776c190b2bc593ea3d6c5895d8e8a`.
 
 ---
 

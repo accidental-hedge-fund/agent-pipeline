@@ -2,9 +2,7 @@
 
 ## Purpose
 TBD - created by archiving change engine-artifact-gitignore-contract. Update Purpose after archive.
-
 ## Requirements
-
 ### Requirement: The engine SHALL declare every engine-written `.agent-pipeline/` artifact directory in one exported contract
 
 The engine SHALL expose a single exported, ordered contract enumerating every directory under
@@ -131,18 +129,6 @@ runs on its own checkout leave the protected branch clean and `pipeline doctor` 
 
 ---
 
-### Requirement: Documentation SHALL list the full set of ignored artifact paths
-
-Documentation SHALL list every contract entry wherever it enumerates the engine's ignored
-`.agent-pipeline/` artifact paths, including `README.md` and each host `SKILL.md` variant. No
-document SHALL list a strict subset of the contract.
-
-#### Scenario: Docs enumerate all three paths
-
-- **WHEN** a reader consults `README.md` or a host `SKILL.md` for the engine's local-only artifact paths
-- **THEN** the listed paths SHALL include `.agent-pipeline/runs/`, `.agent-pipeline/roadmap/`,
-  `.agent-pipeline/history/`, `.agent-pipeline/frg/`, and `.agent-pipeline/factory-release/`
-
 ### Requirement: This repository's `.gitignore` SHALL ignore FRG artifacts
 
 This repository's root `.gitignore` SHALL ignore `.agent-pipeline/frg/` so that a Factory
@@ -220,3 +206,41 @@ for an in-checkout `--request` path.
 - **THEN** it SHALL confirm `.agent-pipeline/factory-release/` is present in both the contract and
   the rendered managed block
 - **AND** dropping that entry without updating the guard SHALL fail the same test
+
+### Requirement: Durable documentation SHALL list the full set of ignored artifact paths
+
+The README and/or linked durable operator documentation SHALL derive or validate
+its local-only `.agent-pipeline/` inventory from `ARTIFACT_CONTRACT`. Wherever
+either surface enumerates those paths, it SHALL enumerate every current contract
+entry rather than cache a hand-maintained strict subset. The current twelve-entry
+inventory is `.agent-pipeline/runs/`, `.agent-pipeline/roadmap/`,
+`.agent-pipeline/history/`, `.agent-pipeline/evals/`,
+`.agent-pipeline/control-attributions.jsonl`,
+`.agent-pipeline/product-fault-reports.jsonl`, `.agent-pipeline/handoffs/`,
+`.agent-pipeline/outcomes/`, `.agent-pipeline/lineage/`,
+`.agent-pipeline/frg/`, `.agent-pipeline/harness-ownership/`, and
+`.agent-pipeline/factory-release/`. Generated short host one-pagers MAY link to
+that documentation; they SHALL NOT be required to duplicate the full
+artifact-path inventory.
+
+#### Scenario: Docs enumerate all three paths
+
+- **WHEN** a reader consults the durable documentation for the engine's
+  local-only artifact paths
+- **THEN** the listed paths SHALL include `.agent-pipeline/runs/`,
+  `.agent-pipeline/roadmap/`, `.agent-pipeline/history/`,
+  `.agent-pipeline/evals/`, `.agent-pipeline/control-attributions.jsonl`,
+  `.agent-pipeline/product-fault-reports.jsonl`, `.agent-pipeline/handoffs/`,
+  `.agent-pipeline/outcomes/`, `.agent-pipeline/lineage/`,
+  `.agent-pipeline/frg/`, `.agent-pipeline/harness-ownership/`, and
+  `.agent-pipeline/factory-release/`
+- **AND** a drift guard SHALL compare the durable inventory with every current
+  `ARTIFACT_CONTRACT` entry so a thirteenth entry cannot leave the docs stale
+
+#### Scenario: Generated one-pager does not cache the inventory
+
+- **WHEN** the artifact contract gains or removes an entry
+- **THEN** generated short host one-pagers SHALL remain valid through their
+  durable documentation pointer
+- **AND** they SHALL NOT be required to carry a second path list that can drift
+

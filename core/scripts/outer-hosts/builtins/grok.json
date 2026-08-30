@@ -24,7 +24,7 @@
       "commandsKind": "none"
     },
     "userOwnedExclusion": "Uninstall only removes an installer-owned symlink at ~/.grok/skills/pipeline. Never deletes the Claude-managed skill tree target or unrelated files under ~/.grok.",
-    "postInstall": "Skill path is a symlink to the Claude-managed install (no separate Grok SKILL.md). After a Claude skill update, re-run: node scripts/install.mjs install --host grok",
+    "postInstall": "Skill path is a symlink to the Claude-managed install. The repository keeps a generated hosts/grok/SKILL.md as a byte-identical conformance output; install does not overlay it. After a Claude skill update, re-run: node scripts/install.mjs install --host grok",
     "installOrder": 40,
     "baseOptional": true
   },

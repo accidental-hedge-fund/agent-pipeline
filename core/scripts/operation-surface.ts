@@ -156,6 +156,24 @@ export const OPERATION_SURFACE: readonly OperationSurfaceEntry[] = [
     fast: false,
   }),
   operation({
+    name: "train",
+    desc:
+      "Operator-authorized integrate train: base-eligible frontiers advance via one loop wave each (recovery inside the wave); optionally serial-merge with base containment; independent R2D siblings may merge while a peer is parked (never called by the advance loop)",
+    usage:
+      "train --milestone <m> [--merge] [--json] [--dry-run] | train --issues <n,n> [--merge] [--json] [--dry-run]",
+    section: "lifecycle",
+    fast: false,
+  }),
+  operation({
+    name: "ship",
+    desc:
+      "Run or inspect one durable milestone shipment (train --merge, release, finish, promote). Operator product is pipeline ship --milestone vX.Y.Z; no grant file required.",
+    usage:
+      "ship --milestone vX.Y.Z [--json] | ship status --milestone vX.Y.Z [--json]",
+    section: "lifecycle",
+    fast: false,
+  }),
+  operation({
     name: "release",
     desc:
       "Prepare a release PR from the matching GitHub milestone plan (or finish-merge one); finish never tags; ship-end ensure-tag creates vX.Y.Z from on-disk HMAC latest.json when FRG is gitignored; --dry-run reports milestone presence/open issues",
@@ -185,7 +203,7 @@ export const OPERATION_SURFACE: readonly OperationSurfaceEntry[] = [
     name: "loop",
     desc: "Durable multi-item run — driven in-repo by the pipeline's own loop supervisor",
     usage:
-      "loop --milestone <m>|--label <l>|--range a-b [--resume <run-id>] [--audit] [--follow]",
+      "loop --milestone <m> [--audit] [--follow] | loop --label <l> [--audit] [--follow] | loop --range a-b [--audit] [--follow] | loop --roadmap-slice <slice> [--audit] [--follow] | loop <N> [<N> ...] [--audit] [--follow] | loop --resume <run-id> [--audit] [--follow]",
     section: "advance",
     fast: false,
     inRepoLoop: true,
