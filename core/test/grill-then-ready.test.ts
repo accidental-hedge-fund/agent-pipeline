@@ -1647,6 +1647,149 @@ test("grill: persist-after-write failure heals on retry without a second write",
   assert.equal(writes, 1);
 });
 
+test("grill: sibling-store failure after body write rebinds siblings on receipt retry", async () => {
+  const spec = "## Summary\nX\n";
+  const nodes = canonicalThinIssueNodes();
+  const art = artifact(nodes, spec);
+  const body = embedDecisionsInBody(spec, art);
+  const store = memoryHandoffStore();
+  const keyDeps = memoryKeyDeps();
+  persistGrillFrontier(
+    "/tmp/repo",
+    issueGrillFrontier({
+      repo: "acme/r",
+      issue: 42,
+      body,
+      artifact: art,
+      now: new Date("2026-01-01T00:00:00Z"),
+      key: "test-key",
+    }),
+    keyDeps,
+  );
+  const inputs = grillAuthorityCreateInputs({
+    domain: "d",
+    repo: "acme/r",
+    issueNumber: 42,
+    artifact: art,
+    proposedBody: body,
+    frontierFp: "fp",
+  });
+  assert.ok(inputs.length >= 2);
+  const firstCreated = await createAndPersistHandoff("/tmp/repo", inputs[0]!, store);
+  const siblingCreated = await createAndPersistHandoff("/tmp/repo", inputs[1]!, store);
+  assert.equal(firstCreated.ok, true);
+  assert.equal(siblingCreated.ok, true);
+  if (!firstCreated.ok || !siblingCreated.ok) return;
+  const originalSiblingHash = siblingCreated.handoff.scope.content_hashes?.[0];
+  let siblingFailOnce = true;
+  const failingStore: HandoffStoreDeps = {
+    ...store,
+    writeFile: async (p, data) => {
+      if (siblingFailOnce && p.endsWith(`${siblingCreated.handoff.handoff_id}.json`)) {
+        siblingFailOnce = false;
+        throw new Error("sibling store boom");
+      }
+      await store.writeFile(p, data);
+    },
+  };
+  let writes = 0;
+  let live = body;
+  const hook = {
+    materialize: async (h: HumanQuestionHandoff, text: string) => {
+      const r = await materializeGrillAnswer(h, text, {
+        getIssueBody: async () => live,
+        updateIssueBody: async (_n, next) => {
+          writes++;
+          live = next;
+        },
+        repoDir: "/tmp/repo",
+        handoffStore: failingStore,
+        keyDeps,
+        frontierKey: "test-key",
+        now: () => new Date("2026-01-01T00:00:01Z"),
+      });
+      return r.ok ? { ok: true as const, wrote: r.wrote } : r;
+    },
+  };
+  const first = await answerAndPersistHandoff(
+    "/tmp/repo",
+    42,
+    firstCreated.handoff.handoff_id,
+    {
+      decision: "answer",
+      actor: "alice",
+      identitySource: "gh",
+      authenticated: true,
+      answerText: "yes",
+    },
+    store,
+    hook,
+  );
+  assert.equal(first.ok, false);
+  assert.equal(first.code, "write_failed");
+  assert.equal(writes, 1);
+  const siblingAfterFail = await loadHandoff(
+    "/tmp/repo",
+    42,
+    siblingCreated.handoff.handoff_id,
+    store,
+  );
+  assert.equal(siblingAfterFail.ok, true);
+  if (!siblingAfterFail.ok) return;
+  assert.equal(siblingAfterFail.handoff.status, "pending");
+  assert.equal(siblingAfterFail.handoff.scope.content_hashes?.[0], originalSiblingHash);
+  const targetAfterFail = await loadHandoff(
+    "/tmp/repo",
+    42,
+    firstCreated.handoff.handoff_id,
+    store,
+  );
+  assert.equal(targetAfterFail.ok, true);
+  if (targetAfterFail.ok) assert.equal(targetAfterFail.handoff.status, "pending");
+  const retry = await answerAndPersistHandoff(
+    "/tmp/repo",
+    42,
+    firstCreated.handoff.handoff_id,
+    {
+      decision: "answer",
+      actor: "alice",
+      identitySource: "gh",
+      authenticated: true,
+      answerText: "yes",
+    },
+    store,
+    hook,
+  );
+  assert.equal(retry.ok, true, retry.ok ? "" : retry.reason);
+  assert.equal(writes, 1);
+  const rebound = await loadHandoff("/tmp/repo", 42, siblingCreated.handoff.handoff_id, store);
+  assert.equal(rebound.ok, true);
+  if (!rebound.ok) return;
+  assert.equal(rebound.handoff.status, "pending");
+  const reboundDecl = parseGrillDeclaration(rebound.handoff.declaration_identity ?? "");
+  assert.ok(reboundDecl);
+  assert.equal(reboundDecl?.bodySha256, sha256Prefixed(live).slice("sha256:".length));
+  assert.equal(rebound.handoff.scope.content_hashes?.[0], sha256Prefixed(live));
+  const originalDecl = parseGrillDeclaration(siblingCreated.handoff.declaration_identity ?? "");
+  assert.equal(reboundDecl?.definitionSha256, originalDecl?.definitionSha256);
+  const second = await answerAndPersistHandoff(
+    "/tmp/repo",
+    42,
+    siblingCreated.handoff.handoff_id,
+    {
+      decision: "answer",
+      actor: "alice",
+      identitySource: "gh",
+      authenticated: true,
+      answerText: "yes",
+    },
+    store,
+    hook,
+  );
+  assert.equal(second.ok, true, second.ok ? "" : second.reason);
+  assert.equal(writes, 2);
+});
+
 test("grill: persist-after-write then drifted spec/fingerprint refuses retry without replacing frontier", async () => {
   const spec = "## Summary\nX\n";
   const nodes = canonicalThinIssueNodes();

@@ -585,6 +585,23 @@ export async function materializeGrillAnswer(
     if (planned.code !== "body_hash_drift") return planned;
     const healed = healGrillAnswerFromReceipt(liveBody, handoff, deps);
     if (!healed) return planned;
+    // A prior write may have failed mid-sibling-rebind; heal must finish that work
+    // before persisting the frontier.
+    if (deps.repoDir) {
+      try {
+        await refreshPendingSiblingGrillHandoffs(
+          deps.repoDir,
+          { answeredHandoff: handoff, newBody: healed.body },
+          deps.handoffStore,
+        );
+      } catch (err) {
+        return {
+          ok: false,
+          reason: `pending sibling rebind failed: ${(err as Error).message}`,
+          code: "write_failed",
+        };
+      }
+    }
     const frontierErr = persistPlannedFrontier(handoff, healed, deps);
     if (frontierErr) return frontierErr;
     return healed;
