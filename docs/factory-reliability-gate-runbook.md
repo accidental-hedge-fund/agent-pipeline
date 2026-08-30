@@ -196,10 +196,14 @@ Tugboat already writes `$RUN_DIR/factory-release-prepare-request.json`.
 This is an idempotent multi-tick protocol.
 
 1. First call with no request-bound pack loop **starts** a `factory-gate`
-   candidate pack loop (`pipeline loop --engine-track candidate`, work-list or
-   `--label factory-gate`) from `frg-packs/factory-gate-v1/templates/`, writes
+   candidate pack loop. The child execs the resolved candidate launcher for
+   the request SHA (not PATH `pipeline` and not `PIPELINE_BIN`).
+   `--engine-track candidate` on the child argv is doctor/soak intent
+   metadata, not a binary selector. The work-list or `--label factory-gate`
+   comes from `frg-packs/factory-gate-v1/templates/`. Prepare writes
    `factory-release-binding.json` (request fingerprint, candidate SHA, version,
-   manifest), persists `loop_run_id`, and returns `status: "in_progress"`.
+   manifest), persists `loop_run_id` as `bound` before spawn, and returns
+   `status: "in_progress"` only after a valid durable `loop_run_handoff`.
    A re-invoke of the **unchanged** request **resumes** the same `loop_run_id`.
    It does **not** start a second unbound pack and does **not** adopt the newest
    unbound `factory-gate` loop. A missing pre-bound loop is a start/resume

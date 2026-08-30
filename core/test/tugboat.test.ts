@@ -4967,7 +4967,7 @@ test("playbook is a thin launcher to repo tugboat.sh (#1151)", () => {
 
 function runFrgPackWaitDecision(
   tick: string,
-  live: "0" | "1" | "unknown",
+  live: "0" | "1" | "unknown" | "failed",
   attempt: number,
   cap: number,
 ): string {
@@ -5018,6 +5018,11 @@ test("frg_pack_wait_decision: in_progress plus live loop at cap N is continue (#
   );
   assert.equal(runFrgPackWaitDecision("retry", "0", 1, cap), "continue");
   assert.equal(
+    runFrgPackWaitDecision("retry", "failed", cap, cap),
+    "fail",
+    "failed identity after the observation window is fail-closed",
+  );
+  assert.equal(
     runFrgPackWaitDecision("attest", "0", 1, cap),
     "continue",
     "first attest spawn for a checkpoint is continue",
@@ -5052,346 +5057,84 @@ test("frg_pack_wait_decision: spent attest allowance is fail (#1295)", () => {
   }
 });
 
-test("frg_pack_loop_is_live: lock pid or non-terminal ledger (#1150)", () => {
+test("frg_pack_loop_is_live: reads prepare JSON liveness.status (#1296)", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-loop-live-"));
   try {
-    const fn = extractNamedFn(
-      fs.readFileSync(frgHelpers, "utf8"),
-      "frg_pack_loop_is_live",
-      "frg-pack-helpers.sh",
-    );
-    const home = path.join(dir, "state");
-    const liveRun = path.join(home, "runs", "loop-live");
-    const deadRun = path.join(home, "runs", "loop-dead");
-    const corruptRun = path.join(home, "runs", "loop-corrupt");
-    const ioFailRun = path.join(home, "runs", "loop-iofail");
-    fs.mkdirSync(liveRun, { recursive: true });
-    fs.mkdirSync(deadRun, { recursive: true });
-    fs.mkdirSync(corruptRun, { recursive: true });
-    fs.mkdirSync(ioFailRun, { recursive: true });
-    fs.writeFileSync(
-      path.join(liveRun, "ledger.json"),
-      JSON.stringify({ schema: LOOP_LEDGER_SCHEMA, run_id: "loop-live", stop: null }),
-    );
-    fs.writeFileSync(
-      path.join(deadRun, "ledger.json"),
-      JSON.stringify({
-        schema: LOOP_LEDGER_SCHEMA,
-        run_id: "loop-dead",
-        stop: { reason: "supervisor_cycle_cap", time: "2026-08-20T00:00:00.000Z" },
-      }),
-    );
-    fs.writeFileSync(
-      path.join(deadRun, "lock.json"),
-      JSON.stringify({ pid: 1_000_000_007, run_id: "loop-dead" }),
-    );
-    fs.writeFileSync(path.join(corruptRun, "lock.json"), "{");
-    fs.mkdirSync(path.join(ioFailRun, "lock.json"));
+    const helpers = fs.readFileSync(frgHelpers, "utf8");
+    const fnLive = extractNamedFn(helpers, "frg_pack_loop_is_live", "frg-pack-helpers.sh");
+    const fnWait = extractNamedFn(helpers, "frg_pack_wait_decision", "frg-pack-helpers.sh");
+    const writePrep = (name: string, liveness: unknown) => {
+      const p = path.join(dir, `${name}.json`);
+      fs.writeFileSync(p, JSON.stringify({ status: "in_progress", loop_run_id: name, liveness }));
+      return p;
+    };
+    const live = writePrep("loop-live", {
+      schema_version: 1,
+      kind: "pack_loop_liveness",
+      status: "live",
+    });
+    const dead = writePrep("loop-dead", {
+      schema_version: 1,
+      kind: "pack_loop_liveness",
+      status: "not-live",
+      reason: "dead_pid",
+    });
+    const unknown = writePrep("loop-unknown", {
+      schema_version: 1,
+      kind: "pack_loop_liveness",
+      status: "unknown",
+      reason: "unreadable_identity",
+    });
+    const failed = writePrep("loop-failed", {
+      schema_version: 1,
+      kind: "pack_loop_liveness",
+      status: "failed",
+      reason: "unreadable_identity",
+    });
+    const missingLiveness = path.join(dir, "loop-missing.json");
+    fs.writeFileSync(missingLiveness, JSON.stringify({ status: "in_progress", loop_run_id: "loop-missing" }));
+    const corrupt = path.join(dir, "loop-corrupt.json");
+    fs.writeFileSync(corrupt, "{");
     const runner = path.join(dir, "run.sh");
     fs.writeFileSync(
       runner,
       [
         "#!/usr/bin/env bash",
         "set -euo pipefail",
-        fn,
-        'printf "live=%s\\n" "$(frg_pack_loop_is_live loop-live)"',
-        'printf "dead=%s\\n" "$(frg_pack_loop_is_live loop-dead)"',
-        'printf "missing=%s\\n" "$(frg_pack_loop_is_live loop-missing)"',
-        'printf "unsafe=%s\\n" "$(frg_pack_loop_is_live ../escape)"',
-        'printf "corrupt=%s\\n" "$(frg_pack_loop_is_live loop-corrupt)"',
-        'printf "iofail=%s\\n" "$(frg_pack_loop_is_live loop-iofail)"',
+        fnLive,
+        fnWait,
+        "probe() {",
+        '  local label=$1',
+        '  local file=$2',
+        '  local live',
+        '  live=$(frg_pack_loop_is_live "$file")',
+        '  printf "%s=%s\\n" "$label" "$live"',
+        '  printf "%s_wait=%s\\n" "$label" "$(frg_pack_wait_decision retry "$live" 2 2)"',
+        "}",
+        `probe live ${JSON.stringify(live)}`,
+        `probe dead ${JSON.stringify(dead)}`,
+        `probe unknown ${JSON.stringify(unknown)}`,
+        `probe failed ${JSON.stringify(failed)}`,
+        `probe missing ${JSON.stringify(missingLiveness)}`,
+        `probe corrupt ${JSON.stringify(corrupt)}`,
+        'printf "absent=%s\\n" "$(frg_pack_loop_is_live /no/such/prepare.json)"',
         "",
       ].join("\n"),
     );
     fs.chmodSync(runner, 0o755);
-    const r = spawnSync("bash", [runner], {
-      encoding: "utf8",
-      env: {
-        ...process.env,
-        AGENT_PIPELINE_STATE_HOME: home,
-      },
-    });
+    const r = spawnSync("bash", [runner], { encoding: "utf8" });
     assert.equal(r.status, 0, `liveness helper exited ${r.status}: ${r.stderr}`);
     assert.match(r.stdout, /^live=1$/m);
+    assert.match(r.stdout, /^live_wait=continue$/m);
     assert.match(r.stdout, /^dead=0$/m);
-    assert.match(r.stdout, /^missing=0$/m);
-    assert.match(r.stdout, /^unsafe=0$/m);
+    assert.match(r.stdout, /^dead_wait=fail$/m);
+    assert.match(r.stdout, /^unknown=unknown$/m);
+    assert.match(r.stdout, /^unknown_wait=continue$/m);
+    assert.match(r.stdout, /^failed=failed$/m);
+    assert.match(r.stdout, /^failed_wait=fail$/m);
+    assert.match(r.stdout, /^missing=unknown$/m);
     assert.match(r.stdout, /^corrupt=unknown$/m);
-    assert.match(r.stdout, /^iofail=unknown$/m);
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("frg_pack_loop_is_live: schema-invalid or undecodable state is unknown at cap (#1150)", () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-loop-schema-"));
-  try {
-    const helpers = fs.readFileSync(frgHelpers, "utf8");
-    const fnLive = extractNamedFn(helpers, "frg_pack_loop_is_live", "frg-pack-helpers.sh");
-    const fnWait = extractNamedFn(helpers, "frg_pack_wait_decision", "frg-pack-helpers.sh");
-    const home = path.join(dir, "state");
-    const emptyLock = path.join(home, "runs", "loop-empty-lock");
-    const badPid = path.join(home, "runs", "loop-bad-pid");
-    const blankLedger = path.join(home, "runs", "loop-blank-ledger");
-    const badStop = path.join(home, "runs", "loop-bad-stop");
-    const emptyStop = path.join(home, "runs", "loop-empty-stop");
-    const malformedStop = path.join(home, "runs", "loop-malformed-stop");
-    const badUtf8Lock = path.join(home, "runs", "loop-bad-utf8-lock");
-    const badUtf8Ledger = path.join(home, "runs", "loop-bad-utf8-ledger");
-    for (const p of [emptyLock, badPid, blankLedger, badStop, emptyStop, malformedStop, badUtf8Lock, badUtf8Ledger]) {
-      fs.mkdirSync(p, { recursive: true });
-    }
-    fs.writeFileSync(path.join(emptyLock, "lock.json"), "{}");
-    fs.writeFileSync(path.join(badPid, "lock.json"), JSON.stringify({ pid: "bad" }));
-    fs.writeFileSync(path.join(blankLedger, "ledger.json"), "  \n\t");
-    fs.writeFileSync(path.join(badStop, "lock.json"), JSON.stringify({ pid: 1_000_000_007 }));
-    fs.writeFileSync(
-      path.join(badStop, "ledger.json"),
-      JSON.stringify({ schema: LOOP_LEDGER_SCHEMA, run_id: "loop-bad-stop", stop: true }),
-    );
-    fs.writeFileSync(path.join(emptyStop, "lock.json"), JSON.stringify({ pid: 1_000_000_007 }));
-    fs.writeFileSync(
-      path.join(emptyStop, "ledger.json"),
-      JSON.stringify({ schema: LOOP_LEDGER_SCHEMA, run_id: "loop-empty-stop", stop: {} }),
-    );
-    fs.writeFileSync(path.join(malformedStop, "lock.json"), JSON.stringify({ pid: 1_000_000_007 }));
-    fs.writeFileSync(
-      path.join(malformedStop, "ledger.json"),
-      JSON.stringify({
-        schema: LOOP_LEDGER_SCHEMA,
-        run_id: "loop-malformed-stop",
-        stop: { reason: "not-a-terminal-reason", time: "2026-08-20T00:00:00.000Z" },
-      }),
-    );
-    fs.writeFileSync(path.join(badUtf8Lock, "lock.json"), Buffer.from([0xff, 0xfe, 0x00, 0x7b]));
-    fs.writeFileSync(path.join(badUtf8Ledger, "ledger.json"), Buffer.from([0x80, 0x81, 0x82]));
-    const runner = path.join(dir, "run.sh");
-    fs.writeFileSync(
-      runner,
-      [
-        "#!/usr/bin/env bash",
-        "set -euo pipefail",
-        fnLive,
-        fnWait,
-        "probe_wait() {",
-        '  local id=$1',
-        '  local live',
-        '  live=$(frg_pack_loop_is_live "$id")',
-        '  printf "%s=%s\\n" "$id" "$live"',
-        '  printf "%s_wait=%s\\n" "$id" "$(frg_pack_wait_decision retry "$live" 2 2)"',
-        "}",
-        "probe_wait loop-empty-lock",
-        "probe_wait loop-bad-pid",
-        "probe_wait loop-blank-ledger",
-        "probe_wait loop-bad-stop",
-        "probe_wait loop-empty-stop",
-        "probe_wait loop-malformed-stop",
-        "probe_wait loop-bad-utf8-lock",
-        "probe_wait loop-bad-utf8-ledger",
-        "",
-      ].join("\n"),
-    );
-    fs.chmodSync(runner, 0o755);
-    const r = spawnSync("bash", [runner], {
-      encoding: "utf8",
-      env: {
-        ...process.env,
-        AGENT_PIPELINE_STATE_HOME: home,
-      },
-    });
-    assert.equal(r.status, 0, `liveness helper exited ${r.status}: ${r.stderr}`);
-    for (const id of [
-      "loop-empty-lock",
-      "loop-bad-pid",
-      "loop-blank-ledger",
-      "loop-bad-stop",
-      "loop-empty-stop",
-      "loop-malformed-stop",
-      "loop-bad-utf8-lock",
-      "loop-bad-utf8-ledger",
-    ]) {
-      assert.match(r.stdout, new RegExp(`^${id}=unknown$`, "m"), `${id} must be unknown`);
-      assert.match(
-        r.stdout,
-        new RegExp(`^${id}_wait=continue$`, "m"),
-        `${id} must wait-continue at cap`,
-      );
-    }
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("frg_pack_loop_is_live: explicit JSON null outstanding_ready is unknown, not terminal (#1150)", () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-loop-null-ready-"));
-  try {
-    const helpers = fs.readFileSync(frgHelpers, "utf8");
-    const fnLive = extractNamedFn(helpers, "frg_pack_loop_is_live", "frg-pack-helpers.sh");
-    const fnWait = extractNamedFn(helpers, "frg_pack_wait_decision", "frg-pack-helpers.sh");
-    const home = path.join(dir, "state");
-    const nullReady = path.join(home, "runs", "loop-null-ready");
-    const omittedReady = path.join(home, "runs", "loop-omitted-ready");
-    const terminalStop = {
-      reason: "supervisor_cycle_cap",
-      time: "2026-08-20T00:00:00.000Z",
-    };
-    for (const p of [nullReady, omittedReady]) {
-      fs.mkdirSync(p, { recursive: true });
-      fs.writeFileSync(path.join(p, "lock.json"), JSON.stringify({ pid: 1_000_000_007 }));
-    }
-    fs.writeFileSync(
-      path.join(nullReady, "ledger.json"),
-      JSON.stringify({
-        schema: LOOP_LEDGER_SCHEMA,
-        run_id: "loop-null-ready",
-        stop: { ...terminalStop, outstanding_ready: null },
-      }),
-    );
-    fs.writeFileSync(
-      path.join(omittedReady, "ledger.json"),
-      JSON.stringify({
-        schema: LOOP_LEDGER_SCHEMA,
-        run_id: "loop-omitted-ready",
-        stop: terminalStop,
-      }),
-    );
-    const runner = path.join(dir, "run.sh");
-    fs.writeFileSync(
-      runner,
-      [
-        "#!/usr/bin/env bash",
-        "set -euo pipefail",
-        fnLive,
-        fnWait,
-        "probe_wait() {",
-        "  local id=$1",
-        "  local live",
-        '  live=$(frg_pack_loop_is_live "$id")',
-        '  printf "%s=%s\\n" "$id" "$live"',
-        '  printf "%s_wait=%s\\n" "$id" "$(frg_pack_wait_decision retry "$live" 2 2)"',
-        "}",
-        "probe_wait loop-null-ready",
-        "probe_wait loop-omitted-ready",
-        "",
-      ].join("\n"),
-    );
-    fs.chmodSync(runner, 0o755);
-    const r = spawnSync("bash", [runner], {
-      encoding: "utf8",
-      env: {
-        ...process.env,
-        AGENT_PIPELINE_STATE_HOME: home,
-      },
-    });
-    assert.equal(r.status, 0, `liveness helper exited ${r.status}: ${r.stderr}`);
-    assert.match(
-      r.stdout,
-      /^loop-null-ready=unknown$/m,
-      "explicit null outstanding_ready must be unknown, not not-live",
-    );
-    assert.match(
-      r.stdout,
-      /^loop-null-ready_wait=continue$/m,
-      "explicit null outstanding_ready must wait-continue at cap",
-    );
-    assert.match(
-      r.stdout,
-      /^loop-omitted-ready=0$/m,
-      "omitted outstanding_ready on a valid ledger remains a terminal stop",
-    );
-    assert.match(
-      r.stdout,
-      /^loop-omitted-ready_wait=fail$/m,
-      "omitted outstanding_ready on a valid ledger at cap remains fail-closed",
-    );
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("frg_pack_loop_is_live: missing or mismatched ledger identity is unknown at cap (#1150)", () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tugboat-loop-identity-"));
-  try {
-    const helpers = fs.readFileSync(frgHelpers, "utf8");
-    const fnLive = extractNamedFn(helpers, "frg_pack_loop_is_live", "frg-pack-helpers.sh");
-    const fnWait = extractNamedFn(helpers, "frg_pack_wait_decision", "frg-pack-helpers.sh");
-    const home = path.join(dir, "state");
-    const stopOnly = path.join(home, "runs", "loop-stop-only");
-    const missingSchema = path.join(home, "runs", "loop-missing-schema");
-    const numericSchema = path.join(home, "runs", "loop-numeric-schema");
-    const mismatchedId = path.join(home, "runs", "loop-mismatched-id");
-    const terminalStop = {
-      reason: "supervisor_cycle_cap",
-      time: "2026-08-20T00:00:00.000Z",
-    };
-    for (const p of [stopOnly, missingSchema, numericSchema, mismatchedId]) {
-      fs.mkdirSync(p, { recursive: true });
-      fs.writeFileSync(path.join(p, "lock.json"), JSON.stringify({ pid: 1_000_000_007 }));
-    }
-    fs.writeFileSync(
-      path.join(stopOnly, "ledger.json"),
-      JSON.stringify({ stop: terminalStop }),
-    );
-    fs.writeFileSync(
-      path.join(missingSchema, "ledger.json"),
-      JSON.stringify({ run_id: "loop-missing-schema", stop: terminalStop }),
-    );
-    fs.writeFileSync(
-      path.join(numericSchema, "ledger.json"),
-      JSON.stringify({ schema: 1, run_id: "loop-numeric-schema", stop: terminalStop }),
-    );
-    fs.writeFileSync(
-      path.join(mismatchedId, "ledger.json"),
-      JSON.stringify({
-        schema: LOOP_LEDGER_SCHEMA,
-        run_id: "other-loop",
-        stop: terminalStop,
-      }),
-    );
-    const runner = path.join(dir, "run.sh");
-    fs.writeFileSync(
-      runner,
-      [
-        "#!/usr/bin/env bash",
-        "set -euo pipefail",
-        fnLive,
-        fnWait,
-        "probe_wait() {",
-        "  local id=$1",
-        "  local live",
-        '  live=$(frg_pack_loop_is_live "$id")',
-        '  printf "%s=%s\\n" "$id" "$live"',
-        '  printf "%s_wait=%s\\n" "$id" "$(frg_pack_wait_decision retry "$live" 2 2)"',
-        "}",
-        "probe_wait loop-stop-only",
-        "probe_wait loop-missing-schema",
-        "probe_wait loop-numeric-schema",
-        "probe_wait loop-mismatched-id",
-        "",
-      ].join("\n"),
-    );
-    fs.chmodSync(runner, 0o755);
-    const r = spawnSync("bash", [runner], {
-      encoding: "utf8",
-      env: {
-        ...process.env,
-        AGENT_PIPELINE_STATE_HOME: home,
-      },
-    });
-    assert.equal(r.status, 0, `liveness helper exited ${r.status}: ${r.stderr}`);
-    for (const id of [
-      "loop-stop-only",
-      "loop-missing-schema",
-      "loop-numeric-schema",
-      "loop-mismatched-id",
-    ]) {
-      assert.match(r.stdout, new RegExp(`^${id}=unknown$`, "m"), `${id} must be unknown`);
-      assert.match(
-        r.stdout,
-        new RegExp(`^${id}_wait=continue$`, "m"),
-        `${id} must wait-continue at cap`,
-      );
-    }
+    assert.match(r.stdout, /^absent=0$/m);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -5739,7 +5482,7 @@ function liveWaitLauncher(candRecord: string, ticksPath: string): string[] {
     "  n += 1;",
     "  writeFileSync(ticksPath, String(n));",
     "  if (n === 1) {",
-    "    process.stdout.write(JSON.stringify({ status: 'in_progress', loop_run_id: 'loop-live' }) + '\\n');",
+    "    process.stdout.write(JSON.stringify({ status: 'in_progress', loop_run_id: 'loop-live', liveness: { schema_version: 1, kind: 'pack_loop_liveness', loop_run_id: 'loop-live', status: 'live', reason: 'live', observed_at: '2026-08-29T12:00:00.000Z' } }) + '\\n');",
     "  } else {",
     "    process.stdout.write(JSON.stringify({ status: 'complete', release_pr: { number: 12 } }) + '\\n');",
     "  }",
@@ -5760,7 +5503,7 @@ function notLiveWaitLauncher(candRecord: string, ticksPath: string): string[] {
     "  try { n = Number(readFileSync(ticksPath, 'utf8')); } catch {}",
     "  n += 1;",
     "  writeFileSync(ticksPath, String(n));",
-    "  process.stdout.write(JSON.stringify({ status: 'in_progress', loop_run_id: 'loop-dead' }) + '\\n');",
+    "  process.stdout.write(JSON.stringify({ status: 'in_progress', loop_run_id: 'loop-dead', liveness: { schema_version: 1, kind: 'pack_loop_liveness', loop_run_id: 'loop-dead', status: 'not-live', reason: 'dead_pid', observed_at: '2026-08-29T12:00:00.000Z' } }) + '\\n');",
     "}",
     "process.exit(0);",
     "",
