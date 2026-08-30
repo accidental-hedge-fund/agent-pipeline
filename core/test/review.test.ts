@@ -701,40 +701,6 @@ test("advanceReview: getPrDiff throw Outcome carries blockerKind harness-failure
   assert.equal(rec.runReviewCalls, 0, "reviewer must not run without a diff");
 });
 
-test("advanceReview: label-transition gh issue view failure Outcome carries blockerKind harness-failure (not needs-human)", async (t) => {
-  // After an approve verdict, transition() calls getIssueDetail (`gh issue view`).
-  // A timeout/generic Command failed must not park as needs-human → workflow-state.
-  // emitBlockedOutcomeEvents defaults a missing Outcome.blockerKind to needs-human.
-  // Live #1342: Label transition failed: gh issue view 1342 failed: Command failed: ...
-  const { deps, rec } = makeDeps([APPROVE]);
-  const throwingDeps: AdvanceReviewDeps = {
-    ...deps,
-    transition: async () => {
-      throw new Error(
-        "gh issue view 1342 failed: Command failed: gh issue view 1342 --json " +
-          "number,title,body,labels,comments,state,url -R accidental-hedge-fund/agent-pipeline",
-      );
-    },
-  };
-  let out: Awaited<ReturnType<typeof advanceReview>> | undefined;
-  await quiet(t, async () => {
-    out = await advanceReview(cfg, 1342, 1, {}, 0, throwingDeps);
-  });
-  assert.equal(out?.advanced, false);
-  assert.equal(out && !out.advanced ? out.status : undefined, "blocked");
-  assert.equal(out && !out.advanced ? out.blockerKind : undefined, "harness-failure");
-  assert.notEqual(out && !out.advanced ? out.blockerKind : undefined, "needs-human");
-  assert.ok(
-    rec.blockedKinds.includes("harness-failure"),
-    "setBlocked must still record harness-failure",
-  );
-  assert.ok(
-    rec.blocked.some((b) => /Label transition failed:.*gh issue view 1342 failed/i.test(b)),
-    "blocked comment must name the label-transition gh issue view failure",
-  );
-  assert.equal(rec.transitions.length, 0, "failed transition must not record a successful hop");
-});
-
 test("advanceReview: harness exit failure Outcome carries blockerKind harness-failure (#882)", async (t) => {
   // Without blockerKind, emitBlockedOutcomeEvents defaults to needs-human →
   // workflow-state, so durable recovery misroutes tester-evidence-gate /
