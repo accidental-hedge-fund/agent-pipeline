@@ -1752,6 +1752,7 @@ test("productionDispatchPackLoop persists binding before spawn", async () => {
         assert.equal(isPendingLoopDispatch(binding), true);
         const instance = JSON.parse(files.get(factoryReleasePackInstancePath(persistCtx.workDir))!);
         assert.equal(instance.loop_run_id, "loop-persist-order");
+        return { dispatch_state: "dispatched" as const };
       },
     },
   );
@@ -1846,6 +1847,7 @@ test("crash after persist before spawn resumes the same bound run", async () => 
       },
       resumeBoundPackLoop: async ({ loop_run_id }) => {
         resumeCalls.push(loop_run_id);
+        return { dispatch_state: "dispatched" as const };
       },
     },
   );
@@ -1941,6 +1943,7 @@ test("failed detached spawn is retried on the same bound run", async () => {
       },
       resumeBoundPackLoop: async ({ loop_run_id }) => {
         await spawnOnce(`resume:${loop_run_id}`);
+        return { dispatch_state: "dispatched" as const };
       },
     },
   );
@@ -2523,6 +2526,383 @@ test("resume OS accept persists starting so a later invoke does not spawn a seco
   assert.equal(second.loop_run_id, loopRunId);
   assert.equal(spawnCount, 1, "in-window starting must not spawn a second child");
   assert.equal(JSON.parse(files.get(bindingPath)!).dispatch_state, "starting");
+});
+
+function seedLoopBinding(files: Map<string, string>, over: {
+  loopRunId: string;
+  workDir: string;
+  dispatch_state: "bound" | "starting" | "dispatched";
+  observation_deadline?: string;
+  resume_count?: number;
+}) {
+  const request = baseRequest();
+  const fingerprint = factoryReleaseRequestFingerprint(request);
+  const packRunId = `pack-${request.target_version.replace(/\./g, "")}-${request.action_id}`.slice(
+    0,
+    200,
+  );
+  const invocation = testInvocation(over.loopRunId);
+  const bindingPath = factoryReleaseLoopBindingPath(over.loopRunId);
+  const binding: Record<string, unknown> = {
+    schema_version: 1,
+    kind: "factory_release_loop_binding",
+    request_fingerprint: fingerprint,
+    target_version: request.target_version,
+    candidate_git_sha: CANDIDATE,
+    pack_id: "factory-gate-v1",
+    manifest_sha256: MANIFEST_SHA,
+    pack_run_id: packRunId,
+    frg_run_id: "frg-seed",
+    loop_run_id: over.loopRunId,
+    dispatch_state: over.dispatch_state,
+    candidate_invocation: {
+      executable: invocation.executable,
+      argv: [...invocation.argv],
+      candidateSha: invocation.candidateSha,
+    },
+  };
+  if (over.observation_deadline) binding.observation_deadline = over.observation_deadline;
+  if (over.resume_count !== undefined) binding.resume_count = over.resume_count;
+  files.set(bindingPath, JSON.stringify(binding));
+  files.set(
+    factoryReleasePackInstancePath(over.workDir),
+    JSON.stringify({
+      schema_version: 1,
+      kind: "factory_release_pack_instance",
+      request_fingerprint: fingerprint,
+      target_version: request.target_version,
+      candidate_git_sha: CANDIDATE,
+      pack_id: "factory-gate-v1",
+      manifest_sha256: MANIFEST_SHA,
+      pack_run_id: packRunId,
+      frg_run_id: "frg-seed",
+      loop_run_id: over.loopRunId,
+      created_at: "2026-08-10T12:00:00Z",
+      updated_at: "2026-08-10T12:00:00Z",
+    }),
+  );
+  return { request, bindingPath, invocation };
+}
+
+function mapFs(files: Map<string, string>) {
+  return {
+    writeFile: async (p: string, body: string) => {
+      files.set(p, body);
+    },
+    readFile: async (p: string) => {
+      const v = files.get(p);
+      if (v === undefined) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+      return v;
+    },
+    fileExists: async (p: string) => files.has(p),
+  };
+}
+
+test("expired starting adopts a valid durable handoff instead of failing (#1296)", async () => {
+  const files = new Map<string, string>();
+  const loopRunId = "loop-starting-adopt";
+  const workDir = "/tmp/frg-work-starting-adopt";
+  const { request, bindingPath } = seedLoopBinding(files, {
+    loopRunId,
+    workDir,
+    dispatch_state: "starting",
+    observation_deadline: "2026-08-10T11:59:00Z",
+  });
+  const fsOps = mapFs(files);
+  let resumeCalls = 0;
+  const result = await generateDurableUnsignedFrg(
+    request,
+    {
+      repoDir: "/repo",
+      workDir,
+      pack: packWithTemplates(),
+      manifestPath: "/pack/factory-gate-v1/manifest.json",
+    },
+    {
+      now: () => new Date("2026-08-10T12:00:00Z"),
+      writeFile: fsOps.writeFile,
+      mkdir: async () => {},
+      readFile: fsOps.readFile,
+      fileExists: fsOps.fileExists,
+      reconcilePackLoop: async () => boundLoopArtifacts({ loop_run_id: loopRunId }),
+      probePackLoopLiveness: async () => ({
+        schema_version: 1,
+        kind: "pack_loop_liveness",
+        loop_run_id: loopRunId,
+        status: "live",
+        reason: "live",
+        observed_at: "2026-08-10T12:00:00Z",
+      }),
+      createOrReusePackIssues: async () => {
+        throw new Error("must not create pack issues while adopting handoff");
+      },
+      dispatchPackLoop: async () => {
+        throw new Error("must not dispatch a second pack");
+      },
+      resumeBoundPackLoop: async () => {
+        resumeCalls += 1;
+        throw new Error("must not resume while adopting a valid starting handoff");
+      },
+      spawnDeps: {
+        readHandoff: async () => validHandoff(loopRunId),
+        readSupervisor: async () => validHandoff(loopRunId).supervisor,
+        storeRunDir: `/state/runs/${loopRunId}`,
+        realpath: (p: string) => p,
+      },
+    },
+  );
+  assert.equal(result.in_progress, true);
+  assert.equal(result.loop_run_id, loopRunId);
+  assert.equal(resumeCalls, 0);
+  assert.equal(JSON.parse(files.get(bindingPath)!).dispatch_state, "dispatched");
+});
+
+test("malformed starting handoff fails closed before the deadline (#1296)", async () => {
+  const files = new Map<string, string>();
+  const loopRunId = "loop-starting-malformed";
+  const workDir = "/tmp/frg-work-starting-malformed";
+  const { request, bindingPath } = seedLoopBinding(files, {
+    loopRunId,
+    workDir,
+    dispatch_state: "starting",
+    observation_deadline: "2026-08-10T12:00:30Z",
+  });
+  const fsOps = mapFs(files);
+  const result = await generateDurableUnsignedFrg(
+    request,
+    {
+      repoDir: "/repo",
+      workDir,
+      pack: packWithTemplates(),
+      manifestPath: "/pack/factory-gate-v1/manifest.json",
+    },
+    {
+      now: () => new Date("2026-08-10T12:00:00Z"),
+      writeFile: fsOps.writeFile,
+      mkdir: async () => {},
+      readFile: fsOps.readFile,
+      fileExists: fsOps.fileExists,
+      reconcilePackLoop: async () => boundLoopArtifacts({ loop_run_id: loopRunId }),
+      createOrReusePackIssues: async () => {
+        throw new Error("must not create pack issues on malformed handoff");
+      },
+      dispatchPackLoop: async () => {
+        throw new Error("must not dispatch a second pack");
+      },
+      resumeBoundPackLoop: async () => {
+        throw new Error("must not resume a malformed starting handoff");
+      },
+      spawnDeps: {
+        readHandoff: async () => validHandoff(loopRunId, "f".repeat(40)),
+        readSupervisor: async () => validHandoff(loopRunId).supervisor,
+        storeRunDir: `/state/runs/${loopRunId}`,
+        realpath: (p: string) => p,
+      },
+    },
+  );
+  assert.equal(result.in_progress, undefined);
+  assert.equal(result.defect_class, "pack_loop_start_failed");
+  assert.match(result.message ?? "", /candidate_sha mismatch|handoff/);
+  assert.equal(JSON.parse(files.get(bindingPath)!).dispatch_state, "failed");
+});
+
+test("stale heartbeat with an alive pid does not authorize resume (#1296)", async () => {
+  const files = new Map<string, string>();
+  const loopRunId = "loop-stale-heartbeat";
+  const workDir = "/tmp/frg-work-stale-heartbeat";
+  const { request, bindingPath } = seedLoopBinding(files, {
+    loopRunId,
+    workDir,
+    dispatch_state: "dispatched",
+    resume_count: 0,
+  });
+  const fsOps = mapFs(files);
+  let resumeCalls = 0;
+  const result = await generateDurableUnsignedFrg(
+    request,
+    {
+      repoDir: "/repo",
+      workDir,
+      pack: packWithTemplates(),
+      manifestPath: "/pack/factory-gate-v1/manifest.json",
+    },
+    {
+      now: () => new Date("2026-08-10T12:00:00Z"),
+      writeFile: fsOps.writeFile,
+      mkdir: async () => {},
+      readFile: fsOps.readFile,
+      fileExists: fsOps.fileExists,
+      reconcilePackLoop: async () => boundLoopArtifacts({ loop_run_id: loopRunId }),
+      probePackLoopLiveness: async () => ({
+        schema_version: 1,
+        kind: "pack_loop_liveness",
+        loop_run_id: loopRunId,
+        status: "not-live",
+        reason: "stale_heartbeat",
+        observed_at: "2026-08-10T12:00:00Z",
+      }),
+      createOrReusePackIssues: async () => {
+        throw new Error("must not create pack issues on stale heartbeat");
+      },
+      dispatchPackLoop: async () => {
+        throw new Error("must not dispatch a second pack");
+      },
+      resumeBoundPackLoop: async () => {
+        resumeCalls += 1;
+        throw new Error("stale heartbeat must not spawn a replacement");
+      },
+    },
+  );
+  assert.equal(result.in_progress, true);
+  assert.equal(result.loop_run_id, loopRunId);
+  assert.equal(result.liveness?.reason, "stale_heartbeat");
+  assert.equal(resumeCalls, 0);
+  const binding = JSON.parse(files.get(bindingPath)!);
+  assert.equal(binding.dispatch_state, "dispatched");
+  assert.equal(binding.resume_count, 0);
+});
+
+test("missing heartbeat does not authorize resume (#1296)", async () => {
+  const files = new Map<string, string>();
+  const loopRunId = "loop-missing-heartbeat";
+  const workDir = "/tmp/frg-work-missing-heartbeat";
+  const { request, bindingPath } = seedLoopBinding(files, {
+    loopRunId,
+    workDir,
+    dispatch_state: "dispatched",
+    resume_count: 0,
+  });
+  const fsOps = mapFs(files);
+  let resumeCalls = 0;
+  const result = await generateDurableUnsignedFrg(
+    request,
+    {
+      repoDir: "/repo",
+      workDir,
+      pack: packWithTemplates(),
+      manifestPath: "/pack/factory-gate-v1/manifest.json",
+    },
+    {
+      now: () => new Date("2026-08-10T12:00:00Z"),
+      writeFile: fsOps.writeFile,
+      mkdir: async () => {},
+      readFile: fsOps.readFile,
+      fileExists: fsOps.fileExists,
+      reconcilePackLoop: async () => boundLoopArtifacts({ loop_run_id: loopRunId }),
+      probePackLoopLiveness: async () => ({
+        schema_version: 1,
+        kind: "pack_loop_liveness",
+        loop_run_id: loopRunId,
+        status: "not-live",
+        reason: "missing_heartbeat",
+        observed_at: "2026-08-10T12:00:00Z",
+      }),
+      createOrReusePackIssues: async () => {
+        throw new Error("must not create pack issues on missing heartbeat");
+      },
+      dispatchPackLoop: async () => {
+        throw new Error("must not dispatch a second pack");
+      },
+      resumeBoundPackLoop: async () => {
+        resumeCalls += 1;
+        throw new Error("missing heartbeat must not spawn a replacement");
+      },
+    },
+  );
+  assert.equal(result.in_progress, true);
+  assert.equal(result.liveness?.reason, "missing_heartbeat");
+  assert.equal(resumeCalls, 0);
+  const binding = JSON.parse(files.get(bindingPath)!);
+  assert.equal(binding.dispatch_state, "dispatched");
+  assert.equal(binding.resume_count, 0);
+});
+
+test("void spawnCandidateLoop does not persist dispatched (#1296)", async () => {
+  const files = new Map<string, string>();
+  const persistCtx = {
+    repoDir: "/repo",
+    workDir: "/tmp/frg-work-void-spawn",
+    request: baseRequest(),
+    pack: packWithTemplates(),
+    packRunId: "pack-1340-void-spawn",
+    frgRunId: "frg-void-spawn",
+    requestFingerprint: factoryReleaseRequestFingerprint(baseRequest()),
+    writeFile: async (p: string, body: string) => {
+      files.set(p, body);
+    },
+    readFile: async (p: string) => {
+      const v = files.get(p);
+      if (v === undefined) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+      return v;
+    },
+    fileExists: async (p: string) => files.has(p),
+    now: () => new Date("2026-08-10T12:00:00Z"),
+  };
+  await assert.rejects(
+    () =>
+      productionDispatchPackLoop(
+        {
+          repoDir: "/repo",
+          request: baseRequest(),
+          pack: packWithTemplates(),
+          packRunId: "pack-1340-void-spawn",
+          issue_numbers: [101, 102],
+          engineTrack: "candidate",
+          label: "factory-gate",
+          persistCtx,
+          candidateInvocation: testInvocation("loop-void-spawn"),
+        },
+        {
+          fileExists: () => true,
+          initBoundLoop: async () => ({ loop_run_id: "loop-void-spawn" }),
+          spawnCandidateLoop: async () => undefined,
+        },
+      ),
+    /no durable handoff acknowledgement/,
+  );
+  const binding = JSON.parse(files.get(factoryReleaseLoopBindingPath("loop-void-spawn"))!);
+  assert.equal(binding.dispatch_state, "bound");
+  assert.notEqual(binding.dispatch_state, "dispatched");
+});
+
+test("void resumeBoundPackLoop does not persist dispatched (#1296)", async () => {
+  const files = new Map<string, string>();
+  const loopRunId = "loop-void-resume";
+  const workDir = "/tmp/frg-work-void-resume";
+  const { request, bindingPath } = seedLoopBinding(files, {
+    loopRunId,
+    workDir,
+    dispatch_state: "bound",
+  });
+  const fsOps = mapFs(files);
+  const result = await generateDurableUnsignedFrg(
+    request,
+    {
+      repoDir: "/repo",
+      workDir,
+      pack: packWithTemplates(),
+      manifestPath: "/pack/factory-gate-v1/manifest.json",
+    },
+    {
+      now: () => new Date("2026-08-10T12:00:00Z"),
+      writeFile: fsOps.writeFile,
+      mkdir: async () => {},
+      readFile: fsOps.readFile,
+      fileExists: fsOps.fileExists,
+      reconcilePackLoop: async () => boundLoopArtifacts({ loop_run_id: loopRunId }),
+      createOrReusePackIssues: async () => {
+        throw new Error("must not create pack issues on void resume");
+      },
+      dispatchPackLoop: async () => {
+        throw new Error("must not dispatch a second pack");
+      },
+      resumeBoundPackLoop: async () => undefined,
+    },
+  );
+  assert.equal(result.in_progress, undefined);
+  assert.equal(result.defect_class, "pack_loop_start_failed");
+  assert.match(result.message ?? "", /no durable handoff acknowledgement/);
+  assert.equal(JSON.parse(files.get(bindingPath)!).dispatch_state, "bound");
 });
 
 test("assertCandidateInvocation rejects SHA mismatch", () => {

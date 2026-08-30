@@ -58,6 +58,7 @@ import {
 import { redactSecrets, sanitize } from "./artifact-sanitize.ts";
 import {
   defaultLoopStoreDeps,
+  loopRunHandoffPath,
   readActionEvidence,
   readContract,
   readEvents,
@@ -1077,6 +1078,24 @@ export function parseDispatchState(raw: unknown): FactoryReleaseLoopDispatchStat
   return null;
 }
 
+function isPackLoopSpawnResult(value: unknown): value is PackLoopSpawnResult {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  return parseDispatchState((value as { dispatch_state?: unknown }).dispatch_state) !== null;
+}
+
+function requirePackLoopSpawnResult(
+  value: unknown,
+  loopRunId: string,
+  action: "spawn" | "resume",
+): PackLoopSpawnResult {
+  if (!isPackLoopSpawnResult(value)) {
+    throw new Error(
+      `pack-loop ${action} returned no durable handoff acknowledgement for ${loopRunId}`,
+    );
+  }
+  return value;
+}
+
 /**
  * Persist pack-instance `loop_run_id` and the matching loop binding.
  * Callers write `bound` before spawn, `starting` after OS accept, and
@@ -1969,6 +1988,83 @@ async function probePrepareLiveness(
   });
 }
 
+async function readStartingHandoffArtifact(
+  loopRunId: string,
+  ctx: DurableReconcilePackLoopCtx,
+  opts: DurableGenerateOptions,
+  storeRunDir: string,
+): Promise<{ handoff: unknown | null; supervisor: { pid?: unknown; boot_id?: unknown; started_at?: unknown } | null }> {
+  let handoff: unknown | null = null;
+  if (opts.spawnDeps?.readHandoff) {
+    handoff = await opts.spawnDeps.readHandoff(loopRunId);
+  } else {
+    const p = loopRunHandoffPath(storeRunDir);
+    if (await ctx.fileExists(p)) {
+      handoff = JSON.parse(await ctx.readFile(p));
+    }
+  }
+  let supervisor: { pid?: unknown; boot_id?: unknown; started_at?: unknown } | null = null;
+  if (opts.spawnDeps?.readSupervisor) {
+    supervisor = await opts.spawnDeps.readSupervisor(loopRunId);
+  } else {
+    const p = path.join(storeRunDir, "supervisor.json");
+    if (await ctx.fileExists(p)) {
+      supervisor = JSON.parse(await ctx.readFile(p)) as {
+        pid?: unknown;
+        boot_id?: unknown;
+        started_at?: unknown;
+      };
+    }
+  }
+  return { handoff, supervisor };
+}
+
+/**
+ * Later prepare ticks must adopt a valid durable handoff written after OS
+ * accept, even when the original parent has already detached. Malformed
+ * evidence fails closed. Missing evidence stays `starting` until the deadline.
+ */
+async function reconcileStartingDurableHandoff(input: {
+  ctx: DurableReconcilePackLoopCtx;
+  loopRunId: string;
+  request: FactoryReleasePrepareRequest;
+  binding: Record<string, unknown> | null;
+  opts: DurableGenerateOptions;
+}): Promise<{ kind: "adopted" } | { kind: "absent" } | { kind: "failed"; error: string }> {
+  const invocation = restoreInvocation(input.binding, input.loopRunId, input.request);
+  const candidateSha = invocation?.candidateSha ?? input.request.integrated_candidate.git_sha;
+  const storeRunDir = input.opts.spawnDeps?.storeRunDir ?? runDir(defaultLoopStoreDeps(), input.loopRunId);
+  let evidence: { handoff: unknown | null; supervisor: { pid?: unknown; boot_id?: unknown; started_at?: unknown } | null };
+  try {
+    evidence = await readStartingHandoffArtifact(input.loopRunId, input.ctx, input.opts, storeRunDir);
+  } catch (err) {
+    return {
+      kind: "failed",
+      error: `pack-loop handoff unreadable: ${(err as Error).message}`,
+    };
+  }
+  if (!evidence.handoff) return { kind: "absent" };
+  const valid = validateDurablePackLoopHandoff({
+    handoff: evidence.handoff,
+    loopRunId: input.loopRunId,
+    candidateSha,
+    storeRunDir,
+    supervisor: evidence.supervisor,
+    realpath: input.opts.spawnDeps?.realpath,
+  });
+  if (!valid.ok) return { kind: "failed", error: valid.error };
+  const extras: FactoryReleaseLoopBindingFields = {};
+  if (invocation) {
+    extras.candidate_invocation = {
+      executable: invocation.executable,
+      argv: [...invocation.argv],
+      candidateSha: invocation.candidateSha,
+    };
+  }
+  await persistFactoryReleaseLoopBinding(input.ctx, input.loopRunId, "dispatched", extras);
+  return { kind: "adopted" };
+}
+
 /**
  * Production dispatch: allocate/init the work-list run, persist `bound`, then
  * spawn the resolved candidate launcher. OS accept is `starting`. Valid
@@ -2111,10 +2207,7 @@ export async function productionDispatchPackLoop(
     }
     throw err;
   }
-  const result: PackLoopSpawnResult =
-    spawnResult && typeof spawnResult === "object" && "dispatch_state" in spawnResult
-      ? spawnResult
-      : { dispatch_state: "dispatched" };
+  const result = requirePackLoopSpawnResult(spawnResult, loop_run_id, "spawn");
   await persistSpawnResult(input.persistCtx, loop_run_id, result, invocation);
   if (result.dispatch_state === "failed") {
     throw new Error(result.last_error ?? "pack-loop dispatch failed before handoff");
@@ -2646,22 +2739,44 @@ export async function generateDurableUnsignedFrg(
       };
     }
     if (dispatchState === "starting") {
-      const deadline = typeof binding?.observation_deadline === "string" ? binding.observation_deadline : "";
-      const expired = !deadline || now().getTime() >= Date.parse(deadline);
-      if (expired) {
-        const msg = `factory-release prepare: pack-loop observation window expired for ${loop.loop_run_id}`;
+      const adopted = await reconcileStartingDurableHandoff({
+        ctx: reconcileCtx,
+        loopRunId: loop.loop_run_id,
+        request,
+        binding,
+        opts,
+      });
+      if (adopted.kind === "failed") {
         await persistFactoryReleaseLoopBinding(reconcileCtx, loop.loop_run_id, "failed", {
-          last_error: msg,
+          last_error: adopted.error,
         });
         return {
-          ...refuseSyntheticTrivialPack(request, {
+          ...(await refuseSyntheticTrivialPack(request, {
             defect_class: "pack_loop_start_failed",
-            message: msg,
-          }),
+            message: adopted.error,
+          })),
           loop_run_id: loop.loop_run_id,
         };
       }
-      // In-window starting: observe, do not spawn a second child.
+      if (adopted.kind === "absent") {
+        const deadline = typeof binding?.observation_deadline === "string" ? binding.observation_deadline : "";
+        const expired = !deadline || now().getTime() >= Date.parse(deadline);
+        if (expired) {
+          const msg = `factory-release prepare: pack-loop observation window expired for ${loop.loop_run_id}`;
+          await persistFactoryReleaseLoopBinding(reconcileCtx, loop.loop_run_id, "failed", {
+            last_error: msg,
+          });
+          return {
+            ...(await refuseSyntheticTrivialPack(request, {
+              defect_class: "pack_loop_start_failed",
+              message: msg,
+            })),
+            loop_run_id: loop.loop_run_id,
+          };
+        }
+        // In-window starting with no handoff: observe, do not spawn a second child.
+      }
+      // Valid durable handoff: persist dispatched above and do not spawn.
     } else if (
       dispatchState === "dispatched" &&
       typeof binding?.resume_count === "number" &&
@@ -2702,23 +2817,25 @@ export async function generateDurableUnsignedFrg(
             liveness: live,
           };
         }
-        if (live.reason === "dead_pid" || live.reason === "stale_heartbeat" || live.reason === "missing_heartbeat") {
+        if (live.reason === "dead_pid") {
           try {
             const invocation = restoreInvocation(binding, loop.loop_run_id, request);
             await persistFactoryReleaseLoopBinding(reconcileCtx, loop.loop_run_id, "bound", {
               resume_count: 1,
               failed_process_identity: failedIdentityFromBinding(binding),
             });
-            const resumed = await resumeBoundPackLoop({
-              repoDir: ctx.repoDir,
-              loop_run_id: loop.loop_run_id,
-              candidateInvocation: invocation,
-            });
-            if (resumed && typeof resumed === "object" && "dispatch_state" in resumed) {
-              await persistSpawnResult(reconcileCtx, loop.loop_run_id, resumed, invocation);
-              if (resumed.dispatch_state === "failed" || resumed.dispatch_state === "bound") {
-                throw new Error(resumed.last_error ?? "pack-loop resume failed");
-              }
+            const resumed = requirePackLoopSpawnResult(
+              await resumeBoundPackLoop({
+                repoDir: ctx.repoDir,
+                loop_run_id: loop.loop_run_id,
+                candidateInvocation: invocation,
+              }),
+              loop.loop_run_id,
+              "resume",
+            );
+            await persistSpawnResult(reconcileCtx, loop.loop_run_id, resumed, invocation);
+            if (resumed.dispatch_state === "failed" || resumed.dispatch_state === "bound") {
+              throw new Error(resumed.last_error ?? "pack-loop resume failed");
             }
           } catch (err) {
             return {
@@ -2744,21 +2861,21 @@ export async function generateDurableUnsignedFrg(
     ) {
       try {
         const invocation = restoreInvocation(binding, loop.loop_run_id, request) ?? opts.candidateInvocation;
-        const resumed = await resumeBoundPackLoop({
-          repoDir: ctx.repoDir,
-          loop_run_id: loop.loop_run_id,
-          candidateInvocation: invocation,
-        });
-        if (resumed && typeof resumed === "object" && "dispatch_state" in resumed) {
-          await persistSpawnResult(reconcileCtx, loop.loop_run_id, resumed, invocation);
-          if (resumed.dispatch_state === "failed") {
-            throw new Error(resumed.last_error ?? "pack-loop resume failed before handoff");
-          }
-          if (resumed.dispatch_state === "bound") {
-            throw new Error(resumed.last_error ?? "pack-loop resume did not start");
-          }
-        } else {
-          await persistFactoryReleaseLoopBinding(reconcileCtx, loop.loop_run_id, "dispatched");
+        const resumed = requirePackLoopSpawnResult(
+          await resumeBoundPackLoop({
+            repoDir: ctx.repoDir,
+            loop_run_id: loop.loop_run_id,
+            candidateInvocation: invocation,
+          }),
+          loop.loop_run_id,
+          "resume",
+        );
+        await persistSpawnResult(reconcileCtx, loop.loop_run_id, resumed, invocation);
+        if (resumed.dispatch_state === "failed") {
+          throw new Error(resumed.last_error ?? "pack-loop resume failed before handoff");
+        }
+        if (resumed.dispatch_state === "bound") {
+          throw new Error(resumed.last_error ?? "pack-loop resume did not start");
         }
       } catch (err) {
         return refuseSyntheticTrivialPack(request, {
