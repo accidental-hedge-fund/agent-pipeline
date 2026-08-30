@@ -392,6 +392,16 @@ for (const keyword of PROFILE_FREE_COMMANDS) {
   });
 }
 
+test("command-registry: refine-spec allowedFlags include issue and proposalFile (#1072)", () => {
+  const entry = COMMAND_REGISTRY["refine-spec"];
+  const flags = entry.allowedFlags as Set<string>;
+  assert.equal(flags.has("issue"), true);
+  assert.equal(flags.has("proposalFile"), true);
+  assert.deepEqual(validateFlags(entry, fakeCmdWithCliFlag("issue")), []);
+  assert.deepEqual(validateFlags(entry, fakeCmdWithCliFlag("proposalFile")), []);
+  assert.deepEqual(validateFlags(entry, fakeCmdWithCliFlag("bogus")), ["bogus"]);
+});
+
 test("command-registry: a genuinely unsupported flag on a profile-free command is still rejected", () => {
   const entry = COMMAND_REGISTRY.scoreboard;
   const cmd = fakeCmdWithCliFlag("bogus");

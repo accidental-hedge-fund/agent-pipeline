@@ -150,8 +150,8 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 
 #### `refine-spec`
 
-- **Usage:** `pipeline refine-spec --title "<t>" --body "<b>"`
-- **Summary:** Refine an existing issue's spec; non-mutating JSON output
+- **Usage:** `pipeline refine-spec --title "<t>" --body "<b>" | pipeline refine-spec --issue N | pipeline refine-spec apply --issue N [--proposal-file PATH]`
+- **Summary:** Grill an issue spec: --title/--body preview, --issue preview, or apply a signed proposal
 
 #### `roadmap`
 

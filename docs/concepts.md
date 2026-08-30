@@ -44,7 +44,7 @@ Hosts (Claude Code `/pipeline`, Codex `$pipeline`, and others) are shims around 
 - Scaffolds `.github/pipeline.yml` with documented defaults
 - Ensures local-only paths under `.agent-pipeline/` are gitignored
 
-Ignored local paths (must never be committed): `.agent-pipeline/runs/`, `.agent-pipeline/roadmap/`, `.agent-pipeline/history/`, `.agent-pipeline/evals/`, `.agent-pipeline/control-attributions.jsonl`, `.agent-pipeline/product-fault-reports.jsonl`, `.agent-pipeline/handoffs/`, `.agent-pipeline/outcomes/`, `.agent-pipeline/lineage/`, `.agent-pipeline/frg/`, `.agent-pipeline/harness-ownership/`, and `.agent-pipeline/factory-release/`. Without that gitignore block, the first run can leave the worktree dirty and fail `pipeline doctor`'s `worktree-clean` check.
+Ignored local paths (must never be committed): `.agent-pipeline/runs/`, `.agent-pipeline/roadmap/`, `.agent-pipeline/history/`, `.agent-pipeline/evals/`, `.agent-pipeline/control-attributions.jsonl`, `.agent-pipeline/product-fault-reports.jsonl`, `.agent-pipeline/handoffs/`, `.agent-pipeline/outcomes/`, `.agent-pipeline/lineage/`, `.agent-pipeline/frg/`, `.agent-pipeline/harness-ownership/`, `.agent-pipeline/factory-release/`, `.agent-pipeline/grill-proposal.key`, and `.agent-pipeline/grill-proposals/`. Without that gitignore block, the first run can leave the worktree dirty and fail `pipeline doctor`'s `worktree-clean` check.
 
 After `init`, commit the config, label an issue `pipeline:ready`, and run `/pipeline N` or `$pipeline N`.
 

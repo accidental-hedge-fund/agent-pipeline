@@ -956,6 +956,38 @@ export function buildRefineSpecPrompt(a: BuildRefineSpecArgs): string {
   });
 }
 
+export interface BuildGrillImplementerArgs {
+  title: string;
+  body: string;
+  integrationBaseSha: string;
+  contextMd: string;
+  dependencyFacts: string;
+}
+
+export function buildGrillImplementerPrompt(a: BuildGrillImplementerArgs): string {
+  return substitute(loadTemplate("refine-spec-issue"), {
+    title: a.title,
+    body: a.body,
+    integration_base_sha: a.integrationBaseSha,
+    context_md: a.contextMd || "(no CONTEXT.md at the integration base)",
+    dependency_facts: a.dependencyFacts,
+    ship_path_autonomy_preamble: shipPathAutonomyPreambleSection(),
+    no_tools_instruction: SPEC_GENERATION_TOOL_FREE_BLOCK,
+  });
+}
+
+export interface BuildGrillReviewerArgs {
+  artifactJson: string;
+  fingerprintJson: string;
+}
+
+export function buildGrillReviewerPrompt(a: BuildGrillReviewerArgs): string {
+  return substitute(loadTemplate("refine-spec-review"), {
+    artifact_json: a.artifactJson,
+    fingerprint_json: a.fingerprintJson,
+  });
+}
+
 export interface BuildIssueReadinessArgs {
   title: string;
   body: string;

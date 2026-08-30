@@ -72,16 +72,20 @@ _Avoid_: Codex (as the name of the role), self-review as the default product
 ### Intake
 
 **Grill**:
-A one-shot intake interview that writes a Decisions frontier into the issue body. Not planning, not a comment, not a chat loop.
-_Avoid_: plan-review, mid-run interview, comment-as-spec
+Per-issue `pipeline refine-spec --issue` / `apply` that looks up repository facts, records a Decisions artifact in the issue body, and lets the reviewer accept or challenge recommended defaults. Not planning, not a comment, not a chat loop, not `triage --stage`.
+_Avoid_: plan-review, mid-run interview, comment-as-spec, bare `pipeline triage N` as a body rewrite
 
 **Decisions**:
-The issue-body section that is the spec for ready. Comments do not settle nodes.
-_Avoid_: review comment, blocker comment, lock comment
+The versioned issue-body artifact and its derived `## Decisions` section. That body is the spec for `--stage ready`. Comments and handoffs prove provenance; they do not replace the body. #1238 comments are pickup verdict evidence, not the spec.
+_Avoid_: review comment, blocker comment, lock comment, comment-as-spec
 
 **Authority node**:
-An unsettled question of scope, security, ship/no-ship, or human-attestation. It blocks `--stage ready`. Non-authority nodes take the recommended default in the body.
+An unsettled question whose class is `scope`, `security`, `irreversible-operations`, `merge-release`, or `human-attestation`. It blocks `--stage ready` until an authenticated hash-bound `pipeline handoff answer`. Unknown or disputed classes stay unresolved authority.
 _Avoid_: open question, TODO, parking everything
+
+**reviewer-accept**:
+Provenance of an automatic default on a taxonomy-validated non-authority node (`interface-contract`, `test-evidence`, `docs-surface`, `operational-default`) after the reviewer returns `accept`. Not operator authority. It cannot settle an Authority node.
+_Avoid_: operator sign-off, handoff answer, comment-as-accept
 
 ### Diagnostics
 

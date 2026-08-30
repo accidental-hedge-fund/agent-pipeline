@@ -174,8 +174,10 @@ const BASE_COMMAND_DOCS: Record<string, CommandDoc> = {
     section: "observability",
   },
   "refine-spec": {
-    summary: "Refine an existing issue's spec; non-mutating JSON output",
-    usage: 'refine-spec --title "<t>" --body "<b>"',
+    summary:
+      "Grill an issue spec: --title/--body preview, --issue preview, or apply a signed proposal",
+    usage:
+      'refine-spec --title "<t>" --body "<b>" | refine-spec --issue N | refine-spec apply --issue N [--proposal-file PATH]',
     documented: true,
     section: "factory",
   },

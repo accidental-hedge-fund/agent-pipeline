@@ -629,6 +629,11 @@ test("pickup coordinators share ready-dispatch gate and have no private copy", a
   const dispatchSrc = readFileSync(join(root, "pipeline-run.ts"), "utf8");
   assert.match(dispatchSrc, /evaluateIssueReadiness/);
   assert.match(dispatchSrc, /case "ready"/);
+  assert.equal(
+    dispatchSrc.includes("pipeline-decisions"),
+    false,
+    "pickup must not skip #1238 because a Decisions artifact is present",
+  );
   for (const rel of ["stages/queue.ts", "stages/train.ts", "stages/ship.ts", "loop/supervisor.ts"]) {
     const src = readFileSync(join(root, rel), "utf8");
     assert.equal(

@@ -46,26 +46,19 @@ function makeDeps(
 // 4.1 Happy path — set ready from backlog
 // ---------------------------------------------------------------------------
 
-test("triage: ready is a label write with no harness slot on TriageDeps", async () => {
+test("triage: TriageDeps has no harness slot", () => {
   const keys = Object.keys(makeDeps(["pipeline:needs-spec"])).filter((k) => !k.startsWith("_")).sort();
-  assert.deepEqual(keys, ["addLabel", "getIssueLabels", "log", "removeLabel"]);
-  const deps = makeDeps(["pipeline:needs-spec"]);
-  await runTriage({ issueArg: "42", stage: "ready" }, deps);
-  assert.equal(deps._addCalls[0].label, "pipeline:ready");
+  assert.ok(keys.includes("addLabel"));
+  assert.ok(keys.includes("getIssueLabels"));
+  assert.ok(!keys.includes("runHarness"));
+  assert.ok(!keys.includes("invoke"));
 });
 
-test("triage: sets pipeline:ready and removes pipeline:backlog", async () => {
+test("triage: --stage ready without a snapshot fails closed with no writes", async () => {
   const deps = makeDeps(["pipeline:backlog", "bug"]);
-  const input: TriageInput = { issueArg: "42", stage: "ready" };
-
-  await runTriage(input, deps);
-
-  assert.equal(deps._removeCalls.length, 1, "should remove exactly one label");
-  assert.equal(deps._removeCalls[0].label, "pipeline:backlog");
-  assert.equal(deps._removeCalls[0].issueNumber, 42);
-  assert.equal(deps._addCalls.length, 1, "should add exactly one label");
-  assert.equal(deps._addCalls[0].label, "pipeline:ready");
-  assert.equal(deps._addCalls[0].issueNumber, 42);
+  await assert.rejects(() => runTriage({ issueArg: "42", stage: "ready" }, deps));
+  assert.equal(deps._addCalls.length, 0);
+  assert.equal(deps._removeCalls.length, 0);
 });
 
 // ---------------------------------------------------------------------------
@@ -88,9 +81,9 @@ test("triage: sets pipeline:backlog and removes pipeline:ready", async () => {
 // 4.3 Idempotent no-op: already set, no writes
 // ---------------------------------------------------------------------------
 
-test("triage: idempotent — already has pipeline:ready, no writes", async () => {
-  const deps = makeDeps(["pipeline:ready", "enhancement"]);
-  const input: TriageInput = { issueArg: "7", stage: "ready" };
+test("triage: idempotent — already has pipeline:backlog, no writes", async () => {
+  const deps = makeDeps(["pipeline:backlog", "enhancement"]);
+  const input: TriageInput = { issueArg: "7", stage: "backlog" };
 
   await runTriage(input, deps);
 
@@ -98,7 +91,7 @@ test("triage: idempotent — already has pipeline:ready, no writes", async () =>
   assert.equal(deps._removeCalls.length, 0, "should not call removeLabel");
   const log = deps._logLines.join("\n");
   assert.ok(log.includes("already set"), "should log 'already set'");
-  assert.ok(log.includes("pipeline:ready"), "should name the label");
+  assert.ok(log.includes("pipeline:backlog"), "should name the label");
 });
 
 // ---------------------------------------------------------------------------
@@ -308,12 +301,12 @@ test("validateTriageInput: rejects missing stage — no deps touched", () => {
 // ---------------------------------------------------------------------------
 
 test("triage: add-first order — if addLabel throws, removeLabel is never called", async () => {
-  const deps = makeDeps(["pipeline:backlog"], {
+  const deps = makeDeps(["pipeline:ready"], {
     addLabel: async (_n, _l) => {
       throw new Error("simulated network failure on add");
     },
   });
-  const input: TriageInput = { issueArg: "42", stage: "ready" };
+  const input: TriageInput = { issueArg: "42", stage: "backlog" };
 
   await assert.rejects(
     () => runTriage(input, deps),

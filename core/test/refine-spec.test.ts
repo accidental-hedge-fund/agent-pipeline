@@ -469,6 +469,8 @@ test("refine-spec: buildCmd() registers --title and --body options with refine-s
   const options = cmd.options.map((o) => o.long ?? "");
   assert.ok(options.includes("--title"), "buildCmd() has --title option");
   assert.ok(options.includes("--body"), "buildCmd() has --body option");
+  assert.ok(options.includes("--issue"), "buildCmd() has --issue option");
+  assert.ok(options.includes("--proposal-file"), "buildCmd() has --proposal-file option");
   const titleOpt = cmd.options.find((o) => o.long === "--title");
   const bodyOpt = cmd.options.find((o) => o.long === "--body");
   assert.ok(

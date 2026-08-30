@@ -1,19 +1,18 @@
-// Triage sub-command (#216): moves an issue between pre-pipeline stage labels
-// (`pipeline:backlog` ↔ `pipeline:ready`) without manual `gh issue edit`.
+// Triage sub-command (#216 / #1072): moves an issue between pre-pipeline stage
+// labels (`pipeline:backlog` ↔ `pipeline:ready`) without a model harness.
 //
-// Fully deterministic — no model harness call. All external I/O is injected
-// via TriageDeps so unit tests use no real network, git, or subprocess calls.
+// `--stage ready` validates the Decisions artifact first. Validation failure
+// makes zero label-write API calls. `--stage backlog` stays a label write.
 
 import {
   addLabel as ghAddLabel,
+  getIssueDetail,
   getIssueStateAndLabels,
   removeLabel as ghRemoveLabel,
 } from "../gh.ts";
+import { validateDecisionsForReady, type GrillReadySnapshot } from "../grill-ready.ts";
+import { listHandoffs } from "../human-question-handoff.ts";
 import type { PipelineConfig } from "../types.ts";
-
-// ---------------------------------------------------------------------------
-// Public types
-// ---------------------------------------------------------------------------
 
 export const ALLOWED_TRIAGE_STAGES = ["backlog", "ready"] as const;
 export type TriageStage = (typeof ALLOWED_TRIAGE_STAGES)[number];
@@ -25,6 +24,8 @@ export interface TriageDeps {
   addLabel(issueNumber: number, label: string): Promise<void>;
   removeLabel(issueNumber: number, label: string): Promise<void>;
   log(msg: string): void;
+  /** Required for `--stage ready`. Unused for backlog. */
+  getReadySnapshot?(issueNumber: number): Promise<GrillReadySnapshot>;
 }
 
 /** Raw CLI inputs — validated inside runTriage so unit tests can probe error paths. */
@@ -33,11 +34,7 @@ export interface TriageInput {
   stage: string | undefined;
 }
 
-// ---------------------------------------------------------------------------
-// Real deps
-// ---------------------------------------------------------------------------
-
-export function realTriageDeps(cfg: PipelineConfig): TriageDeps {
+export function realTriageDeps(cfg: PipelineConfig, snapshot?: GrillReadySnapshot): TriageDeps {
   return {
     getIssueLabels: async (issueNumber) => {
       const result = await getIssueStateAndLabels(cfg, issueNumber);
@@ -53,23 +50,33 @@ export function realTriageDeps(cfg: PipelineConfig): TriageDeps {
       await ghRemoveLabel(cfg, issueNumber, label);
     },
     log: (msg) => process.stdout.write(msg + "\n"),
+    getReadySnapshot: snapshot
+      ? async () => snapshot
+      : undefined,
   };
 }
 
-// ---------------------------------------------------------------------------
-// Pure validation helper (no deps — safe to call before config resolution)
-// ---------------------------------------------------------------------------
+export async function realReadySnapshot(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  compute: () => Promise<Omit<GrillReadySnapshot, "title" | "body" | "comments">>,
+): Promise<GrillReadySnapshot> {
+  const detail = await getIssueDetail(cfg, issueNumber);
+  const extra = await compute();
+  const handoffs = await listHandoffs(cfg.repo_dir, { issue: issueNumber });
+  return {
+    title: detail.title,
+    body: detail.body,
+    comments: detail.comments,
+    ...extra,
+    handoffs: extra.handoffs ?? handoffs,
+  };
+}
 
-/**
- * Validates raw triage CLI inputs. Returns an error message string on the first
- * violation, or null if both inputs are valid. Calling this before resolveConfig()
- * ensures invalid commands never trigger a GitHub API call.
- */
 export function validateTriageInput(
   issueArg: string | undefined,
   stage: string | undefined,
 ): string | null {
-  // Full-string check rejects "42abc", "42.9", "1e2", "0", etc.
   if (!issueArg || !/^[1-9]\d*$/.test(issueArg)) {
     return (
       `issue number is required and must be a positive integer` +
@@ -89,9 +96,16 @@ export function validateTriageInput(
   return null;
 }
 
-// ---------------------------------------------------------------------------
-// Handler
-// ---------------------------------------------------------------------------
+export class TriageReadyError extends Error {
+  readonly exitCode: number;
+  readonly code: string;
+  constructor(message: string, code: string, exitCode = 2) {
+    super(message);
+    this.name = "TriageReadyError";
+    this.code = code;
+    this.exitCode = exitCode;
+  }
+}
 
 export async function runTriage(input: TriageInput, deps: TriageDeps): Promise<void> {
   const { issueArg, stage } = input;
@@ -104,30 +118,56 @@ export async function runTriage(input: TriageInput, deps: TriageDeps): Promise<v
   const issueNumber = Number.parseInt(issueArg!, 10);
   const targetLabel = `${PIPELINE_LABEL_PREFIX}${stage}`;
 
-  // Fetch current labels — first GitHub read; only reached after input validation.
+  if (stage === "ready") {
+    if (!deps.getReadySnapshot) {
+      throw new TriageReadyError(
+        "Decisions artifact validation requires a ready snapshot",
+        "missing_artifact",
+      );
+    }
+    const snapshot = await deps.getReadySnapshot(issueNumber);
+    const ready = validateDecisionsForReady(snapshot);
+    if (!ready.ok) {
+      throw new TriageReadyError(ready.reason, ready.code);
+    }
+  }
+
   const labels = await deps.getIssueLabels(issueNumber);
   const currentPipelineLabels = labels.filter((l) => l.startsWith(PIPELINE_LABEL_PREFIX));
 
-  // Idempotent: already carries exactly the target label, nothing to do.
   if (currentPipelineLabels.length === 1 && currentPipelineLabels[0] === targetLabel) {
     deps.log(`[pipeline triage] already set: ${targetLabel}`);
     return;
   }
 
-  // Add-first: ensure the target label is present before removing stale ones.
-  // If the add succeeds but a later remove fails, the issue still carries the
-  // correct target label and is never left without a pipeline stage.
   if (!currentPipelineLabels.includes(targetLabel)) {
     await deps.addLabel(issueNumber, targetLabel);
   }
 
-  // Remove every pipeline:* label except the target.
   const toRemove = currentPipelineLabels.filter((l) => l !== targetLabel);
   for (const label of toRemove) {
     await deps.removeLabel(issueNumber, label);
   }
 
-  // Log the transition.
+  if (stage === "ready") {
+    const after = await deps.getIssueLabels(issueNumber);
+    let remaining = after.filter((l) => l.startsWith(PIPELINE_LABEL_PREFIX) && l !== targetLabel);
+    if (remaining.length > 0) {
+      for (const label of remaining) {
+        await deps.removeLabel(issueNumber, label);
+      }
+      const retry = await deps.getIssueLabels(issueNumber);
+      remaining = retry.filter((l) => l.startsWith(PIPELINE_LABEL_PREFIX) && l !== targetLabel);
+      if (remaining.length > 0) {
+        throw new TriageReadyError(
+          `label_reconciliation_failed: extra pipeline labels remain (${remaining.join(", ")})`,
+          "label_reconciliation_failed",
+          1,
+        );
+      }
+    }
+  }
+
   if (toRemove.length > 0) {
     deps.log(`[pipeline triage] #${issueNumber}: ${toRemove.join(", ")} → ${targetLabel}`);
   } else {
