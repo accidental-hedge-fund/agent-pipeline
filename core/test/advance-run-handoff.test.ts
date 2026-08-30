@@ -142,6 +142,7 @@ test("plain numeric runAdvance emits advance_run_handoff before first dispatch a
         blockerKind: "needs-human",
       };
     },
+    env: {},
   };
 
   const prevExit = process.exitCode;
@@ -249,6 +250,7 @@ function stubHandoffAdvance(
         blockerKind: "needs-human",
       };
     },
+    env: {},
     ...extra,
   };
   return { deps, lines, order };
