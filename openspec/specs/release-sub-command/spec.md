@@ -2,7 +2,9 @@
 
 ## Purpose
 TBD - created by archiving change release-sub-command. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: The `release` sub-command SHALL run without an issue number
 
 The pipeline CLI SHALL accept `release` as a positional sub-command keyword that requires no issue number and that does not advance any pipeline stage label. It SHALL be dispatched when the first positional argument is the string `release` (case-sensitive).
@@ -71,21 +73,25 @@ After version resolution, the command SHALL update the `version` field in both r
 
 ---
 
-### Requirement: The `release` sub-command SHALL regenerate committed plugin packaging outputs after bumping the version
+### Requirement: The `release` sub-command SHALL regenerate committed host SKILL outputs after bumping the version
 
-After bumping both `package.json` files, the command SHALL run `node scripts/build.mjs` from the repo root to regenerate the declared packaging outputs: the plugin SKILL overlay, launcher scripts, plugin manifest, and marketplace catalog. The build SHALL NOT copy `core/scripts` into `plugin/`. If the build script exits non-zero, the command SHALL abort with a non-zero exit code and SHALL NOT proceed to the CI gate or the ROADMAP edit.
+After bumping both `package.json` files, the command SHALL run `node scripts/build.mjs` from the repo root to regenerate the declared packaging outputs: the four generated host SKILLs. The build SHALL NOT write any path under `plugin/`. If the build script exits non-zero, the command SHALL abort with a non-zero exit code and SHALL NOT proceed to the CI gate or the ROADMAP edit.
 
 #### Scenario: Packaging outputs are regenerated before CI runs
 
 - **WHEN** the version bump writes new `package.json` files
-- **THEN** `node scripts/build.mjs` runs next, before `npm run ci`, ensuring the generated SKILL overlay and marketplace catalog are fresh when CI's `--check` runs
+- **THEN** `node scripts/build.mjs` runs next, before `npm run ci`, ensuring the generated host SKILLs are fresh when CI's `--check` runs
 
 #### Scenario: Build failure aborts the release
 
 - **WHEN** `node scripts/build.mjs` exits non-zero
 - **THEN** the command SHALL exit non-zero, SHALL print the build output, and SHALL NOT proceed to the CI gate, ROADMAP edit, or PR creation
 
----
+#### Scenario: Release generate does not recreate plugin/
+
+- **WHEN** the release path runs `node scripts/build.mjs` after the version bump
+- **THEN** the generator SHALL NOT create a `plugin/` directory
+- **AND** SHALL NOT write `plugin/pipeline/skills/pipeline/SKILL.md`
 
 ### Requirement: The `release` sub-command SHALL gate on `npm run ci` before opening a PR
 
@@ -107,29 +113,30 @@ After the version bump and packaging regeneration, the command SHALL run `npm ru
 
 The live release SHALL refuse to start if any release-managed path has tracked
 or untracked changes. The managed set SHALL include `package.json`,
-`core/package.json`, `ROADMAP.md`, `plugin/`, `.claude-plugin/`, and the exact
+`core/package.json`, `ROADMAP.md`, and the exact
 generated host paths `hosts/claude/SKILL.md`, `hosts/codex/SKILL.md`,
-`hosts/grok/SKILL.md`, and `hosts/opencode/SKILL.md`. This precondition SHALL
+`hosts/grok/SKILL.md`, and `hosts/opencode/SKILL.md`. The managed set SHALL NOT
+include `plugin/`. `.claude-plugin/` SHALL be managed only when that catalog
+file remains a generated output; after the catalog is retired it SHALL NOT be
+a release-managed path. This precondition SHALL
 run before version mutation or `node scripts/build.mjs`, because that generator
-owns all four host SKILLs as well as plugin/catalog outputs.
+owns the four host SKILLs.
 
 Untracked-file detection SHALL remain independent of user git configuration.
-The packaging generator SHALL write only its declared exact SKILL, launcher,
-material-filter, Node-resolver, manifest, and catalog outputs. It MAY remove
-only the two wholly owned retired directories
-`plugin/pipeline/commands/` and `plugin/pipeline/skills/pipeline/core/`; it
-SHALL NOT treat unrelated files under `hosts/` or `plugin/` as generated.
+The packaging generator SHALL write only its declared exact host SKILL outputs.
+It SHALL NOT create or remove paths under `plugin/`.
 
 Any abort after version bump and generation but before release-branch creation
 SHALL restore every release-managed path, including the four generated host
 SKILLs, to its pre-release `HEAD` state and remove only untracked debris at
 declared generator-owned paths. Because the clean precondition covered every
 path the generator can mutate, rollback SHALL remain lossless and SHALL NOT
-discard a maintainer's pre-existing edit.
+discard a maintainer's pre-existing edit. Rollback SHALL NOT recreate a
+`plugin/` tree.
 
 #### Scenario: A dirty release-managed path fails fast before any mutation
 
-- **WHEN** any package, ROADMAP, plugin/catalog, or exact generated host SKILL
+- **WHEN** any package, ROADMAP, or exact generated host SKILL
   path in the release-managed set has tracked or untracked changes at live
   release start
 - **THEN** the command SHALL exit non-zero naming the dirty exact paths and
@@ -140,7 +147,7 @@ discard a maintainer's pre-existing edit.
 
 - **WHEN** the clean-tree precondition checks every release-managed path
 - **THEN** it SHALL force untracked-file reporting (for example
-  `git status --porcelain --untracked-files=all`) so untracked plugin/catalog or
+  `git status --porcelain --untracked-files=all`) so untracked
   exact generated host SKILL debris is detected even when
   `status.showUntrackedFiles=no`
 
@@ -148,11 +155,12 @@ discard a maintainer's pre-existing edit.
 
 - **WHEN** the command bumps the version, regenerates packaging outputs, then
   aborts before creating the release branch
-- **THEN** `package.json`, `core/package.json`, `ROADMAP.md`, `plugin/`,
-  `.claude-plugin/`, and all four exact generated host SKILLs SHALL be restored
+- **THEN** `package.json`, `core/package.json`, `ROADMAP.md`,
+  and all four exact generated host SKILLs SHALL be restored
   to their pre-release `HEAD` state
 - **AND** untracked build debris SHALL be removed only from declared
   generator-owned paths
+- **AND** rollback SHALL NOT create a `plugin/` directory
 - **AND** because the clean-tree precondition held for every managed path, no
   pre-existing local edit is discarded by rollback
 
@@ -226,7 +234,7 @@ If `$EDITOR` is not set and `--no-edit` is not passed, the command SHALL warn an
 ### Requirement: The `release` sub-command SHALL open a release PR after human confirmation
 
 After the ROADMAP diff is confirmed, the command SHALL:
-1. Stage only the release-managed paths `package.json`, `core/package.json`, `ROADMAP.md`, `plugin/`, and `.claude-plugin/`, then create a commit on a new branch `release/vX.Y.Z` containing the version bumps, generated plugin packaging output, and ROADMAP update.
+1. Stage only the release-managed paths `package.json`, `core/package.json`, `ROADMAP.md`, and the four generated host SKILLs, then create a commit on a new branch `release/vX.Y.Z` containing the version bumps, generated host SKILL output, and ROADMAP update. It SHALL NOT stage `plugin/`.
 2. Open a PR via `gh pr create` with title `release: X.Y.Z — <theme>` and a body listing the included issues/PRs.
 3. Print the PR URL on success.
 
@@ -250,7 +258,8 @@ The PR body SHALL include at minimum: the resolved version, the list of issues/P
 #### Scenario: Release commit stages both plugin packaging roots
 
 - **WHEN** the release branch commit is prepared after packaging regeneration
-- **THEN** the explicit staging paths SHALL include both `plugin/` and `.claude-plugin/`
+- **THEN** the explicit staging paths SHALL include the four generated host SKILLs
+- **AND** SHALL NOT include `plugin/`
 - **AND** SHALL NOT include `.agent-pipeline/frg/`
 
 #### Scenario: PR body describes merging as the final step with the tag command as a fallback
@@ -1072,7 +1081,7 @@ This requirement does not change HMAC or pack policy. It does not authorize comm
 
 ### Requirement: Failed staging or commit after release-branch creation SHALL restore the configured base
 
-The live `pipeline release` path SHALL restore the configured base branch (`base_branch` from `.github/pipeline.yml`, default `main`) when `git add` or `git commit` fails after local branch `release/vX.Y.Z` exists and before a successful release commit exists on that branch. The command SHALL restore release-managed files (`package.json`, `core/package.json`, `ROADMAP.md`, `plugin/`, `.claude-plugin/`) to their pre-release HEAD contents in both the index and the working tree. It SHALL NOT leave HEAD on `release/vX.Y.Z`. It SHALL NOT leave uncommitted version bumps in the index or the working tree. It SHALL delete the local `release/vX.Y.Z` branch when that branch has no unique commit, so a retry can create it again. On-disk `.agent-pipeline/frg/` files SHALL remain. A successful release commit SHALL end this restore duty; a later push failure is out of scope.
+The live `pipeline release` path SHALL restore the configured base branch (`base_branch` from `.github/pipeline.yml`, default `main`) when `git add` or `git commit` fails after local branch `release/vX.Y.Z` exists and before a successful release commit exists on that branch. The command SHALL restore release-managed files (`package.json`, `core/package.json`, `ROADMAP.md`, and the four generated host SKILLs) to their pre-release HEAD contents in both the index and the working tree. It SHALL NOT restore or recreate `plugin/`. It SHALL NOT leave HEAD on `release/vX.Y.Z`. It SHALL NOT leave uncommitted version bumps in the index or the working tree. It SHALL delete the local `release/vX.Y.Z` branch when that branch has no unique commit, so a retry can create it again. On-disk `.agent-pipeline/frg/` files SHALL remain. A successful release commit SHALL end this restore duty; a later push failure is out of scope.
 
 #### Scenario: git add of ignored FRG restores the base
 
@@ -1082,6 +1091,7 @@ The live `pipeline release` path SHALL restore the configured base branch (`base
 - **AND** `package.json` and `core/package.json` SHALL match their pre-release versions
 - **AND** HEAD SHALL NOT be `release/v1.39.5`
 - **AND** on-disk `.agent-pipeline/frg/1.39.5/latest.json` SHALL still exist if it existed before the failure
+- **AND** restore SHALL NOT create a `plugin/` directory
 
 #### Scenario: git commit failure restores the base
 

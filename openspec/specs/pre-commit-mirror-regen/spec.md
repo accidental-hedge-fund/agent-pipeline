@@ -2,7 +2,9 @@
 
 ## Purpose
 TBD - created by archiving change pre-commit-plugin-mirror-regen. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: The repository SHALL provide a one-command hook setup script
 
 A `setup-hooks` entry in `package.json` scripts SHALL invoke `scripts/setup-hooks.mjs`, which SHALL set `git config --local core.hooksPath .githooks` and print a confirmation message. Contributors SHALL be able to wire the hook by running `npm run setup-hooks`.
@@ -18,10 +20,10 @@ A `setup-hooks` entry in `package.json` scripts SHALL invoke `scripts/setup-hook
 - **WHEN** a contributor reads the `README.md`
 - **THEN** it SHALL contain a note directing contributors to run `npm run setup-hooks` to activate the pre-commit hook
 
-### Requirement: A committed pre-commit hook SHALL refresh exact generated SKILL/catalog outputs when generator inputs or generated host SKILLs are staged
+### Requirement: A committed pre-commit hook SHALL refresh exact generated host SKILL outputs when generator inputs or generated host SKILLs are staged
 
 The repository SHALL include a `.githooks/pre-commit` shell script. The hook
-SHALL run `node scripts/build.mjs` when the staged set touches a SKILL/catalog
+SHALL run `node scripts/build.mjs` when the staged set touches a host-SKILL
 generator input under `core/` or `hosts/_shared/`, `scripts/build.mjs`, any
 exact generated host SKILL path (`hosts/claude/SKILL.md`,
 `hosts/codex/SKILL.md`, `hosts/grok/SKILL.md`, or
@@ -32,21 +34,17 @@ exact generated host SKILL path (`hosts/claude/SKILL.md`,
 `hosts/opencode/outer-host.manifest.json`). Its unstaged and untracked
 generator-input guards SHALL cover those exact manifest inputs as well as the
 existing generator-input directories. It SHALL stage only the exact generator-owned host
-SKILLs, transitional plugin SKILL, and marketplace catalog that the build
-owns; it SHALL NOT use a broad `git add hosts/` or `git add plugin/`. The hook
-SHALL NOT regenerate or stage a `plugin/` copy of `core/scripts`.
-`renderHostSkill` plus its catalog and manifest inputs provide the SKILL bytes;
-`hosts/claude/SKILL.md` SHALL NOT be treated as the source for the plugin
-overlay. Shared plugin-shell assets under `hosts/_shared/` remain generator
-inputs.
+SKILLs that the build owns; it SHALL NOT use a broad `git add hosts/` or `git add plugin/`.
+The hook SHALL NOT stage any `plugin/` path.
+`renderHostSkill` plus its catalog-of-verbs and manifest inputs provide the SKILL bytes.
+Shared assets under `hosts/_shared/` remain generator inputs.
 
 #### Scenario: Core edit refreshes generated packaging outputs
 
 - **WHEN** a contributor stages changes under `core/` and runs `git commit`
 - **THEN** the pre-commit hook SHALL run `node scripts/build.mjs`
-- **AND** the hook SHALL NOT stage a `plugin/` core copy as required output
-- **AND** the hook MAY stage only changed exact generated host SKILL, plugin
-  SKILL, and marketplace catalog paths
+- **AND** the hook SHALL NOT stage a `plugin/` path
+- **AND** the hook MAY stage only changed exact generated host SKILL paths
 
 #### Scenario: hosts/claude edit triggers regeneration
 
@@ -96,12 +94,11 @@ inputs.
 
 - **WHEN** the contributor has unrelated unstaged changes in the working tree
   at commit time
-- **THEN** the hook SHALL stage only the exact four host SKILL paths,
-  `plugin/pipeline/skills/pipeline/SKILL.md`, and
-  `.claude-plugin/marketplace.json` when those generated outputs changed
+- **THEN** the hook SHALL stage only the exact four host SKILL paths when those
+  generated outputs changed
 - **AND** SHALL NOT stage any other working-tree changes or a broad host/plugin
   directory
-- **AND** SHALL NOT stage a `plugin/` core copy as required output
+- **AND** SHALL NOT stage a `plugin/` path
 
 #### Scenario: Untracked source files abort the hook
 
@@ -111,4 +108,3 @@ inputs.
 - **THEN** the pre-commit hook SHALL exit non-zero and abort the commit
 - **AND** the hook SHALL list the untracked input files so the contributor can
   track, stash, or remove them before committing
-

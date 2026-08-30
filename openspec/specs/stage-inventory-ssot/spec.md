@@ -2,7 +2,9 @@
 
 ## Purpose
 TBD - created by archiving change single-source-stages-inventory. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: Code STAGES and TERMINAL_STAGES are the single source of truth for stage inventory surfaces
 
 The ordered `STAGES` constant and `TERMINAL_STAGES` set in `core/scripts/types.ts` SHALL remain the sole source of truth for stage membership, order, count, and terminal outcomes. README, durable operator docs, project context, living specs, diagrams, and tests that describe the inventory SHALL match those code constants. Generated host SKILLs SHALL remain compact verb/follow one-pagers that link to the durable docs rather than cache the full stage list. This requirement SHALL NOT change runtime stage membership, order, or handler behavior.
@@ -91,13 +93,12 @@ Operator-facing durable documentation (`README.md`, `docs/concepts.md`, `docs/cl
 
 ---
 
-### Requirement: Generated Claude SKILL overlay SHALL carry the shared compact one-pager
+### Requirement: Host SKILL regeneration SHALL NOT write a plugin overlay
 
-After `hosts/claude/SKILL.md` is regenerated from `renderHostSkill()`, `node scripts/build.mjs` SHALL regenerate and commit the transitional plugin SKILL overlay in the same change. The overlay SHALL carry the shared compact verb/follow contract and durable-doc pointers, not the retired stage inventory essay. CI's `node scripts/build.mjs --check` gate SHALL pass without a copied core tree.
+After `hosts/claude/SKILL.md` is regenerated from `renderHostSkill()`, `node scripts/build.mjs` SHALL NOT write a plugin SKILL overlay. CI's `node scripts/build.mjs --check` gate SHALL pass without a `plugin/` tree. The compact one-pager SHALL remain on the four generated host SKILLs.
 
-#### Scenario: SKILL overlay check passes after host skill update
+#### Scenario: Host skill update does not recreate plugin/
 
 - **WHEN** `hosts/claude/SKILL.md` is regenerated as the compact one-pager
-- **THEN** `node scripts/build.mjs` SHALL regenerate the plugin SKILL overlay in the same change
-- **AND** `node scripts/build.mjs --check` SHALL pass while the overlay remains free of the stage-machine essay
-
+- **THEN** `node scripts/build.mjs` SHALL NOT write `plugin/pipeline/skills/pipeline/SKILL.md`
+- **AND** `node scripts/build.mjs --check` SHALL pass while `plugin/` is absent
