@@ -35,6 +35,12 @@ import {
 } from "../stage-output-contract.ts";
 import { ISSUE_TRAILER_KEY, RUN_TRAILER_KEY } from "../traceability.ts";
 import { invoke, type HarnessResult } from "../harness.ts";
+import {
+  buildHarnessSmokeFailureArtifact,
+  formatEvidenceSuffix,
+  writeHarnessSmokeFailureArtifact,
+  type HarnessSmokeFailureLocator,
+} from "../harness-smoke-failure.ts";
 import type { CheckOutcome, CheckResult, DoctorDeps } from "./doctor.ts";
 
 const execFileAsync = promisify(execFile);
@@ -199,6 +205,11 @@ export interface SmokeInvokeRequest {
   prompt: string;
   /** Prompt delivery for unregistered reviewer compatibility adapters. */
   promptDelivery?: "argv" | "stdin";
+  /**
+   * Lean / tool-disabling invoke. Implementer smoke MUST omit this or set
+   * false so the canned turn can commit. Reviewer smoke MAY set true.
+   */
+  lean?: boolean;
 }
 
 export interface SmokeInvokeResult {
@@ -221,6 +232,8 @@ export interface ScratchRepoSnapshot {
    * uncommitted file mutations on reviewer smoke (read-only contract).
    */
   statusPorcelain: string;
+  /** `git log` excerpt for failure artifacts; optional on older fakes. */
+  logExcerpt?: string;
 }
 
 /** True when HEAD, commit count, or working-tree porcelain differs. */
@@ -270,6 +283,14 @@ export interface HarnessSmokeDeps {
   parseTelemetry(adapter: HarnessAdapter, capturedStdout: string): HarnessTelemetry;
   /** Thin exec/fs seam for adapter readiness (shared shape with DoctorDeps). */
   adapterPreflightDeps: AdapterPreflightDeps;
+  /**
+   * Persist one sanitized per-treatment failure artifact before scratch
+   * cleanup. Write failure must not convert the original assertion into a pass.
+   */
+  writeFailureArtifact(
+    domain: string,
+    artifact: Parameters<typeof writeHarnessSmokeFailureArtifact>[1],
+  ): Promise<HarnessSmokeFailureLocator>;
 }
 
 export interface RunHarnessSmokeOptions {
@@ -396,16 +417,18 @@ export function realHarnessSmokeDeps(
       const statusPorcelain = statusRes.ok ? statusRes.stdout : "";
       const headRes = await gitExec(root, ["rev-parse", "HEAD"]);
       if (!headRes.ok) {
-        return { head: null, commitCount: 0, statusPorcelain };
+        return { head: null, commitCount: 0, statusPorcelain, logExcerpt: "" };
       }
       const countRes = await gitExec(root, ["rev-list", "--count", "HEAD"]);
       const commitCount = countRes.ok
         ? Number.parseInt(countRes.stdout.trim(), 10) || 0
         : 0;
+      const logRes = await gitExec(root, ["log", "--format=%H %s", "-20"]);
       return {
         head: headRes.stdout.trim() || null,
         commitCount,
         statusPorcelain,
+        logExcerpt: logRes.ok ? logRes.stdout : "",
       };
     },
     newCommitMessages: async (root, beforeHead) => {
@@ -442,7 +465,7 @@ export function realHarnessSmokeDeps(
         timeoutSec: HARNESS_SMOKE_TIMEOUT_SEC,
         model: req.model,
         reasoningEffort: req.effort,
-        lean: req.role === "implementer" ? true : undefined,
+        lean: req.lean,
         role: req.role,
         promptDelivery: req.promptDelivery,
       });
@@ -458,6 +481,8 @@ export function realHarnessSmokeDeps(
     validateContract: (id, input) => validateStageOutput(id, input),
     parseTelemetry: (adapter, captured) => adapter.parseTelemetry(captured),
     adapterPreflightDeps,
+    writeFailureArtifact: (domain, artifact) =>
+      writeHarnessSmokeFailureArtifact(domain, artifact),
   };
 }
 
@@ -623,10 +648,62 @@ function checkTelemetry(
   return null; // ok
 }
 
+async function attachFailureEvidence(
+  domain: string,
+  treatment: SmokeTreatment,
+  deps: HarnessSmokeDeps,
+  result: CheckResult,
+  fields: {
+    stdout: string;
+    stderr: string;
+    beforePorcelain: string;
+    afterPorcelain: string;
+    head: string | null;
+    logExcerpt: string;
+    exitCode: number | null;
+    timedOut: boolean;
+    preflightFailed: boolean;
+  },
+): Promise<CheckResult> {
+  try {
+    const artifact = buildHarnessSmokeFailureArtifact({
+      treatment: {
+        adapter: treatment.adapter,
+        role: treatment.role,
+        ...(treatment.model ? { model: treatment.model } : {}),
+        ...(treatment.effort ? { effort: treatment.effort } : {}),
+      },
+      stdout: fields.stdout,
+      stderr: fields.stderr,
+      beforePorcelain: fields.beforePorcelain,
+      afterPorcelain: fields.afterPorcelain,
+      head: fields.head,
+      logExcerpt: fields.logExcerpt,
+      exitCode: fields.exitCode,
+      timedOut: fields.timedOut,
+      preflightFailed: fields.preflightFailed,
+    });
+    const loc = await deps.writeFailureArtifact(domain, artifact);
+    return {
+      ...result,
+      status: "fail",
+      detail: `${result.detail}${formatEvidenceSuffix(loc)}`,
+      evidence: loc,
+    };
+  } catch (err) {
+    return {
+      ...result,
+      status: "fail",
+      detail: `${result.detail}; evidence capture failed: ${(err as Error).message}`,
+    };
+  }
+}
+
 async function runOneTreatment(
   treatment: SmokeTreatment,
   deps: HarnessSmokeDeps,
   opts: RunHarnessSmokeOptions,
+  domain: string,
 ): Promise<CheckOutcome> {
   const id = smokeCheckId(treatment);
   const description = `Harness smoke: ${treatmentLabel(treatment)}`;
@@ -730,15 +807,51 @@ async function runOneTreatment(
 
   // --- Dynamic phase: scratch repo + canned prompt ---
   let scratch: string | null = null;
+  let before: ScratchRepoSnapshot | null = null;
+  let after: ScratchRepoSnapshot | null = null;
+  let inv: SmokeInvokeResult | null = null;
+  const evidenceFields = (): {
+    stdout: string;
+    stderr: string;
+    beforePorcelain: string;
+    afterPorcelain: string;
+    head: string | null;
+    logExcerpt: string;
+    exitCode: number | null;
+    timedOut: boolean;
+    preflightFailed: boolean;
+  } => ({
+    stdout: inv?.stdout ?? "",
+    stderr: inv?.stderr ?? "",
+    beforePorcelain: before?.statusPorcelain ?? "",
+    afterPorcelain: after?.statusPorcelain ?? "",
+    head: after?.head ?? before?.head ?? null,
+    logExcerpt: after?.logExcerpt ?? before?.logExcerpt ?? "",
+    exitCode: inv ? inv.exitCode : null,
+    timedOut: Boolean(inv?.timedOut),
+    preflightFailed: Boolean(inv?.preflightFailed),
+  });
+
+  const failWithEvidence = async (result: CheckResult): Promise<CheckOutcome> => {
+    const withEvidence = await attachFailureEvidence(
+      domain,
+      treatment,
+      deps,
+      result,
+      evidenceFields(),
+    );
+    return { id, description, ...withEvidence };
+  };
+
   try {
     scratch = await deps.createScratchRepo();
-    const before = await deps.snapshotRepo(scratch);
+    before = await deps.snapshotRepo(scratch);
     const prompt =
       treatment.role === "implementer"
         ? implementerSmokePrompt()
         : reviewerSmokePrompt();
 
-    const inv = await deps.invokeSmoke({
+    inv = await deps.invokeSmoke({
       adapter: treatment.adapter,
       role: treatment.role,
       model: treatment.model,
@@ -746,7 +859,12 @@ async function runOneTreatment(
       worktreeDir: scratch,
       prompt,
       promptDelivery: opts.reviewerPromptDelivery,
+      // Implementer must keep tools enabled so the canned turn can commit.
+      // Reviewer MAY stay lean because it must remain read-only.
+      ...(treatment.role === "reviewer" ? { lean: true } : {}),
     });
+
+    after = await deps.snapshotRepo(scratch);
 
     if (!inv.success || inv.exitCode !== 0) {
       const why = inv.preflightFailed
@@ -755,16 +873,14 @@ async function runOneTreatment(
           ? "timed out"
           : `exit ${inv.exitCode}`;
       const excerpt = (inv.stderr || inv.stdout).trim().slice(0, 400);
-      return {
-        id,
-        description,
-        ...fail(
+      return await failWithEvidence(
+        fail(
           `${label}: harness spawn failed (${why})${excerpt ? ` — ${excerpt}` : ""}`,
           `Investigate \`${treatment.adapter}\` ${treatment.role} smoke spawn for ` +
             treatmentLabel(treatment) +
             `. Smoke does not retry with a different adapter or model.`,
         ),
-      };
+      );
     }
 
     const productOut = inv.stdout ?? "";
@@ -774,14 +890,12 @@ async function runOneTreatment(
       const messages = await deps.newCommitMessages(scratch, before.head);
       const trailerCommit = messages.find(commitHasRequiredTrailers);
       if (!trailerCommit) {
-        return {
-          id,
-          description,
-          ...fail(
+        return await failWithEvidence(
+          fail(
             `${label}: no new commit with required trailers (${SMOKE_ISSUE_TRAILER}, ${SMOKE_RUN_TRAILER})`,
             `Ensure the implementer adapter \`${treatment.adapter}\` can create a trailer-bearing commit in the scratch repo. Smoke expects Issue: #0 and Pipeline-Run: harness-smoke/0 trailers.`,
           ),
-        };
+        );
       }
 
       const contract = deps.validateContract(
@@ -789,33 +903,28 @@ async function runOneTreatment(
         productOut,
       );
       if (!contract.ok) {
-        return {
-          id,
-          description,
-          ...fail(
+        return await failWithEvidence(
+          fail(
             `${label}: stage-output-contract ${HARNESS_SMOKE_CONTRACT_IDS.implementer} failed — ${contract.reason}`,
             `Implementer smoke output must satisfy ${HARNESS_SMOKE_CONTRACT_IDS.implementer} (JSON object with ok:true).`,
           ),
-        };
+        );
       }
     } else {
       // Reviewer: structured verdict + no commits and no working-tree mutation
       const messages = await deps.newCommitMessages(scratch, before.head);
-      const after = await deps.snapshotRepo(scratch);
       const dirtyTree = scratchRepoMutated(before, after);
       if (messages.length > 0 || dirtyTree) {
         const why =
           messages.length > 0
             ? `${messages.length} new commit(s)`
             : "working-tree file mutation(s)";
-        return {
-          id,
-          description,
-          ...fail(
+        return await failWithEvidence(
+          fail(
             `${label}: reviewer smoke mutated the repository (${why})`,
             `Reviewer smoke must remain read-only — do not create commits or modify tracked/untracked files. Adapter \`${treatment.adapter}\` reviewer treatment failed the no-mutation check.`,
           ),
-        };
+        );
       }
 
       const contract = deps.validateContract(
@@ -823,20 +932,18 @@ async function runOneTreatment(
         productOut,
       );
       if (!contract.ok) {
-        return {
-          id,
-          description,
-          ...fail(
+        return await failWithEvidence(
+          fail(
             `${label}: review verdict contract ${HARNESS_SMOKE_CONTRACT_IDS.reviewer} failed — ${contract.reason}`,
             `Reviewer smoke must emit a schema-satisfying verdict JSON (review.verdict@1). This is an output-contract failure, not an empty-findings approve.`,
           ),
-        };
+        );
       }
     }
 
     const telFail = checkTelemetry(adapter, deps, rawForTelemetry, label);
     if (telFail) {
-      return { id, description, ...telFail };
+      return await failWithEvidence(telFail);
     }
 
     return {
@@ -845,6 +952,14 @@ async function runOneTreatment(
       ...pass(`${label}: smoke passed`),
     };
   } catch (err) {
+    if (scratch) {
+      return await failWithEvidence(
+        fail(
+          `${label}: unexpected smoke error — ${(err as Error).message}`,
+          `Investigate harness smoke for ${label}.`,
+        ),
+      );
+    }
     return {
       id,
       description,
@@ -876,13 +991,18 @@ export async function runHarnessSmoke(
   const plan = buildSmokePlan(config);
   const outcomes: CheckOutcome[] = [];
   for (const treatment of plan) {
-    const outcome = await runOneTreatment(treatment, deps, {
-      failFast: opts.failFast,
-      reviewerPromptDelivery:
-        opts.reviewerPromptDelivery ??
-        config.harnesses.reviewerPromptDelivery ??
-        "argv",
-    });
+    const outcome = await runOneTreatment(
+      treatment,
+      deps,
+      {
+        failFast: opts.failFast,
+        reviewerPromptDelivery:
+          opts.reviewerPromptDelivery ??
+          config.harnesses.reviewerPromptDelivery ??
+          "argv",
+      },
+      config.domain,
+    );
     outcomes.push(outcome);
     if (opts.failFast && outcome.status === "fail") break;
   }

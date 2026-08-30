@@ -82,6 +82,7 @@ import {
   type AdapterProbe,
   type ExternalSandboxMode,
 } from "./harness-adapters/types.ts";
+import { extractProviderAuthStatus, type ProviderAuthStatus } from "./provider-auth-status.ts";
 import { RUN_SCHEMA_VERSION, appendEvent, emitStageAccounting, type RunStoreDeps } from "./run-store.ts";
 import type { Harness, PipelineConfig } from "./types.ts";
 
@@ -296,6 +297,12 @@ export interface HarnessResult {
    * refusal (`environment-auth` | `capability-refusal`).
    */
   preflight_reason_code?: "environment-auth" | "capability-refusal";
+  /**
+   * Structured provider authentication status after spawn (#1265). Prefer this
+   * over leftover log prose. Missing status is not invented as authenticated
+   * or as environment-auth. Served-model / `resolved_model` stays unchanged.
+   */
+  provider_auth_status?: ProviderAuthStatus;
   /**
    * #760-compatible human intervention kind for a production preflight
    * refusal (`auth-tooling-preflight-failure`).
@@ -751,10 +758,12 @@ export async function invoke(
   // Fold product side channel into stdout for freeform consumers; omit the
   // internal field so stages keep a single product field (#882).
   const { product_stdout: _productSideChannel, ...resultWithoutProduct } = result;
+  const providerAuth = extractProviderAuthStatus(result.stdout, result.stderr);
   const finalResult: HarnessResult = {
     ...resultWithoutProduct,
     stdout: productStdout,
     throttled: telemetry?.throttled ?? null,
+    ...(providerAuth ? { provider_auth_status: providerAuth } : {}),
   };
 
   if (opts.accounting) {

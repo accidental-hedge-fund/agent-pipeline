@@ -444,6 +444,41 @@ test("check harness:codex — passes when present; fails naming the binary when 
   assert.match(failR.remediation!, /codex/);
 });
 
+test("assigned-harness pass copy reports credentials or login-status, not authenticated", async () => {
+  const check = getCheck(makeConfig(), "harness:codex");
+  const pass = await check.run(fakeDeps({ execCheck: () => true }));
+  assert.equal(pass.status, "pass");
+  assert.match(pass.detail, /credentials|login-status/i);
+  assert.doesNotMatch(pass.detail, /authenticated|verified authentication/i);
+  assert.doesNotMatch(check.description, /authenticated|verified authentication/i);
+  const env = formatDoctorJson({
+    schema_version: 1,
+    ok: true,
+    ranAt: "t",
+    checks: [{ id: check.id, description: check.description, ...pass }],
+  });
+  assert.match(env.checks[0]!.reason, /credentials|login-status/i);
+  assert.doesNotMatch(env.checks[0]!.reason, /authenticated|verified authentication/i);
+});
+
+test("assigned-harness unauthenticated fail stays distinct from missing-CLI", async () => {
+  const missing = await getCheck(makeConfig(), "harness:codex").run(fakeDeps({ execCheck: () => false }));
+  assertFailWithRemediation(missing);
+  assert.match(missing.remediation!, /Install/);
+  const unauth = await getCheck(
+    makeConfig({ harnesses: { implementer: "grok", reviewer: "codex" } }),
+    "harness:grok",
+  ).run(
+    fakeDeps({
+      execCheck: () => true,
+      exec: () => ({ ok: false, stdout: "", stderr: "not logged in" }),
+    }),
+  );
+  assertFailWithRemediation(unauth);
+  assert.match(unauth.remediation!, /Authenticate/);
+  assert.notEqual(unauth.remediation, missing.remediation);
+});
+
 // ---------------------------------------------------------------------------
 // #779 — prompt-delivery byte limit doctor check
 // ---------------------------------------------------------------------------
@@ -742,7 +777,7 @@ test("check harness:my-reviewer (custom) — fails with remediation when not on 
 // adapter preflight, distinguishing missing-CLI from unauthenticated — not a
 // bare `which` PATH probe. ----
 
-test("check harness:grok — passes when installed and authenticated", async () => {
+test("check harness:grok — passes when installed with credentials or login-status present", async () => {
   const cfg = makeConfig({ harnesses: { implementer: "grok", reviewer: "codex" } });
   const r = await getCheck(cfg, "harness:grok").run(fakeDeps({ execCheck: () => true, exec: () => ({ ok: true, stdout: "", stderr: "" }) }));
   assert.equal(r.status, "pass");
