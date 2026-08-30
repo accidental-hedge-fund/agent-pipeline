@@ -159,7 +159,8 @@ export const OPERATION_SURFACE: readonly OperationSurfaceEntry[] = [
     name: "train",
     desc:
       "Operator-authorized integrate train: base-eligible frontiers advance via one loop wave each (recovery inside the wave); optionally serial-merge with base containment; independent R2D siblings may merge while a peer is parked (never called by the advance loop)",
-    usage: "train --milestone <m>|--issues <n,n> [--merge] [--json] [--dry-run]",
+    usage:
+      "train --milestone <m> [--merge] [--json] [--dry-run] | train --issues <n,n> [--merge] [--json] [--dry-run]",
     section: "lifecycle",
     fast: false,
   }),

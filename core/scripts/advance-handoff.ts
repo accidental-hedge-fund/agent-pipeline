@@ -13,6 +13,34 @@ export const ADVANCE_RUN_HANDOFF_KIND = "advance_run_handoff" as const;
 
 export const ADVANCE_RUN_HANDOFF_SCHEMA_VERSION = "1" as const;
 
+/**
+ * Nested loop/train children inherit stdio. This env tells the child not to
+ * write `advance_run_handoff` onto the parent's machine stdout (train --json).
+ */
+export const PIPELINE_NESTED_ADVANCE_ENV = "PIPELINE_NESTED_ADVANCE" as const;
+
+export const PIPELINE_NESTED_ADVANCE_VALUE = "1" as const;
+
+/** Env bag for a nested numeric `pipeline <N>` child. */
+export function nestedAdvanceChildEnv(
+  parentEnv: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  return { ...parentEnv, [PIPELINE_NESTED_ADVANCE_ENV]: PIPELINE_NESTED_ADVANCE_VALUE };
+}
+
+/**
+ * True only for a top-level direct numeric advance. Nested children (loop
+ * dispatch spawn, in-process recover-parked re-entry) must not emit.
+ */
+export function shouldEmitAdvanceRunHandoff(input: {
+  emitAdvanceHandoff?: boolean;
+  env?: NodeJS.ProcessEnv;
+}): boolean {
+  if (input.emitAdvanceHandoff === false) return false;
+  const env = input.env ?? process.env;
+  return env[PIPELINE_NESTED_ADVANCE_ENV] !== PIPELINE_NESTED_ADVANCE_VALUE;
+}
+
 /** Wire shape of the early advance handoff JSON object written to stdout. */
 export interface AdvanceRunHandoff {
   schema_version: typeof ADVANCE_RUN_HANDOFF_SCHEMA_VERSION;

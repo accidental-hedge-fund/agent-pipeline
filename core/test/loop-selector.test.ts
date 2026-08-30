@@ -23,6 +23,10 @@ import {
   type SelectorResolveDeps,
 } from "../scripts/pipeline.ts";
 import { BLOCKED_LABEL } from "../scripts/types.ts";
+import {
+  PIPELINE_NESTED_ADVANCE_ENV,
+  PIPELINE_NESTED_ADVANCE_VALUE,
+} from "../scripts/advance-handoff.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 import { EventEmitter } from "node:events";
 import type { ChildProcess } from "node:child_process";
@@ -137,7 +141,7 @@ test("realDispatchItem forwards cfg.engine_track onto the child advance argv", a
       scriptPath: "/path/to/pipeline.ts",
       execPath: "/usr/bin/node",
       eventsPathExists: (p) => p === expectedPin.events_path,
-      spawn: ((cmd: string, args: readonly string[]) => {
+      spawn: ((cmd: string, args: readonly string[], _opts?: unknown) => {
         spawned.push([...args]);
         return fakeSpawnChild();
       }) as typeof import("node:child_process").spawn,
@@ -158,6 +162,39 @@ test("realDispatchItem forwards cfg.engine_track onto the child advance argv", a
   const idx = spawned[0].indexOf("--engine-track");
   assert.ok(idx >= 0, "realDispatchItem must pass --engine-track from cfg");
   assert.equal(spawned[0][idx + 1], "candidate");
+});
+
+test("realDispatchItem nested child spawn sets PIPELINE_NESTED_ADVANCE=1", async () => {
+  const spawned: Array<{ env?: NodeJS.ProcessEnv }> = [];
+  const fixedNow = new Date("2026-07-29T13:49:56.421Z");
+  const expectedPin = pinAdvanceRunIdentity("/repo", 1049, fixedNow);
+  const dispatch = realDispatchItem(
+    { repo_dir: "/repo" } as PipelineConfig,
+    "claude",
+    {
+      now: () => fixedNow,
+      scriptPath: "/path/to/pipeline.ts",
+      execPath: "/usr/bin/node",
+      eventsPathExists: (p) => p === expectedPin.events_path,
+      spawn: ((_cmd: string, _args: readonly string[], opts?: { env?: NodeJS.ProcessEnv }) => {
+        spawned.push({ env: opts?.env });
+        return fakeSpawnChild();
+      }) as typeof import("node:child_process").spawn,
+      getIssueDetail: async () => ({ labels: ["pipeline:ready-to-deploy"], state: "open" }) as never,
+      getPrForIssue: async () => 99,
+    },
+  );
+  await dispatch({
+    schema: "pipeline/loop-execution@1",
+    item_id: "1049",
+    repo: { name: "acme/w", base_branch: "main" },
+    engine: "claude",
+    worktree_policy: "default",
+    done_definition: "pipeline:ready-to-deploy",
+    run_id: "loop-run-nested",
+  });
+  assert.equal(spawned.length, 1);
+  assert.equal(spawned[0]!.env?.[PIPELINE_NESTED_ADVANCE_ENV], PIPELINE_NESTED_ADVANCE_VALUE);
 });
 
 // ---------------------------------------------------------------------------

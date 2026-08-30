@@ -71,7 +71,8 @@ const BASE_COMMAND_DOCS: Record<string, CommandDoc> = {
   train: {
     summary:
       "Operator-authorized integrate train: base-eligible frontiers advance via one loop wave each (recovery inside the wave); optionally serial-merge with base containment; independent R2D siblings may merge while a peer is parked (never called by the advance loop)",
-    usage: "train --milestone <m>|--issues <n,n> [--merge] [--json] [--dry-run]",
+    usage:
+      "train --milestone <m> [--merge] [--json] [--dry-run] | train --issues <n,n> [--merge] [--json] [--dry-run]",
     documented: true,
     section: "lifecycle",
   },
@@ -313,6 +314,10 @@ export function formatHostUsage(hostToken: string, usage: string): string {
   const token = hostToken.trim();
   const body = usage.trim();
   if (!body) return token;
-  // Usage that already starts with the bare command form for advance ("N") stays space-joined.
-  return `${token} ${body}`;
+  // Prefix every spaced-pipe alternative so each form is a complete invocation.
+  // Split only on spaced pipes so flag unions such as `[--json|--is-ok]` stay intact.
+  return body
+    .split(/\s+\|\s+/)
+    .map((alt) => `${token} ${alt}`)
+    .join(" | ");
 }

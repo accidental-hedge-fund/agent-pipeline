@@ -9,7 +9,10 @@ import * as path from "node:path";
 
 import {
   ADVANCE_RUN_HANDOFF_KIND,
+  PIPELINE_NESTED_ADVANCE_ENV,
   formatAdvanceRunHandoff,
+  nestedAdvanceChildEnv,
+  shouldEmitAdvanceRunHandoff,
 } from "../scripts/advance-handoff.ts";
 import {
   runAdvance,
@@ -183,5 +186,242 @@ test("plain numeric runAdvance emits advance_run_handoff before first dispatch a
     process.exitCode = prevExit;
     fs.rmSync(repoDir, { recursive: true, force: true });
     fs.rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+function stubHandoffAdvance(
+  repoDir: string,
+  extra: Partial<AdvanceDeps> = {},
+): { deps: AdvanceDeps; lines: string[]; order: string[] } {
+  const lines: string[] = [];
+  const order: string[] = [];
+  const detail = {
+    number: ISSUE,
+    type: "issue" as const,
+    title: "T",
+    body: "B",
+    state: "open",
+    url: `https://example.test/${ISSUE}`,
+    labels: ["pipeline:ready"],
+    comments: [],
+  };
+  const deps: AdvanceDeps = {
+    now: () => STARTED_AT.getTime(),
+    resolvePinnedEngineIdentity: () => null,
+    probeEngineIdentity: () => null,
+    enforceEngineTrack: async () => ({
+      ok: true as const,
+      track: "candidate" as const,
+    }),
+    releaseParkedWorktree: async () => ({
+      action: "absent",
+      reason: "no managed worktree",
+      branch: null,
+      worktree: null,
+    }),
+    ensurePipelineLabels: async () => {},
+    getIssueDetail: (async () => detail) as AdvanceDeps["getIssueDetail"],
+    getGhActor: async () => "pipeline-bot",
+    getPrForIssue: async () => null,
+    getOnDiskForIssue: async () => null,
+    postComment: async () => {},
+    postPrComment: async () => {},
+    setBlocked: async () => {},
+    lastAdvancedCandidateSha: "a".repeat(40),
+    trustedSurfaceObjectSource: {
+      listChangedPaths: async () => ({ paths: [] }),
+      resolveBaseSha: async () => "a".repeat(40),
+    },
+    gitInWorktree: async (_cwd, args) => {
+      if (args[0] === "rev-parse") return { stdout: `${"a".repeat(40)}\n`, stderr: "", code: 0 };
+      return { stdout: "", stderr: "", code: 0 };
+    },
+    writeHandoffLine: (line) => {
+      lines.push(line.replace(/\n$/, ""));
+      order.push("handoff");
+    },
+    dispatch: async () => {
+      order.push("dispatch");
+      return {
+        advanced: false,
+        status: "blocked",
+        reason: "stop after first dispatch",
+        blockerKind: "needs-human",
+      };
+    },
+    ...extra,
+  };
+  return { deps, lines, order };
+}
+
+function handoffCfg(repoDir: string, domain: string): PipelineConfig {
+  return {
+    repo: "owner/repo",
+    domain,
+    repo_dir: repoDir,
+    base_branch: "main",
+    invocation: "pipeline",
+    marker_footer: "*Automated by Claude Code Pipeline Skill*",
+    harnesses: {
+      implementer: "claude",
+      implementerSource: "default",
+      reviewer: "codex",
+      reviewerSource: "default",
+    },
+    steps: { standard_review: true, adversarial_review: true },
+    auto_loop: { enabled: false, max_rounds: 3, max_wallclock_minutes: 60, stages: [] },
+    papercuts: { enabled: false, auto_file: false },
+    corrections: { auto_file: false },
+  } as unknown as PipelineConfig;
+}
+
+test("shouldEmitAdvanceRunHandoff is false for nested env and explicit suppress", () => {
+  assert.equal(shouldEmitAdvanceRunHandoff({}), true);
+  assert.equal(shouldEmitAdvanceRunHandoff({ emitAdvanceHandoff: false }), false);
+  assert.equal(
+    shouldEmitAdvanceRunHandoff({ env: nestedAdvanceChildEnv({}) }),
+    false,
+  );
+  assert.equal(
+    shouldEmitAdvanceRunHandoff({ env: { [PIPELINE_NESTED_ADVANCE_ENV]: "1" } }),
+    false,
+  );
+});
+
+test("runAdvance does not emit advance_run_handoff when mkdir fails", async () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "advance-handoff-mkdir-"));
+  const domain = `advance-handoff-mkdir-${process.pid}-${Date.now()}`;
+  const { deps, lines } = stubHandoffAdvance(repoDir, {
+    runStore: {
+      mkdir: async () => {
+        throw new Error("EACCES: mkdir failed");
+      },
+    },
+  });
+  const prevExit = process.exitCode;
+  process.exitCode = undefined;
+  try {
+    await withoutHostPinAuthorityEnv(() =>
+      runAdvance(handoffCfg(repoDir, domain), ISSUE, {}, deps),
+    );
+    assert.deepEqual(lines, []);
+  } finally {
+    process.exitCode = prevExit;
+    fs.rmSync(repoDir, { recursive: true, force: true });
+    fs.rmSync(`/tmp/pipeline-${domain}`, { recursive: true, force: true });
+  }
+});
+
+test("runAdvance does not emit advance_run_handoff when writeFile fails", async () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "advance-handoff-write-"));
+  const domain = `advance-handoff-write-${process.pid}-${Date.now()}`;
+  const { deps, lines } = stubHandoffAdvance(repoDir, {
+    runStore: {
+      writeFile: async () => {
+        throw new Error("ENOSPC: write failed");
+      },
+    },
+  });
+  const prevExit = process.exitCode;
+  process.exitCode = undefined;
+  try {
+    await withoutHostPinAuthorityEnv(() =>
+      runAdvance(handoffCfg(repoDir, domain), ISSUE, {}, deps),
+    );
+    assert.deepEqual(lines, []);
+  } finally {
+    process.exitCode = prevExit;
+    fs.rmSync(repoDir, { recursive: true, force: true });
+    fs.rmSync(`/tmp/pipeline-${domain}`, { recursive: true, force: true });
+  }
+});
+
+test("runAdvance does not emit advance_run_handoff for an incomplete idempotent store", async () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "advance-handoff-idemp-"));
+  const domain = `advance-handoff-idemp-${process.pid}-${Date.now()}`;
+  const expectedStoreId = runIdFor(ISSUE, STARTED_AT);
+  const runDir = runDirPath(repoDir, expectedStoreId);
+  fs.mkdirSync(runDir, { recursive: true });
+  fs.writeFileSync(path.join(runDir, "run.json"), `${JSON.stringify({ run_id: expectedStoreId })}\n`);
+  assert.equal(fs.existsSync(path.join(runDir, "events.jsonl")), false);
+  const { deps, lines } = stubHandoffAdvance(repoDir);
+  const prevExit = process.exitCode;
+  process.exitCode = undefined;
+  try {
+    await withoutHostPinAuthorityEnv(() =>
+      runAdvance(handoffCfg(repoDir, domain), ISSUE, {}, deps),
+    );
+    assert.deepEqual(lines, []);
+  } finally {
+    process.exitCode = prevExit;
+    fs.rmSync(repoDir, { recursive: true, force: true });
+    fs.rmSync(`/tmp/pipeline-${domain}`, { recursive: true, force: true });
+  }
+});
+
+test("runAdvance does not emit advance_run_handoff in exclusive-sink mode", async () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "advance-handoff-excl-"));
+  const domain = `advance-handoff-excl-${process.pid}-${Date.now()}`;
+  const expectedStoreId = runIdFor(ISSUE, STARTED_AT);
+  const runDir = runDirPath(repoDir, expectedStoreId);
+  const { deps, lines } = stubHandoffAdvance(repoDir, {
+    runStore: {
+      eventSink: async () => {},
+      eventSinkMode: "exclusive",
+      summaryEvents: [],
+    },
+  });
+  const prevExit = process.exitCode;
+  process.exitCode = undefined;
+  try {
+    await withoutHostPinAuthorityEnv(() =>
+      runAdvance(handoffCfg(repoDir, domain), ISSUE, {}, deps),
+    );
+    assert.equal(fs.existsSync(path.join(runDir, "events.jsonl")), false);
+    assert.deepEqual(lines, []);
+  } finally {
+    process.exitCode = prevExit;
+    fs.rmSync(repoDir, { recursive: true, force: true });
+    fs.rmSync(`/tmp/pipeline-${domain}`, { recursive: true, force: true });
+  }
+});
+
+test("nested numeric runAdvance does not emit advance_run_handoff", async () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "advance-handoff-nested-"));
+  const domain = `advance-handoff-nested-${process.pid}-${Date.now()}`;
+  const { deps, lines, order } = stubHandoffAdvance(repoDir, {
+    env: nestedAdvanceChildEnv({}),
+  });
+  const prevExit = process.exitCode;
+  process.exitCode = undefined;
+  try {
+    await withoutHostPinAuthorityEnv(() =>
+      runAdvance(handoffCfg(repoDir, domain), ISSUE, {}, deps),
+    );
+    assert.deepEqual(lines, []);
+    assert.deepEqual(order, ["dispatch"]);
+  } finally {
+    process.exitCode = prevExit;
+    fs.rmSync(repoDir, { recursive: true, force: true });
+    fs.rmSync(`/tmp/pipeline-${domain}`, { recursive: true, force: true });
+  }
+});
+
+test("in-process nested re-entry suppresses advance_run_handoff via emitAdvanceHandoff", async () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "advance-handoff-reenter-"));
+  const domain = `advance-handoff-reenter-${process.pid}-${Date.now()}`;
+  const { deps, lines, order } = stubHandoffAdvance(repoDir);
+  const prevExit = process.exitCode;
+  process.exitCode = undefined;
+  try {
+    await withoutHostPinAuthorityEnv(() =>
+      runAdvance(handoffCfg(repoDir, domain), ISSUE, { emitAdvanceHandoff: false }, deps),
+    );
+    assert.deepEqual(lines, []);
+    assert.deepEqual(order, ["dispatch"]);
+  } finally {
+    process.exitCode = prevExit;
+    fs.rmSync(repoDir, { recursive: true, force: true });
+    fs.rmSync(`/tmp/pipeline-${domain}`, { recursive: true, force: true });
   }
 });

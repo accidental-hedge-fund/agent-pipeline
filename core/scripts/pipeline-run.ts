@@ -63,7 +63,10 @@ import {
   recordRecovery,
   recordStage,
 } from "./evidence-bundle.ts";
-import { flushAdvanceRunHandoff } from "./advance-handoff.ts";
+import {
+  flushAdvanceRunHandoff,
+  shouldEmitAdvanceRunHandoff,
+} from "./advance-handoff.ts";
 import {
   RUN_SCHEMA_VERSION,
   appendEvent,
@@ -224,6 +227,13 @@ export interface AdvanceOpts {
    * `reenterAdvanceAfterRecoverParked` only — not a public CLI flag.
    */
   skipRecoverParked?: boolean;
+  /**
+   * When false, skip the early `advance_run_handoff` stdout line. Nested
+   * in-process re-entry (recover-parked) sets this so train --json stdout
+   * stays one `train_status` object. Default / omitted emits for top-level
+   * `pipeline <N>`. Spawned loop children set PIPELINE_NESTED_ADVANCE=1.
+   */
+  emitAdvanceHandoff?: boolean;
   /**
    * Explicit candidate-SHA override for trusted-surface when no worktree is
    * on disk (#1243). Production CLI: `pipeline N --sha <40-hex>`.
@@ -719,6 +729,11 @@ export interface AdvanceDeps {
    * without writing to the process stdout.
    */
   writeHandoffLine?: (line: string) => Promise<void> | void;
+  /**
+   * Overlay on the run-store I/O seam. Tests inject mkdir/write/stat/sink
+   * failures without touching the real FS or spawning an event-sink command.
+   */
+  runStore?: Partial<RunStoreDeps>;
 }
 
 /**
@@ -1193,6 +1208,19 @@ export async function dispatch(
 // Advance mode lifecycle
 // ---------------------------------------------------------------------------
 
+/** True when the advertised local events.jsonl path exists and can be followed. */
+async function localEventsStreamFollowable(
+  eventsPath: string,
+  deps: Pick<RunStoreDeps, "stat">,
+): Promise<boolean> {
+  try {
+    await deps.stat(eventsPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export async function runAdvance(
   cfg: PipelineConfig,
   issueNumber: number,
@@ -1285,6 +1313,7 @@ export async function runAdvance(
       // finalizeRun) — additive/no-sink mode keeps reading events.jsonl so a
       // resumed run also picks up events appended by an earlier process.
       ...(eventSinkDeps.eventSinkMode === "exclusive" ? { summaryEvents: [] } : {}),
+      ...(deps.runStore ?? {}),
     };
     if (stateDir) {
       // Use the run id pinned by a detached launcher when present, so the detached
@@ -1504,7 +1533,6 @@ export async function runAdvance(
         explicit: opts.discoveryChannel,
         persisted: persistedDiscovery,
       });
-      let runStoreReady = false;
       await initRunDir(
         {
           runDir,
@@ -1518,19 +1546,28 @@ export async function runAdvance(
           discoveryChannel: activeDiscoveryChannel,
         },
         runStoreDeps,
-      )
-        .then(() => {
-          runStoreReady = true;
-        })
-        .catch(() => {});
+      ).catch(() => {});
       // Flush the logs-compatible run-store basename before first stage
-      // dispatch. Distinct from the later commit-trailer `Pipeline-Run` id.
-      if (runStoreReady) {
+      // dispatch only when the local events stream is actually followable.
+      // initRunDir swallows I/O errors, its idempotent branch checks only
+      // run.json, and exclusive-sink mode can omit events.jsonl.
+      const eventsPath = path.join(runDir, "events.jsonl");
+      const eventsFollowable = await localEventsStreamFollowable(
+        eventsPath,
+        runStoreDeps,
+      );
+      if (
+        eventsFollowable &&
+        shouldEmitAdvanceRunHandoff({
+          emitAdvanceHandoff: opts.emitAdvanceHandoff,
+          env: deps.env ?? process.env,
+        })
+      ) {
         await flushAdvanceRunHandoff(
           {
             runId,
             runDir,
-            events: path.join(runDir, "events.jsonl"),
+            events: eventsPath,
           },
           deps.writeHandoffLine,
         );

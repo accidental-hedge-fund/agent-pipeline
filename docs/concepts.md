@@ -377,7 +377,7 @@ Linked-advance follow remains required for complete mid-item stage progress unti
 
 ### Material event kinds
 
-Use `scripts/material-filter.mjs` on follow streams. Unfiltered `events.jsonl` stays the complete evidence file. Human-visible notify uses that material filter so test-gate output cannot surface fixture transitions for unrelated issue numbers, broad stdout matching cannot treat those lines as progress, and rapid duplicate notifications cannot auto-stop a host Monitor. The filter is a notification projection. It does not rewrite the run store. It suppresses heartbeats, accounting noise, kinds outside the material sets, skipped-stage start/complete, repeated identical schedule/reconcile evaluations in one burst, later identical CI `waiting` after the first in a stretch, and repeated CI `partial` / OpenSpec `skipped` outcomes.
+Use `scripts/material-filter.mjs` on follow streams. Unfiltered `events.jsonl` stays the complete evidence file. Human-visible notify uses that material filter so test-gate output cannot surface fixture transitions for unrelated issue numbers, broad stdout matching cannot treat those lines as progress, and rapid duplicate notifications cannot auto-stop a host Monitor. The filter is a notification projection. It does not rewrite the run store. It suppresses heartbeats, accounting noise, kinds outside the material sets, skipped-stage start/complete, repeated identical schedule/reconcile evaluations in one burst, later identical CI `waiting` after the first in a stretch, repeated identical definitive `loop_item_progress` results, and repeated CI `partial` / OpenSpec `skipped` outcomes.
 
 Advance material kinds: `run_start`, `stage_start`, `stage_complete`, `pr_created`, `pr_updated`, `review_verdict`, `gate_result`, `blocker_set`, `blocker_cleared`, `run_complete`.
 
@@ -385,7 +385,7 @@ Loop material kinds: `loop_item_started`, `loop_item_transitioned`, `loop_item_b
 
 Optional loop kinds (burst-suppressed): `loop_schedule_evaluated`, `loop_reconciled`, `loop_merge_barrier_cleared`, `loop_item_paused`, `loop_item_waiting`, `loop_item_resumed`, `loop_item_abandoned`, `loop_item_skipped`, `loop_item_precondition_excluded`, `loop_recovery_attempt`, `loop_run_superseded`.
 
-Definitive `loop_item_progress` statuses: `pass`, `fail`, `approve`, `needs_attention`, `attempted`, `success`, `exhausted`, `blocked`, `advanced`, `started`. Surface the first CI `waiting` in a stretch; suppress later identical waits. Suppress repeated CI `partial` and OpenSpec `skipped` outcomes.
+Definitive `loop_item_progress` statuses: `pass`, `fail`, `approve`, `needs_attention`, `attempted`, `success`, `exhausted`, `blocked`, `advanced`, `started`. Surface the first CI `waiting` in a stretch; suppress later identical waits. Suppress repeated identical definitive `loop_item_progress` results. Suppress repeated CI `partial` and OpenSpec `skipped` outcomes.
 
 Train material kinds: `run_start`, `train_work_list_resolved`, `train_wave_started`, `train_loop_linked`, `train_item_started`, `train_item_completed`, `train_pr_created`, `train_merge_attempted`, `train_merge_proven`, `train_merge_integrated`, `train_sibling_halted`, `train_wave_ended`, `run_complete`.
 

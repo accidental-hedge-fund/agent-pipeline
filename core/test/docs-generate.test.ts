@@ -19,6 +19,7 @@ import {
 import { renderHostSkill } from "../scripts/host-skill.ts";
 import {
   COMMAND_DOCS,
+  formatHostUsage,
   listDocumentedCommands,
   type CommandDoc,
 } from "../scripts/command-docs.ts";
@@ -123,7 +124,7 @@ describe("command-docs metadata", () => {
     assert.equal(doc.documented, true);
     assert.equal(
       doc.usage,
-      "train --milestone <m>|--issues <n,n> [--merge] [--json] [--dry-run]",
+      "train --milestone <m> [--merge] [--json] [--dry-run] | train --issues <n,n> [--merge] [--json] [--dry-run]",
     );
   });
 
@@ -215,6 +216,43 @@ describe("renderCliMarkdown", () => {
       },
     });
     assert.ok(!md.includes("ghost"));
+  });
+
+  test("formatHostUsage prefixes every spaced-pipe alternative", () => {
+    const loop = formatHostUsage(
+      "pipeline",
+      "loop --milestone <m> | loop --label <l> | loop --resume <run-id>",
+    );
+    assert.equal(
+      loop,
+      "pipeline loop --milestone <m> | pipeline loop --label <l> | pipeline loop --resume <run-id>",
+    );
+    const doctor = formatHostUsage("pipeline", "doctor [--json|--is-ok]");
+    assert.equal(doctor, "pipeline doctor [--json|--is-ok]");
+  });
+
+  test("every rendered CLI alternative is a complete pipeline invocation", () => {
+    const md = renderCliMarkdown();
+    const usages = [...md.matchAll(/- \*\*Usage:\*\* `([^`]+)`/g)].map((m) => m[1]!);
+    assert.ok(usages.length > 0, "cli markdown must contain usage lines");
+    for (const usage of usages) {
+      for (const alt of usage.split(/\s+\|\s+/)) {
+        assert.match(
+          alt.trim(),
+          /^pipeline /,
+          `rendered alternative is not a complete pipeline invocation: ${alt}`,
+        );
+      }
+    }
+    assert.ok(
+      usages.some((u) => u.includes("pipeline loop --label")),
+      "later loop alternatives must keep the pipeline prefix",
+    );
+    assert.doesNotMatch(
+      usages.find((u) => u.includes("pipeline loop")) ?? "",
+      / \| loop --/,
+      "copying a later loop alternative must not run `loop` as a separate command",
+    );
   });
 });
 

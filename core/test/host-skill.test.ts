@@ -347,9 +347,25 @@ describe("renderHostSkill contract", () => {
     assert.doesNotMatch(table, /pipeline --issues/);
     assert.doesNotMatch(table, /pipeline --label/);
     assert.match(table, /pipeline train --milestone/);
+    assert.match(table, /pipeline train --issues/);
     assert.match(table, /pipeline ship --milestone vX\.Y\.Z/);
     assert.match(table, /pipeline ship status --milestone vX\.Y\.Z/);
     assert.doesNotMatch(table, /\| ship status/);
+    const usageLines = table
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.startsWith("pipeline "));
+    assert.ok(usageLines.length > 0, "verb table must contain pipeline invocations");
+    for (const line of usageLines) {
+      const usage = line.replace(/\s{2,}.*$/, "").trim();
+      for (const alt of usage.split(/\s+\|\s+/)) {
+        assert.match(
+          alt.trim(),
+          /^pipeline /,
+          `top-level alternative must start with pipeline: ${alt}`,
+        );
+      }
+    }
     const loopOp = OPERATION_SURFACE.find((op) => op.name === "loop");
     assert.ok(loopOp);
     const loopAlts = loopOp.usage.split(/\s+\|\s+/);
@@ -460,6 +476,18 @@ const HOST_DISPATCH_PATTERNS: Array<{ name: string; re: RegExp }> = [
     re: /switch\s*\(\s*(?:manifest|row)\.id\s*\)/,
   },
   {
+    name: "switch(activeHost) with a host case",
+    re: /switch\s*\(\s*\w*[Hh]ost\w*\s*\)[\s\S]{0,200}case\s*["'](?:claude|codex|grok|opencode)["']/,
+  },
+  {
+    name: "array-backed host map",
+    re: /\[\s*(?:\[\s*)?["'](?:claude|codex|grok|opencode)["']\s*,/,
+  },
+  {
+    name: "unquoted host map without notify-field shape",
+    re: /(?:^|[^\w$])(?:claude|codex|grok|opencode)\s*:\s*(?:["'`{\[]|function)/,
+  },
+  {
     name: "metadata-first host map",
     re: new RegExp(
       String.raw`\{\s*(?:host|id|hostId)\s*:\s*["'](?:${SKILL_HOST_ID_ALT})["']`,
@@ -510,6 +538,9 @@ describe("source-of-truth bite", () => {
     const bracket = `notify["codex"] = { tools: [] };`;
     const arbitraryCompare = `if (active === "grok") push();`;
     const switchManifest = `switch (manifest.id) { case "opencode": break; }`;
+    const switchActiveHost = `switch (activeHost) { case "claude": notify(); break; }`;
+    const arrayBacked = `const rows = [["claude", { surface: "x" }]];`;
+    const unquotedMap = `const notify = { claude: "PushNotification", codex: "chat" };`;
     const fixtures: Array<[string, string]> = [
       ["quoted", quoted],
       ["map", mapLiteral],
@@ -518,6 +549,9 @@ describe("source-of-truth bite", () => {
       ["bracket", bracket],
       ["arbitrary-compare", arbitraryCompare],
       ["switch-manifest.id", switchManifest],
+      ["switch-activeHost", switchActiveHost],
+      ["array-backed", arrayBacked],
+      ["unquoted-map", unquotedMap],
     ];
     for (const [label, fixture] of fixtures) {
       assert.throws(
@@ -657,6 +691,22 @@ function assertRenderedFollowContract(skill: string, label = "skill"): void {
   );
   assert.match(skill, /Keep the loop follow active while the loop remains live/, label);
   assert.match(skill, /Stop the loop-scoped follow set on `loop_run_complete`/, label);
+  assert.match(skill, /Interrupted follow is non-terminal/, label);
+  assert.match(
+    skill,
+    /`loop_run_stopped`, or supervisor exit, in the same turn/,
+    label,
+  );
+  assert.match(
+    skill,
+    /Premature supervisor exit is non-terminal failure\/recovery/,
+    label,
+  );
+  assert.match(
+    skill,
+    /Tear down every run-scoped follow, then report recovery/,
+    label,
+  );
   assert.doesNotMatch(
     skill,
     /Stop every run-scoped follow on confirmed terminal \(`run_complete`/,
@@ -690,6 +740,36 @@ describe("semantic follow contract fixtures", () => {
       () => assertRenderedFollowContract(hostile, "hostile-teardown"),
       (err: unknown) => err instanceof assert.AssertionError,
     );
+  });
+
+  test("hostile interrupted-follow, same-turn, and premature-exit mutations fail the validator", () => {
+    const skill = renderHostSkill();
+    const mutations: Array<[string, string, string]> = [
+      [
+        "interrupted-follow",
+        "Interrupted follow is non-terminal. Cancelled wait is not completion.",
+        "Interrupted follow is terminal completion.",
+      ],
+      [
+        "same-turn-teardown",
+        "`loop_run_stopped`, or supervisor exit, in the same turn.",
+        "`loop_run_stopped`, or supervisor exit, on a later turn.",
+      ],
+      [
+        "premature-exit",
+        "Premature supervisor exit is non-terminal failure/recovery, never\n    completion. Tear down every run-scoped follow, then report recovery — do\n    not emit a completion summary.",
+        "Premature supervisor exit is completion. Keep follows running.",
+      ],
+    ];
+    for (const [label, from, to] of mutations) {
+      const hostile = skill.replace(from, to);
+      assert.notEqual(hostile, skill, `${label} mutation must change rendered prose`);
+      assert.throws(
+        () => assertRenderedFollowContract(hostile, label),
+        (err: unknown) => err instanceof assert.AssertionError,
+        `${label} mutation must fail the renderer-connected validator`,
+      );
+    }
   });
 
   test("direct numeric advance follow completes on run_complete without a loop follow", () => {

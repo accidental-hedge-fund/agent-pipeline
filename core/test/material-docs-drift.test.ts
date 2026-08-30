@@ -41,6 +41,7 @@ test("docs/concepts.md names every shared material kind and suppression class", 
   assert.match(docs, /CI `partial`/);
   assert.match(docs, /OpenSpec `skipped`/);
   assert.match(docs, /first CI `waiting`/);
+  assert.match(docs, /repeated identical definitive `loop_item_progress`/);
 });
 
 test("deleting a kind class from durable docs would fail the guard", () => {
@@ -53,4 +54,9 @@ test("deleting a kind class from durable docs would fail the guard", () => {
   assert.ok(!droppedTrain.includes("train_loop_linked"));
   const droppedStatus = docs.replaceAll("`exhausted`", "");
   assert.ok(!droppedStatus.includes("`exhausted`"));
+  const droppedDefinitive = docs.replaceAll(
+    "repeated identical definitive `loop_item_progress`",
+    "",
+  );
+  assert.ok(!droppedDefinitive.includes("repeated identical definitive `loop_item_progress`"));
 });
