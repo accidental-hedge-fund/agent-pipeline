@@ -91,17 +91,13 @@ gh label create "pipeline:ready" --color 0075ca --description "Start the pipelin
 gh issue edit N --add-label "pipeline:ready"
 ```
 
-Then invoke from Claude Code:
+Then invoke:
 
 ```text
-/pipeline N
+pipeline N
 ```
 
-Or from Codex (after restarting it):
-
-```text
-$pipeline N
-```
+Claude Code `/pipeline` and Codex `$pipeline` are historical host shims for the same CLI.
 
 The pipeline advances the issue through planning, implementation, cross-harness review, fix rounds, and pre-merge checks — without further manual input — and stops at `pipeline:ready-to-deploy` for an operator-authorized merge.
 
@@ -241,7 +237,7 @@ Uninstall removes the host skill tree. For Claude it also removes legacy install
 | **[docs/packaging.md](docs/packaging.md)** | Packaging contract: CLI is the product; hosts are shims |
 | **[docs/cli.md](docs/cli.md)** | Full CLI command reference (generated from the command registry) |
 | **[docs/config.md](docs/config.md)** | `.github/pipeline.yml` config key reference (generated from the Zod schema) |
-| **[docs/concepts.md](docs/concepts.md)** | Advanced/optional topics: gates, OpenSpec, review policy, desktop integration, troubleshooting |
+| **[docs/concepts.md](docs/concepts.md)** | Advanced/optional topics: [implementer/reviewer pair](docs/concepts.md#implementer-and-reviewer-pair), gates, OpenSpec, review policy, desktop integration, troubleshooting |
 | **[CHANGELOG.md](CHANGELOG.md)** | Per-version release history (generated from git tags) |
 | **[ROADMAP.md](ROADMAP.md)** | Human-readable forward plan (GitHub milestones are release-plan authority) |
 
@@ -252,8 +248,8 @@ pipeline N                  # advance issue N
 pipeline status N           # stage, blocker, PR, last review
 pipeline doctor             # deterministic preflight (opt-in --harness-smoke)
 pipeline init               # labels + .github/pipeline.yml scaffold
-/pipeline decompose --epic N            # preview epic → child graph (no writes)
-/pipeline decompose --epic N --apply    # create children + ROADMAP PR (never merges)
+pipeline decompose --epic N            # preview epic → child graph (no writes)
+pipeline decompose --epic N --apply    # create children + ROADMAP PR (never merges)
 ```
 
 `pipeline decompose` breaks one epic issue into small dependency-linked children
@@ -271,7 +267,7 @@ loop selectors. Then run `pipeline loop --milestone <lane>` on the children.
 pipeline init
 # Commit .github/pipeline.yml (edit as needed), then:
 gh issue edit N --add-label "pipeline:ready"
-/pipeline N
+pipeline N
 ```
 
 `init` ensures pipeline labels, scaffolds `.github/pipeline.yml`, and gitignores local-only `.agent-pipeline/` paths (including `.agent-pipeline/runs/`, `.agent-pipeline/roadmap/`, `.agent-pipeline/history/`, `.agent-pipeline/evals/`, `.agent-pipeline/control-attributions.jsonl`, `.agent-pipeline/product-fault-reports.jsonl`, `.agent-pipeline/handoffs/`, `.agent-pipeline/outcomes/`, `.agent-pipeline/lineage/`, `.agent-pipeline/frg/`, `.agent-pipeline/harness-ownership/`, `.agent-pipeline/factory-release/`, `.agent-pipeline/grill-proposal.key`, and `.agent-pipeline/grill-proposals/`). For configuration detail, see [docs/config.md](docs/config.md). For optional gates, OpenSpec, and conventions, see [docs/concepts.md](docs/concepts.md).

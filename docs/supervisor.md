@@ -38,6 +38,9 @@ Merge is operator-authorized. This repository does not ship a grant factory, Mes
 1. Install agent-pipeline for the host that will run CLI processes.
 2. `gh` authenticated to the target repo with enough permission to advance and (if using `--merge`) merge.
 3. Repo has `.github/pipeline.yml` (models, harnesses, base branch).
+   Supervisors MUST NOT assume a Claude implement / Codex review pair.
+   They MUST read `harnesses.*` from `.github/pipeline.yml`.
+   They MAY confirm the resolved pair with `pipeline doctor`.
 4. Prove the path once by hand:
 
 ```bash
