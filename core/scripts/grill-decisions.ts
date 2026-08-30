@@ -165,8 +165,8 @@ export function canonicalThinIssueNodes(): DecisionNode[] {
 
 export function implementerSelfAccepted(nodes: readonly DecisionNode[]): boolean {
   for (const node of nodes) {
-    if (node.resolution === "resolved" && node.provenance.settled_by === "reviewer-accept") return true;
-    if (node.provenance.settled_by === "reviewer-accept") return true;
+    if (node.resolution === "resolved") return true;
+    if (node.provenance.settled_by !== "none") return true;
     if (node.provenance.reviewer_verdict === "accept") return true;
   }
   return false;
@@ -176,14 +176,25 @@ export function applyReviewerVerdicts(
   nodes: DecisionNode[],
   verdicts: ReadonlyArray<{ node_id: string; verdict: ReviewerVerdictKind; reason: string }>,
 ): { ok: true; nodes: DecisionNode[]; challenges: boolean } | { ok: false; reason: string } {
-  const byId = new Map(verdicts.map((v) => [v.node_id, v]));
+  const byId = new Map<string, (typeof verdicts)[number]>();
+  for (const v of verdicts) {
+    if (byId.has(v.node_id)) {
+      return { ok: false, reason: `duplicate reviewer verdict for node ${v.node_id}` };
+    }
+    byId.set(v.node_id, v);
+  }
+  const nodeIds = new Set(nodes.map((n) => n.id));
+  for (const id of byId.keys()) {
+    if (!nodeIds.has(id)) {
+      return { ok: false, reason: `reviewer verdict for unknown node ${id}` };
+    }
+  }
   const next: DecisionNode[] = [];
   let challenges = false;
   for (const node of nodes) {
     const v = byId.get(node.id);
     if (!v) {
-      next.push(node);
-      continue;
+      return { ok: false, reason: `reviewer omitted verdict for node ${node.id}` };
     }
     const classified = classifyAuthority(node.class);
     const reason = (v.reason ?? "").trim();
@@ -493,6 +504,22 @@ function parseNode(
       return {
         ok: false,
         reason: `node ${node.id} cannot record settled-by: reviewer-accept`,
+        code: "invalid_shape",
+      };
+    }
+  }
+  if (node.resolution === "resolved" && isNonAuthorityClass(node.class)) {
+    if (node.provenance.settled_by !== "reviewer-accept") {
+      return {
+        ok: false,
+        reason: `node ${node.id} non-authority resolution requires reviewer-accept provenance`,
+        code: "invalid_shape",
+      };
+    }
+    if (node.provenance.eligibility_reason !== NON_AUTHORITY_ELIGIBILITY_REASON) {
+      return {
+        ok: false,
+        reason: `node ${node.id} missing taxonomy eligibility reason`,
         code: "invalid_shape",
       };
     }

@@ -113,7 +113,7 @@ function rawImplementerSelfAccepted(raw: unknown): boolean {
   for (const item of raw) {
     if (item === null || typeof item !== "object") continue;
     const o = item as Record<string, unknown>;
-    if (o.resolution === "accept" || o.settled_by === "reviewer-accept") return true;
+    if (o.resolution === "accept" || o.resolution === "resolved" || o.settled_by === "reviewer-accept") return true;
     const p = o.provenance;
     if (p && typeof p === "object") {
       const rec = p as Record<string, unknown>;
@@ -137,7 +137,9 @@ function parseImplementerNodes(raw: unknown): DecisionNode[] {
       typeof o.recommendation === "string" ? o.recommendation.slice(0, MAX_NODE_TEXT) : "";
     const cls = typeof o.class === "string" ? o.class : "scope";
     const term_id = typeof o.term_id === "string" ? o.term_id : undefined;
-    nodes.push(makeNode({ id, question, recommendation, class: cls, term_id }));
+    const node = makeNode({ id, question, recommendation, class: cls, term_id });
+    if (o.resolution === "resolved") node.resolution = "resolved";
+    nodes.push(node);
   }
   const present = new Set(nodes.map((n) => n.class));
   for (const extra of canonicalThinIssueNodes()) {
@@ -244,11 +246,11 @@ export async function runRefineSpecIssuePreview(
     return fail(deps, "implementer response missing body", 1);
   }
   if (rawImplementerSelfAccepted(parsed.nodes)) {
-    return fail(deps, "implementer cannot mark its own nodes accept / settled-by: reviewer-accept", 1);
+    return fail(deps, "implementer cannot mark its own nodes accept, settled-by: reviewer-accept, or resolved", 1);
   }
   const nodes = parseImplementerNodes(parsed.nodes);
   if (implementerSelfAccepted(nodes)) {
-    return fail(deps, "implementer cannot mark its own nodes accept / settled-by: reviewer-accept", 1);
+    return fail(deps, "implementer cannot mark its own nodes accept, settled-by: reviewer-accept, or resolved", 1);
   }
   const rawProposals = parseImplementerProposals(parsed.context_proposals);
   const classified = classifyContextProposals(rawProposals, nodes, contextMd);
@@ -316,8 +318,7 @@ export async function runRefineSpecIssuePreview(
   } catch {
     return fail(deps, "reviewer returned non-JSON output", 1);
   }
-  const unsettled = nodes.filter((n) => n.resolution === "unresolved");
-  for (const node of unsettled) {
+  for (const node of nodes) {
     if (!verdicts.some((v) => v.node_id === node.id)) {
       return fail(deps, `reviewer omitted verdict for node ${node.id}`, 1);
     }

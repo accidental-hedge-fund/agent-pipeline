@@ -431,6 +431,83 @@ test("grill: implementer self-accept detector bites", () => {
   assert.equal(implementerSelfAccepted([node]), true);
 });
 
+test("grill: implementer self-accept detector bites on pre-resolved non-authority", () => {
+  const node = makeNode({
+    id: "api",
+    question: "Which API?",
+    recommendation: "REST",
+    class: "interface-contract",
+  });
+  node.resolution = "resolved";
+  assert.equal(node.provenance.settled_by, "none");
+  assert.equal(implementerSelfAccepted([node]), true);
+});
+
+test("grill: applyReviewerVerdicts rejects omitted verdict for non-authority node", () => {
+  const node = makeNode({
+    id: "api",
+    question: "Which API?",
+    recommendation: "REST",
+    class: "interface-contract",
+  });
+  node.resolution = "resolved";
+  const applied = applyReviewerVerdicts([node], []);
+  assert.equal(applied.ok, false);
+  if (!applied.ok) assert.match(applied.reason, /omitted verdict for node api/);
+});
+
+test("grill: applyReviewerVerdicts rejects duplicate verdict", () => {
+  const node = makeNode({
+    id: "api",
+    question: "Which API?",
+    recommendation: "REST",
+    class: "interface-contract",
+  });
+  const applied = applyReviewerVerdicts(
+    [node],
+    [
+      { node_id: "api", verdict: "accept", reason: "first" },
+      { node_id: "api", verdict: "accept", reason: "second" },
+    ],
+  );
+  assert.equal(applied.ok, false);
+  if (!applied.ok) assert.match(applied.reason, /duplicate reviewer verdict for node api/);
+});
+
+test("grill: parse rejects resolved non-authority without reviewer-accept", () => {
+  const spec = "## Summary\nX\n";
+  const node = makeNode({
+    id: "api",
+    question: "Which API?",
+    recommendation: "REST",
+    class: "interface-contract",
+  });
+  node.resolution = "resolved";
+  const parsed = parseDecisionsArtifact(artifact([node], spec));
+  assert.equal(parsed.ok, false);
+  if (!parsed.ok) assert.match(parsed.reason, /reviewer-accept/);
+});
+
+test("grill: parse accepts resolved non-authority with reviewer-accept and eligibility reason", () => {
+  const spec = "## Summary\nX\n";
+  const node = makeNode({
+    id: "api",
+    question: "Which API?",
+    recommendation: "REST",
+    class: "interface-contract",
+  });
+  node.resolution = "resolved";
+  node.provenance = {
+    settled_by: "reviewer-accept",
+    reference: null,
+    reviewer_verdict: "accept",
+    reviewer_reason: "fine",
+    eligibility_reason: NON_AUTHORITY_ELIGIBILITY_REASON,
+  };
+  const parsed = parseDecisionsArtifact(artifact([node], spec));
+  assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
+});
+
 // ---------------------------------------------------------------------------
 // 2. CLI registry / help
 // ---------------------------------------------------------------------------
@@ -581,6 +658,65 @@ test("grill: implementer self-accept skips reviewer and writes nothing", async (
     });
     await runRefineSpecIssuePreview(42, deps);
     assert.equal(deps.reviewerPrompts.length, 0);
+    assert.equal(deps.writes.some((w) => w.startsWith("stdout:")), false);
+    assert.notEqual(process.exitCode, 0);
+  });
+});
+
+test("grill: implementer pre-resolved non-authority skips reviewer and writes nothing", async () => {
+  await withExit(async () => {
+    const deps = previewDeps({
+      implementerJson: JSON.stringify({
+        title: "T",
+        body: "## Summary\nX\n\n## User story\nAs a, / I want, / so that.\n\n## Acceptance criteria\n- [ ] a\n\n## Out of scope\n- b",
+        milestone: null,
+        nodes: [
+          {
+            id: "api",
+            question: "Which API?",
+            recommendation: "REST",
+            class: "interface-contract",
+            resolution: "resolved",
+            provenance: { settled_by: "none" },
+          },
+        ],
+      }),
+    });
+    await runRefineSpecIssuePreview(42, deps);
+    assert.equal(deps.reviewerPrompts.length, 0);
+    assert.equal(deps.writes.some((w) => w.startsWith("stdout:")), false);
+    assert.notEqual(process.exitCode, 0);
+  });
+});
+
+test("grill: omitted reviewer verdict for non-authority node fails preview", async () => {
+  await withExit(async () => {
+    const operator = canonicalThinIssueNodes();
+    const deps = previewDeps({
+      implementerJson: JSON.stringify({
+        title: "T",
+        body: "## Summary\nX\n\n## User story\nAs a, / I want, / so that.\n\n## Acceptance criteria\n- [ ] a\n\n## Out of scope\n- b",
+        milestone: null,
+        nodes: [
+          ...operator.map((n) => ({
+            id: n.id,
+            question: n.question,
+            recommendation: "rec",
+            class: n.class,
+          })),
+          {
+            id: "api",
+            question: "Which API?",
+            recommendation: "REST",
+            class: "interface-contract",
+          },
+        ],
+      }),
+      reviewerJson: JSON.stringify({
+        verdicts: operator.map((n) => ({ node_id: n.id, verdict: "accept", reason: "ok" })),
+      }),
+    });
+    await runRefineSpecIssuePreview(42, deps);
     assert.equal(deps.writes.some((w) => w.startsWith("stdout:")), false);
     assert.notEqual(process.exitCode, 0);
   });

@@ -32,7 +32,7 @@ Per-issue grill that looks up repository facts, records a versioned Decisions ar
 
 ### Requirement: Issue preview SHALL invoke the Implementer once then the Reviewer once on the Decisions artifact only
 
-Issue preview SHALL invoke the resolved Implementer exactly once with the active planning treatment from required repository `pipeline.yml`: `harnesses.implementer`, `models.planning`, and `effort.planning`, including `auto` routing. After a valid Implementer proposal, it SHALL invoke the resolved Reviewer exactly once. The Reviewer input SHALL be the proposed Decisions artifact plus the input fingerprint. The Reviewer SHALL NOT receive a second copy of the whole-repository prompt. The Implementer SHALL NOT mark its own nodes `accept` or `settled-by: reviewer-accept`. Harness failure, timeout, malformed output, capability refusal, unavailable facts, or input drift SHALL exit non-zero with no body or label mutation.
+Issue preview SHALL invoke the resolved Implementer exactly once with the active planning treatment from required repository `pipeline.yml`: `harnesses.implementer`, `models.planning`, and `effort.planning`, including `auto` routing. After a valid Implementer proposal, it SHALL invoke the resolved Reviewer exactly once. The Reviewer input SHALL be the proposed Decisions artifact plus the input fingerprint. The Reviewer SHALL NOT receive a second copy of the whole-repository prompt. The Implementer SHALL NOT mark its own nodes `accept`, `settled-by: reviewer-accept`, or `resolution: resolved`. Pipeline SHALL require an exact, unique Reviewer verdict for each Implementer-proposed node before it records `settled-by: reviewer-accept` or the taxonomy eligibility reason. An omitted or duplicate verdict SHALL fail closed. Harness failure, timeout, malformed output, capability refusal, unavailable facts, or input drift SHALL exit non-zero with no body or label mutation.
 
 #### Scenario: Two configured calls and no writes on success
 
@@ -49,6 +49,20 @@ Issue preview SHALL invoke the resolved Implementer exactly once with the active
 - **THEN** preview SHALL exit non-zero
 - **AND** the Reviewer SHALL NOT be invoked
 - **AND** the issue body SHALL be unchanged
+
+#### Scenario: Implementer cannot pre-resolve a non-authority node
+
+- **WHEN** the Implementer output marks a taxonomy-validated non-authority node `resolution: resolved` with `settled-by: none`
+- **THEN** preview SHALL exit non-zero
+- **AND** the Reviewer SHALL NOT be invoked
+- **AND** the issue body SHALL be unchanged
+
+#### Scenario: Omitted reviewer verdict fails closed
+
+- **WHEN** the Implementer proposes a node
+- **AND** the Reviewer omits a verdict for that node
+- **THEN** preview SHALL exit non-zero
+- **AND** SHALL NOT emit a proposal that records that node as resolved
 
 #### Scenario: Harness failure mutates nothing
 
@@ -176,7 +190,7 @@ Pipeline SHALL embed a versioned Pipeline-owned Decisions artifact in the issue 
 
 ### Requirement: Pipeline SHALL validate authority class against a closed taxonomy
 
-The model MAY propose a class. Pipeline SHALL accept a class only when it is a member of versioned closed taxonomy `grill-taxonomy.v1`. Operator-required members SHALL be: `scope`, `security`, `irreversible-operations`, `merge-release`, and `human-attestation`. Non-authority members SHALL be: `interface-contract`, `test-evidence`, `docs-surface`, and `operational-default`. An unknown or disputed class SHALL remain unresolved authority. Only taxonomy-validated non-authority nodes MAY take recommended defaults automatically, and the eligibility reason SHALL be recorded on the node. Non-authority automatic defaults SHALL NOT be applied without that taxonomy validation.
+The model MAY propose a class. Pipeline SHALL accept a class only when it is a member of versioned closed taxonomy `grill-taxonomy.v1`. Operator-required members SHALL be: `scope`, `security`, `irreversible-operations`, `merge-release`, and `human-attestation`. Non-authority members SHALL be: `interface-contract`, `test-evidence`, `docs-surface`, and `operational-default`. An unknown or disputed class SHALL remain unresolved authority. Only taxonomy-validated non-authority nodes MAY take recommended defaults automatically, and the eligibility reason SHALL be recorded on the node. Non-authority automatic defaults SHALL NOT be applied without that taxonomy validation. A resolved non-authority node SHALL record `settled-by: reviewer-accept` and the taxonomy eligibility reason. A resolved non-authority node that lacks that provenance SHALL fail validation.
 
 #### Scenario: Unknown class stays unresolved
 
@@ -189,6 +203,12 @@ The model MAY propose a class. Pipeline SHALL accept a class only when it is a m
 - **WHEN** a node has a taxonomy-validated non-authority class and a recommended default
 - **AND** the Reviewer returns `accept`
 - **THEN** apply SHALL write the body with that default and `settled-by: reviewer-accept`
+
+#### Scenario: Resolved non-authority without reviewer-accept fails closed
+
+- **WHEN** a Decisions artifact contains a taxonomy-validated non-authority node with `resolution: resolved` and `settled-by` other than `reviewer-accept`
+- **THEN** parse and `--stage ready` SHALL fail closed
+- **AND** SHALL NOT treat the node as an automatic default
 
 ---
 
