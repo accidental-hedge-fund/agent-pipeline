@@ -16,7 +16,18 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import yaml from "js-yaml";
 import { DEFAULT_CONFIG } from "../scripts/types.ts";
-import { findGitRoot, syncConfig, repoMapAdd, repoMapRemove, repoMapList, validateOwnerRepo } from "../scripts/config.ts";
+import {
+  findGitRoot,
+  syncConfig,
+  repoMapAdd,
+  repoMapRemove,
+  repoMapList,
+  validateOwnerRepo,
+  classifyMigrationModelAlias,
+  HARNESS_INFERENCE_ALIAS_TABLE_VERSION,
+  omittedHarnessRolesMessage,
+  missingPipelineYmlMessage,
+} from "../scripts/config.ts";
 import { resolveReviewerModelForHarness } from "../scripts/stage-routing.ts";
 
 const PIPELINE_SCRIPT = fileURLToPath(new URL("../scripts/pipeline.ts", import.meta.url));
@@ -74,7 +85,8 @@ test("resolveConfig: missing .github/pipeline.yml fails closed before gh, worktr
         err.message.includes("pipeline init") &&
         err.message.includes("harnesses.implementer") &&
         err.message.includes("harnesses.reviewer") &&
-        /does not select live workers/.test(err.message),
+        /does not select live workers/.test(err.message) &&
+        !err.message.includes("config sync"),
     );
   } finally {
     process.env.PATH = oldPath;
@@ -155,7 +167,8 @@ test("resolveConfig: missing harnesses block fails closed naming both keys (#124
       (err: Error) =>
         err.message.includes("harnesses.implementer") &&
         err.message.includes("harnesses.reviewer") &&
-        /does not fill live workers/.test(err.message),
+        /does not fill live workers/.test(err.message) &&
+        err.message.includes("pipeline config sync"),
     );
   } finally {
     process.env.PATH = oldPath;
@@ -173,6 +186,7 @@ test("resolveConfig: omitted implementer fails closed and does not take the prof
       (err: Error) =>
         err.message.includes("harnesses.implementer") &&
         /does not fill live workers/.test(err.message) &&
+        err.message.includes("pipeline config sync") &&
         !err.message.includes("does not declare the implementer"),
     );
   } finally {
@@ -257,6 +271,7 @@ test("resolveConfig: a partial harnesses block under claude does not resolve rev
       (err: Error) =>
         err.message.includes("harnesses.reviewer") &&
         /does not fill live workers/.test(err.message) &&
+        err.message.includes("pipeline config sync") &&
         !/reviewer.*codex/.test(err.message),
     );
   } finally {
@@ -1517,7 +1532,9 @@ test("resolveConfig: review_harness without harnesses.reviewer fails closed (#12
     assert.throws(
       () => cfgMod.resolveConfig({ repoPath: repo }),
       (err: Error) =>
-        err.message.includes("harnesses.reviewer") && /does not fill live workers/.test(err.message),
+        err.message.includes("harnesses.reviewer") &&
+        /does not fill live workers/.test(err.message) &&
+        err.message.includes("pipeline config sync"),
     );
   } finally {
     process.env.PATH = oldPath;
@@ -2882,6 +2899,7 @@ test("syncConfig: missing config directs the user to run init", () => {
   assert.equal(result.changed, false);
   assert.equal(result.applied, false);
   assert.match(result.diagnostics[0]?.message ?? "", /pipeline init/);
+  assert.doesNotMatch(result.diagnostics[0]?.message ?? "", /config sync/);
 });
 
 test("syncConfig: omits inventing a missing live reviewer from the profile (#1240)", () => {
@@ -2889,14 +2907,354 @@ test("syncConfig: omits inventing a missing live reviewer from the profile (#124
   const repo = makeFakeRepo(original, { exact: true });
   const configPath = path.join(repo, ".github", "pipeline.yml");
 
-  const result = syncConfig(repo, { apply: true });
+  const result = syncConfig(repo, { apply: true }, { profile: "claude", harnesses: { implementer: "claude", reviewer: "codex" } });
   const onDisk = fs.readFileSync(configPath, "utf8");
 
   assert.equal(result.ok, false);
   assert.equal(result.applied, false);
+  assert.equal(result.inferenceFailure, true);
   assert.equal(onDisk, original, "partial harnesses block must not be rewritten with a profile reviewer");
   assert.match(result.diagnostics.map((d) => d.message).join("\n"), /harnesses\.reviewer/);
   assert.doesNotMatch(onDisk, /reviewer: claude/);
+  assert.doesNotMatch(onDisk, /reviewer: codex/);
+});
+
+// ---------------------------------------------------------------------------
+// #1264: config sync infers omitted harness roles from explicit models
+// ---------------------------------------------------------------------------
+
+test("omitted-role diagnostic names pipeline config sync; missing-file names pipeline init only (#1264)", () => {
+  const omitted = omittedHarnessRolesMessage(["harnesses.implementer", "harnesses.reviewer"]);
+  assert.match(omitted, /harnesses\.implementer/);
+  assert.match(omitted, /harnesses\.reviewer/);
+  assert.match(omitted, /pipeline config sync/);
+  const missing = missingPipelineYmlMessage("/repo/.github/pipeline.yml");
+  assert.match(missing, /pipeline init/);
+  assert.doesNotMatch(missing, /config sync/);
+});
+
+test("classifyMigrationModelAlias: closed table classifies Claude/Grok/gpt and rejects auto/unknown/OpenCode/Pi (#1264)", () => {
+  assert.equal(HARNESS_INFERENCE_ALIAS_TABLE_VERSION, 1);
+  assert.equal(classifyMigrationModelAlias("sonnet"), "claude");
+  assert.equal(classifyMigrationModelAlias("claude-fable-5"), "claude");
+  assert.equal(classifyMigrationModelAlias("opus"), "claude");
+  assert.equal(classifyMigrationModelAlias("haiku"), "claude");
+  assert.equal(classifyMigrationModelAlias("grok-4.6"), "grok");
+  assert.equal(classifyMigrationModelAlias("gpt-5.6-terra"), "codex");
+  assert.equal(classifyMigrationModelAlias("auto"), null);
+  assert.equal(classifyMigrationModelAlias("mystery-model"), null);
+  assert.equal(classifyMigrationModelAlias("opencode"), null);
+  assert.equal(classifyMigrationModelAlias("pi"), null);
+  assert.equal(classifyMigrationModelAlias("my-extension"), null);
+  assert.equal(classifyMigrationModelAlias("claude"), null, "bare claude is a command, not a model alias");
+});
+
+test("syncConfig: omitted harnesses block with unambiguous models proceeds and apply writes inferred roles (#1264)", () => {
+  const original = `base_branch: staging
+# keep this operator comment
+models:
+  planning: sonnet
+  implementing: sonnet
+  fix: sonnet
+  review: gpt-5.6-terra
+`;
+  const repo = makeFakeRepo(original, { exact: true });
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+
+  const preview = syncConfig(repo);
+  assert.equal(preview.ok, true, `diagnostics: ${JSON.stringify(preview.diagnostics)}`);
+  assert.equal(preview.applied, false);
+  assert.equal(fs.readFileSync(configPath, "utf8"), original);
+  assert.match(preview.candidate ?? "", /implementer:\s*claude/);
+  assert.match(preview.candidate ?? "", /reviewer:\s*codex/);
+
+  const applied = syncConfig(repo, { apply: true });
+  const synced = fs.readFileSync(configPath, "utf8");
+  assert.equal(applied.ok, true, `diagnostics: ${JSON.stringify(applied.diagnostics)}`);
+  assert.equal(applied.applied, true);
+  const loaded = yaml.load(synced) as { harnesses: { implementer: string; reviewer: string }; models: unknown; base_branch: string };
+  assert.equal(loaded.harnesses.implementer, "claude");
+  assert.equal(loaded.harnesses.reviewer, "codex");
+  assert.equal(loaded.base_branch, "staging");
+  assert.ok(synced.includes("# keep this operator comment"));
+  assert.ok(synced.startsWith("base_branch: staging\n# keep this operator comment"), "existing prefix must stay byte-identical");
+});
+
+test("syncConfig: grok implementer alias infers grok + gpt review infers codex (#1264)", () => {
+  const original = `models:
+  planning: grok-4.6
+  review: gpt-5.6-terra
+`;
+  const repo = makeFakeRepo(original, { exact: true });
+  const result = syncConfig(repo, { apply: true });
+  const synced = fs.readFileSync(path.join(repo, ".github", "pipeline.yml"), "utf8");
+  assert.equal(result.ok, true, `diagnostics: ${JSON.stringify(result.diagnostics)}`);
+  const loaded = yaml.load(synced) as { harnesses: { implementer: string; reviewer: string } };
+  assert.equal(loaded.harnesses.implementer, "grok");
+  assert.equal(loaded.harnesses.reviewer, "codex");
+});
+
+test("syncConfig: auto/unknown/OpenCode/Pi models do not infer and do not fill from profile (#1264)", () => {
+  const cases = [
+    "models:\n  planning: auto\n  review: auto\n",
+    "base_branch: main\n",
+    "models:\n  planning: opencode\n  review: gpt-5.6-terra\n",
+    "models:\n  planning: pi\n  review: gpt-5.6-terra\n",
+    "models:\n  planning: mystery-model\n  review: gpt-5.6-terra\n",
+  ];
+  for (const original of cases) {
+    const repo = makeFakeRepo(original, { exact: true });
+    const configPath = path.join(repo, ".github", "pipeline.yml");
+    const result = syncConfig(repo, { apply: true }, { profile: "claude", harnesses: { implementer: "claude", reviewer: "codex" } });
+    assert.equal(result.ok, false, original);
+    assert.equal(result.inferenceFailure, true, original);
+    assert.equal(fs.readFileSync(configPath, "utf8"), original, original);
+    assert.doesNotMatch(fs.readFileSync(configPath, "utf8"), /implementer: claude/);
+  }
+});
+
+test("syncConfig: unknown key still blocks sync and writes nothing (#1264)", () => {
+  const original = "unknown_key: bad\nmodels:\n  planning: sonnet\n  review: gpt-5.6-terra\n";
+  const repo = makeFakeRepo(original, { exact: true });
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+  const result = syncConfig(repo, { apply: true });
+  assert.equal(result.ok, false);
+  assert.equal(result.inferenceFailure, undefined);
+  assert.equal(fs.readFileSync(configPath, "utf8"), original);
+  assert.ok(result.diagnostics.some((d) => d.path === "unknown_key"));
+});
+
+test("syncConfig: invalid YAML still blocks sync and writes nothing (#1264)", () => {
+  const original = ":\n  - not yaml\n";
+  const repo = makeFakeRepo(original, { exact: true });
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+  const result = syncConfig(repo, { apply: true });
+  assert.equal(result.ok, false);
+  assert.notEqual(result.inferenceFailure, true);
+  assert.equal(fs.readFileSync(configPath, "utf8"), original);
+});
+
+test("syncConfig: empty-string role and unknown key inside harnesses still write nothing (#1264)", () => {
+  const emptyRole = "harnesses:\n  implementer: \"\"\n  reviewer: codex\nmodels:\n  review: gpt-5.6-terra\n";
+  const unknownInside = "harnesses:\n  implementer: grok\n  reviewer: codex\n  extra: no\n";
+  for (const original of [emptyRole, unknownInside]) {
+    const repo = makeFakeRepo(original, { exact: true });
+    const configPath = path.join(repo, ".github", "pipeline.yml");
+    const result = syncConfig(repo, { apply: true });
+    assert.equal(result.ok, false, original);
+    assert.notEqual(result.inferenceFailure, true, original);
+    assert.equal(fs.readFileSync(configPath, "utf8"), original);
+  }
+});
+
+test("syncConfig: one classified implementer field is enough (#1264)", () => {
+  const original = `models:
+  planning: grok-4.6
+  review: gpt-5.6-terra
+`;
+  const repo = makeFakeRepo(original, { exact: true });
+  const result = syncConfig(repo, { apply: true });
+  const loaded = yaml.load(fs.readFileSync(path.join(repo, ".github", "pipeline.yml"), "utf8")) as {
+    harnesses: { implementer: string };
+  };
+  assert.equal(result.ok, true, `diagnostics: ${JSON.stringify(result.diagnostics)}`);
+  assert.equal(loaded.harnesses.implementer, "grok");
+});
+
+test("syncConfig: conflicting implementer models leave implementer unresolved (#1264)", () => {
+  const original = `models:
+  planning: sonnet
+  implementing: grok-4.6
+  review: gpt-5.6-terra
+`;
+  const repo = makeFakeRepo(original, { exact: true });
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+  const result = syncConfig(repo, { apply: true });
+  assert.equal(result.ok, false);
+  assert.equal(result.inferenceFailure, true);
+  assert.match(result.diagnostics.map((d) => d.message).join("\n"), /harnesses\.implementer/);
+  assert.equal(fs.readFileSync(configPath, "utf8"), original);
+});
+
+test("syncConfig: unknown sibling blocks implementer inference (#1264)", () => {
+  const original = `models:
+  planning: sonnet
+  fix: mystery-model
+  review: gpt-5.6-terra
+`;
+  const repo = makeFakeRepo(original, { exact: true });
+  const result = syncConfig(repo, { apply: true });
+  assert.equal(result.ok, false);
+  assert.equal(result.inferenceFailure, true);
+  assert.match(result.diagnostics.map((d) => d.message).join("\n"), /harnesses\.implementer/);
+});
+
+test("syncConfig: review_harness built-in command infers that reviewer (#1264)", () => {
+  const original = `models:
+  planning: sonnet
+review_harness:
+  command: codex
+`;
+  const repo = makeFakeRepo(original, { exact: true });
+  const result = syncConfig(repo, { apply: true });
+  const loaded = yaml.load(fs.readFileSync(path.join(repo, ".github", "pipeline.yml"), "utf8")) as {
+    harnesses: { implementer: string; reviewer: string };
+  };
+  assert.equal(result.ok, true, `diagnostics: ${JSON.stringify(result.diagnostics)}`);
+  assert.equal(loaded.harnesses.implementer, "claude");
+  assert.equal(loaded.harnesses.reviewer, "codex");
+});
+
+test("syncConfig: custom review_harness.command without classified review model satisfies reviewer (#1264)", () => {
+  const original = `models:
+  planning: sonnet
+review_harness: my-reviewer
+`;
+  const repo = makeFakeRepo(original, { exact: true });
+  const result = syncConfig(repo, { apply: true });
+  const loaded = yaml.load(fs.readFileSync(path.join(repo, ".github", "pipeline.yml"), "utf8")) as {
+    harnesses: { reviewer: string };
+  };
+  assert.equal(result.ok, true, `diagnostics: ${JSON.stringify(result.diagnostics)}`);
+  assert.equal(loaded.harnesses.reviewer, "my-reviewer");
+});
+
+test("syncConfig: custom command plus classified review model is unresolved (#1264)", () => {
+  const original = `models:
+  planning: sonnet
+  review: sonnet
+review_harness: my-reviewer
+`;
+  const repo = makeFakeRepo(original, { exact: true });
+  const result = syncConfig(repo, { apply: true });
+  assert.equal(result.ok, false);
+  assert.equal(result.inferenceFailure, true);
+  assert.match(result.diagnostics.map((d) => d.message).join("\n"), /harnesses\.reviewer/);
+  assert.equal(fs.readFileSync(path.join(repo, ".github", "pipeline.yml"), "utf8"), original);
+});
+
+test("syncConfig: built-in command disagrees with review model (#1264)", () => {
+  const original = `models:
+  planning: sonnet
+  review: sonnet
+review_harness:
+  command: codex
+`;
+  const repo = makeFakeRepo(original, { exact: true });
+  const result = syncConfig(repo, { apply: true });
+  assert.equal(result.ok, false);
+  assert.equal(result.inferenceFailure, true);
+  assert.match(result.diagnostics.map((d) => d.message).join("\n"), /harnesses\.reviewer/);
+});
+
+test("syncConfig: declared implementer is kept while reviewer is inferred (#1264)", () => {
+  const original = `harnesses:
+  implementer: grok
+models:
+  planning: sonnet
+  review: gpt-5.6-terra
+`;
+  const repo = makeFakeRepo(original, { exact: true });
+  const result = syncConfig(repo, { apply: true });
+  const loaded = yaml.load(fs.readFileSync(path.join(repo, ".github", "pipeline.yml"), "utf8")) as {
+    harnesses: { implementer: string; reviewer: string };
+  };
+  assert.equal(result.ok, true, `diagnostics: ${JSON.stringify(result.diagnostics)}`);
+  assert.equal(loaded.harnesses.implementer, "grok");
+  assert.equal(loaded.harnesses.reviewer, "codex");
+});
+
+test("syncConfig: complete pair is not rewritten by inference (#1264)", () => {
+  const original = `harnesses:
+  implementer: grok
+  reviewer: claude
+models:
+  planning: sonnet
+  review: gpt-5.6-terra
+`;
+  const repo = makeFakeRepo(original, { exact: true });
+  const result = syncConfig(repo, { apply: true });
+  const synced = fs.readFileSync(path.join(repo, ".github", "pipeline.yml"), "utf8");
+  const loaded = yaml.load(synced) as { harnesses: { implementer: string; reviewer: string } };
+  assert.equal(result.ok, true, `diagnostics: ${JSON.stringify(result.diagnostics)}`);
+  assert.equal(loaded.harnesses.implementer, "grok");
+  assert.equal(loaded.harnesses.reviewer, "claude");
+});
+
+test("syncConfig: commented harnesses block is omitted policy (#1264)", () => {
+  const original = `# harnesses:
+#   implementer: claude
+#   reviewer: claude
+models:
+  planning: grok-4.6
+  review: gpt-5.6-terra
+`;
+  const repo = makeFakeRepo(original, { exact: true });
+  const result = syncConfig(repo, { apply: true });
+  const synced = fs.readFileSync(path.join(repo, ".github", "pipeline.yml"), "utf8");
+  const loaded = yaml.load(synced) as { harnesses: { implementer: string; reviewer: string } };
+  assert.equal(result.ok, true, `diagnostics: ${JSON.stringify(result.diagnostics)}`);
+  assert.equal(loaded.harnesses.implementer, "grok");
+  assert.equal(loaded.harnesses.reviewer, "codex");
+});
+
+test("CLI: config sync preview of inferred harnesses exits 0 and writes nothing (#1264)", () => {
+  const original = `models:
+  planning: sonnet
+  implementing: sonnet
+  fix: sonnet
+  review: gpt-5.6-terra
+`;
+  const repo = makeFakeRepo(original, { exact: true });
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "config", "sync", "--repo-path", repo],
+    { encoding: "utf8" },
+  );
+  assert.equal(result.status, 0, `stderr:\n${result.stderr}\nstdout:\n${result.stdout}`);
+  assert.match(result.stdout, /implementer: claude/);
+  assert.match(result.stdout, /reviewer: codex/);
+  assert.equal(fs.readFileSync(configPath, "utf8"), original);
+});
+
+test("CLI: failed inference exits 2 and names unresolved roles (#1264)", () => {
+  const original = `models:
+  planning: sonnet
+  implementing: grok-4.6
+`;
+  const repo = makeFakeRepo(original, { exact: true });
+  const configPath = path.join(repo, ".github", "pipeline.yml");
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "config", "sync", "--apply", "--repo-path", repo],
+    { encoding: "utf8" },
+  );
+  assert.equal(result.status, 2, `stderr:\n${result.stderr}\nstdout:\n${result.stdout}`);
+  assert.match(result.stdout, /harnesses\.implementer/);
+  assert.match(result.stdout, /harnesses\.reviewer/);
+  assert.equal(fs.readFileSync(configPath, "utf8"), original);
+});
+
+test("CLI: unknown-key sync block stays at exit 1 (#1264)", () => {
+  const original = "unknown_key: bad\n";
+  const repo = makeFakeRepo(original, { exact: true });
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "config", "sync", "--apply", "--repo-path", repo],
+    { encoding: "utf8" },
+  );
+  assert.equal(result.status, 1, `stderr:\n${result.stderr}\nstdout:\n${result.stdout}`);
+});
+
+test("this repository's pipeline.yml declares uncommented harness roles (#1264)", () => {
+  const live = fs.readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", ".github", "pipeline.yml"),
+    "utf8",
+  );
+  assert.match(live, /^harnesses:\s*$/m);
+  assert.match(live, /^  implementer:\s+\S+/m);
+  assert.match(live, /^  reviewer:\s+\S+/m);
 });
 
 test("syncConfig: newline scalar overrides survive sync untouched as valid inline YAML", () => {
