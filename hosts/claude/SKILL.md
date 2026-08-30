@@ -224,8 +224,10 @@ additive — a normal `/pipeline N` run still self-creates any missing labels, s
 `config sync` also takes no number. It refreshes an existing
 `.github/pipeline.yml` against the current init scaffold while preserving
 effective configured behavior. Preview is the default and prints a diff without
-writing; `--apply` writes only after the existing file and rendered candidate
-both validate.
+writing; `--apply` writes only after the candidate validates. When the file's
+only errors are omitted `harnesses.implementer` and/or `harnesses.reviewer`,
+sync infers those roles from explicit `models:` (and `review_harness.command`
+when present). It never fills a role from the active profile.
 
 `config repo-map <add|remove|list>` also takes no number. `add`/`remove` mutate
 only the `repo_map` block of `.github/pipeline.yml` (all other keys, comments,
@@ -671,7 +673,7 @@ domain_name: lyric-utils
 domain_description: a quantitative finance Python library
 ```
 
-A runnable repository must commit `.github/pipeline.yml` with both live harness roles. Other omitted keys use `core/scripts/types.ts:DEFAULT_CONFIG`. The invoking host's profile does not select live workers. A missing file, missing `harnesses` block, or either missing role fails before any worktree, GitHub mutation, or harness spawn. `pipeline init` writes both keys as starter repository policy (copied from the active profile).
+A runnable repository must commit `.github/pipeline.yml` with both live harness roles. Other omitted keys use `core/scripts/types.ts:DEFAULT_CONFIG`. The invoking host's profile does not select live workers. A missing file, missing `harnesses` block, or either missing role fails before any worktree, GitHub mutation, or harness spawn. `pipeline init` writes both keys as starter repository policy (copied from the active profile). A missing file still needs `pipeline init`. An existing file that omits a required role can be migrated with `pipeline config sync`.
 
 ```yaml
 harnesses:

@@ -1444,8 +1444,22 @@ export function omittedHarnessRoleKeys(
 export function omittedHarnessRolesMessage(missing: string[]): string {
   return (
     `${missing.join(" and ")} ${missing.length === 1 ? "is" : "are"} required repository execution policy. ` +
-    ACTIVE_PROFILE_DOES_NOT_FILL_LIVE_WORKERS
+    ACTIVE_PROFILE_DOES_NOT_FILL_LIVE_WORKERS +
+    " Run `pipeline config sync` to add omitted roles from explicit models."
   );
+}
+
+/** True when a diagnostic is the omitted-required-harness-role class (#1264). */
+export function isOmittedHarnessRoleDiagnostic(d: {
+  severity: string;
+  path: string;
+  message: string;
+}): boolean {
+  if (d.severity !== "error") return false;
+  if (d.path !== "harnesses" && d.path !== "harnesses.implementer" && d.path !== "harnesses.reviewer") {
+    return false;
+  }
+  return d.message.includes("required repository execution policy");
 }
 
 export function missingPipelineYmlMessage(configPath: string): string {
@@ -2959,6 +2973,8 @@ export interface SyncConfigResult {
   candidate?: string;
   diff?: string;
   diagnostics: Diagnostic[];
+  /** True when sync refused because omitted harness roles could not be inferred (#1264). CLI exits 2. */
+  inferenceFailure?: boolean;
 }
 
 const defaultReadFile = (fp: string): string | null => {
@@ -4351,6 +4367,7 @@ function normalizeForSync(config: PartialConfig): unknown {
     staged_policies: config.staged_policies,
     repository_control_desired_state: config.repository_control_desired_state,
     git: config.git,
+    harnesses: config.harnesses,
   };
 }
 
@@ -4417,6 +4434,180 @@ function splitTopLevelBlocks(text: string): Map<string, string> {
   }
   flush();
   return blocks;
+}
+
+/** Closed, versioned, migration-only alias table for `config sync` (#1264). */
+export const HARNESS_INFERENCE_ALIAS_TABLE_VERSION = 1 as const;
+
+const IMPLEMENTER_MODEL_KEYS = ["planning", "implementing", "fix", "intake", "sweep"] as const;
+const BUILTIN_REVIEWER_COMMANDS = new Set(["claude", "codex", "grok"]);
+
+export type HarnessInferenceAdapter = "claude" | "codex" | "grok";
+
+/**
+ * Classify an explicit model alias through the migration-only table.
+ * Never consults the host profile or runtime family detectors.
+ */
+export function classifyMigrationModelAlias(raw: string): HarnessInferenceAdapter | null {
+  const value = raw.trim();
+  if (!value || value === "auto") return null;
+  if (value === "sonnet" || value === "opus" || value === "haiku" || value === "claude-fable-5") {
+    return "claude";
+  }
+  if (value.startsWith("claude-")) return "claude";
+  if (value.startsWith("grok-")) return "grok";
+  if (value.startsWith("gpt-")) return "codex";
+  return null;
+}
+
+function classifyExplicitNonAutoAlias(raw: string | undefined): {
+  skip: boolean;
+  family?: HarnessInferenceAdapter;
+  unknown: boolean;
+} {
+  if (raw === undefined) return { skip: true, unknown: false };
+  const value = raw.trim();
+  // Empty/whitespace is explicit unknown evidence, not an absent field.
+  if (value === "auto") return { skip: true, unknown: false };
+  const family = classifyMigrationModelAlias(value);
+  if (family === null) return { skip: false, unknown: true };
+  return { skip: false, family, unknown: false };
+}
+
+function unanimousClassifiedFamily(
+  values: Array<string | undefined>,
+): { family?: HarnessInferenceAdapter; unresolved: boolean } {
+  const classified: HarnessInferenceAdapter[] = [];
+  for (const raw of values) {
+    const result = classifyExplicitNonAutoAlias(raw);
+    if (result.skip) continue;
+    if (result.unknown || result.family === undefined) return { unresolved: true };
+    classified.push(result.family);
+  }
+  if (classified.length === 0) return { unresolved: true };
+  const unique = new Set(classified);
+  if (unique.size !== 1) return { unresolved: true };
+  return { family: classified[0], unresolved: false };
+}
+
+function reviewHarnessCommandOf(config: PartialConfig): string | undefined {
+  const rh = config.review_harness;
+  if (typeof rh === "string") {
+    const trimmed = rh.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+  }
+  if (rh && typeof rh === "object" && typeof rh.command === "string") {
+    const trimmed = rh.command.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+  }
+  return undefined;
+}
+
+function reviewHarnessModelOf(config: PartialConfig): string | undefined {
+  const rh = config.review_harness;
+  if (rh && typeof rh === "object" && typeof rh.model === "string") return rh.model;
+  return undefined;
+}
+
+function inferImplementerAdapter(config: PartialConfig): string | undefined {
+  const models = config.models;
+  const result = unanimousClassifiedFamily(IMPLEMENTER_MODEL_KEYS.map((key) => models?.[key]));
+  return result.unresolved ? undefined : result.family;
+}
+
+function inferReviewerRole(config: PartialConfig): string | undefined {
+  const classified: HarnessInferenceAdapter[] = [];
+  for (const raw of [config.models?.review, reviewHarnessModelOf(config)]) {
+    const result = classifyExplicitNonAutoAlias(raw);
+    if (result.skip) continue;
+    if (result.unknown || result.family === undefined) return undefined;
+    classified.push(result.family);
+  }
+  if (new Set(classified).size > 1) return undefined;
+  const modelFamily = classified[0];
+
+  const command = reviewHarnessCommandOf(config);
+  if (command !== undefined) {
+    if (BUILTIN_REVIEWER_COMMANDS.has(command)) {
+      if (modelFamily !== undefined && modelFamily !== command) return undefined;
+      return command;
+    }
+    if (modelFamily !== undefined) return undefined;
+    return command;
+  }
+  return modelFamily;
+}
+
+export function unresolvedHarnessInferenceMessage(unresolved: string[]): string {
+  return (
+    `Could not infer ${unresolved.join(" and ")} from explicit models: / review_harness evidence. ` +
+    `Set ${unresolved.join(" and ")} in .github/pipeline.yml. ` +
+    `Inference never fills a role from the active profile.`
+  );
+}
+
+/**
+ * Infer omitted required harness roles from explicit models / review_harness.
+ * Declared non-empty roles are preserved. Does not read the host profile.
+ */
+export function inferOmittedHarnessRoles(config: PartialConfig): {
+  implementer?: string;
+  reviewer?: string;
+  unresolved: string[];
+} {
+  const implementer =
+    config.harnesses?.implementer !== undefined
+      ? config.harnesses.implementer
+      : inferImplementerAdapter(config);
+  const reviewer =
+    config.harnesses?.reviewer !== undefined ? config.harnesses.reviewer : inferReviewerRole(config);
+  const unresolved: string[] = [];
+  if (implementer === undefined) unresolved.push("harnesses.implementer");
+  if (reviewer === undefined) unresolved.push("harnesses.reviewer");
+  return { implementer, reviewer, unresolved };
+}
+
+function tryParseValidPartialConfig(text: string): PartialConfig | null {
+  try {
+    return parseValidPartialConfig(text);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Rewrite the named top-level YAML block (active or commented) in place, or
+ * append it when the key is absent. Other top-level blocks stay byte-identical.
+ */
+function replaceOrAppendTopLevelBlock(text: string, key: string, newBlock: string): string {
+  const block = newBlock.replace(/\n+$/, "");
+  const lines = text.split("\n");
+  let start = -1;
+  let end = lines.length;
+  for (let i = 0; i < lines.length; i++) {
+    const k = topLevelKeyOf(lines[i]!);
+    if (start === -1) {
+      if (k === key) start = i;
+    } else if (k !== null) {
+      end = i;
+      break;
+    }
+  }
+  if (start === -1) {
+    const trimmed = text.trimEnd();
+    return trimmed.length === 0 ? `${block}\n` : `${trimmed}\n\n${block}\n`;
+  }
+  while (end > start && (lines[end - 1] ?? "").trim() === "") end--;
+  const beforeText = start === 0 ? "" : `${lines.slice(0, start).join("\n")}\n`;
+  const afterLines = lines.slice(end);
+  while (afterLines.length > 0 && (afterLines[0] ?? "").trim() === "") afterLines.shift();
+  const afterText = afterLines.join("\n").replace(/^\n+/, "");
+  let result = `${beforeText}${block}`;
+  if (afterText.replace(/\n+$/, "").length > 0) {
+    result += `\n\n${afterText.replace(/^\n+/, "")}`;
+  }
+  if (!result.endsWith("\n")) result += "\n";
+  return result;
 }
 
 /**
@@ -4488,11 +4679,44 @@ export function syncConfig(
 
   const validation = validateConfig(gitRoot, deps);
   const blocking = validation.diagnostics.filter((d) => d.severity === "error");
-  if (blocking.length > 0) {
+  const parsedExisting = tryParseValidPartialConfig(current);
+  const omittedRoleOnly =
+    blocking.length > 0 &&
+    blocking.every(isOmittedHarnessRoleDiagnostic) &&
+    parsedExisting !== null;
+
+  let parsed = parsedExisting;
+  let inferredHarnessRoles = false;
+  if (omittedRoleOnly) {
+    const inference = inferOmittedHarnessRoles(parsedExisting);
+    if (inference.unresolved.length > 0 || inference.implementer === undefined || inference.reviewer === undefined) {
+      return {
+        ok: false,
+        changed: false,
+        applied: false,
+        inferenceFailure: true,
+        configPath,
+        diagnostics: [
+          {
+            severity: "error",
+            path: inference.unresolved.length === 1 ? inference.unresolved[0]! : "harnesses",
+            message: unresolvedHarnessInferenceMessage(inference.unresolved),
+          },
+        ],
+      };
+    }
+    parsed = {
+      ...parsedExisting,
+      harnesses: {
+        implementer: inference.implementer,
+        reviewer: inference.reviewer,
+      },
+    };
+    inferredHarnessRoles = true;
+  } else if (blocking.length > 0) {
     return { ok: false, changed: false, applied: false, configPath, diagnostics: validation.diagnostics };
   }
 
-  const parsed = parseValidPartialConfig(current);
   if (!parsed) {
     return { ok: false, changed: false, applied: false, configPath, diagnostics: validation.diagnostics };
   }
@@ -4537,7 +4761,14 @@ export function syncConfig(
     }
   }
 
-  const candidate = buildSyncCandidate(current, freshRender);
+  let mergeBase = current;
+  if (inferredHarnessRoles) {
+    const harnessesBlock = splitTopLevelBlocks(freshRender).get("harnesses");
+    if (harnessesBlock) {
+      mergeBase = replaceOrAppendTopLevelBlock(current, "harnesses", harnessesBlock);
+    }
+  }
+  const candidate = buildSyncCandidate(mergeBase, freshRender);
   const candidateValidation = validateConfig(gitRoot, {
     ...deps,
     readFile: (p) => (path.resolve(p) === path.resolve(configPath) ? candidate : readFileFn(p)),
