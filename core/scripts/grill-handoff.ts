@@ -14,6 +14,8 @@ import {
 } from "./grill-decisions.ts";
 import {
   issueGrillFrontier,
+  liveMatchesGrillFrontier,
+  loadVerifiedGrillFrontier,
   persistGrillFrontier,
 } from "./grill-frontier.ts";
 import {
@@ -406,6 +408,15 @@ export interface GrillMaterializeDeps {
   keyDeps?: GrillProposalKeyDeps;
   frontierKey?: string;
   now?: () => Date;
+  /**
+   * Host-local domain+issue lock for the grill-answer transaction.
+   * Production uses `withLock` from `lock.ts`. Tests inject a fake.
+   */
+  withIssueLock?: <T>(
+    domain: string,
+    issueNumber: number,
+    fn: () => Promise<T>,
+  ) => Promise<T>;
 }
 
 export type GrillMaterializeResult =
@@ -574,7 +585,78 @@ function persistPlannedFrontier(
   }
 }
 
+/**
+ * Persist `planned` only when it still matches the live body. If a sibling
+ * (or other writer) already advanced the live body and persisted a matching
+ * frontier, keep that frontier instead of replacing it with a stale one.
+ */
+async function commitGrillFrontier(
+  handoff: HumanQuestionHandoff,
+  planned: { body: string; artifact: DecisionsArtifact },
+  deps: GrillMaterializeDeps,
+): Promise<GrillMaterializeResult | null> {
+  if (!deps.repoDir || !deps.frontierKey) return null;
+  let liveNow: string;
+  try {
+    liveNow = await deps.getIssueBody(handoff.issue_number);
+  } catch (err) {
+    return {
+      ok: false,
+      reason: `live body re-read failed: ${(err as Error).message}`,
+      code: "write_failed",
+    };
+  }
+  const liveHash = hexDigest(sha256Prefixed(liveNow));
+  const plannedHash = hexDigest(sha256Prefixed(planned.body));
+  if (liveHash !== plannedHash) {
+    const parsed = parseDecisionsFromBody(liveNow);
+    if (!parsed.ok) {
+      return { ok: false, reason: parsed.reason, code: "invalid_artifact" };
+    }
+    const parsedDecl = parseGrillDeclaration(handoff.declaration_identity ?? "");
+    const node = parsedDecl
+      ? parsed.artifact.nodes.find((n) => n.id === parsedDecl.nodeId)
+      : undefined;
+    const ours =
+      node != null &&
+      node.resolution === "resolved" &&
+      node.provenance.reference === `handoff:${handoff.handoff_id}`;
+    const existing = loadVerifiedGrillFrontier(
+      deps.repoDir,
+      handoff.issue_number,
+      deps.frontierKey,
+      handoff.repo,
+      deps.keyDeps ?? defaultGrillProposalKeyDeps,
+    );
+    if (
+      ours &&
+      existing &&
+      liveMatchesGrillFrontier(liveNow, parsed.artifact.nodes, existing).ok
+    ) {
+      return { ok: true, body: liveNow, wrote: false, artifact: parsed.artifact };
+    }
+    return {
+      ok: false,
+      reason: "live issue body advanced past this grill-answer frontier",
+      code: "body_hash_drift",
+    };
+  }
+  return persistPlannedFrontier(handoff, planned, deps);
+}
+
 export async function materializeGrillAnswer(
+  handoff: HumanQuestionHandoff,
+  answerText: string,
+  deps: GrillMaterializeDeps,
+): Promise<GrillMaterializeResult> {
+  const run = () => materializeGrillAnswerUnlocked(handoff, answerText, deps);
+  if (deps.withIssueLock) {
+    return deps.withIssueLock(handoff.domain, handoff.issue_number, run);
+  }
+  return run();
+}
+
+async function materializeGrillAnswerUnlocked(
   handoff: HumanQuestionHandoff,
   answerText: string,
   deps: GrillMaterializeDeps,
@@ -602,8 +684,8 @@ export async function materializeGrillAnswer(
         };
       }
     }
-    const frontierErr = persistPlannedFrontier(handoff, healed, deps);
-    if (frontierErr) return frontierErr;
+    const frontierOut = await commitGrillFrontier(handoff, healed, deps);
+    if (frontierOut) return frontierOut;
     return healed;
   }
   if (planned.wrote) {
@@ -649,8 +731,8 @@ export async function materializeGrillAnswer(
         code: "write_failed",
       };
     }
-    const frontierErr = persistPlannedFrontier(handoff, planned, deps);
-    if (frontierErr) return frontierErr;
+    const frontierOut = await commitGrillFrontier(handoff, planned, deps);
+    if (frontierOut) return frontierOut;
   }
   return planned;
 }

@@ -1545,6 +1545,15 @@ export interface GrillAnswerMaterializeHook {
     | { ok: true; wrote: boolean }
     | { ok: false; reason: string; code: string }
   >;
+  /**
+   * When set, a grill-authority answer runs apply + materialize + ledger save
+   * under this lock. Production uses the host-local domain+issue `withLock`.
+   */
+  withIssueLock?: <T>(
+    domain: string,
+    issueNumber: number,
+    fn: () => Promise<T>,
+  ) => Promise<T>;
 }
 
 export async function answerAndPersistHandoff(
@@ -1593,7 +1602,50 @@ export async function answerAndPersistHandoff(
       code: "not_found",
     };
   }
-  const result = await applyHandoffAnswer({ ...input, handoff: loaded.handoff });
+  const grillBound =
+    typeof loaded.handoff.declaration_identity === "string" &&
+    loaded.handoff.declaration_identity.startsWith("grill-v1:");
+  const execute = () =>
+    persistGrillAnswerAfterLoad(
+      repoDir,
+      issueNumber,
+      handoffId,
+      input,
+      deps,
+      grillMaterialize,
+      loaded.handoff,
+      grillBound,
+    );
+  if (grillBound && input.decision === "answer" && grillMaterialize?.withIssueLock) {
+    try {
+      return await grillMaterialize.withIssueLock(
+        loaded.handoff.domain,
+        loaded.handoff.issue_number,
+        execute,
+      );
+    } catch (err) {
+      return {
+        ok: false,
+        reason: (err as Error).message,
+        handoff: loaded.handoff,
+        code: "lock_held",
+      };
+    }
+  }
+  return execute();
+}
+
+async function persistGrillAnswerAfterLoad(
+  repoDir: string,
+  issueNumber: number,
+  handoffId: string,
+  input: Omit<AnswerHandoffInput, "handoff">,
+  deps: HandoffStoreDeps,
+  grillMaterialize: GrillAnswerMaterializeHook | undefined,
+  loadedHandoff: HumanQuestionHandoff,
+  grillBound: boolean,
+): Promise<AnswerHandoffResult> {
+  const result = await applyHandoffAnswer({ ...input, handoff: loadedHandoff });
   if (!result.ok) {
     await appendHandoffAudit(
       repoDir,
@@ -1611,12 +1663,9 @@ export async function answerAndPersistHandoff(
     );
     return result;
   }
-  const grillBound =
-    typeof loaded.handoff.declaration_identity === "string" &&
-    loaded.handoff.declaration_identity.startsWith("grill-v1:");
   if (grillBound && input.decision === "answer" && grillMaterialize && !result.duplicate) {
     const materialized = await grillMaterialize.materialize(
-      loaded.handoff,
+      loadedHandoff,
       input.answerText ?? "",
     );
     if (!materialized.ok) {
@@ -1637,7 +1686,7 @@ export async function answerAndPersistHandoff(
       return {
         ok: false,
         reason: materialized.reason,
-        handoff: loaded.handoff,
+        handoff: loadedHandoff,
         code: materialized.code,
       };
     }
@@ -1665,7 +1714,7 @@ export async function answerAndPersistHandoff(
         return {
           ok: false,
           reason: `handoff persist failed after body write: ${(err as Error).message}`,
-          handoff: loaded.handoff,
+          handoff: loadedHandoff,
           code: "persist_failed",
         };
       }

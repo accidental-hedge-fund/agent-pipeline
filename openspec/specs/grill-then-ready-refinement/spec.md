@@ -384,7 +384,7 @@ When shared terminology required for implementation is missing, preview SHALL in
 
 ### Requirement: Operator answers SHALL use hash-bound `pipeline handoff answer` and SHALL materialize into the body
 
-Pipeline SHALL extend the existing authenticated `pipeline handoff answer` boundary for pre-admission Decision nodes. It SHALL NOT create a second answer ledger or a new handoff CLI verb. Each handoff and answer SHALL bind repository, issue, node ID, frontier fingerprint, source body hash, and the canonical node-definition digest (id, question, recommendation, class, term_id). When no PR or worktree tip exists, `candidate_sha` MAY be omitted. Create for these nodes SHALL use a policy-bound authority gate whose evidence is that binding; it SHALL NOT weaken mid-flight human-decision-required SHA evidence. A successful answer SHALL deterministically patch that node in the issue body, record the handoff provenance reference, and keep render/artifact identity. Bound-hash drift SHALL exit 2 with no mutation, including when only the Decisions artifact or rendered section changed. Spec-core equality SHALL NOT authorize a drifted full body. Already-materialized recovery SHALL require that same exact live-body match, or a Pipeline-authenticated recovery receipt for the expected post-write body persisted before the GitHub write. A live node whose definition digest does not match the bound digest SHALL fail closed. After a successful materialize write, remaining pending sibling handoffs SHALL bind the new body hash and SHALL keep the original definition digest. Receipt-matching no-write recovery SHALL rebind remaining pending siblings to the recovered body before persisting the next frontier. GitHub review comments and issue comments SHALL NOT settle nodes.
+Pipeline SHALL extend the existing authenticated `pipeline handoff answer` boundary for pre-admission Decision nodes. It SHALL NOT create a second answer ledger or a new handoff CLI verb. Each handoff and answer SHALL bind repository, issue, node ID, frontier fingerprint, source body hash, and the canonical node-definition digest (id, question, recommendation, class, term_id). When no PR or worktree tip exists, `candidate_sha` MAY be omitted. Create for these nodes SHALL use a policy-bound authority gate whose evidence is that binding; it SHALL NOT weaken mid-flight human-decision-required SHA evidence. A successful answer SHALL deterministically patch that node in the issue body, record the handoff provenance reference, and keep render/artifact identity. Bound-hash drift SHALL exit 2 with no mutation, including when only the Decisions artifact or rendered section changed. Spec-core equality SHALL NOT authorize a drifted full body. Already-materialized recovery SHALL require that same exact live-body match, or a Pipeline-authenticated recovery receipt for the expected post-write body persisted before the GitHub write. A live node whose definition digest does not match the bound digest SHALL fail closed. After a successful materialize write, remaining pending sibling handoffs SHALL bind the new body hash and SHALL keep the original definition digest. Receipt-matching no-write recovery SHALL rebind remaining pending siblings to the recovered body before persisting the next frontier. `pipeline handoff answer` SHALL serialize grill-authority body read/write, sibling rebind, frontier persist, and ledger save under the host-local domain-plus-issue lock. Frontier persist SHALL NOT replace an authenticated frontier that already matches the live body with a planned body that does not. GitHub review comments and issue comments SHALL NOT settle nodes.
 
 #### Scenario: Authenticated answer settles an operator-required node
 
@@ -420,6 +420,14 @@ Pipeline SHALL extend the existing authenticated `pipeline handoff answer` bound
 - **THEN** a later identical answer SHALL rebind remaining pending siblings to the recovered body
 - **AND** SHALL persist the frontier only after that rebind succeeds
 - **AND** SHALL NOT write the GitHub body a second time
+
+#### Scenario: Receipt recovery does not replace a newer sibling frontier
+
+- **WHEN** a grill-authority answer has written the issue body and persisted a recovery receipt
+- **AND** a later identical answer rebinds a pending sibling to the recovered body
+- **AND** that sibling then answers and persists a frontier for the later body before recovery persists
+- **THEN** recovery SHALL NOT replace that later frontier with the recovered body
+- **AND** the live body SHALL continue to match the later authenticated frontier
 
 #### Scenario: Comment-only answer does not settle
 

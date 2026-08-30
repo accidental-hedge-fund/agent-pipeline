@@ -5239,6 +5239,7 @@ async function main(): Promise<void> {
                   ? { ok: true as const, wrote: out.wrote }
                   : { ok: false as const, reason: out.reason, code: out.code };
               },
+              withIssueLock: (domain, issueNumber, fn) => withLock(domain, fn, issueNumber),
             }
           : undefined,
       );
