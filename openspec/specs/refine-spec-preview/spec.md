@@ -2,10 +2,12 @@
 
 ## Purpose
 TBD - created by archiving change refine-spec-preview. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: The `refine-spec` sub-command SHALL run without an issue number
 
-The pipeline CLI SHALL accept `refine-spec` as a positional sub-command keyword that requires no issue number and does not advance any pipeline stage label. It SHALL be dispatched when the first positional argument is the string `refine-spec` (case-sensitive). A `--title "<text>"` flag SHALL supply the existing issue title and a `--body "<markdown>"` flag SHALL supply the existing issue body; omitting either SHALL exit non-zero with a usage error.
+The pipeline CLI SHALL accept `refine-spec` as a positional sub-command keyword that does not take a positional issue number and does not advance any pipeline stage label. It SHALL be dispatched when the first positional argument is the string `refine-spec` (case-sensitive). Callers SHALL supply either `--title "<text>"` and `--body "<markdown>"` together, or `--issue N` as specified by `grill-then-ready-refinement`. Omitting both the title/body pair and `--issue` SHALL exit non-zero with a usage error. Supplying `--issue` together with `--title` or `--body` SHALL exit non-zero with a usage error. No harness call SHALL be made on those usage errors.
 
 #### Scenario: Invoked with title and body flags
 
@@ -15,13 +17,13 @@ The pipeline CLI SHALL accept `refine-spec` as a positional sub-command keyword 
 
 #### Scenario: Invoked with missing title
 
-- **WHEN** the user runs `pipeline refine-spec --body "<markdown>"` with no `--title` flag
+- **WHEN** the user runs `pipeline refine-spec --body "<markdown>"` with no `--title` flag and no `--issue` flag
 - **THEN** the command SHALL exit non-zero with a usage error identifying `--title` as required
 - **AND** no harness call SHALL be made
 
 #### Scenario: Invoked with missing body
 
-- **WHEN** the user runs `pipeline refine-spec --title "Some title"` with no `--body` flag
+- **WHEN** the user runs `pipeline refine-spec --title "Some title"` with no `--body` flag and no `--issue` flag
 - **THEN** the command SHALL exit non-zero with a usage error identifying `--body` as required
 - **AND** no harness call SHALL be made
 
@@ -31,17 +33,25 @@ The pipeline CLI SHALL accept `refine-spec` as a positional sub-command keyword 
 - **THEN** the command SHALL exit non-zero with a usage error
 - **AND** no harness call SHALL be made
 
+#### Scenario: Issue flag is an alternate input not a positional issue number
+
+- **WHEN** the user runs `pipeline refine-spec --issue 42`
+- **THEN** the command SHALL dispatch the refine-spec handler
+- **AND** SHALL NOT treat `42` as a positional advance issue number
+- **AND** SHALL NOT advance any pipeline stage label
+
 ---
 
 ### Requirement: The `refine-spec` sub-command SHALL be discoverable via `--help` before invocation
 
-The `refine-spec` sub-command SHALL respond to `pipeline refine-spec --help` with exit code 0 and SHALL print usage text describing its flags (`--title`, `--body`, `--json`). Additionally, `pipeline --help` SHALL list `refine-spec` alongside other no-issue-number sub-commands. A caller (e.g. Pipeline Desk) MAY probe for the contract's presence by invoking `pipeline refine-spec --help` and checking that the output contains usage text mentioning both `--title` and `--body` in a refine-spec context; an install that does not support this contract prints generic top-level help without refine-spec-specific flag descriptions.
+The `refine-spec` sub-command SHALL respond to `pipeline refine-spec --help` with exit code 0 and SHALL print usage text describing `--title`, `--body`, `--issue`, `apply`, `--proposal-file`, and `--json`. Additionally, `pipeline --help` SHALL list `refine-spec` alongside other no-issue-number sub-commands. A caller (e.g. Pipeline Desk) MAY probe for the contract's presence by invoking `pipeline refine-spec --help` and checking that the output contains usage text mentioning both `--title` and `--body` in a refine-spec context; an install that does not support this contract prints generic top-level help without refine-spec-specific flag descriptions.
 
 #### Scenario: `--help` exits zero and prints usage
 
 - **WHEN** `pipeline refine-spec --help` is invoked on an install that supports this contract
 - **THEN** the command exits with code 0
 - **AND** stdout or stderr contains usage text that mentions `--title` and `--body`
+- **AND** the usage text SHALL mention `--issue`, `apply`, and `--proposal-file`
 
 #### Scenario: Top-level help lists `refine-spec`
 
@@ -58,7 +68,7 @@ The `refine-spec` sub-command SHALL respond to `pipeline refine-spec --help` wit
 
 ### Requirement: The `refine-spec` sub-command SHALL produce a machine-readable refined spec via a single model harness call
 
-The handler SHALL invoke exactly one model harness call that takes the provided `--title` and `--body` and returns a refined spec following the WHAT-not-HOW / observable-AC section contract: **Summary** (one paragraph), **User story** (`As a … / I want … / so that …`), **Acceptance criteria** (`- [ ]` items stating observable, falsifiable behaviors), **Out of scope** (explicit exclusions), and **Open questions** only when the input is genuinely ambiguous. The harness call SHALL be the only model-invoking step; no other external calls are permitted.
+When invoked with `--title` and `--body` (and without `--issue` or `apply`), the handler SHALL invoke exactly one model harness call that takes the provided `--title` and `--body` and returns a refined spec following the WHAT-not-HOW / observable-AC section contract: **Summary** (one paragraph), **User story** (`As a … / I want … / so that …`), **Acceptance criteria** (`- [ ]` items stating observable, falsifiable behaviors), **Out of scope** (explicit exclusions), and **Open questions** only when the input is genuinely ambiguous. That harness call SHALL be the only model-invoking step on this path; no other external calls are permitted. The `--issue` preview path SHALL use the two-call contract in `grill-then-ready-refinement` instead of this single-call contract. `apply` SHALL invoke no model.
 
 #### Scenario: Well-specified input produces a complete spec
 
@@ -74,7 +84,7 @@ The handler SHALL invoke exactly one model harness call that takes the provided 
 
 #### Scenario: Harness call is the only model-invoking step
 
-- **WHEN** `pipeline refine-spec` runs to stdout emission
+- **WHEN** `pipeline refine-spec --title "T" --body "B"` runs to stdout emission
 - **THEN** exactly one model harness call SHALL have been made; all subsequent output formatting is deterministic given the harness response
 
 ---
@@ -129,7 +139,7 @@ When invoked (with or without `--json`), the command SHALL write exactly one JSO
 
 ### Requirement: The `refine-spec` sub-command SHALL perform no writes of any kind
 
-The handler SHALL NOT create, edit, label, or comment on any GitHub issue or PR. It SHALL NOT create branches, make commits, or push to any remote. It SHALL NOT write to `ROADMAP.md` or any other tracked file. Re-running the command on the same input SHALL leave all repo and GitHub state unchanged. The `RefineSpecDeps` injectable interface SHALL contain no write-capable dependency slots (no `createIssue`, `writeFile`, `gitCreateBranch`, `createPR`, or equivalent), making the non-mutating guarantee structural rather than behavioral.
+Preview invocations — `pipeline refine-spec --title/--body` and `pipeline refine-spec --issue N` without `apply` — SHALL NOT create, edit, label, or comment on any GitHub issue or PR. They SHALL NOT create branches, make commits, or push to any remote. They SHALL NOT write to `ROADMAP.md` or any other tracked file. Re-running a preview on the same input SHALL leave all repo and GitHub state unchanged. The preview `RefineSpecDeps` injectable interface SHALL contain no write-capable dependency slots (no `createIssue`, `writeFile`, `gitCreateBranch`, `createPR`, or equivalent), making the non-mutating guarantee structural rather than behavioral. Body mutation is specified only by `grill-then-ready-refinement` apply and by hash-bound `pipeline handoff answer` materialize.
 
 #### Scenario: No GitHub writes occur
 
@@ -152,3 +162,7 @@ The handler SHALL NOT create, edit, label, or comment on any GitHub issue or PR.
 - **THEN** all repo and GitHub state is identical before and after both invocations
 - **AND** each invocation MAY produce a different refined spec (model non-determinism), but neither alters any external state
 
+#### Scenario: Issue preview is also non-mutating
+
+- **WHEN** `pipeline refine-spec --issue N` runs to completion
+- **THEN** no GitHub write, git write, or tracked-file write SHALL have been made
