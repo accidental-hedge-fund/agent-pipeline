@@ -32,9 +32,9 @@ classifier, recipe, gate, and controller law stay unchanged.
 
 ## Impact
 
-- New files only: the run-scoped JSON fixture, one unit test under `core/test/`,
-  and this OpenSpec change (pre-merge archives it into
-  `openspec/specs/pack-13916-clean-openspec/`).
+- New files only: the run-scoped JSON fixture, one unit test at
+  `core/test/frg-pack-13916-clean-openspec.test.ts`, and this OpenSpec change
+  (pre-merge archives it into `openspec/specs/pack-13916-clean-openspec/`).
 - Tests reuse `node:test` plus `node:fs` `readFileSync` and `JSON.parse` (same
   pattern as `core/test/stage-output-contract.test.ts`). No fixture loader, helper
   module, or registry.
@@ -47,8 +47,8 @@ classifier, recipe, gate, and controller law stay unchanged.
 - [ ] File `core/test/fixtures/frg/pack-13916-pipeline-ship-1.39.16/clean-openspec.json`
       exists and parses as JSON.
 - [ ] That fixture names release `1.39.16` (exact string).
-- [ ] A unit test reads only that run-scoped path and fails if the named release
-      is not `1.39.16`.
+- [ ] A unit test at `core/test/frg-pack-13916-clean-openspec.test.ts` reads only
+      that run-scoped path and fails if the named release is not `1.39.16`.
 - [ ] No production module under `core/scripts/` changes behavior.
 - [ ] This is the only active OpenSpec change for issue #1335.
 - [ ] Pre-merge archives this change and leaves no foreign active change.

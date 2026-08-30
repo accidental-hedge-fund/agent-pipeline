@@ -1,6 +1,6 @@
 ## 1. Fixture and unit test
 
-- [ ] 1.1 Add `core/test/pack-13916-clean-openspec.test.ts` that reads only
+- [ ] 1.1 Add `core/test/frg-pack-13916-clean-openspec.test.ts` that reads only
       `core/test/fixtures/frg/pack-13916-pipeline-ship-1.39.16/clean-openspec.json`
       with `node:test`, `node:fs` `readFileSync`, and `JSON.parse`, asserts
       `release_version === "1.39.16"`, and verify the test fails before the

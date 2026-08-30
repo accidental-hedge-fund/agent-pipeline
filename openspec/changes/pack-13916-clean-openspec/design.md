@@ -38,11 +38,12 @@ it splits the two FRG templates on the same pack.
 
 ### D2 — Test reads the file with stdlib only
 
-Add a small unit test under `core/test/` that joins
+Add `core/test/frg-pack-13916-clean-openspec.test.ts` that joins
 `fixtures/frg/pack-13916-pipeline-ship-1.39.16/clean-openspec.json` from the
 test file URL, reads UTF-8, parses JSON, and asserts
 `release_version === "1.39.16"`. Reuse `node:test` / `node:assert/strict` /
-`node:fs` / `node:path` / `node:url`. Do not add a helper.
+`node:fs` / `node:url`. Do not add a helper. The `frg-` prefix matches
+existing FRG tests such as `frg-pack-observations.test.ts`.
 
 Alternative considered: fold the assertion into `frg-pack-observations.test.ts`.
 Rejected: that file scores pack collector evidence; this is fixture content.
@@ -70,3 +71,9 @@ change does not require that edit.
   condition.
 - [Sibling `clean-docs` issue may land a parallel fixture tree] → Keep this
   change on `clean-openspec.json` only. Do not share a fixture file.
+
+## Migration Plan
+
+No production rollout. The change adds one fixture and one unit test. Pre-merge
+archives this OpenSpec change into `openspec/specs/pack-13916-clean-openspec/`.
+Rollback is revert of the PR. There is no data migration.
