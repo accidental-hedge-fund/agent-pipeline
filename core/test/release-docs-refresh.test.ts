@@ -26,7 +26,7 @@ test("postTagDocsCommitMessage: stable greppable subject for version", () => {
 test("isGeneratorOwnedPath: CHANGELOG and co-owned generator outputs only", () => {
   assert.equal(isGeneratorOwnedPath("CHANGELOG.md"), true);
   assert.equal(isGeneratorOwnedPath("docs/cli.md"), true);
-  assert.equal(isGeneratorOwnedPath("hosts/claude/SKILL.md"), true);
+  assert.equal(isGeneratorOwnedPath("hosts/claude/SKILL.md"), false);
   assert.equal(isGeneratorOwnedPath("ROADMAP.md"), false);
   assert.equal(isGeneratorOwnedPath("package.json"), false);
   assert.equal(isGeneratorOwnedPath("core/package.json"), false);

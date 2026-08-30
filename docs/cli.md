@@ -5,8 +5,8 @@
 This page is generated from `COMMAND_REGISTRY`, `OPERATION_SURFACE`, and
 co-located metadata in `core/scripts/command-docs.ts`. Do not hand-edit the command inventory.
 
-Host skills use the same inventory with host-specific invocation tokens:
-`/pipeline` (Claude Code) and `$pipeline` (Codex). The Node CLI is `pipeline`.
+Host skills execute the in-scope catalog as `pipeline <verb>`. The Node CLI
+is `pipeline`. This page is the full documented inventory.
 
 Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 
@@ -21,7 +21,7 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 
 #### `loop`
 
-- **Usage:** `pipeline loop --milestone <m>|--label <l>|--range a-b [--resume <run-id>] [--audit] [--follow]`
+- **Usage:** `pipeline loop --milestone <m> [--audit] [--follow] | pipeline loop --label <l> [--audit] [--follow] | pipeline loop --range a-b [--audit] [--follow] | pipeline loop --roadmap-slice <slice> [--audit] [--follow] | pipeline loop <N> [<N> ...] [--audit] [--follow] | pipeline loop --resume <run-id> [--audit] [--follow]`
 - **Summary:** Durable multi-item run — driven in-repo by the pipeline's own loop supervisor
 
 #### `single`
@@ -68,7 +68,7 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 
 #### `release`
 
-- **Usage:** `pipeline release <version> [--theme "..."] [--dry-run|--json] [--no-edit] [--skip-frg] | release finish <pr> [--json] | release ensure-tag <X.Y.Z> <merge-oid> --packed-candidate <sha>`
+- **Usage:** `pipeline release <version> [--theme "..."] [--dry-run|--json] [--no-edit] [--skip-frg] | pipeline release finish <pr> [--json] | pipeline release ensure-tag <X.Y.Z> <merge-oid> --packed-candidate <sha>`
 - **Summary:** Prepare a release PR from the matching GitHub milestone plan (or finish-merge one); finish never tags; ship-end ensure-tag creates vX.Y.Z from on-disk HMAC latest.json when FRG is gitignored; --dry-run reports milestone presence/open issues
 
 #### `remove-worktree`
@@ -78,7 +78,7 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 
 #### `ship`
 
-- **Usage:** `pipeline ship --milestone vX.Y.Z [--json] | ship status --milestone vX.Y.Z [--json]`
+- **Usage:** `pipeline ship --milestone vX.Y.Z [--json] | pipeline ship status --milestone vX.Y.Z [--json]`
 - **Summary:** Run or inspect one durable milestone shipment (train --merge, release, finish, promote). Operator product is pipeline ship --milestone vX.Y.Z; no grant file required.
 
 #### `status`
@@ -88,7 +88,7 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 
 #### `train`
 
-- **Usage:** `pipeline train --milestone <m>|--issues <n,n> [--merge] [--json] [--dry-run]`
+- **Usage:** `pipeline train --milestone <m> [--merge] [--json] [--dry-run] | pipeline train --issues <n,n> [--merge] [--json] [--dry-run]`
 - **Summary:** Operator-authorized integrate train: base-eligible frontiers advance via one loop wave each (recovery inside the wave); optionally serial-merge with base containment; independent R2D siblings may merge while a peer is parked (never called by the advance loop)
 
 #### `unblock`

@@ -1206,9 +1206,12 @@ export async function reenterAdvanceAfterRecoverParked(
     await transition(cfg, issueNumber, "needs-human", "review-2");
   }
   // Force the nested-recovery guard regardless of caller opts.
+  // Nested in-process advance must not emit advance_run_handoff onto the
+  // parent (train --json) stdout.
   const optsWithGuard = {
     ...(advanceOpts ?? {}),
     skipRecoverParked: true as const,
+    emitAdvanceHandoff: false as const,
   };
   await deps.runAdvance(cfg, issueNumber, optsWithGuard);
 }

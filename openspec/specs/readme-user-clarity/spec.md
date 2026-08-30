@@ -2,9 +2,7 @@
 
 ## Purpose
 TBD - created by archiving change readme-user-clarity. Update Purpose after archive.
-
 ## Requirements
-
 ### Requirement: README opens with a purpose-first summary
 
 The README SHALL communicate — within the first visible screenful, before any configuration detail or repository layout — what the tool does, who it is for, the implementer/reviewer pair declared in `.github/pipeline.yml`, and the core prerequisites (Node ≥ 24, git, gh, and the configured harness CLIs authenticated). It SHALL NOT state that both the Claude CLI and the Codex CLI are required as the product, regardless of which host is installed. Deeper harness-pair documentation remains issue #976.
@@ -153,38 +151,37 @@ hard doctor failure or install blocker.
 
 ### Requirement: README SHALL document the Grok Build skill path
 
-The README SHALL include an install-adjacent subsection for Grok Build
-consumers that documents how to obtain the pipeline skill under
-`~/.grok/skills/pipeline`. The preferred documented method SHALL be a symlink
-to the Claude-managed skill install; a copy MAY be documented as a secondary
-option. The subsection SHALL state that Grok is not a first-class host overlay
-with a separate `hosts/grok` SKILL.md package (or, if `--host grok` is
-documented, SHALL describe path materialization only). The Grok subsection
-SHALL appear after the primary Claude/Codex quickstart so newcomers can finish
-the default install without reading Grok-specific layout first.
+The README SHALL include an install-adjacent subsection for Grok Build consumers
+that documents `~/.grok/skills/pipeline`. The preferred installed layout SHALL
+remain the existing symlink to the Claude-managed skill install; a copy MAY be
+documented as a secondary option. The README SHALL distinguish the generated,
+byte-identical `hosts/grok/SKILL.md` repository conformance output from a distinct
+Grok install overlay: `--host grok` SHALL continue to materialize the
+`symlink-claude` lifecycle, not a separate tree. The subsection SHALL appear
+after the primary Claude/Codex quickstart.
 
 #### Scenario: Grok subsection is present and accurate
 
 - **WHEN** a Grok Build user opens the README looking for skill install paths
-- **THEN** the README SHALL document `~/.grok/skills/pipeline` as the Grok
-  skill location
+- **THEN** the README SHALL document `~/.grok/skills/pipeline` as the Grok skill
+  location
 - **AND** SHALL prefer symlink-to-Claude (or the equivalent under
   `CLAUDE_CONFIG_DIR`) over inventing a third unrelated install tree
 
 #### Scenario: Grok content does not block the primary quickstart
 
-- **WHEN** a first-time reader follows only the primary Claude/Codex install
-  and quickstart
-- **THEN** they SHALL reach a working Claude or Codex setup without needing
-  the Grok subsection
+- **WHEN** a first-time reader follows only the primary Claude/Codex install and
+  quickstart
+- **THEN** they SHALL reach a working Claude or Codex setup without needing the
+  Grok subsection
 
 #### Scenario: Grok host status is not overstated
 
-- **WHEN** the README describes Grok consumption
-- **THEN** it SHALL NOT claim a full third packaged host overlay exists when
-  the installer only supports Claude and Codex as first-class hosts
-- **AND** if it documents `--host grok`, that command SHALL match the
-  installer's implemented behavior
+- **WHEN** the README describes `hosts/grok/SKILL.md` or `--host grok`
+- **THEN** it SHALL identify the repository file as a generated, byte-identical
+  conformance output
+- **AND** it SHALL state that installation still exposes the Claude-managed bytes
+  through the Grok symlink rather than consuming a distinct Grok overlay
 
 ### Requirement: README Grok reinstall note SHALL survive Claude updates
 
@@ -200,3 +197,4 @@ exists) so the Grok path is not left dangling or stale.
 - **THEN** the README SHALL state the follow-up step to refresh the Grok path
 - **AND** the step SHALL be runnable from documented commands without reading
   installer source
+

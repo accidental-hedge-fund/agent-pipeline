@@ -196,10 +196,14 @@ Tugboat already writes `$RUN_DIR/factory-release-prepare-request.json`.
 This is an idempotent multi-tick protocol.
 
 1. First call with no request-bound pack loop **starts** a `factory-gate`
-   candidate pack loop (`pipeline loop --engine-track candidate`, work-list or
-   `--label factory-gate`) from `frg-packs/factory-gate-v1/templates/`, writes
+   candidate pack loop. The child execs the resolved candidate launcher for
+   the request SHA (not PATH `pipeline` and not `PIPELINE_BIN`).
+   `--engine-track candidate` on the child argv is doctor/soak intent
+   metadata, not a binary selector. The work-list or `--label factory-gate`
+   comes from `frg-packs/factory-gate-v1/templates/`. Prepare writes
    `factory-release-binding.json` (request fingerprint, candidate SHA, version,
-   manifest), persists `loop_run_id`, and returns `status: "in_progress"`.
+   manifest), persists `loop_run_id` as `bound` before spawn, and returns
+   `status: "in_progress"` only after a valid durable `loop_run_handoff`.
    A re-invoke of the **unchanged** request **resumes** the same `loop_run_id`.
    It does **not** start a second unbound pack and does **not** adopt the newest
    unbound `factory-gate` loop. A missing pre-bound loop is a start/resume
@@ -221,16 +225,22 @@ This is an idempotent multi-tick protocol.
    Real ineligible scores stay `pass: false` and `frg_not_eligible`.
 3. After unsigned artifacts exist and no verified production-owned attestation
    exists, the call returns `awaiting_frg_attestation` with unsigned artifact
-   identities and digests. It does **not** open a release PR. Checkpoint state
-   is stored under
+   identities and digests (`frg_run_id` **A**). It does **not** open a release PR.
+   Checkpoint state is stored under
    `.agent-pipeline/factory-release/<request-fingerprint>/checkpoint.json`
    (keyed by repository, version, candidate commit, and action identity). The
-   wrapper submits those closed artifacts to the fixed trusted attestor. A later
-   call uses the **unchanged** request, verifies the production-owned
-   attestation, invokes shared `runRelease` (prepare-only), and returns
-   `complete` with one exact release pull request, FRG run id, head, base, and
-   restart checkpoint. Repeated calls must reconcile the same checkpoint
-   without another pack, attestation, branch, or pull request.
+   wrapper submits those closed artifacts to the fixed trusted attestor via
+   credentialed `pipeline factory-gate --for <X.Y.Z> --from-run <loop>`. That
+   attestor writes HMAC `latest.json` with a distinct attested `run_id` **B**
+   and top-level `factory_release_binding` that names **A** and the closed
+   unsigned digests **before** HMAC. Unsigned prepare and ship do not overlay
+   that field after sign. A later prepare call uses the **unchanged** request,
+   accepts HMAC-pass **B** when the binding matches **A**, invokes shared
+   `runRelease` (prepare-only), and returns `complete` with the attested run
+   identity. Repeated calls must reconcile the same checkpoint without another
+   pack, attestation, branch, or pull request. Production identities stay
+   distinct (`A` vs `B`). Composers invoke the attestor **once** per unchanged
+   complete checkpoint binding, then fail closed on absent or rejected observe.
 
 Prepare never merges, tags, promotes a pin, or flips Tugboat `--skip-frg`.
 
@@ -244,9 +254,12 @@ after train and before release. #1133: that pack invokes
 `pipeline factory-release prepare` with attestor env **unset** in the
 prepare child. When prepare returns `awaiting_frg_attestation`, the
 composer runs `pipeline factory-gate --for <X.Y.Z> --from-run <loop>` in a
-**separate** credentialed process (no `--observations`). Pack-done is
-bound `latest.json` `pass: true` (or prepare `complete` with an open
-release PR). Unsigned `awaiting_frg_attestation` is **not** pack-done.
+**separate** credentialed process (no `--observations`) **once** for that
+unchanged unsigned checkpoint. That child writes HMAC `factory_release_binding`
+joining attested `run_id` **B** to unsigned **A** before sign. Pack-done is
+prepare `complete` after accepted observe of that bound **B**, or bound
+`latest.json` `pass: true`. Unsigned `awaiting_frg_attestation` is **not**
+pack-done. A second attestor spawn for unchanged **A** is forbidden.
 Unsigned eligible omitted-HMAC `pass: false` is **attest**, not pack-fail.
 Ship-path composers wait until the bound pack loop is terminal (or a real
 pack-fail). Wait-budget expiry while that loop is live is **not** pack-fail.

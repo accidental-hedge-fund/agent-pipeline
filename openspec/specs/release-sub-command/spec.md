@@ -2,9 +2,7 @@
 
 ## Purpose
 TBD - created by archiving change release-sub-command. Update Purpose after archive.
-
 ## Requirements
-
 ### Requirement: The `release` sub-command SHALL run without an issue number
 
 The pipeline CLI SHALL accept `release` as a positional sub-command keyword that requires no issue number and that does not advance any pipeline stage label. It SHALL be dispatched when the first positional argument is the string `release` (case-sensitive).
@@ -107,32 +105,56 @@ After the version bump and packaging regeneration, the command SHALL run `npm ru
 
 ### Requirement: Aborts before branch creation SHALL leave the working tree unchanged
 
-The live release SHALL refuse to start if any release-managed path — `package.json`, `core/package.json`, `ROADMAP.md`, `plugin/`, or `.claude-plugin/` — has uncommitted changes (tracked modifications or untracked files) when the command begins, failing fast with a non-zero exit before bumping the version, regenerating packaging outputs, or writing any file. This clean-tree precondition makes the rollback provably lossless.
+The live release SHALL refuse to start if any release-managed path has tracked
+or untracked changes. The managed set SHALL include `package.json`,
+`core/package.json`, `ROADMAP.md`, `plugin/`, `.claude-plugin/`, and the exact
+generated host paths `hosts/claude/SKILL.md`, `hosts/codex/SKILL.md`,
+`hosts/grok/SKILL.md`, and `hosts/opencode/SKILL.md`. This precondition SHALL
+run before version mutation or `node scripts/build.mjs`, because that generator
+owns all four host SKILLs as well as plugin/catalog outputs.
 
-Untracked-file detection SHALL be forced independent of the user's git configuration (i.e. it SHALL NOT rely on `status.showUntrackedFiles`), because abort rollback cleans untracked files from the release-managed `plugin/` and `.claude-plugin/` paths and would otherwise destroy an untracked file the guard failed to report. The packaging generator SHALL limit writes to its declared SKILL, launcher, material-filter, Node-resolver, manifest, and catalog paths. It MAY remove only the two wholly owned retired directories `plugin/pipeline/commands/` and `plugin/pipeline/skills/pipeline/core/`; unrelated files elsewhere under `plugin/` SHALL NOT be treated as generated output.
+Untracked-file detection SHALL remain independent of user git configuration.
+The packaging generator SHALL write only its declared exact SKILL, launcher,
+material-filter, Node-resolver, manifest, and catalog outputs. It MAY remove
+only the two wholly owned retired directories
+`plugin/pipeline/commands/` and `plugin/pipeline/skills/pipeline/core/`; it
+SHALL NOT treat unrelated files under `hosts/` or `plugin/` as generated.
 
-Any abort after the version bump and packaging regeneration but before the release branch is created — packaging-generation failure, CI failure, issue-discovery failure, or an editor abort — SHALL restore `package.json`, `core/package.json`, `ROADMAP.md`, `plugin/`, and `.claude-plugin/` to their pre-release (HEAD) state and remove any untracked packaging debris generated during the run, so a retry reads the original `previousVersion` and is not poisoned by stranded version or generated-output changes. Because the precondition guaranteed these paths matched HEAD at the start, the rollback restores exactly the pre-release working tree and never discards a maintainer's pre-existing edits.
+Any abort after version bump and generation but before release-branch creation
+SHALL restore every release-managed path, including the four generated host
+SKILLs, to its pre-release `HEAD` state and remove only untracked debris at
+declared generator-owned paths. Because the clean precondition covered every
+path the generator can mutate, rollback SHALL remain lossless and SHALL NOT
+discard a maintainer's pre-existing edit.
 
 #### Scenario: A dirty release-managed path fails fast before any mutation
 
-- **WHEN** any of `package.json`, `core/package.json`, `ROADMAP.md`, `plugin/`, or `.claude-plugin/` has uncommitted changes at the start of a live release
-- **THEN** the command SHALL exit non-zero naming the dirty paths and SHALL NOT bump the version, regenerate packaging outputs, or write any file
-- **AND** because nothing was mutated, no rollback is performed (there is nothing to restore and nothing to discard)
+- **WHEN** any package, ROADMAP, plugin/catalog, or exact generated host SKILL
+  path in the release-managed set has tracked or untracked changes at live
+  release start
+- **THEN** the command SHALL exit non-zero naming the dirty exact paths and
+  SHALL NOT bump the version, regenerate packaging outputs, or write any file
+- **AND** because nothing was mutated, no rollback is performed
 
 #### Scenario: Untracked-file detection does not depend on user git config
 
-- **WHEN** the clean-tree precondition checks the release-managed paths
-- **THEN** it SHALL force untracked-file reporting (e.g. `git status --porcelain --untracked-files=all`) so an untracked file under `plugin/` is detected even when the maintainer has `status.showUntrackedFiles=no` configured
+- **WHEN** the clean-tree precondition checks every release-managed path
+- **THEN** it SHALL force untracked-file reporting (for example
+  `git status --porcelain --untracked-files=all`) so untracked plugin/catalog or
+  exact generated host SKILL debris is detected even when
+  `status.showUntrackedFiles=no`
 
 #### Scenario: post-bump abort rolls back the bumped files
 
-- **WHEN** the command bumps the version, regenerates packaging outputs, then aborts (CI fails, issue discovery fails, or the editor aborts) before creating the release branch
-- **THEN** `package.json` and `core/package.json` SHALL be restored to their pre-bump contents from HEAD
-- **AND** the generated packaging outputs under `plugin/` and `.claude-plugin/` SHALL be restored to their pre-release state and any untracked build debris removed
-- **AND** `ROADMAP.md` SHALL NOT be left in a stamped or partially-patched state
-- **AND** because the clean-tree precondition held at the start, no pre-existing local edit in any release-managed path is discarded by the rollback
-
----
+- **WHEN** the command bumps the version, regenerates packaging outputs, then
+  aborts before creating the release branch
+- **THEN** `package.json`, `core/package.json`, `ROADMAP.md`, `plugin/`,
+  `.claude-plugin/`, and all four exact generated host SKILLs SHALL be restored
+  to their pre-release `HEAD` state
+- **AND** untracked build debris SHALL be removed only from declared
+  generator-owned paths
+- **AND** because the clean-tree precondition held for every managed path, no
+  pre-existing local edit is discarded by rollback
 
 ### Requirement: The `release` sub-command SHALL scaffold `ROADMAP.md` at four locations
 
@@ -610,16 +632,6 @@ When no unshipped plan row exists for the resolved version **and** the release p
 - **AND** no release branch SHALL be created solely from that failure path
 
 ---
-
-### Requirement: Release help and host SKILL SHALL document the required release-plan row shape
-
-Release usage/help output and host SKILL documentation for `pipeline release` SHALL describe the required release-plan table row shape in a form consistent with the row produced by plan-row insert and consumed by `patchReleasePlanRow` (columns: Release, Bump, Theme, Issues, Why; Release cell `| **vX.Y.Z** |` for unshipped). The documented shape SHALL NOT contradict the shape enforced by those helpers.
-
-#### Scenario: Help text states the unshipped plan-row shape
-
-- **WHEN** an operator reads release help or the host SKILL release section
-- **THEN** the docs SHALL show or describe the unshipped `| **vX.Y.Z** | bump | theme | issues | why |` row shape
-- **AND** SHALL note that release will scaffold a missing unshipped row when the insert sentinel is present, or fail with remediation when it is not
 
 ### Requirement: The `release` sub-command SHALL fail closed on open candidate soak engine-class defects before version mutation
 
@@ -1178,3 +1190,128 @@ NOT be the product fix.
 - **WHEN** a unit test inspects prepare dispatch artifacts against the target checkout
 - **AND** prepare would leave an unignored untracked file of its own on that checkout
 - **THEN** the test SHALL fail
+
+### Requirement: Release help and durable operator docs SHALL document the required release-plan row shape
+
+Release usage/help output and durable operator documentation SHALL describe the
+release-plan table row shape in a form consistent with the row produced by
+plan-row insert and consumed by `patchReleasePlanRow` (columns: Release, Bump,
+Theme, Issues, Why; Release cell `| **vX.Y.Z** |` for unshipped). The generated
+short host one-pager MAY list the `release` verb and link to that documentation;
+it SHALL NOT be required to carry the release-plan row tutorial. The documented
+shape SHALL NOT contradict the shape enforced by those helpers.
+
+#### Scenario: Help text states the unshipped plan-row shape
+
+- **WHEN** an operator reads release help or the linked durable release docs
+- **THEN** the surface SHALL show or describe the unshipped
+  `| **vX.Y.Z** | bump | theme | issues | why |` row shape
+- **AND** SHALL note that release will scaffold a missing unshipped row when the
+  insert sentinel is present, or fail with remediation when it is not
+
+#### Scenario: Generated one-pager stays compact
+
+- **WHEN** an operator reads a generated host one-pager
+- **THEN** its verb table MAY point to the release help or durable CLI reference
+- **AND** it SHALL NOT be required to reproduce the release-plan row tutorial
+
+### Requirement: Factory-release pack-loop spawn SHALL use the candidate invocation that wrote the contract
+
+`pipeline factory-release prepare` SHALL spawn or resume the request-bound pack loop with the same verified candidate invocation that wrote that loop's contract. The invocation SHALL include the absolute candidate executable, immutable argv, and candidate SHA. PATH `pipeline` and `PIPELINE_BIN` SHALL NOT be production fallbacks for that child. `--engine-track candidate` SHALL remain on the child argv as intent metadata and SHALL NOT select the binary. The command SHALL persist `loop_run_id` and the matching request binding as `bound` before spawn. It SHALL persist `starting` after OS accept. It SHALL persist `dispatched` only after a valid durable `loop_run_handoff` for that `loop_run_id`. A failed OS spawn (child never started) SHALL fail that tick and SHALL leave the request `bound` to the same `loop_run_id` so a later invoke can retry spawn. A child that exits with status `0` or non-zero before the first valid handoff SHALL persist `failed` for that tick and SHALL NOT be retried as a second blind spawn.
+
+#### Scenario: Prepare pack child is the candidate engine
+
+- **WHEN** pin SHA `P` ≠ candidate SHA `C`
+- **AND** candidate prepare dispatches the pack loop
+- **THEN** the child executable SHALL be the resolved candidate launcher for `C`
+- **AND** it SHALL NOT be PATH `pipeline` or pin `P`
+
+#### Scenario: Binding stays starting until handoff
+
+- **WHEN** prepare has persisted `loop_run_id` `L` and a matching binding
+- **AND** the OS has accepted the child
+- **AND** no valid `loop_run_handoff` for `L` has been observed
+- **THEN** `dispatch_state` SHALL be `starting`
+- **AND** a later invoke of the unchanged request SHALL reconcile `L` instead of minting a second loop
+
+#### Scenario: Pre-handoff child exit fails closed
+
+- **WHEN** the pack child exits `0` or non-zero before a valid `loop_run_handoff`
+- **THEN** that prepare tick SHALL NOT return `status: "in_progress"` as if the loop were running
+- **AND** it SHALL persist `dispatch_state` `failed`
+- **AND** it SHALL NOT blindly spawn a second child for a new `loop_run_id`
+
+### Requirement: Factory-release prepare attestation observe SHALL return accepted, absent, or rejected
+
+`pipeline factory-release prepare` attestation observation SHALL return a typed result of **accepted**, **absent**, or **rejected**. It SHALL NOT fuse rejected HMAC `--from-run` evidence into the same null as a missing file.
+
+**Accepted** SHALL mean HMAC-pass evidence whose top-level `factory_release_binding` matches the closed unsigned checkpoint (`A`, request fingerprint, target version, integrated candidate SHA, pack identity, pack run ID, loop run ID, and every unsigned artifact digest), and whose version and loop match that checkpoint. Attested `run_id` MAY be `B` distinct from `A`. Presence of valid `pack_provenance` SHALL NOT prevent accepted.
+
+**Absent** SHALL mean the evidence file is missing, unreadable, or unparsable.
+
+**Rejected** SHALL mean the file is present but HMAC fails, `factory_release_binding` is missing, the binding mismatches, the only binding carrier is notes or inferred provenance, `pack_provenance` fails its own validation, or a present `pack_provenance.candidate_git_sha` differs from the request integrated candidate. Rejected SHALL carry a stable reason code plus expected unsigned `frg_run_id` `A` and observed `run_id` `B` when those identities are known.
+
+Observation SHALL NOT accept solely because `pack_provenance` is present. Observation SHALL NOT require `evidence.run_id === unsigned.frg_run_id` when the HMAC-covered binding names `A`. A present invalid top-level binding SHALL NOT fall back to notes or `pack_provenance`. Observation SHALL NOT accept HMAC-pass evidence whose `factory_release_binding` names candidate `C` while present `pack_provenance` names a different candidate `D`.
+
+Unsigned prepare SHALL NOT overlay `factory_release_binding` after sign in order to convert rejected into accepted.
+
+#### Scenario: HMAC from-run latest.json with distinct B is accepted
+
+- **WHEN** unsigned checkpoint `frg_run_id` is `A`
+- **AND** HMAC `latest.json` has `run_id` `B`, valid `pack_provenance`, and HMAC-covered `factory_release_binding` matching `A` and the closed digests
+- **THEN** observation SHALL return accepted
+- **AND** it SHALL NOT return absent solely because `run_id` is not `A`
+- **AND** it SHALL NOT return absent solely because `pack_provenance` is present
+
+#### Scenario: From-run payload without binding is rejected
+
+- **WHEN** unsigned checkpoint `frg_run_id` is `A`
+- **AND** HMAC `latest.json` has `run_id` `B` and `pack_provenance` and no top-level `factory_release_binding`
+- **THEN** observation SHALL return rejected
+- **AND** the reason SHALL name the missing binding
+- **AND** it SHALL NOT be treated as success
+
+#### Scenario: Notes-only binding is rejected
+
+- **WHEN** HMAC `latest.json` carries `factory_release_binding` only as a notes string
+- **AND** the top-level field is absent
+- **THEN** observation SHALL return rejected
+- **AND** it SHALL NOT parse notes as the authoritative join to `A`
+
+#### Scenario: Missing latest.json is absent
+
+- **WHEN** unsigned artifacts exist
+- **AND** `.agent-pipeline/frg/<X.Y.Z>/latest.json` is missing
+- **THEN** observation SHALL return absent
+- **AND** prepare SHALL return `status: "awaiting_frg_attestation"`
+
+#### Scenario: Binding C with scored provenance D is rejected
+
+- **WHEN** HMAC `latest.json` has `factory_release_binding` matching unsigned `A` and candidate `C`
+- **AND** `pack_provenance.candidate_git_sha` is `D` distinct from `C`
+- **THEN** observation SHALL return rejected
+- **AND** it SHALL NOT return accepted
+
+### Requirement: Factory-release prepare SHALL complete on accepted bound B
+
+When attestation observation returns **accepted** for HMAC-pass `--from-run` evidence whose `run_id` is `B` and whose `factory_release_binding.frg_run_id` equals closed unsigned `A`, `pipeline factory-release prepare` SHALL treat that attestation as production-owned for the unchanged request. It SHALL invoke shared `runRelease` and SHALL return `status: "complete"` with the attested run identity. It SHALL NOT stay `awaiting_frg_attestation` solely because `evidence.run_id !== unsigned.frg_run_id`. It SHALL NOT return `attestation_mismatch` solely for that `A`/`B` inequality when the HMAC-covered binding matches.
+
+When observation returns **absent**, prepare SHALL return `status: "awaiting_frg_attestation"` with the closed unsigned identities.
+
+When observation returns **rejected**, prepare SHALL still return `status: "awaiting_frg_attestation"` (prepare remains uncredentialed) and SHALL include the observe miss (reason code, unsigned `A`, observed `B` when present) on that awaiting result so the composer can fail closed after its attest allowance.
+
+Complete JSON MAY record attested `run_id` `B`. The unsigned checkpoint SHALL keep `frg_run_id` `A`. Repeated calls at the proved complete checkpoint SHALL NOT create a second pack, attestation, branch, or pull request.
+
+#### Scenario: Second prepare call completes after bound from-run
+
+- **WHEN** the trusted attestor has stored HMAC-pass `latest.json` with `run_id` `B` and `factory_release_binding` matching unsigned `A`
+- **AND** a later `factory-release prepare` uses the unchanged request
+- **THEN** the command SHALL return `status: "complete"`
+- **AND** it SHALL NOT remain `awaiting_frg_attestation` because `run_id` is `B`
+
+#### Scenario: Rejected observe stays awaiting and names the miss
+
+- **WHEN** observation returns rejected for `latest.json` `run_id` `B` against unsigned `A`
+- **THEN** prepare SHALL return `status: "awaiting_frg_attestation"`
+- **AND** that result SHALL include the observe miss reason and both identities when known
+- **AND** it SHALL NOT overlay `factory_release_binding` after sign

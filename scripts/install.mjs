@@ -15,7 +15,8 @@
 // OMP has no env override: --host omp always installs under ~/.omp/agent.
 //
 // Grok Build: --host grok materializes ~/.grok/skills/pipeline as a symlink to
-// the Claude-managed skill install (no separate hosts/grok SKILL.md overlay).
+// the Claude-managed skill install (no separate hosts/grok SKILL.md overlay;
+// hosts/grok/SKILL.md is a repository conformance output only).
 // Requires the Claude skill to already be installed. After a Claude reinstall,
 // re-run --host grok (or recreate the symlink) so the Grok path is not left
 // dangling. Manual layout is documented in the README ("Grok Build skill path").

@@ -368,6 +368,26 @@ test("implementing prompt: includes plan", () => {
   assert.match(out, /PLAN-CONTENT-XYZ/);
 });
 
+test("implementing prompt: requires re-derivation of mutable repository state before writing (#1300)", () => {
+  const out = buildImplementingPrompt({
+    cfg: dummyConfig(),
+    issueNumber: 100,
+    title: "Title",
+    body: "Body",
+    plan: "next Alembic revision is 0069",
+    pipelineRunId: "100/2026-06-08T14:32:00Z",
+  });
+  assert.match(out, /re-read that state in this worktree/);
+  assert.match(out, /Do not treat planning-time fact values as the write-time source of truth/);
+  assert.doesNotMatch(out, /Planning Facts \(engine-observed\)/);
+});
+
+test("planning prompt: omitted planning_facts stays section-free (#1300)", () => {
+  const out = buildPlanningPrompt({ cfg: dummyConfig(), issueNumber: 9, title: "t", body: "b" });
+  assert.doesNotMatch(out, /Planning Facts \(engine-observed\)/);
+  assert.doesNotMatch(out, /\{\{planning_facts\}\}/);
+});
+
 // #108: the conventions instruction must be accurate under BOTH profiles — the
 // codex profile's conventions file is AGENTS.md, so the instruction must not name
 // only CLAUDE.md. dummyConfig has no real conventions file (stub), so AGENTS.md can

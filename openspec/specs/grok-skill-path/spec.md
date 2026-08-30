@@ -5,41 +5,30 @@ TBD - created by archiving change install-document-grok-skill-path. Update Purpo
 ## Requirements
 ### Requirement: Supported Grok skill layout SHALL be documented for operators
 
-The project SHALL document a supported layout for Grok Build consumers of the
-pipeline skill. The preferred layout SHALL be a symlink from
-`~/.grok/skills/pipeline` to the Claude-managed skill install (default
-`~/.claude/skills/pipeline`, or the equivalent under `CLAUDE_CONFIG_DIR`). The
-documentation SHALL also allow a copy of the skill tree under
-`~/.grok/skills/pipeline` as an acceptable alternative and SHALL state the
-trade-off that a copy does not automatically track Claude-side updates. The
-documentation SHALL state that Grok is not a first-class host overlay (no
-required `hosts/grok` SKILL.md fork) unless and until an installer
-`--host grok` target is shipped, in which case documentation SHALL describe
-that target without introducing a Grok-only SKILL.md fork.
+The project SHALL document a supported layout for Grok Build consumers of the pipeline skill in both `README.md` and `docs/packaging.md`. The repository SHALL contain a generated `hosts/grok/SKILL.md` one-pager that is byte-identical to `hosts/claude/SKILL.md`; it is a conformance output, not a separate install overlay or fork. The preferred installed layout SHALL remain a symlink from `~/.grok/skills/pipeline` to the Claude-managed skill install. Documentation MAY still describe a copy of that shared tree as an alternative and SHALL state its update trade-off. Documentation and manifest post-install prose SHALL distinguish the generated repository output from the unchanged `symlink-claude` install lifecycle.
 
 #### Scenario: README describes symlink-first Grok layout
 
 - **WHEN** an operator reads the README install-related section for Grok Build
-- **THEN** the README SHALL show or describe creating
-  `~/.grok/skills/pipeline` as a symlink to the Claude skill install path
-- **AND** SHALL mention copy as a secondary alternative with the update
-  trade-off
+- **THEN** the README SHALL show or describe `~/.grok/skills/pipeline` as a symlink to the Claude-managed skill install
+- **AND** it MAY mention copy as a secondary alternative with the update trade-off
+- **AND** it SHALL NOT instruct the operator to install a distinct Grok tree overlay
+- **AND** `docs/packaging.md` SHALL preserve the same symlink-first lifecycle
 
 #### Scenario: Documentation states Grok host status
 
 - **WHEN** an operator reads the documented Grok layout
-- **THEN** the text SHALL state that Grok is not a first-class host overlay
-  with its own `hosts/grok` packaging, or — if `--host grok` is documented —
-  SHALL describe that target as path materialization (symlink/staging) without
-  claiming a separate Grok SKILL.md fork
+- **THEN** the text SHALL describe `hosts/grok/SKILL.md` as a generated, byte-identical repository output
+- **AND** SHALL state that the installed Grok path continues to consume the shared Claude-managed bytes through `symlink-claude`
+- **AND** SHALL NOT describe the generated repository file as an installer overlay input
 
 #### Scenario: Reinstall guidance covers the Grok path
 
-- **WHEN** an operator reinstalls or updates the Claude-hosted skill after
-  having used the Grok layout
-- **THEN** the documentation SHALL give steps to restore or refresh the Grok
-  skill path (re-create the symlink, re-run a documented Grok install command,
-  or equivalent) without requiring the operator to invent paths from source
+- **WHEN** an operator reinstalls or updates the Claude-hosted skill after having used the Grok layout
+- **THEN** the documentation SHALL give steps to restore or refresh the Grok symlink path
+- **AND** SHALL NOT require a new Grok tree-mode migration
+
+---
 
 ### Requirement: Installer help SHALL acknowledge the Grok consumption path
 
@@ -98,70 +87,54 @@ a false freshness failure when the target tree is coherent and current.
 
 ### Requirement: Optional installer host grok SHALL materialize the Grok skill path
 
-Optional installer host `grok` SHALL materialize the Grok skill path when
-implemented: `install` and `update` with `--host grok` SHALL create or refresh
-`~/.grok/skills/pipeline` as a symlink to the Claude-managed skill directory
-when that Claude install exists. Refreshing an existing path SHALL only replace
-an existing symlink (unlink the link, never recursively delete a directory or
-file). If `~/.grok/skills/pipeline` already exists as a non-symlink path (for
-example the documented copy layout or personal content), the installer SHALL
-preserve that path, exit non-zero, and emit remediation that explains how to
-relocate or remove it before converting to the preferred symlink layout. The
-installer SHALL NOT introduce a separate `hosts/grok` SKILL.md fork for this
-behavior. If the Claude-managed skill directory is missing, the installer SHALL
-fail with remediation that names installing Claude (or the documented shared
-staging alternative) rather than silently creating a divergent copy without
-guidance. `grok` SHALL appear in valid-host usage and error lists when this
-host is implemented.
+Optional installer host `grok` SHALL keep materializing the Grok skill path through the existing `symlink-claude` mode: `install` and `update` with `--host grok` SHALL create or refresh `~/.grok/skills/pipeline` as a symlink to the Claude-managed skill directory when that Claude install exists. The generated `hosts/grok/SKILL.md` SHALL be byte-identical to the generated Claude SKILL, so the symlink exposes the same one-pager without a distinct Grok overlay. Refreshing an existing path SHALL only replace an existing symlink. A user-owned non-symlink path SHALL be preserved with remediation. A missing Claude-managed skill directory SHALL fail with remediation rather than silently creating a divergent copy. `grok` SHALL remain in valid-host usage and error lists.
 
 #### Scenario: --host grok with Claude install present creates symlink
 
-- **WHEN** `~/.claude/skills/pipeline` (or the `CLAUDE_CONFIG_DIR` equivalent)
-  exists as a managed install
+- **WHEN** a Claude-managed skill install exists
 - **AND** the operator runs `node scripts/install.mjs install --host grok`
-  (or the equivalent `npx … install --host grok`)
-- **THEN** `~/.grok/skills/pipeline` SHALL exist as a symlink whose target is
-  that Claude skill directory
+- **THEN** `~/.grok/skills/pipeline` SHALL exist as a symlink to that Claude-managed skill directory
+- **AND** the SKILL bytes visible through the symlink SHALL match generated `hosts/grok/SKILL.md`
 
 #### Scenario: --host grok without Claude install fails with remediation
 
 - **WHEN** no Claude-managed skill install is present
 - **AND** the operator runs install with `--host grok`
 - **THEN** the installer SHALL exit non-zero
-- **AND** the error or remediation SHALL instruct the operator to install the
-  Claude host (or follow the documented shared-staging path) before or with
-  Grok path setup
+- **AND** the remediation SHALL instruct the operator to install the Claude host or documented shared staging path
 
 #### Scenario: --host grok preserves existing non-symlink skill path
 
-- **WHEN** `~/.grok/skills/pipeline` exists as a directory or other non-symlink
-  path (for example a copy-based Grok skill layout)
+- **WHEN** `~/.grok/skills/pipeline` exists as a directory or other non-symlink path
 - **AND** the operator runs install with `--host grok`
 - **THEN** the installer SHALL NOT recursively delete that path
-- **AND** SHALL exit non-zero
-- **AND** the error or remediation SHALL instruct the operator to relocate or
-  remove the path before converting to the preferred symlink layout
+- **AND** SHALL exit non-zero with relocation or removal remediation
 
 #### Scenario: --host grok refreshes an existing symlink without deleting trees
 
-- **WHEN** `~/.grok/skills/pipeline` exists as a symlink whose target is not the
-  current Claude skill directory
+- **WHEN** `~/.grok/skills/pipeline` exists as a symlink whose target is not the current Claude skill directory
 - **AND** the operator runs install with `--host grok` with Claude present
-- **THEN** the installer SHALL replace only the symlink (unlink + recreate)
+- **THEN** the installer SHALL replace only the symlink
 - **AND** SHALL NOT recursively delete any directory tree at that path
 
 #### Scenario: No Grok SKILL.md fork required
 
 - **WHEN** `--host grok` is implemented
-- **THEN** the repository SHALL NOT require a `hosts/grok/SKILL.md` overlay
-  solely to satisfy this host target
-- **AND** Grok SHALL continue to consume the Claude (or shared) skill content
-  via the materialized path
+- **THEN** the repository SHALL keep `hosts/grok/SKILL.md` only as a generated byte-identical conformance output
+- **AND** the installer SHALL NOT consume it as a distinct Grok overlay
+- **AND** Grok SHALL continue to consume the shared Claude-managed skill content through the materialized symlink
+
+#### Scenario: Grok manifest preserves the existing lifecycle
+
+- **WHEN** the Grok repository conformance file is added
+- **THEN** the Grok outer-host manifest SHALL remain `mode: "symlink-claude"`
+- **AND** its `overlayDir` SHALL remain `hosts/claude`
+- **AND** its `overlayFiles` SHALL remain `[]`
+- **AND** install tests SHALL continue to cover symlink creation, refresh, missing-Claude remediation, and user-owned non-symlink preservation
 
 #### Scenario: Valid host lists include grok when implemented
 
 - **WHEN** `--host grok` is implemented
 - **AND** an operator passes an unknown host or reads usage
-- **THEN** `grok` SHALL appear alongside `claude`, `codex`, and `all` in the
-  documented valid host set
+- **THEN** `grok` SHALL appear alongside `claude`, `codex`, and `all` in the documented valid host set
 

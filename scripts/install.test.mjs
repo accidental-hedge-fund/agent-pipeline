@@ -1799,7 +1799,7 @@ test("VALID_HOSTS and HOSTS include grok, opencode, and omp alongside claude and
   // No hosts/grok overlay is required for this path target.
   assert.equal(HOSTS.grok.overlayFiles.length, 0);
   assert.ok(HOSTS.opencode.overlayFiles.includes("SKILL.md"));
-  assert.ok(HOSTS.omp.overlayFiles.includes("SKILL.md"));
+  assert.equal(HOSTS.omp.overlayFiles.length, 0);
 });
 
 test("usage header documents --host grok, opencode, and omp among implemented hosts (#731/#861/#1235)", () => {
@@ -3787,7 +3787,11 @@ test("install --host omp: managed skill tree + command; isolation from other hos
 
     const skillDir = join(home, ".omp", "agent", "skills", "pipeline");
     assert.ok(existsSync(join(skillDir, MANAGED_MARKER)), "managed marker required");
-    assert.ok(existsSync(join(skillDir, "SKILL.md")), "OMP SKILL.md required");
+    assert.equal(
+      existsSync(join(skillDir, "SKILL.md")),
+      false,
+      "OMP tree install must not overlay a SKILL.md",
+    );
     assert.ok(existsSync(join(skillDir, "scripts", "pipeline.mjs")), "launcher required");
     assert.ok(existsSync(join(skillDir, "core", "package.json")), "core required");
     assert.ok(existsSync(join(skillDir, "core", "profiles", "omp.json")), "omp profile required");

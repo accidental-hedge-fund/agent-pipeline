@@ -248,7 +248,7 @@ When the composed `train --merge` would plan or implement any milestone item whi
 
 After `train --merge` is complete or resumed complete, in-engine `pipeline ship` SHALL run Factory Reliability Gate (FRG) pack (`factory-release prepare` and `factory-gate`), `pipeline release`, `release finish`, and any coordinator-invoked tag on the candidate engine bound to the SHA being released. The candidate engine SHALL be the control checkout at that SHA, or an explicit candidate install of that SHA.
 
-When the operator started `pipeline ship` from the previous production-pin CLI, the coordinator SHALL keep that pin process as the durable coordinator and SHALL spawn the candidate engine for leaf post-train verbs (`factory-release prepare`, `factory-gate`, `release`, `release finish`, and `release ensure-tag`). After a successful candidate `factory-gate`, the coordinator SHALL re-invoke the same candidate `factory-release prepare --request <absolute-request.json> --json` until that command returns `status: "complete"`. It SHALL NOT return from the FRG pack phase at the attestation checkpoint. It SHALL NOT treat the later standalone `pipeline release` leaf as a substitute for that complete checkpoint. `release ensure-tag` SHALL run the candidate's `ensureAnnotatedReleaseTag`; it SHALL NOT import that helper from the production-pin process. It SHALL NOT re-exec `pipeline ship`. It SHALL NOT rerun train. It SHALL NOT keep executing those leaf verbs inside the production-pin process when that process source SHA differs from the candidate. Train and `engine-promote` SHALL remain on the production pin.
+When the operator started `pipeline ship` from the previous production-pin CLI, the coordinator SHALL keep that pin process as the durable coordinator and SHALL spawn the candidate engine for leaf post-train verbs (`factory-release prepare`, `factory-gate`, `release`, `release finish`, and `release ensure-tag`). After a successful candidate `factory-gate`, the coordinator SHALL re-invoke the same candidate `factory-release prepare --request <absolute-request.json> --json` once. When that prepare returns `status: "complete"`, the FRG pack phase SHALL return. When that prepare still returns `status: "awaiting_frg_attestation"` because observation is absent or rejected, the FRG pack phase SHALL fail closed and SHALL name unsigned `frg_run_id` `A`, observed `latest.json` `run_id` `B` when present, and the observe miss reason. It SHALL NOT spawn factory-gate again for that unchanged checkpoint. It SHALL NOT return from the FRG pack phase at the first attestation checkpoint. It SHALL NOT treat the later standalone `pipeline release` leaf as a substitute for that complete checkpoint. `release ensure-tag` SHALL run the candidate's `ensureAnnotatedReleaseTag`; it SHALL NOT import that helper from the production-pin process. It SHALL NOT re-exec `pipeline ship`. It SHALL NOT rerun train. It SHALL NOT keep executing those leaf verbs inside the production-pin process when that process source SHA differs from the candidate. Train and `engine-promote` SHALL remain on the production pin.
 
 The coordinator SHALL fail closed before those ship-end verbs if it cannot resolve a matching candidate engine. A failed resolution SHALL persist the train checkpoint and SHALL NOT start FRG pack or release mutation. This requirement does not authorize `--skip-frg` as the default. It does not authorize promote before GitHub Release publication.
 
@@ -278,8 +278,10 @@ The coordinator SHALL fail closed before those ship-end verbs if it cannot resol
 
 - **WHEN** candidate `factory-release prepare --request <absolute-request.json> --json` returns `status: "awaiting_frg_attestation"`
 - **AND** candidate `factory-gate --for <X.Y.Z> --from-run <loop_run_id>` succeeds
-- **THEN** the coordinator SHALL re-invoke the same candidate `factory-release prepare` with that unchanged request
-- **AND** it SHALL NOT return from the FRG pack phase until that prepare returns `status: "complete"`
+- **THEN** the coordinator SHALL re-invoke the same candidate `factory-release prepare` with that unchanged request once
+- **AND** when that prepare returns `status: "complete"`, the FRG pack phase SHALL return
+- **AND** when that prepare still returns `status: "awaiting_frg_attestation"`, the FRG pack phase SHALL fail closed
+- **AND** it SHALL NOT spawn factory-gate again for that unchanged checkpoint
 - **AND** it SHALL NOT treat the later standalone `pipeline release` leaf as a substitute for that complete checkpoint
 
 #### Scenario: Coordinator-invoked tag runs candidate ensure-tag
@@ -364,12 +366,12 @@ An existing `v<X.Y.Z>` SHALL succeed only when origin has an annotated tag whose
 
 ### Requirement: In-engine ship FRG pack wait SHALL outlive the bound pack loop
 
-In-engine `pipeline ship` SHALL keep re-invoking the same candidate `factory-release prepare` request while prepare status is `in_progress` and the bound pack loop is live (`lock.json` pid alive or ledger not terminal). Wait-budget expiry while that loop is live SHALL NOT fail the ship. A short FRG tick cap (including 120 × 10s) plus a "retry the same ship command to resume" error SHALL NOT be pack-fail in that case. The coordinator SHALL keep the ship ledger FRG phase running and SHALL heartbeat on each wait tick. The coordinator SHALL NOT kill the pack loop. Wait-budget expiry MAY fail the FRG pack phase only when the bound loop is not live. Unreadable or malformed `lock.json` or `ledger.json` SHALL NOT count as not-live. The coordinator SHALL keep re-invoking and heartbeat while liveness is unknown. The bound loop is not live only after a positive dead-or-missing lock pid and a positive terminal-or-missing ledger. This requirement does not return from the FRG pack phase at the attestation checkpoint. It does not authorize `--skip-frg` as the default.
+In-engine `pipeline ship` SHALL keep re-invoking the same candidate `factory-release prepare` request while prepare status is `in_progress` and the bound pack loop is live. Live SHALL mean the authoritative pack-loop liveness status object (prepare JSON `liveness`, or the same TypeScript probe): a valid `loop_run_handoff` for that exact loop, plus the exact PID, process-start identity, boot identity, and a fresh heartbeat. A non-terminal ledger SHALL NOT prove live. Wait-budget expiry while that loop is live SHALL NOT fail the ship. A short FRG tick cap (including 120 × 10s) plus a "retry the same ship command to resume" error SHALL NOT be pack-fail in that case. The coordinator SHALL keep the ship ledger FRG phase running and SHALL heartbeat on each wait tick. The coordinator SHALL NOT kill the pack loop. Wait-budget expiry MAY fail the FRG pack phase when the bound loop is not live. Unreadable identity evidence SHALL consume the bounded observation window and then fail closed with a typed observer or identity error. It SHALL NOT keep wait-budget from applying as not-live after that window. False live SHALL NOT disable the wait cap. This requirement does not return from the FRG pack phase at the attestation checkpoint. It does not authorize `--skip-frg` as the default.
 
 #### Scenario: In-engine live-loop wait expiry is not ship fail
 
 - **WHEN** candidate `factory-release prepare` returns `status: "in_progress"` for bound loop `L`
-- **AND** `L` is live
+- **AND** `L` is live under acknowledged-process liveness
 - **AND** the numeric FRG tick cap is exhausted
 - **THEN** `pipeline ship` SHALL NOT fail the FRG pack phase for wait-budget exhaustion
 - **AND** it SHALL keep re-invoking the same request
@@ -383,13 +385,31 @@ In-engine `pipeline ship` SHALL keep re-invoking the same candidate `factory-rel
 - **THEN** `pipeline ship` SHALL fail the FRG pack phase
 - **AND** it SHALL NOT open or finish a release PR for that version on that evidence
 
+#### Scenario: In-engine dead pid plus open ledger is not live
+
+- **WHEN** candidate `factory-release prepare` returns `status: "in_progress"` for bound loop `L`
+- **AND** lock pid for `L` is dead or missing
+- **AND** the ledger for `L` is present without `stop`
+- **AND** events for `L` are not terminal
+- **THEN** `pipeline ship` SHALL NOT classify `L` as live
+- **AND** wait-budget expiry MAY fail the FRG pack phase
+- **AND** `last_error` SHALL include the child exit status and a safe stderr excerpt when that child exited before handoff
+
 #### Scenario: In-engine unreadable liveness at cap is not ship fail
 
 - **WHEN** candidate `factory-release prepare` returns `status: "in_progress"` for bound loop `L`
-- **AND** lock or ledger state for `L` is unreadable or malformed
-- **AND** the numeric FRG tick cap is exhausted
+- **AND** identity evidence for `L` is unreadable or malformed
+- **AND** the bounded observation window has not expired
 - **THEN** `pipeline ship` SHALL NOT fail the FRG pack phase for wait-budget exhaustion
-- **AND** it SHALL keep re-invoking the same request
+- **AND** it SHALL keep observing `L`
+
+#### Scenario: In-engine unreadable identity after the observation window is ship fail
+
+- **WHEN** candidate `factory-release prepare` returns `status: "in_progress"` for bound loop `L`
+- **AND** identity evidence for `L` is unreadable or malformed
+- **AND** the bounded observation window has expired
+- **THEN** `pipeline ship` SHALL fail the FRG pack phase with a typed observer or identity error
+- **AND** it SHALL NOT keep re-invoking as if `L` were live
 
 #### Scenario: Regression fails if in-engine wait treats live in_progress as terminal
 
@@ -569,3 +589,36 @@ Ship FRG observation SHALL return null when `.agent-pipeline/frg/<X.Y.Z>/latest.
 - **THEN** observation SHALL fail closed
 - **AND** it SHALL NOT return null
 - **AND** it SHALL NOT start FRG pack on that drifted identity
+
+### Requirement: In-engine runFrgPack SHALL fail closed after one attest observation
+
+In-engine `pipeline ship` FRG pack (`runFrgPack` / `bindCandidateShipEndOperations`) SHALL spawn credentialed candidate `factory-gate --for <X.Y.Z> --from-run <loop_run_id>` at most once for an unchanged complete unsigned checkpoint binding. After that child exits 0, it SHALL re-invoke the same candidate `factory-release prepare --request <absolute-request.json> --json` once. If that prepare still returns `status: "awaiting_frg_attestation"` because observation is absent or rejected, `runFrgPack` SHALL throw. The error SHALL name unsigned `frg_run_id` `A`, observed `latest.json` `run_id` `B` when present, and the observe miss reason. It SHALL NOT `continue` forever on `"attest"`. It SHALL NOT spawn another factory-gate for that binding.
+
+A changed complete checkpoint binding SHALL reset the allowance. Live `"retry"` wait while the bound pack loop is live SHALL keep the existing #1150 law. `"attest"` SHALL NOT inherit that live-loop uncap.
+
+The existing re-invoke test SHALL drive a real-shaped `--from-run` payload (HMAC-pass `run_id=B`, `pack_provenance`, top-level `factory_release_binding` matching unsigned `A`) through the observe contract. It SHALL NOT mock factory-gate as a no-op that magically makes the next prepare return `complete`. A unit test SHALL fail if unsigned `A` plus `--from-run` `B` + `pack_provenance` and no `factory_release_binding` is treated as observe success, or if `runFrgPack` never terminates.
+
+This requirement does not authorize `--skip-frg`. It does not treat standalone `pipeline release` as a substitute for prepare `complete`.
+
+#### Scenario: HMAC from-run latest.json is observable or ship fails closed
+
+- **WHEN** unsigned checkpoint `frg_run_id` is `A`
+- **AND** HMAC `latest.json` `run_id` is `B` for the same loop and candidate
+- **AND** in-engine `runFrgPack` has spawned factory-gate once and re-invoked prepare once
+- **THEN** prepare SHALL return `status: "complete"` when `factory_release_binding` matches `A`
+- **OR** `runFrgPack` SHALL throw naming `A`, `B`, and the miss reason when observation is absent or rejected
+- **AND** it SHALL NOT loop
+
+#### Scenario: Attest ticks are bounded
+
+- **WHEN** prepare keeps returning `status: "awaiting_frg_attestation"` for unchanged unsigned `A`
+- **AND** ship has already spawned factory-gate once for that checkpoint
+- **THEN** `runFrgPack` SHALL throw
+- **AND** it SHALL NOT spawn another factory-gate
+
+#### Scenario: Magical complete after no-op gate is not the proof
+
+- **WHEN** the candidate FRG pack re-invoke test runs
+- **THEN** factory-gate SHALL persist a real-shaped `--from-run` payload
+- **AND** the next prepare `complete` SHALL be a consequence of accepted observation of that payload
+- **AND** the test SHALL fail if factory-gate is a no-op and prepare returns `complete` anyway

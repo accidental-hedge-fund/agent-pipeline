@@ -21,6 +21,7 @@ A newcomer who completed Prerequisites, Install, and Quickstart in the README ha
 - [Shipcheck gate (optional, default off)](#shipcheck-gate-optional-default-off)
 - [OpenSpec integration (optional)](#openspec-integration-optional)
 - [last30days context (optional, default off)](#last30days-context-optional-default-off)
+- [Planning facts (optional, default off)](#planning-facts-optional-default-off)
 - [Commit traceability trailers (always on)](#commit-traceability-trailers-always-on)
 - [Planning-leverage and material-rework telemetry](#planning-leverage-and-material-rework-telemetry)
 - [Risk-calibrated progressive planning (research)](#risk-calibrated-progressive-planning-research)
@@ -29,6 +30,7 @@ A newcomer who completed Prerequisites, Install, and Quickstart in the README ha
 - [Troubleshooting](#troubleshooting)
 - [Desktop / editor integration](#desktop--editor-integration)
 - [Repository layout](#repository-layout)
+- [Operator follow and notify](#operator-follow-and-notify)
 
 ## How hosts share one CLI
 
@@ -42,7 +44,7 @@ Hosts (Claude Code `/pipeline`, Codex `$pipeline`, and others) are shims around 
 - Scaffolds `.github/pipeline.yml` with documented defaults
 - Ensures local-only paths under `.agent-pipeline/` are gitignored
 
-Ignored local paths (must never be committed): `.agent-pipeline/runs/`, `.agent-pipeline/roadmap/`, `.agent-pipeline/history/`, `.agent-pipeline/frg/`, `.agent-pipeline/factory-release/`, `.agent-pipeline/grill-proposal.key`, `.agent-pipeline/grill-proposals/`. Without that gitignore block, the first run can leave the worktree dirty and fail `pipeline doctor`'s `worktree-clean` check.
+Ignored local paths (must never be committed): `.agent-pipeline/runs/`, `.agent-pipeline/roadmap/`, `.agent-pipeline/history/`, `.agent-pipeline/evals/`, `.agent-pipeline/control-attributions.jsonl`, `.agent-pipeline/product-fault-reports.jsonl`, `.agent-pipeline/handoffs/`, `.agent-pipeline/outcomes/`, `.agent-pipeline/lineage/`, `.agent-pipeline/frg/`, `.agent-pipeline/harness-ownership/`, `.agent-pipeline/factory-release/`, `.agent-pipeline/grill-proposal.key`, and `.agent-pipeline/grill-proposals/`. Without that gitignore block, the first run can leave the worktree dirty and fail `pipeline doctor`'s `worktree-clean` check.
 
 After `init`, commit the config, label an issue `pipeline:ready`, and run `/pipeline N` or `$pipeline N`.
 
@@ -183,6 +185,12 @@ If the target repo has an `openspec/` directory (or `openspec.enabled: on` / boo
 
 When `last30days.enabled: true`, a pre-planning brief from the [last30days skill](https://github.com/mvanhorn/last30days-skill) is injected into planning. Always non-blocking if the skill is missing. **Do not enable for issues with sensitive customer data** — the research topic is forwarded to external data sources after redaction.
 
+## Planning facts (optional, default off)
+
+When `.github/pipeline.yml` omits `planning_facts` or sets `providers: []`, planning is unchanged: no provider spawn, no planning-facts prompt section, no new block. Repositories that need a mutable fact (for example a migration head) declare a named provider: a repo-relative executable that prints versioned JSON. The engine reads provider config and executable bytes from the trusted integration-base revision, runs the script in the managed planning worktree with a constructed environment (no inherited credentials), and injects the bound bundle immediately before planning, plan-revision, and plan-review.
+
+A required provider failure blocks before the model with tag `planning-facts-provider-contract`. Optional failure records the fact as unavailable. Prose verification is not engine-verified; only a typed claims artifact that names a fact id and the current value digest is. Implementers still re-read current worktree state before writing. See [config.md](config.md) for the block shape and ceilings.
+
 ## Commit traceability trailers (always on)
 
 Every pipeline-produced commit carries:
@@ -300,7 +308,7 @@ Machine-facing helpers (no change to human skill flows):
 | `hosts/` | Per-host packaging (`claude`, `codex`, …) |
 | `plugin/` | Generated SKILL overlay — transitional until #1050; not the product; do not hand-edit |
 | `scripts/build.mjs` | Generate/check the SKILL overlay and marketplace catalog |
-| `scripts/generate-docs.mjs` | Generate/check CLI, config, CHANGELOG, SKILL command tables |
+| `scripts/generate-docs.mjs` | Generate/check CLI, config, and CHANGELOG (not host SKILLs) |
 | `docs/` | Operator docs (`packaging.md`, `cli.md`, `config.md`, `concepts.md`) |
 | `openspec/` | Living specs + in-flight changes |
 | `ROADMAP.md` | Human-readable forward plan (milestones own release plan membership) |
@@ -308,7 +316,7 @@ Machine-facing helpers (no change to human skill flows):
 
 ## Generated docs contract
 
-CLI and config references plus `CHANGELOG.md` and host SKILL command-table regions are **generated**. After changing `command-registry.ts` / `command-docs.ts`, the Zod schema in `config.ts`, or release tags:
+CLI and config references plus `CHANGELOG.md` are **generated**. Host SKILLs are generated by `node scripts/build.mjs`, not this docs generator. After changing `command-registry.ts` / `command-docs.ts`, the Zod schema in `config.ts`, or release tags:
 
 ```bash
 node scripts/generate-docs.mjs
@@ -331,3 +339,119 @@ node scripts/release-docs-refresh.mjs --version X.Y.Z --push
 ```
 
 Release prepare (`pipeline release <version>`) does not invent the shipped tag entry (the tag does not exist yet). `pipeline release finish` merges only; it does not tag or publish. Ship-end `pipeline release ensure-tag` owns `vX.Y.Z` when FRG is gitignored.
+
+## Operator follow and notify
+
+Generated host SKILLs carry the compact contract. This page keeps the operator detail that left those essays.
+
+### Run ids and follow commands
+
+`pipeline status <N>` reports issue metadata (stage, blocker, PR). It does not discover a run id.
+
+CLI dispatch is unchanged: `pipeline <N>` is a direct advance. `pipeline single <N>` and `pipeline loop` launch through the durable loop.
+
+Direct numeric advance retains `advance_run_id` from the `advance_run_handoff` JSON line (`run_id`). That value is the run-store basename (`<issue>-<filesystem-safe-timestamp>`), not the commit-trailer `Pipeline-Run` id (`<issue>/<ISO>`). Follow:
+
+```
+pipeline logs <advance-run-id> --events --follow
+```
+
+Loop and `pipeline single` retain `loop_run_id` from the durable handoff. Follow:
+
+```
+pipeline loop logs <loop-run-id> --events --follow
+```
+
+After `loop_item_advance_linked` publishes `pipeline_run_id`, retain that value as `<advance-run-id>` and also follow:
+
+```
+pipeline logs <advance-run-id> --events --follow
+```
+
+Keep the loop follow active. On a later linkage or a terminal advance, stop or replace the prior advance follow. Advance `run_complete` stops or replaces only that advance follow. Keep the loop follow active while the loop remains live. Stop the loop-scoped follow set only on `loop_run_complete`, `loop_run_stopped`, or supervisor exit, in the same turn. Reattach an interrupted follow with the same retained ids. Interrupted follow is non-terminal. Cancelled wait is not completion.
+
+After a confirmed terminal loop outcome, emit a final summary with starting-to-ending stage, elapsed time or transitions when available, PR URL when present, terminal state, the operator-authorized merge next step, and confirmation that follows stopped. After a confirmed terminal direct-advance outcome, emit the same fields for that advance. Merge is an operator-authorized next step, not an observer action. Premature supervisor exit is non-terminal failure/recovery, never completion.
+
+`pipeline loop --audit` is a short synchronous read-only report. Drive and resume are long-running.
+
+Supported loop selectors: `--milestone <name>`, `--label <label>`, `--range <spec>`, `--roadmap-slice <slice>`, and an explicit issue list (one or more issue numbers). Selector arguments are mutually exclusive with `--resume`. Combining a selector with `--resume` exits non-zero and names the conflict. `--audit` is read-only.
+
+Diagnostic fallback for the raw loop stream: `<state-home>/runs/<loop_run_id>/events.jsonl`. State-home resolution order: `AGENT_PIPELINE_STATE_HOME` (preferred) or legacy `PIPELINE_STATE_HOME`; then `$XDG_STATE_HOME/agent-pipeline/loop`; then `~/.local/state/agent-pipeline/loop`. Do not use an informal `/tmp/pipeline-*.log` as the evidence contract.
+
+When an early `loop_run_handoff` is missing and `--resume` is not in use, discover the run by contract, not by newest basename. Snapshot run directories present before launch. Then scan every candidate under `<state-home>/runs/` (ignore `.init-*` staging). Select only a directory that has `contract.json` and `events.jsonl` and a live `lock.json` whose `pid` is this launch (exact integer match) or a descendant of it, while the launcher process instance is still the same pid plus starttime. Do not treat the first newly published basename as ownership. Keep polling until a lock match appears or this launch instance is gone.
+
+Linked-advance follow remains required for complete mid-item stage progress until dense first-class loop progress ships (#611, #682). Re-attach after cancelled wait is #725. Loop-only follow covers schedule, hold, mirrored gate progress, and terminal loop events; it is insufficient alone for mid-item stage progress until those successors land.
+
+### Material event kinds
+
+Use `scripts/material-filter.mjs` on follow streams. Unfiltered `events.jsonl` stays the complete evidence file. Human-visible notify uses that material filter so test-gate output cannot surface fixture transitions for unrelated issue numbers, broad stdout matching cannot treat those lines as progress, and rapid duplicate notifications cannot auto-stop a host Monitor. The filter is a notification projection. It does not rewrite the run store. It suppresses heartbeats, accounting noise, kinds outside the material sets, skipped-stage start/complete, repeated identical schedule/reconcile evaluations in one burst, later identical CI `waiting` after the first in a stretch, repeated identical definitive `loop_item_progress` results, and repeated CI `partial` / OpenSpec `skipped` outcomes.
+
+Advance material kinds: `run_start`, `stage_start`, `stage_complete`, `pr_created`, `pr_updated`, `review_verdict`, `gate_result`, `blocker_set`, `blocker_cleared`, `run_complete`.
+
+Loop material kinds: `loop_item_started`, `loop_item_transitioned`, `loop_item_blocked`, `loop_item_advance_linked`, `loop_item_advance_finished`, `loop_item_stage_progress`, `loop_item_progress`, `loop_run_stopped`, `loop_run_complete`.
+
+Optional loop kinds (burst-suppressed): `loop_schedule_evaluated`, `loop_reconciled`, `loop_merge_barrier_cleared`, `loop_item_paused`, `loop_item_waiting`, `loop_item_resumed`, `loop_item_abandoned`, `loop_item_skipped`, `loop_item_precondition_excluded`, `loop_recovery_attempt`, `loop_run_superseded`.
+
+Definitive `loop_item_progress` statuses: `pass`, `fail`, `approve`, `needs_attention`, `attempted`, `success`, `exhausted`, `blocked`, `advanced`, `started`. Surface the first CI `waiting` in a stretch; suppress later identical waits. Suppress repeated identical definitive `loop_item_progress` results. Suppress repeated CI `partial` and OpenSpec `skipped` outcomes.
+
+Train material kinds: `run_start`, `train_work_list_resolved`, `train_wave_started`, `train_loop_linked`, `train_item_started`, `train_item_completed`, `train_pr_created`, `train_merge_attempted`, `train_merge_proven`, `train_merge_integrated`, `train_sibling_halted`, `train_wave_ended`, `run_complete`.
+
+Train follow: parse `train_run_handoff` for `run_id`, then `pipeline logs <train-run-id> --events --follow` through the shared material filter. When `train_loop_linked` publishes a loop id, dual-follow that loop stream.
+
+### Native `/goal` bootstrap
+
+Starting a durable loop is an operator-owned two-step bootstrap inside the host's native autonomous mode:
+
+- Claude: run `/goal`, then invoke `pipeline loop …` inside that session.
+- Codex: run `/goal`, then invoke `pipeline loop …` inside that session.
+
+The Pipeline skill does not detect whether native goal mode is active. It does not invoke or re-enter that mode. It does not control the native goal session's lifecycle. Ending the native goal session is a host or operator action after `pipeline loop` reports its own terminal and reconciliation conditions. The skill neither ends that session nor merges.
+
+### Adapters, update, lessons, artifacts, stages, release plan
+
+Five local-CLI adapters: `claude`, `codex`, `grok`, `opencode`, `pi`. Login is operator-run before use. Similarly named effort levels are not comparable across harnesses.
+
+| Adapter | Login | Example stage assignment |
+| --- | --- | --- |
+| `claude` | Run `claude` once to complete login | `harnesses: { implementer: claude }` |
+| `codex` | `codex login` | `harnesses: { reviewer: codex }` |
+| `grok` | `grok login` | `harnesses: { implementer: grok }` |
+| `opencode` | `opencode auth login` | `harnesses: { implementer: opencode }` |
+| `pi` | Run `pi` once and complete `/login` | `harnesses: { implementer: pi }` |
+
+Per-stage YAML example:
+
+```yaml
+harnesses:
+  implementer: claude
+  reviewer: codex
+effort:
+  implementing: medium
+  review: high
+```
+
+Grok as implementer (schema-valid local-CLI harness assignment, not a `stage_executors` name):
+
+```yaml
+harnesses:
+  implementer: grok
+  reviewer: codex
+```
+
+Grok notify uses its outer-host manifest mapping (`grok_monitor_lines` / `monitor`). Portable fallback is stdout material lines via `events.jsonl` plus `material-filter.mjs`. Do not require Claude `PushNotification` on Grok.
+
+Refresh an installed engine with:
+
+```
+npx github:accidental-hedge-fund/agent-pipeline update
+```
+
+Carry-forward lessons live in a maintainer-curated `## Lessons / Gotchas` section of the conventions file (`conventions_md_path`, else `CLAUDE.md`). No stage writes that file.
+
+Local-only artifact paths (must stay gitignored): `.agent-pipeline/runs/`, `.agent-pipeline/roadmap/`, `.agent-pipeline/history/`, `.agent-pipeline/evals/`, `.agent-pipeline/control-attributions.jsonl`, `.agent-pipeline/product-fault-reports.jsonl`, `.agent-pipeline/handoffs/`, `.agent-pipeline/outcomes/`, `.agent-pipeline/lineage/`, `.agent-pipeline/frg/`, `.agent-pipeline/harness-ownership/`, and `.agent-pipeline/factory-release/`.
+
+Full stage inventory lives in living specs and engine `STAGES`, not in the generated SKILL. Loop selectors are documented above; see [cli.md](cli.md) for the generated verb inventory.
+
+Release-plan rows live in `ROADMAP.md`. Columns: Release, Bump, Theme, Issues, Why. The unshipped row shape is `| **vX.Y.Z** | bump | theme | issues | why |`. `pipeline release <version>` prepares a release PR from the matching GitHub milestone plan. Release scaffolds a missing unshipped row when the `| *(none)* |` insert sentinel is present, or fails with remediation (file, copy-paste row, restore the sentinel) when it is not. `Ship milestone vX.Y.Z` maps to `pipeline ship --milestone vX.Y.Z`.
+
+True-fast commands (`status`, `doctor`, read-only `pipeline loop --audit`) complete in seconds and need no Monitor. `status` completes in seconds. Loop drive/resume and `pipeline train` do not.

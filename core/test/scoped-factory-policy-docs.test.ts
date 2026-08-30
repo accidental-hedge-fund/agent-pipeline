@@ -64,13 +64,18 @@ test("all host skills keep merge loop-isolated without a grant factory", () => {
   for (const relPath of [
     "hosts/claude/SKILL.md",
     "hosts/codex/SKILL.md",
+    "hosts/grok/SKILL.md",
     "hosts/opencode/SKILL.md",
   ]) {
     const source = read(relPath);
-    assertMergeIsolation(source, relPath);
-    assert.match(source, /merge-queue`? is dry-run by default/i);
-    assert.match(source, /only `grok-4\.6`, with no Grok fallback/i);
+    assert.match(source, /ready-to-deploy/);
+    assert.match(source, /never merge or deploy/);
+    assert.match(source, /Operator-authorized/);
+    assert.match(source, /merge-queue is dry-run by default/);
+    assert.match(source, /never invokes a merge-capable command/);
+    assert.match(source, /`Ship milestone vX\.Y\.Z` maps to `pipeline ship --milestone vX\.Y\.Z`/);
   }
+  assertMergeIsolation(read("AGENTS.md"), "AGENTS.md");
 });
 
 test("command copy names operator authority and keeps dry-run default", () => {

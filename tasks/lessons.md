@@ -1,6 +1,9 @@
 # Lessons
 
+- During long Pipeline model calls, report concrete stage transitions and blocker evidence at least once per minute. If output is silent, inspect the live process and written artifacts; do not leave the operator guessing whether the run is active.
+- A plan-review request cannot broaden an issue past an explicit non-goal. When a required generated host artifact appears to conflict with an existing install lifecycle, inspect the living lifecycle contract and prefer content parity at the existing seam before changing install mode.
 - Before dispatching any durable backlog item while a milestone train is live, compare exact issue identities and subtract every overlap from this run. The train owns overlapping issues; do not infer safety from separate processes or worktrees.
+- A train-owned issue is not necessarily under active recovery. Check the train event stream for `train_item_completed` and later waves. If it terminalized the issue and moved on, report that scheduler gap instead of saying the train is still handling it; later repair commits still need a fresh Pipeline/CI/review pass.
 - When the operator requires per-issue integration, `pipeline:ready-to-deploy` is not a batching point. Merge that issue through the Pipeline merge gate, prove `main` contains the merge, reconcile the ledger, and only then dispatch a dependent successor.
 
 - A newly filed issue that belongs to the active milestone cannot be left unmilestoned. Assign its release milestone when creating it; do not wait for the operator to correct the omission.

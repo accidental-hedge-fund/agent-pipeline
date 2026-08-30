@@ -32,6 +32,10 @@ import {
   type OverrideApproverRule,
   type OverrideClassPolicy,
   type OverrideGovernanceConfig,
+  PLANNING_FACT_VALUE_TYPES,
+  PLANNING_FACTS_PIPELINE_CEILINGS,
+  type PlanningFactProviderConfig,
+  type PlanningFactsConfig,
 } from "./types.ts";
 import { parseGitPushAuth, GitPushAuthConfigError } from "./git-push-auth.ts";
 import { loadProfile, type PipelineProfile } from "./profile.ts";
@@ -237,6 +241,187 @@ const ExecutorDefinitionSchema = z.discriminatedUnion("type", [
   ModelEndpointExecutorSchema,
 ]);
 
+const PLANNING_FACT_TYPE_ENUM = z.enum(PLANNING_FACT_VALUE_TYPES);
+
+/** Repo-relative provider path: no absolute, no `..` segment, no empty segment. */
+export function isSafePlanningFactsExecutable(value: string): boolean {
+  if (typeof value !== "string" || value.length === 0) return false;
+  if (value !== value.trim()) return false;
+  if (path.isAbsolute(value) || value.startsWith("~") || value.includes("\\")) return false;
+  const parts = value.split("/");
+  if (parts.some((seg) => seg === "" || seg === "." || seg === "..")) return false;
+  return true;
+}
+
+const PlanningFactProviderSchema = z
+  .object({
+    id: z.string().min(1).describe("Unique provider id within the planning_facts.providers list."),
+    executable: z
+      .string()
+      .min(1)
+      .describe("Repo-relative path to the provider executable. Absolute paths and `..` segments are rejected."),
+    args: z
+      .array(z.string())
+      .optional()
+      .describe("Additional argv entries passed to the provider. Literal bytes; never interpreted by a shell. Default empty."),
+    required: z
+      .boolean()
+      .describe("When true, provider failure blocks before the planning model is invoked. When false, failure emits unavailable records and planning may continue."),
+    facts: z
+      .record(z.string().min(1), PLANNING_FACT_TYPE_ENUM)
+      .describe("Non-empty map of allowed fact ids to primitive or array-of-primitive types."),
+  })
+  .strict()
+  .superRefine((provider, ctx) => {
+    if (!isSafePlanningFactsExecutable(provider.executable)) {
+      ctx.addIssue({
+        code: "custom",
+        message:
+          "executable must be a repo-relative path with no absolute prefix and no `..` segment",
+        path: ["executable"],
+      });
+    }
+    if (Object.keys(provider.facts).length === 0) {
+      ctx.addIssue({
+        code: "custom",
+        message: "facts must declare at least one fact id",
+        path: ["facts"],
+      });
+    }
+  });
+
+function planningFactsCeiling(key: keyof typeof PLANNING_FACTS_PIPELINE_CEILINGS, description: string) {
+  const max = PLANNING_FACTS_PIPELINE_CEILINGS[key];
+  return z
+    .number()
+    .int()
+    .positive()
+    .max(max, `${key} cannot exceed the pipeline-owned ceiling of ${max}`)
+    .optional()
+    .describe(description);
+}
+
+const PlanningFactsBlockSchema = z
+  .object({
+    providers: z
+      .array(PlanningFactProviderSchema)
+      .optional()
+      .describe("Named providers. Empty (default): no spawn, no planning-facts prompt section."),
+    timeout_ms: planningFactsCeiling(
+      "timeout_ms",
+      `Per-provider runtime ceiling in milliseconds (pipeline max ${PLANNING_FACTS_PIPELINE_CEILINGS.timeout_ms}; repository may only lower).`,
+    ),
+    max_stdout_bytes: planningFactsCeiling(
+      "max_stdout_bytes",
+      `Per-provider stdout ceiling in bytes (pipeline max ${PLANNING_FACTS_PIPELINE_CEILINGS.max_stdout_bytes}; repository may only lower).`,
+    ),
+    max_stderr_bytes: planningFactsCeiling(
+      "max_stderr_bytes",
+      `Per-provider stderr ceiling in bytes (pipeline max ${PLANNING_FACTS_PIPELINE_CEILINGS.max_stderr_bytes}; repository may only lower).`,
+    ),
+    max_fact_count: planningFactsCeiling(
+      "max_fact_count",
+      `Combined fact-count ceiling across providers (pipeline max ${PLANNING_FACTS_PIPELINE_CEILINGS.max_fact_count}; repository may only lower).`,
+    ),
+    max_key_chars: planningFactsCeiling(
+      "max_key_chars",
+      `Fact-key character ceiling (pipeline max ${PLANNING_FACTS_PIPELINE_CEILINGS.max_key_chars}; repository may only lower).`,
+    ),
+    max_value_chars: planningFactsCeiling(
+      "max_value_chars",
+      `Fact-value character ceiling for strings and each array item (pipeline max ${PLANNING_FACTS_PIPELINE_CEILINGS.max_value_chars}; repository may only lower).`,
+    ),
+    max_prompt_chars: planningFactsCeiling(
+      "max_prompt_chars",
+      `Total planning-facts prompt contribution ceiling (pipeline max ${PLANNING_FACTS_PIPELINE_CEILINGS.max_prompt_chars}; repository may only lower).`,
+    ),
+  })
+  .strict()
+  .superRefine((block, ctx) => {
+    const providers = block.providers ?? [];
+    const seenIds = new Set<string>();
+    const seenFacts = new Map<string, string>();
+    for (let i = 0; i < providers.length; i++) {
+      const p = providers[i];
+      if (seenIds.has(p.id)) {
+        ctx.addIssue({
+          code: "custom",
+          message: `duplicate provider id ${JSON.stringify(p.id)}`,
+          path: ["providers", i, "id"],
+        });
+      }
+      seenIds.add(p.id);
+      for (const factId of Object.keys(p.facts)) {
+        const owner = seenFacts.get(factId);
+        if (owner) {
+          ctx.addIssue({
+            code: "custom",
+            message: `duplicate fact id ${JSON.stringify(factId)} (also declared by provider ${JSON.stringify(owner)})`,
+            path: ["providers", i, "facts", factId],
+          });
+        } else {
+          seenFacts.set(factId, p.id);
+        }
+      }
+    }
+  });
+
+/** Resolve a parsed (or absent) planning_facts block to pipeline defaults. */
+export function resolvePlanningFactsConfig(
+  raw: z.infer<typeof PlanningFactsBlockSchema> | undefined,
+): PlanningFactsConfig {
+  const d = DEFAULT_CONFIG.planning_facts;
+  const providers: PlanningFactProviderConfig[] = (raw?.providers ?? []).map((p) => ({
+    id: p.id,
+    executable: p.executable,
+    args: [...(p.args ?? [])],
+    required: p.required,
+    facts: { ...p.facts },
+  }));
+  return {
+    providers,
+    timeout_ms: raw?.timeout_ms ?? d.timeout_ms,
+    max_stdout_bytes: raw?.max_stdout_bytes ?? d.max_stdout_bytes,
+    max_stderr_bytes: raw?.max_stderr_bytes ?? d.max_stderr_bytes,
+    max_fact_count: raw?.max_fact_count ?? d.max_fact_count,
+    max_key_chars: raw?.max_key_chars ?? d.max_key_chars,
+    max_value_chars: raw?.max_value_chars ?? d.max_value_chars,
+    max_prompt_chars: raw?.max_prompt_chars ?? d.max_prompt_chars,
+  };
+}
+
+/**
+ * Parse a trusted-base `.github/pipeline.yml` body for the planning_facts block
+ * only. Unknown sibling keys are ignored so a newer trusted file cannot fail
+ * observation solely for unrelated keys. Invalid planning_facts fails closed.
+ */
+export function parseTrustedPlanningFactsBlock(
+  yamlText: string,
+): { ok: true; config: PlanningFactsConfig } | { ok: false; error: string } {
+  let parsed: unknown;
+  try {
+    parsed = yaml.load(yamlText);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { ok: false, error: `trusted pipeline.yml is not valid YAML: ${message}` };
+  }
+  if (parsed == null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { ok: true, config: resolvePlanningFactsConfig(undefined) };
+  }
+  const block = (parsed as Record<string, unknown>).planning_facts;
+  if (block === undefined) {
+    return { ok: true, config: resolvePlanningFactsConfig(undefined) };
+  }
+  const result = PlanningFactsBlockSchema.safeParse(block);
+  if (!result.success) {
+    const errors = result.error.issues
+      .map((i) => `${["planning_facts", ...i.path].join(".")}: ${i.message}`)
+      .join("; ");
+    return { ok: false, error: errors };
+  }
+  return { ok: true, config: resolvePlanningFactsConfig(result.data) };
+}
+
 const PartialConfigSchema = z.object({
   repo: z.string().optional().describe("GitHub repository in 'owner/name' format (overrides auto-detected value)."),
   base_branch: z.string().optional().describe("Branch that PRs target and worktrees branch from."),
@@ -341,6 +526,9 @@ const PartialConfigSchema = z.object({
     .strict()
     .optional()
     .describe("Opt-in issue-implementation-readiness admission gate (#1238). Default off."),
+  planning_facts: PlanningFactsBlockSchema.optional().describe(
+    "Named planning-fact providers observed immediately before planning, plan-revision, and plan-review (#1300). Absent or empty providers: no spawn, no prompt section, no new blocking failure. SECURITY: each executable is spawned from trusted integration-base bytes with a constructed env (no inherited credentials).",
+  ),
   steps: z
     .object({
       plan_review: z.boolean().optional().describe("Cross-harness review of the plan before coding begins."),
@@ -2043,6 +2231,7 @@ export function resolveConfig(opts: ResolveOptions = {}): PipelineConfig {
       enabled: fileConfig.issue_readiness?.enabled ?? DEFAULT_CONFIG.issue_readiness.enabled,
       timeout: fileConfig.issue_readiness?.timeout ?? DEFAULT_CONFIG.issue_readiness.timeout,
     },
+    planning_facts: resolvePlanningFactsConfig(fileConfig.planning_facts),
     steps: {
       plan_review: fileConfig.steps?.plan_review ?? DEFAULT_CONFIG.steps.plan_review,
       standard_review: fileConfig.steps?.standard_review ?? DEFAULT_CONFIG.steps.standard_review,
@@ -2390,6 +2579,9 @@ export function applyTrustedVerificationPolicy(
     timeout: fileConfig.issue_readiness?.timeout ?? DEFAULT_CONFIG.issue_readiness.timeout,
   };
   applied.push("issue_readiness");
+
+  cfg.planning_facts = resolvePlanningFactsConfig(fileConfig.planning_facts);
+  applied.push("planning_facts");
 
   cfg.override_governance = resolveOverrideGovernanceConfig(fileConfig.override_governance);
   applied.push("override_governance");
@@ -3481,6 +3673,65 @@ function renderReviewHarnessBlock(reviewHarness: PartialConfig["review_harness"]
   return lines.join("\n");
 }
 
+function renderPlanningFactsTemplateBlock(config: PartialConfig, d: typeof DEFAULT_CONFIG): string {
+  const pf = resolvePlanningFactsConfig(config.planning_facts);
+  const ceilingLines = (commented: boolean): string[] => {
+    const p = commented ? "#   " : "  ";
+    return [
+      `${p}timeout_ms: ${yamlScalar(pf.timeout_ms)} # ${sd("planning_facts.timeout_ms", "per-provider runtime ceiling in milliseconds")}`,
+      `${p}max_stdout_bytes: ${yamlScalar(pf.max_stdout_bytes)} # ${sd("planning_facts.max_stdout_bytes", "per-provider stdout ceiling in bytes")}`,
+      `${p}max_stderr_bytes: ${yamlScalar(pf.max_stderr_bytes)} # ${sd("planning_facts.max_stderr_bytes", "per-provider stderr ceiling in bytes")}`,
+      `${p}max_fact_count: ${yamlScalar(pf.max_fact_count)} # ${sd("planning_facts.max_fact_count", "combined fact-count ceiling")}`,
+      `${p}max_key_chars: ${yamlScalar(pf.max_key_chars)} # ${sd("planning_facts.max_key_chars", "fact-key character ceiling")}`,
+      `${p}max_value_chars: ${yamlScalar(pf.max_value_chars)} # ${sd("planning_facts.max_value_chars", "fact-value character ceiling")}`,
+      `${p}max_prompt_chars: ${yamlScalar(pf.max_prompt_chars)} # ${sd("planning_facts.max_prompt_chars", "total planning-facts prompt contribution ceiling")}`,
+    ];
+  };
+  if (config.planning_facts !== undefined) {
+    const header =
+      "planning_facts: # named planning-fact providers (#1300). Empty providers: no spawn, no prompt section. SECURITY: each executable is spawned from trusted integration-base bytes with a constructed env (no inherited credentials).";
+    if (pf.providers.length === 0) {
+      return [
+        header,
+        "  providers: []",
+        "  # Example:",
+        "  # - id: alembic-head",
+        "  #   executable: scripts/pipeline/planning-facts/alembic-head",
+        "  #   args: []",
+        "  #   required: true",
+        "  #   facts:",
+        "  #     alembic_head: string",
+        ...ceilingLines(false),
+      ].join("\n");
+    }
+    const providerLines = pf.providers.flatMap((p) => {
+      const factLines = Object.entries(p.facts).map(
+        ([k, t]) => `        ${k}: ${t}`,
+      );
+      return [
+        `    - id: ${yamlScalar(p.id)}`,
+        `      executable: ${yamlScalar(p.executable)}`,
+        `      args: ${p.args.length ? yamlInline(p.args) : "[]"}`,
+        `      required: ${yamlScalar(p.required)}`,
+        "      facts:",
+        ...factLines,
+      ];
+    });
+    return [header, "  providers:", ...providerLines, ...ceilingLines(false)].join("\n");
+  }
+  return [
+    "# planning_facts: # named planning-fact providers (#1300). Empty providers (default): no spawn, no planning-facts prompt section. SECURITY: each executable is spawned from trusted integration-base bytes with a constructed env (no inherited credentials).",
+    "#   providers:",
+    "#     - id: alembic-head",
+    "#       executable: scripts/pipeline/planning-facts/alembic-head",
+    "#       args: []",
+    "#       required: true",
+    "#       facts:",
+    "#         alembic_head: string",
+    ...ceilingLines(true),
+  ].join("\n");
+}
+
 function renderMaybeScalar(key: string, value: unknown, comment: string): string {
   return `${key}: ${yamlScalar(value)} # ${comment}`;
 }
@@ -3613,6 +3864,8 @@ function renderConfigTemplate(config: PartialConfig = {}, source: "init" | "sync
         `#   enabled: ${yamlScalar(d.issue_readiness.enabled)} # ${sd("issue_readiness.enabled", "when true, evaluate a freshly fetched pipeline:ready issue before worktree or delivery harness")}`,
         `#   timeout: ${yamlScalar(d.issue_readiness.timeout)} # ${sd("issue_readiness.timeout", "seconds for the Implementer planning-treatment admission call")}`,
       ].join("\n"),
+    "",
+    renderPlanningFactsTemplateBlock(config, d),
     "",
     "steps: # turn optional steps off for speed/preference (default: all on)",
     `  plan_review: ${yamlScalar(steps.plan_review)} # ${sd("steps.plan_review", "cross-harness review of the plan before coding")}`,
@@ -4307,6 +4560,7 @@ function normalizeForSync(config: PartialConfig): unknown {
     openspec: { ...d.openspec, ...config.openspec },
     last30days: { ...d.last30days, ...config.last30days },
     issue_readiness: { ...d.issue_readiness, ...config.issue_readiness },
+    planning_facts: resolvePlanningFactsConfig(config.planning_facts),
     steps: { ...d.steps, ...config.steps },
     design_gate: {
       ...d.design_gate,

@@ -28,6 +28,10 @@ const HOOK_SRC = join(REPO_ROOT, ".githooks", "pre-commit");
 const GENERATED_OUTPUTS = [
   ".claude-plugin/marketplace.json",
   "plugin/pipeline/skills/pipeline/SKILL.md",
+  "hosts/claude/SKILL.md",
+  "hosts/codex/SKILL.md",
+  "hosts/grok/SKILL.md",
+  "hosts/opencode/SKILL.md",
 ];
 const UNSTAGED_BUILD_OUTPUTS = [
   "plugin/pipeline/.claude-plugin/plugin.json",
@@ -43,6 +47,10 @@ const BUILD_STUB = `import { mkdirSync, writeFileSync } from "node:fs";
 mkdirSync("plugin/pipeline/.claude-plugin", { recursive: true });
 mkdirSync("plugin/pipeline/skills/pipeline/scripts", { recursive: true });
 mkdirSync(".claude-plugin", { recursive: true });
+for (const id of ["claude", "codex", "grok", "opencode"]) {
+  mkdirSync("hosts/" + id, { recursive: true });
+  writeFileSync("hosts/" + id + "/SKILL.md", "# generated skill\\n");
+}
 writeFileSync("build-ran.marker", "ran\\n");
 writeFileSync(".claude-plugin/marketplace.json", "{}\\n");
 writeFileSync("plugin/pipeline/.claude-plugin/plugin.json", "{}\\n");
@@ -129,7 +137,7 @@ test("core/ edit triggers regeneration and stages owned outputs in the same comm
   });
 });
 
-test("hosts/claude/ edit also triggers regeneration", () => {
+test("hosts/claude/SKILL.md edit also triggers regeneration", () => {
   withRepo(BUILD_STUB, (dir) => {
     stage(dir, "hosts/claude/SKILL.md", "# overlay\n");
     git(dir, ["commit", "-q", "-m", "edit claude overlay"]);
@@ -141,6 +149,33 @@ test("hosts/claude/ edit also triggers regeneration", () => {
   });
 });
 
+test("each SKILL-host outer-host manifest triggers regeneration", () => {
+  for (const id of ["claude", "codex", "grok", "opencode"]) {
+    withRepo(BUILD_STUB, (dir) => {
+      stage(dir, `hosts/${id}/outer-host.manifest.json`, "{}\n");
+      git(dir, ["commit", "-q", "-m", `edit ${id} manifest`]);
+      assert.ok(
+        existsSync(join(dir, "build-ran.marker")),
+        `${id} manifest must trigger build.mjs`,
+      );
+      const files = committedFiles(dir);
+      assert.ok(files.includes(`hosts/${id}/outer-host.manifest.json`));
+      assert.ok(files.includes("hosts/claude/SKILL.md"));
+      assert.ok(files.includes("hosts/codex/SKILL.md"));
+      assert.ok(files.includes("hosts/grok/SKILL.md"));
+      assert.ok(files.includes("hosts/opencode/SKILL.md"));
+    });
+  }
+});
+
+test("scripts/build.mjs edit triggers regeneration", () => {
+  withRepo(BUILD_STUB, (dir) => {
+    stage(dir, "scripts/build.mjs", BUILD_STUB + "// touched\n");
+    git(dir, ["commit", "-q", "-m", "edit build"]);
+    assert.ok(existsSync(join(dir, "build-ran.marker")), "build.mjs should have run");
+  });
+});
+
 test("docs-only commit skips regeneration entirely", () => {
   withRepo(BUILD_STUB, (dir) => {
     stage(dir, "README.md", "# docs\n");
@@ -148,22 +183,22 @@ test("docs-only commit skips regeneration entirely", () => {
 
     assert.ok(
       !existsSync(join(dir, "build-ran.marker")),
-      "build.mjs must not run when no core/ or hosts/claude/ path is staged",
+      "build.mjs must not run when no generator input is staged",
     );
     assert.deepEqual(committedFiles(dir), ["README.md"], "no extra files staged");
   });
 });
 
-test("a hosts/ path outside hosts/claude/ does not trigger regeneration", () => {
+test("an unrelated hosts/ path does not trigger regeneration", () => {
   withRepo(BUILD_STUB, (dir) => {
-    stage(dir, "hosts/codex/SKILL.md", "# codex overlay\n");
-    git(dir, ["commit", "-q", "-m", "edit codex overlay"]);
+    stage(dir, "hosts/codex/agents/openai.yaml", "name: openai\n");
+    git(dir, ["commit", "-q", "-m", "edit unrelated host path"]);
 
     assert.ok(
       !existsSync(join(dir, "build-ran.marker")),
       "only declared generator inputs trigger regeneration",
     );
-    assert.deepEqual(committedFiles(dir), ["hosts/codex/SKILL.md"]);
+    assert.deepEqual(committedFiles(dir), ["hosts/codex/agents/openai.yaml"]);
   });
 });
 

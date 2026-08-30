@@ -89,38 +89,6 @@ async function main() {
     pathToFileURL(join(CORE_SCRIPTS, "types.ts")).href
   );
 
-  const skillClaude = readText("hosts/claude/SKILL.md");
-  const skillCodex = readText("hosts/codex/SKILL.md");
-  const skillOmp = readText("hosts/omp/SKILL.md");
-  const skillOpencode = readText("hosts/opencode/SKILL.md");
-  if (
-    skillClaude === null ||
-    skillCodex === null ||
-    skillOmp === null ||
-    skillOpencode === null
-  ) {
-    console.error("generate-docs: host SKILL.md files are required");
-    process.exit(1);
-  }
-
-  // SKILL files must already contain markers (bootstrap: insert once if missing).
-  const ensureMarkers = (text, hostLabel) => {
-    if (
-      text.includes("<!-- BEGIN GENERATED: cli-command-table -->") &&
-      text.includes("<!-- END GENERATED: cli-command-table -->")
-    ) {
-      return text;
-    }
-    throw new Error(
-      `generate-docs: ${hostLabel} SKILL.md is missing GENERATED cli-command-table markers`,
-    );
-  };
-
-  const claudeSrc = ensureMarkers(skillClaude, "hosts/claude");
-  const codexSrc = ensureMarkers(skillCodex, "hosts/codex");
-  const ompSrc = ensureMarkers(skillOmp, "hosts/omp");
-  const opencodeSrc = ensureMarkers(skillOpencode, "hosts/opencode");
-
   const tagStdout = listGitTagReleases();
   const changelogReleases = parseGitTagListLines(tagStdout);
 
@@ -131,10 +99,6 @@ async function main() {
       : undefined;
 
   const artifacts = buildGeneratedArtifacts({
-    skillClaude: claudeSrc,
-    skillCodex: codexSrc,
-    skillOmp: ompSrc,
-    skillOpencode: opencodeSrc,
     configSchema: schema,
     configDefaults: defaults,
     changelogReleases,

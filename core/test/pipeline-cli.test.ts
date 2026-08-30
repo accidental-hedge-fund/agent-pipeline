@@ -36,6 +36,13 @@ import {
 import { lookupCommand, validateFlags, COMMAND_REGISTRY } from "../scripts/command-registry.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 import type { RunStoreDeps } from "../scripts/run-store.ts";
+import {
+  ADVANCE_RUN_HANDOFF_KIND,
+  flushAdvanceRunHandoff,
+  formatAdvanceRunHandoff,
+  nestedAdvanceChildEnv,
+  shouldEmitAdvanceRunHandoff,
+} from "../scripts/advance-handoff.ts";
 
 function memTrainRunStore(): RunStoreDeps {
   const files = new Map<string, string>();
@@ -1310,6 +1317,98 @@ test("pipeline-cli: train --json stdout stays one train_status when advance-wave
     assert.doesNotMatch(emitted, /loop_run_handoff/);
   } finally {
     console.log = originalLog;
+    process.exitCode = priorExitCode;
+  }
+});
+
+test("pipeline-cli: a nested advance_run_handoff before train_status is not one JSON document", () => {
+  const leaked = `${formatAdvanceRunHandoff({
+    runId: "1049-2026-08-30T00-45-58-000Z",
+    runDir: "/repo/.agent-pipeline/runs/1049-2026-08-30T00-45-58-000Z",
+    events: "/repo/.agent-pipeline/runs/1049-2026-08-30T00-45-58-000Z/events.jsonl",
+  })}\n${JSON.stringify({ schema_version: 1, kind: "train_status", complete: true })}\n`;
+  assert.throws(() => JSON.parse(leaked));
+});
+
+test("pipeline-cli: train --json stdout stays one train_status when nested numeric children inherit stdio (#1049)", async () => {
+  const { opts } = parseCli(["train", "--issues", "1049", "--json"]);
+  const trainCfg = {
+    repo: "owner/repo",
+    repo_dir: "/repo",
+    base_branch: "main",
+  } as PipelineConfig;
+  const deps: TrainCommandDeps = {
+    makeTrainDeps: () => ({
+      log: () => {},
+      listMilestoneIssues: async () => [],
+      getIssue: async (issue) => ({
+        number: issue,
+        title: `Issue ${issue}`,
+        body: "",
+        labels: ["pipeline:ready-to-deploy"],
+        state: "open",
+      }),
+      advanceWave: async () => {
+        throw new Error("the command must replace the base advanceWave seam");
+      },
+      getPrForIssue: async () => null,
+      getPrForIssueAnyState: async () => null,
+      mergeIssuePr: async () => {},
+      observePr: async () => ({ state: "open", mergeCommitOid: null, headRefOid: null }),
+      fetchBase: async () => {},
+      baseTip: async () => "base-tip",
+      isAncestor: async () => false,
+      runStore: memTrainRunStore(),
+      writeHandoff: () => {},
+    }),
+    async runSingleIssue() {
+      throw new Error("train production path uses advanceWave, not N×single");
+    },
+    async runAdvanceWave(issues, _opts, getIssue) {
+      // Production loop dispatch spawns `pipeline N` with inherited stdio and
+      // PIPELINE_NESTED_ADVANCE=1. A child that still emitted would write this
+      // line to train --json stdout before train_status.
+      if (shouldEmitAdvanceRunHandoff({ env: nestedAdvanceChildEnv({}) })) {
+        await flushAdvanceRunHandoff({
+          runId: "1049-2026-08-30T00-45-58-000Z",
+          runDir: "/repo/.agent-pipeline/runs/1049-2026-08-30T00-45-58-000Z",
+          events: "/repo/.agent-pipeline/runs/1049-2026-08-30T00-45-58-000Z/events.jsonl",
+        });
+      }
+      const out = new Map<number, import("../scripts/stages/train.ts").AdvanceOutcome>();
+      for (const issue of issues) {
+        const snap = await getIssue(issue);
+        out.set(issue, {
+          ok: true,
+          terminal: "ready-to-deploy",
+          labels: snap.labels,
+        });
+      }
+      return out;
+    },
+  };
+  const chunks: string[] = [];
+  const originalLog = console.log;
+  const origWrite = process.stdout.write.bind(process.stdout);
+  const priorExitCode = process.exitCode;
+  console.log = (...args: unknown[]) => {
+    chunks.push(`${args.map(String).join(" ")}\n`);
+  };
+  (process.stdout as { write: typeof process.stdout.write }).write = ((chunk: unknown) => {
+    chunks.push(String(chunk));
+    return true;
+  }) as typeof process.stdout.write;
+  process.exitCode = undefined;
+  try {
+    const exitCode = await runTrainCommand(opts, trainCfg, deps);
+    assert.equal(exitCode, 0);
+    const emitted = chunks.join("");
+    const document = JSON.parse(emitted) as { kind?: string };
+    assert.equal(document.kind, "train_status");
+    assert.doesNotMatch(emitted, new RegExp(ADVANCE_RUN_HANDOFF_KIND));
+  } finally {
+    console.log = originalLog;
+    (process.stdout as { write: typeof process.stdout.write }).write = origWrite;
     process.exitCode = priorExitCode;
   }
 });

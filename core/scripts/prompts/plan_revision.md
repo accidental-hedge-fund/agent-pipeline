@@ -16,7 +16,7 @@ Original implementation plan:
 
 Secondary harness plan-review feedback:
 {{feedback}}
-{{human_feedback}}{{spec_context}}
+{{human_feedback}}{{spec_context}}{{planning_facts}}
 Revise the implementation plan before coding. Incorporate valid feedback, resolve conflicts explicitly, and keep the plan surgical.
 
 Before the revised plan, output a `## Feedback Incorporated` section that lists every piece of reviewer feedback and its disposition. Write this section as plain Markdown in your response body — do NOT wrap it in a code fence, and the `## Feedback Incorporated` header MUST appear exactly once in your output and MUST appear at the **start of a line** (never glued to preamble text on the same line). Use one bullet per item, shaped like this:
