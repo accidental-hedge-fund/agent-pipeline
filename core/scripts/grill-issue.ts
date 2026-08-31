@@ -24,6 +24,7 @@ import {
   buildGrillFingerprint,
   fingerprintStaleReasons,
   hashDependencyClosure,
+  type DependencyClosureRecord,
   type GrillFingerprint,
   type ProviderConfigIdentity,
 } from "./grill-fingerprint.ts";
@@ -49,7 +50,7 @@ import { listHandoffs, type HandoffStoreDeps } from "./human-question-handoff.ts
 import type { GrillReadySnapshot } from "./grill-ready.ts";
 import { buildGrillImplementerPrompt, buildGrillReviewerPrompt } from "./prompts/index.ts";
 import { invoke } from "./harness.ts";
-import { getIssueDetail } from "./gh.ts";
+import { getIssueDetail, listIssueBodyRevisions as fetchIssueBodyRevisions } from "./gh.ts";
 import { isKillSwitchActive } from "./lock.ts";
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
@@ -71,6 +72,8 @@ export interface HarnessCallResult {
 export interface GrillIssuePreviewDeps {
   getIssue(issueNumber: number): Promise<{ title: string; body: string }>;
   fetchDependencyIssue: WalkDependenciesDeps["fetchIssue"];
+  /** Durable GitHub issue-body revisions. Missing or empty → migration fail-closed. */
+  listIssueBodyRevisions?(issueNumber: number): Promise<string[]>;
   readContextMd(): Promise<string>;
   resolveIntegrationBase(): Promise<string>;
   providerConfig: ProviderConfigIdentity;
@@ -207,6 +210,31 @@ export function planningTreatmentFromConfig(cfg: {
 }
 
 /**
+ * Legacy root-inclusive `dependency_closure_sha256` from the signed
+ * historical root body (pre-proposal `issue.body`) plus the current
+ * exclusive dependency snapshot. Preview migration only.
+ */
+function legacyRootInclusiveClosureHash(
+  rootIssue: number,
+  rootTitle: string,
+  signedRootBody: string,
+  exclusive: DependencyClosureRecord,
+): string {
+  return hashDependencyClosure({
+    ids: [rootIssue, ...exclusive.ids],
+    per_id: [
+      {
+        id: rootIssue,
+        title_sha256: sha256Prefixed(rootTitle),
+        body_sha256: sha256Prefixed(signedRootBody),
+      },
+      ...exclusive.per_id,
+    ],
+    fact_codes: exclusive.fact_codes,
+  });
+}
+
+/**
  * Authenticated non-ready recovery for artifacts signed under the
  * root-inclusive closure formula. Preserves settled nodes/handoffs.
  * Ready still compares the single current (root-exclusive) formula.
@@ -240,6 +268,21 @@ async function trySignAppliedClosureRefresh(
   if (stale.length !== 1 || stale[0] !== "dependency_closure_sha256") {
     return null;
   }
+  let revisions: string[] = [];
+  try {
+    revisions = deps.listIssueBodyRevisions ? await deps.listIssueBodyRevisions(issueNumber) : [];
+  } catch {
+    return null;
+  }
+  const recorded = artifact.fingerprint.dependency_closure_sha256;
+  const authenticated = revisions.some(
+    (historical) =>
+      typeof historical === "string" &&
+      historical.length > 0 &&
+      recorded ===
+        legacyRootInclusiveClosureHash(issueNumber, issue.title, historical, walk.record),
+  );
+  if (!authenticated) return null;
   const refreshed: DecisionsArtifact = {
     ...artifact,
     fingerprint: liveFp,
@@ -662,6 +705,7 @@ export function realGrillIssuePreviewDeps(cfg: PipelineConfig): GrillIssuePrevie
       const d = await getIssueDetail(cfg, n);
       return { title: d.title, body: d.body };
     },
+    listIssueBodyRevisions: async (n) => fetchIssueBodyRevisions(cfg, n),
     fetchDependencyIssue: async (id) => {
       try {
         const d = await getIssueDetail(cfg, id);

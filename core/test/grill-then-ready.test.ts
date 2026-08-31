@@ -645,6 +645,7 @@ function previewDeps(overrides: Partial<GrillIssuePreviewDeps> & { implementerJs
     implementerPrompts,
     reviewerPrompts,
     getIssue: async () => ({ title: "Thin issue", body: "needs work" }),
+    listIssueBodyRevisions: async () => [],
     fetchDependencyIssue: async () => ({ ok: false, code: "missing" }),
     readContextMd: async () => "**Grill**:\nA one-shot intake interview.\n",
     resolveIntegrationBase: async () => "abc123def456",
@@ -3154,6 +3155,7 @@ test("grill: preview apply handoff ready sequence keeps dependency-closure hash"
 
 test("grill: root-inclusive pre-change artifact recovers via preview apply without new authority", async () => {
   const specWithDep = `${THIN_SPEC}\n\nDepends on #7.\n`;
+  const preProposal = "needs work\n\nDepends on #7.\n";
   const child = { title: "Child seven", body: "leaf seven" };
   const title = "Thin issue";
   const keyDeps = memoryKeyDeps();
@@ -3162,19 +3164,34 @@ test("grill: root-inclusive pre-change artifact recovers via preview apply witho
     fetchIssue: childFetch(child),
   });
   const exclusiveFp = await snapshotFingerprint(42, title, specWithDep, childFetch(child));
+  assert.notEqual(preProposal, specWithDep);
+  assert.notEqual(preProposal, extractSpecCore(specWithDep));
   const rootInclusiveHash = hashDependencyClosure({
     ids: [42, ...exclusiveWalk.record.ids],
     per_id: [
       {
         id: 42,
         title_sha256: sha256Prefixed(title),
-        body_sha256: sha256Prefixed(specWithDep),
+        body_sha256: sha256Prefixed(preProposal),
+      },
+      ...exclusiveWalk.record.per_id,
+    ],
+    fact_codes: exclusiveWalk.record.fact_codes,
+  });
+  const appliedCoreLegacy = hashDependencyClosure({
+    ids: [42, ...exclusiveWalk.record.ids],
+    per_id: [
+      {
+        id: 42,
+        title_sha256: sha256Prefixed(title),
+        body_sha256: sha256Prefixed(extractSpecCore(specWithDep)),
       },
       ...exclusiveWalk.record.per_id,
     ],
     fact_codes: exclusiveWalk.record.fact_codes,
   });
   assert.notEqual(rootInclusiveHash, exclusiveFp.dependency_closure_sha256);
+  assert.notEqual(rootInclusiveHash, appliedCoreLegacy);
   const nodes = settledOperatorNodes();
   const art: DecisionsArtifact = {
     schema_version: "decisions.v1",
@@ -3245,6 +3262,7 @@ test("grill: root-inclusive pre-change artifact recovers via preview apply witho
   const preview = previewDeps({
     getIssue: async () => ({ title: live.title, body: live.body }),
     fetchDependencyIssue: childFetch(child),
+    listIssueBodyRevisions: async () => [preProposal],
     keyDeps,
   });
   await withExit(async () => {
@@ -3296,6 +3314,133 @@ test("grill: root-inclusive pre-change artifact recovers via preview apply witho
   const recovered = await snapshotFingerprint(42, live.title, live.body, childFetch(child));
   await runTriage({ issueArg: "42", stage: "ready" }, readyDeps(live.body, recovered));
   assert.deepEqual(add, ["pipeline:ready"]);
+});
+
+test("grill: root-inclusive recovery fail-closes without a historical pre-proposal snapshot", async () => {
+  const specWithDep = `${THIN_SPEC}\n\nDepends on #7.\n`;
+  const preProposal = "needs work\n\nDepends on #7.\n";
+  const child = { title: "Child seven", body: "leaf seven" };
+  const title = "Thin issue";
+  const exclusiveWalk = await walkDeclaredDependencyClosure(42, title, specWithDep, {
+    fetchIssue: childFetch(child),
+  });
+  const exclusiveFp = await snapshotFingerprint(42, title, specWithDep, childFetch(child));
+  const rootInclusiveHash = hashDependencyClosure({
+    ids: [42, ...exclusiveWalk.record.ids],
+    per_id: [
+      {
+        id: 42,
+        title_sha256: sha256Prefixed(title),
+        body_sha256: sha256Prefixed(preProposal),
+      },
+      ...exclusiveWalk.record.per_id,
+    ],
+    fact_codes: exclusiveWalk.record.fact_codes,
+  });
+  const art: DecisionsArtifact = {
+    schema_version: "decisions.v1",
+    nodes: settledOperatorNodes(),
+    fingerprint: { ...exclusiveFp, dependency_closure_sha256: rootInclusiveHash },
+    required_context: { terms: [], integration_base_sha: null, context_md_sha256: null },
+    unresolved_facts: [],
+    context_proposals: [],
+  };
+  const live = { title, body: embedDecisionsInBody(specWithDep, art) };
+  const preview = previewDeps({
+    getIssue: async () => ({ title: live.title, body: live.body }),
+    fetchDependencyIssue: childFetch(child),
+    implementerJson: implementerPayload(specWithDep),
+  });
+  await withExit(async () => {
+    await runRefineSpecIssuePreview(42, preview);
+    assert.equal(process.exitCode, 0);
+  });
+  assert.equal(preview.implementerPrompts.length, 1, "missing snapshot must re-grill");
+  assert.equal(preview.reviewerPrompts.length, 1, "missing snapshot must re-review");
+});
+
+test("grill: applied specification core is not the historical signed snapshot", async () => {
+  const specWithDep = `${THIN_SPEC}\n\nDepends on #7.\n`;
+  const preProposal = "needs work\n\nDepends on #7.\n";
+  const child = { title: "Child seven", body: "leaf seven" };
+  const title = "Thin issue";
+  const exclusiveWalk = await walkDeclaredDependencyClosure(42, title, specWithDep, {
+    fetchIssue: childFetch(child),
+  });
+  const exclusiveFp = await snapshotFingerprint(42, title, specWithDep, childFetch(child));
+  const rootInclusiveHash = hashDependencyClosure({
+    ids: [42, ...exclusiveWalk.record.ids],
+    per_id: [
+      {
+        id: 42,
+        title_sha256: sha256Prefixed(title),
+        body_sha256: sha256Prefixed(preProposal),
+      },
+      ...exclusiveWalk.record.per_id,
+    ],
+    fact_codes: exclusiveWalk.record.fact_codes,
+  });
+  const art: DecisionsArtifact = {
+    schema_version: "decisions.v1",
+    nodes: settledOperatorNodes(),
+    fingerprint: { ...exclusiveFp, dependency_closure_sha256: rootInclusiveHash },
+    required_context: { terms: [], integration_base_sha: null, context_md_sha256: null },
+    unresolved_facts: [],
+    context_proposals: [],
+  };
+  const live = { title, body: embedDecisionsInBody(specWithDep, art) };
+  const preview = previewDeps({
+    getIssue: async () => ({ title: live.title, body: live.body }),
+    fetchDependencyIssue: childFetch(child),
+    listIssueBodyRevisions: async () => [extractSpecCore(live.body)],
+    implementerJson: implementerPayload(specWithDep),
+  });
+  await withExit(async () => {
+    await runRefineSpecIssuePreview(42, preview);
+    assert.equal(process.exitCode, 0);
+  });
+  assert.equal(preview.implementerPrompts.length, 1, "applied spec core must not authenticate the signed pre-proposal hash");
+  assert.equal(preview.reviewerPrompts.length, 1);
+});
+
+test("grill: child mutation with closure-only stale does not take the root-inclusive refresh shortcut", async () => {
+  const specWithDep = `${THIN_SPEC}\n\nDepends on #7.\n`;
+  const child = { title: "Child seven", body: "leaf seven" };
+  const title = "Thin issue";
+  const exclusiveFp = await snapshotFingerprint(42, title, specWithDep, childFetch(child));
+  const nodes = settledOperatorNodes();
+  const art: DecisionsArtifact = {
+    schema_version: "decisions.v1",
+    nodes,
+    fingerprint: exclusiveFp,
+    required_context: { terms: [], integration_base_sha: null, context_md_sha256: null },
+    unresolved_facts: [],
+    context_proposals: [],
+  };
+  const live = { title, body: embedDecisionsInBody(specWithDep, art) };
+  const mutated = { title: child.title, body: "leaf mutated" };
+  const liveExclusive = await snapshotFingerprint(42, live.title, live.body, childFetch(mutated));
+  assert.deepEqual(fingerprintStaleReasons(exclusiveFp, liveExclusive), ["dependency_closure_sha256"]);
+
+  const preview = previewDeps({
+    getIssue: async () => ({ title: live.title, body: live.body }),
+    fetchDependencyIssue: childFetch(mutated),
+    listIssueBodyRevisions: async () => [specWithDep],
+    implementerJson: implementerPayload(specWithDep),
+  });
+  await withExit(async () => {
+    await runRefineSpecIssuePreview(42, preview);
+    assert.equal(process.exitCode, 0);
+  });
+  assert.equal(preview.implementerPrompts.length, 1, "real dependency change must re-grill");
+  assert.equal(preview.reviewerPrompts.length, 1, "real dependency change must re-review");
+  const env = JSON.parse(
+    preview.writes.find((w) => w.startsWith("stdout:"))!.slice("stdout:".length),
+  ) as GrillProposalEnvelope;
+  assert.equal(
+    env.proposal.artifact.fingerprint.dependency_closure_sha256,
+    liveExclusive.dependency_closure_sha256,
+  );
 });
 
 test("grill: later dependency change stales closure; root title and spec-core stale their own fingerprints", async () => {

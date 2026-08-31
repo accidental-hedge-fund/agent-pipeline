@@ -26,7 +26,7 @@
 ## 5. Authenticated recovery of root-inclusive pre-change artifacts
 
 - [x] 5.1 Add an injected test that starts from an applied Decisions body whose recorded `dependency_closure_sha256` is root-inclusive, with settled handoffs and no bound-input change. Verify `pipeline triage --stage ready` exits 2 with `stale fingerprints: dependency_closure_sha256` before the refresh.
-- [x] 5.2 `pipeline refine-spec --issue N` SHALL sign a root-exclusive closure without calling Implementer or Reviewer when the live artifact's only stale fingerprint is `dependency_closure_sha256`. Verify the signed envelope preserves node ids and handoff provenance.
+- [x] 5.2 `pipeline refine-spec --issue N` SHALL sign a root-exclusive closure without calling Implementer or Reviewer when the live artifact's only stale fingerprint is `dependency_closure_sha256` and the recorded hash equals the legacy root-inclusive closure of an authenticated historical pre-proposal snapshot plus the current declared-dependency snapshot. Verify the signed envelope preserves node ids and handoff provenance. Verify a reachable dependency title or body change that also leaves only `dependency_closure_sha256` stale does not take that shortcut. Verify a distinct pre-proposal body is required and that the applied specification core is not treated as that snapshot.
 - [x] 5.3 Apply of that envelope SHALL persist the refreshed fingerprint and frontier, SHALL NOT create replacement authority handoffs for already-settled nodes, and a following `triage --stage ready` SHALL succeed. Verify ready still compares fingerprints and does not dual-compare formulas.
 
 ## 6. Validation

@@ -423,6 +423,52 @@ export async function getIssueDetail(
  *  without touching the network. */
 export type GhApiRunner = (args: string[]) => Promise<string>;
 
+/**
+ * Historical issue-body snapshots from GitHub `userContentEdits` (#1350).
+ * Each `diff` is the previous full body for that edit. Field shape verified
+ * against live `gh api graphql` on issue #1305 (`userContentEdits.nodes[].diff`).
+ * Bound: latest 100 edits. Missing issue or empty connection → `[]`.
+ */
+export async function listIssueBodyRevisions(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  run: GhApiRunner = (args) => ghRun(args, { wrapperName: "listIssueBodyRevisions" }),
+): Promise<string[]> {
+  const [owner, repo] = cfg.repo.split("/");
+  const stdout = await run([
+    "api",
+    "graphql",
+    "-f",
+    "query=query($owner:String!,$repo:String!,$num:Int!){repository(owner:$owner,name:$repo)" +
+      "{issue(number:$num){userContentEdits(last:100){nodes{diff}}}}}",
+    "-F",
+    `owner=${owner}`,
+    "-F",
+    `repo=${repo}`,
+    "-F",
+    `num=${issueNumber}`,
+  ]);
+  const parsed: unknown = JSON.parse(stdout);
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return [];
+  const data = (parsed as { data?: unknown }).data;
+  if (data === null || typeof data !== "object" || Array.isArray(data)) return [];
+  const repository = (data as { repository?: unknown }).repository;
+  if (repository === null || typeof repository !== "object" || Array.isArray(repository)) return [];
+  const issue = (repository as { issue?: unknown }).issue;
+  if (issue === null || typeof issue !== "object" || Array.isArray(issue)) return [];
+  const edits = (issue as { userContentEdits?: unknown }).userContentEdits;
+  if (edits === null || typeof edits !== "object" || Array.isArray(edits)) return [];
+  const nodes = (edits as { nodes?: unknown }).nodes;
+  if (!Array.isArray(nodes)) return [];
+  const out: string[] = [];
+  for (const node of nodes) {
+    if (node === null || typeof node !== "object" || Array.isArray(node)) continue;
+    const diff = (node as { diff?: unknown }).diff;
+    if (typeof diff === "string" && diff.length > 0) out.push(diff);
+  }
+  return out;
+}
+
 /** Fetch pipeline-label additions for `last_event` (#154).
  *  Uses the GraphQL timeline bounded to the **latest** 100 labeled events
  *  (`timelineItems(last: 100, itemTypes: [LABELED_EVENT])`). A page-1 REST

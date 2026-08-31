@@ -11,6 +11,7 @@ import {
   extractHumanPlanComments,
   getHarnessLabel,
   getIssueLabelEvents,
+  listIssueBodyRevisions,
   getPrForIssue,
   getPrForIssueAnyState,
   isBlocked,
@@ -623,6 +624,56 @@ test("getIssueLabelEvents: a GitHub failure propagates (so the status JSON error
     throw new Error("GraphQL: rate limited");
   };
   await assert.rejects(() => getIssueLabelEvents(LABEL_CFG, 154, run), /rate limited/);
+});
+
+test("listIssueBodyRevisions: queries userContentEdits last:100 without jq", async () => {
+  let captured: string[] = [];
+  const run: GhApiRunner = async (args) => {
+    captured = args;
+    return JSON.stringify({ data: { repository: { issue: { userContentEdits: { nodes: [] } } } } });
+  };
+  await listIssueBodyRevisions(LABEL_CFG, 1305, run);
+  const joined = captured.join(" ");
+  assert.ok(captured.includes("graphql"), "must call the GraphQL endpoint");
+  assert.ok(/userContentEdits\(last:\s*100/.test(joined), "must request the latest 100 body edits");
+  assert.ok(joined.includes("nodes{diff}"), "must select the verified diff field");
+  assert.equal(captured.includes("--jq"), false, "diffs contain newlines; must parse full JSON");
+});
+
+test("listIssueBodyRevisions: returns previous bodies and skips empty diffs", async () => {
+  const run: GhApiRunner = async () =>
+    JSON.stringify({
+      data: {
+        repository: {
+          issue: {
+            userContentEdits: {
+              nodes: [
+                { diff: "needs work\n\nDepends on #7.\n" },
+                { diff: "" },
+                { diff: null },
+                { diff: "## Summary\nApplied spec.\n" },
+              ],
+            },
+          },
+        },
+      },
+    });
+  const bodies = await listIssueBodyRevisions(LABEL_CFG, 1305, run);
+  assert.deepEqual(bodies, ["needs work\n\nDepends on #7.\n", "## Summary\nApplied spec.\n"]);
+});
+
+test("listIssueBodyRevisions: missing issue returns empty without network", async () => {
+  const run: GhApiRunner = async () =>
+    JSON.stringify({ data: { repository: { issue: null } } });
+  const bodies = await listIssueBodyRevisions(LABEL_CFG, 1305, run);
+  assert.deepEqual(bodies, []);
+});
+
+test("listIssueBodyRevisions: a GitHub failure propagates", async () => {
+  const run: GhApiRunner = async () => {
+    throw new Error("GraphQL: rate limited");
+  };
+  await assert.rejects(() => listIssueBodyRevisions(LABEL_CFG, 1305, run), /rate limited/);
 });
 
 // ---------------------------------------------------------------------------
