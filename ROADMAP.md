@@ -24,7 +24,7 @@ This file is human-readable forward-looking documentation for open work. **GitHu
 | **v1.37.0** ✅ shipped | minor | Human authority and evidence | #575, #576, #691–#695, #702, #599, #647, #703 | Shipped 2026-08-12 (tag `v1.37.0`). See CHANGELOG.md. |
 | **v1.38.0** ✅ shipped | minor | Factory operations | #892–#896 | Shipped 2026-08-13 (tag `v1.38.0`). See CHANGELOG.md. |
 | **v1.39.0** ✅ shipped | minor | Hermes and Buzz integration | #907, #897 | Shipped 2026-08-15 (tag `v1.39.0`). See CHANGELOG.md. |
-| **v1.40.0** | minor | Qualified issue integration | #662, #899, #900, #906 | Add evidence-qualified authority, a privilege broker, exact-head merge service, and durable merge actions. |
+| **v1.40.0** ✅ shipped | minor | Qualified issue integration | #662, #899, #900, #906 | Shipped 2026-08-31 (tag `v1.40.0`). See CHANGELOG.md. |
 | **v1.41.0** | minor | Autonomous release and engine promotion | #902, #903 | Add release finalization and exact-tag self-update with rollback. |
 | **v1.42.0** | minor | Work breakdown | #766 | Add epic decomposition into dependency-linked issues and a delivery roadmap. |
 | **v1.43.0** | minor | Forge portability | #648–#650 | Add the ForgeAdapter contract, extraction, and first opt-in GitLab adapter. |
