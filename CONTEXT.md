@@ -93,6 +93,10 @@ _Avoid_: operator sign-off, handoff answer, comment-as-accept
 An operator or third-party credential failure (revoked token, login required). Not an engine defect.
 _Avoid_: workflow-engine-defect, harness-contract (as the durable theme for a 401)
 
+**capability-refusal**:
+A typed, deterministic production-preflight outcome when the selected adapter lacks a required capability contract. The harness did not start, so this is not a harness crash, raw exit failure, workflow-engine defect, or environment-auth failure.
+_Avoid_: exit -1, harness-failure, workflow-engine-defect, environment-auth
+
 ### Ship path
 
 **Live ship**:
