@@ -2,7 +2,7 @@
 // Uses parseDeclaredDependencyIds — no second parser.
 
 import { parseDeclaredDependencyIds } from "./declared-dependency-grammar.ts";
-import type { TypedUnresolvedFact } from "./grill-decisions.ts";
+import { extractSpecCore, type TypedUnresolvedFact } from "./grill-decisions.ts";
 import { sha256Prefixed } from "./grill-hash.ts";
 import type { DependencyClosureRecord } from "./grill-fingerprint.ts";
 
@@ -62,13 +62,17 @@ export async function walkDeclaredDependencyClosure(
     }
     seen.add(id);
     visited.push(id);
-    perId.push({
-      id,
-      title_sha256: sha256Prefixed(title),
-      body_sha256: sha256Prefixed(body),
-    });
+    if (id !== rootIssue) {
+      perId.push({
+        id,
+        title_sha256: sha256Prefixed(title),
+        body_sha256: sha256Prefixed(body),
+      });
+    }
+    const parseText =
+      id === rootIssue ? `${title}\n${extractSpecCore(body)}` : `${title}\n${body}`;
     if (depth >= GRILL_DEP_MAX_DEPTH) {
-      const childIds = parseDeclaredDependencyIds(`${title}\n${body}`, String(id));
+      const childIds = parseDeclaredDependencyIds(parseText, String(id));
       if (childIds.length > 0) {
         exhausted = true;
         facts.push({
@@ -80,7 +84,7 @@ export async function walkDeclaredDependencyClosure(
       }
       return;
     }
-    const rawIds = parseDeclaredDependencyIds(`${title}\n${body}`, String(id));
+    const rawIds = parseDeclaredDependencyIds(parseText, String(id));
     stackPath.push(id);
     for (const raw of rawIds) {
       if (!/^[1-9][0-9]*$/.test(raw)) {
@@ -125,7 +129,7 @@ export async function walkDeclaredDependencyClosure(
   await visit(rootIssue, rootTitle, rootBody, 0);
   return {
     record: {
-      ids: visited,
+      ids: visited.filter((id) => id !== rootIssue),
       per_id: perId,
       fact_codes: facts.map((f) => f.code),
     },

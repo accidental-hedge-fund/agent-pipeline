@@ -15,8 +15,10 @@ import {
   nodeDefinitionDigest,
   nodeInputDigests,
   unresolvedAuthorityNodes,
+  DEPENDENCY_FACT_CODES,
   type DecisionsArtifact,
   type DecisionNode,
+  type TypedUnresolvedFact,
 } from "../scripts/grill-decisions.ts";
 import {
   classifyAuthority,
@@ -28,6 +30,7 @@ import {
 import {
   buildGrillFingerprint,
   fingerprintStaleReasons,
+  hashDependencyClosure,
   type GrillFingerprint,
 } from "../scripts/grill-fingerprint.ts";
 import { planningTreatmentFromConfig } from "../scripts/grill-issue.ts";
@@ -40,7 +43,11 @@ import {
   type GrillProposalEnvelope,
   type GrillProposalKeyDeps,
 } from "../scripts/grill-proposal.ts";
-import { walkDeclaredDependencyClosure } from "../scripts/grill-facts.ts";
+import {
+  GRILL_DEP_MAX_DEPTH,
+  GRILL_DEP_MAX_ISSUES,
+  walkDeclaredDependencyClosure,
+} from "../scripts/grill-facts.ts";
 import {
   classifyContextProposals,
   recordRequiredContextHashes,
@@ -106,7 +113,7 @@ function fingerprint(title: string, spec: string, extra?: Partial<GrillFingerpri
   const base = buildGrillFingerprint({
     title,
     appliedBody: spec,
-    dependencyClosure: { ids: [42], per_id: [{ id: 42, title_sha256: sha256Prefixed(title), body_sha256: sha256Prefixed(spec) }], fact_codes: [] },
+    dependencyClosure: { ids: [], per_id: [], fact_codes: [] },
     integrationBaseSha: "abc123def456",
     contextMd: "**Grill**:\nA one-shot intake interview.\n",
     providerConfig: PROVIDER,
@@ -796,6 +803,7 @@ function applyDeps(envelope: GrillProposalEnvelope, extra?: Partial<GrillIssueAp
     bodies,
     labels,
     getIssue: async () => live,
+    fetchDependencyIssue: async () => ({ ok: false, code: "missing" }),
     updateIssueBody: async (_n, body) => {
       bodies.push(body);
       live.body = body;
@@ -818,6 +826,25 @@ function applyDeps(envelope: GrillProposalEnvelope, extra?: Partial<GrillIssueAp
     ...extra,
   };
 }
+
+function implementerPayload(body: string): string {
+  const nodes = canonicalThinIssueNodes();
+  return JSON.stringify({
+    title: "T",
+    body,
+    milestone: null,
+    nodes: nodes.map((n) => ({
+      id: n.id,
+      question: n.question,
+      recommendation: "rec",
+      class: n.class,
+    })),
+    context_proposals: [],
+  });
+}
+
+const THIN_SPEC =
+  "## Summary\nThin.\n\n## User story\nAs a user, / I want x, / so that y.\n\n## Acceptance criteria\n- [ ] x\n\n## Out of scope\n- y";
 
 async function signedPreview(): Promise<GrillProposalEnvelope> {
   const deps = previewDeps({});
@@ -1062,6 +1089,110 @@ test("grill: missing dependency is typed; closure exhaustion is typed", async ()
   });
   assert.ok(chain.facts.some((f) => f.code === "dependency.closure_exhausted"));
   void n;
+});
+
+test("grill: walker omits root from closure record", async () => {
+  const walk = await walkDeclaredDependencyClosure(1, "Root", "Depends on #2", {
+    fetchIssue: async (id) => {
+      if (id === 2) return { ok: true, title: "Child", body: "leaf" };
+      return { ok: false, code: "missing" };
+    },
+  });
+  assert.equal(walk.record.ids.includes(1), false);
+  assert.equal(walk.record.per_id.some((p) => p.id === 1), false);
+  assert.deepEqual(walk.record.ids, [2]);
+  assert.equal(walk.record.per_id.length, 1);
+  assert.equal(walk.record.per_id[0]!.id, 2);
+  assert.equal(walk.record.per_id[0]!.title_sha256, sha256Prefixed("Child"));
+  assert.equal(walk.record.per_id[0]!.body_sha256, sha256Prefixed("leaf"));
+});
+
+test("grill: Decisions metadata does not change dependency-closure hash", async () => {
+  const spec = "## Summary\nDepends on #2.\n";
+  const fetchIssue = async (id: number) => {
+    if (id === 2) return { ok: true as const, title: "Child", body: "leaf" };
+    return { ok: false as const, code: "missing" as const };
+  };
+  const before = await walkDeclaredDependencyClosure(10, "T", spec, { fetchIssue });
+  const withFence = embedDecisionsInBody(spec, artifact(canonicalThinIssueNodes(), spec, "T"));
+  assert.match(withFence, /pipeline-decisions-v1/);
+  assert.match(withFence, /## Decisions/);
+  const afterFence = await walkDeclaredDependencyClosure(10, "T", withFence, { fetchIssue });
+  assert.equal(hashDependencyClosure(afterFence.record), hashDependencyClosure(before.record));
+  assert.deepEqual(afterFence.record.ids, before.record.ids);
+});
+
+test("grill: root edges come from title and specification core not Decisions text", async () => {
+  const spec = "## Summary\nDepends on #2.\n";
+  const nodes = canonicalThinIssueNodes().map((n) => {
+    const next = { ...n, recommendation: "Depends on #99" };
+    next.input_digests = nodeInputDigests(next);
+    return next;
+  });
+  const body = embedDecisionsInBody(spec, artifact(nodes, spec, "Depends on #3"));
+  assert.match(body, /Depends on #99/);
+  const fetched: number[] = [];
+  const walk = await walkDeclaredDependencyClosure(10, "Depends on #3", body, {
+    fetchIssue: async (id) => {
+      fetched.push(id);
+      return { ok: true, title: `I${id}`, body: "leaf" };
+    },
+  });
+  assert.ok(fetched.includes(2), "specification core Depends on #2");
+  assert.ok(fetched.includes(3), "title Depends on #3");
+  assert.equal(fetched.includes(99), false);
+  assert.equal(walk.record.ids.includes(10), false);
+});
+
+test("grill: child title or body change changes dependency-closure hash", async () => {
+  const walk1 = await walkDeclaredDependencyClosure(1, "R", "Depends on #2", {
+    fetchIssue: async () => ({ ok: true, title: "Child", body: "leaf" }),
+  });
+  const walk2 = await walkDeclaredDependencyClosure(1, "R", "Depends on #2", {
+    fetchIssue: async () => ({ ok: true, title: "Child", body: "leaf changed" }),
+  });
+  const walk3 = await walkDeclaredDependencyClosure(1, "R", "Depends on #2", {
+    fetchIssue: async () => ({ ok: true, title: "Child retitled", body: "leaf" }),
+  });
+  assert.notEqual(hashDependencyClosure(walk1.record), hashDependencyClosure(walk2.record));
+  assert.notEqual(hashDependencyClosure(walk1.record), hashDependencyClosure(walk3.record));
+});
+
+test("grill: empty declared-dependency set hashes empty closure record", async () => {
+  const walk = await walkDeclaredDependencyClosure(1, "R", "no declared deps", {
+    fetchIssue: async () => {
+      assert.fail("empty closure must not fetch");
+    },
+  });
+  assert.deepEqual(walk.record, { ids: [], per_id: [], fact_codes: [] });
+  assert.equal(
+    hashDependencyClosure(walk.record),
+    hashDependencyClosure({ ids: [], per_id: [], fact_codes: [] }),
+  );
+});
+
+test("grill: inaccessible dependency is a typed unresolved fact", async () => {
+  const walk = await walkDeclaredDependencyClosure(1, "A", "Depends on #8", {
+    fetchIssue: async () => ({ ok: false, code: "inaccessible" }),
+  });
+  assert.ok(walk.facts.some((f) => f.code === "dependency.inaccessible"));
+  assert.equal(walk.record.ids.includes(1), false);
+});
+
+test("grill: depth and count exhaustion remain fail-closed", async () => {
+  const depth = await walkDeclaredDependencyClosure(1, "A", "Depends on #2", {
+    fetchIssue: async (id) => ({ ok: true, title: `I${id}`, body: `Depends on #${id + 1}` }),
+  });
+  assert.ok(depth.facts.some((f) => f.code === "dependency.closure_exhausted"));
+  assert.match(depth.facts.find((f) => f.code === "dependency.closure_exhausted")!.message, new RegExp(`depth ${GRILL_DEP_MAX_DEPTH}`));
+
+  const listed = Array.from({ length: GRILL_DEP_MAX_ISSUES + 1 }, (_, i) => `#${i + 2}`).join(" ");
+  const count = await walkDeclaredDependencyClosure(1, "A", `## Dependencies\n${listed}\n`, {
+    fetchIssue: async (id) => ({ ok: true, title: `I${id}`, body: "leaf" }),
+  });
+  assert.ok(count.facts.some((f) => f.code === "dependency.closure_exhausted"));
+  assert.equal(count.record.ids.includes(1), false);
+  assert.ok(count.record.ids.length <= GRILL_DEP_MAX_ISSUES);
 });
 
 // ---------------------------------------------------------------------------
@@ -2653,6 +2784,9 @@ test("grill: ADR names refine-spec as writer and does not say triage rewrites th
   );
   assert.match(adr, /refine-spec/);
   assert.doesNotMatch(adr, /Bare `pipeline triage N` is one implementer shot that rewrites the body/);
+  assert.match(adr, /Root identity is title plus applied specification core/);
+  assert.match(adr, /Dependency closure covers declared dependencies only/);
+  assert.match(adr, /Pipeline-owned Decisions metadata is not a bound input/);
   const glossary = readFileSync(
     join(dirname(fileURLToPath(import.meta.url)), "../../CONTEXT.md"),
     "utf8",
@@ -2705,4 +2839,423 @@ test("grill: unresolvedAuthorityNodes treats reviewer-accept as non-settling for
   const n = makeNode({ id: "scope", question: "Q", recommendation: "R", class: "scope" });
   n.provenance.reviewer_verdict = "accept";
   assert.equal(unresolvedAuthorityNodes([n]).length, 1);
+});
+
+const CONTEXT_MD = "**Grill**:\nA one-shot intake interview.\n";
+const INTEGRATION_BASE = "abc123def456";
+
+function childFetch(child: { title: string; body: string }, childId = 7) {
+  return async (id: number) => {
+    if (id === childId) return { ok: true as const, title: child.title, body: child.body };
+    return { ok: false as const, code: "missing" as const };
+  };
+}
+
+async function snapshotFingerprint(
+  issueNumber: number,
+  title: string,
+  body: string,
+  fetchIssue: (id: number) => Promise<{ ok: true; title: string; body: string } | { ok: false; code: "missing" | "inaccessible" }>,
+): Promise<GrillFingerprint> {
+  const walk = await walkDeclaredDependencyClosure(issueNumber, title, body, { fetchIssue });
+  return buildGrillFingerprint({
+    title,
+    appliedBody: extractSpecCore(body),
+    dependencyClosure: walk.record,
+    integrationBaseSha: INTEGRATION_BASE,
+    contextMd: CONTEXT_MD,
+    providerConfig: PROVIDER,
+    planningTreatment: TREATMENT,
+  });
+}
+
+test("grill: preview signs dependency closure from proposed specification core", async () => {
+  await withExit(async () => {
+    const specWithDep = `${THIN_SPEC}\n\nDepends on #7.\n`;
+    const child = { title: "Child seven", body: "leaf seven" };
+    const deps = previewDeps({
+      getIssue: async () => ({ title: "Thin issue", body: "needs work" }),
+      fetchDependencyIssue: childFetch(child),
+      implementerJson: implementerPayload(specWithDep),
+    });
+    await runRefineSpecIssuePreview(42, deps);
+    assert.equal(process.exitCode, 0);
+    const env = JSON.parse(
+      deps.writes.find((w) => w.startsWith("stdout:"))!.slice("stdout:".length),
+    ) as GrillProposalEnvelope;
+    const signed = env.proposal.artifact.fingerprint.dependency_closure_sha256;
+    const proposedWalk = await walkDeclaredDependencyClosure(42, "Thin issue", specWithDep, {
+      fetchIssue: childFetch(child),
+    });
+    const preWalk = await walkDeclaredDependencyClosure(42, "Thin issue", "needs work", {
+      fetchIssue: childFetch(child),
+    });
+    assert.equal(signed, hashDependencyClosure(proposedWalk.record));
+    assert.notEqual(signed, hashDependencyClosure(preWalk.record));
+    assert.equal(proposedWalk.record.ids.includes(42), false);
+    assert.deepEqual(proposedWalk.record.ids, [7]);
+  });
+});
+
+test("grill: apply walks proposal specification core and refuses mismatch or missing dependency", async () => {
+  const specWithDep = `${THIN_SPEC}\n\nDepends on #7.\n`;
+  const child = { title: "Child seven", body: "leaf seven" };
+  const env = await (async () => {
+    const deps = previewDeps({
+      getIssue: async () => ({ title: "Thin issue", body: "needs work" }),
+      fetchDependencyIssue: childFetch(child),
+      implementerJson: implementerPayload(specWithDep),
+    });
+    await withExit(async () => {
+      await runRefineSpecIssuePreview(42, deps);
+    });
+    return JSON.parse(
+      deps.writes.find((w) => w.startsWith("stdout:"))!.slice("stdout:".length),
+    ) as GrillProposalEnvelope;
+  })();
+
+  await withExit(async () => {
+    const deps = applyDeps(env, { fetchDependencyIssue: childFetch(child) });
+    await runRefineSpecApply(42, {}, deps);
+    assert.equal(process.exitCode, 0);
+    assert.equal(deps.bodies.length, 1);
+  });
+
+  await withExit(async () => {
+    const deps = applyDeps(env, {
+      fetchDependencyIssue: childFetch({ title: "Child seven", body: "leaf mutated" }),
+    });
+    await runRefineSpecApply(42, {}, deps);
+    assert.equal(process.exitCode, 2);
+    assert.equal(deps.bodies.length, 0);
+  });
+
+  await withExit(async () => {
+    const deps = applyDeps(env, {
+      fetchDependencyIssue: async () => ({ ok: false, code: "missing" }),
+    });
+    await runRefineSpecApply(42, {}, deps);
+    assert.equal(process.exitCode, 2);
+    assert.equal(deps.bodies.length, 0);
+  });
+});
+
+test("grill: ready snapshot ignores Decisions metadata and still stales on child change", async () => {
+  const spec = "## Summary\nDepends on #7.\n";
+  const child = { title: "Child seven", body: "leaf seven" };
+  const specHash = await snapshotFingerprint(42, "T", spec, childFetch(child));
+  const withFence = embedDecisionsInBody(spec, artifact(settledOperatorNodes(), spec));
+  const fenceHash = await snapshotFingerprint(42, "T", withFence, childFetch(child));
+  assert.equal(fenceHash.dependency_closure_sha256, specHash.dependency_closure_sha256);
+  const drifted = await snapshotFingerprint(
+    42,
+    "T",
+    withFence,
+    childFetch({ title: "Child seven", body: "leaf changed" }),
+  );
+  assert.ok(
+    fingerprintStaleReasons(specHash, drifted).includes("dependency_closure_sha256"),
+  );
+});
+
+test("grill: handoff materialize does not rewrite dependency_closure_sha256", async () => {
+  const spec = "## Summary\nDepends on #7.\n";
+  const child = { title: "Child seven", body: "leaf seven" };
+  const walk = await walkDeclaredDependencyClosure(42, "T", spec, { fetchIssue: childFetch(child) });
+  const fp = buildGrillFingerprint({
+    title: "T",
+    appliedBody: spec,
+    dependencyClosure: walk.record,
+    integrationBaseSha: INTEGRATION_BASE,
+    contextMd: CONTEXT_MD,
+    providerConfig: PROVIDER,
+    planningTreatment: TREATMENT,
+  });
+  const nodes = canonicalThinIssueNodes();
+  const art: DecisionsArtifact = {
+    schema_version: "decisions.v1",
+    nodes,
+    fingerprint: fp,
+    required_context: { terms: [], integration_base_sha: null, context_md_sha256: null },
+    unresolved_facts: [],
+    context_proposals: [],
+  };
+  const body = embedDecisionsInBody(spec, art);
+  const signed = parseDecisionsFromBody(body);
+  assert.equal(signed.ok, true);
+  if (!signed.ok) return;
+  const signedHash = signed.artifact.fingerprint.dependency_closure_sha256;
+  const input = grillAuthorityCreateInputs({
+    domain: "d",
+    repo: "acme/r",
+    issueNumber: 42,
+    artifact: art,
+    proposedBody: body,
+    frontierFp: "fp",
+  })[0]!;
+  const created = canCreateHandoff(input);
+  assert.equal(created.ok, true);
+  if (!created.ok) return;
+  const patched = materializeGrillNode({
+    liveBody: body,
+    handoff: created.handoff,
+    answerText: "yes",
+  });
+  assert.equal(patched.ok, true, patched.ok ? "" : patched.reason);
+  if (!patched.ok) return;
+  const after = parseDecisionsFromBody(patched.body);
+  assert.equal(after.ok, true);
+  if (!after.ok) return;
+  assert.equal(after.artifact.fingerprint.dependency_closure_sha256, signedHash);
+  const node = after.artifact.nodes.find(
+    (n) => n.id === parseGrillDeclaration(created.handoff.declaration_identity ?? "")?.nodeId,
+  );
+  assert.equal(node?.resolution, "resolved");
+  assert.equal(node?.provenance.settled_by, "handoff");
+});
+
+test("grill: preview apply handoff ready sequence keeps dependency-closure hash", async () => {
+  const specWithDep = `${THIN_SPEC}\n\nDepends on #7.\n`;
+  const child = { title: "Child seven", body: "leaf seven" };
+  const keyDeps = memoryKeyDeps();
+  const store = memoryHandoffStore();
+  const live = { title: "Thin issue", body: "needs work" };
+  const preview = previewDeps({
+    getIssue: async () => ({ title: live.title, body: live.body }),
+    fetchDependencyIssue: childFetch(child),
+    implementerJson: implementerPayload(specWithDep),
+    keyDeps,
+  });
+  await withExit(async () => {
+    await runRefineSpecIssuePreview(42, preview);
+    assert.equal(process.exitCode, 0);
+  });
+  const env = JSON.parse(
+    preview.writes.find((w) => w.startsWith("stdout:"))!.slice("stdout:".length),
+  ) as GrillProposalEnvelope;
+  const signedHash = env.proposal.artifact.fingerprint.dependency_closure_sha256;
+  const proposedWalk = await walkDeclaredDependencyClosure(42, live.title, specWithDep, {
+    fetchIssue: childFetch(child),
+  });
+  assert.equal(signedHash, hashDependencyClosure(proposedWalk.record));
+
+  await withExit(async () => {
+    const deps = applyDeps(env, {
+      keyDeps,
+      handoffStore: store,
+      fetchDependencyIssue: childFetch(child),
+    });
+    await runRefineSpecApply(42, {}, deps);
+    assert.equal(process.exitCode, 0);
+    assert.equal(deps.bodies.length, 1);
+    live.body = deps.bodies[0]!;
+  });
+  const postApply = parseDecisionsFromBody(live.body);
+  assert.equal(postApply.ok, true);
+  if (!postApply.ok) return;
+  assert.equal(postApply.artifact.fingerprint.dependency_closure_sha256, signedHash);
+  assert.match(live.body, /pipeline-decisions-v1/);
+  assert.match(live.body, /## Decisions/);
+
+  const pending = await listHandoffs("/tmp/repo", { issue: 42, status: "pending" }, store);
+  assert.ok(pending.length >= 1);
+  for (const seed of pending) {
+    const loaded = await loadHandoff("/tmp/repo", 42, seed.handoff_id, store);
+    assert.equal(loaded.ok, true);
+    if (!loaded.ok) return;
+    const answered = await answerAndPersistHandoff(
+      "/tmp/repo",
+      42,
+      loaded.handoff.handoff_id,
+      {
+        decision: "answer",
+        actor: "alice",
+        identitySource: "gh",
+        authenticated: true,
+        answerText: "yes",
+      },
+      store,
+      {
+        materialize: async (handoff, text) => {
+          const r = await materializeGrillAnswer(handoff, text, {
+            getIssueBody: async () => live.body,
+            updateIssueBody: async (_n, next) => {
+              live.body = next;
+            },
+            repoDir: "/tmp/repo",
+            handoffStore: store,
+            keyDeps,
+            frontierKey: "test-key",
+            now: () => new Date("2026-01-01T00:00:01Z"),
+          });
+          return r.ok ? { ok: true as const, wrote: r.wrote } : r;
+        },
+      },
+    );
+    assert.equal(answered.ok, true, answered.ok ? "" : answered.reason);
+  }
+  const postHandoff = parseDecisionsFromBody(live.body);
+  assert.equal(postHandoff.ok, true);
+  if (!postHandoff.ok) return;
+  assert.equal(postHandoff.artifact.fingerprint.dependency_closure_sha256, signedHash);
+  assert.ok(postHandoff.artifact.nodes.every((n) => n.provenance.settled_by === "handoff"));
+
+  const recomputed = await snapshotFingerprint(42, live.title, live.body, childFetch(child));
+  assert.equal(recomputed.dependency_closure_sha256, signedHash);
+  const oldStyle = hashDependencyClosure({
+    ids: [42, 7],
+    per_id: [
+      {
+        id: 42,
+        title_sha256: sha256Prefixed(live.title),
+        body_sha256: sha256Prefixed(live.body),
+      },
+      {
+        id: 7,
+        title_sha256: sha256Prefixed(child.title),
+        body_sha256: sha256Prefixed(child.body),
+      },
+    ],
+    fact_codes: [],
+  });
+  assert.notEqual(oldStyle, signedHash);
+
+  const listed = await listHandoffs("/tmp/repo", { issue: 42 }, store);
+  const frontier = loadVerifiedGrillFrontier("/tmp/repo", 42, "test-key", env.repo, keyDeps);
+  let labels = ["pipeline:backlog"];
+  const add: string[] = [];
+  const remove: string[] = [];
+  const deps: TriageDeps = {
+    getIssueLabels: async () => [...labels],
+    addLabel: async (_n, l) => {
+      add.push(l);
+      if (!labels.includes(l)) labels.push(l);
+    },
+    removeLabel: async (_n, l) => {
+      remove.push(l);
+      labels = labels.filter((x) => x !== l);
+    },
+    log: () => {},
+    getReadySnapshot: async () => ({
+      title: live.title,
+      body: live.body,
+      comments: [],
+      fingerprint: recomputed,
+      contextMd: CONTEXT_MD,
+      integrationBaseSha: INTEGRATION_BASE,
+      handoffs: listed,
+      frontier,
+    }),
+  };
+  await runTriage({ issueArg: "42", stage: "ready" }, deps);
+  assert.deepEqual(add, ["pipeline:ready"]);
+  assert.ok(remove.includes("pipeline:backlog"));
+});
+
+test("grill: later dependency change stales closure; root title and spec-core stale their own fingerprints", async () => {
+  const specWithDep = `${THIN_SPEC}\n\nDepends on #7.\n`;
+  const child = { title: "Child seven", body: "leaf seven" };
+  const title = "Thin issue";
+  const recordedFp = await snapshotFingerprint(42, title, specWithDep, childFetch(child));
+  const art: DecisionsArtifact = {
+    schema_version: "decisions.v1",
+    nodes: settledOperatorNodes(),
+    fingerprint: recordedFp,
+    required_context: { terms: [], integration_base_sha: null, context_md_sha256: null },
+    unresolved_facts: [],
+    context_proposals: [],
+  };
+  const body = embedDecisionsInBody(specWithDep, art);
+  const liveFp = await snapshotFingerprint(42, title, body, childFetch(child));
+  assert.equal(liveFp.dependency_closure_sha256, recordedFp.dependency_closure_sha256);
+  assert.equal(liveFp.applied_body_sha256, recordedFp.applied_body_sha256);
+
+  const childChanged = await snapshotFingerprint(
+    42,
+    title,
+    body,
+    childFetch({ title: child.title, body: "leaf mutated" }),
+  );
+  assert.deepEqual(fingerprintStaleReasons(recordedFp, childChanged), ["dependency_closure_sha256"]);
+
+  const titleChanged = await snapshotFingerprint(42, "Thin issue retitled", body, childFetch(child));
+  assert.ok(fingerprintStaleReasons(recordedFp, titleChanged).includes("title_sha256"));
+  assert.equal(
+    fingerprintStaleReasons(recordedFp, titleChanged).includes("dependency_closure_sha256"),
+    false,
+  );
+
+  const newSpec = `${extractSpecCore(body)}\nMore specification core.\n`;
+  const coreChangedBody = embedDecisionsInBody(newSpec, art);
+  const coreChanged = await snapshotFingerprint(42, title, coreChangedBody, childFetch(child));
+  assert.ok(fingerprintStaleReasons(recordedFp, coreChanged).includes("applied_body_sha256"));
+
+  const add: string[] = [];
+  const remove: string[] = [];
+  const deps: TriageDeps = {
+    getIssueLabels: async () => ["pipeline:backlog"],
+    addLabel: async (_n, l) => {
+      add.push(l);
+    },
+    removeLabel: async (_n, l) => {
+      remove.push(l);
+    },
+    log: () => {},
+    getReadySnapshot: async () => ({
+      title,
+      body,
+      comments: [],
+      fingerprint: childChanged,
+      contextMd: CONTEXT_MD,
+      integrationBaseSha: INTEGRATION_BASE,
+      handoffs: art.nodes
+        .filter((n) => n.provenance.settled_by === "handoff")
+        .map((n) => handoffForNode(n)),
+      frontier: frontierFor(body, art),
+    }),
+  };
+  await assert.rejects(() => runTriage({ issueArg: "42", stage: "ready" }, deps), (err: Error) => {
+    assert.equal(err instanceof TriageReadyError, true);
+    assert.equal((err as TriageReadyError).exitCode, 2);
+    assert.match(err.message, /stale fingerprints: dependency_closure_sha256/);
+    return true;
+  });
+  assert.deepEqual(add, []);
+  assert.deepEqual(remove, []);
+});
+
+test("grill: fail-closed dependency facts still block ready with no label write", async () => {
+  for (const code of DEPENDENCY_FACT_CODES) {
+    const spec = "## Summary\nX\n";
+    const nodes = settledOperatorNodes();
+    const fact: TypedUnresolvedFact = {
+      code,
+      issue_ids: [99],
+      edges: [],
+      message: `${code} fixture`,
+    };
+    const art = artifact(nodes, spec);
+    art.unresolved_facts = [fact];
+    const body = embedDecisionsInBody(spec, art);
+    const add: string[] = [];
+    const remove: string[] = [];
+    const deps: TriageDeps = {
+      getIssueLabels: async () => ["pipeline:backlog"],
+      addLabel: async (_n, l) => {
+        add.push(l);
+      },
+      removeLabel: async (_n, l) => {
+        remove.push(l);
+      },
+      log: () => {},
+      getReadySnapshot: async () => completeReadySnapshot(body),
+    };
+    await assert.rejects(() => runTriage({ issueArg: "42", stage: "ready" }, deps), (err: Error) => {
+      assert.equal(err instanceof TriageReadyError, true);
+      assert.equal((err as TriageReadyError).exitCode, 2);
+      return true;
+    });
+    assert.deepEqual(add, []);
+    assert.deepEqual(remove, []);
+  }
 });

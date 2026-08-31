@@ -5,6 +5,7 @@ import { classifyContextProposals, recordRequiredContextHashes } from "./grill-c
 import {
   applyReviewerVerdicts,
   canonicalThinIssueNodes,
+  DEPENDENCY_FACT_CODES,
   embedDecisionsInBody,
   extractSpecCore,
   hasReviewerChallenge,
@@ -21,6 +22,7 @@ import {
 import { walkDeclaredDependencyClosure, type WalkDependenciesDeps } from "./grill-facts.ts";
 import {
   buildGrillFingerprint,
+  hashDependencyClosure,
   type GrillFingerprint,
   type ProviderConfigIdentity,
 } from "./grill-fingerprint.ts";
@@ -86,6 +88,7 @@ export interface GrillIssuePreviewDeps {
 
 export interface GrillIssueApplyDeps {
   getIssue(issueNumber: number): Promise<{ title: string; body: string }>;
+  fetchDependencyIssue: WalkDependenciesDeps["fetchIssue"];
   updateIssueBody(issueNumber: number, body: string): Promise<void>;
   isKillSwitchActive(): boolean;
   now(): Date;
@@ -265,10 +268,17 @@ export async function runRefineSpecIssuePreview(
     contextMd,
   );
 
+  const signedWalk = await walkDeclaredDependencyClosure(
+    issueNumber,
+    issue.title,
+    parsed.body,
+    { fetchIssue: deps.fetchDependencyIssue },
+  );
+
   const fingerprintForReview: GrillFingerprint = buildGrillFingerprint({
     title: issue.title,
     appliedBody: "",
-    dependencyClosure: walk.record,
+    dependencyClosure: signedWalk.record,
     integrationBaseSha: integrationBase,
     contextMd,
     providerConfig: deps.providerConfig,
@@ -280,7 +290,7 @@ export async function runRefineSpecIssuePreview(
     nodes,
     fingerprint: fingerprintForReview,
     required_context: required,
-    unresolved_facts: walk.facts,
+    unresolved_facts: signedWalk.facts,
     context_proposals: classified.proposals,
   };
 
@@ -341,7 +351,7 @@ export async function runRefineSpecIssuePreview(
       applied_body_sha256: sha256Prefixed(specBody),
     },
     required_context: required,
-    unresolved_facts: walk.facts,
+    unresolved_facts: signedWalk.facts,
     context_proposals: classified.proposals,
   };
   const body = embedDecisionsInBody(specBody, artifact);
@@ -437,6 +447,26 @@ export async function runRefineSpecApply(
   }
   const bodyCheck = parseDecisionsFromBody(envelope.proposal.body);
   if (!bodyCheck.ok) return fail(deps, `proposal body is not a valid Decisions artifact: ${bodyCheck.reason}`, 2);
+  const applyWalk = await walkDeclaredDependencyClosure(
+    issueNumber,
+    live.title,
+    envelope.proposal.body,
+    { fetchIssue: deps.fetchDependencyIssue },
+  );
+  const closureHash = hashDependencyClosure(applyWalk.record);
+  if (closureHash !== envelope.proposal.artifact.fingerprint.dependency_closure_sha256) {
+    return fail(deps, "dependency-closure fingerprint mismatch", 2);
+  }
+  const blockingFacts = applyWalk.facts.filter((f) =>
+    (DEPENDENCY_FACT_CODES as readonly string[]).includes(f.code),
+  );
+  if (blockingFacts.length > 0) {
+    return fail(
+      deps,
+      `unresolved dependency facts: ${blockingFacts.map((f) => f.code).join(", ")}`,
+      2,
+    );
+  }
   const created = await createPendingGrillHandoffs(
     deps.repoDir,
     {
@@ -599,6 +629,18 @@ export function realGrillIssueApplyDeps(cfg: PipelineConfig): GrillIssueApplyDep
     getIssue: async (n) => {
       const d = await getIssueDetail(cfg, n);
       return { title: d.title, body: d.body };
+    },
+    fetchDependencyIssue: async (id) => {
+      try {
+        const d = await getIssueDetail(cfg, id);
+        return { ok: true, title: d.title, body: d.body };
+      } catch (err) {
+        const msg = (err as Error).message.toLowerCase();
+        if (msg.includes("404") || msg.includes("not found")) {
+          return { ok: false, code: "missing" };
+        }
+        return { ok: false, code: "inaccessible" };
+      }
     },
     updateIssueBody: async (n, body) => {
       const result = spawnSync(
