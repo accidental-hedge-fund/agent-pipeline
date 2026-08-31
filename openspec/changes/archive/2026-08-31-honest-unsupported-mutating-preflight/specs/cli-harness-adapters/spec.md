@@ -4,7 +4,7 @@
 
 The pipeline SHALL refuse a local-CLI harness for product-mutating implementation work (implement, fix-round, test-fix, eval-fix, visual-fix) when the assigned adapter omits `background_job_lifecycle`. The pipeline SHALL spawn that harness when the adapter declares `background_job_lifecycle.supported` as false. Explicit non-support SHALL mean the adapter cannot prove join. The lifecycle supervisor SHALL stay disabled for that invocation. The pipeline SHALL NOT invent lifecycle events for an unsupported adapter. Outer stage timeout and existing salvage SHALL still apply. When the adapter declares the capability supported under a coherent schema, the pipeline SHALL keep the join-grace watchdog. An omitted-field refusal SHALL be a typed `capability-refusal` distinguishable from missing-CLI, unauthenticated, unsupported model or effort, prompt-size refusal, and bare spawn errors. Planning and review invocations SHALL NOT require this capability and SHALL NOT be refused solely because the adapter declares `background_job_lifecycle` unsupported.
 
-#### Scenario: Unsupported implementer is refused before spawn
+#### Scenario: Unsupported implementer is spawned without lifecycle supervision
 
 - **WHEN** implementing, fix-round, test-fix, eval-fix, or visual-fix assigns an adapter that declares `background_job_lifecycle` unsupported
 - **THEN** this capability check SHALL NOT refuse the invocation
