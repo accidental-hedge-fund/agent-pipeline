@@ -191,7 +191,11 @@ const BASE_COMMAND_DOCS: Record<string, CommandDoc> = {
     summary:
       "List, inspect, answer, reject, or supersede durable human-question handoffs (#647)",
     usage:
-      "handoff list|show|answer|reject|supersede … [--json] [--issue N] [--run-id id] [--status pending]",
+      "handoff list [--issue N] [--run-id id] [--filter-status pending] [--batch 1,2,3] [--json] | " +
+      "handoff show <handoff-id> --issue N [--json] | " +
+      'handoff answer <handoff-id> --issue N --text "…" [--client-request-id id] | ' +
+      "handoff reject <handoff-id> --issue N [--reason …] [--client-request-id id] | " +
+      'handoff supersede <handoff-id> --issue N --question "…" --class <class> --capability <cap> --candidate-sha <sha> --resume-target <t>',
   },
 
   correction: {

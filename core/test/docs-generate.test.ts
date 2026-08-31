@@ -254,6 +254,31 @@ describe("renderCliMarkdown", () => {
       "copying a later loop alternative must not run `loop` as a separate command",
     );
   });
+
+  test("handoff usage publishes executable per-verb grammar (#1349)", () => {
+    const doc = COMMAND_DOCS.handoff;
+    assert.ok(doc, "handoff must have command-docs metadata");
+    const rendered = formatHostUsage("pipeline", doc.usage);
+    for (const form of [
+      "pipeline handoff list",
+      "pipeline handoff show <handoff-id>",
+      "pipeline handoff answer <handoff-id>",
+      "pipeline handoff reject <handoff-id>",
+      "pipeline handoff supersede <handoff-id>",
+    ]) {
+      assert.ok(rendered.includes(form), `missing ${form} in ${rendered}`);
+    }
+    assert.match(doc.usage, /--filter-status/);
+    assert.doesNotMatch(doc.usage, /(?:^|[\s|])--status(?:\s|$)/);
+    assert.doesNotMatch(rendered, /human-question-handoff|node --experimental/);
+    const md = renderCliMarkdown();
+    assert.match(md, /pipeline handoff list/);
+    assert.match(md, /pipeline handoff show <handoff-id>/);
+    assert.match(md, /pipeline handoff answer <handoff-id>/);
+    assert.match(md, /pipeline handoff reject <handoff-id>/);
+    assert.match(md, /pipeline handoff supersede <handoff-id>/);
+    assert.doesNotMatch(md, /handoff list\|show\|answer/);
+  });
 });
 
 // ---------------------------------------------------------------------------

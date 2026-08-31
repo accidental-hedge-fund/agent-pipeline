@@ -226,7 +226,7 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 
 #### `handoff`
 
-- **Usage:** `pipeline handoff list|show|answer|reject|supersede … [--json] [--issue N] [--run-id id] [--status pending]`
+- **Usage:** `pipeline handoff list [--issue N] [--run-id id] [--filter-status pending] [--batch 1,2,3] [--json] | pipeline handoff show <handoff-id> --issue N [--json] | pipeline handoff answer <handoff-id> --issue N --text "…" [--client-request-id id] | pipeline handoff reject <handoff-id> --issue N [--reason …] [--client-request-id id] | pipeline handoff supersede <handoff-id> --issue N --question "…" --class <class> --capability <cap> --candidate-sha <sha> --resume-target <t>`
 - **Summary:** List, inspect, answer, reject, or supersede durable human-question handoffs (#647)
 
 ## Notes
