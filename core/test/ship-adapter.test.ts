@@ -213,6 +213,7 @@ function operations(overrides: Partial<ShipAdapterOperations> = {}): ShipAdapter
     waitForPublication: async () => publication,
     observePromotion: async () => promotion,
     promote: async () => promotion,
+    observeRemainingOpenMilestoneIssues: async () => [],
     ...overrides,
   };
 }
@@ -1155,6 +1156,51 @@ test("planTrainFromMilestoneIssues: mixed open + closed R2D stay in one freeze p
   ];
   const plan = planTrainFromMilestoneIssues("v1.39.13", issues);
   assert.deepEqual([...plan.ordered_issues].sort((a, b) => a - b), [20, 21]);
+});
+
+test("ship adapter remaining-open leftover blocks FRG pack without real gh (#1354)", async () => {
+  const store = memoryShipStore();
+  let frgPackRuns = 0;
+  const deps = shipCoordinatorDepsFromOperations(
+    operations({
+      observeRemainingOpenMilestoneIssues: async () => [1344],
+      runFrgPack: async () => {
+        frgPackRuns += 1;
+      },
+      observeFrg: async () => {
+        throw new Error("observeFrg must not run when remaining-open fails");
+      },
+    }),
+    { state: store, authorizationPublicKey: "test" },
+  );
+  const coordinator = {
+    ...deps,
+    withRunLock: async (_key: string, fn: () => Promise<unknown>) => fn(),
+  };
+  await assert.rejects(
+    () => runShipCoordinator(intent, null, coordinator),
+    /milestone v1\.34\.0 still has open issues: #1344/,
+  );
+  assert.equal(frgPackRuns, 0);
+  assert.ok(store.status?.train, "train must still complete");
+  assert.equal(store.status?.frg_pack, null);
+});
+
+test("ship-adapter remaining-open listing reuses merge-queue helpers, not freeze --limit (#1354)", () => {
+  const src = fs.readFileSync(
+    path.join(__dirname, "../scripts/stages/ship-adapter.ts"),
+    "utf8",
+  );
+  assert.match(src, /listRemainingOpenMilestoneIssueNumbers/);
+  assert.match(src, /observeRemainingOpenMilestoneIssues/);
+  const freezeIdx = src.indexOf("MILESTONE_ISSUE_DISCOVERY_LIMIT");
+  const remainingIdx = src.indexOf("listRemainingOpenMilestoneIssueNumbers");
+  assert.ok(freezeIdx !== -1 && remainingIdx !== -1);
+  assert.notEqual(
+    remainingIdx,
+    freezeIdx,
+    "remaining-open must not reuse the freeze discovery limit listing",
+  );
 });
 
 test("planTrainFromMilestoneIssues: empty freeze-eligible fails closed, not open-only (#1252)", () => {

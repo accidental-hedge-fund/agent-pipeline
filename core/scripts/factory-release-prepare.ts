@@ -92,6 +92,11 @@ import {
   type ReleaseOpts,
   type ReleasePrepareResult,
 } from "./stages/release.ts";
+import {
+  assertNoRemainingOpenMilestoneIssues,
+  listRemainingOpenMilestoneIssueNumbers,
+  remainingOpenGh,
+} from "./stages/ship.ts";
 
 // ---------------------------------------------------------------------------
 // Constants / types
@@ -394,6 +399,14 @@ export interface FactoryReleasePrepareDeps {
    * never touch the real filesystem.
    */
   realpathSync?(absolutePath: string): string;
+  /**
+   * Remaining-open GitHub observation for the ship milestone. Required before
+   * pack-loop start. Tests inject leftover issues / empty sets / query failures.
+   */
+  listRemainingOpenMilestoneIssues?(args: {
+    repository: string;
+    milestone: string;
+  }): Promise<readonly number[]>;
 }
 
 // ---------------------------------------------------------------------------
@@ -3760,6 +3773,9 @@ export function defaultFactoryReleasePrepareDeps(
     scoreBoundPackLoop: overrides.scoreBoundPackLoop,
     log: overrides.log,
     realpathSync: overrides.realpathSync,
+    listRemainingOpenMilestoneIssues:
+      overrides.listRemainingOpenMilestoneIssues ??
+      ((args) => listRemainingOpenMilestoneIssueNumbers(args.repository, args.milestone, remainingOpenGh)),
   };
 }
 
@@ -3988,6 +4004,16 @@ export async function runFactoryReleasePrepare(
     );
   }
   const request = parseFactoryReleasePrepareRequest(raw);
+  const milestone = request.milestone ?? `v${request.target_version}`;
+  const listRemaining = deps.listRemainingOpenMilestoneIssues;
+  if (typeof listRemaining !== "function") {
+    throw new Error("ship-end-open-issue-gate: remaining-open observation is required");
+  }
+  const remaining = await listRemaining({
+    repository: request.repository,
+    milestone,
+  });
+  assertNoRemainingOpenMilestoneIssues(milestone, remaining);
   const fingerprint = factoryReleaseRequestFingerprint(request);
   const workDir = factoryReleaseWorkDir(opts.repoDir, fingerprint);
   const checkpointPath = factoryReleaseCheckpointPath(opts.repoDir, fingerprint);

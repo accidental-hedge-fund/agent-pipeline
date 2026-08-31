@@ -71,6 +71,7 @@ import { LOOP_LEDGER_SCHEMA } from "../loop/types.ts";
 import type { CheckRun, PipelineConfig } from "../types.ts";
 import {
   defaultShipStateStore,
+  listRemainingOpenMilestoneIssueNumbers,
   shipKey,
   shipStatePaths,
   type ShipCoordinatorDeps,
@@ -183,6 +184,11 @@ export interface ShipAdapterOperations {
    * before observing evidence so a pin process can spawn candidate prepare/gate.
    */
   runFrgPack?(intent: ShipIntent, train: ShipTrainEvidence): Promise<void>;
+  /**
+   * Remaining-open GitHub observation for the ship milestone. Required for
+   * every post-train FRG / release / promote boundary.
+   */
+  observeRemainingOpenMilestoneIssues(intent: ShipIntent): Promise<readonly number[]>;
 }
 
 export interface RealShipCoordinatorDepsOptions {
@@ -560,6 +566,13 @@ export function shipCoordinatorDepsFromOperations(
     withRunLock: (key, fn) => withLock(`ship-${key}`, fn),
 
     planTrain: operations.planTrain,
+
+    async observeRemainingOpenMilestoneIssues(intent) {
+      if (typeof operations.observeRemainingOpenMilestoneIssues !== "function") {
+        throw new Error("ship-end-open-issue-gate: remaining-open observation is required");
+      }
+      return operations.observeRemainingOpenMilestoneIssues(intent);
+    },
 
     async reconcile(intent, checkpoint) {
       const progress = emptyProgress();
@@ -1072,6 +1085,20 @@ function realShipAdapterOperations(opts: RealShipCoordinatorDepsOptions): ShipAd
     async planTrain(intent) {
       const issues = await listMilestoneIssues(intent.milestone, "all");
       return planTrainFromMilestoneIssues(intent.milestone, issues);
+    },
+    async observeRemainingOpenMilestoneIssues(intent) {
+      return listRemainingOpenMilestoneIssueNumbers(
+        opts.repo,
+        intent.milestone,
+        async (args) => {
+          const { stdout } = await execFileAsync("gh", args, {
+            cwd: opts.repoDir,
+            timeout: 120_000,
+            maxBuffer: 50 * 1024 * 1024,
+          });
+          return String(stdout);
+        },
+      );
     },
     observeTrain,
     async runTrain(intent, plannedIssues) {

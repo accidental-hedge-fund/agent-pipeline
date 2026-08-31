@@ -144,8 +144,13 @@ not block solely on messenger delivery. Reinstall `ship-notify` from
 Freeze-eligible issues are open non-backlog pipeline issues **and** closed
 issues labeled `pipeline:ready-to-deploy`. An all-integrated milestone does
 **not** stop at `no open issues to freeze`. Train records those closed items
-`already-integrated` and ship proceeds to FRG / release. Mixed milestones
-merge still-open ready-to-deploy PRs in the same run.
+`already-integrated` before the remaining-open check. Freeze-eligible
+integration is **not** authorization to start FRG pack, release, or promote.
+Leftover open GitHub issues on the ship milestone, including `pipeline:backlog`,
+fail closed before FRG / release / promote. Pipeline labels do not exempt an
+open milestoned issue. `--skip-frg` is not a way to start those operations
+while the milestone still has open issues. Mixed milestones merge still-open
+ready-to-deploy PRs in the same run.
 
 Missing FRG evidence is recovered on a native-`/goal` engine:
 

@@ -15,6 +15,17 @@ function read(rel: string): string {
   return fs.readFileSync(path.join(repoRoot, rel), "utf8");
 }
 
+test("CONTEXT ship path names freeze-eligible and ship-end-open-issue-gate (#1354)", () => {
+  const context = read("CONTEXT.md");
+  const shipPath = context.slice(context.indexOf("### Ship path"));
+  assert.match(shipPath, /\*\*Freeze-eligible\*\*:/);
+  assert.match(shipPath, /Train membership only/);
+  assert.match(shipPath, /Not authorization to start FRG pack, release, or promote/);
+  assert.match(shipPath, /\*\*Ship-end-open-issue-gate\*\*:/);
+  assert.match(shipPath, /every post-train FRG pack/);
+  assert.match(shipPath, /Pipeline labels do not exempt/);
+});
+
 test("FRG runbook and supervisor ship text document all-integrated freeze and pack-loop profile (#1252)", () => {
   const runbook = read("docs/factory-reliability-gate-runbook.md");
   const supervisor = read("docs/supervisor.md");
@@ -33,6 +44,21 @@ test("FRG runbook and supervisor ship text document all-integrated freeze and pa
       text,
       /already-integrated/,
       `${name} must record already-integrated before FRG / release`,
+    );
+    assert.match(
+      text,
+      /\*\*not\*\* authorization to start FRG/,
+      `${name} must not treat freeze-eligible integration as FRG start`,
+    );
+    assert.match(
+      text,
+      /pipeline:backlog/,
+      `${name} must name leftover open backlog as fail-closed before FRG`,
+    );
+    assert.match(
+      text,
+      /fails? closed/,
+      `${name} must document remaining-open fail-closed before FRG / release / promote`,
     );
     assert.match(
       text,

@@ -269,7 +269,12 @@ not the product owner. #1001 / #971 do not ban in-engine ship.
 All-integrated milestones (every freeze-eligible issue closed at
 `pipeline:ready-to-deploy` with merged PRs contained in base) do **not** stop
 at `no open issues to freeze`. Freeze includes those closed ready-to-deploy
-items; train records `already-integrated` and ship continues to FRG / release.
+items; train records `already-integrated` before the remaining-open check.
+Freeze-eligible integration is **not** authorization to start FRG pack, release,
+or promote. Leftover open GitHub issues on the ship milestone, including
+`pipeline:backlog`, fail closed before FRG pack, release, and `engine-promote`.
+Pipeline labels do not exempt an open milestoned issue. `--skip-frg` is not a
+way to start those operations while the milestone still has open issues.
 Missing FRG evidence is recovered with
 `pipeline loop --label factory-gate --profile claude` then
 `pipeline factory-gate --for <X.Y.Z> --from-run <loop-run-id>`. `--skip-frg` is

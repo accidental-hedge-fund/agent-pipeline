@@ -7,10 +7,23 @@
 // `reconcile` pass makes a rerun safe after a crash between an external side
 // effect and the local atomic status write.
 
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { homedir } from "node:os";
+import {
+  findMilestoneNumberByTitle,
+  listMilestoneOpenIssuesApiArgs,
+  listMilestonesApiArgs,
+  parseMilestoneIssuesPages,
+  parseMilestonesPages,
+  type MilestoneApiRaw,
+  type MilestoneIssueApiRaw,
+} from "./milestone-open-issues.ts";
+
+const execFileAsync = promisify(execFile);
 
 export const SHIP_SCHEMA_VERSION = 1;
 export const SHIP_AUTHORIZATION_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
@@ -217,6 +230,122 @@ export interface ShipCoordinatorDeps {
   convergeReleaseFinish(intent: ShipIntent, release: ShipReleaseEvidence): Promise<ShipReleaseFinishEvidence>;
   waitForRelease(intent: ShipIntent, release: ShipReleaseFinishEvidence): Promise<ShipPublicationEvidence>;
   convergeEnginePromote(intent: ShipIntent, publication: ShipPublicationEvidence): Promise<ShipPromotionEvidence>;
+  /**
+   * Live GitHub remaining-open observation for the ship milestone.
+   * Returns open issue numbers only (no pull requests). Throws on auth, API,
+   * parse, pagination, or unresolved-title failure — never an empty skip.
+   */
+  observeRemainingOpenMilestoneIssues(intent: ShipIntent): Promise<readonly number[]>;
+}
+
+/** Post-train coordinator phases that re-observe remaining-open GitHub issues. */
+export const SHIP_END_OPEN_ISSUE_GATED_PHASES = [
+  "frg_pack",
+  "frg_score",
+  "release_prepare",
+  "release_finish",
+  "engine_promote",
+] as const satisfies readonly ShipNextAction[];
+
+export type RemainingOpenGhRunner = (args: string[]) => Promise<string>;
+
+export function remainingOpenMilestoneIssuesError(
+  milestone: string,
+  issueNumbers: readonly number[],
+): Error {
+  const listed = issueNumbers.map((n) => `#${n}`).join(", ");
+  return new Error(
+    `ship-end-open-issue-gate: milestone ${milestone} still has open issues: ${listed}`,
+  );
+}
+
+/** Pure fail-closed helper: empty list proceeds; any number throws naming all of them. */
+export function assertNoRemainingOpenMilestoneIssues(
+  milestone: string,
+  issueNumbers: readonly number[],
+): void {
+  if (issueNumbers.length === 0) return;
+  throw remainingOpenMilestoneIssuesError(milestone, issueNumbers);
+}
+
+function parseRemainingOpenSlurpPages<T>(raw: string, label: string): T[][] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw.trim() || "[]");
+  } catch {
+    throw new Error(`ship-end-open-issue-gate: cannot parse ${label}`);
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error(`ship-end-open-issue-gate: cannot parse ${label}`);
+  }
+  if (parsed.some((page) => !Array.isArray(page))) {
+    throw new Error(`ship-end-open-issue-gate: cannot parse ${label}`);
+  }
+  return parsed as T[][];
+}
+
+function wrapRemainingOpenFailure(milestone: string, err: unknown): Error {
+  const detail = err instanceof Error ? err.message : String(err);
+  if (detail.startsWith("ship-end-open-issue-gate:")) return err instanceof Error ? err : new Error(detail);
+  return new Error(
+    `ship-end-open-issue-gate: cannot prove zero open issues on ${milestone}: ${detail}`,
+  );
+}
+
+/**
+ * Exhaustive remaining-open listing. Reuses the shared milestone open-issue
+ * args and parsers. Unresolved title, parse failure, and listing failure throw
+ * rather than returning an empty set.
+ */
+export async function listRemainingOpenMilestoneIssueNumbers(
+  repo: string,
+  milestoneTitle: string,
+  gh: RemainingOpenGhRunner,
+): Promise<number[]> {
+  let msOut: string;
+  try {
+    msOut = await gh(listMilestonesApiArgs(repo));
+  } catch (err) {
+    throw wrapRemainingOpenFailure(milestoneTitle, err);
+  }
+  const msPages = parseRemainingOpenSlurpPages<MilestoneApiRaw>(
+    msOut,
+    `milestone listing for ${milestoneTitle}`,
+  );
+  const milestoneNumber = findMilestoneNumberByTitle(
+    parseMilestonesPages(msPages),
+    milestoneTitle,
+  );
+  if (milestoneNumber === null) {
+    throw new Error(
+      `ship-end-open-issue-gate: cannot resolve milestone ${milestoneTitle}`,
+    );
+  }
+
+  let issueOut: string;
+  try {
+    issueOut = await gh(listMilestoneOpenIssuesApiArgs(repo, milestoneNumber));
+  } catch (err) {
+    throw wrapRemainingOpenFailure(milestoneTitle, err);
+  }
+  const issuePages = parseRemainingOpenSlurpPages<MilestoneIssueApiRaw>(
+    issueOut,
+    `open-issue listing for ${milestoneTitle}`,
+  );
+  return parseMilestoneIssuesPages(issuePages).map((issue) => issue.number);
+}
+
+/** Production `gh` runner for remaining-open observation. Injectable in tests. */
+export async function remainingOpenGh(
+  args: string[],
+  opts: { cwd?: string } = {},
+): Promise<string> {
+  const { stdout } = await execFileAsync("gh", args, {
+    cwd: opts.cwd,
+    timeout: 120_000,
+    maxBuffer: 50 * 1024 * 1024,
+  });
+  return String(stdout);
 }
 
 const AUTHORIZATION_KEYS = [
@@ -796,6 +925,10 @@ export async function runShipCoordinator(
     await recordEvent(deps, status, phase, "started");
     try {
       requireActiveAuthorization();
+      if ((SHIP_END_OPEN_ISSUE_GATED_PHASES as readonly ShipNextAction[]).includes(phase)) {
+        const remaining = await deps.observeRemainingOpenMilestoneIssues(expected);
+        assertNoRemainingOpenMilestoneIssues(expected.milestone, remaining);
+      }
       const value = await operation();
       status = await persist(deps, status, apply(value));
       await recordEvent(deps, status, phase, "completed");
