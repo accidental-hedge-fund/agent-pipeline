@@ -82,7 +82,8 @@ import {
 import type { Outcome, PipelineConfig, Stage } from "../types.ts";
 import { extractBlockingKeysMarker, extractReviewedSha } from "./review.ts";
 import { appendEvent, RUN_SCHEMA_VERSION, type RunStoreDeps } from "../run-store.ts";
-import { buildStageDiagnostic } from "../stage-diagnostic.ts";
+import { classifyHarnessFailure } from "../escalation-classify.ts";
+import { buildStageDiagnostic, type StageDiagnostic } from "../stage-diagnostic.ts";
 import {
   createAndPersistHandoff,
   createInputFromHumanDecisionDeclaration,
@@ -395,6 +396,9 @@ export async function invokeFixHarnessWithRetry(
     if (result.background_wait) {
       return { attempts, finalResult: result, budgetExhausted: false };
     }
+    if (result.preflight_failed) {
+      return { attempts, finalResult: result, budgetExhausted: false };
+    }
     priorReason = result.timed_out
       ? `timed out after ${debitSec.toFixed(0)}s`
       : `exit ${result.exit_code}`;
@@ -433,8 +437,17 @@ export function buildFixRetryPreamble(attempt: number, limit: number, priorReaso
  * test so the propagation is verified through the real construction, not a
  * re-implementation in the test body.
  */
-export function fixHarnessFailureOutcome(reason: string): Outcome {
-  return { advanced: false, status: "blocked", reason, blockerKind: "harness-failure" };
+export function fixHarnessFailureOutcome(
+  reason: string,
+  diagnostic?: StageDiagnostic,
+): Outcome {
+  return {
+    advanced: false,
+    status: "blocked",
+    reason,
+    blockerKind: "harness-failure",
+    ...(diagnostic ? { diagnostic } : {}),
+  };
 }
 
 /** Decision from {@link decideExternalCommitAdvance} — either advance to the round's next stage, or fall through to the existing no-commits block. */
@@ -1006,9 +1019,12 @@ export async function advanceFix(
         };
       }
       if (!result.success && !ctx.salvaged && !ctx.ownershipCheckpointed) {
-        const finalReason = result.timed_out
-          ? `timed out after ${result.duration.toFixed(0)}s`
-          : `exit ${result.exit_code}`;
+        const classified = classifyHarnessFailure(result);
+        const finalReason = result.preflight_failed
+          ? (result.stderr?.trim() || "production preflight refused")
+          : result.timed_out
+            ? `timed out after ${result.duration.toFixed(0)}s`
+            : `exit ${result.exit_code}`;
         const attemptsNote = retryResult.attempts.length > 1
           ? ` after ${retryResult.attempts.length} attempts`
           : "";
@@ -1024,8 +1040,14 @@ export async function advanceFix(
           : ` Worktree ${wt.path} is clean; no recoverable work was found there.`;
         const baseReason = `Fix harness (${harness}) failed${attemptsNote}: ${finalReason}.${budgetNote}${salvageNote}`;
         const reason = await appendWorktreeStateDisclosure(wt.path, baseReason);
+        const diagnostic = buildStageDiagnostic({
+          reasonCode: classified,
+          blockerKind: "harness-failure",
+          reason: finalReason,
+          stage,
+        });
         await setBlocked(cfg, issueNumber, reason, stage, "harness-failure");
-        return { kind: "early", outcome: fixHarnessFailureOutcome(finalReason) };
+        return { kind: "early", outcome: fixHarnessFailureOutcome(finalReason, diagnostic) };
       }
       return {
         kind: "continue",

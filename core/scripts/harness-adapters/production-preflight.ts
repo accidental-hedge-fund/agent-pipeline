@@ -295,18 +295,21 @@ export async function runProductionPreflight(
     };
   }
 
-  // 1b. Mutating implementer work requires background_job_lifecycle (#1299).
+  // 1b. Mutating implementer work requires an explicit background_job_lifecycle
+  // declaration (#1299 / #1364). Omitted field → capability-refusal. Explicit
+  // supported:false means the adapter cannot prove join; spawn anyway and leave
+  // the lifecycle supervisor off. Do not invent events.
   if (requiresBackgroundJobLifecycle(req.stageKind)) {
     const lifecycle =
       adapter.capabilities.background_job_lifecycle ??
       adapter.declaration.background_job_lifecycle;
-    if (!lifecycle || lifecycle.supported !== true) {
+    if (!lifecycle) {
       const msg = capabilityRefusalMessage(adapter.name);
       return {
         ok: false,
         remediation: projectPreflightRemediation(adapter.name, "unsupported-setting", msg, {
           setting: "background_job_lifecycle",
-          value: "unsupported",
+          value: "omitted",
         }),
         cliPath: null,
         versionProbe: null,

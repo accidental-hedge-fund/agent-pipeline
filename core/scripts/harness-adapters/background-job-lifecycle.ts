@@ -569,9 +569,9 @@ export function filterRecipesForHarnessBackgroundWait<T extends string>(
 
 export function capabilityRefusalMessage(adapterName: string): string {
   return (
-    `[harness ${adapterName}] adapter declares background_job_lifecycle unsupported. ` +
+    `[harness ${adapterName}] adapter omits background_job_lifecycle. ` +
     `Mutating implementation work (implement, fix-round, test-fix, eval-fix, visual-fix) ` +
-    `requires a supporting adapter. This is a typed capability-refusal, not a transient spawn error — ` +
+    `requires an explicit declaration. This is a typed capability-refusal, not a transient spawn error — ` +
     `retrying the same invocation cannot succeed without changing the adapter or the declaration.`
   );
 }

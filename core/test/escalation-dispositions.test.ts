@@ -201,6 +201,22 @@ test("capture_error / oversize_argv map to harness-contract", () => {
   );
 });
 
+test("preflight_reason_code capability-refusal projects to capability-refusal, not workflow-engine-defect", () => {
+  const code = classifyHarnessFailure({
+    code: -1,
+    exit_code: -1,
+    preflight_reason_code: "capability-refusal",
+    stdout: "",
+    stderr: "[harness grok] adapter omits background_job_lifecycle",
+  });
+  assert.equal(code, "capability-refusal");
+  assert.notEqual(code, "workflow-engine-defect");
+  assert.notEqual(code, "harness-contract");
+  const proj = projectPipelineReasonCode(code);
+  assert.equal(proj.blockerClass, "environment-auth");
+  assert.equal(proj.disposition, "recover");
+});
+
 test("preflight_reason_code environment-auth projects to environment-auth, not harness-contract", () => {
   const code = classifyHarnessFailure({
     spawn_error: true,
