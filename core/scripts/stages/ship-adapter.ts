@@ -35,8 +35,13 @@ import {
   type FrgEvidence,
   type FrgFsDeps,
   type FrgValidateOpts,
+  type ShipPathFromRunResolution,
 } from "../factory-reliability-gate.ts";
-import { FRG_HYBRID_PILOT_VERSION } from "../frg-pack-observations.ts";
+import {
+  FRG_HYBRID_PILOT_VERSION,
+  isFrgHybridV1PolicyId,
+  isFrgHybridV2PolicyId,
+} from "../frg-pack-observations.ts";
 import {
   livenessStatusFromUnknown,
   probePackLoopLiveness,
@@ -45,8 +50,10 @@ import {
 import { defaultLoopStoreDeps } from "../loop/store.ts";
 import {
   FACTORY_RELEASE_REQUEST_KIND,
-  factoryReleaseVersionIndexPath,
+  defaultResolveShipPathFromRun,
   isPostPilotReleaseVersion,
+  unsignedDigestBindingMismatch,
+  type FactoryReleaseUnsignedDigestBinding,
 } from "../factory-release-prepare.ts";
 import { resolveReleaseConfig } from "../config.ts";
 import { getPrChecks, getPrForIssueAnyState, rerunFailedWorkflows } from "../gh.ts";
@@ -364,58 +371,104 @@ export async function alignReleaseCheckoutToCandidate(
   }
 }
 
+function provenanceMatchesTrain(
+  provenance: NonNullable<FrgEvidence["pack_provenance"]>,
+  train: ShipTrainEvidence,
+  intent: ShipIntent,
+): boolean {
+  return (
+    provenance.candidate_git_sha.toLowerCase() === train.integrated_head_oid &&
+    provenance.repository.toLowerCase() === intent.repository &&
+    provenance.base_branch === intent.base_branch
+  );
+}
+
 export function assertFrgCandidateProvenance(
   evidence: FrgEvidence,
   train: ShipTrainEvidence,
   intent: ShipIntent,
   opts?: {
     /**
-     * Post-pilot durable path may bind the candidate via the factory-release
-     * version index instead of hybrid pack_provenance. When provided, the index
-     * candidate OID is checked against the train head.
+     * Closed unsigned digest binding from the factory-release checkpoint.
+     * Required for post-pilot hybrid-v2. Tests inject; production loads it
+     * via {@link defaultResolveShipPathFromRun}.
      */
-    durableCandidateGitSha?: string | null;
+    closedUnsignedBinding?: FactoryReleaseUnsignedDigestBinding | null;
   },
 ): void {
   const provenance = evidence.pack_provenance;
-  if (!provenance) {
-    // Hybrid pack_provenance is v1.33.0-only. Later releases use durable
-    // factory-release prepare binding (version index / request checkpoint).
-    if (isPostPilotReleaseVersion(intent.version)) {
-      if (provenance != null) {
-        throw new Error(
-          `ship FRG: hybrid pack_provenance is not accepted for v${intent.version}; ` +
-            `use durable factory-release prepare after v${FRG_HYBRID_PILOT_VERSION}`,
-        );
-      }
-      const bound = opts?.durableCandidateGitSha?.toLowerCase() ?? null;
-      if (!bound) {
-        throw new Error(
-          "ship FRG: post-pilot release evidence has no durable candidate binding; " +
-            "run pipeline factory-release prepare --request <absolute-off-repo-request.json> --json " +
-            "from the exact integrated candidate",
-        );
-      }
-      if (bound !== train.integrated_head_oid) {
-        throw new Error("ship FRG: durable candidate binding does not match the exact train candidate");
-      }
-      return;
+  if (intent.version === FRG_HYBRID_PILOT_VERSION) {
+    if (!provenance) {
+      throw new Error(
+        "ship FRG: release evidence has no candidate provenance; " +
+          "the fixed-pack producer must bind the exact repository, base branch, and candidate OID",
+      );
     }
+    if (!provenanceMatchesTrain(provenance, train, intent)) {
+      throw new Error("ship FRG: pack provenance does not match the exact train candidate");
+    }
+    return;
+  }
+
+  if (!isPostPilotReleaseVersion(intent.version)) {
+    if (!provenance) {
+      throw new Error(
+        "ship FRG: release evidence has no candidate provenance; " +
+          "the fixed-pack producer must bind the exact repository, base branch, and candidate OID",
+      );
+    }
+    if (!provenanceMatchesTrain(provenance, train, intent)) {
+      throw new Error("ship FRG: pack provenance does not match the exact train candidate");
+    }
+    return;
+  }
+
+  if (!provenance) {
     throw new Error(
-      "ship FRG: release evidence has no candidate provenance; " +
-        "the fixed-pack producer must bind the exact repository, base branch, and candidate OID",
+      "ship FRG: post-pilot release evidence has no pack_provenance; " +
+        "honest factory-gate --from-run must bind hybrid-v2 provenance",
     );
   }
-  if (intent.version !== FRG_HYBRID_PILOT_VERSION) {
+  const policyId = typeof provenance.policy_id === "string" ? provenance.policy_id : "";
+  if (isFrgHybridV1PolicyId(policyId)) {
     throw new Error(
-      `ship FRG: hybrid pack_provenance is valid only for v${FRG_HYBRID_PILOT_VERSION}; ` +
+      `ship FRG: pack_provenance.policy_id ${policyId} is valid only for v${FRG_HYBRID_PILOT_VERSION}; ` +
         `got ${intent.version}`,
     );
   }
-  if (provenance.candidate_git_sha.toLowerCase() !== train.integrated_head_oid ||
-      provenance.repository.toLowerCase() !== intent.repository ||
-      provenance.base_branch !== intent.base_branch) {
+  if (!isFrgHybridV2PolicyId(policyId)) {
+    throw new Error(
+      `ship FRG: unknown pack_provenance.policy_id ${policyId}; ` +
+        `post-pilot observation requires factory-gate-v1-hybrid-v2`,
+    );
+  }
+  if (!provenanceMatchesTrain(provenance, train, intent)) {
     throw new Error("ship FRG: pack provenance does not match the exact train candidate");
+  }
+  const binding = evidence.factory_release_binding;
+  if (binding == null || typeof binding === "string") {
+    throw new Error(
+      "ship FRG: factory_release_binding is missing or notes-only; " +
+        "post-pilot hybrid-v2 must carry an HMAC-covered unsigned digest binding",
+    );
+  }
+  const closed = opts?.closedUnsignedBinding ?? null;
+  if (!closed) {
+    throw new Error(
+      "ship FRG: post-pilot eligible evidence has no closed unsigned checkpoint; " +
+        "refusing index-only candidate SHA",
+    );
+  }
+  const mismatch = unsignedDigestBindingMismatch(closed, binding);
+  if (mismatch) {
+    throw new Error(`ship FRG: ${mismatch}`);
+  }
+  const boundSha =
+    typeof (binding as { candidate_git_sha?: unknown }).candidate_git_sha === "string"
+      ? (binding as { candidate_git_sha: string }).candidate_git_sha.toLowerCase()
+      : "";
+  if (boundSha !== train.integrated_head_oid) {
+    throw new Error("ship FRG: factory_release_binding.candidate_git_sha does not match the exact train candidate");
   }
 }
 
@@ -762,6 +815,13 @@ export interface ObserveFrgEvidenceDeps {
   frgFs?: FrgFsDeps;
   frgValidateOpts?: FrgValidateOpts;
   readFile?: (path: string) => Promise<string>;
+  resolveShipPathFromRun?: (args: {
+    version: string;
+    fromRun: string;
+    repoDir: string;
+    requestCandidateGitSha?: string;
+    readFile: (p: string) => Promise<string>;
+  }) => Promise<ShipPathFromRunResolution>;
 }
 
 /**
@@ -797,28 +857,39 @@ export async function observeFrgEvidence(
     }
     return null;
   }
-  let durableCandidate: string | null = null;
-  if (isPostPilotReleaseVersion(intent.version) && !evidence.pack_provenance) {
-    const indexPath = factoryReleaseVersionIndexPath(deps.repoDir, intent.version);
-    try {
-      const read = deps.readFile ?? ((p: string) => fs.readFile(p, "utf8"));
-      const indexRaw = JSON.parse(await read(indexPath)) as {
-        candidate_git_sha?: string;
-        version?: string;
-      };
-      if (
-        indexRaw.version === intent.version &&
-        typeof indexRaw.candidate_git_sha === "string" &&
-        /^[0-9a-f]{40,64}$/i.test(indexRaw.candidate_git_sha)
-      ) {
-        durableCandidate = indexRaw.candidate_git_sha.toLowerCase();
-      }
-    } catch {
-      durableCandidate = null;
+  let closedUnsignedBinding: FactoryReleaseUnsignedDigestBinding | null = null;
+  if (isPostPilotReleaseVersion(intent.version)) {
+    const read =
+      deps.readFile ??
+      (async (p: string) => {
+        if (deps.frgFs) return deps.frgFs.readFile(p);
+        return fs.readFile(p, "utf8");
+      });
+    const fromRun = evidence.loop_run_id?.trim() ?? "";
+    if (!fromRun) {
+      throw new Error(
+        "ship FRG: post-pilot eligible evidence has no loop_run_id for closed unsigned checkpoint lookup",
+      );
     }
+    const resolve = deps.resolveShipPathFromRun ?? defaultResolveShipPathFromRun;
+    const resolution = await resolve({
+      version: intent.version,
+      fromRun,
+      repoDir: deps.repoDir,
+      requestCandidateGitSha: train.integrated_head_oid,
+      readFile: read,
+    });
+    if (resolution.kind !== "bound") {
+      const detail =
+        resolution.kind === "fail" ? resolution.message : `ship-path kind=${resolution.kind}`;
+      throw new Error(
+        `ship FRG: post-pilot eligible evidence has no closed unsigned checkpoint: ${detail}`,
+      );
+    }
+    closedUnsignedBinding = resolution.binding as FactoryReleaseUnsignedDigestBinding;
   }
   assertFrgCandidateProvenance(evidence, train, intent, {
-    durableCandidateGitSha: durableCandidate,
+    closedUnsignedBinding,
   });
   const after = await deps.observeBase();
   if (after !== before) throw new Error("ship FRG: base advanced while FRG evidence was checked");

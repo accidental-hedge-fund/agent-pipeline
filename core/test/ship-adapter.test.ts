@@ -51,6 +51,7 @@ import {
   isPathInsideCheckout,
   type FactoryReleaseFrgPayload,
   type FactoryReleasePrepareRequest,
+  type FactoryReleaseUnsignedDigestBinding,
 } from "../scripts/factory-release-prepare.ts";
 import {
   runShipCoordinator,
@@ -77,6 +78,8 @@ import {
 } from "../scripts/factory-reliability-gate.ts";
 import {
   collectFrgPackObservations,
+  FRG_HYBRID_PILOT_POLICY_ID,
+  FRG_HYBRID_V2_POLICY_ID,
   loadFrgPack,
   renderFrgPackIssues,
 } from "../scripts/frg-pack-observations.ts";
@@ -558,6 +561,18 @@ function observeFrgDeps(
     observeBase?: () => Promise<string>;
     isAncestor?: (ancestor: string, descendant: string) => Promise<boolean>;
     readFile?: (path: string) => Promise<string>;
+    resolveShipPathFromRun?: (args: {
+      version: string;
+      fromRun: string;
+      repoDir: string;
+      requestCandidateGitSha?: string;
+      readFile: (p: string) => Promise<string>;
+    }) => Promise<{
+      kind: "standalone" | "bound" | "fail";
+      binding?: unknown;
+      unsigned_frg_run_id?: string;
+      message?: string;
+    }>;
   } = {},
 ) {
   return {
@@ -566,11 +581,54 @@ function observeFrgDeps(
     isAncestor: overrides.isAncestor ?? (async (ancestor: string, descendant: string) => ancestor === descendant),
     frgFs,
     frgValidateOpts: { attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY },
-    readFile: overrides.readFile ?? (async () => {
-      const err = new Error("ENOENT") as NodeJS.ErrnoException;
-      err.code = "ENOENT";
-      throw err;
-    }),
+    readFile: overrides.readFile ?? ((p: string) => frgFs.readFile(p)),
+    resolveShipPathFromRun: overrides.resolveShipPathFromRun,
+  };
+}
+
+function unsignedDigestFixture(opts?: {
+  version?: string;
+  candidate?: string;
+  loopRunId?: string;
+  packRunId?: string;
+  frgRunId?: string;
+}): {
+  request: FactoryReleasePrepareRequest;
+  unsigned: FactoryReleaseFrgPayload;
+  binding: FactoryReleaseUnsignedDigestBinding;
+} {
+  const version = opts?.version ?? "1.40.0";
+  const candidate = opts?.candidate ?? head;
+  const unsigned: FactoryReleaseFrgPayload = {
+    pack_id: FRG_PACK_MANIFEST.pack_id,
+    manifest_path: "/pack/manifest.json",
+    manifest_sha256: "1".repeat(64),
+    pack_run_id: opts?.packRunId ?? "pack-1400",
+    loop_run_id: opts?.loopRunId ?? "loop-frg-observe-1271",
+    frg_run_id: opts?.frgRunId ?? "frg-unsigned-1400",
+    evidence_created_at: "2026-08-31T00:00:00Z",
+    observations: { path: "/u/obs.json", sha256: "1".repeat(64) },
+    evidence_bundle: { path: "/u/bundle.json", sha256: "2".repeat(64) },
+    contract: { path: "/u/contract.json", sha256: "3".repeat(64) },
+    ledger: { path: "/u/ledger.json", sha256: "4".repeat(64) },
+    events: { path: "/u/events.json", sha256: "5".repeat(64) },
+    action_evidence: { path: "/u/action.json", sha256: "6".repeat(64) },
+  };
+  const request: FactoryReleasePrepareRequest = {
+    schema_version: 1,
+    kind: "factory_release_prepare_request",
+    action_id: `pipeline-ship-${version}`,
+    repository: intent.repository,
+    base_branch: intent.base_branch,
+    target_version: version,
+    integrated_candidate: { git_sha: candidate, version: "1.39.16" },
+    production_pin: { version: "1.39.16", tag: "v1.39.16", git_sha: "c".repeat(40) },
+    frg_manifest: { pack_id: FRG_PACK_MANIFEST.pack_id, sha256: "1".repeat(64) },
+  };
+  return {
+    request,
+    unsigned,
+    binding: buildFactoryReleaseUnsignedDigestBinding(request, unsigned),
   };
 }
 
@@ -579,6 +637,8 @@ async function mintHybridEvidence(opts: {
   candidateGitSha: string;
   repository: string;
   baseBranch: string;
+  factoryReleaseBinding?: unknown;
+  policyId?: string;
 }): Promise<FrgEvidence> {
   const pack = await loadFrgPack();
   const packRunId = "frg-pack-observe-1271";
@@ -676,6 +736,12 @@ async function mintHybridEvidence(opts: {
     })),
   });
   const issueIds = observations.pack_provenance!.issues.map((issue) => String(issue.issue_number));
+  if (opts.policyId && observations.pack_provenance) {
+    observations.pack_provenance = {
+      ...observations.pack_provenance,
+      policy_id: opts.policyId,
+    };
+  }
   const evidence = computeFrgEvidence({
     version: opts.version,
     run_id: `frg-observe-${opts.version}`,
@@ -686,6 +752,7 @@ async function mintHybridEvidence(opts: {
     composition_overrides: observations.composition,
     false_human_authority_count: observations.false_human_authority_count,
     pack_provenance: observations.pack_provenance,
+    factory_release_binding: opts.factoryReleaseBinding,
     notes: [
       `Projected from durable loop run ${loopRunId}`,
       `FRG fixed pack validated: pack_id=${FRG_PACK_MANIFEST.pack_id} selector=${JSON.stringify({ type: "label", value: "factory-gate" })}`,
@@ -1126,34 +1193,98 @@ test("shipMissingFrgDiagnostic names pack loop, profile, and from-run (#1252)", 
   assert.ok(!withPrepare.includes("--skip-frg") || withPrepare.lastIndexOf("--skip-frg") > fromRunIdx);
 });
 
-test("ship adapter never rebinds provenance-free FRG evidence to a candidate", () => {
-  // Post-pilot (1.34+) without durable binding fails closed.
+test("ship adapter accepts post-pilot hybrid-v2 with matching checkpoint; refuses index-only and hybrid-v1 (#1340)", () => {
+  const fixture = unsignedDigestFixture({ version: intent.version, candidate: train.integrated_head_oid });
   assert.throws(
     () => assertFrgCandidateProvenance(frg, train, intent),
-    /no durable candidate binding/,
+    /no pack_provenance/,
   );
-  // Post-pilot with matching durable binding is accepted (no hybrid provenance).
-  assert.doesNotThrow(() =>
-    assertFrgCandidateProvenance(frg, train, intent, {
-      durableCandidateGitSha: train.integrated_head_oid,
+  assert.throws(
+    () => assertFrgCandidateProvenance(frg, train, intent, {
+      closedUnsignedBinding: fixture.binding,
     }),
+    /no pack_provenance/,
   );
-  // Hybrid provenance on post-pilot is refused.
-  const hybridOnPostPilot = {
+
+  const hybridV2 = {
     ...frg,
     pack_provenance: {
+      policy_id: FRG_HYBRID_V2_POLICY_ID,
+      candidate_git_sha: train.integrated_head_oid,
+      repository: intent.repository,
+      base_branch: intent.base_branch,
+    },
+    factory_release_binding: fixture.binding,
+  } as unknown as FrgEvidence;
+  assert.doesNotThrow(() =>
+    assertFrgCandidateProvenance(hybridV2, train, intent, {
+      closedUnsignedBinding: fixture.binding,
+    }),
+  );
+
+  const hybridV1 = {
+    ...hybridV2,
+    pack_provenance: {
+      policy_id: FRG_HYBRID_PILOT_POLICY_ID,
       candidate_git_sha: train.integrated_head_oid,
       repository: intent.repository,
       base_branch: intent.base_branch,
     },
   } as unknown as FrgEvidence;
   assert.throws(
-    () => assertFrgCandidateProvenance(hybridOnPostPilot, train, intent),
-    /hybrid pack_provenance is valid only for v1\.33\.0/,
+    () => assertFrgCandidateProvenance(hybridV1, train, intent, {
+      closedUnsignedBinding: fixture.binding,
+    }),
+    /factory-gate-v1-hybrid-v1/,
   );
+
+  const unknownPolicy = {
+    ...hybridV2,
+    pack_provenance: {
+      policy_id: "factory-gate-v1-hybrid-v9",
+      candidate_git_sha: train.integrated_head_oid,
+      repository: intent.repository,
+      base_branch: intent.base_branch,
+    },
+  } as unknown as FrgEvidence;
+  assert.throws(
+    () => assertFrgCandidateProvenance(unknownPolicy, train, intent, {
+      closedUnsignedBinding: fixture.binding,
+    }),
+    /factory-gate-v1-hybrid-v9/,
+  );
+
+  assert.throws(
+    () => assertFrgCandidateProvenance({
+      ...hybridV2,
+      factory_release_binding: undefined,
+    } as FrgEvidence, train, intent, { closedUnsignedBinding: fixture.binding }),
+    /factory_release_binding/,
+  );
+  assert.throws(
+    () => assertFrgCandidateProvenance({
+      ...hybridV2,
+      factory_release_binding: "notes-only",
+    } as FrgEvidence, train, intent, { closedUnsignedBinding: fixture.binding }),
+    /factory_release_binding/,
+  );
+
+  const mismatchedBinding = {
+    ...fixture.binding,
+    candidate_git_sha: "f".repeat(40),
+  };
+  assert.throws(
+    () => assertFrgCandidateProvenance({
+      ...hybridV2,
+      factory_release_binding: mismatchedBinding,
+    } as FrgEvidence, train, intent, { closedUnsignedBinding: fixture.binding }),
+    /factory_release_binding\.candidate_git_sha mismatch/,
+  );
+
   const mismatched = {
     ...frg,
     pack_provenance: {
+      policy_id: FRG_HYBRID_V2_POLICY_ID,
       candidate_git_sha: "f".repeat(40),
       repository: intent.repository,
       base_branch: intent.base_branch,
@@ -1165,6 +1296,72 @@ test("ship adapter never rebinds provenance-free FRG evidence to a candidate", (
       version: "1.33.0",
     }),
     /does not match the exact train candidate/,
+  );
+});
+
+test("observeFrg: v1.40.0 and v1.39.16 hybrid-v2 with matching checkpoint are observed (#1340)", async () => {
+  for (const version of ["1.40.0", "1.39.16"] as const) {
+    const fixture = unsignedDigestFixture({
+      version,
+      candidate: head,
+      loopRunId: "loop-frg-observe-1271",
+    });
+    const matching = await mintHybridEvidence({
+      version,
+      candidateGitSha: head,
+      repository: intent.repository,
+      baseBranch: intent.base_branch,
+      factoryReleaseBinding: fixture.binding,
+      policyId: FRG_HYBRID_V2_POLICY_ID,
+    });
+    assert.equal(matching.pack_provenance?.policy_id, FRG_HYBRID_V2_POLICY_ID);
+    const fsPass = memFs();
+    await writeFrgEvidence("/repo", matching, fsPass);
+    const shipIntent: ShipIntent = { ...intent, version, milestone: `v${version}` };
+    const shipTrain: ShipTrainEvidence = { ...train, milestone: `v${version}` };
+    const observed = await observeFrgEvidence(
+      shipIntent,
+      shipTrain,
+      true,
+      observeFrgDeps(fsPass, {
+        resolveShipPathFromRun: async () => ({
+          kind: "bound",
+          binding: fixture.binding,
+          unsigned_frg_run_id: fixture.unsigned.frg_run_id,
+        }),
+      }),
+    );
+    assert.equal(observed?.pass, true);
+    assert.equal(observed?.version, version);
+    assert.equal(observed?.pack_provenance?.candidate_git_sha, head);
+  }
+});
+
+test("observeFrg: missing closed checkpoint after post-pilot eligible read throws (#1340)", async () => {
+  const fixture = unsignedDigestFixture({ version: "1.40.0", candidate: head });
+  const matching = await mintHybridEvidence({
+    version: "1.40.0",
+    candidateGitSha: head,
+    repository: intent.repository,
+    baseBranch: intent.base_branch,
+    factoryReleaseBinding: fixture.binding,
+    policyId: FRG_HYBRID_V2_POLICY_ID,
+  });
+  const fsPass = memFs();
+  await writeFrgEvidence("/repo", matching, fsPass);
+  const intent140: ShipIntent = { ...intent, version: "1.40.0", milestone: "v1.40.0" };
+  const train140: ShipTrainEvidence = { ...train, milestone: "v1.40.0" };
+  await assert.rejects(
+    () =>
+      observeFrgEvidence(
+        intent140,
+        train140,
+        true,
+        observeFrgDeps(fsPass, {
+          resolveShipPathFromRun: async () => ({ kind: "standalone" }),
+        }),
+      ),
+    /no closed unsigned checkpoint/,
   );
 });
 
