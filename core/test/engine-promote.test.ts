@@ -95,6 +95,9 @@ function makeDeps(over: Partial<EnginePromoteDeps> = {}): EnginePromoteDeps & {
     async resolvePromoteGitSha() {
       return "b".repeat(40);
     },
+    async listRemainingOpenMilestoneIssues() {
+      return [];
+    },
     ...over,
   };
   return Object.assign(base, {
@@ -123,6 +126,31 @@ test("tagForVersion and installCommandForTag", () => {
   assert.match(installCommandForTag("v1.2.3", "all"), /#v1\.2\.3 install --host all/);
   assert.match(installCommandForTag("v1.2.3", "omp"), /#v1\.2\.3 install --host omp/);
   assert.equal(DEFAULT_ENGINE_PROMOTE_HOST, "all");
+});
+
+test("engine-promote leftover open issue fails closed before install (#1354)", async () => {
+  const deps = makeDeps({
+    listRemainingOpenMilestoneIssues: async (milestone) => {
+      assert.equal(milestone, "v1.34.0");
+      return [1344];
+    },
+  });
+  await assert.rejects(
+    () => runEnginePromote(opts(), deps),
+    /milestone v1\.34\.0 still has open issues: #1344/,
+  );
+  assert.equal(deps.promotes, 0);
+  assert.deepEqual(deps.installs, []);
+});
+
+test("engine-promote missing remaining-open observation fails closed (#1354)", async () => {
+  const deps = makeDeps();
+  delete (deps as { listRemainingOpenMilestoneIssues?: unknown }).listRemainingOpenMilestoneIssues;
+  await assert.rejects(
+    () => runEnginePromote(opts(), deps),
+    /remaining-open observation is required/,
+  );
+  assert.equal(deps.promotes, 0);
 });
 
 test("engine-promote: omitted host defaults to all (not silent codex) (#989)", async () => {

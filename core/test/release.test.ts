@@ -121,6 +121,7 @@ function makeDeps(overrides: Partial<ReleaseDeps> = {}): ReleaseDeps {
     requireFrgPass: async (_dir, version) => defaultFrgPass(version),
     // Milestone plan authority (#985): default present so unrelated gates stay focused.
     fetchMilestoneForVersion: async (version) => defaultMilestone(version),
+    listRemainingOpenMilestoneIssues: async () => [],
     ...overrides,
   };
   // Expose collected state via non-standard properties for test inspection.
@@ -1252,6 +1253,50 @@ test("runRelease dry-run: no file writes, no fetchPRTitle, and no fetchPRClosing
   assert.equal(writes.length, 0, "no files written in dry-run");
   assert.ok(!fetchCalled, "fetchPRTitle (gh pr view) not called in dry-run");
   assert.ok(!closingCalled, "fetchPRClosingIssues not called in dry-run");
+});
+
+test("runRelease leftover open issue fails closed before mutation (#1354)", async () => {
+  const writes: string[] = [];
+  let commands = 0;
+  const deps = makeDeps({
+    readFile: (p) => {
+      if (p.endsWith("core/package.json")) return SAMPLE_CORE_PKG;
+      if (p.endsWith("package.json")) return SAMPLE_ROOT_PKG;
+      if (p.endsWith("ROADMAP.md")) return SAMPLE_ROADMAP;
+      throw new Error(`unexpected read: ${p}`);
+    },
+    writeFile: (p) => { writes.push(p); },
+    runCommand: () => {
+      commands += 1;
+      return { code: 0, stdout: "", stderr: "" };
+    },
+    listRemainingOpenMilestoneIssues: async ({ milestone, repository }) => {
+      assert.equal(milestone, "v1.6.0");
+      assert.equal(repository, "org/repo");
+      return [1344];
+    },
+  });
+  await assert.rejects(
+    () => runRelease("1.6.0", { noEdit: true }, { repo_dir: "/repo", repo: "org/repo" }, deps),
+    /milestone v1\.6\.0 still has open issues: #1344/,
+  );
+  assert.equal(writes.length, 0);
+  assert.equal(commands, 0);
+});
+
+test("runRelease missing remaining-open observation fails closed (#1354)", async () => {
+  const deps = makeDeps({
+    readFile: (p) => {
+      if (p.endsWith("core/package.json")) return SAMPLE_CORE_PKG;
+      if (p.endsWith("package.json")) return SAMPLE_ROOT_PKG;
+      throw new Error(`unexpected read: ${p}`);
+    },
+  });
+  delete (deps as { listRemainingOpenMilestoneIssues?: unknown }).listRemainingOpenMilestoneIssues;
+  await assert.rejects(
+    () => runRelease("1.6.0", { dryRun: true }, { repo_dir: "/repo", repo: "org/repo" }, deps),
+    /remaining-open observation is required/,
+  );
 });
 
 test("runRelease dry-run: output contains unified diff markers (not full file content)", async () => {

@@ -18,7 +18,11 @@ import {
   shipRunId,
   shipStatePaths,
   validateBuzzShipAuthorization,
+  assertNoRemainingOpenMilestoneIssues,
+  listRemainingOpenMilestoneIssueNumbers,
+  remainingOpenMilestoneIssuesError,
   type BuzzShipAuthorization,
+  type RemainingOpenGhRunner,
   type ShipCoordinatorDeps,
   type ShipIntent,
   type ShipPhaseEvent,
@@ -26,6 +30,10 @@ import {
   type ShipStateStore,
   type ShipStatus,
 } from "../scripts/stages/ship.ts";
+import {
+  listMilestoneOpenIssuesApiArgs,
+  listMilestonesApiArgs,
+} from "../scripts/stages/merge_queue.ts";
 import { ShipReleaseCheckWaitError } from "../scripts/stages/ship-release-check-wait.ts";
 
 const EVENT_ID = "a".repeat(64);
@@ -161,11 +169,17 @@ function memoryStore(): ShipStateStore & {
 function makeDeps(
   store: ShipStateStore = memoryStore(),
   reconciliation: ShipProgress = emptyProgress(),
-): ShipCoordinatorDeps & { calls: string[] } {
+): ShipCoordinatorDeps & { calls: string[]; remainingOpenCalls: number; remainingOpenIssues: number[] } {
   const calls: string[] = [];
   const progress = completeProgress();
-  return {
+  const deps: ShipCoordinatorDeps & {
+    calls: string[];
+    remainingOpenCalls: number;
+    remainingOpenIssues: number[];
+  } = {
     calls,
+    remainingOpenCalls: 0,
+    remainingOpenIssues: [],
     now: () => NOW,
     state: store,
     authorizationPublicKey: AUTH_PUBLIC_KEY,
@@ -214,7 +228,12 @@ function makeDeps(
       assert.equal(publication.tag, "v1.34.0");
       return structuredClone(progress.promotion!);
     },
+    async observeRemainingOpenMilestoneIssues() {
+      deps.remainingOpenCalls += 1;
+      return [...deps.remainingOpenIssues];
+    },
   };
+  return deps;
 }
 
 async function seedFrozenTrainPlan(
@@ -660,4 +679,303 @@ test("ship coordinator pending wait-cap expiry stays resumable (#1205)", async (
   assert.equal(result.last_error, null);
   assert.ok(resumed.calls.includes("release-finish"));
   assert.ok(!resumed.calls.includes("train"));
+});
+
+// ---------------------------------------------------------------------------
+// Ship-end remaining-open gate (#1354)
+// ---------------------------------------------------------------------------
+
+test("assertNoRemainingOpenMilestoneIssues names every number and allows empty", () => {
+  assert.doesNotThrow(() => assertNoRemainingOpenMilestoneIssues("v1.40.1", []));
+  assert.throws(
+    () => assertNoRemainingOpenMilestoneIssues("v1.40.1", [1344, 1348, 977]),
+    (err: Error) => {
+      assert.match(err.message, /ship-end-open-issue-gate/);
+      assert.match(err.message, /v1\.40\.1/);
+      assert.match(err.message, /#1344/);
+      assert.match(err.message, /#1348/);
+      assert.match(err.message, /#977/);
+      assert.equal(err.message, remainingOpenMilestoneIssuesError("v1.40.1", [1344, 1348, 977]).message);
+      return true;
+    },
+  );
+});
+
+function remainingOpenGhFake(opts: {
+  milestones?: unknown;
+  issues?: unknown;
+  throwOn?: "milestones" | "issues";
+  seen?: string[][];
+}): RemainingOpenGhRunner {
+  return async (args) => {
+    opts.seen?.push([...args]);
+    if (args[0] === "api" && String(args[1] ?? "").includes("/milestones")) {
+      if (opts.throwOn === "milestones") throw new Error("gh auth failed: HTTP 401");
+      return JSON.stringify(opts.milestones ?? [[{ number: 12, title: "v1.40.1" }]]);
+    }
+    if (args[0] === "api" && String(args[1] ?? "").includes("/issues")) {
+      if (opts.throwOn === "issues") throw new Error("gh api paginate failed");
+      return JSON.stringify(opts.issues ?? [[]]);
+    }
+    throw new Error(`unexpected gh args: ${args.join(" ")}`);
+  };
+}
+
+test("listRemainingOpenMilestoneIssueNumbers fails closed on unresolved title, parse, and listing throw", async () => {
+  await assert.rejects(
+    () => listRemainingOpenMilestoneIssueNumbers(
+      "owner/repo",
+      "v1.40.1",
+      remainingOpenGhFake({ milestones: [[{ number: 1, title: "other" }]] }),
+    ),
+    /cannot resolve milestone v1\.40\.1/,
+  );
+  await assert.rejects(
+    () => listRemainingOpenMilestoneIssueNumbers(
+      "owner/repo",
+      "v1.40.1",
+      remainingOpenGhFake({ milestones: "not-json" }),
+    ),
+    /cannot parse milestone listing/,
+  );
+  await assert.rejects(
+    () => listRemainingOpenMilestoneIssueNumbers(
+      "owner/repo",
+      "v1.40.1",
+      async () => "{not json",
+    ),
+    /cannot parse milestone listing/,
+  );
+  await assert.rejects(
+    () => listRemainingOpenMilestoneIssueNumbers(
+      "owner/repo",
+      "v1.40.1",
+      remainingOpenGhFake({ throwOn: "milestones" }),
+    ),
+    /cannot prove zero open issues on v1\.40\.1/,
+  );
+  await assert.rejects(
+    () => listRemainingOpenMilestoneIssueNumbers(
+      "owner/repo",
+      "v1.40.1",
+      remainingOpenGhFake({ throwOn: "issues" }),
+    ),
+    /cannot prove zero open issues on v1\.40\.1/,
+  );
+  await assert.rejects(
+    () => listRemainingOpenMilestoneIssueNumbers(
+      "owner/repo",
+      "v1.40.1",
+      remainingOpenGhFake({ issues: { number: 1 } }),
+    ),
+    /cannot parse open-issue listing/,
+  );
+});
+
+test("listRemainingOpenMilestoneIssueNumbers drops PRs, paginates, and uses milestone query", async () => {
+  const seen: string[][] = [];
+  const numbers = await listRemainingOpenMilestoneIssueNumbers(
+    "owner/repo",
+    "v1.40.1",
+    remainingOpenGhFake({
+      seen,
+      issues: [
+        [
+          { number: 10, labels: [{ name: "pipeline:backlog" }] },
+          { number: 11, pull_request: { url: "https://example/pr/11" }, labels: [] },
+        ],
+        [
+          { number: 501, labels: [{ name: "factory-gate" }] },
+        ],
+      ],
+    }),
+  );
+  assert.deepEqual(numbers, [10, 501]);
+  const msArgs = listMilestonesApiArgs("owner/repo");
+  const issueArgs = listMilestoneOpenIssuesApiArgs("owner/repo", 12);
+  assert.deepEqual(seen[0], msArgs);
+  assert.deepEqual(seen[1], issueArgs);
+  assert.ok(issueArgs.some((a) => a.includes("milestone=12")));
+  assert.ok(issueArgs.includes("--paginate"));
+  assert.ok(!issueArgs.includes("--limit"));
+});
+
+async function seedCompletedTrain(
+  store: ReturnType<typeof memoryStore>,
+): Promise<void> {
+  const deps = makeDeps(store);
+  deps.convergeFrgPack = async () => {
+    throw new Error("stop after train");
+  };
+  await assert.rejects(
+    runShipCoordinator(intent, authorization(), deps),
+    /stop after train/,
+  );
+  assert.ok(store.status?.train);
+  assert.equal(store.status?.frg_pack, null);
+}
+
+test("ship remaining-open: leftover backlog after train does not start FRG (#1354)", async () => {
+  const store = memoryStore();
+  await seedCompletedTrain(store);
+  const deps = makeDeps(store, { ...emptyProgress(), train: completeProgress().train });
+  deps.remainingOpenIssues = [1344];
+  await assert.rejects(
+    runShipCoordinator(intent, authorization(), deps),
+    /milestone v1\.34\.0 still has open issues: #1344/,
+  );
+  assert.ok(deps.calls.includes("train") === false || store.status?.train);
+  assert.ok(!deps.calls.includes("frg-pack"));
+  assert.ok(!deps.calls.includes("frg-score"));
+  assert.equal(store.status?.frg_pack, null);
+  assert.equal(deps.remainingOpenCalls >= 1, true);
+});
+
+test("ship remaining-open: train is not gated by leftover open issues (#1354)", async () => {
+  const store = memoryStore();
+  const deps = makeDeps(store);
+  deps.remainingOpenIssues = [1344];
+  await assert.rejects(
+    runShipCoordinator(intent, authorization(), deps),
+    /#1344/,
+  );
+  assert.ok(deps.calls.includes("plan-train"));
+  assert.ok(deps.calls.includes("train"));
+  assert.ok(!deps.calls.includes("frg-pack"));
+});
+
+test("ship remaining-open: leftover issues block release prepare (#1354)", async () => {
+  const store = memoryStore();
+  const first = makeDeps(store);
+  first.convergeReleasePrepare = async () => {
+    throw new Error("stop after frg score");
+  };
+  await assert.rejects(
+    runShipCoordinator(intent, authorization(), first),
+    /stop after frg score/,
+  );
+  assert.ok(store.status?.frg);
+  assert.equal(store.status?.release, null);
+
+  const blocked = makeDeps(store, {
+    ...emptyProgress(),
+    train: completeProgress().train,
+    frg_pack: completeProgress().frg_pack,
+    frg: completeProgress().frg,
+  });
+  blocked.remainingOpenIssues = [1344];
+  await assert.rejects(
+    runShipCoordinator(intent, authorization(), blocked),
+    /#1344/,
+  );
+  assert.ok(!blocked.calls.includes("release-prepare"));
+  assert.ok(!blocked.calls.includes("release-finish"));
+});
+
+test("ship remaining-open: leftover issues block release finish (#1354)", async () => {
+  const store = memoryStore();
+  const first = makeDeps(store);
+  first.convergeReleaseFinish = async () => {
+    throw new Error("stop after release prepare");
+  };
+  await assert.rejects(
+    runShipCoordinator(intent, authorization(), first),
+    /stop after release prepare/,
+  );
+  assert.ok(store.status?.release);
+  assert.equal(store.status?.release_finish, null);
+
+  const blocked = makeDeps(store, {
+    ...emptyProgress(),
+    train: completeProgress().train,
+    frg_pack: completeProgress().frg_pack,
+    frg: completeProgress().frg,
+    release: completeProgress().release,
+  });
+  blocked.remainingOpenIssues = [1348];
+  await assert.rejects(
+    runShipCoordinator(intent, authorization(), blocked),
+    /#1348/,
+  );
+  assert.ok(!blocked.calls.includes("release-finish"));
+});
+
+test("ship remaining-open: leftover issues block engine-promote (#1354)", async () => {
+  const store = memoryStore();
+  const first = makeDeps(store);
+  first.convergeEnginePromote = async () => {
+    throw new Error("stop after publication");
+  };
+  await assert.rejects(
+    runShipCoordinator(intent, authorization(), first),
+    /stop after publication/,
+  );
+  assert.ok(store.status?.publication);
+  assert.equal(store.status?.promotion, null);
+
+  const blocked = makeDeps(store, {
+    ...completeProgress(),
+    promotion: null,
+  });
+  blocked.remainingOpenIssues = [977];
+  await assert.rejects(
+    runShipCoordinator(intent, authorization(), blocked),
+    /#977/,
+  );
+  assert.ok(!blocked.calls.includes("engine-promote"));
+});
+
+test("ship remaining-open: resume re-observes after completed FRG pack (#1354)", async () => {
+  const store = memoryStore();
+  const first = makeDeps(store);
+  first.convergeFrgScore = async () => {
+    throw new Error("stop after frg pack");
+  };
+  await assert.rejects(
+    runShipCoordinator(intent, authorization(), first),
+    /stop after frg pack/,
+  );
+  assert.ok(store.status?.frg_pack);
+  assert.equal(store.status?.frg, null);
+  const firstObservations = first.remainingOpenCalls;
+  assert.ok(firstObservations >= 1);
+
+  const resumed = makeDeps(store, {
+    ...emptyProgress(),
+    train: completeProgress().train,
+    frg_pack: completeProgress().frg_pack,
+  });
+  resumed.remainingOpenIssues = [1344];
+  await assert.rejects(
+    runShipCoordinator(intent, authorization(), resumed),
+    /#1344/,
+  );
+  assert.ok(resumed.remainingOpenCalls >= 1, "resume must re-observe GitHub");
+  assert.ok(!resumed.calls.includes("frg-score"));
+  assert.ok(!resumed.calls.includes("frg-pack"));
+});
+
+test("ship remaining-open: zero open issues still reaches FRG pack (#1354)", async () => {
+  const store = memoryStore();
+  await seedCompletedTrain(store);
+  const deps = makeDeps(store, { ...emptyProgress(), train: completeProgress().train });
+  deps.remainingOpenIssues = [];
+  const result = await runShipCoordinator(intent, authorization(), deps);
+  assert.ok(deps.calls.includes("frg-pack"));
+  assert.equal(result.frg_pack?.loop_run_id, "loop-1");
+  assert.deepEqual(store.status?.train_plan, { ordered_issues: [901, 902] });
+});
+
+test("ship remaining-open: query failure fails closed before FRG (#1354)", async () => {
+  const store = memoryStore();
+  await seedCompletedTrain(store);
+  const deps = makeDeps(store, { ...emptyProgress(), train: completeProgress().train });
+  deps.observeRemainingOpenMilestoneIssues = async () => {
+    throw new Error("ship-end-open-issue-gate: cannot prove zero open issues on v1.34.0: gh auth failed");
+  };
+  await assert.rejects(
+    runShipCoordinator(intent, authorization(), deps),
+    /cannot prove zero open issues/,
+  );
+  assert.ok(!deps.calls.includes("frg-pack"));
 });

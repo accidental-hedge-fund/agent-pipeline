@@ -19,11 +19,16 @@ freeze **open non-backlog** issues **and** closed issues labeled
 `pipeline:ready-to-deploy`. An all-integrated milestone (every freeze-eligible
 issue closed at ready-to-deploy, linked PRs merged and contained in the fetched
 base) does **not** stop at `no open issues to freeze`. Train merge-mode records
-each item `already-integrated` and the ship run proceeds to the FRG / release
-phase. Mixed milestones merge the still-open ready-to-deploy PRs and skip the
-already-integrated set in the same run. Freeze does not invent a second
-integrated classifier; a closed ready-to-deploy issue without a merged contained
-PR still hits train merge-mode fail-closed law.
+each item `already-integrated` before the remaining-open check. Freeze-eligible
+integration is **not** authorization to start FRG pack, release, or promote.
+Ship re-observes GitHub immediately before those post-train operations and
+fails closed when any issue on that milestone remains open, including
+`pipeline:backlog`. Pipeline labels do not exempt an open milestoned issue.
+`--skip-frg` is not a way to start FRG, release, or promote while the milestone
+still has open issues. Mixed milestones merge the still-open ready-to-deploy
+PRs and skip the already-integrated set in the same run. Freeze does not invent
+a second integrated classifier; a closed ready-to-deploy issue without a merged
+contained PR still hits train merge-mode fail-closed law.
 
 A missing FRG pass is **not** recovered by `--skip-frg` on a non-claude profile.
 Run the pack on a native-`/goal` engine, then score it:

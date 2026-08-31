@@ -523,6 +523,15 @@ function memoryFs() {
   };
 }
 
+function hermeticPrepareDeps(
+  overrides: Partial<FactoryReleasePrepareDeps> = {},
+): FactoryReleasePrepareDeps {
+  return defaultFactoryReleasePrepareDeps({
+    listRemainingOpenMilestoneIssues: async () => [],
+    ...overrides,
+  });
+}
+
 function makeDeps(opts: {
   fs: ReturnType<typeof memoryFs>;
   generate?: FactoryReleasePrepareDeps["generateUnsignedFrg"];
@@ -534,7 +543,7 @@ function makeDeps(opts: {
 }): FactoryReleasePrepareDeps {
   const generateCalls = opts.generateCalls ?? { n: 0 };
   const releaseCalls = opts.releaseCalls ?? { n: 0 };
-  return defaultFactoryReleasePrepareDeps({
+  return hermeticPrepareDeps({
     env: {}, // no attestation key in candidate
     now: () => new Date("2026-08-10T12:00:00Z"),
     readRequestText: (p) => opts.fs.readRequestText(p),
@@ -712,7 +721,7 @@ test("prepare completes from candidate-bound latest.json without runRelease or a
     loop_run_id: "loop-reuse",
   });
   let releaseCalls = 0;
-  const deps = defaultFactoryReleasePrepareDeps({
+  const deps = hermeticPrepareDeps({
     env: {},
     now: () => new Date("2026-08-10T12:00:00Z"),
     readRequestText: (p) => mem.readRequestText(p),
@@ -1389,7 +1398,7 @@ test("default generateUnsigned starts a bound loop and does not invent pass", as
   const request = baseRequest();
   const requestPath = "/tmp/req-134.json";
   await mem.writeFile(requestPath, JSON.stringify(request));
-  const deps = defaultFactoryReleasePrepareDeps({
+  const deps = hermeticPrepareDeps({
     env: {},
     now: () => new Date("2026-08-10T12:00:00Z"),
     readRequestText: (p) => mem.readRequestText(p),
@@ -1413,6 +1422,47 @@ test("default generateUnsigned starts a bound loop and does not invent pass", as
     assert.equal("pass" in outcome.result, false);
   }
   assert.notEqual(outcome.result.status, "complete");
+});
+
+test("factory-release prepare leftover open issue fails closed before pack-loop start (#1354)", async () => {
+  const mem = memoryFs();
+  const request = baseRequest({ milestone: "v1.40.1" });
+  const requestPath = "/tmp/req-remaining-open.json";
+  await mem.writeFile(requestPath, JSON.stringify(request));
+  let packLoopStarts = 0;
+  const generateCalls = { n: 0 };
+  const deps = hermeticPrepareDeps({
+    env: {},
+    now: () => new Date("2026-08-10T12:00:00Z"),
+    readRequestText: (p) => mem.readRequestText(p),
+    readFile: (p) => mem.readFile(p),
+    writeFile: (p, body) => mem.writeFile(p, body),
+    mkdir: async () => {},
+    fileExists: (p) => mem.fileExists(p),
+    loadPack: async () => fakePack(),
+    listRemainingOpenMilestoneIssues: async ({ milestone }) => {
+      assert.equal(milestone, "v1.40.1");
+      return [1344];
+    },
+    startBoundPackLoop: async () => {
+      packLoopStarts += 1;
+      return { loop_run_id: "loop-must-not-start" };
+    },
+    generateUnsignedFrg: async () => {
+      generateCalls.n += 1;
+      throw new Error("must not generate unsigned FRG");
+    },
+    observeAttestation: async () => null,
+    runRelease: async () => {
+      throw new Error("must not release");
+    },
+  });
+  await assert.rejects(
+    () => runFactoryReleasePrepare({ requestPath, repoDir: "/repo" }, deps),
+    /milestone v1\.40\.1 still has open issues: #1344/,
+  );
+  assert.equal(packLoopStarts, 0);
+  assert.equal(generateCalls.n, 0);
 });
 
 test("request fingerprint is stable for the same binding", () => {
@@ -1450,7 +1500,7 @@ test("first prepare with no bound loop dispatches start and returns in_progress"
   const requestPath = "/tmp/req-1037-first.json";
   await mem.writeFile(requestPath, JSON.stringify(request));
   const startCalls: string[] = [];
-  const deps = defaultFactoryReleasePrepareDeps({
+  const deps = hermeticPrepareDeps({
     env: {},
     now: () => new Date("2026-08-10T12:00:00Z"),
     readRequestText: (p) => mem.readRequestText(p),
@@ -1492,7 +1542,7 @@ test("second prepare with the same request resumes the same loop_run_id", async 
   const requestPath = "/tmp/req-1037-resume.json";
   await mem.writeFile(requestPath, JSON.stringify(request));
   const startCalls: string[] = [];
-  const deps = defaultFactoryReleasePrepareDeps({
+  const deps = hermeticPrepareDeps({
     env: {},
     now: () => new Date("2026-08-10T12:00:00Z"),
     readRequestText: (p) => mem.readRequestText(p),
@@ -3144,7 +3194,7 @@ test("in-checkout --request is refused before pack-loop dispatch (#1259)", async
   await mem.writeFile(requestPath, JSON.stringify(request));
   let startCalls = 0;
   let generateCalls = 0;
-  const deps = defaultFactoryReleasePrepareDeps({
+  const deps = hermeticPrepareDeps({
     env: {},
     now: () => new Date("2026-08-10T12:00:00Z"),
     readRequestText: (p) => mem.readRequestText(p),
@@ -3189,7 +3239,7 @@ test("request inside a distinct factory control checkout is refused (#1259)", as
   const requestPath = "/factory-control/.agent-pipeline/request.json";
   await mem.writeFile(requestPath, JSON.stringify(baseRequest()));
   let startCalls = 0;
-  const deps = defaultFactoryReleasePrepareDeps({
+  const deps = hermeticPrepareDeps({
     env: { AGENT_PIPELINE_FACTORY_CONTROL: "/factory-control" },
     now: () => new Date("2026-08-10T12:00:00Z"),
     readRequestText: (p) => mem.readRequestText(p),
@@ -3220,7 +3270,7 @@ test("gitignored descendant --request is still refused (#1259)", async () => {
   const requestPath = "/repo/.agent-pipeline/frg/request.json";
   await mem.writeFile(requestPath, JSON.stringify(baseRequest()));
   let startCalls = 0;
-  const deps = defaultFactoryReleasePrepareDeps({
+  const deps = hermeticPrepareDeps({
     env: {},
     now: () => new Date("2026-08-10T12:00:00Z"),
     readRequestText: (p) => mem.readRequestText(p),
@@ -3251,7 +3301,7 @@ test("symlink --request into the checkout is refused (#1259)", async () => {
   const requestPath = "/tmp/outside-link.json";
   await mem.writeFile(requestPath, JSON.stringify(baseRequest()));
   let startCalls = 0;
-  const deps = defaultFactoryReleasePrepareDeps({
+  const deps = hermeticPrepareDeps({
     env: {},
     now: () => new Date("2026-08-10T12:00:00Z"),
     readRequestText: (p) => mem.readRequestText(p),
@@ -3284,7 +3334,7 @@ test("off-repo --request under $TMPDIR is not rejected for location (#1259)", as
   const request = baseRequest();
   const requestPath = "/tmp/factory-release-prepare-request.json";
   await mem.writeFile(requestPath, JSON.stringify(request));
-  const deps = defaultFactoryReleasePrepareDeps({
+  const deps = hermeticPrepareDeps({
     env: {},
     now: () => new Date("2026-08-10T12:00:00Z"),
     readRequestText: (p) => mem.readRequestText(p),
@@ -3310,7 +3360,7 @@ test("off-repo --request under AGENT_PIPELINE_STATE_HOME is not rejected for loc
   const request = baseRequest();
   const requestPath = "/state/home/factory-release-prepare-request.json";
   await mem.writeFile(requestPath, JSON.stringify(request));
-  const deps = defaultFactoryReleasePrepareDeps({
+  const deps = hermeticPrepareDeps({
     env: { AGENT_PIPELINE_STATE_HOME: "/state/home" },
     now: () => new Date("2026-08-10T12:00:00Z"),
     readRequestText: (p) => mem.readRequestText(p),
@@ -3336,7 +3386,7 @@ test("off-repo request dispatch writes only under contract factory-release/ (#12
   const request = baseRequest();
   const requestPath = "/tmp/factory-release-prepare-request.json";
   await mem.writeFile(requestPath, JSON.stringify(request));
-  const deps = defaultFactoryReleasePrepareDeps({
+  const deps = hermeticPrepareDeps({
     env: {},
     now: () => new Date("2026-08-10T12:00:00Z"),
     readRequestText: (p) => mem.readRequestText(p),

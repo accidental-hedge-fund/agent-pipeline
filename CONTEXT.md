@@ -150,3 +150,11 @@ _Avoid_: unknown, assertion, flake re-run
 **Review-prompt-too-large**:
 Assembled reviewer prompt (after `buildReview*Prompt`, before spawn) exceeds the configured reviewer’s declared max, else Codex `1048576`. `setBlocked`. Do not retry the same payload. Review-1 and review-2.
 _Avoid_: transient timeout, skip-review-and-advance, shrink-the-1.29MB as this cut, per-model table this cut
+
+**Freeze-eligible**:
+Train membership only: open non-backlog pipeline issues plus closed issues labeled `pipeline:ready-to-deploy`. Not proof that the GitHub milestone has zero remaining open issues. Not authorization to start FRG pack, release, or promote.
+_Avoid_: remaining-open set, FRG start condition, “all integrated so ship the milestone”
+
+**Ship-end-open-issue-gate**:
+Live GitHub remaining-open check immediately before every post-train FRG pack, FRG convergence, release, and `engine-promote` boundary. Counts every open milestoned issue. Pipeline labels do not exempt. Restart and resume re-observe. Fail closed when any remain or when observation cannot prove zero.
+_Avoid_: freeze-eligible membership, train freeze snapshot, `--skip-frg` as a leftover-open waiver

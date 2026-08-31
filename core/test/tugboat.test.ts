@@ -316,6 +316,30 @@ test("tugboat supports serial multi-milestone and single-host lock", () => {
   assert.doesNotMatch(body, /\bGNU\s+parallel\b|\bparallel\s+--/);
 });
 
+test("tugboat post-train path has no skippable local remaining-open policy (#1354)", () => {
+  const body = fs.readFileSync(tugboat, "utf8");
+  const shipOneStart = body.indexOf("ship_one() {");
+  const shipOneEnd = body.indexOf("\n# ---------- run serial multi-milestone");
+  assert.ok(shipOneStart >= 0 && shipOneEnd > shipOneStart);
+  const shipOneBody = body.slice(shipOneStart, shipOneEnd);
+  assert.match(shipOneBody, /factory-release prepare --request/);
+  assert.match(shipOneBody, /SHIP_END_CLI\[@\]\}" release "\$version"/);
+  assert.match(shipOneBody, /engine-promote --for "\$version"/);
+  assert.doesNotMatch(
+    shipOneBody,
+    /gh issue list.*--milestone|listMilestoneOpenIssues|remaining.open/,
+    "Tugboat must not keep a second remaining-open listing",
+  );
+  assert.doesNotMatch(
+    shipOneBody,
+    /already-integrated.{0,80}skip.{0,40}frg|skip.{0,40}frg.{0,80}already-integrated/i,
+  );
+  assert.doesNotMatch(
+    shipOneBody,
+    /open issues.{0,40}SKIP_FRG|SKIP_FRG.{0,40}open issues/i,
+  );
+});
+
 test("tugboat failure_detail prefers loop-lock stderr over generic exit code", () => {
   const dir = makeRunDir();
   try {

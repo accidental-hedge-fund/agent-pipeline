@@ -47,6 +47,11 @@ import {
   type StageDiagnostic,
 } from "../stage-diagnostic.ts";
 import { formatFrgSkipReason, resolveFrgSkip } from "../frg-skip.ts";
+import {
+  assertNoRemainingOpenMilestoneIssues,
+  listRemainingOpenMilestoneIssueNumbers,
+  remainingOpenGh,
+} from "./ship.ts";
 
 const HOST_SKILL_RELATIVE_PATHS = SKILL_HOST_IDS.map((id) => `hosts/${id}/SKILL.md`);
 
@@ -226,6 +231,14 @@ export interface ReleaseDeps {
     loopRunId: string | null;
     frgRunId: string;
   }): Promise<TypedSoakEvidence[]>;
+  /**
+   * Remaining-open GitHub observation for the ship milestone. Required before
+   * release mutation. Tests inject leftover issues / empty sets / query failures.
+   */
+  listRemainingOpenMilestoneIssues?(args: {
+    repository: string;
+    milestone: string;
+  }): Promise<readonly number[]>;
 }
 
 // ---------------------------------------------------------------------------
@@ -416,6 +429,8 @@ export function realReleaseDeps(repoDir?: string): ReleaseDeps {
     listClosedSoakDefectCandidates: async () => listSoakDefectCandidatesReal("closed", repoDir),
     listTypedSoakEvidence: async ({ loopRunId, frgRunId }) =>
       listTypedSoakEvidenceReal(loopRunId, frgRunId, repoDir),
+    listRemainingOpenMilestoneIssues: async ({ repository, milestone }) =>
+      listRemainingOpenMilestoneIssueNumbers(repository, milestone, remainingOpenGh),
   };
 }
 
@@ -1767,6 +1782,17 @@ export async function runRelease(
   // 2. Resolve version — throws on invalid input.
   const resolvedVersion = resolveVersion(versionArg, previousVersion);
   d.stdout(`[pipeline release] resolved version: ${resolvedVersion}`);
+
+  const shipMilestone = `v${resolvedVersion}`;
+  const listRemaining = d.listRemainingOpenMilestoneIssues;
+  if (typeof listRemaining !== "function") {
+    throw new Error("ship-end-open-issue-gate: remaining-open observation is required");
+  }
+  const remaining = await listRemaining({
+    repository: cfg.repo,
+    milestone: shipMilestone,
+  });
+  assertNoRemainingOpenMilestoneIssues(shipMilestone, remaining);
 
   // 2b. Factory Reliability Gate (#723) — default fail-closed; skip via CLI
   // `--skip-frg` or config `skip_frg: true` (#1092). FRG stays available as

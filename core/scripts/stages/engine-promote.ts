@@ -21,6 +21,11 @@ import {
 } from "../production-engine-pin.ts";
 import { readSkipFrgFromPipelineYml } from "../config.ts";
 import { formatFrgSkipReason, resolveFrgSkip } from "../frg-skip.ts";
+import {
+  assertNoRemainingOpenMilestoneIssues,
+  listRemainingOpenMilestoneIssueNumbers,
+  remainingOpenGh,
+} from "./ship.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -111,6 +116,11 @@ export interface EnginePromoteDeps {
     tag: string;
     gitSha?: string | null;
   }): Promise<string>;
+  /**
+   * Remaining-open GitHub observation for the ship milestone (`v${version}`).
+   * Required before pin promote / install. Tests inject leftover issues.
+   */
+  listRemainingOpenMilestoneIssues?(milestone: string): Promise<readonly number[]>;
 }
 
 function normalizeVersion(raw: string): string {
@@ -240,6 +250,12 @@ export async function runEnginePromote(
 ): Promise<EnginePromoteResult> {
   const version = normalizeVersion(opts.version);
   const tag = tagForVersion(version);
+  const listRemaining = deps.listRemainingOpenMilestoneIssues;
+  if (typeof listRemaining !== "function") {
+    throw new Error("ship-end-open-issue-gate: remaining-open observation is required");
+  }
+  const remaining = await listRemaining(tag);
+  assertNoRemainingOpenMilestoneIssues(tag, remaining);
   const host = opts.host ?? DEFAULT_ENGINE_PROMOTE_HOST;
   const dryRun = !!opts.dryRun;
   const skipPromoteIfCurrent = opts.skipPromoteIfCurrent !== false;
@@ -556,6 +572,31 @@ export function realEnginePromoteDeps(repoDir: string): EnginePromoteDeps {
       } catch {
         return null;
       }
+    },
+    async listRemainingOpenMilestoneIssues(milestone) {
+      let repo: string;
+      try {
+        const { stdout } = await execFileAsync(
+          "gh",
+          ["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"],
+          { cwd: repoDir, timeout: 30_000, maxBuffer: 1024 * 1024 },
+        );
+        repo = String(stdout).trim();
+      } catch (err) {
+        throw new Error(
+          `ship-end-open-issue-gate: cannot resolve repository for remaining-open check: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+      if (!repo) {
+        throw new Error(
+          "ship-end-open-issue-gate: cannot resolve repository for remaining-open check",
+        );
+      }
+      return listRemainingOpenMilestoneIssueNumbers(repo, milestone, (args) =>
+        remainingOpenGh(args, { cwd: repoDir }),
+      );
     },
   };
 }
