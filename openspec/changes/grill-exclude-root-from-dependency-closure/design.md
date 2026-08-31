@@ -85,11 +85,11 @@ Do not add a new verb. Do not add a new markdown file per command. Do not hand-e
 
 Regression tests in `core/test/grill-then-ready.test.ts` replay preview → apply → answer every authority handoff → `triage --stage ready` with injected GitHub and handoff I/O. That sequence is the #1305/#1344 bug. Those live issues are not mutated by this PR. Extra operator re-attestation is not a ship prerequisite.
 
-Artifacts signed before this change encode a root-inclusive `dependency_closure_sha256`. Ready after this change recomputes a root-exclusive hash. Those old artifacts stay stale until a new preview/apply refreshes the signed snapshot. That refresh is not extra authority attestation. This PR does not rewrite live GitHub bodies. A ready-only dual-formula compare is forbidden.
+Artifacts signed before this change encode a root-inclusive `dependency_closure_sha256`. Ready after this change recomputes a root-exclusive hash. Recovery is an authenticated non-ready preview/apply: when the live body already has a Decisions artifact and the only stale fingerprint is `dependency_closure_sha256`, preview signs the current root-exclusive hash without calling Implementer or Reviewer, and apply writes that snapshot. Settled nodes and answered handoffs stay. Ready still compares the single current formula. A ready-only dual-formula compare is forbidden.
 
 ## Risks / Trade-offs
 
-- **[Risk] Old signed artifacts remain stale after this lands** → Mitigation: that is the cost of snapshot-unity. Document it. Do not add a ready-only exception. A later preview/apply under the new walker refreshes the recorded hash. Extra handoff answers are not required when node definitions are unchanged and a new preview is the refresh path; this PR still does not mutate live issues.
+- **[Risk] Old signed artifacts remain stale after this lands** → Mitigation: `pipeline refine-spec --issue N` then `apply` is the authenticated refresh. When only `dependency_closure_sha256` is stale, preview does not re-grill, so extra handoff answers are not required. Ready does not dual-compare formulas.
 - **[Risk] Apply gains a dependency fetch** → Mitigation: reuse the preview `fetchIssue` seam. Fail closed on mismatch, missing, inaccessible, cycle, malformed, or exhaustion, same as ready. No model call.
 - **[Risk] Root title dependency phrases are dropped** → Mitigation: parse root edges from title plus specification core. Do not hash the title inside the closure.
 - **[Risk] Child grilled issues still hash full bodies** → Mitigation: intended. A declared dependency body change is a bound input. Only the root's Pipeline-owned metadata is excluded.
@@ -98,8 +98,8 @@ Artifacts signed before this change encode a root-inclusive `dependency_closure_
 ## Migration Plan
 
 - Ship as an ordinary ready-to-deploy PR. Advance does not merge.
-- After merge, operators run `pipeline triage N --stage ready` on issues whose fingerprints were signed under the new walker.
-- Issues signed under the old walker need a new preview/apply to refresh `dependency_closure_sha256`. No destructive git operation. No force-push. No live-body rewrite in this PR.
+- After merge, operators run `pipeline refine-spec --issue N` then `pipeline refine-spec apply --issue N` on issues signed under the old walker. That refresh rewrites only the signed closure hash and re-persists the frontier. Then `pipeline triage N --stage ready` can succeed.
+- No destructive git operation. No force-push. This PR does not mutate live GitHub bodies by itself.
 - Rollback is a revert of this PR. Fingerprint field names do not change, so revert restores the previous hash formula.
 
 ## Open Questions

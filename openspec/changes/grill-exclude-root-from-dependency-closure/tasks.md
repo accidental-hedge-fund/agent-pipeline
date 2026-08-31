@@ -23,8 +23,14 @@
 - [x] 4.1 Update `docs/adr/0002-decisions-live-in-the-issue-body.md` so it states: root identity is title plus applied specification core; dependency closure covers declared dependencies only; Pipeline-owned Decisions metadata is not a bound input. Verify those three claims are searchable and that no new CLI verb and no new per-command markdown file were added.
 - [x] 4.2 Leave generated `docs/cli.md` and host SKILL verb tables unchanged unless a core edit forces `node scripts/build.mjs`. Verify `git diff -- docs/cli.md hosts` is empty when no `core/` doc-generator input changed beyond the walker, or that `node scripts/build.mjs --check` passes after a required regen.
 
-## 5. Validation
+## 5. Authenticated recovery of root-inclusive pre-change artifacts
 
-- [x] 5.1 After any `core/` edit run `node scripts/build.mjs` if host SKILL inputs changed, then run `cd core && npm test` focusing on `grill-then-ready.test.ts`. Verify the new regression tests pass.
-- [x] 5.2 Run `openspec validate grill-exclude-root-from-dependency-closure` and `npm run ci` from the repo root. Verify both exit 0.
-- [x] 5.3 Confirm the change adds no merge stage, no `auto_merge` config key, and no destructive git helper. Verify a search of the diff for `auto_merge`, `git push --force`, and `worktree remove --force` is empty.
+- [x] 5.1 Add an injected test that starts from an applied Decisions body whose recorded `dependency_closure_sha256` is root-inclusive, with settled handoffs and no bound-input change. Verify `pipeline triage --stage ready` exits 2 with `stale fingerprints: dependency_closure_sha256` before the refresh.
+- [x] 5.2 `pipeline refine-spec --issue N` SHALL sign a root-exclusive closure without calling Implementer or Reviewer when the live artifact's only stale fingerprint is `dependency_closure_sha256`. Verify the signed envelope preserves node ids and handoff provenance.
+- [x] 5.3 Apply of that envelope SHALL persist the refreshed fingerprint and frontier, SHALL NOT create replacement authority handoffs for already-settled nodes, and a following `triage --stage ready` SHALL succeed. Verify ready still compares fingerprints and does not dual-compare formulas.
+
+## 6. Validation
+
+- [x] 6.1 After any `core/` edit run `node scripts/build.mjs` if host SKILL inputs changed, then run `cd core && npm test` focusing on `grill-then-ready.test.ts`. Verify the new regression tests pass.
+- [x] 6.2 Run `openspec validate grill-exclude-root-from-dependency-closure` and `npm run ci` from the repo root. Verify both exit 0.
+- [x] 6.3 Confirm the change adds no merge stage, no `auto_merge` config key, and no destructive git helper. Verify a search of the diff for `auto_merge`, `git push --force`, and `worktree remove --force` is empty.

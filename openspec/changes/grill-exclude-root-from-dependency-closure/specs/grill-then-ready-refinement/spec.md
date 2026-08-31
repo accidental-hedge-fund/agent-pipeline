@@ -91,9 +91,24 @@ Pipeline SHALL bind root issue identity only with `title_sha256` and `applied_bo
 - **AND** all three SHALL use the proposed or applied specification core as the root edge source
 - **AND** a representation split between original body, specification core, and full applied body SHALL NOT be able to stale the closure by itself
 
+### Requirement: Pipeline SHALL refresh a root-inclusive signed closure without new authority answers
+
+When `pipeline refine-spec --issue N` reads an applied Decisions artifact whose only stale fingerprint field is `dependency_closure_sha256`, Pipeline SHALL sign a root-exclusive `dependency_closure_sha256` from the current walker. That preview SHALL NOT call the Implementer or the Reviewer. It SHALL preserve existing nodes and settled handoff provenance. `pipeline refine-spec apply --issue N` SHALL persist that signed snapshot. Apply SHALL NOT create replacement authority handoffs for already-settled nodes. `pipeline triage --stage ready` SHALL still compare fingerprints. It SHALL NOT skip the ready fingerprint check. It SHALL NOT add a ready-only dual-formula comparison.
+
+#### Scenario: Root-inclusive pre-change artifact recovers
+
+- **WHEN** an applied artifact records a root-inclusive `dependency_closure_sha256`
+- **AND** no bound input changed
+- **AND** every authority handoff is already answered
+- **AND** the operator runs `pipeline refine-spec --issue N` then `pipeline refine-spec apply --issue N`
+- **THEN** preview SHALL NOT call the Implementer or the Reviewer
+- **AND** apply SHALL write a root-exclusive `dependency_closure_sha256`
+- **AND** settled handoff provenance SHALL remain
+- **AND** `pipeline triage N --stage ready` SHALL succeed
+
 ### Requirement: Grill-then-ready tests SHALL replay Decisions self-stale and keep fail-closed dependency cases
 
-Unit tests with injected GitHub and handoff I/O SHALL replay preview → apply → answer every authority handoff → `pipeline triage N --stage ready`. Those tests SHALL assert that the Decisions fence, rendered Decisions section, and handoff provenance do not change `dependency_closure_sha256`. They SHALL assert that a proposed body that adds, removes, or changes a declared dependency updates the closure before signing. They SHALL assert that a later dependency title or body change still stales `dependency_closure_sha256`. Existing fail-closed tests for cycle, missing, inaccessible, malformed, depth exhaustion, and count exhaustion SHALL remain. No unit test SHALL perform a real network, git, or subprocess call.
+Unit tests with injected GitHub and handoff I/O SHALL replay preview → apply → answer every authority handoff → `pipeline triage N --stage ready`. Those tests SHALL assert that the Decisions fence, rendered Decisions section, and handoff provenance do not change `dependency_closure_sha256`. They SHALL assert that a proposed body that adds, removes, or changes a declared dependency updates the closure before signing. They SHALL assert that a later dependency title or body change still stales `dependency_closure_sha256`. They SHALL replay recovery of a root-inclusive pre-change artifact through preview and apply without new Implementer, Reviewer, or authority answers. Existing fail-closed tests for cycle, missing, inaccessible, malformed, depth exhaustion, and count exhaustion SHALL remain. No unit test SHALL perform a real network, git, or subprocess call.
 
 #### Scenario: Injected sequence matches #1305 and #1344
 
@@ -102,6 +117,14 @@ Unit tests with injected GitHub and handoff I/O SHALL replay preview → apply �
 - **AND** that sequence SHALL succeed when no bound input changed and no declared dependency changed
 - **AND** adding Decisions metadata SHALL leave `dependency_closure_sha256` unchanged
 - **AND** no test SHALL open a real GitHub, git, or subprocess call
+
+#### Scenario: Root-inclusive artifact recovery is tested
+
+- **WHEN** the grill-then-ready unit suite runs
+- **THEN** it SHALL replay an applied root-inclusive fingerprint through preview and apply
+- **AND** that sequence SHALL not call Implementer or Reviewer
+- **AND** it SHALL not require a new authority answer
+- **AND** `triage --stage ready` SHALL succeed afterward
 
 #### Scenario: Fail-closed dependency cases remain
 

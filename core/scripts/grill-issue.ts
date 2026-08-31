@@ -22,6 +22,7 @@ import {
 import { walkDeclaredDependencyClosure, type WalkDependenciesDeps } from "./grill-facts.ts";
 import {
   buildGrillFingerprint,
+  fingerprintStaleReasons,
   hashDependencyClosure,
   type GrillFingerprint,
   type ProviderConfigIdentity,
@@ -205,11 +206,95 @@ export function planningTreatmentFromConfig(cfg: {
   };
 }
 
+/**
+ * Authenticated non-ready recovery for artifacts signed under the
+ * root-inclusive closure formula. Preserves settled nodes/handoffs.
+ * Ready still compares the single current (root-exclusive) formula.
+ */
+async function trySignAppliedClosureRefresh(
+  issueNumber: number,
+  issue: { title: string; body: string },
+  deps: GrillIssuePreviewDeps,
+): Promise<number | null> {
+  const parsed = parseDecisionsFromBody(issue.body);
+  if (!parsed.ok) return null;
+  const artifact = parsed.artifact;
+  const contextMd = await deps.readContextMd();
+  const integrationBase = await deps.resolveIntegrationBase();
+  const walk = await walkDeclaredDependencyClosure(issueNumber, issue.title, issue.body, {
+    fetchIssue: deps.fetchDependencyIssue,
+  });
+  if (walk.facts.some((f) => (DEPENDENCY_FACT_CODES as readonly string[]).includes(f.code))) {
+    return null;
+  }
+  const liveFp = buildGrillFingerprint({
+    title: issue.title,
+    appliedBody: extractSpecCore(issue.body),
+    dependencyClosure: walk.record,
+    integrationBaseSha: integrationBase,
+    contextMd,
+    providerConfig: deps.providerConfig,
+    planningTreatment: deps.planningTreatment,
+  });
+  const stale = fingerprintStaleReasons(artifact.fingerprint, liveFp);
+  if (stale.length !== 1 || stale[0] !== "dependency_closure_sha256") {
+    return null;
+  }
+  const refreshed: DecisionsArtifact = {
+    ...artifact,
+    fingerprint: liveFp,
+    unresolved_facts: walk.facts,
+  };
+  const body = embedDecisionsInBody(extractSpecCore(issue.body), refreshed);
+  const key = resolveGrillProposalKey(deps.repoDir, deps.keyDeps ?? defaultGrillProposalKeyDeps, {
+    createIfMissing: true,
+  });
+  const verdicts: Array<{ node_id: string; verdict: ReviewerVerdictKind; reason: string }> = [];
+  for (const node of artifact.nodes) {
+    if (node.provenance.reviewer_verdict !== "accept" && node.provenance.reviewer_verdict !== "challenge") {
+      continue;
+    }
+    verdicts.push({
+      node_id: node.id,
+      verdict: node.provenance.reviewer_verdict,
+      reason: node.provenance.reviewer_reason ?? "",
+    });
+  }
+  const signed = issueGrillProposal({
+    now: deps.now(),
+    repo: deps.repo,
+    issue: issueNumber,
+    input: {
+      title: issue.title,
+      body: issue.body,
+      title_sha256: sha256Prefixed(issue.title),
+      body_sha256: sha256Prefixed(issue.body),
+      fingerprint: liveFp,
+    },
+    proposal: {
+      body,
+      artifact: refreshed,
+      verdicts,
+      advisory_title: issue.title,
+      advisory_milestone: null,
+      context_proposals: artifact.context_proposals,
+    },
+    key,
+  });
+  if (!signed.ok) return fail(deps, signed.reason, 1);
+  deps.log("[pipeline refine-spec] refreshing root-exclusive dependency-closure fingerprint");
+  deps.writeStdout(`${JSON.stringify(signed.envelope)}\n`);
+  process.exitCode = 0;
+  return 0;
+}
+
 export async function runRefineSpecIssuePreview(
   issueNumber: number,
   deps: GrillIssuePreviewDeps,
 ): Promise<number> {
   const issue = await deps.getIssue(issueNumber);
+  const refreshed = await trySignAppliedClosureRefresh(issueNumber, issue, deps);
+  if (refreshed !== null) return refreshed;
   const contextMd = await deps.readContextMd();
   const integrationBase = await deps.resolveIntegrationBase();
   const walk = await walkDeclaredDependencyClosure(
