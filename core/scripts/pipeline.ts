@@ -766,9 +766,16 @@ export function selectPersistedShipFailureStatus(
  * extra-positionals guard in main. `loop` accepts the command plus up to
  * {@link MAX_RANGE_SPAN} issue numbers so an explicit issue-list selector can
  * reach {@link normalizeLoopArgs} instead of dying as "unexpected argument(s)"
- * (#554). Other commands keep their pre-existing caps.
+ * (#554). `handoff` is verb-aware when `args` is passed: `list` (and a missing
+ * or unknown verb) admits command + one token; `show|answer|reject|supersede`
+ * admits command + verb + one handoff ID (#1349). Without `args`, `handoff`
+ * returns the documented ceiling of 3. Other commands keep their pre-existing
+ * caps.
  */
-export function maxPositionalsFor(command: string | undefined): number {
+export function maxPositionalsFor(
+  command: string | undefined,
+  args?: readonly string[],
+): number {
   if (
     command === "run" ||
     command === "single" ||
@@ -809,6 +816,19 @@ export function maxPositionalsFor(command: string | undefined): number {
   }
   if (command === "refine-spec") {
     return 2; // refine-spec [apply]
+  }
+  if (command === "handoff") {
+    if (args === undefined) return 3;
+    const verb = args[1];
+    if (
+      verb === "show" ||
+      verb === "answer" ||
+      verb === "reject" ||
+      verb === "supersede"
+    ) {
+      return 3; // verb + exactly one handoff ID
+    }
+    return 2; // list, missing verb, or unknown verb
   }
   return 1; // plain advance takes only the keyword / issue number
 }
@@ -4602,7 +4622,9 @@ async function main(): Promise<void> {
   // <manifest.json|experiment-dir|harvest-request.json>` (#535).
   // `loop` accepts the keyword plus up to MAX_RANGE_SPAN issue numbers so an
   // explicit issue-list selector reaches normalizeLoopArgs (#554).
-  const maxPositionals = maxPositionalsFor(cmd.args[0]);
+  // `handoff` admits documented sub-verbs (`list` = verb only;
+  // `show|answer|reject|supersede` = verb + one ID) (#1349).
+  const maxPositionals = maxPositionalsFor(cmd.args[0], cmd.args);
   if (cmd.args.length > maxPositionals) {
     const extra = cmd.args.slice(maxPositionals).join(", ");
     console.error(`pipeline: unexpected argument(s): ${extra}`);
