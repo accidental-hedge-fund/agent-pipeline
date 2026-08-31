@@ -5,6 +5,7 @@ import { classifyContextProposals, recordRequiredContextHashes } from "./grill-c
 import {
   applyReviewerVerdicts,
   canonicalThinIssueNodes,
+  DEPENDENCY_FACT_CODES,
   embedDecisionsInBody,
   extractSpecCore,
   hasReviewerChallenge,
@@ -21,6 +22,9 @@ import {
 import { walkDeclaredDependencyClosure, type WalkDependenciesDeps } from "./grill-facts.ts";
 import {
   buildGrillFingerprint,
+  fingerprintStaleReasons,
+  hashDependencyClosure,
+  type DependencyClosureRecord,
   type GrillFingerprint,
   type ProviderConfigIdentity,
 } from "./grill-fingerprint.ts";
@@ -46,7 +50,7 @@ import { listHandoffs, type HandoffStoreDeps } from "./human-question-handoff.ts
 import type { GrillReadySnapshot } from "./grill-ready.ts";
 import { buildGrillImplementerPrompt, buildGrillReviewerPrompt } from "./prompts/index.ts";
 import { invoke } from "./harness.ts";
-import { getIssueDetail } from "./gh.ts";
+import { getIssueDetail, listIssueBodyRevisions as fetchIssueBodyRevisions } from "./gh.ts";
 import { isKillSwitchActive } from "./lock.ts";
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
@@ -68,6 +72,8 @@ export interface HarnessCallResult {
 export interface GrillIssuePreviewDeps {
   getIssue(issueNumber: number): Promise<{ title: string; body: string }>;
   fetchDependencyIssue: WalkDependenciesDeps["fetchIssue"];
+  /** Durable GitHub issue-body revisions. Missing or empty → migration fail-closed. */
+  listIssueBodyRevisions?(issueNumber: number): Promise<string[]>;
   readContextMd(): Promise<string>;
   resolveIntegrationBase(): Promise<string>;
   providerConfig: ProviderConfigIdentity;
@@ -86,6 +92,7 @@ export interface GrillIssuePreviewDeps {
 
 export interface GrillIssueApplyDeps {
   getIssue(issueNumber: number): Promise<{ title: string; body: string }>;
+  fetchDependencyIssue: WalkDependenciesDeps["fetchIssue"];
   updateIssueBody(issueNumber: number, body: string): Promise<void>;
   isKillSwitchActive(): boolean;
   now(): Date;
@@ -202,11 +209,135 @@ export function planningTreatmentFromConfig(cfg: {
   };
 }
 
+/**
+ * Legacy root-inclusive `dependency_closure_sha256` from the signed
+ * historical root body (pre-proposal `issue.body`) plus the current
+ * exclusive dependency snapshot. Preview migration only.
+ */
+function legacyRootInclusiveClosureHash(
+  rootIssue: number,
+  rootTitle: string,
+  signedRootBody: string,
+  exclusive: DependencyClosureRecord,
+): string {
+  return hashDependencyClosure({
+    ids: [rootIssue, ...exclusive.ids],
+    per_id: [
+      {
+        id: rootIssue,
+        title_sha256: sha256Prefixed(rootTitle),
+        body_sha256: sha256Prefixed(signedRootBody),
+      },
+      ...exclusive.per_id,
+    ],
+    fact_codes: exclusive.fact_codes,
+  });
+}
+
+/**
+ * Authenticated non-ready recovery for artifacts signed under the
+ * root-inclusive closure formula. Preserves settled nodes/handoffs.
+ * Ready still compares the single current (root-exclusive) formula.
+ */
+async function trySignAppliedClosureRefresh(
+  issueNumber: number,
+  issue: { title: string; body: string },
+  deps: GrillIssuePreviewDeps,
+): Promise<number | null> {
+  const parsed = parseDecisionsFromBody(issue.body);
+  if (!parsed.ok) return null;
+  const artifact = parsed.artifact;
+  const contextMd = await deps.readContextMd();
+  const integrationBase = await deps.resolveIntegrationBase();
+  const walk = await walkDeclaredDependencyClosure(issueNumber, issue.title, issue.body, {
+    fetchIssue: deps.fetchDependencyIssue,
+  });
+  if (walk.facts.some((f) => (DEPENDENCY_FACT_CODES as readonly string[]).includes(f.code))) {
+    return null;
+  }
+  const liveFp = buildGrillFingerprint({
+    title: issue.title,
+    appliedBody: extractSpecCore(issue.body),
+    dependencyClosure: walk.record,
+    integrationBaseSha: integrationBase,
+    contextMd,
+    providerConfig: deps.providerConfig,
+    planningTreatment: deps.planningTreatment,
+  });
+  const stale = fingerprintStaleReasons(artifact.fingerprint, liveFp);
+  if (stale.length !== 1 || stale[0] !== "dependency_closure_sha256") {
+    return null;
+  }
+  let revisions: string[] = [];
+  try {
+    revisions = deps.listIssueBodyRevisions ? await deps.listIssueBodyRevisions(issueNumber) : [];
+  } catch {
+    return null;
+  }
+  const recorded = artifact.fingerprint.dependency_closure_sha256;
+  const authenticated = revisions.some(
+    (historical) =>
+      typeof historical === "string" &&
+      historical.length > 0 &&
+      recorded ===
+        legacyRootInclusiveClosureHash(issueNumber, issue.title, historical, walk.record),
+  );
+  if (!authenticated) return null;
+  const refreshed: DecisionsArtifact = {
+    ...artifact,
+    fingerprint: liveFp,
+    unresolved_facts: walk.facts,
+  };
+  const body = embedDecisionsInBody(extractSpecCore(issue.body), refreshed);
+  const key = resolveGrillProposalKey(deps.repoDir, deps.keyDeps ?? defaultGrillProposalKeyDeps, {
+    createIfMissing: true,
+  });
+  const verdicts: Array<{ node_id: string; verdict: ReviewerVerdictKind; reason: string }> = [];
+  for (const node of artifact.nodes) {
+    if (node.provenance.reviewer_verdict !== "accept" && node.provenance.reviewer_verdict !== "challenge") {
+      continue;
+    }
+    verdicts.push({
+      node_id: node.id,
+      verdict: node.provenance.reviewer_verdict,
+      reason: node.provenance.reviewer_reason ?? "",
+    });
+  }
+  const signed = issueGrillProposal({
+    now: deps.now(),
+    repo: deps.repo,
+    issue: issueNumber,
+    input: {
+      title: issue.title,
+      body: issue.body,
+      title_sha256: sha256Prefixed(issue.title),
+      body_sha256: sha256Prefixed(issue.body),
+      fingerprint: liveFp,
+    },
+    proposal: {
+      body,
+      artifact: refreshed,
+      verdicts,
+      advisory_title: issue.title,
+      advisory_milestone: null,
+      context_proposals: artifact.context_proposals,
+    },
+    key,
+  });
+  if (!signed.ok) return fail(deps, signed.reason, 1);
+  deps.log("[pipeline refine-spec] refreshing root-exclusive dependency-closure fingerprint");
+  deps.writeStdout(`${JSON.stringify(signed.envelope)}\n`);
+  process.exitCode = 0;
+  return 0;
+}
+
 export async function runRefineSpecIssuePreview(
   issueNumber: number,
   deps: GrillIssuePreviewDeps,
 ): Promise<number> {
   const issue = await deps.getIssue(issueNumber);
+  const refreshed = await trySignAppliedClosureRefresh(issueNumber, issue, deps);
+  if (refreshed !== null) return refreshed;
   const contextMd = await deps.readContextMd();
   const integrationBase = await deps.resolveIntegrationBase();
   const walk = await walkDeclaredDependencyClosure(
@@ -265,10 +396,17 @@ export async function runRefineSpecIssuePreview(
     contextMd,
   );
 
+  const signedWalk = await walkDeclaredDependencyClosure(
+    issueNumber,
+    issue.title,
+    parsed.body,
+    { fetchIssue: deps.fetchDependencyIssue },
+  );
+
   const fingerprintForReview: GrillFingerprint = buildGrillFingerprint({
     title: issue.title,
     appliedBody: "",
-    dependencyClosure: walk.record,
+    dependencyClosure: signedWalk.record,
     integrationBaseSha: integrationBase,
     contextMd,
     providerConfig: deps.providerConfig,
@@ -280,7 +418,7 @@ export async function runRefineSpecIssuePreview(
     nodes,
     fingerprint: fingerprintForReview,
     required_context: required,
-    unresolved_facts: walk.facts,
+    unresolved_facts: signedWalk.facts,
     context_proposals: classified.proposals,
   };
 
@@ -341,7 +479,7 @@ export async function runRefineSpecIssuePreview(
       applied_body_sha256: sha256Prefixed(specBody),
     },
     required_context: required,
-    unresolved_facts: walk.facts,
+    unresolved_facts: signedWalk.facts,
     context_proposals: classified.proposals,
   };
   const body = embedDecisionsInBody(specBody, artifact);
@@ -437,6 +575,26 @@ export async function runRefineSpecApply(
   }
   const bodyCheck = parseDecisionsFromBody(envelope.proposal.body);
   if (!bodyCheck.ok) return fail(deps, `proposal body is not a valid Decisions artifact: ${bodyCheck.reason}`, 2);
+  const applyWalk = await walkDeclaredDependencyClosure(
+    issueNumber,
+    live.title,
+    envelope.proposal.body,
+    { fetchIssue: deps.fetchDependencyIssue },
+  );
+  const closureHash = hashDependencyClosure(applyWalk.record);
+  if (closureHash !== envelope.proposal.artifact.fingerprint.dependency_closure_sha256) {
+    return fail(deps, "dependency-closure fingerprint mismatch", 2);
+  }
+  const blockingFacts = applyWalk.facts.filter((f) =>
+    (DEPENDENCY_FACT_CODES as readonly string[]).includes(f.code),
+  );
+  if (blockingFacts.length > 0) {
+    return fail(
+      deps,
+      `unresolved dependency facts: ${blockingFacts.map((f) => f.code).join(", ")}`,
+      2,
+    );
+  }
   const created = await createPendingGrillHandoffs(
     deps.repoDir,
     {
@@ -547,6 +705,7 @@ export function realGrillIssuePreviewDeps(cfg: PipelineConfig): GrillIssuePrevie
       const d = await getIssueDetail(cfg, n);
       return { title: d.title, body: d.body };
     },
+    listIssueBodyRevisions: async (n) => fetchIssueBodyRevisions(cfg, n),
     fetchDependencyIssue: async (id) => {
       try {
         const d = await getIssueDetail(cfg, id);
@@ -599,6 +758,18 @@ export function realGrillIssueApplyDeps(cfg: PipelineConfig): GrillIssueApplyDep
     getIssue: async (n) => {
       const d = await getIssueDetail(cfg, n);
       return { title: d.title, body: d.body };
+    },
+    fetchDependencyIssue: async (id) => {
+      try {
+        const d = await getIssueDetail(cfg, id);
+        return { ok: true, title: d.title, body: d.body };
+      } catch (err) {
+        const msg = (err as Error).message.toLowerCase();
+        if (msg.includes("404") || msg.includes("not found")) {
+          return { ok: false, code: "missing" };
+        }
+        return { ok: false, code: "inaccessible" };
+      }
     },
     updateIssueBody: async (n, body) => {
       const result = spawnSync(
