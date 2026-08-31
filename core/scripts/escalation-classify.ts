@@ -74,9 +74,10 @@ export function classifyHarnessFailure(
   // Provider credential failure is environment-auth, not harness-contract
   // (#1265). Honor typed preflight reason, structured provider status, and
   // allowlisted JSON codes before spawn_error / non-zero-exit mapping.
+  const preflightReason = (result as { preflight_reason_code?: string | null }).preflight_reason_code;
   if (
     isProviderEnvironmentAuth({
-      preflight_reason_code: (result as { preflight_reason_code?: string | null }).preflight_reason_code,
+      preflight_reason_code: preflightReason,
       provider_auth_status: (result as { provider_auth_status?: ProviderAuthStatus | null }).provider_auth_status,
       stdout: (result as { stdout?: string }).stdout,
       stderr: (result as { stderr?: string }).stderr,
@@ -84,6 +85,7 @@ export function classifyHarnessFailure(
   ) {
     return "environment-auth";
   }
+  if (preflightReason === "capability-refusal") return "capability-refusal";
   if (result.throttled) return "transient-infra";
   if ((result as HarnessFailureSignals).background_wait) return "harness-background-wait";
   if (result.timed_out) return "harness-timeout";

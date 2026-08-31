@@ -486,13 +486,19 @@ test("harness-background-wait is additive, maps before timed_out, projects recov
   assert.equal(diag.reason_code, "harness-background-wait");
 });
 
-test("mutating implementer preflight refuses unsupported adapters; planning and review still spawn", async () => {
+test("mutating implementer preflight spawns explicit unsupported; omits still refuse", async () => {
   _resetRegistryForTests({ reseedBuiltins: true });
   const adapter = makeAdapter({
     name: "no-lifecycle-cli",
     lifecycle: BACKGROUND_JOB_LIFECYCLE_UNSUPPORTED,
   });
   registerAdapter(adapter);
+  const omitted = makeAdapter({
+    name: "omit-lifecycle-cli",
+    lifecycle: BACKGROUND_JOB_LIFECYCLE_UNSUPPORTED,
+    omitLifecycle: true,
+  });
+  registerAdapter(omitted);
   const deps = defaultProductionPreflightDeps({
     exec: async (_file, args) => {
       const joined = args.join(" ");
@@ -506,8 +512,14 @@ test("mutating implementer preflight refuses unsupported adapters; planning and 
     fsExecutable: async () => true,
   });
   for (const stageKind of ["implement", "fix-round", "test-fix", "eval-fix", "visual-fix"] as const) {
-    const refused = await runProductionPreflight(
+    const allowed = await runProductionPreflight(
       adapter,
+      { prompt: "p", stageKind, role: "implementer" },
+      deps,
+    );
+    assert.equal(allowed.ok, true, stageKind);
+    const refused = await runProductionPreflight(
+      omitted,
       { prompt: "p", stageKind, role: "implementer" },
       deps,
     );
@@ -515,7 +527,8 @@ test("mutating implementer preflight refuses unsupported adapters; planning and 
     if (!refused.ok) {
       assert.equal(refused.remediation.reasonCode, "capability-refusal");
       assert.match(refused.remediation.message, /background_job_lifecycle/);
-      assert.match(refused.remediation.message, /no-lifecycle-cli/);
+      assert.match(refused.remediation.message, /omit-lifecycle-cli/);
+      assert.match(refused.remediation.message, /omits/);
       assert.match(refused.remediation.message, /cannot succeed/);
     }
     assert.equal(requiresBackgroundJobLifecycle(stageKind), true);
@@ -542,19 +555,20 @@ test("mutating implementer preflight refuses unsupported adapters; planning and 
     deps,
   );
   assert.equal(ok.ok, true);
-  const claude = resolveAdapter("claude")!;
-  const claudeImpl = await runProductionPreflight(
-    claude,
-    { prompt: "p", stageKind: "implement", role: "implementer" },
-    deps,
-  );
-  assert.equal(claudeImpl.ok, false);
-  if (!claudeImpl.ok) {
-    assert.equal(claudeImpl.remediation.reasonCode, "capability-refusal");
-    assert.match(claudeImpl.remediation.message, /background_job_lifecycle/);
+  for (const name of ["claude", "codex", "grok"] as const) {
+    const builtin = resolveAdapter(name)!;
+    assert.equal(builtin.capabilities.background_job_lifecycle.supported, false, name);
+    const impl = await runProductionPreflight(
+      builtin,
+      { prompt: "p", stageKind: "implement", role: "implementer" },
+      deps,
+    );
+    if (!impl.ok) {
+      assert.doesNotMatch(impl.remediation.message, /background_job_lifecycle/, name);
+    }
   }
   const claudePlan = await runProductionPreflight(
-    claude,
+    resolveAdapter("claude")!,
     { prompt: "p", stageKind: "planning", role: "implementer" },
     deps,
   );
@@ -624,6 +638,38 @@ test("same-adapter retry of the same fingerprint is refused and does not spawn",
   });
   assert.equal(retry.attempts.length, 1);
   assert.equal(retry.finalResult.background_wait, true);
+});
+
+test("invokeFixHarnessWithRetry does not retry a typed production-preflight refusal", async () => {
+  let calls = 0;
+  const retry = await invokeFixHarnessWithRetry({
+    basePrompt: "fix",
+    fixTimeoutSec: 100,
+    maxRetries: 2,
+    invokeAttempt: async () => {
+      calls += 1;
+      return {
+        success: false,
+        stdout: "",
+        stderr:
+          "[harness grok] adapter omits background_job_lifecycle. retrying the same invocation cannot succeed",
+        exit_code: -1,
+        duration: 0,
+        timed_out: false,
+        preflight_failed: true,
+        preflight_class: "unsupported-setting",
+        preflight_reason_code: "capability-refusal",
+      };
+    },
+  });
+  assert.equal(calls, 1);
+  assert.equal(retry.attempts.length, 1);
+  assert.equal(retry.finalResult.preflight_failed, true);
+  assert.equal(retry.finalResult.preflight_reason_code, "capability-refusal");
+  assert.equal(
+    classifyHarnessFailure(retry.finalResult),
+    "capability-refusal",
+  );
 });
 
 test("harness-background-wait recovery recipes do not include same-adapter repair or publish", () => {
