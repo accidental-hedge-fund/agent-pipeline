@@ -89,6 +89,74 @@ _Avoid_: operator sign-off, handoff answer, comment-as-accept
 
 ### Diagnostics
 
+**Supervised operation**:
+A lifecycle-affecting mutation that remains owned until it proves success, remains durably scheduled for recovery, waits on an external condition or typed request, or is explicitly cancelled by an authenticated operator or its authorized caller. Mechanical failure and retry exhaustion do not end ownership.
+_Avoid_: one-shot command, terminal-on-error operation
+
+**Decision request**:
+A choice among permitted product alternatives for which Pipeline supplies a recommendation. Policy may accept a reversible authorized default.
+_Avoid_: failure, capability request, authority request
+
+**Capability request**:
+A typed statement that progress requires an unavailable external capability, condition, or information. It requests restoration or input, not approval.
+_Avoid_: authority request, generic blocker, harness failure
+
+**Authority request**:
+A typed request for authority Pipeline does not possess, such as approval for security-sensitive, irreversible, merge/release, or human-attested action. It cannot be settled by a model-authored default.
+_Avoid_: capability request, decision request, generic needs-human
+
+**RecoverySupervisor**:
+The sole lifecycle owner for supervised operations. Command, stage, integration, ship, and host surfaces report observations to it rather than defining their own terminal or recovery policy.
+_Avoid_: loop supervisor as a separate policy, command-local recovery controller
+
+**Operation adapter**:
+A boundary that performs one bounded operation attempt and reports a typed observation with evidence. It does not choose lifecycle treatment or declare terminal state.
+_Avoid_: recovery controller, scheduler
+
+**Operation observation**:
+Versioned evidence about an operation invariant, candidate, and side-effect certainty. A process exit, exception, timeout, or model response is ingress evidence, not success by itself.
+_Avoid_: exit code as lifecycle state, prose blocker
+
+**Operation invariant**:
+The declared precondition, postcondition, authoritative observer, candidate binding, and replay rule for a supervised operation.
+_Avoid_: best-effort success heuristic
+
+**Authoritative observer**:
+The system whose fresh state proves an operation-specific fact. Local intent history cannot overrule the forge, git remote, CI, release provider, or deployment provider for facts those systems own.
+_Avoid_: local ledger as universal truth
+
+**Candidate epoch**:
+The period during which all candidate-bearing authoritative facts retain one identity. Candidate movement starts a new epoch and invalidates candidate-bound review, test, decision, and authority evidence.
+_Avoid_: process lifetime, retry number
+
+**Side-effect certainty**:
+An observation classifying a side effect as known complete, known absent, or uncertain. Uncertainty requires reconciliation before replay.
+_Avoid_: timeout means absent, exit zero means complete
+
+**Recovery episode**:
+Durable recovery state for one operation invariant, candidate epoch, and normalized evidence identity. It survives process restart and owns its treatment history.
+_Avoid_: command retry loop, class-wide retry counter
+
+**Strategy cursor**:
+The monotonic position within a Recovery Episode's applicable treatments. Exhausting one treatment advances the cursor rather than ending lifecycle ownership.
+_Avoid_: global retry budget
+
+**Cooling**:
+An owned state in which a supervised operation waits until its next eligible observation or wake event. It is not cancellation, human ownership, or terminal failure.
+_Avoid_: recovery exhausted, stopped, abandoned
+
+**External-condition wait**:
+An owned wait on a named external condition with a live probe and a time- or event-based wake rule. It does not ask a human merely because the condition is currently false.
+_Avoid_: needs-human, generic blocked
+
+**Lifecycle projector**:
+The sole mapper from durable Lifecycle State to compatibility labels, comments, diagnostics, and events. Those projections never become scheduler or authority truth.
+_Avoid_: labels as state machine, setBlocked as lifecycle policy
+
+**Operation disposition**:
+The executable classification of a command form as read-only, bounded atomic administration, or supervised lifecycle, independent of its authority requirement.
+_Avoid_: one mutatesGitHub boolean, top-level verb classification only
+
 **Environment-auth**:
 An operator or third-party credential failure (revoked token, login required). Not an engine defect.
 _Avoid_: workflow-engine-defect, harness-contract (as the durable theme for a 401)
@@ -97,7 +165,71 @@ _Avoid_: workflow-engine-defect, harness-contract (as the durable theme for a 40
 A typed, deterministic production-preflight outcome when the selected adapter lacks a required capability contract. The harness did not start, so this is not a harness crash, raw exit failure, workflow-engine defect, or environment-auth failure.
 _Avoid_: exit -1, harness-failure, workflow-engine-defect, environment-auth
 
+**Logical operation**:
+One immutable root identity minted at public-command admission and retained across retries, restarts, reattachment, and nested work. It is the denominator for lifecycle reliability.
+_Avoid_: process, attempt, wave, run ID
+
+**Execution attempt**:
+One physical effort to advance a Logical Operation. Retries and resumed processes create evidence, not additional logical successes.
+_Avoid_: logical operation, successful item
+
+**Verified completion**:
+Authoritative proof that the exact-candidate postcondition of a Logical Operation is satisfied. A terminal process or `run_complete` event is insufficient by itself.
+_Avoid_: process exited zero, run ended
+
+**Manual reinvocation**:
+A new external admission used to continue unfinished work without a valid durable resume binding. Autonomous retry, cooling wake-up, host reattachment, and bound resume are not manual reinvocation.
+_Avoid_: every fresh process, automatic resume
+
+**False-human projection**:
+A mechanical fault or unavailable system condition incorrectly represented as human ownership or as a typed request without a genuine matching condition.
+_Avoid_: any legitimate Decision Request, Capability Request, or Authority Request
+
+**Ownerless terminal**:
+An admitted Logical Operation whose process or strategy ends without verified success, durable active or cooling ownership, an external-condition wait, a valid typed request, or explicit authenticated cancellation.
+_Avoid_: legitimate wait, completed operation
+
+**Exact-candidate recovery**:
+Recovery that preserves and re-proves the candidate identity authorized for the operation rather than substituting a convenient checkout, pin, or artifact.
+_Avoid_: PATH candidate, latest run, control HEAD
+
+**Independent-sibling continuation**:
+Continued progress for selected operations that do not transitively depend on a waiting or cooling peer.
+_Avoid_: abandon the batch on first held item
+
 ### Ship path
+
+**Candidate-engine root**:
+The exact-SHA engine checkout selected for candidate work such as ship or factory evaluation.
+_Avoid_: installed PATH engine, control checkout
+
+**Candidate readiness**:
+Engine-owned proof that a Candidate-engine root is runnable from its own nested lockfile at the selected SHA. A dependency directory alone is not proof.
+_Avoid_: node_modules exists, global reinstall
+
+**Resolve-and-prepare**:
+The shared gate that selects a Candidate-engine root, proves Candidate readiness, revalidates identity and cleanliness, and only then permits candidate commands to spawn.
+_Avoid_: leaf-command install, ship-only bootstrap
+
+**Integration candidate**:
+The exact repository, base, pull request, and head tuple eligible for one authorized merge claim.
+_Avoid_: PR number alone, latest head
+
+**Candidate lineage**:
+The authenticated chain connecting the integrated source candidate to release, publication, promotion, and deployed artifact identities.
+_Avoid_: one SHA across every release transformation, version string as identity
+
+**Continuous shipment**:
+A frozen batch whose terminal proof is exact-candidate integration into its configured base and which carries no implied SemVer release phases.
+_Avoid_: fake patch version, release without a tag
+
+**Liveness provider**:
+A host-neutral mechanism that discovers and reattaches the existing durable supervisor on one machine. It restores workers but cannot choose recovery, answer requests, merge, or own a second ledger.
+_Avoid_: second scheduler, host-specific lifecycle controller
+
+**Fault matrix**:
+A versioned executable manifest mapping supervised operations, generic fault classes, public entrypoints, and host adapters to required recovery outcomes.
+_Avoid_: incident test list, optional coverage sample
 
 **Live ship**:
 A detached `pipeline train --merge` for one milestone. That process is the ship.
@@ -116,16 +248,16 @@ _Avoid_: live-ship probe, paste detector, second scheduler
 _Avoid_: `env.example` factory-control default, mid-ship model override
 
 **STOP**:
-`train --merge` stops on uncontained merge failure, merge-first violation, or when every remaining item is held or dependency-skipped. A contained hold does not abandon independent siblings.
-_Avoid_: park, blocked (as synonyms)
+A compatibility train outcome indicating that no selected item can progress in the current pass. Underlying operations remain durably owned as cooling, external waits, typed requests, or cancellations, and independent siblings are not abandoned.
+_Avoid_: terminal mechanical failure, park, blocked
 
 **Park**:
-The item is at `pipeline:needs-human`.
-_Avoid_: STOP, blocked
+The compatibility projection `pipeline:needs-human` for a current typed request. The label alone is not authority or scheduler truth.
+_Avoid_: mechanical hold, STOP, blocked
 
 **Blocked**:
-The item carries `blocked` (CI exhausted, etc.). Merge-mode train holds that item and continues independent remaining work. Dependents are dependency-skipped. `pipeline loop` may still wave.
-_Avoid_: parked, needs-human
+A legacy compatibility label that must be reclassified through durable Lifecycle State. It is never lifecycle, scheduler, or authority truth by itself.
+_Avoid_: parked, needs-human, recovery exhausted
 
 **Hard wait**:
 `Depends on: #N` or `blocked by #N` whose target is an open issue on this train selector. Only this may deadlock or hold the train.
@@ -152,8 +284,8 @@ _Avoid_: supervisor_no_progress when `next_actions` is advance
 _Avoid_: unknown, assertion, flake re-run
 
 **Review-prompt-too-large**:
-Assembled reviewer prompt (after `buildReview*Prompt`, before spawn) exceeds the configured reviewer’s declared max, else Codex `1048576`. `setBlocked`. Do not retry the same payload. Review-1 and review-2.
-_Avoid_: transient timeout, skip-review-and-advance, shrink-the-1.29MB as this cut, per-model table this cut
+The assembled reviewer prompt exceeds the configured reviewer's declared maximum before spawn. Do not retry the same payload; change treatment or enter an owned wait without projecting human authority.
+_Avoid_: transient timeout, setBlocked, skip-review-and-advance
 
 **Freeze-eligible**:
 Train membership only: open non-backlog pipeline issues plus closed issues labeled `pipeline:ready-to-deploy`. Not proof that the GitHub milestone has zero remaining open issues. Not authorization to start FRG pack, release, or promote.
