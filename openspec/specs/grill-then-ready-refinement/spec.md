@@ -1,7 +1,7 @@
 # grill-then-ready-refinement Specification
 
 ## Purpose
-Per-issue grill that looks up repository facts, records a versioned Decisions artifact in the GitHub issue body, lets the reviewer accept or challenge recommended defaults, and leaves operator-required authority to an authenticated handoff answer before a model-free `--stage ready` gate.
+Decisions artifact, closed taxonomy, dependency-closure fingerprints, and model-free `--stage ready` validator used by `pipeline grill` admission. Operator-facing signed-envelope preview/apply is not the intake controller.
 
 ## Requirements
 
