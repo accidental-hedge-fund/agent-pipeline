@@ -7,7 +7,7 @@ TBD - created by archiving change fix-stage-harness-crash-retry. Update Purpose 
 
 ### Requirement: A failed fix-round harness invocation SHALL be retried in place up to the auto-recovery cap
 
-The fix stage (`fix-1`, `fix-2`) SHALL treat a harness invocation that reports failure (non-zero exit or timeout) as a retriable event rather than an immediate block, except when the result is a typed production-preflight refusal (`preflight_failed`) or `harness-background-wait`. The pipeline SHALL re-invoke the harness in the **same worktree** up to `auto_recovery_max_retries` additional times for crash and timeout failures. The stage SHALL block only after the cap is reached, and the block SHALL be identical in kind to today's (`blockerKind: "harness-failure"`, human-intervention kind `reviewer-unavailable`) unless the result carries a typed preflight reason. A typed `capability-refusal` preflight SHALL block without retry and SHALL keep that reason code.
+The fix stage (`fix-1`, `fix-2`) SHALL treat a harness invocation that reports failure (non-zero exit or timeout) as a retriable event rather than an immediate block, except when the result is a typed production-preflight refusal (`preflight_failed`) or `harness-background-wait`. The pipeline SHALL re-invoke the harness in the **same worktree** up to `auto_recovery_max_retries` additional times for crash and timeout failures. The stage SHALL block only after the cap is reached, and the block SHALL be identical in kind to today's (`blockerKind: "harness-failure"`, human-intervention kind `reviewer-unavailable`) unless the result carries a typed preflight reason. A typed `capability-refusal` preflight SHALL block without retry and SHALL keep that reason code, `preflight_class`, intervention kind, and bounded message.
 
 A structured failure *verdict* produced by a successful invocation is not a harness failure and SHALL NOT trigger this retry path.
 
@@ -47,6 +47,8 @@ A structured failure *verdict* produced by a successful invocation is not a harn
 - **THEN** the pipeline SHALL invoke the harness exactly once
 - **AND** SHALL NOT emit `fix_harness_retry`
 - **AND** SHALL block with a typed `capability-refusal` diagnostic, not a bare `exit -1` reason mapped as `workflow-engine-defect`
+- **AND** the blocked diagnostic SHALL retain `preflight_class` and intervention kind `auth-tooling-preflight-failure`
+- **AND** SHALL record zero harness sessions
 
 ### Requirement: Retries SHALL honor the remaining stage timeout budget
 
