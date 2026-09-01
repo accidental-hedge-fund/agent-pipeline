@@ -175,7 +175,7 @@ export function deriveSettlementSignals(
     ),
     contradictory: false,
     missing_external: false,
-    discoverable_from_facts: false,
+    discoverable_from_facts: engineDiscoverableFromFacts(rec, factText),
     protected_action: protectedAction,
     confidence: "medium",
   };
@@ -210,7 +210,8 @@ export function settleRecommendation(
       reason: "contradictory product requirements",
     };
   }
-  if (signals.missing_external && !signals.discoverable_from_facts) {
+  const recDiscoverable = engineDiscoverableFromFacts(rec, factText);
+  if (signals.missing_external && !signals.discoverable_from_facts && !recDiscoverable) {
     return {
       kind: "typed-request",
       request: "CapabilityRequest",
@@ -286,9 +287,20 @@ export function engineCoveredByExistingAuthority(
 }
 
 /**
+ * A recommendation is discoverable when trusted fact text already contains it.
+ * Empty recommendations are not discoverable.
+ */
+export function engineDiscoverableFromFacts(recommendation: string, factText: string): boolean {
+  const rec = recommendation.trim();
+  if (!rec) return false;
+  return factText.toLowerCase().includes(rec.toLowerCase());
+}
+
+/**
  * Model output may supply pause evidence (contradictory, missing_external)
  * and confidence. Authority-predicate fields are derived from taxonomy,
  * the concrete recommendation, and trusted facts, never copied from the model.
+ * `missing_external` is a candidate only: discoverable facts never pause.
  */
 export function parseSignalsFromModel(
   raw: Record<string, unknown>,
@@ -307,13 +319,14 @@ export function parseSignalsFromModel(
     confidenceRaw === "low" || confidenceRaw === "medium" || confidenceRaw === "high"
       ? confidenceRaw
       : base.confidence;
+  const candidateMissing = bool("missing_external", base.missing_external);
   return {
     reversible: base.reversible,
     in_scope: base.in_scope,
     policy_consistent: base.policy_consistent,
     covered_by_existing_authority: base.covered_by_existing_authority,
     contradictory: bool("contradictory", base.contradictory),
-    missing_external: bool("missing_external", base.missing_external),
+    missing_external: candidateMissing && !base.discoverable_from_facts,
     discoverable_from_facts: base.discoverable_from_facts,
     protected_action: base.protected_action,
     confidence,

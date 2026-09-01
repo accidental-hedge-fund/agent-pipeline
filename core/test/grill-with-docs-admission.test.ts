@@ -575,6 +575,69 @@ test("grill: covered scope does not create a handoff", () => {
   assert.equal(result.kind, "auto-accept");
 });
 
+test("grill: model missing_external is not a CapabilityRequest when facts contain the rec", () => {
+  const rec = "use REST for the public API";
+  const facts = "CONTEXT.md states: use REST for the public API";
+  const signals = parseSignalsFromModel(
+    { missing_external: true, discoverable_from_facts: false },
+    "operational-default",
+    rec,
+    facts,
+  );
+  assert.equal(signals.discoverable_from_facts, true);
+  assert.equal(signals.missing_external, false);
+  const result = settleRecommendation(
+    { class: "operational-default", recommendation: rec },
+    {
+      ...signals,
+      missing_external: true,
+      discoverable_from_facts: false,
+    },
+    facts,
+  );
+  assert.equal(result.kind, "auto-accept");
+});
+
+test("grill: settleFrontierNodes ignores model missing_external when facts contain the rec", () => {
+  const rec = "use REST for the public API";
+  const raw = [
+    {
+      ...makeNode({
+        id: "api",
+        question: "Which transport?",
+        recommendation: rec,
+        class: "operational-default",
+      }),
+      signalsRaw: { missing_external: true, discoverable_from_facts: false },
+    },
+  ];
+  const nodes = settleFrontierNodes(raw, rec);
+  assert.notEqual(nodes[0]!.typed_request, "CapabilityRequest");
+  assert.equal(nodes[0]!.provenance.settled_by, "auto-accept");
+});
+
+test("grill: model missing_external remains CapabilityRequest when facts omit the rec", () => {
+  const rec = "need a vendor account id";
+  const facts = "unrelated CONTEXT.md";
+  const signals = parseSignalsFromModel(
+    { missing_external: true },
+    "operational-default",
+    rec,
+    facts,
+  );
+  assert.equal(signals.missing_external, true);
+  assert.equal(signals.discoverable_from_facts, false);
+  const result = settleRecommendation(
+    { class: "operational-default", recommendation: rec },
+    signals,
+    facts,
+  );
+  assert.equal(result.kind, "typed-request");
+  if (result.kind === "typed-request") {
+    assert.equal(result.request, "CapabilityRequest");
+  }
+});
+
 test("grill: model cannot assert existing authority for auto-accept", () => {
   const signals = parseSignalsFromModel(
     {
