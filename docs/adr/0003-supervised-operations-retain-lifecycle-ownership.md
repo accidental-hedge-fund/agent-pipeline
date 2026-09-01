@@ -1,0 +1,3 @@
+# Supervised operations retain lifecycle ownership
+
+Lifecycle-affecting mutations remain owned until they prove success, remain durably scheduled for recovery, wait on an unavailable external condition or typed request, or are explicitly cancelled by an authenticated operator or the original authorized caller. Mechanical failure, malformed output, process death, no progress, capacity limits, and retry exhaustion may change recovery strategy or cooling state, but cannot manufacture cancellation or human authority. This keeps invocation surfaces from assigning different terminal meaning to the same failure while preserving explicit human authority boundaries.

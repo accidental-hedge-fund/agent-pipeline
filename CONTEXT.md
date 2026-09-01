@@ -89,6 +89,22 @@ _Avoid_: operator sign-off, handoff answer, comment-as-accept
 
 ### Diagnostics
 
+**Supervised operation**:
+A lifecycle-affecting mutation that remains owned until it proves success, remains durably scheduled for recovery, waits on an external condition or typed request, or is explicitly cancelled by an authenticated operator or its authorized caller. Mechanical failure and retry exhaustion do not end ownership.
+_Avoid_: one-shot command, terminal-on-error operation
+
+**Decision request**:
+A choice among permitted product alternatives for which Pipeline supplies a recommendation. Policy may accept a reversible authorized default.
+_Avoid_: failure, capability request, authority request
+
+**Capability request**:
+A typed statement that progress requires an unavailable external capability, condition, or information. It requests restoration or input, not approval.
+_Avoid_: authority request, generic blocker, harness failure
+
+**Authority request**:
+A typed request for authority Pipeline does not possess, such as approval for security-sensitive, irreversible, merge/release, or human-attested action. It cannot be settled by a model-authored default.
+_Avoid_: capability request, decision request, generic needs-human
+
 **Environment-auth**:
 An operator or third-party credential failure (revoked token, login required). Not an engine defect.
 _Avoid_: workflow-engine-defect, harness-contract (as the durable theme for a 401)
