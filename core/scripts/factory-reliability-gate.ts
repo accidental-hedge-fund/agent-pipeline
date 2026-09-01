@@ -48,6 +48,7 @@ import {
 import {
   aggregateUniqueOperationReliability,
   attemptsFromRunArtifacts,
+  filterAttemptsBoundToCandidate,
   parseUniqueOperationReliability,
   REQUIRED_LIFECYCLE_CLASSES_1333,
   REQUIRED_PUBLIC_ENTRYPOINTS,
@@ -3564,8 +3565,17 @@ export interface ComputeFrgInput {
   /** Durable unique-operation attempts for the shared classifier (#1368). */
   unique_operations?: UniqueOperationAttempt[];
   unique_operation_manifest?: UniqueOperationManifest;
-  /** Precomputed section; when omitted, computed from unique_operations. */
+  /**
+   * Ignored on the production/release-eligible path. The section is always
+   * derived from durable `unique_operations` (or the test-only fixture below).
+   * A caller-supplied precomputed report cannot mint release-eligible evidence.
+   */
   operation_reliability?: UniqueOperationReliability;
+  /**
+   * Test-only fixture seam. When set, this section is used instead of
+   * aggregation and release-eligible `pass: true` is refused.
+   */
+  test_only_operation_reliability_fixture?: UniqueOperationReliability;
 }
 
 function isReadyState(state: string): boolean {
@@ -3717,20 +3727,22 @@ export function computeFrgEvidence(input: ComputeFrgInput): FrgEvidence {
     false_human_authority_count: input.false_human_authority_count ?? 0,
   });
   const packProvenance = input.pack_provenance ?? null;
+  const scoredCandidateSha =
+    packProvenance?.candidate_git_sha ??
+    input.unique_operation_manifest?.candidate_sha ??
+    "";
+  const testOnlyFixture = input.test_only_operation_reliability_fixture;
   const operationReliability =
-    input.operation_reliability ??
+    testOnlyFixture ??
     aggregateUniqueOperationReliability({
       attempts: input.unique_operations ?? [],
       manifest: {
         ...(input.unique_operation_manifest ?? {}),
-        candidate_sha:
-          packProvenance?.candidate_git_sha ??
-          input.unique_operation_manifest?.candidate_sha ??
-          "",
+        candidate_sha: scoredCandidateSha,
         release_identity: version,
       },
       composition_false_human_count: input.false_human_authority_count ?? 0,
-      candidate_sha: packProvenance?.candidate_git_sha ?? "",
+      candidate_sha: scoredCandidateSha,
       release_identity: version,
     });
   let integrity = buildFrgIntegrity(scoreboard, composition, packProvenance);
@@ -3768,7 +3780,8 @@ export function computeFrgEvidence(input: ComputeFrgInput): FrgEvidence {
     { requireAttestation: false },
   );
   // Claim pass:true only when structure is eligible and we will attach attestation.
-  const pass = structuralPass && canSign;
+  // The test-only fixture seam cannot mint release-eligible evidence.
+  const pass = structuralPass && canSign && testOnlyFixture == null;
 
   if (canSign) {
     integrity = {
@@ -4402,13 +4415,65 @@ async function readJsonlObjects(
   }
 }
 
+function mergeChildIdentity(
+  primary: Record<string, unknown> | null,
+  extras: Array<Record<string, unknown> | null>,
+): Record<string, unknown> | null {
+  const out: Record<string, unknown> = { ...(primary ?? {}) };
+  for (const extra of extras) {
+    if (!extra) continue;
+    for (const key of [
+      "logical_operation_id",
+      "candidate_sha",
+      "candidate_git_sha",
+      "parent_logical_operation_id",
+      "kind",
+      "release_identity",
+      "release_version",
+    ]) {
+      if (out[key] == null && extra[key] != null) out[key] = extra[key];
+    }
+  }
+  return Object.keys(out).length > 0 ? out : primary;
+}
+
+async function loadFollowableChildRun(
+  fsDeps: FrgFsDeps,
+  loopRunId: string,
+  eventsPath: string,
+): Promise<{
+  runId: string;
+  runJson: Record<string, unknown> | null;
+  events: Record<string, unknown>[];
+  summary: Record<string, unknown> | null;
+} | null> {
+  const dir = path.dirname(eventsPath);
+  const [runJson, contract, handoff, events, summary] = await Promise.all([
+    readJsonObjectOrNull(fsDeps, path.join(dir, "run.json")),
+    readJsonObjectOrNull(fsDeps, path.join(dir, "contract.json")),
+    readJsonObjectOrNull(fsDeps, path.join(dir, "loop-run-handoff.json")),
+    readJsonlObjects(fsDeps, eventsPath),
+    readJsonObjectOrNull(fsDeps, path.join(dir, "summary.json")),
+  ]);
+  const merged = mergeChildIdentity(runJson, [contract, handoff]);
+  if (!merged && events.length === 0 && !summary) return null;
+  return {
+    runId: loopRunId,
+    runJson: merged,
+    events,
+    summary,
+  };
+}
+
 /**
  * Classify durable run/event/summary artifacts. Missing store or unreadable
  * artifacts yield an empty attempt list (integrity failure, not a synthetic pass).
+ * Only artifacts bound to the scored candidate/release are aggregated.
  */
 async function collectUniqueOperationsFromRunStore(
   repoDir: string,
   fsDeps: FrgFsDeps,
+  binding: { candidate_sha?: string | null; release_identity?: string | null } = {},
 ): Promise<UniqueOperationAttempt[]> {
   if (!fsDeps.readdir) return [];
   const root = path.join(repoDir, ".agent-pipeline", "runs");
@@ -4424,9 +4489,11 @@ async function collectUniqueOperationsFromRunStore(
     events: Record<string, unknown>[];
     summary: Record<string, unknown> | null;
   }> = [];
+  const seen = new Set<string>();
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
     const dir = path.join(root, entry.name);
+    seen.add(entry.name);
     runs.push({
       runId: entry.name,
       runJson: await readJsonObjectOrNull(fsDeps, path.join(dir, "run.json")),
@@ -4434,7 +4501,25 @@ async function collectUniqueOperationsFromRunStore(
       summary: await readJsonObjectOrNull(fsDeps, path.join(dir, "summary.json")),
     });
   }
-  return attemptsFromRunArtifacts(runs);
+  for (const run of [...runs]) {
+    for (const event of run.events) {
+      if (event.type !== "train_loop_linked") continue;
+      const loopRunId =
+        typeof event.loop_run_id === "string" ? event.loop_run_id.trim() : "";
+      const eventsPath =
+        typeof event.events === "string" && event.events.trim()
+          ? event.events.trim()
+          : typeof event.events_path === "string"
+            ? event.events_path.trim()
+            : "";
+      if (!loopRunId || !eventsPath || seen.has(loopRunId)) continue;
+      const child = await loadFollowableChildRun(fsDeps, loopRunId, eventsPath);
+      if (!child) continue;
+      seen.add(loopRunId);
+      runs.push(child);
+    }
+  }
+  return filterAttemptsBoundToCandidate(attemptsFromRunArtifacts(runs), binding);
 }
 
 /**
@@ -4738,7 +4823,15 @@ export async function runFactoryGate(
     };
   }
   if (computeInput.unique_operations === undefined) {
-    const collected = await collectUniqueOperationsFromRunStore(opts.repoDir, fsDeps);
+    const scoredCandidateSha =
+      computeInput.pack_provenance?.candidate_git_sha ??
+      computeInput.unique_operation_manifest?.candidate_sha ??
+      opts.unique_operation_manifest?.candidate_sha ??
+      "";
+    const collected = await collectUniqueOperationsFromRunStore(opts.repoDir, fsDeps, {
+      candidate_sha: scoredCandidateSha,
+      release_identity: version,
+    });
     computeInput = {
       ...computeInput,
       unique_operations: collected,
@@ -4748,7 +4841,7 @@ export async function runFactoryGate(
         {
           required_entrypoints: [...REQUIRED_PUBLIC_ENTRYPOINTS],
           required_lifecycle_classes: [...REQUIRED_LIFECYCLE_CLASSES_1333],
-          candidate_sha: computeInput.pack_provenance?.candidate_git_sha ?? "",
+          candidate_sha: scoredCandidateSha,
           release_identity: version,
         },
     };

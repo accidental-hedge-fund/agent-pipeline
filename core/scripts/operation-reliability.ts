@@ -82,6 +82,17 @@ export interface UniqueOperationAttempt {
   /** #1301 live train_loop_linked identity present on this attempt. */
   train_loop_linked?: boolean;
   child_logical_operation_id?: string | null;
+  /** Exact child loop run id from `train_loop_linked` when followable. */
+  child_run_id?: string | null;
+  /** Exact child events path from `train_loop_linked` when followable. */
+  child_events_path?: string | null;
+  /**
+   * Authoritative candidate SHA bound on the durable artifact. Unbound
+   * attempts must not be stamped with a later FRG candidate.
+   */
+  candidate_sha?: string | null;
+  /** Release identity bound on the durable artifact when present. */
+  release_identity?: string | null;
   /** Fixture / operation id used to look up manifest-declared expected outcomes. */
   fixture_id?: string | null;
   manual_reinvocation?: boolean;
@@ -133,6 +144,10 @@ export interface UniqueOperationEvidenceRef {
   entrypoints: string[];
   evidence_refs: string[];
   manual_reinvocation: boolean;
+  /** Per-operation candidate binding copied from durable artifacts, never stamped later. */
+  candidate_sha?: string;
+  /** Per-operation release binding copied from durable artifacts when present. */
+  release_identity?: string;
 }
 
 export interface UniqueOperationReliability {
@@ -247,6 +262,9 @@ export function aggregateUniqueOperationReliability(input: {
   let contradictoryCorrelation = 0;
   const observedEntrypoints = new Set<string>();
   const coveredLifecycle = new Set<string>(manifest.covered_lifecycle_classes ?? []);
+  const scoredSha = (manifest.candidate_sha ?? input.candidate_sha ?? "").trim();
+  const scoredRelease = (manifest.release_identity ?? input.release_identity ?? "").trim();
+
   const byId = new Map<
     string,
     {
@@ -261,10 +279,23 @@ export function aggregateUniqueOperationReliability(input: {
       train_loop_linked: boolean;
       child_ids: string[];
       fixture_ids: string[];
+      candidate_sha: string;
+      release_identity: string;
     }
   >();
 
   for (const attempt of input.attempts) {
+    const attemptSha =
+      typeof attempt.candidate_sha === "string" ? attempt.candidate_sha.trim() : "";
+    const attemptRelease =
+      typeof attempt.release_identity === "string" ? attempt.release_identity.trim() : "";
+    // Other-candidate artifacts must not satisfy the scored candidate's SLOs.
+    if (scoredSha && attemptSha && attemptSha !== scoredSha) {
+      continue;
+    }
+    if (scoredRelease && attemptRelease && attemptRelease !== scoredRelease) {
+      continue;
+    }
     const id = typeof attempt.logical_operation_id === "string" ? attempt.logical_operation_id.trim() : "";
     if (!id) {
       missingCorrelation += 1;
@@ -297,9 +328,13 @@ export function aggregateUniqueOperationReliability(input: {
       train_loop_linked: false,
       child_ids: [],
       fixture_ids: [],
+      candidate_sha: "",
+      release_identity: "",
     };
     if (!entry.run_ids.includes(attempt.run_id)) entry.run_ids.push(attempt.run_id);
     entry.terminals.push(classifyAttempt(attempt));
+    if (attemptSha && !entry.candidate_sha) entry.candidate_sha = attemptSha;
+    if (attemptRelease && !entry.release_identity) entry.release_identity = attemptRelease;
     // A logical operation is nested only when every physical attempt is nested.
     if (attempt.nested !== true) entry.nested = false;
     if (typeof attempt.entrypoint === "string" && attempt.entrypoint.trim()) {
@@ -310,6 +345,12 @@ export function aggregateUniqueOperationReliability(input: {
       for (const ref of attempt.evidence_refs) entry.evidence_refs.push(ref);
     } else {
       entry.evidence_refs.push(`run:${attempt.run_id}`);
+    }
+    if (attemptSha && !entry.evidence_refs.includes(`candidate:${attemptSha}`)) {
+      entry.evidence_refs.push(`candidate:${attemptSha}`);
+    }
+    if (attemptRelease && !entry.evidence_refs.includes(`release:${attemptRelease}`)) {
+      entry.evidence_refs.push(`release:${attemptRelease}`);
     }
     if (attempt.manual_reinvocation === true) entry.manual_reinvocation = true;
     if (attempt.exact_candidate_recovery === true) entry.exact_candidate_recovery.push(true);
@@ -350,14 +391,19 @@ export function aggregateUniqueOperationReliability(input: {
     const hasWait = entry.terminals.includes("external_wait");
     const hasTyped = entry.terminals.includes("typed_request");
     const hasCancel = entry.terminals.includes("cancellation");
+    const hasOwnerless = entry.terminals.includes("ownerless_terminal");
+    const hasPermittedNonSuccess = hasCooling || hasWait || hasTyped || hasCancel;
+    // A later verified proof must not erase an unresolved ownerless exit.
+    const unresolvedOwnerless = hasOwnerless && !hasPermittedNonSuccess;
     let terminal: UniqueOperationTerminal | "unknown";
     if (hasFalseHuman) terminal = "false_human_projection";
+    else if (unresolvedOwnerless) terminal = "ownerless_terminal";
     else if (hasVerified) terminal = "verified_success";
     else if (hasCooling) terminal = "cooling_recovery";
     else if (hasWait) terminal = "external_wait";
     else if (hasTyped) terminal = "typed_request";
     else if (hasCancel) terminal = "cancellation";
-    else if (entry.terminals.includes("ownerless_terminal")) terminal = "ownerless_terminal";
+    else if (hasOwnerless) terminal = "ownerless_terminal";
     else terminal = "unknown";
 
     if (terminal === "unknown") terminal = "ownerless_terminal";
@@ -370,9 +416,12 @@ export function aggregateUniqueOperationReliability(input: {
       entrypoints: [...new Set(entry.entrypoints)],
       evidence_refs: [...entry.evidence_refs],
       manual_reinvocation: entry.manual_reinvocation,
+      ...(entry.candidate_sha ? { candidate_sha: entry.candidate_sha } : {}),
+      ...(entry.release_identity ? { release_identity: entry.release_identity } : {}),
     });
 
-    if (entry.train_loop_linked && (entry.child_ids.length === 0 || entry.child_ids.includes(id))) {
+    // Live train linkage requires a followable child that inherited this id.
+    if (entry.train_loop_linked && entry.child_ids.includes(id)) {
       liveLinkage = true;
     }
 
@@ -394,7 +443,9 @@ export function aggregateUniqueOperationReliability(input: {
       });
     } else if (!entry.nested) {
       cleanEligible += 1;
-      if (hasVerified && !entry.manual_reinvocation) cleanSuccess += 1;
+      if (hasVerified && !entry.manual_reinvocation && !unresolvedOwnerless) {
+        cleanSuccess += 1;
+      }
     }
 
     if (entry.exact_candidate_recovery.length > 0) {
@@ -425,8 +476,8 @@ export function aggregateUniqueOperationReliability(input: {
   }
 
   const uniqueCount = byId.size;
-  const candidateSha = (manifest.candidate_sha ?? input.candidate_sha ?? "").trim();
-  const releaseIdentity = (manifest.release_identity ?? input.release_identity ?? "").trim();
+  const candidateSha = scoredSha;
+  const releaseIdentity = scoredRelease;
   const manifestFingerprint = uniqueOperationManifestFingerprint({
     expected_outcomes: expectedOutcomes,
     required_entrypoints: requiredEntrypoints,
@@ -560,15 +611,87 @@ export function uniqueOperationReleaseBindingFailure(
   return null;
 }
 
+type ScannedRunArtifact = {
+  runId: string;
+  runJson: Record<string, unknown> | null;
+  events: readonly Record<string, unknown>[];
+  summary: Record<string, unknown> | null;
+};
+
+function artifactLogicalId(run: ScannedRunArtifact): string | null {
+  const start = run.events.find((e) => e.type === "run_start");
+  return (
+    uniqueNonEmpty([
+      run.runJson?.logical_operation_id,
+      run.summary?.logical_operation_id,
+      start?.logical_operation_id,
+    ])[0] ?? null
+  );
+}
+
+function artifactCandidateSha(run: ScannedRunArtifact): string | null {
+  const sources = uniqueNonEmpty([
+    run.runJson?.candidate_sha,
+    run.runJson?.candidate_git_sha,
+    run.summary?.candidate_sha,
+    run.summary?.candidate_git_sha,
+    ...run.events.map((e) => e.candidate_sha),
+    ...run.events.map((e) => e.candidate_git_sha),
+  ]);
+  return sources.length === 1 ? sources[0]! : null;
+}
+
+function artifactReleaseIdentity(run: ScannedRunArtifact): string | null {
+  const sources = uniqueNonEmpty([
+    run.runJson?.release_identity,
+    run.runJson?.release_version,
+    run.summary?.release_identity,
+    run.summary?.release_version,
+    ...run.events.map((e) => e.release_identity),
+    ...run.events.map((e) => e.release_version),
+  ]);
+  return sources.length === 1 ? sources[0]! : null;
+}
+
+function trainLinkedEventRefs(event: Record<string, unknown>): {
+  loopRunId: string | null;
+  eventsPath: string | null;
+} {
+  return {
+    loopRunId: nonEmptyTrimmed(event.loop_run_id),
+    eventsPath: nonEmptyTrimmed(event.events) ?? nonEmptyTrimmed(event.events_path),
+  };
+}
+
+/**
+ * Keep only attempts bound to the scored candidate/release. Other-candidate
+ * and unbound artifacts are omitted so they cannot satisfy the current gate.
+ * When `candidate_sha` is empty, the list is returned unchanged (scoreboard).
+ */
+export function filterAttemptsBoundToCandidate(
+  attempts: readonly UniqueOperationAttempt[],
+  binding: { candidate_sha?: string | null; release_identity?: string | null },
+): UniqueOperationAttempt[] {
+  const scoredSha = (binding.candidate_sha ?? "").trim();
+  const scoredRelease = (binding.release_identity ?? "").trim();
+  if (!scoredSha) return [...attempts];
+  return attempts.filter((attempt) => {
+    const sha =
+      typeof attempt.candidate_sha === "string" ? attempt.candidate_sha.trim() : "";
+    if (sha !== scoredSha) return false;
+    const release =
+      typeof attempt.release_identity === "string" ? attempt.release_identity.trim() : "";
+    if (scoredRelease && release && release !== scoredRelease) return false;
+    return true;
+  });
+}
+
 /** Map scanned run artifacts into classifier attempts. Does not invent ids. */
 export function attemptsFromRunArtifacts(
-  runs: readonly {
-    runId: string;
-    runJson: Record<string, unknown> | null;
-    events: readonly Record<string, unknown>[];
-    summary: Record<string, unknown> | null;
-  }[],
+  runs: readonly ScannedRunArtifact[],
 ): UniqueOperationAttempt[] {
+  const byId = new Map<string, ScannedRunArtifact>();
+  for (const run of runs) byId.set(run.runId, run);
   return runs.map((run) => {
     const start = run.events.find((e) => e.type === "run_start");
     const identitySources = uniqueNonEmpty([
@@ -590,11 +713,31 @@ export function attemptsFromRunArtifacts(
       run.events.some((e) => e.type === "verified_completion" || e.exact_candidate_proof === true);
     const entrypoint =
       mapPublicEntrypoint(start?.entrypoint) ?? mapPublicEntrypoint(run.runJson?.kind);
-    const trainLinked = run.events.some((e) => e.type === "train_loop_linked");
-    const childId = run.events
-      .filter((e) => e.type === "train_loop_linked")
-      .map((e) => (typeof e.logical_operation_id === "string" ? e.logical_operation_id : null))
-      .find((v) => v);
+    let trainLinked = false;
+    let childLogical: string | null = null;
+    let childRunId: string | null = null;
+    let childEventsPath: string | null = null;
+    for (const event of run.events) {
+      if (event.type !== "train_loop_linked") continue;
+      const refs = trainLinkedEventRefs(event);
+      if (!refs.loopRunId || !refs.eventsPath) continue;
+      const child = byId.get(refs.loopRunId);
+      if (!child) continue;
+      const childId = artifactLogicalId(child);
+      if (!logical || !childId || childId !== logical) continue;
+      trainLinked = true;
+      childLogical = childId;
+      childRunId = refs.loopRunId;
+      childEventsPath = refs.eventsPath;
+      break;
+    }
+    const candidateSha = artifactCandidateSha(run);
+    const releaseIdentity = artifactReleaseIdentity(run);
+    const evidenceRefs = [`run:${run.runId}`];
+    if (candidateSha) evidenceRefs.push(`candidate:${candidateSha}`);
+    if (releaseIdentity) evidenceRefs.push(`release:${releaseIdentity}`);
+    if (childRunId) evidenceRefs.push(`child-run:${childRunId}`);
+    if (childEventsPath) evidenceRefs.push(`child-events:${childEventsPath}`);
     return {
       run_id: run.runId,
       logical_operation_id: logical,
@@ -609,8 +752,12 @@ export function attemptsFromRunArtifacts(
         run.summary?.finalState === "ready-to-deploy" ||
         run.summary?.final_state === "ready-to-deploy",
       train_loop_linked: trainLinked,
-      child_logical_operation_id: childId ?? (trainLinked ? logical : null),
-      evidence_refs: [`run:${run.runId}`],
+      child_logical_operation_id: childLogical,
+      child_run_id: childRunId,
+      child_events_path: childEventsPath,
+      candidate_sha: candidateSha,
+      release_identity: releaseIdentity,
+      evidence_refs: evidenceRefs,
       contradictory_identity: contradictoryIdentity,
     };
   });

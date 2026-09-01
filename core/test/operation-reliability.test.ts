@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import {
   aggregateUniqueOperationReliability,
   attemptsFromRunArtifacts,
+  filterAttemptsBoundToCandidate,
   passingUniqueOperationAttempts,
   passingUniqueOperationManifest,
   reconcileCompletedSideEffect,
@@ -640,6 +641,322 @@ test("runFactoryGate without unique_operations cannot pass from absent durable e
   );
   assert.equal(result.evidence.pass, false);
   assert.ok(result.evidence.operation_reliability);
+  assert.ok(result.evidence.operation_reliability!.integrity.missing_required_coverage > 0);
+  assert.equal(isReleaseEligibleFrgPass(result.evidence), false);
+});
+
+test("aggregator: other-candidate attempts do not satisfy the scored candidate", () => {
+  const staleSha = "b".repeat(40);
+  const scoredSha = "a".repeat(40);
+  const report = aggregateUniqueOperationReliability({
+    attempts: [
+      {
+        run_id: "old-train",
+        logical_operation_id: "lop-old",
+        nested: false,
+        postcondition_proof: true,
+        entrypoint: "train",
+        train_loop_linked: true,
+        child_logical_operation_id: "lop-old",
+        candidate_sha: staleSha,
+        covered_lifecycle_classes: ["mechanical", "workflow", "infrastructure", "authentication", "unknown"],
+      },
+    ],
+    manifest: {
+      required_entrypoints: ["train"],
+      required_lifecycle_classes: ["mechanical"],
+      candidate_sha: scoredSha,
+      live_train_linkage_present: false,
+    },
+    candidate_sha: scoredSha,
+  });
+  assert.equal(report.operations.length, 0);
+  assert.equal(report.clean_completion.numerator, 0);
+  assert.ok(report.integrity.missing_required_coverage > 0);
+  assert.equal(report.candidate_sha, scoredSha);
+});
+
+test("filterAttemptsBoundToCandidate: drops unbound and other-candidate artifacts", () => {
+  const scored = "a".repeat(40);
+  const kept = filterAttemptsBoundToCandidate(
+    [
+      { run_id: "match", logical_operation_id: "L", candidate_sha: scored, postcondition_proof: true },
+      { run_id: "stale", logical_operation_id: "L2", candidate_sha: "b".repeat(40), postcondition_proof: true },
+      { run_id: "unbound", logical_operation_id: "L3", postcondition_proof: true },
+    ],
+    { candidate_sha: scored },
+  );
+  assert.deepEqual(kept.map((a) => a.run_id), ["match"]);
+});
+
+test("attemptsFromRunArtifacts: extracts candidate binding into evidence refs", () => {
+  const sha = "c".repeat(40);
+  const attempts = attemptsFromRunArtifacts([
+    {
+      runId: "bound",
+      runJson: { run_id: "bound", logical_operation_id: "L", candidate_sha: sha, kind: "single" },
+      events: [{ type: "run_start", logical_operation_id: "L", entrypoint: "single" }],
+      summary: { verified_completion: true, logical_operation_id: "L", candidate_sha: sha },
+    },
+  ]);
+  assert.equal(attempts[0]!.candidate_sha, sha);
+  assert.ok(attempts[0]!.evidence_refs?.includes(`candidate:${sha}`));
+});
+
+test("aggregator: later verified attempt does not erase an unresolved ownerless terminal", () => {
+  const report = aggregateUniqueOperationReliability({
+    attempts: [
+      { run_id: "crash", logical_operation_id: "lop-L", nested: false, entrypoint: "single" },
+      {
+        run_id: "retry",
+        logical_operation_id: "lop-L",
+        nested: false,
+        postcondition_proof: true,
+        entrypoint: "single",
+      },
+    ],
+    manifest: { required_entrypoints: [], required_lifecycle_classes: [], live_train_linkage_present: true },
+  });
+  assert.equal(report.operations[0]!.terminal, "ownerless_terminal");
+  assert.equal(report.ownerless_terminal.numerator, 1);
+  assert.equal(report.clean_completion.numerator, 0);
+});
+
+test("aggregator: ownerless then durable cooling then verified is recovered success", () => {
+  const report = aggregateUniqueOperationReliability({
+    attempts: [
+      { run_id: "crash", logical_operation_id: "lop-L", nested: false, entrypoint: "single" },
+      {
+        run_id: "cool",
+        logical_operation_id: "lop-L",
+        nested: false,
+        terminal: "cooling_recovery",
+        entrypoint: "single",
+      },
+      {
+        run_id: "retry",
+        logical_operation_id: "lop-L",
+        nested: false,
+        postcondition_proof: true,
+        entrypoint: "single",
+      },
+    ],
+    manifest: { required_entrypoints: [], required_lifecycle_classes: [], live_train_linkage_present: true },
+  });
+  assert.equal(report.operations[0]!.terminal, "verified_success");
+  assert.equal(report.ownerless_terminal.numerator, 0);
+  assert.equal(report.clean_completion.numerator, 1);
+});
+
+test("attemptsFromRunArtifacts: train_loop_linked without followable child is not live linkage", () => {
+  const parentOnly = attemptsFromRunArtifacts([
+    {
+      runId: "train-1",
+      runJson: { run_id: "train-1", kind: "train", logical_operation_id: "lop-train" },
+      events: [
+        { type: "run_start", entrypoint: "train", logical_operation_id: "lop-train" },
+        { type: "train_loop_linked", logical_operation_id: "lop-train" },
+      ],
+      summary: { verified_completion: true, logical_operation_id: "lop-train" },
+    },
+  ]);
+  assert.equal(parentOnly[0]!.train_loop_linked, false);
+  assert.equal(parentOnly[0]!.child_logical_operation_id, null);
+
+  const missingChild = attemptsFromRunArtifacts([
+    {
+      runId: "train-2",
+      runJson: { run_id: "train-2", kind: "train", logical_operation_id: "lop-train" },
+      events: [
+        {
+          type: "train_loop_linked",
+          logical_operation_id: "lop-train",
+          loop_run_id: "loop-missing",
+          events: "/state/runs/loop-missing/events.jsonl",
+        },
+      ],
+      summary: null,
+    },
+  ]);
+  assert.equal(missingChild[0]!.train_loop_linked, false);
+
+  const followable = attemptsFromRunArtifacts([
+    {
+      runId: "train-3",
+      runJson: { run_id: "train-3", kind: "train", logical_operation_id: "lop-train" },
+      events: [
+        {
+          type: "train_loop_linked",
+          logical_operation_id: "lop-train",
+          loop_run_id: "loop-child",
+          events: "/state/runs/loop-child/events.jsonl",
+        },
+      ],
+      summary: { verified_completion: true, logical_operation_id: "lop-train" },
+    },
+    {
+      runId: "loop-child",
+      runJson: { run_id: "loop-child", kind: "loop", logical_operation_id: "lop-train" },
+      events: [{ type: "run_start", entrypoint: "loop", logical_operation_id: "lop-train" }],
+      summary: { logical_operation_id: "lop-train" },
+    },
+  ]);
+  assert.equal(followable[0]!.train_loop_linked, true);
+  assert.equal(followable[0]!.child_logical_operation_id, "lop-train");
+  assert.equal(followable[0]!.child_run_id, "loop-child");
+
+  const report = aggregateUniqueOperationReliability({
+    attempts: parentOnly,
+    manifest: { required_entrypoints: ["train"], required_lifecycle_classes: [], live_train_linkage_present: false },
+  });
+  assert.ok(report.integrity.missing_required_coverage > 0);
+});
+
+test("computeFrgEvidence: caller-supplied operation_reliability is not durable proof", () => {
+  const honest = computeFrgEvidence(packInput());
+  assert.equal(honest.pass, true);
+  const spoofed = computeFrgEvidence(
+    packInput({
+      unique_operations: [],
+      operation_reliability: honest.operation_reliability,
+    }),
+  );
+  assert.equal(spoofed.pass, false);
+  assert.ok(spoofed.operation_reliability!.integrity.missing_required_coverage > 0);
+  assert.notEqual(
+    spoofed.operation_reliability!.clean_completion.numerator,
+    honest.operation_reliability!.clean_completion.numerator,
+  );
+  const fixtureOnly = computeFrgEvidence(
+    packInput({
+      unique_operations: [],
+      test_only_operation_reliability_fixture: honest.operation_reliability,
+    }),
+  );
+  assert.equal(fixtureOnly.pass, false);
+  assert.equal(isReleaseEligibleFrgPass(fixtureOnly), false);
+});
+
+test("runFactoryGate: stale-candidate run-store artifacts cannot pass the current candidate", async () => {
+  const files = new Map<string, string>();
+  const staleSha = "b".repeat(40);
+  const scoredSha = "a".repeat(40);
+  const runRoot = "/repo/.agent-pipeline/runs";
+  for (const entrypoint of ["drive", "single", "loop", "train", "merge", "merge-queue", "ship"]) {
+    const dir = `${runRoot}/old-${entrypoint}`;
+    files.set(
+      `${dir}/run.json`,
+      JSON.stringify({
+        run_id: `old-${entrypoint}`,
+        kind: entrypoint,
+        logical_operation_id: "lop-stale",
+        candidate_sha: staleSha,
+      }),
+    );
+    const events = [
+      { type: "run_start", entrypoint, logical_operation_id: "lop-stale" },
+      { type: "verified_completion", exact_candidate_proof: true },
+    ];
+    if (entrypoint === "train") {
+      events.push({
+        type: "train_loop_linked",
+        logical_operation_id: "lop-stale",
+        loop_run_id: "old-loop",
+        events: `${runRoot}/old-loop/events.jsonl`,
+      });
+    }
+    files.set(`${dir}/events.jsonl`, events.map((e) => JSON.stringify(e)).join("\n"));
+    files.set(
+      `${dir}/summary.json`,
+      JSON.stringify({
+        verified_completion: true,
+        logical_operation_id: "lop-stale",
+        candidate_sha: staleSha,
+      }),
+    );
+  }
+  files.set(
+    `${runRoot}/old-loop/run.json`,
+    JSON.stringify({
+      run_id: "old-loop",
+      kind: "loop",
+      logical_operation_id: "lop-stale",
+      candidate_sha: staleSha,
+    }),
+  );
+  files.set(
+    `${runRoot}/old-loop/events.jsonl`,
+    JSON.stringify({ type: "run_start", entrypoint: "loop", logical_operation_id: "lop-stale" }),
+  );
+  files.set(
+    `${runRoot}/old-loop/loop-run-handoff.json`,
+    JSON.stringify({
+      kind: "loop_run_handoff",
+      run_id: "old-loop",
+      events: `${runRoot}/old-loop/events.jsonl`,
+      logical_operation_id: "lop-stale",
+      candidate_sha: staleSha,
+    }),
+  );
+  const fs: FrgFsDeps = {
+    async readFile(p) {
+      const v = files.get(p);
+      if (v === undefined) {
+        const err = new Error(`ENOENT: ${p}`) as NodeJS.ErrnoException;
+        err.code = "ENOENT";
+        throw err;
+      }
+      return v;
+    },
+    async writeFile(p, data) {
+      files.set(p, data);
+    },
+    async mkdir() {},
+    async rename(from, to) {
+      const v = files.get(from);
+      if (v === undefined) throw new Error(`ENOENT rename ${from}`);
+      files.set(to, v);
+      files.delete(from);
+    },
+    async readdir(p) {
+      const prefix = p.endsWith("/") ? p : `${p}/`;
+      const names = new Set<string>();
+      for (const key of files.keys()) {
+        if (!key.startsWith(prefix)) continue;
+        const name = key.slice(prefix.length).split("/")[0];
+        if (name) names.add(name);
+      }
+      return [...names].map((name) => ({ name, isDirectory: () => true }));
+    },
+  };
+  const result = await runFactoryGate(
+    {
+      version: "1.29.1",
+      repoDir: "/repo",
+      scoreInput: {
+        version: "1.29.1",
+        run_id: "frg-stale-mix",
+        loop_run_id: "loop-full-pass",
+        pack_id: FRG_PACK_MANIFEST.pack_id,
+        items: [
+          { item_id: "1", state: "ready", ready_clean: true },
+          { item_id: "2", state: "ready", ready_clean: true },
+        ],
+        scenario_overrides: frgRequiredObservationOverrides("pass"),
+        composition_overrides: frgRequiredCompositionOverrides("pass"),
+        attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
+        unique_operation_manifest: passingUniqueOperationManifest({
+          release_identity: "1.29.1",
+          candidate_sha: scoredSha,
+        }),
+      },
+      stdout: () => {},
+      stderr: () => {},
+    },
+    fs,
+  );
+  assert.equal(result.evidence.pass, false);
+  assert.equal(result.evidence.operation_reliability!.operations.length, 0);
   assert.ok(result.evidence.operation_reliability!.integrity.missing_required_coverage > 0);
   assert.equal(isReleaseEligibleFrgPass(result.evidence), false);
 });

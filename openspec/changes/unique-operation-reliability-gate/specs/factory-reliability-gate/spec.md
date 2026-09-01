@@ -15,6 +15,20 @@ Release-eligible FRG evidence with `pass: true` SHALL include a versioned `opera
 - **AND** correlated durable evidence for those logical operations is missing
 - **THEN** the driver SHALL NOT treat label or closure state as verified unique-operation completion
 
+#### Scenario: Stale-candidate run-store artifacts are not current-candidate proof
+
+- **WHEN** durable run-store artifacts carry a candidate SHA other than the scored FRG candidate
+- **OR** they lack an authoritative candidate SHA while a scored candidate is bound
+- **THEN** those artifacts SHALL NOT satisfy unique-operation coverage, verified-completion numerators, or train linkage for the scored candidate
+- **AND** the driver SHALL NOT stamp the current pack provenance onto unbound or other-candidate operations as if they were scored-candidate proof
+
+#### Scenario: Caller-supplied operation_reliability is not durable proof
+
+- **WHEN** a caller provides a precomputed `operation_reliability` object
+- **AND** durable run, event, loop-store, and handoff evidence was not aggregated into that section
+- **THEN** the driver SHALL NOT treat the supplied object as release-eligible unique-operation evidence
+- **AND** offline `scoreInput` SHALL remain fail-closed
+
 ---
 
 ### Requirement: Unmet unique-operation SLOs SHALL fail FRG promotion and release preparation
@@ -63,6 +77,7 @@ Release-eligible FRG pass SHALL require the #1301 live train-loop linkage, colli
 - **WHEN** a train-driven nested loop has no followable `train_loop_linked` identity from the child `onRunReady` handoff
 - **THEN** FRG promotion SHALL fail as missing correlation or missing required coverage
 - **AND** the driver SHALL NOT guess the child run by latest-run lookup
+- **AND** a `train_loop_linked` event that carries only the parent logical id SHALL NOT count as followable child linkage
 
 ---
 

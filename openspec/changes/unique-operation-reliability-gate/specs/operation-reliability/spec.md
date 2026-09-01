@@ -96,6 +96,14 @@ Every admitted supervised operation SHALL end as exactly one of: verified succes
 - **AND** SHALL NOT become an Ownerless terminal
 - **AND** SHALL NOT become a False-human projection
 
+#### Scenario: Later verified proof does not erase an unresolved ownerless terminal
+
+- **WHEN** a logical operation has a physical attempt that ends ownerless
+- **AND** no durable cooling, recovery, external wait, typed request, or cancellation links that attempt
+- **AND** a later physical attempt records verified completion
+- **THEN** ownerless-terminal count SHALL be greater than zero
+- **AND** the operation SHALL NOT be scored as clean unique-operation success from that later proof alone
+
 #### Scenario: Legitimate typed request is not a false-human projection
 
 - **WHEN** a genuine Decision Request, Capability Request, or Authority Request is recorded with a matching condition

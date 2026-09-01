@@ -15,3 +15,9 @@
 - **WHEN** a later wave result confirms the same child loop already linked
 - **THEN** the confirmed identity SHALL match the original `logical_operation_id`
 - **AND** SHALL NOT replace it with a guessed run
+
+#### Scenario: Train event without followable child is not live linkage
+
+- **WHEN** a `train_loop_linked` event includes the parent `logical_operation_id` but omits a followable child loop `run_id` and events path, or the referenced child handoff or contract is missing or stores a different logical id
+- **THEN** live train-loop linkage SHALL be absent
+- **AND** FRG promotion SHALL fail as missing required coverage or missing correlation
