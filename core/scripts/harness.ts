@@ -287,6 +287,17 @@ export interface HarnessResult {
    */
   preflight_failed?: boolean;
   /**
+   * The signal that terminated the child process, when Node's `close` event
+   * reports `code: null` (a signal-terminated exit, not a normal one). Node's
+   * `ChildProcess` `close` event carries this as its second argument, which
+   * was previously dropped on the floor — every signal-terminated failure
+   * collapsed into the same opaque `exit_code: -1` with no way to tell a
+   * SIGKILL from a SIGSEGV from anything else. Absent when the process exited
+   * normally, or when the failure came from a pre-spawn path (`spawn_error`)
+   * that never produced a `close` event at all.
+   */
+  termination_signal?: string;
+  /**
    * Structured production preflight failure class when `preflight_failed` is
    * true (#636). Includes adapter preflight classes plus prompt-limit /
    * role-ineligible / missing-executable.
@@ -1498,7 +1509,7 @@ export async function runCapped(
       });
     });
 
-    child.on("close", (code) => {
+    child.on("close", (code, signal) => {
       lastExitCode = code;
       // When timed out, the direct child exiting is not sufficient — grandchildren
       // that ignored SIGTERM may still be alive. Defer to the SIGKILL timer above.
@@ -1518,13 +1529,21 @@ export async function runCapped(
         }
       }
       const duration = (Date.now() - start) / 1000;
+      // code === null means the process was signal-terminated, not that it
+      // ran and returned -1 — surface the signal (when known) in stderr too,
+      // since callers building a blocker message currently render only
+      // `exit ${result.exit_code}` and would otherwise show a bare "exit -1"
+      // with no way to tell a SIGKILL from a SIGSEGV from anything else.
+      const signalNote =
+        code === null && signal ? `[harness ${label}] process terminated by signal ${signal}\n` : "";
       const result: HarnessResult = {
         success: code === 0,
         stdout: stdoutBuf,
-        stderr: stderrBuf,
+        stderr: signalNote + stderrBuf,
         exit_code: code ?? -1,
         duration,
         timed_out: false,
+        ...(signal ? { termination_signal: signal } : {}),
       };
       settle(result);
     });

@@ -1089,7 +1089,7 @@ export async function runPlanningPhases(
     if (!revisionResult.success) {
       const reason = revisionResult.timed_out
         ? `Plan revision timed out after ${revisionResult.duration.toFixed(0)}s`
-        : `Plan revision failed (exit ${revisionResult.exit_code})`;
+        : `Plan revision failed (exit ${revisionResult.exit_code})${formatStderrExcerpt(revisionResult.stderr)}`;
       await doSetBlocked(cfg, issueNumber, `Plan revision by ${primary} failed: ${reason}`, "plan-review", "harness-failure");
       await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
       return blockedOutcome(reason, "harness-failure");
@@ -1110,7 +1110,7 @@ export async function runPlanningPhases(
         if (!repairResult.success) {
           const reason = repairResult.timed_out
             ? `Plan revision format-repair timed out after ${repairResult.duration.toFixed(0)}s`
-            : `Plan revision format-repair failed (exit ${repairResult.exit_code})`;
+            : `Plan revision format-repair failed (exit ${repairResult.exit_code})${formatStderrExcerpt(repairResult.stderr)}`;
           return { success: false, reason };
         }
         revisionResult = repairResult;
@@ -1364,7 +1364,7 @@ export async function runPlanningPhases(
         }
         const reason = result.timed_out
           ? `timed out after ${result.duration.toFixed(0)}s`
-          : `exit ${result.exit_code}`;
+          : `exit ${result.exit_code}${formatStderrExcerpt(result.stderr)}`;
 
         // #547 salvage / #1246 checkpoint / #1272 unpublished publish:
         // a timeout that left recovered work must consult the shared
@@ -1850,7 +1850,7 @@ export function makeFreeformPlanningHooks(cfg: PipelineConfig, title: string, bo
       if (!planResult.success || !planResult.stdout.trim()) {
         const reason = planResult.timed_out
           ? `Plan generation timed out after ${planResult.duration.toFixed(0)}s`
-          : `Plan generation failed (exit ${planResult.exit_code})`;
+          : `Plan generation failed (exit ${planResult.exit_code})${formatStderrExcerpt(planResult.stderr)}`;
         return { ok: false, reason, tag: "harness-failure" };
       }
       return {
@@ -1998,7 +1998,7 @@ export function makeOpenspecPlanningHooks(
       if (!planResult.success) {
         const reason = planResult.timed_out
           ? `Plan generation timed out after ${planResult.duration.toFixed(0)}s`
-          : `Plan generation failed (exit ${planResult.exit_code})`;
+          : `Plan generation failed (exit ${planResult.exit_code})${formatStderrExcerpt(planResult.stderr)}`;
         return {
           ok: false,
           reason,
@@ -2073,7 +2073,7 @@ export function makeOpenspecPlanningHooks(
           if (!repairResult.success) {
             const reason = repairResult.timed_out
               ? `OpenSpec authoring format-repair timed out after ${repairResult.duration.toFixed(0)}s`
-              : `OpenSpec authoring format-repair failed (exit ${repairResult.exit_code})`;
+              : `OpenSpec authoring format-repair failed (exit ${repairResult.exit_code})${formatStderrExcerpt(repairResult.stderr)}`;
             return { success: false, reason };
           }
           authorSalvageLatest = await salvageIfNoNewCommit(
