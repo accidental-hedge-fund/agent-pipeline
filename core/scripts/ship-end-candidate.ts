@@ -8,6 +8,13 @@
 import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+  defaultPrepareCandidateEngineDeps,
+  prepareCandidateEngine,
+  type PrepareCandidateEngineDeps,
+  type ResolveAndPrepareDeps,
+} from "./candidate-engine-readiness.ts";
 import { parseExactGitSha } from "./ship-end-identity.ts";
 
 export const CANDIDATE_WORKTREE_PREFIX = "ship-candidate-";
@@ -20,9 +27,11 @@ export interface CandidateEngine {
   commitSha: string;
 }
 
+export type CandidateEngineFailureKind = "identity" | "readiness" | "lock";
+
 export type CandidateEngineResult =
   | { ok: true; engine: CandidateEngine }
-  | { ok: false; error: string };
+  | { ok: false; error: string; kind?: CandidateEngineFailureKind };
 
 export interface ResolveCandidateEngineDeps {
   isDirectory(p: string): boolean;
@@ -80,10 +89,10 @@ export function resolveCandidateEngine(
 ): CandidateEngineResult {
   const sha = parseExactGitSha(opts.candidateSha);
   if (!sha) {
-    return { ok: false, error: "candidate SHA is not an exact 40-hex git OID" };
+    return { ok: false, kind: "identity", error: "candidate SHA is not an exact 40-hex git OID" };
   }
   if (!isSafeAbsoluteDir(opts.repoDir)) {
-    return { ok: false, error: "REPO_DIR must be an absolute directory" };
+    return { ok: false, kind: "identity", error: "REPO_DIR must be an absolute directory" };
   }
   const repoDir = path.resolve(opts.repoDir);
   const worktree = path.join(repoDir, ".worktrees", `${CANDIDATE_WORKTREE_PREFIX}${sha}`);
@@ -94,6 +103,7 @@ export function resolveCandidateEngine(
     if (!isSafeAbsoluteDir(explicit)) {
       return {
         ok: false,
+        kind: "identity",
         error: "PIPELINE_CANDIDATE_ENGINE_ROOT must be an absolute directory",
       };
     }
@@ -114,9 +124,39 @@ export function resolveCandidateEngine(
 
   return {
     ok: false,
+    kind: "identity",
     error:
       `cannot resolve candidate engine at ${sha}: need a clean checkout at that SHA ` +
       `(REPO_DIR, ${worktree}, or PIPELINE_CANDIDATE_ENGINE_ROOT)`,
+  };
+}
+
+export type ResolveAndPrepareCandidateEngineDeps = ResolveCandidateEngineDeps &
+  PrepareCandidateEngineDeps;
+
+/**
+ * Shared resolve-and-prepare seam (#1344). Selects an exact-SHA clean root,
+ * proves nested-core readiness, revalidates SHA and porcelain, then returns a
+ * spawnable engine. Identity-only {@link resolveCandidateEngine} does not
+ * authorize spawn.
+ */
+export async function resolveAndPrepareCandidateEngine(
+  opts: {
+    repoDir: string;
+    candidateSha: string;
+    candidateEngineRootEnv?: string | null;
+  },
+  deps: ResolveAndPrepareCandidateEngineDeps,
+): Promise<CandidateEngineResult> {
+  const resolved = resolveCandidateEngine(opts, deps);
+  if (!resolved.ok) return resolved;
+  return prepareCandidateEngine(resolved.engine, deps as ResolveAndPrepareDeps);
+}
+
+export function defaultResolveAndPrepareDeps(): ResolveAndPrepareCandidateEngineDeps {
+  return {
+    ...defaultResolveCandidateEngineDeps(),
+    ...defaultPrepareCandidateEngineDeps(),
   };
 }
 
@@ -378,4 +418,53 @@ export function pinShaDiffersFromCandidate(
   const cand = parseExactGitSha(candidateSha);
   if (!cand) return true;
   return pin !== cand;
+}
+
+function cliArg(argv: string[], name: string): string | undefined {
+  const i = argv.indexOf(name);
+  if (i < 0 || i + 1 >= argv.length) return undefined;
+  return argv[i + 1];
+}
+
+function isDirectResolveAndPrepareCli(): boolean {
+  if (!process.argv.includes("--resolve-and-prepare")) return false;
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return path.resolve(fileURLToPath(import.meta.url)) === path.resolve(entry);
+  } catch {
+    return false;
+  }
+}
+
+/** Pin-side Tugboat invoke. Not a pipeline CLI verb. */
+export async function runResolveAndPrepareCli(
+  argv: string[] = process.argv.slice(2),
+  env: NodeJS.ProcessEnv = process.env,
+  deps: ResolveAndPrepareCandidateEngineDeps = defaultResolveAndPrepareDeps(),
+): Promise<CandidateEngineResult> {
+  const repoDir = cliArg(argv, "--repo-dir");
+  const sha = cliArg(argv, "--sha");
+  if (!repoDir || !sha) {
+    return {
+      ok: false,
+      kind: "identity",
+      error: "resolve-and-prepare requires --repo-dir and --sha",
+    };
+  }
+  return resolveAndPrepareCandidateEngine(
+    {
+      repoDir,
+      candidateSha: sha,
+      candidateEngineRootEnv: env.PIPELINE_CANDIDATE_ENGINE_ROOT ?? null,
+    },
+    deps,
+  );
+}
+
+if (isDirectResolveAndPrepareCli()) {
+  void runResolveAndPrepareCli().then((result) => {
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    process.exit(result.ok ? 0 : 1);
+  });
 }

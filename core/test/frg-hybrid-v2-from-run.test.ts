@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import {
   defaultCollectHybridV2FromRun,
@@ -631,6 +632,38 @@ test("from-run collect fails closed before probes when request and binding confl
     /packed-candidate SHAs conflict/,
   );
   assert.equal(probes, 0);
+});
+
+test("from-run collect fails closed before TAP when candidate readiness fails (#1344)", async () => {
+  let probes = 0;
+  await assert.rejects(
+    () =>
+      collectPackedCandidate({
+        requestCandidateGitSha: CANDIDATE_C,
+        binding: { present: true, candidateGitSha: CANDIDATE_C },
+        resolveCandidateEngine: async () => ({
+          ok: false,
+          kind: "readiness",
+          error: `candidate engine at ${CANDIDATE_ENGINE} is not ready: nested-core install failed`,
+        }),
+        runProbe: async (probe, input) => {
+          probes++;
+          return fakeProbe(probe, input);
+        },
+      }),
+    /not ready/,
+  );
+  assert.equal(probes, 0);
+});
+
+test("defaultCollectHybridV2FromRun uses resolve-and-prepare (#1344)", () => {
+  const src = fs.readFileSync(
+    new URL("../scripts/frg-hybrid-v2-from-run.ts", import.meta.url),
+    "utf8",
+  );
+  assert.match(src, /resolveAndPrepareCandidateEngine/);
+  assert.match(src, /defaultResolveAndPrepareDeps/);
+  assert.doesNotMatch(src, /resolveCandidateEngine\(/);
 });
 
 test("from-run collect fails closed before TAP when candidate engine for C cannot be resolved (#1298)", async () => {

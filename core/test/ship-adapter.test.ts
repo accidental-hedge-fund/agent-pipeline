@@ -2101,6 +2101,106 @@ test("unresolvable candidate stops ship before FRG and leaves train evidence", a
   assert.equal(store.status?.next_action, "frg_pack");
 });
 
+test("unready candidate stops ship before leaf spawn and keeps train evidence (#1344)", async () => {
+  const store = memoryShipStore();
+  store.status = checkpoint({
+    ship_key: shipKey(intent),
+    next_action: "frg_pack",
+    train,
+    train_plan: { ordered_issues: [...train.ordered_issues] },
+  });
+  const spawned: string[][] = [];
+  let prepareReturned = false;
+  const bound = bindCandidateShipEndOperations(operations({
+    observeFrg: async () => null,
+  }), {
+    pinCommitSha: PIN_SHA,
+    repoDir: "/repo",
+    env: {},
+    factoryReleaseRequestPath: "/abs/req.json",
+    resolveCandidate: async () => {
+      await Promise.resolve();
+      prepareReturned = true;
+      return {
+        ok: false,
+        kind: "readiness",
+        error: "candidate engine at /cand is not ready: nested-core install failed. Run npm ci in /cand/core.",
+      };
+    },
+    spawn: async (argv) => {
+      spawned.push(argv);
+      throw new Error("spawn must not run");
+    },
+  });
+  const deps = shipCoordinatorDepsFromOperations(bound, { state: store });
+  const wrapped = {
+    ...deps,
+    authorizationPublicKey: "test",
+    withRunLock: async (_key: string, fn: () => Promise<unknown>) => fn(),
+  };
+  await assert.rejects(
+    runShipCoordinator(intent, null, wrapped),
+    /readiness defect/,
+  );
+  assert.equal(prepareReturned, true);
+  assert.equal(spawned.length, 0);
+  assert.equal(store.status?.train?.integrated_head_oid, head);
+  assert.equal(store.status?.frg_pack, null);
+  assert.match(store.status?.last_error ?? "", /supervised lifecycle/);
+  assert.doesNotMatch(store.status?.last_error ?? "", /needs-human|DecisionRequest|AuthorityRequest/);
+  assert.equal(store.status?.human_authority, false);
+  assert.equal(store.status?.next_action, "frg_pack");
+});
+
+test("no leaf spawn until resolve-and-prepare returns a ready root (#1344)", async () => {
+  const spawned: string[][] = [];
+  let ready = false;
+  const bound = bindCandidateShipEndOperations(operations({
+    observeRelease: async () => ({ prepare: release, finish: null }),
+  }), {
+    pinCommitSha: PIN_SHA,
+    repoDir: "/repo",
+    env: { PIPELINE_FRG_ATTESTATION_KEY: "secret" },
+    nodeBin: "/usr/bin/node",
+    factoryReleaseRequestPath: "/abs/req.json",
+    resolveCandidate: async () => {
+      await Promise.resolve();
+      ready = true;
+      return { ok: true, engine: candidateEngine };
+    },
+    spawn: async (argv) => {
+      assert.equal(ready, true, "leaf argv must not spawn before readiness success");
+      spawned.push(argv);
+      if (argv.includes("factory-release")) {
+        return { code: 0, stdout: JSON.stringify({ status: "complete" }), stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    },
+  });
+  await bound.runFrgPack!(intent, train);
+  assert.equal(ready, true);
+  assert.ok(spawned.some((argv) => argv.includes("factory-release")));
+  assert.equal(
+    spawned.findIndex((argv) => argv.includes("factory-release")) >= 0,
+    true,
+  );
+});
+
+test("realShipCoordinatorDeps points at resolve-and-prepare (#1344)", () => {
+  const shipCode = fs.readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), "../scripts/stages/ship-adapter.ts"),
+    "utf8",
+  );
+  assert.match(shipCode, /resolveAndPrepareCandidateEngine/);
+  assert.match(shipCode, /defaultResolveAndPrepareDeps/);
+  const resolveBlock = shipCode.slice(shipCode.indexOf("realShipCoordinatorDeps"));
+  assert.match(resolveBlock, /resolveAndPrepareCandidateEngine\(/);
+  assert.doesNotMatch(
+    resolveBlock.slice(0, 2500),
+    /resolveCandidateEngine\(\s*\{/,
+  );
+});
+
 test("matching pin SHA keeps in-process pin prepare", async () => {
   let preparedInProcess = false;
   const spawned: string[][] = [];

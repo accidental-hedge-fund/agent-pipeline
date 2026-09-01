@@ -4540,6 +4540,14 @@ test("tugboat pack phase composes factory-gate --from-run and does not finalize"
   assert.doesNotMatch(pack, /"\$PIPELINE" factory-release prepare/);
   assert.match(shipOneBody, /resolve_ship_end_cli/);
   assert.match(shipOneBody, /SHIP_END_CLI/);
+  const resolveFn = extractNamedFn(body, "resolve_ship_end_cli", "tugboat.sh");
+  assert.match(resolveFn, /invoke_resolve_and_prepare/);
+  assert.doesNotMatch(resolveFn, /engine_root_ok/);
+  const invokeFn = extractNamedFn(body, "invoke_resolve_and_prepare", "tugboat.sh");
+  assert.match(invokeFn, /--resolve-and-prepare/);
+  assert.match(invokeFn, /ship-end-candidate\.ts/);
+  assert.doesNotMatch(invokeFn, /npm ci/);
+  assert.doesNotMatch(body, /^\s*npm ci\b/m);
   assert.doesNotMatch(shipOneBody, /"\$PIPELINE" release finish/);
   assert.match(shipOneBody, /"\$PIPELINE" train --milestone/);
   assert.match(shipOneBody, /"\$PIPELINE" engine-promote --for "\$version"/);
@@ -4551,9 +4559,30 @@ test("tugboat pack phase composes factory-gate --from-run and does not finalize"
   assert.doesNotMatch(stateFn, /PIPELINE_FRG_ATTESTATION_KEY/);
 });
 
+function installPinPrepareStub(binDir: string): void {
+  const moduleDir = path.join(binDir, "core/scripts");
+  fs.mkdirSync(moduleDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(moduleDir, "ship-end-candidate.ts"),
+    [
+      "const argv = process.argv.slice(2);",
+      "const shaIdx = argv.indexOf('--sha');",
+      "const sha = shaIdx >= 0 ? argv[shaIdx + 1] : '';",
+      "const root = process.env.PIPELINE_CANDIDATE_ENGINE_ROOT || '';",
+      "if (!argv.includes('--resolve-and-prepare') || !root) {",
+      "  process.stdout.write(JSON.stringify({ ok: false, kind: 'identity', error: 'cannot resolve candidate engine at ' + sha }) + '\\n');",
+      "  process.exit(1);",
+      "}",
+      "process.stdout.write(JSON.stringify({ ok: true, engine: { engineRoot: root, launcherPath: root + '/scripts/pipeline-launcher.mjs', commitSha: sha } }) + '\\n');",
+      "",
+    ].join("\n"),
+  );
+}
+
 function writeFakePipeline(binDir: string, recordDir: string): string {
   fs.mkdirSync(binDir, { recursive: true });
   fs.mkdirSync(recordDir, { recursive: true });
+  installPinPrepareStub(binDir);
   const bin = path.join(binDir, "pipeline");
   const argvPath = JSON.stringify(path.join(recordDir, "argv"));
   const envPath = JSON.stringify(path.join(recordDir, "env"));

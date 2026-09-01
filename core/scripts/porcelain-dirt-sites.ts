@@ -231,18 +231,11 @@ export const PORCELAIN_DIRT_SITES: readonly PorcelainDirtSiteEntry[] = [
     notes: "Release-managed path cleanliness; not engine-scratch gate",
   },
   {
-    site_id: "stages.ship-adapter",
-    module: "scripts/stages/ship-adapter.ts",
-    disposition: "not-porcelain-dirt-gate",
-    notes:
-      "Candidate-engine identity: git status --porcelain must be empty at the bound SHA. Not a product-vs-scratch setBlocked gate (#1151)",
-  },
-  {
     site_id: "ship-end-candidate",
     module: "scripts/ship-end-candidate.ts",
     disposition: "not-porcelain-dirt-gate",
     notes:
-      "Candidate-engine identity default deps: git status --porcelain must be empty at the bound SHA. Not a product-vs-scratch setBlocked gate (#1151 / #1298)",
+      "Candidate-engine identity and resolve-and-prepare default deps: git status --porcelain must be empty at the bound SHA before and after nested-core bootstrap. Not a product-vs-scratch setBlocked gate (#1151 / #1298 / #1344)",
   },
   {
     site_id: "stages.sweep",
