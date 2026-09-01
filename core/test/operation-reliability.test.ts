@@ -8,6 +8,7 @@ import {
   passingUniqueOperationAttempts,
   passingUniqueOperationManifest,
   reconcileCompletedSideEffect,
+  uniqueOperationReleaseBindingFailure,
   uniqueOperationSloFailure,
 } from "../scripts/operation-reliability.ts";
 import {
@@ -17,8 +18,10 @@ import {
   frgRequiredCompositionOverrides,
   frgRequiredObservationOverrides,
   isReleaseEligibleFrgPass,
+  runFactoryGate,
   validateReleaseEligibleFrgEvidence,
   verifyFrgAttestation,
+  type FrgFsDeps,
 } from "../scripts/factory-reliability-gate.ts";
 
 function packInput(over: Record<string, unknown> = {}) {
@@ -286,6 +289,102 @@ test("attemptsFromRunArtifacts: does not invent a logical id", () => {
   assert.equal(attempts[0]!.logical_operation_id, null);
 });
 
+test("attemptsFromRunArtifacts: contradictory identity sources increment contradictory_correlation", () => {
+  const attempts = attemptsFromRunArtifacts([
+    {
+      runId: "r1",
+      runJson: { run_id: "r1", logical_operation_id: "L1" },
+      events: [{ type: "run_start", run_id: "r1", logical_operation_id: "L2" }],
+      summary: { logical_operation_id: "L1" },
+    },
+  ]);
+  assert.equal(attempts[0]!.contradictory_identity, true);
+  assert.ok(attempts[0]!.logical_operation_id);
+  const report = aggregateUniqueOperationReliability({
+    attempts,
+    manifest: {
+      required_entrypoints: [],
+      required_lifecycle_classes: [],
+      live_train_linkage_present: true,
+    },
+  });
+  assert.ok(report.integrity.contradictory_correlation > 0);
+  assert.equal(uniqueOperationSloFailure({ ...report, candidate_sha: "a".repeat(40), release_identity: "1.30.0" }), "contradictory correlation (1)");
+});
+
+test("attemptsFromRunArtifacts: uses run_start.entrypoint and does not coerce other kinds to single", () => {
+  const drive = attemptsFromRunArtifacts([
+    {
+      runId: "drive-1",
+      runJson: { run_id: "drive-1", kind: "advance" },
+      events: [{ type: "run_start", entrypoint: "drive" }],
+      summary: null,
+    },
+  ]);
+  assert.equal(drive[0]!.entrypoint, "drive");
+
+  const loop = attemptsFromRunArtifacts([
+    {
+      runId: "loop-1",
+      runJson: { run_id: "loop-1", kind: "advance" },
+      events: [{ type: "run_start", entrypoint: "loop" }],
+      summary: null,
+    },
+  ]);
+  assert.equal(loop[0]!.entrypoint, "loop");
+
+  const mergeQueue = attemptsFromRunArtifacts([
+    {
+      runId: "mq-1",
+      runJson: { run_id: "mq-1", kind: "advance" },
+      events: [{ type: "run_start", entrypoint: "merge-queue" }],
+      summary: null,
+    },
+  ]);
+  assert.equal(mergeQueue[0]!.entrypoint, "merge-queue");
+
+  const ship = attemptsFromRunArtifacts([
+    {
+      runId: "ship-1",
+      runJson: { run_id: "ship-1", kind: "advance" },
+      events: [{ type: "run_start", entrypoint: "ship" }],
+      summary: null,
+    },
+  ]);
+  assert.equal(ship[0]!.entrypoint, "ship");
+
+  const kindLoop = attemptsFromRunArtifacts([
+    {
+      runId: "kind-loop",
+      runJson: { run_id: "kind-loop", kind: "loop" },
+      events: [{ type: "run_start" }],
+      summary: null,
+    },
+  ]);
+  assert.equal(kindLoop[0]!.entrypoint, "loop");
+
+  const kindAdvance = attemptsFromRunArtifacts([
+    {
+      runId: "adv",
+      runJson: { run_id: "adv", kind: "advance" },
+      events: [{ type: "run_start" }],
+      summary: null,
+    },
+  ]);
+  assert.equal(kindAdvance[0]!.entrypoint, null);
+  assert.notEqual(kindAdvance[0]!.entrypoint, "single");
+
+  const train = attemptsFromRunArtifacts([
+    {
+      runId: "tr",
+      runJson: { run_id: "tr", kind: "train" },
+      events: [],
+      summary: null,
+    },
+  ]);
+  assert.equal(train[0]!.entrypoint, "train");
+});
+
 test("computeFrgEvidence: writes operation_reliability from durable fakes", () => {
   const evidence = computeFrgEvidence(packInput());
   assert.ok(evidence.operation_reliability);
@@ -435,4 +534,112 @@ test("passing #1333 mechanical fixtures yield zero false-human and zero ownerles
   assert.equal(evidence.operation_reliability!.ownerless_terminal.numerator, 0);
   assert.equal(uniqueOperationSloFailure(evidence.operation_reliability), null);
   assert.equal(evidence.pass, true);
+});
+
+test("empty candidate_sha is not release-eligible", () => {
+  const evidence = computeFrgEvidence(packInput());
+  assert.equal(isReleaseEligibleFrgPass(evidence), true);
+  const emptySha = {
+    ...evidence,
+    operation_reliability: { ...evidence.operation_reliability!, candidate_sha: "" },
+  };
+  assert.equal(uniqueOperationSloFailure(emptySha.operation_reliability), "operation_reliability.candidate_sha is empty");
+  assert.equal(isReleaseEligibleFrgPass(emptySha), false);
+  const emptyRelease = {
+    ...evidence,
+    operation_reliability: { ...evidence.operation_reliability!, release_identity: "" },
+  };
+  assert.equal(
+    uniqueOperationSloFailure(emptyRelease.operation_reliability),
+    "operation_reliability.release_identity is empty",
+  );
+  assert.equal(isReleaseEligibleFrgPass(emptyRelease), false);
+  const mismatchedRelease = {
+    ...evidence,
+    operation_reliability: {
+      ...evidence.operation_reliability!,
+      release_identity: "9.9.9",
+    },
+  };
+  assert.equal(isReleaseEligibleFrgPass(mismatchedRelease), false);
+  assert.match(
+    uniqueOperationReleaseBindingFailure(mismatchedRelease.operation_reliability, {
+      candidate_sha: null,
+      release_identity: evidence.version,
+    }) ?? "",
+    /release_identity/,
+  );
+});
+
+test("precomputed operation_reliability bound to a different candidate is not release-eligible", () => {
+  const evidence = computeFrgEvidence(packInput());
+  assert.equal(
+    uniqueOperationReleaseBindingFailure(evidence.operation_reliability, {
+      candidate_sha: "c".repeat(40),
+      release_identity: evidence.version,
+    }),
+    "operation_reliability.candidate_sha does not match the scored candidate",
+  );
+  assert.equal(
+    isReleaseEligibleFrgPass({
+      ...evidence,
+      operation_reliability: {
+        ...evidence.operation_reliability!,
+        candidate_sha: "d".repeat(40),
+        release_identity: "0.0.1",
+      },
+    }),
+    false,
+  );
+});
+
+test("runFactoryGate without unique_operations cannot pass from absent durable evidence", async () => {
+  const files = new Map<string, string>();
+  const fs: FrgFsDeps = {
+    async readFile(p) {
+      const v = files.get(p);
+      if (v === undefined) {
+        const err = new Error(`ENOENT: ${p}`) as NodeJS.ErrnoException;
+        err.code = "ENOENT";
+        throw err;
+      }
+      return v;
+    },
+    async writeFile(p, data) {
+      files.set(p, data);
+    },
+    async mkdir() {},
+    async rename(from, to) {
+      const v = files.get(from);
+      if (v === undefined) throw new Error(`ENOENT rename ${from}`);
+      files.set(to, v);
+      files.delete(from);
+    },
+  };
+  const result = await runFactoryGate(
+    {
+      version: "1.29.1",
+      repoDir: "/repo",
+      scoreInput: {
+        version: "1.29.1",
+        run_id: "frg-no-uop",
+        loop_run_id: "loop-full-pass",
+        pack_id: FRG_PACK_MANIFEST.pack_id,
+        items: [
+          { item_id: "1", state: "ready", ready_clean: true },
+          { item_id: "2", state: "ready", ready_clean: true },
+        ],
+        scenario_overrides: frgRequiredObservationOverrides("pass"),
+        composition_overrides: frgRequiredCompositionOverrides("pass"),
+        attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
+      },
+      stdout: () => {},
+      stderr: () => {},
+    },
+    fs,
+  );
+  assert.equal(result.evidence.pass, false);
+  assert.ok(result.evidence.operation_reliability);
+  assert.ok(result.evidence.operation_reliability!.integrity.missing_required_coverage > 0);
+  assert.equal(isReleaseEligibleFrgPass(result.evidence), false);
 });

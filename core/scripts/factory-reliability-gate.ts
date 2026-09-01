@@ -47,9 +47,11 @@ import {
 } from "./frg-pack-observations.ts";
 import {
   aggregateUniqueOperationReliability,
+  attemptsFromRunArtifacts,
   parseUniqueOperationReliability,
-  passingUniqueOperationAttempts,
-  passingUniqueOperationManifest,
+  REQUIRED_LIFECYCLE_CLASSES_1333,
+  REQUIRED_PUBLIC_ENTRYPOINTS,
+  uniqueOperationReleaseBindingFailure,
   uniqueOperationSloFailure,
   type UniqueOperationAttempt,
   type UniqueOperationManifest,
@@ -930,6 +932,12 @@ export interface FrgFsDeps {
    * Production default uses a short-retry PID lock; tests inject an in-memory mutex.
    */
   withPathLock?: <T>(lockKey: string, fn: () => Promise<T>) => Promise<T>;
+  /**
+   * Optional run-store listing for unique-operation evidence collection.
+   * Tests omit this so missing artifacts fail closed instead of synthesizing
+   * a passing unique-operation report.
+   */
+  readdir?(p: string): Promise<Array<{ name: string; isDirectory(): boolean }>>;
 }
 
 /** Host-local path lock with brief retry (default production seam for ledger append). */
@@ -967,6 +975,10 @@ const defaultFsDeps: FrgFsDeps = {
   },
   rename: (from, to) => fsp.rename(from, to),
   withPathLock: defaultFrgPathLock,
+  readdir: async (p) => {
+    const entries = await fsp.readdir(p, { withFileTypes: true });
+    return entries.map((e) => ({ name: e.name, isDirectory: () => e.isDirectory() }));
+  },
 };
 
 function isFiniteNumber(v: unknown): v is number {
@@ -1683,6 +1695,14 @@ export function isReleaseEligibleFrgPass(
   if (typeof evidence.run_id === "string" && evidence.run_id.trim() === "") return false;
   // Attestation must be present for release-eligible pass (MAC verified on tag path).
   if (opts?.requireAttestation !== false && !frgAttestationPresent(evidence.integrity)) {
+    return false;
+  }
+  if (
+    uniqueOperationReleaseBindingFailure(evidence.operation_reliability ?? null, {
+      candidate_sha: evidence.pack_provenance?.candidate_git_sha ?? null,
+      release_identity: evidence.version ?? null,
+    }) !== null
+  ) {
     return false;
   }
   if (uniqueOperationSloFailure(evidence.operation_reliability ?? null) !== null) {
@@ -3704,11 +3724,10 @@ export function computeFrgEvidence(input: ComputeFrgInput): FrgEvidence {
       manifest: {
         ...(input.unique_operation_manifest ?? {}),
         candidate_sha:
-          input.unique_operation_manifest?.candidate_sha ??
           packProvenance?.candidate_git_sha ??
+          input.unique_operation_manifest?.candidate_sha ??
           "",
-        release_identity:
-          input.unique_operation_manifest?.release_identity ?? version,
+        release_identity: version,
       },
       composition_false_human_count: input.false_human_authority_count ?? 0,
       candidate_sha: packProvenance?.candidate_git_sha ?? "",
@@ -4345,6 +4364,79 @@ async function attachShipPathFromRunBinding(
   };
 }
 
+async function readJsonObjectOrNull(
+  fsDeps: FrgFsDeps,
+  filePath: string,
+): Promise<Record<string, unknown> | null> {
+  try {
+    const raw = await fsDeps.readFile(filePath);
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    return parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+async function readJsonlObjects(
+  fsDeps: FrgFsDeps,
+  filePath: string,
+): Promise<Record<string, unknown>[]> {
+  try {
+    const raw = await fsDeps.readFile(filePath);
+    const out: Record<string, unknown>[] = [];
+    for (const line of raw.split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        const parsed: unknown = JSON.parse(line);
+        if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+          out.push(parsed as Record<string, unknown>);
+        }
+      } catch {
+        // Skip corrupt tail lines the same way run-store readers do.
+      }
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Classify durable run/event/summary artifacts. Missing store or unreadable
+ * artifacts yield an empty attempt list (integrity failure, not a synthetic pass).
+ */
+async function collectUniqueOperationsFromRunStore(
+  repoDir: string,
+  fsDeps: FrgFsDeps,
+): Promise<UniqueOperationAttempt[]> {
+  if (!fsDeps.readdir) return [];
+  const root = path.join(repoDir, ".agent-pipeline", "runs");
+  let entries: Array<{ name: string; isDirectory(): boolean }>;
+  try {
+    entries = await fsDeps.readdir(root);
+  } catch {
+    return [];
+  }
+  const runs: Array<{
+    runId: string;
+    runJson: Record<string, unknown> | null;
+    events: Record<string, unknown>[];
+    summary: Record<string, unknown> | null;
+  }> = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const dir = path.join(root, entry.name);
+    runs.push({
+      runId: entry.name,
+      runJson: await readJsonObjectOrNull(fsDeps, path.join(dir, "run.json")),
+      events: await readJsonlObjects(fsDeps, path.join(dir, "events.jsonl")),
+      summary: await readJsonObjectOrNull(fsDeps, path.join(dir, "summary.json")),
+    });
+  }
+  return attemptsFromRunArtifacts(runs);
+}
+
 /**
  * Run the FRG driver: score (from ledger / fixture / started loop), write
  * evidence, return pass/fail. Does not merge or tag. After a release-eligible
@@ -4646,15 +4738,19 @@ export async function runFactoryGate(
     };
   }
   if (computeInput.unique_operations === undefined) {
+    const collected = await collectUniqueOperationsFromRunStore(opts.repoDir, fsDeps);
     computeInput = {
       ...computeInput,
-      unique_operations: passingUniqueOperationAttempts(),
+      unique_operations: collected,
       unique_operation_manifest:
         computeInput.unique_operation_manifest ??
-        passingUniqueOperationManifest({
+        opts.unique_operation_manifest ??
+        {
+          required_entrypoints: [...REQUIRED_PUBLIC_ENTRYPOINTS],
+          required_lifecycle_classes: [...REQUIRED_LIFECYCLE_CLASSES_1333],
+          candidate_sha: computeInput.pack_provenance?.candidate_git_sha ?? "",
           release_identity: version,
-          candidate_sha: computeInput.pack_provenance?.candidate_git_sha,
-        }),
+        },
     };
   }
 

@@ -88,6 +88,11 @@ export interface UniqueOperationAttempt {
   covered_lifecycle_classes?: readonly string[];
   /** Evidence refs (run.json path, event seq, proof id). */
   evidence_refs?: readonly string[];
+  /**
+   * Artifact identity sources disagreed (e.g. run.json vs run_start).
+   * Preserved for diagnostics; aggregator increments contradictory_correlation.
+   */
+  contradictory_identity?: boolean;
 }
 
 export interface UniqueOperationManifest {
@@ -183,6 +188,45 @@ function uniqueOpKey(id: string): string {
   return id.trim();
 }
 
+function nonEmptyTrimmed(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed === "" ? null : trimmed;
+}
+
+function uniqueNonEmpty(values: readonly unknown[]): string[] {
+  const out: string[] = [];
+  for (const value of values) {
+    const trimmed = nonEmptyTrimmed(value);
+    if (trimmed && !out.includes(trimmed)) out.push(trimmed);
+  }
+  return out;
+}
+
+const REQUIRED_PUBLIC_ENTRYPOINT_SET: ReadonlySet<string> = new Set(REQUIRED_PUBLIC_ENTRYPOINTS);
+
+/** Map a stamped admission entrypoint or recognized run kind. Never coerce to `single`. */
+export function mapPublicEntrypoint(kindOrEntrypoint: unknown): string | null {
+  const value = nonEmptyTrimmed(kindOrEntrypoint);
+  if (!value) return null;
+  if (REQUIRED_PUBLIC_ENTRYPOINT_SET.has(value)) return value;
+  return null;
+}
+
+export function uniqueOperationManifestFingerprint(manifest: {
+  expected_outcomes?: Readonly<Record<string, ManifestExpectedOutcome>>;
+  required_entrypoints?: readonly string[];
+  required_lifecycle_classes?: readonly string[];
+}): string {
+  return stableFingerprint({
+    expected_outcomes: manifest.expected_outcomes ?? {},
+    required_entrypoints: [...(manifest.required_entrypoints ?? REQUIRED_PUBLIC_ENTRYPOINTS)],
+    required_lifecycle_classes: [
+      ...(manifest.required_lifecycle_classes ?? REQUIRED_LIFECYCLE_CLASSES_1333),
+    ],
+  });
+}
+
 /**
  * One pure aggregator. Deduplicates by logical_operation_id.
  * Nested attempts inherit the parent id and do not increment unique success.
@@ -229,6 +273,9 @@ export function aggregateUniqueOperationReliability(input: {
     const parent = typeof attempt.parent_logical_operation_id === "string"
       ? attempt.parent_logical_operation_id.trim()
       : "";
+    if (attempt.contradictory_identity === true) {
+      contradictoryCorrelation += 1;
+    }
     if (parent && parent !== id) {
       contradictoryCorrelation += 1;
     }
@@ -380,7 +427,7 @@ export function aggregateUniqueOperationReliability(input: {
   const uniqueCount = byId.size;
   const candidateSha = (manifest.candidate_sha ?? input.candidate_sha ?? "").trim();
   const releaseIdentity = (manifest.release_identity ?? input.release_identity ?? "").trim();
-  const manifestFingerprint = stableFingerprint({
+  const manifestFingerprint = uniqueOperationManifestFingerprint({
     expected_outcomes: expectedOutcomes,
     required_entrypoints: requiredEntrypoints,
     required_lifecycle_classes: requiredLifecycle,
@@ -422,6 +469,12 @@ export function uniqueOperationSloFailure(
   if (!section) {
     return "missing operation_reliability section";
   }
+  if (!section.candidate_sha.trim()) {
+    return "operation_reliability.candidate_sha is empty";
+  }
+  if (!section.release_identity.trim()) {
+    return "operation_reliability.release_identity is empty";
+  }
   if (section.integrity.missing_correlation > 0) {
     return `missing correlation (${section.integrity.missing_correlation})`;
   }
@@ -461,6 +514,52 @@ export function uniqueOperationSloFailure(
   return null;
 }
 
+/**
+ * Candidate SHA, release identity, and manifest fingerprint must bind the
+ * scored FRG evidence. Empty or mismatched bindings are not release-eligible.
+ */
+export function uniqueOperationReleaseBindingFailure(
+  section: UniqueOperationReliability | null | undefined,
+  binding: {
+    candidate_sha?: string | null;
+    release_identity?: string | null;
+  },
+): string | null {
+  if (!section) {
+    return "missing operation_reliability section";
+  }
+  if (!section.candidate_sha.trim()) {
+    return "operation_reliability.candidate_sha is empty";
+  }
+  if (!section.release_identity.trim()) {
+    return "operation_reliability.release_identity is empty";
+  }
+  const release = (binding.release_identity ?? "").trim();
+  if (release && section.release_identity !== release) {
+    return (
+      `operation_reliability.release_identity ${section.release_identity} ` +
+      `does not match ${release}`
+    );
+  }
+  const sha = (binding.candidate_sha ?? "").trim();
+  if (sha && section.candidate_sha !== sha) {
+    return "operation_reliability.candidate_sha does not match the scored candidate";
+  }
+  const expectedOutcomes: Record<string, ManifestExpectedOutcome> = {};
+  for (const exclusion of section.exclusions) {
+    if (exclusion.fixture_id) expectedOutcomes[exclusion.fixture_id] = exclusion.reason;
+  }
+  const expectedFp = uniqueOperationManifestFingerprint({
+    expected_outcomes: expectedOutcomes,
+    required_entrypoints: REQUIRED_PUBLIC_ENTRYPOINTS,
+    required_lifecycle_classes: REQUIRED_LIFECYCLE_CLASSES_1333,
+  });
+  if (section.manifest_fingerprint !== expectedFp) {
+    return "operation_reliability.manifest_fingerprint does not match manifested reliability inputs";
+  }
+  return null;
+}
+
 /** Map scanned run artifacts into classifier attempts. Does not invent ids. */
 export function attemptsFromRunArtifacts(
   runs: readonly {
@@ -471,37 +570,26 @@ export function attemptsFromRunArtifacts(
   }[],
 ): UniqueOperationAttempt[] {
   return runs.map((run) => {
-    const fromJson =
-      typeof run.runJson?.logical_operation_id === "string"
-        ? run.runJson.logical_operation_id
-        : null;
-    const fromSummary =
-      typeof run.summary?.logical_operation_id === "string"
-        ? run.summary.logical_operation_id
-        : null;
     const start = run.events.find((e) => e.type === "run_start");
-    const fromEvent =
-      typeof start?.logical_operation_id === "string" ? start.logical_operation_id : null;
-    const logical = fromJson || fromSummary || fromEvent || null;
+    const identitySources = uniqueNonEmpty([
+      run.runJson?.logical_operation_id,
+      run.summary?.logical_operation_id,
+      start?.logical_operation_id,
+    ]);
+    const contradictoryIdentity = identitySources.length > 1;
+    const logical = identitySources[0] ?? null;
     const complete = run.events.find((e) => e.type === "run_complete");
-    const parent =
-      typeof run.runJson?.parent_logical_operation_id === "string"
-        ? run.runJson.parent_logical_operation_id
-        : typeof start?.parent_logical_operation_id === "string"
-          ? start.parent_logical_operation_id
-          : null;
+    const parentSources = uniqueNonEmpty([
+      run.runJson?.parent_logical_operation_id,
+      start?.parent_logical_operation_id,
+    ]);
+    const parent = parentSources[0] ?? null;
     const nested = run.runJson?.nested_logical_operation === true || start?.nested === true;
     const postcondition =
       run.summary?.verified_completion === true ||
       run.events.some((e) => e.type === "verified_completion" || e.exact_candidate_proof === true);
     const entrypoint =
-      typeof run.runJson?.kind === "string"
-        ? run.runJson.kind === "train"
-          ? "train"
-          : "single"
-        : typeof start?.entrypoint === "string"
-          ? start.entrypoint
-          : null;
+      mapPublicEntrypoint(start?.entrypoint) ?? mapPublicEntrypoint(run.runJson?.kind);
     const trainLinked = run.events.some((e) => e.type === "train_loop_linked");
     const childId = run.events
       .filter((e) => e.type === "train_loop_linked")
@@ -523,6 +611,7 @@ export function attemptsFromRunArtifacts(
       train_loop_linked: trainLinked,
       child_logical_operation_id: childId ?? (trainLinked ? logical : null),
       evidence_refs: [`run:${run.runId}`],
+      contradictory_identity: contradictoryIdentity,
     };
   });
 }
