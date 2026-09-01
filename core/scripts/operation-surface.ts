@@ -132,6 +132,15 @@ export const OPERATION_SURFACE: readonly OperationSurfaceEntry[] = [
     fast: false,
   }),
   operation({
+    name: "grill",
+    desc:
+      "Native grill-with-docs admission: freeze a selector, auto-settle in-scope recommendations, write Decisions and domain docs, request pipeline:ready",
+    usage:
+      "grill --issue N [--dry-run] [--json] | grill --issues N,N,... [--dry-run] [--json] | grill --milestone M [--dry-run] [--json] | grill --label L [--label L] [--dry-run] [--json] | grill status --run-id <id> [--follow] [--json] | grill --resume <run-id>",
+    section: "factory",
+    fast: false,
+  }),
+  operation({
     name: "triage",
     desc:
       "Set a pre-pipeline stage label (ready or backlog) on an issue. needs-spec is an admission hold: apply the spec, then triage --stage ready.",

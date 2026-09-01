@@ -150,6 +150,8 @@ import {
   type EffortBand,
 } from "./stages/decompose.ts";
 import { runRefineSpec, realRefineSpecDeps } from "./stages/refine-spec.ts";
+import { isGrillMigratedBody, realGrillDeps, runGrill } from "./stages/grill.ts";
+import { parseGrillSelector } from "./grill-selector.ts";
 import {
   realGrillIssueApplyDeps,
   realGrillIssuePreviewDeps,
@@ -817,6 +819,9 @@ export function maxPositionalsFor(
   if (command === "refine-spec") {
     return 2; // refine-spec [apply]
   }
+  if (command === "grill") {
+    return 2; // grill [status]
+  }
   if (command === "handoff") {
     if (args === undefined) return 3;
     const verb = args[1];
@@ -843,7 +848,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | recover-parked | cleanup | logs | path | config | controls | single | release | ship | factory-gate | factory-release | factory-pin | engine-promote | intake | decompose | triage | roadmap | sweep | merge | merge-queue | train | summary | improve | scoreboard | outcomes | lineage | queue | backfill | evals | loop | correction | handoff | report")
+    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | recover-parked | cleanup | logs | path | config | controls | single | release | ship | factory-gate | factory-release | factory-pin | engine-promote | intake | decompose | triage | roadmap | sweep | grill | merge | merge-queue | train | summary | improve | scoreboard | outcomes | lineage | queue | backfill | evals | loop | correction | handoff | report")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -4114,14 +4119,27 @@ async function main(): Promise<void> {
     process.stdout.write(formatPipelineVersionJson(VERSION, resolveEngineCommitSha(engineRoot)));
     process.exit(0);
   }
+  if (rawArgs[0] === "grill" && (rawArgs.includes("--help") || rawArgs.includes("-h"))) {
+    process.stdout.write(
+      "Usage: pipeline grill --issue N [--dry-run] [--json]\n" +
+      "       pipeline grill --issues N,N,... [--dry-run] [--json]\n" +
+      "       pipeline grill --milestone M [--dry-run] [--json]\n" +
+      "       pipeline grill --label L [--label L] [--dry-run] [--json]\n" +
+      "       pipeline grill status --run-id <id> [--follow] [--json]\n" +
+      "       pipeline grill --resume <run-id>\n\n" +
+      "Native grill-with-docs admission. Exactly one selector form is required.\n" +
+      "Does not merge, deploy, or write the integration branch.\n",
+    );
+    process.exit(0);
+  }
   if (rawArgs[0] === "refine-spec" && (rawArgs.includes("--help") || rawArgs.includes("-h"))) {
     process.stdout.write(
       'Usage: pipeline refine-spec --title "<title>" --body "<markdown>" [--json]\n' +
       "       pipeline refine-spec --issue N [--json]\n" +
       "       pipeline refine-spec apply --issue N [--proposal-file PATH]\n\n" +
-      "Grill / spec refinement. --title/--body is a gh-free single-call preview.\n" +
-      "--issue previews one GitHub issue (Implementer then Reviewer) and writes nothing.\n" +
-      "apply consumes a signed grill-proposal.v1 envelope and writes only the issue body.\n\n" +
+      "Desk preview. Admission is pipeline grill --issue N.\n" +
+      "--title/--body is a gh-free single-call preview.\n" +
+      "--issue and apply are compatibility shims that diagnose toward pipeline grill.\n\n" +
       "Options:\n" +
       "  --title <text>           existing issue title to refine (required with --body)\n" +
       "  --body <markdown>        existing issue body to refine (required with --title)\n" +
@@ -4257,6 +4275,8 @@ async function main(): Promise<void> {
   const isSingleCommand = numArg === "single";
   // `pipeline refine-spec --title "<t>" --body "<b>"` — non-mutating spec refinement preview.
   const isRefineSpecCommand = numArg === "refine-spec";
+  // `pipeline grill --issue N | --issues | --milestone | --label` — native admission.
+  const isGrillCommand = numArg === "grill";
 
   // `pipeline logs [<run-id>] [-f]` is independent of the original pipeline process
   // and must work even when gh is missing, unauthenticated, or the remote is
@@ -5000,6 +5020,63 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Early grill dispatch — no advance loop. Never merge or deploy.
+  if (isGrillCommand) {
+    const startDir = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
+    const repoDir = findGitRoot(startDir) ?? startDir;
+    const subVerb = cmd.args[1];
+    if (subVerb && subVerb !== "status") {
+      process.stderr.write(
+        `pipeline grill: unexpected argument "${subVerb}" (status is the only grill sub-verb)\n`,
+      );
+      process.exitCode = 2;
+      return;
+    }
+    if (subVerb !== "status" && !opts.resume) {
+      const selector = parseGrillSelector({
+        issue: opts.issue,
+        issues: opts.issues,
+        milestone: opts.milestone,
+        label: opts.label,
+      });
+      if (!selector.ok) {
+        process.stderr.write(`pipeline grill: ${selector.reason}\n`);
+        process.exitCode = 2;
+        return;
+      }
+    }
+    let grillCfg;
+    try {
+      grillCfg = resolveConfig({ repoPath: repoDir, baseBranch: opts.base, profile: opts.profile });
+    } catch (err) {
+      if (subVerb === "status" || opts.resume) {
+        console.error(`pipeline grill: ${(err as Error).message}`);
+        process.exitCode = 1;
+        return;
+      }
+      console.error(`pipeline grill: ${(err as Error).message}`);
+      process.exitCode = 1;
+      return;
+    }
+    const exitCode = await runGrill(
+      {
+        issue: opts.issue,
+        issues: opts.issues,
+        milestone: opts.milestone,
+        label: opts.label,
+        dryRun: !!opts.dryRun,
+        json: !!opts.json,
+        follow: !!opts.follow,
+        resume: opts.resume,
+        runId: opts.runId,
+        status: subVerb === "status",
+      },
+      realGrillDeps(grillCfg),
+    );
+    if (exitCode !== 0) process.exit(exitCode);
+    return;
+  }
+
   // Early refine-spec dispatch — no advance loop, no stage-label writes.
   // --title/--body stays gh-free. --issue preview and apply resolve GitHub
   // in their own handlers after flag validation.
@@ -5031,10 +5108,21 @@ async function main(): Promise<void> {
         process.exitCode = 1;
         return;
       }
+      process.stderr.write(
+        `pipeline refine-spec apply is a compatibility shim. Use: pipeline grill --issue ${opts.issue}\n`,
+      );
+      const applyDeps = realGrillIssueApplyDeps(applyCfg);
+      const live = await applyDeps.getIssue(opts.issue);
+      if (isGrillMigratedBody(live.body)) {
+        process.stderr.write(
+          `pipeline refine-spec apply: issue #${opts.issue} is already migrated; refusing rewrite.\n`,
+        );
+        return;
+      }
       await runRefineSpecApply(
         opts.issue,
         { proposalFile: opts.proposalFile },
-        realGrillIssueApplyDeps(applyCfg),
+        applyDeps,
       );
       return;
     }
@@ -5047,6 +5135,9 @@ async function main(): Promise<void> {
         process.exitCode = 1;
         return;
       }
+      process.stderr.write(
+        `pipeline refine-spec --issue is no longer the admission writer. Use: pipeline grill --issue ${opts.issue}\n`,
+      );
       await runRefineSpecIssuePreview(opts.issue, realGrillIssuePreviewDeps(issueCfg));
       return;
     }
@@ -6644,7 +6735,7 @@ async function main(): Promise<void> {
   if (numArg && !/^\d+$/.test(numArg)) {
     const recognized = [
       "init", "doctor", "status", "unblock", "override", "recover-parked", "cleanup",
-      "logs", "path", "config", "run", "single", "release", "intake", "decompose", "refine-spec",
+      "logs", "path", "config", "run", "single", "release", "intake", "decompose", "refine-spec", "grill",
       "roadmap", "sweep", "triage", "merge", "merge-queue", "train", "ship", "summary", "improve", "scoreboard", "outcomes", "lineage", "factory-gate", "factory-release", "factory-pin", "engine-promote", "queue", "backfill", "evals",
       "loop", "controls",
     ];

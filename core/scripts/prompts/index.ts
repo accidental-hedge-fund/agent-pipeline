@@ -976,6 +976,18 @@ export function buildGrillImplementerPrompt(a: BuildGrillImplementerArgs): strin
   });
 }
 
+export function buildGrillAdmissionPrompt(a: BuildGrillImplementerArgs): string {
+  return substitute(loadTemplate("grill-admission"), {
+    title: a.title,
+    body: a.body,
+    integration_base_sha: a.integrationBaseSha,
+    context_md: a.contextMd || "(no CONTEXT.md at the integration base)",
+    dependency_facts: a.dependencyFacts,
+    ship_path_autonomy_preamble: shipPathAutonomyPreambleSection(),
+    no_tools_instruction: SPEC_GENERATION_TOOL_FREE_BLOCK,
+  });
+}
+
 export interface BuildGrillReviewerArgs {
   artifactJson: string;
   fingerprintJson: string;

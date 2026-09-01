@@ -173,6 +173,14 @@ test("pipeline-cli: refine-spec — --title and --body → []", () => {
   assert.deepEqual(roundTrip(["refine-spec", "--title", "T", "--body", "B"]), []);
 });
 
+test("pipeline-cli: grill — --issue → []", () => {
+  assert.deepEqual(roundTrip(["grill", "--issue", "42"]), []);
+});
+
+test("pipeline-cli: grill — --milestone --dry-run → []", () => {
+  assert.deepEqual(roundTrip(["grill", "--milestone", "v1.40.1", "--dry-run"]), []);
+});
+
 test("pipeline-cli: improve — --apply → []", () => {
   assert.deepEqual(roundTrip(["improve", "--apply"]), []);
 });

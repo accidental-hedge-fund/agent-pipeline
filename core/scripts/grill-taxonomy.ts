@@ -29,6 +29,9 @@ const TAXONOMY_SET: ReadonlySet<string> = new Set([...OPERATOR_REQUIRED_CLASSES,
 export const NON_AUTHORITY_ELIGIBILITY_REASON =
   "taxonomy-validated non-authority class in grill-taxonomy.v1";
 
+export const AUTO_ACCEPT_ELIGIBILITY_REASON =
+  "auto-settle: reversible, in-scope, policy-consistent, covered by existing authority";
+
 export function isGrillTaxonomyClass(value: unknown): value is GrillTaxonomyClass {
   return typeof value === "string" && TAXONOMY_SET.has(value);
 }
@@ -43,7 +46,7 @@ export function isNonAuthorityClass(value: unknown): value is NonAuthorityClass 
 
 /**
  * Unknown or disputed classes stay unresolved authority and cannot record
- * `settled-by: reviewer-accept`.
+ * `settled-by: reviewer-accept` or `settled-by: auto-accept`.
  */
 export function classifyAuthority(rawClass: unknown): {
   class: string;

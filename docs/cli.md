@@ -133,6 +133,11 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 - **Usage:** `pipeline factory-release prepare --request <absolute-off-repo-request.json> --json`
 - **Summary:** Durable post-pilot FRG generation + prepare-only release handoff (in_progress → awaiting_frg_attestation → complete; never merges/tags)
 
+#### `grill`
+
+- **Usage:** `pipeline grill --issue N [--dry-run] [--json] | pipeline grill --issues N,N,... [--dry-run] [--json] | pipeline grill --milestone M [--dry-run] [--json] | pipeline grill --label L [--label L] [--dry-run] [--json] | pipeline grill status --run-id <id> [--follow] [--json] | pipeline grill --resume <run-id>`
+- **Summary:** Native grill-with-docs admission: freeze a selector, auto-settle in-scope recommendations, write Decisions and domain docs, request pipeline:ready
+
 #### `improve`
 
 - **Usage:** `pipeline improve [--apply] [--top <n>] [--json]`
@@ -150,8 +155,8 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 
 #### `refine-spec`
 
-- **Usage:** `pipeline refine-spec --title "<t>" --body "<b>" | pipeline refine-spec --issue N | pipeline refine-spec apply --issue N [--proposal-file PATH]`
-- **Summary:** Grill an issue spec: --title/--body preview, --issue preview, or apply a signed proposal
+- **Usage:** `pipeline refine-spec --title "<t>" --body "<b>" [--json] | pipeline refine-spec --issue N | pipeline refine-spec apply --issue N [--proposal-file PATH]`
+- **Summary:** Non-mutating Desk preview from --title/--body. Admission is pipeline grill; --issue/apply diagnose toward grill
 
 #### `roadmap`
 

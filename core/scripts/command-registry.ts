@@ -311,6 +311,30 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
     supportsJson: true,
   },
 
+  // Native grill-with-docs admission (#1369). No positional issue number.
+  // Selectors reuse existing Commander flags; exactly one form per invocation.
+  grill: {
+    needsIssueNumber: false,
+    allowedFlags: new Set([
+      "repoPath",
+      "base",
+      "profile",
+      "issue",
+      "issues",
+      "milestone",
+      "label",
+      "dryRun",
+      "json",
+      "follow",
+      "resume",
+      "runId",
+    ]),
+    needsConfig: true,
+    needsGhAuth: true,
+    mutatesGitHub: true,
+    supportsJson: true,
+  },
+
   logs: {
     needsIssueNumber: false,
     // untilTerminal: advance `logs … --events --follow` until-terminal (#725)

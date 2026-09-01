@@ -3,6 +3,7 @@
 
 import { canonicalJson, isSha256Prefixed, sha256Hex, sha256Prefixed, utf8ByteLength } from "./grill-hash.ts";
 import {
+  AUTO_ACCEPT_ELIGIBILITY_REASON,
   classifyAuthority,
   isNonAuthorityClass,
   isOperatorRequiredClass,
@@ -32,7 +33,8 @@ export type DependencyFactCode = (typeof DEPENDENCY_FACT_CODES)[number];
 
 export type NodeResolution = "unresolved" | "resolved";
 export type ReviewerVerdictKind = "accept" | "challenge";
-export type SettledBy = "none" | "reviewer-accept" | "handoff";
+export type SettledBy = "none" | "reviewer-accept" | "handoff" | "auto-accept";
+export type TypedRequestKind = "DecisionRequest" | "CapabilityRequest" | "AuthorityRequest";
 
 export interface DecisionProvenance {
   settled_by: SettledBy;
@@ -56,6 +58,7 @@ export interface DecisionNode {
   };
   term_id?: string;
   challenge_text?: string;
+  typed_request?: TypedRequestKind;
 }
 
 export interface TypedUnresolvedFact {
@@ -290,9 +293,11 @@ export function hasReviewerChallenge(nodes: readonly DecisionNode[]): boolean {
 
 export function unresolvedAuthorityNodes(nodes: readonly DecisionNode[]): DecisionNode[] {
   return nodes.filter((n) => {
+    if (n.typed_request && n.resolution !== "resolved") return true;
     const classified = classifyAuthority(n.class);
     if (!classified.operatorRequired) return false;
     if (n.resolution !== "resolved") return true;
+    if (n.provenance.settled_by === "auto-accept") return false;
     if (n.provenance.settled_by !== "handoff") return true;
     if (!n.provenance.reference || !n.provenance.reference.startsWith("handoff:")) return true;
     return false;
@@ -335,6 +340,7 @@ export function renderDecisionsSection(artifact: DecisionsArtifact): string {
 
 function formatProvenance(p: DecisionProvenance): string {
   if (p.settled_by === "none") return "none";
+  if (p.settled_by === "auto-accept") return "settled-by: auto-accept";
   if (p.settled_by === "reviewer-accept") return "settled-by: reviewer-accept";
   if (p.reference) return `settled-by: handoff (${p.reference})`;
   return "settled-by: handoff";
@@ -566,6 +572,9 @@ function parseNode(
   if (typeof o.challenge_text === "string" && o.challenge_text.length > 0) {
     node.challenge_text = o.challenge_text;
   }
+  if (o.typed_request === "DecisionRequest" || o.typed_request === "CapabilityRequest" || o.typed_request === "AuthorityRequest") {
+    node.typed_request = o.typed_request;
+  }
   if (node.provenance.settled_by === "reviewer-accept") {
     if (!isNonAuthorityClass(node.class)) {
       return {
@@ -576,26 +585,46 @@ function parseNode(
     }
   }
   if (node.resolution === "resolved" && isNonAuthorityClass(node.class)) {
-    if (node.provenance.settled_by !== "reviewer-accept") {
+    const settled = node.provenance.settled_by;
+    if (settled !== "reviewer-accept" && settled !== "auto-accept" && settled !== "handoff") {
       return {
         ok: false,
-        reason: `node ${node.id} non-authority resolution requires reviewer-accept provenance`,
+        reason: `node ${node.id} non-authority resolution requires reviewer-accept, auto-accept, or handoff provenance`,
         code: "invalid_shape",
       };
     }
-    if (node.provenance.eligibility_reason !== NON_AUTHORITY_ELIGIBILITY_REASON) {
+    if (settled === "reviewer-accept" && node.provenance.eligibility_reason !== NON_AUTHORITY_ELIGIBILITY_REASON) {
       return {
         ok: false,
         reason: `node ${node.id} missing taxonomy eligibility reason`,
         code: "invalid_shape",
       };
     }
-  }
-  if (node.resolution === "resolved" && isOperatorRequiredClass(node.class)) {
-    if (node.provenance.settled_by !== "handoff") {
+    if (
+      settled === "auto-accept" &&
+      node.provenance.eligibility_reason !== AUTO_ACCEPT_ELIGIBILITY_REASON &&
+      node.provenance.eligibility_reason !== NON_AUTHORITY_ELIGIBILITY_REASON
+    ) {
       return {
         ok: false,
-        reason: `node ${node.id} operator-required resolution requires handoff provenance`,
+        reason: `node ${node.id} missing auto-accept eligibility reason`,
+        code: "invalid_shape",
+      };
+    }
+  }
+  if (node.resolution === "resolved" && isOperatorRequiredClass(node.class)) {
+    const settled = node.provenance.settled_by;
+    if (settled !== "handoff" && settled !== "auto-accept") {
+      return {
+        ok: false,
+        reason: `node ${node.id} operator-required resolution requires handoff or auto-accept provenance`,
+        code: "invalid_shape",
+      };
+    }
+    if (settled === "auto-accept" && node.provenance.eligibility_reason !== AUTO_ACCEPT_ELIGIBILITY_REASON) {
+      return {
+        ok: false,
+        reason: `node ${node.id} missing auto-accept eligibility reason`,
         code: "invalid_shape",
       };
     }
@@ -612,7 +641,12 @@ function parseProvenance(
   }
   const o = raw as Record<string, unknown>;
   const settled = o.settled_by;
-  if (settled !== "none" && settled !== "reviewer-accept" && settled !== "handoff") {
+  if (
+    settled !== "none" &&
+    settled !== "reviewer-accept" &&
+    settled !== "handoff" &&
+    settled !== "auto-accept"
+  ) {
     return { ok: false, reason: `node ${nodeId} settled_by is invalid`, code: "invalid_shape" };
   }
   const verdict = o.reviewer_verdict;
