@@ -235,6 +235,40 @@ test("eval-gate: exit 0 + gate mode + PR commit lookup fails → fails closed, r
   assert.equal((out as { to: string }).to, "pre-merge", "an unverifiable review state must fail closed to pre-merge, not advance directly");
 });
 
+test("eval-gate: typed production-preflight refusal is not flattened to exit -1", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 2 });
+  let invokeCalled = 0;
+  const deps = makeDeps(log, [failResult("attempt 1 failed")]);
+  Object.assign(deps, cleanFixDeps());
+  deps.invoke = async () => {
+    invokeCalled++;
+    return {
+      success: false,
+      stdout: "",
+      stderr:
+        "[harness omit-lifecycle-cli] adapter omits background_job_lifecycle. " +
+        "retrying the same invocation cannot succeed. Bearer SECRET-TOKEN",
+      exit_code: -1,
+      duration: 0,
+      timed_out: false,
+      preflight_failed: true,
+      preflight_class: "unsupported-setting",
+      preflight_reason_code: "capability-refusal",
+      preflight_intervention_kind: "auth-tooling-preflight-failure",
+    };
+  };
+
+  const out = await advanceEval(cfg, 44, {}, deps);
+
+  assert.equal(invokeCalled, 1, "the same refusal must not start another harness session");
+  assert.equal(out.advanced, false);
+  assert.equal(log.blocked.length, 1);
+  assert.match(log.blocked[0].reason, /background_job_lifecycle/);
+  assert.doesNotMatch(log.blocked[0].reason, /exit -1/);
+  assert.doesNotMatch(log.blocked[0].reason, /SECRET-TOKEN/);
+});
+
 test("eval-gate: non-zero exit + gate mode → setBlocked, no forward transition", async () => {
   const log = makeCallLog();
   const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 1 });

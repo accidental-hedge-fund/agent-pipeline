@@ -89,6 +89,7 @@ import type { Harness, PipelineConfig } from "./types.ts";
 export { MAX_ARG_STRLEN, MAX_ARGV_PROMPT_BYTES, checkMaterializedPromptBytes };
 export {
   runProductionPreflight,
+  productionPreflightRefusalReason,
   projectPreflightRemediation,
   resolveAbsoluteExecutable,
   defaultProductionPreflightDeps,

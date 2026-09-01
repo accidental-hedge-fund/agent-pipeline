@@ -29,7 +29,9 @@ import {
   type PromptDeliveryChannel,
 } from "./types.ts";
 import {
+  backgroundJobLifecycleCoherenceFailure,
   capabilityRefusalMessage,
+  malformedLifecycleRefusalMessage,
   requiresBackgroundJobLifecycle,
 } from "./background-job-lifecycle.ts";
 
@@ -136,6 +138,21 @@ export function sanitizePreflightDiagnostic(text: string): string {
     return `${cleaned.slice(0, PREFLIGHT_DIAGNOSTIC_MAX_CHARS)}…`;
   }
   return cleaned;
+}
+
+/**
+ * Bounded operator-facing reason for a typed production-preflight refusal.
+ * Returns null when the result is not a preflight refusal. Never copies prompt
+ * text; residual diagnostic text is sanitized.
+ */
+export function productionPreflightRefusalReason(result: {
+  preflight_failed?: boolean;
+  stderr?: string | null;
+}): string | null {
+  if (!result.preflight_failed) return null;
+  const raw = result.stderr?.trim() ?? "";
+  if (!raw) return "production preflight refused";
+  return sanitizePreflightDiagnostic(raw);
 }
 
 /**
@@ -296,9 +313,10 @@ export async function runProductionPreflight(
   }
 
   // 1b. Mutating implementer work requires an explicit background_job_lifecycle
-  // declaration (#1299 / #1364). Omitted field → capability-refusal. Explicit
-  // supported:false means the adapter cannot prove join; spawn anyway and leave
-  // the lifecycle supervisor off. Do not invent events.
+  // declaration (#1299 / #1364 / #1362). Omitted or malformed field →
+  // capability-refusal. Explicit supported:false means the adapter cannot prove
+  // join; spawn anyway and leave the lifecycle supervisor off. Do not invent
+  // events.
   if (requiresBackgroundJobLifecycle(req.stageKind)) {
     const lifecycle =
       adapter.capabilities.background_job_lifecycle ??
@@ -310,6 +328,22 @@ export async function runProductionPreflight(
         remediation: projectPreflightRemediation(adapter.name, "unsupported-setting", msg, {
           setting: "background_job_lifecycle",
           value: "omitted",
+        }),
+        cliPath: null,
+        versionProbe: null,
+        promptBytes: limitCheck.measured,
+        adapterRequest,
+        role,
+      };
+    }
+    const coherence = backgroundJobLifecycleCoherenceFailure(lifecycle);
+    if (coherence) {
+      const msg = malformedLifecycleRefusalMessage(adapter.name, coherence);
+      return {
+        ok: false,
+        remediation: projectPreflightRemediation(adapter.name, "unsupported-setting", msg, {
+          setting: "background_job_lifecycle",
+          value: "malformed",
         }),
         cliPath: null,
         versionProbe: null,

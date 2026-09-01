@@ -33,7 +33,7 @@ import {
   PRE_PLANNING_CONTEXT_HEADER,
 } from "../issue-context-snapshot.ts";
 import * as path from "node:path";
-import { invoke, formatStderrExcerpt, papercutIdentityEnv, type HarnessResult, type InvokeOptions } from "../harness.ts";
+import { invoke, formatStderrExcerpt, papercutIdentityEnv, productionPreflightRefusalReason, type HarnessResult, type InvokeOptions } from "../harness.ts";
 import { invokeReviewer, selfReviewBanner } from "../self-review.ts";
 import {
   assertNoEnsembleStageExecutorBypass,
@@ -1362,9 +1362,11 @@ export async function runPlanningPhases(
           await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
           return blockedOutcome(waitReason, "harness-failure", diagnostic);
         }
-        const reason = result.timed_out
-          ? `timed out after ${result.duration.toFixed(0)}s`
-          : `exit ${result.exit_code}${formatStderrExcerpt(result.stderr)}`;
+        const preflightReason = productionPreflightRefusalReason(result);
+        const reason = preflightReason
+          ?? (result.timed_out
+            ? `timed out after ${result.duration.toFixed(0)}s`
+            : `exit ${result.exit_code}${formatStderrExcerpt(result.stderr)}`);
 
         // #547 salvage / #1246 checkpoint / #1272 unpublished publish:
         // a timeout that left recovered work must consult the shared
@@ -1556,6 +1558,20 @@ export async function runPlanningPhases(
               blockerKind: "harness-failure",
               reason: blockMsg,
               stage: "implementing",
+              ...(result.preflight_failed
+                ? {
+                    preflightFailed: true,
+                    ...(result.preflight_class !== undefined
+                      ? { preflightClass: result.preflight_class }
+                      : {}),
+                    ...(result.preflight_reason_code !== undefined
+                      ? { preflightReasonCode: result.preflight_reason_code }
+                      : {}),
+                    ...(result.preflight_intervention_kind !== undefined
+                      ? { preflightInterventionKind: result.preflight_intervention_kind }
+                      : {}),
+                  }
+                : {}),
             });
             await doSetBlocked(
               cfg,

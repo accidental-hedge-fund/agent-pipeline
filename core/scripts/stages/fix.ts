@@ -31,7 +31,7 @@ import {
   type ScopedOverride,
 } from "../review-policy.ts";
 import * as path from "node:path";
-import { invoke, papercutIdentityEnv, type HarnessResult } from "../harness.ts";
+import { invoke, papercutIdentityEnv, productionPreflightRefusalReason, type HarnessResult } from "../harness.ts";
 import { invokeStageExecutor, type ExecutorHttpDeps } from "../executors.ts";
 import {
   branchName,
@@ -1020,11 +1020,10 @@ export async function advanceFix(
       }
       if (!result.success && !ctx.salvaged && !ctx.ownershipCheckpointed) {
         const classified = classifyHarnessFailure(result);
-        const finalReason = result.preflight_failed
-          ? (result.stderr?.trim() || "production preflight refused")
-          : result.timed_out
+        const finalReason = productionPreflightRefusalReason(result)
+          ?? (result.timed_out
             ? `timed out after ${result.duration.toFixed(0)}s`
-            : `exit ${result.exit_code}`;
+            : `exit ${result.exit_code}`);
         const attemptsNote = retryResult.attempts.length > 1
           ? ` after ${retryResult.attempts.length} attempts`
           : "";
@@ -1045,6 +1044,20 @@ export async function advanceFix(
           blockerKind: "harness-failure",
           reason: finalReason,
           stage,
+          ...(result.preflight_failed
+            ? {
+                preflightFailed: true,
+                ...(result.preflight_class !== undefined
+                  ? { preflightClass: result.preflight_class }
+                  : {}),
+                ...(result.preflight_reason_code !== undefined
+                  ? { preflightReasonCode: result.preflight_reason_code }
+                  : {}),
+                ...(result.preflight_intervention_kind !== undefined
+                  ? { preflightInterventionKind: result.preflight_intervention_kind }
+                  : {}),
+              }
+            : {}),
         });
         await setBlocked(cfg, issueNumber, reason, stage, "harness-failure");
         return { kind: "early", outcome: fixHarnessFailureOutcome(finalReason, diagnostic) };

@@ -576,6 +576,32 @@ export function capabilityRefusalMessage(adapterName: string): string {
   );
 }
 
+/** Bounded malformed-declaration refusal; `coherenceFailure` already names the field. */
+export function malformedLifecycleRefusalMessage(
+  adapterName: string,
+  coherenceFailure: string,
+): string {
+  return (
+    `[harness ${adapterName}] adapter declares a malformed background_job_lifecycle: ${coherenceFailure}. ` +
+    `This is a typed capability-refusal, not a transient spawn error — ` +
+    `retrying the same invocation cannot succeed without changing the adapter or the declaration.`
+  );
+}
+
+/** Recipes that mutate a worktree or invent a session after a never-started harness. */
+export const NEVER_STARTED_PREFLIGHT_FORBIDDEN_RECIPES = [
+  "unlink_engine_scratch",
+  "checkpoint_owned_harness_dirt",
+  "publish_unpublished_stage_commit",
+] as const;
+
+export function filterRecipesForNeverStartedPreflight<T extends string>(
+  recipes: readonly T[],
+): T[] {
+  const forbidden = new Set<string>(NEVER_STARTED_PREFLIGHT_FORBIDDEN_RECIPES);
+  return recipes.filter((r) => !forbidden.has(r));
+}
+
 /**
  * Historical / incident protocol fixture shape. Transcript mentions of a
  * background test run must not flip support.

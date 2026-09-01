@@ -1176,6 +1176,49 @@ test("runPlanningPhases — blocker equivalence: implementation harness failure"
   assert.ok(o?.reason.startsWith("Implementation harness"), `openspec reason: ${o?.reason}`);
 });
 
+test("runPlanningPhases: typed production-preflight refusal is not flattened to exit -1", async () => {
+  const preflightRefusal: HarnessResult = {
+    success: false,
+    stdout: "",
+    stderr:
+      "[harness omit-lifecycle-cli] adapter omits background_job_lifecycle. " +
+      "retrying the same invocation cannot succeed. Bearer SECRET-TOKEN",
+    exit_code: -1,
+    duration: 0,
+    timed_out: false,
+    preflight_failed: true,
+    preflight_class: "unsupported-setting",
+    preflight_reason_code: "capability-refusal",
+    preflight_intervention_kind: "auth-tooling-preflight-failure",
+  };
+  let callCount = 0;
+  const result = await runAndCaptureOutcome(openspecHooks(), {
+    invoke: async () => {
+      callCount++;
+      return callCount >= 2 ? preflightRefusal : revisionOkResult;
+    },
+  });
+  assert.equal(callCount, 2, "plan revision + one implement treatment");
+  assert.equal(result.captured?.tag, "harness-failure");
+  assert.equal(result.captured?.stage, "implementing");
+  assert.match(result.captured?.reason ?? "", /background_job_lifecycle/);
+  assert.doesNotMatch(result.captured?.reason ?? "", /exit -1/);
+  assert.doesNotMatch(result.captured?.reason ?? "", /SECRET-TOKEN/);
+  assert.equal(result.outcome.advanced, false);
+  if (!result.outcome.advanced && result.outcome.status === "blocked") {
+    assert.equal(result.outcome.blockerKind, "harness-failure");
+    assert.equal(result.outcome.diagnostic?.reason_code, "capability-refusal");
+    assert.equal(result.outcome.diagnostic?.detail.preflight_failed, true);
+    assert.equal(result.outcome.diagnostic?.detail.preflight_reason_code, "capability-refusal");
+    assert.equal(
+      result.outcome.diagnostic?.detail.preflight_intervention_kind,
+      "auth-tooling-preflight-failure",
+    );
+    assert.doesNotMatch(result.outcome.reason, /exit -1/);
+    assert.doesNotMatch(result.outcome.reason, /SECRET-TOKEN/);
+  }
+});
+
 // ---------------------------------------------------------------------------
 // #547: implement-stage harness failure/timeout path attempts salvage before
 // blocking, mirroring the fix stage's crash-retry salvage (#486).

@@ -852,6 +852,37 @@ test("gate (regression / finding #1): dirty state after fix always blocks, regar
   assert.match(out.blockReason ?? "", /uncommitted/i);
 });
 
+test("gate: typed production-preflight refusal is not flattened to exit -1", async () => {
+  let invoked = 0;
+  const out = await runTestGate(cfgWith({ max_attempts: 2 }), 1, "/wt", {
+    detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),
+    runTests: async () => failResult,
+    invoke: async () => {
+      invoked += 1;
+      return {
+        success: false,
+        stdout: "",
+        stderr:
+          "[harness omit-lifecycle-cli] adapter omits background_job_lifecycle. " +
+          "retrying the same invocation cannot succeed. Bearer SECRET-TOKEN",
+        exit_code: -1,
+        duration: 0,
+        timed_out: false,
+        preflight_failed: true,
+        preflight_class: "unsupported-setting",
+        preflight_reason_code: "capability-refusal",
+        preflight_intervention_kind: "auth-tooling-preflight-failure",
+      };
+    },
+    ...cleanGitDeps(),
+  });
+  assert.equal(out.passed, false);
+  assert.equal(invoked, 1, "the same refusal must not start another harness session");
+  assert.match(out.blockReason ?? "", /background_job_lifecycle/);
+  assert.doesNotMatch(out.blockReason ?? "", /exit -1/);
+  assert.doesNotMatch(out.blockReason ?? "", /SECRET-TOKEN/);
+});
+
 test("gate: fix harness itself fails → blocked with harness reason", async () => {
   const out = await runTestGate(cfgWith({}), 1, "/wt", {
     detectTestCommand: () => ({ cmd: "npm", args: ["test"] }),

@@ -17,6 +17,7 @@ import * as path from "node:path";
 import type { spawn } from "node:child_process";
 import {
   invoke as defaultInvoke,
+  productionPreflightRefusalReason,
   runCapped,
   type HarnessResult,
   type InvokeOptions,
@@ -879,9 +880,12 @@ export async function runTestGate(
           },
         );
       }
-      const reason = fixRes.timed_out
-        ? `Fix harness (${harness}) timed out after ${fixRes.duration.toFixed(0)}s on test-gate fix attempt ${attempt}.`
-        : `Fix harness (${harness}) failed (exit ${fixRes.exit_code}) on test-gate fix attempt ${attempt}.`;
+      const preflightReason = productionPreflightRefusalReason(fixRes);
+      const reason = preflightReason
+        ? `Fix harness (${harness}) failed (${preflightReason}) on test-gate fix attempt ${attempt}.`
+        : fixRes.timed_out
+          ? `Fix harness (${harness}) timed out after ${fixRes.duration.toFixed(0)}s on test-gate fix attempt ${attempt}.`
+          : `Fix harness (${harness}) failed (exit ${fixRes.exit_code}) on test-gate fix attempt ${attempt}.`;
       // Fix harness failure is not a suite tooling_failure; last suite observation stands.
       const overallStatus =
         lastCmdForEvidence?.status === "timeout"
