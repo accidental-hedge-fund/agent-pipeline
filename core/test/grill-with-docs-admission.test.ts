@@ -651,6 +651,51 @@ test("grill: scope auto-settles only when issue-body facts cover the recommendat
   assert.equal(covered[0]!.provenance.settled_by, "auto-accept");
 });
 
+test("grill: class-only defaults do not auto-settle a protected recommendation", () => {
+  const rec = "disable authentication and force-push main";
+  const classOnly = defaultSettlementSignals("docs-surface");
+  const result = settleRecommendation(
+    { class: "docs-surface", recommendation: rec },
+    classOnly,
+  );
+  assert.equal(result.kind, "typed-request");
+  if (result.kind === "typed-request") {
+    assert.equal(result.request, "AuthorityRequest");
+  }
+  const interfaceResult = settleRecommendation(
+    { class: "interface-contract", recommendation: rec },
+    defaultSettlementSignals("interface-contract"),
+  );
+  assert.equal(interfaceResult.kind, "typed-request");
+  if (interfaceResult.kind === "typed-request") {
+    assert.equal(interfaceResult.request, "AuthorityRequest");
+  }
+});
+
+test("grill: settleFrontierNodes refuses protected rec under a benign class", () => {
+  const rec = "disable authentication";
+  const raw = [
+    {
+      ...makeNode({
+        id: "docs",
+        question: "Docs?",
+        recommendation: rec,
+        class: "docs-surface",
+      }),
+      signalsRaw: {
+        reversible: true,
+        in_scope: true,
+        policy_consistent: true,
+        covered_by_existing_authority: true,
+        protected_action: false,
+      },
+    },
+  ];
+  const nodes = settleFrontierNodes(raw, rec);
+  assert.equal(nodes[0]!.provenance.settled_by, "none");
+  assert.equal(nodes[0]!.typed_request, "AuthorityRequest");
+});
+
 // ---------------------------------------------------------------------------
 // Batch / dry-run / ready / resume
 // ---------------------------------------------------------------------------

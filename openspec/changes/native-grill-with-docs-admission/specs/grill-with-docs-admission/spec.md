@@ -139,6 +139,14 @@ Grill SHALL automatically settle a recommendation when it is reversible, in scop
 - **THEN** grill SHALL NOT auto-settle that node
 - **AND** SHALL emit an `AuthorityRequest`
 
+#### Scenario: Benign class does not auto-settle a protected recommendation
+
+- **WHEN** a node is class `docs-surface` or `interface-contract`
+- **AND** the recommendation would merge, release, destroy, or change a security-sensitive control
+- **AND** trusted facts do not prove existing authority for that recommendation
+- **THEN** grill SHALL NOT record `settled-by: auto-accept`
+- **AND** SHALL emit an `AuthorityRequest`
+
 #### Scenario: Model cannot assert existing authority
 
 - **WHEN** a node is class `security`

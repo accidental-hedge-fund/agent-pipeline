@@ -69,6 +69,7 @@ import {
 } from "../grill-selector.ts";
 import {
   engineCoveredByExistingAuthority,
+  engineProtectedAction,
   parseSignalsFromModel,
   settleRecommendation,
 } from "../grill-settle.ts";
@@ -302,7 +303,12 @@ export function settleFrontierNodes(
       const deps = node.depends_on ?? [];
       if (deps.some((d) => !done.has(d) && byId.has(d))) continue;
       progressed = true;
-      const signals = parseSignalsFromModel(node.signalsRaw, node.class);
+      const signals = parseSignalsFromModel(
+        node.signalsRaw,
+        node.class,
+        node.recommendation,
+        factText,
+      );
       if (factText && node.question && factText.toLowerCase().includes(node.question.toLowerCase().slice(0, 40))) {
         signals.discoverable_from_facts = true;
       }
@@ -311,6 +317,11 @@ export function settleFrontierNodes(
         node.recommendation,
         factText,
       );
+      signals.protected_action = engineProtectedAction(node.class, node.recommendation);
+      if (signals.protected_action) {
+        signals.reversible = false;
+        signals.covered_by_existing_authority = false;
+      }
       const result = settleRecommendation(node, signals);
       if (result.kind === "auto-accept") {
         out.set(node.id, {

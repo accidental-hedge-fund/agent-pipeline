@@ -73,6 +73,14 @@ The model MAY propose a class. Pipeline SHALL accept a class only when it is a m
 - **WHEN** a node has a taxonomy class and a recommended default that is reversible, in scope, policy-consistent, and covered by existing authority
 - **THEN** grill SHALL write the body with that default and `settled-by: auto-accept`
 
+#### Scenario: Benign class does not auto-settle a protected recommendation
+
+- **WHEN** a node is class `docs-surface` or `interface-contract`
+- **AND** the recommendation would merge, release, destroy, or change a security-sensitive control
+- **AND** trusted facts do not prove existing authority for that recommendation
+- **THEN** grill SHALL NOT record `settled-by: auto-accept`
+- **AND** SHALL emit an `AuthorityRequest`
+
 #### Scenario: Model cannot assert existing authority
 
 - **WHEN** a node is class `security`
