@@ -14,6 +14,7 @@ import {
   DEFAULT_FRG_THRESHOLDS,
   computeFrgEvidence,
 } from "../scripts/factory-reliability-gate.ts";
+import { frgPassUniqueOperations } from "./frg-pass-unique-operations.ts";
 import { isMidFlightPipelineStage } from "../scripts/loop/precondition.ts";
 import { classifyDrift } from "../scripts/loop/reconcile.ts";
 import type { LoopExternalIdentity } from "../scripts/loop/types.ts";
@@ -416,6 +417,7 @@ test("FRG Layer A clean-item-throughput + blocker-taxonomy: thresholds are numer
     scenario_overrides: packObs,
     composition_overrides: packComp,
     attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
+    ...frgPassUniqueOperations("1.29.1"),
   });
   assert.equal(pass.pass, true);
   assert.equal(pass.scoreboard.engine_class_rate, 0);

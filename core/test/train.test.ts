@@ -2106,6 +2106,7 @@ test("train appendEvent helper: monotonic seq 1,2,3 and unknown fields", async (
   const session = createTrainEventSession({
     runDir,
     runId: "train-seq",
+    logicalOperationId: "lop-train-seq",
     store: store.deps,
     now: () => new Date("2026-08-28T17:28:03.000Z"),
   });
@@ -2175,6 +2176,10 @@ test("train events: train_loop_linked records a confirmed wave loop id (#1277 1.
   assert.ok(linked, "train stream must contain train_loop_linked");
   assert.equal(linked!.loop_run_id, loopId);
   assert.equal(linked!.events, loopEvents);
+  assert.equal(typeof linked!.logical_operation_id, "string");
+  assert.ok(String(linked!.logical_operation_id).startsWith("lop-"));
+  const start = events.find((e) => e.type === "run_start");
+  assert.equal(linked!.logical_operation_id, start!.logical_operation_id);
   assert.ok(!events.some((e) => JSON.stringify(e).includes("/training")));
   assert.ok(!events.some((e) => JSON.stringify(e).includes("0 errors")));
 });

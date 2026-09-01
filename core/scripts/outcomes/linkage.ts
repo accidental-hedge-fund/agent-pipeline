@@ -26,6 +26,8 @@ export interface RunIdentity {
   /** Candidate / head SHA when known. */
   candidate_sha?: string | null;
   started_at?: string | null;
+  /** Written-once logical-operation identity when the run stores it (#1368). */
+  logical_operation_id?: string | null;
 }
 
 export interface ParsedTrailers {
@@ -116,6 +118,7 @@ export function makeAttribution(args: {
   confidence?: number | null;
   note?: string | null;
   disputed?: boolean;
+  logical_operation_id?: string | null;
 }): OutcomeAttribution | null {
   if (!args.target_id || isPlaceholderIdentity(args.target_id)) return null;
   if (args.target_type === "commit") {
@@ -129,6 +132,9 @@ export function makeAttribution(args: {
       confidence: args.confidence ?? null,
       note: args.note ?? null,
       disputed: args.disputed,
+      ...(typeof args.logical_operation_id === "string" && args.logical_operation_id.trim()
+        ? { logical_operation_id: args.logical_operation_id.trim() }
+        : {}),
     };
   }
   return {
@@ -139,6 +145,9 @@ export function makeAttribution(args: {
     confidence: args.confidence ?? null,
     note: args.note ?? null,
     disputed: args.disputed,
+    ...(typeof args.logical_operation_id === "string" && args.logical_operation_id.trim()
+      ? { logical_operation_id: args.logical_operation_id.trim() }
+      : {}),
   };
 }
 
@@ -164,6 +173,7 @@ export function resolveRunFromTrailer(
         method: "trailer",
         authority: "observed",
         confidence: 1,
+        logical_operation_id: hit.logical_operation_id,
       });
       return { attribution: a, diagnostic: null };
     }
@@ -182,6 +192,7 @@ export function resolveRunFromTrailer(
           method: "trailer",
           authority: "observed",
           confidence: 0.95,
+          logical_operation_id: r.logical_operation_id,
         });
         return { attribution: a, diagnostic: null };
       }

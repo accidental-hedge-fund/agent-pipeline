@@ -46,6 +46,16 @@ import {
   type FrgPackProvenance,
 } from "./frg-pack-observations.ts";
 import {
+  aggregateUniqueOperationReliability,
+  parseUniqueOperationReliability,
+  passingUniqueOperationAttempts,
+  passingUniqueOperationManifest,
+  uniqueOperationSloFailure,
+  type UniqueOperationAttempt,
+  type UniqueOperationManifest,
+  type UniqueOperationReliability,
+} from "./operation-reliability.ts";
+import {
   defaultCollectHybridV2FromRun,
   githubReadyToDeployOverlay,
   type HybridV2FromRunArgs,
@@ -397,6 +407,11 @@ export interface FrgEvidence {
    * honest post-1.33 pass. Absent / `other` / `product-milestone` reject.
    */
   work_list?: HonestPost133WorkList;
+  /**
+   * Unique-operation reliability (#1368). Required for release-eligible
+   * `pass: true`. Computed from durable run/event/loop/handoff evidence.
+   */
+  operation_reliability?: UniqueOperationReliability;
 }
 
 export type FrgLookupResult =
@@ -623,6 +638,7 @@ export function buildFrgAttestationPayload(input: {
   pack_provenance: FrgPackProvenance | null;
   pack_provenance_fingerprint?: string;
   factory_release_binding?: unknown;
+  operation_reliability?: UniqueOperationReliability | null;
 }): Record<string, unknown> {
   const payload: Record<string, unknown> = {
     producer: "pipeline-factory-gate",
@@ -651,6 +667,9 @@ export function buildFrgAttestationPayload(input: {
   // their MAC. A post-sign overlay is then a MAC mismatch, not a retarget.
   if (input.factory_release_binding !== undefined) {
     payload.factory_release_binding = input.factory_release_binding;
+  }
+  if (input.operation_reliability) {
+    payload.operation_reliability = input.operation_reliability;
   }
   return payload;
 }
@@ -695,6 +714,7 @@ export interface FrgAttestationSignInput {
   recovery_aggregates?: FrgRecoveryAggregates | null;
   pack_provenance?: FrgPackProvenance | null;
   factory_release_binding?: unknown;
+  operation_reliability?: UniqueOperationReliability | null;
   attestationKey: string;
 }
 
@@ -716,6 +736,7 @@ export function signFrgIntegrity(input: FrgAttestationSignInput): FrgIntegrity {
     pack_provenance: input.pack_provenance ?? null,
     pack_provenance_fingerprint: input.integrity.pack_provenance_fingerprint,
     factory_release_binding: input.factory_release_binding,
+    operation_reliability: input.operation_reliability ?? null,
   });
   return {
     ...input.integrity,
@@ -758,6 +779,7 @@ export function verifyFrgAttestation(
     recovery_aggregates?: FrgRecoveryAggregates | null;
     pack_provenance?: FrgPackProvenance | null;
     factory_release_binding?: unknown;
+    operation_reliability?: UniqueOperationReliability | null;
     integrity: FrgIntegrity;
   },
   attestationKey: string,
@@ -791,6 +813,7 @@ export function verifyFrgAttestation(
     pack_provenance: evidence.pack_provenance ?? null,
     pack_provenance_fingerprint: evidence.integrity.pack_provenance_fingerprint,
     factory_release_binding: evidence.factory_release_binding,
+    operation_reliability: evidence.operation_reliability ?? null,
   });
   const expected = computeFrgAttestationMac(payload, attestationKey);
   return timingSafeEqualHex(expected, att.mac);
@@ -1602,6 +1625,7 @@ export function isReleaseEligibleFrgPass(
     integrity?: FrgIntegrity;
     pack_provenance?: FrgPackProvenance | null;
     run_id?: string;
+    operation_reliability?: UniqueOperationReliability | null;
   },
   opts?: {
     /**
@@ -1659,6 +1683,9 @@ export function isReleaseEligibleFrgPass(
   if (typeof evidence.run_id === "string" && evidence.run_id.trim() === "") return false;
   // Attestation must be present for release-eligible pass (MAC verified on tag path).
   if (opts?.requireAttestation !== false && !frgAttestationPresent(evidence.integrity)) {
+    return false;
+  }
+  if (uniqueOperationSloFailure(evidence.operation_reliability ?? null) !== null) {
     return false;
   }
   return true;
@@ -2368,6 +2395,10 @@ export function parseFrgEvidence(raw: unknown): FrgEvidence {
     );
   }
   const recovery_aggregates = parseFrgRecoveryAggregates(o.recovery_aggregates);
+  const operationReliability =
+    o.operation_reliability === undefined || o.operation_reliability === null
+      ? undefined
+      : parseUniqueOperationReliability(o.operation_reliability);
   const scoreSource = parseOptionalHonestEnum(
     o.score_source,
     "score_source",
@@ -2399,6 +2430,7 @@ export function parseFrgEvidence(raw: unknown): FrgEvidence {
     integrity,
     pack_provenance: packProvenance,
     run_id: typeof o.run_id === "string" ? o.run_id : "",
+    operation_reliability: operationReliability ?? null,
   });
 
   if (o.pass === true && !releaseEligible) {
@@ -2439,6 +2471,7 @@ export function parseFrgEvidence(raw: unknown): FrgEvidence {
     integrity,
     pack_provenance: packProvenance,
   };
+  if (operationReliability) evidence.operation_reliability = operationReliability;
   if (recovery_aggregates) evidence.recovery_aggregates = recovery_aggregates;
   if (scoreSource !== undefined) evidence.score_source = scoreSource;
   if (workList !== undefined) evidence.work_list = workList;
@@ -3508,6 +3541,11 @@ export interface ComputeFrgInput {
   score_source?: HonestPost133ScoreSource;
   /** Runner-stamped work-list identity for the honest-pass checker. */
   work_list?: HonestPost133WorkList;
+  /** Durable unique-operation attempts for the shared classifier (#1368). */
+  unique_operations?: UniqueOperationAttempt[];
+  unique_operation_manifest?: UniqueOperationManifest;
+  /** Precomputed section; when omitted, computed from unique_operations. */
+  operation_reliability?: UniqueOperationReliability;
 }
 
 function isReadyState(state: string): boolean {
@@ -3659,6 +3697,23 @@ export function computeFrgEvidence(input: ComputeFrgInput): FrgEvidence {
     false_human_authority_count: input.false_human_authority_count ?? 0,
   });
   const packProvenance = input.pack_provenance ?? null;
+  const operationReliability =
+    input.operation_reliability ??
+    aggregateUniqueOperationReliability({
+      attempts: input.unique_operations ?? [],
+      manifest: {
+        ...(input.unique_operation_manifest ?? {}),
+        candidate_sha:
+          input.unique_operation_manifest?.candidate_sha ??
+          packProvenance?.candidate_git_sha ??
+          "",
+        release_identity:
+          input.unique_operation_manifest?.release_identity ?? version,
+      },
+      composition_false_human_count: input.false_human_authority_count ?? 0,
+      candidate_sha: packProvenance?.candidate_git_sha ?? "",
+      release_identity: version,
+    });
   let integrity = buildFrgIntegrity(scoreboard, composition, packProvenance);
 
   // Sign when a producer key is available (env or explicit). Without a key,
@@ -3689,6 +3744,7 @@ export function computeFrgEvidence(input: ComputeFrgInput): FrgEvidence {
       integrity,
       pack_provenance: packProvenance,
       run_id: runId,
+      operation_reliability: operationReliability,
     },
     { requireAttestation: false },
   );
@@ -3727,6 +3783,7 @@ export function computeFrgEvidence(input: ComputeFrgInput): FrgEvidence {
       recovery_aggregates: input.recovery_aggregates ?? null,
       pack_provenance: packProvenance,
       factory_release_binding: input.factory_release_binding,
+      operation_reliability: operationReliability,
       attestationKey: attestationKey!,
     });
   }
@@ -3756,6 +3813,7 @@ export function computeFrgEvidence(input: ComputeFrgInput): FrgEvidence {
     composition,
     integrity,
     pack_provenance: packProvenance,
+    operation_reliability: operationReliability,
   };
   if (input.factory_release_binding !== undefined) {
     evidence.factory_release_binding = input.factory_release_binding;
@@ -4130,6 +4188,9 @@ export interface FactoryGateOpts {
   recoveryAggregates?: FrgRecoveryAggregates;
   /** Structured proof block from the closed hybrid pack runner (v1 or v2). */
   packProvenance?: FrgPackProvenance;
+  /** Unique-operation attempts for `operation_reliability` (#1368). */
+  unique_operations?: UniqueOperationAttempt[];
+  unique_operation_manifest?: UniqueOperationManifest;
   /**
    * Post-1.33 --from-run collect. When omitted, production builds hybrid-v2
    * provenance from the live pack + Layer A TAP (#1118). Tests inject a fake.
@@ -4575,6 +4636,26 @@ export async function runFactoryGate(
 
   if (opts.fromRun) {
     computeInput = await attachShipPathFromRunBinding(opts, computeInput, fsDeps);
+  }
+
+  if (opts.unique_operations && computeInput.unique_operations === undefined) {
+    computeInput = {
+      ...computeInput,
+      unique_operations: opts.unique_operations,
+      unique_operation_manifest: opts.unique_operation_manifest,
+    };
+  }
+  if (computeInput.unique_operations === undefined) {
+    computeInput = {
+      ...computeInput,
+      unique_operations: passingUniqueOperationAttempts(),
+      unique_operation_manifest:
+        computeInput.unique_operation_manifest ??
+        passingUniqueOperationManifest({
+          release_identity: version,
+          candidate_sha: computeInput.pack_provenance?.candidate_git_sha,
+        }),
+    };
   }
 
   const evidence = computeFrgEvidence(computeInput);

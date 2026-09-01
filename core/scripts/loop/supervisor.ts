@@ -2908,12 +2908,17 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
     // Advertise identity after exclusive lock, before any dispatch can block (#665).
     // Inside try so a handoff write failure still releases the exclusive lock.
     if (input.onRunReady) {
+      const logicalOperationId =
+        typeof contract.logical_operation_id === "string" && contract.logical_operation_id.trim()
+          ? contract.logical_operation_id.trim()
+          : undefined;
       await input.onRunReady({
         runId: input.runId,
         runDir: runDir(deps.store, input.runId),
         events: runEventsPath(deps.store, input.runId),
         engine: input.engine,
         resumed: attach.resumed,
+        ...(logicalOperationId ? { logical_operation_id: logicalOperationId } : {}),
       });
     }
 

@@ -462,6 +462,12 @@ export interface DependencyDiscoveryAudit {
 export interface LoopContract {
   readonly schema: typeof LOOP_CONTRACT_SCHEMA;
   run_id: string;
+  /**
+   * Parent or admission logical-operation identity (#1368). Additive;
+   * nested child runs persist the parent id and do not mint a second one.
+   * Absent on historical contracts (missing correlation).
+   */
+  logical_operation_id?: string;
   engine: LoopEngineName;
   repo: {
     name: string;

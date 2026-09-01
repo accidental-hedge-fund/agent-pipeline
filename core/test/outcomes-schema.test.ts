@@ -64,6 +64,43 @@ test("closed enums are locked", () => {
   assert.ok(ATTRIBUTION_METHODS.includes("trailer"));
 });
 
+test("attribution may carry logical_operation_id from the observed run", () => {
+  const r = validateProductionOutcome(
+    baseDeliveryOutcome({
+      attribution: [
+        {
+          target_type: "run",
+          target_id: "155-2026-06-16T21-11-35-000Z",
+          method: "adapter",
+          authority: "observed",
+          confidence: 1,
+          logical_operation_id: "lop-from-run",
+        },
+      ],
+    }),
+  );
+  assert.equal(r.ok, true);
+  assert.equal(r.value?.attribution[0]?.logical_operation_id, "lop-from-run");
+});
+
+test("historical attribution without logical_operation_id remains valid", () => {
+  const r = validateProductionOutcome(
+    baseDeliveryOutcome({
+      attribution: [
+        {
+          target_type: "run",
+          target_id: "155-2026-06-16T21-11-35-000Z",
+          method: "adapter",
+          authority: "observed",
+          confidence: 1,
+        },
+      ],
+    }),
+  );
+  assert.equal(r.ok, true);
+  assert.equal(r.value?.attribution[0]?.logical_operation_id, undefined);
+});
+
 test("validate accepts well-formed delivery record", () => {
   const r = validateProductionOutcome(baseDeliveryOutcome());
   assert.equal(r.ok, true);

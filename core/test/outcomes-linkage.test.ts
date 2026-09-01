@@ -50,6 +50,20 @@ test("trailer to run resolution is observed authority", () => {
   assert.equal(diagnostic, null);
 });
 
+test("run attribution copies logical_operation_id when the run stores it", () => {
+  const { attribution } = resolveRunFromTrailer("42/2026-06-08T14:32:00Z", [
+    { ...runs[0]!, logical_operation_id: "lop-from-run" },
+  ]);
+  assert.ok(attribution);
+  assert.equal(attribution.logical_operation_id, "lop-from-run");
+});
+
+test("run attribution omits logical_operation_id when the run has none", () => {
+  const { attribution } = resolveRunFromTrailer("42/2026-06-08T14:32:00Z", runs);
+  assert.ok(attribution);
+  assert.equal(attribution.logical_operation_id, undefined);
+});
+
 test("unresolved trailer returns diagnostic without throw", () => {
   const { attribution, diagnostic } = resolveRunFromTrailer(
     "999/2026-01-01T00:00:00Z",

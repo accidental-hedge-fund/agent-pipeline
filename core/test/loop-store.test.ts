@@ -194,6 +194,23 @@ test("initRun refuses a malicious run id before creating anything", async () => 
 // Run init + layout
 // ---------------------------------------------------------------------------
 
+test("nested loop contract stores parent logical_operation_id and resume keeps it", async () => {
+  const { deps } = fakeDeps();
+  const contract = { ...testContract(), logical_operation_id: "lop-parent" };
+  await initRun(deps, contract, testLedger());
+  const loaded = await readContract(deps, "run-1");
+  assert.equal(loaded.logical_operation_id, "lop-parent");
+  assert.equal(loaded.run_id, "run-1");
+  const resumed = await readContract(deps, "run-1");
+  assert.equal(resumed.logical_operation_id, "lop-parent");
+  await assert.rejects(
+    () => initRun(deps, { ...testContract(), logical_operation_id: "lop-other" }, testLedger()),
+    /already exists/,
+  );
+  const after = await readContract(deps, "run-1");
+  assert.equal(after.logical_operation_id, "lop-parent");
+});
+
 test("initRun creates contract + ledger and emits an init event", async () => {
   const { deps, files } = fakeDeps();
   await initRun(deps, testContract(), testLedger());

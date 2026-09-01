@@ -130,6 +130,11 @@ export interface OutcomeAttribution {
   confidence: number | null;
   note?: string | null;
   disputed?: boolean;
+  /**
+   * Logical-operation identity when the attributed run stores one (#1368).
+   * Additive; omitted on historical runs. Never invented from labels.
+   */
+  logical_operation_id?: string;
 }
 
 export interface ProductionOutcome {
@@ -355,6 +360,9 @@ function validateAttribution(raw: unknown, issues: ValidationIssue[], path: stri
     confidence,
     note: typeof o.note === "string" ? redactFreeText(o.note, 200) : null,
     disputed: o.disputed === true ? true : undefined,
+    ...(typeof o.logical_operation_id === "string" && o.logical_operation_id.trim()
+      ? { logical_operation_id: o.logical_operation_id.trim() }
+      : {}),
   };
 }
 

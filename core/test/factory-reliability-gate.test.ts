@@ -83,6 +83,11 @@ import {
   type FactoryReleasePrepareRequest,
 } from "../scripts/factory-release-prepare.ts";
 import { presentFrgAttestorCredential } from "../scripts/ship-end-candidate.ts";
+import {
+  passingUniqueOperationAttempts,
+  passingUniqueOperationManifest,
+} from "../scripts/operation-reliability.ts";
+import { frgPassUniqueOperations } from "./frg-pass-unique-operations.ts";
 
 /** Minimal full-pack pass scoring input (all scenarios + composition; K met; live loop). */
 function fullPackPassInput(
@@ -114,6 +119,10 @@ function fullPackPassInput(
       overrides.attestation_key === undefined
         ? FRG_UNIT_TEST_ATTESTATION_KEY
         : overrides.attestation_key,
+    unique_operations: passingUniqueOperationAttempts(),
+    unique_operation_manifest: passingUniqueOperationManifest({
+      release_identity: overrides.version ?? "1.29.1",
+    }),
   };
 }
 
@@ -255,6 +264,7 @@ test("computeFrgEvidence: green unit-shaped pass with K clean ready items + full
     composition_overrides: frgRequiredCompositionOverrides("pass"),
     attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
     now: () => new Date("2026-07-30T12:00:00.000Z"),
+    ...frgPassUniqueOperations("1.29.1"),
   });
   assert.equal(evidence.schema_version, FRG_SCHEMA_VERSION);
   assert.equal(evidence.version, "1.29.1");
@@ -2799,6 +2809,7 @@ test("validateReleaseEligibleFrgEvidence rejects hand-authored self-consistent e
       scoreboard: honest.scoreboard,
       composition: honest.composition,
       recovery_aggregates: honest.recovery_aggregates ?? null,
+      operation_reliability: honest.operation_reliability ?? null,
       attestationKey: otherKey,
     }),
   };
@@ -2844,6 +2855,7 @@ test("HMAC binds pass/scenarios/thresholds — eligibility-field replay rejected
   replay.pass = true;
   replay.scenarios = JSON.parse(JSON.stringify(honest.scenarios));
   replay.thresholds = { ...honest.thresholds };
+  replay.operation_reliability = JSON.parse(JSON.stringify(honest.operation_reliability));
   // Fingerprints still match scoreboard/composition (unchanged) — without field binding
   // the old MAC would still verify.
   assert.equal(

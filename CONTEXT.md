@@ -175,7 +175,7 @@ _Avoid_: exit -1, harness-failure, workflow-engine-defect, environment-auth
 
 **Logical operation**:
 One immutable root identity minted at public-command admission and retained across retries, restarts, reattachment, and nested work. It is the denominator for lifecycle reliability.
-_Avoid_: process, attempt, wave, run ID
+_Avoid_: process, attempt, wave, run ID, issue closure
 
 **Execution attempt**:
 One physical effort to advance a Logical Operation. Retries and resumed processes create evidence, not additional logical successes.

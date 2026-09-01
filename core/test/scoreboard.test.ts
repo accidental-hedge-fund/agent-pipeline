@@ -186,6 +186,119 @@ test("scanRunStore: filters explicit window and honors start timestamp fallback 
   assert.ok(!deps.reads.some((p) => p.endsWith("terminal.log")), "scoreboard must not read terminal.log");
 });
 
+test("scoreboard unique-operation section: two physical runs of one completed L yield denominator 1", async () => {
+  const files: Record<string, string> = {};
+  addRun(files, "run-a", {
+    runJson: {
+      started_at: "2026-06-10T00:00:00Z",
+      issue: 1,
+      logical_operation_id: "lop-shared",
+    },
+    events: [
+      {
+        schema_version: 1,
+        type: "run_start",
+        at: "2026-06-10T00:00:00Z",
+        run_id: "run-a",
+        logical_operation_id: "lop-shared",
+      },
+      { schema_version: 1, type: "run_complete", at: "2026-06-10T00:01:00Z", final_state: "ready-to-deploy", elapsed_ms: 1 },
+    ],
+    summary: { finalState: "ready-to-deploy", verified_completion: true, logical_operation_id: "lop-shared" },
+  });
+  addRun(files, "run-b", {
+    runJson: {
+      started_at: "2026-06-10T00:02:00Z",
+      issue: 1,
+      logical_operation_id: "lop-shared",
+    },
+    events: [
+      {
+        schema_version: 1,
+        type: "run_start",
+        at: "2026-06-10T00:02:00Z",
+        run_id: "run-b",
+        logical_operation_id: "lop-shared",
+      },
+      { schema_version: 1, type: "run_complete", at: "2026-06-10T00:03:00Z", final_state: "ready-to-deploy", elapsed_ms: 1 },
+    ],
+    summary: { finalState: "ready-to-deploy", verified_completion: true, logical_operation_id: "lop-shared" },
+  });
+  addRun(files, "run-c", {
+    runJson: {
+      started_at: "2026-06-10T00:04:00Z",
+      issue: 2,
+      logical_operation_id: "lop-other",
+    },
+    events: [
+      {
+        schema_version: 1,
+        type: "run_start",
+        at: "2026-06-10T00:04:00Z",
+        run_id: "run-c",
+        logical_operation_id: "lop-other",
+      },
+      { schema_version: 1, type: "run_complete", at: "2026-06-10T00:05:00Z", final_state: "needs-human", elapsed_ms: 1 },
+    ],
+    summary: { finalState: "needs-human", logical_operation_id: "lop-other" },
+  });
+  const report = await buildScoreboardReport(
+    { repoDir: REPO_DIR, since: "2026-06-01T00:00:00Z", until: "2026-06-15T00:00:00Z", json: true },
+    memDeps(files),
+  );
+  assert.ok(report.unique_operation_reliability);
+  assert.equal(report.unique_operation_reliability.clean_completion.denominator, 2);
+  assert.equal(report.unique_operation_reliability.clean_completion.numerator, 1);
+  assert.equal(report.unique_operation_reliability.clean_completion.metric_kind, "unique_operation");
+  assert.equal(report.totals.included_runs, 3, "attempt metrics still count physical runs");
+});
+
+test("scoreboard unique-operation: historical run without logical id is missing correlation", async () => {
+  const files: Record<string, string> = {};
+  addRun(files, "old-run", {
+    runJson: { started_at: "2026-06-10T00:00:00Z", issue: 9, run_id: "old-run" },
+    events: [
+      { schema_version: 1, type: "run_start", at: "2026-06-10T00:00:00Z", run_id: "old-run" },
+      { schema_version: 1, type: "run_complete", at: "2026-06-10T00:01:00Z", final_state: "ready-to-deploy", elapsed_ms: 1 },
+    ],
+    summary: { finalState: "ready-to-deploy" },
+  });
+  const report = await buildScoreboardReport(
+    { repoDir: REPO_DIR, since: "2026-06-01T00:00:00Z", until: "2026-06-15T00:00:00Z", json: true },
+    memDeps(files),
+  );
+  assert.equal(typeof report, "object");
+  assert.ok(report.unique_operation_reliability);
+  assert.equal(report.unique_operation_reliability.integrity.missing_correlation, 1);
+  assert.equal(report.unique_operation_reliability.clean_completion.denominator, 0);
+});
+
+test("scoreboard unique-operation: label-only ready-to-deploy is not verified success", async () => {
+  const files: Record<string, string> = {};
+  addRun(files, "label-only", {
+    runJson: {
+      started_at: "2026-06-10T00:00:00Z",
+      issue: 3,
+      logical_operation_id: "lop-label",
+    },
+    events: [
+      {
+        schema_version: 1,
+        type: "run_start",
+        at: "2026-06-10T00:00:00Z",
+        logical_operation_id: "lop-label",
+      },
+      { schema_version: 1, type: "run_complete", at: "2026-06-10T00:01:00Z", final_state: "ready-to-deploy", elapsed_ms: 1 },
+    ],
+    summary: { finalState: "ready-to-deploy", logical_operation_id: "lop-label" },
+  });
+  const report = await buildScoreboardReport(
+    { repoDir: REPO_DIR, since: "2026-06-01T00:00:00Z", until: "2026-06-15T00:00:00Z", json: true },
+    memDeps(files),
+  );
+  assert.equal(report.unique_operation_reliability!.clean_completion.numerator, 0);
+});
+
 test("buildScoreboardReport: computes required throughput, autonomy, reliability, duration, retry, fallback, and cost metrics (#301)", async () => {
   const files: Record<string, string> = {};
   addRun(files, "301-2026-06-10T00-00-00-000Z", {

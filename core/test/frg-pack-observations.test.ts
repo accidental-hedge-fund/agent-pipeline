@@ -37,6 +37,7 @@ import {
   parseFrgObservationsFile,
   verifyFrgAttestation,
 } from "../scripts/factory-reliability-gate.ts";
+import { frgPassUniqueOperations } from "./frg-pass-unique-operations.ts";
 
 function digest(value: string): string {
   return crypto.createHash("sha256").update(value).digest("hex");
@@ -292,6 +293,7 @@ function scoreCollected(pack: LoadedFrgPack, releaseVersion: string) {
       pack_provenance: observations.pack_provenance,
       attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
       now: () => new Date("2026-08-08T12:10:00.000Z"),
+      ...frgPassUniqueOperations(releaseVersion),
     }),
   };
 }
@@ -487,6 +489,7 @@ test("v1.33.0 cannot pass without provenance and hybrid v1 cannot escape to 1.33
     composition_overrides: v2.composition,
     false_human_authority_count: 0,
     attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
+    ...frgPassUniqueOperations("1.33.0"),
   };
   assert.equal(computeFrgEvidence({ ...common, version: "1.33.0" }).pass, false);
   assert.equal(
@@ -557,6 +560,7 @@ test("authentic historical v1.33.0 evidence with the frozen pre-v2 manifest SHA 
     false_human_authority_count: 0,
     attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
     pack_provenance: historicalV1,
+    ...frgPassUniqueOperations("1.33.0"),
   };
   const evidence = computeFrgEvidence({ ...common, version: "1.33.0" });
   assert.equal(historicalV1.manifest_sha256, FRG_HYBRID_V1_MANIFEST_SHA256);
@@ -597,6 +601,7 @@ test("historical v1 probe matrix stays frozen when the current v2 list is simula
     false_human_authority_count: 0,
     attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
     pack_provenance: historicalV1,
+    ...frgPassUniqueOperations("1.33.0"),
   });
 
   const frozenV1 = expectedHybridLayerAProbeIds(FRG_HYBRID_PILOT_POLICY_ID);

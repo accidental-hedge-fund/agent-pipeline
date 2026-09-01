@@ -239,6 +239,11 @@ export interface AdvanceOpts {
    * on disk (#1243). Production CLI: `pipeline N --sha <40-hex>`.
    */
   candidateShaOverride?: string | null;
+  /**
+   * Parent or named-run logical-operation binding (#1368). When omitted,
+   * initRunDir mints a new identity unless run.json already stores one.
+   */
+  logicalOperationId?: string | null;
 }
 
 /** Pure + exported so the PIPELINE_COMMENT_KINDS drift guard exercises the real renderer. */
@@ -1544,6 +1549,7 @@ export async function runAdvance(
           engine: pinnedEngine,
           outerHost,
           discoveryChannel: activeDiscoveryChannel,
+          logicalOperationId: opts.logicalOperationId,
         },
         runStoreDeps,
       ).catch(() => {});
