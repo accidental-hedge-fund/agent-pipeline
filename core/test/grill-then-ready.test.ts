@@ -2775,7 +2775,7 @@ test("grill: persistent extra labels fail closed without dropping ready", async 
   assert.ok(labels.includes("pipeline:ready"));
 });
 
-test("grill: ADR names refine-spec as writer and does not say triage rewrites the body", async () => {
+test("grill: ADR names pipeline grill as writer and does not say triage rewrites the body", async () => {
   const { readFileSync } = await import("node:fs");
   const { dirname, join } = await import("node:path");
   const { fileURLToPath } = await import("node:url");
@@ -2783,8 +2783,10 @@ test("grill: ADR names refine-spec as writer and does not say triage rewrites th
     join(dirname(fileURLToPath(import.meta.url)), "../../docs/adr/0002-decisions-live-in-the-issue-body.md"),
     "utf8",
   );
-  assert.match(adr, /refine-spec/);
+  assert.match(adr, /pipeline grill/);
+  assert.doesNotMatch(adr, /`pipeline refine-spec --issue` \/ `apply` is the grill writer/);
   assert.doesNotMatch(adr, /Bare `pipeline triage N` is one implementer shot that rewrites the body/);
+  assert.doesNotMatch(adr, /must not write CONTEXT\.md or ADRs/);
   assert.match(adr, /Root identity is title plus applied specification core/);
   assert.match(adr, /Dependency closure covers declared dependencies only/);
   assert.match(adr, /Pipeline-owned Decisions metadata is not a bound input/);
@@ -2795,8 +2797,10 @@ test("grill: ADR names refine-spec as writer and does not say triage rewrites th
   assert.match(glossary, /\*\*Grill\*\*:/);
   assert.match(glossary, /\*\*Decisions\*\*:/);
   assert.match(glossary, /\*\*Authority node\*\*:/);
+  assert.match(glossary, /\*\*auto-accept\*\*:/);
   assert.match(glossary, /\*\*reviewer-accept\*\*:/);
   assert.match(glossary, /not operator authority/i);
+  assert.match(glossary, /historical provenance/i);
 });
 
 test("grill: --stage backlog does not require an artifact", async () => {

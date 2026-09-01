@@ -175,9 +175,9 @@ const BASE_COMMAND_DOCS: Record<string, CommandDoc> = {
   },
   "refine-spec": {
     summary:
-      "Grill an issue spec: --title/--body preview, --issue preview, or apply a signed proposal",
+      "Non-mutating Desk preview from --title/--body. Admission is pipeline grill; --issue/apply diagnose toward grill",
     usage:
-      'refine-spec --title "<t>" --body "<b>" | refine-spec --issue N | refine-spec apply --issue N [--proposal-file PATH]',
+      'refine-spec --title "<t>" --body "<b>" [--json] | refine-spec --issue N | refine-spec apply --issue N [--proposal-file PATH]',
     documented: true,
     section: "factory",
   },

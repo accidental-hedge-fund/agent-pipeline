@@ -33,7 +33,7 @@ import { buildCmd } from "../scripts/pipeline.ts";
 const DISPATCH_KEYWORDS = [
   "init", "doctor", "status", "unblock", "override", "recover-parked", "cleanup",
   "release", "ship", "intake", "decompose", "sweep", "triage", "merge", "merge-queue", "train",
-  "refine-spec", "logs", "summary", "path", "config", "run", "single", "improve",
+  "refine-spec", "grill", "logs", "summary", "path", "config", "run", "single", "improve",
   "scoreboard", "outcomes", "lineage", "roadmap", "loop", "correction", "report", "engine-promote",
   "factory-gate", "factory-release", "factory-pin", "controls",
 ];
@@ -250,7 +250,7 @@ test("command-registry: needsIssueNumber is false for named sub-commands that op
   // Commands that act on the repo/environment, not a specific issue.
   const issueAgnosticKeys = [
     "init", "doctor", "cleanup", "release", "ship", "intake", "decompose", "sweep",
-    "triage", "merge", "merge-queue", "train", "refine-spec", "logs", "summary", "path",
+    "triage", "merge", "merge-queue", "train", "refine-spec", "grill", "logs", "summary", "path",
     "config", "improve", "scoreboard", "roadmap", "correction",
   ];
   for (const key of issueAgnosticKeys) {
@@ -297,6 +297,23 @@ test("command-registry: lookupCommand('cleanup') returns cleanup entry with need
   assert.ok(entry !== null);
   assert.equal(entry, COMMAND_REGISTRY.cleanup);
   assert.equal(entry.needsIssueNumber, false);
+});
+
+test("command-registry: lookupCommand('grill') returns grill entry with needsIssueNumber:false", () => {
+  const entry = lookupCommand("grill");
+  assert.ok(entry !== null);
+  assert.equal(entry, COMMAND_REGISTRY.grill);
+  assert.equal(entry.needsIssueNumber, false);
+  assert.equal(entry.supportsJson, true);
+  const flags = entry.allowedFlags as Set<string>;
+  for (const required of ["issue", "issues", "milestone", "label", "dryRun", "json", "follow", "resume"]) {
+    assert.equal(flags.has(required), true, `grill.allowedFlags must include ${required}`);
+  }
+  const bogus = {
+    options: [{ attributeName: () => "bogus" }],
+    getOptionValueSource: (k: string) => (k === "bogus" ? "cli" : "default"),
+  };
+  assert.deepEqual(validateFlags(entry, bogus), ["bogus"]);
 });
 
 test("command-registry: merge-queue entry is an operator-authorized sequential merge surface (#676)", () => {

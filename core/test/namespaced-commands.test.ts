@@ -34,6 +34,7 @@ const EXPECTED_OPERATIONS = new Set([
   "intake",
   "decompose",
   "sweep",
+  "grill",
   "triage",
   "merge",
   "merge-queue",

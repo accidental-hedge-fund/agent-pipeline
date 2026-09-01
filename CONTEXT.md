@@ -72,19 +72,27 @@ _Avoid_: Codex (as the name of the role), self-review as the default product
 ### Intake
 
 **Grill**:
-Per-issue `pipeline refine-spec --issue` / `apply` that looks up repository facts, records a Decisions artifact in the issue body, and lets the reviewer accept or challenge recommended defaults. Not planning, not a comment, not a chat loop, not `triage --stage`.
-_Avoid_: plan-review, mid-run interview, comment-as-spec, bare `pipeline triage N` as a body rewrite
+Native `pipeline grill` admission: select issues, walk each design tree, auto-settle in-scope recommendations, record the Decisions artifact and required domain docs, and request `pipeline:ready`. Not planning, not a comment, not a chat loop, not `triage --stage`, not a host skill.
+_Avoid_: plan-review, mid-run interview, comment-as-spec, bare `pipeline triage N` as a body rewrite, refine-spec as the grill
 
 **Decisions**:
 The versioned issue-body artifact and its derived `## Decisions` section. That body is the spec for `--stage ready`. Comments and handoffs prove provenance; they do not replace the body. #1238 comments are pickup verdict evidence, not the spec.
 _Avoid_: review comment, blocker comment, lock comment, comment-as-spec
 
 **Authority node**:
-An unsettled question whose class is `scope`, `security`, `irreversible-operations`, `merge-release`, or `human-attestation`. It blocks `--stage ready` until an authenticated hash-bound `pipeline handoff answer`. Unknown or disputed classes stay unresolved authority.
+An unsettled question whose class is `scope`, `security`, `irreversible-operations`, `merge-release`, or `human-attestation`. It blocks `--stage ready` until auto-accept under existing authority, or an authenticated hash-bound `pipeline handoff answer`. Unknown or disputed classes stay unresolved authority.
 _Avoid_: open question, TODO, parking everything
 
+**auto-accept**:
+Provenance of an in-scope default that is reversible, policy-consistent, and covered by existing authority. Not operator authority. It never grants merge, release, destructive, security, or other protected authority.
+_Avoid_: operator sign-off, merge grant, comment-as-accept
+
+**typed request**:
+An irreducible `DecisionRequest`, input-requiring `CapabilityRequest`, or protected `AuthorityRequest` that pauses only that issue. Answered through `pipeline handoff answer`. Low model confidence is not a typed request.
+_Avoid_: low confidence as a handoff, second answer ledger
+
 **reviewer-accept**:
-Provenance of an automatic default on a taxonomy-validated non-authority node (`interface-contract`, `test-evidence`, `docs-surface`, `operational-default`) after the reviewer returns `accept`. Not operator authority. It cannot settle an Authority node.
+Historical provenance of an automatic default on a taxonomy-validated non-authority node (`interface-contract`, `test-evidence`, `docs-surface`, `operational-default`) after a reviewer `accept`. Not operator authority. Remaining reviewer-accept nodes stay valid until re-grilled.
 _Avoid_: operator sign-off, handoff answer, comment-as-accept
 
 ### Diagnostics

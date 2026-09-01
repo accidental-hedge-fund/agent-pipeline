@@ -30,6 +30,7 @@ import {
   type GrillProposalKeyDeps,
 } from "./grill-proposal.ts";
 import { classifyAuthority, isOperatorRequiredClass } from "./grill-taxonomy.ts";
+import { typedRequestHandoffClass } from "./grill-settle.ts";
 import {
   appendHandoffAudit,
   canCreateHandoff,
@@ -347,21 +348,29 @@ export function grillAuthorityCreateInputs(input: GrillHandoffCreateInput): Crea
   const out: CreateHandoffInput[] = [];
   for (const node of input.artifact.nodes) {
     const classified = classifyAuthority(node.class);
-    if (!classified.operatorRequired) continue;
+    if (!classified.operatorRequired && !node.typed_request) continue;
+    if (node.resolution === "resolved" && node.provenance.settled_by === "auto-accept") continue;
     if (node.resolution === "resolved" && node.provenance.settled_by === "handoff") continue;
+    const request = node.typed_request;
+    const handoffClass = request
+      ? typedRequestHandoffClass(request, node.class)
+      : grillHandoffClass(node.class);
+    const nonAuthority = handoffClass === "missing_context";
     out.push({
       domain: input.domain,
       repo: input.repo,
       issue_number: input.issueNumber,
       blocked_stage: "triage",
       question: node.question,
-      reason: `grill-authority node ${node.id} (${node.class})`,
-      handoff_class: grillHandoffClass(node.class),
-      authority_mode: "authority",
-      required_capability: ["authority"],
+      reason: request
+        ? `grill ${request} node ${node.id} (${node.class})`
+        : `grill-authority node ${node.id} (${node.class})`,
+      handoff_class: handoffClass,
+      authority_mode: nonAuthority ? "non_authority" : "authority",
+      required_capability: nonAuthority ? ["missing_context"] : ["authority"],
       candidate_sha: null,
       tip_present: false,
-      policy_bound_authority_gate: true,
+      policy_bound_authority_gate: !nonAuthority,
       human_decision_required: null,
       content_hashes: [bodySha, input.frontierFp, node.id, nodeDefinitionDigest(node)],
       declaration_identity: grillDeclarationIdentity({
