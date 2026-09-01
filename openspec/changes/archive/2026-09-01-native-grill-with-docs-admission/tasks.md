@@ -29,6 +29,7 @@
 - [x] 4.4 Emit `DecisionRequest` for contradictory product requirements, map to existing `product_judgment` handoff, and verify the issue pauses while independent issues continue
 - [x] 4.5 Emit `CapabilityRequest` for missing external ability or information, map to `missing_context`, and verify discoverable repo/forge/config facts never become this request
 - [x] 4.6 Emit `AuthorityRequest` for protected actions without existing authority (`security`/`irreversible-operations` → `risk_authority`; `scope`/`merge-release`/`human-attestation` → `product_judgment`), and verify auto-accept never grants merge, release, destructive, or security authority
+- [x] 4.6.1 Derive protected-action status from the concrete recommendation (not class membership alone) and fail closed when a non-authority class carries merge, release, destructive, or security semantics
 - [x] 4.7 Create pending typed-request handoffs idempotently on `declaration_identity` before the body write, reuse `pipeline handoff answer` materialize, and verify comments still do not settle nodes
 - [x] 4.8 Write the Decisions artifact plus derived `## Decisions` section and persist the engine-produced authenticated frontier on grill body writes, and verify ready validation still requires that frontier
 

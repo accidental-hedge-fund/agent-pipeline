@@ -62,7 +62,7 @@ The `triage` sub-command SHALL accept only `backlog` and `ready` as valid `--sta
 
 ### Requirement: The `triage` sub-command SHALL set exactly one `pipeline:<stage>` label on the target issue
 
-After validating inputs, the triage handler SHALL fetch the target issue. For `--stage backlog`, it SHALL determine which `pipeline:*` labels the issue currently carries and update the issue so it carries exactly `pipeline:backlog` and no other `pipeline:*` label, with no Decisions-artifact requirement. For `--stage ready`, it SHALL validate the Decisions artifact as specified by `grill-then-ready-refinement` before any label write; on validation failure it SHALL exit 2 and SHALL NOT add or remove labels. On validation success it SHALL add `pipeline:ready` first (if not already present), then remove all current `pipeline:*` labels that differ from `ready`, then re-fetch labels. If more than one `pipeline:*` label remains, it SHALL retry the remove pass once. If extras still remain, it SHALL exit non-zero with `label_reconciliation_failed` and SHALL NOT remove `pipeline:ready`. This ordering ensures the issue is never left without a `pipeline:*` label if the process is interrupted between writes. Validation failure SHALL still make zero label-write API calls.
+After validating inputs, the triage handler SHALL fetch the target issue. For `--stage backlog`, it SHALL determine which `pipeline:*` labels the issue currently carries and update the issue so it carries exactly `pipeline:backlog` and no other `pipeline:*` label, with no Decisions-artifact requirement. For `--stage ready`, it SHALL validate the Decisions artifact as specified by `grill-then-ready-refinement` before any label write; on validation failure it SHALL exit 2 and SHALL NOT add or remove labels. On validation success it SHALL add `pipeline:ready` first (if not already present), then remove all current `pipeline:*` labels that differ from `ready`, then re-fetch labels. If more than one `pipeline:*` label remains, it SHALL retry the remove pass once. If extras still remain, it SHALL exit non-zero with `label_reconciliation_failed` and SHALL NOT remove `pipeline:ready`. This ordering ensures the issue is never left without a `pipeline:*` label if the process is interrupted between writes. Validation failure SHALL still make zero label-write API calls. `pipeline grill` SHALL invoke this same ready validator and label-reconciliation sequence; it SHALL NOT implement a second ready-label writer.
 
 #### Scenario: Sets `pipeline:ready` and removes `pipeline:backlog`
 
@@ -119,6 +119,12 @@ After validating inputs, the triage handler SHALL fetch the target issue. For `-
 - **AND** the issue SHALL still carry `pipeline:ready`
 - **AND** validation-failure paths SHALL still make zero label-write calls
 
+#### Scenario: Grill uses the same ready label sequence
+
+- **WHEN** `pipeline grill --issue N` decides the issue is eligible
+- **THEN** it SHALL add `pipeline:ready` first and reconcile leftover `pipeline:*` labels using the same sequence
+- **AND** SHALL NOT leave two `pipeline:*` labels on success
+
 ---
 
 ### Requirement: The `triage` sub-command SHALL be idempotent
@@ -166,7 +172,7 @@ All GitHub API calls and log output in the triage handler SHALL be routed throug
 
 ### Requirement: Triage to ready SHALL request admission and SHALL NOT bypass the issue-readiness gate
 
-`pipeline triage <N> --stage ready` SHALL remain a deterministic command. It SHALL NOT invoke the issue-implementation-readiness gate, any other model harness, or a worktree create. It SHALL validate the Decisions artifact as specified by `grill-then-ready-refinement` before any ready label write. When that validation passes and `issue_readiness.enabled` is `true`, the label write SHALL be an admission request only: the next pickup of issue N SHALL re-fetch the issue and SHALL require a `ready` verdict from the shared #1238 gate before any worktree or delivery harness starts.
+`pipeline triage <N> --stage ready` SHALL remain a deterministic command. It SHALL NOT invoke the issue-implementation-readiness gate, any other model harness, or a worktree create. It SHALL validate the Decisions artifact as specified by `grill-then-ready-refinement` before any ready label write. `pipeline grill` ready promotion SHALL use that same validator and SHALL also be an admission request only. When that validation passes and `issue_readiness.enabled` is `true`, the label write SHALL be an admission request only: the next pickup of issue N SHALL re-fetch the issue and SHALL require a `ready` verdict from the shared #1238 gate before any worktree or delivery harness starts.
 
 #### Scenario: Triage still makes no model call
 
@@ -185,9 +191,7 @@ All GitHub API calls and log output in the triage handler SHALL be routed throug
 
 #### Scenario: Next pickup still evaluates the fresh body
 
-- **WHEN** triage has set `pipeline:ready`
+- **WHEN** triage or grill has set `pipeline:ready`
 - **AND** a later pickup path runs with the gate enabled
 - **THEN** that pickup SHALL run the shared gate
 - **AND** SHALL NOT start a worktree or delivery harness unless the fresh body is admitted
-
----
