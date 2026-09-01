@@ -1488,9 +1488,10 @@ export async function advanceFix(
   );
   if (!gates.ok) {
     await setBlocked(cfg, issueNumber, gates.reason, stage,
-      gates.source === "test" ? "test-gate-exhausted" : gates.source === "build" ? "build-failed" : gates.source === "owned-leftover" ? "harness-failure" : "needs-human");
+      gates.source === "test" && gates.diagnostic?.detail.preflight_failed !== true ? "test-gate-exhausted" : gates.source === "build" ? "build-failed" : gates.source === "owned-leftover" || gates.diagnostic?.detail.preflight_failed === true ? "harness-failure" : "needs-human");
     return { advanced: false, status: "blocked", reason: gates.reason,
-      blockerKind: gates.source === "test" ? "test-gate-exhausted" : gates.source === "build" ? "build-failed" : gates.source === "owned-leftover" ? "harness-failure" : "needs-human" };
+      blockerKind: gates.source === "test" && gates.diagnostic?.detail.preflight_failed !== true ? "test-gate-exhausted" : gates.source === "build" ? "build-failed" : gates.source === "owned-leftover" || gates.diagnostic?.detail.preflight_failed === true ? "harness-failure" : "needs-human",
+      ...(gates.diagnostic ? { diagnostic: gates.diagnostic } : {}) };
   }
 
   // ---- Docs freshness (#716): after format/test, before push ----
@@ -1515,9 +1516,10 @@ export async function advanceFix(
     );
     if (!postHealGates.ok) {
       await setBlocked(cfg, issueNumber, postHealGates.reason, stage,
-        postHealGates.source === "test" ? "test-gate-exhausted" : postHealGates.source === "build" ? "build-failed" : "needs-human");
+        postHealGates.source === "test" && postHealGates.diagnostic?.detail.preflight_failed !== true ? "test-gate-exhausted" : postHealGates.source === "build" ? "build-failed" : postHealGates.diagnostic?.detail.preflight_failed === true ? "harness-failure" : "needs-human");
       return { advanced: false, status: "blocked", reason: postHealGates.reason,
-        blockerKind: postHealGates.source === "test" ? "test-gate-exhausted" : postHealGates.source === "build" ? "build-failed" : "needs-human" };
+        blockerKind: postHealGates.source === "test" && postHealGates.diagnostic?.detail.preflight_failed !== true ? "test-gate-exhausted" : postHealGates.source === "build" ? "build-failed" : postHealGates.diagnostic?.detail.preflight_failed === true ? "harness-failure" : "needs-human",
+        ...(postHealGates.diagnostic ? { diagnostic: postHealGates.diagnostic } : {}) };
     }
     const docsCheckOnly = deps.checkDocsFreshness ?? checkDocsFreshness;
     const finalDocs = await docsCheckOnly(wt.path, deps.docsFreshness ?? {});

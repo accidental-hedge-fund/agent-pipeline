@@ -11,7 +11,9 @@ import {
 } from "./model-entitlement.ts";
 import { isProviderEnvironmentAuth, type ProviderAuthStatus } from "./provider-auth-status.ts";
 import {
+  buildStageDiagnostic,
   projectPipelineReasonCode,
+  type StageDiagnostic,
   type StageDiagnosticReasonCode,
 } from "./stage-diagnostic.ts";
 import type { DurableBlockerClass } from "./loop/types.ts";
@@ -103,6 +105,36 @@ export function classifyHarnessFailure(
         : null;
   if (exitCode !== null && exitCode !== 0) return "harness-contract";
   return "workflow-engine-defect";
+}
+
+/**
+ * Preserve a typed production-preflight refusal on the stage diagnostic.
+ * Returns undefined when the result is not a preflight refusal.
+ */
+export function buildPreflightRefusalDiagnostic(
+  result: {
+    preflight_failed?: boolean;
+    preflight_class?: string;
+    preflight_reason_code?: HarnessResult["preflight_reason_code"];
+    preflight_intervention_kind?: HarnessResult["preflight_intervention_kind"];
+  } & Parameters<typeof classifyHarnessFailure>[0],
+  opts: { reason: string; stage: string },
+): StageDiagnostic | undefined {
+  if (!result.preflight_failed) return undefined;
+  return buildStageDiagnostic({
+    reasonCode: classifyHarnessFailure(result),
+    blockerKind: "harness-failure",
+    reason: opts.reason,
+    stage: opts.stage,
+    preflightFailed: true,
+    ...(result.preflight_class !== undefined ? { preflightClass: result.preflight_class } : {}),
+    ...(result.preflight_reason_code !== undefined
+      ? { preflightReasonCode: result.preflight_reason_code }
+      : {}),
+    ...(result.preflight_intervention_kind !== undefined
+      ? { preflightInterventionKind: result.preflight_intervention_kind }
+      : {}),
+  });
 }
 
 /** Re-export for reviewer call sites that want the full HarnessResult shape. */

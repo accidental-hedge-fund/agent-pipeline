@@ -2436,16 +2436,16 @@ export async function resumeFromImplementing(
   );
   if (!gates.ok) {
     const blockerKind: BlockerKind =
-      gates.source === "test"
+      gates.source === "test" && gates.diagnostic?.detail.preflight_failed !== true
         ? "test-gate-exhausted"
-        : gates.source === "owned-leftover"
+        : gates.source === "owned-leftover" || gates.diagnostic?.detail.preflight_failed === true
           ? "harness-failure"
           : "needs-human";
     await blocker(
       cfg, issueNumber, gates.reason, "implementing",
       blockerKind,
     );
-    return blockedOutcome(gates.reason, blockerKind);
+    return blockedOutcome(gates.reason, blockerKind, gates.diagnostic);
   }
 
   // ---- Docs freshness (#716): after format/test, before push / createPr ----
@@ -2469,16 +2469,16 @@ export async function resumeFromImplementing(
     );
     if (!postHealGates.ok) {
       const blockerKind: BlockerKind =
-        postHealGates.source === "test"
+        postHealGates.source === "test" && postHealGates.diagnostic?.detail.preflight_failed !== true
           ? "test-gate-exhausted"
-          : postHealGates.source === "owned-leftover"
+          : postHealGates.source === "owned-leftover" || postHealGates.diagnostic?.detail.preflight_failed === true
             ? "harness-failure"
             : "needs-human";
       await blocker(
         cfg, issueNumber, postHealGates.reason, "implementing",
         blockerKind,
       );
-      return blockedOutcome(postHealGates.reason, blockerKind);
+      return blockedOutcome(postHealGates.reason, blockerKind, postHealGates.diagnostic);
     }
     const docsCheckOnly = deps.checkDocsFreshness ?? checkDocsFreshness;
     const finalDocs = await docsCheckOnly(wt.path, deps.docsFreshness ?? {});

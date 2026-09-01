@@ -438,7 +438,14 @@ const anyCfg = cfg([{ command: "fmt", auto_fix: true }]) as unknown as PipelineC
 // Build injected gate deps from per-round scripted results.
 function convergeDeps(
   fmt: Array<{ status: "ok"; committed: boolean } | { status: "blocked"; reason: string }>,
-  test: Array<{ skipped?: boolean; passed?: boolean; attempts?: number; blockReason?: string; buildFailure?: boolean }>,
+  test: Array<{
+    skipped?: boolean;
+    passed?: boolean;
+    attempts?: number;
+    blockReason?: string;
+    buildFailure?: boolean;
+    diagnostic?: import("../scripts/stage-diagnostic.ts").StageDiagnostic;
+  }>,
 ): { deps: FormatTestGateDeps; fmtCalls: () => number; testCalls: () => number } {
   let fi = 0;
   let ti = 0;
@@ -450,6 +457,7 @@ function convergeDeps(
         return {
           skipped: r.skipped ?? false, passed: r.passed ?? true, attempts: r.attempts ?? 0,
           blockReason: r.blockReason, buildFailure: r.buildFailure,
+          ...(r.diagnostic ? { diagnostic: r.diagnostic } : {}),
         };
       }) as FormatTestGateDeps["runTestGate"],
     },
@@ -501,6 +509,42 @@ test("runFormatAndTestGates: test-gate failure → ok:false, source=test (caller
   const res = await runFormatAndTestGates(anyCfg, 1, "/wt", "fix-1", "run", undefined, c.deps);
   assert.equal(res.ok, false);
   assert.equal(res.ok === false && res.source, "test");
+});
+
+test("runFormatAndTestGates: test-fix preflight diagnostic is preserved on the gate result", async () => {
+  const diagnostic = {
+    schema: "pipeline/stage-diagnostic@1" as const,
+    reason_code: "capability-refusal" as const,
+    evidence_key: "sha256:test-fix-preflight",
+    detail: {
+      blocker_kind: "harness-failure" as const,
+      reason: "Fix harness failed (capability-refusal)",
+      stage: "fix-1",
+      preflight_failed: true,
+      preflight_class: "unsupported-setting",
+      preflight_reason_code: "capability-refusal" as const,
+      preflight_intervention_kind: "auth-tooling-preflight-failure" as const,
+    },
+  };
+  const c = convergeDeps(
+    [{ status: "ok", committed: false }],
+    [{
+      passed: false,
+      attempts: 1,
+      blockReason: "Fix harness failed (capability-refusal)",
+      diagnostic,
+    }],
+  );
+  const res = await runFormatAndTestGates(anyCfg, 1, "/wt", "fix-1", "run", undefined, c.deps);
+  assert.equal(res.ok, false);
+  assert.equal(res.ok === false && res.source, "test");
+  assert.equal(res.ok === false && res.diagnostic?.reason_code, "capability-refusal");
+  assert.equal(res.ok === false && res.diagnostic?.detail.preflight_failed, true);
+  assert.equal(res.ok === false && res.diagnostic?.detail.preflight_reason_code, "capability-refusal");
+  assert.equal(
+    res.ok === false && res.diagnostic?.detail.preflight_intervention_kind,
+    "auth-tooling-preflight-failure",
+  );
 });
 
 test("runFormatAndTestGates: non-convergence at the round cap → blocked (source=noconverge), bounded", async () => {

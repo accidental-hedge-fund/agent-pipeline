@@ -58,6 +58,7 @@ The pipeline SHALL preserve a typed production-preflight refusal through the sta
 - **THEN** the stage block reason SHALL include the typed preflight diagnostic
 - **AND** SHALL NOT be only `exit -1`
 - **AND** the stage SHALL NOT start another harness invocation for that same treatment
+- **AND** the stage outcome or stage diagnostic SHALL retain `preflight_failed`, `preflight_class`, `preflight_reason_code`, and intervention kind
 
 #### Scenario: Typed refusal stays distinct from other harness failures
 

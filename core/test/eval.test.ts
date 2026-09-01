@@ -267,6 +267,20 @@ test("eval-gate: typed production-preflight refusal is not flattened to exit -1"
   assert.match(log.blocked[0].reason, /background_job_lifecycle/);
   assert.doesNotMatch(log.blocked[0].reason, /exit -1/);
   assert.doesNotMatch(log.blocked[0].reason, /SECRET-TOKEN/);
+  if (!out.advanced && out.status === "blocked") {
+    assert.equal(out.blockerKind, "harness-failure");
+    assert.equal(out.diagnostic?.reason_code, "capability-refusal");
+    assert.equal(out.diagnostic?.detail.preflight_failed, true);
+    assert.equal(out.diagnostic?.detail.preflight_class, "unsupported-setting");
+    assert.equal(out.diagnostic?.detail.preflight_reason_code, "capability-refusal");
+    assert.equal(
+      out.diagnostic?.detail.preflight_intervention_kind,
+      "auth-tooling-preflight-failure",
+    );
+    assert.doesNotMatch(out.reason, /exit -1/);
+    assert.doesNotMatch(out.reason, /SECRET-TOKEN/);
+    assert.doesNotMatch(JSON.stringify(out.diagnostic), /SECRET-TOKEN/);
+  }
 });
 
 test("eval-gate: non-zero exit + gate mode → setBlocked, no forward transition", async () => {

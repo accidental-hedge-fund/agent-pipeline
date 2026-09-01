@@ -54,6 +54,8 @@ import { makePipelineRunId, validateCommitTrailers } from "../traceability.ts";
 import { trySalvageUncommittedWork } from "../salvage-harness-work.ts";
 import { OWNERSHIP_CHECKPOINT_FAILED_REASON, runHarnessRound } from "../harness-round.ts";
 import { makeCommandRecord, makePromptRecord, recordCommand, recordPrompt } from "../evidence-bundle.ts";
+import { buildPreflightRefusalDiagnostic } from "../escalation-classify.ts";
+import type { StageDiagnostic } from "../stage-diagnostic.ts";
 import type { BlockerKind, Harness, Outcome, PipelineConfig, Stage } from "../types.ts";
 import { appendEvent, RUN_SCHEMA_VERSION, type RunStoreDeps } from "../run-store.ts";
 import { buildStageAccountingRecord } from "../accounting.ts";
@@ -312,7 +314,7 @@ interface EvalFixRoundDeps {
 
 type EvalFixRoundResult =
   | { ok: true }
-  | { ok: false; reason: string; blockerKind: "harness-failure" | "push-failed" };
+  | { ok: false; reason: string; blockerKind: "harness-failure" | "push-failed"; diagnostic?: StageDiagnostic };
 
 /**
  * Run a single eval-fix round: invoke the implementer harness with the eval
@@ -417,7 +419,16 @@ async function runEvalFixRound(
             : fixRes.timed_out
               ? `Fix harness (${harness}) timed out after ${fixRes.duration.toFixed(0)}s on eval-gate fix round ${attempt}.`
               : `Fix harness (${harness}) failed (exit ${fixRes.exit_code}) on eval-gate fix round ${attempt}.`;
-        return { ok: false, reason, blockerKind: "harness-failure" };
+        const diagnostic = buildPreflightRefusalDiagnostic(fixRes, {
+          reason,
+          stage: "eval-gate",
+        });
+        return {
+          ok: false,
+          reason,
+          blockerKind: "harness-failure",
+          ...(diagnostic ? { diagnostic } : {}),
+        };
       }
 
       // #131: no new commit and salvage produced nothing — block with disclosure.
@@ -600,7 +611,11 @@ export async function advanceEval(
   let stageDeadlineMs = Date.now() + timeoutSec * 1000;
 
   let lastResult: EvalRunResult | null = null;
-  let fixRoundBlocked: { reason: string; blockerKind: "harness-failure" | "push-failed" } | null = null;
+  let fixRoundBlocked: {
+    reason: string;
+    blockerKind: "harness-failure" | "push-failed";
+    diagnostic?: StageDiagnostic;
+  } | null = null;
   // Unconditional same-invocation pending-review signal (#372 pre-merge delta
   // review, key 1469c9cd): a fix commit we just pushed MUST route back through
   // pre-merge even if every GitHub lookup in the durable re-derivation fails
@@ -689,7 +704,11 @@ export async function advanceEval(
       },
     );
     if (!fixResult.ok) {
-      fixRoundBlocked = { reason: fixResult.reason, blockerKind: fixResult.blockerKind };
+      fixRoundBlocked = {
+        reason: fixResult.reason,
+        blockerKind: fixResult.blockerKind,
+        ...(fixResult.diagnostic ? { diagnostic: fixResult.diagnostic } : {}),
+      };
       break;
     }
     fixCommitLandedThisInvocation = true;
@@ -712,6 +731,7 @@ export async function advanceEval(
       status: "blocked",
       reason: fixRoundBlocked.reason,
       blockerKind: fixRoundBlocked.blockerKind,
+      ...(fixRoundBlocked.diagnostic ? { diagnostic: fixRoundBlocked.diagnostic } : {}),
     };
   }
 

@@ -881,6 +881,17 @@ test("gate: typed production-preflight refusal is not flattened to exit -1", asy
   assert.match(out.blockReason ?? "", /background_job_lifecycle/);
   assert.doesNotMatch(out.blockReason ?? "", /exit -1/);
   assert.doesNotMatch(out.blockReason ?? "", /SECRET-TOKEN/);
+  assert.equal(out.diagnostic?.reason_code, "capability-refusal");
+  assert.equal(out.diagnostic?.detail.preflight_failed, true);
+  assert.equal(out.diagnostic?.detail.preflight_class, "unsupported-setting");
+  assert.equal(out.diagnostic?.detail.preflight_reason_code, "capability-refusal");
+  assert.equal(
+    out.diagnostic?.detail.preflight_intervention_kind,
+    "auth-tooling-preflight-failure",
+  );
+  assert.doesNotMatch(JSON.stringify(out.diagnostic), /SECRET-TOKEN/);
+  assert.doesNotMatch(testGateBlockReason(out), /failed after \d+ fix attempt/i);
+  assert.match(testGateBlockReason(out), /background_job_lifecycle/);
 });
 
 test("gate: fix harness itself fails → blocked with harness reason", async () => {
