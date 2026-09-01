@@ -72,6 +72,7 @@ import {
   REVIEW_MARKER_PREFIX_R2,
 } from "./stages/review-parsing.ts";
 import { makePipelineRunId } from "./traceability.ts";
+import { mintLogicalOperationId } from "./logical-operation.ts";
 import { normalizeFullSha } from "./trusted-surface.ts";
 import {
   branchName,
@@ -367,6 +368,11 @@ export const VERSION: string = (() => {
 })();
 
 export interface CliOpts {
+  /**
+   * Parent logical-operation identity for nested loop/single admission (#1368).
+   * Internal: train/ship handoff. Not a public CLI flag.
+   */
+  parentLogicalOperationId?: string;
   status?: boolean;
   summary?: boolean;
   unblock?: string;
@@ -1139,6 +1145,7 @@ export function compileWorkListRun(
   runId: string,
   rawItems?: readonly RawContractItem[],
   sourceSelector?: LoopSelector,
+  logicalOperationId?: string,
 ): { contract: import("./loop/recovery.ts").LoopContractInit; ledger: LoopLedger } {
   // Resolution turns every selector into an issue list for dependency
   // discovery. Keep the normalized source selector on the immutable contract;
@@ -1146,9 +1153,14 @@ export function compileWorkListRun(
   // ad-hoc work list after fresh compilation. Callers that supply only a list
   // retain the existing work-list contract shape.
   const contractSelector = resolvedContractSelector(sourceSelector, issues);
+  const resolvedLogicalId =
+    typeof logicalOperationId === "string" && logicalOperationId.trim()
+      ? logicalOperationId.trim()
+      : mintLogicalOperationId();
   const contract: import("./loop/recovery.ts").LoopContractInit = {
     schema: LOOP_CONTRACT_SCHEMA,
     run_id: runId,
+    logical_operation_id: resolvedLogicalId,
     engine,
     repo: { name: cfg.repo, base_branch: cfg.base_branch },
     selector: contractSelector,
@@ -1205,7 +1217,7 @@ export async function compileWorkListRunFresh(
   runId: string,
   discoverDeps: WorkListDependencyDiscoverDeps = realWorkListDependencyDiscoverDeps(cfg),
   sourceSelector?: LoopSelector,
-  opts?: { forceRefuseIncomplete?: boolean; env?: NodeJS.ProcessEnv },
+  opts?: { forceRefuseIncomplete?: boolean; env?: NodeJS.ProcessEnv; logicalOperationId?: string },
 ): Promise<{
   contract: import("./loop/recovery.ts").LoopContractInit;
   ledger: LoopLedger;
@@ -1232,6 +1244,7 @@ export async function compileWorkListRunFresh(
     runId,
     discovery.items,
     sourceSelector,
+    opts?.logicalOperationId,
   );
   // Additive provenance — older on-disk contracts omit this field and remain
   // readable on resume without re-discovery.
@@ -2807,6 +2820,8 @@ export interface RunLoopEngineInput {
   /** CLI `--engine-track` must reach per-item child advances (FRG candidate soak). */
   engineTrack?: "pinned" | "candidate";
   selector?: LoopSelector;
+  /** Parent logical-operation identity for nested train/ship loop admission (#1368). */
+  logicalOperationId?: string;
   resumeRunId?: string;
   audit: boolean;
   /** `--new-run` (#568, capability `loop-run-supersession`): only ever true alongside `selector`
@@ -3047,6 +3062,7 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
               newRunId,
               discoverDeps,
               input.selector,
+              { logicalOperationId: input.logicalOperationId },
             );
           } catch (err) {
             return {
@@ -3075,6 +3091,7 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
             runId,
             discoverDeps,
             input.selector,
+            { logicalOperationId: input.logicalOperationId },
           );
         } catch (err) {
           return {
@@ -3770,6 +3787,7 @@ export async function advanceWaveThroughLoop(
       audit: false,
       autoSupersedeTerminal: true,
       repoDir: cfg.repo_dir,
+      logicalOperationId: opts.parentLogicalOperationId,
       onRunReady: async (ctx) => {
         // Live handoff for composers (Tugboat stage-watch). Stderr only —
         // train --json stdout stays one train_status object (#1184).
@@ -3921,7 +3939,12 @@ export async function runTrainCommand(
     },
     {
       ...baseDeps,
-      advanceWave: (issues) => wave(issues, opts, baseDeps.getIssue),
+      advanceWave: (issues, ctx) =>
+        wave(
+          issues,
+          { ...opts, parentLogicalOperationId: ctx?.logicalOperationId },
+          baseDeps.getIssue,
+        ),
       // #1061: one supervisor recover-parked pass on park; never invent override in train.
       recoverParked: async (issue) => {
         const {

@@ -46,6 +46,19 @@ import {
   type FrgPackProvenance,
 } from "./frg-pack-observations.ts";
 import {
+  aggregateUniqueOperationReliability,
+  attemptsFromRunArtifacts,
+  filterAttemptsBoundToCandidate,
+  parseUniqueOperationReliability,
+  REQUIRED_LIFECYCLE_CLASSES_1333,
+  REQUIRED_PUBLIC_ENTRYPOINTS,
+  uniqueOperationReleaseBindingFailure,
+  uniqueOperationSloFailure,
+  type UniqueOperationAttempt,
+  type UniqueOperationManifest,
+  type UniqueOperationReliability,
+} from "./operation-reliability.ts";
+import {
   defaultCollectHybridV2FromRun,
   githubReadyToDeployOverlay,
   type HybridV2FromRunArgs,
@@ -397,6 +410,11 @@ export interface FrgEvidence {
    * honest post-1.33 pass. Absent / `other` / `product-milestone` reject.
    */
   work_list?: HonestPost133WorkList;
+  /**
+   * Unique-operation reliability (#1368). Required for release-eligible
+   * `pass: true`. Computed from durable run/event/loop/handoff evidence.
+   */
+  operation_reliability?: UniqueOperationReliability;
 }
 
 export type FrgLookupResult =
@@ -623,6 +641,7 @@ export function buildFrgAttestationPayload(input: {
   pack_provenance: FrgPackProvenance | null;
   pack_provenance_fingerprint?: string;
   factory_release_binding?: unknown;
+  operation_reliability?: UniqueOperationReliability | null;
 }): Record<string, unknown> {
   const payload: Record<string, unknown> = {
     producer: "pipeline-factory-gate",
@@ -651,6 +670,9 @@ export function buildFrgAttestationPayload(input: {
   // their MAC. A post-sign overlay is then a MAC mismatch, not a retarget.
   if (input.factory_release_binding !== undefined) {
     payload.factory_release_binding = input.factory_release_binding;
+  }
+  if (input.operation_reliability) {
+    payload.operation_reliability = input.operation_reliability;
   }
   return payload;
 }
@@ -695,6 +717,7 @@ export interface FrgAttestationSignInput {
   recovery_aggregates?: FrgRecoveryAggregates | null;
   pack_provenance?: FrgPackProvenance | null;
   factory_release_binding?: unknown;
+  operation_reliability?: UniqueOperationReliability | null;
   attestationKey: string;
 }
 
@@ -716,6 +739,7 @@ export function signFrgIntegrity(input: FrgAttestationSignInput): FrgIntegrity {
     pack_provenance: input.pack_provenance ?? null,
     pack_provenance_fingerprint: input.integrity.pack_provenance_fingerprint,
     factory_release_binding: input.factory_release_binding,
+    operation_reliability: input.operation_reliability ?? null,
   });
   return {
     ...input.integrity,
@@ -758,6 +782,7 @@ export function verifyFrgAttestation(
     recovery_aggregates?: FrgRecoveryAggregates | null;
     pack_provenance?: FrgPackProvenance | null;
     factory_release_binding?: unknown;
+    operation_reliability?: UniqueOperationReliability | null;
     integrity: FrgIntegrity;
   },
   attestationKey: string,
@@ -791,6 +816,7 @@ export function verifyFrgAttestation(
     pack_provenance: evidence.pack_provenance ?? null,
     pack_provenance_fingerprint: evidence.integrity.pack_provenance_fingerprint,
     factory_release_binding: evidence.factory_release_binding,
+    operation_reliability: evidence.operation_reliability ?? null,
   });
   const expected = computeFrgAttestationMac(payload, attestationKey);
   return timingSafeEqualHex(expected, att.mac);
@@ -907,6 +933,12 @@ export interface FrgFsDeps {
    * Production default uses a short-retry PID lock; tests inject an in-memory mutex.
    */
   withPathLock?: <T>(lockKey: string, fn: () => Promise<T>) => Promise<T>;
+  /**
+   * Optional run-store listing for unique-operation evidence collection.
+   * Tests omit this so missing artifacts fail closed instead of synthesizing
+   * a passing unique-operation report.
+   */
+  readdir?(p: string): Promise<Array<{ name: string; isDirectory(): boolean }>>;
 }
 
 /** Host-local path lock with brief retry (default production seam for ledger append). */
@@ -944,6 +976,10 @@ const defaultFsDeps: FrgFsDeps = {
   },
   rename: (from, to) => fsp.rename(from, to),
   withPathLock: defaultFrgPathLock,
+  readdir: async (p) => {
+    const entries = await fsp.readdir(p, { withFileTypes: true });
+    return entries.map((e) => ({ name: e.name, isDirectory: () => e.isDirectory() }));
+  },
 };
 
 function isFiniteNumber(v: unknown): v is number {
@@ -1602,6 +1638,7 @@ export function isReleaseEligibleFrgPass(
     integrity?: FrgIntegrity;
     pack_provenance?: FrgPackProvenance | null;
     run_id?: string;
+    operation_reliability?: UniqueOperationReliability | null;
   },
   opts?: {
     /**
@@ -1659,6 +1696,17 @@ export function isReleaseEligibleFrgPass(
   if (typeof evidence.run_id === "string" && evidence.run_id.trim() === "") return false;
   // Attestation must be present for release-eligible pass (MAC verified on tag path).
   if (opts?.requireAttestation !== false && !frgAttestationPresent(evidence.integrity)) {
+    return false;
+  }
+  if (
+    uniqueOperationReleaseBindingFailure(evidence.operation_reliability ?? null, {
+      candidate_sha: evidence.pack_provenance?.candidate_git_sha ?? null,
+      release_identity: evidence.version ?? null,
+    }) !== null
+  ) {
+    return false;
+  }
+  if (uniqueOperationSloFailure(evidence.operation_reliability ?? null) !== null) {
     return false;
   }
   return true;
@@ -2368,6 +2416,10 @@ export function parseFrgEvidence(raw: unknown): FrgEvidence {
     );
   }
   const recovery_aggregates = parseFrgRecoveryAggregates(o.recovery_aggregates);
+  const operationReliability =
+    o.operation_reliability === undefined || o.operation_reliability === null
+      ? undefined
+      : parseUniqueOperationReliability(o.operation_reliability);
   const scoreSource = parseOptionalHonestEnum(
     o.score_source,
     "score_source",
@@ -2399,6 +2451,7 @@ export function parseFrgEvidence(raw: unknown): FrgEvidence {
     integrity,
     pack_provenance: packProvenance,
     run_id: typeof o.run_id === "string" ? o.run_id : "",
+    operation_reliability: operationReliability ?? null,
   });
 
   if (o.pass === true && !releaseEligible) {
@@ -2439,6 +2492,7 @@ export function parseFrgEvidence(raw: unknown): FrgEvidence {
     integrity,
     pack_provenance: packProvenance,
   };
+  if (operationReliability) evidence.operation_reliability = operationReliability;
   if (recovery_aggregates) evidence.recovery_aggregates = recovery_aggregates;
   if (scoreSource !== undefined) evidence.score_source = scoreSource;
   if (workList !== undefined) evidence.work_list = workList;
@@ -3508,6 +3562,20 @@ export interface ComputeFrgInput {
   score_source?: HonestPost133ScoreSource;
   /** Runner-stamped work-list identity for the honest-pass checker. */
   work_list?: HonestPost133WorkList;
+  /** Durable unique-operation attempts for the shared classifier (#1368). */
+  unique_operations?: UniqueOperationAttempt[];
+  unique_operation_manifest?: UniqueOperationManifest;
+  /**
+   * Ignored on the production/release-eligible path. The section is always
+   * derived from durable `unique_operations` (or the test-only fixture below).
+   * A caller-supplied precomputed report cannot mint release-eligible evidence.
+   */
+  operation_reliability?: UniqueOperationReliability;
+  /**
+   * Test-only fixture seam. When set, this section is used instead of
+   * aggregation and release-eligible `pass: true` is refused.
+   */
+  test_only_operation_reliability_fixture?: UniqueOperationReliability;
 }
 
 function isReadyState(state: string): boolean {
@@ -3659,6 +3727,24 @@ export function computeFrgEvidence(input: ComputeFrgInput): FrgEvidence {
     false_human_authority_count: input.false_human_authority_count ?? 0,
   });
   const packProvenance = input.pack_provenance ?? null;
+  const scoredCandidateSha =
+    packProvenance?.candidate_git_sha ??
+    input.unique_operation_manifest?.candidate_sha ??
+    "";
+  const testOnlyFixture = input.test_only_operation_reliability_fixture;
+  const operationReliability =
+    testOnlyFixture ??
+    aggregateUniqueOperationReliability({
+      attempts: input.unique_operations ?? [],
+      manifest: {
+        ...(input.unique_operation_manifest ?? {}),
+        candidate_sha: scoredCandidateSha,
+        release_identity: version,
+      },
+      composition_false_human_count: input.false_human_authority_count ?? 0,
+      candidate_sha: scoredCandidateSha,
+      release_identity: version,
+    });
   let integrity = buildFrgIntegrity(scoreboard, composition, packProvenance);
 
   // Sign when a producer key is available (env or explicit). Without a key,
@@ -3689,11 +3775,13 @@ export function computeFrgEvidence(input: ComputeFrgInput): FrgEvidence {
       integrity,
       pack_provenance: packProvenance,
       run_id: runId,
+      operation_reliability: operationReliability,
     },
     { requireAttestation: false },
   );
   // Claim pass:true only when structure is eligible and we will attach attestation.
-  const pass = structuralPass && canSign;
+  // The test-only fixture seam cannot mint release-eligible evidence.
+  const pass = structuralPass && canSign && testOnlyFixture == null;
 
   if (canSign) {
     integrity = {
@@ -3727,6 +3815,7 @@ export function computeFrgEvidence(input: ComputeFrgInput): FrgEvidence {
       recovery_aggregates: input.recovery_aggregates ?? null,
       pack_provenance: packProvenance,
       factory_release_binding: input.factory_release_binding,
+      operation_reliability: operationReliability,
       attestationKey: attestationKey!,
     });
   }
@@ -3756,6 +3845,7 @@ export function computeFrgEvidence(input: ComputeFrgInput): FrgEvidence {
     composition,
     integrity,
     pack_provenance: packProvenance,
+    operation_reliability: operationReliability,
   };
   if (input.factory_release_binding !== undefined) {
     evidence.factory_release_binding = input.factory_release_binding;
@@ -4130,6 +4220,9 @@ export interface FactoryGateOpts {
   recoveryAggregates?: FrgRecoveryAggregates;
   /** Structured proof block from the closed hybrid pack runner (v1 or v2). */
   packProvenance?: FrgPackProvenance;
+  /** Unique-operation attempts for `operation_reliability` (#1368). */
+  unique_operations?: UniqueOperationAttempt[];
+  unique_operation_manifest?: UniqueOperationManifest;
   /**
    * Post-1.33 --from-run collect. When omitted, production builds hybrid-v2
    * provenance from the live pack + Layer A TAP (#1118). Tests inject a fake.
@@ -4282,6 +4375,151 @@ async function attachShipPathFromRunBinding(
     run_id: attestorRunId,
     factory_release_binding: resolution.binding,
   };
+}
+
+async function readJsonObjectOrNull(
+  fsDeps: FrgFsDeps,
+  filePath: string,
+): Promise<Record<string, unknown> | null> {
+  try {
+    const raw = await fsDeps.readFile(filePath);
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    return parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+async function readJsonlObjects(
+  fsDeps: FrgFsDeps,
+  filePath: string,
+): Promise<Record<string, unknown>[]> {
+  try {
+    const raw = await fsDeps.readFile(filePath);
+    const out: Record<string, unknown>[] = [];
+    for (const line of raw.split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        const parsed: unknown = JSON.parse(line);
+        if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+          out.push(parsed as Record<string, unknown>);
+        }
+      } catch {
+        // Skip corrupt tail lines the same way run-store readers do.
+      }
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+function mergeChildIdentity(
+  primary: Record<string, unknown> | null,
+  extras: Array<Record<string, unknown> | null>,
+): Record<string, unknown> | null {
+  const out: Record<string, unknown> = { ...(primary ?? {}) };
+  for (const extra of extras) {
+    if (!extra) continue;
+    for (const key of [
+      "logical_operation_id",
+      "candidate_sha",
+      "candidate_git_sha",
+      "parent_logical_operation_id",
+      "kind",
+      "release_identity",
+      "release_version",
+    ]) {
+      if (out[key] == null && extra[key] != null) out[key] = extra[key];
+    }
+  }
+  return Object.keys(out).length > 0 ? out : primary;
+}
+
+async function loadFollowableChildRun(
+  fsDeps: FrgFsDeps,
+  loopRunId: string,
+  eventsPath: string,
+): Promise<{
+  runId: string;
+  runJson: Record<string, unknown> | null;
+  events: Record<string, unknown>[];
+  summary: Record<string, unknown> | null;
+} | null> {
+  const dir = path.dirname(eventsPath);
+  const [runJson, contract, handoff, events, summary] = await Promise.all([
+    readJsonObjectOrNull(fsDeps, path.join(dir, "run.json")),
+    readJsonObjectOrNull(fsDeps, path.join(dir, "contract.json")),
+    readJsonObjectOrNull(fsDeps, path.join(dir, "loop-run-handoff.json")),
+    readJsonlObjects(fsDeps, eventsPath),
+    readJsonObjectOrNull(fsDeps, path.join(dir, "summary.json")),
+  ]);
+  const merged = mergeChildIdentity(runJson, [contract, handoff]);
+  if (!merged && events.length === 0 && !summary) return null;
+  return {
+    runId: loopRunId,
+    runJson: merged,
+    events,
+    summary,
+  };
+}
+
+/**
+ * Classify durable run/event/summary artifacts. Missing store or unreadable
+ * artifacts yield an empty attempt list (integrity failure, not a synthetic pass).
+ * Only artifacts bound to the scored candidate/release are aggregated.
+ */
+async function collectUniqueOperationsFromRunStore(
+  repoDir: string,
+  fsDeps: FrgFsDeps,
+  binding: { candidate_sha?: string | null; release_identity?: string | null } = {},
+): Promise<UniqueOperationAttempt[]> {
+  if (!fsDeps.readdir) return [];
+  const root = path.join(repoDir, ".agent-pipeline", "runs");
+  let entries: Array<{ name: string; isDirectory(): boolean }>;
+  try {
+    entries = await fsDeps.readdir(root);
+  } catch {
+    return [];
+  }
+  const runs: Array<{
+    runId: string;
+    runJson: Record<string, unknown> | null;
+    events: Record<string, unknown>[];
+    summary: Record<string, unknown> | null;
+  }> = [];
+  const seen = new Set<string>();
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const dir = path.join(root, entry.name);
+    seen.add(entry.name);
+    runs.push({
+      runId: entry.name,
+      runJson: await readJsonObjectOrNull(fsDeps, path.join(dir, "run.json")),
+      events: await readJsonlObjects(fsDeps, path.join(dir, "events.jsonl")),
+      summary: await readJsonObjectOrNull(fsDeps, path.join(dir, "summary.json")),
+    });
+  }
+  for (const run of [...runs]) {
+    for (const event of run.events) {
+      if (event.type !== "train_loop_linked") continue;
+      const loopRunId =
+        typeof event.loop_run_id === "string" ? event.loop_run_id.trim() : "";
+      const eventsPath =
+        typeof event.events === "string" && event.events.trim()
+          ? event.events.trim()
+          : typeof event.events_path === "string"
+            ? event.events_path.trim()
+            : "";
+      if (!loopRunId || !eventsPath || seen.has(loopRunId)) continue;
+      const child = await loadFollowableChildRun(fsDeps, loopRunId, eventsPath);
+      if (!child) continue;
+      seen.add(loopRunId);
+      runs.push(child);
+    }
+  }
+  return filterAttemptsBoundToCandidate(attemptsFromRunArtifacts(runs), binding);
 }
 
 /**
@@ -4575,6 +4813,38 @@ export async function runFactoryGate(
 
   if (opts.fromRun) {
     computeInput = await attachShipPathFromRunBinding(opts, computeInput, fsDeps);
+  }
+
+  if (opts.unique_operations && computeInput.unique_operations === undefined) {
+    computeInput = {
+      ...computeInput,
+      unique_operations: opts.unique_operations,
+      unique_operation_manifest: opts.unique_operation_manifest,
+    };
+  }
+  if (computeInput.unique_operations === undefined) {
+    const scoredCandidateSha =
+      computeInput.pack_provenance?.candidate_git_sha ??
+      computeInput.unique_operation_manifest?.candidate_sha ??
+      opts.unique_operation_manifest?.candidate_sha ??
+      "";
+    const collected = await collectUniqueOperationsFromRunStore(opts.repoDir, fsDeps, {
+      candidate_sha: scoredCandidateSha,
+      release_identity: version,
+    });
+    computeInput = {
+      ...computeInput,
+      unique_operations: collected,
+      unique_operation_manifest:
+        computeInput.unique_operation_manifest ??
+        opts.unique_operation_manifest ??
+        {
+          required_entrypoints: [...REQUIRED_PUBLIC_ENTRYPOINTS],
+          required_lifecycle_classes: [...REQUIRED_LIFECYCLE_CLASSES_1333],
+          candidate_sha: scoredCandidateSha,
+          release_identity: version,
+        },
+    };
   }
 
   const evidence = computeFrgEvidence(computeInput);

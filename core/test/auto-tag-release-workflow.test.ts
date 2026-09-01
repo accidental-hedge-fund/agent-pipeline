@@ -22,6 +22,7 @@ import {
   writeFrgEvidence,
   type FrgFsDeps,
 } from "../scripts/factory-reliability-gate.ts";
+import { frgPassUniqueOperations } from "./frg-pass-unique-operations.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const WORKFLOW_PATH = join(__dirname, "../../.github/workflows/auto-tag-release.yml");
@@ -705,6 +706,7 @@ test("release-eligible pass:true latest.json allows tag proceed", async () => {
     scenario_overrides: frgRequiredObservationOverrides("pass"),
     composition_overrides: frgRequiredCompositionOverrides("pass"),
     attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
+    ...frgPassUniqueOperations("1.30.0"),
   });
   assert.equal(good.pass, true);
   await writeFrgEvidence("/repo", good, fs);

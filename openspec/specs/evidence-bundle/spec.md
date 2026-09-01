@@ -737,7 +737,6 @@ When a run creates, answers, rejects, supersedes, expires, or attempts resume va
 - **THEN** evidence SHALL include responder identity reference, decision, and timestamp
 - **AND** SHALL include whether the handoff was authority-bearing
 
-
 ### Requirement: Evidence bundle SHALL record governed override decisions and lifecycle state
 
 The evidence bundle (or equivalent run evidence surface) SHALL include override decision records sufficient to distinguish `active`, `expired`, `superseded`, `renewed`, `rejected`, and `invalidated` outcomes for the run. Each recorded decision SHALL expose class, target, actor, authorization summary, timestamps (`created_at`, `expires_at`), lineage identifiers when present, evidence and remediation references, and evidence-subject binding or legacy-unbound disposition. Free-text reasons alone SHALL NOT be the only machine-readable representation of lifecycle state.
@@ -803,7 +802,6 @@ When repository-control desired state is configured and a compare runs during th
 - **THEN** finalized evidence SHALL record `outcome: "unavailable"`
 - **AND** SHALL NOT record that control as `in_sync`
 
-
 ### Requirement: Evidence surfaces SHALL expose lineage export slices and drift reason codes
 
 When lineage data exists for a run, finalized evidence surfaces (evidence bundle and/or `summary.json` and the human-readable summary path) SHALL expose a lineage section that includes at least:
@@ -834,3 +832,24 @@ Absence of a hosted UI SHALL NOT prevent operators from reading these fields via
 - **WHEN** a run finalizes before any lineage projection exists
 - **THEN** the evidence surface SHALL omit the section or record an explicit skip/empty reason
 - **AND** SHALL NOT claim complete intent-to-outcome attribution
+
+### Requirement: Run identity artifacts SHALL persist logical_operation_id next to run_id
+
+`run.json` SHALL persist `logical_operation_id` as a written-once identity field at run-directory initialization. Finalized `summary.json` SHALL include the same `logical_operation_id`. Resume re-entry SHALL reuse the written value and SHALL NOT overwrite it. Absence of the field on historical artifacts SHALL be tolerated by readers as missing correlation, not as a crash.
+
+#### Scenario: First init writes both identities
+
+- **WHEN** a run directory is initialized for a new public admission
+- **THEN** `run.json` SHALL contain `run_id` and `logical_operation_id`
+- **AND** those fields SHALL be non-empty and distinct
+
+#### Scenario: Resume does not rewrite logical_operation_id
+
+- **WHEN** `initRunDir` is called on a directory whose `run.json` already contains `logical_operation_id` `L`
+- **THEN** `run.json` SHALL still contain `L`
+- **AND** no second logical identity SHALL be written
+
+#### Scenario: Finalized summary copies the written identity
+
+- **WHEN** `finalizeRun` writes `summary.json` for a run whose `run.json` contains `logical_operation_id` `L`
+- **THEN** `summary.json` SHALL include `L`

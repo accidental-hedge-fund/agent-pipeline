@@ -5,6 +5,7 @@
 
 import * as path from "node:path";
 import { writeFlushedStdoutLine } from "./loop/handoff.ts";
+import { mintLogicalOperationId } from "./logical-operation.ts";
 import {
   RUN_SCHEMA_VERSION,
   appendEvent,
@@ -63,12 +64,14 @@ export interface TrainEventPayload {
   merge_result_oid?: string | null;
   final_state?: string;
   elapsed_ms?: number;
+  logical_operation_id?: string;
 }
 
 export interface TrainEventSession {
   readonly runId: string;
   readonly runDir: string;
   readonly eventsPath: string;
+  readonly logicalOperationId: string;
   append(type: TrainEventType, payload?: TrainEventPayload & Record<string, unknown>): Promise<void>;
 }
 
@@ -90,6 +93,7 @@ export function formatTrainRunHandoff(input: {
 export function createTrainEventSession(opts: {
   runDir: string;
   runId: string;
+  logicalOperationId: string;
   store?: RunStoreDeps;
   now?: () => Date;
 }): TrainEventSession {
@@ -100,6 +104,7 @@ export function createTrainEventSession(opts: {
     runId: opts.runId,
     runDir: opts.runDir,
     eventsPath: path.join(opts.runDir, "events.jsonl"),
+    logicalOperationId: opts.logicalOperationId,
     async append(type, payload = {}) {
       seq += 1;
       const event: Record<string, unknown> = {
@@ -108,6 +113,7 @@ export function createTrainEventSession(opts: {
         type,
         at: now().toISOString(),
         run_id: opts.runId,
+        logical_operation_id: opts.logicalOperationId,
       };
       for (const [key, value] of Object.entries(payload)) {
         if (value === undefined) continue;
@@ -127,6 +133,7 @@ export async function initTrainRunStore(input: {
   selector: TrainRunSelector;
   store?: RunStoreDeps;
   now?: () => Date;
+  logicalOperationId?: string | null;
 }): Promise<TrainEventSession> {
   const runId = trainRunIdFor(input.startedAt);
   const runDir = runDirPath(input.repoDir, runId);
@@ -142,18 +149,38 @@ export async function initTrainRunStore(input: {
       mergeMode: input.mergeMode,
       selector: input.selector,
       orderedIssues: input.orderedIssues,
+      logicalOperationId: input.logicalOperationId,
     },
     store,
   );
+  let logicalOperationId = typeof input.logicalOperationId === "string" && input.logicalOperationId.trim()
+    ? input.logicalOperationId.trim()
+    : "";
+  if (!logicalOperationId) {
+    try {
+      const raw = await store.readFile(path.join(runDir, "run.json"));
+      const meta = JSON.parse(raw) as { logical_operation_id?: unknown };
+      if (typeof meta.logical_operation_id === "string" && meta.logical_operation_id.trim()) {
+        logicalOperationId = meta.logical_operation_id.trim();
+      }
+    } catch {
+      /* initRunDir is non-fatal; mint below if unreadable */
+    }
+  }
+  if (!logicalOperationId) {
+    logicalOperationId = mintLogicalOperationId();
+  }
   const session = createTrainEventSession({
     runDir,
     runId,
+    logicalOperationId,
     store,
     now: input.now,
   });
   await session.append("run_start", {
     repo: input.repo,
     merge_mode: input.mergeMode,
+    logical_operation_id: logicalOperationId,
   });
   return session;
 }

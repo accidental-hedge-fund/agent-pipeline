@@ -56,6 +56,7 @@ import {
   FRG_PACK_MANIFEST,
   FRG_UNIT_TEST_ATTESTATION_KEY,
 } from "../scripts/factory-reliability-gate.ts";
+import { frgPassUniqueOperations } from "./frg-pass-unique-operations.ts";
 
 const PIPELINE_SCRIPT = fileURLToPath(new URL("../scripts/pipeline.ts", import.meta.url));
 
@@ -78,6 +79,7 @@ function defaultFrgPass(version = "1.6.0") {
     composition_overrides: frgRequiredCompositionOverrides("pass"),
     attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
     now: () => new Date("2026-07-30T00:00:00.000Z"),
+    ...frgPassUniqueOperations(version),
   });
   // Injected requireFrgPass seam: release tests need a usable pass run_id.
   // Post-1.33.0 scoring without hybrid-v2 pack_provenance is not release-eligible.

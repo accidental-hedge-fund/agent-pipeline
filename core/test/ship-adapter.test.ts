@@ -84,6 +84,7 @@ import {
   renderFrgPackIssues,
 } from "../scripts/frg-pack-observations.ts";
 import type { TrainIssueSnapshot } from "../scripts/stages/train.ts";
+import { frgPassUniqueOperations } from "./frg-pass-unique-operations.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -762,6 +763,7 @@ async function mintHybridEvidence(opts: {
     work_list: "factory-gate-pack",
     attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
     now: () => new Date("2026-08-16T12:10:00.000Z"),
+    ...frgPassUniqueOperations(opts.version),
   });
   assert.equal(evidence.pass, true);
   return evidence;
@@ -2921,6 +2923,7 @@ async function shipHybridFromRunEvidence(opts: {
     factory_release_binding: opts.includeBinding ? binding : undefined,
     attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
     score_source: "from-run",
+    ...frgPassUniqueOperations(opts.request.target_version),
     work_list: "factory-gate-pack",
   });
 }
@@ -3900,6 +3903,7 @@ test("ensure-tag does not tag when factory_release_binding is overlaid after HMA
     scenario_overrides: frgRequiredObservationOverrides("pass"),
     composition_overrides: frgRequiredCompositionOverrides("pass"),
     attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
+    ...frgPassUniqueOperations(version),
   });
   assert.equal(signed.pass, true);
   const overlaid = {

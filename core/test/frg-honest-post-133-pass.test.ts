@@ -20,6 +20,7 @@ import {
   parseFrgEvidence,
   parseFrgObservationsFile,
 } from "../scripts/factory-reliability-gate.ts";
+import { frgPassUniqueOperations } from "./frg-pass-unique-operations.ts";
 import {
   collectFrgPackObservations,
   isFrgRequiredLiveCompositionId,
@@ -170,6 +171,7 @@ function scoreCollected(
       attestation_key:
         over.attestation_key === undefined ? FRG_UNIT_TEST_ATTESTATION_KEY : over.attestation_key,
       now: () => new Date("2026-08-16T12:10:00.000Z"),
+      ...frgPassUniqueOperations(releaseVersion),
     }),
   };
 }

@@ -51,6 +51,11 @@ import {
   formatPlanningLeverageScoreboardHuman,
   type PlanningLeverageScoreboardSection,
 } from "./planning-leverage/scoreboard-section.ts";
+import {
+  aggregateUniqueOperationReliability,
+  attemptsFromRunArtifacts,
+  type UniqueOperationReliability,
+} from "./operation-reliability.ts";
 
 /** Repo-relative FRG trend ledger path (#757) — duplicated string to avoid
  *  importing factory-reliability-gate (config/zod) into the scoreboard graph. */
@@ -407,6 +412,12 @@ export interface ScoreboardReport {
    * productivity / leverage / expected-pain score.
    */
   planning_leverage?: PlanningLeverageScoreboardSection;
+  /**
+   * Unique-operation reliability from shared correlated facts (#1368).
+   * Additive. Denominators are distinct logical_operation_id values, never
+   * attempt/run/closed-issue counts.
+   */
+  unique_operation_reliability?: UniqueOperationReliability;
 }
 
 export interface ScoreboardOpts {
@@ -729,6 +740,21 @@ export async function buildScoreboardReport(
     engine_class_release_series: engineClassReleaseSeries,
     outcomes: outcomesSection,
     planning_leverage: planningLeverageSection,
+    unique_operation_reliability: aggregateUniqueOperationReliability({
+      attempts: attemptsFromRunArtifacts(
+        scan.runs.map((r) => ({
+          runId: r.runId,
+          runJson: r.runJson,
+          events: r.events,
+          summary: r.summary,
+        })),
+      ),
+      manifest: {
+        required_entrypoints: [],
+        required_lifecycle_classes: [],
+        live_train_linkage_present: true,
+      },
+    }),
   };
   if (bucket === null) return report;
 

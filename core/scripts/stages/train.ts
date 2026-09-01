@@ -197,7 +197,10 @@ export interface TrainDeps {
    * Advance one base-eligible frontier as a single multi-item wave
    * (production: one loop/advance-wave call — not N×single). Must not merge.
    */
-  advanceWave(issues: readonly number[]): Promise<AdvanceWaveResult>;
+  advanceWave(
+    issues: readonly number[],
+    ctx?: { logicalOperationId?: string },
+  ): Promise<AdvanceWaveResult>;
   /**
    * Legacy single-item advance. Used only when tests/adapters lack advanceWave
    * wiring via {@link advanceWaveFromSingle}. Prefer advanceWave in production.
@@ -1329,7 +1332,9 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
       }
       let waveResult: AdvanceWaveResult;
       try {
-        waveResult = await advanceWave(toAdvance);
+        waveResult = await advanceWave(toAdvance, {
+          logicalOperationId: session.logicalOperationId,
+        });
       } catch (err) {
         blocker = `advance wave failed: ${(err as Error).message}`;
         nextAction = "stopped";
@@ -1345,6 +1350,7 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
         await session.append("train_loop_linked", {
           wave: waveNumber,
           loop_run_id: linked.runId,
+          logical_operation_id: session.logicalOperationId,
           ...(linked.eventsPath ? { events: linked.eventsPath } : {}),
         });
       }
@@ -1639,7 +1645,10 @@ export function realTrainDeps(opts: {
    * call per frontier. When only single-item is available, wrap with
    * {@link advanceWaveFromSingle}.
    */
-  advanceWave: (issues: readonly number[]) => Promise<AdvanceWaveResult>;
+  advanceWave: (
+    issues: readonly number[],
+    ctx?: { logicalOperationId?: string },
+  ) => Promise<AdvanceWaveResult>;
   mergeDeps?: MergeDeps;
 }): TrainDeps {
   const mergeDeps = opts.mergeDeps ?? realMergeDeps(opts.repo);

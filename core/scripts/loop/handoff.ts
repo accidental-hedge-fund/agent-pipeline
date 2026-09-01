@@ -26,6 +26,8 @@ export interface LoopRunReadyContext {
    * Null/omitted on bare `--resume <run-id>` (no selector).
    */
   selector?: LoopSelector | null;
+  /** Parent or admission logical-operation identity when the contract stores it. */
+  logical_operation_id?: string;
 }
 
 /** Wire shape of the early handoff JSON object written to stdout. */
@@ -38,6 +40,7 @@ export interface LoopRunHandoff {
   engine: string;
   resumed: boolean;
   selector: LoopSelector | null;
+  logical_operation_id?: string;
 }
 
 /** Supervisor identity snapshot persisted with the durable pack-loop ack. */
@@ -72,6 +75,9 @@ export function formatLoopRunHandoff(ctx: LoopRunReadyContext): string {
     engine: String(ctx.engine),
     resumed: !!ctx.resumed,
     selector: ctx.selector ?? null,
+    ...(typeof ctx.logical_operation_id === "string" && ctx.logical_operation_id.trim()
+      ? { logical_operation_id: ctx.logical_operation_id.trim() }
+      : {}),
   };
   return JSON.stringify(payload);
 }

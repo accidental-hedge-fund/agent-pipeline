@@ -83,6 +83,11 @@ import {
   type FactoryReleasePrepareRequest,
 } from "../scripts/factory-release-prepare.ts";
 import { presentFrgAttestorCredential } from "../scripts/ship-end-candidate.ts";
+import {
+  passingUniqueOperationAttempts,
+  passingUniqueOperationManifest,
+} from "../scripts/operation-reliability.ts";
+import { frgPassUniqueOperations } from "./frg-pass-unique-operations.ts";
 
 /** Minimal full-pack pass scoring input (all scenarios + composition; K met; live loop). */
 function fullPackPassInput(
@@ -114,6 +119,10 @@ function fullPackPassInput(
       overrides.attestation_key === undefined
         ? FRG_UNIT_TEST_ATTESTATION_KEY
         : overrides.attestation_key,
+    unique_operations: passingUniqueOperationAttempts(),
+    unique_operation_manifest: passingUniqueOperationManifest({
+      release_identity: overrides.version ?? "1.29.1",
+    }),
   };
 }
 
@@ -255,6 +264,7 @@ test("computeFrgEvidence: green unit-shaped pass with K clean ready items + full
     composition_overrides: frgRequiredCompositionOverrides("pass"),
     attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
     now: () => new Date("2026-07-30T12:00:00.000Z"),
+    ...frgPassUniqueOperations("1.29.1"),
   });
   assert.equal(evidence.schema_version, FRG_SCHEMA_VERSION);
   assert.equal(evidence.version, "1.29.1");
@@ -1060,6 +1070,7 @@ test("runFactoryGate --from-run: accepts factory-gate label pack and scores", as
       scenarioOverrides: frgRequiredObservationOverrides("pass"),
       compositionOverrides: frgRequiredCompositionOverrides("pass"),
       attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
+      ...frgPassUniqueOperations("1.29.1"),
       stdout: () => {},
       stderr: () => {},
     },
@@ -1201,6 +1212,7 @@ test("runFactoryGate --from-run post-1.33: collects hybrid-v2 provenance when mi
       loadContract: async () => packContract,
       collectHybridV2: async () => observations,
       attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
+      ...frgPassUniqueOperations("1.39.2"),
       stdout: () => {},
       stderr: () => {},
     },
@@ -1377,6 +1389,7 @@ test("runFactoryGate --from-run forwards request packed candidate and writes lat
         return observations;
       },
       attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
+      ...frgPassUniqueOperations("1.39.15"),
       stdout: () => {},
       stderr: () => {},
     },
@@ -1961,6 +1974,7 @@ test("factory-gate --from-run overlays GitHub R2D over recovery_exhausted blocke
       loadContract: async () => staleBlockedPackContract(),
       collectHybridV2: async () => collected,
       attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
+      ...frgPassUniqueOperations("1.39.6"),
       stdout: () => {},
       stderr: () => {},
     },
@@ -2266,6 +2280,7 @@ test("runFactoryGate: release-eligible pass closes pack artifacts via injected d
       compositionOverrides: frgRequiredCompositionOverrides("pass"),
       attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
       packCloseDeps: deps,
+      ...frgPassUniqueOperations("1.29.1"),
       stdout: () => {},
       stderr: () => {},
     },
@@ -2408,6 +2423,7 @@ test("runFactoryGate: --no-close-pack skips closes while keeping pass", async ()
       attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
       noClosePack: true,
       packCloseDeps: deps,
+      ...frgPassUniqueOperations("1.29.1"),
       stdout: () => {},
       stderr: (m) => stderrLines.push(m),
     },
@@ -2462,6 +2478,7 @@ test("runFactoryGate: close error leaves pass and evidence intact (fail-soft)", 
       compositionOverrides: frgRequiredCompositionOverrides("pass"),
       attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
       packCloseDeps: deps,
+      ...frgPassUniqueOperations("1.29.1"),
       stdout: () => {},
       stderr: () => {},
     },
@@ -2508,6 +2525,7 @@ test("runFactoryGate: without packCloseDeps, release pass does not call network 
       scenarioOverrides: frgRequiredObservationOverrides("pass"),
       compositionOverrides: frgRequiredCompositionOverrides("pass"),
       attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
+      ...frgPassUniqueOperations("1.29.1"),
       stdout: () => {},
       stderr: () => {},
     },
@@ -2561,6 +2579,7 @@ test("runFactoryGate: item absent from scoreboard never closed even if labeled f
       compositionOverrides: frgRequiredCompositionOverrides("pass"),
       attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
       packCloseDeps: deps,
+      ...frgPassUniqueOperations("1.29.1"),
       stdout: () => {},
       stderr: () => {},
     },
@@ -2799,6 +2818,7 @@ test("validateReleaseEligibleFrgEvidence rejects hand-authored self-consistent e
       scoreboard: honest.scoreboard,
       composition: honest.composition,
       recovery_aggregates: honest.recovery_aggregates ?? null,
+      operation_reliability: honest.operation_reliability ?? null,
       attestationKey: otherKey,
     }),
   };
@@ -2844,6 +2864,7 @@ test("HMAC binds pass/scenarios/thresholds — eligibility-field replay rejected
   replay.pass = true;
   replay.scenarios = JSON.parse(JSON.stringify(honest.scenarios));
   replay.thresholds = { ...honest.thresholds };
+  replay.operation_reliability = JSON.parse(JSON.stringify(honest.operation_reliability));
   // Fingerprints still match scoreboard/composition (unchanged) — without field binding
   // the old MAC would still verify.
   assert.equal(
@@ -3366,6 +3387,7 @@ test("factory-gate --from-run presents KEY_FILE as KEY (#1181)", async () => {
       presentAttestorCredential: {
         readFile: () => Buffer.from(dummy),
       },
+      ...frgPassUniqueOperations("1.29.1"),
       stdout: () => {},
       stderr: () => {},
     },
@@ -3625,6 +3647,7 @@ test("ship-path from-run writes HMAC binding before sign and remints the same B 
       scenarioOverrides: frgRequiredObservationOverrides("pass"),
       compositionOverrides: frgRequiredCompositionOverrides("pass"),
       attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
+      ...frgPassUniqueOperations("1.29.1"),
       stdout: () => {},
       stderr: () => {},
     },
@@ -3660,6 +3683,7 @@ test("ship-path from-run writes HMAC binding before sign and remints the same B 
       scenarioOverrides: frgRequiredObservationOverrides("pass"),
       compositionOverrides: frgRequiredCompositionOverrides("pass"),
       attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
+      ...frgPassUniqueOperations("1.29.1"),
       stdout: () => {},
       stderr: () => {},
     },
@@ -3745,6 +3769,7 @@ test("standalone unbound from-run still mints a fresh run_id without binding (#1
       scenarioOverrides: frgRequiredObservationOverrides("pass"),
       compositionOverrides: frgRequiredCompositionOverrides("pass"),
       attestationKey: FRG_UNIT_TEST_ATTESTATION_KEY,
+      ...frgPassUniqueOperations("1.29.1"),
       stdout: () => {},
       stderr: () => {},
     },

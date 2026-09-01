@@ -52,6 +52,7 @@ import {
   stampTrustedSurfaceDecision,
   type TrustedSurfaceDecision,
 } from "./trusted-surface.ts";
+import { mintLogicalOperationId, resolveLogicalOperationId } from "./logical-operation.ts";
 
 export const RUN_SCHEMA_VERSION = 1;
 
@@ -132,6 +133,11 @@ export interface RunStartEvent extends RunEventBase {
    * / reviewer adapter treatment identity. Omitted when unknown.
    */
   outer_host?: string;
+  /**
+   * Opaque immutable logical-operation identity (#1368). Additive;
+   * `schema_version` stays 1. Distinct from physical `run_id`.
+   */
+  logical_operation_id?: string;
 }
 export type RunCompleteStopReason = "iteration-budget-exhausted";
 
@@ -1011,6 +1017,11 @@ export interface RunMeta {
    * not be treated as live-run merely because engine.version exists.
    */
   discovery_channel?: string;
+  /**
+   * Opaque immutable logical-operation identity (#1368). Written once at
+   * first init. Distinct from physical `run_id`. Historical artifacts omit it.
+   */
+  logical_operation_id?: string;
 }
 
 export interface InitRunDirOpts {
@@ -1039,6 +1050,14 @@ export interface InitRunDirOpts {
    * runs that predate this field remain readable without inventing a channel.
    */
   discoveryChannel?: string | null;
+  /**
+   * Resume / parent-handoff binding (#1368). When omitted, a new logical
+   * identity is minted. Re-entry of an existing run.json ignores this and
+   * keeps the written value.
+   */
+  logicalOperationId?: string | null;
+  /** Injectable mint for tests. Production uses crypto.randomBytes. */
+  mintLogicalOperationId?: () => string;
 }
 
 /** Create the run directory, write run.json, append run_start to events.jsonl.
@@ -1076,9 +1095,14 @@ export async function initRunDir(
           ? undefined
           : "live-run";
     const isTrain = opts.kind === "train";
+    const logicalOperationId = resolveLogicalOperationId({
+      parent: opts.logicalOperationId,
+      mint: opts.mintLogicalOperationId ?? mintLogicalOperationId,
+    });
     const meta: RunMeta = {
       schema_version: RUN_SCHEMA_VERSION,
       run_id: opts.runId,
+      logical_operation_id: logicalOperationId,
       repo: opts.repo,
       profile: opts.profile,
       started_at: opts.startedAt,
@@ -1117,6 +1141,7 @@ export async function initRunDir(
         type: "run_start",
         at: opts.startedAt,
         run_id: opts.runId,
+        logical_operation_id: logicalOperationId,
         issue: opts.issue,
         repo: opts.repo,
         ...(outerHost ? { outer_host: outerHost } : {}),
@@ -1693,6 +1718,16 @@ export async function finalizeRun(
   // to the run directory by a single stable identifier (the bundle's runId field
   // uses the commit-trailer format 155/..., which differs from the dir name 155-...).
   const fileRunId = path.basename(runDir);
+  let logicalOperationId: string | undefined;
+  try {
+    const rawMeta = await deps.readFile(path.join(runDir, "run.json"));
+    const meta = JSON.parse(rawMeta) as { logical_operation_id?: unknown };
+    if (typeof meta.logical_operation_id === "string" && meta.logical_operation_id.trim()) {
+      logicalOperationId = meta.logical_operation_id.trim();
+    }
+  } catch {
+    // Historical or missing run.json — omit the field (missing correlation).
+  }
   // Mutate the caller's bundle (not just the summary.json copy) so the harness
   // invocation durations reach `notifyBundlePath`, called right after
   // `finalizeRun` resolves with this same object reference, without a second
@@ -1752,6 +1787,7 @@ export async function finalizeRun(
     ...bundle,
     schema_version: RUN_SCHEMA_VERSION,
     run_id: fileRunId,
+    ...(logicalOperationId ? { logical_operation_id: logicalOperationId } : {}),
     interventions,
     corrections,
     correctionErrors,

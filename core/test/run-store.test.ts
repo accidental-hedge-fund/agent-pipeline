@@ -207,6 +207,132 @@ test("initRunDir: creates run dir, writes run.json with all required fields, eve
   // outer_host omitted when not provided (#784)
   assert.equal(meta.outer_host, undefined);
   assert.equal(events.outer_host, undefined);
+  assert.equal(typeof meta.logical_operation_id, "string");
+  assert.ok(meta.logical_operation_id.startsWith("lop-"));
+  assert.notEqual(meta.logical_operation_id, meta.run_id);
+  assert.equal(events.logical_operation_id, meta.logical_operation_id);
+  assert.equal(events.schema_version, 1);
+});
+
+test("initRunDir: second init on the same directory leaves logical_operation_id unchanged", async () => {
+  const { deps, readFile } = memRunStore();
+  const runId = `${ISSUE}-${STARTED_AT}`;
+  await initRunDir(
+    {
+      runDir: RUN_DIR,
+      runId,
+      issue: ISSUE,
+      repo: "owner/repo",
+      profile: "codex",
+      startedAt: STARTED_AT_ISO,
+      mintLogicalOperationId: () => "lop-first",
+    },
+    deps,
+  );
+  await initRunDir(
+    {
+      runDir: RUN_DIR,
+      runId,
+      issue: ISSUE,
+      repo: "owner/repo",
+      profile: "codex",
+      startedAt: STARTED_AT_ISO,
+      mintLogicalOperationId: () => "lop-second",
+    },
+    deps,
+  );
+  const meta = JSON.parse(readFile(RUN_JSON));
+  assert.equal(meta.logical_operation_id, "lop-first");
+});
+
+test("initRunDir: new public admission without resume binding mints a different logical id", async () => {
+  const { deps, readFile } = memRunStore();
+  const firstDir = path.join(REPO_DIR, ".agent-pipeline", "runs", "155-first");
+  const secondDir = path.join(REPO_DIR, ".agent-pipeline", "runs", "155-second");
+  await initRunDir(
+    {
+      runDir: firstDir,
+      runId: "155-first",
+      issue: ISSUE,
+      repo: "owner/repo",
+      profile: "codex",
+      startedAt: STARTED_AT_ISO,
+    },
+    deps,
+  );
+  await initRunDir(
+    {
+      runDir: secondDir,
+      runId: "155-second",
+      issue: ISSUE,
+      repo: "owner/repo",
+      profile: "codex",
+      startedAt: STARTED_AT_ISO,
+    },
+    deps,
+  );
+  const a = JSON.parse(readFile(path.join(firstDir, "run.json"))).logical_operation_id;
+  const b = JSON.parse(readFile(path.join(secondDir, "run.json"))).logical_operation_id;
+  assert.notEqual(a, b);
+});
+
+test("initRunDir: named-run resume binding keeps L on a new physical run_id", async () => {
+  const { deps, readFile } = memRunStore();
+  const resumeDir = path.join(REPO_DIR, ".agent-pipeline", "runs", "155-resume");
+  await initRunDir(
+    {
+      runDir: resumeDir,
+      runId: "155-resume",
+      issue: ISSUE,
+      repo: "owner/repo",
+      profile: "codex",
+      startedAt: STARTED_AT_ISO,
+      logicalOperationId: "lop-original",
+    },
+    deps,
+  );
+  const meta = JSON.parse(readFile(path.join(resumeDir, "run.json")));
+  assert.equal(meta.run_id, "155-resume");
+  assert.equal(meta.logical_operation_id, "lop-original");
+  const events = await readEvents(resumeDir, deps);
+  assert.equal(events[0]!.logical_operation_id, "lop-original");
+});
+
+test("readEvents: preserves additive logical_operation_id", async () => {
+  const { deps } = memRunStore();
+  await initRunDir(
+    {
+      runDir: RUN_DIR,
+      runId: `${ISSUE}-${STARTED_AT}`,
+      issue: ISSUE,
+      repo: "owner/repo",
+      profile: "codex",
+      startedAt: STARTED_AT_ISO,
+      mintLogicalOperationId: () => "lop-preserved",
+    },
+    deps,
+  );
+  const events = await readEvents(RUN_DIR, deps);
+  assert.equal(events[0]!.logical_operation_id, "lop-preserved");
+});
+
+test("finalizeRun: copies logical_operation_id from run.json into summary.json", async () => {
+  const { deps, readFile } = memRunStore();
+  await initRunDir(
+    {
+      runDir: RUN_DIR,
+      runId: `${ISSUE}-${STARTED_AT}`,
+      issue: ISSUE,
+      repo: "owner/repo",
+      profile: "codex",
+      startedAt: STARTED_AT_ISO,
+      mintLogicalOperationId: () => "lop-summary",
+    },
+    deps,
+  );
+  await finalizeRun(RUN_DIR, makeBundle(), STATE_DIR, ISSUE, STARTED_AT_ISO, deps);
+  const summary = JSON.parse(readFile(path.join(RUN_DIR, "summary.json")));
+  assert.equal(summary.logical_operation_id, "lop-summary");
 });
 
 test("initRunDir: records outer_host separately from profile (#784)", async () => {

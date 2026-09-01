@@ -77,6 +77,7 @@ import {
   renderFrgPackIssues,
   type LoadedFrgPack,
 } from "../scripts/frg-pack-observations.ts";
+import { frgPassUniqueOperations } from "./frg-pass-unique-operations.ts";
 
 const MANIFEST_SHA = "a".repeat(64);
 const CANDIDATE = "b".repeat(40);
@@ -150,6 +151,7 @@ function unsignedEligibleScoreEvidence(
     composition_overrides: frgRequiredCompositionOverrides("pass"),
     false_human_authority_count: 0,
     attestation_key: null,
+    ...frgPassUniqueOperations("1.29.1"),
   });
   assert.equal(evidence.pass, false, "unsigned mint must not invent pass:true");
   assert.equal(
@@ -491,6 +493,7 @@ async function hybridFromRunEvidence(opts: {
     attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
     score_source: "from-run",
     work_list: "factory-gate-pack",
+    ...frgPassUniqueOperations(opts.request.target_version),
   });
   return evidence;
 }

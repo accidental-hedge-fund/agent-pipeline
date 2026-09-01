@@ -123,6 +123,39 @@ pipeline doctor
 4. `pipeline doctor` reports pin target, installed version, and track coherence
    (`install:engine-track`). Run evidence records `engine.track` at run start.
 
+## Unique-operation reliability (#1368)
+
+Release-eligible FRG evidence with `pass: true` includes a versioned
+`operation_reliability` section. That section is the unique-operation contract.
+It is computed from durable run, event, loop-store, and handoff evidence.
+GitHub labels and comment prose are not unique-operation proof.
+
+The section names:
+
+| Field | Meaning |
+|-------|---------|
+| **Numerators / denominators** | Distinct `logical_operation_id` values. Retries, restarts, train waves, ship phases, attestation ticks, raw run counts, and closed-issue counts are not the success-rate denominator. |
+| **Clean completion** | Required clean operations that reached verified completion without Manual reinvocation. Target: 100%. |
+| **False-human projection** | Mechanical, workflow, infrastructure, authentication, or unknown failure projected as human ownership. Target: 0. Reuses composition `false_human_authority_count` classification. |
+| **Ownerless terminal** | Admitted operations that end in none of: verified success, durable cooling/recovery, external wait, typed request, explicit cancellation. Target: 0. |
+| **Exact-candidate recovery** | Applicable recovery that re-proves the authorized candidate. Target: 100% when required. |
+| **Independent-sibling continuation** | Applicable continuation after a contained peer failure. Target: 100% when required. |
+| **Stable exclusions** | Typed request, external wait, or cancellation only when the versioned pack manifest declares that expected outcome. They stay separately counted. |
+| **Integrity counts** | Missing correlation, contradictory parent/child identities, missing required entry-point coverage, missing #1301 live train linkage, missing #1333 lifecycle coverage. These are never exclusions. |
+
+Verified completion requires exact-candidate postcondition proof. Process exit,
+`run_complete`, and issue closure are not success.
+
+Missing `logical_operation_id`, missing required public entry-point coverage,
+or an unmet SLO fails FRG promotion and factory-release prepare.
+
+HMAC attestation binds `operation_reliability`. Mutating a unique-operation
+count after mint fails verification even when public fingerprints stay intact.
+
+`pipeline scoreboard --json` exposes the same classifier as an additive
+`unique_operation_reliability` section. Attempt/run/PR metrics remain, labeled
+as attempt metrics.
+
 ## Two layers (both mandatory)
 
 | Layer | When | What |
