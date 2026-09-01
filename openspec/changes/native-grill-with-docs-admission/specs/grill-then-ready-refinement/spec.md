@@ -54,7 +54,7 @@
 
 ### Requirement: Pipeline SHALL validate authority class against a closed taxonomy
 
-The model MAY propose a class. Pipeline SHALL accept a class only when it is a member of versioned closed taxonomy `grill-taxonomy.v1`. Operator-required members SHALL be: `scope`, `security`, `irreversible-operations`, `merge-release`, and `human-attestation`. Non-authority members SHALL be: `interface-contract`, `test-evidence`, `docs-surface`, and `operational-default`. An unknown or disputed class SHALL remain unresolved authority until classified or raised as a typed request. Taxonomy-validated nodes MAY auto-settle when the recommendation is reversible, in scope, policy-consistent, and covered by existing authority, with `settled-by: auto-accept` recorded. Auto-settle SHALL NOT grant merge, release, destructive, security, or other protected authority. A resolved node that lacks valid provenance SHALL fail validation.
+The model MAY propose a class. Pipeline SHALL accept a class only when it is a member of versioned closed taxonomy `grill-taxonomy.v1`. Operator-required members SHALL be: `scope`, `security`, `irreversible-operations`, `merge-release`, and `human-attestation`. Non-authority members SHALL be: `interface-contract`, `test-evidence`, `docs-surface`, and `operational-default`. An unknown or disputed class SHALL remain unresolved authority until classified or raised as a typed request. Taxonomy-validated nodes MAY auto-settle when the recommendation is reversible, in scope, policy-consistent, and covered by existing authority, with `settled-by: auto-accept` recorded. Pipeline SHALL derive reversibility, in-scope status, policy consistency, protected-action status, and existing-authority coverage from trusted taxonomy, repository, GitHub, and configuration facts. Model-written values for those fields SHALL NOT satisfy the auto-settle predicate. Pipeline SHALL fail closed when coverage cannot be proven. Auto-settle SHALL NOT grant merge, release, destructive, security, or other protected authority. A resolved node that lacks valid provenance SHALL fail validation.
 
 #### Scenario: Unknown class stays unresolved
 
@@ -72,6 +72,14 @@ The model MAY propose a class. Pipeline SHALL accept a class only when it is a m
 
 - **WHEN** a node has a taxonomy class and a recommended default that is reversible, in scope, policy-consistent, and covered by existing authority
 - **THEN** grill SHALL write the body with that default and `settled-by: auto-accept`
+
+#### Scenario: Model cannot assert existing authority
+
+- **WHEN** a node is class `security`
+- **AND** the Implementer marks `covered_by_existing_authority` true
+- **AND** trusted facts do not prove that coverage
+- **THEN** grill SHALL NOT record `settled-by: auto-accept`
+- **AND** SHALL emit an `AuthorityRequest`
 
 #### Scenario: Resolved non-authority without reviewer-accept fails closed
 

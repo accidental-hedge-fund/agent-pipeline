@@ -132,6 +132,29 @@ export function settleRecommendation(
   return { kind: "unresolved", reason: "recommendation does not meet auto-settle predicate" };
 }
 
+/**
+ * Existing-authority coverage is engine-owned. Non-authority classes are
+ * covered by the taxonomy default. Protected classes never auto-grant from
+ * model prose. Scope (and other non-protected operator-required classes)
+ * is covered only when the recommendation already appears in trusted facts.
+ */
+export function engineCoveredByExistingAuthority(
+  nodeClass: string,
+  recommendation: string,
+  factText: string,
+): boolean {
+  if (isNonAuthorityClass(nodeClass)) return true;
+  if (PROTECTED_CLASSES.has(nodeClass)) return false;
+  const rec = recommendation.trim().toLowerCase();
+  if (!rec) return false;
+  return factText.toLowerCase().includes(rec);
+}
+
+/**
+ * Model output may supply pause evidence (contradictory, missing_external)
+ * and confidence. Authority-predicate fields are derived from taxonomy and
+ * trusted facts, never copied from the model.
+ */
 export function parseSignalsFromModel(
   raw: Record<string, unknown>,
   nodeClass: string,
@@ -148,17 +171,14 @@ export function parseSignalsFromModel(
       ? confidenceRaw
       : base.confidence;
   return {
-    reversible: bool("reversible", base.reversible),
-    in_scope: bool("in_scope", base.in_scope),
-    policy_consistent: bool("policy_consistent", base.policy_consistent),
-    covered_by_existing_authority: bool(
-      "covered_by_existing_authority",
-      base.covered_by_existing_authority,
-    ),
+    reversible: base.reversible,
+    in_scope: base.in_scope,
+    policy_consistent: base.policy_consistent,
+    covered_by_existing_authority: base.covered_by_existing_authority,
     contradictory: bool("contradictory", base.contradictory),
     missing_external: bool("missing_external", base.missing_external),
-    discoverable_from_facts: bool("discoverable_from_facts", base.discoverable_from_facts),
-    protected_action: bool("protected_action", base.protected_action),
+    discoverable_from_facts: base.discoverable_from_facts,
+    protected_action: base.protected_action,
     confidence,
   };
 }

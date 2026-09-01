@@ -16,7 +16,11 @@ import {
 import { buildGrillFingerprint } from "../scripts/grill-fingerprint.ts";
 import { AUTO_ACCEPT_ELIGIBILITY_REASON } from "../scripts/grill-taxonomy.ts";
 import { parseGrillSelector, freezeManifest } from "../scripts/grill-selector.ts";
-import { settleRecommendation, defaultSettlementSignals } from "../scripts/grill-settle.ts";
+import {
+  settleRecommendation,
+  defaultSettlementSignals,
+  parseSignalsFromModel,
+} from "../scripts/grill-settle.ts";
 import {
   emptyLedger,
   grillStatusCounts,
@@ -353,6 +357,21 @@ test("pipeline-cli: grill --issue 42 is not advance", () => {
   assert.equal(lookupCommand(String(cmd.args[0])), COMMAND_REGISTRY.grill);
 });
 
+test("CLI: refine-spec apply diagnoses toward grill and does not write", () => {
+  const result = spawnSync(
+    process.execPath,
+    ["--experimental-strip-types", PIPELINE_SCRIPT, "refine-spec", "apply", "--issue", "42"],
+    {
+      encoding: "utf8",
+      env: { ...process.env, GH_TOKEN: "", GH_HOST: "invalid.example", GH_ENTERPRISE_TOKEN: "" },
+      input: "",
+    },
+  );
+  assert.equal(result.status, 0);
+  assert.match(result.stderr, /pipeline grill --issue 42/);
+  assert.doesNotMatch(result.stderr, /apply requires stdin|proposal nonce|kill switch|already migrated/);
+});
+
 // ---------------------------------------------------------------------------
 // Frozen selection
 // ---------------------------------------------------------------------------
@@ -562,6 +581,74 @@ test("grill: covered scope does not create a handoff", () => {
     },
   );
   assert.equal(result.kind, "auto-accept");
+});
+
+test("grill: model cannot assert existing authority for auto-accept", () => {
+  const signals = parseSignalsFromModel(
+    {
+      reversible: true,
+      in_scope: true,
+      policy_consistent: true,
+      covered_by_existing_authority: true,
+      protected_action: false,
+    },
+    "security",
+  );
+  assert.equal(signals.covered_by_existing_authority, false);
+  assert.equal(signals.protected_action, true);
+  assert.equal(signals.reversible, false);
+  assert.equal(signals.in_scope, true);
+  assert.equal(signals.policy_consistent, true);
+  const result = settleRecommendation(
+    { class: "security", recommendation: "weaken auth" },
+    signals,
+  );
+  assert.equal(result.kind, "typed-request");
+  if (result.kind === "typed-request") {
+    assert.equal(result.request, "AuthorityRequest");
+  }
+});
+
+test("grill: settleFrontierNodes ignores model authority claims on protected classes", () => {
+  const raw = [
+    {
+      ...makeNode({
+        id: "sec",
+        question: "Auth?",
+        recommendation: "weaken auth",
+        class: "security",
+      }),
+      signalsRaw: {
+        reversible: true,
+        in_scope: true,
+        policy_consistent: true,
+        covered_by_existing_authority: true,
+        protected_action: false,
+      },
+    },
+  ];
+  const nodes = settleFrontierNodes(raw, "weaken auth is already in the body");
+  assert.equal(nodes[0]!.provenance.settled_by, "none");
+  assert.equal(nodes[0]!.typed_request, "AuthorityRequest");
+});
+
+test("grill: scope auto-settles only when issue-body facts cover the recommendation", () => {
+  const rec = "keep the stated acceptance criteria";
+  const raw = [
+    {
+      ...makeNode({
+        id: "scope",
+        question: "Scope?",
+        recommendation: rec,
+        class: "scope",
+      }),
+      signalsRaw: { covered_by_existing_authority: true },
+    },
+  ];
+  const uncovered = settleFrontierNodes(raw, "unrelated body text");
+  assert.notEqual(uncovered[0]!.provenance.settled_by, "auto-accept");
+  const covered = settleFrontierNodes(raw, rec);
+  assert.equal(covered[0]!.provenance.settled_by, "auto-accept");
 });
 
 // ---------------------------------------------------------------------------
@@ -785,15 +872,19 @@ test("grill: mutating --issue writes Decisions once and replay is idempotent", a
   const parsed = parseDecisionsFromBody(world.bodies[0]!);
   assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.reason);
   if (parsed.ok) {
-    assert.ok(parsed.artifact.nodes.some((n) => n.provenance.settled_by === "auto-accept"));
+    const byClass = new Map(parsed.artifact.nodes.map((n) => [n.class, n]));
+    assert.equal(byClass.get("interface-contract")?.provenance.settled_by, "auto-accept");
+    for (const cls of ["security", "irreversible-operations", "merge-release", "human-attestation"]) {
+      assert.equal(byClass.get(cls)?.provenance.settled_by, "none");
+      assert.equal(byClass.get(cls)?.typed_request, "AuthorityRequest");
+    }
   }
-  assert.ok(world.labelsWritten.some((w) => w.label === "pipeline:ready"));
-  const bodiesAfterFirst = world.bodies.length;
+  assert.equal(world.labelsWritten.some((w) => w.label === "pipeline:ready"), false);
   const labelsAfterFirst = world.labelsWritten.length;
   const second = await runGrill({ issue: 10 }, deps);
   assert.equal(second, 0);
-  assert.equal(world.bodies.length, bodiesAfterFirst);
   assert.equal(world.labelsWritten.length, labelsAfterFirst);
+  assert.equal(world.labelsWritten.some((w) => w.label === "pipeline:ready"), false);
 });
 
 test("grill: two issues settling the same term open one docs PR", async () => {

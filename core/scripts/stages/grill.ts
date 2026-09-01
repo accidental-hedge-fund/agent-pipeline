@@ -68,6 +68,7 @@ import {
   type GrillSelectorFlags,
 } from "../grill-selector.ts";
 import {
+  engineCoveredByExistingAuthority,
   parseSignalsFromModel,
   settleRecommendation,
 } from "../grill-settle.ts";
@@ -305,6 +306,11 @@ export function settleFrontierNodes(
       if (factText && node.question && factText.toLowerCase().includes(node.question.toLowerCase().slice(0, 40))) {
         signals.discoverable_from_facts = true;
       }
+      signals.covered_by_existing_authority = engineCoveredByExistingAuthority(
+        node.class,
+        node.recommendation,
+        factText,
+      );
       const result = settleRecommendation(node, signals);
       if (result.kind === "auto-accept") {
         out.set(node.id, {

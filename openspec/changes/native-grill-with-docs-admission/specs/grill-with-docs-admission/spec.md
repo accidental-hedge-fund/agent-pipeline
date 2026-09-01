@@ -118,7 +118,7 @@ Grill SHALL maintain a per-issue design tree. Each round SHALL process every cur
 
 ### Requirement: Evidence-backed recommendations SHALL auto-settle inside existing authority
 
-Grill SHALL automatically settle a recommendation when it is reversible, in scope, policy-consistent, and covered by existing authority. Provenance SHALL be `settled-by: auto-accept`. Low model confidence alone SHALL NOT pause the issue and SHALL NOT create a typed request. Auto-settle SHALL NOT grant merge, release, destructive, security, or other protected authority.
+Grill SHALL automatically settle a recommendation when it is reversible, in scope, policy-consistent, and covered by existing authority. Provenance SHALL be `settled-by: auto-accept`. Low model confidence alone SHALL NOT pause the issue and SHALL NOT create a typed request. Pipeline SHALL derive reversibility, in-scope status, policy consistency, protected-action status, and existing-authority coverage from trusted taxonomy, repository, GitHub, and configuration facts. Model-written values for those fields SHALL NOT satisfy the auto-settle predicate. Pipeline SHALL fail closed when coverage cannot be proven. Auto-settle SHALL NOT grant merge, release, destructive, security, or other protected authority.
 
 #### Scenario: In-scope default auto-settles
 
@@ -136,6 +136,14 @@ Grill SHALL automatically settle a recommendation when it is reversible, in scop
 #### Scenario: Protected action is not auto-granted
 
 - **WHEN** a recommendation would merge, release, destroy, or change a security-sensitive control and existing authority does not cover it
+- **THEN** grill SHALL NOT auto-settle that node
+- **AND** SHALL emit an `AuthorityRequest`
+
+#### Scenario: Model cannot assert existing authority
+
+- **WHEN** a node is class `security`
+- **AND** the Implementer marks `covered_by_existing_authority` true
+- **AND** trusted facts do not prove that coverage
 - **THEN** grill SHALL NOT auto-settle that node
 - **AND** SHALL emit an `AuthorityRequest`
 

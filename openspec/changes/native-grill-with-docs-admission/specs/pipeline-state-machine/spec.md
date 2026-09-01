@@ -50,6 +50,8 @@ The pipeline CLI positional-argument dispatch block SHALL recognize `refine-spec
 
 - **WHEN** the user runs `pipeline refine-spec apply --issue 42` during migration
 - **THEN** the orchestrator SHALL NOT add, remove, or replace any `pipeline:*` stage label
+- **AND** SHALL emit a diagnostic naming `pipeline grill --issue 42`
+- **AND** SHALL NOT write the GitHub issue body
 
 #### Scenario: `refine-spec` listed in help text
 

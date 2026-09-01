@@ -42,6 +42,13 @@ The pipeline CLI SHALL accept `refine-spec` as a positional sub-command keyword 
 - **AND** SHALL NOT advance any pipeline stage label
 - **AND** SHALL NOT remain the admission writer after replacement coverage
 
+#### Scenario: Apply emits a diagnostic and does not write
+
+- **WHEN** the operator runs `pipeline refine-spec apply --issue 42`
+- **THEN** the command SHALL emit a diagnostic naming `pipeline grill --issue 42`
+- **AND** SHALL NOT write the GitHub issue body
+- **AND** SHALL NOT invoke the signed-envelope apply writer
+
 ---
 
 ### Requirement: The `refine-spec` sub-command SHALL be discoverable via `--help` before invocation

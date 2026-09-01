@@ -150,13 +150,11 @@ import {
   type EffortBand,
 } from "./stages/decompose.ts";
 import { runRefineSpec, realRefineSpecDeps } from "./stages/refine-spec.ts";
-import { isGrillMigratedBody, realGrillDeps, runGrill } from "./stages/grill.ts";
+import { realGrillDeps, runGrill } from "./stages/grill.ts";
 import { parseGrillSelector } from "./grill-selector.ts";
 import {
-  realGrillIssueApplyDeps,
   realGrillIssuePreviewDeps,
   realGrillReadySnapshot,
-  runRefineSpecApply,
   runRefineSpecIssuePreview,
   usageError,
 } from "./grill-issue.ts";
@@ -5078,8 +5076,8 @@ async function main(): Promise<void> {
   }
 
   // Early refine-spec dispatch — no advance loop, no stage-label writes.
-  // --title/--body stays gh-free. --issue preview and apply resolve GitHub
-  // in their own handlers after flag validation.
+  // --title/--body stays gh-free. --issue preview may still read GitHub.
+  // apply is a diagnostic shim toward pipeline grill and does not write.
   if (isRefineSpecCommand) {
     const startDir = opts.repoPath ? path.resolve(opts.repoPath) : process.cwd();
     const repoDir = findGitRoot(startDir) ?? startDir;
@@ -5100,29 +5098,8 @@ async function main(): Promise<void> {
         usageError("apply requires --issue N", (t) => process.stderr.write(t));
         return;
       }
-      let applyCfg;
-      try {
-        applyCfg = resolveConfig({ repoPath: repoDir, baseBranch: opts.base, profile: opts.profile });
-      } catch (err) {
-        console.error(`pipeline refine-spec: ${(err as Error).message}`);
-        process.exitCode = 1;
-        return;
-      }
       process.stderr.write(
         `pipeline refine-spec apply is a compatibility shim. Use: pipeline grill --issue ${opts.issue}\n`,
-      );
-      const applyDeps = realGrillIssueApplyDeps(applyCfg);
-      const live = await applyDeps.getIssue(opts.issue);
-      if (isGrillMigratedBody(live.body)) {
-        process.stderr.write(
-          `pipeline refine-spec apply: issue #${opts.issue} is already migrated; refusing rewrite.\n`,
-        );
-        return;
-      }
-      await runRefineSpecApply(
-        opts.issue,
-        { proposalFile: opts.proposalFile },
-        applyDeps,
       );
       return;
     }
