@@ -34,32 +34,105 @@ const PROTECTED_CLASSES = new Set([
   "human-attestation",
 ]);
 
-/** Engine-owned recommendation scan. Class labels are not sufficient. */
-const PROTECTED_ACTION_PATTERNS: readonly RegExp[] = [
-  /\bauto[_\-]?merge\b/i,
-  /\bsquash[-\s]?merge\b/i,
-  /\bmerge-queue\b/i,
-  /\b(?:pipeline|train)\s+--merge\b/i,
-  /\bmerge\s+(?:this\s+)?(?:pr|pull request)\b/i,
-  /\bmerge\s+into\s+(?:main|staging|production)\b/i,
-  /\b(?:authorize|grant|allow)\s+(?:merge|release|deploy)\b/i,
-  /\bdeploy\s+to\s+(?:prod|production)\b/i,
-  /\bship\s+(?:this\s+)?milestone\b/i,
-  /\bforce[-\s]?push\b/i,
-  /\bgit\s+push\s+--force(?:-with-lease)?\b/i,
-  /\bworktree\s+remove\b/i,
-  /\b(?:delete|remove)\s+(?:the\s+)?(?:branch|worktree)\b/i,
-  /\b(?:destroy|wipe|drop)\s+(?:the\s+)?(?:database|table|data)\b/i,
-  /\birreversible\b/i,
-  /\b(?:weaken|disable|bypass|skip)\b[\s\w-]{0,40}\b(?:auth|authentication|authorization|rbac)\b/i,
-  /\b(?:expose|leak|commit)\s+(?:the\s+)?(?:secret|credential|password)\b/i,
-  /\bsecurity-sensitive\b/i,
+/** Closed protected-action vocabulary. Presence of a token is sufficient. */
+const PROTECTED_TOKENS: ReadonlySet<string> = new Set([
+  "merge",
+  "merging",
+  "merged",
+  "merger",
+  "release",
+  "releasing",
+  "released",
+  "deploy",
+  "deploying",
+  "deployment",
+  "ship",
+  "shipping",
+  "irreversible",
+  "secret",
+  "secrets",
+  "credential",
+  "credentials",
+  "password",
+  "passwords",
+  "rbac",
+  "auth",
+  "authentication",
+  "authorization",
+  "authenticate",
+  "automerge",
+  "squash",
+  "bypass",
+  "bypassing",
+  "bypassed",
+  "weaken",
+  "weakening",
+  "weakened",
+  "destroy",
+  "destroying",
+  "destroyed",
+  "wipe",
+  "wiping",
+  "wiped",
+]);
+
+/** Adjacent-token phrases the single-token set does not cover on its own. */
+const PROTECTED_PAIRS: readonly [string, string][] = [
+  ["force", "push"],
+  ["auto", "merge"],
+  ["delete", "branch"],
+  ["remove", "branch"],
+  ["delete", "worktree"],
+  ["remove", "worktree"],
+  ["drop", "database"],
+  ["drop", "table"],
+  ["drop", "data"],
+  ["grant", "merge"],
+  ["grant", "release"],
+  ["grant", "deploy"],
+  ["disable", "auth"],
+  ["disable", "authentication"],
+  ["disable", "authorization"],
+  ["skip", "auth"],
+  ["skip", "authentication"],
+  ["expose", "secret"],
+  ["leak", "secret"],
+  ["commit", "secret"],
+  ["expose", "credential"],
+  ["disable", "rbac"],
 ];
 
+function tokenizeRecommendation(recommendation: string): string[] {
+  return recommendation
+    .toLowerCase()
+    .replace(/--/g, " ")
+    .split(/[^a-z0-9]+/)
+    .filter((t) => t.length > 0);
+}
+
+function hasPairWithin(
+  tokens: readonly string[],
+  a: string,
+  b: string,
+  window = 3,
+): boolean {
+  for (let i = 0; i < tokens.length; i++) {
+    if (tokens[i] !== a) continue;
+    for (let j = i + 1; j < tokens.length && j <= i + window; j++) {
+      if (tokens[j] === b) return true;
+    }
+  }
+  return false;
+}
+
+/** Engine-owned recommendation scan. Class labels are not sufficient. */
 export function recommendationMatchesProtectedAction(recommendation: string): boolean {
   const rec = recommendation.trim();
   if (!rec) return false;
-  return PROTECTED_ACTION_PATTERNS.some((re) => re.test(rec));
+  const tokens = tokenizeRecommendation(rec);
+  if (tokens.some((t) => PROTECTED_TOKENS.has(t))) return true;
+  if (PROTECTED_PAIRS.some(([a, b]) => hasPairWithin(tokens, a, b))) return true;
+  return false;
 }
 
 export function engineProtectedAction(nodeClass: string, recommendation: string): boolean {
@@ -77,22 +150,27 @@ export function typedRequestHandoffClass(
 }
 
 /**
- * Derive auto-settle predicates from taxonomy + the concrete recommendation
- * + trusted fact text. Class membership alone is not eligibility.
+ * Derive auto-settle predicates from the concrete recommendation plus trusted
+ * taxonomy / repository / GitHub / configuration facts. Class membership
+ * alone is not eligibility. Unproven recommendations fail closed.
  */
 export function deriveSettlementSignals(
   node: { class: string; recommendation: string },
   factText: string,
 ): SettlementSignals {
-  const protectedAction = engineProtectedAction(node.class, node.recommendation);
-  const recProtected = recommendationMatchesProtectedAction(node.recommendation);
+  const rec = (node.recommendation ?? "").trim();
+  const unproven = rec.length === 0;
+  const recProtected = recommendationMatchesProtectedAction(rec);
+  const protectedAction = unproven || engineProtectedAction(node.class, rec);
+  // Configuration law: auto-settle never grants merge/release/deploy/destroy/security.
+  const policyConsistent = !unproven && !protectedAction && !recProtected;
   return {
-    reversible: !protectedAction,
-    in_scope: !recProtected,
-    policy_consistent: !recProtected,
+    reversible: !unproven && !protectedAction,
+    in_scope: !unproven && !protectedAction,
+    policy_consistent: policyConsistent,
     covered_by_existing_authority: engineCoveredByExistingAuthority(
       node.class,
-      node.recommendation,
+      rec,
       factText,
     ),
     contradictory: false,
@@ -106,18 +184,22 @@ export function deriveSettlementSignals(
 export function defaultSettlementSignals(
   nodeClass: string,
   recommendation = "",
+  factText = "",
 ): SettlementSignals {
-  return deriveSettlementSignals({ class: nodeClass, recommendation }, "");
+  return deriveSettlementSignals({ class: nodeClass, recommendation }, factText);
 }
 
 /**
  * Classify one frontier recommendation. Low confidence is ignored.
  * Discoverable facts never become CapabilityRequest.
  * Auto-accept never grants merge, release, destructive, or security authority.
+ * Authority predicates are re-derived from the concrete recommendation and
+ * trusted facts; caller/model signals cannot satisfy them.
  */
 export function settleRecommendation(
   node: { class: string; recommendation: string },
   signals: SettlementSignals,
+  factText = "",
 ): SettlementResult {
   const rec = (node.recommendation ?? "").trim();
   if (signals.contradictory) {
@@ -140,18 +222,6 @@ export function settleRecommendation(
     return { kind: "unresolved", reason: `unknown class ${node.class}` };
   }
   const classified = classifyAuthority(node.class);
-  const recProtected = recommendationMatchesProtectedAction(rec);
-  const protectedGrant =
-    signals.protected_action || engineProtectedAction(node.class, rec);
-  const covered = signals.covered_by_existing_authority && !recProtected && !protectedGrant;
-  if (protectedGrant && !covered) {
-    return {
-      kind: "typed-request",
-      request: "AuthorityRequest",
-      handoff_class: typedRequestHandoffClass("AuthorityRequest", node.class),
-      reason: "protected action lacks existing authority",
-    };
-  }
   if (!rec) {
     if (classified.operatorRequired) {
       return {
@@ -163,12 +233,22 @@ export function settleRecommendation(
     }
     return { kind: "unresolved", reason: "empty recommendation" };
   }
+  const derived = deriveSettlementSignals({ class: node.class, recommendation: rec }, factText);
+  const protectedGrant = derived.protected_action;
+  const covered = derived.covered_by_existing_authority;
+  if (protectedGrant && !covered) {
+    return {
+      kind: "typed-request",
+      request: "AuthorityRequest",
+      handoff_class: typedRequestHandoffClass("AuthorityRequest", node.class),
+      reason: "protected action lacks existing authority",
+    };
+  }
   const autoSettleOk =
-    signals.reversible &&
-    signals.in_scope &&
-    signals.policy_consistent &&
-    !recProtected &&
-    (classified.mayAutoDefault || covered) &&
+    derived.reversible &&
+    derived.in_scope &&
+    derived.policy_consistent &&
+    covered &&
     !protectedGrant;
   if (autoSettleOk) {
     return { kind: "auto-accept", eligibility_reason: AUTO_ACCEPT_ELIGIBILITY_REASON };
@@ -187,7 +267,8 @@ export function settleRecommendation(
 /**
  * Existing-authority coverage is engine-owned. A protected recommendation
  * is never covered, including when the model puts it in a non-authority
- * class. Non-authority classes cover only non-protected recommendations.
+ * class. Empty or unproven recommendations are not covered. Non-authority
+ * classes cover only recommendations the engine classifies as non-protected.
  * Protected classes never auto-grant from model prose. Scope (and other
  * non-protected operator-required classes) is covered only when the
  * recommendation already appears in trusted facts.
@@ -197,11 +278,11 @@ export function engineCoveredByExistingAuthority(
   recommendation: string,
   factText: string,
 ): boolean {
-  if (engineProtectedAction(nodeClass, recommendation)) return false;
-  if (isNonAuthorityClass(nodeClass)) return true;
-  const rec = recommendation.trim().toLowerCase();
+  const rec = recommendation.trim();
   if (!rec) return false;
-  return factText.toLowerCase().includes(rec);
+  if (engineProtectedAction(nodeClass, rec)) return false;
+  if (isNonAuthorityClass(nodeClass)) return true;
+  return factText.toLowerCase().includes(rec.toLowerCase());
 }
 
 /**

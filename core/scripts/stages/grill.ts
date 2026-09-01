@@ -322,7 +322,7 @@ export function settleFrontierNodes(
         signals.reversible = false;
         signals.covered_by_existing_authority = false;
       }
-      const result = settleRecommendation(node, signals);
+      const result = settleRecommendation(node, signals, factText);
       if (result.kind === "auto-accept") {
         out.set(node.id, {
           ...node,

@@ -484,10 +484,7 @@ test("grill: label intersection freeze ignores later adds", async () => {
 
 test("grill: auto-accept and low confidence are not a human boundary", () => {
   const signals = {
-    ...defaultSettlementSignals("interface-contract"),
-    reversible: true,
-    in_scope: true,
-    policy_consistent: true,
+    ...defaultSettlementSignals("interface-contract", "REST"),
     confidence: "low" as const,
   };
   const result = settleRecommendation(
@@ -569,16 +566,11 @@ test("grill: one issue and a list reuse settleFrontierNodes", () => {
 });
 
 test("grill: covered scope does not create a handoff", () => {
+  const rec = "keep the stated AC";
   const result = settleRecommendation(
-    { class: "scope", recommendation: "keep the stated AC" },
-    {
-      ...defaultSettlementSignals("scope"),
-      reversible: true,
-      in_scope: true,
-      policy_consistent: true,
-      covered_by_existing_authority: true,
-      protected_action: false,
-    },
+    { class: "scope", recommendation: rec },
+    defaultSettlementSignals("scope", rec, rec),
+    rec,
   );
   assert.equal(result.kind, "auto-accept");
 });
@@ -597,8 +589,8 @@ test("grill: model cannot assert existing authority for auto-accept", () => {
   assert.equal(signals.covered_by_existing_authority, false);
   assert.equal(signals.protected_action, true);
   assert.equal(signals.reversible, false);
-  assert.equal(signals.in_scope, true);
-  assert.equal(signals.policy_consistent, true);
+  assert.equal(signals.in_scope, false);
+  assert.equal(signals.policy_consistent, false);
   const result = settleRecommendation(
     { class: "security", recommendation: "weaken auth" },
     signals,
@@ -654,6 +646,9 @@ test("grill: scope auto-settles only when issue-body facts cover the recommendat
 test("grill: class-only defaults do not auto-settle a protected recommendation", () => {
   const rec = "disable authentication and force-push main";
   const classOnly = defaultSettlementSignals("docs-surface");
+  assert.equal(classOnly.covered_by_existing_authority, false);
+  assert.equal(classOnly.reversible, false);
+  assert.equal(classOnly.protected_action, true);
   const result = settleRecommendation(
     { class: "docs-surface", recommendation: rec },
     classOnly,
@@ -669,6 +664,24 @@ test("grill: class-only defaults do not auto-settle a protected recommendation",
   assert.equal(interfaceResult.kind, "typed-request");
   if (interfaceResult.kind === "typed-request") {
     assert.equal(interfaceResult.request, "AuthorityRequest");
+  }
+});
+
+test("grill: novel protected phrasing under a benign class fails closed", () => {
+  const recs = [
+    "merge ready pull requests automatically",
+    "drop production data",
+    "remove the production worktree",
+  ];
+  for (const rec of recs) {
+    const result = settleRecommendation(
+      { class: "docs-surface", recommendation: rec },
+      defaultSettlementSignals("docs-surface"),
+    );
+    assert.equal(result.kind, "typed-request", rec);
+    if (result.kind === "typed-request") {
+      assert.equal(result.request, "AuthorityRequest", rec);
+    }
   }
 });
 
