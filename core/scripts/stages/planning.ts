@@ -33,7 +33,7 @@ import {
   PRE_PLANNING_CONTEXT_HEADER,
 } from "../issue-context-snapshot.ts";
 import * as path from "node:path";
-import { invoke, formatStderrExcerpt, papercutIdentityEnv, type HarnessResult, type InvokeOptions } from "../harness.ts";
+import { invoke, formatStderrExcerpt, papercutIdentityEnv, productionPreflightRefusalReason, type HarnessResult, type InvokeOptions } from "../harness.ts";
 import { invokeReviewer, selfReviewBanner } from "../self-review.ts";
 import {
   assertNoEnsembleStageExecutorBypass,
@@ -1362,9 +1362,11 @@ export async function runPlanningPhases(
           await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked", wt.path);
           return blockedOutcome(waitReason, "harness-failure", diagnostic);
         }
-        const reason = result.timed_out
-          ? `timed out after ${result.duration.toFixed(0)}s`
-          : `exit ${result.exit_code}${formatStderrExcerpt(result.stderr)}`;
+        const preflightReason = productionPreflightRefusalReason(result);
+        const reason = preflightReason
+          ?? (result.timed_out
+            ? `timed out after ${result.duration.toFixed(0)}s`
+            : `exit ${result.exit_code}${formatStderrExcerpt(result.stderr)}`);
 
         // #547 salvage / #1246 checkpoint / #1272 unpublished publish:
         // a timeout that left recovered work must consult the shared
@@ -1556,6 +1558,20 @@ export async function runPlanningPhases(
               blockerKind: "harness-failure",
               reason: blockMsg,
               stage: "implementing",
+              ...(result.preflight_failed
+                ? {
+                    preflightFailed: true,
+                    ...(result.preflight_class !== undefined
+                      ? { preflightClass: result.preflight_class }
+                      : {}),
+                    ...(result.preflight_reason_code !== undefined
+                      ? { preflightReasonCode: result.preflight_reason_code }
+                      : {}),
+                    ...(result.preflight_intervention_kind !== undefined
+                      ? { preflightInterventionKind: result.preflight_intervention_kind }
+                      : {}),
+                  }
+                : {}),
             });
             await doSetBlocked(
               cfg,
@@ -2420,16 +2436,16 @@ export async function resumeFromImplementing(
   );
   if (!gates.ok) {
     const blockerKind: BlockerKind =
-      gates.source === "test"
+      gates.source === "test" && gates.diagnostic?.detail.preflight_failed !== true
         ? "test-gate-exhausted"
-        : gates.source === "owned-leftover"
+        : gates.source === "owned-leftover" || gates.diagnostic?.detail.preflight_failed === true
           ? "harness-failure"
           : "needs-human";
     await blocker(
       cfg, issueNumber, gates.reason, "implementing",
       blockerKind,
     );
-    return blockedOutcome(gates.reason, blockerKind);
+    return blockedOutcome(gates.reason, blockerKind, gates.diagnostic);
   }
 
   // ---- Docs freshness (#716): after format/test, before push / createPr ----
@@ -2453,16 +2469,16 @@ export async function resumeFromImplementing(
     );
     if (!postHealGates.ok) {
       const blockerKind: BlockerKind =
-        postHealGates.source === "test"
+        postHealGates.source === "test" && postHealGates.diagnostic?.detail.preflight_failed !== true
           ? "test-gate-exhausted"
-          : postHealGates.source === "owned-leftover"
+          : postHealGates.source === "owned-leftover" || postHealGates.diagnostic?.detail.preflight_failed === true
             ? "harness-failure"
             : "needs-human";
       await blocker(
         cfg, issueNumber, postHealGates.reason, "implementing",
         blockerKind,
       );
-      return blockedOutcome(postHealGates.reason, blockerKind);
+      return blockedOutcome(postHealGates.reason, blockerKind, postHealGates.diagnostic);
     }
     const docsCheckOnly = deps.checkDocsFreshness ?? checkDocsFreshness;
     const finalDocs = await docsCheckOnly(wt.path, deps.docsFreshness ?? {});

@@ -18,6 +18,7 @@ import {
 } from "../worktree-dirt.ts";
 import type { PipelineConfig, Stage } from "../types.ts";
 import type { RunStoreDeps } from "../run-store.ts";
+import type { StageDiagnostic } from "../stage-diagnostic.ts";
 import {
   checkpointOwnedHarnessDirt,
   classifyHarnessMutationDirt,
@@ -186,7 +187,12 @@ export type FormatTestGateResult =
   // declared build_command failed while rebuilding artifacts) → build-failed;
   // "format" (a format/lint failure) and "noconverge" (gates still mutating at
   // the round cap) → needs-human.
-  | { ok: false; reason: string; source: "format" | "test" | "noconverge" | "build" | "owned-leftover" };
+  | {
+      ok: false;
+      reason: string;
+      source: "format" | "test" | "noconverge" | "build" | "owned-leftover";
+      diagnostic?: StageDiagnostic;
+    };
 
 export interface FormatTestGateDeps {
   runFormatGate?: typeof runFormatGate;
@@ -296,7 +302,12 @@ export async function runFormatAndTestGates(
       runStoreDeps,
     );
     if (!gate.skipped && !gate.passed) {
-      return { ok: false, reason: testGateBlockReason(gate), source: gate.buildFailure ? "build" : "test" };
+      return {
+        ok: false,
+        reason: testGateBlockReason(gate),
+        source: gate.buildFailure ? "build" : "test",
+        ...(gate.diagnostic ? { diagnostic: gate.diagnostic } : {}),
+      };
     }
 
     // Converged: the format gate committed nothing this round AND the test gate's

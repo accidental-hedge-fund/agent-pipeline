@@ -88,7 +88,10 @@ import {
   stageDiagnosticFromBlockerSet,
   type StageDiagnostic,
 } from "../stage-diagnostic.ts";
-import { filterRecipesForHarnessBackgroundWait } from "../harness-adapters/background-job-lifecycle.ts";
+import {
+  filterRecipesForHarnessBackgroundWait,
+  filterRecipesForNeverStartedPreflight,
+} from "../harness-adapters/background-job-lifecycle.ts";
 import {
   evaluateRunFatalResumeEligibility,
   formatRunFatalResumeRefusal,
@@ -961,9 +964,13 @@ async function executeBlockedRecovery(
       persisted.diagnostic.reason_code === "harness-background-wait"
         ? filterRecipesForHarnessBackgroundWait(policy.recipes)
         : policy.recipes;
+    const preflightNeverStarted = persisted.diagnostic.detail.preflight_failed === true;
+    const neverStartedFiltered = preflightNeverStarted
+      ? filterRecipesForNeverStartedPreflight(reasonFiltered)
+      : reasonFiltered;
     const executableRecipes = hasCandidateHead
-      ? reasonFiltered
-      : reasonFiltered.filter((recipe) => recipe !== "repair_pipeline_item");
+      ? neverStartedFiltered
+      : neverStartedFiltered.filter((recipe) => recipe !== "repair_pipeline_item");
     // #1060: same-sequence continuation forces repair after findings prep unlink.
     // Also prefer repair when the last matching attempt was already findings prep
     // unlink (avoids modulo re-picking free unlink after scratch is gone).
@@ -985,6 +992,16 @@ async function executeBlockedRecovery(
           ? executableRecipes[matchingAttempts.length % executableRecipes.length]
           : undefined;
     if (!action) {
+      if (preflightNeverStarted && neverStartedFiltered.length === 0) {
+        await appendEvent(deps.store, runId, token, "loop_recovery_preflight_deferred", {
+          item_id: itemId,
+          reason: "inapplicable_recipes",
+          skipped_recipes: reasonFiltered.filter(
+            (recipe) => !neverStartedFiltered.includes(recipe),
+          ),
+        }).catch(() => {});
+        return { ledger, attempted: false };
+      }
       ledger = await stopForRecoveryPreflight(
         deps,
         contract,

@@ -36,7 +36,7 @@ import {
   silentTransition as defaultSilentTransition,
   transition as defaultTransition,
 } from "../gh.ts";
-import { invoke as defaultInvoke, runCapped, type HarnessResult, type InvokeOptions } from "../harness.ts";
+import { invoke as defaultInvoke, productionPreflightRefusalReason, runCapped, type HarnessResult, type InvokeOptions } from "../harness.ts";
 import { buildVisualFixPrompt } from "../prompts/index.ts";
 import {
   DEFAULT_GIT_PUSH_AUTH,
@@ -55,6 +55,8 @@ import { trySalvageUncommittedWork } from "../salvage-harness-work.ts";
 import { OWNERSHIP_CHECKPOINT_FAILED_REASON, runHarnessRound } from "../harness-round.ts";
 import { makeCommandRecord, makePromptRecord, recordCommand, recordPrompt } from "../evidence-bundle.ts";
 import { redactSecrets } from "../artifact-sanitize.ts";
+import { buildPreflightRefusalDiagnostic } from "../escalation-classify.ts";
+import type { StageDiagnostic } from "../stage-diagnostic.ts";
 import type { BlockerKind, Harness, Outcome, PipelineConfig, Stage } from "../types.ts";
 import { appendEvent, RUN_SCHEMA_VERSION, type RunStoreDeps } from "../run-store.ts";
 import { buildStageAccountingRecord } from "../accounting.ts";
@@ -759,7 +761,7 @@ interface VisualFixRoundDeps {
 
 type VisualFixRoundResult =
   | { ok: true }
-  | { ok: false; reason: string; blockerKind: "harness-failure" | "push-failed" };
+  | { ok: false; reason: string; blockerKind: "harness-failure" | "push-failed"; diagnostic?: StageDiagnostic };
 
 /**
  * Run a single visual-fix round. Returns `{ ok: true }` only once a verified
@@ -851,17 +853,29 @@ async function runVisualFixRound(
         return { ok: false, reason: OWNERSHIP_CHECKPOINT_FAILED_REASON, blockerKind: "harness-failure" };
       }
       if (!fixRes.success) {
-        const reason = fixRes.background_wait
-          ? `Fix harness (${harness}) missed delivery or foreground-join on visual-gate fix round ${attempt} (harness-background-wait).` +
-            (ctx.salvageFailureReason
-              ? ` Salvage of uncommitted work also failed: ${ctx.salvageFailureReason}`
-              : ctx.salvaged
-                ? " Uncommitted work was salvaged; the stage outcome remains harness-background-wait."
-                : "")
-          : fixRes.timed_out
-            ? `Fix harness (${harness}) timed out after ${fixRes.duration.toFixed(0)}s on visual-gate fix round ${attempt}.`
-            : `Fix harness (${harness}) failed (exit ${fixRes.exit_code}) on visual-gate fix round ${attempt}.`;
-        return { ok: false, reason, blockerKind: "harness-failure" };
+        const preflightReason = productionPreflightRefusalReason(fixRes);
+        const reason = preflightReason
+          ? `Fix harness (${harness}) failed (${preflightReason}) on visual-gate fix round ${attempt}.`
+          : fixRes.background_wait
+            ? `Fix harness (${harness}) missed delivery or foreground-join on visual-gate fix round ${attempt} (harness-background-wait).` +
+              (ctx.salvageFailureReason
+                ? ` Salvage of uncommitted work also failed: ${ctx.salvageFailureReason}`
+                : ctx.salvaged
+                  ? " Uncommitted work was salvaged; the stage outcome remains harness-background-wait."
+                  : "")
+            : fixRes.timed_out
+              ? `Fix harness (${harness}) timed out after ${fixRes.duration.toFixed(0)}s on visual-gate fix round ${attempt}.`
+              : `Fix harness (${harness}) failed (exit ${fixRes.exit_code}) on visual-gate fix round ${attempt}.`;
+        const diagnostic = buildPreflightRefusalDiagnostic(fixRes, {
+          reason,
+          stage: "visual-gate",
+        });
+        return {
+          ok: false,
+          reason,
+          blockerKind: "harness-failure",
+          ...(diagnostic ? { diagnostic } : {}),
+        };
       }
 
       if (ctx.confirmedNoNewCommit && !ctx.salvaged) {
@@ -1041,7 +1055,11 @@ export async function advanceVisual(
   let lastResult: VisualRunResult | null = null;
   let lastManifest: CapturedManifest = emptyManifest();
   let lastAttempt = 1;
-  let fixRoundBlocked: { reason: string; blockerKind: "harness-failure" | "push-failed" } | null = null;
+  let fixRoundBlocked: {
+    reason: string;
+    blockerKind: "harness-failure" | "push-failed";
+    diagnostic?: StageDiagnostic;
+  } | null = null;
   let fixCommitLandedThisInvocation = false;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -1135,7 +1153,11 @@ export async function advanceVisual(
       },
     );
     if (!fixResult.ok) {
-      fixRoundBlocked = { reason: fixResult.reason, blockerKind: fixResult.blockerKind };
+      fixRoundBlocked = {
+        reason: fixResult.reason,
+        blockerKind: fixResult.blockerKind,
+        ...(fixResult.diagnostic ? { diagnostic: fixResult.diagnostic } : {}),
+      };
       break;
     }
     fixCommitLandedThisInvocation = true;
@@ -1155,6 +1177,7 @@ export async function advanceVisual(
       status: "blocked",
       reason: fixRoundBlocked.reason,
       blockerKind: fixRoundBlocked.blockerKind,
+      ...(fixRoundBlocked.diagnostic ? { diagnostic: fixRoundBlocked.diagnostic } : {}),
     };
   }
 

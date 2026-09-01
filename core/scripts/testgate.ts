@@ -17,6 +17,7 @@ import * as path from "node:path";
 import type { spawn } from "node:child_process";
 import {
   invoke as defaultInvoke,
+  productionPreflightRefusalReason,
   runCapped,
   type HarnessResult,
   type InvokeOptions,
@@ -62,6 +63,8 @@ import {
   resolveVerifierFingerprint,
 } from "./evidence-subject.ts";
 import { resolvePinnedEngineIdentity } from "./engine-identity.ts";
+import { buildPreflightRefusalDiagnostic } from "./escalation-classify.ts";
+import type { StageDiagnostic } from "./stage-diagnostic.ts";
 import type { Harness, PipelineConfig } from "./types.ts";
 
 /** A command split into program + argv — never a raw string at spawn time. */
@@ -119,6 +122,8 @@ export interface TestGateResult {
   recorded_required_exit_0?: boolean;
   required_command_exit_code?: number | null;
   persist?: TesterProducerPersistObservation;
+  /** Typed production-preflight refusal diagnostic when test-fix never spawned. */
+  diagnostic?: StageDiagnostic;
 }
 
 /** Pass `runTestGate`'s typed observation through review regeneration. */
@@ -879,9 +884,16 @@ export async function runTestGate(
           },
         );
       }
-      const reason = fixRes.timed_out
-        ? `Fix harness (${harness}) timed out after ${fixRes.duration.toFixed(0)}s on test-gate fix attempt ${attempt}.`
-        : `Fix harness (${harness}) failed (exit ${fixRes.exit_code}) on test-gate fix attempt ${attempt}.`;
+      const preflightReason = productionPreflightRefusalReason(fixRes);
+      const reason = preflightReason
+        ? `Fix harness (${harness}) failed (${preflightReason}) on test-gate fix attempt ${attempt}.`
+        : fixRes.timed_out
+          ? `Fix harness (${harness}) timed out after ${fixRes.duration.toFixed(0)}s on test-gate fix attempt ${attempt}.`
+          : `Fix harness (${harness}) failed (exit ${fixRes.exit_code}) on test-gate fix attempt ${attempt}.`;
+      const diagnostic = buildPreflightRefusalDiagnostic(fixRes, {
+        reason,
+        stage: stageLabel,
+      });
       // Fix harness failure is not a suite tooling_failure; last suite observation stands.
       const overallStatus =
         lastCmdForEvidence?.status === "timeout"
@@ -890,7 +902,13 @@ export async function runTestGate(
             ? ("tooling_failure" as const)
             : ("failed" as const);
       return finish(
-        { skipped: false, passed: false, attempts: attempt, blockReason: reason },
+        {
+          skipped: false,
+          passed: false,
+          attempts: attempt,
+          blockReason: reason,
+          ...(diagnostic ? { diagnostic } : {}),
+        },
         {
           overallStatus,
           overallReason: reason,
@@ -1158,7 +1176,12 @@ function toolingFailureBlockReason(output: string): string {
  *  ordinary "failed after N fix attempt(s)" wording, so those causes stay
  *  distinguishable from genuine test/build-command exhaustion. */
 export function testGateBlockReason(gate: TestGateResult): string {
-  if (gate.toolingFailure || gate.buildFailure || gate.dirtyWorktree) {
+  if (
+    gate.toolingFailure ||
+    gate.buildFailure ||
+    gate.dirtyWorktree ||
+    gate.diagnostic?.detail.preflight_failed
+  ) {
     return gate.blockReason ?? "(no output captured)";
   }
   return (

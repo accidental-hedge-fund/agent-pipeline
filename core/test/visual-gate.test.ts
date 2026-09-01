@@ -368,6 +368,54 @@ test("visual-gate: retries exhausted + advisory mode → advances to eval-gate (
 // Fix round failure paths
 // ---------------------------------------------------------------------------
 
+test("visual-gate: typed production-preflight refusal is not flattened to exit -1", async () => {
+  const log = makeCallLog();
+  const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 2 });
+  let invokeCalled = 0;
+  const deps = makeDeps(log, [failResult("visual checks failed")]);
+  Object.assign(deps, cleanFixDeps());
+  deps.invoke = async () => {
+    invokeCalled++;
+    return {
+      success: false,
+      stdout: "",
+      stderr:
+        "[harness omit-lifecycle-cli] adapter omits background_job_lifecycle. " +
+        "retrying the same invocation cannot succeed. Bearer SECRET-TOKEN",
+      exit_code: -1,
+      duration: 0,
+      timed_out: false,
+      preflight_failed: true,
+      preflight_class: "unsupported-setting",
+      preflight_reason_code: "capability-refusal",
+      preflight_intervention_kind: "auth-tooling-preflight-failure",
+    };
+  };
+
+  const out = await advanceVisual(cfg, 699, {}, deps);
+
+  assert.equal(invokeCalled, 1, "the same refusal must not start another harness session");
+  assert.equal(out.advanced, false);
+  assert.equal(log.blocked.length, 1);
+  assert.match(log.blocked[0].reason, /background_job_lifecycle/);
+  assert.doesNotMatch(log.blocked[0].reason, /exit -1/);
+  assert.doesNotMatch(log.blocked[0].reason, /SECRET-TOKEN/);
+  if (!out.advanced && out.status === "blocked") {
+    assert.equal(out.blockerKind, "harness-failure");
+    assert.equal(out.diagnostic?.reason_code, "capability-refusal");
+    assert.equal(out.diagnostic?.detail.preflight_failed, true);
+    assert.equal(out.diagnostic?.detail.preflight_class, "unsupported-setting");
+    assert.equal(out.diagnostic?.detail.preflight_reason_code, "capability-refusal");
+    assert.equal(
+      out.diagnostic?.detail.preflight_intervention_kind,
+      "auth-tooling-preflight-failure",
+    );
+    assert.doesNotMatch(out.reason, /exit -1/);
+    assert.doesNotMatch(out.reason, /SECRET-TOKEN/);
+    assert.doesNotMatch(JSON.stringify(out.diagnostic), /SECRET-TOKEN/);
+  }
+});
+
 test("visual-gate: visual-fix round → harness error → blocks (harness-failure), visual NOT re-run", async () => {
   const log = makeCallLog();
   const cfg = baseCfg({ enabled: true, mode: "gate", max_attempts: 2 });

@@ -42,7 +42,7 @@ import {
   type LoopLedger,
 } from "../scripts/loop/types.ts";
 import { LOOP_EXECUTION_CONTRACT_SCHEMA, type LoopExecutionRequest, type LoopExecutionResponse } from "../scripts/loop-execution-contract.ts";
-import { buildStageDiagnostic } from "../scripts/stage-diagnostic.ts";
+import { buildStageDiagnostic, projectStageDiagnostic } from "../scripts/stage-diagnostic.ts";
 
 const READY_LABEL = "pipeline:ready-to-deploy";
 // The precondition stage gate (#568, capability `loop-precondition-stage-gate`) excludes a
@@ -4838,6 +4838,187 @@ test("regression (#787): a run_fatal class exhausted stops with reason run_fatal
   assert.equal(result.stop?.reason, "run_fatal", "workflow-engine-defect is run_fatal once its budget is exhausted");
   assert.equal(result.stop?.theme, "workflow-engine-defect");
   assert.equal(recoveryCalls, 2);
+});
+
+test("typed production-preflight refusal does not claim scratch or dirt recipes", async () => {
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const actions: string[] = [];
+  let dispatchCount = 0;
+  const diagnostic = buildStageDiagnostic({
+    reasonCode: "workflow-engine-defect",
+    blockerKind: "harness-failure",
+    reason: "[harness omit] adapter omits background_job_lifecycle",
+    stage: "fix-1",
+    preflightFailed: true,
+    preflightClass: "unsupported-setting",
+    preflightReasonCode: "capability-refusal",
+    preflightInterventionKind: "auth-tooling-preflight-failure",
+  });
+  const observe = fakeObserveDeps().deps;
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    dispatchCount++;
+    if (dispatchCount === 1) {
+      return {
+        schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+        item_id: request.item_id,
+        run_id: request.run_id,
+        outcome: "blocked_recoverable",
+        evidence: { pr_number: null, pipeline_run_id: "advance-100" },
+        diagnostic,
+      };
+    }
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "ready_to_deploy",
+      evidence: { pr_number: 12, pipeline_run_id: "advance-100-retry" },
+    };
+  };
+  const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async (input) => {
+    actions.push(input.action);
+    return { succeeded: true, evidence: "restarted" };
+  };
+
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  const cycle = await runSupervisorCycle(
+    { store: deps, observe, dispatchItem, executeRecovery },
+    "run-1",
+    token,
+    "claude",
+  );
+
+  assert.equal(cycle.stop, null);
+  assert.ok(actions.length >= 1, "recovery should still have an applicable remaining recipe");
+  assert.equal(actions.includes("unlink_engine_scratch"), false);
+  assert.equal(actions.includes("checkpoint_owned_harness_dirt"), false);
+  assert.equal(actions.includes("publish_unpublished_stage_commit"), false);
+});
+
+test("inapplicable never-started preflight recipes are not recovery exhaustion", async () => {
+  const engineDefect = DEFAULT_RECOVERY_POLICY["workflow-engine-defect"];
+  const contract = testContract({
+    recovery_policy: {
+      ...DEFAULT_RECOVERY_POLICY,
+      "workflow-engine-defect": {
+        ...engineDefect,
+        recipes: [
+          "unlink_engine_scratch",
+          "checkpoint_owned_harness_dirt",
+          "publish_unpublished_stage_commit",
+        ],
+      },
+    },
+    items: [{ id: "100", depends_on: [] }],
+  });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+  let recoveryCalls = 0;
+  const diagnostic = buildStageDiagnostic({
+    reasonCode: "workflow-engine-defect",
+    blockerKind: "harness-failure",
+    reason: "[harness omit] adapter omits background_job_lifecycle",
+    stage: "implementing",
+    preflightFailed: true,
+    preflightClass: "unsupported-setting",
+    preflightReasonCode: "capability-refusal",
+    preflightInterventionKind: "auth-tooling-preflight-failure",
+  });
+  const observe = fakeObserveDeps().deps;
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => ({
+    schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+    item_id: request.item_id,
+    run_id: request.run_id,
+    outcome: "blocked_recoverable",
+    evidence: { pr_number: null, pipeline_run_id: "advance-100" },
+    diagnostic,
+  });
+  const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async () => {
+    recoveryCalls++;
+    return { succeeded: true, evidence: "must not run" };
+  };
+
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  const cycle = await runSupervisorCycle(
+    { store: deps, observe, dispatchItem, executeRecovery },
+    "run-1",
+    token,
+    "claude",
+  );
+
+  assert.equal(cycle.stop, null, "inapplicable recipes must not stop the run as exhaustion");
+  assert.notEqual(cycle.stop?.reason, "recovery_exhausted");
+  assert.equal(recoveryCalls, 0);
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(finalLedger.items["100"].state, "blocked");
+  assert.equal(finalLedger.recovery_attempts.length, 0);
+  const events = await readEvents(deps, "run-1");
+  assert.ok(
+    events.some(
+      (event) =>
+        event.kind === "loop_recovery_preflight_deferred" &&
+        (event.data as { reason?: string }).reason === "inapplicable_recipes",
+    ),
+    "deferred inapplicable recipes must be observed",
+  );
+});
+
+test("mechanical capability-refusal recover uses verify_authentication, not human authority", async () => {
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": itemEntry("100", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const actions: string[] = [];
+  let dispatchCount = 0;
+  const diagnostic = buildStageDiagnostic({
+    reasonCode: "capability-refusal",
+    blockerKind: "harness-failure",
+    reason: "[harness omit] adapter omits background_job_lifecycle",
+    stage: "fix-1",
+    preflightFailed: true,
+    preflightClass: "unsupported-setting",
+    preflightReasonCode: "capability-refusal",
+    preflightInterventionKind: "auth-tooling-preflight-failure",
+  });
+  const observe = fakeObserveDeps().deps;
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => {
+    dispatchCount++;
+    if (dispatchCount === 1) {
+      return {
+        schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+        item_id: request.item_id,
+        run_id: request.run_id,
+        outcome: "blocked_recoverable",
+        evidence: { pr_number: null, pipeline_run_id: "advance-100" },
+        diagnostic,
+      };
+    }
+    return {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: request.item_id,
+      run_id: request.run_id,
+      outcome: "ready_to_deploy",
+      evidence: { pr_number: 12, pipeline_run_id: "advance-100-retry" },
+    };
+  };
+  const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async (input) => {
+    actions.push(input.action);
+    return { succeeded: true, evidence: "auth verified" };
+  };
+
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  const cycle = await runSupervisorCycle(
+    { store: deps, observe, dispatchItem, executeRecovery },
+    "run-1",
+    token,
+    "claude",
+  );
+
+  assert.equal(cycle.stop, null);
+  assert.deepEqual(actions, ["verify_authentication"]);
+  assert.equal(projectStageDiagnostic(diagnostic).disposition, "recover");
+  assert.equal(projectStageDiagnostic(diagnostic).blockerClass, "environment-auth");
 });
 
 test("regression (#787): a mid-pass run stop before a sibling's pass-2 recovery skips gracefully — no throw, no side effect, first-cause stop preserved", async () => {

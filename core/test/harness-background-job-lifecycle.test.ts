@@ -20,6 +20,7 @@ import {
   checkStructure,
   effectiveJoinGraceMs,
   filterRecipesForHarnessBackgroundWait,
+  filterRecipesForNeverStartedPreflight,
   harnessInvocationFingerprint,
   hashAdapterCapabilities,
   hashPromptForFingerprint,
@@ -43,7 +44,10 @@ import {
   type HarnessAdapter,
   type InjectedLifecycleEvent,
 } from "../scripts/harness-adapters/index.ts";
-import { defaultProductionPreflightDeps } from "../scripts/harness-adapters/production-preflight.ts";
+import {
+  defaultProductionPreflightDeps,
+  productionPreflightRefusalReason,
+} from "../scripts/harness-adapters/production-preflight.ts";
 import { classifyHarnessFailure, interventionKindFromReason, isMechanicalInfrastructureReason } from "../scripts/escalation-classify.ts";
 import { STAGE_DIAGNOSTIC_REASON_CODES, buildStageDiagnostic, projectPipelineReasonCode } from "../scripts/stage-diagnostic.ts";
 import { invokeFixHarnessWithRetry } from "../scripts/stages/fix.ts";
@@ -575,6 +579,74 @@ test("mutating implementer preflight spawns explicit unsupported; omits still re
   assert.equal(claudePlan.ok, true, JSON.stringify(claudePlan));
 });
 
+test("mutating implementer preflight refuses malformed required lifecycle before spawn", async () => {
+  _resetRegistryForTests({ reseedBuiltins: true });
+  let built = 0;
+  const malformedSupported = makeAdapter({
+    name: "malformed-supported-cli",
+    lifecycle: { supported: "yes" } as HarnessAdapter["capabilities"]["background_job_lifecycle"],
+  });
+  const origBuild = malformedSupported.buildInvocation.bind(malformedSupported);
+  malformedSupported.buildInvocation = (ctx) => {
+    built += 1;
+    return origBuild(ctx);
+  };
+  registerAdapter(malformedSupported);
+  const missingSchema = makeAdapter({
+    name: "malformed-schema-cli",
+    lifecycle: { supported: true } as HarnessAdapter["capabilities"]["background_job_lifecycle"],
+  });
+  registerAdapter(missingSchema);
+  const deps = defaultProductionPreflightDeps({
+    exec: async () => ({ ok: true, stdout: "ok", stderr: "" }),
+    execCheck: async () => true,
+    resolvePath: async () => "/bin/true",
+    fsExecutable: async () => true,
+  });
+  for (const stageKind of ["implement", "fix-round", "test-fix", "eval-fix", "visual-fix"] as const) {
+    const refused = await runProductionPreflight(
+      malformedSupported,
+      { prompt: "p", stageKind, role: "implementer" },
+      deps,
+    );
+    assert.equal(refused.ok, false, stageKind);
+    if (!refused.ok) {
+      assert.equal(refused.remediation.reasonCode, "capability-refusal");
+      assert.equal(refused.remediation.interventionKind, "auth-tooling-preflight-failure");
+      assert.equal(refused.remediation.failure, "unsupported-setting");
+      assert.match(refused.remediation.message, /malformed-supported-cli/);
+      assert.match(refused.remediation.message, /background_job_lifecycle\.supported/);
+      assert.match(refused.remediation.message, /cannot succeed/);
+    }
+  }
+  const schemaRefused = await runProductionPreflight(
+    missingSchema,
+    { prompt: "p", stageKind: "implement", role: "implementer" },
+    deps,
+  );
+  assert.equal(schemaRefused.ok, false);
+  if (!schemaRefused.ok) {
+    assert.equal(schemaRefused.remediation.reasonCode, "capability-refusal");
+    assert.match(schemaRefused.remediation.message, /malformed-schema-cli/);
+    assert.match(schemaRefused.remediation.message, /schema/);
+  }
+  const invoked = await invoke("malformed-supported-cli", "/tmp/wt", "prompt", {
+    stageKind: "implement",
+    role: "implementer",
+    preflightDeps: deps,
+  });
+  assert.equal(built, 0, "malformed lifecycle must not call buildInvocation");
+  assert.equal(invoked.preflight_failed, true);
+  assert.equal(invoked.preflight_reason_code, "capability-refusal");
+  assert.equal(invoked.preflight_intervention_kind, "auth-tooling-preflight-failure");
+  assert.equal(invoked.timed_out, false);
+  assert.equal(invoked.spawn_error, undefined);
+  assert.notEqual(classifyHarnessFailure(invoked), "environment-auth");
+  assert.notEqual(classifyHarnessFailure(invoked), "harness-timeout");
+  assert.notEqual(classifyHarnessFailure(invoked), "harness-contract");
+  assert.notEqual(classifyHarnessFailure(invoked), "workflow-engine-defect");
+});
+
 test("same-adapter retry of the same fingerprint is refused and does not spawn", async () => {
   _resetRegistryForTests({ reseedBuiltins: true });
   const adapter = makeAdapter({
@@ -659,6 +731,7 @@ test("invokeFixHarnessWithRetry does not retry a typed production-preflight refu
         preflight_failed: true,
         preflight_class: "unsupported-setting",
         preflight_reason_code: "capability-refusal",
+        preflight_intervention_kind: "auth-tooling-preflight-failure",
       };
     },
   });
@@ -670,6 +743,31 @@ test("invokeFixHarnessWithRetry does not retry a typed production-preflight refu
     classifyHarnessFailure(retry.finalResult),
     "capability-refusal",
   );
+  const typedReason = productionPreflightRefusalReason(retry.finalResult);
+  assert.ok(typedReason);
+  assert.doesNotMatch(typedReason!, /exit -1/);
+  const diagnostic = buildStageDiagnostic({
+    reasonCode: classifyHarnessFailure(retry.finalResult),
+    blockerKind: "harness-failure",
+    reason: typedReason!,
+    stage: "fix-1",
+    preflightFailed: true,
+    preflightClass: retry.finalResult.preflight_class,
+    preflightReasonCode: retry.finalResult.preflight_reason_code,
+    preflightInterventionKind: retry.finalResult.preflight_intervention_kind,
+  });
+  assert.equal(diagnostic.reason_code, "capability-refusal");
+  assert.equal(diagnostic.detail.preflight_failed, true);
+  assert.equal(diagnostic.detail.preflight_reason_code, "capability-refusal");
+  assert.equal(diagnostic.detail.preflight_intervention_kind, "auth-tooling-preflight-failure");
+  assert.equal(projectPipelineReasonCode(diagnostic.reason_code).disposition, "recover");
+  assert.notEqual(projectPipelineReasonCode(diagnostic.reason_code).blockerClass, "specification-decision");
+  assert.equal(
+    interventionKindFromReason(diagnostic.reason_code),
+    "auth-tooling-preflight-failure",
+  );
+  assert.equal(retry.finalResult.duration, 0);
+  assert.equal(retry.finalResult.spawn_error, undefined);
 });
 
 test("harness-background-wait recovery recipes do not include same-adapter repair or publish", () => {
@@ -685,6 +783,96 @@ test("harness-background-wait recovery recipes do not include same-adapter repai
     "checkpoint_owned_harness_dirt",
     "restart_workflow_engine",
   ]);
+});
+
+test("typed preflight refusal stays distinct from spawn, signal, timeout, malformed output, and environment-auth", () => {
+  const refusal = {
+    success: false,
+    timed_out: false,
+    exit_code: -1,
+    preflight_failed: true,
+    preflight_reason_code: "capability-refusal" as const,
+  };
+  assert.equal(classifyHarnessFailure(refusal), "capability-refusal");
+  assert.equal(
+    classifyHarnessFailure({ success: false, spawn_error: true, exit_code: -1 }),
+    "harness-contract",
+  );
+  assert.equal(
+    classifyHarnessFailure({ success: false, timed_out: true, exit_code: -1 }),
+    "harness-timeout",
+  );
+  assert.equal(
+    classifyHarnessFailure({ success: false, capture_error: true, exit_code: -1 }),
+    "harness-contract",
+  );
+  assert.equal(
+    classifyHarnessFailure({
+      success: false,
+      preflight_failed: true,
+      preflight_reason_code: "environment-auth",
+      exit_code: -1,
+    }),
+    "environment-auth",
+  );
+  assert.notEqual(classifyHarnessFailure(refusal), classifyHarnessFailure({
+    success: false,
+    termination_signal: "SIGKILL",
+    exit_code: -1,
+  } as { success: false; exit_code: number }));
+});
+
+test("never-started preflight recovery recipes omit scratch, dirt, and publish", () => {
+  const filtered = filterRecipesForNeverStartedPreflight([
+    "unlink_engine_scratch",
+    "checkpoint_owned_harness_dirt",
+    "publish_unpublished_stage_commit",
+    "restart_workflow_engine",
+    "repair_pipeline_item",
+    "verify_authentication",
+  ]);
+  assert.deepEqual(filtered, [
+    "restart_workflow_engine",
+    "repair_pipeline_item",
+    "verify_authentication",
+  ]);
+  const empty = filterRecipesForNeverStartedPreflight([
+    "unlink_engine_scratch",
+    "checkpoint_owned_harness_dirt",
+    "publish_unpublished_stage_commit",
+  ]);
+  assert.deepEqual(empty, []);
+});
+
+test("typed production-preflight refusal evidence redacts secrets and omits prompt body", () => {
+  const promptBody = "You are implementing issue #1362. Full prompt body must not persist.";
+  const reason = productionPreflightRefusalReason({
+    preflight_failed: true,
+    stderr:
+      "[harness grok] adapter omits background_job_lifecycle. Bearer SECRET-TOKEN api_key=sk-live-secret",
+  });
+  assert.ok(reason);
+  const diagnostic = buildStageDiagnostic({
+    reasonCode: "capability-refusal",
+    blockerKind: "harness-failure",
+    reason: reason!,
+    stage: "fix-1",
+    preflightFailed: true,
+    preflightClass: "unsupported-setting",
+    preflightReasonCode: "capability-refusal",
+    preflightInterventionKind: "auth-tooling-preflight-failure",
+  });
+  const blob = JSON.stringify(diagnostic);
+  assert.equal(diagnostic.detail.preflight_failed, true);
+  assert.equal(diagnostic.detail.preflight_class, "unsupported-setting");
+  assert.equal(diagnostic.detail.preflight_reason_code, "capability-refusal");
+  assert.equal(diagnostic.detail.preflight_intervention_kind, "auth-tooling-preflight-failure");
+  assert.match(diagnostic.detail.reason, /background_job_lifecycle/);
+  assert.doesNotMatch(blob, /SECRET-TOKEN/);
+  assert.doesNotMatch(blob, /sk-live-secret/);
+  assert.doesNotMatch(blob, /You are implementing/);
+  assert.doesNotMatch(blob, new RegExp(promptBody.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.equal(projectPipelineReasonCode(diagnostic.reason_code).disposition, "recover");
 });
 
 // ---------------------------------------------------------------------------

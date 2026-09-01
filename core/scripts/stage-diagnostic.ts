@@ -67,6 +67,12 @@ export interface StageDiagnosticDetail {
   /** Positive authority proof emitted only after the fix stage matched a
    * declaration to a current blocking finding at the reviewed candidate. */
   authority_evidence?: HumanAuthorityEvidence[];
+  /** Typed production-preflight refusal fields (#1362). Absent when the
+   * harness started or the failure is not a preflight refusal. */
+  preflight_failed?: boolean;
+  preflight_class?: string;
+  preflight_reason_code?: "environment-auth" | "capability-refusal";
+  preflight_intervention_kind?: "auth-tooling-preflight-failure";
 }
 
 export interface StageDiagnostic {
@@ -190,6 +196,10 @@ function evidenceKeyFor(
     stage: detail.stage ?? null,
     offramp_class: detail.offramp_class ?? null,
     authority_evidence: detail.authority_evidence ?? null,
+    preflight_failed: detail.preflight_failed ?? null,
+    preflight_class: detail.preflight_class ?? null,
+    preflight_reason_code: detail.preflight_reason_code ?? null,
+    preflight_intervention_kind: detail.preflight_intervention_kind ?? null,
   });
   return `sha256:${createHash("sha256").update(canonical).digest("hex")}`;
 }
@@ -383,6 +393,10 @@ export function buildStageDiagnostic(input: {
   stage?: string;
   offrampClass?: PreMergeOfframpClass;
   authorityEvidence?: HumanAuthorityEvidence[];
+  preflightFailed?: boolean;
+  preflightClass?: string;
+  preflightReasonCode?: "environment-auth" | "capability-refusal";
+  preflightInterventionKind?: "auth-tooling-preflight-failure";
 }): StageDiagnostic {
   const detail: StageDiagnosticDetail = {
     blocker_kind: input.blockerKind,
@@ -390,6 +404,14 @@ export function buildStageDiagnostic(input: {
     ...(input.stage !== undefined ? { stage: input.stage } : {}),
     ...(input.offrampClass !== undefined ? { offramp_class: input.offrampClass } : {}),
     ...(input.authorityEvidence !== undefined ? { authority_evidence: input.authorityEvidence } : {}),
+    ...(input.preflightFailed !== undefined ? { preflight_failed: input.preflightFailed } : {}),
+    ...(input.preflightClass !== undefined ? { preflight_class: input.preflightClass } : {}),
+    ...(input.preflightReasonCode !== undefined
+      ? { preflight_reason_code: input.preflightReasonCode }
+      : {}),
+    ...(input.preflightInterventionKind !== undefined
+      ? { preflight_intervention_kind: input.preflightInterventionKind }
+      : {}),
   };
   const reasonCode = input.reasonCode ?? reasonCodeFor(input.blockerKind, input.offrampClass);
   const diagnostic: StageDiagnostic = {
