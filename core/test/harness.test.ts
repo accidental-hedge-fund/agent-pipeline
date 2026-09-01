@@ -508,6 +508,57 @@ test("formatStderrExcerpt: stderr at exactly max is not truncated", () => {
 });
 
 // ---------------------------------------------------------------------------
+// signal-terminated close (harness-failure diagnostics) — a child killed by a
+// signal (not exiting normally) previously collapsed into an opaque
+// `exit_code: -1` with no way to tell a SIGKILL from a SIGSEGV from anything
+// else: Node's ChildProcess 'close' event carries the terminating signal as
+// its second argument, and the handler discarded it. Every stage-level
+// blocker message built from `exit ${result.exit_code}` inherited that
+// blindness, surfacing a bare "exit -1" for a process that in fact never ran
+// to completion at all.
+// ---------------------------------------------------------------------------
+
+test("runCapped: a process terminated by a signal surfaces the signal instead of a bare, unexplained exit -1", async () => {
+  const cli = makeScript("self-sigkill", `kill -9 $$`);
+  const result = await runCapped(cli, [], tmpRoot, 30, false, "test");
+
+  assert.equal(
+    result.exit_code,
+    -1,
+    "Node reports code:null for a signal-terminated process, which the wrapper still surfaces as exit_code -1",
+  );
+  assert.equal(
+    result.termination_signal,
+    "SIGKILL",
+    "the terminating signal must be captured on the result, not discarded",
+  );
+  assert.match(
+    result.stderr,
+    /process terminated by signal SIGKILL/,
+    "the signal must be visible in stderr so callers building blocker messages actually surface it",
+  );
+  assert.equal(result.success, false);
+  assert.equal(
+    result.timed_out,
+    false,
+    "this is not a wrapper-driven timeout — the process was killed by an external/self-inflicted signal",
+  );
+});
+
+test("runCapped: a process that exits normally with a nonzero code never sets termination_signal", async () => {
+  const cli = makeScript("normal-nonzero-exit", `exit 7`);
+  const result = await runCapped(cli, [], tmpRoot, 30, false, "test");
+
+  assert.equal(result.exit_code, 7);
+  assert.equal(
+    result.termination_signal,
+    undefined,
+    "a normal (non-signal) exit must not be misreported as signal-terminated",
+  );
+  assert.doesNotMatch(result.stderr, /process terminated by signal/);
+});
+
+// ---------------------------------------------------------------------------
 // descendant-cleanup (#260) — grandchild process is killed when harness times out
 //
 // runCapped with killProcessGroup:true must kill the entire process group on
