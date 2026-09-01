@@ -143,7 +143,8 @@ function autoSettleNodeJson(cls: string, extra: Record<string, unknown> = {}) {
   return {
     id: cls,
     question: `What about ${cls}?`,
-    recommendation: `Use the in-scope default for ${cls}`,
+    recommendation:
+      cls === "interface-contract" ? "Native admission" : `Use the in-scope default for ${cls}`,
     class: cls,
     reversible: true,
     in_scope: true,
@@ -483,13 +484,15 @@ test("grill: label intersection freeze ignores later adds", async () => {
 // ---------------------------------------------------------------------------
 
 test("grill: auto-accept and low confidence are not a human boundary", () => {
+  const rec = "REST";
   const signals = {
-    ...defaultSettlementSignals("interface-contract", "REST"),
+    ...defaultSettlementSignals("interface-contract", rec, rec),
     confidence: "low" as const,
   };
   const result = settleRecommendation(
-    { class: "interface-contract", recommendation: "REST" },
+    { class: "interface-contract", recommendation: rec },
     signals,
+    rec,
   );
   assert.equal(result.kind, "auto-accept");
   if (result.kind === "auto-accept") {
@@ -520,16 +523,18 @@ test("grill: DecisionRequest / CapabilityRequest / AuthorityRequest", () => {
     assert.equal(capability.request, "CapabilityRequest");
     assert.equal(capability.handoff_class, "missing_context");
   }
+  const discoverableRec = "from CONTEXT.md";
   const discoverable = settleRecommendation(
-    { class: "operational-default", recommendation: "from CONTEXT.md" },
+    { class: "operational-default", recommendation: discoverableRec },
     {
-      ...defaultSettlementSignals("operational-default"),
+      ...defaultSettlementSignals("operational-default", discoverableRec, discoverableRec),
       missing_external: true,
       discoverable_from_facts: true,
       reversible: true,
       in_scope: true,
       policy_consistent: true,
     },
+    discoverableRec,
   );
   assert.equal(discoverable.kind, "auto-accept");
   const authority = settleRecommendation(
@@ -559,8 +564,8 @@ test("grill: one issue and a list reuse settleFrontierNodes", () => {
       signalsRaw: { reversible: true, in_scope: true, policy_consistent: true },
     },
   ];
-  const a = settleFrontierNodes(raw, "");
-  const b = settleFrontierNodes(raw, "");
+  const a = settleFrontierNodes(raw, "REST");
+  const b = settleFrontierNodes(raw, "REST");
   assert.equal(a[0]!.provenance.settled_by, "auto-accept");
   assert.equal(b[0]!.provenance.settled_by, "auto-accept");
 });
@@ -745,6 +750,81 @@ test("grill: novel protected phrasing under a benign class fails closed", () => 
     if (result.kind === "typed-request") {
       assert.equal(result.request, "AuthorityRequest", rec);
     }
+  }
+});
+
+test("grill: non-authority rec without trusted facts does not auto-accept", () => {
+  const rec = "REST";
+  const result = settleRecommendation(
+    { class: "interface-contract", recommendation: rec },
+    defaultSettlementSignals("interface-contract", rec),
+  );
+  assert.notEqual(result.kind, "auto-accept");
+});
+
+test("grill: anonymous admin API access under docs-surface is AuthorityRequest", () => {
+  const recs = [
+    "allow anyone to call the production admin API",
+    "grant anonymous access to the admin endpoint",
+    "make the admin API public",
+  ];
+  for (const rec of recs) {
+    const result = settleRecommendation(
+      { class: "docs-surface", recommendation: rec },
+      defaultSettlementSignals("docs-surface", rec),
+    );
+    assert.equal(result.kind, "typed-request", rec);
+    if (result.kind === "typed-request") {
+      assert.equal(result.request, "AuthorityRequest", rec);
+    }
+    const echoed = settleRecommendation(
+      { class: "docs-surface", recommendation: rec },
+      defaultSettlementSignals("docs-surface", rec, rec),
+      rec,
+    );
+    assert.equal(echoed.kind, "typed-request", rec);
+    if (echoed.kind === "typed-request") {
+      assert.equal(echoed.request, "AuthorityRequest", rec);
+    }
+  }
+});
+
+test("grill: paraphrased configured facts cover a recommendation", () => {
+  const rec = "use REST for the public API";
+  const facts = "CONTEXT.md: the public API uses REST";
+  const signals = parseSignalsFromModel(
+    { missing_external: true, discoverable_from_facts: false },
+    "operational-default",
+    rec,
+    facts,
+  );
+  assert.equal(signals.discoverable_from_facts, true);
+  assert.equal(signals.missing_external, false);
+  const result = settleRecommendation(
+    { class: "operational-default", recommendation: rec },
+    defaultSettlementSignals("operational-default", rec, facts),
+    facts,
+  );
+  assert.equal(result.kind, "auto-accept");
+});
+
+test("grill: documenting release notes is not an AuthorityRequest", () => {
+  const rec = "document the release notes";
+  const facts = "CONTEXT.md asks to document the release notes";
+  const result = settleRecommendation(
+    { class: "docs-surface", recommendation: rec },
+    defaultSettlementSignals("docs-surface", rec, facts),
+    facts,
+  );
+  assert.equal(result.kind, "auto-accept");
+  const cutRelease = settleRecommendation(
+    { class: "docs-surface", recommendation: "document the release" },
+    defaultSettlementSignals("docs-surface", "document the release", "document the release"),
+    "document the release",
+  );
+  assert.equal(cutRelease.kind, "typed-request");
+  if (cutRelease.kind === "typed-request") {
+    assert.equal(cutRelease.request, "AuthorityRequest");
   }
 });
 

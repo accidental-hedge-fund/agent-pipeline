@@ -5,7 +5,6 @@ import {
   AUTO_ACCEPT_ELIGIBILITY_REASON,
   classifyAuthority,
   isGrillTaxonomyClass,
-  isNonAuthorityClass,
 } from "./grill-taxonomy.ts";
 import type { TypedRequestKind } from "./grill-decisions.ts";
 import type { HandoffClass } from "./human-question-handoff.ts";
@@ -34,15 +33,12 @@ const PROTECTED_CLASSES = new Set([
   "human-attestation",
 ]);
 
-/** Closed protected-action vocabulary. Presence of a token is sufficient. */
-const PROTECTED_TOKENS: ReadonlySet<string> = new Set([
+/** Action tokens that are protected on their own. Token absence is not proof of safety. */
+const PROTECTED_ACTION_TOKENS: ReadonlySet<string> = new Set([
   "merge",
   "merging",
   "merged",
   "merger",
-  "release",
-  "releasing",
-  "released",
   "deploy",
   "deploying",
   "deployment",
@@ -76,6 +72,19 @@ const PROTECTED_TOKENS: ReadonlySet<string> = new Set([
   "wiped",
 ]);
 
+/** Release-as-action tokens. Documentation of release notes is not this class. */
+const RELEASE_ACTION_TOKENS: ReadonlySet<string> = new Set([
+  "release",
+  "releasing",
+  "released",
+]);
+
+const RELEASE_NOTES_TOKENS: ReadonlySet<string> = new Set([
+  "notes",
+  "changelog",
+  "readme",
+]);
+
 /** Adjacent-token phrases the single-token set does not cover on its own. */
 const PROTECTED_PAIRS: readonly [string, string][] = [
   ["force", "push"],
@@ -102,6 +111,106 @@ const PROTECTED_PAIRS: readonly [string, string][] = [
   ["disable", "rbac"],
 ];
 
+const ACCESS_ACTORS: ReadonlySet<string> = new Set([
+  "anyone",
+  "anybody",
+  "anonymous",
+  "unauthenticated",
+  "everyone",
+  "world",
+]);
+
+const ACCESS_VERBS: ReadonlySet<string> = new Set([
+  "allow",
+  "allows",
+  "allowed",
+  "permit",
+  "permits",
+  "permitted",
+  "grant",
+  "grants",
+  "granted",
+  "authorize",
+  "authorizes",
+  "authorized",
+  "open",
+  "opens",
+  "expose",
+  "exposes",
+  "enable",
+  "enables",
+]);
+
+const GRANT_REVOKE: ReadonlySet<string> = new Set([
+  "grant",
+  "grants",
+  "granted",
+  "revoke",
+  "revokes",
+  "revoked",
+  "deny",
+  "denies",
+  "denied",
+]);
+
+const PERMISSION_OBJECTS: ReadonlySet<string> = new Set([
+  "permission",
+  "permissions",
+  "role",
+  "roles",
+  "privilege",
+  "privileges",
+  "rbac",
+  "acl",
+  "entitlement",
+  "entitlements",
+]);
+
+const ADMIN_OBJECTS: ReadonlySet<string> = new Set([
+  "admin",
+  "administrator",
+  "admins",
+  "root",
+  "superuser",
+]);
+
+const ACCESS_OBJECTS: ReadonlySet<string> = new Set(["api", "access", "endpoint"]);
+
+const PUBLIC_ACTORS: ReadonlySet<string> = new Set(["public", "anonymous"]);
+
+const FACT_STOPWORDS: ReadonlySet<string> = new Set([
+  "a",
+  "an",
+  "the",
+  "and",
+  "or",
+  "for",
+  "of",
+  "to",
+  "in",
+  "on",
+  "at",
+  "by",
+  "with",
+  "from",
+  "as",
+  "is",
+  "be",
+  "are",
+  "was",
+  "were",
+  "that",
+  "this",
+  "it",
+  "its",
+  "use",
+  "using",
+  "used",
+  "via",
+  "into",
+  "than",
+]);
+
 function tokenizeRecommendation(recommendation: string): string[] {
   return recommendation
     .toLowerCase()
@@ -125,14 +234,83 @@ function hasPairWithin(
   return false;
 }
 
-/** Engine-owned recommendation scan. Class labels are not sufficient. */
+function hasSetPairWithin(
+  tokens: readonly string[],
+  left: ReadonlySet<string>,
+  right: ReadonlySet<string>,
+  window = 8,
+): boolean {
+  for (let i = 0; i < tokens.length; i++) {
+    const a = tokens[i]!;
+    const aLeft = left.has(a);
+    const aRight = right.has(a);
+    if (!aLeft && !aRight) continue;
+    for (let j = i + 1; j < tokens.length && j <= i + window; j++) {
+      const b = tokens[j]!;
+      if (aLeft && right.has(b)) return true;
+      if (aRight && left.has(b)) return true;
+    }
+  }
+  return false;
+}
+
+function recommendationMatchesAccessControl(tokens: readonly string[]): boolean {
+  if (hasSetPairWithin(tokens, ACCESS_VERBS, ACCESS_ACTORS)) return true;
+  if (hasSetPairWithin(tokens, ACCESS_ACTORS, ADMIN_OBJECTS)) return true;
+  if (hasSetPairWithin(tokens, ACCESS_ACTORS, ACCESS_OBJECTS)) return true;
+  if (hasSetPairWithin(tokens, GRANT_REVOKE, PERMISSION_OBJECTS)) return true;
+  if (hasSetPairWithin(tokens, PUBLIC_ACTORS, ADMIN_OBJECTS)) return true;
+  if (hasPairWithin(tokens, "policy", "exception", 4) || hasPairWithin(tokens, "exception", "policy", 4)) {
+    return true;
+  }
+  if (hasPairWithin(tokens, "policy", "exceptions", 4) || hasPairWithin(tokens, "exceptions", "policy", 4)) {
+    return true;
+  }
+  return false;
+}
+
+function isReleaseNotesDocumentation(tokens: readonly string[]): boolean {
+  return (
+    tokens.some((t) => RELEASE_ACTION_TOKENS.has(t)) &&
+    tokens.some((t) => RELEASE_NOTES_TOKENS.has(t))
+  );
+}
+
+/**
+ * Engine-owned fail-closed scan. Class labels and keyword absence are not
+ * sufficient. Access-control changes are protected even without listed verbs
+ * such as auth/merge/deploy.
+ */
 export function recommendationMatchesProtectedAction(recommendation: string): boolean {
   const rec = recommendation.trim();
   if (!rec) return false;
   const tokens = tokenizeRecommendation(rec);
-  if (tokens.some((t) => PROTECTED_TOKENS.has(t))) return true;
+  if (recommendationMatchesAccessControl(tokens)) return true;
   if (PROTECTED_PAIRS.some(([a, b]) => hasPairWithin(tokens, a, b))) return true;
+  if (tokens.some((t) => PROTECTED_ACTION_TOKENS.has(t))) return true;
+  if (!isReleaseNotesDocumentation(tokens) && tokens.some((t) => RELEASE_ACTION_TOKENS.has(t))) {
+    return true;
+  }
   return false;
+}
+
+function contentTokens(text: string): string[] {
+  return tokenizeRecommendation(text).filter((t) => !FACT_STOPWORDS.has(t) && t.length > 1);
+}
+
+/**
+ * Trusted-fact coverage. Exact substring or every content token of the
+ * recommendation already present in gathered facts. Empty input fails closed.
+ */
+export function factsCoverRecommendation(recommendation: string, factText: string): boolean {
+  const rec = recommendation.trim();
+  const facts = factText.trim();
+  if (!rec || !facts) return false;
+  if (facts.toLowerCase().includes(rec.toLowerCase())) return true;
+  const recTokens = contentTokens(rec);
+  if (recTokens.length === 0) return false;
+  const factSet = new Set(tokenizeRecommendation(facts));
+  return recTokens.every((t) => factSet.has(t));
 }
 
 export function engineProtectedAction(nodeClass: string, recommendation: string): boolean {
@@ -269,10 +447,9 @@ export function settleRecommendation(
  * Existing-authority coverage is engine-owned. A protected recommendation
  * is never covered, including when the model puts it in a non-authority
  * class. Empty or unproven recommendations are not covered. Non-authority
- * classes cover only recommendations the engine classifies as non-protected.
- * Protected classes never auto-grant from model prose. Scope (and other
- * non-protected operator-required classes) is covered only when the
- * recommendation already appears in trusted facts.
+ * class membership is not coverage. Coverage requires affirmative trusted
+ * facts for the concrete recommendation. Protected classes never auto-grant
+ * from model prose.
  */
 export function engineCoveredByExistingAuthority(
   nodeClass: string,
@@ -282,18 +459,16 @@ export function engineCoveredByExistingAuthority(
   const rec = recommendation.trim();
   if (!rec) return false;
   if (engineProtectedAction(nodeClass, rec)) return false;
-  if (isNonAuthorityClass(nodeClass)) return true;
-  return factText.toLowerCase().includes(rec.toLowerCase());
+  return factsCoverRecommendation(rec, factText);
 }
 
 /**
- * A recommendation is discoverable when trusted fact text already contains it.
- * Empty recommendations are not discoverable.
+ * A recommendation is discoverable when trusted facts already cover it,
+ * including paraphrases that share the same content tokens. Empty
+ * recommendations are not discoverable.
  */
 export function engineDiscoverableFromFacts(recommendation: string, factText: string): boolean {
-  const rec = recommendation.trim();
-  if (!rec) return false;
-  return factText.toLowerCase().includes(rec.toLowerCase());
+  return factsCoverRecommendation(recommendation, factText);
 }
 
 /**

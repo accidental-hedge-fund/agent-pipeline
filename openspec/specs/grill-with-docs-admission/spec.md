@@ -119,7 +119,7 @@ Grill SHALL maintain a per-issue design tree. Each round SHALL process every cur
 
 ### Requirement: Evidence-backed recommendations SHALL auto-settle inside existing authority
 
-Grill SHALL automatically settle a recommendation when it is reversible, in scope, policy-consistent, and covered by existing authority. Provenance SHALL be `settled-by: auto-accept`. Low model confidence alone SHALL NOT pause the issue and SHALL NOT create a typed request. Pipeline SHALL derive reversibility, in-scope status, policy consistency, protected-action status, and existing-authority coverage from trusted taxonomy, repository, GitHub, and configuration facts. Taxonomy class membership alone SHALL NOT prove those predicates for a model-authored recommendation. Pipeline SHALL classify the concrete recommendation against a closed protected-action vocabulary and those trusted facts. Model-written values for those fields SHALL NOT satisfy the auto-settle predicate. Pipeline SHALL fail closed when coverage cannot be proven. Auto-settle SHALL NOT grant merge, release, destructive, security, or other protected authority.
+Grill SHALL automatically settle a recommendation when it is reversible, in scope, policy-consistent, and covered by existing authority. Provenance SHALL be `settled-by: auto-accept`. Low model confidence alone SHALL NOT pause the issue and SHALL NOT create a typed request. Pipeline SHALL derive reversibility, in-scope status, policy consistency, protected-action status, and existing-authority coverage from trusted taxonomy, repository, GitHub, and configuration facts. Taxonomy class membership alone SHALL NOT prove those predicates for a model-authored recommendation. Pipeline SHALL classify the concrete recommendation with a fail-closed protected-action classifier and those trusted facts. Absence of a listed keyword SHALL NOT prove the recommendation is non-protected. Access-control changes, including anonymous or public admin or API access, permission grants or revocations, and policy exceptions, SHALL be protected. Non-authority class membership SHALL NOT prove existing-authority coverage. Auto-settle SHALL require affirmative coverage from trusted facts for the concrete recommendation. Model-written values for those fields SHALL NOT satisfy the auto-settle predicate. Pipeline SHALL fail closed when coverage cannot be proven. Auto-settle SHALL NOT grant merge, release, destructive, security, or other protected authority.
 
 #### Scenario: In-scope default auto-settles
 
@@ -144,6 +144,14 @@ Grill SHALL automatically settle a recommendation when it is reversible, in scop
 
 - **WHEN** a node is class `docs-surface` or `interface-contract`
 - **AND** the recommendation would merge, release, destroy, or change a security-sensitive control
+- **AND** trusted facts do not prove existing authority for that recommendation
+- **THEN** grill SHALL NOT record `settled-by: auto-accept`
+- **AND** SHALL emit an `AuthorityRequest`
+
+#### Scenario: Access-control recommendation under a benign class is protected
+
+- **WHEN** a node is class `docs-surface`
+- **AND** the recommendation allows anonymous, public, or unauthenticated access to an admin API
 - **AND** trusted facts do not prove existing authority for that recommendation
 - **THEN** grill SHALL NOT record `settled-by: auto-accept`
 - **AND** SHALL emit an `AuthorityRequest`
