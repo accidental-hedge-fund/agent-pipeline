@@ -4,6 +4,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as crypto from "node:crypto";
+import { observeDeploymentAgainstLivePin } from "../scripts/stages/ship-adapter.ts";
 import {
   SHIP_AUTHORIZED_ACTIONS,
   emptyShipProgress,
@@ -107,6 +108,11 @@ function completeProgress(): ShipProgress {
       merged: true,
       merge_commit_oid: MERGE,
     },
+    tag: {
+      version: intent.version,
+      tag: "v1.34.0",
+      peeled_commit: MERGE,
+    },
     publication: {
       version: intent.version,
       tag: "v1.34.0",
@@ -183,8 +189,11 @@ function crashDeps(store: ReturnType<typeof memoryStore>, observed: ShipProgress
       mutations.push("release-merge");
       return structuredClone(progress.release_finish!);
     },
-    async waitForRelease() {
+    async convergeTag() {
       mutations.push("tag-push");
+      return structuredClone(progress.tag!);
+    },
+    async waitForRelease() {
       mutations.push("github-release");
       return structuredClone(progress.publication!);
     },
@@ -276,12 +285,11 @@ test("crash after release merge does not remarge (#1331)", async () => {
   assert.ok(!resumed.mutations.includes("release-merge"));
 });
 
-test("crash after tag push / GitHub Release does not retag (#1331)", async () => {
+test("crash after origin tag push before publication does not retag (#1331)", async () => {
   const store = memoryStore();
   const first = crashDeps(store);
-  first.waitForRelease = async () => {
+  first.convergeTag = async () => {
     first.mutations.push("tag-push");
-    first.mutations.push("github-release");
     throw new Error("died after tag-push");
   };
   await runShipCoordinator(intent, authorization(), first);
@@ -292,11 +300,79 @@ test("crash after tag push / GitHub Release does not retag (#1331)", async () =>
   observed.frg = done.frg;
   observed.release = done.release;
   observed.release_finish = done.release_finish;
+  observed.tag = done.tag;
+  const resumed = crashDeps(store, observed);
+  const result = await runShipCoordinator(intent, authorization(), resumed);
+  assert.ok(!resumed.mutations.includes("tag-push"));
+  assert.ok(resumed.mutations.includes("github-release"));
+  assert.equal(result.tag?.peeled_commit, MERGE);
+  assert.equal(result.complete, true);
+});
+
+test("crash after tag push / GitHub Release does not retag (#1331)", async () => {
+  const store = memoryStore();
+  const first = crashDeps(store);
+  first.waitForRelease = async () => {
+    first.mutations.push("github-release");
+    throw new Error("died after github-release");
+  };
+  await runShipCoordinator(intent, authorization(), first);
+  const observed = emptyShipProgress();
+  const done = completeProgress();
+  observed.train = done.train;
+  observed.frg_pack = done.frg_pack;
+  observed.frg = done.frg;
+  observed.release = done.release;
+  observed.release_finish = done.release_finish;
+  observed.tag = done.tag;
   observed.publication = done.publication;
   const resumed = crashDeps(store, observed);
   await runShipCoordinator(intent, authorization(), resumed);
   assert.ok(!resumed.mutations.includes("tag-push"));
   assert.ok(!resumed.mutations.includes("github-release"));
+});
+
+test("same-version pin retarget does not complete deployment on stale host digest (#1331)", async () => {
+  const store = memoryStore();
+  const first = crashDeps(store);
+  first.convergeDeployment = async () => {
+    throw new Error("died after promotion before pin retarget");
+  };
+  await runShipCoordinator(intent, authorization(), first);
+  const done = completeProgress();
+  const observed = emptyShipProgress();
+  observed.train = done.train;
+  observed.frg_pack = done.frg_pack;
+  observed.frg = done.frg;
+  observed.release = done.release;
+  observed.release_finish = done.release_finish;
+  observed.tag = done.tag;
+  observed.publication = done.publication;
+  observed.promotion = done.promotion;
+  const retarget = "e".repeat(40);
+  const resumed = crashDeps(store, observed);
+  resumed.convergeDeployment = async (_intent, promotion) => {
+    const result = observeDeploymentAgainstLivePin({
+      intent,
+      promotion,
+      pin: {
+        kind: "ok",
+        pin: { version: intent.version, tag: promotion.tag, git_sha: retarget },
+      },
+      hostObservations: [{ host: "claude", digest: MERGE }],
+    });
+    if (result.kind !== "verified") {
+      throw new Error("ship deployment: production pin no longer matches the authorized promotion target");
+    }
+    resumed.mutations.push("host-install");
+    return result.evidence;
+  };
+  const result = await runShipCoordinator(intent, authorization(), resumed);
+  assert.equal(result.complete, false);
+  assert.equal(result.deployment, null);
+  assert.equal(result.lifecycle, "cooling");
+  assert.ok(!resumed.mutations.includes("host-install"));
+  assert.match(result.last_error ?? "", /production pin no longer matches/);
 });
 
 test("crash after pin write does not rewrite the pin (#1331)", async () => {
@@ -314,6 +390,7 @@ test("crash after pin write does not rewrite the pin (#1331)", async () => {
   observed.frg = done.frg;
   observed.release = done.release;
   observed.release_finish = done.release_finish;
+  observed.tag = done.tag;
   observed.publication = done.publication;
   observed.promotion = done.promotion;
   const resumed = crashDeps(store, observed);
@@ -354,6 +431,7 @@ test("uncertain install stays owned and observes before replay (#1331)", async (
   observed.frg = done.frg;
   observed.release = done.release;
   observed.release_finish = done.release_finish;
+  observed.tag = done.tag;
   observed.publication = done.publication;
   observed.promotion = done.promotion;
   const resumed = crashDeps(store, observed);

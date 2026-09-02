@@ -29,6 +29,7 @@ import {
   diagnosticFromError,
   isAuthorizationOrProtocolShipError,
   isRemainingOpenShipWait,
+  lineageHasPriorEdges,
   projectCandidateLineage,
   projectHumanAuthorityBit,
   resolveShipReleaseModel,
@@ -41,6 +42,7 @@ import {
 
 export {
   EMPTY_CANDIDATE_LINEAGE,
+  lineageHasPriorEdges,
   projectCandidateLineage,
   projectShipStatusView,
   shipPhaseInvariant,
@@ -180,6 +182,13 @@ export interface ShipReleaseFinishEvidence extends ShipReleaseEvidence {
   merge_commit_oid: string;
 }
 
+export interface ShipTagEvidence {
+  version: string;
+  tag: string;
+  /** Origin-observed peeled commit. A local-only tag is not this identity. */
+  peeled_commit: string;
+}
+
 export interface ShipPublicationEvidence {
   version: string;
   tag: string;
@@ -212,6 +221,7 @@ export interface ShipProgress {
   frg: ShipFrgEvidence | null;
   release: ShipReleaseEvidence | null;
   release_finish: ShipReleaseFinishEvidence | null;
+  tag: ShipTagEvidence | null;
   publication: ShipPublicationEvidence | null;
   promotion: ShipPromotionEvidence | null;
   deployment: ShipDeploymentEvidence | null;
@@ -288,6 +298,7 @@ export interface ShipCoordinatorDeps {
   convergeFrgScore(intent: ShipIntent, pack: ShipFrgPackEvidence): Promise<ShipFrgEvidence>;
   convergeReleasePrepare(intent: ShipIntent, frg: ShipFrgEvidence): Promise<ShipReleaseEvidence>;
   convergeReleaseFinish(intent: ShipIntent, release: ShipReleaseEvidence): Promise<ShipReleaseFinishEvidence>;
+  convergeTag(intent: ShipIntent, release: ShipReleaseFinishEvidence): Promise<ShipTagEvidence>;
   waitForRelease(intent: ShipIntent, release: ShipReleaseFinishEvidence): Promise<ShipPublicationEvidence>;
   convergeEnginePromote(intent: ShipIntent, publication: ShipPublicationEvidence): Promise<ShipPromotionEvidence>;
   convergeDeployment(intent: ShipIntent, promotion: ShipPromotionEvidence): Promise<ShipDeploymentEvidence>;
@@ -439,6 +450,7 @@ const EMPTY_PROGRESS: ShipProgress = {
   frg: null,
   release: null,
   release_finish: null,
+  tag: null,
   publication: null,
   promotion: null,
   deployment: null,
@@ -452,6 +464,7 @@ export function emptyShipProgress(): ShipProgress {
     frg: null,
     release: null,
     release_finish: null,
+    tag: null,
     publication: null,
     promotion: null,
     deployment: null,
@@ -778,13 +791,25 @@ function validateProgress(
     }
     requireOid(progress.release_finish.merge_commit_oid, "release merge_commit_oid");
   }
+  if (progress.tag) {
+    if (!progress.release_finish || progress.tag.version !== intent.version ||
+        progress.tag.tag !== expectedTag(intent.version)) {
+      throw new Error("ship reconciliation: tag evidence does not match the release");
+    }
+    requireOid(progress.tag.peeled_commit, "tag peeled_commit");
+    if (progress.tag.peeled_commit !== progress.release_finish.merge_commit_oid) {
+      throw new Error("ship reconciliation: tag peel does not match the release merge commit");
+    }
+  }
   if (progress.publication) {
-    if (!progress.release_finish || !progress.publication.published ||
+    if (!progress.release_finish || !progress.tag || !progress.publication.published ||
         progress.publication.version !== intent.version || progress.publication.tag !== expectedTag(intent.version)) {
       throw new Error("ship reconciliation: publication evidence does not match the release");
     }
     requireOid(progress.publication.artifact_digest, "publication artifact_digest");
-    if (progress.publication.artifact_digest !== progress.release_finish.merge_commit_oid) {
+    if (progress.publication.artifact_digest !== progress.release_finish.merge_commit_oid ||
+        progress.publication.tag !== progress.tag.tag ||
+        progress.publication.artifact_digest !== progress.tag.peeled_commit) {
       throw new Error("ship reconciliation: publication digest does not match the release merge commit");
     }
   }
@@ -812,6 +837,9 @@ function validateProgress(
     }
   }
   const lineage = projectCandidateLineage(progress);
+  if (progress.publication && !lineageHasPriorEdges(lineage, "publication")) {
+    throw new Error("ship reconciliation: publication requires a proven origin tag");
+  }
   if (progress.lineage) {
     for (const key of Object.keys(EMPTY_CANDIDATE_LINEAGE) as (keyof CandidateLineage)[]) {
       const expected = lineage[key];
@@ -830,7 +858,7 @@ function nextAction(progress: ShipProgress, releaseModel: ShipReleaseModel = "se
   if (!progress.frg) return "frg_score";
   if (!progress.release) return "release_prepare";
   if (!progress.release_finish) return "release_finish";
-  if (!progress.publication) return "release_wait";
+  if (!progress.tag || !progress.publication) return "release_wait";
   if (!progress.promotion) return "engine_promote";
   if (!progress.deployment) return "deploy";
   return "complete";
@@ -885,6 +913,7 @@ function isPendingReleaseCheckCheckpoint(err: unknown): boolean {
 function attachLineage(progress: ShipProgress): ShipProgress {
   return {
     ...progress,
+    tag: progress.tag ?? null,
     deployment: progress.deployment ?? null,
     lineage: projectCandidateLineage(progress),
   };
@@ -1218,6 +1247,10 @@ export async function runShipCoordinator(
   }
   if (!status.release_finish) {
     await run("release_finish", () => deps.convergeReleaseFinish(expected, status.release!), (release_finish) => ({ ...status, release_finish }));
+    if (waitCheckpoint) return status;
+  }
+  if (!status.tag) {
+    await run("release_wait", () => deps.convergeTag(expected, status.release_finish!), (tag) => ({ ...status, tag }));
     if (waitCheckpoint) return status;
   }
   if (!status.publication) {

@@ -149,6 +149,8 @@ export interface ShipLineageEvidence {
   frg?: { candidate_head_oid: string; frg_run_id: string } | null;
   release?: { pr: number; head_oid: string; candidate_head_oid: string } | null;
   release_finish?: { merge_commit_oid: string; pr: number; head_oid: string } | null;
+  /** Origin-observed annotated tag. Independent of GitHub Release publication. */
+  tag?: { tag: string; peeled_commit: string } | null;
   publication?: { tag: string; artifact_digest?: string | null; published?: boolean } | null;
   promotion?: { tag: string; pin_digest?: string | null } | null;
   deployment?: {
@@ -202,13 +204,15 @@ export function projectCandidateLineage(evidence: ShipLineageEvidence): Candidat
       observer: "merged PR merge-commit OID",
     };
   }
-  if (evidence.publication?.published && evidence.publication.artifact_digest) {
-    const digest = oidIdentity(evidence.publication.artifact_digest, "published_artifact");
+  if (evidence.tag?.peeled_commit) {
     lineage.tag = {
       kind: "tag",
-      identity: `${evidence.publication.tag}@${digest}`,
+      identity: `${evidence.tag.tag}@${oidIdentity(evidence.tag.peeled_commit, "tag")}`,
       observer: "origin annotated tag peeled commit",
     };
+  }
+  if (evidence.publication?.published && evidence.publication.artifact_digest) {
+    const digest = oidIdentity(evidence.publication.artifact_digest, "published_artifact");
     lineage.published_artifact = {
       kind: "published_artifact",
       identity: digest,
@@ -248,8 +252,9 @@ export function lineageHasPriorEdges(
     case "release_finish":
       return Boolean(lineage.release_pr_head);
     case "tag":
-    case "publication":
       return Boolean(lineage.release_merge_result);
+    case "publication":
+      return Boolean(lineage.tag);
     case "promotion":
       return Boolean(lineage.published_artifact && lineage.tag);
     case "deployment":

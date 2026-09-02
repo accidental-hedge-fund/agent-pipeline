@@ -86,6 +86,7 @@ import {
   type ShipReleaseEvidence,
   type ShipReleaseFinishEvidence,
   type ShipStateStore,
+  type ShipTagEvidence,
   type ShipTrainEvidence,
   type ShipTrainPlan,
 } from "./ship.ts";
@@ -170,6 +171,14 @@ export interface ShipAdapterOperations {
   observeRelease(intent: ShipIntent, candidateHeadOid?: string): Promise<ObservedRelease | null>;
   prepareRelease(intent: ShipIntent, candidateHeadOid: string): Promise<ShipReleaseEvidence>;
   finishRelease(intent: ShipIntent, release: ShipReleaseEvidence): Promise<ShipReleaseFinishEvidence>;
+  observeTag(
+    intent: ShipIntent,
+    release: ShipReleaseFinishEvidence,
+  ): Promise<ShipTagEvidence | null>;
+  ensureTag(
+    intent: ShipIntent,
+    release: ShipReleaseFinishEvidence,
+  ): Promise<ShipTagEvidence>;
   observePublication(
     intent: ShipIntent,
     release: ShipReleaseFinishEvidence,
@@ -264,6 +273,80 @@ export async function verifyAnnotatedReleaseTag(
   if (peeled !== expected) {
     throw new Error(`ship release: ${tag} does not point to the release merge commit`);
   }
+}
+
+/**
+ * Observe an origin annotated tag bound to the merge commit.
+ * A missing origin tag is not complete. A wrong origin tag fails closed.
+ * Does not create or push a tag.
+ */
+export async function observeOriginReleaseTag(opts: {
+  version: string;
+  mergeCommitOid: string;
+  git: (args: string[]) => Promise<string>;
+}): Promise<ShipTagEvidence | null> {
+  const tag = expectedTag(opts.version);
+  const localRef = `refs/tags/${tag}`;
+  const observeRef = `refs/tags/${tag}-origin-observe`;
+  const merge = requireOid(opts.mergeCommitOid, "ship release merge commit");
+  try {
+    await opts.git(["fetch", "origin", `${localRef}:${observeRef}`]);
+  } catch (err) {
+    if (isReleaseTagInvariantError(err)) throw err;
+    return null;
+  }
+  await verifyAnnotatedReleaseTag(tag, merge, opts.git, observeRef);
+  return {
+    version: opts.version,
+    tag,
+    peeled_commit: merge,
+  };
+}
+
+export type LivePinDeploymentObservation =
+  | { kind: "verified"; evidence: ShipDeploymentEvidence }
+  | { kind: "pending" }
+  | { kind: "stale_promotion" };
+
+/**
+ * Bind deployment completion to the live production pin identity.
+ * Same-version pin retarget (tag or git_sha movement) is stale promotion,
+ * not verified deployment, even when hosts still run the prior digest.
+ */
+export function observeDeploymentAgainstLivePin(opts: {
+  intent: { version: string };
+  promotion: { tag: string; pin_digest: string };
+  pin: {
+    kind: string;
+    pin?: { version?: string; tag?: string; git_sha?: string | null };
+  };
+  hostObservations: ReadonlyArray<{ host: string; digest: string | null }>;
+}): LivePinDeploymentObservation {
+  const pinDigest = opts.pin.kind === "ok"
+    ? String(opts.pin.pin?.git_sha ?? "").trim().toLowerCase()
+    : "";
+  const pinTag = opts.pin.kind === "ok" ? String(opts.pin.pin?.tag ?? "") : "";
+  if (
+    opts.pin.kind !== "ok" ||
+    opts.pin.pin?.version !== opts.intent.version ||
+    pinTag !== opts.promotion.tag ||
+    pinDigest !== opts.promotion.pin_digest
+  ) {
+    return { kind: "stale_promotion" };
+  }
+  const match = matchingLiveDigestForHosts(opts.hostObservations, pinDigest);
+  if (!match.ok) return { kind: "pending" };
+  return {
+    kind: "verified",
+    evidence: {
+      version: opts.intent.version,
+      tag: pinTag,
+      environment: "all",
+      authorized_digest: pinDigest,
+      live_digest: match.digest,
+      verified: true,
+    },
+  };
 }
 
 function isReleaseTagInvariantError(err: unknown): boolean {
@@ -633,13 +716,28 @@ export function shipCoordinatorDepsFromOperations(
         : release.finish;
       if (!release.finish) return progress;
 
+      progress.tag = await operations.observeTag(intent, release.finish);
+      if (!progress.tag) return progress;
+
       progress.publication = await operations.observePublication(intent, release.finish);
       if (!progress.publication) return progress;
       progress.promotion = await operations.observePromotion(intent, progress.publication);
       if (!progress.promotion) return progress;
-      progress.deployment = operations.observeDeployment
+      const observedDeployment = operations.observeDeployment
         ? await operations.observeDeployment(intent, progress.promotion)
         : null;
+      if (!observedDeployment) {
+        // Live pin movement invalidates stale promotion/deployment evidence.
+        const livePromotion = await operations.observePromotion(intent, progress.publication);
+        if (!livePromotion ||
+            livePromotion.tag !== progress.promotion.tag ||
+            livePromotion.pin_digest !== progress.promotion.pin_digest) {
+          progress.promotion = null;
+        }
+        progress.deployment = null;
+        return progress;
+      }
+      progress.deployment = observedDeployment;
       return progress;
     },
 
@@ -742,6 +840,11 @@ export function shipCoordinatorDepsFromOperations(
       const latest = await requirePreparedRelease();
       if (latest.finish) return latest.finish;
       return operations.finishRelease(intent, release);
+    },
+
+    async convergeTag(intent, release) {
+      return await operations.observeTag(intent, release) ??
+        operations.ensureTag(intent, release);
     },
 
     async waitForRelease(intent, release) {
@@ -1191,8 +1294,20 @@ function realShipAdapterOperations(opts: RealShipCoordinatorDepsOptions): ShipAd
         merge_commit_oid: requireOid(result.mergeCommitOid, "ship release merge commit"),
       };
     },
-    observePublication,
-    async waitForPublication(intent, release) {
+    async observeTag(intent, release) {
+      return observeOriginReleaseTag({
+        version: intent.version,
+        mergeCommitOid: release.merge_commit_oid,
+        git,
+      });
+    },
+    async ensureTag(intent, release) {
+      const existing = await observeOriginReleaseTag({
+        version: intent.version,
+        mergeCommitOid: release.merge_commit_oid,
+        git,
+      });
+      if (existing) return existing;
       await ensureAnnotatedReleaseTag({
         version: intent.version,
         mergeCommitOid: release.merge_commit_oid,
@@ -1201,6 +1316,18 @@ function realShipAdapterOperations(opts: RealShipCoordinatorDepsOptions): ShipAd
         validateFrg: async () =>
           (await validateFrgEvidenceSnapshotForTag(opts.repoDir, intent.version)).snapshot,
       });
+      const observed = await observeOriginReleaseTag({
+        version: intent.version,
+        mergeCommitOid: release.merge_commit_oid,
+        git,
+      });
+      if (!observed) {
+        throw new Error("ship tag: origin did not observe the annotated tag after ensure");
+      }
+      return observed;
+    },
+    observePublication,
+    async waitForPublication(intent, release) {
       for (let attempt = 0; attempt < RELEASE_WAIT_ATTEMPTS; attempt++) {
         const observed = await observePublication(intent, release);
         if (observed) return observed;
@@ -1260,20 +1387,34 @@ function realShipAdapterOperations(opts: RealShipCoordinatorDepsOptions): ShipAd
       for (const host of selectedPromoteHosts(DEFAULT_ENGINE_PROMOTE_HOST)) {
         observations.push({ host, digest: await engineDeps.installedDigest(host) });
       }
-      const match = matchingLiveDigestForHosts(observations, promotion.pin_digest);
-      if (pin.kind !== "ok" || pin.pin.version !== intent.version || !match.ok) {
-        return null;
-      }
-      return {
-        version: intent.version,
-        tag: promotion.tag,
-        environment: "all",
-        authorized_digest: promotion.pin_digest,
-        live_digest: match.digest,
-        verified: true,
-      };
+      const observed = observeDeploymentAgainstLivePin({
+        intent,
+        promotion,
+        pin,
+        hostObservations: observations,
+      });
+      if (observed.kind === "verified") return observed.evidence;
+      return null;
     },
     async deploy(intent, promotion) {
+      const pinBefore = await engineDeps.loadPin({ repoDir: opts.repoDir });
+      const hosts = selectedPromoteHosts(DEFAULT_ENGINE_PROMOTE_HOST);
+      const observationsBefore = [];
+      for (const host of hosts) {
+        observationsBefore.push({ host, digest: await engineDeps.installedDigest(host) });
+      }
+      const before = observeDeploymentAgainstLivePin({
+        intent,
+        promotion,
+        pin: pinBefore,
+        hostObservations: observationsBefore,
+      });
+      if (before.kind === "stale_promotion") {
+        throw new Error(
+          "ship deployment: production pin no longer matches the authorized promotion target",
+        );
+      }
+      if (before.kind === "verified") return before.evidence;
       const result = await runEnginePromote({
         version: intent.version,
         repoDir: opts.repoDir,
@@ -1284,22 +1425,26 @@ function realShipAdapterOperations(opts: RealShipCoordinatorDepsOptions): ShipAd
       if (!result.verified || result.error) {
         throw new Error(`ship deployment: ${result.error ?? "live digest was not verified"}`);
       }
-      const observations = [];
-      for (const host of selectedPromoteHosts(DEFAULT_ENGINE_PROMOTE_HOST)) {
-        observations.push({ host, digest: await engineDeps.installedDigest(host) });
+      const pinAfter = await engineDeps.loadPin({ repoDir: opts.repoDir });
+      const observationsAfter = [];
+      for (const host of hosts) {
+        observationsAfter.push({ host, digest: await engineDeps.installedDigest(host) });
       }
-      const match = matchingLiveDigestForHosts(observations, promotion.pin_digest);
-      if (!match.ok) {
-        throw new Error(`ship deployment: ${match.reason}`);
+      const after = observeDeploymentAgainstLivePin({
+        intent,
+        promotion,
+        pin: pinAfter,
+        hostObservations: observationsAfter,
+      });
+      if (after.kind === "stale_promotion") {
+        throw new Error(
+          "ship deployment: production pin no longer matches the authorized promotion target",
+        );
       }
-      return {
-        version: intent.version,
-        tag: promotion.tag,
-        environment: "all",
-        authorized_digest: promotion.pin_digest,
-        live_digest: match.digest,
-        verified: true,
-      };
+      if (after.kind !== "verified") {
+        throw new Error("ship deployment: live digest was not verified");
+      }
+      return after.evidence;
     },
   };
 }
@@ -2210,11 +2355,13 @@ export function bindCandidateShipEndOperations(
       }
       return observed.finish;
     },
-    async waitForPublication(intent, release) {
+    async ensureTag(intent, release) {
       const engine = await requireCandidate(release.candidate_head_oid);
       if (!shouldSpawn(release.candidate_head_oid)) {
-        return pinOps.waitForPublication(intent, release);
+        return pinOps.ensureTag(intent, release);
       }
+      const existing = await pinOps.observeTag(intent, release);
+      if (existing) return existing;
       if (typeof ctx.spawnEnsureTag === "function") {
         await ctx.spawnEnsureTag(engine, {
           version: intent.version,
@@ -2238,17 +2385,11 @@ export function bindCandidateShipEndOperations(
           );
         }
       }
-      for (let attempt = 0; attempt < RELEASE_WAIT_ATTEMPTS; attempt++) {
-        const observed = await pinOps.observePublication(intent, release);
-        if (observed) return observed;
-        if (attempt + 1 < RELEASE_WAIT_ATTEMPTS) {
-          await new Promise<void>((resolve) => setTimeout(resolve, RELEASE_WAIT_MS));
-        }
+      const observed = await pinOps.observeTag(intent, release);
+      if (!observed) {
+        throw new Error("ship tag: origin did not observe the annotated tag after ensure");
       }
-      throw new Error(
-        `ship release: timed out waiting for published GitHub Release v${intent.version}; ` +
-          "verify the release workflow, then retry the same ship command",
-      );
+      return observed;
     },
   };
 }

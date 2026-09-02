@@ -22,6 +22,7 @@ import {
   listRemainingOpenMilestoneIssueNumbers,
   remainingOpenMilestoneIssuesError,
   emptyShipProgress,
+  lineageHasPriorEdges,
   projectCandidateLineage,
   projectShipStatusView,
   shipPhaseInvariant,
@@ -128,6 +129,11 @@ const completeProgress = (): ShipProgress => {
       merged: true,
       merge_commit_oid: MERGE,
     },
+    tag: {
+      version: intent.version,
+      tag: `v${intent.version}`,
+      peeled_commit: MERGE,
+    },
     publication: {
       version: intent.version,
       tag: `v${intent.version}`,
@@ -230,6 +236,11 @@ function makeDeps(
       calls.push("release-finish");
       assert.equal(release.head_oid, HEAD);
       return structuredClone(progress.release_finish!);
+    },
+    async convergeTag(_intent, release) {
+      calls.push("tag");
+      assert.equal(release.merge_commit_oid, MERGE);
+      return structuredClone(progress.tag!);
     },
     async waitForRelease(_intent, release) {
       calls.push("release-wait");
@@ -340,6 +351,7 @@ test("ship coordinator composes the existing capabilities in one fixed order", a
     "frg-score",
     "release-prepare",
     "release-finish",
+    "tag",
     "release-wait",
     "engine-promote",
     "engine-deploy",
@@ -361,6 +373,7 @@ test("ship coordinator composes the existing capabilities in one fixed order", a
       "frg_score:started", "frg_score:completed",
       "release_prepare:started", "release_prepare:completed",
       "release_finish:started", "release_finish:completed",
+      "release_wait:started", "release_wait:completed",
       "release_wait:started", "release_wait:completed",
       "engine_promote:started", "engine_promote:completed",
       "deploy:started", "deploy:completed",
@@ -460,6 +473,7 @@ test("ship coordinator reuses the frozen train plan after crash instead of repla
     "frg-score",
     "release-prepare",
     "release-finish",
+    "tag",
     "release-wait",
     "engine-promote",
     "engine-deploy",
@@ -505,13 +519,14 @@ test("ship coordinator recovers a release side effect that overtook local status
   await seedFrozenTrainPlan(store);
   const progress = completeProgress();
   progress.release_finish = null;
+  progress.tag = null;
   progress.publication = null;
   progress.promotion = null;
   progress.deployment = null;
   const deps = makeDeps(store, progress);
 
   const result = await runShipCoordinator(intent, authorization(), deps);
-  assert.deepEqual(deps.calls, ["reconcile", "release-finish", "release-wait", "engine-promote", "engine-deploy"]);
+  assert.deepEqual(deps.calls, ["reconcile", "release-finish", "tag", "release-wait", "engine-promote", "engine-deploy"]);
   assert.equal(result.complete, true);
 });
 
@@ -595,7 +610,7 @@ test("default ship store atomically publishes typed status and appends exact-run
     assert.equal(store.statusFile(shipKey(intent)), path.join(root, "ships", shipKey(intent), "status.json"));
     assert.equal(result.events_file, store.eventsFile(shipKey(intent)));
     const eventLines = (await fs.readFile(result.events_file, "utf8")).trim().split("\n");
-    assert.equal(eventLines.length, 19);
+    assert.equal(eventLines.length, 21);
     assert.equal((JSON.parse(eventLines.at(-1)!) as ShipPhaseEvent).phase, "complete");
     assert.deepEqual(
       (await fs.readdir(path.dirname(store.statusFile(shipKey(intent))))).sort(),
@@ -692,6 +707,7 @@ test("ship coordinator pending wait-cap expiry stays resumable (#1205)", async (
 
   const observed = completeProgress();
   observed.release_finish = null;
+  observed.tag = null;
   observed.publication = null;
   observed.promotion = null;
   observed.deployment = null;
@@ -997,6 +1013,43 @@ test("candidate lineage round-trips distinct identities without collapsing to a 
   assert.ok(identities.every((id) => id && id !== intent.version && id !== "1.34.0"));
   assert.notEqual(lineage.integrated_candidate?.identity, lineage.release_pr_head?.identity);
   assert.notEqual(lineage.release_pr_head?.identity, lineage.release_merge_result?.identity);
+});
+
+test("tag lineage node is projected before publication exists (#1331)", () => {
+  const progress = completeProgress();
+  progress.publication = null;
+  progress.promotion = null;
+  progress.deployment = null;
+  const lineage = projectCandidateLineage(progress);
+  assert.equal(lineage.tag?.identity, `v1.34.0@${MERGE}`);
+  assert.equal(lineage.published_artifact, null);
+  assert.equal(lineageHasPriorEdges(lineage, "publication"), true);
+  assert.equal(lineageHasPriorEdges(lineage, "promotion"), false);
+});
+
+test("publication prerequisite requires a proven origin tag (#1331)", () => {
+  const progress = completeProgress();
+  progress.tag = null;
+  progress.publication = null;
+  progress.promotion = null;
+  progress.deployment = null;
+  const lineage = projectCandidateLineage(progress);
+  assert.equal(lineage.tag, null);
+  assert.equal(lineageHasPriorEdges(lineage, "tag"), true);
+  assert.equal(lineageHasPriorEdges(lineage, "publication"), false);
+});
+
+test("publication without an origin tag cannot complete (#1331)", async () => {
+  const store = memoryStore();
+  await seedFrozenTrainPlan(store);
+  const observed = completeProgress();
+  observed.tag = null;
+  const deps = makeDeps(store, observed);
+  await assert.rejects(
+    runShipCoordinator(intent, authorization(), deps),
+    /publication evidence does not match the release|publication requires a proven origin tag/,
+  );
+  assert.equal(store.status?.publication, null);
 });
 
 test("missing observer proof cannot complete a post-ready phase (#1331)", async () => {
