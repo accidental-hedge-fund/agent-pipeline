@@ -286,6 +286,7 @@ function exclusiveCreatePlantsCompetitor(
       ...competitor,
       observation_id: `${competitor.logical_operation_id}:${competitor.form_id}:${competitor.operation}`,
       recorded_at: "2026-01-01T00:00:00Z",
+      claim_revision: 1,
     }), { encoding: "utf8" });
     const err = new Error("EEXIST") as NodeJS.ErrnoException;
     err.code = "EEXIST";
@@ -356,6 +357,89 @@ test("EEXIST after a concurrent cooling write does not let admission discard the
     assert.ok(loaded);
     assert.equal(loaded.lifecycle, "cooling");
     assert.equal(loaded.fault, "mechanical");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("active admission cannot overwrite a persisted cooling fault", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pipeline-obs-mono-active-"));
+  try {
+    const identity = {
+      operation: "engine_promote",
+      form_id: "engine-promote",
+      domain: "engine",
+      logical_operation_id: "lop-engine-mono-active",
+      repository: "/repo",
+    };
+    persistOperationObservation(ownedAdmissionObservation({
+      ...identity,
+      message: "admitted",
+    }), dir);
+    persistOperationObservation(mechanicalFaultObservation({
+      ...identity,
+      message: "promote failed",
+      fault: "mechanical",
+    }), dir);
+    const stale = persistOperationObservation(ownedAdmissionObservation({
+      ...identity,
+      message: "retry admission",
+    }), dir);
+    assert.equal(stale.lifecycle, "cooling");
+    assert.equal(stale.fault, "mechanical");
+    const loaded = loadOwnedOperationClaim(identity.domain, identity.logical_operation_id, dir);
+    assert.ok(loaded);
+    assert.equal(loaded.lifecycle, "cooling");
+    assert.equal(loaded.fault, "mechanical");
+    assert.equal(loaded.message, "promote failed");
+    assert.equal(consumeOwnedOperation(loaded).owned, true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("concurrent active admission cannot overwrite a cooling fault", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pipeline-obs-cas-active-fault-"));
+  try {
+    const identity = {
+      operation: "engine_promote",
+      form_id: "engine-promote",
+      domain: "engine",
+      logical_operation_id: "lop-engine-cas-active-fault",
+      repository: "/repo",
+    };
+    const admission = ownedAdmissionObservation({
+      ...identity,
+      message: "admitted",
+    });
+    const staleAdmission = ownedAdmissionObservation({
+      ...identity,
+      message: "retry admission",
+    });
+    const fault = mechanicalFaultObservation({
+      ...identity,
+      message: "promote failed",
+      fault: "mechanical",
+    });
+    persistOperationObservation(admission, dir);
+    let injected = false;
+    const persisted = persistOperationObservation(staleAdmission, dir, {
+      afterRead(existing) {
+        if (injected || existing?.lifecycle !== "active") return;
+        injected = true;
+        persistOperationObservation(fault, dir);
+      },
+    });
+    assert.equal(injected, true);
+    assert.equal(persisted.lifecycle, "cooling");
+    assert.equal(persisted.fault, "mechanical");
+    assert.equal(persisted.complete, false);
+    const loaded = loadOwnedOperationClaim(identity.domain, identity.logical_operation_id, dir);
+    assert.ok(loaded);
+    assert.equal(loaded.lifecycle, "cooling");
+    assert.equal(loaded.fault, "mechanical");
+    assert.equal(loaded.message, "promote failed");
+    assert.equal(consumeOwnedOperation(loaded).owned, true);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

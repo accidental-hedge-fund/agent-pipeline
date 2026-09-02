@@ -66,6 +66,13 @@ Every form with `execution_disposition: supervised-lifecycle` SHALL act as an op
 - **AND** it SHALL NOT mark the Logical Operation complete, cancelled, or human-owned
 - **AND** RecoverySupervisor SHALL retain ownership
 
+#### Scenario: Stale active admission cannot overwrite cooling
+
+- **WHEN** a cooling observation is persisted for a Logical Operation
+- **AND** a concurrent or delayed active admission is persisted for the same domain and logical_operation_id
+- **THEN** the durable claim SHALL remain cooling
+- **AND** the fault evidence SHALL remain available to RecoverySupervisor
+
 #### Scenario: Supervised mechanical process.exit is forbidden
 
 - **WHEN** a static or unit guard inspects a supervised-lifecycle command module

@@ -7,7 +7,9 @@
 //
 // Persistence is a claim adapter: one atomic record per (domain,
 // logical_operation_id), stored under pipeline state-home (not anonymous
-// /tmp files). Recovery consumes that claim by identity.
+// /tmp files). Transitions are monotonic and compare-and-swap retried so
+// a stale active admission cannot overwrite cooling/waiting/complete.
+// Recovery consumes that claim by identity.
 
 import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
@@ -58,6 +60,8 @@ export interface PersistedOperationObservation extends OperationObservation {
   observation_id: string;
   recorded_at: string;
   transitioned_at?: string;
+  /** Monotonic CAS token. Absent on records written before claim CAS. */
+  claim_revision?: number;
 }
 
 export function resolveOperationClaimDir(env: NodeJS.ProcessEnv = process.env): string {
@@ -145,13 +149,179 @@ function writeClaimAtomic(file: string, record: PersistedOperationObservation): 
   fs.renameSync(tmp, file);
 }
 
+const CLAIM_CAS_ATTEMPTS = 16;
+
+const LIFECYCLE_RANK: Record<ObservationLifecycleState, number> = {
+  active: 0,
+  cooling: 1,
+  waiting: 1,
+  complete: 2,
+};
+
+function lifecycleMayAdvance(
+  from: ObservationLifecycleState,
+  to: ObservationLifecycleState,
+): boolean {
+  return LIFECYCLE_RANK[to] >= LIFECYCLE_RANK[from];
+}
+
+function claimRevisionOf(record: PersistedOperationObservation | null): number {
+  return record?.claim_revision ?? 0;
+}
+
+function isDuplicateClaim(existing: PersistedOperationObservation, obs: OperationObservation): boolean {
+  return (
+    existing.lifecycle === obs.lifecycle &&
+    existing.fault === obs.fault &&
+    existing.complete === obs.complete &&
+    existing.message === obs.message
+  );
+}
+
+function decideNextClaim(
+  existing: PersistedOperationObservation | null,
+  obs: OperationObservation,
+  recorded_at: string,
+): PersistedOperationObservation {
+  if (!existing) {
+    return {
+      ...obs,
+      observation_id: stableObservationId(obs),
+      recorded_at,
+      claim_revision: 1,
+    };
+  }
+  if (!lifecycleMayAdvance(existing.lifecycle, obs.lifecycle)) return existing;
+  if (sameClaimIdentity(existing, obs) && isDuplicateClaim(existing, obs)) return existing;
+  if (sameClaimIdentity(existing, obs)) {
+    return {
+      ...existing,
+      ...obs,
+      observation_id: existing.observation_id,
+      recorded_at: existing.recorded_at,
+      transitioned_at: recorded_at,
+      claim_revision: claimRevisionOf(existing) + 1,
+    };
+  }
+  return {
+    ...obs,
+    observation_id: stableObservationId(obs),
+    recorded_at,
+    claim_revision: claimRevisionOf(existing) + 1,
+  };
+}
+
+function claimCasEqual(
+  current: PersistedOperationObservation | null,
+  expected: PersistedOperationObservation | null,
+): boolean {
+  if (current === null || expected === null) return current === expected;
+  return (
+    claimRevisionOf(current) === claimRevisionOf(expected) &&
+    current.observation_id === expected.observation_id &&
+    current.lifecycle === expected.lifecycle
+  );
+}
+
+function isProcessAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function reclaimStaleClaimLock(lockPath: string): boolean {
+  let holder = 0;
+  try {
+    holder = Number.parseInt(fs.readFileSync(lockPath, "utf8"), 10);
+  } catch {
+    return false;
+  }
+  if (!Number.isInteger(holder) || holder <= 0) return false;
+  if (holder !== process.pid && isProcessAlive(holder)) return false;
+  try {
+    fs.unlinkSync(lockPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function withClaimCasLock(lockPath: string, fn: () => boolean): boolean {
+  const runLocked = (): boolean => {
+    const fd = fs.openSync(lockPath, "wx");
+    try {
+      fs.writeSync(fd, String(process.pid));
+      return fn();
+    } finally {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* already closed */
+      }
+      try {
+        fs.unlinkSync(lockPath);
+      } catch {
+        /* lock already gone */
+      }
+    }
+  };
+  try {
+    return runLocked();
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code !== "EEXIST") throw err;
+    if (!reclaimStaleClaimLock(lockPath)) return false;
+    try {
+      return runLocked();
+    } catch (retryErr) {
+      const re = retryErr as NodeJS.ErrnoException;
+      if (re.code === "EEXIST") return false;
+      throw retryErr;
+    }
+  }
+}
+
 export type PersistOperationObservationDeps = {
   /** Exclusive create (`wx`). Tests inject EEXIST races. */
   exclusiveCreate?: (file: string, contents: string) => void;
+  /** Test seam: runs after the claim is read and before CAS. */
+  afterRead?: (existing: PersistedOperationObservation | null) => void;
 };
 
 function exclusiveCreateClaim(file: string, contents: string): void {
   fs.writeFileSync(file, contents, { encoding: "utf8", flag: "wx" });
+}
+
+function compareAndSwapClaim(
+  file: string,
+  expected: PersistedOperationObservation | null,
+  next: PersistedOperationObservation,
+  deps: PersistOperationObservationDeps,
+): boolean {
+  if (expected === null) {
+    try {
+      (deps.exclusiveCreate ?? exclusiveCreateClaim)(file, JSON.stringify(next));
+      return true;
+    } catch (err) {
+      const e = err as NodeJS.ErrnoException;
+      if (e.code === "EEXIST") return false;
+      throw err;
+    }
+  }
+  return withClaimCasLock(`${file}.caslock`, () => {
+    const current = readClaimFile(file);
+    if (!claimCasEqual(current, expected)) return false;
+    writeClaimAtomic(file, next);
+    return true;
+  });
 }
 
 /** Persist one observation as an atomic claim keyed by domain + logical operation. */
@@ -167,67 +337,18 @@ export function persistOperationObservation(
   const key = operationClaimKey(obs.domain, obs.logical_operation_id);
   const file = path.join(dir, observationFileName(key));
   const recorded_at = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
-  let createRace = false;
-  for (let attempt = 0; attempt < 8; attempt++) {
+  for (let attempt = 0; attempt < CLAIM_CAS_ATTEMPTS; attempt++) {
     const existing = readClaimFile(file);
-    if (existing && sameClaimIdentity(existing, obs)) {
-      const duplicate =
-        existing.lifecycle === obs.lifecycle &&
-        existing.fault === obs.fault &&
-        existing.complete === obs.complete &&
-        existing.message === obs.message;
-      if (duplicate) return existing;
-      // Concurrent create: an admission wx winner must not discard a cooling/fault
-      // report that lost the exclusive create.
-      if (
-        createRace &&
-        obs.lifecycle === "active" &&
-        obs.fault === null &&
-        obs.complete === false &&
-        (existing.fault !== null ||
-          existing.complete ||
-          existing.lifecycle === "cooling" ||
-          existing.lifecycle === "waiting" ||
-          existing.lifecycle === "complete")
-      ) {
-        return existing;
-      }
-      const next: PersistedOperationObservation = {
-        ...existing,
-        ...obs,
-        observation_id: existing.observation_id,
-        recorded_at: existing.recorded_at,
-        transitioned_at: recorded_at,
-      };
-      writeClaimAtomic(file, next);
-      return next;
-    }
-    const record: PersistedOperationObservation = {
-      ...obs,
-      observation_id: stableObservationId(obs),
-      recorded_at,
-    };
-    if (existing === null) {
-      try {
-        (deps.exclusiveCreate ?? exclusiveCreateClaim)(file, JSON.stringify(record));
-        return record;
-      } catch (err) {
-        const e = err as NodeJS.ErrnoException;
-        if (e.code !== "EEXIST") throw err;
-        createRace = true;
-        continue;
-      }
-    }
-    writeClaimAtomic(file, record);
-    return record;
+    deps.afterRead?.(existing);
+    const next = decideNextClaim(existing, obs, recorded_at);
+    if (existing && next === existing) return existing;
+    if (compareAndSwapClaim(file, existing, next, deps)) return next;
+    sleepSync(1);
   }
-  const record: PersistedOperationObservation = {
-    ...obs,
-    observation_id: stableObservationId(obs),
-    recorded_at,
-  };
-  writeClaimAtomic(file, record);
-  return record;
+  const existing = readClaimFile(file);
+  const next = decideNextClaim(existing, obs, recorded_at);
+  if (existing && next === existing) return existing;
+  throw new Error("operation observation: claim CAS retries exhausted");
 }
 
 export function loadOwnedOperationClaim(
