@@ -752,6 +752,8 @@ export interface LoopCoolingRecord {
     | "supervisor_no_progress"
     | "supervisor_cycle_cap"
     | "worktree_capacity";
+  /** Quarantine evidence path when Cooling was entered for unreconstructable durable generation. */
+  quarantine_path?: string;
 }
 
 export interface LoopStopRecord {

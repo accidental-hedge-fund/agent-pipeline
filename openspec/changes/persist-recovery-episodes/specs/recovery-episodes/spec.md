@@ -200,6 +200,13 @@ The store SHALL detect a truncated, invalid, or partial durable generation of a 
 - **THEN** the store SHALL NOT treat that temporary file as the published generation
 - **AND** the previously durable document SHALL remain the live generation when it still parses
 
+#### Scenario: Unreconstructable generation stays owned as Cooling
+
+- **WHEN** a quarantined generation is detected
+- **AND** no last valid generation of the same document is readable
+- **THEN** the store SHALL persist Cooling or an external-condition wait with evidence of the quarantine
+- **AND** the Logical Operation SHALL remain owned
+
 ---
 
 ### Requirement: Mechanical terminal stop reasons SHALL become owned Cooling or waits

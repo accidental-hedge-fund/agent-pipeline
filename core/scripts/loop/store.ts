@@ -26,12 +26,15 @@ import {
   type LoopDecision,
   type LoopEvent,
   type LoopHumanInputRequest,
+  type LoopItemLedgerEntry,
   type LoopLedger,
   type LoopLockRecord,
   type LoopStopRecord,
   type LoopSupervisorProcess,
 } from "./types.ts";
 import {
+  buildCoolingRecord,
+  DURABLE_GENERATION_QUARANTINE_THEME,
   isTempWriteBasename,
   lastValidPathFor,
   PRIVATE_EPISODE_SCHEMA_BASENAME,
@@ -346,10 +349,101 @@ async function readPublishedDocument(
       }
     }
   }
+  const ownedWait = await persistUnreconstructableOwnedWait(deps, publishedPath, kind, quarantine);
+  if (ownedWait) return { ...ownedWait, quarantine };
   throw new LoopError(
     "validation",
     `quarantined invalid ${kind} generation at ${publishedPath} (${quarantine.reason}); reconstructed=${quarantine.reconstructed}; evidence=${quarantine.quarantine_path}`,
   );
+}
+
+function isQuarantineOwnedWait(ledger: LoopLedger): boolean {
+  return ledger.cooling?.theme === DURABLE_GENERATION_QUARANTINE_THEME && ledger.last_reconciliation == null;
+}
+
+function quarantineWaitBlocksMutation(current: LoopLedger, next: LoopLedger): boolean {
+  if (!isQuarantineOwnedWait(current)) return false;
+  if (next.last_reconciliation != null) return false;
+  return (
+    JSON.stringify(current.items) !== JSON.stringify(next.items) ||
+    JSON.stringify(current.recovery_attempts ?? []) !== JSON.stringify(next.recovery_attempts ?? [])
+  );
+}
+
+function pendingItemEntry(id: string): LoopItemLedgerEntry {
+  return { id, state: "pending", history: [], recovery_budgets_remaining: { default: 0 } };
+}
+
+function salvageItemsFromContract(value: unknown): Record<string, LoopItemLedgerEntry> {
+  const items: Record<string, LoopItemLedgerEntry> = {};
+  if (!isLoopContractShape(value)) return items;
+  for (const item of value.items) {
+    if (typeof item?.id === "string" && item.id.length > 0) items[item.id] = pendingItemEntry(item.id);
+  }
+  return items;
+}
+
+async function persistUnreconstructableOwnedWait(
+  deps: LoopStoreDeps,
+  publishedPath: string,
+  kind: "ledger" | "contract",
+  evidence: QuarantineEvidence,
+): Promise<{ text: string; value: unknown } | null> {
+  const dir = path.dirname(publishedPath);
+  const runId = path.basename(dir);
+  if (!SAFE_RUN_ID.test(runId)) return null;
+  const now = deps.now();
+  const nowIso = now.toISOString();
+  const cooling = buildCoolingRecord({
+    reason: "mechanical_exhaustion",
+    time: nowIso,
+    nextEligibleAt: new Date(now.getTime() + 60_000).toISOString(),
+    theme: DURABLE_GENERATION_QUARANTINE_THEME,
+    quarantinePath: evidence.quarantine_path,
+  });
+  const ledgerDest = ledgerPath(dir);
+  const contractDest = contractPath(dir);
+  const existingLedgerText = kind === "ledger" ? null : await deps.readTextFile(ledgerDest);
+  const existingLedger = existingLedgerText ? parseJsonObject(existingLedgerText) : undefined;
+  const existingContractText = await deps.readTextFile(contractDest);
+  const existingContract = existingContractText ? parseJsonObject(existingContractText) : undefined;
+
+  let waitLedger: LoopLedger;
+  if (isLoopLedgerShape(existingLedger)) {
+    waitLedger = {
+      ...existingLedger,
+      cooling,
+      stop: existingLedger.stop,
+    };
+  } else {
+    const items = salvageItemsFromContract(isLoopContractShape(existingContract) ? existingContract : undefined);
+    waitLedger = {
+      schema: LOOP_LEDGER_SCHEMA,
+      run_id: runId,
+      items,
+      consecutive_blocked: 0,
+      merge_barrier: null,
+      stop: null,
+      cooling,
+      last_native_goal_check: null,
+      last_reconciliation: null,
+      reconciliation_sequence: 0,
+      recovery_attempts: [],
+      authority_amendments: [],
+    };
+  }
+  const waitJson = JSON.stringify(waitLedger, null, 2);
+  await deps.writeFileAtomic(ledgerDest, waitJson);
+  await publishLastValid(deps, ledgerDest, waitJson);
+  await appendEventUnchecked(deps, runId, "loop_generation_quarantined", {
+    kind,
+    reason: evidence.reason,
+    evidence: evidence.quarantine_path,
+    reconstructed: false,
+    owned_wait: true,
+  }).catch(() => undefined);
+  if (kind === "ledger") return { text: waitJson, value: waitLedger };
+  return null;
 }
 
 async function publishLastValid(deps: LoopStoreDeps, publishedPath: string, content: string): Promise<void> {
@@ -389,7 +483,14 @@ export async function writeLedger(deps: LoopStoreDeps, ledger: LoopLedger, token
   const dir = runDir(deps, ledger.run_id);
   const dest = ledgerPath(dir);
   const current = await deps.readTextFile(dest);
-  if (current && isLoopLedgerShape(parseJsonObject(current))) {
+  const currentParsed = current ? parseJsonObject(current) : undefined;
+  if (isLoopLedgerShape(currentParsed) && quarantineWaitBlocksMutation(currentParsed, ledger)) {
+    throw new LoopError(
+      "validation",
+      `quarantined generation wait requires live reconciliation before mutation; evidence=${currentParsed.cooling?.quarantine_path ?? "missing"}`,
+    );
+  }
+  if (current && isLoopLedgerShape(currentParsed)) {
     await publishLastValid(deps, dest, current);
   }
   const content = JSON.stringify(ledger, null, 2);

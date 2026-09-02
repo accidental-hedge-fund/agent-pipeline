@@ -21,3 +21,10 @@ RecoverySupervisor SHALL record Recovery Episode treatment history through the e
 - **WHEN** a Recovery Episode treatment is persisted
 - **THEN** the shared recovery-attempt family SHALL carry invariant, candidate epoch, evidence identity, attempts per strategy, strategy cursor, and `next_eligible_at`
 - **AND** a fixture that stores those fields only in a private sidecar SHALL fail
+
+#### Scenario: Exhausting a stage treatment advances the strategy cursor
+
+- **WHEN** RecoverySupervisor records a claimed or exhausted stage treatment on the shared family
+- **THEN** the persisted strategy cursor SHALL advance to the next applicable configured treatment
+- **AND** a later process that resumes the same Recovery Episode SHALL NOT restart at the first treatment solely because the process restarted
+- **AND** a stored cursor SHALL NOT regress

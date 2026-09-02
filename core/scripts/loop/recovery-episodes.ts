@@ -255,6 +255,7 @@ export function buildCoolingRecord(input: {
   itemId?: string;
   theme?: string;
   historicalEvidence?: LoopCoolingRecord["historical_evidence"];
+  quarantinePath?: string;
 }): LoopCoolingRecord {
   return {
     reason: input.reason,
@@ -263,6 +264,7 @@ export function buildCoolingRecord(input: {
     ...(input.itemId ? { item_id: input.itemId } : {}),
     ...(input.theme ? { theme: input.theme } : {}),
     ...(input.historicalEvidence ? { historical_evidence: input.historicalEvidence } : {}),
+    ...(input.quarantinePath ? { quarantine_path: input.quarantinePath } : {}),
   };
 }
 
@@ -366,6 +368,39 @@ export function sameEpisodeKey(a: RecoveryEpisodeKey, b: RecoveryEpisodeKey): bo
     a.evidence_identity === b.evidence_identity
   );
 }
+
+const EPISODE_KEY_FIELDS = ["operation", "invariant", "candidate_epoch", "evidence_identity"] as const;
+
+/** Rejects absent or partial keys so claim and treatment cannot default apart. */
+export function assertCompleteRecoveryEpisodeKey(
+  key: RecoveryEpisodeKey | null | undefined,
+  context: string,
+): RecoveryEpisodeKey {
+  if (!key || typeof key !== "object") {
+    throw new LoopError("validation", `${context} requires a complete RecoveryEpisodeKey`);
+  }
+  const missing = EPISODE_KEY_FIELDS.filter((field) => typeof key[field] !== "string" || key[field].trim() === "");
+  if (missing.length > 0) {
+    throw new LoopError(
+      "validation",
+      `${context} requires a complete RecoveryEpisodeKey (missing ${missing.join(", ")})`,
+    );
+  }
+  return key;
+}
+
+export function assertCursorDoesNotRegress(previous: number, next: number): number {
+  if (!Number.isFinite(next) || next < 0) {
+    throw new LoopError("validation", `strategy cursor must be a non-negative number, got ${String(next)}`);
+  }
+  if (next < previous) {
+    throw new LoopError("validation", `strategy cursor cannot regress from ${previous} to ${next}`);
+  }
+  return next;
+}
+
+/** Theme stamped on Cooling when a durable generation cannot be reconstructed. */
+export const DURABLE_GENERATION_QUARANTINE_THEME = "durable_generation_quarantine";
 
 export function episodeKeyFromAttempt(attempt: LoopRecoveryAttempt, fallbackOperation = "loop_recovery"): RecoveryEpisodeKey {
   return {

@@ -24,6 +24,7 @@ import {
   claimOrResumeRecoveryEpisode,
   countRecoveryEpisodeTreatments,
   recordRecoveryEpisodeTreatment,
+  stageRecoveryEpisodeKey,
 } from "../issue-stage-adapters.ts";
 import { emptyStageAttemptLedger, hydrateStageAttemptLedger, type StageAttemptLedger } from "../stage-attempt-ledger.ts";
 import {
@@ -148,6 +149,11 @@ export async function tryAutoRecover(
   deps: AutoRecoverDeps = defaultAutoRecoverDeps,
 ): Promise<Outcome> {
   const report = deps.reportObservation ?? defaultRecoverySupervisorReport;
+  const episodeKey = stageRecoveryEpisodeKey({
+    issue: issueNumber,
+    candidateEpoch: "unresolved",
+    evidence: `auto_recover:#${issueNumber}`,
+  });
   const episode = claimOrResumeRecoveryEpisode({
     domain: cfg.domain ?? "unknown",
     logical_operation_id: deps.logicalOperationId,
@@ -155,6 +161,7 @@ export async function tryAutoRecover(
     issue: issueNumber,
     message: `auto_recover claims Recovery Episode for #${issueNumber}`,
     reportObservation: report,
+    episodeKey,
   });
 
   const wt = await deps.getOnDiskForIssue(cfg, issueNumber);
@@ -189,6 +196,8 @@ export async function tryAutoRecover(
       evidenceFingerprint: `auto-recover-cap-${recoveryCount}`,
       typedReason: "auto-recovery-cap-cooling",
       runDir: deps.stageAttemptLedger ? undefined : runDir,
+      episodeKey,
+      strategyBound: cfg.auto_recovery_max_retries,
     });
     return {
       advanced: false,
@@ -248,6 +257,8 @@ export async function tryAutoRecover(
     evidenceFingerprint: `auto-recover-${recoveryCount + 1}`,
     typedReason: "auto-recover-reset-to-ready",
     runDir: deps.stageAttemptLedger ? undefined : runDir,
+    episodeKey,
+    strategyBound: cfg.auto_recovery_max_retries,
   });
 
   // Evidence bundle (#147): record the recovery event. Best-effort + gated on

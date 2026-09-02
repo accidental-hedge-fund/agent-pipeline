@@ -21,7 +21,9 @@ import {
   coolingDeadline,
   coolingIsActive,
   coolingRecordForItem,
+  assertCursorDoesNotRegress,
   competingPrivateEpisodePath,
+  DURABLE_GENERATION_QUARANTINE_THEME,
   emptyEpisode,
   isTempWriteBasename,
   lastValidPathFor,
@@ -51,7 +53,8 @@ import {
   type LoopLedger,
   type RecoveryRecipe,
 } from "../scripts/loop/types.ts";
-import { claimOrResumeRecoveryEpisode } from "../scripts/issue-stage-adapters.ts";
+import { claimOrResumeRecoveryEpisode, recordRecoveryEpisodeTreatment, stageRecoveryEpisodeKey } from "../scripts/issue-stage-adapters.ts";
+import { emptyStageAttemptLedger } from "../scripts/stage-attempt-ledger.ts";
 import { COMMAND_REGISTRY } from "../scripts/command-registry.ts";
 
 let fakeDepsCounter = 0;
@@ -238,12 +241,26 @@ test("1.2 second process resumes the same episode identity", async () => {
   assert.equal(second.attempt.attempt_id, first.attempt.attempt_id);
   assert.equal(second.ledger.recovery_attempts.length, 1);
   const dir = mkdtempSync(join(tmpdir(), "ap-1325-ep-"));
+  const episodeKey = stageRecoveryEpisodeKey({
+    issue: 1325,
+    candidateEpoch: "head-abc",
+    evidence: "ci failed",
+  });
   const a = claimOrResumeRecoveryEpisode({
     domain: "test",
     logical_operation_id: "lop-same",
     issue: 1325,
     message: "ci failed",
     persistDir: dir,
+    episodeKey,
+  });
+  const treated = recordRecoveryEpisodeTreatment({
+    ledger: emptyStageAttemptLedger(),
+    headSha: "head-abc",
+    action: "worktree_rematerialize",
+    itemId: "1325",
+    evidenceFingerprint: "ci failed",
+    episodeKey,
   });
   const b = claimOrResumeRecoveryEpisode({
     domain: "test",
@@ -251,8 +268,10 @@ test("1.2 second process resumes the same episode identity", async () => {
     issue: 1325,
     message: "ci failed",
     persistDir: dir,
+    episodeKey,
   });
   assert.equal(b.episode_id, a.episode_id);
+  assert.equal(treated.attempts[0]!.episode_id, a.episode_id);
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -367,6 +386,11 @@ test("2.4 three-recipe class claims the last recipe after earlier spent or skipp
     assert.equal(selected.action, "repair_pipeline_item");
     assert.ok(selected.skipped.includes("unlink_engine_scratch"));
   }
+});
+
+test("2.5a stored strategy cursor cannot regress", () => {
+  assert.equal(assertCursorDoesNotRegress(1, 2), 2);
+  assert.throws(() => assertCursorDoesNotRegress(2, 1), /cannot regress/);
 });
 
 test("2.5 restart resumes the same cursor", async () => {
@@ -609,9 +633,14 @@ test("5.1 truncated ledger is quarantined and is not live authority", async () =
   assert.ok(published);
   files.delete(lastValidPathFor(published!));
   files.set(published!, "{truncated");
-  await assert.rejects(() => readLedger(deps, "run-1"), /quarantined invalid ledger/);
+  const ledger = await readLedger(deps, "run-1");
+  assert.equal(ledger.stop, null);
+  assert.equal(ledger.cooling?.theme, DURABLE_GENERATION_QUARANTINE_THEME);
+  assert.ok(ledger.cooling?.quarantine_path);
+  assert.notEqual(ledger.cooling?.reason, "human_authority");
   const quarantined = [...files.keys()].filter((k) => k.includes("quarantine"));
   assert.ok(quarantined.length >= 1);
+  assert.equal(files.get(published!)?.includes("{truncated"), false);
 });
 
 test("5.2 leftover temporary write is not published authority", async () => {
@@ -642,7 +671,9 @@ test("5.4 partial ledger with only run_id and items is quarantined", async () =>
   const published = [...files.keys()].find((k) => k.endsWith("/ledger.json"))!;
   files.delete(lastValidPathFor(published));
   files.set(published, JSON.stringify({ run_id: "run-1", items: {} }));
-  await assert.rejects(() => readLedger(deps, "run-1"), /quarantined invalid ledger/);
+  const ledger = await readLedger(deps, "run-1");
+  assert.equal(ledger.stop, null);
+  assert.equal(ledger.cooling?.theme, DURABLE_GENERATION_QUARANTINE_THEME);
   const quarantined = [...files.keys()].filter((k) => k.includes("quarantine"));
   assert.ok(quarantined.length >= 1);
 });
@@ -664,6 +695,53 @@ test("5.6 partial contract with only run_id is quarantined", async () => {
   files.delete(lastValidPathFor(published));
   files.set(published, JSON.stringify({ run_id: "run-1" }));
   await assert.rejects(() => readContract(deps, "run-1"), /quarantined invalid contract/);
+  const ledger = await readLedger(deps, "run-1");
+  assert.equal(ledger.stop, null);
+  assert.equal(ledger.cooling?.theme, DURABLE_GENERATION_QUARANTINE_THEME);
+  assert.ok(ledger.cooling?.quarantine_path);
+});
+
+test("5.7 unreconstructable ledger remains owned as a quarantine wait", async () => {
+  const { deps, files, token } = await setup();
+  const published = [...files.keys()].find((k) => k.endsWith("/ledger.json"))!;
+  files.delete(lastValidPathFor(published));
+  files.set(published, "{truncated");
+  const ledger = await readLedger(deps, "run-1");
+  assert.equal(ledger.stop, null);
+  assert.equal(ledger.cooling?.theme, DURABLE_GENERATION_QUARANTINE_THEME);
+  assert.ok(ledger.cooling?.next_eligible_at);
+  assert.equal(ledger.last_reconciliation, null);
+  assert.ok(Object.keys(ledger.items).length >= 1);
+  await assert.rejects(
+    () =>
+      writeLedger(
+        deps,
+        {
+          ...ledger,
+          items: {
+            ...ledger.items,
+            "100": { ...ledger.items["100"]!, state: "in_progress" },
+          },
+        },
+        token,
+      ),
+    /live reconciliation before mutation/,
+  );
+  const reconciled = {
+    ...ledger,
+    last_reconciliation: {
+      sequence: 1,
+      time: deps.now().toISOString(),
+      observed: {},
+      drift: [],
+      next_actions: {},
+    },
+    reconciliation_sequence: 1,
+  };
+  await writeLedger(deps, reconciled, token);
+  const after = await readLedger(deps, "run-1");
+  assert.equal(after.last_reconciliation?.sequence, 1);
+  assert.equal(after.stop, null);
 });
 
 // ---------------------------------------------------------------------------

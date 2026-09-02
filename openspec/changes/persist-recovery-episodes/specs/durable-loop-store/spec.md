@@ -92,3 +92,11 @@ the quarantine. The store SHALL NOT invent a second database or generation log f
 - **THEN** the store SHALL reconstruct the live document from that last valid generation plus live
   truth when reconstruction is safe
 - **AND** the Logical Operation SHALL remain owned
+
+#### Scenario: Unreconstructable generation stays owned as Cooling
+
+- **WHEN** a quarantined generation is detected
+- **AND** no last valid generation of the same document is readable
+- **THEN** the store SHALL persist Cooling or an external-condition wait with evidence of the quarantine
+- **AND** the Logical Operation SHALL remain owned
+- **AND** later mutation SHALL require live reconciliation

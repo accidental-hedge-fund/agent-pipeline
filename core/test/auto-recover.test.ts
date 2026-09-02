@@ -9,7 +9,7 @@ import {
   tryAutoRecover,
   type AutoRecoverDeps,
 } from "../scripts/stages/auto_recover.ts";
-import { recordRecoveryEpisodeTreatment } from "../scripts/issue-stage-adapters.ts";
+import { recordRecoveryEpisodeTreatment, stageRecoveryEpisodeKey } from "../scripts/issue-stage-adapters.ts";
 import { emptyStageAttemptLedger } from "../scripts/stage-attempt-ledger.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 import type { RunStoreDeps } from "../scripts/run-store.ts";
@@ -171,12 +171,19 @@ test("tryAutoRecover: recovery limit reached → blocked, no correction_event (a
 test("tryAutoRecover: ledger-counted cap cannot terminalize even with empty comments", async () => {
   const { deps: runStoreDeps, lines } = memRunStoreDeps();
   const ledger = emptyStageAttemptLedger();
+  const episodeKey = stageRecoveryEpisodeKey({
+    issue: 499,
+    candidateEpoch: "unresolved",
+    evidence: "auto_recover:#499",
+  });
   recordRecoveryEpisodeTreatment({
     ledger,
     headSha: "unresolved",
     action: "no_run_recovery",
     itemId: "499",
     evidenceFingerprint: "auto-recover-1",
+    episodeKey,
+    strategyBound: 2,
   });
   recordRecoveryEpisodeTreatment({
     ledger,
@@ -184,6 +191,8 @@ test("tryAutoRecover: ledger-counted cap cannot terminalize even with empty comm
     action: "no_run_recovery",
     itemId: "499",
     evidenceFingerprint: "auto-recover-2",
+    episodeKey,
+    strategyBound: 2,
   });
   const posted: string[] = [];
   const out = await tryAutoRecover(CFG, 499, undefined, "/tmp/run", runStoreDeps, baseDeps({

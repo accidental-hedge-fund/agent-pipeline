@@ -59,6 +59,7 @@ import { classifyPorcelainForScratchRecover } from "./worktree-dirt.ts";
 import {
   claimOrResumeRecoveryEpisode,
   recordRecoveryEpisodeTreatment,
+  stageRecoveryEpisodeKey,
 } from "./issue-stage-adapters.ts";
 import { defaultRecoverySupervisorReport } from "./operation-observation.ts";
 import { emptyStageAttemptLedger, hydrateStageAttemptLedger, type StageAttemptLedger } from "./stage-attempt-ledger.ts";
@@ -1323,6 +1324,11 @@ export async function runRecoverParked(
     issue: issueNumber,
     message: `recover-parked claims Recovery Episode for #${issueNumber}`,
     reportObservation: report,
+    episodeKey: stageRecoveryEpisodeKey({
+      issue: issueNumber,
+      candidateEpoch: "unresolved",
+      evidence: `recover-parked:#${issueNumber}`,
+    }),
   });
 
   if (opts.skipRecoverParked) {
@@ -1777,6 +1783,11 @@ async function runRecoverParkedLocked(
       `[recover-parked] #${issueNumber}: already-spent fingerprint ${fingerprintId}`,
     );
     const report = deps.reportObservation ?? defaultRecoverySupervisorReport;
+    const episodeKey = stageRecoveryEpisodeKey({
+      issue: issueNumber,
+      candidateEpoch: headSha || "unresolved",
+      evidence: fingerprintId,
+    });
     claimOrResumeRecoveryEpisode({
       domain: cfg.domain ?? "unknown",
       logical_operation_id: deps.logicalOperationId,
@@ -1784,6 +1795,7 @@ async function runRecoverParkedLocked(
       issue: issueNumber,
       message: `recover-parked fingerprint spent — strategy cursor advanced, ownership retained (${fingerprintId})`,
       reportObservation: report,
+      episodeKey,
     });
     const hydrated = hydrateStageAttemptLedger(deps.runDir);
     const ledger = deps.stageAttemptLedger ?? (hydrated.ok ? hydrated.ledger : emptyStageAttemptLedger());
@@ -1795,6 +1807,7 @@ async function runRecoverParkedLocked(
       evidenceFingerprint: fingerprintId,
       typedReason: "recover-parked-pass-spent",
       runDir: deps.stageAttemptLedger ? undefined : deps.runDir,
+      episodeKey,
     });
     return wrap({
       status: "already-spent",
