@@ -25,6 +25,9 @@
 - [x] 4.3 Allow retry only after the prior process group is proven gone. Verify a follow-up injected call is refused while that group remains and is allowed once it is gone.
 - [x] 4.4 Canonicalize candidate root via injected realpath before lock and readiness identity. Verify two lexical aliases of one checkout perform exactly one install.
 - [x] 4.5 Treat missing child identity after owner death as unresolved ownership. Verify a retry during startInstall-before-child-PGID-publication fails closed and does not start a second install.
+- [x] 4.6 After canonicalization, derive `launcherPath` from the canonical root. Verify a symlink-retarget fixture returns and spawns that canonical launcher, not the lexical path.
+- [x] 4.7 Revalidate exact SHA and tracked cleanliness on the canonical root immediately before lockfile digest and install ownership. Verify mutation between identity resolution and bootstrap fails closed with no install.
+- [x] 4.8 Store lock and ready records in a per-user private state directory. Do not trust symlink, other-uid, or group/world-writable records or locks. Verify an untrusted ready record does not skip install and an untrusted lock is not treated as ownership.
 
 ## 5. Caller wiring
 

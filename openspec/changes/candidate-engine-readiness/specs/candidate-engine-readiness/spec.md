@@ -6,7 +6,7 @@ Makes every accepted candidate-engine root runnable before any candidate-engine 
 
 ### Requirement: Resolve-and-prepare SHALL return a runnable candidate root before spawn
 
-The pipeline SHALL provide one asynchronous resolve-and-prepare seam that selects a candidate-engine root, proves candidate readiness, revalidates exact SHA and tracked cleanliness, and only then returns a root that callers may spawn. The ship coordinator and hybrid-v2 Layer A collection SHALL call this seam. Tugboat SHALL invoke the same seam before candidate CLI spawn. Leaf candidate invocations SHALL inherit that guarantee and SHALL NOT spawn first to self-heal. The general installed launcher SHALL NOT gain candidate self-healing. Ordinary issue-worktree bootstrap SHALL remain unchanged.
+The pipeline SHALL provide one asynchronous resolve-and-prepare seam that selects a candidate-engine root, proves candidate readiness, revalidates exact SHA and tracked cleanliness, and only then returns a root that callers may spawn. After canonicalization, the returned launcher path SHALL be derived from that canonical root. The ship coordinator and hybrid-v2 Layer A collection SHALL call this seam. Tugboat SHALL invoke the same seam before candidate CLI spawn. Leaf candidate invocations SHALL inherit that guarantee and SHALL NOT spawn first to self-heal. The general installed launcher SHALL NOT gain candidate self-healing. Ordinary issue-worktree bootstrap SHALL remain unchanged.
 
 Supported selection sources SHALL be a clean `REPO_DIR` whose HEAD equals the exact candidate SHA, an existing `.worktrees/ship-candidate-<sha>` worktree, `PIPELINE_CANDIDATE_ENGINE_ROOT` after the same HEAD and porcelain checks, and a newly created candidate worktree when creation is allowed. Every supported source SHALL pass the same gate. Identity-only resolution SHALL NOT authorize spawn.
 
@@ -36,6 +36,12 @@ Supported selection sources SHALL be a clean `REPO_DIR` whose HEAD equals the ex
 - **AND** no matching readiness record exists
 - **THEN** the seam SHALL prove candidate readiness for that root before spawn
 
+#### Scenario: Spawned launcher is bound to the canonical root
+
+- **WHEN** resolve-and-prepare canonicalizes a lexical candidate root to physical root `R`
+- **THEN** the returned launcher path SHALL be `R/scripts/pipeline-launcher.mjs`
+- **AND** it SHALL NOT remain the pre-canonical lexical launcher path
+
 #### Scenario: Leaf invocations do not self-heal first
 
 - **WHEN** the ship coordinator or hybrid-v2 Layer A collection has not yet completed resolve-and-prepare
@@ -52,7 +58,7 @@ Supported selection sources SHALL be a clean `REPO_DIR` whose HEAD equals the ex
 
 ### Requirement: Candidate readiness SHALL be a SHA-plus-lockfile-digest success record
 
-The pipeline SHALL treat candidate readiness as an engine-owned success record stored outside tracked files, keyed by the candidate SHA and the digest of that SHA's nested `core/package-lock.json`. A `core/node_modules` directory alone SHALL NOT count as ready. An unmarked pre-existing or partial install SHALL NOT be trusted. A matching SHA-plus-digest record SHALL skip a new install. Missing, stale, or partial readiness SHALL cause exactly one serialized install in that candidate `core/` from that lockfile. Repository project `setup_command` SHALL NOT skip or replace this readiness. Candidate readiness SHALL be deterministic from SHA, lockfile digest, and the engine-owned success record. An operator attestation SHALL NOT be required.
+The pipeline SHALL treat candidate readiness as an engine-owned success record stored outside tracked files, keyed by the candidate SHA and the digest of that SHA's nested `core/package-lock.json`. The record and the setup lock SHALL live in a per-user private runtime or state directory with restrictive permissions. The seam SHALL NOT treat a record or lock as engine-owned when that path is a symbolic link, is group-writable or world-writable, or is owned by a different user id. The seam SHALL NOT follow attacker-controlled entries when reading or writing that state. Shared world-writable `/tmp` SHALL NOT be the trust root. A `core/node_modules` directory alone SHALL NOT count as ready. An unmarked pre-existing or partial install SHALL NOT be trusted. A matching SHA-plus-digest record SHALL skip a new install. Missing, stale, or partial readiness SHALL cause exactly one serialized install in that candidate `core/` from that lockfile. Repository project `setup_command` SHALL NOT skip or replace this readiness. Candidate readiness SHALL be deterministic from SHA, lockfile digest, and the engine-owned success record. An operator attestation SHALL NOT be required.
 
 #### Scenario: Matching record skips reinstall
 
@@ -80,6 +86,21 @@ The pipeline SHALL treat candidate readiness as an engine-owned success record s
 - **THEN** resolve-and-prepare SHALL still prove candidate readiness
 - **AND** it SHALL NOT skip engine bootstrap because of that setting
 
+#### Scenario: Untrusted ready record does not skip install
+
+- **WHEN** a success-record path exists for candidate SHA `C` and the current nested lockfile digest
+- **AND** that path is a symbolic link, group-writable or world-writable, or owned by a different user id
+- **THEN** the seam SHALL NOT treat that record as matching
+- **AND** it SHALL run exactly one serialized install from the current lockfile
+
+#### Scenario: Untrusted setup lock is not ownership
+
+- **WHEN** a setup-lock path exists for the canonical root and SHA `C`
+- **AND** that path is a symbolic link, group-writable or world-writable, or owned by a different user id
+- **THEN** the seam SHALL NOT wait on that lock as live ownership
+- **AND** it SHALL fail closed before spawn
+- **AND** it SHALL NOT unlink that untrusted path as reclaim
+
 ---
 
 ### Requirement: Engine bootstrap SHALL install from the nested candidate core lockfile
@@ -103,7 +124,7 @@ Engine bootstrap SHALL select the nested candidate `core/package-lock.json` and 
 
 ### Requirement: Concurrent consumers SHALL share one child-safe serialized install
 
-The pipeline SHALL serialize candidate setup by canonical candidate root and SHA. Canonical root SHALL be the symlink-resolved checkout path. Concurrent consumers of that pair SHALL perform one install. Waiters SHALL reuse that result and SHALL observe bounded heartbeats from the live installer. Locks and readiness records SHALL NOT be stored inside the tracked candidate worktree. Ownership SHALL be child-safe: death of the owner parent PID alone SHALL NOT reclaim the lock while an installer child may still run. Missing installer child identity after owner death SHALL be unresolved ownership and SHALL NOT reclaim. The engine SHALL NOT automatically reclaim a setup lock when the owner parent PID is dead.
+The pipeline SHALL serialize candidate setup by canonical candidate root and SHA. Canonical root SHALL be the symlink-resolved checkout path. Concurrent consumers of that pair SHALL perform one install. Waiters SHALL reuse that result and SHALL observe bounded heartbeats from the live installer. Locks and readiness records SHALL NOT be stored inside the tracked candidate worktree. They SHALL live in a per-user private runtime or state directory and SHALL NOT use shared world-writable `/tmp` as the trust root. Ownership SHALL be child-safe: death of the owner parent PID alone SHALL NOT reclaim the lock while an installer child may still run. Missing installer child identity after owner death SHALL be unresolved ownership and SHALL NOT reclaim. The engine SHALL NOT automatically reclaim a setup lock when the owner parent PID is dead.
 
 #### Scenario: Two waiters share one install
 
@@ -168,7 +189,14 @@ Setup failure SHALL prevent candidate spawn, SHALL write no success record, SHAL
 
 ### Requirement: Exact SHA and tracked cleanliness SHALL be revalidated after bootstrap
 
-The seam SHALL validate exact SHA and tracked cleanliness before bootstrap and again after bootstrap. A mismatch SHALL fail closed. Bootstrap SHALL NOT weaken exact-SHA or clean-worktree checks. Locks and readiness records SHALL remain outside the tracked candidate worktree so those checks stay meaningful.
+The seam SHALL validate exact SHA and tracked cleanliness before bootstrap and again after bootstrap. The pre-bootstrap validation SHALL run on the canonical candidate root immediately before lockfile digest and install ownership authorize bootstrap. A mismatch SHALL fail closed before spawning the nested-core install. Bootstrap SHALL NOT weaken exact-SHA or clean-worktree checks. Locks and readiness records SHALL remain outside the tracked candidate worktree so those checks stay meaningful.
+
+#### Scenario: Mutation between resolve and bootstrap fails closed before install
+
+- **WHEN** identity resolution accepted a candidate root at SHA `C` with empty tracked porcelain
+- **AND** HEAD or tracked porcelain at the canonical root changes before bootstrap
+- **THEN** resolve-and-prepare SHALL fail closed before spawning the nested-core install
+- **AND** it SHALL write no success record
 
 #### Scenario: Post-bootstrap dirty tree fails closed
 
@@ -228,7 +256,7 @@ Operator-facing ship and candidate-engine documentation SHALL state that every a
 
 ### Requirement: Injected-I/O tests SHALL prove spawn-after-ready
 
-Unit tests with injected I/O SHALL cover fresh roots; every selection source (clean `REPO_DIR`, existing ship-candidate worktree, `PIPELINE_CANDIDATE_ENGINE_ROOT`, newly created worktree); partial or unmarked install retry; setup failure with no success record and no spawn; concurrent waiters sharing one install; two lexical aliases of one checkout sharing one install; abandoned ownership fail-closed; owner death before child-PGID publication fail-closed without reclaim; nested-core lockfile selection; post-bootstrap SHA or tracked-dirty mismatch fail-closed; and spawn ordering (no candidate command before readiness success). Unit tests SHALL perform no real network, git, or npm calls. `npm run ci` SHALL pass.
+Unit tests with injected I/O SHALL cover fresh roots; every selection source (clean `REPO_DIR`, existing ship-candidate worktree, `PIPELINE_CANDIDATE_ENGINE_ROOT`, newly created worktree); partial or unmarked install retry; setup failure with no success record and no spawn; concurrent waiters sharing one install; two lexical aliases of one checkout sharing one install; spawned launcher bound to the canonical root after symlink retarget; mutation between identity resolution and bootstrap fail-closed before install; pre-existing untrusted ready-record and setup-lock paths; abandoned ownership fail-closed; owner death before child-PGID publication fail-closed without reclaim; nested-core lockfile selection; post-bootstrap SHA or tracked-dirty mismatch fail-closed; and spawn ordering (no candidate command before readiness success). Unit tests SHALL perform no real network, git, or npm calls. `npm run ci` SHALL pass.
 
 #### Scenario: Spawn ordering test fails if a command precedes readiness
 

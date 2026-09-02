@@ -55,15 +55,16 @@ Ordinary issue-worktree setup (`detectAndInstall` in `core/scripts/worktree-setu
 
 ### 3. Readiness record and lock live outside the tracked tree
 
-**Choice:** Store the success record and the setup lock in host-local untracked state keyed by canonical root (resolved absolute path) plus candidate SHA plus lockfile digest. Sibling files under `/tmp` (same family as `PipelineLock` paths) are sufficient. Do not write lock or ready files inside the candidate worktree.
+**Choice:** Store the success record and the setup lock in a per-user private runtime or state directory keyed by canonical root (resolved absolute path) plus candidate SHA plus lockfile digest. Prefer `XDG_RUNTIME_DIR`, then `AGENT_PIPELINE_STATE_HOME`, then `XDG_STATE_HOME`, then `~/.local/state/agent-pipeline/candidate-readiness`. Create that directory `0700`, write records `0600` with `O_NOFOLLOW`, and refuse symlink / other-uid / group-or-world-writable paths. Do not write lock or ready files inside the candidate worktree. Do not use shared `/tmp` as the trust root.
 
-**Why:** Porcelain must stay empty for the post-bootstrap revalidation. A matching record skips reinstall. Missing, stale digest, or partial (no record) triggers one serialized install.
+**Why:** Porcelain must stay empty for the post-bootstrap revalidation. A matching record skips reinstall. Missing, stale digest, or partial (no record) triggers one serialized install. Predictable files in shared `/tmp` are forgeable by another local user.
 
 **Alternatives considered:**
 
 - Infer ready from `core/node_modules` → rejected: unmarked or partial install is the defect.
 - Write `.pipeline-candidate-ready` inside the worktree → rejected: dirties porcelain or requires ignore games.
-- Put records under `.agent-pipeline/` in `REPO_DIR` → optional later; `/tmp` matches existing host-local locks and does not expand the artifact-ignore contract in this change.
+- Sibling files under `/tmp` (same family as `PipelineLock` paths) → rejected: another local user can pre-create the known SHA/root record or lock.
+- Put records under `.agent-pipeline/` in `REPO_DIR` → rejected: still in the checkout tree and can dirty porcelain or require ignore games.
 
 ### 4. Child-safe ownership reuses marker identity, not `PipelineLock` reclaim
 
@@ -71,7 +72,7 @@ Ordinary issue-worktree setup (`detectAndInstall` in `core/scripts/worktree-setu
 
 **Why:** `PipelineLock.handleExistingLock` treats parent `ESRCH` as stale and reclaims. That is unsafe while `npm ci` may still run in a detached process group (`worktree-setup` already uses `detached: true`).
 
-**Reuse:** Atomic create, pid+starttime markers, and `/tmp` path construction. Not reclaim-on-dead-PID.
+**Reuse:** Atomic create, pid+starttime markers, and private-directory path construction. Not reclaim-on-dead-PID.
 
 **Alternatives considered:**
 
@@ -97,7 +98,7 @@ Ordinary issue-worktree setup (`detectAndInstall` in `core/scripts/worktree-setu
 
 ## Risks / Trade-offs
 
-- **[Risk] `/tmp` readiness records vanish on reboot** → Mitigation: missing record retriggers one serialized install. Deterministic and acceptable.
+- **[Risk] Runtime-dir readiness records vanish on reboot** → Mitigation: missing record retriggers one serialized install. Deterministic and acceptable.
 - **[Risk] `npm ci` mutates candidate `node_modules` while SHA checks run** → Mitigation: validate clean before install; revalidate SHA and tracked porcelain after; ignore untracked `node_modules`.
 - **[Risk] Tugboat pin-side Node invoke fails on a host without pin `core/node_modules`** → Mitigation: pin is the promoted engine and is already required to run train. Fail closed with candidate-local text, not a global reinstall instruction.
 - **[Risk] Concurrent waiters block too long** → Mitigation: bounded heartbeats; stale heartbeat plus proven-dead process group fails closed rather than waiting forever.

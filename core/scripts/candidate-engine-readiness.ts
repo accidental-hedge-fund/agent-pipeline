@@ -4,6 +4,7 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { formatProcessIdentityMarker, getProcessStartTime } from "./lock.ts";
 import { parseExactGitSha } from "./ship-end-identity.ts";
@@ -71,6 +72,10 @@ export interface PrepareCandidateEngineDeps {
   nowMs(): number;
   sleep(ms: number): Promise<void>;
   tmpDir(): string;
+  /** Create/verify a per-user private state directory. False refuses the path. */
+  ensureStateDir(dir: string): boolean;
+  /** False for missing, symlink, other-uid, or group/world-writable paths. */
+  statePathTrusted(p: string): boolean;
   parentIdentity(): { pid: number; starttime: string | null };
   processAlive(pid: number, starttime: string | null): boolean;
   processGroupAlive(pgid: number): boolean;
@@ -98,12 +103,32 @@ export function candidateStateKey(root: string, sha: string): string {
   return createHash("sha256").update(`${path.resolve(root)}\n${sha}`).digest("hex").slice(0, 32);
 }
 
-export function candidateSetupLockPath(root: string, sha: string, tmpDir = "/tmp"): string {
-  return path.join(tmpDir, `pipeline-candidate-setup-${candidateStateKey(root, sha)}.lock`);
+export function candidateSetupLockPath(root: string, sha: string, stateDir: string): string {
+  return path.join(stateDir, `pipeline-candidate-setup-${candidateStateKey(root, sha)}.lock`);
 }
 
-export function candidateReadyRecordPath(root: string, sha: string, tmpDir = "/tmp"): string {
-  return path.join(tmpDir, `pipeline-candidate-ready-${candidateStateKey(root, sha)}.json`);
+export function candidateReadyRecordPath(root: string, sha: string, stateDir: string): string {
+  return path.join(stateDir, `pipeline-candidate-ready-${candidateStateKey(root, sha)}.json`);
+}
+
+/** Per-user private runtime/state dir. Never shared `/tmp`. */
+export function resolveCandidateReadinessStateDir(
+  env: NodeJS.ProcessEnv = process.env,
+  homeDir: string = os.homedir(),
+): string {
+  const runtime = env.XDG_RUNTIME_DIR?.trim();
+  if (runtime && path.isAbsolute(runtime)) {
+    return path.join(runtime, "pipeline-candidate-readiness");
+  }
+  const explicit = env.AGENT_PIPELINE_STATE_HOME?.trim();
+  if (explicit && path.isAbsolute(explicit)) {
+    return path.join(path.resolve(explicit), "candidate-readiness");
+  }
+  const xdg = env.XDG_STATE_HOME?.trim();
+  if (xdg && path.isAbsolute(xdg)) {
+    return path.join(path.resolve(xdg), "agent-pipeline", "candidate-readiness");
+  }
+  return path.join(homeDir, ".local", "state", "agent-pipeline", "candidate-readiness");
 }
 
 export function defaultDigest(buf: Buffer): string {
@@ -210,13 +235,14 @@ function heartbeatFresh(lock: CandidateSetupLock, deps: PrepareCandidateEngineDe
 function revalidateEngine(
   engine: PreparedCandidateEngine,
   deps: CandidateRevalidateDeps,
+  phase: "pre-bootstrap" | "post-bootstrap",
 ): PreparedCandidateResult {
   const head = parseExactGitSha(deps.revParseHead(engine.engineRoot));
   if (head !== engine.commitSha) {
     return closedError(
       "readiness",
       engine.engineRoot,
-      `post-bootstrap HEAD ${head ?? "unknown"} does not equal ${engine.commitSha}`,
+      `${phase} HEAD ${head ?? "unknown"} does not equal ${engine.commitSha}`,
     );
   }
   const porcelain = deps.porcelain(engine.engineRoot);
@@ -224,14 +250,14 @@ function revalidateEngine(
     return closedError(
       "readiness",
       engine.engineRoot,
-      "post-bootstrap tracked porcelain is not empty",
+      `${phase} tracked porcelain is not empty`,
     );
   }
   if (!deps.fileExists(path.join(engine.engineRoot, PIPELINE_TS_REL))) {
-    return closedError("readiness", engine.engineRoot, "pipeline.ts missing after bootstrap");
+    return closedError("readiness", engine.engineRoot, `pipeline.ts missing at ${phase}`);
   }
   if (!deps.fileExists(path.join(engine.engineRoot, LAUNCHER_REL))) {
-    return closedError("readiness", engine.engineRoot, "launcher missing after bootstrap");
+    return closedError("readiness", engine.engineRoot, `launcher missing at ${phase}`);
   }
   return { ok: true, engine };
 }
@@ -241,9 +267,13 @@ function matchingReady(
   digest: string,
   deps: PrepareCandidateEngineDeps,
 ): boolean {
-  const record = parseReadyRecord(
-    deps.readText(candidateReadyRecordPath(engine.engineRoot, engine.commitSha, deps.tmpDir())),
+  const recordPath = candidateReadyRecordPath(
+    engine.engineRoot,
+    engine.commitSha,
+    deps.tmpDir(),
   );
+  if (!deps.statePathTrusted(recordPath)) return false;
+  const record = parseReadyRecord(deps.readText(recordPath));
   if (!record) return false;
   return record.commitSha === engine.commitSha && record.lockfileDigest === digest;
 }
@@ -252,14 +282,14 @@ function writeReadyRecord(
   engine: PreparedCandidateEngine,
   digest: string,
   deps: PrepareCandidateEngineDeps,
-): void {
+): boolean {
   const body: CandidateReadyRecord = {
     schema: READY_RECORD_SCHEMA,
     engineRoot: engine.engineRoot,
     commitSha: engine.commitSha,
     lockfileDigest: digest,
   };
-  deps.writeText(
+  return deps.writeText(
     candidateReadyRecordPath(engine.engineRoot, engine.commitSha, deps.tmpDir()),
     `${JSON.stringify(body)}\n`,
     "w",
@@ -326,12 +356,19 @@ async function runOwnedInstall(
     return closedError("readiness", engine.engineRoot, detail);
   }
 
-  const revalidated = revalidateEngine(engine, deps);
+  const revalidated = revalidateEngine(engine, deps, "post-bootstrap");
   if (!revalidated.ok) {
     deps.remove(lockPath);
     return revalidated;
   }
-  writeReadyRecord(engine, digest, deps);
+  if (!writeReadyRecord(engine, digest, deps)) {
+    deps.remove(lockPath);
+    return closedError(
+      "readiness",
+      engine.engineRoot,
+      "could not write a trusted readiness record",
+    );
+  }
   deps.remove(lockPath);
   return revalidated;
 }
@@ -348,11 +385,13 @@ async function waitForOwner(
   const deadline = deps.nowMs() + maxMs;
   while (deps.nowMs() < deadline) {
     if (matchingReady(engine, digest, deps)) {
-      return revalidateEngine(engine, deps);
+      return revalidateEngine(engine, deps, "post-bootstrap");
     }
     const raw = deps.readText(lockPath);
     if (raw == null) {
-      if (matchingReady(engine, digest, deps)) return revalidateEngine(engine, deps);
+      if (matchingReady(engine, digest, deps)) {
+        return revalidateEngine(engine, deps, "post-bootstrap");
+      }
       return closedError(
         "lock",
         engine.engineRoot,
@@ -392,6 +431,21 @@ async function waitForOwner(
   );
 }
 
+async function installIfStillValid(
+  engine: PreparedCandidateEngine,
+  lockPath: string,
+  lockfilePath: string,
+  digest: string,
+  deps: ResolveAndPrepareDeps,
+): Promise<PreparedCandidateResult> {
+  const checked = revalidateEngine(engine, deps, "pre-bootstrap");
+  if (!checked.ok) {
+    deps.remove(lockPath);
+    return checked;
+  }
+  return runOwnedInstall(engine, lockPath, lockfilePath, digest, deps);
+}
+
 /**
  * Prove candidate readiness for an already-selected exact-SHA clean root.
  * Callers must not spawn until this returns ok.
@@ -405,7 +459,14 @@ export async function prepareCandidateEngine(
   if (!root) {
     return closedError("readiness", lexical, "cannot canonicalize candidate root");
   }
-  const prepared: PreparedCandidateEngine = { ...engine, engineRoot: root };
+  const prepared: PreparedCandidateEngine = {
+    engineRoot: root,
+    launcherPath: path.join(root, LAUNCHER_REL),
+    commitSha: engine.commitSha,
+  };
+  const pre = revalidateEngine(prepared, deps, "pre-bootstrap");
+  if (!pre.ok) return pre;
+
   const lockfilePath = nestedLockfilePath(root);
   if (!deps.fileExists(lockfilePath)) {
     return closedError(
@@ -423,10 +484,17 @@ export async function prepareCandidateEngine(
   }
   const digest = deps.digest(lockBytes);
   const tmpDir = deps.tmpDir();
+  if (!deps.ensureStateDir(tmpDir)) {
+    return closedError(
+      "readiness",
+      root,
+      "cannot create a private engine-owned state directory",
+    );
+  }
   const lockPath = candidateSetupLockPath(root, prepared.commitSha, tmpDir);
 
   if (matchingReady(prepared, digest, deps)) {
-    return revalidateEngine(prepared, deps);
+    return revalidateEngine(prepared, deps, "post-bootstrap");
   }
 
   const parent = deps.parentIdentity();
@@ -442,12 +510,22 @@ export async function prepareCandidateEngine(
   };
 
   if (writeLock(lockPath, initial, deps, "wx")) {
-    return runOwnedInstall(prepared, lockPath, lockfilePath, digest, deps);
+    return installIfStillValid(prepared, lockPath, lockfilePath, digest, deps);
+  }
+
+  if (!deps.statePathTrusted(lockPath)) {
+    return closedError(
+      "lock",
+      root,
+      "setup lock path is untrusted; refusing to honor it",
+    );
   }
 
   const existing = parseLock(deps.readText(lockPath));
   if (!existing) {
-    if (matchingReady(prepared, digest, deps)) return revalidateEngine(prepared, deps);
+    if (matchingReady(prepared, digest, deps)) {
+      return revalidateEngine(prepared, deps, "post-bootstrap");
+    }
     return closedError(
       "lock",
       root,
@@ -457,7 +535,7 @@ export async function prepareCandidateEngine(
   }
 
   if (matchingReady(prepared, digest, deps)) {
-    return revalidateEngine(prepared, deps);
+    return revalidateEngine(prepared, deps, "post-bootstrap");
   }
 
   if (deps.processAlive(existing.parentPid, existing.parentStarttime)) {
@@ -480,7 +558,14 @@ export async function prepareCandidateEngine(
   // Prior group is proven gone: unlink and acquire for this retry.
   deps.remove(lockPath);
   if (writeLock(lockPath, initial, deps, "wx")) {
-    return runOwnedInstall(prepared, lockPath, lockfilePath, digest, deps);
+    return installIfStillValid(prepared, lockPath, lockfilePath, digest, deps);
+  }
+  if (!deps.statePathTrusted(lockPath)) {
+    return closedError(
+      "lock",
+      root,
+      "setup lock path is untrusted; refusing to honor it",
+    );
   }
   const raced = parseLock(deps.readText(lockPath));
   if (raced && deps.processAlive(raced.parentPid, raced.parentStarttime)) {
@@ -558,31 +643,79 @@ function defaultStartInstall(opts: { cwd: string; lockfilePath: string }): Insta
   };
 }
 
+function defaultStatePathTrusted(p: string): boolean {
+  try {
+    const st = fs.lstatSync(p);
+    if (st.isSymbolicLink()) return false;
+    if (typeof process.getuid === "function" && st.uid !== process.getuid()) return false;
+    if (st.mode & 0o022) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function defaultEnsureStateDir(dir: string): boolean {
+  try {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const st = fs.lstatSync(dir);
+    if (st.isSymbolicLink() || !st.isDirectory()) return false;
+    if (typeof process.getuid === "function" && st.uid !== process.getuid()) return false;
+    if ((st.mode & 0o777) !== 0o700 || st.mode & 0o022) {
+      fs.chmodSync(dir, 0o700);
+      const again = fs.lstatSync(dir);
+      if (again.isSymbolicLink() || !again.isDirectory()) return false;
+      if (typeof process.getuid === "function" && again.uid !== process.getuid()) return false;
+      if (again.mode & 0o022) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function defaultReadStateText(p: string): string | null {
+  try {
+    const fd = fs.openSync(p, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    try {
+      const st = fs.fstatSync(fd);
+      if (typeof process.getuid === "function" && st.uid !== process.getuid()) return null;
+      if (st.mode & 0o022) return null;
+      return fs.readFileSync(fd, "utf8");
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return null;
+  }
+}
+
+function defaultWriteStateText(p: string, body: string, flag: "wx" | "w"): boolean {
+  const flags =
+    flag === "wx"
+      ? fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW
+      : fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC | fs.constants.O_NOFOLLOW;
+  try {
+    const fd = fs.openSync(p, flags, 0o600);
+    try {
+      fs.writeFileSync(fd, body);
+    } finally {
+      fs.closeSync(fd);
+    }
+    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (flag === "wx" && code === "EEXIST") return false;
+    if (code === "ELOOP" || code === "EPERM" || code === "EACCES") return false;
+    throw err;
+  }
+}
+
 export function defaultPrepareCandidateEngineDeps(): PrepareCandidateEngineDeps {
   return {
     readFile: (p) => fs.readFileSync(p),
-    readText: (p) => {
-      try {
-        return fs.readFileSync(p, "utf8");
-      } catch {
-        return null;
-      }
-    },
-    writeText: (p, body, flag) => {
-      try {
-        const fd = fs.openSync(p, flag);
-        try {
-          fs.writeFileSync(fd, body);
-        } finally {
-          fs.closeSync(fd);
-        }
-        return true;
-      } catch (err) {
-        const code = (err as NodeJS.ErrnoException).code;
-        if (flag === "wx" && code === "EEXIST") return false;
-        throw err;
-      }
-    },
+    readText: defaultReadStateText,
+    writeText: defaultWriteStateText,
     remove: (p) => {
       try {
         fs.unlinkSync(p);
@@ -593,7 +726,9 @@ export function defaultPrepareCandidateEngineDeps(): PrepareCandidateEngineDeps 
     digest: defaultDigest,
     nowMs: () => Date.now(),
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
-    tmpDir: () => "/tmp",
+    tmpDir: () => resolveCandidateReadinessStateDir(),
+    ensureStateDir: defaultEnsureStateDir,
+    statePathTrusted: defaultStatePathTrusted,
     parentIdentity: () => {
       const pid = process.pid;
       const marker = formatProcessIdentityMarker(pid);

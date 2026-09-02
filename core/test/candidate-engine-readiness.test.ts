@@ -12,6 +12,7 @@ import {
   CANDIDATE_CORE_LOCKFILE_REL,
   READY_RECORD_SCHEMA,
   SETUP_LOCK_SCHEMA,
+  resolveCandidateReadinessStateDir,
   type InstallerHandle,
   type PrepareCandidateEngineDeps,
 } from "../scripts/candidate-engine-readiness.ts";
@@ -98,6 +99,10 @@ function prepareHarness(opts: {
   addOk?: boolean;
   realpath?: (p: string) => string | null;
   onStartInstall?: () => void;
+  porcelainAfterIdentity?: string | null;
+  headAfterIdentity?: string | null;
+  untrustedPaths?: string[];
+  ensureStateDir?: boolean;
 }): {
   deps: ResolveAndPrepareCandidateEngineDeps;
   events: EventLog;
@@ -125,6 +130,24 @@ function prepareHarness(opts: {
     addOk: opts.addOk,
     created,
   });
+  let identityHeadCalls = 0;
+  let identityPorcelainCalls = 0;
+  const origHead = identity.revParseHead;
+  const origPorcelain = identity.porcelain;
+  identity.revParseHead = (cwd) => {
+    identityHeadCalls += 1;
+    if (opts.headAfterIdentity !== undefined && identityHeadCalls > 1) {
+      return opts.headAfterIdentity;
+    }
+    return origHead(cwd);
+  };
+  identity.porcelain = (cwd) => {
+    identityPorcelainCalls += 1;
+    if (opts.porcelainAfterIdentity !== undefined && identityPorcelainCalls > 1) {
+      return opts.porcelainAfterIdentity;
+    }
+    return origPorcelain(cwd);
+  };
   let holdResolve: ((r: { code: number; stdout: string; stderr: string }) => void) | null = null;
   let childGroupAlive = opts.childGroupAlive ?? false;
   let ownerParentAlive = true;
@@ -220,6 +243,8 @@ function prepareHarness(opts: {
       now += 200;
     },
     tmpDir: () => "/tmp-state",
+    ensureStateDir: () => opts.ensureStateDir !== false,
+    statePathTrusted: (p) => !(opts.untrustedPaths ?? []).includes(p),
     parentIdentity: () => ({ pid: 111, starttime: "parent-st" }),
     processAlive: (pid) => {
       if (pid === 111) return ownerParentAlive;
@@ -620,8 +645,152 @@ test("two lexical aliases of one checkout share exactly one install", async () =
   assert.equal(second.ok, true);
   assert.equal(h.installs.length, 1, "aliases of one checkout must serialize on the canonical root");
   assert.equal(h.installs[0]?.cwd, path.join(canonical, "core"));
-  if (first.ok) assert.equal(first.engine.engineRoot, canonical);
-  if (second.ok) assert.equal(second.engine.engineRoot, canonical);
+  if (first.ok) {
+    assert.equal(first.engine.engineRoot, canonical);
+    assert.equal(first.engine.launcherPath, path.join(canonical, "scripts/pipeline-launcher.mjs"));
+  }
+  if (second.ok) {
+    assert.equal(second.engine.engineRoot, canonical);
+    assert.equal(second.engine.launcherPath, path.join(canonical, "scripts/pipeline-launcher.mjs"));
+  }
+});
+
+test("spawned launcher stays under the prepared canonical root after symlink retarget", async () => {
+  const canonical = "/canonical/candidate";
+  const lexical = "/aliases/env-root";
+  const h = prepareHarness({
+    roots: {
+      "/repo": { head: OTHER, porcelain: "" },
+      [lexical]: { head: SHA, porcelain: "" },
+      [canonical]: { head: SHA, porcelain: "" },
+    },
+    lockfiles: {
+      [path.join(lexical, CANDIDATE_CORE_LOCKFILE_REL)]: LOCKFILE_V1,
+      [path.join(canonical, CANDIDATE_CORE_LOCKFILE_REL)]: LOCKFILE_V1,
+    },
+    realpath: (p) => (p === lexical ? canonical : path.resolve(p)),
+  });
+  const r = await resolveThenSpawn(h, { repoDir: "/repo", candidateEngineRootEnv: lexical });
+  assert.equal(r.ok, true);
+  if (r.ok) {
+    assert.equal(r.engine.engineRoot, canonical);
+    assert.equal(r.engine.launcherPath, path.join(canonical, "scripts/pipeline-launcher.mjs"));
+    assert.notEqual(r.engine.launcherPath, path.join(lexical, "scripts/pipeline-launcher.mjs"));
+  }
+  assert.equal(h.spawned[0]?.[1], path.join(canonical, "scripts/pipeline-launcher.mjs"));
+});
+
+test("porcelain mutation between resolve and bootstrap fails closed before install", async () => {
+  const repo = "/repo";
+  const lockfile = path.join(repo, CANDIDATE_CORE_LOCKFILE_REL);
+  const h = prepareHarness({
+    roots: { [repo]: { head: SHA, porcelain: "" } },
+    lockfiles: { [lockfile]: LOCKFILE_V1 },
+    porcelainAfterIdentity: " M core/scripts/pipeline.ts",
+  });
+  const r = await resolveThenSpawn(h, { repoDir: repo });
+  assert.equal(r.ok, false);
+  if (!r.ok) {
+    assert.equal(r.kind, "readiness");
+    assert.match(r.error, /pre-bootstrap tracked porcelain is not empty/);
+  }
+  assert.equal(h.installs.length, 0);
+  assert.equal(h.readyWrites.length, 0);
+  assert.equal(h.spawned.length, 0);
+});
+
+test("SHA mutation between resolve and bootstrap fails closed before install", async () => {
+  const repo = "/repo";
+  const lockfile = path.join(repo, CANDIDATE_CORE_LOCKFILE_REL);
+  const h = prepareHarness({
+    roots: { [repo]: { head: SHA, porcelain: "" } },
+    lockfiles: { [lockfile]: LOCKFILE_V1 },
+    headAfterIdentity: OTHER,
+  });
+  const r = await resolveThenSpawn(h, { repoDir: repo });
+  assert.equal(r.ok, false);
+  if (!r.ok) {
+    assert.equal(r.kind, "readiness");
+    assert.match(r.error, /pre-bootstrap HEAD/);
+    assert.match(r.error, new RegExp(OTHER));
+  }
+  assert.equal(h.installs.length, 0);
+  assert.equal(h.readyWrites.length, 0);
+  assert.equal(h.spawned.length, 0);
+});
+
+test("pre-existing untrusted ready record does not skip install", async () => {
+  const repo = "/repo";
+  const lockfile = path.join(repo, CANDIDATE_CORE_LOCKFILE_REL);
+  const readyPath = candidateReadyRecordPath(repo, SHA, "/tmp-state");
+  const ready = JSON.stringify({
+    schema: READY_RECORD_SCHEMA,
+    engineRoot: repo,
+    commitSha: SHA,
+    lockfileDigest: DIGEST_V1,
+  });
+  const h = prepareHarness({
+    roots: { [repo]: { head: SHA, porcelain: "" } },
+    lockfiles: { [lockfile]: LOCKFILE_V1 },
+    existingReady: `${ready}\n`,
+    untrustedPaths: [readyPath],
+  });
+  const r = await resolveThenSpawn(h, { repoDir: repo });
+  assert.equal(r.ok, true);
+  assert.equal(h.installs.length, 1, "untrusted record must not skip nested-core install");
+  assert.equal(h.spawned.length, 1);
+});
+
+test("pre-existing untrusted setup lock is not treated as ownership", async () => {
+  const repo = "/repo";
+  const lockfile = path.join(repo, CANDIDATE_CORE_LOCKFILE_REL);
+  const lockPath = candidateSetupLockPath(repo, SHA, "/tmp-state");
+  const lockBody = JSON.stringify({
+    schema: SETUP_LOCK_SCHEMA,
+    engineRoot: repo,
+    commitSha: SHA,
+    parentPid: 111,
+    parentStarttime: "parent-st",
+    childPgid: 4242,
+    childStarttime: "child-st",
+    heartbeatAt: 9_999_999,
+  });
+  const h = prepareHarness({
+    roots: { [repo]: { head: SHA, porcelain: "" } },
+    lockfiles: { [lockfile]: LOCKFILE_V1 },
+    existingLock: `${lockBody}\n`,
+    untrustedPaths: [lockPath],
+  });
+  const r = await resolveThenSpawn(h, { repoDir: repo });
+  assert.equal(r.ok, false);
+  if (!r.ok) {
+    assert.equal(r.kind, "lock");
+    assert.match(r.error, /untrusted/);
+  }
+  assert.equal(h.installs.length, 0);
+  assert.equal(h.spawned.length, 0);
+  assert.equal(h.readyWrites.length, 0);
+  assert.equal(h.lockUnlinks.includes(lockPath), false, "must not unlink an untrusted lock path");
+});
+
+test("default readiness state dir is per-user private, not shared /tmp", () => {
+  assert.equal(
+    resolveCandidateReadinessStateDir({ XDG_RUNTIME_DIR: "/run/user/1000" }, "/home/u"),
+    "/run/user/1000/pipeline-candidate-readiness",
+  );
+  assert.equal(
+    resolveCandidateReadinessStateDir({ AGENT_PIPELINE_STATE_HOME: "/state/home" }, "/home/u"),
+    "/state/home/candidate-readiness",
+  );
+  assert.equal(
+    resolveCandidateReadinessStateDir({ XDG_STATE_HOME: "/xdg/state" }, "/home/u"),
+    "/xdg/state/agent-pipeline/candidate-readiness",
+  );
+  assert.equal(
+    resolveCandidateReadinessStateDir({}, "/home/u"),
+    "/home/u/.local/state/agent-pipeline/candidate-readiness",
+  );
+  assert.notEqual(resolveCandidateReadinessStateDir({}, "/home/u"), "/tmp");
 });
 
 test("abandoned ownership fails closed with path and process data", async () => {
@@ -811,6 +980,18 @@ test("seam source does not call detectAndInstall or honor setup_command", () => 
   assert.doesNotMatch(seam, /detectAndInstall/);
   assert.match(seam, /resolveAndPrepareCandidateEngine/);
   assert.match(seam, /resolveCandidateEngine\(/);
+});
+
+test("default state writes refuse shared /tmp and follow no attacker entries", () => {
+  const readiness = fs.readFileSync(
+    path.join(repoRoot, "core/scripts/candidate-engine-readiness.ts"),
+    "utf8",
+  );
+  assert.doesNotMatch(readiness, /tmpDir:\s*\(\)\s*=>\s*"\/tmp"/);
+  assert.match(readiness, /O_NOFOLLOW/);
+  assert.match(readiness, /0o600/);
+  assert.match(readiness, /0o700/);
+  assert.match(readiness, /resolveCandidateReadinessStateDir/);
 });
 
 test("launcher does not self-heal missing candidate node_modules", () => {
