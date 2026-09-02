@@ -5,12 +5,16 @@ import assert from "node:assert/strict";
 import {
   AUDIT_CENSUS_REQUIRED_PATTERNS,
   assertInventoryDispositionsClosed,
+  assertIssueStageMigratedOutcomes,
+  deriveMigratedOutcome,
   discoverProductionSetBlockedSites,
   diffEscalationInventory,
   dispositionForSiteId,
   ESCALATION_INVENTORY,
   ESCALATION_SITE_DISPOSITIONS,
   isEscalationSiteDisposition,
+  isIssueStageInventoryModule,
+  isMigratedOutcome,
   isTransientRetryableSite,
 } from "../scripts/escalation-dispositions.ts";
 import {
@@ -110,6 +114,41 @@ test("disposition drift-guard: every production setBlocked has an inventory row"
     `orphan inventory rows (no production site): ${orphans.map((o) => o.site_id).join("; ")}`,
   );
   assert.equal(ok, true);
+});
+
+test("7.1 issue-stage inventory rows include migrated outcome; missing-row fixture fails", () => {
+  assertIssueStageMigratedOutcomes();
+  const issueStage = ESCALATION_INVENTORY.sites.filter((s) => isIssueStageInventoryModule(s.module));
+  assert.ok(issueStage.length > 0);
+  for (const site of issueStage) {
+    assert.ok(isMigratedOutcome(site.migrated_outcome), site.site_id);
+  }
+  const stripped = {
+    ...ESCALATION_INVENTORY,
+    sites: issueStage.map((s, i) => (i === 0 ? { ...s, migrated_outcome: undefined } : s)),
+  };
+  assert.throws(() => assertIssueStageMigratedOutcomes(stripped), /missing migrated_outcome/);
+});
+
+test("7.2 mechanical worktree/harness/capacity/transport sites do not migrate to Authority Request", () => {
+  for (const site of ESCALATION_INVENTORY.sites) {
+    if (!isIssueStageInventoryModule(site.module)) continue;
+    if (
+      site.blocker_kind === "worktree-capacity" ||
+      site.blocker_kind === "worktree-missing" ||
+      site.blocker_kind === "worktree-creation-failed" ||
+      site.blocker_kind === "harness-failure" ||
+      site.blocker_kind === "push-failed"
+    ) {
+      assert.notEqual(site.migrated_outcome, "typed request", site.site_id);
+      assert.ok(
+        site.migrated_outcome === "Cooling" || site.migrated_outcome === "external-condition wait",
+        `${site.site_id} => ${site.migrated_outcome}`,
+      );
+    }
+  }
+  assert.equal(deriveMigratedOutcome({ blocker_kind: "worktree-capacity", canonical_reason: "worktree-capacity" }), "external-condition wait");
+  assert.equal(deriveMigratedOutcome({ blocker_kind: "harness-failure", canonical_reason: "harness-contract" }), "Cooling");
 });
 
 test("disposition drift-guard bites when a site is missing from inventory", () => {

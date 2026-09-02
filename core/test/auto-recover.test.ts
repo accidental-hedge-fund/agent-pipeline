@@ -9,6 +9,8 @@ import {
   tryAutoRecover,
   type AutoRecoverDeps,
 } from "../scripts/stages/auto_recover.ts";
+import { recordRecoveryEpisodeTreatment } from "../scripts/issue-stage-adapters.ts";
+import { emptyStageAttemptLedger } from "../scripts/stage-attempt-ledger.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
 import type { RunStoreDeps } from "../scripts/run-store.ts";
 
@@ -95,6 +97,7 @@ function memRunStoreDeps(): { deps: RunStoreDeps; lines: () => string[] } {
 function baseDeps(overrides: Partial<AutoRecoverDeps> = {}): AutoRecoverDeps {
   const removeWorktree = overrides.removeWorktree ?? (async () => {});
   return {
+    stageAttemptLedger: emptyStageAttemptLedger(),
     getOnDiskForIssue: async () => ({ path: "/tmp/repo/.worktrees/x", slug: "x" }) as Awaited<ReturnType<AutoRecoverDeps["getOnDiskForIssue"]>>,
     hasCommitsAhead: async () => false,
     getIssueDetail: async () => ({ comments: [] }) as Awaited<ReturnType<AutoRecoverDeps["getIssueDetail"]>>,
@@ -111,6 +114,7 @@ function baseDeps(overrides: Partial<AutoRecoverDeps> = {}): AutoRecoverDeps {
     postComment: async () => {},
     removeLabel: async () => {},
     transition: async () => {},
+    reportObservation: () => {},
     ...overrides,
   };
 }
@@ -151,11 +155,47 @@ test("tryAutoRecover: recovery limit reached → blocked, no correction_event (a
     { body: "## Pipeline: Auto-Recovery (1/2)\n\nRound 1." },
     { body: "## Pipeline: Auto-Recovery (2/2)\n\nRound 2." },
   ];
+  const posted: string[] = [];
   const out = await tryAutoRecover(CFG, 499, undefined, "/tmp/run", runStoreDeps, baseDeps({
     getIssueDetail: async () => ({ comments }) as Awaited<ReturnType<AutoRecoverDeps["getIssueDetail"]>>,
+    postComment: async (_cfg, _n, body) => {
+      posted.push(body);
+    },
   }));
   assert.equal(out.status, "blocked");
   assert.equal(lines().length, 0);
+  assert.equal(posted.length, 0, "must not post a terminal auto-recovery-limit comment");
+  assert.match(out.reason ?? "", /ownership retained|Cooling/i);
+});
+
+test("tryAutoRecover: ledger-counted cap cannot terminalize even with empty comments", async () => {
+  const { deps: runStoreDeps, lines } = memRunStoreDeps();
+  const ledger = emptyStageAttemptLedger();
+  recordRecoveryEpisodeTreatment({
+    ledger,
+    headSha: "unresolved",
+    action: "no_run_recovery",
+    itemId: "499",
+    evidenceFingerprint: "auto-recover-1",
+  });
+  recordRecoveryEpisodeTreatment({
+    ledger,
+    headSha: "unresolved",
+    action: "no_run_recovery",
+    itemId: "499",
+    evidenceFingerprint: "auto-recover-2",
+  });
+  const posted: string[] = [];
+  const out = await tryAutoRecover(CFG, 499, undefined, "/tmp/run", runStoreDeps, baseDeps({
+    stageAttemptLedger: ledger,
+    postComment: async (_cfg, _n, body) => {
+      posted.push(body);
+    },
+  }));
+  assert.equal(out.status, "blocked");
+  assert.equal(lines().length, 0);
+  assert.equal(posted.length, 0, "must not post a terminal auto-recovery-limit comment");
+  assert.match(out.reason ?? "", /ownership retained|Cooling/i);
 });
 
 test("tryAutoRecover: no runDir supplied → recovery still succeeds but no correction_event is emitted", async () => {

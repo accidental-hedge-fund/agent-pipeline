@@ -199,6 +199,7 @@ function makeHarness(state: {
         ];
       },
       log: () => {},
+      reportObservation: () => {},
       tryUnlinkEngineScratch: async () =>
         ({ kind: "no-op", reason: "no scratch" }) as const,
       tryPublishUnpublishedStageCommit: async () =>
@@ -716,6 +717,7 @@ test("5.11 second identical fingerprint → already-spent", async () => {
   assert.equal(first.status, "still-parked");
   const second = await runRecoverParked(cfg(), 1061, {}, h.deps);
   assert.equal(second.status, "already-spent");
+  assert.match(second.message, /remains owned/);
 });
 
 test("5.13 unparked → not-parked; unreadable PR → fail-closed", async () => {

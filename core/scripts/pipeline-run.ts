@@ -178,6 +178,7 @@ import * as preCodeAttestationStage from "./stages/pre_code_attestation.ts";
 import * as shipchecKStage from "./stages/shipcheck.ts";
 import * as deployReady from "./stages/deploy_ready.ts";
 import * as autoRecover from "./stages/auto_recover.ts";
+import { isDeliveryStage, runDeliveryStageAdapter } from "./issue-stage-adapters.ts";
 import {
   reviewStageSkipTarget,
   type BlockerKind,
@@ -227,6 +228,8 @@ export interface AdvanceOpts {
    * `reenterAdvanceAfterRecoverParked` only — not a public CLI flag.
    */
   skipRecoverParked?: boolean;
+  /** RecoverySupervisor observation sink for delivery-stage adapters (#1328). */
+  reportObservation?: import("./operation-observation.ts").ReportOperationObservation;
   /**
    * When false, skip the early `advance_run_handoff` stdout line. Nested
    * in-process re-entry (recover-parked) sets this so train --json stdout
@@ -1016,6 +1019,43 @@ export async function dispatch(
   runStoreDeps?: RunStoreDeps,
   recoveryDeps?: PlanningRecoveryDeps,
 ): Promise<Outcome> {
+  const attempt = () =>
+    dispatchStageHandler(
+      cfg,
+      issueNumber,
+      stage,
+      opts,
+      pipelineRunId,
+      stateDir,
+      runDir,
+      runStoreDeps,
+      recoveryDeps,
+    );
+  if (isDeliveryStage(stage)) {
+    return runDeliveryStageAdapter({
+      stage,
+      cfg,
+      issueNumber,
+      pipelineRunId,
+      logicalOperationId: opts.logicalOperationId,
+      reportObservation: opts.reportObservation,
+      attempt,
+    });
+  }
+  return attempt();
+}
+
+async function dispatchStageHandler(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  stage: Stage,
+  opts: AdvanceOpts,
+  pipelineRunId: string,
+  stateDir?: string,
+  runDir?: string,
+  runStoreDeps?: RunStoreDeps,
+  recoveryDeps?: PlanningRecoveryDeps,
+): Promise<Outcome> {
   const dryRun = !!opts.dryRun;
   const model = opts.model;
   switch (stage) {
@@ -1111,9 +1151,27 @@ export async function dispatch(
     case "review-2":
       return reviewStage.advanceReview(cfg, issueNumber, 2, { dryRun, model, pipelineRunId, stateDir, runDir, runStoreDeps });
     case "fix-1":
-      return fixStage.advanceFix(cfg, issueNumber, 1, { dryRun, model, pipelineRunId, stateDir, runDir, runStoreDeps });
+      return fixStage.advanceFix(cfg, issueNumber, 1, {
+        dryRun,
+        model,
+        pipelineRunId,
+        stateDir,
+        runDir,
+        runStoreDeps,
+        reportObservation: opts.reportObservation,
+        logicalOperationId: opts.logicalOperationId,
+      });
     case "fix-2":
-      return fixStage.advanceFix(cfg, issueNumber, 2, { dryRun, model, pipelineRunId, stateDir, runDir, runStoreDeps });
+      return fixStage.advanceFix(cfg, issueNumber, 2, {
+        dryRun,
+        model,
+        pipelineRunId,
+        stateDir,
+        runDir,
+        runStoreDeps,
+        reportObservation: opts.reportObservation,
+        logicalOperationId: opts.logicalOperationId,
+      });
     case "pre-merge":
       // Use the polling wrapper, not bare advance(). Bare advance returns
       // "waiting" after docs push / on pending CI / after rebase — that

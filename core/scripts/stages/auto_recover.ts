@@ -20,6 +20,16 @@ import {
   type SafeRemoveDeps,
   type SafeRemoveResult,
 } from "../worktree.ts";
+import {
+  claimOrResumeRecoveryEpisode,
+  countRecoveryEpisodeTreatments,
+  recordRecoveryEpisodeTreatment,
+} from "../issue-stage-adapters.ts";
+import { emptyStageAttemptLedger, hydrateStageAttemptLedger, type StageAttemptLedger } from "../stage-attempt-ledger.ts";
+import {
+  defaultRecoverySupervisorReport,
+  type ReportOperationObservation,
+} from "../operation-observation.ts";
 import { recordRecovery } from "../evidence-bundle.ts";
 import { emitCorrectionEvent } from "../correction.ts";
 import * as path from "node:path";
@@ -107,6 +117,10 @@ export interface AutoRecoverDeps {
     toStage: Stage,
     summary: string,
   ) => Promise<void>;
+  reportObservation?: ReportOperationObservation;
+  logicalOperationId?: string | null;
+  /** Injected Recovery Episode ledger. Production hydrates from runDir. */
+  stageAttemptLedger?: StageAttemptLedger;
 }
 
 const defaultAutoRecoverDeps: AutoRecoverDeps = {
@@ -133,6 +147,16 @@ export async function tryAutoRecover(
   runStoreDeps?: RunStoreDeps,
   deps: AutoRecoverDeps = defaultAutoRecoverDeps,
 ): Promise<Outcome> {
+  const report = deps.reportObservation ?? defaultRecoverySupervisorReport;
+  const episode = claimOrResumeRecoveryEpisode({
+    domain: cfg.domain ?? "unknown",
+    logical_operation_id: deps.logicalOperationId,
+    repository: cfg.repo,
+    issue: issueNumber,
+    message: `auto_recover claims Recovery Episode for #${issueNumber}`,
+    reportObservation: report,
+  });
+
   const wt = await deps.getOnDiskForIssue(cfg, issueNumber);
   if (!wt) {
     return { advanced: false, status: "no-op", reason: "no worktree to recover" };
@@ -145,10 +169,36 @@ export async function tryAutoRecover(
 
   const detail = await deps.getIssueDetail(cfg, issueNumber);
   // Dedupe by round token so a retried marker post doesn't inflate the count.
-  const recoveryCount = countRecoveryAttempts(detail.comments);
+  const commentCount = countRecoveryAttempts(detail.comments);
+  const hydrated = hydrateStageAttemptLedger(runDir);
+  let ledger = deps.stageAttemptLedger ?? (hydrated.ok ? hydrated.ledger : emptyStageAttemptLedger());
+  const ledgerCount = countRecoveryEpisodeTreatments(ledger, String(issueNumber));
+  // Ledger is production authority when it has treatments. Comments are
+  // compatibility fallback only — never the sole cap authority (#1328).
+  const recoveryCount = ledgerCount > 0 ? ledgerCount : commentCount;
 
-  // Always remove the failed worktree before retry — through the shared
-  // evaluateRemoveSafety ladder (#759 / #622). Dirty or local-only trees are
+  if (recoveryCount >= cfg.auto_recovery_max_retries) {
+    // Compatibility observation only. Comment-counted cap cannot terminalize
+    // or end RecoverySupervisor ownership (#1328).
+    report(episode);
+    recordRecoveryEpisodeTreatment({
+      ledger,
+      headSha: "unresolved",
+      action: "no_run_recovery",
+      itemId: String(issueNumber),
+      evidenceFingerprint: `auto-recover-cap-${recoveryCount}`,
+      typedReason: "auto-recovery-cap-cooling",
+      runDir: deps.stageAttemptLedger ? undefined : runDir,
+    });
+    return {
+      advanced: false,
+      status: "blocked",
+      reason: `auto-recovery limit reached (${recoveryCount}/${cfg.auto_recovery_max_retries}) — Cooling, ownership retained`,
+    };
+  }
+
+  // RecoverySupervisor treatment: reset-to-ready when no commits ahead.
+  // Shared remove-safety ladder (#759 / #622). Dirty or local-only trees are
   // retained rather than force-destroyed.
   const safeRemove =
     deps.removeManagedWorktreeSafely ?? removeManagedWorktreeSafely;
@@ -163,15 +213,6 @@ export async function tryAutoRecover(
       advanced: false,
       status: "no-op",
       reason: `auto-recover refused unsafe worktree remove: ${removed.reason}`,
-    };
-  }
-
-  if (recoveryCount >= cfg.auto_recovery_max_retries) {
-    await deps.postComment(cfg, issueNumber, buildAutoRecoveryLimitComment(cfg, recoveryCount));
-    return {
-      advanced: false,
-      status: "blocked",
-      reason: `auto-recovery limit reached (${recoveryCount}/${cfg.auto_recovery_max_retries})`,
     };
   }
 
@@ -198,6 +239,16 @@ export async function tryAutoRecover(
   );
 
   await deps.postComment(cfg, issueNumber, buildAutoRecoveryComment(cfg, recoveryCount));
+
+  recordRecoveryEpisodeTreatment({
+    ledger,
+    headSha: "unresolved",
+    action: "no_run_recovery",
+    itemId: String(issueNumber),
+    evidenceFingerprint: `auto-recover-${recoveryCount + 1}`,
+    typedReason: "auto-recover-reset-to-ready",
+    runDir: deps.stageAttemptLedger ? undefined : runDir,
+  });
 
   // Evidence bundle (#147): record the recovery event. Best-effort + gated on
   // stateDir, so unit tests have no filesystem side effects.

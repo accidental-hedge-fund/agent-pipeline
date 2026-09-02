@@ -82,6 +82,10 @@ test("ensureManagedWorktree: already-present → skipped, no create, durable ski
       createCalls += 1;
       return { path: WT_PATH, branch: BRANCH };
     },
+    isOccupiedByOther: () => false,
+    resolveOpenPrHeadForBranch: async () => null,
+    gitCmd: async () => ({ stdout: "", stderr: "", code: 1 }),
+    gitInWorktree: async () => ({ stdout: "", stderr: "", code: 1 }),
     runDir: "/run",
     runStoreDeps: appendOnlyRunStore(appended),
   };
@@ -296,6 +300,10 @@ test("ensureManagedWorktree: HEAD mismatch cleanup prevents re-entry skip on mis
 test("ensureManagedWorktree: no runDir still returns contract (no event)", async () => {
   const deps: EnsureManagedWorktreeDeps = {
     getOnDiskForIssue: async () => ({ path: WT_PATH, slug: SLUG }),
+    isOccupiedByOther: () => false,
+    resolveOpenPrHeadForBranch: async () => null,
+    gitCmd: async () => ({ stdout: "", stderr: "", code: 1 }),
+    gitInWorktree: async () => ({ stdout: "", stderr: "", code: 1 }),
   };
   const out = await ensureManagedWorktree(cfg, ISSUE, deps);
   assert.equal(out.result, "skipped");

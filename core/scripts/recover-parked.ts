@@ -57,6 +57,12 @@ import {
 import { getOnDiskForIssue, gitInWorktree } from "./worktree.ts";
 import { classifyPorcelainForScratchRecover } from "./worktree-dirt.ts";
 import {
+  claimOrResumeRecoveryEpisode,
+  recordRecoveryEpisodeTreatment,
+} from "./issue-stage-adapters.ts";
+import { defaultRecoverySupervisorReport } from "./operation-observation.ts";
+import { emptyStageAttemptLedger, hydrateStageAttemptLedger, type StageAttemptLedger } from "./stage-attempt-ledger.ts";
+import {
   blockerKindFromComments,
   createDefaultImplementDeliverableProbe,
   executePublishUnpublishedStageCommit,
@@ -964,6 +970,12 @@ export interface RecoverParkedDeps {
     opts: { skipRecoverParked: true },
   ) => Promise<void>;
   log?: (msg: string) => void;
+  /** RecoverySupervisor observation sink. Tests inject a memory sink. */
+  reportObservation?: import("./operation-observation.ts").ReportOperationObservation;
+  logicalOperationId?: string | null;
+  /** Recovery Episode ledger. Production hydrates from runDir. */
+  stageAttemptLedger?: StageAttemptLedger;
+  runDir?: string;
   /** Stale-blocked resume sub-deps (tests). */
   staleBlockedDeps?: StaleBlockedResumeDeps;
   /** Injectable seams for default scratch unlink (tests). */
@@ -1303,6 +1315,15 @@ export async function runRecoverParked(
 ): Promise<RecoverParkedResult> {
   const log = deps.log ?? ((m: string) => console.log(m));
   const withLockFn = deps.withIssueLock ?? defaultWithIssueLock;
+  const report = deps.reportObservation ?? defaultRecoverySupervisorReport;
+  claimOrResumeRecoveryEpisode({
+    domain: cfg.domain ?? "unknown",
+    logical_operation_id: deps.logicalOperationId,
+    repository: cfg.repo,
+    issue: issueNumber,
+    message: `recover-parked claims Recovery Episode for #${issueNumber}`,
+    reportObservation: report,
+  });
 
   if (opts.skipRecoverParked) {
     return {
@@ -1755,13 +1776,33 @@ async function runRecoverParkedLocked(
     log(
       `[recover-parked] #${issueNumber}: already-spent fingerprint ${fingerprintId}`,
     );
+    const report = deps.reportObservation ?? defaultRecoverySupervisorReport;
+    claimOrResumeRecoveryEpisode({
+      domain: cfg.domain ?? "unknown",
+      logical_operation_id: deps.logicalOperationId,
+      repository: cfg.repo,
+      issue: issueNumber,
+      message: `recover-parked fingerprint spent — strategy cursor advanced, ownership retained (${fingerprintId})`,
+      reportObservation: report,
+    });
+    const hydrated = hydrateStageAttemptLedger(deps.runDir);
+    const ledger = deps.stageAttemptLedger ?? (hydrated.ok ? hydrated.ledger : emptyStageAttemptLedger());
+    recordRecoveryEpisodeTreatment({
+      ledger,
+      headSha: headSha || "unresolved",
+      action: "no_run_recovery",
+      itemId: String(issueNumber),
+      evidenceFingerprint: fingerprintId,
+      typedReason: "recover-parked-pass-spent",
+      runDir: deps.stageAttemptLedger ? undefined : deps.runDir,
+    });
     return wrap({
       status: "already-spent",
       issue: issueNumber,
       fingerprintId,
       stageId,
       keys: blockingKeys,
-      message: `supervisor pass already spent for fingerprint ${fingerprintId}`,
+      message: `supervisor pass already spent for fingerprint ${fingerprintId}; Logical Operation remains owned`,
     });
   }
 
