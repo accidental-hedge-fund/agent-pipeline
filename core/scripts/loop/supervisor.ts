@@ -35,6 +35,7 @@ import {
   getStatus,
   readActionEvidence,
   readContract,
+  readDecisions,
   readEvents,
   readLedger,
   readLock,
@@ -1588,6 +1589,25 @@ function waitRequestFromClassifier(
   return request;
 }
 
+function hasAutoSettleForCurrentAttempt(
+  decisions: Awaited<ReturnType<typeof readDecisions>>,
+  item: LoopItemLedgerEntry,
+): boolean {
+  let startedAt: string | null = null;
+  for (let i = item.history.length - 1; i >= 0; i--) {
+    if (item.history[i]?.to === "in_progress") {
+      startedAt = item.history[i]!.time;
+      break;
+    }
+  }
+  return decisions.some((decision) => {
+    if (decision.kind !== "loop_item_typed_request_auto_settled") return false;
+    const data = decision.data as { item_id?: unknown } | null;
+    if (!data || data.item_id !== item.id) return false;
+    return startedAt === null || decision.time >= startedAt;
+  });
+}
+
 async function persistAutoSettleAndRevert(
   store: LoopStoreDeps,
   input: { runId: string; token: string; itemId: string; engine: LoopEngineName },
@@ -1597,11 +1617,22 @@ async function persistAutoSettleAndRevert(
   if (!pkg.ok) {
     throw new LoopError("validation", `auto-settle resolution is incomplete: ${pkg.reason}`);
   }
-  await appendDecision(store, input.runId, input.token, "loop_item_typed_request_auto_settled", {
-    item_id: input.itemId,
-    eligibility_reason: classified.eligibility_reason,
-    package: pkg.package,
-  });
+  const ledger = await readLedger(store, input.runId);
+  const item = ledger.items[input.itemId];
+  if (!item) {
+    throw new LoopError("validation", `item "${input.itemId}" not found in run "${input.runId}"`);
+  }
+  const decisions = await readDecisions(store, input.runId);
+  if (!hasAutoSettleForCurrentAttempt(decisions, item)) {
+    await appendDecision(store, input.runId, input.token, "loop_item_typed_request_auto_settled", {
+      item_id: input.itemId,
+      eligibility_reason: classified.eligibility_reason,
+      package: pkg.package,
+    });
+  }
+  if (item.state === "pending") {
+    return ledger;
+  }
   return revertInProgressToPending(
     store,
     input,

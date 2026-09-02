@@ -88,6 +88,13 @@ A `DecisionRequest` and every newly written decision resolution SHALL record rec
 - **THEN** Pipeline SHALL refuse to persist that resolution
 - **AND** SHALL NOT auto-settle or park from the incomplete record
 
+#### Scenario: Auto-settle retry does not duplicate the resolution record
+
+- **WHEN** Pipeline records an auto-settle resolution and the subsequent item revert fails
+- **AND** the same in-progress attempt is classified auto-settle again
+- **THEN** Pipeline SHALL reuse the existing auto-settle record for that attempt
+- **AND** SHALL NOT append a conflicting auto-settle record for that attempt
+
 ---
 
 ### Requirement: CapabilityRequest records SHALL name capability, provider, live probe, and resume condition

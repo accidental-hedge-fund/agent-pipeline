@@ -225,31 +225,81 @@ function requireCompleteTypedRequest(
   return { authority_request: rec.record };
 }
 
-function assertPersistedTypedRequest(outstanding: LoopHumanInputRequest): void {
+/** True when a persisted hold already carries a complete classifier record.
+ *  Pre-change `decision`/`answer`/`authority-grant` holds lack those fields. */
+export function persistedTypedRequestComplete(outstanding: LoopHumanInputRequest): boolean {
   const typed = outstanding.typed_request ?? pauseKindToTypedRequest(outstanding.kind);
   if (typed === "DecisionRequest") {
-    const pkg = validateDecisionPackage(outstanding.decision_package);
-    if (!pkg.ok) {
-      throw new LoopError("validation", pkg.reason);
-    }
-    return;
+    return validateDecisionPackage(outstanding.decision_package).ok;
   }
   if (typed === "CapabilityRequest") {
-    const rec = validateCapabilityRequest(outstanding.capability_request);
-    if (!rec.ok) {
-      throw new LoopError("validation", rec.reason);
-    }
-    return;
+    return validateCapabilityRequest(outstanding.capability_request).ok;
   }
   if (typed === "AuthorityRequest") {
-    const rec = validateAuthorityRequest(
+    return validateAuthorityRequest(
       outstanding.authority_request,
       Boolean(outstanding.authority_candidate_head),
-    );
-    if (!rec.ok) {
-      throw new LoopError("validation", rec.reason);
-    }
+    ).ok;
   }
+  return false;
+}
+
+/** Invalidates a waiting/paused hold that lacks a complete typed-request package
+ *  and re-admits the item as `pending` for shared-classifier reclassification.
+ *  Does not synthesize typed fields and does not accept a human answer. */
+export async function invalidateIncompleteHoldForReclassify(
+  deps: LoopStoreDeps,
+  input: {
+    runId: string;
+    token: string;
+    itemId: string;
+    engine: LoopEngineName;
+    actor?: string;
+    requestId?: string;
+  },
+): Promise<LoopLedger> {
+  await requireToken(deps, input.runId, input.token);
+  const ledger = upgradeLedgerForPauseAuthority(await readLedger(deps, input.runId));
+  const item = ledger.items[input.itemId];
+  if (!item || (item.state !== "waiting" && item.state !== "paused") || !item.hold_request) {
+    throw new LoopError(
+      "validation",
+      `item "${input.itemId}" has no incomplete hold to invalidate`,
+    );
+  }
+  const fromState = item.state;
+  const requestId = input.requestId ?? item.hold_request.request_id;
+  const time = deps.now().toISOString();
+  await appendDecision(deps, input.runId, input.token, "loop_hold_invalidated_for_reclassify", {
+    item_id: input.itemId,
+    from_state: fromState,
+    request_id: requestId,
+    actor: input.actor ?? "engine",
+    reason: "incomplete_typed_request",
+  });
+  const updated = {
+    ...item,
+    state: "pending" as const,
+    hold_request: undefined,
+    history: [
+      ...item.history,
+      {
+        time,
+        from: fromState,
+        to: "pending" as const,
+        engine: input.engine,
+        note: "legacy or incomplete typed-request hold invalidated for classifier re-admission",
+      },
+    ],
+  };
+  const next: LoopLedger = { ...ledger, items: { ...ledger.items, [input.itemId]: updated } };
+  await writeLedger(deps, next, input.token);
+  await appendEvent(deps, input.runId, input.token, "loop_item_hold_invalidated", {
+    item_id: input.itemId,
+    reason: "incomplete_typed_request",
+    request_id: requestId,
+  });
+  return next;
 }
 
 /** Transitions an in_progress item to `waiting`, requiring a well-formed
@@ -399,7 +449,9 @@ export interface ResumeHoldInput {
 /** Resumes a `paused`/`waiting` item to `in_progress` through an audited, fail-closed resume.
  *  Refuses (LoopError "validation"), leaving durable state unchanged, when there is no active
  *  hold, when a `waiting` item's response names a different request, or when the response falls
- *  outside a defined closed permitted set. Still enforces the pipeline-mandate and
+ *  outside a defined closed permitted set. A `waiting` hold that lacks a complete typed-request
+ *  package is not resumed and is not left waiting: it is invalidated and re-admitted as
+ *  `pending` for shared-classifier reclassification. Still enforces the pipeline-mandate and
  *  native-goal-mandate evidence requirements for entering `in_progress` — a satisfying response
  *  with absent/stale mandate evidence is refused under those mandate classes, leaving the item in
  *  its hold. On success, appends an attributed decision to the run's decision log and clears the
@@ -440,13 +492,22 @@ export async function resumeHold(deps: LoopStoreDeps, input: ResumeHoldInput): P
         `resume response names request "${input.response.request_id}", but item "${input.itemId}"'s outstanding request is "${outstanding.request_id}"`,
       );
     }
+    if (!persistedTypedRequestComplete(outstanding)) {
+      return invalidateIncompleteHoldForReclassify(deps, {
+        runId: input.runId,
+        token: input.token,
+        itemId: input.itemId,
+        engine: input.engine,
+        actor: input.actor,
+        requestId: outstanding.request_id,
+      });
+    }
     if (outstanding.permitted_responses && !outstanding.permitted_responses.includes(input.response.value)) {
       throw new LoopError(
         "validation",
         `resume response "${input.response.value}" is not among the outstanding request's permitted responses: ${outstanding.permitted_responses.join(", ")}`,
       );
     }
-    assertPersistedTypedRequest(outstanding);
   }
 
   validatePipelinePreflightEvidence(input.pipeline_preflight);

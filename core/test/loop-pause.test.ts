@@ -312,7 +312,41 @@ test("waitItem: an incomplete DecisionRequest package is refused, leaving state 
   assert.equal(ledger.items["100"].state, "in_progress");
 });
 
-test("resumeHold: an incomplete persisted typed-request record is refused", async () => {
+test("resumeHold: a pre-change waiting hold without a typed-request package is invalidated for classifier re-admission", async () => {
+  const { deps, token } = await setup();
+  const ledger = await readLedger(deps, "run-1");
+  ledger.items["100"] = {
+    ...ledger.items["100"]!,
+    state: "waiting",
+    hold_request: {
+      request_id: "req-legacy",
+      item_id: "100",
+      kind: "decision",
+      prompt: "which base branch?",
+      permitted_responses: ["main", "staging"],
+      requested_by_engine: "claude",
+      requested_at: "2026-07-23T00:00:00.000Z",
+    },
+  };
+  await writeLedger(deps, ledger, token);
+  const after = await resumeHold(deps, {
+    runId: "run-1",
+    token,
+    itemId: "100",
+    engine: "claude",
+    actor: "human:alice",
+    response: { request_id: "req-legacy", value: "main" },
+    pipeline_preflight: PREFLIGHT_OK,
+    native_goal: NATIVE_GOAL_OK,
+  });
+  assert.equal(after.items["100"].state, "pending");
+  assert.equal(after.items["100"].hold_request, undefined);
+  const decisions = await readDecisions(deps, "run-1");
+  assert.ok(decisions.some((d) => d.kind === "loop_hold_invalidated_for_reclassify"));
+  assert.ok(!decisions.some((d) => d.kind === "loop_hold_resumed"));
+});
+
+test("resumeHold: an incomplete persisted typed-request record is invalidated, not left waiting", async () => {
   const { deps, token } = await setup();
   const ledger = await readLedger(deps, "run-1");
   ledger.items["100"] = {
@@ -329,6 +363,37 @@ test("resumeHold: an incomplete persisted typed-request record is refused", asyn
     },
   };
   await writeLedger(deps, ledger, token);
+  const after = await resumeHold(deps, {
+    runId: "run-1",
+    token,
+    itemId: "100",
+    engine: "claude",
+    actor: "human:alice",
+    response: { request_id: "req-incomplete", value: "yes" },
+    pipeline_preflight: PREFLIGHT_OK,
+    native_goal: NATIVE_GOAL_OK,
+  });
+  assert.equal(after.items["100"].state, "pending");
+  assert.equal(after.items["100"].hold_request, undefined);
+  assert.notEqual(after.items["100"].state, "in_progress");
+});
+
+test("resumeHold: a mismatched request id on a legacy hold leaves the item waiting", async () => {
+  const { deps, token } = await setup();
+  const ledger = await readLedger(deps, "run-1");
+  ledger.items["100"] = {
+    ...ledger.items["100"]!,
+    state: "waiting",
+    hold_request: {
+      request_id: "req-legacy",
+      item_id: "100",
+      kind: "answer",
+      prompt: "what is the staging hostname?",
+      requested_by_engine: "claude",
+      requested_at: "2026-07-23T00:00:00.000Z",
+    },
+  };
+  await writeLedger(deps, ledger, token);
   await assert.rejects(
     () =>
       resumeHold(deps, {
@@ -337,18 +402,19 @@ test("resumeHold: an incomplete persisted typed-request record is refused", asyn
         itemId: "100",
         engine: "claude",
         actor: "human:alice",
-        response: { request_id: "req-incomplete", value: "yes" },
+        response: { request_id: "req-other", value: "staging.example" },
         pipeline_preflight: PREFLIGHT_OK,
         native_goal: NATIVE_GOAL_OK,
       }),
     (err: unknown) => {
       assertClass(err, "validation");
-      assert.match((err as Error).message, /decision resolution/);
+      assert.match((err as Error).message, /req-other/);
       return true;
     },
   );
   const after = await readLedger(deps, "run-1");
   assert.equal(after.items["100"].state, "waiting");
+  assert.equal(after.items["100"].hold_request?.request_id, "req-legacy");
 });
 
 test("a paused/waiting hold survives restart — a fresh read sees the same hold and request", async () => {
