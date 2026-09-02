@@ -1,9 +1,4 @@
-# pipeline-run-service Specification
-
-## Purpose
-TBD - created by archiving change command-registry. Update Purpose after archive.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: The advance-loop lifecycle SHALL be exported from `pipeline-run.ts` independently of the CLI
 
@@ -28,19 +23,3 @@ The advance-loop orchestration (locking, run-directory initialization, stage dis
 - **WHEN** a caller invokes `runAdvance` with an `AdvanceOpts` object supplying only advance-relevant fields
 - **THEN** the call SHALL type-check and run without requiring fat `CliOpts` fields for non-advance commands
 - **AND** advance-loop `dispatch` SHALL likewise accept the thin bag rather than fat `CliOpts`
-
-### Requirement: The `pipeline-run.ts` module SHALL retain the injectable `AdvanceDeps` seam
-
-The exported `runAdvance` function SHALL accept an optional `deps: AdvanceDeps` parameter with at minimum a `now?: () => number` clock injection point for the auto-loop wall-clock budget. The `AdvanceDeps` type SHALL be exported from `pipeline-run.ts`. Existing tests that import `AdvanceDeps` from `pipeline.ts` SHALL continue to pass; a re-export from `pipeline.ts` is acceptable to preserve existing import paths.
-
-#### Scenario: Fake clock injection continues to work after extraction
-
-- **WHEN** a test calls `runAdvance(fakeCfg, 42, fakeOpts, { now: () => fixedMs })`
-- **THEN** the auto-loop wall-clock budget check uses `fixedMs` instead of `Date.now()`
-- **AND** the test outcome matches the pre-extraction behavior with the same injected clock
-
-#### Scenario: `AdvanceDeps` re-export from `pipeline.ts` is non-breaking
-
-- **WHEN** existing code imports `{ AdvanceDeps }` from `pipeline.ts`
-- **THEN** the import SHALL resolve to the same type as `{ AdvanceDeps }` from `pipeline-run.ts`
-- **AND** no compile-time or runtime error occurs

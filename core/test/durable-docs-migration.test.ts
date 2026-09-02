@@ -99,7 +99,7 @@ test("durable docs name native-goal ownership, summary fields, filter rationale,
   assert.match(concepts, /suppresses heartbeats/);
   assert.match(concepts, /discover the run by contract/);
   assert.match(concepts, /Do not treat the first newly published basename as ownership/);
-  assert.match(concepts, /`advance_run_handoff`/);
+  assert.match(concepts, /A top-level `advance_run_handoff` is not the canonical identity/);
   assert.match(packaging, /Portable fallback is stdout material lines/);
   assert.match(packaging, /Do not require Claude `PushNotification` on Grok/);
 });

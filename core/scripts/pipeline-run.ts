@@ -232,9 +232,11 @@ export interface AdvanceOpts {
   reportObservation?: import("./operation-observation.ts").ReportOperationObservation;
   /**
    * When false, skip the early `advance_run_handoff` stdout line. Nested
-   * in-process re-entry (recover-parked) sets this so train --json stdout
-   * stays one `train_status` object. Default / omitted emits for top-level
-   * `pipeline <N>`. Spawned loop children set PIPELINE_NESTED_ADVANCE=1.
+   * in-process re-entry (recover-parked) and nested whole-item adapters set
+   * this so parent machine stdout stays one document. Default / omitted emits
+   * for a top-level `runAdvance` caller. Public mutating `pipeline <N>` is not
+   * a top-level `runAdvance` owner. Spawned loop children run the dedicated
+   * nested-advance executor, which always suppresses the handoff.
    */
   emitAdvanceHandoff?: boolean;
   /**

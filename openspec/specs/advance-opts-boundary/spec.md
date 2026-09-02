@@ -2,7 +2,9 @@
 
 ## Purpose
 TBD - created by archiving change split-advance-opts-from-cliopts. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: AdvanceOpts SHALL be owned outside the Commander CLI surface
 
 The advance-loop options bag SHALL be a dedicated type (named `AdvanceOpts` or an equivalent exported type) defined outside `core/scripts/pipeline.ts` and outside Commander program construction. The type SHALL include only fields consumed by the advance loop and stage dispatch (the implementer SHALL derive the field set from `opts.*` reads in the run module; unused kitchen-sink CLI fields such as scoreboard, queue, loop, correction, or report attributes SHALL NOT appear on the bag). Fat `CliOpts` MAY remain the Commander-facing parse shape for the CLI module.
@@ -23,7 +25,7 @@ The advance-loop options bag SHALL be a dedicated type (named `AdvanceOpts` or a
 
 ### Requirement: The advance run module SHALL NOT import the CLI module
 
-`core/scripts/pipeline-run.ts` SHALL NOT import types or values from `./pipeline.ts` / `pipeline.ts`. The advance run module MAY import shared neutral modules, stage modules, and other non-CLI engine modules. The CLI module MAY import the advance run module and map fat CLI opts into the advance options bag at the `runAdvance` call site.
+`core/scripts/pipeline-run.ts` SHALL NOT import types or values from `./pipeline.ts` / `pipeline.ts`. The advance run module MAY import shared neutral modules, stage modules, and other non-CLI engine modules. The CLI module MAY import the advance run module and map fat CLI opts into the advance options bag at the internal executor call site. Public mutating `pipeline <N>` SHALL NOT call that executor as its top-level lifecycle owner. Nested whole-item advancement SHALL pass the mapped bag through the non-public adapter.
 
 #### Scenario: Source-level cycle break
 
@@ -33,11 +35,10 @@ The advance-loop options bag SHALL be a dedicated type (named `AdvanceOpts` or a
 
 #### Scenario: CLI still drives advance via runAdvance
 
-- **WHEN** the operator invokes numeric advance (`pipeline <N>` / equivalent entry)
-- **THEN** the CLI SHALL call `runAdvance` with a mapped advance options bag
-- **AND** stage transitions, labels, events, bundles, and auto-loop behavior SHALL match pre-split behavior for the same logical option values
-
----
+- **WHEN** the operator invokes mutating numeric advance (`pipeline <N>` / equivalent public entry)
+- **THEN** the CLI SHALL enter the one-item durable supervisor rather than calling `runAdvance` as the top-level lifecycle owner
+- **AND** nested whole-item advancement SHALL still call `runAdvance` with a mapped advance options bag
+- **AND** stage transitions, labels, events, bundles, and auto-loop behavior for that nested child SHALL match the existing executor contract for the same logical option values
 
 ### Requirement: Review-ceiling marker and related helpers SHALL be single-sourced
 
@@ -76,4 +77,3 @@ After the advance loop extraction, `pipeline.ts` SHALL NOT retain stage-module i
 
 - **WHEN** a CLI path still calls a stage helper (for example ceiling finding tagging)
 - **THEN** the corresponding stage import SHALL remain and behavior of that CLI path SHALL be unchanged
-

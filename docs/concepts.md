@@ -360,15 +360,9 @@ Generated host SKILLs carry the compact contract. This page keeps the operator d
 
 `pipeline status <N>` reports issue metadata (stage, blocker, PR). It does not discover a run id.
 
-CLI dispatch is unchanged: `pipeline <N>` is a direct advance. `pipeline single <N>` and `pipeline loop` launch through the durable loop.
+Mutating `pipeline <N>` is a compatibility alias for the canonical one-item durable supervisor used by `pipeline single <N>`. `pipeline loop` is the multi-item form of that same supervisor. Invocation syntax does not change lifecycle ownership. A top-level `advance_run_handoff` is not the canonical identity of public numeric drive.
 
-Direct numeric advance retains `advance_run_id` from the `advance_run_handoff` JSON line (`run_id`). That value is the run-store basename (`<issue>-<filesystem-safe-timestamp>`), not the commit-trailer `Pipeline-Run` id (`<issue>/<ISO>`). Follow:
-
-```
-pipeline logs <advance-run-id> --events --follow
-```
-
-Loop and `pipeline single` retain `loop_run_id` from the durable handoff. Follow:
+Mutating `pipeline <N>` and `pipeline single <N>` retain `loop_run_id` from the durable loop handoff (`run_id`). Follow:
 
 ```
 pipeline loop logs <loop-run-id> --events --follow
@@ -380,9 +374,11 @@ After `loop_item_advance_linked` publishes `pipeline_run_id`, retain that value 
 pipeline logs <advance-run-id> --events --follow
 ```
 
+The linked `<advance-run-id>` is the nested child pin, not a second top-level public identity. Hosts follow that linked advance only after linkage. They do not infer the advance identity from the public numeric argv.
+
 Keep the loop follow active. On a later linkage or a terminal advance, stop or replace the prior advance follow. Advance `run_complete` stops or replaces only that advance follow. Keep the loop follow active while the loop remains live. Stop the loop-scoped follow set only on `loop_run_complete`, `loop_run_stopped`, or supervisor exit, in the same turn. Reattach an interrupted follow with the same retained ids. Interrupted follow is non-terminal. Cancelled wait is not completion. A dead worker is not-live, not completion, and not human authority. Restore with `pipeline liveness restore`. Follow with `pipeline logs` / `pipeline loop logs --events --follow`.
 
-After a confirmed terminal loop outcome, emit a final summary with starting-to-ending stage, elapsed time or transitions when available, PR URL when present, terminal state, the operator-authorized merge next step, and confirmation that follows stopped. After a confirmed terminal direct-advance outcome, emit the same fields for that advance. Merge is an operator-authorized next step, not an observer action. Premature supervisor exit is non-terminal failure/recovery, never completion. Invoke `pipeline liveness restore` or portable follow. Do not retry `pipeline single` or classify a recipe because the worker died.
+After a confirmed terminal loop outcome, emit a final summary with starting-to-ending stage, elapsed time or transitions when available, PR URL when present, terminal state, the operator-authorized merge next step, and confirmation that follows stopped. Mutating `pipeline <N>` uses that same loop-terminal contract. It does not complete observation on a child `run_complete` while the one-item supervisor remains live. Merge is an operator-authorized next step, not an observer action. Premature supervisor exit is non-terminal failure/recovery, never completion. Invoke `pipeline liveness restore` or portable follow. Do not retry `pipeline single` or classify a recipe because the worker died.
 
 `pipeline loop --audit` is a short synchronous read-only report. Drive and resume are long-running.
 

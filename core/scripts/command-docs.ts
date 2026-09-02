@@ -50,7 +50,7 @@ const BASE_COMMAND_DOCS: Record<string, CommandDoc> = {
     section: "advance",
   },
   run: {
-    summary: "Advance alias; use with --detach for a legacy raw detached run (desktop launchers)",
+    summary: "Undocumented alias of mutating numeric drive; --detach detaches the one-item supervisor",
     usage: "run <n> [--detach]",
     documented: false,
     section: "advance",

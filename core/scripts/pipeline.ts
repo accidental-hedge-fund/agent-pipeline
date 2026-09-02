@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Top-level orchestrator. Three modes:
 //
-//   pipeline N                            advance loop (default)
+//   pipeline N                            durable one-item drive (alias of pipeline single)
 //   pipeline N --status                   read-only status
 //   pipeline N --unblock "<answer>"       post answer + clear blocked label
 //
@@ -333,16 +333,21 @@ import {
   type PlanningRecoveryDeps,
 } from "./pipeline-run.ts";
 import { nestedAdvanceChildEnv } from "./advance-handoff.ts";
+import {
+  NESTED_ADVANCE_CHILD_SCRIPT,
+  runNestedWholeItemAdvance,
+} from "./nested-advance.ts";
 
 // Re-export for backward compatibility with existing import paths.
 export { isAutoLoopRecoverable, isAutoLoopEligible, canAutoLoopContinue };
 export { ceilingRound, REVIEW_CEILING_MARKER } from "./advance-shared.ts";
 export type { AdvanceDeps, AdvanceOpts, PlanningRecoveryDeps };
+export { NESTED_ADVANCE_CHILD_SCRIPT, runNestedWholeItemAdvance };
 
 /** Map Commander-facing {@link CliOpts} into the thin advance bag (#630). */
 export function toAdvanceOpts(opts: Pick<
   CliOpts,
-  "dryRun" | "model" | "once" | "override" | "jsonEvents" | "profile" | "runId" | "sha"
+  "dryRun" | "model" | "once" | "override" | "jsonEvents" | "profile" | "runId" | "sha" | "engineTrack"
 >): AdvanceOpts {
   const sha = typeof opts.sha === "string" ? opts.sha.trim() : "";
   return {
@@ -357,6 +362,33 @@ export function toAdvanceOpts(opts: Pick<
       ? { engineTrack: opts.engineTrack }
       : {}),
     ...(sha ? { candidateShaOverride: sha } : {}),
+  };
+}
+
+/** Immutable child-advance inputs captured from numeric compatibility flags (#1327). */
+export type OneItemChildAdvanceInputs = Pick<
+  AdvanceOpts,
+  | "dryRun"
+  | "model"
+  | "once"
+  | "runId"
+  | "engineTrack"
+  | "jsonEvents"
+  | "profile"
+  | "candidateShaOverride"
+>;
+
+/** Project {@link AdvanceOpts} onto the one-item child-input bag. */
+export function pickOneItemChildAdvanceInputs(opts: AdvanceOpts): OneItemChildAdvanceInputs {
+  return {
+    dryRun: opts.dryRun,
+    model: opts.model,
+    once: opts.once,
+    runId: opts.runId,
+    engineTrack: opts.engineTrack,
+    jsonEvents: opts.jsonEvents,
+    profile: opts.profile,
+    candidateShaOverride: opts.candidateShaOverride,
   };
 }
 
@@ -1289,11 +1321,30 @@ export async function compileWorkListRunFresh(
  *  (never the external goal-loop skill), then maps the issue's final label
  *  state to a terminal outcome. Injected so unit tests never spawn a real
  *  process. */
-/** Builds the child-process argv for the per-item advance loop hand-off.
- *  Deliberately omits `--once`: the child must run its normal advance loop
- *  to completion (a defined `pipeline/loop-execution@1` terminal outcome —
- *  ready-to-deploy, blocked, or closed), not stop after a single stage (#512
- *  review 1, finding 57fe63fa). Optional `runId` pins the child's
+/** Optional flags forwarded onto a nested whole-item child. Multi-item
+ *  callers omit `once` so the child can reach a contract terminal (#512).
+ *  One-item numeric drive may set `once` via {@link OneItemChildAdvanceInputs}. */
+export type DispatchItemChildArgOpts = {
+  runId?: string;
+  engineTrack?: "pinned" | "candidate";
+  once?: boolean;
+  dryRun?: boolean;
+  model?: string;
+  jsonEvents?: boolean;
+  candidateShaOverride?: string | null;
+  /** Supervisor-resolved `--base` so the nested child does not re-default. */
+  base?: string;
+  /** Supervisor-resolved `--domain` so lock/run namespace matches. */
+  domain?: string;
+};
+
+/** Builds the child-process argv for the per-item nested-advance hand-off.
+ *  The script path is the dedicated nested-advance executor, not public
+ *  `pipeline <N>`. Deliberately omits `--once` unless one-item
+ *  `childAdvance.once` is set: a multi-item child must run its normal advance
+ *  loop to completion (a defined `pipeline/loop-execution@1` terminal outcome
+ *  — ready-to-deploy, blocked, or closed), not stop after a single stage
+ *  (#512 review 1, finding 57fe63fa). Optional `runId` pins the child's
  *  `.agent-pipeline/runs/<run-id>/` via the same internal `--run-id` flag
  *  detached launch already uses (#667). Exported as a pure function so this
  *  contract is unit-testable without spawning a real process. */
@@ -1302,13 +1353,20 @@ export function dispatchItemChildArgs(
   issueNumber: number,
   engine: LoopEngine,
   repoDir: string,
-  opts?: { runId?: string; engineTrack?: "pinned" | "candidate" },
+  opts?: DispatchItemChildArgOpts,
 ): string[] {
   const args = [scriptPath, String(issueNumber), "--profile", engine, "--repo-path", repoDir];
+  if (opts?.base) args.push("--base", opts.base);
+  if (opts?.domain) args.push("--domain", opts.domain);
   if (opts?.runId) args.push("--run-id", opts.runId);
   if (opts?.engineTrack === "pinned" || opts?.engineTrack === "candidate") {
     args.push("--engine-track", opts.engineTrack);
   }
+  if (opts?.once) args.push("--once");
+  if (opts?.dryRun) args.push("--dry-run");
+  if (opts?.model) args.push("--model", opts.model);
+  if (opts?.jsonEvents) args.push("--json-events");
+  if (opts?.candidateShaOverride) args.push("--sha", opts.candidateShaOverride);
   return args;
 }
 
@@ -1542,6 +1600,11 @@ export interface RealDispatchItemDeps {
   readWriteHealthText?: (eventsPath: string) => string | null;
   /** Poll interval (ms) while waiting for store init during the child wait. */
   storeReadyPollMs?: number;
+  /**
+   * One-item numeric compatibility flags forwarded as immutable child inputs
+   * (#1327). Multi-item callers omit this so `--once` stays off the child argv.
+   */
+  childAdvance?: OneItemChildAdvanceInputs;
 }
 
 export function realDispatchItem(
@@ -1557,7 +1620,7 @@ export function realDispatchItem(
   const getGhActorFn = deps.getGhActor ?? getGhActor;
   const getLatestBlockedLabeledAtFn =
     deps.getLatestBlockedLabeledAt ?? getLatestBlockedLabeledAt;
-  const scriptPath = deps.scriptPath ?? fileURLToPath(import.meta.url);
+  const scriptPath = deps.scriptPath ?? NESTED_ADVANCE_CHILD_SCRIPT;
   const execPath = deps.execPath ?? process.execPath;
   const eventsPathExistsFn = deps.eventsPathExists ?? ((p: string) => existsSync(p));
   const readEventsTextFn =
@@ -1581,6 +1644,7 @@ export function realDispatchItem(
       }
     });
   const storeReadyPollMs = deps.storeReadyPollMs ?? 50;
+  const childAdvance = deps.childAdvance;
 
   return async (request, hooks): Promise<LoopExecutionResponse> => {
     const issueNumber = Number(request.item_id);
@@ -1588,10 +1652,17 @@ export function realDispatchItem(
     // (detached-launch pattern). Start linkage + live events_path are published
     // only after the pinned run store is confirmed initialized — never on bare
     // `spawn` (which only proves the OS launched the executable) or on exit
-    // before initRunDir.
+    // before initRunDir. Operator `--run-id` / detach pre-allocation reuse the
+    // supplied id instead of minting a new pin (#1327).
     const pin =
       Number.isFinite(issueNumber) && issueNumber > 0
-        ? pinAdvanceRunIdentity(cfg.repo_dir, issueNumber, nowFn())
+        ? childAdvance?.runId
+          ? {
+              pipeline_run_id: childAdvance.runId,
+              run_dir: runDirPath(cfg.repo_dir, childAdvance.runId),
+              events_path: path.join(runDirPath(cfg.repo_dir, childAdvance.runId), "events.jsonl"),
+            }
+          : pinAdvanceRunIdentity(cfg.repo_dir, issueNumber, nowFn())
         : null;
 
     let startLinkage: Promise<void> = Promise.resolve();
@@ -1614,8 +1685,27 @@ export function realDispatchItem(
           execPath,
           dispatchItemChildArgs(scriptPath, issueNumber, engine, cfg.repo_dir, {
             ...(pin ? { runId: pin.pipeline_run_id } : {}),
-            ...(cfg.engine_track === "pinned" || cfg.engine_track === "candidate"
-              ? { engineTrack: cfg.engine_track }
+            ...(typeof cfg.base_branch === "string" && cfg.base_branch.length > 0
+              ? { base: cfg.base_branch }
+              : {}),
+            ...(typeof cfg.domain === "string" && cfg.domain.length > 0
+              ? { domain: cfg.domain }
+              : {}),
+            ...(childAdvance?.engineTrack === "pinned" || childAdvance?.engineTrack === "candidate"
+              ? { engineTrack: childAdvance.engineTrack }
+              : cfg.engine_track === "pinned" || cfg.engine_track === "candidate"
+                ? { engineTrack: cfg.engine_track }
+                : {}),
+            ...(childAdvance
+              ? {
+                  ...(childAdvance.once ? { once: true } : {}),
+                  ...(childAdvance.dryRun ? { dryRun: true } : {}),
+                  ...(childAdvance.model ? { model: childAdvance.model } : {}),
+                  ...(childAdvance.jsonEvents ? { jsonEvents: true } : {}),
+                  ...(childAdvance.candidateShaOverride
+                    ? { candidateShaOverride: childAdvance.candidateShaOverride }
+                    : {}),
+                }
               : {}),
           }),
           { stdio: "inherit", env: nestedAdvanceChildEnv() },
@@ -2847,11 +2937,27 @@ export interface RunLoopEngineInput {
   follow?: boolean;
   repoDir: string;
   /**
+   * Resolved `--base` / file default so the supervisor and nested child share
+   * one effective base branch (#1327 review 2).
+   */
+  baseBranch?: string;
+  /**
+   * Resolved `--domain` / repo-basename default so lock and run namespace
+   * match the nested child (#1327 review 2).
+   */
+  domainOverride?: string;
+  /**
    * Early run-ready hook (#665): invoked once after exclusive lock and before
    * first item dispatch. Not invoked for `--audit` or failure paths. The engine
    * enriches supervisor context with the selector (null on bare `--resume`).
    */
   onRunReady?: (ctx: LoopRunReadyContext) => void | Promise<void>;
+  /**
+   * One-item numeric compatibility flags (#1327). Present only for
+   * {@link runSingleIssueCommand}; multi-item `pipeline loop` omits this so
+   * child argv still omits `--once`.
+   */
+  childAdvance?: OneItemChildAdvanceInputs;
 }
 
 export type LoopEngineResult =
@@ -2969,7 +3075,12 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
 
   let cfg: PipelineConfig;
   try {
-    cfg = resolveConfig({ repoPath: input.repoDir, profile: input.engine });
+    cfg = resolveConfig({
+      repoPath: input.repoDir,
+      profile: input.engine,
+      ...(input.baseBranch ? { baseBranch: input.baseBranch } : {}),
+      ...(input.domainOverride ? { domainOverride: input.domainOverride } : {}),
+    });
   } catch (err) {
     return { kind: "error", message: `config error: ${(err as Error).message}` };
   }
@@ -3119,7 +3230,7 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
   const supervisorDeps: SupervisorDeps = {
     store,
     observe: defaultReconcileObserveDeps(cfg),
-    dispatchItem: realDispatchItem(cfg, input.engine),
+    dispatchItem: realDispatchItem(cfg, input.engine, { childAdvance: input.childAdvance }),
     executeRecovery: realExecuteRecovery(cfg),
     recoverySleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
     getChangedFiles: realGetChangedFiles(cfg),
@@ -3439,6 +3550,7 @@ export async function runSingleIssueCommand(
     cfg = deps.resolveConfig({
       repoPath: opts.repoPath,
       baseBranch: opts.base,
+      domainOverride: opts.domain,
       profile: opts.profile,
     });
   } catch (err) {
@@ -3464,6 +3576,9 @@ export async function runSingleIssueCommand(
     audit: false,
     autoSupersedeTerminal: true,
     repoDir: cfg.repo_dir,
+    ...(cfg.base_branch ? { baseBranch: cfg.base_branch } : {}),
+    ...(cfg.domain ? { domainOverride: cfg.domain } : {}),
+    childAdvance: pickOneItemChildAdvanceInputs(toAdvanceOpts(opts)),
     onRunReady: async (ctx) => {
       if (output.emitMachineOutput !== false) {
         await deps.writeStdoutLine(
@@ -3504,6 +3619,29 @@ export async function runSingleIssueCommand(
     runId: engineResult.result.runId,
     stopReason,
   };
+}
+
+export interface AdmitMutatingNumericDriveDeps {
+  runSingleIssue: typeof runSingleIssueCommand;
+}
+
+const defaultAdmitMutatingNumericDriveDeps: AdmitMutatingNumericDriveDeps = {
+  runSingleIssue: runSingleIssueCommand,
+};
+
+/**
+ * Remaining mutating numeric drive aliases to the one-item supervisor.
+ * Environment markers such as `PIPELINE_NESTED_ADVANCE` do not select the
+ * nested adapter. Nested whole-item advancement is the dedicated child
+ * executor spawned by supervisor dispatch.
+ */
+export async function admitMutatingNumericDrive(
+  _cfg: PipelineConfig,
+  issueNumber: number,
+  opts: CliOpts,
+  deps: AdmitMutatingNumericDriveDeps = defaultAdmitMutatingNumericDriveDeps,
+): Promise<void> {
+  await deps.runSingleIssue(String(issueNumber), opts);
 }
 
 export interface TrainCommandDeps {
@@ -7242,7 +7380,7 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  await runAdvance(cfg, issueNumber, toAdvanceOpts(opts));
+  await admitMutatingNumericDrive(cfg, issueNumber, opts);
 }
 
 // ---------------------------------------------------------------------------
@@ -8230,12 +8368,18 @@ export interface RunSubcommandDeps {
     reason?: string;
     liveHolder?: { pid: number; hostname: string };
   } | null>;
+  /**
+   * Non-detach attached run. Production: {@link runSingleIssueCommand}.
+   * Injected so unit tests never start a real supervisor.
+   */
+  runSingleIssue?: typeof runSingleIssueCommand;
 }
 const defaultRunSubcommandDeps: RunSubcommandDeps = {
   spawnDetached,
   findGitRoot,
   cwd: () => process.cwd(),
   restoreDeadDetached: (input) => productionRestoreDeadDetached(input),
+  runSingleIssue: runSingleIssueCommand,
 };
 
 export async function handleRunSubcommand(
@@ -8304,9 +8448,11 @@ export async function handleRunSubcommand(
     if (opts.sha) passArgs.push("--sha", opts.sha);
     if (opts.doctor) passArgs.push("--doctor");
     if (opts.failFast) passArgs.push("--fail-fast");
-    // Pin the inner run to the pre-allocated #155 run-store id, and forward
-    // --json-events so the detached run's event stream and run directory are
-    // discoverable via the documented contract rather than the wrapper artifacts (#155).
+    if (opts.engineTrack === "pinned" || opts.engineTrack === "candidate") {
+      passArgs.push("--engine-track", opts.engineTrack);
+    }
+    // Pin the inner nested advance to the pre-allocated #155 run-store id.
+    // This is an immutable child pin, not the canonical loop identity (#1327).
     passArgs.push("--run-id", runStoreRunId);
     if (opts.jsonEvents) passArgs.push("--json-events");
 
@@ -8372,26 +8518,15 @@ export async function handleRunSubcommand(
     console.error(`[pipeline] #${number}: detached run started (PID ${result.pid})`);
     console.error(`[pipeline] #${number}: wrapper supervision: poll ${result.runDir}/sentinel.json (log: ${result.runDir}/pipeline.log)`);
     console.error(`[pipeline] #${number}: structured run artifacts at ${runStoreDir}/ — events.jsonl + terminal.log are the Pipeline Desk contract`);
-    console.error(`[pipeline] #${number}: machine-readable link: ${result.runDir}/run-store.json; follow with: pipeline logs ${runStoreRunId} --follow`);
+    console.error(`[pipeline] #${number}: machine-readable link: ${result.runDir}/run-store.json`);
+    console.error(`[pipeline] #${number}: inner supervisor emits loop_run_handoff onto wrapper stdout; retain that run_id as loop_run_id and follow: pipeline loop logs <loop-run-id> --events --follow`);
+    console.error(`[pipeline] #${number}: pre-allocated --run-id ${runStoreRunId} is the nested advance pin, not the canonical loop identity`);
     return;
   }
 
-  // Non-detach: `pipeline run <N>` ≡ `pipeline <N>`. Resolve config and advance.
-  let cfg: PipelineConfig;
-  try {
-    cfg = resolveConfig({
-      repoPath: opts.repoPath,
-      domainOverride: opts.domain,
-      baseBranch: opts.base,
-      profile: opts.profile,
-    });
-  } catch (err) {
-    console.error(`pipeline run: ${(err as Error).message}`);
-    process.exitCode = 2;
-    return;
-  }
-
-  await runAdvance(cfg, number, toAdvanceOpts(opts));
+  // Non-detach: `pipeline run <N>` ≡ mutating `pipeline <N>` → one-item supervisor.
+  const runSingle = deps.runSingleIssue ?? runSingleIssueCommand;
+  await runSingle(numStr, opts);
 }
 
 // ---------------------------------------------------------------------------

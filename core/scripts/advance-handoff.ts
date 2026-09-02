@@ -28,17 +28,22 @@ export function nestedAdvanceChildEnv(
   return { ...parentEnv, [PIPELINE_NESTED_ADVANCE_ENV]: PIPELINE_NESTED_ADVANCE_VALUE };
 }
 
+/** True when this process is a nested `pipeline/loop-execution@1` child. */
+export function isNestedAdvanceChild(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env[PIPELINE_NESTED_ADVANCE_ENV] === PIPELINE_NESTED_ADVANCE_VALUE;
+}
+
 /**
- * True only for a top-level direct numeric advance. Nested children (loop
+ * True only for a top-level direct `runAdvance` call. Nested children (loop
  * dispatch spawn, in-process recover-parked re-entry) must not emit.
+ * Public mutating `pipeline <N>` is no longer a top-level `runAdvance` owner.
  */
 export function shouldEmitAdvanceRunHandoff(input: {
   emitAdvanceHandoff?: boolean;
   env?: NodeJS.ProcessEnv;
 }): boolean {
   if (input.emitAdvanceHandoff === false) return false;
-  const env = input.env ?? process.env;
-  return env[PIPELINE_NESTED_ADVANCE_ENV] !== PIPELINE_NESTED_ADVANCE_VALUE;
+  return !isNestedAdvanceChild(input.env ?? process.env);
 }
 
 /** Wire shape of the early advance handoff JSON object written to stdout. */

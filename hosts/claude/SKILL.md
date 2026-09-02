@@ -16,12 +16,14 @@ description: |
 
 Host SKILL for the `pipeline` CLI. Execute catalog operations as `pipeline <verb>`.
 
-Default numeric drive (outside the verb table): `pipeline <N>` starts a direct
-advance for issue or PR N. Capture `run_id` from the `advance_run_handoff`
-JSON line as `advance_run_id`. Follow `pipeline logs <advance-run-id> --events --follow`.
-`pipeline single <N>` and `pipeline loop` launch through the durable loop and
-yield `loop_run_id`. `pipeline status <N>` reports issue metadata (stage,
-blocker, PR). It does not discover a run id.
+Default numeric drive (outside the verb table): `pipeline <N>` starts the durable
+one-item drive for issue or PR N, the same lifecycle as `pipeline single <N>`.
+`pipeline <N>` yields `loop_run_id`. Capture `run_id` from the durable loop
+handoff as `loop_run_id`. Follow `pipeline loop logs <loop-run-id> --events --follow`.
+After `loop_item_advance_linked` publishes `pipeline_run_id`, retain that value
+as `advance_run_id` and also follow `pipeline logs <advance-run-id> --events --follow`.
+`pipeline status <N>` reports issue metadata (stage, blocker, PR). It does not
+discover a run id.
 
 ## Operations
 
@@ -57,33 +59,32 @@ Capture durable run ids from handoff and linkage. Do not infer them from
 Do not treat them as seconds-only or as fire-and-forget.
 
 1. Status pre-check: `pipeline status <N>`.
-2. Direct numeric launch: `pipeline <N>`. Retain `advance_run_id` from the
-   `advance_run_handoff` (`run_id`). Follow
-   `pipeline logs <advance-run-id> --events --follow`.
-3. Loop launch: `pipeline single <N>` or `pipeline loop …`. Retain
-   `loop_run_id` from the durable handoff (`run_id`). Follow
-   `pipeline loop logs <loop-run-id> --events --follow`.
-4. After `loop_item_advance_linked` publishes `pipeline_run_id`, retain that
+2. Launch default drive: `pipeline <N>` or `pipeline single <N>`. Retain
+   `loop_run_id` from the durable handoff (`run_id`). `pipeline <N>` yields `loop_run_id`.
+   Follow `pipeline loop logs <loop-run-id> --events --follow`. Multi-item
+   `pipeline loop …` uses the same loop follow.
+3. After `loop_item_advance_linked` publishes `pipeline_run_id`, retain that
    value as the linked `advance_run_id` and also follow
    `pipeline logs <advance-run-id> --events --follow`. Keep the loop follow
    active. On a later linkage or a terminal advance, stop or replace the prior
    advance follow. Do not guess an advance id before linkage.
-5. Notify only material events through the active host row and the shared
+4. Notify only material events through the active host row and the shared
    material filter (`scripts/material-filter.mjs`). See the CLI event
    reference rather than this one-pager for the complete kind inventory.
-6. Reattach an interrupted follow with the same retained ids.
+5. Reattach an interrupted follow with the same retained ids.
    Interrupted follow is non-terminal. Cancelled wait is not completion.
    A dead worker is not-live, not completion, and not human authority.
    Restore with `pipeline liveness restore`. Follow with `pipeline logs` /
    `pipeline loop logs --events --follow` (portable follow).
-7. Advance `run_complete` stops or replaces only that advance follow.
+6. Advance `run_complete` stops or replaces only that advance follow.
    Keep the loop follow active while the loop remains live.
-8. Stop the loop-scoped follow set on `loop_run_complete`,
+7. Stop the loop-scoped follow set on `loop_run_complete`,
    `loop_run_stopped`, or supervisor exit, in the same turn.
-9. After a confirmed terminal loop outcome, emit a final summary with the
-   terminal reason and confirmation that follows stopped. After a confirmed
-   terminal direct-advance outcome, emit the same summary for that advance.
-10. Premature supervisor exit is non-terminal failure/recovery, never
+8. After a confirmed terminal loop outcome, emit a final summary with the
+   terminal reason and confirmation that follows stopped. Mutating
+   `pipeline <N>` uses that same loop-terminal contract rather than completing
+   on a child advance `run_complete` alone.
+9. Premature supervisor exit is non-terminal failure/recovery, never
     completion. Tear down every run-scoped follow, then invoke
     `pipeline liveness restore` or portable follow. Do not retry
     `pipeline single`, classify a recipe, or emit a completion summary.
