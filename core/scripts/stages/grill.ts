@@ -14,6 +14,7 @@ import {
   removeLabel as ghRemoveLabel,
 } from "../gh.ts";
 import { invoke } from "../harness.ts";
+import { mintLogicalOperationId } from "../logical-operation.ts";
 import {
   defaultRecoverySupervisorReport,
   reportMechanicalFault,
@@ -838,6 +839,11 @@ export async function runGrill(input: GrillCliInput, deps: GrillDeps): Promise<n
           form_id: "grill",
           message: (err as Error).message,
           fault: "mechanical",
+          domain: deps.domain,
+          logical_operation_id: mintLogicalOperationId(),
+          repository: deps.repo,
+          issue: id,
+          run_id: ledger.run_id,
         });
       }
       completed.add(id);

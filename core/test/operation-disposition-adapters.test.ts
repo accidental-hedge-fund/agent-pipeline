@@ -15,12 +15,21 @@ import {
   collectReadOnlyRecoveryWrites,
 } from "../scripts/fault-recovery-static-guards.ts";
 import {
+  consumeOwnedOperation,
   listPersistedOperationObservations,
+  loadOwnedOperationClaim,
   mechanicalFaultObservation,
   memoryObservationSink,
+  persistOperationObservation,
   recoverySupervisorObservationSink,
   reportMechanicalFault,
 } from "../scripts/operation-observation.ts";
+import {
+  runEnginePromote,
+  type EnginePromoteDeps,
+} from "../scripts/stages/engine-promote.ts";
+import { runGrill, type GrillDeps, type GrillIssueRecord } from "../scripts/stages/grill.ts";
+import type { GrillStoreDeps } from "../scripts/grill-store.ts";
 import { runQueue, type QueueDeps, type QueueOpts } from "../scripts/stages/queue.ts";
 import { sweepMergedWorktrees, removeWorktreeForIssue, type WorktreeRecord } from "../scripts/worktree.ts";
 import type { PipelineConfig } from "../scripts/types.ts";
@@ -99,14 +108,18 @@ test("queue nested throw reports an observation and does not process.exit(1)", a
       filters: {},
       repoDir: "/fake/repo",
       batchId: "batch-1",
+      domain: "test",
     };
     await runQueue(opts, deps);
     assert.equal(exits.length, 0, "queue must not call process.exit");
-    assert.ok(sink.observations.length >= 1);
-    assert.equal(sink.observations[0]!.owned, true);
-    assert.equal(sink.observations[0]!.complete, false);
-    assert.equal(sink.observations[0]!.human_owned, false);
-    assert.equal(sink.observations[0]!.cancelled, false);
+    const cooling = sink.observations.find((o) => o.lifecycle === "cooling");
+    assert.ok(cooling);
+    assert.equal(cooling.owned, true);
+    assert.equal(cooling.complete, false);
+    assert.equal(cooling.human_owned, false);
+    assert.equal(cooling.cancelled, false);
+    assert.equal(cooling.issue, 1);
+    assert.ok(cooling.logical_operation_id.startsWith("lop-"));
   } finally {
     process.exit = originalExit;
   }
@@ -126,6 +139,8 @@ test("release and factory-release mechanical observations stay owned", () => {
     operation: "release_prepare",
     form_id: "release",
     message: "gh failed",
+    domain: "test",
+    logical_operation_id: "lop-release-test",
   });
   assert.equal(obs.owned, true);
   assert.equal(obs.complete, false);
@@ -189,14 +204,24 @@ test("queue nested throw persists RecoverySupervisor ownership", async () => {
       filters: {},
       repoDir: "/fake/repo",
       batchId: "batch-persist",
+      domain: "test",
     };
     await runQueue(opts, deps);
     const persisted = listPersistedOperationObservations(dir);
-    assert.ok(persisted.length >= 1);
+    assert.equal(persisted.length, 1);
     assert.equal(persisted[0]!.owned, true);
     assert.equal(persisted[0]!.complete, false);
     assert.equal(persisted[0]!.human_owned, false);
     assert.equal(persisted[0]!.form_id, "queue");
+    assert.equal(persisted[0]!.domain, "test");
+    assert.equal(persisted[0]!.issue, 1);
+    assert.ok(persisted[0]!.logical_operation_id.startsWith("lop-"));
+    const loaded = loadOwnedOperationClaim("test", persisted[0]!.logical_operation_id, dir);
+    assert.ok(loaded);
+    const consumed = consumeOwnedOperation(loaded);
+    assert.equal(consumed.owned, true);
+    assert.equal(consumed.lifecycle, "cooling");
+    assert.equal(consumed.issue, 1);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -210,6 +235,9 @@ test("release mechanical fault persists RecoverySupervisor ownership", () => {
       form_id: "release",
       message: "gh failed",
       fault: "mechanical",
+      domain: "test",
+      logical_operation_id: "lop-release-persist",
+      repository: "owner/repo",
     });
     const persisted = listPersistedOperationObservations(dir);
     assert.equal(persisted.length, 1);
@@ -217,6 +245,233 @@ test("release mechanical fault persists RecoverySupervisor ownership", () => {
     assert.equal(persisted[0]!.complete, false);
     assert.equal(persisted[0]!.human_owned, false);
     assert.equal(persisted[0]!.form_id, "release");
+    assert.equal(persisted[0]!.domain, "test");
+    assert.equal(persisted[0]!.logical_operation_id, "lop-release-persist");
+    assert.equal(persisted[0]!.observation_id, "lop-release-persist:release:release_prepare");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("duplicate reports for one logical operation persist a single claim", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pipeline-obs-idempotent-"));
+  try {
+    const sink = recoverySupervisorObservationSink(dir);
+    const input = {
+      operation: "engine_promote",
+      form_id: "engine-promote",
+      message: "not found",
+      fault: "mechanical" as const,
+      domain: "engine",
+      logical_operation_id: "lop-engine-dup",
+      repository: "/repo",
+    };
+    reportMechanicalFault(sink, input);
+    reportMechanicalFault(sink, input);
+    const persisted = listPersistedOperationObservations(dir);
+    assert.equal(persisted.length, 1);
+    assert.equal(persisted[0]!.observation_id, "lop-engine-dup:engine-promote:engine_promote");
+    assert.equal(consumeOwnedOperation(persisted[0]!).owned, true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("engine-promote fault persists one recovery record even if CLI reports again", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pipeline-obs-promote-"));
+  try {
+    const sink = recoverySupervisorObservationSink(dir);
+    const deps: EnginePromoteDeps = {
+      log() {},
+      reportObservation: sink,
+      async verifyPublishedRelease() {
+        return { ok: false, error: "not found" };
+      },
+      async promote() {
+        throw new Error("promote must not run");
+      },
+      async rollback() {
+        throw new Error("rollback must not run");
+      },
+      async loadPin() {
+        return { kind: "missing", path: "/pin.json" };
+      },
+      async installFromTag() {
+        throw new Error("install must not run");
+      },
+      async installedVersion() {
+        return null;
+      },
+      async installedDigest() {
+        return null;
+      },
+      async resolvePromoteGitSha() {
+        return "b".repeat(40);
+      },
+      async listRemainingOpenMilestoneIssues() {
+        return [];
+      },
+      readSkipFrg: () => undefined,
+    };
+    const result = await runEnginePromote(
+      {
+        version: "1.34.0",
+        repoDir: "/repo",
+        host: "codex",
+        domain: "engine",
+        logicalOperationId: "lop-engine-promote-one",
+      },
+      deps,
+    );
+    assert.ok(result.error);
+    assert.equal(result.observation_recorded, true);
+    reportMechanicalFault(sink, {
+      operation: "engine_promote",
+      form_id: "engine-promote",
+      message: result.error ?? "cli",
+      fault: "mechanical",
+      domain: "engine",
+      logical_operation_id: "lop-engine-promote-one",
+      repository: "/repo",
+    });
+    const persisted = listPersistedOperationObservations(dir);
+    assert.equal(persisted.length, 1);
+    assert.equal(persisted[0]!.logical_operation_id, "lop-engine-promote-one");
+    assert.equal(consumeOwnedOperation(persisted[0]!).owned, true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("grill isolated admission fault persists one recovery record even if CLI reports again", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pipeline-obs-grill-"));
+  try {
+    const sink = recoverySupervisorObservationSink(dir);
+    const files = new Map<string, string>();
+    const store: GrillStoreDeps = {
+      fsExists: async (p) => files.has(p),
+      readTextFile: async (p) => files.get(p) ?? null,
+      writeFileAtomic: async (p, c) => {
+        files.set(p, c);
+      },
+      createFileExclusive: async (p, c) => {
+        if (files.has(p)) return false;
+        files.set(p, c);
+        return true;
+      },
+      mkdirp: async () => {},
+      listDir: async () => [],
+      now: () => new Date("2026-09-01T00:00:00Z"),
+      uuid: () => "grillfault01",
+      env: { AGENT_PIPELINE_STATE_HOME: dir },
+    };
+    const issue: GrillIssueRecord = {
+      number: 10,
+      title: "Issue 10",
+      body: "## Summary\nThin.\n",
+      labels: ["pipeline:backlog"],
+      state: "open",
+    };
+    const deps: GrillDeps = {
+      getIssue: async () => issue,
+      fetchDependencyIssue: async () => ({ ok: true, title: issue.title, body: issue.body }),
+      listMilestoneOpenIssues: async () => [],
+      listOpenIssuesByLabel: async () => [],
+      updateIssueBody: async () => {},
+      getIssueLabels: async () => issue.labels,
+      addLabel: async () => {},
+      removeLabel: async () => {},
+      readContextMd: async () => {
+        throw new Error("isolated timeout");
+      },
+      resolveIntegrationBase: async () => "abc123def456",
+      runImplementer: async () => ({ success: true, output: "{}" }),
+      providerConfig: {
+        implementer: "grok",
+        reviewer: "codex",
+        planning_model: "grok-4.6",
+        planning_effort: "auto",
+      },
+      planningTreatment: {
+        adapter: "grok",
+        model: "grok-4.6",
+        effort: "auto",
+      } as never,
+      repo: "acme/r",
+      domain: "acme",
+      repoDir: "/tmp/repo",
+      baseBranch: "main",
+      store,
+      now: () => new Date("2026-09-01T00:00:00Z"),
+      uuid: () => "grillfault01",
+      log: () => {},
+      writeStdout: () => {},
+      writeStderr: () => {},
+      callLog: [],
+      reportObservation: sink,
+    };
+    const exitCode = await runGrill({ issue: 10 }, deps);
+    assert.equal(exitCode, 1);
+    const first = listPersistedOperationObservations(dir);
+    assert.equal(first.length, 1);
+    reportMechanicalFault(sink, {
+      operation: first[0]!.operation,
+      form_id: first[0]!.form_id,
+      message: `pipeline grill exited ${exitCode}`,
+      fault: "mechanical",
+      domain: first[0]!.domain,
+      logical_operation_id: first[0]!.logical_operation_id,
+      repository: first[0]!.repository,
+      issue: first[0]!.issue,
+      run_id: first[0]!.run_id,
+    });
+    const persisted = listPersistedOperationObservations(dir);
+    assert.equal(persisted.length, 1);
+    assert.equal(persisted[0]!.form_id, "grill");
+    assert.equal(persisted[0]!.issue, 10);
+    assert.equal(consumeOwnedOperation(persisted[0]!).owned, true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("engine-promote and grill CLI do not re-report an adapter-observed fault", () => {
+  const src = readFileSync(join(__dirname, "../scripts/pipeline.ts"), "utf8");
+  assert.doesNotMatch(src, /pipeline grill exited/);
+  assert.doesNotMatch(
+    src,
+    /if \(result\.error && !opts\.dryRun\) \{\s*reportMechanicalFault/,
+  );
+});
+
+test("persistOperationObservation refuses an anonymous observation", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pipeline-obs-anon-"));
+  try {
+    assert.throws(
+      () =>
+        persistOperationObservation({
+          schema_version: 1,
+          operation: "release_prepare",
+          form_id: "release",
+          domain: "",
+          logical_operation_id: "",
+          repository: null,
+          issue: null,
+          run_id: null,
+          certainty: "uncertain",
+          lifecycle: "cooling",
+          human_owned: false,
+          complete: false,
+          cancelled: false,
+          process_exit_is_completion: false,
+          owned: true,
+          fault: "mechanical",
+          message: "anon",
+          capability_request: null,
+        }, dir),
+      /domain and logical_operation_id are required/,
+    );
+    assert.equal(listPersistedOperationObservations(dir).length, 0);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

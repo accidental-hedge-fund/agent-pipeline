@@ -17,9 +17,13 @@ import {
   autoFilePapercuts as realAutoFilePapercuts,
   realAutoFileDeps,
 } from "./papercut.ts";
+import { mintLogicalOperationId } from "../logical-operation.ts";
 import {
+  completedOperationObservation,
   defaultRecoverySupervisorReport,
+  ownedAdmissionObservation,
   reportMechanicalFault,
+  reportOwnedOperation,
   type ReportOperationObservation,
 } from "../operation-observation.ts";
 
@@ -670,6 +674,22 @@ async function runQueueUnlocked(opts: QueueOpts, deps: QueueDeps): Promise<void>
 
   function fillSlot(issue: EligibleIssue): void {
     const slotStart = deps.clock();
+    const identity = {
+      domain: (opts.domain ?? "").trim() || "queue",
+      logical_operation_id: mintLogicalOperationId(),
+      repository: opts.repoDir,
+      issue: issue.number,
+      run_id: opts.batchId,
+    };
+    reportOwnedOperation(
+      deps.reportObservation,
+      ownedAdmissionObservation({
+        operation: "queue_nested_drive",
+        form_id: "queue",
+        message: `admitted nested drive #${issue.number}`,
+        ...identity,
+      }),
+    );
     const p = deps.runPipeline(issue.number, { profile: opts.profile, repoPath: opts.repoDir, base: opts.base })
       .catch((err): RunResult => ({
         issueNumber: issue.number,
@@ -686,7 +706,18 @@ async function runQueueUnlocked(opts: QueueOpts, deps: QueueDeps): Promise<void>
             form_id: "queue",
             message,
             fault: /timeout/i.test(message) ? "timeout" : "mechanical",
+            ...identity,
           });
+        } else {
+          reportOwnedOperation(
+            deps.reportObservation,
+            completedOperationObservation({
+              operation: "queue_nested_drive",
+              form_id: "queue",
+              message: `nested drive #${result.issueNumber} ${result.finalState}`,
+              ...identity,
+            }),
+          );
         }
         return { result, issueNumber: result.issueNumber };
       });

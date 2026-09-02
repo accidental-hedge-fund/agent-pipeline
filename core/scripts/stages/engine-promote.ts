@@ -28,6 +28,7 @@ import { formatFrgSkipReason, resolveFrgSkip } from "../frg-skip.ts";
 import { resolveEngineCommitSha } from "../engine-attribution.ts";
 import { resolveOuterHost } from "../outer-hosts/index.ts";
 import { BUILTIN_OUTER_HOST_IDS, type BuiltinOuterHostId } from "../outer-hosts/types.ts";
+import { mintLogicalOperationId } from "../logical-operation.ts";
 import {
   defaultRecoverySupervisorReport,
   reportMechanicalFault,
@@ -70,6 +71,10 @@ export interface EnginePromoteOpts {
    * without promoting or installing.
    */
   expectedPinGeneration?: PinGenerationClaim | null;
+  /** RecoverySupervisor domain for the promote Logical Operation. */
+  domain?: string;
+  /** Resume binding for the promote Logical Operation. Minted when omitted. */
+  logicalOperationId?: string;
 }
 
 /** Durable production-pin identity used as a compare-and-swap claim. */
@@ -126,6 +131,8 @@ export interface EnginePromoteResult {
   reinstall_hint: string | null;
   steps: string[];
   error?: string;
+  /** True when failOwned already reported the fault to RecoverySupervisor. */
+  observation_recorded?: boolean;
 }
 
 export interface EnginePromoteDeps {
@@ -407,6 +414,8 @@ export async function runEnginePromote(
     steps,
   };
 
+  const logicalOperationId = opts.logicalOperationId ?? mintLogicalOperationId();
+  const domain = (opts.domain ?? "engine").trim() || "engine";
   const failOwned = (error: string, extra?: Partial<EnginePromoteResult>): EnginePromoteResult => {
     if (!dryRun) {
       reportMechanicalFault(deps.reportObservation, {
@@ -414,9 +423,13 @@ export async function runEnginePromote(
         form_id: "engine-promote",
         message: error,
         fault: "mechanical",
+        domain,
+        logical_operation_id: logicalOperationId,
+        repository: opts.repoDir,
+        run_id: version,
       });
     }
-    return { ...base, error, ...extra };
+    return { ...base, error, observation_recorded: !dryRun, ...extra };
   };
 
   // 1) Published release

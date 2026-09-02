@@ -48,6 +48,7 @@ import {
 import { PipelineLock, isKillSwitchActive, isLivePlanningActive, tryAcquireLivePlanningMarker, runStateDir, withLock } from "./lock.ts";
 import {
   defaultRecoverySupervisorReport,
+  mintObservationIdentity,
   reportMechanicalFault,
   type ReportOperationObservation,
 } from "./operation-observation.ts";
@@ -4853,6 +4854,7 @@ async function main(): Promise<void> {
           form_id: "release.ensure-tag",
           message,
           fault: "mechanical",
+          ...mintObservationIdentity({ domain: localCfg.domain, repository: localCfg.repo }),
         });
         console.error(`pipeline release ensure-tag: ${message}`);
         process.exitCode = 1;
@@ -4884,6 +4886,7 @@ async function main(): Promise<void> {
           form_id: "release.finish",
           message,
           fault: "mechanical",
+          ...mintObservationIdentity({ domain: localCfg.domain, repository: localCfg.repo }),
         });
         console.error(`pipeline release finish: ${message}`);
         process.exitCode = 1;
@@ -4933,6 +4936,7 @@ async function main(): Promise<void> {
           form_id: "release",
           message,
           fault: "mechanical",
+          ...mintObservationIdentity({ domain: localCfg.domain, repository: localCfg.repo }),
         });
       }
       console.error(`pipeline release: ${message}`);
@@ -5093,17 +5097,7 @@ async function main(): Promise<void> {
       grillDeps,
     );
     if (exitCode === 2) process.exit(2);
-    if (exitCode !== 0) {
-      if (!opts.dryRun && subVerb !== "status") {
-        reportMechanicalFault(grillDeps.reportObservation, {
-          operation: "grill_admit",
-          form_id: "grill",
-          message: `pipeline grill exited ${exitCode}`,
-          fault: "mechanical",
-        });
-      }
-      process.exitCode = exitCode;
-    }
+    if (exitCode !== 0) process.exitCode = exitCode;
     return;
   }
 
@@ -5804,6 +5798,7 @@ async function main(): Promise<void> {
           form_id: "factory-release.prepare",
           message: `factory-release prepare exit ${outcome.exitCode}`,
           fault: "mechanical",
+          ...mintObservationIdentity({ domain: "factory", repository: repoDirFr }),
         });
         process.exitCode = outcome.exitCode;
       }
@@ -5814,6 +5809,7 @@ async function main(): Promise<void> {
         form_id: "factory-release.prepare",
         message,
         fault: "mechanical",
+        ...mintObservationIdentity({ domain: "factory", repository: repoDirFr }),
       });
       console.error(`pipeline factory-release prepare: ${message}`);
       process.exitCode = 1;
@@ -6032,17 +6028,7 @@ async function main(): Promise<void> {
         for (const s of result.steps) console.log(`  - ${s}`);
         if (result.reinstall_hint) console.log(`  reinstall: ${result.reinstall_hint}`);
       }
-      if (result.error && !opts.dryRun) {
-        reportMechanicalFault(defaultRecoverySupervisorReport, {
-          operation: "engine_promote",
-          form_id: "engine-promote",
-          message: result.error,
-          fault: "mechanical",
-        });
-        process.exitCode = 1;
-      } else if (result.error) {
-        process.exitCode = 1;
-      }
+      if (result.error) process.exitCode = 1;
     } catch (err) {
       const message = (err as Error).message;
       if (!opts.dryRun) {
@@ -6051,6 +6037,7 @@ async function main(): Promise<void> {
           form_id: "engine-promote",
           message,
           fault: "mechanical",
+          ...mintObservationIdentity({ domain: "engine", repository: repoDirEp }),
         });
       }
       console.error(`pipeline engine-promote: ${message}`);
@@ -6556,6 +6543,7 @@ async function main(): Promise<void> {
         form_id: "queue",
         message,
         fault: "mechanical",
+        ...mintObservationIdentity({ domain: queueCfg.domain, repository: queueCfg.repo }),
       });
       console.error(`pipeline queue: ${message}`);
       process.exitCode = 1;
@@ -7670,6 +7658,11 @@ export async function runStartPreflightGate(
             detail: capabilityCheck.remediation ?? capabilityCheck.detail,
           }
         : null,
+      ...mintObservationIdentity({
+        domain: cfg.domain,
+        repository: cfg.repo,
+        issue: typeof opts.issue === "number" ? opts.issue : null,
+      }),
     });
     return { proceed: false, result };
   }
@@ -9032,6 +9025,11 @@ export async function runOverride(
       form_id: "override",
       message: (err as Error).message,
       fault: "mechanical",
+      ...mintObservationIdentity({
+        domain: cfg.domain,
+        repository: cfg.repo,
+        issue: issueNumber,
+      }),
     });
     console.error(`pipeline override: ${(err as Error).message}`);
     process.exitCode = 1;

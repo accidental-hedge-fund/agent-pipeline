@@ -253,6 +253,7 @@ function makeDeps(
     writeStdout: () => {},
     writeStderr: () => {},
     callLog: world.callLog,
+    reportObservation: () => {},
   };
 }
 

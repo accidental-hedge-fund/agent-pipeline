@@ -2578,6 +2578,7 @@ test("runStartPreflightGate — failing preflight returns proceed:false (plannin
       return failingResult();
     },
     storePreflightResult: async () => {},
+    reportObservation: () => {},
   };
   const cfg = makeConfig({ doctor: { runOnStart: true, failFast: false } });
   let planningCalls = 0;
@@ -2657,6 +2658,7 @@ test("runStartPreflightGate — repo:'' (gh failure) blocks with doctor summary 
       return runPreflight(config, innerDeps, opts);
     },
     storePreflightResult: async () => {},
+    reportObservation: () => {},
   };
   const output = await captureConsole(async () => {
     const gate = await runStartPreflightGate(cfg, {} as CliOpts, gateDeps);
