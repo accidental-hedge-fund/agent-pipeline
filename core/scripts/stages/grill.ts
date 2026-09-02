@@ -40,6 +40,7 @@ import {
   MAX_NODES,
   MAX_NODE_TEXT,
   parseDecisionsFromBody,
+  writeDecisionResolution,
   type ContextProposal,
   type DecisionNode,
   type DecisionsArtifact,
@@ -78,6 +79,7 @@ import {
   parseSignalsFromModel,
   settleRecommendation,
 } from "../grill-settle.ts";
+import { resolveTypedRequest } from "../typed-request-resolution.ts";
 import {
   appendGrillEvent,
   emptyLedger,
@@ -330,34 +332,95 @@ export function settleFrontierNodes(
         signals.covered_by_existing_authority = false;
       }
       const result = settleRecommendation(node, signals, factText);
-      if (result.kind === "auto-accept") {
-        out.set(node.id, {
-          ...node,
-          resolution: "resolved",
-          provenance: {
-            settled_by: "auto-accept",
-            reference: null,
-            reviewer_verdict: null,
-            reviewer_reason: null,
-            eligibility_reason: result.eligibility_reason,
+      const classified = resolveTypedRequest({
+        nodeClass: node.class,
+        recommendation: node.recommendation,
+        factText,
+        signals: node.signalsRaw,
+        source: "grill",
+        rationale: typeof node.signalsRaw.rationale === "string" ? node.signalsRaw.rationale : undefined,
+        alternatives: Array.isArray(node.signalsRaw.alternatives)
+          ? (node.signalsRaw.alternatives as string[]).filter((a) => typeof a === "string")
+          : undefined,
+        risk: typeof node.signalsRaw.risk === "string" ? node.signalsRaw.risk : undefined,
+        evidence: Array.isArray(node.signalsRaw.evidence)
+          ? (node.signalsRaw.evidence as string[]).filter((e) => typeof e === "string")
+          : undefined,
+      });
+      if (result.kind === "auto-accept" || classified.kind === "auto-settle") {
+        const eligibility =
+          result.kind === "auto-accept"
+            ? result.eligibility_reason
+            : classified.kind === "auto-settle"
+              ? classified.eligibility_reason
+              : result.kind === "typed-request"
+                ? result.reason
+                : "auto-settle";
+        const pkg =
+          classified.kind === "auto-settle" || classified.kind === "DecisionRequest"
+            ? classified.package
+            : {
+                recommendation: node.recommendation,
+                rationale: eligibility,
+                alternatives: [] as string[],
+                risk: "low",
+                evidence: factText.trim() ? [factText.trim()] : [eligibility],
+              };
+        const written = writeDecisionResolution(
+          {
+            ...node,
+            resolution: "resolved",
+            provenance: {
+              settled_by: "auto-accept",
+              reference: null,
+              reviewer_verdict: null,
+              reviewer_reason: null,
+              eligibility_reason: eligibility,
+            },
           },
-        });
+          pkg,
+        );
+        if (!written.ok) {
+          out.set(node.id, node);
+          continue;
+        }
+        out.set(node.id, written.node);
         done.add(node.id);
         continue;
       }
       if (result.kind === "typed-request") {
-        out.set(node.id, {
-          ...node,
-          resolution: "unresolved",
-          typed_request: result.request,
-          provenance: {
-            settled_by: "none",
-            reference: null,
-            reviewer_verdict: null,
-            reviewer_reason: null,
-            eligibility_reason: result.reason,
+        const pkg =
+          classified.kind === "DecisionRequest"
+            ? classified.package
+            : {
+                recommendation: node.recommendation || result.reason,
+                rationale: result.reason,
+                alternatives: [] as string[],
+                risk: result.request === "AuthorityRequest" ? "high" : "medium",
+                evidence: factText.trim() ? [factText.trim()] : [result.reason],
+              };
+        const written = writeDecisionResolution(
+          {
+            ...node,
+            resolution: "unresolved",
+            typed_request: result.request,
+            provenance: {
+              settled_by: "none",
+              reference: null,
+              reviewer_verdict: null,
+              reviewer_reason: null,
+              eligibility_reason: result.reason,
+            },
+            ...(classified.kind === "CapabilityRequest" ? { capability_request: classified.record } : {}),
+            ...(classified.kind === "AuthorityRequest" ? { authority_request: classified.record } : {}),
           },
-        });
+          pkg,
+        );
+        if (!written.ok) {
+          out.set(node.id, node);
+          continue;
+        }
+        out.set(node.id, written.node);
         continue;
       }
       out.set(node.id, node);

@@ -184,10 +184,25 @@ test("waitItem: an in_progress item enters waiting carrying the request, no budg
   assert.ok(req);
   assert.equal(req!.item_id, "100");
   assert.equal(req!.kind, "decision");
+  assert.equal(req!.typed_request, "DecisionRequest");
   assert.equal(req!.prompt, "which base branch?");
   assert.deepEqual(req!.permitted_responses, ["main", "staging"]);
   assert.equal(req!.requested_by_engine, "claude");
   assert.ok(req!.request_id.length > 0);
+});
+
+test("waitItem: answer kind is CapabilityRequest and is not authority-grant", async () => {
+  const { deps, token } = await setup();
+  const ledger = await waitItem(deps, {
+    runId: "run-1",
+    token,
+    itemId: "100",
+    engine: "claude",
+    request: { kind: "answer", prompt: "what is the staging hostname?" },
+  });
+  assert.equal(ledger.items["100"].hold_request?.kind, "answer");
+  assert.equal(ledger.items["100"].hold_request?.typed_request, "CapabilityRequest");
+  assert.notEqual(ledger.items["100"].hold_request?.typed_request, "AuthorityRequest");
 });
 
 test("pauseItem: an engine that does not match the current lock holder is refused, leaving state unchanged", async () => {

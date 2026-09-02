@@ -67,6 +67,8 @@ export interface LoopHumanInputRequest {
   permitted_responses?: string[];
   requested_by_engine: LoopEngineName;
   requested_at: string;
+  /** Public typed-request union projection of {@link kind}. */
+  typed_request?: "DecisionRequest" | "CapabilityRequest" | "AuthorityRequest";
   /** Present only for a hold proven by a canonical current authority
    * diagnostic. Reconciliation requires both values to remain candidate-bound. */
   authority_evidence_key?: string;

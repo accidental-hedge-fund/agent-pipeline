@@ -250,9 +250,9 @@ export function projectPipelineReasonCode(reasonCode: unknown): StageDiagnosticP
     case "external-wait":
       return { blockerClass: "upstream-dependency", disposition: "recover" };
     case "human-context-required":
-      // Underspec / missing operator context is not product authority by itself;
-      // waiting/human-input protocol is a separate durable hold path.
-      return { blockerClass: "specification-decision", disposition: "recover" };
+      // Missing information is a CapabilityRequest or external-condition wait.
+      // Never specification-decision or missing-authority (#1326).
+      return { blockerClass: "upstream-dependency", disposition: "recover" };
     default:
       return {
         blockerClass: "workflow-engine-defect",

@@ -102,16 +102,16 @@ A lifecycle-affecting mutation that remains owned until it proves success, remai
 _Avoid_: one-shot command, terminal-on-error operation
 
 **Decision request**:
-A choice among permitted product alternatives for which Pipeline supplies a recommendation. Policy may accept a reversible authorized default.
-_Avoid_: failure, capability request, authority request
+A choice among permitted product alternatives for which Pipeline supplies a recommendation, rationale, alternatives, risk, and evidence. A reversible in-scope authorized default auto-settles. Product decisions are not authority. Compatibility kind `decision` maps here.
+_Avoid_: failure, capability request, authority request, missing-authority
 
 **Capability request**:
-A typed statement that progress requires an unavailable external capability, condition, or information. It requests restoration or input, not approval.
-_Avoid_: authority request, generic blocker, harness failure
+A typed statement that progress requires unavailable capability or information. It names provider, the exact live probe, and the resume condition. Required information is a CapabilityRequest reason, not a fourth type. A condition that can become true without input is an external-condition wait, not a human ask. Compatibility kind `answer` maps here.
+_Avoid_: authority request, generic blocker, harness failure, specification-decision
 
 **Authority request**:
-A typed request for authority Pipeline does not possess, such as approval for security-sensitive, irreversible, merge/release, or human-attested action. It cannot be settled by a model-authored default.
-_Avoid_: capability request, decision request, generic needs-human
+A typed request for protected authority Pipeline does not possess. It binds eligible actor, repository, operation, scope, candidate epoch, evidence, and expiry, and never records a default grant. Merge, release, deploy, secret, and override authority are never invented. Compatibility kind `authority-grant` maps here.
+_Avoid_: capability request, decision request, generic needs-human, auto-grant
 
 **RecoverySupervisor**:
 The sole lifecycle owner for supervised operations. Command, stage, integration, ship, and host surfaces report observations to it rather than defining their own terminal or recovery policy.

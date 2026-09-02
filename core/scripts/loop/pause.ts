@@ -25,6 +25,7 @@ import {
   type LoopNativeGoalCheck,
   type LoopPipelinePreflightEvidence,
 } from "./types.ts";
+import { pauseKindToTypedRequest } from "../typed-request-resolution.ts";
 import { appendDecision, appendEvent, readLedger, releaseLock, requireToken, writeLedger, type LoopStoreDeps } from "./store.ts";
 
 // ---------------------------------------------------------------------------
@@ -149,6 +150,7 @@ function buildHumanInputRequest(
     permitted = req.permitted_responses as string[];
   }
   const kind: LoopHumanInputRequestKind = req.kind;
+  const typedRequest = pauseKindToTypedRequest(kind);
   if (
     (req.authority_evidence_key !== undefined &&
       (typeof req.authority_evidence_key !== "string" || req.authority_evidence_key.trim() === "")) ||
@@ -169,6 +171,7 @@ function buildHumanInputRequest(
     permitted_responses: permitted,
     requested_by_engine: engine,
     requested_at: deps.now().toISOString(),
+    ...(typedRequest ? { typed_request: typedRequest } : {}),
     source: req.source,
     ...(typeof req.authority_evidence_key === "string"
       ? { authority_evidence_key: req.authority_evidence_key }

@@ -13,6 +13,16 @@ import { artifactSubdir, HANDOFFS_ARTIFACT } from "./artifact-ignore.ts";
 import type { IdentityAdapter } from "./pre-code-attestation.ts";
 import { resolveAuthorizedApprover, type ApproverResolutionResult } from "./pre-code-attestation.ts";
 import type { PreCodeApproverRule } from "./types.ts";
+import { candidateEpochChanged } from "./issue-stage-adapters.ts";
+import type { TypedRequestKind } from "./grill-decisions.ts";
+import {
+  validateAuthorityRequest,
+  validateCapabilityRequest,
+  validateDecisionPackage,
+  type AuthorityRequestRecord,
+  type CapabilityRequestRecord,
+  type DecisionResolutionPackage,
+} from "./typed-request-resolution.ts";
 
 export { HANDOFFS_ARTIFACT };
 
@@ -78,6 +88,7 @@ export interface HumanDecisionRequiredEvidence {
 
 export interface HandoffScopeHashes {
   candidate_sha: string | null;
+  candidate_epoch?: string | null;
   plan_revision?: string | null;
   dossier_hash?: string | null;
   policy_hash?: string | null;
@@ -136,6 +147,10 @@ export interface HumanQuestionHandoff {
   resume_preconditions: string[];
   /** Identity used for idempotent create reuse (finding key + fp + sha). */
   declaration_identity?: string | null;
+  typed_request?: TypedRequestKind;
+  decision_package?: DecisionResolutionPackage;
+  capability_request?: CapabilityRequestRecord;
+  authority_request?: AuthorityRequestRecord;
 }
 
 export type HandoffAuditOp =
@@ -388,6 +403,10 @@ export function parseHumanQuestionHandoff(raw: unknown): HandoffValidation {
     policy_bound_authority_gate: o.policy_bound_authority_gate === true,
     scope: {
       candidate_sha: (scope.candidate_sha as string | null | undefined) ?? null,
+      candidate_epoch:
+        typeof scope.candidate_epoch === "string" && scope.candidate_epoch.trim()
+          ? scope.candidate_epoch
+          : null,
       plan_revision: (scope.plan_revision as string | null | undefined) ?? null,
       dossier_hash: (scope.dossier_hash as string | null | undefined) ?? null,
       policy_hash: (scope.policy_hash as string | null | undefined) ?? null,
@@ -418,6 +437,27 @@ export function parseHumanQuestionHandoff(raw: unknown): HandoffValidation {
     declaration_identity:
       typeof o.declaration_identity === "string" ? o.declaration_identity : null,
   };
+
+  const typed = o.typed_request;
+  if (typed === "DecisionRequest" || typed === "CapabilityRequest" || typed === "AuthorityRequest") {
+    handoff.typed_request = typed;
+    if (typed === "DecisionRequest") {
+      const pkg = validateDecisionPackage(o.decision_package as DecisionResolutionPackage | undefined);
+      if (!pkg.ok) return { ok: false, reason: pkg.reason, raw };
+      handoff.decision_package = pkg.package;
+    } else if (typed === "CapabilityRequest") {
+      const rec = validateCapabilityRequest(o.capability_request as CapabilityRequestRecord | undefined);
+      if (!rec.ok) return { ok: false, reason: rec.reason, raw };
+      handoff.capability_request = rec.record;
+    } else {
+      const rec = validateAuthorityRequest(
+        o.authority_request as AuthorityRequestRecord | undefined,
+        Boolean(handoff.scope.candidate_sha),
+      );
+      if (!rec.ok) return { ok: false, reason: rec.reason, raw };
+      handoff.authority_request = rec.record;
+    }
+  }
   return { ok: true, handoff };
 }
 
@@ -462,6 +502,11 @@ export interface CreateHandoffInput {
    * manual_repair + non_authority (never product_judgment).
    */
   engine_exhaustion_without_decision?: boolean;
+  typed_request?: TypedRequestKind;
+  decision_package?: DecisionResolutionPackage;
+  capability_request?: CapabilityRequestRecord;
+  authority_request?: AuthorityRequestRecord;
+  candidate_epoch?: string | null;
 }
 
 export interface CreateHandoffResult {
@@ -481,7 +526,9 @@ export interface CreateHandoffFailure {
     | "invalid_class"
     | "invalid_authority_mode"
     | "unresolved_authority_routing"
-    | "schema";
+    | "schema"
+    | "incomplete_typed_request"
+    | "default_authority_grant";
 }
 
 /**
@@ -566,6 +613,33 @@ export function canCreateHandoff(
     };
   }
 
+  if (input.typed_request === "DecisionRequest") {
+    const pkg = validateDecisionPackage(input.decision_package);
+    if (!pkg.ok) {
+      return { ok: false, reason: pkg.reason, code: "incomplete_typed_request" };
+    }
+    input = { ...input, decision_package: pkg.package };
+  } else if (input.typed_request === "CapabilityRequest") {
+    const rec = validateCapabilityRequest(input.capability_request);
+    if (!rec.ok) {
+      return { ok: false, reason: rec.reason, code: "incomplete_typed_request" };
+    }
+    input = { ...input, capability_request: rec.record };
+  } else if (input.typed_request === "AuthorityRequest") {
+    if (input.authority_request && "grant" in input.authority_request && input.authority_request.grant != null) {
+      return {
+        ok: false,
+        reason: "AuthorityRequest must not record a default grant",
+        code: "default_authority_grant",
+      };
+    }
+    const rec = validateAuthorityRequest(input.authority_request, input.tip_present === true);
+    if (!rec.ok) {
+      return { ok: false, reason: rec.reason, code: "incomplete_typed_request" };
+    }
+    input = { ...input, authority_request: rec.record };
+  }
+
   // Unresolved authority routing at create: fail closed when authority and no eligible actors.
   const resolution = input.resolution_evidence ?? {
     unresolved: false,
@@ -610,6 +684,7 @@ export function canCreateHandoff(
     policy_bound_authority_gate: input.policy_bound_authority_gate === true,
     scope: {
       candidate_sha: input.candidate_sha ?? null,
+      candidate_epoch: input.candidate_epoch ?? input.authority_request?.candidate_epoch ?? null,
       plan_revision: input.plan_revision ?? null,
       dossier_hash: input.dossier_hash ?? null,
       policy_hash: input.policy_hash ?? null,
@@ -627,6 +702,10 @@ export function canCreateHandoff(
     resume_target: input.resume_target,
     resume_preconditions: input.resume_preconditions ?? [],
     declaration_identity: input.declaration_identity ?? null,
+    ...(input.typed_request ? { typed_request: input.typed_request } : {}),
+    ...(input.decision_package ? { decision_package: input.decision_package } : {}),
+    ...(input.capability_request ? { capability_request: input.capability_request } : {}),
+    ...(input.authority_request ? { authority_request: input.authority_request } : {}),
   };
 
   const parsed = parseHumanQuestionHandoff(handoff);
@@ -1071,6 +1150,7 @@ export function supersedeHandoff(input: SupersedeHandoffInput): SupersedeHandoff
 
 export interface ResumeContext {
   candidate_sha: string | null;
+  candidate_epoch?: string | null;
   dossier_hash?: string | null;
   policy_hash?: string | null;
   plan_revision?: string | null;
@@ -1194,6 +1274,18 @@ export async function validateHandoffResume(
         advances_item: false,
       };
     }
+  }
+  const boundEpoch = h.scope.candidate_epoch ?? h.authority_request?.candidate_epoch ?? null;
+  const currentEpoch = ctx.candidate_epoch ?? ctx.candidate_sha ?? null;
+  if (boundEpoch && candidateEpochChanged(boundEpoch, currentEpoch)) {
+    return {
+      ok: false,
+      reason:
+        `candidate epoch mismatch: handoff bound ${boundEpoch}, ` +
+        `current ${currentEpoch ?? "(none)"}`,
+      code: "stale_sha",
+      advances_item: false,
+    };
   }
 
   if (h.scope.dossier_hash && ctx.dossier_hash !== undefined) {

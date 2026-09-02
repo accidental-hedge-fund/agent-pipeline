@@ -31,6 +31,7 @@ import {
 } from "./grill-proposal.ts";
 import { classifyAuthority, isOperatorRequiredClass } from "./grill-taxonomy.ts";
 import { typedRequestHandoffClass } from "./grill-settle.ts";
+import { defaultAuthorityExpiry } from "./typed-request-resolution.ts";
 import {
   appendHandoffAudit,
   canCreateHandoff,
@@ -356,7 +357,7 @@ export function grillAuthorityCreateInputs(input: GrillHandoffCreateInput): Crea
       ? typedRequestHandoffClass(request, node.class)
       : grillHandoffClass(node.class);
     const nonAuthority = handoffClass === "missing_context";
-    out.push({
+    const created: CreateHandoffInput = {
       domain: input.domain,
       repo: input.repo,
       issue_number: input.issueNumber,
@@ -383,10 +384,41 @@ export function grillAuthorityCreateInputs(input: GrillHandoffCreateInput): Crea
       resume_preconditions: ["grill-authority-answer"],
       resolution_evidence: {
         unresolved: false,
-        eligible_actors: [],
+        eligible_actors: request === "AuthorityRequest" ? ["authenticated-github-actor"] : [],
         resolution_summary: "grill-authority: any authenticated GitHub actor via pipeline handoff answer",
       },
-    });
+    };
+    if (request) {
+      created.typed_request = request;
+      if (request === "DecisionRequest") {
+        created.decision_package = {
+          recommendation: node.recommendation || node.question,
+          rationale: node.rationale || created.reason,
+          alternatives: node.alternatives ?? [],
+          risk: node.risk || "medium",
+          evidence: node.evidence && node.evidence.length > 0 ? node.evidence : [created.reason],
+        };
+      } else if (request === "CapabilityRequest") {
+        created.capability_request = node.capability_request ?? {
+          missing: node.question,
+          provider: "operator",
+          live_probe: `issue body and repository facts for ${node.id}`,
+          resume_condition: "supplied input restores the missing capability or information",
+        };
+      } else {
+        created.authority_request = node.authority_request ?? {
+          eligible_actor: "authenticated-github-actor",
+          repository: input.repo,
+          operation: node.class,
+          scope: node.id,
+          candidate_epoch: null,
+          evidence: node.evidence && node.evidence.length > 0 ? node.evidence : [created.reason],
+          expiry: defaultAuthorityExpiry(),
+          grant: null,
+        };
+      }
+    }
+    out.push(created);
   }
   return out;
 }

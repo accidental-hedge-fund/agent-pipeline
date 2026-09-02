@@ -42,6 +42,13 @@ test("closed blocker taxonomy: only explicit human-decision-required grants huma
   }
 });
 
+test("human-context-required is not specification-decision or missing-authority", () => {
+  const projected = projectPipelineReasonCode("human-context-required");
+  assert.notEqual(projected.blockerClass, "specification-decision");
+  assert.notEqual(projected.blockerClass, "missing-authority");
+  assert.equal(projected.disposition, "recover");
+});
+
 test("generic needs-human and delta-review are mechanical without explicit authority", () => {
   const generic = buildStageDiagnostic({ blockerKind: "needs-human", reason: "free-form says human" });
   assert.equal(projectStageDiagnostic(generic).disposition, "recover");
