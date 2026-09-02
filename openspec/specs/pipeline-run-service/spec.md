@@ -2,16 +2,19 @@
 
 ## Purpose
 TBD - created by archiving change command-registry. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: The advance-loop lifecycle SHALL be exported from `pipeline-run.ts` independently of the CLI
 
-The advance-loop orchestration (locking, run-directory initialization, stage dispatch, event emission, evidence bundle management, auto-loop budget tracking, finalization, and terminal-log tee) SHALL be encapsulated in `core/scripts/pipeline-run.ts` and exported as `runAdvance(cfg: PipelineConfig, issueNumber: number, opts: AdvanceOpts, deps?: AdvanceDeps): Promise<void>` (where `AdvanceOpts` is the thin advance options type owned outside the Commander CLI surface; an equivalent exported name is acceptable). The CLI (`pipeline.ts`) SHALL call this export rather than embedding the lifecycle inline, mapping any Commander-facing opts into `AdvanceOpts` at the call site. The runtime behavior and observable outputs (stage transitions, GitHub label writes, events emitted, bundle contents) for a given logical option set SHALL be identical to the pre-split implementation. `pipeline-run.ts` SHALL NOT import types or values from `pipeline.ts`.
+The advance-loop orchestration (locking, run-directory initialization, stage dispatch, event emission, evidence bundle management, auto-loop budget tracking, finalization, and terminal-log tee) SHALL be encapsulated in `core/scripts/pipeline-run.ts` and exported as `runAdvance(cfg: PipelineConfig, issueNumber: number, opts: AdvanceOpts, deps?: AdvanceDeps): Promise<void>` (where `AdvanceOpts` is the thin advance options type owned outside the Commander CLI surface; an equivalent exported name is acceptable). That export SHALL remain the internal executor for nested whole-item advancement. Public mutating `pipeline <N>` SHALL NOT call this export as its top-level lifecycle owner. The CLI (`pipeline.ts`) MAY import the export for the non-public nested adapter and map any Commander-facing opts into `AdvanceOpts` at that internal call site. `pipeline-run.ts` SHALL NOT import types or values from `pipeline.ts`. The nested executor SHALL NOT recursively create another durable supervisor.
 
 #### Scenario: CLI behavior is unchanged after extraction
 
 - **WHEN** `pipeline <N>` is invoked after the extraction
-- **THEN** the run outcome (stage transitions, labels applied, events emitted, bundle written, auto-loop behavior) SHALL be identical to the pre-extraction behavior for the same logical advance options
-- **AND** no existing stage-loop test or lifecycle test SHALL require modification to pass beyond updating the options type name or import path
+- **THEN** public mutating numeric drive SHALL enter the one-item durable supervisor rather than using `runAdvance` as the top-level lifecycle owner
+- **AND** nested whole-item advancement SHALL still use `runAdvance` as the internal executor
+- **AND** a fixture that treats public numeric drive as a top-level `runAdvance` owner SHALL fail
 
 #### Scenario: `runAdvance` is importable without importing the CLI
 
@@ -41,4 +44,3 @@ The exported `runAdvance` function SHALL accept an optional `deps: AdvanceDeps` 
 - **WHEN** existing code imports `{ AdvanceDeps }` from `pipeline.ts`
 - **THEN** the import SHALL resolve to the same type as `{ AdvanceDeps }` from `pipeline-run.ts`
 - **AND** no compile-time or runtime error occurs
-
