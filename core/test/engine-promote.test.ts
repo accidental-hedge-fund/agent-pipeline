@@ -67,6 +67,7 @@ function makeDeps(over: Partial<EnginePromoteDeps> = {}): EnginePromoteDeps & {
   let current: ProductionEnginePin | null = pin("1.31.1");
   const base: EnginePromoteDeps = {
     log() {},
+    reportObservation() {},
     async verifyPublishedRelease() {
       return { ok: true };
     },

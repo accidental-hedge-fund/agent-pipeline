@@ -190,6 +190,11 @@ function makeOverrideDeps(
     },
     // #693: authenticated actor required for governed record path.
     getGhActor: async () => "operator",
+    fulfillTypedRequest: async () => ({
+      resume: { ok: true, resume_target: "override-or-unblock", handoff_id: "h1" },
+      handoff: null,
+      fulfilled: true,
+    }),
   };
   return { deps, rec };
 }
@@ -637,6 +642,11 @@ test("runUnblock (#499): a successful unblock (label cleared) appends one correc
       getIssueDetail: (async () => detail) as RunUnblockDeps["getIssueDetail"],
       postComment: async () => {},
       clearBlocked: async () => {},
+      fulfillTypedRequest: async () => ({
+        resume: { ok: true, resume_target: "override-or-unblock", handoff_id: "h1" },
+        handoff: null,
+        fulfilled: true,
+      }),
     } as RunUnblockDeps;
 
     await quiet(t, async () => {

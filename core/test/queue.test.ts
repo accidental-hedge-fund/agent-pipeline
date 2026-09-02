@@ -63,6 +63,7 @@ function makeDeps(overrides: Partial<QueueDeps> = {}): QueueDeps & { written: Ma
     autoFileCorrections: async () => {},
     log: (msg) => { logs.push(msg); },
     clock: () => ++tick * 100,
+    reportObservation: () => {},
     written,
     logs,
     ...overrides,

@@ -5,6 +5,7 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
+import { SUPERVISED_COMMAND_MODULES } from "./command-form-inventory.ts";
 
 export const RETIRED_RECOVERY_CONTROLLERS = [
   "legacy-recovery-controller",
@@ -59,8 +60,33 @@ export function collectRetiredControllerImports(source: string, file = "fixture.
 
 export function collectCommandLocalLifecycleExits(source: string, file = "fixture.ts"): StaticGuardHit[] {
   const hits: StaticGuardHit[] = [];
-  if (/process\.exit\s*\(/.test(source) && /mechanical|recovery|exhaust/.test(source)) {
-    hits.push({ file, reason: "command-local lifecycle process.exit on a mechanical fault" });
+  const lines = source.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    if (!/process\.exit\s*\(\s*1\s*\)/.test(lines[i]!)) continue;
+    const start = Math.max(0, i - 2);
+    const end = Math.min(lines.length, i + 3);
+    const window = lines.slice(start, end).join("\n");
+    if (/mechanical|recovery|exhaust/.test(window)) {
+      hits.push({ file, reason: "command-local lifecycle process.exit on a mechanical fault" });
+    }
+  }
+  return hits;
+}
+
+export const RECOVERY_WRITE_IDENTIFIERS = [
+  "writeRecoveryEpisode",
+  "createRecoveryEpisode",
+  "cancelRecoveryEpisode",
+  "updateRecoveryEpisode",
+] as const;
+
+export function collectReadOnlyRecoveryWrites(source: string, file = "fixture.ts"): StaticGuardHit[] {
+  const hits: StaticGuardHit[] = [];
+  for (const id of RECOVERY_WRITE_IDENTIFIERS) {
+    const re = new RegExp(`\\b${id}\\s*\\(`);
+    if (re.test(source)) {
+      hits.push({ file, reason: `read-only form writes recovery state via ${id}` });
+    }
   }
   return hits;
 }
@@ -102,8 +128,11 @@ export function scanProductionRecoveryGuards(coreRoot?: string): StaticGuardHit[
     const rel = relative(root, abs);
     const source = readFileSync(abs, "utf8");
     hits.push(...collectRetiredControllerImports(source, rel));
-    if (rel.startsWith(COMMAND_MODULE_DIR)) {
+    const supervisedRel = SUPERVISED_COMMAND_MODULES.filter((m) => m !== "scripts/pipeline.ts");
+    if (rel.startsWith(COMMAND_MODULE_DIR) || supervisedRel.includes(rel as (typeof supervisedRel)[number])) {
       hits.push(...collectCommandLocalLifecycleExits(source, rel));
+    }
+    if (rel.startsWith(COMMAND_MODULE_DIR)) {
       hits.push(...collectDirectStageLifecycleWrites(source, rel));
     }
     if (

@@ -28,6 +28,11 @@ import { formatFrgSkipReason, resolveFrgSkip } from "../frg-skip.ts";
 import { resolveEngineCommitSha } from "../engine-attribution.ts";
 import { resolveOuterHost } from "../outer-hosts/index.ts";
 import { BUILTIN_OUTER_HOST_IDS, type BuiltinOuterHostId } from "../outer-hosts/types.ts";
+import { mintLogicalOperationId } from "../logical-operation.ts";
+import {
+  defaultRecoverySupervisorReport,
+  reportMechanicalFault,
+} from "../operation-observation.ts";
 import {
   assertNoRemainingOpenMilestoneIssues,
   listRemainingOpenMilestoneIssueNumbers,
@@ -66,6 +71,10 @@ export interface EnginePromoteOpts {
    * without promoting or installing.
    */
   expectedPinGeneration?: PinGenerationClaim | null;
+  /** RecoverySupervisor domain for the promote Logical Operation. */
+  domain?: string;
+  /** Resume binding for the promote Logical Operation. Minted when omitted. */
+  logicalOperationId?: string;
 }
 
 /** Durable production-pin identity used as a compare-and-swap claim. */
@@ -122,10 +131,13 @@ export interface EnginePromoteResult {
   reinstall_hint: string | null;
   steps: string[];
   error?: string;
+  /** True when failOwned already reported the fault to RecoverySupervisor. */
+  observation_recorded?: boolean;
 }
 
 export interface EnginePromoteDeps {
   log(msg: string): void;
+  reportObservation?: import("../operation-observation.ts").ReportOperationObservation;
   /** True when GitHub has a non-draft release for tag. */
   verifyPublishedRelease(tag: string): Promise<{ ok: true } | { ok: false; error: string }>;
   promote(opts: {
@@ -402,11 +414,29 @@ export async function runEnginePromote(
     steps,
   };
 
+  const logicalOperationId = opts.logicalOperationId ?? mintLogicalOperationId();
+  const domain = (opts.domain ?? "engine").trim() || "engine";
+  const failOwned = (error: string, extra?: Partial<EnginePromoteResult>): EnginePromoteResult => {
+    if (!dryRun) {
+      reportMechanicalFault(deps.reportObservation, {
+        operation: "engine_promote",
+        form_id: "engine-promote",
+        message: error,
+        fault: "mechanical",
+        domain,
+        logical_operation_id: logicalOperationId,
+        repository: opts.repoDir,
+        run_id: version,
+      });
+    }
+    return { ...base, error, observation_recorded: !dryRun, ...extra };
+  };
+
   // 1) Published release
   deps.log(`[engine-promote] verifying GitHub Release ${tag}…`);
   const rel = await deps.verifyPublishedRelease(tag);
   if (!rel.ok) {
-    return { ...base, error: rel.error, steps: [...steps, `release_verify_failed: ${rel.error}`] };
+    return failOwned(rel.error, { steps: [...steps, `release_verify_failed: ${rel.error}`] });
   }
   steps.push(`release_verified: ${tag}`);
   base.release_verified = true;
@@ -423,7 +453,7 @@ export async function runEnginePromote(
       steps.push(`git_sha_peeled: ${gitSha.slice(0, 12)}`);
     } catch (err) {
       const msg = (err as Error).message;
-      return { ...base, error: msg, steps: [...steps, `peel_failed: ${msg}`] };
+      return failOwned(msg, { steps: [...steps, `peel_failed: ${msg}`] });
     }
   }
 
@@ -537,7 +567,7 @@ export async function runEnginePromote(
     steps.push(`install_failed: ${msg}`);
     deps.log(`[engine-promote] install failed: ${msg}`);
     steps.push("rollback_not_granted: generic install failure");
-    return { ...base, error: `install failed: ${msg}` };
+    return failOwned(`install failed: ${msg}`);
   }
 
   if (expectedPinGeneration) {
@@ -588,7 +618,7 @@ export async function runEnginePromote(
       : digestProof.reason;
     steps.push(`verify_failed: ${msg}`);
     steps.push("rollback_not_granted: generic verify failure");
-    return { ...base, error: msg };
+    return failOwned(msg);
   }
 
   return base;
@@ -599,6 +629,7 @@ export function realEnginePromoteDeps(repoDir: string): EnginePromoteDeps {
     log(msg) {
       console.error(msg);
     },
+    reportObservation: defaultRecoverySupervisorReport,
     async verifyPublishedRelease(tag) {
       try {
         const { stdout } = await execFileAsync(

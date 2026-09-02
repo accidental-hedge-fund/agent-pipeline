@@ -6,7 +6,9 @@ This page is generated from `COMMAND_REGISTRY`, `OPERATION_SURFACE`, and
 co-located metadata in `core/scripts/command-docs.ts`. Do not hand-edit the command inventory.
 
 Host skills execute the in-scope catalog as `pipeline <verb>`. The Node CLI
-is `pipeline`. This page is the full documented inventory.
+is `pipeline`. OPERATION_SURFACE is the host SKILL catalog, not the complete
+command-form inventory. Documented `--dry-run` and `status` forms are read-only;
+they do not start a durable run or merge.
 
 Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 
@@ -245,3 +247,5 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
   omitted here but remain dispatchable when registered.
 - Flag allowlists and dispatch semantics live in `command-registry.ts`; this
   page does not redefine them.
+- Dry-run, apply, and status forms are classified in the command-form inventory;
+  a `--dry-run` or `status` usage is not a mutating drive.

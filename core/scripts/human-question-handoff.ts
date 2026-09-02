@@ -1108,7 +1108,8 @@ export type ResumeValidation =
         | "ambiguous_resume_target"
         | "stage_preconditions"
         | "authorization_stale"
-        | "unsupported_schema";
+        | "unsupported_schema"
+        | "no_pending_request";
       advances_item: false;
     };
 
