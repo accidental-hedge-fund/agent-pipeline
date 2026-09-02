@@ -160,6 +160,13 @@ export const PORCELAIN_DIRT_SITES: readonly PorcelainDirtSiteEntry[] = [
     notes: "Repair inspects porcelain for dirty refuse; not a scratch-classification dirt gate",
   },
   {
+    site_id: "loop.reconcile",
+    module: "scripts/loop/reconcile.ts",
+    disposition: "not-porcelain-dirt-gate",
+    notes:
+      "Reconcile observes git status --porcelain for worktree identity (product_dirt); not a scratch-classification setBlocked gate (#1324)",
+  },
+  {
     site_id: "openspec-consistency",
     module: "scripts/openspec-consistency.ts",
     disposition: "not-porcelain-dirt-gate",
