@@ -39,6 +39,7 @@ import {
   normalizeEvidenceIdentity,
   perStrategyBound,
   resumeEpisodeFromAttempts,
+  stampEpisodeNextEligibleAt,
   type RecoveryEpisodeKey,
 } from "./recovery-episodes.ts";
 
@@ -1000,7 +1001,21 @@ export async function persistOwnedCooling(
   },
 ): Promise<LoopLedger> {
   const ledger = upgradeLedgerForRecovery(await readLedger(deps, input.runId));
-  const next: LoopLedger = { ...ledger, cooling: input.cooling, stop: ledger.stop };
+  const itemCooling = { ...(ledger.item_cooling ?? {}) };
+  if (input.cooling.item_id) {
+    itemCooling[input.cooling.item_id] = input.cooling;
+  }
+  const attempts =
+    input.cooling.item_id && input.cooling.next_eligible_at
+      ? stampEpisodeNextEligibleAt(ledger.recovery_attempts, input.cooling.item_id, input.cooling.next_eligible_at)
+      : ledger.recovery_attempts;
+  const next: LoopLedger = {
+    ...ledger,
+    cooling: input.cooling,
+    ...(Object.keys(itemCooling).length > 0 ? { item_cooling: itemCooling } : {}),
+    recovery_attempts: attempts,
+    stop: ledger.stop,
+  };
   await writeLedger(deps, next, input.token);
   await appendEvent(deps, input.runId, input.token, "loop_item_cooling", {
     item_id: input.cooling.item_id,

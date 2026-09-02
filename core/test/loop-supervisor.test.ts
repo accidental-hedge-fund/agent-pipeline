@@ -34,7 +34,8 @@ import {
   writeLedger,
   type LoopStoreDeps,
 } from "../scripts/loop/store.ts";
-import { DEFAULT_RECOVERY_POLICY, blockItem } from "../scripts/loop/recovery.ts";
+import { DEFAULT_RECOVERY_POLICY, blockItem, persistOwnedCooling } from "../scripts/loop/recovery.ts";
+import { buildCoolingRecord, coolingDeadline, coolingRecordForItem } from "../scripts/loop/recovery-episodes.ts";
 import { resumeHold } from "../scripts/loop/pause.ts";
 import type { ReconcileObserveDeps } from "../scripts/loop/reconcile.ts";
 import {
@@ -5437,7 +5438,13 @@ test("inapplicable never-started preflight recipes are not recovery exhaustion",
   assert.equal(recoveryCalls, 0);
   const finalLedger = await readLedger(deps, "run-1");
   assert.equal(finalLedger.items["100"].state, "blocked");
-  assert.equal(finalLedger.recovery_attempts.length, 0);
+  assert.equal(finalLedger.recovery_attempts.length, 3);
+  assert.ok(finalLedger.recovery_attempts.every((attempt) => attempt.outcome === "skipped"));
+  assert.equal(
+    finalLedger.recovery_attempts.filter((attempt) => attempt.action === "repair_pipeline_item").length,
+    0,
+    "inapplicable skips must not charge repair_pipeline_item",
+  );
   const events = await readEvents(deps, "run-1");
   assert.ok(
     events.some(
@@ -5447,6 +5454,81 @@ test("inapplicable never-started preflight recipes are not recovery exhaustion",
     ),
     "deferred inapplicable recipes must be observed",
   );
+});
+
+test("sibling Cooling does not erase the first item's deadline or allow an early retry", async () => {
+  const canonicalEvidence = JSON.stringify({
+    schema: "pipeline/loop-recovery-evidence@1",
+    diagnostic: buildStageDiagnostic({
+      blockerKind: "merge-conflict",
+      reason: "The PR head must be rebased onto main",
+      stage: "pre-merge",
+    }),
+    transport: { pr_number: null, pipeline_run_id: "advance-100" },
+  });
+  const blocked100: LoopLedger["items"][string] = {
+    ...itemEntry("100", "blocked"),
+    blocked_theme: "workflow-state",
+    evidence_fingerprint: "fp-p",
+    repeated_evidence_count: 0,
+    history: [
+      {
+        time: "2026-07-22T00:00:00.000Z",
+        from: "in_progress",
+        to: "blocked",
+        engine: "claude",
+        theme: "workflow-state",
+        evidence: canonicalEvidence,
+      },
+    ],
+  };
+  const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
+  const ledger = testLedger({ "100": blocked100 });
+  const { deps } = await setup(contract, ledger);
+  const { token } = await acquireLock(deps, "run-1", "claude");
+  const time = deps.now().toISOString();
+  const coolingP = buildCoolingRecord({
+    reason: "strategy_cursor_exhausted",
+    time,
+    nextEligibleAt: coolingDeadline(time, { initial_seconds: 3600, multiplier: 2, max_seconds: 7200 }, 1),
+    itemId: "100",
+    theme: "workflow-state",
+  });
+  await persistOwnedCooling(deps, { runId: "run-1", token, cooling: coolingP });
+  const coolingQ = buildCoolingRecord({
+    reason: "strategy_cursor_exhausted",
+    time,
+    nextEligibleAt: coolingDeadline(time, { initial_seconds: 30, multiplier: 2, max_seconds: 300 }, 1),
+    itemId: "200",
+    theme: "workflow-state",
+  });
+  await persistOwnedCooling(deps, { runId: "run-1", token, cooling: coolingQ });
+  let recoveryCalls = 0;
+  const observe = fakeObserveDeps({
+    async getIssueStateAndLabels() {
+      return { state: "open", labels: [PIPELINE_READY_LABEL, "blocked"] };
+    },
+  }).deps;
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => ({
+    schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+    item_id: request.item_id,
+    run_id: request.run_id,
+    outcome: "blocked_recoverable",
+    evidence: { pr_number: null, pipeline_run_id: `advance-${request.item_id}` },
+  });
+  const executeRecovery: NonNullable<SupervisorDeps["executeRecovery"]> = async () => {
+    recoveryCalls++;
+    return { succeeded: true, evidence: "must not run while cooling" };
+  };
+  await runSupervisorCycle(
+    { store: deps, observe, dispatchItem, executeRecovery },
+    "run-1",
+    token,
+    "claude",
+  );
+  const after = await readLedger(deps, "run-1");
+  assert.equal(coolingRecordForItem(after, "100")?.next_eligible_at, coolingP.next_eligible_at);
+  assert.equal(recoveryCalls, 0, "item 100 must not claim recovery while its own cooling is still active");
 });
 
 test("mechanical capability-refusal recover uses verify_authentication, not human authority", async () => {

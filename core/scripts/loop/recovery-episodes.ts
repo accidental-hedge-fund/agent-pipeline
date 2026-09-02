@@ -272,6 +272,36 @@ export function coolingIsActive(cooling: LoopCoolingRecord | null | undefined, n
   return Date.parse(cooling.next_eligible_at) > Date.parse(nowIso);
 }
 
+/** Per-item Cooling, falling back to the run-level projection only when it names this item. */
+export function coolingRecordForItem(
+  ledger: Pick<LoopLedger, "cooling" | "item_cooling">,
+  itemId: string,
+): LoopCoolingRecord | null {
+  const perItem = ledger.item_cooling?.[itemId];
+  if (perItem) return perItem;
+  if (ledger.cooling?.item_id === itemId) return ledger.cooling;
+  return null;
+}
+
+/** Stamp `next_eligible_at` on every attempt that shares the item's latest episode id. */
+export function stampEpisodeNextEligibleAt(
+  attempts: readonly LoopRecoveryAttempt[],
+  itemId: string,
+  nextEligibleAt: string,
+): LoopRecoveryAttempt[] {
+  let episodeId: string | undefined;
+  for (let i = attempts.length - 1; i >= 0; i--) {
+    if (attempts[i]!.item_id === itemId && attempts[i]!.episode_id) {
+      episodeId = attempts[i]!.episode_id;
+      break;
+    }
+  }
+  if (!episodeId) return [...attempts];
+  return attempts.map((attempt) =>
+    attempt.episode_id === episodeId ? { ...attempt, next_eligible_at: nextEligibleAt } : attempt,
+  );
+}
+
 export function attachEpisodeFields(
   attempt: LoopRecoveryAttempt,
   episode: RecoveryEpisodeRecord,

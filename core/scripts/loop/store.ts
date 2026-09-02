@@ -195,13 +195,19 @@ export async function initRun(deps: LoopStoreDeps, contract: LoopContract, ledge
   // rename loser observes the winner's published run and reports conflict.
   const staging = `${dir}.init-${deps.uuid()}`;
   await deps.mkdirp(staging);
-  await deps.writeFileAtomic(contractPath(staging), JSON.stringify(contract, null, 2));
-  await deps.writeFileAtomic(ledgerPath(staging), JSON.stringify(ledger, null, 2));
+  const contractJson = JSON.stringify(contract, null, 2);
+  const ledgerJson = JSON.stringify(ledger, null, 2);
+  await deps.writeFileAtomic(contractPath(staging), contractJson);
+  await deps.writeFileAtomic(ledgerPath(staging), ledgerJson);
+  await deps.writeFileAtomic(lastValidPathFor(contractPath(staging)), contractJson);
+  await deps.writeFileAtomic(lastValidPathFor(ledgerPath(staging)), ledgerJson);
   await appendLog(deps, eventsPath(staging), "run_initialized", { run_id: contract.run_id, engine: contract.engine });
   const published = await deps.renameDirExclusive(staging, dir);
   if (!published) {
     await deps.removeFile(contractPath(staging));
     await deps.removeFile(ledgerPath(staging));
+    await deps.removeFile(lastValidPathFor(contractPath(staging)));
+    await deps.removeFile(lastValidPathFor(ledgerPath(staging)));
     await deps.removeFile(eventsPath(staging));
     throw new LoopError(
       "conflict",
@@ -218,16 +224,47 @@ function parseJsonObject(text: string): unknown {
   }
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isCoolingRecordShape(value: unknown): boolean {
+  if (!isPlainObject(value)) return false;
+  return (
+    (value.reason === "strategy_cursor_exhausted" || value.reason === "mechanical_exhaustion") &&
+    typeof value.time === "string"
+  );
+}
+
 function isLoopLedgerShape(value: unknown): value is LoopLedger {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const rec = value as Record<string, unknown>;
-  return typeof rec.run_id === "string" && rec.items !== null && typeof rec.items === "object";
+  if (!isPlainObject(value)) return false;
+  if (value.schema !== LOOP_LEDGER_SCHEMA) return false;
+  if (typeof value.run_id !== "string" || value.run_id.length === 0) return false;
+  if (!isPlainObject(value.items)) return false;
+  if (typeof value.consecutive_blocked !== "number") return false;
+  if (!("stop" in value)) return false;
+  if (!("merge_barrier" in value)) return false;
+  if (!("last_reconciliation" in value)) return false;
+  if (value.recovery_attempts !== undefined && !Array.isArray(value.recovery_attempts)) return false;
+  if (value.cooling !== undefined && value.cooling !== null && !isCoolingRecordShape(value.cooling)) return false;
+  if (value.item_cooling !== undefined && value.item_cooling !== null) {
+    if (!isPlainObject(value.item_cooling)) return false;
+    for (const rec of Object.values(value.item_cooling)) {
+      if (!isCoolingRecordShape(rec)) return false;
+    }
+  }
+  return true;
 }
 
 function isLoopContractShape(value: unknown): value is LoopContract {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const rec = value as Record<string, unknown>;
-  return typeof rec.run_id === "string";
+  if (!isPlainObject(value)) return false;
+  if (value.schema !== LOOP_CONTRACT_SCHEMA) return false;
+  if (typeof value.run_id !== "string" || value.run_id.length === 0) return false;
+  if (typeof value.engine !== "string") return false;
+  if (!isPlainObject(value.repo)) return false;
+  if (!Array.isArray(value.items)) return false;
+  if (value.recovery_policy !== undefined && !isPlainObject(value.recovery_policy)) return false;
+  return true;
 }
 
 export interface QuarantineEvidence {
@@ -242,6 +279,7 @@ async function quarantinePublished(
   publishedPath: string,
   raw: string,
   reason: string,
+  kind: "ledger" | "contract",
 ): Promise<QuarantineEvidence> {
   const stamp = deps.now().toISOString();
   const quarantinePath = quarantinePathFor(publishedPath, stamp);
@@ -255,13 +293,18 @@ async function quarantinePublished(
   const lastValidText = await deps.readTextFile(lastValidPathFor(publishedPath));
   if (lastValidText) {
     const parsed = parseJsonObject(lastValidText);
-    if (parsed !== undefined) {
+    const ok = kind === "ledger" ? isLoopLedgerShape(parsed) : isLoopContractShape(parsed);
+    if (parsed !== undefined && ok) {
       await deps.writeFileAtomic(publishedPath, lastValidText);
       evidence.reconstructed = true;
       return evidence;
     }
   }
   return evidence;
+}
+
+function documentShapeOk(kind: "ledger" | "contract", value: unknown): boolean {
+  return kind === "ledger" ? isLoopLedgerShape(value) : isLoopContractShape(value);
 }
 
 async function readPublishedDocument(
@@ -274,24 +317,31 @@ async function readPublishedDocument(
   const tmpLeftovers = names.filter((name) => name !== basename && isTempWriteBasename(name) && name.includes(basename.replace(/^\./, "")));
   void tmpLeftovers;
   const text = await deps.readTextFile(publishedPath);
-  if (!text) {
+  if (text === null) {
     throw new LoopError("validation", `loop run document not found under ${publishedPath}`);
   }
   const parsed = parseJsonObject(text);
-  const ok = kind === "ledger" ? isLoopLedgerShape(parsed) : isLoopContractShape(parsed);
-  if (parsed !== undefined && ok) return { text, value: parsed };
+  if (parsed !== undefined && documentShapeOk(kind, parsed)) return { text, value: parsed };
+  const schema = isPlainObject(parsed) && typeof parsed.schema === "string" ? parsed.schema : undefined;
+  const supported = kind === "ledger" ? LOOP_LEDGER_SCHEMA : LOOP_CONTRACT_SCHEMA;
+  if (schema !== undefined && schema !== supported) {
+    throw new LoopError(
+      "validation",
+      `loop ${kind} schema id "${schema}" is outside the store's supported set`,
+    );
+  }
   const quarantine = await quarantinePublished(
     deps,
     publishedPath,
     text,
     parsed === undefined ? "truncated_or_invalid_json" : "schema_failure",
+    kind,
   );
   if (quarantine.reconstructed) {
     const restored = await deps.readTextFile(publishedPath);
-    if (restored) {
+    if (restored !== null) {
       const restoredParsed = parseJsonObject(restored);
-      const restoredOk = kind === "ledger" ? isLoopLedgerShape(restoredParsed) : isLoopContractShape(restoredParsed);
-      if (restoredParsed !== undefined && restoredOk) {
+      if (restoredParsed !== undefined && documentShapeOk(kind, restoredParsed)) {
         return { text: restored, value: restoredParsed, quarantine };
       }
     }
@@ -309,7 +359,7 @@ async function publishLastValid(deps: LoopStoreDeps, publishedPath: string, cont
 export async function readContract(deps: LoopStoreDeps, runId: string): Promise<LoopContract> {
   const dir = runDir(deps, runId);
   const text = await deps.readTextFile(contractPath(dir));
-  if (!text) {
+  if (text === null) {
     throw new LoopError("validation", `loop run "${runId}" not found under ${dir}`);
   }
   const parsed = parseJsonObject(text);
@@ -323,7 +373,7 @@ export async function readLedger(deps: LoopStoreDeps, runId: string): Promise<Lo
   const privateEpisode = await deps.readTextFile(path.join(dir, PRIVATE_EPISODE_SCHEMA_BASENAME));
   void privateEpisode;
   const text = await deps.readTextFile(ledgerPath(dir));
-  if (!text) {
+  if (text === null) {
     throw new LoopError("validation", `loop run "${runId}" ledger not found under ${dir}`);
   }
   const parsed = parseJsonObject(text);

@@ -30,8 +30,11 @@ import {
   assertRecoveryEpisodeFields,
   emptyEpisode,
   normalizeEvidenceIdentity,
+  recoveryEpisodeId,
+  resumeEpisodeFromAttempts,
   type RecoveryEpisodeKey,
 } from "./loop/recovery-episodes.ts";
+import type { LoopRecoveryAttempt } from "./loop/types.ts";
 import {
   claimStageAttempt,
   persistStageAttemptLedger,
@@ -789,7 +792,24 @@ export function recordRecoveryEpisodeTreatment(input: {
   invariant?: string;
   candidateEpoch?: string;
 }): StageAttemptLedger {
-  const evidenceIdentity = input.evidenceFingerprint ?? input.headSha;
+  const nowIso = new Date().toISOString();
+  const key: RecoveryEpisodeKey = {
+    operation: RECOVERY_EPISODE_CLAIM_OPERATION,
+    invariant: input.invariant ?? `issue:${input.itemId ?? "stage"}`,
+    candidate_epoch: input.candidateEpoch ?? input.headSha,
+    evidence_identity: normalizeEvidenceIdentity(input.evidenceFingerprint ?? input.headSha),
+  };
+  const projected = resumeEpisodeFromAttempts(
+    input.ledger.attempts as unknown as LoopRecoveryAttempt[],
+    key,
+  ) ?? emptyEpisode(key, nowIso);
+  const attemptsPerStrategy = { ...projected.attempts_per_strategy };
+  attemptsPerStrategy[input.action] = (attemptsPerStrategy[input.action] ?? 0) + 1;
+  const episode = {
+    ...projected,
+    attempts_per_strategy: attemptsPerStrategy,
+    next_eligible_at: nowIso,
+  };
   const claimed = claimStageAttempt(input.ledger, {
     headSha: input.headSha,
     action: input.action,
@@ -797,13 +817,13 @@ export function recordRecoveryEpisodeTreatment(input: {
     evidenceFingerprint: input.evidenceFingerprint,
     typedReason: input.typedReason,
     budgetBefore: 1,
-    invariant: input.invariant ?? `stage:${input.action}`,
-    candidateEpoch: input.candidateEpoch ?? input.headSha,
-    evidenceIdentity,
-    attemptsPerStrategy: { [input.action]: 1 },
-    strategyCursor: 0,
-    nextEligibleAt: new Date().toISOString(),
-    episodeId: `${input.itemId ?? "stage"}:${input.headSha}:${input.action}`,
+    invariant: episode.invariant,
+    candidateEpoch: episode.candidate_epoch,
+    evidenceIdentity: episode.evidence_identity,
+    attemptsPerStrategy: episode.attempts_per_strategy,
+    strategyCursor: episode.strategy_cursor,
+    nextEligibleAt: episode.next_eligible_at,
+    episodeId: recoveryEpisodeId(key),
   });
   if (input.runDir) persistStageAttemptLedger(input.runDir, claimed.ledger);
   return claimed.ledger;

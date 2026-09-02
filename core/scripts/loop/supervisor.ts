@@ -69,6 +69,7 @@ import {
   buildCoolingRecord,
   coolingDeadline,
   coolingIsActive,
+  coolingRecordForItem,
   emptyEpisode,
   perStrategyBound,
   reconcileUncertainClaim,
@@ -991,11 +992,12 @@ async function executeBlockedRecovery(
   let claimedNow = false;
   if (!attempt) {
     const policy = contract.recovery_policy[item.blocked_theme];
-    if (coolingIsActive(ledger.cooling, deps.store.now().toISOString()) && ledger.cooling?.item_id === itemId) {
+    const ownedCooling = coolingRecordForItem(ledger, itemId);
+    if (coolingIsActive(ownedCooling, deps.store.now().toISOString())) {
       await appendEvent(deps.store, runId, token, "loop_recovery_preflight_deferred", {
         item_id: itemId,
         reason: "cooling_next_eligible_at",
-        next_eligible_at: ledger.cooling.next_eligible_at,
+        next_eligible_at: ownedCooling?.next_eligible_at,
       }).catch(() => {});
       return { ledger, attempted: false };
     }
@@ -1071,6 +1073,20 @@ async function executeBlockedRecovery(
           strategyBound: (recipe) => perStrategyBound(policy, recipe),
           isApplicable,
         });
+    for (const skipped of selected.skipped) {
+      const skipResult = await startRecoveryAttempt(deps.store, contract, {
+        runId,
+        token,
+        itemId,
+        engine,
+        action: skipped,
+        candidateIdentity,
+        candidateEpoch,
+        invariant: item.blocked_theme,
+        skipInapplicable: true,
+      });
+      ledger = skipResult.ledger;
+    }
     if (selected.kind === "exhausted") {
       if (preflightNeverStarted && neverStartedFiltered.length === 0) {
         await appendEvent(deps.store, runId, token, "loop_recovery_preflight_deferred", {
@@ -1104,20 +1120,6 @@ async function executeBlockedRecovery(
       });
       ledger = await persistOwnedCooling(deps.store, { runId, token, cooling });
       return { ledger, attempted: false };
-    }
-    for (const skipped of selected.skipped) {
-      const skipResult = await startRecoveryAttempt(deps.store, contract, {
-        runId,
-        token,
-        itemId,
-        engine,
-        action: skipped,
-        candidateIdentity,
-        candidateEpoch,
-        invariant: item.blocked_theme,
-        skipInapplicable: true,
-      });
-      ledger = skipResult.ledger;
     }
     const started = await startRecoveryAttempt(deps.store, contract, {
       runId,

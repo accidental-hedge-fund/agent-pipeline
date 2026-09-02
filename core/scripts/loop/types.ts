@@ -963,10 +963,17 @@ export interface LoopLedger {
   merge_barrier: LoopMergeBarrier | null;
   stop: LoopStopRecord | null;
   /**
-   * Owned Cooling when strategy-cursor exhaustion is current. Absent on
+   * Latest Cooling projection for run-level consumers. Absent on
    * pre-#1333 ledgers. Does not replace a true non-exhaustion `stop`.
+   * Per-item authority is {@link item_cooling}; this field is the most
+   * recently persisted Cooling record and MUST NOT erase sibling deadlines.
    */
   cooling?: LoopCoolingRecord | null;
+  /**
+   * Candidate-scoped Cooling keyed by item id. Survives a later sibling
+   * Cooling write that updates the run-level {@link cooling} projection.
+   */
+  item_cooling?: Record<string, LoopCoolingRecord>;
   last_native_goal_check: LoopNativeGoalCheck | null;
   last_reconciliation: LoopReconciliation | null;
   reconciliation_sequence: number;

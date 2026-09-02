@@ -20,6 +20,7 @@ import {
   buildCoolingRecord,
   coolingDeadline,
   coolingIsActive,
+  coolingRecordForItem,
   competingPrivateEpisodePath,
   emptyEpisode,
   isTempWriteBasename,
@@ -35,6 +36,7 @@ import {
   acquireLock,
   classifyStaleness,
   initRun,
+  readContract,
   readLedger,
   recoverLock,
   requireToken,
@@ -470,6 +472,41 @@ test("3.5 human-decision-required is not converted into Cooling", () => {
   assert.notEqual(cooling.reason, "human_authority");
 });
 
+test("3.7 sibling Cooling does not erase the first item's deadline", async () => {
+  const { deps, contract, token } = await setup();
+  await blockCi(deps, contract, token);
+  await startRecoveryAttempt(deps, contract, {
+    runId: "run-1",
+    token,
+    itemId: "100",
+    engine: "claude",
+    action: "rerun_ci",
+    candidateIdentity: "head-p",
+  });
+  const time = deps.now().toISOString();
+  const coolingP = buildCoolingRecord({
+    reason: "strategy_cursor_exhausted",
+    time,
+    nextEligibleAt: coolingDeadline(time, { initial_seconds: 120, multiplier: 2, max_seconds: 600 }, 1),
+    itemId: "100",
+    theme: "implementation-ci",
+  });
+  await persistOwnedCooling(deps, { runId: "run-1", token, cooling: coolingP });
+  const coolingQ = buildCoolingRecord({
+    reason: "strategy_cursor_exhausted",
+    time,
+    nextEligibleAt: coolingDeadline(time, { initial_seconds: 30, multiplier: 2, max_seconds: 300 }, 1),
+    itemId: "200",
+    theme: "implementation-ci",
+  });
+  const ledger = await persistOwnedCooling(deps, { runId: "run-1", token, cooling: coolingQ });
+  assert.equal(coolingRecordForItem(ledger, "100")?.next_eligible_at, coolingP.next_eligible_at);
+  assert.equal(coolingRecordForItem(ledger, "200")?.next_eligible_at, coolingQ.next_eligible_at);
+  assert.equal(coolingIsActive(coolingRecordForItem(ledger, "100"), time), true);
+  const pAttempts = ledger.recovery_attempts.filter((attempt) => attempt.item_id === "100");
+  assert.ok(pAttempts.some((attempt) => attempt.next_eligible_at === coolingP.next_eligible_at));
+});
+
 test("3.6 historical recovery_exhausted remains readable as evidence", async () => {
   const { deps, token } = await setup();
   const cooling = buildCoolingRecord({
@@ -598,6 +635,35 @@ test("5.3 last valid generation is reconstructed when safe", async () => {
   const restored = await readLedger(deps, "run-1");
   assert.equal(restored.schema, LOOP_LEDGER_SCHEMA);
   assert.equal(restored.run_id, "run-1");
+});
+
+test("5.4 partial ledger with only run_id and items is quarantined", async () => {
+  const { deps, files } = await setup();
+  const published = [...files.keys()].find((k) => k.endsWith("/ledger.json"))!;
+  files.delete(lastValidPathFor(published));
+  files.set(published, JSON.stringify({ run_id: "run-1", items: {} }));
+  await assert.rejects(() => readLedger(deps, "run-1"), /quarantined invalid ledger/);
+  const quarantined = [...files.keys()].filter((k) => k.includes("quarantine"));
+  assert.ok(quarantined.length >= 1);
+});
+
+test("5.5 empty ledger reconstructs from last-valid instead of missing", async () => {
+  const { deps, files } = await setup();
+  const published = [...files.keys()].find((k) => k.endsWith("/ledger.json"))!;
+  assert.ok(files.has(lastValidPathFor(published)));
+  files.set(published, "");
+  const restored = await readLedger(deps, "run-1");
+  assert.equal(restored.schema, LOOP_LEDGER_SCHEMA);
+  assert.equal(restored.run_id, "run-1");
+  assert.ok(Array.isArray(restored.recovery_attempts));
+});
+
+test("5.6 partial contract with only run_id is quarantined", async () => {
+  const { deps, files } = await setup();
+  const published = [...files.keys()].find((k) => k.endsWith("/contract.json"))!;
+  files.delete(lastValidPathFor(published));
+  files.set(published, JSON.stringify({ run_id: "run-1" }));
+  await assert.rejects(() => readContract(deps, "run-1"), /quarantined invalid contract/);
 });
 
 // ---------------------------------------------------------------------------

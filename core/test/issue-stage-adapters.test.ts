@@ -693,6 +693,31 @@ test("5.4 auto-recovery comments are not the sole authority — ledger + claim a
   rmSync(dir, { recursive: true, force: true });
 });
 
+test("5.5 stage treatments for the same candidate share one Recovery Episode", () => {
+  const headSha = "a".repeat(40);
+  const first = recordRecoveryEpisodeTreatment({
+    ledger: emptyStageAttemptLedger(),
+    headSha,
+    action: "worktree_rematerialize",
+    itemId: "1325",
+    evidenceFingerprint: "same-evidence",
+  });
+  const second = recordRecoveryEpisodeTreatment({
+    ledger: first,
+    headSha,
+    action: "no_run_recovery",
+    itemId: "1325",
+    evidenceFingerprint: "same-evidence",
+  });
+  assert.equal(second.attempts.length, 2);
+  assert.equal(second.attempts[0]!.episode_id, second.attempts[1]!.episode_id);
+  assert.equal(second.attempts[0]!.invariant, "issue:1325");
+  assert.equal(second.attempts[1]!.invariant, "issue:1325");
+  assert.equal(second.attempts[1]!.attempts_per_strategy?.["worktree_rematerialize"], 1);
+  assert.equal(second.attempts[1]!.attempts_per_strategy?.["no_run_recovery"], 1);
+  assert.notEqual(second.attempts[0]!.episode_id, `${"1325"}:${headSha}:worktree_rematerialize`);
+});
+
 test("6.1 harness crash, malformed output, unsatisfied no-op, and non-convergence stay owned", () => {
   const crash = observationFromAdapterAttempt({
     stage: "fix-1",
