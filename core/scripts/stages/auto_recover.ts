@@ -6,10 +6,10 @@
 // blocked permanently and a final comment is posted.
 
 import {
-  addLabel,
   getIssueDetail,
   postComment,
   removeLabel,
+  transition,
 } from "../gh.ts";
 import { attestPipelineComment } from "./review-parsing.ts";
 import {
@@ -24,7 +24,7 @@ import { recordRecovery } from "../evidence-bundle.ts";
 import { emitCorrectionEvent } from "../correction.ts";
 import * as path from "node:path";
 import type { RunStoreDeps } from "../run-store.ts";
-import type { Outcome, PipelineConfig } from "../types.ts";
+import type { Outcome, PipelineConfig, Stage } from "../types.ts";
 
 const RECOVERY_MARKER = "## Pipeline: Auto-Recovery";
 const RECOVERY_LIMIT_MARKER = `${RECOVERY_MARKER} Limit`;
@@ -99,7 +99,14 @@ export interface AutoRecoverDeps {
   ) => Promise<SafeRemoveResult>;
   postComment: typeof postComment;
   removeLabel: typeof removeLabel;
-  addLabel: typeof addLabel;
+  /** Approved projector owner for implementing → ready. Not a command-local addLabel. */
+  transition: (
+    cfg: PipelineConfig,
+    issueNumber: number,
+    fromStage: Stage,
+    toStage: Stage,
+    summary: string,
+  ) => Promise<void>;
 }
 
 const defaultAutoRecoverDeps: AutoRecoverDeps = {
@@ -110,7 +117,7 @@ const defaultAutoRecoverDeps: AutoRecoverDeps = {
   removeManagedWorktreeSafely,
   postComment,
   removeLabel,
-  addLabel,
+  transition,
 };
 
 export async function tryAutoRecover(
@@ -168,16 +175,11 @@ export async function tryAutoRecover(
     };
   }
 
-  // Reset labels: remove implementing + blocked, add ready. Clearing
-  // `implementing` is best-effort (its presence isn't load-bearing for the
-  // reset), but clearing `blocked` is required: if it fails, the issue stays
-  // blocked and neither the ready label nor the recovery comment/correction
-  // event may be recorded as if the reset succeeded (#499 finding c41e8715).
-  try {
-    await deps.removeLabel(cfg, issueNumber, "pipeline:implementing");
-  } catch {
-    /* ignore */
-  }
+  // Clear `blocked` first: if it fails, the issue stays blocked and neither
+  // the projector-ready reset nor the recovery comment/correction event may
+  // be recorded as if the reset succeeded (#499 finding c41e8715). The
+  // implementing → ready swap goes through `transition`, the approved
+  // projector owner — not a command-local addLabel.
   try {
     await deps.removeLabel(cfg, issueNumber, "blocked");
   } catch (err) {
@@ -187,7 +189,13 @@ export async function tryAutoRecover(
       reason: `auto-recovery failed to clear the blocked label: ${(err as Error).message}`,
     };
   }
-  await deps.addLabel(cfg, issueNumber, "pipeline:ready");
+  await deps.transition(
+    cfg,
+    issueNumber,
+    "implementing",
+    "ready",
+    `auto-recovery ${recoveryCount + 1}/${cfg.auto_recovery_max_retries}: reset implementing → ready for another attempt`,
+  );
 
   await deps.postComment(cfg, issueNumber, buildAutoRecoveryComment(cfg, recoveryCount));
 

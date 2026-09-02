@@ -625,7 +625,12 @@ export function missingRequiredLifecycleCoverage(
   return MATRIX_LIFECYCLE_CLASSES.filter((cls) => !covered.has(cls));
 }
 
-/** Executed matrix-row result bound to a scored candidate and coverage layer. */
+/**
+ * Executed matrix-row result bound to a scored candidate. Coverage counts
+ * only rows that bind to a declared applicable inventory cell (operation,
+ * fault/state, entrypoint, host, layer, lifecycle class, expected terminal).
+ * Class/layer stamps are not cells.
+ */
 export interface ExecutedMatrixRow {
   candidate_sha: string;
   layer: MatrixCoverageLayer;
@@ -634,24 +639,72 @@ export interface ExecutedMatrixRow {
   fault_state: MatrixFaultState;
   entrypoint: string;
   host: string;
+  observed_terminal: UniqueOperationTerminal;
   passed: boolean;
+}
+
+function applicableCellIndex(
+  inventory: readonly FaultRecoveryMatrixRow[],
+): Map<string, FaultRecoveryMatrixRow> {
+  const byKey = new Map<string, FaultRecoveryMatrixRow>();
+  for (const cell of inventory) {
+    if (cell.not_applicable) continue;
+    const key = matrixCellKey(cell);
+    if (!byKey.has(key)) byKey.set(key, cell);
+  }
+  return byKey;
+}
+
+/**
+ * Candidate-bound executed rows that match a declared applicable matrix cell
+ * and its expected typed terminal. Caller-supplied class/layer records that
+ * do not name a real cell, or that disagree with the cell's class or terminal,
+ * are dropped. This is the matrix inventory binder — not a second runner.
+ */
+export function bindExecutedMatrixRowsForCandidate(
+  executed: readonly ExecutedMatrixRow[],
+  candidateSha: string,
+  inventory: readonly FaultRecoveryMatrixRow[] = FAULT_RECOVERY_MATRIX,
+): ExecutedMatrixRow[] {
+  const sha = candidateSha.trim();
+  if (!sha) return [];
+  const cells = applicableCellIndex(inventory);
+  const bound: ExecutedMatrixRow[] = [];
+  for (const row of executed) {
+    if (row.candidate_sha !== sha || !row.passed) continue;
+    const cell = cells.get(matrixCellKey(row));
+    if (!cell) continue;
+    if (cell.lifecycle_class !== row.lifecycle_class) continue;
+    if (row.observed_terminal !== cell.expected_terminal) continue;
+    bound.push({
+      candidate_sha: sha,
+      layer: cell.layer,
+      lifecycle_class: cell.lifecycle_class,
+      operation: cell.operation,
+      fault_state: cell.fault_state,
+      entrypoint: cell.entrypoint,
+      host: cell.host,
+      observed_terminal: cell.expected_terminal,
+      passed: true,
+    });
+  }
+  return bound;
 }
 
 /**
  * Lifecycle classes proved by passing executed rows for `candidateSha` on
- * every required layer. Absent SHA, failed rows, and other-candidate rows
- * do not count. Inventory declarations never satisfy this function.
+ * every required layer. Only {@link bindExecutedMatrixRowsForCandidate}
+ * results count. Absent SHA, failed rows, other-candidate rows, and
+ * fabricated class/layer stamps do not count. Inventory declarations never
+ * satisfy this function.
  */
 export function coveredLifecycleClassesFromExecutedRows(
   executed: readonly ExecutedMatrixRow[],
   candidateSha: string,
+  inventory: readonly FaultRecoveryMatrixRow[] = FAULT_RECOVERY_MATRIX,
 ): RequiredLifecycleClass1333[] {
-  const sha = candidateSha.trim();
-  if (!sha) return [];
   const layersByClass = new Map<string, Set<string>>();
-  for (const row of executed) {
-    if (row.candidate_sha !== sha) continue;
-    if (!row.passed) continue;
+  for (const row of bindExecutedMatrixRowsForCandidate(executed, candidateSha, inventory)) {
     const set = layersByClass.get(row.lifecycle_class) ?? new Set<string>();
     set.add(row.layer);
     layersByClass.set(row.lifecycle_class, set);

@@ -84,7 +84,7 @@ export function collectDirectStageLifecycleWrites(source: string, file = "fixtur
 export function collectProviderIncidentDispatch(source: string, file = "fixture.ts"): StaticGuardHit[] {
   const hits: StaticGuardHit[] = [];
   for (const key of PROVIDER_OR_INCIDENT_DISPATCH_KEYS) {
-    const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, (ch) => `\\${ch}`);
     const re = new RegExp(`case\\s+["']${escaped}["']|["']${escaped}["']\\s*:`);
     if (re.test(source)) {
       hits.push({ file, reason: `provider or incident string dispatch key: ${key}` });
@@ -104,11 +104,7 @@ export function scanProductionRecoveryGuards(coreRoot?: string): StaticGuardHit[
     hits.push(...collectRetiredControllerImports(source, rel));
     if (rel.startsWith(COMMAND_MODULE_DIR)) {
       hits.push(...collectCommandLocalLifecycleExits(source, rel));
-      // auto_recover.ts still performs a projector-ready reset; the guard
-      // still flags that write in synthetic fixtures and any new command module.
-      if (!rel.endsWith("auto_recover.ts")) {
-        hits.push(...collectDirectStageLifecycleWrites(source, rel));
-      }
+      hits.push(...collectDirectStageLifecycleWrites(source, rel));
     }
     if (
       rel.includes("escalation-classify") ||

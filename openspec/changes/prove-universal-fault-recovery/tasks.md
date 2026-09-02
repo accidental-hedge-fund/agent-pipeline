@@ -10,6 +10,7 @@
 - [x] 2.1 Stop `passingUniqueOperationAttempts()` and `passingUniqueOperationManifest()` from declaring all five required lifecycle classes unless the matrix reports them covered, and verify the helper-stamp unit test fails while those helpers still stamp coverage
 - [x] 2.2 Make release-eligible FRG refuse `pass: true` when unique-operation evidence lists covered classes the matrix did not execute for the scored candidate, and verify `validateReleaseEligibleFrgEvidence` names missing required coverage rather than a stable exclusion
 - [x] 2.3 Keep `#740` hidden eval fixtures out of covering-module registration, and verify the inventory guard fails if a covering module path is an eval holdout fixture
+- [x] 2.4 Bind executed-row FRG coverage to declared applicable matrix cells and expected terminals, and verify fabricated class/layer stamps do not cover required lifecycle classes
 
 ## 3. Adapter-contract layer
 
@@ -55,6 +56,7 @@
 - [x] 8.4 Add a static guard that fails on command-local lifecycle `process.exit` for supervised mutations (read-only and bounded atomic administration remain documented), and verify a synthetic lifecycle-exit fixture fails that guard
 - [x] 8.5 Add a static guard that fails on direct stage-label / `needs-human` writes from command modules, and verify a synthetic write fixture fails that guard
 - [x] 8.6 Add a static guard that fails when production recovery routing switches on provider names or incident titles, and verify known GitHub/CI/conflict/auth/worktree strings appear only in fixtures
+- [x] 8.7 Route `auto_recover` implementing → ready through `transition`, drop the command-module exemption, escape incident dispatch keys by the matched character, and verify regression fixtures for the former write and the dotted `"merge conflict with origin/main"` key
 
 ## 9. Docs, packaging, and CI
 

@@ -19,6 +19,7 @@ import {
   assertFaultRecoveryCoveragePresent,
   assertFaultRecoveryInventoryComplete,
   collectFaultRecoveryInventoryGaps,
+  bindExecutedMatrixRowsForCandidate,
   coveredLifecycleClassesFromExecutedRows,
   coveredLifecycleClassesFromMatrix,
   injectOperationAdapterFault,
@@ -70,14 +71,19 @@ function executedRowsForSha(
   const rows: ExecutedMatrixRow[] = [];
   for (const cls of classes) {
     for (const layer of MATRIX_COVERAGE_LAYERS) {
+      const cell = FAULT_RECOVERY_MATRIX.find(
+        (r) => !r.not_applicable && r.lifecycle_class === cls && r.layer === layer,
+      );
+      if (!cell) continue;
       rows.push({
         candidate_sha: sha,
-        layer,
-        lifecycle_class: cls as ExecutedMatrixRow["lifecycle_class"],
-        operation: "drive",
-        fault_state: "exception",
-        entrypoint: "drive",
-        host: "direct_cli",
+        layer: cell.layer,
+        lifecycle_class: cell.lifecycle_class,
+        operation: cell.operation,
+        fault_state: cell.fault_state,
+        entrypoint: cell.entrypoint,
+        host: cell.host,
+        observed_terminal: cell.expected_terminal,
         passed,
       });
     }
@@ -416,6 +422,115 @@ test("failed executed rows do not cover a lifecycle class", () => {
     coveredLifecycleClassesFromExecutedRows(executedRowsForSha(EXECUTED_SHA, ["mechanical"], false), EXECUTED_SHA),
     [],
   );
+});
+
+function fabricatedClassLayerRows(sha: string): ExecutedMatrixRow[] {
+  const fabricated: ExecutedMatrixRow[] = [];
+  for (const cls of MATRIX_LIFECYCLE_CLASSES) {
+    for (const layer of MATRIX_COVERAGE_LAYERS) {
+      fabricated.push({
+        candidate_sha: sha,
+        layer,
+        lifecycle_class: cls,
+        operation: "drive",
+        fault_state: "exception",
+        entrypoint: "drive",
+        host: "direct_cli",
+        observed_terminal: "cooling_recovery",
+        passed: true,
+      });
+    }
+  }
+  return fabricated;
+}
+
+test("fabricated class/layer executed rows do not satisfy #1333 coverage", () => {
+  const fabricated = fabricatedClassLayerRows(EXECUTED_SHA);
+  assert.deepEqual(coveredLifecycleClassesFromExecutedRows(fabricated, EXECUTED_SHA), ["mechanical"]);
+  assert.equal(bindExecutedMatrixRowsForCandidate(fabricated, EXECUTED_SHA).length, MATRIX_COVERAGE_LAYERS.length);
+});
+
+test("fabricated executed rows fail FRG promotion as missing required coverage", () => {
+  const evidence = computeFrgEvidence({
+    version: "1.30.0",
+    run_id: "frg-fabricated-rows",
+    loop_run_id: "loop-fabricated",
+    pack_id: FRG_PACK_MANIFEST.pack_id,
+    items: [
+      { item_id: "1", state: "ready", ready_clean: true },
+      { item_id: "2", state: "ready", ready_clean: true },
+    ],
+    scenario_overrides: frgRequiredObservationOverrides("pass"),
+    composition_overrides: frgRequiredCompositionOverrides("pass"),
+    attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
+    unique_operations: passingUniqueOperationAttempts().map((a) => ({
+      ...a,
+      candidate_sha: EXECUTED_SHA,
+    })),
+    unique_operation_manifest: passingUniqueOperationManifest({
+      candidate_sha: EXECUTED_SHA,
+      release_identity: "1.30.0",
+    }),
+    executed_matrix_rows: fabricatedClassLayerRows(EXECUTED_SHA),
+  });
+  assert.equal(evidence.pass, false);
+  assert.ok(evidence.operation_reliability!.integrity.missing_required_coverage > 0);
+  assert.equal(evidence.operation_reliability!.exclusions.length, 0);
+});
+
+test("class/layer-only executed records are not matrix cells", () => {
+  const stamped = MATRIX_LIFECYCLE_CLASSES.flatMap((cls) =>
+    MATRIX_COVERAGE_LAYERS.map((layer) => ({
+      candidate_sha: EXECUTED_SHA,
+      layer,
+      lifecycle_class: cls,
+      passed: true,
+    })),
+  ) as ExecutedMatrixRow[];
+  assert.deepEqual(coveredLifecycleClassesFromExecutedRows(stamped, EXECUTED_SHA), []);
+});
+
+test("executed row with mismatched expected terminal does not cover", () => {
+  const cell = FAULT_RECOVERY_MATRIX.find(
+    (r) => !r.not_applicable && r.lifecycle_class === "mechanical" && r.layer === "adapter_contract",
+  );
+  assert.ok(cell);
+  const rows: ExecutedMatrixRow[] = MATRIX_COVERAGE_LAYERS.map((layer) => {
+    const layerCell = FAULT_RECOVERY_MATRIX.find(
+      (r) => !r.not_applicable && r.lifecycle_class === "mechanical" && r.layer === layer,
+    )!;
+    return {
+      candidate_sha: EXECUTED_SHA,
+      layer: layerCell.layer,
+      lifecycle_class: layerCell.lifecycle_class,
+      operation: layerCell.operation,
+      fault_state: layerCell.fault_state,
+      entrypoint: layerCell.entrypoint,
+      host: layerCell.host,
+      observed_terminal: "false_human_projection",
+      passed: true,
+    };
+  });
+  assert.deepEqual(coveredLifecycleClassesFromExecutedRows(rows, EXECUTED_SHA), []);
+});
+
+test("not_applicable inventory cells do not bind as executed coverage", () => {
+  const na = FAULT_RECOVERY_MATRIX.find((r) => r.not_applicable);
+  assert.ok(na);
+  const rows: ExecutedMatrixRow[] = [
+    {
+      candidate_sha: EXECUTED_SHA,
+      layer: na.layer,
+      lifecycle_class: na.lifecycle_class,
+      operation: na.operation,
+      fault_state: na.fault_state,
+      entrypoint: na.entrypoint,
+      host: na.host,
+      observed_terminal: na.expected_terminal,
+      passed: true,
+    },
+  ];
+  assert.deepEqual(bindExecutedMatrixRowsForCandidate(rows, EXECUTED_SHA), []);
 });
 
 test("host × public entrypoint × fault host_conformance cells are inventoried", () => {

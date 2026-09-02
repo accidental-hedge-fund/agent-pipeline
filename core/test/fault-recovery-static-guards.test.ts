@@ -69,6 +69,29 @@ test("provider string dispatch fails the static guard", () => {
   assert.ok(hits.some((h) => /incident string dispatch/.test(h.reason)));
 });
 
+test("dotted incident dispatch key fails the static guard", () => {
+  const synthetic = `switch (err) { case "merge conflict with origin/main": return "park"; }\n`;
+  const hits = collectProviderIncidentDispatch(synthetic, "fixture.ts");
+  assert.ok(
+    hits.some((h) => h.reason.includes("merge conflict with origin/main")),
+    `expected dotted incident key hit, got ${JSON.stringify(hits)}`,
+  );
+});
+
+test("auto_recover projector-ready reset is not exempt from direct stage-write enforcement", () => {
+  const autoRecover = readFileSync(join(CORE_ROOT, "scripts/stages/auto_recover.ts"), "utf8");
+  assert.equal(
+    collectDirectStageLifecycleWrites(autoRecover, "scripts/stages/auto_recover.ts").length,
+    0,
+    "auto_recover must route ready reset through transition, not addLabel",
+  );
+  const exemptedWrite = `await addLabel(cfg, issueNumber, "pipeline:ready");\n`;
+  const hits = collectDirectStageLifecycleWrites(exemptedWrite, "scripts/stages/auto_recover.ts");
+  assert.ok(hits.some((h) => /lifecycle label write/.test(h.reason)));
+  const production = scanProductionRecoveryGuards(CORE_ROOT);
+  assert.ok(!production.some((h) => h.file.endsWith("auto_recover.ts")), JSON.stringify(production));
+});
+
 test("production recovery routing has no retired imports or incident keys", () => {
   const hits = scanProductionRecoveryGuards(CORE_ROOT);
   assert.deepEqual(hits, [], JSON.stringify(hits));

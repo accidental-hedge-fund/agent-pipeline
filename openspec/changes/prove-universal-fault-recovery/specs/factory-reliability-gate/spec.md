@@ -2,7 +2,7 @@
 
 ### Requirement: FRG #1333 coverage SHALL be produced by executed matrix rows rather than stamped helpers
 
-Release-eligible FRG unique-operation evidence SHALL set `covered_lifecycle_classes` only from executed universal-fault-recovery-matrix rows for the scored candidate. Helper fixtures that declare every required lifecycle class without those rows SHALL NOT satisfy #1333 coverage. Absence of those rows SHALL fail FRG promotion as missing required coverage. This capability SHALL NOT create a second scheduler, recovery owner, or fault-matrix runner.
+Release-eligible FRG unique-operation evidence SHALL set `covered_lifecycle_classes` only from executed universal-fault-recovery-matrix rows for the scored candidate. Each executed row SHALL bind to a declared applicable matrix cell (operation, fault/state, public entry point, host, layer) and that cell's expected typed terminal. Helper fixtures that declare every required lifecycle class without those rows SHALL NOT satisfy #1333 coverage. Class/layer records that do not bind to a declared cell SHALL NOT satisfy coverage. Absence of those rows SHALL fail FRG promotion as missing required coverage. This capability SHALL NOT create a second scheduler, recovery owner, or fault-matrix runner.
 
 #### Scenario: Stamped helper coverage fails promotion
 
@@ -17,6 +17,13 @@ Release-eligible FRG unique-operation evidence SHALL set `covered_lifecycle_clas
 - **AND** unique-operation false-human and ownerless-terminal counts for those mechanical rows are zero
 - **THEN** the #1333 coverage proof SHALL be present
 - **AND** FRG MAY pass the unique-operation coverage check for those classes
+
+#### Scenario: Fabricated class/layer records fail promotion
+
+- **WHEN** unique-operation evidence supplies passed records that name lifecycle class and layer for the scored candidate
+- **AND** those records do not match a declared applicable matrix cell and its expected typed terminal
+- **THEN** FRG promotion SHALL fail
+- **AND** the integrity report SHALL name missing required coverage, not a stable exclusion
 
 ## MODIFIED Requirements
 
