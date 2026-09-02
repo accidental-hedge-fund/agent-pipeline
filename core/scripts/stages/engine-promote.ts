@@ -2,14 +2,17 @@
 //
 // After a release is published (tag + GitHub Release), promote the production
 // engine pin, install that exact tag into the host skill tree(s), and verify
-// pin ↔ install receipt agreement. On install/verify failure after a pin
-// mutation, roll the pin back and attempt to reinstall the previous tag.
+// the live installed digest matches the authorized published artifact.
+// Install or verify failure after a pin mutation does not roll the pin back.
+// Rollback is a separate protected operation (`pipeline factory-pin rollback`)
+// that requires an authenticated envelope naming that operation and target.
 //
 // Never merges PRs or creates tags. Loop-isolated CLI surface.
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import {
   isProductionQualityPin,
@@ -20,7 +23,11 @@ import {
   type PromotePinResult,
 } from "../production-engine-pin.ts";
 import { readSkipFrgFromPipelineYml } from "../config.ts";
+import { resolveManifestSkillPath } from "../discovery.ts";
 import { formatFrgSkipReason, resolveFrgSkip } from "../frg-skip.ts";
+import { resolveEngineCommitSha } from "../engine-attribution.ts";
+import { resolveOuterHost } from "../outer-hosts/index.ts";
+import { BUILTIN_OUTER_HOST_IDS, type BuiltinOuterHostId } from "../outer-hosts/types.ts";
 import {
   assertNoRemainingOpenMilestoneIssues,
   listRemainingOpenMilestoneIssueNumbers,
@@ -53,6 +60,49 @@ export interface EnginePromoteOpts {
   gitSha?: string | null;
   /** Absolute pin path override (AGENT_PIPELINE_PRODUCTION_PIN). */
   pinPath?: string | null;
+  /**
+   * Deployment compare-and-swap: the preflight pin generation that must still
+   * hold immediately before pin/install mutation. When set, a mismatch fails
+   * without promoting or installing.
+   */
+  expectedPinGeneration?: PinGenerationClaim | null;
+}
+
+/** Durable production-pin identity used as a compare-and-swap claim. */
+export interface PinGenerationClaim {
+  version: string;
+  tag: string;
+  git_sha: string;
+  /** Bound to `pin.promoted_at`; a rewrite is a new generation. */
+  generation: string;
+}
+
+export const STALE_PIN_GENERATION_ERROR =
+  "ship deployment: production pin no longer matches the authorized promotion target";
+
+export function pinGenerationClaimFromPin(pin: ProductionEnginePin): PinGenerationClaim | null {
+  const gitSha = String(pin.git_sha ?? "").trim().toLowerCase();
+  const generation = String(pin.promoted_at ?? "").trim();
+  if (!OID_RE.test(gitSha) || !generation) return null;
+  return {
+    version: pin.version,
+    tag: pin.tag,
+    git_sha: gitSha,
+    generation,
+  };
+}
+
+export function pinMatchesGenerationClaim(
+  pin: ProductionEnginePin,
+  claim: PinGenerationClaim,
+): boolean {
+  const gitSha = String(pin.git_sha ?? "").trim().toLowerCase();
+  return (
+    pin.version === claim.version &&
+    pin.tag === claim.tag &&
+    gitSha === claim.git_sha &&
+    String(pin.promoted_at ?? "").trim() === claim.generation
+  );
 }
 
 export interface EnginePromoteResult {
@@ -99,8 +149,14 @@ export interface EnginePromoteDeps {
   >;
   /** Run installer for tag; throw on non-zero. */
   installFromTag(tag: string, host: EnginePromoteHost): Promise<{ command: string; stdout: string }>;
-  /** Read installed pipeline --version (semver without v). */
+  /** Read installed pipeline --version (semver without v). Ingress only. */
   installedVersion(): Promise<string | null>;
+  /**
+   * Live installed engine digest (40-hex) for one selected host.
+   * Must observe that host's installed skill engine, not the source checkout.
+   * A matching version string is not this proof.
+   */
+  installedDigest(host: BuiltinOuterHostId): Promise<string | null>;
   /**
    * Optional gh-free `skip_frg` read. When omitted, the command reads
    * `.github/pipeline.yml` via {@link readSkipFrgFromPipelineYml}.
@@ -244,6 +300,57 @@ export function installCommandForTag(
   return `npx ${installArgsForTag(tag, host, startingLockPid).join(" ")}`;
 }
 
+/** Concrete hosts that deployment must observe for `host`. */
+export function selectedPromoteHosts(host: EnginePromoteHost): readonly BuiltinOuterHostId[] {
+  if (host === "all") return BUILTIN_OUTER_HOST_IDS;
+  return [host];
+}
+
+export function matchingLiveDigestForHosts(
+  observations: ReadonlyArray<{ host: string; digest: string | null }>,
+  authorizedDigest: string,
+): { ok: true; digest: string } | { ok: false; reason: string } {
+  const authorized = authorizedDigest.trim().toLowerCase();
+  if (!OID_RE.test(authorized)) {
+    return {
+      ok: false,
+      reason: `live digest (unknown) does not match authorized ${authorizedDigest || "(missing)"}`,
+    };
+  }
+  if (observations.length === 0) {
+    return { ok: false, reason: "live digest observer has no selected hosts" };
+  }
+  for (const obs of observations) {
+    const live = typeof obs.digest === "string" ? obs.digest.trim().toLowerCase() : "";
+    if (!OID_RE.test(live)) {
+      return {
+        ok: false,
+        reason: `live digest ${obs.digest ?? "(unknown)"} for host ${obs.host} does not match authorized ${authorized}`,
+      };
+    }
+    if (live !== authorized) {
+      return {
+        ok: false,
+        reason: `live digest ${live} for host ${obs.host} does not match authorized ${authorized}`,
+      };
+    }
+  }
+  return { ok: true, digest: authorized };
+}
+
+function hostInstalledSkillDir(host: BuiltinOuterHostId): string | null {
+  const manifest = resolveOuterHost(host);
+  if (!manifest) return null;
+  const skill = resolveManifestSkillPath(manifest, {
+    homeDir: () => os.homedir(),
+    envGet: (key) => process.env[key],
+  });
+  const launcher = path.join(skill, "scripts", "pipeline.mjs");
+  const core = path.join(skill, "core");
+  if (!fs.existsSync(launcher) && !fs.existsSync(path.join(core, "scripts"))) return null;
+  return skill;
+}
+
 export async function runEnginePromote(
   opts: EnginePromoteOpts,
   deps: EnginePromoteDeps,
@@ -325,52 +432,93 @@ export async function runEnginePromote(
     repoDir: opts.repoDir,
     overridePath: opts.pinPath,
   });
-  // Same version+tag is already-current only for a production-quality pin,
-  // or when the resolved skip is active. A no-frg-* / null-evidence pin
-  // must re-enter promote (real FRG) or refuse — never succeed as current.
-  let alreadyPinned =
-    pinLoad.kind === "ok" &&
-    pinLoad.pin.version === version &&
-    pinLoad.pin.tag === tag &&
-    (allowWithoutFrg || isProductionQualityPin(pinLoad.pin));
+  const expectedPinGeneration = opts.expectedPinGeneration ?? null;
+  const stalePinGeneration = (load: typeof pinLoad): EnginePromoteResult => ({
+    ...base,
+    pin: load.kind === "ok" ? load.pin : base.pin,
+    pin_path: load.kind === "ok" ? load.path : base.pin_path,
+    error: STALE_PIN_GENERATION_ERROR,
+    steps: [...steps, "stale_pin_generation"],
+  });
+  const pinGenerationHolds = (load: typeof pinLoad): load is { kind: "ok"; pin: ProductionEnginePin; path: string } =>
+    Boolean(
+      expectedPinGeneration &&
+      load.kind === "ok" &&
+      load.pin &&
+      pinMatchesGenerationClaim(load.pin, expectedPinGeneration),
+    );
 
-  if (alreadyPinned && skipPromoteIfCurrent) {
-    steps.push(`pin_already_current: ${version}`);
-    base.pin = pinLoad.kind === "ok" ? pinLoad.pin : null;
-    base.pin_path = pinLoad.kind === "ok" ? pinLoad.path : null;
-    deps.log(`[engine-promote] production pin already at ${version}`);
-  } else if (dryRun) {
-    steps.push(`would_promote_pin: ${version}`);
-    deps.log(`[engine-promote] dry-run: would promote pin to ${version}`);
-  } else {
-    deps.log(`[engine-promote] promoting production pin to ${version}…`);
-    const promo = await deps.promote({
-      repoDir: opts.repoDir,
-      version,
-      gitSha,
-      overridePath: opts.pinPath,
-      allowWithoutFrg,
-    });
-    if (!promo.ok) {
-      return {
-        ...base,
-        error: promo.message,
-        steps: [...steps, `promote_failed: ${promo.message}`],
-        reinstall_hint: null,
-      };
+  if (expectedPinGeneration) {
+    if (!pinGenerationHolds(pinLoad)) {
+      return stalePinGeneration(pinLoad);
     }
-    steps.push(`pin_promoted: ${promo.path}`);
-    base.pin_promoted = true;
-    base.pin = promo.pin;
-    base.pin_path = promo.path;
-    base.reinstall_hint = promo.reinstall_hint;
+    // Deploy is bound to the preflight generation. Do not rewrite the pin
+    // (that would mask an intervening retarget).
+    steps.push(`pin_generation_bound: ${expectedPinGeneration.generation}`);
+    base.pin = pinLoad.pin;
+    base.pin_path = pinLoad.path;
+    deps.log(`[engine-promote] production pin generation bound at ${version}`);
+  } else {
+    // Same version+tag is already-current only for a production-quality pin,
+    // or when the resolved skip is active. A no-frg-* / null-evidence pin
+    // must re-enter promote (real FRG) or refuse — never succeed as current.
+    const alreadyPinned =
+      pinLoad.kind === "ok" &&
+      pinLoad.pin.version === version &&
+      pinLoad.pin.tag === tag &&
+      (allowWithoutFrg || isProductionQualityPin(pinLoad.pin));
+
+    if (alreadyPinned && skipPromoteIfCurrent) {
+      steps.push(`pin_already_current: ${version}`);
+      base.pin = pinLoad.kind === "ok" ? pinLoad.pin : null;
+      base.pin_path = pinLoad.kind === "ok" ? pinLoad.path : null;
+      deps.log(`[engine-promote] production pin already at ${version}`);
+    } else if (dryRun) {
+      steps.push(`would_promote_pin: ${version}`);
+      deps.log(`[engine-promote] dry-run: would promote pin to ${version}`);
+    } else {
+      deps.log(`[engine-promote] promoting production pin to ${version}…`);
+      const promo = await deps.promote({
+        repoDir: opts.repoDir,
+        version,
+        gitSha,
+        overridePath: opts.pinPath,
+        allowWithoutFrg,
+      });
+      if (!promo.ok) {
+        return {
+          ...base,
+          error: promo.message,
+          steps: [...steps, `promote_failed: ${promo.message}`],
+          reinstall_hint: null,
+        };
+      }
+      steps.push(`pin_promoted: ${promo.path}`);
+      base.pin_promoted = true;
+      base.pin = promo.pin;
+      base.pin_path = promo.path;
+      base.reinstall_hint = promo.reinstall_hint;
+    }
   }
 
   // 3) Install
   if (skipInstall) {
     steps.push("install_skipped");
-    base.verified = alreadyPinned || base.pin_promoted;
+    // Pin-only. Deployment still requires a live digest match.
+    base.verified = false;
     return base;
+  }
+
+  if (expectedPinGeneration) {
+    const pinAtMutate = await deps.loadPin({
+      repoDir: opts.repoDir,
+      overridePath: opts.pinPath,
+    });
+    if (!pinGenerationHolds(pinAtMutate)) {
+      return stalePinGeneration(pinAtMutate);
+    }
+    base.pin = pinAtMutate.pin;
+    base.pin_path = pinAtMutate.path;
   }
 
   if (dryRun) {
@@ -388,58 +536,58 @@ export async function runEnginePromote(
     const msg = (err as Error).message;
     steps.push(`install_failed: ${msg}`);
     deps.log(`[engine-promote] install failed: ${msg}`);
-    // Rollback pin if we changed it
-    if (base.pin_promoted) {
-      deps.log(`[engine-promote] rolling back production pin…`);
-      const rb = await deps.rollback({
-        repoDir: opts.repoDir,
-        overridePath: opts.pinPath,
-      });
-      if (rb.ok) {
-        base.rolled_back = true;
-        steps.push(`pin_rolled_back: ${rb.pin.version}`);
-        base.pin = rb.pin;
-        base.reinstall_hint = rb.reinstall_hint;
-        try {
-          await deps.installFromTag(rb.pin.tag, host);
-          steps.push(`reinstall_previous_ok: ${rb.pin.tag}`);
-        } catch (err2) {
-          steps.push(`reinstall_previous_failed: ${(err2 as Error).message}`);
-        }
-      } else {
-        steps.push(`pin_rollback_failed: ${rb.message}`);
-      }
-    }
+    steps.push("rollback_not_granted: generic install failure");
     return { ...base, error: `install failed: ${msg}` };
   }
 
-  // 4) Verify installed version matches
+  if (expectedPinGeneration) {
+    const pinAfter = await deps.loadPin({
+      repoDir: opts.repoDir,
+      overridePath: opts.pinPath,
+    });
+    if (!pinGenerationHolds(pinAfter)) {
+      return { ...stalePinGeneration(pinAfter), install_ran: true };
+    }
+    base.pin = pinAfter.pin;
+    base.pin_path = pinAfter.path;
+  }
+
+  // 4) Verify live digest matches the authorized published artifact on every
+  // selected host. Version string is ingress evidence only.
   const installed = await deps.installedVersion();
-  if (installed && installed.replace(/^[vV]/, "") === version) {
+  const observations: Array<{ host: string; digest: string | null }> = [];
+  for (const selectedHost of selectedPromoteHosts(host)) {
+    observations.push({ host: selectedHost, digest: await deps.installedDigest(selectedHost) });
+  }
+  const livePin = await deps.loadPin({
+    repoDir: opts.repoDir,
+    overridePath: opts.pinPath,
+  });
+  const generationClaim = expectedPinGeneration ?? (base.pin ? pinGenerationClaimFromPin(base.pin) : null);
+  if (generationClaim) {
+    if (livePin.kind !== "ok" || !pinMatchesGenerationClaim(livePin.pin, generationClaim)) {
+      return { ...stalePinGeneration(livePin), install_ran: base.install_ran };
+    }
+    base.pin = livePin.pin;
+    base.pin_path = livePin.path;
+  }
+  const authorizedDigest = (base.pin?.git_sha ?? gitSha ?? "").trim().toLowerCase();
+  const versionMatches = Boolean(installed && installed.replace(/^[vV]/, "") === version);
+  const digestProof = matchingLiveDigestForHosts(observations, authorizedDigest);
+  if (versionMatches && digestProof.ok) {
     base.verified = true;
     steps.push(`verified_installed: ${installed}`);
-    deps.log(`[engine-promote] verified installed version ${installed}`);
+    steps.push(`verified_digest: ${authorizedDigest.slice(0, 12)}`);
+    deps.log(`[engine-promote] verified installed digest ${authorizedDigest.slice(0, 12)}`);
+  } else if (!OID_RE.test(authorizedDigest) && allowWithoutFrg && versionMatches) {
+    steps.push(`digest_unproven: skip-frg pin has no authorized digest`);
+    deps.log(`[engine-promote] skip-frg install matched version ${installed}; digest remains unproven`);
   } else {
-    const msg =
-      `installed version ${installed ?? "(unknown)"} does not match target ${version}`;
+    const msg = digestProof.ok
+      ? `installed version ${installed ?? "(unknown)"} does not match target ${version}`
+      : digestProof.reason;
     steps.push(`verify_failed: ${msg}`);
-    if (base.pin_promoted) {
-      const rb = await deps.rollback({
-        repoDir: opts.repoDir,
-        overridePath: opts.pinPath,
-      });
-      if (rb.ok) {
-        base.rolled_back = true;
-        steps.push(`pin_rolled_back: ${rb.pin.version}`);
-        base.reinstall_hint = rb.reinstall_hint;
-        try {
-          await deps.installFromTag(rb.pin.tag, host);
-          steps.push(`reinstall_previous_ok: ${rb.pin.tag}`);
-        } catch (err2) {
-          steps.push(`reinstall_previous_failed: ${(err2 as Error).message}`);
-        }
-      }
-    }
+    steps.push("rollback_not_granted: generic verify failure");
     return { ...base, error: msg };
   }
 
@@ -572,6 +720,35 @@ export function realEnginePromoteDeps(repoDir: string): EnginePromoteDeps {
       } catch {
         return null;
       }
+    },
+    async installedDigest(host) {
+      const skill = hostInstalledSkillDir(host);
+      if (skill) {
+        const launcher = path.join(skill, "scripts", "pipeline.mjs");
+        if (fs.existsSync(launcher)) {
+          try {
+            const { stdout } = await execFileAsync(
+              process.execPath,
+              [launcher, "--version", "--json"],
+              {
+                timeout: 30_000,
+                maxBuffer: 1024 * 1024,
+                env: process.env,
+              },
+            );
+            const raw = String(stdout).trim().split(/\r?\n/)[0] ?? "";
+            const parsed = JSON.parse(raw) as { commit_sha?: unknown };
+            const sha =
+              typeof parsed.commit_sha === "string" ? parsed.commit_sha.trim().toLowerCase() : "";
+            if (OID_RE.test(sha)) return sha;
+          } catch {
+            // Fall through to installed-core rev-parse. Never use repoDir.
+          }
+        }
+        const sha = resolveEngineCommitSha(path.join(skill, "core"));
+        return sha && OID_RE.test(sha) ? sha.toLowerCase() : null;
+      }
+      return null;
     },
     async listRemainingOpenMilestoneIssues(milestone) {
       let repo: string;

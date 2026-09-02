@@ -1,11 +1,11 @@
 // Pipeline-owned release shipment coordinator.
 //
-// This module is deliberately only a coordinator. It does not supervise a
+// This module is deliberately only a coordinator / compatibility projector.
+// RecoverySupervisor owns lifecycle. The coordinator does not supervise a
 // process, poll Buzz, schedule work, merge directly, or duplicate stage logic.
 // Each injected `converge*` seam must reconcile and then drive its existing
-// Pipeline capability to the typed terminal evidence it returns. The explicit
-// `reconcile` pass makes a rerun safe after a crash between an external side
-// effect and the local atomic status write.
+// Pipeline capability to the typed terminal evidence it returns. Mechanical
+// post-ready faults persist Cooling or wait and return status.
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -22,6 +22,44 @@ import {
   type MilestoneApiRaw,
   type MilestoneIssueApiRaw,
 } from "./milestone-open-issues.ts";
+import { type StageDiagnostic } from "../stage-diagnostic.ts";
+import {
+  EMPTY_CANDIDATE_LINEAGE,
+  coolingUntilIso,
+  diagnosticFromError,
+  isAuthorizationOrProtocolShipError,
+  isRemainingOpenShipWait,
+  lineageHasPriorEdges,
+  projectCandidateLineage,
+  projectHumanAuthorityBit,
+  resolveShipReleaseModel,
+  type CandidateLineage,
+  type OperationBoundAuthority,
+  type ShipLifecycleState,
+  type ShipMutationClaim,
+  type ShipReleaseModel,
+} from "./ship-supervision.ts";
+
+export {
+  EMPTY_CANDIDATE_LINEAGE,
+  lineageHasPriorEdges,
+  projectCandidateLineage,
+  projectShipStatusView,
+  shipPhaseInvariant,
+  assertRollbackEnvelope,
+  operatorRollbackEnvelope,
+  assertOperationBoundAuthority,
+  SHIP_PHASE_INVARIANTS,
+  ROLLBACK_OPERATION,
+  type CandidateLineage,
+  type OperationBoundAuthority,
+  type RollbackAuthorityEnvelope,
+  type ShipLifecycleState,
+  type ShipMutationClaim,
+  type ShipReleaseModel,
+  type ShipStatusView,
+  type SupervisedShipPhase,
+} from "./ship-supervision.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -93,8 +131,10 @@ export type ShipNextAction =
   | "frg_score"
   | "release_prepare"
   | "release_finish"
+  | "tag"
   | "release_wait"
   | "engine_promote"
+  | "deploy"
   | "complete";
 
 export interface ShipTrainPlan {
@@ -143,10 +183,19 @@ export interface ShipReleaseFinishEvidence extends ShipReleaseEvidence {
   merge_commit_oid: string;
 }
 
+export interface ShipTagEvidence {
+  version: string;
+  tag: string;
+  /** Origin-observed peeled commit. A local-only tag is not this identity. */
+  peeled_commit: string;
+}
+
 export interface ShipPublicationEvidence {
   version: string;
   tag: string;
   published: true;
+  /** Tagged commit digest. A version string is not this identity. */
+  artifact_digest: string;
 }
 
 export interface ShipPromotionEvidence {
@@ -154,6 +203,17 @@ export interface ShipPromotionEvidence {
   tag: string;
   verified: true;
   installed_version: string;
+  /** Production-pin git_sha. Ingress version is not this identity. */
+  pin_digest: string;
+}
+
+export interface ShipDeploymentEvidence {
+  version: string;
+  tag: string;
+  environment: string;
+  authorized_digest: string;
+  live_digest: string;
+  verified: true;
 }
 
 export interface ShipProgress {
@@ -162,8 +222,11 @@ export interface ShipProgress {
   frg: ShipFrgEvidence | null;
   release: ShipReleaseEvidence | null;
   release_finish: ShipReleaseFinishEvidence | null;
+  tag: ShipTagEvidence | null;
   publication: ShipPublicationEvidence | null;
   promotion: ShipPromotionEvidence | null;
+  deployment: ShipDeploymentEvidence | null;
+  lineage: CandidateLineage;
 }
 
 export interface ShipStatus extends ShipProgress {
@@ -187,6 +250,14 @@ export interface ShipStatus extends ShipProgress {
   human_authority?: boolean;
   current_item?: number | null;
   last_durable_stage?: string | null;
+  /** Owned lifecycle projection. Mechanical failure stays cooling or waiting. */
+  lifecycle?: ShipLifecycleState;
+  lifecycle_reason?: string | null;
+  cooling_until?: string | null;
+  diagnostic?: StageDiagnostic | null;
+  authority_binding?: OperationBoundAuthority | null;
+  active_claim?: ShipMutationClaim | null;
+  release_model?: ShipReleaseModel;
 }
 
 export interface ShipPhaseEvent {
@@ -228,8 +299,15 @@ export interface ShipCoordinatorDeps {
   convergeFrgScore(intent: ShipIntent, pack: ShipFrgPackEvidence): Promise<ShipFrgEvidence>;
   convergeReleasePrepare(intent: ShipIntent, frg: ShipFrgEvidence): Promise<ShipReleaseEvidence>;
   convergeReleaseFinish(intent: ShipIntent, release: ShipReleaseEvidence): Promise<ShipReleaseFinishEvidence>;
+  convergeTag(intent: ShipIntent, release: ShipReleaseFinishEvidence): Promise<ShipTagEvidence>;
   waitForRelease(intent: ShipIntent, release: ShipReleaseFinishEvidence): Promise<ShipPublicationEvidence>;
   convergeEnginePromote(intent: ShipIntent, publication: ShipPublicationEvidence): Promise<ShipPromotionEvidence>;
+  convergeDeployment(intent: ShipIntent, promotion: ShipPromotionEvidence): Promise<ShipDeploymentEvidence>;
+  /**
+   * Single `roadmap.release_model` policy. Absent or unknown is SemVer.
+   * Do not add a parallel `ship.model` key.
+   */
+  releaseModel?: ShipReleaseModel;
   /**
    * Live GitHub remaining-open observation for the ship milestone.
    * Returns open issue numbers only (no pull requests). Throws on auth, API,
@@ -245,6 +323,7 @@ export const SHIP_END_OPEN_ISSUE_GATED_PHASES = [
   "release_prepare",
   "release_finish",
   "engine_promote",
+  "deploy",
 ] as const satisfies readonly ShipNextAction[];
 
 export type RemainingOpenGhRunner = (args: string[]) => Promise<string>;
@@ -372,9 +451,27 @@ const EMPTY_PROGRESS: ShipProgress = {
   frg: null,
   release: null,
   release_finish: null,
+  tag: null,
   publication: null,
   promotion: null,
+  deployment: null,
+  lineage: { ...EMPTY_CANDIDATE_LINEAGE },
 };
+
+export function emptyShipProgress(): ShipProgress {
+  return {
+    train: null,
+    frg_pack: null,
+    frg: null,
+    release: null,
+    release_finish: null,
+    tag: null,
+    publication: null,
+    promotion: null,
+    deployment: null,
+    lineage: { ...EMPTY_CANDIDATE_LINEAGE },
+  };
+}
 
 function requireNonEmpty(value: unknown, field: string): string {
   if (typeof value !== "string" || value.trim() === "" || /[\u0000-\u001f]/.test(value)) {
@@ -695,10 +792,26 @@ function validateProgress(
     }
     requireOid(progress.release_finish.merge_commit_oid, "release merge_commit_oid");
   }
+  if (progress.tag) {
+    if (!progress.release_finish || progress.tag.version !== intent.version ||
+        progress.tag.tag !== expectedTag(intent.version)) {
+      throw new Error("ship reconciliation: tag evidence does not match the release");
+    }
+    requireOid(progress.tag.peeled_commit, "tag peeled_commit");
+    if (progress.tag.peeled_commit !== progress.release_finish.merge_commit_oid) {
+      throw new Error("ship reconciliation: tag peel does not match the release merge commit");
+    }
+  }
   if (progress.publication) {
-    if (!progress.release_finish || !progress.publication.published ||
+    if (!progress.release_finish || !progress.tag || !progress.publication.published ||
         progress.publication.version !== intent.version || progress.publication.tag !== expectedTag(intent.version)) {
       throw new Error("ship reconciliation: publication evidence does not match the release");
+    }
+    requireOid(progress.publication.artifact_digest, "publication artifact_digest");
+    if (progress.publication.artifact_digest !== progress.release_finish.merge_commit_oid ||
+        progress.publication.tag !== progress.tag.tag ||
+        progress.publication.artifact_digest !== progress.tag.peeled_commit) {
+      throw new Error("ship reconciliation: publication digest does not match the release merge commit");
     }
   }
   if (progress.promotion) {
@@ -707,17 +820,49 @@ function validateProgress(
         progress.promotion.installed_version !== intent.version) {
       throw new Error("ship reconciliation: engine promotion does not match the published release");
     }
+    requireOid(progress.promotion.pin_digest, "promotion pin_digest");
+    if (progress.promotion.pin_digest !== progress.publication.artifact_digest) {
+      throw new Error("ship reconciliation: promotion pin digest does not match the published artifact");
+    }
+  }
+  if (progress.deployment) {
+    if (!progress.promotion || !progress.deployment.verified ||
+        progress.deployment.version !== intent.version || progress.deployment.tag !== expectedTag(intent.version)) {
+      throw new Error("ship reconciliation: deployment evidence does not match the promoted pin");
+    }
+    requireOid(progress.deployment.authorized_digest, "deployment authorized_digest");
+    requireOid(progress.deployment.live_digest, "deployment live_digest");
+    if (progress.deployment.authorized_digest !== progress.promotion.pin_digest ||
+        progress.deployment.live_digest !== progress.deployment.authorized_digest) {
+      throw new Error("ship reconciliation: live digest does not match the authorized published artifact");
+    }
+  }
+  const lineage = projectCandidateLineage(progress);
+  if (progress.publication && !lineageHasPriorEdges(lineage, "publication")) {
+    throw new Error("ship reconciliation: publication requires a proven origin tag");
+  }
+  if (progress.lineage) {
+    for (const key of Object.keys(EMPTY_CANDIDATE_LINEAGE) as (keyof CandidateLineage)[]) {
+      const expected = lineage[key];
+      const actual = progress.lineage[key];
+      if (expected && actual && actual.identity !== expected.identity) {
+        throw new Error(`ship reconciliation: lineage ${key} identity drifted`);
+      }
+    }
   }
 }
 
-function nextAction(progress: ShipProgress): ShipNextAction {
+function nextAction(progress: ShipProgress, releaseModel: ShipReleaseModel = "semver"): ShipNextAction {
   if (!progress.train) return "train_merge";
+  if (releaseModel === "continuous") return "complete";
   if (!progress.frg_pack) return "frg_pack";
   if (!progress.frg) return "frg_score";
   if (!progress.release) return "release_prepare";
   if (!progress.release_finish) return "release_finish";
+  if (!progress.tag) return "tag";
   if (!progress.publication) return "release_wait";
   if (!progress.promotion) return "engine_promote";
+  if (!progress.deployment) return "deploy";
   return "complete";
 }
 
@@ -767,26 +912,71 @@ function isPendingReleaseCheckCheckpoint(err: unknown): boolean {
   );
 }
 
+function attachLineage(progress: ShipProgress): ShipProgress {
+  return {
+    ...progress,
+    tag: progress.tag ?? null,
+    deployment: progress.deployment ?? null,
+    lineage: projectCandidateLineage(progress),
+  };
+}
+
+function lifecycleFor(input: {
+  action: ShipNextAction;
+  lastError: string | null;
+  wait: boolean;
+  humanAuthority: boolean;
+}): ShipLifecycleState {
+  if (input.action === "complete") return "complete";
+  if (input.wait || input.humanAuthority) return "waiting";
+  if (input.lastError) return "cooling";
+  return "active";
+}
+
 async function persist(
   deps: ShipCoordinatorDeps,
   status: ShipStatus,
   progress: ShipProgress,
   lastError: string | null = null,
+  opts: {
+    wait?: boolean;
+    diagnostic?: StageDiagnostic | null;
+    claim?: ShipMutationClaim | null;
+    humanAuthority?: boolean;
+  } = {},
 ): Promise<ShipStatus> {
-  validateProgress(progress, status.intent, status.train_plan);
-  const action = nextAction(progress);
-  const humanAuthority =
-    typeof lastError === "string" &&
-    /needs-human|missing-authority|human.authority|specification-decision/i.test(lastError);
+  const withLineage = attachLineage(progress);
+  validateProgress(withLineage, status.intent, status.train_plan);
+  const releaseModel = resolveShipReleaseModel(status.release_model ?? deps.releaseModel);
+  const action = nextAction(withLineage, releaseModel);
+  const diagnostic = opts.diagnostic === undefined
+    ? (status.diagnostic ?? null)
+    : opts.diagnostic;
+  const humanAuthority = opts.humanAuthority ?? projectHumanAuthorityBit({
+    diagnostic,
+    nowMs: deps.now().getTime(),
+  });
+  const lifecycle = lifecycleFor({
+    action,
+    lastError,
+    wait: opts.wait === true,
+    humanAuthority,
+  });
   const updated: ShipStatus = {
     ...status,
-    ...progress,
+    ...withLineage,
     revision: status.revision + 1,
     next_action: action,
     complete: action === "complete",
     updated_at: deps.now().toISOString(),
     last_error: lastError,
     human_authority: humanAuthority,
+    lifecycle,
+    lifecycle_reason: lastError,
+    cooling_until: lifecycle === "cooling" ? coolingUntilIso(deps.now()) : null,
+    diagnostic,
+    active_claim: opts.claim === undefined ? status.active_claim ?? null : opts.claim,
+    release_model: releaseModel,
   };
   await deps.state.writeAtomic(status.ship_key, updated);
   return updated;
@@ -805,6 +995,8 @@ async function persistTrainPlan(
     revision: status.revision + 1,
     updated_at: deps.now().toISOString(),
     last_error: null,
+    lifecycle: status.lifecycle ?? "active",
+    cooling_until: null,
   };
   await deps.state.writeAtomic(status.ship_key, updated);
   return updated;
@@ -909,34 +1101,84 @@ export async function runShipCoordinator(
       complete: false,
       updated_at: now,
       last_error: null,
+      lifecycle: "active",
+      lifecycle_reason: null,
+      cooling_until: null,
+      diagnostic: null,
+      authority_binding: null,
+      active_claim: null,
+      release_model: resolveShipReleaseModel(deps.releaseModel),
       ...EMPTY_PROGRESS,
     };
     await deps.state.writeAtomic(coordinateKey, status);
   }
 
+  status.release_model = resolveShipReleaseModel(status.release_model ?? deps.releaseModel);
   const reconciled = await deps.reconcile(expected, status);
   validateProgress(reconciled, expected, status.train_plan);
-  status = await persist(deps, status, reconciled);
+  status = await persist(deps, status, reconciled, null, { claim: null });
   await recordEvent(deps, status, status.next_action, "reconciled", "external truth applied");
   const wasComplete = status.complete;
   let waitCheckpoint = false;
 
+  const claimPhase = (phase: ShipNextAction): ShipMutationClaim => ({
+    operation: phase,
+    repository: expected.repository,
+    lineage_node: status.train?.integrated_head_oid ?? expected.version,
+    scope: `${expected.milestone}@${expected.version}`,
+    actor: expected.sender_id,
+    expiry: status.authorization_expires_at,
+    outcome: "started",
+    evidence_fingerprint: `${phase}:${status.train?.integrated_head_oid ?? "none"}:${status.revision}`,
+    started_at: deps.now().toISOString(),
+  });
+
+  const bindAuthority = (phase: ShipNextAction): OperationBoundAuthority | null => {
+    const candidate = status.train?.integrated_head_oid;
+    if (!candidate) return status.authority_binding ?? null;
+    return {
+      operation: phase,
+      repository: expected.repository,
+      candidate,
+      scope: `${expected.milestone}@${expected.version}`,
+      actor: expected.sender_id,
+      expires_at: status.authorization_expires_at,
+    };
+  };
+
   const run = async <T>(phase: ShipNextAction, operation: () => Promise<T>, apply: (value: T) => ShipProgress) => {
+    const claim = claimPhase(phase);
+    status = {
+      ...status,
+      authority_binding: bindAuthority(phase),
+    };
+    status = await persist(deps, status, status, null, { claim });
     await recordEvent(deps, status, phase, "started");
     try {
       requireActiveAuthorization();
+      if (status.authority_binding && status.train) {
+        const current = bindAuthority(phase);
+        if (current && status.authority_binding.candidate !== current.candidate) {
+          throw new Error(
+            `ship authority: candidate does not match the current claim (${status.authority_binding.candidate} vs ${current.candidate})`,
+          );
+        }
+      }
       if ((SHIP_END_OPEN_ISSUE_GATED_PHASES as readonly ShipNextAction[]).includes(phase)) {
         const remaining = await deps.observeRemainingOpenMilestoneIssues(expected);
         assertNoRemainingOpenMilestoneIssues(expected.milestone, remaining);
       }
       const value = await operation();
-      status = await persist(deps, status, apply(value));
+      status = await persist(deps, status, apply(value), null, { claim: null, diagnostic: null });
       await recordEvent(deps, status, phase, "completed");
     } catch (err) {
-      if (isPendingReleaseCheckCheckpoint(err)) {
+      if (isPendingReleaseCheckCheckpoint(err) || isRemainingOpenShipWait(err)) {
         const message = err instanceof Error ? err.message : String(err);
         try {
-          status = await persist(deps, status, status, null);
+          status = await persist(deps, status, status, isRemainingOpenShipWait(err) ? message : null, {
+            wait: true,
+            claim: { ...claim, outcome: "uncertain" },
+          });
           await recordEvent(deps, status, phase, "started", message);
         } catch (stateErr) {
           throw new AggregateError(
@@ -948,13 +1190,23 @@ export async function runShipCoordinator(
         return;
       }
       const message = err instanceof Error ? err.message : String(err);
+      const diagnostic = diagnosticFromError(err);
+      const humanAuthority = projectHumanAuthorityBit({
+        diagnostic,
+        nowMs: deps.now().getTime(),
+      });
       try {
-        status = await persist(deps, status, status, message);
+        status = await persist(deps, status, status, message, {
+          diagnostic,
+          humanAuthority,
+          claim: { ...claim, outcome: "uncertain" },
+        });
         await recordEvent(deps, status, phase, "failed", message);
       } catch (stateErr) {
         throw new AggregateError([err, stateErr], `ship ${phase} failed and status persistence also failed`);
       }
-      throw err;
+      if (isAuthorizationOrProtocolShipError(err)) throw err;
+      waitCheckpoint = true;
     }
   };
 
@@ -974,27 +1226,48 @@ export async function runShipCoordinator(
       () => deps.convergeTrain(expected, status.train_plan!.ordered_issues),
       (train) => ({ ...status, train }),
     );
+    if (waitCheckpoint) return status;
+  }
+  if (resolveShipReleaseModel(status.release_model) === "continuous") {
+    if (!status.complete) status = await persist(deps, status, status, null, { claim: null });
+    if (status.complete && !wasComplete) {
+      await recordEvent(deps, status, "complete", "completed");
+    }
+    return status;
   }
   if (!status.frg_pack) {
     await run("frg_pack", () => deps.convergeFrgPack(expected, status.train!), (frg_pack) => ({ ...status, frg_pack }));
+    if (waitCheckpoint) return status;
   }
   if (!status.frg) {
     await run("frg_score", () => deps.convergeFrgScore(expected, status.frg_pack!), (frg) => ({ ...status, frg }));
+    if (waitCheckpoint) return status;
   }
   if (!status.release) {
     await run("release_prepare", () => deps.convergeReleasePrepare(expected, status.frg!), (release) => ({ ...status, release }));
+    if (waitCheckpoint) return status;
   }
   if (!status.release_finish) {
     await run("release_finish", () => deps.convergeReleaseFinish(expected, status.release!), (release_finish) => ({ ...status, release_finish }));
     if (waitCheckpoint) return status;
   }
+  if (!status.tag) {
+    await run("tag", () => deps.convergeTag(expected, status.release_finish!), (tag) => ({ ...status, tag }));
+    if (waitCheckpoint) return status;
+  }
   if (!status.publication) {
     await run("release_wait", () => deps.waitForRelease(expected, status.release_finish!), (publication) => ({ ...status, publication }));
+    if (waitCheckpoint) return status;
   }
   if (!status.promotion) {
     await run("engine_promote", () => deps.convergeEnginePromote(expected, status.publication!), (promotion) => ({ ...status, promotion }));
+    if (waitCheckpoint) return status;
   }
-  if (!status.complete) status = await persist(deps, status, status);
+  if (!status.deployment) {
+    await run("deploy", () => deps.convergeDeployment(expected, status.promotion!), (deployment) => ({ ...status, deployment }));
+    if (waitCheckpoint) return status;
+  }
+  if (!status.complete) status = await persist(deps, status, status, null, { claim: null });
   if (status.complete && !wasComplete) {
     await recordEvent(deps, status, "complete", "completed");
   }

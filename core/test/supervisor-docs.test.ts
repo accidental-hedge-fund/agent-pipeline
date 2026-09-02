@@ -15,6 +15,33 @@ function read(rel: string): string {
   return fs.readFileSync(path.join(repoRoot, rel), "utf8");
 }
 
+test("ship docs do not describe regex authority or auto-rollback on install failure (#1331)", () => {
+  const context = read("CONTEXT.md");
+  const runbook = read("docs/factory-reliability-gate-runbook.md");
+  const ship = read("docs/runbooks/ship-milestone.md");
+  const commandDocs = read("core/scripts/command-docs.ts");
+  for (const [name, text] of [
+    ["CONTEXT", context],
+    ["runbook", runbook],
+    ["ship-milestone", ship],
+    ["command-docs", commandDocs],
+  ] as const) {
+    assert.doesNotMatch(
+      text,
+      /rollback pin on install failure/i,
+      `${name} must not tell engine-promote to roll back on install failure`,
+    );
+    assert.doesNotMatch(
+      text,
+      /human_authority.{0,80}needs-human\|missing-authority/i,
+      `${name} must not describe regex authority`,
+    );
+  }
+  assert.match(context, /Digest deployment/);
+  assert.match(context, /Protected rollback/);
+  assert.match(commandDocs, /live digest matches the authorized artifact/);
+});
+
 test("CONTEXT ship path names freeze-eligible and ship-end-open-issue-gate (#1354)", () => {
   const context = read("CONTEXT.md");
   const shipPath = context.slice(context.indexOf("### Ship path"));

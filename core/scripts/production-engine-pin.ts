@@ -23,6 +23,13 @@ import {
   type FrgFsDeps,
   type FrgLookupResult,
 } from "./factory-reliability-gate.ts";
+import {
+  assertRollbackEnvelope,
+  operatorRollbackEnvelope,
+  resolveRollbackEnvelopeKey,
+  type RollbackAuthorityEnvelope,
+  type RollbackRetainedTarget,
+} from "./stages/ship-supervision.ts";
 
 // ---------------------------------------------------------------------------
 // Constants / schema
@@ -1922,11 +1929,35 @@ export async function rollbackProductionPin(opts: {
   lookupFrg?: LookupFrgPassFn;
   now?: () => Date;
   env?: NodeJS.ProcessEnv;
+  /**
+   * Automatic rollback requires an authenticated envelope naming
+   * `factory_pin_rollback` and the retained target. Operator CLI supplies
+   * that envelope. Generic deploy/install failure grants no authority.
+   */
+  automatic?: boolean;
+  envelope?: RollbackAuthorityEnvelope | null;
+  /** Repository binding the envelope must name. Defaults to `repoDir`. */
+  repository?: string;
+  /** HMAC key for automatic envelope verification. Defaults to env. */
+  envelopeKey?: string | null;
 }): Promise<PromotePinResult> {
   const fsDeps = opts.fsDeps ?? defaultProductionPinFsDeps;
   const lookup = opts.lookupFrg ?? lookupFrgPass;
   const now = opts.now ?? (() => new Date());
   const pinPath = productionPinPath(opts.repoDir, opts.overridePath, opts.env);
+  const repository = opts.repository ?? opts.repoDir;
+  const envelopeKey =
+    opts.envelopeKey !== undefined
+      ? opts.envelopeKey
+      : resolveRollbackEnvelopeKey(opts.env ?? process.env);
+  if (opts.automatic && !opts.envelope) {
+    return {
+      ok: false,
+      code: "invalid_target",
+      message:
+        "rollback refused: automatic rollback requires an authenticated envelope naming factory_pin_rollback and the retained target",
+    };
+  }
 
   let current: ProductionEnginePin;
   try {
@@ -1950,6 +1981,34 @@ export async function rollbackProductionPin(opts: {
   // Snapshot of the current pin becomes the new previous after rollback.
   const currentAsPrevious = pinWithoutPrevious(current);
 
+  const authorizeRollback = (retained: RollbackRetainedTarget): PromotePinResult | null => {
+    const retainedTarget: RollbackRetainedTarget = {
+      version: retained.version,
+      ...(retained.tag ? { tag: retained.tag } : {}),
+      ...(retained.git_sha ? { git_sha: retained.git_sha } : {}),
+    };
+    const envelope = opts.envelope ?? (
+      opts.automatic
+        ? null
+        : operatorRollbackEnvelope({ retainedTarget, now: now(), repository })
+    );
+    try {
+      assertRollbackEnvelope(envelope, retainedTarget, {
+        repository,
+        nowMs: now().getTime(),
+        hmacKey: envelopeKey,
+        requireMac: opts.automatic === true,
+      });
+      return null;
+    } catch (err) {
+      return {
+        ok: false,
+        code: "invalid_target",
+        message: err instanceof Error ? err.message : String(err),
+      };
+    }
+  };
+
   if (!opts.toVersion || !opts.toVersion.trim()) {
     // Default: restore pin.previous
     if (!current.previous) {
@@ -1961,6 +2020,12 @@ export async function rollbackProductionPin(opts: {
           "Pass --to <X.Y.Z> with an FRG-passed version to rebuild the pin.",
       };
     }
+    const refused = authorizeRollback({
+      version: current.previous.version,
+      tag: current.previous.tag,
+      git_sha: current.previous.git_sha,
+    });
+    if (refused) return refused;
     const restored: ProductionEnginePin = {
       schema_version: PRODUCTION_PIN_SCHEMA_VERSION,
       version: current.previous.version,
@@ -1998,6 +2063,12 @@ export async function rollbackProductionPin(opts: {
 
   // Prefer retained previous when it matches --to
   if (current.previous && versionsMatch(current.previous.version, target)) {
+    const refused = authorizeRollback({
+      version: current.previous.version,
+      tag: current.previous.tag,
+      git_sha: current.previous.git_sha,
+    });
+    if (refused) return refused;
     const restored: ProductionEnginePin = {
       schema_version: PRODUCTION_PIN_SCHEMA_VERSION,
       version: current.previous.version,
@@ -2044,6 +2115,13 @@ export async function rollbackProductionPin(opts: {
       message: `rollback --to ${target}: FRG pass required when previous snapshot is unavailable`,
     };
   }
+
+  const refusedTo = authorizeRollback({
+    version: target,
+    tag: tagForVersion(target),
+    git_sha: look.evidence.pack_provenance?.candidate_git_sha ?? null,
+  });
+  if (refusedTo) return refusedTo;
 
   const pin = buildPinFromFrgPass({
     evidence: look.evidence,

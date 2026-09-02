@@ -15,6 +15,9 @@ import {
   classifyFrgPackWaitDecision,
   ensureAnnotatedReleaseTag,
   hmacPackedCandidateGitShaFromUnknown,
+  observeDeploymentAgainstLivePin,
+  observeDeploymentWithFinalPinRecheck,
+  observeOriginReleaseTag,
   loadRerunAttemptCount,
   persistShipFactoryReleaseRequest,
   persistedShipFactoryReleaseRequestPath,
@@ -152,10 +155,17 @@ const releaseFinish = {
   merge_commit_oid: mergeHead,
 };
 
+const tagEvidence = {
+  version: intent.version,
+  tag: `v${intent.version}`,
+  peeled_commit: mergeHead,
+};
+
 const publication = {
   version: intent.version,
   tag: `v${intent.version}`,
   published: true as const,
+  artifact_digest: mergeHead,
 };
 
 const promotion = {
@@ -163,6 +173,16 @@ const promotion = {
   tag: `v${intent.version}`,
   verified: true as const,
   installed_version: intent.version,
+  pin_digest: mergeHead,
+};
+
+const deployment = {
+  version: intent.version,
+  tag: `v${intent.version}`,
+  environment: "all",
+  authorized_digest: mergeHead,
+  live_digest: mergeHead,
+  verified: true as const,
 };
 
 const state = {
@@ -195,8 +215,20 @@ function checkpoint(overrides: Partial<ShipStatus> = {}): ShipStatus {
     frg: null,
     release: null,
     release_finish: null,
+    tag: null,
     publication: null,
     promotion: null,
+    deployment: null,
+    lineage: {
+      integrated_candidate: null,
+      frg_candidate: null,
+      release_pr_head: null,
+      release_merge_result: null,
+      tag: null,
+      published_artifact: null,
+      promoted_pin: null,
+      deployed: null,
+    },
     ...overrides,
   };
 }
@@ -210,10 +242,14 @@ function operations(overrides: Partial<ShipAdapterOperations> = {}): ShipAdapter
     observeRelease: async () => ({ prepare: release, finish: releaseFinish }),
     prepareRelease: async () => release,
     finishRelease: async () => releaseFinish,
+    observeTag: async () => tagEvidence,
+    ensureTag: async () => tagEvidence,
     observePublication: async () => publication,
     waitForPublication: async () => publication,
     observePromotion: async () => promotion,
     promote: async () => promotion,
+    observeDeployment: async () => deployment,
+    deploy: async () => deployment,
     observeRemainingOpenMilestoneIssues: async () => [],
     ...overrides,
   };
@@ -229,8 +265,164 @@ test("ship adapter reconciliation projects only externally observed typed truth"
   assert.equal(result.frg?.candidate_head_oid, head);
   assert.equal(result.release?.head_oid, releaseHead);
   assert.equal(result.release_finish?.merge_commit_oid, mergeHead);
+  assert.deepEqual(result.tag, tagEvidence);
   assert.deepEqual(result.publication, publication);
   assert.deepEqual(result.promotion, promotion);
+});
+
+test("reconciliation projects origin tag before GitHub Release publication (#1331)", async () => {
+  const deps = shipCoordinatorDepsFromOperations(operations({
+    observePublication: async () => null,
+    observePromotion: async () => {
+      throw new Error("must not observe promotion before publication");
+    },
+  }), { state });
+
+  const result = await deps.reconcile(intent, checkpoint());
+  assert.deepEqual(result.tag, tagEvidence);
+  assert.equal(result.publication, null);
+  assert.equal(result.promotion, null);
+  assert.equal(result.deployment, null);
+});
+
+test("same-version pin retarget does not verify deployment from stale host digest (#1331)", () => {
+  const retarget = "e".repeat(40);
+  const observed = observeDeploymentAgainstLivePin({
+    intent,
+    promotion,
+    pin: {
+      kind: "ok",
+      pin: { version: intent.version, tag: promotion.tag, git_sha: retarget },
+    },
+    hostObservations: [{ host: "claude", digest: mergeHead }],
+  });
+  assert.equal(observed.kind, "stale_promotion");
+});
+
+test("matching live pin digest still verifies deployment (#1331)", () => {
+  const observed = observeDeploymentAgainstLivePin({
+    intent,
+    promotion,
+    pin: {
+      kind: "ok",
+      pin: { version: intent.version, tag: promotion.tag, git_sha: mergeHead },
+    },
+    hostObservations: [{ host: "claude", digest: mergeHead }],
+  });
+  assert.equal(observed.kind, "verified");
+  if (observed.kind !== "verified") throw new Error("expected verified");
+  assert.equal(observed.evidence.authorized_digest, mergeHead);
+  assert.equal(observed.evidence.live_digest, mergeHead);
+  assert.equal(observed.evidence.tag, promotion.tag);
+});
+
+test("pin retarget between pin read and host observation does not verify (#1331)", async () => {
+  const retarget = "e".repeat(40);
+  let pinSha = mergeHead;
+  const observed = await observeDeploymentWithFinalPinRecheck({
+    intent,
+    promotion,
+    observeHosts: async () => {
+      pinSha = retarget;
+      return [{ host: "claude", digest: mergeHead }];
+    },
+    loadPin: async () => ({
+      kind: "ok",
+      pin: { version: intent.version, tag: promotion.tag, git_sha: pinSha },
+    }),
+  });
+  assert.equal(observed.kind, "stale_promotion");
+});
+
+test("pin generation retarget between pin read and host observation does not verify (#1331)", async () => {
+  const generation = "2026-08-09T00:00:00.000Z";
+  let promotedAt = generation;
+  const observed = await observeDeploymentWithFinalPinRecheck({
+    intent,
+    promotion,
+    expectedPinGeneration: {
+      version: intent.version,
+      tag: promotion.tag,
+      git_sha: mergeHead,
+      generation,
+    },
+    observeHosts: async () => {
+      promotedAt = "2026-08-09T00:01:00.000Z";
+      return [{ host: "claude", digest: mergeHead }];
+    },
+    loadPin: async () => ({
+      kind: "ok",
+      pin: {
+        version: intent.version,
+        tag: promotion.tag,
+        git_sha: mergeHead,
+        promoted_at: promotedAt,
+      },
+    }),
+  });
+  assert.equal(observed.kind, "stale_promotion");
+});
+
+test("stable pin after host observation still verifies deployment (#1331)", async () => {
+  const observed = await observeDeploymentWithFinalPinRecheck({
+    intent,
+    promotion,
+    observeHosts: async () => [{ host: "claude", digest: mergeHead }],
+    loadPin: async () => ({
+      kind: "ok",
+      pin: { version: intent.version, tag: promotion.tag, git_sha: mergeHead },
+    }),
+  });
+  assert.equal(observed.kind, "verified");
+  if (observed.kind !== "verified") throw new Error("expected verified");
+  assert.equal(observed.evidence.authorized_digest, mergeHead);
+  assert.equal(observed.evidence.live_digest, mergeHead);
+});
+
+test("reconcile invalidates promotion when the live pin digest moved (#1331)", async () => {
+  const deps = shipCoordinatorDepsFromOperations(operations({
+    observePromotion: async () => null,
+    deploy: async () => {
+      throw new Error("must not deploy from stale promotion");
+    },
+  }), { state });
+
+  const result = await deps.reconcile(intent, checkpoint({
+    promotion,
+    deployment,
+  }));
+  assert.equal(result.promotion, null);
+  assert.equal(result.deployment, null);
+});
+
+test("observeOriginReleaseTag records a completed origin tag without mutating (#1331)", async () => {
+  const calls: string[][] = [];
+  const observed = await observeOriginReleaseTag({
+    version: intent.version,
+    mergeCommitOid: mergeHead,
+    git: async (args) => {
+      calls.push(args);
+      if (args[0] === "fetch") return "";
+      if (args[0] === "cat-file") return "tag";
+      if (args[0] === "rev-parse") return mergeHead;
+      throw new Error(`unexpected git ${args.join(" ")}`);
+    },
+  });
+  assert.deepEqual(observed, tagEvidence);
+  assert.ok(calls.some((args) => args[0] === "fetch"));
+  assert.ok(!calls.some((args) => args[0] === "tag" || args[0] === "push"));
+});
+
+test("observeOriginReleaseTag returns null when origin has no tag (#1331)", async () => {
+  const observed = await observeOriginReleaseTag({
+    version: intent.version,
+    mergeCommitOid: mergeHead,
+    git: async (args) => {
+      if (args[0] === "fetch") throw new Error("couldn't find remote ref");
+      throw new Error(`unexpected git ${args.join(" ")}`);
+    },
+  });
+  assert.equal(observed, null);
 });
 
 test("ship adapter revalidates and retains a restart checkpoint after the release advanced base", async () => {
@@ -788,10 +980,9 @@ test("ship coordinator: after (#N) observeTrain, next_action is frg_pack not tra
     observeFrg: async () => null,
   }), { state: store }));
 
-  await assert.rejects(
-    () => runShipCoordinator(intent, null, coordinator),
-    /ship FRG: no release-eligible/,
-  );
+  const status = await runShipCoordinator(intent, null, coordinator);
+  assert.match(status.last_error ?? "", /ship FRG: no release-eligible/);
+  assert.equal(status.lifecycle, "cooling");
   assert.equal(runs, 0, "must not invoke runTrain");
   assert.ok(store.status?.train, "train evidence must be persisted");
   assert.equal(store.status?.train?.integrated_head_oid, V13914_MAIN);
@@ -937,15 +1128,10 @@ test("ship coordinator: proven train + missing latest.json sets next_action frg_
     },
   }), { state: store }));
 
-  await assert.rejects(
-    () => runShipCoordinator(intent13914, null, coordinator),
-    (err: unknown) => {
-      const message = err instanceof Error ? err.message : String(err);
-      assert.equal(message.includes("Cannot create or push tag"), false, message);
-      assert.match(message, /ship FRG: no release-eligible/);
-      return true;
-    },
-  );
+  const status = await runShipCoordinator(intent13914, null, coordinator);
+  assert.equal((status.last_error ?? "").includes("Cannot create or push tag"), false, status.last_error ?? "");
+  assert.match(status.last_error ?? "", /ship FRG: no release-eligible/);
+  assert.equal(status.lifecycle, "cooling");
   assert.equal(packed, 1, "FRG pack must be the next mutation");
   assert.ok(store.status?.train, "train evidence must be persisted");
   assert.equal(store.status?.train?.integrated_head_oid, head);
@@ -1179,10 +1365,9 @@ test("ship adapter remaining-open leftover blocks FRG pack without real gh (#135
     ...deps,
     withRunLock: async (_key: string, fn: () => Promise<unknown>) => fn(),
   };
-  await assert.rejects(
-    () => runShipCoordinator(intent, null, coordinator),
-    /milestone v1\.34\.0 still has open issues: #1344/,
-  );
+  const status = await runShipCoordinator(intent, null, coordinator);
+  assert.match(status.last_error ?? "", /milestone v1\.34\.0 still has open issues: #1344/);
+  assert.equal(status.lifecycle, "waiting");
   assert.equal(frgPackRuns, 0);
   assert.ok(store.status?.train, "train must still complete");
   assert.equal(store.status?.frg_pack, null);
@@ -1459,8 +1644,10 @@ test("ship adapter accepts already completed release, publication, and promotion
 
   await deps.convergeTrain(intent, train.ordered_issues);
   assert.deepEqual(await deps.convergeReleaseFinish(intent, release), releaseFinish);
+  assert.deepEqual(await deps.convergeTag(intent, releaseFinish), tagEvidence);
   assert.deepEqual(await deps.waitForRelease(intent, releaseFinish), publication);
   assert.deepEqual(await deps.convergeEnginePromote(intent, publication), promotion);
+  assert.deepEqual(await deps.convergeDeployment(intent, promotion), deployment);
   assert.deepEqual(calls, []);
 });
 
@@ -1994,16 +2181,19 @@ test("pin SHA ≠ candidate: post-train prepare/release/tag spawn candidate laun
   let preparedInProcess = false;
   let taggedInProcess = false;
   let gated = false;
+  let originHasTag = false;
   const pinOps = operations({
     observeRelease: async () => ({ prepare: release, finish: null }),
     prepareRelease: async () => {
       preparedInProcess = true;
       return release;
     },
-    waitForPublication: async () => {
+    observeTag: async () => originHasTag ? tagEvidence : null,
+    ensureTag: async () => {
       taggedInProcess = true;
-      return publication;
+      return tagEvidence;
     },
+    waitForPublication: async () => publication,
   });
   const bound = bindCandidateShipEndOperations(pinOps, {
     pinCommitSha: PIN_SHA,
@@ -2030,6 +2220,7 @@ test("pin SHA ≠ candidate: post-train prepare/release/tag spawn candidate laun
         };
       }
       if (argv.includes("factory-gate")) gated = true;
+      if (argv.includes("ensure-tag")) originHasTag = true;
       assert.ok(!argv.includes("ship"));
       assert.ok(!argv.includes("train"));
       return { code: 0, stdout: "", stderr: "" };
@@ -2038,7 +2229,7 @@ test("pin SHA ≠ candidate: post-train prepare/release/tag spawn candidate laun
 
   await bound.runFrgPack!(intent, train);
   await bound.prepareRelease(intent, head);
-  await bound.waitForPublication(intent, releaseFinish);
+  await bound.ensureTag(intent, releaseFinish);
   assert.equal(preparedInProcess, false);
   assert.equal(taggedInProcess, false);
   assert.ok(spawned.some((argv) => argv.includes("factory-release") && argv.includes("/cand/scripts/pipeline-launcher.mjs")));
@@ -2090,10 +2281,9 @@ test("unresolvable candidate stops ship before FRG and leaves train evidence", a
     authorizationPublicKey: "test",
     withRunLock: async (_key: string, fn: () => Promise<unknown>) => fn(),
   };
-  await assert.rejects(
-    runShipCoordinator(intent, null, wrapped),
-    /candidate-engine identity defect/,
-  );
+  const status = await runShipCoordinator(intent, null, wrapped);
+  assert.match(status.last_error ?? "", /candidate-engine identity defect/);
+  assert.equal(status.lifecycle, "cooling");
   assert.equal(preparedInProcess, false);
   assert.equal(store.status?.train?.integrated_head_oid, head);
   assert.equal(store.status?.frg_pack, null);
@@ -2138,10 +2328,9 @@ test("unready candidate stops ship before leaf spawn and keeps train evidence (#
     authorizationPublicKey: "test",
     withRunLock: async (_key: string, fn: () => Promise<unknown>) => fn(),
   };
-  await assert.rejects(
-    runShipCoordinator(intent, null, wrapped),
-    /readiness defect/,
-  );
+  const status = await runShipCoordinator(intent, null, wrapped);
+  assert.match(status.last_error ?? "", /readiness defect/);
+  assert.equal(status.lifecycle, "cooling");
   assert.equal(prepareReturned, true);
   assert.equal(spawned.length, 0);
   assert.equal(store.status?.train?.integrated_head_oid, head);
@@ -3229,12 +3418,14 @@ test("injected request resolver supplies the persisted prepare path when option 
 test("default candidate tag path spawns release ensure-tag on the candidate launcher", async () => {
   const spawned: string[][] = [];
   let taggedInProcess = false;
+  let originHasTag = false;
   const bound = bindCandidateShipEndOperations(operations({
-    observePublication: async () => publication,
-    waitForPublication: async () => {
+    observeTag: async () => originHasTag ? tagEvidence : null,
+    ensureTag: async () => {
       taggedInProcess = true;
-      return publication;
+      return tagEvidence;
     },
+    observePublication: async () => publication,
   }), {
     pinCommitSha: PIN_SHA,
     repoDir: "/repo",
@@ -3243,11 +3434,12 @@ test("default candidate tag path spawns release ensure-tag on the candidate laun
     resolveCandidate: async () => ({ ok: true, engine: candidateEngine }),
     spawn: async (argv) => {
       spawned.push(argv);
+      originHasTag = true;
       return { code: 0, stdout: "", stderr: "" };
     },
   });
-  const result = await bound.waitForPublication(intent, releaseFinish);
-  assert.deepEqual(result, publication);
+  const result = await bound.ensureTag(intent, releaseFinish);
+  assert.deepEqual(result, tagEvidence);
   assert.equal(taggedInProcess, false);
   assert.equal(spawned.length, 1);
   assert.deepEqual(spawned[0], [
@@ -3266,13 +3458,13 @@ test("candidate ensure-tag leaf fails closed on non-zero spawn without pin-proce
   let observed = 0;
   let taggedInProcess = false;
   const bound = bindCandidateShipEndOperations(operations({
-    observePublication: async () => {
+    observeTag: async () => {
       observed++;
-      return publication;
+      return null;
     },
-    waitForPublication: async () => {
+    ensureTag: async () => {
       taggedInProcess = true;
-      return publication;
+      return tagEvidence;
     },
   }), {
     pinCommitSha: PIN_SHA,
@@ -3282,10 +3474,10 @@ test("candidate ensure-tag leaf fails closed on non-zero spawn without pin-proce
     spawn: async () => ({ code: 1, stdout: "", stderr: "candidate tag refused" }),
   });
   await assert.rejects(
-    bound.waitForPublication(intent, releaseFinish),
+    bound.ensureTag(intent, releaseFinish),
     /candidate ensure-tag failed/,
   );
-  assert.equal(observed, 0);
+  assert.equal(observed, 1);
   assert.equal(taggedInProcess, false);
 });
 
@@ -3296,7 +3488,9 @@ test("in-engine HMAC children present KEY_FILE as KEY and prepare stays uncreden
   delete parent.PIPELINE_FRG_ATTESTATION_KEY;
   const recorded: Array<{ verb: string; env: NodeJS.ProcessEnv }> = [];
   let gated = false;
+  let originHasTag = false;
   const bound = bindCandidateShipEndOperations(operations({
+    observeTag: async () => originHasTag ? tagEvidence : null,
     observePublication: async () => publication,
   }), {
     pinCommitSha: PIN_SHA,
@@ -3333,11 +3527,12 @@ test("in-engine HMAC children present KEY_FILE as KEY and prepare stays uncreden
         };
       }
       if (verb === "attestor") gated = true;
+      if (verb === "ensure-tag") originHasTag = true;
       return { code: 0, stdout: "", stderr: "" };
     },
   });
   await bound.runFrgPack!(intent, train);
-  await bound.waitForPublication(intent, releaseFinish);
+  await bound.ensureTag(intent, releaseFinish);
   const attestor = recorded.find((r) => r.verb === "attestor");
   const tag = recorded.find((r) => r.verb === "ensure-tag");
   const prepare = recorded.find((r) => r.verb === "prepare");
@@ -3365,6 +3560,7 @@ test("in-engine HMAC children present KEY_FILE as KEY and prepare stays uncreden
 test("in-engine HMAC-verify does not spawn without a credential (#1181)", async () => {
   const spawned: string[][] = [];
   const bound = bindCandidateShipEndOperations(operations({
+    observeTag: async () => null,
     observePublication: async () => publication,
   }), {
     pinCommitSha: PIN_SHA,
@@ -3390,7 +3586,7 @@ test("in-engine HMAC-verify does not spawn without a credential (#1181)", async 
   await assert.rejects(bound.runFrgPack!(intent, train), /missing_attestor_credential/);
   assert.equal(spawned.filter((argv) => argv.includes("factory-gate")).length, 0);
   await assert.rejects(
-    bound.waitForPublication(intent, releaseFinish),
+    bound.ensureTag(intent, releaseFinish),
     /missing_attestor_credential/,
   );
   assert.equal(spawned.filter((argv) => argv.includes("ensure-tag")).length, 0);
@@ -3435,12 +3631,12 @@ test("candidate ensure-tag spawn does not use uncredentialedPrepareEnv (#1181)",
     path.join(__dirname, "..", "scripts", "stages", "ship-adapter.ts"),
     "utf8",
   );
-  const waitFn = shipAdapter.slice(
-    shipAdapter.lastIndexOf("async waitForPublication"),
-    shipAdapter.indexOf("function defaultResolveCandidateDeps"),
+  const ensureFn = shipAdapter.slice(
+    shipAdapter.lastIndexOf("async ensureTag"),
+    shipAdapter.indexOf("function runningProcessPinSha"),
   );
-  assert.match(waitFn, /hmacVerifyChildEnv/);
-  assert.doesNotMatch(waitFn, /uncredentialedPrepareEnv/);
+  assert.match(ensureFn, /hmacVerifyChildEnv/);
+  assert.doesNotMatch(ensureFn, /uncredentialedPrepareEnv/);
 });
 
 test("runEnsureAnnotatedReleaseTagCli tags via injected git, not ambient git", async () => {
@@ -4057,7 +4253,7 @@ test("real coordinator defaults spawn candidate ensure-tag leaf and persist requ
   assert.match(
     shipCode,
     /shipEndLeafArgv\(\s*"ensure-tag"/,
-    "waitForPublication must spawn candidate release ensure-tag when pin SHA differs",
+    "ensureTag must spawn candidate release ensure-tag when pin SHA differs",
   );
   assert.doesNotMatch(
     shipCode,

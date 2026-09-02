@@ -102,7 +102,7 @@ MUST NOT reintroduce a second live pin path.
 | Bootstrap from FRG pass | `pipeline factory-pin init --from-frg <X.Y.Z>` |
 | Promote after FRG pass | `pipeline factory-pin promote --for <X.Y.Z> [--git-sha <sha>]` |
 | Optional promote after gate | `pipeline factory-gate --for <X.Y.Z> --from-run <id> --promote-pin-on-pass` |
-| Rollback | `pipeline factory-pin rollback` (uses `previous`) or `… rollback --to <X.Y.Z>` |
+| Rollback | `pipeline factory-pin rollback` (uses `previous`) or `… rollback --to <X.Y.Z>`. This is a protected operator operation. Generic `engine-promote` install or verify failure does not grant rollback. |
 | Verify | `pipeline doctor` → checks `install:engine-track` and `install:production-pin-path` |
 
 After promote or rollback, **reinstall** the skill from the pin tag and re-run doctor:
