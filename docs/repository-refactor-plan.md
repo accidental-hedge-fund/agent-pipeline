@@ -100,6 +100,24 @@ Do not collapse advance, durable-loop, merge, train, and ship into one generic
 state machine. Their authority and recovery invariants differ. Do not merge
 domain stores or supervisors merely because they share filesystem mechanics.
 
+## Milestone governance
+
+GitHub milestones are the release-plan authority. The refactor uses two
+separate lanes:
+
+- `Research V2` is a non-implementation gate containing #1393, #1398, and
+  #1401. These issues settle product and state ownership, the retained
+  evaluation boundary, and risk-calibrated validation before broad v2 work.
+- `v2.0.0` contains the implementation program tracked by #1403. Its first
+  wave is the direct simplification work in #1395, #1399, and #1400.
+
+Existing trains retain narrow ownership: v1.40.1 finishes in-flight reliability
+work, v1.40.2 owns bounded patch correctness and temporary-file cleanup,
+v1.41.0 retains evaluation-framework delivery behind #1398, and v1.42.0 owns
+the portable-host chain. Speculative performance and event-plane expansion
+remain unmilestoned until their prerequisites justify re-entry. Empty
+superseded milestone shells stay closed.
+
 ## Workstreams
 
 ### 1. Map concepts to outcomes and risks
@@ -230,22 +248,32 @@ For each stage or gate, document:
 
 ## Sequence
 
-### Phase 1: inventory and quick wins
+### Phase 1: Research V2 decision gate
 
 1. Produce the command, stage, store, and gate ownership map.
-2. Remove the unused `addLabel` import and suppression reference.
-3. Generate builtin host manifests.
-4. Add supported test fixtures and migrate one test family at a time.
-5. Relocate test-only static guards.
+2. Define one retained evaluation domain model, identity, evidence-subject
+   contract, campaign store, reporting boundary, and ownership of isolation and
+   cost evidence.
+3. Calibrate each stage and gate to the failure risk it controls.
+4. Re-scope affected implementation issues if these decisions invalidate their
+   assumed end state.
 
-### Phase 2: filesystem and state foundations
+### Phase 2: direct simplification wins
+
+1. Remove the unused `addLabel` import and suppression reference.
+2. Generate builtin host manifests.
+3. Add supported test fixtures and migrate one test family at a time.
+4. Relocate test-only static guards and prove candidate API deletions against
+   configured entry points and external-consumer risk.
+
+### Phase 3: filesystem and state foundations
 
 1. Implement and test atomic-file publication.
 2. Migrate low-risk stores first.
 3. Migrate durability- and authority-sensitive stores separately.
 4. Identify state models that can be deleted rather than migrated.
 
-### Phase 3: architectural boundaries
+### Phase 4: architectural boundaries
 
 1. Isolate release and self-host qualification.
 2. Establish the issue-delivery service.
@@ -253,21 +281,21 @@ For each stage or gate, document:
    release code.
 4. Preserve existing entry points while callers migrate.
 
-### Phase 4: public-surface reduction
+### Phase 5: public-surface reduction
 
 1. Reclassify commands by audience.
 2. Remove or hide internal-only command forms.
 3. Consolidate the surviving command metadata.
 4. Extract command executors from `pipeline.ts` family by family.
 
-### Phase 5: large-module partitions
+### Phase 6: large-module partitions
 
 1. Separate pure factory evaluation and rendering from persistence.
 2. Separate candidate process supervision from release coordination.
 3. Extract installer planning and validation before changing locks or
    publication.
 
-### Phase 6: evidence-based deletion
+### Phase 7: evidence-based deletion
 
 1. Remove non-evaluation telemetry with no demonstrated consumer; consolidate
    retained evaluation telemetry behind its owned framework boundary.
