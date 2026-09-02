@@ -336,8 +336,8 @@ export interface FixHarnessRetryOpts {
   basePrompt: string;
   /** RecoverySupervisor observation sink. Defaults to the production sink. */
   reportObservation?: ReportOperationObservation;
-  /** Required on retry-capable paths. Defaults to proven-absent so crash
-   *  re-entry may proceed when the caller has no richer observer. */
+  /** Required on retry-capable paths. Missing observer is fail-closed
+   *  `uncertain` (cooling), never a guessed `known_absent` replay. */
   observeCertainty?: () => Promise<SideEffectCertainty> | SideEffectCertainty;
   identity?: {
     domain: string;
@@ -385,7 +385,7 @@ export async function invokeFixHarnessWithRetry(
     onBeforeAttempt: opts.onBeforeAttempt,
     onRetryScheduled: opts.onRetryScheduled,
     nowMs: opts.nowMs,
-    observeCertainty: opts.observeCertainty ?? (() => "known_absent"),
+    observeCertainty: opts.observeCertainty ?? (() => "uncertain"),
     reportObservation: opts.reportObservation ?? defaultRecoverySupervisorReport,
     identity: opts.identity,
   });
@@ -875,6 +875,9 @@ export async function advanceFix(
         fixTimeoutSec: cfg.fix_timeout,
         basePrompt: prompt,
         reportObservation: opts.reportObservation,
+        // Fail-closed: do not fabricate proven-absent. Replay requires an
+        // authoritative observer from the caller of this wrapper.
+        observeCertainty: () => "uncertain",
         identity: {
           domain: cfg.domain ?? "unknown",
           logical_operation_id: opts.logicalOperationId,
