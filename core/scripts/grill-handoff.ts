@@ -356,7 +356,7 @@ export function grillAuthorityCreateInputs(input: GrillHandoffCreateInput): Crea
       ? typedRequestHandoffClass(request, node.class)
       : grillHandoffClass(node.class);
     const nonAuthority = handoffClass === "missing_context";
-    out.push({
+    const created: CreateHandoffInput = {
       domain: input.domain,
       repo: input.repo,
       issue_number: input.issueNumber,
@@ -383,10 +383,27 @@ export function grillAuthorityCreateInputs(input: GrillHandoffCreateInput): Crea
       resume_preconditions: ["grill-authority-answer"],
       resolution_evidence: {
         unresolved: false,
-        eligible_actors: [],
+        eligible_actors: request === "AuthorityRequest" ? ["authenticated-github-actor"] : [],
         resolution_summary: "grill-authority: any authenticated GitHub actor via pipeline handoff answer",
       },
-    });
+    };
+    if (request) {
+      created.typed_request = request;
+      if (request === "DecisionRequest") {
+        created.decision_package = {
+          recommendation: node.recommendation,
+          rationale: node.rationale ?? "",
+          alternatives: node.alternatives ?? [],
+          risk: node.risk ?? "",
+          evidence: node.evidence ?? [],
+        };
+      } else if (request === "CapabilityRequest") {
+        if (node.capability_request) created.capability_request = node.capability_request;
+      } else if (request === "AuthorityRequest") {
+        if (node.authority_request) created.authority_request = node.authority_request;
+      }
+    }
+    out.push(created);
   }
   return out;
 }

@@ -29,11 +29,13 @@ import {
 import {
   acquireLock,
   appendActionEvidence,
+  appendDecision,
   appendEvent,
   classifyStaleness,
   getStatus,
   readActionEvidence,
   readContract,
+  readDecisions,
   readEvents,
   readLedger,
   readLock,
@@ -62,7 +64,13 @@ import {
   type ReconcileObserveDeps,
 } from "./reconcile.ts";
 import { blockItem, completeRecoveryAttempt, fingerprintEvidence, startRecoveryAttempt, upgradeContractForRecovery, upgradeLedgerForRecovery } from "./recovery.ts";
-import { waitItem } from "./pause.ts";
+import { waitItem, type WaitRequestInput } from "./pause.ts";
+import {
+  classifyHumanAsk,
+  shouldReleaseAutoSettleableHold,
+  validateDecisionPackage,
+  type TypedRequestResolution,
+} from "../typed-request-resolution.ts";
 import { computeExternalDependencyStatuses, detectDependencyDeadlock, propagateSkips } from "./dependencies.ts";
 import { detectChangedFileOverlap, selectSchedulableSet } from "./schedule.ts";
 import {
@@ -245,6 +253,11 @@ export interface SupervisorDeps {
    */
   repoDir?: string;
   /**
+   * Trusted fact text for the shared typed-request classifier (#1326).
+   * Empty/omitted facts fail closed (no auto-settle).
+   */
+  typedRequestFacts?(itemId: string): string | Promise<string>;
+  /**
    * Production wrapper / process-identity lookup for an issue (#770). Wired by
    * `defaultRunLoopEngine` to `findWrapperPidForIssue`; unit tests inject a
    * fake or omit (wrapper evidence branch skipped).
@@ -411,16 +424,18 @@ async function excludeInProgressItem(
  * `pending` without a product needs-human hold. The item stays schedulable once
  * capacity frees (park-release of siblings or active work completing).
  */
-async function revertCapacityWaitItem(
+async function revertInProgressToPending(
   store: LoopStoreDeps,
   input: { runId: string; token: string; itemId: string; engine: LoopEngineName },
+  note: string,
+  eventName: "loop_item_capacity_wait" | "loop_item_typed_request_auto_settled",
 ): Promise<LoopLedger> {
   const ledger = await readLedger(store, input.runId);
   const item = ledger.items[input.itemId];
   if (!item || item.state !== "in_progress") {
     throw new LoopError(
       "validation",
-      `item "${input.itemId}" cannot capacity-revert from state "${item?.state}" — only an in_progress item may revert this way`,
+      `item "${input.itemId}" cannot revert from state "${item?.state}" — only an in_progress item may revert this way`,
     );
   }
   const time = store.now().toISOString();
@@ -434,16 +449,28 @@ async function revertCapacityWaitItem(
         from: "in_progress",
         to: "pending",
         engine: input.engine,
-        note: "worktree capacity admission wait — reverted to pending (no product needs-human hold)",
+        note,
       },
     ],
   };
   const newLedger: LoopLedger = { ...ledger, items: { ...ledger.items, [input.itemId]: updated } };
   await writeLedger(store, newLedger, input.token);
-  await appendEvent(store, input.runId, input.token, "loop_item_capacity_wait", {
+  await appendEvent(store, input.runId, input.token, eventName, {
     item_id: input.itemId,
   });
   return newLedger;
+}
+
+async function revertCapacityWaitItem(
+  store: LoopStoreDeps,
+  input: { runId: string; token: string; itemId: string; engine: LoopEngineName },
+): Promise<LoopLedger> {
+  return revertInProgressToPending(
+    store,
+    input,
+    "worktree capacity admission wait — reverted to pending (no product needs-human hold)",
+    "loop_item_capacity_wait",
+  );
 }
 
 /**
@@ -1512,6 +1539,163 @@ async function invalidateStaleAuthorityHolds(
   return ledger;
 }
 
+async function classifyDispatchAsk(
+  deps: SupervisorDeps,
+  contract: LoopContract,
+  itemId: string,
+  diagnostic: StageDiagnostic,
+  candidateSha: string | null,
+): Promise<TypedRequestResolution> {
+  const factText = deps.typedRequestFacts ? await deps.typedRequestFacts(itemId) : "";
+  const evidence = diagnostic.detail.authority_evidence?.[0];
+  const category = evidence?.category ?? (diagnostic.reason_code === "human-context-required" ? null : "product-decision");
+  return classifyHumanAsk({
+    reasonCode: diagnostic.reason_code,
+    category,
+    recommendation: diagnostic.detail.reason,
+    nodeClass: category === "authority" ? "merge-release" : "interface-contract",
+    factText,
+    candidateSha,
+    tipPresent: Boolean(candidateSha),
+    now: deps.store.now(),
+    source: "diagnostic",
+    authority: {
+      repository: contract.repo.name,
+      ...(candidateSha ? { candidate_epoch: candidateSha } : {}),
+    },
+  });
+}
+
+function waitRequestFromClassifier(
+  classified: Extract<
+    TypedRequestResolution,
+    { kind: "DecisionRequest" | "CapabilityRequest" | "AuthorityRequest" }
+  >,
+  prompt: string,
+  extra: Pick<WaitRequestInput, "source" | "authority_evidence_key" | "authority_candidate_head"> = {},
+): WaitRequestInput {
+  const request: WaitRequestInput = {
+    kind: classified.pause_kind,
+    prompt,
+    ...extra,
+  };
+  if (classified.kind === "DecisionRequest") {
+    request.decision_package = classified.package;
+  } else if (classified.kind === "CapabilityRequest") {
+    request.capability_request = classified.record;
+  } else {
+    request.authority_request = classified.record;
+  }
+  return request;
+}
+
+function hasAutoSettleForCurrentAttempt(
+  decisions: Awaited<ReturnType<typeof readDecisions>>,
+  item: LoopItemLedgerEntry,
+): boolean {
+  let startedAt: string | null = null;
+  for (let i = item.history.length - 1; i >= 0; i--) {
+    if (item.history[i]?.to === "in_progress") {
+      startedAt = item.history[i]!.time;
+      break;
+    }
+  }
+  return decisions.some((decision) => {
+    if (decision.kind !== "loop_item_typed_request_auto_settled") return false;
+    const data = decision.data as { item_id?: unknown } | null;
+    if (!data || data.item_id !== item.id) return false;
+    return startedAt === null || decision.time >= startedAt;
+  });
+}
+
+async function persistAutoSettleAndRevert(
+  store: LoopStoreDeps,
+  input: { runId: string; token: string; itemId: string; engine: LoopEngineName },
+  classified: Extract<TypedRequestResolution, { kind: "auto-settle" }>,
+): Promise<LoopLedger> {
+  const pkg = validateDecisionPackage(classified.package);
+  if (!pkg.ok) {
+    throw new LoopError("validation", `auto-settle resolution is incomplete: ${pkg.reason}`);
+  }
+  const ledger = await readLedger(store, input.runId);
+  const item = ledger.items[input.itemId];
+  if (!item) {
+    throw new LoopError("validation", `item "${input.itemId}" not found in run "${input.runId}"`);
+  }
+  const decisions = await readDecisions(store, input.runId);
+  if (!hasAutoSettleForCurrentAttempt(decisions, item)) {
+    await appendDecision(store, input.runId, input.token, "loop_item_typed_request_auto_settled", {
+      item_id: input.itemId,
+      eligibility_reason: classified.eligibility_reason,
+      package: pkg.package,
+    });
+  }
+  if (item.state === "pending") {
+    return ledger;
+  }
+  return revertInProgressToPending(
+    store,
+    input,
+    "typed-request auto-settled under existing authority",
+    "loop_item_typed_request_auto_settled",
+  );
+}
+
+async function reclassifyInFlightHumanHolds(
+  deps: SupervisorDeps,
+  runId: string,
+  token: string,
+  engine: LoopEngineName,
+  ledger: LoopLedger,
+): Promise<LoopLedger> {
+  const observed = ledger.last_reconciliation?.observed ?? {};
+  const candidates = Object.values(ledger.items).filter(
+    (item) => (item.state === "waiting" || item.state === "paused") && item.hold_request,
+  );
+  for (const candidate of candidates) {
+    const current = ledger.items[candidate.id];
+    if (!current?.hold_request) continue;
+    const factText = deps.typedRequestFacts ? await deps.typedRequestFacts(current.id) : "";
+    const kind = current.hold_request.kind;
+    const category = kind === "authority-grant" ? "authority" : "product-decision";
+    if (
+      !shouldReleaseAutoSettleableHold({
+        nodeClass: category === "authority" ? "merge-release" : "interface-contract",
+        recommendation: current.hold_request.prompt,
+        factText,
+        category,
+        source: "diagnostic",
+        candidateSha: observed[current.id]?.head_sha ?? current.hold_request.authority_candidate_head ?? null,
+      })
+    ) {
+      continue;
+    }
+    const time = deps.store.now().toISOString();
+    const updated: LoopItemLedgerEntry = {
+      ...current,
+      state: "pending",
+      hold_request: undefined,
+      history: [
+        ...current.history,
+        {
+          time,
+          from: current.state,
+          to: "pending",
+          engine,
+          note: "in-flight specification-decision hold auto-settled without a human answer",
+        },
+      ],
+    };
+    ledger = { ...ledger, items: { ...ledger.items, [current.id]: updated } };
+    await writeLedger(deps.store, ledger, token);
+    await appendEvent(deps.store, runId, token, "loop_item_hold_invalidated", {
+      item_id: current.id,
+      reason: "typed_request_auto_settled",
+    });
+  }
+  return ledger;
+}
+
 // ---------------------------------------------------------------------------
 // One drive cycle.
 // ---------------------------------------------------------------------------
@@ -1685,6 +1869,7 @@ export async function runSupervisorCycle(
   // carved out of `contract`/`schedulableContract`, and never itself a terminal condition while
   // another item can still make progress.
   ledger = await invalidateStaleAuthorityHolds(deps, runId, token, engine, ledger);
+  ledger = await reclassifyInFlightHumanHolds(deps, runId, token, engine, ledger);
   ledger = await reopenClearedBlockedHolds(deps, runId, token, engine, ledger);
   const heldItemIds = heldItemIdsFromLedger(ledger);
 
@@ -2354,52 +2539,195 @@ export async function runSupervisorCycle(
       }).catch(() => {});
     } else if (outcome === "blocked_recoverable") {
       const projection = projectStageDiagnostic(response?.diagnostic);
-      const diagnostic =
-        projection.disposition === "recover"
-          ? response!.diagnostic!
-          : engineDefectDiagnostic(
-              `pipeline/loop-execution@1 reported blocked_recoverable for item ${itemId} without a valid recoverable diagnostic: ${projection.protocolError ?? `disposition=${projection.disposition}`}`,
-            );
-      const blockerClass =
-        projection.disposition === "recover"
-          ? projection.blockerClass
-          : "workflow-engine-defect";
-      const recovery = await blockAndExecuteRecovery(deps, contract, {
-        runId,
-        token,
-        itemId,
-        engine,
-        blockerClass,
-        diagnostic,
-        evidence: transportEvidence,
-        allowAlreadyStopped: true,
-      });
-      ledger = recovery.ledger;
-      recoveryProgress ||= recovery.attempted;
+      const reasonCode = response?.diagnostic?.reason_code;
+      if (
+        response?.diagnostic &&
+        (reasonCode === "human-context-required" || reasonCode === "human-decision-required")
+      ) {
+        let observedHead: string | null = null;
+        try {
+          observedHead = (await observeExternalIdentity(deps.observe, itemId)).head_sha;
+        } catch {
+          observedHead = null;
+        }
+        const classified = await classifyDispatchAsk(
+          deps,
+          contract,
+          itemId,
+          response.diagnostic,
+          observedHead,
+        );
+        if (classified.kind === "auto-settle") {
+          ledger = await persistAutoSettleAndRevert(
+            deps.store,
+            { runId, token, itemId, engine },
+            classified,
+          );
+          evidenceOutcome = "auto_settled";
+        } else if (classified.kind === "CapabilityRequest") {
+          const preHoldLedger = await readLedger(deps.store, runId);
+          if (preHoldLedger.stop) {
+            ledger = preHoldLedger;
+          } else {
+            ledger = await waitItem(deps.store, {
+              runId,
+              token,
+              itemId,
+              engine,
+              request: waitRequestFromClassifier(
+                classified,
+                response.diagnostic.detail.reason,
+                observedHead
+                  ? {
+                      authority_evidence_key: response.diagnostic.evidence_key,
+                      authority_candidate_head: observedHead,
+                    }
+                  : {},
+              ),
+              note: "CapabilityRequest after shared classifier",
+            });
+          }
+        } else if (classified.kind === "external-condition-wait") {
+          const recovery = await blockAndExecuteRecovery(deps, contract, {
+            runId,
+            token,
+            itemId,
+            engine,
+            blockerClass: "upstream-dependency",
+            diagnostic: response.diagnostic,
+            evidence: transportEvidence,
+            allowAlreadyStopped: true,
+          });
+          ledger = recovery.ledger;
+          recoveryProgress ||= recovery.attempted;
+        } else if (classified.kind === "DecisionRequest" || classified.kind === "AuthorityRequest") {
+          // Durable missing-authority / specification-decision require the same
+          // current canonical diagnostic as blocked_needs_human. Stale or
+          // malformed recoverable diagnostics stay engine-owned.
+          const currentAttested =
+            typeof observedHead === "string" &&
+            observedHead.trim().length > 0 &&
+            isCurrentHumanAuthorityDiagnostic(response.diagnostic, observedHead);
+          if (currentAttested) {
+            const recovery = await blockAndExecuteRecovery(deps, contract, {
+              runId,
+              token,
+              itemId,
+              engine,
+              blockerClass: classified.durable_class,
+              diagnostic: response.diagnostic,
+              evidence: transportEvidence,
+              allowAlreadyStopped: true,
+            });
+            ledger = recovery.ledger;
+            recoveryProgress ||= recovery.attempted;
+          } else {
+            const diagnostic =
+              projection.disposition === "recover"
+                ? response.diagnostic
+                : engineDefectDiagnostic(
+                    `pipeline/loop-execution@1 reported blocked_recoverable for item ${itemId} without current attested human authority: ${projection.protocolError ?? `disposition=${projection.disposition}`}`,
+                  );
+            const recovery = await blockAndExecuteRecovery(deps, contract, {
+              runId,
+              token,
+              itemId,
+              engine,
+              blockerClass:
+                projection.disposition === "recover" ? projection.blockerClass : "workflow-engine-defect",
+              diagnostic,
+              evidence: transportEvidence,
+              allowAlreadyStopped: true,
+            });
+            ledger = recovery.ledger;
+            recoveryProgress ||= recovery.attempted;
+          }
+        } else {
+          const diagnostic =
+            projection.disposition === "recover"
+              ? response.diagnostic
+              : engineDefectDiagnostic(
+                  `pipeline/loop-execution@1 reported blocked_recoverable for item ${itemId} without a valid recoverable diagnostic: ${projection.protocolError ?? `disposition=${projection.disposition}`}`,
+                );
+          const recovery = await blockAndExecuteRecovery(deps, contract, {
+            runId,
+            token,
+            itemId,
+            engine,
+            blockerClass:
+              projection.disposition === "recover" ? projection.blockerClass : "workflow-engine-defect",
+            diagnostic,
+            evidence: transportEvidence,
+            allowAlreadyStopped: true,
+          });
+          ledger = recovery.ledger;
+          recoveryProgress ||= recovery.attempted;
+        }
+      } else {
+        const diagnostic =
+          projection.disposition === "recover"
+            ? response!.diagnostic!
+            : engineDefectDiagnostic(
+                `pipeline/loop-execution@1 reported blocked_recoverable for item ${itemId} without a valid recoverable diagnostic: ${projection.protocolError ?? `disposition=${projection.disposition}`}`,
+              );
+        const blockerClass =
+          projection.disposition === "recover"
+            ? projection.blockerClass
+            : "workflow-engine-defect";
+        const recovery = await blockAndExecuteRecovery(deps, contract, {
+          runId,
+          token,
+          itemId,
+          engine,
+          blockerClass,
+          diagnostic,
+          evidence: transportEvidence,
+          allowAlreadyStopped: true,
+        });
+        ledger = recovery.ledger;
+        recoveryProgress ||= recovery.attempted;
+      }
     } else if (outcome === "blocked_needs_human") {
-      // Only a validated, closed diagnostic may grant human authority. The
-      // outcome string and live labels are transport/workflow evidence, not
-      // authority signals; malformed or mismatched diagnostics enter bounded
-      // engine-defect repair rather than hard-parking the item.
+      // Shared classifier decides DecisionRequest vs auto-settle vs
+      // CapabilityRequest vs AuthorityRequest. Labels never grant authority.
       const projection = projectStageDiagnostic(response?.diagnostic);
       let authorityIdentity = null;
-      if (projection.disposition === "human_authority" && response?.diagnostic) {
+      if (response?.diagnostic) {
         try {
           const observed = await observeExternalIdentity(deps.observe, itemId);
-          if (isCurrentHumanAuthorityDiagnostic(response.diagnostic, observed.head_sha)) {
+          if (
+            projection.disposition !== "human_authority" ||
+            isCurrentHumanAuthorityDiagnostic(response.diagnostic, observed.head_sha)
+          ) {
             authorityIdentity = observed;
           }
         } catch {
           // Missing live candidate proof cannot grant authority.
         }
       }
-      if (authorityIdentity && response?.diagnostic) {
-        // A sibling processed earlier in this same concurrent pass may already
-        // have recorded a terminal stop; entering a hold would throw
-        // LoopError("stop") out of the drive (pause.ts enterHold) and strand
-        // this in_progress item. Re-check the durable stop and skip the hold
-        // gracefully — no ledger write, no waitItem — preserving the
-        // first-cause stop record (mirrors executeBlockedRecovery's guard).
+      const classified = response?.diagnostic
+        ? await classifyDispatchAsk(
+            deps,
+            contract,
+            itemId,
+            response.diagnostic,
+            authorityIdentity?.head_sha ?? null,
+          )
+        : { kind: "engine-owned" as const, reason: "missing diagnostic" };
+      if (classified.kind === "auto-settle") {
+        ledger = await persistAutoSettleAndRevert(
+          deps.store,
+          { runId, token, itemId, engine },
+          classified,
+        );
+        evidenceOutcome = "auto_settled";
+      } else if (
+        (classified.kind === "DecisionRequest" || classified.kind === "AuthorityRequest") &&
+        projection.disposition === "human_authority" &&
+        authorityIdentity &&
+        response?.diagnostic &&
+        isCurrentHumanAuthorityDiagnostic(response.diagnostic, authorityIdentity.head_sha)
+      ) {
         const preHoldLedger = await readLedger(deps.store, runId);
         if (preHoldLedger.stop) {
           ledger = preHoldLedger;
@@ -2418,16 +2746,51 @@ export async function runSupervisorCycle(
             token,
             itemId,
             engine,
-            request: {
-              kind: "answer",
-              prompt: response!.diagnostic!.detail.reason,
+            request: waitRequestFromClassifier(classified, response.diagnostic.detail.reason, {
               authority_evidence_key: response.diagnostic.evidence_key,
               authority_candidate_head: authorityIdentity.head_sha,
               ...(authorityIdentity.blocked_label_present ? { source: "pipeline_blocked_label" as const } : {}),
-            },
-            note: "explicit human-authority stage diagnostic",
+            }),
+            note: "explicit human-authority stage diagnostic after shared classifier",
           });
         }
+      } else if (classified.kind === "CapabilityRequest") {
+        const preHoldLedger = await readLedger(deps.store, runId);
+        if (preHoldLedger.stop) {
+          ledger = preHoldLedger;
+        } else {
+          ledger = await waitItem(deps.store, {
+            runId,
+            token,
+            itemId,
+            engine,
+            request: waitRequestFromClassifier(
+              classified,
+              response?.diagnostic?.detail.reason ?? classified.record.missing,
+              authorityIdentity?.head_sha && response?.diagnostic
+                ? {
+                    authority_evidence_key: response.diagnostic.evidence_key,
+                    authority_candidate_head: authorityIdentity.head_sha,
+                  }
+                : {},
+            ),
+            note: "CapabilityRequest after shared classifier",
+          });
+        }
+      } else if (classified.kind === "external-condition-wait") {
+        const diagnostic = response?.diagnostic ?? engineDefectDiagnostic(classified.record.resume_condition);
+        const recovery = await blockAndExecuteRecovery(deps, contract, {
+          runId,
+          token,
+          itemId,
+          engine,
+          blockerClass: "upstream-dependency",
+          diagnostic,
+          evidence: transportEvidence,
+          allowAlreadyStopped: true,
+        });
+        ledger = recovery.ledger;
+        recoveryProgress ||= recovery.attempted;
       } else {
         // No current attested authority means no human hold. Labels and prior
         // comment markers cannot supply the missing finding/candidate proof;
@@ -2649,6 +3012,7 @@ export async function runSupervisorCycle(
       };
     }
     ledger = await invalidateStaleAuthorityHolds(deps, runId, token, engine, ledger);
+  ledger = await reclassifyInFlightHumanHolds(deps, runId, token, engine, ledger);
     ledger = await reopenClearedBlockedHolds(deps, runId, token, engine, ledger);
     preconditionExclusions = classifyPreconditionExclusions(contract, ledger);
     preconditionExcludedIds = new Set(preconditionExclusions.map((e) => e.item_id));

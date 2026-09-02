@@ -234,6 +234,18 @@ test("compileRecoveryPolicy: missing-authority / specification-decision must rou
   assert.throws(() => compileRecoveryPolicy(bad), /human-authority/);
 });
 
+test("specification-decision and missing-authority are distinct classes with no shared meaning", () => {
+  assert.notEqual("specification-decision", "missing-authority");
+  assert.equal(DEFAULT_RECOVERY_POLICY["specification-decision"].terminal_outcome, "human_authority");
+  assert.equal(DEFAULT_RECOVERY_POLICY["missing-authority"].terminal_outcome, "human_authority");
+  assert.deepEqual(DEFAULT_RECOVERY_POLICY["specification-decision"].recipes, []);
+  assert.deepEqual(DEFAULT_RECOVERY_POLICY["missing-authority"].recipes, []);
+  assert.notDeepEqual(
+    { class: "specification-decision", meaning: "irreducible DecisionRequest" },
+    { class: "missing-authority", meaning: "protected AuthorityRequest" },
+  );
+});
+
 test("compileRecoveryPolicy: unknown class names are refused", () => {
   assert.throws(() => compileRecoveryPolicy({ ...DEFAULT_RECOVERY_POLICY, "not-a-real-class": {} }), /unknown blocker class/);
 });

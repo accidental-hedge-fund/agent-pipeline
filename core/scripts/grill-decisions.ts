@@ -44,6 +44,32 @@ export interface DecisionProvenance {
   eligibility_reason: string | null;
 }
 
+/** Additive recommend-and-commit package. Not part of the definition digest. */
+export interface DecisionResolutionPackageFields {
+  rationale?: string;
+  alternatives?: string[];
+  risk?: string;
+  evidence?: string[];
+}
+
+export interface CapabilityRequestFields {
+  missing: string;
+  provider: string;
+  live_probe: string;
+  resume_condition: string;
+}
+
+export interface AuthorityRequestFields {
+  eligible_actor: string;
+  repository: string;
+  operation: string;
+  scope: string;
+  candidate_epoch: string | null;
+  evidence: string[];
+  expiry: string;
+  grant: null;
+}
+
 export interface DecisionNode {
   id: string;
   question: string;
@@ -59,6 +85,12 @@ export interface DecisionNode {
   term_id?: string;
   challenge_text?: string;
   typed_request?: TypedRequestKind;
+  rationale?: string;
+  alternatives?: string[];
+  risk?: string;
+  evidence?: string[];
+  capability_request?: CapabilityRequestFields;
+  authority_request?: AuthorityRequestFields;
 }
 
 export interface TypedUnresolvedFact {
@@ -186,6 +218,71 @@ export function makeNode(input: {
     input_digests: nodeInputDigests(input),
     ...(input.term_id ? { term_id: input.term_id } : {}),
   };
+}
+
+export function hasResolutionPackage(node: DecisionNode): boolean {
+  return (
+    typeof node.rationale === "string" &&
+    node.rationale.trim().length > 0 &&
+    Array.isArray(node.alternatives) &&
+    typeof node.risk === "string" &&
+    node.risk.trim().length > 0 &&
+    Array.isArray(node.evidence) &&
+    node.evidence.length > 0
+  );
+}
+
+/** Fail closed when a newly written resolution omits the recommend-and-commit package. */
+export function assertNewResolutionPackage(
+  node: DecisionNode,
+): { ok: true } | ParseFailure {
+  if (typeof node.rationale !== "string" || !node.rationale.trim()) {
+    return { ok: false, reason: `node ${node.id} missing rationale`, code: "invalid_shape" };
+  }
+  if (!Array.isArray(node.alternatives)) {
+    return { ok: false, reason: `node ${node.id} missing alternatives`, code: "invalid_shape" };
+  }
+  if (typeof node.risk !== "string" || !node.risk.trim()) {
+    return { ok: false, reason: `node ${node.id} missing risk`, code: "invalid_shape" };
+  }
+  if (!Array.isArray(node.evidence) || node.evidence.length === 0) {
+    return { ok: false, reason: `node ${node.id} missing evidence`, code: "invalid_shape" };
+  }
+  if (!node.recommendation.trim()) {
+    return { ok: false, reason: `node ${node.id} missing recommendation`, code: "invalid_shape" };
+  }
+  return { ok: true };
+}
+
+export function writeDecisionResolution(
+  node: DecisionNode,
+  pkg: {
+    recommendation?: string;
+    rationale: string;
+    alternatives: string[];
+    risk: string;
+    evidence: string[];
+  },
+): { ok: true; node: DecisionNode } | ParseFailure {
+  const recommendation = node.recommendation.trim() || (pkg.recommendation ?? "").trim();
+  const next: DecisionNode = {
+    ...node,
+    recommendation,
+    rationale: pkg.rationale,
+    alternatives: pkg.alternatives,
+    risk: pkg.risk,
+    evidence: pkg.evidence,
+    input_digests: nodeInputDigests({
+      id: node.id,
+      question: node.question,
+      recommendation,
+      class: node.class,
+      term_id: node.term_id,
+    }),
+  };
+  const check = assertNewResolutionPackage(next);
+  if (!check.ok) return check;
+  return { ok: true, node: next };
 }
 
 /** Canonical unresolved operator-required nodes for a thin issue. */
@@ -333,9 +430,95 @@ export function renderDecisionsSection(artifact: DecisionsArtifact): string {
     if (node.term_id) {
       lines.push(`- **Term:** ${escapeMd(node.term_id)}`);
     }
+    if (node.rationale) {
+      lines.push(`- **Rationale:** ${escapeMd(node.rationale)}`);
+    }
+    if (node.alternatives && node.alternatives.length > 0) {
+      lines.push(`- **Alternatives:** ${node.alternatives.map((a) => escapeMd(a)).join("; ")}`);
+    }
+    if (node.risk) {
+      lines.push(`- **Risk:** ${escapeMd(node.risk)}`);
+    }
+    if (node.evidence && node.evidence.length > 0) {
+      lines.push(`- **Evidence:** ${node.evidence.map((e) => escapeMd(e)).join("; ")}`);
+    }
     lines.push("");
   }
   return lines.join("\n");
+}
+
+function parseCapabilityRequestFields(
+  raw: unknown,
+  nodeId: string,
+): { ok: true; fields: CapabilityRequestFields } | ParseFailure {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    return { ok: false, reason: `node ${nodeId} capability_request is invalid`, code: "invalid_shape" };
+  }
+  const o = raw as Record<string, unknown>;
+  if (
+    typeof o.missing !== "string" ||
+    !o.missing.trim() ||
+    typeof o.provider !== "string" ||
+    !o.provider.trim() ||
+    typeof o.live_probe !== "string" ||
+    !o.live_probe.trim() ||
+    typeof o.resume_condition !== "string" ||
+    !o.resume_condition.trim()
+  ) {
+    return { ok: false, reason: `node ${nodeId} capability_request is incomplete`, code: "invalid_shape" };
+  }
+  return {
+    ok: true,
+    fields: {
+      missing: o.missing,
+      provider: o.provider,
+      live_probe: o.live_probe,
+      resume_condition: o.resume_condition,
+    },
+  };
+}
+
+function parseAuthorityRequestFields(
+  raw: unknown,
+  nodeId: string,
+): { ok: true; fields: AuthorityRequestFields } | ParseFailure {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    return { ok: false, reason: `node ${nodeId} authority_request is invalid`, code: "invalid_shape" };
+  }
+  const o = raw as Record<string, unknown>;
+  if (o.grant !== null && o.grant !== undefined) {
+    return { ok: false, reason: `node ${nodeId} authority_request must not record a default grant`, code: "invalid_shape" };
+  }
+  if (
+    typeof o.eligible_actor !== "string" ||
+    !o.eligible_actor.trim() ||
+    typeof o.repository !== "string" ||
+    !o.repository.trim() ||
+    typeof o.operation !== "string" ||
+    !o.operation.trim() ||
+    typeof o.scope !== "string" ||
+    !o.scope.trim() ||
+    typeof o.expiry !== "string" ||
+    !o.expiry.trim() ||
+    !Array.isArray(o.evidence) ||
+    o.evidence.length === 0 ||
+    o.evidence.some((e) => typeof e !== "string")
+  ) {
+    return { ok: false, reason: `node ${nodeId} authority_request is incomplete`, code: "invalid_shape" };
+  }
+  return {
+    ok: true,
+    fields: {
+      eligible_actor: o.eligible_actor,
+      repository: o.repository,
+      operation: o.operation,
+      scope: o.scope,
+      candidate_epoch: typeof o.candidate_epoch === "string" && o.candidate_epoch.trim() ? o.candidate_epoch : null,
+      evidence: o.evidence as string[],
+      expiry: o.expiry,
+      grant: null,
+    },
+  };
 }
 
 function formatProvenance(p: DecisionProvenance): string {
@@ -574,6 +757,28 @@ function parseNode(
   }
   if (o.typed_request === "DecisionRequest" || o.typed_request === "CapabilityRequest" || o.typed_request === "AuthorityRequest") {
     node.typed_request = o.typed_request;
+  }
+  if (typeof o.rationale === "string") node.rationale = o.rationale;
+  if (Array.isArray(o.alternatives) && o.alternatives.every((a) => typeof a === "string")) {
+    node.alternatives = o.alternatives as string[];
+  } else if (o.alternatives !== undefined) {
+    return { ok: false, reason: `node ${o.id} alternatives must be a string array`, code: "invalid_shape" };
+  }
+  if (typeof o.risk === "string") node.risk = o.risk;
+  if (Array.isArray(o.evidence) && o.evidence.every((e) => typeof e === "string")) {
+    node.evidence = o.evidence as string[];
+  } else if (o.evidence !== undefined) {
+    return { ok: false, reason: `node ${o.id} evidence must be a string array`, code: "invalid_shape" };
+  }
+  if (o.capability_request !== undefined) {
+    const cap = parseCapabilityRequestFields(o.capability_request, o.id);
+    if (!cap.ok) return cap;
+    node.capability_request = cap.fields;
+  }
+  if (o.authority_request !== undefined) {
+    const auth = parseAuthorityRequestFields(o.authority_request, o.id);
+    if (!auth.ok) return auth;
+    node.authority_request = auth.fields;
   }
   if (node.provenance.settled_by === "reviewer-accept") {
     if (!isNonAuthorityClass(node.class)) {

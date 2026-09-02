@@ -67,6 +67,34 @@ export interface LoopHumanInputRequest {
   permitted_responses?: string[];
   requested_by_engine: LoopEngineName;
   requested_at: string;
+  /** Public typed-request union projection of {@link kind}. */
+  typed_request?: "DecisionRequest" | "CapabilityRequest" | "AuthorityRequest";
+  /** Classifier DecisionRequest package. Required on a new `decision` hold. */
+  decision_package?: {
+    recommendation: string;
+    rationale: string;
+    alternatives: string[];
+    risk: string;
+    evidence: string[];
+  };
+  /** Classifier CapabilityRequest record. Required on a new `answer` hold. */
+  capability_request?: {
+    missing: string;
+    provider: string;
+    live_probe: string;
+    resume_condition: string;
+  };
+  /** Classifier AuthorityRequest record. Required on a new `authority-grant` hold. */
+  authority_request?: {
+    eligible_actor: string;
+    repository: string;
+    operation: string;
+    scope: string;
+    candidate_epoch: string | null;
+    evidence: string[];
+    expiry: string;
+    grant: null;
+  };
   /** Present only for a hold proven by a canonical current authority
    * diagnostic. Reconciliation requires both values to remain candidate-bound. */
   authority_evidence_key?: string;

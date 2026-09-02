@@ -12,6 +12,7 @@ import {
   collectDirectStageLifecycleWrites,
   collectProviderIncidentDispatch,
   collectRetiredControllerImports,
+  collectHumanAskWithoutClassifier,
   scanProductionRecoveryGuards,
 } from "../scripts/fault-recovery-static-guards.ts";
 import { FAULT_RECOVERY_MATRIX } from "../scripts/fault-recovery-matrix.ts";
@@ -32,6 +33,12 @@ test("each inventoried legacy site maps to a replacement matrix row", () => {
       ),
     );
   }
+});
+
+test("human-ask park without classifier fails the static guard", () => {
+  const synthetic = `await waitItem(store, { request: { kind: "decision" } });\n`;
+  const hits = collectHumanAskWithoutClassifier(synthetic, "fixture.ts");
+  assert.ok(hits.some((h) => /without shared classifier/.test(h.reason)));
 });
 
 test("retired controller import fails the static guard", () => {
