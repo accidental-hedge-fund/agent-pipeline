@@ -125,7 +125,7 @@ as an attempt marker on new runs. Legacy reads MAY hydrate into the ledger once 
 
 ### Requirement: Recovery Episode treatment history SHALL reuse the stage-attempt ledger
 
-RecoverySupervisor SHALL record Recovery Episode treatment history through the existing stage-attempt ledger and the existing operation-claim records. Issue-stage adapters SHALL NOT persist a second terminalizing budget book (comment-counted auto-recovery caps, worktree marker files as sole authority, or process-local retry counters that end ownership). Exhausting one treatment SHALL advance the Recovery Episode strategy cursor. It SHALL NOT end lifecycle ownership.
+RecoverySupervisor SHALL record Recovery Episode treatment history through the existing stage-attempt ledger and the existing operation-claim records. Issue-stage adapters SHALL NOT persist a second terminalizing budget book (comment-counted auto-recovery caps, worktree marker files as sole authority, or process-local retry counters that end ownership). Each Recovery Episode record on that shared family SHALL include the operation invariant, candidate epoch, normalized evidence identity, attempts per applicable strategy, monotonic strategy cursor, and `next_eligible_at`. Exhausting one treatment SHALL advance the Recovery Episode strategy cursor. It SHALL NOT end lifecycle ownership.
 
 #### Scenario: Auto-recovery comments are not the authority
 
@@ -138,3 +138,16 @@ RecoverySupervisor SHALL record Recovery Episode treatment history through the e
 - **WHEN** Recovery Episode records and the stage-attempt ledger are inspected
 - **THEN** they SHALL share the recovery-attempt record family (extended fields allowed)
 - **AND** the engine SHALL NOT persist a competing private episode schema as production authority
+
+#### Scenario: Required episode fields are on the shared family
+
+- **WHEN** a Recovery Episode treatment is persisted
+- **THEN** the shared recovery-attempt family SHALL carry invariant, candidate epoch, evidence identity, attempts per strategy, strategy cursor, and `next_eligible_at`
+- **AND** a fixture that stores those fields only in a private sidecar SHALL fail
+
+#### Scenario: Exhausting a stage treatment advances the strategy cursor
+
+- **WHEN** RecoverySupervisor records a claimed or exhausted stage treatment on the shared family
+- **THEN** the persisted strategy cursor SHALL advance to the next applicable configured treatment
+- **AND** a later process that resumes the same Recovery Episode SHALL NOT restart at the first treatment solely because the process restarted
+- **AND** a stored cursor SHALL NOT regress
