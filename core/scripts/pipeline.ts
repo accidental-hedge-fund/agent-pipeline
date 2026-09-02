@@ -23,6 +23,7 @@ import { Command, Option } from "commander";
 import { resolveConfig, resolveReleaseConfig, resolveLoopNativeGoalAttestation, scaffoldDefaultConfig, findGitRoot, generateConfigSchema, validateConfig, syncConfig, repoMapAdd, repoMapRemove, repoMapList, type RepoMapRelation } from "./config.ts";
 import { ensureArtifactIgnoreBlock } from "./artifact-ignore.ts";
 import { spawnDetached } from "./detach.ts";
+import { productionRestoreDeadDetached } from "./liveness-cli.ts";
 import { discoverHosts, formatDiscovery } from "./discovery.ts";
 import {
   addLabel,
@@ -3166,10 +3167,13 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
   };
 
   try {
+    const parentPidRaw = process.env.PIPELINE_LIVENESS_PARENT_PID;
+    const parentPid = parentPidRaw ? Number.parseInt(parentPidRaw, 10) : Number.NaN;
     const result = await driveSupervisor(supervisorDeps, {
       runId,
       engine: input.engine as LoopEngineName,
       resume: !!input.resumeRunId || resumeExisting,
+      ...(Number.isInteger(parentPid) && parentPid > 0 ? { parentPid } : {}),
       onRunReady: input.onRunReady
         ? async (ctx) => {
             // Selector is known only at the engine/CLI layer; bare --resume has none.
@@ -8148,6 +8152,7 @@ export interface RunSubcommandDeps {
   restoreDeadDetached?: (input: {
     issueNumber: number;
     domain: string;
+    repoDir?: string;
   }) => Promise<{
     ok: boolean;
     runId: string;
@@ -8157,7 +8162,12 @@ export interface RunSubcommandDeps {
     liveHolder?: { pid: number; hostname: string };
   } | null>;
 }
-const defaultRunSubcommandDeps: RunSubcommandDeps = { spawnDetached, findGitRoot, cwd: () => process.cwd() };
+const defaultRunSubcommandDeps: RunSubcommandDeps = {
+  spawnDetached,
+  findGitRoot,
+  cwd: () => process.cwd(),
+  restoreDeadDetached: (input) => productionRestoreDeadDetached(input),
+};
 
 export async function handleRunSubcommand(
   numStr: string,
@@ -8232,7 +8242,7 @@ export async function handleRunSubcommand(
     if (opts.jsonEvents) passArgs.push("--json-events");
 
     if (deps.restoreDeadDetached) {
-      const restored = await deps.restoreDeadDetached({ issueNumber: number, domain });
+      const restored = await deps.restoreDeadDetached({ issueNumber: number, domain, repoDir });
       if (restored?.reason === "live_holder") {
         console.error(
           `pipeline run: issue #${number} is already running` +

@@ -66,7 +66,8 @@ import {
   evaluateShipEndIdentity,
   resolveSelectedPlaybookKind,
 } from "../ship-end-identity.ts";
-import { projectContinuousLiveness } from "../liveness-provider.ts";
+import { livenessStatus, projectContinuousLiveness } from "../liveness-provider.ts";
+import { productionProviderDeps } from "../liveness-cli.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -358,6 +359,7 @@ export function realDoctorDeps(): DoctorDeps {
     claimStaleLockFile,
     restoreClaimedLockFile,
     discardClaimedLockFile,
+    livenessStatus: () => livenessStatus(productionProviderDeps()),
   };
 }
 

@@ -21,6 +21,7 @@ import {
   resolveInstallRoot,
   runPreflight,
   storePreflightResult,
+  realDoctorDeps,
   type DoctorDeps,
   type DoctorJsonEnvelope,
   type ExecResult,
@@ -3240,6 +3241,11 @@ test("check eval-fixture-integrity — passes when all pins resolve as commit", 
     }),
   );
   assert.equal(r.status, "pass", r.detail);
+});
+
+test("realDoctorDeps wires production livenessStatus (hermetic tests still inject the seam)", () => {
+  const deps = realDoctorDeps();
+  assert.equal(typeof deps.livenessStatus, "function");
 });
 
 test("check liveness:continuous — unconfigured keep-alive is skip, not human authority", async () => {

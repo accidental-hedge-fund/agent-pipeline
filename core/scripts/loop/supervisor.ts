@@ -2742,6 +2742,12 @@ export interface SupervisorAttachInput {
   /** True when the caller invoked `--resume` — required to take over a run
    *  whose lock is already held by anyone (even a provably dead holder). */
   resume?: boolean;
+  /**
+   * When set, wait until this pid is not alive before recover/acquire.
+   * Used by liveness restore so the parent can hold the fence until it exits
+   * and the spawned `--resume` child can take over the stale lock.
+   */
+  parentPid?: number;
 }
 
 export interface SupervisorAttachResult {
@@ -2759,6 +2765,12 @@ export interface SupervisorAttachResult {
  *  `supervisor.json` record on success. */
 export async function attachSupervisor(deps: SupervisorDeps, input: SupervisorAttachInput): Promise<SupervisorAttachResult> {
   const { runId, engine } = input;
+  if (input.parentPid && input.parentPid !== deps.store.pid()) {
+    const deadline = Date.now() + 30_000;
+    while (await deps.store.isPidAlive(input.parentPid) && Date.now() < deadline) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 25));
+    }
+  }
   const contract = await readContract(deps.store, runId);
   const ledger = await readLedger(deps.store, runId);
   if (contract.schema !== LOOP_CONTRACT_SCHEMA || ledger.schema !== LOOP_LEDGER_SCHEMA) {
@@ -2840,6 +2852,11 @@ export interface DriveSupervisorInput {
    * the supervisor reads {@link PIPELINE_PACK_LOOP_CANDIDATE_SHA_ENV}.
    */
   candidateSha?: string;
+  /**
+   * Liveness-restore parent pid. When set, attach waits for that process to
+   * exit so this resume can recover the fence the parent claimed.
+   */
+  parentPid?: number;
 }
 
 /** Names which of the three resolved shapes a run ended in (capability
@@ -2897,7 +2914,12 @@ export interface DriveSupervisorResult {
  *  takeover. `supervisor.json` (the process identity record) is left in place
  *  as the last-process record — releasing the lock does not touch it. */
 export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervisorInput): Promise<DriveSupervisorResult> {
-  const attach = await attachSupervisor(deps, { runId: input.runId, engine: input.engine, resume: input.resume });
+  const attach = await attachSupervisor(deps, {
+    runId: input.runId,
+    engine: input.engine,
+    resume: input.resume,
+    parentPid: input.parentPid,
+  });
   const token = attach.token;
   let record = attach.record;
   const contract = await readContract(deps.store, input.runId);
