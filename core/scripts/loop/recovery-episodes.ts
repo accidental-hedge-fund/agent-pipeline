@@ -9,6 +9,8 @@
 import * as crypto from "node:crypto";
 import {
   LoopError,
+  RECOVERY_RECIPES,
+  isRecoveryRecipe,
   type LoopCoolingRecord,
   type LoopLedger,
   type LoopRecoveryAttempt,
@@ -86,6 +88,76 @@ export function recoveryEpisodeId(key: RecoveryEpisodeKey): string {
     key.evidence_identity,
   ].join("\0");
   return crypto.createHash("sha256").update(canonical).digest("hex");
+}
+
+function isNonEmptyText(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+/** Relational Recovery Episode checks used before a ledger is live authority.
+ *  Primitive field presence is not enough: forged `episode_id`, cursor, or
+ *  `attempts_per_strategy` counts must not be accepted. */
+export function isAuthoritativeEpisodeState(
+  value: Record<string, unknown>,
+  siblings: readonly Record<string, unknown>[] = [],
+): boolean {
+  if (!isNonEmptyText(value.operation)) return false;
+  if (!isNonEmptyText(value.invariant)) return false;
+  if (typeof value.candidate_epoch !== "string") return false;
+  if (typeof value.evidence_identity !== "string") return false;
+  if (!isNonEmptyText(value.episode_id)) return false;
+  const expectedId = recoveryEpisodeId({
+    operation: value.operation,
+    invariant: value.invariant,
+    candidate_epoch: value.candidate_epoch,
+    evidence_identity: value.evidence_identity,
+  });
+  if (value.episode_id !== expectedId) return false;
+  if (typeof value.strategy_cursor !== "number" || !Number.isInteger(value.strategy_cursor) || value.strategy_cursor < 0) {
+    return false;
+  }
+  if (value.strategy_cursor > RECOVERY_RECIPES.length) return false;
+  if (value.skipped_strategies !== undefined) {
+    if (!Array.isArray(value.skipped_strategies)) return false;
+    if (!value.skipped_strategies.every((recipe) => isRecoveryRecipe(recipe))) return false;
+    if (value.skipped_strategies.length > value.strategy_cursor) return false;
+  }
+  if (typeof value.attempts_per_strategy !== "object" || value.attempts_per_strategy === null || Array.isArray(value.attempts_per_strategy)) {
+    return false;
+  }
+  const persisted = value.attempts_per_strategy as Record<string, unknown>;
+  for (const [recipe, count] of Object.entries(persisted)) {
+    if (!isRecoveryRecipe(recipe)) return false;
+    if (typeof count !== "number" || !Number.isInteger(count) || count < 0) return false;
+  }
+  if (siblings.length === 0) return true;
+  if (Object.keys(persisted).length === 0) return true;
+  const derived: Record<string, number> = {};
+  for (const sibling of siblings) {
+    if (sibling.episode_id !== value.episode_id) continue;
+    if (!isRecoveryRecipe(sibling.action)) continue;
+    if (sibling.outcome === "skipped" || sibling.outcome === "superseded") continue;
+    derived[sibling.action] = (derived[sibling.action] ?? 0) + 1;
+  }
+  const keys = new Set([...Object.keys(persisted), ...Object.keys(derived)]);
+  for (const recipe of keys) {
+    const claimed = persisted[recipe];
+    const actual = derived[recipe] ?? 0;
+    if ((typeof claimed === "number" ? claimed : 0) !== actual) return false;
+  }
+  return true;
+}
+
+export function ledgerEpisodesAreAuthoritative(attempts: readonly Record<string, unknown>[]): boolean {
+  const latestByEpisode = new Map<string, Record<string, unknown>>();
+  for (const attempt of attempts) {
+    if (typeof attempt.episode_id !== "string" || attempt.episode_id.length === 0) continue;
+    latestByEpisode.set(attempt.episode_id, attempt);
+  }
+  for (const latest of latestByEpisode.values()) {
+    if (!isAuthoritativeEpisodeState(latest, attempts)) return false;
+  }
+  return true;
 }
 
 /** Same purity contract as {@link fingerprintEvidence}: incidental formatting

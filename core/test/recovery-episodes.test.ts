@@ -812,6 +812,69 @@ test("5.7 unreconstructable ledger remains owned as a quarantine wait", async ()
   assert.equal(after.stop, null);
 });
 
+test("forged episode cursor and attempt counts are quarantined (#1325 99629b67)", async () => {
+  const { deps, files, token } = await setup();
+  const published = [...files.keys()].find((k) => k.endsWith("/ledger.json"))!;
+  files.delete(lastValidPathFor(published));
+  const key = {
+    operation: "loop_recovery",
+    invariant: "workflow-state",
+    candidate_epoch: "epoch-1",
+    evidence_identity: "evidence-1",
+  };
+  const honestId = recoveryEpisodeId(key);
+  const base = await readLedger(deps, "run-1", token);
+  const forged = {
+    ...base,
+    recovery_attempts: [
+      {
+        item_id: "100",
+        seq: 0,
+        time: "2026-09-02T00:00:00.000Z",
+        class: "workflow-state",
+        action: "repair_pipeline_item",
+        outcome: "started",
+        episode_id: "forged-episode-id",
+        operation: key.operation,
+        invariant: key.invariant,
+        candidate_epoch: key.candidate_epoch,
+        evidence_identity: key.evidence_identity,
+        attempts_per_strategy: { wait_and_retry: 99 },
+        strategy_cursor: 99,
+        next_eligible_at: "2026-09-02T00:00:00.000Z",
+      },
+    ],
+  };
+  files.set(published, JSON.stringify(forged));
+  await assert.rejects(() => readLedger(deps, "run-1"), /persist requires the current lock holder's token/);
+  const owned = await readLedger(deps, "run-1", token);
+  assert.equal(owned.cooling?.theme, DURABLE_GENERATION_QUARANTINE_THEME);
+  const mismatchedCounts = {
+    ...base,
+    recovery_attempts: [
+      {
+        item_id: "100",
+        seq: 0,
+        time: "2026-09-02T00:00:00.000Z",
+        class: "workflow-state",
+        action: "repair_pipeline_item",
+        outcome: "started",
+        episode_id: honestId,
+        operation: key.operation,
+        invariant: key.invariant,
+        candidate_epoch: key.candidate_epoch,
+        evidence_identity: key.evidence_identity,
+        attempts_per_strategy: { wait_and_retry: 99 },
+        strategy_cursor: 0,
+        next_eligible_at: "2026-09-02T00:00:00.000Z",
+      },
+    ],
+  };
+  files.delete(lastValidPathFor(published));
+  files.set(published, JSON.stringify(mismatchedCounts));
+  await assert.rejects(() => readLedger(deps, "run-1"), /persist requires the current lock holder's token/);
+});
+
 test("5.8 unauthenticated read does not overwrite a corrupt ledger that still carries a started claim", async () => {
   const { deps, files, token } = await setup();
   const published = [...files.keys()].find((k) => k.endsWith("/ledger.json"))!;

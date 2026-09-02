@@ -36,8 +36,10 @@ import {
 import {
   buildCoolingRecord,
   DURABLE_GENERATION_QUARANTINE_THEME,
+  isAuthoritativeEpisodeState,
   isTempWriteBasename,
   lastValidPathFor,
+  ledgerEpisodesAreAuthoritative,
   PRIVATE_EPISODE_SCHEMA_BASENAME,
   quarantinePathFor,
   RECOVERY_EPISODE_REQUIRED_FIELDS,
@@ -278,7 +280,7 @@ function isCompleteEpisodeState(value: Record<string, unknown>): boolean {
   if (!isAttemptsPerStrategy(value.attempts_per_strategy)) return false;
   if (!isNonNegativeInteger(value.strategy_cursor)) return false;
   if (!isIsoTimestamp(value.next_eligible_at)) return false;
-  return true;
+  return isAuthoritativeEpisodeState(value);
 }
 
 function isLoopRecoveryAttemptShape(value: unknown): boolean {
@@ -329,6 +331,13 @@ function isLoopLedgerShape(value: unknown): value is LoopLedger {
     if (!Array.isArray(value.recovery_attempts)) return false;
     for (const attempt of value.recovery_attempts) {
       if (!isLoopRecoveryAttemptShape(attempt)) return false;
+    }
+    if (
+      !ledgerEpisodesAreAuthoritative(
+        value.recovery_attempts.filter((attempt): attempt is Record<string, unknown> => isPlainObject(attempt)),
+      )
+    ) {
+      return false;
     }
   }
   if (value.cooling !== undefined && value.cooling !== null && !isCoolingRecordShape(value.cooling)) return false;
