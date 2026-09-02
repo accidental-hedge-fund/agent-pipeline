@@ -84,6 +84,7 @@ import {
 } from "../scripts/factory-release-prepare.ts";
 import { presentFrgAttestorCredential } from "../scripts/ship-end-candidate.ts";
 import {
+  REQUIRED_LIFECYCLE_CLASSES_1333,
   passingUniqueOperationAttempts,
   passingUniqueOperationManifest,
 } from "../scripts/operation-reliability.ts";
@@ -123,6 +124,7 @@ function fullPackPassInput(
     unique_operation_manifest: passingUniqueOperationManifest({
       release_identity: overrides.version ?? "1.29.1",
     }),
+    matrix_covered_lifecycle_classes: [...REQUIRED_LIFECYCLE_CLASSES_1333],
   };
 }
 

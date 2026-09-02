@@ -524,9 +524,8 @@ export interface BlockItemInput {
  *  siblings from progressing. Repeated identical evidence remains independently
  *  bounded by `repeated_evidence_limit`: the supervisor enforces the bound
  *  item-locally — at the limit it claims no further recovery attempt for the
- *  item (regardless of remaining class budget) and promotes the bound to a
- *  `repeated_no_progress` run stop only once the scheduler proves no
- *  independent sibling remains schedulable. */
+ *  item (regardless of remaining class budget) and records Cooling once the
+ *  scheduler proves no independent sibling remains schedulable. */
 export async function blockItem(deps: LoopStoreDeps, contractInput: LoopContract, input: BlockItemInput): Promise<LoopLedger> {
   if (!input.blockerClass || !isDurableBlockerClass(input.blockerClass)) {
     throw new LoopError("validation", `"${input.blockerClass}" is not a valid DurableBlockerClass`);

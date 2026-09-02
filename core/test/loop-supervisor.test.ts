@@ -743,7 +743,8 @@ test("stage transitions originate in the advance state machine (transitionItem/b
   const result = await driveSupervisor({ store: deps, observe, dispatchItem }, { runId: "run-1", engine: "claude" });
 
   assert.equal(calls.length, 1, "an out-of-set outcome must not be silently re-dispatched");
-  assert.equal(result.stop?.reason, "run_fatal");
+  assert.equal(result.stop, null, "strategy-cursor exhaustion is Cooling, not a terminal stop");
+  assert.equal(result.cooling?.reason, "strategy_cursor_exhausted");
   const finalLedger = await readLedger(deps, "run-1");
   assert.equal(finalLedger.items["100"].state, "blocked");
   assert.equal(finalLedger.items["100"].blocked_theme, "workflow-engine-defect");
@@ -1360,7 +1361,8 @@ test("runSupervisorCycle: a rejected concurrent dispatch is durably classified f
   assert.equal(finalLedger.items["100"].evidence_fingerprint !== undefined, true);
   assert.equal(finalLedger.items["200"].state, "ready", "the successful sibling's outcome survives the sibling's rejected dispatch");
   const terminal = await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
-  assert.equal(terminal.stop?.reason, "run_fatal");
+  assert.equal(terminal.stop, null, "rejected dispatch exhaustion is Cooling");
+  assert.equal(terminal.cooling?.reason, "strategy_cursor_exhausted");
 });
 
 test("serialized dispatch rejection enters bounded recovery and redispatches the same item", async () => {
@@ -1844,7 +1846,8 @@ test("a genuine engine defect (mid-flight non-terminal label, zero transitions) 
 
   const result = await driveSupervisor({ store: deps, observe, dispatchItem }, { runId: "run-1", engine: "claude" });
 
-  assert.equal(result.stop?.reason, "run_fatal");
+  assert.equal(result.stop, null, "engine-defect exhaustion is Cooling, not a terminal stop");
+  assert.equal(result.cooling?.reason, "strategy_cursor_exhausted");
   const finalLedger = await readLedger(deps, "run-1");
   assert.equal(finalLedger.items["100"].state, "blocked");
   assert.equal(finalLedger.items["100"].blocked_theme, "workflow-engine-defect");
@@ -1963,7 +1966,8 @@ test("regression (#568 review 1, finding eb82a1de): a dispatch whose label was m
 
   const result = await driveSupervisor({ store: deps, observe, dispatchItem }, { runId: "run-1", engine: "claude" });
 
-  assert.equal(result.stop?.reason, "run_fatal");
+  assert.equal(result.stop, null, "engine-defect exhaustion is Cooling, not a terminal stop");
+  assert.equal(result.cooling?.reason, "strategy_cursor_exhausted");
   const finalLedger = await readLedger(deps, "run-1");
   assert.equal(finalLedger.items["100"].state, "blocked");
   assert.equal(finalLedger.items["100"].blocked_theme, "workflow-engine-defect");
@@ -2033,7 +2037,8 @@ test("regression (#568 review 2, finding 8bb189a0): a round-trip dispatch (backl
 
   assert.equal(cycle.stop, null, "the mechanical block is recorded before terminal promotion");
   const terminal = await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
-  assert.equal(terminal.stop?.reason, "run_fatal", "a round-trip transition must never be masked as a zero-transition no-op");
+  assert.equal(terminal.stop, null, "a round-trip transition remains an engine defect and cools rather than STOPping");
+  assert.equal(terminal.cooling?.reason, "strategy_cursor_exhausted");
   const finalLedger = await readLedger(deps, "run-1");
   assert.equal(finalLedger.items["100"].state, "blocked");
   assert.equal(finalLedger.items["100"].blocked_theme, "workflow-engine-defect");
@@ -2103,7 +2108,8 @@ test("regression (#568 review 1, finding f09d500c): a real round-trip transition
 
   assert.equal(cycle.stop, null, "the mechanical block is recorded before terminal promotion");
   const terminal = await runSupervisorCycle({ store: deps, observe, dispatchItem }, "run-1", token, "claude");
-  assert.equal(terminal.stop?.reason, "run_fatal", "clock skew must never mask a real round-trip transition as a zero-transition no-op");
+  assert.equal(terminal.stop, null, "clock skew must never mask a real round-trip transition as a zero-transition no-op");
+  assert.equal(terminal.cooling?.reason, "strategy_cursor_exhausted");
   const finalLedger = await readLedger(deps, "run-1");
   assert.equal(finalLedger.items["100"].state, "blocked");
   assert.equal(finalLedger.items["100"].blocked_theme, "workflow-engine-defect");
@@ -2631,11 +2637,12 @@ test("a failed budgeted recovery stays blocked and stops only after the action i
   );
 
   // #1020: unlink_engine_scratch is first; retry_budget 2 ⇒ two claims before
-  // run_fatal (modulo rotation over the three-recipe list).
+  // Cooling (modulo rotation over the three-recipe list).
   assert.equal(recoveryActions[0], "unlink_engine_scratch");
   assert.ok(recoveryActions.includes("restart_workflow_engine") || recoveryActions.includes("repair_pipeline_item") || recoveryActions.length >= 1);
-  assert.equal(result.stop?.reason, "run_fatal");
-  assert.equal(result.stop?.theme, "workflow-engine-defect");
+  assert.equal(result.stop, null, "budget exhaustion is Cooling, not a terminal run stop");
+  assert.equal(result.cooling?.reason, "strategy_cursor_exhausted");
+  assert.equal(result.cooling?.theme, "workflow-engine-defect");
   assert.equal(result.holdOutstanding, false);
   const finalLedger = await readLedger(deps, "run-1");
   assert.equal(finalLedger.items["100"].state, "blocked");
@@ -2725,8 +2732,10 @@ test("an exhausted mechanical item cannot stop an independent sibling before tha
     token,
     "claude",
   );
-  assert.equal(terminalCycle.stop?.reason, "run_fatal", "the exhausted item stops only after sibling progress is complete");
-  assert.deepEqual(terminalCycle.stop?.outstanding_ready, ["200"]);
+  assert.equal(terminalCycle.stop, null, "the exhausted item cools after sibling progress; it does not terminalize");
+  assert.equal(terminalCycle.cooling?.reason, "strategy_cursor_exhausted");
+  assert.equal(terminalCycle.cooling?.theme, "workflow-engine-defect");
+  assert.equal((await readLedger(deps, "run-1")).items["200"].state, "ready");
 });
 
 test("recovery performs deterministic redispatch before model repair", async () => {
@@ -2942,7 +2951,8 @@ test("blocked_needs_human without attested authority remains engine-owned even w
   );
 
   assert.ok(recoveryExecutions >= 1, "missing authority proof must enter bounded engine recovery");
-  assert.equal(result.stop?.reason, "run_fatal");
+  assert.equal(result.stop, null, "unattested needs-human exhaustion is Cooling");
+  assert.equal(result.cooling?.reason, "strategy_cursor_exhausted");
   assert.equal(result.holdOutstanding, false);
 
   const finalLedger = await readLedger(deps, "run-1");
@@ -3167,8 +3177,9 @@ test("authority fail-closed: a failed outcome carrying only the blocked label is
 
   const result = await driveSupervisor({ store: deps, observe, dispatchItem }, { runId: "run-1", engine: "claude" });
 
-  assert.equal(result.stop?.reason, "run_fatal");
-  assert.equal(result.stop?.theme, "workflow-engine-defect");
+  assert.equal(result.stop, null, "failed outcome without authority is Cooling, not a human hold or STOP");
+  assert.equal(result.cooling?.reason, "strategy_cursor_exhausted");
+  assert.equal(result.cooling?.theme, "workflow-engine-defect");
   assert.equal(result.holdOutstanding, false);
 
   const finalLedger = await readLedger(deps, "run-1");
@@ -3229,8 +3240,9 @@ test("regression (#570): a run stop while a sibling is ready discloses the outst
 
   const result = await driveSupervisor({ store: deps, observe, dispatchItem }, { runId: "run-1", engine: "claude" });
 
-  assert.equal(result.stop?.reason, "run_fatal", "item 200 is a genuine engine defect — unaffected by the needs-human disposition change");
-  assert.deepEqual(result.stop?.outstanding_ready, ["100"], "the stranded ready sibling must be named on the stop record");
+  assert.equal(result.stop, null, "item 200 cools rather than STOPping the run");
+  assert.equal(result.cooling?.reason, "strategy_cursor_exhausted");
+  assert.equal(result.cooling?.theme, "workflow-engine-defect");
 
   const finalLedger = await readLedger(deps, "run-1");
   assert.equal(finalLedger.items["100"].state, "ready", "the ready sibling's state is preserved, not discarded, by the stop");
@@ -3276,8 +3288,8 @@ test("a stop recorded with no ready item discloses an empty outstanding_ready se
 
   const result = await driveSupervisor({ store: deps, observe, dispatchItem }, { runId: "run-1", engine: "claude" });
 
-  assert.equal(result.stop?.reason, "run_fatal");
-  assert.deepEqual(result.stop?.outstanding_ready, [], "no item is ready at stop time, so the disclosure is an empty set");
+  assert.equal(result.stop, null, "exhaustion is Cooling; there is no terminal stop disclosure");
+  assert.equal(result.cooling?.reason, "strategy_cursor_exhausted");
 });
 
 // ---------------------------------------------------------------------------
@@ -4155,7 +4167,8 @@ test("regression (#770 genuine defect): crash with no coexistence evidence still
     { runId: "run-1", engine: "claude" },
   );
 
-  assert.equal(result.stop?.reason, "run_fatal");
+  assert.equal(result.stop, null, "live crash exhaustion is Cooling, not a terminal stop");
+  assert.equal(result.cooling?.reason, "strategy_cursor_exhausted");
   const finalLedger = await readLedger(deps, "run-1");
   assert.equal(finalLedger.items["100"].blocked_theme, "workflow-engine-defect");
 });
@@ -4404,7 +4417,8 @@ test("regression (#770 b48730b7): default probe with stale crash store does not 
       { runId: "run-1", engine: "claude" },
     );
 
-    assert.equal(result.stop?.reason, "run_fatal", "stale crash store must not mask genuine defect");
+    assert.equal(result.stop, null, "stale crash store must not mask genuine defect");
+    assert.equal(result.cooling?.reason, "strategy_cursor_exhausted");
     const finalLedger = await readLedger(deps, "run-1");
     assert.equal(finalLedger.items["100"].blocked_theme, "workflow-engine-defect");
   } finally {
@@ -4506,7 +4520,8 @@ test("regression (#770 12e4c0fd): aged linked crash artifact still escalates gen
       { runId: "run-1", engine: "claude" },
     );
 
-    assert.equal(result.stop?.reason, "run_fatal", "aged linked crash must not suppress run_fatal");
+    assert.equal(result.stop, null, "aged linked crash must not suppress engine-owned recovery");
+    assert.equal(result.cooling?.reason, "strategy_cursor_exhausted");
     const finalLedger = await readLedger(deps, "run-1");
     assert.equal(finalLedger.items["100"].blocked_theme, "workflow-engine-defect");
   } finally {
@@ -4686,7 +4701,7 @@ test("regression (#770 ce4794fb): hold-clear with terminal linkage (probe not li
 // lag-tolerant post-repair head verification.
 // ---------------------------------------------------------------------------
 
-test("regression (#787): repeated identical evidence stops the run at repeated_evidence_limit with class budget remaining, reason repeated_no_progress", async () => {
+test("regression (#787/#1333): repeated identical evidence enters Cooling at repeated_evidence_limit with class budget remaining", async () => {
   const workflowState = DEFAULT_RECOVERY_POLICY["workflow-state"];
   const contract = testContract({
     recovery_policy: {
@@ -4735,10 +4750,11 @@ test("regression (#787): repeated identical evidence stops the run at repeated_e
     { runId: "run-1", engine: "claude" },
   );
 
-  assert.equal(result.stop?.reason, "repeated_no_progress", "the limit is promoted to a stop once no sibling is schedulable");
-  assert.equal(result.stop?.item_id, "100");
-  assert.equal(result.stop?.theme, "workflow-state");
-  assert.ok(result.stop?.fingerprint, "the repeating fingerprint is disclosed on the stop record");
+  assert.equal(result.stop, null, "strategy-cursor exhaustion must not be a terminal run stop");
+  assert.equal(result.cooling?.reason, "strategy_cursor_exhausted");
+  assert.equal(result.cooling?.item_id, "100");
+  assert.equal(result.cooling?.theme, "workflow-state");
+  assert.equal(result.cooling?.historical_evidence, "recovery_exhausted");
   assert.equal(recoveryCalls, 2, "the limit bounds implementer dispatches independently of the class budget");
   assert.equal(dispatchCount, 3, "no further dispatch is spent once the limit is reached");
   const finalLedger = await readLedger(deps, "run-1");
@@ -4747,11 +4763,11 @@ test("regression (#787): repeated identical evidence stops the run at repeated_e
   assert.equal(
     finalLedger.items["100"].recovery_budgets_remaining["workflow-state"],
     1,
-    "the class retry budget was NOT drained to reach the stop",
+    "the class retry budget was NOT drained to reach Cooling",
   );
 });
 
-test("regression (#787): a non-run_fatal class whose budget exhausts stops with reason recovery_exhausted", async () => {
+test("regression (#787/#1333): a non-run_fatal class whose budget exhausts enters Cooling not a terminal stop", async () => {
   const workflowState = DEFAULT_RECOVERY_POLICY["workflow-state"];
   const contract = testContract({
     recovery_policy: {
@@ -4797,12 +4813,17 @@ test("regression (#787): a non-run_fatal class whose budget exhausts stops with 
     { runId: "run-1", engine: "claude" },
   );
 
-  assert.equal(result.stop?.reason, "recovery_exhausted");
-  assert.equal(result.stop?.theme, "workflow-state");
+  assert.equal(result.stop, null, "mechanical exhaustion must not be a terminal run stop");
+  assert.equal(result.cooling?.reason, "strategy_cursor_exhausted");
+  assert.equal(result.cooling?.theme, "workflow-state");
+  assert.equal(result.cooling?.historical_evidence, "recovery_exhausted");
+  const cooled = await readLedger(deps, "run-1");
+  assert.equal(cooled.stop, null);
+  assert.equal(cooled.cooling?.reason, "strategy_cursor_exhausted");
   assert.equal(recoveryCalls, 1, "exactly the budgeted attempt executed");
 });
 
-test("regression (#787): a run_fatal class exhausted stops with reason run_fatal", async () => {
+test("regression (#787/#1333): a run_fatal class exhausted enters Cooling not a terminal stop", async () => {
   const contract = testContract({ items: [{ id: "100", depends_on: [] }] });
   const ledger = testLedger({ "100": itemEntry("100", "pending") });
   const { deps } = await setup(contract, ledger);
@@ -4835,8 +4856,10 @@ test("regression (#787): a run_fatal class exhausted stops with reason run_fatal
     { runId: "run-1", engine: "claude" },
   );
 
-  assert.equal(result.stop?.reason, "run_fatal", "workflow-engine-defect is run_fatal once its budget is exhausted");
-  assert.equal(result.stop?.theme, "workflow-engine-defect");
+  assert.equal(result.stop, null, "strategy-cursor exhaustion must not inherit run_fatal terminalization");
+  assert.equal(result.cooling?.reason, "strategy_cursor_exhausted");
+  assert.equal(result.cooling?.theme, "workflow-engine-defect");
+  assert.equal(result.cooling?.historical_evidence, "recovery_exhausted");
   assert.equal(recoveryCalls, 2);
 });
 
@@ -6263,7 +6286,7 @@ test("dead-holder takeover does not cycle forever on a repeated crash after resu
   const takeovers = events.filter((e) => e.kind === "loop_item_dead_holder_takeover");
   assert.equal(takeovers.length, 1, "exactly one dead-holder takeover; a second cycle must not resume the corpse again");
   assert.ok(result.cycles < 25, `drive must terminate before the safety cap (got ${result.cycles} cycles)`);
-  assert.ok(result.stop, "repeated crash after resume must reach a recorded stop, not spin");
+  assert.ok(result.stop || result.cooling, "repeated crash after resume must terminate, not spin");
 });
 
 test("second independent dead-holder interrupt is takeover, not leftover history match (#1096 83e30467)", async () => {

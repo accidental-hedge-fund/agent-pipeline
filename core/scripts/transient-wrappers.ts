@@ -50,7 +50,8 @@ export type TransientGhResult =
 
 /**
  * Bounded gh invocation with the same transient classifier as ghRun.
- * On exhaustion returns a typed engine-owned failure — never invents human authority.
+ * On exhaustion returns a typed engine-owned failure for the caller to enter
+ * Cooling or an external-condition wait — never invents human authority.
  */
 export async function runTransientGh(
   args: string[],

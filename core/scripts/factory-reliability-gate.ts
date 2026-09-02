@@ -58,6 +58,7 @@ import {
   type UniqueOperationManifest,
   type UniqueOperationReliability,
 } from "./operation-reliability.ts";
+import type { ExecutedMatrixRow } from "./fault-recovery-matrix.ts";
 import {
   defaultCollectHybridV2FromRun,
   githubReadyToDeployOverlay,
@@ -2058,9 +2059,11 @@ export function validateReleaseEligibleFrgEvidence(
       evidence.composition?.missing?.length
         ? ` missing composition=[${evidence.composition.missing.join(", ")}]`
         : "";
+    const slo = uniqueOperationSloFailure(evidence.operation_reliability ?? null);
     throw new Error(
       `FRG release-eligibility validation failed for ${expected}: ` +
         `pass=${evidence.pass} releaseEligible=false` +
+        (slo ? ` ${slo}` : "") +
         missing,
     );
   }
@@ -3566,6 +3569,14 @@ export interface ComputeFrgInput {
   unique_operations?: UniqueOperationAttempt[];
   unique_operation_manifest?: UniqueOperationManifest;
   /**
+   * Overlay for unique-operation matrix coverage. `undefined` reads executed
+   * rows bound to the scored candidate. Tests pass `[]` to prove stamped
+   * helper coverage fails. Static inventory is never the default.
+   */
+  matrix_covered_lifecycle_classes?: readonly string[] | null;
+  /** Executed matrix-row records keyed to candidate SHA and coverage layer. */
+  executed_matrix_rows?: readonly ExecutedMatrixRow[];
+  /**
    * Ignored on the production/release-eligible path. The section is always
    * derived from durable `unique_operations` (or the test-only fixture below).
    * A caller-supplied precomputed report cannot mint release-eligible evidence.
@@ -3744,6 +3755,8 @@ export function computeFrgEvidence(input: ComputeFrgInput): FrgEvidence {
       composition_false_human_count: input.false_human_authority_count ?? 0,
       candidate_sha: scoredCandidateSha,
       release_identity: version,
+      matrix_covered_lifecycle_classes: input.matrix_covered_lifecycle_classes,
+      executed_matrix_rows: input.executed_matrix_rows,
     });
   let integrity = buildFrgIntegrity(scoreboard, composition, packProvenance);
 
@@ -4223,6 +4236,8 @@ export interface FactoryGateOpts {
   /** Unique-operation attempts for `operation_reliability` (#1368). */
   unique_operations?: UniqueOperationAttempt[];
   unique_operation_manifest?: UniqueOperationManifest;
+  matrix_covered_lifecycle_classes?: readonly string[] | null;
+  executed_matrix_rows?: readonly ExecutedMatrixRow[];
   /**
    * Post-1.33 --from-run collect. When omitted, production builds hybrid-v2
    * provenance from the live pack + Layer A TAP (#1118). Tests inject a fake.
@@ -4820,6 +4835,18 @@ export async function runFactoryGate(
       ...computeInput,
       unique_operations: opts.unique_operations,
       unique_operation_manifest: opts.unique_operation_manifest,
+    };
+  }
+  if (opts.matrix_covered_lifecycle_classes !== undefined) {
+    computeInput = {
+      ...computeInput,
+      matrix_covered_lifecycle_classes: opts.matrix_covered_lifecycle_classes,
+    };
+  }
+  if (opts.executed_matrix_rows !== undefined) {
+    computeInput = {
+      ...computeInput,
+      executed_matrix_rows: opts.executed_matrix_rows,
     };
   }
   if (computeInput.unique_operations === undefined) {

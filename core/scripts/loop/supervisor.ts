@@ -21,6 +21,7 @@ import {
   type LoopItemLedgerEntry,
   type LoopLedger,
   type LoopPreconditionExclusion,
+  type LoopCoolingRecord,
   type LoopStopRecord,
   type LoopSupervisorProcess,
   type RecoveryRecipe,
@@ -944,13 +945,12 @@ async function executeBlockedRecovery(
     const policy = contract.recovery_policy[item.blocked_theme];
     // Repeated byte-identical evidence is bounded independently of the class
     // retry budget: at `repeated_evidence_limit` no further attempt is claimed
-    // here — the idle-promotion branch in runSupervisorCycle records the
-    // repeated_no_progress stop once the scheduler proves no independent
-    // sibling is schedulable.
+    // here — the idle-promotion branch in runSupervisorCycle records Cooling
+    // once the scheduler proves no independent sibling is schedulable.
     if ((item.repeated_evidence_count ?? 0) >= policy.repeated_evidence_limit) {
       // Durable trace for the per-cycle skip (mirrors the coexistence
       // deferrals' events): without it the at-limit refusal leaves no run-trail
-      // record until the idle promotion records the terminal stop.
+      // record until the idle promotion records Cooling.
       await appendEvent(deps.store, runId, token, "loop_recovery_preflight_deferred", {
         item_id: itemId,
         reason: "repeated_evidence_limit",
@@ -1524,6 +1524,8 @@ export interface SupervisorCycleResult {
   /** Set when this cycle recorded a terminal stop (including the watchdog's
    *  own — that is charged by the caller, driveSupervisor, not here). */
   stop: LoopStopRecord | null;
+  /** Owned Cooling for strategy-cursor exhaustion — not a terminal stop. */
+  cooling?: LoopCoolingRecord | null;
   holdOutstanding: boolean;
   allDone: boolean;
   /** Every item currently held (`paused`/`waiting`) this cycle — populated whenever at least one
@@ -1557,6 +1559,24 @@ export async function runSupervisorCycle(
       progress: "no_progress",
     });
     return { progress: false, stop: ledger.stop, holdOutstanding: false, allDone: false, heldItemIds: heldItemIdsFromLedger(ledger) };
+  }
+
+  if (ledger.cooling) {
+    await appendActionEvidence(deps.store, runId, token, {
+      item_id: ledger.cooling.item_id ?? null,
+      action: "noop",
+      outcome: "cooling_recovery",
+      next_action: null,
+      progress: "no_progress",
+    });
+    return {
+      progress: false,
+      stop: null,
+      cooling: ledger.cooling,
+      holdOutstanding: false,
+      allDone: false,
+      heldItemIds: heldItemIdsFromLedger(ledger),
+    };
   }
 
   let drifted = false;
@@ -1812,8 +1832,10 @@ export async function runSupervisorCycle(
       };
     }
 
-    // Engine-owned exhaustion is item-local until the scheduler proves no
-    // independent sibling remains. Only then is it promoted to a run stop.
+    // Engine-owned strategy-cursor exhaustion stays item-local Cooling (or an
+    // external wait). Repeated evidence and run_fatal policy must not
+    // terminalize this branch — those flags describe independent non-exhaustion
+    // fatalities handled before this promotion.
     const exhausted = Object.values(ledger.items).find((candidate) => {
       if (candidate.state !== "blocked" || !candidate.blocked_theme) return false;
       if (
@@ -1831,27 +1853,25 @@ export async function runSupervisorCycle(
       return remaining <= 0 || (candidate.repeated_evidence_count ?? 0) >= policy.repeated_evidence_limit;
     });
     if (exhausted?.blocked_theme) {
-      const policy = contract.recovery_policy[exhausted.blocked_theme as DurableBlockerClass];
-      const repeated = (exhausted.repeated_evidence_count ?? 0) >= policy.repeated_evidence_limit;
       const time = deps.store.now().toISOString();
-      const stop: LoopStopRecord = {
-        reason: repeated ? "repeated_no_progress" : policy.run_fatal ? "run_fatal" : "recovery_exhausted",
+      const cooling: LoopCoolingRecord = {
+        reason: "strategy_cursor_exhausted",
         time,
         item_id: exhausted.id,
         theme: exhausted.blocked_theme,
-        ...(repeated && exhausted.evidence_fingerprint ? { fingerprint: exhausted.evidence_fingerprint } : {}),
-        outstanding_ready: outstandingReadyItemIds(ledger),
+        historical_evidence: "recovery_exhausted",
       };
-      ledger = { ...ledger, stop };
+      ledger = { ...ledger, cooling };
       await writeLedger(deps.store, ledger, token);
-      await appendEvent(deps.store, runId, token, "loop_run_stopped", {
-        reason: stop.reason,
+      await appendEvent(deps.store, runId, token, "loop_item_cooling", {
         item_id: exhausted.id,
         theme: exhausted.blocked_theme,
+        historical_evidence: "recovery_exhausted",
       });
       return {
         progress: recoveryProgress,
-        stop,
+        stop: null,
+        cooling,
         holdOutstanding: false,
         allDone: false,
         heldItemIds: heldItemIdsFromLedger(ledger),
@@ -2832,6 +2852,8 @@ export interface DriveSupervisorResult {
   runId: string;
   cycles: number;
   stop: LoopStopRecord | null;
+  /** Owned Cooling for strategy-cursor exhaustion — not a terminal ledger stop. */
+  cooling?: LoopCoolingRecord | null;
   holdOutstanding: boolean;
   /** True only when every work-list item reached a terminal-successful (done/abandoned) state
    *  with zero items precondition-excluded (#614) — narrower than "the run resolved," which also
@@ -2866,9 +2888,10 @@ export interface DriveSupervisorResult {
  *  4.2) before entering the cycle loop. A resume of `stop.reason = run_fatal`
  *  either supersedes that stop and re-drives valid outstanding items at the
  *  same run id, or throws a distinct refusal (never a silent zero-dispatch
- *  success). A resume of `stop.reason = recovery_exhausted` runs a resume-only
- *  terminal catch-up for verified `ready`/`merged` items and keeps that stop
- *  as historical evidence (#1297). The lock is held only while actively driving: it is released in
+ *  success). A resume of `stop.reason = recovery_exhausted` or Cooling runs a
+ *  resume-only catch-up for verified `ready`/`merged` items and keeps historical
+ *  `recovery_exhausted` evidence (#1297 / #1333). Live strategy-cursor exhaustion
+ *  is Cooling, not a terminal run stop. The lock is held only while actively driving: it is released in
  *  a `finally` once the run reaches a terminal condition (or the drive throws),
  *  so a released-lock resume can proceed on another host/process without a
  *  takeover. `supervisor.json` (the process identity record) is left in place
@@ -2907,7 +2930,10 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
           next_action: null,
           progress: "progress",
         });
-      } else if (attachedLedger.stop?.reason === "recovery_exhausted") {
+      } else if (
+        attachedLedger.stop?.reason === "recovery_exhausted" ||
+        attachedLedger.cooling
+      ) {
         await resumeRecoveryExhaustedTerminalCatchUp(deps.store, deps.observe, {
           runId: input.runId,
           token,
@@ -2994,6 +3020,7 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
 
     let cycles = 0;
     let stop: LoopStopRecord | null = null;
+    let cooling: LoopCoolingRecord | null = null;
     let holdOutstanding = false;
     let resolved = false;
     let heldItemIds: string[] = [];
@@ -3011,6 +3038,10 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
 
       if (result.stop) {
         stop = result.stop;
+        break;
+      }
+      if (result.cooling) {
+        cooling = result.cooling;
         break;
       }
       if (result.holdOutstanding) {
@@ -3119,7 +3150,7 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
     const exclusionReason = dominantExclusionReason(finalExclusions);
     const dispatched = contract.items.filter((i) => DONE_OR_ABANDONED.has(finalLedger.items[i.id]?.state ?? "")).length;
     const completion: LoopCompletion =
-      stop || holdOutstanding
+      stop || holdOutstanding || cooling
         ? null
         : excludedItemIds.length === 0
           ? "all_done"
@@ -3132,6 +3163,7 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
       runId: input.runId,
       cycles,
       stop,
+      cooling,
       holdOutstanding,
       allDone,
       resumed: attach.resumed,
@@ -3145,13 +3177,14 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
     // terminal event at the point the stop is persisted. Resolved and genuine
     // human-hold exits have no stop transition, so the driver records their
     // terminal summary here. Never emit both terminal kinds for one exit.
-    if (holdOutstanding || resolved) {
+    if (holdOutstanding || resolved || cooling) {
       const terminalRevision = JSON.stringify({
         items: Object.values(finalLedger.items)
           .map((item) => [item.id, item.state, item.hold_request?.request_id ?? null])
           .sort(([a], [b]) => String(a).localeCompare(String(b))),
         held_item_ids: heldItemIds,
         excluded_item_ids: excludedItemIds,
+        cooling: cooling?.reason ?? null,
       });
       const priorEvents = await readEvents(deps.store, input.runId);
       const alreadyRecorded = priorEvents.some(
@@ -3161,7 +3194,11 @@ export async function driveSupervisor(deps: SupervisorDeps, input: DriveSupervis
         await appendEvent(deps.store, input.runId, token, "loop_run_complete", {
           drive_id: record.boot_id,
           terminal_revision: terminalRevision,
-          outcome: holdOutstanding ? "hold_outstanding" : completion,
+          outcome: cooling
+            ? "cooling_recovery"
+            : holdOutstanding
+              ? "hold_outstanding"
+              : completion,
           stop_reason: null,
           held_item_ids: heldItemIds,
           dispatched,

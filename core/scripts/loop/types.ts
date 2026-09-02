@@ -643,8 +643,7 @@ export interface LoopItemLedgerEntry {
    *  — 0 on first occurrence, reset to 0 whenever the fingerprint changes. At
    *  the class's `repeated_evidence_limit` the supervisor claims no further
    *  recovery attempt for this item (independent of remaining class budget)
-   *  and records a `repeated_no_progress` stop once no independent sibling is
-   *  schedulable. */
+   *  and records Cooling once no independent sibling is schedulable. */
   repeated_evidence_count?: number;
   /** Present only while `state === "waiting"` — the outstanding human-input request a resume
    *  must satisfy. Cleared on a successful resume or abandon. */
@@ -679,6 +678,20 @@ export interface LoopMergeBarrier {
   item_id: string;
   merged_sha: string;
   set_at: string;
+}
+
+/**
+ * Owned Cooling for strategy-cursor / mechanical exhaustion (#1333).
+ * Not a terminal run stop, human hold, or ownerless exit. Historical
+ * `recovery_exhausted` may remain as evidence on older ledgers.
+ */
+export interface LoopCoolingRecord {
+  reason: "strategy_cursor_exhausted" | "mechanical_exhaustion";
+  time: string;
+  item_id?: string;
+  theme?: string;
+  /** Historical evidence token only — not a lifecycle STOP. */
+  historical_evidence?: "recovery_exhausted";
 }
 
 export interface LoopStopRecord {
@@ -878,6 +891,11 @@ export interface LoopLedger {
   consecutive_blocked: number;
   merge_barrier: LoopMergeBarrier | null;
   stop: LoopStopRecord | null;
+  /**
+   * Owned Cooling when strategy-cursor exhaustion is current. Absent on
+   * pre-#1333 ledgers. Does not replace a true non-exhaustion `stop`.
+   */
+  cooling?: LoopCoolingRecord | null;
   last_native_goal_check: LoopNativeGoalCheck | null;
   last_reconciliation: LoopReconciliation | null;
   reconciliation_sequence: number;

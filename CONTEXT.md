@@ -236,8 +236,8 @@ A host-neutral mechanism that discovers and reattaches the existing durable supe
 _Avoid_: second scheduler, host-specific lifecycle controller
 
 **Fault matrix**:
-A versioned executable manifest mapping supervised operations, generic fault classes, public entrypoints, and host adapters to required recovery outcomes.
-_Avoid_: incident test list, optional coverage sample
+A versioned executable manifest mapping supervised operations, generic fault classes, public entrypoints, and host adapters to required recovery outcomes. Coverage has adapter-contract, installed-CLI, and host-conformance layers. Mechanical exhaustion is owned Cooling, not a human hold and not a command-local STOP.
+_Avoid_: incident test list, optional coverage sample, helper-stamped lifecycle coverage
 
 **Live ship**:
 A detached `pipeline train --merge` for one milestone. That process is the ship.

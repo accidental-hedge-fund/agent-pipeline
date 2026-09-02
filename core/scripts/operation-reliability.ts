@@ -6,6 +6,7 @@
 // or scheduler.
 
 import * as crypto from "node:crypto";
+import { coveredLifecycleClassesFromExecutedRows, type ExecutedMatrixRow } from "./fault-recovery-matrix.ts";
 
 function stableFingerprint(value: unknown): string {
   const canonical = (v: unknown): unknown => {
@@ -252,6 +253,14 @@ export function aggregateUniqueOperationReliability(input: {
   composition_false_human_count?: number;
   candidate_sha?: string;
   release_identity?: string;
+  /**
+   * Executed matrix coverage for the scored candidate. `undefined` reads
+   * executed rows bound to the scored SHA. An explicit list (including empty)
+   * is the test overlay. Static inventory never satisfies this field.
+   */
+  matrix_covered_lifecycle_classes?: readonly string[] | null;
+  /** Executed matrix-row records keyed to candidate SHA and coverage layer. */
+  executed_matrix_rows?: readonly ExecutedMatrixRow[];
 }): UniqueOperationReliability {
   const manifest = input.manifest ?? {};
   const requiredEntrypoints = [...(manifest.required_entrypoints ?? REQUIRED_PUBLIC_ENTRYPOINTS)];
@@ -261,8 +270,13 @@ export function aggregateUniqueOperationReliability(input: {
   let missingCorrelation = 0;
   let contradictoryCorrelation = 0;
   const observedEntrypoints = new Set<string>();
-  const coveredLifecycle = new Set<string>(manifest.covered_lifecycle_classes ?? []);
   const scoredSha = (manifest.candidate_sha ?? input.candidate_sha ?? "").trim();
+  const matrixCovered = new Set<string>(
+    input.matrix_covered_lifecycle_classes !== undefined
+      ? input.matrix_covered_lifecycle_classes ?? []
+      : coveredLifecycleClassesFromExecutedRows(input.executed_matrix_rows ?? [], scoredSha),
+  );
+  const claimedLifecycle = new Set<string>(manifest.covered_lifecycle_classes ?? []);
   const scoredRelease = (manifest.release_identity ?? input.release_identity ?? "").trim();
 
   const byId = new Map<
@@ -367,7 +381,7 @@ export function aggregateUniqueOperationReliability(input: {
       entry.fixture_ids.push(attempt.fixture_id.trim());
     }
     for (const cls of attempt.covered_lifecycle_classes ?? []) {
-      if (cls) coveredLifecycle.add(cls);
+      if (cls) claimedLifecycle.add(cls);
     }
     byId.set(uniqueOpKey(id), entry);
   }
@@ -465,6 +479,12 @@ export function aggregateUniqueOperationReliability(input: {
   if (compositionFalseHuman > falseHuman) {
     falseHuman = compositionFalseHuman;
   }
+
+  const coveredLifecycle = new Set<string>(
+    [...claimedLifecycle].filter((cls) => matrixCovered.has(cls)),
+  );
+  // Matrix-proved classes count even when helpers no longer stamp them.
+  for (const cls of matrixCovered) coveredLifecycle.add(cls);
 
   const missingEntrypoints = requiredEntrypoints.filter((e) => !observedEntrypoints.has(e));
   const missingLifecycle = requiredLifecycle.filter((c) => !coveredLifecycle.has(c));
@@ -791,7 +811,6 @@ export function passingUniqueOperationAttempts(): UniqueOperationAttempt[] {
     terminal: "verified_success" as const,
     train_loop_linked: entrypoint === "train" || entrypoint === "loop",
     child_logical_operation_id: PASSING_L,
-    covered_lifecycle_classes: [...REQUIRED_LIFECYCLE_CLASSES_1333],
     evidence_refs: [`run:run-${entrypoint}`],
   }));
 }
@@ -879,7 +898,7 @@ export function passingUniqueOperationManifest(input: {
   return {
     required_entrypoints: [...REQUIRED_PUBLIC_ENTRYPOINTS],
     required_lifecycle_classes: [...REQUIRED_LIFECYCLE_CLASSES_1333],
-    covered_lifecycle_classes: [...REQUIRED_LIFECYCLE_CLASSES_1333],
+    covered_lifecycle_classes: [],
     live_train_linkage_present: true,
     candidate_sha: input.candidate_sha ?? "a".repeat(40),
     release_identity: input.release_identity ?? "",

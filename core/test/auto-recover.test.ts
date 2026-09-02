@@ -110,7 +110,7 @@ function baseDeps(overrides: Partial<AutoRecoverDeps> = {}): AutoRecoverDeps {
     },
     postComment: async () => {},
     removeLabel: async () => {},
-    addLabel: async () => {},
+    transition: async () => {},
     ...overrides,
   };
 }
@@ -163,17 +163,31 @@ test("tryAutoRecover: no runDir supplied → recovery still succeeds but no corr
   assert.equal(out.advanced, true);
 });
 
+test("tryAutoRecover routes the ready reset through transition, not addLabel", async () => {
+  const calls: Array<{ from: string; to: string }> = [];
+  const out = await tryAutoRecover(CFG, 499, undefined, undefined, undefined, baseDeps({
+    transition: async (_cfg, _n, from, to) => {
+      calls.push({ from, to });
+    },
+  }));
+  assert.equal(out.advanced, true);
+  assert.deepEqual(calls, [{ from: "implementing", to: "ready" }]);
+});
+
 test("tryAutoRecover: blocked-label clear failure returns a non-success outcome and emits no correction_event — regression for #499 finding c41e8715", async () => {
   const { deps: runStoreDeps, lines } = memRunStoreDeps();
   const postCommentCalls: string[] = [];
+  let transitionCalls = 0;
   const out = await tryAutoRecover(CFG, 499, undefined, "/tmp/run", runStoreDeps, baseDeps({
     removeLabel: async (_cfg, _issue, label) => {
       if (label === "blocked") throw new Error("gh: label removal failed (network error)");
     },
     postComment: async (_cfg, _issue, body) => { postCommentCalls.push(body); },
+    transition: async () => { transitionCalls += 1; },
   }));
   assert.equal(out.advanced, false);
   assert.equal(out.status, "blocked");
+  assert.equal(transitionCalls, 0, "projector-ready reset must not run when blocked was not cleared");
   assert.equal(lines().length, 0, "no correction_event may be recorded when the blocked label was not durably cleared");
   assert.equal(postCommentCalls.length, 0, "no recovery comment may be posted claiming success when the reset did not happen");
 });
