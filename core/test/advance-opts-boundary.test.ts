@@ -108,6 +108,20 @@ test("toAdvanceOpts picks only advance-relevant fields", () => {
   assert.equal("maxIssues" in filtered, false);
 });
 
+test("toAdvanceOpts maps --engine-track onto engineTrack", () => {
+  const mapped = toAdvanceOpts({
+    dryRun: false,
+    model: undefined,
+    once: false,
+    override: undefined,
+    jsonEvents: false,
+    profile: "codex",
+    runId: "r-track",
+    engineTrack: "candidate",
+  });
+  assert.equal(mapped.engineTrack, "candidate");
+});
+
 test("toAdvanceOpts maps --sha onto candidateShaOverride", () => {
   const sha = "a".repeat(40);
   const mapped = toAdvanceOpts({

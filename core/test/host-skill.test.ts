@@ -341,8 +341,9 @@ describe("renderHostSkill contract", () => {
 
   test("retains default numeric drive outside OPERATION_SURFACE table", () => {
     assert.match(skill, /Default numeric drive \(outside the verb table\): `pipeline <N>`/);
-    assert.match(skill, /starts a direct\nadvance/);
-    assert.match(skill, /`pipeline single <N>` and `pipeline loop` launch through the durable loop/);
+    assert.match(skill, /starts the durable\none-item drive/);
+    assert.match(skill, /the same lifecycle as `pipeline single <N>`/);
+    assert.match(skill, /`pipeline <N>` yields `loop_run_id`/);
     const table = skill.split("## Operations")[1]?.split("## Follow")[0] ?? "";
     for (const op of OPERATION_SURFACE) {
       for (const alt of op.usage.split(/\s+\|\s+/)) {
@@ -661,12 +662,9 @@ function applyFollowEvent(
       if (state.loopFollow) {
         return { ...state, advanceFollow: null };
       }
-      return {
-        loopFollow: null,
-        advanceFollow: null,
-        outcome: "completed",
-        summary: "terminal reason=run_complete; follows stopped",
-      };
+      // Public numeric drive is loop-owned. A child run_complete without a
+      // loop follow is not a confirmed terminal for that drive (#1327).
+      return { ...state, advanceFollow: null };
     case "loop_terminal":
       return {
         loopFollow: null,
@@ -686,14 +684,11 @@ function applyFollowEvent(
 
 /** Renderer-connected follow contract. A reducer-only test cannot catch this. */
 function assertRenderedFollowContract(skill: string, label = "skill"): void {
-  assert.match(skill, /Direct numeric launch: `pipeline <N>`/, label);
-  assert.match(skill, /`advance_run_handoff`/, label);
-  assert.match(
-    skill,
-    /Retain `advance_run_id` from the\n   `advance_run_handoff`/,
-    label,
-  );
-  assert.match(skill, /Loop launch: `pipeline single <N>` or `pipeline loop …`/, label);
+  assert.match(skill, /Launch default drive: `pipeline <N>` or `pipeline single <N>`/, label);
+  assert.match(skill, /`pipeline <N>` yields `loop_run_id`/, label);
+  assert.match(skill, /Retain\n   `loop_run_id` from the durable handoff/, label);
+  assert.match(skill, /pipeline loop logs <loop-run-id> --events --follow/, label);
+  assert.match(skill, /pipeline logs <advance-run-id> --events --follow/, label);
   assert.match(
     skill,
     /Advance `run_complete` stops or replaces only that advance follow/,
@@ -722,16 +717,14 @@ function assertRenderedFollowContract(skill: string, label = "skill"): void {
     /Stop every run-scoped follow on confirmed terminal \(`run_complete`/,
     `${label} must not tear down loop follow on advance run_complete`,
   );
+  assert.doesNotMatch(skill, /Direct numeric launch: `pipeline <N>`/, label);
+  assert.doesNotMatch(skill, /starts a direct\nadvance/, label);
   assert.doesNotMatch(
     skill,
-    /Launch default drive: `pipeline <N>` or `pipeline single <N>`/,
+    /Retain `advance_run_id` from the\n   `advance_run_handoff`/,
     label,
   );
-  assert.doesNotMatch(
-    skill,
-    /`pipeline <N>` yields `loop_run_id`/,
-    label,
-  );
+  assert.doesNotMatch(skill, /terminal direct-advance outcome/, label);
 }
 
 describe("semantic follow contract fixtures", () => {
@@ -782,17 +775,33 @@ describe("semantic follow contract fixtures", () => {
     }
   });
 
-  test("direct numeric advance follow completes on run_complete without a loop follow", () => {
+  test("numeric drive follows loop handoff; child run_complete does not complete observation while the loop is live", () => {
+    const skill = renderHostSkill();
+    let state = emptyFollow();
+    state = applyFollowEvent(state, { type: "loop_handoff", loopRunId: "loop-n" });
+    state = applyFollowEvent(state, {
+      type: "loop_item_advance_linked",
+      pipelineRunId: "adv-n",
+    });
+    assert.equal(state.loopFollow, "pipeline loop logs loop-n --events --follow");
+    assert.equal(state.advanceFollow, "pipeline logs adv-n --events --follow");
+    state = applyFollowEvent(state, { type: "advance_terminal" });
+    assert.equal(state.loopFollow, "pipeline loop logs loop-n --events --follow");
+    assert.equal(state.advanceFollow, null);
+    assert.equal(state.outcome, "watching");
+    state = applyFollowEvent(state, { type: "loop_terminal", reason: "all_items_done" });
+    assert.equal(state.outcome, "completed");
+    assert.match(skill, /`pipeline <N>` yields `loop_run_id`/);
+    assert.doesNotMatch(skill, /terminal direct-advance outcome/);
+  });
+
+  test("a fixture that completes numeric observation on child run_complete without a loop follow fails the contract", () => {
     const skill = renderHostSkill();
     let state = emptyFollow();
     state = applyFollowEvent(state, { type: "advance_handoff", advanceRunId: "adv-n" });
-    assert.equal(state.advanceFollow, "pipeline logs adv-n --events --follow");
-    assert.equal(state.loopFollow, null);
     state = applyFollowEvent(state, { type: "advance_terminal" });
-    assert.equal(state.loopFollow, null);
-    assert.equal(state.advanceFollow, null);
-    assert.equal(state.outcome, "completed");
-    assert.match(skill, /terminal direct-advance outcome/);
+    assert.equal(state.outcome, "watching", "child run_complete is not numeric terminal");
+    assert.doesNotMatch(skill, /terminal direct-advance outcome/);
   });
 
   test("after loop_item_advance_linked the loop follow stays active and advance follow is added", () => {

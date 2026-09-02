@@ -1,4 +1,6 @@
-// Early advance_run_handoff for plain numeric `pipeline <N>` (#1049).
+// Early advance_run_handoff for the internal `runAdvance` executor (#1049).
+// Public mutating `pipeline <N>` is no longer a top-level `runAdvance` owner
+// (#1327); these tests cover the executor and nested suppression only.
 // Injected I/O only: no network, git, or subprocess.
 
 import { test } from "node:test";
@@ -62,7 +64,7 @@ test("formatAdvanceRunHandoff emits kind advance_run_handoff with run-store fiel
   assert.ok(!line.includes("\n"));
 });
 
-test("plain numeric runAdvance emits advance_run_handoff before first dispatch and logs resolves it", async () => {
+test("top-level runAdvance executor emits advance_run_handoff before first dispatch and logs resolves it", async () => {
   const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "advance-handoff-"));
   const domain = `advance-handoff-${process.pid}-${Date.now()}`;
   const stateDir = `/tmp/pipeline-${domain}`;
