@@ -145,10 +145,20 @@ function writeClaimAtomic(file: string, record: PersistedOperationObservation): 
   fs.renameSync(tmp, file);
 }
 
+export type PersistOperationObservationDeps = {
+  /** Exclusive create (`wx`). Tests inject EEXIST races. */
+  exclusiveCreate?: (file: string, contents: string) => void;
+};
+
+function exclusiveCreateClaim(file: string, contents: string): void {
+  fs.writeFileSync(file, contents, { encoding: "utf8", flag: "wx" });
+}
+
 /** Persist one observation as an atomic claim keyed by domain + logical operation. */
 export function persistOperationObservation(
   obs: OperationObservation,
   dir: string = OPERATION_OBSERVATION_DIR_DEFAULT,
+  deps: PersistOperationObservationDeps = {},
 ): PersistedOperationObservation {
   if (!obs.domain?.trim() || !isLogicalOperationId(obs.logical_operation_id)) {
     throw new Error("operation observation: domain and logical_operation_id are required");
@@ -156,41 +166,66 @@ export function persistOperationObservation(
   fs.mkdirSync(dir, { recursive: true });
   const key = operationClaimKey(obs.domain, obs.logical_operation_id);
   const file = path.join(dir, observationFileName(key));
-  const existing = readClaimFile(file);
   const recorded_at = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
-  if (existing && sameClaimIdentity(existing, obs)) {
-    const duplicate =
-      existing.lifecycle === obs.lifecycle &&
-      existing.fault === obs.fault &&
-      existing.complete === obs.complete &&
-      existing.message === obs.message;
-    if (duplicate) return existing;
-    const next: PersistedOperationObservation = {
-      ...existing,
+  let createRace = false;
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const existing = readClaimFile(file);
+    if (existing && sameClaimIdentity(existing, obs)) {
+      const duplicate =
+        existing.lifecycle === obs.lifecycle &&
+        existing.fault === obs.fault &&
+        existing.complete === obs.complete &&
+        existing.message === obs.message;
+      if (duplicate) return existing;
+      // Concurrent create: an admission wx winner must not discard a cooling/fault
+      // report that lost the exclusive create.
+      if (
+        createRace &&
+        obs.lifecycle === "active" &&
+        obs.fault === null &&
+        obs.complete === false &&
+        (existing.fault !== null ||
+          existing.complete ||
+          existing.lifecycle === "cooling" ||
+          existing.lifecycle === "waiting" ||
+          existing.lifecycle === "complete")
+      ) {
+        return existing;
+      }
+      const next: PersistedOperationObservation = {
+        ...existing,
+        ...obs,
+        observation_id: existing.observation_id,
+        recorded_at: existing.recorded_at,
+        transitioned_at: recorded_at,
+      };
+      writeClaimAtomic(file, next);
+      return next;
+    }
+    const record: PersistedOperationObservation = {
       ...obs,
-      observation_id: existing.observation_id,
-      recorded_at: existing.recorded_at,
-      transitioned_at: recorded_at,
+      observation_id: stableObservationId(obs),
+      recorded_at,
     };
-    writeClaimAtomic(file, next);
-    return next;
+    if (existing === null) {
+      try {
+        (deps.exclusiveCreate ?? exclusiveCreateClaim)(file, JSON.stringify(record));
+        return record;
+      } catch (err) {
+        const e = err as NodeJS.ErrnoException;
+        if (e.code !== "EEXIST") throw err;
+        createRace = true;
+        continue;
+      }
+    }
+    writeClaimAtomic(file, record);
+    return record;
   }
   const record: PersistedOperationObservation = {
     ...obs,
     observation_id: stableObservationId(obs),
     recorded_at,
   };
-  if (existing === null) {
-    try {
-      fs.writeFileSync(file, JSON.stringify(record), { encoding: "utf8", flag: "wx" });
-      return record;
-    } catch (err) {
-      const e = err as NodeJS.ErrnoException;
-      if (e.code !== "EEXIST") throw err;
-      const raced = readClaimFile(file);
-      if (raced && sameClaimIdentity(raced, obs)) return raced;
-    }
-  }
   writeClaimAtomic(file, record);
   return record;
 }

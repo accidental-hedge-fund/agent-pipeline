@@ -2,7 +2,7 @@
 // Hermetic: injected fakes only.
 
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -20,6 +20,7 @@ import {
   loadOwnedOperationClaim,
   mechanicalFaultObservation,
   memoryObservationSink,
+  ownedAdmissionObservation,
   persistOperationObservation,
   recoverySupervisorObservationSink,
   reportMechanicalFault,
@@ -272,6 +273,89 @@ test("duplicate reports for one logical operation persist a single claim", () =>
     assert.equal(persisted.length, 1);
     assert.equal(persisted[0]!.observation_id, "lop-engine-dup:engine-promote:engine_promote");
     assert.equal(consumeOwnedOperation(persisted[0]!).owned, true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+function exclusiveCreatePlantsCompetitor(
+  competitor: ReturnType<typeof ownedAdmissionObservation> | ReturnType<typeof mechanicalFaultObservation>,
+): (file: string, _contents: string) => void {
+  return (file) => {
+    writeFileSync(file, JSON.stringify({
+      ...competitor,
+      observation_id: `${competitor.logical_operation_id}:${competitor.form_id}:${competitor.operation}`,
+      recorded_at: "2026-01-01T00:00:00Z",
+    }), { encoding: "utf8" });
+    const err = new Error("EEXIST") as NodeJS.ErrnoException;
+    err.code = "EEXIST";
+    throw err;
+  };
+}
+
+test("EEXIST after a concurrent admission write still applies the cooling fault", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pipeline-obs-eexist-fault-"));
+  try {
+    const identity = {
+      operation: "engine_promote",
+      form_id: "engine-promote",
+      domain: "engine",
+      logical_operation_id: "lop-engine-eexist-fault",
+      repository: "/repo",
+    };
+    const admission = ownedAdmissionObservation({
+      ...identity,
+      message: "admitted",
+    });
+    const fault = mechanicalFaultObservation({
+      ...identity,
+      message: "promote failed",
+      fault: "mechanical",
+    });
+    const persisted = persistOperationObservation(fault, dir, {
+      exclusiveCreate: exclusiveCreatePlantsCompetitor(admission),
+    });
+    assert.equal(persisted.lifecycle, "cooling");
+    assert.equal(persisted.fault, "mechanical");
+    assert.equal(persisted.complete, false);
+    const loaded = loadOwnedOperationClaim(identity.domain, identity.logical_operation_id, dir);
+    assert.ok(loaded);
+    assert.equal(loaded.lifecycle, "cooling");
+    assert.equal(loaded.fault, "mechanical");
+    assert.equal(consumeOwnedOperation(loaded).owned, true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("EEXIST after a concurrent cooling write does not let admission discard the fault", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pipeline-obs-eexist-admit-"));
+  try {
+    const identity = {
+      operation: "engine_promote",
+      form_id: "engine-promote",
+      domain: "engine",
+      logical_operation_id: "lop-engine-eexist-admit",
+      repository: "/repo",
+    };
+    const fault = mechanicalFaultObservation({
+      ...identity,
+      message: "promote failed",
+      fault: "mechanical",
+    });
+    const admission = ownedAdmissionObservation({
+      ...identity,
+      message: "admitted",
+    });
+    const persisted = persistOperationObservation(admission, dir, {
+      exclusiveCreate: exclusiveCreatePlantsCompetitor(fault),
+    });
+    assert.equal(persisted.lifecycle, "cooling");
+    assert.equal(persisted.fault, "mechanical");
+    const loaded = loadOwnedOperationClaim(identity.domain, identity.logical_operation_id, dir);
+    assert.ok(loaded);
+    assert.equal(loaded.lifecycle, "cooling");
+    assert.equal(loaded.fault, "mechanical");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
