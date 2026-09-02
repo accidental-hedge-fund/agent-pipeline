@@ -14,7 +14,10 @@ import {
   removeLabel as ghRemoveLabel,
 } from "../gh.ts";
 import { invoke } from "../harness.ts";
-import { reportMechanicalFault } from "../operation-observation.ts";
+import {
+  defaultRecoverySupervisorReport,
+  reportMechanicalFault,
+} from "../operation-observation.ts";
 import type { PipelineConfig } from "../types.ts";
 import { DEFAULT_CONFIG } from "../types.ts";
 import {
@@ -1050,5 +1053,6 @@ export function realGrillDeps(cfg: PipelineConfig): GrillDeps {
       });
       return { success: result.success, output: result.stdout };
     },
+    reportObservation: defaultRecoverySupervisorReport,
   };
 }

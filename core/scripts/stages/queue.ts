@@ -18,6 +18,7 @@ import {
   realAutoFileDeps,
 } from "./papercut.ts";
 import {
+  defaultRecoverySupervisorReport,
   reportMechanicalFault,
   type ReportOperationObservation,
 } from "../operation-observation.ts";
@@ -362,6 +363,7 @@ export function realQueueDeps(repoDir: string, _profile?: string): QueueDeps {
     autoFileCorrections: (autoFileOpts) => realAutoFileCorrections(autoFileOpts, realAutoFileDeps(repoDir)),
     log: (msg: string) => process.stdout.write(msg + "\n"),
     clock: () => Date.now(),
+    reportObservation: defaultRecoverySupervisorReport,
   };
 }
 

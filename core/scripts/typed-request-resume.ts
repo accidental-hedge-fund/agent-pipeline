@@ -39,7 +39,8 @@ function nowIso(): string {
   return new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
 }
 
-/** Build an answered fulfillment so resume validation still runs when no handoff exists. */
+/** Test helper for resume-validation fixtures. Production resume must persist
+ *  fulfillment of an existing pending request — never this in-memory object. */
 export function answeredFulfillmentHandoff(input: TypedRequestResumeInput): HumanQuestionHandoff {
   return {
     schema_version: HANDOFF_SCHEMA_VERSION,
@@ -97,27 +98,34 @@ export async function fulfillTypedRequestAndValidateResume(
     status: "pending",
   });
   const current = pending[0] ?? null;
+  if (!current) {
+    return {
+      resume: {
+        ok: false,
+        reason: "no eligible current typed request to fulfill",
+        code: "no_pending_request",
+        advances_item: false,
+      },
+      handoff: null,
+      fulfilled: false,
+    };
+  }
+
   let handoff = current;
   let fulfilled = false;
-
-  if (current) {
-    const answered = await answerFn(input.repoDir, input.issueNumber, current.handoff_id, {
-      decision: "answer",
-      actor: input.actor,
-      identitySource: "gh",
-      authenticated: true,
-      answerText: input.answer,
-      clientRequestId: null,
-    });
-    if (answered.ok) {
-      handoff = answered.handoff;
-      fulfilled = true;
-    } else {
-      handoff = answered.handoff;
-    }
-  } else {
-    handoff = answeredFulfillmentHandoff(input);
+  const answered = await answerFn(input.repoDir, input.issueNumber, current.handoff_id, {
+    decision: "answer",
+    actor: input.actor,
+    identitySource: "gh",
+    authenticated: true,
+    answerText: input.answer,
+    clientRequestId: null,
+  });
+  if (answered.ok) {
+    handoff = answered.handoff;
     fulfilled = true;
+  } else {
+    handoff = answered.handoff;
   }
 
   const ctx: ResumeContext = {

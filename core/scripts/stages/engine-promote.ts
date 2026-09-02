@@ -28,7 +28,10 @@ import { formatFrgSkipReason, resolveFrgSkip } from "../frg-skip.ts";
 import { resolveEngineCommitSha } from "../engine-attribution.ts";
 import { resolveOuterHost } from "../outer-hosts/index.ts";
 import { BUILTIN_OUTER_HOST_IDS, type BuiltinOuterHostId } from "../outer-hosts/types.ts";
-import { reportMechanicalFault } from "../operation-observation.ts";
+import {
+  defaultRecoverySupervisorReport,
+  reportMechanicalFault,
+} from "../operation-observation.ts";
 import {
   assertNoRemainingOpenMilestoneIssues,
   listRemainingOpenMilestoneIssueNumbers,
@@ -613,6 +616,7 @@ export function realEnginePromoteDeps(repoDir: string): EnginePromoteDeps {
     log(msg) {
       console.error(msg);
     },
+    reportObservation: defaultRecoverySupervisorReport,
     async verifyPublishedRelease(tag) {
       try {
         const { stdout } = await execFileAsync(

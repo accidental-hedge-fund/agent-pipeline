@@ -2,7 +2,8 @@
 // Hermetic: injected fakes only.
 
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
@@ -14,8 +15,11 @@ import {
   collectReadOnlyRecoveryWrites,
 } from "../scripts/fault-recovery-static-guards.ts";
 import {
+  listPersistedOperationObservations,
   mechanicalFaultObservation,
   memoryObservationSink,
+  recoverySupervisorObservationSink,
+  reportMechanicalFault,
 } from "../scripts/operation-observation.ts";
 import { runQueue, type QueueDeps, type QueueOpts } from "../scripts/stages/queue.ts";
 import { sweepMergedWorktrees, removeWorktreeForIssue, type WorktreeRecord } from "../scripts/worktree.ts";
@@ -29,6 +33,7 @@ import {
   runDoctor,
   runStartPreflightGate,
   runOverride,
+  resolveLiveCandidateSha,
   _internals,
   type CliOpts,
   type PreflightCliDeps,
@@ -155,6 +160,278 @@ test("stale-SHA fulfillment refuses resume for unblock/override/handoff answer",
   });
   assert.equal(stale.ok, false);
   if (!stale.ok) assert.equal(stale.code, "stale_sha");
+});
+
+test("queue nested throw persists RecoverySupervisor ownership", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pipeline-obs-queue-"));
+  try {
+    const sink = recoverySupervisorObservationSink(dir);
+    const deps: QueueDeps = {
+      listEligibleIssues: async () => [
+        { number: 1, title: "one", labels: ["pipeline:ready"], priorityScore: 100 },
+      ],
+      runPipeline: async () => {
+        throw new Error("nested timeout");
+      },
+      readRunCost: async () => null,
+      writeFile: async () => {},
+      autoFilePapercuts: async () => {},
+      autoFileCorrections: async () => {},
+      log: () => {},
+      clock: () => 1,
+      reportObservation: sink,
+    };
+    const opts: QueueOpts = {
+      maxIssues: 10,
+      budgetDollars: null,
+      concurrency: 1,
+      maxFailureRate: 1,
+      filters: {},
+      repoDir: "/fake/repo",
+      batchId: "batch-persist",
+    };
+    await runQueue(opts, deps);
+    const persisted = listPersistedOperationObservations(dir);
+    assert.ok(persisted.length >= 1);
+    assert.equal(persisted[0]!.owned, true);
+    assert.equal(persisted[0]!.complete, false);
+    assert.equal(persisted[0]!.human_owned, false);
+    assert.equal(persisted[0]!.form_id, "queue");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("release mechanical fault persists RecoverySupervisor ownership", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pipeline-obs-release-"));
+  try {
+    reportMechanicalFault(recoverySupervisorObservationSink(dir), {
+      operation: "release_prepare",
+      form_id: "release",
+      message: "gh failed",
+      fault: "mechanical",
+    });
+    const persisted = listPersistedOperationObservations(dir);
+    assert.equal(persisted.length, 1);
+    assert.equal(persisted[0]!.owned, true);
+    assert.equal(persisted[0]!.complete, false);
+    assert.equal(persisted[0]!.human_owned, false);
+    assert.equal(persisted[0]!.form_id, "release");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("runStartPreflightGate failure persists RecoverySupervisor ownership", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pipeline-obs-preflight-"));
+  try {
+    const failing: PreflightResult = {
+      schema_version: 1,
+      ok: false,
+      checks: [
+        {
+          id: "github-auth",
+          description: "auth",
+          status: "fail",
+          detail: "not logged in",
+          remediation: "gh auth login",
+        },
+      ],
+      ranAt: "2026-01-01T00:00:00Z",
+    };
+    const deps: PreflightCliDeps = {
+      runPreflight: async () => failing,
+      storePreflightResult: async () => {},
+      reportObservation: recoverySupervisorObservationSink(dir),
+    };
+    const orig = { log: console.log, error: console.error };
+    console.log = () => {};
+    console.error = () => {};
+    try {
+      const gate = await runStartPreflightGate(
+        { ...makeCfg(), doctor: { runOnStart: true, failFast: false } } as PipelineConfig,
+        {} as CliOpts,
+        deps,
+      );
+      assert.equal(gate.proceed, false);
+    } finally {
+      console.log = orig.log;
+      console.error = orig.error;
+    }
+    const persisted = listPersistedOperationObservations(dir);
+    assert.ok(persisted.length >= 1);
+    assert.equal(persisted[0]!.owned, true);
+    assert.equal(persisted[0]!.complete, false);
+    assert.ok(persisted[0]!.capability_request);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("fulfillTypedRequestAndValidateResume refuses when no pending request exists", async () => {
+  let answered = 0;
+  const result = await fulfillTypedRequestAndValidateResume(
+    {
+      repoDir: "/repo",
+      issueNumber: 7,
+      answer: "the answer",
+      actor: "alice",
+      candidateSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      resumeTarget: "override-or-unblock",
+    },
+    {
+      listHandoffs: async () => [],
+      answerAndPersistHandoff: async () => {
+        answered++;
+        throw new Error("must not persist a fabricated handoff");
+      },
+    },
+  );
+  assert.equal(answered, 0);
+  assert.equal(result.fulfilled, false);
+  assert.equal(result.handoff, null);
+  assert.equal(result.resume.ok, false);
+  if (!result.resume.ok) assert.equal(result.resume.code, "no_pending_request");
+});
+
+test("fulfillTypedRequestAndValidateResume refuses stale candidate SHA after persist", async () => {
+  const pending = answeredFulfillmentHandoff({
+    repoDir: "/repo",
+    issueNumber: 7,
+    answer: "pending",
+    actor: "alice",
+    candidateSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    resumeTarget: "override-or-unblock",
+  });
+  pending.status = "pending";
+  pending.answer = null;
+  pending.handoff_id = "h1";
+  const answeredHandoff = {
+    ...pending,
+    status: "answered" as const,
+    answer: {
+      decision: "answer" as const,
+      responder: "alice",
+      identity_source: "gh",
+      answer_text: "the answer",
+      answered_at: "2026-01-01T00:00:00Z",
+      payload_hash: "x",
+    },
+  };
+  const result = await fulfillTypedRequestAndValidateResume(
+    {
+      repoDir: "/repo",
+      issueNumber: 7,
+      answer: "the answer",
+      actor: "alice",
+      candidateSha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      resumeTarget: "override-or-unblock",
+    },
+    {
+      listHandoffs: async () => [pending],
+      answerAndPersistHandoff: async () => ({
+        ok: true,
+        duplicate: false,
+        advances_item: false,
+        handoff: answeredHandoff,
+      }),
+    },
+  );
+  assert.equal(result.fulfilled, true);
+  assert.equal(result.resume.ok, false);
+  if (!result.resume.ok) assert.equal(result.resume.code, "stale_sha");
+});
+
+test("resolveLiveCandidateSha returns the open PR head without network", async () => {
+  const sha = "c".repeat(40);
+  const resolved = await resolveLiveCandidateSha(makeCfg(), 7, {
+    getPrForIssue: async () => 99,
+    getPrDetail: async () => ({ head_sha: sha }) as never,
+  });
+  assert.equal(resolved, sha);
+});
+
+test("runUnblock refuses when no pending typed request exists", async () => {
+  let cleared = false;
+  const deps: RunUnblockDeps = {
+    getIssueDetail: async () => ({
+      number: 7,
+      type: "issue",
+      title: "t",
+      body: "b",
+      state: "open",
+      url: "u",
+      labels: ["pipeline:review-1", "blocked"],
+      comments: [],
+    }) as never,
+    postComment: async () => {},
+    clearBlocked: async () => {
+      cleared = true;
+    },
+    isKillSwitchActive: () => false,
+    getGhActor: async () => "alice",
+    getCandidateSha: async () => "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    fulfillTypedRequest: async () => ({
+      resume: {
+        ok: false,
+        reason: "no eligible current typed request to fulfill",
+        code: "no_pending_request",
+        advances_item: false,
+      },
+      handoff: null,
+      fulfilled: false,
+    }),
+  };
+  const origErr = console.error;
+  console.error = () => {};
+  const prev = process.exitCode;
+  try {
+    await _internals.runUnblock(makeCfg(), 7, "answer", 7, undefined, deps);
+  } finally {
+    console.error = origErr;
+    process.exitCode = prev;
+  }
+  assert.equal(cleared, false);
+});
+
+test("runUnblock passes the live candidate SHA into typed-request resume", async () => {
+  const liveSha = "d".repeat(40);
+  let seenSha: string | null | undefined;
+  const deps: RunUnblockDeps = {
+    getIssueDetail: async () => ({
+      number: 7,
+      type: "issue",
+      title: "t",
+      body: "b",
+      state: "open",
+      url: "u",
+      labels: ["pipeline:review-1", "blocked"],
+      comments: [],
+    }) as never,
+    postComment: async () => {},
+    clearBlocked: async () => {},
+    isKillSwitchActive: () => false,
+    getGhActor: async () => "alice",
+    getCandidateSha: async () => liveSha,
+    fulfillTypedRequest: async (input) => {
+      seenSha = input.candidateSha;
+      return {
+        resume: { ok: true, resume_target: "override-or-unblock", handoff_id: "h1" },
+        handoff: null,
+        fulfilled: true,
+      };
+    },
+  };
+  const origLog = console.log;
+  console.log = () => {};
+  const prev = process.exitCode;
+  try {
+    await _internals.runUnblock(makeCfg(), 7, "answer", 7, undefined, deps);
+  } finally {
+    console.log = origLog;
+    process.exitCode = prev;
+  }
+  assert.equal(seenSha, liveSha);
 });
 
 test("fulfillTypedRequestAndValidateResume answers a pending handoff then validates", async () => {

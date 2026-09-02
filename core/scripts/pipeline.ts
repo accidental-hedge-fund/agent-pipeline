@@ -46,7 +46,11 @@ import {
   transition,
 } from "./gh.ts";
 import { PipelineLock, isKillSwitchActive, isLivePlanningActive, tryAcquireLivePlanningMarker, runStateDir, withLock } from "./lock.ts";
-import { reportMechanicalFault, type ReportOperationObservation } from "./operation-observation.ts";
+import {
+  defaultRecoverySupervisorReport,
+  reportMechanicalFault,
+  type ReportOperationObservation,
+} from "./operation-observation.ts";
 import { fulfillTypedRequestAndValidateResume } from "./typed-request-resume.ts";
 import { findWrapperPidForIssue, isCoexistenceFailureEvidence } from "./loop/live-advance.ts";
 import { eventsTextHasGateUnavailable } from "./issue-readiness.ts";
@@ -4844,7 +4848,7 @@ async function main(): Promise<void> {
         }
       } catch (err) {
         const message = (err as Error).message;
-        reportMechanicalFault(undefined, {
+        reportMechanicalFault(defaultRecoverySupervisorReport, {
           operation: "release_ensure_tag",
           form_id: "release.ensure-tag",
           message,
@@ -4875,7 +4879,7 @@ async function main(): Promise<void> {
         }
       } catch (err) {
         const message = (err as Error).message;
-        reportMechanicalFault(undefined, {
+        reportMechanicalFault(defaultRecoverySupervisorReport, {
           operation: "release_finish",
           form_id: "release.finish",
           message,
@@ -4924,7 +4928,7 @@ async function main(): Promise<void> {
     } catch (err) {
       const message = (err as Error).message;
       if (!opts.dryRun) {
-        reportMechanicalFault(undefined, {
+        reportMechanicalFault(defaultRecoverySupervisorReport, {
           operation: "release_prepare",
           form_id: "release",
           message,
@@ -5795,7 +5799,7 @@ async function main(): Promise<void> {
       );
       console.log(JSON.stringify(outcome.result, null, 2));
       if (outcome.exitCode !== 0) {
-        reportMechanicalFault(undefined, {
+        reportMechanicalFault(defaultRecoverySupervisorReport, {
           operation: "factory_release_prepare",
           form_id: "factory-release.prepare",
           message: `factory-release prepare exit ${outcome.exitCode}`,
@@ -5805,7 +5809,7 @@ async function main(): Promise<void> {
       }
     } catch (err) {
       const message = (err as Error).message;
-      reportMechanicalFault(undefined, {
+      reportMechanicalFault(defaultRecoverySupervisorReport, {
         operation: "factory_release_prepare",
         form_id: "factory-release.prepare",
         message,
@@ -6029,7 +6033,7 @@ async function main(): Promise<void> {
         if (result.reinstall_hint) console.log(`  reinstall: ${result.reinstall_hint}`);
       }
       if (result.error && !opts.dryRun) {
-        reportMechanicalFault(undefined, {
+        reportMechanicalFault(defaultRecoverySupervisorReport, {
           operation: "engine_promote",
           form_id: "engine-promote",
           message: result.error,
@@ -6042,7 +6046,7 @@ async function main(): Promise<void> {
     } catch (err) {
       const message = (err as Error).message;
       if (!opts.dryRun) {
-        reportMechanicalFault(undefined, {
+        reportMechanicalFault(defaultRecoverySupervisorReport, {
           operation: "engine_promote",
           form_id: "engine-promote",
           message,
@@ -6523,7 +6527,6 @@ async function main(): Promise<void> {
       process.exit(2);
     }
     const batchId = new Date().toISOString().replace(/[:.]/g, "-");
-    const queueObservations: import("./operation-observation.ts").OperationObservation[] = [];
     try {
       await runQueue(
         {
@@ -6544,14 +6547,11 @@ async function main(): Promise<void> {
           papercuts: queueCfg.papercuts,
           corrections: queueCfg.corrections,
         },
-        {
-          ...realQueueDeps(queueCfg.repo_dir, opts.profile),
-          reportObservation: (obs) => queueObservations.push(obs),
-        },
+        realQueueDeps(queueCfg.repo_dir, opts.profile),
       );
     } catch (err) {
       const message = (err as Error).message;
-      reportMechanicalFault((obs) => queueObservations.push(obs), {
+      reportMechanicalFault(defaultRecoverySupervisorReport, {
         operation: "queue_batch",
         form_id: "queue",
         message,
@@ -7546,6 +7546,7 @@ const defaultPreflightCliDeps: PreflightCliDeps = {
   storePreflightResult,
   runHarnessSmoke,
   harnessSmokeDeps: () => realHarnessSmokeDeps(realDoctorDeps()),
+  reportObservation: defaultRecoverySupervisorReport,
 };
 
 /**
@@ -8570,6 +8571,28 @@ export function buildUnblockedComment(args: {
   return attestPipelineComment("unblocked", rendered);
 }
 
+/** Resolve the live candidate SHA (open PR head) for typed-request resume. */
+export async function resolveLiveCandidateSha(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  deps: {
+    getPrForIssue?: typeof getPrForIssue;
+    getPrDetail?: typeof getPrDetail;
+  } = {},
+): Promise<string | null> {
+  try {
+    const getPr = deps.getPrForIssue ?? getPrForIssue;
+    const getDetail = deps.getPrDetail ?? getPrDetail;
+    const prNumber = await getPr(cfg, issueNumber);
+    if (prNumber == null) return null;
+    const detail = await getDetail(cfg, prNumber);
+    const sha = String(detail.head_sha ?? "").trim().toLowerCase();
+    return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
+  } catch {
+    return null;
+  }
+}
+
 /** IO seam for {@link runUnblock} so unit tests inject fakes — no real gh. */
 export interface RunUnblockDeps {
   getIssueDetail: typeof getIssueDetail;
@@ -8586,6 +8609,7 @@ const defaultRunUnblockDeps: RunUnblockDeps = {
   getIssueDetail,
   postComment,
   clearBlocked,
+  getCandidateSha: resolveLiveCandidateSha,
 };
 
 async function runUnblock(
@@ -8688,6 +8712,8 @@ const defaultRunOverrideDeps: RunOverrideDeps = {
   silentTransition,
   runAdvance,
   getGhActor,
+  getCandidateSha: resolveLiveCandidateSha,
+  reportObservation: defaultRecoverySupervisorReport,
 };
 
 export async function runOverride(
