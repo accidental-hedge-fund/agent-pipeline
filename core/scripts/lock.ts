@@ -470,3 +470,20 @@ export function isLivePlanningActive(repo: string, issueNumber: number): boolean
     throw err;
   }
 }
+
+/** True when the unified issue-run lock file names a live PID. */
+export function isIssueRunLockLive(domain: string, issueNumber: number): boolean {
+  return isFilePidAlive(issueRunLockPath(domain, issueNumber));
+}
+
+/**
+ * Fenced live owner: issue-run lock with a live PID, or live-planning marker.
+ * Host-local only. Used by cleanup and remove-worktree (#1329).
+ */
+export function isFencedLiveOwner(input: {
+  domain: string;
+  issueNumber: number;
+  repo: string;
+}): boolean {
+  return isIssueRunLockLive(input.domain, input.issueNumber) || isLivePlanningActive(input.repo, input.issueNumber);
+}

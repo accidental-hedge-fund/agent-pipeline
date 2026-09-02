@@ -12,6 +12,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { promisify } from "node:util";
 import { getIssueStateAndLabels, getPrMergeState } from "./gh.ts";
+import { isFencedLiveOwner as defaultIsFencedLiveOwner } from "./lock.ts";
 import type { PipelineConfig } from "./types.ts";
 
 const execFileAsync = promisify(execFile);
@@ -1977,6 +1978,8 @@ export interface RemoveWorktreeResult {
 export interface RemoveWorktreeDeps {
   listOnDisk?: (cfg: PipelineConfig) => Promise<WorktreeRecord[]>;
   hasDirtyWorkdir?: (worktreePath: string) => Promise<boolean>;
+  /** Fenced live owner (issue-run lock or live-planning marker). --force cannot override. */
+  isFencedLiveOwner?: (issueNumber: number) => boolean | Promise<boolean>;
   /** pathOnDisk: true when the directory exists; false when git still has the
    *  entry registered but the directory is already gone (stale registration). */
   removeWorktree?: (cfg: PipelineConfig, issueNumber: number, slug: string, pathOnDisk: boolean, resolvedPath?: string, force?: boolean) => Promise<void>;
@@ -2121,6 +2124,20 @@ export async function removeWorktreeForIssue(
   const localOnlyFn =
     deps.hasLocalOnlyCommits ??
     ((c, p, b) => checkLocalOnlyCommits(c, p, b, { gitCmd: deps.gitCmd }));
+  const liveOwnerFn =
+    deps.isFencedLiveOwner ??
+    ((n: number) => defaultIsFencedLiveOwner({ domain: cfg.domain, issueNumber: n, repo: cfg.repo }));
+  if (await liveOwnerFn(issueNumber)) {
+    return {
+      removed: false,
+      dirty: false,
+      branch: null,
+      worktree: null,
+      error:
+        `refusing to remove worktree for issue #${issueNumber}: a fenced live owner ` +
+        `(issue-run lock or live-planning marker) holds the issue. --force does not override.`,
+    };
+  }
 
   const records = await listFn(cfg);
   // Legacy fallback for records with no underManagedRoot (test-injected, or a
@@ -2657,6 +2674,8 @@ export interface SweepDeps {
     resolvedPath?: string,
   ) => Promise<{ ok: true } | { ok: false; reason: string }>;
   pathExists: (p: string) => boolean;
+  /** Fenced live owner (issue-run lock or live-planning marker). */
+  isFencedLiveOwner?: (issueNumber: number) => boolean | Promise<boolean>;
 }
 
 /** Sweep-specific removal that verifies both worktree deregistration and
@@ -2712,6 +2731,7 @@ export async function sweepMergedWorktrees(
     getWorktreeHeadSha,
     removeWorktree: sweepRemoveWorktree,
     pathExists: fs.existsSync,
+    isFencedLiveOwner: (n) => defaultIsFencedLiveOwner({ domain: cfg.domain, issueNumber: n, repo: cfg.repo }),
     ...deps,
   };
 
@@ -2732,13 +2752,30 @@ export async function sweepMergedWorktrees(
   const skipped: Array<{ rec: WorktreeRecord; reason: string }> = [];
 
   for (const rec of candidates) {
-    if (!rec.branch || rec.issueNumber === undefined || !rec.slug) continue;
+    if (!rec.branch || rec.issueNumber === undefined || !rec.slug) {
+      skipped.push({ rec, reason: "unknown or unclassified worktree state" });
+      continue;
+    }
 
-    const mergeState = await d.getPrMergeState(cfg, rec.branch);
+    let mergeState: Awaited<ReturnType<SweepDeps["getPrMergeState"]>>;
+    try {
+      mergeState = await d.getPrMergeState(cfg, rec.branch);
+    } catch (err) {
+      skipped.push({
+        rec,
+        reason: `unknown or unclassified worktree state: ${(err as Error).message}`,
+      });
+      continue;
+    }
     if (!mergeState.merged) {
       if (mergeState.error !== undefined) {
         skipped.push({ rec, reason: `could not determine PR merge state: ${mergeState.error}` });
       }
+      continue;
+    }
+
+    if (d.isFencedLiveOwner && (await d.isFencedLiveOwner(rec.issueNumber))) {
+      skipped.push({ rec, reason: "fenced live owner (issue-run lock or live-planning marker)" });
       continue;
     }
 
@@ -2753,13 +2790,31 @@ export async function sweepMergedWorktrees(
       continue;
     }
 
-    const dirty = await d.hasDirtyWorkdir(rec.path);
+    let dirty: boolean;
+    try {
+      dirty = await d.hasDirtyWorkdir(rec.path);
+    } catch (err) {
+      skipped.push({
+        rec,
+        reason: `unknown or unclassified worktree state: ${(err as Error).message}`,
+      });
+      continue;
+    }
     if (dirty) {
       skipped.push({ rec, reason: "uncommitted changes" });
       continue;
     }
 
-    const localSha = await d.getWorktreeHeadSha(rec.path);
+    let localSha: string;
+    try {
+      localSha = await d.getWorktreeHeadSha(rec.path);
+    } catch (err) {
+      skipped.push({
+        rec,
+        reason: `unknown or unclassified worktree state: ${(err as Error).message}`,
+      });
+      continue;
+    }
     if (localSha && localSha !== mergeState.headSha) {
       skipped.push({
         rec,

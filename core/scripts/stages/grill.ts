@@ -14,6 +14,7 @@ import {
   removeLabel as ghRemoveLabel,
 } from "../gh.ts";
 import { invoke } from "../harness.ts";
+import { reportMechanicalFault } from "../operation-observation.ts";
 import type { PipelineConfig } from "../types.ts";
 import { DEFAULT_CONFIG } from "../types.ts";
 import {
@@ -155,6 +156,8 @@ export interface GrillDeps {
   writeStderr(text: string): void;
   /** Test seam: grill must never push to these. */
   callLog: string[];
+  /** RecoverySupervisor observation sink for admit faults. Dry-run/status must not write. */
+  reportObservation?: import("../operation-observation.ts").ReportOperationObservation;
 }
 
 export interface GrillCliInput extends GrillSelectorFlags {
@@ -826,6 +829,14 @@ export async function runGrill(input: GrillCliInput, deps: GrillDeps): Promise<n
         error: (err as Error).message,
         evidence: [...prior.evidence, "isolated failure"],
       };
+      if (!dryRun) {
+        reportMechanicalFault(deps.reportObservation, {
+          operation: "grill_admit",
+          form_id: "grill",
+          message: (err as Error).message,
+          fault: "mechanical",
+        });
+      }
       completed.add(id);
     }
   }

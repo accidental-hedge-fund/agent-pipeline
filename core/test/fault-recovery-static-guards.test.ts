@@ -8,6 +8,7 @@ import { readFileSync } from "node:fs";
 import {
   LEGACY_LIFECYCLE_SITE_INVENTORY,
   collectCommandLocalLifecycleExits,
+  collectReadOnlyRecoveryWrites,
   collectDirectStageLifecycleWrites,
   collectProviderIncidentDispatch,
   collectRetiredControllerImports,
@@ -43,6 +44,12 @@ test("command-local lifecycle exit fails the static guard", () => {
   const synthetic = `if (mechanical) { process.exit(1); }\n`;
   const hits = collectCommandLocalLifecycleExits(synthetic, "fixture.ts");
   assert.ok(hits.some((h) => /process.exit/.test(h.reason)));
+});
+
+test("read-only recovery write fails the isolation guard", () => {
+  const synthetic = `function status() { writeRecoveryEpisode({}); }\n`;
+  const hits = collectReadOnlyRecoveryWrites(synthetic, "fixture.ts");
+  assert.ok(hits.some((h) => /writeRecoveryEpisode/.test(h.reason)));
 });
 
 test("direct stage-label write fails the static guard", () => {

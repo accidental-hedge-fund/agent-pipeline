@@ -17,6 +17,10 @@ import {
   autoFilePapercuts as realAutoFilePapercuts,
   realAutoFileDeps,
 } from "./papercut.ts";
+import {
+  reportMechanicalFault,
+  type ReportOperationObservation,
+} from "../operation-observation.ts";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -151,6 +155,8 @@ export interface QueueDeps {
   }): Promise<void>;
   log(msg: string): void;
   clock(): number;
+  /** RecoverySupervisor observation sink. Nested faults stay owned. */
+  reportObservation?: ReportOperationObservation;
 }
 
 // ---------------------------------------------------------------------------
@@ -670,7 +676,18 @@ async function runQueueUnlocked(opts: QueueOpts, deps: QueueDeps): Promise<void>
         durationMs: deps.clock() - slotStart,
         error: err instanceof Error ? err.message : String(err),
       }))
-      .then((result) => ({ result, issueNumber: result.issueNumber }));
+      .then((result) => {
+        if (result.finalState === "error" || result.error) {
+          const message = result.error ?? `nested drive #${result.issueNumber} exited nonzero (${result.finalState})`;
+          reportMechanicalFault(deps.reportObservation, {
+            operation: "queue_nested_drive",
+            form_id: "queue",
+            message,
+            fault: /timeout/i.test(message) ? "timeout" : "mechanical",
+          });
+        }
+        return { result, issueNumber: result.issueNumber };
+      });
     active.set(issue.number, p);
     deps.log(
       `[pipeline queue] #${issue.number}: started (${active.size}/${opts.concurrency} slots used)`,

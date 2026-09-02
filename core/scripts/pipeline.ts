@@ -46,6 +46,8 @@ import {
   transition,
 } from "./gh.ts";
 import { PipelineLock, isKillSwitchActive, isLivePlanningActive, tryAcquireLivePlanningMarker, runStateDir, withLock } from "./lock.ts";
+import { reportMechanicalFault, type ReportOperationObservation } from "./operation-observation.ts";
+import { fulfillTypedRequestAndValidateResume } from "./typed-request-resume.ts";
 import { findWrapperPidForIssue, isCoexistenceFailureEvidence } from "./loop/live-advance.ts";
 import { eventsTextHasGateUnavailable } from "./issue-readiness.ts";
 import {
@@ -4841,8 +4843,15 @@ async function main(): Promise<void> {
           );
         }
       } catch (err) {
-        console.error(`pipeline release ensure-tag: ${(err as Error).message}`);
-        process.exit(1);
+        const message = (err as Error).message;
+        reportMechanicalFault(undefined, {
+          operation: "release_ensure_tag",
+          form_id: "release.ensure-tag",
+          message,
+          fault: "mechanical",
+        });
+        console.error(`pipeline release ensure-tag: ${message}`);
+        process.exitCode = 1;
       }
       return;
     }
@@ -4865,8 +4874,15 @@ async function main(): Promise<void> {
           );
         }
       } catch (err) {
-        console.error(`pipeline release finish: ${(err as Error).message}`);
-        process.exit(1);
+        const message = (err as Error).message;
+        reportMechanicalFault(undefined, {
+          operation: "release_finish",
+          form_id: "release.finish",
+          message,
+          fault: "mechanical",
+        });
+        console.error(`pipeline release finish: ${message}`);
+        process.exitCode = 1;
       }
       return;
     }
@@ -4906,8 +4922,17 @@ async function main(): Promise<void> {
         console.log(JSON.stringify(result, null, 2));
       }
     } catch (err) {
-      console.error(`pipeline release: ${(err as Error).message}`);
-      process.exit(1);
+      const message = (err as Error).message;
+      if (!opts.dryRun) {
+        reportMechanicalFault(undefined, {
+          operation: "release_prepare",
+          form_id: "release",
+          message,
+          fault: "mechanical",
+        });
+      }
+      console.error(`pipeline release: ${message}`);
+      process.exitCode = 1;
     }
     return;
   }
@@ -5047,6 +5072,7 @@ async function main(): Promise<void> {
       process.exitCode = 1;
       return;
     }
+    const grillDeps = realGrillDeps(grillCfg);
     const exitCode = await runGrill(
       {
         issue: opts.issue,
@@ -5060,9 +5086,20 @@ async function main(): Promise<void> {
         runId: opts.runId,
         status: subVerb === "status",
       },
-      realGrillDeps(grillCfg),
+      grillDeps,
     );
-    if (exitCode !== 0) process.exit(exitCode);
+    if (exitCode === 2) process.exit(2);
+    if (exitCode !== 0) {
+      if (!opts.dryRun && subVerb !== "status") {
+        reportMechanicalFault(grillDeps.reportObservation, {
+          operation: "grill_admit",
+          form_id: "grill",
+          message: `pipeline grill exited ${exitCode}`,
+          fault: "mechanical",
+        });
+      }
+      process.exitCode = exitCode;
+    }
     return;
   }
 
@@ -5757,10 +5794,25 @@ async function main(): Promise<void> {
         }),
       );
       console.log(JSON.stringify(outcome.result, null, 2));
-      if (outcome.exitCode !== 0) process.exitCode = outcome.exitCode;
+      if (outcome.exitCode !== 0) {
+        reportMechanicalFault(undefined, {
+          operation: "factory_release_prepare",
+          form_id: "factory-release.prepare",
+          message: `factory-release prepare exit ${outcome.exitCode}`,
+          fault: "mechanical",
+        });
+        process.exitCode = outcome.exitCode;
+      }
     } catch (err) {
-      console.error(`pipeline factory-release prepare: ${(err as Error).message}`);
-      process.exit(1);
+      const message = (err as Error).message;
+      reportMechanicalFault(undefined, {
+        operation: "factory_release_prepare",
+        form_id: "factory-release.prepare",
+        message,
+        fault: "mechanical",
+      });
+      console.error(`pipeline factory-release prepare: ${message}`);
+      process.exitCode = 1;
     }
     return;
   }
@@ -5976,10 +6028,29 @@ async function main(): Promise<void> {
         for (const s of result.steps) console.log(`  - ${s}`);
         if (result.reinstall_hint) console.log(`  reinstall: ${result.reinstall_hint}`);
       }
-      if (result.error) process.exit(1);
+      if (result.error && !opts.dryRun) {
+        reportMechanicalFault(undefined, {
+          operation: "engine_promote",
+          form_id: "engine-promote",
+          message: result.error,
+          fault: "mechanical",
+        });
+        process.exitCode = 1;
+      } else if (result.error) {
+        process.exitCode = 1;
+      }
     } catch (err) {
-      console.error(`pipeline engine-promote: ${(err as Error).message}`);
-      process.exit(1);
+      const message = (err as Error).message;
+      if (!opts.dryRun) {
+        reportMechanicalFault(undefined, {
+          operation: "engine_promote",
+          form_id: "engine-promote",
+          message,
+          fault: "mechanical",
+        });
+      }
+      console.error(`pipeline engine-promote: ${message}`);
+      process.exitCode = 1;
     }
     return;
   }
@@ -6434,7 +6505,7 @@ async function main(): Promise<void> {
       queueCfg = resolveConfig({ repoPath: opts.repoPath, baseBranch: opts.base, profile: opts.profile });
     } catch (err) {
       console.error(`pipeline queue: config error: ${(err as Error).message}`);
-      process.exit(1);
+      process.exit(2);
     }
     const { runQueue, realQueueDeps, validateQueueOpts } = await import("./stages/queue.ts");
     // Precedence: CLI flag > config value > built-in default.
@@ -6452,6 +6523,7 @@ async function main(): Promise<void> {
       process.exit(2);
     }
     const batchId = new Date().toISOString().replace(/[:.]/g, "-");
+    const queueObservations: import("./operation-observation.ts").OperationObservation[] = [];
     try {
       await runQueue(
         {
@@ -6472,11 +6544,21 @@ async function main(): Promise<void> {
           papercuts: queueCfg.papercuts,
           corrections: queueCfg.corrections,
         },
-        realQueueDeps(queueCfg.repo_dir, opts.profile),
+        {
+          ...realQueueDeps(queueCfg.repo_dir, opts.profile),
+          reportObservation: (obs) => queueObservations.push(obs),
+        },
       );
     } catch (err) {
-      console.error(`pipeline queue: ${(err as Error).message}`);
-      process.exit(1);
+      const message = (err as Error).message;
+      reportMechanicalFault((obs) => queueObservations.push(obs), {
+        operation: "queue_batch",
+        form_id: "queue",
+        message,
+        fault: "mechanical",
+      });
+      console.error(`pipeline queue: ${message}`);
+      process.exitCode = 1;
     }
     return;
   }
@@ -7158,7 +7240,8 @@ async function main(): Promise<void> {
   // no planning/implementation/review tokens are consumed.
   const gate = await runStartPreflightGate(cfg, opts);
   if (!gate.proceed) {
-    process.exit(1);
+    process.exitCode = 1;
+    return;
   }
 
   // Resolve N → issue number (after preflight so env is confirmed healthy).
@@ -7444,6 +7527,10 @@ async function runConfigRepoMapCommand(args: string[], opts: CliOpts): Promise<v
 export interface PreflightCliDeps {
   runPreflight: typeof runPreflight;
   storePreflightResult: typeof storePreflightResult;
+  /** RecoverySupervisor observation sink. Standalone doctor must not call this. */
+  reportObservation?: ReportOperationObservation;
+  /** Test seam: recovery episode writes. Standalone doctor must not call this. */
+  writeRecoveryEpisode?: (episode: unknown) => void;
   /** Optional: injected harness-smoke runner for unit tests (#780). */
   runHarnessSmoke?: (
     cfg: PipelineConfig,
@@ -7566,6 +7653,23 @@ export async function runStartPreflightGate(
     console.error(
       `[pipeline] preflight failed — aborting before planning. Fix the issues above (or run \`pipeline doctor\`) and re-run.`,
     );
+    const failing = result.checks.filter((c) => c.status === "fail");
+    const capabilityCheck = failing.find((c) =>
+      /^(github-auth|repo-access|git-push-auth|cli:|harness:)/.test(c.id),
+    );
+    reportMechanicalFault(deps.reportObservation, {
+      operation: "run_start_preflight",
+      form_id: "advance",
+      message: failing.map((c) => `${c.id}: ${c.detail}`).join("; ") || "preflight failed",
+      fault: capabilityCheck ? "capability" : "mechanical",
+      capability_request: capabilityCheck
+        ? {
+            kind: "capability",
+            capability: capabilityCheck.id,
+            detail: capabilityCheck.remediation ?? capabilityCheck.detail,
+          }
+        : null,
+    });
     return { proceed: false, result };
   }
   return { proceed: true, result };
@@ -8471,6 +8575,11 @@ export interface RunUnblockDeps {
   getIssueDetail: typeof getIssueDetail;
   postComment: typeof postComment;
   clearBlocked: typeof clearBlocked;
+  isKillSwitchActive?: (domain: string) => boolean;
+  getGhActor?: typeof getGhActor;
+  getCandidateSha?: (cfg: PipelineConfig, issueNumber: number) => Promise<string | null>;
+  fulfillTypedRequest?: typeof fulfillTypedRequestAndValidateResume;
+  reportObservation?: ReportOperationObservation;
 }
 
 const defaultRunUnblockDeps: RunUnblockDeps = {
@@ -8487,6 +8596,13 @@ async function runUnblock(
   runStoreDeps: RunStoreDeps = defaultRunStoreDeps,
   deps: RunUnblockDeps = defaultRunUnblockDeps,
 ): Promise<void> {
+  const killSwitch = deps.isKillSwitchActive ?? ((domain: string) => isKillSwitchActive(domain));
+  if (killSwitch(cfg.domain)) {
+    console.error(
+      `pipeline: kill switch is active (/tmp/pipeline-${cfg.domain}.disabled). Remove it to re-enable.`,
+    );
+    return;
+  }
   const detail = await deps.getIssueDetail(cfg, issueNumber);
   if (!isBlocked(detail.labels)) {
     console.log(`#${issueNumber}: not blocked — nothing to do.`);
@@ -8495,6 +8611,27 @@ async function runUnblock(
   const stage = pickStage(detail.labels) ?? "(unknown)";
   const ts = new Date().toISOString().replace(/\.\d+Z$/, "Z");
   const body = buildUnblockedComment({ stage, ts, answer });
+  const actor = (await (deps.getGhActor ?? getGhActor)()) ?? "operator";
+  const candidateSha = deps.getCandidateSha
+    ? await deps.getCandidateSha(cfg, issueNumber)
+    : null;
+  const fulfill = deps.fulfillTypedRequest ?? fulfillTypedRequestAndValidateResume;
+  const typed = await fulfill({
+    repoDir: cfg.repo_dir,
+    issueNumber,
+    answer,
+    actor,
+    candidateSha,
+    resumeTarget: "override-or-unblock",
+    blockedStage: stage,
+  });
+  if (!typed.resume.ok) {
+    console.error(
+      `[pipeline] #${issueNumber}: typed-request resume refused (${typed.resume.code}): ${typed.resume.reason}`,
+    );
+    process.exitCode = 1;
+    return;
+  }
   await deps.postComment(cfg, issueNumber, body);
   await deps.clearBlocked(cfg, issueNumber);
   await appendBlockerCleared(cfg.repo_dir, issueNumber, originalNumber, runStoreDeps);
@@ -8538,6 +8675,10 @@ export interface RunOverrideDeps {
   getGhActor?: typeof getGhActor;
   /** Injectable clock for expiry fields (#693). */
   now?: () => Date;
+  isKillSwitchActive?: (domain: string) => boolean;
+  getCandidateSha?: (cfg: PipelineConfig, issueNumber: number) => Promise<string | null>;
+  fulfillTypedRequest?: typeof fulfillTypedRequestAndValidateResume;
+  reportObservation?: ReportOperationObservation;
 }
 
 const defaultRunOverrideDeps: RunOverrideDeps = {
@@ -8566,6 +8707,14 @@ export async function runOverride(
       "pipeline: --override cannot be combined with --dry-run — --override always records an audited disposition.",
     );
     process.exitCode = 2;
+    return;
+  }
+
+  const killSwitch = deps.isKillSwitchActive ?? isKillSwitchActive;
+  if (killSwitch(cfg.domain)) {
+    console.error(
+      `pipeline: kill switch is active (/tmp/pipeline-${cfg.domain}.disabled). Remove it to re-enable.`,
+    );
     return;
   }
 
@@ -8827,7 +8976,40 @@ export async function runOverride(
       `[pipeline] #${issueNumber}: needs-human → ${to} (resuming the round that hit the ceiling)`,
     );
   }
-  await deps.runAdvance(cfg, issueNumber, toAdvanceOpts(opts));
+
+  const candidateSha = deps.getCandidateSha
+    ? await deps.getCandidateSha(cfg, issueNumber)
+    : null;
+  const fulfill = deps.fulfillTypedRequest ?? fulfillTypedRequestAndValidateResume;
+  const typed = await fulfill({
+    repoDir: cfg.repo_dir,
+    issueNumber,
+    answer: validated.explanation,
+    actor: actor ?? "operator",
+    candidateSha,
+    resumeTarget: "override-or-unblock",
+    blockedStage: stage,
+  });
+  if (!typed.resume.ok) {
+    console.error(
+      `[pipeline] #${issueNumber}: typed-request resume refused (${typed.resume.code}): ${typed.resume.reason}`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+
+  try {
+    await deps.runAdvance(cfg, issueNumber, toAdvanceOpts(opts));
+  } catch (err) {
+    reportMechanicalFault(deps.reportObservation, {
+      operation: "override_resume",
+      form_id: "override",
+      message: (err as Error).message,
+      fault: "mechanical",
+    });
+    console.error(`pipeline override: ${(err as Error).message}`);
+    process.exitCode = 1;
+  }
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
