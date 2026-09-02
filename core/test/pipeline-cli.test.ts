@@ -734,6 +734,31 @@ test("classifyTrainAdvanceLabels (#1074): no evidence keeps exit code, invents n
   }
 });
 
+test("classifyTrainAdvanceLabels (#1333): recovery_exhausted stop does not fail an independent R2D sibling", async () => {
+  const { classifyTrainAdvanceLabels } = await import("../scripts/pipeline.ts");
+  const { scopeTrainAdvanceEvidenceForIssue } = await import(
+    "../scripts/stages/train-advance-stop-reason.ts"
+  );
+  const scoped = scopeTrainAdvanceEvidenceForIssue(
+    {
+      stopReason: "recovery_exhausted",
+      blockedClass: "recovery_exhausted",
+      blockedIssue: 10,
+    },
+    11,
+  );
+  const out = classifyTrainAdvanceLabels(
+    { labels: ["pipeline:ready-to-deploy"] },
+    0,
+    scoped,
+    11,
+  );
+  assert.equal(out.ok, true);
+  if (out.ok) {
+    assert.equal(out.terminal, "ready-to-deploy");
+  }
+});
+
 test("classifyTrainAdvanceLabels (#1074): blocked class on needs-human diagnostic", async () => {
   const { classifyTrainAdvanceLabels } = await import("../scripts/pipeline.ts");
   const out = classifyTrainAdvanceLabels(

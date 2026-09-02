@@ -4751,7 +4751,7 @@ test("regression (#787): repeated identical evidence stops the run at repeated_e
   );
 });
 
-test("regression (#787): a non-run_fatal class whose budget exhausts stops with reason recovery_exhausted", async () => {
+test("regression (#787/#1333): a non-run_fatal class whose budget exhausts enters Cooling not a terminal stop", async () => {
   const workflowState = DEFAULT_RECOVERY_POLICY["workflow-state"];
   const contract = testContract({
     recovery_policy: {
@@ -4797,8 +4797,13 @@ test("regression (#787): a non-run_fatal class whose budget exhausts stops with 
     { runId: "run-1", engine: "claude" },
   );
 
-  assert.equal(result.stop?.reason, "recovery_exhausted");
-  assert.equal(result.stop?.theme, "workflow-state");
+  assert.equal(result.stop, null, "mechanical exhaustion must not be a terminal run stop");
+  assert.equal(result.cooling?.reason, "strategy_cursor_exhausted");
+  assert.equal(result.cooling?.theme, "workflow-state");
+  assert.equal(result.cooling?.historical_evidence, "recovery_exhausted");
+  const cooled = await readLedger(deps, "run-1");
+  assert.equal(cooled.stop, null);
+  assert.equal(cooled.cooling?.reason, "strategy_cursor_exhausted");
   assert.equal(recoveryCalls, 1, "exactly the budgeted attempt executed");
 });
 

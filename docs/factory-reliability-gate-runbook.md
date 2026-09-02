@@ -143,6 +143,13 @@ The section names:
 | **Stable exclusions** | Typed request, external wait, or cancellation only when the versioned pack manifest declares that expected outcome. They stay separately counted. |
 | **Integrity counts** | Missing correlation, contradictory parent/child identities, missing required entry-point coverage, missing #1301 live train linkage, missing #1333 lifecycle coverage. These are never exclusions. |
 
+`covered_lifecycle_classes` come from executed universal-fault-recovery-matrix
+rows on the adapter-contract, installed-CLI, and host-conformance layers.
+Helper fixtures that stamp all five required classes without those rows fail
+promotion as missing required coverage, not as a stable exclusion. Mechanical
+exhaustion is owned Cooling (or an external-condition wait), not a human hold
+and not a terminal supervisor STOP.
+
 Verified completion requires exact-candidate postcondition proof. Process exit,
 `run_complete`, and issue closure are not success.
 
@@ -609,8 +616,9 @@ pipeline factory-gate --for 1.30.0 --from-run <loop-run-id> \
 - **GitHub ready-to-deploy overlay (#1297):** `--from-run` (and prepare, which scores
   through that path) counts a pack item as clean-ready when live GitHub shows
   `pipeline:ready-to-deploy` and the **bound** PR checks are green, even if the
-  durable ledger still says `blocked` with `stop.reason=recovery_exhausted`.
-  Operators do not delete `ledger.stop` to score throughput. Missing GitHub,
+  durable ledger still says `blocked` with historical `recovery_exhausted`
+  evidence or owned Cooling. Operators do not delete `ledger.stop` to score
+  throughput. Live mechanical exhaustion is Cooling, not a human-owned STOP. Missing GitHub,
   an unbound PR, pending/failed checks, and `needs-human` without R2D stay
   not clean-ready. `startLoop` scoring stays ledger-only.
 - **Observation required:** overall `pass: true` requires every **required-live**

@@ -681,6 +681,20 @@ export interface LoopMergeBarrier {
   set_at: string;
 }
 
+/**
+ * Owned Cooling for strategy-cursor / mechanical exhaustion (#1333).
+ * Not a terminal run stop, human hold, or ownerless exit. Historical
+ * `recovery_exhausted` may remain as evidence on older ledgers.
+ */
+export interface LoopCoolingRecord {
+  reason: "strategy_cursor_exhausted" | "mechanical_exhaustion";
+  time: string;
+  item_id?: string;
+  theme?: string;
+  /** Historical evidence token only — not a lifecycle STOP. */
+  historical_evidence?: "recovery_exhausted";
+}
+
 export interface LoopStopRecord {
   reason:
     | "recovery_exhausted"
@@ -878,6 +892,11 @@ export interface LoopLedger {
   consecutive_blocked: number;
   merge_barrier: LoopMergeBarrier | null;
   stop: LoopStopRecord | null;
+  /**
+   * Owned Cooling when strategy-cursor exhaustion is current. Absent on
+   * pre-#1333 ledgers. Does not replace a true non-exhaustion `stop`.
+   */
+  cooling?: LoopCoolingRecord | null;
   last_native_goal_check: LoopNativeGoalCheck | null;
   last_reconciliation: LoopReconciliation | null;
   reconciliation_sequence: number;

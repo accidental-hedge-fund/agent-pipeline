@@ -2058,9 +2058,11 @@ export function validateReleaseEligibleFrgEvidence(
       evidence.composition?.missing?.length
         ? ` missing composition=[${evidence.composition.missing.join(", ")}]`
         : "";
+    const slo = uniqueOperationSloFailure(evidence.operation_reliability ?? null);
     throw new Error(
       `FRG release-eligibility validation failed for ${expected}: ` +
         `pass=${evidence.pass} releaseEligible=false` +
+        (slo ? ` ${slo}` : "") +
         missing,
     );
   }
@@ -3566,6 +3568,11 @@ export interface ComputeFrgInput {
   unique_operations?: UniqueOperationAttempt[];
   unique_operation_manifest?: UniqueOperationManifest;
   /**
+   * Overlay for unique-operation matrix coverage. `undefined` reads the live
+   * #1333 inventory. Tests pass `[]` to prove stamped helper coverage fails.
+   */
+  matrix_covered_lifecycle_classes?: readonly string[] | null;
+  /**
    * Ignored on the production/release-eligible path. The section is always
    * derived from durable `unique_operations` (or the test-only fixture below).
    * A caller-supplied precomputed report cannot mint release-eligible evidence.
@@ -3744,6 +3751,7 @@ export function computeFrgEvidence(input: ComputeFrgInput): FrgEvidence {
       composition_false_human_count: input.false_human_authority_count ?? 0,
       candidate_sha: scoredCandidateSha,
       release_identity: version,
+      matrix_covered_lifecycle_classes: input.matrix_covered_lifecycle_classes,
     });
   let integrity = buildFrgIntegrity(scoreboard, composition, packProvenance);
 

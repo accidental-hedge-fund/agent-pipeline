@@ -584,7 +584,7 @@ export async function resumeRecoveryExhaustedTerminalCatchUp(
   input: ReconcileInput,
 ): Promise<void> {
   const ledger = await readLedger(deps, input.runId);
-  if (ledger.stop?.reason !== "recovery_exhausted") return;
+  if (ledger.stop?.reason !== "recovery_exhausted" && !ledger.cooling) return;
 
   const items: LoopLedger["items"] = { ...ledger.items };
   const repaired: Array<{ id: string; from: LoopItemState; to: LoopItemState }> = [];

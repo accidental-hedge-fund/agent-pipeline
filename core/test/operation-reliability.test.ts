@@ -485,6 +485,7 @@ test("missing #1333 coverage is integrity failure not exclusion", () => {
         covered_lifecycle_classes: [],
         required_lifecycle_classes: ["mechanical"],
       },
+      matrix_covered_lifecycle_classes: [],
     }),
   );
   assert.ok(evidence.operation_reliability!.integrity.missing_required_coverage > 0);

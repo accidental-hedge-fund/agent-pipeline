@@ -1918,6 +1918,51 @@ test("train (#1074): exit-only advance error does not invent a stop class", asyn
   assert.match(item?.error ?? "", /exited with code 1/);
 });
 
+test("train (#1333): nested recovery_exhausted does not STOP independent R2D sibling", async () => {
+  const logs: string[] = [];
+  const deps = makeDeps({
+    log(msg) {
+      logs.push(msg);
+    },
+    async advanceWave(issueList) {
+      const out: AdvanceWaveResult = new Map();
+      for (const n of issueList) {
+        if (n === 10) {
+          out.set(n, {
+            ok: false,
+            error: `advance failed for #${n}: recovery_exhausted on #${n}`,
+          });
+        } else {
+          const issues = (deps as unknown as { _issues: Map<number, TrainIssueSnapshot> })._issues;
+          issues.get(n)!.labels = ["pipeline:ready-to-deploy"];
+          out.set(n, {
+            ok: true,
+            terminal: "ready-to-deploy",
+            labels: ["pipeline:ready-to-deploy"],
+          });
+        }
+      }
+      return out;
+    },
+  });
+  deps.seedIssue(snap(10, "mechanical exhaustion"));
+  deps.seedIssue(snap(11, "independent ready"));
+  deps.seedPr(10, 110);
+  deps.seedPr(11, 111);
+
+  const result = await runTrain(baseOpts({ issues: [10, 11], merge: true }), deps);
+  assert.ok(deps.mergeCalls.includes(111), "independent R2D sibling must continue");
+  assert.ok(!deps.mergeCalls.includes(110), "exhausted item must not merge");
+  const exhausted = result.status.items.find((item) => item.issue === 10);
+  const sibling = result.status.items.find((item) => item.issue === 11);
+  assert.match(exhausted?.error ?? "", /recovery_exhausted/);
+  assert.equal(sibling?.integrated, true);
+  assert.ok(
+    logs.some((line) => /recovery_exhausted/.test(line)),
+    "diagnostic text may still quote recovery_exhausted",
+  );
+});
+
 test("train (#1074): recovery_exhausted class + issue in held item error", async () => {
   const deps = makeDeps({
     async advanceWave(issueList) {

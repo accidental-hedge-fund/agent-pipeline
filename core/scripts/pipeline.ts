@@ -3674,10 +3674,11 @@ export function classifyTrainAdvanceLabels(
   // current failure — R2D label flicker must not merge it (#1095 review-2).
   // Recovered blocks have itemTerminal "ready" (or no remaining block
   // fields). #1074 still forbids masking a real stop / engine failure.
+  const mechanicalExhaustionStop = merged.stopReason === "recovery_exhausted";
   const currentFailure =
     exit !== 0 ||
     !!merged.engineMessage ||
-    !!merged.stopReason;
+    (!!merged.stopReason && !mechanicalExhaustionStop);
   const leftoverItemBlock =
     !!merged.blockedClass ||
     !!merged.blockerKind ||
@@ -3832,7 +3833,8 @@ export async function advanceWaveThroughLoop(
   const waveEvidence = extractTrainAdvanceLoopEvidence({
     events,
     stopReason: driveStopReason,
-    exitCode: engineFailed ? 1 : driveStopReason ? 1 : 0,
+    exitCode:
+      engineFailed ? 1 : driveStopReason && driveStopReason !== "recovery_exhausted" ? 1 : 0,
     engineMessage: engineFailed,
   });
 
@@ -3840,8 +3842,10 @@ export async function advanceWaveThroughLoop(
   if (linkedLoop) out.loopRun = linkedLoop;
   for (const issue of issues) {
     const scoped = scopeTrainAdvanceEvidenceForIssue(waveEvidence, issue);
+    const waveFailed =
+      !!engineFailed || (!!driveStopReason && driveStopReason !== "recovery_exhausted");
     const exitForClassify =
-      engineFailed || driveStopReason || (scoped.exitCode != null && scoped.exitCode !== 0)
+      waveFailed || (scoped.exitCode != null && scoped.exitCode !== 0)
         ? scoped.exitCode != null && scoped.exitCode !== 0
           ? scoped.exitCode
           : 1
