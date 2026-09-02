@@ -13,6 +13,7 @@ import {
   type RequiredCheck,
 } from "../scripts/stages/merge.ts";
 import {
+  MERGE_COOLING_MS,
   MERGE_OPERATION_INVARIANT,
   assertOperatorMergeEnvelope,
   bindMergeClaim,
@@ -107,12 +108,13 @@ function liveMerged(head = HEAD, oid = MERGE_OID): MergeRemoteObservation {
 function supervision(
   store: ReturnType<typeof memoryMergeClaimStore>,
   opts: {
-    live?: MergeRemoteObservation;
+    live?: MergeRemoteObservation | (() => MergeRemoteObservation);
     contained?: boolean;
     envelope?: MergeSupervisionContext["envelope"];
     crashBeforeSubmit?: () => void;
     crashAfterSubmit?: () => void;
     observe?: () => Promise<MergeRemoteObservation>;
+    now?: () => Date;
   } = {},
 ): MergeSupervisionContext {
   return {
@@ -122,7 +124,12 @@ function supervision(
     envelope: opts.envelope ?? "pipeline merge",
     actionIdentity: "pipeline merge 42",
     claimStore: store,
-    observeMergedPr: opts.observe ?? (async () => opts.live ?? liveOpen()),
+    observeMergedPr:
+      opts.observe ??
+      (async () => {
+        const src = opts.live;
+        return typeof src === "function" ? src() : (src ?? liveOpen());
+      }),
     async fetchBase() {},
     async baseTip() {
       return "d".repeat(40);
@@ -132,6 +139,7 @@ function supervision(
     },
     crashBeforeSubmit: opts.crashBeforeSubmit,
     crashAfterSubmit: opts.crashAfterSubmit,
+    now: opts.now,
   };
 }
 
@@ -181,18 +189,20 @@ test("1.2 merge is refused if the exact-candidate claim is not persisted", async
 
 test("1.2 claim is bound before ghPrMerge", async () => {
   const store = memoryMergeClaimStore();
+  let live = liveOpen();
   const deps = makeMergeDeps({
-    supervision: supervision(store, { live: liveOpen() }),
+    supervision: supervision(store, { live: () => live, contained: true }),
     async ghPrMerge(pr, headRefOid) {
       const claim = await store.load(mergeClaimKey(REPO, pr));
       assert.ok(claim, "claim must exist before ghPrMerge");
-      assert.equal(claim!.outcome, "started");
+      assert.equal(claim!.outcome, "submitted");
       assert.equal(claim!.inspected_head, headRefOid);
       assert.equal(claim!.repository, REPO);
       assert.equal(claim!.base, "main");
       assert.deepEqual(claim!.frozen_issue_scope, [100]);
       assert.equal(claim!.pr, 42);
       assert.equal(claim!.action_identity, "pipeline merge 42");
+      live = liveMerged();
       deps.mergeCalls.push({ pr, headRefOid });
     },
   });
@@ -204,9 +214,10 @@ test("1.2 claim is bound before ghPrMerge", async () => {
 
 test("1.3 claim binds MERGEABLE+CLEAN head, not an earlier UNKNOWN read", async () => {
   const store = memoryMergeClaimStore();
+  let live = liveOpen(HEAD2);
   let views = 0;
   const deps = makeMergeDeps({
-    supervision: supervision(store, { live: liveOpen(HEAD2) }),
+    supervision: supervision(store, { live: () => live, contained: true }),
     async ghPrView() {
       views += 1;
       if (views === 1) {
@@ -221,6 +232,10 @@ test("1.3 claim binds MERGEABLE+CLEAN head, not an earlier UNKNOWN read", async 
         mergeStateStatus: "CLEAN",
         headRefOid: HEAD2,
       };
+    },
+    async ghPrMerge(pr, headRefOid) {
+      live = liveMerged(HEAD2);
+      deps.mergeCalls.push({ pr, headRefOid });
     },
   });
   await mergePr(42, deps);
@@ -309,14 +324,19 @@ test("2.3 stale head refuses merge under the old claim SHA", async () => {
   });
   assert.equal(reason, "head_drift");
 
+  let live = liveOpen(HEAD2);
   const deps = makeMergeDeps({
-    supervision: supervision(store, { live: liveOpen(HEAD2) }),
+    supervision: supervision(store, { live: () => live, contained: true }),
     async ghPrView() {
       return {
         mergeable: "MERGEABLE",
         mergeStateStatus: "CLEAN",
         headRefOid: HEAD2,
       };
+    },
+    async ghPrMerge(pr, headRefOid) {
+      live = liveMerged(HEAD2);
+      deps.mergeCalls.push({ pr, headRefOid });
     },
   });
   await mergePr(42, deps);
@@ -469,4 +489,118 @@ test("decideMergeReplay: complete claim plus merged+contained is known_complete"
   });
   assert.equal(decision.action, "complete");
   assert.equal(decision.certainty, "known_complete");
+});
+
+test("decideMergeReplay: complete claim plus merged-but-not-contained waits", () => {
+  const claim: MergeClaim = bindMergeClaim({
+    repository: REPO,
+    base: "main",
+    frozenIssueScope: [100],
+    pr: 42,
+    inspectedHead: HEAD,
+    actionIdentity: "pipeline merge 42",
+  });
+  const decision = decideMergeReplay({
+    claim: { ...claim, outcome: "complete" },
+    live: liveMerged(),
+    contained: false,
+  });
+  assert.equal(decision.action, "wait");
+  assert.equal(decision.certainty, "uncertain");
+});
+
+test("decideMergeReplay: submitted plus delayed-open waits and does not may_submit", () => {
+  const startedAt = new Date("2026-09-02T00:00:00.000Z");
+  const claim: MergeClaim = bindMergeClaim({
+    repository: REPO,
+    base: "main",
+    frozenIssueScope: [100],
+    pr: 42,
+    inspectedHead: HEAD,
+    actionIdentity: "pipeline merge 42",
+    now: startedAt,
+  });
+  const decision = decideMergeReplay({
+    claim: { ...claim, outcome: "submitted" },
+    live: liveOpen(),
+    contained: false,
+    now: new Date(startedAt.getTime() + 1_000),
+  });
+  assert.equal(decision.action, "wait");
+  assert.equal(decision.certainty, "uncertain");
+});
+
+test("decideMergeReplay: uncertain plus cooling-elapsed open is known_absent", () => {
+  const startedAt = new Date("2026-09-02T00:00:00.000Z");
+  const claim: MergeClaim = bindMergeClaim({
+    repository: REPO,
+    base: "main",
+    frozenIssueScope: [100],
+    pr: 42,
+    inspectedHead: HEAD,
+    actionIdentity: "pipeline merge 42",
+    now: startedAt,
+  });
+  const decision = decideMergeReplay({
+    claim: { ...claim, outcome: "uncertain" },
+    live: liveOpen(),
+    contained: false,
+    now: new Date(startedAt.getTime() + MERGE_COOLING_MS),
+  });
+  assert.equal(decision.action, "may_submit");
+  assert.equal(decision.certainty, "known_absent");
+});
+
+test("zero-exit merge does not complete without merged+contained observation", async () => {
+  const store = memoryMergeClaimStore();
+  const deps = makeMergeDeps({
+    supervision: supervision(store, { live: liveOpen(), contained: false }),
+  });
+  const result = await runMergeAttempt(42, deps);
+  assert.equal(result.kind, "owned");
+  assert.equal(result.observation.complete, false);
+  assert.equal(result.observation.certainty, "uncertain");
+  assert.equal(deps.mergeCalls.length, 1);
+  const claim = await store.load(mergeClaimKey(REPO, 42));
+  assert.equal(claim?.outcome, "uncertain");
+});
+
+test("uncertain claim becomes retryable after cooling proves the PR still open", async () => {
+  const store = memoryMergeClaimStore();
+  const startedAt = new Date("2026-09-02T00:00:00.000Z");
+  let now = startedAt;
+  let live = liveOpen();
+  const first = makeMergeDeps({
+    supervision: supervision(store, {
+      live: () => live,
+      contained: false,
+      now: () => now,
+    }),
+    async ghPrMerge() {
+      throw new Error("gh pr merge failed: timed out after 60000ms");
+    },
+  });
+  const owned = await runMergeAttempt(42, first);
+  assert.equal(owned.kind, "owned");
+  assert.equal(owned.observation.certainty, "uncertain");
+  const mid = await store.load(mergeClaimKey(REPO, 42));
+  assert.equal(mid?.outcome, "uncertain");
+
+  now = new Date(startedAt.getTime() + MERGE_COOLING_MS);
+  const second = makeMergeDeps({
+    supervision: supervision(store, {
+      live: () => live,
+      contained: true,
+      now: () => now,
+    }),
+    async ghPrMerge(pr, headRefOid) {
+      live = liveMerged();
+      second.mergeCalls.push({ pr, headRefOid });
+    },
+  });
+  const retried = await runMergeAttempt(42, second);
+  assert.equal(retried.kind, "complete");
+  assert.equal(second.mergeCalls.length, 1, "proven-absent uncertain claim may submit once");
+  const done = await store.load(mergeClaimKey(REPO, 42));
+  assert.equal(done?.outcome, "complete");
 });

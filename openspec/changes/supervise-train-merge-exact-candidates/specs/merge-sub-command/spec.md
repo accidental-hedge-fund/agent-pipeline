@@ -20,7 +20,7 @@
 
 ### Requirement: The merge sub-command SHALL persist an exact-candidate claim and reconcile before retry
 
-Before invoking `gh pr merge`, the merge adapter SHALL persist a claim that binds repository, base, frozen issue scope, PR, inspected head SHA, and action identity, using the head SHA from the successful MERGEABLE+CLEAN read. After timeout, crash, or uncertain response, the adapter SHALL observe live PR merge state and prove base containment before any replay. A moved head SHALL invalidate the claim and derived merge authorization.
+Before invoking `gh pr merge`, the merge adapter SHALL persist a claim that binds repository, base, frozen issue scope, PR, inspected head SHA, and action identity, using the head SHA from the successful MERGEABLE+CLEAN read. After timeout, crash, or uncertain response, the adapter SHALL observe live PR merge state and prove base containment before any replay. A zero exit from `gh pr merge` SHALL NOT complete the operation until that observer proves the PR is merged and the merge-result is contained in the fetched base. A moved head SHALL invalidate the claim and derived merge authorization.
 
 #### Scenario: Claim uses the inspected MERGEABLE head
 
@@ -34,6 +34,13 @@ Before invoking `gh pr merge`, the merge adapter SHALL persist a claim that bind
 - **WHEN** the process dies after `gh pr merge` is submitted
 - **AND** a later invoke observes the PR merged with merge-result contained in the fetched base
 - **THEN** the adapter SHALL complete without a second merge mutation
+
+#### Scenario: Zero-exit merge waits until containment is proven
+
+- **WHEN** `gh pr merge` returns zero
+- **AND** the observer has not yet proven the PR merged and contained in the fetched base
+- **THEN** the adapter SHALL NOT persist `outcome: "complete"`
+- **AND** it SHALL keep the claim owned as submitted or uncertain
 
 #### Scenario: Moved head refuses the stale claim
 

@@ -676,6 +676,14 @@ export async function runMergeAttempt(
       await emitObservation(deps, observation);
       // Fresh exact-candidate gates + a new claim under the original envelope.
     }
+    if (
+      decision.action === "may_submit" &&
+      existing &&
+      (existing.outcome === "submitted" || existing.outcome === "uncertain")
+    ) {
+      // Prior side effect is known absent. Record that so later invokes retry.
+      await supervision.claimStore.save({ ...existing, outcome: "started" });
+    }
   }
 
   let inspected: InspectedMergeCandidate;
@@ -748,12 +756,33 @@ export async function runMergeAttempt(
 
     supervision.crashBeforeSubmit?.();
 
+    const submittedClaim = { ...charged, outcome: "submitted" as const };
+    await supervision.claimStore.save(submittedClaim);
+    const pending = await supervision.claimStore.load(
+      mergeClaimKey(supervision.repository, pr),
+    );
+    if (!pending || pending.outcome !== "submitted" || pending.inspected_head !== liveHead) {
+      const observation = mergeObservation({
+        pr,
+        repository: supervision.repository,
+        certainty: "known_absent",
+        lifecycle: "cooling",
+        complete: false,
+        fault: null,
+        message: `merge refused: submitted claim was not persisted before mutation`,
+        claim: pending,
+        inspectedHead: liveHead,
+      });
+      await emitObservation(deps, observation);
+      return { kind: "owned", observation };
+    }
+
     deps.log(`[pipeline merge] #${pr}: all gates passed — squash-merging and deleting branch...`);
     try {
       await deps.ghPrMerge(pr, liveHead);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      const uncertainClaim = { ...charged, outcome: "uncertain" as const };
+      const uncertainClaim = { ...pending, outcome: "uncertain" as const };
       await supervision.claimStore.save(uncertainClaim);
       const { decision, live } = await observeAndDecide({
         pr,
@@ -761,7 +790,7 @@ export async function runMergeAttempt(
         claim: uncertainClaim,
       });
       if (decision.action === "complete") {
-        await supervision.claimStore.save({ ...charged, outcome: "complete" });
+        await supervision.claimStore.save({ ...pending, outcome: "complete" });
         const observation = mergeObservation({
           pr,
           repository: supervision.repository,
@@ -770,7 +799,7 @@ export async function runMergeAttempt(
           complete: true,
           fault: null,
           message: `PR #${pr} is merged and contained in ${supervision.base}`,
-          claim: { ...charged, outcome: "complete" },
+          claim: { ...pending, outcome: "complete" },
           inspectedHead: liveHead,
           mergeCommitOid: decision.mergeCommitOid,
         });
@@ -798,30 +827,52 @@ export async function runMergeAttempt(
 
     supervision.crashAfterSubmit?.();
 
-    const completeClaim = { ...charged, outcome: "complete" as const };
-    await supervision.claimStore.save(completeClaim);
-    let mergeCommitOid: string | null = null;
-    try {
-      const live = await supervision.observeMergedPr(pr);
-      mergeCommitOid = live.mergeCommitOid;
-    } catch {
-      mergeCommitOid = null;
+    const { decision, live, contained } = await observeAndDecide({
+      pr,
+      supervision,
+      claim: pending,
+    });
+    if (decision.action === "complete") {
+      const completeClaim = { ...pending, outcome: "complete" as const };
+      await supervision.claimStore.save(completeClaim);
+      const observation = mergeObservation({
+        pr,
+        repository: supervision.repository,
+        certainty: "known_complete",
+        lifecycle: "complete",
+        complete: true,
+        fault: null,
+        message: `PR #${pr} is merged and contained in ${supervision.base}`,
+        claim: completeClaim,
+        inspectedHead: liveHead,
+        mergeCommitOid: decision.mergeCommitOid,
+      });
+      await emitObservation(deps, observation);
+      deps.log(`[pipeline merge] #${pr}: merged successfully.`);
+      return { kind: "complete", observation, mergedNow: true };
     }
+    const waitingClaim = { ...pending, outcome: "uncertain" as const };
+    await supervision.claimStore.save(waitingClaim);
+    const fault =
+      decision.action === "wait" || decision.action === "invalidate"
+        ? decision.fault
+        : "uncertain_merge_response";
     const observation = mergeObservation({
       pr,
       repository: supervision.repository,
-      certainty: "known_complete",
-      lifecycle: "complete",
-      complete: true,
-      fault: null,
-      message: `PR #${pr}: merged successfully.`,
-      claim: completeClaim,
+      certainty: "uncertain",
+      lifecycle: ownedLifecycleForFault(fault),
+      complete: false,
+      fault,
+      message:
+        `PR #${pr}: merge command returned; postcondition not proven ` +
+        `(state=${live.state}, contained=${contained})`,
+      claim: waitingClaim,
       inspectedHead: liveHead,
-      mergeCommitOid,
+      mergeCommitOid: live.mergeCommitOid,
     });
     await emitObservation(deps, observation);
-    deps.log(`[pipeline merge] #${pr}: merged successfully.`);
-    return { kind: "complete", observation, mergedNow: true };
+    return { kind: "owned", observation };
   }
 
   deps.log(`[pipeline merge] #${pr}: all gates passed — squash-merging and deleting branch...`);

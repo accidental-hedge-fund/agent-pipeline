@@ -34,7 +34,7 @@ The shared invariant SHALL be:
 - **postcondition:** that PR is merged and its merge-result is contained in the fetched configured base
 - **observer:** GitHub pull-request merge state plus git ancestry of the fetched base tip
 - **candidate binding:** repository, base, frozen issue scope, PR, inspected head SHA, and action identity
-- **replay rule:** observe PR state and prove base containment before any replay; do not submit a second merge while the claim is complete or uncertain
+- **replay rule:** observe PR state and prove base containment before any replay; do not submit a second merge while the claim is complete, submitted, or uncertain
 
 #### Scenario: Shared invariant is explicit
 
@@ -85,6 +85,14 @@ After timeout, crash, or uncertain merge response, merge and merge-queue SHALL o
 - **THEN** the operation SHALL complete as verified success
 - **AND** it SHALL NOT invoke the squash-merge mutation again
 
+#### Scenario: Uncertain claim becomes retryable after absence is proven
+
+- **WHEN** a merge claim is submitted or uncertain
+- **AND** reconciliation observes the PR still open after the cooling window
+- **THEN** the adapter SHALL record that the prior side effect is known absent
+- **AND** it MAY start a new exact-candidate gate pass and claim under the original envelope
+- **AND** it SHALL NOT wait solely because the stored outcome remains uncertain
+
 ---
 
 ### Requirement: Merge side effects SHALL be exactly-once across crash boundaries
@@ -104,6 +112,7 @@ Merge submission SHALL be exactly-once for one valid claim. A completed side eff
 - **THEN** a fresh process SHALL observe live PR state and base containment
 - **AND** if the merge completed, it SHALL NOT submit a second merge
 - **AND** if the merge is unproven, RecoverySupervisor SHALL keep the operation owned
+- **AND** it SHALL NOT submit a second merge while remote visibility of that submission remains delayed
 
 #### Scenario: Crash after response persistence does not remarge
 

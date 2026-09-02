@@ -50,7 +50,7 @@ export const MERGE_OPERATION_INVARIANT: MergeOperationInvariant = {
   candidate_binding:
     "repository, base, frozen issue scope, PR, inspected head SHA, and action identity",
   replay_rule:
-    "observe PR state and prove base containment before any replay; do not submit a second merge while the claim is complete or uncertain",
+    "observe PR state and prove base containment before any replay; do not submit a second merge while the claim is complete, submitted, or uncertain",
 };
 
 export function mergeOperationInvariant(): MergeOperationInvariant {
@@ -66,7 +66,7 @@ export interface MergeClaim {
   inspected_head: string;
   action_identity: string;
   evidence_fingerprint: string;
-  outcome: "started" | "complete" | "uncertain";
+  outcome: "started" | "submitted" | "complete" | "uncertain";
   started_at: string;
 }
 
@@ -272,12 +272,24 @@ export type MergeReconcileDecision =
   | { action: "wait"; certainty: "uncertain"; fault: MergeFaultClass }
   | { action: "invalidate"; certainty: "known_absent"; fault: "head_drift" };
 
+function mergeSideEffectPending(claim: MergeClaim | null): boolean {
+  return claim?.outcome === "submitted" || claim?.outcome === "uncertain";
+}
+
+function claimCoolingElapsed(claim: MergeClaim, now: Date): boolean {
+  const started = Date.parse(claim.started_at);
+  if (!Number.isFinite(started)) return false;
+  return now.getTime() - started >= MERGE_COOLING_MS;
+}
+
 export function decideMergeReplay(input: {
   claim: MergeClaim | null;
   live: MergeRemoteObservation;
   contained: boolean;
+  now?: Date;
 }): MergeReconcileDecision {
   const liveMerged = input.live.state === "merged";
+  // Verified completion always requires merged + fetched-base containment.
   if (liveMerged && input.contained) {
     return {
       action: "complete",
@@ -285,14 +297,20 @@ export function decideMergeReplay(input: {
       mergeCommitOid: input.live.mergeCommitOid,
     };
   }
-  if (input.claim?.outcome === "complete" && liveMerged) {
+  // Submitted/uncertain: never remarge until the prior side effect is known absent.
+  if (mergeSideEffectPending(input.claim)) {
+    const now = input.now ?? new Date();
+    if (input.claim && !liveMerged && claimCoolingElapsed(input.claim, now)) {
+      return { action: "may_submit", certainty: "known_absent" };
+    }
     return {
-      action: "complete",
-      certainty: "known_complete",
-      mergeCommitOid: input.live.mergeCommitOid,
+      action: "wait",
+      certainty: "uncertain",
+      fault: "uncertain_merge_response",
     };
   }
-  if (input.claim?.outcome === "uncertain") {
+  // A persisted complete claim without proven containment stays owned; never remarge it.
+  if (input.claim?.outcome === "complete") {
     return {
       action: "wait",
       certainty: "uncertain",
@@ -481,13 +499,20 @@ export async function observeAndDecide(input: {
 }): Promise<{ decision: MergeReconcileDecision; live: MergeRemoteObservation; contained: boolean }> {
   const live = await input.supervision.observeMergedPr(input.pr);
   let contained = false;
-  if (live.state === "merged") {
-    contained = live.mergeCommitOid
-      ? await proveMergeContained(input.supervision, input.supervision.base, live.mergeCommitOid)
-      : true;
+  if (live.state === "merged" && live.mergeCommitOid) {
+    contained = await proveMergeContained(
+      input.supervision,
+      input.supervision.base,
+      live.mergeCommitOid,
+    );
   }
   return {
-    decision: decideMergeReplay({ claim: input.claim, live, contained }),
+    decision: decideMergeReplay({
+      claim: input.claim,
+      live,
+      contained,
+      now: input.supervision.now?.() ?? new Date(),
+    }),
     live,
     contained,
   };

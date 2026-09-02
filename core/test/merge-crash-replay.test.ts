@@ -12,6 +12,7 @@ import {
   type RequiredCheck,
 } from "../scripts/stages/merge.ts";
 import {
+  MERGE_COOLING_MS,
   bindMergeClaim,
   mergeClaimKey,
   memoryMergeClaimStore,
@@ -40,11 +41,12 @@ function liveMerged(): MergeRemoteObservation {
 
 function crashDeps(input: {
   store: ReturnType<typeof memoryMergeClaimStore>;
-  live: MergeRemoteObservation;
+  live: MergeRemoteObservation | (() => MergeRemoteObservation);
   contained: boolean;
   crashBeforeSubmit?: () => void;
   crashAfterSubmit?: () => void;
   mergeImpl?: MergeDeps["ghPrMerge"];
+  now?: () => Date;
 }): MergeDeps & { mergeCalls: Array<{ pr: number; headRefOid: string }> } {
   const mergeCalls: Array<{ pr: number; headRefOid: string }> = [];
   const supervision: MergeSupervisionContext = {
@@ -54,7 +56,8 @@ function crashDeps(input: {
     envelope: "pipeline merge",
     actionIdentity: "pipeline merge 42",
     claimStore: input.store,
-    observeMergedPr: async () => input.live,
+    observeMergedPr: async () =>
+      typeof input.live === "function" ? input.live() : input.live,
     async fetchBase() {},
     async baseTip() {
       return "d".repeat(40);
@@ -64,6 +67,7 @@ function crashDeps(input: {
     },
     crashBeforeSubmit: input.crashBeforeSubmit,
     crashAfterSubmit: input.crashAfterSubmit,
+    now: input.now,
   };
   const deps: MergeDeps & { mergeCalls: Array<{ pr: number; headRefOid: string }> } = {
     mergeCalls,
@@ -123,7 +127,16 @@ test("5.1 crash before submission does not merge until gates re-prove the same h
   assert.equal(started?.outcome, "started");
   assert.equal(started?.inspected_head, HEAD);
 
-  const second = crashDeps({ store, live: liveOpen(), contained: false });
+  let live = liveOpen();
+  const second = crashDeps({
+    store,
+    live: () => live,
+    contained: true,
+    async mergeImpl(pr, headRefOid) {
+      second.mergeCalls.push({ pr, headRefOid });
+      live = liveMerged();
+    },
+  });
   const result = await runMergeAttempt(42, second);
   assert.equal(result.kind, "complete");
   assert.equal(second.mergeCalls.length, 1);
@@ -150,7 +163,7 @@ test("5.2 crash after submission reconciles and does not remarge when postcondit
   await assert.rejects(() => runMergeAttempt(42, first), /injected crash after/);
   assert.equal(first.mergeCalls.length, 1);
   const mid = await store.load(mergeClaimKey(REPO, 42));
-  assert.equal(mid?.outcome, "started");
+  assert.equal(mid?.outcome, "submitted");
 
   const second = crashDeps({ store, live: remote, contained: true });
   const result = await runMergeAttempt(42, second);
@@ -176,6 +189,83 @@ test("5.3 crash after response persistence does not remarge a known-complete cla
   assert.equal(deps.mergeCalls.length, 0);
   const again = await store.load(mergeClaimKey(REPO, 42));
   assert.equal(again?.outcome, "complete");
+});
+
+test("5.4 delayed remote visibility after submission does not remarge", async () => {
+  const store = memoryMergeClaimStore();
+  const first = crashDeps({
+    store,
+    live: liveOpen(),
+    contained: false,
+    crashAfterSubmit: () => {
+      throw new Error("injected crash after ghPrMerge");
+    },
+  });
+  await assert.rejects(() => runMergeAttempt(42, first), /injected crash after/);
+  assert.equal(first.mergeCalls.length, 1);
+  const mid = await store.load(mergeClaimKey(REPO, 42));
+  assert.equal(mid?.outcome, "submitted");
+
+  const second = crashDeps({ store, live: liveOpen(), contained: false });
+  const result = await runMergeAttempt(42, second);
+  assert.equal(result.kind, "owned");
+  assert.equal(result.observation.complete, false);
+  assert.equal(result.observation.certainty, "uncertain");
+  assert.equal(second.mergeCalls.length, 0, "must not remarge while visibility is delayed");
+});
+
+test("5.5 merged-but-not-contained complete claim stays owned and does not remarge", async () => {
+  const store = memoryMergeClaimStore();
+  const claim = bindMergeClaim({
+    repository: REPO,
+    base: "main",
+    frozenIssueScope: [100],
+    pr: 42,
+    inspectedHead: HEAD,
+    actionIdentity: "pipeline merge 42",
+  });
+  await store.save({ ...claim, outcome: "complete" });
+  const deps = crashDeps({ store, live: liveMerged(), contained: false });
+  const result = await runMergeAttempt(42, deps);
+  assert.equal(result.kind, "owned");
+  assert.equal(result.observation.complete, false);
+  assert.equal(deps.mergeCalls.length, 0);
+  const again = await store.load(mergeClaimKey(REPO, 42));
+  assert.equal(again?.outcome, "complete");
+});
+
+test("5.6 uncertain response reconciled as absent may submit after cooling", async () => {
+  const store = memoryMergeClaimStore();
+  const startedAt = new Date("2026-09-02T00:00:00.000Z");
+  let now = startedAt;
+  let live = liveOpen();
+  const first = crashDeps({
+    store,
+    live: () => live,
+    contained: false,
+    now: () => now,
+    async mergeImpl() {
+      throw new Error("gh pr merge failed: timed out after 60000ms");
+    },
+  });
+  const owned = await runMergeAttempt(42, first);
+  assert.equal(owned.kind, "owned");
+  assert.equal((await store.load(mergeClaimKey(REPO, 42)))?.outcome, "uncertain");
+
+  now = new Date(startedAt.getTime() + MERGE_COOLING_MS);
+  const second = crashDeps({
+    store,
+    live: () => live,
+    contained: true,
+    now: () => now,
+    async mergeImpl(pr, headRefOid) {
+      second.mergeCalls.push({ pr, headRefOid });
+      live = liveMerged();
+    },
+  });
+  const retried = await runMergeAttempt(42, second);
+  assert.equal(retried.kind, "complete");
+  assert.equal(second.mergeCalls.length, 1);
 });
 
 test("5.4 crash tests perform no real network, git, or subprocess", () => {
