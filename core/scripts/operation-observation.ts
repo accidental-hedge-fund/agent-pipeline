@@ -21,6 +21,102 @@ export const OPERATION_OBSERVATION_SCHEMA_VERSION = 1 as const;
 
 export type SideEffectCertainty = "known_complete" | "known_absent" | "uncertain";
 
+/** Replay is allowed only when the observer has proven the side effect absent. */
+export function mayReplaySideEffect(certainty: SideEffectCertainty): boolean {
+  return certainty === "known_absent";
+}
+
+/**
+ * Treatment of an observed side effect before retry. `known_complete` does not
+ * replay. `known_absent` may replay under the same identity. `uncertain` stays
+ * Cooling or an external-condition wait — never a guessed mutation.
+ */
+export function treatmentForSideEffectCertainty(
+  certainty: SideEffectCertainty,
+): "complete" | "replay" | "cooling" {
+  if (certainty === "known_complete") return "complete";
+  if (certainty === "known_absent") return "replay";
+  return "cooling";
+}
+
+/** Linked-PR facts used to prove integration completeness (#1324). */
+export interface LinkedPrIntegrationFact {
+  number: number;
+  state: "open" | "closed" | "merged";
+  merge_commit_sha?: string | null;
+  contained?: boolean | null;
+}
+
+/**
+ * Integration side-effect certainty from every linked PR. A later open PR does
+ * not hide a prior merged-and-contained PR. Issue closure is not consulted.
+ * A truncated enumeration or a failed/missing detail read is not absence:
+ * successor mutations stay disallowed until every enumerated linked PR has
+ * been authoritatively inspected and no merged-and-contained PR exists.
+ */
+export function integrationSideEffectCertainty(
+  linked: readonly LinkedPrIntegrationFact[],
+  opts?: { truncated?: boolean; incompleteDetails?: boolean },
+): SideEffectCertainty {
+  if (linked.some((pr) => pr.state === "merged" && pr.contained === true)) {
+    return "known_complete";
+  }
+  if (opts?.truncated || opts?.incompleteDetails) return "uncertain";
+  if (linked.some((pr) => pr.state === "merged")) {
+    return "uncertain";
+  }
+  return "known_absent";
+}
+
+/** Successor PR-open and rebase of squash-contained commits are forbidden unless the merge is proven absent. */
+export function successorMutationsAllowed(certainty: SideEffectCertainty): {
+  openSuccessorPr: boolean;
+  rebaseContainedCommits: boolean;
+} {
+  const allowed = certainty === "known_absent";
+  return { openSuccessorPr: allowed, rebaseContainedCommits: allowed };
+}
+
+/** Prefer a merged-and-contained PR as integration authority over a later open PR. */
+export function selectAuthoritativeLinkedPr(
+  linked: readonly LinkedPrIntegrationFact[],
+): LinkedPrIntegrationFact | null {
+  const containedMerged = linked.find((pr) => pr.state === "merged" && pr.contained === true);
+  if (containedMerged) return containedMerged;
+  const merged = linked.find((pr) => pr.state === "merged");
+  if (merged) return merged;
+  const open = linked.find((pr) => pr.state === "open");
+  if (open) return open;
+  return linked[0] ?? null;
+}
+
+/**
+ * Partial multi-step mutation: a completed archive is not replayed; unfinished
+ * rebase is observed; product dirt still fail-closes the archive.
+ */
+export function archiveReplayDecision(input: {
+  archiveAlreadyDone: boolean;
+  rebaseInProgress: boolean;
+  productDirt: readonly string[];
+}): {
+  archive_certainty: SideEffectCertainty;
+  replay_archive: boolean;
+  dirty_fail_closed: boolean;
+  rebase_in_progress: boolean;
+} {
+  const archive_certainty: SideEffectCertainty = input.archiveAlreadyDone
+    ? "known_complete"
+    : input.rebaseInProgress
+      ? "uncertain"
+      : "known_absent";
+  return {
+    archive_certainty,
+    replay_archive: mayReplaySideEffect(archive_certainty),
+    dirty_fail_closed: input.productDirt.length > 0,
+    rebase_in_progress: input.rebaseInProgress,
+  };
+}
+
 export type ObservationLifecycleState = "active" | "cooling" | "waiting" | "complete";
 
 export interface CapabilityRequestObservation {

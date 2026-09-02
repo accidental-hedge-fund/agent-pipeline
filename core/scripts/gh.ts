@@ -3045,10 +3045,13 @@ function matchesAnyStatePipelineMention(pr: IssueTimelinePr, issueNumber: number
  *  (`isCrossRepository`) are excluded under every identity, same as
  *  {@link resolvePrForIssue}. Scans newest-first within the page. Exported for
  *  tests. */
-export function pickPrFromTimelinePage(
+/** Every matching same-repo PR on one timeline page, newest first. */
+export function listPrsFromTimelinePage(
   nodes: IssueTimelinePage["nodes"],
   issueNumber: number,
-): number | null {
+): number[] {
+  const out: number[] = [];
+  const seen = new Set<number>();
   for (let i = nodes.length - 1; i >= 0; i--) {
     const node = nodes[i]!;
     const pr = node.__typename === "ConnectedEvent"
@@ -3057,12 +3060,22 @@ export function pickPrFromTimelinePage(
         ? node.source
         : null;
     if (!isSameRepoTimelinePr(pr)) continue;
-    if (node.__typename === "ConnectedEvent") return pr.number;
-    if (node.willCloseTarget || matchesAnyStatePipelineMention(pr, issueNumber)) {
-      return pr.number;
-    }
+    const matches =
+      node.__typename === "ConnectedEvent" ||
+      node.willCloseTarget ||
+      matchesAnyStatePipelineMention(pr, issueNumber);
+    if (!matches || seen.has(pr.number)) continue;
+    seen.add(pr.number);
+    out.push(pr.number);
   }
-  return null;
+  return out;
+}
+
+export function pickPrFromTimelinePage(
+  nodes: IssueTimelinePage["nodes"],
+  issueNumber: number,
+): number | null {
+  return listPrsFromTimelinePage(nodes, issueNumber)[0] ?? null;
 }
 
 const ISSUE_TIMELINE_PR_FIELDS = "number headRefName title isCrossRepository";
@@ -3089,16 +3102,37 @@ const ISSUE_TIMELINE_QUERY =
  *  Match identities (#1269): `ConnectedEvent`, closing `willCloseTarget`,
  *  same-repo head `pipeline/<N>-*`, or title parenthetical `(#N)`. Fork PRs
  *  are ignored. Open-path {@link getPrForIssue} does not gain title search. */
-export async function getPrForIssueAnyState(
+/** Safety bound for issue-timeline pagination (50 events per page). Hitting
+ *  this cap is truncation, not a complete linked-PR set — absence must not
+ *  be inferred from the partial window (#1324 review-2). */
+export const ISSUE_TIMELINE_PR_PAGE_CAP = 40;
+
+/** Linked-PR numbers plus whether timeline pagination stopped before exhaustion. */
+export interface LinkedIssuePrs {
+  numbers: number[];
+  truncated: boolean;
+}
+
+/** Accept the complete `{ numbers, truncated }` form or a bare number list
+ *  (test fakes that enumerate a complete set). */
+export function normalizeLinkedIssuePrs(
+  listed: readonly number[] | LinkedIssuePrs,
+): LinkedIssuePrs {
+  if (Array.isArray(listed)) return { numbers: [...listed], truncated: false };
+  return { numbers: [...listed.numbers], truncated: listed.truncated === true };
+}
+
+async function paginateIssueTimelinePrs(
   cfg: PipelineConfig,
   issueNumber: number,
-  run: GhApiRunner = (args) => ghRun(args, { wrapperName: "getPrForIssueAnyState" }),
-): Promise<number | null> {
+  run: GhApiRunner,
+  opts: { stopOnFirst: boolean },
+): Promise<LinkedIssuePrs> {
   const [owner, repo] = cfg.repo.split("/");
   let before: string | null = null;
-  // Safety bound only — 40 pages * 50 events = 2000 timeline events for a
-  // single issue, far beyond any real issue's link history.
-  for (let page = 0; page < 40; page++) {
+  const out: number[] = [];
+  const seen = new Set<number>();
+  for (let page = 0; page < ISSUE_TIMELINE_PR_PAGE_CAP; page++) {
     const args = [
       "api",
       "graphql",
@@ -3117,13 +3151,37 @@ export async function getPrForIssueAnyState(
       data: { repository: { issue: { timelineItems: IssueTimelinePage } | null } };
     };
     const timelineItems = data.data.repository.issue?.timelineItems;
-    if (!timelineItems) return null;
-    const found = pickPrFromTimelinePage(timelineItems.nodes, issueNumber);
-    if (found !== null) return found;
-    if (!timelineItems.pageInfo.hasPreviousPage) return null;
+    if (!timelineItems) return { numbers: out, truncated: false };
+    for (const n of listPrsFromTimelinePage(timelineItems.nodes, issueNumber)) {
+      if (seen.has(n)) continue;
+      seen.add(n);
+      out.push(n);
+      if (opts.stopOnFirst) return { numbers: out, truncated: false };
+    }
+    if (!timelineItems.pageInfo.hasPreviousPage) return { numbers: out, truncated: false };
     before = timelineItems.pageInfo.startCursor;
   }
-  return null;
+  return { numbers: out, truncated: true };
+}
+
+export async function getPrForIssueAnyState(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  run: GhApiRunner = (args) => ghRun(args, { wrapperName: "getPrForIssueAnyState" }),
+): Promise<number | null> {
+  const linked = await paginateIssueTimelinePrs(cfg, issueNumber, run, { stopOnFirst: true });
+  return linked.numbers[0] ?? null;
+}
+
+/** Every same-repo PR linked to the issue (open, closed, merged), newest first.
+ *  `truncated` is true when the safety page cap stopped pagination before
+ *  GraphQL reported exhaustion — callers must not treat that as absence. */
+export async function listPrsForIssueAnyState(
+  cfg: PipelineConfig,
+  issueNumber: number,
+  run: GhApiRunner = (args) => ghRun(args, { wrapperName: "listPrsForIssueAnyState" }),
+): Promise<LinkedIssuePrs> {
+  return paginateIssueTimelinePrs(cfg, issueNumber, run, { stopOnFirst: false });
 }
 
 /** Select the first same-repo PR whose headRefName exactly equals {@link branch}.

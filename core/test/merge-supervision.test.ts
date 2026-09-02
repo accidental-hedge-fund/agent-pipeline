@@ -15,6 +15,7 @@ import {
 import {
   MERGE_COOLING_MS,
   MERGE_OPERATION_INVARIANT,
+  missingMergeInvariantFields,
   assertOperatorMergeEnvelope,
   bindMergeClaim,
   claimInvalidationReason,
@@ -157,6 +158,10 @@ test("1.1 merge operation invariant round-trips and process exit is not completi
   assert.match(invariant.observer, /GitHub pull-request merge state/);
   assert.match(invariant.candidate_binding, /inspected head/);
   assert.match(invariant.replay_rule, /observe PR state/);
+  assert.match(invariant.side_effect_identity, /squash-merge/);
+  assert.match(invariant.safe_replay_predicate, /unmerged/);
+  assert.match(invariant.reconstruction_rule, /do not submit merge/);
+  assert.deepEqual(missingMergeInvariantFields(), []);
   const obs = mergeObservation({
     pr: 42,
     repository: REPO,

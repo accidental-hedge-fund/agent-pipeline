@@ -211,6 +211,17 @@ test("pipelineStageFromLabels: extracts the suffix after the pipeline: prefix", 
   assert.equal(pipelineStageFromLabels(["some-other-label", "pipeline:ready"]), "ready");
 });
 
+test("pipelineStageFromLabels: most advanced STAGES member wins and does not throw", () => {
+  assert.equal(
+    pipelineStageFromLabels(["pipeline:pre-merge", "pipeline:design-gate"]),
+    "pre-merge",
+  );
+  assert.equal(
+    pipelineStageFromLabels(["pipeline:needs-human", "pipeline:review-2"]),
+    "needs-human",
+  );
+});
+
 // ---------------------------------------------------------------------------
 // isBlockedInLabels (#581, capability `loop-blocked-item-hold-continuation`)
 // ---------------------------------------------------------------------------

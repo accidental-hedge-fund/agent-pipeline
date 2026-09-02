@@ -838,10 +838,20 @@ export interface LoopExternalIdentity {
   /** The issue's current `pipeline:*` stage label, minus the prefix (e.g. `"backlog"`,
    *  `"ready"`, `"review-1"`) — `null` when the issue carries no `pipeline:*` label at all.
    *  Feeds the precondition stage gate (#568, capability `loop-precondition-stage-gate`); see
-   *  loop/precondition.ts. When more than one `pipeline:*` label is present (not expected in
-   *  normal operation), the first one observed is recorded. */
+   *  loop/precondition.ts. When more than one `pipeline:*` stage label is present, the
+   *  most advanced STAGES member is recorded. */
   pipeline_stage: string | null;
   observed_at: string;
+  /** On-disk worktree HEAD when observed. Independent of PR head. */
+  local_head_sha?: string | null;
+  /** True when `.git/rebase-merge` or `REBASE_HEAD` is present. */
+  rebase_in_progress?: boolean;
+  /** True when worktree porcelain includes product (non-scratch) dirt. */
+  product_dirt?: boolean;
+  /** Certainty that a linked PR is merged and contained in the fetched base. */
+  integration_certainty?: "known_complete" | "known_absent" | "uncertain";
+  /** Every linked PR number consulted for integration completeness. */
+  linked_pr_numbers?: number[];
 }
 
 export const LOOP_DRIFT_CLASSES = [
@@ -862,6 +872,7 @@ export const LOOP_NEXT_ACTIONS = [
   "advance",
   "await-checks",
   "repair-forward",
+  "reconstruct",
   "clear-merge-barrier",
   "hold-for-human",
   "noop",

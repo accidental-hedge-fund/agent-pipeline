@@ -134,7 +134,28 @@ export function selectSchedulableSet(input: ScheduleInput): ScheduleDecision {
       (item) => [item.id, { id: item.id, decl: item.ownership, normalized: normalizeOwnership(item.ownership) }] as const,
     ),
   );
-  const unresolvedDriftIds = new Set((ledger.last_reconciliation?.drift ?? []).map((d) => d.item_id));
+  const nextActions = ledger.last_reconciliation?.next_actions ?? {};
+  const observedById = ledger.last_reconciliation?.observed ?? {};
+  // Reconstruct and repair-forward rewrote local ledger state this pass.
+  // Unfinished rebase or product dirt is still live worktree contradiction:
+  // keep those identity-mismatches as an adapter gate until recovery and a
+  // later observation prove a clean, non-rebasing worktree.
+  const unresolvedDriftIds = new Set(
+    (ledger.last_reconciliation?.drift ?? [])
+      .filter((d) => {
+        const action = nextActions[d.item_id];
+        if (action === "repair-forward") return false;
+        if (action === "reconstruct") {
+          const observed = observedById[d.item_id];
+          return (
+            d.class === "identity-mismatch" &&
+            (observed?.rebase_in_progress === true || observed?.product_dirt === true)
+          );
+        }
+        return true;
+      })
+      .map((d) => d.item_id),
+  );
 
   const selected: string[] = [];
   const rationale: ScheduleRationale[] = [];

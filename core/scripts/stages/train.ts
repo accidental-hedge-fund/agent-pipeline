@@ -15,7 +15,11 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { parseDeclaredDependencyIds } from "../declared-dependency-grammar.ts";
-import { getPrForIssueAnyState as ghGetPrForIssueAnyState } from "../gh.ts";
+import {
+  getPrForIssueAnyState as ghGetPrForIssueAnyState,
+  normalizeLinkedIssuePrs,
+  type LinkedIssuePrs,
+} from "../gh.ts";
 import { compileContractItems, type RawContractItem } from "../loop/dependencies.ts";
 import { LoopError } from "../loop/types.ts";
 import type { RunStoreDeps } from "../run-store.ts";
@@ -24,6 +28,11 @@ import {
   initTrainRunStore,
 } from "../train-events.ts";
 import type { PipelineConfig } from "../types.ts";
+import { pipelineStageFromLabels } from "../loop/precondition.ts";
+import {
+  integrationSideEffectCertainty,
+  type LinkedPrIntegrationFact,
+} from "../operation-observation.ts";
 import {
   proveMergeResultInBase,
   releaseWorktreeForParkedIssue,
@@ -228,6 +237,9 @@ export interface TrainDeps {
    * Used for merge-mode already-integrated reconciliation after the open PR is gone.
    */
   getPrForIssueAnyState(issue: number): Promise<number | null>;
+  /** Every linked PR (open, closed, merged). Completeness consults this set.
+   *  `{ numbers, truncated }` reports a bounded scan that is not absence. */
+  listLinkedPrs?(issue: number): Promise<readonly number[] | LinkedIssuePrs>;
   /** Existing merge surface (same gates as `pipeline merge`). */
   mergeIssuePr(pr: number): Promise<void>;
   observePr(pr: number): Promise<{
@@ -496,14 +508,7 @@ export function parseIssueList(raw: string | undefined | null): number[] {
   return out;
 }
 
-export function pipelineStageFromLabels(labels: readonly string[]): string | null {
-  const stages = labels.filter((l) => l.startsWith("pipeline:"));
-  if (stages.length === 0) return null;
-  if (stages.length > 1) {
-    throw new Error(`ambiguous pipeline stage labels: ${stages.join(", ")}`);
-  }
-  return stages[0]!.slice("pipeline:".length);
-}
+export { pipelineStageFromLabels };
 
 
 export function isReadyToDeploySnapshot(s: TrainIssueSnapshot): boolean {
@@ -720,23 +725,54 @@ export function formatTrainOrderedIssuesLine(
 async function linkedPrForPlan(
   issue: number,
   deps: TrainDeps,
-): Promise<{ pr: number | null; open: boolean; merged: boolean }> {
+): Promise<{ pr: number | null; open: boolean; merged: boolean; contained: boolean }> {
   const openPr = await deps.getPrForIssue(issue);
-  if (openPr != null) {
-    return { pr: openPr, open: true, merged: false };
-  }
   const anyPr = await deps.getPrForIssueAnyState(issue);
-  if (anyPr == null) {
-    return { pr: null, open: false, merged: false };
+  const listed = deps.listLinkedPrs
+    ? normalizeLinkedIssuePrs(await deps.listLinkedPrs(issue))
+    : { numbers: [] as number[], truncated: false };
+  const numbers = [...new Set([
+    ...listed.numbers,
+    ...(openPr != null ? [openPr] : []),
+    ...(anyPr != null ? [anyPr] : []),
+  ])];
+  const facts: LinkedPrIntegrationFact[] = [];
+  for (const n of numbers) {
+    const obs = await deps.observePr(n);
+    let contained: boolean | null = null;
+    if (obs.state === "merged" && obs.mergeCommitOid) {
+      try {
+        const tip = await deps.baseTip("");
+        contained = await deps.isAncestor(obs.mergeCommitOid, tip);
+      } catch {
+        contained = obs.mergeCommitOid ? true : null;
+      }
+    } else if (obs.state === "merged") {
+      contained = null;
+    }
+    facts.push({
+      number: n,
+      state: obs.state,
+      merge_commit_sha: obs.mergeCommitOid,
+      contained,
+    });
   }
-  const obs = await deps.observePr(anyPr);
-  if (obs.state === "merged") {
-    return { pr: anyPr, open: false, merged: true };
+  const certainty = integrationSideEffectCertainty(facts, { truncated: listed.truncated });
+  const mergedFact = facts.find((f) => f.state === "merged" && f.contained === true)
+    ?? facts.find((f) => f.state === "merged");
+  if (mergedFact) {
+    return {
+      pr: mergedFact.number,
+      open: false,
+      merged: true,
+      contained: certainty === "known_complete" || mergedFact.contained !== false,
+    };
   }
-  if (obs.state === "open") {
-    return { pr: anyPr, open: true, merged: false };
+  const openFact = facts.find((f) => f.state === "open");
+  if (openFact) {
+    return { pr: openFact.number, open: true, merged: false, contained: false };
   }
-  return { pr: null, open: false, merged: false };
+  return { pr: null, open: false, merged: false, contained: false };
 }
 
 function classifyTrainIntendedAction(input: {
@@ -745,9 +781,11 @@ function classifyTrainIntendedAction(input: {
   held: boolean;
   open: boolean;
   merged: boolean;
+  contained?: boolean;
   waitingOnDeps: boolean;
 }): TrainIntendedAction {
   if (input.held) return "held";
+  if (input.merged) return "already-integrated";
   if (input.mergeMode && input.stage === "ready-to-deploy") {
     if (input.open) return "would-merge";
     if (input.merged) return "already-integrated";
@@ -765,7 +803,7 @@ async function planTrainDryRun(input: {
   deps: TrainDeps;
 }): Promise<TrainPlan> {
   const { ordered, byNumber, codeDeps, mergeMode, deps } = input;
-  const linked = new Map<number, { pr: number | null; open: boolean; merged: boolean }>();
+  const linked = new Map<number, { pr: number | null; open: boolean; merged: boolean; contained: boolean }>();
   for (const n of ordered) {
     linked.set(n, await linkedPrForPlan(n, deps));
   }
@@ -777,7 +815,7 @@ async function planTrainDryRun(input: {
     if (isBlockedOrNeedsHumanSnapshot(snap)) held.add(n);
     const stage = pipelineStageFromLabels(snap.labels);
     const pr = linked.get(n)!;
-    if (mergeMode && stage === "ready-to-deploy" && pr.merged) {
+    if (pr.merged) {
       alreadyIntegrated.add(n);
     }
   }
@@ -808,6 +846,7 @@ async function planTrainDryRun(input: {
         held: held.has(n),
         open: pr.open,
         merged: pr.merged,
+        contained: pr.contained,
         waitingOnDeps,
       }),
       on_frontier: frontier.has(n),

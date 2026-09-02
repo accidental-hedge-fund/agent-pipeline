@@ -37,6 +37,9 @@ export interface MergeOperationInvariant {
   observer: string;
   candidate_binding: string;
   replay_rule: string;
+  side_effect_identity: string;
+  safe_replay_predicate: string;
+  reconstruction_rule: string;
 }
 
 /** Shared merge invariant consumed by `pipeline merge`, merge-queue apply, and train merge waves. */
@@ -51,7 +54,29 @@ export const MERGE_OPERATION_INVARIANT: MergeOperationInvariant = {
     "repository, base, frozen issue scope, PR, inspected head SHA, and action identity",
   replay_rule:
     "observe PR state and prove base containment before any replay; do not submit a second merge while the claim is complete, submitted, or uncertain",
+  side_effect_identity: "squash-merge of this exact PR into the configured base",
+  safe_replay_predicate:
+    "replay only when the observer proves the PR is still unmerged and the merge-result is absent from the fetched base",
+  reconstruction_rule:
+    "reconstruct local claim from GitHub merge state and git ancestry; do not submit merge, push, or edit the PR as repair",
 };
+
+export function missingMergeInvariantFields(): string[] {
+  const required = [
+    "precondition",
+    "postcondition",
+    "observer",
+    "candidate_binding",
+    "replay_rule",
+    "side_effect_identity",
+    "safe_replay_predicate",
+    "reconstruction_rule",
+  ] as const;
+  return required.filter((field) => {
+    const value = MERGE_OPERATION_INVARIANT[field];
+    return typeof value !== "string" || value.trim().length === 0;
+  });
+}
 
 export function mergeOperationInvariant(): MergeOperationInvariant {
   return { ...MERGE_OPERATION_INVARIANT };

@@ -10,13 +10,16 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { deriveMigratedOutcome, type MigratedOutcome } from "./escalation-dispositions.ts";
 import {
+  completedOperationObservation,
   consumeOwnedOperation,
+  mayReplaySideEffect,
   mechanicalFaultObservation,
   mintObservationIdentity,
   ownedAdmissionObservation,
   persistOperationObservation,
   reportMechanicalFault,
   reportOwnedOperation,
+  treatmentForSideEffectCertainty,
   type ObservationLifecycleState,
   type OperationObservation,
   type ReportOperationObservation,
@@ -56,6 +59,19 @@ export function isDeliveryStage(stage: string): stage is DeliveryStage {
   return (DELIVERY_STAGES as readonly string[]).includes(stage);
 }
 
+export const OPERATION_INVARIANT_FIELDS = [
+  "precondition",
+  "postcondition",
+  "observer",
+  "candidate_binding",
+  "replay_rule",
+  "side_effect_identity",
+  "safe_replay_predicate",
+  "reconstruction_rule",
+] as const;
+
+export type OperationInvariantField = (typeof OPERATION_INVARIANT_FIELDS)[number];
+
 export interface DeliveryStageInvariant {
   operation: DeliveryStage;
   precondition: string;
@@ -63,6 +79,20 @@ export interface DeliveryStageInvariant {
   observer: string;
   candidate_binding: string;
   replay_rule: string;
+  side_effect_identity: string;
+  safe_replay_predicate: string;
+  reconstruction_rule: string;
+}
+
+/** Names required invariant fields that are missing or blank. */
+export function missingOperationInvariantFields(
+  inv: Partial<Record<OperationInvariantField, string>> | null | undefined,
+): OperationInvariantField[] {
+  if (inv == null) return [...OPERATION_INVARIANT_FIELDS];
+  return OPERATION_INVARIANT_FIELDS.filter((field) => {
+    const value = inv[field];
+    return typeof value !== "string" || value.trim().length === 0;
+  });
 }
 
 const INVARIANT_BY_STAGE: Record<DeliveryStage, DeliveryStageInvariant> = {
@@ -73,6 +103,9 @@ const INVARIANT_BY_STAGE: Record<DeliveryStage, DeliveryStageInvariant> = {
     observer: "GitHub issue comments plus pipeline stage label",
     candidate_binding: "repository, issue, planning worktree branch",
     replay_rule: "observe existing plan artifact before re-authoring; do not treat process exit as completion",
+    side_effect_identity: "plan artifact for this issue and candidate epoch",
+    safe_replay_predicate: "replay only when the observer proves the plan artifact is absent",
+    reconstruction_rule: "reconstruct local claim from GitHub comments and stage label; do not write labels as repair",
   },
   "plan-review": {
     operation: "plan-review",
@@ -81,6 +114,9 @@ const INVARIANT_BY_STAGE: Record<DeliveryStage, DeliveryStageInvariant> = {
     observer: "schema-satisfying plan-review verdict on the issue",
     candidate_binding: "repository, issue, plan artifact identity",
     replay_rule: "observe the latest plan-review verdict before replay; malformed output is not a pass",
+    side_effect_identity: "plan-review verdict bound to the plan artifact identity",
+    safe_replay_predicate: "replay only when no schema-satisfying verdict exists for this plan identity",
+    reconstruction_rule: "reconstruct local claim from the latest schema-satisfying verdict; do not post a new verdict as repair",
   },
   "pre-code-attestation": {
     operation: "pre-code-attestation",
@@ -89,6 +125,9 @@ const INVARIANT_BY_STAGE: Record<DeliveryStage, DeliveryStageInvariant> = {
     observer: "pre-code attestation state comments plus stage label",
     candidate_binding: "repository, issue, plan identity",
     replay_rule: "observe current attestation state before creating a new hold",
+    side_effect_identity: "attestation state comment for this plan identity",
+    safe_replay_predicate: "replay only when attestation state is proven absent for this plan identity",
+    reconstruction_rule: "reconstruct local claim from attestation comments; do not create a new hold as repair",
   },
   implementing: {
     operation: "implementing",
@@ -97,6 +136,9 @@ const INVARIANT_BY_STAGE: Record<DeliveryStage, DeliveryStageInvariant> = {
     observer: "git ancestry of the issue branch versus base plus stage goal check",
     candidate_binding: "repository, issue, worktree HEAD SHA",
     replay_rule: "observe HEAD and goal satisfaction before treating a no-new-commit as success",
+    side_effect_identity: "implementation commits on the candidate branch for this epoch",
+    safe_replay_predicate: "replay only when git ancestry proves those commits are absent",
+    reconstruction_rule: "reconstruct local HEAD and claim from git; do not push or open a PR as repair",
   },
   "design-gate": {
     operation: "design-gate",
@@ -105,6 +147,9 @@ const INVARIANT_BY_STAGE: Record<DeliveryStage, DeliveryStageInvariant> = {
     observer: "design-gate state comments bound to the candidate",
     candidate_binding: "repository, issue, candidate HEAD SHA",
     replay_rule: "observe current gate state for this HEAD before re-challenging",
+    side_effect_identity: "design-gate decision record bound to candidate HEAD",
+    safe_replay_predicate: "replay only when no decision record exists for this HEAD epoch",
+    reconstruction_rule: "reconstruct local claim from candidate-bound comments; a prior-epoch record is invalid",
   },
   "review-1": {
     operation: "review-1",
@@ -113,6 +158,9 @@ const INVARIANT_BY_STAGE: Record<DeliveryStage, DeliveryStageInvariant> = {
     observer: "review.verdict@1 artifact bound to PR head SHA",
     candidate_binding: "repository, PR, inspected HEAD SHA",
     replay_rule: "a prior-epoch verdict does not authorize a new HEAD",
+    side_effect_identity: "review-1 verdict artifact bound to inspected HEAD",
+    safe_replay_predicate: "replay only when no schema-satisfying verdict exists for this HEAD epoch",
+    reconstruction_rule: "reconstruct local claim from the SHA-bound verdict; do not treat a prior-epoch verdict as current",
   },
   "fix-1": {
     operation: "fix-1",
@@ -121,6 +169,9 @@ const INVARIANT_BY_STAGE: Record<DeliveryStage, DeliveryStageInvariant> = {
     observer: "git range since review-1 SHA plus stage goal check",
     candidate_binding: "repository, issue, worktree HEAD SHA",
     replay_rule: "one harness attempt per adapter invocation; crashed work is preserved",
+    side_effect_identity: "fix-1 commits on the candidate since the review-1 SHA",
+    safe_replay_predicate: "replay only when git range proves those commits are absent for this epoch",
+    reconstruction_rule: "reconstruct local HEAD from git; do not push as repair",
   },
   "review-2": {
     operation: "review-2",
@@ -129,6 +180,9 @@ const INVARIANT_BY_STAGE: Record<DeliveryStage, DeliveryStageInvariant> = {
     observer: "review.verdict@1 artifact bound to PR head SHA",
     candidate_binding: "repository, PR, inspected HEAD SHA",
     replay_rule: "a prior-epoch verdict does not authorize a new HEAD",
+    side_effect_identity: "review-2 verdict artifact bound to inspected HEAD",
+    safe_replay_predicate: "replay only when no schema-satisfying verdict exists for this HEAD epoch",
+    reconstruction_rule: "reconstruct local claim from the SHA-bound verdict; do not treat a prior-epoch verdict as current",
   },
   "fix-2": {
     operation: "fix-2",
@@ -137,6 +191,9 @@ const INVARIANT_BY_STAGE: Record<DeliveryStage, DeliveryStageInvariant> = {
     observer: "git range since review-2 SHA plus stage goal check",
     candidate_binding: "repository, issue, worktree HEAD SHA",
     replay_rule: "one harness attempt per adapter invocation; crashed work is preserved",
+    side_effect_identity: "fix-2 commits on the candidate since the review-2 SHA",
+    safe_replay_predicate: "replay only when git range proves those commits are absent for this epoch",
+    reconstruction_rule: "reconstruct local HEAD from git; do not push or open a successor PR as repair",
   },
   "pre-merge": {
     operation: "pre-merge",
@@ -145,6 +202,9 @@ const INVARIANT_BY_STAGE: Record<DeliveryStage, DeliveryStageInvariant> = {
     observer: "CI, OpenSpec validation, review-SHA gate, and live PR head",
     candidate_binding: "repository, PR, live HEAD SHA",
     replay_rule: "observe live HEAD before treating a prior gate result as current",
+    side_effect_identity: "pre-merge gate results and OpenSpec archive bound to live HEAD",
+    safe_replay_predicate: "replay a step only when that step's observer proves it absent; a completed archive is not replayed",
+    reconstruction_rule: "reconstruct local claim from CI, OpenSpec, and live PR head; do not merge, push, or archive as repair",
   },
   "visual-gate": {
     operation: "visual-gate",
@@ -153,6 +213,9 @@ const INVARIANT_BY_STAGE: Record<DeliveryStage, DeliveryStageInvariant> = {
     observer: "visual gate command exit plus configured enablement",
     candidate_binding: "repository, issue, candidate HEAD SHA",
     replay_rule: "a prior-epoch visual result does not authorize a new HEAD",
+    side_effect_identity: "visual-gate result bound to candidate HEAD",
+    safe_replay_predicate: "replay only when no current-epoch visual result exists",
+    reconstruction_rule: "reconstruct local claim from the SHA-bound visual result; process exit is ingress only",
   },
   "eval-gate": {
     operation: "eval-gate",
@@ -161,6 +224,9 @@ const INVARIANT_BY_STAGE: Record<DeliveryStage, DeliveryStageInvariant> = {
     observer: "eval gate command exit plus configured enablement",
     candidate_binding: "repository, issue, candidate HEAD SHA",
     replay_rule: "a prior-epoch eval result does not authorize a new HEAD",
+    side_effect_identity: "eval-gate result bound to candidate HEAD",
+    safe_replay_predicate: "replay only when no current-epoch eval result exists",
+    reconstruction_rule: "reconstruct local claim from the SHA-bound eval result; process exit is ingress only",
   },
   "shipcheck-gate": {
     operation: "shipcheck-gate",
@@ -169,6 +235,9 @@ const INVARIANT_BY_STAGE: Record<DeliveryStage, DeliveryStageInvariant> = {
     observer: "schema-satisfying shipcheck verdict bound to HEAD",
     candidate_binding: "repository, PR, inspected HEAD SHA",
     replay_rule: "a prior-epoch shipcheck verdict does not authorize a new HEAD",
+    side_effect_identity: "shipcheck verdict bound to inspected HEAD",
+    safe_replay_predicate: "replay only when no schema-satisfying verdict exists for this HEAD epoch",
+    reconstruction_rule: "reconstruct local claim from the SHA-bound shipcheck verdict",
   },
   "ready-to-deploy": {
     operation: "ready-to-deploy",
@@ -177,6 +246,9 @@ const INVARIANT_BY_STAGE: Record<DeliveryStage, DeliveryStageInvariant> = {
     observer: "GitHub stage label plus absence of merge side effects from this adapter",
     candidate_binding: "repository, issue, candidate HEAD SHA",
     replay_rule: "observe the stage label; never submit merge from advance/single/loop",
+    side_effect_identity: "pipeline:ready-to-deploy label for this issue",
+    safe_replay_predicate: "replay only when the observer proves the ready-to-deploy label is absent",
+    reconstruction_rule: "reconstruct local claim from the GitHub stage label; never merge as repair",
   },
 };
 
@@ -189,7 +261,12 @@ export function deliveryStageInvariant(stage: DeliveryStage): DeliveryStageInvar
 }
 
 export function missingDeliveryStageInvariants(stages: readonly string[] = DELIVERY_STAGES): DeliveryStage[] {
-  return (stages as DeliveryStage[]).filter((s) => isDeliveryStage(s) && INVARIANT_BY_STAGE[s] == null);
+  return (stages as DeliveryStage[]).filter((s) => {
+    if (!isDeliveryStage(s)) return false;
+    const inv = INVARIANT_BY_STAGE[s];
+    if (inv == null) return true;
+    return missingOperationInvariantFields(inv).length > 0;
+  });
 }
 
 export interface CandidateEpoch {
@@ -279,6 +356,24 @@ export function collectForbiddenAdapterTreatments(
 }
 
 /** Stage-local loops that are not gh transient retry or worktree config-lock retry. */
+const ERROR_NAME_CLASSIFICATION_RE =
+  /catch[\s\S]{0,500}(?:message|\berr\b|\be\b)[\s\S]{0,200}(?:includes|===|==)\s*\(?\s*['"`]ambiguous pipeline stage labels/;
+
+/** Production routing must not classify by matching a thrown error message. */
+export function collectErrorNameClassificationHits(
+  source: string,
+  file = "fixture.ts",
+): ForbiddenAdapterTreatmentHit[] {
+  const hits: ForbiddenAdapterTreatmentHit[] = [];
+  if (ERROR_NAME_CLASSIFICATION_RE.test(source) || /includes\(\s*['"`]ambiguous pipeline stage labels/.test(source)) {
+    hits.push({
+      file,
+      reason: `${file} classifies a fault by matching thrown message 'ambiguous pipeline stage labels'`,
+    });
+  }
+  return hits;
+}
+
 export function collectForbiddenLifecycleRetries(source: string, file = "fixture.ts"): ForbiddenAdapterTreatmentHit[] {
   const hits: ForbiddenAdapterTreatmentHit[] = [];
   if (
@@ -573,7 +668,12 @@ export async function runDeliveryStageAdapter(input: RunDeliveryStageAdapterInpu
     const reported = reportOwnedOperation(input.reportObservation, obs);
     if (!reported.complete) consumeReportedOwned(reported);
     const decision = reconcileIssueStageObservation(reported, outcome);
-    if (decision.treatment === "re-entry" && !outcome.advanced && outcome.blockerKind === "head-drift") {
+    if (
+      decision.treatment === "re-entry" &&
+      !outcome.advanced &&
+      outcome.blockerKind === "head-drift" &&
+      mayReplaySideEffect(reported.certainty)
+    ) {
       const retry = await input.attempt();
       const retryObs = observationFromAdapterAttempt({
         ...base,
@@ -675,10 +775,14 @@ export interface OwnedFixAttempt {
   result: { success: boolean; exit_code?: number; timed_out?: boolean; duration?: number; [k: string]: unknown };
 }
 
+export type OwnedFixObservation = "attempt" | "verified-complete" | "cooling";
+
 export interface OwnedFixAttemptsResult {
   attempts: OwnedFixAttempt[];
   finalResult: OwnedFixAttempt["result"];
   budgetExhausted: boolean;
+  certainty: SideEffectCertainty;
+  observation: OwnedFixObservation;
 }
 
 export interface OwnedFixAttemptsOpts<TResult extends OwnedFixAttempt["result"]> {
@@ -690,6 +794,11 @@ export interface OwnedFixAttemptsOpts<TResult extends OwnedFixAttempt["result"]>
   onBeforeAttempt?: (attempt: number, timeoutSec: number, prompt: string) => Promise<void> | void;
   onRetryScheduled?: (attempt: number, limit: number, reason: string) => Promise<void> | void;
   nowMs?: () => number;
+  /**
+   * Required on every retry-capable call path. Missing observer on re-entry is
+   * fail-closed `uncertain` (cooling), never a guessed replay.
+   */
+  observeCertainty: () => Promise<SideEffectCertainty> | SideEffectCertainty;
   reportObservation?: ReportOperationObservation;
   identity?: {
     domain: string;
@@ -698,6 +807,88 @@ export interface OwnedFixAttemptsOpts<TResult extends OwnedFixAttempt["result"]>
     issue?: number | null;
     run_id?: string | null;
     stage?: "fix-1" | "fix-2";
+  };
+}
+
+function haltOwnedFixOnObservation(
+  attempts: OwnedFixAttempt[],
+  certainty: SideEffectCertainty,
+  opts: OwnedFixAttemptsOpts<OwnedFixAttempt["result"]>,
+): OwnedFixAttemptsResult {
+  const treatment = treatmentForSideEffectCertainty(certainty);
+  const stage = opts.identity?.stage ?? "fix-2";
+  if (treatment === "complete") {
+    if (opts.identity) {
+      reportOwnedOperation(
+        opts.reportObservation,
+        completedOperationObservation({
+          operation: stage,
+          form_id: formIdForStage(stage),
+          message: "observer proved the postcondition complete; reconciling the original operation forward",
+          domain: opts.identity.domain,
+          logical_operation_id: opts.identity.logical_operation_id,
+          repository: opts.identity.repository,
+          issue: opts.identity.issue,
+          run_id: opts.identity.run_id,
+        }),
+      );
+    }
+    return {
+      attempts,
+      finalResult: {
+        success: true,
+        exit_code: 0,
+        duration: 0,
+        observed_complete: true,
+        certainty: "known_complete",
+      },
+      budgetExhausted: false,
+      certainty: "known_complete",
+      observation: "verified-complete",
+    };
+  }
+  if (opts.identity) {
+    reportMechanicalFault(opts.reportObservation, {
+      operation: stage,
+      form_id: formIdForStage(stage),
+      message: "observer could not prove complete or absent; keeping the operation owned as cooling",
+      domain: opts.identity.domain,
+      logical_operation_id: opts.identity.logical_operation_id,
+      repository: opts.identity.repository,
+      issue: opts.identity.issue,
+      run_id: opts.identity.run_id,
+      fault: "mechanical",
+      certainty: "uncertain",
+    });
+  }
+  const prior = attempts[attempts.length - 1]?.result;
+  return {
+    attempts,
+    finalResult: {
+      success: false,
+      exit_code: prior?.exit_code,
+      timed_out: prior?.timed_out,
+      duration: prior?.duration ?? 0,
+      cooling: true,
+      certainty: "uncertain",
+    },
+    budgetExhausted: false,
+    certainty: "uncertain",
+    observation: "cooling",
+  };
+}
+
+function attemptOwnedFixResult(
+  attempts: OwnedFixAttempt[],
+  finalResult: OwnedFixAttempt["result"],
+  budgetExhausted: boolean,
+): OwnedFixAttemptsResult {
+  return {
+    attempts,
+    finalResult,
+    budgetExhausted,
+    certainty: "uncertain",
+    observation: "attempt",
   };
 }
 
@@ -715,6 +906,12 @@ export async function runOwnedFixAttempts<TResult extends OwnedFixAttempt["resul
   const nowMs = opts.nowMs ?? (() => performance.now());
 
   for (let attemptNum = 1; attemptNum <= totalAttemptsCap; attemptNum++) {
+    if (attemptNum > 1) {
+      const certainty = opts.observeCertainty ? await opts.observeCertainty() : "uncertain";
+      if (!mayReplaySideEffect(certainty)) {
+        return haltOwnedFixOnObservation(attempts, certainty, opts);
+      }
+    }
     let timeoutSec: number;
     if (attemptNum === 1) {
       timeoutSec = opts.fixTimeoutSec;
@@ -735,11 +932,7 @@ export async function runOwnedFixAttempts<TResult extends OwnedFixAttempt["resul
             certainty: "uncertain",
           });
         }
-        return {
-          attempts,
-          finalResult: attempts[attempts.length - 1]!.result,
-          budgetExhausted: true,
-        };
+        return attemptOwnedFixResult(attempts, attempts[attempts.length - 1]!.result, true);
       }
       if (opts.onRetryScheduled) {
         await opts.onRetryScheduled(attemptNum, opts.maxRetries, priorReason!);
@@ -761,10 +954,15 @@ export async function runOwnedFixAttempts<TResult extends OwnedFixAttempt["resul
     consumedSec += debitSec;
 
     if (result.success) {
-      return { attempts, finalResult: result, budgetExhausted: false };
+      const certainty = opts.observeCertainty ? await opts.observeCertainty() : "uncertain";
+      if (!mayReplaySideEffect(certainty)) {
+        return haltOwnedFixOnObservation(attempts, certainty, opts);
+      }
+      priorReason = "exit 0 but observer proved the postcondition absent";
+      continue;
     }
     if (result.background_wait || result.preflight_failed) {
-      return { attempts, finalResult: result, budgetExhausted: false };
+      return attemptOwnedFixResult(attempts, result, false);
     }
     priorReason = result.timed_out
       ? `timed out after ${debitSec.toFixed(0)}s`
@@ -785,11 +983,22 @@ export async function runOwnedFixAttempts<TResult extends OwnedFixAttempt["resul
     }
   }
 
-  return {
-    attempts,
-    finalResult: attempts[attempts.length - 1]!.result,
-    budgetExhausted: false,
-  };
+  const last = attempts[attempts.length - 1]!.result;
+  if (last.success) {
+    return {
+      attempts,
+      finalResult: {
+        success: false,
+        exit_code: last.exit_code,
+        duration: last.duration ?? 0,
+        certainty: "known_absent",
+      },
+      budgetExhausted: false,
+      certainty: "known_absent",
+      observation: "attempt",
+    };
+  }
+  return attemptOwnedFixResult(attempts, last, false);
 }
 
 export function scanDeliveryStageAdapterContracts(coreRoot?: string): ForbiddenAdapterTreatmentHit[] {
@@ -807,6 +1016,7 @@ export function scanDeliveryStageAdapterContracts(coreRoot?: string): ForbiddenA
         continue;
       }
       hits.push(...collectForbiddenAdapterTreatments(source, rel, stage));
+      hits.push(...collectErrorNameClassificationHits(source, rel).map((h) => ({ ...h, stage })));
       hits.push(...collectWorktreeRematerializeBypasses(source, rel).map((h) => ({ ...h, stage })));
     }
   }

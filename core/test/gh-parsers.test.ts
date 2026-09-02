@@ -14,6 +14,8 @@ import {
   listIssueBodyRevisions,
   getPrForIssue,
   getPrForIssueAnyState,
+  ISSUE_TIMELINE_PR_PAGE_CAP,
+  listPrsForIssueAnyState,
   isBlocked,
   listOpenPrsForIssue,
   mapRawIssue,
@@ -26,6 +28,7 @@ import {
   parsePrList,
   parsePrMergeState,
   pickPrFromTimelinePage,
+  listPrsFromTimelinePage,
   pickStage,
   resolveOpenPrsForIssue,
   resolvePrForIssue,
@@ -1086,6 +1089,13 @@ test("pickPrFromTimelinePage: scans newest-first when multiple links exist", () 
   assert.equal(pickPrFromTimelinePage([connectedEventNode(5), connectedEventNode(9)], 154), 9);
 });
 
+test("listPrsFromTimelinePage: returns every linked PR, newest first", () => {
+  assert.deepEqual(
+    listPrsFromTimelinePage([connectedEventNode(5), connectedEventNode(9)], 154),
+    [9, 5],
+  );
+});
+
 test("getPrForIssueAnyState: resolves via GraphQL timeline query, not a repo-wide gh pr list scan", async () => {
   let captured: string[] = [];
   const run: GhApiRunner = async (args) => {
@@ -1157,6 +1167,36 @@ test("getPrForIssueAnyState: returns null once the timeline is exhausted with no
   const run: GhApiRunner = async () => timelinePageResponse([], { hasPreviousPage: false, startCursor: null });
   const result = await getPrForIssueAnyState(TIMELINE_CFG, 154, run);
   assert.equal(result, null);
+});
+
+test("listPrsForIssueAnyState: hitting the page cap reports truncated, not a complete set", async () => {
+  let calls = 0;
+  const run: GhApiRunner = async () => {
+    calls++;
+    return timelinePageResponse(
+      calls === 1 ? [connectedEventNode(99)] : [],
+      { hasPreviousPage: true, startCursor: `cursor-${calls}` },
+    );
+  };
+  const result = await listPrsForIssueAnyState(TIMELINE_CFG, 154, run);
+  assert.equal(result.truncated, true);
+  assert.deepEqual(result.numbers, [99]);
+  assert.equal(calls, ISSUE_TIMELINE_PR_PAGE_CAP);
+});
+
+test("listPrsForIssueAnyState: exhaustion is a complete enumeration", async () => {
+  let calls = 0;
+  const run: GhApiRunner = async () => {
+    calls++;
+    return timelinePageResponse(
+      calls === 1 ? [connectedEventNode(3), connectedEventNode(7)] : [],
+      { hasPreviousPage: calls === 1, startCursor: calls === 1 ? "cursor-1" : null },
+    );
+  };
+  const result = await listPrsForIssueAnyState(TIMELINE_CFG, 154, run);
+  assert.equal(result.truncated, false);
+  assert.deepEqual(result.numbers, [7, 3]);
+  assert.equal(calls, 2);
 });
 
 // ---------------------------------------------------------------------------

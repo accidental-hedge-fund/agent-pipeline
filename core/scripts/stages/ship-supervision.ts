@@ -66,6 +66,9 @@ export interface ShipPhaseInvariant {
   observer: string;
   candidate_binding: string;
   replay_rule: string;
+  side_effect_identity: string;
+  safe_replay_predicate: string;
+  reconstruction_rule: string;
 }
 
 export const SHIP_PHASE_INVARIANTS: readonly ShipPhaseInvariant[] = [
@@ -76,6 +79,9 @@ export const SHIP_PHASE_INVARIANTS: readonly ShipPhaseInvariant[] = [
     observer: "GitHub pull-request identity (repository, number, head SHA, base)",
     candidate_binding: "release.candidate_head_oid === frg.candidate_head_oid",
     replay_rule: "observe existing release PR before create; do not open a second PR",
+    side_effect_identity: "release PR whose head is bound to the FRG candidate",
+    safe_replay_predicate: "replay only when the observer proves no release PR exists for this candidate",
+    reconstruction_rule: "reconstruct local claim from GitHub pull-request identity; do not open a PR as repair",
   },
   {
     phase: "release_finish",
@@ -84,6 +90,9 @@ export const SHIP_PHASE_INVARIANTS: readonly ShipPhaseInvariant[] = [
     observer: "GitHub merged pull-request merge-commit OID",
     candidate_binding: "finish.head_oid === prepare.head_oid",
     replay_rule: "observe merged identity before merge; do not remarge a merged PR",
+    side_effect_identity: "merge of the prepared release PR",
+    safe_replay_predicate: "replay only when the observer proves the release PR is still unmerged",
+    reconstruction_rule: "reconstruct local claim from the GitHub merged pull-request OID; do not remarge as repair",
   },
   {
     phase: "tag",
@@ -92,6 +101,9 @@ export const SHIP_PHASE_INVARIANTS: readonly ShipPhaseInvariant[] = [
     observer: "origin annotated tag peeled commit",
     candidate_binding: "tag peel === merge_commit_oid",
     replay_rule: "observe origin tag before create/push; a local-only tag does not complete",
+    side_effect_identity: "origin annotated tag on the merge commit",
+    safe_replay_predicate: "replay only when the origin observer proves that tag is absent",
+    reconstruction_rule: "reconstruct local claim from the origin annotated tag peel; do not push a tag as repair",
   },
   {
     phase: "publication",
@@ -100,6 +112,9 @@ export const SHIP_PHASE_INVARIANTS: readonly ShipPhaseInvariant[] = [
     observer: "GitHub Release (non-draft) + tagged commit digest",
     candidate_binding: "publication.artifact_digest === merge_commit_oid",
     replay_rule: "observe the Release before wait/create; do not republish a proven Release",
+    side_effect_identity: "non-draft GitHub Release bound to the origin tag and digest",
+    safe_replay_predicate: "replay only when the observer proves that Release is absent or still draft",
+    reconstruction_rule: "reconstruct local claim from the GitHub Release; do not republish as repair",
   },
   {
     phase: "promotion",
@@ -108,6 +123,9 @@ export const SHIP_PHASE_INVARIANTS: readonly ShipPhaseInvariant[] = [
     observer: "production pin version + git_sha digest",
     candidate_binding: "pin.git_sha === published artifact digest",
     replay_rule: "observe pin before write; do not rewrite an already matching pin",
+    side_effect_identity: "production pin version plus git_sha digest",
+    safe_replay_predicate: "replay only when the observer proves the pin does not already name this digest",
+    reconstruction_rule: "reconstruct local claim from the production pin; do not rewrite the pin as repair",
   },
   {
     phase: "deployment",
@@ -116,6 +134,9 @@ export const SHIP_PHASE_INVARIANTS: readonly ShipPhaseInvariant[] = [
     observer: "live installed engine digest for the selected host set",
     candidate_binding: "live_digest === authorized_digest",
     replay_rule: "observe live digest before install; a version string alone does not complete",
+    side_effect_identity: "live installed engine digest for the selected host set",
+    safe_replay_predicate: "replay only when the live observer proves the authorized digest is absent",
+    reconstruction_rule: "reconstruct local claim from the live digest; do not deploy as repair",
   },
   {
     phase: "rollback",
@@ -124,8 +145,34 @@ export const SHIP_PHASE_INVARIANTS: readonly ShipPhaseInvariant[] = [
     observer: "production pin previous/retained identity",
     candidate_binding: "pin.version === envelope.retained_target.version",
     replay_rule: "observe retained target before mutation; generic deploy failure grants no authority",
+    side_effect_identity: "production pin repointed to the retained FRG-passed target",
+    safe_replay_predicate: "replay only when the observer proves the pin does not already name the retained target",
+    reconstruction_rule: "reconstruct local claim from the production pin; do not deploy or rewrite the pin as repair",
   },
 ];
+
+export function missingShipPhaseInvariantFields(): string[] {
+  const required = [
+    "precondition",
+    "postcondition",
+    "observer",
+    "candidate_binding",
+    "replay_rule",
+    "side_effect_identity",
+    "safe_replay_predicate",
+    "reconstruction_rule",
+  ] as const;
+  const missing: string[] = [];
+  for (const entry of SHIP_PHASE_INVARIANTS) {
+    for (const field of required) {
+      const value = entry[field];
+      if (typeof value !== "string" || value.trim().length === 0) {
+        missing.push(`${entry.phase}.${field}`);
+      }
+    }
+  }
+  return missing;
+}
 
 export function shipPhaseInvariant(phase: SupervisedShipPhase): ShipPhaseInvariant {
   const found = SHIP_PHASE_INVARIANTS.find((entry) => entry.phase === phase);

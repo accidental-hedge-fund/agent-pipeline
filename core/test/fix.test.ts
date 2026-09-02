@@ -835,13 +835,14 @@ test("advanceFix source pin: a delegated executor result triggers the worktree s
   const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
   // Inside the shared harness-round invoke callback (#629): retry result → sync → return
   // so the helper's post-invoke HEAD read cannot race a delegated executor push.
-  const retryIdx = src.indexOf("const result = retryResult.finalResult;");
-  const syncIdx = src.indexOf("await syncWorktreeToDelegatedExecutorResult(wt.path,", retryIdx);
+  const retryCallIdx = src.indexOf("const retryResult = await invokeFixHarnessWithRetry(");
+  const resultIdx = src.indexOf("retryResult.finalResult", retryCallIdx);
+  const syncIdx = src.indexOf("await syncWorktreeToDelegatedExecutorResult(wt.path,", resultIdx);
   const returnIdx = src.indexOf("return { result, retryResult };", syncIdx);
-  assert.ok(retryIdx !== -1 && syncIdx !== -1 && returnIdx !== -1);
-  assert.ok(retryIdx < syncIdx, "the sync must run after the harness result is known");
+  assert.ok(retryCallIdx !== -1 && resultIdx !== -1 && syncIdx !== -1 && returnIdx !== -1);
+  assert.ok(resultIdx < syncIdx, "the sync must run after the harness result is known");
   assert.ok(syncIdx < returnIdx, "the sync must run before the invoke callback returns (before shared helper reads HEAD)");
-  const guardSlice = src.slice(retryIdx, syncIdx);
+  const guardSlice = src.slice(resultIdx, syncIdx);
   assert.match(
     guardSlice,
     /if\s*\(result\.executor_name\)\s*\{/,
@@ -2034,12 +2035,16 @@ function harnessResult(overrides: Partial<HarnessResult> = {}): HarnessResult {
   };
 }
 
+/** Explicit proven-absent observer for fixtures that exercise replay. */
+const provenAbsent = () => "known_absent" as const;
+
 test("invokeFixHarnessWithRetry: persistently crashing harness with maxRetries=2 is invoked exactly 3 times, then blocks", async () => {
   let calls = 0;
   const result = await invokeFixHarnessWithRetry({
     maxRetries: 2,
     fixTimeoutSec: 2400,
     basePrompt: "BASE-PROMPT",
+    observeCertainty: provenAbsent,
     invokeAttempt: async () => {
       calls++;
       return harnessResult({ exit_code: 1 });
@@ -2049,6 +2054,59 @@ test("invokeFixHarnessWithRetry: persistently crashing harness with maxRetries=2
   assert.equal(result.attempts.length, 3);
   assert.equal(result.finalResult.success, false);
   assert.equal(result.budgetExhausted, false);
+});
+
+test("invokeFixHarnessWithRetry: known_complete observation is verified success, not the failed attempt", async () => {
+  let calls = 0;
+  const result = await invokeFixHarnessWithRetry({
+    maxRetries: 2,
+    fixTimeoutSec: 2400,
+    basePrompt: "BASE-PROMPT",
+    observeCertainty: () => "known_complete",
+    invokeAttempt: async () => {
+      calls++;
+      return harnessResult({ exit_code: 1, timed_out: true });
+    },
+  });
+  assert.equal(calls, 1);
+  assert.equal(result.observation, "verified-complete");
+  assert.equal(result.certainty, "known_complete");
+  assert.equal(result.finalResult.success, true);
+});
+
+test("invokeFixHarnessWithRetry: uncertain observation is cooling and does not replay", async () => {
+  let calls = 0;
+  const result = await invokeFixHarnessWithRetry({
+    maxRetries: 2,
+    fixTimeoutSec: 2400,
+    basePrompt: "BASE-PROMPT",
+    observeCertainty: () => "uncertain",
+    invokeAttempt: async () => {
+      calls++;
+      return harnessResult({ exit_code: 1, timed_out: true });
+    },
+  });
+  assert.equal(calls, 1);
+  assert.equal(result.observation, "cooling");
+  assert.equal(result.certainty, "uncertain");
+  assert.equal(result.finalResult.success, false);
+});
+
+test("invokeFixHarnessWithRetry: omitted observer is fail-closed cooling, not proven-absent replay", async () => {
+  let calls = 0;
+  const result = await invokeFixHarnessWithRetry({
+    maxRetries: 2,
+    fixTimeoutSec: 2400,
+    basePrompt: "BASE-PROMPT",
+    invokeAttempt: async () => {
+      calls++;
+      return harnessResult({ exit_code: 1, timed_out: true });
+    },
+  });
+  assert.equal(calls, 1, "must not replay when the wrapper has no authoritative observer");
+  assert.equal(result.observation, "cooling");
+  assert.equal(result.certainty, "uncertain");
+  assert.equal(result.finalResult.cooling, true);
 });
 
 // Regression test (#486 acceptance criteria: "regression tests bite"): with the
@@ -2070,6 +2128,24 @@ test("invokeFixHarnessWithRetry: maxRetries=0 → exactly one invocation, no ret
   assert.equal(result.finalResult.success, false);
 });
 
+test("invokeFixHarnessWithRetry: successful first attempt without a richer observer is fail-closed cooling, not replay", async () => {
+  let calls = 0;
+  const result = await invokeFixHarnessWithRetry({
+    maxRetries: 2,
+    fixTimeoutSec: 1200,
+    basePrompt: "BASE-PROMPT",
+    invokeAttempt: async () => {
+      calls++;
+      return harnessResult({ success: true, exit_code: 0, duration: 5 });
+    },
+  });
+  assert.equal(calls, 1, "omitted observer must not replay exit 0");
+  assert.equal(result.observation, "cooling");
+  assert.equal(result.certainty, "uncertain");
+  assert.equal(result.finalResult.success, false);
+  assert.equal(result.finalResult.cooling, true);
+});
+
 test("invokeFixHarnessWithRetry: fail then succeed → two invocations, success result returned", async () => {
   let calls = 0;
   const prompts: string[] = [];
@@ -2078,6 +2154,7 @@ test("invokeFixHarnessWithRetry: fail then succeed → two invocations, success 
     maxRetries: 2,
     fixTimeoutSec: 1200,
     basePrompt: "BASE-PROMPT",
+    observeCertainty: () => (calls >= 2 ? "known_complete" : "known_absent"),
     invokeAttempt: async (prompt, timeoutSec) => {
       calls++;
       prompts.push(prompt);
@@ -2102,6 +2179,7 @@ test("invokeFixHarnessWithRetry: second attempt's timeoutSec is the residual bud
     maxRetries: 1,
     fixTimeoutSec: 2400,
     basePrompt: "BASE-PROMPT",
+    observeCertainty: () => (timeouts.length >= 2 ? "known_complete" : "known_absent"),
     invokeAttempt: async (_prompt, timeoutSec) => {
       timeouts.push(timeoutSec);
       if (timeouts.length === 1) return harnessResult({ exit_code: 1, duration: 780 });
@@ -2123,6 +2201,7 @@ test("invokeFixHarnessWithRetry: an underreported duration is debited using meas
     maxRetries: 1,
     fixTimeoutSec: 2400,
     basePrompt: "BASE-PROMPT",
+    observeCertainty: provenAbsent,
     nowMs: () => clockMs,
     invokeAttempt: async (_prompt, timeoutSec) => {
       timeouts.push(timeoutSec);
@@ -2162,6 +2241,7 @@ test("invokeFixHarnessWithRetry: default clock is monotonic, so a backward-jumpi
       maxRetries: 1,
       fixTimeoutSec: 100,
       basePrompt: "BASE-PROMPT",
+      observeCertainty: provenAbsent,
       invokeAttempt: async (_prompt, timeoutSec) => {
         timeouts.push(timeoutSec);
         // Real wall-clock delay the executor underreports as duration: 0.
@@ -2187,6 +2267,7 @@ test("invokeFixHarnessWithRetry: remaining budget at/below the floor blocks with
     maxRetries: 2,
     fixTimeoutSec: 2400,
     basePrompt: "BASE-PROMPT",
+    observeCertainty: provenAbsent,
     invokeAttempt: async () => {
       calls++;
       // First (and only) attempt consumes all but a sliver of the budget.
@@ -2204,6 +2285,7 @@ test("invokeFixHarnessWithRetry: a timed-out attempt is retried within the resid
     maxRetries: 1,
     fixTimeoutSec: 1200,
     basePrompt: "BASE-PROMPT",
+    observeCertainty: () => (calls >= 2 ? "known_complete" : "known_absent"),
     invokeAttempt: async () => {
       calls++;
       if (calls === 1) return harnessResult({ timed_out: true, exit_code: -1, duration: 100 });
@@ -2220,6 +2302,7 @@ test("invokeFixHarnessWithRetry: onRetryScheduled fires once per retry with atte
     maxRetries: 2,
     fixTimeoutSec: 2400,
     basePrompt: "BASE-PROMPT",
+    observeCertainty: provenAbsent,
     invokeAttempt: async () => harnessResult({ exit_code: 1, duration: 10 }),
     onRetryScheduled: (attempt, limit, reason) => {
       scheduled.push({ attempt, limit, reason });
@@ -2238,6 +2321,7 @@ test("invokeFixHarnessWithRetry: onBeforeAttempt fires for every attempt includi
     maxRetries: 1,
     fixTimeoutSec: 1200,
     basePrompt: "BASE-PROMPT",
+    observeCertainty: () => (calls >= 2 ? "known_complete" : "known_absent"),
     invokeAttempt: async () => {
       calls++;
       if (calls === 1) return harnessResult({ exit_code: 1, duration: 10 });
@@ -2308,6 +2392,24 @@ test("advanceFix source pin: an exhausted-retry harness-failure block includes t
   const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
   assert.match(src, /appendWorktreeStateDisclosure\(wt\.path, baseReason\)/);
   assert.match(src, /appendWorktreeStateDisclosure\(wt\.path, noCommitsMsg\)/);
+});
+
+test("advanceFix source pin: crash-retry does not fabricate proven-absent when no observer is supplied (#1324)", async () => {
+  const src = await readFile(fileURLToPath(new URL("../scripts/stages/fix.ts", import.meta.url)), "utf8");
+  assert.doesNotMatch(
+    src,
+    /observeCertainty:\s*opts\.observeCertainty\s*\?\?\s*\(\(\)\s*=>\s*"known_absent"\)/,
+    "invokeFixHarnessWithRetry must not default omitted observers to known_absent",
+  );
+  const retryIdx = src.indexOf("const retryResult = await invokeFixHarnessWithRetry(");
+  assert.ok(retryIdx !== -1);
+  const retryBlock = src.slice(retryIdx, retryIdx + 900);
+  assert.match(
+    retryBlock,
+    /observeCertainty:\s*\(\)\s*=>\s*"uncertain"/,
+    "production crash-retry must pass an explicit fail-closed uncertain observer",
+  );
+  assert.doesNotMatch(retryBlock, /"known_absent"/);
 });
 
 test("advanceFix source pin: retry-event/recovery recording is best-effort — an event-write throw cannot propagate (#486)", async () => {

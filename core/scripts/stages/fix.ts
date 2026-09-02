@@ -62,10 +62,12 @@ import { trySalvageUncommittedWork } from "../salvage-harness-work.ts";
 import {
   FIX_RETRY_MIN_BUDGET_SEC as SUPERVISOR_FIX_RETRY_MIN_BUDGET_SEC,
   runOwnedFixAttempts,
+  type OwnedFixObservation,
 } from "../issue-stage-adapters.ts";
 import {
   defaultRecoverySupervisorReport,
   type ReportOperationObservation,
+  type SideEffectCertainty,
 } from "../operation-observation.ts";
 import { runHarnessRound, type HarnessRoundContext } from "../harness-round.ts";
 import {
@@ -319,6 +321,10 @@ export interface FixHarnessRetryResult {
    *  at/below `FIX_RETRY_MIN_BUDGET_SEC`, rather than because the retry cap
    *  was reached. */
   budgetExhausted: boolean;
+  /** Observer certainty that halted or allowed re-entry. */
+  certainty: SideEffectCertainty;
+  /** Discriminated halt: verified-complete is not the failed attempt. */
+  observation: OwnedFixObservation;
 }
 
 export interface FixHarnessRetryOpts {
@@ -330,6 +336,9 @@ export interface FixHarnessRetryOpts {
   basePrompt: string;
   /** RecoverySupervisor observation sink. Defaults to the production sink. */
   reportObservation?: ReportOperationObservation;
+  /** Required on retry-capable paths. Missing observer is fail-closed
+   *  `uncertain` (cooling), never a guessed `known_absent` replay. */
+  observeCertainty?: () => Promise<SideEffectCertainty> | SideEffectCertainty;
   identity?: {
     domain: string;
     logical_operation_id?: string | null;
@@ -376,6 +385,7 @@ export async function invokeFixHarnessWithRetry(
     onBeforeAttempt: opts.onBeforeAttempt,
     onRetryScheduled: opts.onRetryScheduled,
     nowMs: opts.nowMs,
+    observeCertainty: opts.observeCertainty ?? (() => "uncertain"),
     reportObservation: opts.reportObservation ?? defaultRecoverySupervisorReport,
     identity: opts.identity,
   });
@@ -387,6 +397,8 @@ export async function invokeFixHarnessWithRetry(
     })),
     finalResult: owned.finalResult as HarnessResult,
     budgetExhausted: owned.budgetExhausted,
+    certainty: owned.certainty,
+    observation: owned.observation,
   };
 }
 
@@ -863,6 +875,10 @@ export async function advanceFix(
         fixTimeoutSec: cfg.fix_timeout,
         basePrompt: prompt,
         reportObservation: opts.reportObservation,
+        // Fail-closed: do not fabricate proven-absent. Replay requires an
+        // authoritative observer from the caller of this wrapper. Git/goal
+        // proof of a successful attempt runs after this loop.
+        observeCertainty: () => "uncertain",
         identity: {
           domain: cfg.domain ?? "unknown",
           logical_operation_id: opts.logicalOperationId,
@@ -900,7 +916,11 @@ export async function advanceFix(
           }
         },
       });
-      const result = retryResult.finalResult;
+      const lastAttempt = retryResult.attempts.at(-1)?.result;
+      const result =
+        retryResult.observation === "cooling" && lastAttempt?.success === true
+          ? lastAttempt
+          : retryResult.finalResult;
 
       // #553: the final attempt was served by an external stage executor with no
       // cwd of its own — sync `wt.path` to whatever it may have pushed to the
@@ -950,10 +970,15 @@ export async function advanceFix(
         prLookupFailed = true;
         linkedOpenPr = true;
       }
-      if (result.background_wait) {
-        const waitReason = result.lifecycle_evidence
-          ? `missed delivery or foreground-join for job ${result.lifecycle_evidence.job_id}`
-          : "harness-background-wait";
+      if (
+        result.background_wait ||
+        (retryResult.observation === "cooling" && result.success !== true)
+      ) {
+        const waitReason = retryResult.observation === "cooling"
+          ? "side-effect certainty uncertain; RecoverySupervisor cooling"
+          : result.lifecycle_evidence
+            ? `missed delivery or foreground-join for job ${result.lifecycle_evidence.job_id}`
+            : "harness-background-wait";
         const salvageNote = ctx.salvageFailureReason
           ? ` Salvage of uncommitted work also failed: ${ctx.salvageFailureReason}`
           : ctx.salvaged
