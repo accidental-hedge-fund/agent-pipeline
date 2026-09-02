@@ -246,11 +246,11 @@ When the composed `train --merge` would plan or implement any milestone item whi
 
 ### Requirement: Ship coordinator post-train phases SHALL execute the candidate engine
 
-After `train --merge` is complete or resumed complete, in-engine `pipeline ship` SHALL run Factory Reliability Gate (FRG) pack (`factory-release prepare` and `factory-gate`), `pipeline release`, `release finish`, and any coordinator-invoked tag on the candidate engine bound to the SHA being released. The candidate engine SHALL be the control checkout at that SHA, or an explicit candidate install of that SHA.
+After `train --merge` is complete or resumed complete, in-engine `pipeline ship` SHALL run Factory Reliability Gate (FRG) pack (`factory-release prepare` and `factory-gate`), `pipeline release`, `release finish`, and any coordinator-invoked tag on the candidate engine bound to the SHA being released. The candidate engine SHALL be the control checkout at that SHA, or an explicit candidate install of that SHA. The coordinator SHALL obtain that root from the shared asynchronous resolve-and-prepare seam. Identity-only resolution SHALL NOT authorize leaf spawn.
 
 When the operator started `pipeline ship` from the previous production-pin CLI, the coordinator SHALL keep that pin process as the durable coordinator and SHALL spawn the candidate engine for leaf post-train verbs (`factory-release prepare`, `factory-gate`, `release`, `release finish`, and `release ensure-tag`). After a successful candidate `factory-gate`, the coordinator SHALL re-invoke the same candidate `factory-release prepare --request <absolute-request.json> --json` once. When that prepare returns `status: "complete"`, the FRG pack phase SHALL return. When that prepare still returns `status: "awaiting_frg_attestation"` because observation is absent or rejected, the FRG pack phase SHALL fail closed and SHALL name unsigned `frg_run_id` `A`, observed `latest.json` `run_id` `B` when present, and the observe miss reason. It SHALL NOT spawn factory-gate again for that unchanged checkpoint. It SHALL NOT return from the FRG pack phase at the first attestation checkpoint. It SHALL NOT treat the later standalone `pipeline release` leaf as a substitute for that complete checkpoint. `release ensure-tag` SHALL run the candidate's `ensureAnnotatedReleaseTag`; it SHALL NOT import that helper from the production-pin process. It SHALL NOT re-exec `pipeline ship`. It SHALL NOT rerun train. It SHALL NOT keep executing those leaf verbs inside the production-pin process when that process source SHA differs from the candidate. Train and `engine-promote` SHALL remain on the production pin.
 
-The coordinator SHALL fail closed before those ship-end verbs if it cannot resolve a matching candidate engine. A failed resolution SHALL persist the train checkpoint and SHALL NOT start FRG pack or release mutation. This requirement does not authorize `--skip-frg` as the default. It does not authorize promote before GitHub Release publication.
+The coordinator SHALL fail closed before those ship-end verbs if it cannot resolve-and-prepare a matching runnable candidate engine. A failed resolution or failed candidate readiness SHALL persist the train checkpoint and SHALL NOT start FRG pack or release mutation. Setup failure, abandoned ownership, and lock uncertainty SHALL remain supervised lifecycle states (bounded treatment, Cooling, or External-condition wait) and SHALL NOT become generic blocked, needs-human, or terminal mechanical failure. They SHALL NOT create a DecisionRequest or AuthorityRequest. This requirement does not authorize `--skip-frg` as the default. It does not authorize promote before GitHub Release publication. It does not add a new recover recipe, `auto_merge`, a merge stage, or a special ship of the readiness gate.
 
 #### Scenario: Production-pin ship switches to candidate after train
 
@@ -290,6 +290,22 @@ The coordinator SHALL fail closed before those ship-end verbs if it cannot resol
 - **AND** the pin process SHA differs from the FRG-bound candidate SHA
 - **THEN** the coordinator SHALL spawn `release ensure-tag <X.Y.Z> <merge-commit-oid>` on the candidate launcher
 - **AND** it SHALL NOT call the production-pin process's imported `ensureAnnotatedReleaseTag`
+
+#### Scenario: Unready candidate stops ship before leaf spawn
+
+- **WHEN** train is complete
+- **AND** a candidate-engine root matches the FRG-bound SHA
+- **AND** resolve-and-prepare fails to prove candidate readiness
+- **THEN** ship SHALL stop before `pipeline factory-release prepare` and before `pipeline release`
+- **AND** persisted train evidence SHALL remain so a retry does not retrain
+- **AND** no candidate leaf command SHALL have spawned
+
+#### Scenario: Setup failure is not needs-human
+
+- **WHEN** in-engine `pipeline ship` fails closed on candidate setup or abandoned ownership
+- **THEN** the outcome SHALL be a supervised lifecycle state (bounded treatment, Cooling, or External-condition wait)
+- **AND** it SHALL NOT be generic blocked, needs-human, or terminal mechanical failure
+- **AND** it SHALL NOT create a DecisionRequest or AuthorityRequest solely for that failure
 
 ### Requirement: Candidate ensure-tag SHALL prove the supplied OID is the merged release
 
