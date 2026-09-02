@@ -2529,18 +2529,47 @@ export async function runSupervisorCycle(
           ledger = recovery.ledger;
           recoveryProgress ||= recovery.attempted;
         } else if (classified.kind === "DecisionRequest" || classified.kind === "AuthorityRequest") {
-          const recovery = await blockAndExecuteRecovery(deps, contract, {
-            runId,
-            token,
-            itemId,
-            engine,
-            blockerClass: classified.durable_class,
-            diagnostic: response.diagnostic,
-            evidence: transportEvidence,
-            allowAlreadyStopped: true,
-          });
-          ledger = recovery.ledger;
-          recoveryProgress ||= recovery.attempted;
+          // Durable missing-authority / specification-decision require the same
+          // current canonical diagnostic as blocked_needs_human. Stale or
+          // malformed recoverable diagnostics stay engine-owned.
+          const currentAttested =
+            typeof observedHead === "string" &&
+            observedHead.trim().length > 0 &&
+            isCurrentHumanAuthorityDiagnostic(response.diagnostic, observedHead);
+          if (currentAttested) {
+            const recovery = await blockAndExecuteRecovery(deps, contract, {
+              runId,
+              token,
+              itemId,
+              engine,
+              blockerClass: classified.durable_class,
+              diagnostic: response.diagnostic,
+              evidence: transportEvidence,
+              allowAlreadyStopped: true,
+            });
+            ledger = recovery.ledger;
+            recoveryProgress ||= recovery.attempted;
+          } else {
+            const diagnostic =
+              projection.disposition === "recover"
+                ? response.diagnostic
+                : engineDefectDiagnostic(
+                    `pipeline/loop-execution@1 reported blocked_recoverable for item ${itemId} without current attested human authority: ${projection.protocolError ?? `disposition=${projection.disposition}`}`,
+                  );
+            const recovery = await blockAndExecuteRecovery(deps, contract, {
+              runId,
+              token,
+              itemId,
+              engine,
+              blockerClass:
+                projection.disposition === "recover" ? projection.blockerClass : "workflow-engine-defect",
+              diagnostic,
+              evidence: transportEvidence,
+              allowAlreadyStopped: true,
+            });
+            ledger = recovery.ledger;
+            recoveryProgress ||= recovery.attempted;
+          }
         } else {
           const diagnostic =
             projection.disposition === "recover"

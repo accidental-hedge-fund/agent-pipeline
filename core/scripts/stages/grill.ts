@@ -73,12 +73,7 @@ import {
   type GrillSelector,
   type GrillSelectorFlags,
 } from "../grill-selector.ts";
-import {
-  engineCoveredByExistingAuthority,
-  engineProtectedAction,
-  parseSignalsFromModel,
-  settleRecommendation,
-} from "../grill-settle.ts";
+import { parseSignalsFromModel } from "../grill-settle.ts";
 import { resolveTypedRequest } from "../typed-request-resolution.ts";
 import {
   appendGrillEvent,
@@ -318,25 +313,11 @@ export function settleFrontierNodes(
         node.recommendation,
         factText,
       );
-      if (factText && node.question && factText.toLowerCase().includes(node.question.toLowerCase().slice(0, 40))) {
-        signals.discoverable_from_facts = true;
-      }
-      signals.covered_by_existing_authority = engineCoveredByExistingAuthority(
-        node.class,
-        node.recommendation,
-        factText,
-      );
-      signals.protected_action = engineProtectedAction(node.class, node.recommendation);
-      if (signals.protected_action) {
-        signals.reversible = false;
-        signals.covered_by_existing_authority = false;
-      }
-      const result = settleRecommendation(node, signals, factText);
       const classified = resolveTypedRequest({
         nodeClass: node.class,
         recommendation: node.recommendation,
         factText,
-        signals: node.signalsRaw,
+        signals,
         source: "grill",
         rationale: typeof node.signalsRaw.rationale === "string" ? node.signalsRaw.rationale : undefined,
         alternatives: Array.isArray(node.signalsRaw.alternatives)
@@ -346,26 +327,13 @@ export function settleFrontierNodes(
         evidence: Array.isArray(node.signalsRaw.evidence)
           ? (node.signalsRaw.evidence as string[]).filter((e) => typeof e === "string")
           : undefined,
+        tipPresent: false,
+        authority: {
+          eligible_actor: "authenticated-github-actor",
+          repository: "local",
+        },
       });
-      if (result.kind === "auto-accept" || classified.kind === "auto-settle") {
-        const eligibility =
-          result.kind === "auto-accept"
-            ? result.eligibility_reason
-            : classified.kind === "auto-settle"
-              ? classified.eligibility_reason
-              : result.kind === "typed-request"
-                ? result.reason
-                : "auto-settle";
-        const pkg =
-          classified.kind === "auto-settle" || classified.kind === "DecisionRequest"
-            ? classified.package
-            : {
-                recommendation: node.recommendation,
-                rationale: eligibility,
-                alternatives: [] as string[],
-                risk: "low",
-                evidence: factText.trim() ? [factText.trim()] : [eligibility],
-              };
+      if (classified.kind === "auto-settle") {
         const written = writeDecisionResolution(
           {
             ...node,
@@ -375,10 +343,10 @@ export function settleFrontierNodes(
               reference: null,
               reviewer_verdict: null,
               reviewer_reason: null,
-              eligibility_reason: eligibility,
+              eligibility_reason: classified.eligibility_reason,
             },
           },
-          pkg,
+          classified.package,
         );
         if (!written.ok) {
           out.set(node.id, node);
@@ -388,28 +356,46 @@ export function settleFrontierNodes(
         done.add(node.id);
         continue;
       }
-      if (result.kind === "typed-request") {
+      if (
+        classified.kind === "DecisionRequest" ||
+        classified.kind === "CapabilityRequest" ||
+        classified.kind === "AuthorityRequest"
+      ) {
         const pkg =
           classified.kind === "DecisionRequest"
             ? classified.package
             : {
-                recommendation: node.recommendation || result.reason,
-                rationale: result.reason,
+                recommendation:
+                  node.recommendation ||
+                  (classified.kind === "CapabilityRequest"
+                    ? classified.record.missing
+                    : classified.record.operation),
+                rationale:
+                  classified.kind === "CapabilityRequest"
+                    ? classified.record.missing
+                    : classified.record.operation,
                 alternatives: [] as string[],
-                risk: result.request === "AuthorityRequest" ? "high" : "medium",
-                evidence: factText.trim() ? [factText.trim()] : [result.reason],
+                risk: classified.kind === "AuthorityRequest" ? "high" : "medium",
+                evidence:
+                  classified.kind === "AuthorityRequest"
+                    ? classified.record.evidence
+                    : factText.trim()
+                      ? [factText.trim()]
+                      : classified.kind === "CapabilityRequest"
+                        ? [classified.record.live_probe]
+                        : [classified.record.operation],
               };
         const written = writeDecisionResolution(
           {
             ...node,
             resolution: "unresolved",
-            typed_request: result.request,
+            typed_request: classified.kind,
             provenance: {
               settled_by: "none",
               reference: null,
               reviewer_verdict: null,
               reviewer_reason: null,
-              eligibility_reason: result.reason,
+              eligibility_reason: pkg.rationale,
             },
             ...(classified.kind === "CapabilityRequest" ? { capability_request: classified.record } : {}),
             ...(classified.kind === "AuthorityRequest" ? { authority_request: classified.record } : {}),

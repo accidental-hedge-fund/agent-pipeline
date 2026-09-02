@@ -533,6 +533,49 @@ test("grill settleFrontierNodes writes the resolution package", () => {
   assert.equal(assertNewResolutionPackage(nodes[0]!).ok, true);
 });
 
+test("grill settleFrontierNodes uses only the shared classifier: missing_external is CapabilityRequest, never auto-settle", () => {
+  const rec = "need a vendor account id";
+  const question = "Which vendor account should we use for staging?";
+  const raw = [
+    {
+      ...makeNode({
+        id: "vendor",
+        question,
+        recommendation: rec,
+        class: "operational-default",
+      }),
+      signalsRaw: { missing_external: true, reversible: true, in_scope: true, policy_consistent: true },
+    },
+  ];
+  const nodes = settleFrontierNodes(raw, question);
+  assert.notEqual(nodes[0]!.provenance.settled_by, "auto-accept");
+  assert.equal(nodes[0]!.typed_request, "CapabilityRequest");
+});
+
+test("grill settleFrontierNodes does not auto-settle when the shared classifier emits AuthorityRequest", () => {
+  const rec = "disable authentication";
+  const raw = [
+    {
+      ...makeNode({
+        id: "docs",
+        question: "Docs?",
+        recommendation: rec,
+        class: "docs-surface",
+      }),
+      signalsRaw: {
+        reversible: true,
+        in_scope: true,
+        policy_consistent: true,
+        covered_by_existing_authority: true,
+        protected_action: false,
+      },
+    },
+  ];
+  const nodes = settleFrontierNodes(raw, rec);
+  assert.notEqual(nodes[0]!.provenance.settled_by, "auto-accept");
+  assert.equal(nodes[0]!.typed_request, "AuthorityRequest");
+});
+
 test("validateDecisionPackage rejects omitted rationale", () => {
   const bad = validateDecisionPackage({
     recommendation: "REST",

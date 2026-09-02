@@ -94,6 +94,28 @@ function humanAuthorityDiagnostic(reason = "A human product decision is required
   });
 }
 
+function protectedAuthorityDiagnostic(reviewedSha = "abc123") {
+  return buildStageDiagnostic({
+    blockerKind: "human-decision-required",
+    reason: "merge this PR",
+    stage: "plan-review",
+    authorityEvidence: [{
+      category: "authority",
+      finding_key: "deadbeef",
+      finding_fingerprint: "0123456789abcdef",
+      reviewed_sha: reviewedSha,
+    }],
+  });
+}
+
+function humanContextDiagnostic(reason = "need the partner API url") {
+  return buildStageDiagnostic({
+    reasonCode: "human-context-required",
+    blockerKind: "needs-human",
+    reason,
+  });
+}
+
 function currentLocalIdentity(issueNumber = 100) {
   return {
     issue_number: issueNumber,
@@ -2953,6 +2975,118 @@ test("product-decision auto-settle skips the human hold", async () => {
   assert.notEqual(finalLedger.items["200"].state, "waiting");
   assert.equal(finalLedger.items["200"].hold_request, undefined);
   assert.notEqual(result.holdOutstanding, true);
+});
+
+test("blocked_recoverable authority diagnostic without a current candidate stays engine-owned", async () => {
+  const contract = testContract({ items: [{ id: "200", depends_on: [] }] });
+  const ledger = testLedger({ "200": itemEntry("200", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const observe: ReconcileObserveDeps = {
+    async getIssueStateAndLabels() {
+      return { state: "open", labels: [PIPELINE_READY_LABEL] };
+    },
+    async findPrForIssue() {
+      return null;
+    },
+    async getPrDetail() {
+      return null;
+    },
+    async getPrChecks() {
+      return [];
+    },
+    async getLocalHead() {
+      return { branch: "pipeline/200-fix", sha: "def456" };
+    },
+    async baseBranchContainsSha() {
+      return null;
+    },
+    async getLabelEvents() {
+      return [];
+    },
+    now: () => new Date("2026-07-23T00:00:00.000Z"),
+  };
+  let recoveryExecutions = 0;
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => ({
+    schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+    item_id: request.item_id,
+    run_id: request.run_id,
+    outcome: "blocked_recoverable",
+    evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+    diagnostic: protectedAuthorityDiagnostic("abc123"),
+  });
+
+  const result = await driveSupervisor(
+    {
+      store: deps,
+      observe,
+      dispatchItem,
+      executeRecovery: async () => {
+        recoveryExecutions++;
+        return { succeeded: false, evidence: "engine-owned recovery failed" };
+      },
+      probeLiveAdvance: () => ({ live: false }),
+    },
+    { runId: "run-1", engine: "claude" },
+  );
+
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.ok(recoveryExecutions >= 1, "stale authority on blocked_recoverable must enter engine-owned recovery");
+  assert.notEqual(result.stop?.reason, "human_authority");
+  assert.notEqual(finalLedger.stop?.reason, "human_authority");
+  assert.notEqual(finalLedger.items["200"].blocked_theme, "missing-authority");
+  assert.notEqual(finalLedger.items["200"].blocked_theme, "specification-decision");
+  assert.equal(finalLedger.items["200"].hold_request, undefined);
+});
+
+test("blocked_recoverable human-context-required stays a CapabilityRequest, not missing-authority", async () => {
+  const contract = testContract({ items: [{ id: "200", depends_on: [] }] });
+  const ledger = testLedger({ "200": itemEntry("200", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const observe: ReconcileObserveDeps = {
+    async getIssueStateAndLabels() {
+      return { state: "open", labels: [PIPELINE_READY_LABEL] };
+    },
+    async findPrForIssue() {
+      return null;
+    },
+    async getPrDetail() {
+      return null;
+    },
+    async getPrChecks() {
+      return [];
+    },
+    async getLocalHead() {
+      return { branch: "pipeline/200-fix", sha: "abc123" };
+    },
+    async baseBranchContainsSha() {
+      return null;
+    },
+    async getLabelEvents() {
+      return [];
+    },
+    now: () => new Date("2026-07-23T00:00:00.000Z"),
+  };
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => ({
+    schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+    item_id: request.item_id,
+    run_id: request.run_id,
+    outcome: "blocked_recoverable",
+    evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+    diagnostic: humanContextDiagnostic(),
+  });
+
+  const result = await driveSupervisor(
+    { store: deps, observe, dispatchItem },
+    { runId: "run-1", engine: "claude" },
+  );
+
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.equal(result.stop, null);
+  assert.notEqual(finalLedger.items["200"].blocked_theme, "missing-authority");
+  assert.notEqual(finalLedger.items["200"].blocked_theme, "specification-decision");
+  assert.equal(finalLedger.items["200"].state, "waiting");
+  assert.equal(finalLedger.items["200"].hold_request?.kind, "answer");
+  assert.equal(finalLedger.items["200"].hold_request?.typed_request, "CapabilityRequest");
 });
 
 test("blocked_needs_human without attested authority remains engine-owned even with a live blocked label", async () => {
