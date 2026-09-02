@@ -12,7 +12,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { promisify } from "node:util";
 import { getIssueStateAndLabels, getPrMergeState } from "./gh.ts";
-import { isFencedLiveOwner as defaultIsFencedLiveOwner } from "./lock.ts";
+import { isFencedLiveOwner as defaultIsFencedLiveOwner, isWorkspaceOccupiedByOther } from "./lock.ts";
+import { classifyPorcelainForScratchRecover } from "./worktree-dirt.ts";
 import type { PipelineConfig } from "./types.ts";
 
 const execFileAsync = promisify(execFile);
@@ -1467,6 +1468,17 @@ export interface EnsureManagedWorktreeDeps {
   runStoreDeps?: import("./run-store.ts").RunStoreDeps;
   /** Path existence check used after HEAD-mismatch cleanup (defaults to fs.existsSync). */
   existsSync?: (p: string) => boolean;
+  /**
+   * True when a foreign live owner holds the issue-run lock or live-planning
+   * marker. Defaults to {@link isWorkspaceOccupiedByOther}. Tests inject.
+   */
+  isOccupiedByOther?: (input: {
+    domain: string;
+    issueNumber: number;
+    repo: string;
+  }) => boolean;
+  /** Unlink a worktree-relative scratch path. Never used for unknown dirt. */
+  unlinkPath?: (absPath: string) => Promise<void> | void;
 }
 
 const REMATERIALIZE_REASON_MAX = 400;
@@ -1549,6 +1561,88 @@ export async function ensureManagedWorktree(
 
   const existing = await getOnDiskFn(cfg, issueNumber);
   if (existing) {
+    const occupiedFn = deps.isOccupiedByOther ?? ((input) => {
+      if (!input.domain) return false;
+      return isWorkspaceOccupiedByOther({
+        domain: input.domain,
+        issueNumber: input.issueNumber,
+        repo: input.repo,
+      });
+    });
+    if (
+      occupiedFn({
+        domain: cfg.domain ?? "",
+        issueNumber,
+        repo: cfg.repo,
+      })
+    ) {
+      const reason = boundRematerializeReason(
+        "occupied by live owner — waiting without stealing the workspace",
+      );
+      await recordRematerializeGate(deps, "fail", reason);
+      return { result: "fail", worktree: null, reason, blockerKind: "worktree-creation-failed" };
+    }
+
+    const branch = branchName(issueNumber, existing.slug);
+    let remoteTip: string | null = null;
+    try {
+      const lsRemote = await gitFn(
+        cfg,
+        cfg.repo_dir,
+        ["ls-remote", "origin", `refs/heads/${branch}`],
+        { ignoreFailure: true },
+      );
+      remoteTip =
+        lsRemote.code === 0 && (lsRemote.stdout.trim().split(/\s+/)[0] ?? "").length > 0
+          ? lsRemote.stdout.trim().split(/\s+/)[0]!
+          : null;
+    } catch {
+      remoteTip = null;
+    }
+    let prHead: { prNumber: number; headSha: string } | null = null;
+    try {
+      prHead = await resolveOpenPrHeadFn(cfg, branch);
+    } catch {
+      prHead = null;
+    }
+    const prSha = prHead && prHead.headSha.length > 0 ? prHead.headSha : null;
+    const intendedSha = prSha ?? remoteTip;
+    let headSha = "";
+    try {
+      const headRes = await gitWtFn(existing.path, ["rev-parse", "HEAD"], { ignoreFailure: true });
+      headSha = headRes.code === 0 ? headRes.stdout.trim() : "";
+    } catch {
+      headSha = "";
+    }
+
+    if (intendedSha && headSha && headSha !== intendedSha) {
+      const statusRes = await gitWtFn(
+        existing.path,
+        ["status", "--porcelain", "--untracked-files=all"],
+        { ignoreFailure: true },
+      );
+      const porcelain = statusRes.code === 0 ? statusRes.stdout : "";
+      const classified = classifyPorcelainForScratchRecover(porcelain);
+      if (classified.product.length > 0) {
+        const reason = boundRematerializeReason(
+          `remotely advanced HEAD ${headSha.slice(0, 7)} does not match intended tip ${intendedSha.slice(0, 7)}; unknown or unclassified dirt preserved as inconsistency`,
+        );
+        await recordRematerializeGate(deps, "fail", reason);
+        return { result: "fail", worktree: null, reason, blockerKind: "worktree-creation-failed" };
+      }
+      const unlinkFn = deps.unlinkPath;
+      if (classified.untrackedScratch.length > 0 && unlinkFn) {
+        for (const rel of classified.untrackedScratch) {
+          await unlinkFn(path.join(existing.path, rel));
+        }
+      }
+      const reason = boundRematerializeReason(
+        `remotely advanced HEAD ${headSha.slice(0, 7)} does not match intended tip ${intendedSha.slice(0, 7)}; refusing skip as matching candidate`,
+      );
+      await recordRematerializeGate(deps, "fail", reason);
+      return { result: "fail", worktree: null, reason, blockerKind: "worktree-creation-failed" };
+    }
+
     const reason = "already-present";
     await recordRematerializeGate(deps, "skipped", reason);
     return {

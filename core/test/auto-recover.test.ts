@@ -111,6 +111,7 @@ function baseDeps(overrides: Partial<AutoRecoverDeps> = {}): AutoRecoverDeps {
     postComment: async () => {},
     removeLabel: async () => {},
     transition: async () => {},
+    reportObservation: () => {},
     ...overrides,
   };
 }
@@ -151,11 +152,17 @@ test("tryAutoRecover: recovery limit reached → blocked, no correction_event (a
     { body: "## Pipeline: Auto-Recovery (1/2)\n\nRound 1." },
     { body: "## Pipeline: Auto-Recovery (2/2)\n\nRound 2." },
   ];
+  const posted: string[] = [];
   const out = await tryAutoRecover(CFG, 499, undefined, "/tmp/run", runStoreDeps, baseDeps({
     getIssueDetail: async () => ({ comments }) as Awaited<ReturnType<AutoRecoverDeps["getIssueDetail"]>>,
+    postComment: async (_cfg, _n, body) => {
+      posted.push(body);
+    },
   }));
   assert.equal(out.status, "blocked");
   assert.equal(lines().length, 0);
+  assert.equal(posted.length, 0, "must not post a terminal auto-recovery-limit comment");
+  assert.match(out.reason ?? "", /ownership retained|Cooling/i);
 });
 
 test("tryAutoRecover: no runDir supplied → recovery still succeeds but no correction_event is emitted", async () => {

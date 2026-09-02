@@ -487,3 +487,44 @@ export function isFencedLiveOwner(input: {
 }): boolean {
   return isIssueRunLockLive(input.domain, input.issueNumber) || isLivePlanningActive(input.repo, input.issueNumber);
 }
+
+function readMarkerPid(markerPath: string): number | null {
+  try {
+    const text = fs.readFileSync(markerPath, "utf8").trim();
+    const pid = Number.parseInt(text.split(/\s+/)[0] ?? "", 10);
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * True when a *different* live process holds the issue-run lock or live-planning
+ * marker. The current process (or a parent that already holds the issue-run
+ * lock for this identity) is not a foreign occupier — advance must still be
+ * able to reuse its own managed worktree.
+ */
+export function isWorkspaceOccupiedByOther(input: {
+  domain: string;
+  issueNumber: number;
+  repo: string;
+  selfPid?: number;
+}): boolean {
+  const self = input.selfPid ?? process.pid;
+  if (!isIssueRunLockHeldByParent(input.domain, input.issueNumber)) {
+    const lockPid = readMarkerPid(issueRunLockPath(input.domain, input.issueNumber));
+    if (
+      lockPid != null &&
+      lockPid !== self &&
+      isIssueRunLockLive(input.domain, input.issueNumber)
+    ) {
+      return true;
+    }
+  }
+  const planPid = readMarkerPid(livePlanningMarkerPath(input.repo, input.issueNumber));
+  return (
+    planPid != null &&
+    planPid !== self &&
+    isLivePlanningActive(input.repo, input.issueNumber)
+  );
+}

@@ -52,6 +52,7 @@ import { extractPlan } from "./review-acquisition.ts";
 import {
   branchName,
   createWorktree,
+  ensureManagedWorktree,
   getForIssue,
   getOnDiskForIssue,
   gitInWorktree,
@@ -59,6 +60,8 @@ import {
   isWorktreeCapacityError,
   removeWorktree,
   slugify,
+  type EnsureManagedWorktreeDeps,
+  type EnsureManagedWorktreeResult,
 } from "../worktree.ts";
 import { pushWithCurrencyCheck, type PushWithCurrencyDeps } from "../transient-wrappers.ts";
 import {
@@ -467,6 +470,11 @@ type RunPlanningPhasesDeps = BootstrapWorktreeDeps &
      */
     listChangeDirs?: (dir: string) => string[];
     getOnDiskForIssue?: typeof getOnDiskForIssue;
+    ensureManagedWorktree?: (
+      cfg: PipelineConfig,
+      issueNumber: number,
+      ensureDeps?: EnsureManagedWorktreeDeps,
+    ) => Promise<EnsureManagedWorktreeResult>;
     /** Mutation-ownership seams for the implement harness round (#1246 / #1272). */
     ownershipDeps?: OwnershipDeps;
     /** Optional PR lookup for the unpublished-commit timeout classifier (#1272). */
@@ -728,19 +736,32 @@ export async function runPlanningPhases(
   let lastPlanningFactsBaseSha: string | undefined;
 
   if (resumeImplementing) {
-    const existing = await (deps.getOnDiskForIssue ?? getOnDiskForIssue)(cfg, issueNumber);
-    if (!existing) {
-      await doSetBlocked(
-        cfg,
-        issueNumber,
-        "implement resume requested but no managed worktree exists",
-        "implementing",
-        "worktree-missing",
-      );
+    const ensureFn = deps.ensureManagedWorktree ?? ensureManagedWorktree;
+    const remat = await ensureFn(cfg, issueNumber, {
+      getOnDiskForIssue: deps.getOnDiskForIssue ?? getOnDiskForIssue,
+    });
+    if (remat.result === "fail" || !remat.worktree) {
+      const blockerKind =
+        remat.result === "fail" && remat.blockerKind ? remat.blockerKind : "worktree-missing";
+      const reason =
+        remat.result === "fail"
+          ? `implement resume: rematerialize failed (${blockerKind}): ${remat.reason}`
+          : "implement resume requested but no managed worktree exists";
+      if (blockerKind === "worktree-capacity") {
+        await doSetBlocked(cfg, issueNumber, reason, "implementing", "worktree-capacity");
+        await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked");
+        return blockedOutcome(reason, "worktree-capacity");
+      }
+      if (blockerKind === "worktree-creation-failed") {
+        await doSetBlocked(cfg, issueNumber, reason, "implementing", "worktree-creation-failed");
+        await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked");
+        return blockedOutcome(reason, "worktree-creation-failed");
+      }
+      await doSetBlocked(cfg, issueNumber, reason, "implementing", "worktree-missing");
       await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "blocked");
-      return blockedOutcome("no managed worktree for implement resume", "worktree-missing");
+      return blockedOutcome(reason, "worktree-missing");
     }
-    wt = { path: existing.path, branch: branchName(issueNumber, existing.slug) };
+    wt = { path: remat.worktree.path, branch: remat.worktree.branch };
     const detail = await (deps.getIssueDetail ?? getIssueDetail)(cfg, issueNumber);
     const existingPlan = extractPlan(detail.comments ?? []);
     planText =
@@ -1237,14 +1258,29 @@ export async function runPlanningPhases(
   } // !resumeImplementing
 
   if (!wt) {
-    await doSetBlocked(
-      cfg,
-      issueNumber,
-      "implement stage has no managed worktree",
-      "implementing",
-      "worktree-missing",
-    );
-    return blockedOutcome("no managed worktree for implement", "worktree-missing");
+    const ensureFn = deps.ensureManagedWorktree ?? ensureManagedWorktree;
+    const remat = await ensureFn(cfg, issueNumber, {
+      getOnDiskForIssue: deps.getOnDiskForIssue ?? getOnDiskForIssue,
+    });
+    if (remat.result === "fail" || !remat.worktree) {
+      const blockerKind =
+        remat.result === "fail" && remat.blockerKind ? remat.blockerKind : "worktree-missing";
+      const reason =
+        remat.result === "fail"
+          ? `implement stage rematerialize failed (${blockerKind}): ${remat.reason}`
+          : "implement stage has no managed worktree";
+      if (blockerKind === "worktree-capacity") {
+        await doSetBlocked(cfg, issueNumber, reason, "implementing", "worktree-capacity");
+        return blockedOutcome(reason, "worktree-capacity");
+      }
+      if (blockerKind === "worktree-creation-failed") {
+        await doSetBlocked(cfg, issueNumber, reason, "implementing", "worktree-creation-failed");
+        return blockedOutcome(reason, "worktree-creation-failed");
+      }
+      await doSetBlocked(cfg, issueNumber, reason, "implementing", "worktree-missing");
+      return blockedOutcome(reason, "worktree-missing");
+    }
+    wt = { path: remat.worktree.path, branch: remat.worktree.branch };
   }
 
   // ---- Build implementation plan and invoke implementer harness ----

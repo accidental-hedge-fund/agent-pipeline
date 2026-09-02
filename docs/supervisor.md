@@ -6,6 +6,14 @@ from any outer host: Hermes, OpenClaw, Slack bots, shell cron, or a human.
 **Rule:** supervisors compose the Pipeline CLI. They do not invent a second state
 machine, model matrix, or merge authority in chat.
 
+Issue-advancement stages are RecoverySupervisor **operation adapters**. They
+report observations and evidence. They do not choose Cooling, wait, typed
+request, cancellation, or a terminal mechanical outcome. `setBlocked` is a
+**lifecycle projector** (labels and comments), not lifecycle policy.
+`pipeline recover-parked` and internal `auto_recover` are compatibility
+entrypoints on the same Recovery Episode. There is no `pipeline supervise-advance`
+verb.
+
 Related:
 
 - [Packaging contract](./packaging.md) (CLI is the product; hosts are shims)

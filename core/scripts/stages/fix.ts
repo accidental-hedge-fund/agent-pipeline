@@ -58,6 +58,10 @@ import {
 } from "../verify-harness-commits.ts";
 import { makePipelineRunId } from "../traceability.ts";
 import { trySalvageUncommittedWork } from "../salvage-harness-work.ts";
+import {
+  FIX_RETRY_MIN_BUDGET_SEC as SUPERVISOR_FIX_RETRY_MIN_BUDGET_SEC,
+  runOwnedFixAttempts,
+} from "../issue-stage-adapters.ts";
 import { runHarnessRound, type HarnessRoundContext } from "../harness-round.ts";
 import {
   evaluatePostHarnessNoNewCommit,
@@ -288,7 +292,7 @@ export interface AdvanceFixDeps {
 /** Minimum remaining `fix_timeout` budget (seconds) considered usable for
  *  another retry attempt. At or below this floor, the pipeline blocks instead
  *  of starting a doomed retry. */
-export const FIX_RETRY_MIN_BUDGET_SEC = 60;
+export const FIX_RETRY_MIN_BUDGET_SEC = SUPERVISOR_FIX_RETRY_MIN_BUDGET_SEC;
 
 /** One fix-harness invocation attempt within a retry sequence. */
 export interface FixHarnessAttempt {
@@ -338,74 +342,32 @@ export interface FixHarnessRetryOpts {
 }
 
 /**
- * Retry a fix-round harness invocation in place (same worktree, same prompt
- * plus a retry addendum) up to `maxRetries` additional times, honoring the
- * remaining `fix_timeout` budget across attempts (#486). Never touches git or
- * the worktree itself — purely orchestrates `invokeAttempt` calls — so it is
- * directly unit-testable with a fake invoker and no gh/git/network seam.
+ * One adapter harness attempt, with RecoverySupervisor-owned re-entry
+ * (#1328). The fix stage does not keep a stage-local lifecycle retry loop.
+ * Never touches git or the worktree itself.
  */
 export async function invokeFixHarnessWithRetry(
   opts: FixHarnessRetryOpts,
 ): Promise<FixHarnessRetryResult> {
-  const attempts: FixHarnessAttempt[] = [];
-  let consumedSec = 0;
-  let priorReason: string | null = null;
-  const totalAttemptsCap = 1 + Math.max(0, opts.maxRetries);
-
-  for (let attemptNum = 1; ; attemptNum++) {
-    let timeoutSec: number;
-    if (attemptNum === 1) {
-      timeoutSec = opts.fixTimeoutSec;
-    } else {
-      timeoutSec = Math.max(0, opts.fixTimeoutSec - consumedSec);
-      if (timeoutSec <= FIX_RETRY_MIN_BUDGET_SEC) {
-        return {
-          attempts,
-          finalResult: attempts[attempts.length - 1].result,
-          budgetExhausted: true,
-        };
-      }
-      if (opts.onRetryScheduled) {
-        await opts.onRetryScheduled(attemptNum, opts.maxRetries, priorReason!);
-      }
-    }
-
-    const prompt = attemptNum === 1
-      ? opts.basePrompt
-      : buildFixRetryPreamble(attemptNum, opts.maxRetries, priorReason!) + opts.basePrompt;
-    if (opts.onBeforeAttempt) await opts.onBeforeAttempt(attemptNum, timeoutSec, prompt);
-
-    const nowMs = opts.nowMs ?? (() => performance.now());
-    const attemptStartMs = nowMs();
-    const result = await opts.invokeAttempt(prompt, timeoutSec);
-    const elapsedSec = Math.max(0, (nowMs() - attemptStartMs) / 1000);
-    // #486 review 2: a delegated executor can report a missing, stale, or
-    // underreported `duration` while still consuming real wall time. Debit
-    // the larger of the locally measured elapsed time and the validated
-    // reported duration so the retry budget can never be underspent.
-    const reportedSec = Number.isFinite(result.duration) && result.duration >= 0
-      ? result.duration
-      : 0;
-    const debitSec = Math.max(elapsedSec, reportedSec);
-    attempts.push({ attempt: attemptNum, timeoutSec, result });
-    consumedSec += debitSec;
-
-    if (result.success) {
-      return { attempts, finalResult: result, budgetExhausted: false };
-    }
-    if (result.background_wait) {
-      return { attempts, finalResult: result, budgetExhausted: false };
-    }
-    if (result.preflight_failed) {
-      return { attempts, finalResult: result, budgetExhausted: false };
-    }
-    priorReason = result.timed_out
-      ? `timed out after ${debitSec.toFixed(0)}s`
-      : `exit ${result.exit_code}`;
-    if (attemptNum >= totalAttemptsCap) {
-      return { attempts, finalResult: result, budgetExhausted: false };
-    }
-  }
+  const owned = await runOwnedFixAttempts({
+    maxRetries: opts.maxRetries,
+    fixTimeoutSec: opts.fixTimeoutSec,
+    basePrompt: opts.basePrompt,
+    invokeAttempt: opts.invokeAttempt,
+    buildRetryPreamble: buildFixRetryPreamble,
+    onBeforeAttempt: opts.onBeforeAttempt,
+    onRetryScheduled: opts.onRetryScheduled,
+    nowMs: opts.nowMs,
+  });
+  return {
+    attempts: owned.attempts.map((a) => ({
+      attempt: a.attempt,
+      timeoutSec: a.timeoutSec,
+      result: a.result as HarnessResult,
+    })),
+    finalResult: owned.finalResult as HarnessResult,
+    budgetExhausted: owned.budgetExhausted,
+  };
 }
 
 /**

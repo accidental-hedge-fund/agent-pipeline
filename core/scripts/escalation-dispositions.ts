@@ -17,6 +17,22 @@ export const ESCALATION_SITE_DISPOSITIONS = [
   "reconcile-owned",
 ] as const;
 
+/** RecoverySupervisor migrated outcome for issue-stage escalation sites (#1328). */
+export const MIGRATED_OUTCOMES = [
+  "re-entry",
+  "Cooling",
+  "external-condition wait",
+  "typed request",
+  "compatibility park projection",
+  "authenticated cancellation",
+] as const;
+
+export type MigratedOutcome = (typeof MIGRATED_OUTCOMES)[number];
+
+export function isMigratedOutcome(value: unknown): value is MigratedOutcome {
+  return typeof value === "string" && (MIGRATED_OUTCOMES as readonly string[]).includes(value);
+}
+
 export type EscalationSiteDisposition = (typeof ESCALATION_SITE_DISPOSITIONS)[number];
 
 export function isEscalationSiteDisposition(value: unknown): value is EscalationSiteDisposition {
@@ -37,6 +53,8 @@ export interface EscalationSiteEntry {
   canonical_reason: string;
   notes: string;
   emitter: "setBlocked";
+  /** Required on issue-advancement stage rows (#1328). */
+  migrated_outcome?: MigratedOutcome;
 }
 
 export interface AuthorityEmitterEntry {
@@ -287,3 +305,75 @@ export const AUDIT_CENSUS_REQUIRED_PATTERNS: readonly {
       s.canonical_reason === "review-findings",
   },
 ];
+
+const ISSUE_STAGE_MODULE_SKIP =
+  /\/(merge|ship|train|queue|grill|papercut|doctor|intake|triage|decompose|release|engine-promote|sweep|auto_merge)/;
+
+export function isIssueStageInventoryModule(module: string): boolean {
+  if (module.startsWith("scripts/stages/")) {
+    return !ISSUE_STAGE_MODULE_SKIP.test(module);
+  }
+  return (
+    module === "scripts/pipeline-run.ts" ||
+    module === "scripts/openspec-consistency.ts" ||
+    module === "scripts/issue-context-snapshot.ts" ||
+    module === "scripts/porcelain-dirt-sites.ts"
+  );
+}
+
+const MECHANICAL_BLOCKER_KINDS = new Set([
+  "worktree-missing",
+  "worktree-creation-failed",
+  "worktree-capacity",
+  "worktree-setup-failed",
+  "harness-failure",
+  "push-failed",
+]);
+
+export function deriveMigratedOutcome(site: Pick<EscalationSiteEntry, "blocker_kind" | "canonical_reason">): MigratedOutcome {
+  if (site.blocker_kind === "human-decision-required") return "typed request";
+  if (site.blocker_kind === "worktree-capacity") return "external-condition wait";
+  if (site.canonical_reason === "environment-auth") return "external-condition wait";
+  if (site.canonical_reason === "harness-background-wait") return "external-condition wait";
+  if (site.blocker_kind === "head-drift") return "re-entry";
+  if (site.blocker_kind && MECHANICAL_BLOCKER_KINDS.has(site.blocker_kind)) return "Cooling";
+  if (site.canonical_reason === "transient-infra") return "Cooling";
+  return "compatibility park projection";
+}
+
+export function migratedOutcomeForSite(site: EscalationSiteEntry): MigratedOutcome | null {
+  if (site.migrated_outcome) return site.migrated_outcome;
+  if (!isIssueStageInventoryModule(site.module)) return null;
+  return deriveMigratedOutcome(site);
+}
+
+/** Issue-stage rows must declare a migrated outcome. Mechanical sites must not be typed request. */
+export function assertIssueStageMigratedOutcomes(
+  inventory: EscalationInventory = ESCALATION_INVENTORY,
+): void {
+  const missing: string[] = [];
+  const mechanicalAuthority: string[] = [];
+  for (const site of inventory.sites) {
+    if (!isIssueStageInventoryModule(site.module)) continue;
+    const outcome = site.migrated_outcome;
+    if (!isMigratedOutcome(outcome)) {
+      missing.push(site.site_id);
+      continue;
+    }
+    if (
+      site.blocker_kind &&
+      MECHANICAL_BLOCKER_KINDS.has(site.blocker_kind) &&
+      outcome === "typed request"
+    ) {
+      mechanicalAuthority.push(site.site_id);
+    }
+  }
+  if (missing.length > 0) {
+    throw new Error(`issue-stage inventory missing migrated_outcome: ${missing.join("; ")}`);
+  }
+  if (mechanicalAuthority.length > 0) {
+    throw new Error(
+      `mechanical issue-stage sites must not migrate to Authority Request: ${mechanicalAuthority.join("; ")}`,
+    );
+  }
+}

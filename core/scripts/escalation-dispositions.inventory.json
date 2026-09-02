@@ -24,7 +24,8 @@
       "blocker_kind": "openspec-stale-delta",
       "canonical_reason": "implementation-ci",
       "notes": "spec validity is not infrastructure blip",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "openspec-consistency:openspec-stale-delta#1",
@@ -36,7 +37,8 @@
       "blocker_kind": "openspec-stale-delta",
       "canonical_reason": "implementation-ci",
       "notes": "spec validity is not infrastructure blip",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "pipeline-run:dynamic#0",
@@ -48,7 +50,8 @@
       "blocker_kind": null,
       "canonical_reason": "repair-budget-exhausted",
       "notes": "auto-loop exhaustion terminal",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "pipeline-run:dynamic#1",
@@ -60,7 +63,8 @@
       "blocker_kind": null,
       "canonical_reason": "implementation-ci",
       "notes": "MAX_ITERATIONS fall-through at pre-merge parks with ci-exhausted (#1245); not auto-loop budget",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "porcelain-dirt-sites:dynamic#0",
@@ -72,7 +76,8 @@
       "blocker_kind": null,
       "canonical_reason": "workflow-state",
       "notes": "default fail-closed needs-human park",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "repository-control-drift:needs-human#0",
@@ -96,7 +101,8 @@
       "blocker_kind": "needs-human",
       "canonical_reason": "workflow-state",
       "notes": "new site — fail-closed until explicit",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.deploy_ready:needs-human#1",
@@ -108,7 +114,8 @@
       "blocker_kind": "needs-human",
       "canonical_reason": "workflow-state",
       "notes": "fail-closed repository-control drift readiness park (#695); no auto-remediation of forge settings",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.design_gate:no-pull-request#0",
@@ -120,7 +127,8 @@
       "blocker_kind": "no-pull-request",
       "canonical_reason": "workflow-state",
       "notes": "workflow prerequisite missing",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.design_gate:worktree-capacity#0",
@@ -132,7 +140,8 @@
       "blocker_kind": "worktree-capacity",
       "canonical_reason": "worktree-capacity",
       "notes": "capacity is not site-local retry",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "external-condition wait"
     },
     {
       "site_id": "stages.design_gate:worktree-creation-failed#0",
@@ -144,7 +153,8 @@
       "blocker_kind": "worktree-creation-failed",
       "canonical_reason": "workflow-state",
       "notes": "after rematerialize safety refuse or create fail",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.design_gate:worktree-missing#0",
@@ -156,7 +166,8 @@
       "blocker_kind": "worktree-missing",
       "canonical_reason": "workflow-state",
       "notes": "rematerialize before park when not already exhausted",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.design_gate:harness-failure#0",
@@ -168,7 +179,8 @@
       "blocker_kind": "harness-failure",
       "canonical_reason": "harness-contract",
       "notes": "reviewer harness/entitlement/throttle with typed StageDiagnostic (#870)",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.design_gate:design-gate-failed#0",
@@ -180,7 +192,8 @@
       "blocker_kind": "design-gate-failed",
       "canonical_reason": "implementation-ci",
       "notes": "gate product outcome",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.eval:eval-gate-misconfigured#0",
@@ -192,7 +205,8 @@
       "blocker_kind": "eval-gate-misconfigured",
       "canonical_reason": "implementation-ci",
       "notes": "gate product outcome",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.eval:worktree-capacity#0",
@@ -204,7 +218,8 @@
       "blocker_kind": "worktree-capacity",
       "canonical_reason": "worktree-capacity",
       "notes": "capacity is not site-local retry",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "external-condition wait"
     },
     {
       "site_id": "stages.eval:worktree-creation-failed#0",
@@ -216,7 +231,8 @@
       "blocker_kind": "worktree-creation-failed",
       "canonical_reason": "workflow-state",
       "notes": "after rematerialize safety refuse or create fail",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.eval:worktree-missing#0",
@@ -228,7 +244,8 @@
       "blocker_kind": "worktree-missing",
       "canonical_reason": "workflow-state",
       "notes": "rematerialize before park when not already exhausted",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.eval:push-failed#0",
@@ -240,7 +257,8 @@
       "blocker_kind": "push-failed",
       "canonical_reason": "transient-infra",
       "notes": "push after currency re-sync",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.eval:harness-failure#0",
@@ -252,7 +270,8 @@
       "blocker_kind": "harness-failure",
       "canonical_reason": "harness-contract",
       "notes": "harness/process failure eligible for bounded classify+retry class",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.eval:harness-failure#1",
@@ -264,7 +283,8 @@
       "blocker_kind": "harness-failure",
       "canonical_reason": "harness-timeout",
       "notes": "harness timeout",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.eval:harness-failure#2",
@@ -276,7 +296,8 @@
       "blocker_kind": "harness-failure",
       "canonical_reason": "harness-contract",
       "notes": "harness/process failure eligible for bounded classify+retry class",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.eval:eval-gate-failed#0",
@@ -288,7 +309,8 @@
       "blocker_kind": "eval-gate-failed",
       "canonical_reason": "implementation-ci",
       "notes": "gate product outcome",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "issue-context-snapshot:needs-human#0",
@@ -300,7 +322,8 @@
       "blocker_kind": "needs-human",
       "canonical_reason": "human-context-required",
       "notes": "human-ack gate: operator-scope-change only (#1099)",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "issue-context-snapshot:harness-failure#0",
@@ -312,7 +335,8 @@
       "blocker_kind": "harness-failure",
       "canonical_reason": "workflow-engine-defect",
       "notes": "human-ack recover fallback when in-engine re-plan cannot start (#1099 D5)",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.fix:worktree-capacity#0",
@@ -324,7 +348,8 @@
       "blocker_kind": "worktree-capacity",
       "canonical_reason": "worktree-capacity",
       "notes": "capacity is not site-local retry",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "external-condition wait"
     },
     {
       "site_id": "stages.fix:worktree-creation-failed#0",
@@ -336,7 +361,8 @@
       "blocker_kind": "worktree-creation-failed",
       "canonical_reason": "workflow-state",
       "notes": "after rematerialize safety refuse or create fail",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.fix:worktree-missing#0",
@@ -348,7 +374,8 @@
       "blocker_kind": "worktree-missing",
       "canonical_reason": "workflow-state",
       "notes": "rematerialize before park when not already exhausted",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.fix:needs-human#0",
@@ -360,7 +387,8 @@
       "blocker_kind": "needs-human",
       "canonical_reason": "workflow-state",
       "notes": "default fail-closed needs-human park",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.fix:harness-failure#0",
@@ -372,7 +400,8 @@
       "blocker_kind": "harness-failure",
       "canonical_reason": "harness-background-wait",
       "notes": "typed complete/fail without delivery/join; same-adapter retry forbidden (#1299)",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "external-condition wait"
     },
     {
       "site_id": "stages.fix:harness-failure#1",
@@ -384,7 +413,8 @@
       "blocker_kind": "harness-failure",
       "canonical_reason": "harness-contract",
       "notes": "harness/process failure eligible for bounded classify+retry class",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.fix:no-commits#0",
@@ -396,7 +426,8 @@
       "blocker_kind": "no-commits",
       "canonical_reason": "implementation-ci",
       "notes": "external-commit noop evidence write failure — fail closed (#758 R2)",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.fix:human-decision-required#0",
@@ -408,7 +439,8 @@
       "blocker_kind": "human-decision-required",
       "canonical_reason": "human-decision-required",
       "notes": "authority hold; never auto-retry",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "typed request"
     },
     {
       "site_id": "stages.fix:needs-human#1",
@@ -420,7 +452,8 @@
       "blocker_kind": "needs-human",
       "canonical_reason": "workflow-state",
       "notes": "default fail-closed needs-human park",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.fix:no-commits#1",
@@ -432,7 +465,8 @@
       "blocker_kind": "no-commits",
       "canonical_reason": "implementation-ci",
       "notes": "implementation outcome",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.fix:needs-human#2",
@@ -444,7 +478,8 @@
       "blocker_kind": "needs-human",
       "canonical_reason": "workflow-state",
       "notes": "default fail-closed needs-human park",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.fix:openspec-invalid#0",
@@ -456,7 +491,8 @@
       "blocker_kind": "openspec-invalid",
       "canonical_reason": "implementation-ci",
       "notes": "spec validity is not infrastructure blip",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.fix:build-failed#0",
@@ -468,7 +504,8 @@
       "blocker_kind": "build-failed",
       "canonical_reason": "implementation-ci",
       "notes": "implementation outcome",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.fix:test-gate-exhausted#0",
@@ -480,7 +517,8 @@
       "blocker_kind": "test-gate-exhausted",
       "canonical_reason": "implementation-ci",
       "notes": "implementation outcome",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.fix:needs-human#3",
@@ -492,7 +530,8 @@
       "blocker_kind": "needs-human",
       "canonical_reason": "workflow-state",
       "notes": "default fail-closed needs-human park",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.fix:test-gate-exhausted#1",
@@ -504,7 +543,8 @@
       "blocker_kind": "test-gate-exhausted",
       "canonical_reason": "implementation-ci",
       "notes": "implementation outcome",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.fix:needs-human#4",
@@ -516,7 +556,8 @@
       "blocker_kind": "needs-human",
       "canonical_reason": "workflow-state",
       "notes": "default fail-closed needs-human park",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.fix:needs-human#5",
@@ -528,7 +569,8 @@
       "blocker_kind": "needs-human",
       "canonical_reason": "workflow-state",
       "notes": "default fail-closed needs-human park",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.fix:push-failed#0",
@@ -540,7 +582,8 @@
       "blocker_kind": "push-failed",
       "canonical_reason": "transient-infra",
       "notes": "default transient class is HTTP 5xx after currency re-sync; classifier emits workflow-state for non-fast-forward",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.pre_code_attestation:pre-code-attestation-failed#0",
@@ -552,7 +595,8 @@
       "blocker_kind": "pre-code-attestation-failed",
       "canonical_reason": "workflow-state",
       "notes": "integrity fail-closed for pre-code attestation gate (#575)",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre_code_attestation:pre-code-attestation-failed#1",
@@ -564,7 +608,8 @@
       "blocker_kind": "pre-code-attestation-failed",
       "canonical_reason": "workflow-state",
       "notes": "integrity fail-closed for pre-code attestation gate (#575)",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre_code_attestation:pre-code-attestation-failed#2",
@@ -576,7 +621,8 @@
       "blocker_kind": "pre-code-attestation-failed",
       "canonical_reason": "workflow-state",
       "notes": "integrity fail-closed for pre-code attestation gate (#575)",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre_code_attestation:human-decision-required#0",
@@ -588,7 +634,8 @@
       "blocker_kind": "human-decision-required",
       "canonical_reason": "human-decision-required",
       "notes": "wait for authorized human attestation — durable hold, not new park class (#575)",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "typed request"
     },
     {
       "site_id": "stages.pre_code_attestation:pre-code-attestation-failed#3",
@@ -600,7 +647,8 @@
       "blocker_kind": "pre-code-attestation-failed",
       "canonical_reason": "workflow-state",
       "notes": "integrity fail-closed for pre-code attestation gate (#575)",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre_code_attestation:pre-code-attestation-failed#4",
@@ -612,7 +660,8 @@
       "blocker_kind": "pre-code-attestation-failed",
       "canonical_reason": "workflow-state",
       "notes": "integrity fail-closed for pre-code attestation gate (#575)",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre_code_attestation:pre-code-attestation-failed#5",
@@ -624,7 +673,8 @@
       "blocker_kind": "pre-code-attestation-failed",
       "canonical_reason": "workflow-state",
       "notes": "integrity fail-closed for pre-code attestation gate (#575)",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre_code_attestation:pre-code-attestation-failed#6",
@@ -636,7 +686,8 @@
       "blocker_kind": "pre-code-attestation-failed",
       "canonical_reason": "workflow-state",
       "notes": "integrity fail-closed for pre-code attestation gate (#575)",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre_code_attestation:pre-code-attestation-failed#7",
@@ -648,7 +699,8 @@
       "blocker_kind": "pre-code-attestation-failed",
       "canonical_reason": "workflow-state",
       "notes": "integrity fail-closed for pre-code attestation gate (#575)",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre_code_attestation:pre-code-attestation-failed#8",
@@ -660,7 +712,8 @@
       "blocker_kind": "pre-code-attestation-failed",
       "canonical_reason": "workflow-state",
       "notes": "integrity fail-closed for pre-code attestation gate (#575)",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre_code_attestation:pre-code-attestation-failed#9",
@@ -672,7 +725,8 @@
       "blocker_kind": "pre-code-attestation-failed",
       "canonical_reason": "workflow-state",
       "notes": "integrity fail-closed for pre-code attestation gate (#575)",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre-merge-ci-gate:ci-exhausted#0",
@@ -684,7 +738,8 @@
       "blocker_kind": "ci-exhausted",
       "canonical_reason": "implementation-ci",
       "notes": "CI recovery already exhausted before park",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre-merge-ci-gate:needs-human#0",
@@ -696,7 +751,8 @@
       "blocker_kind": "needs-human",
       "canonical_reason": "transient-infra",
       "notes": "infra read/mutation failure",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.pre-merge-ci-gate:needs-human#1",
@@ -708,7 +764,8 @@
       "blocker_kind": "needs-human",
       "canonical_reason": "workflow-state",
       "notes": "default fail-closed needs-human park",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre-merge-ci-gate:needs-human#2",
@@ -720,7 +777,8 @@
       "blocker_kind": "needs-human",
       "canonical_reason": "workflow-state",
       "notes": "default fail-closed needs-human park",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre-merge-conflict-rebase:dynamic#0",
@@ -732,7 +790,8 @@
       "blocker_kind": "review-findings",
       "canonical_reason": "review-findings",
       "notes": "#1065 conflict-resolve budget exhaust → product/engine-owned review-findings (not human merge-conflict park)",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre-merge-conflict-rebase:dynamic#1",
@@ -744,7 +803,8 @@
       "blocker_kind": "review-findings",
       "canonical_reason": "review-findings",
       "notes": "#1065 conflict-resolve budget exhaust → product/engine-owned review-findings (not human merge-conflict park)",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre-merge-conflict-rebase:dynamic#2",
@@ -756,7 +816,8 @@
       "blocker_kind": "review-findings",
       "canonical_reason": "review-findings",
       "notes": "#1065 conflict-resolve budget exhaust → product/engine-owned review-findings (not human merge-conflict park)",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre-merge-conflict-rebase:dynamic#3",
@@ -768,7 +829,8 @@
       "blocker_kind": "review-findings",
       "canonical_reason": "review-findings",
       "notes": "#1065 conflict-resolve budget exhaust → product/engine-owned review-findings (not human merge-conflict park)",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre-merge-openspec-archive:openspec-invalid#0",
@@ -780,7 +842,8 @@
       "blocker_kind": "openspec-invalid",
       "canonical_reason": "implementation-ci",
       "notes": "spec validity is not infrastructure blip",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre-merge-openspec-archive:needs-human#0",
@@ -792,7 +855,8 @@
       "blocker_kind": "needs-human",
       "canonical_reason": "workflow-state",
       "notes": "default fail-closed needs-human park",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre-merge-openspec-archive:openspec-invalid#1",
@@ -804,7 +868,8 @@
       "blocker_kind": "openspec-invalid",
       "canonical_reason": "implementation-ci",
       "notes": "spec validity is not infrastructure blip",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre-merge-openspec-archive:openspec-invalid#2",
@@ -816,7 +881,8 @@
       "blocker_kind": "openspec-invalid",
       "canonical_reason": "implementation-ci",
       "notes": "spec validity is not infrastructure blip",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre-merge-openspec-archive:worktree-capacity#0",
@@ -828,7 +894,8 @@
       "blocker_kind": "worktree-capacity",
       "canonical_reason": "worktree-capacity",
       "notes": "capacity is not site-local retry",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "external-condition wait"
     },
     {
       "site_id": "stages.pre-merge-openspec-archive:worktree-creation-failed#0",
@@ -840,7 +907,8 @@
       "blocker_kind": "worktree-creation-failed",
       "canonical_reason": "workflow-state",
       "notes": "after rematerialize safety refuse or create fail",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.pre-merge-openspec-archive:worktree-missing#0",
@@ -852,7 +920,8 @@
       "blocker_kind": "worktree-missing",
       "canonical_reason": "workflow-state",
       "notes": "rematerialize before park when not already exhausted",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.pre-merge-openspec-archive:worktree-creation-failed#1",
@@ -864,7 +933,8 @@
       "blocker_kind": "worktree-creation-failed",
       "canonical_reason": "workflow-state",
       "notes": "after rematerialize safety refuse or create fail",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.pre-merge-openspec-archive:needs-human#1",
@@ -876,7 +946,8 @@
       "blocker_kind": "needs-human",
       "canonical_reason": "workflow-state",
       "notes": "default fail-closed needs-human park",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre-merge-openspec-archive:needs-human#2",
@@ -888,7 +959,8 @@
       "blocker_kind": "needs-human",
       "canonical_reason": "workflow-state",
       "notes": "default fail-closed needs-human park",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre-merge-openspec-archive:needs-human#3",
@@ -900,7 +972,8 @@
       "blocker_kind": "needs-human",
       "canonical_reason": "workflow-state",
       "notes": "default fail-closed needs-human park",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre-merge-openspec-archive:needs-human#4",
@@ -912,7 +985,8 @@
       "blocker_kind": "needs-human",
       "canonical_reason": "workflow-state",
       "notes": "default fail-closed needs-human park",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre-merge-openspec-archive:needs-human#5",
@@ -924,7 +998,8 @@
       "blocker_kind": "needs-human",
       "canonical_reason": "workflow-state",
       "notes": "default fail-closed needs-human park",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre-merge-openspec-archive:needs-human#6",
@@ -936,7 +1011,8 @@
       "blocker_kind": "needs-human",
       "canonical_reason": "workflow-state",
       "notes": "default fail-closed needs-human park",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre-merge-openspec-archive:openspec-invalid#3",
@@ -948,7 +1024,8 @@
       "blocker_kind": "openspec-invalid",
       "canonical_reason": "implementation-ci",
       "notes": "spec validity is not infrastructure blip",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre-merge-openspec-archive:needs-human#7",
@@ -960,7 +1037,8 @@
       "blocker_kind": "needs-human",
       "canonical_reason": "workflow-state",
       "notes": "default fail-closed needs-human park",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre-merge-openspec-archive:needs-human#8",
@@ -972,7 +1050,8 @@
       "blocker_kind": "needs-human",
       "canonical_reason": "workflow-state",
       "notes": "default fail-closed needs-human park",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre-merge-openspec-archive:openspec-invalid#4",
@@ -984,7 +1063,8 @@
       "blocker_kind": "openspec-invalid",
       "canonical_reason": "implementation-ci",
       "notes": "spec validity is not infrastructure blip",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre-merge-openspec-archive:harness-failure#0",
@@ -996,7 +1076,8 @@
       "blocker_kind": "harness-failure",
       "canonical_reason": "workflow-engine-defect",
       "notes": "post-archive status failed — cannot prove scratch unstaged before archive commit (#1017 review 2 / #1020 harness-failure)",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.pre-merge-openspec-archive:harness-failure#1",
@@ -1008,7 +1089,8 @@
       "blocker_kind": "harness-failure",
       "canonical_reason": "workflow-engine-defect",
       "notes": "restore --staged failed — fail closed so staged challenge-response JSON cannot enter archive commit (#1017 review 2 / #1020 harness-failure)",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.pre-merge-openspec-archive:harness-failure#2",
@@ -1020,7 +1102,8 @@
       "blocker_kind": "harness-failure",
       "canonical_reason": "workflow-engine-defect",
       "notes": "post-archive status failed — cannot prove scratch unstaged before archive commit (#1017 review 2 / #1020 harness-failure)",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.pre-merge-openspec-archive:harness-failure#3",
@@ -1032,7 +1115,8 @@
       "blocker_kind": "harness-failure",
       "canonical_reason": "workflow-engine-defect",
       "notes": "XY-preserving re-read still shows staged scratch — block before archive commit (#1017 review 2 / #1020 harness-failure)",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.pre-merge-openspec-archive:openspec-invalid#5",
@@ -1044,7 +1128,8 @@
       "blocker_kind": "openspec-invalid",
       "canonical_reason": "implementation-ci",
       "notes": "spec validity is not infrastructure blip",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre-merge-openspec-archive:push-failed#0",
@@ -1056,7 +1141,8 @@
       "blocker_kind": "push-failed",
       "canonical_reason": "transient-infra",
       "notes": "push after currency re-sync",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.pre-merge-openspec-archive:push-failed#1",
@@ -1068,7 +1154,8 @@
       "blocker_kind": "push-failed",
       "canonical_reason": "transient-infra",
       "notes": "push after currency re-sync",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.pre-merge-routing:needs-human#0",
@@ -1080,7 +1167,8 @@
       "blocker_kind": "needs-human",
       "canonical_reason": "workflow-state",
       "notes": "default fail-closed needs-human park",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre-merge-routing:needs-human#1",
@@ -1092,7 +1180,8 @@
       "blocker_kind": "needs-human",
       "canonical_reason": "workflow-state",
       "notes": "default fail-closed needs-human park",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre-merge-routing:needs-human#2",
@@ -1104,7 +1193,8 @@
       "blocker_kind": "needs-human",
       "canonical_reason": "workflow-state",
       "notes": "default fail-closed needs-human park",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre-merge-routing:needs-human#3",
@@ -1116,7 +1206,8 @@
       "blocker_kind": "needs-human",
       "canonical_reason": "workflow-state",
       "notes": "default fail-closed needs-human park",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre-merge-routing:needs-human#4",
@@ -1128,7 +1219,8 @@
       "blocker_kind": "needs-human",
       "canonical_reason": "workflow-state",
       "notes": "default fail-closed needs-human park",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre-merge-routing:needs-human#5",
@@ -1140,7 +1232,8 @@
       "blocker_kind": "needs-human",
       "canonical_reason": "workflow-state",
       "notes": "default fail-closed needs-human park",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre-merge-routing:needs-human#6",
@@ -1152,7 +1245,8 @@
       "blocker_kind": "needs-human",
       "canonical_reason": "workflow-state",
       "notes": "default fail-closed needs-human park",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre-merge-routing:needs-human#7",
@@ -1164,7 +1258,8 @@
       "blocker_kind": "needs-human",
       "canonical_reason": "workflow-state",
       "notes": "default fail-closed needs-human park",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre-merge-routing:merge-conflict#0",
@@ -1176,7 +1271,8 @@
       "blocker_kind": "merge-conflict",
       "canonical_reason": "workflow-state",
       "notes": "reconciler/attempt-ledger #759 owns destructive recovery",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre-merge-routing:openspec-invalid#0",
@@ -1188,7 +1284,8 @@
       "blocker_kind": "openspec-invalid",
       "canonical_reason": "implementation-ci",
       "notes": "spec validity is not infrastructure blip",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre-merge-sha-gate:needs-human#0",
@@ -1200,7 +1297,8 @@
       "blocker_kind": "needs-human",
       "canonical_reason": "environment-auth",
       "notes": "auth/attestation fail-closed",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "external-condition wait"
     },
     {
       "site_id": "stages.pre-merge-sha-gate:needs-human#1",
@@ -1212,7 +1310,8 @@
       "blocker_kind": "needs-human",
       "canonical_reason": "workflow-state",
       "notes": "default fail-closed needs-human park",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre-merge-sha-gate:worktree-capacity#0",
@@ -1224,7 +1323,8 @@
       "blocker_kind": "worktree-capacity",
       "canonical_reason": "worktree-capacity",
       "notes": "capacity is not site-local retry",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "external-condition wait"
     },
     {
       "site_id": "stages.pre-merge-sha-gate:worktree-creation-failed#0",
@@ -1236,7 +1336,8 @@
       "blocker_kind": "worktree-creation-failed",
       "canonical_reason": "workflow-state",
       "notes": "after rematerialize safety refuse or create fail",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.pre-merge-sha-gate:worktree-missing#0",
@@ -1248,7 +1349,8 @@
       "blocker_kind": "worktree-missing",
       "canonical_reason": "workflow-state",
       "notes": "rematerialize before park when not already exhausted",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.pre-merge-sha-gate:needs-human#2",
@@ -1260,7 +1362,8 @@
       "blocker_kind": "needs-human",
       "canonical_reason": "workflow-state",
       "notes": "default fail-closed needs-human park",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre-merge-sha-gate:review-findings#0",
@@ -1272,7 +1375,8 @@
       "blocker_kind": "review-findings",
       "canonical_reason": "review-findings",
       "notes": "pre-merge delta-round ceiling: engine-owned review-findings recovery (not human-authority default)",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.pre-merge-sha-gate:worktree-capacity#1",
@@ -1284,7 +1388,8 @@
       "blocker_kind": "worktree-capacity",
       "canonical_reason": "worktree-capacity",
       "notes": "capacity is not site-local retry",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "external-condition wait"
     },
     {
       "site_id": "stages.pre-merge-sha-gate:worktree-creation-failed#1",
@@ -1296,7 +1401,8 @@
       "blocker_kind": "worktree-creation-failed",
       "canonical_reason": "workflow-state",
       "notes": "after rematerialize safety refuse or create fail",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.pre-merge-sha-gate:worktree-missing#1",
@@ -1308,7 +1414,8 @@
       "blocker_kind": "worktree-missing",
       "canonical_reason": "workflow-state",
       "notes": "rematerialize before park when not already exhausted",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.pre-merge-sha-gate:needs-human#3",
@@ -1320,7 +1427,8 @@
       "blocker_kind": "needs-human",
       "canonical_reason": "workflow-state",
       "notes": "default fail-closed needs-human park",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.review-routing:harness-failure#0",
@@ -1332,7 +1440,8 @@
       "blocker_kind": "harness-failure",
       "canonical_reason": "transient-infra",
       "notes": "gh label/infra path",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.review-routing:no-pull-request#0",
@@ -1344,7 +1453,8 @@
       "blocker_kind": "no-pull-request",
       "canonical_reason": "workflow-state",
       "notes": "workflow prerequisite missing",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.review-routing:harness-failure#1",
@@ -1356,7 +1466,8 @@
       "blocker_kind": "harness-failure",
       "canonical_reason": "harness-contract",
       "notes": "harness/process failure eligible for bounded classify+retry class",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.review-routing:harness-failure#2",
@@ -1368,7 +1479,8 @@
       "blocker_kind": "harness-failure",
       "canonical_reason": "harness-contract",
       "notes": "harness/process failure eligible for bounded classify+retry class",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.review-routing:harness-failure#3",
@@ -1380,7 +1492,8 @@
       "blocker_kind": "harness-failure",
       "canonical_reason": "harness-contract",
       "notes": "harness/process failure eligible for bounded classify+retry class",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.review-routing:harness-failure#4",
@@ -1392,7 +1505,8 @@
       "blocker_kind": "harness-failure",
       "canonical_reason": "harness-contract",
       "notes": "harness/process failure eligible for bounded classify+retry class",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.review-routing:harness-failure#5",
@@ -1404,7 +1518,8 @@
       "blocker_kind": "harness-failure",
       "canonical_reason": "harness-contract",
       "notes": "harness/process failure eligible for bounded classify+retry class",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.review-routing:harness-failure#6",
@@ -1416,7 +1531,8 @@
       "blocker_kind": "harness-failure",
       "canonical_reason": "harness-contract",
       "notes": "harness/process failure eligible for bounded classify+retry class",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.review-routing:harness-failure#7",
@@ -1428,7 +1544,8 @@
       "blocker_kind": "harness-failure",
       "canonical_reason": "harness-contract",
       "notes": "harness/process failure eligible for bounded classify+retry class",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.review-routing:review-independent-quorum-unmet#0",
@@ -1440,7 +1557,8 @@
       "blocker_kind": "review-independent-quorum-unmet",
       "canonical_reason": "workflow-engine-defect",
       "notes": "independent quorum unmet after substitute bound — coverage integrity fail-closed (#694)",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.review-routing:review-no-usable-reviewers#0",
@@ -1452,7 +1570,8 @@
       "blocker_kind": "review-no-usable-reviewers",
       "canonical_reason": "harness-contract",
       "notes": "zero usable reviewers after substitute bound — engine harness/coverage failure not product-judgment (#694)",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.review-routing:review-prompt-too-large#0",
@@ -1464,7 +1583,8 @@
       "blocker_kind": "review-prompt-too-large",
       "canonical_reason": "capability-refusal",
       "notes": "assembled review prompt exceeds reviewer character ceiling before spawn — same-payload retry forbidden (#1054)",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.review-routing:harness-failure#8",
@@ -1476,7 +1596,8 @@
       "blocker_kind": "harness-failure",
       "canonical_reason": "harness-contract",
       "notes": "delegated review format-repair invoke failure (#777) — harness-contract class",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.review-routing:harness-failure#9",
@@ -1488,7 +1609,8 @@
       "blocker_kind": "harness-failure",
       "canonical_reason": "harness-contract",
       "notes": "delegated review.verdict@1 exhausted after shared format-repair (#777) — harness-contract",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.review-routing:harness-failure#10",
@@ -1500,7 +1622,8 @@
       "blocker_kind": "harness-failure",
       "canonical_reason": "workflow-engine-defect",
       "notes": "evidence_subject production failed for new review artifact (#692) — fail closed, never silent legacy_unbound",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.review-routing:harness-failure#11",
@@ -1512,7 +1635,8 @@
       "blocker_kind": "harness-failure",
       "canonical_reason": "harness-contract",
       "notes": "needs-attention+0 findings on re-review — likely unparseable; harness-contract class",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.review-routing:dynamic#0",
@@ -1524,7 +1648,8 @@
       "blocker_kind": null,
       "canonical_reason": "review-findings",
       "notes": "dynamic blockerKind from review policy",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.shipcheck:needs-human#0",
@@ -1680,7 +1805,8 @@
       "blocker_kind": "visual-gate-misconfigured",
       "canonical_reason": "implementation-ci",
       "notes": "gate product outcome",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     },
     {
       "site_id": "stages.visual:worktree-capacity#0",
@@ -1692,7 +1818,8 @@
       "blocker_kind": "worktree-capacity",
       "canonical_reason": "worktree-capacity",
       "notes": "capacity is not site-local retry",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "external-condition wait"
     },
     {
       "site_id": "stages.visual:worktree-creation-failed#0",
@@ -1704,7 +1831,8 @@
       "blocker_kind": "worktree-creation-failed",
       "canonical_reason": "workflow-state",
       "notes": "after rematerialize safety refuse or create fail",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.visual:worktree-missing#0",
@@ -1716,7 +1844,8 @@
       "blocker_kind": "worktree-missing",
       "canonical_reason": "workflow-state",
       "notes": "rematerialize before park when not already exhausted",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.visual:push-failed#0",
@@ -1728,7 +1857,8 @@
       "blocker_kind": "push-failed",
       "canonical_reason": "transient-infra",
       "notes": "push after currency re-sync",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.visual:harness-failure#0",
@@ -1740,7 +1870,8 @@
       "blocker_kind": "harness-failure",
       "canonical_reason": "harness-contract",
       "notes": "harness/process failure eligible for bounded classify+retry class",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.visual:harness-failure#1",
@@ -1752,7 +1883,8 @@
       "blocker_kind": "harness-failure",
       "canonical_reason": "harness-timeout",
       "notes": "harness timeout",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.visual:harness-failure#2",
@@ -1764,7 +1896,8 @@
       "blocker_kind": "harness-failure",
       "canonical_reason": "harness-contract",
       "notes": "harness/process failure eligible for bounded classify+retry class",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "Cooling"
     },
     {
       "site_id": "stages.visual:visual-gate-failed#0",
@@ -1776,7 +1909,8 @@
       "blocker_kind": "visual-gate-failed",
       "canonical_reason": "implementation-ci",
       "notes": "gate product outcome",
-      "emitter": "setBlocked"
+      "emitter": "setBlocked",
+      "migrated_outcome": "compatibility park projection"
     }
   ],
   "authority_emitters": [
