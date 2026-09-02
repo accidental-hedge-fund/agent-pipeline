@@ -353,36 +353,6 @@ In addition to the product train contracts (one multi-item advance wave per base
 - **AND** the system under test advances or merges 271 while 268 remains held
 - **THEN** the test SHALL fail
 
-### Requirement: Train SHALL invoke recover-parked once per park fingerprint before terminal human STOP
-
-When `pipeline train` (including ship/Tugboat composition that invokes train) observes an item at `pipeline:needs-human` or leftover `pipeline:blocked` **after** existing deterministic enter-path resume has been attempted for the current advance, the train SHALL invoke the engine `recover-parked` command (or the same pure entrypoint the CLI uses) **at most once** for that item's current park fingerprint before treating the park as a terminal per-item hold or whole-train STOP for lack of schedulable work. Train SHALL NOT implement a second finding classifier, SHALL NOT call `pipeline override` directly for this reflow, SHALL NOT drop `blocked`/`needs-human` without the recover-parked path, and SHALL NOT call `repair_pipeline_item` as a train-local senior recoverer. If the item remains parked after the single recover-parked attempt (or if the fingerprint already spent its supervisor pass), train SHALL apply today's hold/STOP + notify behavior and MAY continue proven-independent schedulable peers under existing independence rules.
-
-#### Scenario: First park invokes recover-parked once then holds if still parked
-
-- **WHEN** a train item reaches `pipeline:needs-human` (or residual leftover `blocked` after deterministic resume) with a fingerprint that has not spent a supervisor pass
-- **THEN** train SHALL invoke `recover-parked` once for that item
-- **AND** if the item is still parked afterward, train SHALL hold that item and notify with the park reason
-- **AND** train SHALL NOT invent an override disposition outside recover-parked
-
-#### Scenario: Spent fingerprint does not re-invoke senior recover
-
-- **WHEN** the item's park fingerprint has already spent its supervisor recover-parked pass
-- **AND** the item is still or again parked with the same fingerprint
-- **THEN** train SHALL NOT spend another recover-parked senior pass for that fingerprint
-- **AND** SHALL STOP/hold with human notify under existing park rules
-
-#### Scenario: Successful reflow continues same-issue advance without backlog restart
-
-- **WHEN** recover-parked clears or re-enters advance for the parked issue
-- **THEN** train/loop SHALL continue that same issue toward ready-to-deploy on the current work list
-- **AND** SHALL NOT remove and re-select the issue from backlog solely because recover-parked ran
-
-#### Scenario: Train still does not merge from recover-parked
-
-- **WHEN** train invokes recover-parked during a non-merge or merge train
-- **THEN** recover-parked SHALL NOT grant merge authority
-- **AND** train merge behavior SHALL remain governed only by existing `--merge` / merge-wave rules
-
 ### Requirement: Train merge wave SHALL not STOP the ship on in-budget UNKNOWN mergeability
 
 Train merge waves SHALL not STOP the ship on first-read `mergeable: "UNKNOWN"`
@@ -902,3 +872,45 @@ Train SHALL keep a nested item in Cooling, an external-condition wait, or a vali
 - **WHEN** item P records mechanical exhaustion
 - **AND** item Q is proven independent and already ready-to-deploy
 - **THEN** train SHALL NOT abort Q solely because P is cooling
+
+### Requirement: Train SHALL report park and merge observations to RecoverySupervisor
+
+When `pipeline train` (including ship/Tugboat composition that invokes train) observes an item at `pipeline:needs-human`, leftover `pipeline:blocked`, merge conflict, check drift, head drift, unknown mergeability, timeout, or uncertain merge response, train SHALL report a typed operation observation to RecoverySupervisor. Train SHALL NOT invoke the `recover-parked` command or its shared entrypoint. Train SHALL NOT implement a second finding classifier, SHALL NOT call `pipeline override` directly for this reflow, SHALL NOT drop `blocked`/`needs-human` without an audited RecoverySupervisor disposition, and SHALL NOT call `repair_pipeline_item` as a train-local recoverer. Recovery inside an advance wave SHALL remain the loop's job.
+
+#### Scenario: Parked item does not invoke recover-parked
+
+- **WHEN** a train item reaches `pipeline:needs-human` or residual leftover `blocked` after deterministic resume inside the advance wave
+- **THEN** train SHALL NOT invoke `recover-parked`
+- **AND** RecoverySupervisor SHALL retain ownership of that item
+- **AND** train SHALL NOT invent an override disposition
+
+#### Scenario: Successful supervisor recover continues same-issue advance
+
+- **WHEN** RecoverySupervisor clears or re-enters advance for the parked issue
+- **THEN** train/loop SHALL continue that same issue toward ready-to-deploy on the current work list
+- **AND** SHALL NOT remove and re-select the issue from backlog solely because recovery ran
+
+#### Scenario: Train still does not merge from recover-parked
+
+- **WHEN** an operator or RecoverySupervisor recipe invokes `recover-parked` during a non-merge or merge train
+- **THEN** recover-parked SHALL NOT grant merge authority
+- **AND** train merge behavior SHALL remain governed only by existing `--merge` / merge-wave rules
+
+---
+
+### Requirement: Train SHALL treat waiting or cooling as a contained hold for independent siblings
+
+When `--merge` is provided and one selected item reaches a contained wait or Cooling state — including merge conflict, check drift, unknown mergeability, timeout, or uncertain merge response — the train SHALL hold that item and SHALL continue the remaining selected set of proven-independent items. Direct and transitive dependents SHALL remain excluded until the held item's merge-result is contained in the fetched base. The train SHALL NOT whole-train STOP solely because that item is waiting or cooling.
+
+#### Scenario: Cooling item does not abandon independents
+
+- **WHEN** merge-mode train holds issue P in Cooling after uncertain merge response
+- **AND** independent issues S1 and S2 remain on the frozen work list
+- **THEN** the train SHALL continue S1 and S2
+- **AND** it SHALL NOT STOP with `will not implement another sibling` or an equivalent abandonment
+
+#### Scenario: Transitive dependent stays excluded while the prerequisite cools
+
+- **WHEN** merge-mode train holds issue A in Cooling
+- **AND** issue B depends transitively on A
+- **THEN** train SHALL NOT advance or merge B while A remains unintegrated
