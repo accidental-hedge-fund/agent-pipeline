@@ -89,13 +89,17 @@ export function recoveryEpisodeId(key: RecoveryEpisodeKey): string {
 }
 
 /** Same purity contract as {@link fingerprintEvidence}: incidental formatting
- *  does not change identity; material evidence does. Kept here to avoid a
- *  circular import with recovery.ts. */
+ *  (whitespace, case) and explicitly identified incidental tokens (ISO
+ *  timestamps, UUIDs, request IDs, git/hex hashes) do not change identity.
+ *  Semantic values such as HTTP status and error codes are preserved. Kept
+ *  here to avoid a circular import with recovery.ts. */
 export function normalizeEvidenceIdentity(evidence: string): string {
   const normalized = evidence
     .toLowerCase()
+    .replace(/\d{4}-\d{2}-\d{2}t\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:z|[+-]\d{2}:\d{2})?/g, "<ts>")
+    .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/g, "<id>")
+    .replace(/\b(?:x-request-id|x-github-request-id|request[-_]?id)[=:\s]+[0-9a-z._:-]+/g, "<reqid>")
     .replace(/\b[0-9a-f]{7,40}\b/g, "<hash>")
-    .replace(/\d+/g, "<n>")
     .replace(/\s+/g, " ")
     .trim();
   return crypto.createHash("sha256").update(normalized).digest("hex");
@@ -163,6 +167,7 @@ export function resumeEpisodeFromAttempts(
   if (matching.length === 0) {
     const byFields = attempts.filter(
       (attempt) =>
+        attempt.operation === key.operation &&
         attempt.invariant === key.invariant &&
         attempt.candidate_epoch === key.candidate_epoch &&
         (attempt.evidence_identity ?? attempt.evidence_fingerprint) === key.evidence_identity,

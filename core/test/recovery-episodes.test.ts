@@ -51,6 +51,7 @@ import {
   LoopError,
   type LoopContract,
   type LoopLedger,
+  type LoopRecoveryAttempt,
   type RecoveryRecipe,
 } from "../scripts/loop/types.ts";
 import { claimOrResumeRecoveryEpisode, recordRecoveryEpisodeTreatment, stageRecoveryEpisodeKey } from "../scripts/issue-stage-adapters.ts";
@@ -306,6 +307,69 @@ test("1.4 prose-only variation resumes the same evidence identity", () => {
     evidence_identity: a,
   };
   assert.equal(recoveryEpisodeId(key), recoveryEpisodeId({ ...key, evidence_identity: b }));
+});
+
+test("1.5 HTTP status 401 and 403 produce distinct evidence identities", () => {
+  const unauthorized = normalizeEvidenceIdentity("GitHub API returned 401");
+  const forbidden = normalizeEvidenceIdentity("GitHub API returned 403");
+  assert.notEqual(unauthorized, forbidden);
+  const capacityA = normalizeEvidenceIdentity("capacity class 429 retry later");
+  const capacityB = normalizeEvidenceIdentity("capacity class 503 retry later");
+  assert.notEqual(capacityA, capacityB);
+});
+
+test("1.6 timestamps and request IDs are incidental and do not change identity", () => {
+  const a = normalizeEvidenceIdentity(
+    "GitHub API returned 401 at 2026-09-02T00:00:00.000Z request-id: abcdef12-3456-7890-abcd-ef1234567890",
+  );
+  const b = normalizeEvidenceIdentity(
+    "GitHub API returned 401 at 2026-09-02T12:34:56.789Z request-id: 11111111-2222-3333-4444-555555555555",
+  );
+  assert.equal(a, b);
+});
+
+function legacyAttempt(overrides: Partial<LoopRecoveryAttempt> = {}): LoopRecoveryAttempt {
+  return {
+    attempt_id: "legacy-1",
+    seq: 1,
+    time: "2026-09-02T00:00:00.000Z",
+    item_id: "100",
+    class: "implementation-ci",
+    candidate_identity: "head-abc",
+    action: "rerun_ci",
+    actions: ["rerun_ci"],
+    evidence_fingerprint: "ev",
+    outcome: "failed",
+    budget_remaining: 1,
+    invariant: "implementation-ci",
+    candidate_epoch: "head-abc",
+    evidence_identity: "ev",
+    attempts_per_strategy: { rerun_ci: 2 },
+    strategy_cursor: 1,
+    next_eligible_at: "2026-09-03T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+test("1.7 legacy episode fallback requires the operation component of the key", () => {
+  const otherOp = legacyAttempt({ operation: "planning", strategy_cursor: 2 });
+  const currentKey = {
+    operation: "loop_recovery",
+    invariant: "implementation-ci",
+    candidate_epoch: "head-abc",
+    evidence_identity: "ev",
+  };
+  assert.equal(resumeEpisodeFromAttempts([otherOp], currentKey), null);
+
+  const missingOp = legacyAttempt({ strategy_cursor: 2 });
+  delete missingOp.operation;
+  assert.equal(resumeEpisodeFromAttempts([missingOp], currentKey), null);
+
+  const sameOp = legacyAttempt({ operation: "loop_recovery", strategy_cursor: 2 });
+  const resumed = resumeEpisodeFromAttempts([sameOp], currentKey);
+  assert.ok(resumed);
+  assert.equal(resumed!.operation, "loop_recovery");
+  assert.equal(resumed!.strategy_cursor, 2);
 });
 
 // ---------------------------------------------------------------------------

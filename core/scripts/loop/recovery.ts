@@ -474,8 +474,9 @@ export function classifyBlocker(candidates: readonly string[]): DurableBlockerCl
 
 /** Pure function producing a stable fingerprint over normalized evidence —
  *  structurally identical failures fingerprint identically regardless of
- *  incidental formatting (whitespace, case, embedded shas/numbers that vary
- *  run to run), while materially different evidence fingerprints distinctly. */
+ *  incidental formatting (whitespace, case, hashes, timestamps, request IDs),
+ *  while materially different evidence (including HTTP status and error codes)
+ *  fingerprints distinctly. */
 export function fingerprintEvidence(evidence: string): string {
   return normalizeEvidenceIdentity(evidence);
 }
