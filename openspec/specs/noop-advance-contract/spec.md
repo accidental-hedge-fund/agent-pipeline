@@ -2,10 +2,12 @@
 
 ## Purpose
 TBD - created by archiving change generalized-noop-advance-contract. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: The engine SHALL provide a stage-agnostic no-new-commit goal-satisfaction contract
 
-The pipeline SHALL expose a single shared evaluation surface (module/API under `core/scripts/`) that, when a harness or equivalent commit-producing round ends with **no new commit** after salvage has run (or correctly determined there is nothing to salvage), evaluates whether the worktree **HEAD already satisfies the declaring stage’s goal**. The evaluation SHALL return a closed decision among at least: **advance** (goal satisfied), **escalate** (goal not satisfied), and **not-applicable** (path is not a clean no-new-commit case — non-empty commit range, successful salvage commit, or insufficient inputs). Stage modules SHALL NOT each maintain a private full copy of this control skeleton once migrated; stage-specific product meaning of “goal” SHALL remain stage-supplied via explicit goal checks.
+The pipeline SHALL expose a single shared evaluation surface (module/API under `core/scripts/`) that, when a harness or equivalent commit-producing round ends with **no new commit** after salvage has run (or correctly determined there is nothing to salvage), evaluates whether the worktree **HEAD already satisfies the declaring stage’s goal**. The evaluation SHALL return a closed decision among at least: **advance** (goal satisfied), **escalate** (goal not satisfied), and **not-applicable** (path is not a clean no-new-commit case — non-empty commit range, successful salvage commit, or insufficient inputs). Stage modules SHALL NOT each maintain a private full copy of this control skeleton once migrated; stage-specific product meaning of “goal” SHALL remain stage-supplied via explicit goal checks. An **escalate** decision SHALL be an operation observation. RecoverySupervisor SHALL own treatment. The stage adapter SHALL NOT terminalize the Logical Operation.
 
 #### Scenario: Clean no-new-commit with satisfied goal advances
 
@@ -18,8 +20,10 @@ The pipeline SHALL expose a single shared evaluation surface (module/API under `
 
 - **WHEN** a migrated stage’s harness round ends with `headAfter === headBefore`, salvage creates no commit, and the stage’s goal check reports unsatisfied
 - **THEN** the shared evaluation SHALL return **escalate**
-- **AND** the stage SHALL fail closed via its typed blocker path (including `no-commits` or a more specific kind when one already applies)
+- **AND** the adapter SHALL emit a typed observation for that unsatisfied no-op
 - **AND** SHALL NOT treat the round as a silent success
+- **AND** SHALL NOT mark the Logical Operation complete, cancelled, or human-owned
+- **AND** RecoverySupervisor SHALL retain ownership
 
 #### Scenario: Non-empty commit range is not-applicable
 
@@ -129,4 +133,3 @@ The unit-test suite SHALL cover the shared evaluation and migrated call sites wi
 - **WHEN** pre-merge auto-fix noop-clean re-verify clean / still-broken tests run
 - **THEN** they SHALL exercise the shared evaluation (directly or via a stage adapter)
 - **AND** SHALL fail if clean no-commit hard-blocks without goal check or if a second auto-fix attempt is launched solely for re-verify
-
