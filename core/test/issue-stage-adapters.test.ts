@@ -338,6 +338,68 @@ test("retry observation: uncertain is owned cooling, not the original failed att
   assert.equal(cooling[0]?.owned, true);
 });
 
+test("successful first attempt is verified success only after observer proves known_complete", async () => {
+  const sink = memoryObservationSink();
+  let calls = 0;
+  const out = await runOwnedFixAttempts({
+    maxRetries: 2,
+    fixTimeoutSec: 2400,
+    basePrompt: "fix it",
+    buildRetryPreamble: () => "ADDENDUM\n",
+    invokeAttempt: async () => {
+      calls += 1;
+      return { success: true, exit_code: 0, duration: 1 };
+    },
+    observeCertainty: () => "known_complete",
+    reportObservation: sink.reportObservation,
+    identity: { domain: "test", logical_operation_id: "lop-fix-first-ok", issue: 1324, stage: "fix-2" },
+  });
+  assert.equal(calls, 1, "must not replay after verified complete");
+  assert.equal(out.observation, "verified-complete");
+  assert.equal(out.certainty, "known_complete");
+  assert.equal(out.finalResult.success, true);
+  assert.equal(out.finalResult.observed_complete, true);
+});
+
+test("successful first attempt with uncertain observation is owned cooling, not verified success", async () => {
+  let calls = 0;
+  const out = await runOwnedFixAttempts({
+    maxRetries: 2,
+    fixTimeoutSec: 2400,
+    basePrompt: "fix it",
+    buildRetryPreamble: () => "ADDENDUM\n",
+    invokeAttempt: async () => {
+      calls += 1;
+      return { success: true, exit_code: 0, duration: 1 };
+    },
+    observeCertainty: () => "uncertain",
+  });
+  assert.equal(calls, 1, "must not replay when uncertain");
+  assert.equal(out.observation, "cooling");
+  assert.equal(out.certainty, "uncertain");
+  assert.equal(out.finalResult.success, false);
+  assert.equal(out.finalResult.cooling, true);
+});
+
+test("successful first attempt with known_absent may replay under remaining budget", async () => {
+  let calls = 0;
+  const out = await runOwnedFixAttempts({
+    maxRetries: 1,
+    fixTimeoutSec: 2400,
+    basePrompt: "fix it",
+    buildRetryPreamble: () => "ADDENDUM\n",
+    invokeAttempt: async () => {
+      calls += 1;
+      return { success: true, exit_code: 0, duration: 1 };
+    },
+    observeCertainty: () => (calls === 1 ? "known_absent" : "known_complete"),
+  });
+  assert.equal(calls, 2, "known_absent after exit 0 may replay");
+  assert.equal(out.observation, "verified-complete");
+  assert.equal(out.certainty, "known_complete");
+  assert.equal(out.finalResult.success, true);
+});
+
 test("retry observation: missing observer on a retry-capable path is fail-closed cooling", async () => {
   let calls = 0;
   const out = await runOwnedFixAttempts({

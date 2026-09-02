@@ -275,10 +275,14 @@ export async function observeExternalIdentity(deps: ReconcileObserveDeps, itemId
 
   const detailByNumber = new Map<number, Awaited<ReturnType<ReconcileObserveDeps["getPrDetail"]>>>();
   const linkedFacts: LinkedPrIntegrationFact[] = [];
+  let incompleteDetails = false;
   for (const n of linked_pr_numbers) {
     const detail = await deps.getPrDetail(n);
     detailByNumber.set(n, detail);
-    if (!detail) continue;
+    if (!detail) {
+      incompleteDetails = true;
+      continue;
+    }
     let contained: boolean | null = null;
     if (detail.state === "merged" && detail.merge_commit_sha) {
       contained = await deps.baseBranchContainsSha(detail.merge_commit_sha);
@@ -290,11 +294,10 @@ export async function observeExternalIdentity(deps: ReconcileObserveDeps, itemId
       contained,
     });
   }
-  integration_certainty = consultAllLinked
-    ? integrationSideEffectCertainty(linkedFacts, { truncated: listed.truncated })
-    : linkedFacts.some((pr) => pr.state === "merged")
-      ? (linkedFacts.find((pr) => pr.state === "merged")?.contained === true ? "known_complete" : "uncertain")
-      : "known_absent";
+  integration_certainty = integrationSideEffectCertainty(linkedFacts, {
+    truncated: consultAllLinked && listed.truncated,
+    incompleteDetails,
+  });
   const authoritative = consultAllLinked
     ? selectAuthoritativeLinkedPr(linkedFacts)
     : linkedFacts[0] ?? null;

@@ -12,6 +12,7 @@ import {
   LOOP_LEDGER_SCHEMA,
   type LoopContract,
   type LoopContractItem,
+  type LoopExternalIdentity,
   type LoopItemLedgerEntry,
   type LoopItemState,
   type LoopLedger,
@@ -73,6 +74,24 @@ function makeLedger(entries: LoopItemLedgerEntry[], overrides: Partial<LoopLedge
 }
 
 const disjoint = (path: string): OwnershipDeclaration => ({ exclusive: [path] });
+
+function observedIdentity(overrides: Partial<LoopExternalIdentity> = {}): LoopExternalIdentity {
+  return {
+    issue_number: 1,
+    issue_open: true,
+    ready_label_present: false,
+    blocked_label_present: false,
+    pr_number: 12,
+    pr_state: "open",
+    head_branch: "pipeline/1-fix",
+    head_sha: "abc123",
+    merge_commit_sha: null,
+    checks_conclusion: "none",
+    pipeline_stage: "fix-2",
+    observed_at: "2026-07-23T00:00:00.000Z",
+    ...overrides,
+  };
+}
 
 // ---------------------------------------------------------------------------
 // selectSchedulableSet — serialized default.
@@ -339,6 +358,60 @@ test("selectSchedulableSet: reconstructed identity-mismatch is resolved and does
       time: "2026-07-23T00:00:00.000Z",
       observed: {},
       drift: [{ item_id: "1", ledger_state: "waiting", observed_state: "x", class: "identity-mismatch" }],
+      next_actions: { "1": "reconstruct" },
+    },
+  });
+  const decision = selectSchedulableSet({ contract, ledger });
+  assert.deepEqual(decision.selected, ["1"]);
+  assert.notEqual(decision.rationale.find((r) => r.item_id === "1")?.disposition, "unresolved_drift");
+});
+
+test("selectSchedulableSet: reconstructed identity-mismatch with unfinished rebase stays unschedulable", () => {
+  const contract = makeContract([contractItem("1")]);
+  const ledger = makeLedger([ledgerEntry("1")], {
+    last_reconciliation: {
+      sequence: 1,
+      time: "2026-07-23T00:00:00.000Z",
+      observed: {
+        "1": observedIdentity({ rebase_in_progress: true, product_dirt: true }),
+      },
+      drift: [{ item_id: "1", ledger_state: "in_progress", observed_state: "x", class: "identity-mismatch" }],
+      next_actions: { "1": "reconstruct" },
+    },
+  });
+  const decision = selectSchedulableSet({ contract, ledger });
+  assert.deepEqual(decision.selected, []);
+  assert.equal(decision.rationale.find((r) => r.item_id === "1")?.disposition, "unresolved_drift");
+});
+
+test("selectSchedulableSet: reconstructed identity-mismatch with product dirt stays unschedulable", () => {
+  const contract = makeContract([contractItem("1")]);
+  const ledger = makeLedger([ledgerEntry("1")], {
+    last_reconciliation: {
+      sequence: 1,
+      time: "2026-07-23T00:00:00.000Z",
+      observed: {
+        "1": observedIdentity({ rebase_in_progress: false, product_dirt: true }),
+      },
+      drift: [{ item_id: "1", ledger_state: "in_progress", observed_state: "x", class: "identity-mismatch" }],
+      next_actions: { "1": "reconstruct" },
+    },
+  });
+  const decision = selectSchedulableSet({ contract, ledger });
+  assert.deepEqual(decision.selected, []);
+  assert.equal(decision.rationale.find((r) => r.item_id === "1")?.disposition, "unresolved_drift");
+});
+
+test("selectSchedulableSet: reconstructed identity-mismatch after a clean observation is schedulable", () => {
+  const contract = makeContract([contractItem("1")]);
+  const ledger = makeLedger([ledgerEntry("1")], {
+    last_reconciliation: {
+      sequence: 2,
+      time: "2026-07-23T00:00:00.000Z",
+      observed: {
+        "1": observedIdentity({ rebase_in_progress: false, product_dirt: false }),
+      },
+      drift: [{ item_id: "1", ledger_state: "in_progress", observed_state: "x", class: "identity-mismatch" }],
       next_actions: { "1": "reconstruct" },
     },
   });

@@ -26,6 +26,14 @@ SHALL observe that invariant before any local transport retry.
 - **THEN** the observation SHALL NOT mark the Logical Operation complete
 - **AND** side-effect certainty SHALL NOT be `known_complete` solely because of the exit code
 
+#### Scenario: Successful first attempt still requires observer proof
+
+- **WHEN** the first adapter attempt exits 0
+- **THEN** the adapter SHALL observe the declared postcondition
+- **AND** SHALL return verified success only when side-effect certainty is `known_complete`
+- **AND** SHALL keep an `uncertain` result as owned cooling
+- **AND** SHALL replay only after a `known_absent` observation under the same identity and budget
+
 #### Scenario: Adapter observes before local retry
 
 - **WHEN** a delivery-stage adapter is about to retry a proven-idempotent transport operation

@@ -27,3 +27,13 @@ When another actor squash-merges or otherwise merges a pull request linked to th
 - **AND** SHALL NOT be `known_absent`
 - **AND** the engine SHALL NOT open a successor PR
 - **AND** the engine SHALL NOT rebase squash-contained commits
+
+#### Scenario: Failed linked-PR detail reads are not absence
+
+- **WHEN** linked-PR numbers are enumerated
+- **AND** a detail read for any enumerated PR fails or returns no fact
+- **AND** no merged-and-contained PR has been authoritatively observed
+- **THEN** side-effect certainty SHALL be `uncertain`
+- **AND** SHALL NOT be `known_absent`
+- **AND** the engine SHALL NOT open a successor PR
+- **AND** the engine SHALL NOT rebase squash-contained commits

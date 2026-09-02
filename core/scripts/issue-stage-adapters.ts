@@ -954,7 +954,12 @@ export async function runOwnedFixAttempts<TResult extends OwnedFixAttempt["resul
     consumedSec += debitSec;
 
     if (result.success) {
-      return attemptOwnedFixResult(attempts, result, false);
+      const certainty = opts.observeCertainty ? await opts.observeCertainty() : "uncertain";
+      if (!mayReplaySideEffect(certainty)) {
+        return haltOwnedFixOnObservation(attempts, certainty, opts);
+      }
+      priorReason = "exit 0 but observer proved the postcondition absent";
+      continue;
     }
     if (result.background_wait || result.preflight_failed) {
       return attemptOwnedFixResult(attempts, result, false);
@@ -978,7 +983,22 @@ export async function runOwnedFixAttempts<TResult extends OwnedFixAttempt["resul
     }
   }
 
-  return attemptOwnedFixResult(attempts, attempts[attempts.length - 1]!.result, false);
+  const last = attempts[attempts.length - 1]!.result;
+  if (last.success) {
+    return {
+      attempts,
+      finalResult: {
+        success: false,
+        exit_code: last.exit_code,
+        duration: last.duration ?? 0,
+        certainty: "known_absent",
+      },
+      budgetExhausted: false,
+      certainty: "known_absent",
+      observation: "attempt",
+    };
+  }
+  return attemptOwnedFixResult(attempts, last, false);
 }
 
 export function scanDeliveryStageAdapterContracts(coreRoot?: string): ForbiddenAdapterTreatmentHit[] {

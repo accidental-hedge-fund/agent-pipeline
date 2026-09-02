@@ -66,6 +66,13 @@ RecoverySupervisor SHALL reconcile against the declared observers before any rep
 - **THEN** RecoverySupervisor SHALL observe candidate identity, worktree state, and PR identity before the next adapter attempt
 - **AND** SHALL NOT treat the recipe itself as verified completion of the original mutation
 
+#### Scenario: Reconstruct does not schedule adapters over live rebase dirt
+
+- **WHEN** identity-mismatch is an unfinished rebase or product dirt
+- **AND** reconciliation computes `reconstruct`
+- **THEN** the item SHALL remain unschedulable for adapters
+- **AND** SHALL stay unschedulable until a later observation proves a clean, non-rebasing worktree
+
 ---
 
 ### Requirement: Candidate movement SHALL start a new epoch and invalidate candidate-bound evidence
@@ -152,6 +159,15 @@ Before opening a successor PR, rebasing the candidate, or treating advance as st
 
 - **WHEN** linked-PR timeline pagination stops before exhaustion
 - **AND** no merged-and-contained PR is in the observed window
+- **THEN** integration side-effect certainty SHALL be `uncertain`
+- **AND** SHALL NOT be `known_absent`
+- **AND** successor PR-open and rebase of contained commits SHALL remain disallowed
+
+#### Scenario: Failed linked-PR detail reads are not absence
+
+- **WHEN** linked-PR numbers are enumerated
+- **AND** a detail read for any enumerated PR fails or returns no fact
+- **AND** no merged-and-contained PR has been authoritatively observed
 - **THEN** integration side-effect certainty SHALL be `uncertain`
 - **AND** SHALL NOT be `known_absent`
 - **AND** successor PR-open and rebase of contained commits SHALL remain disallowed

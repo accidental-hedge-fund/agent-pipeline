@@ -23,6 +23,7 @@
 - [ ] 4.2 Before PR-open, rebase, or advance-still-needed, observe that linked-PR set, and verify a `fix-2` issue whose linked PR was squash-merged and contained does not open a successor PR and does not rebase squash-contained commits
 - [ ] 4.3 Treat issue closure via `Closes #N` as corroborating evidence only, and verify merged-and-contained PR identity remains the postcondition even when the issue is still labeled `pipeline:fix-2`
 - [x] 4.4 Treat truncated linked-PR timeline pagination as `uncertain`, never `known_absent`, and verify an open PR inside a truncated window does not allow successor mutations
+- [x] 4.5 Treat a failed or missing linked-PR detail read as `uncertain`, never `known_absent`, unless a merged-and-contained PR has already been authoritatively observed
 
 ## 5. Observe before retry and after recovery
 
@@ -31,6 +32,8 @@
 - [ ] 5.3 Reconcile after every recovery recipe before the next adapter attempt, and verify a rematerialize or rebase-abort fixture is not treated as verified completion of the original mutation
 - [ ] 5.4 Keep OpenSpec dirty-before-archive fail-closed when product dirt is present, and verify a first completed archive plus later unfinished-rebase dirt does not replay the archive and does not skip the fail-closed
 - [x] 5.5 Return a discriminated retry observation: `known_complete` is verified success of the original operation, `uncertain` is owned cooling, and a retry-capable path without an observer is fail-closed cooling
+- [x] 5.6 Observe after every owned attempt including a successful first attempt: verified success only for `known_complete`, `uncertain` stays cooling, and `known_absent` may replay under the same identity and budget
+- [x] 5.7 Keep identity-mismatch from an unfinished rebase or product dirt unschedulable for adapters after `reconstruct` until a later observation proves a clean, non-rebasing worktree
 
 ## 6. Dogfood fixture and class guard
 

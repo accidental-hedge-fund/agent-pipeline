@@ -876,7 +876,8 @@ export async function advanceFix(
         basePrompt: prompt,
         reportObservation: opts.reportObservation,
         // Fail-closed: do not fabricate proven-absent. Replay requires an
-        // authoritative observer from the caller of this wrapper.
+        // authoritative observer from the caller of this wrapper. Git/goal
+        // proof of a successful attempt runs after this loop.
         observeCertainty: () => "uncertain",
         identity: {
           domain: cfg.domain ?? "unknown",
@@ -915,7 +916,11 @@ export async function advanceFix(
           }
         },
       });
-      const result = retryResult.finalResult;
+      const lastAttempt = retryResult.attempts.at(-1)?.result;
+      const result =
+        retryResult.observation === "cooling" && lastAttempt?.success === true
+          ? lastAttempt
+          : retryResult.finalResult;
 
       // #553: the final attempt was served by an external stage executor with no
       // cwd of its own — sync `wt.path` to whatever it may have pushed to the
@@ -965,7 +970,10 @@ export async function advanceFix(
         prLookupFailed = true;
         linkedOpenPr = true;
       }
-      if (retryResult.observation === "cooling" || result.background_wait) {
+      if (
+        result.background_wait ||
+        (retryResult.observation === "cooling" && result.success !== true)
+      ) {
         const waitReason = retryResult.observation === "cooling"
           ? "side-effect certainty uncertain; RecoverySupervisor cooling"
           : result.lifecycle_evidence

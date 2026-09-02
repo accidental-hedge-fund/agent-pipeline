@@ -276,6 +276,43 @@ test("4.1 truncated listLinkedPrs does not declare integration absent", async ()
   assert.equal(successorMutationsAllowed(observed.integration_certainty!).openSuccessorPr, false);
 });
 
+test("4.1 failed linked-PR detail reads are uncertain, never known_absent", async () => {
+  const incomplete = integrationSideEffectCertainty(
+    [{ number: 99, state: "open", merge_commit_sha: null, contained: null }],
+    { incompleteDetails: true },
+  );
+  assert.equal(incomplete, "uncertain");
+  assert.notEqual(incomplete, "known_absent");
+  assert.equal(
+    integrationSideEffectCertainty([], { incompleteDetails: true }),
+    "uncertain",
+  );
+  assert.equal(
+    integrationSideEffectCertainty(
+      [{ number: 10, state: "merged", merge_commit_sha: "c".repeat(40), contained: true }],
+      { incompleteDetails: true },
+    ),
+    "known_complete",
+  );
+
+  const deps = fakeObserve({
+    async findPrForIssue() {
+      return 99;
+    },
+    async listLinkedPrs() {
+      return [10, 99];
+    },
+    async getPrDetail() {
+      return null;
+    },
+  });
+  const observed = await observeExternalIdentity(deps, "1369");
+  assert.equal(observed.integration_certainty, "uncertain");
+  assert.notEqual(observed.integration_certainty, "known_absent");
+  assert.equal(successorMutationsAllowed(observed.integration_certainty!).openSuccessorPr, false);
+  assert.equal(successorMutationsAllowed(observed.integration_certainty!).rebaseContainedCommits, false);
+});
+
 test("5.1 SideEffectCertainty gates replay", () => {
   assert.equal(mayReplaySideEffect("known_complete"), false);
   assert.equal(mayReplaySideEffect("known_absent"), true);

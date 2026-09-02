@@ -24,3 +24,10 @@ After every recovery action, the controller SHALL reconcile run ownership, candi
 - **THEN** the controller SHALL observe the rebase as in-progress
 - **AND** SHALL NOT replay the archive
 - **AND** SHALL keep the Logical Operation owned
+
+#### Scenario: Unfinished rebase stays unschedulable until a clean observation
+
+- **WHEN** reconciliation records identity-mismatch for an unfinished rebase or product dirt
+- **AND** the next action is `reconstruct`
+- **THEN** the item SHALL remain unschedulable for adapters
+- **AND** SHALL stay unschedulable until a later observation proves a clean, non-rebasing worktree

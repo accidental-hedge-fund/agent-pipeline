@@ -135,11 +135,25 @@ export function selectSchedulableSet(input: ScheduleInput): ScheduleDecision {
     ),
   );
   const nextActions = ledger.last_reconciliation?.next_actions ?? {};
-  // Reconstruct (and repair-forward) already rewrote local state this pass.
-  // Remaining drift is an audit record, not an unresolved gate.
+  const observedById = ledger.last_reconciliation?.observed ?? {};
+  // Reconstruct and repair-forward rewrote local ledger state this pass.
+  // Unfinished rebase or product dirt is still live worktree contradiction:
+  // keep those identity-mismatches as an adapter gate until recovery and a
+  // later observation prove a clean, non-rebasing worktree.
   const unresolvedDriftIds = new Set(
     (ledger.last_reconciliation?.drift ?? [])
-      .filter((d) => nextActions[d.item_id] !== "reconstruct" && nextActions[d.item_id] !== "repair-forward")
+      .filter((d) => {
+        const action = nextActions[d.item_id];
+        if (action === "repair-forward") return false;
+        if (action === "reconstruct") {
+          const observed = observedById[d.item_id];
+          return (
+            d.class === "identity-mismatch" &&
+            (observed?.rebase_in_progress === true || observed?.product_dirt === true)
+          );
+        }
+        return true;
+      })
       .map((d) => d.item_id),
   );
 
