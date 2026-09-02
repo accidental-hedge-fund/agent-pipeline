@@ -1,10 +1,10 @@
 # Roadmap
 
-This file is human-readable forward-looking documentation for open work. **GitHub milestones** are the authoritative store for which issues are planned for each SemVer release (`pipeline roadmap --apply` writes them; `pipeline release` reads them). Theme labels remain as secondary scope labels. Release history is in [CHANGELOG.md](CHANGELOG.md). Last updated 2026-08-11.
+This file is human-readable forward-looking documentation for open work. **GitHub milestones** are the authoritative store for which issues are planned for each SemVer release (`pipeline roadmap --apply` writes them; `pipeline release` reads them). Theme labels remain as secondary scope labels. Release history is in [CHANGELOG.md](CHANGELOG.md). Last updated 2026-09-02.
 
 ## Roadmap rules
 
-- Every open issue belongs to exactly one full SemVer release milestone.
+- Every scheduled open issue belongs to exactly one full SemVer release milestone. Explicitly parked, deferred, and synthetic factory-run issues remain unmilestoned.
 - A theme label groups related work. It does not replace a release milestone.
 - A patch contains compatible fixes, documentation, or internal hardening. A minor contains compatible new capability. A major requires an approved breaking public-contract change.
 - There is no current major release. No approved open issue requires a breaking change.
@@ -23,7 +23,7 @@ This file is human-readable forward-looking documentation for open work. **GitHu
 | **v1.36.0** ✅ shipped | minor | Roadmap reconciliation | #985 | Shipped 2026-08-11 (tag `v1.36.0`). See CHANGELOG.md. |
 | **v1.37.0** ✅ shipped | minor | Human authority and evidence | #575, #576, #691–#695, #702, #599, #647, #703 | Shipped 2026-08-12 (tag `v1.37.0`). See CHANGELOG.md. |
 | **v1.38.0** ✅ shipped | minor | Factory operations | #892–#896 | Shipped 2026-08-13 (tag `v1.38.0`). See CHANGELOG.md. |
-| **v1.39.0** ✅ shipped | minor | Hermes and Buzz integration | #907, #897 | Shipped 2026-08-15 (tag `v1.39.0`). See CHANGELOG.md. |
+| **v1.39.0** ✅ shipped | minor | Hermes and Buzz integration | #897 | Shipped 2026-08-15 (tag `v1.39.0`). See CHANGELOG.md. |
 | **v1.40.0** ✅ shipped | minor | Qualified issue integration | #662, #899, #900, #906 | Shipped 2026-08-31 (tag `v1.40.0`). See CHANGELOG.md. |
 | **v1.41.0** | minor | Autonomous release and engine promotion | #902, #903 | Add release finalization and exact-tag self-update with rollback. |
 | **v1.42.0** | minor | Work breakdown | #766 | Add epic decomposition into dependency-linked issues and a delivery roadmap. |
@@ -89,8 +89,8 @@ This file is human-readable forward-looking documentation for open work. **GitHu
 | #894 | minor | opt-in | factory controls | v1.38.0 | #647, #890, #891 |
 | #895 | minor | opt-in | provider cooldowns | v1.38.0 | #890, #891 |
 | #896 | minor | opt-in | intake admission | v1.38.0 | #890, #894 |
-| #907 | minor | opt-in | host-neutral integration | v1.39.0 | #891, #892, #894 |
-| #897 | minor | machine-local, default off | Hermes/Buzz productization | v1.39.0 | #891, #892, #894, #907 |
+| #907 | minor | opt-in | host-neutral MCP adapter, parked until a host cannot exec the CLI | *(none)* | #990, #1329, #1332 |
+| #897 | minor | machine-local, default off | Hermes/Buzz productization | v1.39.0 | #891, #892, #894 |
 | #662 | minor | default off | merge qualification | v1.40.0 | #306, #501, #599, #646 |
 | #899 | minor | default off | authority broker | v1.40.0 | #890, #894 |
 | #900 | minor | default off | exact-head merge | v1.40.0 | #662, #899 |
@@ -175,7 +175,8 @@ Theme labels remain on issues to support search and ownership. They do not repla
 |---|---|---|
 | `theme:loop-correctness` | #765 | Dependency-safe loop and integration behavior. |
 | `theme:factory-operations` | #892–#896, #909, #910, #985 | Factory control, observation, and roadmap operations. |
-| `theme:hermes-buzz` | #897, #907 | Hermes and Buzz integration. |
+| `theme:hermes-buzz` | #897 | Hermes and Buzz integration. |
+| `theme:portable-hosts` | #907 | Demand-gated host-neutral adapters over the CLI. |
 | `theme:autonomous-delivery` | #662, #899, #900, #902, #903, #906, #908 | Qualified merge, release, and engine promotion. |
 | `theme:human-evidence` | #575, #576, #599, #647, #691–#695, #702, #703 | Human authority, evidence, intent, and outcomes. |
 | `theme:work-breakdown` | #766 | Epic decomposition and delivery planning. |
