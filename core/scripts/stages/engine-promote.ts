@@ -60,6 +60,49 @@ export interface EnginePromoteOpts {
   gitSha?: string | null;
   /** Absolute pin path override (AGENT_PIPELINE_PRODUCTION_PIN). */
   pinPath?: string | null;
+  /**
+   * Deployment compare-and-swap: the preflight pin generation that must still
+   * hold immediately before pin/install mutation. When set, a mismatch fails
+   * without promoting or installing.
+   */
+  expectedPinGeneration?: PinGenerationClaim | null;
+}
+
+/** Durable production-pin identity used as a compare-and-swap claim. */
+export interface PinGenerationClaim {
+  version: string;
+  tag: string;
+  git_sha: string;
+  /** Bound to `pin.promoted_at`; a rewrite is a new generation. */
+  generation: string;
+}
+
+export const STALE_PIN_GENERATION_ERROR =
+  "ship deployment: production pin no longer matches the authorized promotion target";
+
+export function pinGenerationClaimFromPin(pin: ProductionEnginePin): PinGenerationClaim | null {
+  const gitSha = String(pin.git_sha ?? "").trim().toLowerCase();
+  const generation = String(pin.promoted_at ?? "").trim();
+  if (!OID_RE.test(gitSha) || !generation) return null;
+  return {
+    version: pin.version,
+    tag: pin.tag,
+    git_sha: gitSha,
+    generation,
+  };
+}
+
+export function pinMatchesGenerationClaim(
+  pin: ProductionEnginePin,
+  claim: PinGenerationClaim,
+): boolean {
+  const gitSha = String(pin.git_sha ?? "").trim().toLowerCase();
+  return (
+    pin.version === claim.version &&
+    pin.tag === claim.tag &&
+    gitSha === claim.git_sha &&
+    String(pin.promoted_at ?? "").trim() === claim.generation
+  );
 }
 
 export interface EnginePromoteResult {
@@ -389,45 +432,73 @@ export async function runEnginePromote(
     repoDir: opts.repoDir,
     overridePath: opts.pinPath,
   });
-  // Same version+tag is already-current only for a production-quality pin,
-  // or when the resolved skip is active. A no-frg-* / null-evidence pin
-  // must re-enter promote (real FRG) or refuse — never succeed as current.
-  let alreadyPinned =
-    pinLoad.kind === "ok" &&
-    pinLoad.pin.version === version &&
-    pinLoad.pin.tag === tag &&
-    (allowWithoutFrg || isProductionQualityPin(pinLoad.pin));
+  const expectedPinGeneration = opts.expectedPinGeneration ?? null;
+  const stalePinGeneration = (load: typeof pinLoad): EnginePromoteResult => ({
+    ...base,
+    pin: load.kind === "ok" ? load.pin : base.pin,
+    pin_path: load.kind === "ok" ? load.path : base.pin_path,
+    error: STALE_PIN_GENERATION_ERROR,
+    steps: [...steps, "stale_pin_generation"],
+  });
+  const pinGenerationHolds = (load: typeof pinLoad): load is { kind: "ok"; pin: ProductionEnginePin; path: string } =>
+    Boolean(
+      expectedPinGeneration &&
+      load.kind === "ok" &&
+      load.pin &&
+      pinMatchesGenerationClaim(load.pin, expectedPinGeneration),
+    );
 
-  if (alreadyPinned && skipPromoteIfCurrent) {
-    steps.push(`pin_already_current: ${version}`);
-    base.pin = pinLoad.kind === "ok" ? pinLoad.pin : null;
-    base.pin_path = pinLoad.kind === "ok" ? pinLoad.path : null;
-    deps.log(`[engine-promote] production pin already at ${version}`);
-  } else if (dryRun) {
-    steps.push(`would_promote_pin: ${version}`);
-    deps.log(`[engine-promote] dry-run: would promote pin to ${version}`);
-  } else {
-    deps.log(`[engine-promote] promoting production pin to ${version}…`);
-    const promo = await deps.promote({
-      repoDir: opts.repoDir,
-      version,
-      gitSha,
-      overridePath: opts.pinPath,
-      allowWithoutFrg,
-    });
-    if (!promo.ok) {
-      return {
-        ...base,
-        error: promo.message,
-        steps: [...steps, `promote_failed: ${promo.message}`],
-        reinstall_hint: null,
-      };
+  if (expectedPinGeneration) {
+    if (!pinGenerationHolds(pinLoad)) {
+      return stalePinGeneration(pinLoad);
     }
-    steps.push(`pin_promoted: ${promo.path}`);
-    base.pin_promoted = true;
-    base.pin = promo.pin;
-    base.pin_path = promo.path;
-    base.reinstall_hint = promo.reinstall_hint;
+    // Deploy is bound to the preflight generation. Do not rewrite the pin
+    // (that would mask an intervening retarget).
+    steps.push(`pin_generation_bound: ${expectedPinGeneration.generation}`);
+    base.pin = pinLoad.pin;
+    base.pin_path = pinLoad.path;
+    deps.log(`[engine-promote] production pin generation bound at ${version}`);
+  } else {
+    // Same version+tag is already-current only for a production-quality pin,
+    // or when the resolved skip is active. A no-frg-* / null-evidence pin
+    // must re-enter promote (real FRG) or refuse — never succeed as current.
+    const alreadyPinned =
+      pinLoad.kind === "ok" &&
+      pinLoad.pin.version === version &&
+      pinLoad.pin.tag === tag &&
+      (allowWithoutFrg || isProductionQualityPin(pinLoad.pin));
+
+    if (alreadyPinned && skipPromoteIfCurrent) {
+      steps.push(`pin_already_current: ${version}`);
+      base.pin = pinLoad.kind === "ok" ? pinLoad.pin : null;
+      base.pin_path = pinLoad.kind === "ok" ? pinLoad.path : null;
+      deps.log(`[engine-promote] production pin already at ${version}`);
+    } else if (dryRun) {
+      steps.push(`would_promote_pin: ${version}`);
+      deps.log(`[engine-promote] dry-run: would promote pin to ${version}`);
+    } else {
+      deps.log(`[engine-promote] promoting production pin to ${version}…`);
+      const promo = await deps.promote({
+        repoDir: opts.repoDir,
+        version,
+        gitSha,
+        overridePath: opts.pinPath,
+        allowWithoutFrg,
+      });
+      if (!promo.ok) {
+        return {
+          ...base,
+          error: promo.message,
+          steps: [...steps, `promote_failed: ${promo.message}`],
+          reinstall_hint: null,
+        };
+      }
+      steps.push(`pin_promoted: ${promo.path}`);
+      base.pin_promoted = true;
+      base.pin = promo.pin;
+      base.pin_path = promo.path;
+      base.reinstall_hint = promo.reinstall_hint;
+    }
   }
 
   // 3) Install
@@ -436,6 +507,18 @@ export async function runEnginePromote(
     // Pin-only. Deployment still requires a live digest match.
     base.verified = false;
     return base;
+  }
+
+  if (expectedPinGeneration) {
+    const pinAtMutate = await deps.loadPin({
+      repoDir: opts.repoDir,
+      overridePath: opts.pinPath,
+    });
+    if (!pinGenerationHolds(pinAtMutate)) {
+      return stalePinGeneration(pinAtMutate);
+    }
+    base.pin = pinAtMutate.pin;
+    base.pin_path = pinAtMutate.path;
   }
 
   if (dryRun) {
@@ -455,6 +538,18 @@ export async function runEnginePromote(
     deps.log(`[engine-promote] install failed: ${msg}`);
     steps.push("rollback_not_granted: generic install failure");
     return { ...base, error: `install failed: ${msg}` };
+  }
+
+  if (expectedPinGeneration) {
+    const pinAfter = await deps.loadPin({
+      repoDir: opts.repoDir,
+      overridePath: opts.pinPath,
+    });
+    if (!pinGenerationHolds(pinAfter)) {
+      return { ...stalePinGeneration(pinAfter), install_ran: true };
+    }
+    base.pin = pinAfter.pin;
+    base.pin_path = pinAfter.path;
   }
 
   // 4) Verify live digest matches the authorized published artifact on every

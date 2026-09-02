@@ -70,4 +70,17 @@ When a post-ready ship phase fails, times out, or is interrupted, `pipeline ship
 
 - **WHEN** `roadmap.release_model` is `semver` or the key is absent
 - **AND** an operator runs `pipeline ship --milestone v1.39.3`
-- **THEN** the coordinator SHALL still compose FRG, release, finish, publication, and engine-promote after train merge
+- **THEN** the coordinator SHALL still compose FRG, release, finish, tag, publication, and engine-promote after train merge
+
+---
+
+### Requirement: Tag mutation SHALL use a distinct coordinator phase from publication wait
+
+`pipeline ship` SHALL invoke origin tag create or push as the `tag` next action. Tag mutation claims and phase events SHALL use operation `tag`. GitHub Release publication wait SHALL use `release_wait` only.
+
+#### Scenario: Tag and publication have distinct operations
+
+- **WHEN** a SemVer ship creates or observes the origin annotated tag
+- **THEN** the coordinator SHALL record the mutation under operation `tag`
+- **AND** it SHALL NOT reuse `release_wait` for that tag mutation
+- **AND** GitHub Release publication wait SHALL remain `release_wait`

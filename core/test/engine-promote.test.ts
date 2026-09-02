@@ -15,11 +15,14 @@ import {
   installArgsForTag,
   installCommandForTag,
   matchingLiveDigestForHosts,
+  pinGenerationClaimFromPin,
+  pinMatchesGenerationClaim,
   requirePeeledOid,
   resolvePeeledPromoteGitSha,
   runEnginePromote,
   selectedPromoteHosts,
   startingLockPidFromEnv,
+  STALE_PIN_GENERATION_ERROR,
   tagForVersion,
   type EnginePromoteDeps,
   type EnginePromoteHost,
@@ -334,6 +337,92 @@ test("engine-promote: install failure does not roll back pin (#1331)", async () 
   assert.ok(installs.includes("v1.34.0"));
   assert.ok(!installs.includes("v1.31.1"));
   assert.ok(result.steps.some((s) => s.includes("rollback_not_granted")));
+});
+
+test("engine-promote: expected pin generation refuses install after mid-flight retarget (#1331)", async () => {
+  const authorized = "b".repeat(40);
+  const retarget = "e".repeat(40);
+  const expected = {
+    version: "1.34.0",
+    tag: "v1.34.0",
+    git_sha: authorized,
+    generation: "2026-08-09T00:00:00.000Z",
+  };
+  let loads = 0;
+  let current = pin("1.34.0");
+  current.git_sha = authorized;
+  const deps = makeDeps({
+    async loadPin() {
+      loads += 1;
+      if (loads >= 2) {
+        current = pin("1.34.0");
+        current.git_sha = retarget;
+        current.promoted_at = "2026-08-09T00:01:00.000Z";
+      }
+      return { kind: "ok" as const, pin: current, path: "/pin.json" };
+    },
+    async installedDigest() {
+      return current.git_sha ?? authorized;
+    },
+  });
+  const result = await runEnginePromote(opts({ expectedPinGeneration: expected }), deps);
+  assert.equal(result.error, STALE_PIN_GENERATION_ERROR);
+  assert.equal(result.install_ran, false);
+  assert.equal(result.pin_promoted, false);
+  assert.equal(deps.promotes, 0);
+  assert.deepEqual(deps.installs, []);
+  assert.ok(result.steps.includes("stale_pin_generation"));
+});
+
+test("engine-promote: expected pin generation does not rewrite a retargeted pin (#1331)", async () => {
+  const authorized = "b".repeat(40);
+  const retarget = "e".repeat(40);
+  const expected = {
+    version: "1.34.0",
+    tag: "v1.34.0",
+    git_sha: authorized,
+    generation: "2026-08-09T00:00:00.000Z",
+  };
+  const live = pin("1.34.0");
+  live.git_sha = retarget;
+  live.promoted_at = "2026-08-09T00:01:00.000Z";
+  const deps = makeDeps({
+    async loadPin() {
+      return { kind: "ok" as const, pin: live, path: "/pin.json" };
+    },
+  });
+  const result = await runEnginePromote(opts({ expectedPinGeneration: expected }), deps);
+  assert.equal(result.error, STALE_PIN_GENERATION_ERROR);
+  assert.equal(result.pin_promoted, false);
+  assert.equal(result.install_ran, false);
+  assert.equal(deps.promotes, 0);
+  assert.deepEqual(deps.installs, []);
+  assert.equal(result.pin?.git_sha, retarget);
+});
+
+test("engine-promote: matching pin generation installs without rewriting the pin (#1331)", async () => {
+  const authorized = "b".repeat(40);
+  const current = pin("1.34.0");
+  current.git_sha = authorized;
+  const expected = pinGenerationClaimFromPin(current);
+  assert.ok(expected);
+  assert.equal(pinMatchesGenerationClaim(current, expected), true);
+  const deps = makeDeps({
+    async loadPin() {
+      return { kind: "ok" as const, pin: current, path: "/pin.json" };
+    },
+    async installedDigest() {
+      return authorized;
+    },
+  });
+  const result = await runEnginePromote(opts({ expectedPinGeneration: expected }), deps);
+  assert.equal(result.error, undefined);
+  assert.equal(result.verified, true);
+  assert.equal(result.install_ran, true);
+  assert.equal(result.pin_promoted, false);
+  assert.equal(deps.promotes, 0);
+  assert.deepEqual(deps.installs, ["v1.34.0"]);
+  assert.ok(result.steps.some((step) => step.startsWith("pin_generation_bound:")));
 });
 
 test("engine-promote: matching version with wrong digest does not complete (#1331)", async () => {

@@ -112,9 +112,12 @@ import {
 import {
   DEFAULT_ENGINE_PROMOTE_HOST,
   matchingLiveDigestForHosts,
+  pinGenerationClaimFromPin,
+  pinMatchesGenerationClaim,
   realEnginePromoteDeps,
   runEnginePromote,
   selectedPromoteHosts,
+  STALE_PIN_GENERATION_ERROR,
 } from "./engine-promote.ts";
 import { ownerRepoFromPackageRepository } from "../production-engine-pin.ts";
 
@@ -1410,22 +1413,33 @@ function realShipAdapterOperations(opts: RealShipCoordinatorDepsOptions): ShipAd
         hostObservations: observationsBefore,
       });
       if (before.kind === "stale_promotion") {
-        throw new Error(
-          "ship deployment: production pin no longer matches the authorized promotion target",
-        );
+        throw new Error(STALE_PIN_GENERATION_ERROR);
       }
       if (before.kind === "verified") return before.evidence;
+      const expectedPinGeneration = pinBefore.kind === "ok"
+        ? pinGenerationClaimFromPin(pinBefore.pin)
+        : null;
+      if (!expectedPinGeneration) {
+        throw new Error(STALE_PIN_GENERATION_ERROR);
+      }
       const result = await runEnginePromote({
         version: intent.version,
         repoDir: opts.repoDir,
+        expectedPinGeneration,
       }, {
         ...engineDeps,
         log: opts.progress,
       });
+      if (result.error === STALE_PIN_GENERATION_ERROR) {
+        throw new Error(STALE_PIN_GENERATION_ERROR);
+      }
       if (!result.verified || result.error) {
         throw new Error(`ship deployment: ${result.error ?? "live digest was not verified"}`);
       }
       const pinAfter = await engineDeps.loadPin({ repoDir: opts.repoDir });
+      if (pinAfter.kind !== "ok" || !pinMatchesGenerationClaim(pinAfter.pin, expectedPinGeneration)) {
+        throw new Error(STALE_PIN_GENERATION_ERROR);
+      }
       const observationsAfter = [];
       for (const host of hosts) {
         observationsAfter.push({ host, digest: await engineDeps.installedDigest(host) });
@@ -1437,9 +1451,7 @@ function realShipAdapterOperations(opts: RealShipCoordinatorDepsOptions): ShipAd
         hostObservations: observationsAfter,
       });
       if (after.kind === "stale_promotion") {
-        throw new Error(
-          "ship deployment: production pin no longer matches the authorized promotion target",
-        );
+        throw new Error(STALE_PIN_GENERATION_ERROR);
       }
       if (after.kind !== "verified") {
         throw new Error("ship deployment: live digest was not verified");

@@ -131,6 +131,7 @@ export type ShipNextAction =
   | "frg_score"
   | "release_prepare"
   | "release_finish"
+  | "tag"
   | "release_wait"
   | "engine_promote"
   | "deploy"
@@ -858,7 +859,8 @@ function nextAction(progress: ShipProgress, releaseModel: ShipReleaseModel = "se
   if (!progress.frg) return "frg_score";
   if (!progress.release) return "release_prepare";
   if (!progress.release_finish) return "release_finish";
-  if (!progress.tag || !progress.publication) return "release_wait";
+  if (!progress.tag) return "tag";
+  if (!progress.publication) return "release_wait";
   if (!progress.promotion) return "engine_promote";
   if (!progress.deployment) return "deploy";
   return "complete";
@@ -1250,7 +1252,7 @@ export async function runShipCoordinator(
     if (waitCheckpoint) return status;
   }
   if (!status.tag) {
-    await run("release_wait", () => deps.convergeTag(expected, status.release_finish!), (tag) => ({ ...status, tag }));
+    await run("tag", () => deps.convergeTag(expected, status.release_finish!), (tag) => ({ ...status, tag }));
     if (waitCheckpoint) return status;
   }
   if (!status.publication) {

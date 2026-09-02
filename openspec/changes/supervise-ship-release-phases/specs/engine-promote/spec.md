@@ -20,6 +20,19 @@ A successful `pipeline engine-promote` deployment SHALL prove the authorized pub
 
 ---
 
+### Requirement: Deployment SHALL bind install to a pin-generation compare-and-swap
+
+When ship deployment installs, `runEnginePromote` SHALL verify the expected pin generation immediately before mutation. If the live pin identity no longer matches that claim, the path SHALL fail without installing and SHALL NOT rewrite the pin to restore the prior target. After mutation the same generation-bound claim SHALL be reconciled again.
+
+#### Scenario: Retarget after preflight refuses install
+
+- **WHEN** deployment has observed an authorized pin generation
+- **AND** another actor retargets the production pin before install
+- **THEN** engine-promote SHALL fail without installing
+- **AND** it SHALL NOT promote the pin back to the stale authorized digest
+
+---
+
 ### Requirement: Engine-promote SHALL NOT grant rollback from generic install or verify failure
 
 When install or live-identity verify fails after a pin mutation, `pipeline engine-promote` SHALL report a typed observation with side-effect certainty and SHALL NOT call pin rollback. Automatic rollback SHALL require the separate protected rollback operation with an authenticated envelope naming that rollback and the retained target. Operator `pipeline factory-pin rollback` remains the authorized rollback surface.

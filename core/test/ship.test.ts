@@ -373,7 +373,7 @@ test("ship coordinator composes the existing capabilities in one fixed order", a
       "frg_score:started", "frg_score:completed",
       "release_prepare:started", "release_prepare:completed",
       "release_finish:started", "release_finish:completed",
-      "release_wait:started", "release_wait:completed",
+      "tag:started", "tag:completed",
       "release_wait:started", "release_wait:completed",
       "engine_promote:started", "engine_promote:completed",
       "deploy:started", "deploy:completed",
@@ -1037,6 +1037,30 @@ test("publication prerequisite requires a proven origin tag (#1331)", () => {
   assert.equal(lineage.tag, null);
   assert.equal(lineageHasPriorEdges(lineage, "tag"), true);
   assert.equal(lineageHasPriorEdges(lineage, "publication"), false);
+});
+
+test("tag mutation records a distinct tag operation from publication wait (#1331)", async () => {
+  const store = memoryStore();
+  await seedFrozenTrainPlan(store);
+  const progress = completeProgress();
+  progress.tag = null;
+  progress.publication = null;
+  progress.promotion = null;
+  progress.deployment = null;
+  const deps = makeDeps(store, progress);
+  deps.convergeTag = async () => {
+    throw new Error("tag push timed out");
+  };
+  deps.waitForRelease = async () => {
+    throw new Error("must not wait for publication during tag mutation");
+  };
+  const result = await runShipCoordinator(intent, authorization(), deps);
+  assert.equal(result.next_action, "tag");
+  assert.equal(result.complete, false);
+  assert.equal(result.active_claim?.operation, "tag");
+  assert.ok(store.events.some((event) => event.phase === "tag" && event.status === "started"));
+  assert.ok(!store.events.some((event) => event.phase === "release_wait"));
+  assert.equal(deps.calls.includes("release-wait"), false);
 });
 
 test("publication without an origin tag cannot complete (#1331)", async () => {

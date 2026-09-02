@@ -140,6 +140,13 @@ Authority SHALL survive safe retry only while operation, repository, candidate, 
 - **THEN** prior verification evidence SHALL be non-current
 - **AND** the phase SHALL NOT complete on the stale evidence
 
+#### Scenario: Deployment pin generation must still hold at mutation
+
+- **WHEN** deployment has bound a pin-generation compare-and-swap claim from the preflight pin
+- **AND** another authorized actor retargets that pin before install
+- **THEN** deployment SHALL fail without installing
+- **AND** it SHALL NOT rewrite the pin to restore the preflight target
+
 #### Scenario: Event notify cannot authorize rollback
 
 - **WHEN** a channel adapter delivers a ship failure event
