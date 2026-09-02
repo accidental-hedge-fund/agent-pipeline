@@ -35,6 +35,7 @@ import {
   type LoopStoreDeps,
 } from "../scripts/loop/store.ts";
 import { DEFAULT_RECOVERY_POLICY, blockItem } from "../scripts/loop/recovery.ts";
+import { resumeHold } from "../scripts/loop/pause.ts";
 import type { ReconcileObserveDeps } from "../scripts/loop/reconcile.ts";
 import {
   LOOP_CONTRACT_SCHEMA,
@@ -3419,7 +3420,6 @@ test("legacy waiting hold without typed-request package is re-admitted after res
     };
   };
   const { token } = await acquireLock(deps, "run-1", "claude");
-  const { resumeHold } = await import("../scripts/loop/pause.ts");
   await resumeHold(deps, {
     runId: "run-1",
     token,
