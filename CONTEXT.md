@@ -224,7 +224,7 @@ The exact repository, base, pull request, and head tuple eligible for one author
 _Avoid_: PR number alone, latest head
 
 **Candidate lineage**:
-The authenticated chain connecting the integrated source candidate to release, publication, promotion, and deployed artifact identities.
+The authenticated chain connecting the integrated source candidate to release, publication, promotion, and deployed artifact identities. Ordered nodes: integrated base candidate → FRG candidate → release PR head → release merge result → tag → published artifact → promoted pin → deployed artifact and environment. Each edge has its own observer. A version string is not a node identity.
 _Avoid_: one SHA across every release transformation, version string as identity
 
 **Continuous shipment**:
@@ -302,3 +302,15 @@ _Avoid_: remaining-open set, FRG start condition, “all integrated so ship the 
 **Ship-end-open-issue-gate**:
 Live GitHub remaining-open check immediately before every post-train FRG pack, FRG convergence, release, and `engine-promote` boundary. Counts every open milestoned issue. Pipeline labels do not exempt. Restart and resume re-observe. Fail closed when any remain or when observation cannot prove zero.
 _Avoid_: freeze-eligible membership, train freeze snapshot, `--skip-frg` as a leftover-open waiver
+
+**Ship status projection**:
+`pipeline ship status` reports RecoverySupervisor lifecycle (phase, Candidate lineage, next action, human-authority flag). It does not mutate. `human_authority` is a projection of a current typed Authority Request or canonical diagnostic, never error-message regex. Mechanical post-ready faults stay owned Cooling or external-condition wait.
+_Avoid_: regex `needs-human` / `missing-authority` as authority, persist-and-rethrow as terminal
+
+**Digest deployment**:
+Engine-promote deployment completes only when the live installed engine digest equals the authorized published artifact digest. A matching version string is ingress evidence, not completion.
+_Avoid_: `pipeline --version` as live proof, installer exit 0 as deployment success
+
+**Protected rollback**:
+`pipeline factory-pin rollback` is a separate supervised operation. Automatic rollback requires an authenticated envelope naming `factory_pin_rollback` and the retained target. Generic install or verify failure grants no rollback authority.
+_Avoid_: engine-promote auto-rollback on install failure, previous-tag reinstall as a side effect

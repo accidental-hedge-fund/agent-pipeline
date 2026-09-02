@@ -4,7 +4,12 @@
 in-engine ship product. It composes existing verbs: `train --merge` →
 (semver) `release` → wait checks (`ship-release-check-wait`) →
 `release finish` → `release ensure-tag` → wait GitHub Release →
-`engine-promote`. It does not invent a second merge policy or grant schema.
+`engine-promote` (pin then live-digest deploy). Continuous `roadmap.release_model`
+completes when exact-candidate integration is proven and does not run SemVer
+release/tag/promote/deploy. It does not invent a second merge policy, grant
+schema, or RecoverySupervisor. `human_authority` is a typed projection, never
+error-message regex. Generic install or verify failure does not roll the pin
+back; use `pipeline factory-pin rollback`.
 
 Phrase: **`Ship milestone vX.Y.Z`** → `pipeline ship --milestone vX.Y.Z`
 (detach if the CLI is blocking).  
@@ -172,7 +177,7 @@ non-claude profile.
 5. `pipeline release finish <pr>` (only after the waiter classifies `green`, or when finish evidence is already observed)
 6. `pipeline release ensure-tag <X.Y.Z> <mergeCommitOid> --packed-candidate <integrated_candidate.git_sha>` (candidate engine; on-disk HMAC `latest.json`)
 7. Wait until GitHub Release `vX.Y.Z` is published (non-draft)
-8. `pipeline engine-promote --for X.Y.Z --host all` (or `ENGINE_PROMOTE_HOST` override; **no** `--skip-frg`)
+8. `pipeline engine-promote --for X.Y.Z --host all` (or `ENGINE_PROMOTE_HOST` override; **no** `--skip-frg`). Completes only when the live installed digest matches the authorized published artifact. Install or verify failure does **not** roll the pin back; use `pipeline factory-pin rollback`.
 
 Hardened behaviors (preserve):
 

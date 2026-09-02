@@ -1993,6 +1993,63 @@ test("rollbackProductionPin: --to without previous requires FRG pass", async () 
   assert.equal(files.get(PIN_PATH), before);
 });
 
+test("automatic rollback without an envelope is refused (#1331)", async () => {
+  const current = validPin({
+    version: "1.30.0",
+    previous: {
+      schema_version: 1,
+      version: "1.29.1",
+      tag: "v1.29.1",
+      git_sha: null,
+      git_sha_source: "unknown",
+      frg_run_id: "frg-old",
+      promoted_at: "2026-07-01T00:00:00Z",
+    },
+  });
+  const before = JSON.stringify(current);
+  const { deps, files } = memFs({ [PIN_PATH]: before });
+  const result = await rollbackProductionPin({
+    repoDir: REPO,
+    fsDeps: deps,
+    env: {},
+    automatic: true,
+  });
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.match(result.message, /authenticated envelope/);
+  assert.equal(files.get(PIN_PATH), before);
+});
+
+test("automatic rollback with an envelope naming the retained target is admitted (#1331)", async () => {
+  const current = validPin({
+    version: "1.30.0",
+    tag: "v1.30.0",
+    previous: {
+      schema_version: 1,
+      version: "1.29.1",
+      tag: "v1.29.1",
+      git_sha: null,
+      git_sha_source: "unknown",
+      frg_run_id: "frg-old",
+      promoted_at: "2026-07-01T00:00:00Z",
+    },
+  });
+  const { deps } = memFs({ [PIN_PATH]: JSON.stringify(current) });
+  const { operatorRollbackEnvelope } = await import("../scripts/stages/ship-supervision.ts");
+  const result = await rollbackProductionPin({
+    repoDir: REPO,
+    fsDeps: deps,
+    now: FIXED_NOW,
+    env: {},
+    automatic: true,
+    envelope: operatorRollbackEnvelope({
+      retainedTarget: { version: "1.29.1", tag: "v1.29.1" },
+      actor: "recovery-supervisor",
+    }),
+  });
+  assert.equal(result.ok, true);
+  if (result.ok) assert.equal(result.pin.version, "1.29.1");
+});
+
 test("formatProductionPinSummary includes version and sha unknown", () => {
   const s = formatProductionPinSummary(validPin({ git_sha: null }));
   assert.match(s, /1\.29\.1/);

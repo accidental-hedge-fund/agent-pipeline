@@ -156,6 +156,7 @@ const publication = {
   version: intent.version,
   tag: `v${intent.version}`,
   published: true as const,
+  artifact_digest: mergeHead,
 };
 
 const promotion = {
@@ -163,6 +164,16 @@ const promotion = {
   tag: `v${intent.version}`,
   verified: true as const,
   installed_version: intent.version,
+  pin_digest: mergeHead,
+};
+
+const deployment = {
+  version: intent.version,
+  tag: `v${intent.version}`,
+  environment: "all",
+  authorized_digest: mergeHead,
+  live_digest: mergeHead,
+  verified: true as const,
 };
 
 const state = {
@@ -197,6 +208,17 @@ function checkpoint(overrides: Partial<ShipStatus> = {}): ShipStatus {
     release_finish: null,
     publication: null,
     promotion: null,
+    deployment: null,
+    lineage: {
+      integrated_candidate: null,
+      frg_candidate: null,
+      release_pr_head: null,
+      release_merge_result: null,
+      tag: null,
+      published_artifact: null,
+      promoted_pin: null,
+      deployed: null,
+    },
     ...overrides,
   };
 }
@@ -214,6 +236,8 @@ function operations(overrides: Partial<ShipAdapterOperations> = {}): ShipAdapter
     waitForPublication: async () => publication,
     observePromotion: async () => promotion,
     promote: async () => promotion,
+    observeDeployment: async () => deployment,
+    deploy: async () => deployment,
     observeRemainingOpenMilestoneIssues: async () => [],
     ...overrides,
   };
@@ -788,10 +812,9 @@ test("ship coordinator: after (#N) observeTrain, next_action is frg_pack not tra
     observeFrg: async () => null,
   }), { state: store }));
 
-  await assert.rejects(
-    () => runShipCoordinator(intent, null, coordinator),
-    /ship FRG: no release-eligible/,
-  );
+  const status = await runShipCoordinator(intent, null, coordinator);
+  assert.match(status.last_error ?? "", /ship FRG: no release-eligible/);
+  assert.equal(status.lifecycle, "cooling");
   assert.equal(runs, 0, "must not invoke runTrain");
   assert.ok(store.status?.train, "train evidence must be persisted");
   assert.equal(store.status?.train?.integrated_head_oid, V13914_MAIN);
@@ -937,15 +960,10 @@ test("ship coordinator: proven train + missing latest.json sets next_action frg_
     },
   }), { state: store }));
 
-  await assert.rejects(
-    () => runShipCoordinator(intent13914, null, coordinator),
-    (err: unknown) => {
-      const message = err instanceof Error ? err.message : String(err);
-      assert.equal(message.includes("Cannot create or push tag"), false, message);
-      assert.match(message, /ship FRG: no release-eligible/);
-      return true;
-    },
-  );
+  const status = await runShipCoordinator(intent13914, null, coordinator);
+  assert.equal((status.last_error ?? "").includes("Cannot create or push tag"), false, status.last_error ?? "");
+  assert.match(status.last_error ?? "", /ship FRG: no release-eligible/);
+  assert.equal(status.lifecycle, "cooling");
   assert.equal(packed, 1, "FRG pack must be the next mutation");
   assert.ok(store.status?.train, "train evidence must be persisted");
   assert.equal(store.status?.train?.integrated_head_oid, head);
@@ -1179,10 +1197,9 @@ test("ship adapter remaining-open leftover blocks FRG pack without real gh (#135
     ...deps,
     withRunLock: async (_key: string, fn: () => Promise<unknown>) => fn(),
   };
-  await assert.rejects(
-    () => runShipCoordinator(intent, null, coordinator),
-    /milestone v1\.34\.0 still has open issues: #1344/,
-  );
+  const status = await runShipCoordinator(intent, null, coordinator);
+  assert.match(status.last_error ?? "", /milestone v1\.34\.0 still has open issues: #1344/);
+  assert.equal(status.lifecycle, "waiting");
   assert.equal(frgPackRuns, 0);
   assert.ok(store.status?.train, "train must still complete");
   assert.equal(store.status?.frg_pack, null);
@@ -1461,6 +1478,7 @@ test("ship adapter accepts already completed release, publication, and promotion
   assert.deepEqual(await deps.convergeReleaseFinish(intent, release), releaseFinish);
   assert.deepEqual(await deps.waitForRelease(intent, releaseFinish), publication);
   assert.deepEqual(await deps.convergeEnginePromote(intent, publication), promotion);
+  assert.deepEqual(await deps.convergeDeployment(intent, promotion), deployment);
   assert.deepEqual(calls, []);
 });
 
@@ -2090,10 +2108,9 @@ test("unresolvable candidate stops ship before FRG and leaves train evidence", a
     authorizationPublicKey: "test",
     withRunLock: async (_key: string, fn: () => Promise<unknown>) => fn(),
   };
-  await assert.rejects(
-    runShipCoordinator(intent, null, wrapped),
-    /candidate-engine identity defect/,
-  );
+  const status = await runShipCoordinator(intent, null, wrapped);
+  assert.match(status.last_error ?? "", /candidate-engine identity defect/);
+  assert.equal(status.lifecycle, "cooling");
   assert.equal(preparedInProcess, false);
   assert.equal(store.status?.train?.integrated_head_oid, head);
   assert.equal(store.status?.frg_pack, null);
@@ -2138,10 +2155,9 @@ test("unready candidate stops ship before leaf spawn and keeps train evidence (#
     authorizationPublicKey: "test",
     withRunLock: async (_key: string, fn: () => Promise<unknown>) => fn(),
   };
-  await assert.rejects(
-    runShipCoordinator(intent, null, wrapped),
-    /readiness defect/,
-  );
+  const status = await runShipCoordinator(intent, null, wrapped);
+  assert.match(status.last_error ?? "", /readiness defect/);
+  assert.equal(status.lifecycle, "cooling");
   assert.equal(prepareReturned, true);
   assert.equal(spawned.length, 0);
   assert.equal(store.status?.train?.integrated_head_oid, head);

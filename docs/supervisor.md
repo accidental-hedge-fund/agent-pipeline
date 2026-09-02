@@ -264,7 +264,7 @@ not the product owner. #1001 / #971 do not ban in-engine ship.
 
 | Script | Role |
 |---|---|
-| `pipeline ship --milestone vX.Y.Z` | **Product** durable ship (train `--merge` → FRG pack → release → finish → ensure-tag → promote) |
+| `pipeline ship --milestone vX.Y.Z` | **Product** durable ship (train `--merge` → SemVer FRG pack → release → finish → ensure-tag → promote → digest deploy; continuous completes at exact-candidate integration). Status is a RecoverySupervisor projection. Mechanical faults stay Cooling or wait. |
 
 All-integrated milestones (every freeze-eligible issue closed at
 `pipeline:ready-to-deploy` with merged PRs contained in base) do **not** stop

@@ -116,7 +116,7 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 #### `engine-promote`
 
 - **Usage:** `pipeline engine-promote --for <X.Y.Z> [--host all|codex|claude|grok|opencode|omp] [--dry-run] [--json] [--skip-install] [--skip-frg]`
-- **Summary:** Self-host: verify published release, promote a production-quality pin from FRG, install exact tag to all hosts by default, verify version (rollback pin on install failure; --skip-frg writes a no-frg-* non-production marker only)
+- **Summary:** Self-host: verify published release, promote a production-quality pin from FRG, install exact tag to all hosts by default, prove the live digest matches the authorized artifact (generic install/verify failure does not roll back; use pipeline factory-pin rollback). --skip-frg writes a no-frg-* non-production marker only
 
 #### `evals`
 
@@ -131,7 +131,7 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 #### `factory-pin`
 
 - **Usage:** `pipeline factory-pin show|init --from-frg <X.Y.Z>|promote --for <X.Y.Z>|rollback [--to <X.Y.Z>] [--git-sha <sha>] [--force]`
-- **Summary:** Show / init / promote / rollback the factory production engine pin (last FRG-passed release; promote writes a real frg_run_id + evidence path; never merges or tags)
+- **Summary:** Show / init / promote / rollback the factory production engine pin (last FRG-passed release; promote writes a real frg_run_id + evidence path; rollback is a protected operator operation with a retained target; never merges or tags)
 
 #### `factory-release`
 

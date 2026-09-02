@@ -92,6 +92,9 @@ function makeDeps(over: Partial<EnginePromoteDeps> = {}): EnginePromoteDeps & {
       const last = installs[installs.length - 1];
       return last ? last.replace(/^v/, "") : current?.version ?? null;
     },
+    async installedDigest() {
+      return current?.git_sha ?? "b".repeat(40);
+    },
     async resolvePromoteGitSha() {
       return "b".repeat(40);
     },
@@ -306,7 +309,7 @@ test("engine-promote: missing release fails closed", async () => {
   assert.equal(deps.installs.length, 0);
 });
 
-test("engine-promote: install failure rolls back pin", async () => {
+test("engine-promote: install failure does not roll back pin (#1331)", async () => {
   const deps = makeDeps({
     async installFromTag(tag) {
       if (tag === "v1.34.0") throw new Error("npx failed");
@@ -316,7 +319,6 @@ test("engine-promote: install failure rolls back pin", async () => {
       return "1.31.1";
     },
   });
-  // track installs via wrapper
   const installs: string[] = [];
   const orig = deps.installFromTag;
   deps.installFromTag = async (tag, host) => {
@@ -325,9 +327,45 @@ test("engine-promote: install failure rolls back pin", async () => {
   };
   const result = await runEnginePromote(opts(), deps);
   assert.ok(result.error?.includes("install failed"));
-  assert.equal(result.rolled_back, true);
+  assert.equal(result.rolled_back, false);
+  assert.equal(deps.rollbacks, 0);
   assert.ok(installs.includes("v1.34.0"));
-  assert.ok(installs.includes("v1.31.1")); // reinstall previous
+  assert.ok(!installs.includes("v1.31.1"));
+  assert.ok(result.steps.some((s) => s.includes("rollback_not_granted")));
+});
+
+test("engine-promote: matching version with wrong digest does not complete (#1331)", async () => {
+  const authorized = "b".repeat(40);
+  const deps = makeDeps({
+    async installedVersion() {
+      return "1.34.0";
+    },
+    async installedDigest() {
+      return "c".repeat(40);
+    },
+    async resolvePromoteGitSha() {
+      return authorized;
+    },
+  });
+  const result = await runEnginePromote(opts(), deps);
+  assert.equal(result.verified, false);
+  assert.match(result.error ?? "", /live digest/);
+  assert.equal(result.rolled_back, false);
+  assert.equal(deps.rollbacks, 0);
+  assert.ok(result.pin?.git_sha === authorized);
+});
+
+test("engine-promote: matching digest completes deployment (#1331)", async () => {
+  const digest = "b".repeat(40);
+  const deps = makeDeps({
+    async installedDigest() {
+      return digest;
+    },
+  });
+  const result = await runEnginePromote(opts(), deps);
+  assert.equal(result.verified, true);
+  assert.equal(result.error, undefined);
+  assert.ok(result.steps.some((s) => s.startsWith("verified_digest:")));
 });
 
 test("engine-promote: skip install when pin already current", async () => {

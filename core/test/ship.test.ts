@@ -21,6 +21,11 @@ import {
   assertNoRemainingOpenMilestoneIssues,
   listRemainingOpenMilestoneIssueNumbers,
   remainingOpenMilestoneIssuesError,
+  emptyShipProgress,
+  projectCandidateLineage,
+  projectShipStatusView,
+  shipPhaseInvariant,
+  assertOperationBoundAuthority,
   type BuzzShipAuthorization,
   type RemainingOpenGhRunner,
   type ShipCoordinatorDeps,
@@ -30,6 +35,7 @@ import {
   type ShipStateStore,
   type ShipStatus,
 } from "../scripts/stages/ship.ts";
+import { buildStageDiagnostic } from "../scripts/stage-diagnostic.ts";
 import {
   listMilestoneOpenIssuesApiArgs,
   listMilestonesApiArgs,
@@ -76,71 +82,78 @@ function authorization(overrides: Partial<BuzzShipAuthorization> = {}): BuzzShip
   };
 }
 
-const emptyProgress = (): ShipProgress => ({
-  train: null,
-  frg_pack: null,
-  frg: null,
-  release: null,
-  release_finish: null,
-  publication: null,
-  promotion: null,
-});
+const emptyProgress = (): ShipProgress => emptyShipProgress();
 
-const completeProgress = (): ShipProgress => ({
-  train: {
-    repository: intent.repository,
-    base_branch: intent.base_branch,
-    milestone: intent.milestone,
-    complete: true,
-    ordered_issues: [901, 902],
-    run_id: "train-1",
-    integrated_head_oid: CANDIDATE,
-    completed_at: NOW.toISOString(),
-  },
-  frg_pack: {
-    version: intent.version,
-    complete: true,
-    loop_run_id: "loop-1",
-    pack_id: "factory-gate-v1",
-    candidate_head_oid: CANDIDATE,
-  },
-  frg: {
-    version: intent.version,
-    pass: true,
-    loop_run_id: "loop-1",
-    frg_run_id: "frg-1",
-    candidate_head_oid: CANDIDATE,
-  },
-  release: {
-    repository: intent.repository,
-    base_branch: intent.base_branch,
-    version: intent.version,
-    pr: 1001,
-    head_oid: HEAD,
-    candidate_head_oid: CANDIDATE,
-  },
-  release_finish: {
-    repository: intent.repository,
-    base_branch: intent.base_branch,
-    version: intent.version,
-    pr: 1001,
-    head_oid: HEAD,
-    candidate_head_oid: CANDIDATE,
-    merged: true,
-    merge_commit_oid: MERGE,
-  },
-  publication: {
-    version: intent.version,
-    tag: `v${intent.version}`,
-    published: true,
-  },
-  promotion: {
-    version: intent.version,
-    tag: `v${intent.version}`,
-    verified: true,
-    installed_version: intent.version,
-  },
-});
+const completeProgress = (): ShipProgress => {
+  const progress: ShipProgress = {
+    train: {
+      repository: intent.repository,
+      base_branch: intent.base_branch,
+      milestone: intent.milestone,
+      complete: true,
+      ordered_issues: [901, 902],
+      run_id: "train-1",
+      integrated_head_oid: CANDIDATE,
+      completed_at: NOW.toISOString(),
+    },
+    frg_pack: {
+      version: intent.version,
+      complete: true,
+      loop_run_id: "loop-1",
+      pack_id: "factory-gate-v1",
+      candidate_head_oid: CANDIDATE,
+    },
+    frg: {
+      version: intent.version,
+      pass: true,
+      loop_run_id: "loop-1",
+      frg_run_id: "frg-1",
+      candidate_head_oid: CANDIDATE,
+    },
+    release: {
+      repository: intent.repository,
+      base_branch: intent.base_branch,
+      version: intent.version,
+      pr: 1001,
+      head_oid: HEAD,
+      candidate_head_oid: CANDIDATE,
+    },
+    release_finish: {
+      repository: intent.repository,
+      base_branch: intent.base_branch,
+      version: intent.version,
+      pr: 1001,
+      head_oid: HEAD,
+      candidate_head_oid: CANDIDATE,
+      merged: true,
+      merge_commit_oid: MERGE,
+    },
+    publication: {
+      version: intent.version,
+      tag: `v${intent.version}`,
+      published: true,
+      artifact_digest: MERGE,
+    },
+    promotion: {
+      version: intent.version,
+      tag: `v${intent.version}`,
+      verified: true,
+      installed_version: intent.version,
+      pin_digest: MERGE,
+    },
+    deployment: {
+      version: intent.version,
+      tag: `v${intent.version}`,
+      environment: "all",
+      authorized_digest: MERGE,
+      live_digest: MERGE,
+      verified: true,
+    },
+    lineage: emptyShipProgress().lineage,
+  };
+  progress.lineage = projectCandidateLineage(progress);
+  return progress;
+};
 
 function memoryStore(): ShipStateStore & {
   status: ShipStatus | null;
@@ -228,6 +241,11 @@ function makeDeps(
       assert.equal(publication.tag, "v1.34.0");
       return structuredClone(progress.promotion!);
     },
+    async convergeDeployment(_intent, promotion) {
+      calls.push("engine-deploy");
+      assert.equal(promotion.pin_digest, MERGE);
+      return structuredClone(progress.deployment!);
+    },
     async observeRemainingOpenMilestoneIssues() {
       deps.remainingOpenCalls += 1;
       return [...deps.remainingOpenIssues];
@@ -244,10 +262,9 @@ async function seedFrozenTrainPlan(
     assert.deepEqual(plannedIssues, [901, 902]);
     throw new Error("simulated crash before train result");
   };
-  await assert.rejects(
-    runShipCoordinator(intent, authorization(), deps),
-    /simulated crash/,
-  );
+  const parked = await runShipCoordinator(intent, authorization(), deps);
+  assert.equal(parked.complete, false);
+  assert.match(parked.last_error ?? "", /simulated crash/);
   assert.deepEqual(store.status?.train_plan, { ordered_issues: [901, 902] });
   assert.equal(store.status?.train, null);
 }
@@ -325,6 +342,7 @@ test("ship coordinator composes the existing capabilities in one fixed order", a
     "release-finish",
     "release-wait",
     "engine-promote",
+    "engine-deploy",
   ]);
   assert.equal(result.complete, true);
   assert.equal(result.next_action, "complete");
@@ -345,6 +363,7 @@ test("ship coordinator composes the existing capabilities in one fixed order", a
       "release_finish:started", "release_finish:completed",
       "release_wait:started", "release_wait:completed",
       "engine_promote:started", "engine_promote:completed",
+      "deploy:started", "deploy:completed",
       "complete:completed",
     ],
   );
@@ -397,7 +416,9 @@ test("ship coordinator atomically persists the accepted train plan before train 
     throw new Error("simulated train crash");
   };
 
-  await assert.rejects(runShipCoordinator(intent, authorization(), deps), /simulated train crash/);
+  const parked = await runShipCoordinator(intent, authorization(), deps);
+  assert.match(parked.last_error ?? "", /simulated train crash/);
+  assert.equal(parked.lifecycle, "cooling");
   assert.equal(trainEntered, true);
   assert.deepEqual(store.status?.train_plan, { ordered_issues: [901, 902] });
 });
@@ -441,6 +462,7 @@ test("ship coordinator reuses the frozen train plan after crash instead of repla
     "release-finish",
     "release-wait",
     "engine-promote",
+    "engine-deploy",
   ]);
 });
 
@@ -485,10 +507,11 @@ test("ship coordinator recovers a release side effect that overtook local status
   progress.release_finish = null;
   progress.publication = null;
   progress.promotion = null;
+  progress.deployment = null;
   const deps = makeDeps(store, progress);
 
   const result = await runShipCoordinator(intent, authorization(), deps);
-  assert.deepEqual(deps.calls, ["reconcile", "release-finish", "release-wait", "engine-promote"]);
+  assert.deepEqual(deps.calls, ["reconcile", "release-finish", "release-wait", "engine-promote", "engine-deploy"]);
   assert.equal(result.complete, true);
 });
 
@@ -528,7 +551,9 @@ test("ship coordinator accepts a new signed grant only after the prior grant exp
   const first = makeDeps(store);
   first.convergeTrain = async () => { throw new Error("parked"); };
   const firstGrant = authorization({ expires_at: "2026-08-10T12:01:00.000Z" });
-  await assert.rejects(runShipCoordinator(intent, firstGrant, first), /parked/);
+  const parked = await runShipCoordinator(intent, firstGrant, first);
+  assert.match(parked.last_error ?? "", /parked/);
+  assert.equal(parked.lifecycle, "cooling");
 
   const replacementIntent = { ...intent, event_id: "e".repeat(64), thread_id: "replacement-thread" };
   const replacementGrant = authorization({
@@ -570,7 +595,7 @@ test("default ship store atomically publishes typed status and appends exact-run
     assert.equal(store.statusFile(shipKey(intent)), path.join(root, "ships", shipKey(intent), "status.json"));
     assert.equal(result.events_file, store.eventsFile(shipKey(intent)));
     const eventLines = (await fs.readFile(result.events_file, "utf8")).trim().split("\n");
-    assert.equal(eventLines.length, 17);
+    assert.equal(eventLines.length, 19);
     assert.equal((JSON.parse(eventLines.at(-1)!) as ShipPhaseEvent).phase, "complete");
     assert.deepEqual(
       (await fs.readdir(path.dirname(store.statusFile(shipKey(intent))))).sort(),
@@ -614,29 +639,26 @@ test("operator milestone ship admits without a grant and resumes the same ledger
   assert.ok(!secondDeps.calls.includes("plan-train"));
 });
 
-test("ship persist writes the current human_authority bit so recovery is not stranded (#1096)", async () => {
+test("ship persist does not set human_authority from error-message regex (#1331)", async () => {
   const store = memoryStore();
   const parked = makeDeps(store);
   parked.convergeTrain = async () => {
     throw new Error("needs-human: missing-authority for milestone release");
   };
-  await assert.rejects(
-    runShipCoordinator(intent, authorization(), parked),
-    /needs-human/,
-  );
-  assert.equal(store.status?.human_authority, true);
+  const falseHuman = await runShipCoordinator(intent, authorization(), parked);
+  assert.equal(falseHuman.human_authority, false);
+  assert.equal(store.status?.human_authority, false);
   assert.match(store.status?.last_error ?? "", /missing-authority/);
+  assert.equal(store.status?.lifecycle, "cooling");
 
   const nonHuman = makeDeps(store);
   nonHuman.convergeTrain = async () => {
     throw new Error("transient train crash");
   };
-  await assert.rejects(
-    runShipCoordinator(intent, authorization(), nonHuman),
-    /transient train crash/,
-  );
-  assert.equal(store.status?.human_authority, false);
+  const mechanical = await runShipCoordinator(intent, authorization(), nonHuman);
+  assert.equal(mechanical.human_authority, false);
   assert.equal(store.status?.last_error, "transient train crash");
+  assert.equal(store.status?.lifecycle, "cooling");
 
   const recovered = makeDeps(store);
   const result = await runShipCoordinator(intent, authorization(), recovered);
@@ -672,6 +694,7 @@ test("ship coordinator pending wait-cap expiry stays resumable (#1205)", async (
   observed.release_finish = null;
   observed.publication = null;
   observed.promotion = null;
+  observed.deployment = null;
   const resumed = makeDeps(store, observed);
   const result = await runShipCoordinator(intent, authorization(), resumed);
   assert.equal(result.complete, true);
@@ -807,10 +830,8 @@ async function seedCompletedTrain(
   deps.convergeFrgPack = async () => {
     throw new Error("stop after train");
   };
-  await assert.rejects(
-    runShipCoordinator(intent, authorization(), deps),
-    /stop after train/,
-  );
+  const parked = await runShipCoordinator(intent, authorization(), deps);
+  assert.match(parked.last_error ?? "", /stop after train/);
   assert.ok(store.status?.train);
   assert.equal(store.status?.frg_pack, null);
 }
@@ -820,10 +841,9 @@ test("ship remaining-open: leftover backlog after train does not start FRG (#135
   await seedCompletedTrain(store);
   const deps = makeDeps(store, { ...emptyProgress(), train: completeProgress().train });
   deps.remainingOpenIssues = [1344];
-  await assert.rejects(
-    runShipCoordinator(intent, authorization(), deps),
-    /milestone v1\.34\.0 still has open issues: #1344/,
-  );
+  const blocked = await runShipCoordinator(intent, authorization(), deps);
+  assert.match(blocked.last_error ?? "", /milestone v1\.34\.0 still has open issues: #1344/);
+  assert.equal(blocked.lifecycle, "waiting");
   assert.ok(deps.calls.includes("train") === false || store.status?.train);
   assert.ok(!deps.calls.includes("frg-pack"));
   assert.ok(!deps.calls.includes("frg-score"));
@@ -835,10 +855,9 @@ test("ship remaining-open: train is not gated by leftover open issues (#1354)", 
   const store = memoryStore();
   const deps = makeDeps(store);
   deps.remainingOpenIssues = [1344];
-  await assert.rejects(
-    runShipCoordinator(intent, authorization(), deps),
-    /#1344/,
-  );
+  const blocked = await runShipCoordinator(intent, authorization(), deps);
+  assert.match(blocked.last_error ?? "", /#1344/);
+  assert.equal(blocked.lifecycle, "waiting");
   assert.ok(deps.calls.includes("plan-train"));
   assert.ok(deps.calls.includes("train"));
   assert.ok(!deps.calls.includes("frg-pack"));
@@ -850,10 +869,8 @@ test("ship remaining-open: leftover issues block release prepare (#1354)", async
   first.convergeReleasePrepare = async () => {
     throw new Error("stop after frg score");
   };
-  await assert.rejects(
-    runShipCoordinator(intent, authorization(), first),
-    /stop after frg score/,
-  );
+  const stopped = await runShipCoordinator(intent, authorization(), first);
+  assert.match(stopped.last_error ?? "", /stop after frg score/);
   assert.ok(store.status?.frg);
   assert.equal(store.status?.release, null);
 
@@ -864,10 +881,8 @@ test("ship remaining-open: leftover issues block release prepare (#1354)", async
     frg: completeProgress().frg,
   });
   blocked.remainingOpenIssues = [1344];
-  await assert.rejects(
-    runShipCoordinator(intent, authorization(), blocked),
-    /#1344/,
-  );
+  const held = await runShipCoordinator(intent, authorization(), blocked);
+  assert.match(held.last_error ?? "", /#1344/);
   assert.ok(!blocked.calls.includes("release-prepare"));
   assert.ok(!blocked.calls.includes("release-finish"));
 });
@@ -878,10 +893,8 @@ test("ship remaining-open: leftover issues block release finish (#1354)", async 
   first.convergeReleaseFinish = async () => {
     throw new Error("stop after release prepare");
   };
-  await assert.rejects(
-    runShipCoordinator(intent, authorization(), first),
-    /stop after release prepare/,
-  );
+  const stopped = await runShipCoordinator(intent, authorization(), first);
+  assert.match(stopped.last_error ?? "", /stop after release prepare/);
   assert.ok(store.status?.release);
   assert.equal(store.status?.release_finish, null);
 
@@ -893,10 +906,8 @@ test("ship remaining-open: leftover issues block release finish (#1354)", async 
     release: completeProgress().release,
   });
   blocked.remainingOpenIssues = [1348];
-  await assert.rejects(
-    runShipCoordinator(intent, authorization(), blocked),
-    /#1348/,
-  );
+  const held = await runShipCoordinator(intent, authorization(), blocked);
+  assert.match(held.last_error ?? "", /#1348/);
   assert.ok(!blocked.calls.includes("release-finish"));
 });
 
@@ -906,22 +917,19 @@ test("ship remaining-open: leftover issues block engine-promote (#1354)", async 
   first.convergeEnginePromote = async () => {
     throw new Error("stop after publication");
   };
-  await assert.rejects(
-    runShipCoordinator(intent, authorization(), first),
-    /stop after publication/,
-  );
+  const stopped = await runShipCoordinator(intent, authorization(), first);
+  assert.match(stopped.last_error ?? "", /stop after publication/);
   assert.ok(store.status?.publication);
   assert.equal(store.status?.promotion, null);
 
   const blocked = makeDeps(store, {
     ...completeProgress(),
     promotion: null,
+    deployment: null,
   });
   blocked.remainingOpenIssues = [977];
-  await assert.rejects(
-    runShipCoordinator(intent, authorization(), blocked),
-    /#977/,
-  );
+  const held = await runShipCoordinator(intent, authorization(), blocked);
+  assert.match(held.last_error ?? "", /#977/);
   assert.ok(!blocked.calls.includes("engine-promote"));
 });
 
@@ -931,10 +939,8 @@ test("ship remaining-open: resume re-observes after completed FRG pack (#1354)",
   first.convergeFrgScore = async () => {
     throw new Error("stop after frg pack");
   };
-  await assert.rejects(
-    runShipCoordinator(intent, authorization(), first),
-    /stop after frg pack/,
-  );
+  const stopped = await runShipCoordinator(intent, authorization(), first);
+  assert.match(stopped.last_error ?? "", /stop after frg pack/);
   assert.ok(store.status?.frg_pack);
   assert.equal(store.status?.frg, null);
   const firstObservations = first.remainingOpenCalls;
@@ -946,10 +952,8 @@ test("ship remaining-open: resume re-observes after completed FRG pack (#1354)",
     frg_pack: completeProgress().frg_pack,
   });
   resumed.remainingOpenIssues = [1344];
-  await assert.rejects(
-    runShipCoordinator(intent, authorization(), resumed),
-    /#1344/,
-  );
+  const held = await runShipCoordinator(intent, authorization(), resumed);
+  assert.match(held.last_error ?? "", /#1344/);
   assert.ok(resumed.remainingOpenCalls >= 1, "resume must re-observe GitHub");
   assert.ok(!resumed.calls.includes("frg-score"));
   assert.ok(!resumed.calls.includes("frg-pack"));
@@ -973,9 +977,141 @@ test("ship remaining-open: query failure fails closed before FRG (#1354)", async
   deps.observeRemainingOpenMilestoneIssues = async () => {
     throw new Error("ship-end-open-issue-gate: cannot prove zero open issues on v1.34.0: gh auth failed");
   };
-  await assert.rejects(
-    runShipCoordinator(intent, authorization(), deps),
-    /cannot prove zero open issues/,
-  );
+  const held = await runShipCoordinator(intent, authorization(), deps);
+  assert.match(held.last_error ?? "", /cannot prove zero open issues/);
+  assert.equal(held.lifecycle, "waiting");
   assert.ok(!deps.calls.includes("frg-pack"));
+});
+
+test("candidate lineage round-trips distinct identities without collapsing to a version string (#1331)", () => {
+  const lineage = projectCandidateLineage(completeProgress());
+  assert.equal(lineage.integrated_candidate?.identity, CANDIDATE);
+  assert.equal(lineage.frg_candidate?.identity, `${CANDIDATE}#frg-1`);
+  assert.equal(lineage.release_pr_head?.identity, `pr#1001@${HEAD}`);
+  assert.equal(lineage.release_merge_result?.identity, MERGE);
+  assert.equal(lineage.tag?.identity, `v1.34.0@${MERGE}`);
+  assert.equal(lineage.published_artifact?.identity, MERGE);
+  assert.equal(lineage.promoted_pin?.identity, MERGE);
+  assert.equal(lineage.deployed?.identity, `${MERGE}@all`);
+  const identities = Object.values(lineage).map((node) => node?.identity);
+  assert.ok(identities.every((id) => id && id !== intent.version && id !== "1.34.0"));
+  assert.notEqual(lineage.integrated_candidate?.identity, lineage.release_pr_head?.identity);
+  assert.notEqual(lineage.release_pr_head?.identity, lineage.release_merge_result?.identity);
+});
+
+test("missing observer proof cannot complete a post-ready phase (#1331)", async () => {
+  const store = memoryStore();
+  await seedFrozenTrainPlan(store);
+  const deps = makeDeps(store);
+  deps.waitForRelease = async () => ({
+    version: intent.version,
+    tag: "v1.34.0",
+    published: true,
+    artifact_digest: "",
+  });
+  const result = await runShipCoordinator(intent, authorization(), deps);
+  assert.equal(result.complete, false);
+  assert.equal(result.publication, null);
+  assert.equal(result.lifecycle, "cooling");
+  assert.match(result.last_error ?? "", /artifact_digest|reconciliation|OID|digest/i);
+  const tag = shipPhaseInvariant("tag");
+  assert.match(tag.observer, /origin annotated tag/);
+  assert.match(shipPhaseInvariant("deployment").postcondition, /digest live/);
+});
+
+test("ship status view names phase, candidate, and next action without mutations (#1331)", async () => {
+  const store = memoryStore();
+  const deps = makeDeps(store);
+  const result = await runShipCoordinator(intent, authorization(), deps);
+  const view = projectShipStatusView(result);
+  assert.equal(view.phase, "complete");
+  assert.equal(view.next_action, "complete");
+  assert.equal(view.candidate, MERGE);
+  assert.equal(view.human_authority, false);
+  assert.equal(view.lifecycle, "complete");
+  assert.equal(view.lineage.release_merge_result?.identity, MERGE);
+});
+
+test("canonical human-authority diagnostic still projects the status bit (#1331)", async () => {
+  const store = memoryStore();
+  const deps = makeDeps(store);
+  deps.convergeReleasePrepare = async () => {
+    const err = new Error("needs-human: missing-authority for milestone release") as Error & {
+      diagnostic: ReturnType<typeof buildStageDiagnostic>;
+    };
+    err.diagnostic = buildStageDiagnostic({
+      blockerKind: "human-decision-required",
+      reason: "release authority required",
+      authorityEvidence: [{
+        category: "authority",
+        finding_key: "deadbeef",
+        finding_fingerprint: "0123456789abcdef",
+        reviewed_sha: CANDIDATE,
+      }],
+    });
+    throw err;
+  };
+  const result = await runShipCoordinator(intent, authorization(), deps);
+  assert.equal(result.human_authority, true);
+  assert.equal(result.lifecycle, "waiting");
+  assert.equal(result.complete, false);
+});
+
+test("started claim plus process death does not uncharge a completed side effect (#1331)", async () => {
+  const store = memoryStore();
+  await seedFrozenTrainPlan(store);
+  const observed = emptyProgress();
+  observed.train = completeProgress().train;
+  const first = makeDeps(store, emptyProgress());
+  first.convergeTrain = async () => {
+    throw new Error("died after train mutation started");
+  };
+  const crashed = await runShipCoordinator(intent, authorization(), first);
+  assert.equal(crashed.active_claim?.outcome, "uncertain");
+  assert.equal(crashed.lifecycle, "cooling");
+  const resumed = makeDeps(store, observed);
+  const result = await runShipCoordinator(intent, authorization(), resumed);
+  assert.equal(result.complete, true);
+  assert.ok(!resumed.calls.includes("train"));
+});
+
+test("candidate movement refuses stale operation-bound authority (#1331)", () => {
+  const presented = {
+    operation: "release_prepare",
+    repository: intent.repository,
+    candidate: CANDIDATE,
+    scope: "v1.34.0@1.34.0",
+    actor: intent.sender_id,
+    expires_at: "2026-08-17T11:55:00.000Z",
+  };
+  const moved = { ...presented, candidate: "e".repeat(40) };
+  assert.throws(
+    () => assertOperationBoundAuthority(presented, moved, NOW.getTime()),
+    /candidate does not match/,
+  );
+});
+
+test("roadmap.release_model is the single shipment-intent key (#1331)", async () => {
+  const store = memoryStore();
+  const deps = makeDeps(store);
+  deps.releaseModel = "continuous";
+  const result = await runShipCoordinator(intent, authorization(), deps);
+  assert.equal(result.release_model, "continuous");
+  assert.equal(result.complete, true);
+  assert.deepEqual(deps.calls, ["reconcile", "plan-train", "train"]);
+  assert.ok(!deps.calls.includes("release-prepare"));
+  assert.ok(!deps.calls.includes("engine-promote"));
+  assert.ok(!deps.calls.includes("engine-deploy"));
+});
+
+test("semver remains the default when roadmap.release_model is absent (#1331)", async () => {
+  const store = memoryStore();
+  const deps = makeDeps(store);
+  assert.equal(deps.releaseModel, undefined);
+  const result = await runShipCoordinator(intent, authorization(), deps);
+  assert.equal(result.release_model, "semver");
+  assert.equal(result.complete, true);
+  assert.ok(deps.calls.includes("frg-pack"));
+  assert.ok(deps.calls.includes("engine-promote"));
+  assert.ok(deps.calls.includes("engine-deploy"));
 });

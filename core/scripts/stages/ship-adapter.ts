@@ -73,7 +73,9 @@ import {
   listRemainingOpenMilestoneIssueNumbers,
   shipKey,
   shipStatePaths,
+  emptyShipProgress,
   type ShipCoordinatorDeps,
+  type ShipDeploymentEvidence,
   type ShipFrgEvidence,
   type ShipFrgPackEvidence,
   type ShipIntent,
@@ -178,6 +180,14 @@ export interface ShipAdapterOperations {
     intent: ShipIntent,
     publication: ShipPublicationEvidence,
   ): Promise<ShipPromotionEvidence>;
+  observeDeployment?(
+    intent: ShipIntent,
+    promotion: ShipPromotionEvidence,
+  ): Promise<ShipDeploymentEvidence | null>;
+  deploy?(
+    intent: ShipIntent,
+    promotion: ShipPromotionEvidence,
+  ): Promise<ShipDeploymentEvidence>;
   /**
    * Optional candidate FRG pack. When present, convergeFrgPack runs this
    * before observing evidence so a pin process can spawn candidate prepare/gate.
@@ -478,15 +488,7 @@ export function assertFrgCandidateProvenance(
 }
 
 function emptyProgress(): ShipProgress {
-  return {
-    train: null,
-    frg_pack: null,
-    frg: null,
-    release: null,
-    release_finish: null,
-    publication: null,
-    promotion: null,
-  };
+  return emptyShipProgress();
 }
 
 function projectFrgPack(
@@ -531,6 +533,7 @@ export function shipCoordinatorDepsFromOperations(
     releaseCheckWait?:
       | ShipReleaseCheckWaitDeps
       | ((intent: ShipIntent) => ShipReleaseCheckWaitDeps);
+    releaseModel?: "semver" | "continuous";
   },
 ): ShipCoordinatorDeps {
   const trainCheckpoints = new Map<string, ShipTrainEvidence>();
@@ -562,6 +565,7 @@ export function shipCoordinatorDepsFromOperations(
     now: opts.now ?? (() => new Date()),
     state: opts.state,
     authorizationPublicKey: opts.authorizationPublicKey,
+    releaseModel: opts.releaseModel ?? "semver",
     withRunLock: (key, fn) => withLock(`ship-${key}`, fn),
 
     planTrain: operations.planTrain,
@@ -626,6 +630,10 @@ export function shipCoordinatorDepsFromOperations(
       progress.publication = await operations.observePublication(intent, release.finish);
       if (!progress.publication) return progress;
       progress.promotion = await operations.observePromotion(intent, progress.publication);
+      if (!progress.promotion) return progress;
+      progress.deployment = operations.observeDeployment
+        ? await operations.observeDeployment(intent, progress.promotion)
+        : null;
       return progress;
     },
 
@@ -738,6 +746,19 @@ export function shipCoordinatorDepsFromOperations(
     async convergeEnginePromote(intent, publication) {
       return await operations.observePromotion(intent, publication) ??
         operations.promote(intent, publication);
+    },
+
+    async convergeDeployment(intent, promotion) {
+      if (typeof operations.observeDeployment === "function") {
+        const observed = await operations.observeDeployment(intent, promotion);
+        if (observed) return observed;
+      }
+      if (typeof operations.deploy === "function") {
+        return operations.deploy(intent, promotion);
+      }
+      throw new Error(
+        "ship deployment: live digest observer proof is missing; a version string alone does not complete",
+      );
     },
   };
 }
@@ -1077,7 +1098,12 @@ function realShipAdapterOperations(opts: RealShipCoordinatorDepsOptions): ShipAd
     if (data.isDraft || (data.tagName !== tag && data.tagName !== intent.version)) return null;
     await git(["fetch", "--force", "origin", `refs/tags/${tag}:refs/tags/${tag}`]);
     await verifyAnnotatedReleaseTag(tag, release.merge_commit_oid, git);
-    return { version: intent.version, tag, published: true };
+    return {
+      version: intent.version,
+      tag,
+      published: true,
+      artifact_digest: release.merge_commit_oid,
+    };
   };
 
   return {
@@ -1185,9 +1211,9 @@ function realShipAdapterOperations(opts: RealShipCoordinatorDepsOptions): ShipAd
       const release = await engineDeps.verifyPublishedRelease(publication.tag);
       if (!release.ok) return null;
       const pin = await engineDeps.loadPin({ repoDir: opts.repoDir });
-      const installed = await engineDeps.installedVersion();
+      const pinDigest = pin.kind === "ok" ? String(pin.pin.git_sha ?? "").trim().toLowerCase() : "";
       if (pin.kind !== "ok" || pin.pin.version !== intent.version ||
-          pin.pin.tag !== publication.tag || installed?.replace(/^[vV]/, "") !== intent.version) {
+          pin.pin.tag !== publication.tag || pinDigest !== publication.artifact_digest) {
         return null;
       }
       return {
@@ -1195,9 +1221,51 @@ function realShipAdapterOperations(opts: RealShipCoordinatorDepsOptions): ShipAd
         tag: publication.tag,
         verified: true,
         installed_version: intent.version,
+        pin_digest: pinDigest,
       };
     },
     async promote(intent, publication) {
+      const result = await runEnginePromote({
+        version: intent.version,
+        repoDir: opts.repoDir,
+        skipInstall: true,
+      }, {
+        ...engineDeps,
+        log: opts.progress,
+      });
+      if (result.error || !result.pin) {
+        throw new Error(`ship engine-promote: ${result.error ?? "pin was not promoted"}`);
+      }
+      const pinDigest = String(result.pin.git_sha ?? publication.artifact_digest).trim().toLowerCase();
+      if (!OID_RE.test(pinDigest) || pinDigest !== publication.artifact_digest) {
+        throw new Error("ship engine-promote: pin digest does not match the published artifact");
+      }
+      return {
+        version: intent.version,
+        tag: publication.tag,
+        verified: true,
+        installed_version: intent.version,
+        pin_digest: pinDigest,
+      };
+    },
+    async observeDeployment(intent, promotion) {
+      const pin = await engineDeps.loadPin({ repoDir: opts.repoDir });
+      const live = await engineDeps.installedDigest();
+      const liveDigest = typeof live === "string" ? live.trim().toLowerCase() : "";
+      if (pin.kind !== "ok" || pin.pin.version !== intent.version ||
+          !OID_RE.test(liveDigest) || liveDigest !== promotion.pin_digest) {
+        return null;
+      }
+      return {
+        version: intent.version,
+        tag: promotion.tag,
+        environment: "all",
+        authorized_digest: promotion.pin_digest,
+        live_digest: liveDigest,
+        verified: true,
+      };
+    },
+    async deploy(intent, promotion) {
       const result = await runEnginePromote({
         version: intent.version,
         repoDir: opts.repoDir,
@@ -1206,13 +1274,20 @@ function realShipAdapterOperations(opts: RealShipCoordinatorDepsOptions): ShipAd
         log: opts.progress,
       });
       if (!result.verified || result.error) {
-        throw new Error(`ship engine-promote: ${result.error ?? "installed version was not verified"}`);
+        throw new Error(`ship deployment: ${result.error ?? "live digest was not verified"}`);
+      }
+      const live = await engineDeps.installedDigest();
+      const liveDigest = typeof live === "string" ? live.trim().toLowerCase() : "";
+      if (!OID_RE.test(liveDigest) || liveDigest !== promotion.pin_digest) {
+        throw new Error("ship deployment: live digest does not match the authorized published artifact");
       }
       return {
         version: intent.version,
-        tag: publication.tag,
+        tag: promotion.tag,
+        environment: "all",
+        authorized_digest: promotion.pin_digest,
+        live_digest: liveDigest,
         verified: true,
-        installed_version: intent.version,
       };
     },
   };
@@ -2373,9 +2448,11 @@ export function realShipCoordinatorDeps(opts: RealShipCoordinatorDepsOptions): S
       await state.appendEvent(key, event);
     },
   });
+  const releaseCfg = resolveReleaseConfig(opts.repoDir, opts.baseBranch, opts.profile);
   return shipCoordinatorDepsFromOperations(ops, {
     state,
     authorizationPublicKey: opts.authorizationPublicKey,
     releaseCheckWait: productionReleaseCheckWait(opts, state),
+    releaseModel: releaseCfg.release_model ?? "semver",
   });
 }

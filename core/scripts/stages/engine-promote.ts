@@ -2,8 +2,10 @@
 //
 // After a release is published (tag + GitHub Release), promote the production
 // engine pin, install that exact tag into the host skill tree(s), and verify
-// pin ↔ install receipt agreement. On install/verify failure after a pin
-// mutation, roll the pin back and attempt to reinstall the previous tag.
+// the live installed digest matches the authorized published artifact.
+// Install or verify failure after a pin mutation does not roll the pin back.
+// Rollback is a separate protected operation (`pipeline factory-pin rollback`)
+// that requires an authenticated envelope naming that operation and target.
 //
 // Never merges PRs or creates tags. Loop-isolated CLI surface.
 
@@ -21,6 +23,7 @@ import {
 } from "../production-engine-pin.ts";
 import { readSkipFrgFromPipelineYml } from "../config.ts";
 import { formatFrgSkipReason, resolveFrgSkip } from "../frg-skip.ts";
+import { resolveEngineCommitSha } from "../engine-attribution.ts";
 import {
   assertNoRemainingOpenMilestoneIssues,
   listRemainingOpenMilestoneIssueNumbers,
@@ -99,8 +102,13 @@ export interface EnginePromoteDeps {
   >;
   /** Run installer for tag; throw on non-zero. */
   installFromTag(tag: string, host: EnginePromoteHost): Promise<{ command: string; stdout: string }>;
-  /** Read installed pipeline --version (semver without v). */
+  /** Read installed pipeline --version (semver without v). Ingress only. */
   installedVersion(): Promise<string | null>;
+  /**
+   * Live installed engine digest (40-hex). Required to complete deployment.
+   * A matching version string is not this proof.
+   */
+  installedDigest(): Promise<string | null>;
   /**
    * Optional gh-free `skip_frg` read. When omitted, the command reads
    * `.github/pipeline.yml` via {@link readSkipFrgFromPipelineYml}.
@@ -369,7 +377,8 @@ export async function runEnginePromote(
   // 3) Install
   if (skipInstall) {
     steps.push("install_skipped");
-    base.verified = alreadyPinned || base.pin_promoted;
+    // Pin-only. Deployment still requires a live digest match.
+    base.verified = false;
     return base;
   }
 
@@ -388,58 +397,34 @@ export async function runEnginePromote(
     const msg = (err as Error).message;
     steps.push(`install_failed: ${msg}`);
     deps.log(`[engine-promote] install failed: ${msg}`);
-    // Rollback pin if we changed it
-    if (base.pin_promoted) {
-      deps.log(`[engine-promote] rolling back production pin…`);
-      const rb = await deps.rollback({
-        repoDir: opts.repoDir,
-        overridePath: opts.pinPath,
-      });
-      if (rb.ok) {
-        base.rolled_back = true;
-        steps.push(`pin_rolled_back: ${rb.pin.version}`);
-        base.pin = rb.pin;
-        base.reinstall_hint = rb.reinstall_hint;
-        try {
-          await deps.installFromTag(rb.pin.tag, host);
-          steps.push(`reinstall_previous_ok: ${rb.pin.tag}`);
-        } catch (err2) {
-          steps.push(`reinstall_previous_failed: ${(err2 as Error).message}`);
-        }
-      } else {
-        steps.push(`pin_rollback_failed: ${rb.message}`);
-      }
-    }
+    steps.push("rollback_not_granted: generic install failure");
     return { ...base, error: `install failed: ${msg}` };
   }
 
-  // 4) Verify installed version matches
+  // 4) Verify live digest matches the authorized published artifact.
+  // Version string is ingress evidence only.
   const installed = await deps.installedVersion();
-  if (installed && installed.replace(/^[vV]/, "") === version) {
+  const liveDigest = await deps.installedDigest();
+  const authorizedDigest = (base.pin?.git_sha ?? gitSha ?? "").trim().toLowerCase();
+  const versionMatches = Boolean(installed && installed.replace(/^[vV]/, "") === version);
+  const digestMatches =
+    OID_RE.test(authorizedDigest) &&
+    typeof liveDigest === "string" &&
+    liveDigest.trim().toLowerCase() === authorizedDigest;
+  if (versionMatches && digestMatches) {
     base.verified = true;
     steps.push(`verified_installed: ${installed}`);
-    deps.log(`[engine-promote] verified installed version ${installed}`);
+    steps.push(`verified_digest: ${authorizedDigest.slice(0, 12)}`);
+    deps.log(`[engine-promote] verified installed digest ${authorizedDigest.slice(0, 12)}`);
+  } else if (!OID_RE.test(authorizedDigest) && allowWithoutFrg && versionMatches) {
+    steps.push(`digest_unproven: skip-frg pin has no authorized digest`);
+    deps.log(`[engine-promote] skip-frg install matched version ${installed}; digest remains unproven`);
   } else {
-    const msg =
-      `installed version ${installed ?? "(unknown)"} does not match target ${version}`;
+    const msg = digestMatches
+      ? `installed version ${installed ?? "(unknown)"} does not match target ${version}`
+      : `live digest ${liveDigest ?? "(unknown)"} does not match authorized ${authorizedDigest || "(missing)"}`;
     steps.push(`verify_failed: ${msg}`);
-    if (base.pin_promoted) {
-      const rb = await deps.rollback({
-        repoDir: opts.repoDir,
-        overridePath: opts.pinPath,
-      });
-      if (rb.ok) {
-        base.rolled_back = true;
-        steps.push(`pin_rolled_back: ${rb.pin.version}`);
-        base.reinstall_hint = rb.reinstall_hint;
-        try {
-          await deps.installFromTag(rb.pin.tag, host);
-          steps.push(`reinstall_previous_ok: ${rb.pin.tag}`);
-        } catch (err2) {
-          steps.push(`reinstall_previous_failed: ${(err2 as Error).message}`);
-        }
-      }
-    }
+    steps.push("rollback_not_granted: generic verify failure");
     return { ...base, error: msg };
   }
 
@@ -572,6 +557,10 @@ export function realEnginePromoteDeps(repoDir: string): EnginePromoteDeps {
       } catch {
         return null;
       }
+    },
+    async installedDigest() {
+      const sha = resolveEngineCommitSha(repoDir);
+      return sha && OID_RE.test(sha) ? sha.toLowerCase() : sha;
     },
     async listRemainingOpenMilestoneIssues(milestone) {
       let repo: string;

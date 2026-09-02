@@ -4817,6 +4817,7 @@ async function main(): Promise<void> {
       try {
         const status = await runShipCoordinator(intent, authorization, coordinatorDeps);
         console.log(JSON.stringify(status, null, 2));
+        if (!status.complete) process.exit(1);
       } catch (err) {
         // A lifecycle-stage failure is part of the machine contract when the
         // coordinator persisted it. Print exactly that status once. Failures
@@ -6160,6 +6161,7 @@ async function main(): Promise<void> {
           repoDir,
           toVersion: opts.to ?? null,
           overridePath: pinPathOverride,
+          automatic: false,
         });
         if (!result.ok) {
           console.error(`pipeline factory-pin rollback: ${result.message}`);
