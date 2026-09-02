@@ -596,6 +596,7 @@ test("merge-queue: loop-isolation — no advance stage handler imports merge_que
     "merge-queue-release-when-complete.ts",
     "merge_queue_hold.ts",
     "merge.ts",
+    "merge-supervision.ts",
     "train.ts",
   ]);
   const checkFiles = stageFiles.filter((f) => !exempt.has(f));

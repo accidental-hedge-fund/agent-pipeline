@@ -5,9 +5,10 @@
 // open mergeable PR and proves base containment before any plan/implement.
 // A merge-first log line is not compliance. At most one implement at a time.
 // That merge-first rule is the anti-PR-farm rule. A contained per-item hold
-// (blocked / needs-human / waiting / non-ready) does not abandon independent
-// remaining work. Direct and transitive dependents of a held item are
-// dependency-skipped. `pipeline loop` keeps frontier parallelism.
+// (blocked / needs-human / waiting / cooling / non-ready) does not abandon
+// independent remaining work. Direct and transitive dependents of a held item
+// are dependency-skipped. Train does not invoke recover-parked.
+// `pipeline loop` keeps frontier parallelism.
 //
 // Unit tests inject TrainDeps — no real network, git, or subprocess in tests.
 
@@ -30,7 +31,13 @@ import {
   type ParkReleaseResult,
   type VerifiedMergeProof,
 } from "../worktree.ts";
-import { mergePr, realMergeDeps, type MergeDeps } from "./merge.ts";
+import { mergePr, realMergeDeps, realMergeSupervision, type MergeDeps } from "./merge.ts";
+import {
+  classifyMergeFault,
+  trainItemObservation,
+  type MergeFaultClass,
+  type SupervisedMergeObservation,
+} from "./merge-supervision.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -207,11 +214,13 @@ export interface TrainDeps {
    */
   advanceIssue?(issue: number): Promise<AdvanceOutcome>;
   /**
-   * One supervisor recover-parked pass for a parked item (#1061).
-   * Train MUST NOT invent override or drop blocked labels itself.
-   * Default production wiring invokes `runRecoverParked`; tests inject fakes.
+   * Optional unused seam. Production train MUST NOT wire or invoke recover-parked.
+   * Residual parks are RecoverySupervisor observations. Tests may inject a
+   * throwing stub to prove the entrypoint is not called.
    */
   recoverParked?(issue: number): Promise<TrainRecoverParkedResult>;
+  /** Typed observations for RecoverySupervisor. Train does not choose lifecycle. */
+  reportObservation?(obs: SupervisedMergeObservation): void;
   /** Open PR only — used when a merge mutation may still be required. */
   getPrForIssue(issue: number): Promise<number | null>;
   /**
@@ -303,6 +312,15 @@ export type MergeReadyToDeployResult =
       pr: number | null;
       mergeCommitOid: string | null;
       attempted: boolean;
+    }
+  | {
+      kind: "hold";
+      blocker: string;
+      pr: number | null;
+      mergeCommitOid: string | null;
+      attempted: boolean;
+      fault: MergeFaultClass | "containment" | "missing-pr";
+      lifecycle: "cooling" | "waiting";
     };
 
 /**
@@ -346,22 +364,26 @@ export async function mergeReadyToDeployItem(
       }
       if (recon.kind === "containment-failed") {
         return {
-          kind: "stop",
+          kind: "hold",
           blocker:
             `merge result ${recon.mergeCommitOid} for #${issue} PR #${anyPr} is not contained in ` +
             `fetched ${baseBranch} tip ${recon.tip}`,
           pr: anyPr,
           mergeCommitOid: recon.mergeCommitOid,
           attempted: false,
+          fault: "containment",
+          lifecycle: "waiting",
         };
       }
     }
     return {
-      kind: "stop",
+      kind: "hold",
       blocker: `issue #${issue} is ready-to-deploy but has no linked open PR`,
       pr: null,
       mergeCommitOid: null,
       attempted: false,
+      fault: "missing-pr",
+      lifecycle: "waiting",
     };
   }
 
@@ -373,26 +395,37 @@ export async function mergeReadyToDeployItem(
       await deps.mergeIssuePr(pr);
       attempted = true;
     } catch (err) {
-      return {
-        kind: "stop",
-        blocker: `merge failed for #${issue} PR #${pr}: ${(err as Error).message}`,
-        pr,
-        mergeCommitOid: null,
-        attempted: true,
-      };
+      const message = (err as Error).message;
+      obs = await deps.observePr(pr);
+      if (obs.state === "merged") {
+        attempted = true;
+      } else {
+        const fault = classifyMergeFault(message);
+        return {
+          kind: "hold",
+          blocker: `merge failed for #${issue} PR #${pr}: ${message}`,
+          pr,
+          mergeCommitOid: obs.mergeCommitOid,
+          attempted: true,
+          fault: fault ?? "uncertain_merge_response",
+          lifecycle: fault === "unknown_mergeability" || fault === "check_drift" ? "waiting" : "cooling",
+        };
+      }
     }
     obs = await deps.observePr(pr);
   }
 
   if (obs.state !== "merged" || !obs.mergeCommitOid) {
     return {
-      kind: "stop",
+      kind: "hold",
       blocker:
         `PR #${pr} for #${issue} is not merged with an observable merge commit ` +
         `(state=${obs.state}, mergeCommit=${obs.mergeCommitOid ?? "null"})`,
       pr,
       mergeCommitOid: obs.mergeCommitOid,
       attempted,
+      fault: "uncertain_merge_response",
+      lifecycle: "cooling",
     };
   }
 
@@ -416,13 +449,15 @@ export async function mergeReadyToDeployItem(
   if (!proof) {
     const tip = await deps.baseTip(baseBranch);
     return {
-      kind: "stop",
+      kind: "hold",
       blocker:
         `merge result ${obs.mergeCommitOid} for #${issue} PR #${pr} is not contained in ` +
         `fetched ${baseBranch} tip ${tip}`,
       pr,
       mergeCommitOid: obs.mergeCommitOid,
       attempted,
+      fault: "containment",
+      lifecycle: "waiting",
     };
   }
 
@@ -1005,8 +1040,6 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
   const finished = new Set<number>();
   const held = new Set<number>();
   const integrated = new Set<number>();
-  /** Per-wave-drive: at most one recover-parked attempt per issue (#1061). */
-  const recoverParkedAttempted = new Set<number>();
   const itemByIssue = new Map<number, TrainItemResult>();
   let blocker: string | null = null;
   let nextAction: TrainNextAction = "advance";
@@ -1104,6 +1137,9 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
     issue: number,
     merged: MergeReadyToDeployResult,
   ): TrainResult | null => {
+    if (merged.kind === "hold") {
+      return null;
+    }
     if (merged.kind === "stop") {
       blocker = merged.blocker;
       nextAction = "stopped";
@@ -1159,6 +1195,33 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
       await emitMergeCatalog(issue, merged);
       if (merged.kind === "integrated") {
         await parkReleaseAfterProvenMerge(issue, merged.verifiedMergeProof, opts, deps);
+      }
+      if (merged.kind === "hold") {
+        const heldItem: TrainItemResult = {
+          issue,
+          pr: merged.pr,
+          terminal: "error",
+          merge_result_oid: merged.mergeCommitOid,
+          integrated: false,
+          error: merged.blocker,
+        };
+        await holdContainedItem(heldItem);
+        deps.reportObservation?.(
+          trainItemObservation({
+            issue,
+            kind: "merge_fault",
+            fault:
+              merged.fault === "containment" || merged.fault === "missing-pr"
+                ? null
+                : merged.fault,
+            message: merged.blocker,
+            lifecycle: merged.lifecycle,
+          }),
+        );
+        deps.log(
+          `[train] hold #${issue}: ${merged.blocker} (independent remaining work continues)`,
+        );
+        continue;
       }
       const stopped = applyMergeReady(issue, merged);
       if (stopped) {
@@ -1234,20 +1297,30 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
           continue;
         }
         if (recon.kind === "containment-failed") {
-          blocker =
+          const err =
             `merge result ${recon.mergeCommitOid} for #${issue} PR #${linkedPr} is not contained in ` +
             `fetched ${opts.baseBranch} tip ${recon.tip}`;
-          nextAction = "stopped";
-          pushItem({
+          await holdContainedItem({
             issue,
             pr: linkedPr,
-            terminal: "ready-to-deploy",
+            terminal: "error",
             merge_result_oid: recon.mergeCommitOid,
             integrated: false,
-            error: blocker,
+            error: err,
           });
-          deps.log(`[train] STOP: ${blocker}`);
-          return { exitCode: 1, status: status() };
+          deps.reportObservation?.(
+            trainItemObservation({
+              issue,
+              kind: "merge_fault",
+              fault: null,
+              message: err,
+              lifecycle: "waiting",
+            }),
+          );
+          deps.log(
+            `[train] hold #${issue}: ${err} (independent remaining work continues)`,
+          );
+          continue;
         }
       }
 
@@ -1391,44 +1464,6 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
           (advanced.terminal === "ready-to-deploy" ? "ready-to-deploy" : null);
 
         if (advanced.terminal === "needs-human" || stage === "needs-human") {
-          // #1061: one recover-parked pass per park before terminal hold.
-          // Train never invents override or drops blocked labels itself.
-          if (deps.recoverParked && !recoverParkedAttempted.has(issue)) {
-            recoverParkedAttempted.add(issue);
-            deps.log(`[train] recover-parked once for #${issue} (needs-human)`);
-            let rp: TrainRecoverParkedResult;
-            try {
-              rp = await deps.recoverParked(issue);
-            } catch (err) {
-              rp = {
-                status: "fail-closed",
-                issue,
-                message: `recover-parked threw: ${(err as Error).message}`,
-              };
-            }
-            deps.log(
-              `[train] recover-parked #${issue}: ${rp.status} — ${rp.message}`,
-            );
-            if (rp.status === "recovered" || rp.status === "deterministic-cleared") {
-              // Same-issue continues on work list; refresh labels and do not hold.
-              try {
-                const refreshed = await deps.getIssue(issue);
-                byNumber.set(issue, {
-                  ...byNumber.get(issue)!,
-                  labels: refreshed.labels,
-                  body: refreshed.body,
-                  title: refreshed.title,
-                  state: refreshed.state,
-                });
-              } catch {
-                /* keep prior labels; re-advance may still help next wave */
-              }
-              deps.log(
-                `[train] #${issue}: recover-parked ${rp.status}; continuing same issue (no backlog restart)`,
-              );
-              continue;
-            }
-          }
           const err =
             advanced.diagnostic ?? `issue #${issue} parked at pipeline:needs-human`;
           const parked: TrainItemResult = {
@@ -1440,6 +1475,14 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
             error: err,
           };
           await holdContainedItem(parked);
+          deps.reportObservation?.(
+            trainItemObservation({
+              issue,
+              kind: "park",
+              fault: "park",
+              message: err,
+            }),
+          );
           deps.log(
             mergeMode
               ? `[train] hold #${issue}: needs-human (independent remaining work continues)`
@@ -1448,41 +1491,6 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
           continue;
         }
         if (advanced.terminal === "blocked" || labels.includes("blocked")) {
-          if (deps.recoverParked && !recoverParkedAttempted.has(issue)) {
-            recoverParkedAttempted.add(issue);
-            deps.log(`[train] recover-parked once for #${issue} (blocked)`);
-            let rp: TrainRecoverParkedResult;
-            try {
-              rp = await deps.recoverParked(issue);
-            } catch (err) {
-              rp = {
-                status: "fail-closed",
-                issue,
-                message: `recover-parked threw: ${(err as Error).message}`,
-              };
-            }
-            deps.log(
-              `[train] recover-parked #${issue}: ${rp.status} — ${rp.message}`,
-            );
-            if (rp.status === "recovered" || rp.status === "deterministic-cleared") {
-              try {
-                const refreshed = await deps.getIssue(issue);
-                byNumber.set(issue, {
-                  ...byNumber.get(issue)!,
-                  labels: refreshed.labels,
-                  body: refreshed.body,
-                  title: refreshed.title,
-                  state: refreshed.state,
-                });
-              } catch {
-                /* keep prior */
-              }
-              deps.log(
-                `[train] #${issue}: recover-parked ${rp.status}; continuing same issue (no backlog restart)`,
-              );
-              continue;
-            }
-          }
           const err = advanced.diagnostic ?? `issue #${issue} is blocked`;
           const blockedItem: TrainItemResult = {
             issue,
@@ -1493,6 +1501,14 @@ export async function runTrain(opts: TrainOpts, deps: TrainDeps): Promise<TrainR
             error: err,
           };
           await holdContainedItem(blockedItem);
+          deps.reportObservation?.(
+            trainItemObservation({
+              issue,
+              kind: "block",
+              fault: "block",
+              message: err,
+            }),
+          );
           deps.log(
             mergeMode
               ? `[train] hold #${issue}: blocked (independent remaining work continues)`
@@ -1746,7 +1762,17 @@ export function realTrainDeps(opts: {
     },
 
     async mergeIssuePr(pr) {
-      await mergePr(pr, mergeDeps);
+      await mergePr(pr, {
+        ...mergeDeps,
+        supervision: realMergeSupervision({
+          repo: opts.repo,
+          base: opts.baseBranch,
+          repoDir: opts.repoDir,
+          envelope: "pipeline train --merge",
+          actionIdentity: "pipeline train --merge",
+          mergeDeps,
+        }),
+      });
     },
 
     async observePr(pr) {

@@ -175,7 +175,7 @@ import {
 } from "./stages/papercut.ts";
 import { runSweep, realSweepDeps } from "./stages/sweep.ts";
 import { runTriage, realTriageDeps, validateTriageInput, TriageReadyError } from "./stages/triage.ts";
-import { mergePr, realMergeDeps } from "./stages/merge.ts";
+import { mergePr, realMergeDeps, realMergeSupervision } from "./stages/merge.ts";
 import { runMergeQueue, realMergeQueueDeps } from "./stages/merge-queue.ts";
 import {
   parseIssueList,
@@ -3954,48 +3954,6 @@ export async function runTrainCommand(
           { ...opts, parentLogicalOperationId: ctx?.logicalOperationId },
           baseDeps.getIssue,
         ),
-      // #1061: one supervisor recover-parked pass on park; never invent override in train.
-      recoverParked: async (issue) => {
-        const {
-          runRecoverParked,
-          reenterAdvanceAfterRecoverParked,
-        } = await import("./recover-parked.ts");
-        const { runAdvance: runAdvanceForRecover } = await import("./pipeline-run.ts");
-        const result = await runRecoverParked(
-          trainCfg,
-          issue,
-          {},
-          {
-            getIssueDetail,
-            getPrForIssue,
-            getPrDetail,
-            postComment,
-            clearBlocked,
-            getGhActor,
-            // Default tryUnlinkEngineScratch = production defaultTryUnlinkEngineScratch.
-            reenterAdvance: async (c, n, reOpts) => {
-              // Propagate skipRecoverParked into same-issue advance so a
-              // re-park cannot recursively invoke recover-parked on this stack.
-              await reenterAdvanceAfterRecoverParked(
-                c,
-                n,
-                {
-                  getIssueDetail,
-                  silentTransition,
-                  runAdvance: runAdvanceForRecover,
-                },
-                { ...toAdvanceOpts(opts), skipRecoverParked: reOpts.skipRecoverParked },
-              );
-            },
-            log: (m) => console.error(m),
-          },
-        );
-        return {
-          status: result.status,
-          issue: result.issue,
-          message: result.message,
-        };
-      },
     },
   );
   try {
@@ -6695,7 +6653,18 @@ async function main(): Promise<void> {
       process.exit(1);
     }
     try {
-      await mergePr(prNumber, realMergeDeps(mergeCfg.repo));
+      const mergeDeps = realMergeDeps(mergeCfg.repo);
+      await mergePr(prNumber, {
+        ...mergeDeps,
+        supervision: realMergeSupervision({
+          repo: mergeCfg.repo,
+          base: mergeCfg.base_branch,
+          repoDir: mergeCfg.repo_dir,
+          envelope: "pipeline merge",
+          actionIdentity: `pipeline merge ${prNumber}`,
+          mergeDeps,
+        }),
+      });
     } catch (err) {
       console.error(`pipeline merge: ${(err as Error).message}`);
       process.exit(1);

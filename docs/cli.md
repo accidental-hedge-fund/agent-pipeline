@@ -94,7 +94,7 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 #### `train`
 
 - **Usage:** `pipeline train --milestone <m> [--merge] [--json] [--dry-run] | pipeline train --issues <n,n> [--merge] [--json] [--dry-run]`
-- **Summary:** Operator-authorized integrate train: base-eligible frontiers advance via one loop wave each (recovery inside the wave); optionally serial-merge with base containment; independent R2D siblings may merge while a peer is parked (never called by the advance loop)
+- **Summary:** Operator-authorized integrate train: base-eligible frontiers advance via one loop wave each (recovery inside the wave); optionally serial-merge with base containment; parks stay RecoverySupervisor-owned (recover-parked remains an operator CLI); independent R2D siblings may merge while a peer is parked or cooling (never called by the advance loop)
 
 #### `unblock`
 

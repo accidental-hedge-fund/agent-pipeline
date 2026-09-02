@@ -1316,7 +1316,7 @@ test("train merge: reopened pre-R2D with historical merged + new open PR merges 
   assert.equal(result.status.items[0]!.terminal, "ready-to-deploy");
 });
 
-test("train merge: containment failure stops before next item", async () => {
+test("train merge: containment failure holds and excludes dependents", async () => {
   const deps = makeDeps({
     async isAncestor() {
       return false;
@@ -1329,10 +1329,18 @@ test("train merge: containment failure stops before next item", async () => {
 
   const result = await runTrain(baseOpts({ issues: [1, 2], merge: true }), deps);
   assert.equal(result.exitCode, 1);
-  assert.match(result.status.blocker ?? "", /not contained/);
+  assert.match(result.status.blocker ?? "", /not contained|held/);
   assert.equal(deps.mergeCalls.length, 1);
   assert.equal(deps.advanceCalls.length, 1); // only #1 advanced
-  assert.equal(result.status.items.length, 1);
+  assert.ok(
+    !deps.advanceCalls.includes(2),
+    "dependent must not advance while prerequisite is unintegrated",
+  );
+  const dependent = result.status.items.find((i) => i.issue === 2);
+  if (dependent) {
+    assert.equal(dependent.terminal, "dependency-skipped");
+    assert.equal(dependent.integrated, false);
+  }
 });
 
 test("train merge: open-lookup race to merged + uncontained stops before merge (#1014 review-2)", async () => {
@@ -2463,4 +2471,115 @@ test("train events: TRAIN_EVENT_TYPES catalog is closed", () => {
     "train_wave_ended",
     "run_complete",
   ]);
+});
+
+test("train merge: Cooling item does not abandon independent siblings (#1330)", async () => {
+  const logs: string[] = [];
+  const observations: unknown[] = [];
+  const deps = makeDeps({
+    log(msg) {
+      logs.push(msg);
+    },
+    reportObservation(obs) {
+      observations.push(obs);
+    },
+    async mergeIssuePr(pr) {
+      if (pr === 101) {
+        throw new Error("gh pr merge failed: timed out after 60000ms");
+      }
+      const orig = (
+        deps as unknown as { mergeCalls: number[]; _prState: Map<number, { state: string; oid: string | null; head: string }>; _openPrByIssue: Map<number, number> }
+      );
+      orig.mergeCalls.push(pr);
+      const cur = orig._prState.get(pr);
+      if (!cur) throw new Error(`unknown pr ${pr}`);
+      orig._prState.set(pr, { state: "merged", oid: hexOid(pr), head: cur.head });
+      for (const [issue, p] of orig._openPrByIssue) {
+        if (p === pr) orig._openPrByIssue.delete(issue);
+      }
+    },
+  });
+  deps.seedIssue(snap(1, "cooling", ["pipeline:ready-to-deploy"]));
+  deps.seedIssue(snap(2, "independent sibling", ["pipeline:ready-to-deploy"]));
+  deps.seedPr(1, 101);
+  deps.seedPr(2, 102);
+
+  const result = await runTrain(baseOpts({ issues: [1, 2], merge: true }), deps);
+  assert.ok(
+    !logs.some((line) => line.includes("will not implement another sibling")),
+    "must not STOP with will not implement another sibling during Cooling",
+  );
+  assert.ok(deps.mergeCalls.includes(102), "independent sibling must still merge");
+  const cooling = result.status.items.find((i) => i.issue === 1);
+  const sibling = result.status.items.find((i) => i.issue === 2);
+  assert.equal(cooling?.integrated, false);
+  assert.equal(sibling?.integrated, true);
+  assert.ok(
+    observations.some(
+      (o) =>
+        typeof o === "object" &&
+        o !== null &&
+        (o as { kind?: string }).kind === "merge_fault",
+    ),
+  );
+});
+
+test("train merge: transitive dependent stays excluded while prerequisite cools (#1330)", async () => {
+  const logs: string[] = [];
+  const deps = makeDeps({
+    log(msg) {
+      logs.push(msg);
+    },
+    async mergeIssuePr(pr) {
+      if (pr === 101) {
+        throw new Error("PR has merge conflicts (mergeable: CONFLICTING).");
+      }
+      throw new Error(`must not merge PR #${pr} while prerequisite cools`);
+    },
+  });
+  deps.seedIssue(snap(1, "prereq", ["pipeline:ready-to-deploy"]));
+  deps.seedIssue(snap(2, "Depends on: #1", ["pipeline:ready-to-deploy"]));
+  deps.seedPr(1, 101);
+  deps.seedPr(2, 102);
+
+  const result = await runTrain(baseOpts({ issues: [1, 2], merge: true }), deps);
+  assert.equal(deps.advanceCalls.includes(2), false);
+  assert.ok(!deps.mergeCalls.includes(102));
+  const dependent = result.status.items.find((i) => i.issue === 2);
+  if (dependent) {
+    assert.equal(dependent.terminal, "dependency-skipped");
+  }
+  assert.ok(
+    !logs.some((line) => line.includes("will not implement another sibling")),
+  );
+});
+
+test("train: recoverParked injected stub is never called (#1330)", async () => {
+  let rpCalls = 0;
+  const deps = makeDeps({
+    async recoverParked() {
+      rpCalls += 1;
+      return { status: "still-parked", issue: 1, message: "no" };
+    },
+    async advanceIssue(n) {
+      if (n === 1) {
+        return {
+          ok: true,
+          terminal: "needs-human",
+          labels: ["pipeline:needs-human"],
+        };
+      }
+      return {
+        ok: true,
+        terminal: "ready-to-deploy",
+        labels: ["pipeline:ready-to-deploy"],
+      };
+    },
+  });
+  deps.seedIssue(snap(1, "park me"));
+  deps.seedIssue(snap(2, "independent"));
+  const result = await runTrain(baseOpts({ issues: [1, 2], merge: false }), deps);
+  assert.equal(rpCalls, 0);
+  assert.equal(result.status.items.find((i) => i.issue === 1)?.terminal, "needs-human");
+  assert.equal(result.status.items.find((i) => i.issue === 2)?.terminal, "ready-to-deploy");
 });

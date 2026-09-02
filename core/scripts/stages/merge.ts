@@ -27,6 +27,18 @@
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import {
+  assertOperatorMergeEnvelope,
+  bindMergeClaim,
+  classifyMergeFault,
+  fileMergeClaimStore,
+  mergeClaimKey,
+  mergeObservation,
+  ownedLifecycleForFault,
+  observeAndDecide,
+  type MergeObservation,
+  type MergeSupervisionContext,
+} from "./merge-supervision.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -77,6 +89,12 @@ export interface MergeDeps {
   /** Delay seam for UNKNOWN mergeability re-reads. Production uses a real timer;
    *  unit tests inject a no-wait recorder so suites do not wall-clock sleep. */
   sleep(ms: number): Promise<void>;
+  /**
+   * Optional RecoverySupervisor adapter context. When present, merge persists an
+   * exact-candidate claim, reconciles remote truth before replay, and reports a
+   * typed observation. Standalone CLI still throws for operator UX.
+   */
+  supervision?: MergeSupervisionContext;
 }
 
 export function realMergeDeps(repo: string): MergeDeps {
@@ -229,6 +247,66 @@ export function realMergeDeps(repo: string): MergeDeps {
   };
 }
 
+export function realMergeSupervision(opts: {
+  repo: string;
+  base: string;
+  repoDir: string;
+  envelope: MergeSupervisionContext["envelope"];
+  actionIdentity: string;
+  frozenIssueScope?: readonly number[];
+  claimStore?: MergeSupervisionContext["claimStore"];
+  mergeDeps?: MergeDeps;
+}): MergeSupervisionContext {
+  const mergeDeps = opts.mergeDeps ?? realMergeDeps(opts.repo);
+  const git = async (args: string[]): Promise<string> => {
+    const { stdout } = await execFileAsync("git", args, {
+      cwd: opts.repoDir,
+      timeout: 120_000,
+      maxBuffer: 10 * 1024 * 1024,
+    });
+    return String(stdout).trim();
+  };
+  return {
+    repository: opts.repo,
+    base: opts.base,
+    frozenIssueScope: opts.frozenIssueScope ?? [],
+    envelope: opts.envelope,
+    actionIdentity: opts.actionIdentity,
+    claimStore: opts.claimStore ?? fileMergeClaimStore(),
+    observeMergedPr: async (pr) => {
+      const data = await mergeDeps.ghPrView(pr, [
+        "state",
+        "mergedAt",
+        "mergeCommit",
+        "headRefOid",
+      ]);
+      const stateRaw = String(data.state ?? "").toUpperCase();
+      const mergeCommit = data.mergeCommit as { oid?: string } | null | undefined;
+      const mergedAt = data.mergedAt;
+      const isMerged =
+        stateRaw === "MERGED" ||
+        (mergedAt != null && String(mergedAt) !== "" && String(mergedAt) !== "null");
+      return {
+        state: isMerged ? "merged" : stateRaw === "CLOSED" ? "closed" : "open",
+        mergeCommitOid: mergeCommit?.oid ?? null,
+        headRefOid: data.headRefOid ? String(data.headRefOid) : null,
+      };
+    },
+    fetchBase: async (base) => {
+      await git(["fetch", "origin", base]);
+    },
+    baseTip: async (base) => git(["rev-parse", `origin/${base}`]),
+    isAncestor: async (ancestor, descendant) => {
+      try {
+        await git(["merge-base", "--is-ancestor", ancestor, descendant]);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Gate 1: mergeability
 // ---------------------------------------------------------------------------
@@ -376,7 +454,16 @@ function unknownMergeabilityMessage(): string {
   );
 }
 
-export async function mergePr(pr: number, deps: MergeDeps): Promise<void> {
+export interface InspectedMergeCandidate {
+  pr: number;
+  headRefOid: string;
+  linkedIssue: number;
+}
+
+export async function inspectMergeCandidate(
+  pr: number,
+  deps: MergeDeps,
+): Promise<InspectedMergeCandidate> {
   deps.log(`[pipeline merge] #${pr}: checking mergeability...`);
 
   // Fetch mergeable state and the head SHA together. headRefOid is threaded
@@ -490,7 +577,272 @@ export async function mergePr(pr: number, deps: MergeDeps): Promise<void> {
     throw new Error(stageError);
   }
 
+  const linkedIssue = await deps.getPrLinkedIssue(pr);
+  if (linkedIssue === null) {
+    throw new Error(
+      `PR #${pr} has no linked pipeline issue (no closing-issue reference found). ` +
+        `Add "Closes #<issue>" to the PR body and retry, or verify the issue link.`,
+    );
+  }
+
+  return { pr, headRefOid, linkedIssue };
+}
+
+export type MergeAttemptResult =
+  | { kind: "complete"; observation: MergeObservation; mergedNow: boolean }
+  | { kind: "owned"; observation: MergeObservation };
+
+async function emitObservation(
+  deps: MergeDeps,
+  observation: MergeObservation,
+): Promise<void> {
+  deps.supervision?.reportObservation?.(observation);
+}
+
+/**
+ * One bounded merge attempt as a RecoverySupervisor operation adapter.
+ * Does not declare terminal lifecycle on mechanical failure. Verified
+ * completion requires the observer (merged + base containment).
+ */
+export async function runMergeAttempt(
+  pr: number,
+  deps: MergeDeps,
+): Promise<MergeAttemptResult> {
+  const supervision = deps.supervision;
+  if (supervision) {
+    assertOperatorMergeEnvelope(supervision.envelope);
+    const existing = await supervision.claimStore.load(
+      mergeClaimKey(supervision.repository, pr),
+    );
+    const { decision, live } = await observeAndDecide({
+      pr,
+      supervision,
+      claim: existing,
+    });
+    if (decision.action === "complete") {
+      if (existing && existing.outcome !== "complete") {
+        await supervision.claimStore.save({ ...existing, outcome: "complete" });
+      }
+      const observation = mergeObservation({
+        pr,
+        repository: supervision.repository,
+        certainty: "known_complete",
+        lifecycle: "complete",
+        complete: true,
+        fault: null,
+        message: `PR #${pr} is merged and contained in ${supervision.base}`,
+        claim: existing
+          ? { ...existing, outcome: "complete" }
+          : null,
+        inspectedHead: existing?.inspected_head ?? live.headRefOid,
+        mergeCommitOid: decision.mergeCommitOid,
+      });
+      await emitObservation(deps, observation);
+      deps.log(`[pipeline merge] #${pr}: already merged and contained — no replay.`);
+      return { kind: "complete", observation, mergedNow: false };
+    }
+    if (decision.action === "wait") {
+      const observation = mergeObservation({
+        pr,
+        repository: supervision.repository,
+        certainty: decision.certainty,
+        lifecycle: ownedLifecycleForFault(decision.fault),
+        complete: false,
+        fault: decision.fault,
+        message:
+          `PR #${pr}: merge side-effect is ${decision.certainty}; ` +
+          `reconciling remote truth before replay (${decision.fault})`,
+        claim: existing,
+        inspectedHead: existing?.inspected_head ?? live.headRefOid,
+        mergeCommitOid: live.mergeCommitOid,
+      });
+      await emitObservation(deps, observation);
+      return { kind: "owned", observation };
+    }
+    if (decision.action === "invalidate") {
+      const observation = mergeObservation({
+        pr,
+        repository: supervision.repository,
+        certainty: "known_absent",
+        lifecycle: "cooling",
+        complete: false,
+        fault: "head_drift",
+        message:
+          `PR #${pr}: inspected head moved; stale claim and derived merge authorization are invalid`,
+        claim: existing,
+        inspectedHead: live.headRefOid,
+        mergeCommitOid: live.mergeCommitOid,
+      });
+      await emitObservation(deps, observation);
+      // Fresh exact-candidate gates + a new claim under the original envelope.
+    }
+  }
+
+  let inspected: InspectedMergeCandidate;
+  try {
+    inspected = await inspectMergeCandidate(pr, deps);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const fault = classifyMergeFault(message);
+    const observation = mergeObservation({
+      pr,
+      repository: supervision?.repository ?? "",
+      certainty: "known_absent",
+      lifecycle: fault ? ownedLifecycleForFault(fault) : "cooling",
+      complete: false,
+      fault,
+      message,
+      claim: null,
+    });
+    await emitObservation(deps, observation);
+    return { kind: "owned", observation };
+  }
+
+  if (supervision) {
+    const liveHead = inspected.headRefOid;
+    const existing = await supervision.claimStore.load(
+      mergeClaimKey(supervision.repository, pr),
+    );
+    if (
+      existing &&
+      existing.outcome !== "complete" &&
+      existing.inspected_head !== liveHead
+    ) {
+      deps.log(
+        `[pipeline merge] #${pr}: stale claim head ${existing.inspected_head} ` +
+          `!= inspected ${liveHead}; re-deriving candidate authorization`,
+      );
+    }
+
+    const claim = bindMergeClaim({
+      repository: supervision.repository,
+      base: supervision.base,
+      frozenIssueScope:
+        supervision.frozenIssueScope.length > 0
+          ? supervision.frozenIssueScope
+          : [inspected.linkedIssue],
+      pr,
+      inspectedHead: liveHead,
+      actionIdentity: supervision.actionIdentity,
+      now: supervision.now?.(),
+    });
+    await supervision.claimStore.save(claim);
+    const charged = await supervision.claimStore.load(
+      mergeClaimKey(supervision.repository, pr),
+    );
+    if (!charged || charged.outcome !== "started" || charged.inspected_head !== liveHead) {
+      const observation = mergeObservation({
+        pr,
+        repository: supervision.repository,
+        certainty: "known_absent",
+        lifecycle: "cooling",
+        complete: false,
+        fault: null,
+        message: `merge refused: exact-candidate claim was not persisted before submission`,
+        claim: charged,
+        inspectedHead: liveHead,
+      });
+      await emitObservation(deps, observation);
+      return { kind: "owned", observation };
+    }
+
+    supervision.crashBeforeSubmit?.();
+
+    deps.log(`[pipeline merge] #${pr}: all gates passed — squash-merging and deleting branch...`);
+    try {
+      await deps.ghPrMerge(pr, liveHead);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const uncertainClaim = { ...charged, outcome: "uncertain" as const };
+      await supervision.claimStore.save(uncertainClaim);
+      const { decision, live } = await observeAndDecide({
+        pr,
+        supervision,
+        claim: uncertainClaim,
+      });
+      if (decision.action === "complete") {
+        await supervision.claimStore.save({ ...charged, outcome: "complete" });
+        const observation = mergeObservation({
+          pr,
+          repository: supervision.repository,
+          certainty: "known_complete",
+          lifecycle: "complete",
+          complete: true,
+          fault: null,
+          message: `PR #${pr} is merged and contained in ${supervision.base}`,
+          claim: { ...charged, outcome: "complete" },
+          inspectedHead: liveHead,
+          mergeCommitOid: decision.mergeCommitOid,
+        });
+        await emitObservation(deps, observation);
+        deps.log(`[pipeline merge] #${pr}: merged successfully (reconciled after mutation error).`);
+        return { kind: "complete", observation, mergedNow: true };
+      }
+      const fault =
+        classifyMergeFault(message) ?? "uncertain_merge_response";
+      const observation = mergeObservation({
+        pr,
+        repository: supervision.repository,
+        certainty: "uncertain",
+        lifecycle: ownedLifecycleForFault(fault),
+        complete: false,
+        fault,
+        message,
+        claim: uncertainClaim,
+        inspectedHead: liveHead,
+        mergeCommitOid: live.mergeCommitOid,
+      });
+      await emitObservation(deps, observation);
+      return { kind: "owned", observation };
+    }
+
+    supervision.crashAfterSubmit?.();
+
+    const completeClaim = { ...charged, outcome: "complete" as const };
+    await supervision.claimStore.save(completeClaim);
+    let mergeCommitOid: string | null = null;
+    try {
+      const live = await supervision.observeMergedPr(pr);
+      mergeCommitOid = live.mergeCommitOid;
+    } catch {
+      mergeCommitOid = null;
+    }
+    const observation = mergeObservation({
+      pr,
+      repository: supervision.repository,
+      certainty: "known_complete",
+      lifecycle: "complete",
+      complete: true,
+      fault: null,
+      message: `PR #${pr}: merged successfully.`,
+      claim: completeClaim,
+      inspectedHead: liveHead,
+      mergeCommitOid,
+    });
+    await emitObservation(deps, observation);
+    deps.log(`[pipeline merge] #${pr}: merged successfully.`);
+    return { kind: "complete", observation, mergedNow: true };
+  }
+
   deps.log(`[pipeline merge] #${pr}: all gates passed — squash-merging and deleting branch...`);
-  await deps.ghPrMerge(pr, headRefOid);
+  await deps.ghPrMerge(pr, inspected.headRefOid);
   deps.log(`[pipeline merge] #${pr}: merged successfully.`);
+  const observation = mergeObservation({
+    pr,
+    repository: "",
+    certainty: "known_complete",
+    lifecycle: "complete",
+    complete: true,
+    fault: null,
+    message: `PR #${pr}: merged successfully.`,
+    claim: null,
+    inspectedHead: inspected.headRefOid,
+  });
+  return { kind: "complete", observation, mergedNow: true };
+}
+
+export async function mergePr(pr: number, deps: MergeDeps): Promise<void> {
+  const result = await runMergeAttempt(pr, deps);
+  if (result.kind === "complete" && result.observation.complete) return;
+  throw new Error(result.observation.message);
 }
