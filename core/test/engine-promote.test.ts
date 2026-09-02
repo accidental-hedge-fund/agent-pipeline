@@ -14,9 +14,11 @@ import {
   DEFAULT_ENGINE_PROMOTE_HOST,
   installArgsForTag,
   installCommandForTag,
+  matchingLiveDigestForHosts,
   requirePeeledOid,
   resolvePeeledPromoteGitSha,
   runEnginePromote,
+  selectedPromoteHosts,
   startingLockPidFromEnv,
   tagForVersion,
   type EnginePromoteDeps,
@@ -92,7 +94,7 @@ function makeDeps(over: Partial<EnginePromoteDeps> = {}): EnginePromoteDeps & {
       const last = installs[installs.length - 1];
       return last ? last.replace(/^v/, "") : current?.version ?? null;
     },
-    async installedDigest() {
+    async installedDigest(_host) {
       return current?.git_sha ?? "b".repeat(40);
     },
     async resolvePromoteGitSha() {
@@ -340,7 +342,7 @@ test("engine-promote: matching version with wrong digest does not complete (#133
     async installedVersion() {
       return "1.34.0";
     },
-    async installedDigest() {
+    async installedDigest(_host) {
       return "c".repeat(40);
     },
     async resolvePromoteGitSha() {
@@ -366,6 +368,40 @@ test("engine-promote: matching digest completes deployment (#1331)", async () =>
   assert.equal(result.verified, true);
   assert.equal(result.error, undefined);
   assert.ok(result.steps.some((s) => s.startsWith("verified_digest:")));
+});
+
+test("engine-promote: wrong host digest does not complete (#1331)", async () => {
+  const authorized = "b".repeat(40);
+  const deps = makeDeps({
+    async installedDigest(host) {
+      if (host === "claude") return "c".repeat(40);
+      return authorized;
+    },
+  });
+  const result = await runEnginePromote(opts({ host: "all" }), deps);
+  assert.equal(result.verified, false);
+  assert.match(result.error ?? "", /host claude/);
+  assert.equal(result.rolled_back, false);
+  assert.equal(deps.rollbacks, 0);
+});
+
+test("selectedPromoteHosts expands all to every builtin host (#1331)", () => {
+  assert.deepEqual(selectedPromoteHosts("codex"), ["codex"]);
+  assert.ok(selectedPromoteHosts("all").includes("claude"));
+  assert.ok(selectedPromoteHosts("all").includes("codex"));
+});
+
+test("matchingLiveDigestForHosts refuses a mismatched selected host (#1331)", () => {
+  const authorized = "b".repeat(40);
+  const result = matchingLiveDigestForHosts(
+    [
+      { host: "codex", digest: authorized },
+      { host: "claude", digest: "c".repeat(40) },
+    ],
+    authorized,
+  );
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.match(result.reason, /host claude/);
 });
 
 test("engine-promote: skip install when pin already current", async () => {

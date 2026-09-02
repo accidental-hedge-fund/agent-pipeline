@@ -12,6 +12,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import {
   isProductionQualityPin,
@@ -22,8 +23,11 @@ import {
   type PromotePinResult,
 } from "../production-engine-pin.ts";
 import { readSkipFrgFromPipelineYml } from "../config.ts";
+import { resolveManifestSkillPath } from "../discovery.ts";
 import { formatFrgSkipReason, resolveFrgSkip } from "../frg-skip.ts";
 import { resolveEngineCommitSha } from "../engine-attribution.ts";
+import { resolveOuterHost } from "../outer-hosts/index.ts";
+import { BUILTIN_OUTER_HOST_IDS, type BuiltinOuterHostId } from "../outer-hosts/types.ts";
 import {
   assertNoRemainingOpenMilestoneIssues,
   listRemainingOpenMilestoneIssueNumbers,
@@ -105,10 +109,11 @@ export interface EnginePromoteDeps {
   /** Read installed pipeline --version (semver without v). Ingress only. */
   installedVersion(): Promise<string | null>;
   /**
-   * Live installed engine digest (40-hex). Required to complete deployment.
+   * Live installed engine digest (40-hex) for one selected host.
+   * Must observe that host's installed skill engine, not the source checkout.
    * A matching version string is not this proof.
    */
-  installedDigest(): Promise<string | null>;
+  installedDigest(host: BuiltinOuterHostId): Promise<string | null>;
   /**
    * Optional gh-free `skip_frg` read. When omitted, the command reads
    * `.github/pipeline.yml` via {@link readSkipFrgFromPipelineYml}.
@@ -250,6 +255,57 @@ export function installCommandForTag(
   startingLockPid: number | null = null,
 ): string {
   return `npx ${installArgsForTag(tag, host, startingLockPid).join(" ")}`;
+}
+
+/** Concrete hosts that deployment must observe for `host`. */
+export function selectedPromoteHosts(host: EnginePromoteHost): readonly BuiltinOuterHostId[] {
+  if (host === "all") return BUILTIN_OUTER_HOST_IDS;
+  return [host];
+}
+
+export function matchingLiveDigestForHosts(
+  observations: ReadonlyArray<{ host: string; digest: string | null }>,
+  authorizedDigest: string,
+): { ok: true; digest: string } | { ok: false; reason: string } {
+  const authorized = authorizedDigest.trim().toLowerCase();
+  if (!OID_RE.test(authorized)) {
+    return {
+      ok: false,
+      reason: `live digest (unknown) does not match authorized ${authorizedDigest || "(missing)"}`,
+    };
+  }
+  if (observations.length === 0) {
+    return { ok: false, reason: "live digest observer has no selected hosts" };
+  }
+  for (const obs of observations) {
+    const live = typeof obs.digest === "string" ? obs.digest.trim().toLowerCase() : "";
+    if (!OID_RE.test(live)) {
+      return {
+        ok: false,
+        reason: `live digest ${obs.digest ?? "(unknown)"} for host ${obs.host} does not match authorized ${authorized}`,
+      };
+    }
+    if (live !== authorized) {
+      return {
+        ok: false,
+        reason: `live digest ${live} for host ${obs.host} does not match authorized ${authorized}`,
+      };
+    }
+  }
+  return { ok: true, digest: authorized };
+}
+
+function hostInstalledSkillDir(host: BuiltinOuterHostId): string | null {
+  const manifest = resolveOuterHost(host);
+  if (!manifest) return null;
+  const skill = resolveManifestSkillPath(manifest, {
+    homeDir: () => os.homedir(),
+    envGet: (key) => process.env[key],
+  });
+  const launcher = path.join(skill, "scripts", "pipeline.mjs");
+  const core = path.join(skill, "core");
+  if (!fs.existsSync(launcher) && !fs.existsSync(path.join(core, "scripts"))) return null;
+  return skill;
 }
 
 export async function runEnginePromote(
@@ -401,17 +457,17 @@ export async function runEnginePromote(
     return { ...base, error: `install failed: ${msg}` };
   }
 
-  // 4) Verify live digest matches the authorized published artifact.
-  // Version string is ingress evidence only.
+  // 4) Verify live digest matches the authorized published artifact on every
+  // selected host. Version string is ingress evidence only.
   const installed = await deps.installedVersion();
-  const liveDigest = await deps.installedDigest();
+  const observations: Array<{ host: string; digest: string | null }> = [];
+  for (const selectedHost of selectedPromoteHosts(host)) {
+    observations.push({ host: selectedHost, digest: await deps.installedDigest(selectedHost) });
+  }
   const authorizedDigest = (base.pin?.git_sha ?? gitSha ?? "").trim().toLowerCase();
   const versionMatches = Boolean(installed && installed.replace(/^[vV]/, "") === version);
-  const digestMatches =
-    OID_RE.test(authorizedDigest) &&
-    typeof liveDigest === "string" &&
-    liveDigest.trim().toLowerCase() === authorizedDigest;
-  if (versionMatches && digestMatches) {
+  const digestProof = matchingLiveDigestForHosts(observations, authorizedDigest);
+  if (versionMatches && digestProof.ok) {
     base.verified = true;
     steps.push(`verified_installed: ${installed}`);
     steps.push(`verified_digest: ${authorizedDigest.slice(0, 12)}`);
@@ -420,9 +476,9 @@ export async function runEnginePromote(
     steps.push(`digest_unproven: skip-frg pin has no authorized digest`);
     deps.log(`[engine-promote] skip-frg install matched version ${installed}; digest remains unproven`);
   } else {
-    const msg = digestMatches
+    const msg = digestProof.ok
       ? `installed version ${installed ?? "(unknown)"} does not match target ${version}`
-      : `live digest ${liveDigest ?? "(unknown)"} does not match authorized ${authorizedDigest || "(missing)"}`;
+      : digestProof.reason;
     steps.push(`verify_failed: ${msg}`);
     steps.push("rollback_not_granted: generic verify failure");
     return { ...base, error: msg };
@@ -558,9 +614,34 @@ export function realEnginePromoteDeps(repoDir: string): EnginePromoteDeps {
         return null;
       }
     },
-    async installedDigest() {
-      const sha = resolveEngineCommitSha(repoDir);
-      return sha && OID_RE.test(sha) ? sha.toLowerCase() : sha;
+    async installedDigest(host) {
+      const skill = hostInstalledSkillDir(host);
+      if (skill) {
+        const launcher = path.join(skill, "scripts", "pipeline.mjs");
+        if (fs.existsSync(launcher)) {
+          try {
+            const { stdout } = await execFileAsync(
+              process.execPath,
+              [launcher, "--version", "--json"],
+              {
+                timeout: 30_000,
+                maxBuffer: 1024 * 1024,
+                env: process.env,
+              },
+            );
+            const raw = String(stdout).trim().split(/\r?\n/)[0] ?? "";
+            const parsed = JSON.parse(raw) as { commit_sha?: unknown };
+            const sha =
+              typeof parsed.commit_sha === "string" ? parsed.commit_sha.trim().toLowerCase() : "";
+            if (OID_RE.test(sha)) return sha;
+          } catch {
+            // Fall through to installed-core rev-parse. Never use repoDir.
+          }
+        }
+        const sha = resolveEngineCommitSha(path.join(skill, "core"));
+        return sha && OID_RE.test(sha) ? sha.toLowerCase() : null;
+      }
+      return null;
     },
     async listRemainingOpenMilestoneIssues(milestone) {
       let repo: string;

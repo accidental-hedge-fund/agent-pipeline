@@ -26,7 +26,9 @@ import {
 import {
   assertRollbackEnvelope,
   operatorRollbackEnvelope,
+  resolveRollbackEnvelopeKey,
   type RollbackAuthorityEnvelope,
+  type RollbackRetainedTarget,
 } from "./stages/ship-supervision.ts";
 
 // ---------------------------------------------------------------------------
@@ -1934,11 +1936,20 @@ export async function rollbackProductionPin(opts: {
    */
   automatic?: boolean;
   envelope?: RollbackAuthorityEnvelope | null;
+  /** Repository binding the envelope must name. Defaults to `repoDir`. */
+  repository?: string;
+  /** HMAC key for automatic envelope verification. Defaults to env. */
+  envelopeKey?: string | null;
 }): Promise<PromotePinResult> {
   const fsDeps = opts.fsDeps ?? defaultProductionPinFsDeps;
   const lookup = opts.lookupFrg ?? lookupFrgPass;
   const now = opts.now ?? (() => new Date());
   const pinPath = productionPinPath(opts.repoDir, opts.overridePath, opts.env);
+  const repository = opts.repository ?? opts.repoDir;
+  const envelopeKey =
+    opts.envelopeKey !== undefined
+      ? opts.envelopeKey
+      : resolveRollbackEnvelopeKey(opts.env ?? process.env);
   if (opts.automatic && !opts.envelope) {
     return {
       ok: false,
@@ -1970,15 +1981,24 @@ export async function rollbackProductionPin(opts: {
   // Snapshot of the current pin becomes the new previous after rollback.
   const currentAsPrevious = pinWithoutPrevious(current);
 
-  const authorizeRollback = (retained: { version: string; tag?: string }): PromotePinResult | null => {
-    const retainedTarget = { version: retained.version, tag: retained.tag };
+  const authorizeRollback = (retained: RollbackRetainedTarget): PromotePinResult | null => {
+    const retainedTarget: RollbackRetainedTarget = {
+      version: retained.version,
+      ...(retained.tag ? { tag: retained.tag } : {}),
+      ...(retained.git_sha ? { git_sha: retained.git_sha } : {}),
+    };
     const envelope = opts.envelope ?? (
       opts.automatic
         ? null
-        : operatorRollbackEnvelope({ retainedTarget, now: now() })
+        : operatorRollbackEnvelope({ retainedTarget, now: now(), repository })
     );
     try {
-      assertRollbackEnvelope(envelope, retainedTarget);
+      assertRollbackEnvelope(envelope, retainedTarget, {
+        repository,
+        nowMs: now().getTime(),
+        hmacKey: envelopeKey,
+        requireMac: opts.automatic === true,
+      });
       return null;
     } catch (err) {
       return {
@@ -2003,6 +2023,7 @@ export async function rollbackProductionPin(opts: {
     const refused = authorizeRollback({
       version: current.previous.version,
       tag: current.previous.tag,
+      git_sha: current.previous.git_sha,
     });
     if (refused) return refused;
     const restored: ProductionEnginePin = {
@@ -2045,6 +2066,7 @@ export async function rollbackProductionPin(opts: {
     const refused = authorizeRollback({
       version: current.previous.version,
       tag: current.previous.tag,
+      git_sha: current.previous.git_sha,
     });
     if (refused) return refused;
     const restored: ProductionEnginePin = {
@@ -2094,7 +2116,11 @@ export async function rollbackProductionPin(opts: {
     };
   }
 
-  const refusedTo = authorizeRollback({ version: target });
+  const refusedTo = authorizeRollback({
+    version: target,
+    tag: tagForVersion(target),
+    git_sha: look.evidence.pack_provenance?.candidate_git_sha ?? null,
+  });
   if (refusedTo) return refusedTo;
 
   const pin = buildPinFromFrgPass({

@@ -108,7 +108,13 @@ import {
   parseReleasePrTitle,
   realReleaseFinishDeps,
 } from "./release-finish.ts";
-import { realEnginePromoteDeps, runEnginePromote } from "./engine-promote.ts";
+import {
+  DEFAULT_ENGINE_PROMOTE_HOST,
+  matchingLiveDigestForHosts,
+  realEnginePromoteDeps,
+  runEnginePromote,
+  selectedPromoteHosts,
+} from "./engine-promote.ts";
 import { ownerRepoFromPackageRepository } from "../production-engine-pin.ts";
 
 const execFileAsync = promisify(execFile);
@@ -1250,10 +1256,12 @@ function realShipAdapterOperations(opts: RealShipCoordinatorDepsOptions): ShipAd
     },
     async observeDeployment(intent, promotion) {
       const pin = await engineDeps.loadPin({ repoDir: opts.repoDir });
-      const live = await engineDeps.installedDigest();
-      const liveDigest = typeof live === "string" ? live.trim().toLowerCase() : "";
-      if (pin.kind !== "ok" || pin.pin.version !== intent.version ||
-          !OID_RE.test(liveDigest) || liveDigest !== promotion.pin_digest) {
+      const observations = [];
+      for (const host of selectedPromoteHosts(DEFAULT_ENGINE_PROMOTE_HOST)) {
+        observations.push({ host, digest: await engineDeps.installedDigest(host) });
+      }
+      const match = matchingLiveDigestForHosts(observations, promotion.pin_digest);
+      if (pin.kind !== "ok" || pin.pin.version !== intent.version || !match.ok) {
         return null;
       }
       return {
@@ -1261,7 +1269,7 @@ function realShipAdapterOperations(opts: RealShipCoordinatorDepsOptions): ShipAd
         tag: promotion.tag,
         environment: "all",
         authorized_digest: promotion.pin_digest,
-        live_digest: liveDigest,
+        live_digest: match.digest,
         verified: true,
       };
     },
@@ -1276,17 +1284,20 @@ function realShipAdapterOperations(opts: RealShipCoordinatorDepsOptions): ShipAd
       if (!result.verified || result.error) {
         throw new Error(`ship deployment: ${result.error ?? "live digest was not verified"}`);
       }
-      const live = await engineDeps.installedDigest();
-      const liveDigest = typeof live === "string" ? live.trim().toLowerCase() : "";
-      if (!OID_RE.test(liveDigest) || liveDigest !== promotion.pin_digest) {
-        throw new Error("ship deployment: live digest does not match the authorized published artifact");
+      const observations = [];
+      for (const host of selectedPromoteHosts(DEFAULT_ENGINE_PROMOTE_HOST)) {
+        observations.push({ host, digest: await engineDeps.installedDigest(host) });
+      }
+      const match = matchingLiveDigestForHosts(observations, promotion.pin_digest);
+      if (!match.ok) {
+        throw new Error(`ship deployment: ${match.reason}`);
       }
       return {
         version: intent.version,
         tag: promotion.tag,
         environment: "all",
         authorized_digest: promotion.pin_digest,
-        live_digest: liveDigest,
+        live_digest: match.digest,
         verified: true,
       };
     },

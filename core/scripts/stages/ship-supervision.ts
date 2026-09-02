@@ -5,11 +5,16 @@
 // typed observations, claims, and projections that owner consumes. It is
 // not a second controller, ledger family, grant schema, or scheduler.
 
+import { canonicalJson, hmacEqual, hmacSha256Hex } from "../grill-hash.ts";
 import { projectStageDiagnostic, type StageDiagnostic } from "../stage-diagnostic.ts";
 
 export const SHIP_COOLING_MS = 15_000;
 export const ROLLBACK_OPERATION = "factory_pin_rollback" as const;
 export const ROLLBACK_ENVELOPE_KIND = "rollback_envelope" as const;
+export const ROLLBACK_ENVELOPE_TTL_MS = 24 * 60 * 60 * 1000;
+export const ROLLBACK_ENVELOPE_MAC_PREFIX = "hmac-sha256:";
+export const ROLLBACK_ENVELOPE_KEY_ENV = "PIPELINE_ROLLBACK_ENVELOPE_KEY";
+const ROLLBACK_OID_RE = /^[0-9a-f]{40}$/;
 
 export type ShipReleaseModel = "semver" | "continuous";
 
@@ -313,31 +318,74 @@ export interface RollbackAuthorityEnvelope {
   operation: typeof ROLLBACK_OPERATION;
   retained_target: RollbackRetainedTarget;
   actor: string;
-  repository?: string;
-  issued_at?: string;
-  expires_at?: string;
+  repository: string;
+  issued_at: string;
+  expires_at: string;
+  mac?: string;
+}
+
+export interface AssertRollbackEnvelopeOpts {
+  repository: string;
+  nowMs: number;
+  hmacKey?: string | null;
+  /** Automatic rollback requires a verified HMAC. Operator argv does not. */
+  requireMac?: boolean;
+}
+
+export function resolveRollbackEnvelopeKey(env: NodeJS.ProcessEnv = process.env): string | null {
+  const raw = env[ROLLBACK_ENVELOPE_KEY_ENV];
+  if (typeof raw !== "string") return null;
+  const key = raw.trim();
+  return key === "" ? null : key;
+}
+
+export function signRollbackEnvelope(
+  unsigned: Omit<RollbackAuthorityEnvelope, "mac">,
+  key: string,
+): RollbackAuthorityEnvelope {
+  const mac = `${ROLLBACK_ENVELOPE_MAC_PREFIX}${hmacSha256Hex(key, canonicalJson(unsigned))}`;
+  return { ...unsigned, mac };
+}
+
+function normalizeRollbackOid(value: string | null | undefined): string | null {
+  if (typeof value !== "string") return null;
+  const sha = value.trim().toLowerCase();
+  return ROLLBACK_OID_RE.test(sha) ? sha : null;
+}
+
+function normalizeRollbackTag(value: string): string {
+  return value.trim().replace(/^[vV]/, "");
 }
 
 export function operatorRollbackEnvelope(input: {
   retainedTarget: RollbackRetainedTarget;
   actor?: string;
-  repository?: string;
+  repository: string;
   now?: Date;
+  ttlMs?: number;
+  hmacKey?: string;
 }): RollbackAuthorityEnvelope {
   const now = input.now ?? new Date();
-  return {
+  const ttlMs = input.ttlMs ?? ROLLBACK_ENVELOPE_TTL_MS;
+  const unsigned: Omit<RollbackAuthorityEnvelope, "mac"> = {
     kind: ROLLBACK_ENVELOPE_KIND,
     operation: ROLLBACK_OPERATION,
     retained_target: { ...input.retainedTarget },
     actor: input.actor ?? "operator-cli",
-    ...(input.repository ? { repository: input.repository } : {}),
+    repository: input.repository,
     issued_at: now.toISOString(),
+    expires_at: new Date(now.getTime() + ttlMs).toISOString(),
   };
+  if (typeof input.hmacKey === "string" && input.hmacKey.trim()) {
+    return signRollbackEnvelope(unsigned, input.hmacKey);
+  }
+  return unsigned;
 }
 
 export function assertRollbackEnvelope(
   envelope: unknown,
   retainedTarget: RollbackRetainedTarget,
+  opts: AssertRollbackEnvelopeOpts,
 ): asserts envelope is RollbackAuthorityEnvelope {
   if (!envelope || typeof envelope !== "object" || Array.isArray(envelope)) {
     throw new Error(
@@ -362,8 +410,63 @@ export function assertRollbackEnvelope(
       `rollback refused: envelope retained target ${target.version} does not match ${retainedTarget.version}`,
     );
   }
+  if (typeof retainedTarget.tag === "string" && retainedTarget.tag.trim()) {
+    const presentedTag = typeof target.tag === "string" ? target.tag.trim() : "";
+    if (!presentedTag) {
+      throw new Error("rollback refused: envelope must name the retained target tag");
+    }
+    if (normalizeRollbackTag(presentedTag) !== normalizeRollbackTag(retainedTarget.tag)) {
+      throw new Error(
+        `rollback refused: envelope retained tag ${presentedTag} does not match ${retainedTarget.tag}`,
+      );
+    }
+  }
+  const expectedSha = normalizeRollbackOid(retainedTarget.git_sha);
+  if (expectedSha) {
+    const presentedSha = normalizeRollbackOid(target.git_sha);
+    if (!presentedSha) {
+      throw new Error("rollback refused: envelope must name the retained target digest");
+    }
+    if (presentedSha !== expectedSha) {
+      throw new Error(
+        `rollback refused: envelope retained digest ${String(target.git_sha)} does not match ${retainedTarget.git_sha}`,
+      );
+    }
+  }
   if (typeof rec.actor !== "string" || rec.actor.trim() === "") {
     throw new Error("rollback refused: envelope must name the actor");
+  }
+  if (typeof rec.repository !== "string" || rec.repository.trim() === "") {
+    throw new Error("rollback refused: envelope must name the repository");
+  }
+  if (rec.repository.trim() !== opts.repository.trim()) {
+    throw new Error(
+      `rollback refused: envelope repository ${rec.repository} does not match ${opts.repository}`,
+    );
+  }
+  if (typeof rec.issued_at !== "string" || !Number.isFinite(Date.parse(rec.issued_at))) {
+    throw new Error("rollback refused: envelope must name issued_at");
+  }
+  if (typeof rec.expires_at !== "string" || !Number.isFinite(Date.parse(rec.expires_at))) {
+    throw new Error("rollback refused: envelope must name expires_at");
+  }
+  if (opts.nowMs >= Date.parse(rec.expires_at)) {
+    throw new Error("rollback refused: envelope has expired");
+  }
+  if (!opts.requireMac) return;
+  const key = typeof opts.hmacKey === "string" ? opts.hmacKey.trim() : "";
+  if (!key) {
+    throw new Error("rollback refused: automatic rollback requires a verified signed envelope");
+  }
+  const mac = rec.mac;
+  if (typeof mac !== "string" || !mac.startsWith(ROLLBACK_ENVELOPE_MAC_PREFIX)) {
+    throw new Error("rollback refused: envelope MAC is missing");
+  }
+  const { mac: _mac, ...unsigned } = rec as RollbackAuthorityEnvelope;
+  const expectedMac = hmacSha256Hex(key, canonicalJson(unsigned));
+  const actualMac = mac.slice(ROLLBACK_ENVELOPE_MAC_PREFIX.length);
+  if (!hmacEqual(expectedMac, actualMac)) {
+    throw new Error("rollback refused: envelope MAC verification failed");
   }
 }
 

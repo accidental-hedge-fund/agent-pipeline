@@ -2035,19 +2035,136 @@ test("automatic rollback with an envelope naming the retained target is admitted
   });
   const { deps } = memFs({ [PIN_PATH]: JSON.stringify(current) });
   const { operatorRollbackEnvelope } = await import("../scripts/stages/ship-supervision.ts");
+  const key = "test-rollback-envelope-key";
   const result = await rollbackProductionPin({
     repoDir: REPO,
     fsDeps: deps,
     now: FIXED_NOW,
     env: {},
     automatic: true,
+    envelopeKey: key,
     envelope: operatorRollbackEnvelope({
       retainedTarget: { version: "1.29.1", tag: "v1.29.1" },
       actor: "recovery-supervisor",
+      repository: REPO,
+      now: FIXED_NOW(),
+      hmacKey: key,
     }),
   });
   assert.equal(result.ok, true);
   if (result.ok) assert.equal(result.pin.version, "1.29.1");
+});
+
+test("automatic rollback unsigned envelope is refused (#1331)", async () => {
+  const current = validPin({
+    version: "1.30.0",
+    tag: "v1.30.0",
+    previous: {
+      schema_version: 1,
+      version: "1.29.1",
+      tag: "v1.29.1",
+      git_sha: null,
+      git_sha_source: "unknown",
+      frg_run_id: "frg-old",
+      promoted_at: "2026-07-01T00:00:00Z",
+    },
+  });
+  const before = JSON.stringify(current);
+  const { deps, files } = memFs({ [PIN_PATH]: before });
+  const result = await rollbackProductionPin({
+    repoDir: REPO,
+    fsDeps: deps,
+    now: FIXED_NOW,
+    env: {},
+    automatic: true,
+    envelopeKey: "test-rollback-envelope-key",
+    envelope: {
+      kind: "rollback_envelope",
+      operation: "factory_pin_rollback",
+      retained_target: { version: "1.29.1", tag: "v1.29.1" },
+      actor: "attacker",
+      repository: REPO,
+      issued_at: FIXED_NOW().toISOString(),
+      expires_at: new Date(FIXED_NOW().getTime() + 60_000).toISOString(),
+    },
+  });
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.match(result.message, /MAC is missing|verified signed envelope/);
+  assert.equal(files.get(PIN_PATH), before);
+});
+
+test("automatic rollback expired or unbound envelope is refused (#1331)", async () => {
+  const current = validPin({
+    version: "1.30.0",
+    tag: "v1.30.0",
+    git_sha: "a".repeat(40),
+    previous: {
+      schema_version: 1,
+      version: "1.29.1",
+      tag: "v1.29.1",
+      git_sha: "d".repeat(40),
+      git_sha_source: "unknown",
+      frg_run_id: "frg-old",
+      promoted_at: "2026-07-01T00:00:00Z",
+    },
+  });
+  const before = JSON.stringify(current);
+  const { deps, files } = memFs({ [PIN_PATH]: before });
+  const { operatorRollbackEnvelope } = await import("../scripts/stages/ship-supervision.ts");
+  const key = "test-rollback-envelope-key";
+  const expired = await rollbackProductionPin({
+    repoDir: REPO,
+    fsDeps: deps,
+    now: FIXED_NOW,
+    env: {},
+    automatic: true,
+    envelopeKey: key,
+    envelope: operatorRollbackEnvelope({
+      retainedTarget: { version: "1.29.1", tag: "v1.29.1", git_sha: "d".repeat(40) },
+      actor: "recovery-supervisor",
+      repository: REPO,
+      now: new Date("2026-07-01T12:00:00.000Z"),
+      ttlMs: 1000,
+      hmacKey: key,
+    }),
+  });
+  assert.equal(expired.ok, false);
+  if (!expired.ok) assert.match(expired.message, /expired/);
+  const wrongRepo = await rollbackProductionPin({
+    repoDir: REPO,
+    fsDeps: deps,
+    now: FIXED_NOW,
+    env: {},
+    automatic: true,
+    envelopeKey: key,
+    envelope: operatorRollbackEnvelope({
+      retainedTarget: { version: "1.29.1", tag: "v1.29.1", git_sha: "d".repeat(40) },
+      actor: "recovery-supervisor",
+      repository: "other/repo",
+      now: FIXED_NOW(),
+      hmacKey: key,
+    }),
+  });
+  assert.equal(wrongRepo.ok, false);
+  if (!wrongRepo.ok) assert.match(wrongRepo.message, /repository/);
+  const wrongDigest = await rollbackProductionPin({
+    repoDir: REPO,
+    fsDeps: deps,
+    now: FIXED_NOW,
+    env: {},
+    automatic: true,
+    envelopeKey: key,
+    envelope: operatorRollbackEnvelope({
+      retainedTarget: { version: "1.29.1", tag: "v1.29.1", git_sha: "e".repeat(40) },
+      actor: "recovery-supervisor",
+      repository: REPO,
+      now: FIXED_NOW(),
+      hmacKey: key,
+    }),
+  });
+  assert.equal(wrongDigest.ok, false);
+  if (!wrongDigest.ok) assert.match(wrongDigest.message, /digest|tag|target/);
+  assert.equal(files.get(PIN_PATH), before);
 });
 
 test("formatProductionPinSummary includes version and sha unknown", () => {
