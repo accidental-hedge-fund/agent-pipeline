@@ -73,6 +73,20 @@ Raw stage advancement SHALL remain an internal executor operation. Nested whole-
 
 ---
 
+### Requirement: Nested child advancement SHALL preserve the supervisor's effective base branch and domain
+
+The nested whole-item child SHALL receive the supervisor's resolved `base_branch` and `domain` through `dispatchItemChildArgs`. `parseNestedAdvanceChildArgv` SHALL parse those values. `runNestedAdvanceChild` SHALL pass them to `resolveConfig` before `runAdvance`. Mutating `pipeline <N> --base` and `pipeline <N> --domain` SHALL NOT cause the nested child to re-resolve the repository-default base or domain. The supervisor and nested child SHALL use the same effective base branch and domain.
+
+#### Scenario: Numeric --base and --domain survive the nested child boundary
+
+- **WHEN** an operator invokes mutating `pipeline <N> --base <branch>` or `pipeline <N> --domain <name>`
+- **THEN** the one-item supervisor SHALL resolve configuration with that override
+- **AND** the nested whole-item child argv SHALL carry the supervisor's resolved base branch and domain
+- **AND** the child SHALL pass those values to `resolveConfig`
+- **AND** the child's effective `base_branch` and `domain` SHALL equal the supervisor's
+
+---
+
 ### Requirement: Read-only and mode-selector forms SHALL dispatch before aliasing
 
 The CLI SHALL preserve read-only and mode-selector forms on a numeric first argument before it aliases mutating drive to the one-item supervisor. Those forms include `--status`, `--summary`, `--unblock`, `--override`, `--remove-worktree`, and flag-only `--cleanup` / `--init`. `--detach` SHALL detach the same one-item supervisor rather than a raw-advance owner. Stage-specific compatibility flags (`--once`, `--dry-run`, `--model`, `--run-id`, `--engine-track`, and equivalent advance-loop inputs) SHALL become immutable child inputs to nested advancement. They SHALL NOT select a different top-level lifecycle owner.

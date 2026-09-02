@@ -33,6 +33,10 @@ export interface ParsedNestedAdvanceChildArgv {
   issueNumber: number;
   repoPath: string;
   opts: AdvanceOpts;
+  /** Supervisor-resolved `--base`; omitted when the parent did not serialize one. */
+  baseBranch?: string;
+  /** Supervisor-resolved `--domain`; omitted when the parent did not serialize one. */
+  domainOverride?: string;
 }
 
 /** Inverse of `dispatchItemChildArgs` after the script-path slot. */
@@ -46,6 +50,8 @@ export function parseNestedAdvanceChildArgv(
     options: {
       profile: { type: "string" },
       "repo-path": { type: "string" },
+      base: { type: "string" },
+      domain: { type: "string" },
       "run-id": { type: "string" },
       "engine-track": { type: "string" },
       once: { type: "boolean" },
@@ -69,6 +75,8 @@ export function parseNestedAdvanceChildArgv(
   }
   const engineTrack = values["engine-track"];
   const sha = typeof values.sha === "string" ? values.sha.trim() : "";
+  const base = typeof values.base === "string" ? values.base.trim() : "";
+  const domain = typeof values.domain === "string" ? values.domain.trim() : "";
   return {
     issueNumber,
     repoPath,
@@ -82,6 +90,8 @@ export function parseNestedAdvanceChildArgv(
       jsonEvents: values["json-events"],
       ...(sha ? { candidateShaOverride: sha } : {}),
     },
+    ...(base ? { baseBranch: base } : {}),
+    ...(domain ? { domainOverride: domain } : {}),
   };
 }
 
@@ -113,7 +123,12 @@ export async function runNestedAdvanceChild(
   const resolve = deps.resolveConfig ?? resolveConfig;
   let cfg: PipelineConfig;
   try {
-    cfg = resolve({ repoPath: parsed.repoPath, profile: parsed.opts.profile });
+    cfg = resolve({
+      repoPath: parsed.repoPath,
+      profile: parsed.opts.profile,
+      ...(parsed.baseBranch ? { baseBranch: parsed.baseBranch } : {}),
+      ...(parsed.domainOverride ? { domainOverride: parsed.domainOverride } : {}),
+    });
   } catch (err) {
     writeStderr(`pipeline: ${(err as Error).message}`);
     return 2;

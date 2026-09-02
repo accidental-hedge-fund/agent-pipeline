@@ -25,6 +25,7 @@
 - [x] 3.3 Keep `pipeline <N> --detach` and `pipeline run <N> --detach` on the public numeric inner argv (no nested marker, no `pipeline single` rewrite), and verify the detached child is the one-item supervisor; assert spawn passArgs still include compatible child options and `--engine-track` when set
 - [x] 3.4 Prove a mechanical-fault fixture through mutating numeric drive stays RecoverySupervisor-owned (`owned: true`; not complete, cancelled, or human-owned), and verify numeric, single, and loop still never merge
 - [x] 3.5 When `childAdvance.runId` is set (operator `--run-id` or detach pre-allocation), the nested pin uses that id instead of minting a new `pinAdvanceRunIdentity`
+- [x] 3.6 Carry resolved `--base` and `--domain` through `dispatchItemChildArgs` / nested-advance `resolveConfig`, and verify numeric `--base`/`--domain` give supervisor and child the same effective configuration
 
 ## 4. Handoff, packaging, and docs
 

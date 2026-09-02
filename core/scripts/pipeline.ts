@@ -1332,6 +1332,10 @@ export type DispatchItemChildArgOpts = {
   model?: string;
   jsonEvents?: boolean;
   candidateShaOverride?: string | null;
+  /** Supervisor-resolved `--base` so the nested child does not re-default. */
+  base?: string;
+  /** Supervisor-resolved `--domain` so lock/run namespace matches. */
+  domain?: string;
 };
 
 /** Builds the child-process argv for the per-item nested-advance hand-off.
@@ -1352,6 +1356,8 @@ export function dispatchItemChildArgs(
   opts?: DispatchItemChildArgOpts,
 ): string[] {
   const args = [scriptPath, String(issueNumber), "--profile", engine, "--repo-path", repoDir];
+  if (opts?.base) args.push("--base", opts.base);
+  if (opts?.domain) args.push("--domain", opts.domain);
   if (opts?.runId) args.push("--run-id", opts.runId);
   if (opts?.engineTrack === "pinned" || opts?.engineTrack === "candidate") {
     args.push("--engine-track", opts.engineTrack);
@@ -1679,6 +1685,12 @@ export function realDispatchItem(
           execPath,
           dispatchItemChildArgs(scriptPath, issueNumber, engine, cfg.repo_dir, {
             ...(pin ? { runId: pin.pipeline_run_id } : {}),
+            ...(typeof cfg.base_branch === "string" && cfg.base_branch.length > 0
+              ? { base: cfg.base_branch }
+              : {}),
+            ...(typeof cfg.domain === "string" && cfg.domain.length > 0
+              ? { domain: cfg.domain }
+              : {}),
             ...(childAdvance?.engineTrack === "pinned" || childAdvance?.engineTrack === "candidate"
               ? { engineTrack: childAdvance.engineTrack }
               : cfg.engine_track === "pinned" || cfg.engine_track === "candidate"
@@ -2925,6 +2937,16 @@ export interface RunLoopEngineInput {
   follow?: boolean;
   repoDir: string;
   /**
+   * Resolved `--base` / file default so the supervisor and nested child share
+   * one effective base branch (#1327 review 2).
+   */
+  baseBranch?: string;
+  /**
+   * Resolved `--domain` / repo-basename default so lock and run namespace
+   * match the nested child (#1327 review 2).
+   */
+  domainOverride?: string;
+  /**
    * Early run-ready hook (#665): invoked once after exclusive lock and before
    * first item dispatch. Not invoked for `--audit` or failure paths. The engine
    * enriches supervisor context with the selector (null on bare `--resume`).
@@ -3053,7 +3075,12 @@ async function defaultRunLoopEngine(input: RunLoopEngineInput): Promise<LoopEngi
 
   let cfg: PipelineConfig;
   try {
-    cfg = resolveConfig({ repoPath: input.repoDir, profile: input.engine });
+    cfg = resolveConfig({
+      repoPath: input.repoDir,
+      profile: input.engine,
+      ...(input.baseBranch ? { baseBranch: input.baseBranch } : {}),
+      ...(input.domainOverride ? { domainOverride: input.domainOverride } : {}),
+    });
   } catch (err) {
     return { kind: "error", message: `config error: ${(err as Error).message}` };
   }
@@ -3523,6 +3550,7 @@ export async function runSingleIssueCommand(
     cfg = deps.resolveConfig({
       repoPath: opts.repoPath,
       baseBranch: opts.base,
+      domainOverride: opts.domain,
       profile: opts.profile,
     });
   } catch (err) {
@@ -3548,6 +3576,8 @@ export async function runSingleIssueCommand(
     audit: false,
     autoSupersedeTerminal: true,
     repoDir: cfg.repo_dir,
+    ...(cfg.base_branch ? { baseBranch: cfg.base_branch } : {}),
+    ...(cfg.domain ? { domainOverride: cfg.domain } : {}),
     childAdvance: pickOneItemChildAdvanceInputs(toAdvanceOpts(opts)),
     onRunReady: async (ctx) => {
       if (output.emitMachineOutput !== false) {

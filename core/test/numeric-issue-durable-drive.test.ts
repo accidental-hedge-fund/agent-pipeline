@@ -289,6 +289,8 @@ test("parseNestedAdvanceChildArgv is the inverse of dispatchItemChildArgs", () =
     candidateShaOverride: "a".repeat(40),
     runId: "pin-1",
     engineTrack: "candidate",
+    base: "release",
+    domain: "alternate",
   });
   const parsed = parseNestedAdvanceChildArgv(args.slice(1));
   assert.equal(parsed.issueNumber, 100);
@@ -301,6 +303,115 @@ test("parseNestedAdvanceChildArgv is the inverse of dispatchItemChildArgs", () =
   assert.equal(parsed.opts.candidateShaOverride, "a".repeat(40));
   assert.equal(parsed.opts.runId, "pin-1");
   assert.equal(parsed.opts.engineTrack, "candidate");
+  assert.equal(parsed.baseBranch, "release");
+  assert.equal(parsed.domainOverride, "alternate");
+});
+
+test("numeric --base and --domain: supervisor and nested child share effective config", async () => {
+  const supervisorCfg: PipelineConfig = {
+    ...cfg(),
+    base_branch: "release",
+    domain: "alternate",
+  };
+  let supervisorResolve:
+    | { baseBranch?: string; domainOverride?: string; profile?: string; repoPath?: string }
+    | undefined;
+  let supervisorInput: RunLoopEngineInput | undefined;
+  const originalError = console.error;
+  const originalLog = console.log;
+  const priorExit = process.exitCode;
+  console.error = () => {};
+  console.log = () => {};
+  process.exitCode = undefined;
+  try {
+    await admitMutatingNumericDrive(
+      supervisorCfg,
+      42,
+      { profile: "claude", base: "release", domain: "alternate" },
+      {
+        runSingleIssue: (raw, opts) =>
+          runSingleIssueCommand(raw, opts, {
+            resolveConfig: (resolveOpts) => {
+              supervisorResolve = resolveOpts;
+              return supervisorCfg;
+            },
+            resolveIssueNumber: async (_c, n) => n,
+            runLoopEngine: async (received) => {
+              supervisorInput = received;
+              return driveResult();
+            },
+            writeStdoutLine: () => {},
+          }),
+      },
+    );
+  } finally {
+    console.error = originalError;
+    console.log = originalLog;
+    process.exitCode = priorExit;
+  }
+  assert.equal(supervisorResolve?.baseBranch, "release");
+  assert.equal(supervisorResolve?.domainOverride, "alternate");
+  assert.equal(supervisorInput?.baseBranch, "release");
+  assert.equal(supervisorInput?.domainOverride, "alternate");
+
+  const spawned: string[][] = [];
+  const dispatch = realDispatchItem(supervisorCfg, "claude", {
+    eventsPathExists: () => true,
+    spawn: ((_cmd: string, args: readonly string[]) => {
+      spawned.push([...args]);
+      return fakeSpawnChild();
+    }) as typeof import("node:child_process").spawn,
+    getIssueDetail: async () => ({ labels: ["pipeline:ready-to-deploy"], state: "open" }) as never,
+    getPrForIssue: async () => 1,
+  });
+  await dispatch({
+    schema: "pipeline/loop-execution@1",
+    item_id: "42",
+    repo: { name: "acme/w", base_branch: "release" },
+    engine: "claude",
+    worktree_policy: "default",
+    done_definition: "pipeline:ready-to-deploy",
+    run_id: "loop-run",
+  });
+  assert.equal(spawned.length, 1);
+  const baseIdx = spawned[0]!.indexOf("--base");
+  const domainIdx = spawned[0]!.indexOf("--domain");
+  assert.ok(baseIdx >= 0, "nested child argv must carry --base");
+  assert.equal(spawned[0]![baseIdx + 1], "release");
+  assert.ok(domainIdx >= 0, "nested child argv must carry --domain");
+  assert.equal(spawned[0]![domainIdx + 1], "alternate");
+
+  let childResolve:
+    | { baseBranch?: string; domainOverride?: string; profile?: string; repoPath?: string }
+    | undefined;
+  let childCfg: PipelineConfig | undefined;
+  const code = await runNestedAdvanceChild(spawned[0]!.slice(1), {
+    resolveConfig: (resolveOpts) => {
+      childResolve = resolveOpts;
+      return {
+        ...supervisorCfg,
+        base_branch: resolveOpts.baseBranch ?? "main",
+        domain: resolveOpts.domainOverride ?? "test",
+      };
+    },
+    isKillSwitchActive: () => false,
+    runNestedWholeItemAdvance: async (received) => {
+      childCfg = received;
+    },
+  });
+  assert.equal(code, 0);
+  assert.equal(childResolve?.baseBranch, "release");
+  assert.equal(childResolve?.domainOverride, "alternate");
+  assert.equal(childCfg?.base_branch, supervisorCfg.base_branch);
+  assert.equal(childCfg?.domain, supervisorCfg.domain);
+  assert.match(
+    PIPELINE_SRC,
+    /baseBranch: input\.baseBranch/,
+  );
+  assert.match(
+    PIPELINE_SRC,
+    /domainOverride: input\.domainOverride/,
+  );
 });
 
 // ---------------------------------------------------------------------------
