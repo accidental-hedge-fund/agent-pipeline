@@ -782,9 +782,10 @@ test("trainShouldContinueAfterRecover mapping", () => {
 // 5.12 Train hook once-then-hold
 // ---------------------------------------------------------------------------
 
-test("5.12 train invokes recover-parked once then holds if still parked", async () => {
+test("5.12 train does not invoke recover-parked; holds if still parked", async () => {
   let rpCalls = 0;
   const logs: string[] = [];
+  const observations: unknown[] = [];
   const snap = {
     number: 10,
     title: "item",
@@ -815,6 +816,9 @@ test("5.12 train invokes recover-parked once then holds if still parked", async 
         message: "HIGH remains",
       };
     },
+    reportObservation: (obs) => {
+      observations.push(obs);
+    },
     getPrForIssue: async () => 1,
     getPrForIssueAnyState: async () => 1,
     mergeIssuePr: async () => {
@@ -840,14 +844,24 @@ test("5.12 train invokes recover-parked once then holds if still parked", async 
     },
     deps,
   );
-  assert.equal(rpCalls, 1);
-  assert.ok(logs.some((l) => l.includes("recover-parked once")));
+  assert.equal(rpCalls, 0, "train must not invoke recover-parked");
+  assert.ok(!logs.some((l) => l.includes("recover-parked once")));
   assert.equal(result.status.items[0]?.terminal, "needs-human");
   assert.ok(!logs.some((l) => /invent.*override|drop.*blocked/i.test(l)));
+  assert.ok(
+    observations.some(
+      (o) =>
+        typeof o === "object" &&
+        o !== null &&
+        (o as { kind?: string }).kind === "park",
+    ),
+    "park observation must be reported to RecoverySupervisor",
+  );
 });
 
-test("5.12b train continues same issue when recover-parked recovers", async () => {
+test("5.12b train continues same issue when advance-wave recovery clears without recover-parked", async () => {
   let wave = 0;
+  let rpCalls = 0;
   const logs: string[] = [];
   let labels = ["pipeline:review-2"];
   const deps: TrainDeps = {
@@ -862,28 +876,20 @@ test("5.12b train continues same issue when recover-parked recovers", async () =
     }),
     advanceWave: async (issues) => {
       wave++;
+      labels = ["pipeline:ready-to-deploy"];
       const m: AdvanceWaveResult = new Map();
       for (const i of issues) {
-        if (wave === 1) {
-          m.set(i, {
-            ok: true,
-            terminal: "needs-human",
-            labels: ["pipeline:needs-human"],
-          });
-        } else {
-          labels = ["pipeline:ready-to-deploy"];
-          m.set(i, {
-            ok: true,
-            terminal: "ready-to-deploy",
-            labels: ["pipeline:ready-to-deploy"],
-          });
-        }
+        m.set(i, {
+          ok: true,
+          terminal: "ready-to-deploy",
+          labels: ["pipeline:ready-to-deploy"],
+        });
       }
       return m;
     },
     recoverParked: async (issue) => {
-      labels = ["pipeline:review-2"];
-      return { status: "recovered", issue, message: "cleared below-high" };
+      rpCalls++;
+      return { status: "recovered", issue, message: "must not be called" };
     },
     getPrForIssue: async () => 2,
     getPrForIssueAnyState: async () => 2,
@@ -910,9 +916,10 @@ test("5.12b train continues same issue when recover-parked recovers", async () =
     },
     deps,
   );
-  assert.ok(wave >= 2, "should re-advance same issue after recover");
+  assert.equal(rpCalls, 0, "unpublished-commit recipe is loop/advance-wave recovery, not recover-parked");
+  assert.equal(wave, 1);
   assert.equal(result.status.items.some((i) => i.terminal === "ready-to-deploy"), true);
-  assert.ok(logs.some((l) => l.includes("continuing same issue")));
+  assert.equal(result.status.ordered_issues[0], 11);
 });
 
 // ---------------------------------------------------------------------------

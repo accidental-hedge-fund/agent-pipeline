@@ -442,10 +442,39 @@ test("drive: budget exhaust → held with evidence; no further implementer claim
   assert.equal(result.held[0]!.reason, "merge-conflict");
   assert.equal(result.held[0]!.outcome, "manual-repair");
   assert.equal(result.held[0]!.humanAuthority, false);
+  assert.equal(result.held[0]!.owned, true);
+  assert.equal(result.held[0]!.lifecycle, "cooling");
   assert.equal(result.held[0]!.repairAttemptsUsed, 1);
   assert.equal(deps.mechanicalCalls, 1);
   assert.equal(deps.mergeCalls.length, 0);
   assert.equal(result.merged.length, 0);
+});
+
+test("drive: repair exhaustion stays owned and remaining candidates continue (#1330)", async () => {
+  const deps = makeDeps({
+    candidates: [
+      { issueNumber: 6, prNumber: 60, title: "stuck" },
+      { issueNumber: 7, prNumber: 70, title: "ok" },
+    ],
+    remainingAfterApply: [{ issueNumber: 6, prNumber: 60, title: "stuck" }],
+    eligibility: new Map<number, EligibilitySnapshot>([
+      [60, CONFLICT_SNAP],
+      [70, CLEAN_SNAP],
+    ]),
+    async mechanicalImpl() {
+      return { succeeded: false, evidence: "still broken", error: "still broken" };
+    },
+  });
+  const result = await runMergeQueue(
+    { ...baseOpts, repair: true, repairMaxAttempts: 1 },
+    deps,
+  );
+  assert.equal(result.held.length, 1);
+  assert.equal(result.held[0]!.issueNumber, 6);
+  assert.equal(result.held[0]!.humanAuthority, false);
+  assert.equal(result.held[0]!.owned, true);
+  assert.ok(result.merged.some((c) => c.issueNumber === 7));
+  assert.ok(deps.mergeCalls.some((c) => c.prNumber === 70));
 });
 
 // ---------------------------------------------------------------------------

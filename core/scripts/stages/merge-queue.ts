@@ -29,7 +29,7 @@ import {
   type IntegrityClassification,
 } from "../candidate-integrity.ts";
 import { appendEvent, defaultRunStoreDeps } from "../run-store.ts";
-import { mergePr, realMergeDeps, type MergeDeps } from "./merge.ts";
+import { mergePr, realMergeDeps, realMergeSupervision, type MergeDeps } from "./merge.ts";
 import {
   evaluateReleaseWhenComplete,
   isReleaseWhenCompleteEnabled,
@@ -84,6 +84,10 @@ export interface MergeQueueHeldItem {
   outcome?: "held" | "manual-repair" | "failed";
   /** Never true solely for mechanical budget exhaustion. */
   humanAuthority?: boolean;
+  /** RecoverySupervisor-owned lifecycle. Mechanical holds stay cooling/waiting. */
+  lifecycle?: "cooling" | "waiting";
+  /** Always true for supervised merge-queue holds. */
+  owned?: true;
 }
 
 export interface MergeQueueNonCandidate {
@@ -281,6 +285,8 @@ function holdToResultItem(hold: MergeQueueHoldRecord): MergeQueueHeldItem {
     repairAttemptsUsed: hold.repairAttemptsUsed,
     outcome: hold.outcome,
     humanAuthority: hold.humanAuthority,
+    lifecycle: "cooling",
+    owned: true,
   };
 }
 
@@ -1031,7 +1037,19 @@ export function realMergeQueueDeps(
     },
 
     async mergeCandidate(candidate: MergeQueueCandidate): Promise<void> {
-      await mergePr(candidate.prNumber, md);
+      const base = cfg?.base_branch ?? "main";
+      await mergePr(candidate.prNumber, {
+        ...md,
+        supervision: realMergeSupervision({
+          repo,
+          base,
+          repoDir,
+          envelope: "pipeline merge-queue --apply",
+          actionIdentity: "pipeline merge-queue --apply",
+          frozenIssueScope: [candidate.issueNumber],
+          mergeDeps: md,
+        }),
+      });
     },
 
     async evaluateEligibility(candidate) {
@@ -1178,6 +1196,8 @@ async function processCandidateApply(
     summary: message,
     outcome: budgetExhausted ? "manual-repair" : "failed",
     humanAuthority: false,
+    lifecycle: "cooling",
+    owned: true,
     repairAttemptsUsed: attemptsUsed,
     remediation:
       `PR #${candidate.prNumber} (issue #${candidate.issueNumber}): ${message}. ` +
@@ -1191,6 +1211,8 @@ async function processCandidateApply(
     summary,
     outcome: "held",
     humanAuthority: false,
+    lifecycle: "cooling",
+    owned: true,
     repairAttemptsUsed: attemptsUsed,
     remediation:
       `PR #${candidate.prNumber} (issue #${candidate.issueNumber}) is not queue-eligible: ${summary}. ` +

@@ -916,7 +916,8 @@ test("merge: loop-isolation — no stage handler imports merge or merge-queue", 
       f !== "merge-queue-release-when-complete.ts" &&
       f !== "merge_queue_hold.ts" &&
       f !== "ship-adapter.ts" &&
-      f !== "train.ts",
+      f !== "train.ts" &&
+      f !== "merge-supervision.ts",
   );
 
   for (const file of checkFiles) {
