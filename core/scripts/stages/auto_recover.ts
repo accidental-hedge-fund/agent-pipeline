@@ -14,6 +14,7 @@ import {
 import { attestPipelineComment } from "./review-parsing.ts";
 import {
   getOnDiskForIssue,
+  gitInWorktree,
   hasCommitsAhead,
   removeManagedWorktreeSafely,
   removeWorktree,
@@ -122,6 +123,18 @@ export interface AutoRecoverDeps {
   logicalOperationId?: string | null;
   /** Injected Recovery Episode ledger. Production hydrates from runDir. */
   stageAttemptLedger?: StageAttemptLedger;
+  /** Observed candidate HEAD. Tests inject a fake; production uses git. */
+  resolveHeadSha?: (worktreePath: string) => Promise<string | null>;
+}
+
+async function defaultResolveHeadSha(worktreePath: string): Promise<string | null> {
+  const res = await gitInWorktree(worktreePath, ["rev-parse", "HEAD"], {
+    ignoreFailure: true,
+    timeoutMs: 5_000,
+  });
+  const sha = res.stdout.trim().toLowerCase();
+  if (res.code !== 0 || !/^[0-9a-f]{7,40}$/.test(sha)) return null;
+  return sha;
 }
 
 const defaultAutoRecoverDeps: AutoRecoverDeps = {
@@ -133,6 +146,7 @@ const defaultAutoRecoverDeps: AutoRecoverDeps = {
   postComment,
   removeLabel,
   transition,
+  resolveHeadSha: defaultResolveHeadSha,
 };
 
 export async function tryAutoRecover(
@@ -149,30 +163,54 @@ export async function tryAutoRecover(
   deps: AutoRecoverDeps = defaultAutoRecoverDeps,
 ): Promise<Outcome> {
   const report = deps.reportObservation ?? defaultRecoverySupervisorReport;
+  const resolveHeadSha = deps.resolveHeadSha ?? defaultResolveHeadSha;
+  const claimEpisode = (candidateEpoch: string, evidence: string, message: string) =>
+    claimOrResumeRecoveryEpisode({
+      domain: cfg.domain ?? "unknown",
+      logical_operation_id: deps.logicalOperationId,
+      repository: cfg.repo,
+      issue: issueNumber,
+      message,
+      reportObservation: report,
+      episodeKey: stageRecoveryEpisodeKey({
+        issue: issueNumber,
+        candidateEpoch,
+        evidence,
+      }),
+    });
+
+  const wt = await deps.getOnDiskForIssue(cfg, issueNumber);
+  if (!wt) {
+    claimEpisode("unresolved", `auto_recover:#${issueNumber}:no-worktree`, `auto_recover unresolved wait for #${issueNumber}: no worktree`);
+    return { advanced: false, status: "no-op", reason: "no worktree to recover" };
+  }
+
+  const commitsAhead = await deps.hasCommitsAhead(wt.path, cfg.base_branch);
+  const observedHead = (await resolveHeadSha(wt.path))?.trim() ?? "";
+  if (!observedHead) {
+    claimEpisode("unresolved", `auto_recover:#${issueNumber}:unresolved-head`, `auto_recover unresolved wait for #${issueNumber}: candidate HEAD unreadable`);
+    return { advanced: false, status: "no-op", reason: "candidate HEAD unreadable" };
+  }
+
+  if (commitsAhead) {
+    claimEpisode(observedHead, "auto_recover:commits-ahead", `auto_recover observed commits-ahead for #${issueNumber}`);
+    return { advanced: false, status: "no-op", reason: "worktree already has commits" };
+  }
+
   const episodeKey = stageRecoveryEpisodeKey({
     issue: issueNumber,
-    candidateEpoch: "unresolved",
-    evidence: `auto_recover:#${issueNumber}`,
+    candidateEpoch: observedHead,
+    evidence: "auto_recover:no-commits",
   });
   const episode = claimOrResumeRecoveryEpisode({
     domain: cfg.domain ?? "unknown",
     logical_operation_id: deps.logicalOperationId,
     repository: cfg.repo,
     issue: issueNumber,
-    message: `auto_recover claims Recovery Episode for #${issueNumber}`,
+    message: `auto_recover claims Recovery Episode for #${issueNumber} at ${observedHead.slice(0, 7)}`,
     reportObservation: report,
     episodeKey,
   });
-
-  const wt = await deps.getOnDiskForIssue(cfg, issueNumber);
-  if (!wt) {
-    return { advanced: false, status: "no-op", reason: "no worktree to recover" };
-  }
-
-  // Only auto-recover if HEAD has no commits past origin/{base}.
-  if (await deps.hasCommitsAhead(wt.path, cfg.base_branch)) {
-    return { advanced: false, status: "no-op", reason: "worktree already has commits" };
-  }
 
   const detail = await deps.getIssueDetail(cfg, issueNumber);
   // Dedupe by round token so a retried marker post doesn't inflate the count.
@@ -190,7 +228,7 @@ export async function tryAutoRecover(
     report(episode);
     recordRecoveryEpisodeTreatment({
       ledger,
-      headSha: "unresolved",
+      headSha: observedHead,
       action: "no_run_recovery",
       itemId: String(issueNumber),
       evidenceFingerprint: `auto-recover-cap-${recoveryCount}`,
@@ -251,7 +289,7 @@ export async function tryAutoRecover(
 
   recordRecoveryEpisodeTreatment({
     ledger,
-    headSha: "unresolved",
+    headSha: observedHead,
     action: "no_run_recovery",
     itemId: String(issueNumber),
     evidenceFingerprint: `auto-recover-${recoveryCount + 1}`,

@@ -314,6 +314,7 @@ async function readPublishedDocument(
   deps: LoopStoreDeps,
   publishedPath: string,
   kind: "ledger" | "contract",
+  token?: string,
 ): Promise<{ text: string; value: unknown; quarantine?: QuarantineEvidence }> {
   const names = await deps.listDir(path.dirname(publishedPath)).catch(() => [] as string[]);
   const basename = path.basename(publishedPath);
@@ -349,7 +350,13 @@ async function readPublishedDocument(
       }
     }
   }
-  const ownedWait = await persistUnreconstructableOwnedWait(deps, publishedPath, kind, quarantine);
+  if (!token) {
+    throw new LoopError(
+      "lock",
+      `quarantined invalid ${kind} generation at ${publishedPath} (${quarantine.reason}); reconstructed=${quarantine.reconstructed}; evidence=${quarantine.quarantine_path}; persist requires the current lock holder's token`,
+    );
+  }
+  const ownedWait = await persistUnreconstructableOwnedWait(deps, publishedPath, kind, quarantine, token, parsed);
   if (ownedWait) return { ...ownedWait, quarantine };
   throw new LoopError(
     "validation",
@@ -383,15 +390,39 @@ function salvageItemsFromContract(value: unknown): Record<string, LoopItemLedger
   return items;
 }
 
+function salvageItemsFromParsed(value: unknown): Record<string, LoopItemLedgerEntry> | null {
+  if (!isPlainObject(value) || !isPlainObject(value.items)) return null;
+  const items: Record<string, LoopItemLedgerEntry> = {};
+  let any = false;
+  for (const [id, entry] of Object.entries(value.items)) {
+    if (!isPlainObject(entry)) continue;
+    if (typeof entry.id !== "string" || typeof entry.state !== "string") continue;
+    items[id] = entry as LoopItemLedgerEntry;
+    any = true;
+  }
+  return any ? items : null;
+}
+
+function salvageRecoveryAttempts(value: unknown): LoopLedger["recovery_attempts"] {
+  if (!isPlainObject(value) || !Array.isArray(value.recovery_attempts)) return [];
+  return value.recovery_attempts.filter(
+    (attempt): attempt is LoopLedger["recovery_attempts"][number] =>
+      isPlainObject(attempt) && typeof attempt.attempt_id === "string" && attempt.attempt_id.length > 0,
+  );
+}
+
 async function persistUnreconstructableOwnedWait(
   deps: LoopStoreDeps,
   publishedPath: string,
   kind: "ledger" | "contract",
   evidence: QuarantineEvidence,
+  token: string,
+  parsed: unknown,
 ): Promise<{ text: string; value: unknown } | null> {
   const dir = path.dirname(publishedPath);
   const runId = path.basename(dir);
   if (!SAFE_RUN_ID.test(runId)) return null;
+  await requireToken(deps, runId, token);
   const now = deps.now();
   const nowIso = now.toISOString();
   const cooling = buildCoolingRecord({
@@ -416,7 +447,9 @@ async function persistUnreconstructableOwnedWait(
       stop: existingLedger.stop,
     };
   } else {
-    const items = salvageItemsFromContract(isLoopContractShape(existingContract) ? existingContract : undefined);
+    const items =
+      salvageItemsFromParsed(parsed) ??
+      salvageItemsFromContract(isLoopContractShape(existingContract) ? existingContract : undefined);
     waitLedger = {
       schema: LOOP_LEDGER_SCHEMA,
       run_id: runId,
@@ -428,7 +461,7 @@ async function persistUnreconstructableOwnedWait(
       last_native_goal_check: null,
       last_reconciliation: null,
       reconciliation_sequence: 0,
-      recovery_attempts: [],
+      recovery_attempts: salvageRecoveryAttempts(parsed),
       authority_amendments: [],
     };
   }
@@ -450,7 +483,7 @@ async function publishLastValid(deps: LoopStoreDeps, publishedPath: string, cont
   await deps.writeFileAtomic(lastValidPathFor(publishedPath), content);
 }
 
-export async function readContract(deps: LoopStoreDeps, runId: string): Promise<LoopContract> {
+export async function readContract(deps: LoopStoreDeps, runId: string, token?: string): Promise<LoopContract> {
   const dir = runDir(deps, runId);
   const text = await deps.readTextFile(contractPath(dir));
   if (text === null) {
@@ -458,11 +491,11 @@ export async function readContract(deps: LoopStoreDeps, runId: string): Promise<
   }
   const parsed = parseJsonObject(text);
   if (isLoopContractShape(parsed)) return parsed;
-  const recovered = await readPublishedDocument(deps, contractPath(dir), "contract");
+  const recovered = await readPublishedDocument(deps, contractPath(dir), "contract", token);
   return recovered.value as LoopContract;
 }
 
-export async function readLedger(deps: LoopStoreDeps, runId: string): Promise<LoopLedger> {
+export async function readLedger(deps: LoopStoreDeps, runId: string, token?: string): Promise<LoopLedger> {
   const dir = runDir(deps, runId);
   const privateEpisode = await deps.readTextFile(path.join(dir, PRIVATE_EPISODE_SCHEMA_BASENAME));
   void privateEpisode;
@@ -472,7 +505,7 @@ export async function readLedger(deps: LoopStoreDeps, runId: string): Promise<Lo
   }
   const parsed = parseJsonObject(text);
   if (isLoopLedgerShape(parsed)) return parsed;
-  const recovered = await readPublishedDocument(deps, ledgerPath(dir), "ledger");
+  const recovered = await readPublishedDocument(deps, ledgerPath(dir), "ledger", token);
   return recovered.value as LoopLedger;
 }
 

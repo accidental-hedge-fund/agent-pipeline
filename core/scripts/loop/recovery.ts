@@ -544,7 +544,7 @@ export async function blockItem(deps: LoopStoreDeps, contractInput: LoopContract
   const blockerClass = input.blockerClass;
   const contract = upgradeContractForRecovery(contractInput);
 
-  const ledger = upgradeLedgerForRecovery(await readLedger(deps, input.runId));
+  const ledger = upgradeLedgerForRecovery(await readLedger(deps, input.runId, input.token));
   if (ledger.stop && !input.allowAlreadyStopped) {
     throw new LoopError("stop", `loop run "${input.runId}" is already stopped: ${ledger.stop.reason}`);
   }
@@ -725,7 +725,7 @@ export async function startRecoveryAttempt(
   input: StartRecoveryAttemptInput,
 ): Promise<RecoverItemResult> {
   const contract = upgradeContractForRecovery(contractInput);
-  const ledger = upgradeLedgerForRecovery(await readLedger(deps, input.runId));
+  const ledger = upgradeLedgerForRecovery(await readLedger(deps, input.runId, input.token));
   if (ledger.stop) {
     throw new LoopError("stop", `loop run "${input.runId}" is already stopped: ${ledger.stop.reason}`);
   }
@@ -878,7 +878,7 @@ export async function completeRecoveryAttempt(
   input: CompleteRecoveryAttemptInput,
 ): Promise<RecoverItemResult> {
   upgradeContractForRecovery(contractInput);
-  const ledger = upgradeLedgerForRecovery(await readLedger(deps, input.runId));
+  const ledger = upgradeLedgerForRecovery(await readLedger(deps, input.runId, input.token));
   const attempt = ledger.recovery_attempts.find((candidate) => candidate.attempt_id === input.attemptId);
   if (!attempt || attempt.item_id !== input.itemId) {
     throw new LoopError("validation", `recovery attempt "${input.attemptId}" was not started for item "${input.itemId}"`);
@@ -961,7 +961,7 @@ export async function recoverItem(
   contractInput: LoopContract,
   input: RecoverItemInput,
 ): Promise<RecoverItemResult> {
-  const current = upgradeLedgerForRecovery(await readLedger(deps, input.runId));
+  const current = upgradeLedgerForRecovery(await readLedger(deps, input.runId, input.token));
   if (current.stop) {
     throw new LoopError("stop", `loop run "${input.runId}" is already stopped: ${current.stop.reason}`);
   }
@@ -1000,7 +1000,7 @@ export async function persistOwnedCooling(
     cooling: LoopCoolingRecord;
   },
 ): Promise<LoopLedger> {
-  const ledger = upgradeLedgerForRecovery(await readLedger(deps, input.runId));
+  const ledger = upgradeLedgerForRecovery(await readLedger(deps, input.runId, input.token));
   const itemCooling = { ...(ledger.item_cooling ?? {}) };
   if (input.cooling.item_id) {
     itemCooling[input.cooling.item_id] = input.cooling;

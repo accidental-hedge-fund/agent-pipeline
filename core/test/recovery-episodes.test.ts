@@ -628,12 +628,14 @@ test("4.5 cross-host lock is not auto-taken over", async () => {
 // ---------------------------------------------------------------------------
 
 test("5.1 truncated ledger is quarantined and is not live authority", async () => {
-  const { deps, files } = await setup();
+  const { deps, files, token } = await setup();
   const published = [...files.keys()].find((k) => k.endsWith("/ledger.json"));
   assert.ok(published);
   files.delete(lastValidPathFor(published!));
   files.set(published!, "{truncated");
-  const ledger = await readLedger(deps, "run-1");
+  await assert.rejects(() => readLedger(deps, "run-1"), /persist requires the current lock holder's token/);
+  assert.equal(files.get(published!), "{truncated");
+  const ledger = await readLedger(deps, "run-1", token);
   assert.equal(ledger.stop, null);
   assert.equal(ledger.cooling?.theme, DURABLE_GENERATION_QUARANTINE_THEME);
   assert.ok(ledger.cooling?.quarantine_path);
@@ -667,11 +669,12 @@ test("5.3 last valid generation is reconstructed when safe", async () => {
 });
 
 test("5.4 partial ledger with only run_id and items is quarantined", async () => {
-  const { deps, files } = await setup();
+  const { deps, files, token } = await setup();
   const published = [...files.keys()].find((k) => k.endsWith("/ledger.json"))!;
   files.delete(lastValidPathFor(published));
   files.set(published, JSON.stringify({ run_id: "run-1", items: {} }));
-  const ledger = await readLedger(deps, "run-1");
+  await assert.rejects(() => readLedger(deps, "run-1"), /persist requires the current lock holder's token/);
+  const ledger = await readLedger(deps, "run-1", token);
   assert.equal(ledger.stop, null);
   assert.equal(ledger.cooling?.theme, DURABLE_GENERATION_QUARANTINE_THEME);
   const quarantined = [...files.keys()].filter((k) => k.includes("quarantine"));
@@ -690,11 +693,12 @@ test("5.5 empty ledger reconstructs from last-valid instead of missing", async (
 });
 
 test("5.6 partial contract with only run_id is quarantined", async () => {
-  const { deps, files } = await setup();
+  const { deps, files, token } = await setup();
   const published = [...files.keys()].find((k) => k.endsWith("/contract.json"))!;
   files.delete(lastValidPathFor(published));
   files.set(published, JSON.stringify({ run_id: "run-1" }));
-  await assert.rejects(() => readContract(deps, "run-1"), /quarantined invalid contract/);
+  await assert.rejects(() => readContract(deps, "run-1"), /persist requires the current lock holder's token/);
+  await assert.rejects(() => readContract(deps, "run-1", token), /quarantined invalid contract/);
   const ledger = await readLedger(deps, "run-1");
   assert.equal(ledger.stop, null);
   assert.equal(ledger.cooling?.theme, DURABLE_GENERATION_QUARANTINE_THEME);
@@ -706,7 +710,7 @@ test("5.7 unreconstructable ledger remains owned as a quarantine wait", async ()
   const published = [...files.keys()].find((k) => k.endsWith("/ledger.json"))!;
   files.delete(lastValidPathFor(published));
   files.set(published, "{truncated");
-  const ledger = await readLedger(deps, "run-1");
+  const ledger = await readLedger(deps, "run-1", token);
   assert.equal(ledger.stop, null);
   assert.equal(ledger.cooling?.theme, DURABLE_GENERATION_QUARANTINE_THEME);
   assert.ok(ledger.cooling?.next_eligible_at);
@@ -742,6 +746,41 @@ test("5.7 unreconstructable ledger remains owned as a quarantine wait", async ()
   const after = await readLedger(deps, "run-1");
   assert.equal(after.last_reconciliation?.sequence, 1);
   assert.equal(after.stop, null);
+});
+
+test("5.8 unauthenticated read does not overwrite a corrupt ledger that still carries a started claim", async () => {
+  const { deps, files, token } = await setup();
+  const published = [...files.keys()].find((k) => k.endsWith("/ledger.json"))!;
+  files.delete(lastValidPathFor(published));
+  const startedClaim = {
+    attempt_id: "claim-started-1",
+    seq: 1,
+    time: "2026-09-02T00:00:00.000Z",
+    item_id: "100",
+    class: "implementation-ci",
+    candidate_identity: "head-abc",
+    action: "rerun_ci",
+    actions: ["rerun_ci"],
+    evidence_fingerprint: "ci-failed",
+    outcome: "started",
+    budget_remaining: 2,
+  };
+  const corrupt = JSON.stringify({
+    run_id: "run-1",
+    items: {
+      "100": { id: "100", state: "blocked", history: [], recovery_budgets_remaining: { default: 2 } },
+    },
+    recovery_attempts: [startedClaim],
+  });
+  files.set(published, corrupt);
+  await assert.rejects(() => readLedger(deps, "run-1"), /persist requires the current lock holder's token/);
+  assert.equal(files.get(published), corrupt);
+  const ledger = await readLedger(deps, "run-1", token);
+  assert.equal(ledger.cooling?.theme, DURABLE_GENERATION_QUARANTINE_THEME);
+  assert.equal(ledger.recovery_attempts.length, 1);
+  assert.equal(ledger.recovery_attempts[0]?.attempt_id, "claim-started-1");
+  assert.equal(ledger.recovery_attempts[0]?.outcome, "started");
+  assert.equal(ledger.items["100"]?.state, "blocked");
 });
 
 // ---------------------------------------------------------------------------

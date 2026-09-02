@@ -94,10 +94,13 @@ function memRunStoreDeps(): { deps: RunStoreDeps; lines: () => string[] } {
   return { deps, lines: () => appends };
 }
 
+const OBSERVED_HEAD = "a".repeat(40);
+
 function baseDeps(overrides: Partial<AutoRecoverDeps> = {}): AutoRecoverDeps {
   const removeWorktree = overrides.removeWorktree ?? (async () => {});
   return {
     stageAttemptLedger: emptyStageAttemptLedger(),
+    resolveHeadSha: async () => OBSERVED_HEAD,
     getOnDiskForIssue: async () => ({ path: "/tmp/repo/.worktrees/x", slug: "x" }) as Awaited<ReturnType<AutoRecoverDeps["getOnDiskForIssue"]>>,
     hasCommitsAhead: async () => false,
     getIssueDetail: async () => ({ comments: [] }) as Awaited<ReturnType<AutoRecoverDeps["getIssueDetail"]>>,
@@ -173,12 +176,12 @@ test("tryAutoRecover: ledger-counted cap cannot terminalize even with empty comm
   const ledger = emptyStageAttemptLedger();
   const episodeKey = stageRecoveryEpisodeKey({
     issue: 499,
-    candidateEpoch: "unresolved",
-    evidence: "auto_recover:#499",
+    candidateEpoch: OBSERVED_HEAD,
+    evidence: "auto_recover:no-commits",
   });
   recordRecoveryEpisodeTreatment({
     ledger,
-    headSha: "unresolved",
+    headSha: OBSERVED_HEAD,
     action: "no_run_recovery",
     itemId: "499",
     evidenceFingerprint: "auto-recover-1",
@@ -187,7 +190,7 @@ test("tryAutoRecover: ledger-counted cap cannot terminalize even with empty comm
   });
   recordRecoveryEpisodeTreatment({
     ledger,
-    headSha: "unresolved",
+    headSha: OBSERVED_HEAD,
     action: "no_run_recovery",
     itemId: "499",
     evidenceFingerprint: "auto-recover-2",
@@ -239,4 +242,45 @@ test("tryAutoRecover: blocked-label clear failure returns a non-success outcome 
   assert.equal(transitionCalls, 0, "projector-ready reset must not run when blocked was not cleared");
   assert.equal(lines().length, 0, "no correction_event may be recorded when the blocked label was not durably cleared");
   assert.equal(postCommentCalls.length, 0, "no recovery comment may be posted claiming success when the reset did not happen");
+});
+
+test("tryAutoRecover: episode is scoped to the observed candidate epoch, not unresolved", async () => {
+  const epochs: string[] = [];
+  await tryAutoRecover(CFG, 499, undefined, undefined, undefined, baseDeps({
+    reportObservation: (obs) => {
+      if (obs.candidate_epoch) epochs.push(obs.candidate_epoch);
+    },
+  }));
+  assert.deepEqual(epochs, [OBSERVED_HEAD]);
+});
+
+test("tryAutoRecover: a different observed candidate does not resume the prior episode", async () => {
+  const otherHead = "b".repeat(40);
+  const ids: string[] = [];
+  await tryAutoRecover(CFG, 499, undefined, undefined, undefined, baseDeps({
+    resolveHeadSha: async () => OBSERVED_HEAD,
+    reportObservation: (obs) => {
+      if (obs.episode_id) ids.push(obs.episode_id);
+    },
+  }));
+  await tryAutoRecover(CFG, 499, undefined, undefined, undefined, baseDeps({
+    resolveHeadSha: async () => otherHead,
+    reportObservation: (obs) => {
+      if (obs.episode_id) ids.push(obs.episode_id);
+    },
+  }));
+  assert.equal(ids.length, 2);
+  assert.notEqual(ids[0], ids[1]);
+});
+
+test("tryAutoRecover: no worktree claims an unresolved wait without observing a candidate", async () => {
+  const epochs: string[] = [];
+  const out = await tryAutoRecover(CFG, 499, undefined, undefined, undefined, baseDeps({
+    getOnDiskForIssue: async () => null,
+    reportObservation: (obs) => {
+      if (obs.candidate_epoch) epochs.push(obs.candidate_epoch);
+    },
+  }));
+  assert.equal(out.status, "no-op");
+  assert.deepEqual(epochs, ["unresolved"]);
 });

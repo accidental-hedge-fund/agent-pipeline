@@ -204,8 +204,16 @@ The store SHALL detect a truncated, invalid, or partial durable generation of a 
 
 - **WHEN** a quarantined generation is detected
 - **AND** no last valid generation of the same document is readable
-- **THEN** the store SHALL persist Cooling or an external-condition wait with evidence of the quarantine
+- **THEN** a holder with the current lock token SHALL persist Cooling or an external-condition wait with evidence of the quarantine
 - **AND** the Logical Operation SHALL remain owned
+
+#### Scenario: Unauthenticated document read does not persist salvage Cooling
+
+- **WHEN** a reader without the current lock token finds an unreconstructable generation
+- **AND** no last valid generation of the same document is readable
+- **THEN** the store SHALL quarantine that generation with evidence
+- **AND** SHALL NOT overwrite the published document or last-valid generation
+- **AND** SHALL return typed quarantine state that requires the current lock token to persist Cooling
 
 ---
 

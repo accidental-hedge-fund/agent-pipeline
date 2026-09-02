@@ -1316,20 +1316,6 @@ export async function runRecoverParked(
 ): Promise<RecoverParkedResult> {
   const log = deps.log ?? ((m: string) => console.log(m));
   const withLockFn = deps.withIssueLock ?? defaultWithIssueLock;
-  const report = deps.reportObservation ?? defaultRecoverySupervisorReport;
-  claimOrResumeRecoveryEpisode({
-    domain: cfg.domain ?? "unknown",
-    logical_operation_id: deps.logicalOperationId,
-    repository: cfg.repo,
-    issue: issueNumber,
-    message: `recover-parked claims Recovery Episode for #${issueNumber}`,
-    reportObservation: report,
-    episodeKey: stageRecoveryEpisodeKey({
-      issue: issueNumber,
-      candidateEpoch: "unresolved",
-      evidence: `recover-parked:#${issueNumber}`,
-    }),
-  });
 
   if (opts.skipRecoverParked) {
     return {
@@ -1776,32 +1762,32 @@ async function runRecoverParkedLocked(
   // Fingerprint uses current residual blocking keys (present + DNR from park).
   const blockingKeys = canonicalKeys(residual.map((f) => f.key));
   const fingerprintId = computeFingerprintId(issueNumber, stageId, blockingKeys);
+  const report = deps.reportObservation ?? defaultRecoverySupervisorReport;
+  const episodeKey = stageRecoveryEpisodeKey({
+    issue: issueNumber,
+    candidateEpoch: headSha,
+    evidence: fingerprintId,
+  });
+  claimOrResumeRecoveryEpisode({
+    domain: cfg.domain ?? "unknown",
+    logical_operation_id: deps.logicalOperationId,
+    repository: cfg.repo,
+    issue: issueNumber,
+    message: `recover-parked claims Recovery Episode for #${issueNumber} at ${headSha.slice(0, 7)}`,
+    reportObservation: report,
+    episodeKey,
+  });
 
   const spent = extractRecoverParkedSpent(detail.comments);
   if (isFingerprintSpent(spent, issueNumber, stageId, fingerprintId, blockingKeys)) {
     log(
       `[recover-parked] #${issueNumber}: already-spent fingerprint ${fingerprintId}`,
     );
-    const report = deps.reportObservation ?? defaultRecoverySupervisorReport;
-    const episodeKey = stageRecoveryEpisodeKey({
-      issue: issueNumber,
-      candidateEpoch: headSha || "unresolved",
-      evidence: fingerprintId,
-    });
-    claimOrResumeRecoveryEpisode({
-      domain: cfg.domain ?? "unknown",
-      logical_operation_id: deps.logicalOperationId,
-      repository: cfg.repo,
-      issue: issueNumber,
-      message: `recover-parked fingerprint spent — strategy cursor advanced, ownership retained (${fingerprintId})`,
-      reportObservation: report,
-      episodeKey,
-    });
     const hydrated = hydrateStageAttemptLedger(deps.runDir);
     const ledger = deps.stageAttemptLedger ?? (hydrated.ok ? hydrated.ledger : emptyStageAttemptLedger());
     recordRecoveryEpisodeTreatment({
       ledger,
-      headSha: headSha || "unresolved",
+      headSha,
       action: "no_run_recovery",
       itemId: String(issueNumber),
       evidenceFingerprint: fingerprintId,

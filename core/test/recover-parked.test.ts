@@ -588,6 +588,45 @@ test("5.7 same sorted keys after new commit → already-spent", async () => {
   assert.equal(h.overrides.length, 1); // no second override batch
 });
 
+test("recover-parked claim and already-spent treatment share the live candidate episode key", async () => {
+  const findings = [
+    { key: KEY_HIGH, severity: "high", title: "h" },
+    { key: KEY_MED, severity: "medium", title: "m" },
+  ];
+  const h = makeHarness({
+    labels: ["pipeline:needs-human"],
+    comments: [
+      {
+        author: "bot",
+        body: reviewBody({ sha: HEAD, findings }),
+        createdAt: "2026-08-14T00:00:00Z",
+      },
+    ],
+  });
+  const epochs: string[] = [];
+  const episodeIds: string[] = [];
+  h.deps.reportObservation = (obs) => {
+    if (obs.operation !== "recovery_episode") return;
+    if (obs.candidate_epoch) epochs.push(obs.candidate_epoch);
+    if (obs.episode_id) episodeIds.push(obs.episode_id);
+  };
+  const first = await runRecoverParked(cfg(), 1061, {}, h.deps);
+  assert.equal(first.status, "still-parked");
+  h.setHead(HEAD2);
+  h.addComment({
+    author: "bot",
+    body: reviewBody({ sha: HEAD2, findings }),
+    createdAt: "2026-08-14T01:00:00Z",
+  });
+  const second = await runRecoverParked(cfg(), 1061, {}, h.deps);
+  assert.equal(second.status, "already-spent");
+  assert.ok(epochs.length >= 2);
+  assert.equal(epochs.includes("unresolved"), false);
+  assert.equal(epochs[0], HEAD);
+  assert.equal(epochs[epochs.length - 1], HEAD2);
+  assert.notEqual(episodeIds[0], episodeIds[episodeIds.length - 1]);
+});
+
 test("5.8 partial override subset does not re-grant senior pass", async () => {
   const findings = [
     { key: KEY_HIGH, severity: "high", title: "h" },
