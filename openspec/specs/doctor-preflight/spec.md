@@ -101,7 +101,7 @@ The set of preflight checks SHALL include, at minimum:
 
 ### Requirement: The pipeline SHALL support an opt-in run-start preflight that blocks the run on failure
 
-When `doctor.runOnStart: true` is set in config or `--doctor` is passed on the CLI, the pipeline SHALL run the preflight checks before the planning stage begins. If any check fails, the pipeline SHALL print the doctor summary and exit with a non-zero code without entering the planning stage. No planning, implementation, or review tokens SHALL be consumed when the run-start preflight fails.
+When `doctor.runOnStart: true` is set in config or `--doctor` is passed on the CLI, the pipeline SHALL run the preflight checks before the planning stage begins. If any check fails, the pipeline SHALL print the doctor summary and SHALL NOT enter the planning stage. No planning, implementation, or review tokens SHALL be consumed when the run-start preflight fails. That failure SHALL be reported as a RecoverySupervisor operation observation, or as a typed Capability Request when the failing check is an unavailable external capability, condition, or information. The Logical Operation SHALL remain owned (Cooling or an external-condition wait). The CLI MAY return a non-zero process status as a compatibility projection. That status SHALL NOT be ownerless STOP and SHALL NOT be implemented as a silent raw `process.exit(1)` that ends recovery ownership. Standalone `pipeline doctor` SHALL remain a read-only diagnostic and MAY exit 1 without writing recovery state.
 
 #### Scenario: Run-start preflight blocks on failure
 
@@ -110,6 +110,8 @@ When `doctor.runOnStart: true` is set in config or `--doctor` is passed on the C
 - **THEN** the pipeline SHALL print the failing check(s) with remediation text
 - **AND** SHALL exit before the planning stage
 - **AND** SHALL NOT consume any planning or implementation tokens
+- **AND** SHALL report a typed observation or Capability Request
+- **AND** RecoverySupervisor SHALL retain ownership of the drive
 
 #### Scenario: Run-start preflight passes — run proceeds normally
 
@@ -123,6 +125,14 @@ When `doctor.runOnStart: true` is set in config or `--doctor` is passed on the C
 - **AND** `--doctor` is not passed
 - **THEN** the pipeline run SHALL behave identically to a run without the doctor feature present
 - **AND** no preflight checks SHALL execute
+
+#### Scenario: Standalone doctor stays read-only
+
+- **WHEN** the operator runs `pipeline doctor` and a check fails
+- **THEN** the process MAY exit 1
+- **AND** the command SHALL NOT write a recovery episode, claim, Cooling record, or typed request
+
+---
 
 ### Requirement: `--status` SHALL surface the latest preflight result when available
 
@@ -341,16 +351,17 @@ records like every other check.
 
 ### Requirement: Run-start preflight SHALL block a run on an adapter readiness failure
 
-When run-start preflight is enabled, a failing harness-adapter readiness check SHALL abort
-the run before the assigned stage's model invocation begins. The pipeline SHALL NOT
-substitute a different harness or adapter for the failing one, because substituting would
-silently change the harness under evaluation.
+When run-start preflight is enabled, a failing harness-adapter readiness check SHALL prevent the assigned stage's model invocation. The pipeline SHALL NOT substitute a different harness or adapter for the failing one, because substituting would silently change the harness under evaluation. The failure SHALL be a typed Capability Request or a RecoverySupervisor observation. The Logical Operation SHALL remain owned. The pipeline SHALL NOT treat the failure as ownerless STOP.
 
 #### Scenario: Run-start preflight aborts before the stage runs
 
 - **WHEN** run-start preflight is enabled and an assigned adapter's readiness check fails
-- **THEN** the run SHALL abort before the assigned stage invokes a model
+- **THEN** the run SHALL not invoke a model on the assigned stage
 - **AND** the stage SHALL NOT be executed on a substitute harness
+- **AND** the failure SHALL be reported as a typed observation or Capability Request
+- **AND** RecoverySupervisor SHALL retain ownership
+
+---
 
 ### Requirement: Adapter readiness checks SHALL be unit-testable without real subprocess or network calls
 
@@ -492,6 +503,10 @@ Unassigned adapters MAY be skipped for deep readiness checks under existing unas
 rules; skipping an unassigned adapter solely because it is unassigned SHALL NOT by itself fail
 doctor.
 
+When the same incoherent-declaration failure occurs during run-start preflight, the drive SHALL NOT
+enter planning or invoke a model, and SHALL NOT run the stage on a substitute harness. That failure
+SHALL be a typed observation or Capability Request and SHALL leave the Logical Operation owned.
+
 #### Scenario: Doctor reports delivery channel and maxPromptBytes for assigned adapters
 
 - **WHEN** configuration assigns adapters as implementer and/or reviewer
@@ -535,8 +550,10 @@ doctor.
 
 - **WHEN** run-start preflight is enabled
 - **AND** an assigned adapter fails the prompt-limit coherence check
-- **THEN** the run SHALL abort before the assigned stage invokes a model
+- **THEN** the run SHALL not invoke a model on the assigned stage
 - **AND** the stage SHALL NOT be executed on a substitute harness
+- **AND** the failure SHALL be reported as a typed observation or Capability Request
+- **AND** RecoverySupervisor SHALL retain ownership
 
 ### Requirement: Doctor SHALL admit and report the configured git push-auth mechanism
 
