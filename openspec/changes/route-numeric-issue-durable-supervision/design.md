@@ -7,7 +7,7 @@ Existing surfaces this change extends:
 - `runSingleIssueCommand` in `core/scripts/pipeline.ts` is already the canonical one-item durable supervisor (`runLoopEngine` with a one-item work-list). `pipeline single` is the public verb for that facade.
 - Public mutating `pipeline <N>` currently falls through to `runAdvance` after read-only and mode-selector preservation (`pipeline.ts` after `--override` returns). Hidden `pipeline run <N>` without `--detach` rewrites `numArg` onto that same numeric path. `handleRunSubcommand` without `--detach` still calls `runAdvance` directly (test/direct callers).
 - `--detach` is handled **before** config resolution: `pipeline run <N> --detach` and `pipeline <N> --detach` both call `handleRunSubcommand`, which `spawnDetached`s a wrapper whose inner argv is `pipeline.ts <N> [passArgs]` with **no** `PIPELINE_NESTED_ADVANCE` marker.
-- `runAdvance` in `core/scripts/pipeline-run.ts` is already the whole-item stage executor. Loop children spawn `pipeline <N>` with `PIPELINE_NESTED_ADVANCE=1` via `dispatchItemChildArgs` / `nestedAdvanceChildEnv`. In-process recover-parked re-entry and override resume already call `runAdvance` with `emitAdvanceHandoff: false`.
+- `runAdvance` in `core/scripts/pipeline-run.ts` is already the whole-item stage executor. Loop children spawn the dedicated `nested-advance.ts` executor via `dispatchItemChildArgs`. `PIPELINE_NESTED_ADVANCE` may still suppress `advance_run_handoff` on that child; it is not a public numeric admission switch. In-process recover-parked re-entry and override resume already call `runAdvance` with `emitAdvanceHandoff: false`.
 - `formatLoopRunHandoff` and `loop_item_advance_linked` already publish loop identity and child advance identity. `advance_run_handoff` is the current public-numeric identity (#1049).
 - RecoverySupervisor vocabulary in `CONTEXT.md`. Command-form inventory already labels numeric drive as a durable one-item drive. Living `durable-loop-supervisor` already requires one-item drives to use the same supervisor; `advance-skill-orchestration` still pins a direct-advance bypass.
 
@@ -38,7 +38,7 @@ Follow the existing one-item facade, not a new scheduler.
 
 `runSingleIssueCommand` in `core/scripts/pipeline.ts` already compiles `{ type: "work-list", value: [String(issueNumber)] }`, calls `runLoopEngine` with `autoSupersedeTerminal: true`, and emits `formatLoopRunHandoff` from `onRunReady`. `pipeline single` is that facade. Tests already inject `SingleIssueCommandDeps.runLoopEngine` (see `core/test/pipeline-cli.test.ts`, `advanceIssueThroughSingle`).
 
-This change aliases public mutating numeric drive onto that same function. Child inputs use the existing `toAdvanceOpts` mapper (`CliOpts` → `AdvanceOpts`) so `pipeline-run.ts` never imports the CLI. Nested spawn keeps `dispatchItemChildArgs` + `nestedAdvanceChildEnv`; the new CLI branch calls a named adapter instead of the public alias.
+This change aliases public mutating numeric drive onto that same function. Child inputs use the existing `toAdvanceOpts` mapper (`CliOpts` → `AdvanceOpts`) so `pipeline-run.ts` never imports the CLI. Nested spawn keeps `dispatchItemChildArgs` but targets the dedicated nested-advance child executor; public numeric CLI admission always aliases to `runSingleIssueCommand`.
 
 ## Decisions
 
@@ -52,28 +52,28 @@ After the precedence table in D7, mutating `pipeline <N>` calls `runSingleIssueC
 
 Alternative considered: keep `runAdvance` for numeric and add a thin recovery wrapper. Rejected: that is a second one-item scheduler. The holding rung already exists.
 
-### D2 — Nested admission is an explicit non-public adapter onto `runAdvance`
+### D2 — Nested admission is a dedicated non-public child executor onto `runAdvance`
 
 `runAdvance` stays the internal executor. It is not the public numeric lifecycle owner.
 
-Add an exported adapter `runNestedWholeItemAdvance(cfg, issueNumber, opts: AdvanceOpts)` in `core/scripts/pipeline.ts` (or a tiny adjacent module that already imports both CLI-neutral types and `runAdvance`). The adapter:
+The exported adapter `runNestedWholeItemAdvance(cfg, issueNumber, opts: AdvanceOpts)` lives in `core/scripts/nested-advance.ts`. The adapter:
 
 - Calls `runAdvance(cfg, issueNumber, { ...opts, emitAdvanceHandoff: false })`.
 - Does not call `runSingleIssueCommand`.
-- Does not construct argv.
-- Does not call `buildCmd().parse`, `main()`, or the public numeric alias.
+- Does not construct public `pipeline <N>` argv.
+- Does not call `buildCmd().parse`, `main()`, or `admitMutatingNumericDrive`.
 
 Nested whole-item advancement uses that adapter, not a second public admission:
 
-- Spawned `pipeline/loop-execution@1` children keep `dispatchItemChildArgs` (`pipeline <N>` argv) and `PIPELINE_NESTED_ADVANCE=1`.
-- The CLI treats `isNestedAdvanceChild()` / `PIPELINE_NESTED_ADVANCE=1` as nested admission **before** the public alias and calls `runNestedWholeItemAdvance(cfg, issue, toAdvanceOpts(opts))`.
+- Spawned `pipeline/loop-execution@1` children keep `dispatchItemChildArgs` but the default script is `nested-advance.ts`, not public `pipeline <N>`.
+- `admitMutatingNumericDrive` always aliases to `runSingleIssueCommand`. `PIPELINE_NESTED_ADVANCE` SHALL NOT select the nested adapter from public numeric CLI admission.
 - In-process recover-parked re-entry and override resume keep calling `runAdvance` directly (they already pass `AdvanceOpts`; they may call the adapter). They do not go through public numeric aliasing.
 
-**Resolution of “must not rebuild public numeric argv or re-enter CLI dispatch”:** the adapter itself never rebuilds argv and never enters the public alias. The existing loop-execution spawn remains the process boundary (pin, linkage, stdio inherit). That child process re-enters `pipeline.ts` only far enough to take the nested-admission branch. A fixture that treats that child as public mutating `pipeline <N>` (calls `runSingleIssueCommand`, emits `loop_run_handoff`, or mints a second supervisor) fails.
+**Resolution of “must not rebuild public numeric argv or re-enter CLI dispatch”:** the child executor never enters the public alias. The existing loop-execution spawn remains the process boundary (pin, linkage, stdio inherit). A fixture that treats that child as public mutating `pipeline <N>` (calls `runSingleIssueCommand`, emits `loop_run_handoff`, or mints a second supervisor) fails. A fixture that sets `PIPELINE_NESTED_ADVANCE=1` on public `pipeline <N>` still enters the one-item supervisor.
 
 Do not add a public internal-advance verb. Do not invent `numeric-supervisor.ts`.
 
-Alternative considered: change loop children to spawn `pipeline single <N>`. Rejected: that recursively creates another supervisor. Alternative considered: in-process `runAdvance` from the supervisor with no child argv. Rejected as a larger rewrite; the spawn seam and pin/linkage already work.
+Alternative considered: keep spawning `pipeline <N>` and branch on `PIPELINE_NESTED_ADVANCE`. Rejected: that environment marker is caller-controlled public admission. Alternative considered: change loop children to spawn `pipeline single <N>`. Rejected: that recursively creates another supervisor. Alternative considered: in-process `runAdvance` from the supervisor with no child argv. Rejected as a larger rewrite; the spawn seam and pin/linkage already work.
 
 ### D3 — One canonical loop-run handoff; linkage publishes child advance identity
 
@@ -126,7 +126,7 @@ export type OneItemChildAdvanceInputs = Pick<
 - Forward `once`, `dryRun`, `model`, `engineTrack`, `jsonEvents`, `candidateShaOverride` onto `dispatchItemChildArgs` **only when `childAdvance` is present**.
 - Multi-item callers still call `realDispatchItem(cfg, engine)` with no `childAdvance`, so they still omit `--once` (#512).
 
-**Adapter invoke:** the nested CLI branch and in-process re-entry call `runNestedWholeItemAdvance(cfg, issue, toAdvanceOpts(opts))` / `runAdvance` with that mapped bag. They do not rebuild `["pipeline", String(n), ...]` or re-parse Commander.
+**Adapter invoke:** the nested-advance child and in-process re-entry call `runNestedWholeItemAdvance(cfg, issue, mapped AdvanceOpts)` / `runAdvance` with that mapped bag. They do not rebuild public `["pipeline", String(n), ...]` or re-parse Commander.
 
 `--dry-run` on numeric drive still means no GitHub writes. The supervisor owns the dry-run attempt rather than skipping to an unsupervised executor.
 
@@ -161,10 +161,9 @@ Frozen precedence for a numeric first arg or `pipeline run <N>` rewrite. Do not 
 | 13 | `pipeline <N> --remove-worktree` | `runRemoveWorktree` | before kill-switch |
 | 14 | Kill-switch | exit 0 | flag-form unblock/override currently sit **after** this; keep |
 | 15 | `pipeline <N> --unblock` / `--override` | existing | not the supervisor alias |
-| 16 | Nested marker `PIPELINE_NESTED_ADVANCE=1` | `runNestedWholeItemAdvance` | D2; never `runSingleIssueCommand` |
-| 17 | Remaining mutating numeric | `runSingleIssueCommand` | D1 |
+| 16 | Remaining mutating numeric, including with `PIPELINE_NESTED_ADVANCE=1` | `runSingleIssueCommand` | D1; env markers do not select the nested adapter |
 
-`admitMutatingNumericDrive` is rows 16–17 only. Tests inject `{ runSingleIssue, runNestedWholeItemAdvance }` and never call real network/git/subprocess.
+`admitMutatingNumericDrive` is row 16 only. Tests inject `{ runSingleIssue }` and never call real network/git/subprocess. Nested dispatch is `realDispatchItem` → `nested-advance.ts`, not a CLI admission row.
 
 ### D8 — Direct `runAdvance` owners in this repo (closed list)
 
@@ -175,7 +174,7 @@ Public lifecycle owners that this change must stop:
 
 Nested executors that must stay `runAdvance` / adapter:
 
-- `realDispatchItem` spawn with `PIPELINE_NESTED_ADVANCE=1` → nested CLI branch.
+- `realDispatchItem` spawn of `nested-advance.ts` → `runNestedWholeItemAdvance`.
 - `runOverride` in-process resume (`deps.runAdvance`).
 - `reenterAdvanceAfterRecoverParked` (`deps.runAdvance`).
 
@@ -183,7 +182,7 @@ A change that only aliases default numeric and leaves `handleRunSubcommand` or d
 
 ## Risks / Trade-offs
 
-- **[Risk] Nested spawn of `pipeline <N>` recurses into another supervisor.** → Mitigation: nested marker is checked before the public alias (D7 row 16). Contract test fails if a nested child calls `runSingleIssueCommand` or emits `loop_run_handoff`.
+- **[Risk] Nested spawn of `pipeline <N>` recurses into another supervisor.** → Mitigation: supervisor spawn targets `nested-advance.ts`, not public `pipeline <N>`. Public numeric admission always aliases to `runSingleIssueCommand`. Contract test fails if `PIPELINE_NESTED_ADVANCE=1` bypasses the supervisor, or if a nested child calls `runSingleIssueCommand` or emits `loop_run_handoff`.
 - **[Risk] Hosts still scrape `advance_run_handoff` from `pipeline <N>`.** → Mitigation: documented breaking observability change. Renderer, generated SKILLs, and durable docs switch to loop handoff plus linkage. Drift guards fail if the bypass prose returns.
 - **[Risk] `--once` on one-item drive conflicts with loop children omitting `--once`.** → Mitigation: forward `--once` only when `RunLoopEngineInput.childAdvance` is set. Leave multi-item `dispatchItemChildArgs` unchanged.
 - **[Risk] `runSingleIssueCommand` flag allowlist is narrower than numeric `allowedFlags: "all"`.** → Mitigation: keep numeric parsing; map known advance fields into `childAdvance`. Do not silently drop parsed child inputs. Do not widen `single.allowedFlags`.
@@ -194,13 +193,13 @@ A change that only aliases default numeric and leaves `handleRunSubcommand` or d
 ## Migration Plan
 
 1. Land lifecycle-parity tests that fail on current public numeric `runAdvance` ownership, nested recursion, hidden `run` attached/detached bypass, and host-SKILL bypass prose.
-2. Add `runNestedWholeItemAdvance` and the nested-admission branch (D7 row 16). Alias public mutating numeric and `handleRunSubcommand` non-detach to `runSingleIssueCommand`.
+2. Add `runNestedWholeItemAdvance` in `nested-advance.ts`. Alias public mutating numeric and `handleRunSubcommand` non-detach to `runSingleIssueCommand`. Point `realDispatchItem` spawn at that child executor. Do not admit nested execution from `PIPELINE_NESTED_ADVANCE`.
 3. Thread `OneItemChildAdvanceInputs` through `RunLoopEngineInput` / `realDispatchItem`. Keep multi-item `--once` omission. Forward `--engine-track` on detach.
 4. Switch public numeric handoff to the loop handoff. Replace `advance_run_handoff` pins for the public path. Nested `runAdvance` still suppresses it.
 5. Update `host-skill.ts`, rebuild generated SKILLs, and align durable follow docs.
 6. Keep `npm run ci` green, including `openspec validate --all` and `node scripts/build.mjs --check`. This planning revision claims no suite pass.
 
-Rollback is revert of this change. A partial rollback that aliases numeric drive without the nested-admission guard is not allowed.
+Rollback is revert of this change. A partial rollback that aliases numeric drive while still spawning public `pipeline <N>` as the nested child is not allowed.
 
 ## Open Questions
 

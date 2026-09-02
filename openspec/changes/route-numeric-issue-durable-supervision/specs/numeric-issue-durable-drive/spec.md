@@ -65,6 +65,12 @@ Raw stage advancement SHALL remain an internal executor operation. Nested whole-
 - **THEN** they SHALL NOT recommend the nested adapter as an operator issue-drive command
 - **AND** they SHALL still retain `pipeline <N>` as the public default drive syntax
 
+#### Scenario: Environment marker cannot select the nested adapter
+
+- **WHEN** an operator invokes mutating `pipeline <N>` with `PIPELINE_NESTED_ADVANCE=1` set in the environment
+- **THEN** the CLI SHALL enter the one-item durable supervisor
+- **AND** it SHALL NOT select the nested adapter from that environment variable
+
 ---
 
 ### Requirement: Read-only and mode-selector forms SHALL dispatch before aliasing

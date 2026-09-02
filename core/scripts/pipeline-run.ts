@@ -235,8 +235,8 @@ export interface AdvanceOpts {
    * in-process re-entry (recover-parked) and nested whole-item adapters set
    * this so parent machine stdout stays one document. Default / omitted emits
    * for a top-level `runAdvance` caller. Public mutating `pipeline <N>` is not
-   * a top-level `runAdvance` owner. Spawned loop children set
-   * PIPELINE_NESTED_ADVANCE=1.
+   * a top-level `runAdvance` owner. Spawned loop children run the dedicated
+   * nested-advance executor, which always suppresses the handoff.
    */
   emitAdvanceHandoff?: boolean;
   /**

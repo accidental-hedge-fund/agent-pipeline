@@ -15,6 +15,8 @@
 - [x] 2.2 Alias public mutating `pipeline <N>` after D7 rows 1–15 to `runSingleIssueCommand` (export `admitMutatingNumericDrive` as rows 16–17), and verify the 1.1 numeric/single parity test passes
 - [x] 2.3 Keep hidden `pipeline run <N>` without `--detach` on the same mutating numeric path **and** change `handleRunSubcommand` non-detach from `runAdvance` to `runSingleIssueCommand`; verify 1.6
 - [x] 2.4 Keep recover-parked re-entry and override resume on in-process `runAdvance` / the nested adapter, and verify those paths do not call `runSingleIssueCommand`
+- [x] 2.5 Point `realDispatchItem` default spawn at the dedicated `nested-advance.ts` child executor, not public `pipeline <N>`
+- [x] 2.6 Add a regression test that `PIPELINE_NESTED_ADVANCE=1` on public mutating `pipeline <N>` still enters `runSingleIssueCommand` and does not select the nested adapter
 
 ## 3. Child inputs, detach, and mechanical ownership
 

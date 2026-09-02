@@ -21,6 +21,7 @@ import {
   admitMutatingNumericDrive,
   dispatchItemChildArgs,
   handleRunSubcommand,
+  NESTED_ADVANCE_CHILD_SCRIPT,
   pickOneItemChildAdvanceInputs,
   pinAdvanceRunIdentity,
   realDispatchItem,
@@ -31,11 +32,16 @@ import {
   type RunSubcommandDeps,
   type SingleIssueCommandDeps,
 } from "../scripts/pipeline.ts";
+import {
+  parseNestedAdvanceChildArgv,
+  runNestedAdvanceChild,
+} from "../scripts/nested-advance.ts";
 import type { AdvanceOpts } from "../scripts/pipeline-run.ts";
 import { DEFAULT_CONFIG, type PipelineConfig } from "../scripts/types.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const PIPELINE_SRC = readFileSync(join(here, "../scripts/pipeline.ts"), "utf8");
+const NESTED_ADVANCE_SRC = readFileSync(join(here, "../scripts/nested-advance.ts"), "utf8");
 const RECOVER_PARKED_SRC = readFileSync(join(here, "../scripts/recover-parked.ts"), "utf8");
 const HOST_SKILL_SRC = readFileSync(join(here, "../scripts/host-skill.ts"), "utf8");
 const PIPELINE_SCRIPT = fileURLToPath(new URL("../scripts/pipeline.ts", import.meta.url));
@@ -138,10 +144,6 @@ test("mutating pipeline <N> and pipeline single <N> attach to the same one-item 
   try {
     await runSingleIssueCommand("42", { profile: "claude" }, singleDeps);
     await admitMutatingNumericDrive(cfg(), 42, { profile: "claude" }, {
-      isNestedAdvanceChild: () => false,
-      runNestedWholeItemAdvance: async () => {
-        throw new Error("public numeric must not call nested adapter");
-      },
       runSingleIssue: (raw, opts) => runSingleIssueCommand(raw, opts, singleDeps),
     });
     assert.equal(seen.length, 2);
@@ -166,43 +168,57 @@ test("public numeric tail does not call runAdvance as the top-level lifecycle ow
   assert.doesNotMatch(tail, /formatAdvanceRunHandoff|flushAdvanceRunHandoff|ADVANCE_RUN_HANDOFF/);
 });
 
-test("nested admission returns before runSingleIssueCommand", () => {
+test("PIPELINE_NESTED_ADVANCE=1 cannot bypass the one-item supervisor", async () => {
+  const prior = process.env.PIPELINE_NESTED_ADVANCE;
+  process.env.PIPELINE_NESTED_ADVANCE = "1";
+  let single = 0;
+  try {
+    await admitMutatingNumericDrive(cfg(), 42, { once: true }, {
+      runSingleIssue: async () => {
+        single += 1;
+        return { exitCode: 0 };
+      },
+    });
+    assert.equal(single, 1);
+  } finally {
+    if (prior === undefined) delete process.env.PIPELINE_NESTED_ADVANCE;
+    else process.env.PIPELINE_NESTED_ADVANCE = prior;
+  }
   const body = extractFunction(PIPELINE_SRC, "admitMutatingNumericDrive");
-  const nestedAt = body.indexOf("isNestedAdvanceChild");
-  const singleAt = body.indexOf("runSingleIssue");
-  assert.ok(nestedAt >= 0 && singleAt > nestedAt);
-  assert.match(body, /if \(deps\.isNestedAdvanceChild\(\)\)/);
-  assert.match(body, /return;/);
+  assert.doesNotMatch(body, /isNestedAdvanceChild|PIPELINE_NESTED_ADVANCE|runNestedWholeItemAdvance/);
+  assert.match(body, /runSingleIssue/);
 });
 
 // ---------------------------------------------------------------------------
 // 1.2 / 1.7 / 2.1 nested adapter
 // ---------------------------------------------------------------------------
 
-test("nested PIPELINE_NESTED_ADVANCE children call runNestedWholeItemAdvance and not runSingleIssueCommand", async () => {
+test("nested-advance child calls runNestedWholeItemAdvance and not runSingleIssueCommand", async () => {
   let nested = 0;
   let single = 0;
   let nestedOpts: AdvanceOpts | undefined;
-  await admitMutatingNumericDrive(cfg(), 99, { once: true, dryRun: true }, {
-    isNestedAdvanceChild: () => true,
-    runSingleIssue: async () => {
-      single += 1;
-      return { exitCode: 0 };
+  const code = await runNestedAdvanceChild(
+    ["99", "--profile", "claude", "--repo-path", "/repo", "--once", "--dry-run"],
+    {
+      resolveConfig: () => cfg(),
+      isKillSwitchActive: () => false,
+      runNestedWholeItemAdvance: async (_cfg, issue, opts) => {
+        nested += 1;
+        assert.equal(issue, 99);
+        nestedOpts = opts;
+      },
     },
-    runNestedWholeItemAdvance: async (_cfg, issue, opts) => {
-      nested += 1;
-      assert.equal(issue, 99);
-      nestedOpts = opts;
-    },
-  });
+  );
+  assert.equal(code, 0);
   assert.equal(nested, 1);
   assert.equal(single, 0);
   assert.equal(nestedOpts?.once, true);
   assert.equal(nestedOpts?.dryRun, true);
+  assert.doesNotMatch(NESTED_ADVANCE_SRC, /runSingleIssueCommand|admitMutatingNumericDrive|from "\.\/pipeline\.ts"/);
 });
 
 test("runNestedWholeItemAdvance never constructs argv or calls runSingleIssueCommand", () => {
-  const body = extractFunction(PIPELINE_SRC, "runNestedWholeItemAdvance");
+  const body = extractFunction(NESTED_ADVANCE_SRC, "runNestedWholeItemAdvance");
   assert.match(body, /emitAdvanceHandoff: false/);
   assert.match(body, /runAdvance\(/);
   assert.doesNotMatch(body, /runSingleIssueCommand/);
@@ -211,24 +227,80 @@ test("runNestedWholeItemAdvance never constructs argv or calls runSingleIssueCom
 });
 
 test("a fixture that re-enters public numeric aliasing from the nested adapter fails the source contract", () => {
-  const body = extractFunction(PIPELINE_SRC, "runNestedWholeItemAdvance");
+  const body = extractFunction(NESTED_ADVANCE_SRC, "runNestedWholeItemAdvance");
   assert.doesNotMatch(body, /admitMutatingNumericDrive|runSingleIssueCommand/);
 });
 
 test("nested child does not emit loop_run_handoff or mint a second supervisor", async () => {
-  const body = extractFunction(PIPELINE_SRC, "runNestedWholeItemAdvance");
+  const body = extractFunction(NESTED_ADVANCE_SRC, "runNestedWholeItemAdvance");
   assert.doesNotMatch(body, /formatLoopRunHandoff|runLoopEngine|runSingleIssueCommand/);
   const lines: string[] = [];
-  await admitMutatingNumericDrive(cfg(), 8, {}, {
-    isNestedAdvanceChild: () => true,
-    runSingleIssue: async () => {
-      throw new Error("nested must not mint a second supervisor");
+  const code = await runNestedAdvanceChild(
+    ["8", "--profile", "claude", "--repo-path", "/repo"],
+    {
+      resolveConfig: () => cfg(),
+      isKillSwitchActive: () => false,
+      runNestedWholeItemAdvance: async () => {
+        lines.push("nested");
+      },
     },
-    runNestedWholeItemAdvance: async () => {
-      lines.push("nested");
-    },
-  });
+  );
+  assert.equal(code, 0);
   assert.deepEqual(lines, ["nested"]);
+});
+
+test("realDispatchItem default child script is the nested-advance executor", async () => {
+  assert.match(PIPELINE_SRC, /const scriptPath = deps\.scriptPath \?\? NESTED_ADVANCE_CHILD_SCRIPT;/);
+  assert.equal(NESTED_ADVANCE_CHILD_SCRIPT.endsWith("nested-advance.ts"), true);
+  const spawned: string[][] = [];
+  const dispatch = realDispatchItem(
+    { repo_dir: "/repo" } as PipelineConfig,
+    "claude",
+    {
+      eventsPathExists: () => true,
+      spawn: ((_cmd: string, args: readonly string[]) => {
+        spawned.push([...args]);
+        return fakeSpawnChild();
+      }) as typeof import("node:child_process").spawn,
+      getIssueDetail: async () => ({ labels: ["pipeline:ready-to-deploy"], state: "open" }) as never,
+      getPrForIssue: async () => 1,
+    },
+  );
+  await dispatch({
+    schema: "pipeline/loop-execution@1",
+    item_id: "42",
+    repo: { name: "acme/w", base_branch: "main" },
+    engine: "claude",
+    worktree_policy: "default",
+    done_definition: "pipeline:ready-to-deploy",
+    run_id: "loop-run",
+  });
+  assert.equal(spawned.length, 1);
+  assert.equal(spawned[0]![0], NESTED_ADVANCE_CHILD_SCRIPT);
+  assert.ok(!spawned[0]![0]!.endsWith("pipeline.ts"));
+});
+
+test("parseNestedAdvanceChildArgv is the inverse of dispatchItemChildArgs", () => {
+  const args = dispatchItemChildArgs(NESTED_ADVANCE_CHILD_SCRIPT, 100, "claude", "/repo", {
+    once: true,
+    dryRun: true,
+    model: "m",
+    jsonEvents: true,
+    candidateShaOverride: "a".repeat(40),
+    runId: "pin-1",
+    engineTrack: "candidate",
+  });
+  const parsed = parseNestedAdvanceChildArgv(args.slice(1));
+  assert.equal(parsed.issueNumber, 100);
+  assert.equal(parsed.repoPath, "/repo");
+  assert.equal(parsed.opts.profile, "claude");
+  assert.equal(parsed.opts.once, true);
+  assert.equal(parsed.opts.dryRun, true);
+  assert.equal(parsed.opts.model, "m");
+  assert.equal(parsed.opts.jsonEvents, true);
+  assert.equal(parsed.opts.candidateShaOverride, "a".repeat(40));
+  assert.equal(parsed.opts.runId, "pin-1");
+  assert.equal(parsed.opts.engineTrack, "candidate");
 });
 
 // ---------------------------------------------------------------------------
@@ -245,10 +317,6 @@ test("public mutating numeric drive emits one loop_run_handoff and no top-level 
   process.exitCode = undefined;
   try {
     await admitMutatingNumericDrive(cfg(), 42, { profile: "claude" }, {
-      isNestedAdvanceChild: () => false,
-      runNestedWholeItemAdvance: async () => {
-        throw new Error("public numeric must not nested-advance");
-      },
       runSingleIssue: (raw, opts) =>
         runSingleIssueCommand(raw, opts, {
           resolveConfig: () => cfg(),
@@ -428,10 +496,6 @@ test("pipeline <N> --once still enters the supervisor and forwards once as a chi
   process.exitCode = undefined;
   try {
     await admitMutatingNumericDrive(cfg(), 42, { once: true, profile: "claude" }, {
-      isNestedAdvanceChild: () => false,
-      runNestedWholeItemAdvance: async () => {
-        throw new Error("--once must not select top-level runAdvance");
-      },
       runSingleIssue: (raw, opts) =>
         runSingleIssueCommand(raw, opts, {
           resolveConfig: () => cfg(),
@@ -581,10 +645,6 @@ test("pipeline <N> --detach forwards child options and engine-track; does not re
 test("mechanical fault through mutating numeric drive stays RecoverySupervisor-owned", async () => {
   const sink = memoryObservationSink();
   await admitMutatingNumericDrive(cfg(), 42, {}, {
-    isNestedAdvanceChild: () => false,
-    runNestedWholeItemAdvance: async () => {
-      throw new Error("must not nested");
-    },
     runSingleIssue: async () => {
       reportMechanicalFault(sink.reportObservation, {
         operation: "numeric_issue_drive",
@@ -612,7 +672,7 @@ test("mechanical fault through mutating numeric drive stays RecoverySupervisor-o
 test("numeric, single, and loop still never merge", () => {
   const singleFn = extractFunction(PIPELINE_SRC, "runSingleIssueCommand");
   const admitFn = extractFunction(PIPELINE_SRC, "admitMutatingNumericDrive");
-  const nestedFn = extractFunction(PIPELINE_SRC, "runNestedWholeItemAdvance");
+  const nestedFn = extractFunction(NESTED_ADVANCE_SRC, "runNestedWholeItemAdvance");
   const loopFn = extractFunction(PIPELINE_SRC, "runLoopCommand");
   for (const [name, body] of [
     ["single", singleFn],

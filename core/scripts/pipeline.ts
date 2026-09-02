@@ -332,12 +332,17 @@ import {
   type AdvanceOpts,
   type PlanningRecoveryDeps,
 } from "./pipeline-run.ts";
-import { isNestedAdvanceChild, nestedAdvanceChildEnv } from "./advance-handoff.ts";
+import { nestedAdvanceChildEnv } from "./advance-handoff.ts";
+import {
+  NESTED_ADVANCE_CHILD_SCRIPT,
+  runNestedWholeItemAdvance,
+} from "./nested-advance.ts";
 
 // Re-export for backward compatibility with existing import paths.
 export { isAutoLoopRecoverable, isAutoLoopEligible, canAutoLoopContinue };
 export { ceilingRound, REVIEW_CEILING_MARKER } from "./advance-shared.ts";
 export type { AdvanceDeps, AdvanceOpts, PlanningRecoveryDeps };
+export { NESTED_ADVANCE_CHILD_SCRIPT, runNestedWholeItemAdvance };
 
 /** Map Commander-facing {@link CliOpts} into the thin advance bag (#630). */
 export function toAdvanceOpts(opts: Pick<
@@ -1329,15 +1334,16 @@ export type DispatchItemChildArgOpts = {
   candidateShaOverride?: string | null;
 };
 
-/** Builds the child-process argv for the per-item advance loop hand-off.
- *  Deliberately omits `--once` unless one-item `childAdvance.once` is set: a
- *  multi-item child must run its normal advance loop to completion (a defined
- *  `pipeline/loop-execution@1` terminal outcome — ready-to-deploy, blocked, or
- *  closed), not stop after a single stage (#512 review 1, finding 57fe63fa).
- *  Optional `runId` pins the child's `.agent-pipeline/runs/<run-id>/` via the
- *  same internal `--run-id` flag detached launch already uses (#667). Exported
- *  as a pure function so this contract is unit-testable without spawning a
- *  real process. */
+/** Builds the child-process argv for the per-item nested-advance hand-off.
+ *  The script path is the dedicated nested-advance executor, not public
+ *  `pipeline <N>`. Deliberately omits `--once` unless one-item
+ *  `childAdvance.once` is set: a multi-item child must run its normal advance
+ *  loop to completion (a defined `pipeline/loop-execution@1` terminal outcome
+ *  — ready-to-deploy, blocked, or closed), not stop after a single stage
+ *  (#512 review 1, finding 57fe63fa). Optional `runId` pins the child's
+ *  `.agent-pipeline/runs/<run-id>/` via the same internal `--run-id` flag
+ *  detached launch already uses (#667). Exported as a pure function so this
+ *  contract is unit-testable without spawning a real process. */
 export function dispatchItemChildArgs(
   scriptPath: string,
   issueNumber: number,
@@ -1608,7 +1614,7 @@ export function realDispatchItem(
   const getGhActorFn = deps.getGhActor ?? getGhActor;
   const getLatestBlockedLabeledAtFn =
     deps.getLatestBlockedLabeledAt ?? getLatestBlockedLabeledAt;
-  const scriptPath = deps.scriptPath ?? fileURLToPath(import.meta.url);
+  const scriptPath = deps.scriptPath ?? NESTED_ADVANCE_CHILD_SCRIPT;
   const execPath = deps.execPath ?? process.execPath;
   const eventsPathExistsFn = deps.eventsPathExists ?? ((p: string) => existsSync(p));
   const readEventsTextFn =
@@ -3585,46 +3591,26 @@ export async function runSingleIssueCommand(
   };
 }
 
-/**
- * Non-public nested whole-item adapter (#1327). Calls {@link runAdvance} with
- * handoff suppressed. Never constructs argv and never calls
- * {@link runSingleIssueCommand}.
- */
-export async function runNestedWholeItemAdvance(
-  cfg: PipelineConfig,
-  issueNumber: number,
-  opts: AdvanceOpts,
-  deps?: AdvanceDeps,
-): Promise<void> {
-  await runAdvance(cfg, issueNumber, { ...opts, emitAdvanceHandoff: false }, deps);
-}
-
 export interface AdmitMutatingNumericDriveDeps {
   runSingleIssue: typeof runSingleIssueCommand;
-  runNestedWholeItemAdvance: typeof runNestedWholeItemAdvance;
-  isNestedAdvanceChild: (env?: NodeJS.ProcessEnv) => boolean;
 }
 
 const defaultAdmitMutatingNumericDriveDeps: AdmitMutatingNumericDriveDeps = {
   runSingleIssue: runSingleIssueCommand,
-  runNestedWholeItemAdvance,
-  isNestedAdvanceChild,
 };
 
 /**
- * D7 rows 16–17: nested marker uses the non-public adapter; remaining
- * mutating numeric drive aliases to the one-item supervisor.
+ * Remaining mutating numeric drive aliases to the one-item supervisor.
+ * Environment markers such as `PIPELINE_NESTED_ADVANCE` do not select the
+ * nested adapter. Nested whole-item advancement is the dedicated child
+ * executor spawned by supervisor dispatch.
  */
 export async function admitMutatingNumericDrive(
-  cfg: PipelineConfig,
+  _cfg: PipelineConfig,
   issueNumber: number,
   opts: CliOpts,
   deps: AdmitMutatingNumericDriveDeps = defaultAdmitMutatingNumericDriveDeps,
 ): Promise<void> {
-  if (deps.isNestedAdvanceChild()) {
-    await deps.runNestedWholeItemAdvance(cfg, issueNumber, toAdvanceOpts(opts));
-    return;
-  }
   await deps.runSingleIssue(String(issueNumber), opts);
 }
 
