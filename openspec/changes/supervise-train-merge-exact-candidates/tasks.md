@@ -41,3 +41,10 @@
 - [x] 6.3 After any `core/` edit run `node scripts/build.mjs` and verify `node scripts/build.mjs --check` passes
 - [x] 6.4 Run `openspec validate supervise-train-merge-exact-candidates` and `openspec validate --all`, and verify both exit 0
 - [x] 6.5 Run `npm run ci` from the repo root, and verify the full gate passes
+
+## 7. Review 2 exact-candidate races
+
+- [x] 7.1 Atomically acquire the repository+PR claim (compare-and-swap / exclusive create) before `ghPrMerge`, and verify concurrent invocations submit merge at most once
+- [x] 7.2 Require the live closing issue to equal the frozen candidate scope on inspect and in the final pre-submit read, and verify a relinked-issue fixture refuses merge
+- [x] 7.3 Read `baseRefName` during candidate inspection and require it to equal the configured base immediately before submission, and verify a retargeted-base fixture refuses merge
+- [x] 7.4 Persist a submitted/uncertain transition timestamp and cool from that timestamp, and verify delayed visibility after a slow merge attempt does not remarge

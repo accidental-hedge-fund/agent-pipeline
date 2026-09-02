@@ -68,6 +68,8 @@ export interface MergeClaim {
   evidence_fingerprint: string;
   outcome: "started" | "submitted" | "complete" | "uncertain";
   started_at: string;
+  /** Latest submitted or uncertain transition. Cooling uses this, not started_at. */
+  transitioned_at?: string;
 }
 
 export interface MergeRemoteObservation {
@@ -113,6 +115,15 @@ export type SupervisedMergeObservation = MergeObservation | TrainItemObservation
 export interface MergeClaimStore {
   load(key: string): Promise<MergeClaim | null>;
   save(claim: MergeClaim): Promise<void>;
+  /**
+   * Atomically persist `next` only when the stored claim equals `expected`.
+   * `expected === null` is exclusive create. Returns the stored claim on
+   * success, or null when a competitor holds the record.
+   */
+  compareAndSwap(
+    expected: MergeClaim | null,
+    next: MergeClaim,
+  ): Promise<MergeClaim | null>;
 }
 
 export interface MergeSupervisionContext {
@@ -139,6 +150,26 @@ export function mergeClaimKey(repository: string, pr: number): string {
   return `${repository.trim().toLowerCase()}#${pr}`;
 }
 
+export function mergeClaimsCasEqual(
+  a: MergeClaim | null,
+  b: MergeClaim | null,
+): boolean {
+  if (a === null && b === null) return true;
+  if (a === null || b === null) return false;
+  return (
+    a.outcome === b.outcome &&
+    a.evidence_fingerprint === b.evidence_fingerprint &&
+    a.inspected_head === b.inspected_head &&
+    a.started_at === b.started_at &&
+    (a.transitioned_at ?? "") === (b.transitioned_at ?? "") &&
+    a.repository === b.repository &&
+    a.base === b.base &&
+    a.pr === b.pr &&
+    a.action_identity === b.action_identity &&
+    a.frozen_issue_scope.join(",") === b.frozen_issue_scope.join(",")
+  );
+}
+
 export function memoryMergeClaimStore(
   map: Map<string, MergeClaim> = new Map(),
 ): MergeClaimStore & { map: Map<string, MergeClaim> } {
@@ -151,6 +182,13 @@ export function memoryMergeClaimStore(
     async save(claim) {
       map.set(mergeClaimKey(claim.repository, claim.pr), structuredClone(claim));
     },
+    async compareAndSwap(expected, next) {
+      const key = mergeClaimKey(next.repository, next.pr);
+      const current = map.get(key) ?? null;
+      if (!mergeClaimsCasEqual(current, expected)) return null;
+      map.set(key, structuredClone(next));
+      return structuredClone(next);
+    },
   };
 }
 
@@ -158,27 +196,112 @@ function claimFileName(key: string): string {
   return `${key.replace(/[^a-zA-Z0-9._-]+/g, "_")}.json`;
 }
 
+function isProcessAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function readClaimFile(file: string): Promise<MergeClaim | null> {
+  try {
+    const raw = await fs.readFile(file, "utf8");
+    return JSON.parse(raw) as MergeClaim;
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code === "ENOENT") return null;
+    throw err;
+  }
+}
+
+async function writeClaimAtomic(file: string, claim: MergeClaim): Promise<void> {
+  const tmp = `${file}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
+  await fs.writeFile(tmp, JSON.stringify(claim), "utf8");
+  await fs.rename(tmp, file);
+}
+
+async function withClaimCasLock<T>(
+  lockPath: string,
+  fn: () => Promise<T>,
+): Promise<T | null> {
+  try {
+    const fh = await fs.open(lockPath, "wx");
+    try {
+      await fh.writeFile(String(process.pid), "utf8");
+      return await fn();
+    } finally {
+      await fh.close();
+      await fs.unlink(lockPath).catch(() => {});
+    }
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code !== "EEXIST") throw err;
+    let holder = 0;
+    try {
+      holder = Number.parseInt(await fs.readFile(lockPath, "utf8"), 10);
+    } catch {
+      return null;
+    }
+    if (Number.isInteger(holder) && holder > 0 && !isProcessAlive(holder)) {
+      await fs.unlink(lockPath).catch(() => {});
+      try {
+        const fh = await fs.open(lockPath, "wx");
+        try {
+          await fh.writeFile(String(process.pid), "utf8");
+          return await fn();
+        } finally {
+          await fh.close();
+          await fs.unlink(lockPath).catch(() => {});
+        }
+      } catch (retryErr) {
+        const re = retryErr as NodeJS.ErrnoException;
+        if (re.code === "EEXIST") return null;
+        throw retryErr;
+      }
+    }
+    return null;
+  }
+}
+
 export function fileMergeClaimStore(
   dir: string = path.join(os.tmpdir(), "pipeline-merge-claims"),
 ): MergeClaimStore {
   return {
     async load(key) {
-      const file = path.join(dir, claimFileName(key));
-      try {
-        const raw = await fs.readFile(file, "utf8");
-        return JSON.parse(raw) as MergeClaim;
-      } catch (err) {
-        const e = err as NodeJS.ErrnoException;
-        if (e.code === "ENOENT") return null;
-        throw err;
-      }
+      return readClaimFile(path.join(dir, claimFileName(key)));
     },
     async save(claim) {
       await fs.mkdir(dir, { recursive: true });
       const file = path.join(dir, claimFileName(mergeClaimKey(claim.repository, claim.pr)));
-      const tmp = `${file}.${process.pid}.tmp`;
-      await fs.writeFile(tmp, JSON.stringify(claim), "utf8");
-      await fs.rename(tmp, file);
+      await writeClaimAtomic(file, claim);
+    },
+    async compareAndSwap(expected, next) {
+      await fs.mkdir(dir, { recursive: true });
+      const file = path.join(dir, claimFileName(mergeClaimKey(next.repository, next.pr)));
+      if (expected === null) {
+        try {
+          const fh = await fs.open(file, "wx");
+          try {
+            await fh.writeFile(JSON.stringify(next), "utf8");
+          } finally {
+            await fh.close();
+          }
+          return next;
+        } catch (err) {
+          const e = err as NodeJS.ErrnoException;
+          if (e.code === "EEXIST") return null;
+          throw err;
+        }
+      }
+      return withClaimCasLock(`${file}.caslock`, async () => {
+        const current = await readClaimFile(file);
+        if (!mergeClaimsCasEqual(current, expected)) return null;
+        await writeClaimAtomic(file, next);
+        return next;
+      });
     },
   };
 }
@@ -223,6 +346,27 @@ export function bindMergeClaim(input: {
     outcome: "started",
     started_at,
   };
+}
+
+export function transitionMergeClaim(
+  claim: MergeClaim,
+  outcome: MergeClaim["outcome"],
+  now?: Date,
+): MergeClaim {
+  const next: MergeClaim = { ...claim, outcome };
+  if (outcome === "submitted" || outcome === "uncertain") {
+    next.transitioned_at = (now ?? new Date()).toISOString();
+  }
+  return next;
+}
+
+/** True when the operator-frozen scope is empty or exactly the live closing issue. */
+export function frozenIssueScopeMatchesLinkedIssue(
+  frozenIssueScope: readonly number[],
+  linkedIssue: number,
+): boolean {
+  if (frozenIssueScope.length === 0) return true;
+  return frozenIssueScope.length === 1 && frozenIssueScope[0] === linkedIssue;
 }
 
 export function claimsMatchCandidate(
@@ -277,9 +421,11 @@ function mergeSideEffectPending(claim: MergeClaim | null): boolean {
 }
 
 function claimCoolingElapsed(claim: MergeClaim, now: Date): boolean {
-  const started = Date.parse(claim.started_at);
-  if (!Number.isFinite(started)) return false;
-  return now.getTime() - started >= MERGE_COOLING_MS;
+  const raw = claim.transitioned_at;
+  if (!raw) return false;
+  const at = Date.parse(raw);
+  if (!Number.isFinite(at)) return false;
+  return now.getTime() - at >= MERGE_COOLING_MS;
 }
 
 export function decideMergeReplay(input: {

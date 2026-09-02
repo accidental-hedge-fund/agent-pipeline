@@ -72,14 +72,16 @@ function crashDeps(input: {
   const deps: MergeDeps & { mergeCalls: Array<{ pr: number; headRefOid: string }> } = {
     mergeCalls,
     async ghPrView() {
+      const live = typeof input.live === "function" ? input.live() : input.live;
       return {
         mergeable: "MERGEABLE",
         mergeStateStatus: "CLEAN",
         headRefOid: HEAD,
-        state: input.live.state === "merged" ? "MERGED" : "OPEN",
-        mergedAt: input.live.mergedAt ?? null,
-        mergeCommit: input.live.mergeCommitOid
-          ? { oid: input.live.mergeCommitOid }
+        baseRefName: "main",
+        state: live.state === "merged" ? "MERGED" : "OPEN",
+        mergedAt: live.mergedAt ?? null,
+        mergeCommit: live.mergeCommitOid
+          ? { oid: live.mergeCommitOid }
           : null,
       };
     },

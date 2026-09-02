@@ -47,3 +47,28 @@ Before invoking `gh pr merge`, the merge adapter SHALL persist a claim that bind
 - **WHEN** reconciliation shows a head SHA different from the claimed inspected head
 - **THEN** the adapter SHALL NOT submit merge under the stale claim
 - **AND** derived merge authorization SHALL be invalid until a new gate pass
+
+#### Scenario: Claim acquire is exclusive before mutation
+
+- **WHEN** two merge adapters race to persist the exact-candidate claim for the same PR
+- **THEN** only the compare-and-swap winner SHALL call `gh pr merge`
+- **AND** the loser SHALL reconcile or wait without a second mutation
+
+#### Scenario: Frozen scope must match the live closing issue
+
+- **WHEN** merge-queue apply or train supplies frozen issue scope A
+- **AND** the PR's current closing issue is B
+- **THEN** merge SHALL refuse before submission
+- **AND** it SHALL re-check that linkage in the final pre-submit read
+
+#### Scenario: Live PR base must match the configured base
+
+- **WHEN** a fresh candidate read returns `baseRefName` different from the configured base on the claim
+- **THEN** merge SHALL NOT invoke `gh pr merge`
+- **AND** it SHALL re-check `baseRefName` in the final pre-submit read
+
+#### Scenario: Uncertain cooling starts at the uncertain transition
+
+- **WHEN** `gh pr merge` times out after the claim has been `submitted`
+- **THEN** the claim SHALL record a transition timestamp for `uncertain`
+- **AND** the next invoke SHALL cool from that timestamp rather than `started_at`

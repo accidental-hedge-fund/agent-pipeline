@@ -17,6 +17,13 @@ Operator invocation SHALL authorize only the frozen train, merge-queue, or per-P
 - **AND** the original operator envelope SHALL still name the same frozen scope
 - **AND** merge SHALL proceed only after a new exact-candidate gate pass
 
+#### Scenario: Changed base drops derived authorization only
+
+- **WHEN** the live PR `baseRefName` differs from the configured base on the claim
+- **THEN** candidate-bound merge authorization SHALL be invalid
+- **AND** the original operator envelope SHALL still name the same frozen scope
+- **AND** merge SHALL NOT target the retargeted base
+
 #### Scenario: Repository config still cannot authorize merge
 
 - **WHEN** a repository sets any merge-related key in `.github/pipeline.yml`

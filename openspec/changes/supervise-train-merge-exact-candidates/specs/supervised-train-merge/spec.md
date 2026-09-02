@@ -120,6 +120,34 @@ Merge submission SHALL be exactly-once for one valid claim. A completed side eff
 - **THEN** a fresh process SHALL treat the merge as complete for that claim
 - **AND** it SHALL NOT invoke the squash-merge mutation again
 
+#### Scenario: Concurrent processes submit merge at most once
+
+- **WHEN** two processes for the same repository and PR both pass exact-candidate gates
+- **THEN** only the process that atomically acquires the claim transition to `submitted` SHALL invoke the squash-merge mutation
+- **AND** the competing process SHALL reconcile or wait
+- **AND** it SHALL NOT persist a second `submitted` claim for that PR
+
+#### Scenario: Relinked issue refuses the frozen scope
+
+- **WHEN** the frozen candidate scope names issue A
+- **AND** a fresh inspection or final pre-submit read shows the PR currently closes issue B
+- **THEN** the adapter SHALL NOT bind or submit the merge claim
+- **AND** it SHALL NOT invoke the squash-merge mutation
+
+#### Scenario: Retargeted base refuses the configured base
+
+- **WHEN** the claim or supervision records configured base `main`
+- **AND** a fresh inspection or final pre-submit read shows `baseRefName` other than `main`
+- **THEN** the adapter SHALL NOT submit merge
+- **AND** derived candidate-bound authorization SHALL be invalid
+
+#### Scenario: Cooling is measured from the latest submitted or uncertain transition
+
+- **WHEN** a claim enters `submitted` or `uncertain`
+- **THEN** the adapter SHALL persist a transition timestamp for that outcome
+- **AND** replay cooling SHALL use that latest timestamp
+- **AND** it SHALL NOT treat `started_at` as the cooling origin after submission or uncertainty
+
 ---
 
 ### Requirement: Conflict, check drift, head drift, unknown mergeability, timeout, and uncertain merge response SHALL remain owned

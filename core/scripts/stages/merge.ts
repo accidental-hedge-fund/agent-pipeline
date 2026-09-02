@@ -10,11 +10,13 @@
 // Buzz events or deployment grants. Rule #4 from CLAUDE.md applies to the
 // autonomous advance loop; this sub-command remains loop-isolated.
 //
-// gh pr view field shapes (confirmed 2026-06-17 against agent-pipeline PR #219):
+// gh pr view field shapes (confirmed 2026-06-17 against agent-pipeline PR #219;
+//   baseRefName re-confirmed 2026-09-02 against PR #1385):
 //   mergeable: "MERGEABLE" | "CONFLICTING" | "UNKNOWN"
 //   mergeStateStatus: "CLEAN" | "DIRTY" | "UNKNOWN" | "BEHIND" | "BLOCKED" | "HAS_HOOKS"
 //   headRefOid: string  (the head commit SHA at inspection time, threaded to
 //                        --match-head-commit to prevent merging a different head)
+//   baseRefName: string (the live PR base branch; must equal the configured base)
 //
 // gh pr checks --required --json name,bucket (confirmed 2026-06-17):
 //   JSON fields available: bucket, completedAt, description, event, link, name, startedAt, state, workflow
@@ -32,10 +34,13 @@ import {
   bindMergeClaim,
   classifyMergeFault,
   fileMergeClaimStore,
+  frozenIssueScopeMatchesLinkedIssue,
   mergeClaimKey,
   mergeObservation,
   ownedLifecycleForFault,
   observeAndDecide,
+  transitionMergeClaim,
+  type MergeClaim,
   type MergeObservation,
   type MergeSupervisionContext,
 } from "./merge-supervision.ts";
@@ -458,6 +463,7 @@ export interface InspectedMergeCandidate {
   pr: number;
   headRefOid: string;
   linkedIssue: number;
+  baseRefName: string;
 }
 
 export async function inspectMergeCandidate(
@@ -474,15 +480,18 @@ export async function inspectMergeCandidate(
   // mergeable: UNKNOWN is a transient GitHub compute gap (#1071). Re-read under
   // a bounded budget; hard unclean states refuse immediately with zero sleep.
   let headRefOid = "";
+  let baseRefName = "";
   for (let attempt = 1; attempt <= MERGEABILITY_UNKNOWN_MAX_ATTEMPTS; attempt++) {
     const prData = await deps.ghPrView(pr, [
       "mergeable",
       "mergeStateStatus",
       "headRefOid",
+      "baseRefName",
     ]);
     const mergeable = String(prData.mergeable ?? "UNKNOWN");
     const mergeStateStatus = String(prData.mergeStateStatus ?? "UNKNOWN");
     const oid = String(prData.headRefOid ?? "");
+    const base = String(prData.baseRefName ?? "").trim();
 
     if (mergeable === "UNKNOWN") {
       if (attempt < MERGEABILITY_UNKNOWN_MAX_ATTEMPTS) {
@@ -512,6 +521,7 @@ export async function inspectMergeCandidate(
       );
     }
     headRefOid = oid;
+    baseRefName = base;
     break;
   }
 
@@ -585,18 +595,93 @@ export async function inspectMergeCandidate(
     );
   }
 
-  return { pr, headRefOid, linkedIssue };
+  return { pr, headRefOid, linkedIssue, baseRefName };
 }
 
 export type MergeAttemptResult =
   | { kind: "complete"; observation: MergeObservation; mergedNow: boolean }
   | { kind: "owned"; observation: MergeObservation };
 
+function frozenScopeForClaim(
+  supervision: MergeSupervisionContext,
+  linkedIssue: number,
+): readonly number[] {
+  return supervision.frozenIssueScope.length > 0
+    ? supervision.frozenIssueScope
+    : [linkedIssue];
+}
+
+function exactCandidateMismatch(
+  supervision: MergeSupervisionContext,
+  inspected: InspectedMergeCandidate,
+): string | null {
+  if (inspected.baseRefName !== supervision.base.trim()) {
+    return (
+      `PR #${inspected.pr}: live base ${inspected.baseRefName || "(empty)"} ` +
+      `does not match configured base ${supervision.base}`
+    );
+  }
+  if (supervision.frozenIssueScope.length === 0) return null;
+  if (
+    !frozenIssueScopeMatchesLinkedIssue(
+      supervision.frozenIssueScope,
+      inspected.linkedIssue,
+    )
+  ) {
+    return (
+      `PR #${inspected.pr}: live linked issue #${inspected.linkedIssue} ` +
+      `does not match frozen candidate scope [${supervision.frozenIssueScope.join(",")}]`
+    );
+  }
+  return null;
+}
+
+async function readFreshExactCandidate(
+  pr: number,
+  deps: MergeDeps,
+): Promise<{ headRefOid: string; baseRefName: string; linkedIssue: number | null }> {
+  const data = await deps.ghPrView(pr, ["headRefOid", "baseRefName"]);
+  const linkedIssue = await deps.getPrLinkedIssue(pr);
+  return {
+    headRefOid: String(data.headRefOid ?? "").trim(),
+    baseRefName: String(data.baseRefName ?? "").trim(),
+    linkedIssue,
+  };
+}
+
 async function emitObservation(
   deps: MergeDeps,
   observation: MergeObservation,
 ): Promise<void> {
   deps.supervision?.reportObservation?.(observation);
+}
+
+async function ownedHold(
+  deps: MergeDeps,
+  input: {
+    pr: number;
+    repository: string;
+    message: string;
+    claim: MergeClaim | null;
+    inspectedHead?: string | null;
+    fault?: MergeObservation["fault"];
+    certainty?: MergeObservation["certainty"];
+  },
+): Promise<MergeAttemptResult> {
+  const fault = input.fault ?? null;
+  const observation = mergeObservation({
+    pr: input.pr,
+    repository: input.repository,
+    certainty: input.certainty ?? "known_absent",
+    lifecycle: fault ? ownedLifecycleForFault(fault) : "cooling",
+    complete: false,
+    fault,
+    message: input.message,
+    claim: input.claim,
+    inspectedHead: input.inspectedHead,
+  });
+  await emitObservation(deps, observation);
+  return { kind: "owned", observation };
 }
 
 /**
@@ -682,7 +767,20 @@ export async function runMergeAttempt(
       (existing.outcome === "submitted" || existing.outcome === "uncertain")
     ) {
       // Prior side effect is known absent. Record that so later invokes retry.
-      await supervision.claimStore.save({ ...existing, outcome: "started" });
+      const reset = { ...existing, outcome: "started" as const };
+      const swapped = await supervision.claimStore.compareAndSwap(existing, reset);
+      if (!swapped) {
+        return ownedHold(deps, {
+          pr,
+          repository: supervision.repository,
+          message:
+            `PR #${pr}: concurrent merge claim is already owned; reconciling before replay`,
+          claim: await supervision.claimStore.load(
+            mergeClaimKey(supervision.repository, pr),
+          ),
+          inspectedHead: existing.inspected_head,
+        });
+      }
     }
   }
 
@@ -707,10 +805,20 @@ export async function runMergeAttempt(
   }
 
   if (supervision) {
+    const mismatch = exactCandidateMismatch(supervision, inspected);
+    if (mismatch) {
+      return ownedHold(deps, {
+        pr,
+        repository: supervision.repository,
+        message: mismatch,
+        claim: null,
+        inspectedHead: inspected.headRefOid,
+      });
+    }
+
     const liveHead = inspected.headRefOid;
-    const existing = await supervision.claimStore.load(
-      mergeClaimKey(supervision.repository, pr),
-    );
+    const key = mergeClaimKey(supervision.repository, pr);
+    const existing = await supervision.claimStore.load(key);
     if (
       existing &&
       existing.outcome !== "complete" &&
@@ -722,59 +830,167 @@ export async function runMergeAttempt(
       );
     }
 
-    const claim = bindMergeClaim({
+    const desired = bindMergeClaim({
       repository: supervision.repository,
       base: supervision.base,
-      frozenIssueScope:
-        supervision.frozenIssueScope.length > 0
-          ? supervision.frozenIssueScope
-          : [inspected.linkedIssue],
+      frozenIssueScope: frozenScopeForClaim(supervision, inspected.linkedIssue),
       pr,
       inspectedHead: liveHead,
       actionIdentity: supervision.actionIdentity,
       now: supervision.now?.(),
     });
-    await supervision.claimStore.save(claim);
-    const charged = await supervision.claimStore.load(
-      mergeClaimKey(supervision.repository, pr),
-    );
-    if (!charged || charged.outcome !== "started" || charged.inspected_head !== liveHead) {
-      const observation = mergeObservation({
+
+    let charged: MergeClaim | null = null;
+    if (!existing || existing.outcome === "started") {
+      if (!existing) {
+        charged = await supervision.claimStore.compareAndSwap(null, desired);
+        if (!charged) {
+          const raced = await supervision.claimStore.load(key);
+          if (!raced) {
+            return ownedHold(deps, {
+              pr,
+              repository: supervision.repository,
+              message: `merge refused: exact-candidate claim was not persisted before submission`,
+              claim: null,
+              inspectedHead: liveHead,
+            });
+          }
+          if (raced.outcome === "started" && raced.inspected_head === liveHead) {
+            charged = raced;
+          } else {
+            return ownedHold(deps, {
+              pr,
+              repository: supervision.repository,
+              message:
+                `PR #${pr}: concurrent merge claim is already owned; reconciling before replay`,
+              claim: raced,
+              inspectedHead: liveHead,
+            });
+          }
+        }
+      } else if (
+        existing.inspected_head === liveHead &&
+        existing.base === supervision.base.trim() &&
+        existing.frozen_issue_scope.join(",") ===
+          frozenScopeForClaim(supervision, inspected.linkedIssue).join(",")
+      ) {
+        charged = existing;
+      } else {
+        charged = await supervision.claimStore.compareAndSwap(existing, desired);
+        if (!charged) {
+          return ownedHold(deps, {
+            pr,
+            repository: supervision.repository,
+            message:
+              `PR #${pr}: concurrent merge claim is already owned; reconciling before replay`,
+            claim: await supervision.claimStore.load(key),
+            inspectedHead: liveHead,
+          });
+        }
+      }
+    } else {
+      return ownedHold(deps, {
         pr,
         repository: supervision.repository,
-        certainty: "known_absent",
-        lifecycle: "cooling",
-        complete: false,
-        fault: null,
+        message:
+          `PR #${pr}: concurrent merge claim is already owned; reconciling before replay`,
+        claim: existing,
+        inspectedHead: liveHead,
+      });
+    }
+
+    if (!charged || charged.outcome !== "started" || charged.inspected_head !== liveHead) {
+      return ownedHold(deps, {
+        pr,
+        repository: supervision.repository,
         message: `merge refused: exact-candidate claim was not persisted before submission`,
         claim: charged,
         inspectedHead: liveHead,
       });
-      await emitObservation(deps, observation);
-      return { kind: "owned", observation };
+    }
+
+    const fresh = await readFreshExactCandidate(pr, deps);
+    if (fresh.headRefOid !== liveHead) {
+      return ownedHold(deps, {
+        pr,
+        repository: supervision.repository,
+        message:
+          `PR #${pr}: inspected head moved; stale claim and derived merge authorization are invalid`,
+        claim: charged,
+        inspectedHead: fresh.headRefOid,
+        fault: "head_drift",
+      });
+    }
+    if (fresh.baseRefName !== supervision.base.trim()) {
+      return ownedHold(deps, {
+        pr,
+        repository: supervision.repository,
+        message:
+          `PR #${pr}: live base ${fresh.baseRefName || "(empty)"} ` +
+          `does not match configured base ${supervision.base}`,
+        claim: charged,
+        inspectedHead: liveHead,
+      });
+    }
+    if (fresh.linkedIssue === null) {
+      return ownedHold(deps, {
+        pr,
+        repository: supervision.repository,
+        message:
+          `PR #${pr} has no linked pipeline issue (no closing-issue reference found). ` +
+          `Add "Closes #<issue>" to the PR body and retry, or verify the issue link.`,
+        claim: charged,
+        inspectedHead: liveHead,
+      });
+    }
+    if (supervision.frozenIssueScope.length > 0) {
+      if (
+        !frozenIssueScopeMatchesLinkedIssue(
+          supervision.frozenIssueScope,
+          fresh.linkedIssue,
+        )
+      ) {
+        return ownedHold(deps, {
+          pr,
+          repository: supervision.repository,
+          message:
+            `PR #${pr}: live linked issue #${fresh.linkedIssue} ` +
+            `does not match frozen candidate scope [${supervision.frozenIssueScope.join(",")}]`,
+          claim: charged,
+          inspectedHead: liveHead,
+        });
+      }
+    } else if (fresh.linkedIssue !== inspected.linkedIssue) {
+      return ownedHold(deps, {
+        pr,
+        repository: supervision.repository,
+        message:
+          `PR #${pr}: live linked issue #${fresh.linkedIssue} ` +
+          `does not match frozen candidate scope [${inspected.linkedIssue}]`,
+        claim: charged,
+        inspectedHead: liveHead,
+      });
     }
 
     supervision.crashBeforeSubmit?.();
 
-    const submittedClaim = { ...charged, outcome: "submitted" as const };
-    await supervision.claimStore.save(submittedClaim);
-    const pending = await supervision.claimStore.load(
-      mergeClaimKey(supervision.repository, pr),
+    const submittedClaim = transitionMergeClaim(
+      charged,
+      "submitted",
+      supervision.now?.(),
+    );
+    const pending = await supervision.claimStore.compareAndSwap(
+      charged,
+      submittedClaim,
     );
     if (!pending || pending.outcome !== "submitted" || pending.inspected_head !== liveHead) {
-      const observation = mergeObservation({
+      return ownedHold(deps, {
         pr,
         repository: supervision.repository,
-        certainty: "known_absent",
-        lifecycle: "cooling",
-        complete: false,
-        fault: null,
         message: `merge refused: submitted claim was not persisted before mutation`,
         claim: pending,
         inspectedHead: liveHead,
       });
-      await emitObservation(deps, observation);
-      return { kind: "owned", observation };
     }
 
     deps.log(`[pipeline merge] #${pr}: all gates passed — squash-merging and deleting branch...`);
@@ -782,7 +998,11 @@ export async function runMergeAttempt(
       await deps.ghPrMerge(pr, liveHead);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      const uncertainClaim = { ...pending, outcome: "uncertain" as const };
+      const uncertainClaim = transitionMergeClaim(
+        pending,
+        "uncertain",
+        supervision.now?.(),
+      );
       await supervision.claimStore.save(uncertainClaim);
       const { decision, live } = await observeAndDecide({
         pr,
@@ -851,7 +1071,11 @@ export async function runMergeAttempt(
       deps.log(`[pipeline merge] #${pr}: merged successfully.`);
       return { kind: "complete", observation, mergedNow: true };
     }
-    const waitingClaim = { ...pending, outcome: "uncertain" as const };
+    const waitingClaim = transitionMergeClaim(
+      pending,
+      "uncertain",
+      supervision.now?.(),
+    );
     await supervision.claimStore.save(waitingClaim);
     const fault =
       decision.action === "wait" || decision.action === "invalidate"
