@@ -66,6 +66,7 @@ import {
   evaluateShipEndIdentity,
   resolveSelectedPlaybookKind,
 } from "../ship-end-identity.ts";
+import { projectContinuousLiveness } from "../liveness-provider.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -136,6 +137,26 @@ export interface DoctorDeps {
    * cannot activate pinned two-track policy.
    */
   env?: NodeJS.ProcessEnv;
+  /**
+   * Continuous-liveness status for `liveness:continuous` (#1332). Injected so
+   * unit tests never call systemd, launchd, containers, network, git, or a
+   * subprocess. Doctor never invokes restore.
+   */
+  livenessStatus?: () => Promise<{
+    discriminant: "configured" | "available" | "active" | "degraded" | "unavailable";
+    adapter: string | null;
+    liveWorker: boolean;
+    eligibleRuns: number;
+    capabilityCondition: {
+      kind: "typed_capability_condition";
+      reason: string;
+      adapter?: string;
+    } | null;
+  }>;
+  /**
+   * Present only so tests can prove doctor does not restore. Production omits it.
+   */
+  livenessRestore?: () => Promise<unknown>;
 }
 
 export type CheckStatus = "pass" | "fail" | "skip" | "warn";
@@ -148,6 +169,14 @@ export interface CheckResult {
   remediation?: string;
   /** Optional evidence locator (path + digest) for harness-smoke failures. */
   evidence?: { path: string; content_hash: string };
+  /** Continuous-liveness discriminant (#1332). */
+  discriminant?: "configured" | "available" | "active" | "degraded" | "unavailable";
+  /** Typed capability condition when continuous liveness cannot run. */
+  capability_condition?: {
+    kind: "typed_capability_condition";
+    reason: string;
+    adapter?: string;
+  };
 }
 
 export interface CheckOutcome extends CheckResult {
@@ -1306,6 +1335,45 @@ export function buildPreflightChecks(
     },
   });
 
+  // 16. Continuous liveness (#1332). Status only — never restore.
+  checks.push({
+    id: "liveness:continuous",
+    description:
+      "Continuous-liveness keep-alive path (configured / available / active / degraded / unavailable)",
+    run: async (deps) => {
+      const status = deps.livenessStatus
+        ? await deps.livenessStatus()
+        : projectContinuousLiveness({ adapters: [], liveWorker: false });
+      const adapterBit = status.adapter ? ` (adapter ${status.adapter})` : "";
+      const detail = `continuous liveness is ${status.discriminant}${adapterBit}`;
+      const extra = {
+        discriminant: status.discriminant,
+        ...(status.capabilityCondition
+          ? { capability_condition: status.capabilityCondition }
+          : {}),
+      };
+      if (status.discriminant === "unavailable") {
+        return {
+          status: "skip" as const,
+          detail: `${detail} — typed capability condition, not a human hold`,
+          ...extra,
+        };
+      }
+      if (status.discriminant === "degraded") {
+        const adapterName = status.adapter ?? "keep-alive";
+        return {
+          status: "warn" as const,
+          detail,
+          remediation:
+            `Repair the ${adapterName} adapter so it can claim a fence and probe worker identity. ` +
+            "This is a typed capability condition, not a human decision.",
+          ...extra,
+        };
+      }
+      return { status: "pass" as const, detail, ...extra };
+    },
+  });
+
   return checks;
 }
 
@@ -1385,6 +1453,13 @@ export interface DoctorJsonCheck {
   fix: string;
   /** Present when a harness-smoke assertion failure captured a typed artifact. */
   evidence?: { path: string; content_hash: string };
+  /** Continuous-liveness discriminant on `liveness:continuous` (#1332). */
+  discriminant?: "configured" | "available" | "active" | "degraded" | "unavailable";
+  capability_condition?: {
+    kind: "typed_capability_condition";
+    reason: string;
+    adapter?: string;
+  };
 }
 
 export interface DoctorJsonEnvelope {
@@ -1411,6 +1486,8 @@ export function formatDoctorJson(result: PreflightResult): DoctorJsonEnvelope {
       reason: c.detail,
       fix: c.status === "fail" || c.status === "warn" ? (c.remediation ?? "") : "",
       ...(c.evidence ? { evidence: c.evidence } : {}),
+      ...(c.discriminant ? { discriminant: c.discriminant } : {}),
+      ...(c.capability_condition ? { capability_condition: c.capability_condition } : {}),
     })),
   };
 }

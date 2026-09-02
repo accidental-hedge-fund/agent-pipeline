@@ -10,6 +10,11 @@
 #
 # Usage: pipeline-launcher.sh <pipeline-args...>
 #        PIPELINE_LAUNCHER_PRINT=1 pipeline-launcher.sh   # print resolved command only
+#
+# #971 request/receipt/follow baseline: this wrapper execs the pipeline CLI.
+# Dead-worker restore is `pipeline liveness restore`. Follow is `pipeline logs`
+# / `pipeline loop logs`. This launcher is not the lifecycle owner and must
+# not retry a supervised verb or classify recovery.
 set -euo pipefail
 
 resolve() {

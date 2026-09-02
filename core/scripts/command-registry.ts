@@ -398,6 +398,16 @@ export const COMMAND_REGISTRY: Record<string, CommandEntry> = {
     supportsJson: true,
   },
 
+  // Liveness Provider (#1332): discover/claim/reattach only. Not recovery, not merge.
+  liveness: {
+    needsIssueNumber: false,
+    allowedFlags: new Set(["repoPath", "json", "runId"]),
+    needsConfig: false,
+    needsGhAuth: false,
+    mutatesGitHub: false,
+    supportsJson: true,
+  },
+
   config: {
     needsIssueNumber: false,
     allowedFlags: new Set(["repoPath", "profile", "json", "apply", "rel"]),

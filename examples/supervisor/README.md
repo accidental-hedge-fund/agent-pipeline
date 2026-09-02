@@ -37,6 +37,7 @@ FRG checklist: [docs/runbooks/frg-pack-checklist.md](../../docs/runbooks/frg-pac
 3. Do not default to `--merge` unless the deployment config sets `ALLOW_MERGE=1` (or equivalent).
 4. Never put tokens, FRG keys, private channel IDs, or host home paths in the repository.
 5. Observe only an exact event path returned by Pipeline. Never discover a host-global “latest run.”
+6. Reattach a dead worker with `pipeline liveness restore`. Follow with `pipeline logs` / `pipeline loop logs`. Example packs do not classify faults or retry a supervised verb.
 
 ## Quick start — in-engine ship
 

@@ -800,6 +800,7 @@ export function maxPositionalsFor(
     // host-local store verbs with a subcommand: outcomes list|ingest, lineage export|impact|…
     command === "outcomes" ||
     command === "lineage" ||
+    command === "liveness" ||
     // factory-release prepare; factory-pin show|init|promote|rollback (#1114)
     command === "factory-release" ||
     command === "factory-pin"
@@ -852,7 +853,7 @@ export function buildCmd(): Command {
     // Allow 'pipeline run <N> ...', 'pipeline path', 'pipeline config <verb>', and
     // 'pipeline logs <id>' — they pass a second positional Commander would reject.
     .allowExcessArguments(true)
-    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | recover-parked | cleanup | logs | path | config | controls | single | release | ship | factory-gate | factory-release | factory-pin | engine-promote | intake | decompose | triage | roadmap | sweep | grill | merge | merge-queue | train | summary | improve | scoreboard | outcomes | lineage | queue | backfill | evals | loop | correction | handoff | report")
+    .argument("[number]", "issue or PR number (required unless --cleanup or --remove-worktree), or a subcommand: init | doctor | status | unblock | override | recover-parked | cleanup | logs | path | config | controls | single | release | ship | factory-gate | factory-release | factory-pin | engine-promote | intake | decompose | triage | roadmap | sweep | grill | merge | merge-queue | train | summary | improve | scoreboard | outcomes | lineage | liveness | queue | backfill | evals | loop | correction | handoff | report")
     .option("--cleanup", "sweep pipeline-managed worktrees whose PR is merged and exit")
     .option("--init", "ensure pipeline labels and scaffold .github/pipeline.yml (no issue number required)")
     .option("--doctor", "run the deterministic preflight checks before advancing; abort the run on any failure")
@@ -6268,6 +6269,37 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Early liveness dispatch (#1332) — discover/claim/reattach only; no recovery or merge.
+  if (numArg === "liveness") {
+    if (rawArgs.includes("--help") || rawArgs.includes("-h")) {
+      const { LIVENESS_HELP } = await import("./liveness-cli.ts");
+      process.stdout.write(LIVENESS_HELP + "\n");
+      process.exit(0);
+    }
+    const verb = cmd.args[1] as string | undefined;
+    if (verb !== "status" && verb !== "restore") {
+      console.error(
+        'pipeline liveness: expected subcommand "status" or "restore".\n' +
+          "  Usage: pipeline liveness status [--json]\n" +
+          "         pipeline liveness restore [--json] [--run-id <id>]\n" +
+          "  Discover, claim, and reattach only. Does not classify faults, choose recipes, or merge.",
+      );
+      process.exit(2);
+    }
+    try {
+      const { runLivenessCli, productionProviderDeps } = await import("./liveness-cli.ts");
+      const out = await runLivenessCli(
+        { verb, json: !!opts.json, runId: opts.runId },
+        { provider: productionProviderDeps() },
+      );
+      process.stdout.write(out.text + (out.text.endsWith("\n") ? "" : "\n"));
+    } catch (err) {
+      console.error(`pipeline liveness: ${(err as Error).message}`);
+      process.exit(1);
+    }
+    return;
+  }
+
   // Early scoreboard dispatch — no issue number, no config resolution, no GitHub calls.
   // It reads only existing run artifacts under .agent-pipeline/runs.
   if (numArg === "scoreboard") {
@@ -8108,6 +8140,22 @@ export interface RunSubcommandDeps {
   spawnDetached: typeof spawnDetached;
   findGitRoot: typeof findGitRoot;
   cwd: () => string;
+  /**
+   * Same-host dead-wrapper re-entry (#1332). When provided, a dead holder of a
+   * non-terminal run restores through the Liveness Provider instead of minting
+   * a new Logical Operation. Live holders still reject duplicate detach.
+   */
+  restoreDeadDetached?: (input: {
+    issueNumber: number;
+    domain: string;
+  }) => Promise<{
+    ok: boolean;
+    runId: string;
+    logicalOperationId: string;
+    supervisorStarted: boolean;
+    reason?: string;
+    liveHolder?: { pid: number; hostname: string };
+  } | null>;
 }
 const defaultRunSubcommandDeps: RunSubcommandDeps = { spawnDetached, findGitRoot, cwd: () => process.cwd() };
 
@@ -8182,6 +8230,31 @@ export async function handleRunSubcommand(
     // discoverable via the documented contract rather than the wrapper artifacts (#155).
     passArgs.push("--run-id", runStoreRunId);
     if (opts.jsonEvents) passArgs.push("--json-events");
+
+    if (deps.restoreDeadDetached) {
+      const restored = await deps.restoreDeadDetached({ issueNumber: number, domain });
+      if (restored?.reason === "live_holder") {
+        console.error(
+          `pipeline run: issue #${number} is already running` +
+            (restored.liveHolder ? ` (held by PID ${restored.liveHolder.pid})` : "") +
+            ".",
+        );
+        process.exitCode = 1;
+        return;
+      }
+      if (restored?.ok) {
+        console.log(
+          JSON.stringify({
+            schema_version: 1,
+            kind: "liveness_restore",
+            run_id: restored.runId,
+            logical_operation_id: restored.logicalOperationId,
+            restored: true,
+          }),
+        );
+        return;
+      }
+    }
 
     let result: Awaited<ReturnType<typeof spawnDetached>>;
     try {

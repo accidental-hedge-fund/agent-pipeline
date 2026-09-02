@@ -345,6 +345,75 @@ test("handleRunSubcommand: --detach=false does not call spawnDetached", async ()
   }
 });
 
+test("handleRunSubcommand: dead-wrapper restore reattaches existing identity", async () => {
+  let spawned = false;
+  const deps: RunSubcommandDeps = {
+    spawnDetached: async () => {
+      spawned = true;
+      return { runDir: "/tmp/x", pid: 1 };
+    },
+    findGitRoot: () => "/repo",
+    cwd: () => "/repo",
+    restoreDeadDetached: async () => ({
+      ok: true,
+      runId: "99-existing",
+      logicalOperationId: "lop-existing",
+      supervisorStarted: true,
+      reason: "attached",
+    }),
+  };
+  const origExitCode = process.exitCode;
+  const logs: string[] = [];
+  const origLog = console.log;
+  console.log = (msg?: unknown) => {
+    logs.push(String(msg ?? ""));
+  };
+  try {
+    await handleRunSubcommand("99", { detach: true, profile: "codex" } as CliOpts, deps);
+    assert.equal(spawned, false);
+    assert.match(logs.join("\n"), /lop-existing/);
+    assert.match(logs.join("\n"), /99-existing/);
+  } finally {
+    console.log = origLog;
+    process.exitCode = origExitCode;
+  }
+});
+
+test("handleRunSubcommand: live holder still rejects a duplicate detach", async () => {
+  let spawned = false;
+  const deps: RunSubcommandDeps = {
+    spawnDetached: async () => {
+      spawned = true;
+      return { runDir: "/tmp/x", pid: 1 };
+    },
+    findGitRoot: () => "/repo",
+    cwd: () => "/repo",
+    restoreDeadDetached: async () => ({
+      ok: false,
+      runId: "99-live",
+      logicalOperationId: "lop-live",
+      supervisorStarted: false,
+      reason: "live_holder",
+      liveHolder: { pid: 4242, hostname: "host-a" },
+    }),
+  };
+  const origExitCode = process.exitCode;
+  const errs: string[] = [];
+  const origErr = console.error;
+  console.error = (msg?: unknown) => {
+    errs.push(String(msg ?? ""));
+  };
+  try {
+    await handleRunSubcommand("99", { detach: true, profile: "codex" } as CliOpts, deps);
+    assert.equal(spawned, false);
+    assert.equal(process.exitCode, 1);
+    assert.match(errs.join("\n"), /already running/);
+  } finally {
+    console.error = origErr;
+    process.exitCode = origExitCode;
+  }
+});
+
 test("handleRunSubcommand: detach=true calls spawnDetached with the issue number", async () => {
   const called: number[] = [];
   const deps: RunSubcommandDeps = {

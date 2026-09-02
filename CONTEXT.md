@@ -232,8 +232,8 @@ A frozen batch whose terminal proof is exact-candidate integration into its conf
 _Avoid_: fake patch version, release without a tag
 
 **Liveness provider**:
-A host-neutral mechanism that discovers and reattaches the existing durable supervisor on one machine. It restores workers but cannot choose recovery, answer requests, merge, or own a second ledger.
-_Avoid_: second scheduler, host-specific lifecycle controller
+A host-neutral mechanism that discovers and reattaches the existing durable supervisor on one machine. It restores workers but cannot choose recovery, answer requests, merge, or own a second ledger. A dead worker is lost physical liveness (`not-live`), not a logical terminal and not human authority. `pipeline doctor` reports continuous liveness as configured, available, active, or degraded/unavailable. Absence of a keep-alive adapter is a typed capability condition, not a human hold.
+_Avoid_: second scheduler, host-specific lifecycle controller, worker death as needs-human
 
 **Fault matrix**:
 A versioned executable manifest mapping supervised operations, generic fault classes, public entrypoints, and host adapters to required recovery outcomes. Coverage has adapter-contract, installed-CLI, and host-conformance layers. Mechanical exhaustion is owned Cooling, not a human hold and not a command-local STOP.

@@ -31,7 +31,8 @@ pipeline unblock <n> "<answer>"                     Post an answer and clear the
 pipeline override <n> "<key>: <reason>"             Disposition a review finding and auto-resume the advance loop
 pipeline recover-parked <n> [--json] [--dry-run]    One supervisor pass for a parked issue: deterministic recover first (including publish of an unpublished stage commit), then reflow only stale/DNR/below-high residuals (never auto-override HIGH/CRITICAL/security); pre-PR engine parks re-enter without a linked PR; re-enter single if clear
 pipeline summary <issue-number|run-id>              Print the run evidence bundle for an issue number or exact run-id
-pipeline doctor [--json|--is-ok] [--fail-fast] [--harness-smoke] Deterministic preflight check; print summary, exit 0/1. Opt-in --harness-smoke adds one cheap model call per unique configured harness treatment
+pipeline doctor [--json|--is-ok] [--fail-fast] [--harness-smoke] Deterministic preflight check; print summary, exit 0/1. Reports continuous liveness as configured/available/active/degraded/unavailable without treating absence as human authority. Opt-in --harness-smoke adds one cheap model call per unique configured harness treatment
+pipeline liveness status [--json] | pipeline liveness restore [--json] [--run-id <id>] Discover, claim, and reattach machine-local durable supervisors after worker or machine restart (not recovery or merge)
 pipeline init                                       Ensure pipeline labels and scaffold .github/pipeline.yml
 pipeline cleanup                                    Sweep merged-PR worktrees and delete their local branches
 pipeline intake --description "<text>" [--release vX.Y.Z] [--dry-run] Spec a rough description into a GitHub issue and ROADMAP PR
@@ -72,6 +73,9 @@ Do not treat them as seconds-only or as fire-and-forget.
    reference rather than this one-pager for the complete kind inventory.
 6. Reattach an interrupted follow with the same retained ids.
    Interrupted follow is non-terminal. Cancelled wait is not completion.
+   A dead worker is not-live, not completion, and not human authority.
+   Restore with `pipeline liveness restore`. Follow with `pipeline logs` /
+   `pipeline loop logs --events --follow` (portable follow).
 7. Advance `run_complete` stops or replaces only that advance follow.
    Keep the loop follow active while the loop remains live.
 8. Stop the loop-scoped follow set on `loop_run_complete`,
@@ -80,8 +84,9 @@ Do not treat them as seconds-only or as fire-and-forget.
    terminal reason and confirmation that follows stopped. After a confirmed
    terminal direct-advance outcome, emit the same summary for that advance.
 10. Premature supervisor exit is non-terminal failure/recovery, never
-    completion. Tear down every run-scoped follow, then report recovery — do
-    not emit a completion summary.
+    completion. Tear down every run-scoped follow, then invoke
+    `pipeline liveness restore` or portable follow. Do not retry
+    `pipeline single`, classify a recipe, or emit a completion summary.
 
 The follower or observer never invokes a merge-capable command: `merge`,
 `merge-queue --apply`, `train --merge`, or `ship`.

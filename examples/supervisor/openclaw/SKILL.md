@@ -35,6 +35,19 @@ free-form CLI invention.
 - Keep OpenClaw’s tools least-privilege: allow the wrapper script, not arbitrary `git push --force`.
 - Disable merge-capable intents unless the workspace is private and allowlisted.
 
+## Liveness (reattach, not retry)
+
+A dead worker or interrupted follow is non-terminal. It is not human authority.
+
+```bash
+"$PIPELINE" liveness status --json
+"$PIPELINE" liveness restore --json
+"$PIPELINE" logs <run-id> --events --follow
+"$PIPELINE" loop logs <loop-run-id> --events --follow
+```
+
+Do not classify a dead worker. Do not retry `pipeline single` because follow stopped. Do not merge from follow.
+
 ## Status
 
 On completion, surface the JSON printed by `pipeline train --json`

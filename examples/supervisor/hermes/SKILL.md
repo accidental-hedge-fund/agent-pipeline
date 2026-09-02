@@ -170,6 +170,19 @@ path, report typed status and do not guess one. Do not glob latest runs.
 | `release finish 123` | `pipeline release finish 123` if `ALLOW_MERGE=1` |
 | `stop` | stop the detached tugboat/ship process for that milestone if known; do not invent rollback |
 
+## Liveness (reattach, not retry)
+
+A dead worker or interrupted follow is non-terminal. It is not human authority.
+
+```bash
+"$PIPELINE" liveness status --json
+"$PIPELINE" liveness restore --json
+"$PIPELINE" logs <run-id> --events --follow
+"$PIPELINE" loop logs <loop-run-id> --events --follow
+```
+
+Do not classify a dead worker. Do not retry `pipeline single` because follow stopped. Do not merge from follow.
+
 ## What this skill is not
 
 - Not the removed grant-envelope factory under `ops/hermes-factory`

@@ -44,6 +44,7 @@ const EXPECTED_OPERATIONS = new Set([
   "loop",
   "train",
   "ship",
+  "liveness",
 ]);
 
 // ---------------------------------------------------------------------------

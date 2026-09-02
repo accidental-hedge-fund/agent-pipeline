@@ -39,12 +39,17 @@ Regenerate with `node scripts/generate-docs.mjs` (or `npm run docs:generate`).
 #### `doctor`
 
 - **Usage:** `pipeline doctor [--json|--is-ok] [--fail-fast] [--harness-smoke]`
-- **Summary:** Deterministic preflight check; print summary, exit 0/1. Opt-in --harness-smoke adds one cheap model call per unique configured harness treatment
+- **Summary:** Deterministic preflight check; print summary, exit 0/1. Reports continuous liveness as configured/available/active/degraded/unavailable without treating absence as human authority. Opt-in --harness-smoke adds one cheap model call per unique configured harness treatment
 
 #### `init`
 
 - **Usage:** `pipeline init`
 - **Summary:** Ensure pipeline labels and scaffold .github/pipeline.yml
+
+#### `liveness`
+
+- **Usage:** `pipeline liveness status [--json] | pipeline liveness restore [--json] [--run-id <id>]`
+- **Summary:** Discover, claim, and reattach machine-local durable supervisors after worker or machine restart (not recovery or merge)
 
 #### `merge`
 
