@@ -331,6 +331,22 @@ test("selectSchedulableSet: an item carrying unresolved drift is serialized unti
   assert.equal(decision.rationale.find((r) => r.item_id === "1")?.disposition, "unresolved_drift");
 });
 
+test("selectSchedulableSet: reconstructed identity-mismatch is resolved and does not serialize", () => {
+  const contract = makeContract([contractItem("1")]);
+  const ledger = makeLedger([ledgerEntry("1")], {
+    last_reconciliation: {
+      sequence: 1,
+      time: "2026-07-23T00:00:00.000Z",
+      observed: {},
+      drift: [{ item_id: "1", ledger_state: "waiting", observed_state: "x", class: "identity-mismatch" }],
+      next_actions: { "1": "reconstruct" },
+    },
+  });
+  const decision = selectSchedulableSet({ contract, ledger });
+  assert.deepEqual(decision.selected, ["1"]);
+  assert.notEqual(decision.rationale.find((r) => r.item_id === "1")?.disposition, "unresolved_drift");
+});
+
 // ---------------------------------------------------------------------------
 // Determinism.
 // ---------------------------------------------------------------------------

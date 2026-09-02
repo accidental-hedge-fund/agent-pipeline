@@ -134,7 +134,14 @@ export function selectSchedulableSet(input: ScheduleInput): ScheduleDecision {
       (item) => [item.id, { id: item.id, decl: item.ownership, normalized: normalizeOwnership(item.ownership) }] as const,
     ),
   );
-  const unresolvedDriftIds = new Set((ledger.last_reconciliation?.drift ?? []).map((d) => d.item_id));
+  const nextActions = ledger.last_reconciliation?.next_actions ?? {};
+  // Reconstruct (and repair-forward) already rewrote local state this pass.
+  // Remaining drift is an audit record, not an unresolved gate.
+  const unresolvedDriftIds = new Set(
+    (ledger.last_reconciliation?.drift ?? [])
+      .filter((d) => nextActions[d.item_id] !== "reconstruct" && nextActions[d.item_id] !== "repair-forward")
+      .map((d) => d.item_id),
+  );
 
   const selected: string[] = [];
   const rationale: ScheduleRationale[] = [];

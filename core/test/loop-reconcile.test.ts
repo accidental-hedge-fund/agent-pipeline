@@ -457,6 +457,20 @@ test("classifyDrift: an open PR never supersedes blocked recovery, but ready and
   );
 });
 
+test("classifyDrift: waiting/paused/blocked SHA/rebase mismatch is identity-mismatch", () => {
+  const bound = openPrIdentity({ head_sha: "claimed-sha", pipeline_stage: "fix-2" });
+  const live = openPrIdentity({
+    head_sha: "claimed-sha",
+    local_head_sha: "ondisk-sha",
+    rebase_in_progress: true,
+    product_dirt: true,
+    pipeline_stage: "fix-2",
+  });
+  for (const state of ["waiting", "paused", "blocked"] as const) {
+    assert.equal(classifyDrift(state, live, bound), "identity-mismatch", state);
+  }
+});
+
 test("classifyDrift: mid-flight gate is independent of checks conclusion (#712)", () => {
   for (const checks of ["success", "failure", "pending", "none"] as const) {
     assert.equal(
@@ -514,6 +528,17 @@ test("computeNextAction: contradictions never invent human authority", () => {
     assert.equal(computeNextAction("pr_opened", openPrIdentity(), cls, false), "reconstruct");
     assert.notEqual(computeNextAction("pr_opened", openPrIdentity(), cls, false), "hold-for-human");
     assert.notEqual(computeNextAction("pr_opened", openPrIdentity(), cls, false), "noop");
+  }
+});
+
+test("computeNextAction: waiting/paused/blocked contradictions without typed authority reconstruct, not noop", () => {
+  for (const state of ["waiting", "paused", "blocked"] as const) {
+    for (const cls of ["ledger-ahead", "identity-mismatch"] as const) {
+      const action = computeNextAction(state, openPrIdentity(), cls, false, false);
+      assert.equal(action, "reconstruct", `${state} + ${cls}`);
+      assert.notEqual(action, "noop", `${state} + ${cls} must not idle`);
+      assert.notEqual(action, "hold-for-human", `${state} + ${cls} must not invent authority`);
+    }
   }
 });
 
@@ -718,6 +743,91 @@ test("reconcile: external-absent is reconstructed without inventing human author
   assert.notEqual(result.next_actions["100"], "hold-for-human");
   const ledger = await readLedger(deps, "run-1");
   assert.equal(ledger.items["100"].state, "implemented");
+});
+
+function shaMismatchObserveDeps(stage: string): ReturnType<typeof fakeObserveDeps> {
+  return fakeObserveDeps({
+    async getIssueStateAndLabels() {
+      return { state: "open", labels: [`pipeline:${stage}`] };
+    },
+    async findPrForIssue() {
+      return 12;
+    },
+    async getPrDetail() {
+      return { state: "open", head_ref: "pipeline/100-fix", head_sha: "claimed-sha", merge_commit_sha: null };
+    },
+    async getPrChecks() {
+      return [{ bucket: "pass" }];
+    },
+    async getLocalHead() {
+      return { branch: "pipeline/100-fix", sha: "ondisk-sha", rebase_in_progress: true, product_dirt: true };
+    },
+  });
+}
+
+test("reconcile: identity-mismatch on waiting/paused/blocked reconstructs identity without typed authority", async () => {
+  const claimed = openPrIdentity({ head_sha: "claimed-sha", pipeline_stage: "fix-2" });
+  for (const state of ["waiting", "paused", "blocked"] as const) {
+    const stage = state === "blocked" ? "needs-human" : "fix-2";
+    const bound = { ...claimed, pipeline_stage: stage };
+    const { deps, token, files } = await setup(state, {}, {
+      items: {
+        "100": {
+          id: "100",
+          state,
+          history: [],
+          recovery_budgets_remaining: { default: 3 },
+          last_verified_identity: bound,
+        },
+      },
+    });
+    const { deps: observeDeps, calls } = shaMismatchObserveDeps(stage);
+    const result = await reconcile(deps, observeDeps, { runId: "run-1", token, engine: "claude" });
+    assert.equal(result.drift.find((d) => d.item_id === "100")?.class, "identity-mismatch", state);
+    assert.equal(result.next_actions["100"], "reconstruct", state);
+    assert.notEqual(result.next_actions["100"], "noop", state);
+    assert.notEqual(result.next_actions["100"], "hold-for-human", state);
+    const ledger = await readLedger(deps, "run-1");
+    assert.equal(ledger.items["100"].state, state, `${state} must stay RecoverySupervisor-owned`);
+    assert.equal(ledger.items["100"].last_verified_identity?.local_head_sha, "ondisk-sha", state);
+    assert.equal(ledger.items["100"].last_verified_identity?.rebase_in_progress, true, state);
+    assert.match(ledger.items["100"].history.at(-1)?.note ?? "", /reconstructed local state/, state);
+    assert.ok(calls.every((c) => /^(getIssueStateAndLabels|findPrForIssue|listLinkedPrs|getPrDetail|getPrChecks|getLocalHead|baseBranchContainsSha):/.test(c)), state);
+    void files;
+  }
+});
+
+test("reconcile: current typed authority on waiting identity-mismatch still holds and persists identity", async () => {
+  const bound = openPrIdentity({ head_sha: "claimed-sha", pipeline_stage: "fix-2" });
+  const { deps, token } = await setup("waiting", {}, {
+    items: {
+      "100": {
+        id: "100",
+        state: "waiting",
+        history: [],
+        recovery_budgets_remaining: { default: 3 },
+        last_verified_identity: bound,
+        hold_request: {
+          request_id: "hold-100",
+          item_id: "100",
+          kind: "decision",
+          prompt: "Decide",
+          requested_by_engine: "claude",
+          requested_at: "2026-07-23T00:00:00.000Z",
+          authority_evidence_key: "human-decision-required:100",
+          authority_candidate_head: "claimed-sha",
+        },
+      },
+    },
+  });
+  const { deps: observeDeps } = shaMismatchObserveDeps("fix-2");
+  const result = await reconcile(deps, observeDeps, { runId: "run-1", token, engine: "claude" });
+  assert.equal(result.drift.find((d) => d.item_id === "100")?.class, "identity-mismatch");
+  assert.equal(result.next_actions["100"], "hold-for-human");
+  const ledger = await readLedger(deps, "run-1");
+  assert.equal(ledger.items["100"].state, "waiting");
+  assert.equal(ledger.items["100"].last_verified_identity?.local_head_sha, "ondisk-sha");
+  assert.match(ledger.items["100"].history.at(-1)?.note ?? "", /reconstructed local state/);
 });
 
 test("reconcile: the merge barrier clears only when the base branch is verified to contain the merged SHA", async () => {

@@ -157,6 +157,25 @@ test("3.2 contradictions without typed-request evidence return reconstruct", () 
   }
 });
 
+test("3.2 waiting/paused/blocked contradictions without typed authority reconstruct", () => {
+  const live = identity({
+    pr_state: "open",
+    local_head_sha: "b".repeat(40),
+    rebase_in_progress: true,
+    product_dirt: true,
+  });
+  const bound = identity({ head_sha: "a".repeat(40), pr_state: "open" });
+  for (const state of ["waiting", "paused", "blocked"] as const) {
+    assert.equal(classifyDrift(state, live, bound), "identity-mismatch", state);
+    for (const cls of ["ledger-ahead", "identity-mismatch"] as const) {
+      const action = computeNextAction(state, live, cls, false, false);
+      assert.equal(action, "reconstruct", `${state} + ${cls}`);
+      assert.notEqual(action, "noop", `${state} + ${cls}`);
+      assert.notEqual(action, "hold-for-human", `${state} + ${cls}`);
+    }
+  }
+});
+
 test("3.4 hold-for-human still requires current typed-request evidence", () => {
   assert.equal(computeNextAction("waiting", identity(), null, false, true), "hold-for-human");
   assert.equal(

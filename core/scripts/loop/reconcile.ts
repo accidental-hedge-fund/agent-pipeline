@@ -372,6 +372,12 @@ export function reconstructedLocalState(
   identity: LoopExternalIdentity,
   current: LoopItemState,
 ): LoopItemState {
+  // Waiting/paused holds and blocked recovery stay owned; contradiction
+  // reconstruction persists identity/history rather than dropping the hold
+  // or orphaning a started recovery claim at stranded `pr_opened`.
+  if (current === "waiting" || current === "paused" || current === "blocked") {
+    return current;
+  }
   const target = verifiedForwardTarget(identity);
   if (target) return target;
   if (identity.pr_number !== null && identity.pr_state === "open" && isAdvanceStillNeeded(identity)) {
@@ -451,7 +457,7 @@ export function classifyDrift(
     // Only ready/merged truth may supersede blocked recovery state; otherwise
     // an already-claimed action would be orphaned at pr_opened.
     if (target && !(state === "blocked" && target === "pr_opened")) return "ledger-behind";
-    if (state !== "waiting" && state !== "paused" && localRemoteIdentityDrift(identity, bound)) {
+    if (localRemoteIdentityDrift(identity, bound)) {
       return "identity-mismatch";
     }
     return checksRegressed(bound, identity) ? "checks-regressed" : null;
@@ -526,15 +532,8 @@ export function computeNextAction(
 ): LoopNextAction {
   if (drift === "ledger-behind") return "repair-forward";
   if (currentHumanAuthority) return "hold-for-human";
-  if (
-    (drift === "ledger-ahead" || drift === "external-absent" || drift === "identity-mismatch") &&
-    state !== "waiting" &&
-    state !== "paused"
-  ) {
-    return "reconstruct";
-  }
   if (drift === "ledger-ahead" || drift === "external-absent" || drift === "identity-mismatch") {
-    return "noop";
+    return "reconstruct";
   }
   if (drift === "checks-regressed") return identity.checks_conclusion === "pending" ? "await-checks" : "noop";
   // Labels carry workflow state, never authority.
@@ -617,12 +616,9 @@ export async function reconcile(
       }
       items[id] = repaired;
     } else if (
-      (driftClass === "ledger-ahead" ||
-        driftClass === "external-absent" ||
-        driftClass === "identity-mismatch") &&
-      entry.state !== "waiting" &&
-      entry.state !== "paused" &&
-      entry.state !== "blocked"
+      driftClass === "ledger-ahead" ||
+      driftClass === "external-absent" ||
+      driftClass === "identity-mismatch"
     ) {
       const reconstructed = reconstructedLocalState(identity, entry.state);
       const time = deps.now().toISOString();
