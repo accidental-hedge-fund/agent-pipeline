@@ -16,6 +16,7 @@ import {
   ensureAnnotatedReleaseTag,
   hmacPackedCandidateGitShaFromUnknown,
   observeDeploymentAgainstLivePin,
+  observeDeploymentWithFinalPinRecheck,
   observeOriginReleaseTag,
   loadRerunAttemptCount,
   persistShipFactoryReleaseRequest,
@@ -313,6 +314,69 @@ test("matching live pin digest still verifies deployment (#1331)", () => {
   assert.equal(observed.evidence.authorized_digest, mergeHead);
   assert.equal(observed.evidence.live_digest, mergeHead);
   assert.equal(observed.evidence.tag, promotion.tag);
+});
+
+test("pin retarget between pin read and host observation does not verify (#1331)", async () => {
+  const retarget = "e".repeat(40);
+  let pinSha = mergeHead;
+  const observed = await observeDeploymentWithFinalPinRecheck({
+    intent,
+    promotion,
+    observeHosts: async () => {
+      pinSha = retarget;
+      return [{ host: "claude", digest: mergeHead }];
+    },
+    loadPin: async () => ({
+      kind: "ok",
+      pin: { version: intent.version, tag: promotion.tag, git_sha: pinSha },
+    }),
+  });
+  assert.equal(observed.kind, "stale_promotion");
+});
+
+test("pin generation retarget between pin read and host observation does not verify (#1331)", async () => {
+  const generation = "2026-08-09T00:00:00.000Z";
+  let promotedAt = generation;
+  const observed = await observeDeploymentWithFinalPinRecheck({
+    intent,
+    promotion,
+    expectedPinGeneration: {
+      version: intent.version,
+      tag: promotion.tag,
+      git_sha: mergeHead,
+      generation,
+    },
+    observeHosts: async () => {
+      promotedAt = "2026-08-09T00:01:00.000Z";
+      return [{ host: "claude", digest: mergeHead }];
+    },
+    loadPin: async () => ({
+      kind: "ok",
+      pin: {
+        version: intent.version,
+        tag: promotion.tag,
+        git_sha: mergeHead,
+        promoted_at: promotedAt,
+      },
+    }),
+  });
+  assert.equal(observed.kind, "stale_promotion");
+});
+
+test("stable pin after host observation still verifies deployment (#1331)", async () => {
+  const observed = await observeDeploymentWithFinalPinRecheck({
+    intent,
+    promotion,
+    observeHosts: async () => [{ host: "claude", digest: mergeHead }],
+    loadPin: async () => ({
+      kind: "ok",
+      pin: { version: intent.version, tag: promotion.tag, git_sha: mergeHead },
+    }),
+  });
+  assert.equal(observed.kind, "verified");
+  if (observed.kind !== "verified") throw new Error("expected verified");
+  assert.equal(observed.evidence.authorized_digest, mergeHead);
+  assert.equal(observed.evidence.live_digest, mergeHead);
 });
 
 test("reconcile invalidates promotion when the live pin digest moved (#1331)", async () => {

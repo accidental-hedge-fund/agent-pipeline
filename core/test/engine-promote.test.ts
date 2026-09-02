@@ -459,6 +459,63 @@ test("engine-promote: matching digest completes deployment (#1331)", async () =>
   assert.ok(result.steps.some((s) => s.startsWith("verified_digest:")));
 });
 
+test("engine-promote: pin generation retarget during host observation does not verify (#1331)", async () => {
+  const authorized = "b".repeat(40);
+  const current = pin("1.34.0");
+  current.git_sha = authorized;
+  const expected = pinGenerationClaimFromPin(current);
+  assert.ok(expected);
+  const deps = makeDeps({
+    async loadPin() {
+      return { kind: "ok" as const, pin: current, path: "/pin.json" };
+    },
+    async installedDigest() {
+      current.promoted_at = "2026-08-09T00:01:00.000Z";
+      return authorized;
+    },
+  });
+  const result = await runEnginePromote(opts({ host: "codex", expectedPinGeneration: expected }), deps);
+  assert.equal(result.verified, false);
+  assert.equal(result.error, STALE_PIN_GENERATION_ERROR);
+  assert.equal(result.install_ran, true);
+  assert.equal(result.rolled_back, false);
+  assert.equal(deps.rollbacks, 0);
+  assert.deepEqual(deps.installs, ["v1.34.0"]);
+  assert.ok(result.steps.includes("stale_pin_generation"));
+});
+
+test("engine-promote: pin retarget during host observation does not verify (#1331)", async () => {
+  const authorized = "b".repeat(40);
+  const retarget = "e".repeat(40);
+  let liveSha = authorized;
+  const deps = makeDeps({
+    async promote({ version, gitSha }) {
+      liveSha = String(gitSha ?? authorized);
+      const promoted = pin(version);
+      promoted.git_sha = liveSha;
+      return { ok: true, pin: promoted, path: "/pin.json", reinstall_hint: `npx #v${version}` };
+    },
+    async loadPin() {
+      const current = pin("1.34.0");
+      current.git_sha = liveSha;
+      return { kind: "ok" as const, pin: current, path: "/pin.json" };
+    },
+    async installedDigest() {
+      liveSha = retarget;
+      return authorized;
+    },
+    async resolvePromoteGitSha() {
+      return authorized;
+    },
+  });
+  const result = await runEnginePromote(opts({ host: "codex" }), deps);
+  assert.equal(result.verified, false);
+  assert.match(result.error ?? "", /production pin no longer matches/);
+  assert.equal(result.rolled_back, false);
+  assert.equal(deps.rollbacks, 0);
+  assert.ok(result.steps.includes("stale_pin_generation"));
+});
+
 test("engine-promote: wrong host digest does not complete (#1331)", async () => {
   const authorized = "b".repeat(40);
   const deps = makeDeps({

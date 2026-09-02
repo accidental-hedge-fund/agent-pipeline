@@ -147,6 +147,14 @@ Authority SHALL survive safe retry only while operation, repository, candidate, 
 - **THEN** deployment SHALL fail without installing
 - **AND** it SHALL NOT rewrite the pin to restore the preflight target
 
+#### Scenario: Pin retarget during final digest observation does not complete
+
+- **WHEN** deployment has collected live-host digest observations for the authorized pin
+- **AND** the production pin is rewritten to a different digest or generation before those observations are recorded as verified
+- **THEN** the observer SHALL reload the pin after host observation
+- **AND** the deployment phase SHALL NOT complete on the stale pin snapshot
+- **AND** RecoverySupervisor SHALL keep the operation owned
+
 #### Scenario: Event notify cannot authorize rollback
 
 - **WHEN** a channel adapter delivers a ship failure event

@@ -21,6 +21,7 @@
 ## 4. Deployment digest and protected rollback
 
 - [x] 4.1 Prove engine-promote deployment by live installed digest matching the authorized published artifact, and verify a matching version string with a wrong digest does not complete
+- [x] 4.5 Reload the production pin after live-host digest observation and refuse verified deployment when the pin identity moved, and verify a same-version retarget between pin read and host observation stays owned
 - [x] 4.2 Remove auto-rollback and previous-tag reinstall from engine-promote install/verify failure paths, and verify those paths do not call `rollbackProductionPin`
 - [x] 4.3 Keep `pipeline factory-pin rollback` as the rollback mutation under RecoverySupervisor, and verify automatic rollback without an envelope naming the operation and retained target is refused
 - [x] 4.4 Document that generic deployment failure grants no rollback authority, and verify CLI / FRG runbook copy does not tell engine-promote to roll back on install failure

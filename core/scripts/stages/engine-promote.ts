@@ -559,6 +559,18 @@ export async function runEnginePromote(
   for (const selectedHost of selectedPromoteHosts(host)) {
     observations.push({ host: selectedHost, digest: await deps.installedDigest(selectedHost) });
   }
+  const livePin = await deps.loadPin({
+    repoDir: opts.repoDir,
+    overridePath: opts.pinPath,
+  });
+  const generationClaim = expectedPinGeneration ?? (base.pin ? pinGenerationClaimFromPin(base.pin) : null);
+  if (generationClaim) {
+    if (livePin.kind !== "ok" || !pinMatchesGenerationClaim(livePin.pin, generationClaim)) {
+      return { ...stalePinGeneration(livePin), install_ran: base.install_ran };
+    }
+    base.pin = livePin.pin;
+    base.pin_path = livePin.path;
+  }
   const authorizedDigest = (base.pin?.git_sha ?? gitSha ?? "").trim().toLowerCase();
   const versionMatches = Boolean(installed && installed.replace(/^[vV]/, "") === version);
   const digestProof = matchingLiveDigestForHosts(observations, authorizedDigest);

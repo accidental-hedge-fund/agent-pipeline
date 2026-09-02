@@ -18,11 +18,19 @@ A successful `pipeline engine-promote` deployment SHALL prove the authorized pub
 - **AND** the production pin names that same identity
 - **THEN** engine-promote MAY report verified deployment success
 
+#### Scenario: Pin retarget during final digest observation does not complete
+
+- **WHEN** engine-promote has observed live host digests matching the authorized candidate
+- **AND** the production pin is rewritten to a different digest before verified success is recorded
+- **THEN** engine-promote SHALL reload the pin after host observation
+- **AND** it SHALL NOT report verified deployment success
+- **AND** RecoverySupervisor SHALL keep the deployment operation owned
+
 ---
 
 ### Requirement: Deployment SHALL bind install to a pin-generation compare-and-swap
 
-When ship deployment installs, `runEnginePromote` SHALL verify the expected pin generation immediately before mutation. If the live pin identity no longer matches that claim, the path SHALL fail without installing and SHALL NOT rewrite the pin to restore the prior target. After mutation the same generation-bound claim SHALL be reconciled again.
+When ship deployment installs, `runEnginePromote` SHALL verify the expected pin generation immediately before mutation. If the live pin identity no longer matches that claim, the path SHALL fail without installing and SHALL NOT rewrite the pin to restore the prior target. After host-digest observation the same generation-bound claim SHALL be reloaded and SHALL still hold before verified success is recorded.
 
 #### Scenario: Retarget after preflight refuses install
 
@@ -30,6 +38,14 @@ When ship deployment installs, `runEnginePromote` SHALL verify the expected pin 
 - **AND** another actor retargets the production pin before install
 - **THEN** engine-promote SHALL fail without installing
 - **AND** it SHALL NOT promote the pin back to the stale authorized digest
+
+#### Scenario: Pin generation retarget during final digest observation does not complete
+
+- **WHEN** engine-promote has observed live host digests matching the authorized candidate
+- **AND** the production pin generation changes before verified success is recorded
+- **THEN** engine-promote SHALL reload the pin after host observation
+- **AND** it SHALL NOT report verified deployment success
+- **AND** RecoverySupervisor SHALL keep the deployment operation owned
 
 ---
 

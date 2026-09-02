@@ -113,11 +113,11 @@ import {
   DEFAULT_ENGINE_PROMOTE_HOST,
   matchingLiveDigestForHosts,
   pinGenerationClaimFromPin,
-  pinMatchesGenerationClaim,
   realEnginePromoteDeps,
   runEnginePromote,
   selectedPromoteHosts,
   STALE_PIN_GENERATION_ERROR,
+  type PinGenerationClaim,
 } from "./engine-promote.ts";
 import { ownerRepoFromPackageRepository } from "../production-engine-pin.ts";
 
@@ -350,6 +350,45 @@ export function observeDeploymentAgainstLivePin(opts: {
       verified: true,
     },
   };
+}
+
+/**
+ * Reload the production pin after live-host digest observation.
+ * A retarget between an earlier pin snapshot and host observation is
+ * stale promotion, not verified deployment.
+ */
+export async function observeDeploymentWithFinalPinRecheck(opts: {
+  intent: { version: string };
+  promotion: { tag: string; pin_digest: string };
+  loadPin: () => Promise<{
+    kind: string;
+    pin?: { version?: string; tag?: string; git_sha?: string | null; promoted_at?: string };
+  }>;
+  observeHosts: () => Promise<ReadonlyArray<{ host: string; digest: string | null }>>;
+  expectedPinGeneration?: PinGenerationClaim | null;
+}): Promise<LivePinDeploymentObservation> {
+  const hostObservations = await opts.observeHosts();
+  const pin = await opts.loadPin();
+  const claim = opts.expectedPinGeneration;
+  if (claim) {
+    const gitSha = String(pin.pin?.git_sha ?? "").trim().toLowerCase();
+    const generation = String(pin.pin?.promoted_at ?? "").trim();
+    if (
+      pin.kind !== "ok" ||
+      pin.pin?.version !== claim.version ||
+      pin.pin?.tag !== claim.tag ||
+      gitSha !== claim.git_sha ||
+      generation !== claim.generation
+    ) {
+      return { kind: "stale_promotion" };
+    }
+  }
+  return observeDeploymentAgainstLivePin({
+    intent: opts.intent,
+    promotion: opts.promotion,
+    pin,
+    hostObservations,
+  });
 }
 
 function isReleaseTagInvariantError(err: unknown): boolean {
@@ -1385,32 +1424,38 @@ function realShipAdapterOperations(opts: RealShipCoordinatorDepsOptions): ShipAd
       };
     },
     async observeDeployment(intent, promotion) {
-      const pin = await engineDeps.loadPin({ repoDir: opts.repoDir });
-      const observations = [];
-      for (const host of selectedPromoteHosts(DEFAULT_ENGINE_PROMOTE_HOST)) {
-        observations.push({ host, digest: await engineDeps.installedDigest(host) });
-      }
-      const observed = observeDeploymentAgainstLivePin({
+      const observed = await observeDeploymentWithFinalPinRecheck({
         intent,
         promotion,
-        pin,
-        hostObservations: observations,
+        loadPin: () => engineDeps.loadPin({ repoDir: opts.repoDir }),
+        observeHosts: async () => {
+          const observations = [];
+          for (const host of selectedPromoteHosts(DEFAULT_ENGINE_PROMOTE_HOST)) {
+            observations.push({ host, digest: await engineDeps.installedDigest(host) });
+          }
+          return observations;
+        },
       });
       if (observed.kind === "verified") return observed.evidence;
       return null;
     },
     async deploy(intent, promotion) {
-      const pinBefore = await engineDeps.loadPin({ repoDir: opts.repoDir });
       const hosts = selectedPromoteHosts(DEFAULT_ENGINE_PROMOTE_HOST);
-      const observationsBefore = [];
-      for (const host of hosts) {
-        observationsBefore.push({ host, digest: await engineDeps.installedDigest(host) });
-      }
+      const loadPin = () => engineDeps.loadPin({ repoDir: opts.repoDir });
+      const observeHosts = async () => {
+        const observations = [];
+        for (const host of hosts) {
+          observations.push({ host, digest: await engineDeps.installedDigest(host) });
+        }
+        return observations;
+      };
+      const hostObservationsBefore = await observeHosts();
+      const pinBefore = await loadPin();
       const before = observeDeploymentAgainstLivePin({
         intent,
         promotion,
         pin: pinBefore,
-        hostObservations: observationsBefore,
+        hostObservations: hostObservationsBefore,
       });
       if (before.kind === "stale_promotion") {
         throw new Error(STALE_PIN_GENERATION_ERROR);
@@ -1436,19 +1481,12 @@ function realShipAdapterOperations(opts: RealShipCoordinatorDepsOptions): ShipAd
       if (!result.verified || result.error) {
         throw new Error(`ship deployment: ${result.error ?? "live digest was not verified"}`);
       }
-      const pinAfter = await engineDeps.loadPin({ repoDir: opts.repoDir });
-      if (pinAfter.kind !== "ok" || !pinMatchesGenerationClaim(pinAfter.pin, expectedPinGeneration)) {
-        throw new Error(STALE_PIN_GENERATION_ERROR);
-      }
-      const observationsAfter = [];
-      for (const host of hosts) {
-        observationsAfter.push({ host, digest: await engineDeps.installedDigest(host) });
-      }
-      const after = observeDeploymentAgainstLivePin({
+      const after = await observeDeploymentWithFinalPinRecheck({
         intent,
         promotion,
-        pin: pinAfter,
-        hostObservations: observationsAfter,
+        loadPin,
+        observeHosts,
+        expectedPinGeneration,
       });
       if (after.kind === "stale_promotion") {
         throw new Error(STALE_PIN_GENERATION_ERROR);
