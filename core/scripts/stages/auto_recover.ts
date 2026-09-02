@@ -22,9 +22,10 @@ import {
 } from "../worktree.ts";
 import {
   claimOrResumeRecoveryEpisode,
+  countRecoveryEpisodeTreatments,
   recordRecoveryEpisodeTreatment,
 } from "../issue-stage-adapters.ts";
-import { emptyStageAttemptLedger } from "../stage-attempt-ledger.ts";
+import { emptyStageAttemptLedger, hydrateStageAttemptLedger, type StageAttemptLedger } from "../stage-attempt-ledger.ts";
 import {
   defaultRecoverySupervisorReport,
   type ReportOperationObservation,
@@ -118,6 +119,8 @@ export interface AutoRecoverDeps {
   ) => Promise<void>;
   reportObservation?: ReportOperationObservation;
   logicalOperationId?: string | null;
+  /** Injected Recovery Episode ledger. Production hydrates from runDir. */
+  stageAttemptLedger?: StageAttemptLedger;
 }
 
 const defaultAutoRecoverDeps: AutoRecoverDeps = {
@@ -166,18 +169,26 @@ export async function tryAutoRecover(
 
   const detail = await deps.getIssueDetail(cfg, issueNumber);
   // Dedupe by round token so a retried marker post doesn't inflate the count.
-  const recoveryCount = countRecoveryAttempts(detail.comments);
+  const commentCount = countRecoveryAttempts(detail.comments);
+  const hydrated = hydrateStageAttemptLedger(runDir);
+  let ledger = deps.stageAttemptLedger ?? (hydrated.ok ? hydrated.ledger : emptyStageAttemptLedger());
+  const ledgerCount = countRecoveryEpisodeTreatments(ledger, String(issueNumber));
+  // Ledger is production authority when it has treatments. Comments are
+  // compatibility fallback only — never the sole cap authority (#1328).
+  const recoveryCount = ledgerCount > 0 ? ledgerCount : commentCount;
 
   if (recoveryCount >= cfg.auto_recovery_max_retries) {
     // Compatibility observation only. Comment-counted cap cannot terminalize
     // or end RecoverySupervisor ownership (#1328).
     report(episode);
     recordRecoveryEpisodeTreatment({
-      ledger: emptyStageAttemptLedger(),
+      ledger,
       headSha: "unresolved",
       action: "no_run_recovery",
       itemId: String(issueNumber),
+      evidenceFingerprint: `auto-recover-cap-${recoveryCount}`,
       typedReason: "auto-recovery-cap-cooling",
+      runDir: deps.stageAttemptLedger ? undefined : runDir,
     });
     return {
       advanced: false,
@@ -228,6 +239,16 @@ export async function tryAutoRecover(
   );
 
   await deps.postComment(cfg, issueNumber, buildAutoRecoveryComment(cfg, recoveryCount));
+
+  recordRecoveryEpisodeTreatment({
+    ledger,
+    headSha: "unresolved",
+    action: "no_run_recovery",
+    itemId: String(issueNumber),
+    evidenceFingerprint: `auto-recover-${recoveryCount + 1}`,
+    typedReason: "auto-recover-reset-to-ready",
+    runDir: deps.stageAttemptLedger ? undefined : runDir,
+  });
 
   // Evidence bundle (#147): record the recovery event. Best-effort + gated on
   // stateDir, so unit tests have no filesystem side effects.

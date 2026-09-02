@@ -13,6 +13,7 @@ import {
   getOnDiskForIssue,
   gitInWorktree,
   branchName,
+  isOccupiedWorktreeFault,
 } from "../worktree.ts";
 import {
   PIPELINE_INTERNAL_MARKER_FILES,
@@ -365,6 +366,10 @@ export async function maybeArchiveOpenspec(
       runStoreDeps: deps.runStoreDeps,
     });
     if (remat.result === "fail") {
+      if (isOccupiedWorktreeFault(remat)) {
+        await recordDecision("skipped", remat.reason);
+        return { advanced: false, status: "waiting", reason: remat.reason };
+      }
       const activePart = membershipUnconfirmed
         ? `PR-head OpenSpec membership unconfirmed (${listingError})`
         : `active OpenSpec change(s) still on the PR tip: ${remaining.join(", ")}`;

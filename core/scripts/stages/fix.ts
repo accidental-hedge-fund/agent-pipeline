@@ -38,6 +38,7 @@ import {
   ensureManagedWorktree,
   getOnDiskForIssue,
   gitInWorktree,
+  isOccupiedWorktreeFault,
   reattachIfDetached,
   renderWorktreeStateSection,
   resolveOpenPrHeadForBranch,
@@ -62,6 +63,10 @@ import {
   FIX_RETRY_MIN_BUDGET_SEC as SUPERVISOR_FIX_RETRY_MIN_BUDGET_SEC,
   runOwnedFixAttempts,
 } from "../issue-stage-adapters.ts";
+import {
+  defaultRecoverySupervisorReport,
+  type ReportOperationObservation,
+} from "../operation-observation.ts";
 import { runHarnessRound, type HarnessRoundContext } from "../harness-round.ts";
 import {
   evaluatePostHarnessNoNewCommit,
@@ -134,6 +139,9 @@ export interface AdvanceFixOpts {
   /** Injectable HTTP deps for external stage executor dispatch (#314). Tests
    *  supply a fake `fetchImpl` so no real network call is made. */
   executorHttpDeps?: ExecutorHttpDeps;
+  /** RecoverySupervisor observation sink (#1328). */
+  reportObservation?: ReportOperationObservation;
+  logicalOperationId?: string | null;
 }
 
 /** Injectable seams for {@link advanceFix} — overridable in tests. */
@@ -320,6 +328,16 @@ export interface FixHarnessRetryOpts {
   fixTimeoutSec: number;
   /** Attempt 1's prompt, byte-identical to the pre-#486 prompt. */
   basePrompt: string;
+  /** RecoverySupervisor observation sink. Defaults to the production sink. */
+  reportObservation?: ReportOperationObservation;
+  identity?: {
+    domain: string;
+    logical_operation_id?: string | null;
+    repository?: string | null;
+    issue?: number | null;
+    run_id?: string | null;
+    stage?: "fix-1" | "fix-2";
+  };
   /** Invoke the harness for one attempt with the given (possibly
    *  retry-addendum-prefixed) prompt and timeout budget. */
   invokeAttempt: (prompt: string, timeoutSec: number) => Promise<HarnessResult>;
@@ -358,6 +376,8 @@ export async function invokeFixHarnessWithRetry(
     onBeforeAttempt: opts.onBeforeAttempt,
     onRetryScheduled: opts.onRetryScheduled,
     nowMs: opts.nowMs,
+    reportObservation: opts.reportObservation ?? defaultRecoverySupervisorReport,
+    identity: opts.identity,
   });
   return {
     attempts: owned.attempts.map((a) => ({
@@ -544,6 +564,9 @@ export async function advanceFix(
       runStoreDeps: opts.runStoreDeps,
     });
     if (remat.result === "fail") {
+      if (isOccupiedWorktreeFault(remat)) {
+        return { advanced: false, status: "waiting", reason: remat.reason };
+      }
       const reason =
         `No worktree found and rematerialize failed (${remat.blockerKind}): ${remat.reason}`;
       // Separate calls keep explicit BlockerKind string literals visible to the
@@ -839,6 +862,15 @@ export async function advanceFix(
         maxRetries: cfg.auto_recovery_max_retries,
         fixTimeoutSec: cfg.fix_timeout,
         basePrompt: prompt,
+        reportObservation: opts.reportObservation,
+        identity: {
+          domain: cfg.domain ?? "unknown",
+          logical_operation_id: opts.logicalOperationId,
+          repository: cfg.repo,
+          issue: issueNumber,
+          run_id: pipelineRunId,
+          stage,
+        },
         invokeAttempt: deps.invokeFixHarnessAttempt ?? invokeAttempt,
         onBeforeAttempt: async (attempt, _timeoutSec, attemptPrompt) => {
           if (!opts.stateDir) return;

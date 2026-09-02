@@ -1151,9 +1151,27 @@ async function dispatchStageHandler(
     case "review-2":
       return reviewStage.advanceReview(cfg, issueNumber, 2, { dryRun, model, pipelineRunId, stateDir, runDir, runStoreDeps });
     case "fix-1":
-      return fixStage.advanceFix(cfg, issueNumber, 1, { dryRun, model, pipelineRunId, stateDir, runDir, runStoreDeps });
+      return fixStage.advanceFix(cfg, issueNumber, 1, {
+        dryRun,
+        model,
+        pipelineRunId,
+        stateDir,
+        runDir,
+        runStoreDeps,
+        reportObservation: opts.reportObservation,
+        logicalOperationId: opts.logicalOperationId,
+      });
     case "fix-2":
-      return fixStage.advanceFix(cfg, issueNumber, 2, { dryRun, model, pipelineRunId, stateDir, runDir, runStoreDeps });
+      return fixStage.advanceFix(cfg, issueNumber, 2, {
+        dryRun,
+        model,
+        pipelineRunId,
+        stateDir,
+        runDir,
+        runStoreDeps,
+        reportObservation: opts.reportObservation,
+        logicalOperationId: opts.logicalOperationId,
+      });
     case "pre-merge":
       // Use the polling wrapper, not bare advance(). Bare advance returns
       // "waiting" after docs push / on pending CI / after rebase — that

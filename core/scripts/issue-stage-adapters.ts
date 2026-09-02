@@ -8,7 +8,9 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { deriveMigratedOutcome, type MigratedOutcome } from "./escalation-dispositions.ts";
 import {
+  consumeOwnedOperation,
   mechanicalFaultObservation,
   mintObservationIdentity,
   ownedAdmissionObservation,
@@ -20,8 +22,12 @@ import {
   type ReportOperationObservation,
   type SideEffectCertainty,
 } from "./operation-observation.ts";
-import { claimStageAttempt, type StageAttemptLedger } from "./stage-attempt-ledger.ts";
-import type { Outcome, PipelineConfig } from "./types.ts";
+import {
+  claimStageAttempt,
+  persistStageAttemptLedger,
+  type StageAttemptLedger,
+} from "./stage-attempt-ledger.ts";
+import type { BlockerKind, Outcome, PipelineConfig } from "./types.ts";
 
 export const DELIVERY_STAGE_OPERATION = "issue_delivery_stage" as const;
 
@@ -421,8 +427,13 @@ export function observationFromAdapterAttempt(input: AdapterAttemptInput): Opera
       capability_request: null,
     };
   }
+  const occupied = isOccupiedOutcome(outcome);
   const lifecycle: ObservationLifecycleState =
-    outcome.status === "waiting" ? "waiting" : outcome.status === "finalized" && proven ? "complete" : "cooling";
+    outcome.status === "waiting" || occupied
+      ? "waiting"
+      : outcome.status === "finalized" && proven
+        ? "complete"
+        : "cooling";
   const fault =
     outcome.status === "blocked"
       ? outcome.blockerKind ?? "mechanical"
@@ -447,6 +458,87 @@ export function observationFromAdapterAttempt(input: AdapterAttemptInput): Opera
     message: input.message ?? outcome.reason,
     capability_request: null,
   };
+}
+
+function isOccupiedOutcome(outcome: Outcome | undefined, message?: string): boolean {
+  const text = `${outcome?.reason ?? ""} ${message ?? ""}`;
+  return /\boccupied\b/i.test(text);
+}
+
+export interface IssueStageSupervisorDecision {
+  treatment: MigratedOutcome;
+  owned: true;
+  complete: boolean;
+  cancelled: false;
+  human_owned: false;
+  lifecycle: ObservationLifecycleState;
+}
+
+/**
+ * RecoverySupervisor treatment selection for one issue-stage observation.
+ * Adapters report; this owner chooses Cooling, wait, re-entry, typed request,
+ * compatibility park, or authenticated cancellation. Mechanical faults never
+ * mark the Logical Operation complete, cancelled, or human-owned.
+ */
+export function reconcileIssueStageObservation(
+  obs: OperationObservation,
+  outcome?: Outcome,
+): IssueStageSupervisorDecision {
+  if (outcome?.advanced && obs.complete) {
+    return {
+      treatment: "re-entry",
+      owned: true,
+      complete: true,
+      cancelled: false,
+      human_owned: false,
+      lifecycle: "complete",
+    };
+  }
+  const occupied = isOccupiedOutcome(outcome, obs.message);
+  const blocker = (outcome?.status === "blocked" ? outcome.blockerKind : undefined) as
+    | BlockerKind
+    | undefined;
+  const treatment: MigratedOutcome = occupied
+    ? "external-condition wait"
+    : deriveMigratedOutcome({
+        blocker_kind: blocker ?? null,
+        canonical_reason: obs.fault ?? "",
+      });
+  const lifecycle: ObservationLifecycleState =
+    treatment === "external-condition wait"
+      ? "waiting"
+      : treatment === "re-entry"
+        ? "active"
+        : "cooling";
+  return {
+    treatment,
+    owned: true,
+    complete: false,
+    cancelled: false,
+    human_owned: false,
+    lifecycle,
+  };
+}
+
+/** Process stop follows supervisor treatment; ownership stays with RecoverySupervisor. */
+export function applySupervisorProcessOutcome(
+  obs: OperationObservation,
+  outcome: Outcome,
+): Outcome {
+  if (outcome.advanced) return outcome;
+  const decision = reconcileIssueStageObservation(obs, outcome);
+  if (decision.treatment === "external-condition wait" && outcome.status !== "waiting") {
+    return { advanced: false, status: "waiting", reason: outcome.reason ?? obs.message };
+  }
+  return outcome;
+}
+
+function consumeReportedOwned(obs: OperationObservation): void {
+  consumeOwnedOperation({
+    ...obs,
+    observation_id: `${obs.logical_operation_id}:${obs.form_id}:${obs.operation}`,
+    recorded_at: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
+  });
 }
 
 export interface RunDeliveryStageAdapterInput {
@@ -478,10 +570,23 @@ export async function runDeliveryStageAdapter(input: RunDeliveryStageAdapterInpu
       outcome,
       postconditionProven: input.postconditionProven,
     });
-    reportOwnedOperation(input.reportObservation, obs);
-    return outcome;
+    const reported = reportOwnedOperation(input.reportObservation, obs);
+    if (!reported.complete) consumeReportedOwned(reported);
+    const decision = reconcileIssueStageObservation(reported, outcome);
+    if (decision.treatment === "re-entry" && !outcome.advanced && outcome.blockerKind === "head-drift") {
+      const retry = await input.attempt();
+      const retryObs = observationFromAdapterAttempt({
+        ...base,
+        outcome: retry,
+        postconditionProven: input.postconditionProven,
+      });
+      const reportedRetry = reportOwnedOperation(input.reportObservation, retryObs);
+      if (!reportedRetry.complete) consumeReportedOwned(reportedRetry);
+      return applySupervisorProcessOutcome(reportedRetry, retry);
+    }
+    return applySupervisorProcessOutcome(reported, outcome);
   } catch (error) {
-    reportMechanicalFault(input.reportObservation, {
+    const faultObs = reportMechanicalFault(input.reportObservation, {
       operation: input.stage,
       form_id: formIdForStage(input.stage),
       message: error instanceof Error ? error.message : String(error),
@@ -493,6 +598,7 @@ export async function runDeliveryStageAdapter(input: RunDeliveryStageAdapterInpu
       fault: "mechanical",
       certainty: "uncertain",
     });
+    consumeReportedOwned(faultObs);
     throw error;
   }
 }
@@ -531,6 +637,7 @@ export function recordRecoveryEpisodeTreatment(input: {
   itemId?: string;
   evidenceFingerprint?: string;
   typedReason?: string;
+  runDir?: string;
 }): StageAttemptLedger {
   const claimed = claimStageAttempt(input.ledger, {
     headSha: input.headSha,
@@ -540,7 +647,16 @@ export function recordRecoveryEpisodeTreatment(input: {
     typedReason: input.typedReason,
     budgetBefore: 1,
   });
+  if (input.runDir) persistStageAttemptLedger(input.runDir, claimed.ledger);
   return claimed.ledger;
+}
+
+export function countRecoveryEpisodeTreatments(
+  ledger: StageAttemptLedger,
+  itemId: string,
+  action: "worktree_rematerialize" | "no_run_recovery" = "no_run_recovery",
+): number {
+  return ledger.attempts.filter((a) => a.action === action && a.item_id === itemId).length;
 }
 
 export const FIX_RETRY_MIN_BUDGET_SEC = 60;

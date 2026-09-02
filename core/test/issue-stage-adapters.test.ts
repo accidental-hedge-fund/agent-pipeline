@@ -2,7 +2,7 @@
 // Hermetic: injected fakes only — no real network, git, or subprocess.
 
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -16,6 +16,7 @@ import {
 } from "../scripts/operation-observation.ts";
 import {
   DELIVERY_STAGES,
+  applySupervisorProcessOutcome,
   assertNoSuperviseAdvanceCommand,
   canStartFixReentry,
   candidateEpochChanged,
@@ -23,12 +24,14 @@ import {
   collectForbiddenAdapterTreatments,
   collectForbiddenLifecycleRetries,
   collectWorktreeRematerializeBypasses,
+  countRecoveryEpisodeTreatments,
   deliveryStageInvariant,
   isAuthorityHoldValidForCandidate,
   isCandidateBoundEvidenceValid,
   isDeliveryStage,
   missingDeliveryStageInvariants,
   observationFromAdapterAttempt,
+  reconcileIssueStageObservation,
   remainingFixTimeoutSec,
   runDeliveryStageAdapter,
   runOwnedFixAttempts,
@@ -40,6 +43,8 @@ import { emptyStageAttemptLedger } from "../scripts/stage-attempt-ledger.ts";
 import { STAGES, type Outcome, type PipelineConfig } from "../scripts/types.ts";
 import {
   ensureManagedWorktree,
+  isOccupiedWorktreeFault,
+  projectManagedWorktreeFault,
   type EnsureManagedWorktreeDeps,
 } from "../scripts/worktree.ts";
 import { classifyPorcelainForScratchRecover } from "../scripts/worktree-dirt.ts";
@@ -282,6 +287,11 @@ test("3.1 occupied trees are not stolen; remotely advanced HEAD does not skip as
   );
   assert.equal(occupied.result, "fail");
   assert.match(occupied.reason, /occupied/i);
+  assert.equal(occupied.occupied, true);
+  assert.equal(isOccupiedWorktreeFault(occupied), true);
+  const wait = projectManagedWorktreeFault(occupied);
+  assert.equal(wait.status, "waiting");
+  assert.equal(wait.advanced, false);
   assert.equal(createCalls.length, 0);
 
   const remoteCalls: string[] = [];
@@ -418,6 +428,78 @@ test("4.2 stale authority hold is not preserved by a leftover blocked label", ()
   );
 });
 
+test("RecoverySupervisor reconciles harness-failure to Cooling and occupied to wait", () => {
+  const crash = observationFromAdapterAttempt({
+    stage: "fix-2",
+    domain: "test",
+    logical_operation_id: "lop-reconcile-crash",
+    outcome: { advanced: false, status: "blocked", reason: "exit 1", blockerKind: "harness-failure" },
+  });
+  const cooling = reconcileIssueStageObservation(crash, {
+    advanced: false,
+    status: "blocked",
+    reason: "exit 1",
+    blockerKind: "harness-failure",
+  });
+  assert.equal(cooling.treatment, "Cooling");
+  assert.equal(cooling.owned, true);
+  assert.equal(cooling.complete, false);
+  assert.equal(cooling.cancelled, false);
+  assert.equal(cooling.human_owned, false);
+  assert.equal(cooling.lifecycle, "cooling");
+
+  const occupiedObs = observationFromAdapterAttempt({
+    stage: "planning",
+    domain: "test",
+    logical_operation_id: "lop-reconcile-occ",
+    outcome: {
+      advanced: false,
+      status: "blocked",
+      reason: "occupied by live owner — waiting without stealing the workspace",
+      blockerKind: "worktree-creation-failed",
+    },
+  });
+  const wait = reconcileIssueStageObservation(occupiedObs, {
+    advanced: false,
+    status: "blocked",
+    reason: "occupied by live owner — waiting without stealing the workspace",
+    blockerKind: "worktree-creation-failed",
+  });
+  assert.equal(wait.treatment, "external-condition wait");
+  assert.equal(wait.lifecycle, "waiting");
+  assert.equal(wait.owned, true);
+  const processOut = applySupervisorProcessOutcome(occupiedObs, {
+    advanced: false,
+    status: "blocked",
+    reason: "occupied by live owner — waiting without stealing the workspace",
+    blockerKind: "worktree-creation-failed",
+  });
+  assert.equal(processOut.status, "waiting");
+});
+
+test("runDeliveryStageAdapter converts occupied block into a waiting process stop", async () => {
+  const sink = memoryObservationSink();
+  const out = await runDeliveryStageAdapter({
+    stage: "eval-gate",
+    cfg: cfg(),
+    issueNumber: 1328,
+    pipelineRunId: "run-occ",
+    logicalOperationId: "lop-occ-wait",
+    reportObservation: sink.reportObservation,
+    attempt: async () => ({
+      advanced: false,
+      status: "blocked",
+      reason: "occupied by live owner — waiting without stealing the workspace",
+      blockerKind: "worktree-creation-failed",
+    }),
+  });
+  assert.equal(out.status, "waiting");
+  assert.equal(out.advanced, false);
+  assert.equal(sink.observations[0]?.owned, true);
+  assert.equal(sink.observations[0]?.complete, false);
+  assert.equal(sink.observations[0]?.human_owned, false);
+});
+
 test("5.1 comment-counted auto-recovery cap cannot post a terminal that ends ownership", () => {
   const sink = memoryObservationSink();
   const obs = claimOrResumeRecoveryEpisode({
@@ -452,6 +534,7 @@ test("5.4 auto-recovery comments are not the sole authority — ledger + claim a
   });
   assert.ok(ledger.attempts.length >= 1);
   assert.equal(ledger.attempts[0]!.action, "no_run_recovery");
+  assert.equal(countRecoveryEpisodeTreatments(ledger, "1328"), 1);
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -541,4 +624,7 @@ test("7.3 blocked or waiting process stop does not end ownership; no supervise-a
   assertNoSuperviseAdvanceCommand(Object.keys(COMMAND_REGISTRY));
   assert.equal(isDeliveryStage("backlog"), false);
   assert.equal(isDeliveryStage("needs-spec"), false);
+  const dispatchSrc = readFileSync(join(CORE_ROOT, "scripts/pipeline-run.ts"), "utf8");
+  assert.match(dispatchSrc, /runDeliveryStageAdapter/);
+  assert.match(dispatchSrc, /isDeliveryStage\(stage\)/);
 });

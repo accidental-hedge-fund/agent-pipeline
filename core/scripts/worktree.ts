@@ -14,7 +14,7 @@ import { promisify } from "node:util";
 import { getIssueStateAndLabels, getPrMergeState } from "./gh.ts";
 import { isFencedLiveOwner as defaultIsFencedLiveOwner, isWorkspaceOccupiedByOther } from "./lock.ts";
 import { classifyPorcelainForScratchRecover } from "./worktree-dirt.ts";
-import type { PipelineConfig } from "./types.ts";
+import type { Outcome, PipelineConfig } from "./types.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -1431,6 +1431,8 @@ export type EnsureManagedWorktreeResult =
       worktree: null;
       reason: string;
       blockerKind: "worktree-creation-failed" | "worktree-capacity" | "worktree-missing";
+      /** Live foreign owner — RecoverySupervisor wait, not a steal or park. */
+      occupied?: boolean;
     };
 
 /** Injectable deps for {@link ensureManagedWorktree}. No real network/git in tests. */
@@ -1479,6 +1481,32 @@ export interface EnsureManagedWorktreeDeps {
   }) => boolean;
   /** Unlink a worktree-relative scratch path. Never used for unknown dirt. */
   unlinkPath?: (absPath: string) => Promise<void> | void;
+}
+
+/** True when rematerialize refused because a foreign live owner holds the tree. */
+export function isOccupiedWorktreeFault(
+  remat: Pick<Extract<EnsureManagedWorktreeResult, { result: "fail" }>, "reason" | "occupied">,
+): boolean {
+  return remat.occupied === true || /\boccupied\b/i.test(remat.reason);
+}
+
+/**
+ * RecoverySupervisor projection for a failed materialization seam.
+ * Occupied trees wait without a blocked park. Other faults remain typed
+ * blocked projections; they do not end ownership.
+ */
+export function projectManagedWorktreeFault(
+  remat: Extract<EnsureManagedWorktreeResult, { result: "fail" }>,
+): Outcome {
+  if (isOccupiedWorktreeFault(remat)) {
+    return { advanced: false, status: "waiting", reason: remat.reason };
+  }
+  return {
+    advanced: false,
+    status: "blocked",
+    reason: remat.reason,
+    blockerKind: remat.blockerKind,
+  };
 }
 
 const REMATERIALIZE_REASON_MAX = 400;
@@ -1580,7 +1608,13 @@ export async function ensureManagedWorktree(
         "occupied by live owner — waiting without stealing the workspace",
       );
       await recordRematerializeGate(deps, "fail", reason);
-      return { result: "fail", worktree: null, reason, blockerKind: "worktree-creation-failed" };
+      return {
+        result: "fail",
+        worktree: null,
+        reason,
+        blockerKind: "worktree-creation-failed",
+        occupied: true,
+      };
     }
 
     const branch = branchName(issueNumber, existing.slug);

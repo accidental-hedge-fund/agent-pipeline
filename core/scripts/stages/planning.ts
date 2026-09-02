@@ -57,6 +57,7 @@ import {
   getOnDiskForIssue,
   gitInWorktree,
   hasCommitsAhead,
+  isOccupiedWorktreeFault,
   isWorktreeCapacityError,
   removeWorktree,
   slugify,
@@ -741,6 +742,10 @@ export async function runPlanningPhases(
       getOnDiskForIssue: deps.getOnDiskForIssue ?? getOnDiskForIssue,
     });
     if (remat.result === "fail" || !remat.worktree) {
+      if (remat.result === "fail" && isOccupiedWorktreeFault(remat)) {
+        await completePlanningLifecycle(cfg, issueNumber, activeLifecycle, opts, deps, "skipped");
+        return { advanced: false, status: "waiting", reason: remat.reason };
+      }
       const blockerKind =
         remat.result === "fail" && remat.blockerKind ? remat.blockerKind : "worktree-missing";
       const reason =
@@ -1263,6 +1268,9 @@ export async function runPlanningPhases(
       getOnDiskForIssue: deps.getOnDiskForIssue ?? getOnDiskForIssue,
     });
     if (remat.result === "fail" || !remat.worktree) {
+      if (remat.result === "fail" && isOccupiedWorktreeFault(remat)) {
+        return { advanced: false, status: "waiting", reason: remat.reason };
+      }
       const blockerKind =
         remat.result === "fail" && remat.blockerKind ? remat.blockerKind : "worktree-missing";
       const reason =

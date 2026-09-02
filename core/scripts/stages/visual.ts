@@ -22,6 +22,7 @@ import {
   branchName,
   ensureManagedWorktree,
   getOnDiskForIssue as defaultGetForIssue,
+  isOccupiedWorktreeFault,
   gitInWorktree,
   type EnsureManagedWorktreeDeps,
   type EnsureManagedWorktreeResult,
@@ -1026,6 +1027,9 @@ export async function advanceVisual(
     // non-null worktree is not usable (runtime type-stripping + injectable
     // fakes can return that shape) — park as worktree-missing (#882 review-2).
     if (remat.result === "fail" || !remat.worktree) {
+      if (remat.result === "fail" && isOccupiedWorktreeFault(remat)) {
+        return { advanced: false, status: "waiting", reason: remat.reason };
+      }
       const blockerKind =
         remat.result === "fail" && remat.blockerKind
           ? remat.blockerKind

@@ -56,8 +56,12 @@ import {
 } from "./types.ts";
 import { getOnDiskForIssue, gitInWorktree } from "./worktree.ts";
 import { classifyPorcelainForScratchRecover } from "./worktree-dirt.ts";
-import { claimOrResumeRecoveryEpisode } from "./issue-stage-adapters.ts";
+import {
+  claimOrResumeRecoveryEpisode,
+  recordRecoveryEpisodeTreatment,
+} from "./issue-stage-adapters.ts";
 import { defaultRecoverySupervisorReport } from "./operation-observation.ts";
+import { emptyStageAttemptLedger, hydrateStageAttemptLedger, type StageAttemptLedger } from "./stage-attempt-ledger.ts";
 import {
   blockerKindFromComments,
   createDefaultImplementDeliverableProbe,
@@ -969,6 +973,9 @@ export interface RecoverParkedDeps {
   /** RecoverySupervisor observation sink. Tests inject a memory sink. */
   reportObservation?: import("./operation-observation.ts").ReportOperationObservation;
   logicalOperationId?: string | null;
+  /** Recovery Episode ledger. Production hydrates from runDir. */
+  stageAttemptLedger?: StageAttemptLedger;
+  runDir?: string;
   /** Stale-blocked resume sub-deps (tests). */
   staleBlockedDeps?: StaleBlockedResumeDeps;
   /** Injectable seams for default scratch unlink (tests). */
@@ -1777,6 +1784,17 @@ async function runRecoverParkedLocked(
       issue: issueNumber,
       message: `recover-parked fingerprint spent — strategy cursor advanced, ownership retained (${fingerprintId})`,
       reportObservation: report,
+    });
+    const hydrated = hydrateStageAttemptLedger(deps.runDir);
+    const ledger = deps.stageAttemptLedger ?? (hydrated.ok ? hydrated.ledger : emptyStageAttemptLedger());
+    recordRecoveryEpisodeTreatment({
+      ledger,
+      headSha: headSha || "unresolved",
+      action: "no_run_recovery",
+      itemId: String(issueNumber),
+      evidenceFingerprint: fingerprintId,
+      typedReason: "recover-parked-pass-spent",
+      runDir: deps.stageAttemptLedger ? undefined : deps.runDir,
     });
     return wrap({
       status: "already-spent",
