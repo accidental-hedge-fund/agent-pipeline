@@ -18,3 +18,12 @@ When another actor squash-merges or otherwise merges a pull request linked to th
 - **WHEN** a later open PR exists on the same branch after that squash-merge
 - **THEN** reconciliation SHALL still treat the earlier merged linked PR as `known_complete`
 - **AND** SHALL NOT use only the latest open PR as merge authority
+
+#### Scenario: Truncated linked-PR enumeration is not absence
+
+- **WHEN** linked-PR timeline pagination stops before exhaustion
+- **AND** no merged-and-contained PR is in the observed window
+- **THEN** side-effect certainty SHALL be `uncertain`
+- **AND** SHALL NOT be `known_absent`
+- **AND** the engine SHALL NOT open a successor PR
+- **AND** the engine SHALL NOT rebase squash-contained commits

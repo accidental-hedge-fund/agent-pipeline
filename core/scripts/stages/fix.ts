@@ -62,10 +62,12 @@ import { trySalvageUncommittedWork } from "../salvage-harness-work.ts";
 import {
   FIX_RETRY_MIN_BUDGET_SEC as SUPERVISOR_FIX_RETRY_MIN_BUDGET_SEC,
   runOwnedFixAttempts,
+  type OwnedFixObservation,
 } from "../issue-stage-adapters.ts";
 import {
   defaultRecoverySupervisorReport,
   type ReportOperationObservation,
+  type SideEffectCertainty,
 } from "../operation-observation.ts";
 import { runHarnessRound, type HarnessRoundContext } from "../harness-round.ts";
 import {
@@ -319,6 +321,10 @@ export interface FixHarnessRetryResult {
    *  at/below `FIX_RETRY_MIN_BUDGET_SEC`, rather than because the retry cap
    *  was reached. */
   budgetExhausted: boolean;
+  /** Observer certainty that halted or allowed re-entry. */
+  certainty: SideEffectCertainty;
+  /** Discriminated halt: verified-complete is not the failed attempt. */
+  observation: OwnedFixObservation;
 }
 
 export interface FixHarnessRetryOpts {
@@ -330,6 +336,9 @@ export interface FixHarnessRetryOpts {
   basePrompt: string;
   /** RecoverySupervisor observation sink. Defaults to the production sink. */
   reportObservation?: ReportOperationObservation;
+  /** Required on retry-capable paths. Defaults to proven-absent so crash
+   *  re-entry may proceed when the caller has no richer observer. */
+  observeCertainty?: () => Promise<SideEffectCertainty> | SideEffectCertainty;
   identity?: {
     domain: string;
     logical_operation_id?: string | null;
@@ -376,6 +385,7 @@ export async function invokeFixHarnessWithRetry(
     onBeforeAttempt: opts.onBeforeAttempt,
     onRetryScheduled: opts.onRetryScheduled,
     nowMs: opts.nowMs,
+    observeCertainty: opts.observeCertainty ?? (() => "known_absent"),
     reportObservation: opts.reportObservation ?? defaultRecoverySupervisorReport,
     identity: opts.identity,
   });
@@ -387,6 +397,8 @@ export async function invokeFixHarnessWithRetry(
     })),
     finalResult: owned.finalResult as HarnessResult,
     budgetExhausted: owned.budgetExhausted,
+    certainty: owned.certainty,
+    observation: owned.observation,
   };
 }
 
@@ -950,10 +962,12 @@ export async function advanceFix(
         prLookupFailed = true;
         linkedOpenPr = true;
       }
-      if (result.background_wait) {
-        const waitReason = result.lifecycle_evidence
-          ? `missed delivery or foreground-join for job ${result.lifecycle_evidence.job_id}`
-          : "harness-background-wait";
+      if (retryResult.observation === "cooling" || result.background_wait) {
+        const waitReason = retryResult.observation === "cooling"
+          ? "side-effect certainty uncertain; RecoverySupervisor cooling"
+          : result.lifecycle_evidence
+            ? `missed delivery or foreground-join for job ${result.lifecycle_evidence.job_id}`
+            : "harness-background-wait";
         const salvageNote = ctx.salvageFailureReason
           ? ` Salvage of uncommitted work also failed: ${ctx.salvageFailureReason}`
           : ctx.salvaged

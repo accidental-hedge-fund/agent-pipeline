@@ -194,6 +194,25 @@ test("4.1 later open PR does not hide a prior merged-and-contained PR", () => {
   assert.equal(successorMutationsAllowed(certainty).rebaseContainedCommits, false);
 });
 
+test("4.1 truncated linked-PR scan is uncertain, never known_absent", () => {
+  const openOnly = integrationSideEffectCertainty(
+    [{ number: 99, state: "open", merge_commit_sha: null, contained: null }],
+    { truncated: true },
+  );
+  assert.equal(openOnly, "uncertain");
+  assert.notEqual(openOnly, "known_absent");
+  assert.equal(successorMutationsAllowed(openOnly).openSuccessorPr, false);
+  assert.equal(successorMutationsAllowed(openOnly).rebaseContainedCommits, false);
+  assert.equal(integrationSideEffectCertainty([], { truncated: true }), "uncertain");
+  assert.equal(
+    integrationSideEffectCertainty(
+      [{ number: 10, state: "merged", merge_commit_sha: "c".repeat(40), contained: true }],
+      { truncated: true },
+    ),
+    "known_complete",
+  );
+});
+
 test("4.2/4.3 squash-merge while fix-2 is known_complete even if the issue is still open", async () => {
   const deps = fakeObserve({
     async getIssueStateAndLabels() {
@@ -231,6 +250,29 @@ test("4.2/4.3 squash-merge while fix-2 is known_complete even if the issue is st
   assert.equal(observed.integration_certainty, "known_complete");
   assert.equal(observed.pipeline_stage, "fix-2");
   assert.equal(observed.issue_open, true);
+  assert.equal(successorMutationsAllowed(observed.integration_certainty!).openSuccessorPr, false);
+});
+
+test("4.1 truncated listLinkedPrs does not declare integration absent", async () => {
+  const deps = fakeObserve({
+    async findPrForIssue() {
+      return 99;
+    },
+    async listLinkedPrs() {
+      return { numbers: [99], truncated: true };
+    },
+    async getPrDetail() {
+      return {
+        state: "open",
+        head_ref: "pipeline/1369-fix",
+        head_sha: "b".repeat(40),
+        merge_commit_sha: null,
+      };
+    },
+  });
+  const observed = await observeExternalIdentity(deps, "1369");
+  assert.equal(observed.integration_certainty, "uncertain");
+  assert.notEqual(observed.integration_certainty, "known_absent");
   assert.equal(successorMutationsAllowed(observed.integration_certainty!).openSuccessorPr, false);
 });
 

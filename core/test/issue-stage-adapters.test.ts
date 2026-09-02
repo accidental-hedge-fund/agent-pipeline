@@ -208,6 +208,7 @@ test("2.2 crashing harness is invoked once per adapter attempt; RecoverySupervis
       calls += 1;
       return { success: false, exit_code: 1, duration: 1 };
     },
+    observeCertainty: () => "known_absent",
     reportObservation: sink.reportObservation,
     identity: { domain: "test", logical_operation_id: "lop-fix-once", issue: 1328, stage: "fix-2" },
   });
@@ -231,6 +232,7 @@ test("2.2 RecoverySupervisor may re-enter so harness is invoked at most cap+1 ti
       calls += 1;
       return { success: false, exit_code: 1, duration: 1 };
     },
+    observeCertainty: () => "known_absent",
     nowMs: (() => {
       let t = 0;
       return () => {
@@ -243,6 +245,7 @@ test("2.2 RecoverySupervisor may re-enter so harness is invoked at most cap+1 ti
   });
   assert.equal(calls, 3);
   assert.equal(out.attempts.length, 3);
+  assert.equal(out.observation, "attempt");
   assert.ok(sink.observations.every((o) => o.owned && !o.complete && !o.cancelled && !o.human_owned));
 });
 
@@ -260,6 +263,7 @@ test("2.4 remaining budget and addendum on re-entry; first prompt has no addendu
       timeouts.push(timeoutSec);
       return { success: false, exit_code: 1, duration: 780 };
     },
+    observeCertainty: () => "known_absent",
     nowMs: () => {
       now += 780_000;
       return now;
@@ -275,6 +279,82 @@ test("2.4 remaining budget and addendum on re-entry; first prompt has no addendu
   assert.ok(timeouts[1]! <= 1620);
   assert.ok(timeouts[1]! < 2400);
   assert.equal(canStartFixReentry(remainingFixTimeoutSec(2400, 2395)), false);
+});
+
+test("retry observation: known_complete is verified success of the original operation, not the failed attempt", async () => {
+  const sink = memoryObservationSink();
+  let calls = 0;
+  const out = await runOwnedFixAttempts({
+    maxRetries: 2,
+    fixTimeoutSec: 2400,
+    basePrompt: "fix it",
+    buildRetryPreamble: () => "ADDENDUM\n",
+    invokeAttempt: async () => {
+      calls += 1;
+      return { success: false, exit_code: 1, timed_out: true, duration: 1 };
+    },
+    observeCertainty: () => "known_complete",
+    reportObservation: sink.reportObservation,
+    identity: { domain: "test", logical_operation_id: "lop-fix-complete", issue: 1324, stage: "fix-2" },
+  });
+  assert.equal(calls, 1, "must not replay after known_complete");
+  assert.equal(out.observation, "verified-complete");
+  assert.equal(out.certainty, "known_complete");
+  assert.equal(out.finalResult.success, true);
+  assert.equal(out.finalResult.observed_complete, true);
+  assert.notEqual(out.finalResult.exit_code, 1);
+  const completed = sink.observations.filter((o) => o.complete);
+  assert.equal(completed.length, 1);
+  assert.equal(completed[0]?.certainty, "known_complete");
+  assert.equal(completed[0]?.owned, true);
+});
+
+test("retry observation: uncertain is owned cooling, not the original failed attempt", async () => {
+  const sink = memoryObservationSink();
+  let calls = 0;
+  const out = await runOwnedFixAttempts({
+    maxRetries: 2,
+    fixTimeoutSec: 2400,
+    basePrompt: "fix it",
+    buildRetryPreamble: () => "ADDENDUM\n",
+    invokeAttempt: async () => {
+      calls += 1;
+      return { success: false, exit_code: 1, timed_out: true, duration: 1 };
+    },
+    observeCertainty: () => "uncertain",
+    reportObservation: sink.reportObservation,
+    identity: { domain: "test", logical_operation_id: "lop-fix-cool", issue: 1324, stage: "fix-2" },
+  });
+  assert.equal(calls, 1, "must not replay when uncertain");
+  assert.equal(out.observation, "cooling");
+  assert.equal(out.certainty, "uncertain");
+  assert.equal(out.finalResult.success, false);
+  assert.equal(out.finalResult.cooling, true);
+  assert.notEqual(out.finalResult, out.attempts[0]?.result);
+  const cooling = sink.observations.filter((o) => o.lifecycle === "cooling" && o.message.includes("could not prove"));
+  assert.equal(cooling.length, 1);
+  assert.equal(cooling[0]?.certainty, "uncertain");
+  assert.equal(cooling[0]?.complete, false);
+  assert.equal(cooling[0]?.owned, true);
+});
+
+test("retry observation: missing observer on a retry-capable path is fail-closed cooling", async () => {
+  let calls = 0;
+  const out = await runOwnedFixAttempts({
+    maxRetries: 2,
+    fixTimeoutSec: 2400,
+    basePrompt: "fix it",
+    buildRetryPreamble: () => "ADDENDUM\n",
+    invokeAttempt: async () => {
+      calls += 1;
+      return { success: false, exit_code: 1, duration: 1 };
+    },
+    observeCertainty: undefined as unknown as () => "known_absent",
+  });
+  assert.equal(calls, 1);
+  assert.equal(out.observation, "cooling");
+  assert.equal(out.certainty, "uncertain");
+  assert.equal(out.finalResult.cooling, true);
 });
 
 test("3.1 occupied trees are not stolen; remotely advanced HEAD does not skip as matching", async () => {

@@ -50,13 +50,17 @@ export interface LinkedPrIntegrationFact {
 /**
  * Integration side-effect certainty from every linked PR. A later open PR does
  * not hide a prior merged-and-contained PR. Issue closure is not consulted.
+ * A truncated enumeration is not absence: successor mutations stay disallowed
+ * until a complete search proves no merged-and-contained PR exists.
  */
 export function integrationSideEffectCertainty(
   linked: readonly LinkedPrIntegrationFact[],
+  opts?: { truncated?: boolean },
 ): SideEffectCertainty {
   if (linked.some((pr) => pr.state === "merged" && pr.contained === true)) {
     return "known_complete";
   }
+  if (opts?.truncated) return "uncertain";
   if (linked.some((pr) => pr.state === "merged")) {
     return "uncertain";
   }

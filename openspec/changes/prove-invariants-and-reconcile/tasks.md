@@ -22,6 +22,7 @@
 - [ ] 4.1 Extend the reconcile observation seam so completeness consults every linked PR (open, closed, merged), and verify a fixture with a merged earlier PR plus a later open PR still treats integration as `known_complete`
 - [ ] 4.2 Before PR-open, rebase, or advance-still-needed, observe that linked-PR set, and verify a `fix-2` issue whose linked PR was squash-merged and contained does not open a successor PR and does not rebase squash-contained commits
 - [ ] 4.3 Treat issue closure via `Closes #N` as corroborating evidence only, and verify merged-and-contained PR identity remains the postcondition even when the issue is still labeled `pipeline:fix-2`
+- [x] 4.4 Treat truncated linked-PR timeline pagination as `uncertain`, never `known_absent`, and verify an open PR inside a truncated window does not allow successor mutations
 
 ## 5. Observe before retry and after recovery
 
@@ -29,6 +30,7 @@
 - [ ] 5.2 Observe worktree rebase-in-progress, claimed SHA versus on-disk HEAD, and staged product dirt as local/remote drift, and verify `repair_pipeline_item` does not refuse as `needs-human` solely for that mismatch
 - [ ] 5.3 Reconcile after every recovery recipe before the next adapter attempt, and verify a rematerialize or rebase-abort fixture is not treated as verified completion of the original mutation
 - [ ] 5.4 Keep OpenSpec dirty-before-archive fail-closed when product dirt is present, and verify a first completed archive plus later unfinished-rebase dirt does not replay the archive and does not skip the fail-closed
+- [x] 5.5 Return a discriminated retry observation: `known_complete` is verified success of the original operation, `uncertain` is owned cooling, and a retry-capable path without an observer is fail-closed cooling
 
 ## 6. Dogfood fixture and class guard
 

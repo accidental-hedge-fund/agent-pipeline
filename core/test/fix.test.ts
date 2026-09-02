@@ -2051,6 +2051,42 @@ test("invokeFixHarnessWithRetry: persistently crashing harness with maxRetries=2
   assert.equal(result.budgetExhausted, false);
 });
 
+test("invokeFixHarnessWithRetry: known_complete observation is verified success, not the failed attempt", async () => {
+  let calls = 0;
+  const result = await invokeFixHarnessWithRetry({
+    maxRetries: 2,
+    fixTimeoutSec: 2400,
+    basePrompt: "BASE-PROMPT",
+    observeCertainty: () => "known_complete",
+    invokeAttempt: async () => {
+      calls++;
+      return harnessResult({ exit_code: 1, timed_out: true });
+    },
+  });
+  assert.equal(calls, 1);
+  assert.equal(result.observation, "verified-complete");
+  assert.equal(result.certainty, "known_complete");
+  assert.equal(result.finalResult.success, true);
+});
+
+test("invokeFixHarnessWithRetry: uncertain observation is cooling and does not replay", async () => {
+  let calls = 0;
+  const result = await invokeFixHarnessWithRetry({
+    maxRetries: 2,
+    fixTimeoutSec: 2400,
+    basePrompt: "BASE-PROMPT",
+    observeCertainty: () => "uncertain",
+    invokeAttempt: async () => {
+      calls++;
+      return harnessResult({ exit_code: 1, timed_out: true });
+    },
+  });
+  assert.equal(calls, 1);
+  assert.equal(result.observation, "cooling");
+  assert.equal(result.certainty, "uncertain");
+  assert.equal(result.finalResult.success, false);
+});
+
 // Regression test (#486 acceptance criteria: "regression tests bite"): with the
 // retry loop removed, this test would observe exactly one invocation and fail
 // the assert.equal(calls, 3) above — proving the loop is exercised, not a no-op.

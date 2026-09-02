@@ -15,7 +15,11 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { parseDeclaredDependencyIds } from "../declared-dependency-grammar.ts";
-import { getPrForIssueAnyState as ghGetPrForIssueAnyState } from "../gh.ts";
+import {
+  getPrForIssueAnyState as ghGetPrForIssueAnyState,
+  normalizeLinkedIssuePrs,
+  type LinkedIssuePrs,
+} from "../gh.ts";
 import { compileContractItems, type RawContractItem } from "../loop/dependencies.ts";
 import { LoopError } from "../loop/types.ts";
 import type { RunStoreDeps } from "../run-store.ts";
@@ -233,8 +237,9 @@ export interface TrainDeps {
    * Used for merge-mode already-integrated reconciliation after the open PR is gone.
    */
   getPrForIssueAnyState(issue: number): Promise<number | null>;
-  /** Every linked PR (open, closed, merged). Completeness consults this set. */
-  listLinkedPrs?(issue: number): Promise<number[]>;
+  /** Every linked PR (open, closed, merged). Completeness consults this set.
+   *  `{ numbers, truncated }` reports a bounded scan that is not absence. */
+  listLinkedPrs?(issue: number): Promise<readonly number[] | LinkedIssuePrs>;
   /** Existing merge surface (same gates as `pipeline merge`). */
   mergeIssuePr(pr: number): Promise<void>;
   observePr(pr: number): Promise<{
@@ -723,9 +728,11 @@ async function linkedPrForPlan(
 ): Promise<{ pr: number | null; open: boolean; merged: boolean; contained: boolean }> {
   const openPr = await deps.getPrForIssue(issue);
   const anyPr = await deps.getPrForIssueAnyState(issue);
-  const listed = deps.listLinkedPrs ? await deps.listLinkedPrs(issue) : [];
+  const listed = deps.listLinkedPrs
+    ? normalizeLinkedIssuePrs(await deps.listLinkedPrs(issue))
+    : { numbers: [] as number[], truncated: false };
   const numbers = [...new Set([
-    ...listed,
+    ...listed.numbers,
     ...(openPr != null ? [openPr] : []),
     ...(anyPr != null ? [anyPr] : []),
   ])];
@@ -750,7 +757,7 @@ async function linkedPrForPlan(
       contained,
     });
   }
-  const certainty = integrationSideEffectCertainty(facts);
+  const certainty = integrationSideEffectCertainty(facts, { truncated: listed.truncated });
   const mergedFact = facts.find((f) => f.state === "merged" && f.contained === true)
     ?? facts.find((f) => f.state === "merged");
   if (mergedFact) {

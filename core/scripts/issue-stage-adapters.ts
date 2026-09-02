@@ -10,6 +10,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { deriveMigratedOutcome, type MigratedOutcome } from "./escalation-dispositions.ts";
 import {
+  completedOperationObservation,
   consumeOwnedOperation,
   mayReplaySideEffect,
   mechanicalFaultObservation,
@@ -18,6 +19,7 @@ import {
   persistOperationObservation,
   reportMechanicalFault,
   reportOwnedOperation,
+  treatmentForSideEffectCertainty,
   type ObservationLifecycleState,
   type OperationObservation,
   type ReportOperationObservation,
@@ -773,10 +775,14 @@ export interface OwnedFixAttempt {
   result: { success: boolean; exit_code?: number; timed_out?: boolean; duration?: number; [k: string]: unknown };
 }
 
+export type OwnedFixObservation = "attempt" | "verified-complete" | "cooling";
+
 export interface OwnedFixAttemptsResult {
   attempts: OwnedFixAttempt[];
   finalResult: OwnedFixAttempt["result"];
   budgetExhausted: boolean;
+  certainty: SideEffectCertainty;
+  observation: OwnedFixObservation;
 }
 
 export interface OwnedFixAttemptsOpts<TResult extends OwnedFixAttempt["result"]> {
@@ -788,8 +794,11 @@ export interface OwnedFixAttemptsOpts<TResult extends OwnedFixAttempt["result"]>
   onBeforeAttempt?: (attempt: number, timeoutSec: number, prompt: string) => Promise<void> | void;
   onRetryScheduled?: (attempt: number, limit: number, reason: string) => Promise<void> | void;
   nowMs?: () => number;
-  /** Observe side-effect certainty before a RecoverySupervisor re-entry. */
-  observeCertainty?: () => Promise<SideEffectCertainty> | SideEffectCertainty;
+  /**
+   * Required on every retry-capable call path. Missing observer on re-entry is
+   * fail-closed `uncertain` (cooling), never a guessed replay.
+   */
+  observeCertainty: () => Promise<SideEffectCertainty> | SideEffectCertainty;
   reportObservation?: ReportOperationObservation;
   identity?: {
     domain: string;
@@ -798,6 +807,88 @@ export interface OwnedFixAttemptsOpts<TResult extends OwnedFixAttempt["result"]>
     issue?: number | null;
     run_id?: string | null;
     stage?: "fix-1" | "fix-2";
+  };
+}
+
+function haltOwnedFixOnObservation(
+  attempts: OwnedFixAttempt[],
+  certainty: SideEffectCertainty,
+  opts: OwnedFixAttemptsOpts<OwnedFixAttempt["result"]>,
+): OwnedFixAttemptsResult {
+  const treatment = treatmentForSideEffectCertainty(certainty);
+  const stage = opts.identity?.stage ?? "fix-2";
+  if (treatment === "complete") {
+    if (opts.identity) {
+      reportOwnedOperation(
+        opts.reportObservation,
+        completedOperationObservation({
+          operation: stage,
+          form_id: formIdForStage(stage),
+          message: "observer proved the postcondition complete; reconciling the original operation forward",
+          domain: opts.identity.domain,
+          logical_operation_id: opts.identity.logical_operation_id,
+          repository: opts.identity.repository,
+          issue: opts.identity.issue,
+          run_id: opts.identity.run_id,
+        }),
+      );
+    }
+    return {
+      attempts,
+      finalResult: {
+        success: true,
+        exit_code: 0,
+        duration: 0,
+        observed_complete: true,
+        certainty: "known_complete",
+      },
+      budgetExhausted: false,
+      certainty: "known_complete",
+      observation: "verified-complete",
+    };
+  }
+  if (opts.identity) {
+    reportMechanicalFault(opts.reportObservation, {
+      operation: stage,
+      form_id: formIdForStage(stage),
+      message: "observer could not prove complete or absent; keeping the operation owned as cooling",
+      domain: opts.identity.domain,
+      logical_operation_id: opts.identity.logical_operation_id,
+      repository: opts.identity.repository,
+      issue: opts.identity.issue,
+      run_id: opts.identity.run_id,
+      fault: "mechanical",
+      certainty: "uncertain",
+    });
+  }
+  const prior = attempts[attempts.length - 1]?.result;
+  return {
+    attempts,
+    finalResult: {
+      success: false,
+      exit_code: prior?.exit_code,
+      timed_out: prior?.timed_out,
+      duration: prior?.duration ?? 0,
+      cooling: true,
+      certainty: "uncertain",
+    },
+    budgetExhausted: false,
+    certainty: "uncertain",
+    observation: "cooling",
+  };
+}
+
+function attemptOwnedFixResult(
+  attempts: OwnedFixAttempt[],
+  finalResult: OwnedFixAttempt["result"],
+  budgetExhausted: boolean,
+): OwnedFixAttemptsResult {
+  return {
+    attempts,
+    finalResult,
+    budgetExhausted,
+    certainty: "uncertain",
+    observation: "attempt",
   };
 }
 
@@ -815,14 +906,10 @@ export async function runOwnedFixAttempts<TResult extends OwnedFixAttempt["resul
   const nowMs = opts.nowMs ?? (() => performance.now());
 
   for (let attemptNum = 1; attemptNum <= totalAttemptsCap; attemptNum++) {
-    if (attemptNum > 1 && opts.observeCertainty) {
-      const certainty = await opts.observeCertainty();
+    if (attemptNum > 1) {
+      const certainty = opts.observeCertainty ? await opts.observeCertainty() : "uncertain";
       if (!mayReplaySideEffect(certainty)) {
-        return {
-          attempts,
-          finalResult: attempts[attempts.length - 1]!.result,
-          budgetExhausted: false,
-        };
+        return haltOwnedFixOnObservation(attempts, certainty, opts);
       }
     }
     let timeoutSec: number;
@@ -845,11 +932,7 @@ export async function runOwnedFixAttempts<TResult extends OwnedFixAttempt["resul
             certainty: "uncertain",
           });
         }
-        return {
-          attempts,
-          finalResult: attempts[attempts.length - 1]!.result,
-          budgetExhausted: true,
-        };
+        return attemptOwnedFixResult(attempts, attempts[attempts.length - 1]!.result, true);
       }
       if (opts.onRetryScheduled) {
         await opts.onRetryScheduled(attemptNum, opts.maxRetries, priorReason!);
@@ -871,10 +954,10 @@ export async function runOwnedFixAttempts<TResult extends OwnedFixAttempt["resul
     consumedSec += debitSec;
 
     if (result.success) {
-      return { attempts, finalResult: result, budgetExhausted: false };
+      return attemptOwnedFixResult(attempts, result, false);
     }
     if (result.background_wait || result.preflight_failed) {
-      return { attempts, finalResult: result, budgetExhausted: false };
+      return attemptOwnedFixResult(attempts, result, false);
     }
     priorReason = result.timed_out
       ? `timed out after ${debitSec.toFixed(0)}s`
@@ -895,11 +978,7 @@ export async function runOwnedFixAttempts<TResult extends OwnedFixAttempt["resul
     }
   }
 
-  return {
-    attempts,
-    finalResult: attempts[attempts.length - 1]!.result,
-    budgetExhausted: false,
-  };
+  return attemptOwnedFixResult(attempts, attempts[attempts.length - 1]!.result, false);
 }
 
 export function scanDeliveryStageAdapterContracts(coreRoot?: string): ForbiddenAdapterTreatmentHit[] {

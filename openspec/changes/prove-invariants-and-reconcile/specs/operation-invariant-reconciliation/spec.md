@@ -148,6 +148,14 @@ Before opening a successor PR, rebasing the candidate, or treating advance as st
 - **THEN** reconciliation SHALL still treat the integration side effect as `known_complete`
 - **AND** SHALL NOT consult only the latest open PR as authority
 
+#### Scenario: Truncated linked-PR enumeration is not absence
+
+- **WHEN** linked-PR timeline pagination stops before exhaustion
+- **AND** no merged-and-contained PR is in the observed window
+- **THEN** integration side-effect certainty SHALL be `uncertain`
+- **AND** SHALL NOT be `known_absent`
+- **AND** successor PR-open and rebase of contained commits SHALL remain disallowed
+
 ---
 
 ### Requirement: A partial external operation SHALL be observed before retry

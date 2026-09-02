@@ -31,3 +31,19 @@ SHALL observe that invariant before any local transport retry.
 - **WHEN** a delivery-stage adapter is about to retry a proven-idempotent transport operation
 - **THEN** it SHALL observe the declared invariant first
 - **AND** SHALL NOT retry when side-effect certainty is `known_complete` or `uncertain`
+
+#### Scenario: Observed completion is verified success of the original operation
+
+- **WHEN** a local attempt fails or times out
+- **AND** the observer then proves side-effect certainty `known_complete`
+- **THEN** the retry result SHALL complete as verified success on the original Logical Operation
+- **AND** SHALL NOT return the failed attempt as the final result
+- **AND** SHALL NOT replay the mutation
+
+#### Scenario: Uncertain observation stays owned cooling
+
+- **WHEN** a local attempt fails or times out
+- **AND** the observer reports side-effect certainty `uncertain`
+- **THEN** the retry result SHALL be an owned cooling or external-condition wait outcome
+- **AND** SHALL NOT replay
+- **AND** SHALL NOT treat the original failed attempt as the final ordinary failure

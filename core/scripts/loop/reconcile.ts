@@ -27,7 +27,9 @@ import {
   getPrDetail,
   getPrForIssueAnyState,
   listPrsForIssueAnyState,
+  normalizeLinkedIssuePrs,
   parseChecksAggregate,
+  type LinkedIssuePrs,
 } from "../gh.ts";
 import { getOnDiskForIssue, gitInWorktree } from "../worktree.ts";
 import { isAdvanceStillNeeded, isBlockedInLabels, pipelineStageFromLabels } from "./precondition.ts";
@@ -86,8 +88,10 @@ export interface ReconcileObserveDeps {
   /**
    * Every pull request linked to the issue (open, closed, merged). Completeness
    * consults this set so a later open PR cannot hide a prior squash-merge.
+   * A `{ numbers, truncated }` object reports a bounded scan that must not be
+   * treated as absence. A bare number array is a complete enumeration.
    */
-  listLinkedPrs?(issueNumber: number): Promise<number[]>;
+  listLinkedPrs?(issueNumber: number): Promise<readonly number[] | LinkedIssuePrs>;
   getPrDetail(prNumber: number): Promise<{
     state: "open" | "closed" | "merged";
     head_ref: string;
@@ -260,10 +264,11 @@ export async function observeExternalIdentity(deps: ReconcileObserveDeps, itemId
   let linked_pr_numbers: number[] = [];
 
   const foundPrNumber = await deps.findPrForIssue(issueNumber);
-  const listed = deps.listLinkedPrs ? await deps.listLinkedPrs(issueNumber) : [];
-  const consultAllLinked = Boolean(deps.listLinkedPrs);
+  const listedRaw = deps.listLinkedPrs ? await deps.listLinkedPrs(issueNumber) : null;
+  const consultAllLinked = listedRaw !== null;
+  const listed = listedRaw === null ? { numbers: [] as number[], truncated: false } : normalizeLinkedIssuePrs(listedRaw);
   linked_pr_numbers = consultAllLinked
-    ? listed
+    ? listed.numbers
     : foundPrNumber !== null
       ? [foundPrNumber]
       : [];
@@ -286,7 +291,7 @@ export async function observeExternalIdentity(deps: ReconcileObserveDeps, itemId
     });
   }
   integration_certainty = consultAllLinked
-    ? integrationSideEffectCertainty(linkedFacts)
+    ? integrationSideEffectCertainty(linkedFacts, { truncated: listed.truncated })
     : linkedFacts.some((pr) => pr.state === "merged")
       ? (linkedFacts.find((pr) => pr.state === "merged")?.contained === true ? "known_complete" : "uncertain")
       : "known_absent";

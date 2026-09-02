@@ -3102,19 +3102,37 @@ const ISSUE_TIMELINE_QUERY =
  *  Match identities (#1269): `ConnectedEvent`, closing `willCloseTarget`,
  *  same-repo head `pipeline/<N>-*`, or title parenthetical `(#N)`. Fork PRs
  *  are ignored. Open-path {@link getPrForIssue} does not gain title search. */
+/** Safety bound for issue-timeline pagination (50 events per page). Hitting
+ *  this cap is truncation, not a complete linked-PR set — absence must not
+ *  be inferred from the partial window (#1324 review-2). */
+export const ISSUE_TIMELINE_PR_PAGE_CAP = 40;
+
+/** Linked-PR numbers plus whether timeline pagination stopped before exhaustion. */
+export interface LinkedIssuePrs {
+  numbers: number[];
+  truncated: boolean;
+}
+
+/** Accept the complete `{ numbers, truncated }` form or a bare number list
+ *  (test fakes that enumerate a complete set). */
+export function normalizeLinkedIssuePrs(
+  listed: readonly number[] | LinkedIssuePrs,
+): LinkedIssuePrs {
+  if (Array.isArray(listed)) return { numbers: [...listed], truncated: false };
+  return { numbers: [...listed.numbers], truncated: listed.truncated === true };
+}
+
 async function paginateIssueTimelinePrs(
   cfg: PipelineConfig,
   issueNumber: number,
   run: GhApiRunner,
   opts: { stopOnFirst: boolean },
-): Promise<number[]> {
+): Promise<LinkedIssuePrs> {
   const [owner, repo] = cfg.repo.split("/");
   let before: string | null = null;
   const out: number[] = [];
   const seen = new Set<number>();
-  // Safety bound only — 40 pages * 50 events = 2000 timeline events for a
-  // single issue, far beyond any real issue's link history.
-  for (let page = 0; page < 40; page++) {
+  for (let page = 0; page < ISSUE_TIMELINE_PR_PAGE_CAP; page++) {
     const args = [
       "api",
       "graphql",
@@ -3133,17 +3151,17 @@ async function paginateIssueTimelinePrs(
       data: { repository: { issue: { timelineItems: IssueTimelinePage } | null } };
     };
     const timelineItems = data.data.repository.issue?.timelineItems;
-    if (!timelineItems) return out;
+    if (!timelineItems) return { numbers: out, truncated: false };
     for (const n of listPrsFromTimelinePage(timelineItems.nodes, issueNumber)) {
       if (seen.has(n)) continue;
       seen.add(n);
       out.push(n);
-      if (opts.stopOnFirst) return out;
+      if (opts.stopOnFirst) return { numbers: out, truncated: false };
     }
-    if (!timelineItems.pageInfo.hasPreviousPage) return out;
+    if (!timelineItems.pageInfo.hasPreviousPage) return { numbers: out, truncated: false };
     before = timelineItems.pageInfo.startCursor;
   }
-  return out;
+  return { numbers: out, truncated: true };
 }
 
 export async function getPrForIssueAnyState(
@@ -3152,15 +3170,17 @@ export async function getPrForIssueAnyState(
   run: GhApiRunner = (args) => ghRun(args, { wrapperName: "getPrForIssueAnyState" }),
 ): Promise<number | null> {
   const linked = await paginateIssueTimelinePrs(cfg, issueNumber, run, { stopOnFirst: true });
-  return linked[0] ?? null;
+  return linked.numbers[0] ?? null;
 }
 
-/** Every same-repo PR linked to the issue (open, closed, merged), newest first. */
+/** Every same-repo PR linked to the issue (open, closed, merged), newest first.
+ *  `truncated` is true when the safety page cap stopped pagination before
+ *  GraphQL reported exhaustion — callers must not treat that as absence. */
 export async function listPrsForIssueAnyState(
   cfg: PipelineConfig,
   issueNumber: number,
   run: GhApiRunner = (args) => ghRun(args, { wrapperName: "listPrsForIssueAnyState" }),
-): Promise<number[]> {
+): Promise<LinkedIssuePrs> {
   return paginateIssueTimelinePrs(cfg, issueNumber, run, { stopOnFirst: false });
 }
 
