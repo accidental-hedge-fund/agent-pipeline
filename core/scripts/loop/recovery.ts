@@ -801,7 +801,14 @@ export async function startRecoveryAttempt(
   const notBefore = new Date(Date.parse(time) + backoffSeconds * 1000).toISOString();
   const recipeIndex = policyEntry.recipes.indexOf(input.action);
   if (recipeIndex >= 0 && recipeIndex > episode.strategy_cursor) {
-    episode = { ...episode, strategy_cursor: recipeIndex };
+    const implicitSkips = policyEntry.recipes
+      .slice(episode.strategy_cursor, recipeIndex)
+      .filter((recipe) => !episode.skipped_strategies.includes(recipe));
+    episode = {
+      ...episode,
+      strategy_cursor: recipeIndex,
+      skipped_strategies: [...episode.skipped_strategies, ...implicitSkips],
+    };
   }
   if (skipInapplicable) {
     episode = {

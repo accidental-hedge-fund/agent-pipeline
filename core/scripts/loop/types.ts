@@ -317,6 +317,7 @@ export interface LoopRecoveryAttempt {
   evidence_identity?: string;
   attempts_per_strategy?: Record<string, number>;
   strategy_cursor?: number;
+  skipped_strategies?: RecoveryRecipe[];
   next_eligible_at?: string;
   /** Current fenced lease token that authorized this claim. */
   fence_token?: string;

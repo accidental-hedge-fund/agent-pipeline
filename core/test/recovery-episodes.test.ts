@@ -1089,6 +1089,98 @@ test("forged terminal cursor with incomplete predecessor history is quarantined 
   assert.equal(resumed, null);
 });
 
+test("nonterminal cursor with only a later recipe attempted is not authoritative", () => {
+  const key = {
+    operation: "loop_recovery",
+    invariant: "workflow-state",
+    candidate_epoch: "epoch-1",
+    evidence_identity: "evidence-1",
+  };
+  const forged = {
+    ...key,
+    episode_id: recoveryEpisodeId(key),
+    class: "workflow-state",
+    action: "repair_pipeline_item",
+    outcome: "started",
+    attempts_per_strategy: { repair_pipeline_item: 1 },
+    strategy_cursor: 1,
+    next_eligible_at: "2026-09-02T00:00:00.000Z",
+  };
+  assert.equal(isAuthoritativeEpisodeState(forged), false);
+  assert.equal(isAuthoritativeEpisodeState(forged, [forged]), false);
+  assert.equal(ledgerEpisodesAreAuthoritative([forged]), false);
+});
+
+test("skips from another episode do not justify a predecessor", () => {
+  const key = {
+    operation: "loop_recovery",
+    invariant: "workflow-state",
+    candidate_epoch: "epoch-1",
+    evidence_identity: "evidence-1",
+  };
+  const otherKey = { ...key, evidence_identity: "other-evidence" };
+  const current = {
+    ...key,
+    episode_id: recoveryEpisodeId(key),
+    class: "workflow-state",
+    action: "repair_pipeline_item",
+    outcome: "started",
+    attempts_per_strategy: { repair_pipeline_item: 1 },
+    strategy_cursor: 1,
+    next_eligible_at: "2026-09-02T00:00:00.000Z",
+  };
+  const foreignSkip = {
+    ...otherKey,
+    episode_id: recoveryEpisodeId(otherKey),
+    class: "workflow-state",
+    action: "resync_workflow_state",
+    outcome: "skipped",
+    attempts_per_strategy: {},
+    strategy_cursor: 1,
+    next_eligible_at: "2026-09-02T00:00:00.000Z",
+  };
+  assert.equal(isAuthoritativeEpisodeState(current, [foreignSkip, current]), false);
+  assert.equal(ledgerEpisodesAreAuthoritative([foreignSkip, current]), false);
+});
+
+test("nonterminal cursor with only a later recipe attempted is quarantined", async () => {
+  const { deps, files, token } = await setup();
+  const published = [...files.keys()].find((k) => k.endsWith("/ledger.json"))!;
+  files.delete(lastValidPathFor(published));
+  const key = {
+    operation: "loop_recovery",
+    invariant: "workflow-state",
+    candidate_epoch: "epoch-1",
+    evidence_identity: "evidence-1",
+  };
+  const base = await readLedger(deps, "run-1", token);
+  const forged = {
+    ...base,
+    recovery_attempts: [
+      {
+        item_id: "100",
+        seq: 0,
+        time: "2026-09-02T00:00:00.000Z",
+        class: "workflow-state",
+        action: "repair_pipeline_item",
+        outcome: "started",
+        episode_id: recoveryEpisodeId(key),
+        operation: key.operation,
+        invariant: key.invariant,
+        candidate_epoch: key.candidate_epoch,
+        evidence_identity: key.evidence_identity,
+        attempts_per_strategy: { repair_pipeline_item: 1 },
+        strategy_cursor: 1,
+        next_eligible_at: "2026-09-02T00:00:00.000Z",
+      },
+    ],
+  };
+  files.set(published, JSON.stringify(forged));
+  await assert.rejects(() => readLedger(deps, "run-1"), /persist requires the current lock holder's token/);
+  const owned = await readLedger(deps, "run-1", token);
+  assert.equal(owned.cooling?.theme, DURABLE_GENERATION_QUARANTINE_THEME);
+});
+
 test("5.8 unauthenticated read does not overwrite a corrupt ledger that still carries a started claim", async () => {
   const { deps, files, token } = await setup();
   const published = [...files.keys()].find((k) => k.endsWith("/ledger.json"))!;

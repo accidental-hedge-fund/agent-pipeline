@@ -148,6 +148,7 @@ function collectSkippedRecipes(
   }
   const rows = history.length > 0 ? history : [value];
   for (const row of rows) {
+    if (value.episode_id != null && row.episode_id !== value.episode_id) continue;
     if (row.outcome === "skipped" && isRecoveryRecipe(row.action)) skipped.add(row.action);
   }
   return skipped;
@@ -188,26 +189,21 @@ function numericCounts(persisted: Record<string, unknown>): Record<string, numbe
   return counts;
 }
 
-/** High-water cursor justified by skipped / exhausted / in-progress recipes. */
+/** Prefix-proof cursor: every recipe below the cursor is skipped or bound-exhausted.
+ *  A later recipe's attempts cannot justify skipping an unaccounted predecessor. */
 function justifiedStrategyCursor(
   recipes: readonly RecoveryRecipe[],
   bound: number,
   counts: Record<string, number>,
   skipped: Set<string>,
 ): number {
-  let justified = 0;
   for (let i = 0; i < recipes.length; i++) {
     const recipe = recipes[i]!;
     const spent = counts[recipe] ?? 0;
-    if (skipped.has(recipe)) {
-      justified = Math.max(justified, i + 1);
-    } else if (bound > 0 && spent >= bound) {
-      justified = Math.max(justified, i + 1);
-    } else if (spent > 0) {
-      justified = Math.max(justified, i);
-    }
+    if (skipped.has(recipe) || (bound > 0 && spent >= bound)) continue;
+    return i;
   }
-  return justified;
+  return recipes.length;
 }
 
 function sequenceFullyAccounted(
@@ -529,6 +525,7 @@ export function attachEpisodeFields(
     evidence_identity: episode.evidence_identity,
     attempts_per_strategy: { ...episode.attempts_per_strategy },
     strategy_cursor: episode.strategy_cursor,
+    skipped_strategies: [...episode.skipped_strategies],
     next_eligible_at: episode.next_eligible_at,
     side_effect_certainty: attempt.side_effect_certainty ?? (attempt.outcome === "started" ? "uncertain" : attempt.side_effect_certainty),
   };
