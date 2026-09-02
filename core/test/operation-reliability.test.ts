@@ -3,6 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  REQUIRED_LIFECYCLE_CLASSES_1333,
   aggregateUniqueOperationReliability,
   attemptsFromRunArtifacts,
   filterAttemptsBoundToCandidate,
@@ -40,6 +41,7 @@ function packInput(over: Record<string, unknown> = {}) {
     attestation_key: FRG_UNIT_TEST_ATTESTATION_KEY,
     unique_operations: passingUniqueOperationAttempts(),
     unique_operation_manifest: passingUniqueOperationManifest({ release_identity: "1.30.0" }),
+    matrix_covered_lifecycle_classes: [...REQUIRED_LIFECYCLE_CLASSES_1333],
     ...over,
   };
 }

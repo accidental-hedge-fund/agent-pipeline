@@ -9,6 +9,7 @@ import { test } from "node:test";
 import {
   MATRIX_EXAMPLE_HOSTS,
   MATRIX_FAULT_STATES,
+  MATRIX_PUBLIC_ENTRYPOINTS,
   MATRIX_REQUIRED_HOSTS,
   observeAdapterFault,
 } from "../scripts/fault-recovery-matrix.ts";
@@ -37,14 +38,21 @@ for (const host of MATRIX_REQUIRED_HOSTS) {
       assert.ok(report, `conformance kit missing host ${host}`);
       assert.equal(report.ok, true, JSON.stringify(report.failures));
     }
-    for (const fault of MATRIX_FAULT_STATES) {
-      const obs = observeAdapterFault({ fault_state: fault });
-      assert.equal(obs.declared_run_terminal, false);
-      assert.notEqual(obs.unique_operation_terminal, "false_human_projection");
-      assert.notEqual(obs.unique_operation_terminal, "ownerless_terminal");
-      assert.equal(obs.supervisor_stop, false);
-    }
   });
+  for (const entrypoint of MATRIX_PUBLIC_ENTRYPOINTS) {
+    test(`host conformance: ${host} ${entrypoint}`, () => {
+      for (const fault of MATRIX_FAULT_STATES) {
+        const obs = observeAdapterFault({
+          fault_state: fault,
+          supervisor: { stop: null, cooling: { reason: "strategy_cursor_exhausted" } },
+        });
+        assert.equal(obs.declared_run_terminal, false);
+        assert.notEqual(obs.unique_operation_terminal, "false_human_projection");
+        assert.notEqual(obs.unique_operation_terminal, "ownerless_terminal");
+        assert.equal(obs.supervisor_stop, false);
+      }
+    });
+  }
 }
 
 test("Hermes and OpenClaw stay example-supervisor fixtures", () => {

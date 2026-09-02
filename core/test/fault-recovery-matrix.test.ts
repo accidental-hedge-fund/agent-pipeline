@@ -15,10 +15,13 @@ import {
   MATRIX_NOT_APPLICABLE_REASONS,
   MATRIX_PUBLIC_ENTRYPOINTS,
   SEMVER_ONLY_PHASES,
+  adapterResponseFromFault,
   assertFaultRecoveryCoveragePresent,
   assertFaultRecoveryInventoryComplete,
   collectFaultRecoveryInventoryGaps,
+  coveredLifecycleClassesFromExecutedRows,
   coveredLifecycleClassesFromMatrix,
+  injectOperationAdapterFault,
   isEvalHoldoutModule,
   missingRequiredLifecycleCoverage,
   observeAdapterFault,
@@ -26,8 +29,18 @@ import {
   observeTypedPreflightRefusal,
   requiredMatrixOperations,
   resumeKnownCompleteSideEffect,
+  type ExecutedMatrixRow,
   type FaultRecoveryMatrixRow,
 } from "../scripts/fault-recovery-matrix.ts";
+import { driveSupervisor, type SupervisorDeps } from "../scripts/loop/supervisor.ts";
+import { DEFAULT_RECOVERY_POLICY } from "../scripts/loop/recovery.ts";
+import { initRun, type LoopStoreDeps } from "../scripts/loop/store.ts";
+import {
+  LOOP_CONTRACT_SCHEMA,
+  LOOP_LEDGER_SCHEMA,
+  type LoopContract,
+  type LoopLedger,
+} from "../scripts/loop/types.ts";
 import {
   REQUIRED_LIFECYCLE_CLASSES_1333,
   REQUIRED_PUBLIC_ENTRYPOINTS,
@@ -47,6 +60,171 @@ import {
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CORE_ROOT = join(__dirname, "..");
+const EXECUTED_SHA = "b".repeat(40);
+
+function executedRowsForSha(
+  sha: string,
+  classes: readonly string[] = MATRIX_LIFECYCLE_CLASSES,
+  passed = true,
+): ExecutedMatrixRow[] {
+  const rows: ExecutedMatrixRow[] = [];
+  for (const cls of classes) {
+    for (const layer of MATRIX_COVERAGE_LAYERS) {
+      rows.push({
+        candidate_sha: sha,
+        layer,
+        lifecycle_class: cls as ExecutedMatrixRow["lifecycle_class"],
+        operation: "drive",
+        fault_state: "exception",
+        entrypoint: "drive",
+        host: "direct_cli",
+        passed,
+      });
+    }
+  }
+  return rows;
+}
+
+function inMemoryLoopStore(): LoopStoreDeps {
+  const files = new Map<string, string>();
+  let clock = Date.parse("2026-07-23T00:00:00.000Z");
+  let uuid = 0;
+  return {
+    async fsExists(p) {
+      return files.has(p) || [...files.keys()].some((k) => k.startsWith(`${p}/`));
+    },
+    async readTextFile(p) {
+      return files.get(p) ?? null;
+    },
+    async writeFileAtomic(p, content) {
+      files.set(p, content);
+    },
+    async createFileExclusive(p, content) {
+      if (files.has(p)) return false;
+      files.set(p, content);
+      return true;
+    },
+    async removeFile(p) {
+      files.delete(p);
+    },
+    async removeFileIfMatches(p, expected) {
+      if (files.get(p) !== expected) return false;
+      files.delete(p);
+      return true;
+    },
+    async appendLine(p, line) {
+      files.set(p, `${files.get(p) ?? ""}${line}\n`);
+    },
+    async mkdirp() {},
+    async renameDirExclusive(from, to) {
+      const prefix = `${from}/`;
+      if ([...files.keys()].some((k) => k === to || k.startsWith(`${to}/`))) return false;
+      for (const k of [...files.keys()]) {
+        if (k.startsWith(prefix)) {
+          files.set(`${to}/${k.slice(prefix.length)}`, files.get(k)!);
+          files.delete(k);
+        }
+      }
+      return true;
+    },
+    async listDir(p) {
+      const prefix = `${p}/`;
+      return [...files.keys()].filter((k) => k.startsWith(prefix)).map((k) => k.slice(prefix.length).split("/")[0]);
+    },
+    async isPidAlive() {
+      return false;
+    },
+    hostname: () => "host-a",
+    pid: () => 111,
+    now: () => new Date((clock += 1000)),
+    uuid: () => `uuid-${uuid++}`,
+    env: { AGENT_PIPELINE_STATE_HOME: `/state-frg-adapter-${uuid}` },
+  };
+}
+
+async function consumeAtSupervisor(fault: Parameters<typeof adapterResponseFromFault>[0]["fault_state"]) {
+  const { raw, response } = adapterResponseFromFault({ fault_state: fault, item_id: "100", run_id: "run-1" });
+  const store = inMemoryLoopStore();
+  const contract: LoopContract = {
+    schema: LOOP_CONTRACT_SCHEMA,
+    run_id: "run-1",
+    engine: "claude",
+    repo: { name: "acme/widgets", base_branch: "main" },
+    selector: { type: "milestone", value: "v2" },
+    objective: "adapter contract",
+    worktree_policy: "default",
+    done_definition: "pipeline:ready-to-deploy",
+    authority_grants: ["push_pr", "merge", "release", "deploy"],
+    recovery_budgets: { default: 3 },
+    recovery_policy: Object.fromEntries(
+      Object.entries(DEFAULT_RECOVERY_POLICY).map(([k, v]) => [
+        k,
+        { ...v, backoff: { initial_seconds: 0, multiplier: 1, max_seconds: 0 } },
+      ]),
+    ) as typeof DEFAULT_RECOVERY_POLICY,
+    consecutive_blocked_limit: 3,
+    verification: null,
+    report_format: "markdown",
+    ordering: "dependency_sequential",
+    max_active_items: 1,
+    concurrency_model: "exclusive_lock_single_engine",
+    items: [{ id: "100", depends_on: [] }],
+    canonical_hash: "deadbeef",
+  };
+  const ledger: LoopLedger = {
+    schema: LOOP_LEDGER_SCHEMA,
+    run_id: "run-1",
+    items: { "100": { id: "100", state: "pending", history: [], recovery_budgets_remaining: { default: 3 } } },
+    consecutive_blocked: 0,
+    merge_barrier: null,
+    stop: null,
+    last_native_goal_check: null,
+    last_reconciliation: null,
+    reconciliation_sequence: 0,
+    recovery_attempts: [],
+    authority_amendments: [],
+  };
+  await initRun(store, contract, ledger);
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async () => response;
+  const result = await driveSupervisor(
+    {
+      store,
+      observe: {
+        async getIssueStateAndLabels() {
+          return { state: "open", labels: ["pipeline:ready"] };
+        },
+        async findPrForIssue() {
+          return null;
+        },
+        async getPrDetail() {
+          return null;
+        },
+        async getPrChecks() {
+          return [];
+        },
+        async getLocalHead() {
+          return null;
+        },
+        async baseBranchContainsSha() {
+          return null;
+        },
+        async getLabelEvents() {
+          return [];
+        },
+        async getExternalDependencyIssueState() {
+          return null;
+        },
+        now: () => new Date("2026-07-23T00:00:00.000Z"),
+      },
+      dispatchItem,
+      executeRecovery: async () => ({ succeeded: false, evidence: "injected adapter fault", error: "injected" }),
+      probeLiveAdvance: () => ({ live: false as const }),
+      acquireItemAdvanceLock: async () => ({ release() {} }),
+    },
+    { runId: "run-1", engine: "claude", maxCycles: 20 },
+  );
+  return { raw, response, result };
+}
 
 test("matrix public entrypoints match REQUIRED_PUBLIC_ENTRYPOINTS", () => {
   assert.deepEqual([...MATRIX_PUBLIC_ENTRYPOINTS], [...REQUIRED_PUBLIC_ENTRYPOINTS]);
@@ -215,8 +393,51 @@ test("stamped helper coverage fails FRG promotion", () => {
 });
 
 test("executed matrix rows satisfy #1333 coverage", () => {
-  assert.deepEqual(coveredLifecycleClassesFromMatrix(), [...MATRIX_LIFECYCLE_CLASSES]);
-  assert.deepEqual(missingRequiredLifecycleCoverage(), []);
+  const covered = coveredLifecycleClassesFromExecutedRows(executedRowsForSha(EXECUTED_SHA), EXECUTED_SHA);
+  assert.deepEqual(covered, [...MATRIX_LIFECYCLE_CLASSES]);
+});
+
+test("static inventory is not executed coverage for a scored candidate", () => {
+  assert.deepEqual(coveredLifecycleClassesFromExecutedRows([], EXECUTED_SHA), []);
+  assert.deepEqual(
+    coveredLifecycleClassesFromExecutedRows(executedRowsForSha("c".repeat(40)), EXECUTED_SHA),
+    [],
+  );
+  const report = aggregateUniqueOperationReliability({
+    attempts: passingUniqueOperationAttempts(),
+    manifest: passingUniqueOperationManifest({ candidate_sha: EXECUTED_SHA, release_identity: "1.30.0" }),
+    candidate_sha: EXECUTED_SHA,
+  });
+  assert.ok(report.integrity.missing_required_coverage > 0);
+});
+
+test("failed executed rows do not cover a lifecycle class", () => {
+  assert.deepEqual(
+    coveredLifecycleClassesFromExecutedRows(executedRowsForSha(EXECUTED_SHA, ["mechanical"], false), EXECUTED_SHA),
+    [],
+  );
+});
+
+test("host × public entrypoint × fault host_conformance cells are inventoried", () => {
+  const row = FAULT_RECOVERY_MATRIX.find(
+    (r) =>
+      r.host === "codex" &&
+      r.entrypoint === "single" &&
+      r.fault_state === "timeout" &&
+      r.layer === "host_conformance",
+  );
+  assert.ok(row, "expected codex × single × timeout × host_conformance covering row");
+});
+
+test("missing host × entrypoint cell fails the inventory guard", () => {
+  const without = FAULT_RECOVERY_MATRIX.filter(
+    (r) => !(r.host === "codex" && r.entrypoint === "single" && r.layer === "host_conformance"),
+  );
+  const gaps = collectFaultRecoveryInventoryGaps(without);
+  assert.ok(
+    gaps.some((g) => g.class_id.includes("codex") && g.class_id.includes("single")),
+    `expected missing codex × single cell, got ${JSON.stringify(gaps.slice(0, 5))}`,
+  );
 });
 
 for (const layer of MATRIX_COVERAGE_LAYERS) {
@@ -226,8 +447,16 @@ for (const layer of MATRIX_COVERAGE_LAYERS) {
 }
 
 for (const fault of MATRIX_FAULT_STATES) {
-  test(`adapter contract: ${fault}`, () => {
-    const obs = observeAdapterFault({ fault_state: fault });
+  test(`adapter contract: ${fault}`, async () => {
+    const raw = injectOperationAdapterFault({ fault_state: fault });
+    assert.equal(raw.declared_run_terminal, false, `${fault} adapter declared terminal`);
+    const { response, result } = await consumeAtSupervisor(fault);
+    assert.notEqual(response.outcome, undefined);
+    assert.equal(result.stop, null, `${fault} RecoverySupervisor STOP`);
+    const obs = observeAdapterFault({
+      fault_state: fault,
+      supervisor: { stop: result.stop, cooling: result.cooling ?? null },
+    });
     assert.equal(obs.declared_run_terminal, false);
     assert.equal(obs.false_human, false);
     assert.equal(obs.ownerless_terminal, false);

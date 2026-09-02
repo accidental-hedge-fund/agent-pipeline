@@ -6,7 +6,7 @@
 // or scheduler.
 
 import * as crypto from "node:crypto";
-import { coveredLifecycleClassesFromMatrix } from "./fault-recovery-matrix.ts";
+import { coveredLifecycleClassesFromExecutedRows, type ExecutedMatrixRow } from "./fault-recovery-matrix.ts";
 
 function stableFingerprint(value: unknown): string {
   const canonical = (v: unknown): unknown => {
@@ -254,11 +254,13 @@ export function aggregateUniqueOperationReliability(input: {
   candidate_sha?: string;
   release_identity?: string;
   /**
-   * Executed matrix coverage for the scored candidate. `undefined` reads the
-   * live inventory. An explicit list (including empty) is the test overlay:
-   * stamped helper classes cannot satisfy #1333 without these rows.
+   * Executed matrix coverage for the scored candidate. `undefined` reads
+   * executed rows bound to the scored SHA. An explicit list (including empty)
+   * is the test overlay. Static inventory never satisfies this field.
    */
   matrix_covered_lifecycle_classes?: readonly string[] | null;
+  /** Executed matrix-row records keyed to candidate SHA and coverage layer. */
+  executed_matrix_rows?: readonly ExecutedMatrixRow[];
 }): UniqueOperationReliability {
   const manifest = input.manifest ?? {};
   const requiredEntrypoints = [...(manifest.required_entrypoints ?? REQUIRED_PUBLIC_ENTRYPOINTS)];
@@ -268,13 +270,13 @@ export function aggregateUniqueOperationReliability(input: {
   let missingCorrelation = 0;
   let contradictoryCorrelation = 0;
   const observedEntrypoints = new Set<string>();
+  const scoredSha = (manifest.candidate_sha ?? input.candidate_sha ?? "").trim();
   const matrixCovered = new Set<string>(
     input.matrix_covered_lifecycle_classes !== undefined
       ? input.matrix_covered_lifecycle_classes ?? []
-      : coveredLifecycleClassesFromMatrix(),
+      : coveredLifecycleClassesFromExecutedRows(input.executed_matrix_rows ?? [], scoredSha),
   );
   const claimedLifecycle = new Set<string>(manifest.covered_lifecycle_classes ?? []);
-  const scoredSha = (manifest.candidate_sha ?? input.candidate_sha ?? "").trim();
   const scoredRelease = (manifest.release_identity ?? input.release_identity ?? "").trim();
 
   const byId = new Map<
@@ -799,7 +801,6 @@ const PASSING_L = "lop-frg-required-coverage";
 
 /** Hermetic passing unique-operation attempts for FRG unit fixtures. */
 export function passingUniqueOperationAttempts(): UniqueOperationAttempt[] {
-  const covered = coveredLifecycleClassesFromMatrix();
   return REQUIRED_PUBLIC_ENTRYPOINTS.map((entrypoint) => ({
     run_id: `run-${entrypoint}`,
     logical_operation_id: PASSING_L,
@@ -810,7 +811,6 @@ export function passingUniqueOperationAttempts(): UniqueOperationAttempt[] {
     terminal: "verified_success" as const,
     train_loop_linked: entrypoint === "train" || entrypoint === "loop",
     child_logical_operation_id: PASSING_L,
-    covered_lifecycle_classes: [...covered],
     evidence_refs: [`run:run-${entrypoint}`],
   }));
 }
@@ -895,11 +895,10 @@ export function passingUniqueOperationManifest(input: {
   candidate_sha?: string;
   release_identity?: string;
 } = {}): UniqueOperationManifest {
-  const covered = coveredLifecycleClassesFromMatrix();
   return {
     required_entrypoints: [...REQUIRED_PUBLIC_ENTRYPOINTS],
     required_lifecycle_classes: [...REQUIRED_LIFECYCLE_CLASSES_1333],
-    covered_lifecycle_classes: [...covered],
+    covered_lifecycle_classes: [],
     live_train_linkage_present: true,
     candidate_sha: input.candidate_sha ?? "a".repeat(40),
     release_identity: input.release_identity ?? "",

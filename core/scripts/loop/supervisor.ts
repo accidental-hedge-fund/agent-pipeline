@@ -945,13 +945,12 @@ async function executeBlockedRecovery(
     const policy = contract.recovery_policy[item.blocked_theme];
     // Repeated byte-identical evidence is bounded independently of the class
     // retry budget: at `repeated_evidence_limit` no further attempt is claimed
-    // here — the idle-promotion branch in runSupervisorCycle records the
-    // repeated_no_progress stop once the scheduler proves no independent
-    // sibling is schedulable.
+    // here — the idle-promotion branch in runSupervisorCycle records Cooling
+    // once the scheduler proves no independent sibling is schedulable.
     if ((item.repeated_evidence_count ?? 0) >= policy.repeated_evidence_limit) {
       // Durable trace for the per-cycle skip (mirrors the coexistence
       // deferrals' events): without it the at-limit refusal leaves no run-trail
-      // record until the idle promotion records the terminal stop.
+      // record until the idle promotion records Cooling.
       await appendEvent(deps.store, runId, token, "loop_recovery_preflight_deferred", {
         item_id: itemId,
         reason: "repeated_evidence_limit",
@@ -1833,8 +1832,10 @@ export async function runSupervisorCycle(
       };
     }
 
-    // Engine-owned exhaustion is item-local until the scheduler proves no
-    // independent sibling remains. Only then is it promoted to a run stop.
+    // Engine-owned strategy-cursor exhaustion stays item-local Cooling (or an
+    // external wait). Repeated evidence and run_fatal policy must not
+    // terminalize this branch — those flags describe independent non-exhaustion
+    // fatalities handled before this promotion.
     const exhausted = Object.values(ledger.items).find((candidate) => {
       if (candidate.state !== "blocked" || !candidate.blocked_theme) return false;
       if (
@@ -1852,33 +1853,7 @@ export async function runSupervisorCycle(
       return remaining <= 0 || (candidate.repeated_evidence_count ?? 0) >= policy.repeated_evidence_limit;
     });
     if (exhausted?.blocked_theme) {
-      const policy = contract.recovery_policy[exhausted.blocked_theme as DurableBlockerClass];
-      const repeated = (exhausted.repeated_evidence_count ?? 0) >= policy.repeated_evidence_limit;
       const time = deps.store.now().toISOString();
-      if (repeated || policy.run_fatal) {
-        const stop: LoopStopRecord = {
-          reason: repeated ? "repeated_no_progress" : "run_fatal",
-          time,
-          item_id: exhausted.id,
-          theme: exhausted.blocked_theme,
-          ...(repeated && exhausted.evidence_fingerprint ? { fingerprint: exhausted.evidence_fingerprint } : {}),
-          outstanding_ready: outstandingReadyItemIds(ledger),
-        };
-        ledger = { ...ledger, stop };
-        await writeLedger(deps.store, ledger, token);
-        await appendEvent(deps.store, runId, token, "loop_run_stopped", {
-          reason: stop.reason,
-          item_id: exhausted.id,
-          theme: exhausted.blocked_theme,
-        });
-        return {
-          progress: recoveryProgress,
-          stop,
-          holdOutstanding: false,
-          allDone: false,
-          heldItemIds: heldItemIdsFromLedger(ledger),
-        };
-      }
       const cooling: LoopCoolingRecord = {
         reason: "strategy_cursor_exhausted",
         time,

@@ -11,12 +11,15 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { COMMAND_REGISTRY } from "./command-registry.ts";
+import { classifyGhError, classifyHarnessFailure } from "./escalation-classify.ts";
+import { LOOP_EXECUTION_CONTRACT_SCHEMA, type LoopExecutionResponse } from "./loop-execution-contract.ts";
 import { BUILTIN_OUTER_HOST_IDS } from "./outer-hosts/types.ts";
 import type {
   RequiredLifecycleClass1333,
   RequiredPublicEntrypoint,
   UniqueOperationTerminal,
 } from "./operation-reliability.ts";
+import { buildStageDiagnostic, type StageDiagnostic } from "./stage-diagnostic.ts";
 
 /** Must stay equal to `REQUIRED_PUBLIC_ENTRYPOINTS` (asserted by the inventory test). */
 export const MATRIX_PUBLIC_ENTRYPOINTS = [
@@ -238,55 +241,91 @@ function naRow(input: {
   };
 }
 
-function buildInventory(): FaultRecoveryMatrixRow[] {
-  const rows: FaultRecoveryMatrixRow[] = [];
-  const operations = requiredMatrixOperations();
+export interface RequiredMatrixCell {
+  operation: string;
+  fault_state: MatrixFaultState;
+  entrypoint: string;
+  host: string;
+  layer: MatrixCoverageLayer;
+}
 
-  for (const fault of MATRIX_FAULT_STATES) {
-    rows.push(
-      coveringRow({
-        operation: "drive",
-        fault_state: fault,
-        entrypoint: "drive",
-        host: "direct_cli",
-        layer: "adapter_contract",
-        covering_module: ADAPTER_MODULE,
-        covering_test_name_substring: `adapter contract: ${fault}`,
-      }),
-    );
-  }
+export function matrixCellKey(cell: {
+  layer: string;
+  operation: string;
+  fault_state: string;
+  entrypoint: string;
+  host: string;
+}): string {
+  return `${cell.layer}|${cell.operation}|${cell.fault_state}|${cell.entrypoint}|${cell.host}`;
+}
+
+/**
+ * Applicable cells: adapter-contract and installed-CLI bind to direct CLI;
+ * host-conformance is every required host × every public entrypoint × fault.
+ */
+export function requiredApplicableMatrixCells(): RequiredMatrixCell[] {
+  const cells: RequiredMatrixCell[] = [];
+  const operations = requiredMatrixOperations();
 
   for (const operation of operations) {
     const entrypoint = isPublicEntrypoint(operation) ? operation : "drive";
     for (const fault of MATRIX_FAULT_STATES) {
-      rows.push(
-        coveringRow({
-          operation,
-          fault_state: fault,
-          entrypoint,
-          host: "direct_cli",
-          layer: "installed_cli",
-          covering_module: INSTALLED_CLI_MODULE,
-          covering_test_name_substring: `installed-cli: ${operation}`,
-        }),
-      );
+      cells.push({
+        operation,
+        fault_state: fault,
+        entrypoint,
+        host: "direct_cli",
+        layer: "adapter_contract",
+      });
+      cells.push({
+        operation,
+        fault_state: fault,
+        entrypoint,
+        host: "direct_cli",
+        layer: "installed_cli",
+      });
     }
   }
 
   for (const host of MATRIX_REQUIRED_HOSTS) {
-    for (const fault of MATRIX_FAULT_STATES) {
-      rows.push(
-        coveringRow({
-          operation: "drive",
+    for (const entrypoint of MATRIX_PUBLIC_ENTRYPOINTS) {
+      for (const fault of MATRIX_FAULT_STATES) {
+        cells.push({
+          operation: entrypoint,
           fault_state: fault,
-          entrypoint: "drive",
+          entrypoint,
           host,
           layer: "host_conformance",
-          covering_module: HOST_MODULE,
-          covering_test_name_substring: `host conformance: ${host}`,
-        }),
-      );
+        });
+      }
     }
+  }
+  return cells;
+}
+
+function coveringModuleForLayer(layer: MatrixCoverageLayer): string {
+  if (layer === "adapter_contract") return ADAPTER_MODULE;
+  if (layer === "installed_cli") return INSTALLED_CLI_MODULE;
+  return HOST_MODULE;
+}
+
+function coveringTestSubstring(cell: RequiredMatrixCell): string {
+  if (cell.layer === "adapter_contract") return `adapter contract: ${cell.fault_state}`;
+  if (cell.layer === "installed_cli") return `installed-cli: ${cell.operation}`;
+  return `host conformance: ${cell.host} ${cell.entrypoint}`;
+}
+
+function buildInventory(): FaultRecoveryMatrixRow[] {
+  const rows: FaultRecoveryMatrixRow[] = [];
+
+  for (const cell of requiredApplicableMatrixCells()) {
+    rows.push(
+      coveringRow({
+        ...cell,
+        covering_module: coveringModuleForLayer(cell.layer),
+        covering_test_name_substring: coveringTestSubstring(cell),
+      }),
+    );
   }
 
   for (const host of MATRIX_EXAMPLE_HOSTS) {
@@ -481,6 +520,20 @@ export function collectFaultRecoveryInventoryGaps(
     }
   }
 
+  const seenCells = new Set(
+    rows
+      .filter((row) => !row.ship_phase)
+      .map((row) => matrixCellKey(row)),
+  );
+  for (const cell of requiredApplicableMatrixCells()) {
+    const key = matrixCellKey(cell);
+    if (seenCells.has(key)) continue;
+    gaps.push({
+      class_id: `${cell.layer}:${cell.host}:${cell.entrypoint}:${cell.fault_state}`,
+      reason: `missing covering row or not_applicable for ${cell.layer} ${cell.host} × ${cell.entrypoint} × ${cell.fault_state}`,
+    });
+  }
+
   return gaps;
 }
 
@@ -544,8 +597,9 @@ export function assertFaultRecoveryCoveragePresent(coreRoot?: string): void {
 }
 
 /**
- * Lifecycle classes proved by executed covering rows on every required layer.
- * Checked `not_applicable` cells do not increment coverage.
+ * Inventory-declared classes with a covering module on every required layer.
+ * This is NOT FRG coverage — release evidence uses
+ * {@link coveredLifecycleClassesFromExecutedRows} bound to a candidate SHA.
  */
 export function coveredLifecycleClassesFromMatrix(
   rows: readonly FaultRecoveryMatrixRow[] = FAULT_RECOVERY_MATRIX,
@@ -571,6 +625,43 @@ export function missingRequiredLifecycleCoverage(
   return MATRIX_LIFECYCLE_CLASSES.filter((cls) => !covered.has(cls));
 }
 
+/** Executed matrix-row result bound to a scored candidate and coverage layer. */
+export interface ExecutedMatrixRow {
+  candidate_sha: string;
+  layer: MatrixCoverageLayer;
+  lifecycle_class: RequiredLifecycleClass1333;
+  operation: string;
+  fault_state: MatrixFaultState;
+  entrypoint: string;
+  host: string;
+  passed: boolean;
+}
+
+/**
+ * Lifecycle classes proved by passing executed rows for `candidateSha` on
+ * every required layer. Absent SHA, failed rows, and other-candidate rows
+ * do not count. Inventory declarations never satisfy this function.
+ */
+export function coveredLifecycleClassesFromExecutedRows(
+  executed: readonly ExecutedMatrixRow[],
+  candidateSha: string,
+): RequiredLifecycleClass1333[] {
+  const sha = candidateSha.trim();
+  if (!sha) return [];
+  const layersByClass = new Map<string, Set<string>>();
+  for (const row of executed) {
+    if (row.candidate_sha !== sha) continue;
+    if (!row.passed) continue;
+    const set = layersByClass.get(row.lifecycle_class) ?? new Set<string>();
+    set.add(row.layer);
+    layersByClass.set(row.lifecycle_class, set);
+  }
+  return MATRIX_LIFECYCLE_CLASSES.filter((cls) => {
+    const layers = layersByClass.get(cls);
+    return !!layers && MATRIX_COVERAGE_LAYERS.every((layer) => layers.has(layer));
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Adapter-contract observation seam (hermetic). Adapters report; they do not
 // declare the run terminal. Existing recovery ownership remains the sole owner.
@@ -591,87 +682,259 @@ export interface AdapterObservation {
 
 const TYPED_REQUEST_SET: ReadonlySet<string> = new Set(MATRIX_TYPED_REQUESTS);
 
-export function observeAdapterFault(input: {
+export interface AdapterRawResult {
+  kind:
+    | "exception"
+    | "rejection"
+    | "nonzero_exit"
+    | "signal"
+    | "timeout"
+    | "malformed"
+    | "spawn_error"
+    | "auth"
+    | "unknown_shape"
+    | "typed_request"
+    | "already_complete"
+    | "illegal_terminal"
+    | "other";
+  declared_run_terminal: boolean;
+  error?: Error;
+  exit_code?: number | null;
+  signal?: string;
+  timed_out?: boolean;
+  spawn_error?: boolean;
+  stdout?: string;
+  stderr?: string;
+  mutation_count: number;
+}
+
+export interface SupervisorIngressResult {
+  stop: { reason?: string } | null;
+  cooling?: { reason?: string } | null;
+}
+
+/**
+ * Inject a fault at the operation-adapter I/O seam. Throws/rejects/returns
+ * exit/signal/timeout/malformed output. Never chooses lifecycle treatment.
+ */
+export function injectOperationAdapterFault(input: {
   fault_state: MatrixFaultState | MatrixTypedRequest;
   mutate?: () => void;
   already_completed?: boolean;
   stop_on_exhaustion?: boolean;
-}): AdapterObservation {
-  const typed = TYPED_REQUEST_SET.has(input.fault_state);
+}): AdapterRawResult {
+  if (input.already_completed === true) {
+    return { kind: "already_complete", declared_run_terminal: false, mutation_count: 0 };
+  }
+  if (TYPED_REQUEST_SET.has(input.fault_state)) {
+    return { kind: "typed_request", declared_run_terminal: false, mutation_count: 0 };
+  }
+  if (input.stop_on_exhaustion === true) {
+    return { kind: "illegal_terminal", declared_run_terminal: true, mutation_count: 0 };
+  }
+
+  const fault = input.fault_state as MatrixFaultState;
   let mutationCount = 0;
   const mutate = () => {
     mutationCount += 1;
     input.mutate?.();
   };
-
-  if (input.already_completed === true) {
-    return {
-      fault_state: input.fault_state,
-      lifecycle_class: typed ? "typed_request" : FAULT_STATE_LIFECYCLE[input.fault_state as MatrixFaultState],
-      declared_run_terminal: false,
-      unique_operation_terminal: "cooling_recovery",
-      false_human: false,
-      ownerless_terminal: false,
-      supervisor_stop: false,
-      unauthorized_mutation: false,
-      side_effect_replayed: false,
-      mutation_count: 0,
-    };
-  }
-
-  if (typed) {
-    return {
-      fault_state: input.fault_state,
-      lifecycle_class: "typed_request",
-      declared_run_terminal: false,
-      unique_operation_terminal: "typed_request",
-      false_human: false,
-      ownerless_terminal: false,
-      supervisor_stop: false,
-      unauthorized_mutation: false,
-      side_effect_replayed: false,
-      mutation_count: 0,
-    };
-  }
-
-  const fault = input.fault_state as MatrixFaultState;
-  const terminal = expectedTerminalForFault(fault);
-  if (input.stop_on_exhaustion === true) {
-    return {
-      fault_state: fault,
-      lifecycle_class: FAULT_STATE_LIFECYCLE[fault],
-      declared_run_terminal: true,
-      unique_operation_terminal: "ownerless_terminal",
-      false_human: false,
-      ownerless_terminal: true,
-      supervisor_stop: true,
-      unauthorized_mutation: false,
-      side_effect_replayed: false,
-      mutation_count: 0,
-    };
-  }
-
   if (
-    fault === "interrupted_or_uncertain_side_effect" ||
-    fault === "process_death_at_side_effect_boundary"
+    fault !== "interrupted_or_uncertain_side_effect" &&
+    fault !== "process_death_at_side_effect_boundary" &&
+    fault !== "strategy_exhaustion"
   ) {
-    // Uncertain: do not mutate until the observer proves the invariant.
-  } else if (fault !== "strategy_exhaustion") {
     mutate();
   }
 
+  try {
+    switch (fault) {
+      case "exception":
+        throw new Error("adapter exception");
+      case "rejection": {
+        let captured: Error | undefined;
+        void Promise.reject(new Error("adapter rejection")).catch((err: Error) => {
+          captured = err;
+        });
+        return {
+          kind: "rejection",
+          declared_run_terminal: false,
+          error: captured ?? new Error("adapter rejection"),
+          mutation_count: mutationCount,
+        };
+      }
+      case "nonzero_exit":
+        return { kind: "nonzero_exit", declared_run_terminal: false, exit_code: 1, mutation_count: mutationCount };
+      case "signal":
+        return {
+          kind: "signal",
+          declared_run_terminal: false,
+          exit_code: null,
+          signal: "SIGTERM",
+          mutation_count: mutationCount,
+        };
+      case "timeout":
+        return { kind: "timeout", declared_run_terminal: false, timed_out: true, mutation_count: mutationCount };
+      case "malformed_or_contradictory_output":
+        return {
+          kind: "malformed",
+          declared_run_terminal: false,
+          stdout: "{not-json",
+          mutation_count: mutationCount,
+        };
+      case "unavailable_harness":
+      case "observer_failure":
+        return {
+          kind: "spawn_error",
+          declared_run_terminal: false,
+          spawn_error: true,
+          mutation_count: mutationCount,
+        };
+      case "authentication":
+        return {
+          kind: "auth",
+          declared_run_terminal: false,
+          stderr: "HTTP 401 authentication required",
+          mutation_count: mutationCount,
+        };
+      case "unseen_provider_error_shape":
+        return {
+          kind: "unknown_shape",
+          declared_run_terminal: false,
+          stderr: "XYZ-UNSEEN-PROVIDER-SHAPE 999",
+          mutation_count: mutationCount,
+        };
+      default:
+        return { kind: "other", declared_run_terminal: false, mutation_count: mutationCount };
+    }
+  } catch (err) {
+    return {
+      kind: "exception",
+      declared_run_terminal: false,
+      error: err instanceof Error ? err : new Error(String(err)),
+      mutation_count: mutationCount,
+    };
+  }
+}
+
+function diagnosticFromRaw(
+  raw: AdapterRawResult,
+  faultState: MatrixFaultState | MatrixTypedRequest,
+): StageDiagnostic {
+  if (TYPED_REQUEST_SET.has(faultState)) {
+    return buildStageDiagnostic({
+      reasonCode: faultState === "capability_request" ? "capability-refusal" : "human-decision-required",
+      blockerKind: faultState === "authority_request" ? "human-decision-required" : "needs-human",
+      reason: `typed ${faultState}`,
+      stage: "adapter-contract",
+      ...(faultState === "authority_request" || faultState === "decision_request"
+        ? {
+            authorityEvidence: [
+              {
+                category: faultState === "authority_request" ? "authority" : "product-decision",
+                finding_key: "deadbeef",
+                finding_fingerprint: "0123456789abcdef",
+                reviewed_sha: "abc123",
+              },
+            ],
+          }
+        : {}),
+    });
+  }
+  if (raw.kind === "auth") {
+    const gh = classifyGhError(raw.stderr ?? "");
+    return buildStageDiagnostic({
+      reasonCode: gh.reason_code,
+      blockerKind: "harness-failure",
+      reason: raw.stderr ?? "authentication failure",
+      stage: "adapter-contract",
+    });
+  }
+  const reasonCode = classifyHarnessFailure({
+    timed_out: raw.timed_out === true,
+    spawn_error: raw.spawn_error === true,
+    code:
+      raw.exit_code ??
+      (raw.kind === "nonzero_exit" ? 1 : raw.kind === "exception" || raw.kind === "rejection" ? 1 : null),
+    stdout: raw.stdout,
+    stderr: raw.stderr,
+  });
+  return buildStageDiagnostic({
+    reasonCode,
+    blockerKind: "harness-failure",
+    reason: raw.error?.message ?? raw.stderr ?? raw.stdout ?? `adapter ${faultState}`,
+    stage: "adapter-contract",
+  });
+}
+
+/** Adapter reports a loop-execution observation. It never writes ledger.stop. */
+export function adapterResponseFromFault(input: {
+  fault_state: MatrixFaultState | MatrixTypedRequest;
+  mutate?: () => void;
+  already_completed?: boolean;
+  stop_on_exhaustion?: boolean;
+  item_id?: string;
+  run_id?: string;
+}): { raw: AdapterRawResult; response: LoopExecutionResponse } {
+  const raw = injectOperationAdapterFault(input);
+  const typed = TYPED_REQUEST_SET.has(input.fault_state);
+  let outcome: LoopExecutionResponse["outcome"] = "blocked_recoverable";
+  if (raw.declared_run_terminal) outcome = "failed";
+  else if (typed) outcome = "blocked_needs_human";
+  else if (raw.kind === "already_complete") outcome = "ready_to_deploy";
   return {
-    fault_state: fault,
-    lifecycle_class: FAULT_STATE_LIFECYCLE[fault],
-    declared_run_terminal: false,
+    raw,
+    response: {
+      schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+      item_id: input.item_id ?? "100",
+      run_id: input.run_id ?? "run-adapter",
+      outcome,
+      evidence: { pr_number: null, pipeline_run_id: "adapter-contract" },
+      diagnostic: diagnosticFromRaw(raw, input.fault_state),
+    },
+  };
+}
+
+export function observationFromAdapterRaw(
+  raw: AdapterRawResult,
+  faultState: MatrixFaultState | MatrixTypedRequest,
+  supervisor?: SupervisorIngressResult,
+): AdapterObservation {
+  const typed = TYPED_REQUEST_SET.has(faultState);
+  const lifecycle: RequiredLifecycleClass1333 | "typed_request" = typed
+    ? "typed_request"
+    : FAULT_STATE_LIFECYCLE[faultState as MatrixFaultState];
+  const declared = raw.declared_run_terminal;
+  const supervisorStop = declared || supervisor?.stop != null;
+  const ownerless = declared || (supervisorStop && supervisor?.cooling == null);
+  let terminal: UniqueOperationTerminal;
+  if (declared || ownerless) terminal = "ownerless_terminal";
+  else if (typed) terminal = "typed_request";
+  else if (raw.kind === "already_complete") terminal = "verified_success";
+  else terminal = expectedTerminalForFault(faultState as MatrixFaultState);
+  return {
+    fault_state: faultState,
+    lifecycle_class: lifecycle,
+    declared_run_terminal: declared,
     unique_operation_terminal: terminal,
     false_human: false,
-    ownerless_terminal: false,
-    supervisor_stop: false,
+    ownerless_terminal: ownerless,
+    supervisor_stop: supervisorStop,
     unauthorized_mutation: false,
     side_effect_replayed: false,
-    mutation_count: mutationCount,
+    mutation_count: raw.mutation_count,
   };
+}
+
+export function observeAdapterFault(input: {
+  fault_state: MatrixFaultState | MatrixTypedRequest;
+  mutate?: () => void;
+  already_completed?: boolean;
+  stop_on_exhaustion?: boolean;
+  supervisor?: SupervisorIngressResult;
+}): AdapterObservation {
+  const raw = injectOperationAdapterFault(input);
+  return observationFromAdapterRaw(raw, input.fault_state, input.supervisor);
 }
 
 export function resumeKnownCompleteSideEffect(input: {

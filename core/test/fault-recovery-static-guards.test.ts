@@ -46,7 +46,19 @@ test("command-local lifecycle exit fails the static guard", () => {
 });
 
 test("direct stage-label write fails the static guard", () => {
-  const synthetic = `// command-local\nawait addLabel("pipeline:needs-human");\n`;
+  const synthetic = `await addLabel("pipeline:needs-human");\n`;
+  const hits = collectDirectStageLifecycleWrites(synthetic, "fixture.ts");
+  assert.ok(hits.some((h) => /lifecycle label write|needs-human write/.test(h.reason)));
+});
+
+test("direct addLabels of a lifecycle label fails without command-local prose", () => {
+  const synthetic = `await addLabels(n, ["pipeline:ready-to-deploy"]);\n`;
+  const hits = collectDirectStageLifecycleWrites(synthetic, "fixture.ts");
+  assert.ok(hits.some((h) => /lifecycle label write/.test(h.reason)));
+});
+
+test("direct setBlocked of a lifecycle label fails the static guard", () => {
+  const synthetic = `await setBlocked(cfg, n, reason, "fix", "pipeline:needs-human");\n`;
   const hits = collectDirectStageLifecycleWrites(synthetic, "fixture.ts");
   assert.ok(hits.some((h) => /needs-human write/.test(h.reason)));
 });

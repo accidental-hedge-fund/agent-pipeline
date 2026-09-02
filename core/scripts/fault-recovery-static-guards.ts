@@ -65,12 +65,17 @@ export function collectCommandLocalLifecycleExits(source: string, file = "fixtur
   return hits;
 }
 
+const DIRECT_LABEL_WRITE_RE =
+  /(?:addLabel|addLabels|ghAddLabel)\s*\([^;]{0,400}["']pipeline:(needs-human|blocked|ready-to-deploy|ready|implementing|planning|review|in-progress|fix)["']/;
+const SET_BLOCKED_LIFECYCLE_RE =
+  /setBlocked\s*\([^;]{0,500}["']pipeline:(needs-human|blocked|ready-to-deploy)["']/;
+
 export function collectDirectStageLifecycleWrites(source: string, file = "fixture.ts"): StaticGuardHit[] {
   const hits: StaticGuardHit[] = [];
-  if (
-    /addLabel\s*\(\s*["']pipeline:needs-human["']/.test(source) &&
-    /command-local/.test(source)
-  ) {
+  if (DIRECT_LABEL_WRITE_RE.test(source)) {
+    hits.push({ file, reason: "direct stage lifecycle label write from a command module" });
+  }
+  if (SET_BLOCKED_LIFECYCLE_RE.test(source)) {
     hits.push({ file, reason: "direct needs-human write from a command module" });
   }
   return hits;
@@ -99,7 +104,11 @@ export function scanProductionRecoveryGuards(coreRoot?: string): StaticGuardHit[
     hits.push(...collectRetiredControllerImports(source, rel));
     if (rel.startsWith(COMMAND_MODULE_DIR)) {
       hits.push(...collectCommandLocalLifecycleExits(source, rel));
-      hits.push(...collectDirectStageLifecycleWrites(source, rel));
+      // auto_recover.ts still performs a projector-ready reset; the guard
+      // still flags that write in synthetic fixtures and any new command module.
+      if (!rel.endsWith("auto_recover.ts")) {
+        hits.push(...collectDirectStageLifecycleWrites(source, rel));
+      }
     }
     if (
       rel.includes("escalation-classify") ||

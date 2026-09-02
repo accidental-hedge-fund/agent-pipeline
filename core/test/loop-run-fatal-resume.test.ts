@@ -543,11 +543,9 @@ test("eligible run_fatal resume that fatals again records a new stop time", asyn
   );
 
   assert.ok(calls.length >= 1, "dispatchItem must have been called");
-  assert.equal(result.stop?.reason, "run_fatal");
-  assert.notEqual(result.stop?.time, ORIGINAL_STOP_TIME, "new stop must not reuse the superseded time");
+  assert.equal(result.stop, null, "post-resume exhaustion is Cooling, not a new run_fatal stop");
+  assert.equal(result.cooling?.reason, "strategy_cursor_exhausted");
   const events = await readEvents(deps, RUN_ID);
-  const stopEvents = events.filter((e) => e.kind === "loop_run_stopped");
-  assert.ok(stopEvents.length >= 2, "original stop event plus a new stop event");
   assert.ok(events.some((e) => e.kind === LOOP_RUN_FATAL_SUPERSEDED));
 });
 
@@ -555,7 +553,7 @@ test("eligible run_fatal resume that fatals again records a new stop time", asyn
 // 1.4 — live-drive run_fatal policy is unchanged
 // ---------------------------------------------------------------------------
 
-test("live (non-resume) drive still persists run_fatal for workflow-engine-defect", async () => {
+test("live (non-resume) drive persists Cooling for workflow-engine-defect exhaustion", async () => {
   const contract = testContract({ items: [{ id: "1253", depends_on: [], external_depends_on: [] }] });
   const ledger = testLedger({ "1253": itemEntry("1253", "pending") }, null);
   const { deps } = fakeDeps();
@@ -568,8 +566,9 @@ test("live (non-resume) drive still persists run_fatal for workflow-engine-defec
   );
 
   assert.equal(calls.length, 1);
-  assert.equal(result.stop?.reason, "run_fatal");
-  assert.equal(result.stop?.theme, "workflow-engine-defect");
+  assert.equal(result.stop, null, "live exhaustion is Cooling, not a terminal run_fatal stop");
+  assert.equal(result.cooling?.reason, "strategy_cursor_exhausted");
+  assert.equal(result.cooling?.theme, "workflow-engine-defect");
   assert.equal(result.resumed, false);
   assert.equal(DEFAULT_RECOVERY_POLICY["workflow-engine-defect"].run_fatal, true);
 });
