@@ -29,6 +29,7 @@ import {
 import { buildGrillFingerprint } from "../scripts/grill-fingerprint.ts";
 import { planningTreatmentFromConfig } from "../scripts/grill-issue.ts";
 import { DEFAULT_CONFIG } from "../scripts/types.ts";
+import { grillAuthorityCreateInputs } from "../scripts/grill-handoff.ts";
 import { canCreateHandoff, validateHandoffResume } from "../scripts/human-question-handoff.ts";
 import { projectPipelineReasonCode } from "../scripts/stage-diagnostic.ts";
 import { COMMAND_REGISTRY } from "../scripts/command-registry.ts";
@@ -231,6 +232,55 @@ test("2.2 incomplete CapabilityRequest fails closed", () => {
   });
   assert.equal(create.ok, false);
   if (!create.ok) assert.equal(create.code, "incomplete_typed_request");
+});
+
+test("authority diagnostic without proven bindings does not invent AuthorityRequest defaults", () => {
+  const out = classifyHumanAsk({
+    reasonCode: "human-decision-required",
+    category: "authority",
+    nodeClass: "merge-release",
+    recommendation: "merge this PR",
+    source: "diagnostic",
+    tipPresent: true,
+    candidateSha: "a".repeat(40),
+    authority: {
+      repository: "acme/widgets",
+      candidate_epoch: "a".repeat(40),
+    },
+  });
+  assert.equal(out.kind, "engine-owned");
+  assert.notEqual(out.kind, "AuthorityRequest");
+});
+
+test("grill handoff create fails closed when a typed node lacks its classifier package", () => {
+  const node = makeNode({
+    id: "api",
+    question: "Which API?",
+    recommendation: "REST",
+    class: "interface-contract",
+  });
+  node.typed_request = "DecisionRequest";
+  const spec = "Spec.";
+  const art: DecisionsArtifact = {
+    schema_version: "decisions.v1",
+    nodes: [node],
+    fingerprint: testFingerprint(spec),
+    required_context: { terms: [], integration_base_sha: null, context_md_sha256: null },
+    unresolved_facts: [],
+    context_proposals: [],
+  };
+  const inputs = grillAuthorityCreateInputs({
+    domain: "pipeline",
+    repo: "acme/widgets",
+    issueNumber: 12,
+    artifact: art,
+    proposedBody: embedDecisionsInBody(spec, art),
+    frontierFp: art.fingerprint.planning_treatment_sha256,
+  });
+  assert.equal(inputs.length, 1);
+  const created = canCreateHandoff(inputs[0]!);
+  assert.equal(created.ok, false);
+  if (!created.ok) assert.equal(created.code, "incomplete_typed_request");
 });
 
 test("2.3 incomplete AuthorityRequest fails closed and never defaults a grant", () => {

@@ -10,6 +10,7 @@ When a blocked dispatch carries a current canonical `human-decision-required` di
 - **AND** the classifier auto-settles the recommendation
 - **THEN** the supervisor SHALL NOT create a needs-human hold
 - **AND** SHALL NOT emit `human_intervention`
+- **AND** SHALL persist the classifier resolution package in the durable decision record before reverting the item to pending
 
 #### Scenario: Irreducible DecisionRequest still holds
 
@@ -17,6 +18,7 @@ When a blocked dispatch carries a current canonical `human-decision-required` di
 - **AND** the classifier emits an irreducible `DecisionRequest`
 - **THEN** the supervisor SHALL move the item to a `paused` or `waiting` hold
 - **AND** SHALL retain the candidate and request evidence needed to validate a later answer
+- **AND** the hold SHALL persist the classifier `DecisionRequest` package
 
 #### Scenario: Stale label still is not authority
 

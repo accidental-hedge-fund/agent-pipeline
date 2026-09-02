@@ -136,6 +136,12 @@ An `AuthorityRequest` SHALL bind eligible actor, repository, operation, scope, c
 - **THEN** Pipeline SHALL refuse to persist the `AuthorityRequest`
 - **AND** SHALL NOT invent an assignee or a default grant
 
+#### Scenario: Diagnostic without proven bindings is not AuthorityRequest
+
+- **WHEN** a diagnostic carries category `authority` but does not prove eligible actor, operation, scope, evidence, or expiry
+- **THEN** Pipeline SHALL NOT emit an `AuthorityRequest`
+- **AND** SHALL NOT substitute generic actor, operation, scope, evidence, or expiry values
+
 ---
 
 ### Requirement: Candidate movement SHALL invalidate candidate-bound requests and grants

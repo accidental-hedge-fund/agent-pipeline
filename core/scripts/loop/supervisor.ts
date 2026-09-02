@@ -29,6 +29,7 @@ import {
 import {
   acquireLock,
   appendActionEvidence,
+  appendDecision,
   appendEvent,
   classifyStaleness,
   getStatus,
@@ -62,10 +63,11 @@ import {
   type ReconcileObserveDeps,
 } from "./reconcile.ts";
 import { blockItem, completeRecoveryAttempt, fingerprintEvidence, startRecoveryAttempt, upgradeContractForRecovery, upgradeLedgerForRecovery } from "./recovery.ts";
-import { waitItem } from "./pause.ts";
+import { waitItem, type WaitRequestInput } from "./pause.ts";
 import {
   classifyHumanAsk,
   shouldReleaseAutoSettleableHold,
+  validateDecisionPackage,
   type TypedRequestResolution,
 } from "../typed-request-resolution.ts";
 import { computeExternalDependencyStatuses, detectDependencyDeadlock, propagateSkips } from "./dependencies.ts";
@@ -1557,15 +1559,55 @@ async function classifyDispatchAsk(
     now: deps.store.now(),
     source: "diagnostic",
     authority: {
-      eligible_actor: "authenticated-operator",
       repository: contract.repo.name,
-      operation: category === "authority" ? "protected-action" : undefined,
-      scope: itemId,
-      candidate_epoch: candidateSha,
-      evidence: [diagnostic.detail.reason],
-      expiry: new Date(deps.store.now().getTime() + 14 * 24 * 60 * 60 * 1000).toISOString().replace(/\.\d{3}Z$/, "Z"),
+      ...(candidateSha ? { candidate_epoch: candidateSha } : {}),
     },
   });
+}
+
+function waitRequestFromClassifier(
+  classified: Extract<
+    TypedRequestResolution,
+    { kind: "DecisionRequest" | "CapabilityRequest" | "AuthorityRequest" }
+  >,
+  prompt: string,
+  extra: Pick<WaitRequestInput, "source" | "authority_evidence_key" | "authority_candidate_head"> = {},
+): WaitRequestInput {
+  const request: WaitRequestInput = {
+    kind: classified.pause_kind,
+    prompt,
+    ...extra,
+  };
+  if (classified.kind === "DecisionRequest") {
+    request.decision_package = classified.package;
+  } else if (classified.kind === "CapabilityRequest") {
+    request.capability_request = classified.record;
+  } else {
+    request.authority_request = classified.record;
+  }
+  return request;
+}
+
+async function persistAutoSettleAndRevert(
+  store: LoopStoreDeps,
+  input: { runId: string; token: string; itemId: string; engine: LoopEngineName },
+  classified: Extract<TypedRequestResolution, { kind: "auto-settle" }>,
+): Promise<LoopLedger> {
+  const pkg = validateDecisionPackage(classified.package);
+  if (!pkg.ok) {
+    throw new LoopError("validation", `auto-settle resolution is incomplete: ${pkg.reason}`);
+  }
+  await appendDecision(store, input.runId, input.token, "loop_item_typed_request_auto_settled", {
+    item_id: input.itemId,
+    eligibility_reason: classified.eligibility_reason,
+    package: pkg.package,
+  });
+  return revertInProgressToPending(
+    store,
+    input,
+    "typed-request auto-settled under existing authority",
+    "loop_item_typed_request_auto_settled",
+  );
 }
 
 async function reclassifyInFlightHumanHolds(
@@ -2485,11 +2527,10 @@ export async function runSupervisorCycle(
           observedHead,
         );
         if (classified.kind === "auto-settle") {
-          ledger = await revertInProgressToPending(
+          ledger = await persistAutoSettleAndRevert(
             deps.store,
             { runId, token, itemId, engine },
-            "typed-request auto-settled under existing authority",
-            "loop_item_typed_request_auto_settled",
+            classified,
           );
           evidenceOutcome = "auto_settled";
         } else if (classified.kind === "CapabilityRequest") {
@@ -2502,16 +2543,16 @@ export async function runSupervisorCycle(
               token,
               itemId,
               engine,
-              request: {
-                kind: classified.pause_kind,
-                prompt: response.diagnostic.detail.reason,
-                ...(observedHead
+              request: waitRequestFromClassifier(
+                classified,
+                response.diagnostic.detail.reason,
+                observedHead
                   ? {
                       authority_evidence_key: response.diagnostic.evidence_key,
                       authority_candidate_head: observedHead,
                     }
-                  : {}),
-              },
+                  : {},
+              ),
               note: "CapabilityRequest after shared classifier",
             });
           }
@@ -2643,11 +2684,10 @@ export async function runSupervisorCycle(
           )
         : { kind: "engine-owned" as const, reason: "missing diagnostic" };
       if (classified.kind === "auto-settle") {
-        ledger = await revertInProgressToPending(
+        ledger = await persistAutoSettleAndRevert(
           deps.store,
           { runId, token, itemId, engine },
-          "typed-request auto-settled under existing authority",
-          "loop_item_typed_request_auto_settled",
+          classified,
         );
         evidenceOutcome = "auto_settled";
       } else if (
@@ -2675,13 +2715,11 @@ export async function runSupervisorCycle(
             token,
             itemId,
             engine,
-            request: {
-              kind: classified.pause_kind,
-              prompt: response.diagnostic.detail.reason,
+            request: waitRequestFromClassifier(classified, response.diagnostic.detail.reason, {
               authority_evidence_key: response.diagnostic.evidence_key,
               authority_candidate_head: authorityIdentity.head_sha,
               ...(authorityIdentity.blocked_label_present ? { source: "pipeline_blocked_label" as const } : {}),
-            },
+            }),
             note: "explicit human-authority stage diagnostic after shared classifier",
           });
         }
@@ -2695,16 +2733,16 @@ export async function runSupervisorCycle(
             token,
             itemId,
             engine,
-            request: {
-              kind: classified.pause_kind,
-              prompt: response?.diagnostic?.detail.reason ?? classified.record.missing,
-              ...(authorityIdentity?.head_sha && response?.diagnostic
+            request: waitRequestFromClassifier(
+              classified,
+              response?.diagnostic?.detail.reason ?? classified.record.missing,
+              authorityIdentity?.head_sha && response?.diagnostic
                 ? {
                     authority_evidence_key: response.diagnostic.evidence_key,
                     authority_candidate_head: authorityIdentity.head_sha,
                   }
-                : {}),
-            },
+                : {},
+            ),
             note: "CapabilityRequest after shared classifier",
           });
         }

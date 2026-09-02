@@ -22,6 +22,12 @@ A handoff created for a `DecisionRequest` SHALL include recommendation, rational
 - **THEN** the pending handoff SHALL bind eligible actor, repository, operation, scope, candidate epoch, evidence, and expiry
 - **AND** SHALL NOT store a default grant
 
+#### Scenario: Incomplete typed node fails closed
+
+- **WHEN** create runs for a typed node that lacks its classifier package or request record
+- **THEN** handoff creation SHALL return a validation failure
+- **AND** SHALL NOT synthesize missing DecisionRequest, CapabilityRequest, or AuthorityRequest fields
+
 ---
 
 ### Requirement: Candidate movement SHALL invalidate candidate-bound handoffs and grants

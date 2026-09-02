@@ -25,7 +25,15 @@ import {
   type LoopNativeGoalCheck,
   type LoopPipelinePreflightEvidence,
 } from "./types.ts";
-import { pauseKindToTypedRequest } from "../typed-request-resolution.ts";
+import {
+  pauseKindToTypedRequest,
+  validateAuthorityRequest,
+  validateCapabilityRequest,
+  validateDecisionPackage,
+  type AuthorityRequestRecord,
+  type CapabilityRequestRecord,
+  type DecisionResolutionPackage,
+} from "../typed-request-resolution.ts";
 import { appendDecision, appendEvent, readLedger, releaseLock, requireToken, writeLedger, type LoopStoreDeps } from "./store.ts";
 
 // ---------------------------------------------------------------------------
@@ -107,6 +115,9 @@ export interface WaitRequestInput {
   source?: "pipeline_blocked_label";
   authority_evidence_key?: unknown;
   authority_candidate_head?: unknown;
+  decision_package?: unknown;
+  capability_request?: unknown;
+  authority_request?: unknown;
 }
 
 export interface EnterWaitingInput extends EnterHoldInput {
@@ -151,6 +162,7 @@ function buildHumanInputRequest(
   }
   const kind: LoopHumanInputRequestKind = req.kind;
   const typedRequest = pauseKindToTypedRequest(kind);
+  const typedFields = requireCompleteTypedRequest(kind, req);
   if (
     (req.authority_evidence_key !== undefined &&
       (typeof req.authority_evidence_key !== "string" || req.authority_evidence_key.trim() === "")) ||
@@ -172,6 +184,7 @@ function buildHumanInputRequest(
     requested_by_engine: engine,
     requested_at: deps.now().toISOString(),
     ...(typedRequest ? { typed_request: typedRequest } : {}),
+    ...typedFields,
     source: req.source,
     ...(typeof req.authority_evidence_key === "string"
       ? { authority_evidence_key: req.authority_evidence_key }
@@ -180,6 +193,63 @@ function buildHumanInputRequest(
       ? { authority_candidate_head: req.authority_candidate_head }
       : {}),
   };
+}
+
+function requireCompleteTypedRequest(
+  kind: LoopHumanInputRequestKind,
+  req: WaitRequestInput,
+): Pick<LoopHumanInputRequest, "decision_package" | "capability_request" | "authority_request"> {
+  if (kind === "decision") {
+    const pkg = validateDecisionPackage(req.decision_package as Partial<DecisionResolutionPackage> | null | undefined);
+    if (!pkg.ok) {
+      throw new LoopError("validation", pkg.reason);
+    }
+    return { decision_package: pkg.package };
+  }
+  if (kind === "answer") {
+    const rec = validateCapabilityRequest(
+      req.capability_request as Partial<CapabilityRequestRecord> | null | undefined,
+    );
+    if (!rec.ok) {
+      throw new LoopError("validation", rec.reason);
+    }
+    return { capability_request: rec.record };
+  }
+  const rec = validateAuthorityRequest(
+    req.authority_request as Partial<AuthorityRequestRecord> | null | undefined,
+    typeof req.authority_candidate_head === "string" && req.authority_candidate_head.trim().length > 0,
+  );
+  if (!rec.ok) {
+    throw new LoopError("validation", rec.reason);
+  }
+  return { authority_request: rec.record };
+}
+
+function assertPersistedTypedRequest(outstanding: LoopHumanInputRequest): void {
+  const typed = outstanding.typed_request ?? pauseKindToTypedRequest(outstanding.kind);
+  if (typed === "DecisionRequest") {
+    const pkg = validateDecisionPackage(outstanding.decision_package);
+    if (!pkg.ok) {
+      throw new LoopError("validation", pkg.reason);
+    }
+    return;
+  }
+  if (typed === "CapabilityRequest") {
+    const rec = validateCapabilityRequest(outstanding.capability_request);
+    if (!rec.ok) {
+      throw new LoopError("validation", rec.reason);
+    }
+    return;
+  }
+  if (typed === "AuthorityRequest") {
+    const rec = validateAuthorityRequest(
+      outstanding.authority_request,
+      Boolean(outstanding.authority_candidate_head),
+    );
+    if (!rec.ok) {
+      throw new LoopError("validation", rec.reason);
+    }
+  }
 }
 
 /** Transitions an in_progress item to `waiting`, requiring a well-formed
@@ -376,6 +446,7 @@ export async function resumeHold(deps: LoopStoreDeps, input: ResumeHoldInput): P
         `resume response "${input.response.value}" is not among the outstanding request's permitted responses: ${outstanding.permitted_responses.join(", ")}`,
       );
     }
+    assertPersistedTypedRequest(outstanding);
   }
 
   validatePipelinePreflightEvidence(input.pipeline_preflight);

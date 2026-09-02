@@ -25,6 +25,7 @@ import { ACTIVE_RUN_STORE_MAX_AGE_MS } from "../scripts/loop/live-advance.ts";
 import {
   acquireLock,
   initRun,
+  readDecisions,
   readEvents,
   readLedger,
   readLock,
@@ -2904,6 +2905,10 @@ test("regression (#570): a direct blocked_needs_human outcome enters a needs-hum
   assert.equal(finalLedger.items["200"].state, "waiting", "the blocked item enters a paused/waiting hold");
   assert.equal(finalLedger.items["200"].hold_request?.kind, "decision");
   assert.equal(finalLedger.items["200"].hold_request?.typed_request, "DecisionRequest");
+  assert.ok(finalLedger.items["200"].hold_request?.decision_package?.rationale);
+  assert.ok(Array.isArray(finalLedger.items["200"].hold_request?.decision_package?.alternatives));
+  assert.ok(finalLedger.items["200"].hold_request?.decision_package?.risk);
+  assert.ok((finalLedger.items["200"].hold_request?.decision_package?.evidence.length ?? 0) > 0);
   assert.notEqual(finalLedger.items["200"].blocked_theme, "missing-authority", "never classified missing-authority");
   assert.equal(
     finalLedger.items["100"].state,
@@ -2975,6 +2980,13 @@ test("product-decision auto-settle skips the human hold", async () => {
   assert.notEqual(finalLedger.items["200"].state, "waiting");
   assert.equal(finalLedger.items["200"].hold_request, undefined);
   assert.notEqual(result.holdOutstanding, true);
+  const decisions = await readDecisions(deps, "run-1");
+  const autoSettle = decisions.find((d) => d.kind === "loop_item_typed_request_auto_settled");
+  assert.ok(autoSettle, "auto-settle must persist a durable decision record");
+  const payload = autoSettle!.data as { package?: { recommendation?: string; rationale?: string; evidence?: string[] } };
+  assert.equal(payload.package?.recommendation, "REST");
+  assert.ok(payload.package?.rationale);
+  assert.ok((payload.package?.evidence?.length ?? 0) > 0);
 });
 
 test("blocked_recoverable authority diagnostic without a current candidate stays engine-owned", async () => {
@@ -3038,6 +3050,52 @@ test("blocked_recoverable authority diagnostic without a current candidate stays
   assert.equal(finalLedger.items["200"].hold_request, undefined);
 });
 
+test("attested authority diagnostic without proven bindings does not persist generic AuthorityRequest defaults", async () => {
+  const contract = testContract({ items: [{ id: "200", depends_on: [] }] });
+  const ledger = testLedger({ "200": itemEntry("200", "pending") });
+  const { deps } = await setup(contract, ledger);
+  const observe: ReconcileObserveDeps = {
+    async getIssueStateAndLabels() {
+      return { state: "open", labels: [PIPELINE_READY_LABEL] };
+    },
+    async findPrForIssue() {
+      return null;
+    },
+    async getPrDetail() {
+      return null;
+    },
+    async getPrChecks() {
+      return [];
+    },
+    async getLocalHead() {
+      return { branch: "pipeline/200-fix", sha: "abc123" };
+    },
+    async baseBranchContainsSha() {
+      return null;
+    },
+    async getLabelEvents() {
+      return [];
+    },
+    now: () => new Date("2026-07-23T00:00:00.000Z"),
+  };
+  const dispatchItem: SupervisorDeps["dispatchItem"] = async (request) => ({
+    schema: LOOP_EXECUTION_CONTRACT_SCHEMA,
+    item_id: request.item_id,
+    run_id: request.run_id,
+    outcome: "blocked_needs_human",
+    evidence: { pr_number: null, pipeline_run_id: `pipeline-run-${request.item_id}` },
+    diagnostic: protectedAuthorityDiagnostic("abc123"),
+  });
+
+  await driveSupervisor({ store: deps, observe, dispatchItem }, { runId: "run-1", engine: "claude" });
+
+  const finalLedger = await readLedger(deps, "run-1");
+  assert.notEqual(finalLedger.items["200"].hold_request?.typed_request, "AuthorityRequest");
+  assert.notEqual(finalLedger.items["200"].hold_request?.authority_request?.eligible_actor, "authenticated-operator");
+  assert.notEqual(finalLedger.items["200"].hold_request?.authority_request?.operation, "protected-action");
+  assert.notEqual(finalLedger.items["200"].blocked_theme, "missing-authority");
+});
+
 test("blocked_recoverable human-context-required stays a CapabilityRequest, not missing-authority", async () => {
   const contract = testContract({ items: [{ id: "200", depends_on: [] }] });
   const ledger = testLedger({ "200": itemEntry("200", "pending") });
@@ -3087,6 +3145,10 @@ test("blocked_recoverable human-context-required stays a CapabilityRequest, not 
   assert.equal(finalLedger.items["200"].state, "waiting");
   assert.equal(finalLedger.items["200"].hold_request?.kind, "answer");
   assert.equal(finalLedger.items["200"].hold_request?.typed_request, "CapabilityRequest");
+  assert.ok(finalLedger.items["200"].hold_request?.capability_request?.missing);
+  assert.ok(finalLedger.items["200"].hold_request?.capability_request?.provider);
+  assert.ok(finalLedger.items["200"].hold_request?.capability_request?.live_probe);
+  assert.ok(finalLedger.items["200"].hold_request?.capability_request?.resume_condition);
 });
 
 test("blocked_needs_human without attested authority remains engine-owned even with a live blocked label", async () => {

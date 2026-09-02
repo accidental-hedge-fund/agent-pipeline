@@ -15,9 +15,10 @@ import {
   authorizeGatedTransition,
   handoffRun,
   upgradeLedgerForPauseAuthority,
+  type WaitRequestInput,
 } from "../scripts/loop/pause.ts";
 import { blockItem } from "../scripts/loop/recovery.ts";
-import { initRun, readLedger, readEvents, readDecisions, acquireLock, getStatus, type LoopStoreDeps } from "../scripts/loop/store.ts";
+import { initRun, readLedger, readEvents, readDecisions, acquireLock, getStatus, writeLedger, type LoopStoreDeps } from "../scripts/loop/store.ts";
 import { LOOP_CONTRACT_SCHEMA, LOOP_LEDGER_SCHEMA, LoopError, type LoopContract, type LoopLedger } from "../scripts/loop/types.ts";
 import { DEFAULT_RECOVERY_POLICY } from "../scripts/loop/recovery.ts";
 
@@ -154,6 +155,32 @@ function assertClass(err: unknown, cls: string) {
   return true;
 }
 
+const TYPED_DECISION_PACKAGE = {
+  recommendation: "choose an option",
+  rationale: "need a product choice",
+  alternatives: ["yes", "no"],
+  risk: "low",
+  evidence: ["issue body"],
+};
+
+const TYPED_CAPABILITY_RECORD = {
+  missing: "required information",
+  provider: "operator",
+  live_probe: "issue body",
+  resume_condition: "operator supplies the information",
+};
+
+function typedWaitRequest(
+  kind: "decision" | "answer",
+  prompt: string,
+  extra: { permitted_responses?: string[] } = {},
+): WaitRequestInput {
+  if (kind === "decision") {
+    return { kind, prompt, decision_package: TYPED_DECISION_PACKAGE, ...extra };
+  }
+  return { kind, prompt, capability_request: TYPED_CAPABILITY_RECORD, ...extra };
+}
+
 // ---------------------------------------------------------------------------
 // Entering a hold — admission and non-charging.
 // ---------------------------------------------------------------------------
@@ -175,7 +202,7 @@ test("waitItem: an in_progress item enters waiting carrying the request, no budg
     token,
     itemId: "100",
     engine: "claude",
-    request: { kind: "decision", prompt: "which base branch?", permitted_responses: ["main", "staging"] },
+    request: typedWaitRequest("decision", "which base branch?", { permitted_responses: ["main", "staging"] }),
   });
   assert.equal(ledger.items["100"].state, "waiting");
   assert.equal(ledger.consecutive_blocked, 0);
@@ -189,6 +216,7 @@ test("waitItem: an in_progress item enters waiting carrying the request, no budg
   assert.deepEqual(req!.permitted_responses, ["main", "staging"]);
   assert.equal(req!.requested_by_engine, "claude");
   assert.ok(req!.request_id.length > 0);
+  assert.deepEqual(req!.decision_package, TYPED_DECISION_PACKAGE);
 });
 
 test("waitItem: answer kind is CapabilityRequest and is not authority-grant", async () => {
@@ -198,11 +226,12 @@ test("waitItem: answer kind is CapabilityRequest and is not authority-grant", as
     token,
     itemId: "100",
     engine: "claude",
-    request: { kind: "answer", prompt: "what is the staging hostname?" },
+    request: typedWaitRequest("answer", "what is the staging hostname?"),
   });
   assert.equal(ledger.items["100"].hold_request?.kind, "answer");
   assert.equal(ledger.items["100"].hold_request?.typed_request, "CapabilityRequest");
   assert.notEqual(ledger.items["100"].hold_request?.typed_request, "AuthorityRequest");
+  assert.deepEqual(ledger.items["100"].hold_request?.capability_request, TYPED_CAPABILITY_RECORD);
 });
 
 test("pauseItem: an engine that does not match the current lock holder is refused, leaving state unchanged", async () => {
@@ -257,9 +286,69 @@ test("waitItem: an unknown request kind is refused naming the offending kind", a
 test("waitItem: an empty permitted_responses is refused as a validation failure", async () => {
   const { deps, token } = await setup();
   await assert.rejects(
-    () => waitItem(deps, { runId: "run-1", token, itemId: "100", engine: "claude", request: { kind: "answer", prompt: "x", permitted_responses: [] } }),
+    () => waitItem(deps, { runId: "run-1", token, itemId: "100", engine: "claude", request: { ...typedWaitRequest("answer", "x"), permitted_responses: [] } }),
     (err: unknown) => assertClass(err, "validation"),
   );
+});
+
+test("waitItem: an incomplete DecisionRequest package is refused, leaving state unchanged", async () => {
+  const { deps, token } = await setup();
+  await assert.rejects(
+    () =>
+      waitItem(deps, {
+        runId: "run-1",
+        token,
+        itemId: "100",
+        engine: "claude",
+        request: { kind: "decision", prompt: "which base branch?" },
+      }),
+    (err: unknown) => {
+      assertClass(err, "validation");
+      assert.match((err as Error).message, /decision resolution/);
+      return true;
+    },
+  );
+  const ledger = await readLedger(deps, "run-1");
+  assert.equal(ledger.items["100"].state, "in_progress");
+});
+
+test("resumeHold: an incomplete persisted typed-request record is refused", async () => {
+  const { deps, token } = await setup();
+  const ledger = await readLedger(deps, "run-1");
+  ledger.items["100"] = {
+    ...ledger.items["100"]!,
+    state: "waiting",
+    hold_request: {
+      request_id: "req-incomplete",
+      item_id: "100",
+      kind: "decision",
+      typed_request: "DecisionRequest",
+      prompt: "which?",
+      requested_by_engine: "claude",
+      requested_at: "2026-07-23T00:00:00.000Z",
+    },
+  };
+  await writeLedger(deps, ledger, token);
+  await assert.rejects(
+    () =>
+      resumeHold(deps, {
+        runId: "run-1",
+        token,
+        itemId: "100",
+        engine: "claude",
+        actor: "human:alice",
+        response: { request_id: "req-incomplete", value: "yes" },
+        pipeline_preflight: PREFLIGHT_OK,
+        native_goal: NATIVE_GOAL_OK,
+      }),
+    (err: unknown) => {
+      assertClass(err, "validation");
+      assert.match((err as Error).message, /decision resolution/);
+      return true;
+    },
+  );
+  const after = await readLedger(deps, "run-1");
+  assert.equal(after.items["100"].state, "waiting");
 });
 
 test("a paused/waiting hold survives restart — a fresh read sees the same hold and request", async () => {
@@ -269,7 +358,7 @@ test("a paused/waiting hold survives restart — a fresh read sees the same hold
     token,
     itemId: "100",
     engine: "claude",
-    request: { kind: "answer", prompt: "which env?" },
+    request: typedWaitRequest("answer", "which env?"),
   });
   const resumed = await readLedger(deps, "run-1");
   assert.equal(resumed.items["100"].state, "waiting");
@@ -328,7 +417,7 @@ test("abandonHold: an engine that does not match the current lock holder is refu
 
 test("resumeHold: an engine that does not match the current lock holder is refused, leaving the hold intact", async () => {
   const { deps, token } = await setup(); // lock is held by "claude"
-  await waitItem(deps, { runId: "run-1", token, itemId: "100", engine: "claude", request: { kind: "answer", prompt: "which?" } });
+  await waitItem(deps, { runId: "run-1", token, itemId: "100", engine: "claude", request: typedWaitRequest("answer", "which?") });
   await assert.rejects(
     () =>
       resumeHold(deps, {
@@ -354,7 +443,7 @@ test("resumeHold: a satisfying, evidenced resume advances waiting -> in_progress
     token,
     itemId: "100",
     engine: "claude",
-    request: { kind: "decision", prompt: "go ahead?", permitted_responses: ["yes", "no"] },
+    request: typedWaitRequest("decision", "go ahead?", { permitted_responses: ["yes", "no"] }),
   });
   const requestId = waiting.items["100"].hold_request!.request_id;
 
@@ -397,7 +486,7 @@ test("resumeHold: no active hold is refused, leaving state unchanged", async () 
 
 test("resumeHold: a response naming a different request is refused, item remains in its hold, no decision appended", async () => {
   const { deps, token } = await setup();
-  await waitItem(deps, { runId: "run-1", token, itemId: "100", engine: "claude", request: { kind: "answer", prompt: "which?" } });
+  await waitItem(deps, { runId: "run-1", token, itemId: "100", engine: "claude", request: typedWaitRequest("answer", "which?") });
   await assert.rejects(
     () =>
       resumeHold(deps, {
@@ -425,7 +514,7 @@ test("resumeHold: a response outside the permitted set is refused, item remains 
     token,
     itemId: "100",
     engine: "claude",
-    request: { kind: "decision", prompt: "go ahead?", permitted_responses: ["yes", "no"] },
+    request: typedWaitRequest("decision", "go ahead?", { permitted_responses: ["yes", "no"] }),
   });
   const requestId = waiting.items["100"].hold_request!.request_id;
   await assert.rejects(
@@ -451,7 +540,7 @@ test("resumeHold: a response outside the permitted set is refused, item remains 
 
 test("resumeHold: a satisfying response with no pipeline-preflight evidence is refused with a pipeline-mandate failure, item remains in its hold", async () => {
   const { deps, token } = await setup();
-  const waiting = await waitItem(deps, { runId: "run-1", token, itemId: "100", engine: "claude", request: { kind: "answer", prompt: "which?" } });
+  const waiting = await waitItem(deps, { runId: "run-1", token, itemId: "100", engine: "claude", request: typedWaitRequest("answer", "which?") });
   const requestId = waiting.items["100"].hold_request!.request_id;
   await assert.rejects(
     () =>
@@ -473,7 +562,7 @@ test("resumeHold: a satisfying response with no pipeline-preflight evidence is r
 
 test("resumeHold: a satisfying response with no native-goal evidence is refused with a native-goal-mandate failure, item remains in its hold", async () => {
   const { deps, token } = await setup();
-  const waiting = await waitItem(deps, { runId: "run-1", token, itemId: "100", engine: "claude", request: { kind: "answer", prompt: "which?" } });
+  const waiting = await waitItem(deps, { runId: "run-1", token, itemId: "100", engine: "claude", request: typedWaitRequest("answer", "which?") });
   const requestId = waiting.items["100"].hold_request!.request_id;
   await assert.rejects(
     () =>
@@ -495,7 +584,7 @@ test("resumeHold: a satisfying response with no native-goal evidence is refused 
 
 test("resumeHold: stale native-goal evidence outside the freshness window is refused", async () => {
   const { deps, token } = await setup();
-  const waiting = await waitItem(deps, { runId: "run-1", token, itemId: "100", engine: "claude", request: { kind: "answer", prompt: "which?" } });
+  const waiting = await waitItem(deps, { runId: "run-1", token, itemId: "100", engine: "claude", request: typedWaitRequest("answer", "which?") });
   const requestId = waiting.items["100"].hold_request!.request_id;
   await assert.rejects(
     () =>
@@ -531,7 +620,7 @@ test("resumeHold: a bare paused hold (no request) resumes with just a response a
 
 test("resumeHold: a waiting request with no permitted_responses cannot be resumed with a missing response value", async () => {
   const { deps, token } = await setup();
-  const waiting = await waitItem(deps, { runId: "run-1", token, itemId: "100", engine: "claude", request: { kind: "answer", prompt: "which?" } });
+  const waiting = await waitItem(deps, { runId: "run-1", token, itemId: "100", engine: "claude", request: typedWaitRequest("answer", "which?") });
   const requestId = waiting.items["100"].hold_request!.request_id;
   await assert.rejects(
     () =>
@@ -556,7 +645,7 @@ test("resumeHold: a waiting request with no permitted_responses cannot be resume
 
 test("resumeHold: a non-object response is refused, leaving state unchanged", async () => {
   const { deps, token } = await setup();
-  await waitItem(deps, { runId: "run-1", token, itemId: "100", engine: "claude", request: { kind: "answer", prompt: "which?" } });
+  await waitItem(deps, { runId: "run-1", token, itemId: "100", engine: "claude", request: typedWaitRequest("answer", "which?") });
   await assert.rejects(
     () =>
       resumeHold(deps, {
@@ -591,7 +680,7 @@ test("resumeHold: a decision-log append failure leaves the ledger un-resumed and
     token,
     itemId: "100",
     engine: "claude",
-    request: { kind: "decision", prompt: "go ahead?", permitted_responses: ["yes", "no"] },
+    request: typedWaitRequest("decision", "go ahead?", { permitted_responses: ["yes", "no"] }),
   });
   const requestId = waiting.items["100"].hold_request!.request_id;
 
@@ -816,7 +905,7 @@ test("handoffRun: the receiving engine must re-attest native-goal mode before re
 
 test("getStatus surfaces outstanding requests and active amendments, performing zero writes", async () => {
   const { deps, files, token } = await setup();
-  await waitItem(deps, { runId: "run-1", token, itemId: "100", engine: "claude", request: { kind: "decision", prompt: "go?", permitted_responses: ["yes"] } });
+  await waitItem(deps, { runId: "run-1", token, itemId: "100", engine: "claude", request: typedWaitRequest("decision", "go?", { permitted_responses: ["yes"] }) });
   await recordAuthorityAmendment(deps, { runId: "run-1", token, gate: "merge", scope_item_id: "100", actor: "human:alice", reason: "x" });
 
   const before = new Map(files);

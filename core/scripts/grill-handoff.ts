@@ -31,7 +31,6 @@ import {
 } from "./grill-proposal.ts";
 import { classifyAuthority, isOperatorRequiredClass } from "./grill-taxonomy.ts";
 import { typedRequestHandoffClass } from "./grill-settle.ts";
-import { defaultAuthorityExpiry } from "./typed-request-resolution.ts";
 import {
   appendHandoffAudit,
   canCreateHandoff,
@@ -392,30 +391,16 @@ export function grillAuthorityCreateInputs(input: GrillHandoffCreateInput): Crea
       created.typed_request = request;
       if (request === "DecisionRequest") {
         created.decision_package = {
-          recommendation: node.recommendation || node.question,
-          rationale: node.rationale || created.reason,
+          recommendation: node.recommendation,
+          rationale: node.rationale ?? "",
           alternatives: node.alternatives ?? [],
-          risk: node.risk || "medium",
-          evidence: node.evidence && node.evidence.length > 0 ? node.evidence : [created.reason],
+          risk: node.risk ?? "",
+          evidence: node.evidence ?? [],
         };
       } else if (request === "CapabilityRequest") {
-        created.capability_request = node.capability_request ?? {
-          missing: node.question,
-          provider: "operator",
-          live_probe: `issue body and repository facts for ${node.id}`,
-          resume_condition: "supplied input restores the missing capability or information",
-        };
-      } else {
-        created.authority_request = node.authority_request ?? {
-          eligible_actor: "authenticated-github-actor",
-          repository: input.repo,
-          operation: node.class,
-          scope: node.id,
-          candidate_epoch: null,
-          evidence: node.evidence && node.evidence.length > 0 ? node.evidence : [created.reason],
-          expiry: defaultAuthorityExpiry(),
-          grant: null,
-        };
+        if (node.capability_request) created.capability_request = node.capability_request;
+      } else if (request === "AuthorityRequest") {
+        if (node.authority_request) created.authority_request = node.authority_request;
       }
     }
     out.push(created);
