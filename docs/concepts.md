@@ -49,6 +49,8 @@ Ignored local paths (must never be committed): `.agent-pipeline/runs/`, `.agent-
 
 After `init`, commit the config, label an issue `pipeline:ready`, and run `pipeline N`.
 
+`pipeline doctor` includes a continuous-liveness check (`liveness:continuous`). It reports `configured`, `available`, `active`, or `degraded` / `unavailable`. Absence of systemd, launchd, a container supervisor, or a harness worker is a typed capability condition. It is not a human hold. A dead worker is not-live, not a terminal outcome, and not human authority. Restore with `pipeline liveness restore`.
+
 ## Test/build gate (optional, default on)
 
 Before opening a PR, the pipeline can run the repo's own tests/build (`test_gate` in `.github/pipeline.yml`). Default **enabled**. On failure it routes to a bounded fix loop (`max_attempts`), then blocks with evidence. Set `test_gate.enabled: false` to disable. See [config.md](config.md) for keys.
@@ -378,9 +380,9 @@ After `loop_item_advance_linked` publishes `pipeline_run_id`, retain that value 
 pipeline logs <advance-run-id> --events --follow
 ```
 
-Keep the loop follow active. On a later linkage or a terminal advance, stop or replace the prior advance follow. Advance `run_complete` stops or replaces only that advance follow. Keep the loop follow active while the loop remains live. Stop the loop-scoped follow set only on `loop_run_complete`, `loop_run_stopped`, or supervisor exit, in the same turn. Reattach an interrupted follow with the same retained ids. Interrupted follow is non-terminal. Cancelled wait is not completion.
+Keep the loop follow active. On a later linkage or a terminal advance, stop or replace the prior advance follow. Advance `run_complete` stops or replaces only that advance follow. Keep the loop follow active while the loop remains live. Stop the loop-scoped follow set only on `loop_run_complete`, `loop_run_stopped`, or supervisor exit, in the same turn. Reattach an interrupted follow with the same retained ids. Interrupted follow is non-terminal. Cancelled wait is not completion. A dead worker is not-live, not completion, and not human authority. Restore with `pipeline liveness restore`. Follow with `pipeline logs` / `pipeline loop logs --events --follow`.
 
-After a confirmed terminal loop outcome, emit a final summary with starting-to-ending stage, elapsed time or transitions when available, PR URL when present, terminal state, the operator-authorized merge next step, and confirmation that follows stopped. After a confirmed terminal direct-advance outcome, emit the same fields for that advance. Merge is an operator-authorized next step, not an observer action. Premature supervisor exit is non-terminal failure/recovery, never completion.
+After a confirmed terminal loop outcome, emit a final summary with starting-to-ending stage, elapsed time or transitions when available, PR URL when present, terminal state, the operator-authorized merge next step, and confirmation that follows stopped. After a confirmed terminal direct-advance outcome, emit the same fields for that advance. Merge is an operator-authorized next step, not an observer action. Premature supervisor exit is non-terminal failure/recovery, never completion. Invoke `pipeline liveness restore` or portable follow. Do not retry `pipeline single` or classify a recipe because the worker died.
 
 `pipeline loop --audit` is a short synchronous read-only report. Drive and resume are long-running.
 

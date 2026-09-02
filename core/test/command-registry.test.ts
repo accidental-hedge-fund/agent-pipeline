@@ -35,7 +35,7 @@ const DISPATCH_KEYWORDS = [
   "release", "ship", "intake", "decompose", "sweep", "triage", "merge", "merge-queue", "train",
   "refine-spec", "grill", "logs", "summary", "path", "config", "run", "single", "improve",
   "scoreboard", "outcomes", "lineage", "roadmap", "loop", "correction", "report", "engine-promote",
-  "factory-gate", "factory-release", "factory-pin", "controls",
+  "factory-gate", "factory-release", "factory-pin", "controls", "liveness",
 ];
 
 test("command-registry: every recognized dispatch keyword has a registry entry", () => {
@@ -297,6 +297,18 @@ test("command-registry: lookupCommand('cleanup') returns cleanup entry with need
   assert.ok(entry !== null);
   assert.equal(entry, COMMAND_REGISTRY.cleanup);
   assert.equal(entry.needsIssueNumber, false);
+});
+
+test("command-registry: liveness is discover/claim/reattach only", () => {
+  const entry = COMMAND_REGISTRY.liveness;
+  assert.ok(entry);
+  assert.equal(entry.needsIssueNumber, false);
+  assert.equal(entry.needsGhAuth, false);
+  assert.equal(entry.mutatesGitHub, false);
+  assert.equal(entry.supportsJson, true);
+  const flags = entry.allowedFlags as Set<string>;
+  assert.ok(flags.has("json"));
+  assert.ok(flags.has("runId"));
 });
 
 test("command-registry: lookupCommand('grill') returns grill entry with needsIssueNumber:false", () => {

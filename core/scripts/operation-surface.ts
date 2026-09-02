@@ -89,8 +89,16 @@ export const OPERATION_SURFACE: readonly OperationSurfaceEntry[] = [
   operation({
     name: "doctor",
     desc:
-      "Deterministic preflight check; print summary, exit 0/1. Opt-in --harness-smoke adds one cheap model call per unique configured harness treatment",
+      "Deterministic preflight check; print summary, exit 0/1. Reports continuous liveness as configured/available/active/degraded/unavailable without treating absence as human authority. Opt-in --harness-smoke adds one cheap model call per unique configured harness treatment",
     usage: "doctor [--json|--is-ok] [--fail-fast] [--harness-smoke]",
+    section: "lifecycle",
+    fast: true,
+  }),
+  operation({
+    name: "liveness",
+    desc:
+      "Discover, claim, and reattach machine-local durable supervisors after worker or machine restart (not recovery or merge)",
+    usage: "liveness status [--json] | liveness restore [--json] [--run-id <id>]",
     section: "lifecycle",
     fast: true,
   }),

@@ -316,9 +316,19 @@ describe("renderHostSkill contract", () => {
     assert.match(skill, /pipeline logs <advance-run-id> --events --follow/);
     assert.match(skill, /pipeline loop logs <loop-run-id> --events --follow/);
     assert.match(skill, /Reattach an interrupted follow/);
+    assert.match(skill, /pipeline liveness restore/);
     assert.match(skill, /Advance `run_complete` stops or replaces only that advance follow/);
     assert.match(skill, /Stop the loop-scoped follow set on `loop_run_complete`/);
     assert.match(skill, /terminal reason/);
+  });
+
+  test("dead-worker restore points at shared liveness restore, not retry or classify", () => {
+    assert.match(skill, /A dead worker is not-live/);
+    assert.match(skill, /pipeline liveness restore/);
+    assert.match(skill, /Do not retry\n    `pipeline single`/);
+    assert.match(skill, /classify a recipe/);
+    assert.doesNotMatch(skill, /then retry `pipeline single`/);
+    assert.doesNotMatch(skill, /merge because follow stopped/);
   });
 
   test("forbids follower merge-capable commands", () => {
@@ -704,7 +714,7 @@ function assertRenderedFollowContract(skill: string, label = "skill"): void {
   );
   assert.match(
     skill,
-    /Tear down every run-scoped follow, then report recovery/,
+    /invoke\n    `pipeline liveness restore` or portable follow/,
     label,
   );
   assert.doesNotMatch(
@@ -757,7 +767,7 @@ describe("semantic follow contract fixtures", () => {
       ],
       [
         "premature-exit",
-        "Premature supervisor exit is non-terminal failure/recovery, never\n    completion. Tear down every run-scoped follow, then report recovery — do\n    not emit a completion summary.",
+        "Premature supervisor exit is non-terminal failure/recovery, never\n    completion. Tear down every run-scoped follow, then invoke\n    `pipeline liveness restore` or portable follow. Do not retry\n    `pipeline single`, classify a recipe, or emit a completion summary.",
         "Premature supervisor exit is completion. Keep follows running.",
       ],
     ];

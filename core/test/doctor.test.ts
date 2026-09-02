@@ -21,6 +21,7 @@ import {
   resolveInstallRoot,
   runPreflight,
   storePreflightResult,
+  realDoctorDeps,
   type DoctorDeps,
   type DoctorJsonEnvelope,
   type ExecResult,
@@ -166,6 +167,8 @@ interface FakeOverrides {
   onCall?: (file: string, args: string[]) => void;
   listPipelineLocks?: () => string[];
   isPidLive?: (pid: number) => boolean;
+  livenessStatus?: DoctorDeps["livenessStatus"];
+  livenessRestore?: DoctorDeps["livenessRestore"];
   claimStaleLockFile?: (p: string) => { claimPath: string; content: string | null } | null;
   restoreClaimedLockFile?: (claimPath: string, originalPath: string) => void;
   discardClaimedLockFile?: (claimPath: string) => void;
@@ -282,6 +285,8 @@ function fakeDeps(o: FakeOverrides = {}): DoctorDeps {
     },
     // Hermetic default: empty env so host REPO_DIR cannot pin a clone.
     env: o.env ?? {},
+    livenessStatus: o.livenessStatus,
+    livenessRestore: o.livenessRestore,
   };
 }
 
@@ -3236,4 +3241,124 @@ test("check eval-fixture-integrity — passes when all pins resolve as commit", 
     }),
   );
   assert.equal(r.status, "pass", r.detail);
+});
+
+test("realDoctorDeps wires production livenessStatus (hermetic tests still inject the seam)", () => {
+  const deps = realDoctorDeps();
+  assert.equal(typeof deps.livenessStatus, "function");
+});
+
+test("check liveness:continuous — unconfigured keep-alive is skip, not human authority", async () => {
+  const r = await getCheck(makeConfig(), "liveness:continuous").run(fakeDeps());
+  assert.equal(r.status, "skip");
+  assert.equal(r.discriminant, "unavailable");
+  assert.equal(r.capability_condition?.kind, "typed_capability_condition");
+  assert.doesNotMatch(r.detail, /needs-human|human authority|Decision Request/i);
+  const json = formatDoctorJson({
+    schema_version: 1,
+    ok: true,
+    ranAt: "t",
+    checks: [{ id: "liveness:continuous", description: "liveness", ...r }],
+  });
+  const rec = json.checks.find((c) => c.name === "liveness:continuous");
+  assert.equal(rec?.discriminant, "unavailable");
+  assert.equal(json.status, "ok");
+});
+
+test("check liveness:continuous — active worker reports active discriminant", async () => {
+  const r = await getCheck(makeConfig(), "liveness:continuous").run(
+    fakeDeps({
+      livenessStatus: async () => ({
+        discriminant: "active",
+        adapter: "systemd",
+        liveWorker: true,
+        eligibleRuns: 0,
+        capabilityCondition: null,
+      }),
+    }),
+  );
+  assert.equal(r.status, "pass");
+  assert.equal(r.discriminant, "active");
+  const json = formatDoctorJson({
+    schema_version: 1,
+    ok: true,
+    ranAt: "t",
+    checks: [{ id: "liveness:continuous", description: "liveness", ...r }],
+  });
+  assert.equal(json.checks[0]?.discriminant, "active");
+});
+
+test("check liveness:continuous — broken adapter is degraded, names adapter, not human authority", async () => {
+  const r = await getCheck(makeConfig(), "liveness:continuous").run(
+    fakeDeps({
+      livenessStatus: async () => ({
+        discriminant: "degraded",
+        adapter: "launchd",
+        liveWorker: false,
+        eligibleRuns: 0,
+        capabilityCondition: {
+          kind: "typed_capability_condition",
+          reason: "keep_alive_broken",
+          adapter: "launchd",
+        },
+      }),
+    }),
+  );
+  assert.equal(r.status, "warn");
+  assert.equal(r.discriminant, "degraded");
+  assert.match(r.remediation ?? "", /launchd/);
+  assert.doesNotMatch(r.detail, /needs-human|human authority|Decision Request/i);
+  assert.doesNotMatch(r.remediation ?? "", /needs-human|human authority|Decision Request/i);
+});
+
+test("check liveness:continuous — doctor does not call restore", async () => {
+  let restored = false;
+  const execCalls: string[] = [];
+  const r = await getCheck(makeConfig(), "liveness:continuous").run(
+    fakeDeps({
+      livenessStatus: async () => ({
+        discriminant: "available",
+        adapter: "container",
+        liveWorker: false,
+        eligibleRuns: 1,
+        capabilityCondition: null,
+      }),
+      livenessRestore: async () => {
+        restored = true;
+        throw new Error("doctor must not restore");
+      },
+      onCall: (file) => {
+        execCalls.push(file);
+      },
+    }),
+  );
+  assert.equal(r.status, "pass");
+  assert.equal(restored, false);
+  assert.equal(execCalls.length, 0);
+});
+
+test("check liveness:continuous — no systemd/launchd/container/network/git/subprocess", async () => {
+  const files: string[] = [];
+  const r = await getCheck(makeConfig(), "liveness:continuous").run(
+    fakeDeps({
+      livenessStatus: async () => ({
+        discriminant: "configured",
+        adapter: "harness-worker",
+        liveWorker: false,
+        eligibleRuns: 0,
+        capabilityCondition: null,
+      }),
+      execCheck: (file) => {
+        files.push(file);
+        return true;
+      },
+      exec: (file) => {
+        files.push(file);
+        return { ok: true, stdout: "", stderr: "" };
+      },
+    }),
+  );
+  assert.equal(r.status, "pass");
+  assert.equal(r.discriminant, "configured");
+  assert.deepEqual(files, []);
 });

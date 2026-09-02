@@ -67,6 +67,17 @@ test("dead pid plus open ledger is not live", () => {
   assert.notEqual(status.status, "live");
   assert.equal(status.status, "not-live");
   assert.equal(status.reason, "dead_pid");
+  assert.notEqual(status.status, "failed");
+});
+
+test("non-terminal ledger without a live worker is not-live, not verified completion", () => {
+  const status = classifyPackLoopLiveness(evidence({
+    lockPidAlive: false,
+    supervisor: supervisor({ heartbeat_at: "2026-08-29T11:59:55.000Z" }),
+  }));
+  assert.equal(status.status, "not-live");
+  assert.notEqual(status.reason, "live");
+  assert.notEqual(status.status, "failed");
 });
 
 test("never-dispatched non-terminal ledger is not live", () => {

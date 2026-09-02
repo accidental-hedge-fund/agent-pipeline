@@ -20,11 +20,17 @@ import {
   type LoopStoreDeps,
 } from "./store.ts";
 import type { LoopSupervisorProcess } from "./types.ts";
+import {
+  WORKER_HEARTBEAT_FUTURE_SLACK_MS,
+  WORKER_HEARTBEAT_STALE_MS,
+  classifyWorkerLiveness,
+  parseHeartbeatAt as parseSharedHeartbeatAt,
+} from "../worker-identity.ts";
 
 export const PACK_LOOP_HEARTBEAT_CADENCE_MS = 5_000;
-export const PACK_LOOP_HEARTBEAT_STALE_MS = 30_000;
+export const PACK_LOOP_HEARTBEAT_STALE_MS = WORKER_HEARTBEAT_STALE_MS;
 export const PACK_LOOP_STARTUP_OBSERVATION_MS = 30_000;
-export const PACK_LOOP_HEARTBEAT_FUTURE_SLACK_MS = 1_000;
+export const PACK_LOOP_HEARTBEAT_FUTURE_SLACK_MS = WORKER_HEARTBEAT_FUTURE_SLACK_MS;
 export const PACK_LOOP_STDERR_HEAD_BYTES = 16 * 1024;
 export const PACK_LOOP_STDERR_TAIL_BYTES = 16 * 1024;
 
@@ -116,15 +122,12 @@ export function parseHeartbeatAt(
   raw: unknown,
   now: Date,
 ): { kind: "fresh" | "stale" | "missing" } | { kind: "malformed" } {
-  if (raw == null || raw === "") return { kind: "missing" };
-  if (typeof raw !== "string") return { kind: "malformed" };
-  const ms = Date.parse(raw);
-  if (!Number.isFinite(ms)) return { kind: "malformed" };
-  const skew = ms - now.getTime();
-  if (skew > PACK_LOOP_HEARTBEAT_FUTURE_SLACK_MS) return { kind: "malformed" };
-  const age = now.getTime() - ms;
-  if (age > PACK_LOOP_HEARTBEAT_STALE_MS) return { kind: "stale" };
-  return { kind: "fresh" };
+  return parseSharedHeartbeatAt(
+    raw,
+    now,
+    PACK_LOOP_HEARTBEAT_STALE_MS,
+    PACK_LOOP_HEARTBEAT_FUTURE_SLACK_MS,
+  );
 }
 
 /**
@@ -215,34 +218,31 @@ export function classifyPackLoopLiveness(evidence: PackLoopLivenessEvidence): Pa
   if (!supervisor) {
     return unreadableIdentity(evidence, "unreadable_identity");
   }
-  const snap = evidence.handoff.supervisor;
-  if (
-    supervisor.pid !== snap.pid ||
-    supervisor.boot_id !== snap.boot_id ||
-    supervisor.started_at !== snap.started_at ||
-    supervisor.run_id !== evidence.loopRunId
-  ) {
+  if (supervisor.run_id !== evidence.loopRunId) {
     return statusOf(evidence, "not-live", "pid_reuse");
   }
-  if (evidence.lockPidAlive !== true) {
-    return statusOf(evidence, "not-live", "dead_pid", {
+  const snap = evidence.handoff.supervisor;
+  const identity = classifyWorkerLiveness({
+    now: evidence.now,
+    recorded: { pid: snap.pid, boot_id: snap.boot_id, started_at: snap.started_at },
+    observed: {
+      pid: supervisor.pid,
+      boot_id: supervisor.boot_id,
+      started_at: supervisor.started_at,
       heartbeat_at: supervisor.heartbeat_at,
-    });
-  }
-  const beat = parseHeartbeatAt(supervisor.heartbeat_at, evidence.now);
-  if (beat.kind === "malformed") {
+    },
+    pidAlive: evidence.lockPidAlive,
+  });
+  if (identity.status === "unknown") {
     return unreadableIdentity(evidence, "unreadable_identity");
   }
-  if (beat.kind === "missing") {
-    return statusOf(evidence, "not-live", "missing_heartbeat");
-  }
-  if (beat.kind === "stale") {
-    return statusOf(evidence, "not-live", "stale_heartbeat", {
-      heartbeat_at: supervisor.heartbeat_at,
+  if (identity.status === "not-live") {
+    return statusOf(evidence, "not-live", identity.reason, {
+      heartbeat_at: identity.heartbeat_at,
     });
   }
   return statusOf(evidence, "live", "live", {
-    heartbeat_at: supervisor.heartbeat_at,
+    heartbeat_at: identity.heartbeat_at,
   });
 }
 

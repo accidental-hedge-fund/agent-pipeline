@@ -12,6 +12,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { homedir } from "node:os";
+import { getProcessStartTime as readProcessStartTime } from "../lock.ts";
 import type { DurableLoopRunHandoff } from "./handoff.ts";
 import {
   isDurableBlockerClass,
@@ -76,6 +77,8 @@ export interface LoopStoreDeps {
   listDir(p: string): Promise<string[]>;
   /** True when a process with this pid is alive on the current host. */
   isPidAlive(pid: number): Promise<boolean>;
+  /** Process starttime token for `pid`, or null when gone or unreadable. */
+  getProcessStartTime?(pid: number): Promise<string | null> | string | null;
   hostname(): string;
   pid(): number;
   now(): Date;
@@ -871,6 +874,7 @@ export function defaultLoopStoreDeps(env: NodeJS.ProcessEnv = process.env): Loop
         return false;
       }
     },
+    getProcessStartTime: (pid) => readProcessStartTime(pid),
     hostname: () => os.hostname(),
     pid: () => process.pid,
     now: () => new Date(),
